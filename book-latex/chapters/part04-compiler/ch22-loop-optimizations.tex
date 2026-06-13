@@ -1,9 +1,497 @@
-\plannedchapter{循环优化：展开、重排、归约和依赖}
-{本章讲循环是高性能计算的核心结构，编译器如何分析和改写循环。}
-{\item 什么阻止 loop optimization？
-\item unroll 如何增加 ILP？
-\item reduction 为什么特殊？}
-{\item loop-carried dependency。
-\item unrolling、peeling、unswitching、interchange。
-\item trip count、runtime check、tail loop。}
-{比较 sum1/sum4/unroll/auto-vectorized 版本，解释依赖链和汇编差异。}
+\section{循环优化：展开、重排、归约和依赖}
+
+\subsection{本节要解决的问题}
+
+高性能计算和 AI 算子的大部分时间都花在循环里。GEMM 是循环，卷积是循环，softmax 是循环，layernorm 是循环，attention 的核心也是循环和矩阵块操作。理解循环优化，就是理解现代性能优化的主战场。
+
+本节讨论编译器如何分析和改写循环：
+
+\begin{itemize}
+  \item 循环在 IR 里如何被识别为 loop。
+  \item induction variable、trip count、latch、exit 是什么。
+  \item loop-carried dependency 为什么会限制优化。
+  \item unroll 如何增加 ILP、减少分支开销、暴露向量化机会。
+  \item peeling、unswitching、interchange 分别解决什么问题。
+  \item reduction 为什么是特殊但常见的循环模式。
+  \item 编译器为什么有时拒绝优化一个看似简单的循环。
+\end{itemize}
+
+\begin{keyidea}
+循环优化不是“把循环变快”这么笼统。每个变换都有明确目标：减少循环控制开销、暴露独立操作、改善访存局部性、移动不变量、消除分支、匹配 SIMD 形态或降低依赖链长度。分析循环时必须先判断瓶颈来自控制流、依赖、访存、前端、后端端口还是内存层级。
+\end{keyidea}
+
+\subsection{循环在 IR 中的基本形态}
+
+优化器希望循环有规范结构。一个常见循环：
+
+\begin{lstlisting}[language=C++]
+extern "C" int sum_i32(const int* values, int n)
+{
+    int sum = 0;
+    for (int i = 0; i < n; ++i) {
+        sum += values[i];
+    }
+    return sum;
+}
+\end{lstlisting}
+
+在 IR 的概念结构上接近：
+
+\begin{lstlisting}
+entry:
+  br label %loop
+
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i.next, %loop ]
+  %sum = phi i32 [ 0, %entry ], [ %sum.next, %loop ]
+  %ptr = getelementptr i32, ptr %values, i32 %i
+  %v = load i32, ptr %ptr
+  %sum.next = add i32 %sum, %v
+  %i.next = add i32 %i, 1
+  %done = icmp eq i32 %i.next, %n
+  br i1 %done, label %exit, label %loop
+
+exit:
+  ret i32 %sum.next
+\end{lstlisting}
+
+几个术语：
+
+\begin{center}
+\begin{tabular}{L{0.24\linewidth}L{0.60\linewidth}}
+\toprule
+术语 & 含义 \\
+\midrule
+header & 循环入口 block，通常包含关键 \code{phi}。 \\
+latch & 跳回 header 的 block。简单循环中 header 和 latch 可能是同一个 block。 \\
+backedge & 从 latch 回到 header 的边。 \\
+preheader & 进入循环前的唯一前驱，LICM 常把不变量放这里。 \\
+exit & 离开循环后到达的 block。 \\
+induction variable & 按规律变化的循环变量，例如 \code{i = i + 1}。 \\
+trip count & 循环执行次数，可能是常量、运行时值或不可证明。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+LoopSimplify、LCSSA 等 pass 会把循环整理成更适合后续分析的形态。你不必马上记住所有 pass 名字，但要理解：很多高级优化依赖循环先被规范化。
+
+\subsection{loop-carried dependency}
+
+循环优化最核心的问题是依赖。依赖分为 loop-independent 和 loop-carried。loop-carried dependency 指某一轮迭代依赖前一轮或更早迭代的结果。
+
+最典型的是累加：
+
+\begin{lstlisting}[language=C++]
+sum += values[i];
+\end{lstlisting}
+
+第 \code{i+1} 轮的 \code{sum} 依赖第 \code{i} 轮的 \code{sum}。这形成一条串行依赖链：
+
+\begin{lstlisting}
+sum0 -> add v0 -> sum1 -> add v1 -> sum2 -> add v2 -> sum3
+\end{lstlisting}
+
+如果每次整数加法延迟是 1 cycle，这条链可能还不严重；如果是浮点加法、FMA 或复杂操作，依赖链就可能限制吞吐。编译器和手写优化常用多个累加器打断依赖链：
+
+\begin{lstlisting}[language=C++]
+std::int64_t s0 = 0;
+std::int64_t s1 = 0;
+std::int64_t s2 = 0;
+std::int64_t s3 = 0;
+for (std::size_t i = 0; i + 3 < n; i += 4) {
+    s0 += values[i + 0];
+    s1 += values[i + 1];
+    s2 += values[i + 2];
+    s3 += values[i + 3];
+}
+std::int64_t sum = s0 + s1 + s2 + s3;
+\end{lstlisting}
+
+现在依赖链变成四条较短链：
+
+\begin{lstlisting}
+s0 chain: s0 -> add v0 -> add v4 -> ...
+s1 chain: s1 -> add v1 -> add v5 -> ...
+s2 chain: s2 -> add v2 -> add v6 -> ...
+s3 chain: s3 -> add v3 -> add v7 -> ...
+\end{lstlisting}
+
+这样 CPU 乱序执行可以并行推进多条链，提升 ILP。
+
+\subsection{循环展开}
+
+loop unrolling 把多轮迭代合并到一个更大的循环体里。原始循环：
+
+\begin{lstlisting}
+for i = 0 .. n-1:
+    body(i)
+\end{lstlisting}
+
+展开 4 倍：
+
+\begin{lstlisting}
+for i = 0 .. n-4 step 4:
+    body(i + 0)
+    body(i + 1)
+    body(i + 2)
+    body(i + 3)
+tail loop for remaining elements
+\end{lstlisting}
+
+收益：
+
+\begin{itemize}
+  \item 减少分支和循环计数开销。
+  \item 暴露更多独立指令给调度器。
+  \item 暴露多个 load/store，帮助隐藏延迟。
+  \item 给向量化、SLP、指令选择创造更明显模式。
+\end{itemize}
+
+代价：
+
+\begin{itemize}
+  \item 代码体积增加。
+  \item instruction cache 和 uop cache 压力增加。
+  \item 寄存器压力增加，可能导致 spill。
+  \item tail 处理更复杂。
+\end{itemize}
+
+所以展开不是越大越好。真正的优化需要结合指令延迟、吞吐、寄存器数量、前端带宽、代码体积和数据规模。
+
+\subsection{完全展开和部分展开}
+
+如果 trip count 是小常量，编译器可能完全展开：
+
+\begin{lstlisting}[language=C++]
+extern "C" int sum4(const int* p)
+{
+    int s = 0;
+    for (int i = 0; i < 4; ++i) {
+        s += p[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+优化后可能没有循环：
+
+\begin{lstlisting}
+load p[0]
+load p[1]
+load p[2]
+load p[3]
+add tree
+ret
+\end{lstlisting}
+
+如果 trip count 是运行时值，只能部分展开并保留 tail：
+
+\begin{lstlisting}
+main loop:
+    process 4 elements per iteration
+
+tail:
+    process n % 4 elements
+\end{lstlisting}
+
+这也是 SIMD 向量化中 remainder loop 的来源之一。
+
+\subsection{Loop Peeling}
+
+peeling 把循环前几轮剥离出来，剩下的循环获得更好的性质。
+
+常见目的：
+
+\begin{itemize}
+  \item 处理对齐，让主体循环从对齐地址开始。
+  \item 处理第一次迭代的特殊情况。
+  \item 消除循环体内某个分支。
+  \item 让剩余循环满足向量化条件。
+\end{itemize}
+
+例子：
+
+\begin{lstlisting}
+while pointer is not aligned:
+    scalar process one element
+
+vector loop:
+    process aligned chunks
+
+tail:
+    scalar process remaining elements
+\end{lstlisting}
+
+现代 x86 对非对齐 load 的支持已经很好，但跨 cache line、跨 page、老架构或特定指令仍可能受影响。peeling 是否值得，需要结合目标 CPU 和数据分布。
+
+\subsection{Loop Unswitching}
+
+如果循环内有一个条件在整个循环期间不变，unswitching 可以把分支移到循环外：
+
+\begin{lstlisting}[language=C++]
+extern "C" void scale_or_copy(float* y,
+                              const float* x,
+                              float a,
+                              int n,
+                              bool scale)
+{
+    for (int i = 0; i < n; ++i) {
+        if (scale) {
+            y[i] = a * x[i];
+        } else {
+            y[i] = x[i];
+        }
+    }
+}
+\end{lstlisting}
+
+如果 \code{scale} 在循环中不变，可以变成：
+
+\begin{lstlisting}
+if scale:
+    for i:
+        y[i] = a * x[i]
+else:
+    for i:
+        y[i] = x[i]
+\end{lstlisting}
+
+收益是主体循环不再每轮执行分支，向量化器也更容易处理两个独立循环。代价是代码体积增加。对于 AI 算子中的模式分支、是否加 bias、是否 ReLU、是否 mask，这类变换非常常见。生产库通常会手动 dispatch 到不同 kernel，本质上也是把循环内不变分支外提。
+
+\subsection{Loop Interchange}
+
+loop interchange 改变嵌套循环顺序。它直接影响内存局部性。
+
+行主序二维数组：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < rows; ++i) {
+    for (int j = 0; j < cols; ++j) {
+        sum += a[i * cols + j];
+    }
+}
+\end{lstlisting}
+
+内层 \code{j} 连续访问内存，cache line 利用好。如果交换：
+
+\begin{lstlisting}[language=C++]
+for (int j = 0; j < cols; ++j) {
+    for (int i = 0; i < rows; ++i) {
+        sum += a[i * cols + j];
+    }
+}
+\end{lstlisting}
+
+内层 stride 是 \code{cols}，可能每次访问不同 cache line，性能差很多。
+
+编译器做 interchange 需要证明依赖允许交换。如果循环写入和读取之间存在跨迭代依赖，交换可能改变结果。
+
+\subsection{Reduction：特殊的依赖模式}
+
+reduction 是把一组元素归约成一个值：
+
+\begin{lstlisting}
+sum += x[i]
+prod *= x[i]
+max = max(max, x[i])
+count += predicate(x[i])
+\end{lstlisting}
+
+reduction 有 loop-carried dependency，但它有特殊结构。对于整数加法，如果没有溢出语义障碍，编译器可以用多累加器、向量规约、树形归约等方式改变执行顺序。对于浮点加法，顺序改变会改变舍入结果，因此严格 IEEE 语义下编译器更保守。
+
+这就是为什么同一个 \code{sum_f32}：
+
+\begin{lstlisting}[language=bash]
+clang++ -O3 sum.cpp
+clang++ -O3 -ffast-math sum.cpp
+\end{lstlisting}
+
+可能产生完全不同的向量化结果。fast-math 允许编译器放弃某些浮点语义约束，例如重新结合和忽略 NaN/Inf 的一部分严格行为。第 5.6 会具体拆。
+
+\subsection{依赖距离和内存依赖}
+
+循环中读写数组时，优化器还要判断跨迭代内存依赖：
+
+\begin{lstlisting}[language=C++]
+for (int i = 1; i < n; ++i) {
+    a[i] = a[i - 1] + b[i];
+}
+\end{lstlisting}
+
+第 \code{i} 轮读取 \code{a[i-1]}，这个值由第 \code{i-1} 轮写入。存在明确 loop-carried dependency。不能简单并行化或向量化。
+
+另一个例子：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) {
+    a[i] = b[i] + c[i];
+}
+\end{lstlisting}
+
+如果 \code{a}、\code{b}、\code{c} 不 alias，各迭代基本独立，非常适合向量化。但如果它们可能指向重叠内存，编译器可能需要 runtime alias check：
+
+\begin{lstlisting}
+if arrays do not overlap:
+    vector loop
+else:
+    scalar loop
+\end{lstlisting}
+
+这就是很多高性能 C/C++ 接口使用 \code{restrict}、明确 shape、对齐、stride 和 non-overlap contract 的原因。
+
+\subsection{循环优化和机器执行}
+
+循环优化最终要落到 CPU 执行。分析时不要只问“编译器有没有展开”，还要问：
+
+\begin{itemize}
+  \item 展开后是否增加了独立 load？
+  \item 多累加器是否降低了依赖链长度？
+  \item 寄存器是否够用，是否出现 spill？
+  \item 代码体积是否让前端压力变大？
+  \item tail loop 是否成为小规模输入的主要成本？
+  \item 分支预测是否稳定？
+  \item 内存访问是否连续，cache line 是否充分利用？
+\end{itemize}
+
+这也是为什么第 6 章微架构、第 7 章内存和第 8 章 SIMD 要建立在循环优化之后。循环结构决定了硬件看到的指令流和数据流。
+
+\subsection{实验 22.1：手写多累加器}
+
+\begin{labbox}
+目标：观察多累加器如何改变依赖链和汇编。
+
+实现三个版本：
+
+\begin{lstlisting}[language=C++]
+std::int64_t sum1(const std::int32_t* values, std::size_t size);
+std::int64_t sum2(const std::int32_t* values, std::size_t size);
+std::int64_t sum4(const std::int32_t* values, std::size_t size);
+\end{lstlisting}
+
+要求：
+
+\begin{itemize}
+  \item \code{sum1} 使用一个累加器。
+  \item \code{sum2} 使用两个累加器，每轮处理 2 个元素。
+  \item \code{sum4} 使用四个累加器，每轮处理 4 个元素。
+  \item 每个版本都处理 tail。
+  \item 所有版本返回相同结果。
+\end{itemize}
+
+任务：
+
+\begin{enumerate}
+  \item 生成 \code{-O3 -fno-vectorize -fno-slp-vectorize} 汇编。
+  \item 标注每个版本的累加依赖链。
+  \item benchmark 不同 \code{size}。
+  \item 用 \code{perf stat} 记录 cycles、instructions、IPC。
+  \item 判断性能差异来自依赖链、分支、load 还是其他因素。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 22.2：观察 unroll 和 tail}
+
+\begin{labbox}
+目标：理解展开后的主体循环和尾部循环。
+
+使用同一个 \code{sum_i32}，分别生成：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -S -emit-llvm sum.cpp -o sum_O3.ll
+clang++ -std=c++20 -O3 -fno-unroll-loops -S -emit-llvm sum.cpp -o sum_no_unroll.ll
+clang++ -std=c++20 -O3 -funroll-loops -S -emit-llvm sum.cpp -o sum_unroll.ll
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 比较三个 IR 文件里的循环数量。
+  \item 找主体循环每轮处理多少元素。
+  \item 找 remainder 或 tail 路径。
+  \item 对小 \code{n} 和大 \code{n} 分别 benchmark。
+  \item 写出展开对小规模和大规模输入的不同影响。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 22.3：循环顺序和 cache}
+
+\begin{labbox}
+目标：亲自测量 loop interchange 对局部性的影响。
+
+准备一个行主序矩阵 \code{std::vector<float> a(rows * cols)}，实现：
+
+\begin{lstlisting}[language=C++]
+float sum_row_major(const float* a, int rows, int cols);
+float sum_col_major(const float* a, int rows, int cols);
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 固定总元素数，改变 \code{rows/cols} 组合。
+  \item 记录两种循环顺序的运行时间。
+  \item 用 \code{perf stat} 记录 cache miss 相关事件。
+  \item 解释 stride 如何影响 cache line 利用。
+  \item 画出地址访问序列。
+\end{enumerate}
+
+报告要求：不能只写“行优先更快”，必须结合地址、cache line 和测量证据解释。
+\end{labbox}
+
+\subsection{本节作业}
+
+\begin{exercisebox}
+作业 22.A：循环结构标注
+
+给一个优化后 IR 中的循环，标出：
+
+\begin{itemize}
+  \item header。
+  \item latch。
+  \item preheader。
+  \item exit。
+  \item induction variable。
+  \item trip count 判断。
+  \item reduction \code{phi}。
+\end{itemize}
+
+要求：每个标注都要说明对应哪一行 IR。
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 22.B：依赖分类
+
+判断下面循环是否存在 loop-carried dependency，并说明是否容易向量化：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) a[i] = b[i] + c[i];
+for (int i = 1; i < n; ++i) a[i] = a[i - 1] + b[i];
+for (int i = 0; i < n; ++i) sum += a[i];
+for (int i = 0; i < n; ++i) a[index[i]] += b[i];
+\end{lstlisting}
+
+要求：区分标量依赖、内存依赖和归约模式。
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 22.C：循环优化报告
+
+选择一个真实小 kernel，例如 \code{dot}、\code{saxpy}、\code{relu} 或二维矩阵求和。写一份循环优化报告：
+
+\begin{enumerate}
+  \item baseline 源码。
+  \item 优化前 IR 和汇编摘要。
+  \item 你认为的瓶颈。
+  \item 你做的循环变换。
+  \item 正确性验证。
+  \item benchmark 数据。
+  \item PMU 证据。
+  \item 为什么这个优化有效或无效。
+\end{enumerate}
+\end{exercisebox}
+
+\subsection{本节总结}
+
+循环优化把前面学到的 SSA、CFG、DCE、LICM、alias 和机器执行全部连起来。一个循环是否好优化，取决于控制流是否简单、trip count 是否可知、依赖是否可证明、内存访问是否规律、浮点语义是否允许重排、目标 CPU 是否能利用暴露出的并行性。
+
+下一节进入自动向量化。向量化不是凭空发生的，它通常需要一个已经被标量优化整理好的循环：清晰的 induction variable、可证明的连续访问、可处理的归约、可接受的 alias 关系和明确的尾部策略。

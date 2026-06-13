@@ -1,9 +1,492 @@
-\plannedchapter{Alias、未定义行为和浮点语义}
-{本章讲 C/C++ 语义如何给优化器提供假设，也如何让错误代码产生不可预测结果。}
-{\item undefined behavior 为什么会改变汇编？
-\item strict aliasing 如何影响 load/store 重排？
-\item fast-math 到底放弃了哪些语义？}
-{\item signed overflow、out-of-bounds、uninitialized read。
-\item alias analysis、restrict、TBAA。
-\item IEEE 浮点、NaN、Inf、reassociation、FMA contraction。}
-{写 UB 示例，比较 \code{-O0/-O3}；写 fast-math 前后 reduction 结果和汇编差异。}
+\section{Alias、未定义行为和浮点语义}
+
+\subsection{本节要解决的问题}
+
+很多性能优化争论最后都会回到同一个问题：编译器到底可以假设什么？如果优化器能假设两个指针不重叠，它就可以重排 load/store、向量化循环、把 load 移到循环外。如果优化器能假设有符号整数不溢出，它就可以做代数化简。如果优化器能假设浮点加法可以重新结合，它就可以做向量规约和 FMA contraction。
+
+反过来，如果这些假设不成立，程序可能不是“慢一点”，而是进入未定义行为、得到不同数值结果，或者在不同编译器/优化等级下表现完全不同。
+
+本节要讲清楚：
+
+\begin{itemize}
+  \item alias 是什么，为什么它限制优化。
+  \item strict aliasing、TBAA、\code{restrict} 分别解决什么问题。
+  \item C/C++ 未定义行为为什么会改变汇编。
+  \item signed overflow、越界、未初始化读取为什么不是“小错误”。
+  \item 浮点严格语义和 fast-math 的差别。
+  \item 高性能代码如何在性能和语义契约之间做工程选择。
+\end{itemize}
+
+\begin{keyidea}
+优化器不是根据“通常会怎样”优化，而是根据语言规则和 IR 属性允许它假设什么。高性能 C++ 的关键能力之一，就是写出既正确又能给优化器足够事实的代码：non-alias、alignment、bounds、no UB、可接受的浮点误差，都要成为明确契约。
+\end{keyidea}
+
+\subsection{alias：两个名字是否指向同一片内存}
+
+alias 的意思是：两个指针、引用或内存表达式可能访问同一片存储。
+
+例子：
+
+\begin{lstlisting}[language=C++]
+extern "C" void add_store(int* p, int* q)
+{
+    *p = *p + 1;
+    *q = *q + 1;
+}
+\end{lstlisting}
+
+如果 \code{p == q}，这段代码和 \code{p != q} 的行为不同。优化器不能随便假设它们不重叠。
+
+更典型的数组循环：
+
+\begin{lstlisting}[language=C++]
+extern "C" void add_arrays(float* out,
+                           const float* a,
+                           const float* b,
+                           int n)
+{
+    for (int i = 0; i < n; ++i) {
+        out[i] = a[i] + b[i];
+    }
+}
+\end{lstlisting}
+
+如果 \code{out} 和 \code{a} 或 \code{b} 部分重叠，向量化、展开和重排都可能改变读写顺序。编译器要么保守，要么生成 runtime check，要么依赖更强的接口契约。
+
+\subsection{\code{const} 不是 noalias}
+
+很多初学者误以为 \code{const float* x} 表示 \code{x} 不会被其他指针修改。不是这样。
+
+\begin{lstlisting}[language=C++]
+extern "C" void example(float* y, const float* x)
+{
+    y[0] = 1.0f;
+    float v = x[0];
+}
+\end{lstlisting}
+
+\code{x} 是 \code{const float*} 只表示不能通过 \code{x} 写入 \code{x[0]}。但 \code{y} 仍然可能和 \code{x} 指向同一地址。如果 \code{y == x}，\code{y[0] = 1.0f} 会改变后面 \code{x[0]} 读到的值。
+
+因此，\code{const} 是类型接口约束，不是 alias 证明。
+
+\subsection{\code{restrict}：non-overlap 契约}
+
+C 有标准 \code{restrict}，C++ 没有完全标准化的同名关键字，但 GCC/Clang 支持 \code{__restrict} 或 \code{__restrict__} 扩展。
+
+\begin{lstlisting}[language=C++]
+extern "C" void add_arrays_restrict(float* __restrict out,
+                                    const float* __restrict a,
+                                    const float* __restrict b,
+                                    int n)
+{
+    for (int i = 0; i < n; ++i) {
+        out[i] = a[i] + b[i];
+    }
+}
+\end{lstlisting}
+
+这告诉编译器：在该指针的有效访问范围内，不会有其他 restrict 指针访问同一对象。它是强契约，不是优化建议。如果调用者违反契约，行为不再可靠。
+
+对高性能 kernel，\code{restrict} 可以显著减少 runtime alias check，帮助向量化和 load/store 重排。但它也把责任从编译器转移给接口设计和调用者。
+
+\subsection{TBAA：基于类型的别名分析}
+
+strict aliasing 允许编译器根据类型判断某些指针不应该指向同一对象。例如 \code{int*} 和 \code{float*} 通常不能随便指向同一个对象并通过不同类型访问它。
+
+LLVM IR 中常见 TBAA metadata：
+
+\begin{lstlisting}
+%v = load float, ptr %p, align 4, !tbaa !5
+store i32 %x, ptr %q, align 4, !tbaa !9
+\end{lstlisting}
+
+TBAA 告诉优化器某些访问属于不同类型树，从而辅助 alias analysis。
+
+但 C++ 有例外，例如 \code{char}、\code{std::byte} 可以用于查看对象表示。还有 union、placement new、生命周期、类型擦除等复杂问题。性能代码中不要用违反 strict aliasing 的技巧做“类型重解释”。应使用明确、安全的机制，例如 \code{std::bit_cast} 做值表示转换，或用 \code{std::memcpy} 表达字节复制。
+
+\begin{warningbox}
+违反 strict aliasing 的代码经常在 \code{-O0} 下看起来正常，在 \code{-O3} 下突然出错。原因不是编译器“坏”，而是程序给了优化器错误契约。
+\end{warningbox}
+
+\subsection{未定义行为不是运行时异常}
+
+Undefined Behavior 的意思不是“程序会抛异常”或“结果随机”。它的意思是：一旦程序执行到这种行为，语言标准不再对程序行为作保证；编译器可以假设这种情况不会发生，并基于这个假设优化。
+
+常见 UB：
+
+\begin{itemize}
+  \item 有符号整数溢出。
+  \item 数组越界访问。
+  \item 解引用空指针。
+  \item 使用未初始化的自动变量。
+  \item 违反对象生命周期规则。
+  \item 违反 strict aliasing。
+  \item 数据竞争。
+\end{itemize}
+
+性能优化中最常见的是 signed overflow 和 out-of-bounds。
+
+\subsection{signed overflow 如何改变优化}
+
+例子：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool greater_after_add(int x)
+{
+    return x + 1 > x;
+}
+\end{lstlisting}
+
+数学整数上，这总为真。但机器上的 32 位补码如果 \code{x == INT_MAX}，\code{x + 1} 会 wrap 到 \code{INT_MIN}。C++ 规定有符号整数溢出是 UB，因此编译器可以假设 \code{x + 1} 不溢出，于是返回 true。
+
+IR 中你可能看到：
+
+\begin{lstlisting}
+%add = add nsw i32 %x, 1
+ret i1 true
+\end{lstlisting}
+
+\code{nsw} 就是 no signed wrap。它告诉优化器：产生 signed overflow 的路径不需要保持定义良好的行为。
+
+如果你需要明确 wrap 语义，应使用无符号整数，或使用编译器提供的 checked arithmetic：
+
+\begin{lstlisting}[language=C++]
+std::uint32_t y = x + 1;       // modulo arithmetic
+
+int out = 0;
+bool overflow = __builtin_add_overflow(a, b, &out);
+\end{lstlisting}
+
+\subsection{越界访问和优化}
+
+数组越界不仅可能读错数据，还会给优化器错误前提。
+
+\begin{lstlisting}[language=C++]
+extern "C" int first_or_zero(const int* p, int n)
+{
+    if (n <= 0) {
+        return 0;
+    }
+    return p[n - 1];
+}
+\end{lstlisting}
+
+这里有边界保护，较安全。反过来：
+
+\begin{lstlisting}[language=C++]
+extern "C" int unsafe(const int* p, int n)
+{
+    int x = p[n - 1];
+    if (n <= 0) {
+        return 0;
+    }
+    return x;
+}
+\end{lstlisting}
+
+当 \code{n <= 0} 时，前面的 \code{p[n-1]} 已经越界，程序进入 UB。优化器可能根据“程序不会越界”推导 \code{n > 0}，从而重排或删除后续判断。不要把 UB 当成“反正这条路径不会用结果”。
+
+\subsection{未初始化读取}
+
+未初始化局部变量读取也是 UB：
+
+\begin{lstlisting}[language=C++]
+extern "C" int maybe_uninit(bool flag)
+{
+    int x;
+    if (flag) {
+        x = 42;
+    }
+    return x;
+}
+\end{lstlisting}
+
+如果 \code{flag == false}，读取 \code{x} 未定义。优化器可能生成你意想不到的代码。性能代码中为了“省初始化”留下未初始化路径非常危险。正确做法是：
+
+\begin{itemize}
+  \item 明确所有路径都赋值。
+  \item 使用工具检查，例如 UBSan、MSan。
+  \item 在热路径中用结构保证初始化，而不是依赖注释。
+\end{itemize}
+
+\subsection{浮点语义：不是普通实数代数}
+
+浮点数不是数学实数。IEEE 浮点有：
+
+\begin{itemize}
+  \item 舍入。
+  \item NaN。
+  \item 正负 Inf。
+  \item 正零和负零。
+  \item subnormal。
+  \item 异常标志和环境。
+\end{itemize}
+
+因此：
+
+\begin{lstlisting}
+(a + b) + c
+a + (b + c)
+\end{lstlisting}
+
+在浮点里不一定相等。优化器在严格浮点语义下不能随便重新结合。dot product、sum、mean、variance、softmax 都会受影响。
+
+\subsection{fast-math 到底放弃了什么}
+
+\code{-ffast-math} 通常不是一个单一假设，而是一组假设的集合。不同编译器细节不同，但常见含义包括：
+
+\begin{itemize}
+  \item 允许重新结合浮点表达式。
+  \item 假设没有 NaN 或 Inf，或不严格保留相关行为。
+  \item 忽略有符号零差异。
+  \item 允许 reciprocal 近似。
+  \item 允许 FMA contraction。
+  \item 不严格维护浮点异常和环境。
+\end{itemize}
+
+例子：
+
+\begin{lstlisting}[language=C++]
+sum += a[i] * b[i];
+\end{lstlisting}
+
+严格语义下，编译器可能必须保留逐次累加顺序。fast-math 下，编译器可以用向量 FMA 形成多条累加链，最后水平归约。
+
+\begin{lstlisting}
+strict:
+    scalar order, predictable language-level accumulation order
+
+fast-math:
+    vector lanes accumulate independently
+    horizontal reduction changes order
+    FMA may change rounding
+\end{lstlisting}
+
+AI 推理通常更关心吞吐和可接受误差，fast-math 或等价局部假设经常可用。但训练、科学计算、金融、几何鲁棒性和测试基准可能要求更严格语义。工程上必须写清楚误差标准。
+
+\subsection{FMA contraction}
+
+FMA 把乘法和加法融合成一次舍入：
+
+\begin{lstlisting}
+a * b + c
+    -> fma(a, b, c)
+\end{lstlisting}
+
+性能上，FMA 通常吞吐好；数值上，它和先乘后加不一定完全一样，因为舍入次数不同。编译器是否自动收缩，取决于选项和语义：
+
+\begin{lstlisting}[language=bash]
+clang++ -O3 -ffp-contract=off
+clang++ -O3 -ffp-contract=fast
+clang++ -O3 -ffast-math
+\end{lstlisting}
+
+在 GEMM、dot、convolution 中，FMA 是核心性能来源。你需要同时理解它的性能价值和数值差异。
+
+\subsection{高性能接口的契约设计}
+
+性能 kernel 不应该只写函数签名，还要写清楚契约。例如：
+
+\begin{lstlisting}[language=C++]
+// Contract:
+// - out, a, b point to at least n valid float elements.
+// - out, a, b do not overlap.
+// - pointers are at least 32-byte aligned.
+// - n >= 0.
+// - NaN/Inf behavior follows the selected math mode.
+extern "C" void add_kernel(float* __restrict out,
+                           const float* __restrict a,
+                           const float* __restrict b,
+                           int n);
+\end{lstlisting}
+
+对应实现和测试必须验证或约束这些条件：
+
+\begin{itemize}
+  \item debug 版本加断言。
+  \item benchmark 生成满足契约的数据。
+  \item 文档写明 alias/alignment/size。
+  \item 对外 API 不轻易暴露危险假设。
+  \item 内部 hot kernel 可以有更强 precondition。
+\end{itemize}
+
+生产库常见做法是外层安全 API 做检查和 dispatch，内层 microkernel 假设输入满足严格契约。这是性能和安全之间的工程分层。
+
+\subsection{Sanitizer：找 UB 的工程工具}
+
+学习阶段要养成用 sanitizer 验证性能代码的习惯：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O1 -g -fsanitize=undefined,address \
+  test.cpp -o test_asan_ubsan
+
+./test_asan_ubsan
+\end{lstlisting}
+
+常用工具：
+
+\begin{itemize}
+  \item ASan：越界、use-after-free 等内存错误。
+  \item UBSan：signed overflow、非法 shift、空指针等 UB。
+  \item MSan：未初始化读取。
+  \item TSan：数据竞争。
+\end{itemize}
+
+注意 sanitizer 会改变性能，不能用于最终 benchmark。但它非常适合 correctness 和契约验证。
+
+\subsection{实验 24.1：signed overflow 改变汇编}
+
+\begin{labbox}
+目标：观察 signed overflow 假设如何影响优化。
+
+写：
+
+\begin{lstlisting}[language=C++]
+#include <climits>
+
+extern "C" bool greater_after_add(int x)
+{
+    return x + 1 > x;
+}
+
+extern "C" bool greater_after_add_unsigned(unsigned x)
+{
+    return x + 1 > x;
+}
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 生成 \code{-O0}、\code{-O3} IR。
+  \item 比较 signed 和 unsigned 版本。
+  \item 找 \code{nsw} 或相关优化痕迹。
+  \item 生成汇编，观察 signed 版本是否直接返回 true。
+  \item 用 UBSan 运行 \code{greater_after_add(INT_MAX)}。
+\end{enumerate}
+
+报告要求：解释为什么 signed 版本和 unsigned 版本语义不同。
+\end{labbox}
+
+\subsection{实验 24.2：strict aliasing}
+
+\begin{labbox}
+目标：理解错误类型重解释为什么危险。
+
+准备一个违反 alias 规则的例子，并和安全写法对比：
+
+\begin{lstlisting}[language=C++]
+#include <bit>
+#include <cstdint>
+#include <cstring>
+
+float unsafe_bits_to_float(std::uint32_t bits)
+{
+    return *reinterpret_cast<float*>(&bits);
+}
+
+float safe_bits_to_float(std::uint32_t bits)
+{
+    return std::bit_cast<float>(bits);
+}
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 使用 \code{-O3 -Wall -Wstrict-aliasing} 编译。
+  \item 生成 IR，查看 load 的 TBAA metadata。
+  \item 用不同优化等级运行测试。
+  \item 用 \code{std::memcpy} 再写一个安全版本。
+  \item 总结什么时候应使用 \code{bit_cast}、什么时候用 \code{memcpy}。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 24.3：fast-math 误差和性能}
+
+\begin{labbox}
+目标：把 fast-math 的性能收益和数值风险同时量化。
+
+实现 \code{dot_f32}，生成三种版本：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -march=native dot.cpp -o dot_strict
+clang++ -std=c++20 -O3 -march=native -ffp-contract=fast dot.cpp -o dot_fma
+clang++ -std=c++20 -O3 -march=native -ffast-math dot.cpp -o dot_fast
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 比较三种版本的汇编。
+  \item 记录是否使用 FMA、是否向量化。
+  \item 使用随机数据、极大极小混合数据、包含 NaN/Inf 的数据测试结果差异。
+  \item benchmark 大小为 \code{1K}、\code{1M}、\code{64M} 的输入。
+  \item 写出你能接受 fast-math 的条件。
+\end{enumerate}
+
+交付物必须包含误差表和性能表，不能只给结论。
+\end{labbox}
+
+\subsection{本节作业}
+
+\begin{exercisebox}
+作业 24.A：契约审计
+
+选择一个你前面写过的 kernel，例如 \code{saxpy}、\code{dot} 或 \code{relu}。写一份契约审计：
+
+\begin{itemize}
+  \item 输入指针是否允许为空？
+  \item size 是否允许为 0？
+  \item 指针是否允许重叠？
+  \item 是否要求对齐？
+  \item 是否可能越界？
+  \item 是否有 signed overflow 风险？
+  \item 浮点 NaN/Inf/负零如何处理？
+  \item fast-math 是否可接受？
+\end{itemize}
+
+要求：把每条契约落实到代码、断言、测试或文档。
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 24.B：UB 示例报告
+
+构造三个 UB 示例：
+
+\begin{enumerate}
+  \item signed overflow。
+  \item out-of-bounds。
+  \item uninitialized read。
+\end{enumerate}
+
+对每个示例：
+
+\begin{itemize}
+  \item 运行 \code{-O0} 和 \code{-O3}。
+  \item 生成 IR 和汇编。
+  \item 用 sanitizer 检测。
+  \item 写明为什么不能依赖 \code{-O0} 的表现判断程序正确。
+\end{itemize}
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 24.C：浮点策略说明书
+
+为 AI CPU 算子项目写一页浮点策略说明：
+
+\begin{itemize}
+  \item 哪些 kernel 允许 fast-math。
+  \item 哪些 kernel 只允许 FMA contraction。
+  \item 哪些 kernel 必须严格保持顺序。
+  \item 误差用绝对误差、相对误差还是 ULP 衡量。
+  \item 如何构造极端输入测试。
+  \item benchmark 报告中如何记录浮点编译参数。
+\end{itemize}
+\end{exercisebox}
+
+\subsection{本节总结}
+
+Alias、UB 和浮点语义决定了优化器的边界。你给出的契约越清楚，编译器越能做强优化；契约越模糊，编译器越保守；契约错误，程序就可能在高优化等级下崩塌。性能工程不是绕开语言规则，而是在规则内给优化器足够明确、真实、可验证的信息。
+
+至此，第 5 章建立了从编译器流水线到 IR、SSA、标量优化、循环优化、自动向量化和语义契约的完整主线。后面进入现代 CPU 微架构时，我们会继续把这些 IR 和汇编变化映射到前端、后端、端口、延迟、吞吐、cache 和 TLB。

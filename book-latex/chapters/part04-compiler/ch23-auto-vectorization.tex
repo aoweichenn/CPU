@@ -1,9 +1,521 @@
-\plannedchapter{自动向量化}
-{本章讲编译器把 scalar loop 改写为 SIMD loop 的条件、失败原因和报告阅读。}
-{\item legal 和 profitable 分别是什么意思？
-\item alias、alignment、trip count 如何影响向量化？
-\item 如何读 Clang/GCC vectorization report？}
-{\item loop vectorizer、SLP vectorizer。
-\item runtime alias check、remainder loop。
-\item fast-math、reduction vectorization。}
-{对 SAXPY、dot、ReLU 输出向量化报告，修改源码帮助或阻碍向量化。}
+\section{自动向量化}
+
+\subsection{本节要解决的问题}
+
+SIMD 是 CPU 高性能计算的关键能力之一。手写 AVX2/AVX-512 intrinsic 很重要，但在进入手写 SIMD 之前，必须先理解编译器自动向量化。原因很简单：很多循环本来就能被编译器向量化；很多不能向量化的循环，失败原因会告诉你手写 SIMD 也会遇到什么语义障碍。
+
+本节要讲清楚：
+
+\begin{itemize}
+  \item 编译器把 scalar loop 改写成 SIMD loop 的基本过程。
+  \item loop vectorizer 和 SLP vectorizer 的区别。
+  \item legal 和 profitable 分别是什么意思。
+  \item alias、alignment、trip count、reduction、fast-math 如何影响向量化。
+  \item 如何读 Clang/GCC 的向量化报告。
+  \item 如何写代码帮助编译器向量化，而不是盲目依赖它。
+\end{itemize}
+
+\begin{keyidea}
+自动向量化有两道门：legal 和 profitable。legal 问的是“这样改写是否保持程序语义”；profitable 问的是“这样改写是否值得”。一个循环没有向量化，不一定是编译器弱，也可能是语言语义、别名、浮点、尾部成本、目标 CPU 或成本模型给出的合理结论。
+\end{keyidea}
+
+\subsection{从 scalar loop 到 vector loop}
+
+标量循环：
+
+\begin{lstlisting}[language=C++]
+extern "C" void add_f32(float* out,
+                        const float* a,
+                        const float* b,
+                        int n)
+{
+    for (int i = 0; i < n; ++i) {
+        out[i] = a[i] + b[i];
+    }
+}
+\end{lstlisting}
+
+向量化后的概念结构：
+
+\begin{lstlisting}
+main vector loop:
+    load vector a[i : i+VF-1]
+    load vector b[i : i+VF-1]
+    add vector
+    store vector out[i : i+VF-1]
+    i += VF
+
+remainder loop:
+    handle n % VF elements
+\end{lstlisting}
+
+其中 VF 是 vectorization factor，也就是每个向量处理多少个元素。对于 AVX2：
+
+\begin{lstlisting}
+float:
+    256-bit vector / 32-bit element = 8 lanes
+
+int32:
+    256-bit vector / 32-bit element = 8 lanes
+
+double:
+    256-bit vector / 64-bit element = 4 lanes
+\end{lstlisting}
+
+如果使用 AVX-512，VF 通常更大，但尾部处理、频率、寄存器压力和平台差异也更复杂。后面 SIMD 卷会专门讲。
+
+\subsection{Loop Vectorizer 和 SLP Vectorizer}
+
+LLVM 中常见两类向量化：
+
+\begin{center}
+\begin{tabular}{L{0.26\linewidth}L{0.58\linewidth}}
+\toprule
+类型 & 直觉 \\
+\midrule
+Loop Vectorizer & 把循环的多次迭代合并成一次向量迭代。 \\
+SLP Vectorizer & 在同一 basic block 中把相似的独立标量操作打包成向量。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+loop vectorizer 处理：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) {
+    out[i] = a[i] + b[i];
+}
+\end{lstlisting}
+
+SLP 处理：
+
+\begin{lstlisting}[language=C++]
+float x0 = a0 + b0;
+float x1 = a1 + b1;
+float x2 = a2 + b2;
+float x3 = a3 + b3;
+\end{lstlisting}
+
+在 HPC 和 AI 算子中，两者都会出现。循环向量化负责长数组、矩阵行、连续元素；SLP 常出现在小固定大小向量、展开后的循环体、结构体字段并行计算中。
+
+\subsection{legal：语义上能不能改}
+
+编译器首先要证明向量化合法。常见问题：
+
+\begin{itemize}
+  \item 不同迭代之间是否独立？
+  \item load/store 是否可能互相 alias？
+  \item 是否存在 loop-carried dependency？
+  \item 浮点运算是否允许改变结合顺序？
+  \item 循环内调用是否可向量化或可安全移动？
+  \item 异常、越界、未定义行为和内存访问是否可处理？
+\end{itemize}
+
+容易向量化：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) {
+    out[i] = a[i] + b[i];
+}
+\end{lstlisting}
+
+明显不容易：
+
+\begin{lstlisting}[language=C++]
+for (int i = 1; i < n; ++i) {
+    a[i] = a[i - 1] + b[i];
+}
+\end{lstlisting}
+
+第二个循环有跨迭代依赖。第 \code{i} 轮写的 \code{a[i]} 会被第 \code{i+1} 轮读取。不能简单把多轮同时执行。
+
+\subsection{profitable：值得不值得改}
+
+合法不等于值得。成本模型还要判断：
+
+\begin{itemize}
+  \item 向量指令是否比标量指令吞吐更好。
+  \item 需要多少 shuffle、permute、gather、scatter。
+  \item 是否需要 runtime alias check。
+  \item remainder loop 成本是否太高。
+  \item 循环 trip count 是否太小。
+  \item 向量化是否增加寄存器压力。
+  \item 目标 CPU 上宽向量是否影响频率。
+\end{itemize}
+
+例如带 gather 的间接访问：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) {
+    out[i] = table[index[i]];
+}
+\end{lstlisting}
+
+理论上可以用 gather，但如果目标 CPU 上 gather 很慢，或者访问模式随机导致 cache miss，向量化不一定划算。
+
+\subsection{alias 和 runtime check}
+
+看 SAXPY：
+
+\begin{lstlisting}[language=C++]
+extern "C" void saxpy(float* y,
+                      const float* x,
+                      float a,
+                      int n)
+{
+    for (int i = 0; i < n; ++i) {
+        y[i] = a * x[i] + y[i];
+    }
+}
+\end{lstlisting}
+
+如果 \code{x} 和 \code{y} 重叠，向量化可能改变语义吗？某些重叠关系下，先读一批 \code{x} 再写一批 \code{y}，可能和标量逐个处理不同。编译器有几种选择：
+
+\begin{itemize}
+  \item 拒绝向量化。
+  \item 生成 runtime alias check，不重叠时走向量路径，可能重叠时走标量路径。
+  \item 依赖 \code{restrict}、函数属性或更强接口约定证明不重叠。
+\end{itemize}
+
+概念结构：
+
+\begin{lstlisting}
+if no_overlap(x, y, n):
+    vectorized saxpy
+else:
+    scalar saxpy
+\end{lstlisting}
+
+这就是优化报告里经常看到 runtime checks 的原因。它不是“多余代码”，而是编译器为了在保持语义的同时获得快速路径。
+
+\subsection{alignment}
+
+对齐影响 load/store 成本和可选指令。现代 x86 支持非对齐向量 load/store，但对齐仍可能影响：
+
+\begin{itemize}
+  \item 是否跨 cache line。
+  \item 是否跨 page。
+  \item 某些老指令或平台上的异常/性能。
+  \item 编译器选择 aligned 还是 unaligned 指令。
+  \item 循环 peeling 是否有收益。
+\end{itemize}
+
+C++ 层可用的表达方式包括：
+
+\begin{lstlisting}[language=C++]
+auto* aligned = static_cast<float*>(
+    __builtin_assume_aligned(ptr, 32));
+\end{lstlisting}
+
+但这类假设必须真实。如果指针没有按 32 字节对齐，你告诉编译器它对齐了，程序可能产生错误或崩溃。优化假设不是注释，是契约。
+
+\subsection{trip count、VF 和 remainder}
+
+如果 \code{n} 不是 VF 的整数倍，向量循环处理主体，剩余元素交给 tail：
+
+\begin{lstlisting}
+vector loop:
+    i = 0
+    while i + VF <= n:
+        process VF elements
+        i += VF
+
+scalar tail:
+    while i < n:
+        process 1 element
+        i += 1
+\end{lstlisting}
+
+AVX-512 有 mask，可以用 masked operations 处理尾部；AVX2 通常使用标量 tail 或较小向量 tail。不同策略影响小 \code{n} 性能。
+
+如果 trip count 很小，向量化前的准备、检查和 tail 成本可能超过收益。生产算子常常为不同 size 做多版本 dispatch：
+
+\begin{lstlisting}
+if n < small_threshold:
+    scalar or small-kernel path
+else:
+    vectorized path
+\end{lstlisting}
+
+\subsection{浮点 reduction 和 fast-math}
+
+浮点规约是自动向量化的经典难题：
+
+\begin{lstlisting}[language=C++]
+extern "C" float sum_f32(const float* values, int n)
+{
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += values[i];
+    }
+    return sum;
+}
+\end{lstlisting}
+
+标量顺序：
+
+\begin{lstlisting}
+(((v0 + v1) + v2) + v3) + ...
+\end{lstlisting}
+
+向量归约可能变成：
+
+\begin{lstlisting}
+(v0 + v4 + v8 + ...)
+(v1 + v5 + v9 + ...)
+(v2 + v6 + v10 + ...)
+(v3 + v7 + v11 + ...)
+horizontal add at end
+\end{lstlisting}
+
+加法顺序变了，浮点舍入结果可能不同。严格语义下编译器可能拒绝向量化，或者只做非常保守的转换。启用 \code{-ffast-math}、\code{-fassociative-math} 等选项后，编译器获得重新结合浮点表达式的自由，可能向量化。
+
+\begin{warningbox}
+fast-math 不是“让浮点更快”的普通开关，而是改变语义契约。它可能影响 NaN、Inf、有符号零、舍入、异常、结合律和 FMA contraction。AI 推理中很多场景可以接受近似差异，但数值代码必须明确误差预算。
+\end{warningbox}
+
+\subsection{向量化报告}
+
+Clang 常用：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -march=native \
+  -Rpass=loop-vectorize \
+  -Rpass-missed=loop-vectorize \
+  -Rpass-analysis=loop-vectorize \
+  kernel.cpp -c -o kernel.o
+\end{lstlisting}
+
+GCC 常用：
+
+\begin{lstlisting}[language=bash]
+g++ -std=c++20 -O3 -march=native \
+  -fopt-info-vec \
+  -fopt-info-vec-missed \
+  kernel.cpp -c -o kernel.o
+\end{lstlisting}
+
+报告常见信息：
+
+\begin{itemize}
+  \item loop vectorized，VF 是多少，interleave count 是多少。
+  \item missed：cannot identify array bounds。
+  \item missed：unsafe dependent memory operations。
+  \item missed：value that could not be identified as reduction。
+  \item analysis：runtime pointer checks needed。
+  \item analysis：cost model indicates vectorization is not beneficial。
+\end{itemize}
+
+读报告时要和 IR/汇编对照。报告说 vectorized，不代表最终汇编一定是你期待的 AVX2/FMA；报告说 missed，也不代表没有任何其他优化。
+
+\subsection{帮助编译器向量化的代码风格}
+
+通常更容易向量化的代码：
+
+\begin{itemize}
+  \item 简单 counted loop。
+  \item 连续数组访问。
+  \item 清楚的边界和正向步长。
+  \item 尽量少的循环内分支。
+  \item 函数调用可内联或可向量化。
+  \item 明确 non-overlap 契约。
+  \item 明确对齐和 size。
+  \item reduction 形态清晰。
+\end{itemize}
+
+容易失败的代码：
+
+\begin{itemize}
+  \item 复杂 while 条件。
+  \item 间接索引和随机访问。
+  \item 指针之间可能 alias。
+  \item 循环内不透明调用。
+  \item 复杂控制流和 early exit。
+  \item 浮点严格语义下的规约。
+  \item 数据结构是 AoS 且字段访问跨 stride。
+\end{itemize}
+
+这并不意味着你要为了编译器牺牲所有抽象。正确策略是：热路径 kernel 边界明确，内部循环写得让编译器和人都容易分析；外层保持良好工程结构。
+
+\subsection{实验 23.1：SAXPY 向量化报告}
+
+\begin{labbox}
+目标：读懂一个真实的向量化报告。
+
+实现两个版本：
+
+\begin{lstlisting}[language=C++]
+extern "C" void saxpy_plain(float* y,
+                            const float* x,
+                            float a,
+                            int n);
+
+extern "C" void saxpy_restrict(float* __restrict y,
+                               const float* __restrict x,
+                               float a,
+                               int n);
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 使用 Clang 生成向量化报告。
+  \item 比较 plain 和 restrict 报告差异。
+  \item 生成 \code{-O3 -march=native} 汇编。
+  \item 找是否有 runtime alias check。
+  \item benchmark 两个版本。
+  \item 解释 restrict 是否改变性能，以及为什么。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 优化报告原文摘录。
+  \item 汇编中向量 load、FMA 或 multiply/add 的位置。
+  \item 一张性能表。
+  \item 一段说明：alias 信息如何影响向量化。
+\end{itemize}
+\end{labbox}
+
+\subsection{实验 23.2：dot product 和 fast-math}
+
+\begin{labbox}
+目标：观察浮点规约在严格语义和 fast-math 下的差异。
+
+实现：
+
+\begin{lstlisting}[language=C++]
+extern "C" float dot_f32(const float* a,
+                         const float* b,
+                         int n)
+{
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        sum += a[i] * b[i];
+    }
+    return sum;
+}
+\end{lstlisting}
+
+分别编译：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -march=native \
+  -Rpass=loop-vectorize \
+  -Rpass-missed=loop-vectorize \
+  dot.cpp -c -o dot_strict.o
+
+clang++ -std=c++20 -O3 -march=native -ffast-math \
+  -Rpass=loop-vectorize \
+  -Rpass-missed=loop-vectorize \
+  dot.cpp -c -o dot_fast.o
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 记录两次向量化报告。
+  \item 比较汇编是否出现向量 FMA。
+  \item 用随机输入比较结果误差。
+  \item 用特殊输入测试 NaN、Inf、非常大/非常小数。
+  \item 写出 fast-math 的收益和语义代价。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 23.3：ReLU 的分支和向量化}
+
+\begin{labbox}
+目标：观察简单分支如何被向量化成 compare/select/max。
+
+实现两个版本：
+
+\begin{lstlisting}[language=C++]
+extern "C" void relu_branch(float* out,
+                            const float* x,
+                            int n)
+{
+    for (int i = 0; i < n; ++i) {
+        out[i] = x[i] > 0.0f ? x[i] : 0.0f;
+    }
+}
+
+extern "C" void relu_max(float* out,
+                         const float* x,
+                         int n)
+{
+    for (int i = 0; i < n; ++i) {
+        out[i] = __builtin_fmaxf(x[i], 0.0f);
+    }
+}
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 生成向量化报告。
+  \item 比较两种写法的 IR。
+  \item 比较汇编中是 branch、compare/select 还是 max。
+  \item 测量不同正负数分布下的性能。
+  \item 解释分支预测和 SIMD select 的关系。
+\end{enumerate}
+\end{labbox}
+
+\subsection{本节作业}
+
+\begin{exercisebox}
+作业 23.A：legal/profitable 分类
+
+对下面循环判断向量化障碍，并区分 legal 和 profitable：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) out[i] = a[i] + b[i];
+for (int i = 1; i < n; ++i) a[i] = a[i - 1] + b[i];
+for (int i = 0; i < n; ++i) out[i] = table[index[i]];
+for (int i = 0; i < n; ++i) sum += x[i];
+for (int i = 0; i < n; ++i) out[i] = f(x[i]);
+\end{lstlisting}
+
+要求：不能只写“能/不能”，必须解释依赖、访存、调用、成本模型或浮点语义。
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 23.B：向量化报告归档
+
+选择三个 kernel：\code{saxpy}、\code{dot}、\code{relu}。为每个 kernel 建立报告目录：
+
+\begin{lstlisting}
+results/ch23/<kernel>/
+    source.cpp
+    compile.txt
+    report_clang.txt
+    report_gcc.txt
+    ir_O3.ll
+    asm_O3.s
+    perf.csv
+    notes.md
+\end{lstlisting}
+
+要求：报告中必须同时包含编译器报告、IR 证据、汇编证据和运行时间证据。
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 23.C：帮助编译器优化
+
+选择一个最初没有向量化的循环，逐步修改源码：
+
+\begin{enumerate}
+  \item 简化控制流。
+  \item 移出循环不变量。
+  \item 加入 non-overlap 契约。
+  \item 改善数据布局或访问顺序。
+  \item 在可接受时调整浮点语义。
+\end{enumerate}
+
+每一步都必须记录：源码变化、向量化报告变化、汇编变化、性能变化。最后说明哪一步真正起作用。
+\end{exercisebox}
+
+\subsection{本节总结}
+
+自动向量化连接了编译器语义和硬件 SIMD。它需要清晰循环、可证明依赖、可接受成本、明确内存行为和合适的数值语义。对性能工程师来说，自动向量化报告不是结论，而是线索：它告诉你编译器看到了什么、担心什么、为什么愿意或不愿意生成 SIMD。
+
+下一节讨论 alias、未定义行为和浮点语义。它们是自动向量化背后的根本约束：优化器越能相信你的代码满足某些契约，就越能大胆重排、合并、向量化；契约越模糊，优化器越保守。

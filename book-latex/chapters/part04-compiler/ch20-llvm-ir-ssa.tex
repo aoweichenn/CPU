@@ -1,9 +1,563 @@
-\plannedchapter{LLVM IR、SSA 和控制流图}
-{本章讲读懂 LLVM IR 所需的核心概念：SSA、phi、basic block、load/store、branch 和 metadata。}
-{\item SSA 为什么适合优化？
-\item loop 中的变量为什么变成 phi？
-\item IR 里的 load/store 和 C++ 变量是什么关系？}
-{\item SSA def-use chain。
-\item CFG、dominance、phi 节点。
-\item typed values、memory operations、attributes。}
-{对 sum loop 生成 \code{-O0/-O3} IR，标注 basic block 和 phi 节点。}
+\section{LLVM IR、SSA 和控制流图}
+
+\subsection{本节要解决的问题}
+
+上一节建立了编译器流水线。现在我们要进入真正能解释优化行为的层次：LLVM IR。对高性能计算和 AI CPU 算子优化来说，LLVM IR 不是“编译器内部细节”，而是一种观察窗口。它能告诉你：
+
+\begin{itemize}
+  \item 编译器认为哪些值是普通整数、哪些值是指针、哪些值来自内存。
+  \item 循环是否已经变成可分析的控制流结构。
+  \item 一个变量是否真的存在于内存里，还是只存在为 SSA 值。
+  \item 优化器能不能证明一段代码没有副作用。
+  \item 载入、存储、分支、函数调用、别名和属性如何影响优化。
+\end{itemize}
+
+初学者看 IR 最容易犯两个错误。第一个错误是把 IR 当成“另一种汇编”。它不是。IR 没有目标寄存器、没有真实栈帧、没有端口和 uop。第二个错误是把 IR 当成“压扁后的 C++”。它也不是。IR 已经丢掉大量源码语法结构，并显式化了控制流和值依赖。
+
+\begin{keyidea}
+LLVM IR 的价值在于它把程序变成优化器容易证明的形式：值有类型，控制流由 basic block 和 branch 显式描述，普通临时值大多遵循 SSA，内存访问由 load/store 显式描述。读懂 IR，就是读懂优化器“能证明什么”和“不能证明什么”。
+\end{keyidea}
+
+\subsection{IR 的三种形态}
+
+平时你最常看到的是文本形式的 \code{.ll} 文件。但 LLVM IR 实际上有三种常见形态：
+
+\begin{center}
+\begin{tabular}{L{0.24\linewidth}L{0.60\linewidth}}
+\toprule
+形态 & 作用 \\
+\midrule
+文本 IR & 人能阅读的 \code{.ll}，适合学习、调试、写报告。 \\
+bitcode & 二进制形式的 \code{.bc}，适合保存、传输、LTO。 \\
+内存 IR & 编译器进程内部的数据结构，pass 真正操作的是它。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+生成文本 IR 的常用命令：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O0 -S -emit-llvm sum.cpp -o sum_O0.ll
+clang++ -std=c++20 -O3 -S -emit-llvm sum.cpp -o sum_O3.ll
+\end{lstlisting}
+
+生成 bitcode：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -c -emit-llvm sum.cpp -o sum.bc
+llvm-dis sum.bc -o sum_from_bc.ll
+\end{lstlisting}
+
+学习阶段优先看 \code{.ll}。但要记住：文本 IR 只是打印结果，不是优化器内部对象本身。优化 pass 操作的是内存中的 module、function、basic block、instruction 和 use-def 关系。
+
+\subsection{一个最小函数的 IR}
+
+先从一个不涉及循环的函数开始：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" std::int32_t add3(std::int32_t a,
+                             std::int32_t b,
+                             std::int32_t c)
+{
+    return a + b + c;
+}
+\end{lstlisting}
+
+优化后 IR 通常接近下面这种形态：
+
+\begin{lstlisting}
+define dso_local i32 @add3(i32 noundef %0,
+                           i32 noundef %1,
+                           i32 noundef %2) {
+entry:
+  %4 = add nsw i32 %1, %0
+  %5 = add nsw i32 %4, %2
+  ret i32 %5
+}
+\end{lstlisting}
+
+这里每一行都值得慢慢拆：
+
+\begin{itemize}
+  \item \code{define} 表示函数定义，不是函数声明。
+  \item \code{i32} 是返回类型。
+  \item \code{@add3} 是全局符号名。
+  \item 参数也是带类型的值。
+  \item \code{entry:} 是 basic block 标签。
+  \item \code{add} 产生一个新值。
+  \item \code{ret} 是 terminator，结束当前 basic block。
+\end{itemize}
+
+\code{nsw} 的意思是 no signed wrap。它不是 CPU 指令的一部分，而是 IR 层的语义标记：如果有符号加法溢出，C++ 程序已经进入未定义行为，因此优化器可以把“不会有有符号溢出”当成假设。这一点会在 5.6 中展开。
+
+\begin{warningbox}
+不要把 \code{\%4}、\code{\%5} 理解成真实机器寄存器。它们是 IR 值名。后端可能把它们放进寄存器，也可能重算、合并、删除，甚至整个函数都被内联后消失。
+\end{warningbox}
+
+\subsection{Module、Function、Basic Block、Instruction}
+
+LLVM IR 的层级可以这样理解：
+
+\begin{lstlisting}
+module
+    -> global variables
+    -> function declarations
+    -> function definitions
+        -> basic blocks
+            -> instructions
+                -> operands
+\end{lstlisting}
+
+一个 \code{module} 大致对应一个翻译单元或链接后模块。它包含目标三元组、数据布局、全局变量、函数声明、函数定义、metadata 等信息。
+
+一个 \code{function} 是控制流图的边界。函数内部由 basic block 组成。basic block 的关键规则是：
+
+\begin{itemize}
+  \item 只能从 block 的第一条指令进入。
+  \item 除了最后的 terminator，中间不能跳出。
+  \item 最后一条必须是 terminator，例如 \code{ret}、\code{br}、\code{switch}、\code{invoke}。
+\end{itemize}
+
+basic block 是许多优化的基本单位。比如 DCE 会删除无用指令，CFG simplify 会合并空 block，loop pass 会识别循环头、循环体、退出边和回边。
+
+\subsection{控制流图：程序不再是文本顺序}
+
+看一个分支函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int abs_i32(int x)
+{
+    if (x < 0) {
+        return -x;
+    }
+    return x;
+}
+\end{lstlisting}
+
+低优化等级下可能出现类似结构：
+
+\begin{lstlisting}
+define dso_local i32 @abs_i32(i32 noundef %0) {
+entry:
+  %cmp = icmp slt i32 %0, 0
+  br i1 %cmp, label %then, label %exit
+
+then:
+  %neg = sub nsw i32 0, %0
+  br label %exit
+
+exit:
+  %result = phi i32 [ %neg, %then ], [ %0, %entry ]
+  ret i32 %result
+}
+\end{lstlisting}
+
+这段 IR 的 CFG 可以画成：
+
+\begin{lstlisting}
+entry
+  | true
+  v
+then
+  |
+  v
+exit
+  ^
+  | false
+  +------ from entry
+\end{lstlisting}
+
+源码中的 \code{if} 语句已经变成两个显式分支目标。优化器不再需要猜“if 的范围在哪里”，它只需要遍历 basic block 和边。
+
+\subsection{SSA：值只定义一次}
+
+SSA 是 Static Single Assignment 的缩写。直观说，一个 SSA 值只被定义一次。上面 \code{add3} 中的每个 IR 临时值都只出现一次定义：
+
+\begin{lstlisting}
+%4 = add nsw i32 %1, %0
+%5 = add nsw i32 %4, %2
+\end{lstlisting}
+
+这样做的好处是 use-def chain 非常清楚：
+
+\begin{lstlisting}
+%1 ----\
+       add -> %4 ----\
+%0 ----/             add -> %5 -> ret
+%2 ------------------/
+\end{lstlisting}
+
+如果一个值只定义一次，优化器回答问题会容易得多：
+
+\begin{itemize}
+  \item 这个值从哪里来？
+  \item 哪些指令使用它？
+  \item 如果删除它，会影响哪些地方？
+  \item 两个表达式是否计算同一个值？
+  \item 循环里某个值是否每轮都不变？
+\end{itemize}
+
+没有 SSA，优化器需要反复分析“变量在这个程序点到底是哪一次赋值后的值”。SSA 把这个问题变成图结构上的 def-use 关系。
+
+\subsection{\code{phi}：控制流汇合处的值选择}
+
+SSA 遇到控制流汇合时会出现一个问题：如果一个变量在不同路径上有不同定义，汇合后该用哪个值？
+
+C++ 写法：
+
+\begin{lstlisting}[language=C++]
+extern "C" int choose(int x, int y, bool flag)
+{
+    int v = x;
+    if (flag) {
+        v = y;
+    }
+    return v + 1;
+}
+\end{lstlisting}
+
+SSA 不能让同一个 \code{v} 被赋值两次。IR 会用 \code{phi} 表达“根据前驱 block 选择值”：
+
+\begin{lstlisting}
+entry:
+  br i1 %flag, label %then, label %exit
+
+then:
+  br label %exit
+
+exit:
+  %v = phi i32 [ %y, %then ], [ %x, %entry ]
+  %ret = add nsw i32 %v, 1
+  ret i32 %ret
+\end{lstlisting}
+
+\code{phi} 的含义不是运行时调用一个函数，也不是从内存读一个变量。它是 SSA 图上的控制流选择：
+
+\begin{lstlisting}
+if predecessor is then:
+    %v = %y
+
+if predecessor is entry:
+    %v = %x
+\end{lstlisting}
+
+循环中的 induction variable 也经常由 \code{phi} 表达：
+
+\begin{lstlisting}
+loop:
+  %i = phi i64 [ 0, %entry ], [ %i.next, %loop ]
+  ...
+  %i.next = add nuw i64 %i, 1
+  %done = icmp eq i64 %i.next, %n
+  br i1 %done, label %exit, label %loop
+\end{lstlisting}
+
+这段结构的含义是：第一次进入循环时 \code{\%i} 来自 \code{entry} 的 0；之后每次从 \code{loop} 回来时，\code{\%i} 来自上一轮的 \code{\%i.next}。
+
+\begin{mentalmodel}
+\code{phi} 是读 LLVM IR 时最重要的门槛之一。看到 \code{phi} 时，不要问“它对应哪条机器指令”，而要问“这个 block 有哪些前驱，每条前驱带来哪个值”。后端最终可能用寄存器分配、move、条件 move 或直接合并寄存器来实现它。
+\end{mentalmodel}
+
+\subsection{内存不是自动 SSA}
+
+SSA 主要描述普通 IR 值。内存是另一回事。看这个例子：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_local(int a, int b)
+{
+    int x = a;
+    x += b;
+    return x;
+}
+\end{lstlisting}
+
+在 \code{-O0} 下，Clang 往往保留局部变量的内存槽，IR 里会看到 \code{alloca}、\code{store}、\code{load}：
+
+\begin{lstlisting}
+%3 = alloca i32, align 4
+%4 = alloca i32, align 4
+store i32 %0, ptr %3, align 4
+store i32 %1, ptr %4, align 4
+%5 = load i32, ptr %3, align 4
+%6 = load i32, ptr %4, align 4
+%7 = add nsw i32 %5, %6
+store i32 %7, ptr %3, align 4
+%8 = load i32, ptr %3, align 4
+ret i32 %8
+\end{lstlisting}
+
+在优化后，内存槽通常会被提升为 SSA 值：
+
+\begin{lstlisting}
+%3 = add nsw i32 %1, %0
+ret i32 %3
+\end{lstlisting}
+
+这个过程常被称为 mem2reg。它把满足条件的栈上局部变量提升成 SSA 值。能不能提升，取决于地址是否逃逸、是否被不透明调用使用、是否存在复杂别名等。
+
+\begin{warningbox}
+C++ 变量和 LLVM IR 值不是一一对应关系。一个源码变量可能在 \code{-O0} 下是内存槽，在 \code{-O3} 下完全消失；一个 IR 值也可能没有源码变量名，只是优化器为了表达中间计算生成的临时值。
+\end{warningbox}
+
+\subsection{load/store：优化器眼中的内存边界}
+
+IR 中的 \code{load} 和 \code{store} 是理解性能的关键。很多优化本质上都在问：
+
+\begin{itemize}
+  \item 这次 \code{load} 能不能提前？
+  \item 两次 \code{load} 是否一定读同一个值？
+  \item 这次 \code{store} 会不会影响后面的 \code{load}？
+  \item 两个指针会不会指向同一片内存？
+  \item 这个循环里的 \code{load} 能不能向量化？
+\end{itemize}
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" void saxpy(float* y, const float* x, float a, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        y[i] = a * x[i] + y[i];
+    }
+}
+\end{lstlisting}
+
+这个循环至少有两个 load 和一个 store：
+
+\begin{lstlisting}
+load x[i]
+load y[i]
+compute a * x[i] + y[i]
+store y[i]
+\end{lstlisting}
+
+如果 \code{x} 和 \code{y} 可能 alias，优化器必须更谨慎。它可能需要插入 runtime alias check，也可能拒绝某些重排。第 5.5 和 5.6 会继续把这个例子展开。
+
+\subsection{attribute 和 metadata}
+
+LLVM IR 不只包含指令，还包含属性和 metadata。它们经常决定优化器能不能大胆改写程序。
+
+常见函数或参数属性包括：
+
+\begin{itemize}
+  \item \code{readonly}：函数只读内存，不写内存。
+  \item \code{readnone}：函数不读也不写可观察内存。
+  \item \code{noalias}：某个返回值或参数在特定语义下不与其他对象别名。
+  \item \code{nonnull}：指针不为空。
+  \item \code{noundef}：值不是未定义值。
+  \item \code{align}：内存对齐信息。
+\end{itemize}
+
+常见 metadata 包括：
+
+\begin{itemize}
+  \item TBAA：type-based alias analysis 信息。
+  \item loop metadata：循环展开、向量化、unroll hints。
+  \item debug metadata：源码位置、变量名、调试信息。
+  \item profile metadata：分支概率、执行频率。
+\end{itemize}
+
+属性和 metadata 的重要性在于：同样的指令，如果携带不同事实，优化空间完全不同。例如一个 \code{load} 如果有更强的对齐信息，向量化器可能选择更高效的载入；一个函数如果能证明 \code{readnone}，DCE 可能直接删除它的调用。
+
+\subsection{新版 LLVM 的 opaque pointer}
+
+你可能在不同资料里看到两种指针写法：
+
+\begin{lstlisting}
+older style:
+    i32* %p
+    float* %q
+
+opaque pointer style:
+    ptr %p
+    ptr %q
+\end{lstlisting}
+
+较新的 LLVM IR 默认使用 opaque pointer，也就是统一写成 \code{ptr}，指针本身不携带 pointee type。被访问的数据类型由 \code{load}、\code{store}、\code{getelementptr} 等指令表达：
+
+\begin{lstlisting}
+%v = load i32, ptr %p, align 4
+store float %x, ptr %q, align 4
+\end{lstlisting}
+
+读资料时要注意版本差异。看到旧资料里的 \code{i32*} 不必困惑，它表达的是旧 IR 打印风格。核心问题仍然是：指针值、被访问类型、地址计算和 alias 信息如何共同决定优化。
+
+\subsection{读 IR 的顺序}
+
+初学者读 IR 不应该从第一行逐字符读到最后一行。建议按下面顺序：
+
+\begin{enumerate}
+  \item 看函数签名：参数类型、返回类型、属性。
+  \item 找 basic block 标签：\code{entry}、\code{loop}、\code{exit}。
+  \item 找 terminator：\code{br}、\code{ret}、\code{switch}。
+  \item 画 CFG：block 之间怎么跳。
+  \item 找 \code{phi}：循环变量和路径汇合值。
+  \item 找 \code{load/store}：真正的内存访问在哪里。
+  \item 找 call：不透明调用通常是优化边界。
+  \item 找 metadata 和 attributes：优化器有哪些额外事实。
+\end{enumerate}
+
+\subsection{实验 20.1：标注一个 sum loop 的 IR}
+
+\begin{labbox}
+目标：建立读 LLVM IR 的基本动作。
+
+准备文件 \filepath{results/ch20/sum_loop.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstddef>
+#include <cstdint>
+
+extern "C" std::int64_t sum_i32_ptr(const std::int32_t* values,
+                                    std::size_t size)
+{
+    std::int64_t sum = 0;
+    for (std::size_t i = 0; i < size; ++i) {
+        sum += values[i];
+    }
+    return sum;
+}
+\end{lstlisting}
+
+生成 IR：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O0 -S -emit-llvm \
+  results/ch20/sum_loop.cpp -o results/ch20/sum_O0.ll
+
+clang++ -std=c++20 -O2 -S -emit-llvm \
+  results/ch20/sum_loop.cpp -o results/ch20/sum_O2.ll
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 在 \code{sum_O0.ll} 中找出所有 \code{alloca}、\code{load}、\code{store}。
+  \item 在 \code{sum_O2.ll} 中找出循环 header、latch、exit。
+  \item 标注所有 \code{phi}，说明每个输入来自哪个前驱 block。
+  \item 找到数组访问对应的地址计算和 load。
+  \item 写出 \code{-O0} 到 \code{-O2} 后哪些源码变量消失了。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 一张 CFG 手绘图或文本图。
+  \item 一份带注释的 IR 摘录。
+  \item 一段 500 字报告：SSA 如何让循环变量和累加器变得可分析。
+\end{itemize}
+\end{labbox}
+
+\subsection{实验 20.2：观察 mem2reg}
+
+\begin{labbox}
+目标：理解局部变量从内存槽提升为 SSA 值。
+
+任务：
+
+\begin{enumerate}
+  \item 写一个只有局部整数变量的小函数。
+  \item 生成 \code{-O0} IR，记录 \code{alloca/load/store}。
+  \item 生成 \code{-O1} IR，记录这些指令是否消失。
+  \item 修改函数：把局部变量地址传给外部函数。
+  \item 再次比较 IR，解释为什么地址逃逸会阻碍提升。
+\end{enumerate}
+
+建议使用外部函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" void escape_int(int* p);
+\end{lstlisting}
+
+报告要求：
+
+\begin{itemize}
+  \item 必须贴出关键 IR。
+  \item 必须说明“变量在源码中存在”和“变量在优化后 IR 中存在”的区别。
+  \item 必须解释地址逃逸为什么会让优化器更保守。
+\end{itemize}
+\end{labbox}
+
+\subsection{本节作业}
+
+\begin{exercisebox}
+作业 20.A：IR 结构解释
+
+选择一个包含 \code{if}、\code{for}、数组访问和函数调用的 C++ 函数，生成 \code{-O1} IR。回答：
+
+\begin{enumerate}
+  \item 这个函数有几个 basic block？
+  \item 每个 basic block 的 terminator 是什么？
+  \item CFG 中有几条边？
+  \item 哪些值是 \code{phi} 产生的？
+  \item 哪些指令是真正的内存访问？
+  \item 哪个调用最可能阻止优化？为什么？
+\end{enumerate}
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 20.B：SSA 手工转换
+
+把下面伪代码手工改写成 SSA 风格：
+
+\begin{lstlisting}
+x = a + b
+if cond:
+    x = x * 2
+else:
+    x = x - 1
+y = x + c
+return y
+\end{lstlisting}
+
+要求：
+
+\begin{itemize}
+  \item 给每次定义起不同名字。
+  \item 在控制流汇合处写出 \code{phi}。
+  \item 画出 def-use 关系。
+\end{itemize}
+\end{exercisebox}
+
+\begin{exercisebox}
+作业 20.C：版本差异记录
+
+记录你机器上的 LLVM/Clang 版本，并回答：
+
+\begin{itemize}
+  \item IR 中指针显示为 \code{ptr} 还是类似 \code{i32*}？
+  \item \code{sum_i32_ptr} 的参数有哪些 attributes？
+  \item \code{load} 和 \code{store} 是否带有 \code{align}？
+  \item 是否出现 TBAA metadata？
+\end{itemize}
+
+要求：以后每次引用 IR 片段时，都要在报告中写明编译器版本和命令。
+\end{exercisebox}
+
+\subsection{本节总结}
+
+本节建立了后续优化章节的共同语言：
+
+\begin{lstlisting}
+LLVM IR:
+    typed operations + explicit control flow + explicit memory operations
+
+SSA:
+    each ordinary value has one definition
+
+basic block:
+    straight-line instruction sequence ended by a terminator
+
+CFG:
+    graph formed by basic blocks and branch edges
+
+phi:
+    value selection at control-flow join points
+
+load/store:
+    where optimization meets memory and alias analysis
+\end{lstlisting}
+
+接下来讨论标量优化时，你要一直带着这套问题：这个 pass 删除、移动、合并或改写了哪些 IR 指令？它依赖哪些 SSA 事实、控制流事实和内存事实？如果这些事实不成立，优化为什么不能做？

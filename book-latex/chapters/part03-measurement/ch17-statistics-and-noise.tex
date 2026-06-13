@@ -1,9 +1,1016 @@
-\plannedchapter{性能统计、噪声分析和实验复现}
-{本章补齐基础统计和实验复现能力，解释为什么单次结果不能作为结论。}
-{\item 什么是稳定结果？
-\item outlier 应该删除还是解释？
-\item 如何比较两个优化版本是否真的不同？}
-{\item 中位数、均值、方差、置信直觉。
-\item OS 干扰、频率变化、虚拟化噪声。
-\item 原始数据保存和实验日志。}
-{对同一 benchmark 跑 100 次，画或整理分布表，解释异常值来源。}
+\section{性能统计、噪声分析和实验复现}
+
+\subsection{本章要解决的问题}
+
+第 15 章讲了怎样避免测错，第 16 章讲了怎样把 benchmark 做成可复现工程。本章处理下一层问题：当你已经有了 \code{raw_samples.csv}，该如何解释这些数字？
+
+很多性能报告会犯两个相反的错误：
+
+\begin{itemize}
+  \item 过度相信单次结果：跑一次快了 5\%，就宣布优化成功。
+  \item 过度迷信统计术语：列出均值、方差、p95，却没有解释样本为什么长成这样。
+\end{itemize}
+
+性能统计不是为了把报告写得像数学论文，而是为了保护你不被噪声误导。现代系统里，同一段代码重复运行会受到 OS 调度、中断、CPU 频率、cache 状态、页错误、NUMA、SMT sibling、后台进程、虚拟化和热状态影响。你看到的每个样本都是：
+
+\begin{lstlisting}
+observed time = true workload cost + measurement overhead + system noise
+\end{lstlisting}
+
+本章目标是让你掌握：
+
+\begin{itemize}
+  \item 把测量结果看成样本分布，而不是一个数字。
+  \item 理解 min、mean、median、p95、max、标准差、变异系数各自表达什么。
+  \item 识别常见分布形状：稳定、右长尾、双峰、漂移、阶跃。
+  \item 判断 outlier 应该解释、保留、标注，还是在明确规则下剔除。
+  \item 比较两个版本时避免 run order、频率漂移和样本量不足。
+  \item 写出带限制条件的性能结论。
+  \item 保存足够信息，让未来的你或别人能复现实验。
+\end{itemize}
+
+\begin{keyidea}
+性能结论不是由最快一次或最慢一次决定，而是由样本分布、实验条件、二进制证据、硬件事件和可复现记录共同支持。
+\end{keyidea}
+
+\subsection{样本是什么}
+
+假设你运行了 31 次 \code{sum_u64}：
+
+\begin{lstlisting}
+elapsed_ns:
+    312000
+    311800
+    312300
+    311900
+    330000
+    ...
+\end{lstlisting}
+
+每个值都是一次观测。它不是“真值”，而是某次运行在某个系统状态下的结果。我们真正想知道的是某个 workload 在给定实验条件下的性能特征：
+
+\begin{lstlisting}
+typical cost:
+    median or mean
+
+best stable capability:
+    min or low percentile
+
+tail behavior:
+    p95, p99, max
+
+stability:
+    standard deviation, coefficient of variation, spread
+\end{lstlisting}
+
+所以 raw samples 是一等公民，summary 只是它的摘要。永远保存原始样本。
+
+\begin{warningbox}
+如果你只保存 summary，后续就无法判断样本是否双峰、是否有漂移、是否有明显 outlier、是否适合使用均值。summary 不能替代 raw data。
+\end{warningbox}
+
+\subsection{先排序，再观察}
+
+最简单有效的第一步是排序。
+
+\begin{lstlisting}
+raw:
+    312000, 311800, 330000, 312300, 311900
+
+sorted:
+    311800, 311900, 312000, 312300, 330000
+\end{lstlisting}
+
+排序后你可以立刻看到：
+
+\begin{itemize}
+  \item 最快值。
+  \item 最慢值。
+  \item 中间值。
+  \item 尾部是否突然拉长。
+  \item 样本是否分成多个台阶。
+\end{itemize}
+
+对小样本，文本表格也很有用：
+
+\begin{lstlisting}
+rank,elapsed_ns
+0,311800
+1,311900
+2,312000
+3,312300
+4,330000
+\end{lstlisting}
+
+当样本数变多，可以画直方图或分位数表。即使不用图，也可以分桶：
+
+\begin{lstlisting}
+bucket_ns,count
+311000-312000,2
+312000-313000,2
+330000-331000,1
+\end{lstlisting}
+
+\subsection{常用统计量的含义}
+
+\begin{center}
+\begin{tabular}{p{0.17\linewidth}p{0.42\linewidth}p{0.27\linewidth}}
+\toprule
+统计量 & 表达什么 & 常见误用 \\
+\midrule
+min & 噪声最少时的最好观测。 & 当成平均体验。 \\
+mean & 所有样本的算术平均。 & 被少数慢样本拉高。 \\
+median & 排序后的中间样本。 & 忽略尾部风险。 \\
+p95 & 95\% 样本不超过该值。 & 样本太少时不稳定。 \\
+max & 最慢观测。 & 不解释来源就下结论。 \\
+stddev & 样本围绕均值的离散程度。 & 对非正态和 outlier 敏感。 \\
+CV & 标准差除以均值。 & 忽略分布形状。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+其中 CV 是 \term{coefficient of variation}{变异系数}：
+
+\begin{lstlisting}
+CV = standard_deviation / mean
+\end{lstlisting}
+
+它用于比较不同规模或不同单位下的相对波动。例如：
+
+\begin{lstlisting}
+benchmark A:
+    mean = 100 ns
+    stddev = 2 ns
+    CV = 2%
+
+benchmark B:
+    mean = 10 ms
+    stddev = 0.2 ms
+    CV = 2%
+\end{lstlisting}
+
+两者绝对波动不同，但相对稳定性相同。
+
+\begin{deepdive}
+性能样本常常不是正态分布。它更常见的是右长尾：大多数样本接近稳定热路径，少数样本被调度、中断、缺页或降频拉慢。因此，median 和分位数通常比只看 mean 更直观。
+\end{deepdive}
+
+\subsection{均值和中位数的差异}
+
+看样本：
+
+\begin{lstlisting}
+100, 101, 100, 102, 500
+\end{lstlisting}
+
+排序：
+
+\begin{lstlisting}
+100, 100, 101, 102, 500
+\end{lstlisting}
+
+统计：
+
+\begin{lstlisting}
+min    = 100
+median = 101
+mean   = 180.6
+max    = 500
+\end{lstlisting}
+
+mean 很高，因为一个 500 ns 的慢样本把平均值拉大。median 说明典型运行仍在 101 ns 左右。这个 outlier 不能简单删除；你要问它来自哪里：
+
+\begin{itemize}
+  \item 线程被调度走了吗？
+  \item 发生 page fault 了吗？
+  \item CPU 降频了吗？
+  \item benchmark 第一次触发 lazy binding 了吗？
+  \item 后台进程抢了资源吗？
+\end{itemize}
+
+如果它是偶发系统噪声，median 更能代表热路径典型表现。如果你的应用关心尾延迟，例如在线服务，500 ns 这个尾部就不能忽略。
+
+\subsection{分位数：p95 和 p99}
+
+p95 的直觉是：排序后，大约 95\% 的样本不超过这个值。
+
+nearest-rank 近似：
+
+\begin{lstlisting}
+sorted samples count = N
+p95 index = ceil(0.95 * N) - 1
+\end{lstlisting}
+
+如果样本数只有 10：
+
+\begin{lstlisting}
+p95 index = ceil(9.5) - 1 = 9
+\end{lstlisting}
+
+也就是 max。因此样本太少时，p95 不稳定。
+
+经验：
+
+\begin{itemize}
+  \item 31 次样本可以初步看 median、min、max。
+  \item 100 次样本可以更好地看 p95。
+  \item p99 通常需要更多样本才有意义。
+  \item 服务端尾延迟要按请求级别收集大量样本，不能只用微基准 31 次。
+\end{itemize}
+
+\begin{warningbox}
+不要在样本很少时严肃解读 p99。比如 31 个样本的 p99 基本就是最大值，它更像“本次最慢观测”，不是稳定尾延迟估计。
+\end{warningbox}
+
+\subsection{一个 C++20 统计汇总器}
+
+下面给一个小型 summary 计算器。它处理一组 \code{elapsed_ns}，输出常见统计量。这里仍是教学代码，不替代成熟统计库。
+
+\begin{lstlisting}[language=C++]
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <span>
+#include <vector>
+
+struct SampleSummary {
+    std::uint64_t min = 0;
+    std::uint64_t median = 0;
+    std::uint64_t p95 = 0;
+    std::uint64_t max = 0;
+    double mean = 0.0;
+    double stddev = 0.0;
+    double coefficient_of_variation = 0.0;
+};
+
+double mean_of(std::span<const std::uint64_t> samples)
+{
+    double sum = 0.0;
+    for (const std::uint64_t sample : samples) {
+        sum += static_cast<double>(sample);
+    }
+    return sum / static_cast<double>(samples.size());
+}
+
+double sample_stddev_of(std::span<const std::uint64_t> samples, double mean)
+{
+    constexpr std::size_t STATISTICS_MIN_SAMPLES_FOR_STDDEV = 2;
+
+    if (samples.size() < STATISTICS_MIN_SAMPLES_FOR_STDDEV) {
+        return 0.0;
+    }
+
+    double squared_error_sum = 0.0;
+    for (const std::uint64_t sample : samples) {
+        const double error = static_cast<double>(sample) - mean;
+        squared_error_sum += error * error;
+    }
+
+    const double denominator = static_cast<double>(samples.size() - 1);
+    return std::sqrt(squared_error_sum / denominator);
+}
+
+std::uint64_t percentile_nearest_rank(const std::vector<std::uint64_t>& sorted,
+                                      std::size_t numerator,
+                                      std::size_t denominator)
+{
+    if (sorted.empty()) {
+        return 0;
+    }
+
+    const std::size_t rank = (sorted.size() * numerator + denominator - 1) / denominator;
+    const std::size_t index = std::min(rank - 1, sorted.size() - 1);
+    return sorted[index];
+}
+
+SampleSummary summarize_elapsed_ns(std::span<const std::uint64_t> samples)
+{
+    constexpr std::size_t STATISTICS_P95_NUMERATOR = 95;
+    constexpr std::size_t STATISTICS_PERCENT_DENOMINATOR = 100;
+
+    std::vector<std::uint64_t> sorted(samples.begin(), samples.end());
+    std::sort(sorted.begin(), sorted.end());
+
+    SampleSummary summary;
+    summary.min = sorted.front();
+    summary.median = sorted[sorted.size() / 2];
+    summary.p95 = percentile_nearest_rank(
+        sorted, STATISTICS_P95_NUMERATOR, STATISTICS_PERCENT_DENOMINATOR);
+    summary.max = sorted.back();
+    summary.mean = mean_of(samples);
+    summary.stddev = sample_stddev_of(samples, summary.mean);
+    if (summary.mean != 0.0) {
+        summary.coefficient_of_variation = summary.stddev / summary.mean;
+    }
+    return summary;
+}
+\end{lstlisting}
+
+使用时要保证样本非空。生产代码应在解析 CSV 时检查空样本并报告错误，而不是让 \code{front()} 访问空 vector。
+
+\subsection{常见分布形状}
+
+\subsubsection{稳定窄分布}
+
+\begin{lstlisting}
+100, 101, 100, 101, 102, 100, 101
+\end{lstlisting}
+
+特征：
+
+\begin{itemize}
+  \item min、median、mean 接近。
+  \item max 不远。
+  \item CV 很低。
+\end{itemize}
+
+这种结果通常说明实验比较稳定，可以开始比较版本差异。但仍要看反汇编和环境。
+
+\subsubsection{右长尾}
+
+\begin{lstlisting}
+100, 101, 100, 102, 101, 130, 180, 500
+\end{lstlisting}
+
+特征：
+
+\begin{itemize}
+  \item 大多数样本集中。
+  \item 少数样本明显更慢。
+  \item mean 大于 median。
+\end{itemize}
+
+常见原因：调度、中断、后台进程、缺页、cache 污染。
+
+\subsubsection{双峰分布}
+
+\begin{lstlisting}
+100, 101, 100, 102, 170, 171, 169, 172
+\end{lstlisting}
+
+特征：
+
+\begin{itemize}
+  \item 样本分成两个稳定簇。
+  \item median 可能落在其中一个簇，但不能解释全部。
+\end{itemize}
+
+常见原因：
+
+\begin{itemize}
+  \item 线程在不同 core 间迁移。
+  \item CPU 频率状态不同。
+  \item cache warm 和 cold 混在一起。
+  \item NUMA 节点不同。
+  \item benchmark 内部有两个路径。
+\end{itemize}
+
+\subsubsection{漂移}
+
+\begin{lstlisting}
+100, 101, 102, 104, 107, 111, 116, 122
+\end{lstlisting}
+
+特征：样本随时间逐渐变慢或变快。
+
+常见原因：
+
+\begin{itemize}
+  \item CPU 热起来后降频。
+  \item 后台任务启动。
+  \item 数据结构状态逐渐变化。
+  \item 内存分配器或 cache 状态变化。
+\end{itemize}
+
+\subsubsection{阶跃}
+
+\begin{lstlisting}
+100, 101, 100, 101, 160, 161, 160, 162
+\end{lstlisting}
+
+特征：某个时间点之后整体切到另一个水平。
+
+常见原因：频率档位变化、线程迁移、系统事件、热节流。
+
+\begin{keyidea}
+分布形状本身就是证据。不要只用一个 summary 行掩盖它；至少在报告里描述样本是稳定、长尾、双峰、漂移还是阶跃。
+\end{keyidea}
+
+\subsection{Outlier：删除还是解释}
+
+outlier 是明显偏离主要分布的样本。处理原则：
+
+\begin{enumerate}
+  \item 不要默默删除。
+  \item 先保留 raw data。
+  \item 尝试解释来源。
+  \item 如果要删除，必须提前定义规则，并同时报告删除前后的结果。
+  \item 如果 outlier 代表真实用户会遇到的情况，就不能删除。
+\end{enumerate}
+
+例子：
+
+\begin{lstlisting}
+samples:
+    100, 101, 100, 102, 5000
+\end{lstlisting}
+
+如果 \code{5000} 来自另一个进程抢占 CPU，它对 microkernel 稳态吞吐的估计可能是噪声；但它对端到端延迟体验可能是真实风险。
+
+一个保守报告方式：
+
+\begin{lstlisting}
+Raw result:
+    median = 101 ns
+    max = 5000 ns
+
+Investigation:
+    The max sample coincided with a context switch spike.
+
+Conclusion:
+    For steady-state kernel throughput, median is representative.
+    Tail latency on this shared machine is not controlled.
+\end{lstlisting}
+
+\subsection{噪声来源地图}
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.62\linewidth}}
+\toprule
+来源 & 现象和观察方法 \\
+\midrule
+OS 调度 & 偶发慢样本、长尾；用 \code{taskset}、\code{perf stat} 和系统负载记录辅助解释。 \\
+中断 & 突然慢一次；增加重复次数，必要时使用隔离核心。 \\
+频率变化 & 漂移或阶跃；记录 governor、温度，并用 TSC 或 cycles 对照。 \\
+迁核 & 双峰或阶跃；用 \code{taskset} 固定 CPU，并记录样本所在 CPU。 \\
+SMT 共享核 & 波动变大；关闭 SMT，或避免 sibling 上运行其他重负载线程。 \\
+缺页 & 首次运行慢；增加 warmup，并观察 \code{perf stat} 的 faults 计数。 \\
+NUMA & 大工作集双峰；用 \code{numactl} 固定内存节点和执行节点。 \\
+虚拟化 & 高频噪声和 counter 不准；在报告里记录 VM 或 container 环境。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不是让你每次都控制所有因素，而是让你知道异常形状可能对应什么机制。
+
+\subsection{频率：时间和 cycles 不总是同一件事}
+
+现代 CPU 会动态调频。一个 kernel 的 wall time 可能变慢，不一定是指令变多；可能是频率低了。相反，cycles 变化也要结合频率解释。
+
+报告中可以同时记录：
+
+\begin{lstlisting}
+steady_clock elapsed_ns
+perf stat cycles
+perf stat instructions
+IPC = instructions / cycles
+\end{lstlisting}
+
+如果版本 A 和 B：
+
+\begin{lstlisting}
+A:
+    time = 1.0 ms
+    cycles = 3.5 M
+
+B:
+    time = 1.1 ms
+    cycles = 3.2 M
+\end{lstlisting}
+
+这说明 B retired cycles 更少，但 wall time 更慢。可能原因：
+
+\begin{itemize}
+  \item 运行 B 时频率更低。
+  \item counter 语义或测量区域不同。
+  \item A/B 运行顺序导致热状态不同。
+\end{itemize}
+
+不要只拿一个指标下结论。时间、cycles、instructions、汇编、环境记录要一起看。
+
+\subsection{A/B 比较：不要按顺序跑完 A 再跑 B}
+
+错误做法：
+
+\begin{lstlisting}
+run A 100 times
+run B 100 times
+compare medians
+\end{lstlisting}
+
+如果机器逐渐升温降频，B 可能天然吃亏；如果 cache 或 predictor 被 A 预热，B 也可能受益或受害。
+
+更好的做法是交替：
+
+\begin{lstlisting}
+for rep in repetitions:
+    run A
+    run B
+\end{lstlisting}
+
+或者 ABBA：
+
+\begin{lstlisting}
+for block in blocks:
+    run A
+    run B
+    run B
+    run A
+\end{lstlisting}
+
+也可以随机化顺序，但必须固定 seed 并记录：
+
+\begin{lstlisting}
+order:
+    A, B, B, A, B, A, ...
+seed:
+    12345
+\end{lstlisting}
+
+\begin{deepdive}
+交替运行可以减少慢速漂移的偏差，但会引入另一种问题：A 和 B 可能互相影响 cache、branch predictor 或 shared resources。严格实验需要根据 workload 设计清理或隔离策略。
+\end{deepdive}
+
+\subsection{Speedup 的正确写法}
+
+如果指标是时间，越小越好：
+
+\begin{lstlisting}
+speedup = baseline_time / optimized_time
+\end{lstlisting}
+
+例如：
+
+\begin{lstlisting}
+baseline median = 120 ns
+optimized median = 100 ns
+speedup = 120 / 100 = 1.20x
+\end{lstlisting}
+
+如果指标是吞吐，越大越好：
+
+\begin{lstlisting}
+throughput speedup = optimized_GBps / baseline_GBps
+\end{lstlisting}
+
+不要写错方向。也不要把百分比和倍数混用：
+
+\begin{lstlisting}
+1.20x faster:
+    optimized is 20% faster
+
+20% lower time:
+    optimized_time = baseline_time * 0.80
+    speedup = 1 / 0.80 = 1.25x
+\end{lstlisting}
+
+“快 20\%”和“耗时降低 20\%”不是同一句话。
+
+\subsection{版本差异是否真实}
+
+假设：
+
+\begin{lstlisting}
+A median = 100.0 ns
+B median = 99.5 ns
+\end{lstlisting}
+
+B 看起来快 0.5\%。这是否真实？要看噪声：
+
+\begin{lstlisting}
+A samples mostly between 99 and 102
+B samples mostly between 98.8 and 102
+\end{lstlisting}
+
+两个分布高度重叠，0.5\% 差异可能不可信。
+
+另一个例子：
+
+\begin{lstlisting}
+A median = 100 ns, p95 = 103 ns
+B median = 80 ns,  p95 = 82 ns
+\end{lstlisting}
+
+差异大且分布分离，更可信。
+
+工程判断规则：
+
+\begin{itemize}
+  \item 差异小于样本波动时，不要宣布优化成功。
+  \item 对小差异，增加 repetitions，并在不同进程运行中重复。
+  \item 对重要结论，换一天、换重启后、换固定频率再测。
+  \item 结合汇编解释：代码真的少了指令、减少了 miss，还是只是噪声？
+\end{itemize}
+
+\subsection{置信直觉}
+
+统计学里的置信区间有严格定义。本书先建立工程直觉。
+
+如果样本近似独立、分布不太奇怪，均值的标准误差近似：
+
+\begin{lstlisting}
+standard_error = stddev / sqrt(n)
+\end{lstlisting}
+
+粗略 95\% 区间：
+
+\begin{lstlisting}
+mean +/- 1.96 * standard_error
+\end{lstlisting}
+
+但性能样本常常右长尾、相关、非正态，所以不要机械套公式。更稳妥的工程做法：
+
+\begin{itemize}
+  \item 报告 median、p95、min、max。
+  \item 保存 raw samples。
+  \item 对 A/B 使用交替或随机顺序。
+  \item 多次独立运行整个 benchmark 进程。
+  \item 结论使用“在本环境和本 workload 下”限定。
+\end{itemize}
+
+\begin{warningbox}
+不要把“95\% 置信区间”写成装饰词。如果实验设计不满足基本假设，漂亮的区间数字可能比没有区间更误导。
+\end{warningbox}
+
+\subsection{独立运行：process-level repetition}
+
+同一进程内重复 100 次可以观察短期噪声，但不能覆盖所有变化。更强的复现方式是重复整个进程：
+
+\begin{lstlisting}[language=bash]
+for run in 0 1 2 3 4; do
+    ./bench_suite --output results/run_${run}
+done
+\end{lstlisting}
+
+这能暴露：
+
+\begin{itemize}
+  \item 进程启动状态差异。
+  \item ASLR 地址布局差异。
+  \item 动态链接和首次触页差异。
+  \item 长时间热状态变化。
+\end{itemize}
+
+报告可以分两层：
+
+\begin{lstlisting}
+within-run:
+    median over repetitions inside one process
+
+between-run:
+    median of process medians
+    min and max across process medians
+\end{lstlisting}
+
+如果每个进程内很稳定，但进程间差异大，说明还有未控制的环境因素。
+
+\subsection{复现实验日志}
+
+每次实验保存：
+
+\begin{lstlisting}
+results/experiment_name/
+    raw_samples.csv
+    summary.csv
+    runs/
+        run_00/raw_samples.csv
+        run_00/summary.csv
+        run_01/raw_samples.csv
+        run_01/summary.csv
+    environment.txt
+    command.txt
+    git_status.txt
+    binary_sha256.txt
+    objdump.txt
+    perf_stat.txt
+    notes.md
+\end{lstlisting}
+
+\code{notes.md} 里写：
+
+\begin{lstlisting}
+What changed:
+    Replaced scalar sum with unrolled sum by 4 accumulators.
+
+Hypothesis:
+    Reduces loop-carried dependency and improves ILP.
+
+Expected evidence:
+    Lower cycles per element.
+    Similar bytes read.
+    More independent add instructions in objdump.
+
+Observed:
+    median improved by 8% at L1-sized inputs.
+    no improvement at memory-sized inputs.
+
+Limits:
+    CPU frequency governor was powersave.
+    perf counters unavailable due permission.
+\end{lstlisting}
+
+\begin{keyidea}
+复现不是“我能再跑一次”。复现是未来有人能根据你的代码、命令、输入、环境、二进制和 raw data 重建你的结论路径。
+\end{keyidea}
+
+\subsection{一个 A/B 比较表模板}
+
+不要只给一行 speedup。推荐：
+
+\begin{lstlisting}
+kernel,n,metric,A_median,B_median,speedup,A_p95,B_p95,A_CV,B_CV,verdict
+sum_u64,1048576,time_ns,312000,290000,1.076,330000,305000,0.018,0.012,likely faster
+sum_u64,8388608,time_ns,3500000,3480000,1.006,3700000,3690000,0.021,0.022,inconclusive
+\end{lstlisting}
+
+verdict 不应只有 faster/slower，可以用：
+
+\begin{itemize}
+  \item \code{likely faster}：差异明显，大于噪声，证据一致。
+  \item \code{likely slower}：明显变慢。
+  \item \code{inconclusive}：差异小于波动或证据冲突。
+  \item \code{changed behavior}：正确性、汇编或工作量改变，不能直接比较。
+\end{itemize}
+
+\subsection{实验 17.1：100 次样本分布分析}
+
+\begin{labbox}
+目标：从 raw samples 观察分布，而不是只看 summary。
+
+选择第 16 章的 \code{sum_u64} 或 \code{copy_u64}，固定一个输入规模，运行：
+
+\begin{lstlisting}[language=bash]
+./bench_suite --kernel sum_u64 \
+              --sizes 1048576 \
+              --warmup 5 \
+              --repetitions 100 \
+              --batch 1 \
+              --seed 1 \
+              --output results/ch17_dist
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 保存 raw samples。
+  \item 排序样本。
+  \item 计算 min、mean、median、p95、max、stddev、CV。
+  \item 做一个文本分桶表。
+  \item 判断分布形状：稳定、右长尾、双峰、漂移或阶跃。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item raw samples。
+  \item 排序后的前 10 个和后 10 个样本。
+  \item 统计表。
+  \item 分布形状分析。
+  \item 对异常样本的可能解释。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 17.2：Outlier 调查}
+
+\begin{labbox}
+目标：学习解释 outlier，而不是机械删除。
+
+任务：
+
+\begin{enumerate}
+  \item 找到实验 17.1 中最慢的 3 个样本。
+  \item 查看它们出现的 repetition 序号。
+  \item 检查是否集中在开头、结尾或随机分布。
+  \item 用 \code{/usr/bin/time -v} 或 \code{perf stat} 重新运行，观察 page faults、context switches。
+  \item 写出“保留 outlier”和“按规则剔除 outlier”两份 summary。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item outlier 样本表。
+  \item 你认为的原因假设。
+  \item 删除规则，如果你选择删除。
+  \item 删除前后 summary 对比。
+  \item 说明哪个 summary 更适合你的结论，为什么。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 17.3：A/B 交替比较}
+
+\begin{labbox}
+目标：比较两个版本时避免运行顺序偏差。
+
+准备两个版本：
+
+\begin{itemize}
+  \item A：普通 \code{sum_u64}。
+  \item B：4 个累加器展开版本。
+\end{itemize}
+
+运行三种顺序：
+
+\begin{enumerate}
+  \item 先 A 100 次，再 B 100 次。
+  \item 交替 AB，重复 100 个 pair。
+  \item ABBA block，重复 50 个 block。
+\end{enumerate}
+
+任务：
+
+\begin{enumerate}
+  \item 分别计算 A 和 B 的 median、p95、CV。
+  \item 计算 speedup。
+  \item 判断三种顺序是否给出一致结论。
+  \item 用 objdump 解释 B 是否真的减少依赖链。
+  \item 用 \code{perf stat} 观察 cycles 和 instructions。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item 三种顺序的 raw data。
+  \item A/B summary 表。
+  \item speedup 表。
+  \item 汇编证据。
+  \item 对 run order bias 的解释。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 17.4：频率和温度漂移}
+
+\begin{labbox}
+目标：观察长时间运行时结果是否漂移。
+
+任务：
+
+\begin{enumerate}
+  \item 选择一个至少运行 10 秒的 benchmark。
+  \item 每个 sample 记录 repetition 序号和 \code{elapsed_ns}。
+  \item 按时间顺序观察是否变慢或变快。
+  \item 如果系统提供频率文件，采样当前 CPU 频率。
+  \item 对比 \code{taskset} 绑定前后结果。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item 时间顺序样本表。
+  \item 漂移判断。
+  \item 频率或环境记录。
+  \item 绑定 core 前后的对比。
+  \item 说明你的机器是否适合做精细 microbenchmark。
+\end{enumerate}
+\end{labbox}
+
+\subsection{实验 17.5：复现实验包}
+
+\begin{labbox}
+目标：把一次性能实验整理成别人能复查的结果包。
+
+目录：
+
+\begin{lstlisting}
+results/ch17_repro/
+    README.md
+    command.txt
+    environment.txt
+    raw_samples.csv
+    summary.csv
+    ab_comparison.csv
+    objdump.txt
+    perf_stat.txt
+    notes.md
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item \code{README.md} 写清楚如何重新运行。
+  \item \code{notes.md} 写清楚假设、结果和限制。
+  \item 保留所有 raw samples。
+  \item 至少包含一个 A/B comparison。
+  \item 至少包含一个你认为 inconclusive 的结果，并解释为什么。
+\end{enumerate}
+\end{labbox}
+
+\subsection{本章作业}
+
+\begin{exercisebox}
+\subsubsection*{作业 1：统计量解释}
+
+给定样本：
+
+\begin{lstlisting}
+100, 101, 100, 102, 101, 100, 500
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 排序。
+  \item 计算 min、mean、median、max。
+  \item 解释 mean 和 median 为什么差异很大。
+  \item 判断是否存在 outlier。
+  \item 写出你会如何报告这组样本。
+\end{enumerate}
+
+\subsubsection*{作业 2：分布形状分类}
+
+对下面四组样本分类，并说明可能原因：
+
+\begin{lstlisting}
+A: 100, 101, 100, 101, 102, 100
+B: 100, 101, 102, 150, 300, 900
+C: 100, 101, 100, 170, 171, 169
+D: 100, 102, 105, 110, 118, 127
+\end{lstlisting}
+
+要求至少提到稳定、右长尾、双峰、漂移中的三个概念。
+
+\subsubsection*{作业 3：A/B 结论审计}
+
+给定：
+
+\begin{lstlisting}
+A median = 100 ns, p95 = 103 ns, CV = 0.01
+B median = 98 ns,  p95 = 120 ns, CV = 0.08
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 计算 median speedup。
+  \item 判断 B 是否可以简单称为“更快”。
+  \item 解释 p95 和 CV 暗示了什么风险。
+  \item 写一段严谨结论。
+\end{enumerate}
+
+\subsubsection*{作业 4：噪声来源调查}
+
+在你的机器上运行同一个 benchmark：
+
+\begin{enumerate}
+  \item 不绑定 core。
+  \item 使用 \code{taskset} 绑定一个 core。
+  \item 后台运行一个 CPU 密集程序。
+  \item 如果可以，在电源不同模式下运行。
+\end{enumerate}
+
+提交每种条件下的 median、p95、max、CV，并解释差异。
+
+\subsubsection*{作业 5：完整统计报告}
+
+基于第 16 章的 suite，选择一个 kernel 做完整统计报告：
+
+\begin{itemize}
+  \item 至少 100 个 raw samples。
+  \item 样本排序表。
+  \item 统计 summary。
+  \item 分布形状判断。
+  \item outlier 调查。
+  \item 至少一次 A/B 比较。
+  \item 结论和限制。
+\end{itemize}
+
+\subsubsection*{评分标准}
+
+本章作业按下面标准评价：
+
+\begin{enumerate}
+  \item 是否保存并使用 raw samples。
+  \item 是否能正确解释 mean、median、p95、max 和 CV。
+  \item 是否能识别分布形状，而不是只报一个数字。
+  \item outlier 处理是否透明。
+  \item A/B 比较是否避免运行顺序偏差。
+  \item 结论是否明确限制在具体环境和 workload 下。
+  \item 复现实验包是否足够别人复查。
+\end{enumerate}
+\end{exercisebox}
+
+\subsection{本章小结}
+
+本章把 benchmark 输出的数字变成可解释的证据：
+
+\begin{lstlisting}
+raw samples:
+    preserve first, summarize second
+
+summary:
+    min, mean, median, p95, max, stddev, CV
+
+distribution:
+    stable, right-tail, bimodal, drift, step
+
+outlier:
+    explain and document; do not silently delete
+
+A/B comparison:
+    alternate or randomize order
+    compare distributions, not only medians
+
+reproducibility:
+    raw data, command, environment, binary, objdump, perf, notes
+\end{lstlisting}
+
+从现在开始，你写性能结论时应当更克制：不是“优化后快了”，而是“在这台机器、这个输入规模、这个编译参数、这个样本分布下，B 的 median 比 A 低 7\%，p95 也更低，汇编显示依赖链减少，PMU cycles 下降；但频率未固定，所以仍需在受控环境复测”。这才是性能工程里可信的表达方式。

@@ -1,9 +1,1219 @@
-\plannedchapter{Lab 00：benchmark harness 深入解剖}
-{本章把仓库中的 Lab 00 作为第一个完整实验系统，逐行讲解 benchmark harness 的设计。}
-{\item 为什么需要 workload factory？
-\item \code{do_not_optimize} 和 \code{clobber_memory} 分别解决什么？
-\item 如何扩展一个新 benchmark case？}
-{\item C++ harness 架构。
-\item CSV 输出、summary 生成、环境记录。
-\item 单元测试、coverage 和 correctness reference。}
-{新增一个 \code{triad_f32} benchmark case，补测试、运行脚本和报告。}
+\section{Lab 00：建立可信性能实验室}
+
+\subsection{本章定位}
+
+前面三章分别建立了性能测量的原则、benchmark suite 的工程结构、统计和噪声分析的方法。本章把这些原则落到第一个完整实验：\filepath{labs/lab00_benchmark_foundation}。
+
+这不是一个“跑一下看看速度”的小练习，而是后续所有优化实验的地基。你以后做汇编、SIMD、cache 优化、矩阵乘法、softmax、LayerNorm、算子融合时，都必须回答同一组问题：
+
+\begin{itemize}
+  \item 代码是否正确？
+  \item 被测区域到底包含什么？
+  \item 编译器有没有把工作删掉、提前算掉、合并掉？
+  \item 输入规模和数据分布是否覆盖了你声称的场景？
+  \item raw samples 是否保存？
+  \item summary 是否来自 raw samples，而不是手工挑数？
+  \item 环境、构建模式、编译器、CPU 信息是否记录？
+  \item 结论能否被二进制、反汇编、PMU 或系统信息支持？
+\end{itemize}
+
+本章的目标不是让你马上写最快的 kernel，而是让你拥有一个能产生可信证据的实验室。没有这个地基，所谓优化很容易退化成猜测。
+
+\begin{keyidea}
+可信性能实验的顺序是：先 correctness，再 measurement boundary，再 raw data，再 statistics，再 binary audit，最后才是 performance claim。任何跳过前面步骤的结论都不稳。
+\end{keyidea}
+
+\subsection{你要交付什么}
+
+完成本章后，你应该提交一个完整的 \code{Lab 00} 报告，而不是一张截图。报告至少包含：
+
+\begin{itemize}
+  \item 运行命令和构建类型。
+  \item \filepath{results/lab00/env.txt} 的关键环境摘要。
+  \item \code{ctest} 正确性结果。
+  \item \filepath{results/lab00/foundation.csv} 的 raw sample 摘要。
+  \item 每个 benchmark 在不同输入规模下的 min、median、max。
+  \item 对 \filepath{results/lab00/bad_benchmarks.txt} 中错误案例的解释。
+  \item 至少一个 kernel 的反汇编审计记录。
+  \item 至少 5 条你现在愿意遵守的 benchmark 规则。
+  \item 至少 3 个你仍然不能确定、需要后续章节解决的问题。
+\end{itemize}
+
+如果你不能把这些信息整理出来，说明你还没有真正掌握实验流程；如果你能稳定地产生这些信息，后面的优化工作才有可比较的基础。
+
+\subsection{目录地图}
+
+先从目录看这个 lab 的结构：
+
+\begin{lstlisting}
+labs/lab00_benchmark_foundation/
+  CMakeLists.txt
+  include/lab00/
+    benchmark.hpp
+    kernels.hpp
+  src/
+    benchmark.cpp
+    kernels.cpp
+    main.cpp
+    bad_benchmarks.cpp
+  tests/
+    lab00_tests.cpp
+  scripts/
+    run_lab00.sh
+\end{lstlisting}
+
+对应的输出目录是：
+
+\begin{lstlisting}
+results/lab00/
+  env.txt
+  foundation.csv
+  summary.md
+  bad_benchmarks.txt
+\end{lstlisting}
+
+这两个目录构成了实验闭环：
+
+\begin{lstlisting}
+source code
+    -> build
+    -> tests
+    -> environment report
+    -> benchmark raw samples
+    -> summary
+    -> bad examples
+    -> written report
+\end{lstlisting}
+
+注意这里的顺序。测试在 benchmark 之前，因为错误代码跑得再快也没有价值。环境记录在 benchmark 之前，因为后续解释数据时你需要知道机器和系统状态。raw samples 在 summary 之前，因为 summary 必须可追溯。
+
+\subsection{一键运行脚本不是魔法}
+
+先看最重要的运行入口：
+
+\begin{lstlisting}
+bash labs/lab00_benchmark_foundation/scripts/run_lab00.sh
+\end{lstlisting}
+
+这个脚本做了几件事：
+
+\begin{lstlisting}
+configure Release build
+build lab00_bench, lab00_bad_benchmarks, lab00_tests
+run CTest
+write environment report
+run foundation benchmark
+summarize CSV
+run intentionally bad benchmark examples
+\end{lstlisting}
+
+对应的关键命令如下：
+
+\begin{lstlisting}[language=bash]
+cmake -S "${ROOT_DIR}" -B "${BUILD_DIR}" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCPU_BUILD_LABS=ON
+
+cmake --build "${BUILD_DIR}" \
+    --target lab00_bench lab00_bad_benchmarks lab00_tests
+
+ctest --test-dir "${BUILD_DIR}" \
+    -R lab00_tests \
+    --output-on-failure
+
+"${ROOT_DIR}/tools/env_report.sh" > "${RESULT_DIR}/env.txt"
+
+"${BUILD_DIR}/labs/lab00_benchmark_foundation/lab00_bench" \
+    --sizes 1024,16384,1048576 \
+    --warmup 3 \
+    --iterations 10 \
+    --csv "${RESULT_DIR}/foundation.csv"
+\end{lstlisting}
+
+这里有两个非常重要的设计点。
+
+第一，构建类型是 \code{Release}。Debug build 的性能数据不能用于优化结论，因为它通常包含额外的调试信息、较低优化等级、不同的内联决策、不同的寄存器分配和更多框架开销。Debug build 可以用来调试 correctness，不应用来报告性能。
+
+第二，脚本把输出保存到 \filepath{results/lab00}，而不是只打印到屏幕。性能实验必须留下产物。没有产物，就不能比较、复查、画图、重算统计量，也不能在几周后解释当时发生了什么。
+
+\begin{warningbox}
+一键脚本不是为了偷懒，而是为了减少人为差异。一个实验如果只能靠你手工敲十几条命令复现，那么它迟早会因为漏一步、错一个参数或换一个目录而失真。
+\end{warningbox}
+
+\subsection{CMake 架构：为什么要拆成库、程序和测试}
+
+\filepath{labs/lab00_benchmark_foundation/CMakeLists.txt} 把 lab 拆成四个目标：
+
+\begin{lstlisting}
+lab00_benchmark       static library
+lab00_bench           benchmark executable
+lab00_bad_benchmarks  wrong benchmark examples
+lab00_tests           correctness tests
+\end{lstlisting}
+
+为什么不把所有代码都塞进一个 \code{main.cpp}？
+
+\begin{itemize}
+  \item kernel 和 runner 放进库，测试程序可以直接调用它们。
+  \item benchmark 主程序只处理 CLI 和输出，不承担核心逻辑。
+  \item 错误 benchmark 单独成程序，避免污染正常实验。
+  \item 后续 lab 可以复用 runner 或对比不同实现。
+  \item CTest 能够在运行 benchmark 前先验证基础行为。
+\end{itemize}
+
+这一点非常像大型性能库的工程结构。生产级 GEMM、FFT、DNN 算子库不会把 kernel、测试、benchmark、报告脚本混在一个文件里。它们会把 correctness、measurement、dispatch、report 分开，因为每一层都有不同的不变量。
+
+\begin{lstlisting}
+add_library(lab00_benchmark STATIC
+    src/benchmark.cpp
+    src/kernels.cpp
+)
+
+target_include_directories(lab00_benchmark
+    PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+add_executable(lab00_bench
+    src/main.cpp
+)
+
+target_link_libraries(lab00_bench PRIVATE lab00_benchmark)
+
+add_executable(lab00_tests
+    tests/lab00_tests.cpp
+)
+
+target_link_libraries(lab00_tests PRIVATE lab00_benchmark)
+\end{lstlisting}
+
+这里的 \code{target_include_directories(... PUBLIC ...)} 表示使用 \code{lab00_benchmark} 的目标也能看到 \filepath{include}。因此源码可以写稳定的 include：
+
+\begin{lstlisting}[language=C++]
+#include <lab00/benchmark.hpp>
+#include <lab00/kernels.hpp>
+\end{lstlisting}
+
+这比深层相对路径更稳：
+
+\begin{lstlisting}[language=C++]
+// 不推荐
+#include "../include/lab00/benchmark.hpp"
+\end{lstlisting}
+
+后者会把文件位置耦合到源码路径，目录一变就坏；前者表达的是模块接口。
+
+\subsection{公共 API：benchmark harness 的骨架}
+
+打开 \filepath{include/lab00/benchmark.hpp}，先看几个核心类型：
+
+\begin{lstlisting}[language=C++]
+struct BenchmarkConfig {
+    std::size_t warmup_iterations = LAB00_DEFAULT_WARMUP_ITERATIONS;
+    std::size_t measured_iterations = LAB00_DEFAULT_MEASURED_ITERATIONS;
+    std::vector<std::size_t> input_sizes;
+    std::string only_name;
+};
+
+struct BenchmarkResult {
+    std::string name;
+    std::size_t input_size = 0;
+    std::size_t iteration = 0;
+    std::int64_t elapsed_ns = 0;
+    std::uint64_t checksum = 0;
+};
+
+using BenchmarkWorkload = std::function<std::uint64_t()>;
+using BenchmarkFactory = std::function<BenchmarkWorkload(std::size_t input_size)>;
+
+struct BenchmarkCase {
+    std::string name;
+    BenchmarkFactory make_workload;
+};
+\end{lstlisting}
+
+这些类型看起来普通，但它们把一个 benchmark 的核心边界定义出来了。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.58\linewidth}}
+\toprule
+类型 & 职责 \\
+\midrule
+\code{BenchmarkConfig} & 描述一次实验如何运行：warmup 次数、测量次数、输入规模、是否只运行某个 case。 \\
+\code{BenchmarkResult} & 描述一次观测：哪个 benchmark、哪个输入规模、第几次、耗时多少、结果校验值是多少。 \\
+\code{BenchmarkWorkload} & 一个已经准备好输入、可以直接计时调用的闭包。 \\
+\code{BenchmarkFactory} & 根据输入规模创建 workload，准备阶段不进入计时区域。 \\
+\code{BenchmarkCase} & 把名字和 workload factory 绑定起来。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里最关键的是 \code{BenchmarkFactory} 和 \code{BenchmarkWorkload} 的分离。
+
+\begin{lstlisting}
+factory(input_size):
+    allocate buffers
+    initialize data
+    capture buffers in closure
+    return workload
+
+workload():
+    run only the hot kernel
+    return checksum
+\end{lstlisting}
+
+如果没有 factory，很多初学者会把分配、初始化、随机数生成和 kernel 混在一个函数里计时。那样测到的是“整个准备流程”的成本，不是 kernel 成本。
+
+\begin{mentalmodel}
+把 factory 看成“实验样本制备”，把 workload 看成“被测热路径”。样本制备可以复杂，但不能混入热路径；热路径应该尽量只包含你真正想比较的代码。
+\end{mentalmodel}
+
+\subsection{Runner 数据流}
+
+\code{BenchmarkRunner::run()} 是这个 lab 的心脏。它的逻辑可以压缩成下面的流程：
+
+\begin{lstlisting}
+for each benchmark case:
+    if --only does not match:
+        skip
+
+    for each input size:
+        workload = factory(input_size)
+
+        repeat warmup_iterations:
+            checksum = workload()
+            do_not_optimize(checksum)
+
+        repeat measured_iterations:
+            begin = steady_clock::now()
+            checksum = workload()
+            end = steady_clock::now()
+
+            do_not_optimize(checksum)
+            append BenchmarkResult
+\end{lstlisting}
+
+真实代码中的核心片段是：
+
+\begin{lstlisting}[language=C++]
+for (std::size_t iteration = 0; iteration < this->config_.measured_iterations; ++iteration) {
+    auto const begin = std::chrono::steady_clock::now();
+    std::uint64_t const checksum = workload();
+    auto const end = std::chrono::steady_clock::now();
+
+    do_not_optimize(checksum);
+
+    results.push_back(BenchmarkResult{
+        .name = benchmark_case.name,
+        .input_size = input_size,
+        .iteration = iteration,
+        .elapsed_ns = elapsed_nanoseconds(begin, end),
+        .checksum = checksum,
+    });
+}
+\end{lstlisting}
+
+这段代码有三个边界要盯住。
+
+第一，\code{begin} 和 \code{end} 之间只包含 \code{workload()}。如果这里出现日志、分配、格式化、文件写入、随机数生成，benchmark 就被污染。
+
+第二，\code{do_not_optimize(checksum)} 在计时之后调用。它告诉编译器结果被观察了，不能随便删掉计算。它不应该把大量额外工作加入计时区域。
+
+第三，\code{results.push_back(...)} 在计时之后发生。记录结果本身不是 kernel 的一部分。
+
+\subsection{\code{steady_clock} 和 \code{elapsed_ns}}
+
+这个 lab 使用 \code{std::chrono::steady_clock}：
+
+\begin{lstlisting}[language=C++]
+[[nodiscard]] std::int64_t elapsed_nanoseconds(
+    std::chrono::steady_clock::time_point begin,
+    std::chrono::steady_clock::time_point end)
+{
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count();
+}
+\end{lstlisting}
+
+\code{steady_clock} 的语义是单调时间源：时间点不会因为系统时间校准而倒退。它适合做一般 benchmark 的第一层计时。它的缺点是：一次调用的开销不是零，分辨率和实现依赖平台，极短 kernel 可能被计时器开销淹没。
+
+因此，本章实验有两个实践规则：
+
+\begin{itemize}
+  \item 如果 kernel 太短，增大输入规模或增加 batch，避免一次测量接近计时器开销。
+  \item 不要把 \code{elapsed_ns} 直接当成 CPU cycles。cycles 需要 TSC 或 PMU 辅助观察。
+\end{itemize}
+
+后续章节会引入 \code{rdtsc}、\code{rdtscp}、serializing instruction、PMU event 和 top-down analysis。本章先用 \code{steady_clock} 建立可移植地基。
+
+\subsection{\code{do_not_optimize}：和优化器达成边界协议}
+
+性能测量最常见的灾难之一是：你以为代码跑完了，编译器发现结果没人用，于是把它删了。
+
+本 lab 的 \code{do_not_optimize} 是：
+
+\begin{lstlisting}[language=C++]
+template <typename T>
+inline void do_not_optimize(T const& value) noexcept
+{
+#if defined(__clang__) || defined(__GNUC__)
+    asm volatile("" : : "g"(value) : "memory");
+#else
+    auto const volatile* volatile_value = &value;
+    static_cast<void>(volatile_value);
+#endif
+}
+\end{lstlisting}
+
+对 GCC 和 Clang，这是一段空的 inline assembly。它不生成实际指令，但它告诉编译器：
+
+\begin{itemize}
+  \item \code{value} 是输入操作数。
+  \item 这段 asm 是 \code{volatile}，不能随意删除。
+  \item \code{"memory"} clobber 表示内存可能被观察或影响，不能跨过它任意重排内存访问。
+\end{itemize}
+
+它不是性能优化指令；它是测量边界工具。它解决的是“编译器是否认为结果可删除”的问题，不解决 OS 噪声、cache 状态、频率变化、分支预测等问题。
+
+\begin{warningbox}
+\code{do_not_optimize} 不是万能护身符。它只能降低某些编译器优化对测量的破坏，不能把一个设计错误的 benchmark 变成可信实验。
+\end{warningbox}
+
+\subsection{\code{clobber_memory}：告诉编译器内存边界存在}
+
+对写内存的 kernel，例如 \code{fill_u8} 和 \code{copy_u8}，还需要避免编译器认为某些内存写可以被重排或消除。lab 中使用：
+
+\begin{lstlisting}[language=C++]
+inline void clobber_memory() noexcept
+{
+#if defined(__clang__) || defined(__GNUC__)
+    asm volatile("" : : : "memory");
+#endif
+}
+\end{lstlisting}
+
+\code{clobber_memory()} 不会刷新 CPU cache，也不会执行内存屏障指令。它主要约束编译器，而不是约束硬件。理解这一点很重要：
+
+\begin{lstlisting}
+compiler barrier:
+    affects compiler reordering
+    usually emits no hardware instruction
+
+hardware memory fence:
+    affects CPU memory ordering
+    may emit mfence, lfence, sfence, lock-prefixed instruction, etc.
+\end{lstlisting}
+
+本 lab 暂时只需要 compiler barrier。多线程、atomic、memory ordering 会在后面的并发章节单独讲。
+
+\subsection{CSV：raw sample 是一等公民}
+
+\code{BenchmarkRunner::write_csv()} 输出：
+
+\begin{lstlisting}
+name,input_size,iteration,elapsed_ns,checksum
+sum_i32,1024,0,521,18446744073709551111
+sum_i32,1024,1,514,18446744073709551111
+sum_i32,1024,2,514,18446744073709551111
+\end{lstlisting}
+
+每一行代表一次测量，不是最终结论。这个格式有几个优点：
+
+\begin{itemize}
+  \item \code{name} 支持多个 benchmark。
+  \item \code{input_size} 支持规模扫描。
+  \item \code{iteration} 保留重复测量顺序。
+  \item \code{elapsed_ns} 保留原始耗时。
+  \item \code{checksum} 帮助检查结果是否稳定。
+\end{itemize}
+
+注意 \code{checksum} 不是完整 correctness test。它只说明某次 workload 返回了一个被观察的值。真正的 correctness 仍然需要 \code{lab00_tests} 或 reference implementation。
+
+\begin{deepdive}
+为什么 CSV 里不直接只写 median？因为 median 是可重新计算的派生结果，而 raw sample 不是。保存 raw sample 等于保存实验事实；保存 summary 只是保存一次解释。
+\end{deepdive}
+
+\subsection{五个基础 kernel}
+
+\filepath{src/kernels.cpp} 注册了五个 benchmark：
+
+\begin{lstlisting}
+sum_i32
+sum_f32
+dot_f32
+fill_u8
+copy_u8
+\end{lstlisting}
+
+它们看起来简单，但刚好覆盖后续优化常见问题。
+
+\begin{center}
+\begin{tabular}{L{0.18\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+kernel & 主要工作 & 后续会牵出的主题 \\
+\midrule
+\code{sum_i32} & 整数数组规约。 & load 吞吐、整数加法、循环展开、向量规约。 \\
+\code{sum_f32} & 浮点数组规约。 & 浮点结合律、fast-math、向量化、数值误差。 \\
+\code{dot_f32} & 两个数组乘加规约。 & FMA、内存带宽、寄存器累加器、SIMD lane。 \\
+\code{fill_u8} & 写一个字节数组。 & store 带宽、写分配、\code{memset}、cache line。 \\
+\code{copy_u8} & 从一个数组复制到另一个数组。 & load/store 平衡、\code{memcpy}、预取、内存带宽。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这五个 kernel 不是为了炫技，而是为了建立性能分类直觉：
+
+\begin{lstlisting}
+sum_i32:
+    one input stream
+    integer accumulation
+    likely memory-sensitive for large n
+
+sum_f32:
+    one input stream
+    floating accumulation
+    compiler may preserve strict order unless allowed otherwise
+
+dot_f32:
+    two input streams
+    multiply + add
+    can use FMA if compiler and target allow
+
+fill_u8:
+    write stream
+    may map to optimized memset-like code
+
+copy_u8:
+    read stream + write stream
+    memory subsystem dominates for large n
+\end{lstlisting}
+
+等你后面学到 SIMD 和 microarchitecture，再回头看这些 baseline，会发现它们几乎覆盖了所有基础性能模式。
+
+\subsection{确定性输入：实验不能依赖当天运气}
+
+以 \code{make_i32_input} 为例：
+
+\begin{lstlisting}[language=C++]
+[[nodiscard]] std::vector<std::int32_t> make_i32_input(std::size_t input_size)
+{
+    std::vector<std::int32_t> values(input_size);
+    for (std::size_t index = 0; index < values.size(); ++index) {
+        auto const raw = static_cast<std::int32_t>(
+            (index * LAB00_I32_PATTERN_MULTIPLIER + LAB00_I32_PATTERN_OFFSET)
+            % LAB00_I32_PATTERN_MODULUS);
+        values[index] = raw - LAB00_I32_PATTERN_CENTER;
+    }
+    return values;
+}
+\end{lstlisting}
+
+这里没有在热路径里调用随机数生成器。输入在 factory 阶段生成，然后被 workload 捕获。
+
+\begin{lstlisting}[language=C++]
+benchmarks.push_back(make_case("sum_i32", [](std::size_t input_size) {
+    return [values = make_i32_input(input_size)]() -> std::uint64_t {
+        return checksum_i64(sum_i32(values));
+    };
+}));
+\end{lstlisting}
+
+这个捕获动作很重要：
+
+\begin{lstlisting}
+factory time:
+    allocate vector
+    fill vector
+    move vector into closure
+
+measured time:
+    call sum_i32(values)
+    return checksum
+\end{lstlisting}
+
+如果把输入生成放进 measured time，测到的就是输入生成加 kernel 的总和。对小 kernel 来说，输入生成甚至可能远远超过 kernel 本身。
+
+\subsection{CLI：让实验参数显式化}
+
+\filepath{src/main.cpp} 支持：
+
+\begin{lstlisting}
+--help
+--list
+--csv <path>
+--sizes <a,b,c>
+--warmup <count>
+--iterations <count>
+--only <name>
+\end{lstlisting}
+
+这不是为了界面好看，而是为了让实验条件出现在命令行里。命令行比“改源码里的常量再编译”更适合实验记录。
+
+列出所有 benchmark：
+
+\begin{lstlisting}[language=bash]
+build/lab00-release/labs/lab00_benchmark_foundation/lab00_bench --list
+\end{lstlisting}
+
+只运行 \code{dot_f32}：
+
+\begin{lstlisting}[language=bash]
+build/lab00-release/labs/lab00_benchmark_foundation/lab00_bench \
+  --only dot_f32 \
+  --sizes 1024,16384,1048576 \
+  --warmup 3 \
+  --iterations 10
+\end{lstlisting}
+
+这里的 \code{--only} 对后续调试很重要。一个完整 benchmark suite 可能有几十个 case，如果你每次改一个 kernel 都跑全量，会浪费大量时间，也会让调试反馈变慢。
+
+\subsection{输入规模：Lab 00 的三档只是起点}
+
+默认输入规模是：
+
+\begin{lstlisting}
+1024
+16384
+1048576
+\end{lstlisting}
+
+这三个数并不是神秘常数。它们分别代表：
+
+\begin{itemize}
+  \item 小规模：函数调用、循环开销、前端和计时器开销更明显。
+  \item 中规模：更接近 cache 内工作集。
+  \item 大规模：更容易触及内存带宽和缓存层级。
+\end{itemize}
+
+但是你不能永远只测这三档。本章作业会要求你加入更多规模：
+
+\begin{lstlisting}
+16,64,256,1024,4096,16384,65536,262144,1048576,4194304
+\end{lstlisting}
+
+这些规模能帮助你观察曲线形状：
+
+\begin{lstlisting}
+small n:
+    fixed overhead dominates
+
+medium n:
+    cache behavior and vectorization become visible
+
+large n:
+    bandwidth and memory hierarchy dominate
+\end{lstlisting}
+
+真正的优化报告通常不是一个数字，而是一条曲线。
+
+\subsection{测试：正确性是性能实验的入口}
+
+\filepath{tests/lab00_tests.cpp} 是一个无第三方依赖的小测试程序。它覆盖：
+
+\begin{itemize}
+  \item \code{parse_size_list} 能解析逗号分隔的输入规模。
+  \item \code{parse_size_list} 会拒绝 0。
+  \item \code{sum_i32}、\code{sum_f32}、\code{dot_f32} 的基础正确性。
+  \item \code{dot_f32} 会拒绝不等长输入。
+  \item \code{fill_u8} 和 \code{copy_u8} 会写出期望数据。
+  \item benchmark case 数量符合预期。
+  \item runner 只记录 measured iterations，不记录 warmup。
+  \item \code{--only} 过滤语义。
+  \item CSV 输出格式。
+\end{itemize}
+
+运行命令：
+
+\begin{lstlisting}[language=bash]
+ctest --test-dir build/lab00-release -R lab00_tests --output-on-failure
+\end{lstlisting}
+
+测试代码里有一个简单的 \code{require}：
+
+\begin{lstlisting}[language=C++]
+void require(bool condition, std::string_view message)
+{
+    if (!condition) {
+        throw std::runtime_error(std::string(message));
+    }
+}
+\end{lstlisting}
+
+这不是完整测试框架，但足够让本 lab 不依赖外部库。后续如果你愿意，可以迁移到 Catch2、GoogleTest 或 doctest；但无论使用什么框架，原则不变：先测 correctness，再跑 benchmark。
+
+\subsection{覆盖率：知道自己测到了什么}
+
+仓库里提供了：
+
+\begin{lstlisting}[language=bash]
+bash tools/run_coverage.sh
+cat results/coverage/summary.txt
+\end{lstlisting}
+
+覆盖率不是质量的全部，但它能暴露一个常见问题：你以为测试覆盖了某个分支，实际上完全没有执行过。
+
+对 Lab 00，覆盖率重点不是追求漂亮数字，而是检查这些风险点：
+
+\begin{itemize}
+  \item CLI 解析错误路径是否测试过。
+  \item size list 空 token、非数字、0 是否被拒绝。
+  \item runner 是否真的区分 warmup 和 measured iteration。
+  \item \code{dot_f32} 不等长输入是否报错。
+  \item CSV 输出格式是否稳定。
+\end{itemize}
+
+性能工程里，测试和 benchmark 的关系很紧：测试保证“结果可信”，benchmark 保证“速度可观察”。缺一个都不行。
+
+\subsection{错误 benchmark 博物馆}
+
+\filepath{src/bad_benchmarks.cpp} 故意展示四类错误：
+
+\begin{lstlisting}
+dead result not observed
+allocation inside timing
+RNG inside timing
+formatting inside timing
+\end{lstlisting}
+
+运行后查看：
+
+\begin{lstlisting}[language=bash]
+cat results/lab00/bad_benchmarks.txt
+\end{lstlisting}
+
+这些错误要认真看。它们比正确示例更能训练直觉。
+
+\subsubsection{错误一：结果没有被观察}
+
+错误版本：
+
+\begin{lstlisting}[language=C++]
+std::uint64_t sum = 0;
+for (std::uint64_t value : input) {
+    sum += value;
+}
+static_cast<void>(sum);
+\end{lstlisting}
+
+如果编译器能证明 \code{sum} 没有可观察效果，它可能删除整个循环。最后你测到的不是求和速度，而是空操作或残留框架开销。
+
+受控版本：
+
+\begin{lstlisting}[language=C++]
+std::uint64_t sum = 0;
+for (std::uint64_t value : input) {
+    sum += value;
+}
+lab00::do_not_optimize(sum);
+\end{lstlisting}
+
+这里 \code{do_not_optimize} 让结果成为编译器必须保留的输入。
+
+\subsubsection{错误二：把 allocation 放进计时区域}
+
+错误版本在计时区域里反复创建 vector：
+
+\begin{lstlisting}[language=C++]
+for (std::size_t repeat = 0; repeat < LAB00_BAD_REPEAT_COUNT; ++repeat) {
+    std::vector<std::uint64_t> values(LAB00_BAD_INPUT_SIZE, LAB00_BAD_VECTOR_FILL);
+    checksum += std::accumulate(values.begin(), values.end(), std::uint64_t{0});
+}
+\end{lstlisting}
+
+这测到的是：
+
+\begin{lstlisting}
+allocation
+    + initialization
+    + possible page fault
+    + allocator behavior
+    + sum
+\end{lstlisting}
+
+如果你的目标是测 \code{sum}，这就是污染。如果你的目标是测分配器，那又应该换一个 problem statement。
+
+\subsubsection{错误三：把 RNG 放进计时区域}
+
+随机数生成器本身有成本，而且成本不小。如果你把 RNG 放在热路径里，就无法区分：
+
+\begin{lstlisting}
+random generation cost
+    vs
+kernel cost
+\end{lstlisting}
+
+正确做法通常是预生成输入，然后只计时 kernel。除非你的真实 workload 就包含 RNG，而且你明确要测整个 workload。
+
+\subsubsection{错误四：把格式化放进计时区域}
+
+字符串格式化、IO、日志、流对象构造都不应该混进 kernel 计时区域。性能实验里，输出应该发生在测量之后：
+
+\begin{lstlisting}
+bad:
+    timed region includes formatting
+
+good:
+    timed region returns numeric result
+    reporting code formats after measurement
+\end{lstlisting}
+
+这个规则后续做 AI 算子也一样。不要在 kernel 计时区域里打印 tensor、保存文件、检查每个元素、分配临时字符串。
+
+\subsection{环境记录：没有上下文的数据没有解释力}
+
+\filepath{tools/env_report.sh} 会记录：
+
+\begin{lstlisting}
+date
+uname
+virtualization hint
+lscpu
+cpu flags
+compiler versions
+perf availability
+perf_event_paranoid
+git status
+\end{lstlisting}
+
+这些信息分别回答不同问题：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.66\linewidth}}
+\toprule
+字段 & 为什么重要 \\
+\midrule
+日期 & \code{date} 给性能数据提供时间背景，系统更新、温度和配置可能变化。 \\
+内核 & \code{uname} 记录 kernel 版本；它会影响调度、计时、PMU 权限和虚拟化表现。 \\
+CPU & \code{lscpu} 记录型号、核心数、cache、频率范围和 ISA flags。 \\
+指令集 & \code{cpu flags} 用来判断 AVX2、AVX-512、FMA、VNNI 等指令是否可能使用。 \\
+编译器 & 编译器版本会改变优化、向量化和代码生成。 \\
+PMU 工具 & \code{perf availability} 判断后续能否使用 PMU 做硬件事件分析。 \\
+PMU 权限 & \code{perf_event_paranoid} 决定普通用户能否读取某些性能计数器。 \\
+代码状态 & \code{git status} 记录工作区是否有未提交代码。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+当你看到两个性能结果不同，不要马上说“代码变快了”或“代码变慢了”。先问：
+
+\begin{itemize}
+  \item CPU 是否同一台？
+  \item 编译器是否同一个？
+  \item 编译参数是否一样？
+  \item 是否在 WSL、VM 或 container 里？
+  \item 是否有未提交代码？
+  \item \code{perf_event_paranoid} 是否阻止了硬件事件读取？
+\end{itemize}
+
+\subsection{从源码到反汇编：第一次二进制审计}
+
+性能优化不能只看 C++。即使本章还没有正式进入汇编优化，你也应该开始建立源码到反汇编的映射。
+
+先构建 Release：
+
+\begin{lstlisting}[language=bash]
+cmake -S . -B build/lab00-release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCPU_BUILD_LABS=ON
+
+cmake --build build/lab00-release --target lab00_bench
+\end{lstlisting}
+
+找到二进制：
+
+\begin{lstlisting}
+build/lab00-release/labs/lab00_benchmark_foundation/lab00_bench
+\end{lstlisting}
+
+列出符号：
+
+\begin{lstlisting}[language=bash]
+nm -C build/lab00-release/labs/lab00_benchmark_foundation/lab00_bench \
+  | rg "sum_i32|sum_f32|dot_f32|fill_u8|copy_u8"
+\end{lstlisting}
+
+反汇编：
+
+\begin{lstlisting}[language=bash]
+objdump -d -Mintel -C \
+  build/lab00-release/labs/lab00_benchmark_foundation/lab00_bench \
+  > results/lab00/lab00_bench.objdump.txt
+\end{lstlisting}
+
+查找 \code{sum_i32}：
+
+\begin{lstlisting}[language=bash]
+rg -n "lab00::sum_i32" results/lab00/lab00_bench.objdump.txt
+\end{lstlisting}
+
+你可能看到类似形状的代码：
+
+\begin{lstlisting}
+00000000000035a0 <lab00::sum_i32(std::span<int const, ...>)>:
+    test   rsi,rsi
+    je     35d0
+    lea    rdx,[rdi+rsi*4]
+    xor    eax,eax
+.loop:
+    movsxd rcx,DWORD PTR [rdi]
+    add    rdi,0x4
+    add    rax,rcx
+    cmp    rdi,rdx
+    jne    .loop
+    ret
+\end{lstlisting}
+
+不同编译器、版本、优化参数和 CPU 目标会生成不同指令，所以不要死记这段。你要观察的是结构：
+
+\begin{itemize}
+  \item \register{rdi} 是否像指向数组起点的指针？
+  \item \register{rsi} 是否像元素个数？
+  \item 是否有循环边界？
+  \item load 指令是什么？
+  \item 每次循环处理几个元素？
+  \item 是否有 SIMD 指令？
+  \item 返回值是否在 \register{rax}？
+\end{itemize}
+
+把这些问题写进报告，比单纯贴一大段反汇编更有价值。
+
+\begin{deepdive}
+反汇编审计不是要求你现在完全看懂每条指令，而是训练你形成证据链：C++ 源码对应哪些符号，符号对应哪些指令，指令形状是否支持你的性能解释。
+\end{deepdive}
+
+\subsection{第一次 \code{perf stat} 审计}
+
+如果系统允许，可以运行：
+
+\begin{lstlisting}[language=bash]
+perf stat -e cycles,instructions,branches,branch-misses,cache-misses \
+  build/lab00-release/labs/lab00_benchmark_foundation/lab00_bench \
+  --only dot_f32 \
+  --sizes 1048576 \
+  --warmup 3 \
+  --iterations 10 \
+  --csv /tmp/lab00_dot.csv
+\end{lstlisting}
+
+你需要记录：
+
+\begin{itemize}
+  \item \code{cycles}：大致消耗多少 CPU 周期。
+  \item \code{instructions}：大致退休多少指令。
+  \item \code{branches} 和 \code{branch-misses}：分支行为是否明显。
+  \item \code{cache-misses}：大输入下是否出现缓存未命中。
+\end{itemize}
+
+如果命令失败，不要跳过。把失败原因写进报告。常见原因包括：
+
+\begin{itemize}
+  \item 系统没有安装 \code{perf}。
+  \item 当前环境是 WSL 或虚拟机，PMU 支持有限。
+  \item \code{perf_event_paranoid} 权限过高。
+  \item 容器没有暴露 perf event。
+\end{itemize}
+
+这也是性能工程的一部分：工具不可用本身就是环境事实。
+
+\subsection{怎样阅读 \code{summary.md}}
+
+\filepath{tools/summarize_bench_csv.py} 会从 raw CSV 生成摘要。你应该把它当作第一版报告，不要当作最终分析。
+
+一个好的摘要阅读顺序是：
+
+\begin{enumerate}
+  \item 先按 \code{name} 分组，看每个 kernel 是否都有结果。
+  \item 再按 \code{input_size} 分组，看规模是否覆盖预期。
+  \item 对每组看 min、median、max 的差距。
+  \item 如果 max 明显大于 median，回到 raw CSV 看是哪一次 iteration 慢。
+  \item 如果同一 kernel 随规模变化不合理，检查计时区域和输入生成。
+  \item 如果 checksum 不稳定，优先怀疑 correctness 或未初始化数据。
+\end{enumerate}
+
+不要只复制 summary。你要写解释，例如：
+
+\begin{lstlisting}
+copy_u8 at 1048576 bytes has higher elapsed_ns than sum_i32 at the same input size.
+This is expected because copy_u8 performs both a read stream and a write stream.
+However, the current result is only a first observation; I have not yet controlled
+CPU frequency or pinned the process to one core.
+\end{lstlisting}
+
+这种写法比“copy 比 sum 慢”更专业，因为它同时给出机制解释和限制条件。
+
+\subsection{本章实验流程}
+
+下面是本章你应该按顺序完成的任务。不要跳步。
+
+\begin{labbox}
+实验 18.1：跑通 Lab 00 基线
+
+任务：
+
+\begin{enumerate}
+  \item 执行 \cmd{bash labs/lab00_benchmark_foundation/scripts/run_lab00.sh}。
+  \item 确认 \filepath{results/lab00/env.txt} 存在。
+  \item 确认 \filepath{results/lab00/foundation.csv} 存在。
+  \item 确认 \filepath{results/lab00/summary.md} 存在。
+  \item 确认 \filepath{results/lab00/bad_benchmarks.txt} 存在。
+  \item 把脚本输出中的构建、测试和结果路径写进报告。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 一段运行记录。
+  \item 一段环境摘要。
+  \item 一段说明：为什么这个脚本先测试再 benchmark？
+\end{itemize}
+\end{labbox}
+
+\begin{labbox}
+实验 18.2：理解 raw CSV
+
+任务：
+
+\begin{enumerate}
+  \item 打开 \filepath{results/lab00/foundation.csv}。
+  \item 对每个 \code{name + input_size} 统计样本数。
+  \item 检查同组 checksum 是否一致。
+  \item 找出每组 min、median、max。
+  \item 标出 max 与 median 差距最大的三组。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 一张表，列出 \code{name}、\code{input_size}、sample count、min、median、max。
+  \item 对三组波动最大的结果做解释，不能只写“系统噪声”。
+\end{itemize}
+\end{labbox}
+
+\begin{labbox}
+实验 18.3：扩大输入规模扫描
+
+任务：
+
+\begin{enumerate}
+  \item 手动运行 \code{lab00_bench}，使用更多输入规模。
+  \item 至少包含 \code{16,64,256,1024,4096,16384,65536,262144,1048576,4194304}。
+  \item warmup 至少 3 次，measured iterations 至少 15 次。
+  \item 输出到 \filepath{results/lab00/foundation_wide.csv}。
+  \item 重新生成自己的 summary。
+\end{enumerate}
+
+建议命令：
+
+\begin{lstlisting}[language=bash]
+build/lab00-release/labs/lab00_benchmark_foundation/lab00_bench \
+  --sizes 16,64,256,1024,4096,16384,65536,262144,1048576,4194304 \
+  --warmup 3 \
+  --iterations 15 \
+  --csv results/lab00/foundation_wide.csv
+\end{lstlisting}
+
+交付物：
+
+\begin{itemize}
+  \item 每个 kernel 的规模曲线描述。
+  \item 指出哪个规模开始更像内存带宽问题。
+  \item 说明你的判断依据。
+\end{itemize}
+\end{labbox}
+
+\begin{labbox}
+实验 18.4：错误 benchmark 复盘
+
+任务：
+
+\begin{enumerate}
+  \item 阅读 \filepath{src/bad_benchmarks.cpp}。
+  \item 运行 \code{lab00_bad_benchmarks}。
+  \item 对四个错误分别写出“测到了什么”和“原本想测什么”。
+  \item 任选一个错误，修改源码制造一个更隐蔽的版本。
+  \item 写出你会怎样发现它。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 四个错误案例解释。
+  \item 一个自制错误案例。
+  \item 一个检查清单。
+\end{itemize}
+\end{labbox}
+
+\begin{labbox}
+实验 18.5：反汇编审计
+
+任务：
+
+\begin{enumerate}
+  \item 使用 \code{nm -C} 找到 \code{sum_i32}、\code{sum_f32}、\code{dot_f32}。
+  \item 使用 \code{objdump -d -Mintel -C} 保存反汇编。
+  \item 选择一个 kernel，截取 20 到 80 行相关反汇编。
+  \item 标注入口、循环、load、add 或 multiply、branch、return。
+  \item 判断是否出现 SIMD 指令。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 反汇编文件路径。
+  \item 一段带标注的反汇编。
+  \item 一段源码到指令的解释。
+\end{itemize}
+\end{labbox}
+
+\subsection{高质量作业：新增 \code{triad_f32}}
+
+本章的大作业是给 Lab 00 增加一个新 benchmark：\code{triad_f32}。
+
+目标函数语义：
+
+\begin{lstlisting}[language=C++]
+// out[i] = alpha * x[i] + y[i]
+std::uint64_t triad_f32(
+    std::span<const float> x,
+    std::span<const float> y,
+    std::span<float> out,
+    float alpha);
+\end{lstlisting}
+
+为什么选 \code{triad_f32}？
+
+\begin{itemize}
+  \item 它有两个输入流和一个输出流。
+  \item 它有乘法和加法，后续可以观察 FMA。
+  \item 它接近 STREAM benchmark 的 triad 模式。
+  \item 它是很多 AI 算子中线性组合的简化模型。
+  \item 它会迫使你处理 correctness、checksum、输入生成、输出缓冲、benchmark 注册、测试和报告。
+\end{itemize}
+
+\subsubsection{实现要求}
+
+你需要修改：
+
+\begin{lstlisting}
+labs/lab00_benchmark_foundation/include/lab00/kernels.hpp
+labs/lab00_benchmark_foundation/src/kernels.cpp
+labs/lab00_benchmark_foundation/tests/lab00_tests.cpp
+\end{lstlisting}
+
+函数要求：
+
+\begin{itemize}
+  \item 如果 \code{x}、\code{y}、\code{out} 长度不一致，抛出 \code{std::invalid_argument}。
+  \item 不使用递归。
+  \item 不在 kernel 内部分配内存。
+  \item 使用普通标量 C++ 实现，不要手写 SIMD。
+  \item 返回一个低成本 checksum，避免输出完全不可观察。
+  \item factory 阶段生成输入和输出缓冲。
+  \item measured region 只调用 \code{triad_f32}。
+\end{itemize}
+
+参考结构：
+
+\begin{lstlisting}[language=C++]
+std::uint64_t triad_f32(
+    std::span<const float> x,
+    std::span<const float> y,
+    std::span<float> out,
+    float alpha)
+{
+    if (x.size() != y.size() || x.size() != out.size()) {
+        throw std::invalid_argument("triad_f32 requires equal input sizes");
+    }
+
+    for (std::size_t index = 0; index < x.size(); ++index) {
+        out[index] = alpha * x[index] + y[index];
+    }
+
+    clobber_memory();
+    return checksum_f32(out.empty() ? 0.0F : out[out.size() / 2]);
+}
+\end{lstlisting}
+
+这段只是结构提示。你提交时要根据项目现有命名、常量和测试风格整理实现。
+
+\subsubsection{测试要求}
+
+至少增加这些测试：
+
+\begin{itemize}
+  \item 小数组计算结果正确。
+  \item 空数组行为明确。
+  \item 长度不一致会抛出异常。
+  \item \code{make_foundation_benchmarks} 注册数量增加。
+  \item runner 能通过 \code{--only triad_f32} 运行这个 case。
+\end{itemize}
+
+如果你只加 benchmark 不加测试，这个作业不合格。性能实验不是绕过 correctness 的捷径。
+
+\subsubsection{报告要求}
+
+报告必须回答：
+
+\begin{enumerate}
+  \item \code{triad_f32} 每个元素读取多少字节、写入多少字节？
+  \item 如果不考虑 cache 复用，它的 bytes per element 是多少？
+  \item 每个元素有多少浮点操作？
+  \item 它更可能是 compute-bound 还是 memory-bound？为什么？
+  \item 你的反汇编里有没有 FMA 指令？
+  \item 如果没有 FMA，你认为原因可能是什么？
+  \item 与 \code{dot_f32} 相比，它的内存流数量有什么不同？
+  \item 与 \code{copy_u8} 相比，它多了哪些算术工作？
+\end{enumerate}
+
+\subsection{评分标准}
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.14\linewidth}p{0.46\linewidth}}
+\toprule
+项目 & 分值 & 要求 \\
+\midrule
+跑通基线 & 10 & 脚本成功，四个结果文件齐全。 \\
+环境记录 & 10 & 能解释 CPU、编译器、构建模式、PMU 权限。 \\
+raw CSV 分析 & 15 & 按组统计样本，解释波动和 checksum。 \\
+错误 benchmark 复盘 & 15 & 能指出每个错误测到的真实成本。 \\
+反汇编审计 & 15 & 能把源码、符号、循环和关键指令对应起来。 \\
+\code{triad_f32} 实现 & 15 & API、实现、注册和热路径边界正确。 \\
+测试与覆盖 & 10 & 新增测试覆盖正常路径和错误路径。 \\
+性能解释 & 10 & 能用 bytes、FLOPs、输入规模和限制条件支撑结论。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{提交前检查清单}
+
+提交前逐项检查：
+
+\begin{itemize}
+  \item 是否使用 Release build？
+  \item 是否运行了 \code{ctest}？
+  \item 是否保存了 raw CSV？
+  \item 是否保存了环境记录？
+  \item 是否说明了输入规模？
+  \item 是否说明了 warmup 和 measured iterations？
+  \item 是否检查 checksum 是否稳定？
+  \item 是否解释了 min、median、max 的差距？
+  \item 是否避免把 allocation、RNG、formatting 放进热路径？
+  \item 是否保存了至少一个 kernel 的反汇编？
+  \item 是否说明结论的限制条件？
+\end{itemize}
+
+\subsection{本章总结}
+
+Lab 00 建立的是后续所有章节共用的实验纪律：
+
+\begin{lstlisting}
+correctness first
+measurement boundary explicit
+inputs deterministic
+raw samples preserved
+summary reproducible
+environment recorded
+binary audited
+claims limited by evidence
+\end{lstlisting}
+
+从下一部分开始，我们会进入编译器和 IR：C++ 源码如何被前端解析、如何变成中间表示、优化器如何改写循环、别名和未定义行为如何影响优化、为什么同一段 C++ 在不同编译参数下会生成完全不同的汇编。Lab 00 的价值在于：当你改变代码或编译参数时，你已经有了判断“是否真的变快”的工具。
