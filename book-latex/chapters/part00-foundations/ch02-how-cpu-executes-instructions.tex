@@ -1,0 +1,1140 @@
+\chapter{CPU 如何执行指令}
+
+\section{本章要解决的问题}
+
+上一章已经把一份 C/C++ 源码拆成了预处理、编译、汇编、链接、加载和进程执行。那条路径告诉我们：源代码最后会变成可执行文件中的机器码字节，操作系统把这些字节映射到进程的虚拟地址空间里，然后 CPU 从某个入口地址开始执行。
+
+本章继续往下一层走。我们要回答一个看似简单、实际非常关键的问题：
+
+\begin{center}
+\textbf{CPU 到底怎样把一条指令变成一次真实的机器行为？}
+\end{center}
+
+对初学者来说，这个问题通常会被几种不准确的说法遮住：
+
+\begin{itemize}
+  \item ``CPU 执行 C++ 代码''。
+  \item ``汇编就是 CPU 直接看到的东西''。
+  \item ``一条汇编就是一个硬件动作''。
+  \item ``CPU 一条一条顺序执行，所以源代码顺序就是真实执行顺序''。
+  \item ``内存就是一个大数组，访问一个变量就是直接去内存取它''。
+\end{itemize}
+
+这些说法都有一点影子，但都不够精确。为了做高性能计算、AI 算子优化和 CPU kernel 开发，必须建立更细的模型。我们不要求你在本章就理解现代乱序执行核心的所有细节，但你必须形成一条稳定的链路：
+
+\begin{center}
+C/C++ 表达式 $\rightarrow$ 汇编文本 $\rightarrow$ 机器码字节 $\rightarrow$ 指令语义 $\rightarrow$ 架构状态变化 $\rightarrow$ 微架构执行过程 $\rightarrow$ 性能现象
+\end{center}
+
+后面所有优化都会反复使用这条链路。你看一个循环为什么慢，最终还是要问：
+
+\begin{itemize}
+  \item 它生成了哪些指令？
+  \item 这些指令读写哪些寄存器和内存？
+  \item 哪些指令依赖前面的结果？
+  \item 哪些访问会打到 cache，哪些会去更远的内存层级？
+  \item 哪些分支会打断前端供给？
+  \item CPU 内部能否把多条指令重叠执行？
+\end{itemize}
+
+\begin{keyidea}
+本章不是为了把 CPU 讲成神秘黑盒，而是为了把 CPU 拆成几个可观察、可推理、可实验验证的层次。性能工程的第一原则是：先知道机器真正执行了什么，再讨论优化。
+\end{keyidea}
+
+\section{从一个最小函数开始}
+
+考虑这个 C++ 函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_i32(int x, int y)
+{
+    return x + y;
+}
+\end{lstlisting}
+
+在 x86-64 System V ABI 下，前两个整数参数通常通过 \register{edi} 和 \register{esi} 传入，32 位整数返回值通常放在 \register{eax}。一个容易理解的汇编版本可以写成：
+
+\begin{lstlisting}
+mov eax, edi
+add eax, esi
+ret
+\end{lstlisting}
+
+这三行已经包含了本章的核心问题：
+
+\begin{itemize}
+  \item \instruction{mov} 为什么能把一个参数复制到返回寄存器？
+  \item \instruction{add} 读了什么，写了什么？
+  \item \instruction{ret} 为什么能回到调用者？
+  \item CPU 怎样知道下一条该执行哪条指令？
+  \item 这些汇编文本进入可执行文件后到底是什么？
+\end{itemize}
+
+先强调一个事实：CPU 不知道变量名 \code{x} 和 \code{y}。变量名、函数名、类型名是源代码和调试信息层面的东西。CPU 执行时看到的是指令字节，操作的是寄存器、内存地址和状态位。
+
+如果把这个函数放进目标文件，用 \code{objdump -d -Mintel} 观察，机器码字节可能类似：
+
+\begin{lstlisting}
+89 f8        mov eax, edi
+01 f0        add eax, esi
+c3           ret
+\end{lstlisting}
+
+也可能在优化后看到：
+
+\begin{lstlisting}
+8d 04 37     lea eax, [rdi+rsi]
+c3           ret
+\end{lstlisting}
+
+编译器选择哪一种，取决于优化级别、目标 CPU、上下文和它是否需要保留 flags。这里先不急着判断哪种更好。本章先建立一个原则：
+
+\begin{mentalmodel}
+汇编是人类可读的指令表示，机器码是 CPU 取指单元读取的字节序列。C++ 源码不是 CPU 的输入，汇编文本通常也不是 CPU 的最终输入；真正被执行的是内存中的机器码字节。
+\end{mentalmodel}
+
+\section{CPU 是什么：从状态机开始理解}
+
+很多教材会直接说 CPU 由控制器、运算器和寄存器组成。这个说法没错，但对性能学习还不够。我们需要更底层一点的心智模型：CPU 是一个巨大而高速的状态机。
+
+所谓状态机，就是它有一组状态，每个时钟周期根据当前状态和输入计算出下一个状态。对程序员来说，最重要的状态包括：
+
+\begin{itemize}
+  \item 当前要执行的位置，也就是 instruction pointer，在 x86-64 中叫 \register{rip}。
+  \item 通用寄存器，例如 \register{rax}、\register{rbx}、\register{rcx}、\register{rdx}、\register{rdi}、\register{rsi}。
+  \item 栈指针 \register{rsp}。
+  \item 条件标志位 RFLAGS，例如 zero flag、carry flag、sign flag、overflow flag。
+  \item 内存中可见的数据。
+\end{itemize}
+
+从硬件实现角度看，CPU 内部有大量组合逻辑和时序逻辑。
+
+\term{组合逻辑}{combinational logic} 的输出只由当前输入决定。加法器、比较器、多路选择器、地址生成单元都可以从这个角度理解。给加法器两个输入位模式，它经过门电路传播后给出结果和进位。
+
+\term{时序逻辑}{sequential logic} 会保存状态。寄存器、流水线寄存器、重排序缓冲区中的条目、cache tag 阵列中的状态都属于这一类。时钟边沿到来时，一部分计算结果被锁存成新的状态。
+
+你不需要在本书前几章就掌握电路设计，但必须理解一点：机器执行不是抽象概念，它最终落实为状态的读、组合逻辑的计算和状态的写。
+
+\begin{center}
+\begin{minipage}{0.82\linewidth}
+\begin{verbatim}
+old state + instruction bytes
+        |
+        v
+decode instruction meaning
+        |
+        v
+read operands -> compute -> write results
+        |
+        v
+new state
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+这就是最朴素的 CPU 执行图景。现代 CPU 会把这个过程拆开、重叠、预测、乱序执行、再按程序顺序提交结果，但它必须最终制造出和 ISA 规定一致的可见状态。
+
+\section{ISA：软件和硬件之间的契约}
+
+\term{ISA}{instruction set architecture，指令集体系结构} 是软件和处理器之间的契约。对 x86-64 来说，ISA 规定了：
+
+\begin{itemize}
+  \item 有哪些寄存器。
+  \item 每条指令的编码格式。
+  \item 每条指令读写什么操作数。
+  \item 指令如何改变寄存器、内存、flags 和 \register{rip}。
+  \item 异常、中断、权限、页表等系统级行为如何表现。
+\end{itemize}
+
+ISA 不规定 CPU 内部必须如何实现。例如同样是执行 \instruction{add eax, esi}：
+
+\begin{itemize}
+  \item 一个简单教学 CPU 可以顺序取指、解码、读寄存器、加法、写回。
+  \item 一个现代桌面 CPU 可能把它解码为 micro-op，进入调度队列，等待操作数 ready，在某个整数执行端口上执行，最后在 retire 阶段提交。
+  \item 一个仿真器可以用软件解释这条指令。
+\end{itemize}
+
+只要对程序可见的结果一致，它们都符合 ISA。
+
+\term{架构状态}{architectural state} 是 ISA 规定的软件可见状态，例如通用寄存器、\register{rip}、RFLAGS 和内存。 \term{微架构}{microarchitecture} 是某个具体 CPU 实现 ISA 的内部方式，例如 pipeline、decode queue、uop cache、register renaming、reservation station、load/store queue、L1 cache、TLB 和 branch predictor。
+
+\begin{keyidea}
+ISA 决定正确性语义，微架构决定性能表现。同一份 x86-64 程序在不同 CPU 上结果应该一致，但速度可能差很多，因为内部实现不同。
+\end{keyidea}
+
+\section{x86-64 程序员模型}
+
+学习汇编时，先不要把 CPU 想成无限复杂的乱序机器。先从程序员模型开始。所谓程序员模型，就是写汇编、读反汇编、理解 ABI 时必须看到的那部分 CPU 状态。
+
+\subsection{通用寄存器}
+
+x86-64 有 16 个常用通用整数寄存器：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+64 位 & 32 位低半部分 & 常见用途 \\
+\midrule
+\register{rax} & \register{eax} & 返回值、通用计算 \\
+\register{rbx} & \register{ebx} & callee-saved 通用寄存器 \\
+\register{rcx} & \register{ecx} & 第 4 个整数参数、计数、通用计算 \\
+\register{rdx} & \register{edx} & 第 3 个整数参数、乘除辅助、通用计算 \\
+\register{rsi} & \register{esi} & 第 2 个整数/指针参数 \\
+\register{rdi} & \register{edi} & 第 1 个整数/指针参数 \\
+\register{rbp} & \register{ebp} & 栈帧指针或通用 callee-saved 寄存器 \\
+\register{rsp} & \register{esp} & 栈指针 \\
+\register{r8}  & \register{r8d} & 第 5 个整数/指针参数 \\
+\register{r9}  & \register{r9d} & 第 6 个整数/指针参数 \\
+\register{r10} & \register{r10d} & caller-saved 临时寄存器 \\
+\register{r11} & \register{r11d} & caller-saved 临时寄存器 \\
+\register{r12} & \register{r12d} & callee-saved 通用寄存器 \\
+\register{r13} & \register{r13d} & callee-saved 通用寄存器 \\
+\register{r14} & \register{r14d} & callee-saved 通用寄存器 \\
+\register{r15} & \register{r15d} & callee-saved 通用寄存器 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+寄存器不是变量。寄存器是 CPU 内部的高速状态存储单元。编译器会把源代码里的变量、临时值、地址、中间计算结果分配到寄存器或栈位置。一个变量可能根本没有固定的寄存器；一个寄存器在不同指令之间也可能承载不同含义。
+
+\subsection{32 位写入会清零高 32 位}
+
+x86-64 有一个非常重要的规则：写入 32 位寄存器通常会把对应 64 位寄存器的高 32 位清零。例如：
+
+\begin{lstlisting}
+mov eax, edi
+\end{lstlisting}
+
+这条指令写 \register{eax}，同时会让 \register{rax} 的高 32 位变成 0。这个规则经常帮助 CPU 避免旧高位造成的依赖，也让 32 位整数计算自然产生零扩展结果。
+
+\begin{warningbox}
+不要把 \register{eax} 理解成完全独立于 \register{rax} 的寄存器。它是 \register{rax} 的低 32 位视图。类似地，\register{ax}、\register{al} 也是同一个物理架构寄存器的更小视图。部分寄存器写入在某些老架构上还会带来额外依赖问题，后面讲性能时会再次出现。
+\end{warningbox}
+
+\subsection{RIP：CPU 下一步从哪里取指}
+
+\register{rip} 是 instruction pointer。它保存下一条要执行的指令地址。普通顺序执行时，CPU 取出当前指令后，会把 \register{rip} 更新到下一条指令地址。
+
+x86 指令长度不是固定的。刚才的例子中：
+
+\begin{lstlisting}
+89 f8        mov eax, edi
+01 f0        add eax, esi
+c3           ret
+\end{lstlisting}
+
+\instruction{mov eax, edi} 长 2 字节，\instruction{add eax, esi} 长 2 字节，\instruction{ret} 长 1 字节。所以如果第一条指令地址是 \code{0x1000}，顺序取指时大致会这样：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+执行前 \register{rip} & 指令字节 & 顺序下一地址 \\
+\midrule
+\code{0x1000} & \code{89 f8} & \code{0x1002} \\
+\code{0x1002} & \code{01 f0} & \code{0x1004} \\
+\code{0x1004} & \code{c3}    & 由栈中的返回地址决定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+跳转、调用、返回和异常都会改变 \register{rip}。控制流的本质就是改变 CPU 接下来从哪里取指。
+
+\subsection{RFLAGS：条件判断的隐含状态}
+
+很多整数指令会设置 RFLAGS。例如 \instruction{add} 不只写目标寄存器，还会更新 zero flag、sign flag、carry flag、overflow flag 等状态。条件跳转指令读取这些 flags 来决定是否跳转。
+
+例如：
+
+\begin{lstlisting}
+cmp edi, esi
+jg  greater
+\end{lstlisting}
+
+\instruction{cmp edi, esi} 的语义类似计算 \code{edi - esi} 并更新 flags，但不保存结果。 \instruction{jg} 读取 flags，判断有符号意义下 \register{edi} 是否大于 \register{esi}。
+
+这解释了为什么 \instruction{lea eax, [rdi+rsi]} 有时会替代 \instruction{add}：\instruction{lea} 做地址形式的整数计算，但通常不改 flags。如果后续代码还需要旧 flags，使用 \instruction{lea} 可以避免破坏它们；如果后续不需要 flags，编译器也可能因为编码或调度原因选择其中一种。
+
+\section{机器码字节和汇编文本}
+
+汇编文本是给人看的。机器码字节才是 CPU 取指单元读取的内容。汇编器负责把：
+
+\begin{lstlisting}
+mov eax, edi
+\end{lstlisting}
+
+变成：
+
+\begin{lstlisting}
+89 f8
+\end{lstlisting}
+
+这两个字节不是随意来的。x86 指令编码中包含 opcode、寄存器编号、寻址模式、立即数、位移、前缀等部分。完整 x86 编码非常复杂，本章只建立直觉。
+
+以 \instruction{mov eax, edi} 为例：
+
+\begin{itemize}
+  \item \code{89} 是一类 \instruction{mov} 指令的 opcode。
+  \item \code{f8} 是 ModRM 字节，描述源寄存器和目标寄存器。
+\end{itemize}
+
+以 \instruction{ret} 为例：
+
+\begin{itemize}
+  \item \code{c3} 就是一字节 near return 指令。
+\end{itemize}
+
+x86-64 是变长指令集。一条指令可以很短，也可以很长。变长编码带来代码密度优势，也让前端解码变复杂。现代 x86 CPU 为了高速执行，必须在前端投入大量硬件：取指、边界识别、解码、缓存已经解码过的 uops 等。后面讲前端瓶颈时，这一点会非常重要。
+
+\begin{mentalmodel}
+一条汇编指令不是一个字符串，而是一段字节的解释方式。反汇编器把字节翻译回人类可读文本；汇编器把文本翻译成字节。性能分析时，二者都要看，但最终以实际二进制中的字节和指令为准。
+\end{mentalmodel}
+
+\section{最朴素的 Fetch-Decode-Execute 模型}
+
+先构造一个极简 CPU 模型。它每次只执行一条指令，每条指令完整执行完才开始下一条：
+
+\begin{center}
+\begin{minipage}{0.78\linewidth}
+\begin{verbatim}
+while running:
+    bytes = fetch memory[RIP]
+    inst = decode(bytes)
+    next_RIP = RIP + length(inst)
+    operands = read_registers_or_memory(inst)
+    result = execute(inst, operands)
+    write_registers_or_memory(result)
+    RIP = choose_next_RIP(inst, next_RIP)
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+这个模型非常简化，但它的每个词都值得解释。
+
+\subsection{Fetch：取指}
+
+取指就是根据 \register{rip} 到内存层级中取机器码字节。现代 CPU 通常不是每次直接去主内存取字节，而是从 L1 instruction cache、uop cache 或其他前端结构中拿。第一次学习时可以先想象：
+
+\begin{center}
+\register{rip} $\rightarrow$ instruction memory $\rightarrow$ instruction bytes
+\end{center}
+
+如果指令字节不在前端 cache 里，取指就可能变慢。代码太大、分支太乱、热循环跨越不友好的边界，都可能影响前端供给。
+
+\subsection{Decode：解码}
+
+解码器把机器码字节解释成指令语义。它要知道：
+
+\begin{itemize}
+  \item 这是什么指令。
+  \item 指令有多长。
+  \item 操作数在哪里。
+  \item 是否有立即数或内存位移。
+  \item 这条指令应该读写哪些架构状态。
+\end{itemize}
+
+现代 x86 CPU 通常会把复杂 x86 指令解码成更接近内部执行格式的 micro-ops，简称 uops。不要把 uops 当成另一套必须立刻精通的汇编语言；现在只需要知道：软件看到 x86 指令，硬件内部可能执行一个或多个更小的操作。
+
+\subsection{Read operands：读取操作数}
+
+指令需要输入。输入可能来自：
+
+\begin{itemize}
+  \item 寄存器，例如 \register{edi}、\register{esi}。
+  \item 立即数，例如 \code{add eax, 5} 里的 \code{5}。
+  \item 内存，例如 \code{mov eax, dword ptr [rdi]}。
+  \item 隐含状态，例如 \instruction{ret} 隐含读取 \register{rsp} 指向的栈内存。
+\end{itemize}
+
+读寄存器通常很快。读内存则复杂得多，因为地址可能还要计算，虚拟地址可能要经过 TLB 翻译，数据可能在 L1/L2/L3 cache 或主内存。
+
+\subsection{Execute：执行}
+
+执行是根据指令语义完成计算或动作：
+
+\begin{itemize}
+  \item 整数加法由整数执行单元完成。
+  \item 地址计算由地址生成单元完成。
+  \item load 从内存层级读取数据。
+  \item store 把数据写向内存系统。
+  \item branch 计算下一条指令地址。
+  \item floating-point 和 SIMD 指令使用向量/浮点执行单元。
+\end{itemize}
+
+\subsection{Write back / Commit：写回和提交}
+
+计算结果最终要改变状态。简单 CPU 可以执行完就写架构寄存器。现代乱序 CPU 会先把结果写到内部物理寄存器或缓冲结构中，再在 retire 阶段按程序顺序提交。这样可以保证异常和中断时仍然呈现精确的架构状态。
+
+本章先记住一句话：
+
+\begin{keyidea}
+CPU 可以在内部提前做很多事，但最终必须让软件看到像是按照程序顺序执行每条指令一样的结果。这是理解乱序执行和精确异常的基础。
+\end{keyidea}
+
+\section{逐条执行 \code{add_i32}}
+
+现在手工执行这个版本：
+
+\begin{lstlisting}
+mov eax, edi
+add eax, esi
+ret
+\end{lstlisting}
+
+假设函数入口处：
+
+\begin{itemize}
+  \item \register{edi} = 10。
+  \item \register{esi} = 32。
+  \item \register{rsp} 指向栈顶。
+  \item 栈顶 8 字节保存调用者的返回地址。
+\end{itemize}
+
+第一条：
+
+\begin{lstlisting}
+mov eax, edi
+\end{lstlisting}
+
+语义是把 \register{edi} 的低 32 位复制到 \register{eax}。执行后：
+
+\begin{itemize}
+  \item \register{eax} = 10。
+  \item \register{rax} 高 32 位清零。
+  \item 通常不改变 flags。
+  \item \register{rip} 指向下一条指令。
+\end{itemize}
+
+第二条：
+
+\begin{lstlisting}
+add eax, esi
+\end{lstlisting}
+
+语义是：
+
+\begin{center}
+\register{eax} $\leftarrow$ \register{eax} + \register{esi}
+\end{center}
+
+执行后：
+
+\begin{itemize}
+  \item \register{eax} = 42。
+  \item RFLAGS 根据结果更新。
+  \item \register{rax} 高 32 位仍然是 0。
+  \item \register{rip} 指向下一条指令。
+\end{itemize}
+
+第三条：
+
+\begin{lstlisting}
+ret
+\end{lstlisting}
+
+近似语义是：
+
+\begin{center}
+\begin{minipage}{0.72\linewidth}
+\begin{verbatim}
+target = memory[rsp]
+rsp = rsp + 8
+rip = target
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+也就是说，\instruction{ret} 从栈顶弹出返回地址，更新 \register{rsp}，然后把 \register{rip} 改成返回地址。函数返回值已经在 \register{eax} 中，调用者按照 ABI 从那里读取返回值。
+
+\section{调用和返回：栈为什么参与控制流}
+
+函数调用不是魔法。假设调用者执行：
+
+\begin{lstlisting}
+call add_i32
+\end{lstlisting}
+
+\instruction{call} 的关键语义可以近似理解为：
+
+\begin{center}
+\begin{minipage}{0.72\linewidth}
+\begin{verbatim}
+rsp = rsp - 8
+memory[rsp] = address_of_next_instruction
+rip = address_of_add_i32
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+所以 \instruction{call} 做了两件事：
+
+\begin{itemize}
+  \item 保存返回地址。
+  \item 跳转到被调用函数入口。
+\end{itemize}
+
+\instruction{ret} 则做反向操作：
+
+\begin{itemize}
+  \item 从栈顶取回返回地址。
+  \item 跳回调用者。
+\end{itemize}
+
+这解释了为什么破坏 \register{rsp} 会让程序崩溃，也解释了为什么栈溢出、返回地址覆盖和控制流劫持是安全问题。对性能学习来说，理解 call/ret 也很重要，因为函数调用涉及 ABI、寄存器保存、栈对齐、返回地址预测和 inline 决策。
+
+\begin{warningbox}
+\instruction{call} 和 \instruction{ret} 改变的是控制流，不是普通数据流。你必须同时追踪 \register{rip}、\register{rsp} 和栈内存，才能正确理解函数调用。
+\end{warningbox}
+
+\section{内存访问：一条 load 背后的路径}
+
+再看一个稍微复杂的函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_load(const int* p, int y)
+{
+    return p[0] + y;
+}
+\end{lstlisting}
+
+可能出现这样的汇编：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi]
+add eax, esi
+ret
+\end{lstlisting}
+
+这里 \register{rdi} 保存指针 \code{p}，\code{dword ptr [rdi]} 表示从地址 \register{rdi} 处读取 4 字节整数。
+
+从 ISA 语义看，这条 load 很简单：
+
+\begin{center}
+\register{eax} $\leftarrow$ memory[\register{rdi} ... \register{rdi}+3]
+\end{center}
+
+从微架构看，它可能经过很多步骤：
+
+\begin{enumerate}
+  \item 地址生成单元计算有效地址。
+  \item 如果使用虚拟内存，CPU 用 TLB 查询虚拟地址到物理地址的翻译。
+  \item L1 data cache 根据地址查找 cache line。
+  \item 如果 L1 命中，数据很快返回。
+  \item 如果 L1 未命中，继续查 L2、L3，甚至访问主内存。
+  \item 取回 4 字节并送到目标寄存器。
+\end{enumerate}
+
+这就是性能工程中经常说的：寄存器计算和内存访问不是一个数量级的问题。一个整数加法可能吞吐很高，而一次真正去主内存的 load 会慢很多。
+
+\section{地址计算：数组访问并不神秘}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" int get_i(const int* a, long i)
+{
+    return a[i];
+}
+\end{lstlisting}
+
+核心地址计算是：
+
+\begin{center}
+\code{address = a + i * sizeof(int)}
+\end{center}
+
+x86-64 寻址模式能直接表达常见的 base + index * scale + displacement：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rsi*4]
+ret
+\end{lstlisting}
+
+这里：
+
+\begin{itemize}
+  \item \register{rdi} 是 base，也就是数组起始地址。
+  \item \register{rsi} 是 index，也就是下标。
+  \item \code{4} 是 scale，因为 \code{int} 通常 4 字节。
+  \item 没有额外 displacement。
+\end{itemize}
+
+这条指令同时包含地址计算和内存读取。现代 CPU 内部通常会把地址生成、TLB 查询、cache 访问等步骤分到 load pipeline 中。后面学习 cache、TLB 和 prefetch 时，这个例子会继续使用。
+
+\section{控制流：顺序、跳转和分支}
+
+没有跳转时，\register{rip} 顺序前进。有跳转时，下一条指令地址由跳转目标决定。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" int abs_i32(int x)
+{
+    if (x < 0) {
+        return -x;
+    }
+    return x;
+}
+\end{lstlisting}
+
+一个未必最优但容易理解的汇编形态是：
+
+\begin{lstlisting}
+mov eax, edi
+test edi, edi
+jge done
+neg eax
+done:
+ret
+\end{lstlisting}
+
+\instruction{test edi, edi} 会计算 \register{edi} 和自身的按位与，只更新 flags，不保存结果。它常用于判断是否为 0 或正负。 \instruction{jge done} 根据 flags 决定是否跳到 \code{done}。
+
+控制流引入了性能问题：CPU 前端必须知道接下来取哪里。如果等分支真正执行完再取下一条，流水线会经常停住。现代 CPU 因此引入 branch predictor，提前猜测分支方向和目标地址。
+
+\section{为什么需要流水线}
+
+假设一条指令要经历五步：
+
+\begin{enumerate}
+  \item 取指。
+  \item 解码。
+  \item 读操作数。
+  \item 执行。
+  \item 写回。
+\end{enumerate}
+
+如果一条指令完成所有步骤后才开始下一条，硬件资源大部分时间都在空闲。流水线的想法是把不同指令的不同阶段重叠起来：
+
+\begin{center}
+\begin{tabular}{llllll}
+\toprule
+周期 & 阶段 1 & 阶段 2 & 阶段 3 & 阶段 4 & 阶段 5 \\
+\midrule
+1 & I1 取指 & & & & \\
+2 & I2 取指 & I1 解码 & & & \\
+3 & I3 取指 & I2 解码 & I1 读数 & & \\
+4 & I4 取指 & I3 解码 & I2 读数 & I1 执行 & \\
+5 & I5 取指 & I4 解码 & I3 读数 & I2 执行 & I1 写回 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+流水线提高的是吞吐，不一定降低单条指令延迟。这里要提前区分两个性能概念：
+
+\term{延迟}{latency} 是一个操作从开始到结果可用需要多久。 \term{吞吐}{throughput} 是单位时间内可以完成多少操作。
+
+一条加法可能延迟 1 个周期，但如果 CPU 每周期能发射多条独立加法，那么吞吐可以高于每周期 1 条。后面讲 latency、throughput、ILP 时会严格量化这些概念。
+
+\section{依赖：为什么有些指令不能并行}
+
+考虑：
+
+\begin{lstlisting}
+add eax, esi
+add eax, edx
+add eax, ecx
+\end{lstlisting}
+
+每条指令都读写 \register{eax}。第二条必须等待第一条产生新的 \register{eax}，第三条必须等待第二条。这叫数据依赖。
+
+再考虑：
+
+\begin{lstlisting}
+add eax, esi
+add r8d, r9d
+add r10d, r11d
+\end{lstlisting}
+
+这三条指令互相独立。现代 CPU 更容易把它们重叠执行。高性能代码经常要制造足够多的独立工作，让 CPU 的多个执行单元都有活干。
+
+\begin{keyidea}
+性能优化不是简单减少源代码行数，而是控制机器指令的依赖图、内存访问模式和前端供给。短代码不一定快，能让硬件持续高效工作的代码才快。
+\end{keyidea}
+
+\section{为什么需要乱序执行}
+
+顺序流水线遇到长延迟操作会卡住。例如：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi]   ; 可能 cache miss
+add r8d, r9d               ; 与 eax 无关
+add r10d, r11d             ; 与 eax 无关
+add eax, esi               ; 依赖 load
+\end{lstlisting}
+
+如果第一条 load 很慢，而后两条加法与它无关，理想情况下 CPU 不应该傻等。乱序执行的目标就是：在不改变架构可见结果的前提下，先执行已经 ready 的指令。
+
+现代乱序 CPU 大致会：
+
+\begin{itemize}
+  \item 按程序顺序取指和解码。
+  \item 通过 register renaming 消除一部分假依赖。
+  \item 把 uops 放入调度结构。
+  \item 哪些操作数 ready，哪些执行单元可用，就先执行哪些。
+  \item 最后按程序顺序 retire，保证异常和结果可见性正确。
+\end{itemize}
+
+这解释了一个重要现象：你在汇编里看到的是程序顺序，但 CPU 内部的实际执行顺序可能不同。性能分析不能只看文本顺序，还要看依赖和资源。
+
+\section{寄存器重命名：为什么架构寄存器不等于物理寄存器}
+
+ISA 只暴露 16 个通用寄存器，但现代 CPU 内部通常有更多物理寄存器。寄存器重命名会把架构寄存器名映射到物理寄存器。
+
+看这个例子：
+
+\begin{lstlisting}
+mov eax, edi
+add eax, esi
+mov eax, r8d
+add eax, r9d
+\end{lstlisting}
+
+从文本看，四条指令都写 \register{eax}。但第二组计算并不需要第一组计算的结果。没有重命名时，对同一个架构寄存器的写会制造不必要的顺序限制。重命名可以让两个不同生命期的 \register{eax} 映射到不同物理寄存器，从而消除假依赖。
+
+这对 C++ 优化有一个启发：不要用源代码变量名想当然地判断寄存器压力和依赖。编译器和 CPU 都会重命名、合并、消除和重排中间值。真正可靠的方式是看编译后的汇编，再结合微架构模型分析。
+
+\section{Cache：为什么内存访问不是一个速度}
+
+程序员经常说``访问内存''，但 CPU 看到的是层级结构：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+层级 & 大致特点 & 学习重点 \\
+\midrule
+寄存器 & 最靠近执行单元，数量少 & 分配、依赖、寄存器压力 \\
+L1 data cache & 很小但很快 & cache line、局部性、load/store 吞吐 \\
+L2 cache & 更大但更慢 & 工作集大小、miss 代价 \\
+L3 cache & 多核心共享或分片 & 跨核心影响、容量 \\
+主内存 & 容量大但延迟高 & bandwidth、NUMA、预取 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+CPU 不是按单个 \code{int} 从内存取数据，而是按 cache line 在 cache 和更低层级之间移动数据。常见 cache line 大小是 64 字节。顺序扫描数组通常比随机访问快，一个重要原因就是顺序访问能利用 cache line 和硬件预取。
+
+本章只建立直觉：内存访问速度取决于数据在哪一级，以及访问模式能否被 cache 和 prefetcher 利用。后面内存层级部分会用实验系统展开。
+
+\section{分支预测：CPU 为什么要猜}
+
+流水线越深、前端越宽，分支的代价越高。如果 CPU 不猜，它遇到条件跳转就必须等条件计算完成，然后才知道下一条从哪里取。这会让前端经常空转。
+
+branch predictor 试图预测：
+
+\begin{itemize}
+  \item 条件分支会不会跳。
+  \item 跳转目标在哪里。
+  \item \instruction{ret} 会返回到哪里。
+\end{itemize}
+
+如果预测正确，流水线保持忙碌。如果预测错误，CPU 必须丢弃错误路径上的推测工作，回到正确路径。这会造成明显性能损失。
+
+这解释了为什么数据相关、难预测的分支会慢，也解释了为什么有时编译器或手写优化会使用条件移动、mask、SIMD blend 等方式减少分支。不是所有分支都坏，坏的是高频、难预测、代价明显的分支。
+
+\section{从 C++ 到 CPU 行为的阅读方法}
+
+以后看到一段 C++ hot loop，不要只停留在源代码层。建议按下面步骤阅读：
+
+\begin{enumerate}
+  \item 写出这段代码的输入、输出和允许的 C++ 语义。
+  \item 编译成汇编，分别看 \code{-O0} 和 \code{-O3}，但以优化版本为性能分析对象。
+  \item 标出每条关键指令读写的寄存器和内存。
+  \item 找出循环携带依赖，例如 reduction 中的累加变量。
+  \item 找出内存访问模式，例如连续、跨步、随机、gather。
+  \item 判断控制流是否有难预测分支。
+  \item 用工具验证，不靠纯想象。
+\end{enumerate}
+
+本书会不断训练这套方法。它看起来繁琐，但熟练以后会变成直觉。真正高手读性能代码时，脑子里会自动浮现数据路径、指令路径和瓶颈假设。
+
+\section{贯穿例子：求和循环}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" int sum_i32(const int* a, long n)
+{
+    int s = 0;
+    for (long i = 0; i < n; ++i) {
+        s += a[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+一个标量汇编形态可能包含：
+
+\begin{lstlisting}
+xor eax, eax
+xor ecx, ecx
+loop:
+add eax, dword ptr [rdi + rcx*4]
+inc rcx
+cmp rcx, rsi
+jl loop
+ret
+\end{lstlisting}
+
+逐层理解：
+
+\begin{itemize}
+  \item \register{rdi} 保存数组起始地址。
+  \item \register{rsi} 保存长度 \code{n}。
+  \item \register{eax} 保存累加和。
+  \item \register{rcx} 保存循环下标。
+  \item \code{[rdi + rcx*4]} 是数组元素地址。
+  \item \instruction{add eax, dword ptr [...]} 同时做 load 和加法。
+  \item \instruction{cmp} 和 \instruction{jl} 控制循环。
+\end{itemize}
+
+性能上，这段循环至少有几个问题可以讨论：
+
+\begin{itemize}
+  \item 累加变量 \register{eax} 形成循环携带依赖。
+  \item 每次迭代有一次 load。
+  \item 每次迭代有循环分支。
+  \item 如果编译器能证明安全并且目标支持 SIMD，优化版本可能向量化。
+\end{itemize}
+
+这就是从源代码到性能模型的第一步。你不需要在本章就优化它，但必须能把它拆成寄存器、内存、控制流和依赖。
+
+\section{实验 2.1：观察机器码字节}
+
+\begin{labbox}
+\textbf{目标：}确认 CPU 执行的是机器码字节，汇编只是人类可读表示。
+
+\textbf{步骤：}
+
+\begin{lstlisting}[language=bash]
+mkdir -p scratch/ch02
+cat > scratch/ch02/add.cpp <<'EOF'
+extern "C" int add_i32(int x, int y)
+{
+    return x + y;
+}
+EOF
+
+g++ -O0 -c scratch/ch02/add.cpp -o scratch/ch02/add_O0.o
+g++ -O3 -c scratch/ch02/add.cpp -o scratch/ch02/add_O3.o
+
+objdump -drwC -Mintel scratch/ch02/add_O0.o
+objdump -drwC -Mintel scratch/ch02/add_O3.o
+\end{lstlisting}
+
+\textbf{交付物：}
+
+\begin{itemize}
+  \item 截取 \code{add_i32} 的反汇编。
+  \item 标出每条指令前面的机器码字节。
+  \item 解释 \code{-O0} 和 \code{-O3} 的差异。
+  \item 说明返回值为什么在 \register{eax}。
+\end{itemize}
+\end{labbox}
+
+\section{实验 2.2：用 GDB 单步观察寄存器}
+
+\begin{labbox}
+\textbf{目标：}用调试器观察 \register{rip}、\register{rsp}、\register{eax}、\register{edi}、\register{esi} 如何变化。
+
+\textbf{准备代码：}
+
+\begin{lstlisting}[language=C++]
+#include <cstdio>
+
+extern "C" __attribute__((noinline))
+int add_i32(int x, int y)
+{
+    return x + y;
+}
+
+int main()
+{
+    int z = add_i32(10, 32);
+    std::printf("%d\n", z);
+}
+\end{lstlisting}
+
+\textbf{编译：}
+
+\begin{lstlisting}[language=bash]
+g++ -O0 -g scratch/ch02/debug_add.cpp -o scratch/ch02/debug_add
+gdb scratch/ch02/debug_add
+\end{lstlisting}
+
+\textbf{GDB 命令：}
+
+\begin{lstlisting}
+set disassembly-flavor intel
+break add_i32
+run
+disassemble /r add_i32
+info registers rip rsp rax eax rdi edi rsi esi
+si
+info registers rip rsp rax eax rdi edi rsi esi
+si
+info registers rip rsp rax eax rdi edi rsi esi
+\end{lstlisting}
+
+\textbf{交付物：}
+
+\begin{itemize}
+  \item 每次 \code{si} 后记录关键寄存器。
+  \item 解释 \register{rip} 为什么变化。
+  \item 解释 \register{rsp} 在函数入口和返回附近怎样变化。
+  \item 解释调试版本为什么比优化版本多很多栈帧相关指令。
+\end{itemize}
+\end{labbox}
+
+\section{实验 2.3：flags 和条件跳转}
+
+\begin{labbox}
+\textbf{目标：}理解 \instruction{cmp}、\instruction{test}、条件跳转如何配合。
+
+\textbf{任务：}写三个函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int is_zero(int x)
+{
+    return x == 0;
+}
+
+extern "C" int max_i32(int a, int b)
+{
+    return a > b ? a : b;
+}
+
+extern "C" int abs_i32(int x)
+{
+    return x < 0 ? -x : x;
+}
+\end{lstlisting}
+
+分别使用 \code{-O0}、\code{-O2}、\code{-O3} 编译，观察是否出现：
+
+\begin{itemize}
+  \item \instruction{cmp}
+  \item \instruction{test}
+  \item \instruction{jcc}
+  \item \instruction{cmov}
+  \item \instruction{setcc}
+\end{itemize}
+
+\textbf{交付物：}
+
+\begin{itemize}
+  \item 为每个函数画出控制流或数据流。
+  \item 解释哪条指令设置 flags，哪条指令读取 flags。
+  \item 判断优化版本是否减少了分支。
+\end{itemize}
+\end{labbox}
+
+\section{实验 2.4：call、ret 和栈}
+
+\begin{labbox}
+\textbf{目标：}理解函数调用如何使用栈保存返回地址。
+
+\textbf{任务：}写三个 noinline 函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" __attribute__((noinline)) int f3(int x)
+{
+    return x + 3;
+}
+
+extern "C" __attribute__((noinline)) int f2(int x)
+{
+    return f3(x + 2);
+}
+
+extern "C" __attribute__((noinline)) int f1(int x)
+{
+    return f2(x + 1);
+}
+\end{lstlisting}
+
+用 GDB 在 \code{f3} 里停住，执行：
+
+\begin{lstlisting}
+bt
+info registers rip rsp rbp
+x/8gx $rsp
+disassemble /r f1
+disassemble /r f2
+disassemble /r f3
+\end{lstlisting}
+
+\textbf{交付物：}
+
+\begin{itemize}
+  \item 画出调用链。
+  \item 标出每一层返回地址。
+  \item 解释 \instruction{call} 和 \instruction{ret} 怎样配合。
+  \item 比较 \code{-O0} 和 \code{-O2} 下调用链是否变化，解释 inline 的影响。
+\end{itemize}
+\end{labbox}
+
+\section{实验 2.5：顺序访问和随机访问的第一印象}
+
+\begin{labbox}
+\textbf{目标：}用简单实验感受 cache 和访问模式对性能的影响。本实验不要求建立完整 cache 模型，只要求形成问题意识。
+
+\textbf{任务：}分配一个较大的 \code{std::vector<int>}，分别做：
+
+\begin{itemize}
+  \item 顺序求和。
+  \item 固定 stride 求和，例如 stride = 16。
+  \item 按一个打乱后的 index 数组随机求和。
+\end{itemize}
+
+要求：
+
+\begin{itemize}
+  \item 用相同数据规模。
+  \item 防止编译器把循环优化掉。
+  \item 每个 case 至少运行多次，报告中位数。
+  \item 记录 CPU 型号和编译命令。
+\end{itemize}
+
+\textbf{交付物：}
+
+\begin{itemize}
+  \item 三种访问模式的时间。
+  \item 你对差异的解释。
+  \item 你认为还需要哪些证据才能证明解释是正确的。
+\end{itemize}
+\end{labbox}
+
+\section{常见误区}
+
+\begin{warningbox}
+\textbf{误区一：CPU 执行的是 C++。}
+
+不准确。CPU 执行机器码字节。C++ 是高层语言，编译器把它翻译到目标 ISA。调试信息可以帮助你把机器状态映射回源代码，但那不是 CPU 的原生输入。
+\end{warningbox}
+
+\begin{warningbox}
+\textbf{误区二：汇编和机器码是一回事。}
+
+不准确。汇编是文本表示，机器码是字节。它们可以互相转换，但反汇编不一定恢复原始汇编源文件中的标签、注释和宏结构。
+\end{warningbox}
+
+\begin{warningbox}
+\textbf{误区三：一条汇编一定对应一个硬件动作。}
+
+不准确。复杂 x86 指令可能解码成多个 uops；简单指令也可能在流水线中经历多个阶段。性能上要区分 ISA 指令、uops、执行端口、延迟和吞吐。
+\end{warningbox}
+
+\begin{warningbox}
+\textbf{误区四：程序顺序就是内部执行顺序。}
+
+不准确。现代 CPU 可以乱序执行 ready 的操作，但 retire 时必须保持架构可见结果符合程序顺序。性能分析要看依赖图，而不只是文本顺序。
+\end{warningbox}
+
+\begin{warningbox}
+\textbf{误区五：内存访问速度固定。}
+
+不准确。同样是一条 load，数据在 L1、L2、L3、主内存时成本完全不同。访问模式、工作集大小、TLB、预取和 NUMA 都会影响性能。
+\end{warningbox}
+
+\section{本章作业}
+
+\begin{exercisebox}
+\textbf{作业 1：手工执行指令。}
+
+给定函数入口状态：
+
+\begin{itemize}
+  \item \register{edi} = 7。
+  \item \register{esi} = 5。
+  \item \register{edx} = 3。
+  \item \register{rsp} = \code{0x7fffffffe000}。
+  \item memory[\code{0x7fffffffe000}] 保存返回地址 \code{0x401234}。
+\end{itemize}
+
+手工执行：
+
+\begin{lstlisting}
+mov eax, edi
+add eax, esi
+sub eax, edx
+ret
+\end{lstlisting}
+
+写出每条指令后的 \register{eax}、\register{rax}、\register{rsp}、\register{rip} 的变化，并说明哪条指令会更新 flags。
+\end{exercisebox}
+
+\begin{exercisebox}
+\textbf{作业 2：解释一个数组访问。}
+
+对下面函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int load2(const int* a, long i)
+{
+    return a[i + 2];
+}
+\end{lstlisting}
+
+生成优化汇编。解释地址表达式中 base、index、scale、displacement 分别是什么。说明为什么 \code{int} 下标会乘以 4。
+\end{exercisebox}
+
+\begin{exercisebox}
+\textbf{作业 3：比较 \instruction{add} 和 \instruction{lea}。}
+
+写两个或更多简单加法函数，尝试让编译器生成 \instruction{add} 或 \instruction{lea}。报告中必须包含：
+
+\begin{itemize}
+  \item 源码。
+  \item 编译命令。
+  \item 反汇编。
+  \item 你对编译器选择的解释。
+  \item 这两类指令对 flags 的影响差异。
+\end{itemize}
+\end{exercisebox}
+
+\begin{exercisebox}
+\textbf{作业 4：调用链报告。}
+
+基于实验 2.4，写一份不少于 800 字的报告，回答：
+
+\begin{itemize}
+  \item 函数调用前参数在哪里？
+  \item 返回值在哪里？
+  \item 返回地址在哪里？
+  \item \register{rsp} 如何变化？
+  \item 优化级别改变后，为什么调用链可能消失？
+\end{itemize}
+\end{exercisebox}
+
+\begin{exercisebox}
+\textbf{作业 5：第一次性能解释。}
+
+完成实验 2.5，写一份性能报告。报告不能只写``随机访问慢''，必须包含：
+
+\begin{itemize}
+  \item 数据规模。
+  \item 编译器版本和命令。
+  \item CPU 型号。
+  \item 每种访问模式的时间统计。
+  \item 你基于 cache line 和局部性的解释。
+  \item 你认为本实验还有哪些不严谨之处。
+\end{itemize}
+\end{exercisebox}
+
+\section{验收标准}
+
+学完本章，你应该能够做到：
+
+\begin{itemize}
+  \item 解释 CPU 不直接执行 C++，而是执行机器码字节。
+  \item 区分汇编文本、机器码、ISA 语义和微架构实现。
+  \item 说清楚 \register{rip}、通用寄存器、\register{rsp}、RFLAGS 的基本作用。
+  \item 手工执行简单整数指令，追踪寄存器和 \register{rip} 变化。
+  \item 解释 \instruction{call} 和 \instruction{ret} 如何用栈保存和恢复控制流。
+  \item 解释一条 load 指令为什么可能涉及地址生成、TLB 和 cache。
+  \item 用 \code{objdump} 观察机器码字节和反汇编。
+  \item 用 GDB 单步观察寄存器变化。
+  \item 初步解释 pipeline、cache、branch prediction、out-of-order execution 为什么存在。
+\end{itemize}
+
+如果你能完成这些目标，后面正式进入 x86-64 汇编、ABI、性能测量和微架构时，就不会把术语当成孤立概念，而能把它们放回真实执行链路中理解。

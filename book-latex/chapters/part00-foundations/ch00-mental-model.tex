@@ -1,0 +1,462 @@
+\chapter{学习地图：把程序、机器、系统和性能连成一条主线}
+
+\section{本章不是普通导读}
+
+如果一本系统性能书只在开头说“我们会学习 C++、汇编、CPU、操作系统和性能工具”，这并不能真正帮助初学者。因为初学者最缺的不是名词清单，而是一张能不断回来的地图：当你在第 10 章看到 \instruction{mov}，第 31 章看到 cache line，第 56 章看到 PMU event，第 50 章优化 softmax 时，你必须知道这些东西为什么属于同一件事。
+
+本章的目标就是建立这张地图。
+
+刚学完 C/C++ 的读者通常已经知道变量、函数、数组、指针、结构体、类和简单的标准库调用。但从性能工程角度看，这些只是最上层的表达。程序真正运行时，下面还存在许多层：
+
+\begin{center}
+\begin{minipage}{0.9\linewidth}
+\begin{verbatim}
+C/C++ source
+  -> language semantics
+  -> compiler frontend
+  -> IR and optimization
+  -> target-specific backend
+  -> assembly
+  -> machine-code bytes
+  -> object file and executable
+  -> loader and process
+  -> virtual memory
+  -> ISA architectural state
+  -> microarchitectural execution
+  -> cache / TLB / branch predictor / memory system
+  -> measured time and performance counters
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+性能优化的难点在于：每一层都在隐藏下一层的复杂性，但每一层隐藏得都不完美。平时写业务代码时，隐藏是好事；做高性能计算和 AI CPU 算子时，隐藏经常变成障碍。你必须知道抽象在什么时候可靠，什么时候会泄漏，什么时候会被编译器、CPU 或操作系统用一种你没想到的方式重新解释。
+
+\begin{keyidea}
+本书的主线不是“先学一堆概念，再做优化”。本书的主线是：从一个 C/C++ 表达式出发，追踪它如何变成机器码、如何改变寄存器和内存、如何穿过 CPU 流水线和缓存层级、如何受到操作系统影响，最后如何变成可信或不可信的性能数据。
+\end{keyidea}
+
+\section{一个贯穿全书的例子}
+
+先看一个非常普通的函数：
+
+\begin{lstlisting}[language=C++]
+int sum(int const* a, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        s += a[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+如果只从 C++ 层看，它很简单：遍历数组，把元素加起来。可是为了真正理解它的性能，你至少要能回答下面这些问题：
+
+\begin{itemize}
+  \item \code{int const* a} 是什么？它只是一个地址，还是还携带了类型和别名语义？
+  \item \code{a[i]} 如何变成地址计算？为什么是 \code{base + i * 4}？
+  \item \code{s += a[i]} 在汇编中会使用哪些寄存器？会不会每次都访问内存？
+  \item 编译器能否把循环展开？能否向量化？为什么有时候不能？
+  \item 如果 \code{n} 很小，循环开销和函数调用开销是否比内存访问还重要？
+  \item 如果 \code{n} 很大，性能瓶颈是整数加法，还是内存带宽？
+  \item 如果 \code{a} 没有按 cache line 对齐，是否一定慢？
+  \item 如果多个线程同时处理数组，是否会发生 false sharing？
+  \item benchmark 的结果为什么每次都不一样？操作系统调度、CPU 频率、cache 状态分别可能贡献什么噪声？
+\end{itemize}
+
+这些问题没有一个可以只靠“懂 C++ 语法”解决。它们分别落在语言语义、编译器、汇编、ISA、微架构、操作系统和测量方法上。
+
+\begin{mentalmodel}
+以后看到任何性能代码，都先把它拆成四个视角：
+
+\begin{enumerate}
+  \item 源码视角：程序员写了什么语义。
+  \item 编译器视角：哪些语义限制了优化，哪些语义允许优化。
+  \item 机器视角：实际执行了哪些指令，访问了哪些地址。
+  \item 测量视角：数据是否真的证明了你的判断。
+\end{enumerate}
+\end{mentalmodel}
+
+\section{计算机系统为什么要分层}
+
+现代计算机太复杂，不可能让程序员直接控制每个晶体管、每条内部总线、每个缓存替换决策和每个乱序执行细节。因此系统必须分层。分层的作用是让上层只依赖下层的一部分承诺。
+
+比如 C++ 不要求你知道整数加法电路如何实现，但它要求机器能表示某些整数值。汇编不要求你知道 CPU 内部有多少执行端口，但它要求 CPU 能按照 ISA 的语义执行 \instruction{add}。操作系统不要求应用知道物理内存条的真实地址，但它提供虚拟地址空间，让进程以为自己拥有连续内存。
+
+分层带来的好处是可编程性，代价是性能信息被藏起来。性能工程正是在这些隐藏处工作。
+
+\subsection{物理层：信号、晶体管和时钟}
+
+最底层是物理世界。电路通过电压高低表示 0 和 1。晶体管可以被看作受控制的开关。大量晶体管组合成逻辑门、触发器、寄存器、加法器、选择器、缓存 SRAM 单元和控制逻辑。
+
+本书不会把你训练成芯片设计工程师，但你必须知道两个事实。
+
+第一，硬件不是“瞬间完成”的。信号传播需要时间，门电路切换需要时间，存储单元读写需要时间。因此 CPU 有时钟周期，有关键路径，有流水线。性能中的 latency 和 throughput，最终都与“工作需要经过多少硬件阶段”和“硬件能否并行处理多个工作”有关。
+
+第二，硬件资源是有限的。一个核心不可能无限发射指令，不可能无限读取内存，不可能无限预测分支，不可能无限保存乱序执行中的临时状态。因此现代 CPU 性能常常不是由某一条高级语句决定，而是由执行端口、load/store 单元、ROB 容量、物理寄存器、L1/L2/L3 cache、TLB、内存带宽等资源共同决定。
+
+\subsection{数字逻辑层：组合逻辑和时序逻辑}
+
+组合逻辑的输出只由当前输入决定，比如加法器、比较器、多路选择器。时序逻辑会记住状态，比如寄存器、触发器、计数器和缓存 tag。CPU 可以被看作一个巨大的状态机：每个时钟周期，它根据当前状态和输入，计算下一状态。
+
+这个模型非常重要，因为 ISA 也可以被理解为状态机规则。以 \instruction{add rax, rbx} 为例，抽象语义是：
+
+\begin{center}
+\begin{minipage}{0.72\linewidth}
+\begin{verbatim}
+RAX_next = RAX_old + RBX_old
+RFLAGS_next = flags produced by the addition
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+真实 CPU 内部可能把这条指令拆成微操作，可能乱序执行，可能重命名寄存器，但最终对软件可见的结果必须像上面的状态转移一样。这就是后面“架构状态”和“微架构实现”的区别。
+
+\section{ISA：软件和硬件之间的合同}
+
+\term{ISA}{Instruction Set Architecture} 是指令集体系结构。它定义软件能看到的机器模型：有哪些寄存器、有哪些指令、指令如何编码、内存寻址如何表达、异常如何发生、哪些状态对程序可见。
+
+x86-64 ISA 给程序员承诺了很多东西，例如：
+
+\begin{itemize}
+  \item 有一组通用寄存器，如 \register{rax}、\register{rbx}、\register{rcx}、\register{rdx}、\register{rdi}、\register{rsi}、\register{rsp}、\register{rbp}、\register{r8} 到 \register{r15}。
+  \item 指令可以读取寄存器、写寄存器、读取内存、写内存、改变控制流。
+  \item 内存可以按字节寻址。
+  \item 常见寻址模式可以写成 \code{base + index * scale + displacement}。
+  \item \register{rip} 表示当前执行位置，\register{rsp} 表示栈顶。
+\end{itemize}
+
+但 ISA 不告诉你 CPU 内部有多少流水线阶段，也不告诉你某条指令占用哪个执行端口，不告诉你 L1 cache 多大，不告诉你分支预测器怎么猜。这些属于微架构。
+
+\begin{warningbox}
+初学者经常把 ISA 和 CPU 实现混在一起。说“x86-64 有 \register{rax}”是 ISA 层；说“某 Intel 核心上整数加法吞吐约为每周期若干条”是微架构层。优化时必须区分这两层，否则会把一台机器上的性能经验误当成所有 x86-64 机器的规律。
+\end{warningbox}
+
+\section{微架构：同一份 ISA 可以有不同的执行机器}
+
+同样执行 x86-64 指令，不同 CPU 的内部结构可以非常不同。一个简单核心可以顺序执行；一个高性能核心会取指、解码、分派、重命名、乱序执行、访存、提交。CPU 还会预测分支、预取数据、维护多级缓存、处理 TLB、解决内存一致性问题。
+
+微架构的存在解释了一个看似奇怪的事实：两段汇编指令数量相同，性能可能差很多；两段 C++ 源码看起来复杂度相同，真实性能也可能差很多。
+
+例如：
+
+\begin{lstlisting}
+add eax, dword ptr [rdi + rcx*4]
+\end{lstlisting}
+
+这条指令表面上是“从数组加载一个 int 并加到 eax”。微架构层至少可能发生：
+
+\begin{itemize}
+  \item 地址生成单元计算 \code{rdi + rcx * 4}。
+  \item load 单元向 L1 data cache 发起读取。
+  \item 如果虚拟地址还没有 TLB 命中，需要页表相关机制参与。
+  \item 如果 L1 miss，访问 L2；L2 miss，访问 L3；再 miss，访问内存。
+  \item 加法依赖 load 的结果，因此 load latency 会影响后续加法。
+  \item 如果循环中有多个独立 load，乱序执行可以重叠等待。
+\end{itemize}
+
+同一条汇编，在 cache 命中和 cache miss 时的代价完全不同。这就是为什么本书必须把“指令”和“数据所在位置”一起讲。
+
+\section{操作系统：程序不是独占机器}
+
+C++ 程序不是直接裸奔在 CPU 上。普通 Linux 程序运行在操作系统提供的进程环境中。操作系统负责创建进程、建立虚拟地址空间、加载可执行文件、处理系统调用、调度线程、管理页面、处理中断和异常。
+
+从性能角度看，操作系统至少带来五类重要影响：
+
+\begin{enumerate}
+  \item 虚拟内存让程序看到的是虚拟地址，不是物理地址。
+  \item 页面和 TLB 会影响大数组、随机访问和多线程程序。
+  \item 调度会让线程在不同核心之间迁移，影响 cache 热度和测量稳定性。
+  \item 系统调用和 page fault 会造成远高于普通指令的开销。
+  \item CPU 频率、电源管理、后台任务和中断会污染 benchmark。
+\end{enumerate}
+
+因此，真正的性能工程不是“写一段快代码”这么简单。你还要控制运行环境，知道什么时候该固定 CPU 频率，什么时候该 pin 线程，什么时候该丢弃第一次运行，什么时候要看 page fault、context switch 和 PMU 事件。
+
+\section{编译器：它不是翻译员，而是证明器和重写器}
+
+很多初学者把编译器理解成“把 C++ 翻译成汇编的工具”。这个理解只对了一半。现代优化编译器更像一个在语言规则约束下工作的证明器和重写器。
+
+它会问：
+
+\begin{itemize}
+  \item 这个变量的值是否一定不被使用？
+  \item 这个循环是否可以展开？
+  \item 两个指针是否可能指向同一块对象？
+  \item 这个函数是否可以内联？
+  \item 这个条件是否永远成立或永远不成立？
+  \item 这个浮点表达式能不能重排？
+  \item 这个内存访问是否连续，能不能向量化？
+\end{itemize}
+
+只要 C++ 标准允许，编译器就可能把源码改写成完全不同的机器执行形式。比如下面的代码：
+
+\begin{lstlisting}[language=C++]
+int f(int x)
+{
+    return x + 1 > x;
+}
+\end{lstlisting}
+
+在没有有符号整数溢出的前提下，编译器可以认为 \code{x + 1 > x} 恒为真，从而返回 1。可是如果你按机器补码回绕去想，\code{x} 等于最大正整数时似乎会溢出。关键在于：C++ 有符号整数溢出是未定义行为，编译器可以假设它不会发生。
+
+\begin{deepdive}
+性能优化必须尊重语言规则。很多“我看机器码应该这样”的推理，如果违反 C++ 对对象生命周期、别名、对齐、未定义行为的规定，就不是可靠优化，而是在给编译器提供错误前提。后续讲 alias、\code{restrict}、\code{std::bit_cast}、fast-math 和自动向量化时，会反复回到这一点。
+\end{deepdive}
+
+\section{ABI：函数之间、模块之间必须说同一种话}
+
+\term{ABI}{Application Binary Interface} 是二进制接口。它规定函数调用时参数如何传递、返回值放在哪里、哪些寄存器由调用者保存、哪些由被调用者保存、栈如何对齐、结构体如何返回、异常和动态链接如何约定。
+
+源码层面两个函数看起来只是：
+
+\begin{lstlisting}[language=C++]
+int g(int x, int y);
+int z = g(1, 2);
+\end{lstlisting}
+
+机器层面却必须回答：
+
+\begin{itemize}
+  \item \code{1} 放进哪个寄存器？
+  \item \code{2} 放进哪个寄存器？
+  \item 调用前 \register{rsp} 要满足什么对齐要求？
+  \item \code{g} 能随便改哪些寄存器？
+  \item 返回值从哪里取？
+\end{itemize}
+
+System V AMD64 ABI 是 Linux x86-64 上的核心规则之一。后面学习汇编时，如果不懂 ABI，就看不懂函数序言、函数尾声、栈帧、寄存器保存和 C++ 与汇编互操作。
+
+\section{内存：性能工程的第二个主角}
+
+第一个主角是指令，第二个主角是数据。现代 CPU 的算术单元非常快，但内存层级相对慢得多。一个 AI 算子是否快，常常不取决于“乘法会不会写”，而取决于数据如何布局、是否连续、是否复用、是否落在 cache、是否适合 SIMD load/store。
+
+看下面两个结构：
+
+\begin{lstlisting}[language=C++]
+struct ParticleAoS {
+    float x;
+    float y;
+    float z;
+    float mass;
+};
+
+struct ParticleSoA {
+    float* x;
+    float* y;
+    float* z;
+    float* mass;
+};
+\end{lstlisting}
+
+AoS 和 SoA 的差异不是语法审美问题，而是内存访问模式问题。如果一个 kernel 只需要所有粒子的 \code{x}，AoS 会把不需要的 \code{y}、\code{z}、\code{mass} 一起拖进 cache line；SoA 则能连续加载 \code{x}。后续讲 SIMD、cache line、GEMM packing 和 AI 算子 fusion 时，这个思想会不断出现。
+
+\section{性能不是运行一次得到的数字}
+
+性能工程最危险的习惯之一，是把一次运行时间当成真相。真实机器上，一次运行结果可能受到很多因素影响：
+
+\begin{itemize}
+  \item 编译器是否把代码优化掉。
+  \item 输入数据是否还在 cache 中。
+  \item CPU 当前频率是多少。
+  \item 线程是否被调度到另一个核心。
+  \item 后台进程和中断是否打断了运行。
+  \item 分支预测器和 TLB 是否已经被预热。
+  \item 第一次执行是否触发动态链接、page fault 或内存分配。
+\end{itemize}
+
+所以本书要求你形成“证据链”意识。一个高质量性能结论通常至少包含：
+
+\begin{enumerate}
+  \item correctness reference：优化前后结果是否一致。
+  \item 编译参数：是否启用合理优化，是否说明目标 ISA。
+  \item 汇编或 IR：机器实际执行的形态是什么。
+  \item benchmark 方法：如何预热、重复、统计、避免被优化删除。
+  \item profiling 或 PMU：瓶颈证据支持哪个解释。
+  \item 反例检查：有没有输入规模或机器配置让结论失效。
+\end{enumerate}
+
+\begin{warningbox}
+“我的版本快了 20\%”不是结论，只是观察。真正的结论必须说明：在哪台机器、什么编译器、什么参数、什么输入规模、什么统计方法下快了 20\%；为什么快；有什么证据排除了测量噪声和错误优化；在哪些条件下不保证快。
+\end{warningbox}
+
+\section{本书的四条长期能力线}
+
+为了在 3 到 4 个月内尽量逼近专家水平，本书不按“轻松每周一点点”的节奏写，而是按高强度训练设计。你要同时推进四条能力线。
+
+\subsection{能力线一：机器阅读能力}
+
+机器阅读能力是指你能从源码一路读到汇编、机器码、寄存器和内存变化。最低要求是能读懂简单函数的汇编；更高要求是能看出编译器为什么生成这种形式，性能瓶颈可能在哪里。
+
+这条线的训练材料包括：
+
+\begin{itemize}
+  \item \code{objdump} 和 \code{llvm-objdump}。
+  \item \code{gdb} 单步执行。
+  \item Compiler Explorer。
+  \item \code{clang -S}、\code{clang -emit-llvm}。
+  \item 手工追踪寄存器和栈。
+\end{itemize}
+
+\subsection{能力线二：性能模型能力}
+
+性能模型能力是指你能先不用跑程序，就对瓶颈做出合理预测。比如一个循环每次加载 64 字节、做 16 次浮点运算，你应该能估算它更可能受内存带宽限制还是计算吞吐限制。
+
+这条线会反复训练：
+
+\begin{itemize}
+  \item latency 和 throughput 的区别。
+  \item dependency chain 和 instruction-level parallelism。
+  \item cache line、working set、reuse distance。
+  \item memory bandwidth 和 arithmetic intensity。
+  \item SIMD lane、向量宽度、tail 处理。
+  \item Roofline 模型。
+\end{itemize}
+
+\subsection{能力线三：测量和诊断能力}
+
+测量能力是指你知道怎样设计 benchmark，怎样避免错误测量，怎样用工具定位问题。性能工程中，错误测量比不会优化更危险，因为它会把你带到错误方向。
+
+这条线的工具包括：
+
+\begin{itemize}
+  \item \code{perf stat} 和 \code{perf record}。
+  \item \code{time}、\code{taskset}、\code{numactl}。
+  \item \code{llvm-mca}。
+  \item Intel VTune 或 AMD uProf。
+  \item 自己写 benchmark harness。
+\end{itemize}
+
+\subsection{能力线四：kernel 设计能力}
+
+kernel 设计能力是指你能把机器模型用到真实计算核心里。最终目标不是会背 CPU 概念，而是能写出、解释和验证高性能 kernel，例如 reduction、transpose、stencil、GEMM microkernel、softmax、layernorm、GELU、attention 中的小核心。
+
+这条线要求你能同时处理：
+
+\begin{itemize}
+  \item 数据布局。
+  \item 分块和复用。
+  \item SIMD intrinsic。
+  \item 数值稳定性。
+  \item 多线程和 NUMA。
+  \item ISA dispatch。
+  \item benchmark 和 profiling。
+\end{itemize}
+
+\section{一条完整的优化闭环}
+
+本书要求你以后按下面流程做优化：
+
+\begin{enumerate}
+  \item 写出清晰正确的 baseline。
+  \item 准备 correctness reference 和误差标准。
+  \item 建立粗略性能模型：计算量、访存量、预期瓶颈。
+  \item 设计 benchmark，避免死代码消除和输入偏差。
+  \item 编译并查看汇编或 IR。
+  \item 运行测量，记录环境和统计结果。
+  \item 用 profiling 或 PMU 验证瓶颈。
+  \item 修改一个因素：布局、循环、分块、SIMD、预取或并行。
+  \item 再次验证正确性和性能。
+  \item 写报告，说明哪些假设被证实，哪些被推翻。
+\end{enumerate}
+
+这就是专业性能工程和“凭感觉改代码”的区别。
+
+\section{本章实验：建立你的机器档案}
+
+\begin{labbox}
+本实验不是为了追求速度，而是为了建立后续所有实验都要引用的机器档案。请在 \filepath{results/machine-profile/} 下保存报告。
+
+\subsection*{任务 1：记录 CPU 和系统信息}
+
+运行：
+
+\begin{lstlisting}[language=bash]
+lscpu
+cat /proc/cpuinfo | sed -n '1,80p'
+cat /proc/meminfo | sed -n '1,40p'
+uname -a
+gcc --version
+clang --version
+ldd --version
+\end{lstlisting}
+
+报告中至少记录：
+
+\begin{itemize}
+  \item CPU 型号、核心数、线程数。
+  \item L1d/L1i/L2/L3 cache 信息。
+  \item 支持的 ISA 扩展，例如 SSE、AVX、AVX2、AVX-512、FMA、VNNI。
+  \item 内存总量。
+  \item Linux kernel 版本。
+  \item GCC/Clang 版本。
+\end{itemize}
+
+\subsection*{任务 2：建立第一个源码到汇编证据链}
+
+创建 \filepath{labs/ch00_machine_map/sum.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstddef>
+#include <cstdint>
+
+extern "C" std::int64_t sum_i32(std::int32_t const* a, std::size_t n)
+{
+    std::int64_t s = 0;
+    for (std::size_t i = 0; i < n; ++i) {
+        s += a[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+分别生成未优化和优化后的汇编：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O0 -S -masm=intel sum.cpp -o sum_O0.s
+clang++ -std=c++20 -O3 -S -masm=intel sum.cpp -o sum_O3.s
+\end{lstlisting}
+
+报告必须回答：
+
+\begin{enumerate}
+  \item \code{-O0} 和 \code{-O3} 的循环形态有什么差异？
+  \item 参数 \code{a} 和 \code{n} 分别从哪些寄存器进入函数？
+  \item 汇编中哪里体现了 \code{sizeof(std::int32_t) == 4}？
+  \item 编译器有没有展开或向量化？证据是什么？
+\end{enumerate}
+
+\subsection*{任务 3：第一次测量但不急着下结论}
+
+写一个小 benchmark，测量 \code{n = 1024}、\code{n = 1048576}、\code{n = 67108864} 三种规模。每个规模运行多次，记录最小值、中位数和最大值。报告中必须写明为什么三种规模可能对应不同 cache 行为。
+\end{labbox}
+
+\section{本章作业：写出你的第一份性能工程备忘录}
+
+\begin{exercisebox}
+提交一份不少于 1500 字的中文报告，题目为“从 C++ 到机器执行的第一张地图”。报告必须包含以下部分：
+
+\begin{enumerate}
+  \item 画出从 C++ 源码到 CPU 执行的链路图，并用自己的话解释每一层的职责。
+  \item 用 \code{sum_i32} 例子解释源码、汇编、寄存器、内存访问之间的关系。
+  \item 说明 ISA 和微架构的区别，并举一个“同一条汇编在不同数据状态下性能不同”的例子。
+  \item 说明操作系统为什么会影响 benchmark。
+  \item 列出你当前最不熟悉的 10 个概念，并为每个概念写一句你准备如何验证它。
+\end{enumerate}
+
+评分重点不是语言华丽，而是证据完整、层次清楚、没有把不同抽象层混在一起。
+\end{exercisebox}
+
+\section{验收标准}
+
+完成本章后，你应该能做到：
+
+\begin{itemize}
+  \item 画出源码到机器执行的完整粗粒度链路。
+  \item 区分语言语义、编译器优化、ISA、微架构、操作系统和测量方法。
+  \item 对一个简单循环提出至少三种可能性能瓶颈。
+  \item 用汇编证据回答“编译器实际生成了什么”。
+  \item 解释为什么一次运行时间不能直接当成性能结论。
+\end{itemize}
+
+后续章节会把这张地图逐层放大。第 1 章放大“源码到进程”；第 2 章放大“CPU 如何执行指令”；第 3 章放大“数据、内存、指针和对象布局”；第 10 章开始正式进入 x86-64 汇编；第 31 章以后进入内存层级；第 37 章以后进入 SIMD；第 45 章以后进入 GEMM 和 AI 算子。

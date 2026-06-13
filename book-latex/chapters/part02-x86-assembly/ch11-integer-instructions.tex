@@ -1,0 +1,1007 @@
+\chapter{整数指令、位运算和地址计算}
+
+\section{本章要解决的问题}
+
+上一章建立了读 x86-64 汇编的基本语法：指令、寄存器、立即数、内存操作数、操作数宽度和 \instruction{lea}。本章继续深入最常见的一组指令：整数数据移动、加减、乘法、符号扩展、零扩展、移位、位运算、比较和地址计算。
+
+这些指令看起来简单，但它们是后面所有内容的底层材料：
+
+\begin{itemize}
+  \item 数组下标和结构体字段访问需要整数地址计算。
+  \item 循环计数、边界判断、指针递增都依赖加减和比较。
+  \item 类型转换会生成符号扩展或零扩展。
+  \item 对齐、掩码、量化、哈希、SIMD lane 处理会大量使用位运算。
+  \item 性能优化里经常要判断一条指令是否更新 flags、是否破坏依赖、是否可被 \instruction{lea} 替代。
+\end{itemize}
+
+本章不要求你背完 Intel 手册。目标是让你看到一个整数汇编片段时，能回答：
+
+\begin{lstlisting}
+1. 每条指令读哪些寄存器、内存和 flags？
+2. 每条指令写哪些寄存器、内存和 flags？
+3. 操作数宽度是多少？
+4. 这是有符号语义、无符号语义，还是纯位模式语义？
+5. 如果它来自 C++，语言规则是否允许这种变换？
+6. 它对性能有什么直接影响？
+\end{lstlisting}
+
+\begin{keyidea}
+整数指令处理的是位模式。signed/unsigned 很多时候不是硬件存了不同东西，而是某条指令如何解释这些位、编译器如何根据 C++ 类型选择指令、语言规则允许编译器做哪些假设。
+\end{keyidea}
+
+\section{整数寄存器里的值：位模式先于解释}
+
+先看一个 32 位寄存器：
+
+\begin{lstlisting}
+eax = 0xffffffff
+\end{lstlisting}
+
+这个位模式可以解释成：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+解释方式 & 值 & 说明 \\
+\midrule
+\code{std::uint32_t} & 4294967295 & 无符号解释 \\
+\code{std::int32_t} & -1 & 二进制补码解释 \\
+位掩码 & 所有 32 位都是 1 & mask 解释 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+寄存器本身没有贴着“这是 signed int”的标签。不同指令会以不同方式解释这些位：
+
+\begin{itemize}
+  \item \instruction{add} 对低 N 位加法而言，有符号和无符号使用同一个加法器；区别主要体现在 flags 如何解释。
+  \item \instruction{cmp} 后接有符号条件跳转和无符号条件跳转时，读取的 flags 组合不同。
+  \item \instruction{movsx} 和 \instruction{movzx} 明确区分符号扩展和零扩展。
+  \item \instruction{sar} 是算术右移，保留符号位；\instruction{shr} 是逻辑右移，高位补 0。
+\end{itemize}
+
+\begin{warningbox}
+不要说“这个寄存器是 signed”。更准确的说法是：“这段代码把这个寄存器的位模式按 signed 语义使用”。寄存器存的是位，解释来自指令、类型和上下文。
+\end{warningbox}
+
+\section{\instruction{mov}：复制位模式，不是高级赋值}
+
+\instruction{mov} 是最常见的指令之一，但它的名字容易误导。它不是“移动后源消失”，而是复制位模式：
+
+\begin{lstlisting}
+mov eax, edi
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+eax = edi
+rax high 32 bits = 0
+\end{lstlisting}
+
+因为写 32 位寄存器会清零高 32 位。
+
+\subsection{寄存器到寄存器}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int id(int x)
+{
+    return x;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+mov eax, edi
+ret
+\end{lstlisting}
+
+\register{edi} 是参数，\register{eax} 是返回值。这里没有内存访问。
+
+\subsection{内存到寄存器：load}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int load(int const* p)
+{
+    return *p;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi]
+ret
+\end{lstlisting}
+
+解释：
+
+\begin{lstlisting}
+address = rdi
+load 4 bytes from address
+write eax
+\end{lstlisting}
+
+\subsection{寄存器到内存：store}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" void store(int* p, int x)
+{
+    *p = x;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+mov dword ptr [rdi], esi
+ret
+\end{lstlisting}
+
+解释：
+
+\begin{lstlisting}
+address = rdi
+store low 32 bits of esi to address
+\end{lstlisting}
+
+\subsection{立即数到寄存器或内存}
+
+\begin{lstlisting}
+mov eax, 123
+mov dword ptr [rdi], 123
+\end{lstlisting}
+
+第一条把立即数写入寄存器；第二条把立即数写入内存。第二条是 store，会修改内存。
+
+\section{清零寄存器：\instruction{xor reg, reg} 和 \instruction{mov reg, 0}}
+
+你经常看到：
+
+\begin{lstlisting}
+xor eax, eax
+\end{lstlisting}
+
+它把 \register{eax} 清零。因为任何位和自己异或都是 0：
+
+\begin{lstlisting}
+x ^ x = 0
+\end{lstlisting}
+
+也可以写：
+
+\begin{lstlisting}
+mov eax, 0
+\end{lstlisting}
+
+但编译器常用 \instruction{xor eax, eax}，原因包括编码短、CPU 识别 zero idiom、可打破旧值依赖等。注意 \instruction{xor} 会更新 flags，而 \instruction{mov} 通常不更新 flags。上下文不同，编译器选择也可能不同。
+
+\begin{deepdive}
+现代 x86 核心通常能识别 \instruction{xor reg, reg}、\instruction{sub reg, reg} 这类 zero idiom，把它们当成不依赖旧寄存器值的清零操作。依赖打断对乱序执行和寄存器重命名很重要，后面讲微架构时会展开。
+\end{deepdive}
+
+\section{加法和减法：结果、flags 和语言规则}
+
+\subsection{\instruction{add} 和 \instruction{sub}}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_i32(int x, int y)
+{
+    return x + y;
+}
+
+extern "C" int sub_i32(int x, int y)
+{
+    return x - y;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+add_i32:
+    lea eax, [rdi + rsi]
+    ret
+
+sub_i32:
+    mov eax, edi
+    sub eax, esi
+    ret
+\end{lstlisting}
+
+\instruction{add} 和 \instruction{sub} 都会更新 flags。编译器有时用 \instruction{lea} 做加法，因为 \instruction{lea} 不更新 flags：
+
+\begin{lstlisting}
+lea eax, [rdi + rsi]      ; eax = x + y, flags unchanged
+add eax, esi              ; eax = eax + y, flags updated
+\end{lstlisting}
+
+如果后续不需要 flags，\instruction{lea} 可能更合适。如果后续需要根据结果跳转，\instruction{add} 或 \instruction{sub} 设置 flags 就有价值。
+
+\subsection{有符号溢出和无符号回绕}
+
+机器的 32 位加法天然按低 32 位结果回绕。但 C++ 语言规则不同：
+
+\begin{center}
+\begin{tabular}{p{0.27\linewidth}p{0.48\linewidth}}
+\toprule
+C++ 表达式 & 溢出规则 \\
+\midrule
+\code{std::uint32_t a + b} & 定义良好，按模 $2^{32}$ 回绕 \\
+\code{int a + b} & 有符号溢出是 undefined behavior \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以同样可能生成一条 \instruction{add}，编译器对 signed 和 unsigned 源码能做的优化假设并不一样。不要把“机器会回绕”直接等同为“C++ 程序定义良好”。
+
+\subsection{\instruction{inc} 和 \instruction{dec}}
+
+\instruction{inc} 加 1，\instruction{dec} 减 1：
+
+\begin{lstlisting}
+inc eax
+dec ecx
+\end{lstlisting}
+
+它们会更新大多数 flags，但不更新 CF。现代编译器在一些场景下更偏向 \instruction{add reg, 1} 或 \instruction{sub reg, 1}，因为 flags 行为更规则，也可能更利于后续优化。你看到哪种要按上下文解释，不要死记“循环一定用 inc”。
+
+\section{乘法：\instruction{imul}、常数乘法和 \instruction{lea}}
+
+\subsection{常数乘法经常不用乘法指令}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int mul5(int x)
+{
+    return x * 5;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+lea eax, [rdi + rdi*4]
+ret
+\end{lstlisting}
+
+因为：
+
+\begin{lstlisting}
+x * 5 = x + x * 4
+\end{lstlisting}
+
+\instruction{lea} 可表达 \code{base + index*scale + displacement}，其中 scale 为 1、2、4、8。因此乘以 3、5、9 等常数经常可用一条 \instruction{lea}。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+C++ 表达式 & 可能汇编 & 语义 \\
+\midrule
+\code{x * 3} & \code{lea eax, [rdi + rdi*2]} & \code{x + 2*x} \\
+\code{x * 5} & \code{lea eax, [rdi + rdi*4]} & \code{x + 4*x} \\
+\code{x * 8 + 7} & \code{lea eax, [rdi*8 + 7]} & \code{8*x + 7} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\instruction{imul} 的常见形式}
+
+当乘法不能简单用 \instruction{lea} 或 shift 表达时，会看到 \instruction{imul}：
+
+\begin{lstlisting}
+imul eax, edi, 37      ; eax = edi * 37
+imul eax, esi          ; eax = eax * esi, low 32 bits
+\end{lstlisting}
+
+对低 N 位乘法结果来说，补码 signed 和 unsigned 的低 N 位相同。因此很多普通乘法可以使用同一类指令。但当需要完整宽度结果、高半部分、溢出判断时，signed/unsigned 就会影响指令选择。
+
+\subsection{性能直觉}
+
+整数乘法通常比简单加法、位运算、\instruction{lea} 延迟更高、吞吐更低。现代 CPU 乘法已经很快，但在 tight loop 里仍然要关注。如果乘以常数，编译器经常自动替换成 \instruction{lea}、shift 或加法组合。不要手写“聪明替换”之前先看编译器输出。
+
+\section{符号扩展和零扩展：\instruction{movsx}、\instruction{movzx}、\instruction{movsxd}}
+
+从小整数类型转换到大整数类型时，编译器必须决定高位如何填充。
+
+\subsection{零扩展}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int from_u8(std::uint8_t x)
+{
+    return x;
+}
+\end{lstlisting}
+
+\code{std::uint8_t} 到 \code{int} 要保留 0..255 的值，因此高位补 0。可能汇编：
+
+\begin{lstlisting}
+movzx eax, dil
+ret
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+eax = zero_extend_32(dil)
+\end{lstlisting}
+
+如果是从内存读取：
+
+\begin{lstlisting}
+movzx eax, byte ptr [rdi]
+\end{lstlisting}
+
+表示读取 1 字节，再零扩展到 32 位。
+
+\subsection{符号扩展}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int from_i8(std::int8_t x)
+{
+    return x;
+}
+\end{lstlisting}
+
+\code{std::int8_t} 到 \code{int} 要保留 -128..127 的值，因此复制符号位。可能汇编：
+
+\begin{lstlisting}
+movsx eax, dil
+ret
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+eax = sign_extend_32(dil)
+\end{lstlisting}
+
+举例：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+8 位输入 & \instruction{movzx} 到 32 位 & \instruction{movsx} 到 32 位 \\
+\midrule
+\code{0x7f} & \code{0x0000007f} & \code{0x0000007f} \\
+\code{0x80} & \code{0x00000080} & \code{0xffffff80} \\
+\code{0xff} & \code{0x000000ff} & \code{0xffffffff} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\instruction{movsxd}：32 位到 64 位符号扩展}
+
+数组下标是 \code{int}，地址计算需要 64 位时，经常看到：
+
+\begin{lstlisting}
+movsxd rsi, esi
+mov    eax, dword ptr [rdi + rsi*4]
+\end{lstlisting}
+
+\instruction{movsxd rsi, esi} 把 32 位有符号下标扩展成 64 位。如果 \code{i == -1}，扩展后 \register{rsi} 是 \code{0xffffffffffffffff}，地址计算就会向前移动 4 字节。C++ 中真正访问负下标通常越界，是 UB；但从指令语义看，它就是补码地址计算。
+
+\begin{warningbox}
+\code{char} 是否 signed 在 C++ 中与实现有关。写底层实验时需要明确使用 \code{std::int8_t} 或 \code{std::uint8_t}，不要靠普通 \code{char} 猜测编译器会生成 \instruction{movsx} 还是 \instruction{movzx}。
+\end{warningbox}
+
+\section{移位：乘除 2 的幂、位域和符号}
+
+\subsection{\instruction{shl} 和 \instruction{sal}}
+
+\instruction{shl} 是逻辑左移，\instruction{sal} 是算术左移；在 x86 上它们对整数位模式的效果相同：
+
+\begin{lstlisting}
+shl eax, 3      ; eax = eax << 3
+\end{lstlisting}
+
+如果没有溢出语义问题，左移 3 位相当于乘以 8。但 C++ 对 signed 左移有规则限制，尤其是溢出和负数左移。机器指令只是移位，语言层面未必定义良好。
+
+\subsection{\instruction{shr} 和 \instruction{sar}}
+
+右移分两种：
+
+\begin{lstlisting}
+shr eax, 1      ; logical right shift, high bits filled with 0
+sar eax, 1      ; arithmetic right shift, high bits filled with sign bit
+\end{lstlisting}
+
+例子：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+输入 8 位 & \instruction{shr 1} & \instruction{sar 1} \\
+\midrule
+\code{01111110} & \code{00111111} & \code{00111111} \\
+\code{10000000} & \code{01000000} & \code{11000000} \\
+\code{11111110} & \code{01111111} & \code{11111111} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\instruction{shr} 适合 unsigned 语义；\instruction{sar} 适合补码 signed 语义。C++ 中 signed 负数右移的具体行为在现代主流实现通常是算术右移，但学习标准规则时要注意实现定义历史和标准版本细节。本书在 x86-64/Linux 实验中按补码和算术右移观察。
+
+\subsection{移位计数}
+
+x86 中变量移位计数通常使用 \register{cl}：
+
+\begin{lstlisting}
+shl eax, cl
+shr rdx, cl
+sar edi, cl
+\end{lstlisting}
+
+C++ 中如果移位计数小于 0 或大于等于位宽，行为未定义：
+
+\begin{lstlisting}[language=C++]
+std::uint32_t x = 1;
+auto y = x << 32;    // undefined behavior in C++
+\end{lstlisting}
+
+硬件可能会对计数取模或屏蔽低位，但这不是你可以依赖的 C++ 语义。性能代码要么证明计数合法，要么显式处理。
+
+\section{位运算：mask、alignment 和 flags}
+
+\subsection{\instruction{and}、\instruction{or}、\instruction{xor}、\instruction{not}}
+
+常见位运算指令：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+指令 & 简化语义 & 常见用途 \\
+\midrule
+\instruction{and} & \code{dst = dst & src} & 清位、取低位、对齐 mask \\
+\instruction{or} & \code{dst = dst | src} & 置位、合并 flags \\
+\instruction{xor} & \code{dst = dst ^ src} & 翻转位、清零寄存器、差异检测 \\
+\instruction{not} & \code{dst = ~dst} & 位取反，不更新 flags \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如判断偶数：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool is_even(unsigned x)
+{
+    return (x & 1U) == 0;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+test dil, 1
+sete al
+ret
+\end{lstlisting}
+
+\instruction{test a, b} 计算 \code{a & b} 并设置 flags，但不保存结果。这里用最低位判断奇偶。
+
+\subsection{对齐向下：清掉低位}
+
+如果 \code{align} 是 2 的幂，对地址向下对齐可写成：
+
+\begin{lstlisting}[language=C++]
+std::uintptr_t align_down(std::uintptr_t x)
+{
+    return x & ~std::uintptr_t(63);
+}
+\end{lstlisting}
+
+对应位运算：
+
+\begin{lstlisting}
+and rax, -64
+\end{lstlisting}
+
+因为 64 字节对齐要求低 6 位为 0。清掉低 6 位就是向下对齐到 cache line 边界。
+
+例子：
+
+\begin{lstlisting}
+x = 0x1234
+mask = ~0x3f = ...ffc0
+x & mask = 0x1200
+\end{lstlisting}
+
+\subsection{对齐向上：加再清低位}
+
+向上对齐：
+
+\begin{lstlisting}[language=C++]
+std::uintptr_t align_up_64(std::uintptr_t x)
+{
+    return (x + 63) & ~std::uintptr_t(63);
+}
+\end{lstlisting}
+
+地址例子：
+
+\begin{lstlisting}
+x = 0x1234
+x + 63 = 0x1273
+(x + 63) & ~0x3f = 0x1240
+\end{lstlisting}
+
+这个模式在 allocator、SIMD buffer、cache line padding、tensor storage 对齐中非常常见。
+
+\subsection{位标志}
+
+位运算经常用来维护 flags：
+
+\begin{lstlisting}[language=C++]
+constexpr unsigned kReadable = 1u << 0;
+constexpr unsigned kWritable = 1u << 1;
+constexpr unsigned kPinned   = 1u << 2;
+
+bool writable(unsigned flags)
+{
+    return (flags & kWritable) != 0;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+test dil, 2
+setne al
+ret
+\end{lstlisting}
+
+\instruction{test} 不保存 \code{flags & 2}，只设置 ZF。后续 \instruction{setne} 根据 ZF 生成布尔值。
+
+\section{\instruction{cmp} 和 \instruction{test}：只设置 flags 的计算}
+
+\instruction{cmp a, b} 类似计算：
+
+\begin{lstlisting}
+a - b
+\end{lstlisting}
+
+但不保存结果，只更新 flags。
+
+\instruction{test a, b} 类似计算：
+
+\begin{lstlisting}
+a & b
+\end{lstlisting}
+
+也不保存结果，只更新 flags。
+
+对比：
+
+\begin{lstlisting}
+sub eax, esi      ; eax = eax - esi, flags updated
+cmp eax, esi      ; compute eax - esi only for flags
+
+and eax, 1        ; eax = eax & 1, flags updated
+test eax, 1       ; compute eax & 1 only for flags
+\end{lstlisting}
+
+第 13 章会系统讲条件跳转。本章先掌握一个读法：看到 \instruction{cmp} 或 \instruction{test}，不要找“结果存哪里”；结果不存，flags 才是输出。
+
+\section{read-modify-write：一条指令不等于一次微操作}
+
+看：
+
+\begin{lstlisting}
+add dword ptr [rdi], esi
+\end{lstlisting}
+
+ISA 语义可以写成：
+
+\begin{lstlisting}
+tmp = load 4 bytes from [rdi]
+tmp = tmp + esi
+store low 4 bytes of tmp to [rdi]
+update flags
+\end{lstlisting}
+
+它是一条汇编，但语义包含 load、ALU、store。对于普通内存操作，这已经比寄存器加法重；对于原子 read-modify-write，例如 \code{lock add}，还会牵涉 cache coherence 和内存序。
+
+性能工程里要区分：
+
+\begin{lstlisting}
+add eax, esi                  ; register ALU
+add dword ptr [rdi], esi      ; memory RMW
+lock add dword ptr [rdi], esi ; atomic RMW, much heavier
+\end{lstlisting}
+
+本章只要求你看到内存目的操作数时提高警觉：这不是普通寄存器加法。
+
+\section{案例：从 C++ 类型转换到扩展指令}
+
+创建：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int sum_bytes(std::uint8_t const* a, std::int8_t const* b, int i)
+{
+    return a[i] + b[i];
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+movsxd rax, edx
+movzx  ecx, byte ptr [rdi + rax]
+movsx  eax, byte ptr [rsi + rax]
+add    eax, ecx
+ret
+\end{lstlisting}
+
+逐条解释：
+
+\begin{lstlisting}
+entry:
+    rdi = a
+    rsi = b
+    edx = i
+
+movsxd rax, edx
+    rax = sign_extend_64(i)
+
+movzx ecx, byte ptr [rdi + rax]
+    load a[i] as uint8_t
+    ecx = zero_extend_32(a[i])
+
+movsx eax, byte ptr [rsi + rax]
+    load b[i] as int8_t
+    eax = sign_extend_32(b[i])
+
+add eax, ecx
+    eax = int(b[i]) + int(a[i])
+\end{lstlisting}
+
+这里 \instruction{movzx} 和 \instruction{movsx} 的差异来自 C++ 类型。换成两个 \code{std::uint8_t}，第二个 load 很可能也变成 \instruction{movzx}。
+
+\section{案例：地址计算、常数乘法和结构体大小}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+struct Node {
+    int key;
+    int value;
+    int next;
+};
+
+extern "C" int get_value(Node const* nodes, int i)
+{
+    return nodes[i].value;
+}
+\end{lstlisting}
+
+布局：
+
+\begin{lstlisting}
+sizeof(Node)       = 12
+offset(Node,value) = 4
+addr(nodes[i].value) = base + i * 12 + 4
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+movsxd rax, esi
+lea    rax, [rax + rax*2]
+mov    eax, dword ptr [rdi + rax*4 + 4]
+ret
+\end{lstlisting}
+
+解释：
+
+\begin{lstlisting}
+rax = sign_extend_64(i)
+rax = rax + rax * 2 = i * 3
+address = base + (i * 3) * 4 + 4
+        = base + i * 12 + 4
+\end{lstlisting}
+
+这个案例很典型：结构体大小是 12，不能直接作为 x86 scale，于是编译器拆成 \code{i*3} 再 \code{*4}。
+
+\section{案例：branchless mask 的第一眼}
+
+后面会系统讲 branchless 技术，这里先看一个基础模式：
+
+\begin{lstlisting}[language=C++]
+extern "C" unsigned mask_if_nonzero(unsigned x)
+{
+    return x != 0 ? 0xffffffffu : 0u;
+}
+\end{lstlisting}
+
+一种可能汇编：
+
+\begin{lstlisting}
+neg edi
+sbb eax, eax
+ret
+\end{lstlisting}
+
+简化解释：
+
+\begin{itemize}
+  \item \instruction{neg edi} 计算 \code{0 - x}，并根据是否借位设置 CF。
+  \item 如果 \code{x != 0}，CF 通常为 1；如果 \code{x == 0}，CF 为 0。
+  \item \instruction{sbb eax, eax} 计算 \code{eax = eax - eax - CF}。
+  \item 当 CF 为 1，结果是 \code{0xffffffff}；当 CF 为 0，结果是 0。
+\end{itemize}
+
+这个例子不要求你现在熟练使用 \instruction{sbb}，但要建立意识：整数指令和 flags 可以组合出没有分支的 mask。SIMD tail mask、选择、量化 clamp、条件累加等场景会反复出现这种思想。
+
+\section{性能注意点：延迟、吞吐、依赖和 flags}
+
+本章不做完整微架构表，但必须先建立几个判断：
+
+\begin{enumerate}
+  \item 寄存器 ALU 指令通常很便宜。
+  \item 乘法通常比加法和位运算更重。
+  \item 内存操作比寄存器操作更容易受 cache、TLB、store buffer 影响。
+  \item 更新 flags 会产生 flags 依赖；如果后续不需要 flags，\instruction{lea} 可能避免不必要的 flags 写。
+  \item 32 位写入清零高位，经常用于打断旧高位依赖。
+  \item 小宽度部分寄存器写入可能引入额外依赖或需要合并旧值。
+\end{enumerate}
+
+例如：
+
+\begin{lstlisting}
+add eax, esi      ; writes eax and flags
+lea eax, [rdi+rsi]; writes eax, does not write flags
+\end{lstlisting}
+
+如果后面紧跟条件跳转读取上一条 \instruction{cmp} 的 flags，那么中间插入会写 flags 的指令可能破坏条件。编译器会避开这种错误，但手写汇编必须自己负责。
+
+\section{实验 11.1：类型扩展指令观察}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/extend.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int from_u8(std::uint8_t x) { return x; }
+extern "C" int from_i8(std::int8_t x) { return x; }
+extern "C" int load_u8(std::uint8_t const* p, int i) { return p[i]; }
+extern "C" int load_i8(std::int8_t const* p, int i) { return p[i]; }
+\end{lstlisting}
+
+生成汇编：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -S -masm=intel extend.cpp -o extend.s
+clang++ -std=c++20 -O3 -c extend.cpp -o extend.o
+objdump -d -Mintel extend.o > extend.objdump.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出所有 \instruction{movsx}、\instruction{movzx}、\instruction{movsxd}。
+  \item 解释每条扩展指令对应的 C++ 类型。
+  \item 对 \code{i == -1} 的情况，写出地址公式会如何变化，并说明 C++ 是否允许访问。
+  \item 记录机器码字节。
+\end{enumerate}
+\end{labbox}
+
+\section{实验 11.2：\instruction{lea}、乘法和结构体步长}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/lea_patterns.cpp}：
+
+\begin{lstlisting}[language=C++]
+extern "C" int mul3(int x) { return x * 3; }
+extern "C" int mul5_add7(int x) { return x * 5 + 7; }
+
+struct S12 {
+    int a;
+    int b;
+    int c;
+};
+
+extern "C" int load_s12_c(S12 const* p, int i)
+{
+    return p[i].c;
+}
+
+struct S24 {
+    double a;
+    double b;
+    int c;
+    int d;
+};
+
+extern "C" int load_s24_d(S24 const* p, int i)
+{
+    return p[i].d;
+}
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出所有 \instruction{lea}。
+  \item 解释每个 \instruction{lea} 是否访问内存。
+  \item 写出 \code{S12} 和 \code{S24} 的布局、\code{sizeof} 和字段 offset。
+  \item 从汇编恢复 \code{i * 12 + offset} 和 \code{i * 24 + offset}。
+  \item 对比编译器何时用 \instruction{imul}，何时用 \instruction{lea}。
+\end{enumerate}
+\end{labbox}
+
+\section{实验 11.3：位运算和对齐}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/bit_alignment.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" std::uintptr_t align_down_64(std::uintptr_t x)
+{
+    return x & ~std::uintptr_t(63);
+}
+
+extern "C" std::uintptr_t align_up_64(std::uintptr_t x)
+{
+    return (x + 63) & ~std::uintptr_t(63);
+}
+
+extern "C" bool has_flag(unsigned flags, unsigned bit)
+{
+    return (flags & bit) != 0;
+}
+
+extern "C" unsigned set_flag(unsigned flags, unsigned bit)
+{
+    return flags | bit;
+}
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出 \instruction{and}、\instruction{or}、\instruction{test}。
+  \item 用二进制解释 \code{align_down_64(0x1234)} 和 \code{align_up_64(0x1234)}。
+  \item 解释 \instruction{test} 为什么不保存结果。
+  \item 说明 64 字节对齐为什么和低 6 位有关。
+\end{enumerate}
+\end{labbox}
+
+\section{本章作业}
+
+\begin{exercisebox}
+\subsection*{作业 1：整数指令注释表}
+
+从本章实验中选择至少 30 条整数指令，建立表格：
+
+\begin{itemize}
+  \item 指令文本。
+  \item 分类：move、ALU、shift、bitwise、extension、compare、address calculation。
+  \item 读寄存器/内存。
+  \item 写寄存器/内存。
+  \item 是否更新 flags。
+  \item 对应 C++ 语义。
+\end{itemize}
+
+\subsection*{作业 2：扩展语义推导}
+
+给定输入字节：
+
+\begin{lstlisting}
+0x00
+0x7f
+0x80
+0xff
+\end{lstlisting}
+
+分别写出：
+
+\begin{enumerate}
+  \item \instruction{movzx eax, byte ptr [p]} 的结果。
+  \item \instruction{movsx eax, byte ptr [p]} 的结果。
+  \item 对应 \code{std::uint8_t} 和 \code{std::int8_t} 到 \code{int} 的 C++ 转换结果。
+\end{enumerate}
+
+\subsection*{作业 3：恢复地址公式}
+
+对下面汇编恢复结构体布局的可能信息：
+
+\begin{lstlisting}
+movsxd rax, esi
+lea    rax, [rax + rax*2]
+mov    ecx, dword ptr [rdi + rax*8 + 20]
+ret
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 写出元素步长。
+  \item 写出字段 offset。
+  \item 设计一个可能的 C++ 结构体。
+  \item 解释为什么不能只看 \code{rax*8} 就说元素大小是 8。
+\end{enumerate}
+
+\subsection*{作业 4：对齐函数证明}
+
+证明下面函数对 2 的幂 \code{A} 有效：
+
+\begin{lstlisting}[language=C++]
+std::uintptr_t align_up(std::uintptr_t x, std::uintptr_t A)
+{
+    return (x + A - 1) & ~(A - 1);
+}
+\end{lstlisting}
+
+要求用二进制低位解释，不少于 800 字，并举三个例子：
+
+\begin{itemize}
+  \item 已经对齐的地址。
+  \item 只差 1 字节对齐的地址。
+  \item 随机未对齐地址。
+\end{itemize}
+
+\subsection*{作业 5：小型整数汇编报告}
+
+写一个 20 行以内 C++ 文件，包含：
+
+\begin{itemize}
+  \item \code{std::uint8_t} 和 \code{std::int8_t} load。
+  \item 一个结构体数组字段访问，结构体大小不是 1、2、4、8。
+  \item 一个对齐函数。
+  \item 一个位标志测试函数。
+\end{itemize}
+
+生成 \code{-O3} 汇编并提交不少于 2500 字报告，必须包括：
+
+\begin{itemize}
+  \item 源码和编译命令。
+  \item 类型和结构体布局表。
+  \item 每个函数的核心汇编。
+  \item 所有地址公式。
+  \item 扩展指令解释。
+  \item flags 相关指令解释。
+  \item 至少 10 条机器码字节记录。
+\end{itemize}
+\end{exercisebox}
+
+\section{验收标准}
+
+完成本章后，你应该能做到：
+
+\begin{itemize}
+  \item 区分位模式、signed 解释和 unsigned 解释。
+  \item 解释 \instruction{mov}、load、store 的差异。
+  \item 解释 \instruction{xor reg, reg} 清零和 32 位写清零高位。
+  \item 读懂 \instruction{add}、\instruction{sub}、\instruction{imul}、\instruction{lea} 的基本语义。
+  \item 解释 \instruction{movsx}、\instruction{movzx}、\instruction{movsxd} 对应的 C++ 类型转换。
+  \item 区分 \instruction{shr} 和 \instruction{sar}。
+  \item 用 \instruction{and}、\instruction{or}、\instruction{test} 解释 mask、flag 和 alignment。
+  \item 看到 \instruction{cmp} 和 \instruction{test} 时知道真正输出是 flags。
+  \item 从 \instruction{lea} 组合恢复非 2 的幂结构体步长。
+  \item 初步判断整数指令对性能的影响：寄存器 ALU、内存 RMW、flags 依赖、乘法和地址计算。
+\end{itemize}
+
+如果这些能力稳定，第 13 章的控制流、第 23 章的 loop optimization、第 24 章的 alias/UB、第 42 章的低精度量化和第 48 章的 AVX2 microkernel 都会更容易进入。
