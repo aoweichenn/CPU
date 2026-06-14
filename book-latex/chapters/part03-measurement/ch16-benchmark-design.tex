@@ -1,10 +1,10 @@
 \chapter{Benchmark 设计：输入、热路径和报告}
 
-\section{本章要解决的问题}
+\section{问题与目标}
 
-上一章讲的是“为什么性能测量容易错”。本章讲“怎样把测量原则做成可复现的 benchmark 工程”。
+上一章解释了性能测量为什么容易出错。本章进一步回答：怎样把测量原则落实为可复现、可审计、可长期维护的 benchmark 工程。
 
-这一步很关键。你以后做 HPC kernel、AI 算子、编译器优化、内存布局优化时，不可能每次都手写一段临时代码计时。你需要的是一套可以扩展、可以审计、可以保存原始数据、可以扫描参数、可以比较版本的实验系统。
+这一步非常关键。以后无论做 HPC kernel、AI 算子、编译器优化还是内存布局优化，都不能长期依赖临时代码计时。你需要的是一套可以扩展、可以审计、可以保存原始数据、可以扫描参数、可以比较版本的实验系统。
 
 本章目标是让你能设计一个小型 benchmark suite，而不是只会写一个 \code{main()} 计时器。这个 suite 至少要处理：
 
@@ -18,11 +18,37 @@
   \item 二进制审计：可以把源码、反汇编和数字联系起来。
 \end{itemize}
 
-从工程角度看，benchmark suite 和普通测试框架很像：它要有清晰的数据流、明确的边界、稳定的输出格式和可维护的扩展点。差别在于，benchmark 还必须控制优化器、cache、频率、输入分布和统计口径。
+从工程角度看，benchmark suite 与普通测试框架有相似之处：它需要清晰的数据流、明确的边界、稳定的输出格式和可维护的扩展点。不同之处在于，benchmark 还必须控制优化器、cache、频率、输入分布和统计口径。
 
 \begin{keyidea}
-一个好的 benchmark 不是一段计时代码，而是一套实验协议。它规定被测对象、输入空间、计时边界、重复策略、输出格式、正确性检查、环境记录和审计方法。
+高质量 benchmark 不是一段计时代码，而是一套实验协议。它规定被测对象、输入空间、计时边界、重复策略、输出格式、正确性检查、环境记录和审计方法。
 \end{keyidea}
+
+\section{从一次计时到实验系统}
+
+上一章的最小 harness 解决的是“怎样避免一次测量明显失真”。本章要解决另一个问题：当你需要长期比较多个版本、多个输入规模、多个 kernel、多个机器时，临时代码会迅速失控。每次复制一个 \code{main()}，改几个常量，手工粘贴结果，最终会出现三个问题。
+
+第一，可复现性下降。你很难知道某张结果表来自哪份源码、哪个命令、哪个输入 seed、哪个编译参数。几天后重新运行，结果不同，也无法判断是代码变了、机器状态变了，还是当时记录不完整。
+
+第二，可比性下降。不同 kernel 用不同 warmup 次数，不同 CSV 列名，不同统计口径，不同 batch 策略，最后数字放在同一张表里却不是同一实验协议下的数字。这样的比较会误导。
+
+第三，可维护性下降。新增一个 kernel 需要复制大量代码，修复一个测量 bug 需要改很多地方，CSV 格式变化会破坏旧脚本。benchmark suite 不是为了炫耀架构，而是为了避免实验本身变成不可控变量。
+
+因此，benchmark suite 的设计目标是把变化点显式化。kernel 可以变，输入规模可以变，数据分布可以变，batch 可以变，统计口径可以变；但配置、样本记录、汇总、环境记录和报告流程应尽量稳定。只有稳定的实验协议，才能支持长期性能演进。
+
+\begin{mentalmodel}
+把 benchmark suite 看成一个小型数据生产系统：
+
+\begin{itemize}
+  \item 配置决定实验矩阵。
+  \item workload factory 生成输入实例。
+  \item runner 产生原始样本。
+  \item summarizer 产生派生指标。
+  \item report 解释数据和边界。
+\end{itemize}
+
+不要让这些职责互相混杂。
+\end{mentalmodel}
 
 \section{Benchmark 设计的主线}
 
@@ -59,11 +85,67 @@ audit:
     keep binary, objdump excerpt, perf command, raw data
 \end{lstlisting}
 
-这条流水线背后的思想是：每个阶段只做一类事。输入生成不放进计时区域；统计不混进 kernel；报告不改变运行行为；校验不依赖性能版本本身。
+这条流水线背后的思想是职责分离：每个阶段只做一类事。输入生成不放进计时区域；统计不混进 kernel；报告不改变运行行为；校验不依赖性能版本本身。
 
 \begin{mentalmodel}
 设计 benchmark 时，把它看成“实验编译器”：配置是源程序，workload 是输入实例，kernel 是被执行的目标代码，CSV 是输出产物，报告是解释器。任何隐式状态都会降低可复现性。
 \end{mentalmodel}
+
+\section{职责边界：让实验系统可审计}
+
+benchmark suite 的代码规模通常不大，但职责边界必须清楚。边界不清的 suite 很快会变成“能运行但不能信任”的脚本：参数解析顺便改全局变量，workload 生成顺便 warmup，runner 顺便写 CSV，summary 顺便过滤异常值，最后没有人知道某个数字到底经过了哪些步骤。
+
+一个可审计的 suite 至少应把下面几类责任分开。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.38\linewidth}p{0.26\linewidth}}
+\toprule
+模块 & 应承担的责任 & 不应承担的责任 \\
+\midrule
+options parser & 把命令行变成显式配置。 & 不运行 kernel，不生成输入。 \\
+workload factory & 分配、初始化、计算 reference。 & 不计时，不写结果文件。 \\
+runner & 执行 warmup 和 timed region。 & 不解析命令行，不决定统计口径。 \\
+checker & 判断结果是否正确。 & 不改变被测输入，除非协议说明。 \\
+collector & 保存原始样本。 & 不偷偷删除离群点。 \\
+summarizer & 从 raw 计算 summary。 & 不修改 raw，不改变实验事实。 \\
+writer & 输出 CSV 和 metadata。 & 不参与 timed region。 \\
+recorder & 保存环境、命令、构建信息。 & 不影响 kernel 行为。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里的“不应承担”比“应承担”更重要。因为 benchmark 的失败往往不是某个模块完全缺失，而是职责串线。例如 runner 在计时循环里顺手写一行日志，数字就混入 I/O；summarizer 看到异常点后直接删除，报告就失去可复核性；workload factory 依赖当前时间生成 seed，实验就不能复现。
+
+\subsection{显式数据流优先于隐式全局状态}
+
+benchmark suite 很容易出现全局变量：
+
+\begin{lstlisting}
+global_size
+global_seed
+global_batch
+global_result_file
+\end{lstlisting}
+
+全局状态写起来方便，但会让实验很难审计。一个函数到底使用了哪个 seed？某次 batch 是手工指定还是自动校准得到？写 CSV 的路径来自命令行还是默认值？这些信息如果散落在全局变量和初始化顺序里，后续读报告的人无法重建实验。
+
+更稳的方式是让配置显式流动：
+
+\begin{lstlisting}
+BenchmarkOptions -> Workload -> RawSample -> SummaryRow -> CSV
+\end{lstlisting}
+
+每个阶段接收明确输入，产生明确输出。这样做的好处是：测试容易写，日志容易记录，错误容易定位。比如 summary 计算错了，可以直接用 raw samples 重算；workload 出错了，可以只检查 factory；CSV 列缺失，可以回到 \code{RawSample} 定义。
+
+\subsection{metadata 是实验产物，不是附加说明}
+
+很多人把环境、命令和构建信息写在报告正文里，甚至只写在聊天记录里。这不够。metadata 应该和 raw samples 一样成为结果目录中的一等产物。原因很简单：性能数据离开上下文就没有意义。没有编译器版本，无法判断优化器行为；没有命令行，无法知道 batch、seed、size；没有 git hash，无法知道源码；没有 CPU 信息，无法解释 cache 和 ISA。
+
+推荐把 metadata 分成三类。第一类是运行前已知的配置，例如 size、seed、batch、warmup、repetitions。第二类是运行时环境，例如 CPU、OS、governor、容器、权限。第三类是构建和源码，例如编译命令、编译器版本、git hash、是否 dirty。三类信息都应该由程序或脚本自动记录，尽量减少手工记忆。
+
+\begin{keyidea}
+benchmark suite 的核心不是“少写几行代码”，而是让每个性能数字都能追溯到配置、输入、机器码、环境和原始样本。
+\end{keyidea}
 
 \section{先写清楚问题陈述}
 
@@ -99,7 +181,7 @@ Output:
     fields include n, bytes, sample_ns, median_ns, bandwidth_GBps
 \end{lstlisting}
 
-为什么要这么写？因为性能结论总是有适用范围。一个只在 \code{n = 1024} 时更快的版本，不一定在 \code{n = 16777216} 时更快；一个 warm-cache 下更快的版本，不一定 cold-cache 下更快；一个随机数据下快的分支版本，不一定排序数据下快。
+为什么要这么写？因为性能结论总是有适用范围。一个只在小规模输入时更快的版本，不一定在大规模输入时更快；一个 warm-cache 下更快的版本，不一定 cold-cache 下更快；一个随机数据下快的分支版本，不一定排序数据下快。
 
 \section{输入规模：不要只测一个点}
 
@@ -152,6 +234,171 @@ important n:
 \begin{warningbox}
 只测一个大输入很容易掩盖小规模延迟；只测一个小输入又会掩盖内存带宽瓶颈。算子优化通常需要同时报告小规模、中规模、大规模和尾部边界。
 \end{warningbox}
+
+\subsection{输入规模应服务问题}
+
+输入规模不是越多越好，而是要覆盖你关心的性能区域。若目标是研究函数调用和短小 kernel 开销，小规模点要更密；若目标是研究内存带宽，大规模点要跨过 LLC；若目标是研究 SIMD 尾部处理，就要专门测向量宽度附近的边界值；若目标是研究算法复杂度，就要覆盖足够大的数量级变化。
+
+可以把规模分成三类。第一类是 correctness 边界规模，例如 \code{0, 1, vector_width - 1, vector_width, vector_width + 1}。它们主要用于发现尾部 bug，不一定适合吞吐结论。第二类是 cache 层级规模，例如明显落在 L1、L2、LLC 和内存中的工作集。它们用于观察瓶颈迁移。第三类是业务代表规模，例如真实线上请求常见的 tensor shape、图像大小、batch size 或行数。它们用于判断优化是否有实际价值。
+
+报告中最好把这三类规模区分开。一个版本在 correctness 边界规模上慢，可能是固定开销；在业务规模上快，仍然有价值。反过来，一个版本只在人工大规模上快，但真实业务规模很小，工程价值可能有限。
+
+\subsection{矩阵设计要分阶段}
+
+如果一次性组合所有维度：
+
+\begin{lstlisting}
+5 kernels * 8 sizes * 5 distributions * 3 cache modes * 3 batch modes
+\end{lstlisting}
+
+就会得到 1800 个配置。每个配置再测 31 次，实验时间、数据量和分析复杂度都会暴涨。更糟的是，结果太多反而让你看不清问题。
+
+更好的方法是分阶段。第一阶段固定 distribution、cache mode 和 batch，只扫描 size，建立性能轮廓。第二阶段在异常 size 上增加 distribution，判断分支或数值路径是否影响。第三阶段对短 kernel 引入 batch 校准，判断计时稳定性。第四阶段对内存 kernel 增加 cold-ish 或 eviction buffer，判断 cache 敏感性。第五阶段才跑完整矩阵，作为最终报告。
+
+这种策略符合工程调试思路：先用小实验定位变量，再用大矩阵确认结论。它也减少无意义数据堆积，避免为了“全面”而失去分析能力。
+
+\begin{keyidea}
+benchmark 矩阵不是越大越专业。专业的矩阵应围绕问题分阶段展开，每增加一个维度都要说明它验证什么假设。
+\end{keyidea}
+
+\section{实验变量：一次只让少数东西变化}
+
+benchmark 本质上是实验。实验设计的第一条原则是分清变量。一个性能数字背后至少有三类变量。
+
+第一类是自变量，也就是你主动改变的因素。比如输入规模、数据分布、对齐方式、batch 大小、kernel 版本、编译参数、线程数。自变量应该出现在配置和 CSV 中。
+
+第二类是因变量，也就是你观察的结果。比如 elapsed ns、GB/s、ns/element、GFLOP/s、branch-misses、cache-misses。因变量应该有明确单位和计算公式。
+
+第三类是控制变量，也就是你希望保持不变的条件。比如机器、CPU governor、编译器版本、构建类型、输入 seed、内存分配策略、运行用户、后台负载、环境变量。如果控制变量变化了，结果解释就要更谨慎。
+
+很多错误 benchmark 的根源是同时改变太多东西。例如你把算法换了、编译器从 GCC 换成 Clang、输入从全零换成随机、batch 从 1 变成 auto、机器也换了，然后看到版本 B 更快。这个结果不能回答“算法是不是更好”，因为差异可能来自任何一个变化。
+
+专业做法是先固定控制变量，再改变一个主要自变量。若必须改变多个变量，就用矩阵显式记录，并在报告中说明交互关系。例如“版本 B 在随机输入下更快，但在全零输入下没有优势”，说明版本和 distribution 存在交互；“版本 B 在小规模快、大规模持平”，说明版本和 size 存在交互。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.33\linewidth}p{0.31\linewidth}}
+\toprule
+变量类型 & 例子 & 记录位置 \\
+\midrule
+自变量 & kernel、size、distribution、alignment、batch & command、CSV、report \\
+因变量 & elapsed ns、GB/s、miss rate、speedup & raw、summary、perf output \\
+控制变量 & CPU、compiler、flags、governor、seed & environment、metadata \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keyidea}
+benchmark 不是“跑一下看谁快”，而是控制变量后观察自变量如何影响因变量。变量不清，结论就不清。
+\end{keyidea}
+
+\section{对照组：baseline 必须稳定}
+
+每个优化实验都需要 baseline。baseline 可以是简单 C++ 版本、标准库函数、上一版实现、标量版本、无 SIMD 版本、单线程版本，或者已经验证过的 reference。没有 baseline，数字只是一组孤立时间，无法判断好坏。
+
+baseline 需要满足几个条件。
+
+第一，它必须正确。baseline 不一定最快，但必须语义可信。很多时候 baseline 同时承担 correctness reference 的角色。若 baseline 本身错了，优化版本再快也没有意义。
+
+第二，它必须可复现。baseline 的源码、编译参数、输入和输出都要记录。不要用“我之前那个版本”作为对照，除非能明确指向 commit、文件路径和命令。
+
+第三，它必须和优化版本在同一实验协议下运行。相同机器、相同编译器、相同输入、相同重复次数、相同统计口径。否则比较不公平。
+
+第四，它要尽量保持长期稳定。随着项目发展，baseline 也可能修 bug 或改接口；这时要记录 baseline version。大型项目常常需要多个 baseline：reference baseline 用于正确性，simple baseline 用于教学解释，production baseline 用于工程比较。
+
+\subsection{reference baseline 和 performance baseline}
+
+reference baseline 和 performance baseline 不一定是同一个实现。reference baseline 的目标是语义清楚、容易验证、边界行为可信。它可以慢，可以不用 SIMD，可以使用更高精度或更直接的写法。performance baseline 的目标是代表当前工程里值得比较的版本，例如上一版生产实现、标准库实现、标量优化版或已有手写汇编版。
+
+把二者混在一起会带来两个问题。第一，如果 reference 很慢，候选版本相对 reference 的 speedup 会很好看，但不代表工程上有价值。第二，如果 performance baseline 过于复杂，把它同时当 correctness oracle，就可能把旧 bug 当成标准答案。正确做法是：用 reference 判断结果是否正确，用 performance baseline 判断候选版本是否值得替换。
+
+例如 \code{dot_f32} 可以有三个版本：
+
+\begin{lstlisting}
+reference:
+    simple loop, known reduction order, clear tolerance
+
+baseline:
+    current scalar O3 implementation
+
+candidate:
+    unrolled or vectorized implementation
+\end{lstlisting}
+
+报告应分别写清：candidate 是否通过 reference 校验；candidate 相对 performance baseline 的时间、吞吐和误差如何变化。这样结论不会被漂亮但无意义的 speedup 误导。
+
+\subsection{baseline 要能冻结和复跑}
+
+长期项目中，baseline 本身会变。如果每次都拿“当前 main 分支”当 baseline，几个月后你很难解释历史曲线。更稳的做法是为重要实验记录 \code{baseline_version}，可以是 git hash、release tag、源码文件 checksum 或二进制 checksum。
+
+冻结 baseline 不代表永远不更新。它的意思是：每次更新 baseline 都要作为实验协议变化记录下来。比如从标量 baseline 换成自动向量化 baseline，旧 speedup 和新 speedup 不能直接放在同一条曲线里。否则你看到的性能变化可能只是参照物变化。
+
+对教学实验来说，baseline 可以简单写成：
+
+\begin{lstlisting}
+baseline_name=scalar_cpp
+baseline_source=bench_kernels.cpp
+baseline_compile_flags=-O3 -march=native
+\end{lstlisting}
+
+对工程实验，最好记录 commit 和二进制路径：
+
+\begin{lstlisting}
+baseline_commit=5364eb0
+candidate_commit=working_tree_dirty
+binary=build/bench_suite
+\end{lstlisting}
+
+如果工作区有未提交修改，也要记录 dirty 状态。否则别人只能看到 commit，却复现不出你当时运行的源码。
+
+报告 speedup 时，公式要明确：
+
+\begin{lstlisting}
+speedup = baseline_median_ns / candidate_median_ns
+\end{lstlisting}
+
+如果使用吞吐，则可能写：
+
+\begin{lstlisting}
+throughput_ratio = candidate_GBps / baseline_GBps
+\end{lstlisting}
+
+两者方向相反，不能混用。报告里写“快 2 倍”时，要说明是时间减半还是吞吐翻倍。
+
+\begin{warningbox}
+baseline 不是随便挑一个慢版本。baseline 是实验对照组，必须正确、稳定、可复现，并且和候选版本共享同一实验协议。
+\end{warningbox}
+
+\section{运行顺序：不要让时间顺序伪装成性能差异}
+
+如果你先跑完 baseline 的所有配置，再跑 optimized 的所有配置，结果可能混入时间顺序效应。机器温度、CPU 频率、后台任务、cache 状态、内存分配状态、系统负载都可能随时间变化。于是 optimized 看起来更快或更慢，未必全是代码差异。
+
+更稳的做法是交错运行。比如对每个 size：
+
+\begin{lstlisting}
+for size in sizes:
+    run baseline(size)
+    run optimized(size)
+    run baseline(size)
+    run optimized(size)
+\end{lstlisting}
+
+或者把配置顺序打乱，并记录 order index：
+
+\begin{lstlisting}
+order_index,kernel,size,variant,elapsed_ns
+0,sum_u64,1048576,baseline,...
+1,sum_u64,1048576,optimized,...
+2,sum_u64,32768,optimized,...
+3,sum_u64,32768,baseline,...
+\end{lstlisting}
+
+随机化顺序不是为了制造随机，而是为了避免所有 baseline 都处于一种系统状态、所有 optimized 都处于另一种系统状态。对短实验，交错运行通常已经足够；对长实验，记录顺序、时间戳和环境状态更重要。
+
+当然，交错运行也有副作用。一个配置可能预热另一个配置的 cache 或预测器。解决办法不是固定一种做法，而是让运行顺序成为实验协议的一部分。若你测的是 warm-cache 同一输入，交错可能合理；若你测 cold-cache，配置之间要做 eviction 或隔离。
+
+\begin{mentalmodel}
+性能实验中的时间顺序也是变量。若不记录、不控制，它就会偷偷进入结果。
+\end{mentalmodel}
 
 \section{数据分布：输入不是无关变量}
 
@@ -240,6 +487,28 @@ std::vector<std::uint64_t> make_u64_input(std::size_t size, std::uint64_t seed)
 
 例如 dot product 入门实验可以先使用 \code{[-1, 1]} 的普通有限值，避免把异常数值路径混进第一个实验。后续研究 denormal、fast-math、flush-to-zero 时，再单独设计对应 workload。
 
+\subsection{固定 seed 还不够}
+
+很多报告写“随机输入，seed = 1”，但这仍然不够。还要写清随机生成算法、取值范围、类型转换方式和是否允许特殊值。不同标准库实现的随机分布细节可能不同；不同平台上浮点生成和舍入也可能带来差异。若你希望跨机器完全复现，最好使用自己明确写出的简单生成器，或者把输入文件保存为 artifact。
+
+例如整数输入可以用固定 LCG，因为它的溢出语义在 unsigned 类型中明确。浮点输入可以先生成整数，再映射到固定范围，避免依赖库分布实现。若实验目标不是随机性质量，而是可复现 workload，这样的简单生成器反而更合适。
+
+\subsection{数据分布也是实验参数}
+
+数据分布必须进 CSV。不要只在报告文字里说“随机”。至少应有字段：
+
+\begin{lstlisting}
+distribution,seed,value_range,pattern
+\end{lstlisting}
+
+对分支实验，可以记录 \code{all_positive}、\code{all_negative}、\code{alternating}、\code{random_sign}。对浮点实验，可以记录 \code{finite_uniform}、\code{contains_nan}、\code{subnormal_stress}。对内存实验，可以记录 \code{sequential}、\code{strided_4}、\code{random_index}。
+
+这样做的好处是后续分析不会丢上下文。几个月后你看到某个结果异常，可以从 CSV 知道它不是算法突然变慢，而是输入分布换成了随机访问或 subnormal 压力测试。
+
+\begin{warningbox}
+输入不是背景噪声，而是 benchmark 的一部分。没有输入分布，性能数字没有完整语义。
+\end{warningbox}
+
 \section{对齐、步长和别名}
 
 数组 kernel 的输入不只是长度，还有地址形状。
@@ -287,6 +556,55 @@ void copy_u64(std::span<std::uint64_t> dst,
 \begin{deepdive}
 C++ 标准没有标准化的 \code{restrict} 关键字，但 GCC/Clang 有 \code{__restrict__} 扩展。后续讲 alias analysis 和 vectorization 时会看到：编译器是否知道两个指针不别名，可能直接决定是否能向量化。
 \end{deepdive}
+
+\subsection{把地址形状做成可控变量}
+
+对齐、偏移、步长和别名不应隐藏在 allocator 的偶然结果里。若你想比较 aligned 和 unaligned，就应显式分配更大的 buffer，然后选择不同偏移：
+
+\begin{lstlisting}
+base = aligned allocation
+aligned_ptr = base
+misaligned_ptr = base + 1 element or base + 4 bytes
+\end{lstlisting}
+
+CSV 中记录：
+
+\begin{lstlisting}
+alignment_bytes,offset_bytes,stride,alias_mode
+\end{lstlisting}
+
+这样才能解释结果。如果某次 \code{std::vector} 恰好给了 32 字节对齐，另一次给了 16 字节对齐，而报告没有记录，性能差异就会很难复现。
+
+\subsection{别名模式要单独测}
+
+copy、axpy、vector add 这类 kernel 都可能受别名影响。至少区分：
+
+\begin{itemize}
+  \item no alias：输入输出完全不同。
+  \item exact alias：输出和某个输入相同，例如 in-place。
+  \item partial overlap：输出与输入部分重叠。
+\end{itemize}
+
+不同语义需要不同实现。普通 copy 若允许 overlap，就更接近 \code{memmove}；若不允许 overlap，就可以更激进地向量化和重排。benchmark 不能把这些混在一起。一个不支持 overlap 的高性能 copy，在 no-alias 条件下很快是合理的；拿它和支持 overlap 的通用实现直接比较并不公平。
+
+\subsection{步长实验要防止容量误判}
+
+strided 访问中，元素数相同不代表访问的地址范围相同。例如访问 \code{a[i * 16]}，虽然只读取 \code{n} 个元素，但跨越的内存跨度是连续访问的 16 倍。cache line 利用率、TLB 压力和预取行为都不同。
+
+因此 strided benchmark 应同时记录：
+
+\begin{lstlisting}
+logical_elements = n
+stride_elements = stride
+address_span_bytes = (n - 1) * stride * sizeof(T) + sizeof(T)
+logical_bytes = n * sizeof(T)
+\end{lstlisting}
+
+报告 GB/s 时也要说明是按 logical bytes 还是按 address span 解释。通常 logical bytes 表示算法实际使用的数据量，address span 帮助解释内存系统压力。
+
+\begin{keyidea}
+数组 benchmark 的输入不只是 \code{n}。地址对齐、偏移、步长、别名和地址跨度都会改变机器行为，应该作为实验参数记录。
+\end{keyidea}
 
 \section{热路径边界：把 setup 赶出去}
 
@@ -375,6 +693,33 @@ std::uint64_t run_sum_batch(std::span<const std::uint64_t> values,
 batch 会改变 workload。对 cache 敏感、状态ful、随机输入、分支预测敏感的 kernel，batch 可能让测量更稳定，也可能让测量偏离真实场景。报告里必须写明。
 \end{warningbox}
 
+\subsection{哪些 kernel 不适合简单 batch}
+
+纯函数式、无状态、输入不变的 kernel 最适合 batch，例如对同一数组重复求和。每次调用语义相同，batch 主要改变 cache 和预测状态。
+
+但有些 kernel 不适合简单重复。随机数生成器会更新内部状态；队列 push/pop 会改变容器大小；排序第一次运行后输入已经有序；fill 和 copy 会改变输出 buffer；解码器可能推进流位置；分配器 benchmark 会改变 heap 状态。对这类 kernel，batch 要么需要在每次调用前恢复状态，要么要把 batch 定义成真实 workload 的一部分。
+
+例如 fill benchmark 若重复填同一个 buffer，第一次可能触发写分配和缺页，后续是热写；如果你想测持续写带宽，这可以接受；如果你想测初始化一个新 buffer 的成本，就不能这样 batch。copy benchmark 若每次源和目标相同，cache 状态会迅速变热；若目标是 streaming copy，应使用足够大的 buffer 或轮换多个 buffer。
+
+\subsection{checksum 不能污染被测工作}
+
+为了防止优化器删除 batch，常把每次结果累加到 \code{combined}。这对返回标量的 kernel 很方便。但对输出 buffer kernel，若在 timed region 中扫描输出计算 checksum，就会把校验成本混进测量。正确做法通常是：timed region 只执行 kernel；计时后在区域外校验输出，或只对少量 sentinel 做轻量防优化，同时定期做完整校验。
+
+例如 copy kernel 可以在计时后比较 destination 和 source，但不把比较放入 timed region。为了防止编译器删除 copy，必须让输出缓冲区在计时后有可观察使用，例如抽样读取若干个目标位置并送入防优化接口；完整 correctness check 仍然放在计时区域外。
+
+\subsection{batch 后的单位要一致}
+
+使用 batch 后，所有派生指标都要乘以 batch。若一次 sample 运行了 \code{B} 次，每次处理 \code{n} 个元素，那么：
+
+\begin{lstlisting}
+effective_elements = n * B
+effective_bytes = bytes_per_run * B
+ns_per_element = elapsed_ns / effective_elements
+GB/s = effective_bytes / seconds / 1e9
+\end{lstlisting}
+
+CSV 中如果只有 \code{n} 没有 \code{batch}，后续计算必然出错。不要把 batch 后的 \code{elapsed_ns} 当成单次调用时间，除非列名明确是 \code{elapsed_ns_per_batch} 或 \code{ns_per_call}。
+
 \section{CSV：先保存原始数据}
 
 不要只打印最终汇总。原始样本是后续统计和复查的基础。
@@ -410,6 +755,154 @@ sum_u64,1048576,8388608,lcg,1,31,309900,312000,320100,330000,26.88
   \item 原始样本不要覆盖，只追加或写到带时间戳/配置名的文件。
   \item summary 可以由 raw samples 再生成。
 \end{itemize}
+
+\subsection{schema 要稳定}
+
+CSV schema 一旦被脚本、报告和历史结果依赖，就不要随意改列名。列名是数据接口。比如 \code{elapsed_ns}、\code{batch}、\code{bytes}、\code{distribution} 这些列，应尽早定好语义。如果后续需要新增列，可以追加；如果必须改变语义，应增加 schema version。
+
+建议在 CSV 中或旁边 metadata 文件里记录：
+
+\begin{lstlisting}
+schema_version=1
+time_unit=ns
+bytes_definition=logical_bytes
+batch_semantics=repeated_kernel_calls_per_sample
+\end{lstlisting}
+
+这看起来繁琐，但当你比较几个月前的结果时非常有用。否则你可能不知道旧表里的 \code{bytes} 是只算读，还是读写合计；\code{elapsed_ns} 是单次调用，还是 batch 总时间。
+
+\subsection{raw 和 summary 不要互相替代}
+
+summary 方便阅读，raw 方便复查。只保留 summary，会丢掉样本分布、离群点和后续重新统计能力；只保留 raw，每次看报告都要重新处理。两者应该同时存在，并且 summary 能由 raw 再生成。
+
+如果 summary 中有派生指标，例如 GB/s、GFLOP/s、ns/element，应保证公式写在报告或 metadata 中。派生指标不是原始事实，它依赖 bytes、FLOPs、batch 和时间单位的定义。
+
+\subsection{结果目录应不可变}
+
+一次正式实验输出后，尽量不要手工修改结果目录。若发现 bug，重新跑到新目录。旧目录可以标记为 invalid，但不要覆盖。推荐目录名包含日期、实验名和短 git hash：
+
+\begin{lstlisting}
+results/2026-06-14_sum_suite_5364eb0/
+\end{lstlisting}
+
+如果没有 git hash，也可以记录源码文件校验和或手工版本号。目标是让报告读者能明确知道数据来自哪一次运行，而不是“我记得是昨天跑的那个版本”。
+
+\section{数据审计：先检查样本是否像样}
+
+在计算 speedup 之前，先审计 raw samples。很多错误从 summary 表里看不出来，但 raw samples 一眼就能发现。
+
+最基本的审计包括：
+
+\begin{itemize}
+  \item 每个配置是否有预期数量的 measured repetitions。
+  \item 是否有 0 ns、负数、空行、解析失败或重复行。
+  \item 同一配置的 checksum 是否一致。
+  \item elapsed ns 是否存在明显长尾或异常跳变。
+  \item warmup 是否被误写进 measured samples。
+  \item batch、bytes、n 是否在同一配置内一致。
+  \item 不同配置的 order index 是否符合运行协议。
+\end{itemize}
+
+例如 checksum 不一致，说明某些 sample 的结果不同。原因可能是输入被修改、kernel 有 bug、未初始化数据、随机状态没有固定、batch 改变语义，或者 checksum 设计本身不稳定。在解释速度前，必须先解释 checksum。
+
+再比如某个配置 31 个样本中有 1 个样本比中位数慢 10 倍。它可能是系统中断，也可能是 page fault，也可能是首次触发某个懒初始化，也可能是温度降频。你可以在 summary 中保留 median，但报告应说明异常点如何处理。直接删除异常点而不记录，是不可审计的。
+
+raw data 审计可以先用简单脚本完成。即使不用脚本，报告中也至少要写：
+
+\begin{lstlisting}
+Raw sample audit:
+    all configurations have 31 samples
+    checksum is stable within each configuration
+    no zero elapsed_ns
+    2 outliers observed in large-size copy; kept in raw, median used in summary
+\end{lstlisting}
+
+\begin{keyidea}
+summary 是解释入口，不是原始事实。正式比较前先审计 raw samples，否则漂亮图表可能只是错误数据的包装。
+\end{keyidea}
+
+\section{失败定位：从异常数字回到实验系统}
+
+benchmark suite 不是写完就结束。真正使用时，你会经常遇到奇怪结果：某个版本快得不合理，某个输入规模突然慢十倍，checksum 偶尔变化，样本出现 0 ns，某台机器上趋势完全相反。高质量 suite 要帮助你定位这些问题，而不是只输出一个表。
+
+定位异常时，不要先猜微架构。先按实验系统从外到内检查。
+
+\subsection{第一步：确认数据没有坏}
+
+先检查 raw samples 的结构。每个配置是否都有预期样本数？是否有空行、重复行、解析失败、单位错误？\code{elapsed_ns} 是否为 0？\code{batch} 是否为 0？\code{bytes} 是否和 \code{n} 匹配？如果数据表本身坏了，后面的性能解释都没有意义。
+
+常见错误包括：CSV 写入中途被打断，只保留了一部分样本；旧结果目录被新实验追加，导致两个协议混在一起；summary 脚本把不同 distribution 合并到同一组；batch 后的总时间被误当成单次调用时间；copy 的 bytes 口径从读字节变成读写合计但 schema 没更新。
+
+这类错误通常不需要 perf 或反汇编，只需要严格的数据审计。一个简单规则是：summary 中每一行都应该能回到 raw 中一组唯一样本。如果回不去，summary 就不可审计。
+
+\subsection{第二步：确认 correctness 没有漂移}
+
+checksum 或 correctness 失败时，不要继续看速度。先判断失败是稳定还是偶发。稳定失败通常说明 candidate 语义错、reference 错、输入边界没处理、浮点 tolerance 不合理，或者 batch 改变了状态。偶发失败更危险，可能说明未初始化内存、越界写、数据竞争、输出 buffer 没重置，或者 kernel 依赖未定义行为。
+
+例如 fill benchmark 若每轮不重置 destination，结果也许仍然正确，但测到的是“把已经填过的 buffer 再填一遍”；copy benchmark 若 source 和 destination 意外重叠，结果可能取决于复制方向；dot benchmark 若 reference 使用 \code{float} 累加，candidate 使用 FMA 和不同 reduction tree，误差可能随 \code{n} 增大而增长。每种情况都应该先归类为语义问题，而不是性能问题。
+
+\subsection{第三步：确认 timed region 真的干净}
+
+如果某个配置慢得离谱，检查 timed region 是否混入了分配、初始化、日志、CSV 写入、完整校验、异常处理或系统调用。最直接的方法是读代码和反汇编，也可以用临时日志记录阶段耗时：
+
+\begin{lstlisting}
+setup_ns
+warmup_ns
+measurement_ns
+validation_ns
+write_ns
+\end{lstlisting}
+
+这些阶段耗时不一定进入正式 CSV，但对调试很有用。如果 validation 比 measurement 慢一百倍，这是可以接受的，只要它不在 timed region 中；如果 write CSV 出现在每次 sample 内部，就要修。
+
+\subsection{第四步：确认机器码符合预期}
+
+速度异常常来自编译器改变了被测对象。快得不合理，可能是循环被删除、输入被常量折叠、结果未被观察、两个版本被优化成同一段代码。慢得不合理，可能是内联失败、函数指针导致间接调用、\code{volatile} 阻止向量化、调试构建未开优化、异常路径或边界检查进入热路径。
+
+反汇编审计要回答几个具体问题：目标循环是否存在？是否出现预期的 load/store？是否有意外调用？是否被自动向量化？candidate 和 baseline 机器码是否真的不同？如果报告说优化来自减少分支，但反汇编里两个版本分支结构相同，这个解释就站不住。
+
+\subsection{第五步：再考虑硬件和环境}
+
+只有在数据、正确性、计时区域和机器码都合理后，才进入硬件解释。此时再看 cache、TLB、分支、频率、NUMA、SMT、迁核、后台任务。这样顺序很重要，因为很多“硬件现象”其实是 harness bug。比如大输入慢可能是内存带宽，也可能是每轮重新分配触页；随机输入慢可能是分支预测，也可能是随机生成被放进 timed region。
+
+可以把异常定位写成一张 checklist：
+
+\begin{lstlisting}
+1. raw samples complete?
+2. checksum stable?
+3. timed region clean?
+4. objdump matches expectation?
+5. environment recorded?
+6. perf or system evidence supports hypothesis?
+\end{lstlisting}
+
+\begin{warningbox}
+不要从异常数字直接跳到微架构故事。先排除数据、语义、计时边界和编译器问题，再讨论硬件瓶颈。
+\end{warningbox}
+
+\section{Schema 版本和结果兼容性}
+
+一旦 benchmark suite 开始长期使用，CSV schema 就会演化。最开始可能只有 \code{kernel,n,elapsed_ns}，后来加入 \code{batch}、\code{distribution}、\code{alignment}、\code{variant}、\code{compiler}。如果不管理 schema，旧结果和新结果很容易被错误合并。
+
+建议每个结果目录都包含 metadata：
+
+\begin{lstlisting}
+schema_version=2
+suite_version=ch16-foundation
+time_unit=ns
+bytes_semantics=logical_bytes
+speedup_baseline=baseline_median_ns/candidate_median_ns
+\end{lstlisting}
+
+CSV 中也可以加入 \code{schema_version} 列，或者在同目录放 \filepath{metadata.txt}。关键是后续脚本读取旧数据时，能知道列的含义。
+
+schema 变化分两类。兼容变化是新增列，不改变旧列语义；旧脚本可以忽略新增列。破坏性变化是改列名、改单位、改 bytes 定义、改 batch 语义、改 speedup 方向。破坏性变化必须升级 schema version，并在报告里说明不能直接和旧结果比较。
+
+例如 \code{bytes} 曾经表示只读字节，后来改成读写合计。如果不升级 schema，copy kernel 的 GB/s 会突然翻倍，看起来像性能提升，实际只是指标定义改变。
+
+\begin{warningbox}
+指标定义改变不是性能提升。schema 版本的作用，就是防止数据接口变化伪装成优化成果。
+\end{warningbox}
 
 \section{环境记录：报告不是记忆}
 
@@ -498,6 +991,14 @@ struct SummaryRow {
 \end{itemize}
 
 这里先用 public data struct，因为它们只是数据载体。如果后续需要不变量检查、解析和格式化，可以再封装成类。
+
+\subsection{数据模型先于代码组织}
+
+写 benchmark suite 时，先设计数据模型比先写 runner 更重要。因为最终你要比较的是数据，而不是函数调用本身。哪些字段进入 \code{RawSample}，决定了后续能不能复查；哪些字段进入 \code{BenchmarkOptions}，决定了实验是否可配置；哪些字段进入 \code{SummaryRow}，决定了报告能不能表达趋势。
+
+例如如果 \code{RawSample} 忘记记录 distribution，后面发现随机输入和全零输入差异很大，就无法从旧数据中区分。若忘记记录 batch，就无法正确计算 ns/element。若忘记记录 kernel version，就无法比较手写汇编和 C++ baseline。数据模型缺字段，后续代码再漂亮也补不回历史信息。
+
+因此，benchmark suite 的核心类型应尽量稳定、朴素、可序列化。不要把大量行为塞进这些结构里；它们更像实验记录表的行。复杂逻辑放在 parser、runner、summarizer 和 writer 中。
 
 \section{命令行参数：可复现需要显式配置}
 
@@ -669,6 +1170,26 @@ float dot_f32_kernel(std::span<const float> a, std::span<const float> b)
 过度抽象会污染 benchmark。虚函数调用、\code{std::function} type erasure、动态分派、分配和锁都可能进入热路径。抽象应放在 timed region 外，或者确认编译器能完全内联。
 \end{warningbox}
 
+\subsection{统一输出，不强行统一调用}
+
+多 kernel suite 最需要统一的是输出数据，不一定是调用接口。不同 kernel 的参数和返回值天然不同：sum 返回标量，copy 写输出 buffer，fill 接收常量，dot 返回浮点值。若强行用 \code{std::function<void()>} 包装所有 kernel，可能把类型信息和内联机会都藏掉。
+
+更实用的做法是每类 kernel 有自己的 runner，但所有 runner 都产出同一种 \code{RawSample}。这样 timed region 可以保持直接、简单、可审计，而 suite 的上层仍然能统一写 CSV 和 summary。
+
+这也是系统设计中的常见取舍：不要为了表面统一牺牲关键路径透明度。benchmark 的关键路径尤其敏感，抽象层应停在 timed region 外。
+
+\subsection{dispatch overhead 要单独命名}
+
+如果生产系统确实通过函数指针、虚函数、dispatcher 或 plugin 调用 kernel，那么 dispatch overhead 是真实成本，可以测。但这时 benchmark 名称应明确：
+
+\begin{lstlisting}
+dot_f32_direct
+dot_f32_dispatch
+dot_f32_end_to_end
+\end{lstlisting}
+
+direct 测 kernel 上限；dispatch 测选择后调用成本；end-to-end 测完整 operator 路径。三者都合理，但不能混成一个数字。AI 算子库尤其需要这种区分：microkernel 很快，不代表完整 operator 快；完整 operator 慢，也不一定是 microkernel 慢。
+
 \section{校验策略：不同 kernel 不同方法}
 
 正确性校验不一定每次都完整扫描，但必须有明确策略。
@@ -696,6 +1217,33 @@ for each repetition:
 \end{lstlisting}
 
 如果 reset 成本很大，不能混进 timed region；如果不 reset，又要确认 kernel 的性能不依赖原始内容。
+
+\subsection{校验频率也是设计选择}
+
+最保守的做法是每个 measured sample 后都完整校验。这最安全，但对大输出 buffer 可能很慢。如果校验不在 timed region，慢一些通常可以接受；但若实验矩阵很大，完整校验会让总运行时间变长。
+
+可以采用分层策略：
+
+\begin{itemize}
+  \item debug 模式：每次 sample 后完整校验。
+  \item release benchmark：每个 size 的 warmup 前后完整校验，measured sample 做轻量 checksum。
+  \item nightly 验证：随机输入和边界输入做完整 correctness sweep。
+\end{itemize}
+
+无论选择哪种策略，都要写进报告。不能因为校验贵就完全不校验，也不能把轻量 checksum 当作完整正确性证明。尤其是 copy/fill 这类输出 buffer kernel，少量 sentinel 正确不代表全数组正确。
+
+\subsection{浮点校验要记录误差模型}
+
+浮点 kernel 的 reference 可能使用不同求和顺序，优化版本可能使用 FMA、向量化、展开或 fast-math。结果有误差是正常的，但误差必须有边界。报告应记录：
+
+\begin{itemize}
+  \item reference 使用什么顺序和精度。
+  \item absolute tolerance 和 relative tolerance。
+  \item 是否允许 NaN/Inf。
+  \item 是否启用 fast-math 或 flush-to-zero。
+\end{itemize}
+
+如果误差超出预期，不能继续只讨论性能。性能优化改变数值语义时，必须把它作为算法取舍，而不是实现细节。
 
 \section{样本汇总：从 raw 到 summary}
 
@@ -813,6 +1361,77 @@ bytes_read = 2 * n * sizeof(float)
 
 如果使用 FMA，仍通常按 2 FLOPs 计。
 
+\section{派生指标的口径陷阱}
+
+派生指标很有用，但也最容易误导。GB/s、GFLOP/s、ns/op、speedup 都不是计时器直接测出来的事实，而是根据 elapsed time 和模型计算出来的指标。模型变了，指标就变。
+
+\subsection{GB/s 的 bytes 要说明口径}
+
+对 sum，通常 bytes 是读取的元素总字节数。对 copy，bytes 可以只算读，也可以算读加写。对 fill，bytes 可以只算写，也可以讨论 write allocate 造成的额外硬件流量。不同口径会得到不同 GB/s。
+
+例如 \code{copy_u64} 拷贝 \code{n} 个 8 字节元素：
+
+\begin{lstlisting}
+read_bytes = n * 8
+write_bytes = n * 8
+logical_bytes = read_bytes + write_bytes
+\end{lstlisting}
+
+如果按 \code{read_bytes} 算，GB/s 是一种值；按 \code{logical_bytes} 算，数值翻倍。两种都可以，但必须说明。若要和 \code{memcpy} 或内存带宽工具比较，也要看对方使用什么口径。
+
+更复杂的是硬件实际流量。普通写入一个未在 cache 中的 line，可能先读入 cache line 再写，这叫 write allocate。此时硬件总流量可能大于 logical bytes。第一册不深入建模，但报告至少要知道：logical GB/s 是算法口径，不一定等于内存总线真实流量。
+
+\subsection{GFLOP/s 依赖 FLOP 计数约定}
+
+dot product 通常每个元素算一次乘法和一次加法，所以记 2 FLOPs。若编译器使用 FMA，一条 FMA 指令也通常按 2 FLOPs 计。这是性能报告的常见约定。
+
+但不是所有浮点表达式都这么简单。比如带条件的计算、近似函数、特殊值处理、向量化尾部、fast-math 改写都会让 FLOP 计数变得模糊。报告 GFLOP/s 时必须写出公式。若公式只是估算，就写成 estimated FLOPs。
+
+不要用 GFLOP/s 掩盖数值语义变化。一个版本启用 fast-math 后 GFLOP/s 更高，但它可能改变 NaN、Inf、signed zero、舍入顺序或异常行为。此时性能提升和语义放宽是同一件事的两个方面，必须一起报告。
+
+\subsection{Speedup 要说明方向和基准}
+
+speedup 的方向必须明确：
+
+\begin{lstlisting}
+time_speedup = baseline_time / candidate_time
+throughput_ratio = candidate_throughput / baseline_throughput
+\end{lstlisting}
+
+如果 time speedup 大于 1，候选版本更快；如果 throughput ratio 大于 1，候选版本吞吐更高。两者都能表达性能提升，但不要混用。
+
+还要说明 baseline 是谁。比如：
+
+\begin{lstlisting}
+baseline = scalar C++ O3
+candidate = manually unrolled C++ O3
+\end{lstlisting}
+
+或：
+
+\begin{lstlisting}
+baseline = previous commit 5364eb0
+candidate = current working tree
+\end{lstlisting}
+
+没有 baseline 名称的 speedup 没有完整语义。
+
+\subsection{小时间差不要过度解释}
+
+如果 baseline median 是 100 ns，candidate median 是 97 ns，看起来有 3\% 提升。但如果样本噪声、计时器开销、频率波动或重复运行差异也在几个百分点范围内，这个提升可能不稳定。短 kernel 尤其如此。
+
+报告小幅提升时要看：
+
+\begin{itemize}
+  \item raw samples 是否分布分离。
+  \item 多次独立运行是否复现。
+  \item p95 和 max 是否也改善。
+  \item 反汇编是否支持机制解释。
+  \item PMU 或其他工具是否支持瓶颈变化。
+\end{itemize}
+
+本书不要求第一册引入复杂统计检验，但要求你不把微小差异夸大成确定结论。可以写“观察到约 3\% 趋势，仍需重复实验确认”，这比硬写“优化成功”更可靠。
+
 \section{输出 CSV 的代码结构}
 
 不要在测量循环里频繁 flush。先收集样本，最后写文件。
@@ -850,7 +1469,7 @@ void write_raw_samples_csv(const std::string& path,
 }
 \end{lstlisting}
 
-这段代码使用 C stdio 是为了简单直接。生产代码可以用 RAII 封装文件句柄，或者使用 \code{std::ofstream}。关键不是 API 选择，而是：文件写入不在 timed region 里。
+这段代码使用 C stdio 是为了简单直接。生产代码可以用 RAII 封装文件句柄，也可以使用 C++ 文件流。关键不是 API 选择，而是：文件写入不在 timed region 里。
 
 \section{Runner：把一次实验组织起来}
 
@@ -1177,12 +1796,1146 @@ Limit:
     CPU frequency was not pinned; result needs repeat under performance governor.
 \end{lstlisting}
 
+\subsection{图表要回答问题}
+
+图表不是装饰。每张图都应回答一个问题。若问题是“吞吐如何随规模变化”，横轴用 \code{n} 或 bytes，纵轴用 GB/s；若问题是“短 kernel 固定开销多大”，纵轴用 ns/op 或 ns/element；若问题是“样本是否稳定”，使用散点图或箱线图比单条折线更合适；若问题是“两个版本差异是否稳定”，可以画 ratio：
+
+\begin{lstlisting}
+speedup = baseline_median_ns / optimized_median_ns
+\end{lstlisting}
+
+但 ratio 也要小心。小规模下 baseline 很短，计时噪声可能让 ratio 看起来很夸张；大规模下两个版本都受内存带宽限制，ratio 可能接近 1，但这不代表优化无价值，可能说明瓶颈已经转移。
+
+\subsection{异常点要解释}
+
+如果某个 size 的性能突然下降，不要直接删掉。先问：
+
+\begin{itemize}
+  \item 是否跨过某级 cache 或 TLB 覆盖范围。
+  \item batch 是否在该 size 改变。
+  \item 是否触发了不同代码路径或尾部处理。
+  \item 输入分布是否不同。
+  \item 是否发生系统干扰或频率变化。
+  \item 反汇编是否显示编译器生成了不同版本。
+\end{itemize}
+
+异常点往往是最有价值的信息。它可能暴露 bug、边界条件、cache 层级、分支预测变化或 harness 问题。高质量报告应标出异常点，并说明已验证和未验证的解释。
+
+\subsection{报告要连接三类证据}
+
+最终文字应连接三类证据：数据证据、二进制证据和硬件证据。数据证据来自 raw/summary；二进制证据来自 \code{objdump} 或编译器输出；硬件证据来自 \code{perf stat}、系统环境和硬件规格。三者一致时，结论最稳。
+
+例如：
+
+\begin{lstlisting}
+Data:
+    optimized version is faster for 16 KiB..256 KiB, but equal at 64 MiB.
+
+Binary:
+    optimized version uses AVX2 loads and vector reduction.
+
+Hardware:
+    large-size GB/s is close to measured memory copy bandwidth.
+
+Interpretation:
+    vectorization helps while data is cache-resident; large size becomes memory-bound.
+\end{lstlisting}
+
+这种写法比“AVX2 更快”更准确，因为它说明了在哪些规模更快，为什么大规模不继续提升。
+
+\begin{keyidea}
+benchmark 报告的主线应是“问题、方法、数据、证据、解释、限制”。图表和表格服务这条主线，不是越多越好。
+\end{keyidea}
+
+\section{正式报告模板：让别人能复核你的结论}
+
+很多 benchmark 失败不是因为计时代码完全错误，而是报告无法复核。读者看到一张表，却不知道输入是什么、版本是什么、编译参数是什么、计时区域在哪里、结果是否正确、异常点如何处理。这样的报告即使数字真实，也很难成为工程证据。
+
+一份正式 benchmark 报告至少应包含下面九部分。
+
+\subsection{一、问题和结论先行}
+
+报告开头先写清楚问题，而不是先堆数据。问题应该具体到版本、workload 和指标。例如：
+
+\begin{lstlisting}
+Question:
+    Does the unrolled sum_u64 implementation improve warm-cache throughput
+    over the scalar baseline on this machine?
+
+Primary metric:
+    median ns/element and logical GB/s
+
+Scope:
+    single-threaded, Linux x86-64, clang++ -O3 -march=native
+\end{lstlisting}
+
+然后给出一句有边界的结论：
+
+\begin{lstlisting}
+Conclusion:
+    For 16 KiB to 256 KiB inputs, the unrolled version improves median
+    throughput by 8% to 12%. For 64 MiB inputs, both versions are close,
+    suggesting memory bandwidth dominates. The result is not a claim about
+    cold-cache latency or multi-threaded throughput.
+\end{lstlisting}
+
+这种写法让读者一开始就知道报告回答什么、不回答什么。不要把结论写成“优化版更快”这种无边界句子。
+
+\subsection{二、被测对象}
+
+列出被测 kernel、版本、源码路径和构建方式。若比较多个版本，必须说明 baseline 和 candidate。
+
+\begin{lstlisting}
+Kernel:
+    sum_u64(std::span<const std::uint64_t>)
+
+Baseline:
+    scalar_cpp, source: kernels/sum.cpp
+
+Candidate:
+    unrolled4_cpp, source: kernels/sum_unrolled.cpp
+
+Correctness reference:
+    sum_u64_ref, simple loop with unsigned wraparound semantics
+\end{lstlisting}
+
+如果 baseline 是旧 commit 或生产版本，要写 commit；如果 candidate 来自 dirty worktree，也要写。dirty 不代表不能测，但要诚实记录，否则别人无法复现。
+
+\subsection{三、实验环境}
+
+环境不是附录里的装饰，而是解释数据的前提。至少写：
+
+\begin{itemize}
+  \item CPU 型号、核心数、SMT 状态。
+  \item cache 信息。
+  \item 内存容量。
+  \item 操作系统和 kernel 版本。
+  \item 编译器版本和编译参数。
+  \item CPU governor、是否固定核心、是否在容器中。
+  \item PMU 权限是否可用。
+\end{itemize}
+
+报告中可以只摘要关键字段，完整输出放进 \filepath{environment.txt}。摘要的作用是让读者快速判断这份报告与自己的机器是否可比；完整文件的作用是后续复查。
+
+\subsection{四、workload 矩阵}
+
+workload 矩阵要列出所有自变量：
+
+\begin{lstlisting}
+sizes:
+    1 KiB, 16 KiB, 256 KiB, 4 MiB, 64 MiB
+
+distribution:
+    deterministic LCG, seed = 1
+
+alignment:
+    std::vector allocation, observed pointer alignment recorded separately
+
+cache mode:
+    warm-cache repeated measurement
+
+batch:
+    auto, target sample time = 100 us
+\end{lstlisting}
+
+这部分最容易漏掉 cache mode 和 batch。一个 warm-cache batch benchmark 不能自动代表 cold-cache 首次访问；一个 auto batch benchmark 不能和 batch 1 的端到端延迟直接比较。
+
+\subsection{五、计时协议}
+
+计时协议说明哪些工作在 timed region 内，哪些不在。
+
+\begin{lstlisting}
+Outside timed region:
+    allocate vectors
+    generate input
+    compute reference
+    warmup
+    validate output
+    write CSV
+
+Inside timed region:
+    repeat selected kernel batch times
+    combine scalar result
+\end{lstlisting}
+
+如果 kernel 本身包含分配或 I/O，也要明确写入 timed region。关键不是一定排除所有开销，而是计时边界必须匹配问题陈述。
+
+\subsection{六、正确性和防优化策略}
+
+正式报告必须说明结果如何被观察，防止优化器删除。对返回标量的 kernel，可以记录 checksum；对输出 buffer 的 kernel，要说明输出如何校验。
+
+\begin{lstlisting}
+Correctness:
+    Each size is checked against reference before measured repetitions.
+    For measured repetitions, checksum is stable across samples.
+
+Optimization barrier:
+    Scalar results are passed to do_not_optimize().
+    Output buffers are sampled after the timed region and fully checked
+    outside the timed region.
+\end{lstlisting}
+
+如果没有 correctness，只能叫计时实验，不能叫性能结论。尤其是快得离谱的结果，第一怀疑对象就是代码被删、结果没被用、输入常量化或校验缺失。
+
+\subsection{七、原始数据和汇总}
+
+报告正文可以放 summary 表，但必须给出 raw data 路径。summary 中最好包含 min、median、p95、max，而不是只放一个平均值。
+
+\begin{lstlisting}
+Artifacts:
+    raw samples: results/ch16/raw_samples.csv
+    summary: results/ch16/summary.csv
+    objdump: results/ch16/objdump.txt
+    perf: results/ch16/perf_stat.txt
+\end{lstlisting}
+
+若有异常点，不要只在 summary 中隐藏。要写明 raw 中保留了异常点，summary 使用哪个统计量，以及异常点是否改变结论。
+
+\subsection{八、二进制和硬件证据}
+
+至少给出一段二进制证据。比如：
+
+\begin{lstlisting}
+Binary audit:
+    baseline loop uses one load and one add per element.
+    candidate loop processes four elements per iteration.
+    no unexpected calls are present in the hot loop.
+\end{lstlisting}
+
+若使用 \code{perf stat}，报告应说明事件与假设的关系，而不是简单贴输出。例如 branch benchmark 应关心 \code{branches} 和 \code{branch-misses}；内存扫描应关心 cache misses、cycles、instructions 和带宽口径；短 kernel 应先判断计时器和 batch 是否主导。
+
+\subsection{九、限制和下一步}
+
+限制不是削弱报告，而是提高可信度。一个专业结论总有边界：
+
+\begin{itemize}
+  \item 只测单线程，不代表多线程。
+  \item 只测 warm cache，不代表首次访问。
+  \item 只测一台机器，不代表所有 x86-64。
+  \item 只测一种编译器，不代表其他优化器。
+  \item PMU 权限不足，硬件事件证据缺失。
+  \item CPU 频率未固定，小幅差异需要复测。
+\end{itemize}
+
+下一步应来自限制，而不是随便列愿望。例如“需要在 performance governor 下复测”“需要加入 cold-cache 模式”“需要用 \code{perf stat -e branches,branch-misses} 验证分支解释”。这样后续工作才有方向。
+
+\begin{keyidea}
+正式 benchmark 报告不是把表格贴出来，而是把问题、协议、证据和限制组织成别人能复核的论证。
+\end{keyidea}
+
+\section{结论分级：哪些话可以说，哪些话不能说}
+
+性能报告最容易过度表达。看到一个候选版本在一次运行中快了，就写“优化成功”；看到 \code{perf} 里 cache miss 变多，就写“瓶颈是 cache”；看到 AVX2 指令，就写“SIMD 带来提升”。这些说法可能对，也可能证据不够。为了避免过度结论，本书建议把性能结论分成四级。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.35\linewidth}p{0.31\linewidth}}
+\toprule
+等级 & 可以说什么 & 还不能说什么 \\
+\midrule
+观察 & 某次样本或 summary 显示了某个数字。 & 不能说差异来自算法。 \\
+趋势 & 多次样本或多个规模显示一致方向。 & 不能说已排除所有混杂因素。 \\
+解释 & 数据、汇编和环境证据支持某个机制。 & 不能把机制推广到所有机器。 \\
+结论 & 在明确协议下，某版本优于或不优于 baseline。 & 不能超出协议边界宣传。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如：
+
+\begin{lstlisting}
+Observation:
+    Candidate median is 9% lower at n = 32768.
+
+Trend:
+    Candidate is 8% to 12% lower for 16 KiB, 64 KiB and 256 KiB.
+
+Explanation:
+    Objdump shows loop unrolling reduced branch overhead, and instruction
+    count decreases in perf stat. Cache misses are similar.
+
+Conclusion:
+    Under warm-cache single-threaded measurement on this machine, unrolling
+    improves mid-size sum_u64 throughput. It does not improve 64 MiB inputs,
+    where both versions appear memory-bound.
+\end{lstlisting}
+
+这四级能帮你控制语气。很多时候，实验只支持“观察到趋势”，还不支持“机制已证明”。这不是失败，而是诚实。
+
+\subsection{不要把缺失证据补成故事}
+
+人很擅长给数字编故事。一个版本快了，就说“cache locality 更好”；一个版本慢了，就说“分支预测失败”；一个点跳变，就说“跨过 L3”。这些都可能是真的，但必须有证据。没有证据时，应写成假设：
+
+\begin{lstlisting}
+Hypothesis:
+    The drop at 64 MiB may be caused by memory bandwidth or TLB pressure.
+
+Evidence available:
+    Working set exceeds LLC according to lscpu.
+
+Evidence missing:
+    No perf stat cache/TLB event was collected yet.
+\end{lstlisting}
+
+把证据缺口写出来，读者就知道如何继续验证。把假设写成结论，只会让报告变得脆弱。
+
+\section{常见反模式：看起来专业但不能信}
+
+\subsection{反模式一：只报告最快一次}
+
+有些报告只写“best of N”。最小值确实有用途，它常被用来近似低干扰状态，但不能单独代表整体。若只报告最快一次，读者不知道样本是否稳定、是否有长尾、是否偶然碰到理想调度。更好的做法是同时报告 min、median、p95、max，并说明最终结论主要依据哪个统计量。
+
+\subsection{反模式二：把 setup 放进 timed region 后又解释 kernel}
+
+如果计时区域包含分配、随机数生成、初始化和打印，报告就不能只解释 kernel。也许优化版 kernel 快了，但 setup 主导总时间；也许 kernel 没变，随机数生成器变了。计时区域包含什么，结论就只能关于什么。
+
+\subsection{反模式三：没有 reference 却比较速度}
+
+没有 reference 或 correctness check，快慢没有意义。尤其是浮点、边界条件、尾部处理、手写汇编和 SIMD kernel，错误实现常常比正确实现更快。报告中看到巨大 speedup，第一步不是赞叹，而是找 correctness 证据。
+
+\subsection{反模式四：比较不同编译参数}
+
+baseline 用 \code{-O2}，candidate 用 \code{-O3 -march=native}，然后说 candidate 更快，这是混淆变量。除非你的问题就是“不同构建配置的端到端影响”，否则比较实现时应保持编译参数一致。若必须改变编译参数，要把它作为自变量写进矩阵。
+
+\subsection{反模式五：只测一个输入规模}
+
+单点结果非常危险。小规模可能被固定开销主导，中规模可能被 cache 主导，大规模可能被内存带宽主导，尾部规模可能被边界处理主导。一个优化可能只在其中一个区域有意义。只测一个点，很容易把局部事实当成全局规律。
+
+\subsection{反模式六：把微基准当端到端结论}
+
+微基准能证明某个小 kernel 在受控条件下的行为，但不能直接代表完整应用。真实系统可能有 dispatch、内存分配、数据转换、线程调度、I/O、锁和其他算子。报告可以写“microkernel 更快”，不能直接写“应用会更快”，除非端到端也验证。
+
+\subsection{反模式七：图表没有单位和口径}
+
+GB/s 的 bytes 是读字节、写字节还是读写合计？GFLOP/s 的 FLOP 公式是什么？ns/op 中的 op 是一次函数调用、一次元素处理还是一次 batch？没有单位和口径，图表就只剩形状，不能复核。
+
+\subsection{反模式八：只贴 \code{perf} 输出不解释}
+
+\code{perf stat} 输出不是自动结论。不同事件可能受权限、复用、平台支持和采样误差影响。报告要说明选择哪些事件、它们对应哪个假设、结果是否支持假设。如果只是贴一大段输出，读者仍然不知道该看哪里。
+
+\subsection{反模式九：把 schema 变化当性能变化}
+
+如果某天把 copy 的 bytes 口径从只读改成读写合计，GB/s 会看起来翻倍。若不记录 schema 版本，这种指标变化很容易被误解为优化成功。任何派生指标的公式变化，都必须视为实验协议变化。
+
+\subsection{反模式十：过度清洗数据}
+
+异常值可以分析，可以标注，可以在 summary 中使用稳健统计量降低影响，但不能偷偷删除。若删除样本，必须记录规则和原因。否则报告无法复核，也可能把真实长尾问题清理掉。
+
+\begin{warningbox}
+专业 benchmark 的危险不在于数字不够漂亮，而在于漂亮数字没有证据。反模式的共同点是：隐藏变量、隐藏协议、隐藏原始数据或隐藏失败。
+\end{warningbox}
+
+\section{案例：一次快得不合理的优化}
+
+假设你把 \code{sum_u64} 改成一个新版本，summary 显示 candidate 比 baseline 快 100 倍。不要立刻宣布优化成功。按本章 checklist 排查。
+
+\subsection{第一种可能：循环被删除}
+
+如果 candidate 的结果没有被使用，编译器可能删除整个循环。现象是 elapsed time 极小，反汇编里找不到目标 loop，checksum 可能恒定或缺失。处理方法是确保结果进入 \code{do_not_optimize()}，并且报告中保存 objdump 证据。
+
+\subsection{第二种可能：输入被常量折叠}
+
+如果输入是编译期常量，编译器可能提前计算结果。现象是机器码中没有实际 load，或者只返回常数。处理方法是在运行时生成输入，把生成放在 setup 中，并保证编译器不能把全部输入推导为常量。
+
+\subsection{第三种可能：计时区域测错了}
+
+可能 begin 和 end 放错位置，测到了空区域；也可能 batch 为 0；也可能 elapsed ns 发生整数截断或单位转换错误。处理方法是检查 raw samples 中的 batch、elapsed、n 和 bytes，加入基本 sanity check：
+
+\begin{lstlisting}
+assert(batch_count > 0)
+assert(elements > 0)
+assert(elapsed_ns > 0)
+\end{lstlisting}
+
+\subsection{第四种可能：baseline 被不公平削弱}
+
+baseline 也许使用调试构建、禁用优化、额外校验在 timed region 内、或使用不同输入。处理方法是比较编译命令、计时协议和反汇编。speedup 来自 candidate 变好和 baseline 变坏是两件不同的事。
+
+\subsection{第五种可能：真实优化但边界很窄}
+
+也可能 candidate 真的在某个小规模下快很多，例如把函数调用和循环开销消除了。但这仍然需要说明边界。它是否在大规模仍快？是否结果正确？是否适用于真实 workload？是否只是 warm-cache batch 场景？结论必须跟证据范围一致。
+
+这个案例说明，异常好看的数字和异常糟糕的数字一样，都需要排查。高质量性能工程不是拒绝惊喜，而是要求惊喜通过证据审计。
+
+\section{把 benchmark 当成工程资产}
+
+本章的设计比临时代码计时更复杂。原因是 benchmark 一旦进入项目，就不再只是一次实验，而是工程资产。它会被用来比较版本、发现回归、指导优化、说服 reviewer、写文档、做发布决策。工程资产必须可维护。
+
+可维护 benchmark 有几个特征。
+
+第一，新增 kernel 成本低。已有 options、CSV、summary、environment 和 report 机制可以复用，新增 kernel 只需要定义 workload、runner、checker 和指标公式。
+
+第二，旧结果可读。几个月前的结果目录仍然能说明当时的命令、环境、schema、源码和统计口径。
+
+第三，失败容易定位。checksum 失败、样本缺失、schema 不匹配、二进制异常、环境缺失都能被明确报告，而不是变成一个神秘数字。
+
+第四，结论可降级。证据不足时，可以从“结论”降级为“趋势”或“观察”，而不是强行维持过度说法。
+
+第五，能服务教学和生产。教学中它帮助学生理解变量；生产中它帮助工程师避免性能回归。二者都依赖同一个基础：协议清楚、数据可复核。
+
+\begin{keyidea}
+benchmark suite 的最高价值不是某一次跑出的数字，而是长期积累的可复核性能证据。它应该像测试、文档和构建脚本一样被维护。
+\end{keyidea}
+
+\section{性能回归与 CI：不要把噪声当闸门}
+
+benchmark suite 很自然会进入 CI：每次改代码都跑一次，看看性能是否退化。这个方向是对的，但直接把“慢 1\% 就失败”写成硬规则，通常会制造大量误报。CI 环境常常共享机器、频率不可控、后台负载不可控、PMU 权限受限，性能波动可能比真实改动还大。
+
+更实际的策略是分层。第一层是 correctness 和构建检查，必须稳定通过。第二层是 smoke benchmark，只跑少量规模，用来发现数量级退化，例如慢 2 倍、结果被优化器删除、CSV 写坏。第三层是受控机器上的 nightly 或手工 benchmark，用更多重复、更多输入规模和环境记录判断小幅回归。第四层才是发布前的完整性能报告。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+层级 & 目标 & 适合阈值 \\
+\midrule
+PR smoke & 发现严重退化和实验系统损坏。 & 宽阈值，例如 20\% 到 50\%。 \\
+nightly & 跟踪趋势和中等退化。 & 中等阈值，结合多日趋势。 \\
+受控机器 & 判断小幅性能变化。 & 窄阈值，但需重复和审计。 \\
+发布报告 & 给出工程结论。 & 不只看阈值，还要解释机制。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{回归阈值要按 kernel 和规模设置}
+
+所有 kernel 用同一个阈值通常不合理。短 kernel 噪声大，1 ns 的绝对波动就可能是几个百分点；长时间 streaming kernel 更稳定，但受内存和频率影响；分支敏感 kernel 受输入分布影响；浮点 kernel 还要同时看误差变化。
+
+阈值应至少考虑三件事。第一，历史波动范围：过去一段时间同一配置自然波动多大。第二，工程重要性：这个 kernel 是否在真实场景中频繁调用。第三，证据成本：若阈值很窄，就必须使用更受控环境和更多重复。
+
+例如可以先使用宽松规则：
+
+\begin{lstlisting}
+if median regression > 20%:
+    fail smoke benchmark
+elif median regression > 5%:
+    mark as warning and require review
+else:
+    record trend only
+\end{lstlisting}
+
+这不是最终统计方法，但比小幅波动直接失败更实用。真正要判断 2\% 回归，应在稳定机器上复测，并查看 raw samples、反汇编和环境。
+
+\subsection{CI 报告要保留 artifact}
+
+CI benchmark 若只在日志里打印 summary，很快就无法排查。至少应上传：
+
+\begin{itemize}
+  \item raw samples。
+  \item summary。
+  \item command。
+  \item environment。
+  \item binary 或 build id。
+  \item objdump 关键片段。
+\end{itemize}
+
+当某次 CI 显示退化时，reviewer 需要判断它是真退化、环境噪声、schema 变化、baseline 变化，还是 harness bug。没有 artifact，就只能重新跑；重新跑又可能不复现。
+
+\subsection{性能趋势比单点更有价值}
+
+长期看，一次 benchmark 失败不如趋势重要。如果某个 kernel 连续多天缓慢变慢，单次都没超过阈值，最终仍可能形成明显退化。反过来，某次 CI 变慢 10\%，下一次恢复，可能只是机器噪声。保存历史 summary 可以让你画出趋势，并把性能变化和 commit、编译器升级、硬件迁移联系起来。
+
+趋势分析仍要警惕协议变化。若某天修改了 bytes 口径、batch 策略、输入分布或 baseline，趋势图必须标注 schema 或 protocol change。否则趋势断点会被误解成性能变化。
+
+\begin{keyidea}
+CI 中的 benchmark 首先是报警系统，不是最终裁判。小幅性能结论需要受控复测；CI 更适合发现大退化、趋势变化和实验系统损坏。
+\end{keyidea}
+
+\section{benchmark suite 的架构原则}
+
+一个可维护的 benchmark suite 不应该是一个越写越长的 \code{main.cpp}。它应当有清楚的职责分层：命令行解析负责把实验配置显式化，workload factory 负责生成输入，kernel registry 负责列出可测实现，runner 负责组织重复和计时，checker 负责正确性，recorder 负责写 raw 数据，summarizer 负责汇总，report 层负责解释。每层只做自己的事，实验系统才可审计。
+
+可以用下面结构理解：
+
+\begin{lstlisting}
+config
+    sizes, repetitions, warmup, seed, kernels, output dir
+
+workload factory
+    create input and reference objects
+
+kernel registry
+    name -> function pointer or callable
+
+runner
+    for each workload, kernel, repetition:
+        run warmup if needed
+        time batch
+        collect checksum
+
+checker
+    compare candidate output with reference
+
+recorder
+    append raw sample CSV
+
+summarizer
+    compute min, median, p95, max, derived metrics
+
+report
+    connect summary, objdump, environment, limitations
+\end{lstlisting}
+
+这种架构看起来比临时脚本复杂，但它能解决三个长期问题。第一，新增 kernel 不需要复制整套计时代码。第二，修改统计口径可以集中处理，不会每个实验一套公式。第三，失败时能定位是哪一层坏了：输入生成、正确性、计时、记录、汇总还是报告。
+
+\subsection{配置要显式，不要藏在代码常量里}
+
+实验配置应尽量来自命令行或配置文件，并写入结果目录。输入规模、重复次数、warmup、seed、batch、cache mode、kernel 列表、输出路径，都不应只藏在源码常量里。源码常量可以有默认值，但运行时实际使用的值必须记录。
+
+显式配置有两个好处。第一，可复现。别人可以用同一命令重新跑。第二，可比较。两个结果目录如果命令不同，就能立即看出差异来自哪里。若配置藏在代码里，比较两个日期的结果时还要查 commit，甚至查不出来当时改了什么。
+
+\subsection{kernel registry 要有稳定名称}
+
+每个被测实现都需要稳定名称，例如 \code{scalar_ref}、\code{scalar_opt}、\code{asm_scalar}、\code{avx2_unrolled4}。名称会进入 CSV、报告、历史趋势和 CI 阈值。不要使用容易变化的函数地址或临时描述。若实现语义变了，名称也应变，或通过 version 字段记录。
+
+registry 还应记录 kernel 属性：是否 reference、是否需要特定 ISA、是否允许某些输入、是否写输出 buffer、是否支持 alias、是否需要对齐。runner 可以根据属性过滤 workload，避免用不支持的输入测试某个 kernel，或至少把失败记录成明确的 unsupported，而不是崩溃。
+
+\section{数据模型要先于代码优化}
+
+benchmark suite 最核心的资产是数据。若数据模型设计不好，后面图表、CI、回归、报告都会混乱。一个 raw sample 表应尽量采用追加式、长表结构，而不是为每个 kernel 建一列。长表更适合新增 kernel、size 和指标。
+
+推荐 raw schema：
+
+\begin{lstlisting}
+schema_version,run_id,timestamp,kernel,workload,size,bytes,ops,
+batch,repetition,elapsed_ns,checksum,status,notes
+\end{lstlisting}
+
+推荐 summary schema：
+
+\begin{lstlisting}
+schema_version,run_id,kernel,workload,size,bytes,ops,
+samples,min_ns,median_ns,p95_ns,max_ns,
+ns_per_op,gbps,gops,checksum_status,notes
+\end{lstlisting}
+
+字段名要稳定，单位要写进字段名或 schema 文档。 \code{elapsed} 不如 \code{elapsed_ns}；\code{speed} 不如 \code{gbps} 或 \code{items_per_s}；\code{size} 要说明是元素数还是字节数。派生指标公式应写进文档。否则几个月后，没人知道 GB/s 是只算读，还是读写合计。
+
+\subsection{schema 变化要版本化}
+
+一旦 raw 或 summary 字段变化，就应增加 \code{schema_version}，并在报告中标注。比如把 \code{bytes} 从读字节改成读写总字节，会直接改变 GB/s。若不版本化，历史趋势会出现假提升。schema 版本化不是大型系统专属，小 benchmark 也需要。
+
+版本化还帮助脚本兼容旧结果。summarizer 可以拒绝未知 schema，或按版本选择解析逻辑。比起默默读错列，显式失败更好。性能数据一旦被错误解析，后续报告和决策都会被污染。
+
+\subsection{status 字段要表达失败，而不是丢弃失败}
+
+raw sample 中应有 \code{status}。可能值包括 \code{ok}、\code{checksum_failed}、\code{unsupported}、\code{timeout}、\code{setup_failed}、\code{measurement_failed}。不要把失败样本直接不写。失败频率本身就是重要信息。
+
+例如某个 SIMD kernel 只在非 32 倍长度时 checksum 失败，如果你只保存成功样本，summary 会看起来很漂亮；若保留失败 \code{status}，问题会立刻暴露。CI 也可以基于失败类型做不同处理：correctness 失败直接阻断，\code{unsupported} 可以跳过，\code{measurement_failed} 需要重跑或检查环境。失败类型要和处理策略绑定，不能只留下汇总数字。
+
+\section{正确性检查要避免污染计时}
+
+正确性检查必须存在，但不应混进热路径，除非实验问题就是端到端成本。常见做法是：每个 workload 先用 reference 计算期望结果；每个 candidate 在 warmup 或正式计时前后做校验；计时区域内只执行 kernel 和必要的防优化观察；输出 buffer 的完整比较放在计时外。
+
+对于纯函数式标量返回，可以在每个 batch 后把返回值合并到 checksum，并在计时后检查 checksum 是否与预期模式一致。对于写 buffer 的 kernel，可以在每个样本后抽样检查，或每个 size/repetition 后完整检查，取决于成本。若完整检查太贵，也不能完全取消；可以在 debug 或 nightly 模式全量检查，在 PR smoke 模式抽样检查。
+
+\subsection{reference 也要定义语义}
+
+reference 不是随便写一个“看起来对”的版本。它必须定义边界语义：整数是否允许回绕，浮点误差容忍多少，NaN 如何比较，输入重叠是否允许，输出初值是否参与计算。candidate 与 reference 不一致时，首先要判断 reference 是否真的表达了接口合同。
+
+例如整数点积若使用 64 位累加，reference 应明确每次乘法和累加的宽度。若候选汇编使用 32 位中间结果，会在大值输入下失败。浮点 dot product 则要定义误差模型：逐元素顺序求和、树形求和、FMA 与非 FMA 可能产生不同舍入。若接口允许这些差异，checker 应使用合理容差；若接口要求 bit-exact，就不能随便改求和顺序。
+
+\section{输入生成器要可解释}
+
+输入生成不是次要细节。数据分布会影响分支预测、cache 行为、压缩率、特殊值路径、向量化尾部和数值稳定性。一个好 workload factory 应把分布作为显式参数。
+
+常见分布包括：
+
+\begin{itemize}
+  \item 全零，用于测试最佳压缩或特殊值路径。
+  \item 递增，用于测试可预测模式和简单校验。
+  \item 均匀随机，用于减少特殊模式。
+  \item 固定稀疏度，用于测试分支和掩码。
+  \item 对抗分布，用于制造难预测分支或极端数值。
+  \item 真实样本，用于贴近生产 workload。
+\end{itemize}
+
+每种分布都要记录 seed 和生成算法。固定 seed 不是为了让数据“随机”，而是为了让别人复现同一数据。若生成算法变了，即使 seed 相同，输入也变了。报告中应把分布和生成版本当成 workload 的一部分。
+
+\subsection{真实数据也需要摘要}
+
+真实生产数据很有价值，但通常不能直接公开，也可能太大。使用真实数据时，至少记录摘要：样本来源、日期、大小、值域、稀疏度、长度分布、是否脱敏、是否抽样。否则别人无法判断它代表什么。若不能发布数据本身，可以发布生成相似分布的 synthetic workload，并说明与真实数据的差异。
+
+\section{派生指标要绑定 workload}
+
+同一个 elapsed time 可以派生出很多指标：ns/op、GB/s、items/s、GFLOP/s、cycles/element。指标不是越多越好。每个指标都要绑定 workload 的逻辑。
+
+对于 \code{sum_u64}，若每个元素读取 8 字节、不写输出数组，可以定义：
+
+\begin{lstlisting}
+bytes_read = n * 8
+GB/s = bytes_read / seconds / 1e9
+ns/element = elapsed_ns / n
+\end{lstlisting}
+
+对于 \code{copy_u64}，如果读一个数组写一个数组，可以选择读写合计：
+
+\begin{lstlisting}
+bytes_touched = n * 8 * 2
+GB/s = bytes_touched / seconds / 1e9
+\end{lstlisting}
+
+但必须写明这是读写合计。若另一个报告只算写字节，两个 GB/s 不能直接比较。对于 \code{fill_u64}，只有写字节；对于 \code{dot_f32}，既有 bytes，也有 FLOPs。不同指标回答不同问题：GB/s 说明内存吞吐，GFLOP/s 说明浮点运算吞吐，ns/element 更直观地比较端到端成本。
+
+\subsection{speedup 要说明方向}
+
+speedup 常见公式是：
+
+\begin{lstlisting}
+speedup = baseline_time / candidate_time
+\end{lstlisting}
+
+大于 1 表示 candidate 更快。但也有人用 \code{candidate / baseline} 表示 slowdown。报告必须写公式，不要只写“speedup 1.2”。若使用百分比改善，也要说明：
+
+\begin{lstlisting}
+improvement = (baseline_time - candidate_time) / baseline_time
+\end{lstlisting}
+
+时间降低 20\% 和吞吐提高 25\% 是同一变化的两种表达，不能混用。性能报告里很多沟通错误来自百分比方向不清。
+
+\section{回归判断要结合统计和工程意义}
+
+一个版本慢了 1\%，统计上可能可测，但工程上不重要；一个版本慢了 15\%，样本波动也许很大，但仍值得调查。回归判断需要同时看统计稳定性和工程意义。
+
+可以先用简单规则：
+
+\begin{itemize}
+  \item 若 correctness 失败，性能结论作废。
+  \item 若样本数不足，标记为观察，不做回归判断。
+  \item 若 median 变化小于历史自然波动，记录趋势，不阻断。
+  \item 若 median 变化超过宽阈值，触发警报。
+  \item 若多个相邻规模同向退化，优先级高于单个点。
+  \item 若关键生产规模退化，优先级高于教学规模退化。
+\end{itemize}
+
+后续可以引入更正式的统计检验或置信区间，但不要一开始就用复杂统计掩盖实验设计问题。统计检验无法修复错误计时区域、错误编译参数或错误 correctness。
+
+\subsection{历史基线要冻结}
+
+比较性能时，baseline 必须可追溯。可以使用上一版本 release、某个 commit、某个固定二进制，或当前源码中的 reference kernel。无论哪种，都要记录。如果 baseline 随着 candidate 一起变化，speedup 就失去意义。若 baseline 修 bug 或改协议，应在趋势图中标注，不要让历史比较混在一起。
+
+\section{报告生成可以自动化，解释不能自动化}
+
+benchmark suite 可以自动生成 summary、图表、环境摘要和初步警报。但最终解释仍需要工程判断。自动工具可以告诉你 \code{avx2_unrolled4} 在 \code{n=32768} 上 median 下降 10\%，反汇编包含 \instruction{vpaddq}，\code{perf} instructions 下降；但它不能独立证明这个优化适合生产，也不能知道某个输入分布是否代表真实用户。
+
+因此，自动报告应输出“事实块”，人工报告负责“解释块”。事实块包括命令、环境、raw、summary、二进制审计、PMU。解释块包括问题、结论、机制假设、限制和下一步。把两者分开，可以避免工具生成听起来确定但证据不足的文字。
+
+\subsection{报告中的否定结果也要保留}
+
+优化没有变快，也是一种结果。如果报告只保存成功优化，团队会重复尝试已经证明无效的方向。否定结果应写清：在哪些规模没有提升，二进制是否符合预期，可能瓶颈是什么，下一步是否停止或换方向。
+
+例如：
+
+\begin{lstlisting}
+Observation:
+    Unrolling by 4 does not improve 64 MiB sum_u64 throughput.
+
+Evidence:
+    Both versions reach similar GB/s.
+    Objdump confirms unrolling is present.
+    Large-size throughput is close to copy bandwidth measured separately.
+
+Conclusion:
+    For this workload size, loop overhead is unlikely to be the bottleneck.
+    Further work should investigate memory bandwidth or data layout, not
+    additional scalar unrolling.
+\end{lstlisting}
+
+这种否定结果能节省后续时间。高质量 benchmark suite 不只是证明哪些优化有效，也帮助停止无效方向。
+
+\section{从教学实验过渡到生产测量}
+
+本书第一册的 benchmark 目标是教学和基础可信性，不要求一开始就达到大型性能实验平台的复杂度。但教学实验应保留通向生产的接口：显式配置、raw 数据、summary、环境记录、二进制审计、正确性检查。这样学生后来面对真实项目时，不需要推翻方法，只需要扩大规模。
+
+教学阶段可以简化：
+
+\begin{itemize}
+  \item 只支持单线程。
+  \item 只使用少量 kernel。
+  \item 只记录基础环境。
+  \item 只使用 median、min、max。
+  \item PMU 作为可选证据。
+\end{itemize}
+
+生产阶段再增加：
+
+\begin{itemize}
+  \item 多线程和 NUMA 绑定。
+  \item 更多输入分布和真实数据。
+  \item 历史趋势数据库。
+  \item 自动图表和警报。
+  \item 受控性能机器。
+  \item 更严格统计和发布流程。
+\end{itemize}
+
+关键是两阶段理念一致：先定义问题，再设计 workload，先保证正确，再计时，先保存 raw，再做 summary，先审计二进制，再解释机制。规模可以变，原则不能变。
+
+\section{从零实现一个小型 suite 的步骤}
+
+如果你要从空目录开始实现本章的 benchmark suite，可以按七步推进。
+
+第一步，只实现一个 reference kernel 和一个 candidate kernel。不要一开始就写复杂 registry。先让 \code{sum_u64_ref} 和 \code{sum_u64_candidate} 在同一输入上返回相同结果，并把结果打印出来。正确性先于性能。
+
+第二步，加入命令行配置。至少支持 \code{--size}、\code{--repetitions}、\code{--warmup}、\code{--seed}、\code{--output}。把实际配置写入 \filepath{command.txt} 或 \filepath{config.json}。从这一步开始，实验就不再依赖记忆。
+
+第三步，加入 raw CSV。每次 repetition 写一行，包含 \code{kernel}、\code{size}、\code{batch}、\code{elapsed_ns}、\code{checksum}、\code{status}。先不要急着画图。原始数据是所有后续分析的基础。
+
+第四步，加入 summary。读取 raw CSV，计算 \code{min}、\code{median}、\code{p95}、\code{max}、\code{ns/element}、\code{GB/s}。summary 可以由同一个程序生成，也可以由脚本生成，但公式必须固定。
+
+第五步，加入环境记录。保存编译器版本、CPU、OS、Git 状态、构建命令。此时你的结果目录已经具备基本复现能力。
+
+第六步，加入二进制审计。自动或手动保存关键函数的 \code{objdump}。报告中说明函数是否被内联、是否存在目标循环、是否出现意外调用。没有二进制证据的性能解释要降级。
+
+第七步，加入多 kernel registry 和多 size 扫描。只有前六步稳定后，再扩大矩阵。否则，你会同时调试输入生成、计时、CSV、统计和多个 kernel，问题定位很困难。
+
+\begin{keyidea}
+benchmark suite 的实现顺序应服务可诊断性：先 correctness，再配置，再 raw，再 summary，再环境，再二进制，最后才扩大矩阵。
+\end{keyidea}
+
+\section{结果目录示例}
+
+一次完整运行可以生成：
+
+\begin{lstlisting}
+results/sum_u64/2026-06-14T120000Z/
+    command.txt
+    config.json
+    environment.txt
+    build.txt
+    raw_samples.csv
+    summary.csv
+    objdump/
+        bench.objdump.txt
+        sum_u64.scalar.txt
+        sum_u64.unrolled.txt
+    perf/
+        sum_u64_32768.perf.txt
+    report.md
+    notes.md
+\end{lstlisting}
+
+\filepath{command.txt} 保存原始命令；\filepath{config.json} 保存解析后的配置；\filepath{environment.txt} 保存机器和 Git；\filepath{raw_samples.csv} 保存每个样本；\filepath{summary.csv} 保存汇总；\filepath{objdump/} 保存二进制证据；\filepath{perf/} 保存可选硬件证据；\filepath{report.md} 写结论；\filepath{notes.md} 记录异常和失败。
+
+这个目录可以被压缩、上传 CI artifact、附到 review、作为发布报告证据。不要只把结果打印到终端。终端输出是临时观察，不是工程资产。
+
+\section{回归报告案例}
+
+假设 nightly benchmark 显示 \code{sum_u64} 在 \code{n=32768} 上退化 12\%。不要直接把 PR 打回。先写回归报告：
+
+\begin{lstlisting}
+Symptom:
+    sum_u64 scalar_candidate median ns/element regressed by 12%
+    at n = 32768 in nightly run 2026-06-14.
+
+Evidence:
+    raw samples show all repetitions shifted, not a single outlier.
+    correctness passed.
+    environment matches previous nightly except compiler minor version.
+    objdump shows loop changed from unrolled-by-4 to scalar loop.
+
+Hypothesis:
+    compiler no longer unrolled the loop under current flags, or source change
+    introduced an aliasing constraint.
+
+Next checks:
+    compare build flags
+    compare source diff around kernel
+    compile with previous compiler
+    inspect aliasing and inlining changes
+\end{lstlisting}
+
+这个报告把现象、证据、假设和下一步分开。它没有直接说“代码变差”，因为证据显示编译器版本也变了。若后续确认编译器升级导致 unroll 决策变化，可以选择固定编译器、调整源码、接受变化，或更新 baseline。不同结论对应不同行动。
+
+\subsection{回归不是只看一个点}
+
+如果只有 \code{n=32768} 退化，其他规模不变，可能是 cache、batch、unroll 阈值或统计噪声。如果多个相邻规模都退化，可能是真实实现变化。如果所有 kernel 都退化，可能是环境或机器状态。回归报告应包含邻近规模和其他 kernel 的简短对照。
+
+例如：
+
+\begin{lstlisting}
+Neighbor sizes:
+    n=2048:   +1%
+    n=32768: +12%
+    n=524288:+10%
+
+Other kernels:
+    copy_u64: unchanged
+    fill_u64: unchanged
+\end{lstlisting}
+
+这说明退化可能与 \code{sum_u64} 实现有关，而不是整机变慢。若所有 kernel 都慢，优先检查 governor、后台负载、虚拟机迁移或机器温度。
+
+\section{benchmark 代码本身也要测试}
+
+benchmark harness 是代码，也会有 bug。常见 harness bug 包括：
+
+\begin{itemize}
+  \item 单位换算错误，把 ns 当 us。
+  \item bytes 口径错误，GB/s 翻倍或减半。
+  \item batch 为 0。
+  \item repetitions 没按配置执行。
+  \item CSV 列顺序和 header 不一致。
+  \item checksum 没有真正依赖结果。
+  \item reference 和 candidate 使用不同输入。
+  \item summary 只读取最后一个 kernel。
+\end{itemize}
+
+因此，应给 harness 写小测试。比如用一个 sleep kernel 验证 elapsed 大致范围；用固定返回值 kernel 验证 checksum；用人工 raw CSV 验证 median 和 p95；用小输入验证 bytes 和 ops 公式。不要以为 benchmark 用来测别人，就不需要自己被测试。
+
+\subsection{统计脚本要可复查}
+
+如果 summary 由脚本生成，脚本也要进入版本控制。报告中应写脚本版本或 commit。统计脚本改变可能导致历史结果不可比。尤其是 p95 的定义、异常过滤、status 处理和分组字段，必须固定。
+
+\section{长期维护中的基线管理}
+
+benchmark suite 会随着项目变化。基线管理决定历史数据是否还能解释。
+
+一种简单策略是保留三类基线：
+
+\begin{itemize}
+  \item reference baseline：最清楚、最可靠的实现，用于 correctness。
+  \item performance baseline：当前发布版本或上一个稳定版本，用于 speedup。
+  \item environment baseline：同一机器上基础 kernel 的长期表现，用于判断机器状态。
+\end{itemize}
+
+三类基线不能混用。reference baseline 可能很慢，但语义清楚；performance baseline 代表工程比较对象；environment baseline 代表机器健康。若 copy 带宽 baseline 当天异常下降，所有内存 kernel 的回归都要谨慎解释。
+
+\subsection{基线更新要写原因}
+
+更新 baseline 时，要写原因：
+
+\begin{lstlisting}
+baseline update:
+    old: release-1.2
+    new: release-1.3
+    reason:
+        release-1.3 is now production baseline
+    protocol changes:
+        none
+\end{lstlisting}
+
+若同时改变了 protocol，例如 bytes 口径、输入分布、编译器版本，应明确标注。否则趋势图断点会被误认为性能变化。
+
+\section{把 benchmark 连接到代码评审}
+
+在代码评审中使用 benchmark，应避免两种极端。一种是完全不看性能数据，只凭直觉评审；另一种是只看 speedup 数字，忽略 correctness、二进制和统计。更好的做法是让 PR 提供小型性能证据包：
+
+\begin{itemize}
+  \item 修改说明：性能相关代码改了什么。
+  \item correctness：reference 或测试是否通过。
+  \item benchmark 命令：如何复跑。
+  \item summary：关键规模的 median 和分布。
+  \item raw data 路径：可以复查。
+  \item objdump 摘要：热路径是否符合预期。
+  \item 结论边界：只声称哪些场景。
+\end{itemize}
+
+reviewer 则重点看：比较是否公平、输入是否代表目标、二进制是否符合解释、差异是否大于噪声、是否有退化规模、是否改变了 ABI 或语义。这样 benchmark 就能服务评审，而不是变成数字装饰。
+
+\section{何时停止优化}
+
+benchmark suite 不只告诉你哪里变快，也告诉你何时该停。可以停止某个方向的常见信号：
+
+\begin{itemize}
+  \item 多个实现接近同一内存带宽上限。
+  \item 进一步展开不再降低 ns/element。
+  \item 优化只改善不重要的小规模，重要规模无变化。
+  \item 速度提升小于自然波动。
+  \item 代码复杂度和 ABI 风险明显超过收益。
+  \item 端到端实验显示 microkernel 提升被其他成本淹没。
+\end{itemize}
+
+停止不是失败。停止说明证据已经足够支持资源转移。高质量性能工程不是永远优化同一个函数，而是在正确性、维护成本、风险和收益之间做决策。
+
+\section{综合案例：一个小型 suite 的最终形态}
+
+到本章结束，一个教学级 suite 可以长这样：
+
+\begin{lstlisting}
+bench/
+    CMakeLists.txt
+    include/
+        benchmark_config.hpp
+        benchmark_result.hpp
+        do_not_optimize.hpp
+    src/
+        main.cpp
+        config_parse.cpp
+        environment.cpp
+        recorder.cpp
+        summary.cpp
+        workloads.cpp
+        kernels_sum.cpp
+        kernels_copy.cpp
+        kernels_fill.cpp
+        kernels_dot.cpp
+    tests/
+        test_summary.cpp
+        test_workloads.cpp
+        test_kernels.cpp
+    results/
+\end{lstlisting}
+
+它不需要很大，但职责清晰。 \code{config_parse} 负责配置；\code{environment} 负责机器和构建记录；\code{recorder} 写 raw CSV；\code{summary} 计算统计；\code{workloads} 生成输入；\code{kernels_*} 放被测实现；\code{tests} 验证 harness 自己。
+
+一次运行：
+
+\begin{lstlisting}[language=bash]
+./bench_core --kernels sum_ref,sum_unrolled \
+             --sizes 2048,32768,524288,8388608 \
+             --repetitions 31 \
+             --warmup 5 \
+             --seed 1 \
+             --output results/sum-unrolled
+\end{lstlisting}
+
+产物：
+
+\begin{lstlisting}
+results/sum-unrolled/
+    command.txt
+    environment.txt
+    raw_samples.csv
+    summary.csv
+    report.md
+\end{lstlisting}
+
+如果需要二进制证据，再保存：
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel ./bench_core > results/sum-unrolled/bench.objdump.txt
+\end{lstlisting}
+
+这已经足够支撑第一册级别的可信实验。后续要加入图表、CI、历史趋势、PMU、真实 workload，都可以在这个基础上扩展。
+
+\section{综合案例：从结果到决策}
+
+假设 summary 显示：
+
+\begin{lstlisting}
+size,baseline_ns_per_element,candidate_ns_per_element
+2048,0.45,0.50
+32768,0.32,0.28
+524288,0.34,0.30
+8388608,0.42,0.42
+\end{lstlisting}
+
+不要只写“candidate 更快”。更准确的解释是：
+
+\begin{itemize}
+  \item 小规模 \code{2048} 变慢，可能是额外控制开销超过收益。
+  \item 中等规模 \code{32768} 和 \code{524288} 变快，candidate 的循环结构可能更适合 cache-resident 数据。
+  \item 大规模 \code{8388608} 持平，可能进入内存带宽瓶颈。
+\end{itemize}
+
+决策要看目标 workload。如果生产主要处理中等规模，candidate 值得继续；如果生产主要处理小规模请求，可能需要 size-based dispatch；如果生产主要是大规模 streaming，candidate 的收益有限。benchmark suite 的价值不是给出单一速度标签，而是帮助做条件化决策。
+
+\section{自测清单：benchmark suite 是否可维护}
+
+完成本章后，应能回答：
+
+\begin{enumerate}
+  \item 新增一个 kernel 需要改哪些文件，是否会复制计时代码。
+  \item raw schema 和 summary schema 是否有版本。
+  \item 每个指标的单位和公式是否写清。
+  \item workload 的 size、distribution、seed、alignment 是否记录。
+  \item correctness check 是否独立于 timed region。
+  \item harness 自己是否有测试。
+  \item CI 中的性能阈值是否按 kernel 和规模设置。
+  \item 回归报告是否保存 artifact。
+  \item baseline 更新是否记录原因。
+  \item 性能结论是否能连接数据、二进制和环境证据。
+\end{enumerate}
+
+如果 suite 只能在作者机器上手工运行、只输出一个平均值、没有 raw、没有环境、没有 correctness，那么它只是临时脚本。临时脚本可以用于探索，但不能承担长期性能决策。
+
+\section{深入讲解：suite 的价值在于长期一致性}
+
+一次 benchmark 可以回答一个局部问题；benchmark suite 的价值在于长期一致性。它让团队在不同提交、不同机器、不同优化方向之间使用同一套语言比较性能。没有 suite，每个人都会写自己的计时代码，输入不同、单位不同、统计不同、报告不同，最后数字无法合并。
+
+长期一致性来自四件事。第一，schema 稳定。raw 和 summary 字段不随意改变。第二，workload 稳定。输入规模、分布和 seed 有记录。第三，baseline 稳定。比较对象清楚。第四，报告稳定。结论格式区分观察、解释和限制。只要这四点成立，suite 就能积累历史知识。
+
+长期一致性不等于永远不变。schema 可以升级，workload 可以扩展，baseline 可以更新，报告可以改进。但每次变化都要版本化和记录原因。性能数据最怕无声变化：某个字段公式改了，趋势图却继续连线；某个输入分布改了，speedup 却继续比较。suite 的维护重点，就是让变化可见。
+
+\section{深入讲解：性能数据也是项目资产}
+
+源代码、测试、文档是项目资产，性能数据也是。它记录了某些实现为什么被选择，某些优化为什么停止，某些退化从哪天开始，某些机器为什么不适合比较。没有这些数据，团队会重复讨论同样问题。
+
+把性能数据当资产，意味着要考虑存储、命名、版本、权限和清理。raw 数据可能很大，但关键 release 和回归数据应保留；临时探索数据可以定期清理；报告和 summary 应随 PR 或 release 保存；重要图表应能追溯到 raw。性能数据如果只存在个人电脑里，就不能支撑团队决策。
+
+\section{深入讲解：benchmark suite 和单元测试的关系}
+
+单元测试和 benchmark suite 都是工程反馈系统，但它们回答不同问题。单元测试主要回答“行为是否正确”，通常要求快速、稳定、确定；benchmark 回答“成本如何变化”，通常更慢、更受环境影响、需要统计解释。两者不能互相替代。
+
+正确的关系是：benchmark 依赖单元测试，单元测试保护 benchmark。被测 kernel 应先通过单元测试和 reference 校验，再进入性能测量。benchmark harness 自己也应有单元测试，验证 CSV、summary、median、bytes 公式和配置解析。这样当性能数字异常时，你能先排除 harness bug。
+
+不要让 benchmark 成为唯一 correctness 检查。benchmark 为了减少计时污染，可能不在每次样本内全量校验；单元测试可以更密集地覆盖边界。也不要让单元测试承担性能结论。单元测试运行时间受测试框架、并行执行和环境影响，不适合当作性能指标。
+
+\section{深入讲解：为什么报告模板比图表更重要}
+
+图表很直观，但模板决定图表是否可解释。没有问题陈述，图表不知道回答什么；没有 workload，横轴不知道代表什么；没有单位，纵轴无法比较；没有 raw 数据，图表无法复查；没有二进制证据，趋势无法解释；没有限制，读者会过度推广。
+
+报告模板的作用，是强迫作者在图表之前写清上下文。先写问题和结论，再放图表；先写协议，再放 summary；先写证据，再写解释。这样图表服务论证，而不是替代论证。
+
+一个项目可以为不同层级准备不同模板。PR smoke 报告可以短，只列 correctness、关键 summary 和是否超过阈值；nightly 报告可以包含趋势和 artifact；发布报告则要包含完整环境、二进制和限制。模板层级不同，但核心字段一致。
+
+\section{深入讲解：CI 中的 benchmark 要分层}
+
+把完整 benchmark suite 直接塞进每个 PR，通常不是好设计。PR 需要快速反馈，完整性能实验需要稳定环境、较多样本和人工解释。把两者混在一起，要么 CI 太慢，要么阈值太粗糙，最后大家开始忽略报警。更合理的做法是分层：PR smoke、nightly trend、release benchmark。
+
+PR smoke 的目标是发现明显问题。它可以运行少量 kernel、少量 size、较少 repetition，重点检查 correctness、harness 是否能跑、性能是否出现巨大退化。它的结论应该保守：通过不代表性能一定好，失败也可能需要复跑确认。PR smoke 适合阻断 checksum 失败、崩溃、CSV 格式错误和非常大的退化，不适合阻断百分之一这类小差异。
+
+nightly trend 的目标是观察趋势。它可以在固定机器或较稳定环境中运行较完整矩阵，保存 raw、summary、环境和图表。nightly 的价值不在于某一天的单点，而在于多天趋势。某个版本后连续几天退化，比单次样本波动更值得调查。nightly 也适合发现机器状态变化，例如内核升级、频率策略改变或后台负载污染。
+
+release benchmark 的目标是支持发布决策。它应该使用明确冻结的源码、构建参数、输入矩阵和机器环境，样本数量更充分，报告更完整。发布报告不仅要说明快慢，还要说明是否存在 correctness 风险、二进制变化、适用 workload、不能推广的范围。release benchmark 不是自动红绿灯，而是工程决策材料。
+
+\section{性能回归从报警到结论}
+
+一次 CI 报警只是信号，不是结论。处理性能回归可以按固定流程。第一，确认报警是否可复现。复跑同一提交、同一机器、同一参数，查看 raw samples 是否仍然异常。第二，确认 correctness 和 harness。checksum、样本数、schema、batch、计时边界、环境记录都要先通过。第三，确认比较对象。baseline 提交是否正确，candidate 是否包含预期改动，构建参数是否相同。
+
+第四，缩小 workload。找出哪些 kernel、size、distribution 退化，哪些不退化。若只有小 size 退化，可能是固定开销；若只有大 size 退化，可能是带宽或工作集；若只有随机分布退化，可能是分支或内存局部性；若所有 workload 都退化，可能是构建、环境或公共路径。第五，查看二进制差异。关键循环是否多了分支、函数调用、溢出检查、别名检查或额外 load/store。
+
+第六，再引入硬件事件。先有 workload 和二进制差异，再用 PMU 支持假设。若 branch misses 增加，要能指出哪条分支变得难预测；若 cache misses 增加，要能指出访问模式或工作集变化；若 instructions 增加，要能指出新增代码路径。第七，形成结论等级。若证据不足，就写“当前只能确认某 workload 退化，原因未定”；不要为了关闭问题强行写故事。
+
+\subsection{回归报告的最小字段}
+
+回归报告至少应包含：报警来源、提交范围、复跑结果、受影响 workload、未受影响 workload、正确性状态、构建参数、关键二进制差异、raw data 路径、summary 表、可能原因、排除原因、下一步。若修复已经存在，还要包含修复前后同一协议下的对比。
+
+这份字段清单看起来比“某 PR 变慢”麻烦，但它能让团队节省讨论成本。性能回归最怕信息碎片化：CI 日志在一个系统，图表在另一个系统，反汇编在个人终端，结论在聊天记录里。报告把证据集中在一起，后面无论是回滚、修复、接受退化还是调整阈值，都有依据。
+
+\section{综合案例：从局部优化到保守合入}
+
+设想一个改动把 \code{sum_u64} 的循环手写展开四倍。作者本机单次运行显示快百分之八。按照本章标准，这还不能直接合入。第一步，确认候选实现和 reference 在空数组、一个元素、非四倍长度、大数组和随机数据上结果一致。第二步，确认编译器没有已经自动展开或向量化出等价代码。若 baseline 本来就很好，手写展开可能只增加代码大小。
+
+第三步，做规模扫描。小规模可能因为额外尾部处理变慢，中等规模可能因为减少分支开销变快，大规模可能完全受内存带宽限制而持平。第四步，交错运行。不要先跑完 baseline 再跑 candidate，因为温度、频率和系统负载会随时间变化。第五步，保存反汇编。若 candidate 多了寄存器压力或溢出到栈，某些输入下变慢就不奇怪。
+
+最后的决策可能不是简单合入或拒绝。若生产 workload 主要是中等规模连续数组，可以保守合入并保留阈值监控；若小规模请求很多，可以做 size-based dispatch；若大规模没有收益且代码变复杂，可以拒绝；若证据不稳定，可以要求在固定机器 nightly 中观察一周。高质量 benchmark suite 的作用，是让这些选择有证据，而不是让最快的一次运行赢。
+
+\section{停止优化也是一种结论}
+
+性能工程常见误区是永远追逐更小数字。一个优化是否继续，取决于收益、风险、复杂度和可维护性。若某个改动只在少数不重要 workload 上提升百分之一，却增加大量手写汇编、平台分支和测试成本，它可能不值得。若某个改动带来稳定百分之五收益，但破坏 ABI 或让错误路径难以审查，也需要谨慎。
+
+停止优化不等于失败。它可以是基于证据的结论：当前瓶颈已经转移到内存带宽；当前实现足够接近 baseline；进一步优化需要第二册涉及的 SIMD 或 cache blocking；当前 workload 不支持更复杂分派；当前测量噪声大于预期收益。把这些原因写进报告，后续读者就知道为什么没有继续做。
+
+一个成熟 benchmark suite 应帮助团队回答“是否值得继续”。如果每次报告只说谁快谁慢，它还不够成熟。它应该告诉你收益在哪些条件下出现，风险是什么，复杂度是否合理，下一步需要什么证据，以及停止点在哪里。
+
+\section{数据治理：raw、summary 和图表各司其职}
+
+benchmark suite 的输出至少有三层。raw 是原始样本，记录每次运行的事实；summary 是对 raw 的聚合，方便比较；图表是对 summary 或 raw 的可视化，帮助发现趋势。三者不能互相替代。只有图表没有 raw，无法复查；只有 summary 没有 raw，无法检查异常值；只有 raw 没有 summary，团队难以快速判断。
+
+raw 数据应尽量不可变。一次 run 完成后，不要手工修改 raw CSV。如果发现字段错了，应生成新的 run，并在报告中说明旧 run 无效。summary 可以重新生成，但要记录脚本版本和 schema。图表更是派生产物，应能从 raw 和 summary 重建。这样做可以防止“为了好看改数据”的风险，也方便后续审计。
+
+命名也很重要。结果目录应包含日期、run id、提交号或短哈希、机器名和实验名。文件名应表达内容，而不是 \filepath{result1.csv}、\filepath{new.csv}。当项目积累几百次实验后，命名规则会决定数据是否还能被使用。
+
+\section{benchmark harness 自己也需要测试}
+
+很多团队只测试被测 kernel，不测试 harness。结果是 CSV 写错列、单位换算错、median 算错、batch 除法错、命令行参数没生效、随机 seed 没记录、summary 读到旧文件。harness bug 会污染所有性能结论，因此它也需要测试。
+
+harness 测试可以很小。用固定样本数组测试 median、min、p95 和单位换算；用假 kernel 测试 batch 计数；用故意失败的 checker 测试 status；用临时目录测试 raw 和 summary 文件生成；用固定 seed 测试 workload factory 是否可复现；用参数解析测试默认值和错误输入。测试这些内容不需要长时间 benchmark，却能显著提高可信度。
+
+还可以加入 golden schema 测试。保存一个小 raw CSV 和期望 summary，修改 summarizer 后自动比较。若 schema 升级，测试也跟着升级并记录原因。数据系统一旦自动化，没有 harness 测试就很难发现静默错误。
+
+\section{团队协作中的 benchmark 评审}
+
+benchmark 结果进入代码评审时，reviewer 不应只问“快了多少”。更好的问题是：比较对象是否公平；输入矩阵是否覆盖目标 workload；正确性是否通过；二进制是否符合预期；样本是否稳定；结果是否可复现；复杂度是否值得；是否需要更新 baseline；是否影响其他平台。
+
+作者也不应只贴截图。PR 中应链接结果目录或 artifact，列出关键 summary，说明 raw data 路径，给出反汇编证据，写清限制。若结果不稳定，应主动说明，不要只挑最好一次。若某些 workload 变慢，也要列出来。性能评审的目标是做决策，不是证明作者永远正确。
+
+团队还应约定 baseline 更新流程。什么时候允许更新 baseline，谁批准，是否需要发布报告，旧 baseline 是否保留，趋势图如何断点标注。没有流程时，baseline 容易被悄悄移动，性能回归被吸收进历史数据。baseline 是比较标准，不能随意改。
+
+\section{真实 workload 和合成 workload 的关系}
+
+合成 workload 容易复现、容易控制变量，适合定位机制。真实 workload 更接近生产，但可能难以公开、难以稳定、包含太多变量。成熟 suite 往往同时包含两者。合成 workload 用来解释原因，真实 workload 用来验证价值。
+
+使用真实 workload 时，要记录摘要。输入来源、日期、规模、分布、脱敏方式、采样策略、是否包含异常值，都影响解释。若不能公开真实数据，可以构造匹配分布的 synthetic 数据，并说明差异。不要把“真实数据”当作自动可信的标签。真实数据也可能偏斜、过期、不代表未来。
+
+合成 workload 也不能太玩具化。若真实系统的长度分布有长尾，合成数据只测固定长度就会误导；若真实数据有大量空输入、错误输入或非对齐缓冲，合成数据全是整齐数组就不够。workload 设计本质上是建模，模型要说明保留了什么，忽略了什么。
+
+\section{最终报告：从数据到工程选择}
+
+第一册最后一个能力，是把 benchmark suite 的数据转化为工程选择。工程选择通常不是“最快版本获胜”。还要考虑正确性风险、维护成本、代码大小、平台覆盖、ABI 稳定、调试难度、能耗、发布周期和团队经验。benchmark 提供证据，但决策需要综合权衡。
+
+一个最终报告可以按四段写。第一段给结论：是否建议合入、回滚、继续实验或停止优化。第二段给证据：summary、raw、反汇编、环境和正确性。第三段给风险：哪些 workload 变慢，哪些平台未测，哪些实现更复杂。第四段给后续：需要的测试、监控、baseline 更新或第二册级别优化方向。
+
+这样的报告让性能工程从“数字竞赛”回到项目目标。优化的意义不是让某个 microbenchmark 最好看，而是在明确条件下改善真实目标，同时不破坏正确性和可维护性。
+
+\section{第一册收束：从一次实验到长期体系}
+
+第 15 章教你把一次实验做可信，第 16 章教你把可信实验变成长期体系。长期体系的核心不是代码量，而是一致性：一致的输入描述，一致的计时协议，一致的正确性检查，一致的 raw schema，一致的报告格式，一致的 baseline 管理。只有一致，历史数据才有意义。
+
+当读者进入第二册的 SIMD、HPC 和 AI 算子时，benchmark suite 会变得更重要。高级优化往往有多个实现、多个 ISA、多个输入形状、多个精度和多个平台。没有 suite，就无法判断一个优化是否只对某个玩具输入有效；没有 raw 和 artifact，就无法追踪性能回归；没有 correctness，就无法比较近似算法和数值误差。
+
+因此，本章不是附属工具章，而是第一册的收束。它把源码、汇编、ABI、内存和硬件直觉变成可重复实验。读者若能维护一个小而可信的 suite，就具备了继续深入高性能计算的基本工程能力。
+
+\section{benchmark suite 的毕业要求}
+
+一个第一册级别的毕业 suite 不需要很大，但要完整。至少包含两个正确性 reference、三个输入规模、两种数据分布、raw 和 summary CSV、环境记录、反汇编 artifact、一个失败样本处理路径、一个 CI smoke 入口和一份报告模板。它应能在另一台同类机器上运行，并能说明哪些结果可比较、哪些不可比较。
+
+毕业要求还包括维护动作：新增 kernel 不复制计时代码，schema 变化有版本，baseline 更新有说明，异常结果有排查流程，报告能链接到 raw data。做到这些，suite 就不再是脚本，而是项目资产。
+
+\section{面向第二册的 suite 扩展方向}
+
+第二册会遇到更多变量：SIMD 宽度、ISA dispatch、数据对齐、尾部 mask、cache blocking、线程数、NUMA、真实 AI shape、量化格式和融合算子。第一册的 suite 不需要现在实现这些，但数据模型要能扩展。kernel 名称、实现名、ISA、input shape、dtype、layout、threads、alignment、cache mode 都应有明确字段或扩展位置。
+
+扩展时不要一次性把 suite 做成庞然大物。先保持核心协议稳定，再逐步增加 workload 和指标。每增加一个维度，都要问它服务什么问题，是否能复现，是否有正确性检查，是否会让报告难以解释。高性能 suite 的复杂性应来自真实需求，而不是形式上的完整。
+
+\section{第一册最终交付物}
+
+读者完成第一册后，建议提交一个小仓库作为最终交付物。仓库包含一个 C++ reference、一个汇编 kernel、一个 wrapper、一个 ABI 文档、一个 correctness 测试、一个 benchmark runner、raw 和 summary 示例、反汇编 artifact、环境记录和最终报告。这个仓库可以很小，但要闭环。
+
+最终报告回答四个问题：代码做什么，二进制如何证明，结果是否正确，性能结论在什么条件下成立。若能回答这四个问题，读者已经具备进入第二册的基本工程能力。后续无论做 SIMD、GEMM、attention 还是系统 profiling，都可以在这个闭环上继续扩展。
+
+\section{最终综合项目：mini perf lab}
+
+可以把第一册最后的成果命名为 mini perf lab。它不追求大而全，只追求闭环。项目中有三个 kernel：求和、拷贝、带条件求和。每个 kernel 有 reference 和 candidate；每个 candidate 有 correctness；每个实验保存 raw、summary、环境和反汇编；每份报告说明结论和限制。这个小项目足以覆盖数组访问、整数范围、控制流、ABI、C++ wrapper 和测量协议。
+
+mini perf lab 的目录可以固定为：
+
+\begin{lstlisting}
+src/
+tests/
+bench/
+results/
+docs/abi.md
+docs/report-template.md
+\end{lstlisting}
+
+目录本身不是重点，重点是责任清楚。src 放实现，tests 放正确性，bench 放测量，results 放不可变结果，docs 放合同和报告模板。这样的结构能让读者把第一册知识真正变成工程资产。
+
+\section{第一册结束时应避免的误解}
+
+第一，达到 36 万有效单位不代表质量自动成立；质量来自每段内容是否解释清楚、是否能实验验证、是否有边界。第二，会写一个 benchmark 不代表会做性能工程；还要会维护数据、处理失败、解释限制。第三，会读汇编不代表可以跳过语言语义；汇编解释必须回到 C++ 合同和 ABI。第四，第一册没有深入 SIMD 和 AI，不是因为它们不重要，而是因为没有这些基础，高级优化会变成不可靠技巧。
+
+带着这些边界进入第二册，学习会更稳。读者已经知道如何确认对象、如何读二进制、如何检查 ABI、如何设计实验、如何写报告。后续主题会更难，但方法不变：定义问题，收集证据，建立模型，验证假设，说明限制。
+
+\section{suite 维护者的责任}
+
+benchmark suite 一旦成为项目资产，就需要有人维护。维护者不一定每天写新 benchmark，但要保护 schema、baseline、artifact、报告模板和 CI 入口不被随意破坏。新增 kernel 时，维护者要检查 correctness 是否接入；新增指标时，要检查单位和公式；更新 baseline 时，要要求原因；删除旧结果时，要确认是否仍有追溯价值。
+
+维护者还要防止 suite 膨胀。每个 workload、每个指标、每个图表都应服务问题。没有人解释的图表会变成噪声；无人复查的 raw 会变成垃圾；过慢的 CI 会让大家绕过流程。好的 suite 是克制而稳定的，不是把所有想法都塞进去。
+
+\section{从第一册到第二册的实验迁移}
+
+进入第二册后，实验对象会从标量 kernel 扩展到 SIMD、cache blocking、线程和 AI 算子，但第一册的报告结构仍然适用。问题陈述、正确性、输入矩阵、计时协议、二进制证据、环境和限制，一个都不能少。新增的只是更多字段：ISA、向量宽度、数据布局、线程数、tile size、dtype、误差模型。
+
+如果第一册的 mini perf lab 设计得好，第二册可以自然扩展它，而不是重写实验系统。比如把 \code{sum_u64} 扩展为 AVX2 版本，把 \code{dot_f32} 扩展为向量版本，把输入矩阵扩展到对齐和尾部，把报告模板扩展到 ISA dispatch。这样学习路径连续，工程资产也连续。
+
+\section{第一册最终检查表}
+
+在进入第二册前，可以用下面检查表确认自己是否准备好。第一，能从零构建并运行一个小项目，保存构建命令和二进制身份。第二，能读一个优化构建的核心循环汇编，区分事实和推断。第三，能解释至少一个结构体布局和数组地址公式。第四，能为一个 C++ 调汇编函数写 ABI 合同和测试。第五，能设计一个不把 setup 混进 timed region 的 benchmark。第六，能保存 raw、summary、环境和反汇编 artifact。第七，能写出结论限制，不把单机结果推广成普遍规律。
+
+若某项做不到，就回到对应章节补实验。第一册不是读完就结束，而是形成一套可反复使用的工作台。第二册的所有高级主题，都应该放在这个工作台上完成。
+
+\section{给未来扩写的边界}
+
+后续若继续扩写本书，应保持第一册定位：基础链路、汇编接口、可信测量。更深的 SIMD、HPC、AI 算子、PMU topdown、多线程 NUMA、生产级库设计，可以进入第二册。这样分册边界清楚，第一册不会被高级专题冲散，第二册也能建立在足够扎实的读者能力上。
+
+第一册的每次新增内容，都应问两个问题：它是否帮助读者打通源码到机器执行的基础链路；它是否能通过实验和报告验证。若答案是否定的，就应推迟到第二册或附录。质量来自边界清楚，而不是把所有主题放在同一本书里。
+
 \section{实验 16.1：设计输入规模扫描}
 
 \begin{labbox}
 目标：把单点 benchmark 改成输入规模扫描。
 
-基于第 15 章的 \code{sum_u64} benchmark，支持下面命令：
+基于上一章的 \code{sum_u64} benchmark，支持下面命令：
 
 \begin{lstlisting}[language=bash]
 ./bench_sum_sizes --sizes 128,2048,32768,524288,8388608 \
@@ -1351,6 +3104,48 @@ results/ch16_suite/
 \end{enumerate}
 \end{labbox}
 
+\section{实验 16.6：建立一个性能回归 smoke test}
+
+\begin{labbox}
+目标：把 benchmark suite 变成一个低成本回归报警工具，同时避免把小噪声当成失败。
+
+任务：
+
+\begin{enumerate}
+  \item 选择两个 kernel，例如 \code{sum_u64} 和 \code{copy_u64}。
+  \item 每个 kernel 只选择 2 到 3 个代表规模，避免 CI 时间过长。
+  \item 固定 seed、warmup、repetitions 和 batch。
+  \item 准备一份 baseline summary，可以来自上一轮稳定运行。
+  \item 写脚本比较当前 summary 和 baseline summary。
+  \item 若 median 退化超过 20\%，返回失败。
+  \item 若 median 退化在 5\% 到 20\% 之间，输出 warning 但不失败。
+  \item 上传或保存 raw、summary、environment 和 command。
+\end{enumerate}
+
+比较逻辑示例：
+
+\begin{lstlisting}
+time_ratio = current_median_ns / baseline_median_ns
+
+if time_ratio >= 1.20:
+    status = fail
+elif time_ratio >= 1.05:
+    status = warning
+else:
+    status = pass
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item smoke benchmark 的配置。
+  \item baseline summary。
+  \item 当前 summary。
+  \item 比较脚本输出。
+  \item 一段说明：为什么这个阈值只适合报警，不适合证明小幅优化。
+\end{enumerate}
+\end{labbox}
+
 \section{本章作业}
 
 \begin{exercisebox}
@@ -1434,6 +3229,35 @@ results/ch16_suite/
   \item 实验限制。
 \end{itemize}
 
+\subsection*{作业 6：异常结果排查报告}
+
+构造或寻找一次异常 benchmark 结果，例如某个 size 突然慢很多、checksum 不稳定、CSV 样本数不对、某个版本快得不合理。按本章失败定位 checklist 写排查报告：
+
+\begin{enumerate}
+  \item raw samples 是否完整。
+  \item correctness 是否稳定。
+  \item timed region 是否干净。
+  \item 反汇编是否符合预期。
+  \item 环境是否可能解释异常。
+  \item 最终判断：这是 harness bug、代码 bug、环境噪声，还是可能的真实性能现象。
+\end{enumerate}
+
+要求报告包含证据，不接受只写猜测。
+
+\subsection*{作业 7：性能回归策略设计}
+
+为你的 benchmark suite 设计一套 CI smoke benchmark 策略。要求：
+
+\begin{itemize}
+  \item 选择哪些 kernel 进入 PR smoke。
+  \item 选择哪些输入规模。
+  \item 设定 fail 阈值和 warning 阈值。
+  \item 说明哪些 artifact 必须保存。
+  \item 说明哪些结论不能由 CI smoke 得出。
+\end{itemize}
+
+重点是让策略符合现实环境。不要写“任何 1\% 退化都失败”，除非你能说明机器、频率、重复次数和历史噪声如何支持这个阈值。
+
 \subsection*{评分标准}
 
 本章作业按下面标准评价：
@@ -1446,6 +3270,8 @@ results/ch16_suite/
   \item CSV 是否能支持复现和后续统计。
   \item correctness check 是否独立可信。
   \item 报告是否用数据、汇编和硬件事件支撑结论。
+  \item 是否能从异常结果反推数据、语义、计时边界、机器码和环境问题。
+  \item CI 回归策略是否区分报警、趋势和最终性能结论。
 \end{enumerate}
 \end{exercisebox}
 
@@ -1479,6 +3305,14 @@ outputs:
     objdump.txt
     perf_stat.txt
     report.md
+
+quality loop:
+    raw data audit
+    correctness audit
+    timed-region audit
+    binary audit
+    environment audit
+    regression smoke test
 \end{lstlisting}
 
-到这里，你应该能把一个临时代码片段升级成可复现的实验系统。下一章会继续补齐统计与噪声分析：如何理解样本分布、异常值、均值和中位数，如何比较两个版本是否真的不同，以及如何把实验复现做得更严谨。
+到这里，你应该能把一个临时代码片段升级成可复现的实验系统。统计与噪声分析会在后续性能专题中继续补齐：如何理解样本分布、异常值、均值和中位数，如何比较两个版本是否真的不同，以及如何把实验复现做得更严谨。第一册到这里收束，因为读者已经具备继续进入现代 CPU、SIMD、HPC 和 AI 算子优化所需的基本实验能力。

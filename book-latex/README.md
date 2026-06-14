@@ -1,6 +1,6 @@
 # LaTeX 正式书稿工程
 
-这是本项目的正式教材工程，目标是长期写成百万字级系统教材。
+这是本项目的正式教材工程。当前 PDF 是系列教材第一册，正文保留已经写成的 12 章；后续现代 CPU、SIMD、HPC 和 AI 算子内容进入第二册规划。
 
 Markdown 目录 `docs/book/` 保留为草稿、实验说明和内容素材库；正式排版、章节编号、交叉引用、术语表、索引、习题和附录以本目录为准。
 
@@ -13,7 +13,7 @@ sudo apt update
 sudo apt install texlive-full latexmk
 ```
 
-当前环境检查显示尚未安装 `xelatex`、`lualatex`、`latexmk`，所以本机暂时不能生成 PDF。
+当前环境已配置 `xelatex` 和 `latexmk`，可以直接生成 PDF。
 
 ## 构建命令
 
@@ -22,6 +22,14 @@ sudo apt install texlive-full latexmk
 ```bash
 cd book-latex
 latexmk -xelatex -interaction=nonstopmode main.tex
+```
+
+也可以使用工程提供的 Makefile：
+
+```bash
+cd book-latex
+make check
+make pdf
 ```
 
 清理：

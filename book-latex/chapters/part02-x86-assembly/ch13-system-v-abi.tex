@@ -1,10 +1,10 @@
 \chapter{System V AMD64 ABI}
 
-\section{本章要解决的问题}
+\section{问题与目标}
 
-前面几章已经能看懂一段函数内部的汇编：整数指令、地址计算、条件跳转、循环、\instruction{call} 和 \instruction{ret}。但只知道这些还不够。真实程序不是一个函数孤立运行，而是由大量函数、目标文件、静态库、动态库、运行时和操作系统共同组成。
+前面几章已经建立了阅读函数内部汇编的基础：整数指令、地址计算、条件跳转、循环、\instruction{call} 和 \instruction{ret}。但真实程序不是一个函数孤立运行，而是由大量函数、目标文件、静态库、动态库、运行时和操作系统共同组成。函数之间怎样交接参数、返回值、寄存器和栈状态，是本章必须解决的问题。
 
-问题来了：一个 C++ 文件里编译出来的函数，为什么能被另一个 C 文件调用？一个手写汇编函数，为什么能返回给 C++ 调用者？动态库里的 \code{printf}，为什么知道你的参数放在哪里？异常展开、调试器栈回溯、profiler 采样，为什么能沿着调用链走？
+换句话说：一个 C++ 文件里编译出来的函数，为什么能被另一个 C 文件调用？一个手写汇编函数，为什么能正确返回给 C++ 调用者？动态库里的 \code{printf}，为什么知道实参放在哪里？异常展开、调试器栈回溯和 profiler 采样，为什么能够沿着调用链恢复上下文？
 
 答案是 \term{ABI}{Application Binary Interface}。ABI 是二进制层面的契约。它规定：
 
@@ -17,11 +17,40 @@
   \item 函数入口、函数尾声、调试信息和异常展开如何约定。
 \end{itemize}
 
-本章讲 Linux、macOS 等类 Unix x86-64 平台常用的 System V AMD64 ABI。Windows x64 使用另一套 ABI，参数寄存器、shadow space、保存规则都不同。本书后续默认讨论 System V AMD64，除非明确说明。
+本章讨论 Linux、macOS 等类 Unix x86-64 平台常用的 System V AMD64 ABI。Windows x64 使用另一套 ABI，参数寄存器、shadow space 和保存规则都不同。本册默认以 System V AMD64 为上下文，除非另有明确说明。
 
 \begin{keyidea}
 ISA 告诉 CPU 一条指令怎么执行；ABI 告诉不同二进制代码如何互相调用。读函数级汇编时，如果不懂 ABI，就无法可靠判断参数、返回值、栈槽、寄存器保存和跨语言边界。
 \end{keyidea}
+
+\section{ABI 位于哪一层}
+
+学习 ABI 时，第一步不是背寄存器表，而是把它放到正确层次。源代码层有函数声明、类型、重载、命名空间、引用、对象生命周期和异常语义；ISA 层有寄存器、内存操作数、\instruction{call}、\instruction{ret} 和机器码编码；操作系统层有进程、虚拟地址空间、共享库映射、信号和系统调用。ABI 处在这些层之间，把源码中的“调用一个函数”约束成二进制模块可以共同遵守的接口。
+
+因此，ABI 不是 C++ 标准的一部分。C++ 标准会描述表达式求值、对象生命周期、函数重载、异常传播等语言规则，但不会规定 Linux x86-64 上第一个整数参数一定放在 \register{rdi}。同样，ABI 也不是 CPU 硬件自动强制的规则。CPU 并不知道 \register{rbx} 是 callee-saved，也不会在函数返回时检查 \register{rsp} 是否恢复。ABI 的力量来自编译器、汇编器、链接器、运行时库、调试器和程序员共同遵守。
+
+这一区分能解释许多初学者疑惑。一个破坏 \register{rbx} 的手写汇编函数，CPU 会照样执行，因为从 ISA 角度看 \instruction{mov rbx, ...} 完全合法；但从 ABI 角度看，它可能破坏调用者仍然依赖的值。一个栈未对齐的函数，简单算术测试可能通过，因为没有指令触及对齐敏感路径；但一旦调用库函数、使用某些 SIMD 指令、进入不同优化版本，程序就可能崩溃。ABI 错误的特点往往不是“立即非法”，而是“破坏了其他代码合理依赖的前提”。
+
+\begin{mentalmodel}
+可以把一个函数调用看成四层同时发生：
+
+\begin{itemize}
+  \item 源代码层：调用者认为自己在调用某个有类型的函数。
+  \item ABI 层：调用者把参数放到约定位置，被调用者从约定位置读取。
+  \item ISA 层：\instruction{call} 写入返回地址并跳转，\instruction{ret} 弹出返回地址并跳回。
+  \item 工具层：调试器、profiler 和异常展开器依赖符号、栈帧和展开信息恢复调用链。
+\end{itemize}
+
+只看其中任意一层，都容易误判真实程序。
+\end{mentalmodel}
+
+\section{本章应该怎样学}
+
+ABI 很容易被学成表格背诵：前六个整数参数对应哪些寄存器，返回值放在哪里，哪些寄存器需要保存。表格必须熟悉，但本章的目标不止于此。你应该能从一个 C++ 函数签名出发，推导函数入口时每个参数的位置；能从一段反汇编出发，判断它是否遵守 ABI；能解释为什么某个看似多余的 \instruction{sub rsp, 8} 实际是在维护栈对齐；能看出某个大结构体返回函数为什么多了隐藏参数；还能把这些结论写成可复现实验报告。
+
+学习时建议使用三种笔记。第一种是入口状态笔记：函数刚进入时，哪些寄存器和栈槽有 ABI 含义。第二种是保存责任笔记：函数体修改了哪些 callee-saved 寄存器，是否恢复；调用别的函数前是否保护了仍然需要的 caller-saved 值。第三种是边界证据笔记：结论来自函数签名、ABI 规则、反汇编、调试器单步，还是来自对编译器行为的推测。
+
+本章不会把完整 psABI 规范逐条翻译。规范里的分类算法、对象文件细节、动态链接、线程局部存储、异常展开和向量扩展都很庞大。第一册采用经典教材式路径：先掌握函数调用最常见、最容易出错、最能支撑后续实验的规则；遇到边界情况时明确告诉你应回到正式 ABI 文档和编译器输出验证，而不是凭记忆硬猜。
 
 \section{ABI 为什么必须存在}
 
@@ -95,6 +124,70 @@ callee:
 \end{lstlisting}
 \end{mentalmodel}
 
+\section{从源码函数调用到二进制调用点}
+
+源代码中的函数调用通常只有一行：
+
+\begin{lstlisting}[language=C++]
+long r = f(a, b, c);
+\end{lstlisting}
+
+但在二进制层，调用点至少要完成五件事。第一，计算每个实参表达式，得到要传递的值或地址。第二，按照 ABI 把这些值放入通用寄存器、浮点寄存器或栈参数区。第三，保护调用后还要继续使用、但可能被被调用者破坏的 caller-saved 寄存器值。第四，在执行 \instruction{call} 前维护栈对齐。第五，在返回后从约定寄存器或内存位置读取返回值。
+
+被调用者看到的不是源代码实参表达式，而是调用点留下的机器状态。对它来说，入口状态是事实起点：\register{rdi} 里是什么，\register{xmm0} 里是什么，\register{rsp} 指向哪里，哪些栈槽属于参数，哪些寄存器必须恢复。被调用者不能假设调用者用哪个源文件写成，不能假设调用者保留了局部变量名字，也不能假设调用者和自己使用同一种优化级别。
+
+这也是单独编译能够成立的原因。编译 \code{main.cpp} 时，编译器可能只看见 \code{extern "C" long f(long, long, long);} 这样的声明。它不知道 \code{f} 的函数体，但它知道函数签名和目标 ABI，于是能生成调用序列。编译 \code{f.cpp} 时，编译器不知道所有调用点，却知道入口处第一个 \code{long} 参数应从 \register{rdi} 读取。链接器最后只需要把符号引用接到符号定义，调用双方已经在 ABI 层达成一致。
+
+真实工程里，ABI 边界往往就是编译优化的边界。编译器在一个函数内部可以重排指令、删除变量、内联小函数、把局部值放进任意临时寄存器；但当它生成一个外部可见函数或一个不能内联的调用点时，就必须把自由度收束成 ABI 规定的形状。理解这一点，才能解释为什么同一个计算在内联后可能完全看不见函数调用，而一旦跨动态库边界，参数传递、返回值、PLT 跳转和寄存器保存又全部回来了。
+
+\begin{warningbox}
+不要把“源代码里有一个函数调用”和“机器码里一定有一条 \instruction{call} 指令”画等号。优化器可能内联、常量折叠、尾调用优化，甚至删除整个调用。ABI 规则约束的是实际存在的二进制调用边界；如果边界被优化掉，就不再有那次普通 ABI 调用。
+\end{warningbox}
+
+\section{从函数签名推导入口状态}
+
+读函数汇编时，可以按下面顺序推导入口状态。第一，看目标平台和调用约定，确认当前是 System V AMD64，而不是 Windows x64、内核系统调用约定或某个编译器扩展约定。第二，看函数返回类型，先判断是否可能有隐藏 sret 指针。第三，按从左到右的显式参数顺序分类：整数、指针、引用通常进入通用寄存器序列；标量浮点通常进入 \register{xmm} 序列；聚合类型要看大小、字段类别、对齐和 C++ 平凡性。第四，记录寄存器容量耗尽后的栈参数位置。第五，把返回值位置写在入口笔记旁边，因为很多函数会围绕返回寄存器组织数据流。
+
+对一个普通函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" double f(long a, double b, int c, float d);
+\end{lstlisting}
+
+推导过程不是“第一个参数 \register{rdi}，第二个参数 \register{rsi}”这么简单。应该分通道计数：
+
+\begin{lstlisting}
+long a   -> first integer-class argument  -> rdi
+double b -> first floating-class argument -> xmm0
+int c    -> second integer-class argument -> esi
+float d  -> second floating-class argument -> xmm1
+return double -> xmm0 on return
+\end{lstlisting}
+
+注意返回时 \register{xmm0} 会从参数含义变成返回值含义。寄存器的语义不是永久标签，而是由时间点、ABI 和指令数据流共同决定。
+
+对一个可能有隐藏返回指针的函数：
+
+\begin{lstlisting}[language=C++]
+struct Big3 { long a; long b; long c; };
+extern "C" Big3 make(long x, long y);
+\end{lstlisting}
+
+入口推导要先处理返回类型。若该类型走 sret，调用者会把返回对象地址作为隐藏参数放在第一个通用寄存器位置，显式参数整体后移：
+
+\begin{lstlisting}
+rdi = hidden pointer to caller-provided Big3 storage
+rsi = x
+rdx = y
+return convention may also copy hidden pointer to rax
+\end{lstlisting}
+
+如果你跳过返回类型，直接把 \register{rdi} 当作 \code{x}，后面的所有解释都会错。这类错误在逆向、调试崩溃和手写汇编互操作中非常常见。
+
+\begin{keyidea}
+ABI 推导的基本顺序是：先定目标 ABI，再看返回类型，再分类参数，再分配寄存器和栈槽，最后结合指令数据流验证。不要只凭第一个出现的寄存器名猜源码变量。
+\end{keyidea}
+
 \section{先掌握最常见的整数参数}
 
 System V AMD64 ABI 中，前 6 个整数或指针类参数通常放在这些寄存器里：
@@ -159,6 +252,77 @@ ret
 \register{rcx} 在 System V ABI 中是第 4 个整数参数；在 Windows x64 ABI 中，\register{rcx} 是第 1 个整数参数。看资料或反汇编时必须先确认目标 ABI。
 \end{warningbox}
 
+\section{窄整数参数和高位问题}
+
+很多函数参数不是 64 位整数，而是 \code{bool}、\code{char}、\code{short}、\code{int}、枚举、小整数 typedef。它们在 ABI 层仍然占用通用寄存器位置，但有效位宽和高位解释需要小心。读汇编时，如果只看到 \register{rdi}、\register{rsi} 这类 64 位寄存器名，就直接把参数当成完整 64 位值，很容易误判。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_char_signed(signed char a, signed char b)
+{
+    return int(a) + int(b);
+}
+
+extern "C" int add_char_unsigned(unsigned char a, unsigned char b)
+{
+    return int(a) + int(b);
+}
+\end{lstlisting}
+
+两个函数都可能从第一个、第二个通用参数寄存器接收值，但函数体会用不同扩展方式解释低 8 位：
+
+\begin{lstlisting}
+signed char:
+    sign-extend low 8 bits before arithmetic
+
+unsigned char:
+    zero-extend low 8 bits before arithmetic
+\end{lstlisting}
+
+你可能看到 \instruction{movsx}、\instruction{movsbl}、\instruction{movzx}、\instruction{movzbl} 这类指令，也可能看到编译器利用 32 位写入清零高位的性质消除显式扩展。关键是：参数寄存器的物理宽度不等于源语言参数的有效宽度。源语言类型决定低多少位有效，以及这些位应该按有符号还是无符号解释。
+
+\subsection{调用者和被调用者都不能乱猜高位}
+
+ABI 会规定某些小整数参数如何传递，但不同类型、不同编译器优化和不同调用边界下，高位是否有确定值并不总能靠肉眼猜。安全的读法是：被调用者若需要 \code{signed char} 语义，就看它是否从低 8 位符号扩展；若需要 \code{unsigned char} 语义，就看它是否零扩展或只使用低 8 位。调用者传参时也应按函数原型准备实参，而不是把任意 64 位垃圾值塞进 \register{rdi} 后指望被调用者总能忽略高位。
+
+对 \code{int} 参数，常见代码会使用 \register{edi}、\register{esi}、\register{edx} 等 32 位视图。x86-64 中写 32 位寄存器会清零对应 64 位寄存器高 32 位，所以调用点常通过写 \register{edi} 来自然形成零扩展到 \register{rdi} 的效果。但这不意味着所有有符号语义都被取消。被调用者做 32 位算术时，溢出、比较、返回值解释仍然由源语言和指令决定。
+
+看下面两个函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool is_negative_i32(int x)
+{
+    return x < 0;
+}
+
+extern "C" bool high_bit_u32(unsigned x)
+{
+    return (x & 0x80000000u) != 0;
+}
+\end{lstlisting}
+
+二者都可能检查同一个最高位，但语义不同。第一个是有符号比较，第二个是无符号位测试。汇编里可能都涉及 \register{edi}，但不能只凭寄存器名判断源类型。要结合条件码、比较指令、返回值构造和函数签名。
+
+\subsection{返回窄整数也要看有效位}
+
+返回 \code{bool}、\code{char}、\code{short} 时，结果通常位于 \register{al} 或 \register{ax} 的低位部分；返回 \code{int} 时看 \register{eax}。调用者若把返回值继续提升为 \code{int} 或 \code{long}，会按源类型进行零扩展或符号扩展。手写汇编返回窄类型时，最稳妥的做法是明确设置返回寄存器低位，并在需要时清理高位，避免让调用者后续优化遇到不明确状态。
+
+例如返回 \code{bool} 的函数，建议让 \register{eax} 为 0 或 1：
+
+\begin{lstlisting}
+xor eax, eax
+test edi, edi
+setne al
+ret
+\end{lstlisting}
+
+这样不仅低 8 位正确，高位也被清零，调用者把结果当作整数继续使用时更容易得到稳定、可读的机器码。编译器常生成类似模式。
+
+\begin{warningbox}
+读 ABI 时不要把“参数放在某个 64 位寄存器”理解成“整个 64 位都是该参数的语义值”。窄整数的有效位宽、符号扩展、零扩展和返回低位都要结合源类型和指令判断。
+\end{warningbox}
+
 \section{超过 6 个整数参数：栈上传参}
 
 第 7 个及以后的整数或指针类参数通常通过栈传递。看例子：
@@ -208,6 +372,33 @@ on entry to sum8:
 如果被调用函数一进来就 \instruction{push rbp} 或 \instruction{sub rsp, ...}，参数相对 \register{rsp} 的偏移会改变。因此读汇编时必须知道当前 \register{rsp} 已经移动了多少。使用帧指针时，编译器常用 \register{rbp} 作为稳定基准。
 \end{deepdive}
 
+\subsection{栈参数不是局部变量}
+
+栈上传参容易和局部变量、spill slot 混在一起。第 7 个及之后的参数位于调用者准备好的调用帧区域中；局部变量和临时溢出槽通常位于被调用者自己调整 \register{rsp} 后得到的区域中。二者都在栈上，但所有权和解释方式不同。
+
+从被调用者入口看，\code{[rsp + 8]} 是第一个栈参数；从调用者视角看，它是在执行 \instruction{call} 之前就准备好的一个输出区域。执行 \instruction{call} 后，硬件把返回地址写到当前 \register{rsp - 8}，于是被调用者入口的 \register{rsp} 指向返回地址。这个返回地址不是“参数的一部分”，却夹在栈顶和栈参数之间，所以读偏移时必须把它算进去。
+
+如果被调用者建立帧指针：
+
+\begin{lstlisting}
+push rbp
+mov  rbp, rsp
+\end{lstlisting}
+
+那么入口时的返回地址从 \code{[rsp]} 变成 \code{[rbp + 8]}，第一个栈参数从 \code{[rsp + 8]} 变成 \code{[rbp + 16]}。很多低优化级反汇编都呈现这种形式。初学者常把 \code{[rbp + 16]} 误认为局部变量，因为它也是以 \register{rbp} 为基址；事实上，正偏移通常指向调用者方向，负偏移通常指向被调用者自己的局部区域。
+
+\begin{warningbox}
+不要看到 \code{[rbp + 16]} 就机械说“栈上的局部变量”。在典型帧指针布局里，\register{rbp} 正偏移常常是返回地址和栈参数，负偏移才更常见于局部变量、保存寄存器和 spill slot。
+\end{warningbox}
+
+\subsection{谁负责清理栈参数}
+
+在 System V AMD64 常见调用约定下，调用者负责为栈参数准备空间，并在调用返回后恢复自己的 \register{rsp}。被调用者读取栈参数，但通常不会把调用者压入的参数弹掉。这个规则让被调用者不需要知道调用者在调用点周围还安排了哪些临时栈空间，也让变参函数、尾调用优化和编译器自己的调用序列更容易统一处理。
+
+例如调用一个有 8 个 \code{long} 参数的函数时，调用者可能把第 7、第 8 个参数写到栈上，然后执行 \instruction{call}。返回后，调用者把 \register{rsp} 调回调用前状态。被调用者只保证自己返回时 \register{rsp} 回到入口约定状态，也就是仍然指向返回地址所在的那一层，随后 \instruction{ret} 会弹出返回地址。
+
+这个规则也解释了为什么手写汇编函数不能随意 \instruction{pop} 栈参数。如果你在被调用者里把栈参数弹掉，\instruction{ret} 可能从错误位置取返回地址；即使没有立刻崩溃，调用者恢复 \register{rsp} 时也会基于错误前提继续破坏栈。
+
 \section{浮点和向量参数}
 
 浮点参数走 SSE/AVX 寄存器通道。常见规则：
@@ -256,6 +447,57 @@ mix_args:
 \begin{warningbox}
 \register{xmm0} 既可能是第 1 个浮点参数，也可能是浮点返回值。函数入口和函数返回是两个不同时间点。读汇编时要区分“入口时 \register{xmm0} 是参数”和“返回时 \register{xmm0} 是结果”。
 \end{warningbox}
+
+\subsection{浮点通道和整数通道混用时的常见误判}
+
+混合参数最容易出错的地方，是把参数序号和寄存器序号混成一条线。System V AMD64 中，通用寄存器通道和浮点寄存器通道分别计数。一个 \code{double} 参数不会占掉 \register{rsi}，一个 \code{int} 参数也不会占掉 \register{xmm1}。因此第 4 个源代码参数不一定在第 4 个通用寄存器，也不一定在 \register{xmm3}。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" double f(double a, long b, double c, long d, double e);
+\end{lstlisting}
+
+入口通常应写成：
+
+\begin{lstlisting}
+xmm0 = a
+rdi  = b
+xmm1 = c
+rsi  = d
+xmm2 = e
+\end{lstlisting}
+
+如果你只按源代码位置数“第一个、第二个、第三个”，就会把 \code{c} 错写成 \register{xmm2}，把 \code{d} 错写成 \register{rcx}。正确做法是给每个类别单独维护计数器。写 ABI 推导笔记时，可以画两列：
+
+\begin{lstlisting}
+integer channel:
+    b -> rdi
+    d -> rsi
+
+floating channel:
+    a -> xmm0
+    c -> xmm1
+    e -> xmm2
+\end{lstlisting}
+
+这种写法比单列表更不容易错。
+
+\subsection{向量参数只做第一册边界认识}
+
+SSE、AVX 向量类型也会进入 ABI 讨论，例如 \code{__m128}、\code{__m256}、编译器向量扩展类型。它们的传递规则涉及向量寄存器、对齐、目标 ISA、编译参数和 psABI 扩展。第一册暂不展开 SIMD 编程，但要知道一个事实：向量参数不是普通指针，也不是普通结构体。它们可能直接走 \register{xmm} 或 \register{ymm} 寄存器，调用者和被调用者还必须在同一目标 ISA 假设下编译。
+
+如果你在 C++ 和手写汇编边界传递向量对象，必须确认：
+
+\begin{itemize}
+  \item 函数声明使用的向量类型是什么。
+  \item 编译参数是否启用了对应 ISA。
+  \item 参数和返回值是否走向量寄存器。
+  \item 是否存在 AVX 到 SSE 过渡相关的清理要求。
+  \item 栈上保存向量时是否满足对齐要求。
+\end{itemize}
+
+后续第二册会系统讲 SIMD。当前阶段的原则是：公开 ABI 和手写汇编边界优先使用普通标量、指针和明确布局的平凡结构体；若必须传向量，先用编译器生成一个小例子并反汇编验证。
 
 \section{返回值位置}
 
@@ -375,6 +617,29 @@ rax = rdi
 看到函数第一个参数“不对劲”时，不要马上怀疑编译器。先检查返回类型是否是大结构体，是否存在隐藏 sret 指针。
 \end{keyidea}
 
+\section{返回值不是只有一个寄存器问题}
+
+很多教材在介绍返回值时只说“整数返回值放在 \register{rax}，浮点返回值放在 \register{xmm0}”。这句话对最常见标量情况足够，但不足以解释真实 C++ 程序。C++ 返回值可能是标量、指针、引用、小结构体、大结构体、含浮点字段的聚合、非平凡对象，也可能涉及返回值优化、复制省略、移动构造和析构。ABI 只能描述二进制边界上对象如何被交接，不能替代 C++ 对象语义。
+
+从 ABI 角度看，返回值大致有三种形态。第一种是寄存器返回：一个 \code{int}、一个指针、一个 \code{double}，或者能拆进一两个 eightbyte 的小聚合，直接用 \register{rax}、\register{rdx} 或 \register{xmm0}、\register{xmm1} 交接。第二种是内存返回：调用者提供一块结果对象存储，被调用者把结果写进去，也就是隐藏 sret 指针。第三种是优化后没有普通返回边界：函数被内联，返回对象被直接构造到调用者后续使用的位置，汇编里可能看不到独立的返回动作。
+
+这三种形态要和源码语义分开。源码里 \code{return Big{...};} 仍然是返回一个 \code{Big} 对象；机器层面可能表现为写 \code{[rdi]}、\code{[rdi + 8]}、\code{[rdi + 16]}。源码里返回一个两字段结构体，机器层面可能表现为同时写 \register{rax} 和 \register{rdx}。如果函数被内联，源码返回值甚至可能只表现为调用者内部的几条算术指令。
+
+分析返回值时，建议写下四个问题：
+
+\begin{enumerate}
+  \item 返回类型在 ABI 中属于标量、可寄存器传递的小聚合，还是需要内存返回的对象。
+  \item 返回路径上哪些寄存器或内存地址被写入。
+  \item 调用者在返回后从哪里读取结果。
+  \item C++ 对象语义是否引入构造、析构、异常或非平凡复制移动。
+\end{enumerate}
+
+这些问题比单独背“\register{rax} 返回整数”更可靠。尤其在调试跨语言接口时，调用者和被调用者若对返回类型理解不同，结果可能不是链接失败，而是静默破坏内存。例如 C++ 头文件声明返回小结构体，汇编实现却按大结构体隐藏指针写内存，双方都能生成机器码，但入口寄存器含义完全错位。
+
+\begin{warningbox}
+返回类型是 ABI 推导的一部分，不是最后才看的附加信息。大结构体返回会改变显式参数的位置；小结构体返回可能占用两个寄存器；浮点返回会占用 \register{xmm0}。跳过返回类型，函数入口解释很容易从第一步就错。
+\end{warningbox}
+
 \section{结构体参数的简化分类规则}
 
 System V AMD64 ABI 对聚合类型有详细分类算法。完整规则涉及 \code{INTEGER}、\code{SSE}、\code{SSEUP}、\code{X87}、\code{COMPLEX_X87}、\code{MEMORY} 等类别，还会把对象按 8 字节分块。本书先给出足以读大多数性能代码的简化流程：
@@ -457,6 +722,46 @@ xmm0 = x.b
 结构体 ABI 分类是容易出错的地方。字段顺序、padding、对齐、浮点/整数混合、C++ 非平凡类型都会改变传参方式。遇到公开二进制接口时，不要凭感觉改结构体布局。
 \end{warningbox}
 
+\subsection{为什么按 eightbyte 思考}
+
+System V AMD64 ABI 采用 eightbyte 分类，是因为二进制传参最终要落到机器寄存器和机器字大小附近的传输单元上。一个小结构体虽然在 C++ 层是一个整体对象，但在调用边界上，ABI 可以把它拆成一个或两个 8 字节块，再分别决定走通用寄存器、浮点寄存器，还是内存。这个设计在效率和通用性之间折中：常见小对象不用总是写入内存，复杂对象又能退回更保守的内存传递。
+
+以两个 \code{long} 字段的结构体为例，两个字段刚好分别占两个 eightbyte，且都属于整数类，因此可以用两个通用寄存器传递。以两个 \code{double} 字段的结构体为例，两个字段也各占一个 eightbyte，但类别是 SSE，因此可以用两个 \register{xmm} 寄存器传递。若结构体包含一个 \code{int} 后跟一个 \code{double}，由于对齐和 padding，可能形成一个整数类块和一个 SSE 类块，于是入口状态可能同时使用 \register{edi} 和 \register{xmm0}。
+
+这里的关键不是记住某个例子的答案，而是看到“结构体整体”与“ABI 传输块”之间的差异。源码层的结构体表达了字段关系、类型不变量和程序员意图；ABI 层只关心调用边界上这些字节如何分类、放在哪里、由谁负责复制。一个结构体越接近普通标量组合，越可能被拆进寄存器；一旦它变大、未对齐、类别复杂或带有非平凡 C++ 语义，就更可能回到内存路径。
+
+\subsection{padding 和字段顺序会改变 ABI 形状}
+
+结构体布局不是只影响 \code{sizeof}。它还可能改变 ABI 看到的类别。下面两个结构体包含相似字段，但排列方式不同：
+
+\begin{lstlisting}[language=C++]
+struct A {
+    int x;
+    double y;
+};
+
+struct B {
+    double y;
+    int x;
+};
+\end{lstlisting}
+
+在常见 x86-64 布局下，二者大小可能都被对齐到 16 字节，但字段 offset 不同。ABI 分类时会按 eightbyte 切块并合并字段类别。对于普通情况，二者都可能通过一个通用寄存器和一个 \register{xmm} 寄存器传递；但如果再加入小字段、显式对齐、packing pragma 或向量字段，分类结果可能变化。公开 ABI 中随意调整字段顺序，不只是二进制大小变化，也可能改变调用者如何传参。
+
+这对库设计尤其重要。一个只在单个程序内部使用的结构体，字段重排通常可以随源码一起重新编译；一个暴露在动态库边界、插件接口或 FFI 边界上的结构体，字段 offset、对齐、大小和传参方式都成为兼容性的一部分。改动它可能要求所有调用方重新编译，甚至造成旧调用方按旧 ABI 传参、新库按新 ABI 解释的错误。
+
+\subsection{非平凡 C++ 类型不是普通字节包}
+
+有些结构体大小很小，但仍然不应该按“两个整数寄存器”这样简单理解。C++ 类型可能有非平凡构造、复制、移动、析构，可能包含虚函数、基类、引用成员，或者要求特殊对齐。ABI 在处理 C++ 类型时不仅看字节数量，还要考虑对象如何被创建、复制和销毁。非平凡类型常常会通过地址间接传递，让调用边界能够保持对象语义。
+
+例如一个结构体只包含一个指针，但有自定义析构函数。它在内存大小上像一个机器字，但语言层并不是普通整数。调用者和被调用者必须就对象生命周期达成一致，否则析构次数、所有权转移和异常清理都会出错。ABI 规范和具体编译器 ABI 会规定这些对象在函数参数和返回值中如何处理。读汇编时，如果只凭 \code{sizeof} 判断“应该进 \register{rdi}”，就可能漏掉隐藏地址传递或临时对象构造。
+
+本册后面手写汇编实验会优先使用 \code{extern "C"} 和普通平凡类型，不是因为真实工程只有这些类型，而是为了先把二进制调用约定学清楚。进入复杂 C++ ABI、异常、虚函数和模板库边界时，需要在这个基础上继续查看编译器 ABI 文档和真实反汇编。
+
+\begin{keyidea}
+结构体 ABI 分析至少要同时看四件事：字段布局、eightbyte 分类、寄存器容量、C++ 类型是否平凡。只看 \code{sizeof} 或只看字段个数都不够。
+\end{keyidea}
+
 \section{caller-saved 和 callee-saved}
 
 寄存器数量有限。函数调用前后，哪些寄存器可以被破坏？哪些必须保持？ABI 用 caller-saved 和 callee-saved 分工。
@@ -475,6 +780,20 @@ callee-saved & \register{rbx}、\register{rbp}、\register{r12}--\register{r15} 
 \end{center}
 
 为什么这样分？如果所有寄存器都由调用者保存，每次调用都很重；如果所有寄存器都由被调用者保存，每个函数入口都很重。ABI 把一部分寄存器定义为 caller-saved，适合短生命周期临时值；把另一部分定义为 callee-saved，适合跨调用仍要保留的值。
+
+\subsection{保存责任的真正含义}
+
+caller-saved 和 callee-saved 不是寄存器用途分类，而是责任分类。caller-saved 寄存器不是“只能调用者使用”，callee-saved 寄存器也不是“只能被调用者使用”。任何函数都可以使用大多数通用寄存器，区别在于跨越一次调用边界时，谁必须承担让某个值继续有效的成本。
+
+如果调用者有一个值放在 \register{rax}，并且调用另一个函数后还要使用这个值，那么调用者不能指望被调用者保持 \register{rax} 不变。它必须在调用前把这个值保存到别的地方，例如 callee-saved 寄存器、栈槽，或者重新计算。反过来，如果被调用者想使用 \register{rbx}，它可以使用，但必须在返回前把调用者原来的 \register{rbx} 恢复。调用者看到的是“调用前后的 \register{rbx} 没变”，至于被调用者中间怎样使用，调用者不关心。
+
+这个责任模型给编译器寄存器分配器提供了成本选择。生命周期很短、不会跨调用的临时值，放在 caller-saved 寄存器通常便宜，因为不需要函数入口额外保存。生命周期较长、要跨多个调用的值，放在 callee-saved 寄存器可能更合适，因为只在函数入口和出口保存一次，而不是每个调用点保存一次。当然，具体选择还受优化级别、寄存器压力、内联决策、异常路径和调试信息影响。
+
+手写汇编时，最稳妥的思路是先列出自己会修改的寄存器，再按 ABI 分组。对 caller-saved 寄存器，如果你的函数不需要在调用后保留其中某个值，可以直接使用；如果你自己在调用别的函数前仍然需要它，就由你作为调用者保存。对 callee-saved 寄存器，只要你修改了它，就必须保证返回给你的调用者时恢复原值。这个规则与函数是否崩溃无关，是二进制接口正确性的最低要求。
+
+\begin{deepdive}
+保存 callee-saved 寄存器不一定非要用 \instruction{push} 和 \instruction{pop}。编译器也可能把它们保存到栈帧固定偏移，或者在 shrink wrapping 优化下只在真正需要的分支保存和恢复。判断是否遵守 ABI，要看所有返回路径上调用者原值是否恢复，而不是机械要求函数开头必须有某种序言。
+\end{deepdive}
 
 \subsection{callee-saved 示例}
 
@@ -530,6 +849,42 @@ ret
 \begin{deepdive}
 callee-saved 不是说这个寄存器“不能用”。它的意思是：可以用，但你要把调用者看到的旧值还回去。常见保存方式是 \instruction{push} 和 \instruction{pop}，也可以保存到栈帧中的固定偏移。
 \end{deepdive}
+
+\subsection{caller-saved 示例}
+
+再看 caller-saved 的情况。假设一个函数要计算两个 helper 的结果，并且第一个结果在第二次调用后还要继续使用：
+
+\begin{lstlisting}[language=C++]
+extern "C" long f(long);
+extern "C" long g(long);
+
+extern "C" long combine(long x)
+{
+    long a = f(x);
+    long b = g(x + 1);
+    return a + b;
+}
+\end{lstlisting}
+
+\code{f} 的返回值在 \register{rax}。但随后调用 \code{g} 时，\register{rax} 属于 caller-saved，\code{g} 可以合法覆盖它。因此编译器必须在调用 \code{g} 前保存 \code{a}，可能放到 \register{rbx}，也可能放到栈槽：
+
+\begin{lstlisting}
+combine:
+    push rbx
+    call f
+    mov  rbx, rax
+    lea  rdi, [original_x + 1]
+    call g
+    add  rax, rbx
+    pop  rbx
+    ret
+\end{lstlisting}
+
+这段伪汇编故意省略了 \code{x} 的保存细节，因为真实编译器可能用不同方式保留原始参数。重点是：\code{a} 不能指望留在 \register{rax} 里跨过 \code{g} 的调用。caller-saved 的“可被破坏”不是坏事，它让被调用者能自由使用这些寄存器，减少小函数保存成本。
+
+\begin{warningbox}
+如果你在手写汇编里调用 C++ helper，然后继续使用 \register{rdi}、\register{rsi}、\register{rax}、\register{rcx} 等 caller-saved 寄存器中的旧值，必须先确认这些旧值已经被保存。helper 即使今天没有改它们，也没有 ABI 义务替你保留。
+\end{warningbox}
 
 \section{栈对齐规则}
 
@@ -588,6 +943,24 @@ add rsp, 8:
 手写汇编调用 C/C++ 函数时，最常见错误之一就是忘记在 \instruction{call} 前对齐 \register{rsp}。这种错误可能在简单测试里不暴露，换一个编译器版本、库函数或 CPU 状态就崩。
 \end{warningbox}
 
+\subsection{对齐规则怎样推导}
+
+栈对齐最容易背错，因为入口状态和调用点状态差 8 字节。记住一个事实就够：\instruction{call} 会把 8 字节返回地址压栈。ABI 要求调用点执行 \instruction{call} 之前 \register{rsp} 是 16 字节对齐；所以被调用者刚进入时，\register{rsp} 指向返回地址，数值自然变成 8 mod 16。换句话说，被调用者入口通常满足 \code{rsp + 8} 是 16 字节对齐，而不是 \code{rsp} 本身 16 字节对齐。
+
+如果一个函数不再调用别的函数，它可以在很多情况下不调整栈，只要自己的局部访问和返回满足要求。若它要调用其他函数，就必须在自己的调用点前把 \register{rsp} 调到 16 字节对齐。于是一个没有其它栈需求的非叶子手写函数，经常在入口后执行 \instruction{sub rsp, 8}，调用结束后再 \instruction{add rsp, 8}。这不是为了“申请一个有用变量”，而是为了抵消入口处的 8 字节偏移。
+
+如果函数还要保存 \register{rbx} 或其它寄存器，\instruction{push} 本身也会改变对齐。例如入口 \code{rsp mod 16 = 8}，执行一次 \instruction{push rbx} 后，\code{rsp mod 16 = 0}，此时如果马上调用别的函数，栈对齐可能已经满足。若再额外 \instruction{sub rsp, 8}，反而会破坏调用点对齐。真实函数的栈调整必须把返回地址、保存寄存器、局部空间和调用前对齐一起计算。
+
+\subsection{栈对齐错误为什么难复现}
+
+栈对齐错误常表现得不稳定。一个错误函数可能在本机、当前优化级别、当前 libc 版本下运行正常，因为被调用路径没有使用对齐敏感指令，或者未对齐访问被硬件以较高代价处理了。换一台机器、换一个编译器版本、打开不同优化选项、链接到不同库实现，错误就可能变成崩溃或数据错误。
+
+这类问题不能用“我运行了一次没崩”证明正确。正确证明应来自规则推导和反汇编检查：函数入口 \register{rsp} 余数是多少，执行每条 \instruction{push}、\instruction{sub rsp, ...} 后余数怎样变化，每个 \instruction{call} 前是否回到 0 mod 16，返回前是否恢复到入口对应状态。实验可以帮助暴露错误，但 ABI 正确性首先是静态契约问题。
+
+\begin{keyidea}
+栈对齐分析要按时间线做模 16 计算。入口、保存寄存器、申请局部空间、调用点、恢复路径，每一步都要算；不能只看函数里有没有某条固定的 \instruction{sub rsp, 8}。
+\end{keyidea}
+
 \section{栈帧、帧指针和局部变量}
 
 带帧指针的函数常见形态：
@@ -640,6 +1013,26 @@ clang++ -std=c++20 -O3 -fno-omit-frame-pointer ...
 
 是否保留帧指针是性能、调试、profiling 之间的工程权衡。现代生产服务常为了 profiler 可用性保留帧指针。
 
+\subsection{栈帧不是语言变量表}
+
+栈帧经常被讲成“存放局部变量的地方”，这句话太粗。优化后的栈帧可能没有某些源码局部变量，因为它们被寄存器保存、被常量折叠、被完全消除，或者生命周期被拆散。栈帧里也可能有源码里看不见的内容，例如保存的 callee-saved 寄存器、对齐填充、spill slot、临时对象、异常处理需要的状态、调用其它函数前准备的栈参数区。
+
+因此，读栈帧时不要从变量名出发，而要从用途出发。一个槽可能用于保存 \register{rbx}；一个槽可能用于把 \register{xmm0} 溢出到内存；一个槽可能是为了让局部数组有稳定地址；一个槽可能只是为了维持对齐。调试信息会把部分机器位置映射回源码变量，但高优化级下这种映射可能是分段的、变化的，甚至在某些指令范围内不可用。
+
+这对 GDB 学习很重要。你在 \code{-O0} 下看到 \code{x} 总在 \code{[rbp - 4]}，不代表 \code{x} 在机器模型中天然属于那个地址。到了 \code{-O3}，同一个值可能在 \register{eax}，可能被合并进另一条指令，可能根本没有单独实体。ABI 只要求函数边界遵守约定，不要求函数内部保留源码变量的外观。
+
+\subsection{帧指针、展开信息和调用链}
+
+调试器和 profiler 要恢复调用链，通常需要知道每一层函数的返回地址在哪里、上一层栈位置在哪里、哪些寄存器被保存到哪里。保留帧指针是一种简单而稳定的方式：每个函数把旧 \register{rbp} 保存起来，并让新 \register{rbp} 指向当前帧基准，形成一条链。沿着这条链，工具可以较容易地找到上一帧。
+
+但现代编译器即使省略帧指针，也可以通过 DWARF CFI 等展开信息描述如何从当前指令位置恢复调用者状态。这些信息不是 CPU 执行用的，而是调试、异常处理、栈回溯和性能采样工具使用的元数据。只要展开信息完整，省略帧指针的程序也可以正确回溯；但在生产性能采样、异步采样、JIT、手写汇编或部分 stripped binary 场景中，展开信息可能不完整或工具支持不足，保留帧指针就变得很有价值。
+
+手写汇编如果要参与可靠回溯和异常边界，不能只写能运行的指令，还要考虑函数符号、\code{.type}、\code{.size}、CFI 指令和栈变化描述。本册的基础实验先关注普通调用正确性；工程级汇编库还必须让调试器和 profiler 看得懂。
+
+\begin{deepdive}
+ABI 的“函数边界”不只服务调用者和被调用者，也服务工具。一次采样落在函数中间时，profiler 需要根据当前 \register{rsp}、保存寄存器和展开规则找到上一层调用者。栈帧写得越偏离约定，工具越依赖你提供准确元数据。
+\end{deepdive}
+
 \section{red zone}
 
 System V AMD64 ABI 定义了 \term{red zone}{红区}：用户态函数入口时，\register{rsp} 下方 128 字节区域可以被叶子函数临时使用，而不必移动 \register{rsp}。
@@ -679,6 +1072,18 @@ red zone 的限制：
 \begin{lstlisting}[language=bash]
 clang++ -std=c++20 -O3 -mno-red-zone ...
 \end{lstlisting}
+
+\subsection{red zone 的工程边界}
+
+red zone 的价值是减少叶子函数调整栈指针的开销。一个小叶子函数如果只需要少量临时内存，可以直接使用 \register{rsp} 下方空间，不必执行 \instruction{sub rsp, ...} 和 \instruction{add rsp, ...}。这能减少指令，也让某些短函数更紧凑。
+
+但 red zone 不是“栈下面永远安全的 128 字节”。它成立的前提是 System V 用户态 ABI 保证异步信号处理不会破坏这片区域，并且当前函数不执行会覆盖该区域的普通调用。一旦进入内核代码、中断上下文、裸机环境，或者使用不遵守该约定的运行环境，这个前提就可能不存在。内核代码常禁用 red zone，因为中断和异常处理可能在当前栈上写入状态。
+
+手写汇编里是否使用 red zone，要看目标环境和函数性质。若函数会调用其他函数，不应把仍然需要的值放在 red zone 里跨越 \instruction{call}。若函数需要被移植到 Windows x64 或内核环境，也不能假设 red zone 存在。若为了简单和可读性，基础实验完全可以不用 red zone，显式调整 \register{rsp} 反而更容易推导。
+
+\begin{warningbox}
+red zone 是 System V 用户态的约定，不是 x86-64 硬件特性，也不是所有平台 ABI 都有。跨平台汇编、内核代码和中断相关代码应主动确认是否允许使用。
+\end{warningbox}
 
 \section{变参函数和 \code{va_list}}
 
@@ -740,6 +1145,43 @@ reg_save_area
 手写汇编调用变参函数时，不能只把参数放到寄存器就结束。尤其是调用带浮点参数的 \code{printf}，还要正确设置 \register{al}。这个细节非常适合实验，因为错误代码有时能运行，有时输出错，有时在不同 libc 或优化级别下表现不同。
 \end{deepdive}
 
+\subsection{为什么变参需要额外规则}
+
+普通函数的被调用者知道完整参数类型。它看到自己的函数签名，就知道第几个参数应该从哪个寄存器或栈槽读取。变参函数不同，省略号后面的参数在被调用者函数类型里没有逐项写出。被调用者只能通过格式串、约定或调用者与被调用者共同理解的协议来解释后续参数。
+
+这会带来两个问题。第一，寄存器参数在函数入口后可能被覆盖，但 \code{va_start} 后仍要能依次访问变参。因此编译器通常要建立寄存器保存区，把可能参与变参访问的通用寄存器和浮点寄存器内容保存到一个已知布局中。第二，整数和浮点使用不同寄存器通道，被调用者需要知道浮点寄存器中到底有多少个有效变参或至少知道一个上界，才能正确初始化访问状态。System V AMD64 中 \register{al} 的约定就服务于这个目的。
+
+这解释了为什么调用 \code{printf} 前常能看到 \code{xor eax, eax} 或 \code{mov eax, 1}。这条指令并不是给 \code{printf} 的第一个整数参数赋值，也不是清空返回值；它是在调用变参函数前设置 ABI 要求的隐藏调用状态。读汇编时如果不知道这条规则，很容易把它误解成无意义的优化器习惯。
+
+变参函数也说明 ABI 不是只关心显式参数表。有些调用状态不会出现在 C++ 函数声明中，但仍然是二进制契约的一部分。手写汇编调用普通函数时，参数放对位置通常就够；手写汇编调用变参函数时，还要考虑 \register{al}、默认参数提升、格式串与实参类型匹配、栈对齐和寄存器保存区等细节。
+
+\begin{warningbox}
+C/C++ 的变参函数没有运行时类型检查。格式串写 \code{\%f}，但调用者没有按 ABI 传入 \code{double}，被调用者仍会按 \code{double} 解释某个位置的字节。许多变参错误不会在编译或链接阶段暴露，而是在运行时输出错值或破坏栈/寄存器解释。
+\end{warningbox}
+
+\subsection{默认参数提升和格式串必须一致}
+
+C 风格变参还有一个语言层规则：默认参数提升。传给省略号的 \code{float} 会提升为 \code{double}，小于 \code{int} 的整数类型通常提升为 \code{int} 或 \code{unsigned int}。这意味着 \code{printf("\%f", x)} 期望的不是 \code{float} ABI 形态，而是 \code{double} 形态；\code{printf("\%hhd", c)} 的实参也通常按 \code{int} 传入，格式串再告诉 \code{printf} 如何解释和打印。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+float f = 1.5f;
+std::printf("%f\n", f);
+\end{lstlisting}
+
+调用点会把 \code{f} 转成 \code{double}，再通过浮点参数通道传递。手写汇编若把 32 位 float 原样放进 \register{xmm0} 的低 32 位，却让格式串写 \code{\%f}，\code{printf} 会按 double 读取，结果就是错误解释。类似地，格式串写 \code{\%d} 时，\code{printf} 会按 \code{int} 从通用参数位置取值；你若只准备了低 8 位字符值，高位不明确，就可能输出奇怪结果。
+
+因此，变参调用要同时满足三层规则：
+
+\begin{enumerate}
+  \item C/C++ 默认参数提升后，实参类型是什么。
+  \item System V ABI 把提升后的实参放在哪里。
+  \item 被调用者的格式串或协议按什么类型读取。
+\end{enumerate}
+
+这三层任何一层错了，编译器和链接器都未必能救你。许多现代编译器会对字面量格式串做警告检查，但手写汇编、动态格式串、跨语言 FFI 和错误声明仍然可能绕过检查。
+
 \section{C++ 名字修饰和 \code{extern "C"}}
 
 ABI 不只包含寄存器和栈，也包含符号名约定。C++ 支持函数重载、命名空间、类成员函数，因此编译器会做 \term{name mangling}{名字修饰}。
@@ -765,6 +1207,227 @@ extern "C" int add(int, int);
 \end{lstlisting}
 
 这样符号名通常就是 \code{add}。本书实验里大量使用 \code{extern "C"}，不是因为 C++ 不好，而是为了让汇编符号名稳定、易读、易链接。
+
+\subsection{\code{extern "C"} 改变什么，不改变什么}
+
+\code{extern "C"} 最常见的作用是改变语言链接规则，让 C++ 编译器使用 C 风格符号名，避免名字修饰带来的链接不匹配。它也禁止同一 C 链接名下的 C++ 重载，因为 C 符号名无法表达参数类型列表。对手写汇编来说，这能让汇编文件导出 \code{asm_add2}，C++ 头文件也声明 \code{asm_add2}，链接器看到的是同一个符号。
+
+但 \code{extern "C"} 不会把函数体变成 C 语言执行，也不会关闭 C++ 类型系统，更不会改变目标平台的底层调用约定。一个 \code{extern "C" double f(double)} 在 System V AMD64 下仍然使用 \register{xmm0} 传参和返回；一个 \code{extern "C" Big make()} 如果返回类型需要 sret，仍然会出现隐藏返回指针。它解决的是符号名和语言链接问题，不是所有 ABI 问题。
+
+还要注意，C++ 对异常、对象生命周期、模板实例、内联函数、命名空间和类成员函数有自己的 ABI 细节。把某个函数声明成 \code{extern "C"}，通常意味着你在设计一个更简单、更稳定的二进制边界：参数和返回类型应尽量使用普通标量、指针或明确布局的平凡结构体；不要让 C++ 异常跨越不理解异常 ABI 的语言边界；不要把 STL 容器对象作为长期稳定 ABI 直接暴露给外部模块。
+
+\begin{keyidea}
+\code{extern "C"} 主要稳定符号名，不自动保证接口稳定。真正稳定的 ABI 还需要稳定的类型大小、对齐、字段布局、调用约定、内存所有权、错误处理方式和版本策略。
+\end{keyidea}
+
+\section{引用、指针和成员函数的隐藏参数}
+
+C++ 源码里有些东西看起来不是指针，但 ABI 层经常表现为地址。最常见的是引用、非静态成员函数的 \code{this}、大对象传参和某些非平凡对象。读汇编时，如果只盯着源码表面类型，会把地址当成数值，把隐藏参数当成显式参数。
+
+\subsection{引用通常以地址传递}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" void inc_ref(int& x)
+{
+    ++x;
+}
+\end{lstlisting}
+
+源代码里 \code{x} 是引用，不是指针。但在 ABI 层，被调用者需要知道要修改哪个对象，入口通常会收到对象地址：
+
+\begin{lstlisting}
+rdi = address of referenced int object
+inc dword ptr [rdi]
+ret
+\end{lstlisting}
+
+这和下面函数的机器形态很接近：
+
+\begin{lstlisting}[language=C++]
+extern "C" void inc_ptr(int* x)
+{
+    ++*x;
+}
+\end{lstlisting}
+
+区别在 C++ 语义层：引用必须绑定到对象，语法上不可重新绑定，通常不应为空；指针可以为空、可以重新赋值。ABI 层看到的常常都是地址。因此调试崩溃时，\register{rdi} 为 0 可能意味着调用者违反了引用前提，或者你实际分析的是指针接口；不能只从汇编判断完整源语义。
+
+\subsection{非静态成员函数的 \code{this}}
+
+非静态成员函数有一个隐藏的 \code{this} 参数。比如：
+
+\begin{lstlisting}[language=C++]
+struct Counter {
+    int value;
+
+    int add(int x)
+    {
+        value += x;
+        return value;
+    }
+};
+\end{lstlisting}
+
+在 System V AMD64 下，成员函数入口通常类似：
+
+\begin{lstlisting}
+rdi = this pointer
+esi = x
+\end{lstlisting}
+
+函数体可能访问：
+
+\begin{lstlisting}
+add dword ptr [rdi], esi
+mov eax, dword ptr [rdi]
+ret
+\end{lstlisting}
+
+这说明源代码里看起来只有一个显式参数 \code{x}，但机器层第一个通用寄存器被 \code{this} 占用。若成员函数还返回大结构体，隐藏 sret 指针可能进一步占用第一个通用寄存器，\code{this} 再后移。复杂 C++ ABI 中，隐藏参数的顺序要以具体 ABI 和编译器输出为准。
+
+\subsection{成员函数指针不是普通函数指针}
+
+普通函数指针通常就是代码地址或可调用入口地址；C++ 成员函数指针可能要表达虚函数、基类调整、this 调整等信息，不能简单当作 \code{void*} 或普通函数地址处理。第一册不深入成员函数指针 ABI，但要建立底线：不要把成员函数指针传给期待 C 函数指针的接口，也不要在手写汇编里凭直觉调用它。
+
+如果需要给 C 风格回调传入 C++ 对象，常见做法是使用普通函数指针加 \code{void*} 上下文：
+
+\begin{lstlisting}[language=C++]
+using Callback = void (*)(void* context, int value);
+\end{lstlisting}
+
+调用者把对象地址放进 \code{context}，回调函数内部再把它转回具体类型。这种接口虽然朴素，但 ABI 形状清楚：一个函数指针，一个上下文指针，一个整数参数。许多 C 库和系统 API 都采用这种设计。
+
+\begin{keyidea}
+C++ 源码里看不到的参数，机器层可能真实存在：引用对象地址、\code{this} 指针、sret 指针、异常和展开相关状态。分析函数入口时，要先问“有没有隐藏参数”，再给显式参数编号。
+\end{keyidea}
+
+\section{函数调用 ABI 和系统调用 ABI 不同}
+
+本章讨论的是用户态函数之间的 System V AMD64 调用约定。Linux 系统调用使用另一套寄存器约定。用户态函数调用使用 \instruction{call} 进入普通函数，返回地址在用户栈上；系统调用通常使用 \instruction{syscall} 指令进入内核，参数寄存器和破坏寄存器规则与普通函数调用不同。
+
+常见 Linux x86-64 系统调用约定中，系统调用号放在 \register{rax}，参数使用 \register{rdi}、\register{rsi}、\register{rdx}、\register{r10}、\register{r8}、\register{r9}。注意第 4 个参数是 \register{r10}，不是普通函数 ABI 的 \register{rcx}。原因与 \instruction{syscall} 指令本身会使用 \register{rcx} 和 \register{r11} 保存返回相关状态有关。
+
+这一区分很重要。你在 libc 的 \code{write} 包装函数外层看到的是普通 C 函数 ABI；在它内部最终进入内核的那一刻，才会按系统调用 ABI 摆放寄存器。把两套约定混在一起，会导致手写汇编系统调用、调试 libc、阅读 strace 与 objdump 对照时全部错位。
+
+\begin{warningbox}
+System V AMD64 函数调用约定不等于 Linux syscall 约定。普通函数第 4 个整数参数常在 \register{rcx}，系统调用第 4 个参数常在 \register{r10}。看到 \instruction{syscall} 时必须切换规则。
+\end{warningbox}
+
+\section{动态库边界和 ABI 稳定性}
+
+ABI 最有工程重量的地方，是动态库和长期发布的二进制接口。一个静态链接、全量重新编译的小程序，很多类型和调用边界变化都能被编译器同时更新；一个已经发布的共享库则不同。外部程序可能只拿到头文件和 \code{.so}，按旧头文件编译好的二进制会在运行时加载你的新库。如果你改变了导出函数的参数类型、返回类型、结构体布局、符号名或异常边界，就可能破坏旧程序。
+
+例如，库版本一导出：
+
+\begin{lstlisting}[language=C++]
+extern "C" Result query(Context*, int);
+\end{lstlisting}
+
+如果版本二把 \code{Result} 从两个 \code{long} 字段改成三个 \code{long} 字段，源码看起来只是多了一个字段，但 ABI 形状可能从 \register{rax}/\register{rdx} 返回变成隐藏 sret 指针返回。旧调用者仍然按旧规则从寄存器取结果，新库却按新规则把第一个寄存器解释为输出地址，这就是灾难级不兼容。
+
+再比如把结构体字段顺序改变，可能导致旧调用者写入的 offset 与新库读取的 offset 不一致；把 \code{int} 改成 \code{long}，可能改变寄存器中有效位宽和符号扩展预期；把 C 符号改成 C++ 重载符号，可能让动态链接器找不到旧符号；让异常跨越 C ABI 边界，可能让不理解 C++ 异常运行时的调用方无法正确清理。
+
+因此，稳定 ABI 设计通常会采用更保守的接口风格：使用不透明指针隐藏内部结构体；用显式版本号和大小字段描述可扩展结构；通过函数返回错误码或明确的错误对象处理失败；避免把 C++ 标准库类型、模板类型和非平凡对象直接暴露在二进制边界上；需要升级时保留旧符号或使用符号版本机制。
+
+本册不是动态链接专著，但学习 ABI 时必须形成这个工程意识：ABI 不是写汇编才需要关心的冷门知识，它是库作者、性能工程师、语言互操作工程师和系统调试人员共同依赖的契约。
+
+\subsection{不透明指针：把布局变化藏起来}
+
+稳定 C ABI 常用不透明指针：
+
+\begin{lstlisting}[language=C++]
+extern "C" Context* context_create();
+extern "C" void context_destroy(Context*);
+extern "C" int context_query(Context*, int key, long* value_out);
+\end{lstlisting}
+
+调用者只知道 \code{Context*} 是一个句柄，不知道 \code{Context} 内部字段。库可以在新版本中改变 \code{Context} 的大小、字段顺序、内部缓存和锁，只要创建、销毁和查询函数保持 ABI 兼容，旧调用者就不需要重新理解内部布局。这比把结构体定义暴露在头文件里稳定得多。
+
+不透明指针的代价是调用者不能在栈上直接分配对象，也不能内联访问字段；所有操作都要通过函数调用。但在动态库、插件和跨语言边界上，这个代价通常值得。它把“对象内部实现”从 ABI 中移出去，只把“句柄和函数”作为稳定接口。
+
+\subsection{带大小字段的可扩展结构}
+
+有时接口必须让调用者传入一个结构体，例如配置参数。为了允许未来扩展，常见设计是把结构体大小或版本号放在第一个字段：
+
+\begin{lstlisting}[language=C++]
+struct Options {
+    std::uint32_t size;
+    std::uint32_t version;
+    std::uint32_t flags;
+    std::uint32_t reserved;
+};
+
+extern "C" int run_with_options(const Options* options);
+\end{lstlisting}
+
+调用者把 \code{size} 设置为自己编译时看到的 \code{sizeof(Options)}。库收到后，先检查 \code{size}，只读取调用者保证存在的字段。未来版本可以在结构体末尾添加字段，旧调用者传来的 \code{size} 较小，新库就不会越界读取；新调用者传给旧库时，旧库也可以根据版本和大小拒绝或忽略新字段。
+
+这种设计不能随便改变已有字段的 offset、类型和含义。它只适合在末尾追加字段，并保持对齐和默认值策略清楚。若把中间字段重排，\code{size} 也救不了旧 ABI。
+
+\subsection{内存所有权也是 ABI}
+
+ABI 不只规定寄存器，还规定跨边界对象由谁分配、谁释放、用哪个分配器释放。例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" char* make_message();
+extern "C" void free_message(char*);
+\end{lstlisting}
+
+如果库用自己的 allocator 分配字符串，调用者就不应该用另一个运行时的 \code{free} 或 \code{delete[]} 释放。跨动态库、跨语言、跨运行时边界时，分配器不匹配会导致堆损坏。稳定 ABI 通常让“创建”和“销毁”成对出现在同一库接口里，或要求调用者提供 buffer：
+
+\begin{lstlisting}[language=C++]
+extern "C" int write_message(char* buffer, std::size_t buffer_size);
+\end{lstlisting}
+
+后者把内存所有权留给调用者，库只写入调用者提供的空间。接口更繁琐，但所有权更清楚。
+
+\begin{keyidea}
+公开 ABI 设计的核心是减少二进制边界上的假设：隐藏内部布局，显式记录大小和版本，明确内存所有权，保留旧符号或旧入口，不让调用者猜实现细节。
+\end{keyidea}
+
+\section{尾调用和 ABI 边界}
+
+优化后的汇编中，函数结尾有时不是 \instruction{call} 后再 \instruction{ret}，而是直接 \instruction{jmp} 到另一个函数。这叫尾调用优化或 sibling call。它能复用当前栈帧，避免额外返回地址和调用开销。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" long target(long);
+
+extern "C" long wrapper(long x)
+{
+    return target(x);
+}
+\end{lstlisting}
+
+优化后可能是：
+
+\begin{lstlisting}
+wrapper:
+    jmp target
+\end{lstlisting}
+
+这不是普通跳转 bug，而是合法优化：\code{wrapper} 不需要在 \code{target} 返回后再做任何工作，所以可以让 \code{target} 直接返回给 \code{wrapper} 的调用者。
+
+\subsection{尾调用必须满足 ABI 前提}
+
+尾调用不是随便把 \instruction{call} 换成 \instruction{jmp}。编译器必须保证跳转目标看到的入口状态符合 ABI：参数已经放在正确位置，栈指针处于目标函数期望的调用边界状态，当前函数需要恢复的 callee-saved 寄存器已经恢复，局部栈空间已经释放，返回值语义等价。若这些条件不满足，就不能简单尾跳。
+
+例如当前函数修改了 \register{rbx}，在尾跳前必须先恢复 \register{rbx}。当前函数申请了栈空间，尾跳前必须把 \register{rsp} 恢复到调用者期望状态。当前函数需要把参数重排给目标函数，必须在跳转前完成，且不能破坏仍需要的值。若目标函数参数比当前函数更多，或需要额外栈参数，尾调用可能仍然可行，但条件更复杂。
+
+手写汇编里使用尾跳尤其要谨慎。你不能因为“最后一步就是调用另一个函数”就直接 \instruction{jmp}，而要检查所有 ABI 清单。错误尾跳常表现为调用栈缺失、返回地址错乱、callee-saved 寄存器破坏或目标函数读到错误栈参数。
+
+\subsection{尾调用对调试和 profiling 的影响}
+
+尾调用会改变调用栈外观。源码层看起来有 \code{wrapper -> target}，但机器栈上可能没有 \code{wrapper} 的独立返回帧。GDB、profiler 或崩溃回溯中，\code{wrapper} 可能不出现，或只通过调试信息以特殊形式显示。性能分析时，这可能让热点归因直接落到 \code{target}，而不是包装函数。
+
+这不是工具错误，而是机器码真的没有普通调用帧。若你需要在调试时保留完整调用链，可以降低优化级别或使用编译器选项限制 sibling call；若你在阅读优化构建，就要接受源码调用链和机器调用链可能不同。
+
+\begin{warningbox}
+尾调用优化后的 \instruction{jmp} 仍然是 ABI 边界。目标函数必须看到合法入口状态；当前函数必须先完成自己的保存寄存器、栈恢复和参数重排责任。
+\end{warningbox}
 
 \section{手写汇编函数的最低正确性清单}
 
@@ -801,6 +1464,698 @@ asm_add2:
 \begin{lstlisting}[language=C++]
 extern "C" int asm_add2(int, int);
 \end{lstlisting}
+
+\section{ABI 错误的诊断方法}
+
+ABI 错误的麻烦之处在于，它们经常表现为“离错误很远的地方坏掉”。一个函数忘记恢复 \register{rbx}，真正崩溃的可能是它的调用者之后访问某个数据结构；一个函数调用前栈未对齐，崩溃点可能出现在 libc 内部的 SIMD 指令；一个返回大结构体的函数签名不匹配，表面现象可能是某个无关指针被写坏。诊断时不能只盯着崩溃那条指令，而要回到最近的二进制边界。
+
+实用诊断步骤如下。第一，确认目标平台和调用约定，避免把 Windows x64、System V AMD64、Linux syscall、编译器特殊属性混用。第二，核对声明和定义：C++ 头文件、汇编符号、目标文件导出符号、链接器实际绑定的符号是否一致。第三，根据函数签名手工推导入口状态，并与反汇编调用点比较。第四，检查被调用函数是否修改了 callee-saved 寄存器、是否恢复 \register{rsp}、是否在所有返回路径上满足规则。第五，如果函数内部还调用别的函数，逐个调用点计算栈对齐和 caller-saved 值保存。第六，用 GDB 在调用前、入口、返回前、返回后三个位置记录关键寄存器和栈顶内容。
+
+一个好的 ABI 调试记录不需要贴满整页反汇编。它应该抓住边界状态。例如：
+
+\begin{lstlisting}
+before call:
+    rdi = pointer p
+    esi = n
+    rsp mod 16 = 0
+
+callee entry:
+    rsp points to return address
+    rsp mod 16 = 8
+    rdi still equals p
+    esi still equals n
+
+before callee ret:
+    rax = expected result
+    rsp restored to entry value
+    rbx equals original caller value
+\end{lstlisting}
+
+这类记录能证明函数是否遵守契约，而不是只证明某次输出碰巧正确。尤其是手写汇编实验，必须把“运行结果正确”和“ABI 规则正确”分开。一个坏函数可能在特定测试输入下返回正确数值，但仍然破坏调用者寄存器；这样的函数不能算通过。
+
+\subsection{常见错误模式}
+
+第一类错误是参数错位。常见原因包括忘记浮点和整数参数分通道计数、忘记大结构体返回的隐藏指针、把 Windows x64 寄存器顺序套到 System V、把系统调用约定套到普通函数。表现可能是第一个参数看起来变成地址、第二个参数变成第一个显式参数，或者浮点值全错。
+
+第二类错误是保存责任错位。手写汇编修改 \register{rbx}、\register{r12} 到 \register{r15} 后直接返回，调用者后续状态被破坏；或者调用 C++ helper 后继续相信 \register{rax}、\register{rcx}、\register{rdi} 中旧值还在。表现可能是返回后某个循环变量、对象指针或累加器突然变化。
+
+第三类错误是栈状态错误。包括调用前未对齐、返回前 \register{rsp} 没恢复、额外弹出栈参数、保存和恢复数量不匹配、某条错误路径提前返回。表现可能是 \instruction{ret} 跳到奇怪地址、GDB 回溯断裂、库函数内部崩溃、异常展开失败。
+
+第四类错误是符号和链接边界错误。C++ 声明没有 \code{extern "C"}，汇编导出符号名与 C++ 期望不一致，动态库里导出了不同版本符号，或者链接到了另一个同名函数。表现可能是链接失败，也可能是运行时绑定到意外实现。
+
+第五类错误是对象布局和所有权错误。调用双方对结构体大小、字段 offset、对齐、返回方式、内存所有权理解不同。表现可能是数值字段错位、隐藏指针写坏内存、释放不属于自己的内存，或者跨库析构时崩溃。
+
+\begin{keyidea}
+ABI 调试要围绕边界状态，而不是围绕源码直觉。调用前、入口、调用内部、返回前、返回后，这几个时间点的寄存器和栈状态，比单独看最终输出更能说明问题。
+\end{keyidea}
+
+\section{ABI 实验报告怎么写}
+
+本章实验的目标不是把命令跑通，而是训练可复现的二进制接口分析。报告应包含五部分。
+
+第一，环境和构建条件。写清楚 CPU 架构、操作系统、编译器名称和版本、优化级别、是否保留帧指针、是否使用 PIE、源文件列表和构建命令。ABI 现象会受平台和编译选项影响，缺少这些信息，别人无法复现实验。
+
+第二，函数签名和手工 ABI 推导。对每个被分析函数，先列出返回类型、参数类型、预期参数位置、返回位置、是否存在栈参数、是否可能存在隐藏 sret 指针。这个推导要写在反汇编之前，因为它是你判断反汇编的标准。
+
+第三，反汇编证据。只摘取与结论相关的指令：调用点如何放置参数，被调用者如何读取参数，返回值如何写入，保存寄存器如何入栈和出栈，调用前如何调整 \register{rsp}。不要把完整 objdump 无筛选粘贴进报告。大段原始输出会掩盖分析，也不会提高质量。
+
+第四，动态观察。用 GDB 或同类工具在关键位置记录寄存器、栈顶、返回地址和内存写入。记录应对应你的推导。例如证明第 7 个参数在 \code{[rsp + 8]}，就要在函数入口停住并查看该地址；证明 \register{rbx} 被恢复，就要记录调用前和返回后的值。
+
+第五，结论和边界。说明哪些现象是 ABI 规则必然导致，哪些是当前编译器在当前优化级别下的选择，哪些只是实验中观察到但不能推广的现象。例如“第一个整数参数在 \register{rdi}”属于 ABI 规则；“编译器选择用 \register{rbx} 保存某个局部值”属于编译器选择；“这次错误栈对齐没有崩溃”只是实验现象，不能作为正确性结论。
+
+\begin{warningbox}
+高质量实验报告不靠代码量取胜。真正重要的是：推导是否清楚，证据是否对应结论，是否区分规则、观察和推测，是否能让别人按同样条件复现。
+\end{warningbox}
+
+\section{ABI 推导要从函数类型开始}
+
+ABI 分析最常见的坏习惯，是先看反汇编，再反过来猜参数。正确顺序应该相反：先从函数类型推导调用边界应该是什么，再用反汇编验证编译器或手写汇编是否满足。函数类型包括返回类型、每个参数的类型、是否为成员函数、是否为变参函数、是否有隐藏返回指针、是否经过 \code{extern "C"} 暴露、是否跨动态库边界。缺少这些信息，只凭寄存器很容易误判。
+
+一个 ABI 推导表至少包含：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.32\linewidth}p{0.30\linewidth}}
+\toprule
+项目 & 要问的问题 & 证据来源 \\
+\midrule
+返回类型 & 寄存器返回、内存返回还是无返回值 & 函数声明、类型大小、平凡性 \\
+显式参数 & 每个参数属于整数、指针、浮点、向量还是聚合 & 函数声明、类型定义 \\
+隐藏参数 & 是否有 \code{this}、sret、虚调用辅助信息 & C++ 语义、返回类型、成员函数形式 \\
+栈参数 & 寄存器通道是否耗尽，是否有溢出到栈 & 参数列表、ABI 分类 \\
+保存责任 & 调用者和被调用者各自要保存什么 & System V 规则、函数内部调用情况 \\
+可见符号 & 链接器看到的名字是什么 & \code{nm}、\code{readelf -s}、\code{extern "C"} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+推导表写完后，再看调用点。调用点应当把参数放到正确寄存器或栈位置，满足调用前栈对齐，处理变参所需的额外状态，并在调用后从正确位置取返回值。接着看被调用者入口。被调用者不需要知道调用者源码长什么样，它只依赖 ABI 状态：寄存器里有什么，栈顶是什么，哪些寄存器可自由使用，哪些必须恢复。
+
+\subsection{同一段机器码在不同声明下含义不同}
+
+假设有一个手写汇编函数：
+
+\begin{lstlisting}
+asm_f:
+    mov eax, edi
+    add eax, esi
+    ret
+\end{lstlisting}
+
+若 C++ 声明是：
+
+\begin{lstlisting}[language=C++]
+extern "C" int asm_f(int, int);
+\end{lstlisting}
+
+它可以解释为返回两个 \code{int} 参数之和。若声明错误地写成：
+
+\begin{lstlisting}[language=C++]
+extern "C" long asm_f(long, long);
+\end{lstlisting}
+
+机器码仍然只写 \register{eax}，高 32 位被清零，返回值语义就不是 64 位 signed 加法。若声明写成：
+
+\begin{lstlisting}[language=C++]
+extern "C" double asm_f(double, double);
+\end{lstlisting}
+
+调用者会把参数放入 \register{xmm0}、\register{xmm1}，而汇编函数读取 \register{edi}、\register{esi}，完全错位。运行可能没有立刻崩溃，但结果没有 ABI 意义。
+
+这说明 ABI 正确性是“声明、调用点、被调用实现”三方一致，不是单个函数看起来能运行。跨语言、跨文件、跨动态库时，头文件就是契约的一部分。任何一方对类型、返回方式、符号名、所有权理解不同，都会形成 ABI 错误。
+
+\section{栈对齐要按时间点计算}
+
+栈对齐规则容易背错，原因是很多资料只说“16 字节对齐”，却不说明是调用前、调用后还是函数入口。System V AMD64 的实用读法是：调用者在执行 \instruction{call} 前，要让栈满足被调用者 ABI 期望；\instruction{call} 会把 8 字节返回地址压栈，所以被调用者入口看到的 \register{rsp} 通常与 16 字节边界相差 8。被调用者若还要调用其他函数，就要在自己的调用点前重新调整。
+
+用时间线写更清楚：
+
+\begin{lstlisting}
+caller before call:
+    rsp mod 16 = 0
+
+call target:
+    push return address
+
+callee entry:
+    rsp mod 16 = 8
+    [rsp] = return address
+
+callee before nested call:
+    adjust stack if needed
+    rsp mod 16 = 0
+\end{lstlisting}
+
+具体函数中，\instruction{push rbp}、保存 callee-saved 寄存器、\instruction{sub rsp, N} 都会改变对齐。不要只看 \instruction{sub rsp, 8} 或 \instruction{sub rsp, 16} 单条指令，要从入口一路累计。若函数是 leaf 且不调用其他函数，可能根本不调整栈；若使用 red zone，可能在 \register{rsp} 下方放临时数据但不移动 \register{rsp}；若需要对齐局部对象或调用需要栈参数的函数，调整会更复杂。
+
+\subsection{栈对齐错误为什么有时不崩溃}
+
+错误栈对齐不一定每次立即崩溃。若被调用函数只使用整数寄存器，可能暂时看不出问题；若库函数内部使用要求对齐的 SIMD load/store，才可能触发异常或显著变慢；若编译器选择了不要求对齐的指令，也可能只是性能下降。不能用“一次运行没崩溃”证明栈对齐正确。
+
+诊断栈对齐时，要在每个调用点前记录 \code{rsp mod 16}，而不是只在函数入口看一次。手写汇编里尤其要检查所有路径：正常路径、错误路径、早返回路径、尾调用路径。一个路径多 \instruction{push} 少 \instruction{pop}，或在 \instruction{ret} 前没有恢复 \register{rsp}，可能直到返回很久以后才表现为崩溃。
+
+\subsection{栈参数和返回地址的相对位置}
+
+函数入口处，\register{rsp} 指向返回地址。若有栈上传入的参数，它们位于返回地址之上。也就是说，入口 \code{[rsp]} 是返回地址，\code{[rsp + 8]} 才是第一个栈参数位置，具体还要考虑调用者传参时的布局和类型宽度。若被调用者执行 \instruction{push rbp} 或 \instruction{sub rsp, N}，这些相对 \register{rsp} 的偏移会变化；用 \register{rbp} 建帧时，栈参数常可以用正偏移访问。
+
+初学者常把局部变量和栈参数混在一起。局部变量通常在当前函数调整后的栈空间中，属于被调用者自己的临时存储；栈参数由调用者放置，属于调用边界的一部分。两者都在栈上，但所有权和生命周期不同。报告中应分别写“入口栈参数位置”和“函数内部局部栈槽位置”。
+
+\section{聚合类型传参：不要只看大小}
+
+结构体、数组包装类型、\code{std::pair}、小向量和自定义类的 ABI 分类比整数参数复杂。第一册不要求背完整 System V 分类算法，但必须避免一个错误直觉：不是“结构体小就一定放寄存器，大就一定放栈”这么简单。大小、字段类型、对齐、是否跨 eightbyte、是否包含浮点、是否非平凡拷贝/析构，都会影响传参和返回方式。
+
+\subsection{小结构体可能拆到多个寄存器}
+
+例如：
+
+\begin{lstlisting}[language=C++]
+struct PairI {
+    int a;
+    int b;
+};
+
+extern "C" int sum_pair(PairI p)
+{
+    return p.a + p.b;
+}
+\end{lstlisting}
+
+\code{PairI} 通常可以放在一个 eightbyte 中，通过一个整数寄存器传递。被调用者可能用移位或高低半部分提取字段。若是：
+
+\begin{lstlisting}[language=C++]
+struct TwoLong {
+    long a;
+    long b;
+};
+\end{lstlisting}
+
+它可能占两个 eightbyte，分别通过两个整数寄存器传递。报告中若只写“结构体参数在 \register{rdi}”，可能漏掉第二个寄存器。要根据结构体布局和 ABI 分类写清楚每个 eightbyte 的位置。
+
+\subsection{混合浮点和整数会走不同通道}
+
+例如：
+
+\begin{lstlisting}[language=C++]
+struct Mix {
+    double x;
+    int tag;
+};
+\end{lstlisting}
+
+它可能同时使用浮点寄存器和整数寄存器，具体取决于 ABI 分类和字段布局。调用点可能把 \code{x} 放到 \register{xmm0}，把 \code{tag} 放到某个通用寄存器。若你只按参数序号数通用寄存器，就会错位。混合参数列表也一样：整数通道和 SSE 通道分别计数，\code{int, double, int} 不等于三个都用通用寄存器。
+
+\subsection{非平凡 C++ 类型可能退化为地址传递}
+
+C++ 类型若有非平凡拷贝构造、析构或移动语义，ABI 可能不把它当成普通字节包直接拆寄存器传递，而是通过内存地址间接传递，保证对象生命周期语义。即使大小很小，也不能只凭 \code{sizeof} 判断。阅读 C++ 与汇编接口时，必须检查类型是否是平凡可复制、标准布局、是否有用户定义构造/析构、是否跨翻译单元暴露。
+
+这也是为什么 C ABI 边界常建议使用简单整数、指针和不透明句柄，而不是直接暴露复杂 C++ 类。复杂类型的 ABI 不只与字段字节有关，还与编译器、标准库、异常模型、可见性和版本兼容有关。第一册先建立这个边界，后续工程章节再展开库 ABI 稳定性。
+
+\section{返回值位置要和调用者读取方式配套}
+
+返回值错误经常比参数错误更隐蔽。调用者按照声明决定从哪里读取返回值；被调用者按照实现写某个位置。两者不一致时，可能表现为返回值错、隐藏指针被写坏、栈被破坏，或对象析构异常。
+
+普通整数返回通常在 \register{rax} 的有效低位。返回 \code{int} 只要求低 32 位有意义；返回 \code{bool} 可能只看低 8 位；返回指针或 \code{std::uintptr_t} 需要完整 64 位。若手写汇编函数声明返回指针，却只写 \register{eax}，高 32 位会被清零，地址可能被截断。若声明返回 \code{long}，但实现只做 32 位运算，也可能改变负数扩展语义。
+
+浮点返回通常使用 \register{xmm0}；某些小聚合返回可能使用 \register{rax}/\register{rdx} 或 \register{xmm0}/\register{xmm1}；大结构体返回常使用隐藏 sret 指针。调用者会先准备一块返回对象存储，把指针作为隐藏参数传给被调用者；被调用者把结果写到那里，并可能把该指针也放回 \register{rax}。若手写汇编不知道隐藏参数，就会把第一个显式参数错认为 \register{rdi}，实际 \register{rdi} 可能是返回存储地址。
+
+\subsection{sret 错位的典型症状}
+
+假设 C++ 声明：
+
+\begin{lstlisting}[language=C++]
+struct Big {
+    long a;
+    long b;
+    long c;
+};
+
+extern "C" Big make_big(long x);
+\end{lstlisting}
+
+调用者可能做的是：
+
+\begin{lstlisting}
+rdi = address of caller-provided return storage
+rsi = x
+call make_big
+\end{lstlisting}
+
+若汇编实现误以为 \register{rdi} 是 \code{x}，它就会把返回存储地址当整数参数使用；若它又写 \code{[rdi]}，可能刚好写到返回对象，但字段和参数全错。更糟的是，若它把 \register{rdi} 当普通指针参数解引用，可能破坏调用者栈上的返回对象区域。诊断这种问题的第一步，就是根据返回类型判断是否存在隐藏 sret 指针。
+
+\section{caller-saved 与 callee-saved 是活跃值协议}
+
+很多教材把 caller-saved 和 callee-saved 讲成死记表。更好的理解是：它们规定跨调用的活跃值由谁负责保护。caller-saved 寄存器不是“调用后一定被破坏”，而是“调用者不能要求它保持”。callee-saved 寄存器不是“被调用者不能用”，而是“用了就必须在返回前恢复”。
+
+调用者若有一个值在 \instruction{call} 后还要用，有三种常见选择：放到 callee-saved 寄存器并在当前函数序言/尾声保存恢复；放到栈槽；在调用后重新计算；或者如果值本来在内存中，调用后重新 load。编译器会根据寄存器压力和成本选择。手写汇编必须自己做同样的责任分配。
+
+被调用者若使用 \register{rbx}、\register{rbp}、\register{r12} 到 \register{r15}，通常要保存旧值并在所有返回路径恢复。例如：
+
+\begin{lstlisting}
+push rbx
+mov rbx, rdi
+call helper
+mov rdi, rbx
+call other
+pop rbx
+ret
+\end{lstlisting}
+
+这里 \register{rbx} 用来跨调用保存原始参数。正确性不在于 \register{rbx} 有没有变过，而在于返回给调用者前是否恢复为入口值。若中间有早返回，也必须经过恢复路径。报告中应检查每条 \instruction{ret} 前 callee-saved 状态，而不是只看主路径。
+
+\subsection{caller-saved 失效也包括 flags 和向量寄存器}
+
+普通函数调用后，不仅通用 caller-saved 寄存器不能继续相信，flags 也不能继续相信。不要在 \instruction{cmp} 和 \instruction{jcc} 中间插入普通 \instruction{call} 后还期待 flags 保持。浮点和向量寄存器也有调用约定，某些寄存器属于 caller-saved。若函数调用前后要保留 \register{xmm} 中的值，调用者要自己安排。
+
+内存状态还要看别名和副作用。调用一个未知外部函数后，编译器通常必须假设它可能通过指针、全局变量或可见别名修改内存。若某个 load 在调用前后都出现，不要急着说重复；可能是因为调用使内存值失效，编译器必须重新读取。ABI 规定寄存器保存责任，语言和别名规则规定内存可见性，两者要一起看。
+
+\section{变参函数是 ABI 的压力测试}
+
+变参函数把 ABI 的复杂性集中暴露出来。固定参数部分可以从函数原型知道类型；可变参数部分需要运行时按约定读取。调用者和被调用者必须约定整数寄存器、浮点寄存器和栈参数如何保存到可遍历区域，\code{va_list} 如何描述当前位置，以及调用变参函数时额外状态如何传递。
+
+在 System V AMD64 中，调用变参函数时，\register{al} 常用于表示使用了多少个向量寄存器传递浮点参数。读 \code{printf} 调用汇编时，看到调用前设置 \register{eax} 或 \register{al}，不要误以为它是普通整数参数；它可能是变参 ABI 所需元信息。若手写汇编调用 \code{printf}，忽略这点可能在含浮点参数时出错。
+
+\subsection{格式串错误不是 ABI 能修复的}
+
+\code{printf} 这类函数依赖格式串解释后续参数。ABI 只规定参数如何传递，不知道格式串是否真实匹配。如果格式串写 \code{\%f}，但调用者传了 \code{int}；或格式串写 \code{\%ld}，但传了 \code{int}，被调用者会按错误类型从寄存器保存区或栈中取数据。结果可能是乱码、错位读取或崩溃。这不是 ABI 自动检测的错误，而是调用契约不一致。
+
+默认参数提升也要注意。传给 C 风格变参的 \code{float} 会提升为 \code{double}，小整数会提升为 \code{int} 或 \code{unsigned int}。因此变参调用点的实际 ABI 类型可能不同于源码里字面写的小类型。报告分析变参时，要写“传入变参前经过了哪些提升”，再看寄存器或栈位置。
+
+\section{ABI 稳定性是工程设计问题}
+
+本章主要教你读单个调用点，但真实项目更关心 ABI 是否长期稳定。只要一个函数或类型跨目标文件、动态库、插件、JIT、脚本绑定、手写汇编、FFI 边界暴露，它就变成工程契约。改变参数顺序、返回类型、结构体字段、对齐、异常传播、所有权规则，都可能破坏已有二进制。
+
+\subsection{为什么 C 接口常用不透明句柄}
+
+不透明句柄是一种常见 ABI 设计：
+
+\begin{lstlisting}[language=C++]
+extern "C" Engine* engine_create();
+extern "C" void engine_destroy(Engine*);
+extern "C" int engine_run(Engine*, char const* input);
+\end{lstlisting}
+
+调用者只知道 \code{Engine*} 是一个指针，不知道 \code{Engine} 内部布局。库可以在不改变 ABI 的情况下增删字段、调整容器、替换实现。若直接暴露：
+
+\begin{lstlisting}[language=C++]
+struct Engine {
+    int mode;
+    double threshold;
+    void* impl;
+};
+\end{lstlisting}
+
+那么字段顺序、大小、对齐都进入 ABI。调用者可能在自己的编译单元中按旧 offset 访问字段，库升级后就会错位。不透明句柄牺牲一部分直接访问便利，换来布局演化空间。
+
+\subsection{所有权规则要写进 ABI 文档}
+
+ABI 不只包括寄存器和栈，还包括谁分配、谁释放、能否跨库释放、字符串是否以零结尾、缓冲区长度单位是什么、错误码如何返回、线程安全如何保证。很多跨语言崩溃不是参数寄存器错了，而是所有权错了：一个库用自己的 allocator 分配，另一个模块用不同运行库释放；调用者传入临时缓冲区，被调用者保存指针长期使用；返回字符串没有说明生命周期。
+
+高质量接口文档应写清楚：
+
+\begin{itemize}
+  \item 参数指针是否可为空。
+  \item 缓冲区长度单位是字节、元素还是字符。
+  \item 被调用者是否会写入缓冲区，最多写多少。
+  \item 返回指针由谁释放，用哪个函数释放。
+  \item 错误如何报告，返回值和输出参数在错误时是否有效。
+  \item 回调是否可重入，是否跨线程调用。
+\end{itemize}
+
+这些内容看起来不像“汇编”，但它们决定二进制边界是否可用。底层工程不是只把参数放进正确寄存器，还要让调用双方对对象、内存和错误状态有同一个合同。
+
+\section{ABI 审查清单}
+
+分析或编写一个 ABI 边界函数时，可以按下面清单审查。
+
+\begin{enumerate}
+  \item 声明是否唯一。所有调用方是否包含同一个头文件，是否存在手写重复声明。
+  \item 符号是否匹配。C++ 名字修饰、\code{extern "C"}、可见性、版本脚本是否符合预期。
+  \item 返回方式是否正确。小整数、指针、浮点、小聚合、大聚合、非平凡对象是否按 ABI 返回。
+  \item 参数通道是否正确。整数、指针、浮点、向量、聚合、隐藏参数和栈参数是否逐项推导。
+  \item 栈状态是否正确。入口、调用前、返回前的 \register{rsp} 是否满足规则。
+  \item 保存责任是否正确。callee-saved 寄存器是否所有路径恢复，caller-saved 是否调用后重新建立。
+  \item 变参是否正确。\register{al}、默认提升、格式串和实际参数是否一致。
+  \item 内存所有权是否明确。输入、输出、返回指针、错误路径是否有清晰生命周期。
+  \item 异常和不返回路径是否明确。是否允许 C++ 异常跨 C ABI，\code{[[noreturn]]} 是否被调用者和调用者一致理解。
+  \item 测试是否覆盖边界。负数、大值、空指针、栈参数、浮点参数、大结构体、错误路径是否都测到。
+\end{enumerate}
+
+这张清单的目的不是让每个小函数都写长篇文档，而是在出现跨语言、手写汇编、动态库或性能关键包装时，避免遗漏最常见的灾难点。越是底层边界，越不能靠“看起来能跑”验收。
+
+\section{跨平台 ABI：不要把一套规则带到所有机器}
+
+本章以 Linux 上常见的 System V AMD64 ABI 为主。这个选择是为了让第一册有一个具体、可实验的目标，而不是因为所有 x86-64 平台都这样工作。Windows x64、Linux syscall ABI、macOS 平台约定、AArch64 ABI、RISC-V ABI 都可能在参数寄存器、栈空间、红区、向量寄存器、异常展开、名字修饰和系统调用入口上不同。
+
+最常见的误用是把 Windows x64 的前四个整数参数寄存器 \register{rcx}、\register{rdx}、\register{r8}、\register{r9} 套到 System V 上。System V 常见整数参数顺序是 \register{rdi}、\register{rsi}、\register{rdx}、\register{rcx}、\register{r8}、\register{r9}。如果手写汇编按错平台读取参数，前两个参数就会错位。程序可能仍然运行，但结果毫无 ABI 保证。
+
+另一个差异是栈约定。Windows x64 有 shadow space 概念，System V 有 red zone 概念；二者不能混用。一个在 Linux leaf function 中使用 red zone 的技巧，移植到 Windows x64 不成立；一个按 Windows shadow space 写的调用序列，放到 System V 上也不是同一套规则。跨平台汇编必须为每个 ABI 写独立入口，或通过 C++ wrapper 隔离平台差异。
+
+\subsection{系统调用 ABI 和函数调用 ABI 不同}
+
+即使在同一台 Linux x86-64 机器上，普通函数调用 ABI 和系统调用 ABI 也不同。普通函数把第四个整数参数放在 \register{rcx}；Linux syscall 使用 \register{r10} 传第四个参数，且 \instruction{syscall} 会破坏 \register{rcx} 和 \register{r11}。如果把普通 C 函数调用规则套到 syscall 上，参数会错。
+
+第一册不鼓励初学者直接手写 syscall 包装，但要知道这条边界。调用 libc 的 \code{write} 是普通函数调用，最终 libc 内部可能执行 syscall；你直接写 \instruction{syscall}，就要遵守 syscall ABI。两个层次都叫“调用”，但合同不同。
+
+\subsection{跨 ABI 的安全做法}
+
+如果项目需要跨平台，建议把汇编实现藏在平台专用文件中：
+
+\begin{lstlisting}
+src/
+  dot_ref.cpp
+  dot_dispatch.cpp
+  dot_sysv_x86_64.S
+  dot_win_x64.asm
+  dot_aarch64.S
+\end{lstlisting}
+
+公共 C++ 头文件只暴露稳定 wrapper：
+
+\begin{lstlisting}[language=C++]
+std::int64_t dot_i32(std::span<const std::int32_t> a,
+                     std::span<const std::int32_t> b);
+\end{lstlisting}
+
+wrapper 根据平台选择内部符号。内部符号可以各自遵守本平台 ABI，测试也按平台分别验证。不要试图写一份汇编同时假装满足所有 ABI，除非它只使用非常受限的公共子集且已经明确验证。
+
+\section{ABI 错误案例库}
+
+ABI 错误最好通过案例学习，因为它们的症状常常离根因很远。
+
+\subsection{案例一：忘记恢复 \register{rbx}}
+
+手写汇编：
+
+\begin{lstlisting}
+bad:
+    mov rbx, rdi
+    call helper
+    mov rax, rbx
+    ret
+\end{lstlisting}
+
+这个函数用 \register{rbx} 保存参数，但没有保存和恢复旧 \register{rbx}。如果调用者正好把某个活跃值放在 \register{rbx}，返回后该值被破坏。小测试可能没问题，因为调用者未使用 \register{rbx}；优化构建或复杂调用者中才暴露。
+
+诊断方法是在调用前后记录 \register{rbx}：
+
+\begin{lstlisting}
+before call:
+    rbx = sentinel
+after call:
+    rbx should still be sentinel
+\end{lstlisting}
+
+修复方式是：
+
+\begin{lstlisting}
+good:
+    push rbx
+    mov rbx, rdi
+    call helper
+    mov rax, rbx
+    pop rbx
+    ret
+\end{lstlisting}
+
+修复后还要重新检查栈对齐。因为 \instruction{push rbx} 改变了 \register{rsp}，如果中间还有 \instruction{call helper}，调用前对齐可能需要额外调整。ABI 修复常常牵动多个规则。
+
+\subsection{案例二：返回指针只写 \register{eax}}
+
+错误实现：
+
+\begin{lstlisting}
+get_ptr:
+    mov eax, edi
+    ret
+\end{lstlisting}
+
+若声明是：
+
+\begin{lstlisting}[language=C++]
+extern "C" void* get_ptr(void*);
+\end{lstlisting}
+
+这个实现把输入指针低 32 位写入 \register{eax}，同时清零高 32 位。低地址测试可能碰巧通过，高地址或 ASLR 环境下会返回截断指针。正确实现应写完整 \register{rax}：
+
+\begin{lstlisting}
+mov rax, rdi
+ret
+\end{lstlisting}
+
+这个案例说明返回类型宽度必须和寄存器写入宽度一致。写 32 位寄存器的清零规则对无符号 32 位返回很方便，对指针返回则可能是灾难。
+
+\subsection{案例三：变参调用忘记 \register{al}}
+
+手写汇编调用 \code{printf} 时，如果格式串包含浮点变参，System V ABI 需要调用者在 \register{al} 中提供使用的向量寄存器数量。若忽略，某些调用可能读取错误的寄存器保存区。整数-only \code{printf} 可能看不出问题，含 \code{\%f} 的格式才失败。
+
+这个案例说明变参函数不能只按“参数放进寄存器”理解。变参 ABI 还需要额外元信息和默认提升。调用 \code{printf} 这类函数时，最稳妥做法是让 C++ wrapper 调用，或严格照 ABI 写调用序列。
+
+\subsection{案例四：栈对齐只在主路径正确}
+
+某函数主路径恢复了 \register{rsp}，错误路径提前返回：
+
+\begin{lstlisting}
+f:
+    sub rsp, 24
+    test rdi, rdi
+    je .Lerr
+    call helper
+    add rsp, 24
+    ret
+.Lerr:
+    ret
+\end{lstlisting}
+
+\code{.Lerr} 路径没有 \instruction{add rsp, 24}，\instruction{ret} 会从错误位置取返回地址。若测试很少覆盖空指针路径，问题可能潜伏很久。控制流章节讲过，每个返回路径都要检查状态；ABI 章节在这里给出具体例子：栈状态必须所有路径一致。
+
+修复方式通常是让错误路径跳到统一 epilogue：
+
+\begin{lstlisting}
+f:
+    sub rsp, 24
+    test rdi, rdi
+    je .Ldone
+    call helper
+.Ldone:
+    add rsp, 24
+    ret
+\end{lstlisting}
+
+\section{ABI 与 C++ 对象语义的边界}
+
+ABI 能规定对象如何传递，但不能替你保证 C++ 对象语义正确。比如一个函数接收指针，ABI 只规定指针值在哪个寄存器里；它不保证指针非空、不保证对象生命周期有效、不保证类型别名合法、不保证指向足够大缓冲区。这些属于语言和接口契约。
+
+同样，ABI 可以规定一个非平凡对象通过地址传递，但不会自动调用你忘记写的构造或析构；ABI 可以规定异常展开需要元数据，但裸汇编没有正确 CFI 时，异常穿过该帧仍可能失败；ABI 可以规定返回对象存储由调用者提供，但不会检查被调用者是否写满所有字段。
+
+因此，跨 C++/汇编边界时，至少要分三层写文档：
+
+\begin{itemize}
+  \item ABI 层：寄存器、栈、返回、保存责任、符号。
+  \item 对象层：生命周期、所有权、空指针、长度、别名、对齐。
+  \item 语义层：函数计算什么，错误如何处理，是否允许异常。
+\end{itemize}
+
+只写 ABI 层，函数可能能被调用但语义不安全；只写语义层，手写汇编可能参数错位；只写对象层，性能和二进制边界仍不清楚。三层都写，接口才稳。
+
+\section{ABI 测试夹具设计}
+
+普通单元测试只检查返回值，不能覆盖 ABI 保存责任。可以设计专门夹具。
+
+第一类夹具检查 callee-saved 寄存器。用一段汇编或 compiler-supported 机制在调用前设置 \register{rbx}、\register{r12} 到 \register{r15} 为哨兵值，调用目标函数后检查是否保持。若目标函数内部调用其他函数，也要覆盖。
+
+第二类夹具检查栈对齐。写一个 helper，在入口读取 \register{rsp} 并返回 \code{rsp \% 16}，或在目标函数调用 helper 前让 helper 验证对齐。这样可以发现主路径和错误路径对齐不一致。
+
+第三类夹具检查栈参数。构造超过六个整数参数、混合浮点和整数参数、大结构体返回、变参调用。若只测一两个整数参数，很难发现参数通道错位。
+
+第四类夹具检查隐藏参数。测试成员函数、引用参数、大结构体返回、非平凡对象边界。确认第一个显式参数是否因为 \code{this} 或 sret 被后移。
+
+第五类夹具检查动态库边界。把实现放进共享库，从另一个可执行文件调用，检查符号可见性、RPATH/RUNPATH、版本和异常边界。静态链接通过，不代表动态库部署正确。
+
+\begin{keyidea}
+ABI 测试不应只问“返回值对不对”。它要故意检查调用者看不见的责任：寄存器保存、栈状态、隐藏参数、变参元信息、符号和动态库边界。
+\end{keyidea}
+
+\section{综合案例：一个函数签名的 ABI 推导}
+
+看一个混合签名：
+
+\begin{lstlisting}[language=C++]
+struct Pair {
+    double x;
+    int tag;
+};
+
+extern "C" long f(int a,
+                  double b,
+                  long c,
+                  Pair p,
+                  int d,
+                  double e,
+                  long g);
+\end{lstlisting}
+
+不要直接从参数序号数寄存器。System V AMD64 中，整数/指针通道和浮点/SSE 通道分别计数，聚合类型还要分类。一个推导过程可以写成：
+
+\begin{lstlisting}
+return:
+    long -> rax
+
+arguments:
+    int a    -> integer channel 1 -> edi
+    double b -> SSE channel 1     -> xmm0
+    long c   -> integer channel 2 -> rsi
+    Pair p   -> aggregate classification:
+        double x likely SSE eightbyte
+        int tag likely INTEGER eightbyte or memory depending classification
+    int d    -> next integer channel
+    double e -> next SSE channel
+    long g   -> next integer channel
+\end{lstlisting}
+
+这里故意不把 \code{Pair} 的最终位置写死，因为完整分类需要按 ABI 规则仔细判断字段、padding 和 eightbyte。教材式报告应明确“需要分类”，而不是凭直觉把整个结构体塞进一个寄存器。实际实验可以通过编译小函数、查看调用点和被调用者读取位置来验证。
+
+这个案例训练两点。第一，浮点参数不会占用整数寄存器通道。第二，聚合参数不能只看总大小，还要看字段类别和 eightbyte 分布。复杂签名的 ABI 推导应先在纸上列通道，再看反汇编验证。
+
+\subsection{如何用实验验证推导}
+
+可以写一个调用者：
+
+\begin{lstlisting}[language=C++]
+extern "C" long f(int, double, long, Pair, int, double, long);
+
+long call_f()
+{
+    Pair p{1.5, 7};
+    return f(1, 2.5, 3, p, 4, 5.5, 6);
+}
+\end{lstlisting}
+
+生成 \code{-O0} 和 \code{-O2} 汇编。 \code{-O0} 可能更容易看到参数准备；\code{-O2} 更接近发布路径，但可能内联或优化。若要保留调用，可以把 \code{f} 放在另一个翻译单元，或只声明不定义。报告应记录采取了什么方法保留调用边界。
+
+验证时看调用点如何写 \register{edi}、\register{rsi}、\register{xmm0} 等寄存器，以及是否有栈参数。再看被调用者入口如何读取。调用点和入口应一致。若不一致，可能是你看了不同构建、函数被内联、声明不一致，或 ABI 推导错了。
+
+\section{自测清单：ABI 是否真正掌握}
+
+完成本章后，应能回答：
+
+\begin{enumerate}
+  \item 为什么 ABI 是调用者和被调用者的共同合同。
+  \item 前六个整数/指针参数在 System V AMD64 中通常在哪里。
+  \item 浮点参数为什么使用独立通道。
+  \item 第七个整数参数在入口栈上的相对位置如何判断。
+  \item \register{rsp} 在调用前和被调用者入口的对齐关系。
+  \item caller-saved 和 callee-saved 分别意味着什么责任。
+  \item 大结构体返回为什么可能引入隐藏 sret 指针。
+  \item 非平凡 C++ 类型为什么不能简单当字节包传递。
+  \item 变参函数为什么需要额外 ABI 规则。
+  \item Windows x64、System V 和 Linux syscall ABI 为什么不能混用。
+\end{enumerate}
+
+如果只能背寄存器顺序，但不能从函数签名推导入口状态、不能检查栈对齐、不能发现隐藏参数，就还没有真正掌握 ABI。
+
+\section{深入讲解：ABI 是局部优化的边界}
+
+ABI 不只是正确性规则，也是优化边界。函数内部，编译器可以自由选择寄存器、重排指令、删除局部变量、内联 helper；函数边界处，它必须让调用者和被调用者看到约定好的状态。这个边界限制了优化，也让独立编译成为可能。
+
+如果一个小函数被内联，ABI 边界消失，参数不一定真的放进 \register{rdi}、\register{rsi}，返回值也不一定经过 \register{rax}。值可以直接在调用者的寄存器中流动，甚至被常量折叠。若函数没有内联，ABI 边界保留，调用者必须准备参数，被调用者必须返回结果。性能上，内联常常消除调用开销并暴露优化机会，但也可能增加代码大小。
+
+动态库边界更强。编译器通常不能假设外部可见函数不会被替换，也不能随意改变公共符号 ABI。隐藏符号和 LTO 可以放宽一些限制，但前提是构建系统和链接模型明确。库作者控制符号可见性，不只是为了整洁，也是在给优化器提供边界信息。
+
+手写汇编则处在最硬的 ABI 边界。编译器看不到汇编内部语义，只能按声明和 clobber/符号规则处理。汇编实现必须完全遵守合同。你不能指望编译器帮你保存 \register{rbx}，也不能指望调用者猜到你的隐藏前置条件。
+
+\section{课堂讲解：ABI 推导要从函数类型开始}
+
+很多读者学习 ABI 时会先背“前六个整数参数放在 \register{rdi}、\register{rsi}、\register{rdx}、\register{rcx}、\register{r8}、\register{r9}”。这句话有用，但不够。真正的 ABI 推导必须从函数类型开始：返回类型是什么，参数类型分别属于整数、指针、浮点、向量还是聚合，是否有隐藏参数，是否是变参函数，是否有非平凡 C++ 语义，调用点是否保留函数边界。
+
+推导流程可以固定为六步。第一，写出精确声明，包含命名空间、\code{extern "C"}、引用、指针、const、结构体定义和返回类型。第二，判断返回值位置：普通整数、指针、浮点、大聚合、非平凡类型分别不同。第三，逐个参数分类，并分别维护整数通道和 SSE 通道。第四，判断是否溢出到栈，栈上参数位置要结合调用前后的 \register{rsp} 变化。第五，考虑调用者和被调用者保存寄存器。第六，用反汇编验证调用点和入口是否一致。
+
+这个流程比背表慢一点，但能处理真实签名。真实项目里的函数很少只有六个整数。它们可能有 \code{std::size_t}、指针、double、小结构体、返回结构体、变参、成员函数、引用、模板实例化和异常边界。只靠寄存器顺序，遇到第一个聚合参数就会出错。
+
+\subsection{调用点和被调用者入口要成对看}
+
+ABI 是调用者和被调用者的共同合同，所以验证时不能只看一边。调用点显示参数如何准备、栈如何对齐、返回值如何使用；被调用者入口显示参数如何读取、哪些寄存器被保存、栈帧如何建立。两边合起来，才能确认合同一致。
+
+若只看被调用者入口，可能误判优化器已经把某个参数常量传播或删除。若只看调用点，可能不知道被调用者是否破坏 callee-saved 寄存器或错误解释参数宽度。互操作问题尤其需要成对证据：C++ 声明、调用点反汇编、汇编入口、测试结果必须互相匹配。
+
+\section{ABI 和 C++ 类型系统的边界}
+
+ABI 描述机器级传递规则，但 C++ 类型系统还包含构造、析构、复制、移动、异常、访问控制和对象生命周期。不是所有 C++ 类型都适合直接跨汇编边界传递。平凡、标准布局、固定宽度字段的小结构体相对容易审计；含虚函数、非平凡析构、引用成员、内部指针、allocator 或不稳定布局的类型，通常应由 C++ wrapper 处理，不应直接交给裸汇编解释。
+
+引用在 ABI 上通常以地址形式传递，但语言语义不是“普通可空指针”。若汇编把引用当成可空指针处理，说明接口层已经混乱。异常也类似。汇编函数如果不建立正确的 unwind 信息，就不应该让 C++ 异常穿过它。析构和资源清理依赖栈展开，手写汇编若破坏 unwind 规则，错误会很难排查。
+
+成员函数还涉及隐藏的 \code{this} 参数。普通非静态成员函数的第一个隐含参数是对象指针；虚函数调用还可能经过 vtable；多重继承可能需要 this 调整。第一册不深入 C++ 对象模型，但要明确：看到“一个参数的成员函数”时，ABI 层可能有不止一个来源的值。做汇编互操作时，优先使用简单 C ABI 包装复杂 C++ 类型。
+
+\section{动态库 ABI：兼容比能链接更难}
+
+一个程序能链接到共享库，不代表 ABI 兼容长期成立。共享库一旦发布，外部程序可能保存旧头文件、旧二进制和旧调用方式。库作者改变函数签名、结构体大小、枚举宽度、异常策略、符号名或可见性，都可能破坏旧调用者。ABI 兼容是二进制层承诺，不是源码重新编译后能过就算。
+
+保持动态库 ABI 稳定的常见做法包括：导出最小符号集合，隐藏内部函数；公共结构体使用不透明指针或版本字段；新增函数而不是改变旧函数签名；为参数块保留 size 字段；使用版本脚本管理符号；在 CI 中用 ABI 检查工具或反汇编审计关键符号。对小项目来说，不一定一开始全做，但必须知道问题存在。
+
+调用者也有责任记录库身份。性能或崩溃报告中，应保存实际加载库路径和版本。若系统升级后共享库实现变了，同一可执行文件也可能表现不同。动态库边界把“程序身份”延伸到了运行环境，这是第一章和本章相互连接的地方。
+
+\section{ABI 错误的典型症状}
+
+ABI 错误不一定立刻崩溃。它可能表现为返回值偶尔错误、只在优化构建失败、调用后某个无关变量被破坏、异常路径崩溃、printf 参数错位、栈回溯断裂、只在某个输入规模出现性能异常。原因是 ABI 错误常常破坏调用者和被调用者之间的隐含状态，例如 callee-saved 寄存器、栈对齐、返回地址、隐藏参数或寄存器高位。
+
+排查时要按合同逐项核对。参数位置是否一致；返回值宽度是否一致；\register{rsp} 在 call 前是否按要求对齐；被调用者是否保存并恢复 \register{rbx}、\register{rbp}、\register{r12} 到 \register{r15}；调用变参函数前是否设置需要的寄存器状态；结构体返回是否使用隐藏指针；调用声明是否和定义完全相同。不要只看功能测试是否通过，ABI 错误可能在另一个调用者处暴露。
+
+\section{ABI 审查清单}
+
+对任何跨翻译单元、跨语言或 C++ 调汇编接口，都应至少审查：
+
+\begin{enumerate}
+  \item 声明是否唯一，调用者和实现是否包含同一头文件。
+  \item 符号名是否符合预期，是否需要 \code{extern "C"}。
+  \item 参数类型、宽度、signedness、指针 const 和返回类型是否一致。
+  \item 结构体布局是否用 \code{static_assert} 固定。
+  \item 栈对齐是否在所有调用路径上成立。
+  \item callee-saved 寄存器是否完整保存。
+  \item 是否调用其他函数，若调用是否满足 non-leaf 责任。
+  \item 是否允许异常、回调、线程局部状态或全局状态穿过边界。
+  \item 是否有反汇编证据和运行测试覆盖边界参数。
+  \item 公共 ABI 变化是否版本化。
+\end{enumerate}
+
+ABI 的难点不是规则多，而是错误经常跨文件、跨工具、跨运行时暴露。清单化审查能把隐含合同变成显式事实。
+
+\section{ABI 学习中的反例训练}
+
+ABI 最好通过反例学。写一个汇编函数故意不保存 \register{rbx}，再让调用者在调用前后依赖 \register{rbx} 保存的值；写一个函数故意破坏栈对齐，再调用需要对齐的 helper；写一个 C++ 声明返回 \code{long}，汇编却只写低 32 位；写一个参数块，C++ 端改变字段顺序而汇编 offset 不更新。每个反例都能把一条 ABI 规则变成可观察错误。
+
+反例实验要在安全的小程序里完成，不要在生产代码中破坏 ABI。目标是观察症状：有的立即崩溃，有的只在优化构建下错误，有的只在特定调用者处暴露，有的只是返回值异常。观察后再修复，并保存修复前后的反汇编和测试。这样学习，比单纯背寄存器表更稳。
+
+\section{ABI 报告的最低标准}
+
+一份 ABI 报告至少应包含函数声明、平台和调用约定、参数分类表、返回值位置、栈对齐说明、保存寄存器责任、调用点反汇编、被调用者入口反汇编和测试结果。若涉及结构体，还要包含布局断言；若涉及变参，还要说明额外规则；若涉及动态库，还要说明符号可见性和加载库路径。
+
+报告中不要只写“按 System V ABI”。这句话太宽。你要说明当前函数如何应用 ABI：哪个参数在哪个寄存器，哪个参数上栈，哪个隐藏参数存在，哪个寄存器必须保存。ABI 是文档，工程报告要把文档实例化到当前接口。
+
+\section{ABI 分析的最后一道问题}
+
+ABI 分析结束前，要问一句：调用者和被调用者是否真的在同一个合同上。声明一致不一定够，因为可能有不同头文件、不同编译选项、不同语言链接、不同结构体布局、不同动态库版本。反汇编看起来合理也不一定够，因为你可能只看了被调用者，没有看调用点。
+
+完整检查要把四样东西放在一起：C++ 声明、调用点反汇编、被调用者入口反汇编、运行测试。若涉及共享库，还要加上实际加载路径和符号表。若涉及结构体，还要加上布局断言。只有这些证据一致，才能说 ABI 合同成立。
+
+这个问题在第二册仍然重要。SIMD kernel、AI 算子库、运行时 dispatch、插件接口，都依赖 ABI 边界。越是追求性能，越不能让调用边界含糊。一个寄存器保存错误、一个隐藏参数误解、一个结构体 offset 漂移，都可能让高性能代码变成高风险代码。
+
+\section{综合项目：写一份 ABI 合同文件}
+
+本章结束时，可以选择一个真实或练习用函数，为它写一份 ABI 合同文件。文件不需要长，但必须精确。第一段写公共声明和用途；第二段写参数和返回值在 System V AMD64 下的位置；第三段写前置条件，例如指针非空、长度范围、对齐要求和是否允许别名；第四段写寄存器保存、栈对齐、是否调用其他函数、是否抛异常；第五段写测试和反汇编证据。
+
+例如一个内部函数 \code{asm_sum_i32}，合同文件应写明 \register{rdi} 是指针，\register{rsi} 是元素数，\register{rax} 返回 64 位和，\code{n >= 0}，若 \code{n == 0} 不访问内存，函数不调用其他函数，不修改 callee-saved 寄存器。若未来实现改成调用 helper，合同就必须更新栈对齐和调用责任。
+
+这份文件能帮助多人协作。C++ 调用者知道如何声明，汇编作者知道要遵守什么，测试作者知道测哪些边界，reviewer 知道检查什么。ABI 合同文件是从“我懂规则”到“团队能维护接口”的关键一步。
+
+\section{ABI 变更的迁移策略}
+
+接口总会演化。长度参数可能从 \code{int} 改成 \code{std::size_t}，返回值可能增加错误码，参数块可能新增字段，内部实现可能需要对齐保证。ABI 变更不要悄悄发生。迁移策略可以是新增符号、保留旧符号 wrapper、参数块版本字段、编译期断言、运行时 size 检查和文档标记。
+
+对内部接口，也建议把破坏性变化写进提交说明。因为旧目标文件、旧 benchmark、旧测试和旧文档可能仍在。若变更没有标记，性能数据也会混乱：v1 和 v2 不是同一个接口，不能直接画在一条趋势线上。ABI 迁移策略让变化可见，也让回滚和排查更容易。
+
+\section{深入讲解：ABI 文档应和测试一起存在}
+
+ABI 文档如果没有测试，很容易腐烂；测试如果没有文档，很难知道测什么。两者应该成对存在。文档写“callee-saved none modified”，测试就应检查寄存器；文档写“栈 16 字节对齐后调用 helper”，测试就应覆盖 helper；文档写“n 必须非负”，wrapper 测试就应拒绝负数；文档写“结构体 offset 固定”，编译期就应有 \code{static_assert}。
+
+这种文档-测试对应关系能帮助 review。reviewer 不必凭信任接受注释，而能看到每条关键合同都有验证方式。对底层代码来说，这比单纯追求代码短更重要。一个汇编函数可能只有二十行，但它背后的 ABI 合同和测试可能比函数本身更长。
 
 \section{案例：C++ 调汇编}
 
@@ -1230,6 +2585,82 @@ objdump -d -Mintel varargs.o > varargs.objdump.txt
 \end{enumerate}
 \end{labbox}
 
+\section{实验 13.6：隐藏参数和尾调用}
+
+\begin{labbox}
+目标：观察引用、\code{this} 指针、窄整数扩展和尾调用优化如何改变函数入口解释。
+
+创建 \filepath{labs/ch13_system_v_abi/hidden_and_tail.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int add_schar(signed char a, signed char b)
+{
+    return int(a) + int(b);
+}
+
+extern "C" int add_uchar(unsigned char a, unsigned char b)
+{
+    return int(a) + int(b);
+}
+
+extern "C" void inc_ref(int& x)
+{
+    ++x;
+}
+
+struct Counter {
+    int value;
+
+    int add(int x)
+    {
+        value += x;
+        return value;
+    }
+};
+
+extern "C" int call_member(Counter* counter, int x)
+{
+    return counter->add(x);
+}
+
+extern "C" long target_tail(long x);
+
+extern "C" long wrapper_tail(long x)
+{
+    return target_tail(x);
+}
+\end{lstlisting}
+
+构建：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -S -masm=intel \
+  hidden_and_tail.cpp -o hidden_and_tail.s
+clang++ -std=c++20 -O3 -c hidden_and_tail.cpp -o hidden_and_tail.o
+objdump -drwC -Mintel hidden_and_tail.o > hidden_and_tail.objdump.txt
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 比较 \code{add_schar} 和 \code{add_uchar} 使用的是符号扩展还是零扩展。
+  \item 说明 \code{inc_ref} 的引用参数在入口寄存器中表现为什么。
+  \item 说明 \code{Counter::add} 或 \code{call_member} 中 \code{this} 指针在哪里。
+  \item 判断 \code{wrapper_tail} 是否被编译成尾调用形式。
+  \item 若出现 \instruction{jmp}，解释它为什么仍然必须满足 ABI 边界。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item 相关反汇编片段。
+  \item 每个函数的入口状态表。
+  \item 对窄整数高位、引用地址、\code{this} 指针和尾调用的解释。
+\end{enumerate}
+\end{labbox}
+
 \section{本章作业}
 
 \begin{exercisebox}
@@ -1338,6 +2769,40 @@ make_obj:
   \item \code{objdump} 报告，解释每个函数的 ABI 行为。
 \end{itemize}
 
+\subsection*{作业 6：公开 ABI 设计审查}
+
+设计一个小型 C ABI，用于从动态库中导出一个查询引擎。要求至少包含：
+
+\begin{itemize}
+  \item 创建和销毁上下文的函数。
+  \item 一个查询函数。
+  \item 一个可扩展配置结构体。
+  \item 错误码或错误消息获取方式。
+  \item 明确的内存所有权规则。
+\end{itemize}
+
+然后写审查报告，回答：
+
+\begin{enumerate}
+  \item 哪些类型暴露在 ABI 边界上。
+  \item 结构体如何通过 \code{size} 或 \code{version} 支持扩展。
+  \item 为什么不直接暴露 C++ 类或 STL 容器。
+  \item 如果未来增加字段，旧调用者会怎样。
+  \item 哪些改动会破坏 ABI。
+\end{enumerate}
+
+\subsection*{作业 7：尾调用 ABI 分析}
+
+写三个 wrapper 函数：
+
+\begin{enumerate}
+  \item 直接返回另一个函数的结果。
+  \item 调用另一个函数后还要加 1。
+  \item 调用另一个函数前后使用一个需要保存的局部值。
+\end{enumerate}
+
+用 \code{-O2} 或 \code{-O3} 生成反汇编，判断哪些能变成尾调用，哪些不能。报告必须说明：参数是否需要重排，栈是否恢复，callee-saved 寄存器是否需要恢复，以及为什么某个 \instruction{jmp} 是合法尾调用。
+
 \subsection*{评分标准}
 
 本章作业按下面标准评价：
@@ -1348,6 +2813,9 @@ make_obj:
   \item 是否能正确处理 caller-saved 与 callee-saved。
   \item 手写汇编是否保持栈对齐。
   \item 是否能识别隐藏 sret 指针。
+  \item 是否能识别引用、\code{this} 和窄整数扩展造成的入口状态变化。
+  \item 是否能解释尾调用优化对栈帧和 ABI 边界的影响。
+  \item 是否理解公开 ABI 的布局、版本和内存所有权风险。
   \item 是否能用 GDB、\code{objdump} 和实际运行结果证明结论。
   \item 是否明确区分 System V AMD64 和其他 ABI。
 \end{enumerate}

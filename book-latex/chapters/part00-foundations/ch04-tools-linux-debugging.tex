@@ -1,64 +1,2883 @@
 \chapter{Linux、工具链、调试器和学习工作流}
 
-\section{为什么需要工具基础}
+\section{问题与目标}
 
-底层学习不是只读概念。你必须能编译、反汇编、调试、测量、保存结果和复现实验。本章建立最低工具能力。
+前面几章已经建立三条基础链路：源码经过工具链变成可执行程序，CPU 执行机器码字节，数据在内存中以字节、对象、地址和布局的形式存在。现在需要把这些概念转化为可操作能力；否则，后续汇编、ABI 和 benchmark 学习仍然缺少证据基础。你必须具备一种基本能力：
 
-\section{基本命令}
+\begin{center}
+\textbf{能在 Linux 环境里独立构建、观察、调试、记录和复现实验。}
+\end{center}
 
-必须熟悉：
+底层学习常见的隐形障碍是：概念似乎看懂了，一到自己的机器上却无法验证。命令不知道怎样组织，编译参数不知道放在哪里，\code{objdump} 输出看不懂，GDB 里的寄存器和源码对不上，benchmark 结果没有保存，第二天也复现不了前一天的实验。这样学下去，底层知识只会停留在“看过许多名词”，而不能转化为“解释真实程序行为”的能力。
+
+本章的目标不是把 Linux、CMake、GDB、ELF 工具和性能工具写成手册；手册可以随时查阅。本章要建立的是学习工作流：面对一个 C/C++ 小程序时，知道怎样从源码得到编译命令，从编译命令得到二进制，从二进制得到反汇编，从反汇编进入 GDB 观察，再把观察整理成实验报告。
+
+\begin{keyidea}
+工具不是附属品。对底层学习来说，工具就是证据获取系统。没有命令、输出、反汇编、调试记录和报告，任何“我理解了”的说法都缺少验证。
+\end{keyidea}
+
+\section{本章的最低目标}
+
+学完本章后，你应该能做到：
 
 \begin{itemize}
-  \item \code{g++}、\code{clang++}：编译。
-  \item \code{objdump}：反汇编。
-  \item \code{readelf}：查看 ELF。
-  \item \code{nm}：查看符号。
-  \item \code{gdb}：调试和单步。
-  \item \code{lscpu}：查看 CPU。
-  \item \code{time}、\code{perf}：基础测量。
+  \item 在命令行创建目录、编辑文件、编译并运行 C++ 程序。
+  \item 区分源码文件、头文件、目标文件、可执行文件、调试信息和构建目录。
+  \item 用 GCC 或 Clang 生成 \code{-O0}、\code{-O2}、\code{-O3}、带调试信息和带 sanitizer 的构建。
+  \item 用 \code{objdump}、\code{readelf}、\code{nm} 观察机器码、ELF 结构和符号。
+  \item 用 GDB 设置断点、单步源码、单步指令、查看寄存器、查看内存和反汇编。
+  \item 知道 Debug、Release、sanitizer、benchmark build 的用途不同，不能混用结论。
+  \item 为每个实验保存命令、环境、输入、原始输出和结论。
 \end{itemize}
 
-\section{构建类型}
+这些能力看似朴素，却是后续章节的地基。不会使用这些工具，就很难真正学懂汇编；不会保存实验记录，就很难写出可信 benchmark；不会区分构建类型，就容易把调试版本的行为误当成性能事实。
 
-Debug、Release、sanitizer、coverage build 目的不同。Debug build 不用于性能结论；Release build 不替代 correctness 测试。
+\section{命令行不是障碍，而是可复现实验接口}
 
-\section{GDB 最小工作流}
+图形化 IDE 可以提高编码效率，但底层实验必须学会命令行。原因很简单：命令行是可复制、可粘贴、可记录、可自动化的实验接口。报告里写“我点了某个按钮”没有复现价值；写出完整命令，别人才能在另一台机器上重复你的实验。
+
+先熟悉最基本的命令：
 
 \begin{lstlisting}[language=bash]
-g++ -O0 -g main.cpp -o app
-gdb -q ./app
+pwd                 # 当前目录
+ls -la              # 列出文件和权限
+cd path/to/dir      # 切换目录
+mkdir -p build      # 创建目录
+cp a b              # 复制文件
+mv a b              # 移动或重命名
+rm file             # 删除文件
+rg "pattern" .      # 搜索文本
+find . -name '*.cpp'
+uname -a            # 操作系统和内核信息
+lscpu               # CPU 信息
 \end{lstlisting}
 
-常用命令：
+这些命令的价值不在于“会背”。你要知道它们在实验报告里承担什么角色：
+
+\begin{itemize}
+  \item \code{pwd} 和目录结构说明实验在哪里发生。
+  \item \code{rg} 和 \code{find} 帮你定位源码、汇编和结果文件。
+  \item \code{uname} 和 \code{lscpu} 是环境记录的一部分。
+  \item \code{mkdir -p results/...} 让每次实验的输出有固定归档位置。
+\end{itemize}
+
+\begin{mentalmodel}
+把命令行看成“实验脚本的草稿”。一次手敲命令如果有价值，就应该能被整理成脚本、Makefile、CMake preset 或报告中的复现步骤。
+\end{mentalmodel}
+
+\section{Shell 的执行模型：命令、参数、环境和退出状态}
+
+很多工具学习失败，不是因为工具本身复杂，而是因为没有理解 Shell 到底在做什么。你在终端输入的一行内容，通常会被 Shell 拆成命令名、参数、重定向、管道和环境变量，然后创建进程执行。
+
+例如：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O2 src/main.cpp -o build/app
+\end{lstlisting}
+
+这里 \code{clang++} 是要执行的程序，后面的每一项是参数。编译器看到的是参数数组，而不是你脑子里的“编译这个程序”。参数顺序、空格、引号、路径都会影响结果。路径中如果有空格而没有正确引用，Shell 会把它拆成多个参数；通配符如果被 Shell 展开，程序收到的也不是星号本身。
+
+环境变量是进程继承的一组键值。常见例子包括 \code{PATH}、\code{CC}、\code{CXX}、\code{CFLAGS}、\code{CXXFLAGS}、\code{LD_LIBRARY_PATH}。构建系统、编译器、动态链接器都可能读取环境变量。报告中如果某个环境变量影响结果，就必须记录。比如同一个 CMake 命令，如果 \code{CC} 和 \code{CXX} 指向不同编译器，生成的构建系统就可能完全不同。
+
+每个命令结束时都会返回退出状态。通常 0 表示成功，非 0 表示失败。Shell 变量 \code{\$?} 保存上一条命令的退出状态。脚本中如果忽略退出状态，就可能在编译失败后继续运行旧二进制，得到完全错误的实验结果。因此实验脚本建议使用：
+
+\begin{lstlisting}[language=bash]
+set -euo pipefail
+\end{lstlisting}
+
+这不是魔法安全开关，但它能让许多错误尽早暴露：命令失败时退出，使用未定义变量时报错，管道中某一步失败时不被最后一个命令的成功掩盖。
+
+\begin{warningbox}
+最危险的实验错误之一是“编译失败了，但旧的可执行文件还在，所以运行看起来成功”。每次报告都要保存构建输出或至少确认构建命令成功，并在必要时先清理构建目录。
+\end{warningbox}
+
+\section{脚本化：把手工实验变成可重复过程}
+
+手工命令适合探索，脚本适合复现。一个实验只要需要第二次运行，就应该逐步脚本化。脚本不是为了炫技，而是为了减少遗漏：创建目录、记录环境、编译、保存反汇编、运行程序、保存结果，都应该有固定顺序。
+
+一个好的实验脚本有几个特征：
+
+\begin{itemize}
+  \item 从固定工作目录运行，或在开头切换到脚本所在目录。
+  \item 明确创建输出目录，不把结果散落在项目根目录。
+  \item 打印或保存关键命令，便于审计。
+  \item 构建失败时停止，不继续运行旧程序。
+  \item 输出文件名包含构建类型、输入规模或时间戳等必要维度。
+  \item 不依赖终端历史或个人 Shell 配置。
+\end{itemize}
+
+例如一次章节实验可以有这样的流程：
+
+\begin{lstlisting}[language=bash]
+#!/usr/bin/env bash
+set -euo pipefail
+
+cd "$(dirname "$0")"
+mkdir -p build-release results
+
+{
+  date
+  uname -a
+  clang++ --version
+} > results/environment.txt 2>&1
+
+clang++ -std=c++20 -O3 -DNDEBUG \
+  src/main.cpp -o build-release/app
+
+objdump -drwC -Mintel build-release/app \
+  > results/app.objdump.txt
+
+./build-release/app > results/run.txt 2>&1
+\end{lstlisting}
+
+脚本中的命令仍然要能被读懂。不要把所有内容藏进复杂函数或过度抽象里。教学实验脚本的第一目标是清楚，第二目标才是复用。
+
+\section{Makefile：给小实验一个稳定入口}
+
+脚本适合一次完整流程，Makefile 适合给常用动作提供稳定入口。很多章节实验只有几个源文件，不值得引入完整工程系统；但如果每次都手敲长命令，迟早会出现参数遗漏、输出覆盖、构建类型混乱。一个小 Makefile 可以把这些约定固定下来。
+
+例如：
+
+\begin{lstlisting}
+CXX := clang++
+CXXFLAGS_COMMON := -std=c++20 -Wall -Wextra
+
+SRC := src/main.cpp
+DEBUG_BIN := build-debug/app
+RELEASE_BIN := build-release/app
+
+.PHONY: all debug release inspect clean
+
+all: debug release
+
+debug:
+	mkdir -p build-debug
+	$(CXX) $(CXXFLAGS_COMMON) -O0 -g $(SRC) -o $(DEBUG_BIN)
+
+release:
+	mkdir -p build-release
+	$(CXX) $(CXXFLAGS_COMMON) -O3 -DNDEBUG $(SRC) -o $(RELEASE_BIN)
+
+inspect: release
+	mkdir -p results
+	objdump -drwC -Mintel $(RELEASE_BIN) > results/release.objdump.txt
+	nm -C $(RELEASE_BIN) > results/release.nm.txt
+	readelf -S $(RELEASE_BIN) > results/release.sections.txt
+
+clean:
+	rm -rf build-debug build-release results
+\end{lstlisting}
+
+然后运行：
+
+\begin{lstlisting}[language=bash]
+make debug
+make release
+make inspect
+\end{lstlisting}
+
+Makefile 的价值不是替代 CMake，而是让实验入口稳定。报告里写 \code{make inspect} 比写一长串散落命令更不容易出错，但前提是 Makefile 本身要清楚、短小、可读。教学项目里不要把复杂逻辑藏进多层变量和隐式规则；读者应该能一眼看出 Debug 和 Release 到底用了哪些参数。
+
+\begin{warningbox}
+Makefile 也是实验协议的一部分。修改 Makefile 的编译参数，就等于修改了实验条件。报告中若使用 \code{make}，应保存 Makefile 或记录其版本。
+\end{warningbox}
+
+\section{路径、工作目录和实验目录}
+
+底层实验经常失败在路径混乱上。比如同一个源码文件被复制到多个目录，编译的是旧文件，运行的是旧二进制，报告引用的是另一个输出。为了避免这种混乱，本书建议每个实验都使用固定结构：
+
+\begin{lstlisting}
+labs/
+  ch04_tools/
+    src/
+      main.cpp
+      add.cpp
+      add.hpp
+    build-debug/
+    build-release/
+    results/
+      environment.txt
+      commands.txt
+      objdump.txt
+      gdb-session.txt
+      report.md
+\end{lstlisting}
+
+这个结构表达了几条规则：
+
+\begin{itemize}
+  \item 源码放在 \filepath{src/}，不要和构建产物混在一起。
+  \item Debug 和 Release 分开构建，避免互相覆盖。
+  \item 实验输出放在 \filepath{results/}，不要只留在终端滚动历史里。
+  \item 每个实验至少保存 \filepath{commands.txt} 和 \filepath{environment.txt}。
+\end{itemize}
+
+相对路径和绝对路径都要能看懂。相对路径依赖当前工作目录，绝对路径从根目录开始。报告中可以使用相对路径，但必须说明执行命令时所在目录。例如：
+
+\begin{lstlisting}[language=bash]
+cd labs/ch04_tools
+clang++ -std=c++20 -O2 src/main.cpp -o build-release/app
+./build-release/app
+\end{lstlisting}
+
+如果没有第一行 \code{cd}，后面的相对路径就不完整。
+
+\section{Linux 进程：实验真正运行的对象}
+
+当你在终端输入：
+
+\begin{lstlisting}[language=bash]
+./build-release/app input.txt
+\end{lstlisting}
+
+运行的不是“一个源文件”，也不是“一个函数”，而是一个进程。进程是操作系统给正在运行的程序建立的执行容器。它至少包含：
+
+\begin{itemize}
+  \item 一份虚拟地址空间，里面映射了程序代码、共享库、堆、栈和其他内存区域。
+  \item 一组线程，最简单的程序只有一个主线程。
+  \item 当前工作目录。
+  \item 命令行参数，也就是 \code{argv}。
+  \item 环境变量，也就是 \code{envp}。
+  \item 打开的文件描述符表，例如标准输入、标准输出、标准错误和已经打开的文件。
+  \item 资源限制、信号处理状态、用户和权限信息。
+\end{itemize}
+
+这解释了为什么同一个可执行文件在不同目录、不同环境变量、不同输入和不同权限下，行为可能不同。比如程序用相对路径打开 \filepath{data/input.txt}，实际查找位置取决于进程当前工作目录；程序加载共享库，搜索路径可能受动态链接器配置、\code{LD_LIBRARY_PATH}、RPATH 或 RUNPATH 影响；程序写日志失败，可能不是 C++ 逻辑错误，而是进程没有目录写权限。
+
+从底层学习角度看，进程是把前面几章连接起来的地方。可执行文件提供机器码和元数据；加载器把它映射到进程地址空间；CPU 按 \register{rip} 执行这个地址空间里的指令；系统调用让进程请求内核打开文件、分配内存、创建线程或退出。工具观察也围绕进程展开：GDB 控制进程，\code{strace} 记录系统调用，\filepath{/proc} 暴露内核维护的进程信息，\code{perf} 统计进程运行时事件。
+
+\begin{mentalmodel}
+一次实验不是“运行某个源码”，而是在特定环境中创建一个进程。要复现实验，就必须复现可执行文件、参数、工作目录、环境变量、输入数据、权限和关键系统设置。
+\end{mentalmodel}
+
+\section{权限、可执行位和 PATH 查找}
+
+Linux 文件有权限。一个文件是否能执行，不只取决于它里面是不是 ELF 或脚本，还取决于权限位。常用查看：
+
+\begin{lstlisting}[language=bash]
+ls -l build-release/app
+file build-release/app
+\end{lstlisting}
+
+如果看到类似：
+
+\begin{lstlisting}
+-rwxr-xr-x 1 user user 123456 Jun 14 10:00 app
+\end{lstlisting}
+
+其中 \code{x} 表示可执行权限。若没有执行权限，可以：
+
+\begin{lstlisting}[language=bash]
+chmod +x build-release/app
+\end{lstlisting}
+
+运行当前目录下的程序时通常写：
+
+\begin{lstlisting}[language=bash]
+./build-release/app
+\end{lstlisting}
+
+这里的 \code{./} 很重要。Shell 只会在 \code{PATH} 环境变量列出的目录里查找没有斜杠的命令名。当前目录通常不在 \code{PATH} 里，因此直接输入 \code{app} 可能找不到，或者更糟：执行了另一个同名程序。
+
+查看 PATH：
+
+\begin{lstlisting}[language=bash]
+printf '%s\n' "$PATH" | tr ':' '\n'
+which clang++
+command -v clang++
+\end{lstlisting}
+
+报告中若使用某个工具，最好记录它的真实路径和版本。比如同一台机器上可能同时安装系统 GCC、手动安装 Clang、Conda 环境里的编译器、交叉编译器。只写“用 clang++ 编译”有时不够，至少要保存 \code{clang++ --version}；如果结果异常，还要保存 \code{command -v clang++}。
+
+脚本还有一个特殊入口：shebang。脚本第一行如果是：
+
+\begin{lstlisting}[language=bash]
+#!/usr/bin/env bash
+\end{lstlisting}
+
+内核执行脚本时会用指定解释器运行它。若脚本没有可执行位，可以用：
+
+\begin{lstlisting}[language=bash]
+bash scripts/run.sh
+\end{lstlisting}
+
+这时执行的是 \code{bash}，脚本只是参数；若脚本有可执行位，可以：
+
+\begin{lstlisting}[language=bash]
+./scripts/run.sh
+\end{lstlisting}
+
+这时 shebang 决定解释器。教学实验里，脚本开头建议写清 shebang，并在报告中保存脚本内容或版本。
+
+\begin{warningbox}
+路径和权限问题经常伪装成程序错误。看到权限拒绝、命令不存在、文件不存在这类提示时，先检查执行路径、可执行位、工作目录、解释器和动态库依赖，不要马上改 C++ 逻辑。
+\end{warningbox}
+
+\section{标准输入、标准输出、标准错误和重定向}
+
+Linux 程序通常有三个基本流：
+
+\begin{itemize}
+  \item \code{stdin}：标准输入，文件描述符 0。
+  \item \code{stdout}：标准输出，文件描述符 1。
+  \item \code{stderr}：标准错误，文件描述符 2。
+\end{itemize}
+
+重定向让输出可以保存下来：
+
+\begin{lstlisting}[language=bash]
+./app > results/stdout.txt
+./app 2> results/stderr.txt
+./app > results/stdout.txt 2> results/stderr.txt
+./app > results/all.txt 2>&1
+\end{lstlisting}
+
+这对实验很重要。终端输出一滚过去就很难审计；保存到文件后，报告可以引用，别人可以检查。比如保存反汇编：
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel build-release/app > results/app.objdump.txt
+\end{lstlisting}
+
+管道把一个命令输出交给另一个命令：
+
+\begin{lstlisting}[language=bash]
+nm -C build-release/app | rg "sum|main"
+readelf -S build-release/app | sed -n '1,80p'
+\end{lstlisting}
+
+管道适合快速观察，但报告里最好同时保存完整原始输出。只保存过滤后的几行，可能会丢失上下文。
+
+\section{从单文件编译开始}
+
+先建立一个最小程序：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+#include <cstdio>
+
+extern "C" std::int32_t add_i32(std::int32_t a, std::int32_t b)
+{
+    return a + b;
+}
+
+int main()
+{
+    std::printf("%d\n", add_i32(1, 2));
+    return 0;
+}
+\end{lstlisting}
+
+用 GCC 或 Clang 编译：
+
+\begin{lstlisting}[language=bash]
+g++ -std=c++20 -Wall -Wextra -O0 -g main.cpp -o app_debug
+clang++ -std=c++20 -Wall -Wextra -O3 main.cpp -o app_release
+\end{lstlisting}
+
+这两条命令不是等价的。它们对应不同学习目的：
+
+\begin{itemize}
+  \item \code{-O0 -g}：保留更接近源码的调试结构，适合 GDB 学习。
+  \item \code{-O3}：启用强优化，更接近性能路径，适合阅读优化汇编。
+  \item \code{-Wall -Wextra}：打开常见警告，帮助发现代码问题。
+  \item \code{-std=c++20}：固定语言版本，减少不同默认设置造成的差异。
+\end{itemize}
+
+\begin{warningbox}
+不要用 \code{-O0} 汇编讨论性能。Debug 构建的目标是可调试，不是快。它可能把变量放到栈上，保留多余的 load/store，避免某些优化，生成和真实热路径完全不同的代码。
+\end{warningbox}
+
+\section{分阶段编译：看清工具链边界}
+
+为了理解工具链，不能只会一条 \code{g++ main.cpp -o app}。要能把编译拆开：
+
+\begin{lstlisting}[language=bash]
+g++ -std=c++20 -E main.cpp -o main.i
+g++ -std=c++20 -S -O2 -masm=intel main.cpp -o main.s
+g++ -std=c++20 -c -O2 main.cpp -o main.o
+g++ main.o -o app
+\end{lstlisting}
+
+每一步的产物不同：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+命令阶段 & 产物 & 观察重点 \\
+\midrule
+\code{-E} & \code{.i} & 宏、include、条件编译展开后编译器看到什么 \\
+\code{-S} & \code{.s} & 编译器选择了哪些汇编指令和标签 \\
+\code{-c} & \code{.o} & 目标文件、机器码、符号、重定位 \\
+link & executable & 最终可执行文件、入口、动态链接信息 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+学习时要同时看 \code{.s} 和 \code{objdump}。前者是编译器输出给汇编器的文本，后者是从目标文件或可执行文件中的机器码反汇编出来的文本。它们经常接近，但不是同一层证据。
+
+\section{多文件工程：头文件、定义和链接}
+
+真实程序很少只有一个源文件。考虑三个文件：
+
+\begin{lstlisting}[language=C++]
+// add.hpp
+#pragma once
+#include <cstdint>
+
+std::int32_t add_i32(std::int32_t a, std::int32_t b);
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++]
+// add.cpp
+#include "add.hpp"
+
+std::int32_t add_i32(std::int32_t a, std::int32_t b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++]
+// main.cpp
+#include "add.hpp"
+#include <cstdio>
+
+int main()
+{
+    std::printf("%d\n", add_i32(1, 2));
+}
+\end{lstlisting}
+
+编译：
+
+\begin{lstlisting}[language=bash]
+g++ -std=c++20 -O2 -c add.cpp -o add.o
+g++ -std=c++20 -O2 -c main.cpp -o main.o
+g++ add.o main.o -o app
+\end{lstlisting}
+
+如果忘了链接 \code{add.o}：
+
+\begin{lstlisting}[language=bash]
+g++ main.o -o app
+\end{lstlisting}
+
+链接器会报 undefined reference。这个错误不是语法错误，也不是运行时错误，而是链接阶段找不到某个符号定义。底层学习必须能区分：
+
+\begin{itemize}
+  \item 编译错误：单个翻译单元内部语法或语义不成立。
+  \item 链接错误：多个目标文件合成程序时符号无法解析或重复定义。
+  \item 运行时错误：程序已经生成并启动，但执行过程中出现错误。
+\end{itemize}
+
+这一区分后面看 ABI、符号、重定位和 C++ 与汇编互操作时非常重要。
+
+\section{CMake 的最低工作流}
+
+大型工程不应该长期手写一串编译命令。第一册不需要深入 CMake，但至少要会最小用法：
+
+\begin{lstlisting}
+cmake_minimum_required(VERSION 3.20)
+project(ch04_tools LANGUAGES CXX)
+
+add_executable(app
+    src/main.cpp
+    src/add.cpp
+)
+
+target_compile_features(app PRIVATE cxx_std_20)
+target_compile_options(app PRIVATE -Wall -Wextra)
+\end{lstlisting}
+
+构建：
+
+\begin{lstlisting}[language=bash]
+cmake -S . -B build-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build build-debug
+
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+\end{lstlisting}
+
+CMake 的价值不是“看起来专业”，而是把构建规则显式化。报告里可以写：
+
+\begin{lstlisting}
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --verbose
+\end{lstlisting}
+
+如果需要查看真实编译命令，可以打开：
+
+\begin{lstlisting}[language=bash]
+cmake -S . -B build-release \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+\end{lstlisting}
+
+然后查看 \filepath{build-release/compile_commands.json}。这个文件对编辑器、语言服务器、静态分析和复现实验都很有用。
+
+\subsection{CMake Presets：把配置写成文件}
+
+如果一个项目需要反复生成 Debug、Release、sanitizer 和 benchmark 构建，命令行参数会越来越长。CMake Presets 可以把常用配置写进 \filepath{CMakePresets.json}，让配置可复现。
+
+一个简化示例：
+
+\begin{lstlisting}
+{
+  "version": 6,
+  "configurePresets": [
+    {
+      "name": "debug",
+      "generator": "Ninja",
+      "binaryDir": "build-debug",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    },
+    {
+      "name": "release",
+      "generator": "Ninja",
+      "binaryDir": "build-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
+      }
+    }
+  ]
+}
+\end{lstlisting}
+
+使用：
+
+\begin{lstlisting}[language=bash]
+cmake --preset debug
+cmake --build --preset debug
+
+cmake --preset release
+cmake --build --preset release
+\end{lstlisting}
+
+Presets 的好处是减少“我这次忘了传某个参数”的问题。它也让报告更清楚：你可以写“使用 \code{release} preset 构建”，并把 preset 文件作为源码的一部分保存。大型项目还可以为 sanitizer、benchmark、不同编译器和交叉编译准备不同 preset。
+
+\begin{deepdive}
+Ninja 不是必须的生成器，但它输出简洁、增量构建快，常用于 CMake 工程。没有安装 Ninja 时，可以使用默认生成器；关键是把生成器和构建目录记录下来。
+\end{deepdive}
+
+\section{构建目录审计：确认你运行的是刚生成的程序}
+
+底层实验中，构建目录不是临时垃圾堆，而是证据来源。你应该能回答：这个可执行文件是什么时候生成的，由哪些目标文件链接而来，使用了哪些编译参数，是否来自当前源码。
+
+最基本的审计包括：
+
+\begin{itemize}
+  \item 查看可执行文件时间戳，确认它晚于源码修改。
+  \item 使用 verbose build 保存真实编译和链接命令。
+  \item 保存 \filepath{compile_commands.json}，确认每个源文件的参数。
+  \item 使用 \code{nm}、\code{readelf}、\code{objdump} 验证二进制内容。
+  \item 记录 Git commit 和 dirty status。
+\end{itemize}
+
+如果你使用 CMake，可以运行：
+
+\begin{lstlisting}[language=bash]
+cmake --build build-release --verbose \
+  > results/build.verbose.txt 2>&1
+\end{lstlisting}
+
+这个文件经常比你手写的“我用了 \code{-O3}”更可靠，因为它记录了真实调用。大型工程里，目标可能继承了很多参数，最终命令未必等于你以为的命令。
+
+还要注意增量构建。增量构建会跳过未变化目标，这本来是好事；但如果依赖关系写错，或者源码生成步骤没有被构建系统追踪，就可能运行旧产物。遇到难以解释的结果时，应该做一次干净构建：
+
+\begin{lstlisting}[language=bash]
+rm -rf build-release
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release --verbose
+\end{lstlisting}
+
+这不是每次实验都必须做，但当结论很重要或结果异常时，干净构建能排除一类常见错误。
+
+\begin{deepdive}
+很多“编译器怎么生成了奇怪代码”的问题，最后发现根本不是当前源码生成的二进制。审计构建目录的目的，就是在进入深层分析前先确认观察对象正确。
+\end{deepdive}
+
+\section{编译数据库：让工具看到同一个工程}
+
+\filepath{compile_commands.json} 是一个 JSON 文件，记录每个翻译单元的真实编译命令。它对底层学习有两个价值。
+
+第一，它让编辑器和语言服务器使用与构建系统一致的 include path、宏定义和语言标准。没有编译数据库，编辑器可能用错误参数解析源码，显示不存在的错误，或漏掉真实错误。
+
+第二，它让静态分析工具、格式化工具和审计脚本知道项目如何编译。比如一个文件只有在某个宏定义下才启用一段代码；如果工具没有看到相同宏定义，分析结论就可能不对应真实构建。
+
+生成方式：
+
+\begin{lstlisting}[language=bash]
+cmake -S . -B build-debug \
+  -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+\end{lstlisting}
+
+报告里引用编译数据库时，不必贴完整 JSON，但应说明它来自哪个构建目录。Debug 和 Release 的编译数据库可能不同，因为优化级别、宏定义和 include path 都可能变化。
+
+\section{链接命令也是性能证据}
+
+初学者常只关注编译命令，忽略链接命令。可是链接阶段会影响最终二进制形态。
+
+链接阶段可能决定：
+
+\begin{itemize}
+  \item 使用哪些目标文件和库。
+  \item 是否启用静态链接或动态链接。
+  \item 是否使用 LTO。
+  \item 是否生成 PIE。
+  \item 符号是否被导出、隐藏或丢弃。
+  \item 库搜索路径和运行时库路径。
+\end{itemize}
+
+例如开启 LTO 后，编译器可以跨翻译单元内联和优化；没有 LTO 时，一个源文件里的函数体可能对另一个源文件不可见。又比如动态链接的函数调用可能经过 PLT/GOT，手写汇编互操作时如果没有考虑 PIC/PIE，就可能在链接阶段出错或生成不合适的寻址。
+
+因此，后面分析 ABI 和 C++ 与汇编互操作时，不能只说“源文件编译通过”。必须看链接命令、符号表、重定位和最终可执行文件。链接命令是二进制证据链的一部分。
+
+\section{快速识别二进制：\code{file}、\code{ldd}、\code{size} 和 \code{strings}}
+
+在进入反汇编之前，有几条轻量命令能快速回答“这个文件大概是什么”。
+
+\begin{lstlisting}[language=bash]
+file build-release/app
+ldd build-release/app
+size build-release/app
+strings -a build-release/app | rg "version|error|usage"
+\end{lstlisting}
+
+\code{file} 会告诉你文件类型、目标架构、是否 PIE、是否 stripped、是否包含调试信息等线索。看到 \code{x86-64}、\code{dynamically linked}、\code{not stripped} 这些词时，要能把它们和后面的 ELF、动态链接、符号表联系起来。
+
+\code{ldd} 显示动态库依赖。它能帮助你确认程序运行时会加载哪些共享库，例如 \code{libstdc++}、\code{libc}、\code{libm}。如果程序在一台机器上能运行、另一台机器上找不到库，\code{ldd} 是第一批要看的工具之一。注意不要对不可信二进制随意运行 \code{ldd}；教学实验里使用自己构建的程序即可。
+
+\code{size} 给出 text、data、bss 大小。它不能替代性能分析，但能帮助发现明显异常。例如一个小程序的 text 段突然变大很多，可能是模板实例化、静态链接、sanitizer、调试辅助或大段内联导致。代码大小变化会影响 instruction cache 和前端压力，后续学习前端与代码尺寸时会再次用到。
+
+\code{strings} 从二进制中提取可打印字符串。它适合做粗略检查，例如确认版本字符串、错误消息、usage 文本是否进入二进制。但它不是结构化解析工具，不能替代 \code{readelf} 或符号表。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.35\linewidth}p{0.31\linewidth}}
+\toprule
+工具 & 回答的问题 & 主要限制 \\
+\midrule
+\code{file} & 文件类型、架构、PIE、strip 状态。 & 只给摘要，不解释内部结构。 \\
+\code{ldd} & 动态库依赖。 & 不适合不可信二进制。 \\
+\code{size} & 代码和数据段大小。 & 不能说明热路径在哪里。 \\
+\code{strings} & 二进制中可见字符串。 & 可能误判，也可能漏掉非文本信息。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些工具适合放在实验脚本开头，作为二进制档案的一部分。它们给出的不是最终结论，而是后续深入分析的导航线索。
+
+\section{动态链接的第一印象：程序不只包含自己的代码}
+
+大多数普通 Linux C++ 程序不是把所有代码都静态放进一个文件。它们会依赖共享库，例如 C 标准库、C++ 标准库、数学库、线程库或项目自己的 \filepath{.so}。程序启动时，动态链接器会把需要的共享库映射进进程地址空间，并解析一部分符号引用。
+
+查看依赖：
+
+\begin{lstlisting}[language=bash]
+ldd build-release/app
+readelf -d build-release/app
+\end{lstlisting}
+
+\code{ldd} 给出直观列表；\code{readelf -d} 查看 ELF 的 dynamic section，例如 \code{NEEDED} 项。若程序运行时报共享库找不到，常见原因包括：
+
+\begin{itemize}
+  \item 共享库没有安装。
+  \item 库路径不在系统搜索路径里。
+  \item \code{LD_LIBRARY_PATH} 没有设置或设置错误。
+  \item 二进制中 RPATH/RUNPATH 不符合预期。
+  \item 架构不匹配，例如拿 ARM 库给 x86-64 程序加载。
+\end{itemize}
+
+动态链接还会影响反汇编。调用外部函数时，最终可执行文件里可能出现 PLT/GOT 相关代码。第一册不要求现在就手写动态链接汇编，但要知道：看到 \instruction{call printf@plt} 并不奇怪，它表示调用路径经过过程链接表。目标文件、最终可执行文件和运行时实际跳转路径之间还有动态链接器参与。
+
+如果想看动态链接器加载库的过程，可以使用：
+
+\begin{lstlisting}[language=bash]
+LD_DEBUG=libs ./build-release/app 2> results/ld-debug-libs.txt
+\end{lstlisting}
+
+这个输出可能很长，只适合诊断，不适合每次都保存。报告中如果使用它，要说明目的：例如确认某个 \filepath{.so} 实际从哪个目录加载。
+
+\begin{warningbox}
+不要对不可信程序随意运行 \code{ldd} 或设置复杂的动态链接环境。教学实验使用自己构建的小程序即可。工程环境中分析第三方二进制时，应遵循安全隔离和最小权限原则。
+\end{warningbox}
+
+\subsection{静态链接、动态链接和性能结论}
+
+静态链接把更多库代码放入最终可执行文件，动态链接在运行时映射共享库。它们各有用途，也会影响文件大小、部署方式、符号解析、启动行为和反汇编形态。
+
+性能实验中，链接方式必须记录。比如一个 benchmark 如果静态链接了大型运行时库，text size 和 instruction cache 行为可能不同；如果动态调用某个库函数，第一次调用可能涉及 lazy binding；如果启用 LTO，跨库或跨目标文件优化能力又会变化。大多数基础实验不需要静态链接，但报告必须写清实际链接方式。
+
+可以用这些线索判断：
+
+\begin{lstlisting}[language=bash]
+file build-release/app
+ldd build-release/app
+readelf -d build-release/app | rg 'NEEDED|RUNPATH|RPATH'
+\end{lstlisting}
+
+如果 \code{ldd} 显示它不是动态可执行文件，说明这个程序不走普通动态链接路径。若 \code{file} 显示它是静态链接，也要记录。后面学习 ABI 和互操作时，链接方式会影响符号解析和调用边界。
+
+\section{构建类型：不要混淆目的}
+
+同一个程序可以有多种构建方式。每种构建方式回答的问题不同：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.28\linewidth}p{0.40\linewidth}}
+\toprule
+构建类型 & 常见参数 & 用途 \\
+\midrule
+Debug & \code{-O0 -g} & 源码级调试、变量观察、单步学习。 \\
+RelWithDebInfo & \code{-O2 -g} & 优化后仍保留调试信息，适合结合 GDB 和性能观察。 \\
+Release & \code{-O2} 或 \code{-O3} & 性能路径和最终二进制审计。 \\
+Sanitizer & \code{-fsanitize=address,undefined} & 检查越界、use-after-free、未定义行为。 \\
+Benchmark & \code{-O3 -DNDEBUG} 等 & 稳定测量，通常关闭 sanitizer，记录全部参数。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Debug 构建不能用于性能结论，sanitizer 构建也不能直接用于性能结论。sanitizer 会插入大量检查代码，改变内存布局、调用路径和运行时间。但 sanitizer 对正确性非常重要。正确流程通常是：
+
+\begin{enumerate}
+  \item Debug 或 sanitizer 构建验证 correctness。
+  \item Release 构建阅读优化汇编。
+  \item Benchmark 构建做性能测量。
+  \item 报告中明确写出每一步使用的构建类型。
+\end{enumerate}
+
+\section{警告和 sanitizer：优化前先保证程序有定义}
+
+性能学习不能建立在未定义行为上。下面的代码可能看起来能跑：
+
+\begin{lstlisting}[language=C++]
+int f(int* p)
+{
+    return p[10];
+}
+\end{lstlisting}
+
+如果调用时数组只有 4 个元素，这就是越界。优化器可以利用语言规则做出你意想不到的改写。先用 sanitizer 抓这类问题：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O1 -g \
+  -fsanitize=address,undefined \
+  main.cpp -o app_asan_ubsan
+./app_asan_ubsan
+\end{lstlisting}
+
+常用检查：
+
+\begin{itemize}
+  \item AddressSanitizer：越界、use-after-free、栈/堆内存错误。
+  \item UndefinedBehaviorSanitizer：有符号溢出、错误移位、空指针解引用等。
+  \item ThreadSanitizer：数据竞争，代价较大，后续并发专题再深入。
+\end{itemize}
+
+sanitizer 的结论也要保守。它能抓很多错误，但不能证明程序完全正确；它会改变运行行为，所以不能直接拿 sanitizer 下的时间当优化结果。
+
+\section{\code{objdump}：从机器码回到可读指令}
+
+\code{objdump} 是本书最常用工具之一。基本命令：
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel app > results/app.objdump.txt
+\end{lstlisting}
+
+参数含义：
+
+\begin{itemize}
+  \item \code{-d}：反汇编可执行段。
+  \item \code{-r}：显示重定位信息，目标文件阶段尤其有用。
+  \item \code{-w}：宽输出，不截断长行。
+  \item \code{-C}：demangle C++ 符号名。
+  \item \code{-Mintel}：使用 Intel 语法。
+\end{itemize}
+
+观察一个函数时，先找标签：
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel app | sed -n '/<add_i32>/,+20p'
+\end{lstlisting}
+
+不要只看指令文本，还要看三列信息：
+
+\begin{lstlisting}
+address:  bytes              instruction
+1140:     8d 04 37           lea eax, [rdi+rsi]
+1143:     c3                 ret
+\end{lstlisting}
+
+地址告诉你指令位于二进制中的位置；bytes 是 CPU 真正取到的机器码字节；instruction 是反汇编器给人的解释。读汇编时要记住：CPU 执行 bytes，不执行这一行文字。
+
+\subsection{阅读 objdump 的顺序}
+
+阅读 \code{objdump} 输出时，不建议从文件第一行一直读到最后。更有效的顺序是：
+
+\begin{enumerate}
+  \item 先找到目标函数标签。
+  \item 确认函数是否真的存在独立代码。
+  \item 看函数入口和结尾，判断是否有栈帧、保存寄存器、调用其他函数。
+  \item 找到核心循环或关键分支。
+  \item 标出内存访问指令和调用指令。
+  \item 对照源码，判断哪些语句被内联、删除、展开或改写。
+\end{enumerate}
+
+如果找不到函数，不要立刻认为编译失败。它可能被内联了，也可能因为未使用被删除，或者 C++ 符号名被 name mangling 改写。此时应配合 \code{nm -C}、\code{readelf -s} 和编译选项判断。
+
+阅读反汇编时还要区分目标文件和最终可执行文件。目标文件中的 \instruction{call} 或地址引用可能仍然带重定位信息，最终地址要等链接后才确定。最终可执行文件中，链接器已经解析了许多符号，但动态链接相关引用可能仍然通过 PLT/GOT 间接完成。
+
+\begin{warningbox}
+不要从反汇编里复制几行孤立指令就下结论。至少要确认这几行属于哪个函数、哪个构建类型、哪个地址范围，是否在热路径中，是否来自最终可执行文件。
+\end{warningbox}
+
+\subsection{源码行号和指令地址不是一一对应}
+
+带 \code{-g} 的反汇编或 GDB 可能显示源码行和指令的对应关系，但这个对应关系在优化后会变得复杂。一个源码行可能生成多条指令；多行源码可能合并成一段指令；某些行可能完全没有指令；一条指令也可能被调试信息关联到看似奇怪的源码位置。
+
+这不是工具错误，而是优化器改变了程序结构。比如内联会把被调用函数的代码放进调用者；循环展开会复制循环体；常量传播会删除分支；死代码删除会让某些源码行没有机器实现。
+
+所以，优化代码分析应以机器控制流和数据流为准，再回头解释源码语义。源码行号是导航线索，不是最终证据。
+
+\section{\code{nm}：符号表告诉你名字是否还存在}
+
+\code{nm} 查看符号：
+
+\begin{lstlisting}[language=bash]
+nm -C app | rg "add|main"
+\end{lstlisting}
+
+常见符号类型：
+
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+符号类型 & 含义 \\
+\midrule
+\code{T} & text 段中的全局函数符号。 \\
+\code{t} & text 段中的局部函数符号。 \\
+\code{U} & undefined，需要链接时从别处解析。 \\
+\code{D} & 已初始化全局数据。 \\
+\code{B} & BSS，未初始化全局数据。 \\
+\code{W} & weak symbol，弱符号。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果优化后某个函数在 \code{nm} 中消失，不一定是错误。它可能被内联、删除、合并或变成局部符号。性能报告不能只说“源码里有这个函数”，必须确认二进制里是否有独立函数体，以及热路径是否真的调用它。
+
+\subsection{符号不是函数存在的全部证据}
+
+符号表回答的是“二进制中有哪些名字和地址关系”，但它不是程序行为的完整描述。一个函数可能存在符号，却从来不在热路径被调用；一个函数可能没有独立符号，因为已经被内联到多个调用点；一个模板函数可能实例化出多个版本；一个 weak symbol 可能被别的定义覆盖。
+
+因此，使用 \code{nm} 时要把问题问具体：
+
+\begin{itemize}
+  \item 我关心的函数是否有定义。
+  \item 调用者目标文件是否仍有未解析引用。
+  \item 最终可执行文件中调用是否已经被链接到某个地址。
+  \item C++ name mangling 是否导致符号名和源码名不同。
+  \item 符号可见性是否影响动态链接边界。
+\end{itemize}
+
+后面讲 C++ 与汇编互操作时，\code{extern "C"} 的一个重要作用就是控制符号名，让汇编文件和 C++ 文件能在链接阶段说同一种名字。但它只解决名字问题，不解决参数寄存器、栈对齐、返回值、异常和对象生命周期问题。
+
+\section{\code{readelf}：ELF 文件结构}
+
+\code{readelf} 直接查看 ELF 元数据：
+
+\begin{lstlisting}[language=bash]
+readelf -h app
+readelf -S app
+readelf -l app
+readelf -s app
+readelf -r app
+\end{lstlisting}
+
+最常看的几类信息：
+
+\begin{itemize}
+  \item ELF header：文件类型、机器架构、入口地址。
+  \item sections：\code{.text}、\code{.rodata}、\code{.data}、\code{.bss}、\code{.eh_frame} 等。
+  \item program headers：加载器如何把文件映射进进程地址空间。
+  \item symbol table：符号定义和引用。
+  \item relocations：哪些地址需要链接器或动态链接器修补。
+\end{itemize}
+
+第一册不要求你精通 ELF，但必须知道：可执行文件不是“纯机器码数组”。它是一个结构化文件，包含代码、数据、符号、重定位、调试/展开信息和加载描述。后续学习 ABI、动态链接、C++ 与汇编互操作时，这个认识会反复用到。
+
+\subsection{section 和 segment 的区别}
+
+ELF 里有两个容易混淆的概念：section 和 segment。
+
+section 更偏向链接视角，例如 \code{.text}、\code{.rodata}、\code{.data}、\code{.bss}、\code{.symtab}、\code{.rela.text}。链接器使用 section 组织代码、数据、符号和重定位。
+
+segment 更偏向加载视角。程序启动时，加载器按照 program header 描述把文件的一些范围映射到进程地址空间，并设置读、写、执行权限。多个 section 可以落在同一个 load segment 中。比如 \code{.text} 和某些只读元数据可能都在只读可执行或只读映射附近。
+
+为什么这对底层学习重要？因为“文件里有什么”和“运行时映射成什么权限”不是同一层问题。你用 \code{readelf -S} 看 section，用 \code{readelf -l} 看 loader 如何映射。调试执行权限、只读数据、栈不可执行、动态链接和地址布局时，这个区别很关键。
+
+\subsection{重定位说明地址还没有完全固定}
+
+目标文件里的某些地址无法在编译单个源文件时确定。比如调用另一个翻译单元的函数，编译器可以生成一个占位引用，并让 relocation 记录告诉链接器以后如何修补。
+
+查看目标文件：
+
+\begin{lstlisting}[language=bash]
+readelf -r build-release/main.o
+objdump -drwC -Mintel build-release/main.o
+\end{lstlisting}
+
+你可能看到某条 \instruction{call} 附近带有重定位项。这意味着反汇编中的立即数或目标地址不能按最终地址理解。链接后再看最终可执行文件，目标可能已经变成具体地址，或者变成 PLT 项。
+
+这也是为什么学习链接不能只读源码。源码层写的是函数名；目标文件层保存符号引用和重定位；可执行文件层才接近运行时控制流。
+
+\section{GDB 的基本心智模型}
+
+GDB 不是魔法调试器。它依赖三类信息：
+
+\begin{itemize}
+  \item 可执行文件中的机器码和符号。
+  \item 编译器生成的调试信息，例如 \code{-g}。
+  \item 运行中进程的寄存器、内存和控制权。
+\end{itemize}
+
+最小调试命令：
+
+\begin{lstlisting}[language=bash]
+g++ -std=c++20 -O0 -g main.cpp -o app_debug
+gdb -q ./app_debug
+\end{lstlisting}
+
+GDB 中：
 
 \begin{lstlisting}
 break main
 run
 next
 step
-stepi
+print x
+info locals
 info registers
 x/10i $rip
+x/32xb $rsp
 disassemble /m main
+quit
 \end{lstlisting}
 
-\section{实验记录}
-
-每次实验至少记录：
+这些命令分成几类：
 
 \begin{itemize}
-  \item 日期。
-  \item CPU 和 OS。
-  \item 编译器版本。
-  \item 编译 flags。
-  \item 输入规模。
-  \item 命令。
-  \item 原始输出。
-  \item 结论。
+  \item 控制执行：\code{run}、\code{continue}、\code{next}、\code{step}。
+  \item 观察源码变量：\code{print}、\code{info locals}。
+  \item 观察机器状态：查看寄存器、当前指令和栈内存。
+  \item 观察代码：\code{disassemble}、\code{layout asm}。
 \end{itemize}
 
-\section{习题}
+源码级调试和指令级调试要区分。源码级 \code{next} 以源代码行为为单位，指令级 \code{stepi} 以机器指令为单位。学习汇编和 ABI 时，必须会用 \code{stepi}。
+
+\subsection{断点、观察点和条件断点}
+
+最常见的断点是函数断点和源码行断点：
+
+\begin{lstlisting}
+break main
+break src/main.cpp:42
+\end{lstlisting}
+
+指令级学习时，也可以在地址上下断点：
+
+\begin{lstlisting}
+break *0x401140
+\end{lstlisting}
+
+星号表示把后面的值当成地址，而不是函数名或源码行。使用地址断点前，要确认当前二进制是否启用 PIE，以及地址是否会因为 ASLR 变化。调试教学中如果地址变化造成困扰，可以临时关闭随机化：
+
+\begin{lstlisting}
+set disable-randomization on
+\end{lstlisting}
+
+条件断点适合循环：
+
+\begin{lstlisting}
+break sum_i32 if n == 1024
+break src/main.cpp:30 if i == 100
+\end{lstlisting}
+
+但条件断点可能显著减慢程序，因为调试器需要频繁停下检查条件。性能测量时不能带着 GDB 条件断点运行后下结论。
+
+观察点用于监控某个内存位置何时被读写：
+
+\begin{lstlisting}
+watch variable
+rwatch variable
+awatch variable
+\end{lstlisting}
+
+它对定位“谁改坏了这个值”很有用。但硬件观察点数量有限，复杂表达式也可能退化成很慢的软件观察。使用时要把它当作调试工具，而不是性能工具。
+
+\subsection{崩溃时先看四件事}
+
+程序崩溃时，初学者容易直接猜原因。更好的流程是先收集四类证据：
+
+\begin{enumerate}
+  \item 信号是什么，例如 \code{SIGSEGV}、\code{SIGILL}、\code{SIGABRT}。
+  \item \register{rip} 在哪里，当前指令是什么。
+  \item 关键寄存器是什么，尤其是参与地址计算的寄存器。
+  \item 调用栈是什么，最近的函数调用路径是否合理。
+\end{enumerate}
+
+GDB 中常用：
+
+\begin{lstlisting}
+run
+bt
+info registers
+x/10i $rip
+disassemble /r $rip-32, $rip+32
+\end{lstlisting}
+
+如果当前指令是 load 或 store，要计算它访问的地址，并判断该地址是否合理。比如当前指令从 \register{rdi} 指向的位置读取 32 位整数，第一眼应该看 \register{rdi}。如果 \register{rdi} 是 0 或很小的值，可能是空指针或野指针；如果地址看似合理，还要看页面权限、对象生命周期和是否越界。
+
+如果当前指令是 \instruction{ret} 崩溃，要怀疑返回地址或栈被破坏。此时 \register{rsp}、栈顶内容、调用约定和前面的 store 都是重点。
+
+\begin{warningbox}
+崩溃定位不要先从“代码大概想做什么”开始，而要先从“CPU 正在执行哪条指令、它访问哪个地址、哪个状态不合理”开始。底层调试的证据顺序很重要。
+\end{warningbox}
+
+\section{\filepath{/proc}：从内核视角观察进程}
+
+Linux 的 \filepath{/proc} 提供了一个观察进程状态的接口。它不是普通磁盘目录，而是内核导出的伪文件系统。对底层实验来说，\filepath{/proc/<pid>} 能回答很多“进程现在到底是什么状态”的问题。
+
+先启动一个程序，并找到进程号：
+
+\begin{lstlisting}[language=bash]
+./build-release/app &
+pid=$!
+echo "$pid"
+\end{lstlisting}
+
+然后观察：
+
+\begin{lstlisting}[language=bash]
+cat /proc/$pid/cmdline | tr '\0' ' '
+tr '\0' '\n' < /proc/$pid/environ | sort
+readlink /proc/$pid/cwd
+readlink /proc/$pid/exe
+ls -l /proc/$pid/fd
+cat /proc/$pid/maps
+\end{lstlisting}
+
+这些文件分别告诉你：
+
+\begin{itemize}
+  \item \filepath{cmdline}：进程启动时的参数。
+  \item \filepath{environ}：进程环境变量。
+  \item \filepath{cwd}：当前工作目录。
+  \item \filepath{exe}：实际运行的可执行文件。
+  \item \filepath{fd}：打开的文件描述符。
+  \item \filepath{maps}：虚拟地址空间映射。
+\end{itemize}
+
+\filepath{maps} 对理解 GDB 和崩溃尤其有用。它会显示可执行文件、共享库、堆、栈、匿名映射等地址范围和权限。例如一行里可能有 \code{r-xp}，表示这段映射可读、可执行、私有；也可能有 \code{rw-p}，表示可读写但不可执行。若 \register{rip} 落在没有执行权限的区域，或者崩溃地址不属于任何映射，原因就更清楚。
+
+这也解释了 PIE 和 ASLR 为什么影响调试。启用位置无关可执行文件和地址随机化后，同一个函数每次运行的绝对地址可能变化。反汇编文件中的地址、GDB 中的运行时地址和 \filepath{/proc/<pid>/maps} 中的加载基址要结合起来看。教学实验中如果需要稳定地址，可以在 GDB 中临时使用：
+
+\begin{lstlisting}
+set disable-randomization on
+\end{lstlisting}
+
+但报告中要说明这一点，因为关闭随机化改变了运行环境。
+
+\begin{deepdive}
+\filepath{/proc} 是工具背后的证据来源之一。GDB、ps、top、lsof 等工具都可能从内核接口读取进程信息。学会直接看少量 \filepath{/proc} 文件，可以帮助你判断工具输出到底来自哪里。
+\end{deepdive}
+
+\subsection{core dump：让崩溃现场留下来}
+
+交互式 GDB 适合本地调试，但程序有时在脚本、CI 或长时间运行后崩溃。此时 core dump 可以保存崩溃时的进程快照，让你事后用 GDB 分析。
+
+先查看和开启 core dump 限制：
+
+\begin{lstlisting}[language=bash]
+ulimit -c
+ulimit -c unlimited
+\end{lstlisting}
+
+运行程序崩溃后，如果系统生成了 core 文件，可以这样打开：
+
+\begin{lstlisting}[language=bash]
+gdb -q build-debug/app core
+\end{lstlisting}
+
+进入 GDB 后仍然先看：
+
+\begin{lstlisting}
+bt
+info registers
+x/10i $rip
+disassemble /r $rip-32, $rip+32
+\end{lstlisting}
+
+不同 Linux 发行版对 core dump 的保存方式不同。
+有的会在当前目录生成 \filepath{core} 文件。
+有的会把崩溃信息交给 \code{systemd-coredump} 管理。
+如果当前目录没有看到 core 文件，可以尝试：
+
+\begin{lstlisting}[language=bash]
+coredumpctl list
+coredumpctl gdb
+\end{lstlisting}
+
+core dump 不是万能的。若二进制和 core 不匹配，调试信息缺失，或程序被 strip，分析会困难很多。因此保存崩溃现场时，也要保存对应二进制、构建参数和源码版本。
+
+\begin{keyidea}
+崩溃报告至少要绑定三样东西：core dump、对应二进制、对应源码/构建信息。只有 core 文件，没有二进制和调试信息，证据链是不完整的。
+\end{keyidea}
+
+\section{GDB 单步函数调用}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_i32(int a, int b)
+{
+    return a + b;
+}
+
+int main()
+{
+    return add_i32(10, 32);
+}
+\end{lstlisting}
+
+用 \code{-O0 -g} 编译后，在 GDB 中：
+
+\begin{lstlisting}
+break main
+run
+disassemble /m main
+info registers rip rsp rdi rsi rax
+stepi
+stepi
+x/4gx $rsp
+\end{lstlisting}
+
+观察重点不是“按了多少次回车”，而是回答：
+
+\begin{itemize}
+  \item 调用前参数在哪里。
+  \item \instruction{call} 执行后 \register{rsp} 如何变化。
+  \item 返回地址保存在哪里。
+  \item 进入 \code{add_i32} 后 \register{rip} 指向哪里。
+  \item 返回后 \register{rax} 或 \register{eax} 是否保存返回值。
+\end{itemize}
+
+这就是把 ABI 表格变成机器证据的第一步。
+
+\section{调试信息不是程序语义本身}
+
+\code{-g} 会让编译器在二进制中写入调试信息。调试信息描述源码文件、行号、变量、类型、作用域和机器地址之间的关系。GDB 依赖这些信息把机器状态解释回源码世界。
+
+但调试信息不是程序语义本身，它可能不完整，也可能因为优化而变得难读。比如变量被调试器标成 optimized out，并不表示程序没有这个概念上的变量，而是当前机器位置无法提供一个简单的存放位置。又比如一个变量在函数前半段位于寄存器，后半段被消除，调试器显示可能随位置变化。
+
+所以调试时要区分三件事：
+
+\begin{itemize}
+  \item 源码变量：C++ 语义层的名字。
+  \item 调试信息位置：编译器告诉调试器变量此刻可能在哪里。
+  \item 机器状态：寄存器、内存和指令地址的真实值。
+\end{itemize}
+
+当三者看起来矛盾时，先相信机器状态，再检查调试信息和优化。比如 GDB 显示某个局部变量值奇怪，但反汇编证明变量已经被常量传播或拆分，这时不能用调试器显示直接否定二进制。
+
+\section{工具会改变被观察对象}
+
+工具提供证据，但工具本身也可能改变程序行为。高质量实验必须说明这种影响。
+
+GDB 会控制被调试进程。断点通常通过修改指令字节或使用硬件断点实现；单步执行会频繁让进程停下并交还控制权；条件断点可能让循环慢几个数量级。因此 GDB 适合解释状态，不适合直接给出性能结论。
+
+sanitizer 会在编译期插入检查代码。AddressSanitizer 会改变内存分配、增加红区、插入访问检查；UndefinedBehaviorSanitizer 会插入运行时诊断；ThreadSanitizer 会大幅改变线程调度和访存成本。因此 sanitizer 适合发现错误，不适合直接代表 Release 性能。
+
+\code{strace} 会拦截系统调用并记录参数和返回值。它对系统调用密集程序影响明显。它适合判断文件、路径、权限、进程、网络和系统调用错误，不适合测量正常运行速度。
+
+\code{perf stat} 的干扰通常比 GDB 和 \code{strace} 小，但也不是绝对零开销。计数器复用、权限限制、虚拟化环境、CPU 频率变化、调度迁移都会影响结果。第 11 章会系统讲这些限制。
+
+因此，报告里最好把工具角色写清楚：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+工具 & 适合回答的问题 & 主要干扰 \\
+\midrule
+GDB & 某一刻寄存器、内存、调用栈是什么。 & 断点、单步、调试信息和优化错位。 \\
+sanitizer & 程序是否触发内存错误或未定义行为。 & 插桩改变代码和内存布局。 \\
+\code{strace} & 程序请求了哪些系统调用。 & 拦截系统调用，显著变慢。 \\
+\code{perf stat} & 运行时事件计数大致如何。 & 权限、复用、调度、虚拟化、频率。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keyidea}
+没有无扰动观察。工程上要做的是理解工具扰动，把工具用于它擅长的问题，并在报告中说明结论边界。
+\end{keyidea}
+
+\section{调试优化代码为什么困难}
+
+很多读者会问：既然性能路径是 \code{-O3}，为什么还要学 \code{-O0 -g}？答案是两者回答不同问题。Debug 构建适合建立源码和机器状态的初始对应关系；优化构建适合研究真实性能路径。
+
+优化代码调试会遇到：
+
+\begin{itemize}
+  \item 变量被放进寄存器或直接消失。
+  \item 函数被内联，调用栈看起来和源码不同。
+  \item 循环被展开、向量化或重排。
+  \item 源码行号和指令地址不再一一对应。
+  \item 某些变量显示为 optimized out。
+\end{itemize}
+
+这不是 GDB 坏了，而是优化器改变了程序结构。正确做法是：
+
+\begin{enumerate}
+  \item 用 \code{-O0 -g} 学习基本控制流和状态变化。
+  \item 用 \code{-O2 -g} 或 \code{-O3 -g} 观察优化后的真实路径。
+  \item 用 \code{objdump} 作为最终二进制证据。
+  \item 报告里说明当前观察属于哪种构建。
+\end{enumerate}
+
+\section{\code{time}、\code{perf} 和本册的测量边界}
+
+本章只给最小测量工具意识，系统 benchmark 放到第三部分。
+
+\code{time} 可以粗略看程序整体时间：
+
+\begin{lstlisting}[language=bash]
+/usr/bin/time -v ./app
+\end{lstlisting}
+
+但它测的是整个进程，不是某个 kernel。启动、动态链接、输入输出、初始化都可能混进去。
+
+\code{perf stat} 可以尝试获取硬件或内核计数：
+
+\begin{lstlisting}[language=bash]
+perf stat ./app
+perf stat -e cycles,instructions,branches,branch-misses ./app
+\end{lstlisting}
+
+注意几个限制：
+
+\begin{itemize}
+  \item 虚拟机、容器、WSL2 里 PMU 可能不可用或不准确。
+  \item 不同 CPU 的事件名称和语义可能不同。
+  \item 权限设置可能禁止普通用户读取某些事件。
+  \item \code{perf stat} 默认测整个进程，不自动知道你的热路径在哪里。
+\end{itemize}
+
+所以本章只要求你能运行、保存输出、知道限制。第 11 章和第 12 章会把测量结构系统化。
+
+\section{\code{strace}：观察程序和内核的边界}
+
+有些问题不是单靠源码和反汇编能快速看出来的。程序为什么找不到文件？为什么启动时读了很多路径？为什么一直阻塞？为什么动态库加载失败？这类问题常发生在用户程序和操作系统边界，\code{strace} 可以记录系统调用。
+
+基本用法：
+
+\begin{lstlisting}[language=bash]
+strace -o results/app.strace.txt ./app
+strace -f -o results/app.strace.txt ./app
+strace -e trace=openat,read,write,execve ./app
+\end{lstlisting}
+
+\code{strace} 输出的每一行大致是一次系统调用及其返回值。例如打开文件、读取、写入、创建进程、映射内存、退出。若程序报“文件不存在”，可以在 \code{strace} 中搜索 \code{ENOENT}；若程序启动很慢，可以看是否反复查找动态库、配置文件或字体文件；若程序卡住，可以看最后停在哪个系统调用。
+
+\code{strace} 的定位价值在于分层。比如程序运行失败，GDB 看到的可能只是某个库函数返回错误；\code{strace} 能告诉你底层系统调用返回了什么错误码。再比如 benchmark 结果异常慢，\code{strace} 可以帮助确认 timed region 外是否意外发生大量 I/O 或系统调用。
+
+但 \code{strace} 会显著改变程序运行速度，不适合直接做性能测量。它是诊断工具，不是 benchmark 工具。报告中使用 \code{strace} 时，应说明它用于解释行为，不用于给出时间结论。
+
+\begin{warningbox}
+\code{strace} 看到的是用户态程序请求内核服务的边界，不是 CPU 执行的全部细节。它能解释文件、进程、内存映射和系统调用问题，但不能替代反汇编、GDB 或 PMU。
+\end{warningbox}
+
+\section{环境记录：实验从机器档案开始}
+
+每次实验都应该有环境记录。最低内容：
+
+\begin{lstlisting}[language=bash]
+mkdir -p results
+{
+  date
+  uname -a
+  lscpu
+  g++ --version
+  clang++ --version
+  cmake --version
+} > results/environment.txt 2>&1
+\end{lstlisting}
+
+如果使用 Git，还要记录：
+
+\begin{lstlisting}[language=bash]
+git rev-parse HEAD >> results/environment.txt
+git status --short >> results/environment.txt
+\end{lstlisting}
+
+为什么要记录 dirty status？因为未提交修改会影响实验可复现性。报告里写一个 commit，但工作区还有未记录改动，别人按 commit 复现时可能得到不同结果。
+
+\section{命令记录：让实验能重放}
+
+建议每个实验维护一个 \filepath{commands.txt}：
+
+\begin{lstlisting}
+# build
+clang++ -std=c++20 -O3 -DNDEBUG src/main.cpp -o build-release/app
+
+# inspect
+objdump -drwC -Mintel build-release/app > results/app.objdump.txt
+nm -C build-release/app > results/app.nm.txt
+readelf -S build-release/app > results/app.sections.txt
+
+# run
+./build-release/app --size 1048576 --repetitions 31 \
+  > results/run.txt 2>&1
+\end{lstlisting}
+
+注意：命令记录不是日记。它应该能被另一个人复制执行。不要写“运行程序看看”，要写完整命令、参数、工作目录和输出路径。
+
+\section{报告结构：把观察变成知识}
+
+本章开始，所有实验报告至少包含：
+
+\begin{itemize}
+  \item 实验目标：本次要验证什么。
+  \item 环境：机器、系统、编译器、构建类型。
+  \item 源码：相关文件路径或关键片段。
+  \item 命令：完整编译、观察、运行命令。
+  \item 工具输出：反汇编、符号表、GDB 记录或测量数据。
+  \item 解释：把输出和模型对应起来。
+  \item 限制：哪些结论不能从本实验推出。
+  \item 下一步：还需要什么实验验证。
+\end{itemize}
+
+好的报告不一定长，但必须可审计。比如“\code{-O3} 更快”不是合格结论；“在这个输入规模下，\code{-O3} 版本被内联并生成了更短的循环，原始样本显示 median 从 X 变到 Y，但本实验没有控制 CPU 频率，所以只能作为初步趋势”才像工程结论。
+
+\section{证据链模板：从问题到工具输出}
+
+底层学习最需要训练的是证据链，而不是命令记忆。一个合格证据链应该能回答：我为什么运行这个工具，工具输出里的哪一行支持我的判断，还有哪些可能解释没有排除。
+
+下面给出几类常见问题的证据链模板。
+
+\subsection{证明一个函数是否存在独立机器码}
+
+问题：源码里有 \code{foo}，优化后二进制里是否还有独立函数体？
+
+建议证据：
+
+\begin{enumerate}
+  \item 保存编译命令和构建类型。
+  \item 用 \code{nm -C app | rg "foo"} 查看符号是否存在。
+  \item 用 \code{objdump -drwC -Mintel app} 搜索 \code{<foo>} 标签。
+  \item 在调用者反汇编中查找是否有 \instruction{call} 到 \code{foo}。
+  \item 若没有独立符号，检查是否被内联、删除或名称改写。
+\end{enumerate}
+
+结论写法示例：在当前 \code{-O3} 构建下，\code{foo} 没有出现在最终可执行文件符号表中，调用者也没有 \instruction{call} 到 \code{foo}，因此当前证据支持“该函数在此构建中被内联或删除”。如果要区分内联和删除，还需要看调用点语义和生成指令。
+
+\subsection{证明一次崩溃来自某个非法地址}
+
+问题：程序 \code{SIGSEGV}，是否因为当前指令访问了非法地址？
+
+建议证据：
+
+\begin{enumerate}
+  \item 在 GDB 或 core dump 中记录信号。
+  \item 记录 \register{rip} 和当前指令。
+  \item 记录参与地址计算的寄存器。
+  \item 计算有效地址。
+  \item 查看 \filepath{/proc/<pid>/maps} 或 core 对应映射，判断地址是否属于合法映射和权限是否允许。
+  \item 若使用 sanitizer，也保存 sanitizer 报告作为补充证据。
+\end{enumerate}
+
+结论写法示例：当前指令是从 \register{rdi} 指向地址读取 4 字节，崩溃时 \register{rdi} 为 0，因此这是一次空指针附近地址的非法读取。这个结论来自机器状态，不只是源码猜测。
+
+\subsection{证明性能实验测的是目标代码}
+
+问题：benchmark 变快了，如何证明测的是刚刚修改的目标代码？
+
+建议证据：
+
+\begin{enumerate}
+  \item 记录 Git commit、dirty status 和 diff 摘要。
+  \item 保存完整构建命令或 verbose build。
+  \item 保存可执行文件时间戳和路径。
+  \item 保存目标函数反汇编。
+  \item 保存 benchmark 输入规模、重复次数和原始样本。
+  \item 若结论依赖硬件事件，保存 \code{perf stat} 命令和输出。
+\end{enumerate}
+
+结论写法示例：当前结果对应 \code{build-release/app}，该文件在本次构建日志之后生成；反汇编显示目标函数包含四路展开循环；raw samples 保存于 \filepath{results/raw.csv}。因此至少可以确认测量对象不是旧二进制。至于变快是否来自展开减少分支，还需要更多控制实验。
+
+\begin{mentalmodel}
+工具输出不是越多越好。每一份输出都应该回答一个明确问题，并在报告中被引用到具体判断。
+\end{mentalmodel}
+
+\section{工具选择决策树：先问问题再选命令}
+
+初学者常见做法是遇到问题就把所有工具都跑一遍：\code{file}、\code{ldd}、\code{objdump}、\code{readelf}、\code{gdb}、\code{strace}、\code{perf}。这样看起来很努力，但输出越多，越容易迷失。更好的方法是先把问题分类，再选择最短证据路径。
+
+\subsection{程序没有生成}
+
+如果程序没有生成可执行文件，先不要看 GDB，也不要看 \code{perf}。问题还停留在构建阶段。
+
+检查顺序：
+
+\begin{enumerate}
+  \item 编译命令是否真的执行，退出码是否为 0。
+  \item 错误来自编译阶段还是链接阶段。
+  \item 若是编译错误，看具体翻译单元、include path、宏定义、语言标准。
+  \item 若是链接错误，用 \code{nm -C} 检查目标文件里符号定义和引用。
+  \item 若是构建系统问题，查看 verbose build 和 \filepath{compile_commands.json}。
+\end{enumerate}
+
+典型工具：
+
+\begin{lstlisting}[language=bash]
+cmake --build build-release --verbose
+nm -C build-release/*.o | rg "symbol_name"
+rg "symbol_name" src include
+\end{lstlisting}
+
+这类问题的证据是构建日志和符号表，不是运行时输出。
+
+\subsection{程序生成了但无法启动}
+
+如果可执行文件存在，但运行时报“permission denied”“command not found”“No such file or directory”“cannot open shared object file”，通常先看文件身份、权限、解释器和动态库。
+
+检查顺序：
+
+\begin{enumerate}
+  \item 路径是否正确，是否运行了旧文件。
+  \item 文件是否有执行权限。
+  \item \code{file} 是否显示目标架构匹配当前机器。
+  \item 动态库是否能找到。
+  \item 当前工作目录和环境变量是否符合预期。
+\end{enumerate}
+
+典型工具：
+
+\begin{lstlisting}[language=bash]
+pwd
+ls -l build-release/app
+file build-release/app
+ldd build-release/app
+readelf -d build-release/app | rg 'NEEDED|RPATH|RUNPATH'
+\end{lstlisting}
+
+不要直接改源码逻辑。程序还没真正进入你的业务代码，错误可能来自启动环境。
+
+\subsection{程序启动后崩溃}
+
+如果程序启动后 \code{SIGSEGV}、\code{SIGABRT} 或 sanitizer 报错，问题进入运行时状态。此时需要定位崩溃点、调用链、寄存器、内存地址和对象生命周期。
+
+检查顺序：
+
+\begin{enumerate}
+  \item 用 Debug 或 sanitizer 构建复现。
+  \item GDB 中查看 backtrace 和当前指令。
+  \item 查看寄存器和参与地址计算的值。
+  \item 若有 core dump，确认 core 和二进制匹配。
+  \item 使用 sanitizer 报告补充对象边界和生命周期信息。
+\end{enumerate}
+
+典型工具：
+
+\begin{lstlisting}[language=bash]
+gdb -q ./build-debug/app
+bt
+info registers
+x/10i $rip
+disassemble /r $rip-32, $rip+32
+\end{lstlisting}
+
+如果崩溃只在 Release 出现，不要马上说“编译器 bug”。先检查未定义行为、未初始化数据、越界、use-after-free、数据竞争和 ABI 破坏。
+
+\subsection{程序结果不对}
+
+结果错误不一定会崩溃。它可能来自算法 bug、输入错误、未定义行为、浮点误差、ABI 不匹配、链接到错误库、读取了错误文件。此时要先建立 reference，再比较数据流。
+
+检查顺序：
+
+\begin{enumerate}
+  \item 输入文件、命令行参数和工作目录是否正确。
+  \item reference 实现是否给出不同结果。
+  \item Debug 和 Release 结果是否一致。
+  \item sanitizer 是否报告错误。
+  \item 若涉及跨语言或手写汇编，检查 ABI 和寄存器保存。
+\end{enumerate}
+
+典型工具：
+
+\begin{lstlisting}[language=bash]
+strace -e openat ./app input.txt
+diff expected.txt actual.txt
+gdb -q ./app
+objdump -drwC -Mintel ./app > results/app.objdump.txt
+\end{lstlisting}
+
+这里 \code{strace} 可以帮助确认程序实际打开了哪个文件；GDB 和反汇编帮助确认数据如何流过函数边界。
+
+\subsection{程序结果正确但性能异常}
+
+性能异常是最后一类问题，不应跳过前面的正确性和二进制身份检查。先确认测的是当前二进制、结果正确、timed region 干净，再讨论 cache、分支、频率和 PMU。
+
+检查顺序：
+
+\begin{enumerate}
+  \item 构建命令、Git 状态、二进制时间戳是否匹配。
+  \item benchmark 是否保存 raw samples。
+  \item 结果是否通过 reference。
+  \item 反汇编是否显示目标代码存在。
+  \item 输入规模、distribution、batch、warmup 是否记录。
+  \item 环境和 PMU 证据是否支持性能解释。
+\end{enumerate}
+
+典型工具：
+
+\begin{lstlisting}[language=bash]
+git rev-parse HEAD
+git status --short
+objdump -drwC -Mintel build-release/bench > results/bench.objdump.txt
+perf stat -r 10 ./build-release/bench
+\end{lstlisting}
+
+性能问题最容易被讲成故事。工具选择决策树的作用，就是让你先排除低层错误，再进入高层解释。
+
+\begin{keyidea}
+工具选择不是“会不会用某个命令”，而是能否把问题定位到构建、启动、运行、正确性或性能层。问题层次错了，工具再多也只会制造噪声。
+\end{keyidea}
+
+\section{把事实、解释和建议分开写}
+
+实验报告最常见的问题不是数据少，而是把事实、解释和建议混在一起。工程报告应该让读者清楚知道：哪些是工具直接给出的事实，哪些是你基于模型做出的解释，哪些是下一步行动。
+
+事实是可以被复查的内容。例如：
+
+\begin{itemize}
+  \item 编译命令是某一条具体命令。
+  \item \code{objdump} 显示某个函数中有一条 \instruction{call}。
+  \item \code{nm} 显示某个符号是 undefined。
+  \item GDB 中 \register{rdi} 在崩溃时等于某个地址。
+  \item benchmark 原始样本有若干个数值。
+\end{itemize}
+
+解释是你对事实的模型化理解。例如：
+
+\begin{itemize}
+  \item 这个 \instruction{call} 存在，说明该构建下函数没有被内联到调用点。
+  \item \register{rdi} 是空值，所以当前崩溃可能来自空指针解引用。
+  \item Release 版本更快，可能是循环被展开并减少了分支开销。
+  \item 随机访问更慢，可能是 cache miss 和 TLB miss 增多。
+\end{itemize}
+
+建议是下一步要做什么。例如：
+
+\begin{itemize}
+  \item 增加 sanitizer 构建确认是否存在越界。
+  \item 保存最终可执行文件的反汇编，而不只看目标文件。
+  \item 用更大的样本数重新测量。
+  \item 增加 PMU 事件验证 cache miss 假设。
+\end{itemize}
+
+报告里应当避免把解释伪装成事实。比如“这个程序慢是因为 cache miss”如果没有计数器、访问模式分析或控制实验支持，就应该写成“当前假设是 cache miss 增多”。这种写法不是软弱，而是严谨。
+
+\section{最小可复现实验包}
+
+后续每个章节实验都建议形成一个最小可复现实验包。它不一定要复杂，但至少包含：
+
+\begin{itemize}
+  \item 源码文件或源码路径。
+  \item 构建脚本或完整命令。
+  \item 环境记录。
+  \item 原始工具输出。
+  \item 原始运行结果。
+  \item 简短报告。
+\end{itemize}
+
+目录可以这样组织：
+
+\begin{lstlisting}
+results/
+  README.md
+  environment.txt
+  commands.txt
+  build.verbose.txt
+  app.objdump.txt
+  app.nm.txt
+  app.readelf-sections.txt
+  gdb-session.txt
+  raw-samples.csv
+  report.md
+\end{lstlisting}
+
+\filepath{README.md} 用来说明如何重新运行实验；\filepath{commands.txt} 保存命令；\filepath{report.md} 写事实、解释和限制。原始数据不要只嵌在报告截图里。截图适合展示，不适合审计和后续处理。
+
+\begin{keyidea}
+可复现不是“我还能再做一遍”，而是“另一个人在相近环境中可以根据记录复查我的观察，并知道哪些差异来自环境变化”。
+\end{keyidea}
+
+\section{Git：给实验一个源码身份}
+
+实验不只依赖机器和命令，也依赖源码状态。Git 的作用不是只在提交代码时才出现；它应该进入实验记录。
+
+最低记录：
+
+\begin{lstlisting}[language=bash]
+git rev-parse --short HEAD
+git status --short
+git diff --stat
+\end{lstlisting}
+
+\code{HEAD} 告诉你当前提交；\code{status --short} 告诉你工作区是否有未提交修改；\code{diff --stat} 告诉你修改大致涉及哪些文件。若工作区很脏，报告只写 commit hash 是不够的，因为实验运行的源码不等于该 commit。
+
+对严肃实验，可以保存补丁：
+
+\begin{lstlisting}[language=bash]
+git diff > results/working-tree.patch
+\end{lstlisting}
+
+这样即使没有提交，别人也能看到实验相对 commit 做了什么修改。对于教学项目，保存 patch 能帮助教师判断学生到底运行了哪份代码；对于性能项目，保存 patch 能避免“我记得只改了一行”的不可靠记忆。
+
+\subsection{不要把生成文件和源码混为一谈}
+
+Git status 里经常同时出现源码修改和生成文件修改。源码修改影响程序语义；生成文件可能只是构建产物、PDF、日志、CSV、索引。报告中要区分它们。比如 LaTeX 工程里 \filepath{main.pdf} 是构建产物，\filepath{chapters/...tex} 才是正文源文件；C++ 工程里 \filepath{build/} 下的目标文件通常不应当被当作源码证据。
+
+这一区分对实验复现很重要。源码和脚本决定如何重新生成产物；产物用于审计某次运行结果。两者都可以保存，但角色不同。不要把“我有一个二进制文件”当成“我能复现这个二进制”。
+
+\subsection{提交粒度和实验粒度}
+
+一个实验最好对应清晰的源码变化。如果一次提交同时改算法、改输入、改构建参数、改 benchmark harness，再看到性能变化，就很难归因。工程实践中，建议把语义修改、测量框架修改和报告修改分开，至少在报告里说明哪些变化属于被测对象，哪些变化属于实验系统。
+
+例如：
+
+\begin{lstlisting}
+code change:
+    replace scalar sum with unrolled loop
+
+harness change:
+    add CSV output and environment record
+
+report change:
+    add result table
+\end{lstlisting}
+
+只有 \code{code change} 才应作为性能比较的主要自变量；\code{harness change} 可能改变测量方法，应单独说明。
+
+\section{工具选择的优先级}
+
+底层学习工具很多，但初学阶段不应该陷入工具收集。先建立优先级。
+
+第一优先级是构建和运行工具：编译器、构建系统、Shell、Git。没有稳定构建，后面所有观察都不可靠。
+
+第二优先级是二进制观察工具：\code{objdump}、\code{nm}、\code{readelf}。它们回答“最终程序里有什么”。
+
+第三优先级是动态调试工具：GDB、sanitizer、必要时 core dump。它们回答“程序运行到某个状态时发生了什么”。
+
+第四优先级是测量工具：\code{time}、benchmark harness、\code{perf stat}、后续更专业的 profiling 工具。它们回答“运行代价是多少，瓶颈假设是否成立”。
+
+不要反过来。一开始就追求复杂 profiler，却没有保存编译命令和反汇编，很容易得到无法解释的图表。优秀的性能工程不是工具越多越好，而是每个工具回答一个明确问题。
+
+\section{故障定位地图：按现象选择工具}
+
+工具学习最终要服务问题定位。面对一个异常现象时，先判断它属于哪一类，再选工具。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.36\linewidth}p{0.24\linewidth}}
+\toprule
+现象 & 先问的问题 & 首选工具 \\
+\midrule
+编译失败 & 哪个翻译单元、哪个诊断、哪个参数。 & 编译器输出、\code{compile_commands.json} \\
+链接失败 & 哪个符号未定义或重复定义。 & 链接命令、\code{nm}、\code{readelf -s} \\
+启动失败 & 是否缺库、权限、路径或入口。 & \code{ldd}、\code{strace}、\code{file} \\
+崩溃 & 哪条指令、哪个地址、什么调用栈。 & GDB、core dump、sanitizer \\
+结果错误 & reference 是否可靠，输入是否一致。 & 单元测试、sanitizer、GDB \\
+汇编不符预期 & 是否构建错、被内联、被删除。 & \code{objdump}、\code{nm}、构建日志 \\
+性能异常 & 是否测错对象，环境是否变化。 & raw data、\code{objdump}、\code{perf stat} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个地图不是死规则，但能避免乱用工具。比如链接失败时开 GDB 没意义，因为程序还没有生成；崩溃时先看 \code{bt} 和 \register{rip}，不要先改优化参数；性能异常时先确认二进制和计时区域，再谈 cache 和分支预测。
+
+\subsection{从外到内排查}
+
+一个实用顺序是：
+
+\begin{enumerate}
+  \item 命令是否成功，退出状态是否为 0。
+  \item 构建产物是否是刚生成的，路径是否正确。
+  \item 构建参数是否符合实验目标。
+  \item 程序输入是否正确，输出是否保存。
+  \item 二进制内容是否符合预期。
+  \item 运行时状态是否合理。
+  \item 性能数据是否能支撑结论。
+\end{enumerate}
+
+这个顺序看似保守，但能节省大量时间。很多复杂解释最后都败在第一步：命令失败、路径错、旧二进制、输入错、构建类型错。
+
+\begin{keyidea}
+底层调试的第一原则是先确认观察对象，再解释观察结果。对象错了，解释越精密越危险。
+\end{keyidea}
+
+\section{诊断报告模板：让排障过程可复查}
+
+工具命令只有进入报告，才会变成可复查的工程知识。一个诊断报告不需要很长，但结构必须稳定。推荐模板如下：
+
+\begin{lstlisting}
+Title:
+    one-line symptom
+
+Context:
+    repository / commit / dirty state
+    build type and command
+    machine and OS
+
+Expected:
+    what should happen
+
+Observed:
+    exact command
+    exit status
+    key output
+
+Scope:
+    which inputs fail
+    which builds fail
+    whether failure is deterministic
+
+Evidence:
+    compiler diagnostics / linker output
+    objdump / nm / readelf
+    gdb backtrace / registers
+    sanitizer / strace / perf as needed
+
+Hypothesis:
+    current explanation and why
+
+Action:
+    next experiment or fix
+
+Boundary:
+    what has not been checked
+\end{lstlisting}
+
+这个模板强制你把症状、证据和解释分开。很多排障失败，是因为一开始就写“应该是 cache 问题”“应该是编译器 bug”“应该是链接错了”，然后只寻找支持这个想法的证据。模板要求先写 observed，再写 hypothesis，可以减少这种偏差。
+
+\subsection{症状要具体}
+
+“程序坏了”不是可诊断症状。更好的写法是：
+
+\begin{itemize}
+  \item \code{clang++ -O2} 链接时报 \code{undefined reference to asm_dot_i32}。
+  \item Release 构建在输入 \code{n=0} 时 \code{SIGSEGV}，Debug 构建未复现。
+  \item \code{sum_u64} candidate 在 64 MiB 输入上 median 比 baseline 慢 18\%。
+  \item 动态库版本从 \code{libfoo.so.1} 变成 \code{libfoo.so.2} 后结果不同。
+\end{itemize}
+
+具体症状包含命令、构建类型、输入、错误形式和对比对象。症状越具体，第一批证据越明确。模糊症状会导致工具乱用。
+
+\subsection{复现矩阵比单次复现更有用}
+
+当问题不明显时，建立小复现矩阵：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.20\linewidth}p{0.20\linewidth}p{0.24\linewidth}}
+\toprule
+构建 & 输入 & 机器/环境 & 结果 \\
+\midrule
+Debug & small & local & pass \\
+Release & small & local & pass \\
+Release & n=0 & local & crash \\
+Release+ASan & n=0 & local & heap-buffer-overflow \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+矩阵能帮助你定位变量。若只有 Release 失败，考虑优化暴露未定义行为或构建差异；若只有某个输入失败，考虑边界条件；若只有某台机器失败，考虑 ABI、ISA、库版本或环境；若 sanitizer 失败，优先修 correctness，再谈性能。
+
+\section{从证据到修复：不要跳过最小验证}
+
+找到疑似原因后，不要直接做大改。先设计最小验证。最小验证的目标是证明“如果这个解释正确，那么改变一个小条件应该改变现象”。
+
+例一：链接失败显示未定义符号。假设是源文件没加入构建。最小验证不是重写函数，而是查看构建日志中是否编译了对应 \filepath{.cpp} 或 \filepath{.S}，查看目标文件中是否有该符号，临时把源文件加入 target 后链接是否通过。
+
+例二：崩溃发生在 \instruction{movaps}。假设是栈或内存未对齐。最小验证是用 GDB 在崩溃前打印 \code{rsp \% 16} 或目标地址低位，检查调用点栈调整，而不是立即把所有 SIMD 指令换成 unaligned 版本。
+
+例三：benchmark 变快 100 倍。假设是循环被优化器删除。最小验证是查看反汇编是否还有循环，给结果加 \code{do_not_optimize} 或 checksum 后是否恢复正常，而不是直接接受 speedup。
+
+例四：随机访问慢。假设是 cache/TLB。最小验证是做输入规模扫描、比较顺序访问、收集 PMU 事件。不要直接改数据结构，因为可能真正瓶颈是分支或哈希计算。
+
+\subsection{修复后要回归到证据}
+
+修复完成后，报告要更新证据，而不是只写“已修复”。链接问题要保存新的链接命令和 \code{nm} 输出；崩溃问题要保存 sanitizer 通过或 GDB 状态；ABI 问题要保存寄存器/栈对齐检查；性能问题要保存 raw samples 和反汇编。修复是否有效，要由同一类证据验证。
+
+如果修复改变了实验系统，也要说明。例如把 benchmark 从 batch 1 改成 auto batch，会改变测量协议；把 Debug 改成 Release，会改变二进制；把输入从随机改成全零，会改变 workload。修复不能偷偷改变问题。
+
+\section{工具输出的保存规则}
+
+工具输出要保存原始版本，也要写摘要。只保存摘要，后续无法复查；只保存原始输出，读者不知道重点。建议每个实验目录同时包含：
+
+\begin{itemize}
+  \item \filepath{commands.txt}：完整命令。
+  \item \filepath{environment.txt}：机器、系统、编译器、Git 状态。
+  \item \filepath{raw/}：原始工具输出。
+  \item \filepath{summary.md}：人工摘要。
+  \item \filepath{report.md}：问题、证据、解释、限制。
+\end{itemize}
+
+原始输出文件命名要包含工具和对象，例如：
+
+\begin{lstlisting}
+app.objdump-drwC-Mintel.txt
+app.readelf-dynamic.txt
+app.readelf-relocations.txt
+app.nm-C.txt
+gdb-crash-session.txt
+perf-stat-r10.txt
+strace-openat.txt
+\end{lstlisting}
+
+这样的命名看起来繁琐，但半年后你仍然能知道每个文件怎么来的。不要用 \filepath{output.txt}、\filepath{log2.txt} 这类名字，它们会很快失去意义。
+
+\subsection{输出过大时保存关键切片}
+
+有些输出很大，例如完整 \code{objdump}、完整 \code{strace}、长时间 \code{perf record}。可以同时保存完整文件和关键切片。关键切片应说明截取规则：
+
+\begin{lstlisting}
+objdump excerpt:
+    function asm_dot_i32 and its callers
+
+strace excerpt:
+    openat failures for config file
+
+perf excerpt:
+    summary stat and top 20 symbols
+\end{lstlisting}
+
+不要只贴截图。截图无法搜索、无法 diff、无法被脚本处理。截图可以作为报告辅助，但原始文本更适合工程审计。
+
+\section{调试中的语言边界}
+
+工具看到的是机器状态，程序员关心的是语言对象。调试的难点在于把两者正确对应。GDB 中一个变量显示为 \code{<optimized out>}，不代表程序没有这个概念；它可能被优化器删除、合并、放在寄存器或无法从当前位置恢复。反汇编中一个栈槽存在，也不代表一个 C++ 对象仍然处于生命周期内；它可能只是复用的存储。
+
+sanitizer 报告通常更接近语言边界。AddressSanitizer 可以告诉你越界、use-after-free、栈使用后返回等问题；UndefinedBehaviorSanitizer 可以发现某些 signed overflow、越界移位、空指针引用等问题。但 sanitizer 也会改变二进制、内存布局和性能。它适合 correctness 诊断，不适合直接代表性能。
+
+调试优化代码时，要接受源码行和机器指令不再一一对应。一个源码行可能生成多条指令，一个指令可能来自多个源码表达式，一个变量可能在不同路径上有不同位置。此时更可靠的方法是：用函数签名建立入口状态，用反汇编追踪寄存器和内存，用源码语义解释为什么这种机器路径合法。不要强求调试器把优化后的程序还原成未优化源码。
+
+\section{从工具熟练到工程熟练}
+
+会敲命令只是工具熟练；能选择证据、组织报告、判断边界，才是工程熟练。两者的区别可以这样看：
+
+\begin{center}
+\begin{tabular}{p{0.28\linewidth}p{0.28\linewidth}p{0.28\linewidth}}
+\toprule
+场景 & 工具熟练 & 工程熟练 \\
+\midrule
+链接失败 & 会运行 \code{nm} & 能判断声明、定义、库顺序和名字修饰哪一层错 \\
+崩溃 & 会打开 GDB & 能从 \register{rip}、地址公式和对象生命周期定位证据 \\
+性能异常 & 会运行 \code{perf} & 先确认二进制、计时区域、correctness 和 raw samples \\
+汇编阅读 & 会看 \code{objdump} & 能恢复 ABI 入口、数据流、控制流和推论边界 \\
+报告 & 会贴输出 & 能区分事实、解释、建议和未验证假设 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第一册的工具章节目标不是让你背命令大全，而是让你建立工程熟练度。以后遇到新工具，也应先问它回答什么问题、需要什么输入、输出有什么边界、会不会扰动被观察对象。
+
+\section{综合案例：定位一次 Release-only 崩溃}
+
+假设程序 Debug 正常，Release 在某个输入下崩溃。不要先说“优化器 bug”。按工具流程排查。
+
+第一步，确认复现命令：
+
+\begin{lstlisting}[language=bash]
+./build-release/app --input cases/bad.bin
+echo $?
+\end{lstlisting}
+
+记录退出状态和 stderr。确认 Debug 使用同一个输入：
+
+\begin{lstlisting}[language=bash]
+./build-debug/app --input cases/bad.bin
+\end{lstlisting}
+
+第二步，确认二进制身份：
+
+\begin{lstlisting}[language=bash]
+realpath build-release/app
+ls -l build-release/app
+file build-release/app
+git rev-parse HEAD
+git status --short
+\end{lstlisting}
+
+如果路径错或工作区脏，先记录，不要继续假设。
+
+第三步，用 sanitizer 构建缩小 correctness 问题：
+
+\begin{lstlisting}[language=bash]
+cmake --preset asan
+cmake --build build-asan
+./build-asan/app --input cases/bad.bin
+\end{lstlisting}
+
+如果 ASan 报 use-after-free 或越界，优先修语言错误。Release-only 崩溃常常是未定义行为在优化后暴露，而不是优化器错误。
+
+第四步，如果 sanitizer 没有复现，用 GDB 看崩溃点：
+
+\begin{lstlisting}[language=bash]
+gdb -q --args ./build-release/app --input cases/bad.bin
+run
+bt
+info registers
+x/8i $rip
+disassemble /r $rip-32,$rip+32
+\end{lstlisting}
+
+记录 \register{rip}、参与地址计算的寄存器、当前函数和调用栈。若崩溃指令是 load/store，计算有效地址；若是 \instruction{ret}，怀疑栈破坏；若是间接 \instruction{call} 或 \instruction{jmp}，追踪函数指针或虚表来源。
+
+第五步，检查反汇编和源码对应：
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel build-release/app > results/app.objdump.txt
+nm -C build-release/app > results/app.nm.txt
+\end{lstlisting}
+
+确认崩溃函数是否被内联、是否有多个版本、是否走了某个 dispatch。如果源码行和机器码不直观，按寄存器和地址公式分析，不要强行相信源码单步。
+
+第六步，写结论边界。一个合格的临时结论可能是：
+
+\begin{lstlisting}
+Observed:
+    Release build crashes on cases/bad.bin at mov eax, [rdi+rax*4].
+
+Evidence:
+    rdi points to buffer base.
+    rax = -1 sign-extended to 64-bit.
+    ASan build reports heap-buffer-overflow in the same logical path.
+
+Explanation:
+    Lower-bound check for index is missing. Release exposes the invalid load.
+
+Action:
+    Add explicit 0 <= index check and regression test for index = -1.
+\end{lstlisting}
+
+这个案例展示了工具链如何协作：命令确认复现，Git 和 file 确认对象，sanitizer 提供语言边界证据，GDB 提供机器现场，objdump 提供二进制结构，报告把证据变成修复行动。
+
+\section{综合案例：性能异常但功能正确}
+
+另一个常见场景：程序结果正确，但新版本 benchmark 慢。排查顺序不同。
+
+第一步，确认 benchmark 输出包含 correctness：
+
+\begin{lstlisting}
+status = ok
+checksum = expected
+\end{lstlisting}
+
+如果 correctness 不通过，停止性能分析。
+
+第二步，检查 raw samples。是所有样本都慢，还是只有少数离群点？如果只有少数离群点，先看调度、page fault、系统干扰；如果整体慢，再看二进制和输入。
+
+第三步，检查构建参数。确认两个版本使用同一个优化级别、同一个 \code{-march}、同一个链接方式。不同构建参数会让比较失去归因。
+
+第四步，审计热路径反汇编。确认新版本是否内联失败、向量化失败、走到 fallback、引入额外分支或调用。若反汇编不同，要把差异写成事实，不要直接归因。
+
+第五步，设计对照实验。如果怀疑分支，改变输入分布；如果怀疑内存，扫描规模；如果怀疑 dispatch，强制实现；如果怀疑动态库，记录 \code{ldd} 和 maps；如果怀疑频率，固定核心并重复。
+
+第六步，输出结论等级。若只有时间差，没有二进制证据，只能说“观察到变慢”；若有二进制证据但无 PMU，只能提出机制假设；若有 raw、二进制、PMU 和对照，才可以更强地解释原因。
+
+\begin{keyidea}
+功能调试和性能调试使用许多相同工具，但问题顺序不同。功能问题先找定义良好和状态错误；性能问题先确认 correctness、测量对象和二进制路径。
+\end{keyidea}
+
+\section{深入讲解：工具输出为什么必须可重复}
+
+调试时，很多人会在终端里反复试命令，看到一个结果后凭记忆写结论。这在小问题上可以凑合，但在底层工程中风险很高。因为工具输出依赖当前目录、环境变量、构建目录、时间、进程 PID、ASLR、输入文件和系统状态。没有记录，别人无法复查，你自己第二天也可能复现不了。
+
+可重复的工具输出至少满足三个条件。第一，命令完整，包括工作目录、参数、重定向和环境。第二，输入可得，包括源码、二进制、数据文件和配置。第三，输出保存为文本或结构化文件，而不是只存在终端滚动缓冲或截图。
+
+例如，\code{objdump} 输出必须说明对象是目标文件还是最终可执行文件，是否使用 \code{-d}、\code{-r}、\code{-w}、\code{-C}、\code{-Mintel}。不同选项显示的信息不同。 \code{perf stat} 输出必须说明重复次数、事件列表和命令。 \code{gdb} 会话至少要保存关键命令和输出，例如 backtrace、寄存器和崩溃指令。
+
+可重复不是形式主义。它能让你比较两次构建的差异，能让 reviewer 检查证据，能让未来的你复盘错误。很多性能争议最后不是输在算法，而是输在“没人知道当时到底怎么测的”。
+
+\section{深入讲解：最小复现不是越小越好，而是刚好包含关键条件}
+
+最小可复现示例常被误解为“代码越短越好”。真正的最小复现，是删除无关因素后仍然保留问题触发条件。若问题来自动态库路径，复现必须包含动态库；若问题来自优化级别，复现必须保留相同优化；若问题来自 ABI 和手写汇编，复现必须保留跨文件调用边界；若问题来自输入规模，复现必须保留足够大的数据。
+
+一个过度简化的复现可能把 bug 删掉。比如 Release-only 崩溃，如果你把代码改成单文件 \code{-O0}，问题消失，不代表修复了；只是删除了优化和链接条件。一个好的复现会明确写：
+
+\begin{lstlisting}
+kept:
+    -O3
+    separate translation units
+    same struct layout
+    same failing input boundary
+
+removed:
+    logging
+    unrelated command-line parser
+    UI code
+    network dependency
+\end{lstlisting}
+
+这样别人知道哪些条件是必要的，哪些只是原项目噪声。最小复现的价值不在于短，而在于能隔离原因。
+
+\section{深入讲解：工具学习的迁移方法}
+
+本章讲了 \code{objdump}、\code{nm}、\code{readelf}、GDB、\code{strace}、\code{perf} 等工具。以后你会遇到更多工具，比如 \code{llvm-objdump}、\code{eu-readelf}、\code{bpftrace}、\code{heaptrack}、\code{valgrind}、VTune、uprofile、perfetto。不要把工具学习变成背命令。迁移方法是问四个问题。
+
+第一，它观察哪一层？源码、目标文件、可执行文件、进程、系统调用、硬件事件、内存分配还是时间线。第二，它需要什么输入？二进制、调试信息、root 权限、PMU 权限、符号文件、运行命令还是 trace。第三，它会扰动什么？是否改变时间、内存布局、调度、优化、系统调用路径。第四，它的输出边界是什么？是精确事件、采样估计、符号化结果、还是工具推断。
+
+掌握这四个问题，新工具也能快速归类。你不一定立刻熟悉所有选项，但能判断它适不适合当前问题。工具越高级，越需要边界意识。没有边界意识，漂亮图表和复杂报告只会让错误结论更难被发现。
+
+\section{深入讲解：Linux 命令行的真正价值是可组合}
+
+命令行工具的价值不只是“能敲命令”，而是可组合。一个复杂问题通常需要多个工具串起来：用 \code{file} 确认文件类型，用 \code{ldd} 看动态库，用 \code{readelf} 看动态段，用 \code{objdump} 看机器码，用 GDB 看运行状态，用 \code{strace} 看系统调用，用 \code{perf} 看计数。每个工具只回答一小类问题，组合起来才形成证据链。
+
+可组合的前提是文本输出和文件化记录。把输出重定向到文件，可以搜索、diff、归档和写入报告。比如：
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel ./app > results/app.objdump.txt
+readelf -Ws ./app > results/app.symbols.txt
+readelf -r ./app > results/app.relocations.txt
+nm -C ./app > results/app.nm.txt
+\end{lstlisting}
+
+后续你可以用 \code{rg} 搜函数名，用 \code{diff} 比较两个构建，用脚本提取某些符号。若只在终端里看一眼，就失去了这些能力。
+
+命令行还鼓励小步验证。与其打开一个大型 IDE 面板猜测，不如先问一个具体问题：“这个符号是否存在？”运行 \code{nm}；“这个库从哪里加载？”运行 \code{ldd} 或看 maps；“这个函数有没有 call？”运行 \code{objdump} 搜索。每个问题小，证据清楚，排查速度反而更快。
+
+\subsection{管道不是为了炫技}
+
+管道可以把一个工具输出变成另一个工具输入，例如：
+
+\begin{lstlisting}[language=bash]
+readelf -Ws ./app | rg 'asm_dot|sum_u64'
+objdump -drwC -Mintel ./app | rg -n 'call|ret|sum_u64'
+cat raw_samples.csv | rg ',checksum_failed,'
+\end{lstlisting}
+
+这不是为了写复杂一行命令，而是快速缩小观察范围。正式报告仍应保存原始完整输出，管道结果可以作为摘要。不要只保存过滤后的输出，因为过滤条件可能漏掉重要信息。
+
+\section{深入讲解：调试器中的地址如何回到源码}
+
+GDB 中看到一个地址，例如 \code{0x5555555561a0}，它本身只是虚拟地址。要把它变成源码理解，需要几步。
+
+第一，判断地址属于哪个映射。用 \code{info proc mappings} 或 \filepath{/proc/<pid>/maps}。如果地址落在主程序 \code{r-xp} 映射中，它可能是主程序代码；如果落在共享库映射中，就要找对应库；如果落在栈或堆，说明它不是普通代码地址。
+
+第二，找到对应符号。GDB 的 \code{info symbol 0x...} 或 \code{addr2line} 可以利用符号和调试信息。没有调试信息时，仍可用模块基址加偏移，在 \code{objdump} 中定位附近指令。
+
+第三，确认二进制匹配。ASLR 会改变运行时加载地址，但模块内偏移应与该二进制一致。如果你用另一个构建的二进制查地址，源码行可能错。build-id 和文件时间能帮助确认。
+
+第四，回到源码语义。即使找到源码行，也要记住优化可能让一条指令对应多个源码表达式。最终仍要看寄存器、内存和反汇编，不能只看源码行号。
+
+这个过程在崩溃分析中非常重要。很多错误报告只给了地址和 backtrace；你要能把它们连接到正确二进制和源码，否则修复可能瞄错目标。
+
+\section{课堂讲解：为什么工具链学习要从普通命令开始}
+
+有些读者希望直接学习高级 profiler 或大型 IDE 调试功能，觉得 \code{pwd}、\code{ls}、\code{file}、\code{nm}、\code{readelf} 这些命令太基础。实际工程中，许多严重问题恰恰败在这些基础事实上：运行了旧路径，链接了旧库，二进制架构不对，符号不存在，动态库搜索路径错误，输入文件不是以为的那个。高级工具无法弥补观察对象错误。
+
+普通命令的优势是透明。 \code{pwd} 告诉你当前目录；\code{realpath} 告诉你真实路径；\code{file} 告诉你文件类型和架构；\code{ldd} 告诉你动态库解析；\code{nm} 告诉你符号；\code{readelf} 告诉你 ELF 结构；\code{objdump} 告诉你机器码。每个命令回答一个朴素问题。朴素问题都回答清楚，复杂工具才有意义。
+
+这也是本章强调命令记录的原因。底层工程不是靠记忆维护的，而是靠可复查事实维护。你可以在报告里写：“当前运行文件是 \filepath{/abs/path/build-release/app}，\code{file} 显示 x86-64 ELF，\code{ldd} 显示加载本地 \filepath{libfast.so}，\code{nm} 显示 \code{asm_dot_i32} 存在，\code{objdump} 显示热循环包含预期指令。”这段话比“我确认过了”强很多。
+
+\section{课堂讲解：调试时如何避免破坏现场}
+
+调试会改变被调试对象。重新编译可能改变优化和布局；加日志可能改变时序；GDB 断点可能改变线程调度；sanitizer 会改变内存布局；打印变量可能触发函数调用或锁。调试时要有“现场保护”意识。
+
+第一，先保存原始失败证据。包括命令、输入、二进制、core dump、日志、raw samples。不要在没有保存的情况下直接改代码，因为改完可能无法复现原问题。
+
+第二，分离观察和修复。观察阶段尽量少改被测对象；修复阶段再做最小修改；修复后用同一复现命令验证。若观察过程中必须改变构建，比如启用 ASan，要明确这是一种新实验，不是原现场。
+
+第三，记录每次改变。加了一个环境变量、换了输入、改了优化级别、切换了动态库路径，都可能改变结果。调试日志要写这些变化。否则最后即使问题消失，也不知道是修好了，还是改变了触发条件。
+
+第四，对性能问题尤其谨慎。任何日志、断点、sanitizer、调试构建都可能让性能数据失效。功能诊断可以使用扰动工具；性能结论必须回到发布构建和可信测量协议。
+
+\section{工具不是按钮，而是证据系统}
+
+初学者常把工具当成按钮：崩溃就按 GDB，慢就按 perf，找不到库就按 ldd，链接失败就按 nm。这样使用工具很容易卡住，因为工具输出不会自动变成结论。工程上更可靠的方式是把工具看成证据系统。每个工具回答一类问题，也有自己的盲区。你要先提出问题，再选择工具，再解释输出。
+
+例如 \code{nm} 能告诉你目标文件或库中有哪些符号，符号是定义、未定义、弱符号还是本地符号。但 \code{nm} 不能证明运行时一定加载了这个库，也不能告诉你某个路径搜索为什么失败。要回答运行时加载问题，需要 \code{ldd}、\code{readelf -d}、动态链接器日志、环境变量和实际启动命令。把符号问题和加载问题混在一起，就会在错误工具上浪费时间。
+
+再例如 GDB 能看到某次崩溃的寄存器、栈和指令，但它不能直接证明根因。崩溃点可能只是错误被发现的位置，真正写坏内存的位置可能早得多。此时 sanitizer、watchpoint、core dump、反汇编、日志和最小复现都可能参与。工具链的目标不是让某一个工具说出答案，而是让多个证据互相约束。
+
+\subsection{把工具输出分成事实、解释和建议}
+
+一份高质量调试记录必须区分事实、解释和建议。事实是工具直接给出的内容，例如信号是 \code{SIGSEGV}，\register{rip} 在某个地址，\code{readelf -d} 显示需要某个共享库，\code{objdump} 显示某条指令读取 \register{rax} 指向的内存。解释是你基于事实做出的判断，例如 \register{rax} 为零导致空指针解引用，或者运行时库搜索路径没有包含目标目录。建议是下一步行动，例如增加空指针检查、修复所有权、设置 RPATH、调整部署包。
+
+如果三者混在一起，报告会很难复核。写“程序因为指针错了而崩溃”既不是足够事实，也不是足够解释。更好的写法是：“core 中 \register{rip} 指向一条从 \register{rax} 偏移 16 读取的指令；崩溃时 \register{rax} 为零；调用栈显示该值来自配置解析失败后的返回对象；因此当前证据支持空对象被继续使用。下一步用 sanitizer 和单元测试覆盖配置缺失路径。”这样的结论可复查，也可行动。
+
+\section{综合案例：Release 崩溃怎样从日志追到机器状态}
+
+设想一个服务只在 Release 构建中偶发崩溃，Debug 构建无法复现。低质量排查会停在“优化器有 bug”或“指针有问题”。高质量排查要建立证据链。第一步保存崩溃进程的版本身份：提交号、构建参数、二进制校验和、运行命令、配置文件和环境变量。没有这些，后续看到的反汇编可能不是崩溃那份二进制。
+
+第二步获取现场。若有 core dump，用 GDB 打开同一份可执行文件和 core，记录 \code{bt}、\code{info registers}、当前指令、栈顶内存和共享库映射。若没有 core，至少记录日志中的信号、地址、线程、最后操作和部署版本。第三步把崩溃地址映射到模块。通过 \filepath{/proc/<pid>/maps} 或 core 中的映射，确认地址属于主程序还是共享库，再用基址加偏移找到反汇编位置。
+
+第四步解释当前指令。若当前指令是 load，要找源寄存器的值和来源；若是 store，要找目的地址和写入值；若是 \instruction{ret}，要怀疑返回地址或栈被破坏；若是间接调用，要找函数指针或虚表来源。第五步把机器状态回溯到源码路径，检查哪些前置条件没有满足。这里不要因为 GDB 显示了源码行就停止，优化构建下源码行可能对应多个机器位置。
+
+第六步设计复现和验证。若怀疑越界写，使用 sanitizer、边界输入和 watchpoint。若怀疑 use after free，保留分配栈、启用地址检测或替换 allocator。若怀疑 ABI 错误，检查调用约定、结构体布局、栈对齐和寄存器保存。修复后必须用同类 Release 构建验证，并保留新旧二进制反汇编差异。这样处理，结论才不是猜测。
+
+\section{综合案例：两台机器结果不同怎么排查}
+
+另一类常见问题是同一程序在两台机器上结果不同或性能差异巨大。排查不能从“机器不好”开始。首先要确认程序身份是否相同：源码提交、构建系统、编译器版本、编译参数、链接库、运行参数、输入数据和配置文件。很多所谓机器差异，最后发现是其中一台加载了旧共享库，或者环境变量改变了插件路径。
+
+其次确认二进制身份。使用 \code{file} 查看架构和调试信息，使用 \code{sha256sum} 比较文件内容，使用 \code{ldd} 和 \code{readelf -d} 比较动态依赖，使用 \code{objdump} 抽查关键函数。若二进制不同，就先解释为什么不同；若二进制相同，再进入运行环境和硬件差异。
+
+第三步确认运行身份。工作目录、相对路径、权限、文件描述符、CPU 亲和性、容器限制、频率策略、NUMA、内核版本、透明大页、系统负载，都可能影响结果。对于 correctness 差异，要优先检查未初始化数据、未定义行为、并发数据竞争、浮点环境和输入文件差异。对于性能差异，要记录 CPU 型号、核心数量、cache、频率、内存通道、编译目标和系统干扰。
+
+最终报告应把差异分层写清：哪些差异已排除，哪些差异被证据支持，哪些还只是可能原因。比如“机器 B 慢”不是结论；“两台机器二进制相同，输入相同，机器 B 的 CPU 频率上限较低且 perf 显示 task clock 相近但 cycles 明显减少，因此当前证据支持频率差异是主要原因”才是可讨论结论。
+
+\section{如何阅读陌生工具输出}
+
+面对一个陌生工具，先不要急着复制网上命令。可以按四步阅读。第一，确认工具的输入对象是什么：源码、目标文件、可执行文件、进程、core、系统调用流、硬件事件还是结果文件。第二，确认输出单位是什么：地址、字节、符号、样本、事件计数、时间、比例还是状态码。第三，确认默认过滤和默认汇总。很多工具默认只显示一部分信息，或者把多个线程、进程、事件汇总在一起。
+
+第四，确认输出能回答的问题和不能回答的问题。比如 \code{strace} 能告诉你系统调用层发生了什么，但不能看到用户态函数内部为什么传了这个路径。反汇编能看到机器码，但不能还原所有源码意图。PMU 事件能显示某类硬件现象，但不能自动判定算法是否合理。工具输出越强大，越需要明确边界。
+
+读工具手册时，优先看三类内容：输入选择、输出字段含义、会改变被观察对象的选项。输入选择决定你是否在看正确对象；字段含义决定你是否读懂数字；扰动选项决定观察是否影响结论。比如采样频率过高可能扰动性能，GDB 单步会彻底改变时序，sanitizer 会改变内存布局和执行成本。工具不是中立窗口，它也是实验系统的一部分。
+
+\section{最小复现实验包}
+
+调试报告最终要落到一个别人能运行的实验包。最小复现不是把项目删到只剩一行，也不是随便贴一段代码。它的标准是：保留触发问题所需的语义条件，删除和问题无关的工程噪声，并让另一个人在同类环境下能复现观察。
+
+一个合格实验包通常包含源文件、构建脚本、运行脚本、输入数据、预期输出、实际输出、环境记录和报告。若问题是链接失败，实验包要保留多个目标文件或库之间的关系；若问题是动态链接，实验包要保留库路径和 RPATH/RUNPATH 设置；若问题是崩溃，实验包要保留触发输入和调试命令；若问题是性能异常，实验包要保留计时协议和 raw samples。
+
+最小复现的关键是“可验证地最小”。删除一部分代码后，必须重新运行确认问题仍存在。若问题消失，说明被删部分包含必要条件；若问题仍在，就继续删。这个过程本身也是学习：每删掉一个无关因素，问题边界就更清楚。很多复杂 bug 在最小化过程中已经被定位，因为读者被迫明确哪些条件真正参与。
+
+\subsection{最小复现不能破坏问题性质}
+
+有些最小化会把问题改坏。例如把 Release 崩溃改成 Debug 构建后不再崩溃，却继续分析 Debug；把多线程竞态改成单线程后问题消失，却仍然声称复现；把动态库问题改成静态链接后，库搜索路径已经不存在；把 benchmark 输入缩小到 L1 cache 后，原来的内存带宽问题被改成了小规模问题。这些都不是有效最小复现。
+
+因此，最小化时要保护问题性质。可以删功能，但不能删掉触发条件。报告应写清保留了哪些条件：优化级别、线程数、输入规模、库边界、符号可见性、CPU 特性、环境变量。若为了方便观察改变了条件，也要说明这是新实验，不是原问题本身。
+
+\section{从证据到修复：不要跳过验证}
+
+工具证据支持某个解释后，还需要修复和验证。修复不是“让现象消失”这么简单，而是改变了正确的因果点。若空指针崩溃来自配置解析失败，随手在崩溃处加空指针判断可能避免崩溃，但可能掩盖了配置错误；若链接错误来自库顺序，复制一个库到系统目录可能让本机通过，却破坏部署一致性；若性能异常来自 benchmark 被优化删除，加入 \code{volatile} 也许能保住代码，却可能引入不真实的内存语义。
+
+修复验证应回到原始复现条件。原问题在什么命令、输入、构建和环境下出现，就尽量用同一条件验证。然后再增加回归测试。功能 bug 可以加单元测试或集成测试；ABI bug 可以加寄存器保存、栈对齐、结构体布局测试；动态链接 bug 可以加部署检查；性能 bug 可以加 benchmark harness 测试和二进制审计。没有回归保护，修复很容易在后续改动中消失。
+
+\subsection{修复报告应说明排除了什么}
+
+高质量修复报告不仅说明改了什么，还说明排除了什么。例如“不是编译器优化器错误，因为用旧二进制和新源码不匹配可以解释现象；不是输入文件损坏，因为 sha256 一致；不是动态库版本问题，因为 \code{ldd} 和 \filepath{/proc/<pid>/maps} 显示加载同一库；最终定位为长度字段溢出，因为边界输入稳定复现，ASan 指向小分配大写入”。这种报告让 reviewer 能跟着证据走。
+
+排除项不要写成主观判断，要写证据。底层问题的排查路径常常比最终补丁更有价值。未来遇到类似问题，团队可以复用这条路径，而不是重新从猜测开始。
+
+\section{自动化工具不能替代工程判断}
+
+IDE、sanitizer、静态分析、profiling UI、CI 报警都能提高效率，但它们不能替代工程判断。自动化工具擅长发现模式和收集信息，不擅长理解项目语义。一个 sanitizer 报告能指出越界位置，但不知道这个长度是否来自协议字段；一个 profiler 能显示热点函数，但不知道这个热点是否符合业务目标；一个静态分析 warning 可能是真 bug，也可能是当前抽象无法表达的前置条件。
+
+使用自动化工具时，要把它们纳入证据链。工具发现问题后，仍要确认输入对象、构建参数、路径条件、源码语义和修复策略。工具没有报警，也不等于代码正确；工具报警很多，也不代表都同等重要。工程师的责任是根据风险排序：会改变程序输出、破坏 ABI、导致内存错误、污染性能结论的问题，应优先于纯风格问题。
+
+这也是本章放在汇编和测量之前的原因。后面每个高级主题都会产生更多工具输出。没有证据链思维，工具越多，误判越多；有了证据链思维，工具才会成为放大能力的系统。
+
+\section{调试记录的写作格式}
+
+建议把调试记录写成固定格式：现象、环境、复现、观察、假设、验证、修复、回归。现象描述用户看见的问题；环境绑定版本和机器；复现给出命令；观察保存工具输出；假设解释可能原因；验证说明如何支持或推翻；修复说明改动；回归说明以后如何防止。
+
+这种格式能避免“边查边忘”。调试过程中，假设会多次变化。如果不记录，最后很容易只记得成功路径，忘记哪些可能性已被排除。团队协作时，别人也无法接上你的思路。底层问题尤其需要记录，因为证据来自多个工具，分散在终端、日志、core、反汇编和构建输出中。
+
+\subsection{不要把聊天记录当作唯一报告}
+
+聊天工具适合快速沟通，不适合作为唯一证据存档。命令输出会折叠，文件会过期，结论缺少上下文。重要问题应沉淀到仓库中的报告、issue、PR 描述或结果目录。聊天里可以贴摘要，正式证据要有稳定路径。
+
+这条规则对性能问题尤其重要。几周后回看一个性能决策，团队需要看到 raw data、summary、环境和二进制证据，而不是一句“当时测过”。工具章节的目标，就是让每次观察都能留下可追溯痕迹。
+
+\section{从工具学习到工作流设计}
+
+掌握单个命令只是第一步，更重要的是把命令组织成工作流。面对崩溃，工作流可能是：保存 core，确认二进制身份，用 GDB 查看现场，用 maps 定位模块，用 objdump 解释指令，用 ASan 构造复现，用测试锁定修复。面对链接问题，工作流可能是：查看完整链接命令，定位 undefined symbol，检查目标文件和库，确认符号名和架构，调整依赖关系。面对性能异常，工作流可能是：确认正确性，保存 raw，审计 timed region，查看反汇编，再看 PMU。
+
+工作流的价值在于降低临场混乱。底层问题往往信息量大，若每次都从头想工具，很容易遗漏。把常见问题写成工作流清单，可以让团队形成共同语言。新人也能按清单收集第一轮证据，资深工程师再基于证据深入分析。
+
+工作流也要允许修正。若某个项目大量使用插件，就把插件路径和符号可见性加入启动排查；若项目大量手写汇编，就把 ABI 检查加入 code review；若项目重视性能，就把 benchmark artifact 加入 PR 模板。工具章节不是固定命令大全，而是工作流设计的起点。
+
+\section{工具输出的保存粒度}
+
+保存工具输出有一个平衡。输出太少，无法复查；输出太多，没有索引也难以使用。推荐做法是保留原始完整输出，同时写一个摘要报告。原始输出放在文件中，例如 \filepath{objdump.txt}、\filepath{readelf.txt}、\filepath{gdb.txt}、\filepath{perf_stat.txt}；摘要报告引用关键行并解释含义。
+
+对于长输出，应记录生成命令和工具版本。不同版本的 \code{objdump}、\code{perf}、编译器和链接器可能格式不同。若输出包含绝对路径或敏感信息，公开前可以脱敏，但原始内部记录应尽量完整。对性能数据，raw CSV 比截图重要；对崩溃，core 和符号文件比手抄 backtrace 更重要。
+
+保存粒度的原则是：未来有人能重建你的观察过程。若未来读者只能看到结论，看不到证据，记录就不够；若能从报告追到命令和原始输出，记录就是可审计的。
+
+\section{工具章节的综合训练}
+
+本章最后建议做一次综合训练：故意制造一个小项目，其中包含一个动态库、一个会崩溃的输入、一个 Release 构建和一个简单 benchmark。训练目标不是写复杂程序，而是把证据目录组织完整。目录中至少要有源码提交、构建命令、二进制身份、动态库解析、崩溃现场、反汇编、修复前后测试和 benchmark 原始数据。
+
+完成后，读者应能回答：如果把这个目录交给另一个人，他能否复现崩溃，能否确认运行的是同一二进制，能否理解修复依据，能否判断性能数字是否可信。若答案是否定的，就继续补证据。工具能力的最终形态不是“我会用很多命令”，而是“我能组织一套别人可复查的排查过程”。
+
+\section{案例：把一个模糊 bug 报告改写成工程报告}
+
+模糊 bug 报告常写成：“程序偶尔崩溃，怀疑是优化器问题。”这样的报告几乎不能行动。工程报告应改写为：“在某个提交、Release 构建、固定输入和固定命令下，程序多次运行中偶发 \code{SIGSEGV}。core 中 \register{rip} 位于解析函数偏移处，当前指令从 \register{rax} 加偏移读取，崩溃时 \register{rax} 为零。Debug 构建未复现。ASan 构建在相同输入下报告 use after free，释放点位于缓存清理路径。当前证据不支持优化器 bug，支持对象生命周期错误。”
+
+这个改写并没有增加神秘技巧，只是把现象、环境、复现、工具证据和解释分开。读者可以检查命令，可以打开 core，可以查看反汇编，可以复跑 ASan。工程报告的价值在于让下一步明确：应审查对象所有权和缓存清理路径，而不是盲目调整优化选项。
+
+同样，性能报告也可以从“新版本快很多”改写成：“在固定输入、固定编译参数、交错运行下，新版本 median 降低，但 correctness 在两个边界输入失败，因此性能结论无效。”能写出这种报告，说明工具能力已经服务于工程判断。
+
+\section{工具链学习的常见阶段}
+
+第一阶段是会运行命令。读者知道 \code{gdb}、\code{objdump}、\code{readelf}、\code{strace}、\code{perf} 怎么启动。第二阶段是会解释字段。读者知道符号表、重定位、寄存器、系统调用、事件计数分别表示什么。第三阶段是会组合证据。读者能把崩溃地址、映射、反汇编和源码路径连起来。第四阶段是会设计实验。读者能为了验证一个假设构造最小程序和输入。
+
+本章希望读者至少进入第三阶段，并开始第四阶段。后面章节会不断要求你组合工具，而不是孤立使用工具。汇编阅读需要 \code{objdump} 和 ABI；互操作需要 \code{nm}、\code{readelf} 和测试；benchmark 需要反汇编、raw data 和环境记录。工具链越熟，底层概念越能落地。
+
+\section{工具证据的复盘问题}
+
+每次使用工具后，都可以问五个复盘问题。第一，我看的对象是否正确，是源码、目标文件、可执行文件、进程还是 core。第二，输出中的事实是什么，哪些只是我的解释。第三，这个工具有没有改变被观察对象，例如调试器、sanitizer 或 profiler 的扰动。第四，还需要哪个独立证据来支持当前解释。第五，当前结论能否写进报告并让别人复查。
+
+这些问题能防止工具使用变成仪式。运行 \code{perf stat} 不等于理解性能，打开 GDB 不等于知道根因，生成反汇编不等于读懂汇编。工具只是证据入口，工程判断来自证据之间的连接。复盘问题越固定，排查越稳定。
+
+建议读者在每次实验目录中保留一个 \filepath{notes.md}，专门回答这些问题。它不需要华丽，只要诚实。几周后回看，你会看到自己的判断如何从猜测变成证据链，这比记住更多命令更重要。
+
+\section{工具输出如何进入代码审查}
+
+底层相关 PR 不应只提交源码差异。若改动影响 ABI、汇编、链接、启动、崩溃或性能，PR 描述应附上相应工具证据。ABI 改动要有符号和调用点证据；汇编改动要有反汇编和寄存器保存说明；动态链接改动要有 \code{readelf -d} 或运行时加载路径；性能改动要有 raw data、summary 和二进制审计；崩溃修复要有复现和修复后验证。
+
+这样做不是增加流程负担，而是把 review 从主观争论变成证据讨论。reviewer 可以直接检查：“这个符号是否仍导出”“这个调用点是否仍按同一 ABI 传参”“这个 benchmark 是否真的运行了新实现”“这个修复是否覆盖原始复现”。没有工具证据，reviewer 只能凭经验猜，底层改动的风险会被低估。
+
+项目可以把证据要求写成模板。小改动不需要复杂报告，但越接近二进制边界和性能结论，证据要求越高。工具章节的训练最终要服务这种协作方式：每个重要判断都有可点击、可复查、可重新生成的证据。
+
+\section{从个人排查到团队知识库}
+
+个人排查解决的是一次问题，团队知识库解决的是同类问题反复出现。每次完成一个有代表性的排查，都可以沉淀成知识库条目：问题现象、适用场景、首选工具、关键命令、典型证据、常见误判、最终修复。比如“动态库加载旧版本”“Release 才崩溃”“benchmark 快得不合理”“结构体布局破坏 ABI”，都适合形成条目。
+
+知识库不需要很长，但要具体。不要写“使用 GDB 调试”，而要写“core 中先确认二进制 build id，再用当前 \register{rip} 对照 maps 和 objdump”。不要写“检查性能”，而要写“先确认 correctness，再看 timed region，再看反汇编，再看 PMU”。具体条目能让新人少走弯路，也能让团队形成统一排查语言。
+
+随着本书后续章节展开，读者可以把每章的常见问题都加入知识库。到第一册结束时，这个知识库会覆盖构建、链接、加载、内存、汇编、ABI、互操作和测量。它会成为继续学习第二册时最实用的基础资产。
+
+\section{常见误区}
+
+\begin{warningbox}
+\textbf{误区一：只要程序能运行，就可以开始优化。}
+
+不对。程序能运行不代表没有未定义行为，也不代表结果正确。优化前必须有 reference、测试或不变量。
+
+\textbf{误区二：GDB 看到的变量就是机器里真实存在的变量。}
+
+不准确。变量是源码和调试信息层概念。优化后变量可能在寄存器里、被拆开、被合并，甚至完全不存在。
+
+\textbf{误区三：\code{objdump} 输出和编译器生成的 \code{.s} 文件一定一样。}
+
+不一定。\code{.s} 是汇编器输入，\code{objdump} 是机器码反汇编。链接、重定位、汇编器选择、LTO 都可能改变最终形态。
+
+\textbf{误区四：Release 构建通过了，就不需要 Debug 或 sanitizer。}
+
+不对。Release 适合性能路径，Debug 和 sanitizer 适合发现错误。它们互补，不能互相替代。
+
+\textbf{误区五：终端里看过输出就算记录了实验。}
+
+不对。没有保存命令、环境和原始输出，实验就很难复现，也很难审计。
+\end{warningbox}
+
+\section{实验 4.1：建立你的机器档案}
+
+\begin{labbox}
+\textbf{目标：}为后续所有实验建立环境基线。
+
+创建目录：
+
+\begin{lstlisting}[language=bash]
+mkdir -p labs/ch04_tools/results
+cd labs/ch04_tools
+\end{lstlisting}
+
+保存环境：
+
+\begin{lstlisting}[language=bash]
+{
+  date
+  pwd
+  uname -a
+  lscpu
+  g++ --version
+  clang++ --version
+  cmake --version
+  perf --version
+} > results/environment.txt 2>&1
+\end{lstlisting}
+
+报告必须回答：
+
+\begin{enumerate}
+  \item 当前 CPU 型号是什么。
+  \item 有多少 core 和 hardware thread。
+  \item L1/L2/L3 cache 信息是否能从 \code{lscpu} 看到。
+  \item 当前编译器版本是什么。
+  \item 当前环境是裸机、虚拟机、容器还是 WSL2；这对性能实验有什么影响。
+\end{enumerate}
+\end{labbox}
+
+\section{实验 4.2：单文件四种构建}
+
+\begin{labbox}
+\textbf{目标：}理解 Debug、Release、sanitizer 和 benchmark build 的差异。
+
+写 \filepath{src/build_modes.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+#include <cstdio>
+
+extern "C" std::int64_t sum_i32(std::int32_t const* a, int n)
+{
+    std::int64_t s = 0;
+    for (int i = 0; i < n; ++i) {
+        s += a[i];
+    }
+    return s;
+}
+
+int main()
+{
+    std::int32_t a[4] = {1, 2, 3, 4};
+    std::printf("%lld\n", static_cast<long long>(sum_i32(a, 4)));
+}
+\end{lstlisting}
+
+分别构建：
+
+\begin{lstlisting}[language=bash]
+mkdir -p build-debug build-release build-sanitize results
+
+g++ -std=c++20 -Wall -Wextra -O0 -g \
+  src/build_modes.cpp -o build-debug/app
+
+g++ -std=c++20 -Wall -Wextra -O3 -DNDEBUG \
+  src/build_modes.cpp -o build-release/app
+
+g++ -std=c++20 -Wall -Wextra -O1 -g \
+  -fsanitize=address,undefined \
+  src/build_modes.cpp -o build-sanitize/app
+\end{lstlisting}
+
+保存反汇编：
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel build-debug/app > results/debug.objdump.txt
+objdump -drwC -Mintel build-release/app > results/release.objdump.txt
+objdump -drwC -Mintel build-sanitize/app > results/sanitize.objdump.txt
+\end{lstlisting}
+
+报告必须比较：
+
+\begin{enumerate}
+  \item \code{sum_i32} 在三种构建里是否存在独立函数体。
+  \item Debug 版本是否使用更多栈访问。
+  \item Release 版本是否内联或优化循环。
+  \item sanitizer 版本多了哪些检查调用。
+  \item 哪个构建适合调试，哪个适合性能结论。
+\end{enumerate}
+\end{labbox}
+
+\section{实验 4.3：目标文件、符号和重定位}
+
+\begin{labbox}
+\textbf{目标：}把多文件构建和二进制工具连接起来。
+
+创建：
+
+\begin{lstlisting}
+src/add.hpp
+src/add.cpp
+src/main.cpp
+\end{lstlisting}
+
+分开编译：
+
+\begin{lstlisting}[language=bash]
+g++ -std=c++20 -O2 -c src/add.cpp -o build-release/add.o
+g++ -std=c++20 -O2 -c src/main.cpp -o build-release/main.o
+g++ build-release/add.o build-release/main.o -o build-release/app
+\end{lstlisting}
+
+观察：
+
+\begin{lstlisting}[language=bash]
+nm -C build-release/add.o > results/add.nm.txt
+nm -C build-release/main.o > results/main.nm.txt
+readelf -r build-release/main.o > results/main.reloc.txt
+objdump -drwC -Mintel build-release/main.o > results/main.objdump.txt
+objdump -drwC -Mintel build-release/app > results/app.objdump.txt
+\end{lstlisting}
+
+报告必须回答：
+
+\begin{enumerate}
+  \item \code{add.o} 中 \code{add_i32} 是定义还是未定义引用。
+  \item \code{main.o} 中对 \code{add_i32} 的引用如何表现。
+  \item 未链接目标文件中的 \instruction{call} 为什么可能没有最终地址。
+  \item 链接后可执行文件中调用目标如何变化。
+\end{enumerate}
+\end{labbox}
+
+\section{实验 4.4：GDB 观察寄存器和栈}
+
+\begin{labbox}
+\textbf{目标：}用 GDB 把函数调用从源码层追到寄存器和栈。
+
+使用实验 4.2 的 Debug 构建：
+
+\begin{lstlisting}[language=bash]
+gdb -q build-debug/app
+\end{lstlisting}
+
+建议命令：
+
+\begin{lstlisting}
+set disassembly-flavor intel
+break sum_i32
+run
+info registers rip rsp rdi rsi rax
+disassemble /m sum_i32
+x/8gx $rsp
+stepi
+info registers rip rsp rax
+next
+continue
+\end{lstlisting}
+
+报告必须包含：
+
+\begin{itemize}
+  \item 断点命中时 \register{rdi} 和 \register{esi} 的含义。
+  \item \register{rsp} 指向的内存大致是什么。
+  \item 至少三条指令执行前后的寄存器变化。
+  \item GDB 源码单步和指令单步的差异。
+\end{itemize}
+\end{labbox}
+
+\section{实验 4.5：写一份可复现实验报告}
+
+\begin{labbox}
+\textbf{目标：}把本章工具串成一份完整报告。
+
+报告目录建议：
+
+\begin{lstlisting}
+results/
+  environment.txt
+  commands.txt
+  debug.objdump.txt
+  release.objdump.txt
+  app.nm.txt
+  app.sections.txt
+  gdb-session.txt
+  report.md
+\end{lstlisting}
+
+\filepath{report.md} 至少包含：
+
+\begin{enumerate}
+  \item 实验目标。
+  \item 机器环境。
+  \item 源码文件列表。
+  \item 编译命令。
+  \item Debug 与 Release 的差异。
+  \item \code{objdump} 证据。
+  \item \code{nm} 或 \code{readelf} 证据。
+  \item GDB 观察结果。
+  \item 当前结论的限制。
+\end{enumerate}
+\end{labbox}
+
+\section{实验 4.6：用 \code{strace} 定位文件路径问题}
+
+\begin{labbox}
+\textbf{目标：}理解用户程序和内核之间的系统调用边界。
+
+创建程序：
+
+\begin{lstlisting}[language=C++]
+#include <cerrno>
+#include <cstdio>
+#include <cstring>
+
+int main()
+{
+    const char* path = "data/input.txt";
+    FILE* file = std::fopen(path, "r");
+    if (file == nullptr) {
+        std::fprintf(stderr,
+                     "failed to open %s: %s\n",
+                     path,
+                     std::strerror(errno));
+        return 1;
+    }
+    std::fclose(file);
+    return 0;
+}
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 不创建 \filepath{data/input.txt}，直接运行程序。
+  \item 用 \code{strace -o results/open.strace.txt ./app} 保存系统调用。
+  \item 在输出中搜索 \code{openat} 和 \code{ENOENT}。
+  \item 创建文件后重新运行，比较两次 \code{strace}。
+  \item 解释 C 库函数 \code{fopen} 和 Linux 系统调用之间的关系。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 两份 \code{strace} 输出。
+  \item 程序 stderr 输出。
+  \item 300 字说明：为什么源码只写了 \code{fopen}，工具里看到的是系统调用。
+\end{itemize}
+\end{labbox}
+
+\section{实验 4.7：保存并分析一次 core dump}
+
+\begin{labbox}
+\textbf{目标：}把崩溃现场保存下来，并用 GDB 事后分析。
+
+创建程序：
+
+\begin{lstlisting}[language=C++]
+int main()
+{
+    int* p = nullptr;
+    *p = 42;
+    return 0;
+}
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 用 \code{-O0 -g} 编译。
+  \item 执行 \code{ulimit -c unlimited}。
+  \item 运行程序触发崩溃。
+  \item 如果系统生成 core 文件，用 \code{gdb ./app core} 打开；如果系统使用 \code{systemd-coredump}，尝试 \code{coredumpctl gdb}。
+  \item 在 GDB 中记录 \code{bt}、\code{info registers}、\code{x/10i \$rip}。
+  \item 解释当前指令为什么会崩溃。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 构建命令。
+  \item core dump 获取方式。
+  \item GDB 输出。
+  \item 说明 \register{rip}、当前指令和空指针地址之间的关系。
+\end{itemize}
+\end{labbox}
+
+\section{实验 4.8：用 Git 和 Makefile 固化实验入口}
+
+\begin{labbox}
+\textbf{目标：}让一个小实验具备稳定构建入口和源码身份。
+
+任务：
+
+\begin{enumerate}
+  \item 为实验 4.2 写一个 Makefile，至少包含 \code{debug}、\code{release}、\code{sanitize}、\code{inspect}、\code{clean} 目标。
+  \item \code{inspect} 目标生成 \code{objdump}、\code{nm}、\code{readelf}、\code{file} 和 \code{size} 输出。
+  \item 在 \filepath{results/environment.txt} 中记录 \code{git rev-parse --short HEAD}、\code{git status --short} 和 \code{git diff --stat}。
+  \item 修改一行源码但不提交，重新运行实验。
+  \item 在报告中说明 dirty worktree 为什么会影响复现。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item Makefile。
+  \item \filepath{results/environment.txt}。
+  \item \filepath{results/release.objdump.txt}。
+  \item 一段说明：构建规则、源码状态和实验结果之间的关系。
+\end{itemize}
+\end{labbox}
+
+\section{实验 4.9：用 \filepath{/proc} 验证进程身份}
+
+\begin{labbox}
+\textbf{目标：}确认一次运行中的程序对应哪个可执行文件、哪个工作目录、哪些参数和哪些地址映射。
+
+创建一个会等待输入的小程序：
+
+\begin{lstlisting}[language=C++]
+#include <cstdio>
+
+int main(int argc, char** argv)
+{
+    std::printf("argc=%d\n", argc);
+    std::printf("press enter to exit\n");
+    std::getchar();
+    return 0;
+}
+\end{lstlisting}
+
+构建并后台运行：
+
+\begin{lstlisting}[language=bash]
+g++ -std=c++20 -O2 -g src/proc_probe.cpp -o build-release/proc_probe
+./build-release/proc_probe alpha beta &
+pid=$!
+\end{lstlisting}
+
+观察：
+
+\begin{lstlisting}[language=bash]
+cat /proc/$pid/cmdline | tr '\0' ' ' > results/proc.cmdline.txt
+tr '\0' '\n' < /proc/$pid/environ | sort > results/proc.environ.txt
+readlink /proc/$pid/cwd > results/proc.cwd.txt
+readlink /proc/$pid/exe > results/proc.exe.txt
+ls -l /proc/$pid/fd > results/proc.fd.txt
+cat /proc/$pid/maps > results/proc.maps.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{itemize}
+  \item 解释 \filepath{cmdline}、\filepath{cwd}、\filepath{exe} 和 \filepath{maps} 分别证明什么。
+  \item 在 \filepath{maps} 中找出主程序、libc、heap 和 stack 的映射。
+  \item 说明这些证据如何帮助排查“运行了旧二进制”或“相对路径找错位置”的问题。
+\end{itemize}
+\end{labbox}
+
+\section{实验 4.10：动态链接证据链}
+
+\begin{labbox}
+\textbf{目标：}观察一个普通 C++ 程序依赖哪些共享库，以及调用外部函数时二进制里出现什么线索。
+
+使用包含 \code{std::printf} 或 \code{std::puts} 的程序，构建 Release 版本。保存：
+
+\begin{lstlisting}[language=bash]
+file build-release/app > results/app.file.txt
+ldd build-release/app > results/app.ldd.txt
+readelf -d build-release/app > results/app.dynamic.txt
+objdump -drwC -Mintel build-release/app > results/app.objdump.txt
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 在 \code{ldd} 输出中找出 libc 和 C++ 标准库依赖。
+  \item 在 \code{readelf -d} 输出中找出 \code{NEEDED} 项。
+  \item 在反汇编中搜索 \code{@plt}。
+  \item 解释 \code{ldd}、\code{readelf} 和 \code{objdump} 分别站在哪一层提供证据。
+\end{enumerate}
+
+交付物中必须说明：动态链接证据不能只靠一个工具；库依赖、ELF 元数据和调用点反汇编回答的是不同问题。
+\end{labbox}
+
+\section{实验 4.11：工具扰动对比}
+
+\begin{labbox}
+\textbf{目标：}观察 GDB、sanitizer、\code{strace} 和普通运行的区别，形成“工具有扰动”的边界意识。
+
+选择一个运行时间至少数百毫秒的小程序，分别执行：
+
+\begin{lstlisting}[language=bash]
+/usr/bin/time -v ./build-release/app > results/run.normal.txt 2>&1
+strace -o results/run.strace.log ./build-release/app \
+  > results/run.strace.txt 2>&1
+g++ -std=c++20 -O1 -g -fsanitize=address,undefined \
+  src/main.cpp -o build-sanitize/app
+/usr/bin/time -v ./build-sanitize/app > results/run.sanitize.txt 2>&1
+\end{lstlisting}
+
+报告要求：
+
+\begin{itemize}
+  \item 比较普通运行、\code{strace} 运行和 sanitizer 运行的时间差异。
+  \item 说明这些时间不能直接作为算法性能比较。
+  \item 解释每个工具适合回答什么问题。
+  \item 若差异不明显，也要说明程序规模、系统调用数量和测量方法可能导致观察不到明显差异。
+\end{itemize}
+\end{labbox}
+
+\section{本章作业}
 
 \begin{exercisebox}
-选择一个三行 C++ 函数，分别用 \code{g++ -O0 -g} 和 \code{g++ -O3} 编译。用 GDB 单步 Debug 版本，用 \code{objdump} 阅读 Release 版本。写一页报告说明两者差异。
+\textbf{作业 1：工具链分层图。}
+
+画出从 \code{main.cpp} 到 \code{app} 的完整路径。图中必须包含：
+
+\begin{itemize}
+  \item preprocessor。
+  \item compiler frontend。
+  \item optimizer。
+  \item backend。
+  \item assembler。
+  \item linker。
+  \item loader。
+\end{itemize}
+
+每一层写出输入、输出、常用观察命令和一个可能出错的例子。
+
+\textbf{作业 2：构建错误分类。}
+
+故意制造三类错误：
+
+\begin{enumerate}
+  \item C++ 语法或类型错误。
+  \item undefined reference 链接错误。
+  \item 运行时越界错误。
+\end{enumerate}
+
+保存错误输出，并解释每个错误发生在哪个阶段、应当用什么工具定位。
+
+\textbf{作业 3：GDB 调用链报告。}
+
+写一个三层函数调用：
+
+\begin{lstlisting}[language=C++]
+int f(int);
+int g(int);
+int h(int);
+\end{lstlisting}
+
+用 GDB 在 \code{-O0 -g} 下观察调用链、返回地址、\register{rsp} 变化和返回值。提交不少于 1200 字报告。
+
+\textbf{作业 4：Debug 与 Release 二进制对比。}
+
+选择本书前面任意一个小函数，用 \code{-O0 -g} 和 \code{-O3 -DNDEBUG} 构建。比较：
+
+\begin{itemize}
+  \item 函数是否存在独立符号。
+  \item 栈帧是否存在。
+  \item 局部变量是否落在栈上。
+  \item 循环是否被展开或改写。
+  \item 哪个版本更适合调试，哪个版本更接近性能路径。
+\end{itemize}
+
+\textbf{作业 5：实验可复现性审查。}
+
+拿自己之前写过的一份实验记录，检查是否缺少下面信息：
+
+\begin{itemize}
+  \item 工作目录。
+  \item 源码版本。
+  \item 编译命令。
+  \item 编译器版本。
+  \item CPU 和 OS。
+  \item 输入规模。
+  \item 原始输出。
+  \item 反汇编或工具证据。
+\end{itemize}
+
+把它补成一份别人可以复现的报告。
+
+\textbf{作业 6：工具选择诊断表。}
+
+给出下面 8 个现象，为每个现象选择首选工具，并写出第一条应该运行的命令：
+
+\begin{enumerate}
+  \item 编译器找不到头文件。
+  \item 链接器报告 undefined reference。
+  \item 程序启动时报 shared library not found。
+  \item 程序读取配置文件失败。
+  \item 程序发生 \code{SIGSEGV}。
+  \item Release 版本中某个函数找不到反汇编标签。
+  \item benchmark 数字突然快得不合理。
+  \item 两台机器结果差异很大。
+\end{enumerate}
+
+要求说明为什么选择这个工具，而不是只列命令。
+
+\textbf{作业 7：core dump 调试报告。}
+
+找一个会崩溃的小程序，可以是空指针、越界写或手写汇编破坏栈。生成 core dump，并提交一份报告：
+
+\begin{itemize}
+  \item 构建命令和构建类型。
+  \item core dump 保存方式。
+  \item GDB 中的 \code{bt}、\code{info registers} 和当前指令。
+  \item 崩溃地址的解释。
+  \item 如果使用 sanitizer，同一错误的 sanitizer 报告。
+\end{itemize}
+
+重点是从机器状态解释崩溃，不要只写“因为代码有 bug”。
+
+\textbf{作业 8：最小实验包审计。}
+
+为本章任意实验整理一个完整结果目录，至少包含：
+
+\begin{itemize}
+  \item \filepath{README.md}。
+  \item \filepath{commands.txt}。
+  \item \filepath{environment.txt}。
+  \item 构建输出或 verbose build 日志。
+  \item \code{objdump}、\code{nm}、\code{readelf} 输出。
+  \item 如果涉及崩溃，包含 GDB 或 core dump 记录。
+  \item \filepath{report.md}。
+\end{itemize}
+
+然后写一段自评：另一个人能否根据这个目录复现你的观察？还缺哪些信息？
+
+\textbf{作业 9：进程运行身份报告。}
+
+选择一个自己写的小程序，用 \filepath{/proc/<pid>} 收集运行时身份信息。报告必须包含：
+
+\begin{itemize}
+  \item 启动命令和进程号获取方式。
+  \item \filepath{cmdline}、\filepath{cwd}、\filepath{exe}、\filepath{fd}、\filepath{maps} 的关键输出。
+  \item 当前工作目录如何影响相对路径。
+  \item \filepath{maps} 中主程序、共享库、heap、stack 的地址范围。
+  \item 如果程序崩溃，如何把 \register{rip} 和 \filepath{maps} 对应起来。
+\end{itemize}
+
+\textbf{作业 10：动态链接故障推演。}
+
+假设一个程序在自己机器上能运行，到另一台机器上报错：
+
+\begin{lstlisting}
+error while loading shared libraries: libexample.so: cannot open shared object file
+\end{lstlisting}
+
+写一份排查方案，至少包含：
+
+\begin{itemize}
+  \item 使用 \code{ldd}、\code{readelf -d}、\code{file} 的命令。
+  \item 检查 \code{LD_LIBRARY_PATH}、RPATH/RUNPATH 和库安装路径的方法。
+  \item 如何确认库架构和程序架构一致。
+  \item 为什么不能只把错误归咎于 C++ 源码。
+\end{itemize}
+
+\textbf{作业 11：证据链改写。}
+
+把下面三个不合格结论改写成合格工程结论：
+
+\begin{enumerate}
+  \item “这个函数没有了，因为编译器优化掉了。”
+  \item “程序崩溃是因为指针错了。”
+  \item “Release 比 Debug 快，所以算法优化成功。”
+\end{enumerate}
+
+每个改写都必须列出需要的工具证据、哪些是事实、哪些是解释、哪些还需要进一步验证。
 \end{exercisebox}
+
+\section{验收标准}
+
+完成本章后，你应该能够做到：
+
+\begin{itemize}
+  \item 不依赖 IDE，在 Linux 命令行创建、编译、运行和调试 C++ 程序。
+  \item 解释 Debug、Release、sanitizer、benchmark build 的用途和边界。
+  \item 使用 \code{objdump -drwC -Mintel} 找到函数反汇编，并解释地址、机器码字节和指令文本的区别。
+  \item 使用 \code{nm -C} 判断符号是否定义、未定义或被优化消除。
+  \item 使用 \code{readelf} 查看 ELF header、section、program header、symbol 和 relocation 的基础信息。
+  \item 使用 GDB 设置断点、单步源码、单步指令、查看寄存器和查看栈内存。
+  \item 使用 \code{strace} 判断文件路径、系统调用和错误码相关问题。
+  \item 使用 core dump 保存崩溃现场，并用 GDB 事后分析。
+  \item 使用 \filepath{/proc/<pid>} 观察进程参数、工作目录、可执行文件、文件描述符和地址映射。
+  \item 用 \code{file}、\code{ldd}、\code{size}、\code{readelf -d} 快速建立二进制档案和动态链接证据。
+  \item 保存环境、命令、工具输出和报告，让实验可以复现。
+  \item 解释 GDB、sanitizer、\code{strace} 和 \code{perf} 的主要扰动与适用边界。
+  \item 把工具输出整理成事实、解释、建议分离的证据链。
+  \item 在性能讨论中主动说明构建类型和实验限制，不把调试观察当成性能结论。
+  \item 面对编译、链接、启动、崩溃、错误结果和性能异常，能选择合适工具而不是盲目猜测。
+  \item 能用 Git 状态、构建日志和结果目录说明一次实验对应的源码身份。
+\end{itemize}
+
+如果这些能力稳定，后面进入 x86-64 汇编、ABI、C++ 与汇编互操作、可信性能测量时，读者就不会只是在读概念，而是在用工具不断验证概念。
