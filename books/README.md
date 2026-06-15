@@ -7,6 +7,7 @@
 | book id | status | description |
 |---|---|---|
 | `cpu-volume-1` | active | CPU 底层原理教材第一册：程序、C++、二进制、x86-64、汇编、Linux 工具链和性能测量。 |
+| `algorithm-interview` | active | 算法刷题与 C++ 面试教材：3 个月计划、算法原理、暴力到优化、C++ 容器和力扣题单。 |
 
 ## 书籍目录规范
 

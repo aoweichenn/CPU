@@ -5,8 +5,9 @@
 当前正式书籍：
 
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
+- `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是 3 个月刷题计划、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达。
 
-规划中的新书可以继续放到 `books/` 下，例如算法面试、C++ 语言、编译器、操作系统、AI 系统等方向。
+规划中的新书可以继续放到 `books/` 下，例如 C++ 语言、编译器、操作系统、AI 系统等方向。
 
 ## 仓库结构
 
@@ -19,6 +20,13 @@ books/
     reports/           # 报告模板和学习报告
     results/           # 实验输出，默认只跟踪 .gitkeep
     tools/             # 本书专用脚本
+  algorithm-interview/
+    source/markdown/   # 算法面试书正式 Markdown 主稿
+    materials/         # 题单、写作标准和素材
+    labs/              # C++20 算法示例和测试
+    reports/           # 周报和复盘模板
+    results/           # 实验输出
+    tools/             # 本书检查脚本
 CMakeLists.txt         # 仓库级 C++ 实验入口
 Makefile               # 仓库级常用命令入口
 ```
@@ -51,6 +59,13 @@ make cpu-lab00
 make cpu-coverage
 ```
 
+检查和测试算法面试书：
+
+```bash
+make algo-check
+make algo-test
+```
+
 也可以进入单本书目录执行同名任务：
 
 ```bash
@@ -58,6 +73,14 @@ cd books/cpu-volume-1
 make pdf
 make epub
 make lab00
+```
+
+算法书也可以进入单本书目录执行：
+
+```bash
+cd books/algorithm-interview
+make check
+make test
 ```
 
 ## CMake 构建
@@ -112,3 +135,12 @@ books/<book-id>/
 - 16 周执行计划：`books/cpu-volume-1/materials/x86_64_hpc_ai_16_week_bootcamp.md`
 - Markdown 草稿素材：`books/cpu-volume-1/materials/drafts/README.md`
 - Lab 00：`books/cpu-volume-1/labs/lab00_benchmark_foundation/README.md`
+
+## 当前算法面试书入口
+
+- 算法书说明：`books/algorithm-interview/README.md`
+- 正式主稿：`books/algorithm-interview/source/markdown/main.md`
+- 三个月刷题计划：`books/algorithm-interview/source/markdown/chapters/01-three-month-plan.md`
+- C++ 容器手册：`books/algorithm-interview/source/markdown/chapters/03-cpp-containers.md`
+- 题单地图：`books/algorithm-interview/materials/problem-map.md`
+- C++20 示例：`books/algorithm-interview/labs/cpp20-examples/`

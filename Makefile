@@ -1,7 +1,8 @@
 CPU_BOOK_DIR := books/cpu-volume-1
 CPU_LATEX_DIR := $(CPU_BOOK_DIR)/source/latex
+ALGO_BOOK_DIR := books/algorithm-interview
 
-.PHONY: all cpu-check cpu-pdf cpu-epub cpu-text-count cpu-text-target cpu-lab00 cpu-coverage clean
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-text-count cpu-text-target cpu-lab00 cpu-coverage algo-check algo-test clean
 
 all: cpu-pdf cpu-epub
 
@@ -26,5 +27,12 @@ cpu-lab00:
 cpu-coverage:
 	bash $(CPU_BOOK_DIR)/tools/run_coverage.sh
 
+algo-check:
+	$(MAKE) -C $(ALGO_BOOK_DIR) check
+
+algo-test:
+	$(MAKE) -C $(ALGO_BOOK_DIR) test
+
 clean:
 	$(MAKE) -C $(CPU_LATEX_DIR) clean
+	$(MAKE) -C $(ALGO_BOOK_DIR) clean
