@@ -1,6 +1,6 @@
 # 算法刷题与 C++ 面试教材
 
-这是一本面向刷题找工作的 LaTeX 教材。目标不是堆题解，而是把每类算法讲成一条可以复用的推理链：
+这是一本面向刷题、面试和长期算法能力建设的 LaTeX 教材。目标不是堆题解，也不是把学习压进固定周期，而是把每类算法讲成一条可以复用的推理链：
 
 ```text
 题目条件 -> 暴力枚举 -> 重复工作在哪里 -> 数据结构选择 -> 可维护的不变量 -> 优化算法 -> C++ 实现 -> 复杂度证明 -> 变形题
@@ -20,7 +20,7 @@ results/             # 运行结果，默认不提交批量输出
 
 ## 当前目标
 
-- 制定 3 个月刷题计划。
+- 给出可调节的学习训练路线，集中准备和长期学习都能使用。
 - 数据结构单独成章讲清楚，数组、字符串、链表、栈、队列、哈希表、堆、树、图、并查集都要和算法应用绑定。
 - 每个算法都讲清楚暴力版本、优化版本、多解法版本。
 - 解释为什么能优化，而不是只给结论。
@@ -50,7 +50,7 @@ make test
 ## 已有入口
 
 - 正式主稿：`source/latex/main.tex`
-- 三个月计划：`source/latex/chapters/part00-method/ch01-three-month-plan.tex`
+- 学习训练路线：`source/latex/chapters/part00-method/ch01-study-roadmap.tex`
 - 数据结构主线：`source/latex/chapters/part01-data-structures/`
 - 核心算法主线：`source/latex/chapters/part02-core-algorithms/`
 - 题单地图：`materials/problem-map.md`

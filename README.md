@@ -5,7 +5,7 @@
 当前正式书籍：
 
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
-- `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是 3 个月刷题计划、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达。
+- `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 
 规划中的新书可以继续放到 `books/` 下，例如 C++ 语言、编译器、操作系统、AI 系统等方向。
 
@@ -142,7 +142,7 @@ books/<book-id>/
 
 - 算法书说明：`books/algorithm-interview/README.md`
 - 正式主稿：`books/algorithm-interview/source/latex/main.tex`
-- 三个月刷题计划：`books/algorithm-interview/source/latex/chapters/part00-method/ch01-three-month-plan.tex`
+- 学习训练路线：`books/algorithm-interview/source/latex/chapters/part00-method/ch01-study-roadmap.tex`
 - 数据结构主线：`books/algorithm-interview/source/latex/chapters/part01-data-structures/`
 - 核心算法主线：`books/algorithm-interview/source/latex/chapters/part02-core-algorithms/`
 - 题单地图：`books/algorithm-interview/materials/problem-map.md`

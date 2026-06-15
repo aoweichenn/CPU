@@ -151,6 +151,8 @@ class LatexInline:
             "neq": "≠",
             "sim": "∼",
             "log": "log",
+            "cpp": "C++",
+            "cpp20": "C++20",
             "n": "\n",
             "t": "\t",
         }
