@@ -21,7 +21,7 @@ books/
     results/           # 实验输出，默认只跟踪 .gitkeep
     tools/             # 本书专用脚本
   algorithm-interview/
-    source/markdown/   # 算法面试书正式 Markdown 主稿
+    source/latex/      # 算法面试书正式 LaTeX 主稿
     materials/         # 题单、写作标准和素材
     labs/              # C++20 算法示例和测试
     reports/           # 周报和复盘模板
@@ -63,6 +63,7 @@ make cpu-coverage
 
 ```bash
 make algo-check
+make algo-pdf
 make algo-test
 ```
 
@@ -80,6 +81,7 @@ make lab00
 ```bash
 cd books/algorithm-interview
 make check
+make pdf
 make test
 ```
 
@@ -139,8 +141,9 @@ books/<book-id>/
 ## 当前算法面试书入口
 
 - 算法书说明：`books/algorithm-interview/README.md`
-- 正式主稿：`books/algorithm-interview/source/markdown/main.md`
-- 三个月刷题计划：`books/algorithm-interview/source/markdown/chapters/01-three-month-plan.md`
-- C++ 容器手册：`books/algorithm-interview/source/markdown/chapters/03-cpp-containers.md`
+- 正式主稿：`books/algorithm-interview/source/latex/main.tex`
+- 三个月刷题计划：`books/algorithm-interview/source/latex/chapters/part00-method/ch01-three-month-plan.tex`
+- 数据结构主线：`books/algorithm-interview/source/latex/chapters/part01-data-structures/`
+- 核心算法主线：`books/algorithm-interview/source/latex/chapters/part02-core-algorithms/`
 - 题单地图：`books/algorithm-interview/materials/problem-map.md`
 - C++20 示例：`books/algorithm-interview/labs/cpp20-examples/`

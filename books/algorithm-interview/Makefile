@@ -1,9 +1,13 @@
-.PHONY: check test clean
+.PHONY: check pdf test clean
 
 BUILD_DIR := build/labs-debug
+LATEX_DIR := source/latex
 
 check:
-	@python3 tools/check_book.py
+	$(MAKE) -C $(LATEX_DIR) check
+
+pdf:
+	$(MAKE) -C $(LATEX_DIR) pdf
 
 test:
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug
@@ -12,3 +16,4 @@ test:
 
 clean:
 	rm -rf build
+	$(MAKE) -C $(LATEX_DIR) clean
