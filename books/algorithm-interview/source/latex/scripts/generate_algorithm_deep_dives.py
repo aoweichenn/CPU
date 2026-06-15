@@ -733,19 +733,35 @@ def problem_card(problem: Problem, family: Family) -> str:
         f"""
         \\subsection{{{escape_text(title)}}}
 
-        \\textbf{{题目模型。}} {sentence(problem.model)}。这题归入“{escape_text(family.name)}”主线，因为它的核心不是某个语法技巧，而是如何把输入状态组织成可维护的结构。读题时先把对象、关系、约束和输出目标分开：对象决定容器，关系决定边或区间，约束决定能否单调推进，输出目标决定保存最值、计数、路径还是判定结果。{sentence(problem.focus)}。
+        \\textbf{{从问题出发。}} 先不要问“这题套什么模板”，而要把题面翻译成对象、关系、约束和输出目标。{sentence(problem.model)}。对象决定我们要保存数组下标、节点、区间、字符还是图状态；关系决定候选之间能不能比较、合并或淘汰；输出目标决定最后保存的是最值、计数、路径、集合还是判定结果。把这些拆开以后，才进入“{escape_text(family.name)}”这条主线。
 
-        \\textbf{{暴力解和瓶颈。}} {escape_text(family.brute)} 对于本题，先写暴力解的价值在于看清状态空间：哪些候选会被枚举，哪些信息会被重复计算，哪些检查其实只依赖少量历史状态。{escape_text(family.bottleneck)} 如果面试中直接跳到优化而说不清暴力慢在哪里，后续复杂度分析就会显得像背模板。
+        \\textbf{{先把暴力写清楚。}} 按上面的模型，最直接的办法是完整枚举可能答案或完整模拟题目过程，再对每个候选重新检查是否合法。{escape_text(family.brute)} 写暴力不是为了提交它，而是为了暴露状态空间：哪些候选一定会出现，哪些判断被反复做，哪些中间量其实只和少量历史状态有关。只有这一步说清楚，后面的优化才不是凭空跳出来的答案。
 
-        \\textbf{{优化依据。}} {escape_text(family.optimization)} 本题的优化要抓住“{escape_text(problem.focus)}”这一点，把原来重复扫描或重复搜索的部分改成增量维护。优化以后，每次循环都应该只处理新增状态、删除过期状态或合并两个已经稳定的子答案，而不是重新审查全部输入。若题目条件发生变化，必须重新检查这个依据是否还成立。
+        \\textbf{{瓶颈定位。}} 暴力版本跑慢，通常不是因为代码写得不够巧，而是因为同一类信息被一次次重新取得。{escape_text(family.bottleneck)} 放到本题里，要重点观察“{escape_text(problem.focus)}”这条线索：它说明有一部分信息可以从已经处理过的输入中继承下来，而不需要回头重算。这里的关键观察不是结论，而是从暴力过程里提炼出来的重复工作。
 
-        \\textbf{{正确性不变量。}} {escape_text(family.invariant)} 用这道题复盘时，可以把不变量写成三句话：已经处理的部分满足什么，尚未处理的部分还保留什么可能性，当前操作为什么不会丢掉最优答案或合法答案。{escape_text(family.proof)} 证明不需要很形式化，但必须能排除反例；如果你说“感觉这样选最好”，就还没有完成算法说明。
+        \\textbf{{结构选择和优化。}} 既然瓶颈已经定位，下一步才是选择结构。{escape_text(family.optimization)} 本题的优化应当围绕“{escape_text(problem.focus)}”建立一个可维护状态：新增输入只更新一次，过期候选及时删除，已经稳定的子答案被合并使用。优化后的循环不应重新审查全部输入，而应只处理这一步真正变化的那一小块状态。若题目条件发生变化，例如有序性、正数条件、字符集、边权或是否允许修改输入发生改变，就必须重新验证这个结构是否仍然成立。
 
-        \\textbf{{C++ 实现要点。}} {sentence(family.cpp)}。本题还要特别注意：{sentence(problem.edge)}。写代码时先把边界条件放在函数开头或循环不变量里，而不是用很多补丁式 if 修修补补。容器选择要和访问模式一致：需要顺序就别用无序表，需要极值就别完整排序，需要历史计数就别只保存布尔值。
+        \\textbf{{不变量和证明。}} {escape_text(family.invariant)} 用这道题复盘时，把不变量写成三句话：已经处理的部分满足什么，尚未处理的部分还保留什么可能性，当前操作为什么不会丢掉最优答案或合法答案。{escape_text(family.proof)} 证明不需要很形式化，但必须能排除反例；如果只能说“这样写好像可以”，说明你还没有把优化从暴力中推导出来。
 
-        \\textbf{{复杂度和边界。}} 时间复杂度要按真实输入维度说明，不能把字符串长度、图边数、值域大小都混成一个 n。空间复杂度也要区分辅助结构和输出本身。测试时至少覆盖：最小输入、没有答案、答案在边界、重复元素或重复状态、以及会让暴力解最慢的规模输入。对于这题，边界复盘重点是：{sentence(problem.edge)}。
+        \\textbf{{代码落地。}} {sentence(family.cpp)}。本题还要特别注意：{sentence(problem.edge)}。写代码前先把边界条件放进函数入口、循环条件或状态定义里，而不是写完主体后再用补丁式分支修样例。容器选择要和访问模式一致：需要顺序就别用无序表，需要极值就别完整排序，需要历史计数就别只保存布尔值。
 
-        \\textbf{{扩展和实验。}} {sentence(problem.variant)}。{sentence(family.experiment)}。实验报告建议记录三件事：暴力版本在什么规模开始变慢，优化版本减少了哪类重复工作，哪一个边界用例最容易打破错误实现。这样一张题卡才算从“看过题解”变成“能够迁移”。
+        \\textbf{{复杂度、边界和实验。}} 时间复杂度要按真实输入维度说明，不能把字符串长度、图边数、值域大小都混成一个 n。空间复杂度也要区分辅助结构和输出本身。测试时至少覆盖：最小输入、没有答案、答案在边界、重复元素或重复状态、以及会让暴力解最慢的规模输入。对于这题，边界复盘重点是：{sentence(problem.edge)}。{sentence(problem.variant)}。{sentence(family.experiment)}。实验报告建议记录三件事：暴力版本在什么规模开始变慢，优化版本减少了哪类重复工作，哪一个边界用例最容易打破错误实现。
+        """
+    ).strip()
+
+
+def family_diagram(family: Family) -> str:
+    return dedent(
+        f"""
+        \\begin{{principlebox}}{{图示：{escape_text(family.name)}推导链}}
+        \\begin{{tabular}}{{@{{}}p{{0.18\\linewidth}}p{{0.74\\linewidth}}@{{}}}}
+        暴力基线 & 枚举候选、完整模拟或逐个检查，先保证覆盖全部可能答案。\\\\
+        瓶颈定位 & {sentence(family.bottleneck)}。\\\\
+        结构选择 & {sentence(family.optimization)}。\\\\
+        不变量 & {sentence(family.invariant)}。\\\\
+        代码落地 & {sentence(family.cpp)}。\\\\
+        \\end{{tabular}}
+        \\end{{principlebox}}
         """
     ).strip()
 
@@ -778,9 +794,11 @@ def write_problem_groups() -> None:
             body.append(f"\\subsection{{{escape_text(family.name)}}}")
             body.append(
                 escape_text(
-                    "下面的题卡都按同一条链路展开：题目模型、暴力解、瓶颈、优化依据、不变量、C++ 实现、边界和扩展。格式统一是为了训练面试表达，而每张卡的关键观察和失效条件都要单独复盘。"
+                    "下面的题卡都按同一条链路展开：从问题出发，先写暴力，再定位重复工作，然后选择数据结构或状态不变量，最后落到 C++ 实现、边界和扩展。格式统一是为了训练面试表达，而每张卡的关键观察和失效条件都要单独复盘。"
                 )
             )
+            body.append("")
+            body.append(family_diagram(family))
             body.append("")
             for problem in problems_by_family.get(family_key, []):
                 body.append(problem_card(problem, family))
@@ -814,9 +832,9 @@ def second_pass_card(problem: Problem, family: Family) -> str:
     title = f"{problem.number} {problem.title}"
     return dedent(
         f"""
-        \\textbf{{{escape_text(title)}。}} 二刷这题时，不要满足于能写出代码，而要能在三分钟内讲出完整推理。先用一句话定位模型：{sentence(problem.model)}。再用一句话定位优化点：{sentence(problem.focus)}。如果这两句话说不出来，说明你记住的是答案形状，不是题目结构。
+        \\textbf{{{escape_text(title)}。}} 二刷这题时，不要满足于能写出代码，而要能在三分钟内讲出完整推理。第一句话从问题出发：{sentence(problem.model)}。第二句话交代暴力基线：按题意完整枚举或模拟会覆盖哪些候选。第三句话才讲优化线索：{sentence(problem.focus)}。如果这三句话说不出来，说明你记住的是答案形状，不是题目结构。
 
-        暴力基线要讲具体：枚举哪些对象，重复检查哪类状态，最坏输入如何把它拖慢。然后把优化解释成一个数据结构职责：保存历史、维护边界、弹出过期候选、合并集合、记录前驱、还是缓存子问题。对于本题，边界风险集中在：{sentence(problem.edge)}。请至少准备一个能打破错误实现的用例，并解释错误发生在哪个不变量上。
+        暴力基线要讲具体：枚举哪些对象，检查函数做了什么，最坏输入如何把它拖慢。接着定位浪费：是重复查询历史、重复扫描区间、重复比较候选、重复搜索同一状态，还是重复维护已经稳定的部分。然后把优化解释成一个数据结构职责：保存历史、维护边界、弹出过期候选、合并集合、记录前驱、缓存子问题或维护有序关系。对于本题，边界风险集中在：{sentence(problem.edge)}。请至少准备一个能打破错误实现的用例，并解释错误发生在哪个不变量上。
 
         正确性说明要避开空话。{sentence(family.proof)}。二刷时可以把证明压成两段：第一段证明所有合法答案都会被覆盖，第二段证明被剪掉或丢弃的候选不可能成为更优答案。若使用排序、堆、哈希、队列或 DP 表，还要补一句容器中每个元素代表什么，什么时候进入，什么时候离开，是否可能重复进入。
 
