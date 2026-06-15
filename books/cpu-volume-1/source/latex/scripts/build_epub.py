@@ -223,7 +223,7 @@ class LatexInline:
             if ch == "$":
                 j = find_unescaped(text, "$", i + 1, end)
                 if j != -1:
-                    out.append(f'<span class="math">{html.escape(text[i + 1:j])}</span>')
+                    out.append(f'<span class="math">{html.escape(latex_math_plain(text[i + 1:j]))}</span>')
                     i = j + 1
                     continue
             if ch == "~":
@@ -302,6 +302,17 @@ class LatexInline:
             "textit": "em",
             "makecell": "span",
         }
+        math_arg = {
+            "complexity",
+            "ensuremath",
+            "mathrm",
+            "mathit",
+            "mathbf",
+        }
+        if name in math_arg and j < end and text[j] == "{":
+            raw, j = read_group(text, j)
+            return f'<span class="math">{html.escape(latex_math_plain(raw))}</span>', j
+
         if name in one_arg and j < end and text[j] == "{":
             raw, j = read_group(text, j)
             converted = self.convert(raw)
@@ -769,6 +780,58 @@ def latex_plain(text: str) -> str:
     }
     for old, new in replacements.items():
         text = text.replace(old, new)
+    return text.strip()
+
+
+def latex_math_plain(text: str) -> str:
+    replacements = {
+        r"\cdot": "×",
+        r"\times": "×",
+        r"\log": " log ",
+        r"\ln": " ln ",
+        r"\sqrt": " sqrt ",
+        r"\alpha": "α",
+        r"\beta": "β",
+        r"\gamma": "γ",
+        r"\delta": "δ",
+        r"\epsilon": "ε",
+        r"\theta": "θ",
+        r"\Theta": "Θ",
+        r"\lambda": "λ",
+        r"\mu": "μ",
+        r"\pi": "π",
+        r"\Sigma": "Σ",
+        r"\sum": "Σ",
+        r"\Omega": "Ω",
+        r"\omega": "ω",
+        r"\infty": "∞",
+        r"\leq": "≤",
+        r"\le": "≤",
+        r"\geq": "≥",
+        r"\ge": "≥",
+        r"\neq": "≠",
+        r"\ne": "≠",
+        r"\approx": "≈",
+        r"\sim": "∼",
+        r"\to": "→",
+        r"\rightarrow": "→",
+        r"\leftarrow": "←",
+        r"\lceil": "⌈",
+        r"\rceil": "⌉",
+        r"\lfloor": "⌊",
+        r"\rfloor": "⌋",
+        r"\{": "{",
+        r"\}": "}",
+        r"\_": "_",
+    }
+    for old, new in replacements.items():
+        text = text.replace(old, new)
+    text = re.sub(r"\\(?:left|right)\s*", "", text)
+    text = re.sub(r"\\[A-Za-z@]+\*?", "", text)
+    text = text.replace("{", "").replace("}", "")
+    text = re.sub(r"\s+", " ", text)
+    text = text.replace(" ^", "^").replace("^ ", "^")
+    text = text.replace(" _", "_").replace("_ ", "_")
     return text.strip()
 
 
