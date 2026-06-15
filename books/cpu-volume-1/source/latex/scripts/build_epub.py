@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import html
+import os
 import re
 import subprocess
 import sys
@@ -22,10 +23,10 @@ from pathlib import Path
 from typing import Iterable
 
 
-BOOK_TITLE = "从 C++ 到机器执行：第一册"
-BOOK_SUBTITLE = "底层原理、汇编接口与可信性能测量"
-BOOK_AUTHOR = "CPU Performance Study"
-BOOK_LANG = "zh-CN"
+BOOK_TITLE = os.environ.get("BOOK_TITLE", "从 C++ 到机器执行：第一册")
+BOOK_SUBTITLE = os.environ.get("BOOK_SUBTITLE", "底层原理、汇编接口与可信性能测量")
+BOOK_AUTHOR = os.environ.get("BOOK_AUTHOR", "CPU Performance Study")
+BOOK_LANG = os.environ.get("BOOK_LANG", "zh-CN")
 
 BOX_TITLES = {
     "keyidea": "核心思想",
@@ -261,6 +262,18 @@ class LatexBlockConverter:
                     self.out.append(f'<aside class="box {env}"><p class="box-title">{html.escape(title)}</p>')
                     i += 1
                     continue
+                if env == "principlebox":
+                    self.flush_paragraph()
+                    title = "原则"
+                    rest = begin.group(2).strip()
+                    if rest.startswith("{"):
+                        raw_title, _ = read_group(rest, 0)
+                        title = latex_plain(raw_title) or title
+                    self.out.append(
+                        f'<aside class="box {env}"><p class="box-title">{self.inline.convert(title)}</p>'
+                    )
+                    i += 1
+                    continue
                 if env in {"center", "minipage", "titlepage"}:
                     self.flush_paragraph()
                     i += 1
@@ -273,6 +286,8 @@ class LatexBlockConverter:
                 if env in LIST_ENV:
                     self.close_list()
                 elif env in BOX_TITLES:
+                    self.out.append("</aside>")
+                elif env == "principlebox":
                     self.out.append("</aside>")
                 i += 1
                 continue

@@ -1,4 +1,4 @@
-.PHONY: check pdf test clean
+.PHONY: check pdf epub test clean
 
 BUILD_DIR := build/labs-debug
 LATEX_DIR := source/latex
@@ -8,6 +8,9 @@ check:
 
 pdf:
 	$(MAKE) -C $(LATEX_DIR) pdf
+
+epub:
+	$(MAKE) -C $(LATEX_DIR) epub
 
 test:
 	cmake -S . -B $(BUILD_DIR) -DCMAKE_BUILD_TYPE=Debug
