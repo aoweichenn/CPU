@@ -61,6 +61,7 @@ book-latex/
 - 给最小代码例子。
 - 从源码走到汇编、IR、二进制或性能证据。
 - 包含实验、习题、常见误区、验收标准。
+- 尽量包含贯穿案例、可复现实验和真实系统源码阅读入口；Linux 源码案例见 `appendices/app-f-linux-source-reading.tex`。
 - 关键术语使用 `\term{中文}{English}` 或 `\engterm{English}` 标注。
 
 更详细规则见：
