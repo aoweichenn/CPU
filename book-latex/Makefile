@@ -2,12 +2,15 @@ LATEXMK ?= latexmk
 ENGINE ?= -xelatex
 MAIN ?= main.tex
 
-.PHONY: all pdf clean check text-count text-count-chapters
+.PHONY: all pdf epub clean check text-count text-count-chapters
 
 all: pdf
 
 pdf:
 	$(LATEXMK) $(ENGINE) -interaction=nonstopmode -halt-on-error $(MAIN)
+
+epub:
+	@python3 scripts/build_epub.py --output main.epub
 
 clean:
 	$(LATEXMK) -C
