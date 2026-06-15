@@ -43,6 +43,134 @@ LIST_ENV = {
     "description": "dl",
 }
 
+CPP_KEYWORDS = {
+    "alignas",
+    "alignof",
+    "and",
+    "and_eq",
+    "asm",
+    "auto",
+    "bitand",
+    "bitor",
+    "break",
+    "case",
+    "catch",
+    "class",
+    "co_await",
+    "co_return",
+    "co_yield",
+    "compl",
+    "concept",
+    "const",
+    "consteval",
+    "constexpr",
+    "constinit",
+    "const_cast",
+    "continue",
+    "decltype",
+    "default",
+    "delete",
+    "do",
+    "dynamic_cast",
+    "else",
+    "enum",
+    "explicit",
+    "export",
+    "extern",
+    "false",
+    "for",
+    "friend",
+    "goto",
+    "if",
+    "inline",
+    "mutable",
+    "namespace",
+    "new",
+    "noexcept",
+    "not",
+    "not_eq",
+    "nullptr",
+    "operator",
+    "or",
+    "or_eq",
+    "private",
+    "protected",
+    "public",
+    "register",
+    "reinterpret_cast",
+    "requires",
+    "return",
+    "sizeof",
+    "static",
+    "static_assert",
+    "static_cast",
+    "struct",
+    "switch",
+    "template",
+    "this",
+    "throw",
+    "true",
+    "try",
+    "typedef",
+    "typeid",
+    "typename",
+    "using",
+    "virtual",
+    "volatile",
+    "while",
+    "xor",
+    "xor_eq",
+}
+
+CPP_TYPES = {
+    "array",
+    "bool",
+    "char",
+    "deque",
+    "double",
+    "float",
+    "int",
+    "int64_t",
+    "long",
+    "map",
+    "optional",
+    "pair",
+    "priority_queue",
+    "queue",
+    "set",
+    "shared_ptr",
+    "short",
+    "size_t",
+    "span",
+    "stack",
+    "std",
+    "string",
+    "string_view",
+    "tuple",
+    "uint64_t",
+    "unique_ptr",
+    "unordered_map",
+    "unordered_set",
+    "variant",
+    "vector",
+    "void",
+}
+
+CPP_DIRECTIVES = {
+    "define",
+    "elif",
+    "else",
+    "endif",
+    "error",
+    "if",
+    "ifdef",
+    "ifndef",
+    "include",
+    "pragma",
+    "undef",
+    "warning",
+}
+
 
 @dataclass
 class SourceEntry:
@@ -244,7 +372,7 @@ class LatexBlockConverter:
                 if env in {"lstlisting", "verbatim"}:
                     code, i = collect_environment(lines, i, env)
                     self.flush_paragraph()
-                    self.out.append(f'<pre><code>{html.escape(code.rstrip())}</code></pre>')
+                    self.out.append(render_code_block(code.rstrip(), env, begin.group(2)))
                     continue
                 if env == "tabular":
                     table, i = collect_environment(lines, i, env)
@@ -466,6 +594,108 @@ def collect_environment(lines: list[str], start: int, env: str) -> tuple[str, in
     return "\n".join(body), i
 
 
+def render_code_block(code: str, env: str, options: str) -> str:
+    language = ""
+    language_match = re.search(r"language\s*=\s*([^,\]]+)", options)
+    if language_match:
+        language = language_match.group(1).strip().lower()
+    if env == "lstlisting" and language in {"c++", "cpp"}:
+        return f'<pre class="code-block language-cpp"><code>{highlight_cpp(code)}</code></pre>'
+    return f'<pre class="code-block"><code>{html.escape(code)}</code></pre>'
+
+
+def highlight_cpp(code: str) -> str:
+    highlighted = [highlight_cpp_line(line) for line in code.splitlines()]
+    return "\n".join(highlighted)
+
+
+def highlight_cpp_line(line: str) -> str:
+    stripped = line.lstrip()
+    if stripped.startswith("#"):
+        leading = line[: len(line) - len(stripped)]
+        return html.escape(leading) + highlight_directive_line(stripped)
+
+    out: list[str] = []
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "/" and i + 1 < len(line) and line[i + 1] == "/":
+            out.append(span("comment", line[i:]))
+            break
+        if ch == '"':
+            token, i = collect_quoted_token(line, i, '"')
+            out.append(span("string", token))
+            continue
+        if ch == "'":
+            token, i = collect_quoted_token(line, i, "'")
+            out.append(span("string", token))
+            continue
+        if ch.isdigit():
+            token, i = collect_number_token(line, i)
+            out.append(span("number", token))
+            continue
+        if ch == "_" or ch.isalpha():
+            token, i = collect_identifier_token(line, i)
+            if token in CPP_KEYWORDS:
+                out.append(span("keyword", token))
+            elif token in CPP_TYPES:
+                out.append(span("type", token))
+            else:
+                out.append(html.escape(token))
+            continue
+        out.append(html.escape(ch))
+        i += 1
+    return "".join(out)
+
+
+def highlight_directive_line(line: str) -> str:
+    match = re.match(r"(#\s*)([A-Za-z_]\w*)", line)
+    if not match:
+        return span("directive", line)
+    out = [span("directive", match.group(1))]
+    directive = match.group(2)
+    if directive in CPP_DIRECTIVES:
+        out.append(span("directive", directive))
+    else:
+        out.append(html.escape(directive))
+    rest = line[match.end() :]
+    if rest:
+        out.append(highlight_cpp_line(rest))
+    return "".join(out)
+
+
+def collect_quoted_token(line: str, start: int, quote: str) -> tuple[str, int]:
+    i = start + 1
+    escaped = False
+    while i < len(line):
+        ch = line[i]
+        if ch == quote and not escaped:
+            return line[start : i + 1], i + 1
+        escaped = ch == "\\" and not escaped
+        if ch != "\\":
+            escaped = False
+        i += 1
+    return line[start:], len(line)
+
+
+def collect_number_token(line: str, start: int) -> tuple[str, int]:
+    i = start
+    while i < len(line) and re.match(r"[0-9A-Fa-fxXuUlL'.]", line[i]):
+        i += 1
+    return line[start:i], i
+
+
+def collect_identifier_token(line: str, start: int) -> tuple[str, int]:
+    i = start
+    while i < len(line) and (line[i] == "_" or line[i].isalnum()):
+        i += 1
+    return line[start:i], i
+
+
+def span(css_class: str, text: str) -> str:
+    return f'<span class="tok-{css_class}">{html.escape(text)}</span>'
+
+
 def parse_heading(line: str) -> tuple[str, str] | None:
     for level in ("chapter", "section", "subsection"):
         prefix = "\\" + level
@@ -684,10 +914,44 @@ def part_page(part: PartNode) -> str:
 
 def convert_source(entry: SourceEntry) -> str:
     assert entry.source is not None
-    source = entry.source.read_text(encoding="utf-8")
+    source = expand_source_inputs(entry.source, find_book_dir(entry.source))
     converter = LatexBlockConverter(LatexInline(), heading_prefix=entry.label)
     body = converter.convert(source)
     return xhtml_page(entry.nav_title or entry.title, body)
+
+
+def find_book_dir(source: Path) -> Path:
+    for candidate in (source.parent, *source.parents):
+        if (candidate / "main.tex").exists():
+            return candidate
+    raise FileNotFoundError(f"cannot find LaTeX book root for {source}")
+
+
+def expand_source_inputs(source: Path, book_dir: Path, seen: set[Path] | None = None) -> str:
+    r"""Inline chapter-local ``\input`` files before EPUB conversion.
+
+    The PDF build and text counter already let LaTeX recursively read files.
+    EPUB generation converts each top-level chapter file independently, so
+    chapter-local supplements must be expanded here to keep phone and PDF
+    editions consistent while preserving the coarse navigation.
+    """
+    seen = set() if seen is None else seen
+    resolved = source.resolve()
+    if resolved in seen:
+        return ""
+    seen.add(resolved)
+
+    expanded: list[str] = []
+    for raw in source.read_text(encoding="utf-8").splitlines():
+        line = strip_comment(raw).strip()
+        if line.startswith(r"\input"):
+            name = command_first_arg(line, "input")
+            child = book_dir / f"{name}.tex"
+            if child.exists():
+                expanded.append(expand_source_inputs(child, book_dir, seen))
+                continue
+        expanded.append(raw)
+    return "\n".join(expanded)
 
 
 def build_nav(entries: list[SourceEntry], parts: list[PartNode]) -> str:
@@ -839,27 +1103,54 @@ p {
   text-indent: 2em;
 }
 code {
-  font-family: "Maple Mono NL NF CN", "Source Code Pro", monospace;
-  font-size: 0.92em;
-  background: #f6f6f4;
-  padding: 0.04em 0.18em;
+  font-family: "Maple Mono NL NF CN", "Maple Mono", "Source Code Pro", monospace;
+  font-size: 0.95em;
+  background: #f1f3f5;
+  color: #174e70;
+  padding: 0.04em 0.2em;
   border-radius: 2px;
 }
 pre {
-  font-family: "Maple Mono NL NF CN", "Source Code Pro", monospace;
-  font-size: 0.86em;
-  line-height: 1.45;
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-  background: #fbfbfa;
-  border-top: 1px solid #c8cdd2;
-  border-bottom: 1px solid #c8cdd2;
-  margin: 0.85em 0;
-  padding: 0.75em 0.7em;
+  font-family: "Maple Mono NL NF CN", "Maple Mono", "Source Code Pro", monospace;
+  font-size: 0.92em;
+  line-height: 1.52;
+  white-space: pre;
+  overflow-x: auto;
+  overflow-y: hidden;
+  tab-size: 4;
+  background: #f7f8fa;
+  color: #111111;
+  border: 1px solid #c9d1d9;
+  border-left: 0.6em solid #eef1f5;
+  border-radius: 3px;
+  margin: 0.9em 0;
+  padding: 0.78em 0.82em;
 }
 pre code {
   background: transparent;
+  color: inherit;
   padding: 0;
+  border-radius: 0;
+}
+.tok-keyword {
+  color: #0033b3;
+  font-weight: 700;
+}
+.tok-type {
+  color: #067d7a;
+}
+.tok-string {
+  color: #067d17;
+}
+.tok-comment {
+  color: #8c8c8c;
+  font-style: italic;
+}
+.tok-directive {
+  color: #871094;
+}
+.tok-number {
+  color: #1750eb;
 }
 ul, ol {
   margin: 0.55em 0 0.75em 1.4em;

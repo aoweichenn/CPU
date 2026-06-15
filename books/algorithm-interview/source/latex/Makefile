@@ -2,7 +2,7 @@ LATEXMK ?= latexmk
 ENGINE ?= -xelatex
 MAIN ?= main.tex
 EPUB_BUILDER ?= ../../../cpu-volume-1/source/latex/scripts/build_epub.py
-TEXT_TARGET ?= 180000
+TEXT_TARGET ?= 300000
 
 .PHONY: all pdf epub text-count text-target clean check
 

@@ -258,8 +258,91 @@ std::vector<int> max_sliding_window(const std::vector<int>& nums, int k)
 
 单调队列的优化理由和单调栈相似。一个新元素如果大于等于队尾元素，那么队尾元素在未来任何包含新元素的窗口里都不可能成为最大值，因为它更小且更早过期。于是可以安全删除。每个下标最多进队一次、出队一次，总复杂度 \complexity{O(n)}。
 
+理解 \code{vector} 的底层模型，可以解释很多看似奇怪的 C++ 行为。典型实现内部并不是保存“一个数组对象”，而是保存三个位置：起始位置、当前结束位置、容量结束位置。 \code{size()} 等于当前结束减起始，\code{capacity()} 等于容量结束减起始。 \code{push_back} 时，如果当前结束还没碰到容量结束，就在当前位置构造新元素并移动结束指针；如果容量满了，就申请更大的连续内存，把旧元素移动或复制过去，再释放旧内存。正因为扩容会换一整段内存，旧的指针、引用和迭代器才会失效。
+
+\begin{lstlisting}[language=C++,caption={观察 vector 扩容：地址变化意味着旧指针失效}]
+std::vector<std::size_t> collect_capacity_changes(int count)
+{
+    std::vector<int> values;
+    std::vector<std::size_t> capacities;
+    capacities.reserve(static_cast<std::size_t>(count));
+
+    std::size_t last_capacity = values.capacity();
+    for (int i = 0; i < count; ++i) {
+        values.push_back(i);
+        if (values.capacity() != last_capacity) {
+            capacities.push_back(values.capacity());
+            last_capacity = values.capacity();
+        }
+    }
+
+    return capacities;
+}
+\end{lstlisting}
+
+这段实验代码不是算法题答案，而是学习容器的办法。你可以打印每次容量变化，观察容量通常按倍数增长。标准并不要求具体增长倍数，不同标准库实现可能不同，但“容量不足时整体搬迁”这个语义是理解失效规则的关键。刷题时，如果你要保存 \code{vector} 中元素的地址，然后继续 \code{push_back}，就必须先 \code{reserve} 到足够容量，或者改用不会整体搬迁节点的结构。反过来，如果你只保存下标，扩容不会让下标语义失效，这也是很多算法保存下标而不是指针的原因。
+
+\code{vector} 的摊还 \complexity{O(1)} 插入也值得讲清楚。一次扩容可能移动很多元素，看起来很贵；但如果容量按倍数增长，元素一生被搬迁的次数是对数级，总搬迁成本在一串 \code{push_back} 操作中可以摊成线性。因此连续追加 n 个元素的总成本仍然是 \complexity{O(n)}。这并不意味着每一次 \code{push_back} 都是严格常数，也不意味着扩容时没有延迟尖峰。面试算法一般关心摊还复杂度，工程系统如果关心实时延迟，就要提前预留容量或使用其他结构。
+
+\begin{warningbox}
+\code{reserve} 不是 \code{resize}。前者只改变容量，不创建可访问元素；后者改变大小，会构造元素。写 \code{values.reserve(n)} 后访问 \code{values[i]} 是越界；写 \code{values.resize(n)} 或构造 \code{vector<int> values(n)} 后才可以按下标写。DP 表、计数数组、距离数组通常需要 \code{resize} 或直接构造；收集答案、邻接表追加边、构造结果列表通常适合 \code{reserve} 后 \code{push_back}。
+\end{warningbox}
+
+\code{string} 的底层也不只是“字符数组”。现代标准库实现通常会使用小字符串优化：短字符串直接存在 \code{string} 对象内部，长字符串才分配堆内存。标准不规定小字符串容量，因此不能依赖某个具体长度，但这个优化解释了为什么短字符串拷贝有时比想象中便宜。即便如此，热循环中的 \code{substr} 仍然要谨慎，因为它会构造一个新 \code{string}，可能复制字符、分配内存，并参与哈希计算。单词拆分、回文切分、字符串匹配中，如果在双层循环里频繁 \code{substr}，实际成本可能比复杂度公式更高。
+
+\begin{lstlisting}[language=C++,caption={用 string\_view 表达非拥有子串视图}]
+bool starts_with_at(std::string_view text,
+                    int position,
+                    std::string_view pattern)
+{
+    if (position < 0 ||
+        position + static_cast<int>(pattern.size()) >
+            static_cast<int>(text.size())) {
+        return false;
+    }
+
+    for (int i = 0; i < static_cast<int>(pattern.size()); ++i) {
+        if (text[static_cast<std::size_t>(position + i)] !=
+            pattern[static_cast<std::size_t>(i)]) {
+            return false;
+        }
+    }
+    return true;
+}
+\end{lstlisting}
+
+\code{string_view} 不拥有字符，它只是指向已有字符串的一段视图，所以创建便宜，也不会复制内容。代价是生命周期风险：原字符串销毁或修改导致重分配后，视图可能悬空。刷题中，如果只是函数内部临时比较，\code{string_view} 很合适；如果要把视图存进容器并在原字符串之后继续使用，就必须非常小心。教材里保留一些 \code{substr} 写法，是为了让主算法清晰；源码阅读和工程优化时，再讨论如何减少复制。
+
+\code{deque} 经常被误以为是链表。实际上，\code{deque} 通常是分段连续存储：有一个中控表保存若干固定大小缓冲区的地址，每个缓冲区内部连续。它支持两端高效插入删除，因为在头尾缓冲区还有空间时，只移动段内指针；空间不够时，分配新缓冲区并挂到中控表。它也支持随机访问，但要先定位缓冲区再定位段内偏移，局部性通常不如 \code{vector}。这解释了为什么滑动窗口最大值适合 \code{deque}，而普通 DP 表不应该随便用 \code{deque} 替代 \code{vector}。
+
+\code{list} 是双向链表，节点地址稳定，已知迭代器时插入删除是常数时间。它的缺点也明显：每个节点单独分配，额外保存前后指针，缓存局部性差，不支持下标随机访问。绝大多数刷题场景中，\code{list} 不是首选。LRU 缓存是少数非常适合 \code{list} 的例子，因为我们需要在已知迭代器的情况下，把任意节点移动到表头，并在容量满时删除表尾。这个需求正好匹配 \code{list::splice} 的节点重连能力。
+
+\begin{lstlisting}[language=C++,caption={list::splice：节点移动而不是复制元素}]
+void move_key_to_front(std::list<int>& keys,
+                       std::list<int>::iterator position)
+{
+    keys.splice(keys.begin(), keys, position);
+}
+\end{lstlisting}
+
+\code{splice} 不复制元素，也不重新分配节点，只改变链表链接关系。LRU 中哈希表保存 key 到链表迭代器，链表维护新旧顺序；访问一个 key 时，用迭代器把节点移动到表头。若用 \code{vector} 保存顺序，移动到表头会搬移大量元素，且保存的迭代器会失效；若只用哈希表，又无法知道谁最久未使用。这个案例说明，容器不是按“哪个复杂度低”孤立选择，而是按“多个操作是否同时满足约束”来选择。
+
+栈和队列在 C++ 中通常是容器适配器。 \code{std::stack} 默认底层是 \code{deque}，只暴露栈需要的接口；\code{std::queue} 默认底层也是 \code{deque}，只暴露队列接口。适配器让代码表达意图更明确，但也限制访问能力。例如 \code{std::stack} 不能遍历，也不能 \code{reserve}。刷题中如果需要遍历、预留容量、查看任意位置，直接用 \code{vector} 或 \code{deque} 模拟栈/队列更方便；如果只需要标准栈队列操作，适配器能让语义更干净。
+
+迭代器失效规则是容器原理的考试点。 \code{vector} 扩容会让所有迭代器、指针和引用失效；未扩容时，尾部插入通常只影响尾后迭代器，中间插入删除会影响插入点之后的位置。 \code{deque} 两端插入删除的失效规则比 \code{vector} 复杂，不应长期保存它的迭代器做复杂操作。 \code{list} 删除某个节点只让该节点迭代器失效，其他节点仍稳定。 \code{unordered_map} rehash 会让迭代器失效，但指向元素的引用在很多实现中可能仍稳定；标准语义和具体实现细节要区分，不要在可移植代码里依赖实现偶然行为。
+
+\begin{deepdive}
+源码阅读建议从行为反推结构。读 \code{vector}，先找内部表示大小和容量的成员，再跟 \code{push_back} 的容量足够路径和容量不足路径；读 \code{string}，先找短字符串和长字符串的分支；读 \code{deque}，先找段表和段大小；读 \code{list}，先找节点结构和链接操作；读 \code{stack} 和 \code{queue}，先确认它们只是包装底层容器。不要一开始陷进 allocator 和模板特化细节，先抓住数据如何存、操作如何移动、什么时候失效。
+\end{deepdive}
+
+\begin{labbox}
+线性容器源码实验：第一，连续 \code{push_back} 并打印 \code{vector} 的 \code{capacity()} 和 \code{data()}，观察扩容时地址变化。第二，把一段单词拆分代码中的 \code{substr} 次数统计出来，再改成下标比较，比较运行时间。第三，用 \code{deque} 和 \code{vector} 分别实现滑动窗口最大值，解释为什么 \code{vector} 不适合从头部弹出。第四，实现一个最小 LRU，只支持 \code{get} 和 \code{put}，强制自己说明哈希表和链表各自负责什么。
+\end{labbox}
+
 \begin{principlebox}{线性结构选型}
 需要稳定下标和顺序扫描，优先 \code{vector}；需要字符窗口，使用 \code{string} 加计数结构，不要频繁 \code{substr}；需要局部重连，考虑链表并画清楚前驱、当前、后继；需要最近未解决状态，用栈；需要按层或最短步数扩展，用队列；需要窗口两端同时维护候选，用双端队列。选择结构时同时说出它让哪一步查询、删除或更新变快。
 \end{principlebox}
 
 本章建议配套练习：数组与前缀和做 303、304、560；字符串窗口做 3、438、567、76；链表做 19、21、24、141、142、206、92、25；栈做 20、71、150、155、739、84；队列和双端队列做 102、199、239、994。复盘时不要只写最终代码，要写三行说明：暴力方法慢在哪里，数据结构保存了什么状态，为什么每个元素只被处理有限次。
+
+\input{chapters/generated/generated-data-structures-source}
