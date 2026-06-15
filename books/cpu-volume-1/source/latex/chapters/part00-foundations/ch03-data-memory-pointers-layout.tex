@@ -1,0 +1,3322 @@
+\chapter{数据表示、内存、指针和对象布局}
+
+\section{问题与目标：\code{a[i]} 到底访问了什么}
+
+刚学 C/C++ 时，数组访问通常被解释为“取第 \code{i} 个元素”。这个说法对编写程序有帮助，但不足以支撑机器执行和性能分析。系统分析、性能测量和高性能 kernel 开发中的许多问题，都可以追溯到一个更底层的问题：
+
+\begin{lstlisting}
+某条指令到底访问了哪个地址上的哪些字节？
+\end{lstlisting}
+
+先看一个简单函数：
+
+\begin{lstlisting}[language=C++]
+int get(int const* a, int i)
+{
+    return a[i];
+}
+\end{lstlisting}
+
+在 x86-64 System V ABI 下，编译器可能生成类似汇编：
+
+\begin{lstlisting}
+movsxd  rsi, esi
+mov     eax, dword ptr [rdi + rsi*4]
+ret
+\end{lstlisting}
+
+这三行值得仔细拆解。
+
+\begin{itemize}
+  \item \register{rdi} 保存第一个参数 \code{a}，也就是数组首元素地址。
+  \item \register{esi} 保存第二个参数 \code{i} 的低 32 位。
+  \item \instruction{movsxd rsi, esi} 把 32 位有符号整数扩展成 64 位索引。
+  \item \code{[rdi + rsi*4]} 是地址表达式，意思是 \code{a + i * 4}。
+  \item \code{dword ptr} 说明这次从内存读取 4 字节。
+  \item \register{eax} 是返回值寄存器的低 32 位。
+\end{itemize}
+
+因此，\code{a[i]} 在机器层面不是抽象的“数组操作”，而是一次地址计算加一次内存读取：
+
+\begin{lstlisting}
+address = base_address(a) + i * sizeof(int)
+load 4 bytes from address
+interpret those 4 bytes as int
+\end{lstlisting}
+
+\begin{keyidea}
+机器没有“数组第几个元素”的概念。机器看到的是地址、字节数、寄存器和指令。C/C++ 类型系统把“第几个元素”翻译成“从哪个基地址开始，按多大步长计算地址，读写多少字节，并按什么规则解释这些字节”。
+\end{keyidea}
+
+本章要把这个过程讲清楚。后续性能优化会反复依赖这些基础：cache line 为什么按固定粒度搬运数据，SIMD load 为什么偏好连续布局，结构体字段顺序为什么影响性能，未定义行为为什么会扩大编译器优化空间，AoS 和 SoA 为什么差异显著，GEMM packing 为什么本质上是在重排内存访问。
+
+\section{本章学习路线：从一个字节走到一个 kernel}
+
+本章内容容易学散，因为它同时涉及位、整数、指针、数组、结构体、padding、cache line 和汇编寻址。学习时不要把它们当成孤立知识点背诵；它们之间存在一条明确的依赖链：
+
+\begin{lstlisting}
+bit -> byte -> object representation -> type rule
+    -> address -> pointer expression -> layout
+    -> x86-64 addressing mode -> cache line behavior
+    -> SIMD / HPC / AI kernel data movement
+\end{lstlisting}
+
+这条链路的意思是：
+
+\begin{enumerate}
+  \item \textbf{bit 和 byte} 让你知道机器保存信息的最小粒度。
+  \item \textbf{对象表示} 让你知道一个 C++ 对象最终落成哪些字节。
+  \item \textbf{类型规则} 让你知道这些字节如何被解释，编译器能假设什么。
+  \item \textbf{地址和指针} 让你把源码表达式变成具体内存位置。
+  \item \textbf{布局} 让你知道数组元素、结构体字段、padding 在地址空间里的相对位置。
+  \item \textbf{x86-64 寻址模式} 让你把 C++ 访问表达式对应到 \code{[base + index * scale + displacement]}。
+  \item \textbf{cache line} 让你解释为什么同样的运算量会因为访问模式不同而差很多。
+  \item \textbf{SIMD 和 kernel 优化} 则要求你主动设计数据布局，让硬件以更少指令、更少 cache miss、更高带宽效率完成同样计算。
+\end{enumerate}
+
+如果只是记住“int 通常 4 字节”“double 通常 8 字节”，本章价值很有限。真正要训练的是一种稳定能力：看到任意 C++ 表达式，能回答它访问哪些字节；看到任意内存操作汇编，能反推它可能来自什么数据布局；看到一个慢循环，能判断它是否受布局、步长、对齐或别名影响。
+
+\subsection{本章的四个观察层次}
+
+同一个程序可以从四个层次观察。初学者常犯的问题，是只停在第一层或把四层混在一起。
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+\toprule
+层次 & 你看到什么 & 本章要你学会的问题 \\
+\midrule
+C++ 源码层 & \code{a[i]}、\code{p->x}、\code{sizeof(S)} & 这个表达式的类型是什么？对象生命周期存在吗？访问是否越界？ \\
+对象布局层 & 字段 offset、padding、对齐、数组步长 & 目标字节从基地址偏移多少？一次访问读写几字节？ \\
+汇编层 & \code{mov eax, [rdi+rsi*4]} & 基址、索引、缩放和常量偏移分别来自源码里的什么？ \\
+微架构预告层 & cache line、步长、连续性、带宽 & 这些访问会顺序命中 cache，还是浪费 cache line、破坏预取和 SIMD？ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+学习时必须强迫自己每次都跨层解释。例如：
+
+\begin{lstlisting}[language=C++]
+float z = particles[i].z;
+\end{lstlisting}
+
+不要只说“取第 i 个粒子的 z”。更完整的解释应该是：
+
+\begin{enumerate}
+  \item \code{particles} 是 \code{Particle*}，所以 \code{particles + i} 以 \code{sizeof(Particle)} 为步长。
+  \item 如果 \code{Particle} 大小为 16，\code{z} 字段 offset 为 8，那么目标地址是“首元素地址 + \code{i * 16 + 8}”。
+  \item 目标字段是 \code{float}，因此 load 宽度是 4 字节。
+  \item 在 x86-64 汇编里，因为 scale 不能直接取 16，编译器可能先计算 \code{i * 16}，再访问 \code{dword ptr [base + offset + 8]}。
+  \item 如果循环只读 \code{z}，AoS 布局中每 16 字节只用 4 字节，cache line 利用率可能只有四分之一。
+\end{enumerate}
+
+对应的汇编形态可以放进单独代码块观察：
+
+\begin{lstlisting}
+shl   rax, 4
+movss xmm0, dword ptr [rdi + rax + 8]
+\end{lstlisting}
+
+这种解释方式看起来繁琐，但它是性能优化的基本功。后面做矩阵乘、卷积、attention、quantization、packing、prefetch、SIMD load/store 时，所有复杂技术都只是这条链路的规模化版本。
+
+\subsection{符号约定和推理习惯}
+
+为了让后面的推导不混乱，本章使用下面几个约定：
+
+\begin{itemize}
+  \item \code{addr(x)} 表示对象或子对象 \code{x} 的起始地址。
+  \item \code{sizeof(T)} 表示类型 \code{T} 的对象大小，单位是字节。
+  \item \code{offset(S, field)} 表示字段 \code{field} 相对结构体 \code{S} 起始地址的字节偏移。
+  \item \code{stride} 表示相邻两个逻辑元素之间的地址距离，单位通常是字节。
+  \item \code{load width} 表示一次 load 指令读取多少字节。
+\end{itemize}
+
+你每次推导内存访问时，都应该把“元素下标”和“字节偏移”分开写。下标是源码层概念，偏移是机器地址层概念。例如：
+
+\begin{lstlisting}
+a[3] index        = 3
+a[3] byte_offset  = 3 * sizeof(int)
+                  = 12
+\end{lstlisting}
+
+把这两个数混在一起，是阅读汇编时最常见的早期错误。
+
+\begin{exercisebox}
+\textbf{随堂检查：把一句话说完整}
+
+请不要查资料，直接回答下面三个问题。每个答案至少写出“类型、基地址、字节偏移、访问宽度”四个词。
+
+\begin{enumerate}
+  \item \code{double* p; p[i]} 访问的字节地址如何计算？
+  \item \code{struct V \{ float x, y, z, w; \}; V* v; v[i].z} 访问的字节地址如何计算？
+  \item 下面两条汇编合起来可能对应什么 C++ 访问？
+\end{enumerate}
+
+\begin{lstlisting}
+shl   rax, 4
+movss xmm0, dword ptr [rdi + rax + 8]
+\end{lstlisting}
+
+如果你的答案里只有“取第几个元素”，说明你还停留在源码层；本章后面要反复训练到机器层。
+\end{exercisebox}
+
+\section{位、字节和机器字：数据表示的最小地基}
+
+\subsection{位是信息，字节是寻址单位}
+
+\term{bit}{binary digit} 是二进制位，只能表示 0 或 1。一个 bit 可以表达一个真假状态，但真实程序中的整数、地址、浮点数和指令都需要多个 bit 组合。
+
+\term{byte}{字节} 在现代通用机器上通常是 8 bit。C++ 标准中 \code{char} 是最小可寻址对象单位；在我们学习的 x86-64/Linux 环境中，一个 byte 就是 8 bit。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+单位 & 大小 & 常见用途 \\
+\midrule
+bit & 1 个二进制位 & 标志位、掩码的一位 \\
+byte & 8 bit & 最小寻址单位、\code{char}、对象表示 \\
+word & 依上下文变化 & CPU 自然处理宽度或 ISA 术语 \\
+dword & 32 bit & x86 汇编中的双字 \\
+qword & 64 bit & x86 汇编中的四字 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+注意 \term{word}{字} 是一个容易混淆的词。在 x86 历史语境里，word 常指 16 bit，dword 是 32 bit，qword 是 64 bit；在体系结构教材中，word 有时指机器自然处理宽度；在内存系统里，cache line 又是另一种粒度。读文档时必须看上下文。
+
+\subsection{二进制、十六进制和为什么程序员爱用十六进制}
+
+二进制直接对应 bit，但写起来太长。十六进制每一位刚好表示 4 bit，因此两个十六进制数字刚好表示 1 byte：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+十六进制 & 二进制 & 十进制 \\
+\midrule
+\code{0x0} & \code{0000} & 0 \\
+\code{0x1} & \code{0001} & 1 \\
+\code{0x7} & \code{0111} & 7 \\
+\code{0x8} & \code{1000} & 8 \\
+\code{0xF} & \code{1111} & 15 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如：
+
+\begin{lstlisting}
+0x12 = 0001 0010
+0x34 = 0011 0100
+0x1234 = 0001 0010 0011 0100
+\end{lstlisting}
+
+十六进制非常适合观察内存、机器码和地址。后面你会经常看到：
+
+\begin{itemize}
+  \item 对象字节：\code{78 56 34 12}。
+  \item 机器码字节：\code{8b 04 b7}。
+  \item 地址：\code{0x7ffe...}。
+  \item 位掩码：\code{0xff}、\code{0xffff0000}。
+\end{itemize}
+
+\section{内存的第一模型：按字节寻址的巨大数组}
+
+从最简单的机器模型看，内存可以被想象成一个按地址索引的字节数组：
+
+\begin{lstlisting}
+address    byte
+0x1000  -> 0x78
+0x1001  -> 0x56
+0x1002  -> 0x34
+0x1003  -> 0x12
+0x1004  -> ...
+\end{lstlisting}
+
+地址是“某个字节的位置编号”。如果一个 \code{int} 占 4 字节，地址 \code{0x1000} 处的 \code{int} 会覆盖：
+
+\begin{lstlisting}
+0x1000
+0x1001
+0x1002
+0x1003
+\end{lstlisting}
+
+但是这个模型还不完整，因为普通 Linux 进程看到的是虚拟地址，不是物理内存条上的真实位置。更准确的说法是：对用户态程序而言，指针值通常是虚拟地址；CPU 执行 load/store 时会通过地址翻译机制把虚拟地址转换为物理地址，期间会用到 TLB 和页表。
+
+本章先使用“内存是字节数组”的模型来理解对象表示、指针和布局。虚拟内存、页表和 TLB 会在后续系统与硬件专题中展开。
+
+\begin{mentalmodel}
+先把内存想成字节数组，但永远记住它只是第一模型。性能优化时，你还要逐步叠加 cache line、cache set、TLB、page、NUMA、预取器和内存带宽。
+\end{mentalmodel}
+
+\section{类型不是字节本身，而是解释字节的规则}
+
+内存中的 byte 本身没有“这是 int”或“这是 float”的标签。类型存在于程序语言、编译器和指令语义中。
+
+例如同样 4 个字节：
+
+\begin{center}
+\begin{minipage}{0.72\linewidth}
+\begin{verbatim}
+00 00 80 3f
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+如果按 32 位整数解释，它是某个整数位模式；如果按 IEEE 754 \code{float} 解释，它是 \code{1.0f}；如果按 4 个 \code{unsigned char} 解释，它只是 4 个字节。
+
+C++ 的类型系统至少做了四件事：
+
+\begin{enumerate}
+  \item 决定对象需要多少字节，例如 \code{sizeof(int)}。
+  \item 决定对象要求什么对齐，例如 \code{alignof(double)}。
+  \item 决定表达式如何生成地址，例如 \code{p + 1} 前进多少字节。
+  \item 决定编译器可以做哪些优化，例如别名规则和对象生命周期规则。
+\end{enumerate}
+
+\begin{warningbox}
+“内存只是字节，所以我想怎么解释就怎么解释”是非常危险的半真半假。硬件层面确实是字节；C++ 语言层面有对象、类型、生命周期、对齐和别名规则。高性能代码经常需要看字节，但必须用语言允许的方式看。
+\end{warningbox}
+
+\section{对象表示：C++ 对象在内存中的字节}
+
+C++ 中的对象有类型、存储期、生命周期和值。对象在内存中的底层字节叫作 \term{object representation}{对象表示}。对于一个可平凡复制的对象，你可以通过 \code{unsigned char}、\code{std::byte} 或 \code{char} 观察它的对象表示。
+
+\subsection{对象表示和值表示不是同一个概念}
+
+对象表示是对象占用的全部字节；值表示是这些字节中真正参与表示对象值的部分。对许多整数类型，二者非常接近，读起来像一回事；但一旦出现 padding、浮点特殊值、结构体填充字节、未初始化存储或某些平台相关表示，二者就不能混用。
+
+例如一个结构体可能占 8 字节，其中只有 5 字节对应字段，剩下 3 字节是 padding。对象表示包含这 8 字节；结构体的语义值通常只由字段决定。两个结构体对象字段完全相等，但 padding 字节不同，它们的语义值仍然相等。若你用 \code{memcmp} 比较整个对象表示，就可能把这两个语义相等的对象判成不相等。
+
+这个区分会影响三类工程场景。第一，序列化时不能默认把结构体原始字节直接写进文件，因为 padding、字节序和 ABI 都可能让文件格式不可移植。第二，哈希时不能随便哈希整个对象字节，因为 padding 可能不稳定。第三，性能优化时不能把“字节搬运成功”误认为“类型语义正确”，尤其是跨语言、跨进程、跨文件格式和跨硬件平台时。
+
+\subsection{可平凡复制不是随便改类型}
+
+对可平凡复制类型，把对象表示复制到另一块同类型对象存储中，通常可以保持值。这是 \code{std::memcpy}、文件读写缓冲、网络包组装和 SIMD 批量搬运能够工作的基础之一。但这不等于可以用任意类型指针解释任意字节。
+
+比较下面两种说法：
+
+\begin{itemize}
+  \item “把一个 \code{float} 的对象表示复制到 \code{std::uint32_t} 中，用来观察位模式。”这应使用 \code{std::bit_cast} 或 \code{std::memcpy}。
+  \item “把 \code{float*} 强行转成 \code{std::uint32_t*} 后解引用。”这会碰到别名、对齐和对象生命周期问题，不能作为可靠写法。
+\end{itemize}
+
+底层程序常常需要观察位模式，但观察位模式和改变对象类型是两件事。前者可以通过字节视图、\code{std::memcpy} 或 \code{std::bit_cast} 表达；后者必须符合 C++ 对象模型。把这条边界搞清楚，后面理解 strict aliasing、对象生命周期和编译器优化会轻松很多。
+
+\begin{warningbox}
+对象表示提供“这些字节长什么样”的证据；类型和值提供“这些字节按什么规则解释”的语义。系统工程必须能看字节，但不能忘记 C++ 程序仍然受对象、类型、生命周期和别名规则约束。
+\end{warningbox}
+
+下面的程序打印一个 32 位整数的字节：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+#include <iomanip>
+#include <iostream>
+
+int main()
+{
+    std::uint32_t x = 0x12345678U;
+    auto const* p = reinterpret_cast<unsigned char const*>(&x);
+
+    for (std::size_t i = 0; i < sizeof(x); ++i) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                  << static_cast<unsigned>(p[i]) << '\n';
+    }
+}
+\end{lstlisting}
+
+在 x86-64 上，你通常会看到：
+
+\begin{center}
+\begin{minipage}{0.5\linewidth}
+\begin{verbatim}
+78
+56
+34
+12
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+这就是小端字节序。
+
+\section{字节序：为什么 \code{0x12345678} 在内存里像反过来}
+
+\term{endianness}{字节序} 描述多字节对象的字节如何放进连续地址。
+
+\subsection{小端和大端}
+
+如果最低有效字节放在最低地址，叫 \term{little-endian}{小端}。x86-64 使用小端。对 \code{0x12345678}：
+
+\begin{center}
+\begin{tabular}{cc}
+\toprule
+地址偏移 & 字节 \\
+\midrule
+\code{+0} & \code{0x78} \\
+\code{+1} & \code{0x56} \\
+\code{+2} & \code{0x34} \\
+\code{+3} & \code{0x12} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果最高有效字节放在最低地址，叫 \term{big-endian}{大端}。同一个值会存成：
+
+\begin{center}
+\begin{tabular}{cc}
+\toprule
+地址偏移 & 字节 \\
+\midrule
+\code{+0} & \code{0x12} \\
+\code{+1} & \code{0x34} \\
+\code{+2} & \code{0x56} \\
+\code{+3} & \code{0x78} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{字节序影响什么，不影响什么}
+
+字节序影响“多字节对象在内存中的排列”。它不影响整数的数学值，也不影响寄存器里你写的 \code{0x12345678} 这个值本身。
+
+字节序经常在这些场景中变重要：
+
+\begin{itemize}
+  \item 打印对象字节。
+  \item 解析二进制文件格式。
+  \item 网络协议和磁盘格式。
+  \item 手写 SIMD shuffle 或处理 packed data。
+  \item 调试机器码和内存 dump。
+\end{itemize}
+
+多数纯 C++ 算法不需要直接关心字节序，但系统性能工程师必须能看懂字节序，否则看到内存 dump 时会误读数据。
+
+\section{整数表示：无符号模运算和有符号补码}
+
+\subsection{无符号整数是按位宽取模的环}
+
+一个 N 位无符号整数可以表示 $0$ 到 $2^N - 1$。运算按模 $2^N$ 回绕。例如 8 位无符号整数：
+
+\begin{center}
+\begin{minipage}{0.6\linewidth}
+\begin{verbatim}
+255 + 1 == 0
+0 - 1 == 255
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+C++ 对无符号整数溢出有明确规定：按模回绕。这让无符号整数适合写位运算、哈希、掩码、循环计数的一些底层逻辑。
+
+\subsection{有符号整数通常用补码表示}
+
+现代 x86-64 使用 \term{two's complement}{二进制补码} 表示有符号整数。以 8 位为例：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+位模式 & 无符号解释 & 有符号补码解释 \\
+\midrule
+\code{0000 0000} & 0 & 0 \\
+\code{0000 0001} & 1 & 1 \\
+\code{0111 1111} & 127 & 127 \\
+\code{1000 0000} & 128 & -128 \\
+\code{1111 1111} & 255 & -1 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+补码的好处是加法电路可以同时服务有符号和无符号加法。比如 \code{-1} 的 8 位补码是 \code{1111 1111}，加 1 得到 \code{0000 0000}，自然回到 0。
+
+\subsection{语言规则和机器行为不能混为一谈}
+
+机器补码加法会回绕，但 C++ 有符号整数溢出是未定义行为。也就是说，下面代码在 C++ 语言层面不能被解释成“最大值加一变最小值”：
+
+\begin{lstlisting}[language=C++]
+int f(int x)
+{
+    return x + 1;
+}
+\end{lstlisting}
+
+如果 \code{x == INT_MAX}，表达式 \code{x + 1} 发生有符号溢出，程序有未定义行为。编译器可以假设这种情况不会发生，并据此优化。
+
+这不是抠字眼。性能优化中，编译器对循环边界、条件判断、向量化和死代码删除的很多决定，都依赖“程序没有未定义行为”的假设。
+
+\begin{deepdive}
+后续学习编译器优化时，你会看到 signed overflow、strict aliasing、out-of-bounds、未初始化读取、对象生命周期等规则如何影响优化。底层工程不是绕开语言规则，而是理解语言规则如何给编译器提供证明空间。
+\end{deepdive}
+
+\section{浮点数只先建立直觉}
+
+本章重点是整数、地址和对象布局。浮点数会在 AI 算子、数值稳定性、SIMD 和 FMA 章节中深入。本章先建立三个直觉：
+
+\begin{enumerate}
+  \item \code{float} 和 \code{double} 也是固定字节数的对象表示。
+  \item 它们通常使用 IEEE 754 格式，包含符号、指数和尾数。
+  \item 浮点运算不是实数运算，存在舍入、特殊值、非结合性和 fast-math 语义问题。
+\end{enumerate}
+
+例如 \code{float x = 1.0f;} 的对象字节在小端 x86-64 上通常是：
+
+\begin{center}
+\begin{minipage}{0.5\linewidth}
+\begin{verbatim}
+00 00 80 3f
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+按整数看这只是一个位模式；按 IEEE 754 \code{float} 看它表示 1.0。这个例子再次提醒你：字节没有类型，解释规则来自类型和上下文。
+
+\section{指针：地址值加类型语义}
+
+\subsection{指针值通常是地址}
+
+在普通 x86-64/Linux 用户态程序中，指针值通常可以理解为虚拟地址。比如：
+
+\begin{lstlisting}[language=C++]
+int x = 42;
+int* p = &x;
+\end{lstlisting}
+
+\code{p} 保存的是对象 \code{x} 的地址。打印 \code{p} 可能得到类似：
+
+\begin{center}
+\begin{minipage}{0.62\linewidth}
+\begin{verbatim}
+0x7ffdf2c3a6bc
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+但指针不仅是一个整数地址。C++ 指针还携带类型语义：\code{int*} 指向 \code{int} 对象，\code{double*} 指向 \code{double} 对象，\code{Particle*} 指向 \code{Particle} 对象。类型决定了解引用读取多少字节、指针加法前进多少字节、编译器如何判断别名。
+
+\subsection{解引用是一次按类型解释的内存访问}
+
+表达式 \code{*p} 不是“取地址里的东西”这么笼统。更准确地说：
+
+\begin{enumerate}
+  \item 读取指针表达式 \code{p} 的值，得到一个地址。
+  \item 根据 \code{p} 的静态类型知道目标对象类型是 \code{int}。
+  \item 从该地址开始读取 \code{sizeof(int)} 个字节。
+  \item 按 \code{int} 的对象表示解释这些字节。
+\end{enumerate}
+
+如果地址没有对齐、对象生命周期不存在、类型不匹配或越界，语言层面可能已经出错。硬件是否“碰巧能读”不是 C++ 程序正确性的充分条件。
+
+\subsection{指针的有效范围和 one-past-the-end}
+
+C++ 指针不是可以任意加减的通用整数。对数组对象，指针可以指向数组中的某个元素，也可以指向最后一个元素之后的 one-past-the-end 位置。这个 one-past 指针可以用于比较和循环终止判断，但不能解引用。
+
+\begin{lstlisting}[language=C++]
+int a[4] = {1, 2, 3, 4};
+
+int* first = &a[0];
+int* last  = &a[0] + 4;   // one-past-the-end
+
+for (int* p = first; p != last; ++p) {
+    // *p is valid inside the loop
+}
+\end{lstlisting}
+
+在机器地址层，\code{last} 的数值通常等于 \code{addr(a[0]) + 4 * sizeof(int)}。但这个地址不是一个活着的 \code{int} 对象起点。它只是语言允许你用来表示范围结束的位置。若写 \code{*last}，即使硬件可能从那里读到 4 字节，C++ 层面仍然是未定义行为。
+
+这条规则解释了为什么很多高性能循环喜欢使用半开区间：
+
+\begin{lstlisting}
+[begin, end)
+\end{lstlisting}
+
+它既适合地址计算，也适合语言规则：\code{begin} 到 \code{end} 之前的每个元素可访问，\code{end} 只表示边界。你在汇编里看到循环把指针每次加 4 或 8，再与结束指针比较，本质上就是把下标循环改写成地址范围循环。
+
+\subsection{把指针当整数时要保持克制}
+
+\code{std::uintptr_t} 可以在许多平台上保存指针转换得到的整数值，但这不表示任意整数运算后再转回指针都一定有效。语言层的指针还和对象来源、有效范围、对齐和生命周期有关。底层调试时把指针打印成十六进制地址很有用；工程实现中把指针长期当普通整数算来算去，则需要非常明确的理由。
+
+例如，内存分配器、arena、JIT、序列化运行时、垃圾回收器和硬件映射代码确实会做大量地址整数运算。但它们通常会把“原始字节存储”“对象构造”“对齐修正”“边界检查”“释放责任”分成清楚步骤。普通业务代码和性能 kernel 更应该优先使用类型化指针、span、数组引用、迭代器或明确的字节视图，而不是随意把所有指针变成整数。
+
+\begin{deepdive}
+现代 C++ 标准和编译器实现中，pointer provenance 是一个复杂话题。本书第一册不展开规范争议，只给出工程底线：指针值看起来像地址，但正确访问对象还需要对象来源、生命周期、类型、对齐和边界都成立。
+\end{deepdive}
+
+\subsection{空指针、野指针和悬垂指针}
+
+指针错误是底层学习必须严肃对待的内容。
+
+\begin{description}
+  \item[空指针] 不指向任何对象。解引用空指针是错误。
+  \item[野指针] 未初始化或保存无效地址的指针。它可能指向任意位置。
+  \item[悬垂指针] 原来指向有效对象，但对象生命周期已经结束。
+\end{description}
+
+例如：
+
+\begin{lstlisting}[language=C++]
+int* bad()
+{
+    int x = 1;
+    return &x;
+}
+\end{lstlisting}
+
+\code{x} 是局部自动对象，函数返回后生命周期结束。返回的指针值可能仍然看起来像一个地址，但它不再指向活着的 \code{int} 对象。用它做性能实验，结果没有意义。
+
+\section{有效访问的五个条件}
+
+到目前为止，我们已经能把指针看成地址加类型语义。但在 C++ 中，一次内存访问要可靠成立，至少需要同时满足五个条件。缺任何一个，都可能让程序进入未定义行为、实现相关行为或不可移植边界。
+
+\begin{enumerate}
+  \item 指针值必须指向可访问的存储区域。
+  \item 目标对象的生命周期必须已经开始且尚未结束。
+  \item 访问类型必须符合对象的有效类型和别名规则。
+  \item 地址必须满足访问类型的对齐要求。
+  \item 访问范围不能越过对象或数组允许的边界。
+\end{enumerate}
+
+很多初学者只检查第一条：地址是否看起来落在某个映射区域里。可是硬件“能读到字节”并不等于 C++ 程序“有权用这个类型读这个对象”。性能优化中，编译器正是利用后四条规则做更大胆的重写。
+
+\subsection{条件一：可访问的存储区域}
+
+如果指针指向未映射地址，CPU 访问时通常会触发 page fault，操作系统把它转成 \code{SIGSEGV}。这种错误比较容易观察。比如空指针解引用常见地访问地址 0 附近，用户进程通常没有映射这个区域。
+
+但可映射不代表正确。一个悬垂指针可能仍然落在当前栈或堆映射里；一个越界指针可能落在同一页的另一个对象上；一个错误类型指针可能读到看似合理的字节。它们未必崩溃，却仍然不可靠。
+
+\subsection{条件二：对象生命周期}
+
+对象生命周期定义了某块存储中什么时候真的存在某个类型的对象。局部变量离开作用域后生命周期结束；\code{delete} 后动态对象生命周期结束；一块原始字节缓冲区在构造对象之前，还不是那个对象。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+alignas(int) unsigned char storage[sizeof(int)];
+int* p = reinterpret_cast<int*>(storage);
+\end{lstlisting}
+
+这段代码只是得到一个可能满足对齐的地址，并不自动在 \code{storage} 中创建 \code{int} 对象。现代 C++ 中，在原始存储中创建对象需要明确的构造动作，例如 placement new 或相关库工具。初学阶段不需要掌握全部对象模型细节，但要知道：存储空间和对象生命周期不是同一个概念。
+
+这个边界对 allocator、arena、对象池、序列化、JIT 和高性能框架很重要。许多性能代码为了减少分配，会复用一块大 buffer；如果只把 buffer 当字节，却没有正确管理对象构造和销毁，就会在语言层给优化器错误前提。
+
+\subsection{条件三：访问类型和别名规则}
+
+别名规则回答一个关键问题：两个不同类型的指针，编译器是否必须假设它们可能指向同一个对象？如果编译器能证明或假设它们不别名，就可以把 load/store 重排、缓存到寄存器、向量化或删除重复访问。
+
+看一个简化例子：
+
+\begin{lstlisting}[language=C++]
+int f(int* pi, float* pf)
+{
+    *pi = 1;
+    *pf = 2.0f;
+    return *pi;
+}
+\end{lstlisting}
+
+若编译器根据别名规则认为 \code{int*} 和 \code{float*} 不能指向同一个有效对象，它可以把返回值优化成 1，而不必在写 \code{*pf} 后重新从 \code{*pi} 读取。这个优化不是编译器任性，而是语言规则提供了证明空间。
+
+但 \code{char}、\code{unsigned char} 和 \code{std::byte} 视图有特殊用途，可以观察对象表示。它们适合做字节级检查、序列化中间缓冲和调试输出。即便如此，从字节视图回到类型化对象，也仍然要处理生命周期、对齐和构造问题。
+
+\subsection{条件四：对齐}
+
+如果一个类型要求 8 字节对齐，而你用不满足对齐的地址构造或访问它，语言层面可能已经错误。某些硬件会容忍未对齐普通 load/store，但 C++ 优化器仍然可以假设对象满足其对齐要求。编译器生成向量指令、合并访问或选择特定 load/store 形式时，都可能依赖对齐信息。
+
+例如把字节 buffer 中任意偏移强行转成 \code{double*}：
+
+\begin{lstlisting}[language=C++]
+unsigned char buffer[32];
+double* p = reinterpret_cast<double*>(buffer + 1);
+double x = *p;
+\end{lstlisting}
+
+这里 \code{buffer + 1} 很可能不是 8 字节对齐。即使 x86-64 某次运行没有崩溃，这也不能作为可靠 C++。正确做法通常是用 \code{std::memcpy} 从字节中复制出 \code{double}，或保证 buffer 偏移满足对齐并正确建立对象。
+
+\subsection{条件五：边界}
+
+数组边界和对象边界决定访问范围。读取一个 \code{int} 通常读取 4 字节；如果地址只剩 2 字节属于当前对象，硬件也许能跨过去读到别的对象字节，但语言层面没有这种权限。结构体字段访问也不能越过对象边界去读取邻居对象，除非你通过允许的字节视图观察对象表示。
+
+边界规则是优化器理解循环的基础。若编译器能假设数组访问不越界，就可以消除某些检查、重排循环、展开或向量化。反过来，如果你的程序越界，优化器基于“不会越界”的前提做出的变换可能让错误表现得很奇怪。
+
+\begin{keyidea}
+一次内存访问是否有效，不只看地址数值。它还要满足生命周期、类型、别名、对齐和边界。高性能 C++ 不是绕过这些规则，而是用清晰接口把这些前提告诉编译器和读者。
+\end{keyidea}
+
+\section{别名如何影响优化和测量}
+
+别名是从本章走向编译器优化的关键桥梁。两个指针若可能指向同一块存储，编译器就必须保守，因为一次写入可能改变另一个指针后续读取的值。若能证明不别名，编译器就能保留更多值在寄存器中，也更容易向量化。
+
+\subsection{一个三数组循环}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+void add_arrays(float* out,
+                float const* a,
+                float const* b,
+                std::size_t n)
+{
+    for (std::size_t i = 0; i < n; ++i) {
+        out[i] = a[i] + b[i];
+    }
+}
+\end{lstlisting}
+
+从数学上看，这只是逐元素加法。但 C++ 接口没有明确说明 \code{out} 是否可能和 \code{a} 或 \code{b} 重叠。如果 \code{out == a}，这是 in-place 更新，仍然可能有合理语义；如果 \code{out} 和 \code{a} 部分重叠，某些写入会影响后续读取，循环重排和向量化就要谨慎。
+
+编译器可能生成运行时别名检查：先判断几个指针范围是否相互重叠；如果不重叠，走向量化快速路径；如果可能重叠，走保守标量路径。这种“多版本循环”在优化汇编中很常见。初学者看到大量比较和跳转时，不要立刻以为编译器生成了无用复杂代码，它可能是在保护别名语义。
+
+\subsection{restrict-like 信息}
+
+C++ 标准没有标准 \code{restrict} 关键字，但一些编译器支持扩展，例如 GCC/Clang 的 \code{__restrict__}。它能告诉编译器：在这个指针访问范围内，不会通过其他受限制指针访问同一对象。正确使用时，它可以释放优化空间；错误使用时，程序语义就不可靠。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+void add_arrays_restrict(float* __restrict__ out,
+                         float const* __restrict__ a,
+                         float const* __restrict__ b,
+                         std::size_t n);
+\end{lstlisting}
+
+这个接口把“不重叠”作为调用者必须遵守的合同。它不是单纯性能开关，而是语义承诺。若调用者传入重叠范围，后果不能用“编译器错了”解释。
+
+\subsection{接口设计比局部技巧重要}
+
+很多性能问题不是在循环体里多写一条指令，而是接口没有表达足够前提。比如：
+
+\begin{itemize}
+  \item 指针是否可以为空。
+  \item 输入输出是否允许重叠。
+  \item 数据是否按某个字节数对齐。
+  \item \code{n} 是否为向量宽度的倍数。
+  \item 输入是否连续，还是有 stride。
+  \item 输出 buffer 是否已经分配且足够大。
+\end{itemize}
+
+如果这些前提只存在于作者脑子里，编译器和调用者都无法可靠利用。高质量 kernel 通常会把前提写进 wrapper、断言、文档、类型、span、参数块或专门函数名里。第 14 章讲 C++ 与汇编互操作时，会把这种思想用于手写汇编 kernel 的边界设计。
+
+\begin{warningbox}
+不要为了让编译器生成更快代码而随便添加不真实的别名前提。优化前提是合同，不是建议。合同不成立时，性能数字没有意义。
+\end{warningbox}
+
+\section{字节视图、类型转换和安全观察}
+
+底层学习经常需要观察字节，但不同方法语义不同。
+
+\subsection{用字节视图观察对象表示}
+
+如果只是打印对象表示，可以使用 \code{std::byte const*} 或 \code{unsigned char const*}：
+
+\begin{lstlisting}[language=C++]
+template <class T>
+void print_bytes(T const& value)
+{
+    auto const* bytes =
+        reinterpret_cast<unsigned char const*>(&value);
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        print_one_byte(bytes[i]);
+    }
+}
+\end{lstlisting}
+
+这种做法适合观察对象占用的字节。它不表示你可以通过任意类型指针修改对象，也不表示 padding 字节有稳定语义。
+
+\subsection{用 \code{std::bit_cast} 解释位模式}
+
+如果要在两个大小相同、可平凡复制的类型之间查看位模式，C++20 提供 \code{std::bit_cast}：
+
+\begin{lstlisting}[language=C++]
+#include <bit>
+#include <cstdint>
+
+std::uint32_t bits_of_float(float x)
+{
+    return std::bit_cast<std::uint32_t>(x);
+}
+\end{lstlisting}
+
+\code{std::bit_cast} 表达的是“复制对象表示并按目标类型得到一个值”，不是通过错误类型指针去访问原对象。它通常会被优化成零成本代码，但语义比手写指针转型清楚。
+
+\subsection{用 \code{std::memcpy} 跨越原始字节边界}
+
+在处理二进制文件、网络包或手工 buffer 时，\code{std::memcpy} 是非常重要的工具。它可以把字节复制到一个正确类型的对象中：
+
+\begin{lstlisting}[language=C++]
+std::uint32_t load_u32_le(unsigned char const* p)
+{
+    std::uint32_t value = 0;
+    std::memcpy(&value, p, sizeof(value));
+    return value;
+}
+\end{lstlisting}
+
+这段代码还没有处理字节序转换，只是展示“从字节复制到对象”的基本方式。编译器通常能把固定大小的 \code{memcpy} 优化成 load，但源码语义保持清楚：没有通过不对齐的 \code{std::uint32_t*} 解引用，也没有假设字节 buffer 中原本就存在 \code{std::uint32_t} 对象。
+
+\subsection{为什么不推荐随手 \code{reinterpret_cast}}
+
+\code{reinterpret_cast} 是底层工具，但它不会替你解决生命周期、对齐、别名和边界。许多错误代码看起来像这样：
+
+\begin{lstlisting}[language=C++]
+float x = 1.0f;
+std::uint32_t bits =
+    *reinterpret_cast<std::uint32_t*>(&x);
+\end{lstlisting}
+
+这段代码常常在某些机器上“能跑”，也可能生成期望位模式，但它给编译器和读者的语义都很差。更好的写法是 \code{std::bit_cast<std::uint32_t>(x)}。如果你的目标是性能，清楚语义通常更容易让编译器优化，而不是更难。
+
+\begin{keyidea}
+观察字节、复制字节和把字节当成某个对象访问，是三件不同的事。使用 \code{std::byte}/\code{unsigned char}、\code{std::bit_cast} 和 \code{std::memcpy}，可以把这三件事表达得更清楚。
+\end{keyidea}
+
+\section{指针加法：类型决定缩放}
+
+指针加法不是简单整数加法。若 \code{p} 类型是 \code{T*}，则 \code{p + k} 的地址通常是：
+
+\begin{center}
+\begin{minipage}{0.76\linewidth}
+\begin{verbatim}
+address(p + k) = address(p) + k * sizeof(T)
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+例如：
+
+\begin{lstlisting}[language=C++]
+int* p = reinterpret_cast<int*>(0x1000);
+int* q = p + 3;
+\end{lstlisting}
+
+如果 \code{sizeof(int) == 4}，则 \code{q} 的数值地址是 \code{0x100c}，不是 \code{0x1003}。
+
+这解释了 \code{a[i]}：
+
+\begin{center}
+\begin{minipage}{0.7\linewidth}
+\begin{verbatim}
+a[i] == *(a + i)
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+如果 \code{a} 是 \code{int*}，\code{a + i} 自动按 4 缩放；如果 \code{a} 是 \code{double*}，按 8 缩放；如果 \code{a} 是 \code{Particle*}，按 \code{sizeof(Particle)} 缩放。
+
+\begin{warningbox}
+\code{reinterpret_cast<std::uintptr_t>(p) + 1} 和 \code{p + 1} 不是同一个概念。前者是整数地址加 1 字节；后者是指针按元素大小前进 1 个对象。写底层代码时必须分清“字节偏移”和“元素偏移”。
+\end{warningbox}
+
+\section{数组：连续对象序列}
+
+C/C++ 数组是连续存放的同类型对象序列：
+
+\begin{lstlisting}[language=C++]
+int a[4] = {10, 20, 30, 40};
+\end{lstlisting}
+
+如果 \code{a[0]} 地址为 \code{0x1000}，且 \code{sizeof(int) == 4}，则布局通常是：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+元素 & 起始地址 & 覆盖字节范围 \\
+\midrule
+\code{a[0]} & \code{0x1000} & \code{0x1000..0x1003} \\
+\code{a[1]} & \code{0x1004} & \code{0x1004..0x1007} \\
+\code{a[2]} & \code{0x1008} & \code{0x1008..0x100b} \\
+\code{a[3]} & \code{0x100c} & \code{0x100c..0x100f} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{数组名退化为指针}
+
+在很多表达式中，数组名会退化为指向首元素的指针：
+
+\begin{lstlisting}[language=C++]
+int a[4];
+int* p = a;      // p == &a[0]
+\end{lstlisting}
+
+但数组本身不是指针。下面三个 \code{sizeof} 结果不同：
+
+\begin{lstlisting}[language=C++]
+int a[4];
+
+sizeof(a);       // 4 * sizeof(int)
+sizeof(&a[0]);   // pointer size
+sizeof(int*);    // pointer size
+\end{lstlisting}
+
+这一区别对性能代码很重要。模板、span、数组引用、指针和长度参数会影响编译器是否知道长度、是否能展开、是否能做边界相关优化。
+
+\subsection{越界不是“多走几个字节”这么简单}
+
+从机器地址角度看，\code{a[4]} 似乎只是访问 \code{a[0]} 后面第 16 个字节。但从 C++ 语言角度，访问数组范围外对象是未定义行为。
+
+\begin{lstlisting}[language=C++]
+int a[4] = {1, 2, 3, 4};
+int x = a[4];    // undefined behavior
+\end{lstlisting}
+
+它可能读到某个栈上的值，可能触发崩溃，也可能被编译器假设为永不发生并重写代码。性能工程中不要用越界行为做“技巧”。
+
+\section{四步推导法：从 C++ 表达到机器访问}
+
+前面已经讲了指针、数组和类型，但真正读汇编时，你需要一个固定动作。本节给出一个可以反复使用的四步推导法。以后看到任何内存访问表达式，都按这个顺序走：
+
+\begin{enumerate}
+  \item \textbf{确定表达式的对象类型和访问宽度。} 它最终读写的是 \code{int}、\code{double}、\code{float}，还是某个结构体字段？访问宽度是 1、2、4、8、16、32 还是 64 字节？
+  \item \textbf{确定基地址。} 这个访问从哪个指针、数组首元素、结构体对象或栈帧位置出发？
+  \item \textbf{计算字节偏移。} 把下标、字段 offset、数组步长、结构体大小都换成字节单位。
+  \item \textbf{映射到 x86-64 寻址。} 尽量写成 \code{[base + index * scale + displacement]}，同时标出 load/store 宽度。
+\end{enumerate}
+
+这四步看似简单，但它可以把 C++ 源码、对象布局和汇编连接成一条线。
+
+\subsection{例 1：\code{int a[5]; a[3]}}
+
+假设 \code{a[0]} 的地址是 \code{0x1000}，并且 \code{sizeof(int) == 4}。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.68\linewidth}}
+\toprule
+步骤 & 推导 \\
+\midrule
+对象类型 & \code{a[3]} 是 \code{int} 左值，访问宽度 4 字节。 \\
+基地址 & 数组首元素地址 \code{addr(a[0]) = 0x1000}。 \\
+字节偏移 & 下标 3，元素大小 4，所以 offset = \code{3 * 4 = 12 = 0x0c}。 \\
+最终地址 & \code{0x1000 + 0x0c = 0x100c}，覆盖字节 \code{0x100c..0x100f}。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果 \code{a} 作为第一个参数传入函数，\code{i} 作为第二个参数，汇编可能是：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rsi*4]
+\end{lstlisting}
+
+这里 \register{rdi} 是基地址，\register{rsi} 是元素下标，scale 4 来自 \code{sizeof(int)}，\code{dword ptr} 表示访问 4 字节。
+
+\subsection{例 2：\code{double a[5]; a[3]}}
+
+同样是下标 3，但类型换成 \code{double} 后，字节偏移不同。先把条件单独写清楚：
+
+\begin{lstlisting}
+addr(a[0])       = 0x1000
+sizeof(double)   = 8
+\end{lstlisting}
+
+因此：
+
+\begin{lstlisting}
+offset = 3 * sizeof(double) = 3 * 8 = 24 = 0x18
+addr(a[3]) = 0x1000 + 0x18 = 0x1018
+\end{lstlisting}
+
+对应汇编可能是：
+
+\begin{lstlisting}
+movsd xmm0, qword ptr [rdi + rsi*8]
+\end{lstlisting}
+
+这次 scale 是 8，load width 是 \code{qword}，返回值进入 \register{xmm0}。同一个下标，因为类型不同，机器地址计算不同；同一个地址，因为解释规则不同，得到的值也可能不同。
+
+\subsection{例 3：\code{p[i].z} 如何拆成两层偏移}
+
+看一个对 AI/HPC 很常见的结构：
+
+\begin{lstlisting}[language=C++]
+struct Vec4 {
+    float x;
+    float y;
+    float z;
+    float w;
+};
+
+float get_z(Vec4 const* p, std::size_t i)
+{
+    return p[i].z;
+}
+\end{lstlisting}
+
+在常见 ABI 下，四个 \code{float} 连续排布：
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+字段 & offset & 大小 & 说明 \\
+\midrule
+\code{x} & 0  & 4 & 第一个 \code{float} \\
+\code{y} & 4  & 4 & 第二个 \code{float} \\
+\code{z} & 8  & 4 & 第三个 \code{float} \\
+\code{w} & 12 & 4 & 第四个 \code{float} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以：
+
+\begin{lstlisting}
+addr(p[i].z) = addr(p[0]) + i * sizeof(Vec4) + offset(Vec4, z)
+             = base       + i * 16           + 8
+\end{lstlisting}
+
+这个地址公式不能直接写成单条 x86-64 内存操作数，因为 x86-64 的 scale 只有 1、2、4、8。真实编译器可能先把 \code{i * 16} 算到寄存器里，再做 load：
+
+\begin{lstlisting}
+shl   rsi, 4
+movss xmm0, dword ptr [rdi + rsi + 8]
+\end{lstlisting}
+
+这里第一条指令把元素下标变成字节偏移。对于 \code{i * 16} 这种 2 的幂乘法，左移通常最直观。对于 12、24、40 这类非 2 的幂步长，后面会专门用 \instruction{lea} 解释。
+
+不要死记某一种汇编形态。关键是看出地址公式里有三个来源：数组基址、元素步长、字段 offset。
+
+\subsection{例 4：二维数组下标不是两个 load}
+
+考虑真正的 C++ 二维数组：
+
+\begin{lstlisting}[language=C++]
+int a[3][5];
+int x = a[i][j];
+\end{lstlisting}
+
+\code{a} 是 3 行 5 列的连续数组。按行主序存放，\code{a[i][j]} 的线性元素下标是：
+
+\begin{lstlisting}
+i * 5 + j
+\end{lstlisting}
+
+字节地址是：
+
+\begin{lstlisting}
+addr(a[i][j]) = addr(a[0][0]) + (i * 5 + j) * sizeof(int)
+\end{lstlisting}
+
+这不是“先找到第 i 行指针，再从那个指针找第 j 个元素”。真正的 \code{int a[3][5]} 是一整块连续内存，行长度 5 是类型的一部分。只有 \code{int**} 或“指针数组”才是另一种布局。
+
+\begin{warningbox}
+\code{int a[3][5]}、\code{int (*p)[5]}、\code{int** p} 是三种不同模型。前两者知道每行 5 个 \code{int}，可以用线性地址公式；\code{int**} 是指向指针的指针，通常需要先读取行指针，再访问该行的数据。它们的性能、局部性和汇编形态都可能不同。
+\end{warningbox}
+
+\subsection{例 5：把 \code{a[i] += b[i]} 展开成 load-compute-store}
+
+一个赋值表达式往往不止一次内存访问：
+
+\begin{lstlisting}[language=C++]
+void add_into(float* a, float const* b, std::size_t n)
+{
+    for (std::size_t i = 0; i < n; ++i) {
+        a[i] += b[i];
+    }
+}
+\end{lstlisting}
+
+循环体在标量层面可以拆成：
+
+\begin{lstlisting}
+tmp_a = load 4 bytes from addr(a[0]) + i * 4
+tmp_b = load 4 bytes from addr(b[0]) + i * 4
+tmp   = tmp_a + tmp_b
+store 4 bytes to   addr(a[0]) + i * 4
+\end{lstlisting}
+
+这对性能很关键。你不能只数“一次加法”。真实循环每个元素至少有两个 load、一个 store、一个浮点加法、一个循环控制，以及可能的别名检查、边界处理和向量化 remainder。后面做 roofline 模型时，算术强度就是从这种拆解开始的。
+
+\begin{exercisebox}
+\textbf{随堂检查：按四步推导法写答案}
+
+对下面表达式分别写出对象类型、基地址、字节偏移公式和可能的 x86-64 内存操作形式：
+
+\begin{enumerate}
+  \item \code{std::uint64_t* p; p[i]}
+  \item \code{float* x; x[i + 1]}
+  \item \code{struct Pair \{ int a; int b; \}; Pair* p; p[i].b}
+  \item \code{double a[4][8]; a[i][j]}
+  \item \code{struct Node \{ int key; Node* next; \}; Node* p; p->next}
+\end{enumerate}
+
+要求：不要只写 C++ 解释，必须写成字节地址公式。
+\end{exercisebox}
+
+\section{x86-64 寻址模式：数组访问如何进入指令}
+
+x86-64 内存操作数常见形式是：
+
+\begin{lstlisting}
+[base + index * scale + displacement]
+\end{lstlisting}
+
+其中：
+
+\begin{itemize}
+  \item \code{base} 是基址寄存器。
+  \item \code{index} 是索引寄存器。
+  \item \code{scale} 通常只能是 1、2、4、8。
+  \item \code{displacement} 是编码在指令中的常量偏移。
+\end{itemize}
+
+这非常适合表达 C/C++ 的数组和结构体字段访问。
+
+\subsection{访问 \code{int a[i]}}
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rsi*4]
+\end{lstlisting}
+
+含义：
+
+\begin{lstlisting}
+load 4 bytes from address rdi + rsi * 4
+\end{lstlisting}
+
+如果执行到这条指令时寄存器是：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+寄存器 & 值 & 含义 \\
+\midrule
+\register{rdi} & \code{0x1000} & \code{a[0]} 的地址 \\
+\register{rsi} & \code{3} & 下标 \code{i} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+那么有效地址是：
+
+\begin{lstlisting}
+effective_address = 0x1000 + 3 * 4
+                  = 0x100c
+\end{lstlisting}
+
+\instruction{mov eax, dword ptr [0x100c]} 的语义是从 \code{0x100c} 开始读取 4 字节，写入 \register{eax}。在 x86-64 中，对 \register{eax} 的写入还会清零 \register{rax} 的高 32 位。这一点读汇编时经常重要：\code{int} 返回值写 \register{eax}，但调用者看到的完整 \register{rax} 高位已经被清零。
+
+\subsection{访问结构体字段}
+
+如果有：
+
+\begin{lstlisting}[language=C++]
+struct S {
+    int a;
+    double b;
+    int c;
+};
+
+int get_c(S const* p)
+{
+    return p->c;
+}
+\end{lstlisting}
+
+汇编可能是：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + 16]
+ret
+\end{lstlisting}
+
+\code{16} 就是字段 \code{c} 相对结构体起始地址的 offset。编译器根据类型布局规则算出它，然后把常量写进指令。
+
+这个例子可以完整展开。常见 x86-64 ABI 下，\code{S} 的布局通常是：
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+字节范围 & 内容 & 大小 & 原因 \\
+\midrule
+0..3 & \code{a} & 4 & \code{int} 字段 \\
+4..7 & padding & 4 & 让 \code{b} 满足 8 字节对齐 \\
+8..15 & \code{b} & 8 & \code{double} 字段 \\
+16..19 & \code{c} & 4 & \code{int} 字段 \\
+20..23 & tail padding & 4 & 让 \code{sizeof(S)} 是 8 的倍数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+假设 \register{rdi} 保存 \code{p == 0x2000}，那么：
+
+\begin{lstlisting}
+addr(p->c) = addr(*p) + offset(S, c)
+           = 0x2000   + 16
+           = 0x2010
+\end{lstlisting}
+
+因此：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + 16]
+\end{lstlisting}
+
+就是从 \code{0x2010..0x2013} 读取 4 字节。这里没有 index 和 scale，因为没有数组下标；只有结构体基地址和字段偏移。
+
+\subsection{结构体数组字段访问：scale 和 displacement 同时出现}
+
+更接近真实 kernel 的情况是结构体数组：
+
+\begin{lstlisting}[language=C++]
+struct Pixel {
+    std::uint8_t r;
+    std::uint8_t g;
+    std::uint8_t b;
+    std::uint8_t a;
+};
+
+std::uint8_t load_b(Pixel const* p, std::size_t i)
+{
+    return p[i].b;
+}
+\end{lstlisting}
+
+\code{sizeof(Pixel) == 4}，字段 \code{b} 的 offset 是 2，所以地址公式是：
+
+\begin{lstlisting}
+addr(p[i].b) = addr(p[0]) + i * sizeof(Pixel) + offset(Pixel, b)
+             = base       + i * 4             + 2
+\end{lstlisting}
+
+可能的汇编是：
+
+\begin{lstlisting}
+movzx eax, byte ptr [rdi + rsi*4 + 2]
+ret
+\end{lstlisting}
+
+这条指令有几个细节：
+
+\begin{itemize}
+  \item \code{byte ptr} 表示从内存读取 1 字节。
+  \item \instruction{movzx} 表示 zero extend，读取 8 位后零扩展到 32 位 \register{eax}。
+  \item \code{rsi*4} 来自 \code{sizeof(Pixel)}。
+  \item \code{+ 2} 来自字段 \code{b} 的 offset。
+\end{itemize}
+
+假设：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+寄存器 & 值 & 含义 \\
+\midrule
+\register{rdi} & \code{0x3000} & \code{p[0]} 的地址 \\
+\register{rsi} & \code{5} & 下标 \code{i} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+则：
+
+\begin{lstlisting}
+effective_address = 0x3000 + 5 * 4 + 2
+                  = 0x3016
+\end{lstlisting}
+
+CPU 会读取 \code{0x3016} 这个地址上的 1 字节，把它零扩展到 32 位返回值。这个案例比 \code{int a[i]} 更接近图像处理、量化张量、packed struct、RGBA buffer 这类真实工作负载。
+
+\subsection{当 scale 不够用时：\code{sizeof(T)} 大于 8 怎么办}
+
+x86-64 内存操作数的 scale 只有 1、2、4、8。如果结构体大小是 16、24、32，编译器必须用额外指令先算出字节偏移。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+struct Vec4 {
+    float x;
+    float y;
+    float z;
+    float w;
+};
+
+float load_z(Vec4 const* p, std::size_t i)
+{
+    return p[i].z;
+}
+\end{lstlisting}
+
+地址公式是：
+
+\begin{lstlisting}
+addr(p[i].z) = base + i * 16 + 8
+\end{lstlisting}
+
+一种可能汇编是：
+
+\begin{lstlisting}
+shl   rsi, 4
+movss xmm0, dword ptr [rdi + rsi + 8]
+ret
+\end{lstlisting}
+
+如果寄存器初值是：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+寄存器 & 值 & 含义 \\
+\midrule
+\register{rdi} & \code{0x4000} & \code{p[0]} 的地址 \\
+\register{rsi} & \code{3} & 下标 \code{i} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+执行 \instruction{shl rsi, 4} 后，\register{rsi} 变成 \code{48}，也就是 \code{3 * 16}。随后：
+
+\begin{lstlisting}
+effective_address = 0x4000 + 48 + 8
+                  = 0x4038
+\end{lstlisting}
+
+\instruction{movss} 从 \code{0x4038..0x403b} 读取 4 字节到 \register{xmm0} 的低 32 位。读汇编时要注意：有些寄存器一开始表示“元素下标”，经过 \instruction{shl} 或 \instruction{lea} 后变成“字节偏移”。如果不跟踪这种语义变化，就会把地址算错。
+
+\subsection{\instruction{lea}：地址计算指令不一定访问内存}
+
+\instruction{lea} 的名字是 load effective address，但它不从内存读取数据，只做地址形式的整数计算。例如：
+
+\begin{lstlisting}
+lea rax, [rsi + rsi*2]
+\end{lstlisting}
+
+这条指令计算的是：
+
+\begin{lstlisting}
+rax = rsi + rsi * 2
+    = 3 * rsi
+\end{lstlisting}
+
+它没有访问 \code{[rsi + rsi*2]} 这个内存地址。编译器经常用 \instruction{lea} 做乘法常数、数组偏移和指针计算，因为它可以把“加法 + scale + 常量”合到一条指令里。
+
+例如结构体大小为 24 时：
+
+\begin{lstlisting}[language=C++]
+struct Item24 {
+    double a;
+    double b;
+    int c;
+    int d;
+};
+
+int load_d(Item24 const* p, std::size_t i)
+{
+    return p[i].d;
+}
+\end{lstlisting}
+
+若 \code{sizeof(Item24) == 24}，\code{offset(Item24, d) == 20}，地址公式是：
+
+\begin{lstlisting}
+addr(p[i].d) = base + i * 24 + 20
+\end{lstlisting}
+
+编译器可能生成类似：
+
+\begin{lstlisting}
+lea eax, [rsi + rsi*2]        ; eax = i * 3
+mov eax, dword ptr [rdi + rax*8 + 20]
+ret
+\end{lstlisting}
+
+这里第二条指令的 scale 是 8，所以总乘数是 \code{3 * 8 = 24}。这种组合在真实汇编里很常见。读它时不要只看最后一条内存操作，要把前面的 \instruction{lea} 一起纳入地址公式。
+
+\begin{keyidea}
+C++ 的数组下标、指针解引用、结构体字段访问，在机器层面都落到地址计算。理解地址计算，是读汇编、理解 cache 行为和优化数据布局的共同入口。
+\end{keyidea}
+
+\section{对象的存储期：栈、堆、静态区只是第一步分类}
+
+C++ 对象可以有不同存储期。存储期决定对象的存储何时获得、何时释放。常见分类如下：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+存储期 & 示例 & 生命周期大致特点 \\
+\midrule
+自动存储期 & 局部变量 & 进入作用域创建，离开作用域销毁 \\
+动态存储期 & \code{new}、\code{malloc} & 程序显式申请和释放 \\
+静态存储期 & 全局变量、\code{static} & 程序启动到结束 \\
+线程存储期 & \code{thread_local} & 线程开始到线程结束 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+初学者常说“局部变量在栈上，new 出来的在堆上，全局变量在静态区”。这作为入门直觉可以，但要知道它不是完整语言规则。编译器优化可能把局部变量放在寄存器里，甚至完全消除；动态分配器背后可能使用 \code{mmap}；静态对象还涉及 ELF 段、重定位和运行时初始化。
+
+\subsection{栈对象}
+
+局部自动对象常见实现是在栈帧中分配：
+
+\begin{lstlisting}[language=C++]
+void f()
+{
+    int x = 1;
+    int y = 2;
+}
+\end{lstlisting}
+
+未优化时，编译器可能给 \code{x} 和 \code{y} 分配栈槽。优化后，如果它们不需要真实地址，可能只存在于寄存器甚至常量传播结果中。
+
+\subsection{堆对象}
+
+动态对象常由分配器管理：
+
+\begin{lstlisting}[language=C++]
+auto* p = new int[1024];
+delete[] p;
+\end{lstlisting}
+
+堆分配有额外成本：分配器元数据、锁或线程缓存、对齐、碎片、page fault、NUMA 位置等。性能关键路径中频繁分配小对象通常很危险。
+
+\subsection{静态对象}
+
+全局变量和静态变量通常在可执行文件或共享库的段中描述，并在进程加载时映射：
+
+\begin{lstlisting}[language=C++]
+int global_counter = 0;
+
+int f()
+{
+    static int local_static = 1;
+    return ++local_static;
+}
+\end{lstlisting}
+
+静态对象会牵涉链接、加载、初始化顺序、线程安全局部静态初始化等问题。本书后面讲 ELF、链接和运行时时会展开。
+
+\section{对齐：对象地址不是随便放的}
+
+\term{alignment}{对齐} 是对象地址必须满足的约束。若一个类型 \code{T} 的对齐要求是 \code{A}，则 \code{T} 对象地址通常必须是 \code{A} 的倍数。
+
+例如在常见 x86-64 ABI 下：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+类型 & 常见大小 & 常见对齐 \\
+\midrule
+\code{char} & 1 & 1 \\
+\code{int} & 4 & 4 \\
+\code{float} & 4 & 4 \\
+\code{double} & 8 & 8 \\
+\code{void*} & 8 & 8 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+你可以用 \code{alignof} 查询：
+
+\begin{lstlisting}[language=C++]
+#include <iostream>
+
+int main()
+{
+    std::cout << alignof(char) << '\n';
+    std::cout << alignof(int) << '\n';
+    std::cout << alignof(double) << '\n';
+    std::cout << alignof(void*) << '\n';
+}
+\end{lstlisting}
+
+\subsection{为什么需要对齐}
+
+对齐来自硬件和 ABI 的共同需要。硬件访问自然对齐的数据通常更简单、更快。有些架构上未对齐访问会触发异常；x86-64 通常允许许多未对齐访问，但可能带来性能代价，尤其是跨 cache line、跨页或用于某些 SIMD 指令时。
+
+例如，一个 8 字节 load 如果地址是 8 字节对齐，且不跨 cache line，硬件处理更直接。如果它从 cache line 最后 4 字节开始，就会跨两个 cache line，可能需要两个 cache line 都可用。
+
+\begin{deepdive}
+“x86 支持未对齐访问”不等于“对齐不重要”。标量普通 load/store 可能只是轻微变慢，但跨 cache line、跨 page、原子操作、SIMD 对齐指令、false sharing 场景下，对齐会变成明显性能因素。
+\end{deepdive}
+
+\subsection{对齐要求、分配器保证和过度对齐}
+
+对齐不是只在结构体内部发生。任何对象被创建时，它的起始地址都必须满足该类型的对齐要求。局部对象、全局对象、\code{new} 创建的对象和标准容器中的元素，都要满足各自类型的对齐要求。若一个分配器返回的地址不能满足对象类型对齐，随后构造对象或访问对象就可能违反语言规则。
+
+普通 \code{operator new} 会返回适合常规对象的对齐地址；对 \code{alignas(64)} 这类过度对齐类型，现代 C++ 有对应的对齐分配机制。标准容器在保存过度对齐类型时也应通过 allocator 提供正确对齐。自己写 arena、memory pool 或固定缓冲区时，必须显式处理这件事。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+struct alignas(64) CacheLineBlock {
+    std::uint64_t data[8];
+};
+\end{lstlisting}
+
+这里 \code{alignas(64)} 要求对象起始地址按 64 字节对齐。这个要求可能用于避免 false sharing、配合 cache line 边界、或满足某些向量化数据布局。但它也会增大数组中相邻元素的步长，可能浪费空间。对齐越大不一定越快；它改变的是布局约束，是否提升性能要看访问模式和硬件行为。
+
+\subsection{自然对齐、cache line 对齐和 SIMD 对齐不要混用}
+
+“对齐”这个词在不同场景里有不同粒度：
+
+\begin{itemize}
+  \item \textbf{类型自然对齐：} 例如 \code{double} 通常要求 8 字节对齐。
+  \item \textbf{cache line 对齐：} 常见 x86-64 cache line 是 64 字节，用于减少跨行访问或隔离多线程写入。
+  \item \textbf{SIMD 数据对齐：} 128-bit、256-bit、512-bit load/store 可能希望数据按 16、32、64 字节边界组织。
+  \item \textbf{页面对齐：} 操作系统页通常是 4 KiB 或更大，用于虚拟内存映射、mmap、大页和 DMA 等场景。
+\end{itemize}
+
+这些层次有关联，但不能互相替代。一个地址 8 字节对齐，不代表它 64 字节对齐；一个 buffer 64 字节对齐，也不代表每个结构体字段都避免跨 cache line；一个数组首地址满足 SIMD 对齐，也不代表从任意下标开始的子数组仍然满足同样对齐。
+
+写报告时要说清“对齐到多少字节、为了哪一层问题”。例如“这个 \code{double} 字段放在 offset 8，是为了满足字段 8 字节对齐”；“这个任务描述符用 \code{alignas(64)}，是为了让不同线程写的计数器落在不同 cache line”；“这个 microkernel 的 packed buffer 按 64 字节对齐，是为了方便宽向量 load 和预取”。三句话都讲对齐，但工程目的不同。
+
+\begin{warningbox}
+不要把对齐当成泛泛的性能魔法。对齐首先是正确性和 ABI 布局规则，其次才是性能工具。过度对齐会增加空间占用，可能降低 cache 密度；是否值得，要用访问模式和测量证明。
+\end{warningbox}
+
+\section{结构体布局：字段、padding 和 ABI}
+
+结构体不是简单把字段大小相加。编译器需要为每个字段选择 offset，并在必要时插入 \term{padding}{填充字节}，以满足字段和整个结构体的对齐要求。
+
+\subsection{先掌握一个机械算法}
+
+学习结构体布局时，不要一上来凭感觉。对普通标准布局结构体，可以先用下面这个机械算法训练。真实 ABI 有更多细节，例如继承、虚函数、空基类优化、位域、向量类型、显式 \code{alignas}、packing pragma，但本算法足够支撑本章和大量性能分析。
+
+\begin{enumerate}
+  \item 令当前 offset 为 0。
+  \item 从第一个字段开始，按声明顺序处理。
+  \item 对当前字段，先查出字段大小 \code{sizeof(field)} 和对齐 \code{alignof(field)}。
+  \item 如果当前 offset 不是字段对齐的倍数，就插入 padding，把 offset 向上补齐到下一个满足对齐的位置。
+  \item 当前 offset 就是该字段的 offset。
+  \item offset 增加字段大小。
+  \item 所有字段处理完后，结构体整体对齐通常是所有字段对齐要求的最大值。
+  \item 最终 \code{sizeof(struct)} 必须补齐到结构体整体对齐的倍数，因此末尾可能有 tail padding。
+\end{enumerate}
+
+其中“向上补齐”可以写成一个函数：
+
+\begin{center}
+\begin{minipage}{0.72\linewidth}
+\begin{verbatim}
+align_up(x, A) = smallest y such that y >= x and y % A == 0
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+如果 \code{A} 是 2 的幂，机器代码和系统代码里经常写成：
+
+\begin{lstlisting}[language=C++]
+std::size_t align_up(std::size_t x, std::size_t a)
+{
+    return (x + a - 1) & ~(a - 1);
+}
+\end{lstlisting}
+
+例如 \code{align_up(5, 4) == 8}，\code{align_up(16, 8) == 16}。第一个例子需要补 3 字节，第二个例子本来已经对齐，不需要补。
+
+\begin{keyidea}
+padding 不是编译器“随便浪费空间”。padding 是为了让每个字段和数组中每个结构体元素都满足对齐约束。结构体大小必须包含尾部 padding，否则 \code{arr[1]} 的起始地址可能不满足结构体自身对齐。
+\end{keyidea}
+
+看第一个例子：
+
+\begin{lstlisting}[language=C++]
+struct A {
+    char c;
+    int x;
+};
+\end{lstlisting}
+
+在常见 x86-64 ABI 下，\code{char} 大小 1、对齐 1；\code{int} 大小 4、对齐 4。若 \code{c} 放在 offset 0，那么 \code{x} 不能放在 offset 1，因为 offset 1 不是 4 的倍数。编译器会插入 3 字节 padding：
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+offset & 内容 & 大小 & 说明 \\
+\midrule
+0 & \code{c} & 1 & 字段 \\
+1..3 & padding & 3 & 让下个字段 4 字节对齐 \\
+4..7 & \code{x} & 4 & 字段 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以 \code{sizeof(A)} 通常是 8，不是 5。
+
+\subsection{完整例题：逐字段模拟布局}
+
+现在用算法推一个稍复杂的例子：
+
+\begin{lstlisting}[language=C++]
+struct Record {
+    char tag;
+    double score;
+    int count;
+    short flags;
+};
+\end{lstlisting}
+
+假设常见 x86-64 ABI 下：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+类型 & 大小 & 对齐 \\
+\midrule
+\code{char} & 1 & 1 \\
+\code{short} & 2 & 2 \\
+\code{int} & 4 & 4 \\
+\code{double} & 8 & 8 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+逐字段推导如下：
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+字段 & 进入前 offset & 对齐动作 & 字段 offset & 写入后 offset \\
+\midrule
+\code{tag} & 0 & 已满足 1 对齐 & 0 & 1 \\
+\code{score} & 1 & 补到 8，插入 7 字节 padding & 8 & 16 \\
+\code{count} & 16 & 已满足 4 对齐 & 16 & 20 \\
+\code{flags} & 20 & 已满足 2 对齐 & 20 & 22 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+字段处理完后，最大对齐是 8，所以结构体大小必须补到 8 的倍数。当前 offset 是 22，\code{align_up(22, 8) == 24}，因此尾部 padding 是 2 字节：
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+字节范围 & 内容 & 大小 & 说明 \\
+\midrule
+0 & \code{tag} & 1 & 字段 \\
+1..7 & padding & 7 & 让 \code{score} 8 字节对齐 \\
+8..15 & \code{score} & 8 & 字段 \\
+16..19 & \code{count} & 4 & 字段 \\
+20..21 & \code{flags} & 2 & 字段 \\
+22..23 & tail padding & 2 & 让 \code{sizeof(Record)} 是 8 的倍数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果有数组：
+
+\begin{lstlisting}[language=C++]
+Record r[2];
+\end{lstlisting}
+
+那么：
+
+\begin{center}
+\begin{minipage}{0.72\linewidth}
+\begin{verbatim}
+addr(r[1]) = addr(r[0]) + sizeof(Record)
+           = addr(r[0]) + 24
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+\code{24} 是 8 的倍数，因此 \code{r[1].score} 仍然可以落在 8 字节对齐地址上。如果结构体大小只是字段结束时的 22，数组第二个元素就会破坏字段对齐，这就是尾部 padding 存在的根本原因。
+
+\subsection{把字段重排也算法化}
+
+如果只是追求更小的结构体大小，一个常见启发式是把对齐要求大的字段放前面：
+
+\begin{lstlisting}[language=C++]
+struct RecordPackedOrder {
+    double score;
+    int count;
+    short flags;
+    char tag;
+};
+\end{lstlisting}
+
+逐字段推导：
+
+\begin{center}
+\begin{tabular}{lllll}
+\toprule
+字段 & 进入前 offset & 对齐动作 & 字段 offset & 写入后 offset \\
+\midrule
+\code{score} & 0 & 已满足 8 对齐 & 0 & 8 \\
+\code{count} & 8 & 已满足 4 对齐 & 8 & 12 \\
+\code{flags} & 12 & 已满足 2 对齐 & 12 & 14 \\
+\code{tag} & 14 & 已满足 1 对齐 & 14 & 15 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+最大对齐仍然是 8，最终大小补到 16。和原来的 24 相比，减少了 8 字节。如果这种对象有一千万个，节省的是约 80 MB，不是小数。
+
+但这仍然不是“所有结构体都按大到小排序”的命令。性能结构体设计要同时考虑三类目标：
+
+\begin{itemize}
+  \item \textbf{空间密度：} 减少 padding，让更多对象进入 cache。
+  \item \textbf{访问局部性：} 把同一个 hot loop 经常一起使用的字段放近，把冷字段挪远。
+  \item \textbf{并发隔离：} 多线程频繁写的字段有时要故意分开，避免 false sharing。
+\end{itemize}
+
+字段顺序是数据布局设计的一部分，不只是“省几个字节”。对于 AI runtime 的 tensor metadata、operator descriptor、thread task、work queue node，字段布局会影响 cache 占用、预取效果、false sharing 和 ABI 稳定性。
+
+\subsection{尾部 padding}
+
+再看：
+
+\begin{lstlisting}[language=C++]
+struct B {
+    int x;
+    char c;
+};
+\end{lstlisting}
+
+\code{x} 放在 offset 0，占 4 字节；\code{c} 放在 offset 4，占 1 字节。看起来总共 5 字节。但结构体整体对齐是其成员最大对齐，通常是 4。为了让 \code{B arr[2]} 中每个元素都满足对齐，\code{sizeof(B)} 必须是 4 的倍数，于是尾部会有 3 字节 padding：
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+offset & 内容 & 大小 & 说明 \\
+\midrule
+0..3 & \code{x} & 4 & 字段 \\
+4 & \code{c} & 1 & 字段 \\
+5..7 & tail padding & 3 & 让数组中下个元素对齐 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{字段顺序会影响大小}
+
+比较：
+
+\begin{lstlisting}[language=C++]
+struct Bad {
+    char a;
+    double b;
+    char c;
+    int d;
+};
+
+struct Better {
+    double b;
+    int d;
+    char a;
+    char c;
+};
+\end{lstlisting}
+
+\code{Bad} 可能因为多次对齐插入大量 padding；\code{Better} 把大对齐字段放前面，通常更紧凑。
+
+但字段重排不是无脑优化。你还要考虑：
+
+\begin{itemize}
+  \item ABI 兼容：公开结构体布局不能随便改。
+  \item 序列化和文件格式：布局变化会破坏二进制兼容。
+  \item 热字段和冷字段：有时为了 cache，把常用字段聚在一起比最小 \code{sizeof} 更重要。
+  \item false sharing：多线程写的字段可能需要故意分离到不同 cache line。
+\end{itemize}
+
+\subsection{字段布局设计的三步判断}
+
+真实工程中设计结构体字段顺序，可以按三步判断，而不是只按字段大小排序。
+
+第一步，判断结构体是否跨 ABI 或持久化边界。如果这个结构体出现在公开头文件、动态库接口、文件格式、网络协议、共享内存、插件接口或跨语言 FFI 中，字段顺序就是契约的一部分。为了省几个 padding 字节随意重排，可能让旧二进制、旧文件或其他语言绑定全部失效。此时应优先使用显式版本、大小字段、不透明句柄或稳定序列化格式，而不是把内部结构体裸露出去。
+
+第二步，判断访问模式。若热循环每次只读少数字段，应把热字段聚在一起，甚至考虑 SoA；若每次都完整消费一个对象，紧凑 AoS 可能更好；若某些字段只在错误处理、日志、调试或初始化阶段使用，它们是冷字段，可以与热路径字段分开。空间最小的布局不一定让热路径最快，因为 cache line 搬运的是连续字节，热字段密度比总大小更贴近性能。
+
+第三步，判断并发写入。多线程程序中，如果两个线程频繁写同一 cache line 上的不同字段，会发生 false sharing。为了避免这种情况，有时要故意插入 padding 或使用 \code{alignas(64)}，让不同线程写的字段分开。这个选择会增大对象大小，但可能显著降低缓存一致性流量。
+
+因此，字段布局设计至少要写出下面四项证据：
+
+\begin{enumerate}
+  \item 每个字段的大小、对齐和 offset。
+  \item 热路径实际访问哪些字段，访问频率如何。
+  \item 结构体是否是公开 ABI、文件格式或共享内存布局。
+  \item 是否有多线程频繁写入同一对象或相邻对象的风险。
+\end{enumerate}
+
+这四项比“把大的放前面”更接近工程现实。对于教材练习，先学会手算 padding；对于生产代码，要把 padding 分析放进访问模式和兼容性分析里。
+
+\subsection{布局改变会改变汇编形态}
+
+字段 offset 会直接进入汇编指令的 displacement。结构体大小会直接进入数组访问的 scale、\instruction{shl} 或 \instruction{lea}。因此字段重排不只是 \code{sizeof} 变化，也会改变反汇编中出现的常量。
+
+例如一个字段从 offset 16 移到 offset 8，原来的访问可能是：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rsi*4 + 16]
+\end{lstlisting}
+
+重排后可能变成：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rsi*4 + 8]
+\end{lstlisting}
+
+如果结构体大小从 24 变成 16，数组字段访问的步长也会改变。原本可能需要：
+
+\begin{lstlisting}
+lea rcx, [rsi + rsi*2]       ; i * 3
+mov eax, dword ptr [rdi + rcx*8 + 20]
+\end{lstlisting}
+
+变成 16 字节步长后，可能只需要：
+
+\begin{lstlisting}
+shl rsi, 4
+mov eax, dword ptr [rdi + rsi + 12]
+\end{lstlisting}
+
+这类差异会影响代码尺寸、地址计算指令、寄存器压力和 cache 密度。并不是说某种形态一定更快，而是说明布局设计会被编译器翻译成具体地址计算。读优化报告时，如果只看源代码字段顺序，不看反汇编中的 offset 和步长，就少了一半证据。
+
+\section{\code{sizeof}、\code{alignof} 和 \code{offsetof}}
+
+研究布局时，三个工具非常重要：
+
+\begin{lstlisting}[language=C++]
+#include <cstddef>
+#include <iostream>
+
+struct S {
+    char a;
+    double b;
+    int c;
+};
+
+int main()
+{
+    std::cout << "sizeof(S)  = " << sizeof(S) << '\n';
+    std::cout << "alignof(S) = " << alignof(S) << '\n';
+    std::cout << "offset a   = " << offsetof(S, a) << '\n';
+    std::cout << "offset b   = " << offsetof(S, b) << '\n';
+    std::cout << "offset c   = " << offsetof(S, c) << '\n';
+}
+\end{lstlisting}
+
+\code{offsetof} 对标准布局类型可靠。学习阶段你应该先手工预测，再用程序验证。不要只看输出，因为真正的训练是形成布局推导能力。
+
+\section{padding 字节不一定有稳定值}
+
+结构体 padding 是对象表示的一部分，但不一定参与对象的值。它可能未初始化，也可能包含旧栈数据。比较结构体对象时，不能简单用 \code{memcmp} 替代字段级比较，除非你非常清楚类型性质和初始化方式。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+struct A {
+    char c;
+    int x;
+};
+
+bool equal_bad(A const& lhs, A const& rhs)
+{
+    return std::memcmp(&lhs, &rhs, sizeof(A)) == 0;
+}
+\end{lstlisting}
+
+即使两个对象的 \code{c} 和 \code{x} 相等，padding 字节也可能不同，\code{memcmp} 可能返回不相等。这个问题在哈希、序列化、网络传输和 SIMD 批量比较中很常见。
+
+\begin{warningbox}
+结构体的“值”和结构体的“对象字节”不是总能一一对应。padding、未初始化字节、浮点 NaN、不同但等价的表示，都可能让字节级比较和语义级比较不一致。
+\end{warningbox}
+
+\section{安全地观察和搬运字节}
+
+\subsection{用 \code{unsigned char} 或 \code{std::byte} 观察对象表示}
+
+观察对象字节时，可以使用 \code{unsigned char const*}：
+
+\begin{lstlisting}[language=C++]
+template <class T>
+void dump_bytes(T const& value)
+{
+    auto const* p = reinterpret_cast<unsigned char const*>(&value);
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        std::cout << std::hex << static_cast<unsigned>(p[i]) << ' ';
+    }
+    std::cout << '\n';
+}
+\end{lstlisting}
+
+\subsection{用 \code{std::memcpy} 或 \code{std::bit_cast} 搬运位模式}
+
+如果你想在两种类型之间复制位模式，不要随便用错误类型指针解引用。C++20 提供 \code{std::bit_cast}：
+
+\begin{lstlisting}[language=C++]
+#include <bit>
+#include <cstdint>
+
+float f = 1.0f;
+std::uint32_t bits = std::bit_cast<std::uint32_t>(f);
+\end{lstlisting}
+
+也可以用 \code{std::memcpy}：
+
+\begin{lstlisting}[language=C++]
+std::uint32_t bits;
+std::memcpy(&bits, &f, sizeof(bits));
+\end{lstlisting}
+
+这两种方式都表达“复制对象表示”，比用不匹配类型的指针解引用更可靠。
+
+\section{别名规则：编译器如何知道两个指针会不会指同一块内存}
+
+别名问题是从 C++ 到高性能优化的关键门槛。看下面代码：
+
+\begin{lstlisting}[language=C++]
+void f(int* a, int* b)
+{
+    *a = 1;
+    *b = 2;
+    *a = *a + 3;
+}
+\end{lstlisting}
+
+如果 \code{a} 和 \code{b} 指向不同对象，最后 \code{*a == 4}。如果它们指向同一个 \code{int}，执行过程是：
+
+\begin{enumerate}
+  \item 执行 \code{*a = 1}，该对象变成 1。
+  \item 执行 \code{*b = 2}。因为 \code{a} 和 \code{b} 指向同一对象，所以 \code{*a} 也变成 2。
+  \item 执行 \code{*a = *a + 3}，最终该对象变成 5。
+\end{enumerate}
+
+编译器如果不能证明 \code{a} 和 \code{b} 不别名，就必须保守处理。保守处理会影响寄存器缓存、load/store 重排、循环向量化和 common subexpression elimination。
+
+\subsection{不同类型通常提供别名信息}
+
+看另一个例子：
+
+\begin{lstlisting}[language=C++]
+void g(int* a, double* b)
+{
+    *a = 1;
+    *b = 2.0;
+    *a = *a + 3;
+}
+\end{lstlisting}
+
+在正常 C++ 别名规则下，\code{int*} 和 \code{double*} 通常不能指向同一个活着的对象。编译器可以利用这个事实，把 \code{*a} 保存在寄存器中，而不必担心 \code{*b = 2.0} 改了同一个 \code{int}。
+
+这就是为什么错误的类型双关不仅可能不正确，还可能导致编译器生成你无法预期的代码。
+
+\subsection{别名如何阻止优化}
+
+别名不是抽象语言洁癖，它会直接改变循环汇编。考虑：
+
+\begin{lstlisting}[language=C++]
+void scale_add(float* y, float const* x, float a, std::size_t n)
+{
+    for (std::size_t i = 0; i < n; ++i) {
+        y[i] = y[i] + a * x[i];
+    }
+}
+\end{lstlisting}
+
+如果编译器不知道 \code{x} 和 \code{y} 是否重叠，就必须考虑很多情况：\code{x == y}，\code{x} 指向 \code{y} 中间，\code{y} 指向 \code{x} 中间，或者二者完全不重叠。对于标量循环，这可能只是多几条保守 load/store；对于向量化，情况会更复杂，因为一次向量 store 可能覆盖后续向量 load 还没读取的数据。
+
+编译器常见策略有三种。第一，完全保守，不做某些重排或向量化。第二，生成运行时别名检查：先判断两个区间是否重叠，不重叠走快速向量路径，可能重叠走保守路径。第三，利用源码给出的额外信息，例如不同类型、\code{restrict} 扩展、编译器内建假设、span 的不可重叠约定或更高层算法保证。
+
+这就是为什么同样的数学循环，在 C、C++、Fortran、Rust 或手写汇编中可能得到不同优化结果。不是硬件变了，而是编译器掌握的别名事实不同。Fortran 的数组语义长期对数值优化友好，一个重要原因就是别名假设更强；C/C++ 则需要程序员和接口设计主动表达不重叠关系。
+
+\subsection{运行时别名检查不是坏事}
+
+看到优化后汇编里多了一段指针范围比较，不要立刻认为编译器“变复杂了”。它可能是在做 loop versioning：用少量入口检查换取主循环的向量化。
+
+概念上，编译器可能生成类似逻辑：
+
+\begin{lstlisting}
+if ranges_do_not_overlap(x, y, n):
+    run vectorized loop
+else:
+    run scalar conservative loop
+\end{lstlisting}
+
+这段检查本身有成本，但如果 \code{n} 足够大，向量化主循环节省的成本远大于入口判断。相反，如果 \code{n} 很小，检查成本可能显得明显。后面做 benchmark 时，你要知道：性能曲线里小尺寸和大尺寸表现不同，可能就来自这种版本化、边界处理和 remainder loop。
+
+\subsection{表达不别名关系的工程方式}
+
+在 C++ 中表达“不别名”要谨慎。常见方式包括：
+
+\begin{itemize}
+  \item 通过 API 设计避免同一个 buffer 同时作为输入和输出。
+  \item 在文档和断言中明确输入输出区间不重叠。
+  \item 使用编译器支持的 \code{__restrict__} 或相关属性，但要保证调用者真的遵守。
+  \item 将只读输入标成 \code{T const*}，虽然 \code{const} 本身不证明不别名，但能表达写入方向。
+  \item 在高层容器或 tensor view 中记录区间、shape、stride，并在调试构建检查重叠。
+\end{itemize}
+
+最危险的做法是为了让编译器优化而撒谎。例如把可能重叠的指针声明成 restrict 风格，然后在调用时真的传入重叠区间。这样得到的错误往往只在某些优化级别、某些长度或某些 CPU 上出现，调试成本很高。底层优化依赖契约，契约必须真实。
+
+\begin{deepdive}
+C 的 \code{restrict}、C++ 编译器扩展中的 \code{__restrict__}、LLVM IR 的 alias metadata、Fortran 的数组别名语义，都会显著影响高性能循环能否向量化。后面讲 auto-vectorization 和 AI kernel 时会深入。
+\end{deepdive}
+
+\section{常见混淆：底层学习最容易卡住的地方}
+
+本章内容多，但很多错误可以归结为几组概念混淆。这里集中整理一次。你后面看汇编、写 SIMD、调 benchmark 时，只要结果不符合预期，就应该回到这些问题检查。
+
+\subsection{混淆 1：指针变量和被指对象不是同一个东西}
+
+看下面代码：
+
+\begin{lstlisting}[language=C++]
+int x = 42;
+int* p = &x;
+\end{lstlisting}
+
+\code{x} 是一个 \code{int} 对象，通常占 4 字节。\code{p} 也是一个对象，它的类型是 \code{int*}，在 x86-64 上通常占 8 字节。\code{p} 的值是 \code{x} 的地址，但 \code{p} 自己也需要存储空间。
+
+如果假设：
+
+\begin{lstlisting}
+addr(x) = 0x1000
+addr(p) = 0x2000
+value(p) = 0x1000
+\end{lstlisting}
+
+那么：
+
+\begin{itemize}
+  \item 访问 \code{x}，读取的是 \code{0x1000..0x1003}。
+  \item 访问 \code{p} 这个指针变量，读取的是 \code{0x2000..0x2007}。
+  \item 访问 \code{*p}，先从 \code{p} 的值拿到 \code{0x1000}，再读取 \code{0x1000..0x1003}。
+\end{itemize}
+
+汇编里也会体现这个差异。如果 \register{rdi} 直接保存 \code{p} 的值，也就是 \code{x} 的地址，那么：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi]
+\end{lstlisting}
+
+读取的是 \code{*p}。但如果 \register{rdi} 保存的是指针变量 \code{p} 自己的地址，也就是 \code{&p}，那么通常需要两次 load：
+
+\begin{lstlisting}
+mov rax, qword ptr [rdi]      ; load p itself
+mov eax, dword ptr [rax]      ; load *p
+\end{lstlisting}
+
+第一条读取指针值，第二条读取被指对象。链表、树、稀疏矩阵和 \code{int**} 的性能问题，很多都来自这种“先读地址，再按地址读数据”的间接访问。
+
+\subsection{混淆 2：元素偏移和字节偏移不是同一个单位}
+
+下面两行很像，但单位不同：
+
+\begin{lstlisting}[language=C++]
+int* q1 = p + 3;
+auto q2 = reinterpret_cast<char*>(p) + 3;
+\end{lstlisting}
+
+如果 \code{p == 0x1000}，则：
+
+\begin{lstlisting}
+q1 = 0x1000 + 3 * sizeof(int) = 0x100c
+q2 = 0x1000 + 3                = 0x1003
+\end{lstlisting}
+
+\code{p + 3} 的 3 是元素个数；\code{reinterpret_cast<char*>(p) + 3} 的 3 是字节数。读汇编时，所有地址最终都要落到字节偏移；读 C++ 时，指针加法先按类型缩放。
+
+\subsection{混淆 3：数组对象、数组首元素指针、指向整个数组的指针}
+
+看代码：
+
+\begin{lstlisting}[language=C++]
+int a[4];
+int* p0 = a;
+int (*p1)[4] = &a;
+\end{lstlisting}
+
+它们的数值地址可能相同，但类型不同：
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+表达式 & 类型 & 数值上常见地址 & \code{+1} 的含义 \\
+\midrule
+\code{a} & 表达式中常退化为 \code{int*} & \code{addr(a[0])} & 下一个 \code{int} \\
+\code{&a[0]} & \code{int*} & \code{addr(a[0])} & 下一个 \code{int} \\
+\code{&a} & \code{int (*)[4]} & \code{addr(a)} & 下一个 4 元素数组 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此：
+
+\begin{lstlisting}
+addr((&a[0]) + 1) = base + 4
+addr((&a)    + 1) = base + 16
+\end{lstlisting}
+
+这类区别在多维数组、固定 shape 张量、小矩阵 tile、编译期已知长度的 kernel 中非常重要。编译器知道更多类型信息时，往往能生成更直接的地址计算和更强的优化。
+
+\subsection{混淆 4：硬件能执行不代表 C++ 定义良好}
+
+很多初学者会用“我运行没崩”来判断底层代码对不对。这在系统编程和性能优化里非常危险。看下面例子：
+
+\begin{lstlisting}[language=C++]
+int a[4] = {1, 2, 3, 4};
+int x = a[4];
+\end{lstlisting}
+
+硬件层面，这可能只是从 \code{a[0]} 后面 16 字节的位置发起一次 4 字节 load。但 C++ 层面，\code{a[4]} 越界，行为未定义。编译器可以假设这种情况不会发生，并据此重排、删除或改写代码。
+
+再看类型双关：
+
+\begin{lstlisting}[language=C++]
+int x = 0;
+double* p = reinterpret_cast<double*>(&x);
+double y = *p;
+\end{lstlisting}
+
+硬件也许能从 \code{&x} 开始读 8 字节，但 C++ 对象模型、对齐和别名规则都可能已经被破坏。正确观察位模式时，应优先使用：
+
+\begin{lstlisting}[language=C++]
+std::bit_cast<T>(value)
+std::memcpy(&dst, &src, sizeof(dst))
+unsigned char const* bytes = reinterpret_cast<unsigned char const*>(&obj)
+\end{lstlisting}
+
+底层工程的目标不是“骗过编译器和硬件”，而是在语言规则允许的范围内，把编译器、ISA 和微架构都用到极限。
+
+\subsection{混淆 5：汇编里的地址公式不等于源码里的唯一写法}
+
+同一个源码可能生成多种汇编，同一个汇编片段也可能来自多种源码。比如：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rsi*4 + 8]
+\end{lstlisting}
+
+它可能来自：
+
+\begin{lstlisting}[language=C++]
+return p[i + 2];
+\end{lstlisting}
+
+也可能来自：
+
+\begin{lstlisting}[language=C++]
+struct S {
+    int a;
+    int b;
+    int c;
+};
+
+return p[i].c;
+\end{lstlisting}
+
+区别要靠上下文判断：\register{rdi} 是不是数组首地址？\register{rsi} 是不是原始下标？结构体大小是否为 12？前面是否有 \instruction{lea} 改变了 index？函数参数 ABI、调试信息、周围 load/store 和循环结构都要一起看。
+
+\begin{mentalmodel}
+读汇编不是把每条指令机械翻译回一行 C++。更可靠的方法是先恢复数据流和地址公式，再结合类型、ABI、循环结构和访问宽度推断源码意图。
+\end{mentalmodel}
+
+\section{对象生命周期：有地址不等于有对象}
+
+底层程序员容易犯的另一个错误是把“有一块字节存储”当成“有一个对象”。C++ 区分存储和对象生命周期。
+
+例如，分配一块原始存储：
+
+\begin{lstlisting}[language=C++]
+alignas(int) unsigned char buffer[sizeof(int)];
+\end{lstlisting}
+
+这块字节存在，但其中还没有一个 \code{int} 对象。要在其中创建对象，需要 placement new 或符合标准的对象创建方式：
+
+\begin{lstlisting}[language=C++]
+int* p = new (buffer) int(42);
+\end{lstlisting}
+
+在高性能代码中，自定义 allocator、memory pool、arena、SIMD buffer 和序列化反序列化都会碰到对象生命周期问题。初学阶段不要求你立刻掌握所有细节，但必须建立警觉：地址、字节、对象不是同一个概念。
+
+\subsection{存储、对象和值的三层关系}
+
+可以把底层内存问题分成三层：
+
+\begin{enumerate}
+  \item \textbf{存储：} 有一段足够大、足够对齐的字节空间。
+  \item \textbf{对象：} 在这段存储中，一个特定类型对象的生命周期已经开始。
+  \item \textbf{值：} 这个对象已经被初始化到某个可读取的状态。
+\end{enumerate}
+
+这三层不能跳。分配器返回一段存储，不等于其中已经有 \code{T} 对象；对象生命周期开始了，不等于每个值都已经初始化；对象值可读，也不等于它的 padding 字节有稳定意义。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+alignas(double) std::byte storage[sizeof(double)];
+\end{lstlisting}
+
+这行代码只给出一段按 \code{double} 对齐、大小足够的字节存储。若要在其中创建 \code{double}，需要构造对象；若要结束对象生命周期，需要调用合适的析构过程。对 \code{double} 这种平凡类型，析构看起来没有动作，但“生命周期是否存在”这个语言事实仍然影响你能否通过 \code{double*} 合法访问它。
+
+\subsection{为什么 allocator 和 arena 要关心生命周期}
+
+许多高性能系统会把内存分配拆成两步：先批量拿一大块原始存储，再在其中按需构造对象。这样可以减少系统调用、减少分配器锁、改善局部性，并让对象集中在少数页里。但是这种做法把责任交给了库作者：必须保证对齐正确、对象构造正确、异常时清理正确、析构顺序正确、释放时不再有悬垂引用。
+
+一个 arena 分配器如果只返回 \code{void*} 或 \code{std::byte*}，调用者还要把它变成某个类型对象。正确抽象通常会提供类似“分配并构造 \code{T}”的接口，而不是让业务代码到处手写 placement new。否则很容易出现：地址对了但对象没构造、对象构造了但析构没执行、存储复用了但旧指针仍被使用。
+
+这也是为什么底层性能库虽然追求速度，反而更需要清楚的对象模型。越是接近内存池、tensor buffer、operator workspace、JIT code cache 这类区域，越不能把“我拿到一段地址”当作全部正确性证明。
+
+\subsection{复用存储时旧指针不一定还能用}
+
+当一段存储中的对象生命周期结束，并在同一地址构造另一个对象时，旧指针、旧引用和旧类型假设可能失效。即使数值地址相同，语言层对象已经换了。某些场景需要使用 \code{std::launder} 或重新获取指针，具体规则较细，本册不展开；你现在要记住底线：地址相同不代表对象连续相同。
+
+这个问题在对象池中很常见：
+
+\begin{lstlisting}[language=C++]
+// conceptual only
+T* p = pool.create<T>(...);
+pool.destroy(p);
+U* q = pool.create<U>(...);   // may reuse the same address
+\end{lstlisting}
+
+如果后来还用旧的 \code{p} 访问，就不是“访问同一地址上的新对象”这么简单，而是使用悬垂指针。工具上，AddressSanitizer、UBSan、调试 allocator、对象生命周期分析都可以帮助发现这类错误；工程上，所有权和句柄设计要尽量避免旧指针长期流散。
+
+\begin{warningbox}
+在 C++ 中，合法访问对象需要同时满足：地址落在有效存储内、对齐满足、对象生命周期已经开始、访问类型允许、访问范围不越界。缺一项，都不能只凭“硬件能读写”证明程序正确。
+\end{warningbox}
+
+\section{数据布局如何进入性能：cache line 预告}
+
+CPU 不是每次只从内存拿你请求的那几个字节。缓存层级通常以 cache line 为单位搬运数据。现代 x86-64 常见 cache line 大小是 64 字节。
+
+如果你顺序遍历 \code{int} 数组：
+
+\begin{lstlisting}[language=C++]
+for (std::size_t i = 0; i < n; ++i) {
+    s += a[i];
+}
+\end{lstlisting}
+
+每个 \code{int} 4 字节，一个 64 字节 cache line 可以容纳 16 个 \code{int}。当 CPU 加载 \code{a[i]} 所在 cache line 后，后面的 \code{a[i+1]} 到 \code{a[i+15]} 很可能已经在 cache 中。这叫空间局部性。
+
+如果你随机访问：
+
+\begin{lstlisting}[language=C++]
+for (std::size_t i = 0; i < n; ++i) {
+    s += a[index[i]];
+}
+\end{lstlisting}
+
+每次访问可能落在不同 cache line。即使只需要 4 字节，也可能为它搬来 64 字节，造成带宽浪费和高延迟。
+
+\subsection{步长访问}
+
+步长访问是理解 cache 的第一个实验：
+
+\begin{lstlisting}[language=C++]
+for (std::size_t i = 0; i < n; i += stride) {
+    s += a[i];
+}
+\end{lstlisting}
+
+当 \code{stride == 1} 时，空间局部性最好。当 \code{stride} 很大时，每次访问都可能使用一个新 cache line。访问元素数看似减少了，但每个访问的 cache line 利用率也下降了。
+
+\subsection{cache line 利用率的粗算}
+
+第一册先用一个粗略但非常有用的模型：如果 cache line 是 64 字节，而每次只真正使用其中 4 字节，那么理论上每条 cache line 的有效利用率只有 \(4/64 = 1/16\)。这不是精确性能公式，但能快速解释很多“运算量很少却很慢”的循环。
+
+例如顺序读取 \code{float} 数组：
+
+\begin{lstlisting}
+float a[n]
+\end{lstlisting}
+
+每个元素 4 字节，连续访问时一条 64 字节 cache line 可以提供 16 个元素。若循环确实用到这 16 个元素，带宽利用较好。若你每隔 16 个元素读一个：
+
+\begin{lstlisting}[language=C++]
+for (std::size_t i = 0; i < n; i += 16) {
+    s += a[i];
+}
+\end{lstlisting}
+
+每次访问都可能落在新的 cache line，只用其中 4 字节，剩下 60 字节被搬来却不用。这个循环元素访问次数少了，但单位有效数据需要搬运的 cache line 更多，未必按访问次数线性变快。
+
+结构体字段也是同理。若 \code{Particle} 是 32 字节，而循环只读其中一个 4 字节字段，一条 64 字节 cache line 只能容纳两个 \code{Particle}，有效使用 8 字节，利用率约八分之一。换成 SoA 后，所有目标字段连续存放，同一条 cache line 能提供 16 个目标字段。这就是布局选择和 cache 带宽之间的第一层关系。
+
+\subsection{局部性有空间局部性和时间局部性}
+
+空间局部性是“用到一个地址后，很快会用到附近地址”。连续数组遍历、结构体内相邻字段读取、按行访问矩阵，通常空间局部性较好。时间局部性是“用过的数据很快会再次使用”。小工作集反复迭代、循环内复用某个标量、矩阵块被多次参与计算，通常时间局部性较好。
+
+许多高性能算法的布局设计，就是在这两类局部性之间取平衡。GEMM blocking 让一个矩阵块在 cache 中被多次复用，是时间局部性；packing 把原本跨步访问的数据复制成连续 buffer，是空间局部性；SoA 把同一字段聚到连续数组，是提高单字段循环的空间局部性；hot/cold split 把热字段从大对象里分离出来，是提高热路径 cache 密度。
+
+本章不要求你会设计完整 cache blocking 算法，但要能从最简单的字节地址公式看出：循环每次访问是否连续、每条 cache line 有多少有效字节、某个字段是否被冷字段稀释、某个指针链是否让下一次地址依赖上一次 load。后续所有性能模型都会从这几个问题展开。
+
+\section{AoS 与 SoA：布局决定 SIMD 和 cache 效率}
+
+看一个粒子数组：
+
+\begin{lstlisting}[language=C++]
+struct Particle {
+    float x;
+    float y;
+    float z;
+    float mass;
+};
+
+Particle* particles;
+\end{lstlisting}
+
+这是 \term{AoS}{Array of Structs}：数组中的每个元素是一个结构体。如果只计算所有 \code{x} 的和：
+
+\begin{lstlisting}[language=C++]
+float sx = 0.0f;
+for (std::size_t i = 0; i < n; ++i) {
+    sx += particles[i].x;
+}
+\end{lstlisting}
+
+内存中 \code{x} 被 \code{y}、\code{z}、\code{mass} 间隔开。每次 cache line 搬入很多不需要的字段。
+
+另一种布局是 \term{SoA}{Struct of Arrays}：
+
+\begin{lstlisting}[language=C++]
+struct Particles {
+    float* x;
+    float* y;
+    float* z;
+    float* mass;
+};
+\end{lstlisting}
+
+此时所有 \code{x} 连续存放。对只读 \code{x} 的 kernel，SoA 更利于 cache 和 SIMD。
+
+但如果每次都同时使用 \code{x,y,z,mass}，AoS 可能更直观，也可能有不错局部性。真正的布局选择必须围绕访问模式，而不是口号。
+
+\subsection{AoS、SoA 和 AoSoA}
+
+除了 AoS 和 SoA，真实高性能库中还常见 \term{AoSoA}{Array of Structs of Arrays}。它把对象按小块分组，每个块内部用 SoA，块与块之间形成数组：
+
+\begin{lstlisting}[language=C++]
+struct ParticleBlock8 {
+    float x[8];
+    float y[8];
+    float z[8];
+    float mass[8];
+};
+
+ParticleBlock8* blocks;
+\end{lstlisting}
+
+AoSoA 的动机是把 SIMD 宽度、cache line 和对象语义折中起来。若向量宽度一次处理 8 个 \code{float}，块内 \code{x[8]} 正好连续；同时一个 block 又保留了“8 个粒子的一组字段”这个局部结构。很多物理模拟、图形、推理 runtime 和 tensor kernel 都会出现类似分块布局。
+
+布局选择可以按访问模式粗分：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+布局 & 适合访问模式 & 主要代价 \\
+\midrule
+AoS & 每次消费一个对象的大多数字段 & 单字段扫描浪费 cache line，SIMD gather/permute 可能多 \\
+SoA & 批量处理同一字段或同一属性 & 对象整体搬运不直观，接口和所有权更复杂 \\
+AoSoA & 固定向量宽度或 tile 内批量处理 & 需要处理块大小、尾部元素和布局转换 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不是绝对规则。真正判断要看：一次循环访问哪些字段，是否顺序访问，是否需要 SIMD，是否多线程写入，是否跨 ABI，是否要和外部库共享数据。教材训练的目标，是让你能从地址公式和 cache line 利用率出发解释布局选择，而不是背“布局 A 一定比布局 B 快”。
+
+\begin{keyidea}
+数据布局不是“代码风格”，而是性能模型的一部分。一个 kernel 的访问模式决定它需要什么布局；布局决定 cache line 利用率、SIMD load/store 形态、预取效果和多线程 false sharing 风险。
+\end{keyidea}
+
+\section{从布局回到汇编：offset 和 scale 是布局的影子}
+
+读反汇编时，不要只盯着某一条 \instruction{mov}。你要把它前面的地址计算指令也一起看。下面几组模式非常常见。
+
+\subsection{模式 1：纯数组，scale 直接等于元素大小}
+
+当你看到：
+
+\begin{lstlisting}
+movss xmm0, dword ptr [rdi + rax*4]
+\end{lstlisting}
+
+它很可能表示读取一个连续 \code{float} 数组：
+
+\begin{lstlisting}[language=C++]
+float x = arr[i];
+\end{lstlisting}
+
+解释如下：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+汇编部分 & 含义 & 可能来源 \\
+\midrule
+\register{rdi} & 基地址 & \code{arr} \\
+\register{rax} & 下标 & \code{i} \\
+\code{*4} & 元素大小 & \code{sizeof(float)} \\
+\code{dword ptr} & 访问 4 字节 & \code{float} load \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{模式 2：结构体数组字段，先算大步长}
+
+如果结构体大小是 16，x86 内存操作数不能直接写 \code{rax*16}。真实汇编更可能是：
+
+\begin{lstlisting}
+shl   rax, 4
+movss xmm0, dword ptr [rdi + rax + 4]
+\end{lstlisting}
+
+它可能表示：
+
+\begin{lstlisting}[language=C++]
+struct Particle {
+    float x;
+    float y;
+    float z;
+    float mass;
+};
+
+float y = particles[i].y;
+\end{lstlisting}
+
+推导过程是：
+
+\begin{lstlisting}
+sizeof(Particle)       = 16
+offset(Particle, y)    = 4
+byte_offset_for_i      = i * 16
+addr(particles[i].y)   = base + i * 16 + 4
+\end{lstlisting}
+
+所以 \instruction{shl rax, 4} 把元素下标变成字节偏移，\code{+ 4} 是字段 \code{y} 的 offset。
+
+\subsection{模式 3：用 \instruction{lea} 拼出非 2 的幂步长}
+
+当结构体大小是 24 时，常见组合是：
+
+\begin{lstlisting}
+lea   rcx, [rax + rax*2]
+mov   edx, dword ptr [rdi + rcx*8 + 20]
+\end{lstlisting}
+
+这可能表示：
+
+\begin{lstlisting}[language=C++]
+struct Item24 {
+    double a;
+    double b;
+    int c;
+    int d;
+};
+
+int d = items[i].d;
+\end{lstlisting}
+
+因为：
+
+\begin{lstlisting}
+rcx = rax + rax * 2 = i * 3
+effective_address = base + (i * 3) * 8 + 20
+                  = base + i * 24 + 20
+\end{lstlisting}
+
+\code{20} 是字段 \code{d} 的 offset。这个例子训练的是：不要看到最后一条里只有 \code{rcx*8} 就误判结构体大小是 8；\register{rcx} 本身已经被前一条 \instruction{lea} 变成了 \code{i*3}。
+
+\subsection{模式 4：二维连续数组，行长进入地址公式}
+
+如果源码是：
+
+\begin{lstlisting}[language=C++]
+int get_2d(int const a[3][5], std::size_t i, std::size_t j)
+{
+    return a[i][j];
+}
+\end{lstlisting}
+
+一种可能汇编形态是：
+
+\begin{lstlisting}
+lea eax, [rsi + rsi*4]
+add rax, rdx
+mov eax, dword ptr [rdi + rax*4]
+ret
+\end{lstlisting}
+
+其中：
+
+\begin{lstlisting}
+rax = i + i * 4 = i * 5
+rax = i * 5 + j
+address = base + (i * 5 + j) * 4
+\end{lstlisting}
+
+这说明每行 5 个 \code{int} 这个类型信息已经进入机器地址计算。如果是 \code{int**}，则通常会先 load 行指针，再访问行内元素，汇编形态完全不同。
+
+\section{布局审查：同时看正确性、ABI 和性能}
+
+数据布局不是单纯的内存知识。一个结构体的字段顺序、对齐、padding、大小和访问模式，会同时影响正确性、二进制接口和性能。第一册不要求你立即设计复杂数据结构，但要学会做布局审查。布局审查不是“看看 \code{sizeof} 多大”，而是把源码类型、C++ 对象规则、ABI 传参、汇编地址公式和访问模式放在同一张表里。
+
+一个布局审查表可以包含：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+审查项 & 要问的问题 & 常用证据 \\
+\midrule
+字段 offset & 每个字段从对象起点偏移多少 & \code{offsetof}、调试输出、反汇编 displacement \\
+对象大小 & 数组步长是多少，尾部 padding 多少 & \code{sizeof}、地址打印、scale/LEA 公式 \\
+对齐 & 对象和字段需要什么边界 & \code{alignof}、分配器保证、指令宽度 \\
+生命周期 & 访问时对象是否真实存在 & 源码构造/析构、allocator 逻辑 \\
+别名 & 两个指针是否可能指向同一区域 & 函数契约、类型、运行时检查 \\
+ABI & 类型如何传参和返回 & 函数签名、ABI 规则、反汇编 \\
+性能 & 访问是否连续、跨步、随机或浪费 cache line & 地址公式、输入规模、benchmark \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如一个结构体：
+
+\begin{lstlisting}[language=C++]
+struct Particle {
+    float x;
+    float y;
+    float z;
+    int id;
+    bool active;
+};
+\end{lstlisting}
+
+初学者可能只问 \code{sizeof(Particle)}。更完整的审查会问：\code{active} 后面是否产生 padding？数组中相邻元素的步长是多少？热循环是否每次只读取 \code{x,y,z} 却把 \code{id} 和 \code{active} 一起带入 cache line？如果跨 C ABI 传递，字段和 padding 是否成为公开契约？如果汇编 kernel 按固定 offset 读取 \code{z}，未来重排字段是否会破坏它？如果多个线程更新 \code{active}，是否会造成同一 cache line 上的写竞争？这些问题都从布局出发，但影响远超布局本身。
+
+\subsection{布局改变不是局部修改}
+
+修改结构体字段顺序看起来只是源码重排，但它可能改变：
+
+\begin{itemize}
+  \item \code{sizeof} 和数组步长。
+  \item 每个字段 offset。
+  \item 函数传参和返回的 ABI 分类。
+  \item 序列化、文件格式或网络协议。
+  \item 手写汇编和 SIMD kernel 的地址公式。
+  \item cache line 利用率和预取效果。
+  \item 调试器显示和旧二进制兼容性。
+\end{itemize}
+
+因此，内部私有结构体可以较自由地为性能重排；公共 ABI、文件格式、共享内存、网络协议和汇编参数块则必须谨慎。公共布局一旦发布，字段 offset 就像函数签名一样成为合同。要修改，应通过版本字段、新结构体或 wrapper 转换，而不是静默改变。
+
+\subsection{安全审查和性能审查共用地址公式}
+
+内存安全和性能经常使用同一套地址公式。安全审查问：访问是否在对象边界内，生命周期是否有效，对齐是否满足，类型访问是否合法。性能审查问：访问是否连续，步长是否友好，cache line 是否充分利用，是否有多余 load/store。二者都从同一条机器地址公式开始。
+
+例如：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rcx*12 + 8]
+\end{lstlisting}
+
+安全角度要问：\register{rcx} 是否在有效下标范围内？\code{+8} 是否确实是某个 4 字节字段？对象数组是否至少有 \code{rcx+1} 个元素？地址是否满足 4 字节对齐？性能角度要问：结构体步长 12 是否导致访问字段时 cache line 利用率怎样？若只读取这个字段，是否 SoA 更合适？scale 12 不能直接编码，前面是否有额外 \instruction{lea} 成本？同一条地址公式服务两个方向。
+
+\begin{keyidea}
+布局审查的核心是把 \code{sizeof}/\code{alignof}/\code{offsetof}、C++ 生命周期、ABI 规则和汇编地址公式连起来。只会算大小，不等于理解布局。
+\end{keyidea}
+
+\section{综合案例：一次字段重排引发的事故}
+
+假设项目中有一个参数块：
+
+\begin{lstlisting}[language=C++]
+struct KernelArgs {
+    const float* x;
+    const float* y;
+    float* out;
+    std::int64_t n;
+    std::int64_t stride;
+};
+\end{lstlisting}
+
+手写汇编按固定偏移读取字段：
+
+\begin{lstlisting}
+mov r8,  qword ptr [rdi + 0]   # x
+mov r9,  qword ptr [rdi + 8]   # y
+mov r10, qword ptr [rdi +16]   # out
+mov rcx, qword ptr [rdi +24]   # n
+mov r11, qword ptr [rdi +32]   # stride
+\end{lstlisting}
+
+后来有人为了“把整数放前面更清楚”，把结构体改成：
+
+\begin{lstlisting}[language=C++]
+struct KernelArgs {
+    std::int64_t n;
+    std::int64_t stride;
+    const float* x;
+    const float* y;
+    float* out;
+};
+\end{lstlisting}
+
+C++ wrapper 重新编译后，字段访问当然使用新 offset；但手写汇编仍然按旧 offset 读取。于是 \register{r8} 读到 \code{n}，被当成指针；\register{rcx} 读到 \code{y} 的地址，被当成长度。程序可能立即崩溃，也可能写坏内存。这个事故不是“汇编突然错了”，而是布局合同被静默改变。
+
+正确预防方式有三层。
+
+第一，在 C++ 头文件中写 \code{static_assert}：
+
+\begin{lstlisting}[language=C++]
+static_assert(sizeof(KernelArgs) == 40);
+static_assert(offsetof(KernelArgs, x) == 0);
+static_assert(offsetof(KernelArgs, y) == 8);
+static_assert(offsetof(KernelArgs, out) == 16);
+static_assert(offsetof(KernelArgs, n) == 24);
+static_assert(offsetof(KernelArgs, stride) == 32);
+\end{lstlisting}
+
+第二，在汇编文件注释中写字段表，让 reviewer 能看到偏移来自哪里。
+
+第三，把参数块视为 ABI。若必须改变布局，新增 \code{KernelArgsV2} 和新符号，而不是静默复用旧符号。
+
+\subsection{性能事故：字段重排也会改变 cache 行为}
+
+字段重排不只影响 correctness。假设热循环只读取 \code{x,y,out,n}，很少读取 \code{debug_counter} 和 \code{name_ptr}。如果冷字段夹在热字段中间，数组形式的参数块或对象数组可能浪费 cache line。反过来，把所有字段按大小排序虽然减少 padding，却可能把一起访问的字段拆散。布局优化不能只看 \code{sizeof}，还要看访问模式。
+
+一个布局报告应写：
+
+\begin{lstlisting}
+Correctness:
+    offsets fixed by static_assert
+
+ABI:
+    assembly reads documented offsets
+
+Performance:
+    hot fields x/y/out/n are read at function entry
+    cold fields are not in the hot loop
+
+Risk:
+    changing field order requires updating asm and ABI version
+\end{lstlisting}
+
+这类报告把布局从“内存大小问题”提升为“工程契约问题”。
+
+\section{深入讲解：对象、存储和值为什么要分开}
+
+C++ 底层学习中，最容易混淆的是对象、存储和值。存储是一段字节区域；对象是在某段存储中具有类型和生命周期的实体；值是按类型解释对象表示得到的抽象结果。三者相关，但不能互相替代。
+
+例如，\code{operator new} 返回一段原始存储，这段存储有地址和大小，但还没有构造出某个具体对象。placement new 可以在这段存储中开始对象生命周期。对象析构后，存储可能仍然存在，但对象生命周期结束。此时旧指针的地址值可能还指向同一段字节，但不能随意按旧类型解引用。
+
+这一区分对 allocator、arena、对象池、序列化和手写内存管理非常重要。很多 bug 不是“地址不对”，而是“地址仍然在，但对象已经不存在”或“存储复用了，但旧指针语义失效”。汇编只能看到地址和 load/store，看不到 C++ 生命周期。读底层代码时，必须把语言对象规则补回来。
+
+值也不是字节的唯一解释。同一组字节可以作为 \code{std::uint32_t}、\code{float} 位模式、四个字符或结构体字段的一部分。C++ 允许通过 \code{unsigned char} 或 \code{std::byte} 观察对象表示，但不允许随意把任意字节按任意类型访问。 \code{std::bit_cast} 和 \code{std::memcpy} 提供了更安全的位模式搬运方式。
+
+\subsection{为什么这会影响优化}
+
+编译器依赖对象生命周期和类型规则优化。若两个不同类型指针按规则不能别名，编译器可以重排 load/store；若对象生命周期已经结束，编译器不需要保留旧对象的值；若 signed overflow 未定义，编译器可以假设它不发生。底层程序员若只看硬件能不能读写某个地址，就会和编译器语义模型冲突。
+
+这就是为什么“我在机器上试过能跑”不是 C++ 合法性的证据。未定义行为可能在 \code{-O0} 下看起来正常，在 \code{-O3} 下被优化器利用前提后失败。底层教材必须同时讲机器字节和语言规则，否则读者会写出只在当前构建偶然工作的代码。
+
+\section{深入讲解：布局优化要先问访问模式}
+
+结构体字段重排可以减少 padding，但不一定提升性能。性能取决于访问模式。如果热循环总是同时读取字段 \code{x,y,z}，把它们放在一起有利；如果一个阶段只读所有 \code{x}，另一个阶段只读所有 \code{y}，SoA 可能更好；如果对象很大但每次只用一个字段，AoS 会浪费 cache line；如果对象需要频繁按 id 查找，哈希表或索引结构可能比字段排列更重要。
+
+布局优化应按步骤做：
+
+\begin{enumerate}
+  \item 写出 hot path 访问哪些字段。
+  \item 统计这些字段是一起访问，还是分阶段访问。
+  \item 计算对象大小、字段 offset 和每个 cache line 携带的有效数据。
+  \item 判断是否存在跨步访问、随机访问或 false sharing 风险。
+  \item 设计 AoS、SoA 或参数块版本，并用 benchmark 验证。
+\end{enumerate}
+
+不要只因为 \code{sizeof} 变小就宣布更快。对象变小通常有利于容量和带宽，但如果重排破坏了 ABI、增加了转换成本、让热字段分散，收益可能消失。布局是正确性、接口和性能共同决策。
+
+\section{深入讲解：指针不是整数的替代品}
+
+在很多机器上，指针值看起来就是一个整数地址；也可以把指针转换成 \code{std::uintptr_t} 做打印或某些底层操作。于是初学者容易以为指针就是整数。C++ 语义上，指针携带的不只是数值，还有指向对象的关系、可比较范围、可做指针运算的数组边界和解引用类型。
+
+例如，同一个数值地址，如果它不指向一个生命周期内的对象，就不能合法解引用。两个来自不同数组对象的指针，即使数值上可以比较大小，也不一定有定义良好的关系。指针加法按元素缩放，并且只在同一个数组对象及 one-past 范围内定义。把指针转成整数再转回来，也有实现相关边界，不能把它当成普通数学整数随意运算。
+
+这并不是语言故意复杂，而是为了让编译器能优化，也为了让程序有可移植语义。硬件只看到地址，编译器还要知道对象和类型。底层工程师需要同时理解两层：机器地址解释为什么某条 load 访问某个位置；C++ 指针规则解释这次访问是否定义良好。
+
+\subsection{什么时候可以看作地址}
+
+在调试和汇编阅读中，把指针值看作虚拟地址是必要的。你需要计算 \code{base + index * scale + displacement}，需要判断地址落在哪个映射，是否对齐，是否跨 cache line。这个层面上，指针确实表现为地址。
+
+但在写 C++ 源码时，不能把所有地址技巧都写成指针整数运算。若目的是观察字节，用 \code{std::byte} 或 \code{unsigned char} 视图；若目的是保存地址数值，用 \code{std::uintptr_t} 并承认平台边界；若目的是对象访问，用正确类型和生命周期；若目的是底层 allocator，用明确的构造和析构管理对象。不同目的应使用不同工具。
+
+\section{深入讲解：内存安全错误的共同形状}
+
+越界、use-after-free、未初始化读取、类型别名违规、未对齐访问、double free，看起来是不同 bug，但它们有共同结构：某次内存访问不满足有效访问条件。前文列出的五个条件可以作为统一诊断框架。
+
+第一，可访问存储区域。地址必须落在进程可访问映射中，且权限允许读或写。否则会发生 page fault 或保护错误。
+
+第二，对象生命周期。地址所在存储中必须有对应类型的活对象。free 后的内存、析构后的对象、未构造的 raw storage，都可能有地址但没有对象。
+
+第三，访问类型。用不允许的类型解释对象字节，可能违反别名规则。短期看可能读到预期字节，长期看会被优化器破坏。
+
+第四，对齐。某些类型和指令要求地址满足对齐。未对齐可能在 x86 上能执行但变慢，也可能在其他平台异常。向量指令和原子操作尤其要注意。
+
+第五，边界。地址范围必须落在对象或数组有效范围内。访问一个元素前后的 padding、相邻对象或分配器元数据，即使硬件能读，也不是合法 C++ 对象访问。
+
+把内存 bug 归到这五类，排查会更清楚。比如段错误通常先看可访问存储和边界；ASan use-after-free 指向生命周期；奇怪的优化后错误可能来自别名或未定义行为；特定 SIMD 指令崩溃可能来自对齐；大输入才失败可能来自整数溢出导致边界错误。
+
+\subsection{反汇编阅读清单}
+
+看到一条内存操作时，按下面清单写笔记：
+
+\begin{enumerate}
+  \item 这条指令是 load 还是 store？
+  \item 访问宽度是多少：\code{byte}、\code{word}、\code{dword}、\code{qword}、\code{xmmword} 还是 \code{ymmword}？
+  \item base 寄存器可能是哪一个指针或对象起点？
+  \item index 寄存器现在是元素下标，还是已经被 \instruction{shl}/\instruction{lea} 变成字节偏移？
+  \item scale 来自元素大小、字段数组大小，还是地址计算的中间步骤？
+  \item displacement 是结构体字段 offset、固定下标、栈槽偏移，还是全局对象偏移？
+  \item 如果有前置 \instruction{lea}，它把下标乘成了多少？
+  \item 这次访问落到一个 cache line 内，还是可能跨 cache line？
+\end{enumerate}
+
+\begin{keyidea}
+offset 和 scale 是数据布局在汇编里的影子；\instruction{shl} 和 \instruction{lea} 则经常是“影子被折叠之前”的地址计算过程。读 AI 算子汇编时，先恢复地址公式，再讨论 SIMD、cache、带宽和流水线。
+\end{keyidea}
+
+\section{深入讲解：对象、存储和生命周期是优化边界}
+
+内存章节容易被误读成“会算地址就够了”。地址当然重要，但 C++ 程序中的内存访问从来不只是地址算术。一个访问是否合法，至少要同时满足存储存在、对象生命周期存在、类型访问规则允许、对齐满足、范围没有越界这几类条件。编译器正是依据这些条件优化程序。若程序违反条件，机器上偶尔跑出结果也不能反过来证明代码合法。
+
+对象和存储的区别尤其关键。存储是一段字节区域，可以来自自动变量、静态对象、堆分配、内存映射或外部缓冲。对象是在某段存储中按某种类型和生命周期建立起来的实体。分配了足够字节，不等于其中已经有目标类型对象；对象生命周期结束，也不等于字节立刻消失。很多底层错误就发生在“字节还在，所以对象也还在”的错误想法里。
+
+优化器关心这些边界，因为它必须判断两个访问是否可能指向同一对象，某个 load 是否可以复用旧值，某个 store 是否会影响后续读取，某个对象是否可能被外部函数改动。严格别名、有效类型、生命周期、逃逸和可见副作用都会进入判断。读者不需要在第一册背完所有标准条款，但必须建立一个原则：语言层合法性不是装饰，它会直接改变机器码。
+
+\subsection{安全观察字节不等于任意解释字节}
+
+通过 \code{std::byte}、\code{unsigned char} 或 \code{std::memcpy} 观察对象表示，是学习布局和字节序的常用方法。这种观察通常是安全的，因为语言允许以字节方式查看对象表示。但把同一段字节强行当成另一个无关类型对象来解引用，就进入了另一类问题。前者是在看表示，后者是在声明“这里有一个这种类型的对象，并按这种类型访问它”。
+
+例如把一个整数对象的地址转成浮点指针后解引用，不只是解释方式变了，还可能违反类型访问规则和对齐要求。即使某次运行打印出某个浮点数，也不能说明程序定义良好。正确做法通常是用 \code{std::bit_cast} 在值层面表达位模式转换，或用 \code{std::memcpy} 把字节复制到目标类型对象中。这样写不仅更安全，也让编译器更清楚你的意图。
+
+padding 也需要谨慎。结构体中的 padding 字节是布局的一部分，但它们未必具有稳定值。两个逻辑字段相等的对象，padding 可能不同。因此，用 \code{memcmp} 比较含 padding 的结构体作为逻辑相等判断通常是错误的。反过来，在二进制协议或文件格式中，如果你希望字节级稳定，就必须显式定义每个字段、填充、字节序和版本，而不能把普通 C++ 结构体直接当作外部格式。
+
+\section{课堂讲解：布局决策要从访问模式反推}
+
+结构体字段顺序、数组组织方式、对齐策略和指针关系，不能只按“看起来整齐”决定。布局首先服务访问模式。一个程序如果总是同时读取同一对象的多个字段，AoS 可能直观且局部性较好；如果程序经常只扫描某一个字段，SoA 往往能减少无用字节搬运，并给向量化创造条件。若访问模式会在不同阶段变化，还可能需要分阶段布局或转换成本分析。
+
+以粒子更新为例。若每一步都读取并更新位置、速度和质量，单个对象集中存放便于代码表达，也减少索引管理。但若渲染阶段只需要位置，物理阶段只需要速度和质量，统计阶段只扫描质量，把所有字段绑在一个大结构体里会让 cache line 携带大量当前阶段不需要的数据。性能问题不是“结构体慢”或“数组快”，而是每次 cache line 搬运中有效字节比例是多少。
+
+布局还影响 ABI 和兼容性。对公开头文件中的结构体重新排序字段，可能改变 \code{sizeof}、\code{alignof}、字段 offset 和调用约定。如果这个结构体跨动态库边界、文件格式边界或网络协议边界，改字段顺序就不再是内部优化，而是破坏接口。即使只在单个程序内部，布局变化也可能改变序列化、调试脚本、二进制补丁、汇编互操作和性能测试结果。
+
+\subsection{从 cache line 角度估算有效载荷}
+
+初步布局分析可以从 cache line 有效载荷开始。假设 cache line 是 64 字节，一个结构体大小为 64 字节，其中热循环只读取 8 字节字段。顺序扫描时，每条 cache line 只提供 8 字节有用数据，有效载荷比例大约是八分之一。若把这个热字段拆成独立数组，同样一条 cache line 可以容纳 8 个元素，扫描效率明显不同。
+
+这个估算不是最终结论，因为真实性能还受预取、写回、TLB、分支、向量化和并发影响。但它是很好的第一性检查。若一个布局让绝大多数搬运字节都无用，就必须有其他理由支持它，例如减少间接访问、保持对象封装、降低转换成本或满足 ABI 稳定。工程决策不是只追求某个单点 benchmark，而是在清楚成本后选择。
+
+\subsection{对齐不是越大越好}
+
+对齐可以让硬件访问更自然，也可能满足 SIMD 或原子操作要求。但过度对齐会增加对象大小、浪费 cache、扩大工作集。一个 24 字节对象如果因为某个字段或手动对齐变成 64 字节，顺序数组的内存占用可能接近三倍。若程序瓶颈在内存带宽或 cache 容量，这种变化会明显伤害性能。
+
+因此，对齐决策要回答三个问题：目标硬件或指令是否要求这种对齐；不对齐时代价是否真的可见；增加的 padding 是否会扩大热工作集。很多时候，自然对齐已经足够。需要更高对齐时，应把它局限在真正的热数组、DMA 缓冲、SIMD 数据块或并发共享结构上，并用 benchmark 验证。
+
+\section{综合案例：一次字段重排为什么会引发线上问题}
+
+设想一个项目中有结构体表示请求记录，字段包括用户标识、时间戳、状态码、若干标志位和一个指向扩展信息的指针。有人为了减少 padding，把字段重新排序，本地单元测试全部通过，简单 benchmark 也略快。上线后，一个旧版本插件开始读取错误字段，日志解析脚本也把状态码解释成时间戳的一部分。
+
+这个事故的根因不是“字段重排不好”，而是没有区分内部布局和外部合同。如果结构体只在一个翻译单元内部使用，字段重排通常是可控优化；如果它出现在公共头文件、共享库接口、二进制日志、内存映射文件、插件接口或手写汇编中，它就是 ABI 和数据格式的一部分。任何变化都需要版本化、兼容层或同步升级。
+
+排查这类问题时，要建立四层证据。第一层是源码差异，确认字段顺序、类型和对齐属性变化。第二层是编译期证据，用 \code{sizeof}、\code{alignof} 和 \code{offsetof} 打印布局。第三层是二进制证据，检查访问指令中的 displacement 是否改变。第四层是边界证据，确认哪些外部模块、文件或脚本依赖旧 offset。只有四层合起来，才能判断这是性能优化、接口破坏，还是两者同时发生。
+
+\section{内存相关改动的审查方法}
+
+任何涉及指针、布局、生命周期、别名或缓冲区大小的改动，都应该按审查清单处理。第一，明确对象所有权：谁创建对象，谁结束生命周期，谁可以保存指针或引用。第二，明确范围：每个指针能访问多少元素，长度单位是字节还是元素，边界是否包含尾端。第三，明确类型：是否通过合法类型访问对象，是否需要字节级观察，是否存在违反别名规则的转换。
+
+第四，明确对齐：对象地址是否满足目标类型要求，手写汇编或 SIMD 是否额外要求对齐。第五，明确布局：字段 offset 是否被外部依赖，padding 是否影响比较、序列化或哈希。第六，明确并发：是否有另一个线程可能同时读写同一存储，原子性和内存顺序是否定义清楚。第七，明确测量：若改动声称提升性能，是否给出正确性、反汇编和输入规模证据。
+
+这份清单看起来严格，但它能防止许多高成本错误。内存 bug 的危险在于它们常常不稳定：Debug 下不复现，Release 下偶发；小输入不复现，大输入崩溃；本机不复现，换编译器后出现。审查越早把边界写清楚，后面用工具定位的成本越低。
+
+\section{分配器和对象所有权的第一层模型}
+
+本章主要讲对象、字节和布局，但真实程序中的内存还涉及分配器。分配器负责把较大的虚拟内存区域切分成可用块，并在释放后复用。程序员看到的指针通常指向用户可用区域，分配器还可能在附近保存元数据。越界写有时没有立刻崩溃，是因为写到了相邻对象或分配器元数据；下一次分配或释放才暴露问题。
+
+所有权模型是理解堆内存的第一步。一个对象由谁创建，谁负责销毁，谁只是借用，谁能延长生命周期，谁可以跨线程保存指针，都必须清楚。C++ 的 RAII、智能指针、容器和 span 都是在表达所有权或借用关系。裸指针本身不表达所有权；它只表示一个地址和访问类型。底层代码可以使用裸指针，但接口文档要补足所有权语义。
+
+arena 或 pool 分配器常用于性能场景，因为它们能减少单个对象分配成本，提高局部性，并让批量释放更便宜。但 arena 也改变生命周期模型：单个对象可能不再单独析构，指针在 arena reset 后全部失效。若把 arena 分配出的对象指针保存到 arena 外部，就会产生悬空访问。性能优化不能绕过生命周期说明。
+
+\subsection{释放后地址仍然像地址}
+
+use after free 的迷惑性在于，释放后的指针值通常仍然是一个看起来合理的地址。硬件不知道这个地址曾经属于哪个 C++ 对象；分配器也可能暂时没有复用这块内存。所以程序可能在测试中继续读到旧值。语言层却已经结束了对象生命周期，继续访问就是错误。
+
+ASan 能把这类错误变得更容易观察，因为它会在释放后标记内存状态，并在访问时报告。但 ASan 改变内存布局和性能，不应把 ASan 下的时间数字当成发布性能。功能诊断和性能测量要分开。这正是第 4 章工具边界和第 15 章测量边界的交叉点。
+
+\section{布局演化：内部优化和外部格式要分开}
+
+一个常见工程原则是：内部布局可以为了性能演化，外部格式必须稳定并版本化。内部布局指进程内临时结构体、热循环数据组织、缓存友好的 SoA 数组。外部格式指文件、网络协议、共享内存、数据库记录、插件 ABI、动态库公共结构体。把普通 C++ 结构体直接当作外部格式，短期方便，长期危险。
+
+外部格式应该显式定义字段宽度、字节序、对齐、版本和保留字段。读取时把外部字节解析成内部对象，写出时再从内部对象序列化。这样内部布局可以按访问模式优化，不会破坏历史数据。性能敏感时，可以设计专门的 packed wire format 和内部 hot layout，并测量转换成本，而不是让一个结构体同时承担所有职责。
+
+内部布局也不应随意改。热路径布局变化需要 benchmark，ABI 边界布局变化需要兼容审查，调试和运维工具依赖 offset 时需要同步更新。布局不是纯代码风格，它既是性能选择，也是接口选择。
+
+\section{AoS、SoA 和混合布局的教学案例}
+
+假设有一百万个点，每个点有 \code{x}、\code{y}、\code{z} 和 \code{color}。渲染阶段只需要位置，统计阶段只需要 \code{z}，调试阶段需要完整对象打印。AoS 写起来最自然，每个点一个结构体；SoA 把每个字段放成独立数组；混合布局可以把热字段放在一起，把冷字段放到旁表。
+
+选择时先列访问矩阵：每个阶段读取哪些字段，是否顺序扫描，是否随机访问，是否写入，是否需要同时传给外部 API。若大部分热循环只读取 \code{x}、\code{y}、\code{z}，把 \code{color} 和调试字段放进同一 cache line 就浪费带宽。若外部 API 要求数组结构体，完全 SoA 可能增加转换成本。混合布局往往是工程折中。
+
+这类案例不能只靠口号决定。报告应包含结构体大小、字段 offset、cache line 有效载荷估算、关键循环汇编和 benchmark。若 SoA 版本快，要说明是减少无用字节、改善向量化、降低 stride，还是其他原因。若 AoS 版本更快，也要解释是否因为转换成本、预取、对象封装或输入规模较小。教材的目标不是让读者永远选择某一种布局，而是学会推导。
+
+\section{内存章节的学习输出}
+
+学完本章后，建议读者整理三份产物。第一份是布局报告：选择两个结构体，打印 \code{sizeof}、\code{alignof}、\code{offsetof}，解释 padding 来源，并说明字段重排是否安全。第二份是地址公式报告：从一个数组或结构体访问的汇编中恢复 base、index、scale、displacement，并映射回源码。第三份是内存安全报告：选择一个越界、use after free 或别名错误，用工具证明它属于哪一类。
+
+这三份产物分别训练布局、汇编和语义。只会打印地址不够，只会读汇编也不够，只会运行 sanitizer 也不够。内存能力来自三者合一：知道对象在语言层是什么，知道字节在机器层怎么访问，知道工具如何证明错误。
+
+\section{内存模型和性能模型不要混淆}
+
+内存安全讨论和性能讨论经常使用同一些词，例如地址、对象、cache line、对齐、别名，但它们回答的问题不同。内存模型首先问访问是否合法：对象是否存在、类型是否允许、范围是否正确、生命周期是否有效。性能模型问访问成本如何：是否连续、是否复用、是否跨 cache line、是否命中、是否能预取。合法访问也可能很慢，非法访问也可能在某次运行中看起来很快。
+
+例如越界读取相邻对象，硬件可能顺利返回一个值，性能甚至很好，但语言层已经错误。又例如按合法方式随机访问大数组，程序完全正确，却可能因为 cache 和 TLB 成本很高而慢。把这两类问题混在一起，会导致危险结论：用“跑得快”证明合法，或用“合法”证明高效。
+
+工程报告应先写合法性，再写性能。先证明指针、范围、生命周期和类型成立；再讨论地址模式、工作集和 cache。若合法性不成立，性能结论停止。若合法性成立但性能差，再进入布局和访问模式分析。这条顺序贯穿后面的汇编和 benchmark 章节。
+
+\section{调试内存问题时的证据组合}
+
+内存问题很少只靠一种证据解决。ASan 可以指出越界或释放后使用，GDB 可以显示崩溃现场，\code{objdump} 可以说明访问宽度和地址公式，\code{sizeof} 和 \code{offsetof} 可以证明布局，\filepath{/proc/<pid>/maps} 可以说明地址属于哪个映射，日志和输入可以说明路径条件。把这些证据组合起来，才能从“某地址崩溃”走到“哪个对象、哪个字段、哪条路径、哪个前置条件失败”。
+
+如果只看崩溃地址，可能误判根因；只看源码，可能忽略优化后的访问；只看 sanitizer，可能不知道发布构建中的二进制形态；只看 benchmark，可能把内存错误当成性能差异。内存章节要求读者多工具交叉验证，就是为了避免单点误判。
+
+\section{综合案例：把结构体改小以后为什么反而变慢}
+
+结构体变小通常有利于 cache，但不是绝对。假设一个结构体原来 32 字节，字段自然对齐；优化后通过压缩字段和重新排序变成 24 字节。理论上每个 cache line 能容纳更多对象，但 benchmark 却显示某个热循环变慢。此时不能简单说“cache 理论错了”，而要继续拆。
+
+第一种可能是对齐变化。原来某个热字段在 8 字节对齐位置，改动后变成跨边界访问或需要额外指令组合。第二种可能是访问模式变化。若循环每次访问两个相邻对象的某些字段，24 字节步长可能让访问跨 cache line 的模式更复杂。第三种可能是编译器向量化受影响。字段排列改变后，load/store 组合、别名判断或对齐假设不同，机器码可能变差。第四种可能是 benchmark 输入规模正好落在不同 cache 层级边界，导致比较不稳定。
+
+分析这类问题需要四份证据：布局报告，确认 \code{sizeof}、\code{alignof} 和 offset；反汇编报告，确认访问指令和地址公式；输入规模扫描，确认趋势是否稳定；正确性检查，确认压缩字段没有截断语义。只有这些证据齐备，才能判断结构体变小到底是好是坏。
+
+\section{内存设计的长期维护问题}
+
+内存布局一旦进入公共接口，就会变成长期承诺。项目早期为了方便暴露结构体字段，后期可能发现无法重排；为了性能使用裸指针数组，后期可能发现所有权难以追踪；为了快速序列化直接写结构体字节，后期可能被字节序、padding 和版本升级困住。内存设计的代价经常延后出现。
+
+因此，设计时要区分热路径内部布局和长期稳定边界。内部布局可以频繁实验，用 benchmark 验证；外部边界要保守、版本化、文档化。性能工程不是把所有东西都暴露给底层优化，而是让需要优化的部分有自由度，让需要稳定的部分有合同。
+
+\section{实验：打印地址并区分存储期}
+
+\begin{labbox}
+创建 \filepath{labs/ch03_data_layout/address_map.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdlib>
+#include <iostream>
+#include <memory>
+
+int global_x = 1;
+
+int main()
+{
+    static int static_x = 2;
+    int stack_x = 3;
+    auto heap_x = std::make_unique<int>(4);
+
+    std::cout << "&global_x = " << &global_x << '\n';
+    std::cout << "&static_x = " << &static_x << '\n';
+    std::cout << "&stack_x  = " << &stack_x << '\n';
+    std::cout << "heap_x    = " << heap_x.get() << '\n';
+
+    int stack_arr[4] = {1, 2, 3, 4};
+    for (int i = 0; i < 4; ++i) {
+        std::cout << "&stack_arr[" << i << "] = "
+                  << &stack_arr[i] << '\n';
+    }
+}
+\end{lstlisting}
+
+编译运行：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O0 -g address_map.cpp -o address_map
+./address_map
+./address_map
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 记录两次运行的地址，说明哪些地址变化明显。
+  \item 解释栈数组相邻元素地址差值为什么等于 \code{sizeof(int)}。
+  \item 说明这些地址为什么是虚拟地址，不应直接理解为物理内存地址。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：对象字节、字节序和 \code{std::bit_cast}}
+
+\begin{labbox}
+创建 \filepath{labs/ch03_data_layout/dump_bytes.cpp}，实现一个通用 \code{dump_bytes}：
+
+\begin{lstlisting}[language=C++]
+#include <bit>
+#include <cstdint>
+#include <cstring>
+#include <iomanip>
+#include <iostream>
+#include <type_traits>
+
+template <class T>
+void dump_bytes(char const* name, T const& value)
+{
+    static_assert(std::is_trivially_copyable_v<T>);
+
+    auto const* p = reinterpret_cast<unsigned char const*>(&value);
+    std::cout << name << " (" << sizeof(T) << " bytes): ";
+    for (std::size_t i = 0; i < sizeof(T); ++i) {
+        std::cout << std::hex << std::setw(2) << std::setfill('0')
+                  << static_cast<unsigned>(p[i]) << ' ';
+    }
+    std::cout << std::dec << '\n';
+}
+
+struct A {
+    char c;
+    int x;
+};
+
+int main()
+{
+    std::uint32_t u = 0x12345678U;
+    float f = 1.0f;
+    A a{'Z', 0x12345678};
+
+    dump_bytes("u", u);
+    dump_bytes("f", f);
+    dump_bytes("a", a);
+
+    auto f_bits = std::bit_cast<std::uint32_t>(f);
+    dump_bytes("f_bits", f_bits);
+}
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 标出 \code{u} 的小端字节序。
+  \item 解释 \code{A} 中哪些字节是字段，哪些可能是 padding。
+  \item 比较 \code{f} 和 \code{f_bits} 的输出，说明 \code{bit_cast} 的含义。
+  \item 用 \code{-O0} 和 \code{-O3} 都运行一次，观察输出是否变化。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：手工预测结构体布局}
+
+\begin{labbox}
+对下面结构体，先手工预测 \code{sizeof}、\code{alignof} 和每个字段 offset，再写程序验证：
+
+\begin{lstlisting}[language=C++]
+struct S1 {
+    char a;
+    int b;
+    double c;
+    char d;
+};
+
+struct S2 {
+    double c;
+    int b;
+    char a;
+    char d;
+};
+
+struct S3 {
+    char tag;
+    float x;
+    float y;
+    float z;
+};
+\end{lstlisting}
+
+验证程序必须使用：
+
+\begin{lstlisting}[language=C++]
+sizeof(T)
+alignof(T)
+offsetof(T, field)
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 每个结构体的布局表。
+  \item 手工预测和实际输出的对比。
+  \item 解释字段重排为什么改变或没有改变 \code{sizeof}。
+  \item 说明如果这些结构体已经写入二进制文件，为什么不能随便重排字段。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：指针加法和汇编寻址模式}
+
+\begin{labbox}
+创建 \filepath{labs/ch03_data_layout/pointer_scale.cpp}。本实验不是只看一条 load 指令，而是训练你把源码、结构体布局、汇编寻址和具体地址模拟连起来。
+
+\begin{lstlisting}[language=C++]
+#include <cstddef>
+#include <cstdint>
+
+extern "C" int load_int(int const* p, int i)
+{
+    return p[i];
+}
+
+extern "C" double load_double(double const* p, int i)
+{
+    return p[i];
+}
+
+struct Pair {
+    int a;
+    int b;
+};
+
+extern "C" int load_pair_b(Pair const* p, int i)
+{
+    return p[i].b;
+}
+
+struct Pixel {
+    std::uint8_t r;
+    std::uint8_t g;
+    std::uint8_t b;
+    std::uint8_t a;
+};
+
+extern "C" std::uint8_t load_pixel_b(Pixel const* p, std::size_t i)
+{
+    return p[i].b;
+}
+
+struct Vec4 {
+    float x;
+    float y;
+    float z;
+    float w;
+};
+
+extern "C" float load_vec4_z(Vec4 const* p, std::size_t i)
+{
+    return p[i].z;
+}
+
+extern "C" int load_2d(int const (*a)[5], std::size_t i, std::size_t j)
+{
+    return a[i][j];
+}
+\end{lstlisting}
+
+生成汇编：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -S -masm=intel pointer_scale.cpp -o pointer_scale.s
+clang++ -std=c++20 -O3 -c pointer_scale.cpp -o pointer_scale.o
+objdump -d -Mintel pointer_scale.o > pointer_scale.objdump.txt
+\end{lstlisting}
+
+如果系统上没有 GNU \code{objdump}，可以尝试：
+
+\begin{lstlisting}[language=bash]
+llvm-objdump -d --x86-asm-syntax=intel pointer_scale.o > pointer_scale.objdump.txt
+\end{lstlisting}
+
+第一部分交付物：为每个函数写一张汇编阅读表。
+
+\begin{center}
+\begin{tabular}{p{0.19\linewidth}p{0.18\linewidth}p{0.16\linewidth}p{0.16\linewidth}p{0.18\linewidth}}
+\toprule
+函数 & load 指令 & base & index/scale & displacement \\
+\midrule
+\code{load_int} & 你填写 & 你填写 & 你填写 & 你填写 \\
+\code{load_double} & 你填写 & 你填写 & 你填写 & 你填写 \\
+\code{load_pair_b} & 你填写 & 你填写 & 你填写 & 你填写 \\
+\code{load_pixel_b} & 你填写 & 你填写 & 你填写 & 你填写 \\
+\code{load_vec4_z} & 你填写 & 你填写 & 你填写 & 你填写 \\
+\code{load_2d} & 你填写 & 你填写 & 你填写 & 你填写 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第二部分交付物：为每个函数写地址公式。格式必须像下面这样明确：
+
+\begin{lstlisting}
+load_pair_b:
+    sizeof(Pair) = 8
+    offset(Pair, b) = 4
+    addr(p[i].b) = base + i * 8 + 4
+
+load_vec4_z:
+    sizeof(Vec4) = 16
+    offset(Vec4, z) = 8
+    addr(p[i].z) = base + i * 16 + 8
+\end{lstlisting}
+
+第三部分交付物：选择三个函数做具体地址模拟。至少包含一个 scale 为 4 或 8 的例子、一个结构体字段例子、一个需要 \instruction{shl} 或 \instruction{lea} 的例子。
+
+示例格式：
+
+\begin{lstlisting}
+Function: load_pixel_b
+Assume:
+    rdi = 0x3000
+    rsi = 5
+Formula:
+    addr(p[i].b) = 0x3000 + 5 * 4 + 2
+                 = 0x3016
+Access:
+    load 1 byte from 0x3016
+\end{lstlisting}
+
+第四部分交付物：记录目标文件中的机器码字节。报告里必须贴出每个函数的反汇编片段，例如：
+
+\begin{lstlisting}
+0000000000000000 <load_int>:
+   0:  48 63 f6              movsxd rsi, esi
+   3:  8b 04 b7              mov    eax,DWORD PTR [rdi+rsi*4]
+   6:  c3                    ret
+\end{lstlisting}
+
+如果你的机器生成的指令不同，不要照抄本书示例。你要解释自己的编译器为什么可能选择不同指令，例如用 \instruction{lea}、\instruction{movsxd}、\instruction{shl}、不同寄存器或不同指令顺序。
+
+最终报告必须回答：
+
+\begin{enumerate}
+  \item 哪些函数的元素大小可以直接放进 scale？
+  \item 哪些函数需要额外地址计算？额外地址计算由哪条指令完成？
+  \item 哪些 displacement 来自字段 offset？
+  \item \instruction{movzx} 和普通 \instruction{mov} 在 \code{std::uint8_t} 返回值中有什么区别？
+  \item \instruction{movss} 和 \instruction{movsd} 分别对应什么标量浮点类型？
+  \item \code{load_2d} 的行长 5 如何进入汇编？
+  \item 修改 \code{Pair} 字段顺序或添加字段后，\code{sizeof(Pair)}、字段 offset 和汇编如何变化？
+\end{enumerate}
+\end{labbox}
+
+\section{实验：别名假设如何改变汇编}
+
+\begin{labbox}
+目标：观察同一个循环在“可能别名”和“承诺不别名”两种接口下，编译器生成的汇编是否不同。本实验不要求你得出绝对性能结论，只要求你用反汇编说明编译器掌握了哪些信息。
+
+创建 \filepath{labs/ch03_data_layout/alias_effect.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstddef>
+
+extern "C" void saxpy_maybe_alias(float* y,
+                                  float const* x,
+                                  float a,
+                                  std::size_t n)
+{
+    for (std::size_t i = 0; i < n; ++i) {
+        y[i] = y[i] + a * x[i];
+    }
+}
+
+extern "C" void saxpy_restrict(float* __restrict y,
+                               float const* __restrict x,
+                               float a,
+                               std::size_t n)
+{
+    for (std::size_t i = 0; i < n; ++i) {
+        y[i] = y[i] + a * x[i];
+    }
+}
+\end{lstlisting}
+
+生成汇编和目标文件：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -march=native -S -masm=intel alias_effect.cpp -o alias_effect.s
+clang++ -std=c++20 -O3 -march=native -c alias_effect.cpp -o alias_effect.o
+objdump -drwC -Mintel alias_effect.o > alias_effect.objdump.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 比较两个函数入口附近是否存在指针范围比较或运行时别名检查。
+  \item 比较两个函数主循环是否出现向量 load/store 或展开。
+  \item 记录每个函数中对 \code{x[i]} 和 \code{y[i]} 的 load/store 指令。
+  \item 解释 \code{__restrict} 给编译器承诺了什么，以及调用者违反承诺会有什么风险。
+  \item 把结论写成“汇编证据”，不要写成“某版本一定更快”。若要谈性能，必须另做 benchmark。
+\end{enumerate}
+
+可选扩展：去掉 \code{-march=native}、改用 GCC、或者把 \code{float} 改成 \code{double}，观察汇编形态是否变化。报告里要说明工具链和参数，因为自动向量化高度依赖编译器版本、目标 CPU 和优化开关。
+\end{labbox}
+
+\section{实验：AoS 与 SoA 的第一次 benchmark}
+
+\begin{labbox}
+实现两个版本，计算所有粒子 \code{x} 坐标之和。
+
+\begin{lstlisting}[language=C++]
+struct Particle {
+    float x;
+    float y;
+    float z;
+    float mass;
+};
+
+float sum_x_aos(Particle const* p, std::size_t n)
+{
+    float s = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        s += p[i].x;
+    }
+    return s;
+}
+
+float sum_x_soa(float const* x, std::size_t n)
+{
+    float s = 0.0f;
+    for (std::size_t i = 0; i < n; ++i) {
+        s += x[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 使用相同的 \code{x} 数据初始化 AoS 和 SoA。
+  \item 至少测试 \code{n = 1024}、\code{n = 1048576}、\code{n = 67108864}。
+  \item 每个规模重复运行至少 20 次。
+  \item 防止结果被编译器优化掉。
+  \item 输出最小值、中位数、最大值。
+  \item 查看 \code{-O3} 汇编，记录是否自动向量化。
+\end{enumerate}
+
+报告必须回答：
+
+\begin{enumerate}
+  \item 哪个版本更快？是否所有规模都一样？
+  \item 从 cache line 利用率解释结果。
+  \item 从汇编解释编译器是否生成了不同访问形态。
+  \item 如果同时使用 \code{x,y,z,mass}，你的结论是否可能改变？
+\end{enumerate}
+\end{labbox}
+
+\section{本章作业}
+
+\begin{exercisebox}
+\subsection*{作业 1：字节级对象报告}
+
+选择 5 个对象：
+
+\begin{itemize}
+  \item 一个 \code{std::uint32_t}。
+  \item 一个负的 \code{std::int32_t}。
+  \item 一个 \code{float}。
+  \item 一个含 padding 的结构体。
+  \item 一个你自己设计的嵌套结构体。
+\end{itemize}
+
+对每个对象提交：
+
+\begin{enumerate}
+  \item 源码定义。
+  \item \code{sizeof} 和 \code{alignof}。
+  \item 字节 dump。
+  \item 手工解释每个字段或位模式。
+  \item 哪些字节不应该被当作稳定语义值。
+\end{enumerate}
+
+\subsection*{作业 2：结构体布局优化设计}
+
+设计一个结构体表示简化版神经网络张量元数据，至少包含：
+
+\begin{itemize}
+  \item 数据指针。
+  \item 维度数量。
+  \item 4 个维度。
+  \item 4 个 stride。
+  \item dtype。
+  \item flags。
+  \item 引用计数或状态字段。
+\end{itemize}
+
+提交两个版本：
+
+\begin{enumerate}
+  \item 直觉字段顺序版本。
+  \item 经过布局推导优化后的版本。
+\end{enumerate}
+
+要求给出每个版本的 \code{sizeof}、字段 offset、padding 分析，并解释你是为了减小大小、改善 cache 局部性，还是为了 ABI 可读性做取舍。
+
+\subsection*{作业 3：指针和地址推导题}
+
+假设：
+
+\begin{lstlisting}[language=C++]
+struct P {
+    float x;
+    float y;
+    float z;
+    float w;
+};
+
+P* p = reinterpret_cast<P*>(0x1000);
+\end{lstlisting}
+
+在 \code{sizeof(P) == 16} 的前提下，手工计算：
+
+\begin{enumerate}
+  \item \code{&p[0].x}
+  \item \code{&p[0].z}
+  \item \code{&p[3]}
+  \item \code{&p[3].w}
+  \item \code{reinterpret_cast<char*>(p) + 3}
+\end{enumerate}
+
+然后写程序在真实数组上验证相对偏移。报告中必须明确区分元素偏移和字节偏移。
+
+\subsection*{作业 4：行为分类}
+
+判断下列行为属于 well-defined、implementation-defined、unspecified 还是 undefined，并解释原因：
+
+\begin{enumerate}
+  \item 读取 \code{std::uint32_t} 的对象字节。
+  \item 有符号 \code{int} 溢出。
+  \item 无符号 \code{uint32_t} 溢出。
+  \item 访问 \code{a[n]}，其中数组合法下标为 \code{0..n-1}。
+  \item 用 \code{std::bit_cast<std::uint32_t>(float_value)} 读取位模式。
+  \item 用 \code{reinterpret_cast<double*>(&int_obj)} 后解引用。
+  \item 比较两个含 padding 的结构体对象的 \code{memcmp} 结果。
+  \item 打印指针值并观察 ASLR 导致每次运行不同。
+\end{enumerate}
+
+\subsection*{作业 5：别名与向量化观察}
+
+基于前面的别名观察实验，另外设计一个三数组循环：
+
+\begin{lstlisting}[language=C++]
+z[i] = x[i] + y[i]
+\end{lstlisting}
+
+分别写可能别名版本和 restrict 风格版本，生成 \code{-O3} 汇编。报告必须包含：
+
+\begin{itemize}
+  \item 函数签名和你给编译器的别名信息。
+  \item 是否出现运行时别名检查。
+  \item 是否出现向量化主循环。
+  \item 指令中每次迭代的 load/store 数量。
+  \item 为什么不能在调用者可能传入重叠区间时谎称 restrict。
+\end{itemize}
+
+\subsection*{作业 6：小型性能报告}
+
+完成 AoS vs SoA benchmark。报告不少于 2000 字，必须包括：
+
+\begin{itemize}
+  \item 机器信息。
+  \item 编译器和参数。
+  \item 数据规模和初始化方式。
+  \item correctness 验证方式。
+  \item benchmark 方法。
+  \item 汇编证据。
+  \item 时间结果表。
+  \item 用 cache line 利用率解释的性能模型。
+  \item 至少一个失败或反直觉观察。
+\end{itemize}
+\end{exercisebox}
+
+\section{验收标准}
+
+完成本章后，你应该能做到：
+
+\begin{itemize}
+  \item 解释位、字节、对象表示、类型和值之间的关系。
+  \item 读懂小端内存 dump。
+  \item 区分无符号回绕、有符号补码表示和 C++ 有符号溢出 UB。
+  \item 从 \code{a[i]} 推导出地址计算。
+  \item 从 x86-64 内存操作数识别 base、index、scale、displacement。
+  \item 手工推导简单结构体的 offset、padding、\code{sizeof} 和 \code{alignof}。
+  \item 知道如何安全观察对象字节，什么时候应使用 \code{std::bit_cast} 或 \code{std::memcpy}。
+  \item 解释别名和对象生命周期为什么影响编译器优化。
+  \item 用 cache line 利用率初步解释连续访问、步长访问、随机访问、AoS 和 SoA 的性能差异。
+\end{itemize}
+
+如果你能做到这些，第二册里的 cache、AoS/SoA、SIMD load/store、GEMM blocking 和 AI 算子布局优化，才会真正建立在可推导的基础上，而不是建立在经验口号上。

@@ -2,6 +2,7 @@
 
 int main()
 {
-    std::cout << "Hello, World!" << std::endl;
+    std::cout << "Technical book workspace" << '\n';
+    std::cout << "Current book: books/cpu-volume-1" << '\n';
     return 0;
 }

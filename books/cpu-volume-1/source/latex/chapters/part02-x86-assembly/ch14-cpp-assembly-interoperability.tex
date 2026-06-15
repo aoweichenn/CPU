@@ -1,0 +1,3116 @@
+\chapter{C++ 与汇编互操作}
+
+\section{问题与目标}
+
+上一章讲清楚了 System V AMD64 ABI：参数放在哪里、返回值放在哪里、哪些寄存器要保存、栈如何对齐。这些规则看似只是表格，但真正价值会在工程边界上体现出来：一个 C++ 文件如何调用手写汇编？手写汇编如何再调用 C++ helper？链接器如何把两个目标文件连接到一起？内联汇编为什么经常比表面上更危险？为什么同样一条 \instruction{call}，在目标文件里还没有最终地址，链接之后才变成真实跳转？
+
+本章把“能读汇编”推进到“能设计可维护、可测试、可审计的汇编边界”。你需要掌握的不只是语法，而是一套从声明到二进制证据的工程流程：
+
+\begin{lstlisting}
+source declaration:
+    C++ header says which symbol exists and what ABI contract it has
+
+assembly implementation:
+    .S file exports that symbol and obeys ABI
+
+object file:
+    assembler emits symbols, sections, relocations, debug/unwind hints
+
+linking:
+    linker resolves references and patches call/data addresses
+
+runtime:
+    CPU only executes bytes; correctness depends on the binary contract
+\end{lstlisting}
+
+从高性能计算和 AI 算子开发角度看，本章尤其关键。真实算子库经常出现这样的边界：
+
+\begin{itemize}
+  \item C++ 调度层选择某个 kernel，再调用汇编或 intrinsic 实现。
+  \item 汇编 kernel 接收指针、维度、步长、常量、尾部长度等参数。
+  \item kernel 内部尽量不调用其他函数；一旦调用，就必须恢复 ABI 约束。
+  \item profiler、debugger、sanitizer、异常展开和符号工具都要能看懂这段代码。
+\end{itemize}
+
+因此，本章的核心不是“写几条汇编指令”，而是建立下面这条可验证链路：
+
+\begin{lstlisting}
+C++ type/signature
+    -> ABI-level parameter and return-value locations
+    -> assembly symbol and prologue/epilogue
+    -> object-file symbols and relocations
+    -> linked executable
+    -> debugger/profiler observable behavior
+    -> tests and performance evidence
+\end{lstlisting}
+
+\begin{keyidea}
+C++ 与汇编互操作的本质是二进制契约工程。C++ 编译器不会理解手写汇编的意图；汇编器也不会检查 C++ 类型语义。两边能正确合作，依赖的是符号名、ABI、目标文件格式、链接器、调试元数据和测试共同维持的边界。
+\end{keyidea}
+
+\section{互操作代码的设计原则}
+
+手写汇编边界最怕“聪明但含糊”。一段汇编函数可以很短，但它背后的接口必须保守、清晰、可测试。设计互操作接口时，应优先追求可证明正确，而不是一开始就追求最极限的指令布局。高质量的汇编工程，通常把复杂性放在 C++ 调度层，把汇编热路径压缩到少量明确前置条件下运行。
+
+第一条原则是接口窄。汇编函数最好只接收必要的标量、指针、长度、步长和常量，不要直接暴露复杂 C++ 对象。复杂对象可以在 C++ 层拆解成普通字段，再传给汇编。这样做的好处是 ABI 形状稳定，测试容易，符号边界清楚，也减少手写汇编理解 C++ 对象生命周期的风险。
+
+第二条原则是前置条件明确。汇编函数内部通常不适合做大量错误处理。比如一个点积 kernel 可以要求 \code{a} 和 \code{b} 指向至少 \code{n} 个元素，\code{n >= 0}，外层已经完成空指针和尺寸检查。若这些条件不成立，行为可以定义为调用方错误。这样热循环不需要每轮检查边界，也能让测试集中验证 wrapper 是否正确过滤非法输入。
+
+第三条原则是边界稳定。一个已经被 C++ 调用的汇编函数，参数顺序、类型大小、返回方式和寄存器保存约定都不能随便改。你可以在内部重写指令，也可以增加新的符号提供新版实现，但不要让旧声明继续指向 ABI 形状已经变化的实现。对库来说，符号名就是承诺。
+
+第四条原则是证据优先。互操作代码是否正确，不能依赖“寄存器看起来放对了”这种印象。每个函数都应有 C++ reference、确定性测试、随机测试、反汇编审计、必要的 GDB 记录和接口注释。进入性能优化之前，先证明它在二进制边界上没有违反合同。
+
+\begin{mentalmodel}
+可以把汇编函数看成一个很小的硬件风格模块：
+
+\begin{itemize}
+  \item 输入端口：ABI 参数寄存器和栈参数。
+  \item 输出端口：返回寄存器或返回对象内存。
+  \item 时序要求：调用前栈对齐，返回前恢复 \register{rsp}。
+  \item 保持约束：callee-saved 寄存器必须还原。
+  \item 环境假设：指针、长度、对齐和别名由外层保证。
+\end{itemize}
+
+接口文档就是这个模块的规格书。
+\end{mentalmodel}
+
+\section{先建立三层边界}
+
+许多手写汇编问题并不是由 \instruction{add}、\instruction{mov} 这类指令本身造成的，而是来自三层规则的混淆。
+
+\subsection{第一层：C++ 语言层}
+
+C++ 源代码里看到的是函数声明、类型、重载、命名空间、引用、对象生命周期、异常、访问控制和模板实例化。例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" long asm_sum8(long a, long b, long c, long d,
+                         long e, long f, long g, long h);
+\end{lstlisting}
+
+这个声明告诉 C++ 编译器：
+
+\begin{itemize}
+  \item 存在一个可调用函数。
+  \item 函数名在链接层叫 \code{asm_sum8}，不要使用 C++ name mangling。
+  \item 参数和返回值都是 \code{long}。
+  \item 调用时按当前平台默认调用约定生成代码。
+\end{itemize}
+
+但这个声明没有告诉编译器函数体在哪里，也没有证明汇编实现真的返回 \code{long}。如果你的汇编函数把结果放进了 \register{rcx} 而不是 \register{rax}，C++ 编译器不会替你发现。
+
+\subsection{第二层：ABI 层}
+
+上一章的 ABI 表格在这里变成实际契约。对于上面的 \code{asm_sum8}，System V AMD64 下入口状态应当是：
+
+\begin{lstlisting}
+on entry to asm_sum8:
+    rdi       = a
+    rsi       = b
+    rdx       = c
+    rcx       = d
+    r8        = e
+    r9        = f
+    [rsp + 0] = return address
+    [rsp + 8] = g
+    [rsp +16] = h
+
+on return:
+    rax = result
+\end{lstlisting}
+
+如果函数修改了 \register{rbx}、\register{rbp}、\register{r12} 到 \register{r15}，它必须在返回前恢复。若它调用其他函数，调用点前还要满足栈对齐约定。
+
+\subsection{第三层：目标文件和链接层}
+
+汇编文件最终不是直接和 C++ 源码连接，而是先变成目标文件。目标文件里包含：
+
+\begin{itemize}
+  \item section，例如 \code{.text}、\code{.rodata}、\code{.data}。
+  \item symbol，例如 \code{asm_sum8}、\code{cpp_helper}。
+  \item relocation，例如“这里有一个 \instruction{call}，目标符号稍后由链接器填”。
+  \item debug/unwind metadata，例如调试器和异常展开需要的信息。
+\end{itemize}
+
+可以用下面工具观察：
+
+\begin{lstlisting}[language=bash]
+nm -C file.o
+readelf -Ws file.o
+readelf -r file.o
+objdump -drwC -Mintel file.o
+\end{lstlisting}
+
+\begin{mentalmodel}
+源代码层问“这个函数叫什么、类型是什么”；ABI 层问“参数和返回值在哪些寄存器或栈槽”；目标文件层问“哪个符号定义在哪里，哪个地址需要链接器以后修补”。这三层都正确，跨语言调用才正确。
+\end{mentalmodel}
+
+\section{接口类型应该怎样选}
+
+互操作接口的类型选择，比汇编指令本身更早决定工程质量。C++ 允许非常丰富的类型：类、模板、引用、异常、虚函数、容器、迭代器、lambda、智能指针。它们在源码层很有表达力，但在二进制边界上可能引入复杂 ABI 细节。手写汇编如果直接接触这些对象，就必须理解它们的布局、生命周期、构造析构、异常清理和版本兼容，这通常不是一个热路径 kernel 应承担的责任。
+
+基础阶段建议优先使用下面几类接口类型：
+
+\begin{itemize}
+  \item 固定宽度整数，例如 \code{std::int32_t}、\code{std::uint64_t}。
+  \item 指向连续数组的裸指针，例如 \code{float*}、\code{const std::int32_t*}。
+  \item 显式长度和步长，例如 \code{std::int64_t n}、\code{std::int64_t stride}。
+  \item 平凡小结构体，且字段布局在报告中写清楚。
+  \item 不透明指针，例如 \code{Context*}，由 C++ 层解释内部结构。
+\end{itemize}
+
+不建议直接把下面类型暴露给手写汇编热路径：
+
+\begin{itemize}
+  \item \code{std::vector}、\code{std::string}、\code{std::span} 等库类型对象本身。
+  \item 带虚函数、继承、非平凡析构的类对象。
+  \item 抛出异常或需要异常展开穿过汇编帧的接口。
+  \item 需要汇编负责构造或析构的 C++ 对象。
+  \item 未明确布局和对齐的跨库结构体。
+\end{itemize}
+
+这不是说汇编永远不能和复杂 C++ 系统合作。正确做法通常是：C++ wrapper 接收复杂对象，完成检查、拆解、调度和生命周期管理；汇编 kernel 只接收已经规整好的地址、大小和标量参数。这样复杂语义留在编译器能理解的 C++ 层，汇编层专注执行密集计算。
+
+\subsection{显式长度比隐式约定更好}
+
+数组类接口应显式传入长度。不要让汇编函数通过哨兵值、全局状态或对象内部字段猜测长度，除非这是算法本身的必要部分。显式长度有几个优点：ABI 映射简单，测试能覆盖 \code{n = 0}、\code{n = 1}、边界尾部和大输入，性能报告能按元素数归一化，越界风险也更容易在 C++ wrapper 中检查。
+
+如果存在步长，也应显式传入。矩阵、tensor、图像和切片常常不是简单连续数组。一个汇编 kernel 如果假设连续布局，却被调用方传入有 stride 的数据，结果会静默错误。相反，把 \code{stride} 作为显式参数，会让地址公式在接口中可见，也让反汇编审计更直接。
+
+\subsection{对齐和别名要写进契约}
+
+性能 kernel 经常关心对齐。某些实现可以处理任意地址，只是未对齐时慢；某些 SIMD 指令或手写加载策略要求特定对齐；某些算法要求输入输出不重叠，才能安全重排 load/store。C++ 编译器可以通过类型、\code{restrict} 风格扩展、assume、alignment attribute 等信息进行优化；手写汇编没有这些自动语义，必须由接口文档和 wrapper 维护。
+
+例如一个向量加法 kernel 的前置条件可以写成：
+
+\begin{lstlisting}
+Preconditions:
+    x, y, out point to at least n float elements
+    n >= 0
+    out may alias x, but must not partially overlap y
+    implementation accepts unaligned pointers
+\end{lstlisting}
+
+或者：
+
+\begin{lstlisting}
+Preconditions:
+    x, y, out are 32-byte aligned
+    n is a multiple of 8
+    x, y, out do not overlap
+\end{lstlisting}
+
+这两种接口都可以合理，但它们是不同契约。前者更通用，汇编内部可能要处理尾部和未对齐；后者更快，但调用方必须提供更强保证。教材训练时要把这种取舍写出来，不能只在脑中默认。
+
+\begin{keyidea}
+汇编接口类型越简单，二进制契约越容易证明。复杂 C++ 对象应由 C++ wrapper 处理，汇编 kernel 接收规整后的标量、指针、长度和步长。
+\end{keyidea}
+
+\section{推荐分层：C++ wrapper 和汇编 kernel}
+
+真实项目里，不建议让业务代码直接调用裸汇编符号。更稳妥的结构是两层：
+
+\begin{center}
+\begin{minipage}{0.84\linewidth}
+\begin{verbatim}
+public C++ API
+        |
+        v
+C++ wrapper: validate, normalize, dispatch, document
+        |
+        v
+extern "C" assembly kernel: small ABI-stable hot path
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+公共 C++ API 面向使用者，可以使用类型更丰富的接口。例如接收 \code{std::span<const float>}、矩阵描述对象、枚举参数、错误码或上下文对象。它负责把输入转换为汇编 kernel 能理解的简单形态：裸指针、长度、步长、标量常量和少数标志位。这样调用方不需要知道 ABI 细节，汇编也不需要理解复杂 C++ 类型。
+
+C++ wrapper 至少承担五类责任。
+
+第一，检查前置条件。比如指针是否为空，长度是否非负，输入输出是否允许重叠，是否满足对齐要求，尾部是否需要 fallback。汇编热路径可以假定这些条件已经成立，从而避免在内层循环里反复检查。
+
+第二，规格化参数。比如把 \code{std::size_t} 转换为汇编约定中的 \code{std::int64_t}，把二维矩阵的行列和 stride 展开成显式整数，把布尔模式转换成小整数标志。转换时要处理溢出和范围，不能让一个超出汇编可表达范围的长度悄悄截断。
+
+第三，选择实现。一个 wrapper 可以根据 CPU feature、数据规模、对齐、尾部长度选择不同 kernel。例如 \code{scalar}、\code{avx2}、\code{avx512} 可以是不同内部符号。第一册不展开 ISA dispatch，但要建立分层意识：dispatch 属于 C++ 控制层，单个 kernel 应保持简单。
+
+第四，处理错误和异常。公共 API 可以返回错误码、抛异常或断言失败；汇编 kernel 通常不应该抛异常，也不应该直接构造复杂错误对象。这样异常传播、资源清理和日志记录仍由 C++ 编译器能理解的代码承担。
+
+第五，提供测试锚点。测试可以分别覆盖 wrapper 的非法输入行为和 kernel 的合法输入行为。若直接测试裸汇编，非法输入可能导致崩溃；若只测试公共 API，又可能难以定位是 wrapper 选择错了 kernel，还是 kernel 本身计算错了。分层后两类问题可以分开验证。
+
+\subsection{一个简单 wrapper 形态}
+
+例如裸汇编 kernel 的契约是：
+
+\begin{lstlisting}[language=C++]
+extern "C" std::int64_t asm_dot_i32_kernel(const std::int32_t* a,
+                                           const std::int32_t* b,
+                                           std::int64_t n);
+\end{lstlisting}
+
+公共 wrapper 可以写成：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+#include <span>
+#include <stdexcept>
+
+extern "C" std::int64_t asm_dot_i32_kernel(const std::int32_t* a,
+                                           const std::int32_t* b,
+                                           std::int64_t n);
+
+std::int64_t dot_i32(std::span<const std::int32_t> a,
+                     std::span<const std::int32_t> b)
+{
+    if (a.size() != b.size()) {
+        throw std::invalid_argument("dot_i32: size mismatch");
+    }
+
+    if (a.size() > static_cast<std::size_t>(INT64_MAX)) {
+        throw std::length_error("dot_i32: input too large");
+    }
+
+    return asm_dot_i32_kernel(a.data(),
+                              b.data(),
+                              static_cast<std::int64_t>(a.size()));
+}
+\end{lstlisting}
+
+这个 wrapper 做了三件关键事：检查尺寸相等，检查长度能放进汇编接口的 \code{std::int64_t}，把 \code{std::span} 拆成指针和长度。汇编 kernel 不需要知道 \code{std::span} 的布局，也不需要知道异常类型。它只履行一个小契约：对两个长度为 \code{n} 的数组计算点积。
+
+\subsection{wrapper 不能替代 kernel 测试}
+
+有了 wrapper，并不表示 kernel 可以不测。wrapper 测试回答公共 API 是否按规格处理输入；kernel 测试回答 ABI 边界和汇编计算是否正确。两者的测试输入也不同。
+
+wrapper 测试应包含：
+
+\begin{itemize}
+  \item 尺寸不匹配时是否报错。
+  \item 空 span 是否按规格处理。
+  \item 超大长度是否被拒绝。
+  \item 合法输入是否调用正确实现。
+\end{itemize}
+
+kernel 测试应包含：
+
+\begin{itemize}
+  \item \code{n = 0}、\code{n = 1}、小规模和较大规模。
+  \item 正数、负数、零、随机值。
+  \item 多次调用和不同调用点。
+  \item 反汇编审计和符号审计。
+\end{itemize}
+
+如果项目有多个 ISA kernel，还要保证每个 kernel 都能被单独测试，而不只是通过 dispatch 间接覆盖。否则某个 CPU feature 不可用时，测试可能永远没有跑到某个实现。
+
+\begin{keyidea}
+C++ wrapper 负责语义、检查、调度和错误处理；汇编 kernel 负责小而稳定的机器级计算。把这两层混在一起，会同时破坏 C++ 可维护性和汇编可证明性。
+\end{keyidea}
+
+\section{符号可见性、ODR 和 ABI 稳定性}
+
+互操作项目一旦从单个实验文件进入库，就会遇到另一个问题：符号不仅要“能链接”，还要“按预期被链接”。C++ 有 ODR，也就是一个定义规则；链接器有强符号、弱符号、局部符号、全局符号、默认可见性、隐藏可见性；动态库还有导出符号集合。手写汇编如果不控制这些边界，很容易出现重复定义、意外覆盖、符号泄漏或链接到错误版本。
+
+\subsection{全局符号不是越多越好}
+
+\code{.globl} 会把符号导出给链接器，让其他目标文件可以引用。对于公共 ABI 函数，这是必要的；对于只在当前汇编文件内部使用的局部标签或 helper，则不应该导出。内部标签可以用局部名字，例如 \code{.Lloop}、\code{.Ldone}。这些标签通常不会出现在最终动态符号表里，也不会成为外部链接契约。
+
+导出太多符号有几个问题。第一，命名冲突风险增加。一个通用名字如 \code{loop}、\code{helper}、\code{kernel} 很可能和其他目标文件撞名。第二，动态库 ABI 面变大，未来修改更困难。第三，profiler 和符号工具输出变噪，真正公共入口不容易识别。第四，安全审计更复杂，因为外部可见入口越多，外部代码越可能直接绕过 wrapper 调用内部实现。
+
+工程中常见做法是：公共 C++ 头文件只声明少量稳定入口，汇编内部实现使用带前缀的私有符号，动态库构建时默认隐藏符号，只显式导出 API。对第一册实验来说，你至少应养成前缀习惯，例如所有实验符号使用 \code{asm_} 或项目名前缀，而不是裸 \code{add}、\code{sum}。
+
+\subsection{ODR 和重复定义}
+
+如果两个目标文件都定义同一个强符号，链接器通常会报 multiple definition。若一个是弱符号，链接器可能选择强符号。这个机制在运行时库和默认实现里有用途，但对初学汇编项目来说，弱符号会增加不确定性。你可能以为调用的是自己的汇编实现，实际链接到了另一个同名实现。
+
+模板、inline 函数和头文件实现也会影响 ODR。C++ 编译器可以为模板实例生成多个 COMDAT 弱定义，让链接器合并；手写汇编则通常没有这种高级语义。不要把同一个 \code{.S} 文件通过多个路径重复加入多个库，再把这些库同时链接进最终程序。若构建系统设计不清，重复对象可能导致链接错误或符号选择意外。
+
+报告里应使用 \code{nm} 或 \code{readelf -Ws} 验证最终二进制中公共符号只有预期的一份定义。对于动态库，还应区分普通符号表和动态符号表。能在普通符号表看到，不代表它被动态导出；能被动态导出，则意味着外部加载者可能依赖它。
+
+\subsection{ABI 稳定性：符号名相同不代表契约相同}
+
+最危险的变更是符号名不变，但 ABI 形状变了。比如原来声明是：
+
+\begin{lstlisting}[language=C++]
+extern "C" long asm_dot_i32(const int* a, const int* b, long n);
+\end{lstlisting}
+
+后来你把汇编实现改成额外需要 stride，却没有改符号名和 C++ 声明，只是在汇编里从 \register{rcx} 读取 stride。调用者并不会自动传入这个参数。结果 \register{rcx} 里是调用点上的临时值，程序可能在某些输入下“碰巧能跑”，但 ABI 已经坏了。
+
+正确做法是：如果公共 ABI 参数、返回方式、前置条件或可见副作用发生不兼容变化，就定义新符号，例如 \code{asm_dot_i32_v2}，或者在 C++ wrapper 层保持旧入口兼容，把新入口隐藏在内部。库版本管理可以更复杂，但第一原则很朴素：不要让旧声明调用新契约。
+
+\begin{warningbox}
+符号名是链接器看到的名字，不是完整接口。完整接口还包括参数类型、返回方式、寄存器保存、栈对齐、前置条件、全局副作用和异常规则。符号名不变而契约改变，是互操作代码里最隐蔽的破坏。
+\end{warningbox}
+
+\section{类型宽度和平台差异不能靠猜}
+
+互操作接口里最容易被忽略的细节之一，是 C++ 类型在目标平台上的宽度。比如 \code{int} 通常是 32 位，\code{long long} 通常是 64 位；但 \code{long} 在不同 ABI 上可能不同。在 Linux x86-64 的 System V ABI 下，\code{long} 是 64 位；在 Windows x64 下，\code{long} 仍然是 32 位。若你把 \code{long} 写进公共汇编接口，就已经让接口带上平台假设。
+
+因此，本书在互操作边界优先使用固定宽度整数：
+
+\begin{lstlisting}[language=C++]
+extern "C" std::int64_t asm_add_i64(std::int64_t a, std::int64_t b);
+extern "C" std::uint32_t asm_mix_u32(std::uint32_t x, std::uint32_t y);
+\end{lstlisting}
+
+这不会消除所有 ABI 差异，但至少让值宽度明确。汇编实现也应对应宽度选择寄存器视图。32 位返回值放在 \register{eax}，64 位返回值放在 \register{rax}。若函数声明返回 \code{std::uint32_t}，汇编写 \register{eax} 通常符合预期；若函数声明返回 \code{std::uint64_t}，只写 \register{ax} 或 \register{al} 就很可能留下旧高位，造成错误。
+
+\subsection{在头文件中静态验证假设}
+
+对跨语言结构体或宽度敏感接口，应在 C++ 头文件里写静态断言：
+
+\begin{lstlisting}[language=C++]
+#include <cstddef>
+#include <cstdint>
+#include <type_traits>
+
+struct KernelArgs {
+    const std::int32_t* a;
+    const std::int32_t* b;
+    std::int64_t n;
+    std::int64_t stride;
+};
+
+static_assert(sizeof(std::int32_t) == 4);
+static_assert(sizeof(std::int64_t) == 8);
+static_assert(sizeof(KernelArgs) == 32);
+static_assert(offsetof(KernelArgs, a) == 0);
+static_assert(offsetof(KernelArgs, b) == 8);
+static_assert(offsetof(KernelArgs, n) == 16);
+static_assert(offsetof(KernelArgs, stride) == 24);
+static_assert(std::is_trivially_copyable_v<KernelArgs>);
+\end{lstlisting}
+
+这些断言不是形式主义。若某个字段类型被改了、结构体插入新字段、对齐规则变化、头文件被不同平台编译，断言会尽早失败。没有断言时，汇编可能继续按旧偏移读取字段，程序却只在特定输入下错误。
+
+汇编侧也可以用注释把偏移写清：
+
+\begin{lstlisting}
+# KernelArgs layout:
+#   +0  const int32_t* a
+#   +8  const int32_t* b
+#   +16 int64_t n
+#   +24 int64_t stride
+\end{lstlisting}
+
+注释不能替代 \code{static_assert}，但它让反汇编和源码审计更容易。高质量互操作代码通常两者都要有：C++ 编译期断言负责阻止布局悄悄变化，汇编注释负责让维护者知道每个偏移的含义。
+
+\subsection{不要把一个 ABI 的经验搬到另一个 ABI}
+
+本书第一册主要使用 Linux x86-64 System V ABI。它和 Windows x64 有明显差异，例如整数参数寄存器、shadow space、callee-saved XMM 寄存器规则、结构体返回细节都不完全一样。macOS 也有自己的对象文件和符号命名细节。AArch64 又是另一套寄存器和调用约定。
+
+因此，汇编互操作代码应在文件名、构建条件和文档中标出目标平台：
+
+\begin{lstlisting}
+kernels/
+  x86_64_sysv/
+    dot_i32.S
+  x86_64_windows/
+    dot_i32.asm
+  aarch64_linux/
+    dot_i32.S
+\end{lstlisting}
+
+构建系统也应按平台选择源文件，而不是让一个 \code{.S} 文件用大量条件编译硬撑所有 ABI。小范围宏可以接受，跨 ABI 的寄存器分配、栈规则和 unwind 规则差异太大时，分文件通常更清楚。
+
+\begin{warningbox}
+“我的机器上能跑”只证明当前平台、当前编译器、当前构建方式下没有暴露错误。互操作接口若要跨平台，必须逐个平台写 ABI 表、测试和符号审计。
+\end{warningbox}
+
+\section{一个最小可运行工程}
+
+先做最小例子。目录结构如下：
+
+\begin{lstlisting}
+labs/ch14_interop/minimal/
+    CMakeLists.txt
+    main.cpp
+    asm_add.S
+\end{lstlisting}
+
+\subsection{C++ 调用者}
+
+\begin{lstlisting}[language=C++]
+// main.cpp
+#include <cassert>
+#include <cstdint>
+#include <cstdio>
+
+extern "C" std::int64_t asm_add2(std::int64_t a, std::int64_t b);
+
+int main()
+{
+    const std::int64_t x = 40;
+    const std::int64_t y = 2;
+    const std::int64_t got = asm_add2(x, y);
+
+    assert(got == 42);
+    std::printf("asm_add2(%ld, %ld) = %ld\n", x, y, got);
+}
+\end{lstlisting}
+
+这里的 \code{extern "C"} 不是说这个函数由 C 写成，而是说这个声明使用 C 链接名。没有它，C++ 可能把符号名改写成带类型信息的 mangled name。
+
+\subsection{汇编实现}
+
+\begin{lstlisting}
+// asm_add.S
+.intel_syntax noprefix
+.text
+
+.globl asm_add2
+.type asm_add2, @function
+asm_add2:
+    lea rax, [rdi + rsi]
+    ret
+.size asm_add2, .-asm_add2
+
+.section .note.GNU-stack,"",@progbits
+\end{lstlisting}
+
+逐行解释：
+
+\begin{center}
+\begin{tabular}{p{0.30\linewidth}p{0.55\linewidth}}
+\toprule
+代码 & 含义 \\
+\midrule
+\code{.intel_syntax noprefix} & 使用 Intel 语法，寄存器不写 \code{\%} 前缀。 \\
+\code{.text} & 后续内容进入代码段。 \\
+\code{.globl asm_add2} & 导出符号，让其他目标文件可以引用。 \\
+\code{.type asm_add2, @function} & 标记符号类型为函数，便于工具识别。 \\
+\code{asm_add2:} & 函数入口标签，也是符号地址。 \\
+\code{lea rax, [rdi + rsi]} & 计算第 1、2 个参数之和，放入返回寄存器。 \\
+\code{ret} & 返回到调用者。 \\
+\code{.size asm_add2, .-asm_add2} & 记录函数大小，从入口到当前位置。 \\
+\code{.note.GNU-stack} & 告诉链接器不需要可执行栈。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warningbox}
+\code{.section .note.GNU-stack,"",@progbits} 不会生成运行时代码，但在 Linux ELF 工程中应当保留。省略它可能导致链接器给出 executable stack 警告，或者在某些环境里产生不必要的安全风险。
+\end{warningbox}
+
+\subsection{构建脚本}
+
+\begin{lstlisting}
+# CMakeLists.txt
+cmake_minimum_required(VERSION 3.20)
+project(ch14_minimal LANGUAGES CXX ASM)
+
+add_executable(ch14_minimal
+    main.cpp
+    asm_add.S
+)
+
+target_compile_features(ch14_minimal PRIVATE cxx_std_20)
+target_compile_options(ch14_minimal PRIVATE
+    $<$<COMPILE_LANGUAGE:CXX>:-Wall -Wextra -Wpedantic -O2 -g>
+)
+\end{lstlisting}
+
+构建：
+
+\begin{lstlisting}[language=bash]
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j
+./build/ch14_minimal
+\end{lstlisting}
+
+审计：
+
+\begin{lstlisting}[language=bash]
+nm -C build/ch14_minimal | rg 'asm_add2|main'
+objdump -drwC -Mintel build/ch14_minimal > ch14_minimal.objdump.txt
+rg -n '<asm_add2>|call.*asm_add2' ch14_minimal.objdump.txt
+\end{lstlisting}
+
+\subsection{为什么文件后缀用 \code{.S}}
+
+GNU/Clang 工具链里常见约定：
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.68\linewidth}}
+\toprule
+后缀 & 含义 \\
+\midrule
+\code{.s} & 汇编源文件，通常不经过 C 预处理器。 \\
+\code{.S} & 汇编源文件，先经过 C 预处理器，再交给汇编器。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+使用 \code{.S} 后，可以写：
+
+\begin{lstlisting}
+#if defined(__linux__) && defined(__x86_64__)
+.section .note.GNU-stack,"",@progbits
+#endif
+\end{lstlisting}
+
+也可以在以后用宏生成不同 ISA 版本。但宏会降低可读性。本书训练阶段优先写直白的汇编，只有重复结构明显时才引入宏。
+
+\subsection{CMake 中启用 ASM 的意义}
+
+\code{project(... LANGUAGES CXX ASM)} 不是装饰。它告诉 CMake 当前工程包含汇编源文件，需要用合适的汇编器规则处理 \code{.S}。如果没有启用 ASM，某些构建系统可能不知道如何编译汇编文件，或者把它当成普通文本忽略。大型项目中，汇编文件还可能需要根据目标平台、编译器、操作系统和 ISA 变体选择不同源文件。
+
+训练阶段可以把汇编文件直接加入 \code{add_executable}。工程扩大后，更常见的做法是把 kernel 放入一个静态库或对象库，再由测试程序、benchmark 和最终应用链接。这样做有三个好处：测试可以复用同一份目标文件，benchmark 不会意外使用另一份实现，符号审计也更清楚。
+
+\subsection{PIE、PIC 和地址写法}
+
+现代 Linux 发行版常默认生成 PIE 可执行文件，动态库则要求位置无关代码。位置无关代码不能假设某个全局对象或函数永远位于固定绝对地址，因为加载器可能把程序或共享库映射到不同虚拟地址。x86-64 下，访问静态数据常使用 RIP-relative addressing；调用外部符号可能经过 PLT/GOT。
+
+这对手写汇编有直接影响。教学中的纯函数只使用参数寄存器，不涉及全局地址，通常不受影响；一旦汇编函数访问全局表、常量池、外部函数或动态库符号，就要使用适合位置无关代码的写法。写死绝对地址在现代用户态程序里通常不是正确做法。
+
+例如取本文件内只读数据地址，应优先写：
+
+\begin{lstlisting}
+lea rax, [rip + table]
+\end{lstlisting}
+
+而不是把某个链接时地址常量硬编码进寄存器。对于跨目标文件或动态库符号，还要看重定位类型和链接模式。若构建失败并出现 relocation 不能用于 PIE 的错误，通常说明你的汇编地址写法不适合当前位置无关要求。
+
+\subsection{静态链接、动态链接和第一次调用}
+
+同一个 C++ 声明，最终调用路径会因链接方式不同而变化。静态链接或同一可执行文件内部符号，可能生成直接 \instruction{call}。动态库外部符号，可能经过 PLT；第一次调用可能触发延迟绑定，后续调用使用已解析地址。开启 \code{-fno-plt} 或符号可见性优化时，路径又可能变化。
+
+因此，互操作报告中不能只写“调用了 \code{foo}”。应说明你观察的是目标文件、静态链接后的可执行文件，还是动态链接后的运行路径。目标文件里的 \instruction{call} 可能带 relocation；最终可执行文件里的 \instruction{call} 才有具体相对位移；运行时经过 PLT/GOT 的路径还受加载器影响。
+
+\begin{warningbox}
+如果你的汇编访问全局数据或外部符号，必须考虑 PIE/PIC 和重定位。只在非 PIE 小实验中能链接，不代表它能放进现代共享库或默认 PIE 可执行文件。
+\end{warningbox}
+
+\section{把函数签名当成二进制接口}
+
+互操作时，最危险的习惯是“先写汇编，能跑就行”。正确顺序应该是：
+
+\begin{enumerate}
+  \item 写 C++ 声明，明确类型和链接名。
+  \item 按 ABI 推导参数位置、返回位置、保存责任。
+  \item 写汇编函数框架。
+  \item 写测试，覆盖普通值、边界值、随机值。
+  \item 用 \code{objdump}、\code{nm}、\code{readelf} 审计二进制。
+  \item 再考虑性能。
+\end{enumerate}
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" std::int64_t asm_sum8(std::int64_t a0, std::int64_t a1,
+                                 std::int64_t a2, std::int64_t a3,
+                                 std::int64_t a4, std::int64_t a5,
+                                 std::int64_t a6, std::int64_t a7);
+\end{lstlisting}
+
+ABI 推导表：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.24\linewidth}p{0.42\linewidth}}
+\toprule
+源代码参数 & 入口位置 & 说明 \\
+\midrule
+\code{a0} & \register{rdi} & 第 1 个整数类参数。 \\
+\code{a1} & \register{rsi} & 第 2 个整数类参数。 \\
+\code{a2} & \register{rdx} & 第 3 个整数类参数。 \\
+\code{a3} & \register{rcx} & 第 4 个整数类参数。 \\
+\code{a4} & \register{r8} & 第 5 个整数类参数。 \\
+\code{a5} & \register{r9} & 第 6 个整数类参数。 \\
+\code{a6} & \code{[rsp + 8]} & 第 7 个参数，返回地址之后。 \\
+\code{a7} & \code{[rsp + 16]} & 第 8 个参数。 \\
+return & \register{rax} & 64 位整数返回。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+汇编：
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+
+.globl asm_sum8
+.type asm_sum8, @function
+asm_sum8:
+    lea rax, [rdi + rsi]
+    add rax, rdx
+    add rax, rcx
+    add rax, r8
+    add rax, r9
+    add rax, qword ptr [rsp + 8]
+    add rax, qword ptr [rsp + 16]
+    ret
+.size asm_sum8, .-asm_sum8
+
+.section .note.GNU-stack,"",@progbits
+\end{lstlisting}
+
+注意这里没有函数序言。它是一个 leaf function，不调用其他函数，不需要局部栈空间，不修改 callee-saved 寄存器。这样的函数可以非常短。但这个短小建立在 ABI 推导正确之上，不是随便省略。
+
+\begin{deepdive}
+如果函数入口后执行了 \instruction{push} \register{rbp}，那么第 7 个参数就不再位于当前 \register{rsp} 的 \code{[rsp + 8]}。入口原始布局被改变了：
+\begin{lstlisting}
+on entry:
+    [rsp + 0]  return address
+    [rsp + 8]  a6
+    [rsp +16]  a7
+
+after push rbp:
+    [rsp + 0]  saved rbp
+    [rsp + 8]  return address
+    [rsp +16]  a6
+    [rsp +24]  a7
+\end{lstlisting}
+所以读写栈参数前必须先确定当前 \register{rsp} 相对入口移动了多少。很多手写汇编 bug 就来自这里。
+\end{deepdive}
+
+\section{测试不是附属品}
+
+手写汇编很容易出现“几个样例能跑，但边界条件错”的情况。测试要直接围绕二进制契约设计。
+
+\subsection{确定性测试}
+
+\begin{lstlisting}[language=C++]
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <limits>
+
+extern "C" std::int64_t asm_sum8(std::int64_t, std::int64_t,
+                                 std::int64_t, std::int64_t,
+                                 std::int64_t, std::int64_t,
+                                 std::int64_t, std::int64_t);
+
+static std::int64_t ref_sum8(const std::array<std::int64_t, 8>& values)
+{
+    std::int64_t sum = 0;
+    for (const std::int64_t value : values) {
+        sum += value;
+    }
+    return sum;
+}
+
+int main()
+{
+    const std::array<std::array<std::int64_t, 8>, 4> cases {{
+        {{0, 0, 0, 0, 0, 0, 0, 0}},
+        {{1, 2, 3, 4, 5, 6, 7, 8}},
+        {{-1, -2, -3, -4, -5, -6, -7, -8}},
+        {{100, -50, 7, -8, 9, -10, 11, -12}},
+    }};
+
+    for (const auto& c : cases) {
+        const std::int64_t got = asm_sum8(c[0], c[1], c[2], c[3],
+                                          c[4], c[5], c[6], c[7]);
+        assert(got == ref_sum8(c));
+    }
+}
+\end{lstlisting}
+
+这个测试至少覆盖了：
+
+\begin{itemize}
+  \item 寄存器参数。
+  \item 栈参数 \code{a6} 和 \code{a7}。
+  \item 正数、负数、零。
+  \item 多次调用。
+\end{itemize}
+
+\subsection{随机测试}
+
+\begin{lstlisting}[language=C++]
+#include <array>
+#include <cassert>
+#include <cstdint>
+#include <random>
+
+extern "C" std::int64_t asm_sum8(std::int64_t, std::int64_t,
+                                 std::int64_t, std::int64_t,
+                                 std::int64_t, std::int64_t,
+                                 std::int64_t, std::int64_t);
+
+static std::int64_t ref_sum8(const std::array<std::int64_t, 8>& values)
+{
+    std::int64_t sum = 0;
+    for (const std::int64_t value : values) {
+        sum += value;
+    }
+    return sum;
+}
+
+int main()
+{
+    std::mt19937_64 rng(0xC001D00DULL);
+    std::uniform_int_distribution<std::int64_t> dist(-1000000, 1000000);
+
+    for (int iter = 0; iter < 100000; ++iter) {
+        std::array<std::int64_t, 8> values {};
+        for (std::int64_t& value : values) {
+            value = dist(rng);
+        }
+
+        const std::int64_t got = asm_sum8(values[0], values[1],
+                                          values[2], values[3],
+                                          values[4], values[5],
+                                          values[6], values[7]);
+        assert(got == ref_sum8(values));
+    }
+}
+\end{lstlisting}
+
+\begin{warningbox}
+如果 C++ reference 函数使用 signed overflow，而测试数据可能溢出，那么 reference 本身可能有未定义行为。训练早期可以限制输入范围；后续如果要测试完整 64 位 wraparound，应使用 \code{std::uint64_t} 或明确使用编译器支持的溢出内建函数。
+\end{warningbox}
+
+\subsection{测试矩阵}
+
+互操作测试不能只在一个优化级别、一个输入、一次运行下通过。至少应建立一个小型测试矩阵：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.60\linewidth}}
+\toprule
+维度 & 建议覆盖 \\
+\midrule
+优化级别 & \code{-O0}、\code{-O2} 或 \code{-O3}。 \\
+调试信息 & 带 \code{-g}，必要时保留帧指针。 \\
+输入规模 & \code{0}、\code{1}、小值、边界值、较大值。 \\
+数值分布 & 零、正数、负数、随机值、极端值。 \\
+调用次数 & 单次调用、多次循环调用、嵌套调用。 \\
+寄存器压力 & 调用点周围保留多个活跃变量，逼出保存问题。 \\
+链接方式 & 至少观察目标文件和最终可执行文件；有条件时观察动态库。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不同维度暴露不同问题。\code{-O0} 可能更容易单步，但不能代表优化后调用点；\code{-O3} 更容易暴露 inline asm 约束错误和 caller-saved 保存错误；随机值能发现算术边界；多次调用能发现 callee-saved 寄存器污染；动态链接能暴露符号可见性和 PLT/GOT 路径。
+
+测试还要避免 reference 本身不可靠。若汇编语义是 unsigned wraparound，reference 也应该用 unsigned 类型；若汇编要求指针非空，测试非法指针时应测试 wrapper 拒绝输入，而不是直接调用 kernel；若汇编要求对齐，测试应分别覆盖符合对齐和不符合对齐的 wrapper 行为。
+
+\subsection{错误注入测试}
+
+为了确认测试真的能抓到 ABI 错误，可以故意写坏版本。比如删掉 \register{rbx} 的保存恢复、把第 7 个参数偏移写成 \code{[rsp]}、调用 helper 前不对齐栈、inline asm 漏掉 \code{"cc"} 或 \code{"memory"}。如果测试完全没有失败，说明测试没有覆盖关键契约。
+
+错误注入不是为了保留坏代码，而是为了验证测试敏感性。高质量报告可以写：“我们曾故意移除 \instruction{pop rbx} 前的恢复，随机测试在 \code{-O3} 下失败；恢复后通过。”这比只说“测试通过”更能证明你理解了风险。
+
+\begin{keyidea}
+互操作测试的目标不是证明某个输入能跑，而是让常见 ABI 破坏、参数错位、栈错位和优化器合同错误有机会暴露。
+\end{keyidea}
+
+\section{C++ name mangling 与 \code{extern "C"}}
+
+C++ 支持重载、命名空间、类成员函数、模板实例化。为了让链接器区分这些函数，编译器会把源代码函数名编码成更复杂的链接符号，这叫 \term{name mangling}{名称修饰}。
+
+\begin{lstlisting}[language=C++]
+int add(int a, int b)
+{
+    return a + b;
+}
+
+double add(double a, double b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+编译并查看符号：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O2 -c overload.cpp -o overload.o
+nm overload.o
+nm -C overload.o
+\end{lstlisting}
+
+可能看到类似：
+
+\begin{lstlisting}
+0000000000000000 T _Z3addii
+0000000000000010 T _Z3adddd
+\end{lstlisting}
+
+\code{nm -C} 会 demangle：
+
+\begin{lstlisting}
+0000000000000000 T add(int, int)
+0000000000000010 T add(double, double)
+\end{lstlisting}
+
+如果写：
+
+\begin{lstlisting}[language=C++]
+extern "C" int asm_add_int(int a, int b);
+\end{lstlisting}
+
+链接符号就是：
+
+\begin{lstlisting}
+asm_add_int
+\end{lstlisting}
+
+这让手写汇编更简单。汇编文件只需要导出同名符号：
+
+\begin{lstlisting}
+.globl asm_add_int
+.type asm_add_int, @function
+asm_add_int:
+    lea eax, [edi + esi]
+    ret
+.size asm_add_int, .-asm_add_int
+\end{lstlisting}
+
+\begin{deepdive}
+\code{extern "C"} 只改变语言链接规则和符号名，不会把 C++ 类型系统变成 C，也不会禁用 System V ABI。比如 \code{extern "C" double f(double)} 仍然用 \register{xmm0} 传参与返回。它也不能用于重载同名函数，因为 C 链接名无法表达重载集合。
+\end{deepdive}
+
+\section{目标文件里的符号和重定位}
+
+很多人第一次看目标文件反汇编，会困惑为什么 \instruction{call} 后面是 0。
+
+看 C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" long asm_add2(long, long);
+
+extern "C" long call_add2()
+{
+    return asm_add2(10, 32);
+}
+\end{lstlisting}
+
+编译目标文件：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O2 -c caller.cpp -o caller.o
+objdump -drwC -Mintel caller.o
+readelf -r caller.o
+\end{lstlisting}
+
+你可能看到：
+
+\begin{lstlisting}
+0000000000000000 <call_add2>:
+   0: bf 0a 00 00 00        mov    edi,0xa
+   5: be 20 00 00 00        mov    esi,0x20
+   a: e8 00 00 00 00        call   f <call_add2+0xf>
+        b: R_X86_64_PLT32   asm_add2-0x4
+   f: c3                    ret
+\end{lstlisting}
+
+这里的 \code{e8 00 00 00 00} 不是最终机器码。x86 的 near \instruction{call} 编码通常是：
+
+\begin{lstlisting}
+e8 rel32
+\end{lstlisting}
+
+\code{rel32} 是相对下一条指令地址的有符号 32 位位移。目标文件阶段还不知道 \code{asm_add2} 最终地址，所以汇编器放一个临时值，并生成 relocation 记录：
+
+\begin{lstlisting}
+at offset 0xb:
+    patch 4 bytes
+    relocation type = R_X86_64_PLT32
+    symbol = asm_add2
+    addend = -4
+\end{lstlisting}
+
+链接后，假设：
+
+\begin{lstlisting}
+call instruction address = 0x40112a
+next rip after call      = 0x40112f
+asm_add2 address         = 0x401150
+\end{lstlisting}
+
+那么：
+
+\begin{lstlisting}
+rel32 = target - next_rip
+      = 0x401150 - 0x40112f
+      = 0x21
+\end{lstlisting}
+
+最终编码会接近：
+
+\begin{lstlisting}
+e8 21 00 00 00
+\end{lstlisting}
+
+\begin{keyidea}
+目标文件里的反汇编不是最终地址事实，而是“机器码字节 + 符号 + 重定位请求”的组合。读未链接目标文件时，必须同时看 \code{objdump -dr} 和 \code{readelf -r}。
+\end{keyidea}
+
+\section{汇编函数调用 C++ 函数}
+
+现在反过来：手写汇编调用 C++ helper。
+
+\subsection{C++ helper}
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" std::int64_t cpp_square(std::int64_t x)
+{
+    return x * x;
+}
+
+extern "C" std::int64_t asm_square_plus(std::int64_t x);
+\end{lstlisting}
+
+目标：\code{asm_square_plus(x)} 调用 \code{cpp_square(x)}，再返回 \code{x*x + x}。
+
+错误版本很容易写成：
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+
+.globl asm_square_plus_broken
+.type asm_square_plus_broken, @function
+asm_square_plus_broken:
+    mov rbx, rdi
+    call cpp_square
+    add rax, rbx
+    ret
+.size asm_square_plus_broken, .-asm_square_plus_broken
+\end{lstlisting}
+
+这段有两个风险：
+
+\begin{itemize}
+  \item 修改了 callee-saved \register{rbx}，但没有恢复。
+  \item 进入函数时 \register{rsp} 通常是 \code{16n + 8}；直接 \instruction{call} 时调用点前栈没有 16 字节对齐。
+\end{itemize}
+
+\subsection{修复版本}
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+
+.globl asm_square_plus
+.type asm_square_plus, @function
+asm_square_plus:
+    push rbx
+    mov  rbx, rdi
+
+    call cpp_square
+
+    add  rax, rbx
+    pop  rbx
+    ret
+.size asm_square_plus, .-asm_square_plus
+
+.section .note.GNU-stack,"",@progbits
+\end{lstlisting}
+
+为什么一个 \instruction{push} \register{rbx} 同时解决了两个问题？
+
+入口时：
+
+\begin{lstlisting}
+rsp = 16n + 8
+\end{lstlisting}
+
+执行 \instruction{push} \register{rbx} 后：
+
+\begin{lstlisting}
+rsp = 16n
+\end{lstlisting}
+
+这时执行 \instruction{call} \code{cpp_square}，调用点前 \register{rsp} 满足 16 字节对齐。同时 \register{rbx} 原值被保存到栈上，返回前 \instruction{pop} \register{rbx} 恢复。
+
+栈变化：
+
+\begin{lstlisting}
+on entry to asm_square_plus:
+    [rsp + 0]  return address to C++ caller
+
+after push rbx:
+    [rsp + 0]  saved rbx
+    [rsp + 8]  return address to C++ caller
+
+inside cpp_square after call:
+    [rsp + 0]  return address to asm_square_plus
+    [rsp + 8]  saved rbx
+    [rsp +16]  return address to C++ caller
+\end{lstlisting}
+
+\begin{warningbox}
+不要把“push 一个寄存器刚好对齐”当成万能模板。如果你还要分配局部栈空间，必须重新计算总共改变了多少 \register{rsp}。原则是：每个 \instruction{call} 执行前，调用者的 \register{rsp} 应为 16 字节对齐。
+\end{warningbox}
+
+\section{leaf 和 non-leaf 汇编模板}
+
+手写汇编可以先从两个模板开始。
+
+\subsection{leaf function 模板}
+
+leaf function 不调用其他函数。它可以非常简洁：
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+
+.globl function_name
+.type function_name, @function
+function_name:
+    # use caller-saved registers freely:
+    # rax, rcx, rdx, rsi, rdi, r8-r11, xmm0-xmm15
+    # preserve callee-saved registers if you touch them
+
+    ret
+.size function_name, .-function_name
+
+.section .note.GNU-stack,"",@progbits
+\end{lstlisting}
+
+对于短小整数函数，常见策略是只用 caller-saved 寄存器，避免保存恢复开销。
+
+\subsection{non-leaf function 模板}
+
+non-leaf function 会调用其他函数，必须更谨慎：
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+
+.globl function_name
+.type function_name, @function
+function_name:
+    push rbp
+    mov  rbp, rsp
+    push rbx
+    sub  rsp, 8
+
+    # now rsp is 16-byte aligned before calls
+    # save live caller-saved values yourself before each call if needed
+
+    call some_helper
+
+    add  rsp, 8
+    pop  rbx
+    pop  rbp
+    ret
+.size function_name, .-function_name
+
+.section .note.GNU-stack,"",@progbits
+\end{lstlisting}
+
+为什么有 \code{sub rsp, 8}？计算一下：
+
+\begin{lstlisting}
+entry:
+    rsp = 16n + 8
+
+push rbp:
+    rsp = 16n
+
+mov rbp, rsp:
+    no change
+
+push rbx:
+    rsp = 16n - 8
+
+sub rsp, 8:
+    rsp = 16n - 16
+\end{lstlisting}
+
+所以在 \instruction{call} \code{some_helper} 前，\register{rsp} 是 16 字节对齐。
+
+\begin{deepdive}
+真实编译器会根据局部变量大小、保存寄存器数量、是否省略帧指针、是否需要栈保护、是否有异常展开信息等因素生成不同序言。模板不是背诵答案，而是帮助你建立栈对齐和保存责任的算术模型。
+\end{deepdive}
+
+\section{栈展开、CFI 和异常边界}
+
+手写汇编函数不仅要能执行，还要能被工具理解。调试器回溯调用栈、profiler 在函数中间采样、异常展开查找调用者、崩溃报告打印 backtrace，都需要知道当前函数如何改变了 \register{rsp}、保存了哪些寄存器、返回地址在哪里。这些信息通常通过 unwind metadata 描述，在 GNU 汇编里常见写法是 CFI directives。
+
+\subsection{为什么只会运行还不够}
+
+一个 leaf function 不修改 \register{rsp}，不保存 callee-saved 寄存器，通常很好展开。工具可以认为返回地址仍在入口栈顶附近。可是一个 non-leaf function 如果执行了多次 \instruction{push}、\instruction{sub rsp, ...}、保存了 \register{rbx} 或 \register{rbp}，工具必须知道这些变化，才能从函数中间恢复调用者状态。
+
+如果缺少展开信息，程序仍然可能计算正确，但调试体验会明显变差。GDB 的 backtrace 可能在手写汇编函数处断掉；采样 profiler 可能把大量时间归到错误调用者；异常从 C++ helper 抛出并试图穿过汇编帧时，运行时可能无法正确清理上层帧；崩溃报告可能只显示一串地址。工程质量要求高时，这些都不能忽略。
+
+第一册不会要求完整掌握 DWARF CFI，但要知道它解决什么问题。CFI 不是给 CPU 执行的指令，而是给调试器、异常运行时和采样工具使用的元数据。它描述“在当前指令位置，调用者的栈顶在哪里，返回地址在哪里，保存寄存器在哪里”。
+
+\subsection{一个带 CFI 的简单框架}
+
+典型框架如下：
+
+\begin{lstlisting}
+.globl function_name
+.type function_name, @function
+function_name:
+    .cfi_startproc
+    push rbp
+    .cfi_def_cfa_offset 16
+    .cfi_offset rbp, -16
+    mov rbp, rsp
+    .cfi_def_cfa_register rbp
+
+    # function body
+
+    pop rbp
+    .cfi_def_cfa rsp, 8
+    ret
+    .cfi_endproc
+.size function_name, .-function_name
+\end{lstlisting}
+
+这段元数据的意思可以用人话解释。函数入口时，调用者的返回地址在栈顶；执行 \instruction{push rbp} 后，栈顶多了保存的 \register{rbp}，返回地址相对新的栈顶偏移改变；设置 \register{rbp} 为帧指针后，工具可以用 \register{rbp} 作为稳定基准；返回前弹出 \register{rbp} 后，CFA 又回到基于 \register{rsp} 的状态。
+
+实际 CFI 写法会随序言不同而变化。若函数省略帧指针，只用 \register{rsp} 加偏移描述；若保存多个 callee-saved 寄存器，每个保存位置都应有 \code{.cfi_offset}；若中途调整栈空间，CFA 偏移也要更新。初学阶段可以先保持栈框架简单，让 CFI 容易写对。
+
+\subsection{异常不要随便穿过裸汇编}
+
+C++ 异常展开需要知道每一层栈帧如何恢复。如果手写汇编调用一个可能抛异常的 C++ helper，而汇编帧没有正确展开信息，异常穿过该帧时可能出错。即使有 CFI，还要考虑清理逻辑：汇编函数是否保存了寄存器、是否持有资源、是否需要在异常路径恢复状态。这些工作 C++ 编译器会为 C++ 函数生成，但不会自动为你的手写汇编补齐。
+
+因此，热路径汇编 kernel 的推荐契约通常是：不抛异常，不让异常穿过汇编帧，不在汇编内管理 C++ 对象生命周期。如果需要调用可能失败的 helper，优先让 C++ wrapper 处理异常和错误码，再调用不会抛异常的汇编核心。若确实要写可展开汇编，那已经进入更高级的 ABI 和运行时工程，需要专门测试异常路径。
+
+\begin{keyidea}
+汇编函数的工程契约不止寄存器和返回值，还包括工具能否展开它。CFI、简单栈框架、清晰符号和不让异常随意穿过裸汇编，是可维护互操作代码的重要边界。
+\end{keyidea}
+
+\section{C++ 对象、引用和指针在边界上的形状}
+
+汇编只看见寄存器、内存和地址。C++ 的引用、指针、小结构体、大结构体在 ABI 层有不同形状。
+
+\subsection{引用通常就是地址}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" void asm_inc_ref(std::int64_t& x);
+\end{lstlisting}
+
+虽然源代码写的是引用，但汇编入口看到的通常是指针：
+
+\begin{lstlisting}
+on entry:
+    rdi = address of x
+\end{lstlisting}
+
+汇编实现：
+
+\begin{lstlisting}
+.globl asm_inc_ref
+.type asm_inc_ref, @function
+asm_inc_ref:
+    inc qword ptr [rdi]
+    ret
+.size asm_inc_ref, .-asm_inc_ref
+\end{lstlisting}
+
+这不意味着 C++ 引用“语言上等于指针”。语言层引用有别名、生命周期和绑定规则；ABI 层只是经常用地址传递它。
+
+\subsection{小结构体可能走寄存器}
+
+\begin{lstlisting}[language=C++]
+struct Pair64 {
+    std::int64_t lo;
+    std::int64_t hi;
+};
+
+extern "C" Pair64 asm_make_pair(std::int64_t x, std::int64_t y);
+\end{lstlisting}
+
+两个 64 位整数大小的结构体，在常见 System V AMD64 规则下可用 \register{rax} 和 \register{rdx} 返回：
+
+\begin{lstlisting}
+.globl asm_make_pair
+.type asm_make_pair, @function
+asm_make_pair:
+    mov rax, rdi
+    mov rdx, rsi
+    ret
+.size asm_make_pair, .-asm_make_pair
+\end{lstlisting}
+
+\subsection{大结构体通常通过隐藏指针返回}
+
+\begin{lstlisting}[language=C++]
+struct Triple64 {
+    std::int64_t a;
+    std::int64_t b;
+    std::int64_t c;
+};
+
+extern "C" Triple64 asm_make_triple(std::int64_t x,
+                                    std::int64_t y,
+                                    std::int64_t z);
+\end{lstlisting}
+
+常见入口状态：
+
+\begin{lstlisting}
+rdi = hidden pointer to return object
+rsi = x
+rdx = y
+rcx = z
+\end{lstlisting}
+
+实现：
+
+\begin{lstlisting}
+.globl asm_make_triple
+.type asm_make_triple, @function
+asm_make_triple:
+    mov rax, rdi
+    mov qword ptr [rdi + 0], rsi
+    mov qword ptr [rdi + 8], rdx
+    mov qword ptr [rdi +16], rcx
+    ret
+.size asm_make_triple, .-asm_make_triple
+\end{lstlisting}
+
+注意显式参数 \code{x} 不在 \register{rdi}，因为 \register{rdi} 被隐藏返回对象指针占用了。这是读跨语言汇编时很常见的坑。
+
+\section{全局数据和 RIP-relative addressing}
+
+在 x86-64 位置无关代码中，访问静态数据常用 RIP-relative addressing。
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+
+.globl asm_get_message
+.type asm_get_message, @function
+asm_get_message:
+    lea rax, [rip + message]
+    ret
+.size asm_get_message, .-asm_get_message
+
+.section .rodata
+message:
+    .asciz "hello from assembly"
+
+.section .note.GNU-stack,"",@progbits
+\end{lstlisting}
+
+C++ 声明：
+
+\begin{lstlisting}[language=C++]
+extern "C" const char* asm_get_message();
+\end{lstlisting}
+
+\instruction{lea} 不是读取字符串内容，而是计算字符串地址：
+
+\begin{lstlisting}
+rax = address of message
+\end{lstlisting}
+
+反汇编目标文件时，仍然可能看到 relocation，因为 \code{message} 的最终地址要到链接阶段才知道：
+
+\begin{lstlisting}
+lea rax, [rip + 0x0]
+    relocation: R_X86_64_PC32 .rodata-0x4
+\end{lstlisting}
+
+\begin{deepdive}
+RIP-relative addressing 的基准是下一条指令的地址，不是当前指令开头地址。这个规则和 \instruction{call} \code{rel32} 一样，都是 x86-64 位置无关代码的重要基础。后面讲动态库、PLT/GOT 和 PIC 时会继续展开。
+\end{deepdive}
+
+\section{结构体参数：把偏移当成公开契约}
+
+有些 kernel 参数太多，全部作为独立参数传递会超过寄存器数量，调用点也难读。此时可以用一个平凡参数块：
+
+\begin{lstlisting}[language=C++]
+struct DotConfig {
+    const std::int32_t* a;
+    const std::int32_t* b;
+    std::int64_t n;
+    std::int64_t stride_a;
+    std::int64_t stride_b;
+    std::int64_t bias;
+};
+
+extern "C" std::int64_t asm_dot_config(const DotConfig* cfg);
+\end{lstlisting}
+
+ABI 层只有一个显式参数：\register{rdi} 指向 \code{DotConfig}。汇编内部按偏移读取字段：
+
+\begin{lstlisting}
+# rdi = cfg
+mov r8,  qword ptr [rdi + 0]    # cfg->a
+mov r9,  qword ptr [rdi + 8]    # cfg->b
+mov rcx, qword ptr [rdi +16]    # cfg->n
+mov r10, qword ptr [rdi +24]    # cfg->stride_a
+mov r11, qword ptr [rdi +32]    # cfg->stride_b
+mov rax, qword ptr [rdi +40]    # cfg->bias
+\end{lstlisting}
+
+这种写法让函数签名稳定，但把结构体布局变成了汇编契约。只要 C++ 结构体字段顺序、类型、对齐或 padding 变化，汇编偏移就可能失效。为了防止静默错误，头文件必须给出布局断言：
+
+\begin{lstlisting}[language=C++]
+static_assert(sizeof(DotConfig) == 48);
+static_assert(alignof(DotConfig) == alignof(void*));
+static_assert(offsetof(DotConfig, a) == 0);
+static_assert(offsetof(DotConfig, b) == 8);
+static_assert(offsetof(DotConfig, n) == 16);
+static_assert(offsetof(DotConfig, stride_a) == 24);
+static_assert(offsetof(DotConfig, stride_b) == 32);
+static_assert(offsetof(DotConfig, bias) == 40);
+static_assert(std::is_standard_layout_v<DotConfig>);
+static_assert(std::is_trivially_copyable_v<DotConfig>);
+\end{lstlisting}
+
+\subsection{参数块的优点和代价}
+
+参数块有几个优点。第一，函数签名短，调用点清楚。第二，未来增加内部字段时，可以通过新增版本结构体或 wrapper 兼容旧接口。第三，汇编函数只占用一个参数寄存器，更多寄存器可用于循环内部状态。第四，调试时可以在 GDB 中一次查看整个参数块。
+
+代价也很明确。第一，汇编入口需要额外 load 字段，不能直接从参数寄存器拿到所有值。第二，参数块内存必须在调用期间有效。第三，布局变更风险更高。第四，如果参数块频繁构造且不在 cache 中，可能增加访存。第五，跨语言或跨编译器 ABI 时，结构体布局约定必须更严格。
+
+因此，参数块适合参数较多、配置较复杂、调用频率相对低于内部循环工作量的 kernel。若函数只有两三个整数参数，直接传寄存器更简单。若参数块用于公共 ABI，建议显式版本化：
+
+\begin{lstlisting}[language=C++]
+struct DotConfigV1 {
+    std::uint32_t size;
+    std::uint32_t version;
+    const std::int32_t* a;
+    const std::int32_t* b;
+    std::int64_t n;
+};
+\end{lstlisting}
+
+公共 wrapper 可以检查 \code{size} 和 \code{version}，再调用内部汇编 kernel。裸汇编热路径不一定要处理版本逻辑，但公共 API 层应当有办法拒绝不匹配的结构体。
+
+\begin{warningbox}
+结构体参数不是“绕过 ABI 表”的捷径。它只是把多个寄存器/栈参数换成一个指针，再把字段偏移变成新的二进制契约。偏移必须用 \code{static_assert} 固定，并在汇编注释中写清。
+\end{warningbox}
+
+\section{内联汇编为什么危险}
+
+很多人一学汇编就想在 C++ 里写 inline asm。工程上要反过来：除非你非常清楚编译器优化器和寄存器分配器会怎样看它，否则优先使用普通 C++、compiler builtin、intrinsics 或单独的 \code{.S} 文件。
+
+GNU extended asm 的基本形状：
+
+\begin{lstlisting}[language=C++]
+asm volatile (
+    "assembly template"
+    : output operands
+    : input operands
+    : clobbers
+);
+\end{lstlisting}
+
+它不是“把几行汇编插入 C++”这么简单。它是在告诉优化器：
+
+\begin{itemize}
+  \item 哪些值被这个 asm 读。
+  \item 哪些值被这个 asm 写。
+  \item 哪些寄存器、flags、内存状态被破坏。
+  \item 这个 asm 是否可以删除、移动或合并。
+\end{itemize}
+
+如果这些信息写错，编译器可能生成看似合理但实际错误的代码。
+
+\subsection{错误示例：没有声明输出}
+
+\begin{lstlisting}[language=C++]
+std::int64_t broken_add(std::int64_t a, std::int64_t b)
+{
+    std::int64_t result = a;
+    asm("add %1, %0" : : "r"(result), "r"(b));
+    return result;
+}
+\end{lstlisting}
+
+这段的问题是：模板里修改了 \code{\%0} 对应的寄存器，但约束里没有告诉编译器 \code{result} 是输出。优化器可以认为 \code{result} 没有改变。
+
+修复：
+
+\begin{lstlisting}[language=C++]
+std::int64_t fixed_add(std::int64_t a, std::int64_t b)
+{
+    std::int64_t result = a;
+    asm("add %1, %0"
+        : "+r"(result)
+        : "r"(b)
+        : "cc");
+    return result;
+}
+\end{lstlisting}
+
+\code{"+r"(result)} 表示这个操作数既输入又输出，并且放在某个通用寄存器中。\code{"cc"} 告诉编译器 condition codes 被修改。
+
+\subsection{错误示例：忘记 \code{"memory"} clobber}
+
+考虑一个人为的 store：
+
+\begin{lstlisting}[language=C++]
+void broken_store(std::int64_t* p, std::int64_t value)
+{
+    asm volatile("mov %1, (%0)" : : "r"(p), "r"(value));
+}
+\end{lstlisting}
+
+汇编确实写了 \code{*p}，但 C++ 优化器不知道这个 asm 会改变任意内存。若周围代码读取或写入同一内存，优化器可能重排。
+
+更清晰的写法是把内存作为输出操作数：
+
+\begin{lstlisting}[language=C++]
+void better_store(std::int64_t* p, std::int64_t value)
+{
+    asm volatile("mov %1, %0"
+        : "=m"(*p)
+        : "r"(value)
+        : "memory");
+}
+\end{lstlisting}
+
+这里 \code{"=m"(*p)} 明确描述被写的内存对象，\code{"memory"} 进一步作为编译器级内存屏障，防止优化器把其他内存访问跨过这个 asm 移动。
+
+\begin{warningbox}
+\code{"memory"} clobber 是编译器屏障，不是 CPU 内存栅栏。它限制编译器重排，但不会自动生成 \instruction{mfence}、\instruction{lfence} 或 locked instruction。多线程内存序问题必须用 C++ atomics 或明确的硬件同步指令解决。
+\end{warningbox}
+
+\subsection{\code{volatile} 不是万能药}
+
+\code{asm volatile} 的含义接近“这个 asm 有副作用，不要因为输出未使用就删除它，也不要随便合并”。但它不自动说明：
+
+\begin{itemize}
+  \item asm 读写了哪些 C++ 变量。
+  \item asm 修改了哪些寄存器。
+  \item asm 修改了 flags。
+  \item asm 访问了内存。
+  \item asm 可以作为 CPU fence。
+\end{itemize}
+
+所以 inline asm 的正确性来自 operands 和 clobbers，而不是只靠 \code{volatile}。
+
+\subsection{常见约束}
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.68\linewidth}}
+\toprule
+约束 & 含义 \\
+\midrule
+\code{"r"} & 任意通用寄存器。 \\
+\code{"m"} & 内存操作数。 \\
+\code{"i"} & 编译期立即数。 \\
+\code{"a"} & 使用 \register{rax}/\register{eax}/\register{al} 类寄存器。 \\
+\code{"=r"} & 只写输出寄存器。 \\
+\code{"+r"} & 读写同一个寄存器操作数。 \\
+\code{"=&r"} & early-clobber 输出，输出在所有输入读完前就可能被写。 \\
+\code{"0"} & 与第 0 个输出操作数使用同一位置。 \\
+\code{"cc"} & asm 修改了 flags。 \\
+\code{"memory"} & asm 可能读写未显式列出的内存，限制编译器重排。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{deepdive}
+inline asm 的约束是你和编译器寄存器分配器之间的合同。你不应该在模板里随便写固定寄存器名，然后忘记告诉编译器。固定寄存器越多，寄存器分配越难，优化器越受限制，错误空间也越大。
+\end{deepdive}
+
+\subsection{读写操作数和 matching constraint}
+
+很多指令要求某个输入和输出使用同一位置。最简单写法是 \code{"+r"}，表示该操作数先作为输入读入，asm 执行后又作为输出写回。前面的 \code{fixed_add} 就是这种情况：\code{result} 初值是 \code{a}，模板里对它执行 \instruction{add}，最终 \code{result} 变成新值。
+
+另一种写法是 matching constraint，例如 \code{"0"} 表示某个输入必须和第 0 个输出放在同一寄存器或同一操作数位置。它适合输出约束和输入约束需要分开表达的场景。初学者不必频繁使用，但看到它时要知道：这不是立即数 0，而是“匹配第 0 个操作数”的约束。
+
+\begin{lstlisting}[language=C++]
+std::uint64_t add_with_match(std::uint64_t a, std::uint64_t b)
+{
+    std::uint64_t out;
+    asm("add %2, %0"
+        : "=r"(out)
+        : "0"(a), "r"(b)
+        : "cc");
+    return out;
+}
+\end{lstlisting}
+
+这里第 0 个输出是 \code{out}，输入 \code{"0"(a)} 要求 \code{a} 放在同一个位置。模板执行前，该位置含有 \code{a}；执行后，同一位置成为 \code{out}。如果没有 matching 或读写约束，编译器可能把输入和输出放在不同寄存器，模板含义就和你想象不同。
+
+选择 \code{"+r"} 还是 matching constraint，取决于表达哪个更清楚。对简单读写同一 C++ 变量，\code{"+r"} 通常更直接；对输出变量和输入变量在 C++ 层是不同名字、但机器指令要求同一寄存器的情况，matching constraint 更明确。无论哪种，都要记住：约束是在描述数据流，不是在美化语法。
+
+\subsection{early-clobber：输出过早覆盖输入}
+
+\code{"=&r"} 表示 early-clobber 输出。它告诉编译器：这个输出可能在所有输入读取完成之前就被写，所以不能和某些输入分配到同一个寄存器。没有 early-clobber 时，编译器在认为安全的情况下可能让输出复用输入寄存器，以减少寄存器压力；但某些多指令 asm 模板中，这会破坏还没来得及读取的输入。
+
+考虑一个简化的两步模板：先把输出清零，再用输入计算。如果编译器把输出和某个输入放在同一寄存器，第一条清零就会提前毁掉输入值。此时应使用 early-clobber 输出，阻止这种重叠。
+
+\begin{lstlisting}[language=C++]
+std::uint64_t combine(std::uint64_t a, std::uint64_t b)
+{
+    std::uint64_t out;
+    asm volatile(
+        "xor %0, %0\n\t"
+        "add %1, %0\n\t"
+        "add %2, %0"
+        : "=&r"(out)
+        : "r"(a), "r"(b)
+        : "cc");
+    return out;
+}
+\end{lstlisting}
+
+这个例子可以用普通 C++ 写得更好，它在教材里只是说明 early-clobber 的含义。凡是 asm 模板由多条指令组成，并且输出在模板开头就被写，而输入在后面才被读取，都要检查是否需要 early-clobber。不要等到某个优化级别、某个寄存器压力场景下才偶发错误。
+
+\subsection{固定寄存器约束}
+
+有些指令天然要求固定寄存器。例如 \instruction{rdtsc} 把低 32 位写入 \register{eax}，高 32 位写入 \register{edx}；某些乘除法使用 \register{rax}/\register{rdx}；系统调用在 Linux x86-64 上有固定寄存器约定。这时可以使用 \code{"=a"}、\code{"=d"}、\code{"a"} 这类约束，让编译器知道固定寄存器需求。
+
+固定寄存器比普通 \code{"r"} 更限制寄存器分配。它不是坏事，但应该只在指令真的要求时使用。若你只是习惯在模板里写 \register{rax}、\register{rcx}，却没有在 clobber 或约束里声明，编译器可能同时把某个活跃 C++ 值也放在这些寄存器里，导致值被悄悄破坏。相反，如果你把一大堆寄存器都列为 clobber，编译器又会被迫保存和重算更多值。
+
+正确态度是精确表达：固定输出就写固定输出约束；固定输入就写固定输入约束；临时破坏但不作为输出的寄存器才放 clobber；能让编译器选择普通寄存器时就用 \code{"r"}。inline asm 的可维护性，很大程度上取决于这种克制。
+
+\subsection{\code{asm goto}：把 asm 接入 C++ 控制流}
+
+GNU 扩展还支持 \code{asm goto}，允许 asm 根据条件跳到 C++ 标签。它用于内核、低层运行时和某些静态分支机制。它比普通 inline asm 更危险，因为它把汇编控制流直接接入 C++ 控制流图，编译器需要知道可能跳到哪些标签。
+
+第一册不要求写 \code{asm goto}，但要知道它存在，并且不要用普通 \code{asm} 偷偷跳到 C++ 标签或函数内部地址。编译器如果不知道 asm 可能改变控制流，就会按错误的 CFG 优化周围代码。任何会影响控制流的 asm，都必须用编译器支持的机制准确描述目标。
+
+\begin{warningbox}
+inline asm 的输出、输入、early-clobber、固定寄存器和控制流目标，都必须告诉编译器。模板文本里写了什么，不等于优化器知道了什么。
+\end{warningbox}
+
+\subsection{inline asm 的思维模型}
+
+理解 inline asm 的关键是：编译器不会解析你的汇编模板并自动推断所有语义。对优化器来说，asm 模板大体像一个黑盒节点。这个黑盒有哪些输入、有哪些输出、会破坏哪些寄存器和 flags、是否访问未知内存，都要靠 operands 和 clobbers 描述。描述越准确，编译器越能安全优化；描述缺失，编译器就可能在完全合理的前提下生成错误代码。
+
+例如你在模板里写了 \instruction{add}，它会修改 flags。如果后面的 C++ 条件判断或另一个 asm 依赖 flags，而你没有写 \code{"cc"}，编译器可能认为 flags 没有被破坏。再例如你在模板里写了内存 store，却没有把被写内存列为输出，也没有写 \code{"memory"}，编译器可能把周围 load/store 移到 asm 前后，导致观察顺序和你想象不同。
+
+反过来，clobber 也不是越多越好。滥用 \code{"memory"} 会让编译器不敢重排许多内存访问，可能损失优化机会；固定太多寄存器会增加寄存器压力；不必要的 \code{volatile} 会阻止删除和合并。好的 inline asm 应该像好的函数接口一样，精确表达需要的信息，不多不少。
+
+\subsection{编译器屏障和硬件屏障}
+
+\code{"memory"} clobber 只告诉编译器：这个 asm 可能读写内存，所以不要把普通内存访问随意跨过它重排。它不一定生成任何硬件 fence，也不一定让其他 CPU 核心看到某种顺序。多线程同步必须使用 C++ 原子操作、系统调用约定、锁指令或明确的硬件屏障。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+asm volatile("" ::: "memory");
+\end{lstlisting}
+
+这是一种空的编译器屏障。它没有机器指令，却限制编译器重排。与此不同，\instruction{mfence}、\instruction{lfence}、\instruction{sfence} 或带 lock 前缀的指令是 CPU 层的同步机制，会影响硬件执行和内存可见性。把二者混淆，是并发代码中非常危险的错误。
+
+本书在第一册不深入多线程内存模型，但要强调一条底线：inline asm 不是绕开 C++ 内存模型的捷径。你可以用它表达特定机器指令，但必须同时向编译器和 CPU 两个层面说明顺序需求。只让其中一方知道，另一方仍然可能合法重排。
+
+\subsection{优先寻找替代方案}
+
+很多 inline asm 需求其实有更安全的替代方案。读时间戳可以使用编译器内建或封装好的平台函数；预取可以使用 builtin；SIMD 可以使用 intrinsics；原子操作应使用 \code{std::atomic} 或成熟库；特殊系统交互可以放到单独 \code{.S} 文件，并用普通函数 ABI 包装。
+
+inline asm 最适合非常局部、没有更好表达方式、且作者能精确描述优化器合同的场景。如果一段 inline asm 变长、需要多处标签、需要复杂寄存器分配、需要和 C++ 控制流交织，通常应该改成单独的汇编函数或 intrinsic 版本。这样边界更清楚，测试和反汇编审计也更容易。
+
+\begin{warningbox}
+inline asm 的危险不在于汇编语法本身，而在于它同时跨越 C++ 优化器、寄存器分配、ABI、内存模型和 CPU 指令语义。任何一个层面描述不完整，都可能只在高优化级或特定调用点暴露。
+\end{warningbox}
+
+\section{intrinsics、inline asm 与 \code{.S} 的选择}
+
+现代高性能代码通常优先选择下面顺序：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+方式 & 优点 & 风险 \\
+\midrule
+普通 C++ & 可移植、优化器可理解、测试容易。 & 不一定生成你想要的指令。 \\
+compiler builtin & 表达特殊语义，如 prefetch、expect、overflow。 & 依赖编译器扩展。 \\
+intrinsics & 直接表达 SIMD 指令，寄存器分配仍由编译器做。 & ISA 绑定强，代码可读性下降。 \\
+\code{.S} 文件 & 可完全控制函数级汇编和 ABI。 & 维护成本高，调试和 unwind 要额外注意。 \\
+inline asm & 可在表达式附近插入特殊指令。 & 最容易和优化器合同写错。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对于 AVX2/AVX-512/FMA/VNNI 这类后续 AI 算子优化，第二册会大量使用 intrinsics。原因是 intrinsics 让编译器仍然负责寄存器分配、调用约定、栈框架和调度的一部分，同时你可以明确控制核心 SIMD 操作。
+
+单独 \code{.S} 文件适合：
+
+\begin{itemize}
+  \item 你需要完全固定函数入口、寄存器分配和指令布局。
+  \item 你正在写非常小的热路径 kernel。
+  \item 你需要验证某个 ABI 或机器码现象。
+  \item 你愿意维护多 ISA 版本和测试矩阵。
+\end{itemize}
+
+inline asm 适合：
+
+\begin{itemize}
+  \item 少数没有合适 intrinsic 的特殊指令。
+  \item 需要非常局部的硬件交互。
+  \item 你已经能准确写出 operands、constraints 和 clobbers。
+\end{itemize}
+
+\section{调试和审计工作流}
+
+写互操作代码时，永远保留可审计证据。
+
+\subsection{编译参数}
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O2 -g -fno-omit-frame-pointer \
+    main.cpp kernels.S -o app
+\end{lstlisting}
+
+训练阶段建议：
+
+\begin{itemize}
+  \item 用 \code{-g} 保留调试信息。
+  \item 初期加 \code{-fno-omit-frame-pointer}，让栈回溯更直观。
+  \item 分别看 \code{-O0} 和 \code{-O2/-O3}，理解优化差异。
+  \item 对汇编文件保留注释和清晰符号名。
+\end{itemize}
+
+\subsection{符号审计}
+
+\begin{lstlisting}[language=bash]
+nm -C app | rg 'asm_|cpp_'
+readelf -Ws app | rg 'asm_|cpp_'
+\end{lstlisting}
+
+要检查：
+
+\begin{itemize}
+  \item 汇编函数是否真的导出。
+  \item C++ 是否引用了预期符号名。
+  \item 是否出现未预期的 mangled name。
+  \item 符号类型是否是函数。
+\end{itemize}
+
+\subsection{反汇编审计}
+
+\begin{lstlisting}[language=bash]
+objdump -drwC -Mintel app > app.objdump.txt
+rg -n '<asm_sum8>|<asm_square_plus>|call.*cpp_square' app.objdump.txt
+\end{lstlisting}
+
+要检查：
+
+\begin{itemize}
+  \item 参数寄存器使用是否和 ABI 一致。
+  \item 栈参数偏移是否正确。
+  \item callee-saved 寄存器是否成对保存恢复。
+  \item 调用前 \register{rsp} 是否对齐。
+  \item 是否出现你没预料到的 PLT 调用或间接跳转。
+\end{itemize}
+
+\subsection{GDB 单步}
+
+\begin{lstlisting}[language=bash]
+gdb ./app
+(gdb) break asm_square_plus
+(gdb) run
+(gdb) disassemble /r asm_square_plus
+(gdb) info registers rdi rax rbx rsp rip
+(gdb) x/6gx $rsp
+(gdb) stepi
+(gdb) info registers rdi rax rbx rsp rip
+\end{lstlisting}
+
+单步时不要只看源代码行。要看：
+
+\begin{itemize}
+  \item \register{rip} 是否进入预期符号。
+  \item \register{rsp} 每次 \instruction{push}、\instruction{pop}、\instruction{call}、\instruction{ret} 如何变化。
+  \item 返回地址是否位于预期栈槽。
+  \item 返回值是否写入 \register{rax} 或 \register{xmm0}。
+\end{itemize}
+
+\subsection{CI 中应该保留哪些检查}
+
+互操作代码不能只靠本地手工跑一次。进入项目后，至少应在 CI 中保留几类自动检查。第一，构建矩阵：Debug、Release、RelWithDebInfo 至少两种；若项目支持多个编译器，Clang 和 GCC 都应覆盖。第二，测试矩阵：确定性测试、随机测试、边界测试、非法输入 wrapper 测试。第三，工具审计：检查公共符号列表是否符合预期，检查目标文件没有 executable stack 警告，检查关键汇编函数仍然存在而没有被链接脚本或构建条件排除。
+
+符号审计可以很轻量。例如把允许导出的 \code{asm_} 符号写在一个文本清单里，CI 运行 \code{nm} 或 \code{readelf -Ws} 后比对。若某次改动多导出了 \code{helper}、\code{tmp_loop}，或者少了 \code{asm_dot_i32}，CI 应该失败。这能防止 ABI 面无意扩大，也能防止构建系统漏编某个汇编文件。
+
+反汇编审计也可以自动化一部分。比如检查 \code{asm_call_helper} 中是否出现 \code{call cpp_mul_add}，检查 \code{asm_dot_i32} 是否仍然有预期符号大小，检查某些测试专用坏符号没有链接进 release。不要把 CI 写成依赖每个机器码字节完全不变；编译器、链接器和地址布局会变化。更稳妥的是检查结构性事实：符号存在、重定位类型可解释、没有未定义符号、没有可执行栈、测试通过。
+
+\subsection{callee-saved 破坏的专门测试}
+
+callee-saved 寄存器破坏有时很难被普通结果测试发现。因为调用者不一定在这些寄存器里保存了重要值，或者优化级别不同，寄存器分配不同，错误可能暂时不暴露。为了测试这类问题，可以写一个小的 C++ 或汇编 harness，在调用待测函数前把 \register{rbx}、\register{rbp}、\register{r12} 到 \register{r15} 设置成哨兵值，调用后检查它们是否保持不变。
+
+这种 harness 本身也需要小心，因为普通 C++ 不能直接保证某个变量放在特定 callee-saved 寄存器。可以使用单独汇编测试包装器，或者在受控 inline asm 中设置和读取寄存器，并准确声明 clobber。第一册不要求你实现完整 harness，但要知道：仅比较函数返回值不能充分证明 ABI 保存责任正确。
+
+另一个实用办法是制造寄存器压力。让调用点周围有多个长期存活变量，编译器更可能把一些值放入 callee-saved 寄存器。若汇编函数破坏这些寄存器，调用后计算就可能失败。后面的汇编调用 C++ helper 实验要求构造这种调用者，就是为了让错误更容易显现。
+
+\subsection{栈对齐的专门测试}
+
+栈不对齐的错误有时不会立刻崩溃。若被调用 helper 只使用普通整数指令，它可能“看起来没问题”；一旦 helper 使用要求对齐的保存策略、调用库函数、编译器生成对齐假设下的 SIMD load/store，问题才暴露。因此，non-leaf 汇编函数必须专门测试栈对齐。
+
+一个实用办法是在 C++ helper 里检查入口附近的栈指针。普通 C++ 不能直接、可移植地读取 \register{rsp}，但在本章的 x86-64 GNU/Clang 环境中，可以写一个测试专用 helper：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool cpp_check_stack_alignment()
+{
+    std::uintptr_t rsp = 0;
+    asm volatile("mov %%rsp, %0" : "=r"(rsp));
+    return (rsp % 16) == 8;
+}
+\end{lstlisting}
+
+为什么检查 \code{rsp \% 16 == 8}？因为 System V AMD64 约定要求调用者在执行 \instruction{call} 前让 \register{rsp} 16 字节对齐；\instruction{call} 会压入 8 字节返回地址，所以被调用函数入口看到的 \register{rsp} 通常是 \code{16n + 8}。若 helper 入口看到别的余数，就说明调用者没有按约定对齐。
+
+这类 helper 只能用于测试，不应成为生产 API 的一部分。生产代码里更好的做法是通过汇编审计和清晰栈框架保证每个 call site 前对齐正确。测试 helper 的价值在于快速暴露错误版本，尤其适合教学。
+
+\subsection{保存寄存器的测试包装器}
+
+callee-saved 寄存器破坏也可以用汇编测试包装器直接检测。思路是：测试包装器先给 \register{rbx}、\register{rbp}、\register{r12} 到 \register{r15} 写入哨兵值，调用被测函数，返回后检查这些寄存器是否仍然等于哨兵值。
+
+伪代码如下：
+
+\begin{lstlisting}
+set rbx, sentinel0
+set r12, sentinel1
+set r13, sentinel2
+set r14, sentinel3
+set r15, sentinel4
+call function_under_test
+compare saved registers with sentinels
+return 0 if preserved, nonzero otherwise
+\end{lstlisting}
+
+这个包装器本身也必须遵守 ABI：它修改 callee-saved 寄存器时，要在返回给 C++ 测试程序前恢复原值。否则测试包装器会污染自己的调用者。实际工程中，可以把这种包装器写在测试专用 \code{.S} 文件里，只链接进测试二进制，不进入 release 库。
+
+若暂时不写专用包装器，也应至少使用寄存器压力测试和多次调用测试。比如在调用汇编函数前后保留多组活跃值，调用后参与校验。这样编译器更可能把一部分值放入 callee-saved 寄存器，从而让破坏更容易被发现。但这种方法是间接的，不如专用包装器可靠。
+
+\begin{keyidea}
+ABI 错误要用 ABI 级测试暴露。只比较函数返回值，往往抓不到 callee-saved 破坏、栈对齐错误和异常展开问题。
+\end{keyidea}
+
+\subsection{保护页和哨兵内存}
+
+测试汇编 load/store 越界时，普通数组不一定能暴露问题。越界一两个元素可能仍然落在同一分配块或 padding 中，程序不崩溃，结果也未必立即错。更强的测试方法是使用保护页或哨兵内存。保护页把不可访问页面放在缓冲区旁边，越界访问会触发缺页；哨兵内存在缓冲区前后填固定字节，调用后检查是否被改写。
+
+保护页测试能发现越界读写，但实现比普通单元测试复杂，需要系统调用分配页、设置页权限，并让数据靠近页边界。哨兵内存更简单，适合 CI 长期运行。两者都不能替代正确性证明，但能提高错误暴露概率。对汇编 kernel 来说，测试设计越接近它可能出错的边界，越有价值。
+
+同时要注意，非法输入测试应该打在 wrapper 层，而不是直接要求热路径 kernel 对所有非法输入安全返回。如果契约写明 \code{asm_dot_i32} 要求 \code{a} 和 \code{b} 指向至少 \code{n} 个元素，那么直接传空指针给 kernel 导致崩溃，不一定是 kernel bug；wrapper 没有阻止空指针，才是边界 bug。报告要区分这两层。
+
+\section{sanitizer 和手写汇编的边界}
+
+AddressSanitizer、UndefinedBehaviorSanitizer、ThreadSanitizer 对 C++ 很有价值，但它们不能自动理解你所有手写汇编内存访问。比如汇编里：
+
+\begin{lstlisting}
+mov rax, qword ptr [rdi + rcx*8]
+\end{lstlisting}
+
+如果 \register{rdi} 指向越界地址，ASan 未必能像检查 C++ 数组访问那样插桩发现。原因是插桩发生在编译器能理解的 IR 层；手写汇编已经绕过了这部分语义。
+
+因此汇编边界测试要更保守：
+
+\begin{itemize}
+  \item C++ wrapper 先检查尺寸、空指针和对齐前置条件。
+  \item 汇编 kernel 文档明确要求输入合法。
+  \item 随机测试使用保护页或额外 padding 检查越界。
+  \item 对 debug 版本提供纯 C++ reference path。
+  \item 必要时在汇编函数外层做 shadow check，而不是假设 sanitizer 能看见内部。
+\end{itemize}
+
+\begin{keyidea}
+优化 kernel 的工程边界通常是“外层 C++ 负责合法性和调度，内层汇编负责极少分支的热路径”。不要把复杂错误处理塞进手写汇编热循环。
+\end{keyidea}
+
+\subsection{工具能看到什么}
+
+sanitizer 的能力来自编译器插桩。C++ 源码被编译成中间表示时，编译器知道一次数组访问、一次类型转换、一次原子操作、一次函数调用的语义，于是能在关键位置插入检查。手写汇编已经是目标机器指令，编译器通常不会把 \code{[rdi + rcx*4]} 还原成“访问第 \code{rcx} 个元素并检查边界”。这不是 sanitizer 质量差，而是信息层次已经丢失。
+
+因此，sanitizer 仍然可以帮助发现 wrapper 层错误、调用前参数准备错误、C++ reference 错误、越界分配和释放错误，但它不保证覆盖汇编内部每一条 load/store。若汇编写坏了红区、越界写到仍然可访问的 padding、破坏 callee-saved 寄存器、返回错误地址，sanitizer 可能只在后续 C++ 代码中间接报错，甚至完全不报。
+
+这要求互操作项目把检查放在汇编外层。debug wrapper 可以做尺寸检查、对齐检查、重叠检查和范围检查；release wrapper 可以在性能和安全之间取舍；测试程序可以分配带 guard page 的缓冲区，故意把数组放在页边界附近，让越界访问更容易触发崩溃；也可以在调用前后检查哨兵字节和 callee-saved 寄存器间接效果。
+
+\subsection{纯 C++ reference 的价值}
+
+每个汇编 kernel 都应该有纯 C++ reference。reference 不一定快，但必须语义清楚、容易审查、容易被 sanitizer 插桩。汇编测试不应只比较少量手算答案，而应在大量输入上比较汇编结果和 reference 结果。这样即使汇编实现很复杂，正确性基准仍然在编译器可理解的语言层。
+
+reference 还帮助定义边界。如果 \code{n < 0} 是非法输入，reference 可以断言或由 wrapper 拒绝；如果 \code{n == 0} 应返回 0，reference 明确表达；如果 unsigned 溢出是预期 wraparound，reference 使用 unsigned 类型表达。不要让 reference 和汇编在未定义行为上“碰巧一致”。
+
+\subsection{调试符号和展开信息}
+
+手写汇编如果只追求能运行，调试体验会很差。没有清晰符号名，profiler 只显示匿名地址；没有 \code{.type} 和 \code{.size}，工具可能难以识别函数边界；没有正确的栈行为，GDB 回溯可能断裂；如果未来涉及异常或采样展开，还需要 CFI 信息描述保存寄存器和栈帧变化。
+
+第一册实验可以先不要求完整 CFI，但应该养成两点习惯：函数符号规范，栈变化简单可推导。等后续写更复杂 kernel，尤其是会调用 helper 或需要在生产 profiler 中出现的函数，就要补充展开信息，让工具能够从函数中间恢复调用者状态。
+
+\begin{warningbox}
+“sanitizer 没报错”和“汇编正确”不是同一件事。手写汇编的正确性必须由接口契约、reference、测试矩阵、反汇编审计和必要的动态观察共同证明。
+\end{warningbox}
+
+\section{一个接近算子 kernel 的例子：整数点积}
+
+先写标量整数点积，为后续 SIMD 章节做准备。
+
+C++ 声明：
+
+\begin{lstlisting}[language=C++]
+extern "C" std::int64_t asm_dot_i32(const std::int32_t* a,
+                                    const std::int32_t* b,
+                                    std::int64_t n);
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+sum = 0
+for i in [0, n):
+    sum += int64(a[i]) * int64(b[i])
+return sum
+\end{lstlisting}
+
+ABI 入口：
+
+\begin{lstlisting}
+rdi = a
+rsi = b
+rdx = n
+rax = return value
+\end{lstlisting}
+
+汇编：
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+
+.globl asm_dot_i32
+.type asm_dot_i32, @function
+asm_dot_i32:
+    xor rax, rax
+    test rdx, rdx
+    jle .Ldone
+
+    xor rcx, rcx
+.Lloop:
+    movsxd r8, dword ptr [rdi + rcx*4]
+    movsxd r9, dword ptr [rsi + rcx*4]
+    imul r8, r9
+    add rax, r8
+    inc rcx
+    cmp rcx, rdx
+    jl .Lloop
+
+.Ldone:
+    ret
+.size asm_dot_i32, .-asm_dot_i32
+
+.section .note.GNU-stack,"",@progbits
+\end{lstlisting}
+
+地址公式：
+
+\begin{lstlisting}
+address of a[i] = rdi + rcx * 4
+address of b[i] = rsi + rcx * 4
+\end{lstlisting}
+
+为什么 scale 是 4？因为 \code{std::int32_t} 元素大小是 4 字节。这个 scale 是 x86 地址模式支持的合法 scale。若元素结构大小是 12 字节，就不能写 \code{[base + index*12]}，必须用 \instruction{lea} 或其他指令拆解。
+
+这段代码还不是高性能点积。它每次循环只做一个元素，乘法和加载串行依赖较多，没有展开，没有 SIMD，也没有处理内存带宽。但它是非常好的互操作训练材料，因为它包含：
+
+\begin{itemize}
+  \item 指针参数。
+  \item signed load extension。
+  \item 循环控制流。
+  \item 数组地址公式。
+  \item 64 位累加返回值。
+\end{itemize}
+
+\section{汇编边界的文档模板}
+
+每个手写汇编函数都应有一段接口注释。示例：
+
+\begin{lstlisting}
+# std::int64_t asm_dot_i32(const std::int32_t* a,
+#                          const std::int32_t* b,
+#                          std::int64_t n)
+#
+# ABI:
+#   rdi = a
+#   rsi = b
+#   rdx = n
+#   rax = return sum
+#
+# Preconditions:
+#   a and b point to at least n int32 elements
+#   n >= 0
+#   pointers may be unaligned
+#
+# Clobbers:
+#   rax, rcx, r8, r9, flags
+#
+# Callee-saved:
+#   none modified
+\end{lstlisting}
+
+这不是形式主义。几个月后你优化这个 kernel 时，注释会告诉你哪些寄存器本来可以自由使用，哪些语义由外层保证，哪些行为必须保持。
+
+\subsection{文档要覆盖变更风险}
+
+接口注释不只服务当前实现，也服务未来修改。一个汇编 kernel 常会经历多个版本：标量版本、展开版本、SIMD 版本、按 ISA dispatch 的版本、为不同数据规模特化的版本。只要外部 C++ 声明不变，所有版本都必须遵守同一份契约。文档越清楚，后续优化越不容易破坏边界。
+
+建议在接口注释中额外写三类信息。
+
+第一，别名和重叠规则。输入输出是否允许相同指针？是否允许部分重叠？如果 \code{out == x} 可以，\code{out} 与 \code{y} 部分重叠不可以，就要明确写出。许多优化会改变 load/store 顺序，别名规则不清会让优化后的实现错得很隐蔽。
+
+第二，对齐和尾部规则。函数接受任意地址，还是要求 16/32/64 字节对齐？\code{n} 可以是任意值，还是必须是向量宽度的倍数？尾部由本函数处理，还是由外层 dispatch 到 scalar cleanup？这些规则会直接影响汇编循环结构。
+
+第三，异常和错误处理规则。汇编函数是否可能调用 C++ 函数？是否允许 helper 抛异常？如果前置条件不满足，是返回错误码、断言失败，还是未定义行为？热路径 kernel 通常不抛异常，也不在内部分配内存，这些约束应写清。
+
+第四，符号和可见性规则。这个符号是公共 ABI，还是仅供当前库内部使用？是否允许外部用户直接调用？若将来修改参数或前置条件，是否必须新增版本符号？这些问题看似偏链接层，但它们决定后续维护能否安全演进。
+
+第五，调试和展开规则。函数是否保持简单 leaf 形态？是否有帧指针？是否提供 CFI？是否允许 profiler 从函数中间展开？是否允许异常穿过该帧？如果答案是不允许，也应写清楚，让调用方不要把它放在异常传播路径上。
+
+\subsection{上线前审计清单}
+
+一个准备合入工程的汇编互操作函数，至少应通过下面检查：
+
+\begin{enumerate}
+  \item C++ 头文件声明和汇编导出符号完全一致。
+  \item 参数位置和返回位置有 ABI 推导表。
+  \item 每个 callee-saved 寄存器的修改都有保存恢复证据。
+  \item 每个 \instruction{call} 前的 \register{rsp} 对齐经过计算。
+  \item 栈参数偏移基于当前 \register{rsp} 或 \register{rbp} 状态重新计算。
+  \item 全局数据访问使用适合 PIE/PIC 的寻址方式。
+  \item 目标文件 relocation 能解释，最终二进制反汇编已审计。
+  \item 公共符号和内部符号边界清楚，没有意外导出。
+  \item non-leaf 或复杂栈帧函数具备可解释的展开策略；需要时提供 CFI。
+  \item C++ reference 存在，且测试覆盖确定性、随机和边界输入。
+  \item sanitizer 能覆盖 wrapper 层；汇编内部风险有额外测试。
+  \item CI 覆盖至少两种构建类型，并包含符号或二进制结构性检查。
+  \item 性能报告包含输入规模、平台、编译选项和测量方法。
+\end{enumerate}
+
+这张清单看起来长，但它的目的不是增加流程负担，而是防止低级 ABI 错误混进后续性能工作。一个边界错误的 kernel，即使跑得很快，也没有工程价值。
+
+\begin{keyidea}
+汇编优化的前提是契约稳定。没有接口文档、测试矩阵和二进制审计，性能数字越漂亮，风险越大。
+\end{keyidea}
+
+\section{互操作 API 的设计审查}
+
+在写第一行汇编之前，应该先审查 API。很多汇编互操作问题并不是指令写错，而是接口一开始就把不稳定、不清楚、难测试的东西暴露给了二进制边界。一个好 API 会让汇编实现简单、测试容易、后续优化安全；一个坏 API 会让每个版本都在猜调用者到底承诺了什么。
+
+互操作 API 设计可以按五个问题审查。
+
+第一，参数是否表达了完整边界。指针参数通常需要长度；输出缓冲区需要容量；stride 需要单位；矩阵需要行数、列数和 leading dimension；字符串需要说明是否以零结尾，还是显式长度。只传一个裸指针，却让汇编函数在内部猜长度，是危险接口。汇编没有类型系统保护，越要把边界写成参数或前置条件。
+
+第二，类型宽度是否固定。跨汇编边界优先使用 \code{std::int32_t}、\code{std::uint64_t}、\code{std::size_t} 这类语义明确的类型，不要用含糊的 \code{long} 作为公共接口，除非接口明确只服务某个 ABI。尤其是 Windows x64 和 System V AMD64 上 \code{long} 宽度不同，把它放进跨平台接口会制造移植陷阱。
+
+第三，错误如何报告。热路径汇编 kernel 常常假设输入满足前置条件，不在内部做复杂错误处理；公共 wrapper 则应检查空指针、长度为负、容量不足、版本不匹配等问题。不要让汇编函数一边承担性能热路径，一边承担用户输入验证、异常转换和日志输出。职责混在一起，既慢又难审计。
+
+第四，内存所有权是否单向清楚。汇编函数一般不应该分配内存再让 C++ 调用者猜如何释放；也不应该保存一个指向调用者临时对象的指针，除非文档明确生命周期。若必须跨边界管理资源，应提供成对的创建/销毁函数，并规定同一个模块负责分配和释放。
+
+第五，版本演进是否有空间。公开 ABI 一旦发布，修改参数顺序、结构体字段、返回方式都会破坏旧调用者。若你预计接口会演进，可以使用参数块加 \code{size}、\code{version} 字段，或者保留内部符号只让 C++ wrapper 暴露稳定 API。不要把第一次实验用的裸符号直接变成长期公共 ABI。
+
+\begin{mentalmodel}
+汇编互操作的 API 不是“让汇编能被调用”就够了。它要同时满足可推导、可测试、可审计、可演进。写汇编之前先审查 API，通常比事后调 ABI bug 更便宜。
+\end{mentalmodel}
+
+\subsection{wrapper 应该承担哪些责任}
+
+C++ wrapper 不是多余包装。它是把语言层复杂性和汇编热路径隔开的缓冲层。一个设计良好的 wrapper 通常承担下面职责：
+
+\begin{itemize}
+  \item 检查公共 API 的输入合法性，例如空指针、长度、容量、版本号。
+  \item 把 C++ 类型转换成汇编 kernel 需要的简单类型，例如裸指针、字节数、元素数。
+  \item 处理尾部、空输入、小输入和错误路径。
+  \item 根据 CPU 特性或构建选项选择不同 kernel。
+  \item 维护 reference 结果或 debug 校验。
+  \item 隐藏内部符号，避免外部用户绕过契约直接调用 kernel。
+\end{itemize}
+
+汇编 kernel 则应尽量只做一件事：在清晰前置条件下执行核心计算。例如 \code{asm_dot_i32} 可以假设 \code{a} 和 \code{b} 指向至少 \code{n} 个元素，\code{n >= 0}，返回 64 位累加和。它不应该打印错误，不应该分配内存，不应该解析命令行，不应该在热循环里检查每个指针是否为空。这样写出的 kernel 才容易证明 ABI 正确，也容易测量性能。
+
+wrapper 和 kernel 的边界还可以服务测试。wrapper 测试覆盖公共行为：错误输入、空输入、边界长度、异常路径。kernel 测试覆盖核心计算：寄存器保存、栈对齐、边界 n、随机数据、别名规则。两层测试混在一起，会让失败定位困难；分开之后，公共接口错和汇编实现错能更快区分。
+
+\subsection{哪些接口不适合直接给汇编}
+
+并不是所有 C++ 接口都适合直接由汇编实现。下面几类应谨慎。
+
+第一，接受复杂 C++ 对象的接口。对象可能有非平凡构造、析构、虚表、异常语义、allocator、内部不变量。汇编直接操作它们的字段，等于把对象布局和生命周期全部公开。除非这是非常受控的内部实现，否则应通过 wrapper 提取简单数据。
+
+第二，含有模板和内联策略的接口。模板实例化可能生成多个符号，名字修饰复杂，类型组合多。汇编更适合实现少量稳定的 concrete kernel，再由模板 wrapper 做类型分发。
+
+第三，含有异常传播的接口。裸汇编若没有正确 CFI 和异常边界设计，不应让 C++ 异常穿过。公共 wrapper 可以把异常转换成错误码，或保证调用的汇编函数不抛异常、不调用会抛异常的 helper。
+
+第四，跨标准库对象的接口。例如直接传 \code{std::string}、\code{std::vector}、\code{std::span} 到公共汇编 ABI。 \code{std::span} 在 C++ 源码层很轻量，但它的对象布局仍是 C++ 类型约定；公共 ABI 更稳的做法是把它拆成指针和长度。内部同编译器同版本工程里可以更灵活，但文档要写清范围。
+
+\section{二进制审计应成为开发循环的一部分}
+
+互操作开发不能等到最后才看反汇编。推荐每次修改汇编或 wrapper 后都做一次小审计，确认源代码层、目标文件层和链接后层一致。
+
+一个实用开发循环如下：
+
+\begin{enumerate}
+  \item 修改 C++ 声明、wrapper 或 \filepath{.S}。
+  \item 编译目标文件，不先跑性能。
+  \item 用 \code{nm -C} 检查导出符号和未定义符号。
+  \item 用 \code{objdump -drwC -Mintel} 检查指令、重定位和调用目标。
+  \item 用 \code{readelf -s -r -S} 检查符号表、重定位和 section。
+  \item 跑正确性测试，包括边界和随机输入。
+  \item 跑 ABI 专门测试，例如 callee-saved、栈对齐、错误路径。
+  \item 最后再做 benchmark。
+\end{enumerate}
+
+这个顺序有一个重要理由：性能测量只能在正确边界上进行。若符号错、参数错、返回错、栈错，benchmark 结果没有意义。很多“汇编版本快很多”的故事，最后发现只是少算了元素、少处理了尾部、破坏了返回值或被优化器绕开了调用。
+
+\subsection{符号审计要看正反两面}
+
+符号审计不只看你想导出的符号是否存在，还要看不想导出的符号是否泄漏。公共库里意外导出内部 kernel，会让外部用户绕过 wrapper 直接调用，未来你就很难修改前置条件。可以通过可见性属性、版本脚本、命名约定或构建系统控制导出集合。
+
+同时要检查未定义符号是否符合预期。一个 leaf 汇编 kernel 不应该意外引用 \code{printf}；一个本应完全静态的目标文件不应该留下未解释的外部 helper；一个位置无关对象不应该出现不适合动态库的绝对重定位。未定义符号不是一定错误，但必须能解释。
+
+\subsection{重定位审计能发现地址层错误}
+
+RIP-relative、GOT、PLT、绝对地址、局部标签和外部符号都会在目标文件中留下不同形态。手写汇编若用错地址写法，可能在非 PIE 可执行文件中能链接，在 PIE 或动态库中失败；也可能在链接时通过，但运行时地址被截断。用 \code{objdump -drwC} 和 \code{readelf -r} 审计重定位，可以及早发现这类问题。
+
+审计时不要只看指令助记符，要看重定位类型和符号。访问内部只读表、调用外部函数、读取全局变量、返回字符串地址，分别可能需要不同重定位。若你不理解某个重定位项，先不要把代码视为稳定。它可能是合理的，也可能是地址模型不匹配。
+
+\section{互操作测试要故意制造坏情况}
+
+只测几个正常输入，不能证明汇编边界安全。互操作测试应故意制造容易暴露 ABI 和边界错误的情况。
+
+第一，长度边界。测试 \code{n = 0}、\code{n = 1}、向量宽度减一、向量宽度、向量宽度加一、大长度，以及可能触发 32 位截断的长度。即使第一册的 kernel 是标量，也应养成这个习惯，因为未来 SIMD 版本最容易在尾部出错。
+
+第二，数据边界。整数 kernel 要测试 0、1、-1、最大值、最小值、随机值和会触发累加溢出的组合。浮点 kernel 要测试 0、负数、极大值、极小值、NaN、Inf、非规格化数是否在接口范围内。若接口声明不支持某些值，也要有测试确认 wrapper 拒绝或文档明确前置条件。
+
+第三，地址边界。使用不同对齐的指针，测试输入和输出相同、部分重叠、完全不重叠，测试靠近保护页末尾的缓冲区以暴露越界读写。保护页测试尤其适合发现“多读几个元素但结果没用”的 SIMD 或展开 bug。
+
+第四，寄存器边界。用测试 wrapper 在调用汇编函数前给 callee-saved 寄存器写特定哨兵值，调用后检查是否保持。也可以在调用前后记录 \register{rsp}，检查栈是否恢复。普通功能测试很难发现这类错误，因为返回值可能正确，但调用者状态已经被破坏。
+
+第五，链接边界。至少测试 debug/release 两种构建，PIE 与非 PIE，静态库或动态库模式中的一种。如果函数预计作为库内部符号使用，还要测试外部不能直接链接到内部符号。链接方式改变后才出现的问题，通常说明地址模型或符号可见性没有设计清楚。
+
+\begin{keyidea}
+互操作测试的价值在于主动寻找“正常样例看不出来”的错误：尾部、对齐、别名、寄存器保存、栈状态、重定位和符号边界。
+\end{keyidea}
+
+\section{从标量 kernel 演进到优化 kernel}
+
+本章的点积示例故意保持标量。真实项目里，汇编 kernel 往往会从标量版本演进到展开、SIMD、多 ISA dispatch、预取、分块和多线程版本。演进过程中最重要的是保持外部契约不变，并让每一步都有 reference 对照。
+
+建议采用分阶段策略。
+
+第一阶段，写纯 C++ reference。它应尽量直接、清楚、定义良好，不追求最快。reference 是正确性标准，不是性能目标。若 reference 也写得过度优化，后面发现差异时很难判断谁错。
+
+第二阶段，写标量汇编 kernel。目标是验证 ABI、符号、构建、测试和文档流程。标量汇编未必比 C++ 快，但它能暴露所有互操作基础问题。
+
+第三阶段，做小幅结构优化，例如减少无用 load/store、使用更合适的寄存器分配、展开两到四次。每次优化后都跑完整正确性测试和二进制审计，确保不是靠改变语义获得速度。
+
+第四阶段，引入 ISA 特定实现，例如 SSE、AVX2、AVX-512 或平台专用扩展。这时 wrapper 应负责检测 CPU 特性和选择函数指针，公共 API 不应要求调用者知道内部 ISA。
+
+第五阶段，建立性能矩阵。不同输入规模、对齐、数据分布、尾部长度、cache 状态都要覆盖。一个 SIMD kernel 在大输入上快，不代表小输入也值得 dispatch；一个展开版本在某台 CPU 上快，不代表所有 CPU 上都快。dispatch 策略本身也要测。
+
+\subsection{不要删除旧的 reference 和标量版本}
+
+优化版本合入后，reference 和标量版本仍然有价值。reference 继续作为正确性标准；标量版本继续作为调试退路、无特殊 ISA 机器的 fallback、差异定位工具和教学材料。当 SIMD 版本在某个边界失败时，用标量版本对比可以快速缩小问题范围。
+
+如果担心生产二进制体积，可以通过构建选项控制是否包含调试 kernel，但源码和测试中应保留它们。一个项目只有“最快版本”，没有“最清楚版本”，长期维护会变得困难。
+
+\section{内联汇编的替代路线}
+
+很多 inline asm 的需求其实有更安全的替代路线。
+
+第一，普通 C++ 加编译器内建函数。溢出检测可以用 \code{__builtin_add_overflow}；位操作可以用 \code{std::countr_zero}、\code{std::popcount}、\code{std::rotl}；内存屏障和原子语义可以用 \code{std::atomic}。这些形式让编译器理解语义，通常比黑盒 asm 更容易优化。
+
+第二，intrinsics。若你需要特定 SIMD 指令，intrinsics 往往比 inline asm 更合适。它们仍然暴露目标 ISA，但编译器知道寄存器、类型和依赖关系，能做调度和寄存器分配。intrinsics 也更容易和 C++ 类型、模板 dispatch、调试信息结合。
+
+第三，单独 \filepath{.S} 文件。若你确实需要完全控制指令序列、标签、对齐和寄存器，单独汇编文件通常比 inline asm 更清晰。它有明确 ABI 边界，可以用 objdump 审计，可以写完整 CFI，也不会把优化器约束和 C++ 表达式混在同一个语句里。
+
+第四，编译器属性或选项。有时你只是想阻止内联、保留帧指针、指定目标 ISA、调整对齐或打开某个优化选项，不需要写 asm。先查编译器是否已有属性或 pragma。用 asm 解决编译器已经支持的问题，通常会降低可移植性和可维护性。
+
+inline asm 不是禁区，但它应该是最后选择。使用它时，必须写清 operands、clobbers、内存语义、flags 语义和测试覆盖。若无法向另一个工程师解释每个约束为什么正确，就说明这段 asm 不应进入核心代码。
+
+\section{互操作代码评审应该问什么}
+
+评审汇编互操作代码时，不要只看指令是否“看起来对”。建议 reviewer 按下面问题逐项追问。
+
+\begin{enumerate}
+  \item 公共 C++ 声明在哪里，是否只有一个权威声明。
+  \item 这个函数是否公共 ABI，还是内部实现细节。
+  \item 参数和返回值的 ABI 推导是否写在注释或文档里。
+  \item 前置条件是否覆盖指针、长度、对齐、别名和尾部。
+  \item 错误输入由 wrapper 处理，还是被声明为未定义前置条件。
+  \item 所有 callee-saved 寄存器是否在所有路径恢复。
+  \item 所有 \instruction{call} 前栈是否对齐，变参调用是否设置必要元信息。
+  \item 全局数据访问是否适合目标链接模式。
+  \item 测试是否包含边界、随机、寄存器保存和栈对齐。
+  \item benchmark 是否在 correctness 和二进制审计之后进行。
+\end{enumerate}
+
+如果评审只能回答“样例能跑”，这段代码还不应合入。底层互操作的风险不在于简单输入失败，而在于某个未来版本、某个链接模式、某个边界长度、某个调用者寄存器状态下失败。
+
+\section{互操作接口的版本化}
+
+只要一个汇编符号可能被外部用户、插件、脚本绑定或其他库直接调用，它就需要版本化思维。版本化不是一开始就设计复杂框架，而是承认接口会演进，并给演进留出空间。
+
+最简单的版本化方式是符号名版本化：
+
+\begin{lstlisting}
+asm_dot_i32_v1
+asm_dot_i32_v2
+\end{lstlisting}
+
+\code{v1} 保持旧参数和旧语义，\code{v2} 可以增加参数、改变前置条件或使用新的结果格式。公共 wrapper 根据调用者需求选择版本。这样旧二进制仍然可以链接旧符号，新代码可以迁移到新符号。缺点是符号数量增加，维护成本上升。
+
+另一种方式是参数块版本化：
+
+\begin{lstlisting}[language=C++]
+struct DotConfigV1 {
+    std::uint32_t size;
+    std::uint32_t version;
+    const std::int32_t* a;
+    const std::int32_t* b;
+    std::int64_t n;
+};
+\end{lstlisting}
+
+wrapper 先检查 \code{size} 和 \code{version}，再调用内部汇编。未来增加字段时，可以让新结构体尾部扩展，旧字段 offset 不变。内部热路径不一定直接处理所有版本；它可以只接收 wrapper 规范化后的简单参数。
+
+\subsection{什么时候必须新增版本}
+
+下面变化通常需要新增版本或明确破坏 ABI：
+
+\begin{itemize}
+  \item 参数数量、顺序、类型或宽度改变。
+  \item 返回类型或大结构体返回方式改变。
+  \item 参数块字段顺序、对齐、大小或语义改变。
+  \item 允许或禁止输入输出重叠。
+  \item 对齐前置条件从任意地址变成必须 32 字节对齐。
+  \item 错误处理从返回错误码变成未定义行为，或反过来。
+  \item 所有权规则改变，例如返回指针释放方式改变。
+\end{itemize}
+
+下面变化未必需要新增公共 ABI，但需要更新文档和测试：
+
+\begin{itemize}
+  \item 内部寄存器分配改变。
+  \item 标量实现换成展开实现。
+  \item wrapper 内部选择不同 kernel。
+  \item 性能阈值或 dispatch 策略改变。
+  \item 添加新的内部符号但不公开。
+\end{itemize}
+
+判断标准很简单：外部调用者是否需要重新编译或修改调用方式？旧二进制是否仍能正确调用？如果答案不确定，就不要假装兼容。
+
+\section{dispatch：选择实现也是接口的一部分}
+
+许多底层库会有多个实现：reference、标量汇编、展开版本、特定 ISA 版本、调试检查版本。选择哪个实现，称为 dispatch。第一册不深入 SIMD 指令，但需要理解 dispatch 的工程边界。
+
+一个安全的 dispatch 层应满足：
+
+\begin{itemize}
+  \item 公共函数签名稳定。
+  \item 每个内部 kernel 共享同一语义合同。
+  \item CPU 特性检测只在 wrapper 或初始化层进行。
+  \item 不支持的 ISA 不会被调用。
+  \item 可以通过环境变量或测试选项强制选择某个实现。
+  \item benchmark 报告记录实际选择的实现。
+\end{itemize}
+
+如果 benchmark 只写“测试了 \code{dot_i32}”，但没有记录 dispatch 到 \code{asm_scalar} 还是其他版本，结果不可解释。即使第一册暂时只有标量实现，也应该让报告养成记录 implementation name 的习惯。
+
+\subsection{函数指针 dispatch 的基本形态}
+
+一个常见形态：
+
+\begin{lstlisting}[language=C++]
+using DotFn = std::int64_t (*)(const std::int32_t*,
+                               const std::int32_t*,
+                               std::int64_t);
+
+DotFn select_dot_impl()
+{
+    if (cpu_supports_fast_impl()) {
+        return asm_dot_i32_fast;
+    }
+    return asm_dot_i32_scalar;
+}
+\end{lstlisting}
+
+公共 wrapper：
+
+\begin{lstlisting}[language=C++]
+std::int64_t dot_i32(const std::int32_t* a,
+                     const std::int32_t* b,
+                     std::int64_t n)
+{
+    static DotFn fn = select_dot_impl();
+    return fn(a, b, n);
+}
+\end{lstlisting}
+
+这里公共 ABI 是 \code{dot_i32}，内部 ABI 是多个 \code{asm_dot_i32_*}。测试应能分别直接测试内部实现，也能测试 dispatch 后的公共函数。性能报告要说明是否包含 dispatch 开销。若 \code{dot_i32} 在热循环中反复调用，函数指针间接调用开销可能重要；若每次调用处理大量数据，开销可能可忽略。
+
+\subsection{dispatch 失败的常见模式}
+
+第一，CPU 特性检测错误。程序在不支持某 ISA 的机器上调用了需要该 ISA 的 kernel，导致非法指令异常。测试必须包含 fallback 路径，或在 CI 中至少模拟强制 fallback。
+
+第二，多个实现语义不一致。标量版本允许任意对齐，快速版本要求对齐但 wrapper 没检查；标量版本处理尾部，快速版本假设 \code{n} 是倍数；某个版本对溢出和舍入处理不同。这类错误会表现为“只有某些机器错”。
+
+第三，benchmark 测错实现。环境变量、CPU 检测、构建选项或链接顺序导致实际运行了 reference 或 fallback，而报告以为运行了快速版本。解决办法是让每个实现返回可记录的名称，或在报告中保存符号/反汇编证据。
+
+\section{互操作发布前的二进制兼容检查}
+
+发布一个包含汇编互操作的库前，应做二进制兼容检查。最小检查包括：
+
+\begin{enumerate}
+  \item 导出符号列表是否只包含公共 ABI。
+  \item 公共符号名是否与上个版本兼容。
+  \item 参数块 \code{sizeof}/\code{alignof}/\code{offsetof} 是否保持。
+  \item 动态库依赖是否符合预期。
+  \item 构建是否在 PIE/非 PIE 或共享库模式下都通过。
+  \item stripped 二进制是否仍保留必要 unwind 信息。
+  \item 崩溃时能否用 build-id 找到符号和源码。
+\end{enumerate}
+
+可以保存一个符号快照：
+
+\begin{lstlisting}[language=bash]
+nm -D --defined-only libfast.so | c++filt > abi-symbols.txt
+readelf -d libfast.so > dynamic.txt
+readelf -Ws libfast.so > symbols-full.txt
+\end{lstlisting}
+
+下一次发布时与旧快照比较。如果公共符号消失、类型从 function 变成 object、可见性改变、版本脚本变化，都要审查。不是所有差异都是错误，但每个公共 ABI 差异都需要解释。
+
+\section{案例：一次看似优化的 ABI 破坏}
+
+假设一个点积 kernel 原本声明为：
+
+\begin{lstlisting}[language=C++]
+extern "C" std::int64_t asm_dot_i32(const std::int32_t* a,
+                                    const std::int32_t* b,
+                                    std::int64_t n);
+\end{lstlisting}
+
+后来为了减少参数，开发者改成参数块：
+
+\begin{lstlisting}[language=C++]
+struct DotArgs {
+    const std::int32_t* a;
+    const std::int32_t* b;
+    std::int64_t n;
+};
+
+extern "C" std::int64_t asm_dot_i32(const DotArgs* args);
+\end{lstlisting}
+
+如果公共符号名仍叫 \code{asm_dot_i32}，旧调用者会继续按旧 ABI 把 \code{a} 放在 \register{rdi}、\code{b} 放在 \register{rsi}、\code{n} 放在 \register{rdx}。新实现却把 \register{rdi} 当作 \code{DotArgs*}，于是会从 \code{a} 指向的数据开头读取三个字段。返回值可能是垃圾，甚至越界崩溃。
+
+这个错误无法靠“新代码测试通过”发现，因为新测试使用新声明。必须有 ABI 兼容测试或符号版本策略。正确做法是新增 \code{asm_dot_i32_v2}，保留旧 \code{asm_dot_i32_v1}，或者明确这是破坏性版本并更改公共库版本。
+
+\section{互操作文档的生命周期}
+
+接口文档不是写完一次就结束。每次修改汇编实现或 wrapper，都要检查文档是否仍然真实。常见文档腐烂包括：
+
+\begin{itemize}
+  \item 注释说不修改 callee-saved，但新版本用了 \register{rbx}。
+  \item 注释说任意对齐，但新版本使用对齐 load。
+  \item 注释说 \code{n >= 0}，wrapper 实际允许负数并转换成大无符号。
+  \item 注释说 leaf function，但新版本调用 helper。
+  \item 注释说不会访问全局状态，但 dispatch 读取环境变量。
+\end{itemize}
+
+可以把文档检查纳入 review checklist。每次改汇编，都问：接口注释、C++ 声明、测试、反汇编审计和 benchmark 报告是否同步更新？底层代码最怕“注释仍然描述旧世界”。错误注释比没有注释更危险，因为它会给 reviewer 错误信心。
+
+\begin{keyidea}
+互操作代码的维护质量取决于四个同步：声明和实现同步，文档和实现同步，测试和前置条件同步，benchmark 和实际 dispatch 同步。
+\end{keyidea}
+
+\section{综合案例：从 C++ wrapper 到汇编 kernel 的完整边界}
+
+设计一个内部点积接口：
+
+\begin{lstlisting}[language=C++]
+std::int64_t dot_i32(std::span<const std::int32_t> a,
+                     std::span<const std::int32_t> b);
+\end{lstlisting}
+
+公共 wrapper 应先检查：
+
+\begin{lstlisting}[language=C++]
+if (a.size() != b.size()) {
+    throw std::invalid_argument("size mismatch");
+}
+if (a.empty()) {
+    return 0;
+}
+\end{lstlisting}
+
+然后调用内部 C ABI kernel：
+
+\begin{lstlisting}[language=C++]
+extern "C" std::int64_t asm_dot_i32_kernel(const std::int32_t* a,
+                                           const std::int32_t* b,
+                                           std::int64_t n);
+\end{lstlisting}
+
+这个设计把职责分开。wrapper 处理 C++ 类型、长度一致、空输入、异常和未来 dispatch；汇编 kernel 只处理已经验证的裸指针和长度。kernel 文档写：
+
+\begin{lstlisting}
+Preconditions:
+    a and b point to at least n int32 elements
+    n > 0
+    input ranges do not need special alignment
+    function does not allocate, throw, or call back into C++
+
+ABI:
+    rdi = a
+    rsi = b
+    rdx = n
+    rax = int64 result
+\end{lstlisting}
+
+测试分三层。第一层测试 wrapper：长度不等、空输入、正常输入、异常路径。第二层测试 kernel：小 n、随机数据、负数、大值、寄存器保存、栈对齐。第三层测试 dispatch：强制 reference、强制 asm、默认自动选择，并记录实际实现名。
+
+benchmark 也分两种。若要测公共 API，就包含 wrapper 和 dispatch 开销；若要测 kernel，就直接调用 \code{asm_dot_i32_kernel} 或一个薄 C wrapper。报告必须写清测的是哪一层。两者都合理，但不能混淆。
+
+\section{自测清单：互操作工程是否合格}
+
+完成本章后，应能回答：
+
+\begin{enumerate}
+  \item 公共 C++ API 和内部汇编 ABI 为什么应分层。
+  \item \code{extern "C"} 改变什么，不改变什么。
+  \item 为什么参数块布局需要 \code{static_assert}。
+  \item leaf 和 non-leaf 汇编函数的栈责任有什么不同。
+  \item inline asm 的 operands、clobbers、\code{volatile} 分别解决什么问题。
+  \item \code{"memory"} clobber 为什么不是硬件 fence。
+  \item sanitizer 能覆盖 wrapper 的哪些问题，覆盖不了裸汇编内部哪些问题。
+  \item dispatch 选择实际实现时，benchmark 为什么必须记录实现名。
+  \item 公共 ABI 发生参数变化时为什么需要版本化。
+  \item 上线前二进制审计至少要保存哪些证据。
+\end{enumerate}
+
+如果互操作代码只有一个能跑的样例，没有 ABI 注释、没有边界测试、没有反汇编审计、没有版本策略，那么它还只是实验代码，不是可维护工程代码。
+
+\section{深入讲解：为什么 wrapper 不是性能敌人}
+
+很多人写汇编 kernel 时想绕过 wrapper，认为 wrapper 会降低性能。这个判断过于简单。wrapper 的成本要和 kernel 工作量比较，也要看它是否在热循环内。对于处理大量数据的 kernel，一次 wrapper 检查和 dispatch 成本通常可以忽略；对于纳秒级小函数，wrapper 成本可能重要，需要单独测量。不能一概而论。
+
+wrapper 的价值在于把复杂性移出汇编。它可以检查长度、处理空输入、选择实现、转换类型、记录实现名、处理异常和错误码。这样汇编 kernel 可以保持简单、稳定、易审计。若为了省几条 C++ 检查，把所有边界逻辑塞进汇编，通常会让正确性和维护成本恶化。
+
+高质量做法是分层测量。测公共 API，了解真实调用成本；测内部 kernel，了解核心计算成本；测 dispatch，了解选择实现的开销。报告把三者分开，工程上就能决定是否需要 fast path、是否缓存函数指针、是否为小输入使用纯 C++。
+
+\section{深入讲解：互操作失败常常是“边界无人负责”}
+
+互操作 bug 的根因常常不是某个人写错一条指令，而是边界责任没有分配。谁检查 \code{n >= 0}？谁保证指针对齐？谁处理尾部？谁保存 callee-saved？谁设置 \register{al} 调用变参函数？谁保证参数块 offset？谁记录 dispatch 实现？如果文档没有答案，代码就会靠隐含假设运行。
+
+边界责任应写成明确句子：
+
+\begin{lstlisting}
+Wrapper responsibility:
+    validate public inputs
+    handle n == 0
+    select implementation
+
+Kernel responsibility:
+    compute result for n > 0
+    preserve callee-saved registers
+    return int64 sum in rax
+
+Caller responsibility:
+    do not call internal symbol directly
+\end{lstlisting}
+
+这类文字看起来简单，却能阻止很多事故。底层工程中，模糊责任比复杂指令更危险。
+
+\section{课堂讲解：互操作代码要把“可替换性”设计进去}
+
+一个汇编 kernel 如果只在当前机器、当前编译器、当前输入上能跑，还不能算工程完成。可维护的互操作接口应允许实现被替换：今天是 C++ reference，明天是标量汇编，后天是 SIMD 版本，某些机器回退到 portable 版本。可替换性要求公共 API 稳定、内部 ABI 明确、测试对所有实现使用同一语义、benchmark 记录实际实现名。
+
+最常见的结构是三层。第一层是 public wrapper，面对 C++ 调用者，使用 \code{std::span}、容器、错误码或异常表达友好接口。第二层是 checked C ABI，使用裸指针、长度和固定宽度类型，但只在 wrapper 检查后调用。第三层是具体 kernel，可以是 C++、汇编或编译器内置版本。dispatch 只在第二层和第三层之间选择实现，不让调用者直接依赖某个内部符号。
+
+这种结构的好处是，性能优化可以在内部演进，而公共语义保持不变。新增 AVX2 版本，只需要加入实现和 dispatch；发现某个汇编版本在某 CPU 上有问题，可以禁用它；benchmark 可以分别测 public wrapper、dispatch 和 kernel。若一开始就把公共 API 直接绑定到一个汇编符号，后续改动会非常痛苦。
+
+\section{参数块：复杂接口的稳定边界}
+
+当参数数量增多，或者需要传递多个指针、长度、stride、标志位和输出位置时，直接增加寄存器参数会让 ABI 难读，也容易超过寄存器通道。参数块是常见选择：C++ 端定义一个标准布局结构体，汇编端接收指向参数块的指针，通过固定 offset 读取字段。
+
+参数块必须被当成二进制接口。字段使用固定宽度类型；避免 C++ 容器、引用、虚函数和非平凡对象；提供 \code{size} 或 \code{version} 字段；用 \code{static_assert} 检查 \code{sizeof}、\code{alignof} 和关键 \code{offsetof}；汇编文件中的 offset 常量应来自生成头文件或集中维护，不要手写散落的魔法数字。
+
+参数块还要定义所有权。指针字段指向的内存由谁分配、长度是多少、是否允许重叠、是否要求对齐、kernel 是否会写入、调用后是否仍有效，这些都要写清。参数块本身只解决传参形式，不自动解决对象生命周期和别名问题。
+
+\section{上线前二进制审计}
+
+互操作代码合入前，应做一次二进制审计。审计不是为了追求形式，而是确认最终产物确实符合接口文档。第一，检查符号。用 \code{nm -C} 或 \code{readelf -Ws} 确认导出符号、可见性和名称。第二，检查调用点。确认 wrapper 调用的是预期内部符号，dispatch 路径记录实现名，错误路径不会误入未支持实现。
+
+第三，检查汇编入口。确认参数寄存器和文档一致，若使用参数块，检查 offset；确认 callee-saved 寄存器保存恢复；确认 leaf/non-leaf 栈对齐；确认 \code{.note.GNU-stack} 和 section 属性。第四，检查返回路径。所有路径都设置返回值，错误路径返回约定值或错误码，尾调用不破坏栈。第五，检查测试覆盖。边界长度、空输入、非对齐地址、随机数据、错误参数和多实现一致性都应覆盖。
+
+性能审计也要分开。先证明正确，再看速度。若汇编版本声称更快，应保存同一输入下 C++ reference 和汇编 kernel 的 raw data、summary、反汇编和环境。若只测了 public wrapper，要说明 wrapper 和 dispatch 开销包含在内；若只测 kernel，要说明真实调用还有额外开销。二进制审计让“我以为测了汇编”变成“证据显示测了这个符号”。
+
+\section{版本化：接口变化要可追踪}
+
+互操作接口变化常见于新增参数、改变长度类型、修改返回错误码、增加对齐要求、改变尾部处理策略、引入新的 CPU 特性。只要调用者和实现可能不同步，就需要版本化。版本化可以是符号名版本，例如 \code{asm_dot_i32_v2}；可以是参数块版本字段；可以是库版本和头文件版本；也可以是 dispatch 表中的能力记录。
+
+不要在不改名的情况下悄悄改变内部 ABI。即使所有代码在同一个仓库里，也可能有旧目标文件、旧动态库、旧测试插件或用户私下调用内部符号。若改动必须破坏 ABI，应在构建和运行时尽早失败，而不是让旧调用者以错误参数继续运行。比如参数块可以包含 \code{size} 字段，kernel 或 wrapper 检查不匹配时返回错误。
+
+版本化还服务 benchmark。历史结果必须知道使用的是哪个实现版本。一个 kernel 从 v1 改到 v2 后，性能趋势图若不标注，会把接口变化和优化变化混在一起。报告中记录实现名和版本，是长期性能数据可解释的前提。
+
+\section{互操作审查清单}
+
+对 C++ 与汇编互操作改动，review 至少应问：
+
+\begin{enumerate}
+  \item public API、internal ABI 和具体 kernel 是否分层。
+  \item 输入合法化由 wrapper 负责还是 kernel 负责，是否写清。
+  \item 长度、stride、字节数和元素数单位是否明确。
+  \item 空输入、尾部、非对齐地址和重叠区间如何处理。
+  \item 参数宽度、返回值宽度和 signedness 是否与声明一致。
+  \item callee-saved、栈对齐、红区、调用 helper 的规则是否满足。
+  \item 参数块 layout 是否有 \code{static_assert}。
+  \item sanitizer、单元测试和随机测试覆盖了哪些层。
+  \item benchmark 是否区分 wrapper、dispatch 和 kernel。
+  \item 接口变化是否版本化，历史结果是否能区分实现版本。
+\end{enumerate}
+
+这份清单的核心是责任明确。互操作工程失败时，最难修的往往不是某条指令，而是每一层都以为另一层已经检查了条件。
+
+\section{互操作代码的演进路线}
+
+一个汇编优化最好按阶段演进。第一阶段写 C++ reference，定义语义和测试。第二阶段写最小汇编 kernel，只覆盖最简单合同。第三阶段加入 wrapper，处理公共输入和错误路径。第四阶段加入 benchmark，区分 public API 和 kernel。第五阶段再考虑多实现 dispatch、CPU 特性和版本化。跳过前面阶段直接写复杂汇编，风险很高。
+
+每个阶段都有退出标准。reference 要正确且覆盖边界；kernel 要通过同一测试并遵守 ABI；wrapper 要拒绝非法输入；benchmark 要证明测到的是目标实现；dispatch 要记录实现名并可强制选择。阶段化能让复杂互操作工程变得可审查。
+
+\section{互操作文档应靠近代码}
+
+ABI 注释、参数块布局、前置条件、寄存器使用、clobber 说明、测试命令和 benchmark 命令，应尽量靠近代码或在同一目录文档中。不要只放在聊天记录或远处文档。底层接口一旦修改，远处文档最容易过期。
+
+好的目录可以包含 \filepath{README.md}、\filepath{abi.md}、\filepath{tests/}、\filepath{bench/}、\filepath{objdump/}。README 说明公共 API，abi 文档说明内部合同，tests 验证正确性，bench 验证性能，objdump 保存关键二进制证据。这样互操作代码就不是孤立汇编文件，而是一个可维护单元。
+
+\section{综合项目：从 reference 到汇编 kernel}
+
+本章最合适的综合项目，是为一个小函数建立完整互操作链路。以 \code{dot_i32} 为例，先写 C++ reference，明确整数溢出策略和返回类型；再写 public wrapper，接收 \code{std::span} 并检查长度；再写 internal C ABI 声明，使用裸指针和长度；再写汇编 kernel；最后写测试、反汇编审计和 benchmark。
+
+项目报告要说明每一层职责。reference 定义语义；wrapper 处理公共输入；kernel 假设输入合法并专注计算；测试比较 reference 和 kernel；benchmark 分别测 wrapper 和 kernel。若任何一层职责混乱，例如 kernel 既处理异常又做 dispatch 又计算核心循环，维护成本就会上升。
+
+这个综合项目不需要 SIMD。标量汇编已经足够训练 ABI、寄存器、栈、参数、返回值、整数宽度、正确性和测量。等第二册进入 SIMD 时，读者只需要替换 kernel 实现，而不必重新发明工程边界。
+
+\section{互操作失败后的回滚设计}
+
+高性能实现应有回滚路径。若某个汇编版本在特定机器上失败，项目应该能强制使用 reference 或 portable 实现；若 dispatch 判断有 bug，应该能通过环境变量或配置禁用；若 benchmark 发现性能回归，应该能保留旧实现对比。没有回滚路径的底层优化风险很高。
+
+回滚路径本身也要测试。不要只测试最快实现，也要测试 reference、portable、asm 和 dispatch override。报告中记录实际实现名，能让线上问题快速定位到某个实现。可回滚设计不是保守，而是让优化可以安全演进。
+
+\section{互操作中的调试策略}
+
+互操作 bug 出现时，要先判断错误发生在边界哪一侧。若 C++ wrapper 已经拒绝非法输入，问题可能在 kernel；若 kernel 单独测试正确，问题可能在 wrapper、dispatch 或声明不一致；若只有动态库环境失败，问题可能在符号和加载路径；若只有优化构建失败，可能是 ABI、clobber、未定义行为或内联改变了边界。
+
+调试时建议保留两个入口：一个直接调用 internal C ABI kernel 的测试入口，一个调用 public wrapper 的测试入口。前者帮助定位 kernel 语义，后者帮助定位真实 API 行为。再加一个强制选择实现的开关，可以排除 dispatch 影响。没有这些入口，互操作问题很容易在多层之间来回推诿。
+
+互操作调试也要保存反汇编。源码声明正确不代表最终调用点正确；汇编看起来正确不代表调用者按同一签名调用。调用点、入口和返回点三处证据合在一起，才能定位边界问题。若只看汇编文件本身，可能错过 C++ 编译器在调用点做的参数扩展、栈调整、内联和常量传播。
+
+\section{互操作代码的毕业标准}
+
+本章的毕业标准不是“C++ 能调用汇编并打印正确结果”。那只是最小演示。合格互操作代码应有稳定 public API、明确 internal ABI、边界输入测试、寄存器和栈审计、参数块布局断言、可选择 reference 实现、可复现 benchmark 和二进制 artifact。缺少任何一项，都说明它还不适合承担长期维护责任。
+
+读者可以把毕业标准写进 PR 模板。新增或修改汇编 kernel 时，作者必须说明 ABI 是否变化、测试是否覆盖边界、反汇编是否审计、benchmark 是否区分 wrapper 和 kernel、是否有回滚路径。这样互操作不再依赖个人记忆，而进入团队流程。
+
+毕业标准还要求能解释失败。若汇编版本算错，报告要能指出是输入合同不满足、寄存器保存错误、栈对齐错误、整数宽度错误，还是 wrapper 和 kernel 声明不一致。若只能说“汇编有问题”，说明边界还没有拆清楚。互操作工程的成熟标志，是能把故障定位到明确责任层。
+
+\section{互操作和团队分工}
+
+在团队中，写 public wrapper、写汇编 kernel、写测试、写 benchmark、做二进制审计的人可能不是同一个。接口文档必须让这些角色可以独立工作。wrapper 作者需要知道哪些输入要拒绝；汇编作者需要知道寄存器和内存合同；测试作者需要知道边界值；benchmark 作者需要知道测 public API 还是 kernel；reviewer 需要知道哪些证据必须保存。
+
+若文档只写“调用汇编求和”，团队就会依赖口头约定。口头约定在人员变化、时间推移和版本迭代中最容易丢失。把合同写成文件、测试和 artifact，是为了让项目不依赖某个人一直在场。底层代码越接近硬件，越需要这种显式协作方式。
+
+\section{实验：从零搭建 C++ 调汇编工程}
+
+\begin{labbox}
+目标：建立一个最小但规范的 \code{.S + C++ + CMake} 工程，并用工具证明符号、调用和返回值正确。
+
+创建目录：
+
+\begin{lstlisting}[language=bash]
+mkdir -p labs/ch14_interop/lab14_1_minimal
+cd labs/ch14_interop/lab14_1_minimal
+\end{lstlisting}
+
+文件：
+
+\begin{lstlisting}
+lab14_1_minimal/
+    CMakeLists.txt
+    main.cpp
+    asm_arith.S
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 在 C++ 中声明 3 个函数：
+\begin{lstlisting}[language=C++]
+extern "C" long asm_add2(long a, long b);
+extern "C" long asm_sub2(long a, long b);
+extern "C" long asm_mix4(long a, long b, long c, long d);
+\end{lstlisting}
+  \item 在 \code{asm_arith.S} 中实现它们。
+  \item \code{asm_mix4} 的语义为 \code{(a + b) * 3 - (c - d)}，可以使用 \instruction{lea}、\instruction{add}、\instruction{sub}。
+  \item 写至少 20 个确定性测试，覆盖正数、负数、零和较大值。
+  \item 构建并运行。
+  \item 用 \code{nm -C} 证明符号存在。
+  \item 用 \code{objdump -drwC -Mintel} 找到 3 个函数的机器码。
+\end{enumerate}
+
+推荐命令：
+
+\begin{lstlisting}[language=bash]
+cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake --build build -j
+./build/lab14_1_minimal
+nm -C build/lab14_1_minimal | rg 'asm_'
+objdump -drwC -Mintel build/lab14_1_minimal > lab14_1.objdump.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 源码。
+  \item 运行输出。
+  \item \code{nm} 输出中 3 个汇编符号的行。
+  \item 每个函数的反汇编。
+  \item 一张表：源代码参数、ABI 寄存器、汇编使用位置。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：符号、mangling 和 relocation 审计}
+
+\begin{labbox}
+目标：理解 C++ 符号名、\code{extern "C"} 和链接器重定位。
+
+创建两个版本：
+
+\begin{lstlisting}
+with_c_linkage.cpp
+without_c_linkage.cpp
+caller.cpp
+\end{lstlisting}
+
+\code{with_c_linkage.cpp}：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_c(int a, int b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+\code{without_c_linkage.cpp}：
+
+\begin{lstlisting}[language=C++]
+int add_cpp(int a, int b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+\code{caller.cpp}：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_c(int, int);
+int add_cpp(int, int);
+
+extern "C" int call_both(int x)
+{
+    return add_c(x, 1) + add_cpp(x, 2);
+}
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 分别编译成 \code{.o}。
+  \item 用 \code{nm} 和 \code{nm -C} 比较符号名。
+  \item 用 \code{objdump -drwC -Mintel caller.o} 查看未链接目标文件。
+  \item 用 \code{readelf -r caller.o} 查看 relocation。
+  \item 链接成可执行文件后，再看最终 \instruction{call} 的相对位移。
+\end{enumerate}
+
+命令：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O2 -c with_c_linkage.cpp -o with_c_linkage.o
+clang++ -std=c++20 -O2 -c without_c_linkage.cpp -o without_c_linkage.o
+clang++ -std=c++20 -O2 -c caller.cpp -o caller.o
+nm caller.o
+nm -C caller.o
+objdump -drwC -Mintel caller.o > caller.objdump.txt
+readelf -r caller.o > caller.reloc.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item \code{add_c} 和 \code{add_cpp} 的原始符号名。
+  \item \code{call_both} 中两个 \instruction{call} 的 relocation 记录。
+  \item 解释 \code{R_X86_64_PLT32} 或你机器上出现的 relocation 类型。
+  \item 链接后任选一个 \instruction{call}，用 \code{target - next_rip} 计算其 \code{rel32}。
+  \item 一段 500 字总结：为什么目标文件反汇编不能只看机器码字节。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：ABI 安全的 8 参数汇编函数}
+
+\begin{labbox}
+目标：实现并严格测试一个包含栈参数的汇编函数。
+
+函数签名：
+
+\begin{lstlisting}[language=C++]
+extern "C" long asm_weighted_sum8(long a0, long a1, long a2, long a3,
+                                  long a4, long a5, long a6, long a7);
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+return a0*1 + a1*2 + a2*3 + a3*4
+     + a4*5 + a5*6 + a6*7 + a7*8
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 写 ABI 参数位置表。
+  \item 实现汇编函数。第 7、8 个参数必须从栈读取。
+  \item 写 C++ reference 函数。
+  \item 写 100000 轮随机测试，限制输入范围避免 signed overflow。
+  \item 用 GDB 在函数入口断点，记录 \register{rsp}、\code{[rsp]}、\code{[rsp + 8]}、\code{[rsp + 16]}。
+  \item 用 \code{objdump} 标注每个参数在哪里被使用。
+\end{enumerate}
+
+提示：可以用 \instruction{lea} 组合小常数乘法，但要保证结果语义清楚。例如 \code{x*3} 可以写成：
+
+\begin{lstlisting}
+lea rax, [rdi + rdi*2]
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 参数映射表。
+  \item 完整汇编。
+  \item 测试源码和运行结果。
+  \item GDB 栈截图或文字记录。
+  \item 解释为什么 \code{a6} 是 \code{[rsp + 8]} 而不是 \code{[rsp]}。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：汇编调用 C++ helper}
+
+\begin{labbox}
+目标：写一个 non-leaf 汇编函数，正确处理 callee-saved 寄存器和栈对齐。
+
+C++ helper：
+
+\begin{lstlisting}[language=C++]
+extern "C" long cpp_mul_add(long x, long y, long z)
+{
+    return x * y + z;
+}
+\end{lstlisting}
+
+汇编函数签名：
+
+\begin{lstlisting}[language=C++]
+extern "C" long asm_call_helper(long x, long y, long z, long bias);
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+return cpp_mul_add(x, y, z) + bias
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 先故意写一个错误版本：把 \code{bias} 放进 \register{rbx}，调用 helper 后不恢复。
+  \item 构造 C++ 调用者，让调用者在调用前后有一个长期存活变量，观察错误是否暴露。
+  \item 修复 \register{rbx} 保存恢复。
+  \item 检查调用 \code{cpp_mul_add} 前 \register{rsp} 是否 16 字节对齐。
+  \item 用 GDB 单步过 \instruction{call}，记录 \register{rsp} 和返回地址。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item 错误版本和修复版本的汇编。
+  \item 为什么错误版本违反 ABI。
+  \item 栈对齐计算过程。
+  \item GDB 记录。
+  \item 测试结果。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：inline asm 约束修复}
+
+\begin{labbox}
+目标：理解 inline asm 不是文本替换，而是优化器合同。
+
+给定错误代码：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+std::int64_t broken_add(std::int64_t a, std::int64_t b)
+{
+    std::int64_t result = a;
+    asm("add %1, %0" : : "r"(result), "r"(b));
+    return result;
+}
+
+void broken_store(std::int64_t* p, std::int64_t value)
+{
+    asm volatile("mov %1, (%0)" : : "r"(p), "r"(value));
+}
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 在 \code{-O0} 和 \code{-O3} 下分别编译运行，记录现象。
+  \item 查看反汇编，解释为什么错误版本可能“偶尔看起来能跑”。
+  \item 修复 \code{broken_add}，正确使用读写输出和 \code{"cc"} clobber。
+  \item 修复 \code{broken_store}，正确描述内存写和 \code{"memory"} clobber。
+  \item 写测试证明修复版本在 \code{-O3} 下稳定正确。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item 错误版本和修复版本源码。
+  \item \code{-O0}、\code{-O3} 反汇编对比。
+  \item 每个 constraint 的解释。
+  \item 说明 \code{volatile}、\code{"memory"}、\code{"cc"} 各自解决什么问题，不能解决什么问题。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：标量点积 kernel 的互操作审计}
+
+\begin{labbox}
+目标：实现一个接近算子 kernel 形态的标量点积，并建立 correctness report。
+
+函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" std::int64_t asm_dot_i32(const std::int32_t* a,
+                                    const std::int32_t* b,
+                                    std::int64_t n);
+\end{lstlisting}
+
+任务：
+
+\begin{enumerate}
+  \item 写 C++ reference 实现。
+  \item 写汇编实现。
+  \item 测试 \code{n = 0, 1, 2, 15, 16, 17, 1024}。
+  \item 随机生成数组，做 10000 轮测试。
+  \item 用 \code{objdump} 标注循环基本块、回边、数组地址公式。
+  \item 用 \code{perf stat} 初步测量运行时间、instructions、cycles；如果权限不足，记录错误信息并使用 \code{/usr/bin/time}。
+\end{enumerate}
+
+交付物：
+
+\begin{enumerate}
+  \item 源码和构建脚本。
+  \item 正确性测试输出。
+  \item 循环反汇编标注。
+  \item 地址公式说明。
+  \item 初步性能表。
+  \item 说明为什么这个版本还不是高性能实现，列出至少 5 个后续优化方向。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：C++ wrapper 与参数块}
+
+\begin{labbox}
+目标：把复杂 C++ 接口和简单汇编 kernel 分层，并用静态断言固定参数块布局。
+
+任务：
+
+\begin{enumerate}
+  \item 定义一个 \code{DotConfig} 参数块，包含两个 \code{const std::int32_t*}、长度、两个 stride 和 bias。
+  \item 在 C++ 头文件中为 \code{sizeof}、\code{alignof} 和每个字段 \code{offsetof} 写 \code{static_assert}。
+  \item 编写公共 C++ wrapper，接收更友好的参数，检查长度、空指针和 stride，再填充 \code{DotConfig}。
+  \item 编写 \code{extern "C"} 汇编 kernel，只接收 \code{const DotConfig*}。
+  \item 用确定性测试和随机测试比较 C++ reference 与汇编结果。
+  \item 用 \code{objdump} 标出汇编中每个字段偏移对应的 C++ 字段。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item C++ 头文件中的布局断言。
+  \item wrapper 代码和汇编 kernel。
+  \item 一张字段偏移表。
+  \item 测试结果和反汇编证据。
+  \item 说明参数块相比直接多参数传递的优点和代价。
+\end{itemize}
+\end{labbox}
+
+\section{实验：栈对齐与 callee-saved 测试}
+
+\begin{labbox}
+目标：用测试暴露 non-leaf 汇编函数的栈对齐和寄存器保存错误。
+
+任务：
+
+\begin{enumerate}
+  \item 写一个 C++ helper，返回入口处 \register{rsp} 是否满足 System V AMD64 的入口余数规则。
+  \item 写一个正确汇编函数，在调用 helper 前保证 \register{rsp} 16 字节对齐。
+  \item 写一个错误版本，故意不对齐栈。
+  \item 写一个测试专用汇编包装器，给 \register{rbx}、\register{r12}、\register{r13}、\register{r14}、\register{r15} 设置哨兵，调用被测函数后检查是否保持。
+  \item 将正确版本和错误版本都放进测试，确认测试能失败也能通过。
+\end{enumerate}
+
+交付物：
+
+\begin{itemize}
+  \item 栈余数检查 helper。
+  \item 保存寄存器测试包装器。
+  \item 正确版本和错误版本的汇编。
+  \item 测试输出。
+  \item 一张栈变化图，说明每个 \instruction{call} 前的 \register{rsp} 对齐状态。
+\end{itemize}
+\end{labbox}
+
+\section{本章作业}
+
+\begin{exercisebox}
+\subsection*{作业 1：接口契约报告}
+
+选择你在实验中写的任意 3 个汇编函数，为每个函数写一份接口契约报告，必须包含：
+
+\begin{itemize}
+  \item C++ 声明。
+  \item 链接符号名。
+  \item 参数位置表。
+  \item 返回值位置。
+  \item 修改的 caller-saved 寄存器。
+  \item 是否修改 callee-saved 寄存器；如果修改，如何保存恢复。
+  \item 是否调用其他函数；如果调用，如何保证栈对齐。
+  \item 前置条件和未定义行为边界。
+\end{itemize}
+
+\subsection*{作业 2：修复破坏 ABI 的汇编}
+
+下面函数被 C++ 调用：
+
+\begin{lstlisting}
+.intel_syntax noprefix
+.text
+.globl broken_kernel
+broken_kernel:
+    mov r12, rdi
+    mov r13, rsi
+    call helper
+    add rax, r12
+    add rax, r13
+    ret
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 找出所有 ABI 问题。
+  \item 说明 \register{r12}、\register{r13} 属于 caller-saved 还是 callee-saved。
+  \item 修复保存恢复。
+  \item 修复栈对齐。
+  \item 给出完整汇编。
+  \item 用栈布局图证明你的修复正确。
+\end{enumerate}
+
+\subsection*{作业 3：重定位计算}
+
+给定未链接目标文件片段：
+
+\begin{lstlisting}
+0000000000000000 <foo>:
+   0: e8 00 00 00 00    call 5 <foo+0x5>
+        1: R_X86_64_PLT32 bar-0x4
+   5: c3                ret
+\end{lstlisting}
+
+链接后：
+
+\begin{lstlisting}
+foo address = 0x401100
+bar address = 0x401180
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 写出 \instruction{call} 指令地址。
+  \item 写出 next \register{rip}。
+  \item 计算 \code{rel32}。
+  \item 写出小端序 4 字节。
+  \item 解释为什么 relocation addend 常见为 \code{-4}。
+\end{enumerate}
+
+\subsection*{作业 4：inline asm 审计}
+
+阅读下面代码：
+
+\begin{lstlisting}[language=C++]
+std::uint64_t rdtsc_bad()
+{
+    std::uint32_t lo = 0;
+    std::uint32_t hi = 0;
+    asm volatile("rdtsc");
+    return (static_cast<std::uint64_t>(hi) << 32) | lo;
+}
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 解释为什么它错误。
+  \item 写出正确输出约束，让 \register{eax} 和 \register{edx} 分别写入 \code{lo}、\code{hi}。
+  \item 说明 \instruction{rdtsc} 的乱序风险。
+  \item 查阅本机反汇编，确认约束是否生成预期寄存器。
+  \item 说明为什么 benchmark 不能只靠裸 \instruction{rdtsc}。
+\end{enumerate}
+
+\subsection*{作业：inline asm 约束深度报告}
+
+编写三个小函数，分别演示读写操作数、matching constraint 和 early-clobber 输出。每个函数都要有一个错误版本和一个修复版本。报告不少于 2200 字，必须包含：
+
+\begin{itemize}
+  \item 每个 asm 模板的输入、输出、clobber 表。
+  \item 为什么 \code{"+r"} 表示同一操作数既读又写。
+  \item \code{"0"} 这类 matching constraint 如何把输入绑定到输出位置。
+  \item early-clobber 缺失时，输出和输入复用寄存器会怎样破坏值。
+  \item 固定寄存器约束和普通 \code{"r"} 约束的取舍。
+  \item \code{-O0} 与 \code{-O3} 反汇编对比，以及为什么错误版本可能只在高优化或高寄存器压力下暴露。
+\end{itemize}
+
+\subsection*{作业：符号可见性和 ABI 稳定性审计}
+
+构建一个包含静态库或动态库的小工程，库中至少有两个公共汇编入口和两个内部汇编 helper。报告不少于 1800 字，要求：
+
+\begin{itemize}
+  \item 用 \code{nm} 和 \code{readelf -Ws} 列出普通符号表和动态符号表。
+  \item 区分公共 ABI 符号和内部标签/helper。
+  \item 故意制造一次重复定义，记录链接器错误并解释原因。
+  \item 说明如果某个公共函数参数列表改变，为什么应该新增版本符号或保持 wrapper 兼容。
+  \item 检查是否存在意外导出的内部符号。
+\end{itemize}
+
+\subsection*{作业：展开信息和调试回溯}
+
+写两个 non-leaf 汇编函数：一个只有普通 push/pop，没有 CFI；另一个补充基本 CFI。它们都调用一个 C++ helper，再从 helper 内部触发一次可控崩溃或断点。报告不少于 1800 字，要求：
+
+\begin{itemize}
+  \item 用 GDB 比较两者 backtrace 差异。
+  \item 解释 \code{.cfi_startproc}、\code{.cfi_def_cfa_offset}、\code{.cfi_offset} 的作用。
+  \item 说明为什么异常不应随意穿过裸汇编帧。
+  \item 分析 profiler 或崩溃报告为什么需要展开信息。
+  \item 给出你建议的工程规则：哪些汇编函数必须写 CFI，哪些 leaf kernel 可以暂时不写。
+\end{itemize}
+
+\subsection*{作业：wrapper 分层设计}
+
+选择一个数组或矩阵小 kernel，设计公共 C++ API、C++ wrapper 和汇编 kernel 三层接口。报告必须包含：
+
+\begin{itemize}
+  \item 公共 API 的类型和错误处理策略。
+  \item wrapper 负责检查哪些前置条件。
+  \item 汇编 kernel 的 \code{extern "C"} 声明。
+  \item 汇编 kernel 的 ABI 参数表。
+  \item wrapper 测试和 kernel 测试如何分开。
+  \item 为什么不让汇编直接接收复杂 C++ 对象。
+\end{itemize}
+
+\subsection*{作业：参数块布局审计}
+
+设计一个至少包含 5 个字段的平凡参数块，并让汇编函数通过指针读取字段。提交：
+
+\begin{itemize}
+  \item C++ 结构体定义。
+  \item \code{static_assert} 布局检查。
+  \item 汇编偏移注释。
+  \item \code{objdump} 中对应 load 指令。
+  \item 一段说明：如果中间插入一个新字段，哪些检查会失败，哪些错误可能在没有检查时静默发生。
+\end{itemize}
+
+\subsection*{作业：平台 ABI 对比报告}
+
+选择 Linux x86-64 System V 和另一个 ABI，例如 Windows x64 或 AArch64 Linux，写一份对比报告。要求至少覆盖：
+
+\begin{itemize}
+  \item 前几个整数参数寄存器。
+  \item 返回值位置。
+  \item 栈对齐规则。
+  \item callee-saved 寄存器。
+  \item 结构体返回的差异。
+  \item 为什么同一个 \code{.S} 文件不能不加审计地跨 ABI 复用。
+\end{itemize}
+
+\subsection*{作业 5：互操作小项目}
+
+完成一个小项目：
+
+\begin{lstlisting}
+interop_project/
+    CMakeLists.txt
+    include/kernels.hpp
+    src/main.cpp
+    src/reference.cpp
+    src/kernels.S
+    tests/test_kernels.cpp
+    report.md
+\end{lstlisting}
+
+功能：
+
+\begin{itemize}
+  \item \code{asm_sum8}：8 参数加权求和。
+  \item \code{asm_make_pair}：返回两个 64 位字段的小结构体。
+  \item \code{asm_dot_i32}：标量点积。
+  \item \code{asm_call_helper}：汇编调用 C++ helper。
+\end{itemize}
+
+质量要求：
+
+\begin{enumerate}
+  \item 每个函数都有 reference 实现。
+  \item 每个函数都有确定性测试和随机测试。
+  \item 所有汇编函数都有接口注释。
+  \item 报告中包含 \code{nm}、\code{readelf -r}、\code{objdump} 证据。
+  \item 报告中至少分析 2 个栈布局。
+  \item 报告中至少解释 1 个 relocation。
+  \item 报告中明确列出 sanitizer 能覆盖什么、不能覆盖什么。
+\end{enumerate}
+
+\subsection*{评分标准}
+
+本章作业按下面标准评价：
+
+\begin{enumerate}
+  \item 能否从 C++ 签名正确推导 ABI 参数和返回值位置。
+  \item 汇编符号、\code{.type}、\code{.size}、section 是否规范。
+  \item 是否正确处理 caller-saved、callee-saved 和栈对齐。
+  \item 是否能用 \code{nm}、\code{readelf}、\code{objdump}、GDB 证明结论。
+  \item inline asm 是否准确描述输入、输出和 clobbers。
+  \item 测试是否覆盖边界值、随机值和跨优化级别行为。
+  \item 是否考虑 wrapper 分层、参数块布局断言、符号可见性、ABI 演进、CI 检查和展开信息。
+  \item 报告是否区分语言层语义、ABI 层契约、目标文件层机制和 CPU 执行行为。
+\end{enumerate}
+\end{exercisebox}
+
+\section{本章小结}
+
+本章把 System V AMD64 ABI 放进了真实工程：
+
+\begin{lstlisting}
+C++ declaration:
+    type, language linkage, call site generation
+
+assembly source:
+    symbol definition, sections, prologue/epilogue, instructions
+
+ABI:
+    parameter locations, return locations, register ownership, stack alignment
+
+object file:
+    symbols, sections, relocations
+
+tools:
+    nm, readelf, objdump, gdb, perf
+
+quality:
+    deterministic tests, randomized tests, binary-interface report
+\end{lstlisting}
+
+你现在应该能够从一个 C++ 函数声明出发，写出 ABI 映射表，再写出手写汇编实现，并用工具证明它真的按预期链接和运行。你也应该开始对 inline asm 保持谨慎：它不是简单的“在 C++ 里写汇编”，而是和优化器签订一份非常精确的合同。
+
+后面的章节会进入测量；第二册会进入编译器优化、微架构和 SIMD。本章建立的互操作能力会反复使用：你会写小 kernel、反汇编审计、测量性能、解释瓶颈，再逐步把标量代码推进到 AVX、FMA、VNNI 和 AI 算子优化。

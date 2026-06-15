@@ -1,102 +1,114 @@
-# CPU Performance Study Workspace
+# Technical Books Workspace
 
-这是一个用于系统学习 x86-64、C++ 到汇编、CPU 微架构、性能测量、HPC 和 AI CPU 算子优化的高强度学习仓库。当前主线是 16 周专家冲刺版，不按长期慢速路线执行。
+这是一个多本技术书的写作仓库。仓库根目录只保留公共入口、总构建命令和书库索引；每一本书都放在 `books/<book-id>/` 下面，正文、草稿、实验、报告、结果和工具尽量自包含，避免多本书互相污染。
 
-先读：
+当前正式书籍：
 
-1. `book-latex/README.md`
-2. `book-latex/outline/master-outline.md`
-3. `docs/x86_64_hpc_ai_16_week_bootcamp.md`
-4. `docs/book/README.md`
-5. `labs/lab00_benchmark_foundation/README.md`
-6. `docs/x86_64_hpc_ai_detailed_curriculum.md`
-7. `docs/x86_64_hpc_ai_master_plan.md`
+- `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
 
-## 正式教材工程
+规划中的新书可以继续放到 `books/` 下，例如算法面试、C++ 语言、编译器、操作系统、AI 系统等方向。
 
-正式书稿已经切换到 LaTeX：
+## 仓库结构
 
 ```text
-book-latex/
+books/
+  cpu-volume-1/
+    source/latex/      # 正式 LaTeX 书稿，生成 PDF/EPUB
+    materials/         # 草稿、课程计划、素材、参考资料
+    labs/              # 与本书绑定的代码实验
+    reports/           # 报告模板和学习报告
+    results/           # 实验输出，默认只跟踪 .gitkeep
+    tools/             # 本书专用脚本
+CMakeLists.txt         # 仓库级 C++ 实验入口
+Makefile               # 仓库级常用命令入口
 ```
 
-它按百万字级教材规划，当前包含：
+## 常用命令
 
-- 12 个 Part。
-- 64 章主线。
-- 5 个附录。
-- LaTeX 主文件、preamble、章节模板、实验模板、习题模板。
-- 全书扩写蓝图：`book-latex/outline/master-outline.md`。
-
-`docs/book/` 保留为 Markdown 草稿和实验素材库，不再作为最终成书格式。
-
-## 第一天要做什么
-
-运行 Lab 00：
+生成当前第一册 PDF 和 EPUB：
 
 ```bash
-bash labs/lab00_benchmark_foundation/scripts/run_lab00.sh
+make cpu-pdf
+make cpu-epub
 ```
 
-查看环境：
+检查第一册 LaTeX 输入和正文规模：
 
 ```bash
-cat results/lab00/env.txt
+make cpu-check
+make cpu-text-target
 ```
 
-查看原始 benchmark 数据：
+运行第一册 Lab 00：
 
 ```bash
-head results/lab00/foundation.csv
+make cpu-lab00
 ```
 
-查看汇总结果：
+运行覆盖率检查：
 
 ```bash
-cat results/lab00/summary.md
+make cpu-coverage
 ```
 
-查看错误 benchmark 示例：
+也可以进入单本书目录执行同名任务：
 
 ```bash
-cat results/lab00/bad_benchmarks.txt
+cd books/cpu-volume-1
+make pdf
+make epub
+make lab00
 ```
 
-可选：跑一次覆盖率检查：
+## CMake 构建
+
+仓库根工程用于构建所有启用的 C++ 实验：
 
 ```bash
-bash tools/run_coverage.sh
-cat results/coverage/summary.txt
+cmake -S . -B build/root-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build/root-release
+ctest --test-dir build/root-release --output-on-failure
 ```
 
-然后填写报告模板：
+如果只构建第一册，也可以直接从书目录启动：
+
+```bash
+cmake -S books/cpu-volume-1 -B books/cpu-volume-1/build/lab00-release -DCMAKE_BUILD_TYPE=Release
+cmake --build books/cpu-volume-1/build/lab00-release --target lab00_bench lab00_bad_benchmarks lab00_tests
+ctest --test-dir books/cpu-volume-1/build/lab00-release --output-on-failure
+```
+
+## 新增一本书的约定
+
+新增书籍时使用统一骨架：
 
 ```text
-docs/reports/lab00.md
+books/<book-id>/
+  README.md
+  Makefile
+  source/
+  materials/
+  labs/
+  reports/
+  results/
+  tools/
 ```
 
-## 手动构建
+建议规则：
 
-```bash
-cmake -S . -B build/lab00-release -DCMAKE_BUILD_TYPE=Release -DCPU_BUILD_LABS=ON
-cmake --build build/lab00-release --target lab00_bench lab00_bad_benchmarks lab00_tests
-ctest --test-dir build/lab00-release -R lab00_tests --output-on-failure
-```
+- `source/` 放正式成书工程，优先保持一个主版本，不制造多个并行版本。
+- `materials/` 放草稿、课程计划、参考资料、题单、临时素材。
+- `labs/` 放能独立构建和测试的代码实验。
+- `reports/` 放报告模板和学习报告。
+- `results/` 放实验输出，通常不提交大批运行结果。
+- `tools/` 放本书专用脚本，跨书共享脚本再考虑提升到仓库级。
+- 根目录只维护书库级索引和一键命令，不直接塞单本书的章节、实验或结果。
 
-## 当前已搭建内容
+## 当前第一册入口
 
-- Lab 00 benchmark harness。
-- 基础 benchmark：`sum_i32`、`sum_f32`、`dot_f32`、`fill_u8`、`copy_u8`。
-- 错误 benchmark 博物馆。
-- 环境记录脚本。
-- CSV 汇总脚本。
-- GCC/gcov 覆盖率脚本。
-- Lab 00 报告模板。
-
-## 重要规则
-
-- 先正确，再测量，再优化。
-- Debug build 不能作为性能结论。
-- 任何性能数字都必须带环境信息。
-- 任何 benchmark 都必须说明如何防止 dead-code elimination。
-- 当前 WSL2 环境不适合做完整硬件 PMU 结论，后续严肃 profiling 需要裸机 Linux。
+- 第一册说明：`books/cpu-volume-1/README.md`
+- 正式 LaTeX 工程：`books/cpu-volume-1/source/latex/README.md`
+- 全书扩写蓝图：`books/cpu-volume-1/source/latex/outline/master-outline.md`
+- 16 周执行计划：`books/cpu-volume-1/materials/x86_64_hpc_ai_16_week_bootcamp.md`
+- Markdown 草稿素材：`books/cpu-volume-1/materials/drafts/README.md`
+- Lab 00：`books/cpu-volume-1/labs/lab00_benchmark_foundation/README.md`
