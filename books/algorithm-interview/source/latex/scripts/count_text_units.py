@@ -30,6 +30,7 @@ ENGLISH_WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*(?:[-'][A-Za-z0-9]+)*")
 @dataclass(frozen=True)
 class CountResult:
     path: Path
+    matter: str
     cjk_chars: int
     english_words: int
 
@@ -114,61 +115,81 @@ def readable_text(tex: str) -> str:
     return text
 
 
-def count_file(path: Path) -> CountResult:
+@dataclass(frozen=True)
+class InputItem:
+    path: Path
+    matter: str
+
+
+def count_file(item: InputItem) -> CountResult:
+    path = item.path
     text = readable_text(path.read_text(encoding="utf-8"))
     return CountResult(
         path=path,
+        matter=item.matter,
         cjk_chars=len(CJK_RE.findall(text)),
         english_words=len(ENGLISH_WORD_RE.findall(text)),
     )
 
 
-def input_paths(root: Path, main_tex: Path) -> list[Path]:
-    seen: set[Path] = set()
-    ordered: list[Path] = []
+def update_matter(line: str, matter: str) -> str:
+    if r"\frontmatter" in line:
+        return "frontmatter"
+    if r"\mainmatter" in line:
+        return "mainmatter"
+    if r"\appendix" in line:
+        return "appendices"
+    if r"\backmatter" in line:
+        return "backmatter"
+    return matter
 
-    def visit(path: Path) -> None:
+
+def input_items(root: Path, main_tex: Path) -> list[InputItem]:
+    seen: set[tuple[Path, str]] = set()
+    ordered: list[InputItem] = []
+
+    def visit(path: Path, matter: str) -> None:
         resolved = path.resolve()
-        if resolved in seen:
+        key = (resolved, matter)
+        if key in seen:
             return
-        seen.add(resolved)
-        ordered.append(path)
-        text = path.read_text(encoding="utf-8")
-        for match in re.finditer(r"\\input\{([^{}]+)\}", text):
-            child = root / f"{match.group(1)}.tex"
-            if child.exists():
-                visit(child)
+        seen.add(key)
+        ordered.append(InputItem(path=path, matter=matter))
 
-    visit(main_tex)
+        current_matter = matter
+        for line in path.read_text(encoding="utf-8").splitlines():
+            current_matter = update_matter(line, current_matter)
+            for match in re.finditer(r"\\input\{([^{}]+)\}", line):
+                child = root / f"{match.group(1)}.tex"
+                if child.exists():
+                    visit(child, current_matter)
+
+    visit(main_tex, "other")
     return ordered
 
 
-def category(path: Path) -> str:
-    parts = set(path.parts)
-    if "chapters" in parts:
-        return "chapters"
-    if "frontmatter" in parts:
-        return "frontmatter"
-    if "appendices" in parts or "backmatter" in parts:
-        return "appendices"
-    return "other"
+def category(result: CountResult) -> str:
+    return result.matter
 
 
-def is_book_content(path: Path) -> bool:
-    return category(path) in {"frontmatter", "chapters", "appendices"}
+def is_book_content(result: CountResult) -> bool:
+    return result.matter == "mainmatter"
 
 
 def print_table(results: list[CountResult], root: Path) -> None:
     print("units = Chinese Han characters + English words; code, formulas, and inline code macros excluded")
     print()
-    print(f"{'units':>8} {'CJK':>8} {'EN':>8}  file")
+    print(f"{'units':>8} {'CJK':>8} {'EN':>8} {'matter':>12}  file")
     for result in results:
         rel = result.path.relative_to(root)
-        print(f"{result.total:8d} {result.cjk_chars:8d} {result.english_words:8d}  {rel}")
+        print(
+            f"{result.total:8d} {result.cjk_chars:8d} "
+            f"{result.english_words:8d} {result.matter:>12}  {rel}"
+        )
 
     print()
-    for name in ("frontmatter", "chapters", "appendices"):
-        group = [result for result in results if category(result.path) == name]
+    for name in ("frontmatter", "mainmatter", "appendices", "backmatter"):
+        group = [result for result in results if category(result) == name]
         if not group:
             continue
         total = sum(result.total for result in group)
@@ -176,11 +197,11 @@ def print_table(results: list[CountResult], root: Path) -> None:
         english = sum(result.english_words for result in group)
         print(f"{name:>12}: {total:8d} units ({cjk} CJK + {english} EN)")
 
-    counted = [result for result in results if is_book_content(result.path)]
+    counted = [result for result in results if is_book_content(result)]
     total = sum(result.total for result in counted)
     cjk = sum(result.cjk_chars for result in counted)
     english = sum(result.english_words for result in counted)
-    print(f"{'book total':>12}: {total:8d} units ({cjk} CJK + {english} EN)")
+    print(f"{'main text':>12}: {total:8d} units ({cjk} CJK + {english} EN)")
 
 
 def main() -> int:
@@ -192,15 +213,19 @@ def main() -> int:
     args = parser.parse_args()
 
     root = Path(__file__).resolve().parents[1]
-    paths = input_paths(root, root / "main.tex")
-    paths = [path for path in paths if path.suffix == ".tex"]
+    items = input_items(root, root / "main.tex")
+    items = [item for item in items if item.path.suffix == ".tex"]
     if args.chapters_only:
-        paths = [path for path in paths if "chapters" in path.parts]
+        items = [
+            item
+            for item in items
+            if "chapters" in item.path.parts and item.matter == "mainmatter"
+        ]
 
-    results = [count_file(path) for path in paths]
+    results = [count_file(item) for item in items]
     print_table(results, root)
 
-    total = sum(result.total for result in results if is_book_content(result.path))
+    total = sum(result.total for result in results if is_book_content(result))
     if args.min and total < args.min:
         print()
         print(f"FAILED: {total} units < required minimum {args.min} units")
