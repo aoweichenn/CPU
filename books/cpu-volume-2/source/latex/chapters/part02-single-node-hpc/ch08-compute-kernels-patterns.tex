@@ -52,6 +52,398 @@ Stencil 的边界处理会影响代码形状。可以把内部区域和边界区
 分析计算内核时先问四个问题：每个元素读写多少字节，是否存在跨元素依赖，写入是否冲突，工作量是否均衡。
 \end{keyidea}
 
+\section{内核模式不是算法名字}
+
+本章讲“内核模式”，不是为了让读者背 map、reduce、scan 这些词，而是训练一种分析方式。一个计算任务进入系统后，先不要急着选择线程池、SIMD 或分布式框架，而要先判断它的数据形状：输入是否连续，输出是否连续，读写比例如何，是否有跨元素依赖，是否存在冲突写，工作量是否均匀，能否按块处理，能否先局部处理再合并。
+
+同一个业务问题可能拆成多个内核。日志统计可能先是 map：解析每行日志；再是 filter：丢掉无效记录；再是 partition：按 key 或时间分桶；再是 reduce：对每个 key 计数；最后是 sort：输出 top key。数据库执行器、搜索引擎、图计算和机器学习数据预处理都类似。理解内核模式，可以把一个看似复杂的系统拆成可优化、可测量、可验证的阶段。
+
+Compute Systems Engine 后续的分布式 shuffle 也会复用这些模式。map 端解析和本地聚合，shuffle 前按 key 分区，reduce 端合并，输出前排序或 top-k。单机内核和分布式执行不是两本书的内容，而是同一组模式在不同尺度上的实现。
+
+\section{Map：最容易并行，也最容易被内存带宽限制}
+
+Map 的特征是每个输入元素独立产生输出。它通常最容易并行、向量化和分块，因为迭代之间没有依赖。朴素实现是一层循环。
+
+\begin{lstlisting}[language=C++,caption={baseline：逐元素 map}]
+void scale_and_shift(std::span<const float> input,
+                     std::span<float> output,
+                     float scale,
+                     float shift) {
+    const std::size_t count = std::min(input.size(), output.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        output[i] = input[i] * scale + shift;
+    }
+}
+\end{lstlisting}
+
+这个内核的正确性很简单：每个输出位置只依赖同一位置输入。性能上却要看字节数。如果每个元素读 4 字节写 4 字节，只做一次乘法和一次加法，算术强度很低，输入很大时往往受内存带宽限制。此时 SIMD 可以减少指令数，但未必带来数量级提升。若 map 表达式很重，例如包含多项式、三角函数或复杂解析，计算可能成为瓶颈，向量化和函数近似才更重要。
+
+Map 的常见优化是融合。若先对数组做 scale，再做 clamp，再做转换，每一步都写出中间数组，就会产生多轮内存读写。融合成一次循环可以减少内存流量。
+
+\begin{lstlisting}[language=C++,caption={融合多个 map，减少中间数组}]
+void normalize_clamp(std::span<const float> input,
+                     std::span<float> output,
+                     float mean,
+                     float inv_stddev) {
+    const std::size_t count = std::min(input.size(), output.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        const float normalized = (input[i] - mean) * inv_stddev;
+        output[i] = std::clamp(normalized, -1.0F, 1.0F);
+    }
+}
+\end{lstlisting}
+
+融合也有代价。循环体变大后，寄存器压力可能增加；若把多个不相关路径硬塞进一个循环，前端和分支预测可能变差；若中间结果可复用，融合反而丢掉复用机会。原则是：融合主要用于减少一次性中间读写，不是为了让代码看起来“更优化”。
+
+\section{Reduce：合并语义决定一切}
+
+Reduce 的重点是合并语义。一个 reduce 操作至少要说明单位元、结合律、交换律和重排是否允许。整数最大值很简单，单位元可以是最小可表示值，合并顺序不影响结果。浮点求和不严格满足结合律，合并树会影响舍入。字符串拼接满足结合律时仍可能被分配成本主导。哈希表聚合还要处理 key 冲突和内存分配。
+
+朴素并行 reduce 的错误写法，是所有线程直接更新一个共享结果。
+
+\begin{lstlisting}[language=C++,caption={反例：reduce 中的共享写热点}]
+void count_positive_bad(std::span<const std::int32_t> values,
+                        std::atomic<std::int64_t>& total) {
+    for (const std::int32_t value : values) {
+        if (value > 0) {
+            total.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+}
+\end{lstlisting}
+
+这个版本的结果可以正确，但高频共享写会让 cache line 所有权不断迁移。更好的结构是每个 worker 本地计数，最后合并。
+
+\begin{lstlisting}[language=C++,caption={线程本地 reduce，最后合并}]
+struct alignas(64) CountPartial {
+    std::int64_t positive = 0;
+};
+
+void count_positive_range(std::span<const std::int32_t> values,
+                          CountPartial& partial) {
+    std::int64_t local = 0;
+    for (const std::int32_t value : values) {
+        if (value > 0) {
+            ++local;
+        }
+    }
+    partial.positive = local;
+}
+\end{lstlisting}
+
+这段代码还不是完整线程池实现，但表达了核心原则：热路径写寄存器和本地 partial，不写全局共享对象。它把问题从“每个元素一次同步”变成“每个 worker 一次合并”。当输入很大时，这个差异通常是数量级的。
+
+\section{Scan：把顺序依赖拆成两层}
+
+Scan 看起来比 reduce 更串行，因为每个输出都是前缀结果。但 scan 可以拆成块内扫描、块摘要扫描、回填三阶段。以整数前缀和为例，块内扫描可以并行；每个块产生一个 block sum；对 block sum 做小规模 scan；最后每个块把前面所有块的和加回自己的输出。
+
+\begin{lstlisting}[language=C++,caption={单块局部 scan}]
+std::int64_t scan_block(std::span<const std::int32_t> input,
+                        std::span<std::int64_t> output) {
+    const std::size_t count = std::min(input.size(), output.size());
+    std::int64_t prefix = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        prefix += input[i];
+        output[i] = prefix;
+    }
+    return prefix;
+}
+\end{lstlisting}
+
+这段局部 scan 本身是串行的，但多个块之间可以并行。并行 scan 的关键是把“所有元素依赖前面所有元素”改写成“块内局部依赖 + 块间摘要依赖”。这个思想非常重要：很多系统问题并不是完全无依赖，而是依赖可以摘要化。分布式计算中的 map-side combine、数据库中的局部聚合、图计算中的 frontier 层处理，都有类似结构。
+
+Scan 的测试要比 reduce 更细。reduce 只需要最终结果，scan 每个位置都要正确。测试要覆盖空输入、单元素、刚好一个块、多个块、最后一块不满、负数和可能溢出。若使用无符号类型，还要说明模运算语义；若使用有符号类型，要避免未定义溢出。
+
+\section{Filter 和 stream compaction}
+
+Filter 选择满足谓词的元素。如果串行写，可以直接 \code{push_back}；并行写就不能让所有线程争用一个 vector。标准做法是三阶段：每个块统计保留数量，对数量做 scan 得到输出偏移，最后每个块写入自己的连续输出区间。
+
+\begin{lstlisting}[language=C++,caption={过滤前先统计每个块输出数量}]
+std::int64_t count_selected(std::span<const std::int32_t> values,
+                            std::int32_t threshold) {
+    std::int64_t count = 0;
+    for (const std::int32_t value : values) {
+        if (value >= threshold) {
+            ++count;
+        }
+    }
+    return count;
+}
+\end{lstlisting}
+
+第一阶段只统计，不写输出，因此没有冲突写。第二阶段扫描每个块的 count，得到每个块输出起点。第三阶段每个块再次扫描输入，把满足条件的元素写到自己负责的输出区间。它多读了一遍输入，却消除了共享 push 的锁或原子热点。是否划算取决于选择率、元素大小、谓词成本和内存带宽。
+
+如果选择率很高，输出接近输入大小，两遍读的成本较高；如果选择率很低，输出少，三阶段方法仍然可能更好，因为并发写冲突少且输出紧凑。GPU、数据库和列式执行器都大量使用 selection vector 或 prefix sum 来组织过滤输出。
+
+\section{Stencil：边界和内部区域分离}
+
+Stencil 的核心是邻域复用。以一维三点 stencil 为例，输出位置 \code{i} 读取 \code{i - 1}、\code{i} 和 \code{i + 1}。内部区域很规则，边界位置需要特殊处理。若在每次迭代里判断边界，热循环会有分支；若把边界单独处理，内部循环更干净。
+
+\begin{lstlisting}[language=C++,caption={内部区域和边界分离的一维 stencil}]
+void smooth_three_point(std::span<const float> input,
+                        std::span<float> output) {
+    const std::size_t count = std::min(input.size(), output.size());
+    if (count == 0) {
+        return;
+    }
+    output[0] = input[0];
+    if (count == 1) {
+        return;
+    }
+    for (std::size_t i = 1; i + 1 < count; ++i) {
+        output[i] = (input[i - 1] + input[i] + input[i + 1]) / 3.0F;
+    }
+    output[count - 1] = input[count - 1];
+}
+\end{lstlisting}
+
+二维 stencil 更强调分块。一个像素或网格点会被相邻输出复用，按行扫描能利用一部分局部性；按 tile 处理可以把一块输入和 halo 留在缓存中。分布式 stencil 则要交换 halo 数据。单机的 cache block 和分布式的 halo exchange 是同一思想在不同层级上的表现。
+
+\section{直方图：桶数量决定策略}
+
+直方图的策略取决于桶数量、输入分布和线程数。桶很少时，全局原子会产生严重热点；每线程本地桶可以减少冲突，但合并成本低。桶很多时，每线程完整桶数组可能占用大量内存，TLB 和 cache 压力上升。输入分布倾斜时，少数桶成为热点；输入均匀时，分片效果更稳定。
+
+一个合理实现通常从三版开始：全局锁或原子版本作为 baseline；每线程本地直方图版本作为优化；按 NUMA 节点或分块汇总版本作为扩展。每版都要说明内存占用。例如桶数是一百万、线程数是 64，每线程完整 \code{std::uint64_t} 桶数组需要 512 MiB，仅 partial 就可能过大。这时可以按块处理、稀疏本地 map、分桶分片或两级聚合。
+
+\section{排序：比较、移动和分区}
+
+排序不是只有比较次数。比较排序的成本包括比较函数、数据移动、分支预测、cache locality 和临时空间。若元素很大，排序索引可能比移动对象更好；若 key 是固定宽度整数，基数排序可能比比较排序更适合；若数据已经部分有序，某些算法能利用已有顺序；若需要稳定性，算法选择又不同。
+
+并行排序通常先分区，再局部排序，再合并。分区是否均衡决定负载；局部排序是否 cache 友好决定单核效率；合并是否形成长尾决定扩展性。分布式排序进一步把分区变成 shuffle：样本选择不准会造成某些 reducer 数据过多，形成长尾。排序是连接单机算法和分布式系统的典型内核。
+
+\section{图遍历：不规则内核的代表}
+
+图遍历是规则数组内核的反面。邻接表访问可能随机，顶点度数差异巨大，前沿大小每层变化，写 visited 状态可能有竞争。BFS 的 top-down 策略从当前前沿扩展邻居；bottom-up 策略从未访问顶点检查是否有邻居在前沿。当前沿很小时 top-down 更好，当前沿很大时 bottom-up 可能减少边访问。方向优化的本质，是根据数据形状切换内核。
+
+图算法还暴露负载均衡问题。若一个顶点有百万邻居，而其他顶点只有几个邻居，按顶点静态分配会造成长尾。可以按边切分、按度数分层、把高阶顶点拆成多个任务，或者使用工作窃取。每种方案都改变局部性和同步成本。图遍历提醒我们：高性能计算不只是 SIMD 和矩阵，真实系统有大量不规则数据。
+
+\section{Top-k 和重 hitter}
+
+很多系统不需要完整排序，只需要 top-k 或 heavy hitters。朴素做法是统计所有 key 后全量排序；更好的做法是每个分片维护局部 top-k 或候选集合，最后合并。若 key 空间很大且数据流很长，可以使用近似算法，例如 count-min sketch 或 space-saving，牺牲精确性换取内存和吞吐。
+
+近似算法必须写清误差语义。系统教材不能只说“近似更快”，要说明误差上界、误报/漏报、是否能用于计费或安全策略。对于日志趋势和监控，近似可能足够；对于金融结算，近似不可接受。算法选择受业务语义约束。
+
+\section{内核组合：日志统计流水线}
+
+把本章模式组合起来，可以得到一个日志统计流水线。第一阶段 map：解析每行日志，提取 timestamp、user、event。第二阶段 filter：丢弃无效记录。第三阶段 partition：按 event 或 user 分桶。第四阶段 local reduce：每个 worker 对本地桶计数。第五阶段 merge：合并 partial。第六阶段 top-k：输出最热门事件。
+
+这个流水线可以作为 Compute Systems Engine 的中型案例。每个阶段都有 reference，每个阶段都有可测成本，每个阶段都能映射到后续分布式版本。单机时 partition 是内存写入偏移；分布式时 partition 是 shuffle 目标。单机时 backpressure 是有界队列；分布式时 backpressure 是网络和远端 reducer 的限流。这样一本书的前后内容就能真正贯通。
+
+\section{本章落到贯穿项目}
+
+Compute Systems Engine 在本章应增加一个 kernel suite。至少包含：map 变换、count positive reduce、parallel count-if、stream compaction、thread-local histogram、one-dimensional stencil 和 top-k baseline。每个内核都保留串行 reference 和一个并行版本，benchmark harness 记录输入规模、线程数、输出校验和核心指标。
+
+项目不要一开始追求所有内核极致优化。更重要的是让每个内核展示一种系统问题：map 展示内存带宽；reduce 展示共享写消除；scan 展示依赖分层；filter 展示输出位置分配；histogram 展示冲突更新；stencil 展示邻域复用；graph 或 top-k 展示不规则负载和数据倾斜。
+
+\section{本章习题}
+
+\begin{exercisebox}
+习题一：把一个日志统计任务拆成 map、filter、partition、reduce、top-k 五个阶段。每个阶段写出输入、输出、是否可并行、是否可能向量化、是否有共享写和主要瓶颈。
+
+习题二：实现或设计 parallel count-if。要求先写全局原子反例，再写线程本地 partial 版本。报告中解释为什么 relaxed 原子不能解决共享写扩展性问题。
+
+习题三：设计 stream compaction。写出统计、扫描偏移、写输出三阶段，并说明每阶段的正确性测试。要求覆盖选择率为 0、选择率为 100%、随机选择和倾斜输入。
+
+习题四：为直方图选择三种策略：全局原子、本地桶、稀疏本地 map。分别说明适用的桶数量、输入分布、线程数和内存占用。
+\end{exercisebox}
+
+\section{稠密 key 和稀疏 key}
+
+聚合和直方图经常取决于 key 空间形状。若 key 是 0 到 1023 的事件类型，数组桶非常合适：连续、无哈希、cache 友好、合并简单。若 key 是 64 位用户 ID，实际出现的 key 很稀疏，直接分配巨大数组不现实，哈希表或排序聚合更合适。若 key 分布高度倾斜，普通哈希表也可能在少数 key 上形成热点或长链。
+
+稠密 key 的本地直方图可以写成数组。
+
+\begin{lstlisting}[language=C++,caption={稠密 key 的本地直方图}]
+constexpr std::int32_t EVENT_BUCKET_COUNT = 1024;
+
+struct LocalHistogram {
+    std::array<std::int64_t, EVENT_BUCKET_COUNT> buckets{};
+};
+
+void histogram_dense(std::span<const std::int32_t> events,
+                     LocalHistogram& histogram) {
+    for (const std::int32_t event : events) {
+        if (0 <= event && event < EVENT_BUCKET_COUNT) {
+            ++histogram.buckets[static_cast<std::size_t>(event)];
+        }
+    }
+}
+\end{lstlisting}
+
+这个版本速度可能很高，但它把 key 范围写进了结构。若 event id 不是小整数，或者需要动态 schema，就不能直接使用。稀疏 key 可能使用 \code{std::unordered_map}，但本地哈希表会引入分配和随机访问。工程中常见折中是先对输入按块排序或使用 robin-hood/open-addressing 哈希表，减少分配和指针跳转。
+
+\section{排序聚合和哈希聚合}
+
+Group-by 聚合通常有两条路线。哈希聚合边读边更新哈希表，平均复杂度好，适合无序输入和点更新；排序聚合先按 key 排序，再线性扫描相同 key，适合需要排序输出、key 可比较、内存局部性重要或哈希表冲突严重的场景。排序聚合多了排序成本，却可能减少随机写和分配。
+
+选择时要看 key 数量、输入大小、输出是否需要有序、内存预算和倾斜程度。若 key 很少，哈希聚合或数组桶好；若 key 很多且输出要排序，排序聚合可能更合适；若输入已经按 key 近似有序，排序聚合收益更大。数据库执行器通常同时实现多种聚合，并根据统计信息选择。
+
+\section{Top-k 的两阶段设计}
+
+Top-k 不必全量排序。每个 worker 可以维护一个大小为 k 的小堆或有序数组，得到本地 top-k；最后把所有本地 top-k 合并，再取全局 top-k。若 worker 数是 p，最终合并只处理 p 乘 k 个候选，而不是全部元素。这个结构和 map-side combine 一样，先局部减少数据量，再全局合并。
+
+\begin{lstlisting}[language=C++,caption={本地 top-k 候选的接口形态}]
+struct TopCandidate {
+    std::int32_t key = 0;
+    std::int64_t score = 0;
+};
+
+using TopList = std::vector<TopCandidate>;
+
+TopList merge_top_candidates(std::span<const TopCandidate> candidates,
+                             std::int32_t limit);
+\end{lstlisting}
+
+Top-k 的难点是 tie-breaking 和确定性。若两个 key 分数相同，输出顺序是否按 key 排序，还是任意？分布式系统中，不确定顺序会导致测试和缓存难以复现。接口应定义 tie-break 规则，例如先按 score 降序，再按 key 升序。
+
+\section{Join 是组合内核}
+
+Join 是数据库和数据处理系统中的核心操作。Hash join 先构建较小表的哈希表，再扫描较大表查找匹配；sort-merge join 先按 join key 排序，再线性合并；nested-loop join 朴素但只适合极小输入或有索引的情况。Join 的成本包括构建、探测、输出放大、内存占用和数据倾斜。
+
+Join 也是多个内核的组合：构建哈希表是聚合/索引构造，探测是 map 加随机访问，输出是 compaction 或 append，分布式 join 还需要 partition/shuffle。若某个 key 一对多匹配很多行，输出可能爆炸，成为真正瓶颈。优化 join 不能只看输入大小，还要估算输出基数。
+
+\section{Graph frontier 的数据结构}
+
+图遍历常用 frontier 表示当前层活跃顶点。frontier 可以是向量、队列、bitmap 或稀疏集合。向量适合前沿较小，遍历活跃顶点；bitmap 适合前沿很大，快速判断某个顶点是否在前沿；稀疏集合适合需要快速去重和遍历。方向优化 BFS 的核心就是根据 frontier 大小和边数量切换数据结构和遍历方向。
+
+这说明数据结构不是静态选择。一个算法的不同阶段可能需要不同表示。高质量系统会测量前沿大小、边访问量和重复访问，再切换策略。单一结构在所有阶段都“还可以”，往往不如在关键阶段选择合适表示。
+
+\section{内核流水线和材料化}
+
+多个内核连接时，要决定中间结果是否材料化。材料化把中间结果写成数组或文件，便于调试、复用和容错，但增加内存或 I/O。流水线把上游输出直接送给下游，减少中间写入，但背压、错误恢复和调试更复杂。数据库执行器中的 volcano、vectorized execution、pipeline breaker 都围绕这个取舍。
+
+Reduce、sort、join、shuffle 常常是 pipeline breaker，因为它们需要看到一批数据或按 key 重排才能继续。Map/filter 通常容易流水线。理解哪些阶段必须材料化，哪些阶段可以融合，是计算系统设计的核心能力。
+
+\section{Map 内核的细节}
+
+Map 是最简单的计算内核：每个输入元素独立产生一个输出元素。正因为简单，它适合作为性能分析起点。Map 的主要问题通常是内存带宽、函数调用、分支和类型转换。若每个元素只做一次加法，瓶颈很可能是读写字节；若每个元素调用复杂函数，瓶颈可能转向计算或前端；若每个元素有随机分支，分支预测会进入成本。
+
+Map 内核的输出所有权很清晰：第 i 个输入写第 i 个输出。并行切分时，每个 worker 写自己的连续输出区间，不需要锁。这种结构应成为读者心中的“理想并行形状”。后续 filter、partition、join 的复杂性，很多都来自输出位置不再天然等于输入位置。
+
+Map 还有一个常见优化：就地更新。若输入不再需要，可以直接写回原数组，减少输出内存。但就地更新改变了别名和生命周期。若后续还需要原始输入，就不能就地；若多线程中其他阶段仍在读取输入，就地会造成数据竞争或语义错误。内存节省不能脱离数据流图。
+
+\section{Reduce 内核的细节}
+
+Reduce 把多个输入合成一个或少数几个输出。它的难点是依赖和合并顺序。单线程 reduce 有一条累加依赖链；多累加器和分块 reduce 可以拆链；多线程 reduce 需要 partial；分布式 reduce 需要 map-side combine 和 shuffle。一个 reduce 的形态会随着尺度变化，但核心问题始终是：局部怎样合并，全局怎样合并，合并顺序是否影响语义。
+
+不同 reduce 的单位元和结合性不同。计数求和简单，最小值最大值也简单；浮点求和有误差；集合合并可能需要去重；字符串拼接内存成本高；哈希表合并受 key 分布影响。教材不能把 reduce 简化成一个加法例子。每个 reduce 都要写清操作、单位元、是否结合、是否交换、是否确定性。
+
+\section{Scan 内核的角色}
+
+Scan 的价值在于把局部数量变成全局位置。Stream compaction、partition、基数排序、稀疏矩阵构建、GPU kernel 输出分配都需要 scan。它不是只用于前缀和题目，而是并行写输出的基础设施。
+
+Scan 通常是 pipeline breaker，因为后续写位置依赖前面所有块的数量。优化 scan 时，常把它分层：块内 scan，块总和 scan，块内回填。这个结构在单机多线程和 GPU 中都常见。分布式系统里，对每个 partition 的输出大小做前缀求和，分配文件偏移，也是一种 scan 思想。
+
+\section{Filter 的选择率}
+
+Filter 的性能高度依赖选择率。选择率为 0 时，输出很小，但仍要读全部输入；选择率为 100\% 时，filter 接近 copy；选择率中等且随机时，分支和输出位置都复杂。选择率还影响数据结构选择：低选择率适合 selected index list，高选择率适合 bitmap 或直接保留原数组加 mask，中等选择率可能需要 compaction。
+
+测试 filter 时必须覆盖不同选择率。只测 50\% 随机选择，无法代表真实业务；只测全通过，也看不到输出位置分配成本。日志过滤、权限筛选、数据库谓词和图 frontier 都会有不同选择率分布。算法实现要能处理这些变化。
+
+\section{Partition 的两种目标}
+
+Partition 有两类目标。第一类是为了并行写输出，例如把元素按 bucket 放到连续区间，便于后续每个 bucket 独立处理。第二类是为了改善局部性或控制流，例如按记录类型分桶，让后续同类记录走同一分支。前者关注无冲突写和输出布局，后者关注后续计算效率。很多系统同时使用二者。
+
+Partition 的成本包括两遍扫描、counts 矩阵、输出写入和可能的稳定性维护。如果后续收益不大，partition 可能不划算。一个小输入上为了减少分支而先排序分桶，可能比直接处理更慢。判断 partition 是否值得，要估算后续阶段减少了多少分支、随机访问或网络数据。
+
+\section{Histogram 的冲突维度}
+
+Histogram 的冲突来自多个输入更新同一 bucket。冲突维度有三种：线程之间冲突、cache line 冲突、数据倾斜冲突。线程之间冲突可以用本地桶解决；cache line 冲突要注意相邻 bucket 是否被不同线程频繁写；数据倾斜冲突会让某些 bucket 合并阶段很重。桶数量越少，线程本地数组越小，但热点越强；桶数量越大，本地数组越大，合并成本也高。
+
+稠密 histogram 的合并可以按 bucket 并行，也可以按 worker 并行。按 bucket 并行适合 bucket 很多，每个 bucket 合并所有 worker；按 worker 并行适合 worker 多但 bucket 少，先局部汇总再串行写。合并阶段也可能成为瓶颈，不能只优化本地统计。
+
+\section{Stencil 的边界处理}
+
+Stencil 使用邻域数据计算输出，例如一维平滑、二维卷积、网格 PDE。它的局部性比随机访问好，但边界处理和块间 halo 会带来复杂性。单线程中，边界可以单独处理；多线程中，每个块需要读取邻近块的边界数据。若只读输入写输出，halo 读取没有数据竞争；若就地更新，邻域依赖会破坏并行语义。
+
+Stencil 优化常用 blocking，让一块数据在 cache 中被多次使用。二维 stencil 还要考虑行主序、行跨度、边界分支和向量化。GPU 和图像处理里 stencil 很常见，但 CPU 上同样重要。它训练的是“邻域复用”和“边界语义”。
+
+\section{Sort 的系统角色}
+
+排序不仅是算法题，也是系统工具。排序可以把随机 key 聚成连续区间，便于聚合、join、压缩和写文件。外部排序能处理超过内存的数据：先生成有序 run，再多路归并。分布式排序则先采样选择分区边界，再 shuffle 到 reducer。排序是典型的 pipeline breaker，但它换来后续顺序访问和确定性输出。
+
+排序的稳定性也要声明。稳定排序保持相等 key 的原顺序，适合需要保留时间顺序或二级语义的场景；非稳定排序更快或内存更少。很多系统用复合 key 代替稳定排序，例如先按主 key，再按原始位置。稳定性和确定性是测试和恢复的重要边界。
+
+\section{Join 的输出放大}
+
+Join 最容易低估的是输出放大。两个输入各一百万行，如果某个 key 在左表出现一千次，在右表出现一千次，该 key 的 join 输出就是一百万行。即使输入不大，输出也可能爆炸。系统必须估算输出基数，并设置内存和背压策略。否则 join 不是慢，而是直接 OOM。
+
+Hash join 构建阶段也要选择 build side。通常把较小表放入哈希表，较大表做 probe。但如果小表 key 极端倾斜，某些 bucket 很长；如果大表过滤后很小，先过滤再 join 更好；如果输出需要按 key 排序，sort-merge join 可能减少后续成本。Join 是优化器思维的入口：单个内核选择受上下游影响。
+
+\section{Sketch 和近似计算}
+
+在大规模系统中，有时无法保存所有 key 的精确状态。Sketch 类算法用固定内存近似频率、基数或分位数。Count-min sketch 估计频率，HyperLogLog 估计基数，t-digest 或 KLL 估计分位数。它们适合监控、推荐特征、流量分析和预估，不适合必须精确的结算。
+
+近似算法的教材写法必须包含误差语义、内存大小、合并方式和适用边界。分布式系统喜欢可合并 sketch，因为每个 worker 可以本地构建，最后合并。它们和 reduce 结构天然匹配。若 sketch 不能合并，分布式使用会困难。
+
+\section{Kernel suite 的代码组织}
+
+Compute Systems Engine 的 kernel suite 应把每个内核按相同结构组织：reference、parallel、benchmark、tests。Reference 定义语义，parallel 做优化，benchmark 记录性能，tests 覆盖边界。不要把所有内核写进一个文件。每个内核都要有输入生成器和校验器，便于构造均匀、倾斜、小规模、大规模和边界输入。
+
+接口应使用 span 和明确输出对象。Map 接收 input 和 output span；reduce 返回标量或 partial；histogram 接收 key span 和 bucket span；top-k 返回候选列表；join 返回输出范围或写入 sink。明确输出所有权，可以减少并发写冲突和隐藏分配。
+
+\section{阶段融合的验收}
+
+若要融合两个内核，例如 filter 后 map，应先有未融合 reference。融合版本必须输出完全一致或在声明误差内一致。性能报告要比较三项：未融合耗时、融合耗时、中间数据大小。若融合变快，要解释是少写中间数组、减少分配、改善 cache，还是减少函数调用。若融合变慢，要看寄存器压力、分支复杂度和代码大小。
+
+融合还会影响调试和恢复。分布式作业中，materialized 中间结果可以作为 checkpoint；融合流水线失败后可能要从更早阶段重做。高性能和容错有时冲突。批处理系统常在 stage 边界材料化，就是为了恢复和重试。单机内核融合到分布式系统时，要重新考虑失败语义。
+
+\section{本章验收清单}
+
+本章完成后，读者应能为一个新计算任务做模式识别。它是 map、reduce、scan、filter、partition、sort、join、stencil、graph frontier、top-k 还是 sketch？它的输入输出是什么？输出位置是否天然确定？是否有共享写？是否需要稳定顺序？是否能局部聚合？是否有热点 key？是否有 pipeline breaker？是否能用 reference 校验？这些问题比背诵某个优化技巧更重要。
+
+项目验收则要求至少三个内核串成一个流水线，并保留每阶段指标。比如日志记录先 filter 有效行，再 map 到 event type，再 histogram 聚合，再 top-k 输出。每阶段都要能单独关掉或替换，以便做对照实验。
+
+\section{案例：日志统计的完整内核链}
+
+一个完整日志统计链可以按 batch 处理。第一步，parse map 把原始文本变成热字段列。第二步，valid filter 产生选择向量或错误列表。第三步，event histogram 对有效记录按 event type 本地计数。第四步，partition 把本地计数按 reduce partition 分组。第五步，reduce merge 合并所有 worker 的 partial。第六步，top-k 输出热门事件。
+
+每一步都有独立 reference。Parse reference 可以用简单字符串处理；filter reference 检查每行有效性；histogram reference 用单线程 map；partition reference 检查每个 key 去向；reduce reference 合并所有 partial；top-k reference 全量排序。链路正确性来自每个内核正确加上接口语义正确。这个案例可以作为第 18 章项目的单机子集。
+
+\section{案例：近似 heavy hitter}
+
+如果 event type 很多，精确统计所有 key 成本高，可以使用 heavy hitter 近似。每个 worker 维护固定大小候选集合，记录可能热门 key；最后合并候选，再对候选做精确二次统计或输出近似。这个方法减少内存，但可能漏掉接近阈值的 key。它适合监控和预警，不适合结算。
+
+近似案例的重点是误差合同。报告必须写：最多保留多少候选，什么情况下可能漏报，是否做二次精确验证，输出是否标记近似。系统工程中，近似不是偷懒，而是用明确误差换资源。
+
+\section{案例：Pipeline breaker 的选择}
+
+假设 parse、filter、map 都可以流水线，但 histogram 需要聚合，top-k 需要看到完整结果。Histogram 和 top-k 就是 pipeline breaker。系统可以在 histogram 前保持 batch 流动，在 histogram 后材料化 partial，再进入 top-k。若为了极致低延迟把所有阶段都强行流水线，恢复和调试会复杂；若每一步都材料化，I/O 和内存成本高。
+
+选择 pipeline breaker 时，要问三个问题：后续是否需要全局重排或聚合，失败后是否需要从这里恢复，中间数据是否值得保存。这个判断会贯穿单机执行器和分布式 shuffle。
+
+\section{内核选择的业务语义}
+
+同一个输入可以有多种内核选择。要统计所有 key 的精确计数，用 histogram 或 hash aggregate；只要热门 key，用 top-k 或 heavy hitter；要按 key 连接两个数据集，用 join；要按时间窗口输出趋势，用 partition 加窗口 reduce；要快速估计基数，用 sketch。选择不是只看速度，而是看业务语义：是否精确，是否确定，是否可恢复，是否需要排序，是否允许旧数据。
+
+日志系统里，计费日志必须精确，监控趋势可以近似；审计输出需要稳定顺序，调试指标可以无序；最终报表需要持久化，临时 dashboard 可以丢弃。内核模式和业务语义相连，系统设计不能把所有数据都当成同一种计算。
+
+\section{计算内核章节总结}
+
+计算内核是数据流里的可复用形状。Map 保持位置，filter 选择元素，scan 分配位置，partition 重排数据，reduce 合并状态，sort 建立顺序，join 组合关系，top-k 缩小结果，sketch 用误差换空间。识别这些形状，就能把复杂业务拆成可测试、可测量、可替换的阶段。
+
+\section{内核模式决策表}
+
+选择内核模式时，先问输出和输入的关系。一对一是 map，一对零或一是 filter，一对多可能是 flat-map 或 join，多个输入到一个输出是 reduce，需要位置就是 scan，需要按 key 分组就是 partition 或 sort，需要最热少数就是 top-k，需要固定内存估计就是 sketch。模式识别后，再讨论并行、SIMD 和 I/O。不要一开始就从实现细节出发。
+
+\section{内核验收报告}
+
+本章每个内核都应该有一份验收报告。报告至少包含：串行 reference、输入分布、输出校验、数据结构、内存流量估算、并行切分、共享写分析、负载均衡、异常边界和性能指标。没有这些内容的“优化”只是代码片段。
+
+以直方图为例，验收报告要写：桶数量、key 分布、线程数、本地桶内存占用、合并策略、是否对齐、是否有 false sharing、输入是否随机、输出是否和 reference 一致、在均匀和倾斜输入下差异如何。这样读者才会把算法、数据和系统放在一起看。
+
+\section{本章扩展实验}
+
+\begin{exercisebox}
+实验一：实现稠密 key 直方图和稀疏 key 哈希聚合两个版本。构造小 key 空间、大 key 空间、均匀分布和倾斜分布四组输入，比较内存占用和吞吐。
+
+实验二：实现本地 top-k 加全局合并。要求定义 tie-break 规则，并验证多线程和单线程输出顺序一致。
+
+实验三：设计一个 hash join 和 sort-merge join 的成本比较，不要求完整实现大系统，但要估算构建、排序、探测、输出和内存占用。
+
+实验四：为 BFS frontier 选择 vector 和 bitmap 两种表示。说明当前沿从小变大时，为什么表示应该切换。
+\end{exercisebox}
+
 \begin{labbox}
 实验：在 Compute Systems Labs 中扩展一个线程本地直方图。先写全局 mutex 版本，再写线程本地版本，比较扩展性，并解释差异来自锁竞争还是 cache line 迁移。
 \end{labbox}

@@ -38,6 +38,438 @@
 
 这套模板能防止“并行版本跑得快但其实错”。很多并行 bug 不会在小输入暴露，因为线程交错少、边界简单、缓存状态稳定。测试必须覆盖空输入、极小输入、刚好一个块、多个块、不能整除块大小、重复 key、倾斜 key 和高线程数。
 
+\section{从串行 reference 开始}
+
+并行算法一定要从串行 reference 开始。reference 不一定最快，但它必须简单、可读、边界清楚。所有优化版本先和 reference 比结果，再谈速度。没有 reference 的并行优化很危险，因为你很难判断一个高吞吐结果是否只是漏写、重复写或改变了语义。
+
+以 \code{count_if} 为例，串行 reference 很短。
+
+\begin{lstlisting}[language=C++,caption={串行 count-if reference}]
+std::int64_t count_at_least(std::span<const std::int32_t> values,
+                            std::int32_t threshold) {
+    std::int64_t count = 0;
+    for (const std::int32_t value : values) {
+        if (value >= threshold) {
+            ++count;
+        }
+    }
+    return count;
+}
+\end{lstlisting}
+
+它的语义是：遍历每个输入元素，满足谓词则计数加一。并行版本不能改变谓词，不能漏掉元素，不能重复计数，不能因为线程数不同得到不同整数结果。这个 reference 也能用于测试空输入、负数、重复值、全部满足、全部不满足和随机输入。
+
+\section{静态切分的边界}
+
+静态切分把输入区间按 worker 数分成若干连续块。连续块有两个优点：每个 worker 顺序扫描自己的数据，缓存和预取友好；输出 partial 数组按 worker 索引存放，容易合并。切分时要处理不能整除的情况，不能简单地让每个 worker 处理 \code{n / worker_count} 个元素后丢掉尾部。
+
+\begin{lstlisting}[language=C++,caption={连续区间切分公式}]
+std::size_t block_begin(std::size_t size,
+                        std::int32_t worker,
+                        std::int32_t worker_count) {
+    return size * static_cast<std::size_t>(worker) /
+           static_cast<std::size_t>(worker_count);
+}
+
+std::size_t block_end(std::size_t size,
+                      std::int32_t worker,
+                      std::int32_t worker_count) {
+    return size * static_cast<std::size_t>(worker + 1) /
+           static_cast<std::size_t>(worker_count);
+}
+\end{lstlisting}
+
+这个公式保证所有块覆盖 \code{[0, size)}，相邻块首尾相接，不重叠也不漏元素。若 \code{worker_count > size}，某些块可能为空，因此实际 worker 数可以取 \code{min(worker_count, size)}，或者允许空块但测试要覆盖。工程里还要检查 \code{worker_count} 必须为正。
+
+\section{并行 count-if：从错误版本到正确版本}
+
+错误版本让所有线程更新一个全局原子计数器。它简单但共享写很重。正确的第一步是每个 worker 写自己的 partial。
+
+\begin{lstlisting}[language=C++,caption={并行 count-if 的 partial 版本}]
+struct alignas(64) CountIfPartial {
+    std::int64_t count = 0;
+};
+
+void count_if_worker(std::span<const std::int32_t> values,
+                     std::int32_t threshold,
+                     CountIfPartial& partial) {
+    std::int64_t local = 0;
+    for (const std::int32_t value : values) {
+        if (value >= threshold) {
+            ++local;
+        }
+    }
+    partial.count = local;
+}
+\end{lstlisting}
+
+这个 worker 函数只写自己的 partial，不触碰共享计数器。主线程或合并任务最后扫描 partial 得到总数。这个结构的正确性来自区间划分：每个输入元素属于且只属于一个 worker；每个 worker 的 local 是该区间内满足谓词的数量；合并是整数加法。性能收益来自减少共享写和保持连续扫描。
+
+但 partial 版本也有边界。若输入很小，线程创建和合并成本可能超过收益；若谓词很复杂，每个元素成本高，动态调度可能比静态切分更适合；若阈值和输入分布导致分支不可预测，分支优化可能比并行更重要。并行不是第一反应，正确的流程是先写 reference，再测瓶颈，再选择并行结构。
+
+\section{归约树和关键路径}
+
+线性合并 partial 很简单：一个线程从头到尾加所有 partial。worker 数很少时足够；worker 数很多或 partial 很大时，线性合并会成为串行尾巴。树形合并把 partial 两两合并，关键路径从 \code{O(p)} 变成 \code{O(log p)}，其中 p 是 partial 数。
+
+树形合并也有代价。它需要额外任务或多轮同步；若每个 partial 只是一个整数，线性合并可能已经足够快；若 partial 是大型直方图，树形合并更有价值。不要把树形合并当成默认更好，要看合并成本占比。
+
+\begin{lstlisting}[numbers=none]
+linear merge:
+  (((p0 + p1) + p2) + p3) + p4 ...
+
+tree merge:
+  round 1: p0+p1, p2+p3, p4+p5, p6+p7
+  round 2: s0+s1, s2+s3
+  round 3: t0+t1
+\end{lstlisting}
+
+树形合并还为分布式 reduce 做准备。单机里 round 是线程池任务，分布式里 round 是不同节点之间的聚合阶段。理解关键路径后，读者才能解释为什么某些系统使用分层聚合，而不是把所有 partial 发到一个中心节点。
+
+\section{浮点归约的语义选择}
+
+浮点求和不能简单说“加法满足结合律”。串行从左到右、四累加器、树形合并、按 NUMA 节点合并都会产生不同舍入。工程系统必须选择语义：是否要求逐位一致，是否允许误差范围，是否使用确定性合并树，是否使用补偿求和，是否开启 fast-math。
+
+逐位一致通常成本更高，因为合并顺序要固定，某些向量化和并行优化会受限。误差容忍则需要测试误差界，而不是只比较完全相等。科学计算、金融、渲染、机器学习统计的容忍度不同，不能用一种答案覆盖。
+
+\section{扫描的三阶段实现}
+
+扫描的三阶段可以写得很清楚。第一阶段，每个 worker 对自己的块做局部 scan，并记录块总和。第二阶段，对块总和做 scan，得到每个块之前的总偏移。第三阶段，每个 worker 把该偏移加到自己块内所有输出上。这个算法把一个长依赖链拆成多个短依赖链和一个小规模依赖链。
+
+\begin{lstlisting}[language=C++,caption={局部 scan 和回填偏移}]
+std::int64_t local_inclusive_scan(std::span<const std::int32_t> input,
+                                  std::span<std::int64_t> output) {
+    const std::size_t count = std::min(input.size(), output.size());
+    std::int64_t prefix = 0;
+    for (std::size_t i = 0; i < count; ++i) {
+        prefix += input[i];
+        output[i] = prefix;
+    }
+    return prefix;
+}
+
+void add_block_offset(std::span<std::int64_t> output,
+                      std::int64_t offset) {
+    for (std::int64_t& value : output) {
+        value += offset;
+    }
+}
+\end{lstlisting}
+
+如果使用 inclusive scan，输出位置 \code{i} 包含 input[0] 到 input[i]。如果使用 exclusive scan，输出位置 \code{i} 包含 input[0] 到 input[i-1]。两者都常用，但语义不同。教材和 API 必须在名称中写清 inclusive 或 exclusive，不能只叫 scan 后让调用者猜。
+
+\section{Scan 的工作量和空间}
+
+并行 scan 通常比串行 scan 做更多工作。它需要写输出、写 block sums、扫描 block sums、再回填。若输入很小，串行 scan 更快；若输入很大且多核可用，并行 scan 才有机会获益。scan 还需要额外存储 block sums，通常大小是 worker 数或 block 数，远小于输入，但仍要管理生命周期。
+
+scan 也会受内存带宽限制。对每个元素，局部 scan 读输入写输出，回填又读写输出一次。若元素类型大或输出巨大，内存流量很可观。优化方向可能是把 scan 和后续写输出融合，例如 stream compaction 中，统计和写出阶段可以根据选择率和缓存做调整。算法分阶段清晰，但实现可以在不破坏语义的前提下融合。
+
+\section{Partition 的两级偏移}
+
+按 key 分区通常比 \code{copy_if} 更复杂，因为有多个桶。每个 worker 先统计自己块中每个桶的数量，形成一个二维计数矩阵：worker 乘 bucket。然后对每个 bucket 的 worker counts 做 scan，得到每个 worker 在该 bucket 的写入偏移。最后每个 worker 再次遍历自己的输入，把元素写到对应 bucket 的对应区间。
+
+这个过程避免了多个 worker 对同一 bucket 的共享 push。每个 worker 写入的输出区间是唯一的，不需要锁。代价是计数矩阵和两遍输入扫描。桶数很多时，计数矩阵可能很大；输入很大时，两遍扫描消耗带宽；key 分布倾斜时，某些 bucket 输出很大，后续处理仍会倾斜。分区解决写入冲突，不自动解决下游负载均衡。
+
+\begin{lstlisting}[numbers=none]
+parallel partition shape:
+  pass 1: worker local counts per bucket
+  scan:   compute global bucket offsets
+  pass 2: worker writes to unique output ranges
+\end{lstlisting}
+
+这套结构是分布式 shuffle 的单机版本。pass 1 是 map 端计数，scan 是计算每个分区的输出位置，pass 2 是写分区文件或缓冲。分布式系统把 output range 换成远端节点或磁盘分区，核心思想不变。
+
+\section{稳定分区和非稳定分区}
+
+分区还要说明是否稳定。稳定分区保持相同桶内元素的原始相对顺序；非稳定分区不保证。稳定分区更容易推理和测试，但可能限制优化；非稳定分区可以使用更自由的交换和块内重排，适合只关心集合不关心顺序的场景。
+
+并行稳定分区通常依赖每个 worker 处理连续块，并按 worker 顺序给每个 bucket 分配输出区间。这样同一 worker 内保持顺序，worker 间按原始区间顺序排列。若使用动态调度，稳定性就更难保证，因为任务完成顺序和输入顺序不同。稳定性不是免费属性，必须在接口里声明。
+
+\section{负载均衡和任务切分}
+
+归约和 scan 对均匀数组很友好，静态切分通常足够。分区和过滤则可能不均匀：某些块满足谓词的元素很多，写输出更重；某些 key 特别热，后续 bucket 处理更重。图算法和字符串解析更不均匀，元素成本可能差几个数量级。任务切分要考虑工作量方差。
+
+一种策略是过分割：把输入切成比 worker 多得多的小块，由线程池动态调度。这样负载更均衡，但任务调度成本和 partial 数增加。另一种策略是先采样估计工作量，再按估计切分。数据库和分布式系统常用采样来处理倾斜。没有一种策略永远最好，关键是通过指标观察 worker 空闲时间和长尾任务。
+
+\section{内存分配和输出所有权}
+
+并行算法最怕在热路径里动态扩容共享容器。多个线程对同一个 \code{std::vector} \code{push_back} 必须加锁，扩容还会移动数据。正确做法通常是先计算输出大小或每个块输出大小，再一次性分配输出，最后每个 worker 写自己的区间。scan 的重要性就在这里：它把“我要写到哪里”变成一个无冲突的确定偏移。
+
+如果输出大小无法提前准确知道，可以使用 per-worker buffer，最后合并；也可以使用分块 allocator；或者使用有界队列把输出流式送给下游。每种方案都有代价：per-worker buffer 需要额外内存和合并；allocator 需要生命周期设计；队列引入背压和调度。输出所有权是并行算法设计的一部分，不是实现细节。
+
+\section{测试矩阵}
+
+归约、扫描和分区的测试要覆盖结构性边界。归约测试包括空输入、单位元、一个元素、多块、负数、溢出边界和浮点误差。扫描测试包括 inclusive/exclusive、块边界、最后不满块和输出长度不足。分区测试包括零个元素、全部同桶、每个桶均匀、极端倾斜、稳定性验证和输出容量。并发测试还要在不同线程数下重复运行，捕捉隐藏竞态。
+
+性能测试则要分离三个成本：读取输入、写输出、合并 partial。对于 count-if，读取输入和分支是主成本；对于 stream compaction，写输出和 scan 偏移也重要；对于 histogram，partial 内存占用和合并成本重要。报告不应只给总时间，而要解释哪一阶段主导。
+
+\section{从串行 reference 开始}
+
+并行算法的第一步不是开线程，而是写清串行 reference。Reference 的任务是定义语义：空输入返回什么，溢出如何处理，浮点误差如何比较，输出顺序是否稳定，异常输入是否允许。没有 reference，并行版本即使跑得快，也不知道是否正确。
+
+以 count-if 为例，串行 reference 可以非常朴素。它不追求速度，不使用 SIMD，不提前分块，只表达每个元素被检查一次且满足谓词时计数加一。并行版本的正确性证明要回到它：输入被分成互不重叠的块，每个块使用同一谓词统计，partial 求和等于全局计数。这个证明比代码更重要，因为它让后续优化有基准。
+
+\begin{lstlisting}[language=C++,caption={串行 reference 定义 count-if 语义}]
+std::int64_t count_positive_reference(std::span<const std::int32_t> values) {
+    std::int64_t count = 0;
+    for (const std::int32_t value : values) {
+        if (value > 0) {
+            ++count;
+        }
+    }
+    return count;
+}
+\end{lstlisting}
+
+Reference 还可以故意保持简单类型和清晰边界。若输入长度可能超过 \code{std::int32_t}，计数使用 \code{std::int64_t}。若数据来自文件，reference 不负责 I/O，只处理已经解析好的数组。把语义层和 I/O 层分开，后续测试更稳定。
+
+\section{范围切分的数学边界}
+
+并行数组算法通常先把区间 \code{[0, n)} 切成若干块。切分必须保证覆盖完整、互不重叠、不会越界、空输入正确、线程数大于元素数时仍正确。一个常见写法是根据 block index 计算 begin 和 end，最后一块自然处理余数。不要用容易溢出的 \code{i * block_size} 盲目计算，也不要假设 n 一定能整除 worker 数。
+
+\begin{lstlisting}[language=C++,caption={按块编号计算半开区间}]
+struct Range {
+    std::size_t begin = 0;
+    std::size_t end = 0;
+};
+
+Range block_range(std::size_t total,
+                  std::size_t block_index,
+                  std::size_t block_count) {
+    const std::size_t begin = (total * block_index) / block_count;
+    const std::size_t end = (total * (block_index + 1)) / block_count;
+    return Range{begin, end};
+}
+\end{lstlisting}
+
+这个写法让每个块大小相差不超过一，且不需要单独处理余数。但如果 \code{total * block_index} 可能超过 \code{std::size_t}，超大输入下仍要使用更稳的计算方式。教材阶段至少要让读者知道半开区间和覆盖证明：第 k 块的 end 等于第 k+1 块的 begin，第一块 begin 为零，最后一块 end 为 total。
+
+\section{单位元和结合性}
+
+归约要求一个二元操作和单位元。整数求和的单位元是零，乘法单位元是一，最小值的单位元可以是类型最大值，最大值的单位元可以是类型最小值。若没有正确单位元，空块就难处理。并行切分后，有些 worker 可能拿到空范围，因此算法不能只在“每块至少一个元素”的假设下成立。
+
+结合性决定能否任意重排合并。整数加法在不溢出的数学整数上结合，但固定宽度整数溢出有语言和业务边界；浮点加法因为舍入不严格结合；字符串拼接结合但内存成本高；哈希合并可能依赖顺序。并行归约的 API 应说明操作是否必须结合，是否要求交换，是否保证确定性顺序。
+
+\section{确定性归约}
+
+并行归约常遇到一个现实需求：每次运行结果是否完全一样。整数和某些集合运算容易保持确定；浮点、哈希表迭代、动态调度和非稳定合并会造成结果波动。对机器学习训练日志、科学计算和金融报表，波动可能不能接受；对监控指标和近似统计，误差范围可能可以接受。
+
+确定性归约可以使用固定切分和固定合并树。无论任务完成顺序如何，最终合并按 block id 顺序进行。这样牺牲一部分调度自由，换来可复现。另一个策略是使用补偿求和或更高精度 partial，降低误差但不一定逐位一致。教材应要求读者在报告中写明选择：追求吞吐、误差范围还是逐位复现。
+
+\begin{lstlisting}[numbers=none]
+deterministic reduce:
+  split input into fixed block ids
+  compute partial[block_id]
+  merge partials by a fixed binary tree
+  compare floating output by declared tolerance or exact rule
+\end{lstlisting}
+
+\section{Histogram 的两级设计}
+
+Histogram 是 reduce、partition 和缓存布局的交汇点。朴素并行写法让所有线程对全局 bucket 做原子加法。若 bucket 少且输入大，热点非常明显。更好的写法是每个 worker 维护本地 histogram，最后合并。这样热路径写线程本地数组，避免全局原子争用。
+
+\begin{lstlisting}[language=C++,caption={线程本地 histogram 的核心形态}]
+std::vector<std::uint64_t> histogram_local(
+    std::span<const std::uint32_t> keys,
+    std::uint32_t bucket_count) {
+    std::vector<std::uint64_t> buckets(bucket_count, 0);
+    for (const std::uint32_t key : keys) {
+        ++buckets[key % bucket_count];
+    }
+    return buckets;
+}
+\end{lstlisting}
+
+这个版本只展示本地统计。完整并行版本要为每个 worker 准备一个 buckets 数组，再按 bucket 或按 worker 合并。\code{bucket_count} 很小时，本地数组很小，合并成本低；\code{bucket_count} 很大时，每个 worker 一份数组可能占用大量内存，而且合并会扫描很多零。稀疏 key 场景可能改用局部哈希表；密集小整数 key 场景用数组更快。选择数据结构要看 key 空间和实际非零数量。
+
+\section{Filter 和 Compaction 的推导}
+
+过滤输出满足谓词的元素，看起来像对 vector 做并发 \code{push_back}。朴素做法给输出 vector 加锁，每个命中元素都 push。这个做法正确但慢，因为锁进入每个命中元素的热路径。优化思路是把“我要写哪里”提前算出来。
+
+第一步，每个 worker 统计自己块里命中的数量。第二步，对这些数量做 exclusive scan，得到每个 worker 的输出起始偏移。第三步，每个 worker 再扫描自己的输入，把命中元素写到自己的输出区间。这样每个元素最多读两遍，但写输出无锁且连续。若命中率很低，两遍读取可能仍划算；若谓词计算很重，可以在第一遍保存局部选择位图，第二遍避免重复计算。
+
+\begin{lstlisting}[numbers=none]
+stream compaction:
+  count pass: local selected counts
+  scan pass: worker output offsets
+  write pass: each worker writes selected elements to owned range
+\end{lstlisting}
+
+这个推导要让读者看到优化从哪里来：不是凭空想到 scan，而是因为共享 push 的冲突需要被“所有权区间”替代。Scan 的作用就是把局部数量转换成全局唯一偏移。后续分布式 shuffle 也是同理：先知道每个 partition 有多少数据，再为每个 writer 分配输出位置。
+
+\section{Partition 的内存布局}
+
+多桶 partition 可以把输出组织成连续 bucket 区间，也可以每个 bucket 一个 vector。连续区间适合后续顺序扫描和一次性写文件，bucket vector 适合增量构建但容易产生多次分配。高性能实现常先统计 counts，计算 bucket offsets，分配一个大输出数组，再让 worker 写唯一范围。
+
+如果需要稳定分区，worker 处理的输入区间顺序必须和输出区间顺序一致。对每个 bucket，worker 0 的元素排在 worker 1 前面，worker 内部保持原顺序。若不需要稳定性，可以在块内使用更快交换或局部重排。接口里声明稳定性很重要，因为稳定性会影响测试、性能和后续算法。
+
+\section{排序与分区的关系}
+
+分区可以看成粗粒度排序：只把元素按 bucket 聚到一起，不要求 bucket 内有序。排序则要求全局顺序。很多系统先 partition 再局部 sort，例如数据库按 hash 分区后每个 partition 内排序，或者分布式计算按 key 分区后 reduce 端排序。这样做能把全局大问题拆成多个小问题。
+
+排序也能帮助 reduce。若输入按 key 排好，合并相同 key 只需要顺序扫描；若输入无序，需要哈希表聚合。排序成本是 \complexity{O(n \log n)}，哈希平均接近线性但内存随机访问多。小 key 空间可以用数组 histogram，稀疏大 key 用哈希，范围查询或外部合并用排序。并行算法教材应展示这种选择，而不是把所有聚合都写成一个 \code{unordered_map}。
+
+\section{并行算法和内存带宽}
+
+归约、scan、filter 和 partition 都可能受内存带宽限制。多线程能提高吞吐，直到内存控制器、LLC 或 NUMA 互连饱和。线程数继续增加，时间可能不降反升。报告中应画线程数扩展曲线，而不是只比较 1 线程和最大线程数。
+
+算法阶段也要估算字节流量。Count-if 每个元素读一次，写 partial 很少；scan 读输入写输出，回填又读写输出；compaction 至少读输入两次或读输入加读位图；partition 读输入、写 counts、读写输出。若某个优化减少了计算却增加了内存流量，在带宽瓶颈下可能变慢。理解字节移动，是并行算法的基本功。
+
+\section{任务粒度和调度开销}
+
+并行算法要把工作拆成任务，但任务太小会被调度开销吞掉。每个任务提交、入队、唤醒、执行和记录统计都有成本。若一个任务只处理几十个整数，调度成本可能比计算成本大。任务太大又会负载不均，尤其是过滤、图遍历和字符串解析这类元素成本不均匀的工作。
+
+工程上常用最小粒度阈值。例如每个任务至少处理数千或数万个元素，或者让每个任务目标运行几十微秒以上。这个阈值要测量，不同机器和任务不同。运行时可以自适应：开始使用较大块，发现长尾后切分剩余范围；或者过分割到 worker 数的若干倍，而不是无限细分。
+
+\section{错误传播和取消}
+
+并行算法不只处理成功路径。若某个 worker 在解析输入时发现错误，其他 worker 是否继续？已经写入的输出如何处理？partial 是否有效？线程池如何传播异常？取消后是否要等待正在运行的任务安全退出？这些问题决定算法能否进入真实系统。
+
+一种简单策略是失败快速传播：共享一个原子错误标志，worker 在块边界检查；发现错误后停止提交新任务，等待已运行任务结束，然后丢弃输出。若输出写到外部文件，就必须写临时文件并在成功提交后重命名；失败时删除临时文件。分布式章节中的 attempt 提交协议，正是这个思想的跨机器版本。
+
+\section{源码阅读：并行 STL 和内核思想}
+
+C++ 标准库的并行算法接口展示了一个重要边界：用户提供操作，库决定执行策略。但并行 STL 的具体实现依赖标准库和后端，不能假设每个环境都真正多线程执行。阅读实现时，应关注执行策略如何切分范围、如何处理异常、如何限制任务粒度，以及哪些操作要求可结合或无副作用。
+
+Linux 内核里也有类似思想，例如 per-cpu 计数、RCU 遍历和批量处理。它们不一定叫 reduce 或 scan，但思路一致：把高频写放到本地，低频合并；把读路径做轻，把更新延迟；把全局锁变成分层结构。源码阅读的目标不是照搬内核 API，而是识别这些并行结构在真实系统中的形态。
+
+\section{Segmented scan}
+
+普通 scan 在一个连续序列上计算前缀。Segmented scan 则把输入分成多个段，每段内部独立 scan。它适合按 key 分组后的前缀、稀疏矩阵行偏移、批量变长记录处理和图邻接范围处理。CSR 的 offsets 数组，本质上也和段边界有关。Segmented scan 让 scan 从“数组题”扩展到“结构化批数据”的位置分配工具。
+
+实现 segmented scan 时，要处理段边界。若每个段很短，直接串行处理每段可能更快；若段很长，可以在段内并行；若段长度高度不均，长段会造成负载不均。可以先按段长度分类：短段批处理，长段拆任务。这个策略和图算法按顶点度分层类似。
+
+\section{Prefix sum 和内存分配器}
+
+内存分配器也会用到 scan 思想。假设每个 worker 需要输出不同数量的记录，先统计每个 worker 需要多少字节，对这些字节数做 prefix sum，就能一次性分配大缓冲，并给每个 worker 一个不重叠区间。这样比每个 worker 动态追加到共享 vector 更高效，也更容易恢复。
+
+这种“先计数、再分配、再写入”的模式在本书会反复出现。Stream compaction 是元素级，partition 是 bucket 级，shuffle 文件是 partition 文件级，checkpoint manifest 是 block 级。理解 scan，就理解了许多无锁写输出的基础。
+
+\section{Radix partition 和 radix sort}
+
+Radix partition 按 key 的若干 bit 分桶。第一轮按低几位分桶，第二轮按更高几位分桶，最终可以得到 radix sort。它常用于整数 key、哈希分区和数据库 join。与比较排序不同，radix 方法依赖 key 表示和桶计数，核心步骤是 histogram、scan offsets、scatter。也就是说，它把本章的三个核心模式组合在一起。
+
+Radix partition 的性能取决于每轮处理多少 bit。每轮 bit 多，桶数多，counts 矩阵大，cache 压力高；每轮 bit 少，轮数多，读写次数增加。选择 radix bits 是 cache、TLB、内存带宽和任务粒度的综合问题。教材不需要给固定答案，但要让读者知道这是可测参数。
+
+\section{并行 stable sort 的代价}
+
+排序经常被当作库函数，但并行排序有复杂成本。它需要划分、局部排序、合并或采样分区。稳定排序还要保持相等 key 的原始顺序，可能需要额外内存或更保守合并。若后续只需要按 bucket 分组，不一定需要完整排序；若后续需要 top-k，也不一定需要全排序。算法目标要匹配业务需求。
+
+在 Compute Systems Engine 中，如果日志统计只需要每个 event 的计数，排序全部记录通常是过度；如果输出要按 event id 排序，最终对聚合结果排序即可，不必排序所有输入。这个例子提醒读者：先问输出语义，再选内核。
+
+\section{并行哈希表的困难}
+
+并行哈希聚合看似简单：多个线程往哈希表里更新 key。困难在于冲突、扩容、内存分配和 cache line 争用。全局哈希表加锁简单但竞争大；每个 bucket 一把锁降低冲突但锁数量多；线程本地哈希表最后合并避免热路径共享，但内存占用高；无锁哈希表实现复杂，删除和扩容尤其难。
+
+因此很多系统先做线程本地聚合，再合并。合并阶段可以按 key 分区，把不同 key 交给不同 worker，减少冲突。若 key 空间倾斜，热点 key 仍会造成长尾，需要特殊处理。并行哈希表不是一行 \code{unordered_map} 加 mutex 能解决的。
+
+\section{负载估计和采样}
+
+Partition 和 reduce 的负载均衡可以通过采样改善。先抽样估计 key 分布或记录成本，再决定分区边界或热点 key 列表。数据库查询优化、分布式排序和 shuffle 都常用采样。采样有成本，也可能不准，尤其是输入分布随时间变化或热点很稀有时。
+
+采样结果应进入报告。若系统根据样本决定把 key 42 视为热点，就要记录样本大小、估计频率和实际频率。否则热点处理失败时无法判断是采样不准、实现错误还是输入变化。性能系统里的“智能策略”都需要可观测证据。
+
+\section{并行算法的可组合性}
+
+单个内核正确，不代表组合后正确。Filter 后的输出顺序会影响后续 stable partition；partition 后的 bucket 顺序会影响 deterministic reduce；top-k 的 tie-break 会影响最终输出；scan 的 exclusive/inclusive 选择会影响写偏移。组合系统要把每个内核的语义写成合同。
+
+Compute Systems Engine 的 kernel suite 应为每个内核记录：是否保持输入顺序，是否确定性，是否允许误差，是否可能丢弃，是否改变 key 表示，是否需要 materialization。这样流水线组合时，语义冲突能早发现。
+
+\section{案例：错误行压缩}
+
+日志解析中，错误行通常占少数。我们希望把错误行的行号和 offset 写到错误列表，用于最后报告。朴素并行做法是每个 worker 发现错误就加锁 push 到全局 vector。更好的做法是 stream compaction。第一遍每个 worker 统计错误行数；scan 得到每个 worker 的错误输出偏移；第二遍写入错误行元数据。这样错误列表稳定、无锁、可复现。
+
+如果错误率很低，两遍扫描似乎浪费。另一种折中是每个 worker 使用本地 vector 收集错误，最后按 worker 顺序合并。本地 vector 会动态分配，但错误少时成本可接受。选择两遍 compaction 还是本地 vector，取决于错误率、稳定顺序要求和内存分配成本。教材案例要展示这种权衡，而不是只有一种答案。
+
+\section{案例：输出 offset 分配}
+
+Shuffle 文件写入也需要 offset 分配。每个 map worker 对每个 reduce partition 产生不同大小的 block。若希望把同一 partition 的 blocks 写入一个连续文件，可以先统计每个 block 大小，对 sizes 做 prefix sum，得到每个 block 在文件中的 offset。然后每个 worker 可以写自己的区间。这个过程和数组 compaction 完全同构，只是单位从元素变成字节。
+
+这种设计避免了多个 worker 共享文件 append offset 的锁竞争，也让 manifest 可以记录每个 block 的位置和大小。代价是需要先知道大小，可能要先编码到临时缓冲或先估算。若大小无法提前知道，可以先写每 worker 临时文件，最后合并。算法选择受 I/O 和内存约束影响。
+
+\section{案例：并行去重}
+
+去重可以用 sort 或 hash。Sort-based 去重先排序，再扫描相邻相等元素；hash-based 去重边读边插入集合。并行去重时，sort 路线可以分区排序再合并，hash 路线可以按 key partition 到不同 worker，每个 worker 独占一部分 key 空间。若直接让所有线程更新一个全局 set，锁竞争和分配会很重。
+
+去重语义也要明确。保留第一个出现，还是任意一个？输出是否保持原顺序？若保留第一个出现，并行 partition 会破坏顺序，需要额外位置比较。若只关心集合，算法可以更自由。很多算法题默认语义简单，系统工程必须把这些边界写清。
+
+\section{并行算法的内存上限}
+
+并行算法常用额外数组：partial、counts、offsets、selection、temporary output。线程数越多，partial 越多；bucket 越多，counts 矩阵越大；输入越大，selection 可能接近输入大小。内存上限必须进入设计。一个算法吞吐高但需要 10 倍输入内存，可能无法处理大数据。
+
+报告中应列出额外空间复杂度和实际字节。例如 partition counts 是 \code{worker_count} 乘 \code{bucket_count} 乘 8 字节；selection vector 最坏是 \code{input_count} 乘 4 字节；per-worker hash map 取决于本地 unique key 数。写出这些数字，读者才能判断算法是否适合目标机器。
+
+\section{并行算法章节总结}
+
+Reduce、scan 和 partition 是并行数据处理的三根支柱。Reduce 消除共享写，scan 分配唯一输出位置，partition 把数据按后续处理需求重排。它们组合出 histogram、compaction、radix partition、shuffle 和分布式 reduce。掌握这些模式，比记住某个线程库 API 更重要。每个模式都要同时说明语义、内存上限、确定性和负载均衡。
+
+\section{并行算法决策表}
+
+设计并行算法时，可以先填决策表。输出大小是否已知？若已知，可以预分配并按区间写；若未知，先 count/scan 或使用 per-worker buffer。输出顺序是否稳定？若稳定，切分和合并必须保序；若不稳定，可以更自由重排。操作是否结合？若结合，可以树形合并；若不结合，需要固定顺序。key 是否倾斜？若倾斜，要考虑热点拆分。内存预算是否允许 per-worker state？若不允许，可能要分批处理。
+
+这张表能把算法选择从“凭经验”变成“按约束推导”。同样是 filter，稳定输出和非稳定输出不同；同样是 histogram，稠密 key 和稀疏 key 不同；同样是 reduce，整数精确和浮点误差不同。并行算法的难点在约束，而不只是线程 API。
+
+\section{案例：分批 partition}
+
+当输入太大，counts 矩阵或输出缓冲无法一次容纳时，可以分批 partition。每批独立统计、scan、写临时 block，最后再合并 block。这样降低峰值内存，但增加多批调度和最终合并。分批处理还更容易 checkpoint，因为每个 batch 可以作为恢复单位。代价是全局稳定顺序更难，需要记录 batch 顺序和 bucket 内顺序。
+
+分批 partition 是从单机算法走向分布式 shuffle 的中间形态。分布式系统本质上就是把超大输入拆成可调度、可恢复的批次。
+
+\section{案例：并行算法和容错}
+
+单机并行算法通常默认进程不崩溃，但大规模计算必须考虑容错。Reduce partial 可以重算，scan offsets 可以重算，partition block 可以根据 input split 重写。若每个阶段的输入输出边界清楚，失败后就能从最近边界恢复；若多个阶段完全融合，失败后只能从更早位置重做。算法分阶段不仅是性能问题，也是恢复问题。
+
+这解释了为什么分布式系统喜欢 stage 边界和 materialization。它牺牲一些 I/O，换来可恢复性。单机高性能和分布式容错之间常有张力，系统设计要明确哪条路径更重要。
+
+\section{案例：确定性输出}
+
+并行算法常因为调度顺序不同产生不同输出顺序。若业务只关心集合，这可以接受；若输出文件要用于缓存、测试或审计，确定性很重要。确定性输出通常要求固定 partition 顺序、固定 worker block 顺序、固定 tie-break 和固定合并树。它可能牺牲一些性能，但能显著提高可测试性和可恢复性。
+
+日志统计最终输出可以按 event type 升序，这样无论 map task 如何调度，输出文件都稳定。Top-k 可以按 score 降序、key 升序打破平局。Manifest 可以按 task id 和 partition 排序。确定性是大型系统调试的朋友。
+
+\section{本章落到贯穿项目}
+
+Compute Systems Engine 在本章应增加三个模块。第一，parallel count-if：作为 reduce 的简单案例，展示全局原子反例和 partial 版本。第二，parallel scan：实现局部 scan、block sums scan、回填，并提供 inclusive/exclusive 两个接口或至少明确选择一个。第三，stream compaction：用 count、scan、write 三阶段把满足谓词的元素写到输出。
+
+这三个模块会成为后续分布式 shuffle 的前置训练。count-if 训练局部统计，scan 训练偏移分配，compaction 训练无冲突写输出。分布式章节会把“写输出区间”升级成“写目标分区”，把“block sums”升级成“map 端摘要”。
+
+\section{从串行语义推导并行形态}
+
+并行算法不应从“开几个线程”开始，而应从串行语义开始。以 filter 为例，串行语义是按输入顺序检查每个元素，保留满足谓词的元素，并保持相对顺序。这个语义里有三个信息：谓词独立，输出数量未知，输出顺序稳定。谓词独立说明检查可以并行；输出数量未知说明不能让所有线程直接写同一个当前位置；顺序稳定说明每个元素的输出位置必须等于它之前满足谓词的元素数量。这样自然推出 count、scan、write 三阶段。
+
+如果业务不要求稳定顺序，算法形态会改变。每个 worker 可以写本地 buffer，最后任意合并；甚至可以按 bucket 输出，不保留原顺序。这样减少 scan 成本，但输出语义变弱。若业务只需要集合，非稳定输出可以接受；若输出要用于测试、审计或和原记录对齐，稳定输出更重要。并行优化的第一步永远是明确哪些串行语义必须保留，哪些可以放松。
+
+Reduce 也一样。串行求和有固定顺序；并行求和改变合并树。整数加法在不溢出的数学模型下结合，结果一致；浮点加法不严格结合，结果可能变化；字符串拼接结合但顺序重要；带副作用的操作根本不能随意并行 reduce。教材讲 reduce 时不能只写公式，还要让读者检查操作是否结合、是否交换、是否有单位元、是否要求确定性顺序。
+
+\section{并行写输出的三种模式}
+
+并行算法最大的工程问题之一，是多个 worker 怎样写输出。第一种模式是预先切分固定区间，例如 map 每个输入元素写一个输出元素，worker 按输入区间写输出区间，没有冲突。第二种模式是 count/scan/write，例如 filter、partition、错误行压缩，先计算每个 worker 或每个 bucket 的输出数量，再分配不重叠区间。第三种模式是本地 buffer 后合并，适合输出数量未知但稳定性要求较弱，或者输出很稀疏的场景。
+
+全局锁 append 是最直观但通常最差的模式。它把所有输出写入串行化，还会让输出顺序依赖调度。全局原子 \code{fetch_add} 分配位置比锁轻，但仍然有共享热点，而且稳定顺序不一定满足。若只需要任意顺序，它可能可用；若需要输入顺序，它不够。工程报告要说明为什么选择某种写出模式，而不是只说“避免锁”。
+
+写输出还要考虑内存分配。预先分配需要知道输出上界或精确数量；本地 buffer 需要处理扩容；临时文件需要处理 I/O 和失败清理；mmap 输出需要处理页错误和持久化。单机算法讲清这些细节，后续分布式 shuffle 就更容易理解，因为 shuffle 只是把输出区间从内存数组扩展到磁盘文件和网络分区。
+
+\section{可复现性和测试 oracle}
+
+并行算法的测试 oracle 可以是串行 reference，但要先定义输出是否要求完全一致。稳定 filter、确定性 sort、按 key 排序的聚合，适合和串行结果逐元素比较。非稳定 partition、任意顺序去重、近似 top-k，可能只能比较集合、计数或误差范围。测试必须匹配语义，不能用过强 oracle 错杀合理实现，也不能用过弱 oracle 放过错误。
+
+可复现性在大型系统里很有价值。输出顺序固定，失败重跑更容易比较；stage manifest 固定，缓存命中更稳定；日志行号稳定，排查更容易。为了可复现性，系统可能选择固定合并顺序、固定 worker 分区、固定随机 seed 和固定 tie-break。这些选择会牺牲一点调度自由，但换来测试和运维上的确定性。教材应让读者知道，性能不是唯一目标。
+
+当可复现性和吞吐冲突时，要按业务分类。离线训练数据生成、账务报表、审计日志通常更重视确定性；在线推荐候选召回可能更重视吞吐并接受顺序变化；科学计算可能重视数值误差可控。并行算法的“正确”不是抽象的，它来自业务语义和可验证性要求。
+
+\section{本章习题}
+
+\begin{exercisebox}
+习题一：为 parallel count-if 写完整正确性证明。证明每个输入元素被统计一次且只统计一次，partial 合并结果等于串行 reference。
+
+习题二：设计 inclusive scan 和 exclusive scan 的 API。给出输入 \code{[3, 1, 4]} 的两个输出，并说明哪个更适合分配输出偏移。
+
+习题三：为 stream compaction 写三阶段伪代码。要求说明每阶段读写哪些数组、是否并行、是否有共享写、需要哪些临时空间。
+
+习题四：设计一个倾斜 key 的 partition 测试。要求解释为什么写入区间没有冲突，但下游 reduce 仍可能负载不均。
+
+习题五：比较线性合并和树形合并。给出 partial 数为 8 时的合并步骤，并说明什么时候树形合并不值得。
+\end{exercisebox}
+
 \begin{labbox}
 实验：在 Compute Systems Labs 中扩展 parallel \code{count_if}。先让每个线程本地计数，再合并。随后实现输出压缩：先统计、扫描偏移，再写输出数组。
 \end{labbox}

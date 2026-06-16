@@ -172,11 +172,292 @@ bool try_set_max(std::atomic<std::int64_t>& target,
 
 手机或 x86 设备上跑过不代表 ARM 服务器、POWER 或未来编译器也正确。可移植 C++ 并发必须按语言模型写。教材示例因此宁愿稍保守，也不能依赖某个硬件“实际上不会乱序”的经验。
 
+\section{原子性的边界}
+
+原子操作首先保证的是单个原子对象上的读写不会产生数据竞争，并且读改写不会被撕裂。它不自动保证跨多个变量的不变量，也不自动发布普通变量，更不自动管理对象生命周期。把一个字段改成 \code{std::atomic}，只解决了这个字段本身的并发访问问题；如果这个字段只是一个更大状态机的一部分，状态机仍然可能错误。
+
+例如队列的 \code{size} 使用原子，并不能让 \code{head}、\code{tail} 和 \code{buffer} 的关系安全。两个消费者可能都看到 size 大于零，然后读取同一个槽位。再例如一个指针使用原子发布，并不能说明指针指向对象何时释放。另一个线程 acquire 读到指针后，如果发布者随后释放对象，读者仍然可能悬垂。内存序解决可见性和顺序问题，不解决所有权问题。
+
+因此，选择 atomic 之前要先回答三件事。第一，这个原子对象的线性化含义是什么，是计数、标志、指针、状态枚举还是队列索引。第二，它是否同步其他普通数据。第三，读取者拿到值后，对值关联的资源有什么生命周期保证。回答不清楚时，用 mutex 保护完整不变量通常更稳妥。
+
+\section{Relaxed 的正确用法}
+
+\code{memory_order_relaxed} 不是“随便乱序也无所谓”的开关，而是只需要原子性、不需要跨线程发布其他数据时的选择。请求总数、统计计数、采样次数、CAS 失败计数这类指标，通常可以 relaxed，因为读取者只关心数值最终大致准确或精确累加，不依赖它看到其他普通变量写入。
+
+一个 relaxed 计数器可以保证每次 \code{fetch_add} 不丢，但不能保证“看到计数增加就一定看到对应请求对象已经初始化”。如果业务要用计数器作为队列元素可见的信号，就需要 release/acquire 或锁。很多并发 bug 来自把统计变量升级成协议变量，却没有同步语义。
+
+\begin{lstlisting}[language=C++,caption={Relaxed 适合不发布其他数据的统计计数}]
+class RequestStats {
+public:
+    void record_success() {
+        this->success_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::uint64_t success_count() const {
+        return this->success_count_.load(std::memory_order_relaxed);
+    }
+
+private:
+    std::atomic<std::uint64_t> success_count_{0};
+};
+\end{lstlisting}
+
+这个类的接口没有承诺读取计数时能看到某个请求的响应对象，也没有承诺计数和其他指标之间有一致快照。若监控页面同时读取 success、failure、timeout 三个 relaxed 计数，它们可能来自不同时间点。作为指标，这可以接受；作为协议判断，这不够。
+
+\section{发布对象的完整协议}
+
+release/acquire 常用来发布对象，但完整协议包含初始化、发布、获取、使用和回收五个阶段。初始化阶段由生产者独占对象，普通写入即可。发布阶段用 release store 把指针或状态写给消费者。获取阶段消费者用 acquire load 读到 release 写入的值。使用阶段消费者可以读取对象字段。回收阶段必须保证没有消费者仍在使用对象，这一步不是 release/acquire 自动完成的。
+
+如果对象只发布一次并且活到程序结束，协议很简单。如果对象会热更新，就需要版本、引用计数、RCU、shared pointer、epoch 或锁来管理旧对象。否则消费者可能刚 acquire 到旧指针，发布者就释放旧对象。不要把“可见”误认为“活着”。可见性和生命周期是两个不同问题。
+
+\begin{lstlisting}[numbers=none]
+publish protocol:
+  producer initializes object fields
+  producer release-stores pointer
+  consumer acquire-loads pointer
+  consumer reads fields
+  reclamation waits until no consumer can hold old pointer
+\end{lstlisting}
+
+配置发布是学习这个边界的好例子。若配置对象数量很少，可以选择永不释放旧配置，用内存换简单性。若配置频繁更新，就需要引用计数或 RCU。若配置很大，又不能长时间保留旧版本，就要让读者理解回收成本会进入设计。
+
+\section{Acquire 和 Release 的方向}
+
+release 和 acquire 有方向。release 用在发布者把之前的普通写入推出去；acquire 用在消费者读到发布值后，把之后的普通读取拉进来。把消费者的 store 写成 release，不能让它看到生产者数据；把生产者的 load 写成 acquire，也不能发布数据。内存序要放在建立同步关系的那次读写上。
+
+同步还要求 acquire 读到对应 release 或其 release sequence 中的值。如果消费者 acquire load 读到的是旧值，没有读到发布者的 release store，就没有通过这次操作建立同步。很多协议因此需要循环等待某个状态值，而不是只 load 一次。状态枚举比布尔值更清楚，因为它能表达 Empty、Writing、Ready、Closed 等阶段。
+
+\section{状态枚举比多个布尔值更稳}
+
+并发状态机如果用多个布尔值表达，很容易出现组合状态没有定义。例如 \code{ready=true}、\code{closed=true}、\code{failed=false} 到底代表什么？如果这些布尔值由不同线程更新，读者还可能看到中间组合。使用一个原子枚举表示状态，能让状态转换更集中，CAS 也更容易表达。
+
+\begin{lstlisting}[language=C++,caption={原子状态枚举表达提交阶段}]
+enum class SlotState : std::int32_t {
+    Empty,
+    Writing,
+    Ready,
+    Closed,
+};
+
+struct SlotHeader {
+    std::atomic<SlotState> state{SlotState::Empty};
+};
+\end{lstlisting}
+
+状态枚举不是万能的。若状态改变还伴随多个数据字段更新，仍然需要 release/acquire 或锁来发布这些字段。若状态之间有复杂不变量，可能要用 mutex。它的价值是减少非法组合，让线性化点更容易定位。
+
+\section{CAS 成功和失败的内存序}
+
+\code{compare_exchange_weak} 和 \code{compare_exchange_strong} 都有成功内存序和失败内存序。成功时，操作既读旧值又写新值；失败时，只读取当前值并把它写回 expected 参数。失败内存序不能是 release，因为失败没有发布新值；失败内存序也不能比成功更强。常见写法是成功使用 acquire/release 或 \code{acq_rel}，失败使用 relaxed 或 acquire，具体取决于失败路径是否要基于读取到的值观察其他数据。
+
+CAS 循环还要处理 weak 可能伪失败。弱 CAS 允许即使值相等也失败，因此必须放在循环里。强 CAS 更适合不想处理伪失败的单次尝试，但在循环里弱 CAS 通常也可以。教材不应让读者机械背 API，而要理解：expected 是输入也是输出，失败后它变成实际观察值，下一轮判断要基于这个新值。
+
+\begin{lstlisting}[language=C++,caption={CAS 失败后 expected 被更新}]
+bool mark_ready(std::atomic<SlotState>& state) {
+    SlotState expected = SlotState::Writing;
+    return state.compare_exchange_strong(
+        expected,
+        SlotState::Ready,
+        std::memory_order_release,
+        std::memory_order_relaxed);
+}
+\end{lstlisting}
+
+如果返回 false，\code{expected} 不再一定是 Writing，而是当前实际状态。调用者可以用它决定是已经 Ready、已经 Closed，还是出现非法状态。很多 CAS 代码忽略失败后的 expected，错过了诊断信息。
+
+\section{Fetch-add 和热点}
+
+\code{fetch_add} 常被认为比 mutex 快，但在热点计数器上，它仍然会让同一 cache line 在多个核心之间迁移。原子读改写需要独占该 cache line；线程越多，迁移越频繁。低线程数下 atomic counter 很快，高线程数下可能成为扩展性瓶颈。这就是为什么 sharded counter 和 per-thread partial 如此重要。
+
+计数器有三种典型语义。第一，精确实时全局值，每次操作后都要读到最新总数，这最难扩展。第二，精确最终值，运行过程中不频繁读取，适合分片后最后合并。第三，近似指标，允许短时间误差，适合线程本地缓存、周期性汇总或采样。不要在需求只要第二或第三种时，实现第一种最昂贵语义。
+
+\section{Fence 的谨慎使用}
+
+C++ 还提供 atomic fence，但初学者应谨慎使用。很多 release/acquire 协议可以直接写在原子读写上，更容易审查。Fence 把顺序约束和具体原子对象分离，表达能力强，但也更容易写错。读代码的人必须追踪 fence 前后的普通读写和相关原子操作，证明它们组成同步关系。
+
+工程建议是：除非你在实现底层库、移植成熟算法或有明确性能证据，否则优先使用带内存序的原子操作、mutex 或成熟并发容器。Fence 不是高级优化标志，而是更底层的工具。教材可以介绍它存在，但不应把它作为普通业务代码首选。
+
+\section{内存序和硬件屏障的关系}
+
+C++ 内存序是语言层面的契约，编译器再把它映射到目标架构的指令和屏障。x86 的内存模型较强，某些 acquire/release load/store 可能不需要额外硬件屏障；ARM 和 POWER 更弱，可能需要显式屏障或带 acquire/release 语义的指令。代码不能因为在 x86 上看起来正确，就省略 C++ 同步关系。
+
+编译器也会根据内存序限制优化。普通变量在没有同步关系时，编译器可以重排、缓存或消除某些访问。原子操作同时约束编译器和硬件。学习内存序时，不能只画 CPU 执行顺序，也要记住编译器参与了程序变换。可移植并发的基础是语言模型，而不是某台机器的偶然表现。
+
+\section{ThreadSanitizer 能做什么}
+
+ThreadSanitizer 擅长发现数据竞争：一个变量被多个线程访问，至少一个写，并且没有 happens-before 关系。它能帮助发现忘记加锁、普通变量错误共享、发布协议缺失等问题。但它不能证明算法线性化正确，不能证明内存序最弱但足够，也不能发现所有 ABA 或生命周期协议错误。没有数据竞争的程序仍然可能逻辑错误。
+
+因此测试组合应分层。TSan 用于发现明显数据竞争；压力测试用于增加时序覆盖；模型化小测试用于验证状态机；代码审查用于检查 happens-before 和生命周期；性能测试用于判断同步结构是否扩展。并发程序不能只靠一种测试工具。
+
+\section{把内存序写进注释}
+
+热点原子代码应该把内存序理由写在附近。注释不应重复“使用 release store”，而应说明“发布 buffer 槽位内容给 consumer”或“relaxed 因为该计数器不发布其他数据”。这样的注释能让后续维护者知道哪些语义不能随便改。
+
+如果你无法写出一句清楚的理由，说明当前内存序选择还没有被理解。此时宁愿使用更保守的锁或 seq-cst，也不要写一个看似高性能但没人能证明的 acquire/release 组合。高性能并发代码的质量标准是可证明，不是看起来很底层。
+
+\section{发布订阅的完整示例}
+
+配置发布是 release/acquire 的经典案例。生产者构造新配置，填好普通字段，然后用 release store 发布指针。消费者用 acquire load 读到指针后，可以读取字段。这个例子看似简单，但完整实现还要处理空指针、版本、旧配置回收和多次更新。
+
+\begin{lstlisting}[language=C++,caption={配置发布的最小形态}]
+struct RuntimeConfig {
+    std::int32_t worker_count = 0;
+    std::int32_t queue_capacity = 0;
+};
+
+class ConfigPublisher {
+public:
+    void publish(RuntimeConfig* config) {
+        this->current_.store(config, std::memory_order_release);
+    }
+
+    RuntimeConfig* current() const {
+        return this->current_.load(std::memory_order_acquire);
+    }
+
+private:
+    std::atomic<RuntimeConfig*> current_{nullptr};
+};
+\end{lstlisting}
+
+这个类只负责可见性，不负责所有权。若发布的配置由外部保证活到程序结束，代码可以成立。若配置会替换和释放，就必须加回收协议。把所有权藏在调用者约定里可以作为教学简化，但生产代码要把它写进类型或文档。
+
+\section{版本化发布}
+
+发布配置时，指针之外常需要版本号。消费者读到配置后，可以记录 version；如果执行过程中需要确认配置没有变化，可以再次读取 version。版本号也方便日志和调试：看到某次请求使用配置 42，而不是只看到一个地址。版本号可以放在配置对象内部，也可以和指针一起发布。
+
+如果指针和版本分成两个原子，就要小心一致性。消费者可能读到新指针旧版本或旧指针新版本。更稳的设计是把 version 放在不可变配置对象中，发布指针即发布完整对象；或者使用锁保护多字段快照；或者用原子 shared pointer 等更高层机制。多个原子变量不能自动组成一致快照。
+
+\section{引用计数案例}
+
+原子引用计数常见，但容易误讲。增加引用需要确保对象还活着；减少引用发现自己是最后一个引用时，需要在析构前看到其他线程对对象的修改。一个简单 shared ownership 协议通常把 control block 和对象生命周期绑定。引用计数的 \code{fetch_add}/\code{fetch_sub} 只是协议中的一部分。
+
+若线程已经持有一个有效引用，复制引用时的计数增加可以使用较弱内存序，因为对象可见性来自已有引用的同步。释放引用时，如果不是最后一个，也只是减少计数；如果是最后一个，就要执行 acquire 语义或等价屏障，确保析构看到其他线程在释放前的写入。成熟 \code{std::shared_ptr} 实现非常细致，不建议读者随手自研。
+
+教材要强调一点：引用计数解决的是生命周期，不自动解决对象内部并发访问。多个线程通过 shared pointer 同时修改对象字段，仍然需要 mutex、原子或不可变设计。很多人以为 shared pointer 让对象“线程安全”，这是错误的。
+
+\section{状态发布和数据发布分离}
+
+有些协议同时有数据和状态。生产者写 buffer，再把 state 改成 Ready；消费者看到 Ready 后读 buffer。这里 state 的 release/acquire 同步发布 buffer 内容。若生产者先把 state 设 Ready，再写 buffer，消费者可能读到未初始化数据。顺序必须写清。
+
+\begin{lstlisting}[language=C++,caption={槽位状态发布数据}]
+enum class BufferState : std::int32_t {
+    Empty,
+    Ready,
+};
+
+struct BufferSlot {
+    std::array<std::int32_t, 16> values{};
+    std::atomic<BufferState> state{BufferState::Empty};
+};
+
+void publish_slot(BufferSlot& slot, std::span<const std::int32_t> input) {
+    for (std::size_t i = 0; i < input.size() && i < slot.values.size(); ++i) {
+        slot.values[i] = input[i];
+    }
+    slot.state.store(BufferState::Ready, std::memory_order_release);
+}
+\end{lstlisting}
+
+消费者必须 acquire 读取 state，并且只有看到 Ready 后才能读 values。若消费者 relaxed 读取 state，就没有可移植同步关系。若 values 写入可能抛异常或失败，不能提前发布 Ready。状态发布点就是线性化点。
+
+\section{Relaxed 指标的快照问题}
+
+多个 relaxed 指标组成的快照不一致是常见现象。假设一个系统有 accepted、completed、failed 三个计数器。监控线程分别读取它们时，accepted 可能来自较新时间，completed 来自较旧时间，因此 completed 加 failed 可能短暂大于 accepted 或小于 accepted。这不一定是 bug，而是近似指标语义。
+
+如果监控页面不能接受这种不一致，就需要加锁快照、sequence lock、双缓冲或周期性汇总。不要在每个指标上简单使用 seq-cst 后以为解决了跨变量一致性。seq-cst 给单个原子操作提供全局顺序，但多个变量之间的业务不变量仍需要协议。
+
+\section{Sequence lock 的思想}
+
+Seqlock 常用于读多写少、读者可重试的场景。写者先把序号变成奇数，修改数据，再把序号变成下一个偶数。读者先读序号，复制数据，再读序号；如果两次序号相同且为偶数，说明读到一致快照；否则重试。它让读者无锁，但读者可能在写频繁时反复重试，且读取的数据复制必须能安全进行。
+
+Seqlock 不适合包含指针和复杂生命周期的数据，除非另有回收保护。读者在没有锁的情况下复制数据，如果写者释放了指针指向对象，读者可能悬垂。它适合简单 POD 快照，例如时间、统计摘要、路由版本小结构。这个例子再次说明：原子协议和对象生命周期必须一起设计。
+
+\section{原子等待和通知}
+
+C++20 提供 \code{atomic::wait} 和 \code{notify_one/notify_all}，可以在原子值变化时等待，某些场景下比条件变量更直接。它适合等待单个原子状态变化，例如状态从 Pending 到 Ready。它仍然需要谓词思维：wait 返回后要重新检查值，通知不是业务状态本身。复杂不变量仍然更适合 mutex 和 condition variable。
+
+原子等待也有关闭和取消问题。若线程等待状态变成 Ready，但系统关闭时状态应变成 Closed 并 notify；若只通知 Ready，不通知 Closed，等待者可能悬挂。工具变了，状态机原则不变。
+
+\section{内存序选择流程}
+
+选择内存序可以按流程。第一，是否只是线程本地？若是，不需要原子。第二，是否保护多个字段不变量？若是，优先 mutex 或明确协议。第三，是否只是统计计数，不发布其他数据？可以考虑 relaxed。第四，是否发布普通数据给消费者？需要 release/acquire 或更高层同步。第五，是否需要所有线程看到单一全局顺序？才考虑 seq-cst。第六，是否涉及指针生命周期？必须设计回收，内存序本身不够。
+
+这个流程能减少随意性。内存序不是越弱越专业，也不是越强越正确。正确选择来自语义需求。
+
+\section{架构差异的测试策略}
+
+如果项目要跨 x86 和 ARM，不能只在 x86 上测。x86 较强内存模型可能掩盖某些缺少 acquire/release 的 bug；ARM 更弱，错误更容易暴露。若没有多架构机器，可以使用 ThreadSanitizer、模型检查工具或至少按照 C++ 内存模型审查。手机 Termux 可能正好是 ARM 环境，适合跑并发压力测试，但工具权限可能有限。
+
+报告中应写明架构。一个在 x86 上“跑了很多次没出错”的 relaxed 发布示例，不是正确证据。C++ 并发正确性以语言模型为准。
+
+\section{案例：SPSC 发布协议}
+
+SPSC ring buffer 中，生产者先写 buffer 槽位，再 release 更新 tail；消费者 acquire 读取 tail 后，才能读到槽位内容。Head 由消费者写，tail 由生产者写，单写者让协议简化。若把 tail store 改成 relaxed，消费者可能在语言模型上没有看到 buffer 写入。若先更新 tail 再写 buffer，消费者可能读到未完成数据。
+
+这个案例适合训练内存序注释。Tail release 的理由是发布槽位内容；tail acquire 的理由是获取槽位内容；head release 的理由是发布槽位可复用；head acquire 的理由是生产者看到可用空间。每个内存序都能对应到状态转换，而不是凭感觉选择。
+
+\section{案例：近似指标发布}
+
+运行时指标常使用 relaxed 分片计数。Worker 本地统计任务数、空转次数、窃取次数；监控线程周期性读取并汇总。这里不要求读者看到精确同时刻快照，只要求趋势。因此 relaxed 或无锁读取加最终汇总可以接受。但如果指标用于触发限流或关闭，就必须重新定义同步。
+
+同一个变量在不同用途下可能需要不同语义。作为监控，近似可以；作为协议，必须精确。设计时要防止“先当指标写，后来被业务拿去做决策”的语义漂移。
+
+\section{原子章验收清单}
+
+项目中每个原子变量都应写明：它表示什么状态，谁写谁读，是否发布其他数据，是否参与对象生命周期，选择的内存序理由是什么，失败路径如何处理，是否需要与其他变量组成快照。若只是统计，写明 relaxed 的理由；若是发布，写明 release/acquire 对应的数据；若涉及指针，写明回收协议。这个清单能显著降低并发维护风险。
+
+\section{原子章节总结}
+
+原子操作解决的是特定同步问题，不是并发正确性的万能答案。Relaxed 适合不发布数据的统计，release/acquire 适合发布和获取，seq-cst 适合需要简单全局顺序的场景。多个原子变量不会自动形成一致快照，原子指针不会自动管理生命周期。写原子代码时，必须能画出 happens-before、线性化点和回收边界。
+
+\section{内存序决策表}
+
+内存序选择可以压缩成一句话：先证明语义，再选择最弱足够顺序。只是计数，不发布数据，用 relaxed；发布对象字段，用 release/acquire；读改写既读又写，分别考虑成功和失败内存序；需要简单推理或教学，先用 seq-cst；涉及多个字段不变量，用锁；涉及指针生命周期，加回收协议。任何不能解释的内存序，都应该回到更简单同步。
+
+\section{案例：发布错误原因}
+
+如果一个任务失败，worker 写入错误对象，然后把状态设为 Failed。等待者看到 Failed 后要读取错误对象。这和发布配置完全一样：错误对象字段必须在 release store 状态之前写好，等待者必须 acquire load 状态后读错误。若错误对象是动态分配的，还要保证生命周期覆盖等待者读取。错误传播也是发布协议，不是简单设置一个布尔值。
+
+这类案例在任务图和分布式 driver 中很常见。状态枚举和结果对象应绑定设计，避免状态已完成但结果不可见或已释放。
+
 \section{本章落到贯穿项目}
 
 Compute Systems Engine 在本章应增加三类原子实验。第一，统计计数器：mutex counter、atomic relaxed counter、sharded counter，用来区分原子性和扩展性。第二，发布实验：一个 producer 初始化配置后 release 发布，consumer acquire 获取，用来说明对象可见性。第三，CAS 实验：实现 \code{try_set_max} 或无锁最大值更新，记录 CAS 失败次数，说明竞争下重试成本。
 
 这些实验都要写清语义。计数器 relaxed 的理由是“不发布其他数据”；配置发布 acquire/release 的理由是“读取者需要看到普通字段初始化”；CAS 的理由是“成功那一刻是线性化点”。如果写不出理由，就不应该选择内存序。
+
+\section{从锁版本迁移到原子版本}
+
+把锁版本改成原子版本，不能只把字段类型换成 \code{std::atomic}。锁版本通常保护一组不变量，原子版本必须重新定义线性化点和状态转移。一个 mutex 队列的 \code{head}、\code{tail}、\code{size} 和 \code{closed} 在同一把锁下更新；如果只把 \code{size} 改成原子，其他字段仍会被并发破坏。迁移第一步不是写 CAS，而是写出哪些状态可以独立，哪些状态必须一起变化。
+
+较稳妥的迁移路线是分层。先保留锁版本作为 reference，写足正确性测试。然后引入只用于指标的 relaxed 原子，例如任务完成数和 CAS 失败数，这一步不改变协议。再实现一个边界明确的 SPSC ring，因为单生产者单消费者让 head 和 tail 各自只有一个写者，协议简单。最后才考虑 MPSC、MPMC 或无锁内存回收。这个路线看起来慢，但它让每一步都有可证明的语义和对照测试。
+
+迁移还要考虑性能目标。低竞争 mutex 可能已经很快，原子版本反而因为 cache line 争夺、CAS 重试和复杂回收变慢。原子优化最适合共享状态小、线性化点清楚、生命周期可控、竞争形状明确的场景。若状态复杂、关闭语义复杂、需要等待和取消，mutex 加条件变量往往更清楚。高水平工程判断不是“无锁更高级”，而是知道什么时候不该无锁。
+
+\section{内存序代码审查}
+
+审查原子代码时，应逐个原子变量建立表格。第一列写变量含义，例如计数、状态、指针、索引、版本。第二列写写者和读者。第三列写它是否发布其他普通数据。第四列写内存序。第五列写失败路径和生命周期。若某个原子变量没有清晰含义，只是为了避免数据竞争而存在，通常说明设计还没完成。
+
+看到 relaxed，要问它是否只关心自身数值。若 relaxed 之后读取普通对象字段，就要怀疑发布关系缺失。看到 release，要问哪个普通数据在它之前被发布。看到 acquire，要问它是否确实读到了对应 release 写入的值。看到 CAS，要问成功和失败内存序是否不同，失败后 expected 如何更新，循环体是否有不可回滚副作用。看到原子指针，要问对象何时释放，读者如何保证使用期间对象活着。
+
+审查还要防止“强内存序掩盖设计问题”。把所有操作都写成 seq-cst，可能让小例子更容易运行，但它不会自动解决多变量不变量、丢失唤醒、对象回收和关闭协议。强顺序只能约束操作可见顺序，不能替你定义状态机。若设计不清楚，应该回到 mutex 或更高层同步，而不是用更强内存序硬撑。
+
+\section{线性化点和用户可见语义}
+
+并发对象对外应该像每个操作在某个瞬间生效，这个瞬间就是线性化点。mutex 版本通常把线性化点藏在临界区内部，因为临界区串行执行；原子版本必须显式找出来。无锁栈的 push 线性化点可能是 CAS 成功把新节点挂到 head；pop 的线性化点可能是 CAS 成功把 head 移到 next；SPSC ring 的 push 线性化点可能是 release 更新 tail。
+
+线性化点不只是理论概念，它决定用户看到的行为。若 \code{try_pop} 返回空，表示在它的线性化点上队列为空，而不是整个调用期间都为空；若 \code{close} 成功，后续 \code{push} 应失败，但和 close 并发的 push 是否成功，要看线性化先后。文档写清这点，调用者才能理解边界。很多并发争议来自用户以为“调用先开始就先发生”，而实现按线性化点定义先后。
+
+线性化点还影响测试。并发队列的输出顺序可能不唯一，不能用单一串行顺序硬比。测试应验证存在某个合法线性化顺序，或者验证更具体的不变量：元素不丢不重，关闭后没有新元素，容量不越界，已成功返回的操作符合文档。对于复杂对象，可以使用模型检查或小状态穷举，把线程交错压到可分析范围内。
+
+\section{等待和原子的边界}
+
+原子操作适合表达状态变化，但等待是另一个问题。忙等会消耗 CPU；条件变量可以睡眠但需要 mutex；\code{atomic::wait} 可以围绕单个原子值睡眠；futex 是更底层的机制。选择等待方式时，要看等待时间、唤醒频率、状态复杂度和关闭语义。短等待可以自旋，长等待应睡眠，复杂谓词通常用条件变量更清楚。
+
+自旋等待必须有退出策略。若等待对象的生产者可能被抢占，消费者一直自旋会浪费 CPU，甚至阻碍生产者被调度。常见策略是先短暂自旋，再 yield，再睡眠；或者让运行时知道这是阻塞等待，把 worker 释放给其他任务。等待策略和调度章节直接相连。原子状态本身很快，不代表围绕它等待的系统就快。
+
+原子等待也要处理通知丢失的误解。和条件变量一样，通知不是业务状态。等待者应先读取状态，如果不满足再 wait；被唤醒后重新读取。关闭、取消、失败都应是状态枚举的一部分，并且对应通知。只通知成功状态，不通知关闭状态，会让等待者永久睡眠。工具从 condition variable 换成 atomic wait，谓词思维没有改变。
 
 \section{本章习题}
 

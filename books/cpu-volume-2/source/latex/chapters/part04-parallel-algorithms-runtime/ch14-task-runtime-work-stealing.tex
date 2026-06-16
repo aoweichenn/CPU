@@ -134,6 +134,266 @@ Compute Systems Engine 的运行时路线应分四步。第一步，全局队列
 习题四：设计一个工作窃取实验。先用 mutex deque 实现策略，不使用无锁 deque。比较全局队列和本地队列在任务粒度不同、负载不均不同情况下的 worker 空闲时间和窃取次数。
 \end{exercisebox}
 
+\section{线程池接口的最小完整性}
+
+一个线程池要进入项目，至少要有四类接口：提交任务、等待完成、关闭运行时、查询指标。只有 \code{submit} 而没有 \code{wait}，调用者不知道任务何时全部结束；只有 \code{shutdown} 而没有明确拒绝新任务语义，析构时可能丢任务；没有指标，性能问题无法定位。接口越小越好，但不能缺少生命周期。
+
+\begin{lstlisting}[language=C++,caption={线程池接口的教学形态}]
+class ThreadPool {
+public:
+    explicit ThreadPool(std::int32_t worker_count);
+    ~ThreadPool();
+
+    bool submit(std::function<void()> task);
+    void wait_idle();
+    void shutdown();
+    [[nodiscard]] RuntimeCounters counters() const;
+
+private:
+    void worker_loop(std::int32_t worker_id);
+};
+\end{lstlisting}
+
+这只是接口草图，不是最终性能实现。它暴露了几个必须讨论的问题：\code{submit} 返回 false 表示线程池关闭；\code{wait_idle} 等待已提交任务完成但不关闭线程池；\code{shutdown} 拒绝新任务并让 worker 退出；析构必须安全调用 shutdown。若 task 抛异常，worker 不能直接终止而让未完成计数泄漏，至少要捕获并记录 failed。
+
+\section{未完成计数和条件变量}
+
+线程池 \code{wait_idle} 常用未完成任务计数。提交成功时计数加一，任务执行完毕后计数减一，计数为零时通知等待者。这个计数必须和任务队列状态一起受锁保护，或者用原子和条件变量 carefully 组合。若任务抛异常、被取消或线程池关闭时漏减，等待者会永远阻塞。
+
+等待谓词可以写成“未完成任务数为零”。这里要注意：队列为空不等于任务完成，因为 worker 可能已经取出任务正在执行；worker 空闲也不等于没有任务，因为提交者可能正在入队。未完成计数把 queued 和 running 任务都算进去，才适合 wait。
+
+\section{异常传播策略}
+
+线程池任务的异常不能悄悄消失。教学版可以记录失败次数，并把异常转成日志；future 版应把异常保存在 future 中，让调用者 \code{get} 时重新抛出；任务图版要决定一个节点失败后后继节点是取消、跳过还是继续。异常策略是运行时语义的一部分。
+
+如果项目暂时不实现 future，可以要求提交的任务内部处理异常，线程池只捕获所有逃逸异常并记录 failed。这个策略简单，但调用者无法知道哪个任务失败。后续如果要支持可靠计算，必须引入 task id、结果对象或错误回调。
+
+\section{任务图 ready count 实现}
+
+任务图的核心是 ready count。每个节点记录还未完成的前驱数量。初始为零的节点进入 ready 队列；一个节点完成后，遍历后继，把它们的 ready count 减一；某个后继减到零时，进入 ready 队列。这个模型把等待变成状态变化，而不是让 worker 阻塞。
+
+\begin{lstlisting}[language=C++,caption={任务图节点的核心字段}]
+struct TaskNode {
+    std::uint32_t id = 0;
+    std::atomic<std::int32_t> remaining_dependencies{0};
+    std::vector<std::uint32_t> successors;
+};
+\end{lstlisting}
+
+这里 successors 是 vector，适合教学。大型运行时会更关心内存布局，可能用连续边数组压缩图。ready count 必须能处理并发完成：多个前驱可能同时减少同一个后继计数，因此通常需要原子。减到零的那一次线程负责把任务入队。
+
+\section{任务图的生命周期}
+
+任务图不能在还有任务运行时被销毁。最简单方式是图对象由运行时持有，直到所有节点完成或取消。若任务捕获图中数据引用，生命周期更要清楚。C++ 中常见错误是提交 lambda 捕获局部引用，函数返回后 worker 才执行，导致悬垂引用。教学代码应优先捕获值或使用共享状态对象，并明确所有权。
+
+任务图还要处理失败。如果一个前驱失败，后继是否仍然执行？对于构建系统，依赖失败通常取消后继；对于日志统计，某个 map task 失败可以重试，后继 reduce 等待最终成功 attempt；对于 best-effort 指标，失败可能被忽略。运行时不应替业务猜语义，但必须提供表达方式。
+
+\section{工作窃取和 NUMA}
+
+普通工作窃取从任意 victim 偷任务，NUMA 感知工作窃取会先在本节点内偷，再跨节点偷。这样可以优先保持 cache 和内存本地性。跨节点 steal 不是禁止，而是作为负载不均时的后备。这个策略和分布式数据本地调度一致：先本地，后远程。
+
+实验可以构造两类任务。第一类任务只做 CPU 计算，数据很小，跨节点窃取影响小；第二类任务访问大数组块，数据按 NUMA 节点 first-touch 放置，跨节点窃取会访问远端内存。比较两类任务能说明“负载均衡”和“数据本地性”之间的张力。
+
+\section{任务粒度自动调节}
+
+固定 cutoff 很难适应所有机器。运行时可以记录任务平均耗时、队列长度和 worker 空闲时间，动态调整拆分粒度。若任务太短且队列争用高，就增大 chunk；若 worker 空闲多且长尾明显，就减小 chunk 或启用 work stealing。自动调节要谨慎，避免频繁震荡。
+
+教学项目可以先不做自动调节，但 benchmark 应输出足够指标，让读者手动选择 cutoff。最终目标不是让运行时神秘地“自动变快”，而是让调整有证据。
+
+\section{本章项目验收清单}
+
+线程池进入 Compute Systems Engine 前，至少要通过这些验收：提交 N 个任务全部执行一次；任务抛异常不会杀死 worker；\code{wait_idle} 在任务完成后返回；shutdown 后 submit 失败；析构不会遗留 joinable thread；多线程提交不会破坏队列；指标能统计 submitted、completed、failed。任务图进入项目前，还要测试依赖顺序、并发前驱、失败取消和空图。
+
+性能验收则包括：全局队列在小任务下的队列锁争用，任务粒度曲线，每个 worker 执行任务数分布，worker 空闲时间和关闭耗时。没有这些数字，工作窃取是否必要无从判断。
+
+\section{本章扩展习题}
+
+\begin{exercisebox}
+习题五：为线程池设计异常策略。比较“吞掉异常只计数”、“future 保存异常”、“错误回调”三种方案的语义和适用场景。
+
+习题六：设计任务图内存布局。比较每个节点一个 vector successors 和统一边数组两种方案的局部性、分配次数和修改难度。
+
+习题七：构造一个 worker 捕获局部引用导致悬垂的例子，并改成安全的所有权模型。说明为什么并发代码里 lambda 捕获尤其危险。
+
+习题八：设计 NUMA 感知 work stealing 策略。写出本地偷取、跨节点偷取、victim 选择和指标记录方案。
+\end{exercisebox}
+
+\section{Future 等待的死锁风险}
+
+线程池里最危险的接口之一是 worker 内部等待 future。假设线程池只有四个 worker，四个任务都在运行，并且每个任务都等待同一个池中尚未开始的子任务。队列里有子任务，但没有空闲 worker 执行它们，系统就死锁。这个问题不是 future 本身的错，而是阻塞等待和固定 worker 数组合后的结果。
+
+解决思路有几种。第一，禁止 worker 内部阻塞等待同池任务，改用 continuation。第二，允许 worker 等待时帮助执行队列里的其他任务，类似 work-first 或 help-first 调度。第三，把可能阻塞的任务放到独立线程池，避免占满计算 worker。第四，使用结构化并发，让父任务的等待由运行时管理，而不是任意阻塞线程。哪种策略合适，取决于运行时复杂度和业务语义。
+
+\begin{lstlisting}[numbers=none]
+pool deadlock shape:
+  worker 0 runs parent A and waits for child A1
+  worker 1 runs parent B and waits for child B1
+  worker 2 runs parent C and waits for child C1
+  worker 3 runs parent D and waits for child D1
+  child tasks are queued but no worker is free
+\end{lstlisting}
+
+教材要让读者形成一个原则：线程是执行资源，不要轻易拿执行资源去等待同一资源池里的未来工作。等待可以发生，但必须被运行时理解，或者发生在不会饿死被等待任务的地方。
+
+\section{Work-first 和 help-first}
+
+工作窃取运行时常讨论两种调度风格。Work-first 倾向于让当前 worker 继续执行新生成的子任务，把 continuation 留给别人偷；help-first 倾向于把子任务放入队列，当前 worker 继续执行 continuation。二者会影响 cache 局部性、栈深度、窃取频率和关键路径执行。经典 Cilk 风格偏 work-first，因为它让本地深度优先执行，减少调度开销，窃取者拿到较大的 continuation。
+
+教学项目不必完整实现这些理论，但要理解任务提交顺序不是无关紧要。若每个任务递归拆分两个子任务，然后当前线程等待两个子任务，容易制造过多任务和等待。更好的方式是当前线程直接处理其中一部分，把另一部分提交给运行时，最后合并结果。这样能减少任务数，并保持本地性。
+
+\begin{lstlisting}[language=C++,caption={分治任务中保留一半本地执行}]
+std::int64_t reduce_range(std::span<const std::int32_t> values,
+                          ThreadPool& pool,
+                          std::size_t cutoff) {
+    if (values.size() <= cutoff) {
+        return sequential_sum(values);
+    }
+
+    const std::size_t mid = values.size() / 2;
+    std::future<std::int64_t> right =
+        pool.submit_value([right_values = values.subspan(mid)]() {
+            return sequential_sum(right_values);
+        });
+    const std::int64_t left = reduce_range(values.first(mid), pool, cutoff);
+    return left + right.get();
+}
+\end{lstlisting}
+
+这段代码展示思想，但也暴露等待风险：如果 \code{submit_value} 把任务放进同一个固定池，\code{get} 可能阻塞 worker。生产实现应让等待者帮助执行，或者使用任务图 continuation。教材写代码时要明确这是讨论调度形态，不是最终线程池 API。
+
+\section{任务优先级和饥饿}
+
+运行时常需要优先级：用户请求比后台压缩重要，控制面任务比数据面批处理重要，提交协议比指标刷新重要。优先级队列能让高优先级任务先执行，但也可能让低优先级任务长期饥饿。若低优先级任务负责释放资源或推进 checkpoint，饥饿会反过来影响高优先级任务。
+
+一种常见策略是多队列加配额。高优先级队列可以获得更多调度机会，但运行时周期性执行低优先级任务。另一种策略是 aging：任务等待越久，优先级逐渐提高。还有一种策略是资源隔离：不同优先级使用不同线程池或不同队列容量，避免后台任务占满前台资源。优先级不是简单排序，而是调度公平性和业务目标的表达。
+
+\section{阻塞任务和计算任务分池}
+
+计算线程池适合 CPU-bound 任务，阻塞 I/O 任务适合异步 I/O 或独立阻塞池。把大量阻塞任务提交到计算池，会让 worker 被占住，CPU 计算任务无处执行。反过来，把 CPU 密集任务提交到 I/O completion 线程，也会延迟完成回调，破坏异步系统。运行时设计应区分任务类型。
+
+Compute Systems Engine 可以定义两个执行域。Compute domain 运行归约、scan、partition、hash 聚合等 CPU 任务；I/O domain 负责文件读取、网络模拟和完成回调。两者通过有界队列连接，I/O 太快时对 compute 背压，compute 太慢时 I/O 暂停读取。第 15 章会继续展开这个管线。
+
+\section{本地队列的缓存行为}
+
+本地队列不仅减少锁竞争，也改善缓存行为。worker 刚生成的子任务通常访问相邻数据或共享上下文，放入本地队列后由同一 worker 继续执行，cache 命中更高。窃取者从另一端偷较老任务，通常粒度更大，减少窃取频率。这个设计把“常见路径本地执行，少见路径跨 worker 平衡”写进数据结构。
+
+但本地队列也会让负载短时间不均。某个 worker 本地队列很长，其他 worker 空闲，需要窃取策略及时发现。victim 选择可以随机，可以轮询，也可以优先同 NUMA 节点。随机选择实现简单，避免所有窃取者同时冲向同一 victim；拓扑感知选择更复杂，但对大机器更好。实验要记录 steal attempts、successful steals 和 empty steals。
+
+\section{任务对象池和运行时局部性}
+
+任务对象频繁分配会成为隐藏成本。每次提交 \code{std::function} 可能分配闭包对象，任务图节点可能分散在堆上，worker 访问队列时不断追指针。运行时可以使用任务对象池或 arena，把同一批任务连续存放。这样既减少分配器开销，也改善遍历和调试。
+
+对象池必须和任务生命周期一致。任务完成后，结果是否还被 future 持有？异常对象是否还要读取？指标是否还要汇总？如果任务对象一完成就回收到池里，而 future 还保存指向任务的指针，就会悬垂。高性能运行时常把任务执行状态和用户可见结果分离：任务对象可以复用，结果对象由 future 或 promise 管理。
+
+\section{运行时的内存屏障位置}
+
+线程池初版用 mutex 和 condition variable，内存可见性由锁提供。工作窃取和无锁 ready 队列会暴露内存序问题。任务生产者必须先写完任务对象，再把它发布到队列；worker 从队列取到任务后，必须看到任务字段。这个发布关系通常由锁、release/acquire 或队列内部协议提供。不要在队列外再用一个普通布尔标志表示任务 ready。
+
+任务完成也需要发布。若 worker 写结果后把状态设为 completed，等待者读取 completed 后要看到结果字段。future/promise 已经封装这些同步；自研结果对象就必须自己建立 happens-before。运行时不是只调度函数，它还负责结果可见性。
+
+\section{取消传播}
+
+取消不是强杀线程。安全取消通常是协作式：运行时设置取消标志，任务在边界检查并尽快退出。边界可以是处理完一个块、完成一次 I/O、写完一个输出批次。取消标志可以是原子布尔，但如果它还发布错误对象或原因，就需要更强同步或锁。
+
+任务图取消要传播给后继节点。若某个节点失败，依赖它的节点可能永远不 ready，因此运行时要把它们标记为 canceled，并减少全图未完成计数。取消还要处理已经在队列中但未执行的任务。最简单策略是 worker 取出任务后检查状态，若 canceled 就跳过并完成计数。更复杂策略是从队列中删除任务，但删除本身可能昂贵。
+
+\section{运行时和调试可视化}
+
+任务运行时适合可视化。一个时间线图可以显示每个 worker 何时执行任务、何时空闲、何时窃取、何时等待 I/O。一个任务图可以显示关键路径和长尾任务。一个队列图可以显示队列长度随时间变化。没有图，运行时问题很难凭日志理解。
+
+即使不做完整 GUI，也可以输出 CSV 或 JSON trace。字段包括 timestamp、worker id、task id、event type、queue size、steal victim、duration。后续可以用脚本画图。教学项目中的 trace 不需要高性能到生产级，但要让读者学会从执行历史看调度问题。
+
+\section{运行时源码阅读入口}
+
+源码阅读可以从三个成熟系统切入。第一，Cilk 或 oneTBB 的任务调度，关注工作窃取和任务粒度。第二，LLVM/MLIR 或编译器构建系统里的任务图，关注依赖和 worklist。第三，Linux scheduler 的 CFS 和 NUMA balancing，关注线程不是由用户态运行时独占控制，操作系统调度会影响 worker。阅读时不要试图一次读完全部源码，而是围绕一个问题：为什么 worker 空闲，为什么任务迁移，为什么等待时间高。
+
+把用户态运行时和内核调度联系起来很重要。用户态线程池以为自己有 N 个 worker，但操作系统可能把它们迁移到不同 CPU，可能和其他进程共享核心，可能因为 I/O 睡眠唤醒改变亲和性。性能报告应记录线程绑定、CPU 利用和上下文切换，否则运行时结论可能不稳定。
+
+\section{结构化并发}
+
+结构化并发的核心是让任务生命周期有作用域。父作用域启动子任务，离开作用域前必须等待子任务完成或取消。这样资源不会在调用栈之外漂浮，取消和错误能沿任务树传播。相比随意提交 detached task，结构化并发更容易保证关闭和异常安全。
+
+在线程池里，可以用 task group 表达这个思想。Task group 记录未完成子任务数、取消标志和错误状态。提交到 group 的任务完成后减少计数；某个任务失败后设置错误并请求取消；调用者等待 group 结束。这样 wait 的对象不再是整个线程池，而是一个有边界的任务集合。
+
+结构化并发也有成本。任务必须属于某个作用域，不能随意长期存在；后台服务型任务需要单独生命周期管理；跨作用域依赖要谨慎。它不是所有场景的万能答案，但对批处理计算、并行算法和测试非常有帮助。
+
+\section{Work helping}
+
+Work helping 用于避免 worker 阻塞等待时浪费执行资源。若 worker 等待某个 task group 完成，它可以继续从队列取任务执行，帮助推进系统，而不是睡眠。这样能缓解父任务等待子任务导致的线程池耗尽。Work helping 要小心重入和栈增长：等待路径执行了其他任务，其他任务可能又等待更多任务。
+
+一种简单策略是只允许在等待同一 task group 时帮助执行该 group 的 ready 任务，避免任意重入。另一种策略是全局帮助，吞吐更好但控制流更复杂。教学项目可以先禁止 worker 内等待，再在运行时章节作为扩展设计 work helping。关键是接口必须写清：\code{wait} 在 worker 内调用时会做什么。
+
+\section{任务图内存布局}
+
+任务图节点如果每个都单独分配，执行时会产生大量指针追踪和分配器开销。更高效的布局是把节点数组和边数组连续存放。每个节点记录 successor 起始偏移和数量，successors 全部放在一个 \code{std::vector<std::uint32_t>} 中。这类似 CSR 图结构。任务图本身就是有向图，完全可以借鉴图布局。
+
+\begin{lstlisting}[language=C++,caption={任务图的 CSR 式布局}]
+struct TaskGraphNode {
+    std::uint32_t first_successor = 0;
+    std::uint32_t successor_count = 0;
+    std::atomic<std::int32_t> remaining_dependencies{0};
+};
+
+struct TaskGraphStorage {
+    std::vector<TaskGraphNode> nodes;
+    std::vector<std::uint32_t> successors;
+};
+\end{lstlisting}
+
+这个布局适合构图后执行多次或执行一次但节点很多的场景。若任务图动态变化频繁，连续边数组修改成本高，可能需要增量结构。再次说明：数据布局选择要看生命周期和修改模式。
+
+\section{任务窃取的粒度}
+
+窃取太频繁会增加跨 worker 同步和 cache 迁移；窃取太少会负载不均。一个常见策略是偷较大的任务或半个队列，而不是每次偷一个极小任务。分治算法中，窃取较老的 continuation 往往能拿到更大工作块；本地 worker 继续处理新生成的小任务，保持 cache 局部性。
+
+实验要记录 empty steals。空窃取多，说明 victim 选择或粒度不合适；成功窃取少但 worker 空闲多，说明任务不足或本地队列不暴露；成功窃取多但性能差，可能窃取成本太高或破坏局部性。Work stealing 的好坏不能只看总时间。
+
+\section{任务取消的检查点}
+
+协作式取消需要任务在安全点检查取消标志。安全点通常是块边界、循环批次边界、I/O 完成边界或输出提交前。不能在任意指令强行取消 C++ 任务，否则可能破坏对象不变量、锁状态和资源释放。取消检查太频繁会增加开销，太少会延迟响应。
+
+长任务应拆成可取消块。例如解析大文件时，每处理一批记录检查一次取消；归约大数组时，每处理一个 chunk 检查；shuffle 发送时，每个 block 边界检查。取消后要定义已经产生的 partial 是否丢弃、是否提交、是否需要清理。取消不是简单设置 bool。
+
+\section{运行时错误分类}
+
+任务运行时的错误至少分为用户任务异常、运行时内部错误、取消、资源不足和关闭拒绝。用户任务异常应归还给提交者或 task group；内部错误可能需要停止运行时；取消是预期控制流；资源不足可能触发背压；关闭拒绝说明提交太晚。把所有错误都记成 failed，会让上层无法做正确处理。
+
+错误分类也影响指标。failed tasks、canceled tasks、rejected submissions、dropped low-priority tasks 应分开计数。否则看见失败数上升，不知道是业务 bug、取消策略还是过载保护。
+
+\section{运行时 trace 格式}
+
+Trace 事件应简单稳定。可以包含 event type、timestamp、worker id、task id、queue id、duration、extra value。事件类型包括 \code{submit}、\code{start}、\code{finish}、\code{fail}、\code{cancel}、\code{steal_attempt}、\code{steal_success}、\code{wait_begin}、\code{wait_end}、\code{queue_full}。输出 CSV 足够教学使用，后续可转 JSON。
+
+Trace 采样也要考虑成本。每个任务都记录详细事件适合调试小规模；大规模时可以采样或只记录慢任务。运行时应允许关闭 trace，只保留轻量 counters。观测性的开销要被测量，不能默认忽略。
+
+\section{运行时和分布式 driver 的对应}
+
+线程池运行时和分布式 driver 结构相似。线程池调度本地任务，driver 调度远端 task attempt；线程池 ready queue 对应分布式 pending task 队列；worker stats 对应节点指标；task group wait 对应 stage completion；异常传播对应 task failure；work stealing 对应任务重新分配。理解本地运行时后，分布式调度不再是全新概念，而是把执行实体从线程换成节点，把队列从内存结构换成 RPC 和持久化元数据。
+
+这种对应关系能帮助项目设计。Compute Systems Engine 可以先在本机线程池里实现 task id、attempt、状态和指标，再把同样字段用于分布式模拟。字段稳定，尺度变化，系统更容易演进。
+
+\section{运行时章节总结}
+
+运行时把算法的并行性变成实际执行。它需要队列、worker、任务状态、依赖、等待、取消、异常、指标和关闭协议。工作窃取解决负载不均，但也带来本地性和同步问题；任务图解决依赖等待，但也带来生命周期和错误传播问题。一个好的运行时不是只会跑函数，而是能解释任务从提交到完成的每个状态。
+
+\section{运行时决策表}
+
+选择运行时结构时，可以先判断任务关系。任务独立且均匀，固定线程池加静态切分足够；任务独立但不均匀，需要动态队列或 work stealing；任务有依赖，需要任务图；任务会阻塞 I/O，需要分离 I/O 池或异步；任务需要优先级，需要多队列或调度策略；任务需要取消，需要 task group 和取消检查点。不要一开始就上最复杂运行时。
+
+运行时还要和算法协同。算法切分太细，运行时开销大；算法切分太粗，work stealing 也救不了长尾；算法隐藏依赖，任务图无法调度；算法把大对象复制进 task，队列会变慢。运行时不是算法外部的黑盒，而是算法实现的一部分。
+
+\section{案例：慢任务隔离}
+
+如果某些任务可能非常慢，例如解析超长行、处理热点 key 或写慢磁盘，把它们和普通短任务放同一个 FIFO 队列，可能拖慢整体。运行时可以检测任务耗时，把慢任务标记出来，后续单独调度或拆分。也可以为不同任务类型设置队列，避免慢任务占满所有 worker。
+
+慢任务隔离需要指标支持。没有 task duration 和类型标签，运行时无法知道谁慢。这个案例再次说明观测性是调度策略的前提。
+
+\section{案例：Speculation 的本地版本}
+
+分布式系统有 speculative execution，本地运行时也可以有类似思想。若某个任务长时间未完成，运行时可以把剩余可拆分范围重新切成更小任务，让其他 worker 帮忙。但这只适用于可拆分、幂等、输出可去重的任务。普通函数任务不能随便复制执行，否则副作用会重复。
+
+这个案例连接运行时和分布式 attempt。Speculation 的前提永远是：重复执行不会产生重复外部效果，或者提交协议能去重。没有这个前提，speculation 是错误放大器。
+
 \begin{labbox}
 实验：设计一个线程池接口，列出 submit、shutdown、wait 的语义。不要急着实现完整工作窃取，先实现固定线程数和全局队列，并写出关闭时不丢任务的测试。
 \end{labbox}

@@ -182,11 +182,336 @@ std::vector<WorkerStats> stats(static_cast<std::size_t>(worker_count));
 
 迁移时要防止“双写不一致”。如果旧结构和新结构同时存在，更新必须保证二者一致，或者明确一个是权威数据，另一个是缓存。缓存需要失效策略；双写需要事务边界；延迟同步需要版本号。布局重构不是单纯换容器，而是数据所有权迁移。
 
+\section{标准容器的内存形状}
+
+数据布局不只发生在自己定义的结构体里，也发生在每一次选择标准容器时。\code{std::vector} 的元素连续存放，适合顺序扫描、批量复制、SIMD 读取和按索引访问。它的扩容会搬迁元素，因此外部保存元素指针或引用时必须小心。\code{std::deque} 不是一个大连续数组，而是由多个固定大小块组成，头尾插入更稳定，但长距离顺序扫描的局部性通常不如 \code{std::vector}。\code{std::list} 每个节点独立分配，插入删除不移动其他节点，但遍历时会产生指针追踪、cache miss、TLB miss 和分配器开销。很多初学者只记住复杂度表，却没有把复杂度和硬件成本合起来看。
+
+例如一个任务运行时维护 ready task。如果任务总数在构图后基本稳定，\code{std::vector} 加索引队列或环形缓冲通常更适合。如果任务需要频繁从中间删除，但遍历又很热，链表也未必正确，因为删除的理论优势可能被遍历成本吞掉。若真的需要稳定句柄，可以用索引加 generation，而不是直接把每个任务做成堆上节点。容器选择不是 API 风格问题，而是访问模式、生命周期和硬件局部性的共同结果。
+
+\begin{lstlisting}[language=C++,caption={索引队列比链表更容易保持局部性}]
+struct ReadyTask {
+    std::uint32_t task_id = 0;
+    std::uint32_t generation = 0;
+};
+
+class ReadyRing {
+public:
+    explicit ReadyRing(std::uint32_t capacity)
+        : buffer_(capacity), head_(0), tail_(0), size_(0) {}
+
+    bool push(ReadyTask task) {
+        if (this->size_ == this->buffer_.size()) {
+            return false;
+        }
+        this->buffer_[this->tail_] = task;
+        this->tail_ = (this->tail_ + 1) % this->buffer_.size();
+        ++this->size_;
+        return true;
+    }
+
+    std::optional<ReadyTask> pop() {
+        if (this->size_ == 0) {
+            return std::nullopt;
+        }
+        const ReadyTask task = this->buffer_[this->head_];
+        this->head_ = (this->head_ + 1) % this->buffer_.size();
+        --this->size_;
+        return task;
+    }
+
+private:
+    std::vector<ReadyTask> buffer_;
+    std::size_t head_;
+    std::size_t tail_;
+    std::size_t size_;
+};
+\end{lstlisting}
+
+这个例子还不是并发队列，因为它没有锁和内存序。它要说明的是另一个层次：在考虑同步之前，先让数据本身连续、容量有界、访问路径可预测。后续给它加互斥或 SPSC 语义时，至少不会再被链式节点和频繁分配拖住。很多高性能结构的第一步不是“无锁”，而是“固定容量、连续存储、清楚所有权”。
+
+\section{分配器不是只影响分配速度}
+
+分配器常被理解成“申请内存快不快”，但它对布局的影响更深。通用分配器需要支持不同大小、不同生命周期、不同线程的分配和释放，因此会维护元数据、空闲链表、线程本地缓存和大块映射。小对象如果被零散分配，遍历时访问的是分配器历史留下的空间分布，而不是业务逻辑希望的顺序。一个图算法使用链式邻接节点，即使每个节点只有十几个字节，也可能因为节点分散而消耗大量 cache 和 TLB 资源。
+
+Arena 的优势来自生命周期整齐。解析一个输入文件时产生的临时节点，可以在解析结束后一次性释放；构建一轮任务图时产生的任务对象，可以在图执行结束后批量销毁。这样做减少了单个对象释放的成本，也让相近生命周期的数据更容易靠近。缺点是对象不能随意提前释放，析构顺序要清楚，长期存活对象不能混进短生命周期 arena。否则 arena 会保留大量已经无用但不能回收的空间。
+
+对象池则适合固定大小、频繁复用的对象，例如网络请求上下文、日志批次缓冲、任务描述符。对象池可以把对象初始化和内存申请分开，减少热路径分配；也可以按线程或 NUMA 节点分池，减少跨线程竞争。对象池的风险是复用对象时忘记清理旧状态，或者跨线程归还导致远端 cache line 流量。高质量实现要把 reset、owner thread、debug generation 和峰值容量都写进设计。
+
+\begin{lstlisting}[language=C++,caption={固定大小对象池的基本接口形状}]
+struct RequestContext {
+    std::uint64_t request_id = 0;
+    std::uint32_t attempt = 0;
+    std::uint32_t worker_id = 0;
+};
+
+class RequestPool {
+public:
+    explicit RequestPool(std::size_t capacity) : storage_(capacity) {
+        for (std::uint32_t index = 0;
+             index < static_cast<std::uint32_t>(storage_.size());
+             ++index) {
+            this->free_.push_back(index);
+        }
+    }
+
+    std::optional<std::uint32_t> acquire() {
+        if (this->free_.empty()) {
+            return std::nullopt;
+        }
+        const std::uint32_t index = this->free_.back();
+        this->free_.pop_back();
+        this->storage_[index] = RequestContext{};
+        return index;
+    }
+
+    void release(std::uint32_t index) {
+        this->storage_[index] = RequestContext{};
+        this->free_.push_back(index);
+    }
+
+private:
+    std::vector<RequestContext> storage_;
+    std::vector<std::uint32_t> free_;
+};
+\end{lstlisting}
+
+这个池子仍然只是单线程教学版本。并发版本必须决定 free list 由谁保护，是否每个 worker 一个本地池，跨线程释放是否进入 remote free 队列，是否要用 generation 防止旧句柄复用。不要因为代码短就忽略这些语义。内存池的工程难点不在“写一个 vector”，而在生命周期、并发所有权和调试可见性。
+
+\section{面向数据的接口设计}
+
+布局优化失败的常见原因，是内部换了 SoA，外部接口仍然要求每次返回一个完整对象。这样热路径又不得不临时拼对象，或者频繁跨数组取字段，收益被接口吃掉。面向数据的接口应该让调用者表达批量意图。例如不是提供 \code{get_particle(i)} 返回完整粒子，而是提供 \code{x_span()}、\code{velocity_span()} 或批处理函数，让热路径直接操作连续字段。
+
+接口也要避免泄漏实现细节。完全暴露 \code{std::vector<float>&} 会让外部随意 resize，破坏布局不变量；完全隐藏成单元素 getter 又丢掉批量优化机会。折中做法是暴露只读或可写 \code{std::span}，并用类型说明生命周期和访问权限。只读输入、可写输出、临时 scratch、线程本地 partial 应该在函数签名中区分开。
+
+\begin{lstlisting}[language=C++,caption={批量接口比单元素接口更能表达热路径}]
+struct PositionView {
+    std::span<float> x;
+    std::span<float> y;
+    std::span<float> z;
+};
+
+void integrate(PositionView position,
+               PositionView velocity,
+               float delta_time) {
+    const std::size_t count = position.x.size();
+    for (std::size_t i = 0; i < count; ++i) {
+        position.x[i] += velocity.x[i] * delta_time;
+        position.y[i] += velocity.y[i] * delta_time;
+        position.z[i] += velocity.z[i] * delta_time;
+    }
+}
+\end{lstlisting}
+
+这个函数把布局意图表达给编译器和读者：三个坐标数组连续，循环边界统一，写入位置清楚。实际生产代码还要检查 span 长度一致、别名关系和对齐条件。接口设计的目标不是把所有优化都写进函数，而是不要一开始就把优化可能性封死。
+
+\section{ECS 和列式布局}
+
+Entity Component System 常见于游戏引擎，但它背后的思想适用于任何大量对象、少数字段热访问的系统。实体只是 ID，组件按类型连续存放，系统按组件批量处理。渲染系统关心位置和网格，物理系统关心位置和速度，AI 系统关心状态和目标。每个系统只扫描自己需要的组件，避免把完整对象的冷字段一起带入缓存。
+
+日志分析和数据库执行器也使用类似思想。列式存储把同一列连续存放，过滤某个字段时只读取相关列；投影阶段再把需要的列组合输出。若查询只需要用户 ID 和事件类型，就不应该读取完整 JSON 文本。若后续需要原始文本，再通过行号或 offset 访问冷数据。列式布局的核心不是“数据库专属格式”，而是按访问组合移动最少字节。
+
+列式布局还有压缩优势。同一列的数据类型相同、分布相近，更容易做字典编码、差分编码、位图和运行长度编码。压缩后减少内存和 I/O 流量，但增加解码成本。若过滤条件能直接在压缩表示上执行，收益很大；若每次都要完整解码，收益可能下降。布局、编码和算法必须一起设计。
+
+\section{CSR：图结构的局部性案例}
+
+图算法最容易暴露指针结构的问题。一个朴素邻接表如果每条边都是独立节点，遍历邻居时会不断指针跳转。Compressed Sparse Row 把所有边目标压到一个连续数组里，再用 offsets 数组标出每个顶点的邻居范围。这样遍历顶点 \code{v} 的邻居时，只需要扫描 \code{edges[offsets[v]]} 到 \code{edges[offsets[v + 1]]} 之间的连续区间。
+
+\begin{lstlisting}[language=C++,caption={CSR 图的核心布局}]
+struct CsrGraph {
+    std::vector<std::uint32_t> offsets;
+    std::vector<std::uint32_t> edges;
+};
+
+std::uint64_t degree_sum(const CsrGraph& graph) {
+    std::uint64_t total = 0;
+    for (std::size_t vertex = 0; vertex + 1 < graph.offsets.size(); ++vertex) {
+        const std::uint32_t begin = graph.offsets[vertex];
+        const std::uint32_t end = graph.offsets[vertex + 1];
+        total += static_cast<std::uint64_t>(end - begin);
+    }
+    return total;
+}
+\end{lstlisting}
+
+CSR 的代价也要讲清楚。它适合静态图或批量更新后的图，不适合高频单边插入删除。插入一条边可能需要移动后续大量边，或者维护增量结构再周期性重建。它还把顶点 ID 映射和边排序变成预处理问题。很多系统会使用双层结构：主图用 CSR 保持扫描性能，增量更新放在小的补丁区，定期合并。这个设计和 LSM-tree、列式数据库的 delta store 很像：热更新和冷扫描分层处理。
+
+\section{块大小的选择方法}
+
+分块是布局优化的核心技巧，但块大小不能拍脑袋。选择块大小时至少要考虑五个因素。第一，块内工作集是否能放进目标 cache 层级。第二，块内循环是否能形成足够 SIMD 和指令级并行。第三，块大小是否造成尾部处理过多。第四，块是否方便按线程或 NUMA 节点分配。第五，块元数据是否过多。
+
+以矩阵乘法为例，一个块需要同时容纳 A 的子块、B 的子块和 C 的子块。若三者合起来超过 L1 或 L2，块内复用就会下降。以日志聚合为例，一个批次需要容纳 key、value、hash、输出缓冲和临时计数。批次太小，函数调用和调度成本高；批次太大，cache 复用差，背压粒度粗。块大小应通过候选集实验选择，例如从 1 KiB、4 KiB、16 KiB、64 KiB、256 KiB 开始，观察吞吐、cache miss、TLB miss 和尾延迟。
+
+块大小还影响错误恢复。分布式计算中，任务块越大，调度开销越低，但失败重做成本越高；块越小，负载均衡更好，但调度和元数据成本更高。单机 cache block、线程池 task grain、分布式 partition chunk 其实是同一个问题在不同尺度上的版本。
+
+\section{可测量的布局报告}
+
+布局优化的报告至少应包含四类数据。第一，结构体大小和对齐：使用 \code{sizeof}、\code{alignof}，列出字段顺序和 padding。第二，访问字节数估算：每处理一个元素理论上读取和写入多少字节，哪些字节是冷字段。第三，硬件指标：时间、带宽、cache miss、TLB miss、分支和 IPC。第四，语义影响：接口是否改变，生命周期是否改变，是否影响稳定引用和并发写入。
+
+只有耗时数字的报告不够。假设 SoA 比 AoS 快了 1.8 倍，你还要说明原因是否来自少读冷字段、SIMD 更好、预取更稳定、TLB 覆盖更高，还是因为新版本顺便少做了别的工作。若无法解释，就应该补实验。可以构造一个只访问全部字段的场景，如果 AoS 反而更快，说明 SoA 的优势确实来自字段子集访问，而不是神秘加速。
+
+下面是一份布局报告的文字模板，但写报告时要填真实数据。
+
+\begin{lstlisting}[numbers=none]
+layout report:
+  workload: aggregate event type from N records
+  baseline: vector<Record>, hot fields mixed with raw line
+  candidate: HotLogBatch plus ColdLogBatch
+  semantic change: external record id remains stable
+  bytes per hot record: baseline estimated 80, candidate 12
+  metrics: time, cache misses, dTLB misses, bandwidth
+  result: candidate improves hot aggregation, cold error path unchanged
+\end{lstlisting}
+
+\section{布局优化的反例}
+
+布局优化也会失败。第一类失败是工作集很小，本来就全部在 cache 里，换布局只增加代码复杂度。第二类失败是热路径需要完整对象，SoA 反而让字段分散在多个数组中，增加地址计算和 cache line 数。第三类失败是业务频繁插入删除，CSR 或紧凑数组重建成本太高。第四类失败是并发访问模式改变，新布局把原来分散的写入集中到同一 cache line。第五类失败是接口没有同步迁移，内部布局高效，外部仍然单元素调用。
+
+因此本章不是要求读者把所有对象都改成 SoA，而是要求读者学会问问题：热路径读哪些字段，写哪些字段，数据能否批量处理，生命周期是否成批，是否有稳定 ID 需求，是否多线程写，是否需要序列化，是否有恢复和调试要求。布局是系统设计，不是局部技巧。
+
+\section{日志系统的布局案例}
+
+贯穿项目的日志统计可以用一个具体布局案例串起来。原始日志行是冷数据，解析后的 event type、user id、timestamp 和 value 是热数据，解析错误信息是低频冷数据。若每条记录都保存成一个包含字符串和多个字段的大结构，聚合 event type 时会把大量原始文本和调试字段带入 cache。更好的设计是先把输入按 batch 解析，热字段放入列式数组，原始行或错误上下文按 offset 另存。
+
+这种设计还方便错误处理。正常路径只扫描热字段；遇到解析错误时，把错误行号和原始 offset 写入冷错误列表；需要输出错误报告时再回到原始文本。热路径和冷路径分开后，性能和调试都更清楚。很多系统性能差，不是因为算法复杂，而是每次处理热字段都拖着一堆冷调试信息走。
+
+\begin{lstlisting}[language=C++,caption={日志批次的热冷布局}]
+struct ParsedLogHotBatch {
+    std::vector<std::uint64_t> timestamps;
+    std::vector<std::uint64_t> user_ids;
+    std::vector<std::uint32_t> event_types;
+    std::vector<std::int64_t> values;
+};
+
+struct ParsedLogColdBatch {
+    std::vector<std::uint64_t> raw_offsets;
+    std::vector<std::uint32_t> error_rows;
+};
+\end{lstlisting}
+
+这个布局不要求原始输入立即复制。\code{raw_offsets} 可以指向 mmap 文件或输入缓冲中的位置，但生命周期要清楚：如果输入缓冲释放，offset 就不能再用于错误报告。布局和生命周期永远绑定在一起。
+
+\section{ECS 变体：稀疏集合}
+
+ECS 常用 sparse set 维护实体到组件位置的映射。Dense 数组保存实际组件，sparse 数组从 entity id 映射到 dense index。遍历组件时扫描 dense，局部性好；查询某个 entity 是否有组件时，用 sparse 快速定位。删除时可以用 swap-remove，把最后一个元素移到删除位置，再更新 sparse。这个结构牺牲稳定顺序，换取紧凑遍历。
+
+如果业务需要稳定顺序，swap-remove 就不合适；如果 entity id 非常稀疏，sparse 数组可能很大；如果组件跨线程频繁增删，需要同步。再次说明，数据结构没有脱离语义的绝对优劣。Sparse set 适合大量实体、组件遍历热、增删可接受重排的场景。
+
+\section{Columnar batch 和 vectorized execution}
+
+数据库的 vectorized execution 通常以 batch 为单位处理列式数据。一个 batch 可能包含几千行，每个算子处理一个 batch 后交给下一个算子。Batch 太小，函数调用和调度成本高；batch 太大，cache 压力和延迟增加。Batch 模型是 row-at-a-time 和全量材料化之间的折中。
+
+日志统计项目可以借鉴这个模型。输入解析成 batch，filter 处理 batch，histogram 处理 batch，shuffle 按 batch 发送。每个 batch 有热字段列、选择向量、错误列表和统计摘要。这样项目既能展示数据布局，也能展示 I/O 背压：下游慢时，上游 batch 队列满，读取暂停。
+
+\section{布局和序列化的差异}
+
+内存布局和磁盘/网络格式不必相同。内存中为了计算使用 SoA，网络上为了兼容和压缩使用长度前缀或 protobuf 类格式，磁盘上为了恢复使用稳定 manifest。直接把内存结构 dump 到磁盘，短期方便，长期会被 ABI、padding、字节序和版本拖垮。高质量系统会显式转换格式。
+
+转换本身有成本，因此需要批处理和缓冲。一次转换一条记录，函数调用和分配成本高；一次转换一个 batch，可以顺序读取列、批量编码、批量校验。布局优化和 I/O 章节在这里相遇：好的内存布局也要服务序列化。
+
+\section{缓存友好的哈希表}
+
+哈希表是系统里常见的性能热点。链地址法每个 bucket 指向链表节点，容易指针追踪；开放寻址把元素放在连续数组中，探测时更 cache 友好，但删除、扩容和高负载因子要小心。Robin Hood hashing、SwissTable 类结构通过控制探测长度和元数据字节改善局部性。教材不要求实现这些成熟结构，但要让读者知道 \code{std::unordered_map} 不是唯一选择。
+
+日志聚合如果使用 \code{std::unordered_map<std::string, std::int64_t>}，每个 key 可能分配字符串和节点，局部性较差。若先把 event type intern 成 \code{std::uint32_t}，再用数组或开放寻址表，热路径会更清楚。数据布局优化常常从“把复杂 key 转成紧凑 id”开始。
+
+\section{内存布局的调试工具}
+
+布局优化需要工具。可以用 \code{sizeof} 和 \code{alignof} 检查结构体大小；用编译器警告或工具查看 padding；用地址打印检查数组连续性；用 \cmd{perf stat} 观察 cache 和 TLB；用 heap profiler 看分配热点；用 sanitizer 检查越界和 use-after-free。布局优化如果没有调试工具，很容易变成猜测。
+
+项目可以增加一个 layout report 命令，打印关键结构体大小、对齐、字段数量、batch 容量和估算字节数。这个命令不直接提升性能，但能让读者看到数据结构的物理形状。系统教材应让抽象类型落到字节。
+
+\section{布局迁移的测试策略}
+
+从 AoS 迁移到 SoA 时，测试要覆盖读写一致性。可以保留旧 AoS reference，随机生成记录，分别填充 AoS 和 SoA，执行同一聚合，比较结果。还要测试边界：空 batch、单元素、非对齐长度、错误行、超长字符串、冷热字段缺失。迁移期间如果保留双表示，要测试更新一个字段后另一个表示是否同步或明确无效。
+
+性能测试则要比较至少三条路径：完整记录访问、只访问热字段、错误报告访问。SoA 可能在热字段聚合上快，但完整记录访问变慢。报告要承认这种取舍，而不是只展示最好场景。
+
+\section{对齐分配器和实际收益}
+
+有些内核希望输入按 32 字节或 64 字节对齐。可以使用对齐分配器或平台 API 分配内存，也可以让容器内部保证对齐。对齐能减少跨 cache line 访问和满足某些 SIMD 要求，但它不是万能优化。若访问本来连续且 CPU 对非对齐访问支持良好，收益可能很小。若切片从对齐数组中间开始，起始地址仍可能不对齐。
+
+项目中可以把对齐作为实验参数。生成同样数据，分别使用普通 vector、对齐缓冲、故意偏移一个元素的视图。比较自动向量化和手写 chunked 版本。报告中写清对齐如何保证、如何验证、对尾部和偏移如何处理。
+
+\section{Scratch buffer 管理}
+
+高性能算法常需要 scratch buffer，例如 scan 的 block sums、partition 的 counts、top-k 的候选、解析的临时位置列表。每次函数调用都分配 scratch，会引入分配器成本和内存波动。更好的做法是由运行时或调用者提供 scratch，或者每个 worker 复用本地 scratch。
+
+Scratch 复用要清楚生命周期和大小。一个 worker 处理过大 batch 后，scratch 可能扩容到很大，后续小任务继续占用内存。可以设置最大保留容量，超过后释放或归还池。Scratch buffer 是数据布局和资源管理的交叉点。
+
+\section{Layout API 的封装}
+
+内部使用 SoA 或 AoSoA，不代表外部调用者要知道所有数组。可以提供 batch view，让热路径拿 span，冷路径通过 record id 获取完整记录。封装的目标是同时保护布局不变量和提供批量访问能力。单元素 getter 方便但可能慢；完全暴露 vector 容易破坏不变量。View 是折中。
+
+\begin{lstlisting}[language=C++,caption={批量视图封装布局}]
+struct EventColumnsView {
+    std::span<const std::uint32_t> event_types;
+    std::span<const std::int64_t> values;
+};
+
+EventColumnsView event_columns(const ParsedLogHotBatch& batch) {
+    return EventColumnsView{batch.event_types, batch.values};
+}
+\end{lstlisting}
+
+这个接口让聚合内核只看到自己需要的列，不依赖完整 batch 结构。后续如果 batch 从 vector 改成 mmap 或压缩列，接口仍有机会保持稳定。
+
+\section{布局章节总结}
+
+本章的主线是让数据形状服务访问形状。顺序热访问需要连续，字段子集热访问需要列式或冷热分离，高频并发写需要分片和对齐，稳定引用需要索引和 generation，静态图需要 CSR，动态更新需要增量结构。布局优化不是把所有东西改成一种格式，而是让每条热路径少搬无用字节、少追随机指针、少共享写。
+
+设计布局时，先写访问矩阵，再写生命周期，再写并发写者，再写序列化边界，最后才写代码。这个顺序能避免“为了性能换结构，最后语义乱了”的常见错误。
+
+\section{布局决策表}
+
+选择布局时，可以先填表。字段是否总是一起访问？若是，AoS 可能清晰；若只访问少数字段，SoA 或冷热分离更好。对象是否需要稳定地址？若需要，考虑索引句柄或对象池；若不需要，连续数组更简单。是否高频插入删除？若是，CSR 这类紧凑静态结构可能不合适。是否要 SIMD？字段连续和对齐更重要。是否要序列化？内存布局和 wire format 要分开。是否多线程写？写者要分片或对齐。
+
+这张表能避免布局争论变成风格争论。面向对象、面向数据、列式、池化都只是工具。真正决定工具的是访问矩阵、生命周期和并发语义。
+
+\section{案例：任务图的布局}
+
+任务图也需要布局。最直观的表示是每个节点一个对象，每个对象有 \code{std::vector} successors。小图这样写清楚，大图会有很多小 vector 分配，遍历后继时指针跳转多。CSR 式任务图把节点和边分别放入连续数组，ready count 在节点数组中，successor id 在边数组中。执行时，worker 完成节点后顺序扫描后继范围，局部性更好。
+
+缺点是动态修改困难。如果任务图在执行中不断新增边，CSR 重建成本高。可以使用两层结构：静态主图用 CSR，动态新增任务用小的 pending edge 列表，stage 结束后合并。这个设计和静态图加增量边、列式主存加 delta store 是同一模式。布局思维可以迁移到运行时元数据。
+
+\section{案例：模型权重的预告}
+
+虽然 AI 在第三册展开，但模型权重布局可以作为预告。权重通常是大块只读数据，推理时被反复扫描；量化权重可能按 block 存放 scale、zero point 和 int8 数据；算子希望连续读取并适配 SIMD。这个场景和本章的列式、AoSoA、对齐、冷热分离完全相关。第二册学习日志 batch 和矩阵 block，不是只为日志系统，而是为后续权重和 tensor 布局打基础。
+
+这也说明布局知识具有迁移性。字段从 event type 换成 tensor value，原则不变：热数据连续，元数据分离，block 大小匹配 cache 和 SIMD，序列化格式与内存计算格式分开。
+
 \section{本章落到贯穿项目}
 
 Compute Systems Engine 可以在本章加入两个实验模块。第一个是记录批处理模块：用 AoS、SoA 和冷热分离三种布局统计 key，比较热字段扫描、错误记录访问和内存占用。第二个是 worker stats 模块：紧凑统计槽位与 \code{alignas(64)} 槽位对照，观察多线程写入扩展性。这两个模块分别训练“读局部性”和“写共享”两种布局能力。
 
 项目代码不必一口气实现复杂 AoSoA 容器，但要把布局实验和 benchmark harness 接起来。每个布局版本必须使用同一份输入、同一个 reference 结果和同一组线程策略。否则布局差异会和算法差异混在一起。
+
+\section{从业务记录推导列式批次}
+
+很多布局优化失败，是因为一开始就讨论“要不要 SoA”，却没有先讨论业务记录到底怎样被使用。正确推导应从一个具体记录开始。假设日志记录包含时间戳、用户编号、事件类型、数值、原始行、解析错误、调试标签和来源文件。解析阶段需要原始行、来源文件和错误字段；聚合阶段只需要用户编号、事件类型和数值；错误报告阶段需要原始行和错误字段；调试查询阶段才需要标签。把这些字段全部放在一个大对象里，聚合阶段每处理一条记录都会把大量冷字段一起带进缓存。聚合代码看起来只读三个字段，硬件实际搬动的字节却远多于三个字段。
+
+推导列式批次时，可以先保留最直观的 AoS reference。它的价值是语义清晰，便于测试新布局。然后为热路径建立列式批次：用户编号是一列，事件类型是一列，数值是一列，解析状态可以是一列，原始行和调试信息放入冷批次。热聚合只接收热批次视图，错误报告才接收冷批次视图。这样做并不是为了追求某个抽象名称，而是为了让热路径少搬无用字节，让编译器更容易生成顺序扫描，让硬件预取器更容易工作。
+
+迁移时要特别注意记录编号。列式批次里第 i 个用户编号、第 i 个事件类型、第 i 个数值和冷批次第 i 个原始行必须表示同一条逻辑记录。这个关系可以通过统一长度、统一追加、统一过滤掩码和稳定 record id 保持。如果某个阶段删除错误记录，不能只从一列删除而忘记其他列。更稳的做法是先生成 selection vector，表示哪些记录有效，后续聚合按 selection vector 读取；等到批次稳定后，再做 compact。这样能避免列之间长度和顺序不一致。
+
+列式批次还要考虑异常和边界。解析一行失败时，热列是否填默认值？错误列如何记录原因？聚合阶段是否跳过失败记录？如果错误记录很多，selection vector 会不会成为新的热点？如果原始行很长，冷批次是否保存完整字符串，还是保存文件偏移和长度？这些问题都属于布局设计，而不是外围细节。真正的工程布局必须同时说明成功路径、失败路径、调试路径和序列化路径。
+
+\section{稀疏结构和图布局}
+
+图和稀疏矩阵是布局思想最集中的场景。最直观的图表示是每个节点一个对象，每个对象保存一个后继列表。这种写法适合教学和小图，但在大图上会产生大量小分配。遍历一个节点的邻居时，程序先读节点对象，再读 vector 元数据，再跳到邻居数组；如果每个邻居数组都来自不同分配位置，cache 和 TLB 压力会很高。CSR 表示把所有边放到一条连续边数组里，再用 offset 数组记录每个节点的边范围。遍历节点 v 的邻居时，只需要顺序扫描 edges 从 offsets[v] 到 offsets[v + 1] 的区间。
+
+CSR 的核心收益是把指针追踪变成连续区间扫描。连续扫描让硬件预取器能提前加载，也让多线程分片更容易。若节点范围按编号切分，每个 worker 扫描一段节点和对应边，读路径相对稳定。代价是动态更新困难。插入一条边可能需要移动后续大量边，删除也可能留下空洞。因此 CSR 更适合静态图、阶段性重建图或批处理图。动态图可以使用主 CSR 加 delta 边列表：主图负责绝大多数只读遍历，新增边暂存在小结构中，阶段边界再合并。
+
+稀疏矩阵也类似。按行压缩适合行遍历和矩阵向量乘；按列压缩适合列遍历；块稀疏适合局部密集区域和 SIMD。选择格式时，不能只说“稀疏矩阵用 CSR”。要看内核按行访问还是按列访问，是否需要转置，是否需要并行写输出，非零分布是否倾斜，行长度差异是否很大。行长度极不均匀时，按行分配线程可能负载不均；可以按非零数量切分，也可以把长行拆成多个任务，但拆长行又会引入输出累加同步。布局、算法和并行调度在这里不能分开。
+
+Compute Systems Engine 后续做 shuffle、join 和任务图时，都可以借用稀疏结构思维。任务图的 successors 数组就是边数组，任务的 successor range 就是 offset。分区后的 key 到记录位置，也可以看成倒排索引或稀疏结构。读者如果只把 CSR 当成图算法专用格式，就错过了更重要的思想：当大量对象之间的关系可以静态收集时，把关系压成连续区间，通常比每个对象挂一串指针更适合现代硬件。
+
+\section{布局实验报告怎样写}
+
+布局实验报告必须说明输入规模、记录大小、字段访问比例、线程策略、内存分配方式和测量指标。只报告“快了两倍”没有意义，因为读者不知道快在哪里。一个合格报告至少要写三组结果：完整对象访问、热字段访问、冷路径访问。SoA 可能让热字段聚合更快，但完整对象调试变慢；冷热分离可能减少缓存流量，但增加索引和封装复杂度。报告要把收益和代价都列出来。
+
+指标上，时间只是起点。还应观察 cache miss、TLB miss、内存带宽、分配次数、峰值内存、输出是否一致。多线程布局实验还要看扩展曲线和 false sharing。若紧凑统计槽位在单线程下更快，对齐槽位在多线程下更快，这不是矛盾，而是写共享形状改变了瓶颈。单线程结论不能直接推到多线程，多线程结论也不能忽略内存占用。
+
+报告还要防止把算法变化伪装成布局变化。AoS 版本如果使用普通循环，SoA 版本同时换成 SIMD 和分块，就无法判断收益来自哪里。更严谨的方式是逐步改变：先只改布局，算法保持一致；再加分块；再加 SIMD；再加线程。每一步都有 reference 结果和性能指标。这样得到的不是一组漂亮数字，而是一条可复查的因果链。
 
 \section{本章习题}
 
