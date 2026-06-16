@@ -10,6 +10,7 @@ add_executable(book_workspace main.cpp)
 
 option(BOOKS_BUILD_CPU_VOLUME_1 "Build CPU Volume 1 labs" ON)
 option(BOOKS_BUILD_CPU_VOLUME_2 "Build CPU Volume 2 labs" ON)
+option(BOOKS_BUILD_CPU_VOLUME_3 "Build CPU Volume 3 labs" ON)
 option(BOOKS_BUILD_ALGORITHM_INTERVIEW "Build algorithm interview book labs" ON)
 
 if(BOOKS_BUILD_CPU_VOLUME_1)
@@ -20,6 +21,11 @@ endif()
 if(BOOKS_BUILD_CPU_VOLUME_2)
     enable_testing()
     add_subdirectory(books/cpu-volume-2)
+endif()
+
+if(BOOKS_BUILD_CPU_VOLUME_3)
+    enable_testing()
+    add_subdirectory(books/cpu-volume-3)
 endif()
 
 if(BOOKS_BUILD_ALGORITHM_INTERVIEW)

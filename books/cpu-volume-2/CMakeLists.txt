@@ -10,5 +10,5 @@ option(CPU_VOLUME_2_BUILD_LABS "Build CPU Volume 2 labs" ON)
 
 if(CPU_VOLUME_2_BUILD_LABS)
     enable_testing()
-    add_subdirectory(labs/linux_cpu_inference)
+    add_subdirectory(labs/compute_systems)
 endif()

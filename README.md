@@ -5,7 +5,8 @@
 当前正式书籍：
 
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
-- `books/cpu-volume-2/`：CPU 高性能与 AI 计算教材第二册，主题是 Linux 现代 CPU、多核心并发、锁、缓存、TLB、SIMD、AI 基础、算子开发和本地量化推理引擎。
+- `books/cpu-volume-2/`：CPU 计算系统教材第二册，主题是硬件原理、多核心并行、高性能计算、多线程、锁、原子、无锁数据结构、并行算法和分布式计算。
+- `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 
 规划中的新书可以继续放到 `books/` 下，例如 C++ 语言、编译器、操作系统、AI 系统等方向。
@@ -28,6 +29,12 @@ books/
     reports/           # 报告模板和学习报告
     results/           # 实验输出
     tools/             # 本书专用脚本
+  cpu-volume-3/
+    labs/              # 第三册 AI 推理引擎实验
+    materials/
+    reports/
+    results/
+    tools/
   algorithm-interview/
     source/latex/      # 算法面试书正式 LaTeX 主稿
     materials/         # 题单、写作标准和素材
@@ -169,13 +176,17 @@ books/<book-id>/
 - 第二册说明：`books/cpu-volume-2/README.md`
 - 正式主稿：`books/cpu-volume-2/source/latex/main.tex`
 - 全书结构：`books/cpu-volume-2/source/latex/outline/book-architecture.tex`
-- Linux 性能工程主线：`books/cpu-volume-2/source/latex/chapters/part01-performance-model/`
-- 内存与 SIMD 主线：`books/cpu-volume-2/source/latex/chapters/part02-memory-simd/`
-- 并发同步主线：`books/cpu-volume-2/source/latex/chapters/part02-multicore-concurrency/`
-- AI 基础主线：`books/cpu-volume-2/source/latex/chapters/part03-ai-foundations/`
-- 算子开发主线：`books/cpu-volume-2/source/latex/chapters/part04-operator-development/`
-- 量化推理运行时主线：`books/cpu-volume-2/source/latex/chapters/part05-quant-runtime/`
-- 贯穿项目：`books/cpu-volume-2/labs/linux_cpu_inference/`
+- 硬件执行模型：`books/cpu-volume-2/source/latex/chapters/part01-hardware-foundations/`
+- 单机高性能计算：`books/cpu-volume-2/source/latex/chapters/part02-single-node-hpc/`
+- 多线程与同步：`books/cpu-volume-2/source/latex/chapters/part03-concurrency-synchronization/`
+- 并行算法与运行时：`books/cpu-volume-2/source/latex/chapters/part04-parallel-algorithms-runtime/`
+- 分布式计算：`books/cpu-volume-2/source/latex/chapters/part05-distributed-computing/`
+- 贯穿项目：`books/cpu-volume-2/labs/compute_systems/`
+
+## 当前第三册入口
+
+- 第三册说明：`books/cpu-volume-3/README.md`
+- AI 推理引擎实验：`books/cpu-volume-3/labs/linux_cpu_inference/`
 
 ## 当前算法面试书入口
 

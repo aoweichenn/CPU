@@ -12,8 +12,8 @@ pdf:
 	$(LATEXMK) $(ENGINE) -interaction=nonstopmode -halt-on-error $(MAIN)
 
 epub:
-	@BOOK_TITLE="从 C++ 到 AI 计算：第二册" \
-	BOOK_SUBTITLE="Linux 现代 CPU、多核并发、AI 基础、算子开发与量化推理引擎" \
+	@BOOK_TITLE="从 C++ 到计算系统：第二册" \
+	BOOK_SUBTITLE="硬件原理、多核并行、高性能计算、同步、无锁结构与分布式计算" \
 	BOOK_AUTHOR="CPU Performance Study" \
 	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables
 

@@ -1,0 +1,67 @@
+\chapter{原子操作与内存序}
+
+原子操作提供不可分割的读写或读改写，并参与线程间同步。内存序定义操作之间的可见性和重排约束。理解原子操作，必须区分原子性、顺序性和生命周期。
+
+\section{原子不是普通变量}
+
+\code{std::atomic} 的 \code{load}、\code{store}、\code{fetch_add}、\code{compare_exchange} 等操作会生成特殊指令或特殊约束。它们可以避免数据竞争，但不自动保证算法正确。一个原子计数器容易写，一个无锁队列需要处理节点发布、竞争失败、ABA 和回收。
+
+低竞争下，原子操作可能比 mutex 轻；高竞争下，多个线程反复修改同一 cache line，原子也会扩展性很差。判断依据仍然是共享写频率和一致性流量。
+
+\section{常见内存序}
+
+\code{memory\_order\_relaxed} 只保证原子性，不建立跨变量同步。计数器统计常用 relaxed，因为只关心最终数值。\code{memory\_order\_release} 发布写入，\code{memory\_order\_acquire} 获取发布的结果，二者配合可建立 happens-before。\code{memory\_order\_seq\_cst} 提供更强的全局顺序，但成本和约束也更强。
+
+选择内存序的原则是从语义出发，而不是从性能愿望出发。若一个线程写好对象后通过原子标志发布，写标志应 release，读标志应 acquire。若只是统计事件数量，relaxed 足够。
+
+\begin{lstlisting}[language=C++,caption={release/acquire 发布数据}]
+struct Shared {
+    std::int32_t data = 0;
+    std::atomic<bool> ready = false;
+};
+
+void producer(Shared& shared) {
+    shared.data = 42;
+    shared.ready.store(true, std::memory_order_release);
+}
+
+std::int32_t consumer(Shared& shared) {
+    while (!shared.ready.load(std::memory_order_acquire)) {
+    }
+    return shared.data;
+}
+\end{lstlisting}
+
+release store 之前的普通写，在 acquire load 看到该 store 后，对 consumer 可见。这里不能把 \code{ready} 简单改成普通 bool，也不能把 acquire/release 无脑改成 relaxed；否则程序缺少跨线程发布关系。
+
+\section{Relaxed 的正确用途}
+
+Relaxed 常用于统计计数、采样标志、引用计数的某些阶段和不参与对象发布的指标。它保证原子变量自身不会数据竞争，但不保证其他变量的可见性。用 relaxed 写高性能代码时，必须能说清“我只需要这个原子变量自己的数值，不需要借它同步别的数据”。
+
+例如请求计数器可以用 relaxed，因为最终统计只关心总次数。对象指针发布不能只用 relaxed，因为读到指针的线程还需要看到对象内部字段已经初始化。
+
+\section{CAS 循环}
+
+Compare-and-swap 读取旧值，若仍等于期望值就写入新值。无锁算法常用 CAS 循环处理竞争。CAS 失败不表示错误，而是说明其他线程已经修改状态，需要重新读取并尝试。
+
+CAS 循环必须考虑进度。低竞争时很快，高竞争时可能大量失败。复杂结构还要考虑 ABA：一个位置从 A 变 B 又变回 A，CAS 看到 A 可能误以为没有变化。解决方法包括版本号、hazard pointer、epoch 回收等。
+
+\section{CAS 的 weak 和 strong 版本}
+
+\code{compare_exchange_weak} 允许伪失败，即使当前值等于期望值也可能失败，因此通常放在循环里。\code{compare_exchange_strong} 不允许伪失败，更适合不在循环里的单次尝试。很多平台上二者生成代码可能接近，但语义差异必须理解。
+
+CAS 还有一个容易忽视的行为：失败时会把当前实际值写回 expected 参数。这让循环可以基于新值继续尝试，但也容易让初学者误用 expected。写无锁代码时，要把成功内存序和失败内存序都写清楚。
+
+\section{内存屏障和硬件}
+
+不同架构的内存模型不同。x86-64 相对强，ARM 和 POWER 更弱。C++ 内存序提供跨平台抽象，编译器和硬件会根据目标架构生成必要约束。不要因为某段代码在 x86 上“看起来没问题”，就认为它是正确的并发程序。
+
+\section{原子与缓存一致性}
+
+原子读改写通常会让目标 cache line 进入独占修改路径。多个核心同时对一个原子变量做 \code{fetch_add}，实际上是在争夺同一条 cache line 的所有权。内存序越强，编译器和硬件重排空间越小；竞争越强，一致性流量越大。
+
+这就是为什么高性能计数常用分片计数器。每个线程或每个核心写自己的本地计数，读取总数时再合并。它牺牲实时精确读取成本，换取写入热路径扩展性。
+
+\begin{labbox}
+实验：比较 mutex counter 和 atomic counter。在低线程数和高线程数下记录耗时。解释 relaxed 为什么适合这个计数器，也说明它为什么不能替代对象发布同步。
+\end{labbox}

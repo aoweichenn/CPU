@@ -1,6 +1,6 @@
-# CPU 高性能与 AI 计算教材第二册
+# CPU 计算系统教材第二册
 
-本目录是第二册的自包含工程。第一册讲程序、二进制、x86-64、ABI、Linux 工具链和可信性能测量；第二册先讲 Linux 上的现代 CPU 性能工程、多核心并发、锁、原子操作、缓存、TLB、SIMD 和软件优化，再从零讲 AI 模型、张量、推理图和算子开发，最终完成一个本地 CPU 量化推理引擎。
+本目录是第二册的自包含工程。第一册讲程序、二进制、x86-64、ABI、Linux 工具链和可信性能测量；第二册讲计算系统：现代 CPU 硬件原理、多核心并行、高性能计算、多线程、锁、条件变量、原子操作、内存模型、无锁数据结构、并行算法、异步 I/O 和分布式计算。AI 模型、算子开发和本地量化推理引擎放入第三册。
 
 ## 目录结构
 
@@ -41,14 +41,13 @@ make text-count
 贯穿项目位于：
 
 ```text
-labs/linux_cpu_inference/
+labs/compute_systems/
 ```
 
-当前第一阶段实现了 Linux 本地 CPU 量化 MLP 推理：
+当前第一阶段实现了计算系统基础实验：
 
-- 文本模型格式 `LCQI_MODEL_V1`
-- int8 权重和 per-layer scale
-- float 输入和激活
-- 量化线性层、ReLU、argmax
-- CLI 推理和 benchmark
+- 顺序归约和并行归约
+- mutex 计数器和 atomic 计数器
+- bounded MPMC 队列
+- CLI demo
 - CTest 正确性测试
