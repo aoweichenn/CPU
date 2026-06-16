@@ -110,6 +110,121 @@ struct PairHash {
 std::unordered_set<std::pair<int, int>, PairHash> visited;
 \end{lstlisting}
 
+为了把“桶、冲突、负载因子”讲实，可以写一个只支持 \code{int} 的开放寻址哈希集合。开放寻址不为每个冲突元素单独挂链表，而是在同一个数组里继续探测下一个候选桶。最简单的是线性探测：若当前位置被其他 key 占用，就看下一个位置，走到末尾再绕回开头。删除不能直接把桶改成空，因为这会截断后面冲突 key 的查找路径；所以桶需要三种状态：空、已占用、已删除。真实标准库实现更复杂，但这个小实现足够说明哈希表为什么需要负载因子、为什么删除有墓碑状态、为什么 rehash 会重新放置所有元素。
+
+\begin{lstlisting}[language=C++,caption={开放寻址哈希集合：桶状态、线性探测和扩容}]
+class IntHashSet {
+public:
+    IntHashSet() : buckets_(INITIAL_BUCKETS) {}
+
+    bool contains(int key) const
+    {
+        return this->find_slot(key).has_value();
+    }
+
+    bool insert(int key)
+    {
+        if ((this->size_ + 1) * LOAD_FACTOR_DENOMINATOR >
+            static_cast<int>(this->buckets_.size()) * LOAD_FACTOR_NUMERATOR) {
+            this->rehash(static_cast<int>(this->buckets_.size()) *
+                         BUCKET_GROWTH_FACTOR);
+        }
+
+        int first_deleted = -1;
+        const int start = this->bucket_index(key);
+        for (int step = 0; step < static_cast<int>(this->buckets_.size()); ++step) {
+            const int index =
+                (start + step) % static_cast<int>(this->buckets_.size());
+            Bucket& bucket = this->buckets_[static_cast<std::size_t>(index)];
+            if (bucket.state == BucketState::Occupied && bucket.key == key) {
+                return false;
+            }
+            if (bucket.state == BucketState::Deleted && first_deleted == -1) {
+                first_deleted = index;
+            }
+            if (bucket.state == BucketState::Empty) {
+                const int target = first_deleted == -1 ? index : first_deleted;
+                Bucket& target_bucket =
+                    this->buckets_[static_cast<std::size_t>(target)];
+                target_bucket.key = key;
+                target_bucket.state = BucketState::Occupied;
+                ++this->size_;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    bool erase(int key)
+    {
+        const std::optional<int> slot = this->find_slot(key);
+        if (!slot.has_value()) {
+            return false;
+        }
+        this->buckets_[static_cast<std::size_t>(slot.value())].state =
+            BucketState::Deleted;
+        --this->size_;
+        return true;
+    }
+
+private:
+    enum class BucketState {
+        Empty,
+        Occupied,
+        Deleted
+    };
+
+    struct Bucket {
+        int key = 0;
+        BucketState state = BucketState::Empty;
+    };
+
+    int bucket_index(int key) const
+    {
+        return static_cast<int>(
+            std::hash<int>{}(key) % static_cast<std::size_t>(this->buckets_.size()));
+    }
+
+    std::optional<int> find_slot(int key) const
+    {
+        const int start = this->bucket_index(key);
+        for (int step = 0; step < static_cast<int>(this->buckets_.size()); ++step) {
+            const int index =
+                (start + step) % static_cast<int>(this->buckets_.size());
+            const Bucket& bucket = this->buckets_[static_cast<std::size_t>(index)];
+            if (bucket.state == BucketState::Empty) {
+                return std::nullopt;
+            }
+            if (bucket.state == BucketState::Occupied && bucket.key == key) {
+                return index;
+            }
+        }
+        return std::nullopt;
+    }
+
+    void rehash(int next_bucket_count)
+    {
+        std::vector<Bucket> old_buckets = std::move(this->buckets_);
+        this->buckets_.assign(static_cast<std::size_t>(next_bucket_count), Bucket{});
+        this->size_ = 0;
+        for (const Bucket& bucket : old_buckets) {
+            if (bucket.state == BucketState::Occupied) {
+                this->insert(bucket.key);
+            }
+        }
+    }
+
+    static constexpr int INITIAL_BUCKETS = 8;
+    static constexpr int BUCKET_GROWTH_FACTOR = 2;
+    static constexpr int LOAD_FACTOR_NUMERATOR = 7;
+    static constexpr int LOAD_FACTOR_DENOMINATOR = 10;
+    std::vector<Bucket> buckets_;
+    int size_ = 0;
+};
+\end{lstlisting}
+
+这个实现有三个教学重点。第一，\code{contains} 不是直接看哈希位置，而是沿同一条探测路径一直找，直到遇到空桶或目标 key。第二，删除后放置 \code{Deleted} 墓碑，是为了不破坏后续 key 的查找路径；否则某个冲突 key 明明还在表中，却会因为中途遇到空桶而被误判不存在。第三，扩容后必须重新插入所有已占用 key，因为桶数量变了，\code{hash(key) mod bucket_count} 的结果也变了。这解释了为什么 \code{unordered_map} rehash 后迭代器会失效，也解释了为什么提前 \code{reserve} 能减少热路径上的重排成本。
+
 堆解决的是动态极值问题。C++ 里通常使用 \code{std::priority_queue}，默认是大顶堆；如果要小顶堆，需要显式给出容器和比较器。堆的插入和弹出堆顶都是 \complexity{O(\log n)}，查看堆顶是 \complexity{O(1)}。它不适合频繁删除任意元素，也不适合遍历出有序结果而不破坏结构。换句话说，堆只承诺“我能很快告诉你当前最大或最小是谁”。
 
 二叉堆的物理存储通常是数组，而不是指针树。把数组下标从 0 开始看，节点 \code{i} 的左孩子是 \code{2*i+1}，右孩子是 \code{2*i+2}，父节点是 \code{(i-1)/2}。堆只维护局部顺序：父节点不小于孩子就是大顶堆，父节点不大于孩子就是小顶堆。它不保证整棵树中序有序，也不能像平衡树那样快速找任意排名。插入新元素时先放到数组末尾，再不断和父节点比较并上浮；弹出堆顶时把末尾元素移到根，再不断和更合适的孩子交换并下沉。
@@ -189,6 +304,8 @@ private:
 
 这段代码不是为了替代标准库，而是为了看清堆为什么是 \complexity{O(\log n)}。完全二叉树高度约为 \complexity{\log n}，上浮和下沉每次只向上一层或下一层移动，所以单次插入和弹出堆顶最多走树高。真实写题时应优先用 \code{std::priority_queue}，除非题目需要 decrease-key、删除任意元素、或者需要同时维护位置索引，这时普通 \code{priority_queue} 就不够，需要额外结构或改用其他数据结构。
 
+手写堆时要检查四个不变量。第一，数组表示的是完全二叉树，不能在中间留下空洞；第二，小顶堆要求任意节点不大于两个孩子，大顶堆方向相反；第三，\code{push} 只可能破坏新节点到根路径上的堆序，所以只需上浮；第四，\code{pop} 只可能破坏根到叶子路径上的堆序，所以只需下沉。若题目需要同时知道某个元素在堆里的位置，例如自己实现带 decrease-key 的 Dijkstra，就必须额外维护 value 到下标的映射，并在每次 \code{swap} 后同步更新映射；否则位置索引会立刻失真。
+
 \begin{lstlisting}[language=C++,caption={priority\_queue 的大顶堆和小顶堆}]
 std::priority_queue<int> max_heap;
 
@@ -247,7 +364,7 @@ bool is_valid_bst(TreeNode* root)
 {
     std::vector<TreeNode*> stack;
     TreeNode* current = root;
-    std::optional<long long> previous;
+    std::optional<std::int64_t> previous;
 
     while (current != nullptr || !stack.empty()) {
         while (current != nullptr) {
@@ -490,6 +607,6 @@ private:
 优化通常来自查询模型的改变。哈希表把历史查找变快，堆把动态极值变快，树把层次状态和有序性质显式化，图把状态转移统一成边，并查集把动态连通性维护变快。刷题复盘时必须同时写出算法动作和数据结构职责：保存什么，支持什么查询，删除什么过期状态，为什么不会漏答案。
 \end{principlebox}
 
-本章建议配套练习：哈希表做 1、49、128、560、146；堆做 215、347、23、295、621；树做 94、98、102、104、105、124、236、230；图做 200、207、210、417、994、127、752；并查集做 547、684、721、990、1319。每道题至少复盘一次建模：如果不用这个结构，暴力瓶颈在哪里；用了这个结构，哪一步查询或合并被降下来了；结构本身有什么边界和失效条件。
+本章对应题目索引统一见附录“LeetCode 题目索引”。每道题至少复盘一次建模：如果不用这个结构，暴力瓶颈在哪里；用了这个结构，哪一步查询或合并被降下来了；结构本身有什么边界和失效条件。
 
 \input{chapters/generated/generated-nonlinear-structures-deep}
