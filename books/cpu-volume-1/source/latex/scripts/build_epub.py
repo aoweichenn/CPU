@@ -850,11 +850,11 @@ def latex_math_plain(text: str) -> str:
     return text.strip()
 
 
-def collect_entries(book_dir: Path) -> tuple[list[SourceEntry], list[PartNode]]:
+def collect_entries(book_dir: Path, include_cover: bool = True) -> tuple[list[SourceEntry], list[PartNode]]:
     main = (book_dir / "main.tex").read_text(encoding="utf-8")
-    entries: list[SourceEntry] = [
-        SourceEntry(kind="cover", title=BOOK_TITLE, nav_title="封面", output="cover.xhtml")
-    ]
+    entries: list[SourceEntry] = []
+    if include_cover:
+        entries.append(SourceEntry(kind="cover", title=BOOK_TITLE, nav_title="封面", output="cover.xhtml"))
     parts: list[PartNode] = []
     state = "preamble"
     current_part: PartNode | None = None
@@ -1038,7 +1038,9 @@ def build_nav(entries: list[SourceEntry], parts: list[PartNode]) -> str:
     appendices = [e for e in entries if e.kind == "chapter" and e.state == "appendix"]
     back = [e for e in entries if e.kind == "chapter" and e.state == "backmatter"]
 
-    lines = ['<ol>', '<li><a href="cover.xhtml">封面</a></li>']
+    lines = ["<ol>"]
+    if any(e.kind == "cover" for e in entries):
+        lines.append('<li><a href="cover.xhtml">封面</a></li>')
     for entry in front:
         lines.append(f'<li><a href="{html.escape(entry.output, quote=True)}">{html.escape(entry.nav_title)}</a></li>')
     for part in parts:
@@ -1183,6 +1185,11 @@ h3 {
 }
 p {
   margin: 0.62em 0;
+  text-indent: 2em;
+}
+h1 + p,
+h2 + p,
+h3 + p {
   text-indent: 2em;
 }
 code {
@@ -1360,13 +1367,45 @@ def container_xml() -> str:
 '''
 
 
-def build_epub(book_dir: Path, output: Path) -> None:
-    entries, parts = collect_entries(book_dir)
+IMAGE_EXTENSIONS = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
+IMAGE_MARKUP = re.compile(
+    r"(<\s*(?:img|svg|picture|source|figure)\b|image/|data:image|background-image|cover-image)",
+    re.IGNORECASE,
+)
+
+
+def validate_no_embedded_images(output: Path) -> None:
+    bad_files: list[str] = []
+    bad_markup: list[str] = []
+    with zipfile.ZipFile(output) as archive:
+        for name in archive.namelist():
+            suffix = Path(name).suffix.lower()
+            if suffix in IMAGE_EXTENSIONS:
+                bad_files.append(name)
+                continue
+            if suffix not in {".css", ".opf", ".xhtml", ".xml"}:
+                continue
+            content = archive.read(name).decode("utf-8", errors="replace")
+            if IMAGE_MARKUP.search(content):
+                bad_markup.append(name)
+    if bad_files or bad_markup:
+        details = []
+        if bad_files:
+            details.append("image files: " + ", ".join(bad_files))
+        if bad_markup:
+            details.append("image markup: " + ", ".join(bad_markup))
+        raise RuntimeError("EPUB contains image content; " + "; ".join(details))
+
+
+def build_epub(book_dir: Path, output: Path, include_cover: bool = True, forbid_images: bool = False) -> None:
+    entries, parts = collect_entries(book_dir, include_cover=include_cover)
     fonts = collect_embedded_fonts()
     uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{BOOK_TITLE}"))
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-    pages: dict[str, str] = {"cover.xhtml": cover_page()}
+    pages: dict[str, str] = {}
+    if include_cover:
+        pages["cover.xhtml"] = cover_page()
     part_by_output = {part.output: part for part in parts}
     for entry in entries:
         if entry.kind == "cover":
@@ -1390,6 +1429,8 @@ def build_epub(book_dir: Path, output: Path) -> None:
             archive.write(font.source, f"OEBPS/{font.href}", compress_type=zipfile.ZIP_DEFLATED)
         for name, content in pages.items():
             archive.writestr(f"OEBPS/{name}", content, compress_type=zipfile.ZIP_DEFLATED)
+    if forbid_images:
+        validate_no_embedded_images(output)
 
 
 def parse_args(argv: Iterable[str]) -> argparse.Namespace:
@@ -1406,12 +1447,27 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=Path(__file__).resolve().parents[1] / "main.epub",
         help="Output EPUB path.",
     )
+    parser.add_argument(
+        "--no-cover-page",
+        action="store_true",
+        help="Do not add a generated XHTML cover page to the EPUB spine or navigation.",
+    )
+    parser.add_argument(
+        "--forbid-images",
+        action="store_true",
+        help="Fail the build if the EPUB contains image files or image markup.",
+    )
     return parser.parse_args(list(argv))
 
 
 def main(argv: Iterable[str]) -> int:
     args = parse_args(argv)
-    build_epub(args.book_dir.resolve(), args.output.resolve())
+    build_epub(
+        args.book_dir.resolve(),
+        args.output.resolve(),
+        include_cover=not args.no_cover_page,
+        forbid_images=args.forbid_images,
+    )
     print(args.output.resolve())
     return 0
 
