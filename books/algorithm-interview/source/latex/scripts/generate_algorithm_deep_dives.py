@@ -417,9 +417,32 @@ DEEP_SECTIONS: list[tuple[str, str, list[str]]] = [
 
 GROUPS: dict[str, list[str]] = {
     "generated-array-window-cards.tex": ["array", "window"],
-    "generated-hash-binary-stack-cards.tex": ["prefix_hash", "binary", "stack", "bit"],
+    "generated-hash-prefix-cards.tex": ["prefix_hash"],
+    "generated-binary-search-cards.tex": ["binary"],
+    "generated-stack-queue-cards.tex": ["stack"],
+    "generated-bit-state-cards.tex": ["bit"],
     "generated-tree-graph-cards.tex": ["tree", "graph", "shortest", "dsu"],
-    "generated-dp-greedy-cards.tex": ["dp", "knapsack", "greedy", "interval", "backtrack", "heap", "linked"],
+    "generated-dp-cards.tex": ["dp", "knapsack"],
+    "generated-greedy-cards.tex": ["greedy"],
+    "generated-interval-cards.tex": ["interval"],
+    "generated-backtracking-cards.tex": ["backtrack"],
+    "generated-heap-cards.tex": ["heap"],
+    "generated-linked-list-cards.tex": ["linked"],
+}
+
+GROUP_TITLES: dict[str, str] = {
+    "generated-array-window-cards.tex": "数组、双指针和滑动窗口深度题卡",
+    "generated-hash-prefix-cards.tex": "哈希表和前缀和深度题卡",
+    "generated-binary-search-cards.tex": "二分查找深度题卡",
+    "generated-stack-queue-cards.tex": "栈、单调栈和队列深度题卡",
+    "generated-bit-state-cards.tex": "位运算和状态压缩深度题卡",
+    "generated-tree-graph-cards.tex": "树、图和图论结构深度题卡",
+    "generated-dp-cards.tex": "动态规划和背包深度题卡",
+    "generated-greedy-cards.tex": "贪心证明深度题卡",
+    "generated-interval-cards.tex": "排序和区间深度题卡",
+    "generated-backtracking-cards.tex": "回溯、枚举和剪枝深度题卡",
+    "generated-heap-cards.tex": "堆和动态极值深度题卡",
+    "generated-linked-list-cards.tex": "链表和指针重连深度题卡",
 }
 
 
@@ -1094,7 +1117,7 @@ def write_deep_sections() -> None:
             )
         )
         body.append("\\end{principlebox}")
-        (OUT_DIR / filename).write_text("\n".join(body) + "\n", encoding="utf-8")
+        (OUT_DIR / filename).write_text("\n".join(body).rstrip() + "\n", encoding="utf-8")
 
 
 def write_problem_groups() -> None:
@@ -1103,7 +1126,8 @@ def write_problem_groups() -> None:
         problems_by_family.setdefault(problem.family, []).append(problem)
 
     for filename, families in GROUPS.items():
-        body: list[str] = [f"\\section{{{escape_text(filename.replace('generated-', '').replace('-cards.tex', ' 深度题卡'))}}}", ""]
+        title = GROUP_TITLES[filename]
+        body: list[str] = [f"\\section{{{escape_text(title)}}}", ""]
         for family_key in families:
             family = FAMILIES[family_key]
             body.append(f"\\subsection{{{escape_text(family.name)}}}")
@@ -1118,7 +1142,7 @@ def write_problem_groups() -> None:
             for problem in problems_by_family.get(family_key, []):
                 body.append(problem_card(problem, family))
                 body.append("")
-        (OUT_DIR / filename).write_text("\n".join(body), encoding="utf-8")
+        (OUT_DIR / filename).write_text("\n".join(body).rstrip() + "\n", encoding="utf-8")
 
 
 def write_code_snippets() -> None:
