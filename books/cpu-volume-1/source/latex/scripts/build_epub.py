@@ -463,6 +463,8 @@ class LatexBlockConverter:
                         self.out.append(f"<h2>{text}</h2>")
                 elif level == "subsection":
                     self.out.append(f"<h3>{self.inline.convert(title)}</h3>")
+                elif level == "topic":
+                    self.out.append(f'<h4 class="topic-heading">{self.inline.convert(title)}</h4>')
                 i += 1
                 continue
 
@@ -727,7 +729,7 @@ def span(css_class: str, text: str) -> str:
 
 
 def parse_heading(line: str) -> tuple[str, str] | None:
-    for level in ("chapter", "section", "subsection"):
+    for level in ("chapter", "section", "subsection", "topic"):
         prefix = "\\" + level
         if line.startswith(prefix):
             i = len(prefix)

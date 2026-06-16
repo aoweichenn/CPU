@@ -80,6 +80,7 @@ def normalize_text_macros(text: str) -> str:
     text = re.sub(r"\\term\s*\{([^{}]*)\}\s*\{([^{}]*)\}", r"\1 \2", text)
     text = re.sub(r"\\engterm\s*\{([^{}]*)\}", r"\1", text)
     text = re.sub(r"\\href\s*\{[^{}]*\}\s*\{([^{}]*)\}", r"\1", text)
+    text = re.sub(r"\\topic\s*\{([^{}]*)\}", r"\1", text)
     return text
 
 

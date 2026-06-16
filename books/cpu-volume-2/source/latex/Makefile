@@ -2,7 +2,7 @@ LATEXMK ?= latexmk
 ENGINE ?= -xelatex
 MAIN ?= main.tex
 EPUB_BUILDER ?= ../../../cpu-volume-1/source/latex/scripts/build_epub.py
-TEXT_TARGET ?= 500000
+TEXT_TARGET ?= 600000
 
 .PHONY: all pdf epub clean check text-count text-count-chapters text-target
 
@@ -32,4 +32,4 @@ text-count-chapters:
 	@python3 scripts/count_text_units.py --chapters-only
 
 text-target:
-	@python3 scripts/count_text_units.py --min $(TEXT_TARGET)
+	@python3 scripts/count_text_units.py --chapters-only --min $(TEXT_TARGET)
