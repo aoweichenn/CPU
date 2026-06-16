@@ -76,6 +76,120 @@ CAS 还有一个容易忽视的行为：失败时会把当前实际值写回 exp
 
 x86-64 的内存模型相对强，很多 acquire/release 在硬件指令上看起来很轻；ARM 等架构更弱，可能需要更显式的屏障。可移植 C++ 代码不能因为在 x86 上测试通过，就省略必要内存序。教材示例必须按 C++ 语义写正确，而不是按某台机器的偶然行为写正确。
 
+\section{三件事必须分开}
+
+学习原子操作时，最重要的是把三件事分开：原子性、可见性和顺序性。原子性回答“这个变量本身的读写会不会撕裂，会不会产生数据竞争”。可见性回答“一个线程写入的其他数据，另一个线程什么时候能看到”。顺序性回答“多个操作之间能否被编译器或硬件重排，其他线程能以什么顺序观察到”。很多错误来自把原子性误当成全部同步。
+
+例如 \code{std::atomic<bool> ready} 可以原子地表示标志，但如果生产者用 relaxed 存储 \code{ready=true}，消费者用 relaxed 读取到 true 后再读普通字段，普通字段的初始化不一定通过这个标志建立可见性关系。标志本身没有数据竞争，不代表对象发布正确。反过来，一个 relaxed 计数器用于统计请求次数完全可以，因为读取计数不需要借它观察其他普通数据。
+
+教材里的判断标准应是：这个原子变量是否只是自己的值有意义，还是它承担了发布其他状态的责任？只看自己的值，通常 relaxed 可以讨论；发布其他状态，就需要 release/acquire、mutex 或更强同步。
+
+\section{发布对象的完整故事}
+
+对象发布是内存序最常见的真实案例。生产者分配或准备一个对象，写入多个普通字段，然后把指针或 ready 标志交给消费者。消费者看到标志后读取对象字段。如果没有同步，消费者可能看到未初始化或部分初始化状态；即使在某台 x86 机器上看不出来，C++ 语义也不允许依赖这种偶然。
+
+\begin{lstlisting}[language=C++,caption={用原子指针发布只读对象}]
+struct Config {
+    std::int32_t shard_count = 0;
+    std::int32_t queue_capacity = 0;
+};
+
+std::atomic<Config*> published_config{nullptr};
+
+void publish(Config* config) {
+    config->shard_count = 16;
+    config->queue_capacity = 4096;
+    published_config.store(config, std::memory_order_release);
+}
+
+Config* acquire_config() {
+    Config* config = nullptr;
+    while (config == nullptr) {
+        config = published_config.load(std::memory_order_acquire);
+    }
+    return config;
+}
+\end{lstlisting}
+
+release store 之前对 \code{config} 字段的写入，在 acquire load 读到同一个指针后，对消费者可见。这个例子还隐藏了生命周期问题：谁拥有 \code{Config}，何时释放，是否允许热更新？release/acquire 只解决发布时的可见性，不自动解决对象回收。无锁章节会继续处理这个问题。
+
+\section{消息传递和 happens-before}
+
+内存序最终要落到 happens-before 关系。若线程 A 的某些写入 happens-before 线程 B 的某些读取，B 就能按 C++ 规则观察到 A 发布的结果。mutex 的 unlock 和后续 lock 可以建立这种关系；release store 和读到它的 acquire load 也可以建立这种关系；线程创建和 join 也有同步语义。
+
+理解 happens-before 时，不要把它想成“时间上先发生”。两个线程在物理时间上先后执行，不一定建立 C++ 同步关系。生产者可能确实先写了 data，再写 ready；消费者也可能确实后读 ready，再读 data。但如果 ready 使用 relaxed，语言层面没有建立 data 的发布关系，程序就缺少可移植保证。并发正确性看的是同步关系，不是肉眼看到的执行顺序。
+
+\section{Release sequence 和读改写}
+
+C++ 内存模型里，release sequence 处理了一类常见场景：一个 release 操作后面接着对同一个原子变量的一系列读改写操作，acquire 读到这个序列中的值时，仍可能与最初 release 建立同步。这个规则让一些引用计数、队列状态和发布协议能正确表达，但也容易让初学者迷糊。
+
+本书不要求在入门阶段手写复杂 release sequence 算法，但要知道两个原则。第一，同步关系通常围绕同一个原子对象上的读写建立，不能随便把一个原子变量的 release 借给另一个原子变量。第二，读改写操作既读旧值又写新值，它的成功和失败内存序都需要理解。CAS 成功时可能发布新状态，失败时只是观察当前状态；失败内存序不能比成功内存序更强。
+
+\section{CAS 循环的副作用边界}
+
+CAS 循环最容易漏讲的是副作用边界。因为 CAS 可能失败，循环体可能执行很多次。若循环体里做了不可回滚副作用，例如写日志、发送网络请求、增加外部计数、释放对象或修改另一个结构，那么失败重试会让语义混乱。正确写法通常把“准备候选值”和“提交副作用”分开，只有 CAS 成功后才执行对外可见副作用。
+
+\begin{lstlisting}[language=C++,caption={CAS 循环只在成功后提交外部副作用}]
+bool try_set_max(std::atomic<std::int64_t>& target,
+                 std::int64_t candidate) {
+    std::int64_t observed = target.load(std::memory_order_relaxed);
+    while (observed < candidate) {
+        if (target.compare_exchange_weak(
+                observed,
+                candidate,
+                std::memory_order_release,
+                std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+\end{lstlisting}
+
+这个函数在失败时，\code{observed} 会被更新成当前实际值，下一轮基于新值继续判断。函数没有在循环内部写外部日志或修改其他共享结构，因此失败重试不会产生额外语义。若调用者需要记录“最大值被更新”，应在返回 true 后记录。
+
+\section{原子引用计数的双重语义}
+
+引用计数常用原子实现，但它不是简单计数器。增加引用通常只需要保证计数本身原子，减少引用并发现自己是最后一个引用时，需要在销毁对象前看到其他线程对对象的修改。也就是说，引用计数同时涉及原子性和对象生命周期。很多成熟库在 increment、decrement 和最后释放之间使用不同内存序，就是因为不同阶段承担不同语义。
+
+教材不应让读者以为“引用计数用 relaxed 就行”或“引用计数都用 \code{memory_order_seq_cst} 最安全”。更好的说法是：引用计数需要一套完整协议。获取引用时必须确保对象仍然活着；释放引用时如果不是最后一个，只是减少计数；如果是最后一个，必须和其他线程对对象的访问建立足够同步，然后才能析构。协议比单条原子指令重要。
+
+\section{Seq-cst 的价值和成本}
+
+\code{memory_order_seq_cst} 提供一个所有 seq-cst 操作参与的单一全局顺序。它让推理更接近直觉，适合初始实现、教学示例和确实需要全局顺序的算法。但它不是“让并发程序自动正确”的开关。若对象生命周期没处理，seq-cst 也不能防止 use-after-free；若不变量跨多个变量没有协议，seq-cst 原子也不能自动保持不变量。
+
+性能上，seq-cst 可能限制编译器和硬件重排，在某些架构上需要更重屏障。x86 上某些 seq-cst load/store 也许看起来不重，但读改写和跨平台成本仍要考虑。工程建议是：先用清晰同步写正确，再在热点路径中根据证明降低到 acquire/release 或 relaxed。不要为了性能从一开始就写最弱内存序，也不要为了省脑把所有原子永远 seq-cst 后忽略结构设计。
+
+\section{原子和锁的组合}
+
+原子和 mutex 可以组合使用，但必须明确各自保护什么。常见模式是用原子做 fast path 标志，用 mutex 保护复杂慢路径状态。例如一个队列可以用原子 size 做近似指标，但真实 head、tail、buffer 仍由 mutex 保护。错误模式是同一份状态有时用锁保护，有时绕过锁用原子修改，导致不变量被拆碎。
+
+如果一个变量参与锁保护的不变量，就不要随意在锁外用 relaxed 读它来做决策，除非这个决策允许过期和近似。例如队列长度指标可以近似展示；判断是否可以安全 pop 不能靠锁外近似 size。区分“指标”和“协议状态”非常重要。
+
+\section{内存序测试为什么困难}
+
+内存序 bug 很难通过普通测试证明不存在。它可能只在特定架构、编译器优化、核心数和时序下出现。压力测试能增加信心，但不能替代语义证明。写并发代码时，应先用 happens-before 关系证明，再用 ThreadSanitizer、压力测试和架构测试辅助验证。
+
+手机或 x86 设备上跑过不代表 ARM 服务器、POWER 或未来编译器也正确。可移植 C++ 并发必须按语言模型写。教材示例因此宁愿稍保守，也不能依赖某个硬件“实际上不会乱序”的经验。
+
+\section{本章落到贯穿项目}
+
+Compute Systems Engine 在本章应增加三类原子实验。第一，统计计数器：mutex counter、atomic relaxed counter、sharded counter，用来区分原子性和扩展性。第二，发布实验：一个 producer 初始化配置后 release 发布，consumer acquire 获取，用来说明对象可见性。第三，CAS 实验：实现 \code{try_set_max} 或无锁最大值更新，记录 CAS 失败次数，说明竞争下重试成本。
+
+这些实验都要写清语义。计数器 relaxed 的理由是“不发布其他数据”；配置发布 acquire/release 的理由是“读取者需要看到普通字段初始化”；CAS 的理由是“成功那一刻是线性化点”。如果写不出理由，就不应该选择内存序。
+
+\section{本章习题}
+
+\begin{exercisebox}
+习题一：给三个场景选择内存序并解释理由：请求计数器、配置对象发布、无锁最大值更新。每个场景都要说明是否同步其他普通数据，是否需要全局顺序，失败时会发生什么。
+
+习题二：把一个错误的 relaxed 发布例子改成 release/acquire。要求画出 happens-before 关系，并说明对象生命周期仍然需要额外处理。
+
+习题三：写一个 CAS 循环，要求循环体内没有不可回滚副作用。然后列出三种不应该放进 CAS 重试循环的副作用，并解释原因。
+
+习题四：阅读项目中的 \code{AtomicCounter}。解释为什么当前 \code{fetch_add} 可以使用 relaxed，也说明它为什么不适合作为对象发布机制或队列同步机制。
+\end{exercisebox}
+
 \begin{labbox}
 实验：比较 mutex counter 和 atomic counter。在低线程数和高线程数下记录耗时。解释 relaxed 为什么适合这个计数器，也说明它为什么不能替代对象发布同步。
 \end{labbox}

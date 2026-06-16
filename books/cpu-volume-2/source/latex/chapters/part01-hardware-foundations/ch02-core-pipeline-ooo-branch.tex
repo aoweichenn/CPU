@@ -88,6 +88,269 @@ SMT 让一个物理核心暴露多个逻辑 CPU。它可以在一个线程等待
 
 核心流水线给软件三个直接启发。第一，减少长依赖链，例如把单个累加器拆成多个局部累加器。第二，减少不可预测分支，让热路径尽量直。第三，减少会强制顺序的操作，例如不必要的原子和屏障。后续章节讨论 SIMD、锁、无锁队列和并行归约时，都会回到这些原则。
 
+\section{问题案例：为什么一个求和循环也会慢}
+
+本章不能只停留在“流水线很深、乱序很强”这种抽象描述上。我们从 Compute Systems Engine 的第一条主线开始：对一个很大的 \code{std::int32_t} 数组求和。这个问题看起来太简单，甚至像入门练习，但正因为它简单，才适合暴露单核执行的几个基本矛盾：每次循环都有加载、扩展、加法、循环控制和分支；总和变量形成循环携带依赖；数组访问通常可被预取器识别；输入足够大时又会被内存带宽限制。一个求和循环可以同时讲清“依赖、前端、后端、内存和测量”这几条线。
+
+朴素版本通常写成一个累加器。
+
+\begin{lstlisting}[language=C++,caption={baseline：单累加器顺序归约}]
+std::int64_t sum_baseline(std::span<const std::int32_t> values) {
+    std::int64_t sum = 0;
+    for (std::size_t i = 0; i < values.size(); ++i) {
+        sum += values[i];
+    }
+    return sum;
+}
+\end{lstlisting}
+
+这个版本的好处是清楚、正确、容易作为 reference。它的弱点也很明显：每一轮的 \code{sum} 都依赖上一轮的 \code{sum}。处理器可以提前加载后面的数组元素，也可以预测循环分支，但加法结果本身是一条长链。只要下一次加法必须等上一次加法结果，乱序执行就不能把这些加法任意并行起来。此时瓶颈不一定是加法器数量，而可能是依赖链延迟。
+
+改进版本把一个长依赖链拆成多条短依赖链。
+
+\begin{lstlisting}[language=C++,caption={改进版本：四个独立累加器}]
+std::int64_t sum_four_accumulators(std::span<const std::int32_t> values) {
+    std::int64_t sum0 = 0;
+    std::int64_t sum1 = 0;
+    std::int64_t sum2 = 0;
+    std::int64_t sum3 = 0;
+
+    std::size_t i = 0;
+    const std::size_t limit = values.size() / 4 * 4;
+    for (; i < limit; i += 4) {
+        sum0 += values[i];
+        sum1 += values[i + 1];
+        sum2 += values[i + 2];
+        sum3 += values[i + 3];
+    }
+    for (; i < values.size(); ++i) {
+        sum0 += values[i];
+    }
+    return (sum0 + sum1) + (sum2 + sum3);
+}
+\end{lstlisting}
+
+这个版本不是为了“手动展开看起来高级”，而是给乱序核心更多可调度空间。四个累加器之间没有真实数据依赖，核心可以在一个累加器等待结果时推进另一个累加器。循环体变大，前端压力略增，但依赖链压力下降。若输入在缓存中，这种改法常能提高 IPC；若输入远大于 LLC 并且已经接近内存带宽上限，提升可能很小，因为瓶颈已经从依赖链迁移到数据移动。
+
+还要注意边界处理。第二个循环处理不能被四整除的尾部元素。很多性能示例为了简短直接假设长度是四的倍数，这是教材不应采用的写法。真实系统里，输入规模经常来自文件、网络或上层分片，不能为了微优化丢掉边界正确性。Compute Systems Engine 的 reference 测试必须覆盖空输入、一个元素、非对齐长度、负数和大规模输入，不能只测漂亮输入。
+
+\section{优化不是越展开越好}
+
+既然四个累加器能拆依赖链，是否八个、十六个更好？答案取决于机器、编译器和工作负载。展开过少，依赖链仍然限制后端；展开过多，会增加寄存器压力、代码体积和前端供给压力。寄存器不够时，编译器可能把临时值溢出到栈上，反而引入额外 load/store。代码体积变大时，热循环可能更容易超过微操作缓存或 instruction cache 的舒适范围。
+
+这就是本册反复强调的“瓶颈会迁移”。一个版本慢，是因为单累加器依赖；另一个版本慢，可能因为寄存器压力；再另一个版本慢，可能因为已经受内存带宽限制。优化不能只问“这个技巧有没有用”，要问“在当前证据下，它针对的是哪个瓶颈，改完后瓶颈会迁到哪里”。
+
+教材里常见的坏写法是直接给“最佳版本”。这种写法让读者只会背答案，不会分析。正确写法应保留 baseline，因为 baseline 是 correctness oracle；给出有限改进版本，因为它暴露优化动机；再说明它的边界，因为工程中没有永久最优版本。对求和来说，baseline 用于验证结果，多累加器用于解释依赖链，SIMD 版本用于解释向量执行，线程本地 partial 用于解释共享写和 false sharing，多线程版本用于解释带宽和 NUMA。这些版本不是重复代码，而是同一个问题在不同系统层面的投影。
+
+\section{不要把共享原子当作并行归约}
+
+很多初学者把并行求和写成多个线程同时对一个原子变量做加法。这个版本结果可能是正确的，却几乎一定不是好的归约实现。
+
+\begin{lstlisting}[language=C++,caption={反例：所有 worker 争用同一个原子和同一条 cache line}]
+std::int64_t sum_with_hot_atomic(std::span<const std::int32_t> values,
+                                 std::int32_t worker_count) {
+    std::atomic<std::int64_t> global_sum{0};
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(worker_count));
+
+    for (std::int32_t worker = 0; worker < worker_count; ++worker) {
+        const std::size_t begin =
+            values.size() * static_cast<std::size_t>(worker) /
+            static_cast<std::size_t>(worker_count);
+        const std::size_t end =
+            values.size() * static_cast<std::size_t>(worker + 1) /
+            static_cast<std::size_t>(worker_count);
+        workers.emplace_back([&values, &global_sum, begin, end]() {
+            for (std::size_t i = begin; i < end; ++i) {
+                global_sum.fetch_add(values[i], std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+    return global_sum.load(std::memory_order_relaxed);
+}
+\end{lstlisting}
+
+这里使用 \code{memory_order_relaxed} 并没有错，因为这个原子只用于统计自身数值，不发布其他对象。但 relaxed 只能减少顺序约束，不能消除一致性争用。所有线程仍在更新同一个 cache line。每一次 \code{fetch_add} 都要求对应 cache line 获得独占修改权，多个核心会反复争夺所有权。结果是用户以为自己写了“无锁高性能”，硬件看到的是一个极热的共享写点。
+
+正确方向通常是线程本地 partial。
+
+\begin{lstlisting}[language=C++,caption={工程版本：线程本地 partial，再串行合并}]
+struct alignas(64) PartialSum {
+    std::int64_t value = 0;
+};
+
+std::int64_t sum_with_partials(std::span<const std::int32_t> values,
+                               std::int32_t worker_count) {
+    std::vector<PartialSum> partials(static_cast<std::size_t>(worker_count));
+    std::vector<std::thread> workers;
+    workers.reserve(static_cast<std::size_t>(worker_count));
+
+    for (std::int32_t worker = 0; worker < worker_count; ++worker) {
+        const std::size_t begin =
+            values.size() * static_cast<std::size_t>(worker) /
+            static_cast<std::size_t>(worker_count);
+        const std::size_t end =
+            values.size() * static_cast<std::size_t>(worker + 1) /
+            static_cast<std::size_t>(worker_count);
+        workers.emplace_back([&values, &partials, worker, begin, end]() {
+            std::int64_t local = 0;
+            for (std::size_t i = begin; i < end; ++i) {
+                local += values[i];
+            }
+            partials[static_cast<std::size_t>(worker)].value = local;
+        });
+    }
+
+    for (std::thread& worker : workers) {
+        worker.join();
+    }
+
+    std::int64_t total = 0;
+    for (const PartialSum& partial : partials) {
+        total += partial.value;
+    }
+    return total;
+}
+\end{lstlisting}
+
+这个版本把热路径写共享变成线程本地写。每个 worker 在自己的寄存器里累加，结束时只写一次 partial。对齐槽位用于避免多个 partial 落在同一条 cache line 上形成 false sharing。它的代价也要写清楚：需要额外 partial 数组，需要合并阶段，线程创建和 join 也有成本。如果输入很小，线程成本可能超过计算成本；如果输入很大，局部顺序扫描加一次合并通常比热原子好得多。
+
+\section{从源码到汇编应该看什么}
+
+第一册已经讲过如何读汇编。第二册读汇编不是为了炫耀指令名，而是为了验证源码是否产生了符合预期的执行形态。看求和循环时，应至少关注四件事。
+
+第一，看编译器是否保留了循环。若结果没有被使用，优化器可能删除整个循环，benchmark 就变成空测。第二，看循环是否形成单累加器依赖，还是被编译器展开成多个累加器。现代编译器在优化级别较高时可能自动做循环展开和向量化，因此手写版本和编译器生成版本要放在同一编译选项下比较。第三，看是否有意外的内存访问。例如寄存器压力过大导致 spill，会在热循环中出现额外栈访问。第四，看是否有分支和调用留在热路径里。例如调试检查、虚调用、异常路径或不可内联函数都可能改变前端压力。
+
+下面是一份实验报告可以采用的观察顺序。先用 \cmd{objdump} 或编译器的汇编输出确认热循环；再用 \cmd{perf stat} 比较 cycles、instructions 和 IPC；然后改变输入规模，让数据分别处在 L1、L2、LLC 和内存范围；最后再改变版本，从 baseline 到多累加器到线程本地 partial。若只看一个规模，很容易把依赖瓶颈和内存瓶颈混在一起。
+
+\begin{deepdive}
+同一个源码版本，在不同编译器和不同优化级别下可能生成不同机器码。教材里的结论必须写成“分析方法”，不能写成“某段源码永远会生成某条指令”。严肃报告要记录编译器版本、目标架构、优化选项和关键汇编片段。
+\end{deepdive}
+
+\section{别名会限制编译器和硬件}
+
+处理器的乱序执行受真实依赖限制，编译器的优化也受别名限制。若函数接收两个指针，一个用于读，一个用于写，编译器必须考虑它们可能指向同一块内存。只要存在别名可能，编译器就不能随意重排 load 和 store，也不容易做激进向量化。硬件层面也类似，load/store queue 要判断后面的 load 是否可能读取前面尚未完成的 store。
+
+看一个简化例子。
+
+\begin{lstlisting}[language=C++,caption={别名不清会让优化更保守}]
+void add_scaled(std::span<const std::int32_t> input,
+                std::span<std::int32_t> output,
+                std::int32_t scale) {
+    const std::size_t count = std::min(input.size(), output.size());
+    for (std::size_t i = 0; i < count; ++i) {
+        output[i] += input[i] * scale;
+    }
+}
+\end{lstlisting}
+
+这个函数语义清晰，但它没有说明 \code{input} 和 \code{output} 是否重叠。若调用方传入同一数组的重叠视图，循环每一轮的写可能影响后续读。编译器为了保持 C++ 语义，必须保守。工程中解决别名问题不是靠随口告诉编译器“相信我”，而是靠 API 设计、数据所有权和测试约束。例如把输入输出设计成不同对象，文档声明不允许重叠，调试版本检查地址范围，或者把算法拆成先读后写的两阶段结构。底层性能问题常常来自上层接口没有表达清楚所有权。
+
+Compute Systems Engine 的数据流也要这样设计。输入数组应是只读 span，输出 partial 数组由运行时创建并按 worker 独占写入，合并阶段再读取 partial。这样 API 本身表达了“读输入”和“写 partial”不会互相别名，后续章节讨论线程池和任务图时也能延续这个边界。
+
+\section{分支预测案例：过滤计数}
+
+分支预测不是只影响 if 语句的理论概念。考虑一个常见内核：统计数组中大于阈值的元素数量。最直观版本如下。
+
+\begin{lstlisting}[language=C++,caption={baseline：带条件分支的过滤计数}]
+std::int64_t count_greater_branch(std::span<const std::int32_t> values,
+                                  std::int32_t threshold) {
+    std::int64_t count = 0;
+    for (const std::int32_t value : values) {
+        if (value > threshold) {
+            ++count;
+        }
+    }
+    return count;
+}
+\end{lstlisting}
+
+如果输入已经排序，或者绝大多数值都落在同一侧，分支预测器很容易猜对。若输入接近随机，且一半大于阈值，一半不大于阈值，预测会困难得多。错误预测导致流水线清空错误路径工作，短循环中的成本会被放大。
+
+可以写一个无显式分支版本。
+
+\begin{lstlisting}[language=C++,caption={改进方向：把条件变成整数贡献}]
+std::int64_t count_greater_branchless(std::span<const std::int32_t> values,
+                                      std::int32_t threshold) {
+    std::int64_t count = 0;
+    for (const std::int32_t value : values) {
+        count += value > threshold ? 1 : 0;
+    }
+    return count;
+}
+\end{lstlisting}
+
+这段源码仍然写了条件表达式，编译器可能生成条件移动、集合指令或向量比较，也可能仍生成分支，具体取决于目标架构和优化器。教材重点不是保证某种机器码，而是教读者提出可验证假设：随机输入下 branch miss 是否更高；无分支版本 instructions 是否增加；总时间是否下降；当输入分布从随机变成有序后，两个版本差距是否消失。如果这些现象吻合，就说明分支预测是主要因素之一。
+
+分支优化也有代价。把复杂 if 改成掩码运算，可能让所有路径都执行，增加算术或内存访问；把数据分组处理，可能增加预处理成本；把虚调用改成分发表，可能降低可读性。不要把“branchless”当作普遍更快。只有当分支不可预测且热路径短，减少分支才经常有收益。
+
+\section{前端瓶颈案例：热循环里的调用和大 switch}
+
+很多性能分析只盯着数据 cache，却忽略了前端供给。前端要取指、预测、译码和提供微操作。若热路径里有过多不可内联调用、异常边、模板膨胀后的大代码体、解释器式大 \code{switch} 或间接跳转，后端可能一直等不到足够微操作。
+
+一个典型案例是记录处理器。每条记录包含类型字段，不同类型执行不同处理逻辑。朴素实现可能把所有逻辑放进一个巨大的 \code{switch}，每个 case 又调用复杂函数。若输入类型分布随机，间接分支或多路分支预测困难；若每个 case 代码很大，instruction cache 和微操作缓存压力上升。优化方向可能不是“少做几次整数加法”，而是重排数据：先按类型分桶，再批量处理同类记录。这样做改变了控制流形状，让分支更稳定，也让热代码更集中。
+
+这类优化有一个重要边界：分桶会增加一次额外遍历和写入，还可能破坏原始顺序。若语义要求严格保持输入顺序，就需要额外索引或稳定输出；若记录数量很少，分桶成本超过收益；若每个记录处理非常重，分支成本可能不是主导。系统工程的结论永远要回到工作负载。
+
+\section{内存级并行度和指针追踪}
+
+乱序执行能隐藏一部分内存延迟，前提是窗口里有多个独立 load。顺序数组扫描虽然会 cache miss，但预取器能提前请求后续 cache line，多个 miss 可以同时飞行。链表遍历则不同：下一步地址存放在当前节点里，必须等当前节点加载完成后才知道下一次 load 地址。这种指针追踪几乎把内存访问串成依赖链。
+
+下面的代码形态看起来只是遍历节点，硬件看到的是一条地址依赖链。
+
+\begin{lstlisting}[language=C++,caption={指针追踪：下一次加载地址依赖当前加载结果}]
+struct Node {
+    std::int32_t value = 0;
+    Node* next = nullptr;
+};
+
+std::int64_t sum_list(const Node* head) {
+    std::int64_t sum = 0;
+    const Node* current = head;
+    while (current != nullptr) {
+        sum += current->value;
+        current = current->next;
+    }
+    return sum;
+}
+\end{lstlisting}
+
+这段代码不适合作为热路径大规模数据扫描的默认结构。它的每个节点可能来自不同页面，cache miss 和 TLB miss 都可能很高；下一节点地址不可提前知道，内存级并行度低；分配器还可能把节点分散到不同 NUMA 节点。若业务语义允许，把节点压缩成连续数组或索引数组，通常更适合现代 CPU。若必须使用链式结构，可以考虑批量处理多条独立链，让核心同时等待多个地址链；也可以使用池化分配，让节点尽量连续；还可以把热字段和冷字段分离，减少每个 cache line 带入的无用数据。
+
+\section{和编译器优化的边界}
+
+有些读者会问：既然编译器能展开、向量化、调度指令，为什么还要学习微架构？答案是，编译器非常强，但它不是业务语义的读心器。编译器不知道某个输入分布是否随机，不知道两个 span 在业务上是否必不重叠，不知道一把锁竞争是否来自热点 key，不知道任务粒度是否会造成线程池空转，也不知道分布式 shuffle 是否会遇到倾斜。它只能在 C++ 语义、目标架构和优化启发式内工作。
+
+软件工程师要做的是把真实语义表达给编译器和硬件。用连续容器表达顺序访问，用只读 span 表达输入不可修改，用线程本地 partial 表达写入独占，用稳定的数据分块表达可预测访问，用测试保证边界输入正确。高性能代码不是处处和编译器对抗，而是提供更清晰的结构，让编译器能安全优化，让硬件能持续执行。
+
+\section{Linux 与工具源码阅读入口}
+
+本章的 Linux 源码阅读不应从调度器全局策略开始，而应从性能证据的来源开始。若使用 \cmd{perf stat} 观察 cycles、instructions、branches 和 branch-misses，可以阅读 Linux 内核的 perf event 子系统入口，理解用户态工具如何请求硬件计数器、内核如何复用和调度计数器、权限如何限制某些事件。体系结构相关事件通常在 \filepath{arch/x86/events/} 一类目录下，通用框架在 \filepath{kernel/events/} 附近。不同内核版本路径会变化，读源码时必须记录版本。
+
+编译器源码阅读可以从优化报告开始，而不是直接钻进后端。GCC 和 Clang 都能输出向量化或优化诊断。读者可以先写两个循环，一个容易向量化，一个因为别名或分支不容易向量化；观察诊断后，再选择性阅读对应编译器文档或源码。目标不是成为编译器开发者，而是理解“为什么这段循环没被优化”的证据链。
+
+\section{本章落到贯穿项目}
+
+Compute Systems Engine 在本章至少要得到三个能力。第一，顺序 reference：\code{sequential_sum} 保持最直接写法，用它验证所有优化版本结果。第二，单核优化版本：增加多累加器或向量化实验，但每个版本都要保留 correctness check。第三，测量 harness：能以相同输入、相同编译选项、相同计时边界比较 baseline、多累加器、热原子和线程本地 partial。这里的目标不是立刻写最强归约，而是建立“同一问题跨层演化”的实验骨架。
+
+实验报告建议按下面结构写。先说明输入规模、数据类型和正确性 oracle；再说明 CPU 型号、编译器、优化选项、线程数和是否绑定；然后列出版本：baseline、四累加器、热原子、多线程 partial；最后解释每个版本的预期瓶颈和实际指标。若四累加器没有变快，不能直接说技巧无效，要检查编译器是否已经自动展开、输入是否被内存带宽限制、计时是否包含线程创建、以及结果是否被优化掉。
+
+\section{本章习题}
+
+\begin{exercisebox}
+习题一：为 \code{sum_baseline}、\code{sum_four_accumulators} 和当前项目里的 \code{parallel_sum} 写同一组正确性测试。输入必须包含空数组、单元素数组、长度不是四的倍数的数组、包含负数的数组和足够大的随机数组。报告每个测试验证的不是“跑得快”，而是哪一种语义边界。
+
+习题二：构造两个 \code{count_greater} 输入。第一个输入使分支非常可预测，第二个输入使分支接近随机。用 \cmd{perf stat} 记录 branches 和 branch-misses。若当前设备权限不足，写出你本来要运行的命令、预期现象和无法运行的原因。
+
+习题三：把一个链表求和改写成连续数组求和。要求说明两版在源码复杂度、内存布局、cache line、TLB、预取和对象生命周期上的差异。不要只写“数组更快”，要写清为什么更可能快，以及在哪些业务语义下不能直接替换。
+
+习题四：阅读当前项目的 \filepath{books/cpu-volume-2/labs/compute_systems/src/parallel_reduce.cpp}。指出 \code{parallel_sum} 的 correctness oracle、任务切分方式、线程创建成本、partial 写入位置和可能的 false sharing 风险。给出一个改进计划，但不要直接删除 baseline。
+\end{exercisebox}
+
 \begin{labbox}
 实验：写两个求和版本。第一个使用单累加器，第二个使用四个独立累加器。用 \cmd{perf stat} 比较 cycles、instructions 和 IPC。再构造一个带随机分支的版本，观察 branch-misses 对时间的影响。
 \end{labbox}

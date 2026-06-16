@@ -83,6 +83,123 @@ cold path: debug print
 
 很多布局优化失败，是因为同时改了太多东西：换容器、改算法、改线程数、改内存分配、改输入规模。这样即使变快，也不知道原因。教材实验必须强调单变量对照，让读者学会建立因果证据。
 
+\section{AoSoA：折中不是妥协}
+
+AoS 和 SoA 常被讲成二选一，但真实系统经常使用 AoSoA。它把数据按小块分组，每个块内部采用 SoA，块与块之间保持对象批次关系。这样可以让一个块适配 SIMD 宽度或缓存块，同时又不会把整个系统改造成完全分离的字段数组。粒子系统、物理模拟和向量数据库里都能看到类似结构。
+
+\begin{lstlisting}[language=C++,caption={AoSoA 的基本形态}]
+constexpr std::int32_t PARTICLE_BLOCK_WIDTH = 8;
+
+struct ParticleBlock {
+    std::array<float, PARTICLE_BLOCK_WIDTH> x;
+    std::array<float, PARTICLE_BLOCK_WIDTH> y;
+    std::array<float, PARTICLE_BLOCK_WIDTH> z;
+    std::array<float, PARTICLE_BLOCK_WIDTH> vx;
+    std::array<float, PARTICLE_BLOCK_WIDTH> vy;
+    std::array<float, PARTICLE_BLOCK_WIDTH> vz;
+};
+
+struct ParticleBlocks {
+    std::vector<ParticleBlock> blocks;
+    std::int32_t size = 0;
+};
+\end{lstlisting}
+
+这里的块宽度不是魔法数字。它可能来自 SIMD lane 数、cache line 大小、对齐要求、尾部处理成本和代码复杂度。块太小，循环层次变多但复用不足；块太大，尾部浪费和缓存压力上升。AoSoA 的价值是提供一个调节旋钮，让布局能同时服务向量化和对象组织。
+
+AoSoA 也有成本。随机访问第 \code{i} 个对象需要计算块号和块内偏移；插入删除比 \code{std::vector<Particle>} 更复杂；调试打印不如 AoS 直观；接口要隐藏布局细节，否则业务代码会到处写块索引。工程中通常把 AoSoA 封装在专用容器或视图后面，让热路径拿到高效访问，普通路径仍保持清晰 API。
+
+\section{访问矩阵如何落到代码}
+
+访问矩阵不是文档装饰，它应该直接影响类型设计。假设日志统计系统的每条记录有时间戳、用户 ID、事件类型、原始文本、解析状态和调试信息。热路径只需要用户 ID 和事件类型做聚合，原始文本只在错误报告时使用。如果把所有字段放在一个大结构里，聚合时每次都把冷字段附近的数据带入缓存。更好的设计是把热字段压成连续数组，把冷字段放在旁边，通过索引关联。
+
+\begin{lstlisting}[language=C++,caption={冷热分离的记录批次}]
+struct HotLogBatch {
+    std::vector<std::uint64_t> user_ids;
+    std::vector<std::int32_t> event_types;
+};
+
+struct ColdLogBatch {
+    std::vector<std::string> raw_lines;
+    std::vector<std::int32_t> parse_status;
+};
+
+struct LogBatch {
+    HotLogBatch hot;
+    ColdLogBatch cold;
+};
+\end{lstlisting}
+
+这个设计牺牲了“一个对象包含所有字段”的直观性，换来热路径更少的数据移动。它还让并发更容易：聚合 worker 可以只读 \code{hot}，错误处理线程再查看 \code{cold}。若业务经常需要完整记录，冷热分离可能不值得；若绝大多数请求只走热路径，它就很自然。布局设计必须从访问频率和访问组合出发。
+
+\section{索引优于指针的场景}
+
+指针直接表达对象关系，但在大规模数据结构中，索引常常更适合性能和序列化。索引可以是 \code{std::uint32_t} 或 \code{std::uint64_t}，指向连续数组中的位置。它比指针更紧凑，容易持久化和跨进程传递，也让对象搬迁和压缩更容易。图的邻接表、编译器 IR、游戏 ECS 和列式存储都大量使用索引。
+
+索引也有代价。每次访问需要多一步数组寻址；删除对象后要处理空洞、代际版本或稳定 ID；越界和悬空索引需要调试检查。若系统需要稳定引用，可以使用“索引加 generation”的句柄，避免旧索引误指向新对象。这个思想和无锁结构里的 ABA 类似：同一个位置再次被复用时，需要版本信息区分“看起来一样”和“语义上还是同一个对象”。
+
+\begin{lstlisting}[language=C++,caption={索引句柄表达稳定引用}]
+struct EntityId {
+    std::uint32_t index = 0;
+    std::uint32_t generation = 0;
+};
+
+struct EntitySlot {
+    std::uint32_t generation = 0;
+    bool alive = false;
+};
+\end{lstlisting}
+
+这里使用明确位宽类型，是为了让内存布局和序列化边界清楚。系统教材中不能随手使用 \code{long long} 这类平台相关宽度。布局设计和数据类型选择是一件事：类型宽度会影响结构体大小、cache 密度、文件格式和网络协议。
+
+\section{压缩、编码和计算成本}
+
+有时减少内存流量比减少计算更重要。列式数据库和搜索系统常把整数压缩成变长编码、差分编码或位图。这样每个元素读取的字节数减少，但解码需要额外 CPU。是否划算取决于瓶颈：若系统受内存带宽限制，压缩可能提高吞吐；若系统受计算限制，压缩可能变慢。
+
+这个权衡也出现在分布式 shuffle 中。压缩中间数据可以减少网络和磁盘 I/O，但会增加 CPU 时间和延迟。单机 cache 层面的“少搬字节，多做一点计算”和分布式层面的“少发网络，多做一点压缩”是同一个思想。教材应让读者从底层内存开始建立这种成本交换模型。
+
+\section{并发写布局}
+
+并发数据布局要先标出写者。字段是否共享，不看它是否在同一个结构体里，而看哪些线程写它、写入频率如何、是否落在同一 cache line 上。一个常见错误是把多个线程的统计字段放进同一个 \code{Stats} 数组，觉得每个线程写自己的下标就安全。结果每个字段很小，多个线程的字段落在同一条 cache line，形成 false sharing。
+
+更好的设计是把写热字段按写者分开，并且让每个写者独占 cache line 或至少独占写热点。读者汇总时再扫描这些槽位。若读取频率很高，可以维护分层汇总；若读取只是指标展示，可以接受延迟。并发布局本质上是在写入吞吐、读取成本和内存占用之间取舍。
+
+\begin{lstlisting}[language=C++,caption={线程本地统计槽位}]
+struct alignas(64) WorkerStats {
+    std::uint64_t tasks_executed = 0;
+    std::uint64_t steal_attempts = 0;
+    std::uint64_t empty_polls = 0;
+};
+
+std::vector<WorkerStats> stats(static_cast<std::size_t>(worker_count));
+\end{lstlisting}
+
+这类结构适合 worker 高频写自己的统计。它不适合每个请求都读取全局精确值。如果业务需要实时限流，统计槽位还要配合周期性汇总或原子发布。布局优化总是要回到语义。
+
+\section{迁移旧代码的策略}
+
+把成熟代码从 AoS 改成 SoA 或冷热分离，风险很高。直接大改会破坏接口、测试和调试习惯。稳妥策略是分阶段迁移。第一阶段写访问矩阵和性能证据，证明布局确实是瓶颈。第二阶段增加新布局的内部表示，但保留旧接口，通过 adapter 暴露兼容访问。第三阶段把热路径迁到新布局，保留 reference 对照。第四阶段逐步清理旧路径。
+
+迁移时要防止“双写不一致”。如果旧结构和新结构同时存在，更新必须保证二者一致，或者明确一个是权威数据，另一个是缓存。缓存需要失效策略；双写需要事务边界；延迟同步需要版本号。布局重构不是单纯换容器，而是数据所有权迁移。
+
+\section{本章落到贯穿项目}
+
+Compute Systems Engine 可以在本章加入两个实验模块。第一个是记录批处理模块：用 AoS、SoA 和冷热分离三种布局统计 key，比较热字段扫描、错误记录访问和内存占用。第二个是 worker stats 模块：紧凑统计槽位与 \code{alignas(64)} 槽位对照，观察多线程写入扩展性。这两个模块分别训练“读局部性”和“写共享”两种布局能力。
+
+项目代码不必一口气实现复杂 AoSoA 容器，但要把布局实验和 benchmark harness 接起来。每个布局版本必须使用同一份输入、同一个 reference 结果和同一组线程策略。否则布局差异会和算法差异混在一起。
+
+\section{本章习题}
+
+\begin{exercisebox}
+习题一：为一个日志统计系统写访问矩阵。字段至少包括时间戳、用户 ID、事件类型、原始文本、解析错误、调试标签。热路径至少包括解析、按用户聚合、错误输出和调试查询。根据矩阵给出布局方案。
+
+习题二：把一个指针链表设计改成索引数组设计。说明索引宽度、generation、删除策略、遍历局部性和序列化影响。不要只写“索引更快”，要写清生命周期如何保证。
+
+习题三：设计一个冷热分离迁移计划。要求保留旧接口、建立 reference 测试、说明双写或缓存一致性策略，并给出何时删除旧布局的条件。
+
+习题四：实现或设计 worker stats 的紧凑版和对齐版。报告每个版本的结构体大小、对齐、cache line 分布、写入线程和汇总成本。
+\end{exercisebox}
+
 \begin{labbox}
 实验：实现 AoS 和 SoA 两个版本的字段求和。比较顺序访问和随机访问。再构造两个线程分别写相邻字段和分离字段的场景，观察 false sharing。
 \end{labbox}
