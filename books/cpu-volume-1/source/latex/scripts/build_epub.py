@@ -178,6 +178,7 @@ class SourceEntry:
     source: Path | None = None
     title: str = ""
     label: str = ""
+    chapter_no: int | None = None
     part_id: str | None = None
     state: str = "main"
     appendix: bool = False
@@ -358,9 +359,16 @@ class LatexInline:
 
 
 class LatexBlockConverter:
-    def __init__(self, inline: LatexInline, heading_prefix: str = "") -> None:
+    def __init__(
+        self,
+        inline: LatexInline,
+        heading_prefix: str = "",
+        chapter_no: int | None = None,
+    ) -> None:
         self.inline = inline
         self.heading_prefix = heading_prefix
+        self.chapter_no = chapter_no
+        self.section_no = 0
         self.out: list[str] = []
         self.paragraph: list[str] = []
         self.list_stack: list[dict[str, object]] = []
@@ -438,10 +446,17 @@ class LatexBlockConverter:
                 level, title = heading
                 self.flush_paragraph()
                 if level == "chapter":
+                    self.section_no = 0
                     text = f"{self.heading_prefix} {self.inline.convert(title)}".strip()
                     self.out.append(f"<h1>{text}</h1>")
                 elif level == "section":
-                    self.out.append(f"<h2>{self.inline.convert(title)}</h2>")
+                    self.section_no += 1
+                    text = self.inline.convert(title)
+                    if self.chapter_no is not None:
+                        number = f"{self.chapter_no}.{self.section_no}"
+                        self.out.append(f'<h2><span class="section-number">{number}</span> {text}</h2>')
+                    else:
+                        self.out.append(f"<h2>{text}</h2>")
                 elif level == "subsection":
                     self.out.append(f"<h3>{self.inline.convert(title)}</h3>")
                 i += 1
@@ -897,6 +912,7 @@ def collect_entries(book_dir: Path) -> tuple[list[SourceEntry], list[PartNode]]:
                 source=source,
                 title=title,
                 label=label,
+                chapter_no=chapter_no if state == "mainmatter" else None,
                 part_id=current_part.ident if current_part else None,
                 state=state,
                 appendix=appendix,
@@ -978,7 +994,7 @@ def part_page(part: PartNode) -> str:
 def convert_source(entry: SourceEntry) -> str:
     assert entry.source is not None
     source = expand_source_inputs(entry.source, find_book_dir(entry.source))
-    converter = LatexBlockConverter(LatexInline(), heading_prefix=entry.label)
+    converter = LatexBlockConverter(LatexInline(), heading_prefix=entry.label, chapter_no=entry.chapter_no)
     body = converter.convert(source)
     return xhtml_page(entry.nav_title or entry.title, body)
 
@@ -1157,6 +1173,10 @@ h1 {
 }
 h2 {
   font-size: 1.22em;
+}
+.section-number {
+  color: #2a6f97;
+  margin-right: 0.35em;
 }
 h3 {
   font-size: 1.05em;
