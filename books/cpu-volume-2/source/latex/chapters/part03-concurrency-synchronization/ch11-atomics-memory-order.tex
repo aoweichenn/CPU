@@ -10,7 +10,7 @@
 
 \section{常见内存序}
 
-\code{memory\_order\_relaxed} 只保证原子性，不建立跨变量同步。计数器统计常用 relaxed，因为只关心最终数值。\code{memory\_order\_release} 发布写入，\code{memory\_order\_acquire} 获取发布的结果，二者配合可建立 happens-before。\code{memory\_order\_seq\_cst} 提供更强的全局顺序，但成本和约束也更强。
+\code{memory_order_relaxed} 只保证原子性，不建立跨变量同步。计数器统计常用 relaxed，因为只关心最终数值。\code{memory_order_release} 发布写入，\code{memory_order_acquire} 获取发布的结果，二者配合可建立 happens-before。\code{memory_order_seq_cst} 提供更强的全局顺序，但成本和约束也更强。
 
 选择内存序的原则是从语义出发，而不是从性能愿望出发。若一个线程写好对象后通过原子标志发布，写标志应 release，读标志应 acquire。若只是统计事件数量，relaxed 足够。
 
@@ -34,6 +34,8 @@ std::int32_t consumer(Shared& shared) {
 
 release store 之前的普通写，在 acquire load 看到该 store 后，对 consumer 可见。这里不能把 \code{ready} 简单改成普通 bool，也不能把 acquire/release 无脑改成 relaxed；否则程序缺少跨线程发布关系。
 
+理解 acquire/release 时，不要把它想成“刷新所有缓存”这样粗糙的动作。更准确的教材模型是：release 把之前的写放在发布点之前，acquire 在看到这个发布后，让之后的读写不能越过获取点，并建立 happens-before。具体硬件怎样实现，取决于架构强弱和编译器约束。C++ 程序只应依赖语言层面的同步关系。
+
 \section{Relaxed 的正确用途}
 
 Relaxed 常用于统计计数、采样标志、引用计数的某些阶段和不参与对象发布的指标。它保证原子变量自身不会数据竞争，但不保证其他变量的可见性。用 relaxed 写高性能代码时，必须能说清“我只需要这个原子变量自己的数值，不需要借它同步别的数据”。
@@ -45,6 +47,8 @@ Relaxed 常用于统计计数、采样标志、引用计数的某些阶段和不
 Compare-and-swap 读取旧值，若仍等于期望值就写入新值。无锁算法常用 CAS 循环处理竞争。CAS 失败不表示错误，而是说明其他线程已经修改状态，需要重新读取并尝试。
 
 CAS 循环必须考虑进度。低竞争时很快，高竞争时可能大量失败。复杂结构还要考虑 ABA：一个位置从 A 变 B 又变回 A，CAS 看到 A 可能误以为没有变化。解决方法包括版本号、hazard pointer、epoch 回收等。
+
+CAS 循环还必须考虑循环体里是否做了不可重复副作用。失败重试意味着循环体可能执行多次，如果每次尝试都分配内存、写日志、修改外部状态或增加不可回滚计数，就会产生额外语义问题。常见写法是先准备候选新状态，在 CAS 成功后才执行对外可见副作用；失败时只更新局部期望值并重试。
 
 \section{CAS 的 weak 和 strong 版本}
 
@@ -61,6 +65,16 @@ CAS 还有一个容易忽视的行为：失败时会把当前实际值写回 exp
 原子读改写通常会让目标 cache line 进入独占修改路径。多个核心同时对一个原子变量做 \code{fetch_add}，实际上是在争夺同一条 cache line 的所有权。内存序越强，编译器和硬件重排空间越小；竞争越强，一致性流量越大。
 
 这就是为什么高性能计数常用分片计数器。每个线程或每个核心写自己的本地计数，读取总数时再合并。它牺牲实时精确读取成本，换取写入热路径扩展性。
+
+\section{内存序选择流程}
+
+选择内存序可以按问题反推。第一，是否只需要原子变量自身不撕裂、不数据竞争。如果是统计计数，通常 relaxed 足够。第二，是否通过某个原子变量发布了其他普通数据。如果是，需要 release/acquire 或更强同步。第三，是否需要多个线程观察到一个全局一致顺序。如果确实需要，才考虑 \code{memory_order_seq_cst}。第四，是否可以用 mutex 表达更清晰的不变量。如果共享状态复杂，mutex 往往比一组难懂的原子更可靠。
+
+内存序不是性能调参旋钮。把 \code{memory_order_seq_cst} 改成 relaxed 之前，必须写出被保留的同步关系和被放弃的顺序关系。若写不出来，说明程序设计还没清楚到可以安全降级。
+
+\section{x86 和 ARM 的差异}
+
+x86-64 的内存模型相对强，很多 acquire/release 在硬件指令上看起来很轻；ARM 等架构更弱，可能需要更显式的屏障。可移植 C++ 代码不能因为在 x86 上测试通过，就省略必要内存序。教材示例必须按 C++ 语义写正确，而不是按某台机器的偶然行为写正确。
 
 \begin{labbox}
 实验：比较 mutex counter 和 atomic counter。在低线程数和高线程数下记录耗时。解释 relaxed 为什么适合这个计数器，也说明它为什么不能替代对象发布同步。
