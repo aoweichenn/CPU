@@ -24,4 +24,4 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(algorithm_book_tests PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
-add_test(NAME algorithm_book_tests COMMAND algorithm_book_tests)
+add_test(NAME algorithm_book_tests COMMAND $<TARGET_FILE:algorithm_book_tests>)

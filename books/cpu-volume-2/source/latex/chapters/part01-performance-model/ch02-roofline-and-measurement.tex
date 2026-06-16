@@ -1,0 +1,64 @@
+\chapter{Roofline 模型与可信测量}
+
+性能优化最危险的习惯，是看到时间变短就认为自己理解了原因。时间只是结果，不是解释。一个程序变快，可能是指令少了，可能是缓存命中好了，可能是编译器做了新的向量化，也可能只是输入刚好留在缓存里。Roofline 模型提供了一个粗但非常有用的坐标系：横轴看计算强度，也就是每搬一个字节做多少操作；纵轴看实际吞吐；硬件的计算峰值和内存带宽给出上界。
+
+\section{计算强度的意义}
+
+\term{计算强度}{arithmetic intensity} 定义为操作数除以字节数。若一个算子做了很多乘加，但只需要少量数据并能反复复用，那么计算强度高；若一个算子只是读一个元素、做很少计算、写一个元素，那么计算强度低。高计算强度算子更可能被浮点吞吐限制，低计算强度算子更可能被内存带宽限制。
+
+例如向量加法 $C=A+B$，每个元素读两个 float、写一个 float，大约移动十二个字节，只做一次加法，计算强度很低。矩阵乘 $C=A B$ 如果分块做得好，每个块里的元素会被重复使用，计算强度可以很高。Softmax 介于两者之间：它有指数、求和和除法，看起来计算不少，但通常需要多次扫描同一行，还涉及数值稳定性和归约，最终瓶颈取决于行长度、实现方式和向量化程度。
+
+\begin{deepdive}
+Roofline 不是精确模拟器。它不会告诉你分支预测、端口压力、TLB miss、依赖链、前端解码和线程同步的全部细节。它的价值在于先排除不可能：如果计算强度很低，而你的吞吐已经接近内存带宽上界，再继续手写 FMA 通常不会带来数量级提升。
+\end{deepdive}
+
+\section{建立测量边界}
+
+可信测量要先定义边界。测单个内核时，输入数据是否包含初始化时间，是否包含内存分配，是否包含线程池创建，是否包含随机数生成，都必须说清楚。测端到端推理时，也要区分 prefill、decode、采样、IO、tokenization 和模型计算。边界不同，数字没有可比性。
+
+最小的 benchmark 应该至少记录五件事：机器和编译器信息、输入形状、重复次数、预热策略、计时范围。预热的目的不是“让数字好看”，而是让动态链接、页错误、缓存冷启动、频率变化等一次性成本不污染稳定阶段。重复次数不能机械固定，应当让总运行时间足够长，避免计时器分辨率和调度抖动主导结果。
+
+\begin{lstlisting}[language=C++,caption={最小计时框架：只计核心循环}]
+#include <chrono>
+#include <cstdint>
+#include <functional>
+#include <iostream>
+
+double measure_seconds(const std::function<void()>& work,
+                       std::int32_t warmup,
+                       std::int32_t repeat) {
+    for (std::int32_t i = 0; i < warmup; ++i) {
+        work();
+    }
+
+    const auto begin = std::chrono::steady_clock::now();
+    for (std::int32_t i = 0; i < repeat; ++i) {
+        work();
+    }
+    const auto end = std::chrono::steady_clock::now();
+    const std::chrono::duration<double> elapsed = end - begin;
+    return elapsed.count() / static_cast<double>(repeat);
+}
+\end{lstlisting}
+
+这个框架仍然很朴素。真实项目中还要防止编译器把结果优化掉，要固定输入或记录随机种子，要把输出校验和写到不可优化的位置，要记录 CPU 频率策略。若测多线程，还要说明线程数、亲和性、NUMA 节点和是否与系统其他任务竞争。
+
+\section{计数器证据}
+
+时间告诉我们结果，性能计数器帮助解释原因。在 Linux 上常用 perf stat、perf record 和 perf report。对于本册的主题，常看的指标可以分成三类：执行侧看 cycles、instructions、branches 和 branch-misses；缓存侧看 cache-references、cache-misses、L1 data cache load misses、LLC misses 和 dTLB misses；平台相关部分再补充 SIMD 浮点计数器和内存带宽事件。
+
+计数器也有误差。不同 CPU 的事件名不同，虚拟化环境可能屏蔽部分事件，过短程序的采样不稳定，多线程程序的进程级计数可能混入调度影响。因此计数器不能机械崇拜，而要与模型对照。若 Roofline 估算认为程序应受内存限制，而 perf 显示 LLC miss 和带宽很高，这两者互相支持；若计数器与模型冲突，就要检查输入规模、缓存热度、编译选项和测量边界。
+
+\begin{labbox}
+实验建议：写三个内核，分别是向量加法、点积和朴素矩阵乘。对每个内核记录运行时间、估算 FLOPs、估算读写字节，并用 \cmd{perf stat} 查看 cycles、instructions 和 cache-misses。观察哪个内核更接近内存带宽问题，哪个内核更接近计算吞吐问题。
+\end{labbox}
+
+\section{从数字回到决策}
+
+测量的最终目的不是报一个漂亮数字，而是做决策。若一个矩阵乘只有理论峰值的百分之五，且 cache miss 很高，那么下一步可能是改循环顺序、分块或 packing；若一个逐元素激活已经达到很高内存带宽，那么下一步可能是算子融合，减少中间张量读写；若多线程从四核到八核不再加速，那么下一步要看带宽饱和、任务粒度、同步和 NUMA。
+
+这就是本册后续章节的工作方式。每个技术点都要回到三个问题：它改变了计算账本还是内存账本，它把瓶颈从哪里移动到哪里，它能被什么实验验证。无法回答这三个问题的优化，最多算一次尝试，不能算工程结论。
+
+\begin{warningbox}
+不要只报告最快一次。最快一次通常最不代表真实服务，因为它避开了调度抖动、缓存冷启动和尾延迟。教材中的内核实验可以看平均值，系统实验还要看分位数和稳定性。
+\end{warningbox}

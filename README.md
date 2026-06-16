@@ -5,6 +5,7 @@
 当前正式书籍：
 
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
+- `books/cpu-volume-2/`：CPU 高性能与 AI 计算教材第二册，主题是性能模型、缓存和数据布局、SIMD、矩阵乘、卷积、Attention、量化、线程运行时和源码阅读。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 
 规划中的新书可以继续放到 `books/` 下，例如 C++ 语言、编译器、操作系统、AI 系统等方向。
@@ -19,6 +20,13 @@ books/
     labs/              # 与本书绑定的代码实验
     reports/           # 报告模板和学习报告
     results/           # 实验输出，默认只跟踪 .gitkeep
+    tools/             # 本书专用脚本
+  cpu-volume-2/
+    source/latex/      # 第二册正式 LaTeX 书稿，生成 PDF/EPUB
+    materials/         # 草稿、课程计划、素材、参考资料
+    labs/              # 与本书绑定的代码实验
+    reports/           # 报告模板和学习报告
+    results/           # 实验输出
     tools/             # 本书专用脚本
   algorithm-interview/
     source/latex/      # 算法面试书正式 LaTeX 主稿
@@ -59,6 +67,15 @@ make cpu-lab00
 make cpu-coverage
 ```
 
+生成第二册 PDF 和 EPUB：
+
+```bash
+make cpu2-check
+make cpu2-pdf
+make cpu2-epub
+make cpu2-text-count
+```
+
 检查和测试算法面试书：
 
 ```bash
@@ -83,6 +100,15 @@ cd books/algorithm-interview
 make check
 make pdf
 make test
+```
+
+第二册也可以进入单本书目录执行：
+
+```bash
+cd books/cpu-volume-2
+make check
+make pdf
+make epub
 ```
 
 ## CMake 构建
@@ -137,6 +163,17 @@ books/<book-id>/
 - 16 周执行计划：`books/cpu-volume-1/materials/x86_64_hpc_ai_16_week_bootcamp.md`
 - Markdown 草稿素材：`books/cpu-volume-1/materials/drafts/README.md`
 - Lab 00：`books/cpu-volume-1/labs/lab00_benchmark_foundation/README.md`
+
+## 当前第二册入口
+
+- 第二册说明：`books/cpu-volume-2/README.md`
+- 正式主稿：`books/cpu-volume-2/source/latex/main.tex`
+- 全书结构：`books/cpu-volume-2/source/latex/outline/book-architecture.tex`
+- 性能模型主线：`books/cpu-volume-2/source/latex/chapters/part01-performance-model/`
+- 内存和 SIMD 主线：`books/cpu-volume-2/source/latex/chapters/part02-memory-simd/`
+- 张量内核主线：`books/cpu-volume-2/source/latex/chapters/part03-tensor-kernels/`
+- Transformer 推理主线：`books/cpu-volume-2/source/latex/chapters/part04-transformer-inference/`
+- 量化和运行时主线：`books/cpu-volume-2/source/latex/chapters/part05-quant-runtime/`
 
 ## 当前算法面试书入口
 

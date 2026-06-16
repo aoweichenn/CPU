@@ -1,0 +1,94 @@
+\chapter{矩阵乘：从三重循环到性能结构}
+
+矩阵乘是 AI 计算里最重要的内核之一。全连接层、卷积降维、Transformer 的投影、MLP、Attention 中的 $QK^T$ 和 $PV$ 都可以直接或间接落到 GEMM。矩阵乘的公式很简单：$C_{ij} = \sum_k A_{ik}B_{kj}$。困难在于，这个公式对应的数据访问和复用空间极大，朴素三重循环通常离硬件上限很远。
+
+\section{先看最朴素的三重循环}
+
+假设矩阵按行主序存储，$A$ 的形状是 $M \times K$，$B$ 的形状是 $K \times N$，$C$ 的形状是 $M \times N$。最直接的写法如下。
+
+\begin{lstlisting}[language=C++,caption={朴素 GEMM：按 i、j、k 顺序计算}]
+#include <cstdint>
+#include <span>
+
+void gemm_ijk(std::span<const float> a,
+              std::span<const float> b,
+              std::span<float> c,
+              std::int32_t m,
+              std::int32_t n,
+              std::int32_t k_size) {
+    for (std::int32_t i = 0; i < m; ++i) {
+        for (std::int32_t j = 0; j < n; ++j) {
+            float acc = 0.0F;
+            for (std::int32_t k = 0; k < k_size; ++k) {
+                const float av =
+                    a[static_cast<std::size_t>(i) * k_size + k];
+                const float bv =
+                    b[static_cast<std::size_t>(k) * n + j];
+                acc += av * bv;
+            }
+            c[static_cast<std::size_t>(i) * n + j] = acc;
+        }
+    }
+}
+\end{lstlisting}
+
+这个版本对 $A$ 的访问是顺序的，对 $B$ 的访问是跨行跳跃的：固定 $j$，$k$ 每增加一，地址增加 $N$ 个 float。如果 $N$ 很大，每次访问 $B$ 都可能落在新的 cache line 上。数学上，$B$ 的同一行会被多个 $j$ 使用，$A$ 的同一个元素会被多个输出列使用，但这个循环顺序并没有很好地让缓存捕获这些复用。
+
+\section{循环顺序改变复用位置}
+
+把循环顺序改成 $i,k,j$，可以让 $B$ 的一整行被顺序扫描，同时让 $A_{ik}$ 复用于多个输出列。代码如下。
+
+\begin{lstlisting}[language=C++,caption={按 i、k、j 顺序暴露 A 元素对一行 C 的复用}]
+#include <algorithm>
+#include <cstdint>
+#include <span>
+
+void gemm_ikj(std::span<const float> a,
+              std::span<const float> b,
+              std::span<float> c,
+              std::int32_t m,
+              std::int32_t n,
+              std::int32_t k_size) {
+    std::fill(c.begin(), c.end(), 0.0F);
+    for (std::int32_t i = 0; i < m; ++i) {
+        for (std::int32_t k = 0; k < k_size; ++k) {
+            const float av =
+                a[static_cast<std::size_t>(i) * k_size + k];
+            for (std::int32_t j = 0; j < n; ++j) {
+                c[static_cast<std::size_t>(i) * n + j] +=
+                    av * b[static_cast<std::size_t>(k) * n + j];
+            }
+        }
+    }
+}
+\end{lstlisting}
+
+这个版本常常比 $i,j,k$ 顺序更友好，因为内层 $j$ 顺序访问 $B$ 和 $C$。但它也带来新问题：$C$ 的同一行会被反复读写 $K$ 次。如果 $N$ 很大，$C$ 行不能稳定留在高层缓存里，读写流量仍然很高。矩阵乘优化不是找到一个永远最好的循环顺序，而是让 $A$、$B$、$C$ 的工作块同时适合缓存和寄存器。
+
+\section{复杂度相同，常数完全不同}
+
+两个版本的时间复杂度都是 \complexity{O(MKN)}，但性能可能差很多。这说明大 O 只能描述增长阶，不能描述内存层级、SIMD 和常数因素。对于 AI 内核，复杂度分析仍然有用，因为它告诉我们计算量规模；但要预测真实性能，还必须把地址序列和复用结构写出来。
+
+矩阵乘有一个重要性质：每个 $A_{ik}$ 会参与 $N$ 个输出，每个 $B_{kj}$ 会参与 $M$ 个输出。如果能把一小块 $A$ 和一小块 $B$ 留在缓存或寄存器里，它们就能产生一小块 $C$ 的许多结果。这就是分块的基本动机。后面的章节会看到，工业 GEMM 把这个思想分成多层：L3 cache 级别的大块、L2 cache 级别的 panel、L1 cache 级别的 packed block、寄存器级别的 micro tile。
+
+\begin{keyidea}
+矩阵乘快，不是因为公式神秘，而是因为它有高复用潜力。优化的核心是让这种潜力真实落到缓存、寄存器和 SIMD lane 上，而不是只停留在数学表达式里。
+\end{keyidea}
+
+\section{误差和累加顺序}
+
+浮点矩阵乘还涉及数值问题。不同循环顺序、不同分块、不同 SIMD 归约顺序，可能得到略有差异的结果，因为浮点加法不满足严格结合律。高性能库通常接受这种微小差异，并用误差容忍检查正确性。教材实验中不要用完全相等比较 float，而应使用绝对误差和相对误差。
+
+\begin{lstlisting}[language=C++,caption={浮点结果检查：同时看绝对误差和相对误差}]
+#include <cmath>
+
+bool close_enough(float actual, float expected) {
+    const float abs_error = std::fabs(actual - expected);
+    const float scale = std::max(1.0F, std::fabs(expected));
+    return abs_error <= 1.0e-4F * scale;
+}
+\end{lstlisting}
+
+\begin{exercisebox}
+实现 $i,j,k$ 和 $i,k,j$ 两个版本，使用相同输入验证结果接近。随后固定 $M$ 和 $K$，逐步增加 $N$，观察两个版本的差距如何变化。把观察结果和 $B$、$C$ 的访问轨迹联系起来解释。
+\end{exercisebox}
