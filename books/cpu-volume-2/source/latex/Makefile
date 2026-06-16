@@ -13,7 +13,7 @@ pdf:
 
 epub:
 	@BOOK_TITLE="从 C++ 到 AI 计算：第二册" \
-	BOOK_SUBTITLE="SIMD、矩阵乘、卷积、Attention、量化与高性能推理" \
+	BOOK_SUBTITLE="Linux 现代 CPU、多核并发、AI 基础、算子开发与量化推理引擎" \
 	BOOK_AUTHOR="CPU Performance Study" \
 	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables
 

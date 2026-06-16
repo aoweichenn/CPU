@@ -1,6 +1,6 @@
 # LaTeX 正式书稿工程
 
-这是 `books/cpu-volume-2` 的正式教材工程。第二册主题是现代 CPU 上的高性能 AI 计算：性能模型、缓存和数据布局、SIMD、矩阵乘、卷积、Attention、量化、并行运行时和源码阅读。
+这是 `books/cpu-volume-2` 的正式教材工程。第二册主题是 Linux 上的现代 CPU 性能工程、多核心并发、缓存和 TLB、SIMD、软件优化、AI 基础、算子开发，以及本地 CPU 量化推理引擎实现。
 
 ## 构建命令
 
@@ -30,3 +30,4 @@ make text-count
 - 性能结论必须配合计算量、内存流量、输入形状和测量边界。
 - C++ 示例使用位宽明确的整数类型，例如 `std::int32_t`、`std::int64_t` 和 `std::uint64_t`。
 - 不把源码阅读写成函数列表，要围绕数据结构、热路径、benchmark 和工程报告展开。
+- 贯穿项目是 `labs/linux_cpu_inference/`，后续扩写要让章节内容能落到这个项目上。

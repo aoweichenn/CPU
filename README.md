@@ -5,7 +5,7 @@
 当前正式书籍：
 
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
-- `books/cpu-volume-2/`：CPU 高性能与 AI 计算教材第二册，主题是性能模型、缓存和数据布局、SIMD、矩阵乘、卷积、Attention、量化、线程运行时和源码阅读。
+- `books/cpu-volume-2/`：CPU 高性能与 AI 计算教材第二册，主题是 Linux 现代 CPU、多核心并发、锁、缓存、TLB、SIMD、AI 基础、算子开发和本地量化推理引擎。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 
 规划中的新书可以继续放到 `books/` 下，例如 C++ 语言、编译器、操作系统、AI 系统等方向。
@@ -169,11 +169,13 @@ books/<book-id>/
 - 第二册说明：`books/cpu-volume-2/README.md`
 - 正式主稿：`books/cpu-volume-2/source/latex/main.tex`
 - 全书结构：`books/cpu-volume-2/source/latex/outline/book-architecture.tex`
-- 性能模型主线：`books/cpu-volume-2/source/latex/chapters/part01-performance-model/`
-- 内存和 SIMD 主线：`books/cpu-volume-2/source/latex/chapters/part02-memory-simd/`
-- 张量内核主线：`books/cpu-volume-2/source/latex/chapters/part03-tensor-kernels/`
-- Transformer 推理主线：`books/cpu-volume-2/source/latex/chapters/part04-transformer-inference/`
-- 量化和运行时主线：`books/cpu-volume-2/source/latex/chapters/part05-quant-runtime/`
+- Linux 性能工程主线：`books/cpu-volume-2/source/latex/chapters/part01-performance-model/`
+- 内存与 SIMD 主线：`books/cpu-volume-2/source/latex/chapters/part02-memory-simd/`
+- 并发同步主线：`books/cpu-volume-2/source/latex/chapters/part02-multicore-concurrency/`
+- AI 基础主线：`books/cpu-volume-2/source/latex/chapters/part03-ai-foundations/`
+- 算子开发主线：`books/cpu-volume-2/source/latex/chapters/part04-operator-development/`
+- 量化推理运行时主线：`books/cpu-volume-2/source/latex/chapters/part05-quant-runtime/`
+- 贯穿项目：`books/cpu-volume-2/labs/linux_cpu_inference/`
 
 ## 当前算法面试书入口
 

@@ -7,7 +7,7 @@
 | book id | status | description |
 |---|---|---|
 | `cpu-volume-1` | active | CPU 底层原理教材第一册：程序、C++、二进制、x86-64、汇编、Linux 工具链和性能测量。 |
-| `cpu-volume-2` | active | CPU 高性能与 AI 计算教材第二册：性能模型、缓存和数据布局、SIMD、矩阵乘、卷积、Attention、量化、线程运行时和源码阅读。 |
+| `cpu-volume-2` | active | CPU 高性能与 AI 计算教材第二册：Linux 现代 CPU、多核心并发、锁、缓存、TLB、SIMD、AI 基础、算子开发和本地量化推理引擎。 |
 | `algorithm-interview` | active | 算法刷题与 C++ 面试教材：LaTeX 正式书稿，覆盖数据结构、算法原理、暴力到优化、C++ 容器、力扣题单、训练路线和面试表达。 |
 
 ## 书籍目录规范
