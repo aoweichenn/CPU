@@ -15,7 +15,7 @@ epub:
 	@BOOK_TITLE="算法刷题与 C++ 面试教材" \
 	BOOK_SUBTITLE="数据结构、算法设计、复杂度证明与工程化题解" \
 	BOOK_AUTHOR="Algorithm Interview Study" \
-	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images
+	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables
 
 text-count:
 	@python3 scripts/count_text_units.py

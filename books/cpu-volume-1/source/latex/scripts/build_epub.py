@@ -27,6 +27,7 @@ BOOK_TITLE = os.environ.get("BOOK_TITLE", "从 C++ 到机器执行：第一册")
 BOOK_SUBTITLE = os.environ.get("BOOK_SUBTITLE", "底层原理、汇编接口与可信性能测量")
 BOOK_AUTHOR = os.environ.get("BOOK_AUTHOR", "CPU Performance Study")
 BOOK_LANG = os.environ.get("BOOK_LANG", "zh-CN")
+EPUB_LINEARIZE_TABLES = os.environ.get("EPUB_LINEARIZE_TABLES", "").lower() in {"1", "true", "yes", "on"}
 
 BOX_TITLES = {
     "keyidea": "核心思想",
@@ -364,10 +365,12 @@ class LatexBlockConverter:
         inline: LatexInline,
         heading_prefix: str = "",
         chapter_no: int | None = None,
+        linearize_tables: bool = False,
     ) -> None:
         self.inline = inline
         self.heading_prefix = heading_prefix
         self.chapter_no = chapter_no
+        self.linearize_tables = linearize_tables
         self.section_no = 0
         self.out: list[str] = []
         self.paragraph: list[str] = []
@@ -396,7 +399,7 @@ class LatexBlockConverter:
                 if env == "tabular":
                     table, i = collect_environment(lines, i, env)
                     self.flush_paragraph()
-                    self.out.append(render_table(table, self.inline))
+                    self.out.append(render_table(table, self.inline, linearize=self.linearize_tables))
                     continue
                 if env in LIST_ENV:
                     self.flush_paragraph()
@@ -736,23 +739,46 @@ def parse_heading(line: str) -> tuple[str, str] | None:
     return None
 
 
-def render_table(source: str, inline: LatexInline) -> str:
+def render_table(source: str, inline: LatexInline, linearize: bool = False) -> str:
     cleaned = re.sub(r"\\(toprule|midrule|bottomrule|hline)", "\n", source)
     cleaned = cleaned.replace(r"\tabularnewline", r"\\")
     rows = [row.strip() for row in re.split(r"\\\\", cleaned) if row.strip()]
-    out = ['<table class="book-table">']
-    for row_index, row in enumerate(rows):
+    parsed_rows: list[list[str]] = []
+    for row in rows:
         if row.startswith(r"\end"):
             continue
         cells = [cell.strip() for cell in split_table_row(row)]
-        if not cells:
-            continue
+        if cells:
+            parsed_rows.append(cells)
+
+    if linearize:
+        return render_linearized_table(parsed_rows, inline)
+
+    out = ['<table class="book-table">']
+    for row_index, cells in enumerate(parsed_rows):
         tag = "th" if row_index == 0 else "td"
         out.append("<tr>")
         for cell in cells:
             out.append(f"<{tag}>{inline.convert(cell)}</{tag}>")
         out.append("</tr>")
     out.append("</table>")
+    return "\n".join(out)
+
+
+def render_linearized_table(rows: list[list[str]], inline: LatexInline) -> str:
+    if not rows:
+        return ""
+
+    out = ['<dl class="book-table-list">']
+    for row in rows:
+        label = row[0]
+        detail = "；".join(cell for cell in row[1:] if cell)
+        if not detail:
+            out.append(f"<dt>{inline.convert(label)}</dt>")
+            continue
+        out.append(f"<dt>{inline.convert(label)}</dt>")
+        out.append(f"<dd>{inline.convert(detail)}</dd>")
+    out.append("</dl>")
     return "\n".join(out)
 
 
@@ -994,7 +1020,12 @@ def part_page(part: PartNode) -> str:
 def convert_source(entry: SourceEntry) -> str:
     assert entry.source is not None
     source = expand_source_inputs(entry.source, find_book_dir(entry.source))
-    converter = LatexBlockConverter(LatexInline(), heading_prefix=entry.label, chapter_no=entry.chapter_no)
+    converter = LatexBlockConverter(
+        LatexInline(),
+        heading_prefix=entry.label,
+        chapter_no=entry.chapter_no,
+        linearize_tables=EPUB_LINEARIZE_TABLES,
+    )
     body = converter.convert(source)
     return xhtml_page(entry.nav_title or entry.title, body)
 
@@ -1278,6 +1309,22 @@ li {
   font-weight: bold;
   background: #f7f7f5;
 }
+.book-table-list {
+  margin: 0.85em 0;
+  padding: 0;
+}
+.book-table-list dt {
+  font-weight: 700;
+  color: #174e70;
+  margin: 0.55em 0 0.12em;
+}
+.book-table-list dd {
+  margin: 0 0 0.5em 1.2em;
+  padding: 0;
+}
+.book-table-list dd p {
+  text-indent: 0;
+}
 .cover {
   min-height: 80vh;
   display: flex;
@@ -1397,7 +1444,17 @@ def validate_no_embedded_images(output: Path) -> None:
         raise RuntimeError("EPUB contains image content; " + "; ".join(details))
 
 
-def build_epub(book_dir: Path, output: Path, include_cover: bool = True, forbid_images: bool = False) -> None:
+def build_epub(
+    book_dir: Path,
+    output: Path,
+    include_cover: bool = True,
+    forbid_images: bool = False,
+    linearize_tables: bool | None = None,
+) -> None:
+    global EPUB_LINEARIZE_TABLES
+    if linearize_tables is not None:
+        EPUB_LINEARIZE_TABLES = linearize_tables
+
     entries, parts = collect_entries(book_dir, include_cover=include_cover)
     fonts = collect_embedded_fonts()
     uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{BOOK_TITLE}"))
@@ -1457,6 +1514,12 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         action="store_true",
         help="Fail the build if the EPUB contains image files or image markup.",
     )
+    parser.add_argument(
+        "--linearize-tables",
+        action="store_true",
+        default=EPUB_LINEARIZE_TABLES,
+        help="Render LaTeX tabular environments as text definition lists instead of XHTML tables.",
+    )
     return parser.parse_args(list(argv))
 
 
@@ -1467,6 +1530,7 @@ def main(argv: Iterable[str]) -> int:
         args.output.resolve(),
         include_cover=not args.no_cover_page,
         forbid_images=args.forbid_images,
+        linearize_tables=args.linearize_tables,
     )
     print(args.output.resolve())
     return 0
