@@ -291,6 +291,7 @@ class LatexInline:
 
         one_arg = {
             "code": "code",
+            "codeesc": "code",
             "cmd": "code",
             "filepath": "code",
             "register": "code",
