@@ -1,0 +1,368 @@
+\chapter{Linux 源码阅读案例}
+
+\section{为什么第一册要读 Linux 源码}
+
+第一册的主线是从 C/C++ 源码追到机器执行，再追到可信测量。Linux 源码阅读不是额外装饰，而是把这条主线接到真实操作系统实现上。前面章节讲进程、虚拟地址空间、ELF 加载、系统调用、\filepath{/proc}、调度噪声和 \code{perf} 时，如果只停留在概念层，读者仍然会把操作系统当成黑盒；若能读几条窄而清楚的 Linux 源码路径，就能知道用户态程序和内核之间的边界究竟在哪里。
+
+不过，源码阅读必须控制范围。第一册不要求读完整 Linux 内核，不要求理解所有锁、RCU、内存回收、文件系统和调度策略。它只要求读者能围绕一个具体问题，找到相关源码入口，顺着少量关键函数读出事实，并把事实和本书前面的工具证据连起来。
+
+\begin{keyidea}
+Linux 源码阅读的目标不是背函数名，而是训练一条证据链：用户态现象、系统调用或文件接口、内核源码入口、关键数据结构、返回路径、可复现实验。
+\end{keyidea}
+
+\section{准备源码和记录版本}
+
+阅读内核源码前，必须先固定版本。Linux 内核发展很快，同一个机制在不同版本里函数名、文件位置和调用路径都可能变化。报告里如果只写“Linux 源码中这样实现”，通常是不合格的；更准确的写法是“在 Linux 某个 tag 或某个 commit 中，观察到如下路径”。
+
+推荐准备一个单独源码目录：
+
+\begin{lstlisting}[language=bash]
+mkdir -p ~/src
+cd ~/src
+git clone --depth=1 https://github.com/torvalds/linux.git linux-src
+cd linux-src
+git rev-parse HEAD
+git describe --tags --always
+\end{lstlisting}
+
+如果网络或存储受限，也可以使用发行版提供的 kernel source 包，或者只下载某个 release tarball。无论来源是什么，都要记录：
+
+\begin{itemize}
+  \item 源码来源，是上游 Linux、发行版源码包，还是 Android/common kernel。
+  \item commit hash 或 release tag。
+  \item 本机运行内核版本，可用 \code{uname -a} 记录。
+  \item 阅读工具和搜索命令。
+  \item 你是否真的编译运行了这个内核。多数第一册实验只读源码，不要求运行自编译内核。
+\end{itemize}
+
+\begin{warningbox}
+不要把“正在运行的内核版本”和“你下载的源码版本”混为一谈。除非你确认二者对应，否则源码只能用来理解机制，不能直接证明当前机器内核的精确实现。
+\end{warningbox}
+
+\section{源码阅读工具}
+
+第一册阶段优先使用简单工具。复杂 IDE 可以提高效率，但不应替代基本搜索能力。
+
+\begin{lstlisting}[language=bash]
+rg -n "SYSCALL_DEFINE.*write" .
+rg -n "load_elf_binary" fs arch include
+rg -n "do_user_addr_fault|handle_mm_fault" arch mm
+rg -n "show_map_vma|proc_pid_maps" fs/proc
+git grep -n "struct vm_area_struct"
+git grep -n "struct task_struct"
+\end{lstlisting}
+
+读源码时建议同时开三类文件：
+
+\begin{itemize}
+  \item 入口文件：例如系统调用、\filepath{/proc} 文件接口、ELF loader。
+  \item 数据结构定义：例如 \code{task_struct}、\code{mm_struct}、\code{vm_area_struct}、\code{file}。
+  \item 实验记录：保存搜索命令、源码片段位置、调用路径、还没理解的问题。
+\end{itemize}
+
+源码报告不应大量复制内核代码。更好的方式是列出文件、函数、关键字段和自己的解释。代码只能作为少量证据，重点是机制路径。
+
+\section{通用阅读模板}
+
+每个 Linux 源码案例都按同一个模板完成。
+
+\begin{enumerate}
+  \item 问题：用户态观察到什么现象。
+  \item 接口：这个现象通过系统调用、\filepath{/proc}、ELF loader、调度器还是 PMU 暴露。
+  \item 入口：在源码中找到第一处稳定入口。
+  \item 数据结构：列出路径上最关键的结构体。
+  \item 路径：画出三到七个关键函数组成的调用链。
+  \item 边界：说明哪些结论来自源码，哪些来自工具观察，哪些只是推测。
+  \item 实验：用用户态小程序或命令验证一个可观察结果。
+  \item 报告：记录版本、命令、路径、源码位置、实验输出和限制。
+\end{enumerate}
+
+\begin{mentalmodel}
+读 Linux 源码时不要从“我要看懂这个子系统”开始，而要从“我要解释一个用户态现象”开始。问题越窄，源码路径越可控，报告越容易复查。
+\end{mentalmodel}
+
+\section{案例一：从 \code{write} 系统调用读到 VFS}
+
+\subsection{起始问题}
+
+用户态程序执行：
+
+\begin{lstlisting}[language=C++]
+#include <unistd.h>
+
+int main()
+{
+    write(1, "hello\n", 6);
+}
+\end{lstlisting}
+
+这行代码表面上是写标准输出，但底层发生了系统调用。第一册读这个案例的目标不是掌握整个文件系统，而是回答：
+
+\begin{lstlisting}
+用户态参数怎样进入内核？
+内核怎样把 fd = 1 解释成一个打开文件？
+写入路径为什么可能返回短写或错误码？
+\end{lstlisting}
+
+\subsection{源码入口}
+
+在常见 Linux 6.x 源码中，可以从下面搜索开始：
+
+\begin{lstlisting}[language=bash]
+rg -n "SYSCALL_DEFINE.*write" fs include arch
+rg -n "ksys_write|vfs_write" fs include
+\end{lstlisting}
+
+常见阅读路径是：
+
+\begin{lstlisting}
+SYSCALL_DEFINE3(write, ...)
+    -> ksys_write(...)
+        -> fdget_pos(...)
+        -> vfs_write(...)
+        -> file specific write operation
+\end{lstlisting}
+
+具体函数名和中间层会随版本变化，报告必须以本地源码搜索结果为准。
+
+\subsection{要看的结构体}
+
+这个案例至少要认识三类对象：
+
+\begin{itemize}
+  \item \code{struct file}：内核表示一个打开文件对象。
+  \item \code{struct fd}：帮助管理文件描述符引用。
+  \item \code{file_operations}：文件对象支持哪些操作，例如写入。
+\end{itemize}
+
+读者不需要展开所有字段，但必须知道 \code{fd = 1} 不是文件本身。它是进程文件描述符表里的索引，内核通过它找到对应的打开文件对象，再调用具体文件或设备的写入实现。
+
+\subsection{实验任务}
+
+\begin{labbox}
+写一个小程序，分别向标准输出、普通文件和无效 fd 写入数据。用 \code{strace} 记录系统调用，再用源码报告解释返回值。
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O2 write_demo.cpp -o write_demo
+strace -o write_demo.strace ./write_demo
+rg -n "write\\(" write_demo.strace
+\end{lstlisting}
+
+报告必须包含：用户态代码、\code{strace} 输出、内核源码版本、源码入口、关键函数链、一个错误码解释。
+\end{labbox}
+
+\section{案例二：ELF 如何被加载到进程}
+
+\subsection{起始问题}
+
+第一章已经讲过：\code{main} 通常不是进程第一条指令，可执行文件也不只是机器码。本案例把这个结论接到 Linux 源码中，回答：
+
+\begin{lstlisting}
+Linux 怎样识别 ELF 文件？
+程序头表怎样影响虚拟地址映射？
+解释器 PT_INTERP 为什么会引入动态链接器？
+\end{lstlisting}
+
+\subsection{源码入口}
+
+从 ELF loader 搜索：
+
+\begin{lstlisting}[language=bash]
+rg -n "load_elf_binary" fs
+rg -n "PT_INTERP|PT_LOAD" fs/binfmt_elf.c include
+\end{lstlisting}
+
+常见入口是 \filepath{fs/binfmt_elf.c} 中的 \code{load_elf_binary}。读者应重点观察它如何检查 ELF header、遍历 program header、处理 \code{PT_LOAD} 和 \code{PT_INTERP}，以及最终准备用户态入口状态。
+
+\subsection{配套工具证据}
+
+源码阅读必须和工具输出对上：
+
+\begin{lstlisting}[language=bash]
+readelf -h ./app
+readelf -l ./app
+readelf -W -l ./app | rg "LOAD|INTERP|Entry"
+\end{lstlisting}
+
+报告中不要只写“内核加载 ELF”。应说明：\code{readelf -l} 中的 \code{LOAD} 段怎样对应虚拟地址范围，\code{INTERP} 指向哪个动态链接器，entry point 与 \code{main} 有什么区别。
+
+\begin{labbox}
+分别编译静态链接和动态链接的小程序，比较 \code{readelf -l} 输出中是否存在 \code{INTERP}。阅读 \code{load_elf_binary} 中处理解释器的代码路径，解释为什么动态链接程序启动时会先进入动态链接器附近，而不是直接进入 \code{main}。
+\end{labbox}
+
+\section{案例三：\filepath{/proc/self/maps} 从哪里来}
+
+\subsection{起始问题}
+
+第四章要求用 \filepath{/proc} 观察进程。本案例追问：\filepath{/proc/self/maps} 的每一行到底由谁生成？它为什么能显示虚拟地址区间、权限、偏移和文件路径？
+
+\subsection{源码入口}
+
+可以从下面的名字搜索：
+
+\begin{lstlisting}[language=bash]
+rg -n "proc_pid_maps|show_map_vma|maps_open" fs/proc
+rg -n "struct vm_area_struct" include mm
+\end{lstlisting}
+
+常见路径会进入 \filepath{fs/proc/task_mmu.c}。读者重点看两件事：第一，\filepath{/proc} 文件并不是磁盘上的普通文件，而是内核根据当前进程状态动态生成的视图；第二，maps 行和 \code{vm_area_struct} 这样的虚拟内存区域结构有关。
+
+\subsection{实验任务}
+
+\begin{labbox}
+写一个程序，分别创建栈变量、堆分配、全局变量、\code{mmap} 匿名映射和映射文件。运行时打印地址，并保存 \filepath{/proc/self/maps}。
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O2 maps_demo.cpp -o maps_demo
+./maps_demo > maps_report.txt
+\end{lstlisting}
+
+报告要把至少三个地址归入 maps 中的区间，并说明这些区间对应栈、堆、可执行映射、共享库或 mmap 区域。然后阅读 \filepath{fs/proc/task_mmu.c} 中生成 maps 的函数，写出源码路径。
+\end{labbox}
+
+\section{案例四：缺页异常和虚拟内存}
+
+\subsection{起始问题}
+
+第三章把内存先看成按字节寻址的巨大数组，但真实程序访问虚拟地址时，可能触发缺页异常。第一册不深入页表和内存回收，但应该能回答：
+
+\begin{lstlisting}
+为什么第一次访问一大块新分配内存可能更慢？
+用户态访问无效地址为什么会变成 SIGSEGV？
+Linux 源码中缺页处理大致从哪里进入？
+\end{lstlisting}
+
+\subsection{源码入口}
+
+x86 平台常见搜索路径：
+
+\begin{lstlisting}[language=bash]
+rg -n "do_user_addr_fault|handle_page_fault" arch/x86 mm
+rg -n "handle_mm_fault" mm include
+\end{lstlisting}
+
+阅读时只要求建立粗路径：
+
+\begin{lstlisting}
+CPU page fault
+    -> arch/x86 fault handler
+        -> do_user_addr_fault(...)
+            -> handle_mm_fault(...)
+                -> allocate/map/fail depending on VMA and permissions
+\end{lstlisting}
+
+不同版本和配置会有差异，报告要注明。
+
+\subsection{实验任务}
+
+\begin{labbox}
+写一个程序分配大数组，分别测量只分配不触摸、逐页写入、第二次逐页写入的时间。用 \code{getrusage} 或 \code{perf stat} 观察 page fault 相关指标；如果权限受限，就记录工具不可用并保留普通计时结果。
+
+报告要说明：第一次触页和第二次触页的差异，哪些现象能由缺页解释，哪些还可能受 cache、TLB、调度和分配器影响。
+\end{labbox}
+
+\section{案例五：调度噪声从哪里来}
+
+\subsection{起始问题}
+
+第十一章讲 benchmark 样本会受 OS 调度、中断、迁核和后台任务影响。源码阅读不要求掌握完整调度器，但应知道用户态线程并不是独占 CPU。问题可以写成：
+
+\begin{lstlisting}
+为什么同一个 kernel 的单次样本偶尔会慢很多？
+线程什么时候可能被切走？
+Linux 调度器源码入口在哪里？
+\end{lstlisting}
+
+\subsection{源码入口}
+
+可以从这些名字开始：
+
+\begin{lstlisting}[language=bash]
+rg -n "asmlinkage.*schedule|void __sched schedule|try_to_wake_up" kernel/sched
+rg -n "struct task_struct" include linux kernel
+\end{lstlisting}
+
+第一册只要求读者知道 \code{task_struct} 表示任务，调度器在合适时机选择下一个可运行任务，benchmark 的墙钟时间可能包含线程未在 CPU 上执行的时间。不要在第一册试图完整解释 CFS 或 EEVDF 的所有细节。
+
+\subsection{实验任务}
+
+\begin{labbox}
+写一个短 kernel benchmark，分别在空闲系统、后台 CPU 压力、固定 CPU 亲和性三种情况下运行。保存 raw samples，观察 max、p95 和 median 的变化。源码阅读只要求定位 \code{schedule} 和 \code{task_struct}，并解释为什么墙钟时间可能包含等待重新运行的时间。
+\end{labbox}
+
+\section{案例六：\code{perf stat} 背后的内核子系统}
+
+\subsection{起始问题}
+
+\code{perf stat} 能报告 cycles、instructions、branches、cache-misses 等事件。第一册不要求掌握 PMU 编程，但要知道这些数字不是普通日志，而是内核 perf event 子系统和硬件计数器共同产生的结果。
+
+\subsection{源码入口}
+
+可从下面路径开始：
+
+\begin{lstlisting}[language=bash]
+rg -n "perf_event_open" kernel include tools
+rg -n "SYSCALL_DEFINE.*perf_event_open" kernel
+\end{lstlisting}
+
+常见入口包括 \code{perf_event_open} 系统调用以及 \filepath{kernel/events/} 下的 perf event 核心代码。用户态 \code{perf} 工具本身通常在 \filepath{tools/perf/} 目录中。
+
+\subsection{实验任务}
+
+\begin{labbox}
+对同一个求和 kernel 分别运行普通计时和 \code{perf stat}。如果系统不允许访问硬件事件，要记录错误信息和 \code{/proc/sys/kernel/perf_event_paranoid} 的值。报告要说明：哪些指标来自硬件事件，哪些只是派生比值，为什么权限限制会影响证据等级。
+\end{labbox}
+
+\section{源码解读报告模板}
+
+每份 Linux 源码解读报告至少包含下面字段：
+
+\begin{lstlisting}
+Title:
+Question:
+User-space experiment:
+Kernel source version:
+Search commands:
+Entry functions:
+Key structs:
+Call path:
+Observed output:
+Explanation:
+Limitations:
+Next questions:
+\end{lstlisting}
+
+其中 \code{Limitations} 很重要。源码阅读最常见的错误，是把一个版本的一条路径写成所有 Linux 版本的绝对结论，或者把源码路径当成当前机器已经实际执行的证据。若没有运行同版本内核，就应明确写出“这是源码机制阅读，不是当前内核行为证明”。
+
+\section{第一册推荐的源码阅读顺序}
+
+建议按下面顺序和正文章节配套：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.28\linewidth}p{0.36\linewidth}}
+\toprule
+阅读案例 & 对应章节 & 学习目标 \\
+\midrule
+\code{write} 系统调用 & 第 1、4、13 章 & 用户态到内核边界，fd 和返回值。 \\
+ELF 加载 & 第 1、4 章 & 可执行文件、program header、动态链接器。 \\
+\filepath{/proc/self/maps} & 第 1、3、4 章 & 虚拟地址空间和 VMA。 \\
+缺页处理 & 第 2、3、15 章 & 虚拟内存、首次触页、测量噪声。 \\
+调度器入口 & 第 4、15 章 & 墙钟时间、调度噪声、样本离群点。 \\
+\code{perf_event_open} & 第 15、16 章 & PMU 证据、权限、事件解释边界。 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{验收标准}
+
+完成本附录训练后，读者应能做到：
+
+\begin{itemize}
+  \item 固定 Linux 源码版本并记录 commit 或 tag。
+  \item 用 \code{rg} 或 \code{git grep} 从函数名、系统调用名、结构体名定位源码入口。
+  \item 围绕一个用户态现象画出三到七个函数组成的内核源码路径。
+  \item 把 \code{strace}、\code{readelf}、\filepath{/proc}、\code{perf stat} 等工具输出和源码路径对应起来。
+  \item 说明源码阅读结论的版本边界和证据边界。
+  \item 写出一份不依赖口头解释也能复查的源码解读报告。
+\end{itemize}
+

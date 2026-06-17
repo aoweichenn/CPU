@@ -1,0 +1,2461 @@
+\chapter{整数指令、位运算和地址计算}
+
+\section{问题与目标}
+
+上一章建立了阅读 x86-64 汇编的基本语法：指令、寄存器、立即数、内存操作数、操作数宽度和 \instruction{lea}。本章进入最常见、也最容易被低估的一组机器动作：整数数据移动、加减、乘法、除法、符号扩展、零扩展、移位、位运算、比较、溢出检测和地址计算。
+
+这些指令本身不复杂，但它们构成了后续章节的底层材料。数组下标、结构体字段、循环计数、边界判断、指针递增、类型转换和掩码处理，最终都会落到这些整数操作上。若这一层只靠助记符记忆，后面阅读控制流、ABI、C++ 互操作和性能报告时就会不断误判。
+
+\begin{itemize}
+  \item 数组下标和结构体字段访问需要整数地址计算。
+  \item 循环计数、边界判断、指针递增都依赖加减和比较。
+  \item 类型转换会生成符号扩展或零扩展。
+  \item 对齐、掩码、量化、哈希、SIMD lane 处理会大量使用位运算。
+  \item 性能优化里经常要判断一条指令是否更新 flags、是否破坏依赖、是否可被 \instruction{lea} 替代。
+\end{itemize}
+
+本章不要求背诵完整 Intel 手册，而是训练一套可复查的读法。看到一个整数汇编片段时，你应能逐项回答：
+
+\begin{lstlisting}
+1. 每条指令读哪些寄存器、内存和 flags？
+2. 每条指令写哪些寄存器、内存和 flags？
+3. 操作数宽度是多少？
+4. 这是有符号语义、无符号语义，还是纯位模式语义？
+5. 如果它来自 C++，语言规则是否允许这种变换？
+6. 它对性能有什么直接影响？
+\end{lstlisting}
+
+\begin{keyidea}
+整数指令直接处理的是固定位宽的位模式。有符号和无符号的差异，通常不在于寄存器中保存了两类对象，而在于指令如何解释这些位、编译器如何根据 C++ 类型选择指令，以及语言规则允许优化器作出哪些假设。
+\end{keyidea}
+
+\section{学习整数指令时最容易混淆的三件事}
+
+整数指令表面上比控制流、ABI 和浮点更直观，但它反而容易形成错误直觉。原因在于“整数”同时存在于三种语境：C++ 类型系统中的整数类型，ISA 中的整数寄存器和整数指令，数学中的无限精度整数。三者有关联，却不能直接等同。
+
+第一，C++ 整数类型带有语言规则。一个表达式是 \code{int} 还是 \code{unsigned int}，会影响整型提升、比较规则、溢出规则、移位规则和编译器能做的优化假设。尤其是有符号整数溢出，在 C++ 中不是普通回绕，而是未定义行为。编译器可以利用这个前提消除分支、改写循环或做代数化简。
+
+第二，ISA 指令处理的是固定宽度位模式。寄存器里没有“这个值是 signed”的标签。许多指令只关心低 N 位结果，例如普通加法、减法、按位与、按位或、异或。另一些指令或后续条件码会以 signed 或 unsigned 方式解释 flags。扩展指令、除法指令、右移指令和条件跳转尤其会暴露这种解释差异。
+
+第三，数学整数是无限精度概念，而机器整数有宽度。数学上 \code{2147483647 + 1} 是 \code{2147483648}；32 位补码低位结果是 \code{0x80000000}；C++ \code{int} 加法如果溢出则没有定义良好的程序语义；\code{std::uint32_t} 加法则按模 \code{2^32} 回绕。读汇编时必须同时知道这三种视角，否则会把机器现象误认为语言保证。
+
+\begin{mentalmodel}
+整数分析的顺序是：先看位宽，再看指令如何处理位模式，再看 C++ 类型给编译器什么语义约束，最后才谈数学含义和性能。不要反过来从数学直觉直接解释机器指令。
+\end{mentalmodel}
+
+\section{补码为什么成为本章默认模型}
+
+现代 x86-64 整数使用二进制补码表示有符号整数。补码的核心好处是同一套低位加法硬件可以同时服务有符号和无符号加法。比如 8 位里，\code{0xff} 如果按无符号解释是 255，按有符号解释是 -1；但它和 \code{0x01} 相加的低 8 位结果都是 \code{0x00}。区别不在加法器本身，而在你如何解释结果以及 flags。
+
+补码还能让取负具有统一形式：按位取反再加一。这个性质解释了许多底层技巧，例如用 \instruction{neg} 产生借位信息，用 \instruction{sbb} 生成全零或全一掩码，或者用位运算处理符号扩展。初学阶段不需要记住所有技巧，但必须理解它们来自补码表示和 flags 语义的共同作用，而不是某种脱离规则的特殊写法。
+
+补码模型也解释了为什么 signed 和 unsigned 的低位乘法结果常常相同。两个 N 位数相乘后取低 N 位，许多情况下同一条机器指令就足够；只有当你需要高半部分、完整双倍宽度结果、除法、比较或溢出判断时，signed 和 unsigned 的区别才会变得明显。
+
+不过，补码机器不等于 C++ signed 溢出有定义。现代 C++ 标准已经越来越明确地贴近补码现实，但优化器仍然依赖语言层规则。你在 x86 上观察到某条 \instruction{add} 产生回绕，只能说明机器执行了低位加法，不能证明原始 C++ signed 表达式在所有输入上定义良好。高质量教材必须把这条边界反复讲清楚。
+
+\section{整数寄存器里的值：位模式先于解释}
+
+先看一个 32 位寄存器：
+
+\begin{lstlisting}
+eax = 0xffffffff
+\end{lstlisting}
+
+这个位模式可以解释成：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+解释方式 & 值 & 说明 \\
+\midrule
+\code{std::uint32_t} & 4294967295 & 无符号解释 \\
+\code{std::int32_t} & -1 & 二进制补码解释 \\
+位掩码 & 所有 32 位都是 1 & mask 解释 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+寄存器本身没有贴着“这是 signed int”的标签。不同指令会以不同方式解释这些位：
+
+\begin{itemize}
+  \item \instruction{add} 对低 N 位加法而言，有符号和无符号使用同一个加法器；区别主要体现在 flags 如何解释。
+  \item \instruction{cmp} 后接有符号条件跳转和无符号条件跳转时，读取的 flags 组合不同。
+  \item \instruction{movsx} 和 \instruction{movzx} 明确区分符号扩展和零扩展。
+  \item \instruction{sar} 是算术右移，保留符号位；\instruction{shr} 是逻辑右移，高位补 0。
+\end{itemize}
+
+\begin{warningbox}
+不要说“这个寄存器是 signed”。更准确的说法是：“这段代码把这个寄存器的位模式按 signed 语义使用”。寄存器存的是位，解释来自指令、类型和上下文。
+\end{warningbox}
+
+这个原则会贯穿本章。一个寄存器里的低 32 位全 1，可以作为 -1 参与有符号比较，也可以作为四十多亿这个无符号数参与无符号比较，还可以作为所有位都为 1 的掩码。编译器选择哪种指令，不是因为寄存器本身变了，而是因为源码类型、后续用途和语言规则要求不同解释。
+
+因此，读整数汇编时不要只问“值是多少”，还要问“位宽是多少”“后续按什么语义使用”。\register{eax} 的 \code{0xffffffff} 作为 32 位 \code{int} 是 -1；如果写入 \register{eax} 后再读 \register{rax}，高 32 位会被清零，64 位值变成 \code{0x00000000ffffffff}，按 64 位 signed 解释就是正数 4294967295。这个细节在参数扩展、地址计算和比较中非常重要。
+
+\section{C++ 类型如何影响汇编选择}
+
+许多初学者以为编译器只是把 \code{+} 翻译成 \instruction{add}，把 \code{*} 翻译成 \instruction{imul}，把 \code{<} 翻译成某个固定跳转。实际情况要严格得多：同一个源码符号在不同类型下可能生成不同指令；同一条机器指令也可能服务不同源码语义。
+
+以小整数加载为例。读取 \code{std::uint8_t} 后转换成 \code{int}，高位必须补 0；读取 \code{std::int8_t} 后转换成 \code{int}，高位必须复制符号位。因此一个看似相同的“读一个字节”操作，可能分别生成 \instruction{movzx} 和 \instruction{movsx}。如果你只看内存访问宽度，会漏掉类型语义。
+
+比较也是如此。\code{int x < int y} 和 \code{unsigned x < unsigned y} 都可能先用 \instruction{cmp} 设置 flags，但后续读取 flags 的条件码不同。有符号比较关心符号位和溢出位组合，无符号比较关心进位或借位。控制流章节会系统展开条件码，本章先要求你知道：\instruction{cmp} 本身不是 signed 或 unsigned 的全部答案，后续如何解释 flags 才决定比较语义。
+
+算术优化也受类型影响。无符号加法按模回绕定义良好，编译器不能假设它不会溢出；有符号溢出未定义，编译器通常可以假设它不会发生，从而进行某些代数化简。比如某些边界检查、循环终止条件和表达式比较，在 signed 与 unsigned 下可优化空间不同。读汇编时如果发现 signed 和 unsigned 版本不一样，不要只从指令表找原因，要回到语言规则。
+
+\begin{keyidea}
+C++ 类型不会作为标签保存在寄存器里，但它会影响编译器选择扩展方式、比较条件、溢出假设和优化形状。汇编里看不见类型，不代表类型不重要。
+\end{keyidea}
+
+\subsection{整型提升：小整数通常先变成 \code{int}}
+
+C++ 里很多小整数运算并不是在 8 位或 16 位上直接完成。表达式求值前会发生整型提升：\code{bool}、\code{char}、\code{signed char}、\code{unsigned char}、\code{short}、\code{unsigned short} 这类小类型，在通常算术表达式中会先提升到 \code{int}，如果 \code{int} 不能表示该类型所有值，才提升到 \code{unsigned int}。在常见 x86-64/Linux 环境里，\code{std::uint8_t} 和 \code{std::int8_t} 参与普通加法时，后续算术通常发生在 32 位寄存器上。
+
+这解释了一个常见现象：源码看起来只处理字节，汇编却出现 \register{eax}、\register{ecx} 这样的 32 位寄存器。编译器不是把字节“扩大成了变量”，而是在执行 C++ 的表达式规则。读取无符号字节后用 \instruction{movzx} 得到 0 到 255 的 \code{int} 值，读取有符号字节后用 \instruction{movsx} 得到 -128 到 127 的 \code{int} 值，然后再做 32 位加法、比较或返回。
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int add_u8(std::uint8_t a, std::uint8_t b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+这段代码的返回类型是 \code{int}，表达式 \code{a + b} 也按提升后的整数语义求值。汇编中可能先零扩展两个参数，再做 32 位加法。不要因为源码参数是字节，就期待最终加法一定是 8 位 \instruction{add}。如果程序员真正需要 8 位回绕，应当在源码里把结果转换回 \code{std::uint8_t}，并清楚说明这是窄化后的低 8 位结果。
+
+整型提升还会影响布尔和字符处理。普通 \code{char} 是否有符号由实现决定，\code{char c = 0xff} 在不同实现上的提升结果可能不同。底层教材和实验代码应避免依赖普通 \code{char} 的符号性。你要研究字节数值，就使用 \code{std::uint8_t}；要研究有符号小整数，就使用 \code{std::int8_t}；要研究文本字符，就把字符编码和字节表示分开说明。
+
+\subsection{usual arithmetic conversions：混合类型先统一语义}
+
+两个操作数类型不同时，C++ 会通过 usual arithmetic conversions 把它们转换到一个共同类型。这个规则比“谁更大就转成谁”复杂，但在底层阅读里最容易出错的是 signed 和 unsigned 混合。若一个 \code{int} 和一个 \code{unsigned int} 比较，\code{int} 往往会转换成 \code{unsigned int}。因此 \code{-1 < 1u} 的结果不是数学直觉里的真，而是假，因为 \code{-1} 转换成无符号后成为很大的值。
+
+\begin{lstlisting}[language=C++]
+extern "C" bool mixed_less(int x, unsigned y)
+{
+    return x < y;
+}
+\end{lstlisting}
+
+这段源码在语义上不是“有符号 x 小于无符号 y”。比较前 \code{x} 会按规则转换到无符号类型，后续比较按 unsigned 语义进行。汇编里常见表现是同样的 \instruction{cmp} 后面接无符号条件码，例如 \instruction{setb} 或 \instruction{jb}，而不是有符号的 \instruction{setl} 或 \instruction{jl}。如果报告只写“比较 x 和 y”，就漏掉了最关键的语言转换。
+
+\code{std::size_t} 是另一个常见陷阱。容器大小、数组长度、内存字节数通常用无符号的 \code{std::size_t} 表示。如果循环变量是 \code{int}，条件里又和 \code{std::size_t} 混合，比较可能转成无符号语义。负数下标在比较时可能变成极大的无符号数，控制流就会和直觉相反。高质量底层代码通常会让索引类型、长度类型和边界检查保持一致，或者在转换处写出明确的前提。
+
+这条规则也解释了为什么从汇编反推源码类型并不唯一。你看到无符号条件跳转，可能是源码本来使用 unsigned，也可能是 signed 与 unsigned 混合后被转换，也可能是编译器把某个范围已知非负的 signed 值当作无符号比较处理。汇编提供证据，但最终结论需要结合源码类型、编译选项和上下文推导。
+
+\begin{warningbox}
+混合 signed 和 unsigned 不是小风格问题，它会改变比较语义、循环边界和越界检查。读汇编时看到无符号条件码，要回到源码确认是否发生了 usual arithmetic conversions。
+\end{warningbox}
+
+\section{本章的读法：每条整数指令都问五个问题}
+
+本章后面会看到很多指令。不要把它们背成“助记符表”。每遇到一条整数指令，都按五个问题做笔记。
+
+第一，操作数宽度是多少。是 8 位、16 位、32 位还是 64 位？是通用寄存器、内存，还是立即数？写 32 位寄存器是否会清零高 32 位？部分寄存器写入是否留下旧高位？
+
+第二，它读取和写入哪些状态。状态不只是通用寄存器，还包括内存和 flags。\instruction{cmp} 不写通用寄存器，但写 flags；\instruction{test} 不保存按位与结果，但写 flags；内存目的操作数的 \instruction{add} 同时读内存、写内存、写 flags。
+
+第三，它如何解释位模式。是纯位运算、模加法、符号扩展、零扩展、算术右移、逻辑右移，还是乘法低位结果？如果后续有条件跳转或条件设置，要看 flags 按 signed 还是 unsigned 语义被消费。
+
+第四，它在 C++ 里需要什么前提。移位计数是否合法？signed 加法是否可能溢出？指针下标是否越界？小整数转换是否需要符号扩展？这些问题决定编译器输出是否只是机器习惯，还是语言规则允许的优化。
+
+第五，它对性能的直接影响是什么。它是寄存器 ALU，还是 load/store，还是 read-modify-write？它是否产生依赖链？是否写 flags 并影响后续指令？是否可以被 \instruction{lea} 替代？这里先建立定性判断，第二册再做定量微架构分析。
+
+\begin{mentalmodel}
+整数指令的学习目标不是“看到助记符就说中文名”，而是能回答宽度、读写、解释、语言前提和性能影响。
+\end{mentalmodel}
+
+\section{\instruction{mov}：复制位模式，不是高级赋值}
+
+\instruction{mov} 是最常见的指令之一，但它的名字容易误导。它不是“移动后源消失”，而是复制位模式：
+
+\begin{lstlisting}
+mov eax, edi
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+eax = edi
+rax high 32 bits = 0
+\end{lstlisting}
+
+因为写 32 位寄存器会清零高 32 位。
+
+\subsection{寄存器到寄存器}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int id(int x)
+{
+    return x;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+mov eax, edi
+ret
+\end{lstlisting}
+
+\register{edi} 是参数，\register{eax} 是返回值。这里没有内存访问。
+
+\subsection{内存到寄存器：load}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int load(int const* p)
+{
+    return *p;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi]
+ret
+\end{lstlisting}
+
+解释：
+
+\begin{lstlisting}
+address = rdi
+load 4 bytes from address
+write eax
+\end{lstlisting}
+
+\subsection{寄存器到内存：store}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" void store(int* p, int x)
+{
+    *p = x;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+mov dword ptr [rdi], esi
+ret
+\end{lstlisting}
+
+解释：
+
+\begin{lstlisting}
+address = rdi
+store low 32 bits of esi to address
+\end{lstlisting}
+
+\subsection{立即数到寄存器或内存}
+
+\begin{lstlisting}
+mov eax, 123
+mov dword ptr [rdi], 123
+\end{lstlisting}
+
+第一条把立即数写入寄存器；第二条把立即数写入内存。第二条是 store，会修改内存。
+
+\subsection{为什么 \instruction{mov} 不是“赋值语句”}
+
+把 \instruction{mov} 理解成 C++ 赋值语句，会在两个地方出错。第一，C++ 赋值有类型、对象生命周期、重载运算符、volatile、原子对象和别名规则；\instruction{mov} 只是复制某个宽度的位模式。第二，C++ 赋值的源和目标是语言对象；\instruction{mov} 的源和目标是寄存器、立即数或内存地址。它们可能对应某个对象，也可能只是临时值或保存槽。
+
+例如 \instruction{mov eax, edi} 可以来自函数返回参数，也可以来自清理高位，也可以来自把某个中间结果换到返回寄存器。你不能只根据 \instruction{mov} 断言源码有一条赋值语句。反过来，源码的一条赋值也可能变成多条 load/store，或者在优化后完全消失。
+
+load 和 store 也要分开看。load 把内存中的字节复制到寄存器；store 把寄存器或立即数的字节写回内存。load 可能因为 cache miss、缺页或依赖而等待；store 可能进入 store buffer，稍后才真正对其他核心可见。第 7 章不展开完整内存系统，但从现在开始，报告里要明确写出一条 \instruction{mov} 是否访问内存，访问方向是什么。
+
+\begin{warningbox}
+看到 \instruction{mov} 不要自动写“赋值”。应写清楚：复制多少位，从哪里读，写到哪里，是否访问内存，是否因为写 32 位寄存器清零高位。
+\end{warningbox}
+
+\section{清零寄存器：\instruction{xor reg, reg} 和 \instruction{mov reg, 0}}
+
+你经常看到：
+
+\begin{lstlisting}
+xor eax, eax
+\end{lstlisting}
+
+它把 \register{eax} 清零。因为任何位和自己异或都是 0：
+
+\begin{lstlisting}
+x ^ x = 0
+\end{lstlisting}
+
+也可以写：
+
+\begin{lstlisting}
+mov eax, 0
+\end{lstlisting}
+
+但编译器常用 \instruction{xor eax, eax}，原因包括编码短、CPU 识别 zero idiom、可打破旧值依赖等。注意 \instruction{xor} 会更新 flags，而 \instruction{mov} 通常不更新 flags。上下文不同，编译器选择也可能不同。
+
+\begin{deepdive}
+现代 x86 核心通常能识别 \instruction{xor reg, reg}、\instruction{sub reg, reg} 这类 zero idiom，把它们当成不依赖旧寄存器值的清零操作。依赖打断对乱序执行和寄存器重命名很重要，后面讲微架构时会展开。
+\end{deepdive}
+
+清零指令还有一个容易忽略的语义细节：写 \register{eax} 会把 \register{rax} 高 32 位清零。因此 \instruction{xor eax, eax} 不只是把低 32 位清零，它让整个 \register{rax} 都成为 0。类似地，\instruction{mov eax, 0} 也会让 \register{rax} 成为 0。若你看到 \instruction{xor al, al}，情况就不同了，它只清最低 8 位，高位仍然保留旧值。
+
+为什么编译器偏爱清零 idiom，还和寄存器重命名有关。普通指令通常依赖旧目的寄存器值，例如 \instruction{add eax, esi} 必须读取旧 \register{eax}。但 \instruction{xor eax, eax} 的数学结果不依赖旧值，硬件可以把它识别为“生成一个新的零值”。这样后续读取 \register{eax} 的指令不必等待旧 \register{eax} 的生产者。这个机制本质上是性能话题，但在读汇编时先知道它，有助于理解为什么编译器不用看起来更直观的 \instruction{mov}。
+
+不过，不能机械地把所有清零都改成 \instruction{xor}。如果后续还需要保留之前的 flags，\instruction{xor} 会覆盖 flags，而 \instruction{mov} 通常不会。手写汇编时，这种差异会导致条件判断错误。编译器会根据上下文选择；读者要能解释选择背后的状态影响。
+
+\section{加法和减法：结果、flags 和语言规则}
+
+\subsection{\instruction{add} 和 \instruction{sub}}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_i32(int x, int y)
+{
+    return x + y;
+}
+
+extern "C" int sub_i32(int x, int y)
+{
+    return x - y;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+add_i32:
+    lea eax, [rdi + rsi]
+    ret
+
+sub_i32:
+    mov eax, edi
+    sub eax, esi
+    ret
+\end{lstlisting}
+
+\instruction{add} 和 \instruction{sub} 都会更新 flags。编译器有时用 \instruction{lea} 做加法，因为 \instruction{lea} 不更新 flags：
+
+\begin{lstlisting}
+lea eax, [rdi + rsi]      ; eax = x + y, flags unchanged
+add eax, esi              ; eax = eax + y, flags updated
+\end{lstlisting}
+
+如果后续不需要 flags，\instruction{lea} 可能更合适。如果后续需要根据结果跳转，\instruction{add} 或 \instruction{sub} 设置 flags 就有价值。
+
+\instruction{add} 和 \instruction{sub} 的目的操作数既是输入也是输出。读 \instruction{add eax, esi} 时，要写成“读取 \register{eax} 和 \register{esi}，把结果写回 \register{eax}”，不能写成“把 \register{esi} 加到某个新变量”。这种原地更新形式会形成依赖链：下一条读取 \register{eax} 的指令必须等待这条加法结果。
+
+内存目的操作数更要小心。比如 \instruction{add dword ptr [rdi], esi} 表面是一条指令，但语义是从内存读 4 字节，加上 \register{esi}，再写回同一地址，并更新 flags。它不是普通寄存器加法，也不是单纯 store。若以后加上 \instruction{lock} 前缀，它还会变成更重的原子 read-modify-write。第 7 章的最低要求是：看到内存目的操作数，就必须把 load、计算和 store 都写进解释。
+
+为什么编译器有时用 \instruction{lea} 表达加法？除了不更新 flags，\instruction{lea} 还能在一条指令里完成某些加法组合，例如一个基址、一个缩放索引和一个常量位移。如果这个表达式只是为了产生整数或地址，且不需要 flags，\instruction{lea} 可以避免破坏前面比较留下的 flags。这个细节连接到控制流章节：flags 是隐式状态，被覆盖就会改变后续条件指令的意义。
+
+\subsection{有符号溢出和无符号回绕}
+
+机器的 32 位加法天然按低 32 位结果回绕。但 C++ 语言规则不同：
+
+\begin{center}
+\begin{tabular}{p{0.27\linewidth}p{0.48\linewidth}}
+\toprule
+C++ 表达式 & 溢出规则 \\
+\midrule
+\code{std::uint32_t a + b} & 定义良好，按模 $2^{32}$ 回绕 \\
+\code{int a + b} & 有符号溢出是 undefined behavior \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以同样可能生成一条 \instruction{add}，编译器对 signed 和 unsigned 源码能做的优化假设并不一样。不要把“机器会回绕”直接等同为“C++ 程序定义良好”。
+
+这个边界值得多说一点。机器加法总会产生某个低 N 位结果，flags 也会记录进位、溢出、零值、符号等信息。但 C++ 优化器在生成这条机器加法之前，已经根据语言规则做过推理。对于 unsigned，回绕是程序定义的一部分；对于 signed，如果溢出发生，程序已经进入未定义行为，编译器可以假设这种情况不会出现在合法执行中。
+
+因此，读到 signed 加法生成 \instruction{add} 时，不要说“C++ signed 加法就是补码回绕”。更准确的说法是：在编译器认为不会发生 signed 溢出的合法路径上，这条机器指令实现了加法；如果硬件实际输入导致低位回绕，那是某次机器执行现象，不是 C++ 对所有输入的语义承诺。性能工程里大量边界错误、越界检查消失和循环优化惊讶，都来自忽视这点。
+
+如果实验目的就是研究溢出，应显式使用无符号类型、编译器内建溢出检查，或能定义溢出行为的选项和库函数。教材里的普通性能实验不应依赖 signed 溢出结果，因为那样测到的是未定义行为下的编译器选择，而不是稳定程序语义。
+
+\subsection{CF 和 OF：同一条加法的两种溢出视角}
+
+\instruction{add} 和 \instruction{sub} 会同时更新多种 flags，其中最容易混淆的是 CF 和 OF。CF 常用于 unsigned 语义，表示最高位之外发生进位或借位；OF 常用于 signed 语义，表示补码有符号结果超出了可表示范围。它们来自同一条机器加法或减法，但回答的问题不同。
+
+以 8 位加法为例，\code{0xff + 0x01} 的低 8 位结果是 \code{0x00}。按 unsigned 解释，这是 255 加 1，超出 0 到 255，发生回绕，所以 CF 为 1。按 signed 解释，\code{0xff} 是 -1，加 1 得到 0，结果完全可表示，所以 OF 为 0。同一组位，同一条加法，unsigned 溢出和 signed 溢出结论不同。
+
+再看 \code{0x7f + 0x01}。低 8 位结果是 \code{0x80}。按 unsigned 解释，这是 127 加 1 得到 128，没有超过 255，所以 CF 为 0。按 signed 解释，127 加 1 试图得到 128，但 8 位 signed 最大值是 127，结果位模式 \code{0x80} 解释为 -128，所以 OF 为 1。这个例子正好和前一个例子相反。
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+8 位运算 & 低 8 位结果 & unsigned 视角 & signed 视角 \\
+\midrule
+\code{0xff + 0x01} & \code{0x00} & CF=1，回绕 & OF=0，-1+1 合法 \\
+\code{0x7f + 0x01} & \code{0x80} & CF=0，未超过 255 & OF=1，127+1 越界 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不是让你背 flag 公式，而是训练区分问题。问“无符号加法是否产生模回绕”，看 CF；问“补码有符号数学结果是否超出范围”，看 OF。条件跳转也遵循这个分工：无符号比较用 CF/ZF 组合，有符号比较用 SF/OF/ZF 组合。后面控制流章节会系统化，本章先把概念边界打牢。
+
+减法里的 CF 更容易让人误解。x86 的 \instruction{cmp a, b} 本质上计算 \code{a - b} 并设置 flags。对于 unsigned 语义，如果 \code{a < b}，减法需要借位，CF 会反映这个借位，因此 \instruction{jb}、\instruction{jc} 这类条件码能表达 unsigned 小于。对于 signed 语义，是否小于不能只看最高位，因为溢出会改变符号位含义，需要结合 SF 和 OF。
+
+\begin{mentalmodel}
+CF 回答 unsigned 是否进位或借位，OF 回答 signed 补码结果是否越过可表示范围。不要把“溢出”当成一个单一概念。
+\end{mentalmodel}
+
+\subsection{显式溢出检测：让语言语义和 flags 对齐}
+
+如果程序确实需要检测整数溢出，应该把这个需求写进源码，而不是依赖未定义行为。C++ 标准库和编译器内建能力在不同版本里有所差异，工程中常见做法包括使用无符号边界推导、宽类型临时值、手写范围检查，或使用编译器提供的 \code{__builtin_add_overflow}、\code{__builtin_sub_overflow}、\code{__builtin_mul_overflow} 这类内建函数。
+
+\begin{lstlisting}[language=C++]
+extern "C" bool add_overflow_i32(int a, int b, int* out)
+{
+    return __builtin_add_overflow(a, b, out);
+}
+\end{lstlisting}
+
+这类源码把“我要知道是否溢出”变成了明确语义。编译器就可以生成 \instruction{add} 后接 \instruction{seto}，或者使用其他等价序列来保存 OF 结果。关键是：这里不是让 signed 溢出先发生再观察硬件回绕，而是请求编译器生成定义良好的溢出检测代码。源码语义和机器 flags 在这里对齐了。
+
+无符号溢出检测常见地使用 CF。例如两个 \code{std::uint32_t} 相加后，如果结果小于任一加数，说明发生了模回绕；汇编也可能用 \instruction{add} 后接 \instruction{setb} 或 \instruction{adc} 之类序列。signed 溢出检测则要关注 OF。两者都叫 overflow，但对应 flags 和语言语义不同。
+
+手写溢出检查时还要避免检查表达式本身已经触发 UB。下面这种写法看似直观，但如果 \code{a + b} 先以 signed \code{int} 求值并溢出，程序已经没有定义良好语义：
+
+\begin{lstlisting}[language=C++]
+int c = a + b;       // 如果这里溢出，后面的检查已经太晚
+if (c < a) { ... }
+\end{lstlisting}
+
+正确的思路是先用不会溢出的条件判断、宽类型，或内建溢出检测，让“检查”发生在危险运算之前或由编译器以定义良好方式生成。底层教材强调这一点，是为了避免把汇编实验变成 UB 实验。
+
+\begin{warningbox}
+硬件 flags 可以表达溢出现象，但 C++ signed 溢出不能先发生再被普通代码补救。要检测溢出，就在源码语义里显式表达检测。
+\end{warningbox}
+
+\subsection{\instruction{inc} 和 \instruction{dec}}
+
+\instruction{inc} 加 1，\instruction{dec} 减 1：
+
+\begin{lstlisting}
+inc eax
+dec ecx
+\end{lstlisting}
+
+它们会更新大多数 flags，但不更新 CF。现代编译器在一些场景下更偏向 \instruction{add reg, 1} 或 \instruction{sub reg, 1}，因为 flags 行为更规则，也可能更利于后续优化。你看到哪种要按上下文解释，不要死记“循环一定用 inc”。
+
+\instruction{inc} 和 \instruction{dec} 的历史很长，写法也很自然，但现代编译器并不总是优先用它们。原因之一就是 flags 行为不完全等同于 \instruction{add} 和 \instruction{sub}。它们不更新 CF，这在多精度算术或依赖进位的代码中很重要。对于普通循环计数，如果后续条件只关心 ZF 或 SF/OF，差异可能不影响结果；但编译器统一使用 \instruction{add} 或 \instruction{sub} 可以让 flags 模型更规整。
+
+读汇编时看到 \instruction{inc}，仍然要按完整规则写：它读取并写回目的操作数，更新大多数 flags，但保留 CF。不要因为它“只是加一”就忽略 flags。后续控制流如果读取 flags，就必须确认读取的是哪条指令留下的状态。
+
+\section{乘法：\instruction{imul}、常数乘法和 \instruction{lea}}
+
+\subsection{常数乘法经常不用乘法指令}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int mul5(int x)
+{
+    return x * 5;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+lea eax, [rdi + rdi*4]
+ret
+\end{lstlisting}
+
+因为：
+
+\begin{lstlisting}
+x * 5 = x + x * 4
+\end{lstlisting}
+
+\instruction{lea} 可表达 \code{base + index*scale + displacement}，其中 scale 为 1、2、4、8。因此乘以 3、5、9 等常数经常可用一条 \instruction{lea}。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+C++ 表达式 & 可能汇编 & 语义 \\
+\midrule
+\code{x * 3} & \code{lea eax, [rdi + rdi*2]} & \code{x + 2*x} \\
+\code{x * 5} & \code{lea eax, [rdi + rdi*4]} & \code{x + 4*x} \\
+\code{x * 8 + 7} & \code{lea eax, [rdi*8 + 7]} & \code{8*x + 7} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\instruction{imul} 的常见形式}
+
+当乘法不能简单用 \instruction{lea} 或 shift 表达时，会看到 \instruction{imul}：
+
+\begin{lstlisting}
+imul eax, edi, 37      ; eax = edi * 37
+imul eax, esi          ; eax = eax * esi, low 32 bits
+\end{lstlisting}
+
+对低 N 位乘法结果来说，补码 signed 和 unsigned 的低 N 位相同。因此很多普通乘法可以使用同一类指令。但当需要完整宽度结果、高半部分、溢出判断时，signed/unsigned 就会影响指令选择。
+
+\subsection{性能直觉}
+
+整数乘法通常比简单加法、位运算、\instruction{lea} 延迟更高、吞吐更低。现代 CPU 乘法已经很快，但在 tight loop 里仍然要关注。如果乘以常数，编译器经常自动替换成 \instruction{lea}、shift 或加法组合。不要手写“聪明替换”之前先看编译器输出。
+
+乘法优化也是一个很好的例子，说明“源码运算符”和“机器指令”不是一一对应。源码里写 \code{x * 5}，编译器可以生成 \instruction{lea}；源码里写数组或结构体地址计算，编译器也可能生成 \instruction{lea}，但这不代表源码里有显式乘法。汇编里的 \instruction{lea} 是地址形式的整数计算工具，既可以服务源码乘法，也可以服务内存寻址。
+
+什么时候常数乘法适合用 \instruction{lea}、移位或加法组合，取决于常数形状、目标 CPU 指令代价、寄存器压力和是否需要 flags。现代编译器通常比手写替换更可靠。初学者不应该为了“乘法慢”而盲目把所有乘法改写成移位加法；这样可能降低可读性，也可能不比编译器输出更好。正确做法是先看优化后汇编，再用性能实验验证。
+
+乘法还提醒我们注意结果宽度。一个 32 位乘法的数学结果可能需要 64 位保存，但很多指令形式只保留低 32 位。若源码类型只需要低位回绕，低位结果足够；若需要检查溢出或得到完整结果，指令选择就不同。读到 \instruction{imul} 时，要问它是哪种形式，结果保存在哪里，是否只取低位。
+
+\begin{warningbox}
+不要把“没有 \instruction{imul}”解释成“没有乘法语义”，也不要把“有 \instruction{imul}”解释成“性能一定瓶颈”。先恢复表达式和结果宽度，再结合目标 CPU 和测量判断。
+\end{warningbox}
+
+\section{除法：\instruction{div}、\instruction{idiv} 和高半寄存器}
+
+整数除法比加法、乘法更难读，因为 x86 的除法指令有强烈的隐式寄存器约定，延迟通常也更高。普通二操作数风格里，你习惯看到源和目的都写在指令文本里；但 \instruction{div} 和 \instruction{idiv} 会隐式使用 \register{rax}、\register{rdx}，结果也隐式写回这些寄存器。读这类汇编时，如果只看显式操作数，会漏掉大部分语义。
+
+无符号除法使用 \instruction{div}，有符号除法使用 \instruction{idiv}。以 64 位除法为例，被除数不是单独的 \register{rax}，而是 \register{rdx}:\register{rax} 组成的 128 位值；显式操作数是除数；商写入 \register{rax}，余数写入 \register{rdx}。32 位形式类似，使用 \register{edx}:\register{eax} 作为 64 位被除数，商在 \register{eax}，余数在 \register{edx}。
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+形式 & 被除数 & 除数 & 结果 \\
+\midrule
+\instruction{div r/m32} & \register{edx}:\register{eax} & 显式 32 位操作数 & 商 \register{eax}，余数 \register{edx} \\
+\instruction{idiv r/m32} & \register{edx}:\register{eax} & 显式 32 位操作数 & 商 \register{eax}，余数 \register{edx} \\
+\instruction{div r/m64} & \register{rdx}:\register{rax} & 显式 64 位操作数 & 商 \register{rax}，余数 \register{rdx} \\
+\instruction{idiv r/m64} & \register{rdx}:\register{rax} & 显式 64 位操作数 & 商 \register{rax}，余数 \register{rdx} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这就是为什么除法前经常看到 \instruction{xor edx, edx}、\instruction{cdq} 或 \instruction{cqo}。无符号 32 位除法前，如果被除数本来只有 \register{eax} 的 32 位值，高半 \register{edx} 通常要清零，否则 \register{edx}:\register{eax} 会形成一个完全不同的 64 位被除数。有符号 32 位除法前，\instruction{cdq} 会把 \register{eax} 的符号位扩展到 \register{edx}；有符号 64 位除法前，\instruction{cqo} 会把 \register{rax} 的符号位扩展到 \register{rdx}。
+
+\begin{lstlisting}
+; unsigned eax / esi
+xor edx, edx
+div esi
+
+; signed eax / esi
+cdq
+idiv esi
+
+; signed rax / rsi
+cqo
+idiv rsi
+\end{lstlisting}
+
+\instruction{cdq} 和 \instruction{cqo} 不应该被解释成普通“把某个变量赋给另一个变量”。它们是在构造除法要求的双倍宽度被除数。若 \register{eax} 是负数，\instruction{cdq} 会让 \register{edx} 变成全 1；若 \register{eax} 非负，\register{edx} 变成 0。这样 \register{edx}:\register{eax} 才是正确的有符号扩展被除数。
+
+除法还有异常边界。除数为 0 会触发硬件异常；商无法放入目标寄存器也会触发异常。典型例子是最小 signed 整数除以 -1，数学结果超过同宽 signed 最大值。在 C++ 中，整数除以 0 是未定义行为；signed 最小值除以 -1 这类不可表示结果也不能当作普通定义良好的运算。编译器可以基于这些前提优化，所以读汇编时不要把硬件异常路径当作 C++ 保证的错误处理机制。
+
+\begin{warningbox}
+\instruction{div} 和 \instruction{idiv} 的显式操作数只是除数。被除数、商和余数都在隐式寄存器里。解释除法指令必须同时追踪 \register{rax} 和 \register{rdx} 的定义。
+\end{warningbox}
+
+\subsection{商和余数：同一次除法产生两个结果}
+
+C++ 的 \code{/} 和 \code{\%} 看起来是两个运算符，但机器除法常常一次产生商和余数。如果源码同时需要 \code{x / y} 和 \code{x \% y}，编译器可能只生成一次 \instruction{idiv} 或 \instruction{div}，然后分别使用 \register{rax} 和 \register{rdx}。如果源码只需要余数，也仍然可能需要完整除法，因为余数是除法结果的一部分。
+
+\begin{lstlisting}[language=C++]
+extern "C" int quotient_plus_remainder(int x, int y)
+{
+    return x / y + x % y;
+}
+\end{lstlisting}
+
+可能汇编会把 \code{x} 放入 \register{eax}，用 \instruction{cdq} 构造 \register{edx}:\register{eax}，执行 \instruction{idiv esi}，然后把 \register{edx} 加到 \register{eax}。这里 \register{eax} 和 \register{edx} 都是除法输出。报告里不能只写“\instruction{idiv} 得到除法结果”，要写清商和余数分别在哪里。
+
+C++ 对 signed 除法和取余有明确关系：商向零截断，余数满足 \code{x == (x / y) * y + x \% y}，并且余数符号与被除数相关。这个规则与数学里某些向下取整除法不同。负数场景下，汇编中的修正序列往往正是为了实现向零截断，而不是向负无穷取整。
+
+\subsection{除以 2 的幂：unsigned 简单，signed 需要修正}
+
+对 unsigned 整数，除以 2 的幂通常可以用逻辑右移实现。例如 \code{x / 8u} 可以变成 \instruction{shr eax, 3}，\code{x \% 8u} 可以变成 \instruction{and eax, 7}。这是因为 unsigned 值非负，二进制右移和向下取整除法一致。
+
+对 signed 整数，情况不同。C++ signed 除法向零截断，而 \instruction{sar} 对负数更接近向负无穷取整。比如 -3 除以 2，在 C++ 中结果是 -1；算术右移一位得到 -2。编译器要把 signed \code{x / 2} 优化成移位时，通常会先根据符号加一个偏置，再执行算术右移。
+
+\begin{lstlisting}
+; 一种常见思想，不代表唯一输出
+mov eax, edi
+shr eax, 31       ; 提取符号形成 0 或 1
+add eax, edi      ; 负数时加偏置
+sar eax, 1
+\end{lstlisting}
+
+这个序列的目的不是“多余操作”，而是修正舍入方向。对于非负数，偏置为 0，右移等价于除以 2；对于负奇数，先加 1，再算术右移，可以得到向零截断结果。除以 4、8、16 等 2 的幂时，偏置通常会变成 \code{2^k - 1}，并且只在负数路径上生效。
+
+因此，看到 signed 除以 2 的幂生成多条位运算，不要急着说编译器没有优化。它已经把高延迟除法替换成了移位和加法，只是还必须遵守 C++ 的舍入语义。教材里反复要求说明语言规则，原因就在这里：如果只从硬件位移直觉看，你会误删必要修正。
+
+\subsection{除以常数：乘法、移位和 magic number}
+
+除以非 2 的幂常数也不一定生成 \instruction{idiv}。编译器经常把除以编译期常数改写成乘以一个预先计算的常数，再取高位、移位和修正。这类常数常被称作 magic number。它不是近似计算，而是在固定整数宽度和特定舍入规则下等价的整数算法。
+
+\begin{lstlisting}[language=C++]
+extern "C" unsigned div10(unsigned x)
+{
+    return x / 10u;
+}
+\end{lstlisting}
+
+优化后汇编可能出现一个看起来很大的立即数、\instruction{mul} 或 \instruction{imul}、右移和若干修正，而不是 \instruction{div}。初学者常把这误认为哈希、随机常数或混淆代码。正确读法是：编译器在用乘高位近似并精确恢复整数除法商。常数如何推导需要数论和编译器优化知识，本册只要求能识别这种模式，不把它误判为源码里真的写了乘法。
+
+signed 常数除法更复杂，因为要满足向零截断，还要处理负数。编译器可能使用算术右移、符号位修正、加减偏置等组合。你在报告里不必手推完整 magic number 证明，但要说明：源码除法语义、目标位宽、signed/unsigned 和舍入规则共同决定了这段序列。
+
+什么时候仍会看到真实 \instruction{div} 或 \instruction{idiv}？常见情况是除数运行期才知道，编译器无法把它化成常数乘法；或者优化级别较低；或者目标架构和代价模型判断直接除法更合适。除法通常比简单 ALU 指令重得多，但是否构成瓶颈仍要看循环结构、数据依赖和内存行为。
+
+\begin{keyidea}
+整数除法的核心不是背 \instruction{idiv}，而是看清：隐式高半被除数、商和余数寄存器、除零和不可表示结果、signed 舍入规则，以及编译器用乘法和移位替代除法的条件。
+\end{keyidea}
+
+\section{符号扩展和零扩展：\instruction{movsx}、\instruction{movzx}、\instruction{movsxd}}
+
+从小整数类型转换到大整数类型时，编译器必须决定高位如何填充。
+
+扩展指令是 C++ 类型语义最直观地出现在汇编里的地方。内存里同样一个字节 \code{0xff}，如果来源类型是 \code{std::uint8_t}，转换到 \code{int} 应该得到 255；如果来源类型是 \code{std::int8_t}，转换到 \code{int} 应该得到 -1。硬件不能只“读取一个字节”就结束，因为后续计算通常在 32 位寄存器上进行，高位必须有确定含义。
+
+零扩展表示高位补 0，保留无符号数值；符号扩展表示复制源最高有效位，保留补码有符号数值。扩展不是“改变原来的内存”，而是决定装入更宽寄存器时高位如何构造。很多 bug 就来自错误地把字节当 signed 或 unsigned，例如图像像素、网络包字段、量化权重、字符处理和二进制文件解析。
+
+扩展还和寄存器写入规则重叠。写 \register{eax} 会清零 \register{rax} 高 32 位，所以许多 32 位结果自然变成零扩展到 64 位。但从 8 位或 16 位变成 32 位时，编译器仍然需要 \instruction{movzx} 或 \instruction{movsx} 这类指令来决定高位。读报告时要把“32 位写清零高位”和“小宽度到大宽度的扩展”同时考虑。
+
+\subsection{零扩展}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int from_u8(std::uint8_t x)
+{
+    return x;
+}
+\end{lstlisting}
+
+\code{std::uint8_t} 到 \code{int} 要保留 0..255 的值，因此高位补 0。可能汇编：
+
+\begin{lstlisting}
+movzx eax, dil
+ret
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+eax = zero_extend_32(dil)
+\end{lstlisting}
+
+如果是从内存读取：
+
+\begin{lstlisting}
+movzx eax, byte ptr [rdi]
+\end{lstlisting}
+
+表示读取 1 字节，再零扩展到 32 位。
+
+\subsection{符号扩展}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int from_i8(std::int8_t x)
+{
+    return x;
+}
+\end{lstlisting}
+
+\code{std::int8_t} 到 \code{int} 要保留 -128..127 的值，因此复制符号位。可能汇编：
+
+\begin{lstlisting}
+movsx eax, dil
+ret
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+eax = sign_extend_32(dil)
+\end{lstlisting}
+
+举例：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+8 位输入 & \instruction{movzx} 到 32 位 & \instruction{movsx} 到 32 位 \\
+\midrule
+\code{0x7f} & \code{0x0000007f} & \code{0x0000007f} \\
+\code{0x80} & \code{0x00000080} & \code{0xffffff80} \\
+\code{0xff} & \code{0x000000ff} & \code{0xffffffff} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{\instruction{movsxd}：32 位到 64 位符号扩展}
+
+数组下标是 \code{int}，地址计算需要 64 位时，经常看到：
+
+\begin{lstlisting}
+movsxd rsi, esi
+mov    eax, dword ptr [rdi + rsi*4]
+\end{lstlisting}
+
+\instruction{movsxd rsi, esi} 把 32 位有符号下标扩展成 64 位。如果 \code{i == -1}，扩展后 \register{rsi} 是 \code{0xffffffffffffffff}，地址计算就会向前移动 4 字节。C++ 中真正访问负下标通常越界，是 UB；但从指令语义看，它就是补码地址计算。
+
+\begin{warningbox}
+\code{char} 是否 signed 在 C++ 中与实现有关。写底层实验时需要明确使用 \code{std::int8_t} 或 \code{std::uint8_t}，不要靠普通 \code{char} 猜测编译器会生成 \instruction{movsx} 还是 \instruction{movzx}。
+\end{warningbox}
+
+\subsection{扩展错误会怎样污染后续计算}
+
+扩展错误不是局部小问题，它会改变后续所有算术和地址计算。假设一个字节是 \code{0xff}。零扩展到 32 位得到 255；符号扩展到 32 位得到 -1。之后无论是加法、比较、数组下标还是 mask 生成，都会沿着完全不同的路径走。
+
+在数组下标中，这尤其危险。如果 32 位下标被 \instruction{movsxd} 扩展到 64 位，负数会变成高位全 1 的 64 位值，地址公式会向基址前方移动。机器可以照样计算地址，但 C++ 中越界访问通常是未定义行为。不要把“汇编能算出地址”当成“源码访问合法”。本书反复强调语言语义，是因为优化器会利用这些合法性前提。
+
+在性能代码里，扩展指令也可能影响依赖和指令数量。循环里反复从 \code{uint8_t} 数据加载并扩展，是图像、文本、量化模型和压缩数据处理的常见模式。后续如果进入 SIMD，扩展会变成向量 unpack、zero extend、sign extend 等操作。第 7 章把标量扩展讲清楚，是第二册低精度计算的基础。
+
+\section{移位：乘除 2 的幂、位域和符号}
+
+移位指令表面简单，但它同时涉及位模式、乘除法直觉、符号处理和语言规则。左移经常被理解为乘以 2 的幂，右移经常被理解为除以 2 的幂；这种说法只在特定前提下成立。对无符号整数，左移低位结果按模宽度保留，右移逻辑补零；对有符号整数，负数、溢出和舍入方向都需要格外谨慎。
+
+机器移位只移动位。C++ 表达式是否定义良好，还要看移位计数和被移位值。计数为负或大于等于位宽是未定义行为；signed 负数左移和溢出也存在规则限制。编译器可以假设合法程序不会触发这些情况。底层代码如果没有证明计数范围，就容易写出在某台机器上“看起来能跑”、但语言层不可靠的程序。
+
+\subsection{\instruction{shl} 和 \instruction{sal}}
+
+\instruction{shl} 是逻辑左移，\instruction{sal} 是算术左移；在 x86 上它们对整数位模式的效果相同：
+
+\begin{lstlisting}
+shl eax, 3      ; eax = eax << 3
+\end{lstlisting}
+
+如果没有溢出语义问题，左移 3 位相当于乘以 8。但 C++ 对 signed 左移有规则限制，尤其是溢出和负数左移。机器指令只是移位，语言层面未必定义良好。
+
+左移的性能通常很好，编译器也常把乘以 2 的幂替换成左移或地址计算。但你不需要手工把所有乘法写成移位。写 \code{x * 8} 通常更清楚，优化器会选择合适指令。手工移位只有在表达位级协议、mask、哈希或对齐时更自然。教材训练的重点是读懂编译器输出，而不是用低级写法替代清晰源码。
+
+\subsection{\instruction{shr} 和 \instruction{sar}}
+
+右移分两种：
+
+\begin{lstlisting}
+shr eax, 1      ; logical right shift, high bits filled with 0
+sar eax, 1      ; arithmetic right shift, high bits filled with sign bit
+\end{lstlisting}
+
+例子：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+输入 8 位 & \instruction{shr 1} & \instruction{sar 1} \\
+\midrule
+\code{01111110} & \code{00111111} & \code{00111111} \\
+\code{10000000} & \code{01000000} & \code{11000000} \\
+\code{11111110} & \code{01111111} & \code{11111111} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\instruction{shr} 适合 unsigned 语义；\instruction{sar} 适合补码 signed 语义。C++ 中 signed 负数右移的具体行为在现代主流实现通常是算术右移，但学习标准规则时要注意实现定义历史和标准版本细节。本书在 x86-64/Linux 实验中按补码和算术右移观察。
+
+右移与除法的关系更容易误导。对非负整数，右移一位通常等价于除以 2 向下取整。对负数，算术右移会向负无穷方向靠近，而 C++ 整数除法通常向零截断。编译器在把 signed 除以 2 的幂优化成移位时，常常需要额外修正偏置，不能简单地把 \code{x / 2} 变成 \instruction{sar}。如果你在汇编里看到若干加法、移位和符号位处理组合，很可能是在实现这种舍入规则。
+
+这也说明为什么“右移就是除法”不是合格解释。合格解释要说明数据是否无符号、是否可能为负、舍入方向是什么、语言规则要求什么。对 unsigned，\instruction{shr} 很自然；对 signed，\instruction{sar} 保留符号位，但是否等价于源码除法要看具体表达式和编译器附加修正。
+
+\subsection{移位计数}
+
+x86 中变量移位计数通常使用 \register{cl}：
+
+\begin{lstlisting}
+shl eax, cl
+shr rdx, cl
+sar edi, cl
+\end{lstlisting}
+
+C++ 中如果移位计数小于 0 或大于等于位宽，行为未定义：
+
+\begin{lstlisting}[language=C++]
+std::uint32_t x = 1;
+auto y = x << 32;    // undefined behavior in C++
+\end{lstlisting}
+
+硬件可能会对计数取模或屏蔽低位，但这不是你可以依赖的 C++ 语义。性能代码要么证明计数合法，要么显式处理。
+
+变量移位中使用 \register{cl} 还有一个实际阅读意义：如果你看到编译器把某个参数移动到 \register{ecx} 或 \register{cl}，随后出现移位指令，这通常不是 ABI 参数位置本身的要求，而是 x86 指令编码对变量移位计数的要求。读汇编时要把这种目标指令约束与函数参数传递约定区分开。
+
+移位计数合法性也会影响优化。若编译器能证明计数范围在 0 到位宽减一之间，它可以生成直接移位；若无法证明，源码又要求定义良好行为，程序员可能需要显式 mask 或分支处理。硬件会屏蔽某些计数位，并不意味着 C++ 自动允许越界计数。
+
+\section{位运算：mask、alignment 和 flags}
+
+位运算是底层编程的基本语言。它看起来像“技巧”，但本质上是在利用二进制表示的结构：某些低位表示对齐，某个位表示布尔标志，某些连续位表示字段，某个全零或全一模式表示选择掩码。理解位运算，不是为了写晦涩代码，而是为了读懂系统代码、运行时库、内存分配器、压缩格式、SIMD mask 和量化数据。
+
+位运算通常不关心 signed 或 unsigned 的数学解释，而关心每一位的模式。比如 \instruction{and} 清掉某些位，\instruction{or} 设置某些位，\instruction{xor} 翻转或比较差异，\instruction{test} 用按位与结果设置 flags。即使操作数在 C++ 里写成整数，底层意图可能是 mask，而不是普通数量。
+
+\subsection{\instruction{and}、\instruction{or}、\instruction{xor}、\instruction{not}}
+
+常见位运算指令：
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+指令 & 简化语义 & 常见用途 \\
+\midrule
+\instruction{and} & \code{dst = dst & src} & 清位、取低位、对齐 mask \\
+\instruction{or} & \code{dst = dst | src} & 置位、合并 flags \\
+\instruction{xor} & \code{dst = dst ^ src} & 翻转位、清零寄存器、差异检测 \\
+\instruction{not} & \code{dst = ~dst} & 位取反，不更新 flags \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如判断偶数：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool is_even(unsigned x)
+{
+    return (x & 1U) == 0;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+test dil, 1
+sete al
+ret
+\end{lstlisting}
+
+\instruction{test a, b} 计算 \code{a & b} 并设置 flags，但不保存结果。这里用最低位判断奇偶。
+
+\subsection{对齐向下：清掉低位}
+
+如果 \code{align} 是 2 的幂，对地址向下对齐可写成：
+
+\begin{lstlisting}[language=C++]
+std::uintptr_t align_down(std::uintptr_t x)
+{
+    return x & ~std::uintptr_t(63);
+}
+\end{lstlisting}
+
+对应位运算：
+
+\begin{lstlisting}
+and rax, -64
+\end{lstlisting}
+
+因为 64 字节对齐要求低 6 位为 0。清掉低 6 位就是向下对齐到 cache line 边界。
+
+例子：
+
+\begin{lstlisting}
+x = 0x1234
+mask = ~0x3f = ...ffc0
+x & mask = 0x1200
+\end{lstlisting}
+
+为什么 64 字节对应低 6 位？因为 \code{64 = 2^6}。一个地址按 64 字节对齐，意味着它能被 64 整除；在二进制中，这等价于最低 6 位全为 0。向下对齐就是保留高位、清掉低 6 位。mask \code{~63} 的低 6 位为 0，其余位为 1，所以按位与会把低 6 位清零。
+
+这个知识会在很多地方出现。cache line 常见大小是 64 字节，SIMD buffer 可能要求 16、32 或 64 字节对齐，页大小常见是 4096 字节，对应低 12 位。无论具体数字是什么，只要对齐值是 2 的幂，低位清零模型都成立。后面讲内存层级和 allocator 时，这会成为基本语言。
+
+\subsection{对齐向上：加再清低位}
+
+向上对齐：
+
+\begin{lstlisting}[language=C++]
+std::uintptr_t align_up_64(std::uintptr_t x)
+{
+    return (x + 63) & ~std::uintptr_t(63);
+}
+\end{lstlisting}
+
+地址例子：
+
+\begin{lstlisting}
+x = 0x1234
+x + 63 = 0x1273
+(x + 63) & ~0x3f = 0x1240
+\end{lstlisting}
+
+这个模式在 allocator、SIMD buffer、cache line padding、tensor storage 对齐中非常常见。
+
+向上对齐比向下对齐多一个步骤：先加上 \code{A - 1}，再清低位。直觉是，如果地址已经对齐，加上 \code{A - 1} 后仍落在同一个对齐块内，清低位会回到原地址；如果地址未对齐，加上 \code{A - 1} 会把它推到下一个对齐块内，清低位得到下一个边界。这个公式只对 2 的幂对齐直接成立，任意整数对齐不能直接用同一个 mask 技巧。
+
+写底层代码时还要考虑溢出。表达式 \code{x + A - 1} 如果超过整数宽度，会发生回绕或未定义行为，取决于类型。地址计算通常使用无符号整数类型如 \code{std::uintptr_t}，但即便如此，回绕是否是你想要的结果也要小心。教材例子先讲正常范围内的位模型，工程代码还需要边界检查。
+
+\subsection{位标志}
+
+位运算经常用来维护 flags：
+
+\begin{lstlisting}[language=C++]
+constexpr unsigned kReadable = 1u << 0;
+constexpr unsigned kWritable = 1u << 1;
+constexpr unsigned kPinned   = 1u << 2;
+
+bool writable(unsigned flags)
+{
+    return (flags & kWritable) != 0;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+test dil, 2
+setne al
+ret
+\end{lstlisting}
+
+\instruction{test} 不保存 \code{flags & 2}，只设置 ZF。后续 \instruction{setne} 根据 ZF 生成布尔值。
+
+位标志的优点是紧凑，一个整数可以同时携带多个布尔状态。代价是可读性和正确性需要纪律：每个位的含义要有命名常量，设置、清除、测试要使用明确 mask，不要把 magic number 散落在代码里。汇编层看到的只是 \instruction{test dil, 2}，但源码层应当让人知道 2 代表哪个标志位。
+
+并发场景下，位标志还可能牵涉原子操作和内存序。普通 \instruction{or} 或 \instruction{and} 修改内存中的 flags 不是自动线程安全的。第 7 章不展开并发，但要知道：位运算本身只是位模式操作，线程间可见性和竞态需要额外机制。第二册讲 atomics 和 false sharing 时会回到这个边界。
+
+\section{\instruction{cmp} 和 \instruction{test}：只设置 flags 的计算}
+
+\instruction{cmp a, b} 类似计算：
+
+\begin{lstlisting}
+a - b
+\end{lstlisting}
+
+但不保存结果，只更新 flags。
+
+\instruction{test a, b} 类似计算：
+
+\begin{lstlisting}
+a & b
+\end{lstlisting}
+
+也不保存结果，只更新 flags。
+
+对比：
+
+\begin{lstlisting}
+sub eax, esi      ; eax = eax - esi, flags updated
+cmp eax, esi      ; compute eax - esi only for flags
+
+and eax, 1        ; eax = eax & 1, flags updated
+test eax, 1       ; compute eax & 1 only for flags
+\end{lstlisting}
+
+控制流章节会系统讲条件跳转。本章先掌握一个读法：看到 \instruction{cmp} 或 \instruction{test}，不要找“结果存哪里”；结果不存，flags 才是输出。
+
+\instruction{cmp} 和 \instruction{test} 是理解“隐式输出”的最好例子。它们没有显式目的寄存器，但绝不是没有输出。输出在 flags 里。后面如果紧跟 \instruction{je}、\instruction{jne}、\instruction{setl}、\instruction{setb}、\instruction{cmovg} 这类条件指令，条件指令读取的就是前面留下的 flags。读汇编时要把 flags 当成一组真实状态，而不是注释。
+
+\instruction{cmp} 的 signed/unsigned 区别不在 \instruction{cmp} 本身，而在后续如何解释 flags。比如同样比较两个 32 位位模式，\code{0xffffffff} 和 \code{1}：按 unsigned，前者大于后者；按 signed，前者代表 -1，小于后者。前面的减法设置了同一组 flags，后面的条件码选择不同组合，得到不同结论。这是 C++ signed/unsigned 比较在汇编里分叉的关键。
+
+\instruction{test} 常用来判断零、判断某个位是否设置、或者检查两个 mask 是否有交集。它的好处是不用破坏原操作数。比如 \instruction{test eax, eax} 可以判断 \register{eax} 是否为 0，同时保留 \register{eax} 的值；\instruction{test dil, 2} 可以判断某个标志位，同时不保存中间 mask 结果。这种“只生产条件信息”的模式在控制流和布尔返回里非常常见。
+
+\begin{warningbox}
+看到 \instruction{cmp} 或 \instruction{test} 后，必须向下寻找消费 flags 的指令。只解释它本身不够；如果找不到消费者，可能是 flags 后来被覆盖，或者这段反汇编不是完整热路径。
+\end{warningbox}
+
+\subsection{同一个 \instruction{cmp}，不同条件码}
+
+有符号比较和无符号比较最适合用“同一个 \instruction{cmp}，不同消费者”来理解。假设两个 32 位位模式分别是 \code{0xffffffff} 和 \code{0x00000001}。执行 \instruction{cmp eax, esi} 后，硬件只知道它做了一次低 32 位减法并设置 flags。它并不知道源码想比较 \code{int} 还是 \code{unsigned}。真正的分叉发生在后续条件指令。
+
+\begin{center}
+\begin{tabular}{lll}
+\toprule
+源码语义 & 常见条件码 & 直觉 \\
+\midrule
+\code{int x < y} & \instruction{jl} 或 \instruction{setl} & signed 小于，看 SF 与 OF \\
+\code{int x <= y} & \instruction{jle} 或 \instruction{setle} & signed 小于等于，看 ZF/SF/OF \\
+\code{unsigned x < y} & \instruction{jb} 或 \instruction{setb} & below，unsigned 小于，看 CF \\
+\code{unsigned x <= y} & \instruction{jbe} 或 \instruction{setbe} & below or equal，看 CF/ZF \\
+\code{x == y} & \instruction{je} 或 \instruction{sete} & 相等，只看 ZF \\
+\code{x != y} & \instruction{jne} 或 \instruction{setne} & 不相等，只看 ZF \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\instruction{jl} 里的 less 是 signed less；\instruction{jb} 里的 below 是 unsigned below。很多反汇编器还会显示 \instruction{jc}、\instruction{jnc}、\instruction{ja}、\instruction{jg} 等别名。读者不需要在第一遍背完所有名字，但必须知道 signed 和 unsigned 使用的条件码族不同。看到 \instruction{jb}，优先想到 unsigned 小于或借位；看到 \instruction{jl}，优先想到 signed 小于。
+
+比较常量时也要注意操作数顺序。Intel 语法的 \instruction{cmp eax, 10} 表示用 \register{eax} 减 10 设置 flags。随后 \instruction{jl} 表示 \register{eax} 按 signed 小于 10，\instruction{jb} 表示 \register{eax} 按 unsigned 小于 10。如果换成 \instruction{cmp 10, eax}，逻辑方向就反过来。实际汇编中立即数不能总是作为目的操作数，所以编译器会选择可编码形式；反汇编报告必须根据真实操作数顺序解释条件。
+
+布尔返回常用 \instruction{setcc}。例如：
+
+\begin{lstlisting}
+cmp edi, esi
+setl al
+ret
+\end{lstlisting}
+
+这里 \instruction{setl al} 只写低 8 位 \register{al}，随后返回 \code{bool} 时 ABI 只关心低 8 位结果。若返回 \code{int}，编译器通常还会用 \instruction{movzx eax, al} 或直接生成能把高位清零的序列，确保 \register{eax} 是 0 或 1。不要把 \instruction{setcc} 写成“跳转”，它是条件置字节；也不要忽略它只写一个字节的宽度。
+
+\subsection{min/max、条件移动和比较证据}
+
+比较不一定生成分支。一个简单的 \code{min} 或 \code{max} 可能生成 \instruction{cmp} 加条件移动 \instruction{cmovcc}，也可能生成分支，或者在优化后变成其他等价序列。
+
+\begin{lstlisting}[language=C++]
+extern "C" int min_i32(int a, int b)
+{
+    return a < b ? a : b;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+mov eax, esi
+cmp edi, esi
+cmovl eax, edi
+ret
+\end{lstlisting}
+
+这段汇编没有分支，但仍然有比较。条件移动读取 flags，如果条件成立，就把源寄存器复制到目的寄存器；如果条件不成立，目的寄存器保持旧值。这里 \instruction{cmovl} 的 \code{l} 仍然是 signed less。若源码是 \code{unsigned}，可能变成 \instruction{cmovb} 或其他 unsigned 条件移动。
+
+条件移动的性能好坏取决于场景。它避免了分支预测失败，但也可能让两边值都需要提前计算，并引入数据依赖。第一册不展开完整分支预测模型，但要建立读法：没有 \instruction{jcc} 不代表没有条件语义，看到 \instruction{cmovcc} 和 \instruction{setcc} 同样要追踪 flags 来源。
+
+\subsection{\instruction{test reg, reg} 和零比较}
+
+判断一个寄存器是否为 0，经常看到 \instruction{test eax, eax}，而不是 \instruction{cmp eax, 0}。两者都能设置 ZF 来表达是否为零，但 \instruction{test reg, reg} 编码紧凑，也清楚表达“按位与自己，只关心是否全零”。它还会清除 CF 和 OF，设置 SF/ZF/PF 等 flags。具体 flags 行为在手写汇编中可能重要。
+
+\begin{lstlisting}
+test eax, eax
+je   zero_case
+\end{lstlisting}
+
+这段代码的条件不是“按位与的结果被保存了”，而是“按位与结果为 0，所以 ZF=1”。如果 \register{eax} 非零，\code{eax & eax} 非零，ZF=0。对于指针判空也类似，常见 \instruction{test rdi, rdi} 后接 \instruction{je} 或 \instruction{jne}。
+
+\instruction{test} 也常用于 mask 判断。例如 \instruction{test eax, 7} 可以判断低 3 位是否全为 0，用于检查 8 字节对齐；\instruction{test eax, eax} 是其中的特殊情况，mask 等于自身。报告里应说明它检查的是哪几位，而不是笼统写“测试 eax”。
+
+\begin{keyidea}
+\instruction{cmp} 和 \instruction{test} 的意义要和后续 \instruction{jcc}、\instruction{setcc}、\instruction{cmovcc} 连起来读。条件码才告诉你 signed、unsigned、相等、零值或 mask 的真正语义。
+\end{keyidea}
+
+\section{read-modify-write：一条指令不等于一次微操作}
+
+看：
+
+\begin{lstlisting}
+add dword ptr [rdi], esi
+\end{lstlisting}
+
+ISA 语义可以写成：
+
+\begin{lstlisting}
+tmp = load 4 bytes from [rdi]
+tmp = tmp + esi
+store low 4 bytes of tmp to [rdi]
+update flags
+\end{lstlisting}
+
+它是一条汇编，但语义包含 load、ALU、store。对于普通内存操作，这已经比寄存器加法重；对于原子 read-modify-write，例如 \code{lock add}，还会牵涉 cache coherence 和内存序。
+
+性能工程里要区分：
+
+\begin{lstlisting}
+add eax, esi                  ; register ALU
+add dword ptr [rdi], esi      ; memory RMW
+lock add dword ptr [rdi], esi ; atomic RMW, much heavier
+\end{lstlisting}
+
+本章只要求你看到内存目的操作数时提高警觉：这不是普通寄存器加法。
+
+read-modify-write 指令还有一个重要边界：ISA 把它描述成一条指令，但性能上它不是“免费合并”。处理器仍然要获得内存中的旧值，完成计算，再安排写回。旧值如果不在 L1 cache 中，load 部分会等待；store 部分也要进入 store buffer，并遵守内存顺序规则。它比寄存器上的 \instruction{add eax, esi} 复杂得多。
+
+从正确性角度看，普通 read-modify-write 也不是线程安全的原子操作。两个线程同时执行普通 \instruction{add dword ptr [mem], 1}，可能发生丢失更新，因为 load 和 store 之间没有原子性保证。带 \instruction{lock} 前缀的原子 RMW 才会引入缓存一致性协议层面的互斥效果，但代价也高得多。第 7 章只建立这个边界，后面并发章节再展开。
+
+从汇编阅读角度看，内存目的操作数要明确写出“读内存”和“写内存”。很多报告只写“给内存加上 \register{esi}”，这仍然太粗。应该写：从有效地址读取指定宽度的旧值，与寄存器或立即数计算，把结果写回同一地址，并更新 flags。这样才能为后续性能分析留下足够证据。
+
+\begin{keyidea}
+一条汇编指令是一条 ISA 指令，不等于一次内部操作，也不等于一次内存访问。读性能相关汇编时，要把语义拆成 load、计算、store 和 flags 更新。
+\end{keyidea}
+
+\section{部分寄存器：为什么编译器偏爱 32 位写}
+
+x86-64 的通用寄存器有多个名字表示不同宽度。例如 \register{rax} 是 64 位，\register{eax} 是低 32 位，\register{ax} 是低 16 位，\register{al} 是低 8 位。它们不是四个独立寄存器，而是同一个物理/架构寄存器的不同视图。这个设计让旧代码兼容新架构，但也给汇编阅读带来细节。
+
+\begin{center}
+\begin{tabular}{llll}
+\toprule
+名字 & 宽度 & 写入效果 & 典型用途 \\
+\midrule
+\register{rax} & 64 位 & 写完整 64 位 & 指针、\code{std::uint64_t}、返回 64 位值 \\
+\register{eax} & 32 位 & 写低 32 位，并清零高 32 位 & \code{int} 运算、清高位、返回 32 位值 \\
+\register{ax} & 16 位 & 只写低 16 位，高位保留 & 窄整数、特殊 ABI 或指令约束 \\
+\register{al} & 8 位 & 只写低 8 位，高位保留 & \code{bool}、字节操作、\instruction{setcc} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+最重要的规则是：写 32 位寄存器会把对应 64 位寄存器的高 32 位清零。写 \register{eax} 后，\register{rax} 的高半一定为 0；写 \register{edi} 后，\register{rdi} 的高半一定为 0。这个规则在 x86-64 中非常关键，编译器经常利用它产生零扩展效果和打断旧高位依赖。
+
+相比之下，写 8 位或 16 位寄存器不会自动清高位。执行 \instruction{mov al, 1} 只改变 \register{rax} 的最低 8 位，\register{ah}、\register{ax} 的高 8 位、\register{eax} 的高 24 位和 \register{rax} 的高 32 位都保留旧值。若后续把完整 \register{eax} 或 \register{rax} 当成新值读取，就必须确认旧高位是否仍然合法。编译器通常会通过 \instruction{movzx} 等指令把窄结果扩展成干净的 32 位值。
+
+\begin{lstlisting}
+setne al
+movzx eax, al
+\end{lstlisting}
+
+这两条常见序列表示先根据 flags 产生 0 或 1 的字节，再零扩展到完整 \register{eax}。如果源码返回 \code{bool}，只写 \register{al} 通常足够；如果返回 \code{int}，高位必须明确为 0。这个差异来自 ABI 和返回类型，不是编译器随意多生成了一条指令。
+
+部分寄存器还牵涉性能历史。较老或某些微架构上，先写低 8 位或 16 位、再读完整 32/64 位，可能需要硬件合并旧值和新值，形成额外依赖。现代 CPU 已经改善了很多场景，但编译器仍然倾向于使用 32 位写来产生完整、干净、依赖简单的值。这也是你经常看到 \instruction{xor eax, eax} 而不是 \instruction{xor al, al} 的原因之一。
+
+高 8 位寄存器 \register{ah}、\register{bh}、\register{ch}、\register{dh} 还和 REX 前缀存在编码限制，现代 64 位代码中较少主动使用。初学者不需要记住所有编码细节，但要知道：如果反汇编出现 \register{al}、\register{ax}、\register{eax}、\register{rax}，它们的写入宽度和高位效果不同。报告里不能只写“写 rax”，应写明实际写的是哪一部分。
+
+\begin{warningbox}
+写 \register{eax} 会清零 \register{rax} 高 32 位；写 \register{al} 或 \register{ax} 不会。很多整数汇编 bug 都来自把部分寄存器写入误认为完整寄存器赋值。
+\end{warningbox}
+
+\section{案例：从 C++ 类型转换到扩展指令}
+
+创建：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int sum_bytes(std::uint8_t const* a, std::int8_t const* b, int i)
+{
+    return a[i] + b[i];
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+movsxd rax, edx
+movzx  ecx, byte ptr [rdi + rax]
+movsx  eax, byte ptr [rsi + rax]
+add    eax, ecx
+ret
+\end{lstlisting}
+
+逐条解释：
+
+\begin{lstlisting}
+entry:
+    rdi = a
+    rsi = b
+    edx = i
+
+movsxd rax, edx
+    rax = sign_extend_64(i)
+
+movzx ecx, byte ptr [rdi + rax]
+    load a[i] as uint8_t
+    ecx = zero_extend_32(a[i])
+
+movsx eax, byte ptr [rsi + rax]
+    load b[i] as int8_t
+    eax = sign_extend_32(b[i])
+
+add eax, ecx
+    eax = int(b[i]) + int(a[i])
+\end{lstlisting}
+
+这里 \instruction{movzx} 和 \instruction{movsx} 的差异来自 C++ 类型。换成两个 \code{std::uint8_t}，第二个 load 很可能也变成 \instruction{movzx}。
+
+这个案例的重点不是记住四条指令，而是看清类型如何留下痕迹。两个数组都按字节访问，地址公式也几乎一样；真正区分它们的是扩展方式。无符号字节进入整数加法前必须零扩展，有符号字节进入整数加法前必须符号扩展。后面的 \instruction{add} 只是 32 位低位加法，它并不知道两个源值原来来自什么类型。
+
+写报告时应该把这类案例分成三层。第一层是内存事实：两个 load 都读取 1 字节，地址分别是 \register{rdi} 加下标、\register{rsi} 加下标。第二层是扩展事实：一个零扩展到 32 位，一个符号扩展到 32 位。第三层是 C++ 推论：这对应 \code{std::uint8_t} 和 \code{std::int8_t} 的整数提升。三层都写清楚，结论才稳。
+
+还要注意 \code{i} 的扩展。参数 \code{i} 是 \code{int}，地址计算需要 64 位索引，所以编译器用 \instruction{movsxd}。如果源码使用 \code{std::size_t}，入口参数可能已经是 64 位无符号值，汇编形态可能不同。不要把 \instruction{movsxd} 当成所有数组访问固定模板，它来自具体下标类型和目标地址宽度。
+
+\section{案例：地址计算、常数乘法和结构体大小}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+struct Node {
+    int key;
+    int value;
+    int next;
+};
+
+extern "C" int get_value(Node const* nodes, int i)
+{
+    return nodes[i].value;
+}
+\end{lstlisting}
+
+布局：
+
+\begin{lstlisting}
+sizeof(Node)       = 12
+offset(Node,value) = 4
+addr(nodes[i].value) = base + i * 12 + 4
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+movsxd rax, esi
+lea    rax, [rax + rax*2]
+mov    eax, dword ptr [rdi + rax*4 + 4]
+ret
+\end{lstlisting}
+
+解释：
+
+\begin{lstlisting}
+rax = sign_extend_64(i)
+rax = rax + rax * 2 = i * 3
+address = base + (i * 3) * 4 + 4
+        = base + i * 12 + 4
+\end{lstlisting}
+
+这个案例很典型：结构体大小是 12，不能直接作为 x86 scale，于是编译器拆成 \code{i*3} 再 \code{*4}。
+
+这个案例还训练一个重要能力：不要被单个 scale 误导。最后的内存操作数里看起来是 \code{rax*4 + 4}，但 \register{rax} 已经被上一条 \instruction{lea} 改成了 \code{i*3}。完整地址公式必须沿着寄存器定义链往前追，不能只看最后一条内存指令。最终步长是 \code{3*4 = 12}，不是 4。
+
+复杂数据布局经常会出现这种多步地址计算。结构体大小不是 1、2、4、8 时，x86 寻址模式无法直接表达 \code{i * sizeof(T)}，编译器就会先构造某个中间倍数，再在内存操作数中使用允许的 scale。二维数组、AoS/AoSoA 布局、张量 strides 也会出现类似模式。第 7 章只用小结构体示范，后面内存和性能章节会继续扩大。
+
+如果要验证字段 offset，最好同时用 C++ 的 \code{sizeof} 和 \code{offsetof}，再对照汇编。不要只从汇编猜结构体，因为不同字段组合可能产生相同 offset。汇编能证明机器访问了某个偏移，源码和布局工具才能证明这个偏移对应哪个字段。
+
+\section{案例：branchless mask 的第一眼}
+
+后面会系统讲 branchless 技术，这里先看一个基础模式：
+
+\begin{lstlisting}[language=C++]
+extern "C" unsigned mask_if_nonzero(unsigned x)
+{
+    return x != 0 ? 0xffffffffu : 0u;
+}
+\end{lstlisting}
+
+一种可能汇编：
+
+\begin{lstlisting}
+neg edi
+sbb eax, eax
+ret
+\end{lstlisting}
+
+简化解释：
+
+\begin{itemize}
+  \item \instruction{neg edi} 计算 \code{0 - x}，并根据是否借位设置 CF。
+  \item 如果 \code{x != 0}，CF 通常为 1；如果 \code{x == 0}，CF 为 0。
+  \item \instruction{sbb eax, eax} 计算 \code{eax = eax - eax - CF}。
+  \item 当 CF 为 1，结果是 \code{0xffffffff}；当 CF 为 0，结果是 0。
+\end{itemize}
+
+这个例子不要求你现在熟练使用 \instruction{sbb}，但要建立意识：整数指令和 flags 可以组合出没有分支的 mask。SIMD tail mask、选择、量化 clamp、条件累加等场景会反复出现这种思想。
+
+这个例子容易让人兴奋，也容易让人过早滥用 branchless 写法。这里的教学目的不是让你立刻手写 \instruction{neg} 加 \instruction{sbb}，而是理解整数指令、flags 和补码可以合成布尔掩码。编译器在某些场景会自动选择这种形式，尤其当分支预测代价可能高于几条整数指令时。
+
+但是 branchless 并不天然更快。它可能增加指令数量，延长依赖链，消耗执行端口，或者让本来很好预测的分支变成额外计算。是否值得使用，要看数据分布、分支可预测性、指令代价和整体热路径。第 8 章会更系统地讲分支和条件移动；本章只把 mask 生成作为整数指令组合能力的预告。
+
+从报告角度看，这类代码更要写清 flags 依赖。不能只写“生成 mask”。应说明哪条指令设置 CF，哪条指令读取 CF，为什么结果变成全零或全一。否则读者无法判断这个技巧是否真的成立。
+
+\section{案例：signed 和 unsigned 比较只差一个条件码}
+
+下面两个函数源码结构几乎相同，唯一差别是类型：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool less_i32(int a, int b)
+{
+    return a < b;
+}
+
+extern "C" bool less_u32(unsigned a, unsigned b)
+{
+    return a < b;
+}
+\end{lstlisting}
+
+优化后汇编可能都是先比较两个参数，再设置低字节返回值：
+
+\begin{lstlisting}
+less_i32:
+    cmp edi, esi
+    setl al
+    ret
+
+less_u32:
+    cmp edi, esi
+    setb al
+    ret
+\end{lstlisting}
+
+核心差异不是 \instruction{cmp}，而是 \instruction{setl} 与 \instruction{setb}。\instruction{setl} 按 signed less 解释 flags，\instruction{setb} 按 unsigned below 解释 flags。若 \register{edi} 的位模式是 \code{0xffffffff}，\register{esi} 是 \code{1}，第一个函数把它解释成 -1 小于 1，返回真；第二个函数把它解释成 4294967295 小于 1，返回假。
+
+这个案例说明，汇编里没有类型标签，但类型仍然改变机器代码的条件码。报告必须写出“同一条 \instruction{cmp} 的 flags 被不同条件码消费”。如果只写“\instruction{cmp} 比较 a 和 b”，两个函数会被错误地解释成一样。
+
+若把源码改成混合类型：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool less_mixed(int a, unsigned b)
+{
+    return a < b;
+}
+\end{lstlisting}
+
+它通常会更接近 unsigned 版本，因为 usual arithmetic conversions 会把 \code{a} 转成 unsigned 后比较。这个结果对很多人反直觉，但它是 C++ 类型规则的直接后果。底层性能代码里，索引、长度、偏移、返回值的 signed/unsigned 选择必须有统一策略，否则边界判断很容易在汇编层变成另一种语义。
+
+\section{案例：除以常数为什么没有 \instruction{idiv}}
+
+考虑三个函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" unsigned u_div8(unsigned x) { return x / 8u; }
+extern "C" int      i_div8(int x)      { return x / 8; }
+extern "C" unsigned u_div10(unsigned x){ return x / 10u; }
+\end{lstlisting}
+
+第一个函数通常可以用 \instruction{shr}。第二个函数虽然也是除以 8，但 signed 负数要向零截断，编译器可能生成提取符号、加偏置、\instruction{sar} 的组合。第三个函数除数不是 2 的幂，优化后可能出现乘以大常数、取高位和右移，而不是 \instruction{div}。
+
+这三个函数是非常好的课堂对照。它们都写着除法，但汇编形态分别体现了 unsigned 右移、signed 舍入修正和常数除法强度削弱。学生如果只记“除法对应 \instruction{idiv}”，会完全读错；如果只记“除以常数会优化”，也会漏掉 signed 舍入规则。正确答案必须把源码类型、除数形状和 C++ 除法语义连起来。
+
+写这类报告时，不要求手工证明 magic number 的正确性，但要做三件事。第一，指出源码是否 signed。第二，指出除数是否为 2 的幂。第三，指出生成序列是为了避免高延迟除法，同时保持语言规定的商。若报告里出现“编译器把除法错编成乘法”这种说法，说明对整数优化还没有入门。
+
+\section{案例：溢出检测和普通加法的差别}
+
+再比较两个函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_plain(int a, int b)
+{
+    return a + b;
+}
+
+extern "C" bool add_checked(int a, int b, int* out)
+{
+    return __builtin_add_overflow(a, b, out);
+}
+\end{lstlisting}
+
+第一个函数只要求在定义良好的 signed 加法范围内返回数学结果。编译器可以生成一条 \instruction{lea} 或 \instruction{add}，并不需要保存 OF。第二个函数要求返回是否溢出，并把低位结果写入 \code{out}。汇编里通常会看到会设置 flags 的加法、store，以及 \instruction{seto} 或等价条件处理。两者看起来都做加法，但语义合同完全不同。
+
+这个对照能纠正一个常见误解：不是所有加法都需要检查溢出。C++ 普通 signed 加法没有把溢出变成返回值；一旦溢出，程序语义不再定义良好。只有源码显式要求检查，编译器才需要把 OF 转化成可见结果。底层教材必须区分“硬件产生了 OF”与“程序语义需要观察 OF”。
+
+在安全关键代码、解析外部输入、分配内存大小计算、图像尺寸和 tensor 元素个数计算中，显式溢出检查非常重要。例如计算 \code{n * sizeof(T)} 时，如果乘法溢出再传给 allocator，可能导致缓冲区过小。工程代码应当使用定义良好的检查方式，而不是依赖回绕后再猜测。后续内存章节会继续讨论这类问题。
+
+\section{性能注意点：延迟、吞吐、依赖和 flags}
+
+本章不做完整微架构表，但必须先建立几个判断：
+
+\begin{enumerate}
+  \item 寄存器 ALU 指令通常很便宜。
+  \item 乘法通常比加法和位运算更重。
+  \item 内存操作比寄存器操作更容易受 cache、TLB、store buffer 影响。
+  \item 更新 flags 会产生 flags 依赖；如果后续不需要 flags，\instruction{lea} 可能避免不必要的 flags 写。
+  \item 32 位写入清零高位，经常用于打断旧高位依赖。
+  \item 小宽度部分寄存器写入可能引入额外依赖或需要合并旧值。
+\end{enumerate}
+
+例如：
+
+\begin{lstlisting}
+add eax, esi      ; writes eax and flags
+lea eax, [rdi+rsi]; writes eax, does not write flags
+\end{lstlisting}
+
+如果后面紧跟条件跳转读取上一条 \instruction{cmp} 的 flags，那么中间插入会写 flags 的指令可能破坏条件。编译器会避开这种错误，但手写汇编必须自己负责。
+
+这一节只给定性直觉，不给具体周期表，是有意的。不同 CPU 微架构上，整数加法、乘法、load、store、\instruction{lea} 的 latency 和 throughput 都可能不同；同一指令在不同寻址形式下也可能代价不同。第一册的目标是让你先能分类：哪些是寄存器 ALU，哪些访问内存，哪些产生 flags 依赖，哪些可能是 RMW，哪些只是地址计算。
+
+真正的性能判断需要结合上下文。单独一条乘法可能不是瓶颈，如果循环受内存带宽限制；一条 load 也可能很便宜，如果数据稳定命中 L1；一条 \instruction{lea} 也可能不是免费，如果它在关键依赖链上或形式复杂。不要把“某指令通常更快”变成绝对结论。后续测量章节会要求用数据验证。
+
+不过，有几个阅读习惯现在就要养成。看到寄存器到寄存器 ALU，先标记依赖链；看到内存操作，先标记 load/store 和地址来源；看到 flags 写入，检查后续是否读取；看到 \instruction{imul}，确认是否常数乘法已经无法用简单地址计算表达；看到 \instruction{movsx}/\instruction{movzx}，回到 C++ 类型。这样读出来的汇编，才有资格进入性能分析。
+
+\begin{mentalmodel}
+第一册不让你背每条指令的周期数，而是训练分类和证据。分类正确，第二册查具体微架构数据才有意义；分类错误，周期表背得再熟也会判断错。
+\end{mentalmodel}
+
+\section{整数汇编报告应该怎样写}
+
+本章的实验报告要比上一章更严格。上一章主要训练语法和地址公式；本章必须把类型、位宽、扩展、flags 和语言规则写进去。
+
+报告开头应列出源码中涉及的整数类型，尤其是 \code{std::int8_t}、\code{std::uint8_t}、\code{int}、\code{unsigned}、\code{std::size_t}、\code{std::uintptr_t}。不要只贴源码。你要说明这些类型的宽度、signed/unsigned 属性，以及它们为什么会影响扩展、比较、移位或地址计算。
+
+逐条注释时，至少写出六项：指令读什么，写什么，操作数宽度，是否访问内存，是否更新 flags，位模式如何解释。遇到扩展指令，要说明高位如何填充；遇到移位，要说明计数是否合法以及是逻辑还是算术；遇到位运算，要说明 mask 的二进制含义；遇到 \instruction{cmp}/\instruction{test}，要说明后续消费者。
+
+报告还要写语言边界。比如 signed 溢出不能当成定义良好回绕；负下标地址计算不代表 C++ 允许访问；移位计数越界不能靠硬件屏蔽解释成合法；普通内存 RMW 不等于原子操作。这些边界是本章质量要求的一部分。没有边界说明的报告，只能算指令翻译，不能算教材式分析。
+
+\begin{keyidea}
+整数汇编报告的最低标准是：从 C++ 类型到机器位宽，从指令读写到 flags，从地址公式到语言合法性，都能闭环解释。
+\end{keyidea}
+
+\section{flags 不是附属品：它们是隐藏的数据流}
+
+很多读者学整数指令时只盯着通用寄存器，忽略 flags。这样读简单加法还勉强可以，一旦遇到比较、条件跳转、条件移动、溢出检查、进位链、多精度运算，就会失去主线。flags 不是装饰性副作用，而是一组隐含的数据流。某条指令写 flags，后面的 \instruction{jcc}、\instruction{setcc}、\instruction{cmovcc}、\instruction{adc}、\instruction{sbb} 等指令读取 flags。只要中间有另一条写 flags 的指令，原来的条件信息就被覆盖。
+
+读 flags 要先抓住四个常用标志位：
+
+\begin{center}
+\begin{tabular}{p{0.15\linewidth}p{0.31\linewidth}p{0.38\linewidth}}
+\toprule
+标志位 & 直觉 & 常见用途 \\
+\midrule
+ZF & 结果是否为 0 & 相等比较、零测试、循环结束 \\
+SF & 结果最高有效位是否为 1 & signed 结果符号的一部分证据 \\
+CF & 无符号加法进位或减法借位 & unsigned 比较、多精度加减 \\
+OF & signed 补码溢出 & signed 比较、显式溢出检测 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这四个标志位不能孤立理解。ZF 常常比较直观：\instruction{sub} 或 \instruction{cmp} 的结果为零，说明两个操作数相等。CF 和 OF 最容易混淆：CF 是无符号视角下低 N 位放不下或发生借位，OF 是有符号补码视角下数学结果超出范围。SF 只是结果最高位，不等于“signed 比较结论”，因为 signed 比较还要考虑 OF。条件码之所以有 \instruction{jl} 和 \instruction{jb} 的区别，就是因为它们消费 flags 的方式不同。
+
+\subsection{把 flags 当成一个临时寄存器}
+
+可以把 flags 想成一个没有名字的临时寄存器。下面这段代码：
+
+\begin{lstlisting}
+cmp edi, esi
+setl al
+\end{lstlisting}
+
+可以理解为：
+
+\begin{lstlisting}
+tmp_flags = compare_signed_related(edi - esi)
+al = tmp_flags.signed_less ? 1 : 0
+\end{lstlisting}
+
+如果中间插入一条会写 flags 的指令：
+
+\begin{lstlisting}
+cmp edi, esi
+add ecx, 1
+setl al
+\end{lstlisting}
+
+那么 \instruction{setl} 读取的是 \instruction{add} 的 flags，不再是 \instruction{cmp} 的 flags。这就是为什么编译器在调度指令时要尊重 flags 依赖，为什么手写汇编不能随意在比较和跳转之间插入指令。某些指令如 \instruction{lea} 不写 flags，所以常常可以放在比较和条件跳转之间而不破坏条件；某些指令如 \instruction{inc}、\instruction{dec} 写一部分 flags 而不写 CF，也会带来更细的依赖问题。
+
+flags 的生命周期通常很短。编译器喜欢让 \instruction{cmp} 或 \instruction{test} 紧贴 \instruction{jcc}，一个原因是读者容易看懂，另一个原因是减少 flags 活跃区间，给指令调度留下空间。若你看到比较和使用 flags 的指令隔得很远，不要只看最近的 \instruction{cmp}，要逐条检查中间是否有 \instruction{add}、\instruction{sub}、\instruction{and}、\instruction{or}、\instruction{xor}、\instruction{test}、\instruction{imul} 等可能写 flags 的指令。
+
+\subsection{\instruction{cmp}、\instruction{sub} 和条件码的关系}
+
+\instruction{cmp a, b} 本质上计算 \code{a - b} 并设置 flags，但不保存结果。Intel 语法中目的操作数在前，源操作数在后，所以：
+
+\begin{lstlisting}
+cmp edi, esi
+\end{lstlisting}
+
+设置的是 \code{edi - esi} 的 flags。若后面是：
+
+\begin{lstlisting}
+jl .Lless
+\end{lstlisting}
+
+语义是 signed \code{edi < esi}；若后面是：
+
+\begin{lstlisting}
+jb .Lbelow
+\end{lstlisting}
+
+语义是 unsigned \code{edi < esi}。同一个 \instruction{cmp} 可以服务 signed 或 unsigned 条件，区别在消费者。报告中写“\instruction{cmp} 比较两个数”不够，必须写“后续条件码如何解释这次减法 flags”。
+
+减法结果的低 N 位相同，但 signed 和 unsigned 结论不同。以 8 位直觉说明，\code{0xff - 0x01} 的低位结果是 \code{0xfe}。按 unsigned，255 大于 1，不发生借位，CF 为 0；按 signed，-1 小于 1，signed less 条件应为真。硬件不需要把寄存器标成 signed，它只提供 flags，条件码负责选择解释。
+
+\subsection{为什么 \instruction{test} 常用于零测试}
+
+\instruction{test a, b} 本质上计算 \code{a \& b} 并设置 flags，但不保存结果。最常见形式是：
+
+\begin{lstlisting}
+test edi, edi
+je .Lzero
+\end{lstlisting}
+
+一个数与自身按位与，结果仍是它自己。因此 ZF 说明 \register{edi} 是否为 0。编译器常用 \instruction{test reg, reg} 做零测试，因为它不需要额外立即数，也能设置后续条件跳转需要的 flags。若你看到 \instruction{test} 后接 \instruction{js}，则是在测试结果最高位；若 \instruction{test mask, value} 后接 \instruction{jne}，通常是在测试某些 bit 是否至少有一位为 1。
+
+\instruction{test} 与 \instruction{cmp reg, 0} 常能表达相同零测试，但 flags 细节和编码可能不同。报告不需要宣称某一种一定更快，只要说明它生产了后续条件需要的 ZF/SF 等信息。若后续是 signed 大小比较，就不能把任意 \instruction{test} 误解成 \instruction{cmp} 的替代，因为 signed 大小比较通常需要减法相关的 OF 信息。
+
+\section{整数宽度是一种契约}
+
+每条整数指令都有宽度。宽度决定读取多少位、写入多少位、flags 按多少位结果计算、立即数如何扩展、内存访问几个字节、写入 32 位寄存器是否清零高位。宽度不是语法细节，而是机器契约。一个 8 位 \instruction{add al, 1} 和一个 32 位 \instruction{add eax, 1} 都叫 \instruction{add}，但它们影响的寄存器部分、flags 计算宽度和后续解释都不同。
+
+读宽度时，先看寄存器名。 \register{rax} 是 64 位，\register{eax} 是低 32 位，\register{ax} 是低 16 位，\register{al} 是低 8 位。内存操作数则需要从指令或显式 ptr 标记判断，例如 \code{byte ptr}、\code{word ptr}、\code{dword ptr}、\code{qword ptr}。有些汇编行从寄存器操作数就能推出内存宽度，例如 \instruction{mov dword ptr [rdi], eax} 里的 \register{eax} 已经说明写 4 字节；有些行必须写 ptr 标记，否则汇编器无法判断。
+
+\subsection{写 32 位寄存器为什么常见}
+
+x86-64 中写 32 位通用寄存器会把对应 64 位寄存器的高 32 位清零。例如写 \register{eax} 会让 \register{rax} 高半部分变成 0。这条规则对读汇编非常重要。它解释了为什么编译器经常用 \instruction{xor eax, eax} 清零返回值，也解释了为什么读取 \code{std::uint32_t} 后返回 \code{std::uint64_t} 可能只需要写 \register{eax}。
+
+但这也会制造陷阱。假设入口 \register{rdi} 是 64 位指针，如果代码写：
+
+\begin{lstlisting}
+mov edi, edi
+\end{lstlisting}
+
+这不是无效果操作，它会清零 \register{rdi} 高 32 位，从而破坏地址。编译器不会这样处理真实指针，但手写汇编或错误约束的内联汇编可能造成灾难。相反，若值的语义本来就是无符号 32 位扩展到 64 位，写 32 位寄存器正好表达了需要的零扩展。
+
+\subsection{部分寄存器写入要检查后续合并}
+
+写 8 位或 16 位部分寄存器不会自动清零高位。例如：
+
+\begin{lstlisting}
+mov al, 1
+\end{lstlisting}
+
+只写 \register{rax} 的低 8 位，其余位保持旧值。若后续读取 \register{eax} 或 \register{rax}，必须知道高位来自哪里。编译器通常会在需要完整整数结果时使用 \instruction{movzx} 清高位，例如：
+
+\begin{lstlisting}
+setne al
+movzx eax, al
+\end{lstlisting}
+
+\instruction{setne al} 只产生低 8 位布尔结果，\instruction{movzx eax, al} 把它变成 0 或 1 的 32 位整数结果。若报告只写“\instruction{setne} 返回 bool”，就漏掉了后续扩展对返回寄存器正确性的作用。C++ \code{bool} 返回值和 \code{int} 返回值在 ABI 上都可能使用 \register{al}/\register{eax} 的有效部分，但调用者如何读取、编译器如何清理高位，仍要看具体代码和类型。
+
+\subsection{立即数宽度和符号扩展}
+
+立即数也有宽度。某些 x86 指令会把较小立即数符号扩展到操作数宽度，例如常见的 \instruction{add rax, imm32} 会把 32 位立即数符号扩展后参与 64 位加法。另一些形式有专门短立即数编码。反汇编中显示的 \code{add rax, -1} 可能编码为较短立即数，而不是完整 64 位常量。
+
+这通常不影响高层语义，但会影响机器码字节和某些边界常量。若你要解释指令长度、重定位、机器码字节或手写汇编编码，就不能只看助记符。对于普通阅读，至少要知道：操作数宽度由寄存器或内存宽度决定，立即数会按指令规则扩展或截断。若立即数超出可编码范围，汇编器可能选择不同编码或报错。
+
+\begin{keyidea}
+宽度决定结果，不只是显示风格。任何整数指令分析都必须先回答“这是几位运算”，再谈 signed、unsigned、溢出、返回值和性能。
+\end{keyidea}
+
+\section{从 C++ 整数表达式推到指令选择}
+
+读整数汇编的另一半工作，是从 C++ 表达式规则理解编译器为什么可以这么生成。C++ 源码中的 \code{+}、\code{-}、\code{*}、\code{/}、\code{<}、\code{>>} 并不直接指定某条机器指令，而是指定语言语义。编译器只要保持定义良好程序的可观察行为，就可以选择不同机器形态。
+
+\subsection{普通加法与显式溢出检查}
+
+看两个函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int add_plain(int a, int b)
+{
+    return a + b;
+}
+
+extern "C" bool add_checked(int a, int b, int* out)
+{
+    return __builtin_add_overflow(a, b, out);
+}
+\end{lstlisting}
+
+\code{add_plain} 的语言合同是在不发生 signed 溢出的定义良好输入上返回和。编译器可以用 \instruction{lea}，也可以用 \instruction{add}，不需要保留 OF 给调用者。若输入导致 signed 溢出，C++ 层没有定义良好结果，不能用“硬件回绕了”反推源码合法。
+
+\code{add_checked} 的合同完全不同。它要求把加法低位结果写入 \code{out}，并返回是否溢出。此时 OF 或等价溢出检测必须转化成可见布尔值。你可能看到 \instruction{add} 后接 \instruction{seto}，也可能看到其他序列。报告应写清楚：这里观察 OF 不是因为所有 signed 加法都必须检查，而是因为源码显式要求检查。
+
+\subsection{无符号回绕是语言语义，不是优化失败}
+
+\code{unsigned} 加法按模 \(2^N\) 回绕，这是 C++ 语言定义。编译器不能假设它不溢出，从而像 signed 那样使用“无溢出”前提做某些变换。例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool wrapped(unsigned x)
+{
+    return x + 1 < x;
+}
+\end{lstlisting}
+
+对无符号整数，这个表达式只在 \code{x} 为最大值时为真。编译器可能把它优化成与最大值比较。若把类型改成 \code{int}，\code{x + 1 < x} 在定义良好 signed 语义下永远为假，因为 \code{x + 1} 不允许溢出；编译器可以直接返回 false。两者的机器码差异来自语言规则，不是硬件加法器不同。
+
+\subsection{右移要区分算术和逻辑}
+
+右移是另一个类型驱动的典型例子。无符号右移应高位补 0，常对应 \instruction{shr}；有符号负数右移在现代编译器和目标上通常使用算术右移 \instruction{sar} 以复制符号位，但要注意语言标准和实现定义细节。对于非负 signed 值，\instruction{shr} 和 \instruction{sar} 的结果可能相同；对于负数，它们完全不同。
+
+除以 2 的幂也不能简单等同右移。无符号除以 \(2^k\) 可以直接逻辑右移；signed 除法在 C++ 中向零截断，而算术右移对负数更接近向负无穷取整。编译器若把 signed 除以 8 改写成移位，通常需要先做偏置修正。看到几条看似多余的加法、比较、移位，不要急着说“编译器没有优化好”，它可能是在保持 C++ 舍入语义。
+
+\subsection{比较指令不携带类型，条件码携带解释}
+
+比较表达式的类型信息通常体现在条件码上。下面两个函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" bool less_i(int a, int b) { return a < b; }
+extern "C" bool less_u(unsigned a, unsigned b) { return a < b; }
+\end{lstlisting}
+
+可能都使用 \instruction{cmp edi, esi}。差异在后续 \instruction{setl} 和 \instruction{setb}，或 \instruction{jl} 和 \instruction{jb}。若是混合 signed/unsigned，C++ 的 usual arithmetic conversions 可能让比较转成 unsigned 条件码。报告必须把源码类型、转换规则和条件码三者连起来。
+
+\section{多精度整数的第一眼：\instruction{adc} 和 \instruction{sbb}}
+
+虽然第一册不展开大整数库实现，但理解 \instruction{adc} 和 \instruction{sbb} 能帮助你看懂 CF 的真实用途。普通 \instruction{add} 做低 N 位加法并设置 CF；\instruction{adc} 会把 CF 也加进去。这样可以把多个机器字拼成更宽的整数。
+
+例如做 128 位无符号加法，低 64 位相加后产生的进位要传给高 64 位：
+
+\begin{lstlisting}
+add rax, rdx
+adc rcx, r8
+\end{lstlisting}
+
+可以理解为：
+
+\begin{lstlisting}
+low  = low_a + low_b
+carry = carry_out(low)
+high = high_a + high_b + carry
+\end{lstlisting}
+
+这里 CF 就是跨指令的数据。它不是“顺便设置的标志”，而是高位加法的输入。类似地，\instruction{sbb} 会把借位纳入减法，常用于多精度减法，也常用于生成全零或全一掩码：
+
+\begin{lstlisting}
+cmp edi, esi
+sbb eax, eax
+\end{lstlisting}
+
+这类序列的具体含义取决于 CF。若比较后发生 unsigned 借位，\instruction{sbb eax, eax} 可以把 \register{eax} 变成 \code{0xffffffff}；否则变成 0。优化器和手写高性能代码有时利用这种性质构造 branchless mask。读到这类代码时，必须把 CF 从生产者追到消费者，否则完全看不懂。
+
+\begin{warningbox}
+\instruction{adc} 和 \instruction{sbb} 说明 flags 可以参与真实数据计算。不要把 flags 只看成条件跳转的附属信息。
+\end{warningbox}
+
+\section{整数错误诊断：从症状回到位宽}
+
+整数 bug 在底层经常表现为“偶尔越界”“大输入才错”“负数才错”“跨平台才错”。诊断时不要先猜算法，而要回到位宽、扩展、比较和溢出四类问题。
+
+第一类是扩展错误。无符号字节被符号扩展，\code{0xff} 变成 -1；有符号字节被零扩展，-1 变成 255。症状常见于解析二进制协议、图像像素、压缩数据、网络包和字符处理。检查方法是找 \instruction{movsx} 与 \instruction{movzx}，再回到源码类型确认 \code{char}、\code{signed char}、\code{unsigned char}、\code{std::byte}、\code{std::uint8_t} 是否使用正确。
+
+第二类是比较语义错误。signed 与 unsigned 混合导致负数变成巨大无符号数，边界检查失效或循环不退出。检查方法是找 \instruction{setb}/\instruction{jb}/\instruction{ja} 这类 unsigned 条件码，以及源码中 \code{std::size_t} 和 \code{int} 的混合。不要看到源码里写了 \code{i < n} 就假设是 signed 比较；类型转换可能已经改变语义。
+
+第三类是溢出错误。外部输入参与大小计算，例如 \code{width * height * channels}，若在 32 位中溢出，再用于分配内存，就可能产生小缓冲区和大写入。检查方法是确认乘法和加法的类型宽度，确认是否使用显式溢出检查或更宽类型，确认编译器是否有机会假设 signed 溢出不发生。机器上看到回绕不等于 C++ 程序合法。
+
+第四类是移位错误。移位计数为负或大于等于类型宽度，在 C++ 中不是普通硬件屏蔽语义；signed 负数右移还要注意实现语义和目标假设。检查方法是确认计数来源是否受约束，确认源码是否先做范围检查，确认汇编中是否有 mask 或 branch 保护。若代码依赖 x86 对移位计数的硬件屏蔽，而源码没有合法化计数，就可能被优化器按未定义行为前提改写。
+
+第五类是地址计算窄化。下标或字节数在 32 位里计算后再扩展到 64 位，可能在大输入下回绕。检查方法是找 \instruction{movsxd}、32 位 \instruction{imul}、写 \register{eax}/\register{ecx} 后用于地址的模式。地址公式中的 index 若来自 32 位结果，要问源码是否本来就限制了范围，还是意外截断了 \code{std::size_t}。
+
+\begin{mentalmodel}
+整数问题的诊断顺序是：位宽是否足够，扩展是否正确，比较是否按预期 signed/unsigned，溢出是否定义良好，移位计数是否合法，地址计算是否在足够宽度上完成。
+\end{mentalmodel}
+
+\section{把整数指令和内存安全连起来}
+
+整数指令本身只处理位模式，但它们经常决定内存安全。数组下标、长度、容量、字节偏移、对齐、对象大小、分配尺寸，最终都要通过整数计算进入地址公式。一个整数语义错误，可能不会在算术位置崩溃，而是在很远的 load/store 处表现为越界访问。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" int load_bad(int const* p, int n, int i)
+{
+    if (i < n) {
+        return p[i];
+    }
+    return 0;
+}
+\end{lstlisting}
+
+这个检查没有保证 \code{i >= 0}。若 \code{i} 是 -1，signed \code{i < n} 可能为真，地址公式 \code{p + i * 4} 会访问数组前面的内存。汇编可能清楚显示 \instruction{movsxd} 把 \code{i} 符号扩展到 64 位，再用于 \code{[rdi + rax*4]}。这里汇编没有错，错的是源码边界条件不完整。
+
+再看无符号混合：
+
+\begin{lstlisting}[language=C++]
+extern "C" int load_mixed(int const* p, int i, unsigned n)
+{
+    if (i < n) {
+        return p[i];
+    }
+    return 0;
+}
+\end{lstlisting}
+
+这里比较可能按 unsigned 语义进行，负数 \code{i} 会转换成很大的无符号值，通常使检查失败。这一次负数可能不会进入 load，但语义已经和许多程序员直觉不同。若后续又把 \code{i} 转成其他宽度，问题会更复杂。底层教材要训练的不是记住哪个例子安全，而是知道边界检查必须同时覆盖下界、上界、类型转换和地址计算宽度。
+
+整数和内存安全还在分配大小上相遇：
+
+\begin{lstlisting}[language=C++]
+std::size_t bytes = count * sizeof(T);
+void* p = std::malloc(bytes);
+\end{lstlisting}
+
+若 \code{count * sizeof(T)} 溢出，分配可能小于实际需要。之后循环按 \code{count} 写入，会越过缓冲区。汇编里可能只看到一次乘法或移位，再传给 allocator。判断它是否安全，不能只看乘法指令，还要看源码是否检查 \code{count <= max / sizeof(T)}，或使用了能报告溢出的安全封装。性能优化和安全检查在这里不是对立关系；定义清楚的整数前提，反而让编译器和读者都更容易推理。
+
+\section{范围分析：整数值不是只有当前位模式}
+
+读整数汇编时，除了当前寄存器位模式，还要关心值的范围。范围分析回答“这个值可能是多少”。编译器会利用范围信息做优化；程序员也要利用范围信息判断访问是否合法、比较是否冗余、扩展是否安全、溢出是否可能。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" int load_checked(int const* p, int n, int i)
+{
+    if (0 <= i && i < n) {
+        return p[i];
+    }
+    return 0;
+}
+\end{lstlisting}
+
+进入 load 块时，路径条件给出范围：
+
+\begin{lstlisting}
+i >= 0
+i < n
+\end{lstlisting}
+
+如果还知道 \code{n <= capacity} 且 \code{p} 指向至少 \code{capacity} 个元素，那么 \code{p[i]} 是边界内访问。汇编里可能只看到一次 signed compare 或 unsigned trick，但安全性来自路径条件和对象范围共同成立。只看地址公式 \code{p + i*4} 不够。
+
+\subsection{无符号范围技巧}
+
+编译器常把两个 signed 边界检查合并成一次 unsigned 比较。源码：
+
+\begin{lstlisting}[language=C++]
+if (0 <= i && i < n)
+\end{lstlisting}
+
+在某些前提下可以改写成：
+
+\begin{lstlisting}
+cmp edi, esi
+jae .Lout
+\end{lstlisting}
+
+若 \register{edi} 是 \code{i}，\register{esi} 是 \code{n}，unsigned \code{i >= n} 会同时处理负数 \code{i}：负数按无符号解释为很大的数，自然大于等于非负 \code{n}，进入 out。这个技巧依赖 \code{n} 非负或范围已知。报告中看到 unsigned 条件码，不要立刻说源码使用 unsigned；它也可能是编译器用 unsigned 比较实现 signed 下界加上界检查。
+
+这种范围技巧说明条件码和源码类型不是一一对应。分析时要写：
+
+\begin{lstlisting}
+machine:
+    unsigned compare i and n
+possible source meaning:
+    range check 0 <= i < n if n is known non-negative
+evidence needed:
+    earlier path or type proves n >= 0
+\end{lstlisting}
+
+\subsection{范围信息会让检查消失}
+
+如果编译器已经知道某个值范围，后续检查可能被删除。例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" int f(unsigned char x)
+{
+    if (x < 256) {
+        return x;
+    }
+    return -1;
+}
+\end{lstlisting}
+
+\code{unsigned char} 的值范围已经是 0 到 255，条件永远为真，优化后可能只返回 \code{x}。这不是编译器忽略检查，而是检查在语言类型下冗余。类似地，数组循环中如果前面已经检查了 \code{n > 0}，循环内部可能不再重复检查。
+
+范围信息也可能来自循环。若循环写成 \code{for (int i = 0; i < n; ++i)}，进入循环体时编译器知道 \code{i < n}，也知道 \code{i} 从 0 开始递增。但如果 \code{i} 可能 signed 溢出，语言规则又会影响优化。范围分析、溢出规则和循环优化紧密相关。
+
+\section{整数转换审查：从源类型到目标寄存器}
+
+跨函数、跨 ABI、跨内存加载时，整数经常发生转换。审查转换时，按下面链路：
+
+\begin{enumerate}
+  \item 源值的类型和范围是什么。
+  \item 目标类型的宽度和 signed/unsigned 属性是什么。
+  \item 转换是保值、取模、符号扩展、零扩展还是实现定义。
+  \item 汇编中对应 \instruction{movsx}、\instruction{movzx}、写 32 位寄存器还是截断 store。
+  \item 后续按什么语义使用转换结果。
+\end{enumerate}
+
+例如读取字节：
+
+\begin{lstlisting}[language=C++]
+extern "C" int read_byte(unsigned char const* p)
+{
+    return *p;
+}
+\end{lstlisting}
+
+汇编中应看到零扩展语义。若是：
+
+\begin{lstlisting}[language=C++]
+extern "C" int read_sbyte(signed char const* p)
+{
+    return *p;
+}
+\end{lstlisting}
+
+则应看到符号扩展语义。两者都从内存读取 1 字节，但高位填充不同。若后续用结果做数组下标、表查找或比较，扩展错误会变成真实 bug。
+
+\subsection{截断 store 也属于转换}
+
+写入窄类型时，常见汇编只存低位：
+
+\begin{lstlisting}
+mov byte ptr [rdi], sil
+\end{lstlisting}
+
+这表示把 \register{sil} 的低 8 位写到内存。若源码是把 \code{int} 转成 \code{std::uint8_t}，这符合取低 8 位的无符号窄化语义。若程序员以为大值会报错，那就是源码语义误解。C++ 普通窄化转换在很多情况下不会自动检查范围。安全代码若需要拒绝大值，应显式检查：
+
+\begin{lstlisting}[language=C++]
+if (x < 0 || x > 255) {
+    return false;
+}
+*out = static_cast<std::uint8_t>(x);
+\end{lstlisting}
+
+汇编报告中看到窄 store，要问它是有意截断，还是缺少范围检查。
+
+\section{整数乘法和分配大小}
+
+内存分配中的整数乘法是安全审查重点。常见模式：
+
+\begin{lstlisting}[language=C++]
+std::size_t bytes = count * sizeof(T);
+void* p = std::malloc(bytes);
+\end{lstlisting}
+
+如果 \code{count * sizeof(T)} 溢出，分配到的字节数会变小。后续按 \code{count} 写入，就会越界。安全写法应检查：
+
+\begin{lstlisting}[language=C++]
+if (count > std::numeric_limits<std::size_t>::max() / sizeof(T)) {
+    return nullptr;
+}
+std::size_t bytes = count * sizeof(T);
+\end{lstlisting}
+
+汇编中安全版本通常会多出比较、除法常量或等价边界检查；不安全版本可能只有一次 \instruction{lea}、\instruction{shl} 或 \instruction{imul}。不要把少几条指令自动看成优化好。对于外部输入驱动的大小计算，缺少溢出检查是 correctness 风险。
+
+\subsection{左移不是总能替代乘法}
+
+当 \code{sizeof(T)} 是 2 的幂时，编译器可能用左移计算字节数：
+
+\begin{lstlisting}
+shl rdi, 3
+\end{lstlisting}
+
+这相当于乘以 8 的低位结果。但在源码层，如果 \code{count * 8} 需要检查溢出，单纯左移不提供检查。对于无符号类型，回绕定义良好但可能不符合分配意图；对于 signed 类型，溢出或非法移位可能是未定义行为。安全接口应使用无符号大小类型并显式检查上界。
+
+\section{从整数汇编审查漏洞模式}
+
+许多安全漏洞最终都能在整数汇编中看到模式。
+
+第一种是检查后截断。源码先用宽类型检查某个范围，但随后把值截断成窄类型用于地址或长度。汇编表现为比较发生在 64 位，之后写 32 位寄存器或使用 \instruction{mov} 截断，再参与地址计算。要确认检查和使用的宽度一致。
+
+第二种是 signed/unsigned 错配。边界检查用 signed，长度使用 unsigned，或反过来。汇编表现为 \instruction{jl}/\instruction{jge} 与 \instruction{jb}/\instruction{jae} 混合，或 \instruction{movsxd} 与零扩展路径混合。要回到源码确认转换规则。
+
+第三种是乘法溢出后分配。汇编中只有低位乘法或左移，随后调用 allocator；后续循环使用原始 count。要查是否有上界检查。若没有，外部输入可能构造小分配大写入。
+
+第四种是负数下标。汇编中出现 \instruction{movsxd} 把 32 位下标扩展到 64 位，再用于地址；前置检查只检查 \code{i < n}，没有检查 \code{i >= 0}。要看是否有 unsigned 合并检查或其他路径条件保护。
+
+第五种是移位计数未检查。汇编中移位计数来自 \register{cl}，源码没有保证范围。x86 硬件会屏蔽计数，但 C++ 源码中计数过大可能未定义。优化器可利用未定义行为前提，因此不能用硬件屏蔽当作语言保证。
+
+\section{整数代码审查清单}
+
+审查整数相关 C++ 和汇编时，可以使用下面清单：
+
+\begin{enumerate}
+  \item 所有外部输入进入整数计算时，类型宽度是否足够。
+  \item signed 与 unsigned 混合是否有意，是否记录原因。
+  \item 所有数组下标是否同时检查下界和上界，或有等价 unsigned 范围检查。
+  \item 所有分配大小乘法是否检查溢出。
+  \item 所有窄化转换是否有范围检查或明确取低位语义。
+  \item 所有移位计数是否保证在范围内。
+  \item 所有字节加载是否使用正确的符号扩展或零扩展。
+  \item 所有 32 位写后用于 64 位地址的值是否符合零扩展预期。
+  \item 所有显式溢出检测是否把 flags 或 builtin 结果转成可见错误处理。
+  \item 汇编条件码是否和源码比较语义一致。
+\end{enumerate}
+
+这张清单既适用于安全，也适用于性能。整数前提清楚，优化器才能安全重写；整数前提混乱，性能测量可能只是测到未定义行为或错误结果。
+
+\section{综合案例：一个长度检查为什么仍然越界}
+
+考虑下面函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int get_value(const int* p, int len, int index)
+{
+    if (index < len) {
+        return p[index];
+    }
+    return 0;
+}
+\end{lstlisting}
+
+很多初学者会认为它已经检查了边界。整数审查会指出至少三个问题。
+
+第一，没有检查 \code{index >= 0}。若 \code{index = -1} 且 \code{len = 10}，signed \code{-1 < 10} 为真，程序访问 \code{p[-1]}。汇编中常见形态是 \instruction{movsxd} 把 \code{index} 符号扩展成 64 位，再用于 \code{[rdi + rax*4]}。机器忠实执行了源码允许的路径，但 C++ 访问越界。
+
+第二，没有说明 \code{len} 是否非负。若 \code{len} 来自外部输入，负数长度本身就表示接口前置条件混乱。更稳的接口可以使用 \code{std::size_t len}，但这又引入 signed/unsigned 混合问题，需要把 \code{index} 先检查为非负再转换。
+
+第三，没有证明 \code{p} 指向至少 \code{len} 个元素。边界检查只约束 index 和 len 的关系，不证明对象范围。调用者必须提供有效数组，或接口必须携带 span-like 契约。
+
+安全版本可以写成：
+
+\begin{lstlisting}[language=C++]
+extern "C" int get_value_safe(const int* p, int len, int index)
+{
+    if (p == nullptr || len <= 0) {
+        return 0;
+    }
+    if (index < 0 || index >= len) {
+        return 0;
+    }
+    return p[index];
+}
+\end{lstlisting}
+
+优化器可能把两个 index 检查合并成 unsigned 范围检查。报告中若看到 unsigned 条件码，不要惊讶；要解释它如何同时排除负数和大于等于 len 的值。
+
+\subsection{从汇编验证修复}
+
+修复后应在汇编中看到三类保护之一：
+
+\begin{itemize}
+  \item 显式检查 \code{index < 0} 和 \code{index >= len}。
+  \item unsigned 合并范围检查。
+  \item 上层 wrapper 已经保证范围，当前函数只作为内部 unchecked kernel。
+\end{itemize}
+
+如果当前函数是公共入口，却只有 \code{index < len} 一条 signed 检查，报告应标为边界缺失。若它是内部 kernel，文档必须写清调用者保证 \code{0 <= index < len}。同一段汇编，在公共 API 和内部 kernel 中风险等级不同。
+
+\section{综合案例：分配大小溢出}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+void* make_buffer(std::uint32_t count)
+{
+    std::uint32_t bytes = count * 16;
+    return std::malloc(bytes);
+}
+\end{lstlisting}
+
+若 \code{count} 接近 \code{2^32 / 16} 以上，\code{count * 16} 在 32 位中回绕。汇编可能只是：
+
+\begin{lstlisting}
+shl edi, 4
+jmp malloc
+\end{lstlisting}
+
+这不是高性能优化，而是潜在漏洞。若后续代码按原始 \code{count} 写入对象，就可能小分配大写入。
+
+更安全的写法：
+
+\begin{lstlisting}[language=C++]
+void* make_buffer_safe(std::uint32_t count)
+{
+    constexpr std::uint32_t MAX = UINT32_MAX / 16;
+    if (count > MAX) {
+        return nullptr;
+    }
+    std::size_t bytes = static_cast<std::size_t>(count) * 16;
+    return std::malloc(bytes);
+}
+\end{lstlisting}
+
+汇编里应出现上界比较，并且乘法在足够宽度上完成。这个案例说明，整数指令审查必须看源码意图。少一条比较可能是优化，也可能是缺少安全检查；判断依据是输入是否可信、接口是否声明前置条件、后续是否按原始 count 使用内存。
+
+\section{自测清单：整数语义是否过关}
+
+完成本章后，应能回答：
+
+\begin{enumerate}
+  \item 寄存器中的位模式为什么本身没有 signed 标签。
+  \item \instruction{movsx} 和 \instruction{movzx} 分别对应什么转换。
+  \item 写 \register{eax} 后读取 \register{rax} 为什么高 32 位为 0。
+  \item CF 和 OF 分别代表什么溢出视角。
+  \item 同一条 \instruction{cmp} 后为什么可以接 signed 或 unsigned 条件码。
+  \item C++ signed overflow 和硬件回绕为什么不是一回事。
+  \item 移位计数为什么需要源码范围保证。
+  \item 分配大小乘法为什么必须审查溢出。
+  \item 窄化 store 为什么可能是有意取低位，也可能是缺少检查。
+  \item 地址计算中的下标宽度和扩展方式如何影响内存安全。
+\end{enumerate}
+
+\section{深入讲解：整数语义是优化器和安全的共同边界}
+
+整数规则看起来像语言细节，但它同时影响优化器和安全。优化器依赖规则删除不可能路径、合并比较、重写循环；安全审查依赖规则判断溢出、截断、越界和错误转换。若程序员和编译器对整数语义理解不同，bug 往往很隐蔽。
+
+例如 signed overflow。程序员可能以为 \code{int} 加法在 x86 上自然回绕；硬件确实产生低 32 位结果；但 C++ 语义不把 signed overflow 定义为普通回绕。优化器可以假设定义良好程序中它不发生。于是某些检查在源码层看似合理，优化后可能消失。安全代码如果需要回绕，应使用无符号类型或显式定义良好的函数；如果需要报错，应使用 overflow builtin 或手工检查。
+
+无符号整数则相反。它定义为模 \(2^N\) 回绕，所以非常适合位掩码、哈希、计数器和底层协议。但无符号也会带来边界陷阱，尤其是和 signed 混合比较。负数转成无符号会变成大数，可能让检查方向反直觉。使用 \code{std::size_t} 表示长度合理，但下标若来自 signed 输入，应先检查非负再转换。
+
+移位也类似。硬件可能屏蔽移位计数，但 C++ 对越界移位计数有自己的规则。若输入来自外部，必须检查 \code{0 <= shift < width}。否则测试在某台 x86 上看似正常，优化器仍可能按未定义行为前提重写。
+
+整数语义的工程原则是：外部输入先合法化，内部计算用足够宽度，边界转换显式写出，溢出策略明确选择。不要把硬件偶然表现当作语言合同。
+
+\section{深入讲解：为什么范围信息能提高性能}
+
+范围信息不只是安全检查，也能帮助性能。若编译器知道下标非负且小于长度，可以消除重复检查；若知道指针不为空，可以避免保护分支；若知道长度是向量宽度倍数，可以省掉 tail；若知道值在 0 到 255，可以使用窄表或零扩展。
+
+程序员可以通过接口设计提供范围信息。例如把内部 kernel 的前置条件写成 \code{n > 0} 且 \code{n} 是 4 的倍数，让 wrapper 处理空输入和尾部。这样 kernel 更简单，汇编更可预测。但这要求文档和测试严格，否则调用者一旦违反前置条件，错误会很严重。
+
+另一个例子是把长度和下标都使用同一类型，减少混合比较。若 API 接收 \code{std::span<T>}，wrapper 可以从 span 得到指针和 \code{std::size_t} 长度，再在边界处转换给汇编。类型一致减少了隐式转换，也让范围证明更清楚。
+
+性能和安全在这里并不冲突。清晰的范围合同让安全检查集中在边界，让内部热路径更简单；模糊的范围合同则既容易越界，又让编译器保守，导致更多检查和 reload。
+
+\section{课堂讲解：整数审计从“值域”开始}
+
+整数 bug 往往不是某条加法或比较本身难懂，而是值域没有写清。一个变量可能来自外部输入、文件长度、网络包字段、容器大小、数组下标、循环计数、字节数或元素数。不同来源有不同合法范围。若一开始不写值域，后面的扩展、截断、乘法、比较和地址计算都会变成猜测。
+
+整数审计的第一步是给每个关键变量写三种范围：接口范围、内部期望范围、机器表示范围。接口范围是调用者可能传入什么；内部期望范围是函数正确执行需要什么；机器表示范围是当前类型能表示什么。比如参数类型是 \code{int n}，机器表示范围可能很大且包含负数；内部期望可能是 \code{0 <= n <= len}；接口若来自不可信输入，则必须在函数边界检查。
+
+第二步是写单位。很多溢出来自字节和元素混用。数组长度是元素数，分配大小是字节数，指针差可能是元素差，也可能被转换成字节偏移。变量名 \code{size}、\code{len}、\code{count} 若没有单位，审查会很困难。高质量代码和报告应写 \code{elements}、\code{bytes}、\code{stride}、\code{capacity} 这类明确词。
+
+第三步是检查所有边界转换。signed 到 unsigned、窄整数到宽整数、宽整数到窄整数、元素数到字节数、用户输入到内部下标、容器大小到 \code{int}，这些都是风险点。转换本身不是错误；隐式、无检查、无注释的转换才危险。
+
+\section{综合案例：长度字段如何变成越界写}
+
+考虑一个二进制协议，头部有 16 位长度字段，表示后续 payload 字节数。解析代码把它读入 \code{std::uint16_t len}，然后为了添加头部开销，计算 \code{std::uint16_t total = len + 8}，再分配 \code{total} 字节，最后复制 \code{len} 字节并写入 8 字节元数据。若 \code{len} 接近 65535，\code{len + 8} 会在 16 位中回绕，分配很小缓冲区，却复制很大 payload。
+
+在汇编中，这类错误可能表现为窄寄存器加法、零扩展、较小的 \instruction{malloc} 参数和后续较大的复制长度。单看指令，\instruction{add}、\instruction{movzx}、\instruction{call memcpy} 都很普通。问题来自值域和单位：总大小计算应该在足够宽度上进行，并检查是否超过最大允许容量。
+
+安全修复不是简单把类型全改成 \code{std::size_t}。如果协议字段本来是 16 位，读取时保留 16 位语义是合理的；关键是提升到足够宽度后再计算总字节数，并检查上限。修复报告应写清：输入字段范围、最大允许 payload、头部开销、加法是否可能溢出、分配大小和复制大小是否一致。
+
+\subsection{从汇编找整数风险信号}
+
+阅读汇编时，下面信号值得警惕：
+
+\begin{itemize}
+  \item 使用 \instruction{movsx} 还是 \instruction{movzx} 与源码期望不一致。
+  \item 乘法或移位后直接作为分配大小，没有上界比较。
+  \item 用 32 位寄存器计算字节数，再传给需要 64 位大小的接口。
+  \item 比较使用 unsigned 条件码，但输入可能来自 signed 参数。
+  \item 下标先参与地址计算，范围检查在后面或不支配访问。
+  \item 窄化 store 后又按宽值使用同一逻辑变量。
+  \item 负数被转换成很大的 \code{std::size_t} 后参与循环。
+\end{itemize}
+
+这些信号不是自动判错。底层代码有时故意使用回绕、截断和位掩码。审查要看接口合同。如果合同明确要求模 \(2^N\) 算术，并且后续使用也按这个合同解释，那么回绕可以是正确设计；如果合同是长度、容量、下标或分配大小，回绕通常需要检查。
+
+\section{整数和 ABI 的交叉点}
+
+整数宽度在 ABI 边界尤其重要。C++ 函数声明中的 \code{int}、\code{long}、\code{std::size_t}、指针和枚举类型，会决定调用者如何准备参数以及被调用者如何解释寄存器低位和高位。手写汇编若把 \code{int} 参数当成 64 位有符号值直接使用，可能读到未定义或不符合期望的高位。常见稳妥做法是在汇编入口显式使用 32 位寄存器或做符号/零扩展，让语义清楚。
+
+返回值也类似。返回 32 位整数通常写 \register{eax}，这会清零 \register{rax} 高 32 位；返回 64 位整数则必须写完整 \register{rax}。如果声明和汇编实现不一致，调用者会按声明解释返回寄存器，错误可能非常隐蔽。C++ wrapper 和汇编符号之间必须保持签名、宽度和 signedness 文档一致。
+
+结构体中的整数字段更要小心。字段 offset、字段宽度和 padding 决定汇编 load/store。若 C++ 端把字段从 \code{std::uint32_t} 改成 \code{std::size_t}，手写汇编仍按 4 字节访问，就会产生 ABI 破坏。公开参数块应使用固定宽度类型，并用 \code{static_assert} 检查 offset 和 size。
+
+\section{整数审查清单}
+
+任何涉及整数边界的代码，都可以按下面清单审查：
+
+\begin{enumerate}
+  \item 输入来源是否可信，是否需要合法化。
+  \item 每个长度变量的单位是元素还是字节。
+  \item signed 与 unsigned 比较是否符合意图。
+  \item 乘法、加法、左移是否可能溢出。
+  \item 分配大小和后续写入大小是否使用同一检查结果。
+  \item 下标范围检查是否支配数组访问。
+  \item 窄化转换是否有显式上界检查。
+  \item 汇编入口是否按声明正确扩展参数。
+  \item 返回值宽度是否与声明一致。
+  \item benchmark 是否覆盖边界值，而不是只测普通中间值。
+\end{enumerate}
+
+这份清单同时服务正确性、安全和性能。范围清楚后，优化器更容易生成紧凑代码；范围不清时，代码要么危险，要么保守。整数不是“小类型细节”，而是系统边界的一部分。
+
+\section{整数测试要覆盖边界而不是只测中间值}
+
+整数代码最容易在边界失败。只用普通中间值测试，例如长度 100、下标 3、正数 42，几乎不能证明整数逻辑稳健。测试应覆盖零、一、最大值、最大值减一、负一、类型边界、乘法临界点、对齐临界点、尾部长度和溢出前后。若函数接收外部输入，还要覆盖非法值。
+
+例如分配大小为 \code{count * sizeof(T)}，就应测试 \code{count = 0}、\code{1}、正常值、\code{max / sizeof(T)}、\code{max / sizeof(T) + 1}。若代码把 \code{int} 转成 \code{std::size_t}，就应测试 \code{-1}。若循环按 4 个元素展开，就应测试长度 0、1、3、4、5、7、8、9。边界测试能暴露尾部、回绕、符号转换和范围检查错误。
+
+汇编层也要覆盖边界。手写汇编可能在普通长度上正确，但在 \code{n == 0} 时仍读取第一个元素；可能在尾部长度不是向量宽度倍数时越界；可能在负长度被解释为巨大无符号数时长时间运行。wrapper 应把非法输入挡在边界，kernel 测试应验证前置条件内的边界。
+
+\section{整数性能优化也要保留语义}
+
+整数优化常见做法包括用移位代替乘除、用掩码代替取模、用 \instruction{lea} 合并乘加、用查表代替分支、用窄类型减少内存带宽。这些优化只有在语义前提成立时才正确。除以 8 可以变成右移吗？对无符号数和非负有符号数通常容易；对负数，舍入方向可能不同。取模可以变成掩码吗？只有模数是 2 的幂，且语义是无符号或非负范围时才简单。
+
+查表优化也有边界。索引必须范围检查，表项类型要足够宽，默认路径要正确。窄类型优化要考虑溢出和提升规则。把 \code{int} 中间值改成 \code{int16_t} 可能减少内存，但如果计算需要更大范围，就会改变结果。性能优化不能把“当前测试数据没溢出”当作语义保证。
+
+因此，整数优化报告应同时包含语义证明和性能证据。语义证明写范围、单位和溢出策略；性能证据写反汇编、输入规模和时间。只给其中一半都不够。
+
+\section{整数错误的跨层传播}
+
+整数错误通常不会停留在整数层。一个长度溢出会变成小分配大写入，这是内存错误；一个 signed/unsigned 比较错误会变成控制流绕过，这是路径错误；一个参数宽度不一致会变成 ABI 错误；一个 benchmark 的计数溢出会变成错误吞吐指标；一个数组下标截断会变成错误地址公式。整数是很多底层问题的源头。
+
+因此，排查复杂问题时要主动寻找整数边界。崩溃地址很大，可能来自负数转无符号；malloc 分配很小，可能来自乘法回绕；循环次数异常，可能来自窄化；性能指标离谱，可能是 ops 或 bytes 计算溢出。不要把整数章节看成孤立的指令知识，它连接内存、控制流、ABI 和测量。
+
+\section{写给接口的整数合同}
+
+接口文档应明确整数合同。例如长度参数是否允许零，是否允许负数，最大值是多少，单位是字节还是元素；stride 是否可以为负；offset 是否必须对齐；返回值是否可能溢出；错误码如何表示。没有这些合同，调用者和实现者会各自猜测。
+
+对于内部 hot kernel，可以把合同写得更严格，例如 \code{n > 0} 且 \code{n} 是 8 的倍数；wrapper 负责把公共输入拆成符合合同的主循环和尾部。严格合同能简化汇编，但必须有测试防止误用。接口合同越明确，整数风险越低。
+
+\section{整数章节的综合训练}
+
+本章可以用一个缓冲区分配函数做综合训练。输入是元素数量和元素大小，输出是分配指针。读者要写三个版本：错误版本、带溢出检查版本、把检查放在 wrapper 并让 kernel 假设范围合法的版本。然后生成汇编，观察比较、乘法、扩展和调用。
+
+报告要说明每个版本的合同、边界输入、汇编差异和测试结果。若安全版本多了几条比较，不要简单说它慢；要说明这些指令换来了什么语义保证。若内部 kernel 去掉检查，也要说明 wrapper 如何保证前置条件。这个训练能把整数、内存、ABI 和性能放到同一个小问题中。
+
+\section{整数报告中的反例表}
+
+整数分析报告可以附一张反例表。表中列出输入、期望行为、错误版本行为、安全版本行为、汇编证据。例如 \code{count = max / elem + 1} 时，错误版本回绕并分配小缓冲区，安全版本返回错误；\code{n = -1} 时，错误版本转成巨大无符号长度，安全版本拒绝；\code{shift = width} 时，错误版本触发未定义行为，安全版本检查范围。
+
+反例表能防止报告只覆盖顺利输入。整数规则的危险恰恰在边界，边界不列出来，审查者很难知道你是否真的考虑了风险。对安全相关代码，反例表比一段笼统说明更有说服力。
+
+\section{整数知识向第二册的迁移}
+
+第二册中的 SIMD、量化、矩阵乘法和 AI 算子会大量使用整数。索引、stride、tile size、字节偏移、对齐、尾部 mask、量化 scale、int8 累加、饱和和回绕，都会回到本章主题。若整数范围和单位不清，高级优化会非常危险。
+
+因此，本章不是只为普通整数表达式服务。它为后续所有高性能 kernel 提供边界语言。你要能说清每个循环计数、每个 offset、每个 byte count、每个 accumulator 的范围，才能安全地写更复杂的优化。
+
+\section{实验：类型扩展指令观察}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/extend.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int from_u8(std::uint8_t x) { return x; }
+extern "C" int from_i8(std::int8_t x) { return x; }
+extern "C" int load_u8(std::uint8_t const* p, int i) { return p[i]; }
+extern "C" int load_i8(std::int8_t const* p, int i) { return p[i]; }
+\end{lstlisting}
+
+生成汇编：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -S -masm=intel extend.cpp -o extend.s
+clang++ -std=c++20 -O3 -c extend.cpp -o extend.o
+objdump -d -Mintel extend.o > extend.objdump.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出所有 \instruction{movsx}、\instruction{movzx}、\instruction{movsxd}。
+  \item 解释每条扩展指令对应的 C++ 类型。
+  \item 对 \code{i == -1} 的情况，写出地址公式会如何变化，并说明 C++ 是否允许访问。
+  \item 记录机器码字节。
+\end{enumerate}
+\end{labbox}
+
+\section{整数审查的最后一道问题}
+
+审查整数代码时，最后要问一句：如果输入取到边界，这段代码会发生什么。这个问题简单，却能暴露大量缺陷。长度为零是否访问内存，长度为一是否走尾部，长度为最大值是否溢出，负数是否被转换成巨大无符号数，乘法临界点是否被检查，返回值是否能表达错误，都是边界问题。
+
+边界问题也要进入性能测试。很多优化只在普通长度上测过，到了非整倍尾部就走完全不同路径；很多汇编 kernel 在大输入上快，小输入上被固定开销支配；很多量化或累加代码在普通值上正确，在极值上溢出。整数边界不是安全章节的附属内容，而是性能 kernel 的日常条件。
+
+如果读者能在写代码前先写出边界表，写汇编前先写出参数范围，写 benchmark 前先写出输入矩阵，那么本章目标就达到了。第二册中的 SIMD tail、tile size、量化累加和地址偏移，都会继续使用这套边界思维。
+
+\section{实验：\instruction{lea}、乘法和结构体步长}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/lea_patterns.cpp}：
+
+\begin{lstlisting}[language=C++]
+extern "C" int mul3(int x) { return x * 3; }
+extern "C" int mul5_add7(int x) { return x * 5 + 7; }
+
+struct S12 {
+    int a;
+    int b;
+    int c;
+};
+
+extern "C" int load_s12_c(S12 const* p, int i)
+{
+    return p[i].c;
+}
+
+struct S24 {
+    double a;
+    double b;
+    int c;
+    int d;
+};
+
+extern "C" int load_s24_d(S24 const* p, int i)
+{
+    return p[i].d;
+}
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出所有 \instruction{lea}。
+  \item 解释每个 \instruction{lea} 是否访问内存。
+  \item 写出 \code{S12} 和 \code{S24} 的布局、\code{sizeof} 和字段 offset。
+  \item 从汇编恢复 \code{i * 12 + offset} 和 \code{i * 24 + offset}。
+  \item 对比编译器何时用 \instruction{imul}，何时用 \instruction{lea}。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：位运算和对齐}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/bit_alignment.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" std::uintptr_t align_down_64(std::uintptr_t x)
+{
+    return x & ~std::uintptr_t(63);
+}
+
+extern "C" std::uintptr_t align_up_64(std::uintptr_t x)
+{
+    return (x + 63) & ~std::uintptr_t(63);
+}
+
+extern "C" bool has_flag(unsigned flags, unsigned bit)
+{
+    return (flags & bit) != 0;
+}
+
+extern "C" unsigned set_flag(unsigned flags, unsigned bit)
+{
+    return flags | bit;
+}
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出 \instruction{and}、\instruction{or}、\instruction{test}。
+  \item 用二进制解释 \code{align_down_64(0x1234)} 和 \code{align_up_64(0x1234)}。
+  \item 解释 \instruction{test} 为什么不保存结果。
+  \item 说明 64 字节对齐为什么和低 6 位有关。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：比较条件码与 signed/unsigned}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/compare_flags.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstddef>
+
+extern "C" bool less_i32(int a, int b) { return a < b; }
+extern "C" bool less_u32(unsigned a, unsigned b) { return a < b; }
+extern "C" bool less_mixed(int a, unsigned b) { return a < b; }
+extern "C" bool index_before(int i, std::size_t n) { return i < n; }
+extern "C" int min_i32(int a, int b) { return a < b ? a : b; }
+extern "C" unsigned min_u32(unsigned a, unsigned b) { return a < b ? a : b; }
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出每个函数中的 \instruction{cmp} 或 \instruction{test}。
+  \item 记录后续使用 flags 的 \instruction{setcc}、\instruction{jcc} 或 \instruction{cmovcc}。
+  \item 区分 \instruction{setl}/\instruction{cmovl} 与 \instruction{setb}/\instruction{cmovb}。
+  \item 解释 \code{less_mixed(-1, 1u)} 的 C++ 结果，并说明汇编条件码是否符合。
+  \item 对 \code{index_before} 写出 \code{int} 与 \code{std::size_t} 混合比较的转换过程。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：除法、余数与常数除法优化}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/division.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int div_i32(int a, int b) { return a / b; }
+extern "C" int mod_i32(int a, int b) { return a % b; }
+extern "C" int divmod_sum_i32(int a, int b) { return a / b + a % b; }
+
+extern "C" unsigned div_u32(unsigned a, unsigned b) { return a / b; }
+extern "C" unsigned mod_u32(unsigned a, unsigned b) { return a % b; }
+
+extern "C" int div8_i32(int x) { return x / 8; }
+extern "C" unsigned div8_u32(unsigned x) { return x / 8u; }
+extern "C" unsigned div10_u32(unsigned x) { return x / 10u; }
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出 \instruction{idiv} 和 \instruction{div}，说明显式操作数和隐式寄存器。
+  \item 找出 \instruction{cdq}、\instruction{cqo} 或清零 \register{edx}/\register{rdx} 的指令，解释它们如何构造被除数高半部分。
+  \item 对 \code{divmod_sum_i32} 判断编译器是否复用一次除法结果。
+  \item 对比 \code{div8_i32} 和 \code{div8_u32}，说明 signed 舍入修正是否出现。
+  \item 对 \code{div10_u32} 记录是否出现 magic number、乘法或右移，并说明为什么这仍然是除法语义。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：溢出检测和部分寄存器}
+
+\begin{labbox}
+创建 \filepath{labs/ch11_integer_instructions/overflow_partial.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int add_plain(int a, int b)
+{
+    return a + b;
+}
+
+extern "C" bool add_checked(int a, int b, int* out)
+{
+    return __builtin_add_overflow(a, b, out);
+}
+
+extern "C" bool is_nonzero(int x)
+{
+    return x != 0;
+}
+
+extern "C" int bool_to_int(int x)
+{
+    return x != 0;
+}
+
+extern "C" std::uint64_t write_u32(std::uint64_t x)
+{
+    std::uint32_t y = static_cast<std::uint32_t>(x);
+    return y;
+}
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 对比 \code{add_plain} 和 \code{add_checked}，说明哪一个需要把 OF 转化成可见结果。
+  \item 找出 \instruction{seto} 或等价溢出检测序列。
+  \item 找出 \instruction{setne al} 这类只写低 8 位的指令。
+  \item 判断后续是否有 \instruction{movzx eax, al} 或其他清高位操作。
+  \item 解释写 \register{eax} 为什么会清零 \register{rax} 高 32 位，并说明 \code{write_u32} 的返回值语义。
+\end{enumerate}
+\end{labbox}
+
+\section{本章作业}
+
+\begin{exercisebox}
+\subsection*{作业 1：整数指令注释表}
+
+从本章实验中选择至少 30 条整数指令，建立表格：
+
+\begin{itemize}
+  \item 指令文本。
+  \item 分类：move、ALU、shift、bitwise、extension、compare、address calculation。
+  \item 读寄存器/内存。
+  \item 写寄存器/内存。
+  \item 是否更新 flags。
+  \item 对应 C++ 语义。
+\end{itemize}
+
+\subsection*{作业 2：扩展语义推导}
+
+给定输入字节：
+
+\begin{lstlisting}
+0x00
+0x7f
+0x80
+0xff
+\end{lstlisting}
+
+分别写出：
+
+\begin{enumerate}
+  \item \instruction{movzx eax, byte ptr [p]} 的结果。
+  \item \instruction{movsx eax, byte ptr [p]} 的结果。
+  \item 对应 \code{std::uint8_t} 和 \code{std::int8_t} 到 \code{int} 的 C++ 转换结果。
+\end{enumerate}
+
+\subsection*{作业 3：恢复地址公式}
+
+对下面汇编恢复结构体布局的可能信息：
+
+\begin{lstlisting}
+movsxd rax, esi
+lea    rax, [rax + rax*2]
+mov    ecx, dword ptr [rdi + rax*8 + 20]
+ret
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 写出元素步长。
+  \item 写出字段 offset。
+  \item 设计一个可能的 C++ 结构体。
+  \item 解释为什么不能只看 \code{rax*8} 就说元素大小是 8。
+\end{enumerate}
+
+\subsection*{作业 4：对齐函数证明}
+
+证明下面函数对 2 的幂 \code{A} 有效：
+
+\begin{lstlisting}[language=C++]
+std::uintptr_t align_up(std::uintptr_t x, std::uintptr_t A)
+{
+    return (x + A - 1) & ~(A - 1);
+}
+\end{lstlisting}
+
+要求用二进制低位解释，不少于 800 字，并举三个例子：
+
+\begin{itemize}
+  \item 已经对齐的地址。
+  \item 只差 1 字节对齐的地址。
+  \item 随机未对齐地址。
+\end{itemize}
+
+\subsection*{作业 5：小型整数汇编报告}
+
+写一个 20 行以内 C++ 文件，包含：
+
+\begin{itemize}
+  \item \code{std::uint8_t} 和 \code{std::int8_t} load。
+  \item 一个结构体数组字段访问，结构体大小不是 1、2、4、8。
+  \item 一个对齐函数。
+  \item 一个位标志测试函数。
+\end{itemize}
+
+生成 \code{-O3} 汇编并提交不少于 2500 字报告，必须包括：
+
+\begin{itemize}
+  \item 源码和编译命令。
+  \item 类型和结构体布局表。
+  \item 每个函数的核心汇编。
+  \item 所有地址公式。
+  \item 扩展指令解释。
+  \item flags 相关指令解释。
+  \item 至少 10 条机器码字节记录。
+\end{itemize}
+
+\subsection*{作业 6：signed/unsigned 条件码对照报告}
+
+编写一个 30 行以内 C++ 文件，至少包含以下函数：
+
+\begin{itemize}
+  \item \code{int} 小于比较。
+  \item \code{unsigned} 小于比较。
+  \item \code{int} 与 \code{unsigned} 混合比较。
+  \item \code{std::size_t} 长度与 \code{int} 索引比较。
+  \item signed 和 unsigned 的 \code{min} 或 \code{max}。
+\end{itemize}
+
+生成 \code{-O3} 汇编，提交不少于 2200 字报告。报告必须列出每个函数的源码类型、usual arithmetic conversions 结果、\instruction{cmp} 操作数顺序、后续 \instruction{setcc}/\instruction{jcc}/\instruction{cmovcc}，并解释为什么某些函数使用 signed 条件码，某些函数使用 unsigned 条件码。报告还要用 \code{-1}、\code{0}、\code{1}、\code{UINT_MAX} 设计至少四组输入，预测 C++ 结果和汇编条件码结果是否一致。
+
+\subsection*{作业 7：除法强度削弱分析}
+
+编写一组除法函数，包含：
+
+\begin{itemize}
+  \item signed 变量除以变量。
+  \item unsigned 变量除以变量。
+  \item signed 除以 2、4、8、16。
+  \item unsigned 除以 2、4、8、16。
+  \item unsigned 除以 3、5、10、100。
+\end{itemize}
+
+生成 \code{-O3} 汇编，提交不少于 2500 字报告。报告必须说明哪些函数使用 \instruction{idiv} 或 \instruction{div}，哪些函数使用移位，哪些函数出现 magic number 和乘高位模式。对 signed 除以 2 的幂，必须解释负数向零截断为什么需要修正；对变量除法，必须说明 \register{edx}:\register{eax} 或 \register{rdx}:\register{rax} 的被除数构造。
+
+\subsection*{作业 8：溢出检测与 UB 边界}
+
+编写一组加法、减法、乘法函数，分别包含普通 signed 运算、普通 unsigned 运算和 \code{__builtin_add_overflow}、\code{__builtin_sub_overflow}、\code{__builtin_mul_overflow} 检测版本。提交不少于 2200 字报告，要求：
+
+\begin{itemize}
+  \item 区分普通 signed 运算的语言语义和硬件低位结果。
+  \item 说明 unsigned 回绕为什么定义良好。
+  \item 找出检测版本中 flags、\instruction{seto}、\instruction{setb} 或等价序列。
+  \item 解释为什么“先溢出再检查”不是可靠 C++ 写法。
+  \item 至少举两个真实工程场景，说明整数溢出检查为什么影响内存安全或数据正确性。
+\end{itemize}
+
+\subsection*{作业 9：部分寄存器读写表}
+
+从本章实验和你自己补充的例子里收集至少 20 条涉及 \register{al}、\register{ax}、\register{eax}、\register{rax} 或其他同类寄存器别名的指令，建立表格。每一行必须写出：实际写入宽度、是否清高位、后续读取宽度、是否需要 \instruction{movzx}/\instruction{movsx} 补充扩展、对应源码返回类型或表达式类型。最后用不少于 1200 字解释为什么现代编译器经常偏爱 32 位写入。
+\end{exercisebox}
+
+\section{验收标准}
+
+完成本章后，你应该能做到：
+
+\begin{itemize}
+  \item 区分位模式、signed 解释和 unsigned 解释。
+  \item 解释 \instruction{mov}、load、store 的差异。
+  \item 解释 \instruction{xor reg, reg} 清零和 32 位写清零高位。
+  \item 读懂 \instruction{add}、\instruction{sub}、\instruction{imul}、\instruction{lea} 的基本语义。
+  \item 解释 \instruction{movsx}、\instruction{movzx}、\instruction{movsxd} 对应的 C++ 类型转换。
+  \item 区分 \instruction{shr} 和 \instruction{sar}。
+  \item 用 \instruction{and}、\instruction{or}、\instruction{test} 解释 mask、flag 和 alignment。
+  \item 看到 \instruction{cmp} 和 \instruction{test} 时知道真正输出是 flags。
+  \item 区分 \instruction{jl}/\instruction{setl}/\instruction{cmovl} 和 \instruction{jb}/\instruction{setb}/\instruction{cmovb}。
+  \item 解释 signed/unsigned 混合比较为什么可能转成 unsigned 条件码。
+  \item 解释 CF 和 OF 分别回答什么问题。
+  \item 说明普通 signed 溢出、unsigned 回绕和显式溢出检测的差异。
+  \item 读懂 \instruction{div}/\instruction{idiv} 的隐式寄存器、商和余数。
+  \item 解释 signed 除以 2 的幂为什么可能需要偏置修正。
+  \item 识别除以常数时的 magic number、乘法和移位模式。
+  \item 解释部分寄存器写入与 32 位写清高位规则。
+  \item 从 \instruction{lea} 组合恢复非 2 的幂结构体步长。
+  \item 初步判断整数指令对性能的影响：寄存器 ALU、内存 RMW、flags 依赖、乘法和地址计算。
+\end{itemize}
+
+如果这些能力稳定，本册后面的控制流和 ABI 会更容易进入；第二册的 loop optimization、alias/UB、低精度量化和 AVX microkernel 也会有更好的汇编基础。

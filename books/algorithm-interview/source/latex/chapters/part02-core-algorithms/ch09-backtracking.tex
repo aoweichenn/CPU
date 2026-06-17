@@ -1,0 +1,578 @@
+\chapter{回溯、枚举和搜索空间剪枝}
+
+回溯题表面上是在“试所有可能”，本质上是在一棵决策树上搜索。每一层做一个选择，每条从根到叶子的路径代表一个候选答案。真正要学会的不是某个递归模板，而是四个问题：当前层决定什么，已经选择了什么，下一步还能选什么，什么时候可以停止或剪枝。只要这四件事说不清，代码再短也只是碰巧通过样例。
+
+暴力枚举和回溯的边界并不绝对。最朴素的暴力会把所有组合全部生成出来，再逐个检查是否合法；回溯则把“合法性判断”提前到生成过程中。一旦发现当前前缀已经不可能形成答案，就不再向下扩展。这个动作叫剪枝。剪枝不是为了让代码看起来高级，而是减少决策树里根本不需要访问的分支。
+
+\cpp 面试题常用递归表达回溯，因为调用栈天然保存了“走到第几层、下一步尝试哪个分支、回退后恢复什么状态”。但递归深度不受控时会带来工程风险。本章讲递归心智模型，代码尽量把栈帧显式写出来，让搜索过程、状态恢复和边界条件更可见。这样写会比递归略长，但它能训练你看清楚回溯真正维护的状态。
+
+本章先讲搜索树、路径状态、候选集合、剪枝和去重，再用排列、子集、组合、括号、棋盘和字符串切分题展示这些概念如何落地。回溯题卡现在单独放在本章末尾；位运算和状态压缩作为枚举状态的一种表示，也放在回溯之后，而不是混在哈希或 DP 章节里。
+
+\section{搜索树、约束和输出规模}
+
+回溯题要先画搜索树。树的第几层代表什么，取决于题目对象。全排列中，第 \code{depth} 层决定排列的第 \code{depth} 个位置；子集中，第 \code{index} 层决定当前元素选或不选；组合题中，一层选择下一个加入组合的候选；切分题中，一层选择下一个切分终点；网格路径中，一层选择下一步方向。层含义不同，代码里的 \code{start}、\code{used}、\code{index} 和访问标记就不同，不能统一套一个函数形状。
+
+路径状态表示从根到当前节点已经做出的选择。它可以是一个数组、一段字符串、若干个切分片段、棋盘上已经放置的皇后位置，或者一个网格路径访问集合。候选集合表示当前层还能选什么。排列题的候选是所有未使用下标；组合题的候选是从 \code{start} 往后的下标；括号生成的候选是左括号或右括号，但受剩余数量限制；N 皇后的候选是当前行的各列，但受列和两条对角线限制。把路径和候选集合分清，回溯代码才有明确职责。
+
+剪枝必须是必要条件或支配关系，不能是直觉。组合总和中，候选全为正数且已排序，当前值大于剩余目标时，后续更大值也不能使用，这是合法剪枝；括号生成中，任意前缀右括号数不能超过左括号数，否则后面无法修复；复原 IP 地址中，剩余字符数量必须落在剩余段数到三倍剩余段数之间；N 皇后中，同列或同对角线冲突一定非法。没有证明的剪枝会制造隐藏漏解，尤其是在输入有负数、重复值或目标条件变化时。
+
+去重也要分层次。路径内去重解决“同一个元素不能在一条路径里重复使用”，常用 \code{used} 或访问标记；同层去重解决“相同值作为本层不同分支会生成重复答案”，常用排序后跳过相邻重复值。全排列 II 同时有路径内去重和同层去重；组合总和 II 通过 \code{start} 保证下标不重复，再通过同层跳过重复值保证答案不重复；子集 II 的去重只在同一层发生。把这些条件混在一起，会出现要么漏掉合法重复使用，要么产生重复答案。
+
+输出规模决定复杂度下限。全排列有 \complexity{n!} 个答案，子集有 \complexity{2^n} 个答案，括号生成有卡特兰数个答案，N 皇后答案数量也随 n 快速增长。如果题目要求输出所有方案，算法时间不可能低于输出总大小。复杂度分析要把“搜索访问的状态数”和“复制答案的成本”分开：生成一个长度为 n 的排列，光复制路径就是 \complexity{O(n)}。这不是实现低效，而是输出本身需要这么多信息。
+
+递归和迭代只是保存栈帧的两种方式。递归函数参数通常包括层号、路径、候选起点、剩余目标和访问标记；显式栈版本则把这些字段放进结构体。递归写法短，适合表达；显式栈写法长，但能避免调用栈风险，也更容易看清状态复制成本。本书代码偏向显式栈，并不否认递归思维；恰恰相反，只有先理解递归栈帧保存了什么，才能把它可靠地改写成迭代。
+
+\begin{principlebox}{回溯题的建模清单}
+先写搜索树层含义，再写路径状态和候选集合；然后写终止条件，说明何时把路径加入答案；接着写剪枝条件，并证明被剪掉的分支不可能产生答案；最后写去重条件，区分路径内去重和同层去重。若答案数量本身是指数级，复杂度表达必须包含输出规模。
+\end{principlebox}
+
+全排列是回溯的第一道标准题。题目给定互不相同的数字，要求返回所有排列。暴力想法是枚举长度为 \code{n} 的所有序列，再检查是否每个数字恰好使用一次。若把每个位置都看成有 \code{n} 种选择，总分支数是 \complexity{n^n}，绝大多数序列会因为重复使用元素而被丢弃。优化方法是在生成过程中维护 \code{used} 数组，保证同一个下标不会被选两次。这样搜索树只保留真正的排列分支，叶子数变成 \complexity{n!}。
+
+下面的实现用显式栈模拟递归。每个栈帧保存当前层接下来要尝试的候选下标 \code{next_index}。进入下一层时，把选择加入 \code{path} 并标记 \code{used}；一层候选全部尝试完时，弹出栈帧，并撤销上一层做出的选择。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 46 全排列：显式栈模拟回溯}]
+std::vector<std::vector<int>> permute(const std::vector<int>& nums)
+{
+    struct Frame {
+        int next_index = 0;
+    };
+
+    const int n = static_cast<int>(nums.size());
+    std::vector<std::vector<int>> answer;
+    std::vector<int> path;
+    std::vector<char> used(n, false);
+    std::vector<Frame> stack{{0}};
+
+    while (!stack.empty()) {
+        if (static_cast<int>(path.size()) == n) {
+            answer.push_back(path);
+            stack.pop_back();
+            if (!path.empty()) {
+                const int last_value = path.back();
+                path.pop_back();
+                const auto found = std::find(nums.begin(), nums.end(), last_value);
+                used[static_cast<int>(found - nums.begin())] = false;
+            }
+            continue;
+        }
+
+        Frame& frame = stack.back();
+        while (frame.next_index < n && used[frame.next_index]) {
+            ++frame.next_index;
+        }
+        if (frame.next_index == n) {
+            stack.pop_back();
+            if (!path.empty()) {
+                const int last_value = path.back();
+                path.pop_back();
+                const auto found = std::find(nums.begin(), nums.end(), last_value);
+                used[static_cast<int>(found - nums.begin())] = false;
+            }
+            continue;
+        }
+
+        const int chosen_index = frame.next_index;
+        ++frame.next_index;
+        used[chosen_index] = true;
+        path.push_back(nums[chosen_index]);
+        stack.push_back(Frame{0});
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+这段代码为了突出栈帧，撤销选择时用值反查下标；在生产代码里可以把“本层选择的下标”也放进下一层栈帧，避免反查。它的时间复杂度必须按输出规模理解：一共有 \complexity{n!} 个排列，每个排列复制长度为 \code{n} 的路径，所以输出成本是 \complexity{O(n \cdot n!)}。额外空间是路径、标记和栈，都是 \complexity{O(n)}，不计答案。复盘这题时要能说清楚：\code{used} 是路径合法性的约束，\code{path.size() == n} 是叶子条件，回退必须撤销最后一次选择。
+
+如果输入含重复数字，全排列 II 的难点就变成去重。很多人会先生成所有排列，再放进 \code{set} 去重；这当然能做，但浪费大量重复分支。更好的方法是先排序，然后在同一层跳过“相同数值且前一个相同值还没有被本路径使用”的候选。这个条件的含义是：同一层里，相同值只允许最左边那个代表这一类选择，避免生成形如交换两个相同值位置的重复排列。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 47 全排列 II：排序后按层去重}]
+std::vector<std::vector<int>> permute_unique(std::vector<int> nums)
+{
+    std::sort(nums.begin(), nums.end());
+
+    const int n = static_cast<int>(nums.size());
+    std::vector<std::vector<int>> answer;
+    std::vector<int> path;
+    std::vector<char> used(n, false);
+
+    struct State {
+        std::vector<int> path;
+        std::vector<char> used;
+    };
+
+    std::vector<State> stack{{path, used}};
+    while (!stack.empty()) {
+        State state = std::move(stack.back());
+        stack.pop_back();
+
+        if (static_cast<int>(state.path.size()) == n) {
+            answer.push_back(std::move(state.path));
+            continue;
+        }
+
+        for (int i = n - 1; i >= 0; --i) {
+            if (state.used[i]) {
+                continue;
+            }
+            if (i > 0 && nums[i] == nums[i - 1] && !state.used[i - 1]) {
+                continue;
+            }
+
+            State next = state;
+            next.used[i] = true;
+            next.path.push_back(nums[i]);
+            stack.push_back(std::move(next));
+        }
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+这个版本为了让去重条件清楚，直接把状态复制进栈，适合教材解释；高性能版本会用一份路径和标记做原地回退。去重条件最容易写反。排序后，相同数字挨在一起，\code{!state.used[i - 1]} 表示前一个相同数字在当前层还没有被拿来作为代表，此时选择后一个会制造重复分支，所以跳过。时间复杂度仍然与唯一排列数量成正比，最坏不超过 \complexity{O(n \cdot n!)}。
+
+子集题的决策树更简单。每个元素只有两种选择：选或者不选。暴力枚举可以用二进制掩码，从 \code{0} 到 \code{2^n - 1}，第 \code{i} 位表示是否选择第 \code{i} 个元素。回溯写法则是沿着数组位置向后决定。两种方法本质相同，都是遍历大小为 \complexity{2^n} 的搜索空间。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 78 子集：迭代扩展已有答案}]
+std::vector<std::vector<int>> subsets(const std::vector<int>& nums)
+{
+    std::vector<std::vector<int>> answer{{}};
+
+    for (const int x : nums) {
+        const int old_size = static_cast<int>(answer.size());
+        for (int i = 0; i < old_size; ++i) {
+            std::vector<int> next = answer[i];
+            next.push_back(x);
+            answer.push_back(std::move(next));
+        }
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+这段代码的不变量是：处理完前 \code{i} 个元素后，\code{answer} 包含这些元素的全部子集。加入新元素 \code{x} 时，旧子集保持“不选 \code{x}”的版本；每个旧子集复制一份并加上 \code{x}，得到“选 \code{x}”的版本。这个算法没有剪枝，因为所有子集都是合法答案。时间复杂度 \complexity{O(n2^n)}，空间复杂度同样由输出规模主导。
+
+组合总和比子集多了一个目标约束。题目给定候选数组和目标值，要求找出所有和为目标的组合，同一个数字可以重复使用。暴力思路是不断选数字，直到长度达到某个上限再检查和；问题是上限不好定，而且大量分支会在总和已经超过目标后继续扩展。优化来自两个事实：候选数字都是正数；排序后，如果当前候选已经大于剩余目标，后面的更大候选也不可能使用。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 39 组合总和：显式状态保存起点和剩余目标}]
+std::vector<std::vector<int>> combination_sum(std::vector<int> candidates,
+                                              int target)
+{
+    std::sort(candidates.begin(), candidates.end());
+
+    struct State {
+        int start = 0;
+        int remaining = 0;
+        std::vector<int> path;
+    };
+
+    std::vector<std::vector<int>> answer;
+    std::vector<State> stack{{0, target, {}}};
+
+    while (!stack.empty()) {
+        State state = std::move(stack.back());
+        stack.pop_back();
+
+        if (state.remaining == 0) {
+            answer.push_back(std::move(state.path));
+            continue;
+        }
+
+        for (int i = static_cast<int>(candidates.size()) - 1;
+             i >= state.start;
+             --i) {
+            if (candidates[i] > state.remaining) {
+                continue;
+            }
+            State next = state;
+            next.path.push_back(candidates[i]);
+            next.remaining -= candidates[i];
+            next.start = i;
+            stack.push_back(std::move(next));
+        }
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+\code{start} 的语义很重要：组合不关心顺序，\code{[2,3,2]} 和 \code{[2,2,3]} 是同一个答案，因此后续只能从当前下标及其右侧继续选，避免同一组合以不同顺序重复出现。因为允许重复使用当前数字，下一层的 \code{start} 仍然是 \code{i}；如果题目变成每个数字只能用一次，就应设为 \code{i + 1}。这就是组合类题最核心的变体开关。复杂度取决于目标值和候选分布，不能简单写成多项式；面试里应说明它是指数级搜索，但剪枝能显著减少无效分支。
+
+括号生成的关键不是枚举所有长度为 \code{2n} 的括号串再检查。那样有 \complexity{2^{2n}} 个候选，大多数不合法。合法前缀必须满足两个计数约束：左括号数量不能超过 \code{n}；任何前缀中右括号数量不能超过左括号数量。把这两个约束提前放进生成过程，就不会产生明显非法的前缀。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 22 括号生成：前缀合法性剪枝}]
+std::vector<std::string> generate_parenthesis(int n)
+{
+    struct State {
+        std::string text;
+        int left = 0;
+        int right = 0;
+    };
+
+    std::vector<std::string> answer;
+    std::vector<State> stack{{"", 0, 0}};
+
+    while (!stack.empty()) {
+        State state = std::move(stack.back());
+        stack.pop_back();
+
+        if (static_cast<int>(state.text.size()) == 2 * n) {
+            answer.push_back(std::move(state.text));
+            continue;
+        }
+
+        if (state.right < state.left) {
+            State next = state;
+            next.text.push_back(')');
+            ++next.right;
+            stack.push_back(std::move(next));
+        }
+        if (state.left < n) {
+            State next = state;
+            next.text.push_back('(');
+            ++next.left;
+            stack.push_back(std::move(next));
+        }
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+这题的正确性可以用前缀不变量解释：任何时刻 \code{left <= n} 且 \code{right <= left}。如果 \code{right > left}，说明某个右括号没有左括号匹配，后面再加字符也无法修复这个非法前缀；如果 \code{left > n}，也已经超过题目允许。输出数量是第 \code{n} 个卡特兰数，算法复杂度至少与答案数量成正比。易错点是终止条件：必须长度达到 \code{2n} 才能加入答案，只看 \code{left == right} 会把短前缀误加进去。
+
+单词搜索把回溯放进网格图。节点是格子，边是上下左右相邻，路径不能重复使用同一个格子。暴力想法是从每个格子出发尝试所有方向，最后检查路径字符串；优化点是边走边比较目标单词的当前位置，一旦字符不匹配立即停止。访问标记也必须属于当前路径，而不是全局永久标记，因为同一个格子可以出现在不同起点或不同路径中。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 79 单词搜索：显式栈保存路径访问状态}]
+bool exist(std::vector<std::vector<char>>& board, const std::string& word)
+{
+    if (word.empty()) {
+        return true;
+    }
+    if (board.empty() || board[0].empty()) {
+        return false;
+    }
+
+    constexpr std::array<std::pair<int, int>, 4> DIRECTIONS{
+        std::pair{1, 0}, std::pair{-1, 0},
+        std::pair{0, 1}, std::pair{0, -1}
+    };
+
+    const int rows = static_cast<int>(board.size());
+    const int cols = static_cast<int>(board[0].size());
+
+    struct State {
+        int row = 0;
+        int col = 0;
+        int index = 0;
+        std::vector<std::vector<char>> visited;
+    };
+
+    for (int row = 0; row < rows; ++row) {
+        for (int col = 0; col < cols; ++col) {
+            if (board[row][col] != word[0]) {
+                continue;
+            }
+
+            std::vector<std::vector<char>> visited(rows, std::vector<char>(cols, false));
+            visited[row][col] = true;
+            std::vector<State> stack{{row, col, 0, std::move(visited)}};
+
+            while (!stack.empty()) {
+                State state = std::move(stack.back());
+                stack.pop_back();
+                if (state.index + 1 == static_cast<int>(word.size())) {
+                    return true;
+                }
+
+                for (const auto [dr, dc] : DIRECTIONS) {
+                    const int next_row = state.row + dr;
+                    const int next_col = state.col + dc;
+                    const int next_index = state.index + 1;
+                    const bool out_of_bounds =
+                        next_row < 0 || next_row >= rows ||
+                        next_col < 0 || next_col >= cols;
+                    if (out_of_bounds || state.visited[next_row][next_col] ||
+                        board[next_row][next_col] != word[next_index]) {
+                        continue;
+                    }
+
+                    State next = state;
+                    next.row = next_row;
+                    next.col = next_col;
+                    next.index = next_index;
+                    next.visited[next_row][next_col] = true;
+                    stack.push_back(std::move(next));
+                }
+            }
+        }
+    }
+
+    return false;
+}
+\end{lstlisting}
+
+这个教材版把 \code{visited} 放进状态里，语义最清楚，但会复制较多布尔矩阵；原地回退版性能更好。本题最坏复杂度接近 \complexity{O(mn \cdot 3^L)}：第一步最多从每个格子出发，之后每一步通常不能回到上一个格子，所以分支近似 3，\code{L} 是单词长度。常见错误是把访问标记设成全局，导致某个格子被一条失败路径占用后，其他合法路径无法使用它。
+
+N 皇后是回溯剪枝的代表。暴力方法在 \complexity{n \times n} 棋盘上选 \code{n} 个格子，再检查行、列、对角线是否冲突，搜索空间巨大。优化方式是按行放皇后：第 \code{row} 层只决定第 \code{row} 行皇后放在哪一列。这样行冲突天然消失，只需要维护列、主对角线和副对角线是否被占用。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 51 N 皇后：按行放置并维护三类占用}]
+std::vector<std::vector<std::string>> solve_n_queens(int n)
+{
+    struct State {
+        int row = 0;
+        std::vector<int> queens;
+        std::vector<char> cols;
+        std::vector<char> diag1;
+        std::vector<char> diag2;
+    };
+
+    std::vector<std::vector<std::string>> answer;
+    std::vector<State> stack{{0,
+                              {},
+                              std::vector<char>(n, false),
+                              std::vector<char>(2 * n - 1, false),
+                              std::vector<char>(2 * n - 1, false)}};
+
+    while (!stack.empty()) {
+        State state = std::move(stack.back());
+        stack.pop_back();
+
+        if (state.row == n) {
+            std::vector<std::string> board(n, std::string(n, '.'));
+            for (int row = 0; row < n; ++row) {
+                board[row][state.queens[row]] = 'Q';
+            }
+            answer.push_back(std::move(board));
+            continue;
+        }
+
+        for (int col = n - 1; col >= 0; --col) {
+            const int main_diag = state.row - col + n - 1;
+            const int anti_diag = state.row + col;
+            if (state.cols[col] || state.diag1[main_diag] ||
+                state.diag2[anti_diag]) {
+                continue;
+            }
+
+            State next = state;
+            next.queens.push_back(col);
+            next.cols[col] = true;
+            next.diag1[main_diag] = true;
+            next.diag2[anti_diag] = true;
+            ++next.row;
+            stack.push_back(std::move(next));
+        }
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+主对角线上的格子满足 \code{row - col} 相同；为了把负数下标变成数组下标，代码加上 \code{n - 1}。副对角线满足 \code{row + col} 相同，范围天然是 \code{0} 到 \code{2n - 2}。这题的面试重点不是把棋盘画出来，而是把冲突检测从扫描整张棋盘优化成三个数组的常数查询。复杂度仍然是指数级，但剪枝把不可行分支尽早挡在下一层之外。
+
+回溯去重可以分成两类：路径内去重和同层去重。路径内去重解决“同一个元素不能被重复使用”，典型工具是 \code{used} 数组；同层去重解决“相同值作为同一层选择会生成重复答案”，典型工具是排序后跳过相邻重复值。全排列 II 同时需要这两类去重，组合总和 II 主要需要同层去重。只要把这两个概念混在一起，条件就很容易写反。
+
+组合总和 II 中，每个候选数字只能使用一次，输入可能有重复值，答案组合不能重复。与组合总和 I 相比，下一层起点必须是 \code{i + 1}，因为当前下标不能再次使用；与全排列 II 相比，我们不需要 \code{used} 数组，因为 \code{start} 已经保证每个下标最多被使用一次。同层去重条件是：在同一个循环层里，如果当前值和前一个值相同，并且前一个值已经作为本层候选被跳过或处理过，那么当前值也不能再作为新的分支开头。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 40 组合总和 II：每个下标最多使用一次，同层跳过重复值}]
+std::vector<std::vector<int>> combination_sum2(std::vector<int> candidates,
+                                               int target)
+{
+    std::sort(candidates.begin(), candidates.end());
+
+    struct State {
+        int start = 0;
+        int remaining = 0;
+        std::vector<int> path;
+    };
+
+    std::vector<std::vector<int>> answer;
+    std::vector<State> stack{{0, target, {}}};
+
+    while (!stack.empty()) {
+        State state = std::move(stack.back());
+        stack.pop_back();
+
+        if (state.remaining == 0) {
+            answer.push_back(std::move(state.path));
+            continue;
+        }
+
+        for (int i = static_cast<int>(candidates.size()) - 1;
+             i >= state.start;
+             --i) {
+            if (i + 1 < static_cast<int>(candidates.size()) &&
+                candidates[i] == candidates[i + 1] &&
+                i + 1 >= state.start) {
+                continue;
+            }
+            if (candidates[i] > state.remaining) {
+                continue;
+            }
+
+            State next = state;
+            next.path.push_back(candidates[i]);
+            next.remaining -= candidates[i];
+            next.start = i + 1;
+            stack.push_back(std::move(next));
+        }
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+这段显式栈代码为了保持输出方向，用倒序枚举候选；倒序时同层去重要和相邻的后一个元素比较。递归版本通常正序枚举，条件写成 \code{i > start && candidates[i] == candidates[i - 1]}。两个条件本质相同：同一个递归层里，相同值只能由一个下标代表。面试中如果不确定倒序条件，先写递归式正序伪代码说明去重，再实现自己更熟悉的版本。最重要的是讲清楚：同层重复会制造相同组合，路径重复则是同一个下标重复使用，这两个问题不能用同一个条件糊过去。
+
+字符串切分题也属于回溯。分割回文串要求把字符串切成若干段，每一段都是回文。暴力做法是枚举所有切分方式，再逐段检查是否回文；如果每次检查都扫描子串，会产生大量重复判断。优化方法是先用 DP 预处理 \code{is_palindrome[left][right]}，表示闭区间子串是否回文。之后回溯只需要常数时间判断某一段是否合法。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 131 分割回文串：预处理回文表后搜索切分点}]
+std::vector<std::vector<std::string>> partition_palindrome(const std::string& s)
+{
+    const int n = static_cast<int>(s.size());
+    std::vector<std::vector<char>> is_palindrome(n, std::vector<char>(n, false));
+    for (int length = 1; length <= n; ++length) {
+        for (int left = 0; left + length - 1 < n; ++left) {
+            const int right = left + length - 1;
+            if (s[left] != s[right]) {
+                continue;
+            }
+            is_palindrome[left][right] =
+                length <= 2 || is_palindrome[left + 1][right - 1];
+        }
+    }
+
+    struct State {
+        int start = 0;
+        std::vector<std::string> parts;
+    };
+
+    std::vector<std::vector<std::string>> answer;
+    std::vector<State> stack{{0, {}}};
+    while (!stack.empty()) {
+        State state = std::move(stack.back());
+        stack.pop_back();
+        if (state.start == n) {
+            answer.push_back(std::move(state.parts));
+            continue;
+        }
+
+        for (int end = n - 1; end >= state.start; --end) {
+            if (!is_palindrome[state.start][end]) {
+                continue;
+            }
+            State next = state;
+            next.parts.push_back(s.substr(state.start, end - state.start + 1));
+            next.start = end + 1;
+            stack.push_back(std::move(next));
+        }
+    }
+    return answer;
+}
+\end{lstlisting}
+
+这题的决策树层数不是固定的 \code{n}，而是取决于切了多少段。每个状态的 \code{start} 表示下一个待切分位置，选择是从 \code{start} 开始切到哪个 \code{end}。预处理回文表的转移也很经典：两端字符相等，且内部子串是回文，整个子串才是回文；长度为 1 或 2 时内部为空或单字符，可以直接成立。搜索复杂度仍然可能指数级，因为合法切分数量本身可能很多，但预处理避免了在搜索树中反复扫描同一段字符串。
+
+复原 IP 地址是切分题的约束版。字符串要切成四段，每段长度 1 到 3，数值 0 到 255，且不能有前导零。暴力枚举三个切分点就能做，因为段数固定；也可以用回溯统一表达。剪枝点很明确：剩余字符太少或太多时停止；当前段长度超过 3 停止；以 0 开头的多位段非法；数值超过 255 非法。
+
+\begin{lstlisting}[language=C++,caption={LeetCode 93 复原 IP 地址：段数和剩余长度剪枝}]
+std::vector<std::string> restore_ip_addresses(const std::string& s)
+{
+    constexpr int SEGMENT_COUNT = 4;
+    constexpr int MAX_SEGMENT_VALUE = 255;
+    std::vector<std::string> answer;
+
+    struct State {
+        int index = 0;
+        std::vector<std::string> segments;
+    };
+
+    std::vector<State> stack{{0, {}}};
+    while (!stack.empty()) {
+        State state = std::move(stack.back());
+        stack.pop_back();
+
+        const int used_segments = static_cast<int>(state.segments.size());
+        const int remaining_segments = SEGMENT_COUNT - used_segments;
+        const int remaining_chars = static_cast<int>(s.size()) - state.index;
+        if (remaining_chars < remaining_segments ||
+            remaining_chars > remaining_segments * 3) {
+            continue;
+        }
+
+        if (used_segments == SEGMENT_COUNT) {
+            if (state.index == static_cast<int>(s.size())) {
+                answer.push_back(state.segments[0] + "." + state.segments[1] +
+                                 "." + state.segments[2] + "." +
+                                 state.segments[3]);
+            }
+            continue;
+        }
+
+        int value = 0;
+        for (int length = 1; length <= 3; ++length) {
+            if (state.index + length > static_cast<int>(s.size())) {
+                break;
+            }
+            if (length > 1 && s[state.index] == '0') {
+                break;
+            }
+            value = value * 10 + (s[state.index + length - 1] - '0');
+            if (value > MAX_SEGMENT_VALUE) {
+                break;
+            }
+
+            State next = state;
+            next.segments.push_back(s.substr(state.index, length));
+            next.index += length;
+            stack.push_back(std::move(next));
+        }
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+这题适合训练“剩余量剪枝”。如果剩余字符数少于剩余段数，每段至少一个字符都不够；如果剩余字符数大于剩余段数乘 3，每段最多三个字符也放不下。这种剪枝不依赖数据运气，是严格必要条件，因此不会漏解。很多组合题都可以做类似估算：剩余元素数量是否足够，剩余目标是否可能达到，剩余步数是否还能完成。
+
+回溯题也可以用位掩码表示集合。子集枚举、访问状态、N 皇后列占用都可以压成整数位。位掩码的优势是状态复制便宜、哈希和比较方便；缺点是可读性下降，并且 \code{n} 不能太大。对于 \code{n <= 20} 的集合问题，位掩码常常是从回溯过渡到状态压缩 DP 的桥梁。
+
+\begin{lstlisting}[language=C++,caption={位掩码枚举子集：每一位表示选或不选}]
+std::vector<std::vector<int>> subsets_by_mask(const std::vector<int>& nums)
+{
+    const int n = static_cast<int>(nums.size());
+    const int state_count = 1 << n;
+    std::vector<std::vector<int>> answer;
+    answer.reserve(state_count);
+
+    for (int mask = 0; mask < state_count; ++mask) {
+        std::vector<int> subset;
+        for (int i = 0; i < n; ++i) {
+            if ((mask & (1 << i)) != 0) {
+                subset.push_back(nums[i]);
+            }
+        }
+        answer.push_back(std::move(subset));
+    }
+
+    return answer;
+}
+\end{lstlisting}
+
+位掩码写法的复杂度是 \complexity{O(n2^n)}，因为每个集合要检查 n 位。它没有递归栈，也不需要回退，适合子集这种所有状态都合法的题；如果有复杂剪枝，例如组合总和或单词搜索，回溯更自然。选择表达方式时要看题目结构，不要为了使用位运算牺牲清晰性。
+
+剪枝必须证明不会漏解。常见剪枝有四类。第一，合法性剪枝：括号前缀右括号不能超过左括号。第二，容量剪枝：组合总和中当前和超过目标立即停止。第三，剩余量剪枝：IP 地址剩余字符数量必须落在可行范围。第四，排序剪枝：候选已排序时，当前值超过剩余目标，后续更大值也不可能使用。没有证明的剪枝很危险，比如“看起来这个分支不太可能有答案”不能作为正确算法的一部分。
+
+\begin{labbox}
+回溯实验：第一，把组合总和 II 的同层去重条件删除，观察重复答案如何出现。第二，把复原 IP 地址的剩余量剪枝删除，统计访问状态数量变化。第三，把分割回文串的回文预处理去掉，改成每次扫描判断，比较长字符串上的耗时。第四，用位掩码和迭代扩展两种方式生成子集，比较输出顺序和代码复杂度。
+\end{labbox}
+
+\begin{principlebox}{回溯题复盘模板}
+回溯题不要先背代码。先画出决策树的一层，写清本层选择、路径状态、可选集合、终止条件和剪枝条件。组合题重点看 \code{start} 是否允许重复使用当前元素；排列题重点看 \code{used} 和同层去重；网格题重点看访问标记是路径级还是全局级；括号和棋盘题重点把非法前缀提前剪掉。最后再问一句：答案数量本身有多大？如果答案就是指数级，复杂度不可能被写成线性或多项式。
+\end{principlebox}
+
+\input{chapters/generated/generated-backtracking-cards}
+\input{chapters/generated/generated-bit-state-cards}

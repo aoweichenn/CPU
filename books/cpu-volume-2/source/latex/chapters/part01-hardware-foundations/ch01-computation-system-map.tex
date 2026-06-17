@@ -1,0 +1,1183 @@
+\chapter{计算系统全景}
+
+\section{问题与目标}
+
+第二册不能从一串名词开始。若第一章只是依次介绍多核、缓存、TLB、线程、锁、无锁队列、异步 I/O 和分布式协议，读者会得到一张很长的术语表，却仍然不知道真实系统为什么会变慢、为什么会出错、为什么某个概念必须出现。经典教材舒服的地方，不是标题漂亮，而是它能从读者已经会写的小程序出发，让每个新概念都从一个绕不开的问题里长出来。
+
+本章选择一个足够朴素的任务：读取一批日志，按事件名统计次数，写出结果。这个任务小到可以用几十行 C++ 写出串行版本，也大到会自然遇到第二册的全部核心矛盾。输入变大以后，数据搬运比加法更贵；线程变多以后，共享计数表会产生锁竞争和缓存行迁移；写出结果以后，临时文件存在并不代表结果已经有效；任务失败以后，重试可能让同一份数据被合并两次；扩展到多机以后，分片、shuffle、提交点和幂等性都会变成正面问题。
+
+所以本章不是把全书知识提前压缩一遍，而是建立一条以后每章都要遵守的推导线：
+
+\begin{center}
+\begin{minipage}{0.86\linewidth}
+\begin{verbatim}
+一个具体任务
+  -> 一个朴素实现
+  -> 一个暴露出来的问题
+  -> 一个必须引入的系统概念
+  -> 一个可检查的接口或实验
+  -> 一个新的边界条件
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+这条线也解释了为什么本册要接在第一册后面。第一册已经讲过程序如何从源码变成进程，虚拟地址如何组织内存，汇编指令如何改变寄存器和内存，Linux 工具如何帮助我们观察运行结果。第二册不再重复这些基础，而是把一个进程放进更复杂的计算环境里：多个核心同时执行，多个缓存层级同时保存副本，多个线程共享状态，多个任务在队列中等待，多个节点通过网络交换数据，多个失败路径随时可能打断正常流程。
+
+\begin{keyidea}
+第二册的主题不是“使用更多资源”，而是“让一个计算任务在更多资源、更复杂等待和更多失败边界下仍然正确、快速、可解释”。硬件、操作系统、运行时、算法和分布式协议，都是为这个目标服务的工具。
+\end{keyidea}
+
+本章读完后，你不需要已经掌握所有优化技巧，但应当能回答六个基础问题。第一，什么结果算正确，reference 应该怎样定义。第二，数据从输入到输出经过哪些形态，哪些字段属于热路径，哪些字段只是诊断信息。第三，CPU、缓存、TLB 和内存系统为什么会影响一个看似普通的循环。第四，多个执行实体怎样协作，等待点怎样从隐式调用变成可观察状态。第五，结果何时对外有效，临时状态和提交事实怎样区分。第六，后续章节怎样沿同一条逻辑继续展开，而不是变成互不相干的概念堆叠。
+
+\section{从一个朴素日志统计程序开始}
+
+先不要急着谈多线程。一个系统如果连单线程语义都讲不清，后面的并行优化只会把错误放大。假设每行日志采用非常简单的格式：
+
+\begin{center}
+\begin{minipage}{0.78\linewidth}
+\begin{verbatim}
+timestamp user_id event_name value
+\end{verbatim}
+\end{minipage}
+\end{center}
+
+本章先只统计 \code{event_name} 出现次数。朴素思路是逐行读取，解析字段，把事件名放入哈希表计数。这个版本不追求极致速度，而是作为 reference 的雏形：它要尽量直接、容易审查、错误策略清楚，方便后面所有优化版本对照。
+
+\begin{lstlisting}[language=C++,caption={串行 reference 的最小形态}]
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <vector>
+
+struct ParseResult {
+    bool ok = false;
+    std::string_view event_name;
+    std::uint32_t error_code = 0;
+};
+
+ParseResult parse_line(std::string_view line);
+
+using EventCountMap = std::unordered_map<std::string, std::uint64_t>;
+
+EventCountMap run_reference(const std::vector<std::string>& lines)
+{
+    EventCountMap counts;
+
+    for (const std::string& line : lines) {
+        const ParseResult parsed = parse_line(line);
+        if (!parsed.ok) {
+            continue;
+        }
+
+        ++counts[std::string(parsed.event_name)];
+    }
+
+    return counts;
+}
+\end{lstlisting}
+
+这段代码看起来简单，却已经暴露出许多系统问题。第一，错误行被跳过，这是否符合业务语义。第二，\code{std::string(parsed.event_name)} 每次可能分配内存，热路径上会有额外成本。第三，\code{std::unordered_map} 的节点通常分散在堆上，查询和插入可能产生随机访存。第四，哈希表扩容会造成突发成本。第五，如果多个线程直接共享这个 map，需要锁或原子协调。第六，函数返回时只有内存结果，没有说明结果如何写到磁盘、如何恢复、如何防止重复提交。
+
+这些不是要马上修复的缺陷，而是教材叙事的入口。一本合格的系统书不能在这里直接跳到“使用线程池”或“使用 SIMD 解析”。它必须先把朴素程序拆开，说明哪些问题属于语义，哪些问题属于数据布局，哪些问题属于硬件执行，哪些问题属于并发协作，哪些问题属于持久化和恢复。
+
+\topic{一、reference 的作用不是慢版本}
+很多人把 reference 理解成“一个慢但容易写的版本”。这个说法只说对了一半。Reference 的核心作用是定义正确性，而不是定义速度。后续的多线程版本、SIMD 版本、异步 I/O 版本、分布式版本，都必须在同一批输入上与 reference 对齐。只要 reference 语义含糊，任何性能数字都没有意义。
+
+例如错误行到底计入错误计数，还是直接跳过；大小写是否敏感；空事件名是否合法；最后一行没有换行符是否有效；同一个输入文件重复处理一次是否允许；输出顺序是否必须稳定。这些问题不写清楚，后续优化版本就可能各自做出不同解释。表面上它们都在“统计日志”，实际得到的是不同程序。
+
+\topic{二、朴素程序帮我们找到第一批边界}
+从代码结构看，最小统计程序包含四个阶段：读取、解析、聚合、输出。读取阶段把字节放进内存；解析阶段把文本字段变成结构化字段；聚合阶段把字段变成计数；输出阶段把计数对外公布。每个阶段都有自己的边界。读取边界关心文件、offset、buffer 和行分隔；解析边界关心字段规则和错误分类；聚合边界关心 key 的身份和计数溢出；输出边界关心格式、排序、临时文件和提交点。
+
+如果这些边界没有提前分清，后续章节就会混乱。缓存章节会不清楚热数据在哪里，线程章节会不清楚共享状态是谁，锁章节会不清楚临界区保护什么，I/O 章节会不清楚写出完成是否等于结果有效，分布式章节会不清楚重复执行是否安全。因此第一章要把简单程序里的边界讲透，而不是急着扩展。
+
+\topic{三、第一版代码为什么故意不完美}
+第一版 reference 仍然把事件名复制进 \code{std::string}，仍然使用通用哈希表，仍然跳过错误行。这是教学上有意保留的粗糙度。若第一段代码就塞进字符串池、冷热分离、分片聚合、批量写出和 manifest，读者会看到一堆设计，却看不到设计从哪里来。正确的顺序是先接受一个朴素版本，再让它在更大的输入、更高的并发和更真实的失败路径中暴露问题，最后再引入必要机制。
+
+\section{规模放大：朴素程序为什么会长成系统}
+
+一个几十行日志统计程序，在一百行输入上看不出系统味道。它读文件很快，哈希表很小，错误可以人工检查，写出结果也只是一瞬间。很多教材写得散乱，原因之一就是没有先解释规模怎样改变问题：小输入上不存在的问题，在大输入、长时间运行、多线程和失败恢复中会变成主线。第二册必须从这里把逻辑接起来，否则后面讲缓存、队列、锁和分布式都会像突然冒出来的概念。
+
+先把输入放大到一亿行。哪怕每行平均只有几十字节，程序也要处理数 GB 的文本。此时，读入字节、扫描分隔符、计算哈希、比较字符串、分配 key、更新计数和写出 partial，每一步都可能占据可观时间。再把事件名分布改成高度倾斜：百分之九十的记录都是同一个事件。此时，全局计数器会成为热点。再把 worker 增加到多个核心：热点计数所在 cache line 会在核心之间迁移。再加入故障：某个 worker 写出 partial 后崩溃，重试又写出一份 partial。此时，目录里有两个看起来都像结果的文件，reduce 如果扫描目录就会重复合并。
+
+这些变化不是在增加“高级功能”，而是在逐步去掉朴素程序默认享受的假设。小输入默认内存够用，大输入不一定。单线程默认顺序固定，多线程不一定。一次运行默认不会失败，长时间作业不一定。内存结果默认立即有效，外部文件和分布式消息不一定。系统概念就是从这些假设被打破的地方长出来的。
+
+\topic{一、小输入隐藏固定成本}
+每个系统都有固定成本和可变成本。启动线程、打开文件、分配哈希表、初始化队列、提交 manifest、写 trace，这些成本不完全随记录数线性增加。输入很小时，固定成本可能比实际计算还大；输入很大时，每条记录上的可变成本又会主导。若只用小输入测量，很容易得出错误结论：某个批处理优化看起来没用，可能只是因为输入太小；某个线程池版本看起来更慢，可能只是因为任务太少，线程调度成本盖过了并行收益。
+
+日志统计里，批量解析就是固定成本和可变成本的取舍。一次处理一行，接口简单，但每行都要走一遍函数调用、边界检查和容器操作。一次处理一批，批次头部、队列入出和 trace 只发生一次，可以摊薄固定成本；但批次太大，又会增加尾延迟和失败后重做范围。于是 batch size 不是随便选的常量，而是由输入规模、缓存容量、队列等待、I/O 写出和恢复粒度共同决定。
+
+\topic{二、工作负载不是一个数字}
+说“输入有一亿行”仍然不够。系统性能取决于工作负载形状。总字节数决定数据移动下限，平均行长影响解析，最大行长影响 buffer 策略，事件种类数影响聚合结构，最高频事件占比影响热点，错误率影响冷路径，split 大小影响任务粒度，输入是否已在 page cache 中影响 I/O 结论。一个工程报告如果只写输入规模，不写这些形状，就很难解释为什么同一程序在另一批数据上表现不同。
+
+例如事件种类少时，线程本地 partial 的收益通常明显，因为共享热点可以被推迟到合并阶段。事件种类极多时，partial 自身可能很大，合并阶段会成为新的瓶颈，字符串存储和哈希表局部性更重要。若错误行集中在一个 split，取消和重试策略会被放大；若错误均匀分布，错误路径可能只是轻微开销。工作负载不同，正确的系统形状就不同。
+
+\topic{三、复杂度不能替代机器成本}
+朴素扫描、批量解析和本地聚合，从算法复杂度看都可能是 \complexity{O(n)}。但机器成本并不相同。一个版本顺序扫描连续 buffer，另一个版本每条记录都创建字符串并插入节点式哈希表；它们的复杂度相同，cache、TLB、分配器和分支行为却完全不同。复杂度回答规模增长趋势，机器成本回答真实硬件怎样执行。第二册不能丢掉复杂度，但也不能停在复杂度。
+
+同样是常数时间操作，成本也可能差几个数量级。一次本地整数加法、一次原子加法、一次互斥锁竞争、一次系统调用、一次磁盘写、一次跨机 RPC，都可以被粗略看成某种常数操作，但系统设计不能把它们当成同一种常数。日志统计里，减少一条本地加法的收益，可能抵不过一次额外字符串分配；减少一次字符串复制的收益，可能抵不过一次错误的跨节点 shuffle。成本尺度决定优化优先级。
+
+\topic{四、批量化和流水线从问题中出现}
+当 reader、parser、worker 和 writer 的速度不同，单个大循环就不再合适。Reader 可能被磁盘或 page cache 影响，parser 消耗 CPU，worker 聚合时受哈希和内存影响，writer 受文件系统影响。若所有阶段串行执行，任何一个慢阶段都会让整个程序停住；若阶段之间用有界队列连接，就可以形成流水线，让不同阶段同时工作。但流水线不是免费午餐，它引入了队列容量、关闭语义、错误传播和背压。
+
+批量化也是同一个推导。逐行传递会让队列节点和调度成本过高；整文件传递又会让内存压力和失败重做范围过大。批次是折中：它把若干记录作为一个处理单位，让固定成本被摊薄，同时让错误定位和恢复仍然可控。这个折中会在后面的 SIMD、任务运行时、异步 I/O 和分布式 shuffle 中反复出现。
+
+\topic{五、瓶颈迁移不是异常}
+优化一个阶段后，瓶颈经常迁移。最初的串行程序可能慢在字符串分配；引入字符串视图和批量 buffer 后，慢点可能变成哈希表随机访问；改成线程本地 partial 后，慢点可能变成合并阶段；加入更多线程后，慢点可能变成内存带宽或 NUMA；异步写出后，慢点可能变成 manifest 提交；扩展到多机后，慢点可能变成 shuffle 和热点 key。若报告只写“优化后快了多少”，没有说明瓶颈是否迁移，就不算完整分析。
+
+瓶颈迁移也能解释为什么同一个优化在不同阶段结论不同。在全局锁严重竞争时，线程本地 partial 提升巨大；当内存带宽已经打满时，同样的 partial 结构再精细也可能收益有限。在 parser 分支误预测严重时，SIMD 扫描有价值；当 I/O 阻塞主导时，改 parser 只会让队列更快积压。高质量教材要教读者重新判断瓶颈，而不是记住一个固定答案。
+
+\begin{mentalmodel}
+规模放大不是把小程序运行更多次，而是逐步打破小程序隐含的假设。每打破一个假设，就会逼出一个新的系统边界：工作负载、批次、队列、共享状态、提交点、恢复和证据。
+\end{mentalmodel}
+
+\section{第一道边界：什么结果算正确}
+
+系统设计的第一个问题不是“怎样更快”，而是“怎样判断没有算错”。对于日志统计，正确性至少包括输入合同、解析规则、错误策略、计数语义和输出格式。输入合同说明每行有哪些字段、字段用什么分隔、最大行长是多少、编码是什么。解析规则说明事件名从哪里取、是否允许空字段、是否允许转义。错误策略说明坏行是跳过、终止、记录到错误输出，还是进入特殊计数。计数语义说明重复行、重复文件和重试是否可能造成重复计数。输出格式说明 key 的排序、数值宽度和校验方式。
+
+这些内容看起来像业务细节，其实是系统优化的基础。没有输入合同，就不知道 split 能不能从任意字节切开。没有错误策略，就不知道 parser 是否能把错误局部化。没有计数语义，就不知道并行 partial 能不能无序合并。没有输出格式，就不知道结果能不能稳定比较。性能工程不是绕过这些细节，而是把它们变成可验证的接口。
+
+\begin{lstlisting}[language=C++,caption={把语义写成可检查的结构}]
+#include <cstdint>
+#include <string>
+#include <string_view>
+
+enum class ParseError : std::uint32_t {
+    none = 0,
+    empty_line = 1,
+    missing_field = 2,
+    event_too_long = 3,
+    malformed_value = 4
+};
+
+struct RecordId {
+    std::uint32_t input_id = 0;
+    std::uint32_t split_id = 0;
+    std::uint64_t byte_offset = 0;
+    std::uint32_t line_index = 0;
+};
+
+struct ParsedRecord {
+    RecordId id;
+    std::string_view event_name;
+    ParseError error = ParseError::none;
+};
+\end{lstlisting}
+
+这里的重点不是多写几个结构体，而是让系统以后能回答“这一条记录是谁”。\code{RecordId} 把记录和输入位置绑定起来。解析成功时，热路径只需要事件名和必要标识；解析失败时，错误报告可以通过 \code{RecordId} 回到原始输入。这样做会增加一点控制信息，但换来的是可追踪性。没有可追踪性，后续并发和分布式错误会很难复盘。
+
+\topic{一、为什么要有数据身份}
+单线程小程序可以靠调用栈理解当前处理哪一行。多线程之后，记录会被切成批次，放入队列，被不同 worker 处理，再合并成 partial。分布式之后，记录还会跨进程、跨节点、跨重试 attempt 迁移。若没有稳定身份，一条错误记录可能只留下“worker 3 解析失败”这种无用信息。更糟的是，重复执行时系统无法判断某个 partial 是否来自同一份输入。
+
+数据身份不是为了让代码看起来正式，而是为了让优化后仍能解释数据。缓存优化可能改变对象布局，线程池可能改变执行顺序，I/O 批处理可能改变写出时机，分布式调度可能改变 worker 位置。只要 \code{RecordId}、\code{SplitId}、\code{AttemptId} 和 \code{BlockId} 这些身份保持清楚，系统就能在执行顺序变化后仍然追踪事实。
+
+\topic{二、错误策略必须早于并行化}
+假设输入中某一行缺少事件字段。朴素程序直接跳过，另一个程序把它计入 \code{bad_record}，第三个程序遇到错误立即终止。三者都可能有道理，但它们不是同一个语义。如果先并行化再讨论错误策略，会遇到更难的问题：一个 worker 发现错误时，其他 worker 已经写出 partial 怎么办；错误是否需要取消整批任务；已经提交的结果是否撤销；错误报告是否保留输入位置。
+
+因此本册要求每个模块先写错误出口。错误出口至少说明谁观察到错误，哪些资源需要释放，哪些结果可以保留，哪些结果必须撤销，是否允许重试。这样后面讲锁、原子、I/O 和分布式时，错误不是额外补丁，而是正常路径的一部分。
+
+\topic{三、reference 要覆盖边界输入}
+Reference 不只跑正常输入。第一章的 reference 至少要覆盖空文件、只有一行、最后一行没有换行符、超长行、字段缺失、事件名重复、事件名极多、某个事件名占据大部分记录、输入被拆成多个 split 后跨边界。这些输入不是为了凑测试数量，而是为了逼迫语义变清楚。
+
+例如跨 split 的半行问题会迫使我们定义 split 的边界。若 split 可以从任意字节开始，reader 必须找到第一条完整记录；若 split 必须由上游按行边界生成，调度器要保存这个合同。再比如热点事件名会迫使我们思考共享计数表是否会变成热点。边界输入越早出现，后续优化越不容易走偏。
+
+\begin{warningbox}
+不要把“能跑完一个正常样例”当成正确。系统越往后扩展，越多错误来自边界输入、重复执行、迟到完成和局部失败。第一章就把这些条件写进 reference，后面才能放心谈性能。
+\end{warningbox}
+
+\section{第二道边界：数据怎样穿过机器}
+
+当输入从几百行变成几亿行，程序的主要成本通常不再是几次整数加法，而是数据如何移动。日志字节从存储设备进入内核页缓存，进入用户态 buffer，进入解析器，进入聚合结构，最后进入输出文件。每一次复制、解析、哈希、分配和写回，都可能比 \code{++count} 本身贵得多。第二册的硬件部分正是从这里开始，而不是凭空介绍缓存名词。
+
+朴素 reference 的热路径至少包含三类数据。第一类是输入字节，它们连续、体积大、只读，适合顺序扫描。第二类是热字段，例如事件名的起止位置、事件名哈希值和计数，它们在聚合时反复访问。第三类是冷信息，例如原始行文本、错误诊断、输入文件名、详细 trace，它们很重要，但不应该被每次计数操作一起搬进缓存。
+
+如果把所有信息塞进一个大对象，热循环就会不断搬动不需要的字段。硬件按 cache line 搬数据，而不是按 C++ 字段的“重要程度”搬数据。一个对象里只要有热字段和冷字段混在一起，CPU 读取热字段时就可能顺便把冷字段所在的字节也带进缓存。小输入看不出问题，大输入就会变成缓存容量和带宽浪费。
+
+\begin{lstlisting}[language=C++,caption={把热字段和冷字段分开}]
+#include <cstdint>
+#include <string>
+#include <string_view>
+#include <vector>
+
+struct HotRecord {
+    std::uint64_t event_hash = 0;
+    std::uint32_t event_begin = 0;
+    std::uint32_t event_size = 0;
+    std::uint32_t local_line_index = 0;
+};
+
+struct ColdRecordInfo {
+    RecordId id;
+    std::string original_line;
+    ParseError error = ParseError::none;
+};
+
+struct ParsedBatch {
+    std::string input_bytes;
+    std::vector<HotRecord> hot_records;
+    std::vector<ColdRecordInfo> cold_infos;
+};
+\end{lstlisting}
+
+这段代码不是最终实现，只是表达一个原则：热路径应尽量携带计算必须反复使用的最小信息，冷路径保存诊断和恢复需要的上下文。后续章节讲数据布局、预取、SIMD 和 cache 时，都会回到这个原则。高性能不是把所有信息删掉，而是让不同频率的信息走不同路径。
+
+\topic{一、从字节流到结构化记录}
+读取文件时，程序看到的是字节流；解析之后，程序才知道哪些字节构成时间戳、用户、事件名和值。这个转换看似简单，却决定了后面的并行性。若每条记录独立，多个 worker 可以处理不同 split；若格式允许引号、转义、多行字段，解析状态可能跨字符传播，切分就不再随意。输入格式越复杂，reader 和 parser 的合同越重要。
+
+日志统计的教学版本可以先限制格式，让每行独立。这个限制不是偷懒，而是为后续推导建立清晰起点。等理解了独立记录如何切分、聚合和提交，再放宽格式，读者就能看清额外复杂性来自哪里。经典教材不会一开始就给最复杂的工业格式，而是先给能暴露本质的模型。
+
+\topic{二、为什么连续访问通常更友好}
+连续数组让硬件更容易工作。CPU 读取某个地址时，缓存通常会以 cache line 为单位搬入一段连续字节；硬件预取器也更容易识别顺序访问模式。相反，链表节点、哈希表节点和散落的小对象会让访问地址难以预测，导致更多 cache miss 和 TLB 压力。两个算法复杂度都可以是 \complexity{O(n)}，但连续扫描和随机追指针的机器成本可能相差很大。
+
+这正是朴素 \code{std::unordered_map} 版本的问题之一。它语义方便，但每个 key 可能是独立分配的字符串，每个桶和节点也可能分散在内存中。对于事件种类较少的日志，局部聚合可以把多个记录先聚到线程本地结构，再批量合并；对于事件种类很多的日志，可以考虑字符串池、排序归约或分片哈希。选择哪一种方案，取决于 workload，而不是取决于某个容器名字是否高级。
+
+\topic{三、硬件章节要回答的不是术语，而是代价}
+后面讲流水线时，要解释一个循环为什么可能受依赖链限制。讲缓存时，要解释热字段为什么应当紧凑，随机访问为什么会慢。讲 TLB 时，要解释大工作集和大量小对象为什么会击穿地址转换缓存。讲 NUMA 时，要解释同一个虚拟地址背后的物理页可能靠近某个 socket，远端访问为什么会拖慢多线程程序。所有硬件概念都要回到“这批日志字节怎样穿过机器”这个问题。
+
+\begin{mentalmodel}
+先画数据路径，再谈硬件优化。若不知道字节从哪里来、变成什么结构、被谁反复访问、在哪里写出，就无法判断缓存、TLB、预取、SIMD 或 NUMA 优化到底作用在哪一段。
+\end{mentalmodel}
+
+\section{第三道边界：多个执行实体怎样协作}
+
+单线程 reference 清楚以后，最自然的想法是把输入切成多个 split，让多个 worker 并行处理。表面上这只是把循环拆开，实际会立刻引入执行实体、队列、共享状态、等待和背压。多线程不是把同一段代码复制几份那么简单，因为多个执行实体一旦共享资源，就必须回答谁拥有状态、谁能修改状态、谁等待谁、等待多久、失败如何传播。
+
+先看一个常见但危险的设计：所有 worker 共享一个全局计数 map，每解析到一条记录就加锁更新。小输入上它能工作，线程数上来后却可能变慢。原因不是“锁一定慢”这么粗，而是每条记录都要进入同一个临界区，哈希表内部状态和锁所在 cache line 会在核心之间迁移。worker 越多，争用越严重，最后程序的主成本可能从解析和聚合变成等待锁。
+
+更好的第一步通常是线程本地聚合。每个 worker 处理自己的 split，把结果写入本地 partial；最后再合并 partial。这个设计牺牲了一点内存，换来热路径上更少共享写。它也把问题拆成两个阶段：map 阶段并行处理输入，reduce 阶段合并 partial。这个结构以后会自然扩展到分布式计算。
+
+\begin{lstlisting}[language=C++,caption={线程本地 partial 的接口形状}]
+#include <cstdint>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+struct Split {
+    std::uint32_t input_id = 0;
+    std::uint32_t split_id = 0;
+    std::uint64_t begin_offset = 0;
+    std::uint64_t end_offset = 0;
+};
+
+struct PartialCount {
+    std::uint32_t split_id = 0;
+    std::unordered_map<std::string, std::uint64_t> counts;
+};
+
+PartialCount process_split(const Split& split);
+
+EventCountMap merge_partials(const std::vector<PartialCount>& partials)
+{
+    EventCountMap merged;
+
+    for (const PartialCount& partial : partials) {
+        for (const auto& [event_name, count] : partial.counts) {
+            merged[event_name] += count;
+        }
+    }
+
+    return merged;
+}
+\end{lstlisting}
+
+这段代码仍然不是最终高性能版本，但它把共享写从每条记录一次，降低到每个 partial 合并时发生。这个变化背后的思想很重要：并发优化的第一原则通常不是马上使用更复杂的同步原语，而是减少共享、延迟共享、分片共享，让大部分工作在本地完成。
+
+\topic{一、任务队列为什么必须有边界}
+如果 reader 不断产生 split，worker 处理速度又跟不上，队列会不断增长。无界队列看起来提高了吞吐，实际可能把内存耗尽，或者把延迟藏起来。系统需要有界队列：队列满时，上游必须等待或降速；队列关闭时，下游必须能醒来退出；任务失败时，等待者必须能收到错误。这个机制叫背压，但它不是一个独立术语，而是从“生产者可能快于消费者”这个问题中推导出来的。
+
+有界队列的合同至少包括容量、push 失败条件、pop 等待条件、关闭语义和错误传播。若这些合同不清楚，线程池很容易卡死。比如 producer 在队列满时等待，consumer 因错误提前退出，队列没有关闭通知，producer 就可能永远睡眠。后续讲 mutex、condition variable 和 semaphore 时，必须围绕这些具体不变量展开，而不是只背 API。
+
+\topic{二、线程池不是为了把代码异步化}
+线程池的核心价值是控制执行资源。没有线程池时，每个任务都创建线程，成本高且数量失控；有线程池后，系统可以限制 worker 数量，复用线程，集中处理任务生命周期。线程池也带来新的责任：任务提交后是否一定执行，shutdown 是否等待正在运行的任务，任务抛出异常如何传播，worker 内部等待另一个任务是否可能死锁。
+
+这些问题都可以在日志统计项目里具体出现。Reader 提交 split，worker 解析并聚合，writer 写出 partial。如果 writer 阻塞，worker 是否继续产生结果；如果某个 split 失败，其他 split 是否取消；如果主线程等待所有 future，而 worker 又等待主线程提交的任务，是否可能形成等待环。线程池不是语法糖，而是执行图的一部分。
+
+\topic{三、等待点必须显式化}
+并发程序最难解释的时间通常不是计算时间，而是等待时间。等待队列空间、等待任务、等待锁、等待 I/O、等待另一个线程完成、等待重试预算，都会让吞吐和延迟变化。若代码没有记录等待点，系统报告只能说“变慢了”，无法判断是上游太快、下游太慢、队列太小、锁太粗，还是任务粒度太碎。
+
+第一章要求每个任务至少有几个时间点：创建、入队、开始运行、结束运行、提交结果。后续章节可以把这些时间点展开成更细指标，例如锁等待、futex、context switch、I/O completion 和 RPC deadline。显式等待不是为了多写日志，而是为了让性能瓶颈有证据。
+
+\section{队列、状态机和背压}
+
+上一节说到队列，但队列不只是一个容器。一个普通 \code{std::queue} 只能保存元素，不能表达生产者什么时候该停、消费者什么时候该醒、系统失败时谁负责通知等待者。真正进入系统设计后，队列必须带状态机。状态机的意义不是把代码写复杂，而是把隐式控制流变成可讨论的合同。
+
+在日志统计项目里，reader 向 split queue 放任务，worker 从 split queue 取任务并生成 partial，writer 从 partial queue 取结果并写出 block。只要 writer 慢于 worker，partial queue 就会增长；只要 worker 慢于 reader，split queue 就会增长。若队列无界，系统会把速度不匹配伪装成内存增长，直到延迟失控或进程被杀。若队列有界，上游在队列满时等待，速度不匹配会立刻暴露出来。这就是背压。
+
+\topic{一、队列状态先于实现技巧}
+一个有界队列至少有四种状态。Open 表示可以 push，也可以 pop。Closing 表示不再接受新任务，但已有任务仍可被消费。Closed 表示队列为空，消费者应该退出。Failed 表示队列因为错误关闭，等待者应收到失败原因。很多初学者只写一个布尔变量 \code{done}，结果无法区分“正常没有更多任务”和“发生错误必须取消”。这两种情况对上游和下游完全不同。
+
+例如 reader 读完整个文件后关闭 split queue，这是正常结束。Worker 解析时发现不可恢复的输入合同错误，应该让下游知道作业失败，并让其他等待者醒来退出。Writer 写 manifest 失败，也可能需要阻止 reducer 继续读取 partial。若队列只有空和非空，没有失败状态，错误只能藏在日志里，控制流仍然可能继续向前走。
+
+\topic{二、等待谓词必须写成不变量}
+条件变量最容易写错的地方，是把等待当成“睡一会儿”，而不是等待某个谓词变真。对有界队列来说，producer 等待的谓词通常是“队列未满，或者队列已经关闭，或者队列已经失败”；consumer 等待的谓词通常是“队列非空，或者队列已经关闭，或者队列已经失败”。只要谓词没有写清楚，虚假唤醒、关闭竞态和错误传播都会出问题。
+
+这就是为什么后面讲锁和条件变量时，不能只写 API。必须先写队列的不变量：元素数量不超过容量；open 状态允许 push；closing 状态拒绝新 push；closed 状态没有剩余元素；failed 状态唤醒全部等待者；任何等待都必须能被关闭或失败打断。API 只是实现这些不变量的工具。
+
+\topic{三、任务状态帮助解释等待}
+队列里保存的不应只是一个函数对象。教学项目里，每个任务至少应有 \code{TaskId}、输入 split、attempt、状态、创建时间、入队时间、开始时间、结束时间和错误码。这样当吞吐下降时，报告能区分任务还没入队、已经入队但没有 worker、正在运行、等待写出、已经失败还是已经提交。没有状态字段，线程池内部就会成为黑箱。
+
+\begin{lstlisting}[language=C++,caption={任务状态记录的教学形态}]
+#include <cstdint>
+
+enum class TaskState : std::uint32_t {
+    created = 0,
+    queued = 1,
+    running = 2,
+    finished = 3,
+    committed = 4,
+    failed = 5,
+    cancelled = 6
+};
+
+struct TaskTrace {
+    std::uint32_t task_id = 0;
+    std::uint32_t split_id = 0;
+    std::uint32_t attempt_id = 0;
+    TaskState state = TaskState::created;
+    std::uint64_t timestamp_ns = 0;
+    std::uint32_t worker_id = 0;
+};
+\end{lstlisting}
+
+这段代码看起来像控制面信息，但它会直接影响性能分析。若大量任务停在 queued，说明 worker 数量、任务粒度或上游提交方式有问题；若大量任务 running 时间很长，说明计算或 I/O 本身慢；若 finished 到 committed 间隔很长，说明写出或 manifest 是瓶颈；若 cancelled 很多，说明错误传播或重试策略需要检查。状态机让等待可见。
+
+\topic{四、背压不是简单把队列变小}
+有界队列的容量需要设计。容量太小，生产者和消费者频繁互相等待，吞吐可能下降。容量太大，系统延迟和内存占用升高，失败时需要处理的在途任务也更多。合理容量来自成本账本：每个 split 大小、每个 ParsedBatch 大小、每个 partial 大小、worker 数量、writer 吞吐和允许的内存预算。队列容量应该能解释，而不是写成随手的常量。
+
+在日志统计中，split queue 可以按 worker 数量设置为若干倍，让 reader 有少量预读空间，但不要把整个文件都塞进队列。partial queue 要考虑 writer 速度，若 writer 被磁盘阻塞，上游应当降速，而不是无限制造 partial。分布式系统中的限流和 backpressure，本质上就是同一个问题扩大到跨节点消息。
+
+\topic{五、关闭路径是并发程序的试金石}
+很多并发代码在正常输入上能工作，在关闭时暴露问题。Reader 结束后，worker 如何知道没有新 split；worker 失败后，reader 是否还继续读取；writer 失败后，partial queue 中已有数据如何处理；主线程收到取消后，正在运行的 worker 能否安全结束；某个等待 push 的 producer 能否醒来。这些问题不解决，程序就会出现偶发卡死。
+
+因此，第一章的样板要求每个并发模块都写关闭路径。不是只写 happy path 的“处理完所有任务”，还要写 reader 失败、worker 失败、writer 失败、主线程取消、队列满时取消、队列空时关闭。后面讲线程池和锁时，这些关闭路径会成为测试用例，而不是口头描述。
+
+\begin{keyidea}
+队列的本质不是保存元素，而是管理速度差、等待关系和关闭语义。没有状态机的队列，只能演示并发；有状态机和背压的队列，才开始像系统组件。
+\end{keyidea}
+
+\section{第四道边界：结果何时对外有效}
+
+单线程程序返回一个 map 时，结果有效性比较直观。系统变大后，结果往往先进入临时状态，再通过某个提交动作对外有效。这个区分非常关键。一个 worker 写出了临时 partial 文件，不代表 reduce 阶段应该读取它；一个异步写请求返回，不代表数据已经进入最终 manifest；一个 attempt 告诉 driver 成功，不代表它一定是被接受的那一次成功。
+
+考虑一个失败场景。Worker 处理 split 7，写出文件 \filepath{part-7.tmp}，随后进程崩溃。Driver 没收到成功响应，于是重试 split 7，新 attempt 写出 \filepath{part-7-retry.tmp}。如果 reduce 阶段只是扫描目录，把两个文件都合并，split 7 就被统计了两次。这个错误不是性能问题，而是提交语义问题。正确做法是让 manifest 成为唯一有效事实：临时文件可以存在，但只有 manifest 接受的 block 才能被下游读取。
+
+\begin{lstlisting}[language=C++,caption={用 manifest 表达提交事实}]
+#include <cstdint>
+#include <string>
+#include <vector>
+
+enum class BlockState : std::uint32_t {
+    temporary = 0,
+    committed = 1,
+    discarded = 2
+};
+
+struct ShuffleBlock {
+    std::uint32_t split_id = 0;
+    std::uint32_t attempt_id = 0;
+    std::uint32_t block_id = 0;
+    std::uint64_t record_count = 0;
+    std::uint64_t checksum = 0;
+    std::string path;
+    BlockState state = BlockState::temporary;
+};
+
+struct ManifestEntry {
+    std::uint32_t manifest_id = 0;
+    std::uint32_t split_id = 0;
+    std::uint32_t accepted_attempt_id = 0;
+    std::uint32_t block_id = 0;
+    std::uint64_t checksum = 0;
+};
+
+using Manifest = std::vector<ManifestEntry>;
+\end{lstlisting}
+
+Manifest 的意义在于把“产生了文件”和“结果已经被系统接受”分开。临时文件是事实，但不是提交事实。Reduce 只读取 manifest 中出现的 block，因此重复 attempt 不会造成重复合并。这个思想后面会扩展到 I/O 完成、分布式提交、检查点和恢复。
+
+\topic{一、提交点是正确性和性能的交界}
+提交点越早，下游越快看到结果，但失败恢复可能更复杂。提交点越晚，系统更容易一次性校验和提交，但延迟可能增加，临时状态也更多。批量提交可以减少 I/O 和锁开销，却扩大崩溃后重做范围；逐条提交恢复简单，却可能吞吐很低。性能和正确性不是两条线，而是在提交点上同时出现。
+
+日志统计项目的第一版可以选择按 split 提交 partial。每个 split 完成后，worker 写出临时 block，校验 checksum，向 manifest 提交一条记录。这个粒度足够小，失败后只重做一个 split；又足够大，避免每条记录都提交。后续章节讲批处理、异步 I/O 和分布式 checkpoint 时，可以继续讨论粒度如何调整。
+
+\topic{二、幂等性来自身份和提交事实}
+幂等不是一句“重复执行也没事”。它需要身份和提交事实支撑。若每个 attempt 都有 \code{AttemptId}，每个输出 block 都有 \code{BlockId}，manifest 又能记录某个 split 已经接受了哪个 attempt，那么重复消息、迟到成功和重复扫描都可以被处理。若没有这些身份，系统只能依赖时间顺序和文件名猜测，失败路径很容易出错。
+
+一个简单规则是：可重试的操作必须有请求身份，可对外有效的结果必须有提交记录，可重复到达的响应必须能被判定为旧响应或已接受响应。单机任务队列、异步 I/O、分布式 RPC 都遵守这个规则。第二册后面不会把幂等性当成分布式章节才出现的概念，而是从第一章的本地 manifest 就开始训练。
+
+\topic{三、恢复不是失败后再补}
+恢复能力要在状态设计时出现。若写出文件时没有 checksum，恢复时无法判断文件是否完整；若 manifest 没有输入 split 范围，恢复时无法判断哪些 split 已经完成；若任务状态没有 attempt，恢复时无法区分旧执行和新执行；若错误日志没有 record id，恢复后无法定位坏输入。失败发生后再补信息，通常已经太晚。
+
+这也是第一章反复强调身份、时间线和提交点的原因。它们不是管理系统的花活，而是恢复路径的最低信息量。后续任何优化，只要破坏这些信息，就必须给出新的证明方式。
+
+\section{失败时间线：从一次崩溃推导恢复协议}
+
+为了避免把恢复讲成概念，本节只分析一次具体崩溃。输入 split 7 被提交给 worker 2，attempt id 为 1。Worker 解析 split，生成 local partial，写出临时文件，计算 checksum，然后准备向 manifest 提交。就在写出临时文件之后、manifest 提交之前，进程崩溃。重启后，driver 看不到 split 7 的 manifest 条目，于是提交 attempt id 为 2。新 attempt 成功写出并提交。此时目录里可能同时存在两个临时文件，但 manifest 只有 attempt 2 的条目。
+
+这个时间线解释了为什么“扫描目录找文件”是错误恢复方法。目录记录的是文件系统事实，不是作业语义事实。临时文件可以来自失败 attempt、旧 attempt、部分写入、调试输出或清理失败；它们不能直接进入 reduce。Manifest 记录的是提交事实：哪个 split 的哪个 attempt 被接受，checksum 是什么，record count 是多少，下游可以读取哪个 block。恢复协议的核心，就是让语义事实不依赖偶然留下的临时状态。
+
+\topic{一、正常时间线}
+正常情况下，split 从 created 进入 queued，再进入 running。Worker 完成解析和本地聚合后，生成 temporary block。Writer 把 block 写入临时路径，计算 checksum，确认记录数，然后请求 manifest commit。Manifest 检查这个 split 是否尚未接受其他 attempt；若尚未接受，就写入条目并返回 committed；若已经接受，就拒绝这个迟到 attempt。Worker 收到 committed 后，任务状态才进入 committed。
+
+这条时间线里有两个容易混淆的点。第一，worker finished 不等于作业结果有效。Finished 只是计算完成，committed 才表示外部可见。第二，文件写完不等于 block 有效。Block 必须通过校验并被 manifest 引用。把这两个点分清，后面异步 I/O 和分布式响应才不会误读。
+
+\topic{二、崩溃后的扫描顺序}
+恢复程序启动后，不应该先相信临时目录，而应该先读取 manifest。Manifest 告诉系统哪些 split 已经有有效输出。随后再扫描临时目录，把不在 manifest 中的旧临时文件标记为 orphan，按策略清理或保留诊断。接着 driver 重新提交未完成 split。这个顺序很重要：先看 manifest，再处理临时文件；不要先扫描目录再拼出 manifest。
+
+如果反过来，系统会把失败 attempt 留下的文件当成候选输出，恢复逻辑就会变得复杂。它必须猜测文件是否完整、是否来自旧运行、是否已经被 reduce 读过。让 manifest 成为唯一提交事实，可以把猜测变成查询。
+
+\topic{三、校验和不是装饰}
+Checksum 的作用不是防止所有数据损坏，而是给恢复一个最低限度的完整性证据。Writer 写出 block 后，计算 checksum 并把它写进 manifest。Reducer 读取 block 时重新计算，若不一致，就拒绝这个 block 并触发恢复。没有 checksum，短写、截断、旧文件覆盖和路径错误都可能变成静默错误。
+
+教学项目里的 checksum 可以先很简单，但接口要保留它的位置。后续章节可以讨论更强的校验、压缩块校验、分段校验和端到端校验。重要的是读者从第一章就知道：结果有效不只取决于控制状态，也取决于数据本身能被验证。
+
+\topic{四、重试预算防止恢复变成放大器}
+重试可以恢复临时失败，也可以放大故障。若磁盘已满，writer 失败后无限重试只会消耗 CPU 和日志空间；若输入合同错误，重试同一个 split 也不会成功；若网络拥塞，所有 worker 同时重试可能造成更大拥塞。因此 attempt 必须有重试预算和错误分类。可恢复错误进入重试，不可恢复错误进入 failed，超出预算进入作业失败。
+
+这条规则在单机和分布式中一致。单机 writer 短暂失败可以重试，输入格式错误不该重试；分布式 RPC 超时可以重试，业务语义冲突不该盲目重试。恢复协议不是“遇错再跑一遍”，而是根据错误类型、attempt 身份和提交事实决定下一步。
+
+\topic{五、迟到响应必须可判定}
+分布式系统里经常出现迟到响应，单机异步系统里也一样。Attempt 1 可能在 driver 判定超时后仍然完成，并在 attempt 2 提交后才返回成功。如果 driver 只看“成功”两个字，就可能用旧结果覆盖新结果。正确做法是让响应携带 split id、attempt id、block id 和 checksum，manifest 根据当前已接受 attempt 判断它是新提交、重复提交还是迟到提交。
+
+这就是为什么第一章要引入身份。身份不是为了日志好看，而是让迟到事件可判定。没有 attempt id，系统无法区分“这是当前运行的成功”还是“这是旧运行的迟到成功”。没有 block id，系统无法关联文件和提交。没有 manifest id，系统无法说明 reducer 读取的是哪个版本的提交事实。
+
+\topic{六、恢复协议也要有 reference}
+恢复逻辑同样需要 reference。最简单的 reference 可以不关心性能，只根据输入 split 和已接受 manifest 重新计算最终结果。然后对照优化版本：无论 worker 崩溃多少次、临时文件留下多少个、attempt 顺序怎样变化，只要最终 manifest 接受的 split 集合相同，reduce 结果就必须与 reference 一致。这样故障注入才有判断标准。
+
+很多系统教材把恢复放在最后讲，导致读者把它看成额外章节。本册从第一章就把恢复放进主线，是因为失败会改变接口。没有恢复需求，临时文件和最终文件可以混在一起；有恢复需求，就必须有 manifest。没有重试需求，任务可以没有 attempt；有重试需求，就必须有 attempt id。恢复不是附加功能，而是塑造系统结构的力量。
+
+\begin{deepdive}
+一次崩溃就足以推出四个概念：临时状态、提交事实、attempt 身份和恢复扫描顺序。若教材直接给出这些名词，读者会觉得抽象；从崩溃时间线推出来，它们就是不得不有的工程边界。
+\end{deepdive}
+
+\section{第五道边界：硬件为什么会改变软件设计}
+
+到这里，我们已经从语义、数据、执行和提交几个角度拆开了日志统计。现在回到第二册第一部分的标题：硬件执行模型。硬件不是背景知识，而是会反过来改变软件接口和数据结构的约束。一个数据结构在源码层看起来清楚，不代表在机器上便宜；一个算法在复杂度上最优，不代表它适合缓存和多核；一个同步原语在 API 上简单，不代表它不会造成 cache line 所有权来回迁移。
+
+先看聚合。若事件种类很少，全局哈希表里某几个 key 会成为热点。多个线程更新同一个计数，即使用原子加法，也会让包含计数的 cache line 在多个核心之间移动。每次移动都需要一致性协议协调，代价远高于本地寄存器加法。于是线程本地 partial 不是一种“高级并发技巧”，而是从硬件缓存一致性中推导出的设计：让大部分更新在本地发生，把跨核心共享推迟到合并阶段。
+
+再看解析。若每条记录都创建 \code{std::string}，程序会频繁分配小对象。小对象不仅带来分配器成本，还会让事件名散落在堆上，增加随机访存和 TLB 压力。于是字符串视图、字符串池、批量分配和冷热分离就不是过度设计，而是为了让热路径更连续，让硬件更容易预取和缓存。
+
+\topic{一、流水线让依赖链变重要}
+CPU 核心可以同时处理多条指令，但这种并行需要独立工作。如果一个循环每次迭代都依赖上一次结果，例如单个累加器连续相加，依赖链可能限制吞吐。多累加器版本把一条长依赖链拆成几条短依赖链，让乱序执行更容易重叠工作。后面讲核心流水线和乱序执行时，会用这种例子说明为什么“同样的加法次数”也可能有不同速度。
+
+日志统计里也有类似问题。若所有记录都更新同一个计数器，依赖和共享都会集中；若先在线程本地或分片结构里计数，依赖被拆散，合并阶段再处理全局结果。这里的思想与多累加器相通：不要把所有工作压在一条不可并行的链上。
+
+\topic{二、缓存让布局变重要}
+缓存按块搬运数据。热字段越集中，一次缓存行搬运能服务的有效工作越多；冷字段混入热对象，缓存就会搬来很多暂时不用的字节。后面讲 cache 和 TLB 时，会详细分析数组、结构体数组、结构体拆分、对齐、padding、false sharing 和随机访问。本章只先建立一个判断：数据布局不是代码风格，而是机器执行成本的一部分。
+
+对日志统计来说，\code{HotRecord} 可以连续存放，解析循环顺序写入，聚合循环顺序读取。错误详情和原始行文本进入冷路径，只在出错或诊断时访问。这个设计不会让所有情况都最快，但它让主路径更清楚，也让后续测量有对象可测。
+
+\topic{三、TLB 让页级行为变重要}
+程序使用虚拟地址，CPU 访问内存前需要地址转换。TLB 缓存最近的虚拟页到物理页映射。若工作集跨越大量页面，或者随机访问分散小对象，TLB miss 会增加。大数组顺序扫描通常比大量小节点随机访问更友好，不只是因为 cache，也因为页级局部性更好。
+
+这会影响容器选择。通用哈希表方便，但节点式布局可能让访问跨越许多页面。排序后归约、开放寻址哈希、分片数组或批量 arena 分配，有时能以更好的局部性换取更高吞吐。是否值得这样做，要看事件种类、输入规模、内存预算和错误诊断需求，不能只凭容器名下结论。
+
+\topic{四、NUMA 让“同一台机器”不再简单}
+多 socket 机器上，内存物理位置可能靠近某个 socket。一个线程访问本地 NUMA 节点内存较快，访问远端内存较慢。如果主线程先分配并初始化所有 buffer，其他 socket 上的 worker 可能频繁访问远端页面。于是 first-touch、线程绑定和按 NUMA 节点分块就会进入软件设计。后面讲 NUMA 时，我们会把日志统计的输入 split 和 partial buffer 放到这个背景下分析。
+
+这里先记住一件事：多线程性能差，不一定是锁；可能是内存放置、线程迁移、共享缓存争用、带宽上限或远端访问。没有硬件证据，就不要急着改同步结构。
+
+\section{第六道边界：证据怎样支撑判断}
+
+系统性能分析最忌讳把猜测写成结论。看到多线程不加速，就说“锁太慢”；看到 CPU 占用高，就说“计算密集”；看到一次运行很快，就说“优化有效”。这些说法都缺少证据。第二册每章都要训练一种写法：先给现象，再给假设，再给可验证指标，再给对照实验，最后承认边界。
+
+日志统计项目的性能报告不需要一开始就很复杂，但至少要包含输入规模、事件分布、错误比例、线程数、机器信息、编译参数、运行次数、热身策略、reference 校验和主要指标。主要指标可以从简单的吞吐、总耗时、CPU 时间、最大队列长度、错误行数开始；后面再逐步加入 PMU 事件、cache miss、TLB miss、context switch、futex、I/O 等待和 trace。
+
+\topic{一、输入分布决定结论能否外推}
+同样是一亿行日志，事件名只有十种和事件名有一千万种，是两种完全不同的 workload。前者容易出现热点 key，局部聚合收益大；后者哈希表体积大，字符串存储和随机访存更重要。同样是错误率千分之一，错误均匀分布和错误集中在某个 split，也会影响取消和重试。报告不写输入分布，就无法解释性能差异。
+
+因此每个实验都应保存输入摘要：总行数、字节数、平均行长、最大行长、事件种类数、最高频事件占比、错误行数、split 数量。摘要不是装饰，而是让后来的人知道这个结论适用在哪里。
+
+\topic{二、对照实验要一次只改变一个主因素}
+如果把字符串池、线程池、分片哈希、SIMD 解析和异步写出一次性全加进去，速度变快也很难解释原因。经典教材的推导通常一次只改变一个主因素：先比较串行 reference 和线程本地 partial，观察共享写减少后的变化；再比较不同 split 大小，观察任务粒度；再比较冷热分离，观察缓存和分配；再比较异步写出，观察 I/O 等待。这样每个概念都有证据，而不是堆功能。
+
+这并不意味着真实工程只能小步提交。真实工程可以合并多个优化，但教学和复盘必须能拆开原因。第二册后续每章都会尽量保持这种节奏。
+
+\topic{三、测量边界要诚实}
+在手机或普通云主机上，可能没有完整 PMU 权限；在单 socket 机器上，无法真实验证 NUMA；在本机模拟网络时，无法代表真实跨机延迟；文件系统缓存也可能掩盖磁盘成本。报告要把这些边界写出来。诚实写边界不是降低质量，而是提高结论可信度。
+
+例如本章实验如果只在本地文件系统上运行，就不要声称证明了分布式 shuffle 的性能；如果只用小输入，就不要声称缓存优化可以外推到大数据；如果没有固定 CPU 频率，就要承认运行时间可能受频率变化影响。专业的系统报告不会把所有结论说满。
+
+\begin{deepdive}
+证据链的最低形状是：reference 证明结果，输入摘要说明 workload，版本和编译参数说明构建，指标说明现象，对照实验支持或反驳假设，边界说明哪些结论还不能外推。后续章节只是在这条链上增加更专业的指标。
+\end{deepdive}
+
+\section{三张图：身份、执行和成本}
+
+面对一个计算系统，第一反应不应是写更多代码，而是画三张图。第一张是数据身份图，回答每份数据从哪里来、现在叫什么、何时有效。第二张是执行等待图，回答哪些执行实体在工作，哪些地方可能等待。第三张是成本账本，回答每个阶段主要消耗什么资源，证据在哪里。这三张图能把硬件、运行时、算法和恢复连接到同一张工作台上。
+
+\topic{一、数据身份图}
+日志统计的数据身份可以这样画：
+
+\begin{lstlisting}[numbers=none]
+input file
+  -> split_id
+  -> record_id
+  -> parsed hot record
+  -> local partial
+  -> shuffle block
+  -> manifest entry
+  -> final result
+\end{lstlisting}
+
+每一次箭头都表示数据形态变化。输入文件切成 split，split 内的行获得 record id，解析后生成热字段，本地聚合后生成 partial，写出后生成 block，manifest 接受后成为有效输出，最终 reduce 读 manifest 得到结果。若某个箭头没有身份，恢复时就会断链。若某个状态没有有效条件，下游就可能读取临时数据。
+
+这张图以后会出现在不同章节。缓存章节会问 hot record 是否连续；线程章节会问 partial 是否线程本地；I/O 章节会问 block 是否完整；分布式章节会问 manifest 是否能处理重复 attempt。图没有变，只是每章放大不同边。
+
+\topic{二、执行等待图}
+同一个作业的执行等待图可以这样画：
+
+\begin{lstlisting}[numbers=none]
+reader
+  -> bounded split queue
+  -> worker threads
+  -> partial queue
+  -> writer
+  -> manifest commit
+  -> reducer
+\end{lstlisting}
+
+箭头不是简单调用，而是可能等待的边。Reader 可能等待 split queue 有空间；worker 可能等待任务，也可能等待 partial queue 有空间；writer 可能等待 I/O 完成；manifest commit 可能等待锁或持久化；reducer 必须等待所需 block 被提交。任何一个等待点都可能成为瓶颈。若只看源码调用顺序，就看不到队列积压和异步完成。
+
+执行图还要标出关闭路径。Reader 完成后如何通知 worker 没有新 split；worker 完成后如何通知 writer 没有新 partial；某个 worker 失败后，队列中的任务是否取消；writer 失败后，已经完成的 worker 如何退出。没有关闭路径的并发设计，在正常输入上可能没问题，在错误路径上容易卡死。
+
+\topic{三、成本账本}
+成本账本不是财务表，而是把每个阶段的主要资源写清楚：
+
+\begin{lstlisting}[numbers=none]
+read bytes        -> I/O, page cache, copy
+parse fields      -> branch, SIMD opportunity, input bandwidth
+aggregate local   -> hash, allocation, cache locality
+merge partials    -> key cardinality, memory bandwidth, contention
+write blocks      -> buffering, syscall, filesystem
+commit manifest   -> serialization, fsync policy, retry rule
+reduce output     -> data movement, sort or hash, checksum
+\end{lstlisting}
+
+成本账本的作用是防止错配优化。若主成本是本地聚合的随机访存，先改异步 I/O 未必有效；若主成本是 writer 阻塞导致队列积压，给 parser 加 SIMD 可能只会更快制造等待；若主成本是 manifest 锁，增加 worker 可能让尾延迟更差。成本账本让讨论回到证据，而不是回到感觉。
+
+\begin{mentalmodel}
+数据身份图保证系统知道“这是谁”；执行等待图保证系统知道“谁在等谁”；成本账本保证系统知道“时间花在哪里”。三张图缺一张，系统分析都会失去一条主线。
+\end{mentalmodel}
+
+\section{代码演进：从一行日志到可恢复作业}
+
+前面已经把语义、数据、执行、提交和证据讲成几条边界。现在需要把这些边界落到代码演进上。高质量教材不应该一上来给一个很大的框架，然后要求读者接受它的复杂性；更好的写法是先解决一个小问题，观察它暴露出的缺口，再扩展一点代码。每一次扩展都要能说清：它解决了上一版的什么问题，又留下了什么问题。
+
+下面的代码不是最终工程实现，而是一组教学骨架。它们故意从一行日志开始，逐步扩展到 reference、记录身份、批处理、局部聚合和 manifest 提交。每一步都很小，但连起来就是 Compute Systems Engine 的第一条主线。
+
+\topic{一、先只解决一行：解析 event 字段}
+第一步不要写线程池，也不要写哈希表。先回答最小问题：给一行日志，能不能稳定取出 \code{event_name}。这一版的输入合同很窄：字段用单个空格分隔，格式是 \code{timestamp user_id event_name value}，事件名最长不超过固定字节数，不处理引号和转义。限制写清楚以后，代码就容易审查；以后要支持更复杂格式，也知道复杂性从哪里增加。
+
+\begin{lstlisting}[language=C++,caption={第一步：只解析一行日志的事件字段}]
+#include <cstddef>
+#include <string_view>
+
+struct EventField {
+    bool ok = false;
+    std::string_view event_name;
+    ParseError error = ParseError::none;
+};
+
+EventField parse_event_field(std::string_view line)
+{
+    constexpr char FIELD_DELIMITER = ' ';
+    constexpr std::size_t MAX_EVENT_NAME_BYTES = 64;
+
+    const std::size_t first_space = line.find(FIELD_DELIMITER);
+    if (first_space == std::string_view::npos) {
+        return {false, {}, ParseError::missing_field};
+    }
+
+    const std::size_t second_space =
+        line.find(FIELD_DELIMITER, first_space + 1);
+    if (second_space == std::string_view::npos) {
+        return {false, {}, ParseError::missing_field};
+    }
+
+    const std::size_t third_space =
+        line.find(FIELD_DELIMITER, second_space + 1);
+    if (third_space == std::string_view::npos) {
+        return {false, {}, ParseError::missing_field};
+    }
+
+    const std::size_t event_begin = second_space + 1;
+    const std::size_t event_size = third_space - event_begin;
+    if (event_size == 0) {
+        return {false, {}, ParseError::missing_field};
+    }
+    if (event_size > MAX_EVENT_NAME_BYTES) {
+        return {false, {}, ParseError::event_too_long};
+    }
+
+    return {
+        true,
+        line.substr(event_begin, event_size),
+        ParseError::none
+    };
+}
+\end{lstlisting}
+
+这一版解决了“字段在哪里”的问题，同时暴露出第一个限制：它只返回 \code{std::string_view}，这个 view 指向原始行。只要原始行还活着，它就有效；如果调用者把原始行释放了，event view 就会悬垂。因此下一步不能只考虑解析，还要考虑输入数据的生命周期。
+
+\topic{二、再解决多行：写出可对照 reference}
+第二步把单行解析放进循环，得到最小 reference。这里仍然不优化字符串复制，因为 reference 的任务是定义语义和输出，而不是追求速度。它把成功行和失败行分开统计，让后续优化版本有明确对照。
+
+\begin{lstlisting}[language=C++,caption={第二步：把单行解析扩展成 reference}]
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct ReferenceResult {
+    EventCountMap counts;
+    std::uint64_t accepted_records = 0;
+    std::uint64_t rejected_records = 0;
+};
+
+ReferenceResult run_reference_checked(
+    const std::vector<std::string>& lines)
+{
+    ReferenceResult result;
+
+    for (const std::string& line : lines) {
+        const EventField field = parse_event_field(line);
+        if (!field.ok) {
+            ++result.rejected_records;
+            continue;
+        }
+
+        ++result.counts[std::string(field.event_name)];
+        ++result.accepted_records;
+    }
+
+    return result;
+}
+\end{lstlisting}
+
+这一版解决了“怎么算正确”的问题，但还不能回答“哪一行错了”。如果输入只有十行，人工看日志就行；如果输入有一亿行，错误报告只写 rejected count 完全不够。于是下一步必须给每条记录加身份。
+
+\topic{三、给记录加身份：错误能够回到输入}
+第三步不改变算法，只改变记录接口。解析函数接收 \code{RecordId}，返回 \code{ParsedRecord}。这样错误不再只是一个计数，而能回到 input、split、offset 和行号。注意，这一步没有让程序更快，但让后续并发和恢复变得可解释。
+
+\begin{lstlisting}[language=C++,caption={第三步：把解析结果和 RecordId 绑定}]
+ParsedRecord parse_record(RecordId id, std::string_view line)
+{
+    const EventField field = parse_event_field(line);
+    if (!field.ok) {
+        return {id, {}, field.error};
+    }
+
+    return {id, field.event_name, ParseError::none};
+}
+
+bool is_valid_record(const ParsedRecord& record)
+{
+    return record.error == ParseError::none;
+}
+\end{lstlisting}
+
+这一版解决了“错误能否定位”的问题，但仍然是一行一行处理。每行都单独进入聚合，无法表达批次生命周期，也很难把热字段和冷诊断分开。下一步要把若干行组成一个 batch。
+
+\topic{四、引入 batch：让生命周期和冷热数据清楚}
+第四步把 split 中的一批行解析成 batch。热路径只保留聚合需要的事件名和哈希，错误行进入冷路径。这里仍然使用 \code{std::string_view}，因此 batch 的生命周期必须覆盖这些 view 的使用期。真实工程里可以让 \code{ParsedBatch} 拥有输入字节 buffer，或者让上游保证输入块在下游完成前不释放。
+
+\begin{lstlisting}[language=C++,caption={第四步：把逐行解析扩展成批处理}]
+#include <span>
+
+std::uint64_t stable_hash(std::string_view text);
+
+struct EventView {
+    RecordId id;
+    std::string_view event_name;
+    std::uint64_t event_hash = 0;
+};
+
+struct BatchParseResult {
+    std::vector<EventView> events;
+    std::vector<ColdRecordInfo> errors;
+};
+
+BatchParseResult parse_split_lines(
+    std::uint32_t input_id,
+    std::uint32_t split_id,
+    std::span<const std::string> lines)
+{
+    BatchParseResult batch;
+
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        const RecordId id{
+            input_id,
+            split_id,
+            0,
+            static_cast<std::uint32_t>(index)
+        };
+        const ParsedRecord record = parse_record(id, lines[index]);
+
+        if (!is_valid_record(record)) {
+            batch.errors.push_back({
+                id,
+                lines[index],
+                record.error
+            });
+            continue;
+        }
+
+        batch.events.push_back({
+            id,
+            record.event_name,
+            stable_hash(record.event_name)
+        });
+    }
+
+    return batch;
+}
+\end{lstlisting}
+
+这一版解决了“批次和冷热路径”的问题，也暴露出两个新问题。第一，\code{byte_offset} 这里暂时填了 0，说明这段代码还不是完整 reader；真正按文件切 split 时，reader 必须给出准确 offset。第二，\code{static_cast<std::uint32_t>(index)} 假设一个 split 的行数不会超过 \code{std::uint32_t} 可表示范围；真实工程要么限制 split 大小，要么把行号字段改成更宽类型。教材代码必须把这些边界说出来，不能假装不存在。
+
+\topic{五、局部聚合：先减少共享，再谈锁}
+第五步把 batch 聚合成 partial。这里先不让多个线程写同一个全局 map，而是每个 split 产生自己的 \code{PartialCount}。这样热路径没有跨线程共享写。后面要优化容器布局、字符串池或排序归约，都可以在这个局部边界内替换实现。
+
+\begin{lstlisting}[language=C++,caption={第五步：把 batch 聚合成局部 partial}]
+PartialCount aggregate_batch(
+    std::uint32_t split_id,
+    const BatchParseResult& batch)
+{
+    PartialCount partial;
+    partial.split_id = split_id;
+
+    for (const EventView& event : batch.events) {
+        ++partial.counts[std::string(event.event_name)];
+    }
+
+    return partial;
+}
+\end{lstlisting}
+
+这一版解决了“多个 worker 是否必须共享全局 map”的问题。它仍然复制字符串，仍然使用节点式哈希表，但这些是下一阶段的数据结构优化问题，而不是并发语义问题。教材写法要把问题分层：先把共享边界改清楚，再优化局部容器；不要一段代码同时引入线程、字符串池、SIMD 和 manifest，让读者分不清每个变化解决了什么。
+
+\topic{六、提交 partial：从内存结果走向可恢复输出}
+第六步把 partial 写成 \code{ShuffleBlock}，再提交到 manifest。下面只展示提交判断，不展示文件写入细节。关键规则是：同一个 split 只能接受一个 attempt；迟到 attempt 可以存在，但不能成为有效结果。
+
+\begin{lstlisting}[language=C++,caption={第六步：manifest 只接受一个 attempt}]
+struct CommitDecision {
+    bool accepted = false;
+    ManifestEntry entry;
+};
+
+CommitDecision commit_block(
+    Manifest& manifest,
+    const ShuffleBlock& block)
+{
+    for (const ManifestEntry& entry : manifest) {
+        if (entry.split_id == block.split_id) {
+            return {false, entry};
+        }
+    }
+
+    ManifestEntry entry;
+    entry.manifest_id =
+        static_cast<std::uint32_t>(manifest.size());
+    entry.split_id = block.split_id;
+    entry.accepted_attempt_id = block.attempt_id;
+    entry.block_id = block.block_id;
+    entry.checksum = block.checksum;
+
+    manifest.push_back(entry);
+    return {true, entry};
+}
+\end{lstlisting}
+
+这一版解决了“重复 attempt 是否会重复计数”的问题。它仍然是单进程内存 manifest，不具备崩溃持久化能力，也没有并发提交保护。下一章之后继续扩展时，读者就能清楚地区分：这里的规则是提交语义，后面需要补的是持久化、锁保护、并发安全和分布式复制，而不是重新发明提交事实。
+
+\topic{七、每一步都要有验收}
+代码渐进的价值在于每一步都能验收。解析一行时，验收正常行、缺字段、空事件名、超长事件名。Reference 阶段，验收 accepted 和 rejected 计数。RecordId 阶段，验收错误能定位到 split 和 line。Batch 阶段，验收 hot events 和 cold errors 数量。Partial 阶段，验收合并结果等于 reference。Manifest 阶段，验收重复 attempt 不会重复计数。验收不是附录，它是下一步扩展的地基。
+
+\begin{keyidea}
+从一行日志到可恢复作业，中间每一步都只解决一个新问题：字段解析、正确性对照、错误定位、批次生命周期、减少共享、提交事实。以后改后续章节，也按这个节奏写：先小问题，再代码，再暴露限制，再扩展。
+\end{keyidea}
+
+\section{三个实际案例：问题怎样推动代码继续长大}
+
+上一节给出了代码演进的骨架，但真正学习系统时，还要看到具体输入怎样把问题逼出来。本节补三组实际案例。每组都先给一个很小的现象，再说明朴素实现为什么不够，最后给出下一步代码形态和验收方式。这样读者不会觉得 \code{RecordId}、线程本地 partial 和 manifest 是为了“架构好看”才出现，而会看到它们各自解决了哪类真实问题。
+
+\topic{一、案例一：一条坏日志为什么逼出 RecordId}
+假设输入只有六行，其中第五行缺少 \code{event_name}：
+
+\begin{lstlisting}[numbers=none]
+10:00 u001 login 1
+10:01 u002 view 1
+10:02 u001 click 1
+10:03 u003 logout 1
+10:04 u004
+10:05 u001 login 1
+\end{lstlisting}
+
+最早的 reference 只会把 \code{rejected_records} 加一。这个结果在六行输入上还能人工定位；一旦输入变成数千万行，错误报告只有“拒绝一行”就没有工程价值。运维想知道坏行在哪个文件、哪个 split、哪个 offset；开发想知道是字段缺失、事件名过长，还是数值格式错误；恢复程序想知道这个错误是否影响整个 split。于是错误计数不够，必须把错误和数据身份绑定。
+
+这一步的代码变化不大，但思想很关键。解析函数不能只返回 bool，而要返回带身份的结果。错误路径也不能只写日志，因为日志只是旁路文本，后续程序无法可靠查询。更稳的做法是把错误变成结构化对象，和 \code{RecordId} 一起进入 cold path。
+
+\begin{lstlisting}[language=C++,caption={把错误行变成结构化诊断}]
+struct ParseDiagnostic {
+    RecordId id;
+    ParseError error = ParseError::none;
+    std::uint32_t column = 0;
+};
+
+struct CheckedRecord {
+    RecordId id;
+    std::string_view event_name;
+    ParseDiagnostic diagnostic;
+};
+
+CheckedRecord parse_checked(RecordId id, std::string_view line)
+{
+    const EventField field = parse_event_field(line);
+    if (!field.ok) {
+        return {
+            id,
+            {},
+            {id, field.error, 0}
+        };
+    }
+
+    return {
+        id,
+        field.event_name,
+        {id, ParseError::none, 0}
+    };
+}
+\end{lstlisting}
+
+这里没有追求 column 的完整实现，因为第一章重点不是写一个完美 parser，而是展示诊断对象的位置。等后续 parser 更复杂时，column 可以来自扫描状态；错误也可以带上字段名、原始片段和恢复建议。关键是接口已经承认：错误是系统语义的一部分，不是打印到 stderr 就结束。
+
+这个案例的验收很具体。给定上面的六行输入，reference 输出应包含 \code{login=2}、\code{view=1}、\code{click=1}、\code{logout=1}，accepted 为五，rejected 为一；诊断中应有一条记录，指向 input id、split id 和第五行的 line index。若把输入切成两个 split，诊断仍应指向同一条逻辑记录，而不是只写“第二个 worker 出错”。这就说明 RecordId 解决的是错误定位和并发后可追踪性。
+
+\topic{二、案例二：热点事件为什么逼出线程本地 partial}
+再看第二组输入。假设一千万行日志中，九百万行都是 \code{view}，其余事件分散。朴素多线程方案可能让每个 worker 直接更新全局 map：
+
+\begin{lstlisting}[language=C++,caption={危险版本：所有 worker 共享一个全局 map}]
+#include <mutex>
+
+struct SharedCounts {
+    std::mutex mutex;
+    EventCountMap counts;
+};
+
+void update_shared_counts(
+    SharedCounts& shared,
+    std::string_view event_name)
+{
+    const std::lock_guard<std::mutex> lock(shared.mutex);
+    ++shared.counts[std::string(event_name)];
+}
+\end{lstlisting}
+
+这段代码语义上很容易理解，也许在两千行输入上没有明显问题。但热点输入会把它的结构缺陷放大：每条记录都要进入同一把锁，每次更新 \code{view} 都会修改同一个计数节点，多个核心在同一小块状态上排队。此时增加线程不一定提高吞吐，反而可能增加上下文切换、锁等待和 cache line 迁移。问题不是“mutex 这个 API 不好”，而是“共享发生得太频繁、太早、太集中”。
+
+下一步不是立刻改成无锁结构。若把全局锁换成全局 atomic counter，只能解决一个特殊 key 的计数，无法处理任意事件名；若把哈希表每个桶都加锁，热点 key 仍然集中在同一个桶附近；若一上来写复杂无锁哈希表，读者会被实现细节淹没。更清晰的第一步是线程本地 partial：让 worker 在自己的局部 map 中计数，处理完 split 后再合并。
+
+\begin{lstlisting}[language=C++,caption={把共享更新推迟到合并阶段}]
+PartialCount build_partial_from_events(
+    std::uint32_t split_id,
+    std::span<const EventView> events)
+{
+    PartialCount partial;
+    partial.split_id = split_id;
+
+    for (const EventView& event : events) {
+        ++partial.counts[std::string(event.event_name)];
+    }
+
+    return partial;
+}
+
+void merge_one_partial(
+    EventCountMap& merged,
+    const PartialCount& partial)
+{
+    for (const auto& [event_name, count] : partial.counts) {
+        merged[event_name] += count;
+    }
+}
+\end{lstlisting}
+
+这个版本没有消灭合并成本，只是把共享从“每条记录一次”改成“每个 partial 的每个 key 一次”。如果一个 split 内有一百万条 \code{view}，局部 map 对 \code{view} 的更新仍然很多，但它发生在单个 worker 的本地状态里，不需要跨线程协调。合并时只把 \code{view} 的局部总数加到全局结果一次。对于热点 key，这个结构变化通常比微调锁 API 更有价值。
+
+这个案例的验收也要清楚。先用串行 reference 计算结果，再用共享全局 map 版本和线程本地 partial 版本分别计算，三者输出必须一致。然后记录每个版本的任务时间和等待时间：共享版本如果锁等待占比高，说明问题确实在共享更新；partial 版本如果合并阶段变成主成本，说明瓶颈已经迁移。教学重点不是宣布 partial 永远最快，而是让读者看到共享边界怎样改变瓶颈位置。
+
+\topic{三、案例三：一次写后崩溃为什么逼出 manifest}
+第三组案例是失败恢复。假设 split 3 的 worker 已经完成 partial，并写出临时文件 \filepath{tmp-s3-a1.block}，但还没来得及告诉 driver 成功，进程就崩溃了。Driver 重启后没有看到 split 3 的提交事实，于是启动 attempt 2，写出 \filepath{tmp-s3-a2.block} 并成功提交。现在目录里有两个文件。如果 reduce 只是扫描 \filepath{*.block}，就会把 split 3 统计两次。
+
+朴素实现常写成这样：
+
+\begin{lstlisting}[language=C++,caption={危险版本：reduce 扫描所有 block}]
+std::vector<ShuffleBlock> scan_all_blocks(std::string_view directory);
+
+EventCountMap reduce_by_scanning_directory(std::string_view directory)
+{
+    EventCountMap result;
+    const std::vector<ShuffleBlock> blocks =
+        scan_all_blocks(directory);
+
+    for (const ShuffleBlock& block : blocks) {
+        merge_block_into_result(result, block);
+    }
+
+    return result;
+}
+\end{lstlisting}
+
+这段代码的问题在于，它把“文件存在”误认为“结果有效”。文件系统目录不知道哪个 attempt 被接受，也不知道某个 block 是临时输出、旧输出还是诊断残留。要修复这个问题，不是在文件名里多加几个 if，而是改变 reduce 的输入来源：reduce 只能从 manifest 读取已提交条目，再根据条目找到对应 block。
+
+\begin{lstlisting}[language=C++,caption={安全版本：reduce 只读 manifest 接受的 block}]
+std::vector<ShuffleBlock> load_committed_blocks(
+    const Manifest& manifest);
+
+EventCountMap reduce_from_manifest(const Manifest& manifest)
+{
+    EventCountMap result;
+    const std::vector<ShuffleBlock> blocks =
+        load_committed_blocks(manifest);
+
+    for (const ShuffleBlock& block : blocks) {
+        merge_block_into_result(result, block);
+    }
+
+    return result;
+}
+\end{lstlisting}
+
+这一步解决的是外部可见性。Worker 产生 block，只说明它完成了一次尝试；manifest 接受 block，才说明这个 block 成为作业结果的一部分。Attempt 1 留下的临时文件可以被清理，也可以保留用于诊断，但不能被 reduce 当成输入。这样的设计让恢复规则简单得多：先读取 manifest，确定已经提交的 split；再决定哪些 split 需要重试；最后清理不在 manifest 中的临时文件。
+
+这个案例的验收必须包含故障注入。先运行 attempt 1，让它写出临时 block 后模拟崩溃；再运行 attempt 2 并提交；最后检查目录中确实可以存在两个 block，但 manifest 只有一个条目，reduce 输出与串行 reference 完全一致。若把 reduce 改回扫描目录，测试应当失败。这种测试比口头说“我们支持恢复”更有价值。
+
+\topic{四、三个案例串起来看}
+这三个案例看似分属不同主题：坏日志是解析问题，热点事件是并发性能问题，写后崩溃是恢复问题。它们共同说明同一件事：系统结构不是凭空设计出来的，而是被具体输入、具体等待和具体失败推出来的。坏日志推动结构化诊断和 RecordId；热点事件推动减少共享和 partial；写后崩溃推动提交点和 manifest。每个概念都对应一个小反例。
+
+后续章节也按这个方法写。讲缓存时，不是先列 L1、L2、L3，而是拿连续数组和随机节点比较；讲 TLB 时，不是先背页表层级，而是拿大工作集和小对象分配比较；讲锁时，不是先列 mutex 种类，而是拿共享计数器的等待时间比较；讲无锁时，不是先贴复杂算法，而是从“锁保护的不变量能否拆成单写者状态”开始；讲分布式时，不是先列 CAP 和共识名词，而是从迟到响应和重复提交开始。这样的写法才有学习价值。
+
+\topic{五、代码扩展要保留旧版本}
+教学项目中，每次扩展都应保留旧版本作为对照。保留单行 parser，是为了测试边界字段；保留串行 reference，是为了校验并行结果；保留共享 map 版本，是为了展示锁等待；保留扫描目录的失败测试，是为了证明 manifest 的必要性。旧版本不是垃圾代码，而是反例和基线。没有旧版本，读者只看到最终结构，看不到为什么需要它。
+
+工程仓库可以把这些版本放在不同实验或测试里，而不是在生产路径中到处保留分支。教材正文则要明确告诉读者：最终写法不是天生正确，它是在一个个反例中长出来的。这个习惯会影响整本书的质量，也会影响读者以后写系统的方式。
+
+\topic{六、把案例变成可运行实验}
+案例只有文字还不够，必须能运行。第一章的实验组织可以很朴素：一个目录保存输入样例，一个 reference 程序生成黄金输出，一个实验程序生成候选输出，一个比较程序检查结果和诊断。不要一开始就引入复杂测试框架；先让读者看到最小闭环。闭环跑通后，再把同一批输入交给多线程版本、批处理版本和 manifest 版本。这样每个新版本都不是“重新写一个程序”，而是在同一条验证链上增加能力。
+
+最小实验可以按三类输入组织。第一类是正常输入，用来证明基础路径正确。第二类是边界输入，用来验证空行、缺字段、超长事件名、最后一行没有换行符。第三类是故障输入或故障脚本，用来触发写后崩溃、重复 attempt、迟到响应和 orphan block。每类输入都要有说明，不是简单把文件堆在目录里。读者看到一个失败时，应当知道它是在验证哪条系统边界。
+
+\begin{lstlisting}[numbers=none]
+experiments/ch01/
+  inputs/normal.log
+  inputs/dirty.log
+  inputs/hot-key.log
+  inputs/retry-split-3.log
+  expected/reference-counts.txt
+  expected/reference-errors.txt
+  run-reference
+  run-partial
+  run-manifest-failure
+\end{lstlisting}
+
+这张目录图的意义在于把“读书”变成“复盘”。正常输入对应 reference，dirty 输入对应 RecordId 和诊断，hot-key 输入对应共享 map 与 partial 对比，retry 输入对应 manifest。以后第二章讲流水线，可以继续用 hot-key 或普通输入观察单核执行；第三章讲缓存，可以继续用同一批 parsed batch 观察布局；第十章讲锁，可以继续用共享 map 反例；第十五章讲 I/O，可以继续用 manifest 和临时 block。实验材料复用，学习主线就不会断。
+
+\topic{七、比较程序比打印输出更重要}
+很多初学者写实验，只看程序打印结果。这样很容易漏掉错误。更好的做法是让比较程序明确检查三个东西：计数是否一致，错误诊断是否一致，提交事实是否一致。计数一致证明最终结果对；错误诊断一致证明坏输入没有被悄悄吞掉；提交事实一致证明恢复路径没有把临时状态当成有效状态。只比较最终计数，有时会掩盖严重 bug。例如某个 split 被重复计数，另一个 split 又丢失，最终总数可能偶然相同，但 manifest 和 RecordId 会暴露问题。
+
+比较程序的输出也要面向学习。不要只写 \code{failed}，而要写出哪一个 key 计数不同，哪一个 record id 的错误分类不同，哪一个 split 被重复提交。错误信息越具体，读者越容易把现象和章节概念连起来。教材里的实验不是竞赛判题器，而是调试材料。它应该帮助读者回答“为什么失败”，而不只是宣布“失败了”。
+
+\begin{lstlisting}[language=C++,caption={比较计数结果的最小骨架}]
+struct CompareMismatch {
+    std::string key;
+    std::uint64_t expected = 0;
+    std::uint64_t actual = 0;
+};
+
+std::vector<CompareMismatch> compare_counts(
+    const EventCountMap& expected,
+    const EventCountMap& actual)
+{
+    std::vector<CompareMismatch> mismatches;
+
+    for (const auto& [key, expected_count] : expected) {
+        const auto found = actual.find(key);
+        const std::uint64_t actual_count =
+            found == actual.end() ? 0 : found->second;
+        if (actual_count != expected_count) {
+            mismatches.push_back({
+                key,
+                expected_count,
+                actual_count
+            });
+        }
+    }
+
+    for (const auto& [key, actual_count] : actual) {
+        if (!expected.contains(key)) {
+            mismatches.push_back({key, 0, actual_count});
+        }
+    }
+
+    return mismatches;
+}
+\end{lstlisting}
+
+这段代码仍然只是骨架。真实比较还要检查错误诊断、accepted records、rejected records、manifest 条目和 checksum。这里先展示计数比较，是为了让读者理解 reference 的使用方式：reference 不是拿来人工看的，而是进入自动比较链。后续任何优化只要改变输出，就必须被比较程序抓住。
+
+\topic{八、从小实验扩展到压力实验}
+小实验负责证明语义，压力实验负责暴露成本。两者不能互相替代。三十行 dirty 输入很适合检查 RecordId，却无法说明哈希表布局；一亿行 hot-key 输入很适合暴露锁等待，却不适合人工审查每条错误。第一章要求读者把实验分层：先用小输入保证每条边界正确，再用大输入观察瓶颈迁移。若语义小实验不过，不允许进入压力实验；若压力实验没有 reference 校验，性能数据也不可信。
+
+压力实验也要一步一步扩展。先跑串行 reference，得到基线吞吐和输出。再跑共享 map 多线程版本，记录线程数增加时吞吐是否线性增长、锁等待是否出现。再跑线程本地 partial，观察共享等待是否下降、合并阶段是否上升。再加入 manifest，观察写出和提交开销。每一步只改一个主因素，报告才有解释力。一次性加入所有优化，只能得到一个数字，不能得到知识。
+
+\topic{九、实验报告要写出限制}
+实验报告最后必须写限制。比如输入在 page cache 中，不能代表冷盘读取；机器只有单 socket，不能验证 NUMA；没有 PMU 权限，不能给出 cache miss 事件；manifest 只是内存 vector，不能证明崩溃后持久化；网络用本机队列模拟，不能代表真实 RTT。写限制不是认输，而是说明结论的适用范围。一个诚实的限制，比一个说满的结论更接近工程事实。
+
+这个习惯也会影响后续章节。讲缓存时要说明输入规模是否超过 LLC；讲 SIMD 时要说明编译器参数和目标指令集；讲锁时要说明线程是否绑定核心；讲分布式时要说明故障模型。第一章把报告限制写清楚，后面每章就有统一标准。
+
+\topic{十、从案例到全书写作规则}
+本章后续打磨全书时，每章都应该能找到类似三组材料：一个小输入或小代码暴露语义问题，一个中等规模实验暴露性能问题，一个失败或边界案例暴露恢复问题。不是每章都必须三者完全一样，但至少要有“问题、反例、代码、验收”这条链。没有代码的概念要补代码，没有反例的结论要补反例，没有验收的优化要补验收，没有限制的报告要补限制。
+
+这也是第一章现在和旧稿最大的区别。旧稿里许多内容是正确的，但读者会感觉它们并列摆放；新写法把它们放回同一个学习过程：先解析一行，再统计多行，再定位错误，再批处理，再减少共享，再提交结果，再恢复失败。后面修改第二章、第三章和分布式章节时，也按这个过程处理。这样整本书才会像经典教材，而不是像资料库。
+
+这个规则还会约束代码篇幅。代码多不等于质量高，代码少也不等于讲得清。真正有价值的代码，应当让读者看到一个边界怎样被对象和函数承接。比如 \code{parse_event_field} 承接字段合同，\code{run_reference_checked} 承接正确性对照，\code{parse_checked} 承接错误定位，\code{parse_split_lines} 承接批次和生命周期，\code{build_partial_from_events} 承接减少共享，\code{commit_block} 承接提交事实。若一段代码不能说明自己承接了哪条边界，就应该删掉或改写；若一段文字讲了很重要的边界，却没有任何代码、实验或反例承接，就应该补上。
+
+后续章节也要保持这种“先窄后宽”的节奏。讲核心流水线时，先从一个整数累加循环开始，不要一上来铺满取指、译码、重命名、发射、执行、提交等名词；等读者看到单累加器受依赖链限制，再引出多累加器和乱序窗口。讲缓存时，先从两个同为 \complexity{O(n)} 的循环开始，一个连续访问，一个随机追指针；等读者看到复杂度相同但机器成本不同，再引出 cache line、预取和 TLB。讲锁时，先从共享计数器的等待时间开始；等读者看到所有线程排队，再引出临界区、不变量、条件变量和背压。讲分布式时，先从 split 重试导致重复 partial 开始；等读者看到扫描目录会算错，再引出 manifest、attempt、幂等和提交协议。
+
+第一章还要提醒读者：最终版本不是学习的起点。很多工业系统的源码一打开就是成熟结构，里面已经有线程池、任务图、缓冲区、状态机、重试、压缩、校验和指标。直接阅读这种源码，初学者很容易只记住对象名，却不知道它们为什么存在。本册的写法要反过来：先让读者经历缺失这些对象时会发生什么，再给出对象。读者以后读 Linux、数据库、计算框架或推理引擎源码时，就能把复杂结构还原成问题链，而不是把源码当成不可理解的工程堆叠。
+
+这种写法对作者也有约束。每章写完后，都要自查四个问题。第一，本章第一个案例是否足够小，小到读者能手工推导。第二，本章扩展是否每一步只引入一个主概念。第三，本章代码是否能被 reference 或实验验收。第四，本章是否写出了限制，说明哪些结论还不能外推。若四个问题回答不上来，就说明章节还在堆材料，需要继续重写。第一章就是这个检查表的样板。
+
+\topic{十一、最小闭环的日常运行顺序}
+真正写项目时，不要等到全章代码都写完再验证。每天最小闭环可以很固定：先跑单行 parser 的边界输入，再跑串行 reference，再跑 batch 解析，再跑 partial 合并，再跑 manifest 故障注入，最后跑一次小压力输入。前四步证明语义没有坏，第五步证明恢复边界没有坏，最后一步只观察性能趋势。若前面任意一步失败，就不要看压力数据，因为那时程序可能只是更快地算错。
+
+这个顺序看起来保守，其实能节省大量调试时间。比如某次修改 parser 后，hot-key 压力测试吞吐下降。若没有最小闭环，作者可能直接怀疑锁、缓存或线程调度；但如果单行 parser 边界测试已经失败，就说明问题还在语义层。再比如 manifest 故障注入失败，而普通 reference 仍然通过，说明计算本身没错，错误在提交事实。分层验证能防止调试方向乱跳。
+
+读者以后阅读大型源码，也可以用同样方法反推。看到一个复杂模块时，先找它的最小输入是什么，reference 或基线在哪里，错误如何定位，批次生命周期由谁保证，局部结果怎样合并，提交事实在哪里记录。若源码没有这些边界，就要格外警惕；若源码有这些边界，就能顺着边界阅读，而不是按文件名乱翻。这种阅读方式会贯穿后面的 Linux 数据结构、线程运行时、I/O 管线和分布式章节。
+
+\topic{十二、扩写也必须服务学习路径}
+本书后面会继续扩充，但扩充不能变成把材料往章节里塞。每新增一段，都要能回答它服务哪一步学习路径：是让小问题更具体，还是让反例更真实，还是让代码边界更清楚，还是让实验验收更可靠。若一段文字只是换个说法重复概念，它会增加字数，却降低密度；若一段代码只是展示最终答案，却没有说明从哪里推出来，它会增加篇幅，却降低理解。第一章宁可围绕日志统计反复深入，也不要跳到十个不相干的例子上。后面每章也一样：深度来自把一个问题拆穿，而不是把许多名词排满。
+
+因此，第一章的质量标准不是“介绍了多少概念”，而是读者能否沿着同一条线复述出来：一行日志怎样被解析，坏行怎样定位，很多行怎样形成 reference，批次怎样承载生命周期，热点 key 怎样推动局部聚合，临时输出怎样通过 manifest 变成有效结果，失败后怎样恢复，实验怎样证明这些边界没有坏。能复述这条线，才说明章节真的讲清楚了。
+
+\section{从单机原则到分布式计算}
+
+第二册后面会讲分布式计算，但第一章不能突然把单机和分布式切成两门课。更好的方式是从日志统计的单机 pipeline 自然推出分布式版本。单机里，多个 worker 线程处理多个 split；分布式里，多个 worker 进程或节点处理多个 split。单机里，线程本地 partial 最后合并；分布式里，map worker 产生 shuffle block，reduce worker 按 key 合并。单机里，manifest 防止重复 attempt；分布式里，manifest 或提交协议防止重复输出。尺度变大了，但问题类型没有变。
+
+区别在于成本和失败模式。线程之间通信通常是共享内存，节点之间通信要经过网络。线程崩溃通常会带着进程一起失败，节点失败可能只影响一部分任务。单机时间大致由同一台机器观察，分布式时间没有全局可靠顺序。共享内存里的指针不能跨节点，必须序列化成消息。正因为这些差异，分布式系统需要更严格的身份、重试、超时和提交协议。
+
+\topic{一、分片来自并行，也来自恢复}
+把输入切成 split，一开始是为了并行：多个 worker 可以同时处理不同范围。后来它也服务恢复：一个 split 失败，只需要重做这个 split，而不是重做整个输入。分布式系统的 partition 也是同样道理。按输入范围分片可以让读取并行，按 key 分区可以让 reduce 并行，按时间窗口分片可以让恢复边界清楚。分片不是单纯为了负载均衡，它同时决定数据本地性、失败粒度和提交粒度。
+
+分片过小，调度和 manifest 条目过多，固定成本上升；分片过大，负载不均和失败重做成本上升。若某个事件名占据大部分记录，按输入范围平均切分也可能在 reduce 阶段形成热点 key。于是分布式章节要讲的负载均衡，并不是凭空出现，而是从第一章的 split 粒度和 key 分布继续推导。
+
+\topic{二、shuffle 是跨边界的数据重排}
+单机线程本地 partial 合并时，数据还在同一进程或同一台机器里。分布式 map-reduce 中，map worker 需要把相同 key 的 partial 发送到同一个 reduce 分区，这就是 shuffle。Shuffle 的本质是为了让“同一个 key 的所有贡献”在某个地方相遇。这个需求来自聚合语义，不来自框架名字。
+
+Shuffle 之所以昂贵，是因为它把数据从本地内存和本地磁盘推向网络、远端内存和远端磁盘。第一章的数据移动原则在这里被放大：能在 map 端先合并，就不要把每条记录都发出去；能压缩，就用 CPU 换网络字节；能按 key 分区稳定输出，就让 reduce 少做随机查找；能把热点 key 单独处理，就不要让一个 reduce 被拖垮。后面讲分布式时，这些策略都应从 shuffle 的成本中推出来。
+
+\topic{三、慢节点把平均速度变成尾部问题}
+单机多线程里，一个 worker 慢会让最终合并等待它。分布式里，一个节点慢会让整个 stage 等它，这个慢任务常被称为 straggler。它可能因为硬件差异、远端读取、数据倾斜、重试、后台负载或网络拥塞产生。若报告只看平均任务时间，就看不到最后几个任务拖住全局进度。执行等待图必须从平均时间扩展到尾部时间。
+
+日志统计的例子很直观。若某个 split 包含异常长的行，parser 慢；若某个 split 包含热点 key，reduce 慢；若某个 worker 所在节点磁盘慢，写出慢；若某个 block 需要跨机拉取，shuffle 慢。分布式优化不是简单增加节点，而是让慢任务可见、可重试、可拆分，并确保重试不会破坏提交语义。
+
+\topic{四、一致性从提交点继续长出来}
+第一章的 manifest 是单机提交事实。到了分布式环境，manifest 本身可能需要复制，driver 可能失败，多个节点可能同时尝试提交同一个 split。此时就会引出更强的复制、租约、epoch、共识或事务日志。注意，这些概念不是突然从分布式教材里掉下来，而是从“谁有权宣布结果有效”这个问题继续长出来。
+
+如果只有一个可靠 driver，manifest 可以是本地文件。若 driver 可能失败，就要把 manifest 放到可靠存储或复制服务里。若多个 driver 可能同时存在，就要有 leader 或 epoch 防止旧 leader 继续提交。若多个副本要对提交顺序达成一致，就会进入共识协议。第一章不展开这些协议细节，但要让读者看到它们的源头：提交事实必须唯一、可恢复、可被下游信任。
+
+\topic{五、单机实验也能训练分布式思想}
+即使没有多机环境，也可以在本机模拟分布式的关键问题。用多个进程或线程模拟 worker，用消息队列模拟 RPC，用随机延迟模拟网络抖动，用重复消息模拟重试，用临时目录模拟远端 block，用 manifest 模拟提交事实。这个模拟不能证明真实性能，但可以验证语义：重复请求不会重复计数，迟到响应不会覆盖新提交，失败 attempt 不会被 reduce 读取。
+
+这很适合本册读者。手机 Termux 或普通 Linux 机器未必能提供真实集群，但完全可以训练分布式系统最重要的语义边界。等以后进入真实集群，网络成本、调度系统和存储系统会更复杂，但身份、提交、幂等、重试和恢复这些原则不会变。
+
+\begin{keyidea}
+分布式不是另一套孤立概念，而是把单机的切分、等待、数据移动和提交事实放大到网络和故障更多的环境中。先把单机边界讲清，分布式才不会变成术语堆。
+\end{keyidea}
+
+\section{贯穿项目：Compute Systems Engine}
+
+本册需要一个贯穿全书的大项目，否则章节会散成很多局部技巧。这个项目命名为 Compute Systems Engine。它不是要做商业级大数据框架，而是用一个足够小、可测试、可测量、可失败注入的工程，把现代计算系统的核心问题串起来。第一章只定义项目的骨架，后面每章都在这个骨架上增加一个可解释的能力。
+
+项目的输入是一批日志 split，输出是按事件名聚合的结果。第一阶段实现串行 reference 和输入合同。第二阶段实现批量解析、冷热分离和局部聚合，用来连接缓存、TLB 和数据布局。第三阶段实现有界队列、线程池和线程本地 partial，用来连接调度、锁和背压。第四阶段实现异步写出、manifest 和恢复，用来连接 I/O、提交点和故障处理。第五阶段实现本机分布式模拟：多个 worker 进程或线程按分片处理，shuffle 按 key 重分布，reduce 读取 manifest，故障注入验证幂等。
+
+\topic{一、项目不是功能堆砌}
+每加一个模块，都必须回答三件事。语义上，它改变了什么结果合同；性能上，它试图移动哪个瓶颈；恢复上，它新增了哪个失败路径。若一个模块只能让架构图更复杂，却说不清这三件事，就不应该加入教材。比如线程池不是为了“看起来高级”，而是为了控制执行资源和显式化等待；manifest 不是为了“模拟大数据系统”，而是为了防止重复 attempt 污染结果；分片聚合不是为了“多写一层”，而是为了减少共享写和改善局部性。
+
+\topic{二、项目的最小接口}
+第一章后的项目可以只有几个核心对象：\code{InputSplit} 描述输入范围，\code{RecordId} 描述记录身份，\code{ParsedBatch} 描述解析结果，\code{PartialCount} 描述局部聚合，\code{ShuffleBlock} 描述临时输出，\code{ManifestEntry} 描述提交事实，\code{TraceEvent} 描述状态变化。对象数量不多，但每个对象都有明确责任。
+
+后面章节可以替换实现，但不轻易改变责任边界。比如聚合容器可以从 \code{std::unordered_map} 换成开放寻址哈希或排序归约，但 \code{PartialCount} 的语义仍然是某个输入范围的局部计数。队列可以从 mutex 版本换成无锁 ring buffer，但队列合同仍然包含容量、关闭和等待谓词。这样全书既能深入实现，又不会失去主线。
+
+\topic{三、项目要能故意失败}
+只会跑 happy path 的项目不能教授系统。Compute Systems Engine 从第一章就要支持故障注入：解析到某个 record id 时返回错误，worker 写出 block 后崩溃，writer 短写，manifest commit 前后分别失败，重复提交同一个 attempt，迟到响应覆盖新响应。每个失败都必须有 reference 或恢复验证。这样后面讲并发和分布式时，读者不会只看到理论概念，而能看到错误怎样被接口吸收。
+
+\topic{四、项目要能测量}
+每个阶段都要输出最小指标。Reader 输出字节数、split 数和队列水位；parser 输出记录数、错误数和处理时间；worker 输出运行时间和等待时间；writer 输出 block 数、写入字节和失败次数；manifest 输出提交条目和重复 attempt；reducer 输出最终 checksum。指标不需要一开始就完美，但要能支撑下一步问题。后面加入 PMU 和 trace 时，这些基础身份会让指标可以关联。
+
+\section{本章实验}
+
+第一章的实验不追求性能极限，而是把系统边界跑通。建议准备一个包含三十到一百行的小输入，再准备几个破坏朴素假设的输入：最后一行没有换行符，某行缺少事件字段，某个事件名非常长，同一个 split 被重复执行，worker 在写出临时 block 后模拟崩溃。实验规模故意小，是为了让读者能手工检查每条记录的命运。
+
+\topic{一、实验一：写出串行 reference}
+先实现 \code{run_reference}，输入是内存中的行数组，输出是事件计数 map 和错误统计。要求把错误策略写清楚，并为每条错误记录保存 \code{RecordId}。验收方式不是看程序打印了什么，而是用固定输入得到固定输出，并能解释每个错误行为什么被归类。
+
+这个实验训练的是语义边界。不要在这里急着优化字符串分配，也不要急着并行。若 reference 还在变化，后续所有性能实验都会失去锚点。
+
+\topic{二、实验二：引入 split 和 record id}
+把输入切成两个或多个 split，每个 split 记录起止 offset 或行范围。要求每条记录获得稳定 \code{RecordId}，并且无论 split 处理顺序如何，最终 reference 输出相同。若某条记录跨 split，要么在合同中禁止这种切分，要么由 reader 修正到行边界。实验报告必须说明你选择了哪一种合同。
+
+这个实验训练的是数据身份。只要身份稳定，执行顺序就可以改变；身份不稳定，后续线程池和重试都会失控。
+
+\topic{三、实验三：线程本地 partial}
+实现多个 split 的局部聚合，每个 split 生成 \code{PartialCount}，最后合并。要求最终结果与串行 reference 相同。先不使用共享全局 map，避免一开始就把锁竞争引入主路径。报告要记录 split 数量、每个 partial 的记录数、每个 partial 的 key 数量，以及合并后的 checksum。
+
+这个实验训练的是减少共享。线程本地 partial 不是最终答案，但它让读者看到并行化的基本形状：先本地计算，再合并结果。
+
+\topic{四、实验四：临时 block 和 manifest}
+把每个 partial 写成临时 block，再通过 manifest 提交。Reduce 只能读取 manifest，不允许扫描目录中所有临时文件。故意模拟一次 worker 写出临时文件后崩溃，再重试同一个 split。验收条件是目录里可以有多个临时文件，但 manifest 只接受一个 attempt，最终结果不重复计数。
+
+这个实验训练的是提交点。它比性能数字更重要，因为没有提交点，分布式和异步 I/O 后面一定会错。
+
+\topic{五、实验五：写一页系统报告}
+报告只需要一页，但必须包含输入合同、reference 输出摘要、数据身份图、执行等待图、成本账本、故障注入结果和未验证边界。未验证边界可以写得很朴素，例如没有真实磁盘故障、没有多 socket NUMA、没有 PMU 权限、没有真实网络。重点是养成诚实复盘的习惯。
+
+\begin{exercisebox}
+习题一：为日志统计定义三组输入：正常输入、边界输入和破坏朴素假设的输入。说明每组输入验证哪条语义。
+
+习题二：把共享全局 map 版本和线程本地 partial 版本画成执行等待图。指出两者主要等待点有什么不同。
+
+习题三：构造一个重复 attempt 导致重复计数的反例，再用 manifest 修复它。要求写出每个 attempt 的 \code{AttemptId}、临时路径和最终 manifest 条目。
+
+习题四：为项目增加最小 trace。每个任务至少记录 created、queued、started、finished、committed 五个状态，并说明这些状态怎样帮助定位等待。
+\end{exercisebox}
+
+\section{后续章节的统一规则}
+
+读者学习这本书，不是为了背一个又一个名词，而是为了形成能处理真实计算系统的能力。因此从第一章开始，后续章节都按同一套规则打磨。
+
+\topic{一、每章先从具体问题开始}
+讲流水线，就从一个循环为什么不能每周期完成一次开始；讲缓存，就从连续数组和随机指针为什么同为线性复杂度却速度不同开始；讲锁，就从共享计数器为什么线程越多越慢开始；讲原子，就从一个无锁计数器为什么仍然可能成为热点开始；讲分布式，就从一个 split 重试为什么会重复提交开始。概念必须从问题中出现，而不是先列概念再找例子。
+
+\topic{二、每个概念都要说明为什么需要}
+引入 cache line，要说明硬件按块搬运数据；引入 TLB，要说明虚拟地址需要转换；引入 acquire 和 release，要说明线程之间的发布和观察需要顺序；引入 backpressure，要说明生产者可能快于消费者；引入 consensus，要说明多个副本在故障下仍要同意一个提交事实。只给定义不解释需求，就是低质量写法。
+
+\topic{三、代码必须服务原理}
+代码不是答案展示，而是推导材料。每段代码要说明它暴露了什么问题，解决了什么边界，仍然留下什么限制。示例使用位宽清晰的整数类型，例如 \code{std::uint32_t} 和 \code{std::uint64_t}。如果代码只是为了堆长度，应该删掉；如果代码能把抽象概念落到对象、状态和不变量上，就应该写完整、排版清楚。
+
+\topic{四、案例必须有反例和验收}
+只给正确版本不够。好的教材要先给朴素版本，再给它失败的输入或性能现象，然后分析结构，最后给改进版本和验收证据。比如 manifest 不是直接端出来，而是从重复 partial 的反例中推导；有界队列不是直接端出来，而是从无界队列内存膨胀和下游阻塞中推导；线程本地聚合不是直接端出来，而是从全局锁竞争中推导。
+
+\topic{五、章节之间要串起来}
+第一部分讲硬件，不是为了停在硬件；它要解释第二部分的数据布局和测量。第二部分讲单机高性能，不是为了停在 microbenchmark；它要支撑第三部分的多线程设计。第三部分讲同步，不是为了炫耀锁和原子；它要支撑第四部分的任务运行时。第四部分讲并行算法和 I/O，不是为了停在单机；它要自然过渡到第五部分的分布式计算。每章都要告诉读者：上一章解决了什么，本章新增了什么问题，下一章为什么必须继续。
+
+\begin{keyidea}
+本册后续修改以第一章为样板：问题驱动、反例驱动、原理先行、代码落地、实验验收、边界诚实。没有这六点，内容再多也只是材料堆积。
+\end{keyidea}
+
+\section{本章小结}
+
+本章只讨论了一个日志统计作业，却已经建立了第二册的主线。我们没有从概念列表出发，而是从一个朴素 reference 出发，依次看到正确性、数据路径、硬件成本、执行协作、提交事实、证据链和贯穿项目。每个概念都不是孤立出现的：\code{RecordId} 来自追踪记录的需要，冷热分离来自数据搬运成本，线程本地 partial 来自减少共享写，有界队列来自生产者和消费者速度不匹配，manifest 来自重复 attempt 和恢复，三张图来自系统复盘的需要。
+
+后面第二章会把视角缩进 CPU 核心内部，讨论流水线、乱序执行、分支预测和依赖链。读者不应把它看成脱离项目的硬件知识。相反，它要回答本章留下的第一个性能问题：同样处理一批记录，为什么某些循环能被核心高吞吐执行，某些循环却被依赖、分支或取数等待卡住。只要记住这个问题，硬件章节就不会变成术语背诵，而会成为解释系统性能的第一块地基。

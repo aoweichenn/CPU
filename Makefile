@@ -1,0 +1,71 @@
+CPU_BOOK_DIR := books/cpu-volume-1
+CPU_LATEX_DIR := $(CPU_BOOK_DIR)/source/latex
+CPU2_BOOK_DIR := books/cpu-volume-2
+CPU2_LATEX_DIR := $(CPU2_BOOK_DIR)/source/latex
+ALGO_BOOK_DIR := books/algorithm-interview
+
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu2-check cpu2-pdf cpu2-epub cpu2-text-count cpu2-text-count-chapters cpu2-text-target algo-check algo-pdf algo-epub algo-text-count algo-text-target algo-test clean
+
+all: cpu-pdf cpu-epub
+
+cpu-check:
+	$(MAKE) -C $(CPU_LATEX_DIR) check
+
+cpu-pdf:
+	$(MAKE) -C $(CPU_LATEX_DIR) pdf
+
+cpu-epub:
+	$(MAKE) -C $(CPU_LATEX_DIR) epub
+
+cpu-text-count:
+	$(MAKE) -C $(CPU_LATEX_DIR) text-count
+
+cpu-text-target:
+	$(MAKE) -C $(CPU_LATEX_DIR) text-target
+
+cpu-lab00:
+	bash $(CPU_BOOK_DIR)/labs/lab00_benchmark_foundation/scripts/run_lab00.sh
+
+cpu-coverage:
+	bash $(CPU_BOOK_DIR)/tools/run_coverage.sh
+
+cpu2-check:
+	$(MAKE) -C $(CPU2_LATEX_DIR) check
+
+cpu2-pdf:
+	$(MAKE) -C $(CPU2_LATEX_DIR) pdf
+
+cpu2-epub:
+	$(MAKE) -C $(CPU2_LATEX_DIR) epub
+
+cpu2-text-count:
+	$(MAKE) -C $(CPU2_LATEX_DIR) text-count
+
+cpu2-text-count-chapters:
+	$(MAKE) -C $(CPU2_LATEX_DIR) text-count-chapters
+
+cpu2-text-target:
+	$(MAKE) -C $(CPU2_LATEX_DIR) text-target
+
+algo-check:
+	$(MAKE) -C $(ALGO_BOOK_DIR) check
+
+algo-pdf:
+	$(MAKE) -C $(ALGO_BOOK_DIR) pdf
+
+algo-epub:
+	$(MAKE) -C $(ALGO_BOOK_DIR) epub
+
+algo-text-count:
+	$(MAKE) -C $(ALGO_BOOK_DIR) text-count
+
+algo-text-target:
+	$(MAKE) -C $(ALGO_BOOK_DIR) text-target
+
+algo-test:
+	$(MAKE) -C $(ALGO_BOOK_DIR) test
+
+clean:
+	$(MAKE) -C $(CPU_LATEX_DIR) clean
+	$(MAKE) -C $(CPU2_LATEX_DIR) clean
+	$(MAKE) -C $(ALGO_BOOK_DIR) clean

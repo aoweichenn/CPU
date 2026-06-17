@@ -1,0 +1,3382 @@
+\chapter{控制流：跳转、循环、调用与 switch}
+
+\section{问题与目标}
+
+前两章已经建立了单条整数指令、寄存器、内存操作数、地址公式和 flags 的阅读方法。本章把这些材料组合成程序的执行路径。只有能解释路径选择，才能从“逐行看懂指令”进入“看懂程序行为”。
+
+一个 C++ 程序不会从第一行机械地直线执行到最后一行。它会判断、跳转、循环、调用函数、返回调用点，也会通过函数指针、虚函数或跳转表进入运行时才确定的目标。机器层面并不存在高级语法中的 \code{if}、\code{while}、\code{switch}、\code{return}；机器真正维护的是下一条取指地址的选择：
+
+\begin{lstlisting}
+normal instruction:
+    rip = address_of_next_instruction
+
+branch/call/ret:
+    rip = some_other_address
+\end{lstlisting}
+
+\register{rip} 表示下一条要取指的地址。只要能够解释一段代码在什么条件下改变 \register{rip}、改变为哪个地址、为什么选择那个地址，就能把控制流从表面语法还原到机器行为。
+
+本章目标是让你完成下面几件事：
+
+\begin{itemize}
+  \item 把 C++ 的 \code{if/else}、条件表达式、循环、\code{switch} 和函数调用还原成基本块和边。
+  \item 理解 \instruction{cmp}、\instruction{test} 如何生产 flags，\instruction{jcc}、\instruction{setcc}、\instruction{cmovcc} 如何消费 flags。
+  \item 区分 signed 比较和 unsigned 比较使用的条件码。
+  \item 能画出一段汇编的控制流图。
+  \item 能解释循环中的入口、回边、退出条件、归纳变量和地址递推。
+  \item 能看懂 \code{switch} 的比较链和跳转表。
+  \item 能用具体地址解释 \instruction{call} 写入返回地址、\instruction{ret} 取回返回地址。
+  \item 初步理解分支预测、间接跳转和返回预测为什么影响现代 CPU 性能。
+\end{itemize}
+
+\begin{keyidea}
+控制流的本质是对 \register{rip} 的选择。顺序执行是默认选择；条件跳转、无条件跳转、调用、返回和间接跳转，都是在明确改变下一条指令地址。
+\end{keyidea}
+
+\section{控制流位于哪一层}
+
+控制流同时存在于多个层次。源代码层有 \code{if}、\code{for}、\code{while}、\code{switch}、\code{return}、短路逻辑和函数调用；编译器中间层有基本块、边、支配关系、循环、\code{phi} 节点和控制依赖；机器层有 \instruction{cmp}、\instruction{test}、\instruction{jcc}、\instruction{jmp}、\instruction{call}、\instruction{ret} 以及 \register{rip}；微架构层还有分支预测、目标预测、取指队列、错误路径清空和返回地址预测。
+
+学习时必须分清这些层次。C++ 源码中的一条 \code{if} 不一定对应机器码里的一条条件跳转。编译器可能把条件选择改写成 \instruction{cmovcc}，可能把布尔结果改写成 \instruction{setcc}，可能把小的 \code{switch} 改写成比较链，也可能把密集 \code{switch} 改写成跳转表或数据表。反过来，机器码中的一条 \instruction{jcc} 也不一定直接对应源码里的显式 \code{if}，它可能来自循环边界检查、数组范围保护、异常路径、空指针防御、编译器生成的运行时检查，或者链接器与安全机制插入的控制流。
+
+本章的训练目标不是把每条跳转机械翻译回一行 C++，而是恢复控制流结构。你要能回答：有哪些基本块？每个块在什么条件下到达？块尾选择了哪条边？循环的回边在哪里？退出条件是什么？哪些指令生产 flags，哪些指令消费 flags？哪些选择改变 \register{rip}，哪些选择只改变数据？只有这些问题清楚，后面看 ABI、性能测量、分支预测、向量化和热路径报告才有基础。
+
+\begin{mentalmodel}
+读控制流有三张图：
+
+\begin{itemize}
+  \item 源码图：程序员写下的语法结构。
+  \item CFG 图：基本块和边表达的执行可能性。
+  \item 机器图：\register{rip}、flags、跳转目标和返回地址形成的实际路径。
+\end{itemize}
+
+三张图相关，但不能直接等同。
+\end{mentalmodel}
+
+\section{从源代码到基本块}
+
+先看一个很普通的 C++ 函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int classify(int x)
+{
+    if (x < 0) {
+        return -1;
+    }
+    if (x == 0) {
+        return 0;
+    }
+    return 1;
+}
+\end{lstlisting}
+
+源代码有三条返回路径。编译器降低它时，会先把代码切成若干 \term{basic block}{基本块}。基本块是一段只有一个入口、一个出口的连续指令序列。进入基本块之后，中间不会跳走；要跳走只能发生在块尾。
+
+控制流图可以写成：
+
+\begin{lstlisting}
+entry:
+    test x
+    if x < 0 goto neg
+    goto check_zero
+
+neg:
+    return -1
+
+check_zero:
+    test x
+    if x == 0 goto zero
+    goto pos
+
+zero:
+    return 0
+
+pos:
+    return 1
+\end{lstlisting}
+
+真实编译器可能使用分支，也可能用 \instruction{setcc} 或 \instruction{cmovcc} 生成无分支代码。学习时不要预设“这段 C++ 必须长成某种汇编”。更可靠的训练方式是：
+
+\begin{enumerate}
+  \item 找出基本块。
+  \item 找出每个基本块最后如何选择下一块。
+  \item 找出每条边的条件。
+  \item 找出每个块里产生或使用的数据。
+  \item 再分析编译器是否把控制流改写成数据流。
+\end{enumerate}
+
+\begin{deepdive}
+编译器中间表示通常会显式表达基本块、边和控制依赖。后面讲 LLVM IR 时，你会看到 \code{br}、\code{switch}、\code{phi}。汇编阶段虽然没有 \code{phi}，但基本块和边仍然存在，只是隐藏在标签、跳转和寄存器赋值里。
+\end{deepdive}
+
+\subsection{为什么基本块是控制流分析的基本单位}
+
+基本块不是教材为了画图而发明的装饰概念，而是编译器、反汇编人员和性能工程师共同使用的最小结构单位。原因在于：如果一段指令中间没有其他入口，也没有提前出口，那么只要执行进入这段指令的第一条，后面的指令就会按顺序执行到块尾。这样，块内部主要是数据流问题，块与块之间才是控制流问题。
+
+这种分离非常重要。分析块内部时，你可以追踪寄存器定义、内存访问、flags 生产和普通算术依赖；分析块尾时，你再判断 \register{rip} 会去哪个后继块。如果不切分基本块，所有指令混在一起，条件跳转、fallthrough、循环回边、早返回和跳转表会互相干扰，报告很快变成逐行翻译，无法证明程序结构。
+
+编译器优化也依赖基本块。局部公共子表达式消除、死代码删除、寄存器分配里的活跃性传播、循环识别、分支概率估计、热冷分离、代码布局，都要先知道基本块和边。即使你暂时不写编译器，也应该用同一种结构读汇编。这样后面进入 LLVM IR、SSA 和优化器章节时，概念不会重新开始。
+
+基本块还有一个实用价值：它能让你发现不完整分析。一个块如果有两个入口，说明切分错了；一个条件跳转如果只画了一条边，说明漏掉 fallthrough；一个循环如果没有回边，说明你可能只看到了展开后的部分代码或把 latch 误删了。教材式报告应该允许别人根据你的块表复查路径，而不是只能相信你的文字结论。
+
+\subsection{基本块切分的规则}
+
+手工切分基本块时，可以采用一个机械规则。第一，函数入口是基本块入口。第二，任何跳转目标标签都是基本块入口。第三，任何条件跳转、无条件跳转、\instruction{ret}、可能不返回的调用之后，下一条指令若仍可到达，也应作为新基本块入口。第四，一个基本块在遇到跳转、返回或函数结束时结束。
+
+这个规则比凭缩进和标签更可靠。汇编标签不一定都代表源代码分支，有些标签只是调试、对齐或跳转表辅助；没有显式标签的位置也可能是基本块入口，例如条件跳转的 fallthrough 目标就是下一条指令。反汇编工具有时会把标签命名成 \code{.LBB0_2}、\code{<foo+0x17>} 或地址偏移，名字不同不影响基本块含义。
+
+切分之后，每个块应只有一个入口。如果一段指令中间可以从别处跳入，那么它就不能和前面的指令属于同一个基本块。每个块也应只有一个控制出口：顺序落入下一个块、条件跳转形成两条边、无条件跳转形成一条边、\instruction{ret} 结束当前函数控制流、\instruction{call} 通常不是块出口，除非调用目标被证明不返回。
+
+一个常见错误是把 \instruction{call} 一律当成控制流终点。普通 \instruction{call} 会临时转到被调用函数，但它预期会返回到下一条指令，所以在当前函数的 CFG 中，\instruction{call} 通常属于基本块内部指令。只有调用 \code{abort}、\code{exit}、抛出后不返回的函数，或者编译器知道 \code{[[noreturn]]} 时，调用才可能成为当前函数路径的终点。
+
+\subsection{fallthrough 是一条边}
+
+条件跳转有两条边：taken edge 和 fallthrough edge。taken edge 是条件满足时跳到目标标签；fallthrough edge 是条件不满足时顺序进入下一条指令所在块。初学者容易只画跳转箭头，忘记 fallthrough。这样画出来的 CFG 会少一条执行路径，后续数据流分析也会错。
+
+例如：
+
+\begin{lstlisting}
+test edi, edi
+jle .Lelse
+lea eax, [rsi+rsi]
+ret
+.Lelse:
+lea eax, [rsi+3]
+ret
+\end{lstlisting}
+
+\instruction{jle .Lelse} 的 taken edge 表示 \code{x <= 0} 时进入 else；fallthrough edge 表示 \code{x > 0} 时继续执行 then。源代码写的是 \code{if (x > 0)}，但汇编用反条件跳走。这种布局很常见，因为编译器会把更适合顺序执行、代码布局或预测的路径放在 fallthrough 上。
+
+fallthrough 对性能也有意义。顺序路径通常有更好的取指连续性，不需要跳转目标预测；但现代 CPU 会预测 taken 分支并提前取目标，所以不能简单说 fallthrough 永远更快。工程分析时要结合输入分布、代码布局和实际计数器。对本章而言，先把两条边画全，比急着讨论哪条快更重要。
+
+\begin{keyidea}
+画 CFG 时，每个条件跳转都至少问两个问题：跳转条件成立时去哪里？条件不成立时顺序落到哪里？漏掉 fallthrough，就漏掉了一条真实路径。
+\end{keyidea}
+
+\subsection{合流点：多条路径在哪里重新汇合}
+
+控制流不只会分叉，也会汇合。一个 \code{if/else} 之后继续执行公共代码时，then 路径和 else 路径会在某个块重新汇合。这个汇合块常被称为 join block。读汇编时，合流点和分叉点同样重要，因为返回值、临时变量和寄存器活跃性经常在这里发生变化。
+
+看一个简单例子：
+
+\begin{lstlisting}[language=C++]
+extern "C" int choose_then_add(int x, int y)
+{
+    int v;
+    if (x > 0) {
+        v = y + 1;
+    } else {
+        v = y - 1;
+    }
+    return v * 3;
+}
+\end{lstlisting}
+
+一种低优化形态可以写成：
+
+\begin{lstlisting}
+test edi, edi
+jle .Lelse
+lea eax, [rsi + 1]
+jmp .Ljoin
+.Lelse:
+lea eax, [rsi - 1]
+.Ljoin:
+lea eax, [rax + rax*2]
+ret
+\end{lstlisting}
+
+这里 \code{.Ljoin} 就是合流点。进入 \code{.Ljoin} 时，\register{eax} 必须已经保存变量 \code{v}。then 路径把 \code{y + 1} 放进 \register{eax}，else 路径把 \code{y - 1} 放进 \register{eax}，合流点之后的代码不再关心它来自哪条路径，只依赖“\register{eax} 是 v”这个事实。
+
+编译器中间表示用 SSA 时，会用 \code{phi} 节点描述这种“根据前驱边选择值”的语义。伪形式如下：
+
+\begin{lstlisting}
+join:
+    v = phi(then: y + 1, else: y - 1)
+    return v * 3
+\end{lstlisting}
+
+汇编里没有显式 \code{phi} 指令。编译器会通过寄存器放置、move 插入、栈槽、\instruction{cmovcc} 或重排控制流来实现同样效果。因此，看到多条路径汇合时，要检查每条前驱边进入合流点前是否为后续代码准备了同一组寄存器或内存状态。
+
+\begin{mentalmodel}
+分叉点回答“下一步走哪条边”；合流点回答“不同路径带来的值如何统一”。没有合流点思维，就很难读懂优化后的返回值、循环变量和 SSA 降低结果。
+\end{mentalmodel}
+
+\subsection{支配关系的直觉}
+
+控制流图里还有一个常用概念：如果每条从入口到某个块的路径都必须经过块 A，就说 A 支配这个块。第一册不要求形式化算法，但直觉很有用。函数入口支配所有可达块；循环 preheader 通常支配循环体；某个 null check 如果支配后续 load，就说明所有到达 load 的路径都已经检查过指针。
+
+这个概念能帮助你判断编译器是否真的保留了保护条件。比如：
+
+\begin{lstlisting}[language=C++]
+if (p != nullptr) {
+    return *p;
+}
+return 0;
+\end{lstlisting}
+
+如果汇编中 load 所在块只可能从 \code{p != nullptr} 的 fallthrough 或 taken 路径到达，那么检查支配了 load。若某个优化把 load 移到检查之前，就要问语言语义是否允许提前访问。对普通指针解引用而言，空指针路径不能执行 load，所以这种移动通常不合法。用支配关系描述，比笼统说“应该先判断”更精确。
+
+循环里也一样。若结束指针在 preheader 里计算，且 preheader 支配循环体，那么每次进入循环体时结束指针都已经可用。若某个寄存器只在某条分支里定义，却在合流后的所有路径使用，就要检查另一条路径是否也定义了它；否则可能是你漏读了初始化，或者这段路径实际上不可达。
+
+\section{RIP：CPU 正在执行哪里}
+
+从 ISA 视角看，CPU 有一个架构状态：通用寄存器、flags、内存可见状态和 \register{rip}。普通指令完成后，\register{rip} 指向下一条指令：
+
+\begin{lstlisting}
+address  bytes        instruction
+0x1000   89 f8        mov eax, edi
+0x1002   01 f0        add eax, esi
+0x1004   c3           ret
+\end{lstlisting}
+
+执行过程：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+当前 \register{rip} & 执行指令 & 下一步 \register{rip} \\
+\midrule
+\code{0x1000} & \code{mov eax, edi} & \code{0x1002} \\
+\code{0x1002} & \code{add eax, esi} & \code{0x1004} \\
+\code{0x1004} & \code{ret} & 从栈顶取出的返回地址 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+为什么 \code{0x1000} 后面是 \code{0x1002}？因为 \instruction{mov eax, edi} 的机器码长度是 2 字节。x86 是变长指令集，一条指令可以是 1 字节，也可以更长。取指和解码前端的复杂性，一部分就来自“下一条指令地址不是固定加 4”。
+
+分支指令则不同。比如：
+
+\begin{lstlisting}
+0x2000: 85 ff        test edi, edi
+0x2002: 7e 08        jle 0x200c
+0x2004: 8d 04 36     lea eax, [rsi + rsi]
+0x2007: 83 c0 01     add eax, 1
+0x200a: c3           ret
+0x200c: 8d 46 03     lea eax, [rsi + 3]
+0x200f: c3           ret
+\end{lstlisting}
+
+\instruction{jle} 的条件为真时，下一条 \register{rip} 是 \code{0x200c}；条件为假时，下一条 \register{rip} 是顺序地址 \code{0x2004}。这就是控制流分叉。
+
+\begin{mentalmodel}
+读控制流时，把每条跳转都看成一次对 \register{rip} 的赋值：
+\begin{lstlisting}
+if condition:
+    rip = target
+else:
+    rip = next_instruction
+\end{lstlisting}
+\end{mentalmodel}
+
+\section{Flags 回顾}
+
+上一章已经见过 flags。本章要把它们放进控制流里使用。x86-64 的很多条件跳转不是直接读取 C++ 的布尔变量，而是读取前面指令设置的 flags。
+
+\subsection{cmp 的本质}
+
+Intel 语法：
+
+\begin{lstlisting}
+cmp destination, source
+\end{lstlisting}
+
+语义近似是：
+
+\begin{lstlisting}
+temporary = destination - source
+set flags according to temporary
+discard temporary
+\end{lstlisting}
+
+例如：
+
+\begin{lstlisting}
+cmp edi, esi
+jg  .Lgreater
+\end{lstlisting}
+
+这表示先按 \code{edi - esi} 设置 flags，然后 \instruction{jg} 判断 signed 意义下 \code{edi > esi} 是否成立。
+
+最常用 flags：
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.25\linewidth}p{0.43\linewidth}}
+\toprule
+flag & 名称 & 典型含义 \\
+\midrule
+\code{ZF} & zero flag & 结果为 0；常用于相等判断 \\
+\code{SF} & sign flag & 结果最高位为 1；常用于 signed 判断的一部分 \\
+\code{CF} & carry flag & unsigned 加法进位或减法借位 \\
+\code{OF} & overflow flag & signed 加减溢出 \\
+\code{PF} & parity flag & 低 8 位奇偶；现代 C++ 性能代码较少直接关心 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{test 的本质}
+
+\instruction{test} 做按位与，只设置 flags，不保存结果：
+
+\begin{lstlisting}
+test edi, edi
+je   .Lzero
+\end{lstlisting}
+
+语义近似：
+
+\begin{lstlisting}
+temporary = edi & edi
+set flags according to temporary
+discard temporary
+\end{lstlisting}
+
+因为 \code{x & x == x}，所以 \instruction{test edi, edi} 常用于判断 \code{x == 0}、\code{x < 0} 或 \code{x > 0}。它不会像 \instruction{cmp edi, 0} 那样编码一个立即数 0，机器码通常更短。
+
+\begin{lstlisting}
+test edi, edi
+je   zero       ; ZF=1, x == 0
+js   negative   ; SF=1, x < 0 in signed interpretation
+jne  nonzero    ; ZF=0, x != 0
+\end{lstlisting}
+
+\begin{warningbox}
+flags 是隐式状态。很多指令会写 flags，很多条件指令会读 flags。手写汇编时，如果在 \instruction{cmp} 和 \instruction{jcc} 中间插入会改 flags 的指令，条件判断就会改变。编译器会维护这种依赖；人写汇编必须自己负责。
+\end{warningbox}
+
+\subsection{flags 的生命周期}
+
+flags 没有变量名，也很少在源码层显式出现。它们像一组隐藏寄存器，由某条指令写入，再被后面的条件指令读取。读汇编时必须建立“flags 定义到 flags 使用”的数据流，而不是只看 \instruction{jcc} 本身。
+
+最简单情况是相邻的 \instruction{cmp} 和 \instruction{jcc}：
+
+\begin{lstlisting}
+cmp edi, esi
+jl  .Lless
+\end{lstlisting}
+
+这里 flags 的生产者明显是 \instruction{cmp edi, esi}，消费者是 \instruction{jl}。但真实编译器可能在二者之间插入不改 flags 的指令，例如某些 \instruction{lea}、\instruction{mov}：
+
+\begin{lstlisting}
+cmp edi, esi
+lea eax, [rdi + rsi]
+jl  .Lless
+\end{lstlisting}
+
+此时 \instruction{jl} 仍然读取 \instruction{cmp} 设置的 flags，因为 \instruction{lea} 不改 flags。相反，如果中间插入 \instruction{add}、\instruction{sub}、\instruction{test}、\instruction{and} 等会改 flags 的指令，后面的 \instruction{jcc} 读取的就不是原来那次比较结果。
+
+这也是为什么 \instruction{lea} 在地址计算和算术优化里很有用。它能计算加法、乘以小常数和地址表达式，但不破坏 flags。编译器有时故意选择 \instruction{lea} 而不是 \instruction{add}，就是为了在保持 flags 可用的同时准备某个数据值。
+
+\subsection{读条件码的四步}
+
+看到条件跳转时，建议按四步推导。第一，找到最近的有效 flags 生产者，注意跳过不写 flags 的指令，也要警惕中间写 flags 的指令。第二，判断生产者的逻辑：\instruction{cmp a, b} 相当于计算 \code{a - b} 设置 flags；\instruction{test a, a} 相当于按位与后判断零和符号；\instruction{add}、\instruction{sub} 等算术指令也会设置 flags。第三，判断消费者使用 signed、unsigned、相等、非零还是符号位条件。第四，把机器条件翻译成当前程序里的语义，并写清楚操作数顺序。
+
+操作数顺序尤其容易出错。Intel 语法 \code{cmp edi, esi} 是用 \code{edi - esi} 设置 flags；若后面是 \instruction{jl}，含义是 signed \code{edi < esi}。如果你把它误读成 \code{esi < edi}，分支方向就反了。AT\&T 语法的操作数顺序又不同，所以本书统一使用 Intel 语法，减少不必要混乱。
+
+\begin{warningbox}
+不要只看到 \instruction{jl} 就写“跳到小于”。必须写清楚“谁小于谁”，以及这是 signed 还是 unsigned。完整表述应类似：在 \code{cmp edi, esi} 之后，\instruction{jl} 表示 signed \code{edi < esi}。
+\end{warningbox}
+
+\section{条件跳转}
+
+\instruction{jcc} 是一族条件跳转。这里的 \code{cc} 是 condition code，例如 \instruction{je}、\instruction{jne}、\instruction{jl}、\instruction{jg}、\instruction{ja}、\instruction{jb}。
+
+基本形态：
+
+\begin{lstlisting}
+cmp a, b
+jcc target
+\end{lstlisting}
+
+含义：
+
+\begin{lstlisting}
+compute flags for a - b
+if condition(flags):
+    rip = target
+else:
+    rip = next_instruction
+\end{lstlisting}
+
+\subsection{相等和不相等}
+
+相等判断只需要看 \code{ZF}：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.26\linewidth}p{0.34\linewidth}}
+\toprule
+指令 & 条件 & 常见 C++ 关系 \\
+\midrule
+\instruction{je} 或 \instruction{jz} & \code{ZF == 1} & \code{a == b} \\
+\instruction{jne} 或 \instruction{jnz} & \code{ZF == 0} & \code{a != b} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{signed 比较}
+
+signed 比较需要考虑 \code{SF} 和 \code{OF}：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+指令 & 读 flags 的条件 & \code{cmp a, b} 后的含义 \\
+\midrule
+\instruction{jl} 或 \instruction{jnge} & \code{SF != OF} & signed \code{a < b} \\
+\instruction{jle} 或 \instruction{jng} & \code{ZF == 1 || SF != OF} & signed \code{a <= b} \\
+\instruction{jg} 或 \instruction{jnle} & \code{ZF == 0 && SF == OF} & signed \code{a > b} \\
+\instruction{jge} 或 \instruction{jnl} & \code{SF == OF} & signed \code{a >= b} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{unsigned 比较}
+
+unsigned 比较主要看 \code{CF} 和 \code{ZF}：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+指令 & 读 flags 的条件 & \code{cmp a, b} 后的含义 \\
+\midrule
+\instruction{jb} 或 \instruction{jnae} & \code{CF == 1} & unsigned \code{a < b} \\
+\instruction{jbe} 或 \instruction{jna} & \code{CF == 1 || ZF == 1} & unsigned \code{a <= b} \\
+\instruction{ja} 或 \instruction{jnbe} & \code{CF == 0 && ZF == 0} & unsigned \code{a > b} \\
+\instruction{jae} 或 \instruction{jnb} & \code{CF == 0} & unsigned \code{a >= b} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{keyidea}
+同一个 \instruction{cmp} 之后，接 signed 条件跳转还是 unsigned 条件跳转，会得到不同语义。硬件没有问变量类型；类型信息已经体现在编译器选择了哪条条件指令。
+\end{keyidea}
+
+\section{signed 和 unsigned 的分叉}
+
+下面两个函数源代码几乎一样，但类型不同：
+
+\begin{lstlisting}[language=C++]
+extern "C" int less_i32(int a, int b)
+{
+    return a < b;
+}
+
+extern "C" int less_u32(unsigned a, unsigned b)
+{
+    return a < b;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+less_i32:
+    xor eax, eax
+    cmp edi, esi
+    setl al
+    ret
+
+less_u32:
+    xor eax, eax
+    cmp edi, esi
+    setb al
+    ret
+\end{lstlisting}
+
+两段都用 \instruction{cmp edi, esi}，但是 signed 版本使用 \instruction{setl}，unsigned 版本使用 \instruction{setb}。这不是小细节，而是语义核心。
+
+设：
+
+\begin{lstlisting}
+edi = 0xffffffff
+esi = 0x00000001
+\end{lstlisting}
+
+解释：
+
+\begin{center}
+\begin{tabular}{p{0.25\linewidth}p{0.28\linewidth}p{0.30\linewidth}}
+\toprule
+解释方式 & \register{edi} 的值 & \code{edi < esi} \\
+\midrule
+\code{std::int32_t} & \code{-1} & true \\
+\code{std::uint32_t} & \code{4294967295} & false \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以：
+
+\begin{lstlisting}
+cmp edi, esi
+setl al    ; signed:   -1 < 1, true
+setb al    ; unsigned: 4294967295 < 1, false
+\end{lstlisting}
+
+\begin{warningbox}
+很多性能 bug 和安全 bug 都来自 signed/unsigned 混用。看到 \instruction{jl}、\instruction{jg} 时要想到 signed；看到 \instruction{jb}、\instruction{ja} 时要想到 unsigned。尤其是数组长度、下标、\code{size_t}、负数检查混在一起时，要非常警惕。
+\end{warningbox}
+
+\section{if/else 的降低}
+
+考虑函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int branchy(int x, int y)
+{
+    if (x > 0) {
+        return y * 2 + 1;
+    } else {
+        return y + 3;
+    }
+}
+\end{lstlisting}
+
+为了教学，我们先看一种有显式分支的写法：
+
+\begin{lstlisting}
+branchy:
+    test edi, edi
+    jle  .Lelse
+    lea  eax, [rsi + rsi]
+    add  eax, 1
+    ret
+.Lelse:
+    lea  eax, [rsi + 3]
+    ret
+\end{lstlisting}
+
+控制流图：
+
+\begin{lstlisting}
+entry:
+    test x
+    if x <= 0 goto else
+    goto then
+
+then:
+    eax = y * 2 + 1
+    return
+
+else:
+    eax = y + 3
+    return
+\end{lstlisting}
+
+注意编译器经常会把源代码条件取反。源代码写的是 \code{x > 0}，汇编却可能写 \instruction{jle .Lelse}。这不是语义反了，而是把不满足 then 的情况跳到 else，让 then 作为 fallthrough。
+
+逐条解释一次：
+
+\begin{lstlisting}
+entry:
+    edi = x
+    esi = y
+
+test edi, edi
+    flags = flags_of(x & x)
+
+jle .Lelse
+    if signed x <= 0:
+        rip = .Lelse
+    else:
+        rip = next instruction
+
+lea eax, [rsi + rsi]
+    eax = y * 2
+    flags unchanged
+
+add eax, 1
+    eax = y * 2 + 1
+    flags updated, but no later use here
+
+ret
+    return eax
+
+.Lelse:
+lea eax, [rsi + 3]
+    eax = y + 3
+
+ret
+\end{lstlisting}
+
+\subsection{带机器码地址的观察}
+
+反汇编里可能看到类似：
+
+\begin{lstlisting}
+0000000000000000 <branchy>:
+   0: 85 ff              test   edi, edi
+   2: 7e 08              jle    c <branchy+0xc>
+   4: 8d 04 36           lea    eax, [rsi+rsi]
+   7: 83 c0 01           add    eax, 0x1
+   a: c3                 ret
+   c: 8d 46 03           lea    eax, [rsi+0x3]
+   f: c3                 ret
+\end{lstlisting}
+
+\code{jle} 的机器码 \code{7e 08} 使用 8 位相对位移。位移不是从当前指令开头算，而是从下一条指令地址算：
+
+\begin{lstlisting}
+jle address       = 0x0002
+jle length        = 2
+next instruction  = 0x0004
+encoded offset    = 0x08
+target            = 0x0004 + 0x08 = 0x000c
+\end{lstlisting}
+
+这就是 \code{c <branchy+0xc>} 的来源。
+
+\begin{deepdive}
+x86 条件跳转既可以使用短位移，也可以使用更长的相对位移。汇编器会根据目标距离选择编码。链接和重定位还可能调整最终地址。理解“相对下一条指令”的规则，对读机器码、二进制补丁和反汇编非常重要。
+\end{deepdive}
+
+\section{setcc：把条件变成 0 或 1}
+
+C++ 经常需要返回布尔值：
+
+\begin{lstlisting}[language=C++]
+extern "C" int is_positive(int x)
+{
+    return x > 0;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+is_positive:
+    xor  eax, eax
+    test edi, edi
+    setg al
+    ret
+\end{lstlisting}
+
+\instruction{setg al} 表示如果 signed \code{x > 0}，就把 \register{al} 写成 1，否则写成 0。由于 \instruction{setcc} 只写 8 位目标，前面常见 \instruction{xor eax, eax}，先把整个 \register{eax} 清零，避免高位残留：
+
+\begin{lstlisting}
+xor eax, eax
+    eax = 0
+
+test edi, edi
+    flags = flags_of(x)
+
+setg al
+    if x > 0:
+        al = 1
+    else:
+        al = 0
+    eax is now 0 or 1
+\end{lstlisting}
+
+常见 \instruction{setcc}：
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.31\linewidth}p{0.33\linewidth}}
+\toprule
+指令 & 条件 & 常见含义 \\
+\midrule
+\instruction{sete} & \code{ZF == 1} & 等于 \\
+\instruction{setne} & \code{ZF == 0} & 不等于 \\
+\instruction{setl} & signed 小于 & \code{a < b} for signed \\
+\instruction{setg} & signed 大于 & \code{a > b} for signed \\
+\instruction{setb} & unsigned 小于 & \code{a < b} for unsigned \\
+\instruction{seta} & unsigned 大于 & \code{a > b} for unsigned \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{cmovcc：把控制选择变成数据选择}
+
+分支会改变 \register{rip}。有时候编译器不想改变控制流，而是先算出两个候选值，然后用 \instruction{cmovcc} 选择一个。
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int min_i32(int a, int b)
+{
+    return a < b ? a : b;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+min_i32:
+    mov eax, esi
+    cmp edi, esi
+    cmovl eax, edi
+    ret
+\end{lstlisting}
+
+逐条解释：
+
+\begin{lstlisting}
+entry:
+    edi = a
+    esi = b
+
+mov eax, esi
+    result candidate = b
+
+cmp edi, esi
+    flags = flags_of(a - b)
+
+cmovl eax, edi
+    if signed a < b:
+        eax = a
+    else:
+        eax remains b
+
+ret
+\end{lstlisting}
+
+\instruction{cmovcc} 不改变 \register{rip}，但它读取 flags，并且目标寄存器会依赖条件和两个候选值。它适合分支难预测、两边计算都便宜的情况。
+
+\subsection{什么时候不要盲目追求 branchless}
+
+无分支不等于一定更快。考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" int maybe_load(int cond, int const* p, int fallback)
+{
+    if (cond) {
+        return *p;
+    }
+    return fallback;
+}
+\end{lstlisting}
+
+这类代码不能简单改成“先 load 再 cmov”，因为 \code{cond == 0} 时 \code{p} 可能为空或无效。C++ 语义只允许在条件为真时访问 \code{*p}。机器硬件可以执行 load，但语言层面和异常行为都不允许你随便提前访问。
+
+性能判断也要看代价：
+
+\begin{itemize}
+  \item 分支高度可预测时，普通分支可能非常快。
+  \item 分支接近随机时，错误预测代价可能很高，\instruction{cmovcc} 可能更好。
+  \item \instruction{cmovcc} 会保留数据依赖，可能拉长关键路径。
+  \item 如果两边计算很重，branchless 可能让本来不需要执行的一边也产生代价。
+  \item 如果一边包含潜在非法内存访问，不能用简单数据选择替代控制选择。
+\end{itemize}
+
+\begin{keyidea}
+分支优化不是“消灭所有分支”。正确问题是：这条分支是否可预测？错误预测代价多大？两边计算是否便宜？数据依赖是否变长？语言语义是否允许提前计算？
+\end{keyidea}
+
+\section{短路逻辑和早返回}
+
+C++ 的 \code{&&} 和 \code{||} 不是普通的按位运算。它们有短路语义：对 \code{a && b}，如果 \code{a} 为假，\code{b} 不会求值；对 \code{a || b}，如果 \code{a} 为真，\code{b} 不会求值。这意味着它们天然包含控制流，尤其当右侧表达式有函数调用、内存访问或可能触发未定义行为时，编译器不能随意提前执行。
+
+看一个边界明确的例子：
+
+\begin{lstlisting}[language=C++]
+extern "C" int safe_read(int const* p, int n)
+{
+    if (p != nullptr && n > 0) {
+        return p[0];
+    }
+    return 0;
+}
+\end{lstlisting}
+
+一种可能控制流是：
+
+\begin{lstlisting}
+test rdi, rdi
+je   .Lzero
+test esi, esi
+jle  .Lzero
+mov  eax, dword ptr [rdi]
+ret
+.Lzero:
+xor  eax, eax
+ret
+\end{lstlisting}
+
+这里不能先无条件执行 \code{mov eax, [rdi]} 再根据条件选择返回值，因为当 \code{p == nullptr} 时，源码语义并不会访问 \code{p[0]}。短路保护的是右侧求值本身，不只是最终结果。这个例子也说明 branchless 改写必须服从语言语义，不能只看数学等价。
+
+早返回也会形成多个出口块：
+
+\begin{lstlisting}[language=C++]
+extern "C" int clamp_positive(int x)
+{
+    if (x < 0) {
+        return 0;
+    }
+    if (x > 100) {
+        return 100;
+    }
+    return x;
+}
+\end{lstlisting}
+
+汇编可能有多个 \instruction{ret}，也可能把多个路径合并到一个共同尾声。多个 \instruction{ret} 不代表函数逻辑混乱，只说明编译器认为直接返回更短。共同尾声则常见于需要恢复栈、弹出 callee-saved 寄存器或执行统一清理的函数。读汇编时要区分“源码有几个 return”和“机器码有几个 ret”，二者不必相同。
+
+\begin{keyidea}
+短路逻辑是一种控制依赖。只要右侧表达式可能访问内存、调用函数、产生异常或触发未定义行为，就不能把它当成普通数据表达式随便提前计算。
+\end{keyidea}
+
+\section{控制依赖和数据依赖}
+
+控制流分析里有两个常用词：控制依赖和数据依赖。若某条指令是否执行取决于前面的条件跳转，它就处在控制依赖之下。若某条指令的输入值来自前面指令的输出，它就有数据依赖。编译器优化经常在这两者之间转换。
+
+前面的 \code{min_i32} 可以用分支写：
+
+\begin{lstlisting}
+cmp edi, esi
+jge .Luse_b
+mov eax, edi
+ret
+.Luse_b:
+mov eax, esi
+ret
+\end{lstlisting}
+
+也可以用 \instruction{cmovl} 写：
+
+\begin{lstlisting}
+mov eax, esi
+cmp edi, esi
+cmovl eax, edi
+ret
+\end{lstlisting}
+
+第一种形式中，\code{mov eax, edi} 是否执行受控制依赖影响；第二种形式中，\instruction{cmovl} 总会执行，但 \register{eax} 的最终值依赖 flags 和两个候选数据。控制依赖减少了不必要计算，但可能带来分支预测风险；数据依赖消除了分支，但可能拉长关键路径。
+
+这一区分对性能阅读很重要。一个看起来“没有分支”的版本，并不等于没有代价。它可能让本来不需要的计算变成每次都做，也可能让后续指令必须等待条件和两个数据源都准备好。相反，一个有分支的版本，如果输入分布稳定、预测准确，可能更快也更省功耗。
+
+\begin{deepdive}
+编译器是否选择分支、\instruction{setcc}、\instruction{cmovcc} 或查表，取决于目标 CPU、优化级别、分支概率信息、两边计算成本、异常和内存安全语义。源码层的三目运算符并不强制生成 \instruction{cmovcc}。
+\end{deepdive}
+
+\section{循环的机器结构}
+
+循环不是一个神秘结构。它由入口判断、循环体、回边和退出边组成。
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int sum_i32(int const* p, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        s += p[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+一种容易教学的汇编：
+
+\begin{lstlisting}
+sum_i32:
+    xor eax, eax
+    test esi, esi
+    jle .Ldone
+    xor ecx, ecx
+.Lloop:
+    add eax, dword ptr [rdi + rcx*4]
+    inc rcx
+    cmp ecx, esi
+    jl  .Lloop
+.Ldone:
+    ret
+\end{lstlisting}
+
+这里假设 \register{rdi} 是 \code{p}，\register{esi} 是 \code{n}，\register{eax} 是累加器，\register{ecx}/\register{rcx} 是循环下标。
+
+控制流图：
+
+\begin{lstlisting}
+entry:
+    s = 0
+    if n <= 0 goto done
+    i = 0
+    goto loop
+
+loop:
+    s += p[i]
+    i += 1
+    if i < n goto loop
+    goto done
+
+done:
+    return s
+\end{lstlisting}
+
+回边是：
+
+\begin{lstlisting}
+jl .Lloop
+\end{lstlisting}
+
+它让 \register{rip} 回到更小地址处的循环体开头。后面讲分支预测时会看到，循环回边往往非常可预测：大多数迭代跳回，最后一次不跳。
+
+\subsection{地址和循环变量一起推导}
+
+对循环体核心指令：
+
+\begin{lstlisting}
+add eax, dword ptr [rdi + rcx*4]
+\end{lstlisting}
+
+推导：
+
+\begin{lstlisting}
+rdi = p
+rcx = i
+element width = 4 bytes
+
+address = p + i * 4
+load    = *(int*)(p + i * 4)
+eax     = s + load
+\end{lstlisting}
+
+每轮迭代：
+
+\begin{center}
+\begin{tabular}{p{0.14\linewidth}p{0.20\linewidth}p{0.28\linewidth}p{0.22\linewidth}}
+\toprule
+迭代 & \register{rcx} & 访问地址 & 语义 \\
+\midrule
+0 & \code{0} & \code{p + 0} & \code{s += p[0]} \\
+1 & \code{1} & \code{p + 4} & \code{s += p[1]} \\
+2 & \code{2} & \code{p + 8} & \code{s += p[2]} \\
+\code{k} & \code{k} & \code{p + 4*k} & \code{s += p[k]} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{指针递增形式}
+
+编译器也可能不用显式下标，而是让指针前进：
+
+\begin{lstlisting}
+sum_i32_ptr:
+    xor eax, eax
+    test esi, esi
+    jle .Ldone
+    movsxd rsi, esi
+    lea rdx, [rdi + rsi*4]
+.Lloop:
+    add eax, dword ptr [rdi]
+    add rdi, 4
+    cmp rdi, rdx
+    jne .Lloop
+.Ldone:
+    ret
+\end{lstlisting}
+
+这里：
+
+\begin{lstlisting}
+rdi = current pointer
+rdx = end pointer = p + n * 4
+
+loop:
+    s += *current
+    current += 4
+    continue while current != end
+\end{lstlisting}
+
+这和源代码的 \code{i < n} 语义等价，但汇编里看不到 \code{i}。你要恢复的是数据流和地址递推，而不是强行找源代码变量名。
+
+\begin{warningbox}
+不要看到 \instruction{cmp rdi, rdx} 就以为源代码一定写了两个指针比较。它也可能来自数组下标循环，编译器把下标形式优化成了指针递增形式。
+\end{warningbox}
+
+\subsection{循环的三个问题}
+
+读循环时，不要先问“这是 \code{for} 还是 \code{while}”。机器层面更重要的是三个问题。
+
+第一，循环是否可能执行零次。若入口处先判断 \code{n <= 0} 并跳到 done，那么循环体可能一次不执行；若直接进入循环体，条件在尾部检查，那么至少执行一次。这个问题关系到空数组、边界输入和 benchmark 中小规模输入的行为。
+
+第二，每次迭代改变什么状态。常见状态包括累加器、归纳变量、当前指针、剩余计数、循环内临时值。只要能写出每轮迭代前后的状态变化，就能判断循环是否等价于源码，而不需要强行找回源代码变量名。
+
+第三，退出条件依赖什么。退出条件可能依赖计数器，也可能依赖指针到达 end，也可能依赖数据内容，例如扫描到零字节、找到匹配元素、遇到错误码。计数型循环通常更容易预测和向量化；数据依赖退出的循环更难批量处理，因为每一轮是否继续取决于刚读到的数据。
+
+\begin{mentalmodel}
+循环可以写成四个槽位：
+
+\begin{lstlisting}
+preheader:
+    prepare invariants and initial state
+
+header:
+    decide whether to enter/continue
+
+body:
+    do useful work and update state
+
+latch:
+    jump back to header or exit
+\end{lstlisting}
+
+真实汇编可能合并这些槽位，但分析时可以按这个模型恢复。
+\end{mentalmodel}
+
+\subsection{preheader、header、latch 和 exit}
+
+编译器内部经常把循环拆成几个角色：preheader 是进入循环前只执行一次的块，header 是判断是否继续或承载循环入口的块，body 是主要工作，latch 是更新状态并跳回 header 的块，exit 是离开循环后的块。真实汇编可能把 header 和 body 合并，也可能把 latch 和 body 合并，但这些角色仍然存在。
+
+为什么要有这些名字？因为它们回答不同问题。preheader 适合放循环不变量，例如结束指针、常量倍数、mask、表地址；header 适合放入口条件和从上一轮带来的状态；body 放每轮真正工作；latch 放归纳变量更新和回边判断；exit 放返回值整理或后续代码。若报告只说“这里是循环”，就无法说明某条 \instruction{lea} 是每轮执行还是只执行一次，也无法判断优化是否减少了循环体成本。
+
+以指针递增求和为例，\instruction{lea rdx, [rdi + rsi*4]} 在 preheader 里计算 end pointer。如果它在循环体里，每轮都要重新计算结束地址；移到 preheader 后，每轮只需要比较当前指针和 \register{rdx}。这就是循环不变量外提的基本形态。对性能来说，一条指令是否在循环内，影响会被迭代次数放大；对正确性来说，它是否支配循环体，也决定循环体能否安全使用它。
+
+exit 也不能忽略。很多循环离开后还要处理 tail、返回累加器、恢复寄存器、处理没有进入循环的空输入，或者进入第二个清理循环。优化后的代码常常有多个 exit：一个处理 \code{n <= 0}，一个处理主循环结束，一个处理提前找到目标。画 CFG 时要把每个 exit 分开标注，否则会把不同边界条件混成一个结论。
+
+\subsection{归纳变量替换：源码的 \code{i} 可能消失}
+
+归纳变量是循环优化的核心。源码里写的是 \code{i}，汇编里可能改成当前指针、剩余计数、偏移字节数，甚至同时维护多个等价变量。编译器这样做不是为了让人难读，而是为了减少每轮计算、适配寻址模式、方便向量化或方便退出判断。
+
+一个下标循环：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) {
+    s += p[i];
+}
+\end{lstlisting}
+
+可以用三种等价机器状态表达：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+形态 & 每轮状态 & 退出判断 \\
+\midrule
+下标形态 & \code{i = i + 1} & \code{i < n} \\
+指针形态 & \code{cur = cur + 4} & \code{cur != end} \\
+剩余计数形态 & \code{count = count - 1} & \code{count != 0} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这三种形态都可能来自同一段源码。读者要学会证明它们等价。下标形态里地址是 \code{base + i * 4}；指针形态里 \code{cur} 初始为 \code{base}，每轮加 4，因此第 k 轮 \code{cur = base + k * 4}；剩余计数形态里可能同时维护当前指针和剩余元素数，退出时 count 归零。证明时写出初始值、每轮递推和退出条件，就能恢复源码含义。
+
+归纳变量替换也会改变条件码。源码 \code{i < n} 是 signed 比较，但如果编译器先证明 \code{n > 0} 且 \code{i} 从 0 递增，就可能使用指针不等或 unsigned 范围检查。不要看到 \instruction{jne .Lloop} 就说源码写了 \code{while (p != end)}。更准确的说法是：优化后循环使用当前指针和结束指针表达原来的计数边界。
+
+\subsection{循环退出证明：为什么不会多读一个元素}
+
+读循环汇编时，必须证明每次 load 都在合法迭代范围内。对于前面的下标版本，入口处 \instruction{test esi, esi; jle .Ldone} 证明 \code{n <= 0} 时不进入循环。进入循环后初始 \code{i = 0}，每轮先读 \code{p[i]}，再执行 \code{i += 1}，然后用 \code{i < n} 决定是否回边。这样最后一次读取发生在旧 \code{i = n - 1} 时，更新后 \code{i = n}，比较失败退出，没有读取 \code{p[n]}。
+
+对于指针版本，preheader 计算 \code{end = p + n * 4}。循环中先读 \code{*cur}，再执行 \code{cur += 4}，然后比较 \code{cur != end}。若初始 \code{n > 0}，第 0 次读 \code{p}，第 k 次读 \code{p + 4k}，当读完 \code{p + 4(n-1)} 后，\code{cur} 加到 \code{end}，比较失败退出。这个证明比“看起来像数组循环”更可靠。
+
+边界输入要单独检查。若 \code{n == 0}，入口判断必须绕过循环；若 \code{n < 0}，源码里的循环条件 \code{i < n} 对初始 \code{i = 0} 为假，也应绕过循环。若编译器使用 \code{std::size_t} 或 unsigned 长度，负数不再是可能值，但混合类型转换可能引入其他边界。高质量报告应至少覆盖零长度、单元素和最大常见长度三个场景。
+
+\begin{warningbox}
+循环报告不能只写“回到 .Lloop”。必须证明入口条件、每轮更新和退出判断共同保证访问范围正确。尤其是优化成指针递增后，更要说明当前指针和结束指针如何对应原始下标。
+\end{warningbox}
+
+\subsection{循环合并块和循环携带依赖}
+
+循环本身也是一种合流结构。每次回边回到 header 时，某些值来自第一次进入循环前，另一些值来自上一轮迭代后的 latch。SSA 里会用 \code{phi} 表达这种关系，例如：
+
+\begin{lstlisting}
+header:
+    i = phi(entry: 0, latch: i_next)
+    s = phi(entry: 0, latch: s_next)
+\end{lstlisting}
+
+汇编里没有 \code{phi}，但你能看到寄存器扮演同样角色。\register{ecx} 初始为 0，回边后保存下一轮的 \code{i}；\register{eax} 初始为 0，回边后保存下一轮的累加和 \code{s}。这类值叫循环携带值，因为它们从一轮迭代传到下一轮。
+
+循环携带依赖会影响性能。累加器 \code{s += p[i]} 形成一条跨迭代依赖链：第 k+1 轮的 \code{s} 依赖第 k 轮加法结果。简单计数器也有依赖，但通常便宜。后续讲 ILP、展开和向量化时，会看到编译器通过多个累加器、循环展开或向量归约来缩短这种依赖链。第一册只要求你能在汇编里指出哪些寄存器跨迭代保留状态。
+
+\subsection{循环不变量}
+
+\term{loop invariant}{循环不变量} 是循环执行期间不变化的值或计算。编译器会尽量把不变量移到循环外，减少每次迭代成本。例如数组基址、元素宽度、结束指针、某个常量系数，都可能在循环前准备好。
+
+在指针递增版本里：
+
+\begin{lstlisting}
+movsxd rsi, esi
+lea rdx, [rdi + rsi*4]
+\end{lstlisting}
+
+\register{rdx} 是 end pointer，在循环中保持不变。循环体只递增 \register{rdi}，每轮比较当前指针和 end pointer。这个转换把每轮的 \code{i < n} 和 \code{p + i * 4} 关系改写成“当前指针是否到达终点”。对机器来说，这可能减少地址计算压力，也让循环状态更直接。
+
+读优化汇编时，要主动寻找 preheader 中的这些准备指令。很多看似不属于循环的 \instruction{lea}、\instruction{movsxd}、\instruction{shl}，其实是在构造循环不变量。如果只看标签之间的循环体，会漏掉循环正确性的前提。
+
+\subsection{break 和 continue}
+
+\code{break} 和 \code{continue} 会给循环增加额外边。看例子：
+
+\begin{lstlisting}[language=C++]
+extern "C" int first_positive_sum_until_zero(int const* p, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        int v = p[i];
+        if (v == 0) {
+            break;
+        }
+        if (v < 0) {
+            continue;
+        }
+        s += v;
+    }
+    return s;
+}
+\end{lstlisting}
+
+CFG 中至少有这些边：
+
+\begin{lstlisting}
+entry -> loop_header
+loop_header -> done          if i >= n
+loop_header -> body          if i < n
+body -> done                 if v == 0        ; break
+body -> latch                if v < 0         ; continue
+body -> add_positive         otherwise
+add_positive -> latch
+latch -> loop_header
+\end{lstlisting}
+
+\code{break} 的目标是循环外的 done，\code{continue} 的目标通常是 latch 或 step 位置，然后再回到条件判断。优化后标签名字可能不明显，但边的语义仍然存在。画 CFG 时，如果只找一条回边和一条退出边，会漏掉这类多出口循环。
+
+这类循环也更难优化。它的数据内容决定退出和跳过路径，分支预测依赖输入分布；向量化时还要处理提前停止和掩码选择。第二册讨论 SIMD 和扫描类算法时，会反复回到这些控制流结构。
+
+\section{循环形态：while、do-while 和 for}
+
+高级语言有不同循环语法，机器层面差异主要在第一次检查条件的位置。
+
+\subsection{while 循环}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int count_down(int n)
+{
+    int s = 0;
+    while (n > 0) {
+        s += n;
+        --n;
+    }
+    return s;
+}
+\end{lstlisting}
+
+结构：
+
+\begin{lstlisting}
+entry:
+    s = 0
+    if n <= 0 goto done
+
+loop:
+    s += n
+    n -= 1
+    if n > 0 goto loop
+
+done:
+    return s
+\end{lstlisting}
+
+while 是先判断，再执行。若初始条件不成立，循环体一次都不执行。
+
+\subsection{do-while 循环}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int count_down_do(int n)
+{
+    int s = 0;
+    do {
+        s += n;
+        --n;
+    } while (n > 0);
+    return s;
+}
+\end{lstlisting}
+
+结构：
+
+\begin{lstlisting}
+entry:
+    s = 0
+
+loop:
+    s += n
+    n -= 1
+    if n > 0 goto loop
+
+done:
+    return s
+\end{lstlisting}
+
+do-while 至少执行一次。汇编里常见特征是循环体前面没有入口条件跳转，条件跳转在尾部。
+
+\subsection{for 循环}
+
+\code{for(init; cond; step)} 常见结构：
+
+\begin{lstlisting}
+init
+if not cond goto done
+
+loop:
+    body
+    step
+    if cond goto loop
+
+done:
+\end{lstlisting}
+
+编译器会根据优化目标重排。比如把第一次条件判断放到循环尾，或者把不变量挪到循环外。读汇编时不要纠结源代码写法，先识别基本块和边。
+
+\section{归纳变量和循环优化预告}
+
+\term{induction variable}{归纳变量} 是每次迭代按固定规律变化的变量。最常见：
+
+\begin{lstlisting}
+i = i + 1
+ptr = ptr + 4
+offset = offset + stride
+\end{lstlisting}
+
+在 HPC 和 AI 算子里，归纳变量非常重要，因为它决定内存访问模式、向量化条件、预取距离和 cache line 利用率。
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" void axpy(float* y, float const* x, float a, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        y[i] += a * x[i];
+    }
+}
+\end{lstlisting}
+
+标量汇编的核心形态可能是：
+
+\begin{lstlisting}
+.Lloop:
+    movss xmm1, dword ptr [rsi + rcx*4]
+    mulss xmm1, xmm0
+    addss xmm1, dword ptr [rdi + rcx*4]
+    movss dword ptr [rdi + rcx*4], xmm1
+    inc rcx
+    cmp ecx, edx
+    jl .Lloop
+\end{lstlisting}
+
+控制流只是循环；性能核心则在数据流：
+
+\begin{lstlisting}
+x address = x + i * 4
+y address = y + i * 4
+two loads + one store per element
+one multiply + one add per element
+branch once per scalar iteration
+\end{lstlisting}
+
+后面讲 SIMD 时，这个循环会变成每轮处理多个元素，回边次数减少，地址递增步长变大，tail 处理成为新问题。本章先把标量控制流看清楚。
+
+\section{switch：比较链和跳转表}
+
+\code{switch} 的降低取决于 case 值是否密集、数量是否多、每个分支体大小和编译器策略。
+
+\subsection{比较链}
+
+C++：
+
+\begin{lstlisting}[language=C++]
+extern "C" int small_switch(int x)
+{
+    switch (x) {
+        case 1: return 10;
+        case 7: return 70;
+        default: return -1;
+    }
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+small_switch:
+    cmp edi, 1
+    je  .Lcase1
+    cmp edi, 7
+    je  .Lcase7
+    mov eax, -1
+    ret
+.Lcase1:
+    mov eax, 10
+    ret
+.Lcase7:
+    mov eax, 70
+    ret
+\end{lstlisting}
+
+控制流就是多次比较加条件跳转。case 稀疏时，这种形式很常见。
+
+\subsection{跳转表}
+
+case 密集时，编译器可能生成跳转表：
+
+\begin{lstlisting}[language=C++]
+extern "C" int dense_switch(int x)
+{
+    switch (x) {
+        case 0: return 3;
+        case 1: return 5;
+        case 2: return 8;
+        case 3: return 13;
+        case 4: return 21;
+        default: return -1;
+    }
+}
+\end{lstlisting}
+
+如果每个 case 只是返回常量，编译器可能生成数据表而不是代码跳转表。为了看清跳转表，可以让每个分支调用不同函数。教学形式如下：
+
+\begin{lstlisting}
+dense_switch:
+    cmp edi, 4
+    ja  .Ldefault
+    mov eax, edi
+    jmp qword ptr [rip + .LJTI0_0 + rax*8]
+
+.Lcase0:
+    mov eax, 3
+    ret
+.Lcase1:
+    mov eax, 5
+    ret
+.Lcase2:
+    mov eax, 8
+    ret
+.Lcase3:
+    mov eax, 13
+    ret
+.Lcase4:
+    mov eax, 21
+    ret
+.Ldefault:
+    mov eax, -1
+    ret
+
+.LJTI0_0:
+    .quad .Lcase0
+    .quad .Lcase1
+    .quad .Lcase2
+    .quad .Lcase3
+    .quad .Lcase4
+\end{lstlisting}
+
+分解：
+
+\begin{lstlisting}
+cmp edi, 4
+ja .Ldefault
+    unsigned if x > 4 goto default
+
+mov eax, edi
+    rax = zero-extended x
+
+jmp qword ptr [rip + table + rax*8]
+    target_address = *(table + x * 8)
+    rip = target_address
+\end{lstlisting}
+
+为什么使用 \instruction{ja} 而不是 \instruction{jg}？因为这里常见技巧是用 unsigned 范围检查同时处理负数：
+
+\begin{lstlisting}
+x = -1 as int32 bits = 0xffffffff
+as unsigned         = 4294967295
+4294967295 > 4      = true
+\end{lstlisting}
+
+所以 \code{x < 0} 和 \code{x > 4} 都会跳到 default。
+
+\begin{keyidea}
+跳转表把多路选择变成一次范围检查、一次表访问、一次间接跳转。它减少比较次数，但引入间接分支和额外取表访问。它是性能优化、二进制分析和安全缓解都会关心的结构。
+\end{keyidea}
+
+\subsection{编译器为什么有时不用跳转表}
+
+初学者常以为 \code{switch} 就应该生成跳转表。实际并不一定。编译器会综合考虑 case 的数量、取值密度、范围大小、分支体复杂度、是否能把结果折叠成数据表、目标平台的间接分支成本和代码大小。
+
+如果 case 值很稀疏，例如 \code{1}、\code{1000}、\code{1000000}，直接建立从最小值到最大值的跳转表会浪费大量空间。此时比较链、二分比较树或哈希式策略可能更合理。如果每个 case 只是返回常量，编译器可能生成常量表：先做范围检查，再从表里 load 返回值，而不是跳到不同代码块。这样控制流更少，取表访问变成普通数据访问。
+
+如果目标平台对间接分支预测很敏感，或者启用了某些安全缓解，跳转表的收益也可能下降。现代系统为了防御间接分支攻击，可能引入 retpoline、IBT、CFI 等机制；这些机制会改变间接跳转和间接调用的成本模型。第一册不展开安全缓解细节，但必须知道：跳转表不是无条件更快，它是在比较次数、代码大小、预测难度和安全约束之间做取舍。
+
+\subsection{default 路径是正确性的边界}
+
+跳转表之前通常必须有范围检查。没有范围检查，错误的 \code{x} 会把表外内存当成跳转目标，控制流直接失控。对于 \code{switch (x)} 中合法 case 为 \code{0..4} 的例子，\instruction{cmp edi, 4} 和 \instruction{ja .Ldefault} 不只是优化前奏，而是安全边界。
+
+如果 case 从非零基准开始，编译器常先做归一化：
+
+\begin{lstlisting}
+sub edi, 10
+cmp edi, 4
+ja  .Ldefault
+jmp qword ptr [rip + table + rdi*8]
+\end{lstlisting}
+
+这对应源代码 case \code{10..14}。减去 10 后，合法范围变成 \code{0..4}，才能直接作为表下标。读这种汇编时，要把归一化前的源码值和归一化后的表索引分开。
+
+\begin{warningbox}
+跳转表分析必须包含范围检查。只看到 \instruction{jmp [table + index*8]} 就开始列 case，容易漏掉负数、越界值和 default 路径。
+\end{warningbox}
+
+\subsection{数据表不是跳转表}
+
+\code{switch} 的另一个常见降低方式是数据表。若每个 case 只是返回常量，编译器没有必要跳到多个代码块再返回；它可以先做范围检查，然后从常量数组里 load 结果。
+
+\begin{lstlisting}[language=C++]
+extern "C" int fib_case(int x)
+{
+    switch (x) {
+        case 0: return 3;
+        case 1: return 5;
+        case 2: return 8;
+        case 3: return 13;
+        case 4: return 21;
+        default: return -1;
+    }
+}
+\end{lstlisting}
+
+可能变成：
+
+\begin{lstlisting}
+cmp edi, 4
+ja  .Ldefault
+mov eax, dword ptr [rip + table + rdi*4]
+ret
+.Ldefault:
+mov eax, -1
+ret
+\end{lstlisting}
+
+这里表项宽度是 4 字节，表里放的是返回值，不是代码地址。控制流只有范围检查和 default 分支，没有间接跳转。若把它误判成跳转表，就会错误地寻找不存在的 case 标签和间接分支成本。
+
+区分数据表和跳转表的方法很直接：看表项被当作什么使用。若表项被 load 到普通返回寄存器或参与计算，它是数据；若表项被 load 后写入 \register{rip}，或直接出现在 \instruction{jmp qword ptr [table + index*8]} 这样的控制转移里，它才是跳转目标。表项宽度也给线索：代码地址在 x86-64 上通常是 8 字节，\code{int} 常量表通常是 4 字节。
+
+有时编译器还会生成“混合表”：先从表里取偏移，再加上基址形成目标；或者表里不是绝对地址，而是相对偏移。这和 PIE、重定位和代码模型有关。分析时不要只凭 \code{.quad} 或 \code{.long} 下结论，要看使用点。
+
+\subsection{稀疏 switch：比较链、二分树和位测试}
+
+case 稀疏时，比较链不一定按源码顺序排列。编译器可能按概率、数值范围或二分搜索形状组织比较。例如 case 为 \code{1}、\code{100}、\code{1000}、\code{10000} 时，线性比较四次不是唯一选择；编译器可能先比较 \code{x < 1000}，再在左右两边继续比较。这时 CFG 更像一棵比较树。
+
+比较树的好处是减少最坏比较次数，但会改变 fallthrough 和 taken 路径。若 profile 信息显示某个 case 特别常见，编译器也可能把它提前，让热路径更短。读这种汇编时，不要用源码 case 顺序判断逻辑。应当把每条比较产生的范围约束写在边上，例如“进入右子树意味着 \code{x >= 1000}”，再继续细化。
+
+某些小范围稀疏集合还可能用位测试。例如合法 case 是 \code{0}、\code{2}、\code{5}，编译器可能先检查范围，再用一个常量 mask 判断对应 bit 是否为 1。这种形式看起来像位运算而不是 \code{switch}，但语义仍然是集合成员测试。它适合 case 范围不大、分支结果可合并的场景。
+
+教材在第一册不要求穷尽所有降低策略，但要建立一个原则：\code{switch} 是多路选择的语义，机器实现可以是比较链、比较树、跳转表、数据表、位测试，甚至被完全代数化。报告应描述你实际观察到的结构，而不是套用“switch 等于跳转表”的模板。
+
+\subsection{跳转表和重定位}
+
+目标文件阶段的跳转表常常不能包含最终运行时地址，因为函数和代码段还没有被链接器放到最终位置。于是表项会带有重定位记录。链接器根据最终布局修正表项，动态链接器还可能在程序加载时继续处理 PIE 或共享库中的相对地址。
+
+这解释了实验里为什么要求同时看 \code{objdump -dr} 和 \code{readelf -r}。\code{objdump -d} 能看到指令和表附近的数据，\code{-r} 能把相关重定位显示出来；\code{readelf -r} 则列出目标文件里的重定位项。若只看反汇编，可能看到 \code{0x0}、占位偏移或看似奇怪的表项，于是误以为跳转目标是空地址。实际上，这些值要等链接时才完整。
+
+PIE 下还常见相对寻址和相对表项。代码不把绝对地址写死，而是通过 \register{rip} 相对地址找到表，再把表中偏移加到基址得到目标。这样同一份代码可以加载到不同虚拟地址。读这种形式时，要分清三层：指令里到表的位移、表项里到 case 的位移、运行时实际加载基址。
+
+\begin{keyidea}
+跳转表是代码地址或代码偏移的数据结构。目标文件里看到的表项可能需要重定位；PIE 中的表项可能是相对偏移。分析跳转表必须把汇编、表内容和重定位记录一起看。
+\end{keyidea}
+
+\subsection{跳转表的地址推导}
+
+设：
+
+\begin{lstlisting}
+rip at jmp next instruction base = 0x401050
+.LJTI0_0 runtime address         = 0x402000
+rax                              = 3
+entry width                      = 8 bytes
+\end{lstlisting}
+
+则：
+
+\begin{lstlisting}
+entry_address = 0x402000 + 3 * 8
+              = 0x402018
+
+target = *(uint64_t*)0x402018
+       = address of .Lcase3
+
+rip = target
+\end{lstlisting}
+
+反汇编时，\code{rip + displacement} 里的 \code{rip} 通常指下一条指令地址，不是当前指令开头地址。这一点和前面的相对跳转一致。
+
+\section{无条件跳转和尾调用}
+
+\instruction{jmp} 直接改变 \register{rip}：
+
+\begin{lstlisting}
+jmp .Ltarget
+\end{lstlisting}
+
+语义：
+
+\begin{lstlisting}
+rip = .Ltarget
+\end{lstlisting}
+
+它不写返回地址。和 \instruction{call} 的区别非常关键。
+
+一个函数末尾直接返回另一个函数结果：
+
+\begin{lstlisting}[language=C++]
+extern "C" int callee(int);
+
+extern "C" int wrapper(int x)
+{
+    return callee(x);
+}
+\end{lstlisting}
+
+优化后可能是：
+
+\begin{lstlisting}
+wrapper:
+    jmp callee
+\end{lstlisting}
+
+这叫 \term{tail call}{尾调用} 或 tail-call optimization。因为 \code{wrapper} 调用 \code{callee} 后没有额外工作，编译器可以复用调用者给 \code{wrapper} 的返回地址。这样 \code{callee} 返回时直接回到 \code{wrapper} 的调用者。
+
+控制流：
+
+\begin{lstlisting}
+caller -> wrapper -> callee -> caller
+\end{lstlisting}
+
+尾调用优化后：
+
+\begin{lstlisting}
+caller -> wrapper
+          jmp callee
+callee -> caller
+\end{lstlisting}
+
+\subsection{尾调用成立的边界}
+
+尾调用不是“函数最后一行有调用”就一定发生。编译器必须确认当前函数在目标函数返回后没有任何工作要做，并且目标调用可以复用当前调用帧。若调用后还要调整返回值、执行析构、释放动态资源、恢复某些栈状态、处理异常清理，或者调用约定不兼容，就不能简单改成 \instruction{jmp}。
+
+C++ 里对象生命周期尤其重要。下面函数看似最后返回被调函数结果，但如果局部对象有析构函数，调用返回后还必须执行析构，就不再是简单尾调用：
+
+\begin{lstlisting}[language=C++]
+extern "C" int callee(int);
+
+int wrapper_with_cleanup(int x)
+{
+    SomeGuard g;
+    return callee(x);
+}
+\end{lstlisting}
+
+这里 \code{g} 的析构是语言语义的一部分。即使源码最后一行是 \code{return callee(x);}，编译器也要保证离开函数前执行清理。优化器可能通过内联或其他方式改变形态，但不能丢掉析构语义。读汇编时，如果没有看到尾调用，不要立即认为编译器能力不足，先检查函数是否还有隐藏清理工作。
+
+尾调用还受 ABI 约束。参数数量、栈上传参、栈对齐、返回类型、调用约定、可变参数函数、异常处理元数据，都可能影响能否复用当前栈帧。下一章讲 ABI 后，这些限制会更清楚。本章先记住：\instruction{jmp callee} 作为尾调用，意味着当前函数不再需要自己的返回点，目标函数将直接返回到更上层调用者。
+
+\begin{warningbox}
+看到函数末尾的 \instruction{jmp}，要判断它是普通跳转、错误路径合并，还是尾调用。尾调用没有压入新的返回地址，调用栈形状会和普通 \instruction{call} 不同。
+\end{warningbox}
+
+\section{call 和 ret}
+
+\instruction{call} 做两件事：
+
+\begin{enumerate}
+  \item 把返回地址压入栈。
+  \item 把 \register{rip} 改成被调用函数入口地址。
+\end{enumerate}
+
+\instruction{ret} 做相反动作：
+
+\begin{enumerate}
+  \item 从栈顶取出返回地址。
+  \item \register{rsp} 增加 8。
+  \item 把 \register{rip} 改成取出的返回地址。
+\end{enumerate}
+
+以具体地址说明。假设：
+
+\begin{lstlisting}
+main:
+0x401120: e8 5b 00 00 00    call 0x401180 <f>
+0x401125: 83 c0 01          add eax, 1
+
+f:
+0x401180: 8d 04 3f          lea eax, [rdi+rdi]
+0x401183: c3                ret
+\end{lstlisting}
+
+执行 \instruction{call} 前：
+
+\begin{lstlisting}
+rip = 0x401120
+rsp = 0x7fffffffdc90
+\end{lstlisting}
+
+执行 \instruction{call 0x401180} 后：
+
+\begin{lstlisting}
+rsp = 0x7fffffffdc88
+[rsp] = 0x401125
+rip = 0x401180
+\end{lstlisting}
+
+返回地址是 \code{0x401125}，也就是 \instruction{call} 的下一条指令地址。函数 \code{f} 执行 \instruction{ret} 时：
+
+\begin{lstlisting}
+target = *(uint64_t*)rsp = 0x401125
+rsp = rsp + 8
+rip = target
+\end{lstlisting}
+
+于是执行回到 \code{main} 里的 \instruction{add eax, 1}。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.31\linewidth}p{0.31\linewidth}}
+\toprule
+指令 & 栈动作 & \register{rip} 动作 \\
+\midrule
+\instruction{call target} & \code{push next_rip} & \code{rip = target} \\
+\instruction{ret} & \code{pop target} & \code{rip = target} \\
+\instruction{jmp target} & 无返回地址动作 & \code{rip = target} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warningbox}
+\instruction{ret} 信任栈顶的返回地址。如果栈上的返回地址被破坏，控制流就会跳到错误位置。这是理解栈溢出、ROP、控制流完整性和影子栈等安全机制的基础。
+\end{warningbox}
+
+\subsection{call 在当前函数 CFG 中怎么画}
+
+普通 \instruction{call} 会把控制流临时交给被调用函数，但如果它会返回，那么当前函数的下一条指令仍然是后继执行点。因此，在当前函数的 intraprocedural CFG 中，普通 \instruction{call} 通常画在基本块内部，而不是块尾的终止指令。块尾仍然由后面的 \instruction{jcc}、\instruction{jmp}、\instruction{ret} 或函数末尾决定。
+
+这和跨函数调用图不同。调用图会画出 \code{caller -> callee} 的边，用来表示函数之间可能调用关系；当前函数 CFG 则关注一个函数内部基本块如何互相到达。两张图解决的问题不同。把 \instruction{call} 当作 CFG 终点，会导致你误以为调用后的代码不可达，进而漏掉返回值使用、错误处理和后续分支。
+
+但是，有些调用确实不返回。例如 \code{abort}、\code{exit}、某些抛异常后不回到当前路径的 helper，或者被编译器标记为 \code{[[noreturn]]} 的函数。对这类调用，当前函数的正常控制流在 call 处结束，下一条指令可能只是对齐填充、冷路径或不可达保护。反汇编里有时会在不返回调用后看到 \instruction{ud2}，用于表示不可达陷阱。
+
+因此，报告里应写清调用类别：普通返回调用、不返回调用、可能抛异常调用、尾调用、间接调用。第一册不展开完整异常控制流，但必须知道 C++ 异常会引入隐藏边：调用可能正常返回，也可能转到异常处理和栈展开路径。若你只看普通 \instruction{ret} 路径，复杂 C++ 函数的真实控制流会被低估。
+
+\subsection{返回地址是控制数据}
+
+返回地址不是抽象概念，它是一段可读写内存里的 8 字节数据。函数调用嵌套越深，栈上保存的返回地址、旧帧指针、局部变量、临时溢出槽就越多。只要某次越界写覆盖了返回地址，后续 \instruction{ret} 就会把错误数据当成代码地址。
+
+从程序正确性角度，返回地址损坏常表现为“函数 return 时崩溃”，但根因往往在更早的位置。比如局部数组越界写、错误的 \code{memcpy} 长度、手写汇编没有恢复 \register{rsp}、调用约定不匹配、把数据指针当函数指针调用，都可能让控制流在 \instruction{ret} 或间接 \instruction{call} 处失控。
+
+从系统安全角度，返回地址是攻击和防御的核心对象。栈 canary 试图在返回前发现栈帧被覆盖；不可执行栈阻止把栈上数据当代码执行；ASLR 让代码地址难预测；CET shadow stack 用硬件维护一份受保护返回地址副本；CFI 检查间接控制流目标是否属于合法集合。这些机制各自复杂，本册只要求理解它们保护的是“控制数据不能被普通数据写坏”这一条主线。
+
+\subsection{call 不是普通 jmp}
+
+\instruction{call} 和 \instruction{jmp} 都会改变 \register{rip}，但它们的契约完全不同。\instruction{jmp} 只是跳走，不留下返回路径；\instruction{call} 会把下一条指令地址写入栈，建立一个预期的返回点。因此，\instruction{call} 同时属于控制流机制和函数调用协议的一部分。
+
+这一区别解释了尾调用优化为什么可以用 \instruction{jmp}。如果当前函数已经不需要自己的栈帧，不需要在被调用函数返回后继续做事，那么它可以把控制流直接交给目标函数，让目标函数最终使用当前栈上的返回地址回到更上层调用者。反过来，如果当前函数在调用后还要加一、恢复寄存器、释放栈空间或处理返回值，就不能简单替换成 \instruction{jmp}。
+
+\instruction{call} 还和 ABI 紧密相连。执行 \instruction{call} 前，调用者必须按 ABI 放好参数并维护栈对齐；执行 \instruction{call} 后，被调用者入口看到的是返回地址位于 \register{rsp} 指向的位置，参数位于寄存器或返回地址上方的栈槽。下一章会系统讲这些规则；本章先抓住控制流事实：返回地址是调用点下一条指令地址，它是 \instruction{ret} 能回来的原因。
+
+\subsection{ret 的目标来自数据}
+
+\instruction{ret} 看起来像“返回到调用者”，但机器层面它只是从栈顶取一个地址写入 \register{rip}。这个地址通常由最近的 \instruction{call} 写入，但硬件不会验证它一定来自合法调用。只要栈顶被覆盖，\instruction{ret} 就会跳到被覆盖后的地址。
+
+这让 \instruction{ret} 同时具有两面性。正常程序利用它实现函数嵌套和返回预测；攻击者可能利用栈破坏构造异常返回路径；防御机制则尝试验证返回地址，例如栈 canary、影子栈、控制流完整性和硬件 CET。作为第一册基础，读者至少要知道：返回地址是普通内存中的控制数据，保护它是系统安全的重要主题。
+
+调试崩溃时，如果 \instruction{ret} 跳到无效地址，不要只看 \instruction{ret} 本身。真正的破坏通常发生在更早的位置：栈缓冲区越界写、错误的 \register{rsp} 恢复、push/pop 数量不匹配、手写汇编误弹参数、调用约定不匹配。要沿着栈状态回溯，找出返回地址何时被写坏。
+
+\section{直接调用和间接调用}
+
+直接调用目标在指令里：
+
+\begin{lstlisting}
+call foo
+\end{lstlisting}
+
+间接调用目标来自寄存器或内存：
+
+\begin{lstlisting}
+call rax
+call qword ptr [rdi + 16]
+\end{lstlisting}
+
+C++ 函数指针：
+
+\begin{lstlisting}[language=C++]
+using Fn = int (*)(int);
+
+extern "C" int call_fn(Fn f, int x)
+{
+    return f(x) + 1;
+}
+\end{lstlisting}
+
+可能汇编：
+
+\begin{lstlisting}
+call_fn:
+    push rbx
+    mov  rbx, rdi
+    mov  edi, esi
+    call rbx
+    add  eax, 1
+    pop  rbx
+    ret
+\end{lstlisting}
+
+这里 \register{rdi} 初始是函数指针，\register{esi} 是参数 \code{x}。调用前要把 \code{x} 放进第一个参数寄存器 \register{edi}，再 \instruction{call rbx}。
+
+间接调用在 C++ 中还来自：
+
+\begin{itemize}
+  \item 函数指针。
+  \item 虚函数调用。
+  \item \code{std::function} 或回调封装。
+  \item 动态链接过程中的 PLT/GOT。
+  \item JIT 生成代码或插件系统。
+\end{itemize}
+
+性能上，间接调用目标不固定，分支预测更难。安全上，间接调用目标需要控制流完整性保护。后面讲分支预测、动态链接和生产库 dispatch 时会继续深入。
+
+\subsection{函数指针和虚函数的控制流形状}
+
+函数指针调用的目标来自数据值。这个数据值可能是参数、结构体字段、全局表项或运行时选择结果。对 CFG 来说，间接调用不是一条指向固定函数的边，而是一组可能目标。静态分析工具可能只能给出保守集合，运行时 profiler 则能记录实际热点目标。
+
+虚函数调用通常还多一层内存读取。对象指针指向对象，对象中有虚表指针，虚表中某个槽位保存目标函数地址。机器层可能类似：
+
+\begin{lstlisting}
+mov rax, qword ptr [rdi]        ; load vptr
+call qword ptr [rax + offset]   ; call virtual function slot
+\end{lstlisting}
+
+这不是“虚函数一定很慢”的证明，而是说明它的控制流目标要到运行时才能从对象动态类型中读出。若编译器能证明动态类型，可能去虚化，把间接调用变成直接调用甚至内联；若不能证明，就要保留间接调用。性能上要看目标稳定性、内联机会、对象布局和实际热点，不要用一句口号判断。
+
+\subsection{PLT/GOT 也是间接控制流}
+
+动态链接中的外部函数调用可能经过 PLT 和 GOT。源码里写 \code{printf}，反汇编里可能先跳到 PLT stub，再通过 GOT 中的地址跳到真实 libc 实现。第一次调用还可能触发动态链接器解析符号，之后 GOT 项被更新，后续调用路径变短。
+
+这说明控制流不只由当前函数源码决定，还受链接方式、PIE、符号可见性、延迟绑定和共享库加载影响。做性能测量时，第一次调用和热身后的调用可能不是同一条路径；做二进制分析时，看到 \code{call printf@plt} 不代表目标函数体就在当前二进制中。
+
+\begin{keyidea}
+直接调用的目标写在指令或重定位里；间接调用的目标来自寄存器或内存。目标越依赖运行时数据，越需要关注预测、内联机会、安全检查和动态链接路径。
+\end{keyidea}
+
+\section{现代 CPU 如何处理分支}
+
+ISA 语义很简单：条件满足就跳，不满足就不跳。但现代 CPU 为了性能不会慢慢等条件算完才取下一条指令。它会预测。
+
+一个简化执行过程：
+
+\begin{lstlisting}
+front-end:
+    fetch bytes at predicted rip
+    decode instructions
+
+branch predictor:
+    predict taken/not taken
+    predict target address
+
+back-end:
+    execute compare/test
+    resolve actual branch direction
+
+retire:
+    if prediction was correct:
+        commit work
+    else:
+        flush wrong-path work
+        restart from correct rip
+\end{lstlisting}
+
+常见预测结构包括：
+
+\begin{itemize}
+  \item 方向预测：这次分支会不会跳。
+  \item BTB：branch target buffer，预测跳转目标地址。
+  \item RSB：return stack buffer，预测 \instruction{ret} 返回到哪里。
+  \item 间接分支预测：预测 \instruction{jmp rax} 或 \instruction{call rax} 的目标。
+\end{itemize}
+
+这解释了为什么控制流会影响性能：
+
+\begin{itemize}
+  \item 可预测分支通常成本低。
+  \item 不可预测分支会造成错误路径清空，浪费前端和后端工作。
+  \item 间接分支目标多时，预测更困难。
+  \item 代码布局会影响取指、I-cache、BTB 和 fallthrough。
+  \item \instruction{ret} 通常依赖 RSB 预测；异常调用模式可能让返回预测变差。
+\end{itemize}
+
+\begin{deepdive}
+这不是说每个分支都要手工消掉。高性能工程里要用数据证明：\code{perf stat} 的 branch misses、采样热点、输入分布、汇编路径长度、内存行为都要一起看。单独盯一条 \instruction{jcc}，很容易做出错误优化。
+\end{deepdive}
+
+\subsection{可预测性来自模式}
+
+分支预测器利用历史模式预测未来。一个循环回边通常很容易预测，因为它在绝大多数迭代中都跳回循环开头，只在最后一次退出。一个判断输入是否为空的分支也可能很好预测，因为生产环境中非空请求占绝大多数。相反，一个根据随机数据位决定走向的分支，可能接近不可预测。
+
+“随机”也要说清楚。完全独立的随机位对方向预测器最困难；周期性模式如真、假、真、假可能被某些预测器学到；长段连续真再长段连续假通常比均匀随机容易；按排序数据扫描时，分支可能只在阈值附近改变一次。输入分布不是一个形容词，而是实验条件的一部分。
+
+这意味着同一段代码在不同输入分布下性能可能完全不同。下面这种代码：
+
+\begin{lstlisting}[language=C++]
+if (a[i] > threshold) {
+    s += a[i];
+}
+\end{lstlisting}
+
+如果 \code{a[i] > threshold} 几乎总为真或几乎总为假，分支预测通常容易；如果真假接近随机各一半，错误预测可能显著增加。把它改成 branchless 形式是否更快，要看 load、add、mask、cmov 或向量指令的成本，以及错误预测减少了多少。
+
+因此，控制流性能实验必须报告输入分布。只说“branchless 版本更快”没有意义；应该说明数据是有序、随机、偏斜、周期性，还是来自真实业务采样。还要说明数据是否足够大到让 cache 行为成为瓶颈，是否经过热身，是否固定 CPU 频率和亲和性。后面测量章节会系统讲这些要求，本章先强调：分支性能不是代码文本单独决定的。
+
+\subsection{branch miss 计数怎么读}
+
+\code{perf stat} 里的 \code{branches} 和 \code{branch-misses} 很有用，但不能孤立解释。首先，不同 CPU、内核版本和权限配置对事件的含义与可用性可能不同。其次，\code{branch-misses} 统计的是硬件事件，不等于源码层 \code{if} 失败次数。循环回边、函数调用返回、间接跳转、编译器生成的边界检查，都可能贡献分支事件。
+
+第三，分支错预测不是唯一瓶颈。一个版本 branch miss 很少，但如果它每次多做几次 load 或形成更长依赖链，仍然可能慢；另一个版本 branch miss 较多，但循环被向量化、内存访问更少，也可能快。性能结论必须把时间、指令数、分支数、miss 比例、cache miss、汇编形态和输入分布一起看。
+
+第四，编译器可能改写你的实验。你写了 \code{if}，优化器可能生成 \instruction{cmovcc}、mask 或向量比较；你写了 branchless，优化器也可能把它识别成选择并重新生成分支。实验前必须检查汇编核心循环。若要对比标量分支和标量 branchless，可能需要禁止向量化、禁止内联、使用合适的数据依赖或单独编译函数。
+
+第五，测量顺序会影响结果。先运行的版本可能承担冷 cache、动态链接、页错误和分支预测器初始状态；后运行的版本可能受益于热数据。严谨实验应交错运行、重复多轮、报告方差或至少报告多次样本。后面测量章节会更严格地规范这些问题；本章先要求你不要用一次运行得出绝对结论。
+
+\begin{warningbox}
+\code{branch-misses} 不是“源码 if 错了几次”的同义词。它是硬件计数器事件，必须和汇编、输入分布、循环形态、内存行为和测量方法一起解释。
+\end{warningbox}
+
+\subsection{代码布局也影响控制流成本}
+
+即使语义相同，基本块排列也会影响取指和预测。编译器可能把常见路径放在顺序 fallthrough 上，把冷错误路径放到远处；可能把异常处理块、断言失败块、慢路径 helper 放在函数末尾或单独的 cold section；也可能根据 profile-guided optimization 重新排列基本块。
+
+代码布局影响 I-cache、指令 TLB、预取、BTB 项局部性和前端带宽。一个热循环如果被很少执行的错误处理代码插在中间，可能增加取指压力；把冷路径移开后，热路径更连续。对小函数来说，这种差异可能不明显；对大型服务、解释器、数据库执行引擎和机器学习 runtime，代码布局会成为真实性能因素。
+
+读反汇编时，如果看到源代码相邻的分支在机器码中被拆远，不要立刻认为编译器“打乱了逻辑”。它可能是在做热冷分离、尾合并、跳转缩短或布局优化。分析报告应从实际地址和基本块边出发，而不是从源码行号顺序出发。
+
+\subsection{分支预测和安全缓解}
+
+现代 CPU 的预测执行提高性能，也带来安全挑战。间接分支预测、返回预测和错误路径执行曾经成为多类侧信道攻击的基础。系统和编译器为此引入了各种缓解，例如限制间接分支预测、插入序列避免某些推测路径、使用间接分支跟踪或控制流完整性检查。
+
+第一册不要求展开这些安全机制，但要形成正确直觉：控制流性能不是纯 ISA 问题。相同源代码在不同编译选项、内核缓解状态、CPU 代际、动态链接方式下，间接调用和返回的成本可能不同。做高质量 benchmark 时，应记录系统环境和编译选项；做跨机器性能比较时，应避免把安全缓解差异误判成算法差异。
+
+\section{控制流阅读流程}
+
+读一段陌生控制流汇编，按下面顺序：
+
+\begin{enumerate}
+  \item 标出函数入口和所有标签。
+  \item 按跳转、调用、返回切分基本块。
+  \item 给每个基本块编号，例如 \code{B0}、\code{B1}、\code{B2}。
+  \item 对每个块写入口寄存器含义。
+  \item 找出块尾的 \instruction{jcc}、\instruction{jmp}、\instruction{call}、\instruction{ret}。
+  \item 如果是 \instruction{jcc}，向上找最近一次设置 flags 的指令。
+  \item 判断条件是 signed、unsigned、相等、非零还是位测试。
+  \item 画边：taken edge 和 fallthrough edge。
+  \item 对循环找回边和退出边。
+  \item 对每条内存访问写地址公式。
+\end{enumerate}
+
+报告里建议使用这种格式：
+
+\begin{lstlisting}
+B0:
+    instructions:
+        test edi, edi
+        jle B2
+    state:
+        edi = x
+        esi = y
+    outgoing edges:
+        if signed x <= 0 -> B2
+        otherwise        -> B1
+
+B1:
+    instructions:
+        lea eax, [rsi+rsi]
+        add eax, 1
+        ret
+    meaning:
+        return y * 2 + 1
+
+B2:
+    instructions:
+        lea eax, [rsi+3]
+        ret
+    meaning:
+        return y + 3
+\end{lstlisting}
+
+\subsection{常见误区}
+
+第一，按源码缩进画 CFG。优化后源码块可能被合并、拆分、重排、内联或删除。正确做法是按机器跳转和标签切分，再回头解释它对应的源码意图。
+
+第二，把每个 \instruction{call} 当成当前函数 CFG 的终点。普通调用会返回到下一条指令，它是基本块内部的一次控制转移；只有不返回调用或异常路径需要特殊处理。
+
+第三，忘记 fallthrough。条件跳转的目标是一条边，下一条指令也是一条边。报告里应明确写出两条边的条件。
+
+第四，只写“跳转到小于”而不写操作数顺序和 signed/unsigned。完整结论必须包含 flags 生产者、消费者和语义，例如“\code{cmp ecx, esi} 后 \instruction{jl} 表示 signed \code{ecx < esi}”。
+
+第五，看到 \instruction{cmovcc} 就说“无分支一定更快”。\instruction{cmovcc} 消除的是控制流分支，不消除数据依赖，也不允许提前执行有副作用或非法访问风险的表达式。
+
+第六，把跳转表当成绝对地址数组而忽略 \register{rip} 相对寻址、索引归一化和范围检查。跳转表分析必须从 range check 开始。
+
+\subsection{高质量控制流报告}
+
+控制流报告应当证明你能恢复结构，而不是把反汇编逐行翻译成中文。建议包含六个部分。
+
+第一，构建条件。写清编译器、优化级别、目标平台、是否 PIE、是否保留帧指针。不同条件会改变基本块布局和调用形式。
+
+第二，函数签名和入口状态。列出参数寄存器和返回寄存器。即使本章重点是控制流，也不能离开 ABI 入口状态读寄存器含义。
+
+第三，基本块表。每个块给出地址范围、核心指令、块尾控制指令。不要无筛选粘贴整段 objdump。
+
+第四，边表。对每条边写明 taken/fallthrough、条件、signed/unsigned、对应 flags 生产者。循环要标出回边和退出边。
+
+第五，数据流摘要。写清累加器、归纳变量、指针递推、地址公式和返回值来源。控制流和数据流必须合在一起，才能解释程序含义。
+
+第六，性能解释边界。如果讨论分支性能，要说明输入分布、预测可能性、是否有间接分支、是否有内存瓶颈、是否有实际计数器证据。没有测量证据时，只能写“可能”，不能写成确定结论。
+
+第七，合流点和循环携带值。对有分支后继续执行的函数，写清每条前驱边进入合流点时哪些寄存器已经准备好。对循环，写清哪些寄存器从上一轮传到下一轮，例如累加器、当前指针、剩余计数和 mask。没有这部分，报告只能说明“代码会走哪里”，还不能说明“值如何跨路径和跨迭代保持正确”。
+
+第八，二进制证据。涉及跳转表、外部调用、PLT/GOT 或重定位时，应给出目标文件和最终可执行文件的差异。目标文件里看到的占位地址、重定位项和最终链接后的运行时地址不是同一层事实。报告要说明自己观察的是哪一层。
+
+\begin{keyidea}
+控制流报告的核心不是“这条指令是什么意思”，而是“这些基本块和边共同允许哪些执行路径，每条路径上数据如何变化，哪些结论来自规则，哪些来自观察”。
+\end{keyidea}
+
+\section{把控制流和数据流一起读}
+
+控制流图只告诉你程序可能走哪些路径，数据流告诉你每条路径上值如何产生、传递和合流。只画 CFG 不追数据，会得到一张空图；只追寄存器不画边，又会在分支、循环和早返回处迷路。真实汇编阅读必须把两者合起来。
+
+看一个简单形态：
+
+\begin{lstlisting}
+test edi, edi
+jle .Lnonpos
+lea eax, [rsi + 1]
+jmp .Ljoin
+.Lnonpos:
+lea eax, [rsi - 1]
+.Ljoin:
+add eax, edx
+ret
+\end{lstlisting}
+
+CFG 说明入口根据 \register{edi} 分成两条路径，随后在 \code{.Ljoin} 汇合。数据流说明两条路径进入 \code{.Ljoin} 前都必须定义 \register{eax}：正数路径定义为 \code{y + 1}，非正路径定义为 \code{y - 1}。合流后 \instruction{add eax, edx} 不关心 \register{eax} 来自哪条路径，只要求每条可达路径都已经准备好它。
+
+如果报告只写“条件满足跳到 \code{.Lnonpos}，否则继续”，还没有解释返回值。如果只写“\register{eax} 最后加上 \register{edx}”，又没有解释 \register{eax} 在不同路径上的来源。合格分析应该写成：
+
+\begin{lstlisting}
+B0:
+    condition: signed x <= 0
+    if true  -> B2
+    if false -> B1
+
+B1:
+    eax = y + 1
+    -> B3
+
+B2:
+    eax = y - 1
+    -> B3
+
+B3:
+    incoming eax:
+        from B1: y + 1
+        from B2: y - 1
+    eax = eax + z
+    return eax
+\end{lstlisting}
+
+这种写法等价于在汇编层恢复一个隐含的 \code{phi}。机器码没有 \code{phi} 指令，但合流点确实存在“根据前驱路径选择值”的语义。理解这点之后，读优化后的分支、循环累加器和条件移动会容易很多。
+
+\subsection{路径条件是数据流的一部分}
+
+路径条件不是只用于画箭头，它还会约束后续数据范围。例如：
+
+\begin{lstlisting}
+test edi, edi
+jle .Ldone
+mov eax, dword ptr [rsi]
+.Ldone:
+ret
+\end{lstlisting}
+
+若 fallthrough 进入 load，说明在该路径上 signed \code{edi > 0}。这个条件可以成为后续推理的前提。编译器优化也会利用这类事实：进入某个块后，某些值已知非零、非负、小于边界、等于某个常量或某个位已设置。人工读汇编时也应把路径条件写入状态表。
+
+路径条件尤其影响循环。进入循环体前可能已经证明 \code{n > 0}；进入某个数组 load 前可能已经证明 \code{i < n}；进入 default 块前可能已经证明 switch 值不在若干 case 中。若你不记录这些条件，就会误以为某些访问缺少检查；若你记录错了，又可能把不安全路径误判为安全。
+
+\subsection{合流点要检查每个前驱}
+
+每个合流点都要检查所有前驱是否提供后续需要的状态。后续需要的状态包括寄存器值、栈指针位置、callee-saved 寄存器恢复情况、flags 是否仍有效、内存是否已经写入。很多隐藏错误都发生在“某条路径忘了准备某个值”。
+
+例如手写汇编中：
+
+\begin{lstlisting}
+test edi, edi
+jle .Lskip
+mov eax, esi
+.Lskip:
+add eax, edx
+ret
+\end{lstlisting}
+
+若 \code{edi <= 0}，执行会直接到 \code{.Lskip}，但 \register{eax} 没有在当前函数中定义。它可能保留调用者留下的旧值，导致结果不可预测。编译器生成的定义良好代码通常不会这样，但手写汇编、错误内联汇编、反汇编混淆和坏优化器 bug 都可能出现类似形态。合流点检查能及时发现问题。
+
+\begin{warningbox}
+控制流分析不能只画边。每个合流点都要写“从每条前驱进入时，后续要用的寄存器和内存状态是什么”。
+\end{warningbox}
+
+\section{条件码选择表要结合操作数顺序}
+
+条件码最常见错误有两个：忘记 Intel 语法的 \instruction{cmp dst, src} 表示 \code{dst - src}，以及把 signed/unsigned 条件码混用。一个实用方法是每次看到条件跳转都写三行：
+
+\begin{lstlisting}
+producer:
+    cmp A, B
+temporary:
+    flags from A - B
+consumer:
+    jl means signed A < B
+    jb means unsigned A < B
+\end{lstlisting}
+
+不要直接写“\instruction{jl} 跳到小于”。小于谁？按 signed 还是 unsigned？操作数顺序是什么？如果这些问题没有回答，条件码分析就没有完成。
+
+\subsection{常用条件码的阅读模板}
+
+下面模板适用于 \instruction{cmp A, B} 后的常见条件：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.30\linewidth}p{0.35\linewidth}}
+\toprule
+条件码 & 读法 & 适用语义 \\
+\midrule
+\instruction{je}/\instruction{jz} & \code{A == B} & 相等，不区分 signed/unsigned \\
+\instruction{jne}/\instruction{jnz} & \code{A != B} & 不相等，不区分 signed/unsigned \\
+\instruction{jl}/\instruction{jnge} & \code{A < B} & signed 小于 \\
+\instruction{jle}/\instruction{jng} & \code{A <= B} & signed 小于等于 \\
+\instruction{jg}/\instruction{jnle} & \code{A > B} & signed 大于 \\
+\instruction{jge}/\instruction{jnl} & \code{A >= B} & signed 大于等于 \\
+\instruction{jb}/\instruction{jc}/\instruction{jnae} & \code{A < B} & unsigned 小于 \\
+\instruction{jbe}/\instruction{jna} & \code{A <= B} & unsigned 小于等于 \\
+\instruction{ja}/\instruction{jnbe} & \code{A > B} & unsigned 大于 \\
+\instruction{jae}/\instruction{jnb}/\instruction{jnc} & \code{A >= B} & unsigned 大于等于 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些助记符有多个别名。别名不是不同指令语义，而是同一条件的不同名字，强调角度不同。例如 \instruction{jb} 和 \instruction{jc} 都看 CF，只是前者强调 unsigned below，后者强调 carry。报告里建议使用能表达源码语义的名字，例如数组长度比较用 unsigned below/above，进位链用 carry/no carry。
+
+\subsection{\instruction{test} 后的条件码不要乱套比较模板}
+
+\instruction{test A, B} 产生的是 \code{A \& B} 的 flags，不是 \code{A - B}。因此 \instruction{test} 后的 \instruction{je} 常表示“按位与结果为 0”，\instruction{jne} 表示“至少有一个被测试 bit 为 1”，\instruction{js} 表示结果最高位为 1。不要把 \instruction{test} 后的 \instruction{jl} 解释成 “A < B”。虽然 flags 组合仍然有定义，但常规大小比较模板基于 \instruction{cmp}/\instruction{sub}，不能直接套到位测试上。
+
+例如：
+
+\begin{lstlisting}
+test edi, 8
+jne .Lhas_bit3
+\end{lstlisting}
+
+这里不是比较 \code{edi} 和 8 的大小，而是测试 bit 3 是否设置。若写成“\code{edi != 8} 时跳转”，就是错误解释。完整说明应为：计算 \code{edi \& 8}，若结果非零，则说明 \code{edi} 的 bit 3 为 1，跳到 \code{.Lhas_bit3}。
+
+\section{循环分析要证明边界}
+
+循环是控制流和数据流最密集的结构。一个合格的循环分析不只是找出回边，还要证明循环从哪里开始、何时结束、每轮访问哪些内存、是否可能多读或少读一个元素。尤其是数组循环，边界证明直接关系到正确性和安全性。
+
+\subsection{四个循环块的工程含义}
+
+许多优化后的循环可以分成四类块：preheader、header、latch、exit。preheader 是进入循环前只执行一次的准备块，常计算结束指针、初始累加器、对齐信息或常量。header 是每次迭代开始处，常包含退出检查或循环体入口。latch 是每轮末尾，更新归纳变量并决定是否回到下一轮。exit 是循环结束后的块。
+
+并非每个循环在机器码中都明显分成四个标签，但这个模型能帮助你找职责。若结束指针在循环前计算，要记录它是循环不变量；若下标在 latch 递增，要记录递增宽度；若退出检查在循环头，是 while-like；若退出检查在循环尾，是 do-while-like 或经过 loop rotation 的形态。编译器可能重排循环，使源码 \code{for} 看起来像 \code{do-while}。不要按源码语法判断机器循环形态。
+
+\subsection{证明数组访问范围}
+
+以典型求和循环为例：
+
+\begin{lstlisting}
+xor eax, eax
+test esi, esi
+jle .Ldone
+xor ecx, ecx
+.Lloop:
+add eax, dword ptr [rdi + rcx*4]
+inc rcx
+cmp ecx, esi
+jl .Lloop
+.Ldone:
+ret
+\end{lstlisting}
+
+边界证明可以写成：
+
+\begin{lstlisting}
+entry:
+    p = rdi
+    n = esi
+    s = 0
+
+precheck:
+    if signed n <= 0, no load happens
+
+loop invariant before load:
+    0 <= i < n
+    rcx = i
+    eax = sum of p[0..i-1]
+
+load:
+    address = p + i * 4
+    width = 4 bytes
+
+latch:
+    i = i + 1
+    if i < n, continue
+    otherwise exit
+\end{lstlisting}
+
+这个证明说明第一次 load 时 \code{i = 0}，最后一次 load 时 \code{i = n - 1}，当 \code{n <= 0} 时没有 load。若没有 precheck，\code{n = 0} 时可能仍执行一次循环，形态就不同。若比较条件是 unsigned，负数 \code{n} 的路径也不同。边界证明必须包含 signed/unsigned 条件。
+
+\subsection{指针递增循环的边界证明}
+
+优化器常把下标循环变成指针递增：
+
+\begin{lstlisting}
+lea rax, [rdi + rsi*4]
+xor ecx, ecx
+.Lloop:
+add ecx, dword ptr [rdi]
+add rdi, 4
+cmp rdi, rax
+jne .Lloop
+mov eax, ecx
+ret
+\end{lstlisting}
+
+这里 \register{rdi} 不再是固定 base，而是当前指针；\register{rax} 是结束指针。报告应写：
+
+\begin{lstlisting}
+initial:
+    cur = p
+    end = p + n * 4
+
+each iteration:
+    load 4 bytes from cur
+    cur = cur + 4
+    continue while cur != end
+\end{lstlisting}
+
+这种循环的正确性依赖进入循环前已经保证 \code{n > 0}，否则 \code{cur == end} 时仍可能先 load 一次。若机器码没有显示 precheck，要查前面是否有单独路径处理空长度。指针递增形式特别容易让初学者忘记 base 已经变化，错误地把每轮访问都写成 \code{p[0]}。状态表必须在每轮更新 \register{rdi} 的含义。
+
+\section{短路逻辑是受保护的控制流}
+
+C++ 的 \code{&&} 和 \code{||} 不只是布尔运算，它们有短路求值规则。机器层面常表现为控制流保护：只有前一个条件允许时，后一个表达式才会求值。这对于避免非法内存访问非常重要。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" int guarded_load(int const* p, int n)
+{
+    if (p != nullptr && n > 0) {
+        return *p;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+一种机器形态可能是：
+
+\begin{lstlisting}
+test rdi, rdi
+je .Lzero
+test esi, esi
+jle .Lzero
+mov eax, dword ptr [rdi]
+ret
+.Lzero:
+xor eax, eax
+ret
+\end{lstlisting}
+
+这里 load 所在块被两个条件共同支配：\code{p != nullptr} 和 signed \code{n > 0}。短路逻辑的安全性就在于，如果 \code{p == nullptr}，第二个条件和 load 都不会以需要解引用 \code{p} 的方式执行。若编译器把 load 提前到 null check 之前，就会改变定义良好路径上的行为或引入非法访问，因此通常不允许。
+
+\code{||} 的保护方向不同：
+
+\begin{lstlisting}[language=C++]
+if (p == nullptr || *p == 0) {
+    return 0;
+}
+return *p;
+\end{lstlisting}
+
+这里只有当 \code{p != nullptr} 时，才能执行 \code{*p}。机器码可能先判断空指针，若为空直接返回；若非空再 load。报告中应写“哪个条件保护哪个 load”。这比笼统写“短路逻辑会跳转”更有用。
+
+\subsection{branchless 不能破坏保护关系}
+
+短路逻辑有时可以被改写成 branchless 数据选择，但前提是被选择的表达式都可以安全求值，且没有副作用或异常边界。比如两个纯整数表达式：
+
+\begin{lstlisting}[language=C++]
+return cond ? a + 1 : b + 1;
+\end{lstlisting}
+
+可能变成 \instruction{cmovcc}。但下面这种不能简单同时求值：
+
+\begin{lstlisting}[language=C++]
+return p != nullptr ? *p : 0;
+\end{lstlisting}
+
+如果先无条件 load \code{*p}，空指针输入会出错。编译器可以使用某些受保护的投机或目标相关技巧，但必须保持语言语义。人工优化时尤其要谨慎，不要为了消除分支而把原本受保护的内存访问提前。
+
+\begin{warningbox}
+branchless 不是无条件更高级。若条件保护了内存访问、除零、溢出检查、函数副作用或异常路径，把控制依赖改成数据依赖可能改变程序语义。
+\end{warningbox}
+
+\section{switch 分析要先找归一化和范围检查}
+
+跳转表是 \code{switch} 最容易吸引注意的部分，但分析跳转表不能从表开始，而要从归一化和范围检查开始。编译器通常会把 case 值转换成从 0 开始的索引，再检查索引是否在表范围内，最后才用索引读取跳转目标或结果表。
+
+例如源码 case 是 10 到 14：
+
+\begin{lstlisting}[language=C++]
+switch (x) {
+case 10: return 1;
+case 11: return 2;
+case 12: return 3;
+case 13: return 4;
+case 14: return 5;
+default: return 0;
+}
+\end{lstlisting}
+
+机器码可能先做：
+
+\begin{lstlisting}
+sub edi, 10
+cmp edi, 4
+ja .Ldefault
+jmp qword ptr [rip + .LJTI + rdi*8]
+\end{lstlisting}
+
+这里 \instruction{sub edi, 10} 把原始 \code{x} 归一化成 \code{x - 10}；\instruction{cmp edi, 4} 与 \instruction{ja} 使用 unsigned 检查。为什么 unsigned 检查可以同时挡住小于 10 和大于 14？因为若原始 \code{x < 10}，归一化后在 32 位无符号视角下会变成很大的数，满足 \code{> 4}，进入 default。这个技巧很常见，报告里必须写清楚，否则会误以为缺少下界检查。
+
+\subsection{跳转表、结果表和位测试不要混淆}
+
+并非所有 \code{switch} 都生成跳转表。若每个 case 只是返回常量，编译器可能生成结果表：
+
+\begin{lstlisting}
+mov eax, dword ptr [rip + table + rdi*4]
+ret
+\end{lstlisting}
+
+这里读取的是返回值，不是跳转目标。若 case 集合稀疏但可以用位集合表示，编译器可能生成 bit test。若 case 数量少，可能生成比较链或二分树。判断依据不是“看到表就是跳转表”，而是看表项如何被使用：表项被加载到 \register{rip} 或作为间接 \instruction{jmp} 目标，才是控制流跳转表；表项被加载到 \register{eax} 返回，就是数据表。
+
+\subsection{default 是安全边界}
+
+对于跳转表，default 不只是语义分支，也是安全边界。没有范围检查，任意输入都可以作为索引读取表外地址，形成任意间接跳转。编译器生成的定义良好 \code{switch} 会保护跳转表索引。手写汇编或二进制漏洞分析中，若看到间接跳转使用未检查索引，就要高度警惕。
+
+报告中分析 \code{switch} 至少写四项：原始 switch 表达式在哪个寄存器，如何归一化，范围检查条件是什么，表项类型是什么。最后再列出 case 到目标块或返回值的映射。顺序不能反过来。
+
+\section{调用边也是控制流边}
+
+在当前函数的 CFG 中，普通 \instruction{call} 通常不是终点，因为它预期返回到下一条指令。但它仍然是一条重要控制流边：执行会暂时离开当前函数，进入另一个函数，可能读写内存、破坏 caller-saved 寄存器、抛异常、调用回调、阻塞、进行系统调用，甚至不返回。分析调用点时，不能只写“调用某函数”，还要说明调用前后状态。
+
+调用点至少有五个问题：
+
+\begin{enumerate}
+  \item 参数是否已经放到 ABI 要求的位置。
+  \item 调用前 \register{rsp} 是否满足对齐规则。
+  \item 调用后哪些寄存器仍可相信，哪些 caller-saved 已失效。
+  \item 返回值从哪里取得，宽度是多少。
+  \item 调用目标是否可能不返回、抛异常或通过指针修改内存。
+\end{enumerate}
+
+例如：
+
+\begin{lstlisting}
+mov edi, eax
+call helper
+add ebx, eax
+\end{lstlisting}
+
+若 \register{ebx} 在调用前保存累加器，它是 callee-saved，调用后仍应保持；\register{eax} 在调用后是返回值，不再是调用前的旧 \register{eax}；\register{edi} 是参数寄存器，调用后不能假设仍等于参数。若 \code{helper} 可能修改 \register{rdi} 指向的内存，调用前后的内存状态也要失效或重新证明。
+
+\subsection{间接调用需要目标集合}
+
+直接调用的目标在反汇编中通常是符号或相对地址；间接调用的目标来自寄存器或内存：
+
+\begin{lstlisting}
+call rax
+call qword ptr [rdi + 16]
+\end{lstlisting}
+
+这种调用不能只写“调用 rax”。报告应尽量恢复目标集合：\register{rax} 来自函数指针参数、虚表槽、回调表、PLT/GOT 入口，还是编译器生成的 thunk？如果无法确定，就写明未知。间接调用对性能、安全和可调试性都更复杂，因为目标预测、控制流完整性、动态绑定和 ABI 适配都可能参与。
+
+\subsection{不返回调用改变 CFG}
+
+若调用目标是 \code{abort}、\code{exit}、\code{__builtin_trap} 或被标注 \code{[[noreturn]]} 的函数，调用后没有正常 fallthrough。编译器可能在 \instruction{call} 后不生成返回路径，也可能放置不可达填充。手工画 CFG 时，要把这类调用作为终点。若误把它当成普通 call，会画出不存在的路径，后续数据流也会出现“未定义值继续使用”的假象。
+
+\begin{keyidea}
+调用点是 ABI、控制流和数据流的交界。读 \instruction{call} 时要同时考虑参数、返回值、寄存器失效、内存副作用和是否返回。
+\end{keyidea}
+
+\section{控制流证据矩阵}
+
+控制流分析经常出现一种问题：报告画了一张 CFG，但没有说明哪些边来自静态反汇编，哪些边在实验输入中真的走过，哪些边只是理论可能，哪些边需要额外测试。为了解决这个问题，可以给每个函数建立控制流证据矩阵。
+
+矩阵至少包含：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.24\linewidth}p{0.25\linewidth}p{0.19\linewidth}}
+\toprule
+边 & 静态条件 & 动态证据 & 备注 \\
+\midrule
+B0 -> B1 & fallthrough, \code{x > 0} & input \code{x=3} hit & then path \\
+B0 -> B2 & taken, \code{x <= 0} & input \code{x=0,-1} hit & boundary covered \\
+B1 -> B3 & unconditional & covered with \code{x=3} & join \\
+B2 -> B3 & unconditional & covered with \code{x=0} & join \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+静态条件来自反汇编和 flags 分析；动态证据可以来自测试输入、GDB 断点、coverage、采样、日志或手工记录。对于性能报告，静态可能路径和实际热路径必须分开。一个错误处理分支静态存在，不代表它影响当前 benchmark；一个分支在测试中未覆盖，也不代表它不重要。
+
+\subsection{边覆盖不是语句覆盖}
+
+源代码语句覆盖不能替代机器边覆盖。优化器可能合并分支、删除分支、把分支改成 \instruction{cmov}，也可能把多个源码条件共享一个机器分支。若你要验证汇编控制流，最好直接以基本块和边为单位记录。
+
+例如短路逻辑：
+
+\begin{lstlisting}[language=C++]
+if (p != nullptr && n > 0) {
+    return *p;
+}
+return 0;
+\end{lstlisting}
+
+测试只覆盖 \code{p != nullptr, n > 0} 的路径，还不能证明空指针保护路径正确。至少要覆盖：
+
+\begin{itemize}
+  \item \code{p == nullptr}，第一条件失败，不能执行 load。
+  \item \code{p != nullptr, n <= 0}，第二条件失败，不能执行 load。
+  \item \code{p != nullptr, n > 0}，执行 load。
+\end{itemize}
+
+机器边覆盖能明确说明每个保护条件都被测试到。对安全关键代码和手写汇编包装函数，这比只看返回值更可靠。
+
+\section{路径条件和断言}
+
+控制流分析得到的路径条件可以转化为测试断言。若某个块只应在 \code{0 <= i < n} 时执行，你可以在调试构建中加入断言，或在 GDB 条件断点中验证。这样能把静态推理和动态检查连接起来。
+
+例如：
+
+\begin{lstlisting}
+Bload:
+    path condition:
+        i >= 0
+        i < n
+    memory:
+        load p[i]
+\end{lstlisting}
+
+对应测试应覆盖：
+
+\begin{itemize}
+  \item \code{i = -1} 应走 out。
+  \item \code{i = 0} 应走 load。
+  \item \code{i = n - 1} 应走 load。
+  \item \code{i = n} 应走 out。
+\end{itemize}
+
+这四个点比随机挑几个正常输入更有价值，因为它们直接验证边界。控制流报告若能列出这些输入，说明作者不仅画了 CFG，还理解了路径条件的意义。
+
+\subsection{不可达路径也要说明原因}
+
+优化后汇编中可能缺少某条源码路径。原因可能是路径在语言规则下不可达、被常量折叠、被内联合并、被 \code{__builtin_unreachable} 或假设消除，也可能是你没看完整二进制。报告中看到路径消失，应说明原因。
+
+例如：
+
+\begin{lstlisting}[language=C++]
+extern "C" int g(unsigned char x)
+{
+    if (x > 255) {
+        return -1;
+    }
+    return x;
+}
+\end{lstlisting}
+
+\code{x > 255} 在类型范围下不可能成立，优化后不会有这条分支。这里“不可达”来自类型范围。另一个例子，如果程序写了 signed overflow 后的检查，编译器可能基于未定义行为前提删除某些路径。这里“不可达”来自语言规则假设，更需要谨慎解释。
+
+\section{循环路径的三种正确性}
+
+循环分析至少有三种正确性：入口正确、迭代正确、退出正确。
+
+入口正确指第一次进入循环体前，循环变量、累加器、当前指针和结束条件已经初始化。如果 \code{n <= 0} 时不应进入循环，入口前必须有检查，或循环形态必须保证先检查再 load。
+
+迭代正确指每轮循环体在路径条件下执行正确工作。例如第 \code{i} 轮读取 \code{p[i]}，更新 \code{s}，然后把 \code{i} 改成 \code{i+1}。如果循环展开，每一轮机器迭代可能处理多个源码元素，报告要写清每个 unrolled lane 对应哪个下标。
+
+退出正确指循环结束时刚好处理了应处理的元素，没有多处理也没有少处理。退出条件可能在头部，也可能在尾部；可能比较下标，也可能比较指针；可能使用 \code{jl}、\code{jne}、\code{jae} 等不同条件码。必须把最后一次迭代和退出边界说清楚。
+
+\subsection{展开循环的边界}
+
+优化器可能把循环展开四次：
+
+\begin{lstlisting}
+.Lloop:
+    add rax, qword ptr [rdi + rcx*8]
+    add rax, qword ptr [rdi + rcx*8 + 8]
+    add rax, qword ptr [rdi + rcx*8 + 16]
+    add rax, qword ptr [rdi + rcx*8 + 24]
+    add rcx, 4
+    cmp rcx, rsi
+    jb .Lloop
+\end{lstlisting}
+
+这段主循环只适合处理能被 4 分块覆盖的部分。真实编译器还需要处理余数，可能在前面计算 \code{n & -4}，后面有 tail loop，或使用条件处理。报告不能只解释主循环，还要找尾部路径。很多 SIMD 和展开 bug 都发生在尾部。
+
+边界说明可以写成：
+
+\begin{lstlisting}
+main loop:
+    processes i, i+1, i+2, i+3
+    advances i by 4
+    valid only while i + 3 < n
+
+tail:
+    processes remaining n % 4 elements
+\end{lstlisting}
+
+如果没有 tail，而接口允许任意 \code{n}，就可能是 bug；如果 wrapper 保证 \code{n} 是 4 的倍数，则需要文档证据。
+
+\section{控制流和错误处理路径}
+
+性能报告往往只关心热路径，但正确性报告不能忽略错误路径。错误路径包括空指针、长度为零、越界、格式错误、系统调用失败、分配失败、unsupported ISA、checksum failed 等。优化构建可能把错误路径放到冷 section，也可能用不返回调用结束。
+
+读错误路径时，要问：
+
+\begin{itemize}
+  \item 错误条件在哪里检测。
+  \item 错误路径是否会继续使用未初始化或非法数据。
+  \item 错误返回值或异常是否符合接口。
+  \item 错误路径是否恢复栈和 callee-saved 寄存器。
+  \item 错误路径是否影响 benchmark timed region。
+\end{itemize}
+
+手写汇编中，错误路径尤其容易忘记恢复寄存器或栈。C++ 中，错误路径可能抛异常、调用日志、分配字符串，导致性能测量中的长尾。报告中应把热路径和错误路径分开，但不能把错误路径当作不存在。
+
+\section{间接控制流的目标恢复}
+
+间接跳转、函数指针、虚函数、PLT/GOT 和跳转表都属于间接控制流。它们共同特点是：指令文本里不直接写最终目标，而是从寄存器或内存取得目标地址。分析间接控制流时，要恢复目标集合。
+
+函数指针调用：
+
+\begin{lstlisting}
+call rax
+\end{lstlisting}
+
+目标可能来自参数、表项、lambda 转换、回调注册或虚拟分发。你需要向上追踪 \register{rax} 的来源。如果来源是 \code{[rdi]} 或 \code{[rdi + offset]}，可能是对象中的函数指针或虚表槽；如果来源是 GOT，可能是动态链接；如果来源是跳转表，目标集合来自 case 表。
+
+\subsection{虚函数调用的第一眼}
+
+C++ 虚函数调用常见形态是先从对象读取 vptr，再从 vtable 读取函数地址：
+
+\begin{lstlisting}
+mov rax, qword ptr [rdi]
+call qword ptr [rax + 16]
+\end{lstlisting}
+
+这里 \register{rdi} 通常是 \code{this} 指针。第一条 load 读取对象开头的 vptr，第二条通过 vtable offset 调用某个虚函数槽。这个形态不是普通结构体字段访问那么简单，它连接了 C++ 对象模型、ABI 和间接调用。优化器若能证明动态类型，可能去虚化，把间接调用改成直接调用甚至内联。若不能证明，间接调用会保留。
+
+报告中看到虚调用形态，应说明目标集合可能包含哪些动态类型，当前构建是否有去虚化证据，性能解释是否考虑间接调用和内联失败。不要只写“调用某个函数”，因为机器码中并没有直接目标。
+
+\section{控制流审查清单}
+
+分析一个函数控制流时，使用下面清单：
+
+\begin{enumerate}
+  \item 是否列出所有基本块入口和出口。
+  \item 每个条件跳转是否写出 taken 和 fallthrough 两条边。
+  \item 每个条件是否注明 flags 生产者和 signed/unsigned 语义。
+  \item 每个合流点是否说明前驱路径提供的寄存器和内存状态。
+  \item 每个循环是否说明入口、迭代、回边、退出和尾部处理。
+  \item 每个短路逻辑是否说明哪个条件保护哪个危险操作。
+  \item 每个 switch 是否说明归一化、范围检查和表项类型。
+  \item 每个 call 是否说明参数、返回、寄存器失效和是否可能不返回。
+  \item 每个间接控制流是否追踪目标来源或承认未知。
+  \item 动态测试是否覆盖关键边界路径。
+\end{enumerate}
+
+这张清单能把控制流报告从“画图”提升到“证明路径”。图画得漂亮但边界不清，仍然不能支持正确性和性能结论。
+
+\section{综合案例：短路保护不能被随意改写}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" int maybe_load(const int* p, int fallback)
+{
+    if (p != nullptr && *p > 0) {
+        return *p;
+    }
+    return fallback;
+}
+\end{lstlisting}
+
+控制流的关键不是有两个条件，而是第二个条件受第一个条件保护。机器码必须保证当 \code{p == nullptr} 时，不会执行 \code{*p} 的 load。一种合理形态是：
+
+\begin{lstlisting}
+test rdi, rdi
+je .Lfallback
+mov eax, dword ptr [rdi]
+test eax, eax
+jle .Lfallback
+ret
+.Lfallback:
+mov eax, esi
+ret
+\end{lstlisting}
+
+CFG 分析应写：
+
+\begin{lstlisting}
+B0:
+    if p == nullptr -> Bfallback
+    else -> Bload
+
+Bload:
+    path condition: p != nullptr
+    v = *p
+    if v <= 0 -> Bfallback
+    else -> Breturn_v
+\end{lstlisting}
+
+如果有人为了“branchless”把它改成先无条件 load，再用条件选择返回值：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi]
+...
+\end{lstlisting}
+
+这会在 \code{p == nullptr} 时崩溃，改变语义。控制依赖在这里是安全条件，不只是性能成本。控制流优化必须证明被提前执行的操作对所有路径都合法。
+
+\subsection{测试如何覆盖这个案例}
+
+至少需要三个输入：
+
+\begin{itemize}
+  \item \code{p == nullptr}，应返回 fallback，且不能 load。
+  \item \code{p != nullptr, *p <= 0}，应返回 fallback。
+  \item \code{p != nullptr, *p > 0}，应返回 \code{*p}。
+\end{itemize}
+
+若只测试第三个输入，错误 branchless 改写也能通过。控制流测试必须覆盖保护失败路径。
+
+\section{综合案例：switch 跳转表的安全边界}
+
+考虑：
+
+\begin{lstlisting}[language=C++]
+extern "C" int classify(int x)
+{
+    switch (x) {
+    case 10: return 100;
+    case 11: return 110;
+    case 12: return 120;
+    case 13: return 130;
+    default: return -1;
+    }
+}
+\end{lstlisting}
+
+优化后可能出现：
+
+\begin{lstlisting}
+sub edi, 10
+cmp edi, 3
+ja .Ldefault
+mov eax, dword ptr [rip + table + rdi*4]
+ret
+.Ldefault:
+mov eax, -1
+ret
+\end{lstlisting}
+
+这里不是跳转表，而是结果表。范围检查使用 unsigned \instruction{ja}，同时处理原始 \code{x < 10} 和 \code{x > 13}。报告要写清：
+
+\begin{lstlisting}
+normalized index = x - 10
+valid range      = 0..3
+out of range     = unsigned index > 3
+table kind       = data table, not jump target table
+\end{lstlisting}
+
+如果表项被用作 \instruction{jmp} 目标，才是控制流跳转表。无论结果表还是跳转表，范围检查都是安全边界。没有范围检查的表索引，可能变成越界读或任意跳转。
+
+\section{自测清单：控制流分析是否过关}
+
+完成本章后，应能回答：
+
+\begin{enumerate}
+  \item 基本块如何切分，fallthrough 为什么也是边。
+  \item \instruction{cmp A, B} 后的条件码如何根据 \code{A-B} 解释。
+  \item signed 和 unsigned 条件码如何区分。
+  \item 合流点如何统一不同前驱路径上的值。
+  \item 循环入口、回边、退出和尾部如何证明。
+  \item 短路逻辑保护了哪些危险操作。
+  \item \instruction{cmovcc} 消除分支时有什么语义前提。
+  \item switch 的归一化、范围检查和表类型如何恢复。
+  \item 普通 \instruction{call} 在当前函数 CFG 中为什么通常不是终点。
+  \item 间接调用如何追踪目标集合。
+\end{enumerate}
+
+\section{深入讲解：控制流优化为什么会改变可读性}
+
+优化器经常把源码控制流改写成机器上更合适的形态。它可能反转条件，让热路径 fallthrough；可能把多个 early return 合并成一个出口；可能把小分支改成 \instruction{cmovcc}；可能把 \code{switch} 改成查表；可能把循环旋转成先执行一次再在尾部判断；可能把错误路径移到冷区域。所有这些都会降低源码形状和机器形状的一一对应。
+
+这不是编译器故意让人难读，而是机器成本模型不同于源码排版。fallthrough 布局影响取指和分支；合并出口可以减少重复 epilogue；条件移动可以避免难预测分支；跳转表可以减少比较链；循环旋转可以让主循环更紧凑；冷路径分离可以改善热路径局部性。
+
+读优化控制流时，不要问“为什么它不按我的 if 写”。要问：这个布局的基本块是什么，路径条件是什么，数据如何在合流点统一，热路径是否更短，错误路径是否仍正确，二进制证据是否支持。源码结构是起点，机器 CFG 才是实际执行对象。
+
+\section{深入讲解：控制流正确性和性能经常拉扯}
+
+有些优化看起来性能更好，但会碰到正确性边界。提前执行 load 可以隐藏延迟，但如果原路径中 load 受 null check 或边界检查保护，就不能提前。把分支改成 \instruction{cmov} 可以减少 branch miss，但两个候选值必须都能安全计算。把 \code{switch} 改成跳转表可以快，但索引必须先范围检查。把错误路径标为 unreachable 可以优化热路径，但前提必须真实。
+
+因此，控制流优化的审查顺序是：先证明合法，再谈性能。合法性包括路径保护、对象生命周期、异常和副作用、除零、溢出、越界、函数调用副作用。只有候选路径都安全，才能把控制依赖变成数据依赖。
+
+性能上也不能简单认为分支越少越好。可预测分支可能很便宜；\instruction{cmov} 可能延长依赖链；查表可能增加内存访问；跳转表可能引入间接分支；合并路径可能增加寄存器压力。真正的选择要看输入分布、热路径、依赖和测量。
+
+\section{课堂讲解：为什么 CFG 是编译器和人工分析的共同语言}
+
+控制流图不是画图作业，而是把程序路径变成可讨论对象的方法。编译器需要 CFG 来做可达性、支配关系、循环分析、数据流分析、异常路径、活跃变量和优化合法性判断。人工阅读汇编时也需要 CFG，因为线性反汇编只显示地址顺序，不显示每条路径在语义上如何分叉和汇合。
+
+基本块是 CFG 的节点，边是控制可能从一个块流向另一个块的关系。这个抽象看似简单，却能统一很多现象。一个 \code{if/else} 是分叉后合流；一个循环是入口、回边和退出；一个早返回是直接通向函数出口；一个 \code{switch} 是范围检查后通向多个目标；一个函数调用在当前函数内通常是“调用后返回到下一条指令”的边；一个不返回调用则终止当前路径。
+
+CFG 的价值在于它迫使读者说明路径条件。看到一个 load，不能只说“这里读取内存”，还要问到达这个 load 的路径上是否检查过指针非空、下标范围、对象生命周期和权限。看到一个除法，不能只说“这里除以寄存器”，还要问除数在所有前驱路径上是否可能为零。看到一个 \instruction{cmov}，要问两个候选值是否都已经安全计算。路径条件是正确性证明的一部分。
+
+\subsection{支配关系把保护条件说清楚}
+
+支配关系的直觉是：如果每条到达 B 的路径都必须经过 A，那么 A 支配 B。这个概念对安全检查特别有用。若一个边界检查块支配数组访问块，说明访问前一定经过检查；若它不支配，就可能存在绕过检查的路径。很多漏洞、崩溃和优化错误都可以用“保护块没有支配危险操作”来描述。
+
+在优化后汇编中，保护条件可能被重排、合并或反转。源码中的 \code{if (p) use(p)} 可能变成先跳过空指针路径，也可能变成错误路径外提。人工分析时不要执着于源码排版，而要看机器 CFG 上是否所有到达 use 的路径都满足非空条件。若危险操作被提前到检查之前，就必须证明它在所有路径上都安全，否则优化不合法。
+
+\section{课堂讲解：控制流性能先问“可预测吗”}
+
+讨论分支性能时，第一问题不是“有没有分支”，而是“目标是否可预测”。一个总是走同一方向的分支，成本通常很低；一个随机方向的分支，可能频繁错误预测；一个和数据分布相关的分支，在排序输入、偏斜输入和随机输入上可能表现完全不同。没有输入分布，分支性能结论是不完整的。
+
+可预测性也不只属于条件分支。间接调用的目标集合是否稳定，虚函数调用是否总是同一动态类型，\instruction{ret} 是否匹配返回地址栈，跳转表索引是否集中在少数 case，循环退出次数是否稳定，都会影响控制流预测。控制流越动态，越需要用数据分布和 PMU 事件支持判断。
+
+branchless 改写也要放在这个框架里。把分支改成 \instruction{cmov} 或掩码运算，可能减少错误预测，但可能增加无条件计算、延长依赖链、增加寄存器压力，甚至破坏短路保护。若原分支高度可预测，branchless 可能更慢。若原分支难预测且两个候选计算都便宜，branchless 才可能有优势。结论必须来自具体 workload。
+
+\subsection{用路径热度读优化后的布局}
+
+优化器常把热路径放在 fallthrough，把冷路径放到远处，或把错误处理块集中到冷区域。线性反汇编中，地址相邻不一定表示语义关系最强；地址遥远也不一定表示不相关。阅读时要结合跳转方向、条件反转和剖析信息，恢复真实热路径。
+
+例如一个边界检查可能写成“越界则跳到冷错误块，否则继续”。这时正常路径没有显式跳转，错误路径有一个 taken branch。若输入几乎都合法，这种布局有利于取指和预测。反过来，如果错误路径也很常见，布局假设就不成立。控制流性能报告应说明热路径假设来自哪里：代码语义、输入数据、profile、样本计数还是硬件事件。
+
+\section{综合案例：边界检查、数据选择和合法提前执行}
+
+考虑一个函数，它在下标合法时读取数组，否则返回默认值。源码上很容易写成一个 \code{if}。优化器可能尝试把条件变成数据选择，例如先计算默认值，再在合法路径读取数组，然后用条件移动选择结果。这个改写是否合法，关键不在于 \instruction{cmov} 本身，而在于数组读取是否仍受范围检查保护。
+
+若机器码先执行数组 load，再用 \instruction{cmov} 选择是否采用 load 结果，那么当下标越界时，即使最终返回默认值，越界 load 也已经发生。这通常不等价于源码语义，可能触发崩溃、泄露信息或读到非法对象。合法的 branchless 改写必须保证所有无条件提前执行的操作在所有路径上都安全，或者只提前执行纯寄存器计算、常量选择等不会触发未定义行为的操作。
+
+这个例子能帮助读者理解控制依赖和数据依赖的区别。原始 \code{if} 让 load 受控制依赖保护；改成数据选择后，选择本身可能是数据依赖，但候选值的计算如果提前，就可能失去保护。人工审查时要问：危险操作是否还在保护路径之后？保护块是否支配危险操作？如果不支配，有没有其他理由证明危险操作总是安全？
+
+性能上也要谨慎。保留分支可能在合法输入上非常可预测；改成 branchless 可能引入额外计算和依赖。若默认路径很少出现，分支版本可能更好。若输入下标随机且两个路径都安全，branchless 才值得实验。正确报告必须同时包含合法性证明和测量证据。
+
+\section{路径覆盖：测试语句不等于测试边}
+
+控制流测试常见误区是只看语句覆盖。一个函数的每一行都执行过，不代表每条边都执行过；每条边都执行过，也不代表关键路径组合都覆盖了。底层错误往往藏在特定边上：错误路径没有释放资源，短路保护被绕过，循环零次执行没有初始化，switch default 没有处理，尾调用路径破坏栈。
+
+边覆盖比语句覆盖更接近 CFG。对于 \code{if/else}，then 边和 else 边都要有；对于循环，要覆盖零次、一次、多次和退出；对于 \code{switch}，要覆盖每个 case、default、边界值和越界值；对于短路逻辑，要覆盖左操作数阻止右操作数执行的路径；对于错误处理，要覆盖每个返回错误码的边。测试设计应从 CFG 反推输入，而不是只从源码行数反推。
+
+路径组合也重要。两个独立条件各自覆盖，不代表四种组合都覆盖。如果后续代码依赖两个条件共同成立，缺少组合测试会漏掉合流点错误。第一册不要求完整路径爆炸分析，但要求读者知道：控制流正确性不只是“跑到那一行”。
+
+\section{循环不变量和退出证明}
+
+读循环汇编时，要写出三个问题：进入循环前什么成立，每次迭代保持什么，退出时什么成立。进入条件决定零次循环是否安全；迭代不变量决定数组访问和累加状态是否正确；退出条件决定返回值或后续访问是否在合法范围内。
+
+例如数组求和循环的不变量可以写成：在每次迭代头部，指针指向第 \code{i} 个元素，累加器等于前 \code{i} 个元素之和，且 \code{0 <= i <= n}。循环体读取第 \code{i} 个元素后，递增指针和 \code{i}，回到头部时不变量仍成立。退出时 \code{i == n}，累加器等于全部元素之和。汇编中的指针递增形式可能没有显式 \code{i}，但不变量仍可用元素计数表示。
+
+优化后循环可能展开、剥离、向量化或拆成主循环和尾循环。不变量要相应分层。主循环每次处理多个元素，尾循环处理剩余元素；展开循环可能有多个 load 和累加器；向量化循环可能有向量累加和水平归约。无论形态如何，边界证明仍然要回答：不会读越界，不会漏元素，不会重复处理，零长度是否安全。
+
+\section{错误路径也是一等路径}
+
+性能代码常把错误路径视为冷路径，但冷不等于不重要。错误路径可能处理空指针、长度不匹配、分配失败、文件打开失败、CPU 不支持某指令、checksum 不一致、系统调用失败。若错误路径没有测试，程序可能在异常条件下泄露资源、返回未初始化值、破坏 ABI 或误报性能结果。
+
+从控制流角度看，错误路径通常有早返回、跳到清理块、调用不返回函数、设置错误码或抛异常。阅读汇编时要确认错误路径是否仍满足函数出口约定：返回值是否设置，栈是否恢复，callee-saved 是否恢复，锁是否释放，已构造对象是否析构。C++ 源码中的 RAII 可以帮助管理资源，但手写汇编或 \code{goto} 清理逻辑仍要人工审查。
+
+benchmark 中也有错误路径。若 candidate checksum 失败，runner 应把样本标为失败并停止性能结论，而不是继续汇总时间。若 perf 权限不足，报告应说明缺少硬件事件，而不是伪造解释。错误路径处理得好，实验系统才可信。
+
+\section{控制流报告模板}
+
+一份控制流分析报告建议包含：
+
+\begin{enumerate}
+  \item 函数身份和构建命令。
+  \item 基本块列表和每个块的入口条件。
+  \item 边列表，包括 fallthrough、taken branch、call、return、tail call 和不返回调用。
+  \item flags 生产者和消费者配对。
+  \item signed/unsigned 条件码解释。
+  \item 循环入口、回边、退出和不变量。
+  \item 短路保护和危险操作的支配关系。
+  \item switch 的范围检查、索引归一化和表类型。
+  \item 热路径假设和输入分布。
+  \item 测试或实验如何覆盖关键边。
+\end{enumerate}
+
+这份模板能防止两类错误。第一类是只翻译指令，不证明路径条件。第二类是只谈分支性能，不证明优化合法。控制流章节的核心就是把这两件事放在一起。
+
+\section{控制流和资源管理}
+
+控制流不仅决定计算路径，也决定资源生命周期。文件打开后哪些路径关闭，锁加上后哪些路径释放，内存分配后哪些路径释放，对象构造后哪些路径析构，都是控制流问题。C++ 的 RAII 能把很多资源释放绑定到对象生命周期，但手写汇编、C 接口、错误码风格代码和性能 kernel 仍然需要显式审查。
+
+在 CFG 中，资源获取点和释放点应形成支配和后支配关系。简单说，所有成功获取资源的路径，最终都应经过释放或转移所有权的路径。若某个早返回绕过释放，就有泄漏；若某个错误路径重复释放，就有 double free；若异常路径没有 unwind 信息，析构可能不发生。控制流图能把这些问题画出来。
+
+性能优化也可能改变资源路径。把错误检查外提、合并出口、使用尾调用、把分支改成条件移动，都可能影响清理逻辑。优化前后必须证明资源语义不变。对于底层库，资源路径错误往往比热路径慢一点更严重。
+
+\section{间接控制流的安全视角}
+
+函数指针、虚函数、跳转表、回调和 PLT 都属于间接控制流。它们的共同特点是目标地址来自数据，而不是指令中固定写死。阅读间接控制流时，要恢复目标集合：可能跳到哪些函数，目标由谁写入，是否经过范围检查或类型检查，是否可能被外部输入影响。
+
+从安全角度，间接控制流需要特别谨慎。越界跳转表可能变成任意跳转；被破坏的函数指针可能劫持执行；虚表指针错误可能调用错误方法；返回地址被覆盖会影响 \instruction{ret}。第一册不展开漏洞利用，但要求读者知道：控制数据也是数据，保护它和保护普通内存同样重要。
+
+从性能角度，间接控制流的目标集合越稳定，预测越容易；目标越多、模式越乱，预测越难。报告应区分安全目标恢复和性能可预测性分析。前者问“可能去哪”，后者问“通常去哪”。
+
+\section{控制流重构的审查原则}
+
+把多个 return 合并成一个出口、把嵌套 if 改成早返回、把分支改成查表、把错误路径移到冷函数、把循环拆成主循环和尾循环，都是控制流重构。审查这类改动时，不能只看代码更短或更快，要确认路径语义不变。
+
+审查可以按路径集合比较。重构前有哪些输入类别，每类走哪些路径，产生什么结果和副作用；重构后是否一一对应。尤其要检查边界输入、错误输入、零次循环、异常路径、资源清理和短路保护。若路径集合变化，应说明这是有意语义变化，而不是隐藏在重构里的 bug。
+
+控制流重构还可能改变调试和测量。合并出口可能让 backtrace 和日志位置变化；冷路径外提可能影响反汇编布局；branchless 改写可能改变 PMU 事件。报告应说明这些变化，不要只写“等价重构”。
+
+\section{路径条件的文字表达}
+
+画 CFG 很重要，但文字表达同样重要。每个关键块旁边应写路径条件，例如“到达此块时 \code{p != nullptr} 且 \code{0 <= i < n}”，“此块只处理 \code{n == 0}”，“此块是 default 路径，说明索引不在表范围内”。路径条件写清楚后，危险操作是否合法就容易检查。
+
+路径条件也是测试设计的来源。若某块条件是 \code{p == nullptr}，就需要空指针测试；若某块条件是 \code{i == n - 1}，就需要尾部测试；若某块条件是越界 default，就需要越界输入。控制流分析和测试不应分离。
+
+\section{控制流章节的综合训练}
+
+综合训练可以选择一个带长度检查、空指针检查、循环、早返回和 \code{switch} 的函数。读者先画源码 CFG，再看 \code{-O3} 汇编恢复机器 CFG，最后比较两者。报告应指出哪些源码块消失了，哪些路径合并了，哪些保护关系仍然成立，哪些输入分布可能影响性能。
+
+这个训练能把本章所有主题连起来：flags、条件码、基本块、循环、switch、call、间接跳转、branchless 和预测。若读者能完成这样的报告，说明控制流已经从语法知识变成分析能力。
+
+\section{控制流知识向调试和优化迁移}
+
+调试时，控制流帮助你判断错误是否可能发生。若崩溃指令被某个检查支配，检查条件就要重新解释；若崩溃路径绕过检查，CFG 能直接指出漏洞；若 backtrace 停在错误处理函数，调用边能帮你回到真正来源。没有控制流，调试只能按线性代码猜测。
+
+优化时，控制流帮助你判断改写是否合法和值不值得。把分支变成数据选择，要证明候选计算安全；把循环展开，要证明尾部正确；把 switch 改表，要证明范围检查仍在；把错误路径外提，要证明资源清理不变。控制流是正确性和性能之间的共同语言。
+
+\section{控制流章节的毕业标准}
+
+完成本章后，读者应能拿一段优化汇编，画出基本块和边，写出路径条件，解释 flags，恢复循环边界，判断 switch 表类型，区分直接和间接调用，并说明输入分布如何影响预测。若只能把 \instruction{jle} 翻译成“小于等于跳转”，还没有达到毕业标准。
+
+毕业标准不要求读者预测每个 CPU 的精确分支代价，但要求读者知道哪些证据缺失。能说“当前只能证明路径形态，不能证明性能，因为缺少输入分布和测量”，也是合格能力。
+
+\section{控制流分析的最后一道问题}
+
+控制流分析结束前，也要问一句：有没有一条路径没有被我解释。未解释路径可能是错误处理、零长度、default、尾部循环、不返回调用、异常路径、间接跳转或编译器分离出的冷块。很多 bug 不在主路径，而在这些被忽略的路径上。
+
+这句话对性能同样有用。若只解释热路径，不解释冷路径为什么冷，报告就缺少输入分布；若只解释 branchless 主体，不解释候选值是否安全计算，报告就缺少合法性；若只解释跳转表，不解释范围检查，报告就缺少安全边界。控制流分析的完整性，来自每条重要边都有名字、有条件、有证据。
+
+当读者能把未解释路径主动列出来，说明他已经不再只是翻译跳转指令，而是在审查程序路径。这是进入 ABI、互操作和 benchmark 的重要门槛。
+
+\section{案例：从 C++ 到 CFG 到汇编}
+
+综合前面内容，分析一个带循环和条件的函数：
+
+\begin{lstlisting}[language=C++]
+extern "C" int sum_positive(int const* p, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        int v = p[i];
+        if (v > 0) {
+            s += v;
+        }
+    }
+    return s;
+}
+\end{lstlisting}
+
+一种分支式汇编：
+
+\begin{lstlisting}
+sum_positive:
+    xor eax, eax
+    test esi, esi
+    jle .Ldone
+    xor ecx, ecx
+.Lloop:
+    mov edx, dword ptr [rdi + rcx*4]
+    test edx, edx
+    jle .Lskip
+    add eax, edx
+.Lskip:
+    inc rcx
+    cmp ecx, esi
+    jl .Lloop
+.Ldone:
+    ret
+\end{lstlisting}
+
+基本块：
+
+\begin{lstlisting}
+B0 entry:
+    s = 0
+    if n <= 0 goto Bdone
+    i = 0
+    goto Bloop
+
+Bloop:
+    v = p[i]
+    if v <= 0 goto Bskip
+    goto Badd
+
+Badd:
+    s += v
+    goto Bskip
+
+Bskip:
+    i += 1
+    if i < n goto Bloop
+    goto Bdone
+
+Bdone:
+    return s
+\end{lstlisting}
+
+地址公式：
+
+\begin{lstlisting}
+p base        = rdi
+i             = rcx
+element width = 4
+load address  = rdi + rcx * 4
+\end{lstlisting}
+
+flags 生产和消费：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+\toprule
+生产 flags & 消费 flags & 语义 \\
+\midrule
+\code{test esi, esi} & \code{jle .Ldone} & signed \code{n <= 0} \\
+\code{test edx, edx} & \code{jle .Lskip} & signed \code{v <= 0} \\
+\code{cmp ecx, esi} & \code{jl .Lloop} & signed \code{i < n} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+编译器也可能使用无分支形式：
+
+\begin{lstlisting}
+.Lloop:
+    mov edx, dword ptr [rdi + rcx*4]
+    test edx, edx
+    cmovle edx, r8d
+    add eax, edx
+    inc rcx
+    cmp ecx, esi
+    jl .Lloop
+\end{lstlisting}
+
+这里假设 \register{r8d} 已经是 0。含义是如果 \code{v <= 0}，把 \code{edx} 变成 0，再无条件加到 \code{s}。这消除了循环体内部的数据相关分支，但引入 \instruction{cmovle} 和数据依赖。哪种更快取决于正数分布、分支可预测性、CPU 和内存瓶颈。
+
+\section{实验：signed 和 unsigned 条件码}
+
+\begin{labbox}
+创建 \filepath{labs/ch12_control_flow/signed_unsigned.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int less_i32(std::int32_t a, std::int32_t b)
+{
+    return a < b;
+}
+
+extern "C" int less_u32(std::uint32_t a, std::uint32_t b)
+{
+    return a < b;
+}
+
+extern "C" int in_range_i32(std::int32_t x)
+{
+    return x >= 0 && x <= 4;
+}
+
+extern "C" int in_range_u32(std::uint32_t x)
+{
+    return x <= 4;
+}
+\end{lstlisting}
+
+生成：
+
+\begin{lstlisting}[language=bash]
+mkdir -p labs/ch12_control_flow/build
+clang++ -std=c++20 -O3 -S -masm=intel \
+  labs/ch12_control_flow/signed_unsigned.cpp \
+  -o labs/ch12_control_flow/build/signed_unsigned.s
+
+clang++ -std=c++20 -O3 -c \
+  labs/ch12_control_flow/signed_unsigned.cpp \
+  -o labs/ch12_control_flow/build/signed_unsigned.o
+
+objdump -d -Mintel \
+  labs/ch12_control_flow/build/signed_unsigned.o \
+  > labs/ch12_control_flow/build/signed_unsigned.objdump.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出 signed 版本使用的 \instruction{setcc} 或 \instruction{jcc}。
+  \item 找出 unsigned 版本使用的 \instruction{setcc} 或 \instruction{jcc}。
+  \item 用 \code{a = -1, b = 1} 的位模式解释 signed 和 unsigned 结果差异。
+  \item 对 \code{in_range_i32(-1)} 和 \code{in_range_u32(0xffffffff)} 解释 flags 和返回值。
+  \item 从 \code{objdump} 中记录至少 6 条机器码字节，并说明每条指令的地址。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：画控制流图}
+
+\begin{labbox}
+创建 \filepath{labs/ch12_control_flow/cfg.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int score(int const* p, int n, int threshold)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        int v = p[i];
+        if (v > threshold) {
+            s += v - threshold;
+        } else {
+            s -= threshold - v;
+        }
+    }
+    return s;
+}
+\end{lstlisting}
+
+分别生成 \code{-O0} 和 \code{-O3}：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O0 -S -masm=intel cfg.cpp -o cfg_O0.s
+clang++ -std=c++20 -O3 -S -masm=intel cfg.cpp -o cfg_O3.s
+clang++ -std=c++20 -O3 -c cfg.cpp -o cfg.o
+objdump -d -Mintel cfg.o > cfg.objdump.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 对 \code{cfg_O0.s} 切分基本块，至少标出入口块、循环条件块、then 块、else 块、回边块、退出块。
+  \item 对 \code{cfg_O3.s} 切分基本块。如果编译器使用 \instruction{cmovcc} 或代数化简，要说明控制流如何变成数据流。
+  \item 画出 \code{-O0} 和 \code{-O3} 的控制流图。可以用文本图、Graphviz 或手绘截图。
+  \item 对每个 \instruction{jcc} 写出：生产 flags 的指令、条件码、taken edge、fallthrough edge。
+  \item 对循环体里的 \code{p[i]} 写地址公式。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：分支和 branchless 对比}
+
+\begin{labbox}
+创建 \filepath{labs/ch12_control_flow/branch_vs_cmov.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <random>
+#include <vector>
+
+extern "C" int sum_branch(int const* p, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        if (p[i] > 0) {
+            s += p[i];
+        }
+    }
+    return s;
+}
+
+extern "C" int sum_mask(int const* p, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        int v = p[i];
+        int mask = -(v > 0);
+        s += v & mask;
+    }
+    return s;
+}
+
+static std::uint64_t now_ns()
+{
+    auto t = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(t).count();
+}
+
+int main()
+{
+    constexpr int n = 1 << 24;
+    std::vector<int> data(n);
+
+    // pattern 1: predictable, all positive
+    std::fill(data.begin(), data.end(), 1);
+
+    volatile int sink = 0;
+    auto t0 = now_ns();
+    for (int r = 0; r < 20; ++r) sink += sum_branch(data.data(), n);
+    auto t1 = now_ns();
+    for (int r = 0; r < 20; ++r) sink += sum_mask(data.data(), n);
+    auto t2 = now_ns();
+
+    std::printf("predictable branch=%llu ns mask=%llu ns sink=%d\n",
+        (unsigned long long)(t1 - t0),
+        (unsigned long long)(t2 - t1),
+        sink);
+
+    // pattern 2: random signs
+    std::mt19937 rng(123);
+    for (int& x : data) {
+        x = (rng() & 1) ? 1 : -1;
+    }
+
+    t0 = now_ns();
+    for (int r = 0; r < 20; ++r) sink += sum_branch(data.data(), n);
+    t1 = now_ns();
+    for (int r = 0; r < 20; ++r) sink += sum_mask(data.data(), n);
+    t2 = now_ns();
+
+    std::printf("random branch=%llu ns mask=%llu ns sink=%d\n",
+        (unsigned long long)(t1 - t0),
+        (unsigned long long)(t2 - t1),
+        sink);
+}
+\end{lstlisting}
+
+构建并观察汇编：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -march=native \
+  branch_vs_cmov.cpp -o branch_vs_cmov
+
+clang++ -std=c++20 -O3 -march=native -S -masm=intel \
+  branch_vs_cmov.cpp -o branch_vs_cmov.s
+
+./branch_vs_cmov
+
+perf stat -e branches,branch-misses ./branch_vs_cmov
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找出 \code{sum_branch} 和 \code{sum_mask} 的汇编核心循环。
+  \item 说明编译器是否自动向量化。如果向量化了，额外用下面参数生成标量版本比较：
+\begin{lstlisting}[language=bash]
+-fno-vectorize -fno-slp-vectorize
+\end{lstlisting}
+  \item 比较 predictable 和 random 两种输入的时间。
+  \item 记录 \code{branches} 和 \code{branch-misses}。如果系统不允许访问 perf 事件，说明权限问题并至少报告运行时间。
+  \item 写出结论：什么时候分支更好，什么时候 mask/branchless 更好，本实验不能证明什么。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：switch 和跳转表}
+
+\begin{labbox}
+创建 \filepath{labs/ch12_control_flow/switch_table.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+
+extern "C" int f0(int x) { return x + 3; }
+extern "C" int f1(int x) { return x + 5; }
+extern "C" int f2(int x) { return x + 8; }
+extern "C" int f3(int x) { return x + 13; }
+extern "C" int f4(int x) { return x + 21; }
+
+extern "C" int dense_dispatch(int op, int x)
+{
+    switch (op) {
+        case 0: return f0(x);
+        case 1: return f1(x);
+        case 2: return f2(x);
+        case 3: return f3(x);
+        case 4: return f4(x);
+        default: return -1;
+    }
+}
+
+extern "C" int sparse_dispatch(int op, int x)
+{
+    switch (op) {
+        case 1: return f0(x);
+        case 17: return f1(x);
+        case 101: return f2(x);
+        default: return -1;
+    }
+}
+\end{lstlisting}
+
+生成：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O3 -fno-inline -S -masm=intel \
+  switch_table.cpp -o switch_table.s
+
+clang++ -std=c++20 -O3 -fno-inline -c \
+  switch_table.cpp -o switch_table.o
+
+objdump -dr -Mintel switch_table.o > switch_table.objdump.txt
+readelf -r switch_table.o > switch_table.reloc.txt
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 判断 \code{dense_dispatch} 是否使用跳转表。
+  \item 判断 \code{sparse_dispatch} 是否使用比较链或其他策略。
+  \item 找出范围检查指令，并解释为什么可能使用 unsigned 条件。
+  \item 如果出现 \code{jmp qword ptr [rip + ... + rax*8]}，写出表项地址公式。
+  \item 在 \code{readelf -r} 中找出和跳转表相关的重定位项，说明目标文件阶段为什么还需要重定位。
+\end{enumerate}
+\end{labbox}
+
+\section{实验：call/ret 和返回地址}
+
+\begin{labbox}
+创建 \filepath{labs/ch12_control_flow/call_ret.cpp}：
+
+\begin{lstlisting}[language=C++]
+#include <cstdio>
+
+extern "C" int twice(int x)
+{
+    return x * 2;
+}
+
+extern "C" int caller(int x)
+{
+    int y = twice(x);
+    return y + 1;
+}
+
+int main()
+{
+    std::printf("%d\n", caller(21));
+}
+\end{lstlisting}
+
+构建带调试信息的版本：
+
+\begin{lstlisting}[language=bash]
+clang++ -std=c++20 -O0 -g call_ret.cpp -o call_ret_O0
+objdump -d -Mintel call_ret_O0 > call_ret_O0.objdump.txt
+\end{lstlisting}
+
+用 GDB 观察：
+
+\begin{lstlisting}[language=bash]
+gdb ./call_ret_O0
+(gdb) break caller
+(gdb) run
+(gdb) disassemble /r caller
+(gdb) info registers rip rsp rbp
+(gdb) x/4gx $rsp
+(gdb) stepi
+(gdb) info registers rip rsp rbp
+(gdb) x/4gx $rsp
+\end{lstlisting}
+
+交付物：
+
+\begin{enumerate}
+  \item 找到 \instruction{call} 指令地址和下一条指令地址。
+  \item 在执行 \instruction{call} 前记录 \register{rsp}。
+  \item 在进入 \code{twice} 后记录 \register{rsp} 和栈顶 8 字节。
+  \item 证明栈顶保存的是返回地址。
+  \item 执行到 \instruction{ret} 前后，记录 \register{rip} 和 \register{rsp} 的变化。
+  \item 对 \code{-O3} 再构建一次，观察是否发生内联或尾调用，并解释差异。
+\end{enumerate}
+\end{labbox}
+
+\section{本章作业}
+
+\begin{exercisebox}
+\subsection*{作业 1：条件码推导表}
+
+给定下面位模式：
+
+\begin{lstlisting}
+a = 0xffffffff
+b = 0x00000001
+\end{lstlisting}
+
+完成表格：
+
+\begin{itemize}
+  \item 把 \code{a}、\code{b} 分别解释成 \code{std::int32_t} 和 \code{std::uint32_t}。
+  \item 对 \code{cmp a, b} 写出 signed 小于、signed 大于、unsigned 小于、unsigned 大于的真假。
+  \item 说明 \instruction{setl}、\instruction{setg}、\instruction{setb}、\instruction{seta} 各会产生 0 还是 1。
+  \item 用文字解释为什么同一个位模式会得到不同结果。
+\end{itemize}
+
+\subsection*{作业 2：控制流图恢复}
+
+对下面汇编恢复控制流图和可能 C-like 伪代码：
+
+\begin{lstlisting}
+foo:
+    xor eax, eax
+    test esi, esi
+    jle .Ldone
+    xor ecx, ecx
+.Lloop:
+    mov edx, dword ptr [rdi + rcx*4]
+    cmp edx, 10
+    jl .Lskip
+    add eax, edx
+.Lskip:
+    inc rcx
+    cmp ecx, esi
+    jl .Lloop
+.Ldone:
+    ret
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 切分基本块。
+  \item 给每条边标注条件。
+  \item 说明每个 \instruction{jcc} 使用 signed 还是 unsigned 语义。
+  \item 写出数组访问地址公式。
+  \item 给出至少一种可能的 C++ 源码。
+\end{enumerate}
+
+\subsection*{作业：合流点和 \code{phi} 思维}
+
+编写一个函数，包含 \code{if/else} 后继续执行公共计算，例如两个分支分别计算临时值，最后统一乘以常数或参与第二次判断。分别生成 \code{-O0} 和 \code{-O3} 汇编，提交不少于 1800 字分析。要求：
+
+\begin{itemize}
+  \item 画出 then、else、join 三类基本块。
+  \item 说明每条前驱边进入 join 时，哪个寄存器或栈槽保存同一个逻辑变量。
+  \item 用伪 \code{phi} 表示合流点的值选择。
+  \item 如果 \code{-O3} 使用 \instruction{cmovcc} 或代数化简，说明控制合流如何转成数据选择。
+  \item 判断 join 块是否被两个分支共同支配，哪些检查支配后续内存访问。
+\end{itemize}
+
+\subsection*{作业 3：switch 反推}
+
+给定：
+
+\begin{lstlisting}
+cmp edi, 5
+ja .Ldefault
+mov eax, edi
+jmp qword ptr [rip + .Ltable + rax*8]
+\end{lstlisting}
+
+要求：
+
+\begin{enumerate}
+  \item 解释为什么 \instruction{ja} 可以同时过滤负数和大于 5 的值。
+  \item 写出跳转表索引公式。
+  \item 假设 \code{.Ltable = 0x5000}，\code{edi = 4}，写出表项地址。
+  \item 说明这是直接跳转还是间接跳转。
+  \item 说明这种结构对分支预测有什么潜在影响。
+\end{enumerate}
+
+\subsection*{作业：数据表、跳转表和重定位}
+
+写两个 \code{switch} 函数：第一个每个 case 只返回不同常量，第二个每个 case 调用不同的 \code{noinline} 函数。使用 \code{-O3 -fno-inline} 生成目标文件和可执行文件，提交不少于 2200 字报告。要求：
+
+\begin{itemize}
+  \item 判断第一个函数是否生成数据表，表项宽度是多少，表项如何被使用。
+  \item 判断第二个函数是否生成跳转表，表项是地址还是偏移。
+  \item 对每个表写出范围检查、索引归一化和表项地址公式。
+  \item 使用 \code{objdump -dr} 和 \code{readelf -r} 找出重定位记录。
+  \item 对比目标文件和最终可执行文件中的表内容差异。
+\end{itemize}
+
+\subsection*{作业 4：call/ret 地址审计}
+
+从任意一个你自己编译的 \code{-O0} 程序中选择一个非内联函数调用，提交：
+
+\begin{itemize}
+  \item \code{objdump -d -Mintel} 中调用者和被调用者的反汇编。
+  \item \instruction{call} 的机器码字节。
+  \item \instruction{call} 指令地址、下一条指令地址、目标函数地址。
+  \item GDB 中 \instruction{call} 前后的 \register{rsp}、\register{rip} 和栈顶值。
+  \item 用具体数值证明返回地址被压栈。
+\end{itemize}
+
+\subsection*{作业：普通调用、不返回调用和尾调用}
+
+编写三个小函数组：普通调用后继续加一；调用 \code{std::abort} 或自定义 \code{[[noreturn]]} 函数；函数末尾直接返回另一个函数结果。生成 \code{-O0} 和 \code{-O3} 汇编，提交不少于 1800 字报告。要求：
+
+\begin{itemize}
+  \item 说明普通 \instruction{call} 在当前函数 CFG 中为什么不是终点。
+  \item 找出不返回调用后的控制流形态，观察是否有 \instruction{ud2} 或不可达块。
+  \item 判断尾调用是否生成 \instruction{jmp}，并解释为什么没有新返回地址入栈。
+  \item 若尾调用没有发生，分析可能的 ABI、栈帧、清理或返回值原因。
+  \item 用调用图和单函数 CFG 分别画出三类调用的差异。
+\end{itemize}
+
+\subsection*{作业 5：分支性能小报告}
+
+基于分支和 branchless 对比实验写一份 1800 字以上报告，必须包含：
+
+\begin{itemize}
+  \item CPU 型号、编译器版本、编译参数。
+  \item 输入数据分布。
+  \item 汇编核心循环。
+  \item 运行时间表。
+  \item branch 和 branch-miss 数据；若无法获得，解释原因。
+  \item 是否发生向量化、内联或 branchless 改写；必须用汇编证明。
+  \item 至少三种输入分布：全真或全假、随机、偏斜或排序。
+  \item 多次运行样本或交错运行设计，避免只用一次计时下结论。
+  \item 结论和限制：不要只写“branchless 更快”或“branch 更快”，必须说明条件。
+\end{itemize}
+
+\subsection*{评分标准}
+
+本章作业按下面标准评价：
+
+\begin{enumerate}
+  \item 是否能从 flags 生产指令追踪到 flags 消费指令。
+  \item 是否能正确区分 signed 和 unsigned 条件码。
+  \item 是否能切分基本块并画出完整边。
+  \item 是否能把地址公式、循环变量和内存访问联系起来。
+  \item 是否能用真实工具输出支持自己的结论。
+  \item 是否明确区分 C++ 语言语义、ISA 语义和微架构性能现象。
+\end{enumerate}
+\end{exercisebox}
+
+\section{本章小结}
+
+本章把单条指令扩展成了程序路径。你应该把控制流理解成三层：
+
+\begin{lstlisting}
+source level:
+    if / while / for / switch / function call
+
+ISA level:
+    cmp/test -> flags -> jcc/setcc/cmov
+    call -> push return address + jump
+    ret  -> pop return address + jump
+    jmp  -> direct or indirect rip assignment
+
+microarchitecture level:
+    prediction, speculation, BTB, RSB, misprediction recovery
+\end{lstlisting}
+
+从性能工程角度，控制流不是孤立问题。它和输入分布、数据布局、内存访问、向量化、代码布局、前端带宽和预测器状态交织在一起。下一章进入 System V AMD64 ABI，把函数调用的参数、返回值、寄存器保存、栈对齐和结构体传递规则讲清楚。到那时，\instruction{call} 和 \instruction{ret} 就不只是跳转，而会成为二进制接口的一部分。
