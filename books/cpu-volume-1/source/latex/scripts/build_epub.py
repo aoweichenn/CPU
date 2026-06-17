@@ -44,6 +44,11 @@ LIST_ENV = {
     "description": "dl",
 }
 
+SKIP_ENV = {
+    "pdfdiagram",
+    "tikzpicture",
+}
+
 CPP_KEYWORDS = {
     "alignas",
     "alignof",
@@ -392,6 +397,10 @@ class LatexBlockConverter:
             begin = re.match(r"\\begin\{([^}]+)\}(.*)", line)
             if begin:
                 env = begin.group(1)
+                if env in SKIP_ENV:
+                    _, i = collect_environment(lines, i, env)
+                    self.flush_paragraph()
+                    continue
                 if env in {"lstlisting", "verbatim"}:
                     code, i = collect_environment(lines, i, env)
                     self.flush_paragraph()
