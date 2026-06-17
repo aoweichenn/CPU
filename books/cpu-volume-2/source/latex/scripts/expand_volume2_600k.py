@@ -1,11 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from pathlib import Path
-
-
-MARKER_BEGIN = "% BEGIN VOLUME2_600K_EXPANSION"
-MARKER_END = "% END VOLUME2_600K_EXPANSION"
 
 
 @dataclass(frozen=True)
@@ -39,112 +34,6 @@ class ChapterPlan:
     cases: tuple[CaseStudy, ...]
     linux_paths: tuple[str, ...]
     project_steps: tuple[str, ...]
-
-
-def paragraph(text: str) -> str:
-    return text.strip()
-
-
-def render_mechanism(chapter: ChapterPlan, mechanism: Mechanism, index: int) -> str:
-    variants = [
-        (
-            f"先把问题收窄到一个可推导的场景：{mechanism.question}。"
-            f"在{chapter.running_problem}里，这个问题不会以术语形式出现，而是以结果不稳定、吞吐不增长、延迟抖动或恢复困难的形式出现。"
-            f"如果一上来只背{mechanism.name}的定义，读者很容易把它当成孤立知识点；更好的顺序是先看朴素方案为什么合理，再看它在真实约束下怎样失败。"
-        ),
-        (
-            f"朴素方案通常是：{mechanism.naive}。这个方案的吸引力在于它贴近单线程直觉，代码短，状态少，测试也容易写。"
-            f"但是它隐含了几个没有说出口的假设：输入总是干净，资源近似无限，执行不会交错，失败不会发生，硬件成本和源码结构大体一致。"
-            f"一旦这些假设被打破，{mechanism.failure}。这时继续在原方案上加 if 或加锁，往往只会把真正的问题埋得更深。"
-        ),
-        (
-            f"{mechanism.name}就是从这个失败里长出来的概念。它的核心模型可以这样理解：{mechanism.model}。"
-            f"这个模型必须同时放在三个层次看。源码层要说明谁读谁写、谁拥有对象、哪个状态允许变化；运行时层要说明线程、队列、任务和 I/O 怎样排队；硬件或系统层要说明缓存、页、调度、文件系统或网络怎样参与成本。"
-            f"三层缺一层，解释都会变形：只有源码层会看不见隐藏成本，只有硬件层会丢失业务语义，只有运行时层又容易把正确性和性能混在一起。"
-        ),
-        (
-            f"观察方法不能停在“跑一下变快了”。这一点在本章尤其重要：{mechanism.observe}。"
-            f"实验要有 reference，要固定输入规模，要记录环境，要把冷启动、预热、核心循环、提交和清理分开。"
-            f"如果工具权限不足，也要写清楚不能观察什么，而不是把猜测写成结论。系统教材的严谨性来自证据链：现象、假设、对照、指标、结论边界。"
-        ),
-        (
-            f"{mechanism.name}也有边界。{mechanism.boundary}。"
-            f"工程判断不是把一个技术推到所有地方，而是知道它在哪些约束下成立。"
-            f"读者在本章应形成一种习惯：每学到一个机制，都要问它解决了什么失败、引入了什么新成本、需要什么测试、在什么输入或部署环境下会失效。"
-        ),
-    ]
-    return "\n\n".join(paragraph(item) for item in variants)
-
-
-def render_case(case: CaseStudy) -> str:
-    return "\n\n".join(
-        paragraph(item)
-        for item in (
-            f"案例“{case.name}”用于把抽象机制落到一段可复现实验。场景是：{case.setup}。这个场景要足够小，小到读者可以手工画出数据流、状态变化和成本路径；又要足够真实，能暴露教材正文讨论的失败模式。",
-            f"第一版不要急着写最终答案，而应保留一个朴素版本：{case.first_try}。朴素版本的价值不是性能，而是语义清楚。它告诉我们结果应该是什么，也告诉我们优化前系统在哪些地方偷懒。",
-            f"第二版再引入改进：{case.improve}。改进必须说明成本迁移到哪里，而不是只说“更快”。例如减少共享写可能增加最终合并成本，批处理可能增加尾延迟，分片可能引入负载倾斜，异步可能让生命周期更难验证。",
-            f"验证时重点看：{case.verify}。报告里至少写出输入规模、硬件或系统环境、编译选项、运行命令、关键指标和反例。若结果与预期不同，优先检查实验变量，而不是马上改代码。"
-        )
-    )
-
-
-def render_linux(chapter: ChapterPlan) -> str:
-    if not chapter.linux_paths:
-        return ""
-    paths = "、".join(f"\\filepath{{{path}}}" for path in chapter.linux_paths)
-    return "\n\n".join(
-        paragraph(item)
-        for item in (
-            f"Linux 源码阅读要从用户态现象倒推入口。本章可围绕 {paths} 做窄范围阅读。不要试图一次读完整子系统，先选择一个问题，例如一次阻塞为什么睡眠、一次缺页怎样建立映射、一次唤醒怎样进入 run queue、一次写回怎样变成持久化边界。",
-            "阅读报告应固定内核版本、阅读路径和实验命令。第一段写用户态最小程序，第二段写观察到的现象，第三段写源码中的关键结构和状态变化，第四段写结论边界。若当前设备不是对应内核，报告必须说明源码只是机制参考，而不是当前运行系统的直接证据。",
-            "源码阅读还要看数据结构，而不只是函数名。队列、树、链表、位图、引用计数、状态枚举、等待队列、页表、inode、bio、task 结构这些细节，决定了机制怎样落地。读者要练习把一个用户态概念翻译成内核对象：线程对应 task，等待对应 wait queue 或 futex 路径，文件缓存对应 page cache，内存策略对应 VMA 和页面分配。"
-        )
-    )
-
-
-def render_project(chapter: ChapterPlan) -> str:
-    steps = "\n".join(f"  {i + 1}. {step}" for i, step in enumerate(chapter.project_steps))
-    diagram = (
-        "\\begin{lstlisting}[numbers=none]\n"
-        "chapter project checkpoints:\n"
-        f"{steps}\n"
-        "\\end{lstlisting}"
-    )
-    return "\n\n".join(
-        paragraph(item)
-        for item in (
-            "把本章落到贯穿项目时，不要只加一个接口或一个 benchmark。每次新增能力都应有语义目标、最小实现、对照实验、指标和失败注入。项目不是堆功能，而是把本章的机制变成可运行、可检查、可复盘的工程对象。",
-            diagram,
-            "项目报告要回答四个问题。第一，朴素版本是什么，为什么不足。第二，改进版本改变了哪个边界，是数据边界、执行边界、同步边界、I/O 边界还是提交边界。第三，证据是什么，哪些指标支持结论。第四，剩余风险是什么，在哪些输入、机器或失败条件下结论可能不成立。只有这样，项目才不会变成代码展示，而会变成系统能力训练。"
-        )
-    )
-
-
-def render_expansion(chapter: ChapterPlan) -> str:
-    parts: list[str] = [
-        MARKER_BEGIN,
-        "",
-        "\\topic{高密度主线补充：从失败推导机制}",
-        "",
-        paragraph(
-            f"{chapter.bridge}这一轮补充专门解决两个问题：第一，避免把本章写成概念枚举；第二，让每个概念都能从{chapter.running_problem}的失败中自然推出。"
-            f"本章的核心失败不是“代码不会写”，而是{chapter.main_failure}。"
-            "所以正文的顺序必须始终保持为：先给出具体任务，再写朴素方案，再观察失败信号，再引入机制，最后给出实验和边界。"
-        ),
-        paragraph(
-            "这样的写法比直接给定义慢一些，但它更接近工程学习的真实路径。真实系统很少把问题包装成选择题；它只会表现为吞吐上不去、CPU 利用率怪、结果偶尔错、队列越积越多、重启后状态对不上、线上延迟突然变长。"
-            "读者要学会从这些现象反推机制，而不是看到术语才想起术语。"
-        ),
-    ]
-    for index, mechanism in enumerate(chapter.mechanisms):
-        parts.extend(["", f"\\topic{{{mechanism.name}}}", "", render_mechanism(chapter, mechanism, index)])
-    parts.extend(["", "\\topic{案例与实验串联}", ""])
-    parts.extend(render_case(case) for case in chapter.cases)
-    linux = render_linux(chapter)
-    if linux:
-        parts.extend(["", "\\topic{Linux 源码阅读与系统观察}", "", linux])
-    parts.extend(["", "\\topic{贯穿项目检查点}", "", render_project(chapter), "", MARKER_END, ""])
-    return "\n".join(parts)
 
 
 CHAPTERS: tuple[ChapterPlan, ...] = (
@@ -300,7 +189,7 @@ CHAPTERS: tuple[ChapterPlan, ...] = (
         main_failure="循环看似简单，但依赖、分支、尾部、对齐和数值语义会决定能否安全向量化",
         mechanisms=(
             Mechanism("标量语义", "一个标量循环在什么条件下可以按多元素一组执行", "把每次迭代都视为独立", "隐藏依赖、别名或异常语义会让向量化不合法", "向量化要求多次迭代之间没有破坏语义的依赖，并且内存访问形状可描述", "查看编译器向量化报告中 accepted 和 missed 原因", "能向量化不代表值得向量化，小输入和内存瓶颈收益有限"),
-            Mechanism("固定宽度类型", "为什么教材代码应使用 std::int32_t 而不是随手 int 或 long long", "用平台默认整数类型", "元素宽度不清会影响 lane 数、溢出边界和文件格式", "SIMD lane 数由向量寄存器宽度和元素位宽共同决定", "在报告中写明数据类型、溢出策略和对齐", "固定宽度类型也不能替代范围检查"),
+            Mechanism("固定宽度类型", "为什么教材代码应使用 \\code{std::int32_t} 而不是平台宽度不清的默认整数类型", "用平台默认整数类型", "元素宽度不清会影响 lane 数、溢出边界和文件格式", "SIMD lane 数由向量寄存器宽度和元素位宽共同决定", "在报告中写明数据类型、溢出策略和对齐", "固定宽度类型也不能替代范围检查"),
             Mechanism("尾部处理", "数组长度不是向量宽度倍数时怎么办", "假设输入长度总能整除", "最后几个元素漏算或越界读取", "尾部可以用标量收尾、掩码 load 或补齐输入处理", "用长度覆盖零、一、小于向量宽度、正好整除和多一", "补齐会改变内存访问和边界，必须保证语义"),
             Mechanism("掩码", "有分支的过滤为什么也能部分向量化", "每个元素 if 判断后 push", "控制流分散导致分支预测和输出位置都困难", "掩码把条件结果变成 lane 上的布尔选择，再配合压缩或 scan 分配输出位置", "比较随机条件、全真、全假和稀疏命中", "mask 计算不是免费，稀疏输出还会受写入形状限制"),
             Mechanism("归约向量化", "sum、min、max 为什么不是简单逐 lane 独立", "把所有 lane 直接写回一个标量", "跨 lane 合并需要水平归约，浮点顺序还会改变", "向量归约先在向量寄存器内累积，最后水平合并", "比较整数和浮点归约的结果稳定性", "浮点优化必须说明可接受误差和确定性要求"),
@@ -581,33 +470,3 @@ CHAPTERS: tuple[ChapterPlan, ...] = (
         project_steps=("实现 split 边界检查", "实现 shuffle manifest", "实现 task attempt 提交表", "实现 checkpoint 恢复", "写端到端故障注入矩阵"),
     ),
 )
-
-
-def insert_expansion(root: Path, chapter: ChapterPlan) -> bool:
-    path = root / chapter.path
-    text = path.read_text(encoding="utf-8")
-    if MARKER_BEGIN in text:
-        return False
-    if chapter.anchor not in text:
-        raise RuntimeError(f"anchor not found in {path}: {chapter.anchor}")
-    expansion = render_expansion(chapter)
-    text = text.replace(chapter.anchor, f"{expansion}\n{chapter.anchor}", 1)
-    path.write_text(text, encoding="utf-8")
-    return True
-
-
-def main() -> int:
-    root = Path(__file__).resolve().parents[1]
-    changed = 0
-    for chapter in CHAPTERS:
-        if insert_expansion(root, chapter):
-            changed += 1
-            print(f"expanded {chapter.path}")
-        else:
-            print(f"already expanded {chapter.path}")
-    print(f"changed chapters: {changed}")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
