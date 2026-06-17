@@ -1,1308 +1,1066 @@
 \chapter{分布式计算模型}
 
-上一章之前，我们一直在单机内部讨论计算。线程共享同一进程地址空间，任务队列里放的是一个 C++ 对象，worker 处理完以后可以直接修改同一块内存，主线程等待 future 或 join 就能拿到结果。现在把同一个日志统计作业拆到多台 worker 上，最先消失的不是某个 API，而是“调用栈会回来”这个假设。Driver 不能把一个 lambda 指针发给另一台机器，也不能把本地引用交给远端。它只能发一条消息，然后等待另一条消息。消息可能晚到、重复、丢失，也可能在远端已经执行完以后只丢失响应。
+分布式计算把计算扩展到多台机器，但同时引入网络通信和故障。共享内存消失后，线程之间的读写变成消息；锁和原子不再直接可用；时间、顺序和失败都变得不可靠。
 
-本章不从 CAP、RPC、Quorum 这些词开始。它们当然重要，但如果读者还没有亲眼看到一个普通任务怎样在网络和故障下变形，这些词只会变成概念清单。我们从一个固定案例出发：一个 driver，三个 worker，一个本机模拟的 \code{MessageBus}，输入日志被切成多个 split。Driver 发送 \code{MapTaskRequest}，worker 读取 split，按 event type 做本地计数，把临时输出写到自己的工作目录，再返回 \code{MapTaskReply}。第一版完全可以在同一个进程里跑，但必须按分布式语义设计：driver 和 worker 不共享业务状态，所有交互都通过消息完成，MessageBus 可以延迟、丢弃、重复和乱序投递消息。
+\section{从共享内存到消息系统}
 
-这个小系统已经足够暴露分布式计算的核心困难。只要响应可能丢失，超时就不能证明 worker 没有执行；只要请求可能重复，输出提交就必须幂等；只要响应可能乱序，driver 就必须区分旧 attempt 和新 attempt；只要 worker 队列可能满，异步发送就必须有背压；只要 driver 可能重启，task table 和 commit table 就不能只留在内存里。分布式系统不是把单机程序搬到网络上，而是把原来隐含在调用栈、共享内存和进程生命周期里的边界全部写成协议。
+单机内存访问通常以纳秒计，网络往返通常以微秒到毫秒计。单机 cache miss 已经很贵，跨网络请求更贵。分布式系统要尽量减少同步往返，使用批处理、流水线、数据本地性和异步通信。
+
+网络还可能丢包、重排、延迟抖动或断开。应用层必须处理超时、重试、重复请求和部分失败。一个请求超时，不代表对方没有执行；重试可能造成重复副作用，因此幂等性非常重要。
+
+\section{RPC、延迟和 in-flight 请求}
+
+RPC 把远程调用包装成类似本地函数调用的形式，但它不是本地函数。参数要序列化，消息要进入内核或用户态网络栈，经过网卡和交换机，到达对端后再反序列化和调度执行。一次 RPC 的固定成本远高于一次函数调用，因此分布式系统要避免细粒度频繁 RPC。
+
+批处理、流水线和异步调用是常见优化。批处理减少每条消息固定开销，流水线隐藏往返延迟，异步调用避免线程阻塞。但它们都会增加错误处理复杂度：部分成功、乱序返回、超时重试和取消都要定义清楚。
+
+RPC 还会隐藏背压问题。本地函数调用如果慢，调用者自然等在当前线程；远程调用如果被异步提交，调用者可能继续制造更多请求，直到队列、连接池或对端服务被压垮。因此 RPC 客户端必须有并发上限、超时、重试预算和排队策略。没有这些边界，异步 RPC 只是把阻塞变成不可控积压。
+
+\topic{时间和顺序}
+不同机器没有完美同步时钟。日志时间戳可以帮助观察，但不能单独作为一致性依据。分布式系统常用逻辑时钟、版本号、任期号和日志索引表达顺序关系。
+
+顺序要区分因果顺序和物理时间顺序。请求 A 触发请求 B，B 因果上发生在 A 之后；但两个机器的墙钟时间可能显示 B 的时间戳更早。协议通常不依赖墙钟证明因果，而是使用请求 ID、版本号、日志索引、任期或向量时钟等逻辑信息。日志时间戳主要用于观测和排查，不应被误用成强一致证据。
+
+\section{超时、重试和幂等}
+
+幂等操作执行一次和执行多次效果相同。分布式系统中，客户端超时后常常不知道服务器是否执行了请求。若请求不是幂等的，重试可能造成重复扣款、重复创建或重复写入。常见做法是给请求分配唯一 ID，服务器记录已处理 ID，并在重复请求时返回同一结果。
+
+幂等设计要落到存储结构。只在客户端生成请求 ID 不够，服务器还要把请求 ID、执行结果和业务状态放在同一个原子提交边界里。否则服务器可能已经修改业务状态，但还没记录请求 ID 就崩溃，重试后仍然重复执行。工程上常用去重表、条件写、事务日志或状态机日志解决这个问题。
+
+\section{故障、降级和背压}
+
+机器可能宕机，进程可能重启，网络可能分区，磁盘可能慢，消息可能重复。多数工程系统采用 crash-stop 或 crash-recovery 模型，不处理任意恶意错误。明确故障模型，是协议设计的第一步。
+
+\topic{数据本地性}
+分布式计算中，移动计算到数据附近通常比移动大量数据更划算。MapReduce、Spark、分布式数据库和对象存储都围绕数据分片、任务调度和网络 shuffle 做权衡。
+
+数据本地性是 NUMA 原则在集群尺度上的版本。单机里远端 NUMA 访问慢，集群里跨机拉取数据更慢；单机里先在线程本地 partial 再合并，集群里先在 map 端 combine 再 shuffle；单机里热点 cache line 会拖慢所有核心，集群里热点 key 会拖慢整个 stage。前面章节的思想在这里不是类比游戏，而是同一原则换了成本单位。
+
+\topic{CAP 的正确理解}
+CAP 不是说系统只能在一致性、可用性、分区容忍性里任选两个。网络分区是分布式系统必须面对的现实；在分区发生时，系统需要在继续响应请求和保持强一致之间做选择。正常情况下，系统仍然要同时追求低延迟、高可用和足够一致。工程讨论要具体到故障场景，而不是只背缩写。
+
+\topic{超时、重试和重试风暴}
+超时不是失败证明，只是本地等待时间超过阈值。请求可能在网络上，可能在对端队列里，可能已经执行但响应丢失，也可能确实失败。重试可以提高成功率，也可能放大过载。如果一个服务已经慢了，所有客户端同时重试，会制造重试风暴，让系统更慢。
+
+健康的重试策略通常包括指数退避、抖动、最大重试次数、总超时预算、幂等保证和熔断。重试预算尤其重要：一个上游请求如果调用十个下游，每个下游都重试三次，总请求量可能迅速膨胀。分布式系统的性能问题常常来自这些控制路径，而不是用户函数本身。
 
 \begin{keyidea}
-分布式系统的第一原则不是“使用网络”，而是承认本地调用栈不再能表达远端执行的完成、失败、重复和恢复。协议字段、状态表、提交点和指标，都是为了把这些失去的保证显式补回来。
+分布式系统的性能问题往往是正确性问题的影子。重试、复制、超时、共识和恢复都会改变吞吐和延迟。
 \end{keyidea}
 
-\section{从一次日志统计作业出发}
+\topic{从共享内存到消息}
+单机多线程里，线程通过共享内存通信。即使共享内存有 cache line、一致性协议和内存序成本，程序仍然可以用一个地址表达共同状态。分布式系统里，这个前提消失了。机器 A 不能直接读取机器 B 的内存；它只能发送消息，请求 B 执行某个操作或返回某份数据。共享变量变成消息，锁变成协议，原子操作变成带版本号或日志索引的提交。
 
-先把任务说具体。输入是一批日志文件，每行包含时间戳、用户 ID 和事件类型。目标是统计每种事件出现次数。串行 reference 很简单：按顺序读所有日志，解析 event type，用一个 map 或数组累加，最后输出按 event type 排序的计数。这个 reference 不追求性能，它只定义语义：哪些输入算有效，解析失败如何计数，每条记录应该贡献几次，最终结果怎样比较。
+这个变化非常根本。单机中一个 mutex 临界区通常在纳秒到微秒级，跨网络的一次协调可能是微秒到毫秒级，还会遇到排队、丢包、重试和对端故障。单机中线程崩溃通常意味着进程整体失败，分布式中一个节点失败后其他节点可能继续运行。单机中内存序由语言和硬件定义，分布式中消息顺序、重复和超时都要由协议处理。
 
-在单机线程池版本里，driver 可以把 split 描述和函数对象放入队列。Worker 线程执行函数，直接把 partial 写进共享数组，最后主线程合并。这里的很多保证来自同一进程：对象地址有效，异常能沿调用栈传播，内存生命周期由同一个运行时控制，进程退出意味着所有 worker 一起消失。即使并发代码有锁、原子和队列成本，通信对象仍然是同一台机器上的地址。
+因此分布式系统不能把远程调用当成本地函数。RPC 库可以隐藏序列化细节，但不能隐藏失败语义。调用者必须问：请求是否到达，对端是否执行，响应是否丢失，重试是否安全，重复请求如何处理，超时后资源如何回收。若这些问题没有答案，系统在正常路径看起来能跑，在故障路径会变得不可控。
 
-把 worker 看成另一台机器后，这些前提全部失效。Driver 不能发送本地指针，因为对端没有相同地址空间；不能发送捕获了引用的 lambda，因为捕获对象只在本进程存在；不能让 worker 直接写 driver 的 vector，因为那块内存不在 worker 上。Driver 只能发送一份可序列化的请求：哪个 job，哪个 stage，哪个 task，哪个 input split，当前是第几次 attempt，deadline 是什么时候，输出应该提交到哪里。Worker 收到请求后，重新定位输入，执行任务，写临时输出，再用响应报告结果摘要。
+\topic{消息的生命周期}
+一条消息从客户端到服务器，至少经过序列化、排队、发送、网络传输、接收、反序列化、调度、执行、生成响应、响应传输和客户端处理。每一步都可能排队，每一步都可能失败。性能报告如果只写“RPC 延迟 3 ms”，还不够；要拆出客户端排队、网络 RTT、服务端队列、执行时间和响应排队。
 
-\begin{lstlisting}[language=C++,caption={日志统计作业的输入和请求语义}]
-struct InputSplit {
-    std::uint64_t split_id = 0;
-    std::uint64_t file_id = 0;
-    std::uint64_t begin_offset = 0;
-    std::uint64_t end_offset = 0;
+消息还需要身份。没有 request id，客户端无法把响应和请求可靠对应；没有 attempt id，服务端无法区分第一次请求和重试；没有 trace id，观测系统无法串起跨节点路径；没有 partition id，shuffle 系统无法知道数据应写到哪里。系统工程中，消息头不是形式，它承载正确性和观测性。
+
+\begin{lstlisting}[language=C++,caption={本机模拟用的消息元数据}]
+struct MessageHeader {
+ std::uint64_t request_id = 0;
+ std::uint32_t source_worker = 0;
+ std::uint32_t target_partition = 0;
+ std::uint32_t attempt = 0;
 };
 
-struct MapTaskRequest {
-    std::uint64_t job_id = 0;
-    std::uint64_t stage_id = 0;
-    std::uint64_t task_id = 0;
-    std::uint32_t attempt = 0;
-    std::uint64_t request_id = 0;
-    InputSplit split;
-    std::uint32_t target_partition_count = 0;
-    std::uint64_t deadline_milliseconds = 0;
-};
-
-struct MapTaskReply {
-    std::uint64_t request_id = 0;
-    std::uint64_t task_id = 0;
-    std::uint32_t attempt = 0;
-    std::uint32_t status = 0;
-    std::uint64_t output_records = 0;
-    std::uint64_t output_bytes = 0;
-    std::uint64_t output_checksum = 0;
+struct ShuffleMessage {
+ MessageHeader header;
+ std::vector<std::int32_t> keys;
+ std::vector<std::int64_t> values;
 };
 \end{lstlisting}
 
-这段代码不是为了展示网络库，而是为了把语义字段摆到桌面上。\code{task_id} 是逻辑任务身份，同一个 input split 重试时不变；\code{attempt} 是物理执行身份，每次重试递增；\code{request_id} 是一次消息交互身份，用于匹配请求和响应；\code{deadline_milliseconds} 是这次请求的预算；\code{output_checksum} 让 driver 不必只相信一句“我完成了”。如果这些字段缺失，后面的失败路径都会变成猜谜。
+这段代码不是网络协议实现，但它展示了分布式消息需要的基本边界。request id 用于幂等和去重，source worker 用于观测和调试，target partition 用于路由，attempt 用于重试分析。真实系统还会有校验、版本、压缩格式、认证信息和时间戳。
 
-\topic{为什么不能只发函数名}
+\topic{延迟、吞吐和 in-flight 请求}
+分布式系统里，吞吐往往依赖足够的 in-flight 请求。一个请求的往返延迟可能很高，如果客户端每次只发一个请求，吞吐会被 RTT 限制。流水线允许多个请求同时在网络中飞行，提高吞吐。但 in-flight 太多会导致队列积压、内存占用上升、对端过载和尾延迟恶化。
 
-初学者常说：driver 发一个 \code{runMap(splitId)} 不就行了吗？这个想法的问题不在于函数名错误，而在于函数名只描述“做什么”，没有描述“这次执行是谁”。当响应回来时，driver 需要判断它属于哪个 job、哪个 stage、哪个 task、哪个 attempt，是否已经过期，是否来自旧路由，是否能提交结果。函数名无法回答这些问题。
+这和 CPU 的内存级并行度很像：核心可以同时挂起多个 cache miss 来隐藏延迟，但 miss 太多会占满 load buffer；客户端可以同时发多个 RPC 来隐藏 RTT，但请求太多会占满队列和连接。系统要有并发窗口，窗口大小要由延迟、吞吐、错误率和对端能力共同决定。
 
-本地函数调用把身份藏在调用栈里。调用者进入函数体，函数体返回到调用者，返回值天然对应这一次调用。远程调用没有这条栈。请求和响应在不同线程、不同队列、不同机器上流动，中间可能经过重试、超时、排队和连接复用。响应到达时，driver 看到的只是一包字节。没有身份字段，它无法知道这包字节应该改变哪个状态。
+一个简单模型是 Little's Law：在稳定系统中，平均并发数约等于吞吐乘以平均延迟。若希望每秒处理 10000 个请求，平均延迟 10 ms，则系统中大约有 100 个请求在飞行。这个模型不能替代测量，但能帮助你判断一个并发上限是否荒谬。
 
-所以消息头不是装饰，它是分布式系统的控制面。它携带的不是“日志上好看”的信息，而是协议判断需要的信息：这条响应是否重复，是否属于当前 attempt，是否还能提交，是否应该触发重试，是否应该刷新路由。很多分布式 bug 不是用户函数算错，而是消息身份不清导致旧响应覆盖新状态、重复 attempt 重复提交、超时请求在后台继续写入。
+\topic{超时不是取消}
+客户端超时只表示客户端不再等待，不表示服务器停止执行。服务器可能已经完成业务状态修改，只是响应丢失；也可能还在队列中等待；也可能稍后才执行。若客户端超时后立即重试，而操作不是幂等的，就会重复副作用。若客户端释放请求上下文，但底层完成回调稍后到达，就可能访问已释放对象。
 
-\topic{从内存对象到 wire format}
+因此超时要配合取消和幂等。取消是尽力而为，不一定成功；幂等保证重复执行的外部效果可控；请求上下文保证完成路径无论成功、失败、超时还是取消，都能安全回收。异步 I/O 章节里的生命周期问题，在分布式 RPC 中更严重，因为远端是否执行不是本地进程能完全控制的。
 
-上面的 C++ 结构体是教学模型，不等于真实 wire format。真实网络协议要定义字节序、字段长度、版本、校验、payload 长度和兼容策略。不能把一个 C++ struct 的内存直接写到 socket，因为 padding、对齐、大小端和 ABI 都可能不同。同一段代码在不同编译器、不同平台或不同编译选项下，结构体布局可能变化。协议格式必须按字节定义，而不是按当前进程的内存布局定义。
+\topic{幂等提交点}
+幂等性不是“重试时先查一下”这么简单。真正的幂等需要把请求 ID、业务状态修改和响应结果放在同一个提交边界里。考虑转账、创建订单或写检查点：如果服务器先修改业务状态，随后记录 request id 前崩溃，重试时看不到旧 request id，就可能重复执行；如果先记录 request id，但业务状态没修改就崩溃，重试时又可能误以为已经成功。
 
-教学项目可以先用进程内对象模拟消息，但文字和接口要保留清楚边界：\code{MapTaskRequest} 表示逻辑消息，MessageBus 内部可以直接移动对象；如果未来改成 socket，必须加入编码层，把逻辑消息转成稳定字节流。这样做能避免一个常见误解：本机模拟不是因为分布式系统“本质上就是函数调用”，而是为了在单机上先验证协议语义。
+一种常见设计是把请求处理当作状态机事务：检查 request id 是否已处理；若已处理，返回保存的结果；若未处理，执行业务修改，同时写入 request id 和结果；提交后再返回。这个过程可以用数据库事务、共识日志或本地 WAL 实现。关键是提交点必须清楚。
 
-\begin{lstlisting}[language=C++,caption={协议头部应表达的稳定字段}]
+\topic{消息顺序和重复}
+网络可能重排消息。客户端发送 A 再发送 B，不代表服务器一定先处理 A。即使 TCP 在单连接内保持字节顺序，应用层多连接、多队列、多线程处理仍可能改变完成顺序。协议如果依赖顺序，就必须显式携带序号、版本或日志索引。
+
+消息还可能重复。客户端重试会重复发送，网络代理可能重放，服务端超时后客户端又发下一次 attempt。服务端必须决定重复消息如何处理：直接丢弃、返回旧结果、合并、覆盖还是报错。没有 request id 和幂等表，重复消息通常无法安全处理。
+
+\topic{故障检测的模糊性}
+分布式系统无法可靠地区分“节点死了”和“节点很慢”。心跳超时可能因为节点崩溃、网络拥塞、GC 暂停、磁盘卡顿、CPU 被抢占或调度延迟。把慢节点误判为死节点可能导致重复调度和资源浪费；把死节点长期当成活节点会拖慢恢复。故障检测本质上是基于超时的怀疑，不是数学证明。
+
+工程上通常使用多次心跳、租约、任期、健康检查、慢节点隔离和人工可观测指标。对计算任务而言，可以把慢任务 speculative retry 到其他节点，但要处理重复输出；对存储副本而言，不能轻易让旧 leader 继续写，需要任期和共识保证。故障检测和一致性协议紧密相连。
+
+\topic{部分失败和降级}
+单机程序常常整体成功或整体失败，分布式系统经常部分失败。一个查询请求可能需要访问十个分片，其中九个成功、一个超时。系统要定义结果：失败整个请求，返回部分结果，使用缓存旧值，还是降级为近似结果。这个选择取决于业务语义。
+
+搜索结果可以返回部分分片并标记结果不完整；计费系统不能忽略一个失败分片；监控系统可以延迟补齐；推荐系统可以使用缓存。分布式教材不能只讲协议，还要让读者看到业务语义如何决定失败处理。
+
+\topic{背压和重试预算}
+分布式背压要跨节点传播。服务端队列满时，应让客户端降低发送速率、拒绝低优先级请求或返回明确错误。若服务端已经过载，客户端仍按固定策略重试，只会放大故障。健康的客户端要有最大并发、总超时、重试次数、指数退避、抖动和熔断。
+
+重试预算可以按上游请求计算。例如一个用户请求最多允许产生 20 次下游调用尝试，超过就停止重试并返回错误。这样可以防止多层服务各自重试导致请求量指数膨胀。预算还应被观测：报告中要记录原始请求数、重试请求数、超时数、最终失败数和重试原因。
+
+\topic{数据本地性和调度}
+分布式计算里，调度任务时要考虑数据位置。若输入分片在节点 A，本地执行可以避免网络读取；若节点 A 忙或失败，可以远程读取或复制数据，但要付出网络成本。数据本地性不是绝对规则，而是调度决策的一项成本。
+
+这和 NUMA 类似。单机里，线程靠近内存节点更快；集群里，任务靠近数据分片更快。若本地节点排队很长，远程执行可能更快；若远程网络拥塞，本地等待更好。调度器需要把数据位置、队列长度、节点健康、资源类型和任务优先级一起考虑。
+
+\topic{本机多进程模拟}
+本册不要求读者立刻搭建真实集群。可以先用本机多进程或多线程模拟分布式系统：每个 worker 有自己的输入分片和消息队列，driver 负责分配任务，网络用有界队列和随机延迟模拟，故障用随机丢弃、超时和重复消息模拟。这样可以在一台机器上训练协议思维。
+
+模拟不能证明真实网络性能，但能验证语义：请求 ID 是否去重，重试是否幂等，队列是否背压，检查点是否能恢复，重复输出是否被提交协议挡住。先在本机把语义做清楚，再迁移到真实网络环境，风险更低。
+
+\topic{RPC 不是函数调用}
+远程调用看起来像函数调用，但语义完全不同。本地函数调用要么进入函数体，要么在调用前就失败；调用栈、对象生命周期和异常传播都在同一进程内。RPC 经过序列化、发送队列、内核网络栈、网卡、交换机、对端内核、服务端队列、业务线程、响应路径。任何一段都可能排队、失败、重复、超时或部分完成。把 RPC 当成本地函数，是分布式系统设计里最常见的错误之一。
+
+RPC 的调用者必须接受一个事实：超时后不知道远端到底发生了什么。远端可能没有收到请求，可能收到但还没执行，可能已经执行并提交，可能响应丢失，可能响应正在返回。这个不确定性决定了幂等、请求 ID、重试预算和提交点不是附加功能，而是 RPC 的基本语义。只要系统允许超时重试，就必须回答重复请求如何处理。
+
+服务端也不能把 RPC 当成本地函数。请求进入服务端后，首先进入接收队列，再由某个 worker 处理。若业务处理很慢，接收队列会增长；若队列无限，内存会增长；若队列有限，客户端会遇到拒绝或超时。服务端处理完后，响应也可能在发送队列中等待。一次 RPC 的延迟不是业务函数耗时，而是排队、执行、序列化和网络共同组成的端到端路径。
+
+\topic{消息边界和协议版本}
+分布式系统中，消息必须有明确边界。TCP 是字节流，不保留应用层消息边界；一次 \code{write} 不等于对端一次 \code{read}。应用协议需要 framing，例如固定长度头部加变长 body，或者长度前缀，或者分隔符。没有 framing，服务端无法可靠知道一条消息在哪里结束，下一条消息在哪里开始。
+
+消息还需要版本。系统升级时，客户端和服务端可能不是同一版本。若消息结构只按当前代码隐式解析，一次滚动升级就可能造成字段错读。稳健协议会在 header 中放 protocol version、message type、flags、payload length 和 checksum。新增字段要有默认值，删除字段要经历兼容期。分布式系统的接口不是函数签名，而是长期存在的协议合同。
+
+\begin{lstlisting}[language=C++,caption={消息头部的语义字段}]
 struct WireHeader {
-    std::uint16_t protocol_version = 1;
-    std::uint16_t message_type = 0;
-    std::uint32_t flags = 0;
-    std::uint64_t request_id = 0;
-    std::uint32_t payload_bytes = 0;
-    std::uint32_t checksum = 0;
+ std::uint16_t protocol_version = 1;
+ std::uint16_t message_type = 0;
+ std::uint32_t flags = 0;
+ std::uint64_t request_id = 0;
+ std::uint32_t payload_bytes = 0;
+ std::uint32_t checksum = 0;
 };
 \end{lstlisting}
 
-协议版本看似琐碎，实际很关键。分布式系统升级通常不是所有节点同时重启。某些 worker 可能已经运行新版本，某些 worker 还在旧版本。新增字段要有默认值，旧节点要能忽略未知字段，新节点要能读旧消息。教学项目可以暂时要求同版本运行，但教材必须说明这是简化，不是工程事实。
+这段代码只是表达字段，不是跨平台二进制协议的完整实现。真实协议还要定义字节序、对齐、字段编码、字符串格式和兼容规则。不要直接把 C++ 结构体内存写到网络里，因为 padding、大小端、编译器布局和 ABI 都可能不同。协议格式要按字节定义，而不是按当前进程的内存布局定义。
 
-\topic{输入 split 的边界不是随便切}
+\topic{序列化的成本和边界}
+序列化不是简单的“把对象转成字节”。它会消耗 CPU、分配内存、访问字段、复制数据、计算校验，可能还要压缩。对象布局如果适合本地计算，不一定适合网络传输；网络格式如果紧凑，也不一定适合 CPU 直接计算。高性能系统常在内部布局和 wire format 之间做显式转换。
 
-日志统计作业里，input split 也不能写得太抽象。如果按文本文件的字节范围切分，split 的 begin offset 可能落在一行中间。非零 begin 应先跳到下一行起点，end 可以读到当前行结束。否则两个 worker 可能重复读一行，或者都跳过同一行。分布式系统中很多“结果偶尔不对”的 bug，就来自这些被当作小事的输入边界。
+零拷贝也不是免费。要真正避免拷贝，需要缓冲区生命周期跨越发送完成，不能在发送返回后立即复用；需要处理分片、对齐和 scatter-gather；还要保证应用不能在内核或网卡尚未发送完成时修改内容。许多系统先用清晰的复制式协议做正确，再对热点路径引入缓冲池和批量发送。不要在协议语义没清楚时追求零拷贝。
 
-二进制格式也类似。固定长度记录可以按记录大小对齐；变长记录需要块目录、索引或同步标记。Split 元数据要持久化，因为失败后重试必须读取同一个逻辑范围。若重试时重新按当前文件大小切分，输入发生变化就会破坏 reference 语义。分布式计算的正确性从输入合同开始，不是从 RPC 开始。
+序列化还影响故障恢复。检查点文件、shuffle manifest、任务提交表都需要稳定格式。若格式依赖当前类定义，代码升级后旧检查点可能无法读取。一个工程化系统应为持久化数据定义版本和迁移策略。分布式计算不是只在网络上传消息，还要把状态写到磁盘，并在失败后读回来。
 
-\topic{身份字段的作用域}
+\topic{逻辑时间和因果关系}
+分布式系统不能依赖全局精确时钟来判断所有事件顺序。机器之间时钟会漂移，NTP 会校正，进程会暂停，网络延迟不稳定。物理时间适合做超时、租约和观测，但协议正确性常需要逻辑时间。最简单的逻辑时间是单调递增版本号、epoch、term 或日志索引。它们不表示真实时间，而表示协议中的先后和所有权。
 
-\code{job_id}、\code{stage_id}、\code{task_id}、\code{attempt}、\code{request_id} 不是越多越好，而是各自回答不同问题。Job 表示一次完整作业；stage 表示一组依赖相同输入的任务；task 表示一个逻辑输入 split 或 reduce partition；attempt 表示某个 task 的一次物理执行；request 表示一次消息发送。若把它们混成一个 ID，代码短一些，但恢复、去重和观测会变得混乱。
+例如 driver 每次发布新的路由表版本，就把 epoch 加一。Worker 收到旧 epoch 的任务，可以拒绝并要求刷新。Raft 的 term 也是类似思想：旧任期的 leader 即使还活着，也不能继续以旧身份提交新写。逻辑时间让系统能区分“我看到的状态”和“当前合法状态”。
 
-作用域也要说清。\code{task_id} 可以只在一个 stage 内唯一，也可以在整个 job 内唯一；\code{request_id} 可以由 driver 全局递增，也可以按 worker 分配范围；\code{attempt} 通常只在 task 内有意义。日志和提交表必须能从字段组合唯一定位对象。例如提交表按 \code{job_id, stage_id, task_id} 去重，而不是按 \code{request_id} 去重。因为响应丢失后重试会产生新的 \code{request_id}，但逻辑任务还是同一个。
+向量时钟能表达更细的因果关系，但成本更高。很多系统不需要完整向量时钟，只需要针对某个资源的版本号。教材阶段要让读者理解：当两个事件分布在不同机器上时，肉眼时间先后不一定可靠；协议需要自己的顺序标记。
 
-\topic{本章固定拓扑}
+\topic{请求 ID 的设计}
+请求 ID 不是随机数装饰，而是去重、追踪、幂等和调试的核心。一个请求 ID 至少应在一次逻辑操作内稳定，重试 attempt 不应改变逻辑 request id。否则服务端无法知道两次到达的请求其实是同一个操作的重复。Attempt id 可以单独增加，用于观测和超时分析。
 
-本章后面所有机制都围绕同一个拓扑展开。Driver 维护 task table 和 commit table。Worker 0、Worker 1、Worker 2 各有接收队列、执行线程和临时输出目录。MessageBus 负责把 driver 请求放到目标 worker 队列，把 worker 响应放回 driver 队列。为了训练协议思维，MessageBus 支持四个故障开关：延迟某条消息，丢弃某条消息，重复投递某条消息，改变响应到达顺序。
+请求 ID 的生成要考虑冲突范围。单机自增 ID 在单个进程内简单，但跨进程和重启后需要节点 ID、时间段或持久化计数。随机 ID 冲突概率低，但调试时不如结构化 ID 直观。雪花类 ID 把时间、节点和序列号组合起来，但依赖时钟行为。教学项目可以使用 driver 分配的 \code{std::uint64_t} 递增 ID，因为它在本机模拟里足够清楚；真实系统要写明冲突域和重启策略。
 
-\begin{lstlisting}[numbers=none]
-Driver
-  task table: task_id -> state, attempt, request_id, deadline
-  commit table: task_id -> committed attempt, output checksum
-  send MapTaskRequest to MessageBus
-
-MessageBus
-  delay / drop / duplicate / reorder
-  enforce bounded queues and in-flight windows
-
-Worker
-  receive request
-  execute split
-  write temporary output
-  send MapTaskReply
-\end{lstlisting}
-
-这个拓扑很小，但它已经覆盖分布式模型最重要的失败：请求可能没有到达，响应可能没有回来，worker 可能执行完却被 driver 当作超时，多个 attempt 可能同时存在，队列可能积压，driver 可能崩溃后丢失内存状态。后面所有概念都从这些路径里推出来。
-
-\section{Driver 状态表和正常路径}
-
-单机函数调用依赖调用栈保存状态。函数还没返回时，调用者的栈帧还在；函数返回后，返回值进入调用者；异常沿栈传播。分布式系统没有一条跨机器的调用栈，所以 driver 必须把“我发了什么、等什么、当前能接受什么响应”写成显式状态表。没有状态表，正常路径看起来能跑，故障路径一来就会失控。
-
-状态表不能由一堆 bool 拼起来。比如 \code{sent=true}、\code{done=false}、\code{retrying=true}、\code{failed=false} 看似灵活，实际会出现很多非法组合。一个 task 不应该同时是 committed 和 retrying，也不应该在没有 request id 的情况下处于 running。用单一枚举表达主状态，再配合 attempt、deadline 和 retry count，代码更容易审查。
-
-\begin{lstlisting}[language=C++,caption={Driver 端任务状态}]
-enum class DriverTaskState : std::int32_t {
-    Pending,
-    Sent,
-    Running,
-    Retrying,
-    Committed,
-    Failed,
-};
-
-struct DriverTaskEntry {
-    std::uint64_t task_id = 0;
-    std::uint32_t current_attempt = 0;
-    std::uint64_t current_request_id = 0;
-    DriverTaskState state = DriverTaskState::Pending;
-    std::uint64_t deadline_milliseconds = 0;
-    std::uint32_t retry_count = 0;
-    std::uint32_t assigned_worker = 0;
+\begin{lstlisting}[language=C++,caption={逻辑请求和 attempt 分离}]
+struct RequestKey {
+ std::uint64_t request_id = 0;
+ std::uint32_t attempt = 0;
 };
 \end{lstlisting}
 
-\code{Pending} 表示还没发出请求；\code{Sent} 表示请求已经进入 MessageBus，但未必到达 worker；\code{Running} 表示 worker 已确认接收，或者 driver 根据发送记录认为它可能在执行；\code{Retrying} 表示当前 attempt 已经超过本地等待预算，但逻辑 task 尚未失败；\code{Committed} 表示某个 attempt 的输出已经被接受；\code{Failed} 表示预算耗尽或遇到不可重试错误。每个状态都要有允许的进入和退出路径，不能靠注释猜。
+服务端去重表通常按 \code{request_id} 存储逻辑结果，而不是按 attempt 存储。新 attempt 到达时，如果 \code{request_id} 已提交，就返回旧结果或忽略重复副作用。Attempt 只用于记录“这是第几次尝试”，不改变业务语义。
 
-\topic{正常路径先画清楚}
+\topic{幂等表的容量和回收}
+幂等表不能无限增长。服务端记录所有 request id，内存迟早耗尽。系统必须定义 request id 的有效期、客户端重试窗口和服务端保留时间。若客户端可能在一天后重试，服务端至少要保留一天；若服务端只保留一分钟，客户端一分钟后重试就可能重复执行。幂等语义是客户端和服务端共同的合同。
 
-正常路径不是为了浪费篇幅。只有正常路径的边界画清楚，故障路径才知道在哪里插入。下面是一条没有丢包、没有慢节点、没有重试的时间线。
+回收幂等表时要小心。按时间删除最简单，但依赖时钟和请求延迟分布。按提交日志截断更稳：如果所有客户端都保证不会重试某个 checkpoint 之前的请求，服务端可以删除旧记录。对于批处理任务，幂等表可以和 task attempt manifest 绑定：一个 stage 完成并 checkpoint 后，旧 attempt 去重记录可以随 checkpoint 压缩。
 
-\begin{lstlisting}[numbers=none]
-t0 driver: task 17 is Pending
-t1 driver -> worker1: request_id 8001, task 17, attempt 0
-t2 driver: task 17 is Sent
-t3 worker1: receive request 8001 and start split 17
-t4 worker1: write temp output task17_attempt0
-t5 worker1 -> driver: reply request 8001, checksum C
-t6 driver: verify reply and commit task17_attempt0
-t7 driver: task 17 is Committed
-\end{lstlisting}
+幂等表里保存什么也要权衡。只保存 request id 可以防止重复执行，但重复请求无法返回原响应；保存 request id 和响应结果，可以让客户端收到同样结果，但占用更多空间；保存结果摘要可以减少空间，但可能不能满足业务。设计时要从调用者语义出发。
 
-这条时间线暴露出三个提交边界。第一，driver 发出请求不等于 worker 收到请求；第二，worker 写出临时输出不等于结果对作业可见；第三，driver commit 之后，迟到的其他 attempt 不能再改变结果。朴素程序常把这三件事混在一起：发出请求就认为任务在跑，worker 写文件就认为结果有效，响应回来就覆盖状态。正常路径里这些偷懒不一定出错，故障路径里一定会出错。
+\topic{错误分类}
+分布式错误不能只返回“失败”。至少要区分可重试错误、不可重试错误、过载错误、版本错误、权限错误和未知错误。可重试错误包括临时网络失败、服务端 busy、leader 切换中。不可重试错误包括请求格式错误、权限不足、资源不存在。版本错误说明客户端路由表或协议版本过旧，需要刷新而不是盲目重试。
 
-\topic{状态转换要由事件驱动}
+错误分类直接影响重试策略。对不可重试错误反复重试，只会浪费资源；对 busy 错误立即高频重试，会加剧过载；对版本错误不刷新路由，会一直打到错误节点。返回码是背压和控制面的接口，不只是调试信息。
 
-Driver 不是每隔一会儿“猜一猜”任务状态，而是根据事件转换状态。事件包括：请求入队成功，worker 接收确认，deadline 到达，响应到达，commit 成功，commit 失败，worker busy，driver 恢复 checkpoint。每个事件都要检查当前状态是否允许处理。若一个已经 committed 的 task 又收到响应，它不是“再成功一次”，而是 late reply。
-
-\begin{lstlisting}[numbers=none]
-event: send accepted by MessageBus
-  Pending -> Sent
-
-event: worker accepted request
-  Sent -> Running
-
-event: deadline reached
-  Sent or Running -> Retrying
-
-event: valid reply committed
-  Sent or Running or Retrying -> Committed
-
-event: retry budget exhausted
-  Retrying -> Failed
-\end{lstlisting}
-
-这个状态机不是形式主义。它能让代码审查有抓手。看到一个响应处理分支时，可以问：当前 task 若已 committed 会怎样？若 attempt 不匹配会怎样？若 response 的 request id 不是当前 request 会怎样？若 commit table 已有记录会怎样？没有状态机，这些问题会散落在许多 if 里，最后变成线上偶发错误。
-
-\topic{响应处理的检查顺序}
-
-响应到达时，driver 不能先处理输出，再更新状态。正确顺序应该先确认身份和状态，再验证输出，再提交。第一步查 \code{task_id} 是否存在；第二步查 task 是否已经 \code{Committed}；第三步查响应 attempt 是否还能被接受；第四步查 request id 是否匹配当前 attempt 或可接受的历史记录；第五步验证输出摘要；第六步进入 commit table。
-
-\begin{lstlisting}[numbers=none]
-on reply:
-  task = task_table.find(reply.task_id)
-  if task does not exist:
-      record unknown_reply
-      return
-  if task.state == Committed:
-      record late_reply
-      return
-  if reply.attempt != task.current_attempt:
-      record stale_attempt
-      return
-  if reply.request_id != task.current_request_id:
-      record stale_request
-      return
-  verify output checksum
-  commit output for task_id
-\end{lstlisting}
-
-这个顺序的意义是把旧消息挡在业务效果之外。很多系统出错，是因为先把输出加入结果，再发现状态不对。提交前的检查和提交后的审计要分开。迟到响应可以记录、可以触发清理临时文件、可以用于诊断慢节点，但不能再改变业务结果。
-
-\topic{指标也是状态表的一部分}
-
-状态表不是只服务正确性，也服务观测性。Driver 至少要记录每个 task 的发送时间、开始时间、完成时间、attempt 数、最后错误、所在 worker、输出字节和 checksum。否则 stage 变慢时，只能知道“某些任务慢”，不知道是排队慢、执行慢、响应慢、重试多、还是 commit 慢。
-
-\begin{lstlisting}[language=C++,caption={教学项目的任务指标}]
-struct TaskMetrics {
-    std::uint64_t task_id = 0;
-    std::uint32_t attempts_started = 0;
-    std::uint32_t timeouts = 0;
-    std::uint32_t late_replies = 0;
-    std::uint32_t stale_replies = 0;
-    std::uint64_t first_send_milliseconds = 0;
-    std::uint64_t commit_milliseconds = 0;
-    std::uint64_t output_bytes = 0;
+\begin{lstlisting}[language=C++,caption={错误分类的教学形态}]
+enum class RpcStatus : std::int32_t {
+ Ok,
+ Retryable,
+ Busy,
+ StaleRoute,
+ InvalidRequest,
+ PermissionDenied,
+ Unknown,
 };
 \end{lstlisting}
 
-分布式系统的可维护性来自 ID 和指标的统一。日志里出现 \code{task_id=17 attempt=1 request_id=8002}，指标里也要能按这些字段聚合。没有共同 ID，driver、worker、MessageBus 的日志只是三堆时间戳。出了问题以后，读者无法还原因果关系。
+真实协议还会有更细错误码和错误详情，但分类必须稳定。客户端重试库通常只看分类，日志和排查再看详细原因。把所有错误都归为 Unknown，会让客户端无法做正确行为。
 
-\topic{本地时间和单调时间}
+\topic{超时预算的分解}
+一个用户请求的总超时预算应被分解到各个下游调用，而不是每一层都重新给自己一个完整超时。假设用户请求总预算 1000 ms，服务 A 调服务 B，B 调 C。如果每层都设置 1000 ms，最坏情况下总延迟会远超用户预算。更好的做法是把剩余 deadline 随请求传递，下游根据剩余时间决定是否执行、降级或立即失败。
 
-超时测量应使用单调时间，而不是 wall clock。系统时间可能被 NTP 调整，向前或向后跳；单调时间适合计算 elapsed time。跨机器传递 deadline 时，物理时钟差异还要保守处理，但在本机模拟里，至少要把“日志时间戳”和“超时计时”分开。日志时间用于排查，单调时间用于预算。
+Deadline 比 timeout 更适合跨层传播。Timeout 是相对时间，每一层都要重新计算；deadline 是绝对截止点，传递后各层可以看当前剩余时间。时钟漂移会影响跨机器 deadline，因此通常还要保守处理，但它仍比无预算重试更清楚。批处理系统也有类似概念：一个 stage 的时间预算应来自整作业 SLA，而不是每个 task 自己无限重试。
 
-教学项目可以把 \code{deadline_milliseconds} 定义为模拟时钟上的绝对时间点。Driver 发送请求时记录当前模拟时间加预算；MessageBus 和 worker 在处理前检查是否已经过期。这样做比每一层重新设置 timeout 更清楚。Timeout 是相对等待时长，deadline 是绝对截止点。多层系统里，deadline 更容易表达“整个操作还剩多少预算”。
+\topic{重试、退避和抖动}
+重试要慢下来，而不是立刻把同一个请求再打一遍。指数退避让连续失败后的等待时间增长，抖动让大量客户端不要在同一时刻重试。没有抖动时，所有客户端可能在服务恢复的一瞬间同时重试，造成第二波过载。重试预算限制一次逻辑请求最多产生多少 attempt，避免多层服务重试相乘。
 
-\topic{正常路径的第一组测试}
+重试还要和幂等绑定。读请求通常更容易重试，写请求必须有 request id 和提交语义。若写请求不是幂等的，客户端在超时后可能只能查询状态，而不是直接重试。教材要让读者看到：重试是正确性功能，不是简单可靠性增强。
 
-第一组测试不注入故障，只验证协议骨架。给三个 input split，三个 worker，MessageBus 不丢包不乱序。期望每个 split 生成一个 \code{MapTaskReply}，commit table 有三条记录，最终结果和串行 reference 一致。测试还要检查指标：\code{attempts_started} 全部为 1，\code{timeouts} 为 0，\code{late_replies} 为 0，最大 in-flight 不超过配置。
+\topic{慢节点和尾延迟}
+分布式系统的整体延迟常被最慢分片决定。一个查询要访问十个分片，九个分片很快，一个分片慢，整体就慢。慢节点可能没有完全失败，只是磁盘抖动、CPU 被抢占、GC、网络拥塞或热点 key。故障检测如果只判断死活，就看不见慢节点。
 
-这组测试看似简单，但它防止后续故障逻辑污染正常路径。很多系统为了处理异常路径，正常路径被写得难以理解。高质量教材应该让读者看到：先有清晰正常路径，再逐个加入失败条件，每次只新增一个机制。
+处理慢节点的方法包括 speculative execution、请求 hedging、负载隔离、热点迁移和降级。Speculation 会启动重复 attempt，最先完成者获胜；hedging 会在等待一段时间后给另一个副本发同样读请求。这些方法能降低尾延迟，但增加资源消耗和重复副作用风险。没有幂等提交和重试预算，speculation 会让系统更危险。
 
-\section{响应丢失与幂等提交}
+\topic{队列和排队论直觉}
+分布式系统里很多延迟来自排队。服务时间接近满载时，队列等待会快速上升。即使平均处理能力略高于平均到达率，突发流量也会造成队列。背压和限流的目的，就是在队列失控前让上游看到压力。
 
-第一个故障是响应丢失。Worker 已经执行完 split，写出了临时输出，也发送了响应，但响应在 MessageBus 中被丢弃。Driver 等到 deadline 还没有收到响应，只能看到一个事实：本地等待时间到了。它不能证明 worker 没收到请求，也不能证明 worker 没执行，更不能证明 worker 的临时输出不存在。
+Little's Law 给出一个粗略关系：系统内平均在途请求数等于吞吐乘以平均延迟。若 in-flight 请求数持续增加而吞吐没有增加，说明延迟正在上升。若队列长度上升但 CPU 很空，可能是 I/O 或锁等待；若 CPU 满且队列上升，可能是计算能力不足；若网络出站队列上升，可能是下游慢或带宽瓶颈。队列是分布式系统最重要的压力表。
 
-\begin{lstlisting}[numbers=none]
-t0 driver -> worker1: request 8001, task 17, attempt 0
-t1 worker1: execute split 17
-t2 worker1: write temp output task17_attempt0
-t3 worker1 -> driver: reply 8001 is dropped
-t4 driver: deadline reached, task 17 enters Retrying
-t5 driver -> worker2: request 8002, task 17, attempt 1
-t6 worker2: execute split 17
-t7 worker2 -> driver: reply 8002 arrives
-t8 driver: commit attempt 1
-t9 worker1 cleanup or late reply appears
-\end{lstlisting}
-
-这条时间线说明一个核心事实：\important{超时是本地观察，不是全局事实}。Driver 在 t4 只能说“我没有等到可接受响应”，不能说“attempt 0 没有执行”。如果 reduce 端已经读取了 attempt 0 的输出，或者 worker1 的迟到响应又触发一次提交，最终计数就会重复。日志统计看似只是加法，一旦同一个 split 被加两次，结果就错了。
-
-\topic{朴素修复为什么不够}
-
-朴素修复一是“超时后删掉旧输出”。问题是旧输出在 worker1 上，driver 未必能访问；worker1 可能仍在执行；删除请求也可能丢失；甚至删除本身可能和旧 attempt 写文件并发。朴素修复二是“worker 收到取消就停”。取消只能尽力而为，不能保证已经执行的副作用消失。朴素修复三是“把 timeout 调大”。这只能减少触发概率，不能改变语义。
-
-正确方向是承认重复 attempt 可能存在，然后让外部效果只发生一次。对本章任务来说，外部效果是“某个 \code{task_id} 的输出进入最终 manifest 或 reduce 输入集合”。Worker 写临时文件不是外部效果，driver 把某个 attempt 记入 commit table 才是外部效果。只要 commit table 按逻辑 task 去重，attempt 0 和 attempt 1 可以都执行，但最终只能接受其中一个。
-
-\topic{提交表的最小形态}
-
-\begin{lstlisting}[language=C++,caption={按逻辑任务去重的提交记录}]
-struct CommitRecord {
-    std::uint64_t job_id = 0;
-    std::uint64_t stage_id = 0;
-    std::uint64_t task_id = 0;
-    std::uint32_t committed_attempt = 0;
-    std::uint64_t output_bytes = 0;
-    std::uint64_t output_checksum = 0;
-    bool committed = false;
-};
-\end{lstlisting}
-
-提交表按 \code{job_id, stage_id, task_id} 去重，而不是按 \code{request_id} 去重。因为响应丢失后，attempt 1 会有新的 request id；按 request id 去重只能防止同一消息重复处理，不能防止同一逻辑任务被不同 attempt 重复提交。提交表也不应该只保存一个 bool。它要保存选择了哪个 attempt、输出大小和 checksum，这些信息用于恢复和审计。
-
-\topic{提交点必须原子}
-
-幂等提交不是“先查一下表”这么简单。假设 driver 先把 attempt 1 的输出加入 manifest，然后在写 commit record 前崩溃。恢复后，commit table 看不到 task 17 已提交，可能再次接受 attempt 0 或 attempt 2，导致重复结果。反过来，若先写 commit record，再写 manifest 前崩溃，恢复后可能认为 task 已完成，却找不到有效输出。
-
-所以幂等记录和业务结果必须处在同一个提交边界里。工程上可以使用数据库事务、WAL、原子 rename、两阶段 manifest 或共识日志。教学项目可以用本地文件模拟：先把新 manifest 写到临时文件，包含 commit record 和输出条目，fsync 后原子 rename 为当前 manifest。只要恢复时只读取完整 manifest，就不会把半提交状态当成成功。
-
-\begin{lstlisting}[numbers=none]
-safe commit outline:
-  read current committed manifest
-  if task_id already committed:
-      reject duplicate attempt
-  verify temporary output checksum
-  append commit record and output metadata to new manifest file
-  flush new manifest file
-  atomically publish new manifest
-  mark task as Committed in memory
-\end{lstlisting}
-
-这里的关键不是文件 API 细节，而是顺序。内存状态最后更新，因为内存状态崩溃后会丢。可恢复事实必须先写到持久化提交边界里。很多教材讲“幂等”时只说重复执行结果相同，却没有讲提交边界，这会让读者在真正写系统时踩坑。
-
-\topic{临时输出和最终输出}
-
-Worker 不应直接写最终输出路径。每个 attempt 写自己的临时路径，例如 \code{job7/stage2/task17/attempt0/part0.tmp}。Driver 提交后，manifest 指向被接受的 attempt。其他 attempt 即使文件存在，也不是有效结果。Reduce 端不应该扫描目录猜哪些文件可读，而应该只读取 manifest 中列出的 block。
-
-这种设计把“文件存在”和“结果有效”分开。文件存在只是数据面事实，manifest 才是控制面事实。分布式计算系统里，控制面决定哪些数据属于最终结果，数据面负责搬运和保存字节。把这两件事混在一起，旧 attempt 残留文件、半写文件、损坏文件都可能被误读。
-
-\topic{worker 端是否也要去重}
-
-Driver 端 commit table 保证最终结果只提交一次，但 worker 端仍然可能重复执行同一 request。是否要在 worker 端去重，要看副作用在哪里。如果 worker 只写 attempt 临时文件，重复执行成本高但不破坏最终结果；如果 worker 会扣减配额、写外部系统、发送下游消息，就必须在 worker 端也做幂等。对于本章教学项目，worker 端可以先不跨重启保存去重表，但要记录重复 request 指标。
-
-更成熟的设计会把 request id、执行结果和响应摘要保存在 worker 的本地去重表里。重复 request 到达时，worker 不重新执行，而是返回旧响应或报告 duplicate。这个表同样需要回收。若客户端可能在一分钟内重试，worker 至少要保留一分钟；若去重记录太早删除，迟到重试仍可能重复执行。幂等语义是客户端和服务端共同的合同。
-
-\topic{响应丢失实验}
-
-响应丢失实验要有朴素版和修复版。朴素版让 MessageBus 固定丢弃 request 8001 的响应。Driver timeout 后向 worker2 派发 attempt 1。若系统没有 commit table，最终可能把两个 attempt 的输出都纳入结果，reference 对比会失败。修复版加入 commit table 和 manifest，只接受第一个通过校验并成功提交的 attempt，迟到响应只增加 \code{late_reply_count}。
-
-验收条件不能只写“结果正确”。至少要检查：最终每个 \code{task_id} 只有一个 commit record；重复或迟到响应不会改变 commit record；manifest 中没有半写临时文件；最终计数与串行 reference 一致；指标中能看到一次 timeout、一次 retry、一次 late 或 duplicate 事件。这样读者才能知道机制真的被触发，而不是测试没有覆盖故障。
-
-\section{超时、重试和乱序响应}
-
-第二组故障来自超时和重试。响应丢失会触发重试，worker 慢也会触发重试，MessageBus 延迟也会触发重试。重试本身不是坏事，它让系统能从临时失败中恢复。但没有预算、退避和幂等的重试，会把小故障放大成系统过载。
-
-先看最朴素策略：driver 等到 timeout，立刻再发一次；再次 timeout，再发一次；直到成功。这种策略在单元测试里很容易通过，因为测试规模小、worker 很快、消息不拥塞。但真实系统里，timeout 往往正是因为下游慢或队列长。此时所有 driver 都立刻重试，会让下游队列更长，响应更慢，更多请求 timeout，形成重试风暴。
-
-\topic{deadline 比每层 timeout 更清楚}
-
-一个用户操作或一个 stage 应该有总预算。Driver 发送 request 时，把剩余预算作为 deadline 传下去，而不是让每一层重新设置完整 timeout。假设 stage 希望在 30 秒内完成，某个 task 已经等待 28 秒，重试 attempt 不应再拿到完整 30 秒预算。否则局部 timeout 会让整体时间失控。
-
-Deadline 也能让 worker 做更合理的判断。Worker 收到请求时，发现 deadline 只剩很短时间，可以拒绝或快速返回 busy，而不是开始一个注定来不及完成的计算。这样可以减少无效工作。注意，deadline 不等于取消。Worker 看到 deadline 过期后可以停止新工作，但已经完成的提交仍要按幂等规则处理。
-
-\begin{lstlisting}[language=C++,caption={重试预算和 deadline 的教学结构}]
-struct RetryPolicy {
-    std::uint32_t max_attempts = 3;
-    std::uint64_t initial_backoff_milliseconds = 20;
-    std::uint64_t max_backoff_milliseconds = 1000;
-    std::uint64_t jitter_milliseconds = 10;
-};
-
-struct TaskDeadline {
-    std::uint64_t absolute_deadline_milliseconds = 0;
-};
-\end{lstlisting}
-
-这里没有写随机数实现，是因为书中重点是语义。指数退避让连续失败后的等待增长，抖动让大量 driver 不在同一时刻重试。最大 attempt 数限制重复执行规模，绝对 deadline 限制整体等待。重试策略不是“可靠性增强开关”，而是控制系统压力的机制。
-
-\topic{错误分类决定能否重试}
-
-不是所有失败都能重试。Worker 返回 input split 不存在，说明元数据或输入损坏，换个 worker 也不一定能解决；返回 busy，说明容量不足，应该退避或换 worker；返回 stale epoch，说明路由版本过旧，应该刷新控制面；返回 temporary I/O error，可以在预算内重试；返回 invalid request，应该停止并暴露 bug。
-
-\begin{lstlisting}[language=C++,caption={面向行为的任务状态码}]
-enum class TaskStatus : std::int32_t {
-    Ok,
-    Busy,
-    RetryableIoError,
-    InvalidSplit,
-    StaleEpoch,
-    DuplicateRequest,
-    DeadlineExceeded,
-    InternalError,
-};
-\end{lstlisting}
-
-错误码不是日志装饰，而是协议的一部分。Driver 根据错误码决定退避、刷新路由、换 worker、停止重试还是失败 task。把所有失败都写成 \code{InternalError}，等于让上层只能猜。教材里的错误分类不用追求工业系统那么细，但必须能表达行为差异。
-
-\topic{重试是新 attempt，不是删除旧 attempt}
-
-当 driver 决定重试时，它启动的是另一个 attempt。它不能宣布旧 attempt 不存在。旧 attempt 可能还在 worker 队列里，可能正在执行，可能已经写完临时输出，只是响应还没到。新 attempt 和旧 attempt 可以同时存在，所以状态表必须允许“逻辑 task 未提交，但多个物理 attempt 曾经启动过”。
-
-这也是 \code{task_id} 和 \code{attempt} 分离的原因。\code{task_id} 保护逻辑结果只提交一次；\code{attempt} 帮助区分执行历史。若每次重试都生成新的 task id，commit table 就无法知道这些 attempt 来自同一个 input split。若不递增 attempt，driver 又无法判断哪个响应是旧执行。
-
-\topic{乱序响应}
-
-现在看第二条时间线。Attempt 0 先发出，超时后 attempt 1 发出。Attempt 1 的响应先到并成功提交，随后 attempt 0 的响应迟到。
-
-\begin{lstlisting}[numbers=none]
-t0 request 8001, task 17, attempt 0 -> worker1
-t1 deadline reached, driver starts attempt 1
-t2 request 8002, task 17, attempt 1 -> worker2
-t3 reply 8002 arrives, driver commits attempt 1
-t4 reply 8001 arrives late
-\end{lstlisting}
-
-朴素 driver 若按“最后到达覆盖状态”更新，t4 的旧响应会污染已提交结果。正确规则是：\important{已提交任务不能被迟到 attempt 改写}。迟到响应可以记录为 late reply，可以用于清理 attempt 0 的临时输出，但不能再进入 commit table。
-
-乱序不仅发生在不同 worker 之间。即使使用 TCP，单连接内字节顺序是有序的，应用层多连接、多队列、多线程处理仍可能让完成顺序变化。一个服务端线程先处理后到请求，另一个线程后处理先到请求，响应完成顺序就变了。协议如果依赖顺序，就必须显式携带序号、版本或 attempt，而不是相信到达顺序。
-
-\topic{旧路由和 epoch}
-
-重试和乱序在后续分片迁移中还会遇到 epoch。假设 task 17 原本分配给 worker1，路由 epoch 为 5。Driver 超时后控制面把该 partition 迁到 worker2，epoch 变成 6。Worker1 恢复后带着 epoch 5 的旧响应回来，driver 必须拒绝它对新状态的修改。Epoch 是 fencing token，用来阻止旧持有者继续写。
-
-本章不展开完整再分片，那是下一章的主题。但第16章需要先建立直觉：分布式系统里的“旧”不等于“已经死”。旧 worker、旧 leader、旧 attempt、旧路由都可能在网络恢复后重新出现。协议必须让旧消息没有破坏力，而不是希望它们永远不回来。
-
-\topic{重试风暴的具体数字}
-
-设想 1000 个 task 同时发往 worker 集群。Worker 因磁盘抖动，平均响应从 50 ms 变成 800 ms。Driver timeout 设置为 100 ms，且超时后立即重试。100 ms 时，第一批 1000 个请求大多还在执行；driver 又发 1000 个；200 ms 再发 1000 个。几轮以后，系统里同时存在数千个 attempt，worker 队列更长，磁盘更忙，真正能完成的请求反而更少。
-
-加入预算后，行为应该不同。每个 task 最多 3 个 attempt；每次 retry 使用退避和抖动；每个 worker 有 in-flight 上限；收到 busy 后不会立即重试同一个 worker。这样做可能让某些 task 更早失败，但系统不会被无界重复请求拖垮。分布式系统里，明确失败常常比无界等待更健康。
-
-\begin{lstlisting}[numbers=none]
-retry allowed only if:
-  task is not committed
-  error is retryable or local deadline expired
-  retry_count < max_attempts
-  job deadline still has remaining budget
-  target worker or alternative worker has capacity
-  retry budget for the job is not exhausted
-\end{lstlisting}
-
-\topic{请求取消的边界}
-
-Driver 超时后可以向 worker 发送 cancel，但 cancel 不能作为正确性基础。Cancel 消息可能丢失，worker 可能已经执行完，worker 可能在不可中断的 I/O 中，或者 cancel 到达时旧 attempt 已经写出临时输出。正确系统应该把 cancel 当作资源回收优化，而不是当作避免重复提交的机制。
-
-这点和单机异步 I/O 很像。调用者超时后释放上下文，但底层完成回调可能稍后到达。若没有安全生命周期管理，就会访问已释放对象。分布式系统中，迟到完成不仅可能访问旧对象，还可能写入旧结果。所以超时路径必须和幂等提交、迟到响应处理、临时文件清理一起设计。
-
-\topic{driver 重启}
-
-再加入一个实际故障：driver 在 task \code{Sent} 或 \code{Retrying} 状态崩溃。若 task table 和 commit table 只在内存里，重启后 driver 不知道哪些 task 已经提交，哪些 attempt 只是写了临时文件，哪些响应还可能回来。最简单的恢复策略是：持久化 commit table 和已发布 manifest；重启时把未提交的 running task 全部转回 pending；已提交 task 根据 manifest 验证输出存在和 checksum。
-
-\begin{lstlisting}[numbers=none]
-driver recovery:
-  load last valid checkpoint
-  verify committed manifest entries and checksums
-  for each task:
-      if committed in manifest:
-          state = Committed
-      else:
-          state = Pending
-          current_attempt = next attempt after checkpoint
-  ignore replies with request_id not present in recovered state
-\end{lstlisting}
-
-这个策略保守但清楚。它可能重复执行未提交 task，但不会重复提交已提交 task。恢复设计的核心不是“尽量少重跑”，而是先保证不漏算、不重复算。性能优化可以后加，例如恢复 worker 本地 attempt 状态、复用完整临时输出、增量扫描 manifest。教材阶段先把可恢复边界写对。
-
-\topic{超时和重试实验}
-
-超时实验让 worker 固定 sleep 500 ms，driver timeout 为 100 ms。朴素版本立即重试，记录请求总数、最大 in-flight、worker 队列峰值和最终失败数。修复版加入 max attempts、退避、抖动和 worker 窗口。对比不应只看最终是否成功，还要看重复 attempt 是否受控、队列水位是否回落、busy 是否被正确处理。
-
-乱序实验让 MessageBus 固定让 attempt 1 响应先到，attempt 0 后到。验收条件是 commit record 保持 attempt 1，attempt 0 只增加 stale 或 late 指标。Driver 日志要能串起两条响应的 request id 和 attempt。没有这条日志，读者看见结果正确，也不知道系统是否真的走过乱序路径。
-
-\section{背压、慢节点和 in-flight 窗口}
-
-分布式系统里，异步发送容易掩盖等待。单机函数慢，调用者卡在当前线程；异步消息慢，driver 可能继续发更多请求，直到 MessageBus、worker 队列、连接池或内存被塞满。背压不是性能优化，而是系统不崩溃的条件。
-
-本章模型里，背压至少有三层。第一，每个 worker 的接收队列有容量。第二，driver 对每个 worker 有 in-flight 上限。第三，整个 job 有总 in-flight 和总重试预算。发送请求前，driver 要检查这些窗口。若 worker 队列满，MessageBus 返回 \code{Busy} 或拒绝入队；若 driver 在本地无限排队，只是把问题从 worker 内存转移到 driver 内存。
-
-\topic{in-flight 窗口从哪里来}
-
-窗口大小不是凭感觉写一个大数字。Little's Law 给出一个基本直觉：稳定系统中，平均在途请求数约等于吞吐乘以平均延迟。若 worker 平均 20 ms 完成一个 split，希望每秒完成 500 个 split，系统大约需要 10 个 in-flight split 才能填满流水线。若只允许 1 个，吞吐被延迟限制；若允许 10000 个，队列和内存会膨胀。
-
-这个模型不是精确预测工具，但能帮助判断配置是否荒谬。窗口大小要随延迟、吞吐、worker 数量、输出大小和错误率调整。短任务需要更小批量和更低排队；长任务可能需要较大 in-flight 来隐藏调度延迟；输出很大的任务受网络和磁盘限制，不能只按任务数控流，还要按字节数控流。
-
-\begin{lstlisting}[language=C++,caption={按任务数和字节数控制窗口}]
-struct WorkerWindow {
-    std::uint32_t worker_id = 0;
-    std::uint32_t max_in_flight_tasks = 0;
-    std::uint32_t current_in_flight_tasks = 0;
-    std::uint64_t max_in_flight_bytes = 0;
-    std::uint64_t current_in_flight_bytes = 0;
-};
-\end{lstlisting}
-
-\topic{慢节点不是死节点}
-
-故障检测的难点是无法可靠区分“死了”和“很慢”。Worker 可能在磁盘等待、CPU 被抢占、内存回收、网络拥塞、运行时暂停或处理热点 split。Driver 等不到响应，只能怀疑它慢或不可达，不能证明它没有执行。把慢节点误判为死节点，会启动重复 attempt；把死节点长期当成慢节点，会拖慢恢复。
-
-处理慢节点时，可以降低发往它的窗口，也可以启动 speculative attempt。Speculation 的规则是：某个 task 运行时间明显超过同类任务分位数后，在另一个 worker 启动新的 attempt，先完成且通过校验的 attempt 可以提交，其他 attempt 的迟到结果必须拒绝。注意顺序：先有 commit table 和 attempt 检查，再开启 speculation。没有幂等提交，speculation 会直接制造重复结果。
-
-\topic{慢节点指标}
-
-慢节点不能靠感觉判断。Driver 应记录每个 worker 的队列长度、接收速率、完成速率、平均延迟、尾延迟、timeout 数、busy 数、重试数和输出字节。一个 worker 响应慢，可能是它处理的 split 更大，也可能是节点本身慢。若不记录输入字节和输出字节，就会把数据倾斜误判为节点故障。
-
-Stage 级别也要看分布，而不是只看平均值。平均 task 100 ms，P99 task 5 s，说明长尾严重；每个 worker 平均差不多，但某个 partition 队列很长，说明热点 key 或 reduce 背压；CPU 很空但队列长，可能是 I/O 或锁等待；CPU 满且队列长，可能是计算能力不足。队列是分布式系统最重要的压力表之一。
-
-\topic{reduce 背压}
-
-日志统计作业不只有 map 请求。Map worker 本地 combine 后，还要把 partial 按 event type 发送到 reduce partition。若某个 event type 特别热，负责它的 reduce partition 会变慢。Map worker 如果继续发送，reduce 队列会越来越长，内存最终失控。正确行为是 reduce 端返回 \code{Busy} 或降低 credit，map worker 暂停向该 partition 发送，继续处理其他 partition 或在本地做更多 combine。
-
-\begin{lstlisting}[numbers=none]
-reduce partition backpressure:
-  queue below low watermark  -> accept new messages
-  queue above high watermark -> return Busy with retry_after
-  map worker receives Busy   -> pause that partition
-  map worker may combine more local records before retry
-  retry uses backoff and jitter
-\end{lstlisting}
-
-这里有两个水位，而不是一个阈值。高水位触发 busy，低水位恢复接收，中间区域保持当前状态。这可以避免队列在阈值附近反复抖动。Map 端收到 busy 后，也不能所有 worker 在同一时间重试，否则会形成同步尖峰。Busy 响应最好带 \code{retry_after} 或 credit 信息，让上游有节奏地恢复。
-
-\topic{热点 key 的层次化处理}
-
-热点 key 是分布式版的共享写热点。单机里，全局原子计数器会让多个核心争用同一 cache line；分布式里，所有 map worker 把同一个 event type 发到同一个 reduce partition，会让该 partition 成为长尾。解决思路也类似：先分散，再合并。
-
-Map-side combine 已经把同一 worker 内的重复 key 合并成 partial。若某个 key 仍然太热，可以把它拆成多个子 key，例如 \code{event_type, local_shard}，让多个 reduce partition 分别合并，最后再做二级 reduce。这个方案会增加最终合并阶段，但能降低第一阶段长尾。它不是第16章的主线，但它说明背压和数据倾斜不是纯网络问题，而是数据分布、调度和算法共同造成的。
-
-\begin{lstlisting}[numbers=none]
-normal key:
-  partition = hash(event_type) % reduce_count
-
-hot key:
-  shard = hash(map_task_id) % hot_shard_count
-  partition = hot_partition_base + shard
-  final stage merges all shards for the same event_type
-\end{lstlisting}
-
-\topic{背压和公平性}
-
-如果只有一个 job，背压主要保护系统稳定。如果多个 job 共用 worker，背压还要考虑公平性。一个大 job 或热点 key 不应该占满所有 reduce 队列，让小 job 无法前进。可以按 job、stage 或 partition 设置独立队列和配额，也可以用加权轮询调度。代价是资源利用率可能下降，但故障半径更可控。
-
-教学项目可以先只支持单 job，但字段里保留 \code{job_id} 是有意义的。未来扩展多租户时，指标、去重、manifest 和配额都要按 job 区分。没有 job id，所有请求混在一起，系统很难解释“是谁压垮了谁”。
-
-\topic{连接池也是背压点}
-
-本机 MessageBus 可以先不用真实 socket，但真实 RPC 系统还有连接池。连接池有最大连接数、每连接最大 in-flight、空闲超时、健康检查和错误恢复。连接都忙时，新请求是等待、失败还是新建连接？等待是否消耗 deadline？连接 reset 时，正在飞行的请求算失败还是未知？这些问题和 worker 队列一样属于背压语义。
-
-这也是为什么本章强调模型而不是具体网络库。换成 gRPC、HTTP、TCP 自定义协议或共享内存队列，问题形状仍然存在：发送方能否无限提交，接收方忙时如何反馈，已提交但未完成的请求如何计数，失败后是否重试。库可以帮你传字节，不能替你定义业务语义。
-
-\topic{背压实验}
-
-背压实验构造一个热点 event type，让 90\% 的记录都落到同一个 reduce partition。朴素版本中，map worker 不看 reduce 队列水位，持续发送 partial，reduce 队列峰值持续增长。修复版本加入 high watermark、low watermark、busy 和 retry after。验收条件是：队列水位能回落，map 端等待时间可观测，最终结果与 reference 一致，重试请求量不超过预算。
-
-另一个实验是慢 worker。让 worker2 每个 split sleep 2 秒，其他 worker 50 ms 完成。Driver 开始时平均分配任务，随后根据延迟和队列水位降低 worker2 窗口。验收条件是：worker2 不再积压大量新任务；stage 尾延迟下降；如果开启 speculation，重复 attempt 不会重复提交。报告要同时写收益和成本：speculation 降低尾延迟，但增加 CPU 和 I/O 消耗。
-
-\section{MessageBus 模拟和故障注入}
-
-本章不要求读者立刻搭真实集群。更好的训练方式，是先用本机 \code{MessageBus} 模拟网络。MessageBus 不需要真实 socket，先用有界队列表达节点之间的通道。每条消息携带 source、target、request id、task id、attempt、payload size、deadline 和 message type。MessageBus 可以按规则注入延迟、丢弃、重复和乱序。
-
-本机模拟不能证明真实网络性能，但能验证协议语义。请求 ID 是否去重，重试是否有预算，队列是否背压，迟到响应是否被拒绝，driver 重启后是否恢复，重复输出是否被提交表挡住，这些都可以在一台机器上验证。先把语义做清楚，再迁移到真实网络，风险更低。
+\topic{消息总线的本机实现}
+本机模拟可以用一个 MessageBus 对象表示网络。它不需要真实 socket，先用多个有界队列表达节点之间的通道。每条消息带 source、target、request id、attempt、payload bytes、deadline 和 status。MessageBus 可以注入延迟、丢弃、重复和乱序。这样一台手机或一台开发机就能训练分布式协议。
 
 \begin{lstlisting}[language=C++,caption={本机消息的核心字段}]
-enum class MessageType : std::int32_t {
-    MapTaskRequest,
-    MapTaskReply,
-    Busy,
-    Cancel,
-};
-
 struct LocalMessage {
-    MessageType type = MessageType::MapTaskRequest;
-    std::uint32_t source_node = 0;
-    std::uint32_t target_node = 0;
-    std::uint64_t request_id = 0;
-    std::uint64_t task_id = 0;
-    std::uint32_t attempt = 0;
-    std::uint64_t payload_bytes = 0;
-    std::uint64_t deadline_milliseconds = 0;
+ std::uint32_t source_worker = 0;
+ std::uint32_t target_worker = 0;
+ std::uint64_t request_id = 0;
+ std::uint32_t attempt = 0;
+ std::uint32_t payload_bytes = 0;
+ RpcStatus status = RpcStatus::Ok;
 };
 \end{lstlisting}
 
-这段结构体仍然是逻辑模型。真实 payload 可以放在单独对象或缓冲区中。重要的是每条消息都有足够身份信息，MessageBus 的日志也能记录这些字段。故障注入失败后，读者要能看到“request 8001 被丢弃，task 17 attempt 0 timeout，request 8002 被发送，attempt 1 提交，attempt 0 迟到响应被拒绝”。
-
-\topic{故障规则要可复现}
-
-随机故障有价值，但单元测试需要确定性。MessageBus 应支持按 request id 注入故障，例如丢弃 request 8001 的响应，延迟 task 17 attempt 0，重复投递 request 9002，或者让某个 worker 队列在第 N 次发送时返回 busy。也可以使用固定随机 seed 生成故障序列，并把序列写入日志，失败后用同一个 seed 重放。
-
-\begin{lstlisting}[language=C++,caption={可复现故障注入规则}]
-enum class FailureAction : std::int32_t {
-    None,
-    Drop,
-    Delay,
-    Duplicate,
-    Reorder,
-};
-
-struct FailureRule {
-    std::uint64_t request_id = 0;
-    MessageType message_type = MessageType::MapTaskReply;
-    FailureAction action = FailureAction::None;
-    std::uint64_t delay_milliseconds = 0;
-};
-\end{lstlisting}
-
-可复现性是分布式测试的生命线。偶现 bug 如果无法重放，修复很容易变成猜测。教学项目里的故障注入不必覆盖所有真实网络行为，但至少要覆盖本章讨论的四类：丢失、重复、延迟、乱序。每类故障都要有一个最小测试。
-
-\topic{MessageBus 不应该隐藏背压}
-
-很多教学模拟会把 MessageBus 写成无限 vector 或无限 queue。这样做会掩盖最重要的系统问题：队列无界增长。MessageBus 的每个通道都应有容量，可以按消息数限制，也可以按 payload 字节限制。容量满时，发送方必须得到明确结果：accepted、busy、deadline exceeded 或 invalid target。
-
-\begin{lstlisting}[numbers=none]
-send result:
-  Accepted         message is queued
-  Busy             target queue is above high watermark
-  DeadlineExpired  message deadline has already passed
-  InvalidTarget    route is unknown or stale
-\end{lstlisting}
-
-这个返回值会影响 driver 行为。Accepted 后 task 进入 Sent；Busy 后进入退避或换 worker；DeadlineExpired 后不应再重试同一个 attempt；InvalidTarget 后需要刷新路由或失败。MessageBus 不是简单管道，它是本机训练背压和错误分类的工具。
-
-\topic{Trace 关联}
-
-每次事件都要写 trace。Trace 不只是日志文本，而是带结构字段的事件流。Driver 发送、MessageBus 入队、MessageBus 丢弃、worker 接收、worker 完成、driver 提交、driver 拒绝迟到响应，都应该有 event type、timestamp、job id、task id、attempt、request id 和 node id。这样一次故障能被完整串起来。
-
-\begin{lstlisting}[numbers=none]
-trace event fields:
-  time_milliseconds
-  event_type
-  job_id
-  stage_id
-  task_id
-  attempt
-  request_id
-  source_node
-  target_node
-  status
-\end{lstlisting}
-
-没有 trace，读者只能看最终结果。最终结果正确不代表系统语义正确，可能只是故障没有触发。Trace 让实验报告能回答：哪条消息丢了，哪次 timeout 触发重试，哪个 attempt 提交，哪个旧响应被拒绝。分布式系统的学习不能只看结果，还要看路径。
-
-\topic{指标清单}
-
-本章最低指标清单如下。
-
-\begin{lstlisting}[numbers=none]
-minimum distributed metrics:
-  requests_sent
-  replies_received
-  timeouts
-  retries_started
-  duplicate_messages
-  duplicate_replies
-  stale_replies
-  late_replies
-  busy_responses
-  max_in_flight_tasks
-  max_worker_queue_depth
-  max_reduce_queue_depth
-  committed_tasks
-  failed_tasks
-\end{lstlisting}
+模拟器要把故障做成可重复。使用固定 seed，记录每次丢包、重复、延迟和重排事件。测试失败后，可以用同一个 seed 重放。没有可重复性，分布式 bug 会非常难查。
 
-每个指标都要服务一个问题。请求数和重试数看重试是否失控；late 和 stale 看乱序响应是否被挡住；busy 和队列水位看背压是否生效；committed 和 failed 看任务最终状态；in-flight 看窗口配置是否合理。指标不是为了漂亮仪表盘，而是为了验证协议假设。
+\topic{实验报告的故障矩阵}
+分布式实验报告不能只写正常路径。至少要列出故障矩阵：请求丢失、响应丢失、服务端忙、服务端执行后崩溃、客户端超时后重试、重复消息到达、旧路由请求、慢节点、队列满、driver 重启。每一项都要写预期行为：重试、去重、返回旧结果、刷新路由、背压、失败还是恢复。
 
-\topic{实验矩阵}
+这张矩阵会迫使设计暴露缺口。例如如果响应丢失后客户端重试，而服务端没有保存响应结果，客户端可能无法知道第一次是否成功；如果执行后崩溃但提交点没持久化，恢复后可能重复执行；如果旧路由请求没有版本检查，迁移期间可能写到旧分片。故障矩阵不是测试附录，而是分布式设计本身。
 
-实验矩阵应覆盖正常输入、边界输入、压力输入和错误输入。正常输入验证功能；边界输入验证 split 边界、空 split、单条记录、多个 split 同一 key；压力输入验证队列、水位和窗口；错误输入验证丢响应、重复响应、乱序响应、busy、worker 慢、driver 重启。每一项都要写预期行为。
+\topic{连接管理}
+真实 RPC 系统还要管理连接。每个请求新建 TCP 连接成本高，通常会复用连接池；连接池又要处理最大连接数、空闲超时、健康检查、连接重置和负载均衡。一个连接上的请求可能按顺序发送，也可能多路复用。若一个连接出现队头阻塞，后续请求会被拖慢；若连接太多，内核和远端都会有压力。
 
-\begin{lstlisting}[numbers=none]
-fault matrix:
-  request dropped        -> retry within budget
-  reply dropped          -> retry; old attempt may finish but cannot double commit
-  reply duplicated       -> second reply is ignored or returns old result
-  replies reordered      -> stale attempt cannot overwrite committed result
-  worker busy            -> backoff or choose another worker
-  worker slow            -> reduce window or start speculative attempt
-  driver restart         -> recover manifest; rerun only uncommitted tasks
-  reduce queue full      -> map side pauses that partition
-\end{lstlisting}
+连接池的背压语义也要定义。连接都忙时，新请求是等待、失败、还是新建连接？等待是否消耗用户 deadline？连接错误时，正在飞行的请求如何标记？这些问题和线程池、有界队列非常相似。连接池不是网络库细节，而是分布式系统的执行资源管理。
 
-这张矩阵不是附录装饰，而是设计本身。每一行都逼迫系统回答一个具体问题。若某一行没有答案，说明协议还有洞。分布式系统最危险的不是某个名词没背，而是故障路径没有被写成可执行行为。
+\topic{服务发现和负载均衡}
+客户端需要知道请求发给哪些服务实例。服务发现可以来自静态配置、DNS、注册中心或控制面。发现结果通常会缓存，因此要处理实例上下线、健康状态和版本变化。负载均衡策略可以是轮询、随机、最少连接、按延迟加权、按 locality 选择。策略不同，故障时行为也不同。
 
-\topic{Linux 视角：不要神化网络}
+负载均衡不能只看请求数量。一个实例可能处理轻请求很多，另一个处理重请求少；一个实例延迟高可能是过载，也可能是网络远；一个实例刚启动缓存冷，直接大量流量打过去会抖动。工程系统常使用慢启动、健康检查、熔断和 outlier detection。教材项目可以简化为 driver 分配 worker，但应让读者知道真实服务发现是控制面的一部分。
 
-真实网络路径经过用户态缓冲、系统调用或用户态网络栈、socket buffer、调度、网卡队列、交换机、对端队列和对端线程。Linux 源码阅读可以从窄路径开始：socket 发送和接收、定时器、epoll 唤醒、网络设备队列。阅读目标不是一次读懂网络栈，而是把用户态现象和内核对象对应起来：发送为什么会阻塞，接收为什么会等待，超时由谁触发，队列满时错误如何返回。
+\topic{熔断和隔离}
+熔断器在下游持续失败或延迟过高时，暂时停止向它发送请求，快速失败或降级。这样可以避免线程、连接和队列被坏下游拖住，也给下游恢复时间。熔断不是为了隐藏错误，而是保护系统。熔断状态通常包括 closed、open、half-open：正常发送、快速失败、试探恢复。
 
-对本章来说，最重要的 Linux 启发是：网络不是魔法函数调用。一次 \code{write} 不等于对端一次 \code{read}；TCP 是字节流，不保留应用消息边界；socket buffer 满会导致排队或返回 busy；定时器触发只说明本地等待时间到了；线程调度会影响延迟。理解这些事实，能帮助读者相信本章的模型不是凭空复杂，而是对真实系统边界的抽象。
+隔离则是把不同下游或不同优先级请求放进不同资源池。若所有下游共享一个线程池，某个慢下游可能耗尽所有 worker，影响无关请求。隔离可以用独立队列、独立连接池、独立线程池或配额。代价是资源利用率可能下降，但故障影响范围更可控。
 
-\section{落到贯穿项目}
+\topic{幂等性和业务键}
+请求 ID 可以由系统生成，也可以来自业务键。创建订单时，客户端可以提供 client request id；写日志时，可以使用文件分片和 offset；提交 map output 时，可以使用 job id、stage id、task id。业务键更容易跨重启恢复，因为它和逻辑操作绑定。系统生成的随机 ID 如果只在内存里保存，重启后可能丢失去重语义。
 
-Compute Systems Engine 在本章要实现的不是完整集群，而是一个语义正确的本机分布式模拟。最低模块包括 \code{Driver}、\code{Worker}、\code{MessageBus}、\code{CommitTable}、\code{TraceLog} 和 \code{Metrics}。Driver 维护 task table、attempt、deadline 和调度窗口；Worker 只通过消息接收任务并返回结果；MessageBus 支持延迟、丢弃、重复、乱序和有界队列；CommitTable 保证每个逻辑 task 只提交一次；TraceLog 让故障能被复盘。
+幂等键还要定义作用域。一个 request id 在单个用户内唯一，还是全系统唯一？一个 task id 在一个 job 内唯一，还是跨 job 唯一？作用域不清会导致误去重或漏去重。教学项目应使用结构化 key，例如 job id、stage id、task id、attempt。这样日志和 manifest 更容易读。
 
-实现顺序要克制。不要一开始搭一个看似完整的框架。第一步写串行 reference，固定输入格式和输出比较。第二步让 driver 发送一个 map task 给一个 worker，跑正常路径。第三步加入三个 worker 和 task table。第四步让 MessageBus 支持丢响应，加入 timeout 和 retry budget。第五步实现 commit table 和 manifest，保证重复 attempt 不重复提交。第六步加入乱序和重复消息测试。第七步加入 worker busy、reduce 背压和窗口。第八步加入 checkpoint 和 driver 重启恢复。
+\topic{时钟和单调时间}
+超时测量应使用单调时钟，而不是 wall clock。系统时间可能被 NTP 调整，向前或向后跳；单调时钟适合计算 elapsed time。分布式系统传 deadline 时，跨机器 wall clock 差异仍要考虑，但本机队列和 I/O 超时应使用单调时间。日志时间戳和超时计时是不同用途。
 
-\begin{lstlisting}[numbers=none]
-implementation order:
-  1. serial reference for log counting
-  2. Driver sends one MapTaskRequest to one Worker
-  3. three Workers and a Driver task table
-  4. MessageBus supports delay and drop
-  5. Driver adds timeout, retry budget and backoff
-  6. CommitTable rejects duplicate task commits
-  7. MessageBus supports duplicate and reorder
-  8. reduce queues return Busy with high and low watermarks
-  9. TraceLog and metrics CSV record protocol behavior
-  10. checkpoint allows Driver restart recovery
-\end{lstlisting}
+租约和跨机器 deadline 更复杂。若依赖物理时间做安全判断，就要给时钟漂移和暂停留余量。很多协议避免直接依赖绝对时间来保证一致性，而使用 term、epoch 和 quorum。时间可以优化性能，不应轻易成为唯一正确性依据。
 
-\topic{reference 不能省}
+\topic{有序、因果和重放}
+消息重放是测试分布式系统的重要方法。记录一段消息历史，包括发送、延迟、丢弃、重复和处理结果，然后在本机重放。若系统确定性足够，重放能复现 bug。为了支持重放，消息处理应尽量由输入消息和当前状态决定，避免隐藏随机数和真实时间直接影响核心语义。随机故障应使用记录的 seed。
 
-Reference 是整个项目的锚点。没有 reference，最终输出是否正确只能靠感觉。Reference 可以很慢，可以是单线程，可以不做任何分布式优化，但必须精确定义语义。分布式版本无论如何重试、乱序、背压、speculation，最终输出都要和 reference 一致。若输入包含坏行，reference 要定义坏行如何处理；若 event type 越界，reference 要定义是丢弃、报错还是进入错误计数。
+因果关系也可以在 trace 中表达。一个 retry attempt 由哪次 timeout 触发，一个 reduce commit 由哪些 shuffle block 组成，一个 checkpoint 覆盖到哪个 stage，这些都应有 ID 关联。没有因果关联的日志，只是一堆时间戳，出了问题很难追。
 
-Reference 还可以帮助定位错误。若分布式结果比 reference 多，优先怀疑重复提交或 split 重叠；若少，怀疑漏 split、commit 丢失或恢复跳过；若只有热点 key 错，怀疑热点拆分或 reduce 去重；若每次运行输出顺序不同但计数相同，可能是排序或输出格式问题。好的 reference 不只是测试 oracle，也是调试地图。
+\topic{分布式观测性}
+分布式观测性至少包含 metrics、logs 和 traces。Metrics 聚合数量和延迟，适合看趋势；logs 记录离散事件和错误，适合排查细节；traces 串起一次请求或一个 task attempt 的路径，适合分析长尾。三者需要共同的 ID：request id、job id、stage id、task id、attempt、partition。没有 ID，无法把 driver、worker、shuffle 和 reduce 的事件连起来。
 
-\topic{CommitTable 接口}
+指标也要按维度分解。只看全局平均延迟，会掩盖某个 partition 长尾；只看总重试数，无法知道哪个 worker 或哪类错误导致；只看总吞吐，无法发现队列越来越长。分布式系统的指标设计要服务故障定位，而不是只服务漂亮仪表盘。
 
-CommitTable 的接口应该围绕不变量设计，而不是暴露随意写 map 的能力。调用者提交一个 attempt，CommitTable 返回 accepted、already committed、stale attempt 或 checksum mismatch。CommitTable 内部负责检查 task 是否已提交，验证输出摘要，更新 manifest。外部不能绕过它直接修改 committed 状态。
+\topic{本章新增实验}
+本章可以增加三个小实验。第一，连接池模拟：限制最大 in-flight 连接数，观察过载时等待和失败。第二，熔断模拟：让一个 worker 持续超时，客户端在多次失败后暂时停止发送，观察重试量是否下降。第三，trace 关联：为每条消息记录 request id 和 parent event id，重放一次响应丢失导致的重试。
 
-\begin{lstlisting}[language=C++,caption={提交决策的接口形态}]
-enum class CommitDecision : std::int32_t {
-    Accepted,
-    AlreadyCommitted,
-    StaleAttempt,
-    ChecksumMismatch,
-};
+这些实验不需要真实网络，但能训练分布式语义。它们也会给第 18 章的 driver 和 message bus 提供基础。
 
-struct CommitRequest {
-    std::uint64_t task_id = 0;
-    std::uint32_t attempt = 0;
-    std::uint64_t output_bytes = 0;
-    std::uint64_t output_checksum = 0;
-};
-\end{lstlisting}
+\topic{多租户和公平性}
+分布式计算系统常同时运行多个 job。若所有 job 共用 worker 和 shuffle 队列，大 job 可能占满资源，小 job 长时间等待。公平调度需要定义资源份额、优先级和抢占策略。最简单的策略是每个 job 有独立队列，driver 按轮询或权重取任务；更复杂策略会考虑输入大小、deadline、用户配额和历史用量。
 
-这个接口没有展示文件写入细节，但它把行为边界说清。Driver 处理响应时不应该自己写一堆 if 再改 manifest，而应该把提交请求交给 CommitTable。这样测试可以集中覆盖重复提交、迟到 attempt、checksum mismatch 和恢复后的提交。
+公平性和吞吐有时冲突。让大 job 连续占用资源，吞吐可能最高；穿插小 job，平均响应更好但缓存和调度成本增加。教学项目可以先支持单 job，但设计字段时保留 job id，就是为了未来多租户和公平调度。没有 job id，所有指标和去重都会混在一起。
 
-\topic{Worker 的责任边界}
+\topic{背压和公平的交汇}
+多个上游共享一个下游时，背压还要公平。若 reduce partition 队列满，是否阻塞所有 map worker，还是只阻塞发送该 partition 的 worker？若某个 job 产生大量热点 key，是否影响其他 job 的正常 partition？系统可以为每个 job 或 partition 设置独立队列和配额，防止一个热点拖垮全局。
 
-Worker 的职责是读取 split、执行 map、写 attempt 临时输出、返回摘要。Worker 不决定最终结果是否有效，也不直接修改全局 manifest。这样做让 worker 可以重复执行而不破坏外部效果。Worker 可以清理自己未被接受的临时文件，但清理失败不影响最终语义，只影响磁盘空间。
+这和单机线程池里的优先级队列类似。资源隔离降低故障传播，但可能降低资源利用率。工程设计要写清目标：批处理吞吐、交互延迟、公平性还是隔离。不同目标会得到不同调度器。
 
-Worker 还要报告可观测信息：读取字节、解析记录、错误记录、本地 combine 后 key 数、输出字节、执行耗时。若 worker 只返回 \code{Ok}，driver 无法判断慢在哪里。一个 split 处理慢，可能是输入大、坏行多、key 多、磁盘慢、CPU 忙或队列等待。指标越早设计，后面的性能章节越容易承接。
+\topic{数据本地性和复制选择}
+若输入分片有多个副本，调度器可以选择负载较低且距离较近的副本。只看本地性可能把任务都打到一个繁忙节点，只看负载可能产生大量远程读取。调度器需要一个成本函数，把数据位置、队列长度、节点健康、网络成本和优先级结合起来。教学项目可以用简单规则：优先本地，若本地队列超过阈值则远程。
 
-\topic{MessageBus 的责任边界}
+这个规则和 NUMA 调度完全相似：优先本地内存，过载时跨节点。第二册反复建立这种跨尺度类比，是为了让读者面对新系统时能迁移思维。
 
-MessageBus 负责消息投递和故障注入，不负责业务提交。它可以根据规则丢弃、延迟、重复和乱序消息，可以根据队列容量返回 busy，可以记录 trace。但它不应该知道 task 是否 committed，也不应该替 driver 决定重试。这样模块边界清楚：MessageBus 模拟不可靠通信，Driver 处理协议语义，CommitTable 处理提交不变量。
+\topic{协议演进和兼容测试}
+分布式协议一旦持久化或跨进程，就需要兼容测试。新增字段要有默认值，旧节点收到新字段能忽略，新节点收到旧消息能补默认值。删除字段要经历过渡期。消息版本、feature flags 和最小兼容版本都要有策略。否则滚动升级时，集群可能出现部分新旧节点互相不能通信。
 
-这个边界也有助于未来替换真实网络。若 MessageBus 里混入大量业务逻辑，换成 socket 后就很难迁移。若 MessageBus 只表达通信语义，真实网络层只需要提供类似的 send result、receive event 和 trace hook。
+教学项目可以简单要求“同一版本运行”，但如果写成教材，就要说明这是简化。第三册 AI 推理引擎如果加入模型格式和算子版本，也会遇到同样问题。协议演进是长期系统的基本能力。
 
-\topic{Checkpoint 的最低内容}
+\topic{混沌测试和演练}
+故障注入可以从单元测试扩展到混沌测试：在长时间运行中随机让 worker 变慢、丢消息、重启 driver、损坏临时 block、让队列变满。混沌测试的目标不是制造混乱，而是验证系统在预期故障集合内保持可控。每次注入都应记录事件，失败后能回放。
 
-Driver checkpoint 至少包含 job 配置、input split 列表、task 状态摘要、commit table、manifest、下一批 request id 或其生成策略、路由 epoch 和指标摘要。缺少 job 配置，恢复后可能用不同 reduce 数解释旧输出；缺少 split 列表，无法判断哪些 task 还要跑；缺少 commit table，重复响应可能再次提交；缺少 request id 策略，日志关联会混乱。
+混沌测试必须有安全边界。不要在没有隔离的真实数据上随意注入；不要注入系统无法承受的未知破坏；不要只看系统没崩就算通过，还要检查结果正确、重试预算、队列长度和恢复时间。可靠性测试同样需要 oracle。
 
-教学项目可以在 stage 边界 checkpoint，也可以每次 commit 后 checkpoint。前者正常路径成本低，但崩溃后重跑更多；后者恢复更快，但持久化成本高。教材要让读者看到这是权衡，而不是有一个永远正确的频率。高质量系统设计总是把成本写出来。
+\topic{分布式模型的知识地图}
+到本章结束，读者应能把分布式系统拆成：消息、时间、故障、身份、路由、幂等、背压、调度和观测。消息回答数据如何传；时间回答何时放弃；故障回答什么可能坏；身份回答这是哪个请求；路由回答发给谁；幂等回答重复怎么办；背压回答过载怎么办；调度回答谁执行；观测回答如何知道发生了什么。后两章会把这些部件组合成分片复制和计算引擎。
 
-\topic{和第 17、18 章的衔接}
+\topic{分布式模型章节总结}
+分布式系统的困难不是网络 API，而是不确定性。消息可能丢、重复、乱序；节点可能慢、停、恢复；客户端超时不代表服务端停止；重试可能放大故障；旧路由和旧 leader 可能继续发送请求。解决这些问题需要请求身份、版本、deadline、幂等表、背压、故障矩阵和 trace。把这些基础模型建好，后面的复制和计算工程才有可靠语义。
 
-本章只解决“一个逻辑 task 如何在消息系统里安全执行和重试”。第17章再讨论分片、复制和共识：partition 在哪里，路由版本怎么变，哪些控制面状态需要强一致，旧 leader 如何被 fencing。第18章把这些机制放进完整 shuffle：map 输出如何进入 manifest，reduce 如何只读已提交 block，checkpoint 如何恢复，热点 key 如何做二级聚合。
+\topic{分布式模型决策表}
+设计一个 RPC 或消息协议时，先填决策表。请求是否幂等？若不是，超时后不能盲目重试。是否有 request id？若没有，服务端无法去重。是否有 deadline？若没有，多层调用会放大延迟。是否区分 busy 和 fatal？若没有，客户端无法正确退避。是否有路由版本？若没有，迁移期间旧请求难以拒绝。是否有 trace id？若没有，故障后无法串联路径。
 
-这个顺序很重要。若读者还说不清 \code{task_id}、\code{attempt}、\code{request_id} 的区别，就不该急着看共识；若还说不清超时和取消的区别，就不该急着写 speculative execution；若还没有 commit table，就不该允许重复 attempt 写最终结果。分布式系统不是概念越多越高级，而是每个失败路径都有明确边界。
+这张表适用于任何分布式调用，也适用于本机异步消息。只要执行和完成分离，就需要身份、时间、状态和错误语义。
 
-\topic{事故复盘：把概念压成可执行流程}
+\topic{消息协议审查表}
+每个消息类型都应审查：谁发送，谁接收，是否允许重复，是否有响应，超时后发送方做什么，接收方是否幂等，payload 是否有版本和长度，错误码是否分类，是否进入 trace，是否影响提交状态。审查后会发现很多消息只是指标，可以丢；有些消息是提交，必须持久化；有些消息是控制面，必须带 epoch。消息不是字节包，而是系统状态转换。
 
-如果只说“要有 request id、要能重试、要做幂等”，这章仍然会显得模糊。真正理解分布式系统，要能把一次事故从输入、状态、消息、指标和修复全部走通。下面用同一个日志统计作业复盘一次具体事故：最终 event 7 的计数比串行 reference 多了 1280。输入没有变化，单机 reference 稳定，只有分布式模拟偶尔多算。这个现象足够具体，后面才能讨论原因。
+分布式模型章的回归阅读应从本地调用栈失效开始。调用本地函数时，返回值和异常沿栈同步传播；发送远端消息后，请求可能排队、丢失、重复、乱序、执行成功但响应丢失，调用者无法仅凭超时知道远端发生了什么。因此 request id、attempt id、deadline、重试预算和幂等表不是附加字段，而是远端调用的最低语义。
 
-事故发生时的系统配置是：一个 driver，三个 worker，十二个 input split，四个 reduce partition。Driver timeout 为 100 ms，worker1 被故障注入延迟 300 ms，MessageBus 对 request 4107 的响应执行 drop。朴素版本里，worker 写完 map 临时输出后，reduce 端会直接读取 worker 目录下所有完成文件。Driver 收不到响应后启动 attempt 1，attempt 1 也写出一份同一 split 的 partial。最后 reduce 扫目录时读到了两份 partial，于是 event 7 多了 1280。
+响应丢失案例要完整走一遍。driver 发送 attempt A，worker 执行并写出结果，响应在返回途中丢失；driver 超时后发送 attempt B；稍后 A 的迟到响应到达。系统必须决定谁能提交，旧响应如何拒绝，重复输出如何清理，最终 manifest 是否只引用一次结果。若这里解释不清，就不能进入复制和共识。
 
-这不是抽象的“幂等问题”，而是一条可复现的路径。复盘时先把时间线写出来。
+本章还要防止重试风暴。客户端重试必须有指数退避、抖动、总预算和并发窗口；服务端过载时要把背压传回上游；监控要区分原始请求、重试请求、超时和最终失败。分布式性能经常是正确性控制路径的后果，不能把 RPC 当作稍慢的函数调用。
 
-\begin{lstlisting}[numbers=none]
-t0  driver sends request 4107: task 5, attempt 0, worker1
-t1  worker1 reads split 5 and writes temp block A
-t2  worker1 sends reply 4107, MessageBus drops it
-t3  driver timeout for request 4107
-t4  driver sends request 4119: task 5, attempt 1, worker2
-t5  worker2 reads split 5 and writes temp block B
-t6  worker2 reply 4119 arrives
-t7  driver marks task 5 completed
-t8  reduce scans worker temp directories and reads block A and block B
-\end{lstlisting}
+消息状态表是本章的核心工具。每个 request 至少经历 Created、Sent、InFlight、TimedOut、Retried、Completed、Committed、Rejected 或 Cancelled 中的一部分状态。attempt 是物理尝试，request 是逻辑请求，二者不能混用。响应回来时，driver 先按 request 找逻辑状态，再按 attempt 判断是否仍然有效，最后才决定是否提交。没有这张表，超时和迟到响应只能靠 if 语句临时处理。
 
-这条线一写出来，修复方向就变得清楚。问题不是 worker1 写出了 block A，重复执行在分布式系统中可以发生；问题是 reduce 不应该扫描临时目录。Reduce 应该只读取 driver commit manifest 中被接受的 block。临时目录是数据面暂存，manifest 是控制面提交边界。把二者分开后，attempt 0 和 attempt 1 可以都产生文件，但只有被 commit table 接受的那个 attempt 会进入 manifest。
+本机模拟也要承认边界。线程队列可以模拟丢消息、重复消息、延迟和乱序，但不能完全模拟真实网络拥塞、内核协议栈、跨机时钟和进程崩溃。模拟的价值是让语义先可测：身份、超时、重试、幂等和背压。等语义稳定后，再迁移到进程间或真实网络，性能数字必须重新测，协议边界则可以复用。
 
-\topic{复盘第一步：确认 reference}
+超时配置要从延迟分布推导，而不是随便写一个数字。超时太短会制造无意义重试，超时太长会拖慢恢复；不同阶段的超时也不同，map task、shuffle fetch、manifest commit 和 heartbeat 不能共用同一个值。报告应记录正常延迟、尾延迟、重试次数和最终失败数，再调整 deadline。分布式系统里，时间参数本身就是协议的一部分。
 
-事故复盘不能从猜测开始。第一步是确认串行 reference。拿同一批十二个 split，单线程读取，按同样解析规则统计 event type，输出稳定 checksum。若 reference 本身每次不一样，分布式层无从判断。若 reference 和分布式版本解析规则不同，后面所有 trace 都会偏。Reference 要记录输入文件列表、split 边界、总记录数、解析失败数、每个 event 的计数摘要和最终 checksum。
+幂等表要和业务状态同提交。若先写输出文件，再记录 request id，中途崩溃会导致重试重复写；若先记录 request id，再写输出失败，又可能误认为已完成。更稳的做法是让 attempt 写临时输出，commit 阶段原子更新 manifest 和去重记录。这样幂等性不是靠记忆，而是靠提交边界。
 
-这里的关键是“同一语义”。如果分布式 worker 遇到坏行会跳过，而 reference 遇到坏行会中止，结果不一致不是分布式协议造成的。如果 reference 按 event type 排序输出，而分布式版本按哈希表遍历顺序输出，字节级比较可能失败但计数正确。教材项目必须先把这些差异写清，否则读者会把数据合同问题误判为 RPC 问题。
+消息格式要有版本。第一版消息可能只有 request、attempt 和 payload，第二版加入 deadline，第三版加入 epoch 和 trace。如果没有 version，旧 worker 和新 driver 混跑时就无法判断字段含义。版本不是为了兼容所有未来，而是为了让系统在升级和回滚时能拒绝不认识的消息，或者按旧语义解析。教材项目可以用简单整数版本和必填字段检查，先建立意识。
 
-\topic{复盘第二步：查 trace 而不是猜}
+Deadline 还要和取消传播连接。上游请求超时后，下游 task 可能仍在运行；如果它最终完成并提交，就会产生用户已经放弃但系统仍改变状态的问题。稳妥设计是 deadline 进入 MessageEnvelope，worker 在开始前和关键检查点判断是否过期，driver 对过期 attempt 的响应拒绝提交。取消不保证远端立刻停止，但提交点必须尊重逻辑时限。
 
-有了 reference，再看 trace。Trace 不应该只有一行“task 5 success”。它要能回答 task 5 到底启动了几次 attempt，哪个 request 被丢弃，哪个 attempt 写了 block，哪个 block 被 commit，reduce 读了哪些 block。一个有用的 trace 片段应该像下面这样。
+分布式章还应讲观察字段。每条消息记录 send time、receive time、start execute、finish execute、response send 和 response receive，才能区分网络慢、对端排队慢、执行慢还是响应丢失。只记录一个“RPC latency”会把所有成本混在一起。后面的最终项目 runbook 也应要求保留这些字段，方便读者做故障演练。
 
-\begin{lstlisting}[numbers=none]
-000120 driver_send       task=5 attempt=0 request=4107 target=worker1
-000128 worker_start      task=5 attempt=0 request=4107 worker=worker1
-000311 worker_write      task=5 attempt=0 block=A checksum=991
-000315 bus_drop_reply    task=5 attempt=0 request=4107
-000420 driver_timeout    task=5 attempt=0 request=4107
-000436 driver_send       task=5 attempt=1 request=4119 target=worker2
-000491 worker_write      task=5 attempt=1 block=B checksum=991
-000500 driver_commit     task=5 attempt=1 block=B checksum=991
-000700 reduce_read       task=5 attempt=0 block=A
-000701 reduce_read       task=5 attempt=1 block=B
-\end{lstlisting}
+\section{把本机模拟写成真正的分布式语义}
 
-最后两行就是 bug。Reduce 读 block 时没有经过 manifest 过滤。注意，这个结论不是靠背“exactly once”得到的，而是 trace 把错误路径暴露出来。高质量分布式教材要训练读者看路径：一条消息、一个状态、一个提交点。只给名词，不给路径，读者遇到真实问题仍然不会修。
+本机 MessageBus 很容易被写成函数调用包装：driver 调一个方法，worker 立即执行，响应直接返回。这样虽然代码跑在一个进程里，却没有训练分布式思维。正确的教学模拟应强制隔离：driver 和 worker 不共享业务对象，交互只能通过消息；消息可延迟、重复、乱序、丢失；worker 输出必须先写临时位置，再由 driver commit；driver 重启后只能依靠持久状态恢复。
 
-\topic{复盘第三步：收紧不变量}
+这套限制不是为了复杂，而是为了显式补回本地调用栈失去的保证。本地调用里，返回值天然对应本次调用；远端消息里，响应只是带着 request id 的字节包。本地异常能沿栈传播；远端错误必须编码成状态。本地对象生命周期由进程统一管理；远端输出生命周期要靠 attempt、manifest 和清理协议。模拟如果不体现这些差异，读者学到的只是多线程队列，不是分布式模型。
 
-修复时不要只加一个 if。要把不变量写出来：每个 \code{job_id, stage_id, task_id} 最多有一个 committed attempt；reduce 只能读取 manifest 中的 committed block；worker 临时目录中的文件没有业务可见性；迟到响应不能修改 committed record；checkpoint 恢复后仍然遵守这些规则。代码和测试都要围绕这些不变量展开。
+\topic{消息身份和状态表是控制面}
 
-不变量写清后，模块职责也清楚。Worker 可以写临时 block，但不能发布最终结果；Driver 可以接收 reply，但必须通过 CommitTable；CommitTable 可以修改 manifest，但必须保证原子发布；Reduce 可以读取 block，但只能从 manifest 获取有效 block 列表；MessageBus 可以丢消息，但不能改变业务状态。职责一分开，很多模糊设计会自然消失。
+消息字段要回答“这是谁的一次尝试”。Job、stage、task、attempt、request 的作用域不同。Task 是逻辑工作单元，attempt 是物理执行尝试，request 是一次消息交互。响应丢失后重试会产生新 request 和新 attempt，但逻辑 task 不变；提交表应按逻辑 task 去重，而不是按 request 去重。若这个边界混乱，旧响应覆盖新状态、重复 attempt 重复提交都会发生。
 
-\topic{修复后的时间线}
+Driver 状态表是远端调用栈的替代物。它记录当前 attempt、目标 worker、deadline、状态、重试次数和提交结果。响应处理必须先查状态，再验证身份，再检查输出，最后提交。已经 Committed 的 task 收到迟到响应，只能记录 late reply 和清理临时文件，不能改变结果。
 
-修复后，同样事故应该变成下面的路径。
+状态表也服务观测性。每个 task 的发送时间、完成时间、超时次数、late reply、stale reply、输出字节和 checksum 都应记录。没有这些指标，分布式作业慢时只能看到“某些任务慢”，无法区分排队、执行、网络、重试和提交。
 
-\begin{lstlisting}[numbers=none]
-t0  attempt 0 writes temp block A
-t1  reply for attempt 0 is dropped
-t2  driver starts attempt 1
-t3  attempt 1 writes temp block B
-t4  CommitTable accepts task 5 attempt 1
-t5  manifest contains task 5 -> block B
-t6  attempt 0 late reply arrives or block A remains on disk
-t7  driver records late reply and schedules cleanup for block A
-t8  reduce reads manifest and sees only block B
-\end{lstlisting}
+\topic{超时不是远端失败证明}
 
-这条路径允许旧 attempt 留下痕迹，但不允许旧 attempt 产生业务效果。这个区别很重要。分布式系统很难保证“坏事完全不发生”，更现实的目标是让坏事发生后越不过提交边界。临时文件残留是资源问题，重复计数是正确性问题。先保护正确性，再处理资源清理。
+Timeout 只说明本地等待预算耗尽，不说明远端没有执行。请求可能没到，worker 可能正在排队，worker 可能执行完但响应丢失，响应可能迟到。每一种情况的处理不同。若超时后直接认为任务失败并允许新 attempt 提交，同时旧 attempt 仍能提交，就会重复计数或覆盖结果。
 
-\topic{事故报告应该怎样写}
+Deadline 比层层 timeout 更适合复杂路径。Driver 给一次 task attempt 剩余预算，MessageBus 和 worker 都按同一 deadline 判断是否继续。若每层重新设置 timeout，整体请求可能无限拖长。Retry budget 也要全局控制，避免重试风暴。队列满、worker busy、网络抖动时，盲目重试会放大压力。
 
-事故报告不应只写“加入幂等表修复”。至少要包括五段。第一段写现象：哪个输入、哪个 event、差多少、是否可复现。第二段写触发条件：响应丢失、timeout、重试、reduce 扫目录。第三段写根因：reduce 的有效输入来源错误，把临时目录当成提交事实。第四段写修复：manifest 成为唯一有效输入，CommitTable 原子发布。第五段写验证：同一故障种子下 reference 一致，late reply 增加，manifest 只含一个 block，临时残留不影响结果。
+幂等提交保护外部效果。Worker 写临时输出可以重复，driver commit 只能接受一个 attempt。Commit table 记录 task id、accepted attempt、checksum、manifest entry。重复响应、迟到响应和旧 attempt 都不能改变已提交结果。Exactly once 不是“执行只发生一次”，而是“外部可见提交只生效一次”。这句话必须在分布式章讲清楚。
 
-这种报告会让读者形成正确习惯：先描述事实，再定位路径，再提出机制，再验证机制。它比“分布式系统要幂等”这种句子慢，但更接近工程。一个人只有能写出这种复盘，才算真正理解本章。
+\topic{背压和流控防止重试风暴}
 
-\topic{协议细节：从 driver 主循环到提交崩溃点}
+分布式系统里的队列也要有界。Driver 向 worker 发送任务，要限制 per-worker in-flight；worker 接收队列满时，应返回 busy 或让 driver 等待；shuffle block 拉取也要控制并发。没有流控，慢 worker 会积压请求，driver 超时后又重试到更多 worker，最终把系统拖垮。
 
-本章前面讲了状态和失败，现在把它落到更接近代码的流程。Driver 主循环可以看成四类工作：调度新 task，处理消息，检查 deadline，提交 checkpoint。真实实现可以是事件循环、多线程或 actor，但语义顺序基本一致。重要的是每一步都要先看状态，再改变状态，不能把网络回调写成随意修改全局 map 的函数。
+流控要区分任务数和字节数。一个大 split 和一个小 split 都是一项任务，但内存、I/O 和网络成本不同。Window 可以同时按 in-flight task 数、in-flight bytes 和 deadline 控制。响应包含 output bytes 和处理耗时，driver 根据反馈调整分配。这个机制和本机 I/O 背压、线程池队列容量同源。
 
-\begin{lstlisting}[numbers=none]
-driver loop:
-  poll messages from MessageBus
-  for each message:
-      dispatch by message type
-  check deadlines for sent or running tasks
-  start retries if policy allows
-  schedule pending tasks if worker windows allow
-  flush commit manifest or checkpoint when needed
-  emit metrics and trace events
-\end{lstlisting}
+Trace id 串联三端日志。Driver 发请求、MessageBus 投递、worker 接收、worker 写输出、driver commit，都要携带同一组 id。否则响应丢失和乱序时无法复盘。分布式系统的可调试性来自控制面字段的一致使用，而不是事后拼文本。
 
-这个循环让读者看到，分布式系统不是一个大 if。消息处理、deadline 检查、调度和 checkpoint 都会竞争同一批 task 状态。若 response handler 正在 commit，deadline checker 又认为同一 task timeout，代码必须有清晰的状态转换规则。最简单的教学实现可以把 driver loop 放在单线程中，先避免数据竞争，把协议语义写对。等语义稳定后，再讨论多线程 driver 和锁。
+\topic{故障注入和恢复演练}
 
-\topic{发送请求前的检查}
+本章实验必须包含故障注入：丢请求、丢响应、重复请求、乱序响应、worker 崩溃、driver 重启、队列满、commit 失败。每次只开一种故障，先看 reference 是否保持，再组合故障。不要一开始就做复杂混沌测试，否则无法归因。
 
-Driver 准备发送 task 时，至少检查五件事。第一，task 是否仍为 \code{Pending} 或允许 retry；第二，job deadline 是否还有预算；第三，目标 worker 的窗口是否有容量；第四，split 元数据是否有效；第五，新 request id 是否已经分配并写入 task entry。发送前先写状态还是发送后再写状态，也要明确。
+恢复演练要从 checkpoint 开始。Driver 重启后读取 task table 和 commit table，重新发送未完成 task，拒绝旧 epoch 响应，清理未提交临时文件。若所有状态只在内存里，重启演练必然失败。教学项目可以用本地文件保存简化状态，但必须有版本、checksum 和崩溃点测试。
 
-教学实现可以采用保守顺序：先在内存中生成 request id 和 attempt，调用 MessageBus send；若 send 返回 accepted，再把 task 标记为 \code{Sent} 并记录发送时间；若 send 返回 busy，则 task 保持 pending 或进入退避队列。若先把 task 标记为 sent，再发现 MessageBus 拒绝，就会留下一个没有真实消息的 sent 状态。真实多线程实现还要考虑 send accepted 后 driver 立刻崩溃，这就进入 checkpoint 设计。
+本章和真实系统仍有距离：没有真实网络拥塞、没有多进程隔离、没有节点时钟漂移、没有滚动升级。但它已经覆盖分布式模型的核心：身份、状态、超时、重试、幂等、背压和恢复。把这些在本机讲透，比一开始列 CAP 和 Paxos 更适合第二册。
 
-\topic{处理 Busy 不是处理失败}
+\topic{案例走查：响应丢失后的重复提交}
 
-Busy 表示容量信号，不等于业务失败。Worker busy 时，driver 不应该马上把 task 标成 failed，也不应该立刻对同一 worker 高速重试。更合理的行为是记录 busy，更新 worker 窗口，设置 retry after，把 task 放回 pending 或 delayed queue。若有其他健康 worker，可以换 worker；若所有 worker 都 busy，driver 应降低调度速率。
+Worker 收到 request 8001，完成 task 17 attempt 0，写出临时 block，并发送 reply。MessageBus 丢弃 reply。Driver 超时，启动 attempt 1，worker 又写出一个 block，reply 8002 到达并提交。稍后旧 reply 8001 迟到。若 driver 只按 \code{task_id} 更新结果，旧 reply 可能覆盖新提交或重复计数；若 commit table 按 \code{task_id} 去重并检查 attempt，旧 reply 只能进入 late reply 指标。
 
-Busy 的语义要和 deadline 结合。若 task deadline 还有很多预算，可以等待；若 deadline 接近耗尽，继续排队可能没有意义。此时应返回 deadline exceeded 或 stage timeout，而不是把系统压到更满。过载时快速失败虽然看起来不友好，但比无限排队更可诊断。
+这个案例要写出状态表每一步。Pending、Sent、Running、Retrying、Committed 如何变化；\code{current_attempt} 何时递增；commit table 何时写入；旧 response 如何被拒绝；临时文件如何清理。读者看到状态表，才能理解幂等提交不是口号。
 
-\topic{处理响应的细化流程}
+实验中固定随机 seed，注入一次响应丢失和一次迟到。期望最终输出和串行 reference 一致，commit table 只有一条 task 17，late replies 为 1，临时目录没有未引用 block。这个验收比“作业成功”更具体。
 
-响应处理可以拆成身份检查、状态检查、输出检查和提交检查。身份检查确认 \code{task_id}、\code{attempt}、\code{request_id} 是否属于可接受范围；状态检查确认 task 未提交且未失败；输出检查确认 worker 报告的字节数、记录数、checksum 和 manifest 中临时 block 一致；提交检查由 CommitTable 决定是否接受。
+\topic{MessageBus 的故障规则文件}
 
-\begin{lstlisting}[numbers=none]
-reply handling:
-  1. find task entry
-  2. reject unknown task
-  3. reject already committed task as late reply
-  4. reject stale attempt
-  5. reject stale request id
-  6. verify status and output checksum
-  7. call CommitTable.try_commit
-  8. update task state from commit decision
-  9. emit trace and metrics
-\end{lstlisting}
+故障注入要可复现，不能靠随机心情。MessageBus 可以读取一个规则列表：第几条消息、匹配哪个 request id、执行 drop、delay、duplicate、reorder 或 corrupt。每条规则有 seed 和触发次数。这样报告能写“丢弃 request 8001 的第一次 reply”，别人可以复现同一路径。
 
-顺序不能随便调。若先 verify output 再检查 stale attempt，旧 attempt 可能触发昂贵 I/O；若先更新 task state 再 commit manifest，崩溃后内存状态丢失；若 CommitTable 返回 already committed 却仍覆盖 task entry，会破坏迟到响应语义。书里把这个流程写细，是为了让读者知道哪些 if 是协议边界，不是代码风格。
+规则文件还要记录注入点。丢请求和丢响应不同；worker 执行前崩溃和写出后崩溃不同；driver commit 前崩溃和 commit 后崩溃不同。单点问题单点分析，不要一次开一堆故障。只有单点路径都清楚后，组合故障才有意义。
 
-\topic{提交崩溃点矩阵}
+项目中的 MessageBus 不要偷偷共享对象引用。消息进入 bus 时复制或移动成独立对象，worker 修改本地副本，不影响 driver 内存。这样本机模拟才接近跨进程语义。若为了性能共享指针，就必须在教学文本中说明这是模拟层优化，不能改变协议边界。
 
-Commit 是最容易模糊的地方。下面不用表格，而用四个崩溃点逐个分析。第一，验证输出前崩溃。恢复后 manifest 没有新记录，task 仍未提交，可以重跑。临时文件可能存在，但 reduce 不会读。第二，验证输出后、写新 manifest 前崩溃。恢复行为相同，因为没有发布提交事实。第三，写完新 manifest 临时文件、rename 前崩溃。恢复时只读取已发布 manifest，临时 manifest 被清理或忽略。第四，rename 成功后、内存 task state 更新前崩溃。恢复时读取新 manifest，task 变为 committed，不会重跑。
+\topic{分布式章节的源码阅读边界}
 
-这四个点说明为什么原子发布重要。恢复逻辑只相信一个事实来源：已发布 manifest。内存状态、临时文件、未发布 manifest 都不能单独证明 task 已提交。这样设计后，崩溃点再多，也会收敛到两类：发布前当作未提交，发布后当作已提交。
+本章不是网络库教程。源码阅读可以看 Linux socket buffer、epoll ready、TCP 重传的高层资料，但主线仍是协议状态。读者先把 request/reply、deadline、retry、commit table 写清，再去看网络实现。否则很容易陷入 API 细节，忘记超时不能证明远端失败。
 
-\topic{manifest 的内容}
+也可以阅读成熟系统的任务状态设计，例如 MapReduce/Spark 的 stage、task、attempt 概念，但要避免照搬。阅读时只摘取身份、attempt、speculation、shuffle 文件和 commit protocol 这些与本章项目对应的点。每读一个概念，都要写“它解决本项目哪个失败路径”。
 
-Manifest 不是一个简单路径列表。它至少要包含 job id、stage id、task id、attempt、reduce partition、文件位置、字节数、记录数、checksum 和 schema version。若只保存文件路径，恢复时不知道这个文件属于哪个逻辑 task，也不知道是否来自旧 attempt。若不保存 checksum，磁盘残缺或写入错误可能被当作有效数据。若不保存 schema version，后续格式变化会破坏旧 checkpoint。
+本章作业要求写一个故障矩阵，而不是写更多代码。行是故障点，列是 driver 状态、worker 状态、临时输出、commit table、最终结果。填完矩阵，代码实现就有了目标。
 
-\begin{lstlisting}[language=C++,caption={manifest 条目的教学形态}]
-struct ManifestEntry {
+\topic{综合练习：填写响应丢失故障矩阵}
+
+本题给定一个 task 的时间线：driver 发送 request，worker 收到，worker 写临时输出，reply 丢失，driver 超时重试，新 attempt 成功提交，旧 reply 迟到。读者要填写矩阵：每个时间点 driver task state、current attempt、commit table、临时文件、可接受响应集合、指标如何变化。矩阵中任何一格写不出，就说明状态机不完整。
+
+第二步改故障点：丢请求而不是丢响应。此时 worker 没有执行，旧输出不存在，driver 重试是安全的。再改成请求重复投递，worker 可能执行两次同一 attempt。读者要比较三种情况，不能用同一个“超时重试”句子糊弄。单点问题单点分析，是分布式章的基本纪律。
+
+第三步加入 driver 重启。内存中的 current attempt 丢失后，持久 task table 和 commit table 如何恢复？旧 worker 回来的响应带旧 epoch，应如何处理？若没有持久状态，矩阵会空掉。这个题能让读者理解为什么分布式系统必须把调用栈变成状态表。
+
+验收不是口头回答，而是项目测试。MessageBus 按规则注入故障，程序输出矩阵摘要和最终 checksum。测试通过时，late reply、stale reply、retry count 等指标也要符合期望。
+
+\topic{容易出错的边界：远端调用不能用本地直觉修补}
+
+第一个反例是“超时等于失败”。超时只说明本地没等到，不说明远端没执行。第二个反例是“重试总能提高可靠性”。没有幂等和预算的重试会重复提交并放大故障。第三个反例是“响应到了就成功”。响应可能来自旧 attempt、旧 epoch 或旧 request，必须先检查身份和状态。
+
+第四个反例是“本机模拟共享内存没关系”。如果 driver 和 worker 共享业务对象，消息丢失、序列化、生命周期和旧响应都被掩盖。第五个反例是“exactly once 表示只执行一次”。在故障下执行可能多次，系统能保证的是外部提交只生效一次。第六个反例是“日志里有 request id 就够”。状态表、指标、manifest 和临时文件都要使用同一身份体系。
+
+本章源码索引要求读者检查所有跨边界函数调用：是否实际上绕过了 MessageBus，是否传了指针或引用，是否共享了 mutable 状态，是否没有 request id。任何绕过协议的捷径都要删除或标明只用于测试。教学模拟要逼迫读者面对分布式语义，而不是用本机便利逃避问题。
+
+故障注入也要写索引。每个规则有名字、触发点、期望指标和恢复动作。比如 \code{drop_reply_once} 期望 retry count 加一、late reply 可能出现、commit 仍唯一。规则名比随机代码更能形成学习材料。
+
+\topic{本章核心接口：MessageEnvelope}
+
+分布式模型章给项目留下 \code{MessageEnvelope}。所有消息都有 protocol version、message type、job id、stage id、task id、attempt、request id、epoch、deadline、payload bytes 和 checksum。业务 payload 可以变化，envelope 字段必须稳定。没有 envelope，就无法统一处理重试、迟到响应、版本兼容和 trace。
+
+MessageEnvelope 也让本机模拟更真实。Driver 和 worker 只能看到 envelope 和 payload，不能直接共享对象。故障注入规则匹配 envelope 字段，指标也按 envelope 聚合。这个接口是从单机运行时走向分布式系统的关键边界。
+
+\topic{从消息模型进入分区和复制}
+
+消息模型解决单个 task attempt 的身份、超时、重试和提交。下一章的问题更大：当很多 task、很多 key、很多 partition 同时存在时，谁拥有哪份状态，状态如何复制，旧 owner 的消息如何拒绝。没有第十六章的 request、attempt 和 commit table，就无法理解分区 epoch；没有分区 epoch，迟到响应和迁移会再次失控。
+
+项目中，MessageEnvelope 的 epoch 字段在本章可能只是 driver 重启版本，下一章会扩展成 OwnershipEpoch。这个扩展说明协议字段不是随便加的，而是从单点故障逐步推广到状态归属。读者应看到概念如何长大，而不是突然进入“共识”大词。
+
+\topic{深入补充：单点故障要按位置拆开}
+
+分布式故障不能只写“worker 失败”。Worker 在收到请求前失败，driver 只会超时；worker 收到请求后、执行前失败，可能没有输出；执行后、写临时文件前失败，没有可提交结果；写临时文件后、发送响应前失败，输出存在但 driver 未知；发送响应后失败，driver 可能已经提交。每个位置对恢复的要求不同。把它们都叫 worker failed，会掩盖协议边界。
+
+Driver 失败也要拆。发送请求前失败，重启后任务仍 pending；发送请求后、持久化状态前失败，可能出现远端执行但 driver 不知道；commit table 写入前失败，临时输出未发布；manifest 写入后失败，结果已可见。教学项目可以简化持久化，但必须写清简化假设。否则读者会误以为内存状态足以恢复分布式作业。
+
+网络故障同样拆位置。请求丢失、请求重复、响应丢失、响应重复、响应乱序、响应损坏，处理方式都不同。请求重复要求 worker 或 commit 幂等，响应乱序要求 attempt 检查，响应损坏要求 checksum 或协议校验。单点问题单点分析，就是把这些位置逐个写进测试，而不是用一个随机故障开关覆盖一切。
+
+\topic{深入补充：消息格式和版本演进}
+
+教学项目即使用内存对象模拟消息，也要设计稳定格式。字段要有版本，未知字段如何处理要有策略，必需字段缺失要拒绝。真实系统滚动升级时，新旧 worker 可能同时存在；即使本书项目不实现滚动升级，也要让读者知道协议版本为什么存在。没有版本，消息结构一改，旧状态和旧日志都可能无法读取。
+
+版本演进有三条保守规则。第一，新增字段要有默认值，旧消息读入时能得到合理语义。第二，改变字段含义要增加版本，不要复用旧名字。第三，删除字段要经过兼容期，至少恢复程序能读旧 checkpoint。Manifest、task table 和 message envelope 都属于长期状态，不应随意改变。
+
+这部分会影响第三册模型文件管理。模型 artifact、tokenizer、量化参数和算子版本都需要稳定元数据。第二册在 MessageEnvelope 中训练版本意识，第三册就能自然迁移到 ModelArtifact。
+
+\topic{深入补充：本机模拟的边界声明}
+
+本机模拟无法覆盖真实网络的全部问题。它没有跨机器时钟漂移，没有真实 TCP 拥塞控制，没有进程崩溃后的资源泄漏，没有操作系统级网络分区，也没有多版本节点长期共存。教材必须把这些边界写清楚。写清边界不是降低质量，而是防止读者把模拟结论过度外推。
+
+但是本机模拟仍然非常有价值。它可以稳定复现请求丢失、响应丢失、重复、乱序、队列满、driver 重启和 commit 幂等。它让读者在一台手机或笔记本上训练协议思维。等将来进入真实多机环境，新增的是网络和运维复杂度，核心状态机已经有基础。
+
+因此本章验收分两层。第一层是模拟内语义正确：所有故障注入下 checksum 和状态表符合预期。第二层是边界声明完整：列出哪些真实分布式问题尚未覆盖。两个层次都完成，才算合格。
+
+\topic{故障矩阵细化：请求、执行、输出、响应四段分开}
+
+为了让分布式模型不再模糊，本章可以把每个 task attempt 拆成四段。第一段是请求投递：driver 生成 request，MessageBus 接收，worker 队列入队。这里的失败包括请求没有进入 bus、进入 bus 但被丢弃、worker 队列满、请求重复入队。第二段是远端执行：worker 取出 request，检查 epoch 和 deadline，读取 input split，运行 map。这里的失败包括 worker busy、deadline 已过、输入读失败、解析错误、执行中崩溃。第三段是输出生成：worker 写临时 block，计算 checksum，记录 output bytes。这里的失败包括短写、校验不一致、临时目录不可写、写出后崩溃。第四段是响应返回：worker 发送 reply，driver 接收，验证身份和输出，写 commit table。这里的失败包括响应丢失、重复、乱序、旧 attempt、旧 epoch、commit 前崩溃。
+
+这四段对应四类状态，不能混成一个 Running。请求投递阶段失败，通常可以换 worker 重发；远端执行阶段失败，要看是否产生外部效果；输出生成阶段失败，可能需要清理临时文件；响应返回阶段失败，最容易出现“远端已经做完，本地不知道”。不同阶段的重试语义不同。若教材只写“超时后重试”，读者就会忽略这些差异。
+
+故障矩阵可以用文本列表示。行是故障点，列是是否可能已有临时输出、是否可能已有外部提交、是否允许同 attempt 重发、是否必须增加 attempt、是否需要清理、是否影响最终 checksum。比如响应丢失时，可能已有临时输出但未提交，允许新 attempt，旧 reply 迟到要拒绝；请求丢失时，没有临时输出，重发较简单；commit 后 driver 崩溃时，最终输出已可见，恢复不能重复提交。这样的矩阵能把分布式故障从故事变成决策表。
+
+\topic{本机模拟中的持久化最小集}
+
+即使是本机模拟，也要明确哪些状态必须持久化。最小集合包括 job id、epoch、task table、commit table、partition assignment 和 manifest。Task table 让 driver 知道哪些任务未完成；commit table 防止重复提交；epoch 拒绝旧响应；manifest 告诉 reduce 哪些输出可见。若这些只存在内存里，driver 重启测试没有意义。
+
+持久化可以很简单。教学项目可以用文本或 JSON 行，每条记录带 version、checksum 和换行结束标记。恢复时读到半行就丢弃或报错，读到 checksum 不匹配就拒绝。这个实现不追求数据库级能力，但能训练两个关键概念：状态要有稳定格式，恢复要验证完整性。不要用“以后再持久化”跳过这个边界，因为一跳过，很多分布式语义都无法测试。
+
+持久化状态还要和临时文件目录对账。恢复时扫描 manifest 引用的 block，确认存在且 checksum 正确；扫描临时目录中未引用 block，按 epoch 和 attempt 判断可清理或保留诊断。这个对账过程和 I/O 章的崩溃点矩阵衔接。单机可靠写入和分布式 commit 在这里合并成同一条恢复路径。
+
+\topic{故障注入报告的固定格式}
+
+每个分布式故障实验都应输出固定格式。第一段写规则：例如 drop reply for request 8001 once。第二段写期望：retry count 加一，commit table 最终一条，late reply 一条，checksum 与 reference 一致。第三段写实际状态：task table 状态变化，worker 输出文件，driver 指标。第四段写结论：是否通过，若失败，失败发生在哪个阶段。第五段写边界：本实验没有覆盖真实网络拥塞、时钟漂移或多进程崩溃。
+
+这种格式能避免故障实验变成日志截图。读者不需要翻几千行日志找答案，而是先看摘要，再按 id 追踪细节。项目工具可以自动生成一部分摘要，书中展示文本样例。EPUB 中保持文本形式，也避免图片解析问题。
+
+本章最后要强调，分布式模型的学习成果不是会说 RPC、CAP 或一致性，而是能面对一个具体故障，写出状态表、提交边界和恢复动作。只要做到这一点，后续分区、复制和最终工程章才有坚实基础。
+
+\section{项目落地}
+
+Compute Systems Engine 的分布式模拟从三个对象开始：driver、worker、message bus。driver 生成任务和 request id；worker 读取本地分片并执行 map/reduce；message bus 用有界队列模拟网络，支持随机延迟、超时、重复和丢弃。每条消息携带 request id、attempt、source、target partition 和 payload size。
+
+第一版只做日志计数：worker 本地统计 key，再把 partial 发给 reduce partition。第二版加入重试：message bus 随机丢响应，driver 重试同一 request id，reduce 端必须去重。第三版加入背压：reduce 队列满时返回 busy 或延迟，map 端降低发送速率。第四版加入检查点：每个 partition 记录已提交 request id 和结果。
+
+\topic{消息身份}
+request id 表示一次逻辑操作，attempt 表示第几次尝试。重试不能换 request id，否则服务端无法去重。
+
+
+\topic{超时}
+超时不是失败证明。远端可能没收到，可能排队，可能执行完成但响应丢失。客户端必须把未知状态写进协议。
+
+
+\topic{幂等}
+幂等要把 request id、业务状态和结果放在同一提交边界里。只在客户端生成 ID，不在服务端持久记录，不能防重复执行。
+
+
+\topic{deadline}
+跨层调用应传递截止时间，而不是每层重新给自己完整 timeout。deadline 让下游知道剩余预算，避免请求超过用户期望。
+
+
+\topic{重试预算}
+重试提高成功率，也可能制造风暴。预算要按一次上游请求计算，限制 attempt 总数、退避和抖动。
+
+
+\topic{消息版本}
+协议升级要求版本、类型、长度和兼容规则。C++ 结构体内存布局不能直接当 wire format。
+
+
+\topic{背压协议}
+服务端 busy 应进入响应分类，让客户端降低并发或停止低优先级请求。把 busy 当普通失败重试，会放大过载。
+
+
+\topic{本机模拟}
+本册可以用 MessageBus 在本机模拟丢包、重复、延迟和 busy。模拟不能证明网络性能，却能验证语义。
+
+
+\topic{案例：响应丢失}
+worker 已提交结果但响应被丢弃，driver 用同一 request id 重试。reduce 端应返回旧结果，不重复执行。
+
+
+\topic{案例：慢节点和重试风暴}
+让一个 worker 变慢，客户端无预算重试，再加入 retry budget 和 jitter，比较请求放大倍数。
+
+
+\topic{案例：协议版本}
+构造旧版本 worker 收到新字段的消息，要求拒绝或按兼容规则处理。
+
+
+\topic{源码阅读路线}
+Linux 源码阅读从 \filepath{net/core/dev.c}、\filepath{fs/eventpoll.c}、\filepath{kernel/time/timer.c} 附近进入即可。阅读目标不是把整套子系统抄进书里，而是追一条和本章实验相关的路径：用户态动作怎样变成内核对象，内核对象怎样排队、等待、唤醒、计数、提交或回收。
+
+阅读报告要写证据等级。能直接测到的数字放在第一层；从源码控制流推导出的解释放在第二层；当前设备无法验证、只能作为合理猜测的内容放在第三层。这样读者会知道 消息语义报告 中哪些结论可复现，哪些结论需要换机器继续确认。
+
+源码阅读还要克制。看到一个复杂函数，不要把每个分支都展开；先回到本章的问题，问它能否解释一个等待点、一次状态转移或一条性能曲线。解释不了的内容可以留到索引，不要打断正文主线。
+
+\topic{响应丢失}
+worker 已提交结果但响应被丢弃，driver 用同一 request id 重试。reduce 端应返回旧结果，不重复执行。
+
+\topic{慢节点和重试风暴}
+让一个 worker 变慢，客户端无预算重试，再加入 retry budget 和 jitter，比较请求放大倍数。
+
+\topic{协议版本}
+构造旧版本 worker 收到新字段的消息，要求拒绝或按兼容规则处理。
+
+\topic{RPC 不是函数}
+
+远程调用经过序列化、排队、网络、对端调度和响应路径。超时后不知道远端是否执行。
+
+实验设计：让服务端执行成功但响应丢失，观察客户端重试。
+
+\topic{消息身份}
+
+request id、attempt id、trace id 和 partition id 分别解决不同问题。一个 id 不能承担全部语义。
+
+实验设计：构造同一 request 多次 attempt，检查去重表。
+
+\topic{幂等提交}
+
+幂等不是客户端生成 id 就够了。服务器要把 request id、业务修改和结果放进同一提交边界。
+
+实验设计：模拟修改状态后崩溃但未记录 id 的错误路径。
+
+\topic{重试预算}
+
+重试能提高成功率，也能放大过载。预算要按上游请求计算，不能每层服务各自无限重试。
+
+实验设计：统计原始请求数、尝试数、超时数和最终失败数。
+
+\topic{退避和抖动}
+
+所有客户端同时重试会形成重试风暴。指数退避和抖动让压力分散，但会增加尾延迟。
+
+实验设计：让多个客户端同时遇到慢服务，比较固定间隔与抖动。
+
+\topic{逻辑时间}
+
+墙钟适合观测，不适合证明顺序。epoch、term、version 和 log index 表达协议中的先后。
+
+实验设计：让两个节点时钟错开，说明不能用时间戳决定提交顺序。
+
+\topic{故障检测}
+
+超时只能表示怀疑，不能证明节点已死。慢节点、网络拥塞和进程暂停都可能表现为心跳丢失。
+
+实验设计：在模拟器中注入慢 worker 和断连，比较恢复动作。
+
+\topic{部分失败}
+
+十个分片九个成功一个失败，业务要决定返回部分结果、失败整体还是降级。没有统一答案，只有语义选择。
+
+实验设计：为搜索、计费和统计三种业务分别写处理策略。
+
+\topic{本机模拟}
+
+没有多机也能训练协议思维。多进程或多线程队列可以模拟乱序、重复、丢失、延迟和崩溃。
+
+实验设计：实现有界 MessageBus，并可配置错误率和延迟。
+
+\topic{项目接口}
+
+MessageEnvelope 记录协议版本、请求身份、attempt、deadline、payload、错误分类和幂等键。
+
+实验设计：后续分片、复制和 shuffle 都使用同一消息头。
+
+\section{分布式不是远程函数调用，而是消息、身份和不确定性}
+
+分布式模型章节要先拆掉本地函数调用直觉。本地函数调用要么进入函数体，要么调用前失败；调用栈、对象寿命和异常都在一个进程里。RPC 看起来像函数，实际经过序列化、队列、网络、对端调度、执行、响应和客户端完成路径。任何一段都可能慢、丢、重复或部分完成。超时后，客户端不知道远端是否执行，这就是幂等和提交点出现的根源。
+
+消息身份不能只放一个 id。request id 表示逻辑请求，attempt id 表示一次尝试，trace id 串起跨节点路径，partition id 指示归属，epoch 或 version 表示路由和协议状态。缺少 attempt，服务端无法区分第一次请求和重试；缺少 request id，重复请求无法去重；缺少 epoch，旧路由可能继续写旧 owner。身份字段不是日志装饰，而是协议语义。
+
+幂等要落到提交边界。客户端生成 request id 只是开始。服务端必须把 request id、业务状态修改和响应结果放进同一个原子提交边界。若先修改业务状态，崩溃前没记录 request id，重试会重复执行；若先记录 request id，业务状态没改就崩溃，重试又可能误以为成功。数据库事务、WAL、共识日志或状态机日志都是围绕这个边界服务。
+
+重试预算是性能和正确性的交界。一个请求调用十个下游，每个下游重试三次，系统负载可能迅速放大。服务已经慢时，所有客户端同时重试，会形成重试风暴。指数退避和抖动能分散压力，但也会增加尾延迟。报告要记录原始请求数、尝试数、超时数、成功数和最终失败数，而不是只写“加了重试”。
+
+时间也要重新理解。墙钟适合日志排序和观测，不适合证明因果。两个机器时钟可能漂移，进程可能暂停，网络延迟可能抖动。逻辑时间如 epoch、term、version、log index 才是协议里的顺序。请求 A 触发请求 B，B 的墙钟时间可能更早，但因果上仍在 A 之后。教材要让读者看到为什么分布式系统常用版本号而不是只看时间戳。
+
+本章可以在本机模拟，不必等待真实集群。用多线程或多进程建立 MessageBus，每个 worker 有输入队列，网络由有界队列、随机延迟、重复、丢弃和乱序模拟。这个模拟不能证明真实网络性能，却能验证语义：request id 是否去重，attempt 是否可追踪，deadline 是否传播，背压是否控制队列，迟到响应是否被安全处理。先在一台机器上把协议状态讲清，迁移到真实网络时才不会把不确定性放大成混乱。
+
+故障模型要写明。多数教学系统处理 crash-stop 或 crash-recovery，不处理恶意拜占庭错误。机器慢、网络分区、响应丢失、消息重复和进程重启分别需要不同策略。CAP 也要具体到场景：分区发生时，是继续响应可能陈旧的请求，还是拒绝以保持强一致。只背 CAP 缩写没有工程价值。
+
+\topic{案例推导：一次响应丢失如何逼出 request id、attempt 和幂等表}
+
+客户端向 worker 发送“处理 split 7”的请求，worker 完成处理并提交输出，但响应在返回途中丢失。客户端超时后重试。同一个逻辑请求现在有两次 attempt：第一次可能已经成功，第二次正在发送。如果系统只按当前连接状态判断，就会把同一 split 再处理一遍，产生重复输出。这个小案例足以推导出 request id、attempt id 和幂等提交表。
+
+request id 表示逻辑请求，重试不能改变它；attempt id 表示一次尝试，便于观察和诊断；输出提交表记录 request id 对应的结果和状态。worker 收到重复 request id 时，不应再次执行业务副作用，而应返回之前保存的结果。这里的关键是保存结果必须和业务状态修改处于同一提交边界。否则修改完成但结果未保存时崩溃，重试仍会重复执行。
+
+超时也要重新解释。客户端超时只说明本地等待超过预算，不说明服务器没执行。取消请求也是尽力而为，不保证远端停止。客户端可以停止等待用户结果，但系统仍要消费迟到响应，清理 attempt 状态，并防止重复回调。这个逻辑和 I/O completion 迟到完全一致，只是完成事件来自网络。
+
+重试预算防止系统自我放大。若每个 split 请求最多重试三次，一个作业有一万个 split，最坏尝试数就会显著增加。若下游已经过载，固定间隔重试会形成风暴。指数退避和抖动可以分散压力，但 deadline 剩余不足时不应继续重试。报告要记录每个 request 的 attempt 数和最终原因，而不是只记录成功率。
+
+本机模拟可以复现全部语义。MessageBus 随机丢弃响应、重复请求、延迟消息；worker 维护幂等表；driver 维护 deadline 和 attempt 状态。输入不需要大，三个 split 就够：一个正常，一个响应丢失，一个 worker 慢。观察 manifest 是否只提交一次，迟到响应是否被识别，重试预算是否生效。这个实验比搭建真实集群更适合教学，因为每个不确定性都可控。
+
+源码或工具阅读可以补充 socket 的 ready 语义和网络缓冲，但不要把本章变成网络协议大全。读者要带走的是：分布式正确性从“我调用了函数”转成“我发送了带身份的消息，并定义了重复、超时和提交”。
+
+\begin{labbox}
+实验：在本机用多个进程模拟客户端和服务器。人为加入随机延迟和超时，观察重试如何造成重复请求。设计一个幂等请求 ID 机制。
+\end{labbox}
+
+\topic{分布式从本地调用失效开始}
+本地函数调用有调用栈、返回值和异常；远程调用没有这些天然保证。请求可能丢，响应可能丢，远端可能执行成功但本地不知道，远端可能执行两次，本地时钟可能和远端不一致，网络延迟可能突然变大。分布式系统模型不是概念列表，而是解释为什么本地调用语义在跨进程后失效。只有从这个断裂开始，超时、重试、幂等和 trace 才有必要。
+
+贯穿项目中，driver 发送 task 给 worker。若 driver 超时没有收到响应，有三种可能：worker 没收到，worker 收到但还没执行完，worker 执行完但响应丢了。driver 若直接重发，就可能让同一个 task 执行两次。若 task 写输出没有 attempt 身份和幂等提交，重复执行会污染结果。这个例子应贯穿本章，而不是只在最后出现。
+
+\topic{消息身份是恢复的起点}
+每条请求至少需要 request id、task id、attempt id、driver epoch 和 deadline。Request id 用于去重，task id 表示逻辑任务，attempt id 表示一次执行尝试，epoch 区分 driver 重启或领导权变化，deadline 限制过期工作。响应也要带回这些身份，否则 driver 无法判断它对应哪个请求、是否过期、是否来自旧 attempt。
+
+幂等结果表记录已经接受的结果。若同一个 request id 重复到达，可以返回同一摘要；若旧 attempt 晚到，要检查它是否仍是有效 attempt；若新 attempt 已提交，旧响应不能覆盖。这里的核心不是某个 RPC 框架，而是身份和状态机。没有身份，重试无法安全。
+
+\topic{超时不是失败证明}
+超时只说明在本地预算内没有等到结果，不证明远端没有执行。把超时当失败证明，是分布式程序的常见错误。正确做法是把超时视为不确定状态，进入查询、重试、取消或降级流程。重试必须和幂等配合，取消也不一定能终止远端正在运行的任务，只能请求它在安全点停止或忽略其结果。
+
+Deadline 比单次 timeout 更完整。Deadline 表示整个请求的截止时间，传递给下游后，每一层都能知道剩余预算。否则每层都用自己的 timeout，会让总耗时无限放大。项目里的 task message 应携带 deadline，worker 在开始前检查，运行中在 batch 边界检查，写出前再次检查。过期任务不应继续消耗大量资源。
+
+\topic{Trace 替代调用栈}
+跨进程后，本地调用栈断了，trace id 需要承担连接责任。一条任务从 driver 发出，到 worker 接收，到执行 parse，到写 block，到返回结果，每个事件都带同一个 trace id 和 task identity。故障时，读者可以沿 trace 看到请求在哪里等待、在哪里重试、哪个 attempt 写了输出、哪个响应被丢弃。没有 trace，分布式调试只能靠猜。
+
+Trace 也能用纯文本输出：时间、组件、事件、request id、attempt、state、摘要。EPUB 中不需要图片。读者可以把文本 trace 和单机任务 trace 对照，看到第二册从线程运行时到分布式 driver 的连续性。
+
+\topic{实验：丢响应后的正确行为}
+构造一个本机 MessageBus，支持注入丢请求、丢响应、延迟、重复和乱序。场景是 worker 实际完成并写出结果，但成功响应被丢。Driver 超时后重试，worker 收到重复 request。正确行为是：若原 request 已完成且结果可验证，返回同一结果摘要；若新 attempt 被创建，提交表只能接受一个有效 attempt；旧 attempt 晚到不能覆盖新提交。
+
+报告要列状态表，而不是只说“支持重试”。状态包括 Sent、Received、Running、Completed、ResponseLost、Retrying、DuplicateObserved、Committed。每个状态允许哪些转移，哪些消息被忽略，哪些消息触发告警。分布式章节若没有状态表，就容易变成概念堆砌。
+
+\topic{Linux 和系统工具连接点}
+本章不需要深入内核网络栈，但要会用基本工具观察连接和延迟。\cmd{ss} 查看连接状态，\cmd{tcpdump} 或日志 trace 观察消息，\cmd{tc netem} 可以注入延迟和丢包，进程日志记录 request id。源码阅读可以关注 RPC 框架或消息队列如何处理 request id、deadline、retry 和 connection state。重点仍是语义，不是工具列表。
+
+把这些工具带回项目，可以让本机模拟真正表现出分布式问题。即使所有进程跑在同一台 Linux 上，只要消息可能延迟、丢失、重复和乱序，程序就必须按分布式语义设计。这样读者进入真实集群时不会以为问题突然出现。
+
+\topic{消息身份的第二轮细读}
+
+本节继续把 driver 向 worker 派发 task 拆开。前面已经建立了基本概念，现在要进一步追问：worker 成功执行但响应丢失，driver 超时后重试导致重复执行 时，旧程序为什么失去解释能力，哪些对象必须独立出来，哪些实验能证明改进有效。这里不新增目录层级，只把本章最容易含糊的点逐个压实。
+
+\topic{为什么超时不是失败证明}
+
+先把问题落到一个具体动作上。为什么超时不是失败证明，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+\topic{为什么 request id 是去重起点}
+
+这一点不能只靠定义说明。为什么 request id 是去重起点，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+\topic{为什么 attempt id 区分逻辑任务和尝试}
+
+真正的判断来自反例。为什么 attempt id 区分逻辑任务和尝试，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+\topic{为什么 deadline 比局部 timeout 更可靠}
+
+工程上更稳的路径是先固定语义。为什么 deadline 比局部 timeout 更可靠，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+\topic{为什么重试需要预算}
+
+读者容易忽略的地方在边界。为什么重试需要预算，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+\topic{为什么 trace 替代跨进程调用栈}
+
+把这个点写成实验时，要故意保留旧方案。为什么 trace 替代跨进程调用栈，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+\topic{为什么本机模拟也要注入乱序}
+
+如果把它放进贯穿项目，接口就要承担更多责任。为什么本机模拟也要注入乱序，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+\topic{为什么 busy 和 fatal 要区分}
+
+源码阅读只服务这个问题。为什么 busy 和 fatal 要区分，不是为了多记一个术语，而是为了处理 worker 成功执行但响应丢失，driver 超时后重试导致重复执行 这样的具体场景。如果仍沿用 RPC 返回失败就重新调用，没有 request id 和结果表，小输入可能看不出问题，可一旦出现并发、失败、倾斜或资源等待，状态就会散落在调用栈、临时文件、日志文本或线程局部变量里。本章要求读者把这些状态写回 message envelope、request id、attempt id、deadline、idempotent result、fault rule，让后续观察和恢复有共同语言。
+
+
+C++ 代码里的表达要跟这个推导一致。身份、长度、版本、计数和偏移使用位宽明确的整数；只读数据用视图；拥有者和观察者分开；状态用枚举或结构化记录。测试不能只走正常路径，还要覆盖旧输入、压力输入、取消、重试、关闭或恢复。若这个点不能进入测试和报告，它就还只是文字解释。
+
+实验报告要能独立阅读。输入摘要、命令、reference、关键 trace、资源指标、错误注入和未验证边界都要保留。源码或工具阅读则围绕 连接状态、事件通知和定时器路径 展开，只解释与当前现象相关的路径。完成后，本章留下的材料应能自然交给下一章的 分片和复制，而不是在章末断掉。
+
+这一轮细读的目的，是让 driver 向 worker 派发 task 不再只是案例名，而成为贯穿本章的推导线。读者应能从 RPC 返回失败就重新调用，没有 request id 和结果表 出发，解释它为什么合理、为什么失败、怎样引入 message envelope、request id、attempt id、deadline、idempotent result、fault rule，以及怎样用实验和源码证据验证。能做到这一点，本章内容才真正从概念变成工程知识。
+
+\topic{消息故障实验判读}
+分布式模拟的判读核心是同一逻辑任务是否只有一个有效结果。丢请求、丢响应、重复响应、乱序响应和 deadline 过期要分别记录。超时后看到迟到成功，不应覆盖已提交的新 attempt；重复 request 应返回同一摘要或明确拒绝。trace 中缺少 request id，就无法做这种判读。
+
+
+这一段也服务于复习。读者合上书后，应该能凭本章的判读口径重新审查自己的代码：有没有最小正确版本，有没有能击穿旧方案的输入，有没有状态记录，有没有资源指标，有没有失败后的恢复动作。若五个问题缺两个以上，就说明实现还停在演示层，而不是工程层。
+
+
+\topic{丢响应场景的逐步状态表}
+丢响应不是一句“重试即可”。Driver 发送 request 17，worker 收到并执行，写出 attempt 3 的临时结果，提交表接受 attempt 3，成功响应在网络中丢失。Driver 到 deadline 后只知道没有收到响应，不知道远端是否执行。此时重试必须携带同一 task id 和新的或相同 attempt 策略。
+
+若服务端保存 request id 的结果摘要，重复 request 可以返回同一摘要；若 driver 创建新 attempt，提交表必须保证旧 attempt 和新 attempt 只有一个进入 manifest。迟到响应到达时，也要根据 attempt 状态判断是否忽略。这个状态表能让读者理解：超时后的世界是不确定的，不是简单失败。
+
+本机 MessageBus 实验应把这些状态打印出来。只看最终输出一致还不够，要看到哪个消息被丢，哪个 request 被重试，哪个 attempt 被接受，哪个响应被忽略。分布式系统的可调试性来自这种身份链。
+
+\topic{实验课：本机 MessageBus 注入真实分布式语义}
+MessageBus 不需要真实网络，也能模拟分布式关键问题。每条消息带 request id、task id、attempt id、deadline 和 trace id。故障规则可以按 request id 丢请求、丢响应、延迟、重复、乱序。Driver 和 worker 跑在同机进程或线程里，但只通过消息交互，不共享调用栈。
+
+丢响应实验最重要。Worker 已经执行并写出结果，响应被丢。Driver 超时后重试。若 worker 保存 request id 到结果摘要的映射，重复请求可以返回同一摘要；若 driver 生成新 attempt，提交表必须保证只有一个 attempt 进入 manifest。迟到响应到达时，要根据 attempt 状态决定忽略或确认。
+
+Deadline 实验也要做。每层都用自己的 timeout 会放大总时间；携带 deadline 后，worker 在开始前、批次边界和写出前检查剩余预算。过期任务不应继续消耗大量资源，除非业务明确要求必须完成。报告要比较局部 timeout 和全链路 deadline 的行为差异。
+
+最终 trace 应能串起一次请求：send、receive、start、write、commit、respond、retry、ignore。没有 trace id 的系统，遇到分布式故障只能猜。
+
+\topic{消息系统练习验收重点}
+合格答案不能把 timeout 当失败证明。必须写 request id、attempt id、deadline、重试预算和幂等结果表。丢响应题要给状态表：远端可能已执行，本地未知，重试如何不重复提交，迟到响应如何处理。
+
+答案还要写“为什么不采用更复杂方案”。例如没有证据证明队列是瓶颈，就不应把锁队列换成无锁；没有证明输出顺序可变，就不应随意重排；没有证明错误路径能恢复，就不应只提交正常路径。能解释不做什么，说明读者开始具备工程判断。
+
+最后，答案必须包含可复查材料。至少有输入摘要、关键状态、期望输出、实际输出、运行命令和未验证边界。没有这些材料，老师或同伴无法判断结论是否成立。第二册的作业不是让读者写漂亮段落，而是训练读者把系统问题变成可验证证据。
+
+\topic{项目实现：分布式计算模型}
+本章对应的贯穿项目实现不要求一次写成完整框架，但必须有最小可运行切片。这个切片包含三个部分：一个 reference，一个带本章机制的实现，一个能击穿 reference 之外隐含假设的测试。Reference 用来固定语义，机制实现用来展示本章知识，测试用来证明新增复杂度确实解决了问题。
+
+代码组织上，不要把所有内容放进一个大文件。基础类型、输入生成、核心机制、报告输出和测试应分开。即使当前只是教学项目，也要让目录能表达责任边界。这样后续章节接入时，不会因为找不到状态归属而重新发明一套对象。
+
+每个实现都要输出一段机器可读摘要。摘要至少包含输入规模、关键状态、错误数、输出校验、耗时和未验证边界。这里的机器可读不要求复杂格式，简单的 key value 文本也可以。关键是让脚本和读者都能复查，而不是只能看屏幕截图。
+
+测试应包含正常路径、边界路径和失败路径。正常路径证明功能可用；边界路径证明长度、容量、尾部、空输入、关闭或超时没有遗漏；失败路径证明本章机制不是装饰。若失败路径写不出来，往往说明本章概念还没有落到工程对象上。
+
+报告最后写一个取舍段。新增机制带来了什么好处，增加了什么成本，哪些场景不应该使用它，下一章会复用哪个字段或对象。这个取舍段非常重要，因为系统工程不是把所有高级机制都加进去，而是在证据和约束下选择合适的边界。
+
+\topic{调试笔记：超时后先列可能世界}
+请求超时后，可能是请求没到、远端未完成、远端完成但响应丢、响应迟到、或者本地处理响应失败。排查时先列这些可能世界，再看 request id、attempt id 和 trace。若没有身份字段，就无法区分重复执行和迟到响应。分布式调试的第一原则是承认本地不知道远端真实状态。
+
+
+\topic{复查清单：分布式计算模型}
+复查本章时，先检查 reference 是否仍然存在。没有 reference，后面的并发、优化、异步或分布式改造都无法证明语义没有变。再检查压力输入是否尖锐：它应当攻击本章最核心的边界，而不是只把数据量放大。第三，检查状态是否可观察：关键对象的身份、状态、错误和提交结果应能在报告中找到。
+
+第四，检查代码示例是否说明禁止行为。调用者不能做什么，往往比能做什么更能体现工程质量。第五，检查实验是否写出未验证边界；当前设备、权限或输入无法证明的结论，必须标注。第六，检查本章对象是否能被下一章复用，不能复用就说明边界还不稳。
+
+完成这六项后，再看文字是否连贯。每个概念都应从问题推出，每个案例都应从朴素方案走到改进方案，每个实验都应能解释一个判断。若某段话放到其他章节也成立，就把它改成本章的具体对象、具体输入和具体失败。
+
+\section{综合案例：把本机函数调用改造成消息系统}
+
+分布式系统不能从 CAP、共识、微服务这些大词开始。读者最需要先看见一个变化：本机函数调用有调用栈、共享地址空间和确定返回；消息系统只有请求、响应、超时、重复、乱序和部分失败。只要把 Compute Systems Engine 的 worker 从本地函数改成消息，就会自然推出 request id、deadline、幂等、重试预算和背压。
+
+\topic{一、函数调用丢失了哪些保证}
+本机调用 \code{run_task(task)} 时，调用者知道自己把参数交给了哪个函数；函数返回后，调用者知道它已经完成或抛出异常；如果进程没有崩溃，调用栈给出了清楚的因果关系。RPC 改变了这些假设。请求可能没发出，可能发出但丢失，可能被远端执行但响应丢失，可能响应迟到，可能执行两次，可能远端已经完成但本地超时。
+
+因此，分布式语义的第一步不是选协议，而是补回本机调用丢掉的身份。每个请求需要 request id，每次任务尝试需要 attempt id，每个响应要带回对应身份，每个输出要说明由哪个 attempt 产生。没有这些身份，本地超时后无法判断迟到响应是否仍应采纳，也无法区分重试产生的重复输出。
+
+\topic{二、超时不是取消}
+初学者常把 timeout 理解成远端停止执行。实际 timeout 只说明本地等待时间耗尽，不说明远端发生了什么。远端可能从未收到请求，也可能正在执行，也可能已经写出输出，只是响应丢了。若本地超时后立即重试，而远端旧 attempt 后来成功，系统就可能重复提交。
+
+正确做法是把超时和提交分开。超时触发本地状态从 Waiting 进入 Suspect 或 Retrying，但外部结果是否有效由 commit protocol 决定。旧 attempt 的响应迟到时，driver 根据 attempt id、route epoch 和 commit table 判断接纳、忽略还是记录为迟到。这样 timeout 只是故障检测信号，不是最终事实。
+
+\topic{三、幂等性来自提交点，不来自祈祷}
+幂等不是“我觉得这个操作重复执行也没事”。它要落到状态表。以 shuffle block 写出为例，worker 可以重复计算同一个 input split，但只有一个 attempt 的 block 被 manifest 接纳。未接纳的临时文件可以清理，迟到响应只能报告 already committed。这样重复执行不会重复计数，因为 reduce 只读取 manifest。
+
+请求处理也一样。若操作有外部效果，例如写输出、扣库存、发送通知，就必须有稳定操作 id 和提交记录。收到重复请求时，系统返回第一次提交的结果，或明确说明仍在处理中。没有提交点，重试只是把临时故障变成重复效果。分布式章节要让读者把幂等看成状态设计，而不是接口注释。
+
+\topic{四、消息信封是分布式系统的最小类型}
+贯穿项目可以先在本机模拟消息，不急着上真实网络。关键是消息信封必须包含足够语义：job id、stage id、task id、attempt id、source、destination、deadline、route epoch、payload checksum。payload 是数据面，信封是控制面。分开之后，测试可以注入丢包、乱序、重复和延迟，而不破坏业务数据结构。
+
+\begin{lstlisting}[language=C++,caption={消息信封保存控制面身份}]
+struct MessageEnvelope {
     std::uint64_t job_id = 0;
-    std::uint64_t stage_id = 0;
+    std::uint32_t stage_id = 0;
     std::uint64_t task_id = 0;
-    std::uint32_t attempt = 0;
-    std::uint32_t reduce_partition = 0;
-    std::uint64_t block_id = 0;
-    std::uint64_t byte_size = 0;
-    std::uint64_t record_count = 0;
-    std::uint64_t checksum = 0;
-    std::uint32_t schema_version = 1;
+    std::uint32_t attempt_id = 0;
+    std::uint64_t route_epoch = 0;
+    std::uint64_t deadline_ns = 0;
+    std::uint64_t payload_checksum = 0;
 };
 \end{lstlisting}
 
-这段结构同样不是二进制格式，只是说明 manifest 的语义字段。真实系统还要保存路径、压缩格式、副本位置、创建时间和加密信息。教学项目先保留核心字段，就能把“哪些输出有效”这件事说清。
+这个结构不关心 payload 类型，因此可以用于 map 请求、reduce 请求、心跳、取消和提交响应。它把分布式章节的抽象问题压成可测试对象：重复消息是否有同一个 identity，旧 epoch 消息是否被拒绝，deadline 过期后是否仍可能收到响应，checksum 不一致是否能被发现。
 
-\topic{清理不是提交路径}
+\topic{五、重试预算防止故障放大}
+重试能掩盖短暂故障，也能放大故障。若所有客户端在同一超时时间后立即重试，故障节点刚恢复就会收到更大的流量；若 driver 对每个慢 task 无限重试，队列会被旧 attempt 和新 attempt 塞满；若没有退避和抖动，系统会形成同步风暴。重试策略必须有预算：最大次数、最大总等待、指数退避、随机抖动和按错误分类的处理。
 
-未被接受的 attempt 临时文件要清理，但清理不应影响正确性。清理请求可能失败，worker 可能离线，文件可能已经被手动删除。系统应该允许垃圾文件暂时存在，并通过后台清理按 manifest 反向判断哪些文件不再需要。若把清理放进提交关键路径，worker1 清理失败可能阻塞 attempt 1 提交，反而降低可用性。
+错误分类很重要。连接失败、远端忙、校验失败、权限错误、输入不存在、版本过旧，不应使用同一种重试策略。可恢复错误可以重试，不可恢复错误应快速失败，疑似慢节点可以 speculative retry，但提交点仍然只允许一个 attempt 生效。工程报告要记录每类错误的次数和最终状态，否则“重试成功率”会掩盖系统压力。
 
-这又是控制面和数据面的分离。Manifest 控制有效数据集合；后台清理优化磁盘空间。正确性依赖 manifest，不依赖清理成功。读者写系统时要保持这种分离，否则会把资源回收错误升级成业务失败。
+\topic{六、背压跨越进程边界}
+单机有界队列满了，生产者可以阻塞或失败；分布式系统中，队列满可能表现为远端拒绝、响应变慢、连接堆积或消息超时。背压必须在协议中显式表达。Worker 可以返回 Busy 并带建议重试时间，driver 可以限制每个 worker 的 in-flight 请求，shuffle 可以按 partition 维持水位，写出端可以把磁盘慢反馈给 map 端。
 
-\topic{driver 多线程化的边界}
+没有背压，系统会把压力转成内存、重试和尾延迟。更糟的是，局部优化可能放大全局故障：map 端变快后生成更多 shuffle block，reduce 端和磁盘来不及消费，driver 又因为超时重试制造更多 block。第 16 章要把背压从队列概念扩展成端到端的流量合同。
 
-教学实现可以先单线程 driver，但真实 driver 可能多线程处理消息、调度和 checkpoint。多线程化时，task entry 和 commit table 是共享状态，必须有清晰同步。最保守的方法是让所有状态转换回到一个 driver event loop，其他线程只把事件放入队列。这样业务状态仍然单线程修改，网络和 I/O 可以并行。
+\topic{七、本机模拟要模拟失败，而不是只模拟 API}
+很多项目用本机多线程模拟分布式，但仍然共享对象指针，函数调用直接返回，错误路径很少。这种模拟只能验证业务算法，不能验证分布式语义。真正有价值的本机模拟要强制消息通过队列，payload 序列化或复制，响应可能乱序，消息可能重复，driver 和 worker 只能通过信封识别请求。
 
-如果直接让多个线程同时修改 task map，很容易出现竞态：deadline 线程启动 attempt 1 的同时，response 线程提交 attempt 0；checkpoint 线程正在序列化 manifest 时，commit 线程追加新记录；metrics 线程遍历 map 时，调度线程删除 entry。分布式系统已经有消息乱序，不要再让本地共享状态增加不必要的不确定性。
+故障注入至少包括五类：请求丢失、响应丢失、重复投递、延迟超过 deadline、旧 epoch 消息迟到。每类故障都要检查 commit table 和 manifest 是否保持一致。若模拟器没有这些故障，后面写真实网络只会更难。
 
-\topic{从推送 shuffle 到拉取 manifest}
+\topic{八、观察指标要从平均值扩展到分布}
+分布式系统的平均延迟经常骗人。少量慢请求会拖住 stage barrier，少量热点 partition 会拖住 reduce，少量重试会让尾部时间膨胀。指标至少要包含 in-flight 请求数、队列水位、超时次数、重试次数、迟到响应次数、重复请求次数、每个 worker 的成功率、每个 partition 的字节数和耗时分位数。
 
-前面的事故暴露了一个核心问题：reduce 端怎样知道哪些 map 输出有效。这里需要比较两种设计。第一种是推送式：map worker 完成后主动把 partial 推给 reduce worker。第二种是拉取式：map worker 先写 shuffle block，driver commit manifest，reduce worker 根据 manifest 拉取已提交 block。两种都能工作，但故障语义不同。
+这些指标要和身份关联。只知道有十次 timeout 不够，还要知道它们属于哪个 stage、哪个 worker、哪个 partition、哪个 attempt。否则无法判断是网络抖动、热点 key、磁盘慢还是调度错误。第一章建立的 trace id，在分布式章正式发挥作用。
 
-推送式看起来更直接，map 端有数据就发，reduce 端收到就合并。问题是重复 attempt 和响应丢失时，reduce 端可能收到同一逻辑 task 的多份 partial。若 reduce 端边收边加到最终 hash map，就必须维护去重表，且要处理“attempt 0 发了一半失败，attempt 1 完整成功”的边界。去重粒度按 request id 不够，按 attempt 也不够，最终要回到 logical task 或 manifest。
+\section{案例深化：消息乱序和重复如何改变程序结构}
 
-拉取式把有效性判断集中到 driver manifest。Map attempt 写完整 block 后报告摘要，driver 选择一个 attempt commit，reduce 只拉取 manifest 中列出的 block。这样 reduce 端不用猜目录，也不会读旧 attempt。代价是多一个 manifest 控制面，reduce 要等 map commit 后才能拉取，可能增加一点调度延迟。但对教学项目来说，拉取式更容易把 exactly once 外部效果讲清楚。
+本机调用的返回值天然对应一次调用；消息系统里，响应可能乱序、重复、迟到。程序结构必须从“等待一个返回值”改成“维护请求状态表”。这个改变是分布式系统的入门门槛。
 
-\topic{reduce 端合并的去重边界}
+\topic{一、请求状态表替代调用栈}
+Driver 发送请求后，把 request id、attempt id、deadline、状态和重试次数写入表。收到响应时，根据 id 查表，而不是依赖当前调用栈。若响应对应已提交 attempt，忽略或返回已提交结果；若对应已取消 attempt，记录迟到；若未知，可能是旧消息或 bug。状态表让乱序响应变成可处理事件。
 
-即使使用 manifest，reduce 端也应该防御重复拉取。网络重试可能让同一个 block 被拉两次，reduce worker 重启可能重放一段输入，MessageBus 可能重复投递 block 消息。Reduce 可以维护 \code{block_id} 或 \code{task_id, reduce_partition} 的已处理集合。区别在于，\code{block_id} 防止同一 block 重复处理，\code{task_id, reduce_partition} 防止同一逻辑 map task 的多个 block 进入同一 partition。
+没有状态表，代码常写成发送后阻塞等待，这会把消息系统退化成本地调用，并隐藏迟到和重复问题。教学模拟器应强制异步回调或事件循环，让读者面对状态表。
 
-如果 manifest 已经保证每个 task 每个 partition 只有一个 block，reduce 端按 \code{block_id} 去重足够防重复拉取；若 reduce 端允许直接接收推送，则必须按逻辑 task 去重。教材要明确前提，不能笼统说“reduce 要去重”。去重键取错，会让系统在某些故障下仍然重复计数。
+\topic{二、重复请求必须返回同一语义}
+重复请求可能来自客户端重试，也可能来自消息总线重复投递。服务端看到同一个 request id，应返回第一次处理结果、当前处理中状态或明确拒绝，而不是再执行一次外部效果。若任务是纯计算且输出未提交，重复执行可能可接受；若写 manifest 或外部系统，必须去重。
 
-\topic{局部聚合和输出确定性}
+去重表也有生命周期。保存太久耗内存，保存太短会让迟到重复逃逸。通常按 job、epoch 或 checkpoint 清理。项目可以在 job 完成后一段时间保留 request outcome，用于处理迟到响应。清理策略也是协议的一部分。
 
-Map-side combine 会改变数据发送形态，但不应改变结果。Worker 可以用哈希表做本地聚合，输出时要按 partition 组织。如果最终结果需要稳定比较，reduce 输出应按 event type 排序，或者输出 checksum 时使用确定顺序。否则多线程和哈希表遍历顺序会让每次输出字节不同，虽然数学计数相同。
+\topic{三、乱序测试}
+模拟器应把响应顺序随机打乱。发送 task 1、2、3，可能先收到 3，再收到 1，最后 2 超时。Driver 不能假设响应顺序等于发送顺序。测试检查最终 manifest 是否按 task id 和 attempt id 提交，而不是按响应到达顺序错误覆盖。
 
-输出确定性对测试和恢复很重要。若每次运行输出顺序不同，reference 对比要么变复杂，要么误报失败。一个教学项目应先追求确定输出：相同输入、相同故障规则、相同配置，输出字节和 trace 关键路径稳定。性能优化可以在确定性基础上做，而不是让随机顺序掩盖协议问题。
+\topic{四、事件循环报告}
+分布式模型实验应保存事件日志：send、deliver、drop、timeout、retry、response、commit、ignore stale。每个事件带 logical time 和 id。读者能从日志重放状态机，就说明协议可解释。没有事件日志，分布式 bug 很难复盘。
 
-\topic{热点 key 的实际处理流程}
+\section{补强案例：时钟只能辅助，不能替代协议}
 
-热点 key 处理也要从现象出发。假设 reduce partition 1 的队列水位持续高，其他 partition 很低。Trace 显示 90\% 的 records 都是 event type 7，普通哈希分区把它们都路由到 partition 1。第一步不是立刻上复杂算法，而是确认 map-side combine 是否已经开启。如果 map 端还在逐记录发送，先做本地聚合，网络量可能立刻下降。
+分布式系统里很容易滥用时间。超时、租约、重试退避、指标窗口都需要时钟，但时钟有漂移、暂停和调度延迟。协议不能仅凭“我觉得已经过了足够久”判断远端一定停止或旧 leader 一定失效。
 
-若 combine 后仍然热点，就引入 hot key split。Driver 或采样器把 event type 7 标记为 hot，map worker 对它输出多个 shard，reduce 第一阶段分别合并 shard，第二阶段再把 shard 合成 event type 7 的最终计数。这个改动必须进入 manifest：每个 hot shard 都有自己的 block 和 checksum，最终合并 stage 也有自己的 task id。否则恢复时不知道哪些 shard 已经处理。
+\topic{一、超时是怀疑，不是事实}
+请求超时只说明本地等待超过阈值。远端可能仍在执行。把超时当成取消，会导致重复提交。正确做法是超时后进入怀疑状态，发起重试或探测，但最终提交仍靠 attempt id 和 commit table 判断。
 
-\topic{背压下的本地 combine}
+\topic{二、租约需要时钟假设}
+Leader lease 或 cache lease 可以减少读协调，但依赖时钟误差有界和进程不长时间暂停。若虚拟机暂停、系统休眠或 GC 停顿超过租约假设，旧 leader 可能继续认为自己有效。使用租约必须写出时钟假设和安全边界。
 
-Reduce 返回 busy 后，map worker 不一定只能睡眠。它可以继续读取输入并在本地 combine 更多记录，前提是本地内存水位允许。这样上游把压力转成更大的 batch，而不是立刻重试网络发送。若本地 combine 内存也达到上限，worker 才应该暂停读取或把 partial spill 到本地磁盘。
+\topic{三、逻辑时间用于排序事件}
+Route epoch、term、log index、attempt id 都是逻辑时间。它们不代表物理时间，却能表达版本先后。分布式协议更常依赖逻辑时间而不是墙钟。项目中的 route epoch 和 manifest version 就是逻辑时间，用来拒绝旧请求和旧输出。
 
-这个流程把单机和分布式原则串起来：有界队列给出背压，本地聚合减少数据量，spill 防止内存爆，manifest 管理中间文件，retry budget 防止 busy 放大。它不是一堆概念并列，而是一条压力从 reduce 端传回 map 端的实际路径。
+\topic{四、实验}
+在消息模拟器中加入延迟和本地时钟跳变。检查 timeout 后旧响应是否被正确处理，旧 epoch 请求是否被拒绝，重试退避是否避免风暴。报告明确哪些地方使用物理时间，哪些地方使用逻辑版本。这样读者不会把时间戳当作协议本身。
 
-\topic{实验报告：必须能复现、能解释、能回归}
+\section{协议案例：从一次重复提交推导幂等表}
 
-本章的实验报告要比“跑通截图”严格得多。每个实验都应包含输入描述、配置、故障规则、朴素版本行为、修复版本行为、关键指标、trace 摘要、reference 对比和未验证边界。这样写看起来麻烦，但它能防止教材内容变成口号。读者必须知道每个机制到底解决了什么。
+分布式系统里，重复提交比请求失败更危险。失败通常能重试，重复提交会让结果悄悄变错。日志统计作业中，如果同一个 map attempt 的 block 被 reduce 读两次，最终计数可能翻倍。这个事故能让读者理解幂等表、attempt id 和 manifest 的必要性。
 
-\topic{实验一：响应丢失}
+\topic{一、重复提交的具体时间线}
+Driver 发送 map attempt 5 给 worker。Worker 计算完成，写出临时 block，并发送成功响应。响应在网络中延迟，driver 超时后启动 attempt 6。Attempt 6 也成功，driver 把 attempt 6 的 block 写入 manifest。随后 attempt 5 的迟到响应到达。如果 driver 只看 task id，不看 attempt 和 commit 状态，可能把 attempt 5 也写入 manifest。Reduce 读取两个 block，结果重复计数。
 
-输入为十二个 split，每个 split 至少包含一个共同 event type，方便发现重复计数。故障规则固定为丢弃 task 5 attempt 0 的 reply。朴素版本让 reduce 扫描临时目录，预期结果是 event 计数高于 reference。修复版本让 reduce 只读 manifest，预期结果和 reference 一致。
+注意这里每个局部动作都“成功”：worker 没错，网络只是延迟，重试也合理。错误来自控制面没有定义唯一提交。这个例子比抽象讲 exactly once 更适合入门，因为它把重复效果压到一个可见输出上。
 
-报告中的指标至少应包含：\code{requests_sent=13}，因为一个 task 重试一次；\code{timeouts=1}；\code{retries_started=1}；\code{committed_tasks=12}；\code{late_replies} 可能为 0 或 1，取决于是否让旧 reply 延迟到达；manifest 中 task 5 只有一个 entry。若这些指标不满足，说明实验没有真正覆盖目标故障。
+\topic{二、幂等表保存请求结果}
+幂等表按 task id 或 operation id 记录提交状态。状态可以是 Empty、Running、Committed、Failed。Committed 记录被接纳的 attempt id、block id、checksum 和结果摘要。新响应到达时，driver 先查表：若 Empty，可以尝试提交；若 Committed 且 attempt 相同，返回已提交；若 Committed 但 attempt 不同，忽略迟到；若 Running，按策略等待或比较 attempt。
 
-\topic{实验二：乱序响应}
+这张表必须持久化或进入 checkpoint，否则 driver 崩溃后会忘记已提交操作。幂等不是内存 map 这么简单，它是恢复状态的一部分。保存多久也要定义：job 完成后可以清理，跨 job 的 request id 不应冲突。
 
-故障规则固定为让 task 6 attempt 1 的 reply 先于 attempt 0 到达。朴素版本若采用“最后响应覆盖”，可能表现为 committed attempt 被改回旧 attempt，或者 metrics 中没有 stale reply。修复版本应在 attempt 1 commit 后拒绝 attempt 0。报告要贴出两条 trace：attempt 1 commit 的事件和 attempt 0 stale reply 的事件。
+\topic{三、提交要原子地更新表和 manifest}
+如果 driver 先写 manifest，再更新幂等表，中间崩溃后恢复可能不知道 manifest 中的条目对应哪个提交状态；如果先更新表，再写 manifest，恢复后可能认为已提交但 reduce 看不到 block。需要一个明确的提交协议。单机项目可以让 manifest entry 本身就是提交记录，或用临时 manifest 加原子 rename；多机系统可能需要复制状态机。
 
-这个实验的重点不是结果是否正确，因为两个 attempt 计算同一 split 时 checksum 可能相同，最终计数未必错。重点是状态不能被旧响应覆盖。如果实验只看最终计数，就会漏掉一个潜在恢复 bug。高质量测试要验证不变量，不只验证输出。
+教学项目可简化为：构造 ManifestEntry，校验 block，写入 manifest log，fsync 或按承诺级别同步，内存表从 log 重建。这样崩溃后以 manifest log 为准。关键是只有一个权威提交源，不能让目录扫描、内存表和日志各说各话。
 
-\topic{实验三：重试风暴}
+\topic{四、幂等表和重试预算配合}
+幂等表防重复，重试预算防风暴。一个任务超时后，可以启动新 attempt，但同时记录旧 attempt 可能迟到。达到重试上限后，task 进入 Failed，不再接受新 attempt 的成功响应，除非恢复策略明确允许。否则系统可能在用户已经看到失败后，又迟到提交成功结果。
 
-配置为 100 个 task，worker 固定 sleep 300 ms，driver timeout 50 ms。朴素版本立即重试且无 max attempts，预期 in-flight 和队列水位持续上升。修复版本设置 max attempts 为 3，退避从 50 ms 开始，加入 jitter，并限制每个 worker in-flight。预期请求总数不会超过 300 加上少量 busy 探测，队列峰值受窗口限制。
+状态机要写清最终状态。Committed 和 Failed 都是终态吗？Failed 后是否允许人工 retry？人工 retry 是否使用新 task id 或新 epoch？这些问题如果不写，迟到消息会不断挑战边界。分布式系统的难点不在 happy path，而在终态和旧消息。
 
-报告要写出两组数字：朴素版本的最大 in-flight、最大 worker 队列、总请求数；修复版本的同样指标。若修复版本只是最终成功，但请求数仍然爆炸，说明预算没有生效。若队列水位下降但失败数上升，也要如实写出，这是稳定性和完成率的权衡。
+\topic{五、实验：重复响应矩阵}
+模拟四种情况：响应丢失后重试成功，旧响应迟到；旧响应先到，新响应后到；两个 attempt 都写出 block 但只有一个 commit；driver commit 后崩溃再恢复。每种情况检查 manifest 只有一个条目，reduce 只读一个 block，迟到响应被记录但不改变结果。事件日志要能重放整个状态变化。
 
-\topic{实验四：driver 重启}
+\topic{六、和锁、原子线性化的对应}
+单机原子 CAS 从 Empty 到 Committed，只有一个线程成功；分布式幂等表从 Empty 到 Committed，只有一个 attempt 成功。前者线性化点是 CAS 成功，后者线性化点是 manifest commit 或复制日志提交。尺度不同，结构相同。把这个对应讲清楚，读者会发现并发和分布式不是割裂的两门课。
 
-这个实验要覆盖四个崩溃点：request sent 后崩溃、worker 写临时 block 后崩溃、manifest 临时文件写完但未发布时崩溃、manifest 发布后内存状态更新前崩溃。每个崩溃点都用固定钩子触发。恢复后运行到结束，最终结果必须和 reference 一致。
+\section{补充案例：流量控制和重试预算的联动}
 
-报告要说明每个点的恢复状态。发布前崩溃，task 回到 pending 或 retrying，可能重跑；发布后崩溃，task 从 manifest 恢复为 committed，不重跑。若某个崩溃点需要人工清理才能通过，说明恢复协议不完整。分布式系统不能只在干净关闭后恢复，真正要处理的是中途崩溃。
+重试和流量控制必须一起设计。没有流量控制的重试会放大故障；没有重试的流量控制会让短暂错误直接失败。系统需要同时限制 in-flight 请求、重试次数和重试节奏。
 
-\topic{实验五：reduce 背压}
+\topic{一、每个 worker 的窗口}
+Driver 对每个 worker 维护 in-flight 窗口。窗口满了，不再发送新请求。成功响应释放窗口；超时可能暂时保留或转入 retry 状态；Busy 响应可以降低窗口。窗口防止单个慢 worker 被更多请求压垮。
 
-输入让 90\% 记录落到 event type 7。普通分区下，partition 1 队列变长。开启 high watermark 和 low watermark 后，map 端收到 busy，暂停该 partition，并继续处理其他 partition 或本地 combine。报告要记录 partition 级别队列水位、busy 次数、map 等待时间、最终 checksum。若只看总吞吐，会看不出背压是否按 partition 生效。
+\topic{二、全局重试预算}
+除了单 worker 窗口，还要有 job 级重试预算。某个阶段大量失败时，继续重试可能浪费资源。预算耗尽后，job 进入 Failed 或 Degraded。预算要按错误类型区分，校验失败和 Busy 不应同等处理。
 
-进一步可以比较三种版本：无 combine、combine、combine 加 hot key split。无 combine 网络消息最多；combine 降低消息数；hot key split 降低 partition 长尾但增加最终合并阶段。这个对比能让读者看到优化不是单调“更高级更好”，而是在不同成本之间移动。
+\topic{三、退避和抖动}
+多个请求同时超时，如果同时重试，会形成峰值。指数退避和随机抖动能打散流量。退避不是延迟越长越好，太长会增加恢复时间。报告要记录重试时间分布。
 
-\topic{未验证边界也要写}
+\topic{四、实验}
+模拟 worker 变慢和 worker 短暂不可用。比较无预算立即重试、固定重试、退避加窗口三种策略。观察队列水位、成功时间、重复请求和失败放大。这个实验让重试从口号变成控制系统。
 
-实验报告最后要写未验证边界。例如本机 MessageBus 没有真实网络拥塞，不能证明真实 TCP 下的吞吐；单进程模拟没有跨机器时钟漂移，不能证明租约安全；本地文件 rename 的语义不能直接代表对象存储；固定输入规模不能证明更大数据下内存上限合理。写出这些边界不是降低质量，而是防止把局部证据夸大成普遍结论。
+\section{补充专题：消息大小和批处理}
 
-这也是本章写法和概念清单的区别。概念清单容易给人一种“知道名词就掌握系统”的错觉。实验边界会提醒读者：原理可以迁移，数字要重测；不变量可以保留，实现要适配；本机模拟能证明语义，不能替代真实部署压测。
+分布式性能不仅由延迟决定，也由消息大小和批处理决定。小消息太多，协议头、系统调用和调度成本高；大消息太大，尾延迟、内存峰值和重传成本高。批处理是吞吐和延迟的取舍。
 
-\topic{常见错误：为什么很多分布式章节读起来空}
+\topic{一、控制消息和数据消息分开}
+心跳、状态更新、commit ack 是控制消息，应小而及时；shuffle block 是数据消息，可以大而批量。把控制消息塞进大数据队列，会让控制延迟受数据传输影响；把数据拆成过小控制消息，会浪费吞吐。
 
-最后把几个常见写法问题直接指出来。第一种错误是先讲 CAP、Paxos、RPC，再补一个例子。读者会记住术语，却不知道这些术语从哪个失败路径里长出来。更好的顺序是先让一个普通任务失败：响应丢了、重复执行了、旧响应回来了、队列满了、driver 重启了。然后再引出机制。
+\topic{二、批处理的边界}
+批处理应有最大字节数、最大记录数和最大等待时间。只按字节可能让低流量请求等待太久；只按时间可能产生小包；只按记录数可能忽略记录大小。三个边界共同控制。
 
-第二种错误是把所有问题都叫“一致性”。重复 attempt 导致重复计数，是幂等提交问题；旧路由写入，是 epoch 和 fencing 问题；多个副本选择写入顺序，是共识或复制问题；reduce 读半写文件，是 manifest 提交边界问题。都叫一致性，听起来高级，实际会模糊修复点。教材应该训练读者把问题切细。
+\topic{三、失败成本}
+批越大，失败重传越贵；批越小，协议开销越高。对于可重算 block，大批可以接受；对于交互请求，小批更合适。报告要写重做字节数和尾延迟。
 
-第三种错误是只讲正常路径。正常路径里，一条请求、一条响应、一个结果，几乎所有设计都看起来合理。分布式系统的设计质量要看故障路径：响应丢失后是否重复提交，旧 attempt 回来后是否覆盖状态，worker busy 后是否重试风暴，driver 崩溃后是否恢复，manifest 半写后是否被误读。没有故障路径，章节就会空。
+\topic{四、实验}
+模拟不同 message batch size，记录吞吐、p99、重试时重做字节和队列水位。让读者看到批处理不是单纯越大越好。
 
-\topic{不要把 exactly once 写成魔法}
+\section{补充专题：服务降级和部分结果}
 
-Exactly once 在工程中通常不是“函数真的只执行一次”。函数可能执行多次，消息可能投递多次，attempt 可能跑多次。系统追求的是外部效果等价于一次：重复执行被 commit table、manifest、去重表或事务输出吸收。若教材把 exactly once 写成网络保证，读者会误以为只要换一个消息队列就能解决问题。
+分布式系统不总是在成功和失败之间二选一。有些计算可以返回部分结果或降级结果，有些必须失败。服务降级要有语义合同，否则会把错误伪装成成功。
 
-本章的日志统计正好能说明这点。Task 5 的 attempt 0 和 attempt 1 都可以执行，这是 at least once 的执行现实；manifest 中 task 5 只有一个有效 block，这是 exactly once 的外部效果。把执行次数和外部效果分开，很多概念会清楚很多。
+\topic{一、部分结果的条件}
+日志统计如果用于审计，不能丢 partition；如果用于实时监控，可能允许返回已完成 partition 并标注缺失比例。合同必须写清输出是否完整。调用者看到结果时，应知道它是 complete、partial 还是 stale。
 
-\topic{不要把 timeout 写成失败证明}
+\topic{二、降级和重试}
+降级不等于停止重试。系统可以先返回部分结果，同时后台继续补齐；也可以在预算耗尽后返回 partial。状态机要表达 Degraded，而不是把它当 Completed。Manifest 也要标注缺失。
 
-Timeout 只是本地等待到期。它不能证明请求没到，不能证明 worker 没执行，不能证明响应不会回来。若教材说“超时后任务失败”，读者就会写出危险代码。正确说法是：超时后 driver 可以怀疑当前 attempt 不再值得等待，并在预算内启动新 attempt；旧 attempt 的后续响应仍要按迟到消息处理。
+\topic{三、指标}
+降级结果要记录缺失 task、缺失字节、缺失 key range 和错误原因。没有这些指标，用户无法判断结果能否使用。部分结果比失败更需要清楚元数据。
 
-这句话看似冗长，却是分布式系统的根。只要理解它，request id、attempt、commit table、late reply、cancel、retry budget 都会变得自然。若不理解它，所有机制都像强行加上的复杂度。
+\topic{四、实验}
+让一个 reduce partition 永久失败。分别按严格模式返回 job failure，按监控模式返回 partial。比较输出元数据。这样读者会理解可用性提升需要语义支持。
 
-\topic{不要把背压写成性能章节的附属品}
+\section{消息系统实现细节：本机 MessageBus 的最小语义}
 
-背压不是“优化一下吞吐”。没有背压，系统在过载时会用队列和重试把自己压垮。Driver 的发送窗口、worker 队列容量、reduce partition 水位、连接池 in-flight、retry budget 都是背压的一部分。它们共同回答一个问题：下游处理不过来时，上游如何减速。
+在真正网络之前，本书项目可以实现本机 MessageBus。它不追求吞吐，而是提供分布式语义：消息复制、身份、延迟、丢失、重复、乱序和关闭。只有模拟器具备这些能力，后续协议测试才有价值。
 
-如果只在性能章节讲背压，读者会忽略它的正确性意义。重试风暴会导致 deadline 大量过期，旧 attempt 堆积会增加重复提交压力，队列爆炸会触发 OOM，OOM 后恢复又会考验 checkpoint。背压、可靠性和恢复不是三件孤立的事。
+\topic{一、消息必须复制或拥有 payload}
+如果 MessageBus 只是保存指向调用者栈上对象的指针，就不是消息系统。发送后，发送者可能修改或释放对象，接收者看到的不是发送时内容。Bus 应复制 payload，或接管引用计数块所有权。这个边界强迫模块放弃共享内存假设。
 
-\topic{不要让项目代码偏离书的主线}
+\topic{二、故障注入是核心功能}
+Bus 应能按规则丢弃请求、丢弃响应、重复投递、延迟投递、乱序投递。规则可按 message type、task id、attempt id 或随机 seed 配置。每次注入都写事件日志。没有故障注入，MessageBus 只是函数调用包装。
 
-贯穿项目最容易失控的地方，是先写一堆框架：抽象节点、抽象协议、抽象调度器、抽象插件。这样代码看起来工程化，实际没有验证任何不变量。第16章项目必须反过来：先让一个 split 正常执行，再让一个响应丢失，再让重试不重复提交，再让乱序响应被拒绝，再让 busy 产生背压，再让 driver 重启恢复。每一步都有一个失败路径和一个验收指标。
+\topic{三、关闭语义}
+Bus 关闭时，未投递消息如何处理？可以 drain，也可以 cancel。Driver shutdown 和 worker shutdown 要看到明确状态。关闭期间发送新消息应失败。这个语义和本地队列关闭一致，只是对象变成消息。
 
-代码结构也要服务这个顺序。\code{MessageBus} 不需要一开始支持所有协议，但必须能确定性丢一条 reply；\code{CommitTable} 不需要一开始支持分布式存储，但必须能拒绝重复 task；\code{TraceLog} 不需要接入大型观测系统，但必须能串起 request id；\code{Metrics} 不需要漂亮 UI，但必须输出 CSV。先把证据链做出来，再扩展规模。
+\topic{四、事件日志}
+Bus 记录 send、drop、duplicate、deliver、timeout、close。每条事件带 envelope id 和 logical time。协议测试失败时，事件日志能重放发生了什么。分布式调试高度依赖这种日志。
 
-\topic{本章最终判断力}
+\topic{五、实验}
+用 MessageBus 跑 map attempt。开启响应丢失和重复投递，验证 driver 通过幂等表只提交一次。再开启乱序，验证响应顺序不影响 manifest。这个模拟器是第 18 章项目的核心测试工具。
 
-读完本章，读者应能拿到一个分布式调用场景，先问七个具体问题。第一，这个请求的逻辑身份是什么？第二，重试时哪些字段不变，哪些字段变化？第三，超时后旧执行可能留下什么副作用？第四，外部效果的提交点在哪里？第五，重复响应和迟到响应如何处理？第六，下游 busy 时上游如何减速？第七，崩溃恢复时相信哪个持久化事实？
+\section{从一次超时推导分布式系统模型}
 
-如果这七个问题都有答案，系统设计至少有了骨架。若答案是“应该不会发生”“网络库会处理”“超时就失败”“扫目录就行”，说明设计还停留在单机直觉。分布式系统的难点不在于代码行数，而在于每条失败路径都要有明确边界。
+分布式系统不应该从 CAP、RPC、租约、逻辑时钟这些概念名词开始。更好的入口是一条普通请求超时：客户端发送任务给 worker，等待超过预算，没有收到响应。此时客户端知道的事实很少：请求可能没有发出，可能已经到达，可能正在队列中，可能已经执行完成但响应丢失，可能 worker 崩溃，可能只是网络慢。分布式系统模型就是为这种“不知道”建立可执行的处理规则。
 
-\topic{一条记录从输入到输出的完整旅程}
+\topic{一、超时只表达本地等待结束}
+超时不是远端失败证明。若客户端把超时直接解释成失败并重新提交，可能重复执行；若把超时解释成成功，又可能丢任务。正确做法是把 Unknown 当成真实状态写进协议。请求状态可以从 Created、Sent、TimedOut、Retrying、Succeeded、Failed、Abandoned 转换，但 TimedOut 不等于 Failed。这个区别会逼出 request id、attempt id、幂等表和迟到响应处理。概念不是凭空加的，而是由超时后的信息缺口逼出来的。
 
-为了让本章不悬在概念层，再把一条日志记录的旅程完整走一遍。输入文件里有一行记录，落在 split 5 的字节范围内。Driver 不直接读取这行记录，它只知道 split 5 的元数据。Driver 选择 worker1，发送 task 5 attempt 0。Worker1 收到请求后，先打开输入文件，调整 begin offset 到行边界，顺序读取到 end offset 后的当前行结束。解析器把这一行转换成 event type 7。Map-side combine 把 event type 7 的局部计数加一。等 split 处理完，worker1 按 reduce partition 把 partial 写成临时 block，计算 checksum，然后向 driver 返回 reply。
+\topic{二、消息身份替代跨进程调用栈}
+本地函数调用有调用栈，远程消息没有。消息必须携带自己的身份：request id 表示逻辑请求，attempt id 表示一次尝试，trace id 串起跨服务路径，deadline 表示剩余时间，epoch 表示发送方或路由版本。响应也必须带回这些字段。否则 driver 无法判断响应属于哪个任务、是否已经过期、是否来自旧尝试。身份字段不是日志装饰，而是恢复和去重的最低条件。
 
-这条旅程里有许多容易被省略的边界。第一，driver 调度的是 split，不是单条记录；所以 split 边界决定这条记录会不会被处理。第二，worker 的局部计数不是最终结果，它只是 attempt 临时输出。第三，临时 block 写完不代表 reduce 可以读取，因为 attempt 可能是旧的，也可能永远不被 commit。第四，reply 返回 driver 只是提交申请，不是提交完成。第五，driver 把 block 写入 manifest 后，reduce 才能把这条记录贡献的 partial 纳入最终结果。
+\topic{三、幂等来自服务端提交点}
+客户端生成 request id 只解决一半问题。服务端必须把 request id、业务状态修改和响应结果放进同一提交边界。若先修改业务状态，再崩溃于记录 request id 前，重试会重复执行；若先记录 request id，再崩溃于业务修改前，重试可能误判成功。文件系统、数据库事务、WAL、状态机日志或 manifest 都是在帮助建立这个提交边界。教学中要用时间线把这些错误讲清，不要把幂等说成“重复调用也没事”这么空泛。
 
-若读者能沿着这条旅程指出每个状态，就会发现分布式系统的很多术语都不是凭空来的。Split 边界解决输入恰好一次的问题；attempt 解决重复执行的问题；checksum 解决输出是否完整的问题；manifest 解决哪些 block 有效的问题；deadline 解决等待多久的问题；backpressure 解决下游处理不过来时怎么办的问题。每个概念都对应这条旅程中的一个断点。
+\topic{四、重试预算防止系统自我攻击}
+重试可以提高成功率，也能在下游变慢时制造风暴。一个上游请求调用十个下游，每个下游重试三次，尝试数会迅速放大；若所有客户端固定间隔重试，压力会在同一时刻打回故障节点。重试预算应随原始请求传播，deadline 不足时停止重试，退避和抖动用于分散压力，busy 响应用于让上游降速。报告要记录原始请求数、尝试数、超时数、busy 数、最终失败数和队列长度。没有这些数字，重试策略无法评价。
 
-\topic{Map block 的状态机}
+\topic{五、本机模拟要模拟不确定性}
+没有真实集群也能训练分布式思维。MessageBus 可以在本机模拟延迟、丢请求、丢响应、重复、乱序、busy 和 worker 崩溃。重点不是追求网络真实带宽，而是让协议状态可控。三个 split 就能覆盖基本语义：一个正常完成，一个响应丢失后重试，一个 worker 慢到 deadline 过期。验收时检查 manifest 是否只提交一次、迟到响应是否被识别、幂等表是否返回同一结果、重试预算是否阻止放大。这种小实验比直接搭复杂集群更适合讲原理。
 
-临时输出也需要状态机。很多重复计算 bug 不是 task 状态错，而是输出文件状态含混。一个 map block 可以有五个状态：building、sealed、reported、committed、abandoned。Building 表示 worker 正在写，reduce 绝不能读取；sealed 表示 worker 写完并计算 checksum，但 driver 还不知道；reported 表示 reply 已发出，但可能丢失；committed 表示 driver manifest 接受；abandoned 表示这个 attempt 没被接受，可以后台清理。
+\section{消息系统的最小实现剖面}
 
-\begin{lstlisting}[numbers=none]
-map block lifecycle:
-  building   worker is writing bytes
-  sealed     bytes and checksum are complete
-  reported   reply has been sent to driver
-  committed  manifest includes this block
-  abandoned  another attempt won or task failed
-\end{lstlisting}
+分布式模型要避免只讲概念，也要给出本机 MessageBus 的实现剖面。这个剖面至少包含 Envelope、Endpoint、Inbox、NetworkRule、Timer、RetryPolicy、IdempotencyTable 和 TraceLog。Envelope 保存身份和 payload；Endpoint 表示 driver 或 worker；Inbox 是有界队列；NetworkRule 注入丢弃、重复、延迟和乱序；Timer 触发 deadline 和重试；RetryPolicy 决定 attempt；IdempotencyTable 记录提交结果；TraceLog 让跨端调试可复盘。
 
-这个状态机能解释为什么 reduce 扫目录是错的。目录里可能有 building 文件，读它会读到半截；可能有 sealed 文件，worker 写完但 driver 未提交；可能有 reported 文件，响应在路上或已经丢失；可能有 abandoned 文件，旧 attempt 输给了新 attempt。只有 committed 文件具有业务可见性。文件系统只告诉你字节存在，不告诉你协议是否接受。
+\topic{一、发送不是直接调用接收函数}
+如果 send 直接调用 receiver 的处理函数，本机模拟会重新获得本地调用栈，失去分布式不确定性。更好的做法是 send 把 Envelope 复制或移动到网络层队列，网络层按规则决定何时投递、是否丢弃、是否重复。这样即使在一个进程里，driver 也不能知道 worker 何时处理，worker 也不能依赖 driver 的调用栈。模拟的价值就在于打破本地直觉。
 
-状态机还影响清理策略。Building 文件在 worker 崩溃后可能残留，恢复时可以按临时命名规则清理；sealed 但未 reported 的文件可以在 worker 本地恢复后重新报告，也可以丢弃重跑；reported 但未 committed 的文件要等待 driver 决定；abandoned 文件可以延迟清理。若清理程序不知道这些状态，可能删掉仍有机会被 commit 的输出，也可能保留大量无用文件。
+\topic{二、有界 Inbox 让 busy 成为协议}
+每个 endpoint 的 Inbox 应有容量。满了以后，网络层可以返回 busy、丢弃低优先级消息或延迟投递。busy 必须进入响应分类，让发送方减少并发或停止重试。若 Inbox 无限增长，模拟永远不会暴露过载，读者会误以为重试没有成本。有界队列把资源限制带进分布式协议，是背压章节在消息系统里的延续。
 
-\topic{请求丢失和响应丢失不是同一种故障}
+\topic{三、Timer 驱动状态而不是睡眠}
+超时不应靠业务线程 sleep 后猜测，而应由 Timer 根据 deadline 或 \code{retry_at} 产生事件。事件到来时，状态机检查 request 是否已经完成、是否还有预算、是否应发送新 attempt。若迟到响应先到，Timer 事件应发现请求已完成并忽略。这样超时和响应成为两个竞争事件，正好训练读者理解分布式不确定性。
 
-请求丢失时，worker 没有收到 task，通常没有业务副作用。Driver timeout 后重试，主要成本是等待时间。响应丢失时，worker 可能已经执行并写出临时输出，业务副作用已经部分发生。两者在 driver 眼里都表现为 timeout，但恢复动作不同。若教材把它们都写成“网络失败”，读者会错过关键差别。
+\topic{四、幂等表保存结果而不只是保存见过的 ID}
+服务端收到重复 request id 时，应返回同一语义结果。若幂等表只记录“见过”，却不保存结果，客户端重试后无法得到之前响应。表项应包含 request id、状态、结果摘要、错误分类、提交时间和过期策略。过期太早会让迟到重试重复执行，过期太晚会占用内存。过期策略要和业务 deadline、重试窗口和恢复日志一起设计。
 
-请求丢失实验中，trace 应显示 driver send、bus drop request、无 worker start、driver timeout、retry。响应丢失实验中，trace 应显示 worker start、worker write、bus drop reply、driver timeout、retry。后者必须验证 commit table；前者主要验证 retry budget 和 deadline。两个实验的最终结果都应该正确，但触发的机制不同。
+\topic{五、TraceLog 替代跨进程调试栈}
+每个事件记录 trace id、request id、attempt id、endpoint、状态、时间和原因。调试响应丢失时，TraceLog 应能串起发送、投递、执行、提交、响应丢弃、超时、重试、重复命中幂等表、最终完成。没有 TraceLog，分布式 bug 只剩“偶尔超时”。有了 TraceLog，读者能把不确定性拆成事件序列。
 
-同样，worker 执行前崩溃、执行中崩溃、执行后响应前崩溃也不同。执行前崩溃没有输出，重跑即可；执行中崩溃可能留下 building 临时文件，恢复要清理；执行后响应前崩溃可能留下 sealed block，driver 不知道它存在。若 worker 本地有恢复日志，可以重新报告 sealed block；若没有，就让 task 重跑，并让旧 block 作为垃圾清理。设计要把这些位置说清，而不是统称“worker fail”。
+\section{故障矩阵：从事件组合推导处理规则}
 
-\topic{Worker 崩溃的三个位置}
+分布式章节最后还要训练读者写故障矩阵。单个概念讲清楚还不够，因为真实错误往往是事件组合：请求丢失加上客户端重试，响应丢失加上服务端已提交，worker 慢加上 deadline 过期，driver 重启加上旧 attempt 迟到。故障矩阵的作用是把这些组合列出来，逐格写处理规则，而不是等 bug 出现后临时解释。
 
-先看 worker 在读取 split 前崩溃。Driver 只会看到 timeout 或连接断开。因为 worker 没写输出，commit table 不会变化。恢复策略是 retry。这个场景最简单，但仍要受 retry budget 控制，不能无限重试同一个坏 split 或坏 worker。
+\topic{一、请求未到达}
+客户端发送后，消息在网络层被丢弃，worker 没有任何记录。客户端超时后用同一 request id 新建 attempt。服务端看到的是第一次到达的请求，正常执行。这个格子的关键是：客户端不能因为“上一 attempt 没响应”就换 request id，否则后续去重会失效。TraceLog 应记录第一次 attempt 发送和丢弃，第二次 attempt 投递和执行。
 
-再看 worker 写了一半 block 后崩溃。磁盘上可能留下一个临时文件。这个文件没有 sealed 标记，没有 checksum，没有 manifest entry。恢复时不能读它，也不能拿它补结果。后台清理可以删除它。若 worker 使用临时文件名加原子 rename，那么半写文件不会伪装成 sealed block；若直接写最终临时名，恢复程序就要用额外元数据判断是否完整。
+\topic{二、请求到达但未执行}
+消息进入 worker inbox，但 worker 忙或进程崩溃，业务逻辑未运行。客户端仍然只能看到超时。重试到另一个 worker 时，如果分区归属允许，新 worker 可以执行；如果同一分区只能由原 owner 执行，就要等待归属切换。这个格子把分布式模型和分区归属连接起来：能不能换 worker，不由客户端心情决定，而由 ownership epoch 决定。
 
-最后看 worker 写完 block、计算 checksum、但 reply 还没到 driver 就崩溃。这个位置最微妙。数据其实完整，但 driver 不知道。系统可以选择简单策略：不恢复 worker 本地 sealed block，直接重跑 task。也可以选择优化策略：worker 重启后扫描 sealed block，重新向 driver report。优化策略能省计算，但必须保证 report 仍按原 task id 和 attempt 进入 CommitTable，不能绕过 manifest。教学项目先用简单策略也可以，但要明确代价是多重跑。
+\topic{三、执行完成但响应丢失}
+这是幂等表的核心场景。worker 已经提交输出和结果记录，响应被丢弃。客户端重试后，worker 或新 owner 应返回旧结果，而不是再次执行副作用。若幂等表只在内存中，worker 崩溃后会丢失去重信息；若幂等表和输出提交不在同一边界，也可能重复。这个格子要求读者检查提交点，而不是只检查重试代码。
 
-\topic{Reduce 读取 manifest 的具体步骤}
+\topic{四、响应迟到且客户端已放弃}
+deadline 过期后，客户端可能已经向用户返回失败或启动新的计划。迟到响应不能随便写入最终状态。状态机要检查 request 是否仍然活跃、attempt 是否仍然属于当前 epoch、结果是否已经提交。若请求已 abandoned，迟到响应只能记录并释放资源。这个格子帮助读者理解取消不是远端事实，只是本地不再等待。
 
-Reduce worker 不应该拿到一个目录路径就开读。它应该拿到一个 manifest snapshot。第一步，driver 发布 stage manifest，包含所有已提交 map block。第二步，reduce worker 选择自己负责的 partition，只过滤 manifest 中 \code{reduce_partition} 匹配的条目。第三步，对每个条目检查 task id、attempt、block id、byte size 和 checksum。第四步，拉取或读取 block。第五步，合并前再次记录 \code{block_id} 已处理，防止重放。第六步，合并完成后输出 reduce attempt 临时结果，再由 driver 提交最终 output manifest。
-
-这个流程看起来比扫目录麻烦，但每一步都有故障意义。Manifest snapshot 保证 reduce 看到的是同一个提交视图；partition 过滤防止读到别人的数据；checksum 防止半写或损坏；已处理集合防止重复拉取；reduce output 也走 attempt 提交，防止 reduce 自己重试时覆盖结果。Map 和 reduce 的提交模型是一致的，只是输入输出角色不同。
-
-\begin{lstlisting}[numbers=none]
-reduce read path:
-  load manifest snapshot for stage
-  select entries for my reduce partition
-  for each entry:
-      skip if block_id was already processed
-      read block bytes
-      verify byte size and checksum
-      merge partial counts
-      record block_id as processed
-  write reduce attempt output
-  ask driver to commit reduce output
-\end{lstlisting}
-
-这里还有一个隐藏点：manifest snapshot 要稳定。若 reduce 一边读 manifest，一边 driver 继续追加条目，reduce 可能看到半个 stage。批处理系统通常在 map stage 全部完成后再启动 reduce，或者给 reduce 一个明确的 snapshot version。流式系统可以边产边消费，但要有 offset 和 checkpoint 语义。本章先按批处理讲，边界更清楚。
-
-\topic{把背压接入调度器}
-
-背压不是 worker 返回 busy 就结束。Driver 调度器要根据 busy 改变后续决策。若 worker1 连续 busy，driver 应降低它的窗口；若 partition 2 busy，map worker 应暂停发送 partition 2 的数据，但可以继续发送其他 partition；若所有 partition 都 busy，map worker 应停止读取新 split 或把 partial spill 到本地。背压信号必须能沿数据流向上游传播。
-
-一个实用的教学策略是维护三类窗口。Worker window 控制发往某个 worker 的 task 数；partition window 控制某个 reduce partition 的 in-flight 字节；job window 控制整个 job 的总 in-flight 和总 retry。调度时先检查 job window，再检查 worker 或 partition window。任何一层满了，都不继续发送。这样能避免一个局部热点吃掉全局资源。
-
-\begin{lstlisting}[numbers=none]
-scheduling gates:
-  job_in_flight_tasks < job_limit
-  worker_in_flight_tasks[target] < worker_limit[target]
-  partition_in_flight_bytes[p] < partition_byte_limit[p]
-  retry_budget[job] has remaining attempts
-  current_time < job_deadline
-\end{lstlisting}
-
-这些 gate 不是为了让程序变复杂，而是把资源边界写成代码。没有 gate，系统默认资源无限；真实机器会用内存耗尽、连接耗尽、磁盘队列爆掉来提醒你这个假设错误。高质量系统设计要主动写上限，而不是等操作系统替你失败。
-
-\topic{调度选择要解释成本}
-
-Driver 选择 worker 时，不能只轮询。至少要考虑数据本地性、worker 队列长度、历史延迟、失败率和当前窗口。若 split 在 worker1 本地，worker1 队列很短，就本地执行；若 worker1 队列很长而 worker2 空闲，可以远程读；若 worker2 最近频繁 timeout，就不要把新任务发过去。调度器不是追求某个绝对最优，而是在可观测成本之间做保守选择。
-
-教学项目可以从简单评分开始。每个候选 worker 有一个 cost：本地性惩罚、队列惩罚、延迟惩罚、失败惩罚。选择 cost 最低且窗口可用的 worker。这个策略不需要复杂数学，却能让读者看到调度不是“随便找一个 worker”。更重要的是，每个惩罚都能对应指标，实验报告可以解释为什么某个 task 被调度到远端。
-
-\topic{端到端 trace 样例}
-
-一条成功但经历 retry 的 task trace 应该能连成一条因果链。下面的格式不是唯一的，但字段要足够稳定。
-
-\begin{lstlisting}[numbers=none]
-driver_schedule task=5 attempt=0 worker=1 reason=locality
-bus_accept      request=4107 queue=worker1 depth=3
-worker_start    request=4107 task=5 attempt=0
-worker_seal     request=4107 block=770 bytes=4096 checksum=991
-bus_drop_reply  request=4107 rule=drop_once
-driver_timeout  request=4107 task=5 attempt=0
-driver_retry    task=5 attempt=1 worker=2 reason=timeout
-worker_seal     request=4119 block=884 bytes=4096 checksum=991
-driver_commit   task=5 attempt=1 block=884 decision=accepted
-reduce_read     partition=3 block=884 checksum=991
-\end{lstlisting}
-
-读者可以用这条 trace 检查本章所有概念。Request 4107 和 4119 是不同消息；task 5 是同一个逻辑任务；attempt 0 超时但不等于未执行；attempt 1 被 commit；block 770 存在但没有进入 reduce；reduce 只读 block 884。若 trace 缺少这些字段，系统出了错就无法复盘。
-
-\topic{为什么要强调单点问题单点分析}
-
-用户看到“分布式”三个字，很容易把所有机制混在一起讲：RPC、共识、复制、缓存、负载均衡、容错、观测性。这样的章节读起来会散，因为每个概念都只说了半页。更好的写法是单点问题单点分析：响应丢失只分析响应丢失；乱序响应只分析乱序响应；背压只分析队列水位和上游减速；driver 重启只分析持久化事实。分析完一个点，再说明它怎样接到主线。
-
-本章所有补充都遵守这个原则。响应丢失推出 commit table，不顺便讲共识；乱序响应推出 attempt 检查，不顺便讲复制；reduce 背压推出 high watermark，不顺便讲全局调度论文；driver 重启推出 manifest 和 checkpoint，不顺便讲所有备份策略。这样读者不会在一个段落里同时接收五个新概念，也更容易把知识转成代码。
-
-\topic{本章和真实系统的距离}
-
-本章模型仍然简化。真实系统可能有多个 driver 或 driver 高可用，可能有对象存储而不是本地文件，可能有跨机时钟漂移，可能有认证和权限，可能有压缩、加密、版本兼容和多租户隔离。简化不是问题，问题是不能忘记简化在哪里。本章只承诺训练核心语义：身份、attempt、deadline、幂等提交、manifest、背压、故障注入和恢复。
-
-当读者把项目迁移到真实 Linux 网络环境时，需要重新测量网络 RTT、socket buffer、磁盘 fsync、rename 语义、线程调度、CPU 占用和内存峰值。语义不变量可以沿用：一个 task 只提交一次，reduce 只读 manifest，迟到响应不能覆盖状态。性能数字不能照搬：本机 MessageBus 的 1 ms 延迟不代表真实网络，单机文件 rename 的成本也不代表对象存储 commit。区分不变量和数字，是系统工程判断力的一部分。
-
-\topic{单点故障场景库}
-
-为了避免本章变成“知道一堆原则但不会排查”，下面把常见故障按单点拆开。每个场景都只分析一个问题：现象是什么，朴素误判是什么，正确边界在哪里，应该看哪些指标，测试如何复现。实际系统的事故常常由多个场景叠加，但学习时必须先能把单点说清楚。若一个单点都说不清，叠加场景只会更混乱。
-
-\topic{场景一：请求丢失}
-
-请求丢失的现象是 driver 发出了 request，但 worker 从未出现 start trace。Driver 等到 deadline，看到 task 仍未完成。朴素误判是“worker 慢”，于是把 worker 标成坏节点。正确判断要看 MessageBus trace 或 worker 接收日志：如果没有 worker start，说明请求可能在发送路径丢失、路由错误、队列拒绝或目标不可达。此时重试是合理的，但不能无限重试。
-
-这个场景主要验证 retry budget 和路由检查，不主要验证 commit table。因为 worker 没执行，就没有输出副作用。测试可以固定丢弃 request 9001，期望 driver 在预算内发出 request 9002。指标应显示 \code{timeouts=1}、\code{retries_started=1}、worker 端没有 attempt 0 的 start 事件。若 worker 端出现 start，却 driver 认为是请求丢失，说明 trace 关联有问题。
-
-请求丢失还要区分目标队列 busy。若 MessageBus 返回 busy，driver 明确知道请求未入队；若 MessageBus accepted 后内部丢弃，driver 只会通过 timeout 观察到失败。两种情况都可以重试，但日志语义不同。Accepted 后丢失更像网络不可靠；busy 更像背压。把两者都写成 timeout，会让排查方向混乱。
-
-\topic{场景二：重复请求}
-
-重复请求的现象是 worker 收到两条相同 \code{request_id} 的消息，或者收到同一 \code{task_id} 同一 \code{attempt} 的重复投递。重复可能来自 MessageBus duplicate，也可能来自客户端在未确认 accepted 时重新发送。朴素处理是再执行一次。若 worker 只写 attempt 临时文件，重复执行主要浪费资源；若 worker 会向下游发送 partial 或写外部系统，就可能制造重复副作用。
-
-正确边界取决于副作用位置。对本章 map worker，最少要保证 attempt 临时文件名包含 task 和 attempt，重复写不会混到别的 task。更稳的做法是在 worker 端维护短期 request table：同一 request id 已经完成，就返回同一摘要；正在执行，就拒绝或合并等待；已经过期，就按策略重新执行但不能绕过 driver commit。这个表不替代 driver commit table，它只是减少重复执行和重复响应。
-
-测试方法是让 MessageBus 对 request 9010 执行 duplicate。Worker trace 应显示 duplicate received。若采用 worker 去重，执行次数应为一，响应次数可以为二，两个响应摘要相同。Driver 最终只 commit 一次。若不采用 worker 去重，执行次数可以为二，但两个输出都必须是 attempt 临时输出，最终 manifest 仍只接受一个。这两种设计都可以，但报告必须写清成本和边界。
-
-\topic{场景三：重复响应}
-
-重复响应比重复请求更常见。Worker 只执行一次，但 reply 被 MessageBus duplicate，driver 收到两次相同 request id。朴素 driver 如果每次响应都累加结果，会重复提交。正确处理是响应进入 CommitTable，第二次返回 already committed 或 late reply。这里去重键可以是 \code{request_id}，也可以是 \code{task_id} 加 attempt，最终仍要以 \code{task_id} 的 committed 状态为准。
-
-重复响应测试应该让同一 reply 连续到达两次。期望第一条 accepted，第二条 rejected 或 ignored。指标应显示 \code{duplicate_replies=1}，\code{committed_tasks} 不变，manifest 条目不增加。若最终计数正确但 duplicate 指标为零，说明测试没有覆盖重复响应，或者系统把重复响应静默吞掉而不可观测。静默吞掉看似没错，但排查线上问题时会丢失证据。
-
-\topic{场景四：校验失败}
-
-校验失败的现象是 worker reply 中的 checksum 与 driver 读取到的 block checksum 不一致，或者 manifest 中记录的 byte size 与实际文件不一致。朴素处理是忽略 checksum，继续 reduce。这样会把损坏数据带入最终结果。正确处理是拒绝该 attempt 的提交，把 task 标记为 retryable failure，并记录损坏 block。若多次校验失败，可能是 worker 磁盘、编码逻辑或传输路径有问题，应隔离 worker。
-
-校验失败不是普通 timeout。Timeout 说明本地没等到响应；checksum mismatch 说明响应到了，但输出不可信。Retry 可以解决临时损坏，但必须让坏 block 不进入 manifest。测试可以在 worker seal 后篡改 block 字节，保持 reply checksum 不变。CommitTable 应返回 checksum mismatch，task 进入 retry 或 failed，reduce 不应读取该 block。
-
-这个场景还说明 checksum 的位置。只在网络消息上做 checksum，不足以发现磁盘临时文件损坏；只在 manifest 写 checksum，不足以发现 worker 报告前已经算错。教学项目可以先用简单 checksum，但要说明真实系统会使用更强校验和、长度校验、编码版本和可能的端到端数据摘要。目标不是追求复杂算法，而是让“输出完整性”成为提交条件。
-
-\topic{场景五：旧 epoch 请求}
-
-旧 epoch 的现象是请求携带的路由版本或 partition epoch 低于服务端当前版本。朴素 worker 可能仍然执行请求，导致旧路由写入新系统。正确处理是拒绝旧 epoch，并返回 stale epoch，让 driver 刷新路由或重新调度。这个场景在第17章会展开，但本章需要先知道 epoch 是防旧写的边界。
-
-在日志统计项目里，可以模拟 reduce partition 迁移。Partition 3 原本由 worker1 负责，epoch 为 5；控制面把它迁到 worker2，epoch 变成 6；worker1 收到 epoch 5 的 shuffle 消息。Worker1 不应继续接受写入，也不应悄悄转发后仍返回 success。它应返回 stale epoch，driver 或 map worker 根据新路由重发。否则旧 worker 的迟到写可能进入旧目录，被后续错误扫描读到。
-
-测试方法是先发送 epoch 5 消息，再切换到 epoch 6，让旧消息迟到。期望旧消息被拒绝，trace 中出现 stale epoch，manifest 只包含 epoch 6 的 block。若旧消息被接受但最终结果仍然正确，仍然要算风险，因为下一次清理或恢复可能把旧 block 引入结果。旧写被拒绝是协议不变量，不应依赖后续运气。
-
-\topic{场景六：checkpoint 损坏}
-
-Checkpoint 损坏的现象是 driver 重启后无法读取 checkpoint，或者 checkpoint 中 manifest checksum 不匹配。朴素处理是忽略损坏 checkpoint，从头开始或按部分内容恢复。部分恢复最危险，因为它可能相信半截 commit table，导致漏算或重复算。正确处理是 checkpoint 必须有版本、长度、checksum 和原子发布；恢复时只接受完整且校验通过的 checkpoint。若当前 checkpoint 损坏，可以回退到上一个完整 checkpoint，或者明确从头重跑。
-
-测试可以在 checkpoint 写入一半时 kill driver，或者篡改 checkpoint 中一条 manifest entry。恢复程序应拒绝当前 checkpoint，并报告原因。若系统选择从上一个 checkpoint 恢复，必须验证上一个 checkpoint 覆盖的 stage 边界清楚。若没有上一个 checkpoint，就从 reference 输入重新开始。不能把半损坏文件“尽量读出来”，这在计算系统中比失败更危险。
-
-这个场景还连接到文件系统语义。写 checkpoint 文件后，只调用 close 不一定代表目录项和数据都已经按预期持久化。教学项目可以不深入所有文件系统细节，但要让读者知道可靠发布通常使用临时文件、flush、rename 和必要的目录同步。不同环境语义不同，所以实验报告要写清运行文件系统和简化假设。
-
-\topic{场景七：队列满但 CPU 很空}
-
-队列满并不一定表示 CPU 不够。Reduce 队列满而 CPU 很空，可能是 reduce 在等待磁盘，可能是锁竞争，可能是单个热点 key 让一个 partition 串行处理，可能是下游输出提交慢。朴素判断是“加 worker”。如果瓶颈是单个 partition 或单个磁盘，加 worker 未必有用。正确做法是看分层指标：队列长度、处理速率、CPU 时间、I/O 等待、锁等待、partition 分布和 key 分布。
-
-测试可以让 reduce 在写输出时 sleep，同时 CPU 不忙。此时 map 端收到 busy，队列水位高，但 CPU 指标低。报告应解释瓶颈是输出路径，不是计算路径。修复可以是降低 map 发送速率、增加 reduce 输出缓冲、批量写、改变输出提交频率，或者把热点 partition 拆分。若只根据 CPU 空闲继续加请求，队列会更长。
-
-这个场景提醒读者：背压信号告诉你“下游承受不了”，但不直接告诉你为什么承受不了。原因要靠指标拆分。系统书如果只写“队列满就限流”，仍然不够；还要教读者限流后如何定位瓶颈。
-
-\topic{场景八：平均延迟正常但尾延迟很高}
-
-Stage 平均延迟 100 ms 看起来正常，但 P99 是 5 s。朴素报告只写平均值，会掩盖长尾。分布式计算的作业完成时间常由最慢 task 决定，尤其在 barrier stage 中，所有 map 完成后 reduce 才能开始。一个慢 task 就能拖住整批任务。正确指标要看分位数、慢 task 列表、worker 分布、split 大小和重试历史。
-
-慢 task 分析要先区分输入大还是执行慢。若 split 17 输入字节是其他 split 的十倍，它慢是数据倾斜；若输入一样大但只在 worker2 上慢，是节点问题；若所有包含 event 7 的 split 都慢，是热点 key 或解析路径问题；若慢 task 都经历 retry，是网络或 timeout 配置问题。不同原因对应不同修复：重新切分、隔离 worker、热点拆分、调整 deadline 或 speculation。
-
-测试可以构造一个大 split 和一个慢 worker。报告必须说明调度器如何区分两者。若只看 duration，可能把大 split 当成坏节点；若只看 worker，可能把数据倾斜当成机器慢。高质量观测要把输入规模和执行时间放在一起看。
-
-\topic{场景九：结果正确但资源泄漏}
-
-有些故障不会立刻让结果错误，却会慢慢拖垮系统。响应丢失后旧 attempt 的临时 block 没有进入 manifest，结果正确，但文件没有清理；重复请求被 commit table 拦住，结果正确，但 worker 重复执行消耗大量 CPU；busy 被退避处理，结果正确，但 map 端缓存 partial 越积越多。若只看最终 checksum，这些问题都会被漏掉。
-
-因此实验报告要记录资源指标：临时文件数量和字节数、abandoned block 数、清理成功数、worker 执行次数、map 端缓存字节、spill 次数、队列峰值。正确性测试保证不算错，资源测试保证系统能长期运行。分布式系统的很多线上事故不是第一分钟算错，而是运行数小时后磁盘满、内存满或队列满。
-
-这个场景也说明 cleanup 需要自己的指标和重试策略。清理失败不应阻塞提交，但不能永久无人管。后台清理可以扫描 manifest 之外的旧 attempt 文件，根据 age 和状态删除。清理动作也要保守，不能删除仍可能被 commit 的 sealed block。最简单规则是只清理 checkpoint 已经确认不需要的旧 attempt。
-
-\topic{场景十：指标互相矛盾}
-
-有时指标会看起来互相矛盾：requests sent 不高，但 worker queue 很长；timeouts 很多，但 worker 完成率也很高；busy 很少，但内存持续上涨；committed tasks 正常，但 late replies 很多。遇到这种情况，不要立刻改代码，要先检查指标定义。Requests sent 是逻辑请求还是 attempt？Queue depth 是消息数还是字节数？Timeout 是 task deadline 还是 RPC timeout？Late reply 是已提交后的响应，还是任意迟到消息？
-
-指标定义不清，会让排查偏离。教学项目要在 README 或实验报告里定义每个指标。比如 \code{requests_sent} 统计每次 MessageBus accepted 的请求，不统计 busy 拒绝；\code{retries_started} 统计新 attempt，不统计同一 attempt 的重复发送；\code{late_replies} 统计 task 已 committed 后到达的 reply；\code{stale_replies} 统计 attempt 或 request id 不匹配的 reply。定义清楚后，指标才能比较。
-
-这个场景的测试可以故意制造重复响应和旧 attempt 响应，检查 late 与 stale 是否按定义增加。若两个指标混在一起，虽然结果不受影响，但后续排查会困难。分布式系统的观测性不是附加功能，它是协议的一部分。
-
-\topic{场景库的使用方式}
-
-这十个场景不是让读者死记，而是提供排查顺序。遇到结果错误，先查 reference 和 manifest；遇到重复计数，查 commit table、reduce 输入来源和 late reply；遇到作业慢，查队列、分位数、worker 和 split 分布；遇到恢复异常，查 checkpoint 和崩溃点；遇到资源上涨，查 abandoned block、缓存和清理。每次只改变一个变量，保留 trace 和指标，再比较 reference。
-
-真正的工程能力来自这种收敛过程。先缩小现象，再定位单点，再绑定不变量，再写测试。第17章会讲分片、复制和共识，但那些机制也要按同样方法学习。不要因为概念更高级，就放弃单点分析。系统越大，越需要把问题拆回一条消息、一个状态、一条日志和一个提交边界。
-
-\topic{为什么本章不直接上共识}
-
-读者可能会问：既然 commit table 和 manifest 这么重要，为什么不直接用共识协议把它们复制起来？原因不是共识不重要，而是学习顺序不能倒。共识解决的是多个节点在故障中如何对一串状态变更达成同一顺序；本章先解决的是单个 driver 如何定义状态变更本身。如果你还没说清“task 5 attempt 1 commit”到底意味着什么，把它放进 Raft 日志也只是把模糊状态复制到更多节点。
-
-共识日志里不能放含混操作。好的日志条目应像这样清楚：在 job 7 stage 2 中，task 5 的 attempt 1 被接受，block 884 的 byte size 是 4096，checksum 是 991，reduce partition 是 3，前提是 task 5 尚未提交。这个条目有明确前置条件和结果。坏的日志条目是“worker2 完成了任务”，它没有说明任务身份、attempt、输出、提交条件和重复处理。第17章讲共识时，会继续沿用本章的 commit 语义。
-
-\topic{为什么本章不展开复制}
-
-复制也一样。复制 manifest 之前，先要知道 manifest 是什么、何时发布、损坏后如何恢复、旧 attempt 如何被排除。否则复制三份目录扫描结果，只会把错误放大三倍。复制解决可用性和容错，不能替你定义有效数据集合。若 reduce 仍然扫描临时目录，即使目录有三副本，重复 attempt 仍然会被读入。
-
-本章的边界是单 driver、单提交事实来源。这个模型简单，但它让读者看清提交点。下一章把这个提交事实来源复制起来，才有意义。学习系统时经常要先把一个节点上的语义写对，再讨论多节点复制。否则读者会误以为复杂协议能弥补本地状态设计不清。
-
-\topic{为什么本章仍然提前引入 epoch}
-
-虽然本章不展开分片迁移，但提前提 epoch 是必要的。因为旧 attempt 和旧路由有同一个问题：旧的执行者可能在你认为它失效之后重新出现。Attempt 通过 attempt id 和 commit table 被挡住；旧路由通过 epoch 和 fencing 被挡住。读者先在 task attempt 上理解“旧消息不能改写新状态”，下一章学旧 leader、旧副本、旧路由时就不会陌生。
-
-Epoch 不需要一开始很复杂。教学项目可以让 driver 持有一个单调递增的 partition epoch，消息携带 epoch，接收方发现旧 epoch 就拒绝。关键是让读者看到 epoch 不是时间戳，也不是日志装饰，而是权限版本。谁持有旧 epoch，谁就没有资格对新状态产生写入效果。
-
-\topic{控制面和数据面的再次分离}
-
-本章反复出现控制面和数据面的分离：task table、commit table、manifest、epoch、deadline 属于控制面；日志记录、partial block、shuffle 字节、临时文件属于数据面。控制面决定哪些数据有效，数据面负责产生和搬运数据。这个分离会贯穿后续章节。第17章的路由表和副本组是控制面，实际 key-value 或 shuffle block 是数据面；第18章的 stage manifest 是控制面，map 和 reduce 的大批量中间数据是数据面。
-
-很多系统变慢或变脆，是因为控制面和数据面混在一起。把每条日志记录都写入强一致控制面，吞吐会被控制面拖死；把提交决策藏在数据目录里，恢复时又不知道哪些数据有效。正确做法是让控制面小而强，让数据面大而快。Manifest 正是这个思想在本章的具体形态：它不保存所有数据，只保存哪些数据有效。
-
-\topic{本章给后续项目留下的接口}
-
-为了让后续章节能继续扩展，本章项目应留下几个稳定接口。第一，\code{MessageBus} 提供 accepted、busy、deadline expired 和 invalid target 四类发送结果。第二，\code{CommitTable} 提供 accepted、already committed、stale attempt 和 checksum mismatch 四类提交结果。第三，\code{TraceLog} 至少能按 job、task、attempt 和 request id 过滤事件。第四，\code{Metrics} 能按 worker、partition 和 stage 聚合。第五，manifest 条目包含 task、attempt、partition、字节数和 checksum。
-
-这些接口不追求一次到位覆盖真实集群，但要足够稳定。第17章加入路由 epoch 时，不应推翻 request id 和 attempt；第18章加入完整 shuffle 时，不应推翻 manifest；后续如果把 MessageBus 换成真实 socket，也不应改变 CommitTable 的不变量。好的章节之间不是互相重写，而是在前一章稳定边界上增加能力。
-
-\topic{读者自查清单}
-
-本章结束前，读者可以用一份自查清单判断自己是否真的理解。给定一个 task，能否说清它的 logical id 和 attempt id？给定一次 timeout，能否列出请求未到、worker 执行中、响应丢失、响应迟到四种可能？给定一个临时 block，能否判断它是 building、sealed、reported、committed 还是 abandoned？给定一次重复响应，能否说明哪个模块拒绝它？给定一次 driver 崩溃，能否说明恢复时相信 manifest 还是内存状态？给定一个 reduce 长队列，能否判断是 CPU、I/O、热点 key 还是背压配置？
-
-如果这些问题能回答，本章主线就连起来了。如果只能背“分布式系统需要幂等和重试”，说明还停留在口号层。系统学习的关键不是记住更多词，而是把每个词放回具体路径：哪条消息、哪个状态、哪个文件、哪个指标、哪个提交点。这样进入第17章时，分片、复制和共识才会变成自然扩展，而不是又一组孤立名词。
-
-\topic{一次完整排查演练}
-
-最后用一次完整排查把本章收住。假设实验报告显示：最终 checksum 和 reference 不一致，event type 7 多了 1280，其他 event 大多正确。第一反应不应该是“分布式系统不一致”，而是先缩小差异。Event type 7 多，说明某些记录被重复合并，或者 reference 与分布式解析规则不同。先跑串行 reference 两次，确认输入、split 列表和输出 checksum 稳定；再让分布式系统关闭故障注入，只跑正常路径。如果正常路径一致，说明解析和 split 大体没问题，错误来自故障路径。
-
-第二步看 manifest，而不是看 worker 目录。找到所有包含 event type 7 的 block，按 \code{task_id} 分组。如果 task 5 出现两个 committed block，说明 CommitTable 没有按逻辑 task 去重；如果 manifest 只有一个 block，但 reduce trace 读了两个 block，说明 reduce 绕过 manifest 读了临时目录；如果 manifest 和 reduce 都只有一个 block，但计数仍然多，说明 block 内部内容可能重复，回到 worker 的 split 边界和 combine 逻辑。这个顺序能把问题从“结果错了”压缩成三个明确方向。
-
-第三步检查 task 5 的 trace。理想 trace 应能看到 attempt 0、attempt 1、两个 request id、一次 timeout、一次 commit 和一次 late 或 stale 响应。若 trace 里没有 attempt 0 的 worker start，说明不是重复执行，而可能是请求丢失；若 attempt 0 写了 block 但没有 commit，且 reduce 读了它，说明是 manifest 边界被绕过；若 attempt 0 和 attempt 1 都被 commit，说明 CommitTable 不变量被破坏；若两个 attempt 都没有被 commit，却 reduce 有输入，说明 reduce 输入来源完全错误。每一种结论都对应不同修复。
-
-第四步看指标，验证 trace 结论。若怀疑响应丢失，应看到 \code{timeouts} 和 \code{retries_started} 增加；若怀疑乱序响应，应看到 \code{stale_replies} 或 \code{late_replies}；若怀疑背压导致重试风暴，应看到 \code{max_in_flight_tasks} 和 worker queue depth 上升；若怀疑 reduce 绕过 manifest，应看到 committed block 数和 reduce read block 数不一致。指标不是替代 trace，而是帮助你判断问题是否只有一个点，还是多个机制同时失效。
-
-第五步写最小复现。不要直接用完整大输入调试。构造两个 split，其中 split 5 只包含 event type 7 的 1280 条记录，另一个 split 包含少量其他 event。固定故障规则：丢弃 split 5 attempt 0 的 reply。这样如果系统错误，event type 7 正好多 1280，现象和线上一致。修复后，保留这个测试作为回归。好的故障测试应该小、确定、解释力强，而不是依赖大输入随机触发。
-
-第六步修复并复查边界。若根因是 reduce 扫目录，修复不是“过滤一下 attempt 名字”，而是让 reduce 只能从 manifest snapshot 获取输入。然后新增测试：旧 attempt 文件存在但不在 manifest，reduce 不读取；manifest 中 block checksum 错，reduce 拒绝；manifest snapshot 固定后，后续新提交不影响当前 reduce。这样修复的是边界，而不是当前一个例子。
-
-第七步写报告。报告应包含：现象、reference 结果、故障规则、task 5 时间线、manifest 对比、reduce 读取列表、根因、不变量、修复、回归测试和未验证边界。未验证边界也要写，例如本机文件系统的 rename 语义与对象存储不同，真实网络可能有更复杂的连接断开，当前测试只覆盖单 driver。这样的报告会让后来者知道你修的是哪个失败路径，也知道哪些问题还没有证明。
-
-这次演练展示了本章真正想教的东西：不是把“幂等、重试、背压、manifest”分别背下来，而是在一个实际错误里按顺序使用它们。Reference 定义正确结果；trace 还原因果；manifest 定义有效数据；CommitTable 保护提交不变量；metrics 检查压力和异常；故障注入把事故变成可重复测试。只要这个闭环能跑通，分布式章节就不再是空泛概念，而是一套能落地的工程方法。
-
-\topic{质量验收：怎样判断这一章写实}
-
-评价这一章不能只看有没有覆盖名词，而要看读者能否拿它写出一个小系统，并在小系统出错时定位问题。第一条标准是主线是否稳定。所有机制都应回到同一个日志统计作业，而不是上一段讲 RPC，下一段突然讲 CAP，再下一段跳到缓存。读者应始终知道 driver、worker、MessageBus、CommitTable 和 manifest 分别在做什么。若一个概念无法放回这五个对象的交互中，它就不应该在本章展开。
-
-第二条标准是失败路径是否具体。只写“网络可能失败”不合格；要写请求丢失、响应丢失、重复响应、乱序响应、worker 崩溃、driver 崩溃、队列满、checkpoint 损坏分别怎样表现。每个失败都要有可观察信号：trace 中缺哪一行，metrics 中哪个计数增加，manifest 中哪个条目变化，reference 对比会怎样失败。没有观察信号，概念就无法转成工程判断。
-
-第三条标准是不变量是否能落到代码。比如“每个 task 只提交一次”必须落到 CommitTable 的 key 和返回值；“reduce 只读有效数据”必须落到 manifest snapshot；“迟到响应不能覆盖状态”必须落到 reply handler 的检查顺序；“下游过载要让上游减速”必须落到窗口、水位和 busy 处理。若不变量只存在于文字中，代码仍然可以绕过它，这章就没有真正讲透。
-
-第四条标准是实验能否复现。每个关键机制都要能用固定 seed 或固定 request id 触发。响应丢失不是“有时会发生”，而是 request 4107 的 reply 被丢弃；乱序不是“网络可能乱序”，而是 attempt 1 先到、attempt 0 后到；driver 崩溃不是“模拟故障”，而是在 manifest rename 前后两个位置分别 kill。可复现的实验才能形成回归测试，不可复现的实验只能形成经验故事。
-
-第五条标准是取舍是否写清。重试提高成功概率，但会增加重复执行和过载风险；speculation 降低尾延迟，但会消耗额外 CPU 和 I/O；每次 commit 都 checkpoint 恢复快，但正常路径变慢；manifest 控制有效数据，但增加控制面发布成本；hot key split 降低单 partition 长尾，但增加最终合并阶段。高质量教材不能只说机制好，还要说机制把成本移到了哪里。
-
-第六条标准是和后续章节的边界是否清楚。本章不需要把 Raft、再分片和完整 shuffle 全讲完，但必须把它们需要的地基打好：消息身份、attempt、deadline、commit record、manifest、epoch、trace 和 metrics。下一章讲复制时，复制的是这些清楚的状态；第18章讲工程实践时，组合的是这些已经验证过的边界。若本章把所有高级主题都浅讲一遍，后面就没有承接；若本章把一个 task 的生命周期讲透，后面扩展才有章法。
-
-按这六条标准复查，本章的写作目标就很明确：让读者从一个真实计算任务出发，先看到朴素方案为什么会失败，再理解机制为什么出现，最后能用实验和指标证明修复有效。这样的章节才不像概念机器，也不会靠字数堆密度。它把分布式系统还原成可观察、可测试、可恢复的一组状态转换。
-
-\topic{本章最小可实现定义}
-
-把本章压到最小实现，可以这样定义：Driver 拥有唯一的 task table 和 commit table；Worker 只能写 attempt 临时输出，不能发布最终结果；MessageBus 可以接受、拒绝、延迟、丢弃、重复和乱序消息，但不能改变业务状态；CommitTable 是唯一能把 attempt 输出写入 manifest 的模块；Reduce 只能读取 manifest snapshot，不能扫描临时目录；Trace 和 Metrics 必须覆盖每一次发送、接收、超时、重试、提交、拒绝和 busy。
-
-只要这七条成立，一个本机模拟系统就已经具备分布式计算的基本骨架。它还不是高可用集群，也没有完整复制和共识，但它已经能回答最关键的问题：同一个逻辑任务重复执行时，哪个结果有效；消息晚到时，谁有权改变状态；下游过载时，上游怎样减速；driver 重启时，恢复相信什么。第17章和第18章要扩展的是规模和容错层次，不应推翻这些最小定义。
-
-因此，本章验收不看概念数量，而看这些对象能否在故障注入下守住边界。只要边界清楚，后续扩展才是在稳固地基上增加能力；边界含混时，增加节点只会放大错误。
-
-这也是分布式学习最核心的起点。
-
-后续所有复杂系统都从这里继续生长。
+\topic{五、driver 重启后的恢复}
+driver 崩溃重启后，内存中的 in-flight 表消失，但 manifest、幂等表或任务日志仍在。恢复时要重建 request 状态：已提交的不再执行，未提交的重新排队，状态未知的按 request id 查询或重试。若没有持久化任务身份，driver 只能重新全量执行，可能产生重复输出。故障矩阵把“持久化最小集”逼出来：输入 split、request id、attempt、输出路径、提交状态和 checksum。
 
 \section{本章习题}
 
 \begin{exercisebox}
-习题一：画出 task 17 的三条时间线：正常响应、响应丢失后重试、attempt 1 先返回而 attempt 0 后返回。每条时间线标出 driver task state、request id、attempt、deadline 和 commit table 的变化。
+习题一：画出一次 RPC 的完整生命周期，从客户端提交到服务端响应返回。标出每个排队点、失败点和需要记录的指标。
 
-习题二：设计 \code{CommitTable}。说明它按 \code{task_id} 还是按 \code{request_id} 去重，为什么。给出 attempt 0 成功但响应丢失、attempt 1 后成功、attempt 0 迟到响应三个场景下的处理结果。
+习题二：设计一个幂等请求表。说明 request id、业务状态、响应结果如何在同一个提交边界内更新。给出崩溃发生在提交前和提交后的恢复行为。
 
-习题三：实现一个本机 \code{MessageBus} 的故障注入接口。至少支持 delay、drop、duplicate、reorder。要求每个故障能用固定 seed 或固定 request id 复现，并把注入事件写入 trace。
+习题三：构造一个重试风暴。假设服务端延迟升高，客户端超时后立即重试。计算请求量如何放大，并设计重试预算、退避和抖动策略。
 
-习题四：构造重试风暴实验。让 worker 固定 sleep，driver timeout 很短。记录请求总数、最大 in-flight、worker 队列峰值和最终失败数。然后加入重试预算、退避和抖动，比较两次结果。
+习题四：用本机多线程模拟消息乱序和重复。要求每条消息携带 request id 和 attempt，服务端能识别重复请求并返回同一结果。
 
-习题五：为 reduce 背压设计 high watermark 和 low watermark。说明 map worker 收到 \code{Busy} 后应该等待多久，是否可以继续处理其他 partition，以及如何避免所有 map worker 同时重试。
-
-习题六：设计 driver 重启恢复流程。Driver 在 task \code{Sent}、\code{Retrying}、commit manifest 写入前、commit manifest 写入后四个位置崩溃。分别说明恢复后 task 状态、临时输出和重复响应如何处理。
+习题五：比较数据本地调度和远程调度。给出本地排队长、远程网络快以及本地网络快、远程排队短两种场景，说明调度器应如何取舍。
 \end{exercisebox}
-
-\begin{labbox}
-实验：在本机实现 driver、三个 worker 和 MessageBus。输入是一组日志 split，输出是 event 计数。先跑正常路径，再分别注入响应丢失、重复响应、乱序响应、慢 worker、reduce busy 和 driver 重启。最终结果必须与串行 reference 一致，同时输出 trace 和 metrics CSV。实验报告必须包含朴素版本、失败现象、修复机制、指标对照和未验证边界。
-\end{labbox}
