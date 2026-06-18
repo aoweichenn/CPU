@@ -39,6 +39,7 @@ BOX_TITLES = {
 }
 
 SKIP_ENVIRONMENTS = {
+    "pdfdiagram",
     "systemdiagram",
     "tikzpicture",
 }
