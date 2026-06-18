@@ -12,6 +12,8 @@ CODE_ENVIRONMENTS = {
     "Verbatim",
     "codeblock",
     "tcblisting",
+    "systemdiagram",
+    "tikzpicture",
 }
 
 INLINE_CODE_COMMANDS = {

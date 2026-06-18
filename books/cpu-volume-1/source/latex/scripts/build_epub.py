@@ -38,6 +38,11 @@ BOX_TITLES = {
     "deepdive": "深入理解",
 }
 
+SKIP_ENVIRONMENTS = {
+    "systemdiagram",
+    "tikzpicture",
+}
+
 LIST_ENV = {
     "itemize": "ul",
     "enumerate": "ol",
@@ -283,6 +288,7 @@ class LatexInline:
             "log": "log",
             "cpp": "C++",
             "cpp20": "C++20",
+            "cppTwenty": "C++20",
             "n": "\n",
             "t": "\t",
         }
@@ -392,6 +398,10 @@ class LatexBlockConverter:
             begin = re.match(r"\\begin\{([^}]+)\}(.*)", line)
             if begin:
                 env = begin.group(1)
+                if env in SKIP_ENVIRONMENTS:
+                    _, i = collect_environment(lines, i, env)
+                    self.flush_paragraph()
+                    continue
                 if env in {"lstlisting", "verbatim"}:
                     code, i = collect_environment(lines, i, env)
                     self.flush_paragraph()
