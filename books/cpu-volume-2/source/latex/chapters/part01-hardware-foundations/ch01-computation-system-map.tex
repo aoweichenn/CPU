@@ -117,7 +117,9 @@ timestamp user_id event_name value
 10:04 u002 view 1
 \end{lstlisting}
 
-最小目标是统计 \code{event_name} 的出现次数。这个目标足够小，读者可以手工检查结果；同时它足够真实，规模、并发、I/O 和恢复都会自然出现。不过，事件计数只是第一层实验。若每一行都彼此独立，项目只能解释哈希聚合、锁竞争和 I/O 背压，很难解释顺序依赖、窗口状态、乱序到达、会话切分和状态机优化。因此，Compute Systems Engine 的正式方向不是“普通日志计数器”，而是“事件流分析引擎”：先用独立事件计数建立 reference，再逐步加入时间顺序、用户会话、事件序号、窗口聚合、转化链路和迟到数据。
+最小目标是统计 \code{event_name} 的出现次数。这个目标足够小，读者可以手工检查结果；同时它足够真实，规模、并发、I/O 和恢复都会自然出现。不过，事件计数只能作为第一把尺子，不能成为整个项目的终点。若每一行都彼此独立，系统只需要解决哈希聚合、锁竞争和 I/O 背压；一旦读者问“同一用户是否先浏览再点击”“五分钟窗口内的点击是否已经完整”“迟到数据是否应该修正结果”，普通计数器就没有足够语义回答。
+
+因此，Compute Systems Engine 的正式方向应当是事件流分析引擎。它先用独立事件计数建立 reference，再逐步加入时间顺序、用户会话、事件序号、窗口聚合、转化链路和迟到数据。这个选择不是为了把字段堆得更复杂，而是为了让后续每一章都有真实压力：硬件章节会看到重排缓冲和状态表怎样改变局部性；并发章节会看到同一会话状态怎样制造共享和热点；运行时章节会看到窗口关闭、背压和取消怎样互相影响；分布式章节会看到迟到消息和重复提交为什么必须有身份与提交边界。
 
 第二层输入会扩展为事件流记录：
 
@@ -130,46 +132,55 @@ event_name object_id value
 \end{minipage}
 \end{center}
 
-\code{event_time} 是事件真实发生时间，\code{ingest_time} 是系统接收时间，二者不一定相同；\code{session_id} 和 \code{seq} 用来表达同一用户会话内的顺序；\code{object_id} 可以表示页面、商品、文件或请求对象。这样一批数据既能退化成简单计数，也能形成更复杂的实验：同一用户是否先 \code{login} 再 \code{view}，五分钟窗口内 \code{click} 次数如何变化，\code{view -> click -> pay} 转化链是否成立，迟到事件是否还能修正窗口结果。后续高性能章节会把这些顺序关系纳入复杂度分析：已按 \code{user_id,event_time,seq} 排好的输入可以线性扫描；完全乱序输入可能需要排序或按用户分区后局部排序；有界乱序输入需要重排缓冲、水位线和活动会话状态。
+\code{event_time} 是事件真实发生时间，\code{ingest_time} 是系统接收时间，二者不一定相同；\code{session_id} 和 \code{seq} 用来表达同一用户会话内的顺序；\code{object_id} 可以表示页面、商品、文件或请求对象。这样一批数据既能退化成简单计数，也能形成更复杂的实验：同一用户是否先 \code{login} 再 \code{view}，五分钟窗口内 \code{click} 次数如何变化，\code{view -> click -> pay} 转化链是否成立，迟到事件是否还能修正窗口结果。
+
+先看一个小反例。同一会话真实发生顺序是 \code{login -> view -> click -> pay}，但由于客户端缓冲、网络抖动或上游重试，系统可能先收到 \code{pay}，过一会儿才收到 \code{click}。若引擎只按 \code{ingest_time} 更新转化状态，就会在 \code{pay} 到达时得出“没有 click，所以转化链不成立”的结论；这个结论不是业务事实，而是观察顺序造成的假象。正确设计必须同时保存三种信息：\code{event_time} 和 \code{seq} 定义会话语义，\code{ingest_time} 定义系统实际承受的输入顺序，watermark（水位线）定义窗口何时可以被认为已经看完。
+
+Watermark 不是图上的装饰箭头，而是系统对 \code{event_time} 完整性的承诺。水位线推进到某个时间 T，表示系统准备关闭 T 以前的窗口；之后再到达、且 \code{event_time < T} 的记录不能悄悄改写结果，必须进入明确的 late policy（迟到策略）：丢弃、补偿输出、旁路诊断，或者触发可审计的修正。这个承诺一旦进入系统，就会牵动缓冲大小、状态生命周期、输出稳定性和失败恢复。
 
 \begin{pdfdiagram}[x=1cm,y=1cm]
-  \node[book title label] at (0,3.35) {同一会话的事件顺序};
+  \node[book title label] at (0.15,6.05) {同一会话的事件顺序};
 
-  \draw[BookRule,line width=0.42pt] (1.25,2.35) -- (10.65,2.35);
-  \draw[BookRule,line width=0.42pt] (1.25,0.65) -- (10.65,0.65);
-  \node[book label, anchor=east] at (1.02,2.35) {event\_time};
-  \node[book label, anchor=east] at (1.02,0.65) {ingest\_time};
+  \draw[book lane] (-0.2,0.1) rectangle (3.05,5.45);
+  \draw[book lane] (3.7,0.1) rectangle (6.95,5.45);
+  \draw[book lane] (7.6,0.1) rectangle (10.95,5.45);
 
-  \foreach \x/\t in {1.75/10:00,4.0/10:02,6.25/10:04,8.5/10:06,10.35/10:08} {
-    \draw[BookRule,line width=0.35pt] (\x,2.18) -- (\x,2.52);
-    \node[book label] at (\x,1.88) {\t};
-    \draw[BookRule,line width=0.35pt] (\x,0.48) -- (\x,0.82);
-    \node[book label] at (\x,0.2) {\t};
-  }
+  \node[book label, text width=2.9cm] at (1.43,5.05) {发生顺序\\event\_time + seq};
+  \node[book label, text width=2.9cm] at (5.33,5.05) {到达顺序\\ingest\_time};
+  \node[book label, text width=3.05cm] at (9.28,5.05) {窗口判定\\watermark};
 
-  \node[book accent node, text width=1.45cm] (login) at (1.75,2.9) {login\\seq 1};
-  \node[book teal node, text width=1.45cm] (view) at (4.0,2.9) {view\\seq 2};
-  \node[book purple node, text width=1.45cm] (click) at (6.25,2.9) {click\\seq 3};
-  \node[book amber node, text width=1.45cm] (pay) at (8.5,2.9) {pay\\seq 4};
+  \node[book accent node, text width=2.45cm] (e1) at (1.43,4.15) {event 10:00\\login / seq 1};
+  \node[book teal node, text width=2.45cm] (e2) at (1.43,3.05) {event 10:02\\view / seq 2};
+  \node[book purple node, text width=2.45cm] (e3) at (1.43,1.95) {event 10:04\\click / seq 3};
+  \node[book amber node, text width=2.45cm] (e4) at (1.43,0.85) {event 10:06\\pay / seq 4};
 
-  \node[book accent node, text width=1.45cm] (loginIn) at (1.95,1.18) {login};
-  \node[book teal node, text width=1.45cm] (viewIn) at (4.25,1.18) {view};
-  \node[book amber node, text width=1.45cm] (payIn) at (8.65,1.18) {pay};
-  \node[book red node, text width=1.45cm] (clickLate) at (10.0,1.18) {click\\迟到};
+  \node[book accent node, text width=2.45cm] (i1) at (5.33,4.15) {ingest 10:00\\login};
+  \node[book teal node, text width=2.45cm] (i2) at (5.33,3.05) {ingest 10:02\\view};
+  \node[book amber node, text width=2.45cm] (i3) at (5.33,1.95) {ingest 10:06\\pay};
+  \node[book red node, text width=2.45cm] (i4) at (5.33,0.85) {ingest 10:08\\click};
 
-  \draw[book dashed arrow] (login.south) -- (loginIn.north);
-  \draw[book dashed arrow] (view.south) -- (viewIn.north);
-  \draw[book dashed arrow] (pay.south) -- (payIn.north);
-  \draw[book back arrow] (click.east) .. controls +(1.25,0.1) and +(-0.25,0.85) ..
-    node[book label, pos=0.55, yshift=7pt] {迟到} (clickLate.north);
+  \node[book small node, text width=2.95cm] (d1) at (9.28,4.15) {打开会话\\记录 seq 1};
+  \node[book small node, text width=2.95cm] (d2) at (9.28,3.05) {等待 click\\转化链未闭合};
+  \node[book amber node, text width=2.95cm] (d3) at (9.28,1.95) {watermark = 10:05\\pay 暂存};
+  \node[book red node, text width=2.95cm] (d4) at (9.28,0.85) {click event 10:04\\进入迟到策略};
 
-  \draw[book brace] (1.45,3.42) -- node[book label, yshift=6pt] {五分钟窗口状态} (6.55,3.42);
-  \draw[book brace] (3.7,-0.22) -- node[book label, yshift=-7pt] {接收顺序不等于发生顺序} (10.25,-0.22);
+  \draw[book dashed arrow] (e1) -- (e2);
+  \draw[book dashed arrow] (e2) -- (e3);
+  \draw[book dashed arrow] (e3) -- (e4);
+  \draw[book dashed arrow] (i1) -- (i2);
+  \draw[book dashed arrow] (i2) -- (i3);
+  \draw[book dashed arrow] (i3) -- (i4);
 
-  \draw[book strong arrow] (7.25,0.34) -- (7.25,1.1);
-  \node[book label] at (7.25,1.35) {水位线};
+  \draw[book strong arrow] (i1) -- (d1);
+  \draw[book strong arrow] (i2) -- (d2);
+  \draw[book strong arrow] (i3) -- (d3);
+  \draw[book back arrow] (i4) -- (d4);
+
+  \node[book label, align=left, text width=10.2cm] at (5.35,-0.65) {同一事件有两种顺序：左列定义语义，中列定义系统实际看到的顺序；右列只在水位线给出完整性承诺后关闭窗口。};
 \end{pdfdiagram}
-\diagramnote{事件流项目比普通日志计数更适合贯穿本册，因为它能自然引出顺序、窗口、乱序、状态和背压；水位线推进后，更早到达的事件会被归入迟到处理。}
+\diagramnote{图中故意把 \code{event_time}、\code{ingest_time} 和 watermark 拆成三列：前者定义会话事实，中间列定义系统观察顺序，右列决定窗口何时稳定以及迟到事件怎样处理。}
+
+这个反例让第一章从字段介绍进入系统设计。为了让 \code{click} 不被错误地判定为缺失，系统必须保存会话状态；为了等待迟到数据，系统必须为重排缓冲付出内存；为了让输出稳定，系统必须说明水位线推进后是否允许补偿；为了在失败后重放，manifest 和 trace 必须记录窗口、attempt 和 late policy 的决定。后续高性能章节会把这些顺序关系纳入复杂度分析：已按 \code{user_id,event_time,seq} 排好的输入可以线性扫描；完全乱序输入可能需要排序或按用户分区后局部排序；有界乱序输入需要重排缓冲、水位线和活动会话状态。
 
 用日志系统作为主线是合适的前提，是把它定义成事件流系统，而不是停在独立行统计。矩阵、图遍历和图像 stencil 很适合做单独高性能内核实验，但它们不容易自然承载 parser、I/O、背压、manifest、重试、幂等和分布式 shuffle。事件流主线可以把这些系统问题串起来；矩阵、图和 stencil 则作为 kernel suite 的专项实验插入第二部分。后续章节会继续扩展同一个项目：先有串行 reference，再有 split、batch、冷热分离和局部聚合；接着加入会话状态、窗口聚合、稳定输出和维表 join；再加入有界队列、线程池、锁、原子、无锁结构和任务图；最后加入异步写出、manifest、故障注入、shuffle 和分布式 driver。项目每增加一个能力，都要回答语义、性能和恢复三个问题。
 
