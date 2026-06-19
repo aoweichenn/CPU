@@ -45,55 +45,59 @@
 贯穿项目还有一个好处：同一批输入可以反复使用。第二章用它观察循环依赖和分支；第三章用它观察缓存、TLB 和 page cache；第六章用它比较 AoS、SoA、字符串池和哈希表布局；第十章用它制造锁竞争；第十四章用它观察任务调度；第十五章用它验证 I/O 背压；第十六章以后用它模拟消息丢失和重复提交。输入不变，关注点变化，读者才能看清“同一个系统被不同章节放大”的感觉。
 
 \topic{三、核心概念的操作语义}
-操作语义指一个对象在程序中的可检查含义：它对应哪个程序对象，允许哪些状态变化，哪些行为是合法的，违反边界后会产生什么错误。本章先给出后续章节反复使用的一组操作语义。这样定义之后，读者看到代码、实验报告或系统日志时，才能判断某个对象究竟承担了正确性职责、性能职责，还是恢复职责。
+操作语义指一个对象在程序中的可检查含义：它对应哪个程序对象，允许哪些状态变化，哪些行为是合法的，违反边界后会产生什么错误。与其先背一串名词，不如从一次失败运行开始看这些对象为什么必须存在。
 
-\code{reference} 是正确性基准。它通常是一份结构清晰、执行顺序确定、便于人工复查的实现，用来定义同一输入下应当得到的可观察结果。五行日志手算得到 \code{view=2}，reference 程序也必须得到 \code{view=2}；坏行被拒绝时，reference 还要给出 rejected records 的数量和对应的 \code{RecordId}。后续 SIMD 版本、多线程版本、异步 I/O 版本和分布式版本都要和 reference 比较。只要输入合同没有改变，优化版本就必须保持相同计数、相同错误分类和相同提交语义。Reference 因此承担三项职责：规定结果、生成期望值、为性能优化设置不可跨越的正确性边界。
+假设五行日志的人工答案是 \code{view=2}。第一版程序在一个线程里顺序读取，结果正确；于是我们把这份顺序、确定、容易审查的实现保留下来，称为 \code{reference}。Reference 不是慢版本的羞耻备份，而是正确性基准：它规定同一输入下计数是多少、坏行怎样分类、错误记录的 \code{RecordId} 是什么。后续版本只要没有改变输入合同，就必须和它对齐。
 
-\code{split} 是输入切片。大日志不能总是由一个线程从头读到尾，系统会把文件划成多个范围，例如 split 0 处理前三行，split 1 处理后两行。Split 的定义包含两层约束：物理上它是一段字节范围，语义上它必须包含若干完整记录。若切分点落在一行中间，reader 需要移动到行边界；否则一条日志可能被漏掉、截断或重复处理。Split 让并行读取成为可能，也让失败恢复有了粒度：某个 split 失败时，系统可以只重做这一片输入。
+输入变大以后，程序把文件切成多个 \code{split}。这时第一个反例马上出现：切分点落在一行中间，前一个 worker 读到半行，后一个 worker 又从半行开始读，同一条记录可能被截断、丢失或重复。Split 因此不只是字节范围，而是“这段完整记录归谁处理”的合同。每条记录还需要稳定身份；否则切分方式一变，错误诊断就无法证明自己仍然指向同一条坏行。
 
-\code{partial} 是局部结果。Split 0 得到 \code{view=1}，split 1 也得到 \code{view=1}，这两个结果都只是各自输入范围对全局答案的贡献；合并两个 partial 后才得到 \code{view=2}。Partial 的操作语义要求它能说明来源：来自哪个 split、哪个 attempt、使用哪个输入版本、覆盖哪些 key。缺少这些身份字段时，合并阶段只能看到一堆计数，却无法判断它们是否重复、过期或缺失。
+并行处理 split 之后，每个 worker 先产生 \code{partial}。Partial 不是最终答案，而是某个输入范围对最终答案的贡献。它必须说明来源：来自哪个 split、哪个 attempt、覆盖哪些 key。没有这些字段，合并阶段看到的只是一堆计数，无法判断它们是否重复、过期或缺失。
 
-\code{attempt} 是同一个逻辑任务的一次物理执行。Split 1 第一次执行写出了临时文件后崩溃，driver 可以再次调度 split 1；逻辑任务仍然是 split 1，物理执行却有 attempt 1 和 attempt 2。Attempt id 的作用是区分旧输出和新输出。没有 attempt id，系统会把“同一任务重跑产生的两个 block”误认为“两份不同输入的贡献”，最终把同一段日志算两次。
+写出阶段暴露第二个反例。Worker 已经把 split 1 的结果写成临时 block，但在写 manifest 前崩溃；driver 重新调度 split 1，又产生第二个 block。如果 reducer 扫描目录，就会把同一段输入合并两次。于是需要 \code{attempt} 区分同一逻辑任务的多次物理执行，需要 \code{manifest} 把“文件存在”提升为“结果生效”。目录记录文件系统事实，manifest 记录作业语义事实。
 
-\code{manifest} 是已提交结果清单。目录中存在一个 block，只说明文件系统里出现了这个文件；manifest 中存在一条被接受的记录，才说明该 block 进入作业的提交事实，reduce 阶段可以读取它。对于写出后崩溃的 split，磁盘上可能残留多个临时 block，manifest 只能承认其中一个有效贡献。Manifest 把“文件存在”提升为“结果生效”，它是恢复协议和下游读取之间的边界。
+运行慢时还会暴露控制边界。Reader 读取很快，writer 持久化很慢，如果中间队列没有容量上限，内存会替系统承担无限缓冲。于是需要 \code{backpressure}：下游处理能力不足时，上游必须被限速。只知道“系统慢了”还不够，\code{trace} 要把 task 的状态按身份串起来，例如 queued、running、writing、committing 和 committed。这样才能判断慢在 CPU、队列、I/O 还是提交。
 
-\code{backpressure} 是背压，表示下游处理能力不足时，上游必须被限速。Reader 读 split 很快，writer 写磁盘很慢，如果中间队列没有容量上限，内存会持续上涨，延迟也会失去边界。背压的操作语义是：队列达到水位后，reader 暂停读取、worker 暂停产生更多 partial，或者调度器降低上游并发。背压牺牲一部分瞬时吞吐，换来有界内存、可解释延迟和更小的失败恢复范围。
+规模继续放大，数据本身也要分层。热路径是每条正常记录反复经过的主流程，冷路径是少数错误、诊断或调试时才访问的流程。日志解析和计数属于热路径；错误原文和详细诊断属于冷路径。把冷信息塞进热对象，会让 CPU 反复搬运暂时用不到的字节；把热字段集中起来，缓存行能容纳更多有效数据。TLB 和 NUMA 则提醒读者：同一段 C++ 在不同数据布局和线程放置下，地址翻译、远端内存和 cache line 迁移都会改变成本。
 
-\code{trace} 是执行轨迹。它把 task 的关键状态按时间串起来，例如 queued、running、writing、committing 和 committed。普通日志只记录某一时刻发生了什么，trace 还要求按任务身份连接事件。系统变慢时，trace 能说明任务卡在等待队列、CPU 执行、写出阶段还是提交阶段；系统失败时，trace 能说明哪个 attempt 已经写出、哪个 attempt 已经提交、哪个响应已经过期。
-
-热路径是每条正常记录反复经过的主流程，冷路径是少数错误、诊断或调试场景才会访问的流程。日志解析和计数属于热路径；错误原文、详细诊断和调试上下文属于冷路径。把冷信息放进热对象，会让 CPU 反复搬运暂时用不到的字节；把热字段集中起来，缓存行能容纳更多有效数据，也更容易进行批量处理。热路径和冷路径的划分，是数据布局章节的第一条成本边界。
-
-TLB 是地址翻译缓存。程序访问虚拟地址时，CPU 需要把虚拟地址翻译成物理地址；TLB 保存最近使用过的翻译结果。若工作集过大、对象分散或访问缺乏局部性，TLB 命中率下降，循环会因为地址翻译而变慢。NUMA 是非一致内存访问模型，多插槽机器上的核心访问本地内存更快，访问远端内存更慢。Worker 在一个 CPU socket 上运行，却频繁读取另一个 socket 初始化的哈希表或 buffer，就会产生远端访问成本。TLB 和 NUMA 解释的是同一段 C++ 在不同数据布局和线程放置下为什么会出现性能差异。
-
-\code{epoch} 是所有权轮次。假设某个分片原来归 worker A，后来迁移给 worker B。A 在旧轮次下发出的成功响应如果迟到，不能再写入 manifest；只有当前 epoch 的拥有者才有提交权。Epoch 把“谁现在有权宣布结果有效”编码进状态表，后续讲分片迁移、复制、leader 切换和模型热更新时，都要依靠它拒绝过期响应。
-
-这些概念共同形成第一章的边界表：reference 定义结果，split 定义输入归属，partial 定义局部贡献，attempt 定义物理执行，manifest 定义提交事实，backpressure 定义等待传播，trace 定义可观测证据，热路径与冷路径定义数据布局，TLB 与 NUMA 定义硬件成本，epoch 定义所有权轮次。后续章节会不断扩展这张边界表，而不是重新发明一套分析语言。
+分布式环境再暴露所有权边界。某个分片原来归 worker A，后来迁移给 worker B；A 在旧轮次下发出的成功响应如果迟到，不能再写入 manifest。于是需要 \code{epoch} 表示当前提交权轮次。Epoch 不是时间戳，而是“谁现在有权宣布结果有效”的状态。没有它，旧 owner 的迟到消息会覆盖新 owner 的提交事实。
 
 \begin{pdfdiagram}[x=1cm,y=1cm]
-  \node[book title label] at (0.4,4.1) {第一章的三组边界};
+  \node[book title label] at (0.35,5.85) {一次失败运行暴露三组边界};
 
-  \node[book label, align=center, text width=2.5cm] at (1.35,3.35) {语义边界};
-  \node[book label, align=center, text width=2.5cm] at (5.15,3.35) {可观测边界};
-  \node[book label, align=center, text width=2.5cm] at (8.95,3.35) {提交边界};
+  \draw[book lane] (-0.2,0.05) rectangle (3.15,5.25);
+  \draw[book lane] (3.7,0.05) rectangle (7.0,5.25);
+  \draw[book lane] (7.55,0.05) rectangle (10.95,5.25);
 
-  \node[book accent node, text width=2.25cm] (reference) at (1.35,2.55) {reference\\正确结果};
-  \node[book teal node, text width=2.25cm] (split) at (1.35,1.3) {split\\输入归属};
-  \node[book amber node, text width=2.25cm] (partial) at (1.35,0.05) {partial\\局部贡献};
+  \node[book label, text width=3.0cm] at (1.48,4.88) {语义边界\\结果是什么};
+  \node[book label, text width=3.0cm] at (5.35,4.88) {执行边界\\谁在等待};
+  \node[book label, text width=3.1cm] at (9.25,4.88) {提交边界\\何时生效};
 
-  \node[book small node, text width=2.25cm] (layout) at (5.15,2.55) {热/冷路径\\字段与诊断};
-  \node[book small node, text width=2.25cm] (backpressure) at (5.15,1.3) {backpressure\\等待传播};
-  \node[book small node, text width=2.25cm] (trace) at (5.15,0.05) {trace\\执行证据};
+  \node[book accent node, text width=2.55cm] (reference) at (1.48,4.05) {reference\\人工可审查答案};
+  \node[book teal node, text width=2.55cm] (split) at (1.48,2.95) {split / RecordId\\输入归属};
+  \node[book amber node, text width=2.55cm] (partial) at (1.48,1.85) {partial\\局部贡献};
+  \node[book small node, text width=2.55cm] (compare) at (1.48,0.75) {验收\\计数和诊断一致};
 
-  \node[book purple node, text width=2.25cm] (attempt) at (8.95,2.55) {attempt\\物理执行};
-  \node[book navy node, text width=2.25cm] (manifest) at (8.95,1.3) {manifest\\提交事实};
-  \node[book small node, text width=2.25cm] (epoch) at (8.95,0.05) {epoch\\提交权轮次};
+  \node[book purple node, text width=2.55cm] (hotcold) at (5.35,4.05) {热/冷路径\\字段和诊断分离};
+  \node[book teal node, text width=2.55cm] (queue) at (5.35,2.95) {backpressure\\队列水位有界};
+  \node[book small node, text width=2.55cm] (trace) at (5.35,1.85) {trace\\状态和等待证据};
+  \node[book small node, text width=2.55cm] (cost) at (5.35,0.75) {验收\\等待和成本可定位};
 
-  \draw[book strong arrow] (reference) -- (split);
-  \draw[book strong arrow] (split) -- (partial);
-  \draw[book strong arrow] (attempt) -- (manifest);
-  \draw[book strong arrow] (manifest) -- (epoch);
+  \node[book purple node, text width=2.65cm] (attempt) at (9.25,4.05) {attempt\\一次物理执行};
+  \node[book navy node, text width=2.65cm] (manifest) at (9.25,2.95) {manifest\\唯一提交事实};
+  \node[book red node, text width=2.65cm] (epoch) at (9.25,1.85) {epoch\\当前提交权};
+  \node[book small node, text width=2.65cm] (commitcheck) at (9.25,0.75) {验收\\重复和迟到被拒绝};
+
+  \draw[book dashed arrow] (reference) -- (split);
+  \draw[book dashed arrow] (split) -- (partial);
+  \draw[book dashed arrow] (partial) -- (compare);
+  \draw[book dashed arrow] (hotcold) -- (queue);
+  \draw[book dashed arrow] (queue) -- (trace);
+  \draw[book dashed arrow] (trace) -- (cost);
+  \draw[book dashed arrow] (attempt) -- (manifest);
+  \draw[book dashed arrow] (manifest) -- (epoch);
+  \draw[book dashed arrow] (epoch) -- (commitcheck);
 \end{pdfdiagram}
-\diagramnote{概念关系应当先画成边界链：哪些对象定义结果，哪些对象解释执行，哪些对象阻止重复提交。}
+\diagramnote{边界对象不是名词表。每一列都从一个失败现象出发，并落到可验收证据：语义列证明没有算错，执行列证明等待可见，提交列证明重复和迟到不会生效。}
 
 \section{贯穿全书的计算作业}
 
@@ -213,12 +217,7 @@ Watermark 不是图上的装饰箭头，而是系统对 \code{event_time} 完整
 
 同时也要记住最小样例的边界。它擅长保护语义，却不能证明缓存局部性、锁竞争、I/O 吞吐或网络延迟。进入性能章节后，仍要使用更大的输入、更多 key 分布、更真实的等待和更完整的故障矩阵。小样例负责让系统不偏离正确性，压力实验负责让系统暴露成本；两者合在一起，才构成可靠教材项目。
 
-若最小样例失败，性能数据应暂时搁置；系统还没有证明自己算对，任何吞吐数字都缺少解释价值。
-这也是本章反复强调 reference 的原因。
-先正确，再优化。
-所有实验都应服从这条顺序。
-Reference 也是团队讨论正确性的公共语言。
-它让性能争论回到同一个事实基础。
+若最小样例失败，性能数据应暂时搁置。系统还没有证明自己算对，任何吞吐数字都缺少解释价值。这也是本章反复强调 reference 的原因：它不只是测试程序，而是团队讨论正确性的公共语言。等 reference、split、partial 和 manifest 的语义都被小输入证明以后，压力实验才有资格进入讨论；否则所谓优化只是在一个尚未定义清楚的结果上比较速度。
 
 \topic{二、从十行输入到十亿行输入}
 十行输入和十亿行输入不是同一个问题的简单重复。十行输入中，文件打开、容器初始化和输出打印可能比真正计数还显眼；十亿行输入中，程序要处理数十 GB 甚至更多字节，解析、哈希、字符串分配、内存带宽、page cache 和写出策略都会进入主成本。十行输入可以人工检查坏行；十亿行输入必须把错误变成结构化诊断。十行输入崩溃后可以重新运行；长时间作业崩溃后需要知道哪些 split 已经提交，哪些 attempt 只是留下了临时状态。
@@ -347,21 +346,31 @@ ReferenceResult run_reference_checked(
 把日志统计写成流程，可以看到每一步都对应后续章节的主题。Reader 先读取一段字节，确定 split 边界；parser 扫描字段，产生 \code{ParsedRecord} 或诊断；batch builder 把热字段集中起来，并保存冷诊断；worker 在本地 partial 中聚合 key；writer 把 partial 写成临时 block；driver 把 block 提交进 manifest；reducer 读取 manifest 中的 block 并输出最终结果。
 
 \begin{pdfdiagram}[x=1cm,y=1cm]
-  \node[book title label] at (0.45,6.65) {端到端处理流程};
+  \node[book title label] at (0.35,7.05) {端到端处理流程};
 
-  \node[book label, text width=3.0cm, align=center] at (3.0,5.95) {主处理路径};
-  \node[book label, text width=3.0cm, align=center] at (7.85,5.95) {旁路证据};
+  \draw[book lane] (-0.2,-0.15) rectangle (3.15,6.45);
+  \draw[book lane] (3.75,-0.15) rectangle (7.0,6.45);
+  \draw[book lane] (7.6,-0.15) rectangle (10.95,6.45);
 
-  \node[book accent node, text width=2.55cm] (reader) at (3.0,5.15) {Reader\\确定 split};
-  \node[book teal node, text width=2.55cm] (parser) at (3.0,3.9) {Parser\\字段扫描};
-  \node[book purple node, text width=2.55cm] (worker) at (3.0,2.65) {Batch/Worker\\热字段和 partial};
-  \node[book amber node, text width=2.55cm] (writer) at (3.0,1.4) {Writer\\临时 block};
-  \node[book navy node, text width=2.55cm] (manifest) at (3.0,0.15) {Manifest\\提交事实};
-  \node[book accent node, text width=2.55cm] (reducer) at (3.0,-1.1) {Reducer\\读取提交结果};
+  \node[book label, text width=3.0cm, align=center] at (1.48,6.05) {主处理路径};
+  \node[book label, text width=3.0cm, align=center] at (5.38,6.05) {旁路证据};
+  \node[book label, text width=3.1cm, align=center] at (9.28,6.05) {反馈和背压};
 
-  \node[book small node, text width=2.85cm] (diag) at (7.85,3.9) {冷诊断\\错误原文/RecordId};
-  \node[book small node, text width=2.85cm] (trace) at (7.85,2.65) {trace\\队列、等待、状态};
-  \node[book small node, text width=2.85cm] (checksum) at (7.85,1.4) {checksum\\block 完整性};
+  \node[book accent node, text width=2.55cm] (reader) at (1.48,5.18) {Reader\\确定 split};
+  \node[book teal node, text width=2.55cm] (parser) at (1.48,4.18) {Parser\\字段扫描};
+  \node[book purple node, text width=2.55cm] (worker) at (1.48,3.18) {Batch/Worker\\热字段和 partial};
+  \node[book amber node, text width=2.55cm] (writer) at (1.48,2.18) {Writer\\临时 block};
+  \node[book navy node, text width=2.55cm] (manifest) at (1.48,1.18) {Manifest\\提交事实};
+  \node[book accent node, text width=2.55cm] (reducer) at (1.48,0.18) {Reducer\\读取提交结果};
+
+  \node[book small node, text width=2.55cm] (diag) at (5.38,4.18) {冷诊断\\错误原文/RecordId};
+  \node[book small node, text width=2.55cm] (trace) at (5.38,3.18) {trace\\队列、等待、状态};
+  \node[book small node, text width=2.55cm] (checksum) at (5.38,2.18) {checksum\\block 完整性};
+  \node[book small node, text width=2.55cm] (report) at (5.38,1.18) {report\\输入、指标、限制};
+
+  \node[book teal node, text width=2.65cm] (splitQ) at (9.28,4.68) {split queue\\限制 reader};
+  \node[book amber node, text width=2.65cm] (partialQ) at (9.28,3.18) {partial queue\\限制 worker};
+  \node[book red node, text width=2.65cm] (failure) at (9.28,1.68) {失败/取消\\唤醒等待者};
 
   \draw[book strong arrow] (reader) -- (parser);
   \draw[book strong arrow] (parser) -- (worker);
@@ -371,9 +380,14 @@ ReferenceResult run_reference_checked(
 
   \draw[book dashed arrow] (parser) -- (diag);
   \draw[book dashed arrow] (worker) -- (trace);
-  \draw[book dashed arrow] (writer.east) -- ++(0.55,0) |- (checksum.west);
+  \draw[book dashed arrow] (writer) -- (checksum);
+  \draw[book dashed arrow] (manifest) -- (report);
+
+  \draw[book back arrow] (splitQ.west) -- ++(-0.45,0) |- (reader.east);
+  \draw[book back arrow] (partialQ.west) -- ++(-0.45,0) |- (worker.east);
+  \draw[book back arrow] (failure.west) -- ++(-0.45,0) |- (trace.east);
 \end{pdfdiagram}
-\diagramnote{端到端管线要同时看热路径、冷诊断、提交证据和背压方向；这样每个箭头都能连接到后续章节的实验。}
+\diagramnote{端到端管线不是单向箭头。主路径负责产生结果，旁路证据负责解释结果，反馈列负责把队列满、writer 慢和失败取消变成可观察控制信号。}
 
 这个流程的每个箭头都可能失败或变慢。Reader 可能遇到短读、编码错误或 page cache miss；parser 可能遇到坏行、分支误预测或 SIMD 尾部处理；worker 可能遇到哈希冲突、字符串分配、锁等待或 NUMA 远端内存；writer 可能遇到队列积压、短写或 fsync 延迟；driver 可能遇到迟到响应、重复 attempt 或 manifest 冲突；reducer 可能遇到热点 key、checksum 错误或输入 block 缺失。全书就是围绕这些箭头逐步放大。
 
@@ -815,29 +829,33 @@ struct TaskTrace {
 这个错误来自提交语义，而不是来自哈希表或线程调度。目录记录的是文件系统事实，manifest 记录的是作业语义事实。临时文件可以来自失败 attempt、旧 attempt、部分写入、调试输出或清理失败；下游只应读取 manifest 接受的 block。
 
 \begin{pdfdiagram}[x=1cm,y=1cm]
-  \node[book title label] at (0.45,4.85) {split 7 的两次 attempt};
+  \node[book title label] at (0.45,5.05) {split 7 的两次 attempt};
 
-  \node[book label, text width=2.5cm, align=center] at (1.3,4.1) {物理尝试};
-  \node[book label, text width=2.5cm, align=center] at (5.15,4.1) {磁盘事实};
-  \node[book label, text width=2.5cm, align=center] at (9.0,4.1) {提交事实};
+  \draw[book lane] (-0.2,2.65) rectangle (10.8,4.45);
+  \draw[book lane] (-0.2,-0.35) rectangle (10.8,2.05);
 
-  \node[book accent node, text width=2.35cm] (a1) at (1.3,3.25) {attempt 1\\写出后崩溃};
-  \node[book small node, text width=2.35cm] (tmp1) at (5.15,3.25) {\filepath{part-7-a1.tmp}\\orphan block};
-  \node[book red node, text width=2.35cm] (bad) at (9.0,3.25) {错误路径\\扫描目录};
+  \node[book label, text width=1.05cm, align=center] at (0.55,3.55) {错误\\路径};
+  \node[book label, text width=1.05cm, align=center] at (0.55,1.15) {正确\\路径};
+  \node[book label, text width=2.2cm] at (2.35,4.05) {物理尝试};
+  \node[book label, text width=2.2cm] at (5.35,4.05) {磁盘事实};
+  \node[book label, text width=2.2cm] at (8.35,4.05) {reduce 入口};
 
-  \node[book teal node, text width=2.35cm] (a2) at (1.3,1.65) {attempt 2\\重新执行};
-  \node[book small node, text width=2.35cm] (tmp2) at (5.15,1.65) {\filepath{part-7-a2.tmp}\\candidate block};
-  \node[book amber node, text width=2.35cm] (entry) at (9.0,1.65) {manifest entry\\split 7 -> attempt 2};
+  \node[book accent node, text width=2.15cm] (a1) at (2.35,3.35) {attempt 1\\写出后崩溃};
+  \node[book small node, text width=2.25cm] (tmp1) at (5.35,3.35) {\filepath{part-7-a1.tmp}\\orphan block};
+  \node[book red node, text width=2.25cm] (bad) at (8.35,3.35) {扫描目录\\重复计数};
 
-  \node[book navy node, text width=2.35cm] (reduce) at (9.0,0.2) {reduce\\只读 manifest};
+  \node[book teal node, text width=2.15cm] (a2) at (2.35,1.15) {attempt 2\\重新执行};
+  \node[book small node, text width=2.25cm] (tmp2) at (5.35,1.15) {\filepath{part-7-a2.tmp}\\candidate block};
+  \node[book amber node, text width=2.25cm] (entry) at (8.35,1.15) {manifest entry\\split 7 -> attempt 2};
+  \node[book navy node, text width=2.25cm] (reduce) at (8.35,0.05) {reduce\\只读 manifest};
 
-  \draw[book dashed arrow] (a1) -- (tmp1);
+  \draw[book back arrow] (a1) -- (tmp1);
   \draw[book back arrow] (tmp1) -- (bad);
   \draw[book strong arrow] (a2) -- (tmp2);
   \draw[book strong arrow] (tmp2) -- (entry);
   \draw[book strong arrow] (entry) -- (reduce);
 \end{pdfdiagram}
-\diagramnote{目录里有文件不等于结果生效；manifest 是 reduce 阶段判断“哪个输出有效”的唯一语义入口，未被 manifest 接受的 block 只能清理或保留诊断。}
+\diagramnote{错误路径和正确路径分开画：目录扫描会把 orphan block 当成有效贡献；manifest 路径只承认被接受的 attempt，reduce 因而不会重复合并 split 7。}
 
 \begin{lstlisting}[language=C++,caption={用 manifest 表达提交事实}]
 #include <cstdint>
