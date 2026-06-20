@@ -1,1021 +1,338 @@
 \chapter{锁、条件变量与信号量}
 
-先看一个有界队列 bug：生产者关闭队列后，某个消费者仍然睡在条件变量上，测试偶尔卡死。代码里有锁，也有 \code{notify_one}，看起来同步原语都用上了；真正的问题是等待谓词没有包含 closed 状态，通知和状态转移没有形成一个完整协议。另一个版本把 \code{size} 在锁外读取，为了缩短临界区，反而让 head、tail 和 size 的不变量被拆开。
+第 9 章让线程池问题变得可见：ready 任务排队、worker 阻塞、CPU 空闲、关闭卡住。现在看一个更小但更本质的事故。线程池 worker 在空队列上等待，主线程调用 \code{shutdown}，设置 \code{closed = true} 后只通知了 \code{not_full}。生产者被唤醒并退出，消费者仍睡在 \code{not_empty} 上，析构时 \code{join} 永远不返回。代码里有 mutex，有 condition variable，也有 \code{notify_one}，但同步语义仍然错，因为等待谓词没有覆盖关闭状态，通知对象也没有覆盖所有等待者。
 
-本章从这种队列关闭事故出发讲锁、条件变量和信号量。锁的作用不是给代码贴一个“线程安全”标签，而是保护一组共享状态不变量；条件变量不是让线程睡醒的工具，而是让状态变化和等待谓词配对；信号量不是万能限流器，而是把容量写成可等待的资源计数。正确使用这些原语，必须先明确保护对象、锁顺序、临界区长度和等待条件。
+本章的核心句子是：同步原语必须从共享状态的不变量和等待谓词推出来。Mutex 不是给代码块贴“线程安全”标签，而是保护一组字段之间的关系；condition variable 不是事件队列，而是让线程在谓词不满足时睡眠，并在状态可能变化时醒来重查；semaphore 不是更高级的锁，而是表达可等待的资源额度。贯穿案例是可关闭有界队列，因为它足够小，却同时包含互斥、等待、背压、关闭、异常、安全析构和测试。
 
-\section{从共享状态到互斥锁}
+\begin{learninggoals}
+学完本章后，读者应能完成八件事：
+\begin{enumerate}
+  \item 为一个并发对象写出锁保护的不变量，而不是只说“这里加锁”。
+  \item 解释条件变量为什么等待谓词，不等待通知次数，并能修复丢失唤醒和虚假唤醒问题。
+  \item 设计有界队列的 \code{push/pop/close/drain} 状态机，使关闭、背压和等待者退出都有定义。
+  \item 区分 mutex、condition variable、semaphore、read-write lock、RCU 和 atomic 的适用边界。
+  \item 说明锁顺序、锁内未知代码、异常路径和析构副作用如何制造死锁或尾延迟。
+  \item 从 futex fast path/slow path 理解用户态同步与内核睡眠唤醒的关系。
+  \item 为 Compute Systems Engine 写出 \code{QueueContract}，并让线程池、I/O 队列和 MessageBus 复用。
+  \item 设计容量为一、满队列关闭、空队列关闭、多生产者多消费者、异常任务和压力交错测试。
+\end{enumerate}
+\end{learninggoals}
 
-每把锁都应该有清晰的保护范围。一个队列锁保护 head、tail、size 和 buffer 状态；一个计数器锁保护 value；一个对象锁保护对象不变量。锁如果没有对应的不变量，就很容易出现“看起来加锁了但仍然错”的情况。
+\section{互斥锁保护的是不变量}
 
-临界区应尽量短，但不能为了短而破坏不变量。把状态检查放在锁外，可能引入竞态；把耗时 I/O 放在锁内，会扩大阻塞范围。工程上要在正确性和粒度之间找到边界。
+很多并发错误来自一个误解：mutex 保护某个变量。更准确地说，mutex 保护一组状态之间的不变量。环形队列的 \code{head}、\code{tail}、\code{size}、\code{buffer} 和 \code{closed} 不是孤立字段，它们共同说明哪些槽位可读、哪些槽位可写、队列是否还接收新元素。只把 \code{size} 改成 atomic，不能让队列线程安全，因为 \code{size} 与 \code{head/tail/buffer} 的关系仍可能被并发修改破坏。
 
-\begin{lstlisting}[language=C++,caption={锁保护队列不变量}]
+\topic{先写不变量表}
+有界队列的不变量至少包括：容量固定且大于零；\code{0 <= size <= capacity}；\code{head} 和 \code{tail} 总在数组范围内；\code{size == 0} 表示没有可读槽；\code{size == capacity} 表示没有可写槽；\code{head} 指向下一个可读槽；\code{tail} 指向下一个可写槽；\code{closed} 后不再接受新 \code{push}。所有会改变这些事实的代码，都必须在同一互斥边界内完成状态转换。
+
+\begin{lstlisting}[numbers=none,caption={有界队列的不变量不是注释装饰，而是代码审查依据}]
+bounded queue invariant:
+  capacity > 0
+  0 <= size <= capacity
+  head and tail are valid slots
+  size == 0 means no readable slot
+  size == capacity means no writable slot
+  closed means future push must fail
+\end{lstlisting}
+
+不变量表把代码审查变得具体。若 \code{push} 写入槽位后忘记更新 \code{size}，违反容量关系；若 \code{pop} 先减 \code{size} 再移动元素而移动抛异常，状态可能提交一半；若 \code{close} 在锁外设置 \code{closed}，等待者可能看见旧状态；若 \code{head} 在锁内改、\code{tail} 在锁外改，环形区间关系被拆碎。
+
+\topic{临界区越短越好，但不能拆散不变量}
+临界区应该短，是因为持锁时间越长，其他线程等待越多，尾延迟越不稳定。但“短”不能优先于“完整”。把队列是否满的检查放在锁外，看似减少持锁时间，实际上让检查和写入之间出现竞态。正确原则是：锁内完成最小的、不可拆分的状态转换；锁外执行耗时且不改变受保护不变量的工作。
+
+锁内尤其不能执行未知代码：用户回调、任务函数、磁盘 I/O、网络请求、复杂日志格式化、可能很慢的析构、会再进入运行时的函数。C++ 中最后一个 \code{std::shared_ptr} 在锁内析构，也可能触发复杂逻辑。高质量代码常在锁内把对象移动到局部变量，释放锁后再处理或析构。
+
+\begin{lstlisting}[language=C++,caption={互斥锁保护队列状态转换}]
 class QueueState {
 public:
- void push(std::int32_t value) {
- std::lock_guard<std::mutex> lock(this->mutex_);
- this->values_.push_back(value);
- }
+  void push(std::int32_t value) {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->values_.push_back(value);
+  }
 
 private:
- std::mutex mutex_;
- std::vector<std::int32_t> values_;
+  std::mutex mutex_;
+  std::vector<std::int32_t> values_;
 };
 \end{lstlisting}
 
-这段代码的关键不是 \code{push_back} 这一行，而是锁和不变量的关系：\code{values_} 的内部结构不能被多个线程同时修改。如果未来再加入 \code{size_}、\code{head_} 或统计字段，它们也必须在同一把锁保护下保持一致。
+这个示例很小，但习惯要严格：成员访问使用 \code{this->}，锁对象用 RAII，锁的作用域就是临界区。后续加入 \code{head_}、\code{tail_}、\code{size_}、\code{closed_} 后，它们都应归入同一不变量边界，直到测量证明需要拆分。
 
-写锁代码时，应先写“锁保护的不变量”，再写代码。比如有界队列的不变量可以是：\code{0 <= size <= capacity}，\code{head} 和 \code{tail} 总是落在环形数组范围内，\code{size == 0} 表示不能 pop，\code{size == capacity} 表示不能 push。互斥锁保护的是这些关系，不只是保护某一个变量。若 \code{size} 在锁内改，\code{head} 在锁外改，这个不变量就被拆碎了。
+\section{条件变量等待的是谓词}
 
-\topic{锁粒度}
-粗粒度锁容易证明正确，但并发度低。细粒度锁提高并发度，却增加锁顺序、死锁和状态拆分复杂度。分片锁是一种常见折中：按 key、队列分段或线程组拆成多把锁，让无关操作并行，热点操作仍受保护。
+条件变量常被误解为事件通知系统。正确模型是：线程持锁检查共享状态；若谓词不满足，\code{wait} 原子地释放锁并睡眠；被通知或虚假唤醒后，重新持锁检查谓词。通知本身不保存状态；如果通知发生时没有等待者，它不会留在条件变量里等后来者；被唤醒也不代表条件已经成立，因为别的线程可能先拿到锁并消费资源。
 
-锁粒度应从访问模式出发。如果所有请求都访问同一个热点 key，分片没有帮助；如果请求天然分散，分片锁可以显著减少竞争。锁优化前要先测量等待时间和竞争比例。
+\begin{systemdiagram}{条件变量：通知只是让等待者重新检查谓词}
+\begin{pdfdiagram}
+\node[book title label] at (0,0.68) {等待者};
+\node[book title label] at (3.0,0.68) {共享状态};
+\node[book title label] at (6.0,0.68) {通知};
+\node[book title label] at (9.0,0.68) {重新检查};
 
-\section{从等待谓词到条件变量}
+\node[book state,text width=2.1cm] (w0) at (0,0) {持锁检查\\predicate};
+\node[book amber node,text width=2.1cm] (sleep) at (0,-1.25) {不满足\\释放锁睡眠};
+\node[book data,text width=2.1cm] (state) at (3.0,-1.25) {size/closed\\在锁内改变};
+\node[book purple node,text width=2.1cm] (notify) at (6.0,-1.25) {\code{notify}};
+\node[book state,text width=2.1cm] (again) at (9.0,-1.25) {醒来后\\再次检查};
+\node[book red node,text width=2.35cm] (bad) at (4.5,-2.65) {不要把 notify\\当成数据};
 
-条件变量用于等待某个状态变真。它必须和互斥锁配合，并在循环里检查谓词。原因是线程可能被虚假唤醒，也可能在被唤醒后发现条件已经被其他线程消费。正确模式是“持锁检查条件，不满足则等待，醒来继续检查”。
+\draw[book arrow] (w0) -- (sleep);
+\draw[book strong arrow] (sleep) -- (state);
+\draw[book strong arrow] (state) -- (notify);
+\draw[book strong arrow] (notify) -- (again);
+\draw[book dashed arrow] (bad) -- (notify);
+\draw[book dashed arrow] (bad) -- (again);
 
-\begin{lstlisting}[language=C++,caption={条件变量等待谓词}]
-std::unique_lock<std::mutex> lock(this->mutex_);
-this->not_empty_.wait(lock, [this]() {
- return !this->values_.empty();
-});
-const std::int32_t value = this->values_.front();
-\end{lstlisting}
-
-这里谓词属于受锁保护的状态。通知本身不携带数据，数据在共享状态里。若不用循环检查谓词，就可能在虚假唤醒或竞争消费后读取空队列。
-
-条件变量最重要的句子是：等待的是谓词，不是通知。通知可能在等待前发生，也可能唤醒多个线程，也可能出现虚假唤醒。只要谓词在锁保护下检查，程序就正确；只依赖“我收到过一次 notify”，程序就脆弱。生产者消费者队列里，\code{not_empty} 的谓词是队列非空，\code{not_full} 的谓词是队列未满。两个谓词对应同一组受锁保护状态。
-
-\topic{信号量和资源计数}
-信号量表示可用资源数量。它适合限制并发度、实现 bounded buffer 或控制连接池。信号量和互斥锁不同：互斥锁保护状态的一致性，信号量表达资源额度。混用时要小心锁顺序，避免死锁。
-
-\section{锁顺序、异常和性能路径}
-
-死锁通常需要互斥、持有并等待、不可抢占和循环等待四个条件。破坏循环等待的常见方法是规定全局锁顺序。复杂系统里，锁顺序文档和锁级别检查很重要，因为死锁往往在低概率路径中出现。
-
-\topic{优先级反转和 convoy}
-优先级反转发生在低优先级线程持有锁，高优先级线程等待它，而中等优先级线程持续占用 CPU，导致高优先级线程无法前进。锁 convoy 则是多个线程排队等待同一锁，锁释放后唤醒和抢占成本让系统吞吐下降。这些问题说明锁不仅是用户态对象，也和调度器行为相互作用。
-
-工程系统要避免在锁内做不可控工作，例如磁盘 I/O、网络调用、复杂回调和用户插件。锁内执行时间越不可预测，越容易出现尾延迟问题。
-
-\topic{锁的性能路径}
-mutex 通常有三条路径。第一条是无竞争 fast path，用户态原子操作成功，成本较低。第二条是短暂竞争路径，线程可能自旋几轮，等待锁持有者很快释放。第三条是阻塞路径，线程进入内核等待，涉及 futex、调度和唤醒。性能分析要判断当前主要走哪条路径。一个低竞争 mutex 没必要改成复杂无锁结构；一个长期进入阻塞路径的热点锁，则需要拆分状态、缩短临界区或改变算法。
-
-临界区长度不只由代码行数决定。锁内分配内存、写日志、调用用户回调、访问远端 NUMA 内存、发生 page fault、触发异常路径，都会让持锁时间变长。锁优化报告应列出锁内可能的慢操作，而不只是说“这个锁很粗”。
-
-\topic{读写锁和 RCU 直觉}
-读多写少场景中，读写锁允许多个读者并发，但写者需要独占。它适合读临界区不太长、写入不太频繁的结构。若读者很多且读路径必须极轻，RCU 的思想更进一步：读者在不阻塞写者的情况下读取旧版本，写者发布新版本后，等所有旧读者离开再回收旧对象。
-
-RCU 的难点不在“读很快”这个口号，而在对象生命周期。旧对象什么时候没人再读，什么时候可以释放，如何处理写者之间的同步，都是必须证明的问题。后面讲无锁内存回收时，会看到相同主题。
-
-\section{有界队列、关闭和背压}
-
-Compute Systems Engine 的第一个同步结构应是有界队列，因为它把互斥、条件变量、背压和关闭语义放在同一个小系统里。有界队列不是一个简单容器，它表达了生产者和消费者之间的容量契约：队列未满时生产者可以放入，队列非空时消费者可以取出，队列满时生产者必须等待或失败，队列关闭后等待者必须能醒来并退出。
-
-先写不变量，再写代码。一个环形有界队列至少有这些不变量：容量大于零；\code{head} 和 \code{tail} 总在 \code{[0, capacity)} 范围内；\code{size} 总在 \code{[0, capacity]} 范围内；\code{size == 0} 时没有元素可取；\code{size == capacity} 时没有空槽可写；\code{head} 指向下一个可读槽；\code{tail} 指向下一个可写槽。互斥锁保护的是这组关系，而不是某一个整数。
-
-只要写代码时先写不变量，很多错误会提前暴露。例如 \code{push} 修改 \code{tail} 但忘了增加 \code{size}，\code{try_pop} 读取元素后忘了通知 \code{not_full}，\code{size} 用无符号类型导致下溢，析构时仍有线程阻塞，关闭后生产者继续写入，这些都不是语法问题，而是不变量和状态转换没有定义清楚。
-
-\begin{systemdiagram}{有界队列的状态、谓词和通知}
-\centering
-\begin{tikzpicture}[book diagram, x=1cm, y=1cm]
-  \node[book state, minimum width=2.0cm] (open) {Open\\接收写入};
-  \node[book hot, minimum width=2.35cm, right=0.85cm of open] (notfull) {not\_full\\size < capacity};
-  \node[book hot, minimum width=2.35cm, right=0.85cm of notfull] (notempty) {not\_empty\\size > 0};
-  \node[book warnnode, minimum width=2.0cm, right=0.85cm of notempty] (closed) {Closed\\唤醒退出};
-
-  \node[book data, minimum width=1.62cm, below=1.02cm of notfull] (head) {head};
-  \node[book data, minimum width=1.62cm, right=0.45cm of head] (size) {size};
-  \node[book data, minimum width=1.62cm, right=0.45cm of size] (tail) {tail};
-  \node[draw=BookRule, rounded corners=2pt, inner sep=0.28cm,
-        fit=(head)(size)(tail),
-        label={[font=\footnotesize\sffamily\color{BookMuted}]below:同一把 mutex 保护环形队列不变量}] (inv) {};
-
-  \draw[book arrow] (open) -- node[above, font=\footnotesize\sffamily] {push} (notfull);
-  \draw[book arrow] (notfull) -- node[above, font=\footnotesize\sffamily] {写入后通知} (notempty);
-  \draw[book arrow] (notempty) to[bend left=15] node[below, font=\footnotesize\sffamily] {读出后通知} (notfull);
-  \draw[book arrow] (notempty) -- node[above, font=\footnotesize\sffamily] {close} (closed);
-
-  \node[font=\footnotesize\sffamily\color{BookMuted}, below=0.55cm of inv]
-    {等待谓词写成“队列非空/未满，或 closed”；close 必须修改状态并 notify\_all。};
-\end{tikzpicture}
+\node[book label,text width=8.8cm] at (4.55,-3.55) {条件变量不记住通知次数。数据在共享状态里，正确性来自“持锁改状态 + 谓词等待 + 状态变化后通知”。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：等待者醒来只说明状态可能变了，不说明谓词一定为真。}
 \end{systemdiagram}
 
-\topic{从 try 到 blocking 的接口分层}
-队列接口不应只有一种操作。常见接口至少分成三类：非阻塞尝试、阻塞等待和关闭。非阻塞 \code{try_push} 或 \code{try_pop} 立即返回，适合事件循环或自定义调度；阻塞 \code{push} 或 \code{pop} 等待谓词变真，适合普通生产者消费者；关闭 \code{close} 唤醒等待者，告诉它们系统不再接受新任务或不再产生新元素。
+\topic{谓词必须覆盖退出条件}
+有界队列中，生产者等待的谓词不是“收到 \code{not_full} 通知”，而是“队列未满，或者队列已关闭”。消费者等待的谓词不是“收到 \code{not_empty} 通知”，而是“队列非空，或者队列已关闭”。关闭状态必须进入所有相关谓词，否则关闭时即使 \code{notify_all}，线程醒来后发现队列仍满或仍空，又会睡回去。
 
-如果队列没有关闭语义，线程池很难优雅退出。worker 可能永远阻塞在空队列上，主线程析构线程池时只能强行终止进程或依赖外部哨兵值。哨兵值在泛型队列中也不可靠，因为每种元素类型未必都有安全哨兵。正确做法是把关闭作为队列状态的一部分，受同一把锁保护，并在关闭时通知所有等待者。
+\begin{lstlisting}[language=C++,caption={条件变量等待的是谓词，不是通知次数}]
+std::optional<std::int32_t> pop_wait() {
+  std::unique_lock<std::mutex> lock(this->mutex_);
+  this->not_empty_.wait(lock, [this]() {
+    return this->closed_ || this->size_ > 0;
+  });
+
+  if (this->size_ == 0) {
+    return std::nullopt;
+  }
+
+  const std::int32_t value =
+      this->buffer_[static_cast<std::size_t>(this->head_)];
+  this->head_ = (this->head_ + 1) %
+      static_cast<std::int32_t>(this->buffer_.size());
+  --this->size_;
+  this->not_full_.notify_one();
+  return value;
+}
+\end{lstlisting}
+
+这段代码的线性化点是 \code{head/size} 更新。消费者取出元素并释放一个槽位后，通知一个生产者重新检查 \code{not_full} 谓词。若此时有多个消费者被唤醒，只有持锁后看到 \code{size > 0} 的消费者能继续；其他消费者必须继续等待或在关闭状态下退出。
+
+\topic{notify 的时机}
+常见写法是先在锁内修改状态，再通知。通知可以发生在仍持锁时，也可以在释放锁后发生，两者有性能和竞争细节差异。教学阶段不要为了微优化打乱状态逻辑：先保证所有等待者的谓词正确，所有能改变谓词结果的状态修改都在锁保护下，关闭时通知所有相关等待者。
+
+\section{有界队列：同步语义的最小系统}
+
+Compute Systems Engine 的线程池、I/O 写出队列、MessageBus、分布式模拟请求队列，都需要一个共同概念：容量有限、能背压、能关闭、能 drain 的队列。这个队列不是普通容器，而是生产者和消费者之间的同步合同。
+
+\begin{systemdiagram}{有界队列状态机：Open、Closing、Closed}
+\begin{pdfdiagram}
+\node[book state,text width=2.0cm] (open) at (0,0) {Open\\接收 push};
+\node[book amber node,text width=2.35cm] (full) at (2.7,0) {Full\\push waits};
+\node[book purple node,text width=2.35cm] (closing) at (5.65,0) {Closing\\拒绝 push\\允许 drain};
+\node[book red node,text width=2.0cm] (closed) at (8.75,0) {Closed\\empty};
+
+\node[book data,text width=2.0cm] (nonempty) at (2.7,-1.35) {NonEmpty\\pop ok};
+\node[book data,text width=2.0cm] (empty) at (5.65,-1.35) {Empty\\pop exits};
+
+\draw[book arrow] (open) -- node[above,font=\footnotesize\sffamily] {push 到满} (full);
+\draw[book arrow] (full) -- node[right,font=\footnotesize\sffamily] {pop} (nonempty);
+\draw[book arrow] (open) -- node[above,font=\footnotesize\sffamily] {close} (closing);
+\draw[book arrow] (full) -- node[above,font=\footnotesize\sffamily] {close} (closing);
+\draw[book arrow] (closing) -- node[right,font=\footnotesize\sffamily] {drain} (empty);
+\draw[book strong arrow] (empty) -- (closed);
+\draw[book dashed arrow] (nonempty) -- node[below,font=\footnotesize\sffamily] {继续 pop} (closing);
+
+\node[book label,text width=8.6cm] at (4.35,-2.7) {close 不是析构细节，而是状态转换。Closing 拒绝新输入，但允许已接收元素被取完；Closed 表示队列空且等待者都应退出。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：关闭协议必须区分“拒绝新输入”和“排空旧输入”。}
+\end{systemdiagram}
+
+\topic{接口先表达合同}
+队列接口应分层：非阻塞尝试、阻塞等待、关闭和可选 drain/timeout。非阻塞 \code{try_push/try_pop} 适合事件循环或自定义调度；阻塞 \code{push/pop} 适合普通生产者消费者；\code{close} 负责唤醒等待者并改变生命周期状态。哨兵值不是好方案，因为泛型元素未必有安全哨兵，且哨兵无法表达多个等待者和关闭策略。
 
 \begin{lstlisting}[language=C++,caption={有关闭语义的有界队列接口草图}]
 class BoundedQueue {
 public:
- explicit BoundedQueue(std::int32_t capacity);
+  explicit BoundedQueue(std::int32_t capacity);
 
- bool try_push(std::int32_t value);
- bool push(std::int32_t value);
- std::optional<std::int32_t> pop();
- void close();
+  bool try_push(std::int32_t value);
+  bool push(std::int32_t value);
+  std::optional<std::int32_t> pop();
+  void close();
 
 private:
- std::vector<std::int32_t> buffer_;
- std::int32_t head_ = 0;
- std::int32_t tail_ = 0;
- std::int32_t size_ = 0;
- bool closed_ = false;
- std::mutex mutex_;
- std::condition_variable not_empty_;
- std::condition_variable not_full_;
+  std::vector<std::int32_t> buffer_;
+  std::int32_t head_ = 0;
+  std::int32_t tail_ = 0;
+  std::int32_t size_ = 0;
+  bool closed_ = false;
+  std::mutex mutex_;
+  std::condition_variable not_empty_;
+  std::condition_variable not_full_;
 };
 \end{lstlisting}
 
-这里 \code{push} 返回 bool，是为了表达关闭后不能再写入；\code{pop} 返回 optional，是为了表达关闭且队列为空时消费者应退出。这个接口比单纯抛异常更适合作为线程池内部队列，因为关闭不是异常，而是正常生命周期事件。当然，业务层接口也可以选择抛异常，但内部状态机仍要明确。
+\code{push} 返回 \code{false}，表示关闭后不再接受新元素；\code{pop} 返回 \code{std::nullopt}，表示队列已关闭且没有剩余元素。这比在内部偷偷抛异常或让线程永久阻塞更适合作为运行时基础。业务层可以选择把这种状态转换成错误码、异常或取消，但底层合同必须明确。
 
-\topic{等待谓词的完整写法}
-生产者等待的谓词不是“收到 not full 通知”，而是“队列未满或已经关闭”。消费者等待的谓词不是“收到 not empty 通知”，而是“队列非空或已经关闭”。关闭必须出现在谓词里，否则关闭时即使 \code{notify_all}，线程醒来后发现队列仍满或仍空，又会继续睡回去，线程池无法退出。
+\topic{push 和 pop 的状态转换}
+生产者进入 \code{push} 后，先等待“有空间或关闭”。若关闭，返回失败；若有空间，写入槽位，更新 \code{tail/size}，通知消费者。消费者进入 \code{pop} 后，先等待“有元素或关闭”。若没有元素且关闭，返回空；若有元素，取出槽位，更新 \code{head/size}，通知生产者。
 
-\begin{lstlisting}[language=C++,caption={push 的状态转换}]
+\begin{lstlisting}[language=C++,caption={push 的谓词包含关闭状态}]
 bool BoundedQueue::push(std::int32_t value) {
- std::unique_lock<std::mutex> lock(this->mutex_);
- this->not_full_.wait(lock, [this]() {
- return this->closed_ ||
- this->size_ < static_cast<std::int32_t>(this->buffer_.size());
- });
- if (this->closed_) {
- return false;
- }
+  std::unique_lock<std::mutex> lock(this->mutex_);
+  this->not_full_.wait(lock, [this]() {
+    return this->closed_ ||
+        this->size_ < static_cast<std::int32_t>(this->buffer_.size());
+  });
+  if (this->closed_) {
+    return false;
+  }
 
- this->buffer_[static_cast<std::size_t>(this->tail_)] = value;
- this->tail_ = (this->tail_ + 1) %
- static_cast<std::int32_t>(this->buffer_.size());
- ++this->size_;
- this->not_empty_.notify_one();
- return true;
+  this->buffer_[static_cast<std::size_t>(this->tail_)] = value;
+  this->tail_ = (this->tail_ + 1) %
+      static_cast<std::int32_t>(this->buffer_.size());
+  ++this->size_;
+  this->not_empty_.notify_one();
+  return true;
 }
 \end{lstlisting}
 
-\begin{lstlisting}[language=C++,caption={pop 的状态转换}]
-std::optional<std::int32_t> BoundedQueue::pop() {
- std::unique_lock<std::mutex> lock(this->mutex_);
- this->not_empty_.wait(lock, [this]() {
- return this->closed_ || this->size_ > 0;
- });
- if (this->size_ == 0) {
- return std::nullopt;
- }
-
- const std::int32_t value =
- this->buffer_[static_cast<std::size_t>(this->head_)];
- this->head_ = (this->head_ + 1) %
- static_cast<std::int32_t>(this->buffer_.size());
- --this->size_;
- this->not_full_.notify_one();
- return value;
+\begin{lstlisting}[language=C++,caption={close 必须唤醒所有可能等待的谓词}]
+void BoundedQueue::close() {
+  {
+    std::lock_guard<std::mutex> lock(this->mutex_);
+    this->closed_ = true;
+  }
+  this->not_empty_.notify_all();
+  this->not_full_.notify_all();
 }
 \end{lstlisting}
 
-这两个片段体现了条件变量的关键原则：状态改变和谓词检查都在同一把锁保护下；通知只用于让等待者重新检查谓词；关闭是状态机的一部分。注意通知可以在持锁时调用，也可以在释放锁后调用，不同写法有不同唤醒和竞争细节。教材阶段更重要的是先保证谓词正确，再讨论微小性能差异。
+\topic{异常安全和提交点}
+教学代码用 \code{std::int32_t}，元素赋值不会抛出复杂异常。泛型队列则必须考虑移动构造、拷贝、分配和析构。状态提交点要清楚：元素成功进入槽位并更新 \code{tail/size} 后，\code{push} 才对消费者可见；元素成功移出并更新 \code{head/size} 后，槽位才重新可用。若元素操作可能抛异常，应在不改变不变量的阶段完成可能失败的工作，或者要求元素满足 \code{noexcept} move，或者使用更复杂的槽位生命周期管理。
 
-\topic{锁内代码的边界}
-有界队列的锁内代码应只做状态转换，不应执行用户回调、复杂分配、日志格式化或长时间 I/O。若 \code{push} 在锁内调用用户提供的处理函数，队列锁就保护了不可控代码，任何慢操作都会阻塞所有生产者和消费者。若 \code{pop} 在锁内执行任务，线程池全局队列会退化成串行执行器。
+\topic{背压是正常控制流}
+队列满了，生产者等待或失败，这不是程序坏了，而是背压在工作。背压防止下游慢时上游无限制造任务和占用内存。容量不是越大越好：容量过大能隐藏短期拥塞，但会放大排队延迟和内存峰值；容量过小会频繁阻塞，降低吞吐。项目报告应记录队列满次数、生产者等待时间、最大队列长度、拒绝数和关闭耗时。
 
-这条原则可以推广到所有锁。锁内只维护不变量，锁外做耗时工作。若必须在锁内移动复杂对象，应考虑预分配、移动语义、异常安全和对象析构成本。C++ 中对象析构也可能执行代码，如果最后一个引用在锁内释放，析构函数可能做不可控工作。高质量并发代码会尽量让重析构发生在锁外。
+\section{信号量：资源额度，不是对象不变量}
 
-\topic{异常安全和状态回滚}
-C++ 队列如果存储复杂对象，\code{push} 可能在移动或拷贝元素时抛异常。若异常发生在 \code{tail} 和 \code{size} 已经修改之后，不变量就会损坏。教学示例用 \code{std::int32_t} 可以避开这个问题，但正式教材必须说明边界：泛型队列需要把可能抛异常的操作和状态提交点分开，或者要求元素移动不抛异常，或者使用预构造槽位和 placement new carefully 管理生命周期。
+信号量表达“还有多少许可”。它适合连接池、I/O in-flight 限额、同时写文件数量、令牌桶、空槽/元素数量等资源计数。Mutex 保护复杂状态关系，semaphore 控制有多少个并发使用权。拿到许可后，线程仍可能需要 mutex 修改共享队列；释放许可时，还要保证失败和取消路径归还资源。
 
-状态机里要有提交点。对于 \code{push}，元素成功放入槽位并且 \code{tail/size} 更新后，操作才对消费者可见；对于 \code{pop}，元素被取出并且 \code{head/size} 更新后，槽位才重新可用。若中间步骤可能失败，就要保证失败前队列仍保持旧状态，或失败后能回滚。锁只能提供互斥，不能自动提供异常安全。
+\topic{用信号量理解 bounded buffer}
+有界队列可以用两个信号量理解：\code{empty_slots} 初始为 capacity，\code{filled_slots} 初始为 0。生产者先获取空槽许可，再写入；消费者先获取元素许可，再读取。环形索引仍需要 mutex 或单生产者/单消费者特化协议保护。这个模型能帮助读者看到“容量”是一种资源。
 
-\topic{信号量实现 bounded buffer 的视角}
-有界队列也可以用两个信号量表达：一个信号量记录空槽数量，一个信号量记录已有元素数量，再用互斥保护环形索引。生产者先获取空槽，再写入；消费者先获取元素，再读取。这个模型把“资源数量”和“状态互斥”分开，适合帮助读者理解信号量。
+但信号量版本同样需要关闭语义。消费者阻塞在 \code{filled_slots.acquire()} 时，\code{close} 如何唤醒？生产者阻塞在 \code{empty_slots.acquire()} 时，关闭后如何返回失败？已经拿到许可但任务取消，许可是否归还？标准信号量本身不携带 \code{closed} 状态，因此还需要额外状态和取消/唤醒机制。信号量不是条件变量的万能替代品，只是更直接地表达数量资源。
 
-但信号量版本同样需要关闭语义。若消费者阻塞在元素信号量上，关闭时如何唤醒？若生产者阻塞在空槽信号量上，关闭时如何退出？标准信号量本身不携带“关闭”状态，需要额外状态和唤醒策略。条件变量版本把谓词写在代码里，更适合教学；信号量版本更接近资源额度控制。两者没有绝对优劣，关键是状态机是否完整。
+\topic{令牌和队列容量不是一回事}
+令牌可以限制并发 I/O 数量，但不等于队列容量。一个系统可能允许队列里积压 100 个待写 block，但同时只允许 4 个 fsync in-flight；也可能允许 32 个 RPC in-flight，但请求队列容量按内存字节控制。把所有限制都写成一个队列长度，会混淆内存预算、设备并发度和业务优先级。第 15 章的异步 I/O 会复用这个区分。
 
-\topic{锁顺序和组合操作}
-单个队列容易证明，多个锁组合就会出现锁顺序问题。假设线程池有全局队列锁、worker 本地队列锁和指标锁。如果 worker 持有本地队列锁时尝试拿全局队列锁，而另一个线程持有全局队列锁时尝试拿本地队列锁，就可能死锁。工程系统应定义锁级别：例如先全局配置锁，再队列锁，再指标锁；或者避免同时持有多把锁，用消息和局部复制拆开组合操作。
+\section{锁顺序、性能路径和工业现实}
 
-组合操作还会诱导“为了省事加一把大锁”。大锁让正确性简单，却可能把整个运行时串行化。合理做法是先用粗锁实现 reference，写清不变量和测试；再根据测量拆分锁，而不是一开始就写复杂细锁。拆锁时，每拆一把都要重新写不变量：哪些状态仍由旧锁保护，哪些状态由新锁保护，跨锁关系如何保持。
-
-\topic{futex 慢路径和用户态 fast path}
-Linux 上常见 mutex 和 condition variable 都会尽量把无竞争路径留在用户态。无竞争加锁可能只是一次原子状态改变；竞争时才进入 futex 让线程睡眠。条件变量等待也会释放 mutex 并进入等待，唤醒后重新竞争 mutex。这个设计说明锁不是一上来就系统调用，系统调用通常是竞争或等待的慢路径。
-
-阅读 futex 相关内容时，要抓住三个点。第一，用户态变量保存同步状态，内核只在需要睡眠和唤醒时参与。第二，等待必须和用户态状态检查配合，避免丢失唤醒。第三，唤醒不等于立即执行，被唤醒线程还要进入调度器、被安排到 CPU，并重新竞争锁。因此高竞争条件变量的成本不只是 \code{notify_one}，还包括调度和再次竞争。
-
-\topic{互斥锁保护的是不变量}
-很多人把 mutex 理解成“保护变量”，这句话不够精确。mutex 保护的是一组变量之间的不变量。以环形队列为例，\code{head}、\code{tail}、\code{size} 和 \code{buffer} 不是四个孤立变量，而是共同满足容量边界、满空状态、元素位置和可用槽位这些关系。只把 \code{size} 改成原子并不能让队列线程安全，因为 \code{size} 和 \code{head/tail} 的关系仍然会被并发修改破坏。
-
-写并发代码时，第一步应写不变量表。哪些字段属于同一个状态机，哪些字段只用于指标，哪些字段可以近似，哪些字段必须精确。锁的粒度也由不变量决定。如果两个字段永远一起变化，拆成两把锁可能反而制造跨锁一致性问题；如果两个字段从语义上独立，一把大锁可能只是偷懒。锁设计不是“粗锁慢、细锁快”的简单比较，而是不变量边界和竞争形状的平衡。
-
-\begin{lstlisting}[numbers=none]
-bounded queue invariant:
- 0 <= size <= capacity
- head and tail are valid positions
- size == 0 means no readable slot
- size == capacity means no writable slot
- readable slots form one circular interval from head
- writable slots are the complement interval
-\end{lstlisting}
-
-有了这张表，代码审查就更具体。每个会修改状态的函数，都必须在持锁状态下从一个合法状态转换到另一个合法状态。每个等待谓词，都必须对应一个状态条件，而不是对应一次通知。每个关闭路径，都必须说明关闭后哪些操作仍允许，哪些操作返回失败，哪些等待者必须被唤醒。
-
-\topic{条件变量不是事件}
-条件变量最常见的误解，是把它当成事件通知系统。正确理解是：条件变量让线程在某个谓词不满足时睡眠，并在可能满足时醒来重新检查。通知本身不保存状态；如果通知发生时没有等待者，通知不会留在条件变量里等后来者。状态必须保存在受 mutex 保护的变量中。
-
-这条原则可以解释为什么等待必须写成循环或谓词版本。线程可能被虚假唤醒；也可能被唤醒后别的线程先抢到锁并消费了资源；也可能关闭状态改变但队列仍空。醒来不代表条件成立，只代表“应该重新检查”。把 \code{if} 写成 \code{while} 不是形式主义，而是条件变量语义的一部分。
-
-\begin{lstlisting}[language=C++,caption={条件变量等待的是谓词，不是通知次数}]
-std::optional<std::int32_t> pop_wait() {
- std::unique_lock<std::mutex> lock(this->mutex_);
- this->not_empty_.wait(lock, [this]() {
- return this->closed_ || this->size_ > 0;
- });
-
- if (this->size_ == 0) {
- return std::nullopt;
- }
-
- const std::int32_t value =
- this->buffer_[static_cast<std::size_t>(this->head_)];
- this->head_ = (this->head_ + 1) %
- static_cast<std::int32_t>(this->buffer_.size());
- --this->size_;
- this->not_full_.notify_one();
- return value;
-}
-\end{lstlisting}
-
-这段代码里，\code{closed_} 和 \code{size_} 都在同一把锁下读写。若关闭函数只设置 \code{closed_} 却不 \code{notify_all}，等待线程可能永远睡眠；若关闭函数通知但不把 \code{closed_} 放进谓词，线程醒来后又睡回去。状态和通知必须配套。
-
-\topic{关闭语义是并发容器的一等接口}
-很多教学队列只写 \code{push} 和 \code{pop}，但线程池真正需要的是关闭语义。关闭不是析构的附属动作，而是容器状态机的一部分。一个队列关闭后，生产者是否还能写入？消费者是否能继续取出已经存在的元素？空队列关闭后消费者返回什么？满队列关闭后生产者如何退出？这些问题决定 worker 能否优雅停止。
-
-常见策略是：关闭后拒绝新 \code{push}；已经在队列中的元素仍允许被 \code{pop} 取出；当队列为空且关闭时，\code{pop} 返回空值；关闭函数唤醒所有生产者和消费者。这种策略适合线程池 drain：不再接收新任务，但已提交任务可以执行完。另一种策略是 cancel：关闭后直接丢弃队列中剩余任务。它适合进程退出或错误恢复，但必须明确通知调用者哪些任务未执行。没有声明的关闭策略，会让上层业务在退出、异常和超时时出现悬挂。
-
-\begin{lstlisting}[numbers=none]
-queue close policy:
- open + not full: push succeeds
- open + full: producer waits
- closed: push fails
- closed + nonempty: pop drains existing item
- closed + empty: pop returns null
-\end{lstlisting}
-
-线程池的 \code{shutdown}、\code{shutdown_now}、\code{wait} 和析构函数应围绕这套语义设计。析构函数里悄悄阻塞等待所有任务完成，可能让用户在持锁析构时死锁；析构函数直接丢任务，又可能破坏业务语义。教材应鼓励读者把关闭写成显式 API，而不是把复杂语义藏在析构里。
-
-\topic{锁粒度的演化}
-一个复杂系统最稳妥的路线，通常是先写粗锁 reference。粗锁版本把不变量集中在一处，容易测试，容易与串行 reference 对比。等到测量证明锁确实是瓶颈，再拆成细锁、分片锁、读写锁或无锁结构。直接从细锁开始，很容易得到一个既不快也不正确的系统。
-
-拆锁时要写迁移计划。第一步，确认锁保护的全部状态和不变量。第二步，把状态按独立性分组，设计新锁的保护范围。第三步，找出跨组操作，例如移动任务、关闭队列、汇总指标。第四步，为跨组操作定义锁顺序或避免同时持锁。第五步，保留粗锁版本作为 reference 或测试 oracle。拆锁不是把一个 mutex 机械替换成多个 mutex，而是重新设计状态机边界。
-
-读写锁也不是默认更快。读多写少且读临界区较长时，它可能有收益；读临界区很短时，读写锁本身的元数据和公平策略可能比普通 mutex 更重；写者频繁时，读写锁还可能造成写者饥饿或读者抖动。若读路径只需要不可变快照，RCU 或 copy-on-write 可能比读写锁更适合。同步原语必须和访问模式匹配。
-
-\topic{锁竞争的观测}
-锁竞争不能只靠感觉。应用指标可以记录等待次数、等待总时间、最长等待、持锁时间、队列长度和唤醒次数。系统工具可以观察 futex 调用、调度切换、CPU 利用率和 off-CPU 时间。若一个程序 CPU 使用率很低但延迟很高，可能大量时间在等待锁或 I/O；若 CPU 使用率很高但吞吐不升，可能在自旋或 CAS 失败。
-
-持锁时间和等待时间要分开。持锁时间长，说明临界区里工作太多；等待时间长，可能因为竞争高，也可能因为持锁线程被调度走。若临界区很短但等待时间长，要看线程数是否远超核心、是否有优先级反转、是否发生 NUMA 迁移。锁问题是执行图问题，不是单行代码问题。
-
-在 Linux 上，可以结合 \cmd{perf}、\cmd{strace -e futex}、调度 trace 和应用内部统计。教材不要求每个读者都能开启所有权限，但要让读者知道证据链：用户态等待指标说明哪里堵，futex 说明是否进入内核睡眠，调度指标说明线程是否被抢占，CPU 拓扑说明 cache line 迁移是否昂贵。
-
-\topic{优先级反转和公平性}
-锁还涉及调度语义。优先级反转指高优先级线程等待低优先级线程持有的锁，而低优先级线程又迟迟得不到 CPU。实时系统中，这会造成严重延迟。某些系统通过优先级继承缓解：持锁的低优先级线程临时继承等待者的高优先级，尽快释放锁。普通服务端虽然不一定使用实时优先级，也会遇到类似现象：关键请求等待后台任务持有的锁，尾延迟被放大。
-
-公平锁按等待顺序唤醒线程，可以减少饥饿，但可能降低吞吐，因为它限制了“刚好在 CPU 上的线程再次获得锁”的机会。非公平锁吞吐可能更高，但某些线程可能长期等待。条件变量唤醒一个还是唤醒全部，也有公平和惊群权衡。高性能系统要根据业务目标选择：批处理更关心总吞吐，交互服务更关心尾延迟和饥饿。
-
-\topic{RAII 和异常边界}
-C++ 中锁必须用 RAII 管理。手写 \code{lock} 和 \code{unlock} 容易在异常、早返回和多分支中漏解锁。\code{std::lock_guard} 适合简单临界区，\code{std::unique_lock} 适合条件变量、延迟加锁和手动解锁。教材示例应让读者形成习惯：锁对象的作用域就是临界区，作用域越小越好，锁外做耗时工作。
-
-RAII 也不能替你设计不变量。一个函数里拿了锁，但把引用返回给外部，让外部在锁释放后修改受保护状态，仍然错误。一个类内部用 mutex，但复制构造没有定义好，也可能把锁和状态复制出奇怪语义。并发类通常应禁用复制，或者显式定义移动和共享语义。锁只是同步工具，不是封装边界的替代品。
-
-\topic{生产者消费者的完整测试}
-生产者消费者测试不能只检查几个值是否按顺序出来。完整测试至少包含容量为一、容量为多、单生产者单消费者、多生产者多消费者、生产者快消费者慢、消费者快生产者慢、关闭空队列、关闭非空队列、满队列关闭、重复关闭、析构前关闭、压力运行和 ThreadSanitizer。每个测试对应一个状态机边界。
-
-还要测试没有丢失和没有重复。可以让每个生产者生成带 producer id 和 sequence 的任务，消费者记录所有任务，最终检查总数、唯一性和每个生产者内部顺序。如果队列声明全局 FIFO，就检查全局顺序；如果只声明每生产者顺序或无序，就不要测试不存在的保证。接口保证必须和测试一致。
-
-\begin{lstlisting}[numbers=none]
-queue stress test data:
- producer id: identifies writer
- sequence: monotonically increasing per producer
- payload: optional checksum
- consumer log: records every consumed item
- final check: no loss, no duplicate, declared order holds
-\end{lstlisting}
-
-性能测试也要有边界。线程创建成本不应混进队列操作；输入生成不应混进消费；日志输出不应放在热循环；关闭时间和正常处理时间要分开。否则队列性能报告很容易测到无关成本。
-
-\topic{读写锁的适用边界}
-读写锁允许多个读者并发进入，写者独占进入。它看起来很适合“读多写少”，但真实收益取决于读临界区长度、写入频率、实现公平性和缓存行为。若读临界区很短，读写锁内部维护读者计数和状态的成本可能超过普通 mutex；若写者频繁，读者并发优势会被写者阻塞抵消；若实现偏向读者，写者可能饥饿；若实现偏向写者，读者尾延迟可能变差。
-
-读写锁特别适合读操作较长、读者之间不修改共享状态、写操作低频且能接受等待的结构，例如较大的配置表、路由快照或只读索引。它不适合每次请求都要读写的小状态，也不适合读路径本身会更新统计字段的场景。很多“读操作”其实包含隐藏写，例如更新 LRU、增加引用计数、记录访问时间，这会破坏读者并发。
-
-若读多写少结构可以使用不可变快照，RCU 或 copy-on-write 可能比读写锁更好。读者读取一个稳定指针，不加锁；写者复制一份新结构，修改后发布；旧结构延迟回收。这样读路径更轻，但写路径复制成本和回收复杂度更高。读写锁、RCU、copy-on-write 都是同一问题的不同取舍：读者成本、写者成本、一致性和回收。
-
-\topic{锁分解案例：统计服务}
-假设一个统计服务维护三类状态：全局配置、每个 worker 的计数、最近错误列表。朴素实现可以用一把大锁保护所有状态，正确性最简单，但每次更新计数都和读取配置、写错误列表互相阻塞。拆锁前，应先写状态关系。配置很少更新，读多；计数高频写，读少；错误列表低频写，偶尔查询。它们的访问模式不同，适合不同同步策略。
-
-一种改进是配置使用快照或读写锁，计数使用每 worker 分片，错误列表使用单独 mutex。这样高频计数不再抢配置锁，错误查询也不阻塞计数热路径。拆锁后要检查跨状态操作。例如“更新配置并清空统计”是否需要同时触碰配置和计数？如果需要，就要定义锁顺序或改成两阶段操作。拆锁的难点不在把 mutex 数量变多，而在找出跨状态不变量。
-
-\begin{lstlisting}[language=C++,caption={按访问模式拆分状态的结构形态}]
-struct alignas(64) WorkerCounter {
- std::uint64_t accepted = 0;
- std::uint64_t rejected = 0;
-};
-
-class RuntimeStats {
-public:
- explicit RuntimeStats(std::int32_t worker_count)
- : counters_(static_cast<std::size_t>(worker_count)) {}
-
- void record_accept(std::int32_t worker_id) {
- this->counters_[static_cast<std::size_t>(worker_id)].accepted += 1;
- }
-
-private:
- std::vector<WorkerCounter> counters_;
- mutable std::mutex error_mutex_;
- std::vector<std::string> recent_errors_;
-};
-\end{lstlisting}
-
-这段代码仍然省略了并发读取总数的同步语义。若只有 worker 写、实验结束后汇总，可以不加锁；若运行中监控线程读取，就要定义近似还是精确。如果要求精确实时快照，需要额外同步，分片计数的写入优势会被读取语义部分抵消。同步设计总是从读写语义出发。
+单个锁保护单个队列容易证明；多个锁组合后，死锁和尾延迟变得真实。死锁的必要条件包括互斥、持有并等待、不可抢占和循环等待。工程上最常见的破坏方式是规定锁顺序，或者把组合操作改成消息传递/两阶段提交，避免同时持有多把锁。
 
 \topic{锁顺序表}
-多个锁共存后，项目需要锁顺序表。锁顺序表不是形式主义，它让代码审查能发现潜在死锁。例如规定：配置锁先于任务图锁，任务图锁先于队列锁，队列锁先于指标锁。任何代码如果反向获取，就必须重构或证明不会并发。没有锁顺序表，死锁常常在很久后由一次看似无关的功能触发。
+项目应维护锁顺序表。例如：全局配置锁先于任务图锁，任务图锁先于队列锁，队列锁先于指标锁。任何反向获取都应被重构或严格证明不会并发。锁顺序表还要写明哪些锁持有时禁止调用用户回调、禁止 I/O、禁止等待 future。持锁进入未知代码，比持有两把锁更危险，因为未知代码可能再进入运行时并获取另一把锁。
 
-锁顺序表还要说明哪些锁不能在持有时调用用户回调、不能做 I/O、不能等待 future。最危险的不是持有两把锁，而是持锁进入未知代码。用户回调可能再进入运行时，拿另一把锁，或者阻塞等待当前锁保护的状态。高质量库通常在锁内只修改内部状态，复制出需要处理的数据，然后锁外调用回调。
+\topic{优先级反转和 convoy}
+优先级反转发生在低优先级线程持有锁，高优先级线程等待它，而中等优先级线程持续占用 CPU，使低优先级线程迟迟不能释放锁。普通服务端也有类似现象：前台请求等待后台 checkpoint 持有的锁，尾延迟被放大。Lock convoy 则是大量线程排队等待同一锁，释放后唤醒、抢占和再次竞争降低吞吐。
 
-\topic{条件变量和多谓词}
-真实队列常有多个等待条件：不空、不满、关闭、取消、优先级任务到达、队列水位下降。把所有条件混成一个布尔变量会让状态机混乱。更好的方式是用明确状态字段和谓词函数。例如生产者等待“有空间或关闭”，消费者等待“有任务或关闭”，drain 等待“未完成计数为零”。每个谓词都应能用当前状态直接判断。
+公平锁可以减少饥饿，但可能降低吞吐；非公平锁吞吐可能更高，但某些线程等待时间更长。同步原语的选择要服务业务目标：批处理更关注总吞吐，交互服务更关注尾延迟和饥饿边界。
 
-多个条件变量可以减少无关唤醒，但也增加复杂度。一个 bounded queue 常用 \code{not_empty} 和 \code{not_full} 两个条件变量；线程池可能还有 \code{idle_cv} 用于 wait；关闭时通常要 \code{notify_all} 所有相关条件变量。通知遗漏会导致悬挂，通知过多会导致惊群。先保证状态机正确，再用指标判断是否需要优化唤醒策略。
+\topic{mutex 的 fast path 和 futex 慢路径}
+Linux 上常见 mutex 在无竞争时尽量只做用户态原子状态改变；竞争严重时，线程通过 futex 进入内核睡眠，释放方再唤醒等待者。条件变量等待也会释放 mutex 并进入等待，唤醒后重新竞争 mutex。理解这点后，“锁慢”就不再是单一结论：低竞争短临界区很便宜，高竞争睡眠唤醒会涉及内核和调度，过度订阅下自旋会浪费 CPU。
 
-\topic{Semaphore 和资源额度}
-信号量适合表达资源额度。数据库连接池、并发请求上限、I/O in-flight 限额、令牌桶都可以用信号量思想理解。它和 mutex 的区别是：mutex 保护临界区不变量，semaphore 控制有多少个许可。把二者混淆会导致设计不清。一个线程拿到许可后，仍可能需要 mutex 修改共享队列。
+\begin{casebox}
+\textbf{Linux futex。}
+futex 的核心工程思想是：同步状态放在用户态地址，内核只在需要睡眠和唤醒时介入。它购买的能力是低争用 fast path 和高争用 blocking path 的分离；代价是用户态必须正确维护等待条件，避免丢失唤醒。教学项目不实现 futex，但要学习“状态检查和睡眠必须成对”。
 
-信号量还要处理取消和关闭。线程等待许可时，如果上层请求超时，等待能否被取消？系统关闭时，等待者如何醒来？许可已经拿到但任务失败，是否归还？这些都是资源状态机的一部分。信号量不是“比条件变量简单”的替代品，它只是把数量资源表达得更直接。
+\textbf{pthread mutex/condition variable。}
+pthread 把互斥、等待、唤醒和调度交给成熟库和内核配合处理。它购买的是可移植、可靠和经过大量边界打磨的同步语义；代价是抽象层隐藏了一些性能细节。教学代码应使用标准库 RAII 包装，而不是手写锁原语。
 
-\topic{锁保护对象的文档格式}
-并发类应在代码附近写清每个锁保护哪些字段，以及哪些字段是原子或线程本地。注释不需要冗长，但要能帮助维护者判断修改是否安全。比如：“\code{mutex_} protects head, tail, size, buffer, closed”，“\code{stats_} is worker-owned and read after join”，“\code{closed_} is only read while holding mutex”。这种注释比泛泛写“thread-safe”有用得多。
+\textbf{Linux wait queue 和 workqueue。}
+内核 wait queue 强调等待条件和唤醒来源；workqueue 强调工作项与执行线程分离。两者共同提醒我们：等待者要围绕状态睡眠，工作项不等于线程。Compute Systems Engine 的 \code{QueueContract} 和 worker 退出协议应吸收这个原则。
 
-接口文档也要写清线程安全级别。某个对象是否允许多个线程同时调用 \code{push}？是否允许一个线程析构时其他线程仍在调用？\code{close} 是否幂等？\code{wait} 是否可以和 \code{submit} 并发？这些问题如果不写，调用者会按自己的理解使用，最终把内部不变量打破。
+\textbf{RCU。}
+RCU 通过“读者读旧版本，写者发布新版本，延迟回收旧对象”优化读多写少路径。它购买的是极轻读路径；代价是对象生命周期和回收协议复杂。教学项目可在配置快照或路由表章节借鉴“不可变版本发布”，但不要用 RCU 替代需要复杂关闭语义的队列。
+\end{casebox}
 
-\topic{案例：关闭线程池}
-关闭线程池是锁和条件变量的综合案例。线程池有任务队列、未完成计数、worker 列表和状态。调用 \code{shutdown} 后，\code{submit} 应拒绝新任务，worker 应继续取出已接受任务，队列为空且状态为 shutting down 时退出。\code{wait_idle} 应等待未完成计数为零，但不一定关闭线程池。析构应确保 worker 已 join。
+\section{读写锁、RCU 和原子的边界}
 
-错误实现常见于三个地方。第一，只设置 \code{closed} 但没有 \code{notify_all}，睡眠 worker 不醒。第二，队列空就让 worker 退出，但 \code{submit} 仍可能并发加入任务。第三，任务抛异常后未完成计数没有减少，\code{wait} 永久阻塞。正确实现需要一张状态机，而不是几处布尔判断。
+读写锁允许多个读者并发、写者独占，适合读临界区相对较长、写入低频、读路径不修改共享状态的对象，例如配置表或路由快照。它不适合每次请求都要更新统计、LRU、引用计数或访问时间的“伪读操作”。读临界区极短时，读写锁维护读者计数和公平策略的成本可能超过普通 mutex。
 
-\topic{案例：有界队列和内存预算}
-有界队列的容量可以按任务数，也可以按字节。线程池任务通常按数量限制；I/O batch 队列更需要按字节限制。若每个任务大小差别很大，只限制数量可能导致内存爆炸。锁保护的状态也会更复杂：不仅有 \code{size}，还有 \code{bytes_in_queue}。生产者等待谓词变成“任务数未满且字节数未超，或关闭”。
+RCU 或 copy-on-write 更适合不可变快照：读者读取稳定版本，写者复制并发布新版本，旧版本延迟回收。它让读路径很轻，却把复杂度转移到写路径和内存回收。第 12 章会深入生命周期和回收问题。
 
-这个案例说明锁保护的是不变量集合。任务数、字节数、head/tail、closed 共同决定队列状态。拆开任何一个，都可能破坏背压语义。
+Atomic 适合更窄的协议：统计计数、一次性发布、小状态机、槽位 ready 标志、单生产者单消费者 ring 的索引。Atomic 不是锁的替代品。若一个状态需要维护多字段不变量、复杂关闭和等待队列，先用 mutex/reference 写清语义，再考虑是否有足够窄的原子协议。
 
-\topic{锁章验收清单}
-本章完成后，项目里的每个锁都应能回答：保护哪些字段，临界区是否调用用户代码，是否可能同时持有多把锁，锁顺序是什么，等待谓词是什么，关闭时谁被唤醒，异常路径是否保持不变量，测试是否覆盖容量一、关闭、并发压力和重复关闭。若回答不出来，这把锁就是维护风险。
+\section{QueueContract：项目中的同步合同}
 
-\topic{锁章节总结}
-锁的价值是让复杂不变量变得可证明，条件变量的价值是让线程在谓词不满足时睡眠，信号量的价值是表达资源额度。它们不是低级替代品，而是并发系统的基础工具。先用锁写正确 reference，再用测量决定是否拆锁、分片、读写锁、RCU 或无锁。把锁视为失败，只会诱导更难证明的错误代码。
+\code{QueueContract} 不是一个必须存在的 C++ 类，而是每个队列必须填写的工程合同。线程池队列、I/O 队列、MessageBus 队列、completion 队列可以使用不同实现，但必须回答同一组问题：容量按任务数还是字节数计算；满时阻塞、失败还是丢弃；空时等待还是返回；关闭后是否允许 drain；是否支持 timeout；元素所有权何时转移；等待谓词是什么；关闭时通知哪些等待者。
 
-\topic{同步原语决策表}
-选择同步原语时，先看状态形状。一个复杂不变量，用 mutex；等待某个谓词，用 condition variable；控制资源额度，用 semaphore；读多写少且读临界区较长，用读写锁或快照；只需要统计，用 relaxed atomic；单生产者单消费者队列，可以考虑 SPSC ring；多生产者多消费者且关闭语义复杂，先用 mutex bounded queue。选择同步原语不是按“高级程度”，而是按状态语义。
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+合同字段 & 要回答的问题 & Compute Systems Engine 默认 \\
+\midrule
+容量 & 按元素、字节还是 in-flight 许可 & 线程池按任务数，I/O 按字节和 in-flight \\
+满队列 & 阻塞、返回失败、丢弃还是背压上游 & 计算任务阻塞或背压，不静默丢弃 \\
+空队列 & 阻塞等待、返回空还是轮询 & worker 阻塞等待谓词 \\
+关闭 & 拒绝新输入，是否 drain 已接收元素 & 默认 drain accepted \\
+取消 & 未开始元素如何处理，运行中如何协作退出 & 状态记录为 canceled \\
+所有权 & push 成功后元素归谁，pop 后谁负责处理 & 队列只转移所有权，不执行任务 \\
+通知 & 哪些状态变化会唤醒哪些等待者 & push/pop/close/task finish 明确列出 \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-\topic{案例：锁内析构}
-C++ 中最后一个 \code{std::shared_ptr} 在锁内离开作用域，可能触发对象析构。析构函数如果写日志、释放大内存、关闭文件或调用回调，就把不可控工作放进锁内。高质量代码会在锁内把对象移动到局部变量，释放锁后再让局部变量析构。这个细节常常影响尾延迟。
+\topic{从队列迁移到线程池}
+线程池比队列多两个状态：正在运行的任务和未完成计数。队列为空不代表线程池 idle，因为 worker 可能已经取出任务正在执行；队列关闭不代表任务完成，因为已接收任务可能还在 running。线程池的 \code{wait_idle} 谓词应围绕 unfinished count，而不是队列长度。任务抛异常时，也必须减少 unfinished count 并通知等待者。
 
-锁内析构说明临界区不只包含显式语句，也包含对象生命周期副作用。审查锁内代码时，要看构造、析构、分配、回调和异常，不只看表面几行。
-
-\topic{案例：等待谓词丢失}
-一个常见 bug 是消费者等待 \code{not_empty}，但关闭时只设置 \code{closed} 并通知 \code{not_full}。结果消费者如果正睡在 \code{not_empty}，就永远不醒。另一个 bug 是等待谓词只写 \code{size} 大于零，不包含 \code{closed}；关闭后消费者醒来，发现 \code{size} 仍为零，又睡回去。正确代码必须让每个等待者的谓词覆盖所有能让它退出等待的状态。
-
-这个案例看似简单，却是线程池停不下来的常见根源。并发代码的退出路径和成功路径一样重要。
-
-锁章的回归阅读应围绕有界队列的关闭语义。一个队列不只是 \code{push} 和 \code{pop}，还要定义容量满时谁等待、空队列时谁等待、关闭后 \code{push} 是否失败、关闭后剩余元素能否继续取、异常时是否唤醒所有等待者。若这些谓词没有写清，条件变量代码就会出现丢唤醒、永久等待或关闭后仍写入。
-
-互斥锁保护的是不变量，不是几行代码。队列的 buffer、head、tail、size 和 closed 必须在同一把锁下形成一致状态；分片 map 的每个 shard 锁只保护对应桶；双锁转移要定义锁顺序，防止死锁。临界区越小越好只是经验，真正的问题是最小临界区是否仍能保护完整不变量。
-
-本章验收应要求写出队列状态表。状态包括 Open、Closing、Closed，动作包括 push、pop、close、wait、notify。每个动作都标出前置条件、状态变化和唤醒对象。通过这个表再写代码，读者会发现条件变量等待的是谓词，而不是通知本身。
-
-Linux 源码阅读可以把 mutex 和 futex 联系起来。用户态互斥锁的快路径通常先尝试在用户态修改状态，竞争严重时才进入内核等待；futex 的价值就在于让“用户态可判定的等待条件”进入内核睡眠。读 \filepath{kernel/futex/core.c} 时不必追完整实现，重点看等待队列、唤醒和用户地址之间的关系。这样读者会明白：锁不是只有一条成本，低竞争、短临界区和高竞争睡眠路径完全不同。
-
-本章还要讲异常和 RAII。C++ 中锁必须用 \code{std::lock_guard}、\code{std::unique_lock} 或更明确的封装管理，避免异常路径忘记释放。条件变量需要 \code{std::unique_lock}，因为等待时要原子地释放锁并睡眠，唤醒后再重新持有锁检查谓词。若示例代码为了短而手写 lock/unlock，读者会学到错误习惯。教材里的同步代码要比普通示例更严格。
-
-信号量适合表达资源计数，但不适合替代所有队列语义。它可以限制 in-flight 请求数量、可用 buffer 数量或同时写文件数量；但元素所有权、关闭、错误传播和取消仍需要额外状态。若只用 semaphore 控制数量，却没有记录哪些请求已提交、哪些请求已取消，就会在关闭路径丢失语义。同步原语要服务不变量，而不是让代码看起来短。
-
-锁性能分析也要包含临界区外的工作。一个队列慢，可能是锁等待，也可能是消费者处理慢导致队列满；一个 map 锁竞争高，可能是 key 分布倾斜，而不是 mutex 实现差；一个条件变量唤醒多，可能是批大小太小。优化锁之前，先画出保护对象、等待谓词和生产消费速率，否则很容易把业务背压误诊为锁问题。
-
-\section{同步原语要从不变量推出来}
-
-锁不是保护代码块，而是保护不变量。一个队列的不变量可能是：\code{head}、\code{tail} 和 \code{size} 一致；\code{size} 不超过容量；关闭后不再接受新元素；等待者在状态变化时能被唤醒。若不先写不变量，mutex、condition variable、semaphore 都会变成“觉得这里要加锁”的局部补丁。
-
-最小有界队列是本章主线。生产者 push，消费者 pop，队列有容量，有关闭语义，有等待谓词。这个对象足够小，却包含真实并发系统的核心问题：互斥、等待、唤醒、虚假唤醒、异常安全、关闭、背压和析构。后续线程池、I/O 和分布式 MessageBus 都会复用这个模型。
-
-\topic{Mutex 的边界：互斥、RAII 和临界区}
-
-Mutex 建立互斥，让同一时刻只有一个线程修改受保护状态。C++ 中应使用 RAII 锁对象，保证异常路径释放锁。临界区要尽量只包含状态检查和必要修改，不要在锁内执行长时间 I/O、用户回调或复杂计算。否则锁会把系统串行化，还可能引入死锁和优先级反转。
-
-但“临界区越短越好”也不是绝对。若为了缩短锁，把一个不变量拆到多个锁外步骤，可能让状态中间暴露，或者需要额外原子和补偿。正确做法是先写不变量，再决定哪些操作必须在同一把锁下原子完成。比如 bounded queue 的 push：检查 closed、检查容量、写入元素、更新 size、通知消费者，这些步骤的边界要清楚。
-
-多个锁时，要写锁顺序。双队列转移、分片 map rehash、任务从一个 deque 移到另一个 deque，都可能需要两把锁。若按调用者传入顺序加锁，会出现 ABBA 死锁。可以使用全局顺序、\code{std::scoped_lock} 同时锁多把 mutex，或重新设计避免同时持有。教材要给出死锁反例和修复方式。
-
-\topic{条件变量等待的是谓词}
-
-条件变量不是消息队列，通知也不是状态本身。等待者必须在锁内检查谓词，通常写成 \code{cv.wait(lock, predicate)}。谓词可能是“队列非空或已关闭”，而不是“收到一次通知”。虚假唤醒、通知丢失、先通知后等待都要求谓词写清。只记 \code{notify_one} 和 \code{wait} 的 API，写不出可靠队列。
-
-关闭语义是条件变量最好的教材案例。若消费者在空队列等待，生产者关闭队列时必须唤醒消费者，让它看到 closed 并退出。若只设置 closed 不通知，消费者可能永久睡眠。若 push 在关闭后仍然成功，析构时可能有任务泄漏。若 pop 只等待非空，不考虑 closed，关闭空队列会死锁。每个错误都能用测试复现。
-
-Semaphore 适合表达资源计数，例如空槽数量、可用连接数、in-flight 请求预算。它不直接保护复杂不变量，通常还需要 mutex 保护队列本身。把 semaphore 当作 mutex 替代品会混乱。章节要比较：mutex 保护状态一致性，condition variable 等待状态变化，semaphore 控制数量资源。
-
-\topic{背压和关闭不是异常路径}
-
-有界队列把容量变成系统契约。队列满时，push 可以阻塞、返回 false、超时失败或丢弃低优先级项。选择取决于上层语义。必须执行的任务不能静默丢弃；可丢指标可以采用 drop；服务请求可能需要 deadline。背压不是系统失败，而是把下游压力传给上游，防止内存无限增长。
-
-关闭要有状态机。Open 接受 push 和 pop；Closing 拒绝新 push，但允许消费者 drain；Closed 表示队列空且不再有元素。不同项目可以简化，但必须写清。线程池 shutdown、I/O drain、分布式 driver 停止发送任务都依赖类似状态。如果关闭只是一个 bool，很多边界会变成猜测。
-
-异常安全也要覆盖。若元素移动构造抛异常，队列 size 是否已经改变？若任务执行抛异常，未完成计数是否递减？若 shutdown 在等待者阻塞时调用，是否唤醒所有人？教学代码可以选择要求任务类型 noexcept move，但要求必须写进接口合同。
-
-\topic{实验、源码和项目落地}
-
-本章实验围绕 bounded queue。正常输入验证生产消费；边界输入测试容量 1、空队列关闭、满队列关闭；压力输入测试多生产者多消费者；错误输入测试任务抛异常和超时 push。指标包括 push 等待次数、pop 等待次数、最大队列长度、关闭耗时和丢弃/失败数量。
-
-Linux 源码阅读可以从 futex 概念入手。用户态 mutex/condition variable 在低争用时可能不进内核，高争用或睡眠时才进入 futex 等待队列。读者不必实现 futex，但要理解“锁慢”可能慢在用户态 cache line 自旋，也可能慢在内核睡眠唤醒。工具上可以用 \cmd{strace -f -e futex}、\cmd{perf} 或用户态指标观察等待路径。
-
-项目交付物是可复用的 \code{BoundedQueue<T>} 设计说明和测试。说明要列出不变量、状态机、等待谓词、关闭语义、背压策略和异常策略。后续线程池、I/O 和 MessageBus 都使用它，这样全书同步语义保持一致。
-
-\topic{案例走查：有界队列 close 的四个错误版本}
-
-错误版本一：只设置 closed，不通知等待者。消费者可能永远睡眠。错误版本二：通知了等待者，但 pop 谓词只检查非空，不检查 closed，仍可能睡眠。错误版本三：关闭后 push 仍然成功，shutdown 后任务泄漏。错误版本四：析构时直接销毁队列，仍有 producer 或 consumer 访问，造成悬垂。
-
-正确版本必须让等待谓词包含状态：push 等待“未满且 open”或发现 closed 失败；pop 等待“非空或 closed”；close 改状态后 notify all；析构要先 close，再等待外部线程结束或由更高层保证生命周期。每个错误版本都写成测试，比直接给正确代码更能说明条件变量为什么等待谓词。
-
-这个案例还连接背压。容量为 1 的队列能暴露大多数等待交错，容量很大反而掩盖问题。教学测试要故意使用小容量和随机调度，让不变量问题尽早出现。
-
-\topic{锁实验的公平性和尾延迟}
-
-锁实验不能只看总吞吐。一个锁方案可能平均吞吐高，但让某些线程长期饥饿；另一个方案吞吐略低，但尾延迟稳定。Bounded queue 实验应记录每个 producer 的成功次数、等待时间分布、消费者空闲时间和关闭耗时。公平性是系统可用性的一部分。
-
-不同锁实现和调度器会影响结果。自旋锁在短临界区和低线程数下可能快，在过度订阅时会浪费 CPU；mutex 会睡眠和唤醒，尾延迟可能受调度影响；读写锁在读多写少时有效，但写者饥饿或升级问题要考虑。第二册不需要实现所有锁，但要让读者知道没有一个同步原语固定最优。
-
-实验还要加入异常路径。生产者在持锁前抛异常、持锁后移动元素抛异常、消费者处理任务抛异常、关闭同时发生。RAII 和状态机能把这些路径收束起来。若实验只跑正常 push/pop，队列看起来正确，实际不可靠。
-
-\topic{从有界队列迁移到线程池}
-
-线程池复用 bounded queue，但新增未完成计数和 worker 生命周期。这里要提醒读者：队列为空不等于线程池 idle，因为 worker 可能正在执行任务；closed 队列不等于所有任务完成，因为队列中任务可能还要 drain。未完成计数把 queued 和 running 统一起来，等待谓词应是 count 为零。
-
-这个迁移能训练抽象复用。Bounded queue 不应该知道线程池的任务计数；线程池在 submit 成功后增加计数，在任务完成后减少。若 task 抛异常，也必须减少。这样两个模块边界清晰。后续任务运行时会继续扩展，而不是把所有逻辑塞回队列。
-
-本章验收可以要求读者解释每个 notify 的必要性：push 后通知消费者，pop 后通知生产者，close 后通知所有等待者，task 完成后通知 \code{wait_idle}。能解释 notify，才说明谓词和状态真的理解了，也说明等待测试不是摆设。
-
-\topic{综合练习：写出队列不变量审查表}
-
-本章综合题要求读者为 \code{BoundedQueue<T>} 写不变量审查表。容量不变量：\code{size} 在 0 和 capacity 之间。位置不变量：head、tail 和 size 对应同一组元素。状态不变量：Open 接受 push，Closing 拒绝 push 但允许 pop，Closed 表示不可再变化。等待不变量：生产者等待空间或关闭，消费者等待元素或关闭。生命周期不变量：队列析构时没有外部线程继续访问。
-
-审查表写完后，再要求读者审三段错误代码。第一段 push 在检查 closed 后释放锁，再写入元素，状态可能变化；第二段 pop 等待非空，没有处理 close；第三段 close 只 notify one，多个等待者仍睡眠。读者要指出违反哪个不变量，而不是只说“这里有 bug”。这种训练能把并发 bug 从感觉变成可定位问题。
-
-最后实现压力测试。多个 producer 和 consumer 随机 sleep，容量取 1、2、7，随机在运行中 close。每个元素有唯一 id，最终检查不丢不重；所有线程能退出；等待者不会永久阻塞。测试还要跑异常任务，确认未完成计数不泄漏。这个题完成后，线程池和 I/O 队列才有可靠基础。
-
-评分标准包括文档和测试。只有代码没有不变量说明，不合格；只有说明没有压力测试，也不合格。同步原语的教学重点就是把不变量、代码和测试绑在一起。
-
-\topic{容易出错的边界：同步代码最怕半语义}
-
-半语义的第一个表现是只有锁，没有不变量。代码到处 \code{lock_guard}，却没人知道锁保护哪几个字段。第二个表现是只有通知，没有谓词。看到 \code{notify_one} 就以为事件不会丢，忽视先通知后等待和虚假唤醒。第三个表现是只有 close flag，没有状态机。关闭时生产者、消费者和析构者各自猜行为，最终出现死锁或丢任务。
-
-第四个表现是异常路径没有计数回收。任务抛异常后未完成计数不减，wait 永久阻塞。第五个表现是锁内调用用户回调。用户回调可能再次进入队列、等待 I/O 或抛异常，让锁语义失控。第六个表现是多个锁无顺序。小测试不死锁，压力下出现 ABBA。
-
-本章源码索引要求读者为每把 mutex 写注释：保护哪些字段，禁止在持锁时做什么，和其他锁的顺序是什么。为每个 condition variable 写等待谓词和通知来源。为每个 semaphore 写资源含义和最大值。若写不出来，就说明同步设计还没完成。
-
-工程上可以接受少量重复注释，因为并发边界需要显式。不要写“保护数据”这种空话，要写“保护 queue、closed、unfinished 三个字段的一致性”。这种注释能让后续审查真正发现 bug。
-
-\topic{本章核心接口：QueueContract}
-
-锁章给项目留下 \code{QueueContract}。它不是代码类，而是每个队列必须填写的合同：容量，push 满时行为，pop 空时行为，close 后行为，是否 drain，是否支持 timeout，元素所有权如何转移，等待谓词是什么。不同队列可以有不同策略，但必须显式。
-
-BoundedQueue、I/O queue、MessageBus queue 都应写这个合同。这样队列满、关闭和取消不会在不同模块各自解释。合同统一后，背压才能沿 pipeline 传播，而不是在某个层次被吞掉。
-
-\topic{从锁保护不变量进入原子发布协议}
-
-锁章给出最清楚的同步模型：在临界区内维护不变量，条件变量等待谓词。下一章进入原子，是为了处理一些更窄的同步场景：发布只读配置、统计计数、槽位状态、一次性提交。原子不是替代锁，而是当状态足够小、协议足够清楚时，用更细粒度的方式表达可见性和线性化点。
-
-项目中每个原子优化都应有锁版 reference。BoundedQueue 先用锁实现，SPSC 槽位再用原子发布；commit 状态先用 mutex 表达，再用 atomic enum 表达单进程状态转换。这个顺序能让读者看到原子协议从哪里来，而不是凭空写内存序。
-
-\section{项目落地}
-
-Compute Systems Engine 当前的 \code{BoundedMpmcQueue} 已经有容量、head、tail、size、mutex 和 \code{not_full}，但它还不是完整线程池队列，因为它只有阻塞 push 和非阻塞 try pop，没有 \code{not_empty} 等待，也没有 close。作为教学阶段的最小模块可以接受，但后续运行时章节必须补全关闭语义和消费者等待，否则 worker 无法优雅阻塞和退出。
-
-本章要求项目至少增加设计文档或测试计划：列出队列不变量，列出 push、try pop、未来 blocking pop 和 close 的状态转换，列出需要的测试。测试不能只 push 两个值再 pop 两个值，还要覆盖容量为一、队列满时生产者等待、队列空时消费者等待、close 唤醒等待者、多生产者多消费者压力、异常容量和析构时没有等待线程。
-
-\topic{状态机比代码片段更重要}
-同步代码最怕只看局部片段。一个 \code{push} 函数看起来正确，一个 \code{pop} 函数看起来正确，合在一起仍可能在关闭、异常、等待和析构时出错。因此并发容器应先写状态机。以有界队列为例，状态至少包括 open empty、open partial、open full、closing nonempty、closed empty。每个状态下，\code{push}、\code{try_push}、\code{pop}、\code{try_pop}、\code{close}、\code{wait_empty} 的行为都要定义。
-
-状态机能暴露隐藏问题。open full 状态下，阻塞 \code{push} 等待什么谓词？如果此时调用 \code{close}，生产者应返回失败还是继续等待？closing nonempty 状态下，消费者能否继续取出剩余任务？closed empty 状态下，\code{pop} 返回空值还是抛异常？这些问题不回答，代码只能靠偶然行为。一个高质量并发库的接口文档，应像协议一样说明状态转换。
-
-状态机还要说明线性化点。对于 \code{push}，元素写入槽位并更新 \code{tail} 和 \code{size} 后，操作对消费者可见；对于 \code{pop}，元素被取出并更新 \code{head} 和 \code{size} 后，槽位重新可用；对于 \code{close}，\code{closed_} 从 false 变为 true 的那一刻，后续生产者必须观察到关闭。线性化点不清楚，就无法判断并发调用的先后语义。
-
-\topic{背压不是错误路径}
-有界队列满了，生产者等待，这不是程序变差，而是背压在工作。背压的目的，是让下游资源不足时，上游不要无限制地产生任务和占用内存。没有背压的系统，短时间 benchmark 可能看起来更快，因为它把工作全部塞进内存；一旦输入持续增长，就会出现内存膨胀、延迟暴涨和最终崩溃。有界队列用等待或拒绝把压力反馈给上游。
-
-背压策略要和业务语义匹配。日志系统可以选择丢弃低优先级调试日志；任务运行时通常不能丢计算任务；网络服务可以对新请求返回繁忙；分布式 shuffle 可以暂停上游分片读取。队列只提供机制，业务决定策略。教材中如果只写“队列满则阻塞”，还不够完整；还要讨论阻塞会不会占住 compute worker，是否需要异步等待，是否需要超时，是否需要取消。
-
-背压指标也要写入报告。队列满的次数、生产者等待总时长、最大队列长度、丢弃任务数、拒绝请求数，这些指标能说明系统是在健康限流，还是下游长期跟不上。没有指标，开发者可能把背压误认为锁慢，然后盲目增加容量。容量变大只会把压力藏得更深，尾延迟和内存风险更高。
-
-\topic{锁和异常传播}
-线程池中的任务可能抛异常。异常传播如果处理不好，会破坏锁保护的不变量。最基本原则是：任务执行不应发生在队列锁内，任务异常不应让未完成计数漏减，异常对象的发布要有同步关系。队列只负责交付任务，worker 从队列取出任务后释放锁，再执行任务。执行结束后，不管成功还是异常，都要更新任务状态和未完成计数，并通知等待者。
-
-C++ 的 RAII 能帮助释放锁，但不能自动维护业务状态。若一个任务执行前增加了 in-flight 计数，异常路径必须减少；若 worker 把错误写入 shared state，等待者读取错误前要有同步；若异常对象包含动态分配资源，生命周期要覆盖读取者。并发异常不是“catch 一下”这么简单，它和状态机、通知和对象生命周期同时相关。
-
-一个实用模式是把任务结果分成状态和载荷。状态可以是 Pending、Running、Succeeded、Failed、Cancelled；载荷是返回值或错误信息。worker 先写载荷，再在锁内或 release 语义下发布状态，然后通知等待者。等待者醒来后检查状态，再读取载荷。这个模式和原子章节的对象发布一致，只是这里多了一层任务语义。
-
-\topic{测试等待路径要制造极端条件}
-同步代码的测试不能只跑正常路径。容量为一的队列比容量很大的队列更容易暴露满和空之间的状态转换；一个 producer 一个 consumer 能测基本交替；多个 producer 一个慢 consumer 能测 \code{not_full}；一个 producer 多个 consumer 能测 \code{not_empty} 和惊群；关闭时有线程阻塞在 push 和 pop，能测 \code{notify_all} 是否完整。小容量、慢消费者、随机 yield、重复关闭和异常任务，是并发测试的基本工具。
-
-测试还应覆盖析构边界。线程池析构时是否自动 shutdown？如果还有外部线程提交任务，行为是什么？析构能否在 worker 正在执行任务时等待？如果析构发生在某个任务持有业务锁时，会不会死锁？这些问题不一定都由队列解决，但队列和线程池接口必须定义。未定义行为可以存在，但必须明确禁止，而不是让用户猜。
-
-压力测试不能替代不变量证明，但能发现实现错误。可以把队列操作与串行 reference 对比：多个线程随机 push 和 pop，同时记录成功操作日志，最终验证元素没有丢失、没有重复、容量不越界、关闭后没有新元素进入。对于不可确定顺序的并发队列，验证重点不是全局顺序完全一致，而是每个成功 push 最多被 pop 一次，关闭语义符合文档。
-
-\topic{不变量}
-队列不变量包括容量范围、head/tail 关系、size 与槽位状态、closed 后禁止新 push、drain 后没有剩余元素。锁保护的不是代码块，而是这些关系。
-
-
-\topic{RAII 锁}
-C++ 中锁必须和作用域绑定。异常路径、早返回和条件分支都不能绕过 unlock。RAII 不是风格问题，而是维护不变量的基本手段。
-
-
-\topic{谓词等待}
-\code{condition_variable} 的 wait 必须围绕谓词写。虚假唤醒、notify 丢失和状态竞争都要求醒来后重新检查条件。谓词应包含 closed 状态，否则关闭时线程可能永远睡眠。
-
-
-\topic{notify 顺序}
-通常先在锁内修改状态，再 notify。通知不是状态本身，只是提醒等待者重新检查谓词。把 notify 当成消息，会导致醒来时条件并不成立。
-
-
-\topic{容量令牌}
-有界容量是背压机制。生产者等待 \code{not_full}，不是性能退化，而是系统告诉上游下游处理不过来。容量设计要结合内存预算和延迟目标。
-
-
-\topic{close 和 drain}
-close 表示不再接受新输入，drain 表示处理完已接受输入。二者不能混成一个布尔值。push、pop、close、drain 在每个状态下的返回都要写清。
-
-
-\topic{锁顺序}
-多个锁需要全局顺序。反向拿锁的死锁不是概率 bug，而是设计缺陷。能用一个更高层状态机避免双锁，就不要让调用者临时组合。
-
-
-\topic{futex 直觉}
-用户态 mutex 快路径通常不进内核，竞争严重时才通过 futex 睡眠。理解这点能解释为什么低竞争锁很便宜，高竞争锁会出现调度和唤醒成本。
-
-
-\topic{案例：容量为一的队列}
-容量为一最容易暴露 empty/full 转换。一个 producer、一个 consumer、随机 close，能检查谓词和 notify 是否完整。
-
-
-\topic{案例：关闭时阻塞线程}
-让 producer 阻塞在满队列，consumer 阻塞在空队列，然后调用 close。所有线程都应有定义明确的返回路径。
-
-
-\topic{案例：反向锁顺序}
-构造两个队列相互转移元素，故意反向拿锁，再用审查表修复。这个案例说明死锁来自状态组合，而不是线程运气。
-
-
-\topic{源码阅读路线}
-Linux 源码阅读从 \filepath{kernel/futex/core.c}、\filepath{kernel/locking/mutex.c}、\filepath{include/linux/wait.h} 附近进入即可。阅读目标不是把整套子系统抄进书里，而是追一条和本章实验相关的路径：用户态动作怎样变成内核对象，内核对象怎样排队、等待、唤醒、计数、提交或回收。
-
-阅读报告要写证据等级。能直接测到的数字放在第一层；从源码控制流推导出的解释放在第二层；当前设备无法验证、只能作为合理猜测的内容放在第三层。这样读者会知道 同步状态机报告 中哪些结论可复现，哪些结论需要换机器继续确认。
-
-源码阅读还要克制。看到一个复杂函数，不要把每个分支都展开；先回到本章的问题，问它能否解释一个等待点、一次状态转移或一条性能曲线。解释不了的内容可以留到索引，不要打断正文主线。
-
-\topic{容量为一的队列}
-容量为一最容易暴露 empty/full 转换。一个 producer、一个 consumer、随机 close，能检查谓词和 notify 是否完整。
-
-\topic{关闭时阻塞线程}
-让 producer 阻塞在满队列，consumer 阻塞在空队列，然后调用 close。所有线程都应有定义明确的返回路径。
-
-\topic{反向锁顺序}
-构造两个队列相互转移元素，故意反向拿锁，再用审查表修复。这个案例说明死锁来自状态组合，而不是线程运气。
-
-\topic{不变量}
-
-锁保护的不是代码块，而是一组状态关系。队列的 head、tail、size、closed 和 buffer 必须一起满足约束。
-
-实验设计：先写不变量表，再写 push 和 pop 的状态转换。
-
-\topic{临界区}
-
-临界区越大，等待越多；临界区越小，越容易把不变量拆碎。边界应由状态关系决定，而不是只追求短。
-
-实验设计：把队列操作拆得过细，构造 size 与 buffer 不一致的错误。
-
-\topic{谓词等待}
-
-条件变量等待的是谓词，不是通知次数。虚假唤醒和丢通知都要求醒来后重新检查状态。
-
-实验设计：把 wait 写成 if，再用 spurious wake 或关闭路径展示问题。
-
-\topic{notify 顺序}
-
-通知只是提醒等待者检查状态。通常先改状态，再通知。若通知和状态更新脱离，醒来的线程可能看不到条件成立。
-
-实验设计：记录生产者修改 size、释放锁和 notify 的顺序。
-
-\topic{关闭语义}
-
-队列关闭后，push 应失败或返回状态，pop 应能取完已有元素后结束。没有关闭语义，消费者可能永远睡眠。
-
-实验设计：构造 producer 提前退出，consumer 仍在等待的案例。
-
-\topic{容量令牌}
-
-有界容量不是性能退化，而是背压。容量把内存预算和上游速度控制在可解释范围内。
-
-实验设计：让生产者快于消费者，比较无界队列和有界队列的内存峰值。
-
-\topic{信号量}
-
-信号量适合表达资源数量，但它不自动保护复杂不变量。把它和 mutex 混用时，要明确谁保护什么。
-
-实验设计：用信号量限制 in-flight 请求，再用锁保护队列结构。
-
-\topic{死锁}
-
-多个锁必须有顺序。反向拿锁不是概率问题，而是状态图有环。设计上能合并状态机就不要让调用者临时组合。
-
-实验设计：画出两个锁的等待图，说明环在哪里出现。
-
-\topic{futex 直觉}
-
-用户态锁低竞争时通常不进内核，竞争或等待时才通过 futex 睡眠。锁成本随竞争形态变化。
-
-实验设计：比较低竞争锁、高竞争锁和条件等待的系统调用迹象。
-
-\topic{项目接口}
-
-QueueContract 要写清容量、关闭、等待谓词、异常、push 失败和 pop 结束条件。后续线程池和 I/O 背压都依赖它。
-
-实验设计：为每个状态转换写测试，不只测 happy path。
-
-\section{同步原语从不变量和等待谓词推导出来}
-
-锁章节如果只讲 API，用不了多久读者就会写出看似能跑但偶尔死锁、偶尔丢任务的代码。正确顺序是先写不变量，再选择原语。以有界队列为例，不变量包括：元素只存在于有效槽位，size 等于可取元素数量，head 和 tail 在容量范围内，closed 后不再接受新元素，等待者醒来后必须能重新判断状态。mutex 保护的是这些关系，不是某几行代码。
-
-条件变量等待的是谓词。很多错误来自把 notify 当成消息：生产者 notify 了，消费者就以为一定有数据。实际中可能虚假唤醒，可能多个消费者争抢同一个元素，也可能 notify 发生在等待之前。正确写法是醒来后重新检查谓词，谓词包含数据可用、队列关闭、容量可用等状态。若关闭状态不在谓词里，消费者可能在生产者退出后永远睡眠。
-
-notify 的顺序也要从状态推导。通常先在锁内修改状态，再 notify；通知只负责让等待者重新检查，不承载状态本身。若先通知再修改，或者修改的状态不受同一把锁保护，等待者醒来时可能看不到条件成立。这里要让读者明白：条件变量和 mutex 是一套协议，拆开理解会误用。
-
-容量是背压，不是麻烦。有界队列让上游知道下游处理不过来，避免内存无限增长。容量太小会降低吞吐，容量太大会隐藏过载并增加尾延迟。队列容量应来自内存预算、batch 大小和延迟目标。比如每个 batch 4 MiB，容量 128 就是 512 MiB，仅这一条队列就可能超过手机环境预算。同步章节要把容量和资源预算连起来。
-
-信号量适合表达资源数量，例如允许同时 in-flight 的请求数。但信号量不保护复杂结构，队列的 head、tail 和 buffer 仍需要不变量保护。把 semaphore、mutex 和 condition variable 混在一起时，必须说明每个原语负责什么。否则容易出现令牌归还了但队列状态没更新，或者队列关闭后令牌仍让 producer 进入的错误。
-
-死锁要用等待图讲。两个锁 A 和 B，如果路径一先拿 A 再拿 B，路径二先拿 B 再拿 A，就形成环。这个 bug 不靠概率解释，而是设计缺陷。能用更高层状态机避免双锁，就不要让调用者自由组合；必须多锁时，就定义全局顺序，并在代码审查里检查。
-
-Linux futex 可以作为直觉补充：低竞争 mutex 通常在用户态完成，竞争时才进入内核睡眠和唤醒。于是锁成本不是固定的，取决于竞争、临界区长度和唤醒形态。实验可以比较无竞争锁、高竞争锁和条件变量等待，记录吞吐、上下文切换或替代指标。读者会看到：锁不是绝对慢，错误的共享状态才慢。
-
-\topic{案例推导：有界队列的正确性来自状态表，不来自锁的数量}
-
-有界队列是同步原语最好的综合案例。它有数据结构不变量：容量固定，head 指向下一个可取元素，tail 指向下一个可写位置，size 在零和容量之间。它有等待谓词：非空才能 pop，非满才能 push，关闭后等待者要退出。它还有背压语义：满不是异常，而是系统告诉上游下游处理不过来。用一把 mutex 保护这些关系是实现选择，不变量才是设计核心。
-
-先写错误版本：\code{pop} 里用 if 判断空，然后 wait；醒来后直接取元素。这个版本在没有虚假唤醒、只有一个消费者时可能能跑。加入两个消费者或虚假唤醒后，一个消费者可能在条件不成立时继续执行。修复方式是 while 或带谓词的 wait。教材要强调：wait 返回只表示“应该重新检查”，不表示条件已经成立。
-
-再看关闭。生产者结束后，如果队列为空，消费者应返回结束状态；如果队列还有元素，消费者应取完后再结束；关闭后 push 应失败。这个语义要写成状态表：open 且 not full 可以 push，closed 不可 push；not empty 可以 pop，empty 且 closed 返回结束，empty 且 open 等待。没有这张表，代码很容易在某条路径漏 notify 或漏检查 closed。
-
-容量设计也要进入报告。容量一能暴露交替等待问题；容量很大能隐藏背压并增加内存峰值；容量按 batch 字节数设置更贴近 I/O 场景。实验可以让 producer 速度是 consumer 两倍，比较无界队列、有界阻塞队列和 try push 返回失败。观察内容包括吞吐、内存、平均等待和尾延迟。这样读者会明白有界队列不是为了“慢一点安全”，而是为了让系统可控。
-
-信号量版本可以作为对照。一个 semaphore 表示可用槽位，一个 semaphore 表示可用元素，mutex 保护环形数组。这个设计能让资源计数更显式，但状态更多，关闭语义也更复杂。若关闭时只释放元素信号，不释放槽位等待者，producer 可能卡住；若随意释放信号，又可能破坏计数。对照能说明原语没有银弹，状态设计才是关键。
-
-Linux futex 阅读可以帮助理解锁为什么低竞争时便宜、高竞争时昂贵。用户态先尝试原子修改，失败或需要等待时进入内核睡眠。条件变量也会围绕 futex 或类似机制等待唤醒。读源码不为背 API，而是解释实验现象：低竞争锁几乎不进内核，高竞争等待出现调度和唤醒成本。
-
-\begin{warningbox}
-不要把锁竞争问题简单理解成“换成无锁”。如果临界区保护的是复杂不变量，无锁实现可能更难证明正确，也可能在高竞争下 CAS 失败更多。
-\end{warningbox}
+\topic{从队列迁移到 I/O 背压}
+I/O 队列还要考虑字节容量和 in-flight 许可。一个 \code{ShuffleBlock} 可能大小差异很大，只按任务数限制会导致内存峰值失控。可靠写出还会引入 temp file、checksum、fsync、rename、manifest commit，队列只负责交付 block 描述，不能把长 I/O 放进队列锁。第 15 章会把这里的背压合同扩展成完整 I/O 管线。
 
 \begin{labbox}
-实验：实现一个 bounded queue。先用 mutex 和 condition variable 写阻塞 push/pop，再记录高生产者数量下的等待时间。解释锁保护的状态和等待谓词。
+\textbf{实验：可关闭有界队列。}
+实现一个 \code{BoundedQueue<int32_t>} 或等价教学队列。测试容量为 1、容量为 2、多个 producer/consumer、空队列 close、满队列 close、重复 close、运行中 close、消费者慢、生产者慢。每个元素包含 producer id 和 sequence，最终检查不丢、不重、每个 producer 内部顺序符合接口声明。记录 push 等待次数、pop 等待次数、最大队列长度、close 到所有线程退出的时间。
 \end{labbox}
 
-\topic{锁保护的是不变量，不是代码块}
-讲锁不能从“进入临界区”开始，而要从共享对象的不变量开始。有界队列的不变量包括：head、tail、size 与 buffer 内容一致；size 不超过 capacity；队列关闭后不再接受新元素；等待者醒来后看到的状态必须能解释为什么醒来。互斥锁的作用是让检查和修改这些状态成为一个不可被并发打断的动作。若不变量没写清，锁范围就只能靠感觉。
-
-以有界队列为例，push 必须在同一把锁下检查未关闭、检查未满、写入元素、更新 tail 和 size。pop 必须检查非空或关闭，读取元素，更新 head 和 size。notify 不是凭空发送消息，而是在状态变化后唤醒可能等待该状态的线程。条件变量等待的也是谓词：not full、not empty 或 closed。把这些谓词写清，丢唤醒和虚假唤醒就不再神秘。
-
-\topic{条件变量的正确模式从时间线推导}
-丢唤醒常发生在把通知当事件，而不是把状态当事实。生产者先修改队列状态再 notify；消费者等待时在锁下检查谓词，不满足才 sleep；醒来后重新检查谓词。即使 notify 发生在消费者真正睡眠之前，只要状态已经改变，消费者重新检查时就会继续。若代码只等待一次通知，不检查状态，就会把时间线偶然性当语义。
-
-虚假唤醒也因此容易处理。等待循环不是为了防某个实现缺陷，而是因为醒来不等于谓词成立。多个消费者竞争同一个元素时，一个线程醒来后可能发现元素已被别人取走；关闭时所有等待者都醒来，但有的看到队列空且 closed，有的先取完剩余元素。while predicate 是条件变量的核心写法。
-
-\topic{信号量表达资源数量}
-信号量适合表达可用资源数量，例如缓冲槽、连接许可、并发上传数。它不直接保护复杂不变量，通常和其他状态结构配合。比如有界队列可以用两个计数信号量分别表示空槽和已用槽，再用互斥保护 ring buffer 索引。这样 push 先获取空槽，再写 buffer，再释放已用槽；pop 反过来。它把容量约束拆成资源计数，但关闭、异常和取消仍需要额外状态。
-
-因此不要把信号量当作“更快的条件变量”。它们表达模型不同。条件变量等待任意谓词，信号量等待资源计数。若谓词是复杂组合，如队列非空或关闭或超时，条件变量更直接；若只是限制同时执行的任务数，信号量更自然。教材要让读者按不变量选择原语。
-
-\topic{死锁从资源顺序解释}
-死锁的四个条件可以通过项目案例具体化。线程 A 持有队列锁等待 manifest 锁，线程 B 持有 manifest 锁等待队列锁；两者都不释放，资源不可抢占，形成环。修复方式不是“少用锁”这么空泛，而是定义全局锁顺序、缩短锁持有时间、避免持锁调用外部回调、把等待移到锁外、使用 try lock 加回退。每种方式都要说明改变了哪个条件。
-
-锁顺序表是工程文档的一部分。比如 RuntimeState 锁先于 WorkerQueue 锁，WorkerQueue 锁不能在持有 Manifest 锁时获取，用户回调永远在无锁状态调用。代码审查时检查这些规则，比看到死锁后再排查容易得多。
-
-\topic{实验：写一个可关闭有界队列}
-本章实验应要求完整实现有界队列，而不是只写 push pop。功能包括阻塞 push、非阻塞 try push、阻塞 pop、关闭、等待 drain、超时版本和异常安全。测试要覆盖：空队列 pop 后关闭，满队列 push 后关闭，多生产者多消费者，任务函数抛异常，析构时仍有等待者，重复 close。每个测试都要验证没有线程永久等待。
-
-性能实验比较容量大小、生产消费速度差异和通知策略。容量太小会增加等待，容量太大会隐藏背压并增加内存；notify one 通常够用，但关闭时需要 notify all；持锁时间过长会降低并发。这个队列会被第 14、15 章复用，所以语义必须比性能技巧更先稳定。
-
-\topic{Linux futex 阅读连接点}
-条件变量和互斥锁在 Linux 上常会借助 futex。Futex 的思想是用户态先用原子操作处理无竞争快路径，只有需要睡眠或唤醒时进入内核。源码阅读时关注用户态原子值和内核等待队列如何对应：等待前必须确认值仍然是预期状态，唤醒时唤醒等待该地址的线程。这个机制再次说明等待的是状态，不是单纯通知。
-
-把 futex 思想带回项目，可以理解为什么锁的无竞争路径很重要，也能理解为什么把大量短任务压到一个共享锁上会放大内核等待成本。同步原语不是黑盒，它们在用户态状态和内核调度之间架桥。
-
-\topic{事故复盘：关闭队列为什么会卡死}
-有界队列的正常 push pop 很容易写对，关闭路径却经常卡死。Producer 在队列满时等待，主线程设置 closed 后只唤醒 consumer；consumer 醒来发现队列空但 closed 判断写错，又继续等待；或者 notify 被当成“消息”，醒来后不重新检查谓词。此时锁不是保护一段代码，而是保护队列不变量：buffer 内容、容量、关闭状态、等待条件必须同时一致。
-
-条件变量等待的是谓词，不是通知本身。Producer 的谓词是“队列未满或已关闭”，consumer 的谓词是“队列非空或已关闭”。任何 wait 返回后都要在锁下重新检查谓词，因为可能有虚假唤醒，也可能被其他线程抢先改变状态。关闭状态进入状态机后，push 应返回拒绝，pop 应能 drain 剩余元素并最终返回结束。Notify 只是提醒对方重新看状态，不携带业务语义。
-
-实验要专门打关闭和异常路径。满队列关闭、空队列关闭、producer 正在等待时关闭、consumer 正在等待时关闭、多个等待者同时关闭、回调抛异常、持锁调用用户函数，这些都比正常路径更能暴露设计。资源顺序也要画出来，避免一个线程拿队列锁再拿日志锁，另一个线程反过来拿导致死锁。同步章节的核心是用不变量和谓词解释代码，而不是用 mutex 包住一切。
-
-
-\topic{同步测试实验判读}
-有界队列测试最重要的是关闭和异常路径。若正常 push pop 通过，不代表队列正确。判读时检查等待者能否在 close 后全部醒来，满队列的 producer 是否能退出，空队列的 consumer 是否能退出，异常是否泄漏 unfinished 计数。性能结果也要和容量、水位线和持锁时间一起看。
-
-
-这一段也服务于复习。读者合上书后，应该能凭本章的判读口径重新审查自己的代码：有没有最小正确版本，有没有能击穿旧方案的输入，有没有状态记录，有没有资源指标，有没有失败后的恢复动作。若五个问题缺两个以上，就说明实现还停在演示层，而不是工程层。
-
-
-\topic{关闭路径比正常路径更能检验同步设计}
-有界队列正常 push 和 pop 很容易写通，真正检验设计的是关闭。队列为空时 consumer 等待，close 后应醒来并返回 closed；队列满时 producer 等待，close 后也应醒来并失败；队列中还有元素时，drain close 可以允许 consumer 取完，immediate close 则要定义剩余元素如何处理。
-
-条件变量代码的核心是谓词。等待 not empty、not full、closed 这些状态，而不是等待某个 notify。notify 可以丢，虚假唤醒可以发生，多个线程醒来也会竞争同一个状态。只要谓词写对，这些都不会破坏正确性；谓词写错，再多 notify 也只是碰运气。
-
-信号量版本可以作为对照。它把空槽和已用槽表达成资源数量，但关闭语义仍然需要额外状态。这个对照能让读者理解：同步原语不是越高级越好，而是表达模型是否贴合不变量。
-
-\topic{实验课：可关闭有界队列的状态表}
-先画状态表再写代码。队列有 open、closing、closed 三种状态；buffer 有 empty、partial、full 三种容量状态；等待者分 producer 和 consumer。push 等待 not full 或 closed；pop 等待 not empty 或 closed；close 修改状态并唤醒所有等待者。状态表写清后，代码只是把表翻译成 mutex、condition variable 和谓词循环。
-
-测试分六组。空队列上 consumer 等待后 close；满队列上 producer 等待后 close；多个 producer 和 consumer 同时运行；任务处理抛异常；drain close 允许取完剩余元素；immediate close 直接拒绝后续操作。每组都要有超时保护，防止测试本身永久挂住。若任何等待者没有退出，说明谓词或通知顺序有问题。
-
-性能实验再看容量。容量太小，生产者和消费者频繁等待；容量太大，背压被隐藏，内存峰值上升。报告不要只写吞吐，还要写最大水位、平均等待、notify 次数或替代指标。这样队列不只是同步练习，也是 I/O 和任务运行时背压的基础。
-
-信号量对照可以放在最后。用 empty slots 和 used slots 两个信号量实现队列，读者会看到资源计数更直接，但关闭语义仍然需要额外状态。这个对照能加深“原语服务模型”的理解。
-
-\topic{同步原语练习验收重点}
-合格答案从不变量开始。队列 head、tail、size、buffer 和 closed 状态之间的关系要写清。条件变量题必须写等待谓词，并说明虚假唤醒和丢通知为何不破坏正确性。信号量题要说明它表达资源数量，而不是替代所有状态。
-
-答案还要写“为什么不采用更复杂方案”。例如没有证据证明队列是瓶颈，就不应把锁队列换成无锁；没有证明输出顺序可变，就不应随意重排；没有证明错误路径能恢复，就不应只提交正常路径。能解释不做什么，说明读者开始具备工程判断。
-
-最后，答案必须包含可复查材料。至少有输入摘要、关键状态、期望输出、实际输出、运行命令和未验证边界。没有这些材料，老师或同伴无法判断结论是否成立。第二册的作业不是让读者写漂亮段落，而是训练读者把系统问题变成可验证证据。
-
-\topic{项目实现：锁、条件变量与信号量}
-本章对应的贯穿项目实现不要求一次写成完整框架，但必须有最小可运行切片。这个切片包含三个部分：一个 reference，一个带本章机制的实现，一个能击穿 reference 之外隐含假设的测试。Reference 用来固定语义，机制实现用来展示本章知识，测试用来证明新增复杂度确实解决了问题。
-
-代码组织上，不要把所有内容放进一个大文件。基础类型、输入生成、核心机制、报告输出和测试应分开。即使当前只是教学项目，也要让目录能表达责任边界。这样后续章节接入时，不会因为找不到状态归属而重新发明一套对象。
-
-每个实现都要输出一段机器可读摘要。摘要至少包含输入规模、关键状态、错误数、输出校验、耗时和未验证边界。这里的机器可读不要求复杂格式，简单的 key value 文本也可以。关键是让脚本和读者都能复查，而不是只能看屏幕截图。
-
-测试应包含正常路径、边界路径和失败路径。正常路径证明功能可用；边界路径证明长度、容量、尾部、空输入、关闭或超时没有遗漏；失败路径证明本章机制不是装饰。若失败路径写不出来，往往说明本章概念还没有落到工程对象上。
-
-报告最后写一个取舍段。新增机制带来了什么好处，增加了什么成本，哪些场景不应该使用它，下一章会复用哪个字段或对象。这个取舍段非常重要，因为系统工程不是把所有高级机制都加进去，而是在证据和约束下选择合适的边界。
-
-\topic{调试笔记：死锁和卡住先写等待图}
-程序卡住时，先写每个线程持有哪些锁、等待哪个谓词、队列状态是什么、关闭状态是什么。若两个线程互等资源，是锁顺序问题；若所有消费者等待 not empty 但队列已 closed，是谓词没有包含关闭状态；若 producer 等 not full 但关闭后没醒，是通知路径缺失。等待图比猜测哪把锁慢更有效。
-
-
-\topic{复查清单：锁、条件变量与信号量}
-复查本章时，先检查 reference 是否仍然存在。没有 reference，后面的并发、优化、异步或分布式改造都无法证明语义没有变。再检查压力输入是否尖锐：它应当攻击本章最核心的边界，而不是只把数据量放大。第三，检查状态是否可观察：关键对象的身份、状态、错误和提交结果应能在报告中找到。
-
-第四，检查代码示例是否说明禁止行为。调用者不能做什么，往往比能做什么更能体现工程质量。第五，检查实验是否写出未验证边界；当前设备、权限或输入无法证明的结论，必须标注。第六，检查本章对象是否能被下一章复用，不能复用就说明边界还不稳。
-
-完成这六项后，再看文字是否连贯。每个概念都应从问题推出，每个案例都应从朴素方案走到改进方案，每个实验都应能解释一个判断。若某段话放到其他章节也成立，就把它改成本章的具体对象、具体输入和具体失败。
-
-\section{工程案例：从有界队列推导锁、条件变量和背压}
-
-锁和条件变量最好的教学对象是有界队列。它同时包含共享状态、不变量、等待谓词、关闭语义、背压和异常安全。若这个队列讲不清，后面线程池、I/O pipeline 和分布式背压都很难讲清。不要把 mutex 当作“保护代码块”的工具，它保护的是状态不变量。
-
-\topic{一、先写队列不变量}
-有界队列至少有这些状态：buffer、head、tail、size、capacity、closed。它的不变量包括：size 不超过 capacity；head 和 tail 始终落在环形范围；size 为 0 时不能 pop；size 等于 capacity 时不能 push；closed 后不再接纳新元素；closed 且 size 为 0 时消费者应退出。这些不变量必须由同一把锁保护，不能有的字段锁内改，有的字段锁外原子读写。
-
-写锁代码前先写不变量，能防止很多错误。比如在锁外读 size 判断是否 pop，看起来减少锁开销，实际上破坏了 head、tail、size 的一致关系。size 是协议状态，不是近似指标。若只是监控队列长度，可以维护另一个 relaxed 指标；但实际 pop 决策必须在锁保护下完成。
-
-\topic{二、条件变量等待的是谓词，不是通知}
-条件变量的通知可能早到、晚到、合并或虚假唤醒。等待者必须在循环里检查谓词。生产者 push 后通知 not empty；消费者 pop 后通知 not full；关闭时同时通知所有等待者。若等待者只等通知，不检查 closed 和 size，就会出现丢唤醒或关闭悬挂。
-
-\begin{lstlisting}[language=C++,caption={有界队列的等待谓词要包含关闭状态}]
-bool can_pop(std::size_t size, bool closed) {
-    return size > 0 || closed;
-}
-
-bool can_push(std::size_t size, std::size_t capacity, bool closed) {
-    return size < capacity || closed;
-}
-\end{lstlisting}
-
-这两个函数看似简单，却表达了核心语义。pop 等到有元素或关闭；push 等到有空间或关闭。等待返回后还要根据 closed 和 size 决定成功、失败或退出。谓词写清，条件变量代码才可审查。
-
-\topic{三、关闭语义要区分 drain 和 cancel}
-关闭队列有两种常见语义。Drain 表示不接收新元素，但已有元素允许消费者取完；Cancel 表示队列中未处理元素被丢弃或标记取消。两者对生产者、消费者和等待者的返回值不同。很多 bug 来自只设置 \code{closed=true}，却不说明剩余元素怎么办。
-
-Compute Systems Engine 的 parse-to-compute 队列通常适合 drain：上游不再产生新 batch，下游处理已有 batch 后退出。错误恢复或作业取消可能需要 cancel：未开始的 batch 被标记取消，等待者收到取消状态。队列接口应返回枚举结果，而不是只返回 bool，让调用者区分 success、closed、cancelled。
-
-\topic{四、锁内代码越短越好，但不能拆散不变量}
-临界区应只做状态检查、移动元素和更新索引，不应在锁内解析大对象、写文件、调用用户回调或分配大量内存。锁内工作过长会造成 convoy，其他线程排队等待。但为了缩短锁而把不变量拆到锁外，也会出错。正确做法是先在锁外准备好元素，再进入锁内提交；pop 时锁内取出元素所有权，锁外处理。
-
-异常安全也要考虑。push 时如果元素移动或构造可能抛异常，不能先增加 size 再构造；pop 时如果移动到输出对象抛异常，队列状态不能丢元素。实际工程中可以要求元素移动不抛，或使用 optional 存储，或先在槽位构造成功后再发布 size。教材应让读者知道异常路径不是 C++ 并发代码的边角料。
-
-\topic{五、Semaphore 表达资源计数，但不保护复杂不变量}
-信号量适合表达“有多少资源可用”，例如空槽数量、满槽数量、并发请求额度。它不直接保护 head、tail 和 buffer 的一致性。一个环形队列可以用两个 semaphore 管理空槽和满槽，再用互斥保护索引；也可以在 SPSC 场景下用原子索引避免锁。选择取决于生产者消费者数量和不变量复杂度。
-
-不要用 semaphore 替代所有 mutex。若状态是多个字段组合，仍然需要互斥或明确无锁协议。Semaphore 的优势是资源计数和等待路径清晰，尤其适合限流和并发度控制。I/O 章节会把它扩展成 in-flight 请求预算。
-
-\topic{六、锁性能要看等待时间而不是锁次数}
-锁调用次数多不一定慢，低竞争短临界区可能很便宜；锁次数少但每次持有很久，尾延迟可能很差。测量锁性能要记录等待时间、持有时间、队列长度、上下文切换和 futex 慢路径。只看总吞吐会漏掉 convoy 和长尾。
-
-Linux futex 的直觉是：无竞争时用户态 fast path 修改原子状态即可；竞争时进入内核睡眠和唤醒。理解这一点后，读者会知道为什么短临界区低竞争锁可以接受，为什么高竞争热点锁会突然变慢。工具上可以用 perf、trace 或应用内计时记录等待区间。
-
-\topic{七、实验交付：QueueContract}
-本章给项目留下 \code{QueueContract}。它写明容量、push 返回值、pop 返回值、关闭模式、取消模式、是否保持 FIFO、元素所有权、等待谓词和异常保证。任何线程池、I/O pipeline 或分布式消息队列都要引用这个合同。
-
-实验比较三种队列：无界 mutex 队列、有界条件变量队列、信号量控制并发的队列。输入包含上游快下游慢、下游快上游慢、关闭时仍有元素、取消时有等待者、异常注入。验收不只看吞吐，还看内存峰值、等待者是否悬挂、关闭后是否丢失已提交元素。这样锁章就真正服务后续系统，而不是停留在 API 介绍。
-
-\section{案例深化：锁顺序和组合操作}
-
-单个锁容易讲，多个锁组合才容易出事故。系统中常见组合操作包括从一个队列移动到另一个队列、同时更新任务表和队列、提交 manifest 时更新状态和文件索引。若锁顺序不清，死锁和不变量破坏会出现。
-
-\topic{一、锁保护的是对象边界}
-每把锁都应有保护对象。队列锁保护 head、tail、size、closed 和 buffer；任务表锁保护 task state map；manifest 锁保护提交表。若一个函数同时需要队列和任务表，必须按固定顺序获取锁，或把操作拆成两个阶段，中间使用稳定 id 连接。不能在不同代码路径里用不同顺序。
-
-锁顺序应写进设计文档或类型注释。比如先 task table，再 ready queue，再 manifest。若某个路径必须反过来，说明边界设计可能有问题。锁顺序不是死板规定，而是消除循环等待的工具。
-
-\topic{二、组合操作要找提交点}
-从 pending 队列取一个 task 并标记 running，是一个组合操作。若先从队列移除，后标记状态，中间抛异常或取消，task 可能丢失；若先标记 running，后出队失败，状态和队列不一致。正确做法是在同一临界区更新相关不变量，或设计可恢复的中间状态。
-
-提交点也影响用户语义。submit 返回成功的那一刻，任务是否一定会运行？shutdown 开始后，并发 submit 是成功还是失败？close 队列时，已入队元素是否保证被处理？这些问题都要靠组合操作的提交点回答。
-
-\topic{三、避免锁内调用未知代码}
-持锁调用用户回调、日志格式化、分配器、I/O 或另一个模块的复杂函数，会放大死锁和长临界区风险。锁内应只做状态变更和简单移动。需要回调时，把要通知的对象收集出来，释放锁后再调用。条件变量通知通常可以在释放锁后做，但要确保状态已经更新。
-
-这个原则在任务运行时尤其重要。任务完成时要更新 shared state，然后唤醒等待者或调度后继；不要在持 shared state 锁时执行后继任务。否则一个任务完成可能递归进入任意用户代码，锁边界失控。
-
-\topic{四、组合锁实验}
-构造两个队列和一个任务表，实现 move task。故意用相反锁顺序制造死锁，再改成固定顺序；故意在两步之间抛异常，观察状态丢失，再改成单临界区或中间状态。这个实验能让锁章从 API 使用升级到不变量设计。
-
-\section{贯穿案例：队列 close 后为什么还有消费者永远睡着}
-
-锁和条件变量如果从 API 开始讲，读者会记住 \code{wait}、\code{notify_one}、\code{notify_all}，却未必知道等待的到底是什么。考虑一个有界队列：生产者 push 解析后的 batch，消费者 pop 后计算。正常路径都能跑。作业取消时，主线程设置 \code{closed=true}，但只通知了 \code{not_full}，忘记通知 \code{not_empty}。此时某个消费者正等队列非空，它永远睡着；另一个生产者被唤醒后发现 closed，返回失败；主线程 join 消费者时卡住。没有数据竞争，程序仍然死锁。
-
-这个事故能讲清条件变量的本质：等待的不是通知，而是谓词。消费者等待的是“队列有元素或队列关闭”；生产者等待的是“队列有空间或队列关闭”。关闭改变了两个谓词，所以必须唤醒两个方向的等待者。通知只是让线程有机会重新检查谓词，不能替代谓词本身。这个推导比直接说“防虚假唤醒要 while”更容易让人记住。
-
-\topic{一、先写队列合同而不是先写锁}
-QueueContract 应说明容量、FIFO 是否保证、push 成功后元素是否一定可见、pop 在关闭后如何返回、drain 和 cancel 的差异、等待者如何唤醒、元素所有权何时转移。合同写清后，锁只是实现不变量的手段。若合同没有区分 ClosedAndDrained、Cancelled 和 Success，调用者只能用 bool 猜测，关闭路径必然混乱。
-
-\topic{二、关闭状态要参与所有等待谓词}
-消费者谓词是 \code{size > 0 || closed || cancelled}；生产者谓词是 \code{size < capacity || closed || cancelled}。等待返回后，消费者还要区分有元素、关闭且无元素、取消；生产者要区分有空间、关闭、取消。这样关闭不会依赖某次通知刚好到达。条件变量代码的正确性来自谓词完整，而不是通知次数。
-
-\topic{三、drain 和 cancel 要分开测试}
-Drain 表示不再接收新元素，但已有元素必须被消费者取完；Cancel 表示未处理元素可以丢弃或标记取消。两者唤醒方式类似，返回语义不同。日志处理正常结束适合 drain，用户取消或 fatal 错误可能需要 cancel。若一个接口只叫 close，却不说明是哪一种，后续线程池和 I/O 管线都会出现歧义。测试要分别覆盖两种模式。
-
-\topic{四、锁内只更新不变量，锁外处理元素}
-Push 前可以在锁外构造元素，进锁后只检查谓词、移动元素、更新 head/tail/size，再通知；pop 在锁内取出元素所有权，锁外解析、写文件或执行回调。这样临界区短，不会因为用户代码阻塞其他线程。可是为了缩短锁，不能把 size、head、tail 的一致关系拆到锁外。短临界区和完整不变量要同时满足。
-
-\topic{五、异常路径要保持队列不变量}
-如果元素移动可能抛异常，push 不能先增加 size 再构造；pop 也不能先减少 size 再把元素交给调用者却在移动时失败。教学实现可以要求元素 no-throw move，或者使用内部 optional 槽位和两阶段发布。关键是让读者知道异常不是 C++ 并发代码的边角料。异常路径破坏不变量，后续等待谓词也会失效。
-
-\topic{六、从有界队列走向背压}
-有界队列不只是内存优化，它是背压边界。上游 push 阻塞或返回 Full，说明下游跟不上；队列容量决定最多积压多少 batch；关闭状态决定系统如何收束。I/O in-flight、MessageBus inbox、线程池 ready queue 都是同一类合同。第 10 章如果把队列 close 讲清，后面章节的背压和关闭就有共同语言。
-
-\topic{七、最小复现实验}
-容量为一的队列，启动一个消费者等待 pop，不放入元素，主线程关闭队列。错误版本只通知 not full，消费者卡住；修复版本 notify all 后消费者返回 Closed。再加入一个生产者等待空间，关闭后它也返回 Closed。最后测试 drain：队列里已有一个元素，关闭后消费者先取元素，再下一次 pop 返回 Closed。这个小实验足以证明谓词和关闭合同，比大规模压力测试更能解释问题。
-
-\section{补强案例：读写锁和 RCU 的适用边界}
-
-读多写少的共享状态常让人想到读写锁或 RCU。二者都能提高读并发，但语义和成本不同。读写锁仍然让读者进入锁协议，写者需要等待读者；RCU 让读者更轻，但更新者延迟回收旧版本。选择前要看读写比例、读侧耗时、写侧要求和对象生命周期。
-
-\topic{一、读写锁适合短读侧临界区}
-若读操作短、不会阻塞、写操作也不频繁，读写锁可以让多个读者并发。问题是读者太多时写者可能饥饿，或实现为了避免饥饿让新读者等待写者。读写锁不适合读侧长时间阻塞 I/O，也不适合读者在锁内调用未知代码。
-
-\topic{二、RCU 适合不可变版本切换}
-RCU 的读者不阻塞写者发布新版本，但旧版本回收要等待读者离开。它适合配置表、路由表、读多写少索引。对象应尽量不可变，更新创建新版本。若写很多，旧版本堆积；若读者长时间不退出，回收延迟。RCU 的成本转移到更新和回收。
-
-\topic{三、配置表案例}
-配置表读频率高，写频率低。Mutex 简单但所有读串行；读写锁允许多读；atomic shared pointer 或 RCU 让读者拿 snapshot。三者都正确，但成本不同。实验比较读延迟、写延迟、旧版本释放延迟和代码复杂度。不要只看吞吐，写侧尾延迟和内存峰值也重要。
-
-\topic{四、和原子章连接}
-读写锁通过 lock unlock 建立 happens-before；RCU 或 atomic snapshot 需要发布和生命周期协议。若对象会被释放，必须说明谁等待读者。同步原语选择不是 API 喜好，而是围绕不变量、等待和回收边界的设计。
-
-\section{补充案例：条件变量和关闭竞态}
-
-关闭竞态是条件变量代码最常见的问题之一。生产者正在 push，消费者正在 wait，另一个线程调用 close。若状态和通知顺序不清，可能丢元素、悬挂等待者或让关闭后的 push 成功。
-
-\topic{一、close 必须持锁修改状态}
-关闭状态和队列 size 属于同一不变量，应在同一把锁下修改。close 设置 closed 后 notify all。等待者醒来后检查 size 和 closed，决定取剩余元素或退出。若 close 不持锁，等待者可能错过状态变化。
-
-\topic{二、并发 push 和 close}
-push 进入临界区后，如果队列未关闭并成功放入元素，它应返回成功；close 之后进入的 push 应失败。push 和 close 的先后由锁内顺序决定，而不是调用开始时间。这个语义要写在 QueueContract 里。
-
-\topic{三、drain 语义的消费者退出}
-Drain close 下，消费者在 size 大于零时继续 pop，即使 closed 已经 true；只有 size 为零且 closed true 时退出。很多错误版本看到 closed 就立即退出，导致已入队元素丢失。
-
-\topic{四、实验}
-让多个生产者和消费者并发 push、pop、close。检查成功 push 的元素都被 pop，close 后 push 失败，所有等待者退出。用小容量队列放大竞态。这个实验比普通生产消费测试更能证明关闭语义。
-
-\section{补充专题：Semaphore 和令牌桶限流}
-
-信号量不仅能实现队列资源计数，也能表达并发额度。分布式和 I/O 章节里的 in-flight 限制，可以在单机用 semaphore 或令牌桶先理解。
-
-\topic{一、并发额度}
-假设最多允许 64 个写请求同时在 I/O 子系统中飞行。每次提交前 acquire 一个令牌，completion 后 release。这样即使上游很快，in-flight 也不会无限增长。令牌数量就是资源预算。
-
-\topic{二、令牌和队列容量不同}
-队列容量限制等待中的请求数，令牌限制已经提交但未完成的请求数。二者可以同时存在。队列满说明上游生产过快；令牌耗尽说明下游并发资源用满。指标解释不同，调参也不同。
-
-\topic{三、超时和令牌归还}
-请求超时后是否归还令牌，要看底层请求是否仍可能完成。若超时不等于取消，过早归还会让 in-flight 实际超过预算。必须等 completion 或明确取消成功后归还。这个原则会在分布式请求窗口中重复出现。
-
-\topic{四、实验}
-用 semaphore 限制同时写出的 block 数，模拟慢 completion。比较无限制、只限制队列、限制 in-flight 三种策略。记录内存、尾延迟和完成顺序。读者会看到资源计数比简单队列更精确。
-
-\section{补充专题：锁设计中的所有权转移}
-
-锁保护状态，但数据所有权常常要在锁内转移、锁外处理。这个模式在队列、任务表和 I/O completion 中反复出现。掌握它能同时减少临界区时间和生命周期错误。
-
-\topic{一、锁内移动，锁外处理}
-消费者 pop 时，在锁内检查队列非空，把元素移动到局部变量，更新 head 和 size，然后释放锁。真正处理元素在锁外进行。这样队列不变量在锁内完成，耗时业务逻辑不阻塞其他线程。若元素移动可能抛异常，要设计异常保证。
-
-\topic{二、所有权必须唯一}
-元素从队列槽位移动到消费者局部变量后，队列不再拥有它。若同时保留引用或指针，就会出现双重所有权。C++ 中使用 move-only 类型能帮助表达这一点。任务对象、I/O buffer 和 message payload 都适合用移动语义表达所有权转移。
-
-\topic{三、通知不等于所有权}
-通知等待者只是告诉状态可能变化，不转移数据所有权。等待者醒来后仍要持锁检查，并在锁内取得元素所有权。把通知当作“我已经拥有数据”会导致竞态。条件变量教学必须强调这一点。
-
-\topic{四、实验}
-实现一个队列传递 move-only buffer。验证 push 后生产者不能再使用，pop 后消费者独占。故意在锁外读取队列内部引用，观察关闭和复用时的悬垂风险。这个实验能把锁和 C++ 所有权结合起来。
-
-\section{从临界区推导同步语义}
-
-锁、条件变量和信号量不是三个孤立 API。它们解决的是不同形态的等待和互斥：锁保护共享不变量，条件变量等待状态变化，信号量管理可用令牌。若只记函数名，代码很容易写出偶发死锁、丢通知、虚假唤醒错误和容量失控。同步章节要从具体不变量开始：哪些数据必须一起变化，哪个状态让等待者继续，容量代表什么资源，关闭时谁负责唤醒。
-
-\topic{一、锁保护不变量，不保护代码块}
-很多错误来自把锁理解成“进入这段代码的门”。更准确地说，锁保护一组共享状态的不变量。比如队列的 \code{buffer}、\code{head}、\code{tail}、\code{size} 和 \code{closed} 必须在同一把锁下检查和修改。若 push 修改了 buffer 但 size 更新在锁外，消费者就可能看到不一致状态。临界区大小也要围绕不变量决定：太小会破坏原子状态变化，太大会扩大等待。先写不变量，再决定锁的边界。
-
-\topic{二、条件变量等待谓词，不等待通知}
-条件变量的正确写法是循环检查谓词。通知只是提醒“可能有变化”，不是保证条件已经成立。虚假唤醒、多个消费者竞争同一元素、通知发生在等待之前，都要求等待者重新检查状态。以有界队列为例，消费者等待的是 \code{!empty || closed}，生产者等待的是 \code{!full || closed}。关闭状态必须进入谓词，否则关闭时等待者可能永远睡眠。读者要把这条规则理解为状态机，而不是背诵模板。
-
-\topic{三、信号量适合表达可用资源数量}
-信号量的值代表令牌数量，比如可用连接数、可用 buffer 数、并发请求配额。它不适合表达复杂不变量，因为拿到令牌不代表某个容器状态已经一致。用信号量限制 in-flight 请求时，还要考虑异常路径和取消路径是否归还令牌；若令牌泄漏，系统会逐渐停住；若重复释放，容量约束会失效。信号量让容量显式化，也要求生命周期显式化。
-
-\topic{四、关闭协议是同步结构的验收题}
-队列、线程池、buffer pool 最容易在关闭时暴露设计问题。关闭不是简单设置一个 bool，而是声明不再接受新任务、唤醒等待者、让已提交任务完成或取消、回收资源并禁止迟到回调访问已析构对象。每个同步结构都应有关闭状态表：Open、Closing、Drained、Closed。若没有状态表，析构函数常会和后台线程、条件变量或 future 发生竞态。关闭协议写清楚，平时运行的正确性也会更清楚。
-
-\topic{五、同步实验要故意制造交错}
-并发 bug 不会稳定出现，所以实验要主动制造交错：小容量队列、多生产者多消费者、随机 sleep、异常退出、取消、关闭时仍有等待者。测试不只看最终输出，还要看是否死锁、是否丢元素、是否重复消费、是否泄漏令牌、是否能在 deadline 内退出。同步章节的代码示例应鼓励读者把调度不确定性暴露出来，而不是只跑一次 happy path。
-
-\section{有界阻塞队列的完整语义}
-
-有界阻塞队列是同步章节最值得完整讲透的数据结构。它同时包含互斥、条件变量、容量、关闭、异常安全和背压。只给出 push 和 pop 代码是不够的，必须先定义语义：队列容量是多少，push 在满时等待还是失败，pop 在空时等待还是失败，close 后是否还能取出剩余元素，等待者如何醒来，析构时是否允许仍有线程访问。
-
-\topic{一、状态变量要少而完整}
-一个基本实现需要 buffer、head、tail、size、capacity、closed。buffer 保存元素，head 指向下一个可读位置，tail 指向下一个可写位置，size 区分空和满，closed 表示不再接受新元素。所有变量都由同一把 mutex 保护。不要把 size 改成 atomic 试图减少加锁，因为它和 head、tail、closed 共同构成不变量，单独原子化会制造不一致观察。
-
-\topic{二、push 的谓词是有空间且未关闭}
-生产者进入 push 后，在锁内等待 \code{size < capacity || closed}。被唤醒后若 closed，返回失败或抛出明确定义的错误；否则构造元素，推进 tail，增加 size，再通知消费者。元素构造如果抛异常，队列状态不能改变。这里可以用先在局部准备对象，再在临界区移动构造的方式缩短锁时间，但状态更新必须仍在锁内完成。
-
-\topic{三、pop 的谓词是有元素或已关闭}
-消费者等待 \code{size > 0 || closed}。若 size 大于零，取出元素、推进 head、减少 size、通知生产者。若 size 为零且 closed，返回结束信号。这样 close 后消费者仍能 drain 剩余元素。若业务希望 close 后立即丢弃剩余元素，也必须写成另一种明确语义，不能让调用者猜。
-
-\topic{四、close 要广播所有等待者}
-close 在锁内设置 closed，然后同时通知 \code{not_empty} 和 \code{not_full}。等待 push 的生产者需要醒来发现队列关闭，等待 pop 的消费者需要醒来 drain 或退出。close 应该幂等，多次调用不破坏状态。析构函数通常应要求外部先停止线程并调用 close；若析构内部调用 close，也仍要保证没有线程在对象销毁后访问条件变量。
-
-\topic{五、测试覆盖队列语义而非只覆盖结果}
-测试要覆盖满队列 push 等待、空队列 pop 等待、close 唤醒生产者、close 唤醒消费者、close 后 drain、异常构造、多个生产者、多个消费者和容量为一。每个测试都应检查状态转移和元素数量。这个队列讲清楚后，读者再看线程池 ready 队列、I/O buffer pool 和 MessageBus inbox，就能识别同一套同步语义。
-
-\section{案例深化：有界队列的完整合同}
-
-有界队列是锁、条件变量和背压的交汇点。它看似简单：push 等队列不满，pop 等队列不空。真正的合同还包括关闭、异常、多个生产者消费者、公平性和容量语义。若这份合同没有写清，后续线程池、I/O 背压和 MessageBus 都会继承错误。
-
-\topic{一、队列不变量}
-队列不变量包括：元素数不超过容量，head 和 tail 指向合法位置，closed 后不接受新元素，drain 模式下已有元素仍可取出，cancel 模式下已有元素被丢弃或交给清理器。锁保护这些不变量，而不是保护某几行代码。任何函数返回前，不变量都必须成立。
-
-\topic{二、等待谓词}
-Producer 等待“队列未满或 closed”，consumer 等待“队列非空或 closed”。谓词必须在锁下检查，wait 返回后重新检查。Notify 不是消息，丢了也没关系，因为状态才是真相。这个原则一旦掌握，虚假唤醒、提前 notify、多个等待者竞争都不再神秘。
-
-\topic{三、容量是背压合同}
-容量不是随便取一个数。它表达上游最多可以超前下游多少工作。容量太小会降低吞吐，太大又会隐藏过载并增加内存峰值。报告要说明每个元素平均大小、允许排队时间和内存预算。I/O 章节的 in-flight bytes、分布式章节的 worker window 都是同一个思想。
-
-\topic{四、不要持锁调用用户代码}
-持锁回调会把未知代码放进临界区，可能重入队列、拿其他锁、阻塞 I/O 或抛异常。正确做法是在锁下取出元素和状态，在锁外执行用户回调。若必须在锁内调用，就要写清不会阻塞和不会重入的合同。很多死锁不是锁本身复杂，而是锁内做了不可控工作。
-
-\topic{五、测试要覆盖关闭矩阵}
-关闭矩阵至少包括空队列关闭、满队列关闭、生产者等待时关闭、消费者等待时关闭、多个等待者、drain 和 cancel 两种策略。每个测试都检查没有线程泄漏、没有重复元素、没有丢失未声明丢弃的元素。一个能通过关闭矩阵的队列，才适合作为后面运行时和 MessageBus 的基础。
-
-\section{案例复盘：有界队列的关闭合同}
-
-有界队列正常 push pop 通过，不代表同步正确。关闭时 producer 可能等队列不满，consumer 可能等队列非空，若 closed 没进入谓词，线程会卡死。锁保护的是不变量，条件变量等待的是谓词，notify 只是提醒重新检查状态。
-
-\topic{不变量和谓词}
-队列不变量包括容量、head、tail、closed、drain 或 cancel 策略。Producer 谓词是队列未满或 closed，consumer 谓词是队列非空或 closed。Wait 返回后必须在锁下重查。持锁回调、锁顺序反转和关闭遗漏都要作为测试场景。
-
-\topic{实验判据}
-关闭矩阵覆盖空队列、满队列、等待 producer、等待 consumer、多等待者、drain 和 cancel。指标包括等待线程数、重复元素、丢弃元素、关闭耗时和锁持有时间。这个队列合同会被线程池、I/O 和 MessageBus 复用。
+\topic{测试要攻击等待路径}
+并发测试应故意制造极端条件：队列容量为一，worker 数为一或二，随机 \code{yield}，随机短 sleep，固定 seed 重放失败，任务抛异常，close 与 push/pop 并发。大容量和大线程数有时只会掩盖状态机错误。ThreadSanitizer 可以发现数据竞争，但会改变性能，不能用于性能结论。
+
+\begin{sourcereadingbox}
+本章源码阅读按“等待为何能正确醒来”这条线组织。
+\begin{enumerate}
+  \item Linux futex：阅读 \filepath{kernel/futex/core.c} 相关等待和唤醒路径，重点看用户态地址、等待队列和 wake 的关系，不需要追完整优先级继承实现。
+  \item Linux mutex/wait queue：阅读 \filepath{kernel/locking/mutex.c} 和 \filepath{include/linux/wait.h}，说明 fast path、阻塞路径和唤醒条件如何分层。
+  \item pthread 或 libc++ 同步原语：观察 \code{std::condition_variable} 如何映射到底层 pthread，理解标准库为什么要求配合 \code{std::unique_lock}。
+  \item 工业队列或 executor：找一个有 shutdown/drain 语义的队列，分析它怎样定义关闭、取消和等待者唤醒。
+\end{enumerate}
+报告必须从一个具体失败开始，例如“close 后消费者不醒”或“任务异常后 wait 永久阻塞”，然后把源码机制和项目 \code{QueueContract} 对上。
+\end{sourcereadingbox}
+
+\begin{rubricbox}
+本章满分 100 分：
+\begin{enumerate}
+  \item 不变量说明，15 分：明确列出队列字段、保护锁和状态关系。
+  \item 条件变量谓词，15 分：push/pop/wait/close 的谓词完整覆盖关闭和虚假唤醒。
+  \item 关闭与背压，20 分：区分 close、drain、cancel、满队列等待和拒绝策略。
+  \item 正确性测试，20 分：覆盖容量为一、多生产者多消费者、满/空 close、重复 close、异常路径和压力交错。
+  \item 锁边界与异常安全，10 分：锁内不执行任务/I/O/未知回调，异常路径不破坏计数和不变量。
+  \item 性能与观测，10 分：记录等待次数、等待时间、最大队列长度、关闭耗时，能解释锁慢还是下游慢。
+  \item 工业案例迁移，10 分：能从 futex、pthread、workqueue 或 RCU 中分析约束、机制、能力、代价和项目取舍。
+\end{enumerate}
+\end{rubricbox}
+
+\section{本章小结}
+
+锁、条件变量和信号量不是三个孤立 API，而是三种表达同步语义的工具。Mutex 保护不变量；condition variable 等待谓词；semaphore 表达资源额度。同步设计的质量取决于状态机是否完整、等待者是否有退出路径、关闭和异常是否覆盖、锁内是否只做可控状态转换、测试是否故意攻击边界。
+
+本章留下的项目对象是 \code{QueueContract}。第 9 章的 \code{ThreadPoolPlan} 和 \code{WorkerSnapshot} 需要队列合同才能可靠 shutdown；第 14 章的任务运行时会在队列之上增加 ready count 和 unfinished count；第 15 章的 I/O 管线会把容量从任务数扩展到字节和 in-flight；第 16 章以后的 MessageBus 会复用同样的 close/drain/backpressure 语义。
 
 \section{本章习题}
 
 \begin{exercisebox}
-习题一：为当前项目的 \code{BoundedMpmcQueue} 写不变量清单。逐行解释 \code{push} 和 \code{try_pop} 怎样保持这些不变量。指出当前接口缺少哪些线程池需要的语义。
-
-习题二：把 bounded queue 设计成支持 \code{close}。不要求立刻写完整代码，但必须画出状态转换：open nonempty、open empty、open full、closed nonempty、closed empty。说明每个状态下 push 和 pop 应返回什么。
-
-习题三：设计一个队列等待实验。多个生产者写入，消费者故意变慢，让队列经常满。记录生产者等待次数、最大队列长度和总吞吐。解释这是背压，不是单纯性能退化。
-
-习题四：阅读 glibc、musl 或 Linux futex 文档和源码入口，写清 mutex 低竞争 fast path 和竞争 slow path 的差异。报告中必须说明哪些部分发生在用户态，哪些部分进入内核。
+\begin{enumerate}
+  \item 写出 \code{BoundedQueue<T>} 的不变量表，并标出每个字段由哪把锁保护。解释为什么只把 \code{size} 改成 atomic 不能让队列正确。
+  \item 给出一个错误版本：\code{pop} 的等待谓词只检查 \code{size > 0}。构造空队列 close 的测试，让消费者永久睡眠，再修复它。
+  \item 实现容量为一的有界队列压力测试。多个 producer 产生唯一 id，多个 consumer 记录消费日志，最终检查不丢、不重、关闭后所有线程退出。
+  \item 设计 \code{QueueContract} 文档，分别填写 compute task queue、I/O byte queue、MessageBus queue 三种队列的容量、满队列、空队列、close、drain 和取消语义。
+  \item 分析一个锁顺序死锁：线程 A 持有队列锁后等待指标锁，线程 B 持有指标锁后等待队列锁。给出锁顺序表和重构方案。
+  \item 阅读 futex 或 pthread condition variable 的资料，解释为什么“修改状态”和“进入等待”必须配合，不能只靠一次 \code{notify}。
+\end{enumerate}
 \end{exercisebox}

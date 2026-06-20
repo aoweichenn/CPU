@@ -1,1767 +1,449 @@
 \chapter{分布式计算工程实践}
 
-先看最终项目要能复现的一次完整事故：输入包含三个 split，其中一个 split 有非法字段，一个 key 是热点；worker 1 写出 task 0 后 Driver 在 manifest 提交后崩溃；worker 2 的 task 1 第一次写出遇到短写；task 2 的成功响应被 MessageBus 丢弃，Driver 超时重试，旧响应随后迟到。正常路径里这只是一个日志统计作业，事故路径里它同时考验解析错误、I/O 可靠写、任务状态、重试、幂等提交、热点 key、trace 和恢复。
+第二卷最后一章不再新增一个孤立主题，而是把前面所有机制收束成一个可运行、可测量、可故障注入、可恢复的教学系统：Compute Systems Engine。它处理一批日志记录，按 key 聚合计数，经过 map、combine、shuffle、reduce 和 manifest commit，最后输出确定结果。目标不是替代 Spark、Flink 或数据库执行器，而是在一台机器上把现代计算系统的关键边界写清：数据怎样进入热路径，任务怎样并行，I/O 怎样可靠完成，远端消息怎样提交，失败后谁是权威事实。
 
-本章从这个端到端事故进入分布式计算工程实践。分布式计算工程把算法、运行时、存储、网络和观测性结合起来。真正的系统不仅要在正常路径跑得快，还要在机器慢、网络抖动、任务失败和数据倾斜时保持可诊断、可恢复。前面章节讲的每个局部机制，最后都要回到这个项目里接受同一次故障演练。
+先看最终项目要能复现的一次完整事故。输入有三个 split，其中一个 split 含非法字段，一个 key 是热点；worker 1 写出 task 0 后，Driver 在 manifest 提交后崩溃；worker 2 的 task 1 第一次写出遇到短写；task 2 的成功响应被 MessageBus 丢弃，Driver 超时重试，旧响应随后迟到。正常路径里这只是一个日志统计作业，事故路径里它同时考验解析错误、I/O 可靠写、任务状态、重试、幂等提交、热点 key、trace 和恢复。
 
-\section{从 MapReduce 到 Shuffle}
+本章的判断标准很简单：读者不能只让程序跑通，还要能解释程序为什么可信。解释必须落到具体对象：\code{InputSplit}、\code{TaskId}、\code{AttemptId}、\code{ShuffleBlock}、\code{ManifestEntry}、\code{MessageEnvelope}、\code{Checkpoint} 和 \code{RunReport}。如果一个结果出错，报告应能把它缩小到解析、分区、写出、提交或恢复中的某个边界，而不是让人翻日志猜。
 
-Shuffle 把数据按 key 重新分布，是很多分布式计算框架的核心成本。它包含序列化、压缩、网络传输、落盘、排序、合并和反序列化。一个 group-by 或 join 的成本，常常主要来自 shuffle，而不是用户函数。
+\begin{learninggoals}
+学完本章后，读者应能完成八件事：
+\begin{enumerate}
+  \item 把第二卷的硬件、布局、并发、运行时、I/O 和分布式机制组合成一条端到端计算流水线。
+  \item 为日志统计项目定义串行 reference、输入身份、输出语义和错误合同。
+  \item 设计 map-side combine、shuffle manifest、reduce 去重和热点 key 拆分的工程边界。
+  \item 区分执行事实、存储事实和提交事实，解释为什么 manifest 是恢复权威。
+  \item 设计 task attempt、request id、deadline、retry budget 和 checkpoint，使响应丢失和 Driver 重启不会重复提交。
+  \item 输出能审查的 RunReport，包含 correctness、performance、resources、faults、recovery 和 unverified boundaries。
+  \item 按里程碑交付最终项目，而不是一次性堆出一个不可调试的大框架。
+  \item 说明本章项目如何为第三卷 CPU 推理引擎留下模型文件、tensor buffer、算子任务和服务化请求的系统接口。
+\end{enumerate}
+\end{learninggoals}
 
-优化 shuffle 的方向包括减少数据量、提前聚合、压缩、分区均衡、避免热点 key、使用本地磁盘顺序写和控制并发拉取。它是分布式版的数据布局问题。
+\section{最终系统的第一条主线：Reference 先行}
 
-Shuffle 的基本流程可以拆成 map 端分区、局部排序或缓冲、落盘、网络拉取、reduce 端合并。每一步都有独立瓶颈：序列化消耗 CPU，压缩节省网络但增加计算，落盘受磁盘带宽影响，拉取并发过高会压垮对端，key 倾斜会让少数 reduce 任务变成长尾。优化 shuffle 不能只调一个参数，要先确认慢在哪一步。
+任何分布式计算项目都要先有可验证 reference。Reference 可以慢，但必须定义语义：输入格式是什么，坏行如何处理，key 如何规范化，计数类型是否溢出，输出顺序是否稳定，错误摘要如何记录。没有 reference，后面的线程池、shuffle、重试、checkpoint 和热点优化都没有正确性锚点。
 
-\section{检查点、幂等和容错}
+\topic{日志记录和输出语义}
+教学项目可以从固定字段日志开始：timestamp、user id、event type 和 value。Reference 单线程读取全部输入，跳过或记录坏行，按 event type 累加 value，最后按 event type 排序输出。优化版本可以改变布局、并行方式、shuffle 方式和写出方式，但不能改变这份语义。
 
-长任务必须考虑失败。检查点保存中间状态，让失败后从最近点恢复，而不是从头开始。检查点太频繁会拖慢正常路径，太稀疏会增加恢复成本。流式计算还要处理 exactly-once 或 at-least-once 语义。
-
-检查点设计要说明一致性边界。批处理任务可以在 stage 边界保存输出，失败后重跑某个分区；流式任务需要同时保存输入 offset、算子状态和输出提交位置。若只保存算子状态，不保存已经输出到哪里，恢复后可能重复输出；若只保存 offset，不保存状态，聚合结果会丢失。所谓 exactly-once 往往不是“消息真的只执行一次”，而是通过幂等提交、事务输出或去重让外部效果等价于一次。
-
-\topic{观测性}
-没有观测性，分布式系统无法维护。日志、指标、trace、profile 和事件审计要能回答：请求经过哪些节点，在哪里等待，重试了几次，队列多长，哪个分片慢，哪个任务倾斜，哪次部署引入变化。
-
-观测性要围绕问题设计。延迟问题需要端到端 trace 和每段耗时；吞吐问题需要输入速率、处理速率和队列长度；倾斜问题需要按 key、分片、worker 的分布；可靠性问题需要错误码、重试、超时和恢复路径；资源问题需要 CPU、内存、磁盘、网络和 GC 或分配器指标。只打印一行“任务失败”没有工程价值。
-
-\topic{从单机原则到集群原则}
-第二册前面讲的原则在分布式系统中仍然成立。局部性对应数据本地调度；锁竞争对应热点 key；false sharing 对应多个任务争用同一分片；背压对应限流和队列控制；归约对应 map-side combine 和树形聚合；缓存一致性对应复制一致性和失效策略。系统规模变大，原则没有消失，只是成本单位从 cache line 变成网络消息和磁盘块。
-
-\topic{一个贯穿工程案例}
-考虑一个日志统计系统：输入日志按文件分片放在多台机器上，每个 worker 读取本地分片，解析出 key，先做本地 hash 聚合，再把 partial 按 key 分区 shuffle 到 reduce worker，最后合并并写出结果。这个系统把第二册几乎所有原则串在一起。本地解析要考虑 CPU 和内存布局，本地聚合要避免锁热点，shuffle 要处理网络和背压，reduce 要处理 key 倾斜，输出要保证幂等，失败后要能从检查点恢复。
-
-如果某个 key 特别热，单机里它像一个热点锁，分布式里它像一个热点分片。解决方法也相似：先把热点拆成多个局部 partial，再在后续阶段合并。若网络拉取过多，像单机任务队列无背压一样，系统会排队爆炸。若 worker 失败后重跑，输出必须用任务 ID 和分区 ID 保证幂等提交。这样的案例比孤立讲术语更能训练系统思维。
-
-\begin{keyidea}
-分布式计算不是单机计算的替代，而是单机计算原则在通信、故障和复制约束下的扩展。
-\end{keyidea}
-
-\section{贯穿项目架构}
-
-Compute Systems Engine 在第二册最后要变成一个本机可运行的分布式计算模拟。它不追求替代 Spark 或 Flink，而是把前面章节的核心原则压进一个可测、可失败、可恢复的小系统。输入是一批日志记录，map worker 读取本地分片并解析 key，map 端先做本地聚合，shuffle 把 partial 按 key 分发给 reduce partition，reduce worker 合并结果，driver 负责任务分配、attempt、检查点和最终提交。
-
-这个项目的价值在于贯穿。顺序 reference 来自第一批归约；数据布局来自热字段和冷字段分离；SIMD 和 map 内核用于解析和过滤；scan 和 partition 用于分配 shuffle 输出；bounded queue 和背压用于阶段之间限流；线程池和任务图用于本机执行；幂等和 request id 用于重试；检查点用于恢复；观测性用于解释慢在哪里。它把整本书的机制串成同一个可运行系统。
-
-\topic{数据格式和 reference}
-任何分布式项目都要先有可验证 reference。日志记录可以简化成三列：timestamp、user id、event id。reference 单线程读取全部输入，按 event id 计数，输出排序后的计数结果。分布式模拟的最终输出必须和 reference 一致。只有 reference 清楚，后面的重试、分区、合并和检查点才有正确性锚点。
-
-\begin{lstlisting}[language=C++,caption={日志记录和聚合结果的简化类型}]
+\begin{lstlisting}[language=C++,caption={Reference 使用的稳定数据合同}]
 struct LogRecord {
- std::uint64_t timestamp = 0;
- std::uint64_t user_id = 0;
- std::int32_t event_id = 0;
+  std::uint64_t timestamp = 0;
+  std::uint64_t user_id = 0;
+  std::uint32_t event_type = 0;
+  std::int64_t value = 0;
 };
 
 struct EventCount {
- std::int32_t event_id = 0;
- std::int64_t count = 0;
+  std::uint32_t event_type = 0;
+  std::int64_t total = 0;
 };
 \end{lstlisting}
 
-这里用明确位宽类型，是为了让文件格式、网络消息和内存布局都可解释。真实系统还会处理字符串、变长字段和 schema 版本，但教学项目先用固定字段，能把注意力放在计算和系统语义上。
+这段结构体是内存语义，不等于文件格式。文件格式可以是文本、二进制或列式块，但解析后必须进入稳定数据合同。若未来加入 schema 版本、字符串 key 或变长字段，也要先扩展 reference，再扩展优化路径。
 
-\topic{Map 端本地聚合}
-朴素 shuffle 会把每条日志都发送到 reduce 端。若一亿条日志中只有一万个 event id，这样会浪费大量网络和序列化成本。map-side combine 先在每个 worker 本地对 event id 计数，再发送 partial。这样发送量从“记录数”下降到“本地出现过的 key 数”。这是 reduce 原则在网络尺度上的应用。
-
-本地聚合可以用哈希表，也可以在 event id 范围小且密集时用数组。哈希表适合稀疏 key，但有随机访问、分配和 rehash 成本；数组适合密集小 key，连续且容易向量化，但 key 空间大时浪费内存。教材项目可以同时保留两种策略，让读者根据 key 分布选择。
-
-\topic{Shuffle 文件和网络缓冲}
-真实 shuffle 常把 map 输出按 partition 写成多个缓冲或文件。每个 reduce partition 拉取属于自己的数据。即使本机模拟，也可以按 partition 组织缓冲：map worker 产生 \code{partition_id -> partials}，message bus 按 partition 投递给 reduce worker。这样读者能看到 shuffle 的核心结构，而不用先搭真实网络。
-
-Shuffle 的成本包括序列化、压缩、缓冲、落盘、发送、接收和合并。每一步都可以成为瓶颈。压缩减少网络字节但增加 CPU；落盘提高容错但增加 I/O；内存缓冲快但可能 OOM；并发拉取提高吞吐但可能压垮 map 端。优化前必须先记录每一步的字节数和耗时。
-
-\topic{Reduce 端合并和热点 key}
-Reduce 端收到多个 map worker 的 partial 后，按 key 合并。若 key 分布均匀，每个 reduce partition 工作量接近；若某个 key 极热，它所在 partition 会成为长尾。热点 key 的处理通常要二级聚合：先把热 key 拆成多个子分区，让多个 reduce worker 合并 partial，再把这些结果做最后合并。
-
-这和单机 sharded counter 完全对应。全局 hot key 就像全局原子计数器；map-side combine 是线程本地 partial；热 key 拆分是 sharded counter；最终合并是读取总数。第二册前面的并发原则在这里直接变成分布式算法。
-
-\topic{任务 attempt 和幂等输出}
-分布式任务可能失败重试，因此一个逻辑 task 可能有多个 attempt。输出提交必须按逻辑 task 去重，不能让两个 attempt 都提交成功。常见做法是每个 task 输出到 attempt 临时位置，完成后由 driver 或 commit protocol 原子地把某个 attempt 标记为成功。其他 attempt 即使晚完成，也不能覆盖已提交结果。
-
-\begin{lstlisting}[language=C++,caption={任务提交元数据}]
-enum class TaskState : std::int32_t {
- Pending,
- Running,
- Committed,
- Failed,
-};
-
-struct TaskAttempt {
- std::uint64_t task_id = 0;
- std::uint32_t attempt = 0;
- TaskState state = TaskState::Pending;
-};
-\end{lstlisting}
-
-这个模型同样适用于本机模拟。worker 完成后发送 commit 请求，driver 检查 task id 是否已经 committed。若没有，则提交该 attempt；若已经提交，则丢弃重复结果并记录 duplicate attempt。这个机制训练 exactly-once 外部效果的基本思想。
-
-\topic{检查点的内容}
-检查点不能只保存“程序运行到第几步”。对于日志统计系统，检查点至少应包含输入分片进度、已完成 map task、shuffle 输出位置、reduce partition 状态、已提交输出和请求去重表。缺少任何一项，恢复后都可能漏处理或重复输出。
-
-检查点频率要权衡。每处理一条记录就 checkpoint，正常路径太慢；只在最后 checkpoint，失败恢复成本太高。批处理可以在 stage 边界 checkpoint，例如 map 输出全部完成后记录 shuffle manifest，reduce 输出提交后记录最终结果。流式系统则需要周期性 checkpoint，并把输入 offset、状态和输出提交绑定。
-
-\topic{Exactly once 的工程含义}
-Exactly once 常被误解成“每条消息真的只执行一次”。在真实系统中，消息可能重复，任务可能重跑，函数可能执行多次。工程上追求的是外部效果等价于一次：重复执行被幂等提交、去重表或事务输出吸收。理解这点非常重要，否则读者会在网络不可靠时追求不可能的语义。
-
-对于日志统计，若同一个 map attempt 输出被 reduce 合并两次，计数会翻倍。解决方法是 reduce 端按 \code{task_id, attempt} 或 logical map id 去重，或者 driver 只让一个 attempt 的输出进入 manifest。提交协议要定义清楚哪些输出属于最终结果，哪些只是临时文件。
-
-\topic{调度和数据本地性}
-Driver 调度 map task 时，应优先把任务放到拥有输入分片的 worker；若本地 worker 忙或失败，可以远程调度。Reduce task 则按 partition 分配，尽量让同一 partition 的数据由同一个 worker 合并，减少跨节点状态移动。若某个 reduce partition 太大，可以拆分或引入二级 reduce。
-
-调度还要考虑 speculative execution。若某个 task 明显慢，可以启动另一个 attempt。第一个完成并提交的 attempt 获胜，另一个 attempt 的结果丢弃。Speculation 能处理慢节点，但会增加资源消耗和重复输出风险。没有幂等提交，不应开启 speculation。
-
-\topic{背压贯穿 shuffle}
-Shuffle 最容易出现过载。Map 端产生数据太快，reduce 端处理不过来，网络缓冲和队列增长。正确做法是让 reduce 端容量反馈到 map 端：每个 reduce partition 有接收队列容量，队列满时 map 端暂停、降低发送速率或批量合并。若 map 端无限发送，最终只是把 OOM 从一个节点转移到另一个节点。
-
-背压指标包括每个 partition 的队列长度、入站字节率、处理字节率、拒绝或 busy 次数、map 端等待时间和端到端延迟。没有这些指标，shuffle 慢时只能猜。第 15 章的有界队列实验在这里变成跨 worker 流控。
-
-\topic{观测性设计}
-一个可维护的分布式计算系统至少要回答七个问题：哪个 stage 慢，哪个 task 慢，哪个 worker 慢，哪个 partition 数据最多，哪个 key 最热，重试发生在哪里，输出提交是否重复。指标要按 stage、worker、partition、task attempt 和 key 分布聚合。
-
-日志要包含 task id、attempt、partition、request id 和错误码。Trace 要能从 driver 调度追到 worker 执行、shuffle 发送、reduce 合并和输出提交。Profile 要能分辨 CPU 解析、hash 聚合、序列化、压缩、网络等待和磁盘写入。观测性不是最后加的，它决定系统是否能被调试。
-
-\topic{故障注入}
-没有故障注入的分布式系统测试是不完整的。项目应主动注入：随机丢消息、延迟消息、重复消息、让 worker 中途失败、让 reduce 队列变慢、让某个 key 极热、让磁盘写入失败、让 commit 响应丢失。每个故障都应有预期行为：重试、去重、背压、恢复或明确失败。
-
-故障注入要可重复。使用固定随机种子，记录注入事件，失败时能重放。否则低概率 bug 很难定位。系统工程的测试不只看 happy path，更要让失败路径成为日常。
-
-\topic{本机模拟实现路线}
-第一阶段，只实现串行 reference 和单进程多 worker 模拟。输入切成分片，worker 本地聚合，driver 合并所有结果。第二阶段，加入 shuffle partition，每个 map worker 把 partial 发到 reduce partition 队列。第三阶段，加入 request id 和 attempt，支持重复消息去重。第四阶段，加入 checkpoint manifest，失败后从 manifest 恢复。第五阶段，加入热点 key 拆分和背压。
-
-每阶段都保留测试。第一阶段测试结果正确；第二阶段测试 partition 后结果仍一致；第三阶段测试重复消息不重复计数；第四阶段测试崩溃恢复；第五阶段测试热点和过载下系统不会无限排队。这样项目逐步长大，不会变成一次性堆代码。
-
-\topic{端到端 reference}
-分布式计算项目必须先有端到端 reference。对日志统计来说，reference 可以是单线程读取所有记录，解析出 key，然后用一个 map 聚合计数，最后按 key 排序输出。它不追求性能，只定义语义：哪些行有效，解析失败如何处理，key 如何规范化，计数类型是什么，输出顺序如何确定。后续 map-side combine、shuffle、reduce、热点拆分和重试都要和它对比。
-
-Reference 还要固定输入格式。不要一边开发分布式执行器，一边让输入格式隐式变化。可以定义每行包含 timestamp、user id、event type 和 value；解析失败的行进入错误计数；event type 作为聚合 key；value 使用 \code{std::int64_t} 累加。若后续加入更多字段，也要版本化。计算系统项目不是只练线程和网络，也要练数据合同。
-
-\begin{lstlisting}[language=C++,caption={日志记录的教学格式}]
-struct LogRecord {
- std::uint64_t timestamp = 0;
- std::uint64_t user_id = 0;
- std::uint32_t event_type = 0;
- std::int64_t value = 0;
-};
-\end{lstlisting}
-
-这段结构体用于内存中的解析结果，不等于文件格式。文件格式可以是文本或二进制，但解析后进入稳定内存结构。所有优化版本都以同样的 \code{LogRecord} 或等价列式布局作为输入，避免把解析差异误当成执行器差异。
-
-\topic{输入分片和 offset}
-按文件分片时，不能随意从字节中间开始解析一行。若每个 worker 负责文件字节范围，分片边界要调整到行边界：非零 begin 先跳到下一行起点，end 可以读到当前行结束。每个分片记录文件名、begin offset、end offset 和分片 ID。这样失败恢复时可以重新读取同一范围。
-
-如果输入是二进制块，分片边界要按记录格式对齐。若记录变长，就需要索引或块目录。不要把“把文件切成 N 份”说得过于简单。分片正确性决定每条记录是否恰好处理一次。漏一行和重复一行都会让最终计数错误。
+\topic{输入身份}
+输入 split 不能只是“第几个任务”。它要能定位字节范围和恢复边界。文本文件按字节切分时，非零 begin 要跳到下一行起点；end 可以读到当前行结束；错误记录要能回到 file id、offset 和 record id。若每次运行都无法证明处理的是同一批字节，benchmark 和恢复报告都不可信。
 
 \begin{lstlisting}[language=C++,caption={输入分片元数据}]
 struct InputSplit {
- std::uint64_t split_id = 0;
- std::uint64_t file_id = 0;
- std::uint64_t begin_offset = 0;
- std::uint64_t end_offset = 0;
+  std::uint64_t split_id = 0;
+  std::uint64_t file_id = 0;
+  std::uint64_t begin_offset = 0;
+  std::uint64_t end_offset = 0;
+  std::uint64_t input_checksum = 0;
 };
 \end{lstlisting}
 
-\code{split_id} 是逻辑任务 ID 的基础。即使 attempt 重试，\code{split_id} 不变。输出提交时按 \code{split_id} 去重，而不是按 attempt 去重。这个原则贯穿整个项目。
+\code{split_id} 是逻辑 task 的基础。Attempt 重试时 \code{split_id} 不变，物理执行变的是 \code{attempt}。这个区分贯穿全章：逻辑身份决定语义，物理 attempt 只是实现路径。
 
-\topic{Map-side combine 的内存设计}
-Map worker 不应每读一条记录就发一条网络消息。它应在本地按 key 聚合，形成 partial map，再按 reduce partition 输出。这样减少网络消息数量和字节数，也把热点 key 的一部分压力留在本地。Map-side combine 是分布式版的线程本地 partial。
+\section{端到端架构：控制面和数据面分开}
 
-本地聚合的数据结构要根据 key 空间选择。event type 如果是小整数，可以使用 vector buckets；如果 key 是字符串或大整数，可能使用哈希表；如果输入已经按 key 排序，可以顺序合并。教材项目可以从小整数 key 开始，后续扩展到字符串 key。无论使用哪种结构，都要记录内存峰值和 key 数量，否则大输入可能让 map 端内存失控。
+Compute Systems Engine 的架构可以分成两条路径。数据面搬运和处理大块数据：读取 split、解析 batch、本地 combine、写 shuffle block、reduce 合并。控制面维护小而关键的事实：task 状态、attempt、manifest、checkpoint、route epoch、retry budget 和 recovery audit。控制面决定哪些数据有效，数据面负责高吞吐处理。
 
-\begin{lstlisting}[language=C++,caption={小整数 key 的本地聚合}]
+\begin{systemdiagram}{最终引擎：数据面搬运大块，控制面定义有效性}
+\begin{pdfdiagram}
+\node[book title label] at (0,1.05) {数据面};
+\node[book data,text width=1.75cm] (input) at (0,0.42) {InputSplit};
+\node[book data,text width=1.75cm] (parse) at (2.0,0.42) {HotBatch};
+\node[book data,text width=1.75cm] (combine) at (4.0,0.42) {local\\combine};
+\node[book data,text width=1.75cm] (shuffle) at (6.0,0.42) {Shuffle\\Block};
+\node[book data,text width=1.75cm] (reduce) at (8.0,0.42) {Reduce\\Output};
+
+\node[book title label] at (0,-1.05) {控制面};
+\node[book state,text width=1.75cm] (task) at (0,-1.68) {Task\\Attempt};
+\node[book amber node,text width=1.75cm] (bus) at (2.0,-1.68) {Message\\Envelope};
+\node[book amber node,text width=1.75cm] (commit) at (4.0,-1.68) {Commit\\Record};
+\node[book purple node,text width=1.75cm] (manifest) at (6.0,-1.68) {Manifest};
+\node[book state,text width=1.75cm] (checkpoint) at (8.0,-1.68) {Checkpoint};
+
+\draw[book strong arrow] (input) -- (parse);
+\draw[book strong arrow] (parse) -- (combine);
+\draw[book strong arrow] (combine) -- (shuffle);
+\draw[book strong arrow] (shuffle) -- (reduce);
+\draw[book strong arrow] (task) -- (bus);
+\draw[book strong arrow] (bus) -- (commit);
+\draw[book strong arrow] (commit) -- (manifest);
+\draw[book strong arrow] (manifest) -- (checkpoint);
+\draw[book dashed arrow] (shuffle) -- (manifest);
+\draw[book dashed arrow] (reduce) -- (manifest);
+
+\node[book label,text width=8.8cm] at (4.0,-3.08) {数据面可以重做、重发、重读；控制面决定哪个 attempt 的哪个 block 对下游可见。最终系统的恢复能力来自这条边界。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：最终计算引擎不是一个大函数，而是数据面和控制面共同维护的状态机。}
+\end{systemdiagram}
+
+\topic{模块边界}
+Parser 接收 \code{InputSplit}，输出 batch 和错误摘要；它不提交结果。Kernel 接收热字段 span，输出本地 partial；它不理解重试。Partitioner 接收 partial，输出按 partition 分组的 block；它不写 manifest。I/O 层负责临时文件、buffer 生命周期、短写和 checksum；它不决定业务生效。Driver 维护 task table、retry、commit 和 checkpoint；它不解析每行日志。MessageBus 传递消息和故障事件；它不决定业务成功。
+
+边界清楚不是为了目录好看，而是为了事故时能定位责任。若 Parser 直接写 manifest，解析错误会污染提交语义；若 I/O completion handler 直接提交业务结果，短写和迟到 completion 会绕过状态表；若 Runtime 理解业务 key，任务运行时就无法复用到后续推理引擎。
+
+\topic{目录建议}
+项目可以按责任组织：\filepath{engine/model} 放稳定 ID 和消息结构；\filepath{engine/reference} 放串行 reference；\filepath{engine/input} 放 split 和解析；\filepath{engine/kernel} 放 combine、filter、partition；\filepath{engine/runtime} 放队列、线程池和任务图；\filepath{engine/io} 放可靠写和 block 校验；\filepath{engine/driver} 放 task 状态、manifest 和 checkpoint；\filepath{engine/fault} 放故障注入；\filepath{engine/report} 放 RunReport。
+
+\section{Map、Combine、Shuffle 和 Reduce}
+
+朴素 shuffle 会把每条记录都发给 reduce。若一亿条日志只有一万个 event type，这样会浪费大量网络、序列化和写盘成本。Map-side combine 先在每个 worker 本地按 key 聚合，再把 partial 发给 reduce。发送量从记录数下降到本地出现过的 key 数。这是第 13 章 reduce 原则在网络尺度上的应用。
+
+\topic{本地聚合策略}
+如果 event type 是小范围整数，可以用连续数组，内存访问规则、容易向量化；如果 key 稀疏或是字符串，可以用哈希表，但要承担随机访问、分配和 rehash 成本；如果输入已经按 key 排序，可以顺序合并。项目报告不应只写“用了哈希表”，而要记录 key 基数、最大 bucket、combine ratio、内存峰值和输出 block 数量。
+
+\begin{lstlisting}[language=C++,caption={小整数 key 的本地 combine}]
 std::vector<std::int64_t> combine_events(
- std::span<const LogRecord> records,
- std::uint32_t event_type_count) {
- std::vector<std::int64_t> partial(event_type_count, 0);
- for (const LogRecord& record : records) {
- partial[record.event_type] += record.value;
- }
- return partial;
+    std::span<const LogRecord> records,
+    std::uint32_t event_type_count) {
+  std::vector<std::int64_t> partial(event_type_count, 0);
+  for (const LogRecord& record : records) {
+    if (record.event_type < event_type_count) {
+      partial[record.event_type] += record.value;
+    }
+  }
+  return partial;
 }
 \end{lstlisting}
 
-生产代码要检查 \code{event_type} 越界，并处理解析错误。教学片段突出 combine 思想。局部聚合后的数据再按 partition 打包，发送给 reduce。
+真实项目不能静默忽略越界 event type。教学片段只突出 combine 结构；生产版应把非法 key 进入错误摘要，并让 reference 和优化路径共享同一错误合同。
 
-\topic{Shuffle 文件和消息}
-Shuffle 可以走内存消息，也可以写本地文件再由 reduce 拉取。内存消息简单，适合本机模拟；文件 shuffle 更接近大规模批处理，因为中间数据可能超过内存，也需要失败恢复。无论哪种方式，都要有 manifest 描述哪些 map 输出存在、属于哪个 partition、来自哪个 attempt、大小和校验是什么。
+\topic{ShuffleBlock 和 Manifest}
+Shuffle 可以先用本机内存队列模拟，也可以写本地文件再由 reduce 拉取。无论哪种方式，都要有 manifest 描述哪些 block 有效。Reduce 不应扫描临时目录，也不应接受 MessageBus 里随机到达的所有 partial。它只读取 manifest 接受的 block。
 
-Manifest 是控制面，shuffle 数据是数据面。Reduce 不应扫描目录猜哪些文件有效，而应读取 driver 提交的 manifest。这样重复 attempt 产生的临时文件不会被误读；失败 attempt 的残留文件也不会进入结果。控制面决定有效数据集合，是 exactly-once 外部效果的关键。
-
-\begin{lstlisting}[language=C++,caption={Shuffle manifest 条目}]
+\begin{lstlisting}[language=C++,caption={Shuffle block 和 Manifest entry}]
 struct ShuffleBlock {
- std::uint64_t map_task_id = 0;
- std::uint32_t attempt = 0;
- std::uint32_t reduce_partition = 0;
- std::uint64_t byte_size = 0;
- std::uint64_t checksum = 0;
+  std::uint64_t block_id = 0;
+  std::uint64_t map_task_id = 0;
+  std::uint32_t attempt = 0;
+  std::uint32_t reduce_partition = 0;
+  std::uint64_t byte_size = 0;
+  std::uint64_t checksum = 0;
+};
+
+struct ManifestEntry {
+  std::uint64_t generation = 0;
+  std::uint64_t logical_task_id = 0;
+  std::uint32_t accepted_attempt = 0;
+  ShuffleBlock block;
 };
 \end{lstlisting}
 
-真实系统还会记录文件路径、压缩格式、记录数、写入时间和副本位置。教学项目至少要有 map task、attempt、partition、大小和 checksum。恢复时，driver 读取 manifest 后校验每个 block 是否存在且摘要匹配。
+Manifest entry 是提交事实。临时文件存在只是存储事实；worker 返回 Ok 只是执行事实；只有 manifest 接受某个 logical task 的某个 attempt，下游才允许读取对应 block。这个规则是最终项目可靠性的中心。
 
 \topic{Reduce 端去重}
-Reduce 端不能简单地把收到的每条 partial 都加进去。若 map attempt 因响应丢失而重试，reduce 可能收到两个内容相同的 partial。正确策略是按逻辑 map task 去重，或者只接受 manifest 中被 driver 选中的 attempt。若 reduce 直接接收推送消息，也要维护已处理 request id 或 map task id 集合。
+Reduce 端最危险的错误是重复合并同一个 logical map task。Attempt 0 写出后响应丢失，Attempt 1 重试并提交；如果 Reduce 扫描目录，它会把两个 block 都读进去，计数翻倍。正确策略是 reduce 根据 manifest 拉取已接受 attempt，或按 logical task 去重。按 attempt 去重不够，因为不同 attempt 仍可能属于同一个 logical task。
 
-去重的粒度要慎重。按 attempt 去重只能防止同一 attempt 重复发送，不能防止不同 attempt 的同一逻辑 task 重复合并。按 map task id 去重能保证一个逻辑输入分片只贡献一次，但要处理 attempt A 部分发送后失败、attempt B 重试成功的情况。更稳的做法是 attempt 输出先写临时 block，driver 只在完整成功后把某个 attempt 加入 manifest，reduce 根据 manifest 拉取。
+\topic{热点 key}
+如果某个 key 占输入 90\%，普通 hash partition 会让一个 reduce partition 长尾。第一层优化是 map-side combine，减少重复传输；第二层是热 key 拆成多个执行子 key，分给多个 reduce；第三层再做二级 reduce，把子 key 合回业务 key。子 key 是执行身份，不是业务身份。Manifest 和 RunReport 要记录 hot route version、subkey count、final merge checksum 和二级合并成本。
 
-\topic{输出提交协议}
-最终输出也需要提交协议。Reduce task 不应直接写最终文件名，因为失败重试可能留下半文件，多个 attempt 可能互相覆盖。常见做法是每个 attempt 写到临时路径，写完并校验后向 driver 提交。Driver 检查该 reduce partition 是否已经提交；若未提交，原子发布该 attempt 的输出；若已提交，拒绝重复 attempt 并清理临时文件。
+\section{Attempt、提交事实和恢复权威}
 
-在本地文件系统里，可以用 rename 模拟原子发布。跨对象存储或分布式文件系统时，rename 语义可能不同，需要专门 commit protocol。教材项目可以先用本地目录，但必须在文字中说明提交点：只有 driver manifest 记录的输出才是有效最终结果，临时文件不是。
+最终项目必须让读者区分三种事实。执行事实：某个 worker 是否做过某次 attempt。存储事实：某个 block 是否存在且 checksum 正确。提交事实：下游是否允许把这份结果计入最终输出。系统可以有多个执行事实和多个存储事实，但每个 logical task 只能有一个提交事实。
 
-\topic{Checkpoint 内容清单}
-本项目 checkpoint 至少包含六类内容。第一，输入 splits 和每个 split 的任务状态。第二，map attempt 和已提交 shuffle block manifest。第三，reduce partition 的状态和已提交输出。第四，路由或 partition 版本。第五，请求去重表或其可恢复摘要。第六，作业配置和输入数据摘要。缺少作业配置，恢复后可能用不同 reduce 数重新解释旧 shuffle；缺少去重表，重复消息可能再次生效。
+\begin{systemdiagram}{执行事实、存储事实和提交事实不能混淆}
+\begin{pdfdiagram}
+\node[book title label] at (0,0.78) {执行事实};
+\node[book title label] at (3.25,0.78) {存储事实};
+\node[book title label] at (6.5,0.78) {提交事实};
 
-Checkpoint 还要有版本。项目代码升级后，旧 checkpoint 如何读取？教学阶段可以要求版本不兼容时拒绝恢复，并提示重新运行。成熟系统需要迁移工具。不要把 checkpoint 当作临时 dump，它是持久化协议。
+\node[book amber node,text width=2.35cm] (a0) at (0,0) {attempt 0\\worker done};
+\node[book data,text width=2.35cm] (b0) at (3.25,0) {tmp block A\\checksum ok};
+\node[book red node,text width=2.35cm] (lost) at (6.5,0) {reply lost\\not committed};
 
-\topic{故障注入驱动开发}
-分布式项目应从一开始就有故障注入，而不是最后补测试。每个阶段都加入一个最小故障。Map 阶段加入任务失败重试；shuffle 阶段加入重复消息；manifest 阶段加入响应丢失；reduce 阶段加入慢 partition；checkpoint 阶段加入 driver 重启。这样协议随功能一起成长。
+\node[book amber node,text width=2.35cm] (a1) at (0,-1.45) {attempt 1\\worker done};
+\node[book data,text width=2.35cm] (b1) at (3.25,-1.45) {tmp block B\\checksum ok};
+\node[book purple node,text width=2.35cm] (m1) at (6.5,-1.45) {manifest\\accept B};
 
-故障注入要可配置。可以在 MessageBus 中按 request id 决定是否丢弃，也可以在 worker 执行到某个 split 时故意失败。随机故障用于压力测试，确定性故障用于单元测试。单元测试应能精准复现“attempt A 写完但提交响应丢失，attempt B 后完成”这种场景。
+\draw[book strong arrow] (a0) -- (b0);
+\draw[book weak arrow] (b0) -- (lost);
+\draw[book strong arrow] (a1) -- (b1);
+\draw[book strong arrow] (b1) -- (m1);
+\draw[book back arrow] (b0) -- (m1);
 
-\topic{热点 key 实验设计}
-热点 key 实验不能只说“构造倾斜输入”。要定义分布。例如 90\% 的记录使用 event type 1，其余 10\% 均匀分布到其他 key。运行普通 hash partition，记录每个 reduce partition 的输入字节、记录数、处理时间和队列等待。然后启用 map-side combine，再启用热 key 拆分和二级 reduce，对比长尾是否下降。
+\node[book label,text width=8.1cm] at (3.25,-2.9) {Attempt 0 可以真实执行过，block A 也可以真实存在，但它没有进入 manifest。恢复和 reduce 只能相信提交事实。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：最终结果由 manifest 决定，不由目录扫描或 worker 成功响应决定。}
+\end{systemdiagram}
 
-还要记录网络流量。Map-side combine 可能大幅减少消息数；热 key 拆分可能增加最终二级合并流量，但降低第一阶段长尾。报告要解释总吞吐、尾延迟和资源消耗之间的取舍。不要只写“热点拆分更快”，要说明在哪个阶段更快，代价是什么。
+\topic{状态表}
+最小状态表可以分四类。Task table 保存逻辑任务：task id、stage id、current attempt、deadline、retry budget、state。Attempt table 保存物理执行：attempt、worker id、start、finish、reply state、candidate block。Block table 保存存储事实：block id、path、bytes、checksum、write state、orphan reason。Manifest table 保存提交事实：logical task、accepted attempt、accepted block、generation。
 
-\topic{数据倾斜和任务倾斜}
-数据多不一定任务慢，任务慢也不一定数据多。某些 key 处理逻辑复杂，某些记录解析成本高，某些分区落在慢节点，某些节点 I/O 慢。观测性要区分数据倾斜和执行倾斜。每个 task 记录输入记录数、输入字节、输出字节、CPU 时间、排队时间、重试次数和所在 worker。只有这样，慢任务才能归因。
-
-调度策略也不同。数据倾斜可以通过重新分区、热点拆分和二级聚合处理；执行倾斜可能需要 speculative execution、节点隔离或资源调整；I/O 倾斜可能需要数据本地性和预取；解析倾斜可能需要改变输入格式。系统工程不能把所有慢都归为“节点慢”。
-
-\topic{资源隔离}
-分布式计算作业里，map、shuffle、reduce、checkpoint 和指标上报共享 CPU、内存、磁盘和网络。若 shuffle 发送占满网络，checkpoint 可能超时；若 reduce 哈希表占满内存，map 输出队列可能 OOM；若指标日志太多，磁盘写入干扰输出提交。资源隔离要明确每个阶段的上限。
-
-本机模拟可以用简单参数表达：每个 reduce partition 最大队列字节数，map 端最大 in-flight shuffle 字节数，每个 worker 最大本地聚合内存，checkpoint 写入频率和并发数。达到上限时触发背压，而不是继续申请内存。资源上限是系统稳定性的组成部分。
-
-\topic{压缩和编码}
-Shuffle 数据常需要压缩。压缩减少网络和磁盘字节，增加 CPU。若 reduce 端是网络瓶颈，压缩有益；若 map 端 CPU 已满，压缩可能变慢。编码也类似：小整数 key 可以用定长数组，稀疏 key 可以用 varint 或字典，字符串 key 可以先 intern 成 ID。压缩格式要进入 manifest，否则恢复和跨版本读取会出错。
-
-实验应比较无压缩、轻量压缩和更强压缩。指标包括 map CPU 时间、shuffle 字节、reduce 解压时间、端到端时间和内存峰值。不要把压缩当作固定开关，要让读者看到它是 CPU 与 I/O 的成本交换。
-
-\topic{本机到多机的迁移边界}
-本机模拟验证语义，但不能证明真实多机性能。迁移到多机时，会新增真实网络延迟、连接管理、序列化成本、内核缓冲、TLS、时钟漂移、节点故障和部署问题。模拟中一个队列 push 可能微秒级，真实 RPC 可能毫秒级；模拟中进程共享时钟，真实机器时钟不一致；模拟中磁盘路径可靠，真实对象存储有不同一致性语义。
-
-因此项目文档要把“已验证”和“未验证”分开。已验证：去重、manifest、提交协议、背压状态机、故障恢复逻辑。未验证：真实网络吞吐、跨机时钟、对象存储 commit、节点安全、部署滚动升级。成熟工程知道自己的证据边界。
-
-\topic{代码组织建议}
-Compute Systems Engine 应按责任分模块。reference 模块只做串行正确性。input 模块处理分片和解析。map 模块做本地聚合。shuffle 模块处理 partition、消息、manifest 和背压。reduce 模块合并 partial。driver 模块维护任务状态、attempt 和 checkpoint。fault 模块提供故障注入。metrics 模块记录指标。不要把所有逻辑写进一个 main 函数，否则后续实验无法扩展。
-
-接口要围绕数据合同，而不是围绕演示脚本。Map worker 接收 InputSplit，输出 ShuffleBlock；Reduce worker 接收 partition id 和 manifest blocks，输出 OutputBlock；Driver 只看 task id、attempt 和状态，不关心内部聚合代码。模块边界越清楚，故障注入和测试越容易。
-
-\topic{验收测试清单}
-本项目最终至少要有这些测试。串行 reference 与分布式模拟结果一致。输入分片覆盖每条记录一次。Map attempt 重试不会重复进入 manifest。Reduce 重复接收同一 block 不会重复计数。Driver 重启后能从 checkpoint 恢复。旧 route epoch 的消息被拒绝。Reduce 队列满时 map 端背压。热点 key 拆分后最终结果仍合并成原 key。输出提交只接受一个 attempt。损坏 block 校验失败并触发重试或作业失败。
-
-性能测试至少包括均匀输入、热点输入、大 key 空间、小 key 空间、慢 reduce、丢消息、重复消息和 checkpoint 频繁写入。每个测试都要有正确性 oracle。性能数字没有 correctness oracle，意义不大。
-
-\topic{项目报告结构}
-综合实验报告建议按固定结构。第一，语义：输入格式、输出格式、错误行处理、计数类型。第二，系统结构：driver、worker、message bus、manifest、checkpoint。第三，正确性：reference 对比、去重、提交点、恢复。第四，性能：各 stage 时间、队列长度、shuffle 字节、热点 key、重试次数。第五，故障注入：列出注入事件和系统行为。第六，限制：哪些只在本机模拟验证，哪些需要真实 Linux 多进程或多机验证。
-
-这样的报告训练的是系统工程表达能力。面试或工作中，真正有价值的不是说“我写了一个分布式计算框架”，而是能清楚说明语义、瓶颈、失败模式和证据边界。
-
-\topic{项目目录结构}
-贯穿项目应该有清晰目录，而不是所有代码堆在一个文件中。建议结构包括 \filepath{include/} 放公共接口，\filepath{src/input/} 放分片和解析，\filepath{src/kernels/} 放 map、filter、histogram、top-k，\filepath{src/runtime/} 放线程池、队列和任务图，\filepath{src/shuffle/} 放 partition、manifest 和消息，\filepath{src/driver/} 放 task 状态和 checkpoint，\filepath{src/fault/} 放故障注入，\filepath{tests/} 放单元和集成测试，\filepath{benchmarks/} 放性能实验。
-
-目录结构体现责任边界。Input 模块不应知道线程池内部锁；kernel 不应直接写 checkpoint；driver 不应解析每行日志；shuffle 不应决定业务 key 的含义。边界清楚，测试才能独立，后续第三册 AI 推理引擎也能复用 runtime、benchmark 和 I/O 模块。
-
-\topic{核心类型清单}
-项目可以先定义少量稳定类型。JobId、StageId、TaskId、AttemptId、PartitionId 使用明确位宽整数，避免随手用平台相关的整数类型。InputSplit 描述输入范围，MapOutput 描述 map 产生的 shuffle block，ReduceOutput 描述最终输出，TaskState 描述任务状态，Checkpoint 描述可恢复状态。这些类型是系统语言。
-
-\begin{lstlisting}[language=C++,caption={项目 ID 类型的形态}]
-struct JobId {
- std::uint64_t value = 0;
+\begin{lstlisting}[language=C++,caption={Task 和 attempt 的教学形态}]
+enum class TaskState : std::int32_t {
+  Pending,
+  Running,
+  Retrying,
+  Committed,
+  Failed,
 };
 
-struct TaskId {
- std::uint64_t value = 0;
+struct TaskRecord {
+  std::uint64_t task_id = 0;
+  std::uint32_t current_attempt = 0;
+  std::uint64_t deadline_ns = 0;
+  std::uint32_t retry_count = 0;
+  TaskState state = TaskState::Pending;
 };
 
-struct AttemptId {
- std::uint32_t value = 0;
-};
-
-struct PartitionId {
- std::uint32_t value = 0;
+struct AttemptRecord {
+  std::uint64_t task_id = 0;
+  std::uint32_t attempt = 0;
+  std::uint32_t worker_id = 0;
+  std::uint64_t candidate_block_id = 0;
+  bool reply_received = false;
 };
 \end{lstlisting}
 
-强类型 ID 可以防止把 partition id 误传成 worker id。C++ 中可以进一步定义比较和哈希。教学阶段即使只用简单 struct，也比裸整数更能表达语义。
+\topic{恢复顺序}
+恢复不是把旧进程内存复活。正确顺序是先读 manifest，确定哪些 logical task 已经外部生效；再读 checkpoint，恢复 job、stage、retry budget 和未完成任务；再扫描临时目录，把未被 manifest 引用的 block 标成 orphan candidate；最后重新调度 pending 或 uncertain task。若恢复程序先扫描目录并承认文件，就会把未提交 attempt 当成结果；若只读 checkpoint 而忽略 manifest，就会丢掉 commit 后崩溃的事实。
 
-\section{Driver、Worker 和 MessageBus}
+\section{可靠 I/O、Checkpoint 和 Backpressure}
 
-Driver 是控制面。它维护 job 状态、stage 状态、task attempt、manifest 和 checkpoint。一个 task 可以处于 pending、running、committed、failed、canceled。Attempt 是 task 的一次执行尝试，可以成功、失败或超时。Task committed 表示某个 attempt 的输出被接受，其他 attempt 的输出无效。
+最终项目的 I/O 层承接第 15 章：submit、completion 和 commit 必须分开。Worker 写出 block 时，先写临时文件，可靠写循环处理短写，完成后计算 checksum，再向 Driver 提交。Driver 接受后，manifest 才让 block 对 reduce 可见。短写、延迟 completion、取消后 completion、rename 前后崩溃，都应进入测试。
 
-Driver 的核心操作包括 schedule task、record attempt start、commit attempt、fail attempt、checkpoint、recover。每个操作都要幂等。比如 commit attempt 请求可能因为响应丢失被重复发送，driver 再次收到同一 attempt commit，应返回已经提交或重复，而不是再次添加 manifest。幂等不是只在 worker 端需要，控制面同样需要。
+\topic{Checkpoint 内容}
+Checkpoint 保存控制面，不复制所有大数据。至少包含 job id、stage 状态、task table、manifest generation、retry budget、route epoch、输入身份和 idempotency 摘要。Shuffle block 本身可以留在数据面，只要有稳定路径、bytes、checksum 和 manifest 引用。Checkpoint 小而强，block 大而可校验，这就是控制面和数据面分离在最终项目里的落地。
 
-\topic{Worker 执行模型}
-Worker 从 driver 获取 task，读取 input split，执行 map-side combine，写 shuffle block，发送 commit。Worker 本身不决定最终输出是否有效，它只产生 attempt output。Worker 可以失败、超时或被取消。Worker 重启后，不应依赖内存中旧状态决定提交；有效性由 driver manifest 和 checkpoint 决定。
+\topic{Backpressure 贯穿流水线}
+读取、解析、map combine、shuffle 写出、reduce 合并和 manifest commit 都可能成为瓶颈。每个阶段都要有有界队列或资源窗口：input queue、in-flight shuffle bytes、buffer pool、reduce partition queue、checkpoint writer。队列满时，上游应等待、降速、合并或返回 Busy，而不是无限分配内存。RunReport 要记录 high watermark、busy count、wait time 和 dropped/late events。
 
-Worker 也要有本地资源限制：最大本地聚合内存、最大 in-flight shuffle 字节、最大输出临时文件数、最大并行 task 数。没有限制，单个 worker 可能因为热点 key 或慢 reduce OOM。资源限制触发背压或任务失败，driver 再调度。
+\topic{资源预算}
+最终项目不是某个函数最快，而是在资源预算内稳定完成工作。预算包括线程数、队列容量、buffer pool bytes、临时文件数、in-flight requests、checkpoint frequency 和 retry count。若吞吐提升伴随内存无限增长，不能算成功；若平均延迟下降但 p99 和 recovery cost 爆炸，也要写入报告。
 
-\topic{MessageBus 接口}
-本机 MessageBus 可以先提供 send 和 poll completion。send 接受 LocalMessage，可能返回 accepted、busy、closed；poll 返回已完成消息或超时。故障注入在 MessageBus 内部进行：延迟、丢弃、重复、乱序。这样 worker 和 driver 不直接调用随机故障逻辑，测试可以统一控制。
+\section{故障注入和 RunReport}
 
-MessageBus 还应记录指标：发送消息数、丢弃数、重复数、busy 次数、队列最大长度、平均延迟和超时数。分布式系统的网络层必须可观测，否则上层只会看到任务慢，不知道是网络、reduce 还是 driver。
+没有故障注入的分布式计算项目只证明 happy path。最终项目应把故障注入当作一等模块，而不是调试脚本。故障规则要有 id、匹配条件、触发次数和 action；所有事故演练都能用固定 seed 或固定 rule id 重放。
 
-\topic{Manifest 格式}
-Manifest 是恢复的核心。它应能回答：哪些 map task 已提交，哪个 attempt 获胜，产生了哪些 shuffle block，每个 block 属于哪个 reduce partition，大小和校验是多少，文件路径或消息范围在哪里。Reduce 阶段只读取 manifest 中的 block，不能读取临时目录中所有文件。
+\topic{故障矩阵}
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.32\linewidth}p{0.30\linewidth}}
+\toprule
+故障 & 注入方式 & 预期行为 \\
+\midrule
+坏行 & split 中插入非法字段 & reference 和优化路径记录同样错误摘要 \\
+短写 & 第一次 write 只写部分字节 & 继续写剩余字节，未完整不提交 manifest \\
+响应丢失 & drop 某次 TaskReply & timeout 进入 unknown，retry 新 attempt，manifest 唯一 \\
+重复响应 & 同一 reply 投递两次 & 第二次进入 duplicate 或 late 指标 \\
+Driver 崩溃 & manifest 前后分别终止 & 前者重做，后者承认已提交事实 \\
+Reduce busy & partition queue 高水位 & Map 端背压，retry budget 不被放大 \\
+热点 key & 一个 key 占大多数输入 & 普通 hash 长尾，拆分后正确二级合并 \\
+旧 epoch & route 切换后旧请求到达 & StaleRoute，不改变 manifest \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-Manifest 还要版本化。第一版可以是简单文本或 JSON，但字段要稳定；后续若改格式，version 用于拒绝或迁移。Manifest 写入要使用临时文件加提交步骤，避免半写文件被当成有效。恢复时先校验 manifest，再校验 block。若 block 缺失或 checksum 不匹配，系统应重跑对应 map task 或报告不可恢复。
+\topic{RunReport 是最终系统的用户界面}
+RunReport 不是日志汇总，而是可审查证据。它至少包含输入摘要、reference checksum、engine checksum、错误行数、stage 耗时、queue high watermark、task 数、attempt 数、retry amplification、late reply 数、duplicate reject 数、manifest generation、checkpoint generation、故障规则、恢复动作和未验证边界。
 
-\section{恢复、故障注入和验收}
-
-恢复算法可以写成明确步骤。第一，加载最新 checkpoint 文件并校验版本和 checksum。第二，恢复 driver 的 job、stage、task 状态。第三，读取 manifest，确认已提交 outputs 存在。第四，把 running 但未 committed 的 task 改回 pending，因为旧 attempt 是否还活着不可依赖。第五，重新调度 pending task。第六，重复收到旧 attempt commit 时，根据 epoch 和 task state 拒绝或去重。
-
-这个算法说明恢复不是“读回内存结构”这么简单。运行中的 task 在崩溃后状态不确定，必须回到可重试状态；已经 committed 的 task 不能重复；临时文件需要清理但不能误删已提交文件。恢复算法应有单元测试。
-
-\topic{故障注入表}
-项目可以维护一张故障注入表。按阶段列：input read failure、parse error、map worker crash、shuffle message drop、shuffle duplicate、reduce busy、commit response lost、checkpoint write fail、driver restart。每项写注入方式、预期行为、需要的测试和指标。表驱动能防止只测自己想到的 happy path。
-
-例如 commit response lost：worker 写出 block 并向 driver commit，driver 已记录 manifest，但响应被丢。Worker 超时后重试 commit。预期：driver 返回 already committed，manifest 不重复，reduce 只读取一次。这个测试能验证幂等提交。
-
-\topic{性能里程碑}
-项目性能里程碑应逐步建立。第一，串行 reference 正确。第二，单机多 worker 比串行在大输入上有加速。第三，map-side combine 减少 shuffle bytes。第四，热点 key 拆分降低 reduce 长尾。第五，背压下队列不无限增长。第六，故障注入下正确性保持。每个里程碑都有指标，不要求一开始达到生产性能。
-
-里程碑顺序很重要。不要在 reference 还不稳定时优化 shuffle；不要在 manifest 去重没做好时开启 speculation；不要在指标缺失时调复杂调度。系统工程需要可验证台阶。
-
-\topic{实验输入集}
-至少准备四类输入。第一，均匀 key，小规模，用于快速 correctness。第二，均匀 key，大规模，用于吞吐和带宽。第三，热点 key，用于倾斜和二级聚合。第四，含错误行和边界值，用于解析和错误处理。每类输入都要有固定 seed 和摘要。测试不能只靠随机生成后立即丢弃 seed。
-
-输入还应覆盖空文件、单行文件、没有换行结尾、超长行、非法字段、\code{event_type} 越界、value 溢出边界。系统教材的质量体现在这些边界上。只处理理想 CSV，不是真正的数据处理系统。
-
-\topic{结果校验}
-结果校验不只是比较输出文件文本。可以先把输出解析成 key 到 value 的 map，再和 reference 比较。若输出顺序声明确定，再比较顺序；若输出顺序不保证，就不要因为顺序不同判错。错误行计数、重复请求计数和丢弃低优先级日志也要进入校验。校验规则要和语义合同一致。
-
-浮点或近似算法需要误差校验。日志计数通常是整数精确，适合完全相等。若未来 AI 推理引擎加入浮点算子，校验策略会不同。第二册先用整数聚合训练 exactly-once 和确定性，是有意降低数值复杂度，让系统语义更清楚。
-
-\topic{从本机线程到多进程}
-本机多线程模拟共享地址空间，bug 和真实多进程不同。下一步可以把 worker 做成多进程，通过 pipe、Unix domain socket 或本地 TCP 通信。多进程能训练序列化、进程崩溃、文件持久化和真实内核队列。代价是实现复杂度增加。项目可以先把 MessageBus 接口抽象好，后续替换传输层。
-
-多进程版本要处理进程启动、退出、信号、日志收集和临时目录清理。Worker 崩溃后，driver 要发现并重试任务。共享内存不再可直接传递对象指针，消息必须序列化。这是从“模拟分布式”走向“本机分布式”的关键一步。
-
-\topic{安全和权限边界}
-即使是教学项目，也要意识到权限边界。Worker 不应随意写任意路径，输出目录应由 driver 分配；消息解析要检查长度和版本，避免越界；临时文件名要避免冲突；恢复时不要信任损坏 manifest。真实系统还需要认证、授权和加密，本册不展开，但接口应留出 metadata 和错误码空间。
-
-安全不是第三册或生产阶段才考虑。很多数据损坏来自缺少边界检查和信任内部输入。分布式系统里，“内部消息”也可能因为 bug、旧版本或损坏而非法。
-
-\topic{推理负载的接口预留}
-虽然 AI 推理不是本章主题，项目仍然可以预留计算内核接口。今天的 map/reduce kernel 处理日志记录，未来可以处理 tensor block；今天的 thread pool 执行 histogram，未来可以执行 GEMM tile；今天的 manifest 记录 shuffle block，未来可以记录模型分片或量化权重缓存。接口应围绕任务、数据块、运行时、指标和检查点，而不是写死日志业务。
-
-这种预留要能被验收，而不能只停在命名上。最小检查是把日志 batch 换成一段连续数值 buffer，让同一个任务接口、报告接口和可靠写出接口仍然工作；若接口大量依赖 event id、日志字段或字符串 key，说明抽象还没有真正脱离当前业务。CPU 推理引擎不是凭空出现，它会复用数据布局、SIMD、线程池、背压、checkpoint 和观测性。当前基础越扎实，后续越能深入算子和模型，而不是返工基础设施。
-
-\topic{最小可运行版本}
-最小可运行版本应非常克制。一个命令读取固定输入文件，使用串行 reference 输出结果；另一个命令使用多 worker 模拟，输出同样结果。此时不需要真实网络、复杂 checkpoint 或热 key 拆分。目标是建立输入格式、输出格式、校验器和 benchmark harness。没有这个最小版本，后面所有功能都缺少落脚点。
-
-最小版本也要有错误处理。输入文件不存在、格式错误、event type 越界、value 溢出、输出路径不可写，都要返回明确错误。教材项目不能只在理想输入上成功。系统质量从第一个版本就开始积累。
-
-\topic{第二阶段：单机并行}
-第二阶段加入线程池或固定 worker。输入 splits 被分配给 worker，每个 worker 本地 combine，driver 合并 partial。这个阶段重点是任务切分、partial 布局、worker stats、正确性对比和扩展曲线。还不需要 shuffle，因为所有 partial 可以在进程内合并。
-
-实验应比较串行、每次创建线程、固定线程池三种版本。输入小的时候，串行可能最快；输入大时，多 worker 有收益；任务太细时，线程池调度成本上升。这个阶段验证第二册前半部分：数据布局、线程、NUMA、测量和并行 reduce。
-
-\topic{第三阶段：本机 shuffle}
-第三阶段加入 shuffle partition。Map worker 不再直接把 partial 交给 driver，而是按 reduce partition 写入队列或 block。Reduce worker 从 partition 队列读取并合并。此时出现背压、partition 队列长度、热点 key 和 reduce 长尾。所有通信仍在本机内存中，但数据流已经像分布式系统。
-
-这个阶段要加入 manifest 概念，即使 block 还在内存中。Manifest 记录哪些 map task 的输出属于哪个 partition。Reduce 只读 manifest 中有效 block。这样第四阶段加入失败重试时，不需要重写架构。
-
-\topic{第四阶段：故障和重试}
-第四阶段加入 attempt、request id 和故障注入。Map task 可能失败重试，shuffle message 可能重复，commit response 可能丢失。Driver 只接受一个 attempt 提交，manifest 去重。Reduce 端不能重复合并同一逻辑 map task。这个阶段验证 exactly-once 外部效果。
-
-测试要使用确定性故障。比如 task 3 的第一次 attempt 在写完 block 后 commit response 丢失；第二次 attempt 重试；最终 manifest 只能有一个 task 3 输出。再比如 reduce 队列第一次返回 busy，map 端退避后重试。每个故障都有明确预期。
-
-\topic{第五阶段：Checkpoint}
-第五阶段加入 checkpoint 和恢复。Driver 在 stage 边界写 checkpoint，包含 task 状态和 manifest。测试中强制 driver 在 checkpoint 后重启，恢复后继续运行。Running task 回到 pending，committed task 保持 committed，临时文件清理，重复 commit 被拒绝。
-
-Checkpoint 阶段要非常保守。不要同时引入复杂压缩和真实网络。先让恢复语义正确，再优化写入成本。恢复测试应成为常规测试，不是偶尔手工演练。
-
-\topic{第六阶段：热点和优化}
-只有在正确性、重试和恢复稳定后，才加入热点 key 拆分、压缩、拓扑调度、work stealing 和多进程传输。此时每个优化都有 reference 和故障测试保护。热点 key 拆分要保证最终合并回原 key；压缩要保证 checksum 覆盖压缩数据或解压后数据；多进程传输要保证消息 framing 和版本。
-
-优化阶段要保留开关。能关闭热点拆分回到普通 hash partition，能关闭压缩，能关闭 speculation。开关让对照实验和故障定位更容易。生产系统也常需要 feature flag 控制风险。
-
-\topic{接口示例：MapTask}
-MapTask 输入是 InputSplit 和作业配置，输出是若干 ShuffleBlock。它不直接写最终结果。它可以返回 MapTaskResult，包含 attempt id、block 列表、记录数、错误数和指标。Driver 决定是否提交这个结果。
-
-\begin{lstlisting}[language=C++,caption={MapTaskResult 的接口形态}]
-struct MapTaskResult {
- TaskId task_id;
- AttemptId attempt_id;
- std::vector<ShuffleBlock> blocks;
- std::uint64_t records_read = 0;
- std::uint64_t records_rejected = 0;
-};
+\begin{lstlisting}[numbers=none,caption={RunReport 摘要示例}]
+input.records=3000000
+input.bad_records=12
+reference.checksum=0x51b76290
+engine.checksum=0x51b76290
+tasks.total=96
+attempts.total=101
+reply.late=2
+commit.duplicate_rejected=3
+shuffle.bytes=1843200
+queue.reduce.high_watermark=65536
+manifest.generation=17
+checkpoint.generation=4
+fault.rule=drop_task_reply_once
+boundary.unverified=real_network_power_loss
 \end{lstlisting}
 
-这个接口把执行结果和提交分开。Worker 产生 result，不代表 result 生效。Driver commit 才改变控制面状态。这个分离是分布式计算正确性的核心。
+报告要机器可读，也要人能读。机器可读便于回归比较，人能读便于排查事故。若报告只能说“success”，它不能支持工程判断；若报告能解释每个故障的状态变化，它就是系统的一部分。
 
-\topic{接口示例：ReduceTask}
-ReduceTask 输入是 partition id 和 manifest 中属于该 partition 的 block 列表，输出是临时 OutputBlock。Reduce 不应扫描所有 map 输出，也不应接受 manifest 之外的 block。这样 repeated attempt 和临时文件不会污染最终结果。
+\section{里程碑：每一步都能失败、解释和回退}
 
-ReduceTask 还要处理输入 block 缺失或损坏。若 block 缺失，返回 retryable 或 corrupt，让 driver 重新调度对应 map task 或失败作业。若直接跳过，最终计数会少。错误处理必须进入输出语义。
+最终项目不应一次性实现完整框架。每个里程碑只引入一个新边界，同时保留上一版可运行结果和失败测试。这样复杂度有来源，出错时能回退。
 
-\topic{指标示例}
-项目指标可以分五组。Input：读取字节、解析记录、错误行。Map：本地聚合 key 数、输出 block 数、map 耗时。Shuffle：发送字节、队列等待、busy 次数、重复消息。Reduce：输入 block 数、合并 key 数、热点 key 时间、输出字节。Control：attempt 数、重试数、commit 延迟、checkpoint 耗时、恢复耗时。
+\topic{一、串行 reference 和输入身份}
+实现输入解析、错误摘要、排序输出和 reference report。测试空文件、单行、坏行、越界 event type、超长行和固定随机输入。这个阶段回答“到底在算什么”。
 
-每组指标都要带 job、stage、task、partition 或 worker 维度。全局总数用于概览，维度指标用于定位。指标命名稳定后，实验报告和图表才能复用。
+\topic{二、HotBatch 和本地 combine}
+把热字段从原始记录中分离，保留 record id 回溯。实现本地 combine，并记录 key 数、combine ratio、内存峰值。这个阶段回答“如何少搬热路径数据，同时不丢证据”。
 
-\topic{作业失败策略}
-不是所有错误都无限重试。每个 task 应有最大 attempt 数；每个 job 应有总重试预算；某些错误如格式不兼容、输出路径权限错误应立即失败；某些错误如 reduce busy 可退避重试；某些错误如 block checksum mismatch 可能重跑 map。失败策略要写成表，而不是散落在 if 语句里。
+\topic{三、并行 partition 和任务运行时}
+用 count-scan-write 替代共享 push，建立 bucket range 和 partition manifest；再用线程池或任务图执行 chunk 任务，记录 ready、running、waiting、done、cancelled。这个阶段回答“多个 worker 如何写同一个逻辑输出而不互相踩”。
 
-作业失败后要清理资源：停止提交新任务，取消 pending task，等待 running task 到安全点，保留或删除临时文件，写失败报告。失败报告应包含错误分类、失败 task、attempt 历史和可恢复建议。一个只返回 false 的作业系统很难调试。
+\topic{四、可靠写和 manifest commit}
+实现临时 block、短写处理、checksum、manifest append 和恢复扫描。测试写中崩溃、写完未提交崩溃、提交后崩溃。这个阶段回答“文件存在为什么不等于结果有效”。
 
-\topic{实验报告中的图}
-本书不能在 EPUB 中依赖图片，但报告可以用文本图、CSV 和外部脚本生成图。关键图包括线程扩展曲线、队列长度时间线、每 partition 输入大小、每 worker 任务数、重试次数、热点 key 分布、checkpoint 耗时。即使最终书里用文字描述，项目输出应保留数据，方便读者自己画。
+\topic{五、MessageBus、retry 和幂等提交}
+把本地调用改成消息事件。加入 request id、attempt、deadline、retry budget、Busy 和 late reply。测试响应丢失后只提交一个 attempt。这个阶段回答“远端执行成功为什么不是外部生效”。
 
-图的价值是发现形状。一个 partition 明显比其他大，说明倾斜；队列长度持续上升，说明背压不足；worker 任务数差异大，说明调度不均；checkpoint 耗时周期性尖峰，说明持久化影响。数字表和图要互相印证。
+\topic{六、Checkpoint、热点 key 和两进程边界}
+加入 checkpoint generation、恢复 audit、热点 key 拆分和可选两进程部署。两进程部署不追求性能，而是检查序列化、framing、process crash 和共享状态假设。这个阶段回答“系统重启后谁说了算，以及本机模拟有没有偷共享内存的懒”。
 
-\topic{测试分层}
-项目测试应分四层。第一层是纯函数单元测试，例如 parse line、hash partition、top-k merge、checksum。第二层是并发结构测试，例如 bounded queue、thread pool、SPSC ring。第三层是 stage 集成测试，例如 map stage、shuffle stage、reduce stage。第四层是端到端故障测试，例如 driver restart、duplicate commit、hot key split。分层测试能快速定位问题。
+\begin{labbox}
+毕业演练：使用三个小 split、两个 worker 和一个 MessageBus。打开四个故障：坏行、短写、成功响应丢失、Driver 在 manifest 后重启。要求最终 checksum 等于 reference，manifest 每个 logical task 只有一个 accepted attempt，RunReport 能列出 late reply、duplicate rejected、partial write 和 recovery action。
+\end{labbox}
 
-每层测试的速度和覆盖不同。纯函数测试应该很多且快；并发结构测试需要重复和 sanitizer；stage 测试需要临时文件和较小输入；端到端故障测试较慢但覆盖协议。不要只写端到端测试，失败时很难定位；也不要只写单元测试，协议组合 bug 会漏掉。
+\section{一次失败排查日记}
 
-\topic{属性测试}
-日志统计适合属性测试。随机生成一批记录，reference 和分布式模拟结果应相同；打乱输入顺序后，如果语义是按 key 求和，结果应相同；把输入分成不同 split，结果应相同；重复发送同一个 committed block，结果不应改变；删除一个未提交临时 block，结果不应改变；删除一个已提交 block，恢复应失败或重跑。属性测试比手写几个例子更能覆盖边界。
+最终系统要训练的不只是设计能力，还包括排查能力。假设小输入只有一百条记录，reference 输出 key A 为三十七，优化版输出三十九。差异很小，最容易被误判成并行顺序、随机噪声或“测试不稳定”。正确做法不是先改代码，而是沿 RunReport 一层一层收窄。
 
-属性测试要记录 seed。失败时输出 seed、输入摘要和最小化后的反例。这样复杂系统 bug 才能复现。随机测试如果不能复现，只会增加噪声。
+\topic{一、先排除输入和解析}
+先比较 input checksum、record count、bad record count 和 reference parser 的错误摘要。若这些不同，问题还在输入身份或 parser 合同；不要继续查 shuffle。若这些一致，再比较 HotBatch checksum 和 record id 回溯。若 HotBatch 与 reference 的 key/value 序列一致，说明冷热布局没有丢字段。排查要先把上游语义排除，而不是一看到并行版本就怀疑线程。
 
-\topic{性能测试分层}
-性能测试也要分层。Kernel benchmark 测 map、histogram、top-k；runtime benchmark 测队列和线程池；stage benchmark 测 map stage 和 reduce stage；end-to-end benchmark 测完整作业。每层回答不同问题。End-to-end 慢了，不知道具体瓶颈；kernel 快了，不代表系统快。分层性能数据才能指导优化。
+\topic{二、再排除输出位置}
+查看 count、scan、write 三阶段的 bucket range。若 count 阶段显示 chunk 4 对 bucket 2 有七条，write 阶段写了九条，就说明 predicate 在两次执行中不一致，或者 chunk 4 被执行了两次。若 range 正确但最终多了两条，就继续查 manifest。Scan 和 partition 的中间账本，是把“结果不一致”缩小到“输出位置或重复提交”的关键证据。
 
-每次优化要说明影响哪一层。比如 AoSoA 改动影响 kernel；work stealing 影响 runtime；map-side combine 影响 stage 和 end-to-end；manifest fsync 优化影响 commit 阶段。若优化目标不清，性能报告就会散。
+\topic{三、最后查提交点}
+Task table 显示 chunk 4 有两个 attempt。Attempt 0 写出成功，但 TaskReply 被故障规则丢弃；Attempt 1 后来写出并提交。Manifest 却包含 attempt 0 和 attempt 1 两条 block。根因不是 reduce 算错，而是 manifest 按 block 文件名接受提交，没有按 logical task 去重。修复应落在 CommitRecord：同一个 logical task 只能接受一个 attempt，旧 attempt 只能进入 LateAttempt 或 Duplicate 分类。
 
-\topic{文档和学习产物}
-贯穿项目还应产出文档：设计文档、状态机、故障矩阵、性能报告、源码阅读笔记和实验记录。代码只是学习的一部分。系统工程需要把设计讲清楚，让别人能审查和复现。每章结束时，项目文档应补充相应部分：数据布局章补 batch layout，锁章补队列不变量，I/O 章补背压链，分布式章补 manifest 和恢复。
+\topic{四、把事故固化成回归测试}
+新增回归测试：\code{drop_reply_then_retry_keeps_one_manifest_entry}。输入固定，故障规则固定丢 attempt 0 的 reply。测试断言 parallel checksum 等于 reference，manifest 中 chunk 4 只有一条 accepted entry，late reply count 为一，临时目录可以存在旧 block。注意最后一条：旧 block 存在不是错误，错误是把它当提交事实。这个测试能防止后续重构再次把目录扫描引回 reduce。
 
-这些文档不应长篇空话，而应包含具体字段、状态、返回值和测试。比如“BoundedQueue close 语义”比“队列是线程安全的”有用得多；“commit response lost 测试”比“支持故障恢复”有用得多。
+\topic{五、补报告字段}
+这次事故还说明旧报告缺字段。RunReport 应增加 task commit summary：task id、accepted attempt、candidate blocks、late replies、duplicate replies、orphan blocks。报告字段不是越多越好，而是每次事故后补上能缩短排查路径的证据。高质量系统会把排查经验沉淀成报告，而不是只沉淀在某个人脑子里。
 
-\topic{最终验收标准}
-最终项目验收可以定义为：在固定 seed 输入下，串行 reference、多线程本机模拟、带 shuffle 模拟输出一致；在注入重复消息、响应丢失和 worker 失败时输出仍一致；在热点 key 输入下能输出倾斜指标并可选启用热点拆分；在生产速度超过消费速度时队列不无限增长；checkpoint 后 driver 重启能恢复；所有结果文件或 manifest 有 checksum；性能报告包含线程扩展、队列、partition 和重试指标。
+\section{实现工单样例}
 
-这个验收不要求商业级分布式系统，但要求语义完整、证据完整、失败路径可控。达到这个标准，读者就具备把同一套方法迁移到更复杂计算负载的基础。
+最终项目不应以“实现一个分布式计算引擎”这种大工单开始。更稳的做法是逐张工单收敛，每张工单解决一个具体缺口，附带测试和报告字段。
 
-\topic{学习成果清单}
-完成本项目后，读者应该能交付几类成果。第一，能写出一个正确的串行 reference，并用它校验优化版本。第二，能把数据按 batch 和列式布局组织，说明冷热字段和生命周期。第三，能实现有界队列和线程池，说明关闭和等待语义。第四，能使用 reduce、scan、partition 构造无共享写的并行内核。第五，能设计本机 shuffle、manifest 和幂等提交。第六，能写故障注入测试并解释恢复行为。第七，能用指标和 trace 分析瓶颈。
+\topic{工单一：输入身份}
+动机：错误报告和恢复无法定位输入。修改：增加 FileId、ChunkId、RecordId 和 input checksum；reference report 输出这些身份。测试：同一文件两次运行 id 稳定，修改文件后 FileId 改变，错误行能回溯 offset。完成标准：没有性能要求，只要求身份稳定。
 
-这些成果比某个单独优化技巧更重要。后续 CPU 推理引擎会需要矩阵内核、量化数据布局、线程池调度、模型文件加载、缓存和错误处理。前面的计算系统训练越扎实，后续越能把精力放在模型和算子本身。
+\topic{工单二：共享 push 改为 count-scan-write}
+动机：共享输出锁竞争，失败后不知道写入范围。修改：filter/partition 先 count，再 exclusive scan，再写独占区间。测试：共享 push 反例、稳定顺序、chunk 写失败。报告字段：chunk count、bucket range、scan checksum。完成标准：结果与 reference 一致，输出区间可审计。
 
-\topic{系统能力收束}
-现代 CPU 推理离不开本章建立的系统能力。一个量化模型的推理引擎需要理解 cache、SIMD、线程池、NUMA、I/O、任务图和观测性；一个可靠本地服务还需要背压、超时和恢复。先把计算系统讲清楚，再讨论 AI 算子开发，学习路径会更稳。
+\topic{工单三：有界队列关闭合同}
+动机：取消或错误时消费者可能永远等待。修改：队列返回 Success、Closed、Cancelled；close drain 和 close cancel 分开；关闭时 notify all。测试：消费者等待空队列时关闭，生产者等待满队列时关闭，drain 保留已有元素。报告字段：queue high watermark、closed mode、waiter wake count。
 
-到这里，整条计算系统路线形成闭环：硬件执行模型解释单核成本，内存层级解释数据移动，多线程和同步解释共享状态，并行算法解释任务切分，I/O 和背压解释等待，分布式计算解释故障和提交，贯穿项目把它们组合成一个可运行系统。后续只是在这个系统上接入更复杂的计算负载。
-
-\topic{项目章节总结}
-本章把全书原则落成一个工程：日志统计计算引擎。它从 reference 开始，用数据布局改善热路径，用线程池组织执行，用 reduce/scan/partition 构造并行内核，用 I/O 管线和背压控制等待，用 manifest 和 checkpoint 定义提交与恢复，用故障注入验证幂等。这个项目不是商业产品，却覆盖现代计算系统最重要的骨架。读者真正完成它，就不再只是知道概念，而是能把概念组合成系统。
-
-\topic{项目决策表}
-推进项目时，每加一个功能都要填决策表。功能改变了哪个语义？影响哪个状态机？需要哪些新字段？失败时如何恢复？是否影响 reference？需要哪些新测试？需要哪些指标？性能瓶颈预期迁移到哪里？是否能开关回退？例如加入热点 key 拆分，就要新增 hot key 识别、subkey、二级 reduce、结果合并、重复 attempt 去重和倾斜指标。没有决策表，功能很容易堆成不可维护的复杂度。
-
-\topic{计算内核的通用化演练}
-完成日志统计引擎后，可以做一个过渡任务：保留 batch、thread pool、benchmark、manifest，把计算内核替换成一个简单 tensor elementwise 算子，例如 \code{y = a * x + b}。这个任务不涉及模型推理，却能验证基础设施是否通用。如果基础设施只能处理日志而不能处理 tensor batch，说明抽象边界还不够好。后续向量化算子、矩阵乘、量化和本地推理引擎都会沿着这个过渡继续展开。
-
-\topic{项目风险清单}
-项目最大的风险不是性能不够，而是边界不清。输入格式边界不清，会导致解析和恢复不一致；任务 ID 边界不清，会导致去重失败；输出提交边界不清，会导致重复或丢失；队列容量边界不清，会导致 OOM；线程池关闭边界不清，会导致悬挂；checkpoint 边界不清，会导致恢复错误。每个风险都对应前面章节建立的一个边界。
-
-因此项目评审应先看风险清单，再看性能数字。一个快但无法恢复的系统，不是高性能系统；一个吞吐高但队列无界的系统，只是把故障推迟；一个无锁但没有回收协议的队列，是潜在崩溃点。成熟设计必须把这些边界写进类型、状态机、测试和报告。
-
-\topic{项目交付目录}
-交付时可以包含四类文件。源码目录包含模块化实现；测试目录包含单元、并发、集成和故障测试；结果目录包含 benchmark CSV 和报告；文档目录包含状态机、故障矩阵、布局报告和恢复演练。书中的文字只是指导，项目产物才是读者真正掌握的证据。
-
-多书仓库也应保持清楚边界：每本书有自己的 source、labs、materials、reports 和 results。后续推理引擎项目可以复用本项目的 labs 基础设施，但输出到独立书目录，避免版本混乱。
-
-\topic{项目审查表}
-项目审查可以按模块进行。Input 模块：split 是否覆盖每条记录一次，错误行如何处理。Kernel 模块：reference 是否存在，边界测试是否完整。Runtime 模块：队列是否有界，shutdown 是否唤醒所有等待者。Shuffle 模块：block 是否有 checksum，partition 是否可恢复。Driver 模块：attempt 是否幂等，manifest 是否只提交一次。Checkpoint 模块：恢复是否把 running task 变回 pending。Metrics 模块：每个指标是否有维度和成本控制。
-
-审查表让项目保持高质量。没有审查，代码越写越多，语义却越来越不清楚。第二册的目标不是堆功能，而是让每个功能都有边界、测试和证据。
-
-\topic{项目复盘问题}
-完成项目后，建议读者复盘十个问题：哪一次优化改变了瓶颈？哪一个 bug 来自生命周期不清？哪一个测试暴露了并发问题？哪一个指标最有助于定位？哪一个队列需要背压？哪一个数据结构布局收益最大？哪一个失败注入最有价值？哪一个模块最难恢复？哪一处抽象边界需要调整？哪些基础设施能复用到下一类计算负载？这些问题能把项目经验固化下来。
-
-\topic{从实验到工程结论}
-项目报告应把实验结论写成可复查的工程判断。每个判断都应包含一个问题、一个朴素版本、一个瓶颈或失败、一个改进版本、一个验证方法和一个边界说明。比如队列问题：朴素无界队列会积压，改成有界队列后出现背压，验证队列长度和生产者等待，边界是业务必须选择阻塞或失败。这样的报告比直接给最终答案更有价值。
-
-后续继续扩展项目时，也应保持这种写法：从问题出发，解释为什么朴素方案不够，推导改进，给出代码或状态机，最后说明测试和限制。系统训练的目标不是堆知识点，而是让读者跟着推理过程建立判断力。
-
-\topic{计算系统基础的定位}
-本项目服务于现代计算系统和高性能并发基础。它不是单纯操作系统练习，也不是某个框架的缩小版，而是把硬件、操作系统、运行时、算法、I/O 和分布式计算连接起来。目标读者是已经会写 C++ 和基础算法，但想把程序写成可靠、高性能、可测量系统的人。后续推理引擎会在这个基础上继续，而不是替代它。
-
-\topic{完整作业演练}
-一次完整作业演练可以这样写。准备输入：一份均匀日志、一份热点日志、一份包含错误行的日志。先运行串行 reference，保存结果摘要。再运行多 worker 本机版本，比较结果。随后开启 shuffle，记录每个 partition 的 block 数和字节数。再注入一次 commit response lost，验证 manifest 不重复。再让一个 reduce partition 慢下来，观察背压链。最后写 checkpoint，重启 driver，继续完成作业。
-
-演练报告要把每一步的预期和实际写清。不是只说“测试通过”，而是说明哪个机制被验证：reference 验证语义，多 worker 验证并行正确性，shuffle 验证分区，commit 丢失验证幂等，慢 reduce 验证背压，driver 重启验证恢复。这样的演练才能形成可审查证据。
-
-\topic{项目扩展边界}
-Compute Systems Engine 还可以扩展，但要控制边界。可以加入多进程 worker，可以加入真实 socket，可以加入压缩，可以加入更复杂 key 类型，可以加入简化 Raft 控制面。但每次扩展都要保持 reference、manifest、故障测试和性能报告。不要一次加入多项，否则问题难以定位。
-
-扩展的判断标准是：它是否服务系统主线，是否能被测试，是否能被解释。如果只是为了功能看起来多，而没有语义和证据，就不应进入主线。系统项目宁愿少而深，也不要多而散。
-
-回归阅读应审查一个完整作业，而不是再列概念。输入 split 进入 parser，输出 \code{ParsedLogBatch}；map-side combine 生成 partial；partition 写出 \code{ShuffleBlock}；I/O 层完成临时文件和 checksum；driver 提交 \code{ManifestEntry}；reduce 读取 manifest 并输出最终结果。任何一步缺少身份、所有权或校验，系统都只能算 demo。
-
-故障注入必须覆盖正常路径之外的状态：坏行、慢 worker、短写、响应丢失、重复 attempt、旧 epoch、driver 重启和热点 key。每个故障都要有预期状态表，而不是只看程序是否退出。最终报告要列出 reference checksum、阶段耗时、队列水位、重试次数、manifest 内容和未验证边界。这样工程章才真正把硬件、并发、I/O 和分布式组合成一个系统。
-
-CPU 推理引擎可以从这里接上。权重加载、tensor buffer、算子调度、KV cache 和流式输出都会复用本章接口；这里先预留接口和边界，不提前展开模型细节。这样的收束能保证当前主题仍然是现代计算系统，后续再专心进入 AI 模型和算子开发。
-
-最终项目还应提供一份 runbook。第一段写如何生成固定输入和 reference；第二段写如何运行单线程、列式、多线程、任务图、异步 I/O 和分布式模拟六个版本；第三段写如何打开每个故障开关；第四段写如何比较 checksum、manifest、trace 和性能报告；第五段写发现失败时先看哪张状态表。runbook 的价值是让读者不靠记忆运行系统，而是按步骤复现实验。
-
-代码目录也要体现书的结构。可以把 reference 放在 \filepath{engine/reference}，热内核放在 \filepath{engine/kernel}，运行时放在 \filepath{engine/runtime}，I/O 放在 \filepath{engine/io}，分布式模拟放在 \filepath{engine/distributed}，报告和测试放在 \filepath{tests} 与 \filepath{labs}。目录不是装饰，它让模块边界在文件系统里可见。若所有内容塞进一个大文件，书里讲的边界就没有落地。
-
-读者应能独立回答一个具体问题：为什么一个本地日志统计系统需要硬件事件、数据布局、线程池、队列、I/O、消息身份和 manifest。答案不应是“因为书里讲了这些”，而应是每个机制都处理一个真实失败：热循环慢、地址流差、共享写冲突、worker 饥饿、写出无界、响应丢失、重复提交。能把机制和失败一一对应，这条计算系统主线才算真正闭合。
-
-最终评审还要看删减能力。若项目里某个抽象没有测试、没有 trace 字段、没有失败场景，也没有被后续接口使用，就应删除或降级为 TODO。系统项目常见问题是越写越复杂，最后每个名词都有类，却没有足够语义支撑。本项目要反过来：每个接口都能说出它保护什么，测量什么，或者让哪个故障可恢复。
-
-进入下一类计算负载前，项目还应冻结一组稳定文件格式。输入 split 描述、benchmark report、task trace、shuffle manifest、fault injection 配置和 final report 都要有简单文本或 JSON 形态。AI 推理引擎接入时，可以新增 model artifact 和 tensor metadata，但不要推翻已有身份、attempt、epoch 和 manifest 语义。这样后续不是重新开项目，而是逐层扩展同一个计算系统。
-
-最终项目的文档应包括“从零运行”和“事故复现”两条路径。从零运行面向第一次读者，只要求生成输入、运行 reference、运行并行版本、比较输出；事故复现面向完成本册的读者，要求打开坏行、慢 worker、短写、迟到响应和 driver 重启，逐项解释状态变化。两条路径分开，能避免新读者一上来被故障矩阵压住，也能让进阶读者真正检查系统边界。
-
-最终报告还要包含结构调整记录。凡是只换名词的通用段落，都应删除或改成具体对象；后续维护也一样。记录要写明删掉了什么、为什么删、用什么具体内容替代。这样内容质量不会只靠主观感觉，而能像代码重构一样留下理由。成熟教材不是永远增加，而是持续把空泛内容换成可解释内容。
-
-CPU 推理引擎接入时，可以直接使用本项目验收框架：reference 输出变成小模型推理结果，HotKernelReport 变成算子报告，MemoryShape 变成 tensor 和权重布局，TaskStateRecord 变成 layer 或 token 任务，CompletionRecord 变成模型加载和缓存写入，MessageEnvelope 变成请求协议。这样的延续能让本项目成为后续算子开发和推理引擎工程化的直接基础。
-
-\section{全书收束与扩展}
-
-到这里，第二册的主线闭环了。核心流水线解释单线程为什么慢；缓存、TLB 和 NUMA 解释数据移动；测量章提供证据；数据布局和 SIMD 提供单核内核；锁、原子和无锁结构提供同步基础；线程池和任务图组织单机并行；I/O 和背压处理等待；分布式模型、分片复制和本章工程实践把这些原则扩展到集群。后续第三册 AI 推理引擎，会在这个基础上讨论算子、模型、量化和 CPU 推理优化。
-
-\section{把全册机制组合成一个可运行计算引擎}
-
-最后一章不能只总结概念，而要把 Compute Systems Engine 组装成一个可运行、可测量、可故障注入的教学系统。目标不是追求工业框架规模，而是让读者看到一个日志统计作业如何从输入文件走到最终 manifest，并在每个边界上使用前面章节的知识：热循环分析、布局、SIMD、线程池、任务图、背压、I/O、消息身份、幂等提交和恢复。
-
-系统的最小端到端路径包括：读取 input split，解析成 \code{ParsedLogBatch}，本地 combine，partition 成 shuffle block，异步写出 block，driver commit manifest，reduce 读取 manifest，合并输出，写最终结果。每一步都要有 reference 或可检查摘要。若端到端只有“跑完了”，读者无法知道哪个阶段错了，也无法定位性能瓶颈。
-
-\topic{模块边界和数据合同}
-
-Parser 接收字节范围，输出 batch 和错误摘要。它不负责线程调度，也不提交结果。Compute kernel 接收热字段 span，输出本地 partial。Partitioner 接收 partial 或记录，输出按 partition 分组的 block。Runtime 负责任务状态和调度，不理解业务 key。I/O 层负责写临时文件和 completion，不决定业务提交。Driver 负责状态表、重试、commit 和 manifest。边界清楚，模块才能单独测试。
-
-数据合同要写进类型。\code{InputSplit} 使用文件 id、begin/end offset；\code{TaskAttemptId} 区分逻辑 task 和物理 attempt；\code{ShuffleBlock} 带 partition id、attempt、bytes 和 checksum；\code{ManifestEntry} 表示外部可见提交。不要用裸字符串和散落的整数传递关键身份。C++ 示例中应使用位宽明确的 id 类型，避免模糊类型和魔法数字。
-
-错误合同同样重要。Parser 可能遇到坏行；I/O 可能短写；worker 可能超时；driver 可能看到旧响应；reduce 可能发现 checksum 不匹配。每个错误要分类：可重试、不可重试、可跳过、需要人工介入。错误分类决定重试和提交，不是日志文本。
-
-\topic{端到端 reference 和分阶段优化}
-
-第一版端到端 reference 可以完全串行：按顺序读文件、解析、计数、输出。它慢，但定义语义。第二版加入 batch 和列式热字段，只改变布局；第三版加入线程本地 partial，只改变并行 reduce；第四版加入任务图，只改变调度；第五版加入异步 I/O 和背压；第六版加入 MessageBus 故障注入和幂等提交。每一步都保留前一步对照。
-
-这种分阶段推进防止“优化大杂烩”。若一次同时加入 SIMD、线程池、异步 I/O 和重试，结果变快或变慢都无法解释。工程教材要展示慢慢加机制的过程，因为真实系统维护也需要这种可回退路径。
-
-每个阶段都有验收。布局阶段验收字节移动和输出一致；并行阶段验收扩展曲线和 false sharing；运行时阶段验收 task trace 和取消；I/O 阶段验收队列水位和崩溃点；分布式阶段验收重复请求、响应丢失和 driver 重启。验收项进入仓库，不能只写在书里。
-
-\topic{性能总账和瓶颈迁移}
-
-端到端系统的瓶颈会迁移。串行 reference 慢在单线程解析；列式布局后可能慢在内存带宽；多线程后可能慢在 partition 热点；异步 I/O 后可能慢在 manifest fsync；分布式模拟后可能慢在重试和背压。最后一章要把这些迁移串成一张总账：每阶段主要成本是什么，改动把成本推到哪里，下一步证据是什么。
-
-总账还要记录资源预算。CPU 核数、内存峰值、队列容量、in-flight bytes、临时文件数量、manifest 大小、checkpoint 频率、重试预算。一个系统不是某个函数最快，而是在资源预算内稳定完成工作。若吞吐提升伴随内存无限增长，不能算成功；若平均延迟下降但 p99 爆炸，也要解释。
-
-项目报告可以给一个固定工作负载：若干日志文件、确定 key 分布、可注入坏行和慢 I/O。对每个版本输出同一张表：正确性 checksum、吞吐、p50/p95/p99、内存峰值、队列水位、重试数、提交数。读者用这张表能看到全册知识如何合并。
-
-\topic{故障演练作为毕业测试}
-
-最后的毕业测试不是最大吞吐，而是故障演练。演练一：响应丢失，driver 超时重试，旧响应迟到，最终只提交一次。演练二：worker 写出 block 后崩溃，driver 重试，临时文件清理不影响 manifest。演练三：I/O 队列满，上游背压，内存峰值受控。演练四：热点 key 导致 reduce 长尾，任务运行时记录倾斜并用热点策略改善。演练五：driver 重启，从 checkpoint 恢复 task table 和 commit table。
-
-每个演练都要有命令、输入、期望状态表、关键 trace 和恢复后输出。这样项目才像系统，不像 demo。读者完成这些演练，就已经把硬件、软件、算法、并发和分布式的主线打通。
-
-第三册 AI 推理引擎可以建立在这个基础上。模型权重是大规模只读数据，算子是计算内核，batch 是数据布局，线程池和任务图调度算子，I/O 层加载权重，分布式思想处理分片和恢复。第二册不急着上 AI，是为了把计算系统地基打稳。最后一章要明确这条延伸线，但不把第三册内容提前混进本册。
-
-\topic{案例走查：一次完整毕业演练}
-
-毕业演练输入 4 个日志 split，其中一个 split 含坏行，一个 worker 被设置为慢节点，MessageBus 丢弃一次响应，I/O 层让一次写出短写。系统应完成以下动作：parser 把坏行放入错误摘要但不影响其他行；driver 对慢 worker 触发 deadline 和重试；commit table 拒绝迟到响应；I/O completion 报告短写并让对应 attempt 失败；最终 manifest 只引用成功 block；reduce 输出和 reference 在定义语义下相等。
-
-演练报告分五栏：事件时间线、状态表变化、输出文件变化、指标变化、最终判断。事件时间线让读者看到因果；状态表证明协议正确；输出文件变化证明提交边界；指标变化证明性能和背压可观察；最终判断说明哪些问题已验证，哪些只是模拟。没有这五栏，毕业项目就容易退化成“运行成功”。
-
-这个演练也是第二册和第三册的交界。第三册要做 CPU 推理引擎时，也会面对大权重加载、算子调度、batch、线程池、I/O、量化误差和端到端验收。第二册把这些系统能力训练好，第三册才能专心进入 AI 模型和算子开发。
-
-\topic{最终项目的代码审查清单}
-
-最后一章应给出代码审查清单。数据层：每个跨阶段对象是否有稳定 id、bytes、checksum 和 owner；热字段是否避免无用搬运；span 和引用生命周期是否清楚。执行层：任务是否有状态机，ready/wait/running 是否可观测，worker 是否会阻塞等待同池任务。同步层：每个锁保护什么不变量，每个 atomic 发布什么，每个队列关闭语义是什么。
-
-I/O 层：请求完成前 buffer 是否可复用，短写如何处理，manifest 何时可见，崩溃后如何恢复。分布式层：request、task、attempt、epoch 是否区分，超时后旧响应如何处理，commit 是否幂等，重试是否有预算，背压是否向上游传播。测量层：每个优化是否有 reference、实验矩阵、原始指标和未验证边界。
-
-清单不是官僚流程，而是把全书知识压成可执行审查。读者以后写自己的系统，也可以拿这份清单走查。若某个模块无法回答清单问题，就说明边界还没设计清楚。
-
-\topic{从第二册过渡到第三册的接口}
-
-第三册 CPU 推理引擎会复用第二册的许多接口。权重加载需要可靠 I/O 和内存布局；token 或 batch 调度需要任务运行时；矩阵乘、归一化、采样需要内核测量和 SIMD；量化需要明确数值语义；模型文件和缓存需要 manifest；端到端推理需要 trace 和性能报告。第二册最后要把这些接口留好，而不是把 AI 内容硬塞进本册。
-
-可以在项目中保留 \code{TensorBuffer}、\code{KernelTask}、\code{ModelArtifact} 这类预留名，但不展开 AI 算子。只说明它们将来如何使用现有运行时和 I/O 层。这样读者能够看到本册与后续推理引擎之间的工程衔接。
-
-最终验收是两份产物：一本书中的端到端解释，以及仓库中的可运行最小系统。书解释为什么这么设计，代码证明设计能跑，报告证明结果能测，故障演练证明边界能守住。四者缺一，第二册就不完整。
-
-\topic{综合练习：最终项目评审会议}
-
-最后的综合题模拟一次评审会议。每个模块负责人必须用五分钟说明自己的模块：输入输出合同、不变量、性能指标、失败路径、未验证边界。Parser 负责人说明 split 边界和错误行；Kernel 负责人说明热字段和统计语义；Runtime 负责人说明任务图和取消；I/O 负责人说明完成事件和 checkpoint；Driver 负责人说明 retry、epoch 和 commit；Measurement 负责人说明报告如何复现。
-
-评审不接受“代码已经跑通”。每个模块都要展示至少一个反例测试。例如 Parser 展示跨 split 行，Runtime 展示 future 等待死锁反例，I/O 展示 rename 前崩溃，Driver 展示迟到响应。反例测试是系统成熟度的证据。没有反例，说明模块只覆盖 happy path。
-
-会议最后做端到端演练。选择一个固定输入，打开响应丢失、慢 I/O、热点 key 和坏行四个开关，但一次只解释一个开关的影响。输出最终 manifest、阶段耗时、任务 trace、重试指标和 checksum。若解释不清，就回到对应章节补设计。最终章不是庆祝完成，而是用全书标准审查系统。
-
-这个评审题也为第三册铺路。AI 推理引擎进入项目时，同样要过这些问题：权重归谁拥有，tensor buffer 何时可复用，算子任务如何调度，量化误差如何验收，模型文件如何提交，端到端延迟如何报告。第二册的最终评审清单将直接成为第三册的项目入口。
-
-\topic{容易出错的边界：最终系统不能只追求跑通}
-
-第一个反例是端到端跑通但没有 reference。输出看起来合理，却可能重复计数、漏掉坏行或忽略迟到响应。第二个反例是单机跑通但没有故障演练。响应丢失、短写、driver 重启一来就崩。第三个反例是性能好但没有资源预算。内存、临时文件、队列和 in-flight 请求无限增长，长任务会拖垮机器。
-
-第四个反例是模块边界模糊。Parser 直接写 manifest，I/O 层决定业务提交，Runtime 理解业务 key，这些都会让后续维护困难。第五个反例是指标不贯通。Parser 有自己的 id，driver 有另一套 id，I/O 文件名又没有 attempt，事故时无法串联。第六个反例是第三册提前侵入。AI 推理引擎很重要，但第二册还没把计算、并发、I/O 和分布式地基打稳时，直接上模型会让两册都散。
-
-最终源码索引要求读者从 main 函数追踪一条记录，列出每个函数所在模块和状态变化。若路径中出现“顺手访问全局变量”“直接改别的模块内部状态”“没有错误返回”这类点，就要重构边界。最终章的价值在于把全书审查标准集中应用一次。
-
-毕业项目的最后报告应包含三份摘要：正确性摘要列 reference 和故障演练；性能摘要列阶段耗时和瓶颈迁移；工程摘要列不变量、未验证边界和第三册接口。这样这本书不只是读完，而是留下一个可继续演进的系统。
-
-\topic{本章核心接口：第二册能力清单}
-
-最终章把前面接口收成能力清单：统一 ID、HotKernelReport、MemoryShape、PlacementHint、BenchmarkCase、BatchView、KernelVariant、KernelPlan、WorkerSnapshot、QueueContract、AtomicProtocolNote、ProgressAndReclaim、ParallelSemanticContract、TaskStateRecord、CompletionRecord、MessageEnvelope、OwnershipEpoch。每个接口都对应一个章节的核心能力，也对应项目中的一个检查点。
-
-这份清单不是为了让项目显得复杂，而是为了防止知识散掉。若某个接口在代码里没有最小实现，说明对应章节还停留在阅读，没有落地。若所有接口都有最小实现和测试，第二册就真正形成了计算系统基础，可以承接第三册 AI 推理引擎。
-
-\topic{第二册结束时应达到的能力}
-
-读完第二册，读者应能做四件事。第一，拿到一个热循环，能从源码、编译器和硬件事件建立证据链。第二，拿到一个多线程 pipeline，能写出不变量、队列合同、任务状态和背压路径。第三，拿到一个并行算法，能从串行语义推导 reduce、scan、partition 和任务图。第四，拿到一个本机分布式模拟，能处理身份、超时、重试、幂等提交、epoch 和恢复。
-
-这四项能力比记住某个 API 更重要。第三册进入 AI 推理引擎后，矩阵乘、量化、KV cache、模型加载、batch 调度和端到端延迟都会复用它们。第二册的质量标准，就是让读者面对第三册的大项目时，不再被线程、缓存、I/O 和分布式边界绊住，而能专心理解模型和算子。
-
-\topic{把全书接口落成最小实现顺序}
-
-最终项目不应一次实现所有接口。最小顺序可以分八步。第一步，实现串行 reference 和统一 ID。第二步，实现 BatchView 和 MemoryShape，让数据布局可见。第三步，实现 HotKernelReport 和 BenchmarkCase，让热内核能测。第四步，实现 QueueContract 和 WorkerSnapshot，让线程池可观察。第五步，实现 ParallelSemanticContract 和 KernelPlan，让并行算法有语义。第六步，实现 TaskStateRecord，让任务图可追踪。第七步，实现 CompletionRecord 和有界 I/O，让背压可见。第八步，实现 MessageEnvelope 和 OwnershipEpoch，让分布式模拟可恢复。
-
-每一步都要能单独运行，不能依赖后面步骤。这样项目即使中途暂停，也有稳定成果。第一步只有串行程序也有价值，因为它定义 oracle；第三步没有线程也有价值，因为它能解释热循环；第五步没有分布式也有价值，因为它能生成 shuffle-friendly block。高质量工程路线不是一口气搭大框架，而是每个阶段都可验证。
-
-最终章还要明确哪些内容没有放进第二册。没有完整数据库事务，没有完整 Raft 实现，没有 GPU，没有 AI 算子，没有生产级网络框架。这些不是遗漏，而是范围控制。第二册的目标是把现代计算、多核、并发、高性能、I/O 和分布式计算地基讲清。第三册再在这个地基上实现 CPU 推理引擎。
-
-\topic{项目质量验收}
-
-最终项目的质量不能只靠吞吐量判断。第一项是连贯性：每个模块是否从具体故障推出，是否能说明上一阶段的输出怎样进入下一阶段。第二项是具体性：每个设计是否对应项目对象、代码边界、实验和失败路径，而不是停留在名词解释。第三项是可验证性：每个重要结论是否能落到测试、指标、trace 或 run report。第四项是边界意识：是否说明适用范围、反例和未验证条件。第五项是可维护性：目录、类型、状态机和报告字段是否能让另一个人接手。
-
-项目验收还要检查模块语言是否具体。硬件相关证据应落到指令、地址、cache line、TLB 或计数器；同步相关证据应落到不变量、等待谓词、关闭路径和内存可见性；I/O 相关证据应落到 request、buffer、completion、checksum 和提交点；分布式相关证据应落到 message、attempt、epoch、manifest 和恢复扫描。共同方法可以相同，但每个模块必须使用自己的对象和事故说明问题。
-
-所有 C++ 示例都要遵守清晰类型和可维护性原则。示例使用位宽明确类型，热路径避免无意义拷贝，类方法示例中成员访问保持清楚，递归式运行时策略优先改为显式 worklist。教材代码不等于生产库，但它会塑造读者的工程习惯；示例越小，越要把身份、所有权、状态和错误边界写清。
-
-\topic{端到端项目的验收脚本设计}
-
-最终项目需要一个统一验收脚本，而不是人工按章节逐个运行。脚本可以分成五组。第一组是 correctness：串行 reference、列式 batch、并行 partial、shuffle/reduce 输出都必须产生相同 checksum 或符合误差合同。第二组是 concurrency：bounded queue 关闭、线程池 wait、任务图取消、SPSC ring 单调序号都要通过压力测试。第三组是 performance smoke：小规模运行 HotKernelReport 和 BenchmarkCase，确认没有明显退化，不追求固定绝对数字。第四组是 I/O recovery：短写、rename 前崩溃、manifest 后恢复。第五组是 distributed fault：丢响应、重复请求、旧 epoch、driver 重启。
-
-每组测试都要有清楚的输入和预期。性能 smoke 不应因为不同设备速度不同而失败，但可以检查 checksum、阶段是否输出、计数是否非零、队列水位是否受控。故障测试不应依赖随机，而使用固定规则文件。脚本输出一份摘要，列出通过、跳过和失败。跳过必须有原因，例如当前设备没有 PMU 权限或没有 NUMA。这样用户在手机 Termux 上也能得到诚实结果。
-
-验收脚本还要保护教材示例。书中给出的接口名、状态名和字段名应在项目里有最小对应，否则文字和代码会逐渐分离。每次修改代码，都要检查书中核心概念是否仍然准确。反过来，教材新增机制，也要在项目中留下最小测试或 TODO。教材和项目互相校验，质量才不会只停留在排版上。
-
-\topic{推理引擎对计算系统基础的要求}
-
-AI 推理引擎本身就是计算系统。一个 CPU 推理引擎要加载模型文件，管理权重内存，选择数据布局，执行矩阵乘和归一化，处理量化误差，调度 token 或 batch，控制线程池，复用 KV cache，记录端到端延迟，并在失败时给出可诊断状态。如果读者还没有掌握缓存、线程、队列、I/O 和测量，直接写推理引擎只会把所有问题混在一起。
-
-后续推理引擎会把这里的接口重新使用。ModelArtifact 类似 manifest entry，TensorBuffer 需要 MemoryShape，算子实现需要 HotKernelReport 和 KernelVariant，推理 pipeline 需要 KernelPlan 和 TaskStateRecord，请求队列需要 QueueContract 和 FlowControlWindow，模型加载需要 CompletionRecord，服务化推理需要 MessageEnvelope 和 OwnershipEpoch 的思想。这里的每个接口都不是临时教学对象，而是后续项目的地基。
-
-因此本章结束时，读者应对“计算”有完整理解：数据如何移动，指令如何执行，线程如何等待，算法如何拆分，I/O 如何完成，远端消息如何提交。AI 只是下一组 workload，不是跳过系统基础的理由。这条路线先讲程序如何在机器上运行，再讲计算如何扩展和可靠完成，最后才适合进入 AI 推理如何建立在这些能力之上。
-
-\topic{交付前的系统复查项}
-
-最终项目发布前应人工复查五类问题。第一，目录和层级：目录是否表达模块责任，runbook 是否能按阶段运行，而不是把所有命令堆在一起。第二，格式和转义：报告、配置、manifest 和 trace 中的路径、下划线、花括号和命令名是否被正确处理，避免把格式噪声泄漏给读者。第三，代码风格：C++ 示例是否使用位宽明确类型，关键成员访问是否清楚，项目实现是否避免用无界递归承担运行时遍历。第四，移动端阅读：图示尽量用文本事件表和清楚叙述表达，核心信息不依赖图片。第五，重复：若一段说明换掉对象名后仍然成立，就要改成项目中的具体对象、输入、状态和失败路径。
-
-人工复查和自动检查分工不同。自动检查能发现输入缺失、构建失败、格式泄漏和部分宏残留；人工复查能发现逻辑散、案例空、衔接断、段落过于通用。最终项目经过多轮演进后，最容易留下旧的机械段落和已经失效的承诺。复查时看到泛泛原则，应追问它保护哪个对象；看到案例，应追问它是否包含朴素方案、失败信号、改进方案和验收方式。
-
-交付材料应包含书籍产物、项目 runbook、测试摘要、故障矩阵、报告样例和版本记录。交付信息可以简洁，但证据必须真实。读者拿到的不应只是一个能打开的文件，而是一套可以继续运行、复查和扩展的计算系统材料。
-
-\topic{CPU 推理引擎的系统边界}
-
-后续贯穿项目会是 CPU 推理引擎，这里先说明它将如何接入当前系统。模型文件不是普通输入文件，它包含权重、tokenizer、配置、量化参数和版本。加载模型时要用 I/O 章的可靠读取和 CompletionRecord；权重进入内存后要用 MemoryShape 描述字节规模、对齐、页数和冷热区域；权重发布给 worker 前要用原子章的发布协议或更高层只读对象生命周期；多个请求共享权重时，要避免重复加载和悬垂释放。
-
-算子不是孤立函数，它是 KernelVariant 和 HotKernelReport 的自然延伸。矩阵乘、layer norm、softmax、采样、量化/反量化都需要 scalar reference、误差合同、批量接口和平台特化。第二册的 SIMD 章没有讲 AI，但它训练了“先证明批量语义，再选择指令”的方法；第三册只是在更复杂的张量形状上重复这条路。算子调度也不是新问题，它会复用 TaskStateRecord、WorkerSnapshot 和背压窗口，区别是任务粒度变成 token、batch、layer 或 tile。
-
-KV cache 会把数据布局、生命周期和并发重新组合。它是跨 token 持续增长的状态，既要高效访问，又要按请求隔离；既要避免频繁分配，又要在请求结束后释放；如果支持多请求 batch，还要处理不同序列长度和 padding。第二册的 BatchView、MemoryShape、QueueContract 和 ProgressAndReclaim 都会成为设计材料。没有这些基础，KV cache 很容易写成巨大 vector 和一堆特殊 if。
-
-推理服务还会用到分布式思想。即使只在本机跑，request id、deadline、取消、重试、背压和 trace 仍然重要。用户取消请求时，已经排队的 token task 如何取消；模型加载失败时，错误如何传播；batch 太大时，系统是排队、拒绝还是降级；输出 token 流式返回时，哪一步算提交。这些问题都不是 AI 特有，而是第二册已经训练过的系统问题。
-
-因此项目目录中可以预留 \filepath{engine/inference}，但只放接口草案，不展开模型正文。接口草案包括 \code{ModelArtifact}、\code{TensorBuffer}、\code{KernelVariant}、\code{InferenceRequest}、\code{TokenTask} 和 \code{InferenceTrace}。每个接口旁边标注它复用哪个计算系统能力。这样后续进入推理引擎时能从系统地基出发，而不是重新搭工程骨架。
-
-\topic{项目演进路线：继续扩展而不散}
-
-Compute Systems Engine 后续还可以扩展，但每次新增能力都要先说明它在系统链路中的位置：它处理数据移动、执行调度、同步等待、I/O 完成、分布式提交还是后续推理算子语义。找不到位置，就不应直接加入主线。新增能力至少要带一个项目对象、一个反例、一个实验或一个源码阅读入口。这样可以防止项目变成功能堆叠。
-
-修改已有模块时，先检查是否重复第一册已经解决的问题。ABI、虚拟地址、进程和汇编可以作为基础被引用，但第二册关注的是它们在多核、性能、并发和分布式场景中的新影响。若某段实现只是复述基础定义，应缩短；若它能解释 TLB、page fault、NUMA first-touch、热循环或恢复边界，才应进入本册项目。
-
-演进还要保护读者体验。目录保留章级结构，正文用少量编号小节组织大块内容，topic 只作为段内提示。新增图示优先用文本图和事件表，避免移动端把核心信息解析成难读图片。代码块保持 Maple 字体、固定宽度类型和可读缩进。每次生成 PDF 和 EPUB 后，都要抽查目录、章节标题、代码换行和手机阅读效果。
-
-最重要的是保护内容密度。任何新增正文都应增加原理、案例、实验、源码阅读或项目设计中的真实内容。为了保持规模而保留空泛段落，会稀释真正有价值的材料。项目越大，越要敢于删除不承担结构功能的文字，再用具体输入、状态、代码和故障演练补上。
-
-\topic{计算系统自测项目}
-
-读者可以用一个自测项目检验本章能力。项目输入是一组本地日志文件，输出是按 event type 和用户桶聚合的结果。要求先写串行 reference，再实现列式 batch，再实现线程本地 partial，再实现并行 filter 和 partition，再实现任务图调度，再实现有界异步写出，最后实现本机 MessageBus 和故障注入。每一步都必须保留上一版对照。
-
-自测项目有明确通过标准。功能上，所有版本输出与 reference 一致；性能上，报告能解释主要瓶颈和迁移；并发上，队列关闭、任务取消和异常收束有测试；I/O 上，短写和崩溃点能恢复；分布式上，响应丢失、重复请求和旧 epoch 不会重复提交。若某一步做不到，不要继续加功能，而是回到对应章节补不变量和测试。
-
-自测项目还要求写一页复盘。复盘不写“学到了很多”，而写具体能力：哪个数据结构因为 MemoryShape 改了布局，哪个热循环因为 HotKernelReport 找到瓶颈，哪个队列因为 QueueContract 修复关闭，哪个 task 因为 TaskStateRecord 找到长尾，哪个故障因为 MessageEnvelope 和 OwnershipEpoch 被拒绝。能写出这种复盘，就说明计算系统方法真正被消化。
-
-这也是后续 CPU 推理引擎的入场考试。只有自测项目跑通并能解释，才适合进入推理引擎。否则 AI 项目中的每个问题都会被缓存、线程、I/O 和协议基础拖住。计算系统训练的目的不是延迟 AI，而是让 AI 项目站在可靠系统上。
-
-\topic{术语、接口和章节边界的一致性}
-
-最后还要做一项经常被忽视的工作：术语一致性。一本系统教材如果前面叫 task，后面叫 job unit，再后面叫 work item，读者会以为它们是三个概念。本书规定：job 表示一次完整作业，stage 表示一组依赖边界相同的任务，task 表示逻辑工作单元，attempt 表示一次物理执行，request 表示一次消息交互，block 表示可校验的数据输出，manifest 表示已提交输出集合，epoch 表示所有权轮次。任何新增章节都要沿用这些词，除非明确解释为什么需要新词。
-
-接口一致性同样重要。HotKernelReport 不应在某章变成 BenchmarkResult 的同义重复；QueueContract 不应在 I/O 章另起名字；CompletionRecord 和 MessageEnvelope 的共同字段应保持一致；OwnershipEpoch 不应被普通 version 字段替代。术语一致不是文字洁癖，而是让读者能把一个对象从硬件、运行时、I/O、分布式一路追踪到最终项目。如果名字频繁变化，trace 和报告也会断裂。
-
-章节边界也要复查。基础册已经讲过进程、虚拟地址、ELF、调用约定和基础汇编，这里引用这些知识时，应服务于多核、性能、并发或分布式问题。例如虚拟地址在这里主要进入 TLB、page fault、NUMA first-touch 和 mmap I/O；汇编主要进入热循环、依赖和向量化；进程主要进入隔离、消息和故障恢复。若某段内容只是重复基础定义，就应该删短。
-
-全书内部也要避免混讲。数组局部性放在缓存和布局章，原子可见性放在内存序章，数据结构回收放在无锁章，重试和幂等放在分布式模型章。章节之间可以衔接，但不要在每章都重新讲一遍全部概念。读者需要的是一条推进线，而不是每章都从头开始。
-
-系统复查可以按接口追踪法进行。选择 \code{TaskStateRecord}，检查线程章、锁章、运行时章、I/O 章、分布式章是否使用同一含义；选择 \code{ManifestEntry}，检查 I/O、分布式和最终项目是否同一提交语义；选择 \code{BatchView}，检查布局、SIMD 和内核章节是否同一生命周期语义。接口追踪比随机翻页更能发现断裂。
-
-排版上也要保持一致。章节主标题承担大结构，小节承担聚合，topic 只作为段内提示。代码块不应被过窄字体压扁，Maple 字体和语法颜色服务阅读而不是装饰。正文以黑色为主，色彩用于盒子、标题和代码强调。EPUB 中不依赖图片和复杂表格，文本图必须能独立说明。这样 PDF 和手机阅读都能保持稳定。
-
-这项一致性工作看似不像“新增知识”，实际决定学习质量。经典系统材料读起来舒服，往往不是因为每页都有新术语，而是因为术语稳定、结构克制、案例递进、反例明确。本书要达到这个标准，就必须把接口、章节和排版一起维护。
-
-\section{工程交付清单和演进规则}
-
-工程交付时，仓库里不应只留下 PDF 和 EPUB，还应留下能解释系统质量的工程痕迹。第一类痕迹是构建痕迹：书籍产物能稳定生成，手机目录中有对应副本。第二类痕迹是运行痕迹：reference、并行版本、故障模拟和恢复扫描都能由 runbook 复现。第三类痕迹是格式痕迹：目录只列章，正文小节编号清楚，topic 不进入目录也不打断正文。第四类痕迹是内容痕迹：每章都有原理、案例、实验、源码或工具入口、项目接口和反例。第五类痕迹是版本痕迹：仓库历史能追踪接口、报告和产物变化。
-
-后续迭代规则也要明确。若继续扩展 Compute Systems Engine，不要一次加入多个互不相关的机制。每次新增内容先选定模块，写清要修补的具体缺口，再补对应案例、实验或源码阅读。新增后运行 reference、故障矩阵、LaTeX 构建和 EPUB 检查。若某次扩展牺牲连贯性，就应删除重写。系统越大，越要靠小步、可验证、可回退的规则维护。
-
-后续新项目开始前，应冻结本项目的基础接口。冻结不是永远不改，而是任何改名、改语义、改字段都要检查全书引用和项目代码。比如 \code{attempt} 不能突然表示模型推理轮次，\code{epoch} 不能同时表示训练轮次和所有权轮次，\code{manifest} 不能一会儿表示文件列表，一会儿表示内存缓存。若新项目需要新概念，就给新名字，并说明和已有概念的关系。
-
-读者使用本书时，也可以把交付清单变成自己的学习清单。读完一章，不是问“我看完了吗”，而是问“我能不能把本章接口写进项目，能不能跑一个最小实验，能不能解释一个反例，能不能写出未验证边界”。如果答案是否定的，就回到该章，而不是继续往后赶。系统知识不是靠阅读速度积累，而是靠可运行、可测量、可解释的对象积累。
-
-本书最终要达到的状态，是让读者觉得每个概念都从具体问题里长出来，每个实验都能检验一个判断，每个接口都能服务后续项目，每个反例都能防止误用。做到这一点，项目规模才有意义；否则内容再多也只是堆砌。最终项目的演进也应围绕这个标准进行。
-
-\topic{分阶段验收流程}
-
-最终项目不要一次验收全部能力，而要按问题切片。第一轮只看主线：数据是否从 input split 进入 parser、batch、partial、shuffle block、manifest 和 final output，控制面是否从 task、attempt、epoch、checkpoint 走到恢复。若某段实现无法说明它在这条主线中的位置，就要么删除，要么改写成项目对象、失败路径或实验。
-
-第二轮只看概念来源。缓存相关对象应从地址序列和字段访问推出；锁和条件变量应从队列不变量和等待谓词推出；异步 I/O 应从提交和 completion 分离推出；RPC 和重试应从本地调用栈失效推出。若概念先出现，问题后补，就调整顺序。系统学习的高级感来自“问题逼出机制”，不是“机制排列成表”。
-
-第三轮只看案例质量。每个案例都要有朴素版本、失败信号、改进版本和验收指标。朴素版本不能省，因为读者需要看到直觉方案为什么诱人；失败信号不能空，因为它决定机制是否必要；改进版本不能只给答案，因为它要解释成本迁移；验收指标不能只写耗时，因为正确性、资源和恢复也要验证。
-
-第四轮只看代码示例。C++ 示例要使用位宽明确的整数类型，避免模糊长整型；热路径接口应优先使用 span、string view 和只读引用，避免无意义拷贝；类方法示例中成员访问要清楚，状态枚举要表达非法组合不可出现；项目实现路线中避免把递归作为主要运行时策略，任务图和遍历更适合显式 worklist。
-
-第五轮只看可验证性。硬件章节偏 benchmark 和反汇编，并发章节偏状态表和压力测试，I/O 章节偏崩溃点矩阵，分布式章节偏故障注入和 commit table，最终项目偏端到端 runbook。若某个机制没有可验证材料，就说明内容仍停在讲述层，没有进入工程层。
-
-\topic{变更合并规则}
-
-项目演进不能把所有想法一次性混进去。合并顺序应按风险排序。第一类是正确性问题，例如术语含义冲突、代码示例错误、内存序说明不成立、分布式提交语义不完整，这类必须先修。第二类是结构问题，例如模块边界混乱、目录层级不合适、案例和原理脱节。第三类是深度问题，例如某个原理缺少推导、某个实验缺少变量、某个源码入口没有说明。第四类才是文字润色和局部排版。
-
-每次合并只处理一组同类问题。比如修分布式章的超时和幂等，就不要同时改 SIMD 代码排版；整理目录层级，就不要同时扩写 Linux 源码阅读。这样做是为了让 diff 可审查。大型项目如果每次提交同时改几十类问题，后面发现错误时很难知道是哪次改动引入的。教材项目和代码工程一样，需要小步、可回退、可解释。
-
-合并后要做三项局部复查。第一，读改动前后各三段，确认衔接没有断。第二，运行 reference 和相关故障测试，确认没有因为删改破坏语义。第三，如果改动包含 LaTeX 命令、代码块、下划线或反斜杠，立即构建 PDF，并抽取文本检查是否有原始符号泄漏。不要等全书改完再构建，格式错误越早发现越便宜。
-
-若两个建议冲突，要按学习目标裁决。比如一个建议希望增加更多标题，另一个建议希望减少碎片，应优先保持教材阅读流畅：正文可以有编号小节，但不要把每个知识点都升成标题。再比如一个建议希望加图片，另一个建议担心 EPUB 解析，应优先保证手机阅读稳定；能用文本图和清楚叙述解决的，就不引入图片。
-
-\topic{回归阅读路径}
-
-项目修改后，还需要做一次回归阅读。回归阅读不是重新润色全文，而是沿三条路径抽查。第一条路径是数据路径：从 \code{InputSplit} 到 \code{ParsedLogBatch}，到 partial，到 \code{ShuffleBlock}，到 \code{ManifestEntry}，到最终输出，检查每个状态是否仍然有稳定身份、所有者和提交语义。第二条路径是执行路径：从 worker 线程到 task graph，到 I/O completion，到 driver retry，检查等待点是否清楚、取消是否收束、背压是否传播。第三条路径是证据路径：从 reference 到 benchmark，到 trace，到 fault injection，到 final report，检查每个结论是否能被验证材料支撑。
-
-这三条路径覆盖的是系统骨架。随机读一页可能发现错别字，却不一定发现系统逻辑断裂；沿路径读，能发现前后术语是否一致、接口是否变形、某章新增内容是否破坏后文。比如 \code{BatchView} 生命周期如果在布局章改了，就要检查 SIMD、任务运行时和 I/O 章节有没有继续假设旧生命周期；\code{MessageEnvelope} 如果新增 epoch，就要检查分区复制章和最终项目是否使用同一含义。回归阅读的目标是保持整本书像一个系统，而不是一组文章。
-
-回归阅读还要保留记录。每次发现问题，写明路径、位置、影响和修复方式。若问题只影响文字，可以局部改；若影响接口，就要检查全书引用；若影响项目代码，就要补测试。这样书和项目能同步演进。
-
-\topic{逐章验收索引}
-
-最终验收可以按逐章索引执行。第一章检查系统账本：record、task、attempt、block、manifest 是否贯通，数据面和控制面是否分开。第二章检查热循环证据：源码、反汇编、输入分布、分支和依赖是否能互相解释。第三章检查地址序列：连续、步长、随机、mmap 冷读和容器遍历是否有对照。第四章检查拓扑：false sharing、线程本地 partial、first-touch 和分层合并是否各自有实验。
-
-第五章检查测量：reference、字节账本、计数器、统计口径和环境记录是否齐全。第六章检查布局：热字段、冷字段、arena、句柄、索引位宽和写路径是否讲清。第七章检查 SIMD：标量语义、尾部、mask、溢出、误差和 fallback 是否存在。第八章检查内核模式：map、filter、scan、partition、histogram、join、top-k 和 frontier 是否各有数据结构和失败点。若这八章只剩概念介绍，没有实验和对象，就说明基础部分还没写实。
-
-第九章检查线程：worker snapshot、阻塞路径、亲和性、大小核和持续运行曲线是否可解释。第十章检查同步：队列谓词、关闭状态、RAII、futex 和信号量资源计数是否分清。第十一章检查原子：计数、发布、状态机、CAS 副作用和等待策略是否分类。第十二章检查无锁：SPSC ring、ABA、hazard pointer、epoch 和 RCU 是否围绕生命周期讲，而不是只展示 CAS。并发部分的验收标准，是每个共享状态都能回答谁写、谁读、什么时候可见、什么时候释放。
-
-第十三章检查并行语义：identity、结合律、scan 输出位置、partition 稳定性、浮点误差和重做边界是否明确。第十四章检查运行时：ready count、worker deque、future 饥饿、取消、trace 和任务粒度是否形成状态机。第十五章检查 I/O：completion、buffer 生命周期、短写、崩溃点矩阵、背压闭环和错误分类是否进入类型。并行运行时部分的验收标准，是一个失败 task 或失败 write 能被追踪到明确状态，而不是只在日志里出现一行错误。
-
-第十六章检查消息：request、attempt、deadline、版本、幂等表、重试预算和观察字段是否完整。第十七章检查状态归属：partition、routing version、OwnershipEpoch、热点拆分、副本落后和共识边界是否分清。第十八章检查毕业系统：runbook、fault injection、manifest、trace、final report 和第三册接口是否闭环。分布式部分的验收标准，是超时、迟到响应、旧 epoch 和 driver 重启都不会改变已经提交的语义。
-
-这个索引还有一个作用：防止后续扩展重新退回通用化。新增段落如果找不到对应章节对象，就先不要写；能找到对象，也要补一个输入、一个状态、一个实验或一个失败点。比如给缓存章新增内容，就必须落到地址、页、cache line 或 TLB；给 I/O 章新增内容，就必须落到 request、buffer、completion、manifest 或崩溃点。用这种索引验收，教材会越来越具体，而不是越来越厚但越来越空。
-
-交付后还应做抽样阅读。第一种抽样是顺序抽样：每一部分选一章，从章首读到章尾，检查概念是否从问题推出，案例是否从朴素方案走到改进方案，实验是否能验证判断。第二种抽样是对象抽样：选择 \code{BatchView}、\code{QueueContract}、\code{CompletionRecord}、\code{MessageEnvelope} 等接口，沿全书查它是否保持同一含义。第三种抽样是失败抽样：选择短写、迟到响应、线程池饥饿、热点 key、TLB miss 这些失败，看书中是否有现象、原因、修复和验收。三种抽样比从头泛读更容易发现结构问题。
-
-抽样阅读时要允许删改。若一个段落读起来像任何章节都能用，就改成当前章节的具体对象；若一个案例只有最终答案，就补朴素版本和失败信号；若一个实验只有耗时，就补正确性、资源和边界；若一个接口只在书里出现，项目中没有最小对应，就补测试或降低承诺。内容规模越大，质量控制越重要，因为多余段落会稀释真正有教学价值的内容。
-
-最终章还要给读者一个判断标准：学完第二册后，面对一个新的计算任务，应先画数据身份和所有权，再写串行 reference，然后建立测量基线，再决定布局、并行、同步、I/O 和分布式边界。若读者一上来就想开线程、写无锁队列或拆分节点，说明还在用工具驱动设计；若能先问输入是什么、输出如何提交、失败如何恢复、瓶颈如何证明，说明已经形成系统思维。
-
-这套标准也约束第三册。CPU 推理引擎不是一个孤立 AI 程序，而是一组计算系统问题的组合：模型文件是大输入，tensor 是布局对象，算子是热内核，batch 是调度单位，KV cache 是生命周期和并发问题，流式 token 是提交语义，量化误差是正确性合同。第三册可以引入模型和算子细节，但不能放弃第二册建立的账本、证据、状态和恢复习惯。
-
-因此，最终交付不是把所有话说完，而是把一条可靠学习路线固定下来。遇到硬件问题，先找地址、指令和计数器；遇到并发问题，先找不变量、等待和生命周期；遇到并行算法问题，先找串行语义、输出位置和合并顺序；遇到 I/O 问题，先找完成事件、buffer 和提交点；遇到分布式问题，先找消息身份、epoch 和幂等边界。读者能按这条路线独立分析新问题，并能把新问题落到对象、状态和证据上，本章才真正完成了它的任务。
-
-读者能力验收还可以换成口头答辩。第一题给一段变慢的循环，要求读者先问输入规模、地址序列、分支分布、编译选项和计数器，而不是直接建议改写代码。第二题给一个偶发卡死的线程池，要求读者画出任务状态、等待关系、队列容量和关闭路径，而不是只说加线程。第三题给一个写出后崩溃的作业，要求读者说明临时文件、校验、提交记录和恢复扫描怎样配合。第四题给一个响应丢失的远端任务，要求读者区分超时、重试、迟到响应和重复提交。若这些问题能回答清楚，说明第二册知识已经能迁移到新场景。
-
-答辩时还要追问取舍。为什么不用更复杂的无锁队列，为什么某个阶段要材料化，为什么某个数据结构牺牲了内存换局部性，为什么某个重试预算宁可早失败，为什么某个指标只做趋势而不做绝对门槛。能回答取舍，说明读者不只是记住方案，还理解了约束。系统工程没有永远正确的技巧，只有在给定工作负载、硬件、失败模型和维护成本下更合适的选择。
-
-最后一项验收是让读者删掉一个自己写过的抽象。删之前要说明它原本想解决什么问题，实际有没有被测试、有没有被项目调用、有没有让状态更清楚；删之后要说明哪些代码变简单，哪些能力没有丢。这个练习看似和性能无关，却能训练工程判断。很多系统变差不是因为缺少知识，而是因为每次学习一个新概念就把它加进项目，却没有证明它真的承担责任。
-
-本册的高质量标准最终落在这三件事上：概念从问题中长出来，代码从不变量中长出来，优化从证据中长出来。只要后续修改仍守住这三点，项目可以继续扩展；如果某次扩展只是增加名词、增加标题、增加看似专业的段落，就应回到这一节重新审查。第二册已经建立了足够大的系统面，后续最重要的不是继续堆内容，而是保持每一段都能服务读者理解真实计算系统。
-
-最后还要强调学习顺序。读者不要把本册当作速查手册，从某个名词跳到另一个名词；更好的方式是把每章都放回同一个作业里观察。先看一条数据怎样进入系统，再看它怎样被核心执行，再看它怎样跨缓存和页移动，再看多个线程怎样分享或避免分享状态，再看算法怎样把输出位置算出来，再看运行时怎样安排任务，再看写出怎样变成可恢复结果，最后看远端消息怎样保持同一次提交。沿着这条路线读，硬件、软件、算法和分布式不会互相割裂，而会变成同一个计算过程的不同侧面。这样的学习方式慢一些，但每一步都能落到对象、状态和实验，比背概念更可靠。
-
-如果后续继续扩展，优先补那些读者会真正卡住的地方：一是从朴素方案到改进方案之间缺少失败信号，二是代码示例没有说明生命周期和错误路径，三是实验只给结果没有解释变量，四是章节之间缺少承接，五是术语在不同章节含义漂移。每次只修一个具体缺口，并在修完后重新构建和抽样阅读。这样第二册会越来越像一本能带人做项目的教材，而不是越来越像资料合集。
-
-最终读者应带走一种工作习惯：先把问题放到一个可观察的场景里，再写出最小正确版本，再设计能击穿它的压力条件，然后才引入更复杂的机制。每个机制都要回答它解决了什么失败，增加了什么成本，怎样被测试，怎样在失败后恢复。只要坚持这个顺序，面对新的硬件、新的运行时、新的数据规模或新的分布式边界，读者也能继续推导，而不是只能复述书里的例子。
-
-这也是本册和普通资料汇编的区别。资料汇编回答“有什么”，本册要回答“为什么需要、怎样长出来、哪里会失败、怎样证明”。后续所有修改都应守住这个差别。只要一段内容不能帮助读者形成判断，就应重写。
-
-判断力比名词更重要。
-
-\topic{观测性}
-
-Compute Systems Engine 从输入 split 到最终 manifest 的毕业项目中，观测性首先表现为对象边界是否清楚：\code{InputSplit}、\code{ParsedLogBatch}、\code{ShuffleBlock}、\code{ManifestEntry}、\code{TaskStateRecord}、\code{CompletionRecord} 和 \code{MessageEnvelope} 都要能说明自己的身份、所有者和状态。若其中一个对象只在日志文本里出现，而没有稳定字段，事故发生时就无法把输入、任务、写出和提交串起来。
-
-\topic{Map 端本地聚合}
-
-Map 端本地聚合的出发点是串行语义：输入怎样变成输出，输出位置由谁决定，合并顺序是否影响结果。它不是单纯为了减少网络字节，而是把共享写和远端传输推迟到局部语义明确之后。每个 map worker 先在本地 partial 中合并，再按 partition 写出 block；reduce 阶段只处理已经提交的 block。这样优化和恢复共享同一套身份。
-
-\topic{检查点的内容}
-
-检查点记录控制面，而不是复制所有数据面内容。它至少要保存 job id、stage、task table、attempt 状态、accepted manifest generation、route epoch 和重试预算。大块 shuffle 数据通过路径、checksum 和 manifest 引用恢复。若 checkpoint 只保存“正在运行”这种模糊状态，driver 重启后就无法区分已经提交、可以重试和必须丢弃的 attempt。
-
-\topic{事故复盘：最终引擎为什么先做 reference}
-最终项目最容易变成“正常路径能跑”的拼装程序：读取输入、并行 map、shuffle、reduce、输出 word count。真正的事故发生在故障路径。丢一个 shuffle block、Driver 在 commit 后重启、旧 attempt 晚到、worker 临时文件残留，程序仍然返回成功，却无法解释结果是否等于串行语义。没有 reference，所有性能和容错讨论都没有地基。
-
-Reference 不是慢版本凑数，而是语义法庭。它定义输入解析、错误行处理、key 规范化、计数溢出、输出排序和 checksum。并行版本、异步版本、分布式模拟版本都要向它对齐。Manifest、checkpoint、trace、temporary block、retry budget 和 message envelope 都围绕这个 reference 服务。每次加入优化，都先说明它改变了执行顺序、数据布局还是故障恢复，不能改变什么语义。
-
-毕业引擎的验收按阶段打开复杂度。先跑串行 reference，再跑无故障并行，再开背压，再开响应丢失，再开 Driver 重启，再开旧 attempt 迟到。每一步检查最终输出、manifest 条目、checkpoint generation、trace 事件和临时目录清理。性能报告最后写，先证明系统知道自己做了什么。这样第二册收束成一个可复查的计算系统，而不是一堆 demo。
-
-
-\topic{毕业项目实验判读}
-最终引擎不能只展示正常运行。判读顺序是先跑串行 reference，再跑无故障并行版本，再逐个打开故障注入。每次故障后检查最终输出、manifest、checkpoint、trace 和临时文件清理。性能报告要说明瓶颈从 parser、shuffle、writer、driver 哪一段迁移。若 runbook 无法让另一个人复现，项目还没有交付完成。
-
-
-这一段也服务于复习。读者合上书后，应该能凭本章的判读口径重新审查自己的代码：有没有最小正确版本，有没有能击穿旧方案的输入，有没有状态记录，有没有资源指标，有没有失败后的恢复动作。若五个问题缺两个以上，就说明实现还停在演示层，而不是工程层。
-
-
-\topic{最终 runbook 的内容标准}
-毕业项目 runbook 要让另一个人能复现同一结果。它应包含构建命令、输入生成、串行 reference、无故障运行、每个故障注入开关、预期输出、检查 manifest 的命令、清理临时文件的方式和性能报告位置。没有 runbook，项目很容易退化成只能在单一环境中复现的演示。
-
-Runbook 还要写失败时怎么判断。比如 shuffle block 缺失时，应该看到哪个 task 回到 pending；checkpoint 损坏时，driver 应从哪个 generation 恢复；旧 attempt 晚到时，manifest 是否拒绝；慢 writer 时，哪个队列水位上升。每个判断都要对应 trace 字段，而不是靠人工读日志猜。
-
-给后续推理引擎留下接口时，也要写在 runbook 里。这里先预留 tensor batch、kernel backend、inference request 和 trace 位置，不展开模型原理。这样 CPU 推理引擎可以接入当前系统，同时复用调度、测量、I/O 和恢复框架。当前工程章的收束才不会和后续模型章节抢内容。
-
-\topic{实验课：最终引擎的端到端故障矩阵}
-毕业项目先跑串行 reference，再跑无故障并行版本，最后逐个打开故障注入。故障矩阵至少包含：跨 split 行、parse error、map worker 崩溃、shuffle block 截断、写出短写、manifest 写失败、响应丢失、旧 attempt 晚到、checkpoint 损坏、driver 重启。每个故障都要写预期状态，而不是只写应该成功。
-
-端到端验收不只看最终计数。还要看 manifest 中有效 block 数、临时文件清理、task table 状态、checkpoint generation、trace 中的 retry 和 ignored response。若最终输出正确但临时文件无限增长，系统仍不成熟；若故障后需要人工猜测恢复点，runbook 也不合格。
-
-性能报告和故障报告要同源。无故障时记录 parser、map、shuffle、reduce、writer、commit 各阶段时间；故障时记录额外重试、等待和恢复时间。这样读者能看到可靠性成本在哪里，而不是把恢复当作免费能力。某些场景下更频繁 checkpoint 会让恢复更快但正常路径更慢，报告要明确这种取舍。
-
-第三册接口只做预留。把 TensorBuffer、KernelVariant、InferenceRequest、InferenceTrace 写成草案，说明它们复用第二册的 batch、backend dispatch、任务图和 trace。不要在第二册末尾突然讲模型结构；第二册的任务是交付计算系统地基，让第三册可以自然接上。
-
-\topic{毕业项目练习验收重点}
-合格答案是一份可执行 runbook，而不是项目介绍。它要包含 reference、输入、构建命令、故障矩阵、manifest 检查、checkpoint 恢复、trace 摘要和性能报告。每个模块至少有一个反例测试。第三册接口只能预留，不应把 AI 正文提前塞进第二册。
-
-答案还要写“为什么不采用更复杂方案”。例如没有证据证明队列是瓶颈，就不应把锁队列换成无锁；没有证明输出顺序可变，就不应随意重排；没有证明错误路径能恢复，就不应只提交正常路径。能解释不做什么，说明读者开始具备工程判断。
-
-最后，答案必须包含可复查材料。至少有输入摘要、关键状态、期望输出、实际输出、运行命令和未验证边界。没有这些材料，老师或同伴无法判断结论是否成立。第二册的作业不是让读者写漂亮段落，而是训练读者把系统问题变成可验证证据。
-
-\topic{项目实现：分布式计算工程实践}
-本章对应的贯穿项目实现不要求一次写成完整框架，但必须有最小可运行切片。这个切片包含三个部分：一个 reference，一个带本章机制的实现，一个能击穿 reference 之外隐含假设的测试。Reference 用来固定语义，机制实现用来展示本章知识，测试用来证明新增复杂度确实解决了问题。
-
-代码组织上，不要把所有内容放进一个大文件。基础类型、输入生成、核心机制、报告输出和测试应分开。即使当前只是教学项目，也要让目录能表达责任边界。这样后续章节接入时，不会因为找不到状态归属而重新发明一套对象。
-
-每个实现都要输出一段机器可读摘要。摘要至少包含输入规模、关键状态、错误数、输出校验、耗时和未验证边界。这里的机器可读不要求复杂格式，简单的 key value 文本也可以。关键是让脚本和读者都能复查，而不是只能看屏幕截图。
-
-测试应包含正常路径、边界路径和失败路径。正常路径证明功能可用；边界路径证明长度、容量、尾部、空输入、关闭或超时没有遗漏；失败路径证明本章机制不是装饰。若失败路径写不出来，往往说明本章概念还没有落到工程对象上。
-
-报告最后写一个取舍段。新增机制带来了什么好处，增加了什么成本，哪些场景不应该使用它，下一章会复用哪个字段或对象。这个取舍段非常重要，因为系统工程不是把所有高级机制都加进去，而是在证据和约束下选择合适的边界。
-
-\topic{调试笔记：毕业项目失败先查控制面}
-最终引擎失败时，不要先改热内核。先查控制面：input manifest 是否完整，task table 是否有重复有效 attempt，shuffle manifest 是否只引用校验通过的 block，checkpoint generation 是否单调，driver 重启后 running 任务如何处理。控制面解释不了，数据面再快也无法保证结果可信。
-
-
-\topic{复查清单：分布式计算工程实践}
-复查本章时，先检查 reference 是否仍然存在。没有 reference，后面的并发、优化、异步或分布式改造都无法证明语义没有变。再检查压力输入是否尖锐：它应当攻击本章最核心的边界，而不是只把数据量放大。第三，检查状态是否可观察：关键对象的身份、状态、错误和提交结果应能在报告中找到。
-
-第四，检查代码示例是否说明禁止行为。调用者不能做什么，往往比能做什么更能体现工程质量。第五，检查实验是否写出未验证边界；当前设备、权限或输入无法证明的结论，必须标注。第六，检查本章对象是否能被下一章复用，不能复用就说明边界还不稳。
-
-完成这六项后，再看文字是否连贯。每个概念都应从问题推出，每个案例都应从朴素方案走到改进方案，每个实验都应能解释一个判断。若某段话放到其他章节也成立，就把它改成本章的具体对象、具体输入和具体失败。
-
-\section{毕业项目：实现一个可恢复的本机分布式计算引擎}
-
-第二册的最终项目不是做一个庞大框架，而是把全书概念收束成一个可运行、可测量、可恢复的小系统。它在一台 Linux 机器上模拟 driver、worker、message bus、shuffle storage 和 manifest，用本机进程或线程传消息，但语义按分布式系统写：消息有身份，attempt 可重复，输出通过 manifest 提交，故障可以注入，恢复可以演练。
-
-\topic{一、项目目标和非目标}
-目标是处理一批日志，按 key 聚合计数，输出确定结果。系统要支持输入切分、map 本地聚合、shuffle block 写出、reduce 合并、manifest 提交、失败重试和 checkpoint。非目标是高吞吐商业框架、完整网络协议、复杂 SQL、自动资源管理。范围小不是降低质量，而是让每个语义都能被读者看见和测试。
-
-项目必须保留串行 reference。任何并行或分布式输出都先和 reference 比较。若 key 顺序不同，就按合同排序后比较；若错误处理不同，就先统一错误合同。没有 reference，毕业项目会变成“看起来能跑”的 demo，而不是教材级工程。
-
-\topic{二、模块边界}
-Driver 负责 job 状态、task 切分、attempt 管理、重试预算和 manifest commit。Worker 负责执行 map 或 reduce，不直接决定全局提交。MessageBus 负责传递消息、注入延迟、重复、丢失和乱序。ShuffleStore 负责写临时 block、校验、列出已提交 block。Manifest 负责定义哪些输出对 reduce 可见。
-
-这些边界不能混。Worker 可以写临时文件，但不能把自己写出的文件直接变成全局有效；MessageBus 可以丢消息，但不能修改 payload 语义；ShuffleStore 可以报告写失败，但不能替 driver 决定重试。每个模块只承担自己的责任，故障时才能定位。
-
-\topic{三、数据格式从热路径和恢复共同决定}
-输入 split 保存文件名、offset、length 和 split id。Map 输出 block 保存 partition id、attempt id、record count、checksum 和 payload。Reduce 输出保存 key、count 和 deterministic order。格式要既适合顺序读写，也适合恢复校验。不要把调试文本塞进热 payload；调试信息通过 manifest 和 trace 关联。
-
-Block 文件可以先用简单二进制或文本格式，但必须有 header。Header 至少包含 magic、version、partition id、attempt id、payload size 和 checksum。版本字段让后续格式变化可检测；checksum 让 reduce 不只相信文件存在；attempt id 让重复输出可识别。格式小，也要有工程边界。
-
-\topic{四、Map 阶段先本地 combine}
-Map worker 读取 split，解析记录，生成本地 \code{unordered_map} 或排序数组，再按 partition 写 block。不要每条记录都发消息给 reduce。Map-side combine 减少 shuffle 字节，也降低热点 key 压力。这里复用了第 13 章 reduce 和 partition 的思想：局部聚合，分区输出，manifest 提交。
-
-本地 combine 的数据结构要按 key 基数选择。key 少时数组桶更快；key 多时哈希表更通用；key 极端倾斜时热点 key 可以单独计数。项目第一版可以用哈希表，但报告要记录 key 数量、最大 bucket、输出 block 大小和 combine ratio。这样后续优化有依据。
-
-\topic{五、Reduce 阶段只读 manifest}
-Reduce worker 不扫描临时目录，只读取 manifest 中属于自己 partition 的 block。它校验 header 和 checksum，合并 key，输出最终结果。若某个 block 文件存在但未提交，reduce 必须忽略；若 manifest 条目指向的 block 校验失败，reduce 报告输入损坏，driver 决定重试或失败。
-
-这个规则看似严格，却是恢复语义的核心。目录扫描会把未提交、旧 attempt、部分写入文件混进结果；manifest 把“写过”与“有效”分开。第 15 章 I/O、第 16 章幂等、第 17 章控制状态都在这里汇合。
-
-\topic{六、Checkpoint 记录控制面，不复制所有数据}
-Checkpoint 至少记录 job id、stage 状态、已完成 task、已提交 manifest、route epoch、重试预算和未完成 attempt。大块 shuffle 数据不必全部写进 checkpoint，只要它们有稳定文件、checksum 和 manifest 引用。这样 checkpoint 小，恢复快，也符合控制面和数据面分离。
-
-恢复时，driver 读取 checkpoint 和 manifest，重建 task 状态。已提交 block 不重复计算；未提交或校验失败的 attempt 重新调度；迟到响应根据 attempt id 和 manifest 状态忽略。恢复流程要写成测试，而不是只写文档。杀进程、删除临时文件、重复投递响应，都应在故障矩阵里出现。
-
-\topic{七、故障矩阵}
-毕业项目至少覆盖八类故障。第一，map 请求丢失。第二，map 响应丢失但 block 已写出。第三，worker 写出短写。第四，driver 在 manifest commit 前崩溃。第五，driver 在 commit 后响应前崩溃。第六，旧 attempt 迟到。第七，reduce 读取 block 时 checksum 失败。第八，热点 partition 导致长尾。每类故障都要写期望状态和验收指标。
-
-故障矩阵让项目不像玩具。很多系统 bug 不是 happy path 不会跑，而是某个边界状态没人定义。矩阵中的每一行都迫使读者回答：哪个对象拥有状态，哪个结果已经提交，哪个动作可以重试，哪个临时产物要清理。
-
-\topic{八、性能报告和恢复报告分开}
-毕业项目要有两份报告。性能报告记录输入规模、key 分布、线程数、block size、map 时间、shuffle 写时间、reduce 时间、manifest 时间、队列水位和硬件证据。恢复报告记录故障注入、重试次数、重复响应、忽略的旧 attempt、恢复耗时和最终 reference 比较。两份报告都重要，不能用吞吐掩盖恢复漏洞，也不能用可靠性忽略明显瓶颈。
-
-报告中还要写未验证边界。例如没有真实多机网络，没有磁盘断电测试，没有跨 NUMA 设备，没有真实权限读取某些 PMU。诚实边界不会降低项目质量，反而说明读者知道系统结论依赖环境。
-
-\topic{九、代码组织建议}
-项目可以按模块组织：\filepath{engine/driver}、\filepath{engine/worker}、\filepath{engine/message}、\filepath{engine/shuffle}、\filepath{engine/runtime}、\filepath{engine/tests}。公共类型放在 \filepath{engine/model}，例如 JobId、TaskId、AttemptId、PartitionId、MessageEnvelope、ManifestEntry。不要让所有东西放在一个大文件里，也不要让 worker 直接 include driver 内部状态。
-
-C++ 接口要表达所有权。消息 payload 使用值或引用计数块；I/O block 提交后移动所有权；manifest entry 是不可变记录；driver 状态由单线程事件循环或明确锁保护；worker 不持有 driver 指针，只通过 MessageBus 通信。这样的组织能把第二册的并发和分布式原则落到代码结构。
-
-\topic{十、最终验收}
-最终验收分五步。第一，串行 reference 通过全部输入。第二，无故障分布式模拟输出与 reference 一致。第三，故障矩阵全部通过，且没有读取未提交 block。第四，性能报告能解释主瓶颈和一次优化前后成本迁移。第五，代码审查能列出每个共享状态、每个原子、每个队列和每个持久提交点的合同。
-
-完成这五步，第二册的目标就达到了：读者不是背了一堆硬件、并发和分布式概念，而是能把它们组合成一个可以运行、可以测量、可以恢复的计算系统。第三册进入 AI 推理引擎时，这个项目会变成基础设施：模型权重是输入数据，算子是计算内核，线程池是运行时，KV cache 和中间张量是数据布局，模型版本和输出提交仍然需要 manifest 和恢复语义。
-
-\topic{十一、状态转移演练：同一个 task 的三种事实}
-最终项目中，很多错误来自把不同事实混在一起。以 task 12、partition 3 为例。Driver 第一次发送 attempt 0，task table 从 pending 变成 running。Worker 真的执行了 attempt 0，并把 \filepath{tmp-t12-a0.block} 写到临时目录，block header 中包含 task id、attempt id、partition id、payload size 和 checksum。随后成功响应在 MessageBus 中被丢弃。此时系统里已经有一个执行事实：attempt 0 确实做过计算；也有一个存储事实：临时目录里存在一个看起来完整的 block；但还没有提交事实，因为 manifest 没有接受它。
-
-Driver 到达 deadline 后不能断言 attempt 0 失败，只能说本地等待已经结束，远端状态未知。它创建 attempt 1，并把 task table 中当前可接受 attempt 更新为 1。Attempt 1 也写出 block，并成功进入 manifest。Manifest 现在包含 task 12 的 accepted attempt 1，reduce 只能读取这条记录引用的 block。过一段时间，attempt 0 的成功响应迟到。这个响应在执行层面为真：worker 没有撒谎，它确实成功执行过；在存储层面也可能为真：旧 block 仍然存在并且 checksum 正确；但在提交层面已经过期，因为 task 12 的提交权已经交给 attempt 1。正确行为是把 attempt 0 记录为 late attempt 或 orphan candidate，而不是第二次写入 manifest。
-
-这个演练要求读者区分三种事实。执行事实回答“某个 worker 是否做过这次物理尝试”；存储事实回答“某个字节块是否存在且能通过校验”；提交事实回答“下游是否允许把这份结果计入最终输出”。三种事实都重要，但只有提交事实决定外部可见结果。若 reduce 扫描目录，它把存储事实误当成提交事实；若 driver 收到 Ok 就提交，它把执行事实误当成提交事实；若恢复程序只读 checkpoint 而不读 manifest，它把过期控制面状态误当成提交事实。
-
-Run report 应把这三种事实分开呈现。Task timeline 写出 pending、running、timeout、retrying、committed、late reply；Block summary 写出 candidate block、checksum、bytes、orphan reason；Manifest summary 写出每个 logical task 的 accepted attempt。这样一次事故发生后，读者不需要从日志里猜测“到底谁成功了”，而能直接看到：attempt 0 执行过但没有生效，attempt 1 执行过且已经生效，最终输出只允许使用 attempt 1。这个小演练会在第三册继续出现，只是 block 会换成模型权重、tensor cache 或某个 token 任务的输出。
-
-最小状态表也应围绕这三种事实设计。Task table 保存逻辑任务状态：task id、stage id、current attempt、deadline、retry budget、last error 和 committed flag。Attempt table 保存物理执行状态：attempt id、worker id、start time、finish time、reply state 和 output block id。Block table 保存存储事实：block id、path、bytes、checksum、write state、verify state 和 orphan reason。Manifest table 保存提交事实：logical task、accepted attempt、accepted block、manifest generation 和 commit checksum。四张表看起来比一个日志文件麻烦，却能换来清楚的恢复路径。
-
-恢复时按表的权威等级读取。先读 manifest，确定哪些 logical task 已经外部生效；再读 checkpoint 或 task table，找出仍需重做的任务；再读 block table 或扫描临时目录，把没有被 manifest 引用的 block 标成 orphan；最后根据 retry budget 重新调度 pending task。这个顺序避免了两个常见错误：一是看到 block 存在就把它合并，二是看到 checkpoint 里 task 未完成就忽略已经提交的 manifest。恢复不是把旧进程状态复活，而是用提交事实重建一个可继续推进的新状态。
-
-读者实现时可以先把这些表写成普通文本或 JSON，不急着设计数据库。关键是字段稳定、含义清楚、恢复顺序可测试。一次小输入故障演练就能覆盖它们：丢一个响应，制造两个 candidate block，让一个 attempt 迟到，再重启 driver。若最终报告能解释每张表怎样变化，说明系统已经具备最小恢复语义；若报告只能打印“retry success”，说明状态仍然藏在代码路径里，后续扩展到多进程或推理引擎时会重新失控。
-
-\section{最终复盘：第二册怎样为第三册 AI 推理引擎铺路}
-
-第二册没有直接进入 AI，是有意安排。AI 推理引擎不是只会调用模型文件和矩阵乘。它需要模型权重加载、内存布局、算子调度、线程池、量化数据格式、缓存、I/O、版本管理和恢复。第二册的 Compute Systems Engine 正是这些能力的通用底座。
-
-\topic{一、权重文件对应输入 split 和 manifest}
-模型权重不是普通数组。它有文件格式、tensor 名称、shape、dtype、量化参数、校验和版本。加载时需要 mmap 或 read，需要 page cache，需要校验，需要 manifest 说明哪些 tensor 属于同一模型版本。这和日志输入 split、shuffle block 和 manifest 是同一类问题：大数据可校验，控制面定义有效版本。
-
-\topic{二、算子对应计算内核}
-矩阵乘、卷积、归一化、激活、采样都可以用第二册的内核分析方法看：数据流是什么，热字段是什么，是否可向量化，是否受内存带宽限制，输出位置是否固定，线程如何切分。量化算子还要处理整数位宽、溢出、缩放和误差合同。第二册的 SIMD、布局和测量章节会直接复用。
-
-\topic{三、推理请求对应任务图}
-一个推理请求不是单个函数，而是一组算子依赖。某些算子顺序严格，某些预处理和后处理可以并行，batching 会改变延迟和吞吐，KV cache 会引入生命周期和并发访问。任务运行时、背压和线程池配置都要再次使用。若第二册没有讲清任务状态机，第三册的推理调度会很散。
-
-\topic{四、模型版本对应配置热更新}
-在线替换模型和第 11 章配置热更新相似。新模型加载完成后发布，正在使用旧模型的请求必须继续安全完成，旧权重何时释放需要生命周期协议。shared pointer、epoch 或 RCU 的选择会再次出现。模型版本号还要进入日志和输出，便于复现。
-
-\topic{五、第三册项目接口}
-第三册 CPU 推理引擎可以复用第二册的对象：BenchmarkCase、MemoryShape、HotKernelReport、QueueContract、TaskStateRecord、MessageEnvelope、ManifestEntry。不是复制代码，而是复用思维框架。这样 AI 算子开发不会变成孤立专题，而是现代计算系统的延伸。
-
-\section{最终补强：项目评分标准}
-
-毕业项目需要清楚评分标准，否则读者容易只追求能跑。评分不应只看代码量或吞吐，而应看语义、证据、恢复和可维护性。下面给出一套面向本书的验收口径。
-
-\topic{一、语义完整性}
-输入合同、错误合同、输出排序、重复执行、提交点和恢复边界都写清。Reference 覆盖正常和边界输入。任何优化版本都能解释自己保留了哪些语义，放松了哪些语义。若某个模块只能说“通常不会出错”，语义不合格。
-
-\topic{二、工程结构}
-Driver、worker、message bus、runtime、shuffle store、manifest 分工清楚。共享状态有锁或原子合同，队列有关闭语义，I/O buffer 有所有权，任务有状态机。没有万能 manager，没有所有逻辑堆在一个文件里。结构清楚不是为了好看，而是为了失败时能定位责任。
-
-\topic{三、测试和故障注入}
-测试覆盖 reference、并行输出、重复 attempt、迟到响应、短写、崩溃恢复、热点 partition 和取消。故障注入不是可选加分项，而是系统项目的核心。没有故障注入，只能证明 happy path。
-
-\topic{四、性能证据}
-性能报告有阶段时间、输入规模、线程数、block size、队列水位、checksum 和环境信息。优化说明瓶颈假设、改动、结果和反证。报告承认不可验证边界。只给一张最终耗时表，不合格。
-
-\topic{五、代码质量}
-C++ 类型使用位宽明确整数，所有权清楚，热路径避免不必要拷贝，状态使用枚举，错误使用结构化返回或异常合同。代码不靠全局变量串状态，不在锁内调用未知复杂逻辑，不把 relaxed 变量当协议信号。代码质量服务系统语义。
-
-\topic{六、面向第三册的延展}
-项目最后写一页说明：若把日志统计换成 CPU 推理引擎，哪些模块保留，哪些模块替换。保留 driver、runtime、I/O、manifest、benchmark；替换 parser 为 model loader，替换 map reduce 为 tensor kernels，替换 shuffle 为中间张量和 KV cache 管理。能写出这页，说明第二册知识已经可以迁移。
-
-\section{项目扩展：从单机模拟到两进程部署}
-
-毕业项目第一版可以在一个进程里模拟 driver、worker 和 message bus。为了更接近真实系统，下一步可以拆成两个进程：driver 进程和 worker 进程，通过本机 socket 或管道传消息。这个扩展不追求网络性能，而是强迫系统放弃共享指针和调用栈，真正使用消息身份和序列化边界。
-
-\topic{一、序列化让所有权更清楚}
-单进程模拟很容易偷懒，把 payload 指针直接放进消息。两进程后，消息必须序列化或通过共享文件传递。序列化会暴露类型版本、字节序、长度、校验和错误处理。它也迫使 driver 和 worker 不共享内存对象，所有状态都通过 MessageEnvelope 和 payload 表达。
-
-这一步能发现很多隐藏耦合。若 worker 需要访问 driver 内部表，拆进程就会失败；若消息没有 attempt id，响应无法归属；若 payload 没有长度和 checksum，worker 无法验证输入。两进程部署是结构审查工具。
-
-\topic{二、进程崩溃更接近真实故障}
-单线程故障注入可以模拟响应丢失，但进程崩溃会测试更多边界：worker 写了一半 block 后退出，driver socket 断开，临时文件残留，进程重启后 request id 是否复用，旧响应不再可能到达但旧文件仍在。系统必须通过 manifest 和 checkpoint 恢复，而不是依赖内存状态。
-
-实验可以让 worker 在写出 block 的三个点崩溃：写 header 前，写 payload 中，写完但未报告。Driver 重试后，reduce 仍只能看到一个已提交 block。这个实验直接验证 I/O 和分布式语义。
-
-\topic{三、部署脚本也要记录环境}
-两进程实验需要记录端口或 socket 路径、工作目录、临时目录、日志目录、输入路径和清理策略。路径错误、旧临时文件和权限问题都会影响结果。不要把部署脚本当成附属物；它是实验可复现的一部分。
-
-\topic{四、扩展后的验收}
-两进程版本通过同一 reference，同一故障矩阵，输出同一 manifest。性能可以慢一些，因为目标是语义边界。报告比较单进程和两进程：多了哪些序列化成本，少了哪些共享状态假设，哪些 bug 被暴露。这样的扩展为真正多机部署打基础，也为第三册模型服务化打基础。
-
-\section{补充案例：毕业项目的最小代码骨架}
-
-为了让读者能真正开始写项目，本章应给出最小代码骨架的职责说明。不是贴完整代码，而是说明每个模块最先实现哪些接口，哪些接口暂时不要做复杂。
-
-\topic{一、model 层}
-model 层只放值类型：JobId、TaskId、AttemptId、PartitionId、RecordId、MessageEnvelope、ManifestEntry、BlockHeader。它不依赖 driver 或 worker。值类型使用位宽明确整数，支持比较、打印和简单校验。这个层稳定后，其他模块都围绕它通信。
-
-\topic{二、reference 层}
-reference 层实现串行日志统计。它不使用线程，不使用消息，不写 shuffle，只定义语义。测试先覆盖 reference。任何后续输出都和 reference 比较。这个层慢可以接受，但必须清楚。
-
-\topic{三、runtime 层}
-runtime 层先实现有界队列和固定线程池，不急着工作窃取。接口包含 submit、shutdown drain、shutdown cancel、wait。等项目语义稳定后，再替换任务图或工作窃取。不要一开始把运行时做复杂。
-
-\topic{四、shuffle 层}
-shuffle 层实现 write temp block、verify block、commit manifest、list committed blocks。Reduce 只能通过 manifest 读取。这个层是恢复语义的核心，优先写测试。
-
-\topic{五、driver 和 worker}
-Driver 切分 task，发送 MessageEnvelope，维护 attempt 状态和重试预算。Worker 接收 task，运行 map 或 reduce，写临时 block，返回响应。即使单进程模拟，也要通过消息接口通信，避免共享内部状态。
-
-\topic{六、测试顺序}
-测试顺序是 reference，block 写读，manifest commit，单 worker map reduce，无故障多 worker，响应丢失，重复 attempt，崩溃恢复，热点 partition。按这个顺序推进，比一上来写完整系统更稳。
-
-\section{补充专题：最终项目文档怎么写}
-
-项目完成后，文档不是 README 几行命令。它应让别人能理解语义、运行实验、复现故障和继续扩展。文档质量也是工程质量。
-
-\topic{一、运行文档}
-写清构建命令、输入生成、运行命令、输出路径、手机目录复制方式和清理命令。每个命令说明会产生哪些文件。不要让读者猜 main.pdf 或 main.epub 在哪里；项目产物同样要有 manifest 思维。
-
-\topic{二、语义文档}
-写输入格式、错误策略、输出排序、重试策略、提交点、恢复边界。语义文档比接口注释更重要，因为它定义系统承诺。后续优化不能破坏这些承诺。
-
-\topic{三、实验文档}
-列出 benchmark case、故障注入 case、预期结果和不可验证边界。性能数字要带环境。故障注入要说明如何触发、如何判断通过。这样别人才能复查。
-
-\topic{四、扩展文档}
-说明如何把单进程模拟扩展到两进程，如何替换消息总线，如何加入真实网络，如何在第三册替换成模型推理任务。扩展文档让项目成为后续工作的地基，而不是一次性作业。
-
-\section{补充专题：毕业项目的演示脚本}
-
-最终项目应有一套演示脚本，让读者和审查者快速看到系统能力。演示不是替代测试，而是把核心路径串起来：生成输入、运行 reference、运行分布式模拟、注入故障、恢复、比较输出、生成报告。
-
-\topic{一、正常路径演示}
-脚本生成固定 seed 的日志输入，运行 reference，运行 Compute Systems Engine，比较输出，打印阶段时间和 manifest 摘要。输出目录包含 reference result、engine result、manifest、trace 和 benchmark report。
-
-\topic{二、故障路径演示}
-脚本启用响应丢失、短写或 driver 崩溃注入。运行后恢复，再比较 reference。报告列出重试次数、忽略的迟到响应、清理的临时 block 和最终 manifest。这个演示能直观看到系统不是 happy path demo。
-
-\topic{三、性能路径演示}
-脚本改变 block size、线程数和 key 分布，生成三份报告。读者可以看到瓶颈如何变化。演示脚本不要隐藏命令，应该打印完整参数，方便复制和修改。
-
-\topic{四、交付目录}
-最终产物目录应包含 PDF、EPUB、源码、测试报告和运行报告。手机阅读目录只放书籍产物，仓库内保留可复现材料。这样书和项目都能被继续使用。
-
-\section{项目实现细节：测试先于优化}
-
-毕业项目很容易被性能目标带偏。正确顺序是先测试语义，再优化热路径。没有测试矩阵的高性能版本，只是在制造更快的未知行为。
-
-\topic{一、第一组测试只测 reference}
-Reference 测试覆盖输入解析、错误策略、输出排序和溢出处理。它不依赖线程和消息。只要 reference 不稳，后面所有比较都没有意义。Reference 慢可以接受，但必须易读、确定、覆盖边界。
-
-\topic{二、第二组测试测存储和 manifest}
-在没有 worker 和 driver 前，单独测试 block 写入、checksum、manifest commit、未提交临时文件忽略、重复 entry 拒绝。这样 I/O 和提交语义先稳定。不要等整个系统跑起来后才发现 manifest 设计不清。
-
-\topic{三、第三组测试测消息和 attempt}
-使用模拟 MessageBus，发送 map request，注入响应丢失、重复和迟到。Driver 状态表应只提交一次。此时 compute 可以是很小的假任务，重点测协议。协议稳定后再接真实 map 计算。
-
-\topic{四、第四组测试测端到端}
-最后才运行完整日志统计。先无故障，再有故障，再性能输入。每次都和 reference 比较。端到端失败时，根据前面分层测试定位，而不是在巨大系统里盲查。
-
-\topic{五、优化门槛}
-只有当测试覆盖某个模块后，才允许优化该模块。优化必须附带 benchmark 和反证输入。比如替换哈希表、改线程池、加入 SIMD、改变 block size，都要证明 reference 不变，故障测试仍过，性能报告解释收益。这个门槛保证项目越快越可信，而不是越快越脆。
-
-\section{把第二册收束成一个可交付系统}
-
-第二册最后的项目不是把每章代码拼在一起，而是把硬件理解、性能测量、并发控制、并行算法、运行时、I/O 和分布式语义压成同一个可交付系统。一个 Compute Systems Engine 至少应能读取输入、切分任务、并行处理、写出结果、记录 manifest、处理失败、生成报告，并在本机模拟分布式执行。项目越复杂，越不能靠口头解释正确性，必须把状态、提交点、指标和恢复材料写进系统。
-
-\topic{一、先交付串行 reference}
-毕业项目的第一步不是线程池，也不是分布式模拟，而是串行 reference。它定义输入格式、输出格式、错误处理、排序规则、数值误差和边界行为。所有优化版本都必须能和 reference 对比。没有 reference，后续每个并发 bug 都会变成争论：到底是优化错了，还是原始语义没定义。reference 可以慢，但要清楚、确定、覆盖边界。
-
-\topic{二、再交付阶段化流水线}
-系统应拆成读取、解析、partition、compute、merge、write、commit 几个阶段。每个阶段写明输入、输出、所有权、失败后是否可重做、指标如何记录。阶段边界不是为了画图，而是为了让恢复和测量有位置。若 compute 成功但 write 失败，可以重写输出；若 commit 失败，要检查 manifest；若 parse 失败，要记录错误输入而不是让后续阶段猜测。阶段清楚，系统才有可维护性。
-
-\topic{三、把性能优化绑定到证据}
-项目中每个优化都要有前后对照。数据布局优化应有地址或带宽证据，SIMD 优化应有反汇编或向量化报告，线程优化应有队列和空闲时间，I/O 优化应有 in-flight、buffer 和完成延迟，分布式优化应有尝试数和故障矩阵。若一个优化没有证据，只是让代码更复杂，就不应进入主线。本项目要训练的是工程判断，而不是堆砌机制。
-
-\topic{四、把失败注入纳入常规测试}
-系统必须能处理短写、崩溃点、重复消息、响应丢失、worker 慢、任务取消、队列关闭、配置热更新和重复提交。失败注入不是附加题，而是验证状态机是否完整的核心方法。每个失败实验都要写期望状态：哪些文件可以存在，哪些 manifest 条目有效，哪些 request id 可重试，哪些 buffer 必须释放，哪些任务应取消。失败路径讲清楚，正常路径通常也会更稳。
-
-\topic{五、为推理引擎保留系统接口}
-后续会进入 AI 和 CPU 推理引擎，但这里已经准备了基础：数据布局、SIMD、线程池、任务图、异步 I/O、分布式切分和性能报告。最终项目不需要提前实现模型推理，却要保留可复用接口：连续 tensor buffer、算子调度、batch 输入、权重文件读取、量化数据类型、kernel 报告和本机 worker 模拟。这样后续推理引擎可以在当前计算系统基础上继续推进。
-
-\section{最终验收：让项目像系统而不是作业}
-
-最终验收要比“能跑通样例”严格得多。一个系统至少要证明五件事：结果正确，资源有界，性能可解释，失败可恢复，文档能让别人接手。每一件事都要有材料，而不是口头承诺。这样收束整本书，读者才会明白前面反复讲 reference、状态表、指标、manifest、故障注入和报告的原因。
-
-\topic{一、正确性验收}
-正确性材料包括串行 reference、输入生成器、边界输入、随机输入、错误输入和优化版本对比。并行版本必须说明输出顺序是否要求稳定，浮点结果是否允许误差，重复记录如何处理。若项目有分布式模拟，单机和分布式输出必须能按 manifest 对齐。正确性不是一条 assert，而是一组可复现输入和明确 oracle。
-
-\topic{二、资源验收}
-资源材料包括内存峰值、队列容量、buffer pool 大小、线程数、文件描述符、临时文件数量和 in-flight 请求数。每个容量都要能解释来源。若 buffer pool 容量扩大，吞吐提升多少，内存增加多少；若队列容量缩小，背压提前多少，尾延迟如何变化。资源有界是系统能长期运行的基础。
-
-\topic{三、性能验收}
-性能材料包括阶段耗时、吞吐、延迟分位数、主要瓶颈、一次优化前后对照和未验证边界。至少选择一个优化做完整论证：例如列式布局减少带宽、线程本地 partial 降低共享写、异步写出隐藏等待、重试预算降低故障放大。性能验收的重点是解释，不是堆数字。
-
-\topic{四、恢复验收}
-恢复材料包括崩溃点矩阵、重复消息矩阵、关闭测试和重启扫描结果。系统应证明不会读取未提交输出，不会重复应用同一 request，不会泄漏临时文件，不会在 close 后留下后台线程。恢复验收最能区分演示程序和工程系统，因为 happy path 无法覆盖这些状态。
-
-\topic{五、交接文档验收}
-最后要有一份交接文档，说明目录结构、核心对象、状态机、运行命令、测试命令、已知限制和第三册预留接口。文档不需要长篇宣传，但必须能让另一个读者拉下仓库后运行项目、复现实验、理解关键设计。系统知识的最终形态应当是代码、测试、报告和文档共同构成的可交接对象。
-
-\section{项目目录、测试矩阵和报告结构}
-
-最终项目要落到仓库结构里，否则整本书会停在文字层面。一个推荐结构可以分为 \filepath{engine/core}、\filepath{engine/runtime}、\filepath{engine/io}、\filepath{engine/distributed}、\filepath{engine/tools}、\filepath{tests} 和 \filepath{reports}。core 放串行语义、数据模型和 reference；runtime 放线程池、任务图和并行算法；io 放可靠写出、manifest 和恢复扫描；distributed 放 MessageBus、Envelope、worker 模拟和故障规则；tools 放基准和报告生成；tests 放正确性、压力和故障注入；reports 保存每次实验的可复盘材料。目录不是形式，它把责任边界写进文件系统。
-
-\topic{一、核心对象要少而稳定}
-最终项目不需要一开始设计很多抽象。核心对象保持少而稳定更重要：Record 表示输入记录，Chunk 表示输入切分，Task 表示可执行工作，Block 表示输出块，ManifestEntry 表示已提交结果，Envelope 表示跨 worker 消息，TraceEvent 表示可观测事件。每个对象都要有明确所有权和状态。对象少，读者容易追踪；状态清楚，后续优化不会把系统撕裂。
-
-\topic{二、测试矩阵按风险排列}
-测试不要只按模块排列，也要按风险排列。第一组是 reference 正确性：小输入、空输入、错误输入、随机输入。第二组是并行等价：不同线程数、不同 chunk 大小、不同输出顺序要求。第三组是资源边界：小队列、小 buffer、低内存预算。第四组是故障注入：短写、崩溃点、重复消息、响应丢失、worker 慢、关闭。第五组是恢复：重启后扫描 manifest、删除临时文件、重做未提交任务。这样的矩阵能直接对应本书每章主题。
-
-\topic{三、报告文件要机器可读也要人可读}
-实验报告最好同时输出结构化 JSON 和简洁文本。JSON 方便后续比较和脚本检查，文本方便读者阅读。报告字段包括版本标识、机器信息、编译选项、输入摘要、阶段耗时、资源峰值、错误计数、故障规则、输出 checksum 和未验证边界。若没有这些字段，半年后再看一次实验，很难知道当时的结论是否仍然可信。
-
-\topic{四、命令行接口服务于复现}
-项目应提供稳定命令：生成输入、运行 reference、运行并行版本、运行分布式模拟、注入故障、恢复扫描、生成报告。每条命令都应能指定随机种子、线程数、chunk 大小、buffer 数和故障规则。这样教材中的案例就不是一次性文字，而是可以反复运行的实验。命令行不是附属工具，它是教学内容的执行入口。
-
-\topic{五、代码审查按状态机进行}
-最终审查不按文件大小排序，而按状态机排序。先审查 Task 状态，确认没有重复完成；再审查 Manifest 状态，确认未提交结果不可见；再审查 Queue 状态，确认 close 唤醒所有等待者；再审查 Envelope 状态，确认 request id、attempt 和 deadline 贯穿全程；最后审查恢复状态，确认重启后能确定每个输出块的命运。这种审查方式能让读者把全书概念聚合到一个系统里。
-
-\topic{六、性能验收要有退路}
-如果某个优化在用户机器上没有变快，项目仍然要能给出解释。比如 SIMD 不明显，可能输入太小或编译器已自动向量化；线程池不明显，可能 I/O 才是瓶颈；分布式模拟不明显，可能本机队列开销大于并行收益。报告要把“没有收益”也纳入结论，而不是强行宣称成功。高质量教材要教读者面对反证，而不是只展示顺利路径。
-
-\topic{七、为第三册保存算子接口}
-后续 CPU 推理引擎会需要 tensor、operator、kernel、scheduler、weight loader 和 quantized buffer。最终项目可以先定义轻量接口：连续 buffer、shape、element type、block reader、kernel report 和 task graph。即使暂时只处理日志或数值数组，也要让数据路径能承载未来的张量块。这样进入 AI 推理主题时，读者不会重新学习并发、I/O 和测量，而是把已有系统能力用于算子开发。
-
-\topic{八、最终交付以可复现为准}
-交付时，应能从干净目录执行一组命令，生成输入，运行 reference，运行并行版本，运行故障模拟，恢复扫描，生成 PDF 或文本报告，并比较 checksum。若某一步依赖手工解释，系统就还没有交付完成。可复现不是形式主义，而是让知识从“我懂了”变成“别人也能验证”。第二册的学习目标也在这里闭环：从硬件原理一路走到一个可测、可恢复、可解释的计算系统。
-
-\section{端到端案例：一次作业从输入到恢复}
-
-为了让第二册真正收束，最后用一次完整作业走通所有层次。输入是一批日志或数值记录，目标是过滤、分区、统计并输出结果。这个目标看起来普通，却足以覆盖硬件、布局、线程、同步、并行算法、I/O、消息、恢复和报告。教材不应把每章机制留在各自章节里，而要让读者看到它们在同一个作业生命周期里如何互相约束。
-
-\topic{一、输入进入系统时先建立身份}
-每个输入文件、每个 chunk、每条输出 block 都要有稳定身份。文件身份可以来自路径、大小、修改时间和 checksum，chunk 身份来自文件身份加偏移范围，输出 block 身份来自阶段、partition、attempt 和 checksum。身份建立以后，后续线程调度、分布式消息、manifest 提交和恢复扫描才有共同语言。没有身份，系统只能说“有个任务失败了”；有了身份，系统能说“文件 A 的第七个 chunk 在第二次 attempt 写出 block 3 时短写失败”。这就是第一章系统账本在最终项目里的具体形态。
-
-\topic{二、读取阶段体现 I/O 和背压}
-读取线程不能无限把数据塞进内存。它从输入文件读 chunk，放入有界队列；队列满时，读取阶段被背压，说明下游处理速度跟不上。此时正确反应不是再开更多读取线程，而是观察瓶颈：解析慢、partition 慢、写出慢，还是 manifest 提交慢。读取阶段还要处理短读、错误输入和取消。若作业被取消，读取线程应停止产生新 chunk，唤醒等待者，并把未处理 chunk 状态写入报告。
-
-\topic{三、解析阶段体现布局和热路径}
-解析器先用串行 reference 定义字段、错误行、编码和输出语义。优化版本再把热字段拆到连续数组，把冷字段留在原始记录或错误表中。若常见输入格式稳定，可以设置快路径；若发现异常字符或缺失字段，再进入慢路径记录错误。性能报告要能说明热路径每条记录读多少字节、写多少字节、分支是否稳定、错误行是否影响主循环。这样数据布局和流水线章节不会停留在抽象讨论。
-
-\topic{四、分区阶段体现 scan 和 manifest}
-解析后的记录按 key 或谓词进入多个 partition。每个 worker 先统计本 chunk 的 bucket 数量，做前缀和后得到输出区间，再回填结果。回填完成后生成局部 manifest 条目，记录 bucket、offset、length 和 checksum。若某个 worker 崩溃或被取消，只需要重做对应 chunk 或 partition，而不是全作业重跑。这里的重点是：scan 的中间结果同时服务性能和恢复，partition 的输出区间同时服务并行写和分布式 shuffle。
-
-\topic{五、计算阶段体现线程和运行时}
-计算阶段由任务图驱动。读取完成某个 chunk 后，解析任务 ready；解析完成后，partition 任务 ready；所有相关 partition 完成后，merge 任务 ready；写出任务依赖 merge。worker 不能在任务内部阻塞等待另一个未运行任务，而应通过依赖计数和 continuation 让运行时调度后续任务。若某个任务失败，异常进入任务状态，依赖任务被取消或转入降级路径。最终报告要列出关键路径、worker 空闲时间、队列长度和取消传播时间。
-
-\topic{六、写出阶段体现提交边界}
-输出先写临时文件，可靠写循环处理短写，完成后计算 checksum，再提交 manifest。manifest 提交前，结果对外不可见；manifest 提交后，恢复扫描必须能找到它。若写中崩溃，临时文件在恢复时删除或重做；若写完未提交崩溃，仍不能被当作有效输出；若提交后崩溃，输出必须可被读取。这个阶段把 I/O、生命周期和分布式幂等连接起来，因为重复 attempt 也只能提交同一个逻辑 block 一次。
-
-\topic{七、分布式模拟体现消息身份}
-把本机 worker 换成 MessageBus 后，driver 发送带 request、attempt、deadline 和 chunk 身份的消息。worker 收到后执行同一套解析、分区和写出逻辑。若响应丢失，driver 用同一 request 重试；worker 通过幂等表返回旧结果，不重复提交。若 worker 慢到 deadline 过期，driver 可以放弃等待，但迟到响应仍要被识别和释放。这个模拟让读者看到，分布式不是把函数搬远，而是把身份、提交和不确定性写进协议。
-
-\topic{八、恢复阶段体现状态机完整性}
-作业重启后，系统先读取 manifest，确认已提交输出；扫描临时目录，清理未提交文件；读取任务日志，重建未完成 chunk；读取幂等表，避免重复执行已提交 request。每个对象都要有确定命运：已提交、可重做、可删除、需人工检查。若某个文件既不在 manifest，也无法从任务日志解释，就是状态机缺口。恢复阶段是最终项目最严格的考试，因为它会暴露所有“正常运行时看不见”的边界。
-
-\topic{九、性能报告体现证据链}
-端到端报告不能只给总耗时。它要列阶段耗时、输入大小、输出大小、队列峰值、内存峰值、线程数、I/O in-flight 数、重试次数、错误行数量、cache 或带宽证据、失败注入规则和未验证边界。读者应能根据报告判断下一步优化方向：如果 parse 占比高，回到布局和分支；如果 write 占比高，回到 I/O 和背压；如果 worker 空闲，回到任务图和切分；如果重试多，回到消息模型和 deadline。
-
-\topic{十、这个案例如何进入第三册}
-第三册实现 CPU 推理引擎时，输入文件变成权重和 token，chunk 变成 tensor block，partition 变成 batch 或算子切分，kernel 变成矩阵乘、量化反量化和激活函数，manifest 变成模型加载和输出提交记录，MessageBus 可以模拟多 worker 推理。第二册端到端案例已经训练了身份、布局、并行、I/O、调度和报告，第三册只需要把计算 kernel 换成 AI 算子，并继续沿用同一套系统纪律。这样三册之间是递进关系，不是主题跳跃。
-
-\section{移动端和受限 Linux 环境的实验边界}
-
-用户可能在 Termux、容器、云主机或权限受限的 Linux 环境中学习第二册。这样的环境不一定能使用全部性能计数器，不一定能设置 CPU 频率，不一定有 NUMA，也不一定允许 \code{io_uring} 或某些 tracing 工具。教材不能因此把实验全部取消，而要教读者区分“语义实验”和“硬件定量实验”。语义实验在受限环境中仍然能做，硬件定量结论则要诚实标注边界。
-
-\topic{一、Termux 适合训练状态机和恢复}
-手机环境很适合跑小规模但严格的实验：有界队列、线程池关闭、短写模拟、manifest 恢复、MessageBus 丢包、重复请求和幂等表。这些实验不依赖高权限计数器，却能覆盖系统正确性。读者可以用小输入和固定随机种子反复运行，观察状态日志是否符合预期。不要因为设备不是服务器，就放弃状态机训练。
-
-\topic{二、性能结论要降低表述强度}
-在移动端上，温控、调频、后台进程和系统限制会让性能数字波动更大。报告可以记录 wall time、阶段耗时、输入大小、线程数和内存峰值，但不要把它宣称为通用硬件结论。更合适的写法是：“在当前设备和当前温度策略下，这个输入显示写出阶段占比最高”。如果要得到更强结论，需要换到可控机器上复测。
-
-\topic{三、工具缺失时保留替代证据}
-没有 perf，可以保留反汇编、阶段计时和输入族；没有 NUMA 工具，可以保留线程数、绑定限制和共享写实验；没有真实异步 I/O，可以用延迟写线程和短写包装器模拟完成事件；没有多机集群，可以用 MessageBus 模拟消息乱序和丢失。替代证据不能伪装成完整证据，但它能继续训练推导能力。
-
-\topic{四、文件路径和产物要固定}
-移动端阅读时，产物目录应稳定，比如 \filepath{/sdcard/STU/BOOKS} 下按书名放 PDF 和 EPUB。项目实验也应把输入、输出、manifest、临时文件和报告放在可清理的固定目录。路径稳定能减少调试噪声，也方便读者把书和实验材料对应起来。工程学习中，文件组织本身就是降低认知负担的一部分。
-
-\topic{五、受限环境更要求小而完整}
-设备资源有限时，不要追求巨大输入，而要追求小输入覆盖完整状态。三个 chunk、两个 worker、一个响应丢失、一个短写、一次重启，就能覆盖端到端恢复。输入小，时间线更容易画；状态完整，原理更容易验证。等语义稳定后，再把同一套实验搬到更强机器上测性能。这个顺序比直接追求大规模数字更可靠。
-
-\section{验收失败后的返工规则}
-
-最终项目如果没有通过验收，不能用“再调一调”含糊处理。返工应按失败类型回到对应章节，而不是在最后一章临时堆补丁。这样做能保护系统结构，也能让读者知道每个知识点在项目里的责任。一次失败报告至少要写出失败现象、触发输入、所属阶段、可能原因、下一步验证和回退方案。
-
-\topic{一、结果不一致先回 reference}
-如果优化版本和 reference 输出不一致，先停止性能优化。检查输入解析、输出顺序、浮点误差、错误行处理和重复记录规则。若 reference 本身没有覆盖该边界，就先补 reference 和测试；若 reference 已经明确，才去查并行切分、scan offset、merge 顺序或分布式重复提交。正确性失败不能靠增加日志掩盖。
-
-\topic{二、吞吐低先回证据链}
-如果系统慢，先看阶段耗时和资源峰值。解析慢回到布局、分支和 SIMD；计算慢回到 kernel 和并行算法；线程空闲回到任务图和队列；写出慢回到 I/O 和背压；重试多回到消息模型。不要看到慢就同时改十个地方。一次只验证一个假设，保留优化前后报告，才能知道哪一步真的有效。
-
-\topic{三、内存失控先回所有权}
-如果内存峰值超过预算，先列出 buffer、队列、临时文件、幂等表、退休节点和中间数组。确认每个对象谁创建、谁释放、什么时候可见、失败时是否清理。很多内存问题不是分配器问题，而是生命周期没有闭合。回到所有权图，比盲目换容器更可靠。
-
-\topic{四、关闭卡住先回等待状态}
-如果程序退出卡住，先列出所有等待者：线程池 worker、条件变量等待者、I/O completion、MessageBus timer、future 等待者。检查 close 是否广播，取消是否传播，任务是否还持有未完成依赖，队列是否已关闭但仍有人 push。关闭失败通常说明等待状态没有显式化，不能只在析构函数里强行终止线程。
-
-\topic{五、恢复失败先回提交点}
-如果重启后重复输出、丢输出或读取半成品，先检查 manifest、临时文件、checksum、request id 和提交顺序。写出、提交、响应和幂等记录必须处于一致边界。恢复失败往往不是恢复代码单独的问题，而是正常路径没有把提交点写清楚。修复时要同时改正常路径和恢复路径，并补崩溃点测试。
-
-\section{最终阅读顺序和复盘方法}
-
-读完第二册后，不建议只按页码复习。更有效的方式是按一次作业的生命周期复盘：输入身份怎样建立，数据怎样进入内存，热路径怎样减少分支和搬运，线程怎样领取任务，队列怎样背压，partial 怎样合并，输出怎样提交，消息怎样重试，恢复怎样判断每个对象的命运。每复盘一步，就回到对应章节找证据和反例。这样复习不是重复阅读，而是把知识重新编排成工程路径。
-
-\topic{一、先复盘正确性}
-拿一个小输入，手写 reference 输出，再让并行版本、异步写出版本和分布式模拟版本都生成同一语义结果。若结果不同，不要先看性能。先问输出顺序、重复记录、错误输入、浮点误差和提交边界是否定义一致。正确性复盘能防止读者把系统复杂性误当成优化成果。
-
-\topic{二、再复盘资源}
-同一输入下记录内存峰值、buffer 数、队列长度、线程数、临时文件数量和 in-flight 请求数。资源复盘会暴露很多隐藏假设：队列容量是否随输入放大，幂等表是否有过期策略，退休节点是否长期滞留，临时文件是否清理。系统能长期运行，靠的不是一次跑通，而是资源边界稳定。
-
-\topic{三、最后复盘证据}
-每个结论都要能指向证据：反汇编、阶段耗时、checksum、状态日志、故障矩阵、源码阅读笔记或工具输出。没有证据的结论保留为猜测，不能写进最终设计。这个习惯会直接带到第三册的推理引擎：算子快不快、量化对不对、调度是否合理，都必须用同样的证据链说明。
-
-复盘完成后，读者应能把一个陌生系统的问题拆成语义、资源、等待、生命周期和观测五条线，再按证据逐步收窄，而不是依赖经验猜测。
-这也是本书最终要交付的能力：面对新机器、新输入和新故障时，仍然能从稳定问题出发，逐步建立可验证的系统解释。
-
-\section{贯穿项目：从一个能跑的统计器改成可恢复计算引擎}
-
-最终项目最容易走偏成“把前面所有模块都列一遍”。更好的写法是从一个能跑但不可靠的统计器开始。第一版程序读取日志，解析事件，按 key 计数，输出结果。正常输入上它很快，也能通过简单测试。然后我们连续注入几个事故：某个输入 chunk 解析到一半失败，某个 worker 在写出 block 后崩溃，某个响应丢失导致 task 重试，某个热点 key 让 reduce 长尾，Driver 在 manifest 提交前后分别重启。若程序只能在正常路径跑通，这些事故会把它拆散；若它是一个真正的计算引擎，每个事故都应进入状态表、manifest、checkpoint 和报告。
-
-这个项目的主线不是“实现很多功能”，而是让每个功能从失败中长出来。输入身份来自重复处理和错误回溯；冷热布局来自热路径和调试证据冲突；scan 来自并行输出位置；任务图来自 worker 等待 future 的饥饿；可靠写来自短写和崩溃点；MessageBus 来自响应丢失；checkpoint 来自 Driver 重启；最终报告来自用户必须相信结果。这样第 18 章不是概念汇总，而是把前 17 章改写成一个可运行、可审查、可恢复的工程。
-
-\topic{一、第一版只允许串行 reference}
-项目第一步必须保留串行 reference。它可以慢，但要把语义写清：输入行如何切分，非法字段如何记录，重复 record id 如何处理，key 如何编码，输出顺序是否稳定，计数溢出如何报告。Reference 的任务不是参与性能竞争，而是给后续所有优化提供 oracle。没有 reference，并行、异步和分布式版本都无法证明自己仍在解决同一个问题。
-
-Reference 还要输出审计材料。每个输入文件有 file id，每个 chunk 有 offset 和 length，每条记录有 record id，每个输出 key 有确定顺序和 checksum。若后续版本结果不同，先用这些材料定位差异来自解析、过滤、聚合、分区还是写出。把 reference 写得太随意，最后项目会在性能优化里失去方向。
-
-\topic{二、第二版建立身份账本}
-身份账本是全书第一条工程线。FileId 记录路径、大小、修改时间和输入 checksum；ChunkId 记录文件和 offset 范围；RecordId 记录 chunk 内序号；TaskId 记录阶段和 chunk；Attempt 记录物理执行；BlockId 记录输出文件、partition 和 checksum；ManifestGeneration 记录可见输出版本。这些字段看似繁琐，但每个都回答一个事故问题。
-
-当 worker 迟到响应时，Attempt 能区分旧尝试和新尝试；当错误报告要回溯时，RecordId 能找到原始行；当恢复扫描发现临时文件时，BlockId 和 manifest 能判断它是否有效；当输入文件被替换时，FileId 的 checksum 能拒绝旧 checkpoint。身份账本不是日志装饰，而是项目能否解释自身状态的前提。
-
-\topic{三、第三版拆出热路径和证据路径}
-解析后的数据进入 HotBatch：连续的 key id、value、record id、错误 mask。原文、错误上下文和字段字符串留在 ColdStore。聚合阶段只读 HotBatch，错误报告和调试再用 record id 回到 ColdStore。这个设计把第 6 章数据布局落到项目里。热路径不搬运原文，证据路径不丢失上下文。
-
-这里要警惕一个常见失败：为了速度删除 record id。短期看聚合更快，长期看一旦 checksum 不一致，系统无法定位哪条记录导致差异。最终项目必须把“可解释结果”列为验收项。性能优化如果破坏证据链，就不合格。
-
-\topic{四、第四版用 scan 定义并行输出位置}
-Filter 和 partition 不允许多个线程直接 push 到共享输出。每个 chunk 先统计每个 bucket 的数量，再做 prefix，得到每个 chunk 每个 bucket 的输出区间，最后并行回填。这样输出位置是确定的，线程之间不抢写，manifest 也能记录每个 bucket 的范围。第 13 章的 scan 在这里变成工程结构：它不仅提高性能，还让失败重做范围清晰。
-
-如果某个 chunk 回填失败，系统能知道哪些输出区间无效；如果某个 bucket 热点严重，报告能看到 bucket 大小和长尾；如果需要稳定输出，chunk 顺序和 bucket 顺序成为合同。并行算法不再是一个孤立 kernel，而是 manifest 和恢复的一部分。
-
-\topic{五、第五版引入任务图而不是阻塞 future}
-读取、解析、局部聚合、partition、写出和 manifest commit 都是任务。任务之间用依赖边连接：chunk 读取完成后解析 ready，解析完成后聚合 ready，聚合完成后 partition ready，partition 完成后写出 ready，写出完成后 commit ready。任何 worker 都不能在任务内部阻塞等待同池 future。等待必须变成 continuation，事件到来后再入队。
-
-这个设计能复现并修复第 14 章的饥饿事故。Trace 应记录 task submit、ready、start、finish、fail、cancel、resume。若项目慢了，报告能判断 worker 是空闲、阻塞、偷取过多还是依赖链太长。任务图不是为了炫技，而是让执行资源和等待状态可见。
-
-\topic{六、第六版把写出改成临时文件加 manifest}
-写出阶段先写临时文件，可靠写循环处理短写，完成后计算 checksum，再尝试提交 manifest。Manifest 接受后，block 才对 reduce 或最终输出可见。临时文件存在不等于提交，completion 成功不等于提交，响应成功也不等于提交。这个边界贯穿 I/O 和分布式章节。
-
-崩溃点矩阵必须进入测试。写前崩溃，任务可重做；写一半崩溃，临时文件 checksum 不匹配；写完未提交崩溃，临时文件仍是候选而非结果；manifest 提交后崩溃，恢复应接受该 block；清理前崩溃，恢复扫描再次清理。若某一格写不清，说明提交协议还不完整。
-
-\topic{七、第七版加入 MessageBus 和故障注入}
-本机函数调用改成 MessageBus 后，Driver 和 worker 不共享业务对象。Driver 发送带 request、attempt、deadline、epoch、chunk id 的消息；worker 返回 block id、checksum 和状态。MessageBus 可以丢请求、丢响应、延迟、重复、乱序和返回 Busy。每个故障规则必须可复现，不能只靠随机概率。
-
-响应丢失实验是最小验收。Worker 写出 block，reply 被 drop，Driver timeout 后创建新 attempt，新 attempt 提交，旧 reply 迟到。期望 manifest 只接受一个 block，旧 reply 被标记 LateAttempt，临时文件按规则清理。这个实验把第 16 章的事故放进最终项目，而不是停在文字。
-
-\topic{八、第八版加入 checkpoint 和恢复}
-Checkpoint 保存 driver epoch、task table、manifest generation、partition assignment、retry budget、幂等表摘要和输入身份。恢复时先读 checkpoint，再读 manifest，扫描临时目录，对账输入文件，重建未完成任务。每个对象必须落入四类之一：已提交、可重做、可删除、需人工检查。恢复程序不能用文件修改时间猜测正确性。
-
-恢复还要处理版本。若输入文件 checksum 变了，旧 checkpoint 不能继续使用；若协议版本不兼容，程序应拒绝恢复并保留旧文件；若 manifest 引用的 block 缺失，作业不能假装成功。最终项目的恢复语义要保守而清楚，宁可明确失败，也不能静默给出错误结果。
-
-\topic{九、第九版加入热点 key 和分片策略}
-构造一个 key 占据输入的大部分。普通 hash partition 会让一个 reduce partition 变成长尾。第一步做 map-side combine，减少同一 key 的重复传输；第二步把热点 key 拆成多个子 key，分给多个 reduce；第三步二级 reduce 合并子 key。每一步都要保持 manifest 和 record id 证据链，不能让热点拆分破坏最终精确计数。
-
-热点策略也要进入报告。记录最大 key 占比、前十 key 占比、每个 partition 字节数、每个 reduce 耗时、二级合并成本和最终 checksum。这样分片不是“hash 一下”，而是从输入分布、负载均衡和提交语义推导出来。
-
-\topic{十、第十版生成可审查 run report}
-最终项目每次运行都生成 run report。报告包含输入摘要、reference checksum、并行 checksum、阶段耗时、队列高水位、内存峰值、任务数、attempt 数、retry amplification、late reply 数、Busy 数、manifest generation、checkpoint generation、故障规则、恢复动作和未验证边界。报告本身也有版本和 checksum，方便比较多次运行。
-
-这份报告是最终项目最重要的用户界面。没有它，用户只能相信程序；有了它，用户能审查程序为什么可信。高质量系统教材不应只教读者写快代码，还要教读者给出能被别人复查的证据。
-
-\topic{十一、从一次失败演练看完整链路}
-把所有机制合在一起，做一次小输入演练：三个 chunk，两个 worker，一个热点 key，一个响应丢失，一个短写，一个 Driver 重启。时间线如下。Chunk 0 正常完成；Chunk 1 的 first attempt 写出后响应丢失；Chunk 2 触发热点拆分；写出阶段对某个 block 注入短写，可靠写循环补齐；Driver 在 manifest commit 后重启；恢复程序读取 manifest，接受已提交 block，拒绝旧 attempt 响应，重做未提交 task，最终 checksum 与 reference 一致。
-
-这个演练比大规模 benchmark 更能说明项目质量。输入小，时间线能画出来；故障多，状态机能被验证；结果可比，reference 能兜底。等这个演练稳定后，再扩大输入、线程数和 worker 数，性能数据才有意义。
-
-\topic{十二、项目代码边界}
-最终项目可以按模块组织：input 负责文件身份和 chunk；parse 负责 reference 和 HotBatch；runtime 负责任务图；partition 负责 scan 和 bucket；io 负责可靠写与 buffer 所有权；manifest 负责提交；bus 负责消息和故障注入；recovery 负责 checkpoint 和对账；report 负责证据输出。模块边界来自事故链，而不是文件夹审美。
-
-C++ 示例也要遵守这个边界。跨模块传递固定宽度 id，不传裸指针；view 不拥有内存，owner 管理生命周期；状态枚举表达合法转移；错误返回区分 Retryable、Fatal、Busy、Stale 和 Cancelled；协议字段不要使用含糊的整型写法。最终项目既是教材内容，也是代码规范训练。
-
-\topic{十三、验收标准}
-最终验收按顺序进行。第一，reference 和优化版在无故障下 checksum 一致。第二，故障注入矩阵每一格有预期和实际。第三，恢复后不重复提交、不读取半成品、不丢已提交结果。第四，热点输入下报告能解释长尾和改善。第五，受限环境中能跑语义实验，并诚实标注硬件结论边界。第六，PDF 和 EPUB 中保留代码、表述和路径，不出现原始 LaTeX 泄漏。验收顺序体现本书价值：正确性、恢复、可解释性在性能口号之前。
-
-\section{最终项目里程碑：每一步都要能失败、能解释、能回退}
-
-最终项目如果一次性要求实现完整计算引擎，读者很容易迷失。更好的推进方式是里程碑。每个里程碑只引入一个新的系统边界，同时保留上一版可运行结果和失败测试。这样项目从小到大增长，复杂度有来源，出错时也能回退。里程碑不是进度表，而是知识结构：每一步都说明为什么要加一个概念、它解决哪个事故、它带来什么新风险。
-
-\topic{一、里程碑一：串行 reference 和输入身份}
-目标是读取输入、解析记录、统计 key、输出结果，并生成 reference report。新增概念只有输入身份和 record id。测试包括空文件、单行、非法字段、重复行、超长行。验收看输出 checksum、错误记录和 record id 回溯。这个里程碑不追求性能，它回答“我们到底在算什么”。若第一步语义含糊，后面所有优化都没有地基。
-
-失败注入可以很简单：输入文件在两次运行之间被修改。程序应通过 file id 或 checksum 发现 reference 不可比较，而不是把旧报告和新输入混在一起。这个小事故让读者理解输入身份为什么要早早存在。
-
-\topic{二、里程碑二：HotBatch 和地址报告}
-目标是把解析结果拆成热字段和冷字段。新增概念是 HotBatch、ColdStore、RecordId 索引和地址报告。测试要求聚合结果和 reference 一致，错误记录仍能回溯原文。报告比较 AoS 和 SoA 的阶段耗时、分配次数、内存峰值和错误回溯成功率。这个里程碑回答“如何让热路径少搬数据，同时不丢证据”。
-
-失败注入是删除或损坏 ColdStore 中的一条记录。程序应在错误报告阶段发现 record id 无法回溯，并把它记为诊断失败，而不是输出错误的原文。这样布局优化和可诊断性同时被验收。
-
-\topic{三、里程碑三：并行 scan 和 partition manifest}
-目标是把 filter、partition、local combine 改成并行版本。新增概念是 chunk count、exclusive scan、bucket range、partition manifest。测试包括共享 push 反例、倾斜 bucket、稳定输出和某 chunk 写入失败。验收看每个 chunk 的输出区间、最终 checksum、bucket 大小和重做范围。这个里程碑回答“多个 worker 如何写同一个逻辑输出而不互相踩”。
-
-失败注入是让第三个 chunk 在回填中途失败。恢复程序应根据 manifest 或区间记录知道第三个 chunk 的范围无效，其他 chunk 不受影响。若系统只能全量重跑，也可以接受，但报告要说明当前恢复粒度。不要假装已经支持细粒度恢复。
-
-\topic{四、里程碑四：线程池、队列和关闭}
-目标是把并行任务交给可解释线程池。新增概念是 QueueContract、worker state、task lifecycle、drain close、cancel close。测试包括上游快下游慢、关闭时队列有元素、消费者等待空队列时关闭、任务抛异常。验收看没有悬挂，异常能回到 driver，队列高水位进入报告。这个里程碑回答“等待和关闭怎样不靠运气”。
-
-失败注入是只通知一个条件变量方向，复现消费者永远睡眠；修复后，关闭能唤醒所有等待者。这个小测试比大压力测试更能说明条件变量谓词。
-
-\topic{五、里程碑五：任务图和 continuation}
-目标是把读取、解析、聚合、写出、提交改成任务图。新增概念是 DependencyCounter、ReadyQueue、Continuation、CancellationSource。测试包括父任务等待子任务的饥饿反例、菱形依赖、任务失败后取消后继、关闭时仍有未完成任务。验收看 trace 能解释每个任务状态。这个里程碑回答“为什么任务不能把等待藏在线程栈里”。
-
-失败注入是两个 worker、两个父任务、两个子任务的 future 饥饿。修复后，父任务后半段变成 continuation，子任务能运行。这个测试把任务图的必要性讲清楚。
-
-\topic{六、里程碑六：可靠写、短写和 manifest}
-目标是把输出写到临时文件，完成后提交 manifest。新增概念是 WriteRequest、offset、in-flight bytes、temporary block、ManifestEntry。测试包括短写、写出延迟、写完未提交崩溃、提交后崩溃、取消后 completion 迟到。验收看恢复后只读取 manifest 接受的 block，不读半成品。这个里程碑回答“文件存在为什么不等于结果有效”。
-
-失败注入是 write 只写一部分。同步版本应继续写剩余部分；异步版本应生成 PartialWritten completion 并维护 offset。若任何版本把短写当成功，manifest checksum 会失败。这个测试直接训练 I/O 语义。
-
-\topic{七、里程碑七：MessageBus、retry 和幂等提交}
-目标是把本机 worker 改成消息驱动。新增概念是 MessageEnvelope、request id、attempt、deadline、retry budget、CommitRecord。测试包括丢请求、丢响应、重复请求、迟到响应、Busy、旧 epoch。验收看 manifest 不重复提交，retry amplification 可控，late reply 被分类。这个里程碑回答“远端执行成功为什么不是外部生效”。
-
-失败注入是 worker 执行成功但 response 被 drop。Driver 创建新 attempt 并最终提交一个结果，旧 attempt 迟到后不改变 manifest。这个测试是第 16 章的核心事故，必须进入自动回归。
-
-\topic{八、里程碑八：多进程边界}
-目标是让 Driver 和 worker 运行在不同进程，通过 Unix domain socket 或管道通信。新增概念是 wire format、framing、partial read/write、process crash、connection state。测试包括半 header 关闭、响应写一半关闭、worker 崩溃后临时文件残留、旧进程恢复发送旧响应。验收看协议解析严格，恢复规则不依赖共享内存。这个里程碑回答“本机模拟是否真的遵守消息边界”。
-
-失败注入是 worker 在写出 block 后进程退出。Driver 应重试 task，恢复扫描应保留或清理旧临时文件但不能自动提交。这个测试会暴露单进程版本里隐藏的全局状态和指针假设。
-
-\topic{九、里程碑九：分片、热点 key 和读写语义}
-目标是处理倾斜 key 和 partition route。新增概念是 partition version、route epoch、hot key split、二级 reduce、stale route。测试包括热点 key 长尾、旧 epoch 请求、子 key 合并、迁移中旧响应。验收看输出精确、长尾改善、旧 owner 无法提交新结果。这个里程碑回答“分片如何从负载问题变成状态归属问题”。
-
-失败注入是 epoch 41 的旧请求在 epoch 42 后到达旧 owner。旧 owner 必须返回 StaleRoute 或转发，不能执行提交。报告应能按 key 查询这条历史。
-
-\topic{十、里程碑十：checkpoint、恢复和审计报告}
-目标是把所有状态纳入恢复。新增概念是 checkpoint generation、task table、manifest generation、idempotency table、recovery audit。测试包括 checkpoint 前崩溃、checkpoint 后响应丢失、manifest 缺失、临时目录脏文件、输入 checksum 改变。验收看恢复报告能解释每个对象命运。这个里程碑回答“系统重启后谁说了算”。
-
-失败注入是 Driver 在 manifest 提交后、内存状态更新前崩溃。恢复时必须从 manifest 重建 committed 状态，而不是重做并重复提交。这个测试如果失败，说明提交权威仍然不清。
-
-\topic{十一、里程碑十一：性能证据和边界声明}
-目标是生成可信性能报告。新增概念是阶段耗时、输入族、字节账本、队列高水位、线程状态、未验证边界。测试包括规则输入、随机输入、错误密集输入、热点输入、小输入、大输入。验收看报告能解释性能变化，而不是只给总时间。这个里程碑回答“快在哪里，为什么快，什么时候不保证快”。
-
-受限环境中，报告要降级但不失真。没有 PMU，就不写确定的 branch miss 结论；没有 NUMA，就不声称 NUMA 优化；手机温控明显，就记录多轮样本和设备状态。诚实边界是高质量教材的一部分。
-
-\topic{十二、里程碑十二：发布工件和阅读体验}
-最终里程碑不是代码，而是书和实验材料的发布。PDF 和 EPUB 要使用统一字体和代码样式，EPUB 不应包含解析错误的图片化图示，正文不应泄漏原始 LaTeX 符号，目录只保留章级入口。书籍产物放到固定手机目录，实验报告也放在项目输出目录。学习材料如果自己不可读，读者就很难相信它讲的工程质量。
-
-这个里程碑回应一个现实问题：系统工程不只在代码里，也在文档、构建、发布和复查里。最终项目的产物要能被手机阅读、能被 git 追踪、能被重新构建、能被别人审查。可重复发布是可重复实验的延伸。
-
-\section{验收报告样例：一次小输入故障演练应该写什么}
-
-为了避免报告变成空泛模板，本节给出一份小输入故障演练的文字形态。输入包含三个文件，每个文件十行；其中一行非法字段，一个 key 是热点。系统启动两个 worker，一个 Driver，一个 MessageBus。故障规则为：丢弃 task 2 attempt 0 的成功响应；让 task 1 的写出第一次短写；在 manifest 提交 task 0 后重启 Driver。演练规模很小，但覆盖输入、解析、写出、消息、提交和恢复。
-
-\topic{一、输入摘要}
-报告先写输入事实：文件数量、总字节数、总记录数、非法记录数、key 基数、最大 key 占比、reference checksum。非法字段的位置通过 file id、offset、record id 表达。这样后续任何阶段都能回到同一输入身份。不要一上来写性能数字，因为此时还不知道程序是否处理了同一批数据。
-
-\topic{二、故障规则}
-故障规则必须可复现。写成“随机丢包”没有审计价值。应写：request 2007、task 2、attempt 0、TaskReply 第一次到达 MessageBus 时 drop；WriteRequest 1003 第一次 completion 返回 4096 bytes，total 为 16384 bytes；Driver 在 manifest generation 5 append 完成后退出。每条规则都有目标、触发次数和预期影响。
-
-\topic{三、阶段结果}
-报告按阶段列出 read、parse、partition、write、commit、recover。Parse 阶段输出错误记录数和 HotBatch checksum；partition 阶段输出 bucket range 和热点拆分信息；write 阶段输出短写重试次数和 block checksum；commit 阶段输出 manifest entries；recover 阶段输出接受、重做、删除和人工检查对象数量。阶段报告让用户知道错误没有被总 checksum 掩盖。
-
-\topic{四、状态机事件}
-事件表列出关键状态转移：task 0 committed before restart；task 1 partial write then completed；task 2 attempt 0 output written but reply dropped；task 2 attempt 1 committed；late reply from attempt 0 rejected。每个事件带 trace id、request id、attempt、epoch 和 reason。这样响应丢失事故不再是文字描述，而是可审查数据。
-
-\topic{五、最终判断}
-最终判断按顺序写。Correctness：parallel checksum 等于 reference checksum，非法记录一致。Recovery：Driver 重启后未重复提交 task 0，task 2 只有 attempt 1 进入 manifest。Resources：in-flight bytes 峰值低于预算，queue high watermark 可接受。Performance：本次小输入不用于硬件结论，只用于语义演练。Open boundary：未验证真实多机网络、掉电持久化和 NUMA。这个结论比“测试通过”更有信息量。
-
-\topic{六、报告失败时如何返工}
-若最终 checksum 不一致，先比较 reference 和 HotBatch；若 HotBatch 一致，比较 partition range；若 range 一致，比较 block checksum；若 block 一致，比较 manifest；若 manifest 一致，检查 reduce 合并。报告应给出这种排查路径。没有路径，失败就会变成翻日志。最终项目要把调试路线也作为交付物。
-
-\section{源码级实现切片：把书里的概念落到文件和接口}
-
-最终项目如果只停留在文字，会让读者觉得所有原则都很正确，却不知道如何开始写代码。本节给出一个源码级切片，不要求一次实现完整系统，但要求每个目录、接口和测试都对应前面的事故。代码组织不是审美问题，而是责任边界。一个目录如果无法说明自己维护什么状态、拥有什么资源、处理什么失败，就会逐渐变成杂物箱。
-
-\topic{一、input 模块只负责身份和字节范围}
-\filepath{src/input/} 负责 FileId、ChunkId、输入扫描、chunk 切分和输入 checksum。它不负责解析字段，也不负责业务统计。这样输入模块可以独立测试：给定文件和 chunk size，输出稳定 chunk 列表；文件改变后，FileId 改变；非法路径或读取失败返回明确错误。若 input 模块顺手解析业务字段，后面 HotBatch 和 reference 的责任就会混乱。
-
-\topic{二、parse 模块同时提供 reference 和 HotBatch}
-\filepath{src/parse/} 包含串行 reference parser 和优化 parser。Reference parser 生成完整语义结果和错误记录；优化 parser 生成 HotBatch、ColdStore 和 error index。测试先比较两者语义，再测性能。这个模块的核心接口不是“parse 一行字符串”，而是“从 ChunkId 生成带 RecordId 的批次”。只有这样，错误回溯、分区和恢复才能共享身份。
-
-\topic{三、runtime 模块不理解业务 key}
-\filepath{src/runtime/} 负责 Task、TaskState、DependencyCounter、ReadyQueue、Worker、CancellationSource 和 TraceEvent。它不应该知道 event key、manifest 或 checksum 的业务含义。任务函数可以产生业务结果，但运行时只管理状态、依赖、取消、异常和调度。这样运行时可以用人工任务图测试，而不需要真实日志输入。若运行时直接操作 manifest，模块边界就会倒向一个巨大的 driver。
-
-\topic{四、partition 模块负责输出位置合同}
-\filepath{src/partition/} 负责局部 histogram、exclusive scan、bucket range、回填和 PartitionManifest。它接收 HotBatch 和 partition function version，输出每个 bucket 的区间和 checksum。这个模块不写文件，也不提交最终结果。它的测试应覆盖共享 push 反例、热点 bucket、稳定顺序、predicate 版本不一致。这样 scan 的正确性和恢复边界可以独立验证。
-
-\topic{五、io 模块负责 buffer 所有权和可靠写}
-\filepath{src/io/} 负责 BufferPool、WriteRequest、WriteState、可靠写循环、短写模拟、completion 和临时文件。它不决定 block 是否最终有效，只报告写出候选是否完整、checksum 是否匹配。Manifest 提交属于更高层。这个边界能避免 completion handler 直接写业务状态。I/O 模块测试包括短写、延迟完成、取消后完成、buffer 归还、队列字节高水位。
-
-\topic{六、manifest 模块是提交权威}
-\filepath{src/manifest/} 负责 ManifestEntry、ManifestGeneration、CommitRecord、append、load、rebuild 和 duplicate rejection。它接收候选 block 和 task identity，决定是否接受。它不读原始输入，也不执行计算。恢复时，manifest 模块提供权威条目，其他模块按它清理或重做。测试包括重复 attempt、旧 epoch、半写 manifest、checksum mismatch 和 generation 恢复。
-
-\topic{七、bus 模块只模拟传输不决定业务}
-\filepath{src/bus/} 负责 MessageEnvelope、framing、故障规则、inbox 容量、timer event、delivery event。它可以丢消息、延迟消息、重复消息、返回 Busy，但不应知道日志统计语义。业务层收到事件后进入状态机。这样 MessageBus 能用合成消息测试，也能迁移到多进程 socket。若 bus 直接调用 worker 函数并返回结果，它就退化成本地调用包装。
-
-\topic{八、driver 模块编排状态机}
-\filepath{src/driver/} 负责 JobState、TaskRuntimeState、retry budget、deadline、checkpoint、recovery 和 run report 汇总。Driver 是控制面，负责把 input、runtime、partition、io、manifest、bus 连接起来。它不应承载所有模块的细节逻辑。每个复杂动作都应委托给对应模块，Driver 只保存跨模块状态和决策。Driver 测试是端到端故障矩阵，而不是所有单元测试的替代。
-
-\topic{九、fault 模块让失败可复现}
-\filepath{src/fault/} 负责确定性故障注入：drop reply、partial write、worker crash、driver restart、busy response、stale epoch、checksum corruption。故障规则有 id、匹配条件、触发次数和 action。所有事故演练都引用 fault rule id。这样失败报告能重放，不依赖“随机有时发生”。随机压力可以作为后期测试，但不能替代确定性单点故障。
-
-\topic{十、report 模块输出人能读的证据}
-\filepath{src/report/} 负责 RunReport、StageReport、FaultReport、RecoveryAudit、PerformanceSummary。它读取其他模块生成的结构化事件，输出文本或 JSON。报告模块不应重新推断业务事实，而是格式化已记录事实。若报告里需要某个字段，说明生产该字段的模块应在事件中记录。报告是系统的观察面，不是事后补注释。
-
-\topic{十一、测试目录按事故组织}
-\filepath{tests/} 不只按模块组织，也按事故组织。比如 \filepath{tests/fault/drop_reply_retries_once}，\filepath{tests/recovery/crash_after_manifest_append}，\filepath{tests/queue/close_wakes_consumers}，\filepath{tests/partition/shared_push_counterexample}。事故测试能防止概念回退。每个测试都写输入、故障规则、预期状态、预期报告字段。这样读者看到测试名就知道它守住哪条教材原则。
-
-\topic{十二、接口评审清单}
-每个公共接口评审时问八个问题。它是否暴露稳定身份；是否说明所有权；是否区分 view 和 owner；是否返回结构化错误；是否可取消；是否可重试；是否能写入 trace；是否有恢复语义。若某个接口只能在正常路径解释，就不应进入最终项目。这个清单能把全书质量要求压到代码层。
-
-\section{实现工单样例：不是一次写完整，而是逐张工单收敛}
-
-为了让读者真正能动手，本节把一个阶段拆成工单。每张工单都包含动机、修改、测试和报告字段。这样项目管理也体现教材方法：从问题出发，做最小改动，验证一个边界，再进入下一步。不要用“实现分布式系统”这种巨大工单吓住自己。
-
-\topic{工单一：为输入 chunk 增加身份}
-动机：恢复和错误报告无法定位输入。修改：增加 FileId、ChunkId、RecordId；reference report 输出这些身份。测试：同一文件两次运行 id 稳定，修改文件后 FileId 改变，错误行能回溯 offset。报告字段：file count、chunk count、record count、input checksum。完成标准：没有性能要求，只要求身份稳定。
-
-\topic{工单二：把共享 push 改成 count-scan-write}
-动机：共享输出锁竞争，失败后不知道写入范围。修改：filter 先 count，再 exclusive scan，再写区间。测试：共享 push 反例、稳定顺序、chunk 写失败。报告字段：chunk count、output offset、output count、scan checksum。完成标准：结果与 reference 一致，输出区间可审计。
-
-\topic{工单三：给有界队列补关闭合同}
-动机：取消时消费者可能永远等待。修改：QueueContract 返回 Success、Closed、Cancelled；close drain 和 close cancel 分开；关闭时 notify all。测试：消费者等待空队列时关闭，生产者等待满队列时关闭，drain 保留已有元素。报告字段：queue high watermark、closed mode、waiter wake count。完成标准：关闭测试不悬挂。
-
-\topic{工单四：写出层处理短写}
-动机：write 返回部分字节时可能误提交坏文件。修改：WriteRequest 保存 offset 和 remaining；completion 区分 PartialWritten、Completed、Failed。测试：注入第一次只写一部分，最终文件 checksum 正确；注入 fatal 错误时 manifest 不提交。报告字段：partial write count、retry count、block checksum。完成标准：短写不破坏输出。
+\topic{工单四：可靠写处理短写}
+动机：write 返回部分字节时可能误提交坏 block。修改：WriteRequest 保存 offset 和 remaining；completion 区分 PartialWritten、Completed、Failed。测试：第一次只写部分字节，最终 checksum 正确；fatal 错误时 manifest 不提交。报告字段：partial write count、retry count、block checksum。
 
 \topic{工单五：manifest 拒绝重复 attempt}
-动机：响应丢失后重试会产生两个候选 block。修改：CommitRecord 按 task id 保存 accepted attempt；重复或迟到 attempt 返回 LateAttempt 或 Duplicate。测试：attempt 0 写出后响应丢失，attempt 1 提交，attempt 0 迟到。报告字段：accepted attempt、late reply count、duplicate count。完成标准：manifest 每个 task 只有一条有效记录。
+动机：响应丢失后重试会产生两个候选 block。修改：CommitRecord 按 logical task 保存 accepted attempt；重复或迟到 attempt 返回 LateAttempt 或 Duplicate。测试：attempt 0 写出后响应丢失，attempt 1 提交，attempt 0 迟到。报告字段：accepted attempt、late reply count、duplicate rejected。
 
-\topic{工单六：Driver 重启后从 manifest 重建状态}
-动机：内存状态丢失导致重复提交。修改：启动时读取 manifest 和 checkpoint，重建 task table；旧 epoch 响应拒绝。测试：manifest append 后崩溃，恢复后不重做；append 前崩溃，恢复后重做。报告字段：recovered committed tasks、rescheduled tasks、stale replies。完成标准：两个崩溃点行为不同且符合预期。
+\topic{工单六：恢复从 manifest 重建状态}
+动机：Driver 崩溃后内存状态丢失，可能重复提交。修改：启动时读取 manifest 和 checkpoint，重建 task table；旧 epoch 响应拒绝。测试：manifest append 前崩溃要重做，append 后崩溃要承认已提交。报告字段：recovered committed tasks、rescheduled tasks、stale replies。
 
-\topic{工单七：热点 key 拆分和二级合并}
-动机：单个 reduce partition 长尾。修改：检测热 key，生成子 key，多个 reducer 处理，最终二级合并回业务 key。测试：分散强 key、单热 key、tie-break、重复 attempt。报告字段：max key ratio、subkey count、reduce p99、final merge checksum。完成标准：输出精确，长尾解释清楚。
+\section{工业设计参照}
 
-\topic{工单八：生成 run report}
-动机：用户无法审查程序结果。修改：汇总输入、阶段、故障、恢复、性能和未验证边界。测试：每个故障演练报告包含指定字段；缺字段测试失败。报告字段本身即产物。完成标准：读报告能复现事故时间线，不需要翻源码猜测。
+\begin{casebox}
+\topic{Spark：stage、shuffle 和 output commit}
+Spark 的核心经验不是“分布式计算可以并行”，而是把宽依赖切成 stage，把 map output 和 shuffle metadata 管起来，把 task attempt 和输出提交分开。它面对 executor 故障、长尾 task、shuffle 文件丢失和 speculative execution。核心机制是 stage boundary、task attempt、map output tracker、shuffle block 和 output commit protocol。代价是 driver 元数据和 shuffle 服务成为关键路径，speculation 也会放大资源消耗。
 
-\topic{工单九：构建阅读产物}
-动机：教材需要稳定交付到固定目录。修改：构建 PDF 和 EPUB，复制到书名目录，校验 checksum，扫描 EPUB 不含图片和原始 LaTeX。测试：PDF 文本抽取无明显宏泄漏，EPUB 解包无图片资源，目录章级可读。完成标准：产物路径固定，可重复生成。
+本书项目应借鉴 stage、attempt、shuffle manifest 和 speculative attempt 的幂等提交边界，但不需要实现 Spark 的完整调度、资源管理和外部 shuffle 服务。
+\end{casebox}
 
-\topic{工单十：记录版本边界}
-动机：工程变更必须可追踪。修改：记录核心接口、测试摘要、故障矩阵和产物 checksum；版本说明写清本次改动解决了哪个问题。测试：从版本记录能找到对应 runbook、构建产物和验证结果。完成标准：后续读者可以追溯一次交付包含哪些正文、代码、测试和书籍产物。
+\begin{casebox}
+\topic{Flink：checkpoint barrier 和状态一致性}
+Flink 这类流式系统面对的是持续输入、算子状态和外部输出的一致恢复。核心机制是 checkpoint barrier、operator state、input offset 和 sink commit 的绑定。它说明 checkpoint 不能只保存“程序运行到哪里”，而要把输入位置、状态和输出提交点放在同一一致边界里。代价是 checkpoint 频率、状态大小和外部 sink 协议会直接影响延迟和吞吐。
 
-\section{Linux 源码对照阅读工单：从项目现象回到内核路径}
+本书项目是批处理模拟，但应借鉴这个原则：checkpoint 保存控制面和提交边界，不只保存内存 dump。若只保存 task table，不保存 manifest generation，恢复后仍可能重复输出。
+\end{casebox}
 
-Linux 源码解读不能写成“列几个内核函数”。源码阅读必须从项目现象出发：线程为什么被唤醒，写文件为什么只是进入页缓存，队列等待为什么可能进入 futex，进程崩溃后文件为什么还在，网络连接关闭为什么只告诉我们传输断了而不是业务失败。读源码的目标不是覆盖内核全貌，而是让读者能把项目里的状态转移和 Linux 提供的机制对应起来。每次阅读都要有输入现象、用户态证据、内核入口、源码角色、未验证边界和回到项目的设计结论。
+\begin{casebox}
+\topic{DuckDB/ClickHouse：向量化执行和 pipeline}
+单机分析型执行器的经验同样适用最终项目。DuckDB、ClickHouse 这类系统强调列式或向量化 batch、pipeline、selection vector、压缩和 operator profiling。它们面对的是 CPU cache、SIMD、分支、内存带宽和复杂查询管线。核心机制是批量处理热字段，让算子间传递结构化 batch，并输出可解释 profile。
 
-\topic{一、futex 对照有界队列等待}
-现象是消费者在队列为空时等待，生产者 push 后唤醒；关闭时必须唤醒所有等待者。用户态先看条件变量谓词：有元素、关闭、取消。Linux 层面，很多 pthread 条件变量和 mutex 的慢路径会落到 futex 思路：无竞争时尽量在用户态修改原子状态，竞争时进入内核睡眠，状态变化后唤醒等待者。阅读时不需要把 futex 每个分支背下来，而要理解它回答的问题：线程什么时候从可运行变成睡眠，谁负责唤醒，唤醒后为什么还要重新检查谓词。
+本书项目应借鉴 batch、selection vector、operator profile 和 pipeline breaker 的思想。Map-side combine 和 reduce merge 不应只当分布式概念，也要继承单机执行器的热路径纪律。
+\end{casebox}
 
-回到项目，结论是条件变量不能等待通知本身，必须等待状态谓词。即使内核正确唤醒，用户态状态如果没有在同一锁保护下更新，等待者仍可能看到不一致事实。源码阅读证明的是“睡眠和唤醒只是执行机制”，不替代队列合同。报告应写：本次阅读解释了为什么低竞争锁可以很快，也解释了为什么高竞争或错误关闭会进入内核等待；它没有证明任何业务状态正确。
+\begin{casebox}
+\topic{Ray/actor runtime：任务、对象和故障边界}
+Ray 等系统把分布式执行抽象成 task、actor 和 object store，面对的是任务依赖、对象传输、worker 故障和调度可观察性。它提醒我们：数据对象和任务状态要有稳定身份，运行时不能只靠调用栈理解依赖，失败后要知道哪些对象可重建、哪些需要重新提交。
 
-\topic{二、调度器对照 worker 空闲和抢占}
-现象是任务运行时报告某 worker 执行一个短任务用了很久。用户态 trace 显示任务 start 到 finish 时间长，但 CPU time 可能不长。Linux 调度器看到的是线程，不知道任务图。阅读调度路径时，重点不是完整理解所有调度类，而是理解可运行线程、睡眠线程、抢占、时间片、CPU 亲和和迁移这些角色。线程池以为 worker 正在运行，实际它可能被抢占；线程池以为任务在等待，操作系统只知道线程睡眠。
+本书项目不需要复制 Ray 的 API，但应借鉴对象身份、任务 trace 和故障重建的思想。ShuffleBlock、ManifestEntry 和 TaskRecord 就是教学版的对象和任务账本。
+\end{casebox}
 
-回到项目，结论是 run report 要区分 wall time 和 CPU time，并记录实际 CPU。若 worker 任务耗时长但 CPU time 小，问题可能是调度延迟或阻塞；若 CPU time 也长，才更可能是计算路径慢。受限环境没有完整调度跟踪时，报告至少保留 worker 时间线和系统可见 CPU 列表。源码阅读帮助读者理解“线程池不是操作系统调度器”，二者分层不同。
+\section{面向第三卷的接口}
 
-\topic{三、页缓存对照可靠写出}
-现象是 \code{write} 返回成功后，进程崩溃或系统异常时，恢复发现文件内容或目录项并不符合预期。用户态先看可靠写合同：临时文件完整写入、checksum 校验、必要同步、manifest 提交。Linux 阅读从 VFS、file、inode、address space、dirty page、writeback 的角色进入。普通 write 往往把数据放进页缓存并标记 dirty，设备写回稍后发生；fsync 试图把相关数据和元数据推到持久化边界；rename 改变目录项，但目录持久化也有自己的顺序问题。
+第二卷没有直接写 CPU 推理引擎，是为了先把计算系统地基打稳。第三卷会处理模型权重、tensor buffer、算子内核、batch 调度、KV cache、请求 deadline 和流式输出。这些不是全新问题，而是本章接口的延伸。
 
-回到项目，结论是文件存在不等于提交成功，write 返回不等于掉电后可见。教学项目可以在受限环境中不承诺完整掉电语义，但必须用进程崩溃点矩阵训练顺序：写中、写完未提交、manifest 后、清理前。源码阅读让读者知道为什么要使用临时文件、checksum 和 manifest，而不是扫描目录当作结果。
+\topic{模型文件对应输入和 manifest}
+模型文件有 tensor 名称、shape、dtype、量化参数、checksum 和版本。它比日志输入更严格，但同样需要输入身份、可靠读取、manifest 和版本边界。加载权重时，CompletionRecord、checksum 和 manifest 仍然适用。
 
-\topic{四、page fault 对照 mmap 和输入读取}
-现象是第一次扫描输入慢，第二次扫描快；或者 mmap 版本在某些输入上出现长尾。Linux 源码阅读从缺页处理、VMA、页缓存和文件映射关系进入。第一次访问映射页时，内核可能需要建立页表、读取文件页或关联页缓存；后续访问命中页缓存和 TLB，成本不同。这个路径能解释为什么冷运行和热运行不能混为一个数字。
+\topic{算子对应 kernel 和 task}
+矩阵乘、归一化、softmax、采样和量化都需要 scalar reference、误差合同、HotKernelReport、MemoryShape 和 KernelVariant。线程池和任务图会调度 layer、tile、token 或 batch。背压从 shuffle queue 变成 request queue 和 token generation queue。
 
-回到项目，结论是性能报告要区分冷读和热读。若优化只是在热页缓存下测得，不能宣称改善了真实首次读取；若 mmap 简化了拷贝，但增加了缺页长尾，也要写入边界。源码阅读不是让读者背页表层级，而是帮助解释“为什么同一个顺序扫描第一次和第二次不一样”。
+\topic{KV cache 对应生命周期和所有权}
+KV cache 是跨 token 持续存在的状态，既要高效访问，又要按请求隔离。它会重新考验 BatchView、buffer ownership、ProgressAndReclaim、队列关闭和取消语义。若第二卷项目已经把所有权和状态机写清，第三卷进入 KV cache 时就不会从零开始。
 
-\topic{五、内存分配对照 HotBatch 和 arena}
-现象是节点式对象版本分配次数多、内存碎片明显，HotBatch 版本更稳。Linux 和运行库层面的完整分配器很复杂，教学阅读可从用户态 allocator 和系统调用边界入手：小对象可能来自分配器缓存，大块内存可能通过映射或堆扩展获得，释放也不一定立刻还给系统。内核只看到页和映射，不理解 LogRecord 语义。
+\section{复查清单}
 
-回到项目，结论是 arena 适合生命周期一致的 batch，但不适合跨任务长期持有的对象。HotBatch 的 owner 必须活到所有 view 结束，错误报告如果需要冷数据，就不能提前释放 arena。源码阅读帮助读者把“分配快”翻译成“生命周期和页行为更可控”，而不是把 arena 当万能优化。
+\topic{一、Reference 是否仍然是权威}
+所有优化版本、故障版本和分布式模拟都要能回到 reference。若 reference 未定义错误行、输出顺序或溢出语义，先补 reference，不要继续优化。
 
-\topic{六、网络字节流对照 MessageBus framing}
-现象是多进程版本中 worker 收到半个消息，或响应发送一半后连接关闭。Linux socket 层提供字节流语义，应用层消息边界不自动保留。阅读时关注 read、write、poll 或 epoll 的用户可见行为：可读不等于完整消息，可写不等于全部写完，连接关闭不等于业务失败。TCP 或 Unix domain socket 的内部路径很深，本书只需追到“字节流和就绪事件”这条线。
+\topic{二、Manifest 是否是唯一提交入口}
+Reduce 和恢复都只能读取 manifest 接受的 block。临时目录、worker Ok 响应和 checkpoint 内存状态都不能越过 manifest。
 
-回到项目，结论是 MessageEnvelope 必须有 framing，连接层必须维护 ReadingHeader 和 ReadingPayload 状态，业务层必须根据 request 和 attempt 判断连接关闭后如何恢复。源码阅读把“RPC 不是函数调用”进一步落到系统调用边界：一次 write 和一次 read 不是一条消息。
+\topic{三、故障是否可复现}
+响应丢失、短写、Driver 崩溃、旧 epoch、Reduce busy 和热点 key 都要用固定规则复现。随机压力可以补充，不能替代确定性故障。
 
-\topic{七、epoll 对照事件循环}
-现象是多个连接、timer 和 I/O completion 同时存在，业务代码如果在回调里直接提交状态，很快混乱。Linux epoll 或类似机制提供 ready event，不提供业务状态机。阅读时关注事件来源：文件描述符可读、可写、错误、关闭；timerfd 或用户态 timer 触发；事件可能合并，处理后需要再次检查状态。内核告诉你“某个资源可能能推进”，不告诉你“某个 task 应该提交”。
+\topic{四、报告是否能解释失败}
+RunReport 应能让读者沿输入、batch、partition、block、manifest、checkpoint 查到差异位置。若失败只能靠翻源码，报告还不合格。
 
-回到项目，结论是事件循环只生成 DriverEvent，业务状态由 Driver 状态机处理。TimeoutEvent、ReplyEvent、BusyEvent、CancelEvent 都统一进入同一判定流程。不要在 epoll 回调里直接写 manifest。源码阅读让读者理解系统事件和业务事件之间的边界。
+\topic{五、性能结论是否有边界}
+性能报告必须带输入、环境、线程数、阶段耗时、资源峰值和未验证条件。移动端或受限 Linux 环境的数字不能被写成通用硬件结论。
 
-\topic{八、进程退出对照 worker crash}
-现象是 worker 进程退出，Driver 看到连接断开或 wait 状态，但临时文件仍在。Linux 会回收进程内存、关闭文件描述符，却不会理解业务临时文件是否有效。阅读进程退出路径时，只需抓住资源回收范围：内存、描述符、进程状态由内核处理；业务文件、manifest、checkpoint 仍由应用协议处理。不要指望操作系统替你回滚业务状态。
+\topic{六、第三卷接口是否克制}
+可以预留 ModelArtifact、TensorBuffer、KernelTask 和 InferenceRequest 的接口方向，但不要在第二卷展开 AI 算子正文。最终章的任务是收束计算系统，不是提前分散主题。
 
-回到项目，结论是 worker crash 只产生一个故障事件。恢复仍要通过 manifest、checksum、attempt 和 task table 判断临时文件命运。进程死亡不是业务事务回滚。这个结论能防止读者把系统崩溃恢复想得过于简单。
+\begin{sourcereadingbox}
+源码和工业阅读任选一条：
+\begin{enumerate}
+  \item 阅读 Spark 的 task attempt、shuffle block 或 output commit 相关路径，说明它如何避免重复输出。
+  \item 阅读 Flink checkpoint 和 sink commit 的一条路径，说明 input offset、operator state 和外部输出如何绑定。
+  \item 阅读 DuckDB、ClickHouse 或类似执行器的 vectorized pipeline/profile 路径，说明 batch 和 pipeline breaker 如何影响性能证据。
+  \item 阅读 Linux 的 futex、page cache、epoll 或进程退出路径之一，必须从本章项目现象进入，不允许只列函数名。
+\end{enumerate}
+报告按“项目现象、源码入口、能解释的事实、不能证明的边界、回到项目的设计结论”组织。
+\end{sourcereadingbox}
 
-\topic{九、文件锁和进程锁的边界}
-现象是多个进程同时访问同一 manifest 或输出目录。Linux 提供文件锁和原子 rename 等机制，但它们不是分布式共识。文件锁可以协调同机进程，不能自动解决多机脑裂；rename 可以提供某些文件系统上的原子目录项切换，不能证明数据已经按业务语义提交。源码阅读或手册阅读要把这些边界写清。
-
-回到项目，结论是教学版可以用单 Driver 管理 manifest，多进程 worker 不直接提交全局 manifest。若未来多 Driver，就需要 leader term 或共识。不要把本地文件锁包装成集群一致性。边界诚实比功能包装更重要。
-
-\topic{十、cgroup 和移动环境对照性能数字}
-现象是同一线程数在 Termux、容器和服务器上表现差异很大。Linux cgroup、CPU quota、调度策略、后台限制和移动设备温控都会影响可运行时间。源码级深入不是本书重点，但读者应知道：可见 CPU 数、实际可用算力和调度权限可能不同。报告中记录环境比强行解释数字更重要。
-
-回到项目，结论是性能报告要有环境段。手机上可完成状态机和恢复实验，但硬件结论要降级；容器内要记录 CPU quota；服务器上要记录 NUMA 和频率策略。源码阅读帮助读者理解“操作系统也是实验条件”。
-
-\topic{十一、内核源码阅读报告格式}
-每份源码阅读报告都按六段写。第一，项目现象，例如短写、等待、缺页、连接关闭。第二，用户态最小复现。第三，内核入口或机制角色。第四，源码或文档能解释的事实。第五，仍未验证或依赖文件系统、平台、权限的边界。第六，回到项目的设计修改。这样的报告能防止源码阅读变成函数名堆砌。
-
-\topic{十二、源码阅读不替代测试}
-读懂某条内核路径，不等于项目正确。futex 解释睡眠，不能证明队列谓词正确；页缓存解释 write 返回，不能证明 manifest 恢复正确；epoll 解释 ready event，不能证明业务状态机正确。源码阅读给我们物理和系统机制，测试验证我们的协议。两者互补，不可互相替代。
-
-\section{面向 CPU 推理引擎的系统接口检查}
-
-CPU 版本推理引擎需要加载量化模型，并在本地 Linux 上跑推理。它不应该突然从模型名词开始，而应该继承本书已经建立的工程骨架：输入身份、可靠 I/O、HotBatch、任务图、buffer 所有权、manifest、trace、checkpoint、性能报告。不同的是，日志记录变成 token 和 tensor，统计 kernel 变成矩阵乘、量化反量化、归一化和采样，shuffle block 变成权重块、KV cache 和中间激活。
-
-\topic{一、模型文件是更严格的输入}
-模型文件不是普通二进制 blob。它包含权重张量、量化参数、tokenizer、配置、版本和校验。第二册的 FileId、checksum 和 manifest 可以直接迁移。加载时先建立 ModelId，记录文件路径、大小、格式版本、权重 checksum、tokenizer checksum 和配置摘要。若任何一项变化，旧缓存和旧 benchmark 不能直接复用。这样第三册一开始就有输入身份，不会靠文件名猜模型。
-
-\topic{二、权重布局继承 HotBatch 思路}
-量化权重的热路径只需要紧凑的整数块、scale、zero point 或 group 参数；调试路径需要张量名、原始维度、来源层和校验。权重布局应像 HotBatch 一样区分热数据和证据数据。矩阵乘内核读紧凑块，报告和错误诊断通过 TensorId 回到模型元数据。这样性能和可解释性不冲突。
-
-\topic{三、算子调度继承任务图}
-一次推理不是一个函数，而是一串算子依赖：embedding、attention、MLP、norm、sampling。单 batch 可以串行，多个请求可以并发，某些层内可以分块并行。任务图能表达算子依赖、buffer 生命周期和取消。若用户取消请求，已经提交的算子如何停止，KV cache 如何释放，输出 token 如何标记，都和第二册任务图一致。
-
-\topic{四、KV cache 是生命周期考试}
-KV cache 会跨 token 存活，又随请求结束释放；它很大，不能随便复制；它可能按层、头、位置分块；并发请求共享权重但不共享 KV。第二册的 owner/view、BufferPool、in-flight bytes、checkpoint 思路都能迁移。第三册不能只讲 attention 公式，还要讲 KV cache 的内存布局、所有权、回收和观测。
-
-\topic{五、量化结果要有 reference}
-推理引擎也必须先有 reference。可以先用简单标量实现或小矩阵高精度版本，定义量化反量化误差、token 输出差异和可接受范围。优化版的 SIMD、线程和缓存布局都和 reference 比较。没有 reference，量化推理很容易变成“能输出文字就算对”。正确性先于性能的原则必须延续。
-
-\topic{六、算子性能报告继承 Roofline 和阶段报告}
-矩阵乘、softmax、layer norm、sampling 的瓶颈不同。报告要拆阶段，记录 token latency、prefill latency、decode latency、内存带宽、线程数、batch size、权重字节、激活字节。若某算子声称优化成功，要说明是减少访存、增加 SIMD 利用、改善线程分块，还是减少临时分配。第二册测量章的证据链直接复用。
-
-\topic{七、推理请求继承 deadline 和背压}
-推理服务即使只在本地跑，也会遇到请求排队。用户可能提交多个 prompt，某些请求很长，decode 阶段占用时间多。系统需要 request id、deadline、queue capacity、cancel、Busy 和 run report。不要等到第三册讲服务化才引入这些概念。第二册的 MessageBus 和背压已经提供了模型。
-
-\topic{八、模型输出也需要可复现边界}
-采样可能使用随机数，temperature、top-k、top-p、seed 都影响输出。若测试要求可复现，就要固定 seed 和采样策略；若允许随机，就要比较概率边界或中间 logits。并行确定性章节已经训练了这件事：输出顺序和随机性必须成为接口合同。推理引擎只是在 AI 场景中重新应用。
-
-\topic{九、Linux 观察仍然服务具体问题}
-推理引擎慢时，不要先猜模型太大。先看加载慢、prefill 慢、decode 慢、内存分配慢、线程空闲还是 cache miss。Linux 工具仍然只服务问题：缺页解释首次加载，perf 解释热算子，线程 trace 解释调度，I/O trace 解释模型读取。源码阅读仍然不堆函数名，而是解释现象。
-
-\topic{十、推理引擎从已有骨架长出来}
-推理引擎可以先把日志统计引擎中的 input、runtime、io、report 骨架保留下来，把 parse 和 kernel 替换成 tokenizer 和 tensor operator。这样读者会看到新主题不是另一本孤立书，而是在同一系统骨架上引入更复杂计算负载。最终项目写得越扎实，后续越能把篇幅用于 AI 模型和算子本身，而不是重新补系统基础。
-
-\topic{十一、交接检查表}
-进入推理引擎前，计算系统项目至少应具备：稳定输入身份，可靠写出，任务图 trace，buffer 所有权，manifest，run report，故障注入，手机产物发布。若这些还没有，推理引擎会在模型加载、权重缓存、算子调度和输出报告中反复踩同样的坑。接口检查不是拖延，而是保证新内容能建立在已有工程能力上。
-
-\topic{十二、读者能力目标}
-读到这里，读者不一定已经会写高性能推理引擎，但应该能面对一个推理引擎设计提出正确问题：模型文件身份是什么，权重怎样布局，KV cache 谁拥有，算子输出如何校验，线程池是否被阻塞 I/O 占住，deadline 如何传播，报告如何复现一次慢请求。能提出这些问题，后续才有可能把 AI 算子讲深，而不是把读者淹没在新名词里。
-
-\section{端到端设计评审：把所有问题按顺序问完}
-
-最终项目交付前，应模拟一次设计评审会议。评审不问“用了哪些高级技术”，而按作业生命周期逐项追问。每个问题都要求指向代码、状态表、测试和报告字段。答不上来，就不是表达不够漂亮，而是系统边界还没写清。设计评审的价值在于它把全书知识变成一套固定问法，让读者以后面对任何系统都能复用。
-
-\topic{一、输入评审}
-评审先问输入身份。文件被替换后，系统如何发现？同一路径下内容变化，旧 checkpoint 是否会被拒绝？非法行如何记录，错误报告能否回到 offset？若答案只是“输入文件一般不会变”，评审不通过。最终项目必须承认外部世界会变化，并用 FileId、ChunkId、RecordId 和 checksum 把变化写进证据链。
-
-\topic{二、语义评审}
-接着问 reference。串行 reference 是否覆盖空输入、非法字段、重复记录、超长行和热点 key？优化版本改变输出顺序是否被允许？浮点或近似算法有没有误差规则？若 reference 只是为了跑通 demo，而不是语义合同，所有性能数字都不能进入评审。正确性是第一道门。
-
-\topic{三、布局评审}
-然后问热路径。聚合阶段实际读取哪些字段？冷字段能否回溯？HotBatch 生命周期由谁拥有？View 是否可能在 arena 释放后继续使用？如果某个指针跨过异步边界，评审要求指出 owner。数据布局优化不是只看 cache，而要同时看证据和生命周期。
-
-\topic{四、并行评审}
-并行阶段要问输出位置。多个 worker 是否写共享 vector？如果用了 scan，count 和 write 是否使用同一 predicate version？某 chunk 失败后，输出区间如何作废？Partition manifest 是否记录 bucket 范围和 checksum？若并行输出没有可审计区间，恢复和调试都会变成全局猜测。
-
-\topic{五、线程评审}
-线程池要问任务分类。Compute、I/O、completion、driver 是否共用同一 worker 集合？若磁盘慢，解析任务是否会被写出任务占住？关闭时已提交任务是 drain 还是 cancel？等待者如何唤醒？设计评审不接受“析构时 join 一下”这种答案，必须看到状态机。
-
-\topic{六、同步评审}
-锁和条件变量要问谓词。队列等待的是通知，还是等待“有元素、关闭、取消”这样的状态？多个锁的获取顺序是否固定？锁内是否调用用户回调或 I/O？指标变量是否偷偷参与关闭协议？同步代码最怕看起来短，评审要看不变量，而不是看 API 数量。
-
-\topic{七、原子评审}
-原子变量要问角色。它是统计、发布、线性化、生命周期还是等待？每个 release 发布了哪些普通字段？每个 acquire 后允许读取哪些字段？Relaxed 变量是否可能被后续维护者拿来判断释放或关闭？如果不能给每个原子变量写角色，宁可用锁保留清晰语义。
-
-\topic{八、I/O 评审}
-写出阶段要问提交点。Submit 成功、completion 成功、checksum 通过、manifest 提交分别是什么状态？短写如何推进 offset？Buffer completion 前能否复用？崩溃发生在写中、写完未提交、提交后、清理前分别怎样恢复？若答案依赖“文件应该已经写完”，评审不通过。
-
-\topic{九、消息评审}
-分布式模拟要问未知状态。Timeout 是否被当成失败？重试是否有预算？旧 attempt 响应迟到如何分类？Busy 是否触发退避而不是立即重试？消息里是否带 request、attempt、epoch、deadline、trace、payload length 和 checksum？如果响应处理函数收到 Ok 就直接提交，说明第 16 章没有落地。
-
-\topic{十、恢复评审}
-恢复阶段要问权威记录。重启后先信 manifest、checkpoint、临时目录还是 worker 响应？每个临时文件如何归类？Manifest 指向的 block 缺失怎么办？Checkpoint 版本不兼容怎么办？恢复不是正常路径的附录，而是系统语义的最终裁判。评审必须能看到恢复矩阵。
-
-\topic{十一、性能评审}
-性能报告要问证据链。总耗时下降来自哪个阶段？输入族是否覆盖规则、随机、错误密集、热点和小输入？没有 PMU 权限时用了什么替代证据？数字是否超过字节账本能解释的上限？性能评审不接受“快了很多”，必须给出可复查的阶段数据和边界声明。
-
-\topic{十二、可读性评审}
-最后问产物。PDF 目录是否只保留章级入口？代码块是否可读？EPUB 是否没有图片化图示和原始 LaTeX 泄漏？手机目录是否按书名组织？这些看似排版问题，实际影响学习路径。一本系统教材如果自己的构建产物不可审查，就很难说服读者相信它的工程纪律。
-
-\topic{十三、评审结论写法}
-设计评审结论不要写“基本通过”。它应列出通过项、阻塞项、风险项和后续工单。通过项说明已有测试；阻塞项必须在发布前修复；风险项说明当前边界，例如未验证真实掉电、未验证多机网络、未验证 NUMA；后续工单进入第三册或后续版本。评审结论本身也应提交到仓库，成为项目历史的一部分。
-
-\topic{十四、为什么这不是形式主义}
-这些问题看起来多，但每个都来自前面的具体事故：重复 partial、解析器变慢、共享计数器、队列关闭悬挂、ready 发布错误、Treiber 栈回收、共享 push、future 饥饿、短写、响应丢失、旧 owner 写入、Driver 重启。设计评审只是把事故经验固化成问法。真正的形式主义是背术语却不问事故。
-
-\section{常见反例库：用小事故防止系统退化}
-
-最终项目维护到后期，最容易退化的不是大架构，而是一个个小反例被遗忘。新人看到代码，会觉得某个字段太麻烦、某个状态太保守、某个测试太小，于是删掉 attempt、合并错误码、把 manifest 改成扫描目录、把 queue close 简化成一个布尔值。短期看代码少了，长期看同一类事故会重新出现。因此项目应保留一组常见反例库。每个反例都很小，但都守住一条系统原则。回归测试不是为了覆盖率数字，而是为了防止知识退化。
-
-\topic{反例一：重复 partial 让结果翻倍}
-输入只有两行，split 0 统计出 key A 的计数为二。Worker 写出 partial 后，Driver 在写 manifest 前崩溃。错误恢复扫描临时目录，把旧 partial 读入；随后又重做 split 0，生成新 partial；reduce 合并两份，结果变成四。这个反例守住 manifest 权威性。修复不是禁止重试，而是规定只有 manifest 接受的 block 才能进入 reduce，临时目录只是候选池。测试应检查临时目录里可以有多份候选，但 manifest 每个逻辑 task 只有一条有效记录。
-
-\topic{反例二：错误行被性能优化吞掉}
-解析器优化后跳过了慢错误路径。规则输入 checksum 一致，错误密集输入中错误行数量变少。这个反例守住 reference 和错误语义。修复不是把错误路径重新塞回热循环，而是保留快路径检测和慢路径精确报告。测试应同时比较成功记录、错误记录和错误位置。只比较最终计数，可能完全看不到错误记录丢失。
-
-\topic{反例三：共享计数器让扩展曲线停住}
-每条记录处理后都更新一个全局原子计数器。八线程以内还能接受，线程继续增加后吞吐不升反降。这个反例守住共享写热点分析。修复是把高频计数拆成线程本地或节点本地 partial，低频合并。测试不只看最终计数，还看扩展曲线、cache line 争用或替代指标。Atomic 语义正确，不代表它适合高频热路径。
-
-\topic{反例四：队列关闭只通知生产者}
-消费者在空队列上等待，主线程关闭队列，只唤醒等待空间的生产者，没有唤醒等待元素的消费者。程序退出卡住。这个反例守住条件变量谓词。修复是让关闭状态进入所有等待谓词，并在关闭时唤醒所有方向的等待者。测试要用容量为一的小队列复现，不需要大压力。小反例越小，越能说明问题本质。
-
-\topic{反例五：发布状态早于字段写入}
-生产者先把 ready 置为 true，再写 payload 字段。消费者看到 ready 后读字段，偶尔读到旧值或未初始化值。这个反例守住发布协议。修复是先写普通字段，最后 release 发布状态；消费者 acquire 观察状态后再读字段。测试不一定能稳定复现，所以代码评审必须写出发布了哪些字段。内存序正确性不能完全交给运行结果。
-
-\topic{反例六：无锁栈释放了仍被观察的节点}
-线程一读到栈顶节点后暂停，线程二弹出并释放该节点，分配器复用地址，线程一恢复后继续使用旧指针。这个反例守住无锁生命周期。修复可以是 hazard pointer、epoch 或先保留锁版结构。测试要故意暂停读者线程，观察退休列表和释放时机。无锁结构的关键不是 CAS 写得短，而是节点什么时候可以安全释放。
-
-\topic{反例七：共享 push 让输出顺序和恢复都失控}
-多个线程过滤记录后直接向共享 vector push。加锁版本慢，去锁版本错，本地 vector 合并版本顺序不稳定，失败后不知道哪些输出有效。这个反例守住 scan 的系统意义。修复是 count、scan、write 三阶段，让每个 chunk 拥有确定输出区间。测试要在某个 chunk 写到一半时失败，检查恢复能定位该区间。
-
-\topic{反例八：future 等待把线程池全部占住}
-两个 worker 分别运行父任务，父任务提交子任务后同步等待。子任务已经 ready，但没有 worker 执行。这个反例守住任务图和 continuation。修复是把父任务后半段注册为子任务完成后的 continuation，释放 worker 去跑 ready 任务。测试只需要两个 worker 和四个任务。若这个反例不在回归中，运行时很容易被重新写成阻塞线程池。
-
-\topic{反例九：短写被当作完整成功}
-写出 16 KiB block，第一次 write 只返回 4 KiB，代码却把它当成功并提交 manifest。Reduce 读取坏文件，checksum 不一致。这个反例守住可靠写循环。修复是 WriteRequest 保存 offset 和 remaining，直到所有字节完成后才进入 checksum 和 commit。测试要注入短写，而不是等待真实文件系统偶然出现。可靠 I/O 必须可模拟。
-
-\topic{反例十：响应丢失后两个 attempt 都提交}
-Attempt 0 执行成功并写出 block，成功响应丢失。Driver 超时后启动 attempt 1，attempt 1 提交。随后 attempt 0 的旧响应迟到，错误代码再次提交。这个反例守住分布式模型的核心：执行成功不等于外部生效。修复是 CommitRecord 按逻辑 task 接受一个 attempt，旧响应只进入 late 事件。测试要检查 manifest generation 不变，late reply 指标增加。
-
-\topic{反例十一：旧 owner 在新 epoch 后继续写}
-Partition 7 从 worker A 迁移到 worker B，epoch 从 41 切到 42。A 收到旧请求并按旧路由写出结果，B 也按新路由提交。这个反例守住状态归属和 fencing。修复是请求、响应、manifest 都带 route epoch，旧 epoch 写入被拒绝或转发。测试要按一个 key 的时间线检查旧 owner 是否失去提交权。
-
-\topic{反例十二：恢复时相信内存而不是日志}
-Driver 在 manifest append 成功后崩溃，内存状态还没更新。恢复程序只看 checkpoint 中旧状态，认为 task 未提交，于是重做并重复输出。这个反例守住恢复权威。修复是恢复时从 manifest 重建 committed 状态，再用 checkpoint 补充未完成任务。测试要区分 append 前崩溃和 append 后崩溃，两者行为必须不同。
-
-\topic{反例十三：性能报告只给总时间}
-优化版声称快三倍，但没有输入摘要、checksum、阶段耗时、环境和失败输入。这个反例守住测量纪律。修复是生成 run report：输入、正确性、阶段、资源、故障和边界。测试可以要求报告字段存在，缺字段即失败。性能报告如果不能被审查，速度数字就不能进入设计决策。
-
-\topic{反例十四：手机环境数字被当成通用结论}
-Termux 上某个版本更快，就把结论写成“该算法更快”。后来在服务器上结果相反。这个反例守住环境边界。修复是报告设备、温度、权限、可见 CPU、是否有 PMU、是否有 NUMA，并把移动端结论降级为当前环境现象。受限环境可以训练状态机，不应假装验证全部硬件结论。
-
-\topic{反例十五：源码阅读变成函数名堆砌}
-报告列了一串 Linux 函数，却没有解释项目现象。这个反例守住源码阅读方法。修复是每次阅读从现象开始：短写、缺页、等待、连接关闭、进程崩溃。然后写用户态复现、内核机制、能解释的事实和不能证明的边界。源码阅读服务工程判断，不服务炫耀阅读量。
-
-\topic{反例库的使用方式}
-这些反例应进入测试、设计评审和章节复习。每次改 manifest，跑重复 partial 和响应迟到；每次改队列，跑关闭唤醒；每次改运行时，跑 future 饥饿；每次改 I/O，跑短写和崩溃点；每次改分片，跑旧 epoch 写入。反例库让系统记住过去犯过的错。它也让教材质量可持续：依靠测试和评审把原则固定下来。
-
-\topic{反例库和第三册的关系}
-第三册推理引擎会出现新名词，但这些反例仍然有效。模型文件被替换对应输入身份；量化误差对应 reference；KV cache 悬垂对应生命周期；请求取消对应队列关闭；算子 completion 对应异步完成；权重 manifest 对应提交权威；热 token 或长 prompt 对应热点 key；性能报告仍要写环境边界。反例库是跨主题的系统思维，不是第二册一次性材料。
-
-\section{一次失败排查日记：从错误结果回到单个提交点}
-
-最终再给一段排查日记。假设小输入只有一百条记录，reference 输出 key A 为三十七，优化版输出三十九。这个差异很小，最容易被误判成并行顺序、浮点误差或随机噪声。正确做法不是先改代码，而是沿着报告一层一层收窄。第一步看输入摘要：文件 checksum 一致，记录数一致，非法记录数一致，说明输入和解析边界大概率没有变。第二步看 HotBatch checksum：reference parser 和优化 parser 的 key 序列一致，说明冷热布局没有丢字段。第三步看 partition manifest：bucket 2 的输出 count 比 reference 多二。到这里，问题已经从全系统缩小到一个 bucket 的输出位置或重复提交。
-
-\topic{一、先排除解析和布局}
-排查人员打开错误记录表，确认非法字段数量一致；再按 record id 抽查 key A 的记录，发现每条记录都能回溯到原始 offset。若这一步失败，应该回第 6 章的 HotBatch 和 ColdStore，而不是继续查分布式提交。很多系统调试浪费时间，就是因为没有先排除上游语义。报告能让我们用证据说“解析阶段暂时不是嫌疑人”。
-
-\topic{二、再排除 scan 写区间}
-查看 count、scan、write 三阶段。Count 阶段显示 chunk 3 对 bucket 2 的 count 为五，write 阶段也写了五个元素；chunk 4 的 count 为七，write 阶段却写了九个元素。这个差异说明 predicate 在 count 和 write 两次执行中不一致，或者 chunk 4 被执行了两次。若是 predicate 不一致，应回到配置版本；若是执行两次，应继续查 task attempt。排查不靠猜，而靠阶段中间量。
-
-\topic{三、再看 task attempt}
-Task table 显示 chunk 4 有两个 attempt。Attempt 0 写出成功，但响应被故障规则丢弃；Attempt 1 后来写出并提交。Manifest 却包含 attempt 0 和 attempt 1 两条 block。至此根因出现：manifest 提交表没有按逻辑 task 去重，而是按 block 文件名接受。这个错误和第 16 章响应丢失事故完全一致。输出多二不是并行算法问题，而是提交权威问题。
-
-\topic{四、修复要落在提交层}
-错误修复不应在 reduce 阶段过滤重复文件名，也不应在恢复扫描时按时间选择较新文件。真正修复是 ManifestCommit 检查 task id、stage id、attempt 和 generation：若逻辑 task 已有 accepted attempt，新 block 只能进入 late 或 duplicate 分类。修复后，临时目录里仍可以保留两个 block，但 reduce 只读取 manifest 接受的一个。这样系统承认重复执行存在，同时阻止重复生效。
-
-\topic{五、补回归测试}
-新增回归测试叫“响应丢失后旧 attempt 不重复提交”。输入仍是一百条记录，故障规则固定丢 attempt 0 的 reply。测试断言三件事：parallel checksum 等于 reference，manifest 中 chunk 4 只有一条 accepted entry，late reply count 为一。还要断言临时目录可以存在旧 block，因为临时文件存在不是错误，错误是把它当有效结果。这个测试把排查日记固化成反例库的一员。
-
-\topic{六、更新报告字段}
-这次事故还暴露报告缺口：旧报告只有最终 checksum，没有每个 task 的 accepted attempt。修复后，run report 增加 task commit summary：task id、accepted attempt、candidate blocks、late replies、duplicate replies。这样下次看到 checksum 差异，可以更快定位到提交层。报告字段不是越多越好，而是每次事故后补上能缩短排查路径的证据。
-
-\topic{七、复盘结论}
-这个排查日记展示了第二册最重要的方法：错误结果先回 reference，再沿阶段证据缩小范围，最后把根因落到一个明确提交点。不要被并行、异步、分布式这些大词吓住。系统再复杂，也可以拆成输入、布局、输出位置、任务 attempt、写出、manifest 和恢复。只要每层有身份、状态和 checksum，排查就不是玄学。
-
-\section{最终交付清单}
-
-交付时，读者不应只拥有一本 PDF 和几个零散实验，而应拥有一套能复查的材料。第一，正文讲清了从硬件、单机性能、多线程、并行算法、I/O 到分布式计算的推导链。第二，贯穿项目有 reference、任务图、可靠写出、manifest、故障注入和报告。第三，每个关键概念至少有一个反例测试守住。第四，构建产物能在手机上阅读。第五，版本记录能说明关键接口和产物为什么变化。这个清单看似普通，却能防止项目回到“概念很多、证据很少”的状态。
-
-\topic{一、正文交付}
-正文必须以案例推动概念。看到流水线，要能回到解析循环；看到 TLB，要能回到地址序列；看到锁，要能回到队列关闭；看到原子，要能回到 ready 发布；看到 scan，要能回到共享 push；看到分布式，要能回到响应丢失。若某一章只能背名词，说明还没有达到系统教材标准。
-
-\topic{二、实验交付}
-实验必须小而完整。每个实验都要有 reference、输入、故障规则、预期状态、实际报告。大输入 benchmark 可以作为补充，但不能替代小反例。小反例让读者理解为什么概念必要，大 benchmark 只说明某台机器上的性能现象。两者顺序不能反。
-
-\topic{三、报告交付}
-Run report 至少包含输入摘要、正确性 checksum、阶段耗时、资源高水位、故障规则、恢复动作和未验证边界。报告如果不能解释一次失败，就只是日志集合。报告如果能让别人重放事故，它就是工程材料。最终项目必须把报告当成一等产物。
-
-\topic{四、源码阅读交付}
-Linux 源码阅读笔记必须绑定项目现象。futex 对应队列等待，页缓存对应可靠写，epoll 对应事件循环，调度器对应 worker 时间线，进程退出对应 worker crash。每份笔记都写能解释什么和不能证明什么。源码阅读不是函数名索引，而是系统现象的解释工具。
-
-\topic{五、发布交付}
-PDF 和 EPUB 要放到固定目录，文件名稳定，字体和代码风格统一，EPUB 不含图片化图示，正文不泄漏 LaTeX 符号。发布不是最后的机械步骤，而是读者学习体验的一部分。能稳定发布，才说明构建系统、排版和内容结构都进入可维护状态。
-
-\topic{六、第三册入口}
-进入推理引擎前，本项目应留下清楚接口：模型文件继承输入身份，权重布局继承 HotBatch，算子调度继承任务图，KV cache 继承 buffer 所有权，推理请求继承 deadline 和背压，推理报告继承 run report。后续内容将在这套计算系统上加入 AI 算子和推理语义。
-
-\section{发布前人工复读}
-
-自动检查能发现很多格式和构建问题，但最后仍要人工复读几个关键段落。复读不是从第一页逐字校对，而是按风险点抽查。先读第 16 章响应丢失事故，看 timeout 是否仍被解释成未知状态，旧 attempt 是否不会重新提交。再读第 17 章单 key 迁移，看旧 owner、route epoch、leader term 和 manifest generation 是否串成一条时间线。最后读第 18 章故障演练，看 reference、HotBatch、scan、任务图、可靠写、MessageBus、checkpoint 和 run report 是否能组成同一个项目，而不是八个并列模块。
-
-\topic{一、复读概念来源}
-每遇到一个术语，都问它从哪个事故出来。Deadline 来自本地等待不能证明远端停止；attempt 来自同一 task 多次执行；manifest 来自临时文件不能直接代表结果；route epoch 来自旧 owner 迟到写；continuation 来自 worker 等待 future 的饥饿；release 和 acquire 来自 ready 发布普通字段。若某个术语找不到事故，就要改写或删掉。这样能防止正文重新退化成概念表。
-
-\topic{二、复读代码边界}
-代码示例要检查三件事。第一，协议字段使用固定宽度整数或清楚类型，不用含糊写法。第二，发送、写出、提交、恢复这些跨边界动作都带身份和状态。第三，示例不暗示可以直接把 C++ 对象布局当作持久格式或网络格式。代码是教材可信度的一部分，示例若偷懒，读者会把偷懒当成建议。
-
-\topic{三、复读排版体验}
-移动端阅读时，章节标题不应挤成目录噪声，代码块要能横向理解，正文第一行要有缩进，彩色只用于强调和代码，不应抢正文。EPUB 中若图示被转换成图片，会影响微信读书等阅读器，所以本册尽量用文字事件表和代码表达图示。排版不是装饰，它决定读者能否长时间读下去。
-
-\topic{四、复读质量边界}
-如果某段文字放到任何系统书里都成立，就说明它太空。要把它改成本书对象：日志记录、HotBatch、partition、manifest、attempt、worker、Driver、checkpoint。具体对象越清楚，读者越能把知识落到实验。第二册的标准不是“讲过这个词”，而是“读者能用这个词解释一个失败运行”。
-
-\topic{五、回归策略}
-一个计算系统即使已经能够生成正确结果，也不能只靠端到端大样例证明自己可靠。最小回归应围绕反例库组织：错误行回溯、共享 push 改 scan、队列关闭唤醒、ready 发布、短写、响应丢失、旧 epoch 写入、Driver 重启恢复。小反例守住语义，大 benchmark 只说明当前机器上的速度。读者维护自己的项目时，也应先保住这些反例，再谈规模和吞吐。
-
-\topic{六、延展原则}
-本册留下的不是一组固定答案，而是一种扩展方法。遇到新主题时，先选一个具体事故：算子结果不一致，buffer 悬垂，模型文件版本错，请求取消后 completion 迟到。先写事故，再推概念，再给代码和实验。这样新内容会接在已有系统边界上，而不会变成术语百科。内容越多，越要坚持从具体失败推导抽象原则。
-
-\topic{七、读者复查路线}
-读者复查第二册时，可以只拿一个小输入反复走完整链路。先看它在 reference 中怎样得到正确答案，再看 HotBatch 怎样保存热字段和 record id，再看 scan 怎样给它分配输出位置，再看 task attempt 怎样写出候选 block，再看 manifest 怎样接受或拒绝它，最后看恢复报告怎样解释它的命运。这个复查路线能把全书压成一条记录的旅程，避免复习时重新变成概念背诵。
-
-\topic{八、最小闭环}
-最小闭环只有一句话：同一条记录在任何阶段都能说明自己从哪里来、现在归谁管、失败后如何处理、最终是否已经生效。硬件、并发、I/O 和分布式知识都服务这句话。只要这个闭环不断，系统扩大以后仍然可解释；一旦闭环断开，代码再快也只是暂时能跑。
-
-\topic{九、最终提醒}
-第二册不追求把所有系统技巧一次讲完，而是要求每个技巧都有来源、有边界、有证据。读者以后遇到陌生框架，也可以先问同样的问题：输入身份是否稳定，状态是否发布，等待是否可见，提交点是否唯一，恢复是否能解释每个残留对象，报告是否能让别人复查。能把这些问题问顺，系统学习就不再依赖记忆名词。
-最终交付要让读者相信两件事：程序为什么得到这个结果，以及结果出错时应该从哪里开始查。
-这就是闭环。
-
-\section{案例深化：最终项目的故障演练脚本}
-
-最终工程章要把前面所有原则收束成一套可运行演练。演练不是随机制造错误，而是按系统边界逐个切开：输入、解析、局部聚合、shuffle、写出、manifest、checkpoint、恢复。每个脚本都要有明确预期和验收指标。这样项目不只是“能跑 word count”，而是能证明自己在故障下仍然解释得清楚。
-
-\topic{一、输入损坏脚本}
-构造包含非法字段、超长行、缺失分隔符和重复 record id 的输入。Reference 给出错误记录和可接受输出。并行版本必须报告同样错误，不因为分块而丢失错误位置。这个脚本连接第一章的 record id、第二章的解析热循环和第六章的冷热字段回溯。
-
-\topic{二、shuffle 丢 block 脚本}
-让某个 map attempt 写出 block 后，删除临时文件或让响应丢失。系统应检测 manifest 缺失或 checksum 不匹配，重试相应 task，而不是让 reduce 静默少读。验收看最终 checksum、manifest 条目和重试次数。这个脚本连接 I/O 可靠写入和分布式幂等提交。
-
-\topic{三、Driver 重启脚本}
-在 manifest 写入前、写入后、checkpoint 写入前、写入后四个位置分别终止 Driver。恢复后，已提交 task 不重做，未提交 task 重做，旧 attempt 响应被分类。验收看 generation、task table、临时目录和 trace。这个脚本证明最终项目真的有恢复语义。
-
-\topic{四、热点 key 脚本}
-构造一个 key 占据大部分输入。普通 hash partition 会让一个 reduce partition 长尾。加入本地聚合和热 key 拆分后，观察尾延迟和输出正确性。验收不只看速度，还要看子 key 合并是否精确，manifest 是否防止重复 attempt 计数。这个脚本连接数据结构、并行算法和分片调度。
-
-\topic{五、报告生成脚本}
-最终项目应能自动输出一份 run report：输入摘要、reference checksum、并行 checksum、任务数、attempt 数、retry amplification、queue high watermark、manifest generation、checkpoint generation、故障规则和未验证边界。报告生成本身是工程能力。没有报告，用户只能相信程序；有报告，用户可以审查程序。
-
-\section{案例复盘：最终引擎靠故障演练收束}
-
-最终项目不能只展示正常 word count。丢一个 shuffle block、Driver 在 commit 后重启、旧 attempt 晚到、热点 key 拖慢 reduce，都会让系统暴露真实质量。没有 reference、manifest、checkpoint 和 trace，程序即使输出数字，也无法解释这个数字是否可信。
-
-\topic{从演练脚本到验收报告}
-演练按输入损坏、shuffle 丢 block、Driver 重启、热点 key、慢 worker 的顺序打开。每一步检查 reference checksum、parallel checksum、attempt 数、checkpoint generation、queue high watermark、临时文件清理和故障规则。性能报告放在正确性和恢复报告之后。
-
-\topic{给后续系统留下工程骨架}
-AI 推理引擎会遇到相同问题：模型 artifact 需要 manifest，算子执行需要 trace，量化结果需要 checksum，推理请求需要 deadline 和 backpressure。最终项目不是结束，而是为后续系统保留一套可复查的工程骨架。
+\begin{rubricbox}
+最终项目评分建议：
+\begin{enumerate}
+  \item 语义完整性 20 分：reference、输入身份、错误合同、输出排序和 checksum 清楚。
+  \item 工程结构 20 分：driver、worker、runtime、io、manifest、bus、report 边界清楚，核心 ID 稳定。
+  \item 故障和恢复 25 分：短写、响应丢失、重复 attempt、Driver 重启、旧 epoch、热点 key 都有确定性测试。
+  \item 性能证据 15 分：阶段耗时、资源高水位、瓶颈迁移和未验证边界写入 RunReport。
+  \item 工业判断和第三卷衔接 20 分：能说明从 Spark、Flink、向量化执行器、Linux 路径中采用、简化和拒绝的部分，并能把接口迁移到 CPU 推理引擎。
+\end{enumerate}
+\end{rubricbox}
 
 \section{本章习题}
 
 \begin{exercisebox}
-习题一：为日志统计系统写端到端数据流图。要求包含输入分片、map-side combine、shuffle partition、reduce merge、输出提交和 checkpoint。
+习题一：为日志统计系统写端到端数据流。要求包含 InputSplit、HotBatch、map-side combine、ShuffleBlock、ManifestEntry、ReduceOutput 和 Checkpoint。
 
-习题二：设计 shuffle manifest。说明它记录哪些 map 输出、partition、attempt、文件位置或消息范围，以及恢复时如何使用。
+习题二：设计一个 reference 合同。说明输入坏行、event type 越界、value 溢出、输出排序和错误摘要如何处理。
 
-习题三：构造热点 key 输入。比较普通 hash partition、map-side combine、热 key 拆分和二级 reduce。说明每种方案的网络流量和 reduce 长尾变化。
+习题三：构造响应丢失事故。Attempt 0 写出 block 后 reply 被 drop，Attempt 1 提交，Attempt 0 reply 迟到。写出 task table、block table、manifest table 的状态变化。
 
-习题四：设计 task attempt 提交协议。要求处理 attempt A 成功但响应丢失、attempt B 后完成、driver 重启三种情况。
+习题四：设计 shuffle manifest。说明它记录哪些字段，为什么 reduce 不能扫描临时目录。
 
-习题五：为本机模拟系统设计故障注入表。至少包含丢消息、重复消息、慢 worker、慢 reduce、提交失败和 checkpoint 损坏。每个故障写出预期恢复行为。
+习题五：设计 checkpoint 内容清单。要求说明哪些属于控制面，哪些属于可校验数据面，恢复时按什么顺序读取。
+
+习题六：设计热点 key 实验。比较普通 hash、map-side combine、热点拆分和二级 reduce，报告网络字节、reduce p99、最终 checksum 和二级合并成本。
+
+习题七：写一个故障注入表。至少包含坏行、短写、丢响应、重复响应、Driver 崩溃、Reduce busy、旧 epoch。每项写注入方式、预期行为和报告字段。
+
+习题八：为最终项目设计 RunReport。字段必须覆盖 correctness、performance、resources、faults、recovery、unverified boundaries。
+
+习题九：把本章接口迁移到 CPU 推理引擎。说明 ModelArtifact、TensorBuffer、KernelTask、KV cache、InferenceRequest 分别复用哪些第二卷能力。
+
+习题十：写一份最终项目评审报告。每个模块用“输入输出合同、不变量、失败路径、指标、未验证边界”五项说明。
 \end{exercisebox}
