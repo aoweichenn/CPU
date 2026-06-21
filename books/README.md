@@ -7,7 +7,8 @@
 | book id | status | description |
 |---|---|---|
 | `cpu-volume-1` | active | CPU 底层原理教材第一册：程序、C++、二进制、x86-64、汇编、Linux 工具链和性能测量。 |
-| `cpu-volume-2` | active | CPU 计算系统教材第二册：硬件原理、多核心并行、高性能计算、多线程、同步、无锁数据结构、并行算法和分布式计算。 |
+| `cpu-volume-2` | active | 从 C++ 到计算系统第二册原理卷：硬件原理、多核心并行、高性能计算、多线程、同步、无锁数据结构、并行算法、运行时、异步 I/O 和分布式计算。 |
+| `compute-systems-engine-code` | active | 第二册配套代码实践卷：围绕 Compute Systems Engine 实现完整 C++20 工程、测试、benchmark、故障注入和报告。 |
 | `cpu-volume-3` | planning | CPU 与 AI 计算教材第三册：AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。 |
 | `algorithm-interview` | active | 算法刷题与 C++ 面试教材：LaTeX 正式书稿，覆盖数据结构、算法原理、暴力到优化、C++ 容器、力扣题单、训练路线和面试表达。 |
 

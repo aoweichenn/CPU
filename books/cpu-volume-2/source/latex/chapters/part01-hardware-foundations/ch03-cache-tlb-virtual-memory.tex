@@ -1,894 +1,628 @@
-\chapter{缓存、TLB 与页级性能}
+\chapter{缓存、TLB 与虚拟内存的地址路径}
 
-先看一个反常结果：两个程序都处理一千万条记录，理论复杂度都是线性扫描，甚至第二个程序少做了几次比较，但它更慢。继续看代码才发现，第一版把记录放在连续数组中，热路径顺序读取少数字段；第二版为了“对象更清晰”，把每条记录拆成多个堆对象，字段通过指针互相跳转。算法复杂度没有变，地址序列变了。核心不再连续拿 cache line，TLB 要覆盖更多页，预取器也很难提前猜到下一次访问。
+前面把视角放在核心内部：前端怎样供给微操作，乱序窗口怎样寻找独立工作，分支预测失败为什么会丢掉已经做过的事。接下来继续追问一个更基本的问题：一条 load 指令真正要访问哪个地址，那个地址附近还有多少有用数据，地址翻译能不能命中，第一次访问页面时操作系统要做什么，多个核心写同一条 cache line 时会发生什么。
 
-本章从这种地址序列的变化出发讲缓存和 TLB。缓存不是抽象的“快内存”，它按 cache line 搬运数据；TLB 不是背景细节，它决定虚拟地址到物理地址翻译是否能被快速命中；页面首次触碰、映射关系和写共享会把同一个源码循环变成完全不同的硬件行为。读者要学会先画出地址访问顺序，再谈缓存层级、page walk、首次触页和局部性优化。
+仍然从 Compute Systems Engine 的日志统计任务开始。第一版实现很自然：每读一行日志，就分配一个 \code{LogRecord} 对象，里面保存原始文本、事件名字符串、用户字符串、时间戳、错误信息和若干指针；随后把对象指针放进容器，聚合阶段再遍历这些对象并更新哈希表。它在小输入上容易写、容易调试，也能和顺序 reference 对齐。输入放大后，另一个版本却明显更快：它把记录的稳定身份保存为 \code{RecordId}，把热字段压成连续数组，把事件名编码为整数，错误文本和原始行只留在冷存储中，需要诊断时再回查。
 
-\section{从地址访问到缓存层级}
+两个版本的算法复杂度都可以写成线性。差别不在大 O，而在地址路径。对象版让核心追踪堆节点、字符串、桶数组和错误对象；列式热字段版让聚合阶段顺序扫描事件 id 和计数槽。前者每处理一条记录可能触碰多条 cache line、多个页面和多次指针依赖；后者让硬件预取器看到稳定步长，让 TLB 用较少翻译项覆盖更多有效数据。缓存、TLB 和虚拟内存不是背景知识，它们直接决定“线性扫描”到底像顺着连续道路前进，还是像在城市里按纸条找下一扇门。
 
-缓存不是按单个字节移动数据，而是按 cache line 移动。常见 cache line 大小是 64 字节。顺序访问数组时，一次 miss 可以带来后续多个元素；随机访问链表时，每个节点可能引入一次新的 miss。这个差异解释了为什么连续数组常常比指针结构更快。
+分析沿六条线展开：把 C++ 对象图翻译成 CPU 看到的地址序列，区分连续扫描、固定步长、随机索引、指针追踪和冷热字段混读；解释 cache line 为什么既是空间局部性的机会，也是 false sharing 和写共享的争用单位；用工作集、活跃页数、TLB 覆盖、page walk 和 first-touch 解释同一算法在不同输入规模下的性能拐点；区分分配、触页、预热、热循环、mmap 冷读、page cache 热读和持久化写回，避免把系统状态混进算法结论；为日志统计、哈希聚合、partial 数组、输入读取和 checkpoint 写出地址路径实验，而不是只给容器名和耗时；在 Compute Systems Engine 中形成 \code{MemoryShape} 和 \code{AccessTrace} 报告，让后续数据布局、线程、I/O 和分布式机制复用同一张地址地图。
 
-缓存有容量、相联度和替换策略。容量不足会产生容量 miss，相联度不足会产生冲突 miss，多核心共享写会产生一致性流量。一个算法理论复杂度更低，不代表真实更快；如果它把连续访问变成随机访问，可能输给复杂度略高但局部性更好的算法。
+\begin{casebox}
+贯穿案例是同一份日志输入的四种地址形状：胖对象数组、指针对象图、热字段列式 batch、按 key 分区后的局部聚合。四种形状必须输出同样的统计结果、错误摘要和 checksum。比较它们时，不只记录总时间，还要记录热字段字节数、冷字段是否进入热路径、活跃页面、访问顺序、是否预热、是否存在共享写和可用的 cache/TLB 证据。
+\end{casebox}
 
-从第二册的角度看，cache line 还是多核协作的最小一致性单元。两个线程哪怕写的是两个不同字段，只要字段落在同一条 cache line 上，硬件就必须在核心之间移动同一个一致性单元。很多并发程序的扩展性问题，不是算法复杂度问题，而是写入布局问题。后面讲锁、原子和无锁队列时，都要回到这个事实。
+\begin{systemdiagram}{同一条记录在对象图和地址图中的差异}
+\begin{pdfdiagram}
+\node[book accent node,text width=2.0cm] (record) at (-0.8,0) {LogRecord\\胖对象};
+\node[book small node,text width=1.75cm] (raw) at (-2.8,-1.45) {raw text\\冷字段};
+\node[book small node,text width=1.75cm] (event) at (-0.8,-1.45) {event\\string};
+\node[book small node,text width=1.75cm] (error) at (1.2,-1.45) {error\\detail};
 
-\begin{systemdiagram}{对象边界、cache line 边界和页边界不是同一回事}
-\centering
-\begin{tikzpicture}[book diagram, x=1cm, y=1cm]
-  \foreach \i/\label/\thread in {0/{counter[0]}/T0,1/{counter[1]}/T1,2/{counter[2]}/T2,3/{counter[3]}/T3} {
-    \node[book hot, minimum width=2.25cm, minimum height=0.72cm] (c\i) at ({2.25*\i}, 0) {\label};
-    \node[font=\footnotesize\sffamily\color{BookMuted}, below=0.18cm of c\i] {\thread 写};
-  }
-  \node[draw=BookAccent, rounded corners=2pt, inner xsep=0.2cm, inner ysep=0.22cm,
-        fit=(c0)(c1)(c2)(c3),
-        label={[font=\footnotesize\sffamily\color{BookAccent}]above:同一条 cache line，常见为 64 字节}] (line) {};
+\draw[book strong arrow] (record) -- (raw);
+\draw[book strong arrow] (record) -- (event);
+\draw[book strong arrow] (record) -- (error);
 
-  \node[book data, minimum width=2.45cm, below=1.35cm of c0] (page0) {虚拟页 0};
-  \node[book data, minimum width=2.45cm, right=0.55cm of page0] (page1) {虚拟页 1};
-  \node[book data, minimum width=2.45cm, right=0.55cm of page1] (page2) {虚拟页 2};
-  \node[book state, minimum width=2.35cm, right=0.7cm of page2] (tlb) {TLB\\页表缓存};
-  \node[book warnnode, minimum width=2.4cm, below=0.95cm of page1] (walk) {TLB miss\\page walk};
+\node[book teal node,text width=2.0cm] (batch) at (6.4,0) {HotBatch\\列式热字段};
+\node[book small node,text width=1.75cm] (ids) at (4.35,-1.45) {record id\\连续};
+\node[book small node,text width=1.75cm] (etype) at (6.4,-1.45) {event id\\连续};
+\node[book small node,text width=1.75cm] (cold) at (8.45,-1.45) {cold store\\回查};
 
-  \draw[book arrow] (page0) -- (tlb);
-  \draw[book arrow] (page1) -- (tlb);
-  \draw[book arrow] (page2) -- (tlb);
-  \draw[book weak arrow] (tlb.south) .. controls +(0,-0.65) and +(0.65,0) .. (walk.east);
-  \draw[book weak arrow] (line.south) .. controls +(0,-0.35) and +(0,0.45) .. (page1.north);
+\draw[book strong arrow] (batch) -- (ids);
+\draw[book strong arrow] (batch) -- (etype);
+\draw[book weak arrow] (batch) -- (cold);
 
-  \node[font=\footnotesize\sffamily\color{BookMuted}, below=0.22cm of walk]
-    {源码里的四个元素互不相关，硬件可能把它们作为一个一致性单元迁移；工作集跨页后，还要看 TLB 覆盖。};
-\end{tikzpicture}
+\node[book label,text width=10.7cm] at (2.85,-2.75) {对象图说明程序员看到的关系；地址图说明热循环实际读取哪些连续字节、跳转到哪些堆对象、跨越多少页。性能判断必须从地址图开始。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：同样的业务记录可以产生完全不同的地址路径；优化首先改变的是机器要走的路。}
 \end{systemdiagram}
 
-这类图要让读者形成一个直觉：源码里的变量边界，不等于硬件里的传输边界。硬件搬的是 cache line，TLB 记的是页，操作系统调度的是线程，分布式系统发送的是消息。边界错位，是系统性能问题最常见的来源之一。
+\section{地址首先是硬件选择问题}
 
-\topic{缓存映射和冲突}
-缓存通常按 set associative 组织。一个地址会映射到某个 set，同一个 set 里只有有限个 way。如果多个热点地址恰好映射到同一个 set，而数量超过相联度，就会频繁互相驱逐，即使总工作集小于缓存容量也会慢。这类冲突 miss 很隐蔽，因为从容量角度看“不应该放不下”。
+程序里的指针看起来像一个整数，源码里写的是 \code{records[i].event_id} 或 \code{node->next}。硬件面对的不是字段名，而是一组地址位。地址位进入译码电路，选择某个 cache set、某个 TLB 项、某条总线请求、某个内存控制器队列，最后落到 DRAM 的行、列和 bank。缓存、TLB、预取器和页表之所以存在，是因为核心不能每次都把完整地址请求送到远处主存再等待答案。地址必须先在近处被筛选、缓存和预测。
 
-矩阵步长、数组对齐和结构体大小都可能触发冲突。若多个数组按相同大步长访问，并且基地址关系不佳，它们可能持续争用同一组 cache set。改变 padding、改变块大小或调整访问顺序，有时能显著改善性能。
+从这个角度看，内存访问不是“读一个变量”这么简单。一次 load 至少包含五个问题：虚拟地址是否合法；虚拟页能否翻译成物理页；目标 cache line 是否在 L1D；若不在，是否在 L2、LLC 或其他核心的缓存中；取回 line 后，指令需要的是其中哪些字节。写入还要多问几个问题：是否需要先取得独占权限；是否需要把旧 line 读入；其他核心是否持有这条 line；写入何时对其他核心可见。后续会展开一致性和内存序，这里先把单核地址路径讲清。
 
-\topic{Inclusive、Exclusive 和共享缓存}
-不同处理器的缓存层级策略不同。有的层级倾向 inclusive，也就是上层 cache 的内容也在下层保留；有的倾向 exclusive，尽量让不同层级存放不同内容；还有很多混合策略。软件通常不需要依赖某个具体策略，但要知道共享 LLC 不是无限资源。多个线程在同一 socket 上跑不同任务，可能互相驱逐 LLC。
+\topic{为什么不能直接访问主存}
+执行单元附近的寄存器很小但极快；片上 SRAM 可以做成 L1/L2 cache，容量较小但延迟低；主存容量大，距离远，延迟和能耗都高。若一个循环每次 load 都等待主存，乱序窗口很快被未完成 load 填满，执行端口没有可发射的独立工作。缓存层级的动机不是“多做几层表”，而是在核心附近保存最近和附近的字节，让常见访问不必走到远处。
 
-这对并行任务调度有直接影响。把共享数据的任务放在共享缓存附近，可能复用 LLC；把互相干扰的大流式任务放在同一 socket，可能争抢带宽和 LLC。操作系统调度器会做一般性决策，但高性能程序常需要自己记录拓扑并做亲和性实验。
+这个推导也解释了为什么缓存不能无限大。缓存越大，查找路径、连线、面积和能耗越高；离核心越近，越需要小而快。L1D 通常追求低延迟和高带宽，容量有限；L2 稍大稍慢；LLC 更大，也要服务多个核心。不同处理器参数会变，但交换不变：越近越快也越小，越远越大也越慢。软件的局部性，就是让正在使用的工作集尽量停留在更近的层级。
 
-\section{共享、写入和一致性成本}
+\topic{地址序列决定硬件能否提前工作}
+连续数组扫描时，下一次地址可以从当前地址加固定步长得到。硬件预取器可以在程序真正请求之前，把后续 cache line 提前拉近；乱序窗口也可以同时挂起多个独立 load。指针追踪不同，下一地址藏在当前节点内容里，当前 load 没回来就不知道下一步去哪。随机索引数组介于二者之间：索引流本身可能连续，但数据地址由索引决定，预取器未必能看出规律。
 
-读缓存可以共享，写缓存必须取得 cache line 的独占所有权。两个线程写不同变量，如果这些变量落在同一条 cache line 上，硬件仍然会把它们当成同一块一致性单元反复迁移，这就是 false sharing。它不是锁竞争，却会表现出类似的扩展性下降。
+因此，地址序列比算法复杂度更接近硬件等待。两个 \complexity{O(n)} 循环，一个是 \code{base + i * 4}，另一个是 \code{p = p->next}，大 O 相同，硬件并行度、cache line 利用率、TLB 覆盖和预取效果都不同。性能报告必须把“访问什么地址”写出来，否则后面的缓存名词没有落点。
 
-解决 false sharing 的方法包括按线程分配独立槽位、使用对齐和填充、批量合并结果、减少共享写频率。并行归约通常先让每个线程写自己的 partial sum，最后再合并，正是为了避免每次加法都写同一个共享变量。
+\begin{keyidea}
+内存层级的第一原理是距离和选择：核心需要的字节可能在寄存器旁边，也可能在芯片外；地址位决定先查哪里，命中在哪里，失败后向哪里请求。
+\end{keyidea}
 
-\begin{lstlisting}[language=C++,caption={用对齐槽位减少 false sharing}]
-struct alignas(64) LocalCounter {
- std::int64_t value = 0;
-};
+\topic{一个字节从文件到寄存器的生命周期}
+为了避免把 cache、TLB 和 page cache 讲成孤立部件，先追踪日志文件中的一个字符。它最初在存储设备或内核 page cache 中；通过 \code{read} 时，内核把它复制进用户 buffer；通过 \code{mmap} 时，用户虚拟地址在访问时映射到对应文件页。随后 parser 执行一条 load 指令，虚拟地址进入 DTLB 翻译；翻译成功后，物理地址进入 L1D cache 查找；L1D miss 时向 L2、LLC 或内存请求整条 cache line；line 到达后，load 从 line 中抽出目标字节放进寄存器；分支或查表逻辑再使用这个寄存器值判断字段边界。
 
-std::vector<LocalCounter> counters(worker_count);
-for (std::int32_t worker = 0; worker < worker_count; ++worker) {
- counters[static_cast<std::size_t>(worker)].value += 1;
+\begin{lstlisting}[numbers=none,caption={一个输入字节到达寄存器的事件链}]
+storage or page cache contains file bytes
+read copies bytes to a user buffer
+or mmap maps a file page into the process address space
+
+parser computes virtual address of byte i
+DTLB translates virtual page to physical page
+L1D cache looks up the physical cache line
+if miss, lower cache or memory supplies the whole line
+load extracts one byte from the line
+register receives the byte
+branch or table lookup classifies the byte
+\end{lstlisting}
+
+这条链说明“读一个字符”不是单层动作。若文件页尚未驻留，等待可能在 I/O；若虚拟页尚未映射，等待在 page fault；若页表翻译不在 TLB，等待在 page walk；若数据 line 不在 cache，等待在内存层级；若分支预测错了，刚读到的字节可能属于错误投机路径，后续工作会被丢弃。不同等待有不同修复方向，不能全部写成“内存慢”。
+
+\topic{虚拟地址、物理地址和文件偏移不是同一个身份}
+文件偏移描述字节在文件中的位置；虚拟地址描述进程访问它的位置；物理地址描述内存控制器最终看到的位置。通过 \code{read} 读取时，同一个文件偏移被复制到用户 buffer 的某个虚拟地址；通过 \code{mmap} 读取时，文件偏移和虚拟页之间建立映射；同一个文件页还可能被多个进程映射到不同虚拟地址。程序指针只能表示当前进程的虚拟地址，不能作为持久身份写进诊断、manifest 或网络消息。
+
+这解释了为什么第一章使用 \code{RecordId} 而不是裸指针。裸指针可以让当前进程快速定位内存，却无法在重启后定位文件内容，也无法证明另一个 attempt 处理的是同一输入 generation。文件偏移和 checksum 才能跨进程、跨重试、跨持久化边界保持意义。地址路径优化如果丢掉这种身份，后续恢复会失去依据。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}@{}}
+\toprule
+身份 & 由谁解释 & 适合解决的问题 \\
+\midrule
+文件偏移 & 文件系统和输入合同 & 诊断回查、split 边界、恢复验证 \\
+虚拟地址 & 当前进程页表 & 用户态 load/store、指针和视图生命周期 \\
+物理地址 & 硬件缓存、TLB 和内存控制器 & cache set、NUMA 位置、互连和带宽 \\
+逻辑 record id & 项目状态机 & 重试、partial、manifest 和审计 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{地址生命周期推出视图生命周期}
+很多解析器为了避免拷贝，会让字段视图直接指向输入 buffer 或 mmap 区域。这样做可以减少字符串分配，却把字段生命周期绑定到底层存储。若 buffer 被复用，视图会指向新内容；若 mmap 被解除，视图变成悬空引用；若文件被截断，后续访问可能触发错误；若字段视图跨线程传递，释放时机必须被同步保护。零拷贝不是免费优化，它只是把拷贝成本换成生命周期证明。
+
+因此，一个阶段如果只需要临时比较 event name，可以使用 span；如果结果要跨 batch、跨线程、跨 checkpoint，就需要编码、复制或持久化身份。第六章的数据布局会继续展开这一点：热路径可以用短生命周期视图减少搬运，系统边界必须用稳定身份防止悬空。
+
+\section{取指路径和取数路径必须同时看}
+
+很多性能分析把缓存简化成“数据是否在 cache 中”。实际热循环同时消耗两条流：指令流和数据流。指令流由程序计数器驱动，经过 ITLB、I-cache、译码器或 micro-op cache，最后变成后端可发射的微操作；数据流由 load/store 地址驱动，经过 DTLB、L1D/L2/LLC、store buffer、一致性协议和内存控制器。两条流任何一条断供，核心都可能等待。
+
+\topic{为什么 I-cache 会影响数据处理}
+解析日志看似是数据问题，但 parser 的控制逻辑本身也要被取入。若热函数包含大量模板实例、异常处理、格式化日志、虚调用和罕见错误路径，热循环的指令工作集会膨胀。I-cache miss 或译码供给不足时，即使数据已经在 L1D 中，执行单元也可能没有足够微操作可做。前端瓶颈常见于解释器、正则引擎、协议解析器、数据库表达式执行器和复杂状态机。
+
+把错误路径移出热函数、把多态逐行调用改成批量 dispatch、把稀有 case 放到慢路径，不只是减少分支，也是在缩小指令地址工作集。I-cache 的关键问题是“下一批要执行的指令字节是否已经在近处”，不是“代码行数是否少”。
+
+\topic{ITLB 和 DTLB 是两张不同账本}
+指令地址也要翻译。PC 给出的是虚拟地址，取指路径需要 ITLB；数据 load/store 需要 DTLB。一个大程序可能数据局部性很好，却因为热代码分散、插件化、JIT 代码过多或模板展开导致 ITLB/I-cache 压力。反过来，一个短小循环可能取指稳定，却因随机数据访问导致 DTLB 和 D-cache 压力。报告中把所有 miss 都叫“缓存不好”，会掩盖修复方向。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+路径 & 访问对象 & 常见修复方向 \\
+\midrule
+取指路径 & 热代码字节、分支目标、译码结果 & 冷路径分离、批量 dispatch、减少间接跳转、缩小热函数 \\
+取数路径 & 输入字节、热字段、桶、节点、计数槽 & 连续布局、分块、字典编码、局部 partial、减少随机页 \\
+写入路径 & 目标 cache line、store buffer、所有权状态 & 独占写区间、padding、分片、批量提交 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{一条 load 之前，前端已经做了很多事}
+当源码写下 \code{value = event_types[i]}，真正的数据 load 发生之前，前端必须先取得并译码对应指令。若分支预测错误，后端可能已经发起了错误路径上的 load，之后又被冲刷；若取指 miss，正确路径上的 load 甚至还没机会进入后端。于是“数据 cache 命中”并不保证循环快。第 2 章讨论前端，本章讨论数据地址，实际判读要把二者相乘：热循环要既能持续供给指令，又能让 load/store 地址可预测、可翻译、可缓存。
+
+\topic{取指和取数的共同敌人：分散}
+取指分散表现为代码块多、跳转目标多、内联过度或解释器分派频繁；取数分散表现为堆节点、字符串、随机桶、跨页对象和远端页面。二者的底层相似：有限的近端缓存装不下当前工作集，下一步位置难以提前知道。批量化能同时改善两者：一批同类记录走同一个小内核，指令路径稳定；同一批热字段连续存放，数据路径稳定。
+
+\section{数据 cache 的组相联结构}
+
+第二章用 I-cache 解释了指令字节怎样被缓存。数据 cache 的基本结构相似，也要把地址拆成 offset、set index 和 tag；不同之处在于，数据 cache 还要处理读写、store buffer、写分配、原子修改和多核一致性。先看单核 load。处理器得到一个物理地址后，用低位 offset 选择 cache line 内字节，用中间位选择 set，用高位 tag 判断某个 way 是否正好保存目标 line。命中则返回 line 中需要的字节；未命中则向下层缓存或内存请求整条 line。
+
+\begin{systemdiagram}{一次数据 load 的地址路径}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+\node[book accent node,text width=2.1cm] (virt) at (0,0) {load 虚拟地址\\virtual address};
+\node[book amber node,text width=2.0cm] (dtlb) at (2.7,0) {DTLB\\页翻译};
+\node[book purple node,text width=2.0cm] (l1) at (5.3,0) {L1D cache\\set/tag/way};
+\node[book teal node,text width=2.0cm] (line) at (7.9,0) {cache line\\返回字节};
+\node[book navy node,text width=2.0cm] (reg) at (10.5,0) {寄存器\\操作数可用};
+
+\draw[book strong arrow] (virt) -- (dtlb);
+\draw[book strong arrow] (dtlb) -- (l1);
+\draw[book strong arrow] (l1) -- (line);
+\draw[book strong arrow] (line) -- (reg);
+
+\node[book red node,text width=2.25cm] (walk) at (2.7,-1.55) {TLB miss\\page walk};
+\node[book red node,text width=2.25cm] (lower) at (5.3,-1.55) {L1 miss\\L2/LLC/内存};
+\node[book red node,text width=2.25cm] (fault) at (0,-1.55) {权限或缺页\\异常边界};
+
+\draw[book back arrow] (dtlb) -- (walk);
+\draw[book back arrow] (l1) -- (lower);
+\draw[book back arrow] (virt) -- (fault);
+
+\node[book label,text width=10.8cm] at (5.25,-2.75) {一次 load 不是单个动作：先证明虚拟地址能翻译，再查数据 cache；任一层 miss 都会把等待推向更远的结构。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：数据访问的成本来自地址翻译、cache 查找和 miss 恢复的串联，而不是来自变量名本身。}
+\end{systemdiagram}
+
+\topic{为什么按 cache line 搬运}
+若硬件只搬运一个字节，每次顺序扫描都要产生大量小请求，控制成本和总线利用率都会很差。把连续地址按固定大小分成 cache line 后，一次 miss 可以服务后续多个相邻元素。扫描 \code{std::int32_t} 数组时，一条 64 字节 line 可以包含 16 个整数；处理器取第一个整数时带来的 line，后续若干元素可以直接命中。对象图或随机访问的低效，也正是在这里出现：一条 line 被搬进来，却只用其中几个字节。
+
+cache line 是搬运单位，不是 C++ 对象单位。一个对象可能跨两条 line；多个对象可能共享一条 line；一个字段可能和完全不相关的冷字段同处一条 line。结构体布局、字段顺序、对齐、padding、数组元素大小和分配器返回地址，都会改变 line 内哪些字节被一起搬运。性能分析要问“这条 line 里有多少字节被当前阶段使用”，而不是只问“对象是否连续”。
+
+\topic{set、way 和冲突}
+数据 cache 也会有冲突。若两个热数组的地址间隔让它们反复映射到同一组，即使总工作集小于 cache 容量，也可能互相替换。步长访问尤其容易暴露这个问题：每次跨固定大步长，低位 offset 不变，中间 set 位按某种周期变化，可能只打到少数 set。实际处理器有复杂索引和替换策略，不应手算成绝对结论；但理解 set/way 能解释为什么“数据总量不大”仍可能 miss 高。
+
+工程上常见的缓解包括改变布局、分块、给数组加少量 padding、把多个并行数组合并或拆分、调整 batch 大小、避免多个大表以相同步长同步访问。每个办法都可能反噬：padding 增大内存占用，合并字段可能把冷字段带热，拆分字段可能增加地址流。正确做法不是套公式，而是先画访问序列，再用规模阶梯和计数器验证。
+
+\topic{一次 store 比一次 load 多出什么}
+Load 需要找到最新可见数据，store 还要获得修改权。单线程、线程私有数据上，这个差别常被缓存和 store buffer 隐藏；多核心共享写时，差别会变成主要成本。处理器不能只把一个字节写到某个抽象变量里，它要把包含目标字节的整条 cache line 置于可写状态。若其他核心持有 Shared 副本，需要让它们失效；若另一个核心持有 Modified 副本，需要拿到最新 line。只有这些动作完成后，store 才能安全修改本地副本。
+
+\begin{lstlisting}[numbers=none,caption={一次 store 的额外问题}]
+compute virtual address
+translate address through DTLB
+find cache line
+obtain writable ownership for the line
+place store into store buffer or write cache line
+make the write visible according to memory ordering rules
+\end{lstlisting}
+
+这解释了为什么“每线程写自己的计数器”仍可能慢。如果多个计数器落在同一条 line，worker 0 写 \code{counter[0]}，worker 1 写 \code{counter[1]}，硬件看到的仍是同一条 line 被两个核心反复修改。第三章先从 cache line 单位解释这个事实，第四章会把它放进一致性协议和互连消息里，第十一章再讨论原子和内存序。
+
+\topic{写分配为什么会读旧 line}
+许多缓存采用 write-allocate 策略：写一个当前不在缓存中的地址时，先把整条 line 读入缓存，再在本地修改它。这对“读后写”很合理，因为后续可能继续访问同一 line；对一次性大输出，则可能浪费带宽。比如写一个从未读取、不会很快再读的大数组，每次 store miss 都可能先拉入旧 line，再写新数据。某些平台和编译器可以使用 streaming store 或 non-temporal store 提示，绕开部分缓存污染，但它们有对齐、大小、顺序和可移植性边界，不能当作默认选择。
+
+日志系统写 output block 时也会遇到这件事。若先在用户 buffer 中顺序生成，再一次性写出，用户态 store 仍会经过 cache；若 output 很大，它可能挤掉 parser 和聚合的热数据。若使用 direct I/O 或注册 buffer，又会引入对齐、生命周期和错误处理约束。I/O 章节讲异步写之前，必须先知道普通 store 和普通 write 已经在内存层级中制造状态。
+
+\begin{lstlisting}[numbers=none,caption={写入策略的粗分类}]
+ordinary cached store:
+  good for data that will be read or modified soon
+  may allocate cache lines and evict other hot data
+
+streaming or non-temporal store:
+  useful for large one-way output on suitable platforms
+  requires platform-specific validation and careful ordering
+
+kernel write path:
+  copies or maps user bytes into kernel-managed I/O state
+  completion and durability are separate questions
+\end{lstlisting}
+
+\topic{非对齐和跨 line 访问}
+若一个字段跨越 cache line 边界，一次 load 可能需要读取两条 line；若跨越页面边界，还可能涉及两次地址翻译和两种权限结果。多数现代处理器能处理许多非对齐访问，但成本和异常边界会变复杂。数据结构设计不必把所有字段都过度对齐，却要避免让热路径中高频访问的多字节字段反复跨 line 或跨页。
+
+字符串解析尤其容易忽略边界。一个 SIMD 扫描可能一次读取 16、32 或 64 字节，若读取越过 buffer 末尾，哪怕后续用掩码丢掉多余字节，也可能触碰无效页面。安全实现要么保证输入末尾有 padding，要么在尾部使用安全标量路径，要么使用不会越界 fault 的加载策略。第七章讲 SIMD 时会回到这里：向量宽度不是只影响速度，也影响边界安全。
+
+\begin{lstlisting}[language=C++,caption={数据 cache 查找的抽象伪代码}]
+LoadedBytes load_bytes(Address virtual_address, std::size_t width) {
+  PageTranslation page = dtlb_translate(virtual_address);
+  Address physical = page.physical_base + virtual_address.page_offset();
+
+  LineOffset offset = low_bits(physical);
+  SetIndex set = middle_bits(physical);
+  Tag tag = high_bits(physical);
+
+  for (Way way : l1d.sets[set].ways) {
+    if (way.valid && way.tag == tag) {
+      return way.line.bytes(offset, width);
+    }
+  }
+
+  CacheLine line = lower_cache_hierarchy.read_line(physical);
+  replace_one_way(l1d.sets[set], tag, line);
+  return line.bytes(offset, width);
 }
 \end{lstlisting}
 
-这段代码不是说所有结构体都要强行 64 字节对齐，而是表达一个设计原则：如果多个线程会高频写不同槽位，这些槽位不要共享同一条 cache line。否则程序表面没有共享变量，硬件层面仍然在共享一致性单元。
+这段伪代码省略了乱序执行、store-to-load forwarding、非对齐访问、权限异常、硬件预取、多核一致性和 speculation，但它保留了关键因果：虚拟地址先翻译，物理地址再查 cache，miss 后按 line 填充。后续所有布局优化都可以回到这个伪代码提问：它减少了翻译次数，减少了 line 数，减少了冲突，还是让更多 load 能并行挂起。
 
-false sharing 的危险在于它不像数据竞争那样直接破坏结果。程序可能完全正确，测试也全部通过，只是在核心数增加时吞吐突然停止增长。排查时要看写入频率、字段布局、线程到槽位的映射和 cache line 迁移事件。若没有 \cmd{perf c2c} 或类似工具，也可以用对齐填充做对照实验：只改变布局，不改变算法。如果对齐版本显著更快，就说明共享写路径值得重点检查。
+\section{先画地址序列，再谈缓存层级}
 
-\topic{读共享和写共享}
-共享数据不总是坏事。只读共享表、常量配置、不可变索引和代码段可以被多个核心同时缓存，通常扩展性很好。真正昂贵的是写共享，尤其是多个核心高频写同一条 cache line。读多写少的数据可以使用读写锁、RCU、版本化快照或 copy-on-write，目的都是让读路径尽量不进入写共享热路径。
+缓存章最常见的坏写法，是从 L1、L2、L3 的容量和延迟列表开始。参数有用，但它们不是分析起点。起点应当是一串地址：\code{base + 0}、\code{base + 4}、\code{base + 8} 这样的连续扫描；每次跨 64 字节或 4096 字节的固定步长；按随机索引访问数组；从节点里读出下一节点地址的指针追踪；先访问 bucket 再访问节点再访问字符串的哈希查询。硬件看到的是这些地址，不是变量名、类名或容器名。
 
-写共享也分层次。最差情况是每次操作都写同一个全局变量，例如所有线程对一个原子计数器做 \code{fetch_add}。较好的情况是每个线程写本地槽位，周期性合并。更好的情况是让写入天然按数据分片分散，例如按 key 分片的哈希表或按 NUMA 节点分组的内存池。布局、同步和算法在这里是同一个问题的三个面。
+\topic{连续扫描和指针追踪不是同一种线性}
+数组求和和链表求和都是 \complexity{O(n)}，但它们让核心等待的方式不同。数组扫描的下一地址可以由当前地址加固定步长得到，cache line 里通常包含多个后续元素，硬件预取器有机会提前请求后面的 line。链表追踪必须先等当前节点加载回来，才能知道下一节点地址。乱序执行可以并行多个独立 miss，却很难提前追一条单独的 next 指针链。
 
-\section{从虚拟地址到页表和 TLB}
+这就是为什么前面的“内存级并行度”会在地址路径里继续出现。连续数组可以让多个独立 load 同时在路上；随机指针链常把关键路径变成“等一个节点，再等下一个节点”。若链表节点还由普通分配器分散到许多页面，TLB miss 和 cache miss 会叠加。复杂度描述增长阶，地址序列描述每一步要等什么。
 
-虚拟地址访问物理内存前需要地址翻译。TLB 缓存虚拟页到物理页的映射。工作集页数太多或访问模式太随机时，TLB miss 会增加，核心需要走页表。大页可以减少页数，提高 TLB 覆盖范围，但也会影响内存分配、NUMA 放置和碎片。
+\topic{容器名不是访问模式}
+\code{std::vector} 连续存储，但如果用随机索引访问，它仍然可能局部性很差。\code{std::deque} 分段连续，适合两端增长，但长距离扫描不如单个连续数组直接。\code{std::list} 插入删除稳定，却让遍历变成节点追踪。\code{std::unordered_map} 平均查找是常数，但一次查询可能包含 bucket、节点、key 字节和 value 的多次随机访问。不能只背容器复杂度表，还要问业务热路径怎样访问它。
 
-理解 TLB 对数据结构设计很重要。一个跨很多小对象的图遍历，不只会造成 cache miss，还可能造成 TLB miss。紧凑存储、池化分配和按块遍历，可以同时改善 cache 和 TLB 行为。
+日志统计中的事件名聚合就是典型例子。直接用字符串作为 key 更新 \code{std::unordered_map}，一次记录可能要读字符串、计算哈希、访问 bucket、追节点、比较字符串，再写计数。若先把事件名字典编码为整数，后续聚合就可以更新紧凑数组或局部整数哈希表。编码阶段并没有消失，它只是把昂贵的字符串地址路径集中在前面，让后续多次聚合使用更短、更可预测的地址路径。
 
-TLB 的特殊之处在于，它限制的是“能高效覆盖多少虚拟页”。一个程序的工作集如果只看字节数不大，但分散在大量页面上，仍然可能受到 TLB miss 影响。链表、树、哈希表桶、对象池和图邻接结构都可能出现这个问题。把对象压缩到连续数组里，不只是减少 cache miss，也是在减少活跃页数。
+\topic{对象图和地址图}
+对象图描述业务关系：记录有字段，字段有字符串，错误对象引用原始行。地址图描述硬件路径：某个字段和哪些冷字段落在同一条 cache line；字符串内容是否在另一块堆内存；哈希节点是否跨页；同一线程下一步能否预取；不同线程是否写同一条 line。严谨的性能报告必须把对象图翻译成地址图。
 
-\topic{Page walk 的成本}
-TLB miss 后，硬件需要按页表层级查找映射。x86-64 常见四级或五级页表，每一级页表项本身也在内存里，虽然页表项可能被缓存，但最坏情况下一个地址翻译会触发多次内存访问。若程序随机访问大量页面，真正拖慢它的不只是数据 load，还有地址翻译。
+这个翻译常常暴露接口问题。若聚合阶段只需要 \code{event_id}，却必须拿到完整 \code{LogRecord} 才能调用接口，冷字段就会被迫进入热路径。若错误报告只需要少数坏行，却每条正常记录都构造完整错误上下文，前端和缓存都会被污染。把热字段和冷字段分开，不是追求某种架构潮流，而是让每个阶段只移动自己真正需要的字节。
 
-大页把页大小从 4 KiB 扩大到 2 MiB 或更大，显著增加 TLB 覆盖范围。它适合大数组、数据库缓存和数值计算工作集，但不适合所有场景。大页可能增加内存碎片，NUMA 放置也要更谨慎。使用大页前应先用计数器确认 TLB 确实是瓶颈。
+\begin{keyidea}
+局部性不是容器属性，而是布局、访问顺序、字段冷热、生命周期和共享写共同产生的结果。说“vector 更快”不够，要说它让哪一段地址变连续，让哪些 cache line 的有效字节比例提高。
+\end{keyidea}
 
-Page walk 还会和缓存层级交织。页表项本身也要从内存层级读取，也可能命中或错过缓存。一个随机访问大数组的程序，表面上每次只读一个元素，实际上可能同时触发数据 cache miss 和页表访问。若工作集跨越大量页面，TLB miss 的成本会叠加在数据访问成本上。优化时不能只看“每个元素读几个字节”，还要看“每个时间窗口内活跃多少页”。
+\section{Cache line：搬运单位也是争用单位}
 
-\topic{缺页和内存分配}
-分配内存不等于物理页已经准备好。操作系统通常按需分配页面，第一次触碰页面时可能发生 page fault。benchmark 如果把第一次触碰计入核心循环，会把页错误成本混入算法时间。严谨实验通常要预热、固定输入规模，并记录 page-faults。
+处理器通常按 cache line 搬运数据，常见大小是 64 字节，具体平台要查询。程序读取一个 4 字节整数时，硬件通常把它所在的整条 line 带入缓存。顺序扫描数组时，这很有利，因为一条 line 包含多个相邻元素；扫描胖对象的单个小字段时，这可能浪费，因为同一条 line 里大部分字节不是热路径需要的数据。
 
-缺页也分 minor fault 和 major fault。minor fault 不需要从磁盘读数据，可能只是建立页表映射；major fault 需要从存储设备读取，成本高得多。高性能计算通常要避免在热路径出现 major fault，也要避免把大量 minor fault 误判为算法本身慢。
+\topic{从总线效率推出整行填充}
+下层缓存和内存不是为每个字节单独服务的。如果核心要读一个 4 字节字段，硬件仍然倾向于把包含它的一整条 line 拉近，因为控制一次请求、仲裁一次总线、检查一次 tag 和维护一次一致性状态都有固定成本。整行填充把固定成本摊到多个相邻字节上。这个设计依赖一个假设：程序访问一个地址后，很可能访问附近地址。连续数组、结构化扫描和紧凑 batch 会兑现这个假设；随机指针图和只读胖对象中的一个小字段会浪费这个假设。
 
-第一册已经要求 benchmark 避免把初始化混进热路径。第二册要进一步要求初始化方式和计算方式一致。NUMA 机器上，如果主线程单独触碰全部页面，再让多个 socket 上的 worker 计算，页面可能集中在主线程所在节点，后续计算变成远端内存访问。正确实验通常让每个 worker 初始化自己之后要处理的分块，这样 page fault、物理页分配和计算拓扑保持一致。
+整行填充也解释了为什么“读少量字段”可能并不便宜。假设一个对象 160 字节，热阶段只读其中 8 字节。即使对象数组完全连续，每条记录仍可能带来多条 line 的搬运；如果这些对象里还混有字符串指针和错误详情，后续访问会跳到更多 line。列式布局不是因为名字高级，而是把同一阶段真正要读的字段压到相邻 line，让一次搬运服务更多有效字节。
 
-\section{文件、页缓存和持久化}
+\topic{有效字节比例}
+设一个 \code{LogRecord} 对象有 128 字节，聚合阶段只需要其中 4 字节事件 id 和 4 字节计数输入。即使对象数组连续，硬件仍可能为每条记录搬运多条 cache line，而热路径只使用很少字节。列式 \code{HotBatch} 把事件 id 连续存放后，一条 cache line 可以携带多个事件 id，有效字节比例明显提高。这个变化比“结构体数组还是列式数组”的名字更重要。
 
-\code{mmap} 可以把文件或匿名内存映射到进程地址空间。它让文件 I/O 看起来像内存访问，但不意味着没有 I/O 成本。第一次访问未驻留页面时仍然会缺页，顺序扫描大文件时内核预读可能有效，随机访问时可能产生大量 page fault。
+有效字节比例也解释了为什么 map 融合和冷热拆分有边界。若多个字段总是一起使用，把它们拆得太散会增加多条独立地址流；若冷字段很少访问，把它们和热字段绑在一起就浪费带宽。布局优化的第一句话应当是“本阶段每条记录实际读取哪些字段”，而不是“我要使用 SoA”。
 
-数据库、搜索引擎和日志系统常利用 \code{mmap} 或 page cache，但必须理解内核何时回收页面、何时写回脏页、何时产生 I/O 抖动。系统工程里，虚拟内存既是便利抽象，也是性能变量。
+\topic{False sharing}
+Cache line 也是多核一致性的基本单位。两个线程写不同变量，如果变量落在同一条 cache line 上，硬件仍然要让这条 line 的独占所有权在核心之间迁移。这叫 \term{false sharing}{伪共享}：软件层面没有共享同一个字段，硬件层面却共享了同一个搬运和一致性单位。它不会让结果错误，却会让扩展性突然崩掉。
 
-\topic{Linux 源码阅读入口}
-第一册的 Linux 源码阅读只要求读者能从用户态现象找到入口。第二册要读出数据结构和性能路径。围绕本章，可以固定一个 Linux 版本，沿下面几条路径做窄范围阅读：页错误入口可从体系结构相关的 fault handler 进入，再走到通用内存管理逻辑；VMA 管理可关注 \filepath{mm/mmap.c} 和相关 maple tree 结构；页表和 fault 处理可关注 \filepath{mm/memory.c}；NUMA 策略可关注 \filepath{mm/mempolicy.c}；page cache 和文件映射可从 \filepath{mm/filemap.c} 开始。
+并行计数很容易中招。源码里每个 worker 写自己的 \code{partial[worker]}，逻辑上互不干扰；如果这些 8 字节计数器紧挨着，多个 worker 可能反复写同一条 64 字节 line。对齐和填充能把高频写槽位分到不同 line，但它也增加内存占用。百万个低频计数器全部填充到 64 字节并不划算。系统设计要问写入频率、线程数、读取频率和空间预算，而不是见到计数器就填充。
 
-源码阅读报告不要写成“Linux 使用某某机制”这么宽泛。合格报告要写清内核版本、阅读路径、关键结构、用户态实验和结论边界。例如研究首次触页，可以写一个大数组实验，记录 page-faults，再阅读 fault 路径中如何建立匿名页映射。若当前设备权限不足，仍然可以保留源码阅读，但必须承认它不是当前运行内核的直接证据。
+\topic{一致性为什么以 line 为单位}
+多核系统必须回答一个问题：某个核心写了一个地址，其他核心什么时候不能继续使用旧值。若一致性按单个字节维护，状态量和协议流量会非常大；按 cache line 维护则把一小段连续字节作为一致性单位。于是一个核心想写某个字节，通常要取得包含它的整条 line 的独占或修改权限。另一个核心哪怕只写同一 line 上另一个变量，也会争夺同一份权限。这就是 false sharing 的硬件根源。
 
-\section{内存实验与排查方法}
+这个机制和语言层面的数据竞争不是一回事。两个线程写同一普通变量且没有同步，可能是 C++ 数据竞争，结果未定义；两个线程写不同变量但落在同一 line，语义可能完全正确，只是硬件来回转移 line 权限而变慢。正确性和扩展性要分开分析。第 11 章讨论原子时会看到，\code{memory_order_relaxed} 可以放松顺序要求，却不能消除同一 line 的独占权限迁移。
 
-缓存和 TLB 优化可以压缩成四条原则。第一，让热路径连续访问，减少随机指针跳转。第二，让共享写分散，避免多个线程争用同一条 cache line。第三，让工作集按块复用，避免超出缓存后仍反复访问。第四，让页面放置和线程执行位置一致，避免首次触页造成远端访问。这四条原则会贯穿后面的数据布局、并行归约、线程池、工作窃取和分布式 shuffle。
+\begin{lstlisting}[language=C++,caption={按 cache line 隔离高频写 partial}]
+constexpr std::size_t CACHE_LINE_BYTES = 64;
 
-\begin{warningbox}
-不要把 \code{std::vector} 的连续性理解成所有成本都消失了。连续布局改善 cache line 和预取，但如果容量超过缓存，仍然会受内存带宽限制；如果首次访问大量新页，仍然会看到缺页成本。
-\end{warningbox}
-
-\topic{从变量边界到硬件边界}
-本章最重要的模型，是把软件边界和硬件边界分开。C++ 源码里，\code{counter[0]} 和 \code{counter[1]} 是两个不同元素；硬件里，如果它们落在同一条 cache line 上，写入时就是同一个一致性单元。C++ 里，两个对象可能由两个 \code{new} 表达式产生；分配器里，它们可能挨在同一个页上，也可能散落到不同页。进程里，虚拟地址看起来连续；物理页可能分布在不同 NUMA 节点。性能问题经常不是因为某一层“错了”，而是因为层与层的边界没有对齐。
-
-因此分析内存性能时，不要只画类图和对象关系，还要画四种边界。第一是对象边界，说明字段和容器怎样组织。第二是 cache line 边界，说明哪些字段会一起被搬运和一致性维护。第三是页边界，说明工作集跨越多少页，TLB 是否能覆盖。第四是 NUMA 边界，说明页面在哪个节点，线程在哪个节点执行。只有对象图没有硬件边界，分析会停留在源码层；只有硬件术语没有对象图，优化又会脱离业务语义。
-
-Compute Systems Engine 的 partial 数组就是一个很好的例子。源码里每个 worker 写一个 partial，逻辑上互不共享；如果每个 partial 只是一个 \code{std::int64_t}，八个 partial 可能正好落在同一条 64 字节 cache line 上。八个 worker 写不同元素，却让同一条 cache line 在核心之间迁移。若给每个 partial 做 \code{alignas(64)}，源码上的数组变胖了，内存占用增加了，但写共享路径被拆开。这里没有绝对答案，只有工作负载下的权衡：若 worker 很少或写入很少，padding 可能不值得；若每个 worker 高频写 partial，对齐常常值得。
-
-\topic{局部性不是一个词}
-局部性至少有三种。时间局部性表示刚访问过的数据很可能很快再次访问；空间局部性表示访问一个地址后，附近地址很可能被访问；结构局部性表示程序的数据结构让相关数据天然挨在一起。很多教材只讲时间和空间局部性，但工程中结构局部性更容易被设计改变。
-
-数组顺序扫描空间局部性很好，时间局部性可能不强，因为每个元素只用一次。矩阵分块同时制造时间局部性和空间局部性，因为一个块中的数据会被多次复用。哈希表查询如果 key 随机，空间局部性差；若桶数组连续但节点链表分散，第一跳和后续跳的局部性还不同。图算法更复杂，邻接表可能连续，但顶点状态数组访问可能随机。说“这个算法局部性不好”太粗，应说明是哪一类局部性不好，坏在数据结构的哪个位置。
-
-局部性还要和读写性质一起看。只读随机访问通常只是慢，写随机共享访问可能同时慢且影响其他核心。只读大表可以被多个核心缓存；写热点计数器会触发一致性迁移；写不同字段如果落在同一 cache line 上，会形成 false sharing。后续讲无锁队列时，head 和 tail 的布局就是典型局部性问题：把它们放近可以减少对象体积，但若生产者写 tail、消费者写 head，放太近反而让两端互相干扰。
-
-\topic{案例：三种计数器的内存路径}
-为了把缓存一致性讲清楚，可以比较三个计数器版本。第一个版本用 mutex 保护全局计数器，第二个版本用 atomic 全局计数器，第三个版本用分片计数器。三者都能给出正确总数，但内存路径完全不同。
-
-\begin{lstlisting}[language=C++,caption={baseline：mutex counter 表达最清楚的不变量}]
-class MutexCounter {
-public:
- void add(std::int64_t delta) {
- std::lock_guard<std::mutex> lock(this->mutex_);
- this->value_ += delta;
- }
-
- std::int64_t value() const {
- std::lock_guard<std::mutex> lock(this->mutex_);
- return this->value_;
- }
-
-private:
- mutable std::mutex mutex_;
- std::int64_t value_ = 0;
+struct alignas(CACHE_LINE_BYTES) WorkerPartial {
+  std::uint64_t valid_records = 0;
+  std::uint64_t parse_errors = 0;
 };
+
+static_assert(sizeof(WorkerPartial) <= CACHE_LINE_BYTES);
 \end{lstlisting}
 
-mutex 版本的语义最直接：锁保护 \code{value_}。低竞争时，它可能只走用户态 fast path；竞争上升后，线程可能进入 futex 等待，调度器和唤醒成本会进入系统。它的瓶颈通常是临界区串行化和锁等待，不只是那一次整数加法。
+这段代码只是示例形态。真实工程中还要防止两个相邻对象被分配器放回同一 line，要确认结构体大小和对齐是否达到预期，还要避免把只读字段和高频写字段混在一起。第 9 章讨论线程亲和性，第 11 章讨论原子和内存序，第 12 章讨论队列 head/tail 布局时，都会回到这条 line 边界。
 
-\begin{lstlisting}[language=C++,caption={改进但不一定扩展：atomic counter}]
-class AtomicCounter {
-public:
- void add(std::int64_t delta) {
- this->value_.fetch_add(delta, std::memory_order_relaxed);
- }
+\topic{写分配和一次性输出}
+写入也会消耗内存带宽。普通写 miss 往往采用 write allocate：先把目标 line 读入缓存，再修改，之后再写回。若程序写的是一次性大块输出，旧内容没有价值，这个读入可能浪费带宽。某些架构提供 non-temporal store，用于减少缓存污染和写分配，但它不是普遍优化；如果输出马上被下一阶段读取，绕过缓存可能更慢。
 
- std::int64_t value() const {
- return this->value_.load(std::memory_order_relaxed);
- }
+Compute Systems Engine 的 \code{ShuffleBlock} 就有这个取舍。若写出后立刻在本机 reduce，普通缓存路径可能有用；若写完交给磁盘或网络，缓存污染可能更明显。这里不手写特殊指令，但问题必须说清：写也有地址路径，写入目标是否会再读，决定了缓存策略是否值得讨论。
 
-private:
- std::atomic<std::int64_t> value_{0};
-};
-\end{lstlisting}
+\topic{store buffer 让写入不等于已经全局可见}
+核心执行 store 时，常常先把写入放进 store buffer，让本线程继续向前执行。这样可以隐藏一部分写延迟，也能把多个写合并到同一 line。可是 store buffer 里的内容什么时候对其他核心可见，和本线程什么时候继续执行，不是同一件事。单线程程序通常看不见这个差异；多线程程序若用普通变量通信，就会踩到可见性边界。锁、原子和内存序的价值，正是把这些硬件缓冲和重排边界变成语言层面的 happens-before。
 
-atomic 版本消除了锁等待和内核睡眠路径，但所有线程仍写同一 cache line。低竞争时它可能比 mutex 快；高竞争时它可能因为 cache line 所有权迁移而扩展性很差。这里的 relaxed 只说明不需要用计数器同步其他数据，不说明这次写没有硬件成本。
+这里先固定一个事实：写路径也会占用 cache line、store buffer、一致性权限和写回带宽。并行程序里一个热计数器可能比一大段只读输入更贵，因为它把许多核心聚集到同一条 line 上反复争夺修改权。后面讲线程本地 partial、分区聚合和 lock-free 队列时，都会回到这条写路径。
 
-\begin{lstlisting}[language=C++,caption={扩展方向：按 worker 分片计数}]
-struct alignas(64) CounterShard {
- std::int64_t value = 0;
-};
+\section{工作集、预取和分块}
 
-class ShardedCounter {
-public:
- explicit ShardedCounter(std::int32_t shard_count)
- : shards_(static_cast<std::size_t>(shard_count)) {}
+\term{工作集}{working set} 是某一时间窗口内会被反复访问的数据集合。它可能是一个热字段数组，一个局部哈希表，一个 batch，一个队列，也可能是任务图的 ready 状态。工作集小到能留在 L1/L2，和大到超过 LLC、甚至跨越大量页面，是完全不同的问题。性能曲线上的拐点，往往来自工作集越过某个层级。
 
- void add(std::int32_t shard, std::int64_t delta) {
- this->shards_[static_cast<std::size_t>(shard)].value += delta;
- }
+\topic{工作集为什么不是总数据量}
+一个作业可能处理 100 GiB 输入，但某一瞬间真正反复使用的状态只有一个 256 KiB 局部哈希表和几个输入缓冲；另一个作业总输入只有 200 MiB，却在每条记录上随机访问一个 50 MiB 字典。前者总数据量巨大，热工作集可能可控；后者总数据量较小，热窗口却超过缓存层级。问“数据集多大”不够，要问“这一段循环的活跃字节有多少，多久会再次访问，访问前是否已经被驱逐”。
 
- std::int64_t value() const {
- std::int64_t total = 0;
- for (const CounterShard& shard : this->shards_) {
- total += shard.value;
- }
- return total;
- }
+工作集还包括写入目标。一个局部 histogram 如果每个 bucket 高频更新，它既占缓存容量，也占写权限；一个输出缓冲如果只写一次不再读，它的缓存价值和局部表不同；一个队列如果生产者和消费者同时读写 head/tail，它的工作集还包括一致性状态。把这些状态混成一个“内存占用”数字，会掩盖真正的等待来源。
 
-private:
- std::vector<CounterShard> shards_;
-};
-\end{lstlisting}
+\topic{层级拐点怎样出现}
+规模阶梯实验常看到几个台阶：小数组很快，变大后突然慢一些，再变大又慢一截，最后接近内存带宽或随机访问延迟。这不是算法复杂度突然改变，而是工作集从 L1D 溢出到 L2，从 L2 溢出到 LLC，从 LLC 溢出到内存，或者活跃页超过 TLB 覆盖。每跨一个层级，命中延迟、带宽和可并行 miss 数量都会变化。
 
-分片版本把高频写入分散到多个 cache line。它牺牲了读取总数的成本和实时性：每次读取总数要扫描所有分片；如果读取和写入并发，还需要额外同步或定义弱一致语义。它适合写多读少的统计路径，不适合每次操作都需要立即得到全局精确值的协议。这个案例说明高性能设计常常不是“换一个更快原语”，而是改变读写比例和共享形状。
+拐点比单点耗时更有解释力。若 32 KiB 附近出现变化，可能与 L1D 容量或冲突有关；若几百 KiB 或数 MiB 附近变化，可能与 L2/LLC 或 TLB 有关；若步长变成每页一次后突然退化，TLB 和 page walk 可能参与。具体容量要看平台资料，不能把某台机器的数字写成普遍规律，但“跨层级出现拐点”这个分析方法稳定。
 
-\topic{false sharing 的对照实验}
-false sharing 很适合用对照实验学习，因为它不改变算法结果，只改变布局。实验可以构造两个版本。版本一使用紧凑数组，每个线程反复写自己的槽位；版本二使用 \code{alignas(64)} 的槽位。两个版本的循环次数、线程数和写入次数完全相同，只改变槽位是否共享 cache line。如果对齐版本在多线程下显著更快，而单线程差异不大，就说明写共享边界是关键变量。
+\topic{分块的本质}
+矩阵乘法用 blocking 控制缓存工作集。日志统计也需要同样思想：一次处理一个 batch，让热字段、局部 histogram、错误摘要和输出缓冲保持在可控范围内。Batch 太小，函数调用、调度和 I/O 边界成本占比高；batch 太大，cache、TLB 和恢复范围都变差。一个只看算法循环的最佳 batch size，不一定是系统最佳 batch size。
 
-实验报告要避免两个误区。第一，不要只跑一个线程数。false sharing 的危害随线程数和核心拓扑变化，至少应从 1 线程跑到物理核心数。第二，不要只看耗时。若工具允许，应观察 cache line 迁移或相关事件；若没有权限，也应写出对照设计为什么能隔离变量。第三，不要把 padding 当成默认答案。对齐会增加内存占用，可能降低缓存容量利用率。只有高频并发写的槽位才优先考虑 padding。
+数据布局、预取和 kernel suite 后面会继续展开。这里先建立原则：分块不是为了好看，而是让昂贵搬运服务更多有用工作，让局部状态在被驱逐前完成足够计算。单机 cache block、I/O buffer、网络 batch 和分布式 shuffle block 在不同尺度上解决同一个问题：控制工作集和边界成本。
 
-\topic{TLB 覆盖范围和数据结构}
-很多人把 TLB miss 当成“虚拟内存细节”，但它会直接改变数据结构选择。假设页面大小是 4 KiB，一个数据结构每个节点只有几十字节，但节点随机分布在几百万个页面上。每次访问节点不仅可能 cache miss，还可能 TLB miss。TLB 覆盖范围是有限的，活跃页数超过覆盖范围后，地址翻译本身就会变成瓶颈。
+\topic{分块同时控制容量和复用距离}
+复用距离是同一数据两次使用之间，程序访问了多少其他数据。若复用距离超过某个缓存层级容量，第一次搬入的数据在第二次使用前可能已经被驱逐。分块通过改变循环顺序或阶段边界，把会互相复用的数据放在较短时间窗口内。矩阵乘法里，tile 让一小块 A/B/C 在缓存中反复使用；日志聚合里，batch 让事件 id、局部计数表和错误摘要在可控窗口内完成足够工作。
 
-紧凑数组同时改善两件事：一条 cache line 带来多个相邻元素，一个 TLB 项覆盖同一页内多个元素。对象池也有类似作用：即使保留指针结构，至少让节点来自较少的连续页面。图算法中的 CSR 格式把邻接边压成连续数组，不只是为了少分配，也是为了提高 cache 和 TLB 友好性。哈希表开放寻址常常比链地址法更 cache 友好，也部分因为它减少指针跳转和页面分散。
-
-大页是另一种提高 TLB 覆盖范围的方法。把 4 KiB 页换成 2 MiB 页，同样数量的 TLB 项能覆盖更大地址范围。它适合大数组和长时间驻留的大工作集，但要考虑碎片、权限、部署和 NUMA 放置。不要一看到 TLB miss 就无脑开大页。正确顺序是先证明活跃页数和 TLB miss 是瓶颈，再评估大页对分配、首次触页和系统配置的影响。
-
-\topic{首次触页和 NUMA 的隐藏变量}
-NUMA 机器上，页面通常在首次写入时分配到触碰它的线程所在节点。若主线程分配并初始化整个数组，然后把计算分给其他 socket 上的线程，其他线程可能大量访问远端内存。程序源码里看不到这个问题，因为数组地址连续、线程切分也正确；硬件拓扑里却出现远端访问。
-
-这就是为什么 benchmark 的初始化也属于实验设计。若计算阶段按 worker 分块，那么初始化阶段也应按同样分块让 worker 触碰自己的页面。这样 page fault、物理页分配和计算线程位置更一致。若为了方便只让主线程初始化，测到的可能不是算法性能，而是错误页面放置后的远端带宽。
-
-Compute Systems Engine 后续要把输入生成拆成两种模式。第一种是 single-touch，由主线程初始化，用于展示错误实验设计可能带来的远端访问。第二种是 parallel first-touch，由每个 worker 初始化自己负责的块，用于展示正确放置。两者结果如果在单 socket 机器上接近，在多 socket 机器上可能差异明显。教材不能假设每个读者都有 NUMA 设备，但要让读者知道该怎样设计实验。
-
-\topic{矩阵访问：从行列顺序到分块}
-矩阵是讲缓存最经典的案例。行优先存储的二维数组按行扫描，连续访问；按列扫描，步长等于一行长度，若矩阵很大，每次访问都可能落到新的 cache line 甚至新的页。这个例子不能只停在“行优先快”上，还要继续推进到分块。
-
-矩阵乘法中，朴素三重循环会反复访问矩阵块。如果循环顺序不合适，某些数据刚被加载就被驱逐，下次又要从更慢层级取回。分块的思想是让一小块数据在缓存中被多次复用，提高算术强度。块太小，循环开销和复用不足；块太大，超过缓存后又失效。块大小还与 cache 容量、相联度、TLB、SIMD 宽度和数据类型有关。
-
-这个案例的意义不是要求第二册变成矩阵计算专著，而是让读者学会一类推理：先估算工作集大小，再估算每个块的数据复用，再根据缓存层级选择实验矩阵。后面讲分布式 shuffle 时，思想相同：先本地聚合减少网络数据，再按分区批量发送，避免每条记录都独立跨网络移动。cache block 和 network batch 在不同尺度上解决同一个问题：让昂贵移动服务更多有用计算。
-
-\topic{分配器和对象布局}
-C++ 程序常把性能问题归咎于容器，却忽略分配器。频繁小对象分配会让对象分散、增加元数据开销、破坏 cache 和 TLB 局部性，还可能引入锁竞争。多线程分配器通常有线程本地缓存、arena 或 tcache 机制，用于减少全局锁，但也会影响对象在哪个线程、哪个 NUMA 节点上实际分配。
-
-对象池不是万能答案。它可以改善局部性和分配成本，但也会引入生命周期管理、碎片复用、调试困难和峰值内存占用问题。如果对象跨线程释放，池的所有权和回收路径又会变复杂。无锁数据结构尤其要小心：节点从结构中摘除，不等于可以立即释放；分配器复用同一地址还可能放大 ABA 问题。缓存、TLB、分配器和内存回收最终会在无锁章节汇合。
-
-\topic{写回、脏页和 I/O 误判}
-并不是所有内存成本都来自 DRAM。文件映射、page cache 和脏页写回会把内存访问和 I/O 混在一起。一个程序用 \code{mmap} 扫描文件，第一次访问可能触发缺页和磁盘读取；写入映射文件后，脏页可能稍后由内核写回，导致延迟在看似无关的时刻出现。若 benchmark 只测用户态循环，不记录 page faults 和 I/O，就可能把系统行为误判为算法波动。
-
-日志系统和数据库特别容易遇到这个问题。用户写入内存缓冲并不等于数据已经安全落盘；调用 \code{fsync} 又会把持久化成本集中暴露出来。第二册虽然重点是计算系统，但分布式计算章节会讨论检查点和输出提交，那里必须区分“写入内存”“写入 page cache”“持久化到存储”和“对外宣布提交”。单机虚拟内存知识会直接影响分布式正确性。
-
-\topic{Cache line 是共享和移动单位}
-CPU cache 不是按单个字节搬运，而是按 cache line 搬运。常见 cache line 大小是 64 字节，具体平台要查询。程序读取一个 \code{std::int32_t}，硬件通常会把它所在的整条 cache line 带入缓存。顺序扫描数组时，这很好，因为一条 cache line 包含多个相邻元素；随机访问时，可能每条 cache line 只用一个元素，大部分带宽被浪费。
-
-Cache line 也是一致性协议的基本单位。两个线程写同一条 cache line 上的不同变量，也会互相争夺所有权，这就是 false sharing。软件层面看它们没有共享变量，硬件层面它们共享移动单位。理解这一点后，\code{alignas(64)}、结构体 padding、线程本地 partial 和 per-worker stats 的意义就很清楚：它们不是为了美观，而是为了让高频写不落在同一条 line 上。
-
-但 padding 也有成本。一个 8 字节计数器对齐到 64 字节，内存占用变成 8 倍。若有百万个计数器，padding 会浪费大量 cache 容量和内存。只有高频跨线程写的槽位值得优先隔离。只读共享或低频写共享不一定需要 padding。布局优化始终是成本交换。
-
-\topic{缓存相联度和冲突 miss}
-Cache 容量不是唯一限制。多数 cache 是组相联结构，一个地址会映射到某个 set，set 中只有有限 way。如果多个热地址映射到同一个 set，超过相联度后会互相驱逐，即使总工作集小于 cache 容量，也可能 miss 很多。这叫 conflict miss。矩阵步长、哈希表大小和数组对齐都可能触发冲突。
-
-这也是为什么实验要改变输入大小和步长。若某个规模突然变慢，可能不是算法复杂度变化，而是 cache set 冲突、TLB 覆盖范围或页边界效应。通过改变数组 padding、起始偏移、步长和容量，可以验证是否存在冲突。不要把所有拐点都简单归因于 L1、L2、L3 容量。
-
-\topic{写分配和写回}
-写入内存也会触发 cache 行为。普通写 miss 常采用 write-allocate：先把目标 cache line 读入缓存，再修改，之后再写回内存。对将来不会再读取的大块输出，这可能浪费带宽，因为读入旧内容没有价值。某些架构提供 non-temporal store，用于流式写出，减少缓存污染和写分配。但它也有边界：如果后续马上读取这些数据，绕过缓存可能变慢。
-
-并行算法写输出时要考虑写分配。Stream compaction 的输出可能是连续写，后续 reduce 也许马上读；此时普通写可能有益。文件 I/O 或网络发送缓冲如果只是写完交给设备，缓存污染可能更明显。教材不要求读者手写 non-temporal 指令，但要知道写也会产生内存流量。
+分块也控制 TLB。一个 batch 若跨越太多页面，即使每页只访问少量字节，也会增加翻译压力；一个局部表若刚好能留在少量页面中，TLB 覆盖就更稳定。于是 batch size 不是越大越好。系统还要考虑恢复边界：batch 太大，失败重试成本高；batch 太小，调度和提交开销高。好的分块大小来自 cache、TLB、调度、I/O 和恢复的共同约束。
 
 \topic{硬件预取器能看懂什么}
-硬件预取器擅长顺序访问和某些固定步长访问。它不理解复杂指针结构，也不理解哈希表随机访问。若程序顺序扫描 \code{std::vector}，预取器能提前请求后续 cache line；若程序遍历链表，下一地址必须等当前节点加载出来，预取器很难帮忙。若程序按随机索引访问数组，即使数组本身连续，访问序列仍然不可预测。
+硬件预取器擅长顺序访问和某些固定步长访问。它不理解业务对象，也很难理解复杂指针图。若程序按 \code{event_ids[i]} 顺序扫描，预取器容易提前请求后续 line；若程序从哈希节点跳到字符串，再跳到下一个节点，下一地址依赖当前 load 结果，预取困难。软件预取只有在地址能提前算出、预取距离合适且不会污染缓存时才可能有效；更可靠的优化通常是先改变布局和访问顺序。
 
-这说明“连续存储”和“连续访问”是两件事。一个 vector 按随机索引访问，仍可能 miss 很多；一个链表如果由对象池按顺序分配，也许比完全随机链表好，但仍受下一指针依赖限制。优化访问模式比手写 prefetch 更可靠。软件预取只有在地址能提前算出、预取距离合适、不会污染缓存时才可能有效。
+\topic{预取为什么会失败}
+预取器需要在“太早”和“太晚”之间命中窗口。太晚，数据还没回来，load 仍然等待；太早，预取来的 line 可能在使用前被驱逐，还会污染缓存；预取错了，会占用带宽和 cache 空间。复杂对象图、数据相关分支、哈希表探测、压缩格式解析和不规则图遍历，都可能让预取器无法稳定预测。软件预取也不是万能，它增加指令、占用前端和寄存器，还要求程序能提前算出未来地址。
 
-\topic{TLB 的多级结构}
-地址翻译也有缓存。TLB 保存虚拟页到物理页的映射，常有 L1 dTLB、iTLB 和更大的二级 TLB。TLB miss 时，硬件或内核需要遍历页表，成本可能很高。一个程序如果访问很多页面且每页只用很少数据，TLB miss 会成为瓶颈。链表、巨大哈希表和随机图遍历都容易遇到这个问题。
+更稳的办法通常是改变地址序列。把链表节点放进 arena，至少能减少页分散；把字符串 key 编码成整数，能把随机字符串比较变成紧凑数组访问；把每条记录的虚调用改成 batch 内核，能让一批相似地址连续处理。预取优化若不改变不可预测地址的来源，收益常常很脆弱。
 
-TLB 覆盖范围等于 TLB 项数乘以页面大小。使用大页可以扩大覆盖范围，但会带来分配、碎片、权限和 NUMA 放置问题。透明大页可能自动启用，也可能因为内存碎片或访问模式没有生效。性能报告中若讨论 TLB，应记录页面大小、是否启用透明大页、工作集跨越多少页，以及 dTLB 事件是否可用。
+\topic{哈希表的内存成本}
+哈希表是工作集分析的好对象。小 key 集合下，bucket、节点和字符串可能大多留在缓存里；key 基数扩大后，每次更新可能访问随机 bucket，装载因子、探测长度、节点分配和字符串比较都会进入成本。热点 key 又有双重性：读多时提高命中，写多并发时制造共享写热点。
 
-\topic{Page fault 的几类含义}
-Page fault 不一定表示错误。Minor fault 可能表示虚拟页第一次映射到物理页、按需分配零页、建立页表项；Major fault 通常涉及磁盘 I/O，例如文件页不在 page cache 中。还有写时复制 fault：fork 后父子共享页面，某一方写入时内核复制页面。不同 fault 的成本差别很大。
+项目报告不能只写“使用 unordered map 统计”。它至少要记录 key 数量、最大 key 占比、前十 key 占比、装载因子、是否发生 rehash、节点分配次数、局部表大小和合并成本。若 key 空间可以编码为小整数，数组桶可能更好；若 key 稀疏且一次性处理，哈希可能更合适；若输入要分布式 shuffle，编码表是否稳定又会变成协议问题。
 
-Benchmark 如果没有预热和初始化，第一次访问大数组会包含大量 minor fault；第一次 mmap 文件会包含 page cache miss 和 major fault；fork 后写内存可能包含 COW 成本。若目标是热循环性能，就应把这些成本分离；若目标是冷启动或批处理端到端，就应保留并单独报告。不要让 page fault 悄悄混进“算法时间”。
+\section{TLB：页级覆盖也是性能资源}
 
-\topic{虚拟内存和安全边界}
-虚拟内存不仅是性能机制，也是隔离机制。每个进程看到自己的虚拟地址空间，页表控制哪些页可读、可写、可执行。缺页异常让内核有机会按需分配、加载文件、处理 COW 或拒绝非法访问。理解这些机制有助于解释为什么越界访问可能崩溃，为什么 mmap 可以把文件映射为内存，为什么进程间共享内存需要明确映射。
+程序使用虚拟地址，硬件执行时要把虚拟页翻译成物理页。TLB 缓存最近使用的翻译。TLB 命中时，翻译成本很低；TLB miss 时，处理器需要进行 page walk，读取多级页表项。页表项本身也在内存层级中，可能命中缓存，也可能继续等待内存。一个程序即使数据 cache 行为尚可，只要活跃页数太多，地址翻译也可能成为瓶颈。
 
-高性能系统有时会使用共享内存绕过网络或减少拷贝，但共享内存会重新引入并发同步和生命周期问题。两个进程共享一块内存，不代表它们自动有一致的协议。仍然需要 ring buffer、sequence、futex、eventfd 或其他同步机制。虚拟内存提供地址映射，不提供业务语义。
+\topic{为什么需要虚拟地址}
+如果所有程序直接使用物理地址，进程之间很难隔离，装载位置也会互相冲突，操作系统难以按需分配和回收页面。虚拟地址给每个进程一套看起来连续的地址空间，操作系统用页表把虚拟页映射到物理页，并在映射上附带权限。这样，两个进程可以都使用同一个虚拟地址而指向不同物理页；只读共享库可以映射到多个进程；写时复制可以让 fork 后的页面在真正写入时再复制；未使用的虚拟范围可以暂时不占物理内存。
 
-\topic{Page cache 和持久化}
-Linux 的 page cache 会缓存文件数据。读取文件时，数据可能来自内存中的 page cache，而不是磁盘；写文件时，写入通常先进入 page cache，稍后由内核写回。调用 write 成功，不等于数据已经安全落盘。调用 fsync 或 fdatasync 才把持久化成本显式拉到当前路径，但具体语义还受文件系统和设备影响。
+虚拟地址带来的代价是每次内存访问都需要翻译。若每个 load/store 都完整遍历页表，成本会不可接受，于是有了 TLB。TLB 不是普通数据缓存，而是页表翻译缓存：用虚拟页号查到物理页号和权限。它缓存的是“这一页怎样映射”，不是这一页的数据字节。数据字节仍由 L1D/L2/LLC/内存层级负责。
 
-这对检查点非常重要。一个分布式作业写 checkpoint 文件后，如果没有正确 fsync，进程崩溃或机器掉电后文件可能不存在或内容不完整。写 manifest 时还要考虑目录项持久化，rename 后是否 fsync 目录。教学项目可以简化持久化，但文字上必须说明“写文件”和“可恢复提交”不是同一件事。
+\topic{页内偏移为什么不需要翻译}
+页面大小固定时，虚拟地址可以拆成虚拟页号和页内偏移。页表翻译虚拟页号到物理页号，页内偏移原样保留。若页面大小是 4 KiB，低 12 位就是页内偏移；虚拟页和物理页的这 12 位位置相同。这个事实让硬件可以并行做一些事情，例如用低位选择 cache line 内偏移，或在某些设计中让 TLB 查找和 cache 索引部分重叠。具体实现复杂，但基本拆分很重要：TLB 覆盖的是页，不是单个字节。
 
-\topic{mmap 的优点和陷阱}
-\code{mmap} 可以把文件映射到地址空间，让程序像访问内存一样访问文件。它适合随机读取、由内核按需分页、避免显式 read 缓冲管理。缺点是 page fault 出现在访问指令处，延迟可能分散；错误处理也不同，访问损坏或截断文件可能触发信号；预取和释放需要 madvise 等机制辅助；写映射文件还涉及脏页和持久化。
+\topic{活跃页数比元素数更接近问题}
+假设页面大小是 4 KiB。连续数组顺序扫描一百万个整数，会跨越很多页，但访问顺序稳定，一页内使用大量元素，TLB 和预取器都有机会工作。若一百万个小对象随机散在堆页上，每处理一个对象可能跳到新页，每页只用少量字节。两者元素数相同，活跃页形状不同。
 
-顺序扫描大文件时，普通 read 加显式缓冲有时更容易控制 I/O 节奏和错误处理；mmap 更简洁，但性能不一定总更好。系统教材应避免把 mmap 神化。选择 read 还是 mmap，要看访问模式、错误处理、文件大小、内存压力和持久化要求。
+TLB 覆盖范围可以粗略理解为“当前 TLB 能同时记住多少页面的翻译”。当热窗口跨越的页面远超过覆盖范围，page walk 会频繁出现。对象池、arena、冷热拆分、排序索引和分块，都可能减少单位时间内的活跃页数。大页把页粒度从 4 KiB 扩大到 2 MiB 或更大，能显著扩大覆盖范围，但它会影响内存碎片、权限粒度、NUMA 放置和部署配置。大页是取舍，不是魔法开关。
 
-\topic{内存分配和页粒度}
-用户态分配器向内核申请大块内存，再切给小对象。小对象释放后，内存可能回到分配器缓存，不一定立即还给内核。进程 RSS、虚拟内存大小和业务对象大小之间可能差很多。并发分配器还可能为每个线程保留缓存，线程退出或跨线程释放会影响内存回收和局部性。
+\topic{page walk 为什么昂贵}
+多级页表可以避免为整个巨大虚拟地址空间一次性分配页表。虚拟页号被拆成多段，每段索引一层页表；最后一层页表项给出物理页号和权限。TLB miss 时，硬件 page walker 需要读取这些页表项。页表项本身在内存里，也要经过 cache 层级；若页表项不在 cache 中，page walk 会继续等待内存。一次 TLB miss 可能不只是一次内存访问，而是一串相关的内存访问。
 
-这会影响性能实验。一个测试反复分配释放小对象，第二轮可能比第一轮快，因为分配器缓存已经热；也可能 RSS 不下降，让人误以为泄漏。对象池和 arena 可以改善可预测性，但要报告峰值内存和释放策略。内存优化不是只看 malloc 次数，还要看页、TLB、cache 和生命周期。
+这就是为什么活跃页数过多会让程序变慢，即使数据 cache line 看起来利用率不错。每次访问的数据可能很少，但每个新页都需要翻译；翻译缺失又要读取页表；页表读取还会占用 cache 和内存带宽。大型哈希表、对象图、稀疏矩阵、图算法和随机采样，都容易同时面对数据 miss 和 TLB miss。
 
-\topic{缓存一致性和虚拟内存的连接}
-Cache coherence 处理多个核心对物理内存中同一 cache line 的一致视图，虚拟内存处理虚拟地址到物理页的映射。两个不同虚拟地址可能映射到同一物理页，例如共享内存或文件映射；两个进程通过不同地址写同一物理页，仍会触发 cache line 一致性。理解这个连接，有助于分析 mmap 共享文件、进程间队列和 page cache。
+\begin{lstlisting}[language=C++,caption={多级页表查找的抽象伪代码}]
+PageTableEntry walk_page_tables(VirtualAddress address) {
+  PageTable* table = current_process.root_page_table;
+  for (Level level : page_table_levels) {
+    std::size_t index = address.index_bits(level);
+    PageTableEntry entry = table->entries[index];
 
-分布式系统中，跨机器没有硬件 cache coherence，必须用协议维护一致性。单机共享内存的 cache line 迁移，在集群中变成 RPC、复制和共识。第二册先讲虚拟内存和 cache coherence，再讲分布式复制，就是为了让读者看到“一致视图”的成本如何随尺度上升。
+    if (!entry.present) {
+      raise_page_fault(address, level);
+    }
+    if (level == Level::Leaf) {
+      return entry;
+    }
+    table = entry.next_level_table();
+  }
+  unreachable();
+}
+\end{lstlisting}
 
-\topic{内存实验的设计}
-本章实验应覆盖三类访问。第一，顺序扫描，观察带宽和预取。第二，固定步长访问，观察 cache line 利用率、set 冲突和 TLB 覆盖。第三，随机访问或指针追踪，观察预取失效和内存级并行度下降。每类实验都要保持逻辑工作量一致，例如访问相同数量的元素，返回相同类型的校验结果。
+这段伪代码保留了 page walk 的根本形状：页表是由地址位逐层索引的数据结构；每一层都可能因为页表项不在 cache 中而等待；叶子项还要检查权限。真实处理器会有 page walk cache、并行 walker 和各种优化，但不能把 TLB miss 想成“查一个寄存器”。它是可能走到内存层级深处的一组相关访问。
 
-实验还要控制数据初始化。先分配再初始化，记录初始化是否计时；如果比较 NUMA，初始化线程和计算线程要明确；如果比较 page fault，冷启动和热启动要分开；如果比较 mmap，page cache 状态要说明。内存实验最容易被隐藏状态影响，因此报告必须详细。
+\topic{TLB miss 和 page fault 不是一回事}
+TLB miss 表示翻译缓存里没有目标页的映射；page walk 如果找到有效页表项，就可以填回 TLB 后继续执行。Page fault 表示页表项不存在、权限不允许，或者需要操作系统介入，例如按需分配、从文件读取、写时复制或报错。前者是硬件可恢复的缓存缺失；后者是异常边界，控制权进入内核，处理完后再回到用户态重试或终止。把二者混在一起，会误判成本和修复方向。
 
-\topic{案例：对象数组和指针数组}
-一个常见布局选择是保存对象数组，还是保存指针数组。对象数组 \code{std::vector<Record>} 中对象连续，遍历时 cache 友好；指针数组 \code{std::vector<Record*>} 本身连续，但每个指针指向的对象可能分散。若热路径需要访问每个对象字段，指针数组会多一次间接访问，并可能导致随机 cache miss 和 TLB miss。
+例子很直接。顺序扫描一个已经初始化的大数组，可能出现 TLB miss，但通常不会 page fault；第一次写一个刚 \code{resize} 或 \code{mmap} 后尚未触碰的页面，可能出现 minor fault，内核分配并清零物理页；访问被换出或文件尚未读入的页面，可能出现 major fault，需要 I/O；写一个共享的 COW 页面，可能触发复制。它们都和“页”有关，但等待形状完全不同。
 
-指针数组也有价值。对象很大且需要稳定地址，或者多个索引共享同一对象，或者对象由不同生命周期管理时，指针更灵活。高性能系统常用“稳定 ID 加对象池”折中：外部持有 ID，内部对象池尽量连续。这个案例提醒读者：局部性和稳定引用经常冲突，需要设计层面的取舍。
+\topic{页级实验}
+一个好的 TLB 实验要固定逻辑工作量，同时改变页形状。连续扫描、每 cache line 访问一个元素、每页访问一个元素、随机页访问，四者处理的元素数可以相同，但有效字节比例、TLB 压力和预取能力完全不同。若平台能读取 dTLB miss 事件，就记录；若不能，就用访问规模阶梯、步长曲线和页数估算做替代证据，并明确写出证据边界。
 
-\topic{案例：内存映射日志文件}
-使用 mmap 扫描日志文件很方便。程序可以把文件映射成字节 span，然后查找换行和分隔符。但第一次访问页面可能触发 page fault，文件被截断时访问可能出错，映射区域的生命周期必须覆盖解析过程。若解析阶段把 \code{raw_offsets} 指向 mmap 区域，后续错误报告必须保证映射仍然存在。
+实验还要避免编译器把访问优化掉。每轮访问应当贡献到 checksum 或累加结果，并在报告中保存结果。输入规模要跨过 L1、L2、LLC 和内存，不要只测一个点。性能拐点比单次耗时更能说明层级行为。
 
-普通 read 版本则显式管理缓冲。它可能多一次复制，但错误处理和背压更直接：读取一个 batch，解析完释放或复用缓冲。mmap 和 read 的选择取决于访问模式、错误处理和生命周期。项目可以同时保留两种输入后端作为实验，而不是假设 mmap 永远更快。
+\begin{lstlisting}[language=C++,caption={AccessTrace 的示例形态}]
+enum class AccessPattern {
+  Sequential,
+  FixedStride,
+  RandomIndex,
+  PointerChase
+};
 
-\topic{案例：Page fault 进入计时区}
-假设 benchmark 分配一个 1 GiB vector，然后直接开始计时求和，但初始化没有触碰所有页面。求和第一次读到页面时可能触发缺页，计时结果包含页表建立和物理页分配。另一个版本提前初始化数组，求和时没有这些 fault。两者时间差不一定来自求和算法。这个案例非常常见。
+struct AccessTrace {
+  std::string structure_name;
+  AccessPattern pattern = AccessPattern::Sequential;
+  std::uint64_t element_count = 0;
+  std::uint64_t element_bytes = 0;
+  std::uint64_t touched_bytes = 0;
+  std::uint64_t estimated_pages = 0;
+  bool writes_data = false;
+  bool warmed_pages = false;
+  std::uint64_t checksum = 0;
+};
+\end{lstlisting}
 
-正确实验应明确分配、初始化、预热和计时。若要测端到端，就报告 page faults；若要测热循环，就在计时前触碰页面。没有这个区分，内存实验经常得出错误结论。
+这个结构不会预测性能，它只是强迫报告说清地址形状。后续章节可以继续扩展：线程章节加入 worker id 和 cache line 写共享，NUMA 章节加入节点放置，I/O 章节加入 mmap 和 page cache 状态，分布式章节加入 block identity 和 manifest。
 
-\topic{内存安全和性能}
-越界访问、use-after-free 和数据竞争不仅是正确性问题，也会破坏性能分析。未定义行为可能让编译器做出激进优化，导致 benchmark 结果没有意义。释放后访问可能偶尔命中旧内存，看似正常，压力下崩溃。性能代码更需要 sanitizer 和边界测试，因为它常使用手写布局、对象池和指针。
+\topic{页表是数据结构，不是抽象开关}
+页表经常被描述成“虚拟地址映射到物理地址”。这句话正确，但太短。页表本身是内核维护的一组内存中的表；每个进程有自己的根页表；页表项记录物理页号、权限、是否 present、是否 dirty、是否 accessed、是否可执行等状态。TLB miss 时，硬件 page walker 要读取这些页表项；缺页时，内核要修改这些页表项；上下文切换、页面回收、COW、mmap 和 NUMA 放置都会改变页表或它指向的物理页。
 
-项目应在 debug/asan/tsan 构建中跑 correctness tests，在 release 构建中跑性能。不要用 sanitizer 构建得出性能结论，也不要用 release-only 测试证明内存安全。正确性工具和性能工具各有位置。
+因此虚拟内存不是一层透明薄膜。它同时提供隔离、懒分配、文件映射、共享库、写时复制和权限控制，也引入页级状态和页级成本。一个系统若大量创建短生命周期映射、频繁触发 COW、随机访问巨量页或在多核间迁移页面，就会把页表和 TLB 变成热问题。
 
-\topic{案例：Page cache 和 checkpoint}
-Checkpoint 写入常被误测。程序把 checkpoint 写到文件后立即返回，测试显示很快；但真正崩溃恢复时，文件可能还在 page cache，没有持久化。若下一章分布式项目把这个时间当作提交点，就会得到错误可靠性。正确实验要区分 write 时间、fsync 时间和 rename 提交时间。
+\topic{从页表状态推出缺页分类}
+访问一个虚拟地址时，硬件先检查当前页是否已经有有效翻译。若 TLB 没有，就 page walk。Page walk 可能找到 present 页表项，说明只是 TLB miss；也可能发现页不存在或权限不允许，触发 page fault。进入内核后，内核会根据 VMA 和页表状态决定动作：给匿名页分配并清零物理页，给文件页从 page cache 建立映射，从磁盘读入缺失文件页，复制 COW 页，或者发送错误信号。
 
-可以设计一个小实验：写固定大小 checkpoint，分别只 write、write 后 fsync、临时文件 fsync 后 rename 并 fsync 目录。比较时间，并说明每种语义。这个实验会让读者理解为什么可靠输出比普通文件写入复杂。性能和持久性是交换关系，不能只看最快路径。
+\begin{lstlisting}[numbers=none,caption={从页表状态到缺页处理的分类}]
+TLB miss:
+  page table entry is present
+  hardware fills TLB and retries the access
 
-\topic{案例：共享内存队列}
-两个进程通过 mmap 共享内存实现队列时，cache、TLB、虚拟内存和同步会同时出现。共享内存提供同一物理页映射，但 head/tail 的发布仍需要原子和内存序；进程退出时，队列状态可能停在中间；不同进程地址不同，不能在共享结构中保存普通指针，应保存 offset 或索引。
+minor fault:
+  virtual range is valid
+  no disk read is needed
+  kernel allocates/maps a physical page or resolves COW
 
-这个案例非常适合作为本章到无锁章节的桥梁。虚拟内存解决映射，cache coherence 解决同一机器上的可见性，C++ 原子解决语言级同步，状态机解决关闭和恢复。任何一层缺失，队列都不完整。
+major fault:
+  virtual range is valid
+  file page is not resident
+  kernel waits for storage I/O, then maps the page
 
-\topic{缓存章节总结}
-缓存、TLB 和虚拟内存共同决定“访问一个地址”的真实成本。连续访问利用 cache line 和预取，随机访问浪费带宽并增加 TLB 压力；page fault 和 page cache 会把内存访问与 I/O 混在一起；mmap 提供方便但不消除状态机；写入不等于持久化。理解内存层级后，数据布局、并行算法和分布式 checkpoint 才有坚实基础。
+protection fault:
+  access violates permission
+  kernel reports error or terminates the process
+\end{lstlisting}
 
-\topic{内存问题排查路径}
-遇到疑似内存瓶颈，可以按路径排查。第一，看工作集大小是否超过缓存层级，输入规模曲线是否有拐点。第二，看访问模式，是顺序、步长、随机还是指针追踪。第三，看每个元素实际使用多少字节，cache line 里有多少无用数据。第四，看页面数量和 TLB 覆盖范围，是否存在大量随机跨页访问。第五，看是否有 page fault、mmap 冷启动或 page cache 干扰。第六，看写入是否产生写分配、脏页和 fsync 成本。
+这四类等待形状完全不同。TLB miss 仍主要在硬件和页表读取中恢复；minor fault 进入内核但通常不等磁盘；major fault 进入 I/O；protection fault 是语义错误。把它们都叫“内存慢”，无法指导修复。
 
-这个路径可以应用到很多问题。哈希聚合慢，可能是随机访问和分配；图遍历慢，可能是邻接数据分散和 TLB；日志扫描慢，可能是 page cache 冷启动；checkpoint 慢，可能是 fsync 和写回。把“内存慢”拆成具体层次，优化方向才清楚。
+\topic{虚拟连续不等于物理连续}
+\code{std::vector} 给程序一个连续虚拟地址区间，但它背后的物理页可以来自不同物理位置，甚至不同 NUMA 节点。对顺序扫描来说，虚拟连续已经足够让地址递增和预取工作；对 NUMA 和 I/O 来说，物理页归属仍然重要。若主线程先触碰所有页，物理页可能集中在一个节点；若 worker 分别 first-touch 自己的范围，物理页更可能贴近使用者。
 
-\topic{内存章节项目要求}
-项目中每个大数据结构都应写明三件事：内存布局、生命周期、访问模式。ParsedLogHotBatch 是列式热字段，生命周期为一个 batch，访问模式为顺序扫描；ShuffleBlock 是序列化后的中间数据，生命周期到 manifest 清理，访问模式为写一次读一次；TaskGraphStorage 是连续节点和边，生命周期为一个 stage，访问模式为随机 ready 更新和顺序 successor 遍历。这样写文档能让后续优化有依据。
+这条事实解释了为什么布局分析要分两层。虚拟地址形状决定程序能否形成连续 load/store、预取和 TLB 局部性；物理页放置决定访问距离、内存控制器和 NUMA 带宽。前者主要由数据结构和访问顺序控制，后者还受操作系统策略、线程位置和缺页时机影响。
 
-缓存章的回归阅读要从地址序列开始，而不是从层级参数开始。选同一批记录，分别用连续结构数组、指针数组、列式热字段和 \code{mmap} 冷读四种方式处理。算法复杂度都可以是线性的，但硬件看到的地址完全不同：连续数组利用 cache line，指针数组暴露随机 load，列式热字段减少无用搬运，冷 \code{mmap} 可能把 page fault 混进热路径。
+\section{首次触页、NUMA 与测量边界}
 
-实验设计要把 cache 和 TLB 拆开。小工作集主要看 L1/L2 行为，中等工作集看 LLC 和预取，大工作集看内存带宽，跨越大量页面时再观察 TLB 和 page fault。步长扫描要覆盖 1、cache line 大小、页大小和非整齐步长；矩阵访问要比较行主序和列主序；链式访问要说明预取器为什么很难帮忙。只有这样，局部性才不是一句空话。
+分配内存不等于物理页面已经就位。许多系统采用按需分配：程序拿到虚拟地址范围后，第一次写某个页面时才真正分配物理页、清零页面并建立页表项。这次 page fault 可能是 minor fault，不涉及磁盘，但它仍然远比普通 load/store 昂贵。若 benchmark 把首次触页放进热循环，就会把页面分配成本误写成算法成本。
 
-项目中的 \code{MemoryShape} 应记录字节数、元素大小、热字段、页数、对齐和访问顺序。它不需要预测所有性能，但要让报告有对象可指。若一个优化只写“缓存友好”，却不说明减少了哪些字段搬运、少跨了多少页、地址序列如何改变，就应退回重写。缓存章的核心能力，是把数据结构翻译成硬件会经历的地址流。
+\topic{reserve、commit 和物理页不是同一件事}
+C++ 容器的 \code{reserve}、运行库的堆分配、操作系统的虚拟地址范围和物理页面分配，不在同一层。一个 vector 预留容量，可能只是让分配器拿到一段虚拟地址；操作系统可能还没有为每个页面分配物理页。第一次写入某页时，CPU 发现页表项尚未指向可写物理页，触发缺页异常；内核检查这段地址是否属于合法 VMA，分配或找到物理页，清零或建立文件映射，更新页表，再回到用户态重试那条指令。
 
-Linux 观察入口也要服务地址流。读者可以用 \cmd{/proc/self/maps} 确认映射范围，用 \cmd{/proc/self/smaps} 观察 resident、dirty 和 huge page 线索，用 \cmd{perf stat} 记录 cache 与 dTLB 相关事件，在权限不足时退回页错误计数、工作集阶梯和冷热运行对照。源码阅读可以从 \filepath{mm/memory.c} 的缺页路径、\filepath{mm/filemap.c} 的页缓存路径和 \filepath{mm/mmap.c} 的映射管理开始，但阅读目标不是背内核函数，而是理解一次地址访问怎样从用户态 load 走到页表、页缓存和回收策略。
+这个过程通常比普通 cache miss 重得多。普通 miss 仍在硬件数据路径里恢复；缺页进入内核，涉及权限检查、页表修改、可能的锁、内存分配和 TLB shootdown 等动作。若需要从磁盘读文件页，成本更高。性能实验必须区分“算法处理已驻留数据”和“端到端包含分配与触页”。两者都可以测，但不能混写成同一个结论。
 
-C++ 容器也要放进这张图里。连续 \code{std::vector} 通常给预取器更清楚的地址序列，\code{std::deque} 分段连续，\code{std::list} 节点追踪会制造大量指针 load，\code{std::unordered_map} 可能在 bucket、node 和 key 上来回跳。容器选择不是只看复杂度表，复杂度相同的 \complexity{O(n)} 遍历可能有完全不同的 cache 和 TLB 行为。后面数据结构与算法书也会复用这个原则。
+\topic{分配、初始化、预热、测量}
+严谨实验至少区分四段。第一，分配虚拟地址或容器容量。第二，初始化或生成输入，此时可能触碰页面。第三，预热，让 page fault、cache 状态或 JIT/动态链接等一次性成本离开被测热循环。第四，正式测量核心循环。若研究冷启动或端到端批处理，可以故意包含前几段，但报告必须说明。若研究热循环吞吐，就不能让首次触页悄悄混进来。
 
-页级行为还要和文件 I/O 联系。顺序扫描一个大文件时，页缓存和 readahead 可能让访问看起来像内存读取；随机访问同一文件时，页缓存命中、缺页和磁盘调度会交织在一起；使用 \code{mmap} 时，load 指令可能触发 page fault，错误路径不再显式出现在源码里。教材必须让读者知道，虚拟内存不是抽象背景，它会直接改变热路径的可见成本。
+日志输入生成尤其容易犯错。一个版本在生成时顺序写满所有页面，另一个版本只 reserve 容量后开始计时解析；后者第一次解析就承担 page fault。两者总时间不同，不一定是解析算法不同。测量框架会把这些字段制度化；每个内存实验都必须写清触页策略。
 
-本章也适合讲“冷启动”和“热启动”的区别。第一次运行可能包含磁盘读取、页表建立和 cache 冷 miss，第二次运行可能大量命中页缓存。若报告没有区分冷读和热读，就很容易把操作系统缓存当成算法优化。项目中每个文件扫描实验都应记录是否清理缓存、是否预热、输入是否重新生成，以及 page fault 数量是否和结论一致。
+\topic{预热不是作弊}
+如果目标是热循环吞吐，预热是为了移除与该问题无关的一次性成本：页面首次分配、动态链接、文件页进入 page cache、分支预测器和缓存初始状态等。预热不是把程序变快的作弊，而是把问题边界写清。相反，如果目标是冷启动延迟、批处理端到端时间或失败恢复时间，就必须包含这些成本，并且把它们单独分项。真正的问题不是是否预热，而是报告有没有说明测的是哪一种语义。
 
-\section{从地址序列理解缓存、TLB 和虚拟内存}
+\topic{缺页计数怎样读}
+minor fault 通常表示不需要磁盘 I/O 的缺页，例如匿名页首次触碰、COW 或已经在 page cache 中的文件页建立映射；major fault 通常涉及阻塞 I/O。这个区分不是绝对性能公式，但能帮助解释冷读和首次触页。一个解析器版本如果 minor faults 明显更多，可能是触页策略不同；major faults 更多，可能是文件页没有驻留或系统内存压力更大。没有这些计数时，至少要记录输入是否预热、是否重复运行、系统内存压力和文件缓存状态。
 
-缓存和 TLB 不应从层级图开始背。先写一串地址：连续数组访问、固定步长访问、随机索引访问、链表追踪、二维矩阵按行访问、二维矩阵按列访问。硬件看到的不是变量名，而是地址序列。地址相邻，cache line 搬进来的一整块数据都可能被用上；地址跨页太多，TLB 覆盖不住，页表遍历进入成本；地址依赖上一次 load，预取器难以提前工作。把地址序列画出来，缓存章才不会变成“L1、L2、L3 多大”的参数表。
+\topic{NUMA first-touch}
+在 NUMA 机器上，页面常按 first-touch 策略放置到首次写入它的线程所在节点。若主线程初始化整个大数组，再把计算分给另一个 socket 的 worker，worker 可能大量访问远端内存。源码里数组连续、分块也正确；硬件拓扑里却变成远端访问。正确实验通常让每个 worker 初始化自己负责的分块，使物理页放置和计算线程一致。
 
-第一册讲过虚拟地址到物理地址的翻译，第二册要追问翻译成本怎样进入热路径。每次 load/store 都要经过地址翻译，TLB 命中时成本低，TLB miss 时可能触发多级页表遍历。若工作集跨越大量小页，TLB miss 会把看似顺序的扫描拖慢；若使用大页，TLB 覆盖范围变大，但分配、权限、碎片和系统配置也变复杂。教材要让读者看到大页不是开关，而是“用更大的页粒度换更少翻译项”的取舍。
+不是每台实验设备都有 NUMA 拓扑，但这个变量仍然必须进入设计，因为服务端系统、数据库和 HPC 程序经常遇到它。在单 socket 或无法控制亲和性的环境中，报告应写明“未验证 NUMA 放置”，并保留 first-touch 的设计说明。未验证边界写清，比给出虚假的通用结论更专业。
 
-\topic{Cache line 是搬运单位，也是争用单位}
+\topic{内存压力会改变所有结论}
+当工作集接近或超过物理内存，系统开始回收 page cache、换出匿名页或触发更多缺页。一个本来受 cache miss 限制的程序，会变成回收和 I/O 问题。Benchmark 应至少记录输入大小、进程峰值内存、可用内存、是否启用 swap、是否有其他大进程干扰。Compute Systems Engine 的 batch size、队列容量、block cache 和 checkpoint 保留数量，都会影响内存压力。内存不是无限背景资源，而是所有章节共享的预算。
 
-源码里你读取的是一个字段，硬件搬运的是一个 cache line。若结构体里热字段和冷字段混放，扫描热字段时会顺带搬动冷字段，浪费带宽。若多个线程更新不同变量，但这些变量落在同一条 cache line，硬件一致性协议仍会让整条 line 的所有权来回迁移，形成 false sharing。读者必须同时记住两句话：cache line 是空间局部性的机会，也是共享写的冲突边界。
+\section{mmap、page cache 和持久化边界}
 
-教学实验可以从计数器数组开始。版本一让每个 worker 更新 \code{std::vector<std::uint64_t>} 中相邻槽位；版本二给每个槽位按 cache line 对齐和填充；版本三让每个 worker 写线程本地对象，最后合并。若版本一随线程数增加反而变慢，版本二或三改善，就能把 false sharing 变成可观察事实。实验报告还要说明代价：填充会增加内存占用，线程本地合并会增加最终汇总阶段，二者都不是免费。
+\code{mmap} 可以把文件映射到进程地址空间，让程序像访问内存一样读取文件。它简化了某些随机读取和共享映射场景，但不等于文件已经在内存里，也不等于错误处理消失。第一次访问未驻留页面时仍可能 page fault；文件被截断或读取失败时，错误可能出现在后续访问处；映射生命周期必须覆盖所有指向映射区域的视图。
 
-Cache line 还影响写策略。普通写 miss 常常会先把旧 line 读入缓存再修改，这叫 write allocate。对一次性大块输出，读取旧内容可能没有价值；non-temporal store 可以减少缓存污染，但若后续马上读取输出，就可能变慢。高质量章节要写出这种边界，避免把特殊指令讲成单向优化。
+\topic{page cache 是内核维护的文件页缓存}
+文件数据常先进入 page cache。普通 \code{read} 会把 page cache 中的字节复制到用户 buffer；\code{mmap} 让用户虚拟页直接映射到文件页，访问时通过缺页把对应文件页带入内存。两者都可能受 page cache 影响。第二次读取同一文件快，不一定是解析器优化，而可能是文件页已经驻留；第一次读取慢，也可能是存储设备、readahead、压缩文件系统或内存压力的结果。
 
-\topic{局部性不是容器属性，而是访问属性}
+page cache 属于系统共享状态，不是某个进程私有缓存。另一个进程读过同一文件，当前实验可能受益；系统内存压力大，page cache 可能被回收；写入文件后，page cache 中的页可能变脏，稍后异步写回。文件 I/O benchmark 若不记录冷/热状态，数字很容易不可复现。
 
-\code{std::vector} 连续存储，但使用随机索引访问时仍然可能局部性很差；链表节点逻辑相邻，但物理地址可能散落各处；结构体数组适合每次读取完整对象，列式数组适合只扫描少数字段。局部性由布局和访问顺序共同决定，不由容器名字决定。
+\topic{read 和 mmap 是不同状态机}
+普通 \code{read} 把 I/O 边界显式放在系统调用处：读一个 buffer，解析，释放或复用 buffer。它可能多一次拷贝，但错误处理、背压和生命周期更直观。\code{mmap} 把读取延迟分散到页面访问处，代码短，但 page fault、readahead、信号错误和映射生命周期都要进入设计。Compute Systems Engine 可以同时保留 read 后端和 mmap 后端，用实验说明二者差异，而不是把 mmap 神化成永远更快。
 
-日志项目可以用热冷字段说明。原始记录包含时间戳、用户 id、事件类型、原始文本、错误原因和调试标记。热路径只需要事件类型和少量数值字段，如果所有字段放在一个大对象数组里，扫描会搬动许多无用字节。列式 batch 把热字段拆出来，可以让解析后的计算阶段只读必要数据。冷字段仍然保留，用于错误报告和审计，但不进入每条记录的热循环。
+日志解析若把 \code{raw_offsets} 指向 mmap 区域，后续错误报告必须保证映射仍存在。若为了节省内存提前解除映射，冷字段回查会失效。地址路径优化不能破坏诊断语义。
 
-局部性还要考虑生命周期。一个对象若在队列中跨线程传递，频繁分配释放会打散地址，也会给分配器和 TLB 带来压力。Arena 或对象池能把同生命周期对象放在一起，减少分配开销和提升局部性；但它也会推迟释放，可能增加峰值内存。章节要把“分配器优化”从“更快 malloc”提升到“生命周期和地址布局管理”。
+\topic{冷读、热读和污染状态}
+文件实验至少区分三种状态。冷读尽量减少 page cache 命中，用来观察缺页、磁盘和预读。热读重复读取同一文件，用来观察 page cache 命中后的解析和内存路径。污染状态在两次运行之间读取更大的无关文件，用来观察缓存被挤出后的行为。这三种状态都不完美，但能防止把 page cache 命中误写成算法优化。
 
-\topic{TLB、页错误和 Linux 观察入口}
+报告不要只写“mmap 比 read 快”。要写文件大小、访问顺序、是否预热、major/minor faults、解析 checksum、错误处理边界和冷/热差异。若当前环境无法清理系统 page cache，就明确说明，并用热读、污染读和输入变更做近似对照。
 
-TLB 是虚拟地址翻译的缓存。一个 4 KiB 页面能覆盖的连续数据很有限，大数组随机访问会让 TLB 工作集膨胀。若每次访问跨到新页，即使 cache line 只用少量字节，地址翻译也可能成为主成本。大页、批量访问、排序索引和分块都可以减少 TLB 压力，但它们影响不同层次：大页改变页粒度，分块改变访问顺序，排序索引改变算法输出顺序或需要额外恢复顺序。
+\topic{写文件不等于提交事实}
+写入文件成功，数据可能只在 page cache 中变脏，尚未持久化到设备。内核会异步写回；\code{fsync} 或 \code{fdatasync} 把部分持久化成本拉到当前路径；写临时文件、fsync、rename、再 fsync 目录，才更接近可靠提交协议。文件系统和设备仍有自己的语义边界。可靠写、背压和 manifest 都建立在同一个原则上：写字节、页面变脏、文件名可见、崩溃后可恢复，不是同一件事。
 
-页错误要分清 major 和 minor。Minor fault 可能只是建立页表映射或分配匿名页，不一定读磁盘；major fault 通常涉及 I/O。第一次触碰大数组时，初始化成本、页面分配和 NUMA first-touch 都会混入测量。若 benchmark 把分配和初始化放进热循环，总耗时就不能代表内核计算成本。测量章会系统讲报告格式，但缓存章必须提前提醒：内存相关实验要区分分配、触页、预热和核心循环。
+Compute Systems Engine 的 checkpoint 实验要显式比较三种语义：只 write，write 后 fsync，临时文件 fsync 后 rename 并 fsync 目录。最快路径不一定是正确提交路径。性能和恢复能力是必须声明的交换。
 
-Linux 观察可以从 \cmd{perf stat} 的 cache、TLB 和 page-fault 事件开始，再结合 \filepath{/proc/self/smaps}、\cmd{numastat} 和 \cmd{perf mem}。在手机或受限环境没有权限时，仍可通过输入规模阶梯、访问步长曲线和预热对照获取间接证据。重要的是把“没权限看计数器”写进报告，而不是假装已经证明了硬件事件。
+\topic{mmap 的生命周期陷阱}
+如果解析阶段把字段视图、错误上下文或原始行偏移指向 mmap 区域，后续阶段就依赖映射继续存在。解除映射后，这些视图不再有效；文件被截断后，访问某些页可能触发信号；映射文件被替换后，旧映射和新文件名之间的关系也需要说清。普通 \code{read} 把数据复制到自有 buffer，生命周期更显式；\code{mmap} 减少拷贝，却把生命周期和错误边界变得分散。
 
-\topic{把地址序列优化落回项目}
+因此，\code{mmap} 不是“更底层所以更快”的同义词。顺序大文件读取中，\code{read} 加合理 buffer 可能已经很好；随机读取或多进程共享同一文件页时，\code{mmap} 可能更方便；错误处理和背压复杂时，显式 \code{read} 状态机更容易控制。选择哪一个，取决于访问顺序、生命周期、错误语义和系统状态，而不是 API 名字。
 
-贯穿项目在本章应完成三个版本。第一个版本保留对象数组，作为最直观 reference；第二个版本拆出热字段 batch，比较解析后计算阶段的字节移动和 cache 行为；第三个版本为 worker partial、队列槽位和统计指标加入 cache line 对齐，验证 false sharing 是否下降。每个版本都要保持输出一致，不能为了局部性改变语义。
+\section{案例走查：哈希聚合怎样从地址问题变成系统问题}
 
-还要加入一个反例：若输入很小，小到完全落在 L1/L2 内，列式布局和对齐可能收益不明显，甚至因为代码复杂和额外索引而变慢。若热字段几乎总是和冷字段一起使用，拆分也可能增加访存次数。教材要训练读者判断适用范围，而不是把 SoA、padding 和大页当成固定答案。
+现在把前面的概念连成一条完整路径。任务是统计日志中每个事件名出现次数。朴素版本直接用 \code{std::unordered_map<std::string, std::uint64_t>} 更新全局表。单线程小数据下，它足够清楚，也适合作 reference 的一部分。输入变大、key 变多、线程加入后，问题开始分层暴露。
 
-本章最终判断力是：看到一个数据结构，能说出它会产生什么地址序列；看到一个地址序列，能推断可能的 cache、TLB、预取和一致性问题；看到一个优化建议，能设计对照实验证明它确实改变了地址序列或搬运成本。只会背缓存层级参数，还没有进入系统工程。
+\topic{第一层：字符串和节点让地址随机}
+每条记录的事件名可能在原始行中，也可能复制成字符串对象。计算哈希要读字符串字节；访问哈希表要读 bucket；节点式实现还要追节点指针；发生冲突时继续比较 key。若这些对象分散在堆页上，cache miss 和 TLB miss 会同时上升。优化方向可以是字符串 interning、字典编码、开放寻址、排序后线性合并或按 batch 局部聚合。每个方向改变的是地址路径和语义合同。
 
-\topic{案例走查：同样是 vector，为什么速度差很多}
+这里的关键不是“哈希表慢”，而是一次更新包含多条地址流。字符串字节是一条流，bucket 数组是一条流，节点对象是一条流，计数槽写入又是一条流。若 key 很短且重复度高，字符串可能很快被编码掉；若 key 很长且多数只出现一次，哈希和比较成本会放大；若节点分配分散，TLB 覆盖也会变差。报告应把一次更新拆成这些地址动作，而不是只给容器名称。
 
-构造两个版本的用户统计表。版本一是 \code{std::vector<UserRecord>}，每个 record 包含 id、name、debug string、last timestamp 和 counter。热循环只更新 counter。版本二把 counter 单独放成 \code{std::vector<std::uint32_t>}，冷字段留在另一组结构里。两者都使用 vector，但地址序列和有效字节比例完全不同。
+\topic{第二层：共享写让 cache line 迁移}
+多线程直接更新全局哈希表会引入锁、原子或细粒度分片。即使使用 relaxed 原子计数，热点 key 的计数槽仍可能在核心间来回迁移。更稳的方向是每个 worker 先写局部 histogram，再合并。这样热路径从共享写变成本地写，代价是内存峰值和合并阶段增加。若 key 基数巨大，局部表也可能超过 cache，需要继续分区。
 
-实验要分三步。第一步只读 counter，比较带宽和 cache miss；第二步随机访问用户 id，观察 TLB 和缓存行为变化；第三步多线程更新相邻 counter，加入对齐 partial 版本比较 false sharing。这样读者能看到 vector 不是局部性的保证，字段冷热、访问顺序和共享写才是关键。
+局部 histogram 也不是免费。每个 worker 一份表会把内存占用乘以 worker 数；key 空间大时，局部表可能超过 L2/LLC；合并阶段可能变成新的随机访问；如果热点 key 很少，局部表加合并的成本可能高于少量同步。工程上需要比较至少三种形状：全局共享表、按 worker 局部表、按 key 分区表。三者分别购买的是实现简单、本地写入、工作集缩小，代价也不同。
 
-报告还要写内存占用。列式拆分减少热路径字节，但增加多个数组和索引；对齐 partial 降低 false sharing，但增加空间。高性能数据结构不是只追求最快一组数据，而是在速度、空间、接口和可维护性之间做可解释取舍。
+\topic{第三层：分区把工作集缩小，但引入 manifest}
+按 key hash 把记录分成多个 partition，可以让每个 partition 的聚合工作集更小，也为分布式 shuffle 铺路。可是 partition 不只是写几个输出数组。系统要记录每个 bucket 的范围、hash seed、partition 版本、记录数和 checksum。这个记录就是后面反复出现的 \term{manifest}{清单}：描述输出对象身份和边界的事实。没有 manifest，重试、恢复和分布式 reduce 都无法证明自己读的是同一批数据。
 
-\topic{缓存实验的输入规模阶梯}
+分区把一个大随机问题变成多个小随机问题。若每个 partition 的 key 集合能留在 cache 或 TLB 覆盖范围内，聚合会稳定很多；若 partition 太多，调度、文件句柄、buffer 和 manifest 管理成本会反过来上升。分区数不是越多越好。它由 key 基数、倾斜程度、局部表大小、输出 block 大小、I/O 合并成本和恢复粒度共同决定。
 
-缓存实验必须跨多个输入规模。只测一个大数组，会把 L1、L2、LLC、DRAM 和 TLB 混在一起。建议准备按容量阶梯增长的数据：小到 L1 能容纳，中等到 L2，接近 LLC，超过 LLC，最后到内存。每个规模下比较连续扫描、固定步长、随机索引、链表追踪。曲线比单点数字更能说明层级边界。
+\topic{第四层：字典编码改变协议}
+把事件字符串编码为整数能让聚合更快，但编码表的生命周期必须清楚。它是每个 batch 独立，还是整个 run 共享？不同 worker 是否使用同一编码？checkpoint 是否保存编码表版本？输出时如何反查字符串？若分布式阶段每个 worker 独立给 \code{login} 编成不同 id，后续聚合就会错。一个看似局部的内存优化，最终会变成协议和恢复问题。
 
-步长实验要注意解释。步长为 1 时空间局部性最好；步长等于 cache line 内元素数时，每条 line 只用一个元素；步长跨页时，TLB 压力上升；随机索引会破坏预取。报告应写出每次访问有效字节比例，而不是只写速度下降。这样读者能把“cache line 是搬运单位”落到数字上。
+\topic{第五层：排序把随机写变成线性合并}
+另一条路线是先收集 \code{event_id}，排序后线性计数。排序会增加 \complexity{O(n \log n)} 或 radix pass 成本，却把随机哈希更新变成顺序扫描和相邻相等合并。小数据或高重复 key 上，哈希可能更直接；超大数据、需要外部排序或分布式 shuffle 时，排序路线更容易控制工作集和输出顺序。这里不能只背复杂度：哈希的随机地址和排序的顺序 pass 是完全不同的硬件形状。
 
-链表实验要避免分配器偶然性。可以先随机打乱数组索引，用索引模拟链表，保证节点在一个连续数组中但访问顺序随机；再比较真正分配节点的链表。前者隔离预取和地址依赖，后者加入分配碎片和 TLB。两者差异能帮助读者区分不规则访问的不同来源。
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.20\linewidth}p{0.26\linewidth}p{0.25\linewidth}p{0.21\linewidth}@{}}
+\toprule
+方案 & 地址形状 & 购买的能力 & 主要代价 \\
+\midrule
+全局字符串哈希 & 字符串、bucket、节点随机访问 & 实现直接，reference 清楚 & cache/TLB miss、共享写、锁或原子 \\
+字典编码 + 数组计数 & 字符串成本前置，热路径整数索引 & 热循环紧凑，计数槽连续 & 编码表生命周期和版本管理 \\
+worker 局部表 & 每个 worker 本地写 & 减少 line 迁移和锁竞争 & 内存峰值、合并阶段、key 基数压力 \\
+按 key 分区 & 每个 partition 工作集变小 & cache/TLB 更稳定，便于 shuffle & partition 元数据、倾斜、I/O 合并 \\
+排序后线性合并 & 多次顺序 pass & 随机写变少，输出有序 & 排序成本、临时空间、批次边界 \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-\topic{Linux 内存观察的降级路径}
+\begin{mentalmodel}
+内存优化不是把容器换成另一个容器，而是改变地址路径、共享形状和状态身份。若优化让结果更难复查、重试或恢复，它只是把成本推迟到了后面的系统边界。
+\end{mentalmodel}
 
-理想情况下，读者可以用 \cmd{perf stat} 看 cache 和 TLB 事件，用 \cmd{numactl} 控制绑定，用 \cmd{/proc/self/smaps} 看映射，用 \cmd{pmap} 看地址空间。但手机或容器环境可能权限不足。教材要给降级路径：没有 PMU 事件时，用输入规模曲线和步长曲线；没有 numactl 时，只做单节点 first-touch 说明；没有大页权限时，只解释设计和风险。
+\section{MemoryShape 和 AccessTrace}
 
-降级不是放弃严谨。报告要明确写“本实验未能直接读取 dTLB 事件，因此只能通过页数和耗时曲线间接支持假设”。这种表述比假装有硬件证据更专业。系统工程常在权限不足、生产环境不可扰动、硬件不可控的条件下工作，诚实写证据边界本身就是能力。
+Compute Systems Engine 在这里形成两个报告对象。第一个是 \code{MemoryShape}，描述数据结构的静态形状：元素大小、元素数量、热字段、冷字段、对齐、页数估计、生命周期和所有权。第二个是 \code{AccessTrace}，描述某次实验的动态访问：顺序、步长、随机、指针追踪、是否写入、是否预热、checksum 和可用指标。它们不是为了搭建复杂框架，而是让后续每次优化都有共同语言。
 
-本章还建议读 \filepath{Documentation/admin-guide/mm} 下与 huge pages、transparent huge pages、NUMA balancing 相关的说明，再结合 \filepath{mm/} 目录中的 page fault 和 reclaim 入口做浅阅读。目标是知道内核中确实存在这些机制，而不是把它们当成用户态工具输出的黑盒。
+\topic{静态形状回答“字节在哪里”}
+\code{MemoryShape} 应回答一组静态问题：对象有多大，哪些字段在热路径，哪些字段只用于诊断，元素是否连续，结构是否有指针外跳，分配器是否把对象集中在 arena，字段是否按 cache line 对齐，生命周期跨越一个 batch、一个 stage、整个 run 还是持久化文件。没有这些字段，性能讨论会退回“这个结构体大概不太好”。
 
-\topic{综合练习：设计地址序列基准}
+\topic{动态访问回答“字节怎样被走过”}
+\code{AccessTrace} 应回答动态问题：访问是顺序、步长、随机索引还是指针追踪；每次访问读写多少字节；同一 line 是否复用；活跃页数大约多少；是否有共享写；是否预热；checksum 是否证明访问没有被优化掉。静态形状相同，动态访问可以完全不同：同一个 \code{std::vector} 顺序扫很好，随机索引可能很差；同一个哈希表小 key 集合很好，大 key 集合可能变成随机内存测试。
 
-本章综合题要求读者实现一个地址序列基准，而不是一个泛泛的内存 benchmark。基准提供四种访问器：连续访问、固定步长访问、随机索引访问、依赖式指针追踪。每种访问器都必须产生同样的 checksum，避免编译器删除循环。输入规模按 L1、L2、LLC、超过 LLC、远超内存缓存几个阶梯设置。报告不能只写“随机慢”，而要解释随机慢在哪里：空间局部性、预取、TLB、地址依赖分别扮演什么角色。
+\begin{lstlisting}[language=C++,caption={MemoryShape 的示例形态}]
+enum class LifetimeKind {
+  BatchLocal,
+  StageLocal,
+  RunGlobal,
+  Persistent
+};
 
-第二步把数据结构换成三个版本：对象数组、热字段列式数组、索引模拟链表。对象数组用于展示无效字段搬运，列式数组用于展示热路径变窄，索引链表用于分离地址依赖和分配碎片。若读者直接用真实链表，分配器碎片、节点大小和地址依赖混在一起，结论会不清楚。先用索引模拟，再加真实链表，才是逐步加因素。
+struct MemoryShape {
+  std::string name;
+  std::uint64_t element_count = 0;
+  std::uint64_t element_bytes = 0;
+  std::uint64_t hot_field_bytes = 0;
+  std::uint64_t cold_field_bytes = 0;
+  std::uint64_t alignment_bytes = 0;
+  std::uint64_t estimated_pages = 0;
+  LifetimeKind lifetime = LifetimeKind::BatchLocal;
+  bool has_shared_writes = false;
+  bool owns_storage = true;
+};
+\end{lstlisting}
 
-第三步加入跨线程写。让多个线程更新相邻槽位，再比较紧凑槽位、cache line 填充槽位和线程本地槽位。这个实验把本章的 cache line 搬运和下一章的一致性流量连接起来。报告要同时写时间和内存占用，因为 padding 的收益来自空间换冲突减少。
+写这类报告时，要避免过度精确的假象。估算页数不等于知道物理页放置；记录 alignment 不等于证明 false sharing 消失；写 \code{has_shared_writes=false} 不等于没有并发 bug。报告的价值是把问题显式化，让实验和代码审查知道该看哪里。
 
-这个综合题的评分标准不是谁跑得最快，而是谁能画出地址序列并解释曲线形状。若曲线出现异常，例如某个规模突然变快或变慢，要要求读者写候选原因：预取、页大小、CPU 频率、系统噪声、编译器优化、TLB 或分配器。不能解释异常的 benchmark 只是一组数字。
+\topic{项目最小交付}
+Compute Systems Engine 的最小切片包括三组对照。第一，胖对象或对象指针版本对热字段列式版本，比较有效字节和扫描吞吐。第二，紧凑 partial 数组对 cache-line 对齐 partial，比较多线程写入扩展性。第三，read 输入后端对 mmap 输入后端，比较冷读、热读和错误生命周期。三组对照都必须和顺序 reference 输出同样 checksum 和错误摘要。
 
-\topic{容易出错的边界：局部性优化的副作用}
+这些实验的完整 C++ 实现属于代码实践卷。原理卷保留伪代码、报告字段和判读口径。这样分册以后，正文可以把因果链讲透，代码卷可以把输入生成器、测试、benchmark harness 和平台降级路径做完整。
 
-局部性优化最常见的副作用是空间换时间。Cache line 对齐可以减少 false sharing，但会扩大对象；列式布局可以减少热路径搬运，但会增加数组数量和索引；大页可以减少 TLB 压力，但可能增加内存碎片和配置复杂度；对象池可以减少分配开销，但可能推迟释放，抬高峰值内存。教材要把这些副作用和收益放在同一段里讲，否则读者会把所有布局技巧当成单向加速。
-
-第二个副作用是接口复杂。AoS 对业务代码友好，SoA 对热循环友好。若把列式数组直接暴露给所有模块，业务代码会到处操作多个平行 vector，容易破坏不变量。更好的做法是提供批量视图和有限修改接口。这样热路径看见连续 span，控制面仍然通过清晰对象管理生命周期。布局优化不是让所有代码都变底层，而是让底层成本在合适边界内可见。
-
-第三个副作用是调试难度。材料化中间对象多，内存大但容易检查；完全融合和列式化后，中间状态少，性能好但调试困难。贯穿项目可以保留 debug 模式：输出 batch 摘要、字段范围和错误索引。性能模式关闭这些检查，保留 checksum。这样读者会看到工程系统常常同时保留可诊断路径和高性能路径。
-
-本章的源码索引也应包含 C++ 容器规则。\code{std::vector} 的 reallocation 失效，\code{std::deque} 的分段存储，\code{std::list} 的节点稳定和局部性差，\code{std::unordered_map} 的 rehash 和分配，这些都是数据布局的一部分。学习缓存不能只看硬件手册，也要看语言容器如何制造地址序列。
-
-\topic{本章核心接口：MemoryShape}
-
-缓存章给项目留下 \code{MemoryShape} 描述。它记录对象大小、热字段字节数、冷字段字节数、连续数组数量、是否 cache line 对齐、是否可能 false sharing、估算工作集页数。每个核心数据结构都应能生成这个描述。描述不需要完美，但要迫使设计者写出数据如何占用内存。
-
-后续布局优化和 NUMA 策略都依赖它。线程本地 partial 要声明是否按 cache line 隔离；batch 要声明热字段跨度；shuffle block 要声明字节数和页数。没有 MemoryShape，局部性讨论会退回感觉。
-
-\topic{从缓存层级进入 NUMA 和一致性}
-
-本章解释了单个线程或单个核心附近的数据移动。下一章把多个核心放进同一张图：同一条 cache line 被谁读，谁写，页面归属哪个节点，远端访问经过哪条互连。很多 false sharing 和热点 atomic 问题，在本章看来只是 cache line 搬运，在下一章会变成一致性所有权迁移。很多大数组扫描，在本章看来是内存带宽，在下一章会变成内存控制器和 NUMA 放置。
-
-项目推进时，先让数据结构具备可解释的 MemoryShape，再谈拓扑策略。没有对象大小、热字段字节、partial 布局和页数估算，NUMA 优化就无从下手。缓存章给的是局部地址地图，NUMA 章给的是多核心、多节点之间的交通规则。
-
-\section{项目落地}
-
-Compute Systems Engine 在本章至少要增加四类实验。第一，partial 对齐实验：比较紧凑 partial 和 \code{alignas(64)} partial，观察多线程写入扩展曲线。第二，访问模式实验：比较顺序数组、固定步长、随机索引和链表遍历。第三，页级实验：改变工作集跨越页数，记录 page faults 和可能的 dTLB 事件。第四，first-touch 实验：在支持 NUMA 的机器上比较主线程初始化和 worker 分块初始化。
-
-这些实验都必须有 reference。访问模式版本必须返回同样的逻辑结果；partial 对齐版本必须只改变布局，不改变算法；first-touch 版本必须分离初始化时间和计算时间，同时也可以单独报告初始化成本。若实验一次改变多个变量，结论就不可靠。
-
-\topic{cache line}
-处理器搬运的基本粒度通常不是一个字段，而是一条 cache line。读取一个 int 可能顺带搬入相邻字段；写一个小字段也可能让整条 line 进入独占状态。冷热字段混在一起，会让热循环被冷数据拖住。
-
-
-\topic{空间局部性}
-连续数组之所以常快，不是因为名字叫数组，而是因为地址递增稳定，预取器能工作，一条 line 能服务多个元素。链表或随机指针会让每个元素都可能变成一次独立等待。
-
-
-\topic{时间局部性}
-时间局部性要求数据在被驱逐前再次使用。若工作集超过缓存容量，重复扫描也可能没有收益。实验要逐步扩大输入规模，找到 L1、L2、L3 和内存之间的拐点。
-
-
-\topic{TLB 覆盖}
-TLB 缓存虚拟页到物理页的转换。访问很多页、每页只用少量数据，会把周期花在地址翻译上。大页、紧凑布局和分块访问都可以改善 TLB 覆盖，但它们各自有分配、碎片和权限成本。
-
-
-\topic{false sharing}
-两个线程写不同变量，如果变量落在同一条 cache line，也会互相使对方缓存失效。这个问题不靠锁数量判断，而靠地址和写入频率判断。按 cache line 分隔计数器，是为了隔离一致性流量。
-
-
-\topic{页缓存}
-文件 I/O 经常先进入 page cache。第一次读取可能包含缺页和磁盘成本，第二次读取可能只是内存访问。benchmark 若不区分冷读和热读，就会把 I/O、缺页和解析混成一个数字。
-
-
-\topic{mmap 边界}
-mmap 让文件像内存一样访问，但不是把 I/O 成本变没了。缺页发生在访问时，错误也可能在访问时暴露。教材应强调 mmap 的生命周期、页粒度和故障处理，而不是把它当作魔法优化。
-
-
-\topic{C++ 表达}
-地址序列应进入接口。只读连续输入用 std::span，热字段拆成列式数组，跨线程计数器显式对齐，索引替代指针链。接口让访问模式可见，后续 SIMD 和并行章节才能复用。
-
-
-\topic{案例：数组、指针数组、链表}
-三种结构处理同样数量元素，比较每元素耗时和 cache/TLB 现象。报告必须解释地址递增、随机跳转和节点分配对预取的影响。
-
-
-\topic{案例：冷热字段拆分}
-结构体里放 \code{hot_value}、status、\code{debug_text}、timestamp。扫描 \code{hot_value} 时先用 AoS，再改成 SoA，记录搬运字节和收益边界。
-
-
-\topic{案例：两线程计数器}
-让两个线程写相邻计数器，再加 padding 分隔。这个实验把 false sharing 从概念变成可观察现象。
-
-
-\topic{源码阅读路线}
-Linux 源码阅读从 \filepath{mm/filemap.c}、\filepath{mm/memory.c}、\filepath{mm/mmap.c} 附近进入即可。阅读目标不是把整套子系统抄进书里，而是追一条和本章实验相关的路径：用户态动作怎样变成内核对象，内核对象怎样排队、等待、唤醒、计数、提交或回收。
-
-阅读报告要写证据等级。能直接测到的数字放在第一层；从源码控制流推导出的解释放在第二层；当前设备无法验证、只能作为合理猜测的内容放在第三层。这样读者会知道 地址序列报告 中哪些结论可复现，哪些结论需要换机器继续确认。
-
-源码阅读还要克制。看到一个复杂函数，不要把每个分支都展开；先回到本章的问题，问它能否解释一个等待点、一次状态转移或一条性能曲线。解释不了的内容可以留到索引，不要打断正文主线。
-
-\topic{数组、指针数组、链表}
-三种结构处理同样数量元素，比较每元素耗时和 cache/TLB 现象。报告必须解释地址递增、随机跳转和节点分配对预取的影响。
-
-\topic{冷热字段拆分}
-结构体里放 \code{hot_value}、status、\code{debug_text}、timestamp。扫描 \code{hot_value} 时先用 AoS，再改成 SoA，记录搬运字节和收益边界。
-
-\topic{两线程计数器}
-让两个线程写相邻计数器，再加 padding 分隔。这个实验把 false sharing 从概念变成可观察现象。
-
-\topic{cache line}
-
-硬件按 cache line 搬运数据，不按 C++ 字段搬运。读取一个热字段时，旁边冷字段也可能被带进缓存，浪费带宽。
-
-实验设计：构造包含热计数、状态、调试文本和时间戳的结构体，对比 AoS 与 SoA 扫描。
-
-\topic{工作集}
-
-小工作集停留在 cache 中，大工作集进入内存带宽和 TLB 压力。只说输入大小不够，要换算成访问字节和活跃页面数。
-
-实验设计：从几 KiB 扫到数百 MiB，记录曲线拐点，并写出可能对应的层级。
-
-\topic{步长访问}
-
-固定步长会改变 cache line 利用率和预取效果。步长越大，每次搬运的有效字节越少，TLB 覆盖也可能更早耗尽。
-
-实验设计：对同一数组用步长一、八、六十四和页大小扫描，比较每元素时间。
-
-\topic{TLB 覆盖}
-
-TLB 缓存虚拟页到物理页的翻译。页面数超过覆盖范围后，即使命中 cache 的数据不多，地址翻译也会成为等待来源。
-
-实验设计：在相同字节量下改变页数量，观察小页、大页和随机页访问的差异。
-
-\topic{页错误}
-
-minor fault、major fault 和写时复制 fault 语义不同。第一次触碰匿名页、读取文件页和 fork 后写共享页，成本不能混成一类。
-
-实验设计：读取新映射文件、重复读取热文件和写入 fork 后页面，分别记录 fault 类型。
-
-\topic{page cache}
-
-文件读取常先进入 page cache。第二次读取快，不一定是程序优化，可能是内核缓存。写入也可能先返回，稍后才真正落盘。
-
-实验设计：比较冷读、热读、普通 read 和 mmap，报告明确是否测到存储设备。
-
-\topic{mmap 生命周期}
-
-mmap 让文件内容像内存一样访问，但页面错误、SIGBUS、文件截断和映射生命周期都要处理。它不是免费数组。
-
-实验设计：映射文件后模拟文件变化或输入缓冲释放，写出使用 mmap 的限制。
-
-\topic{false sharing}
-
-两个线程写不同变量，如果变量落在同一 cache line，仍会争夺所有权。结构体字段不共享不等于硬件不共享。
-
-实验设计：把每线程计数放在相邻元素和对齐槽位中，比较扩展曲线。
-
-\topic{冷热分离}
-
-热字段进入连续数组，冷字段留在旁路结构，可以降低带宽和 cache 污染。代价是索引、生命周期和错误报告要重新设计。
-
-实验设计：让解析阶段只输出热字段视图，错误报告通过稳定记录号回查冷字段。
-
-\topic{源码观察}
-
-Linux 的页表和 page cache 路径很深，本章只追一条可解释实验的线：缺页怎样进入处理，文件页怎样查找，读写怎样触发缓存。
-
-实验设计：阅读时只摘和实验现象相关的入口，不把整套内存管理搬进正文。
-
-\section{从地址序列而不是变量名理解内存系统}
-
-缓存和 TLB 章节不能只讲 L1、L2、L3 的层级表。读者真正需要学会的是把程序变成地址序列。源码说“遍历记录数组”，硬件看到的是一串 cache line；源码说“访问字段”，硬件搬运的是包含这个字段的一整段字节；源码说“读取文件”，内核可能先从 page cache 给出页，再由缺页路径建立映射。变量名和对象边界是给程序员看的，地址序列和页面边界才是硬件与内核看到的。
-
-先看结构体扫描。日志记录里有事件类型、时间戳、用户 id、错误文本和调试字段。如果统计只需要事件类型，AoS 会把冷字段一起带进缓存；SoA 把热字段连成数组，扫描时每个 cache line 包含更多有效信息。这个优化不是简单地把结构体拆开，因为拆开后错误报告、生命周期和索引关系也要改变。若热字段数组里的第 1024 个元素出错，系统仍要能回到原始记录和冷字段。布局优化必须和语义账本一起写。
-
-再看 TLB。很多教材会说 TLB 缓存页表项，但工程里要问的是：一次扫描触碰多少页面，访问顺序是否规律，页面大小和工作集如何影响覆盖。一个随机访问 64 MiB 数组的程序，可能不是数据本身太大，而是活跃页面数太多，地址翻译成为等待。实验可以固定总字节数，改变元素分布在页面上的方式：连续页面、每页一个元素、随机页。这样读者会发现“同样读 N 个元素”在机器上不是同一件事。
-
-文件 I/O 也要放在同一套地址思维里。\code{mmap} 让文件像内存，但第一次访问可能触发缺页；文件被截断可能出现错误；映射区域的生命周期和文件描述符生命周期也要区分。普通 \code{read} 多一次缓冲管理，却让错误处理和背压更直接。不要告诉读者 mmap 永远更快，也不要告诉读者 read 永远安全。正确写法是按访问模式判断：顺序大读、随机小读、错误恢复、生命周期和 page cache 状态分别怎样影响选择。
-
-page cache 是本章和 I/O 章的桥。第一次读文件可能慢在存储，第二次读同一文件可能快在内存；写入成功可能只是数据进入 page cache，真正持久化要看 fsync 和文件系统语义。性能报告如果不写冷缓存还是热缓存，读者无法判断优化是否有效。手机环境下可能没有权限清理 page cache，那就诚实写明限制，用不同文件或大于内存的数据集做替代，不要把热缓存结果当成磁盘性能。
-
-本章实验可以做成四个小而清楚的系列。第一，AoS 与 SoA 扫描热字段，记录搬运字节估计和运行时间。第二，步长访问，从步长一到页大小，观察每元素成本。第三，TLB 覆盖，固定元素数但分散到更多页面。第四，mmap 与 read，对比首次读取、重复读取和错误处理代码复杂度。每个实验都应附一段地址序列解释，而不是只给图表。图表在 EPUB 里也许不方便，文字表和结论链更可靠。
-
-Linux 源码阅读可从三个入口进入：缺页处理、filemap 查找页缓存、read/write 系统调用路径。读源码时不要求记住所有分支，而要回答实验里的问题：为什么第一次访问映射页会慢，为什么第二次读可能不碰磁盘，为什么写入返回和持久化不是一回事。这样缓存、TLB、虚拟内存和文件系统才会在读者脑中连成一条线。
-
-\topic{案例推导：冷热字段拆分为什么必须同时处理错误报告}
-
-旧日志记录结构体把事件类型、时间戳、用户 id、原始行偏移、错误文本和调试标签放在一起。统计事件类型时，每个 worker 顺序扫描结构体数组，只读取事件类型和用户 id。profile 显示内存带宽压力很高。最直接的优化是把热字段拆成列式数组，让扫描只读取事件类型和用户 id。这个优化看似纯性能，但很快会碰到语义问题：当某个聚合结果异常时，如何回到原始行和错误文本？
-
-如果拆分后丢掉原始记录身份，错误报告就会退化。旧结构体里字段在一起，调试方便；新布局里热字段和冷字段分离，必须用稳定 record id 或 offset 连接。LayoutPlan 要记录热字段列、冷字段表、原始输入位置和生命周期。热循环不搬冷字段，但报告路径仍能按 id 找到冷信息。这样才能同时满足性能和可诊断性。
-
-实验可以设计两组。第一组只测扫描吞吐：AoS、SoA、冷热分离三种版本，输入包含长错误文本和短正常文本。第二组测错误路径：故意让某些记录解析失败，要求最终报告能输出原始偏移、错误原因和对应热字段。若 SoA 版本吞吐提高但错误报告丢失，它不是合格优化。教材要明确这一点，因为工程系统不能用“快但不可诊断”作为最终答案。
-
-TLB 也会参与这个案例。冷热分离后，热字段连续，活跃页面减少；冷字段表虽然仍占内存，但不在热循环中触碰。若冷字段被随机回查，回查路径可能慢，但频率低。报告应写出热路径和冷路径的访问频率，而不是把所有路径平均。这样读者能理解为什么某些布局让主路径快，同时保留慢但少见的诊断路径。
-
-源码阅读可从 page cache 和缺页路径连接到输入读取。若热字段来自 mmap 文件，第一次扫描触发缺页；若来自 read 后的解析批次，成本转移到读取和复制阶段。两种方案都可以成立，但生命周期不同。mmap 版本需要处理文件截断和映射有效期；read 版本需要管理缓冲复用和背压。缓存章节的深度就在于：每个地址序列背后都有所有权和恢复边界。
-
-\begin{labbox}
-实验：比较行优先访问矩阵和列优先访问矩阵。记录 cache-misses、dTLB 相关事件和时间。再把矩阵规模从 L1、L2、L3 可容纳范围逐步扩大，观察拐点。
-\end{labbox}
-
-\topic{地址序列比变量名更接近真相}
-缓存和 TLB 的学习要从地址序列开始，而不是从 cache line、set、way 的名词开始。贯穿项目里，读取日志文件、解析记录、更新哈希表、写出 partial block，都会产生不同地址序列。顺序扫描输入接近线性流，硬件预取容易工作；更新哈希表会根据 key 跳到不同桶，随机性更强；写输出 buffer 若按 partition 分散写，可能在多个区域之间来回切换；读取 mmap 文件会把缺页、页缓存和用户态指针连在一起。变量名叫 input 或 map 不重要，真正影响性能的是 CPU 看到的地址怎样变化。
-
-第一类地址序列是流式访问。它的特点是步长稳定、局部性好、可预取。流式读取最容易把瓶颈推到内存带宽或 I/O，而不是指令执行。第二类是小工作集反复访问，例如固定大小的计数数组或字符分类表。它适合待在 L1 或 L2。第三类是大工作集随机访问，例如高基数哈希表。它会暴露 cache miss、TLB miss 和分配器碎片。第四类是冷热字段混合访问，例如每条记录的热字段只需要事件类型和数值，冷字段却包含长字符串。若结构体把冷热字段绑在一起，缓存会被不需要的数据占满。
-
-\topic{页缓存和 mmap 要从失败语义讲清}
-很多教材把 mmap 写成“少一次拷贝”，这太粗。mmap 把文件页映射到进程地址空间，访问时可能触发缺页，由内核把页从页缓存或磁盘带入。它让代码像访问内存一样访问文件，但错误语义、生命周期和页级行为都变复杂。文件被截断后访问映射区域可能出错；随机访问大文件可能造成大量缺页；映射生命周期和文件描述符生命周期要区分；预读策略也会影响吞吐。
-
-普通 read 路径更显式：系统调用把数据从内核缓冲拷到用户缓冲，用户代码处理这块 buffer。它有拷贝成本，但边界清楚，错误点清楚，buffer 生命周期由程序掌控。mmap 适合某些随机读取、共享映射或把文件当地址空间处理的场景；read 适合顺序流、明确 buffer 管理和错误控制。项目不应直接宣布哪种更快，而要按输入大小、访问模式、页缓存状态和错误处理实验。
-
-\topic{TLB miss 为什么会突然出现}
-TLB 缓存虚拟页到物理页的翻译。若工作集跨越太多页面，或者访问模式在大范围随机跳页，TLB 容量会成为瓶颈。哈希表、图邻接表、对象池和多个大数组交错访问都可能增加 TLB 压力。把记录按块处理、压缩热字段、使用连续数组、减少指针对象数量，都可以降低页级随机性。
-
-大页不是万能答案。它能减少页表项数量和 TLB 压力，但会影响内存分配、碎片、NUMA 放置和权限粒度。若工作集本来很小，大页没有意义；若访问只碰每页少量数据，大页可能浪费内存；若需要频繁映射和释放，大页管理成本也要考虑。本章应要求读者先用页级访问统计描述问题，再讨论大页。
-
-\topic{实验：同一算法的三种内存形状}
-可以设计一个 key 计数实验。版本一使用 \code{std::unordered_map} 直接更新，观察随机桶访问和分配成本。版本二先把记录分块，每块使用局部 map，再合并，观察工作集是否变小。版本三若 key 范围可压缩，把 key 映射成紧凑整数，使用连续计数数组，观察 cache 和 TLB 行为。三个版本输出必须相同，但地址序列完全不同。
-
-报告要写清 key 分布：低基数、高基数、Zipf 热点、随机字符串。低基数下连续数组可能极快；高基数字符串下哈希和分配可能主导；热点分布下局部 map 能减少共享写；随机字符串下字符串比较和内存分配可能超过哈希本身。这样读者会明白数据结构选择不是按名称决定，而是按地址序列、工作集和语义决定。
-
-\topic{Linux 源码阅读连接点}
-读 Linux 页缓存时，重点看文件页如何被标识、查找、标记脏、回写和失效。页缓存不是一个魔法加速层，而是一套以页为单位的共享状态机。读虚拟内存相关代码时，关注 VMA、页表、缺页处理和权限。项目中的 manifest 和 block cache 可以借鉴这种思路：每个缓存对象必须有身份、状态、引用、失效规则和回写规则。
-
-源码阅读还要注意快慢路径分离。缺页是慢路径，命中页缓存是快路径；写回是异步过程，fsync 是同步边界；内存回收可能在看似普通分配时触发。把这些现象带回项目，读者就会理解为什么一次 vector push、一次文件读取或一次哈希插入的延迟会有长尾。系统性能不是平均成本的线性相加，慢路径会决定尾延迟。
-
-\topic{事故复盘：同样复杂度为什么跑出不同阶梯}
-两个版本都说自己是线性复杂度：一个把记录解析成节点对象后放进 unordered map，另一个把热字段压成连续数组并用索引关联冷字段。小输入时差异不明显，输入扩大以后，节点版时间突然出现阶梯，perf 显示 cache miss、TLB miss 和缺页都参与进来。复杂度没有说谎，只是它没有描述地址序列。CPU 看到的不是“大 O”，而是一串加载地址、页号和 cache line。
-
-分析要把访问路径画出来。节点对象让 key、value、错误信息和 next 指针散在堆上，哈希桶跳转又引入随机访问；连续数组让扫描阶段按 cache line 前进，但可能需要额外索引回到原始文本；mmap 首次访问可能触发缺页，read 可能多一次拷贝却让预取和页缓存行为更稳定。大页能减少 TLB 压力，也可能浪费内存并扩大无用搬运。每个方案都不是口号，而是一组地址行为。
-
-实验不应只给一组总时间。要逐步扩大工作集，记录冷运行和热运行，区分页缓存、缺页、TLB 覆盖和数据缓存容量的拐点。哈希表实验还要报告 key 分布、装载因子、冲突长度和节点分配策略。若一次优化让扫描更快却让错误定位丢失，就不是合格优化。缓存章节真正要建立的能力，是从程序对象推导地址序列，再从地址序列解释硬件和操作系统成本。
-
-
-\topic{地址实验实验判读}
-缓存实验要看拐点，不只看最终时间。输入逐步扩大时，若时间在某个规模突然上升，要回到工作集、页数和访问步长；冷热运行差异大，说明页缓存或缺页参与；顺序和随机差异大，说明预取和 TLB 覆盖不同。报告中应写清每个版本的地址形状，而不是只写容器名。
-
-
-这一段也服务于复习。读者合上书后，应该能凭本章的判读口径重新审查自己的代码：有没有最小正确版本，有没有能击穿旧方案的输入，有没有状态记录，有没有资源指标，有没有失败后的恢复动作。若五个问题缺两个以上，就说明实现还停在演示层，而不是工程层。
-
-
-\topic{页缓存实验必须区分冷、热和污染}
-文件读取实验至少要跑三种状态。冷状态尽量减少页缓存影响，用来观察缺页、磁盘和预读；热状态重复读取同一文件，用来观察页缓存命中后的解析与内存路径；污染状态在两次运行之间读一个更大的无关文件，用来观察缓存被挤出后的行为。三种状态都不是完美真相，但合在一起能防止把页缓存命中误写成算法优化。
-
-mmap 和 read 的比较也要写错误语义。mmap 让访问看起来像普通内存，但缺页发生在 load 指令附近，文件截断和映射生命周期会带来额外边界；read 把系统调用和用户缓冲区分开，拷贝成本更显式，也更容易控制 buffer 复用。若只比较一次运行时间，读者会错过最重要的生命周期差异。
-
-地址实验的报告建议附一张文本表：访问形状、工作集大小、页面数量、是否顺序、是否随机、是否触碰冷字段、是否写回。这个表比容器名称更重要。unordered map、vector、mmap 都只是接口，真正决定硬件行为的是地址流。
-
-\topic{实验课：同一个计数任务的四种地址形状}
-输入仍然是日志事件计数。第一版每条记录分配一个节点对象，节点里保存字符串 key，然后更新 \code{std::unordered_map}。第二版先把事件名 intern 成整数 id，再更新连续计数数组。第三版按 split 建局部 map，最后合并。第四版把热字段列式化，聚合阶段只扫描 event id 列。四个版本输出必须和串行 reference 一致。
-
-实验不要一上来跑最大输入。先按工作集阶梯扩大规模：能放入 L1 的小数据，能放入 L2 的中等数据，超过 LLC 的大数据，再到跨越大量页面的超大数据。每个规模记录时间、页错误、缓存相关事件或替代指标、内存峰值和输出 checksum。权限不足时，也要记录冷运行与热运行差异、输入规模拐点和访问步长曲线。
-
-判读时重点看地址形状。节点对象版本可能在小输入上够快，但规模增大后随机指针和字符串比较会暴露；整数 id 数组版本可能极快，但要求有字典编码；局部 map 降低共享写，却增加合并成本；列式化减少热路径字节，却要保留冷字段回查。没有一个版本天然最好，选择取决于 key 分布、错误报告需求和内存预算。
-
-再把文件读取加入实验。用 read 版本和 mmap 版本分别喂同样的解析器，跑冷、热、污染三种状态。报告写清哪部分时间来自读取、哪部分来自解析、哪部分来自页缓存状态。这样读者会看到：虚拟内存、页缓存和容器布局共同决定实际成本，复杂度记号只能提供很粗的上界。
-
-\topic{地址序列练习验收重点}
-合格答案要把容器名翻译成地址序列。vector 是连续还是分段，unordered map 是否节点分配，mmap 是否会触发缺页，read 是否有用户缓冲复用。答案要区分冷运行和热运行，并写出如果没有硬件计数器时用什么替代证据。
-
-答案还要写“为什么不采用更复杂方案”。例如没有证据证明队列是瓶颈，就不应把锁队列换成无锁；没有证明输出顺序可变，就不应随意重排；没有证明错误路径能恢复，就不应只提交正常路径。能解释不做什么，说明读者开始具备工程判断。
-
-最后，答案必须包含可复查材料。至少有输入摘要、关键状态、期望输出、实际输出、运行命令和未验证边界。没有这些材料，老师或同伴无法判断结论是否成立。第二册的作业不是让读者写漂亮段落，而是训练读者把系统问题变成可验证证据。
-
-\topic{项目实现：缓存、TLB 与页级性能}
-本章对应的贯穿项目实现不要求一次写成完整框架，但必须有最小可运行切片。这个切片包含三个部分：一个 reference，一个带本章机制的实现，一个能击穿 reference 之外隐含假设的测试。Reference 用来固定语义，机制实现用来展示本章知识，测试用来证明新增复杂度确实解决了问题。
-
-代码组织上，不要把所有内容放进一个大文件。基础类型、输入生成、核心机制、报告输出和测试应分开。即使当前只是教学项目，也要让目录能表达责任边界。这样后续章节接入时，不会因为找不到状态归属而重新发明一套对象。
-
-每个实现都要输出一段机器可读摘要。摘要至少包含输入规模、关键状态、错误数、输出校验、耗时和未验证边界。这里的机器可读不要求复杂格式，简单的 key value 文本也可以。关键是让脚本和读者都能复查，而不是只能看屏幕截图。
-
-测试应包含正常路径、边界路径和失败路径。正常路径证明功能可用；边界路径证明长度、容量、尾部、空输入、关闭或超时没有遗漏；失败路径证明本章机制不是装饰。若失败路径写不出来，往往说明本章概念还没有落到工程对象上。
-
-报告最后写一个取舍段。新增机制带来了什么好处，增加了什么成本，哪些场景不应该使用它，下一章会复用哪个字段或对象。这个取舍段非常重要，因为系统工程不是把所有高级机制都加进去，而是在证据和约束下选择合适的边界。
-
-\topic{调试笔记：缓存问题先画访问步长}
-怀疑 cache 或 TLB 时，先画访问步长和工作集，不要先换容器。顺序步长、固定大步长、随机桶访问、指针追踪和冷热字段混读，对硬件完全不同。若工作集从小到大出现台阶，就把台阶和缓存层级或页数量联系起来；若冷运行慢、热运行快，就把页缓存和缺页写入报告；若随机访问慢，就检查是否能排序、分桶或压缩索引。
-
-
-\topic{复查清单：缓存、TLB 与页级性能}
-复查本章时，先检查 reference 是否仍然存在。没有 reference，后面的并发、优化、异步或分布式改造都无法证明语义没有变。再检查压力输入是否尖锐：它应当攻击本章最核心的边界，而不是只把数据量放大。第三，检查状态是否可观察：关键对象的身份、状态、错误和提交结果应能在报告中找到。
-
-第四，检查代码示例是否说明禁止行为。调用者不能做什么，往往比能做什么更能体现工程质量。第五，检查实验是否写出未验证边界；当前设备、权限或输入无法证明的结论，必须标注。第六，检查本章对象是否能被下一章复用，不能复用就说明边界还不稳。
-
-完成这六项后，再看文字是否连贯。每个概念都应从问题推出，每个案例都应从朴素方案走到改进方案，每个实验都应能解释一个判断。若某段话放到其他章节也成立，就把它改成本章的具体对象、具体输入和具体失败。
-
-\section{工程案例：用地址序列解释缓存、TLB 和页缓存}
-
-缓存、TLB 和虚拟内存不是三块互不相干的知识。它们都在回答同一个问题：程序给机器的地址序列是什么形状，硬件和操作系统能否用有限的近处存储承接这个序列。若地址连续、重复利用高，缓存和预取器会帮忙；若地址随机、工作集跨越太多页，核心会频繁等待；若文件访问没有和页缓存语义对齐，I/O 和内存会互相污染。
-
-\topic{一、从地址序列开始，而不是从缓存名词开始}
-同样是 \complexity{O(n)}，顺序扫描数组和追踪链表完全不同。数组扫描每次访问下一个元素，cache line 被充分利用，硬件预取器容易预测；链表追踪每次 load 下一个指针，下一步地址依赖当前 load 结果，预取困难，乱序窗口也难以产生足够独立 miss。算法复杂度没有错，但它没有描述地址序列。
-
-因此本章实验要记录访问模式。连续、固定步长、随机索引、热点加长尾、二维行优先、二维列优先、分块访问，这些序列要用同一套输入规模比较。报告不要只写耗时，还要写元素大小、总字节数、访问页数、步长、是否重复使用、是否修改。这样缓存讨论才不会停留在“局部性好”这种口号。
-
-\topic{二、cache line 是数据搬运单位}
-处理器通常按 cache line 搬运数据，而不是按单个字段。若热循环只用结构体中的两个小字段，却每次把包含字符串、调试信息和冷状态的大结构体一起搬进 cache，就会浪费带宽。数据布局章会继续讲 AoS 和 SoA，但本章先解释为什么浪费发生：硬件无法只搬你逻辑上关心的字段，它按连续字节块搬。
-
-false sharing 也是同一件事的并发版本。两个线程写不同变量，如果变量落在同一 cache line 上，硬件仍要在核心之间迁移这条 line。源码看起来没有共享同一个字段，cache line 层面却共享了搬运和所有权。实验可以让多个线程分别写相邻计数器，再加入 padding 或按线程分块，观察扩展曲线变化。
-
-\topic{三、TLB 把虚拟页转换变成热点资源}
-虚拟地址访问需要转换到物理地址。TLB 缓存最近使用的页表翻译。若工作集跨越的页太多，TLB miss 会引发 page walk，核心即使 cache line 在内存中也要先解决地址翻译。随机访问大数组、稀疏矩阵、哈希表和大图遍历都容易遇到这个问题。它们慢的不只是 cache miss，还有页级覆盖不足。
-
-实验可以固定访问字节数，改变元素步长和页数。比如每页访问一个 64 位整数，与连续扫描同样数量元素比较。前者浪费 cache line，也打爆 TLB 覆盖；后者充分利用每页和每条 line。若系统支持 huge page，可以比较普通页和大页，但报告要写明大页分配是否成功。不要把“开启大页”写成普遍建议，它会影响内存碎片、NUMA 放置和启动成本。
-
-\topic{四、虚拟内存让首次触页成为实验变量}
-分配大数组不等于物理内存已经就位。很多系统采用按需分配，第一次写某页时才真正建立物理页映射。若 benchmark 把首次触页混在热路径里，测到的可能是 page fault 和清零成本，而不是算法本身。多线程程序还会受到 first-touch 策略影响：哪个线程首次写页，页就可能放到哪个 NUMA 节点。
-
-因此实验要分清初始化、预热和测量。先分配，再按计划触页，再进入热循环。若研究冷启动，就明确把首次触页作为被测对象；若研究内核性能，就把首次触页排除。很多看似玄学的性能波动，来自没有控制页状态、缓存状态和 CPU 频率状态。
-
-\topic{五、mmap 和 page cache 不是普通内存的简单别名}
-\code{mmap} 让文件内容映射到虚拟地址空间，读写看起来像内存访问，但背后仍有 page fault、page cache、脏页回写和文件系统错误。顺序读取大文件时，\code{read} 和 \code{mmap} 各有适用边界；随机小访问时，mmap 可能简化代码；写入持久数据时，何时 \code{msync} 或 \code{fsync} 又会进入语义。
-
-日志统计项目可以用 \code{mmap} 做输入读取实验，但要写清：映射成功不代表所有页面已经在内存中；访问坏页或文件截断可能产生错误；page cache 命中和冷读差距很大。I/O 章节会继续讲可靠写入，本章只强调 page cache 是内存层级和文件系统之间的桥，不能当成普通数组完全忽略。
-
-\topic{六、C++ 数据结构如何暴露地址形状}
-\code{std::vector} 暴露连续地址，适合扫描和 SIMD；\code{std::deque} 分段连续，适合两端操作但整体扫描局部性不如 vector；链表节点分散，插入删除稳定但遍历慢；哈希表平均查找快，却常有随机访问和分支。选择容器时，不能只背复杂度，还要看访问频率和地址序列。
-
-项目中的 parsed batch 应优先使用连续列式数组保存热字段。原始字符串和错误文本可以放在冷存储，通过偏移关联。这样解析、统计和分区阶段看到的是连续数值列；诊断阶段需要时再追冷数据。这个设计会在第 6 章展开，本章先从 cache line 和 TLB 解释它的必要性。
-
-\topic{七、实验交付：AccessTrace}
-本章可以给项目留下 \code{AccessTrace} 报告。它记录数据结构类型、元素大小、元素数量、访问顺序、总字节数、页数、是否写入、是否预热、是否使用 huge page、是否 mmap。每个实验输出 checksum，防止编译器优化掉访问。报告还要记录无法观测的指标，例如没有权限读取 dTLB miss 时，明确标记 unavailable。
-
-验收时选择三组对照：vector 顺序扫描对链表遍历，AoS 热字段扫描对 SoA 热字段扫描，普通页随机访问对大页随机访问。每组都要求读者先预测地址序列，再运行实验。若结果和预测不同，回到编译器优化、缓存状态、页大小和硬件预取器解释差异。这样缓存章节就会变成可操作的分析方法。
+\topic{观察入口}
+理想环境下，可以使用 \cmd{perf stat} 观察 cache、dTLB、page-faults 等事件，用 \cmd{/proc/self/maps} 和 \cmd{/proc/self/smaps} 检查映射，用 \cmd{numastat} 或 \cmd{numactl} 观察 NUMA 放置，用编译器和反汇编确认循环没有被优化掉。受限环境下，仍可使用规模阶梯、步长曲线、冷/热运行、checksum 和内存峰值作为替代证据。报告必须把 unavailable 写成显式状态，不能把读不到的指标填零。
 
 \section{源码阅读：从 Linux 页表和页缓存看内存成本}
 
-缓存和 TLB 的实验解释了现象，但还需要读者知道操作系统在背后维护哪些状态。源码阅读不要求把 Linux 内存子系统读完，而是选几条和项目直接相关的路径：缺页如何建立映射，页缓存如何承接文件读取，脏页如何回写，内存映射如何影响错误处理。这样读者会知道“内存访问慢”有时不是硬件 cache alone，而是硬件和内核状态共同作用。
+源码阅读不要求把 Linux 内存子系统读成百科，重点是把用户态实验现象和内核维护的状态连接起来。可以固定一个内核版本，选择三条窄路径：缺页怎样建立映射，文件页怎样进入 page cache，脏页怎样写回。报告中写概念、状态和实验对应关系，不要罗列无关函数。
 
-\topic{一、缺页路径回答首次触页为什么贵}
-用户程序访问尚未映射的虚拟页时，会触发 page fault。内核要检查 VMA，判断权限，分配或找到物理页，建立页表项，可能清零页面，最后返回用户态重试指令。这个过程远比普通 load 昂贵。大数组第一次写入时，很多周期花在这里，而不是花在算法本身。
+\topic{缺页路径}
+用户程序访问尚未映射的虚拟页时，会触发 page fault。内核检查 VMA，判断权限，找到或分配物理页，建立页表项，必要时清零页面，然后返回用户态重试指令。VMA 描述虚拟地址区间的来源和权限；页表项描述虚拟页到物理页的映射；匿名页、文件页和写时复制页的处理不同。把这个路径读清后，首次触页为什么贵就不再神秘。
 
-阅读时关注概念，不背函数名。VMA 描述一段虚拟地址的权限和来源；页表项描述虚拟页到物理页的映射；匿名页和文件页处理不同；写时复制会让读共享和写私有分开。项目报告中如果把首次触页计入热循环，就应该明确说明；如果排除，就要预触页。读者要能把 page fault 这个系统事件和 benchmark 曲线对应起来。
+\topic{页缓存路径}
+文件读取常通过 page cache。第二次读取同一文件可能很快，因为页面已经在内存；第一次读取可能受磁盘、readahead 和缺页影响；内存压力下，page cache 会被回收。阅读 \filepath{mm/filemap.c} 或对应版本的文件映射路径时，要关注 page cache 是以页为单位管理共享状态，不是某个进程私有的普通数组。
 
-\topic{二、页缓存解释文件读为什么像内存又不像内存}
-文件读取常先进入 page cache。第二次读取同一文件可能很快，因为数据已经在内存；第一次读取可能受磁盘和 readahead 影响；内存压力下，页缓存会被回收。mmap 访问文件页时，第一次访问也可能触发缺页，把文件页带入 page cache。于是同一段代码在冷 cache 和热 cache 下差距巨大。
+\topic{脏页和回写}
+写文件后，页面可能处于 dirty 状态，稍后由内核回写。脏页太多会触发回写压力，普通写路径可能突然变慢。\code{fsync} 把提交语义和等待成本显式拉到调用处。源码阅读报告要把 dirty page、writeback、fsync 和项目 checkpoint 对应起来：什么时候只是写入内存，什么时候才可以宣布提交。
 
-实验报告必须区分冷读和热读。若要测解析器，应尽量把输入预热或使用内存 buffer；若要测 I/O pipeline，就明确测冷读、热读和写回。不要把 page cache 命中后的速度当成磁盘吞吐，也不要把冷读瓶颈误判成解析器慢。页缓存让文件和内存连接起来，也让测量更需要边界。
+\begin{sourcereadingbox}
+源码阅读交付一张表即可。行包括 page fault、TLB miss、page cache hit、major fault、dirty page、writeback、reclaim、COW。列包括用户态现象、内核维护的状态、项目中可能出现的位置、观测方法和未验证边界。重点是把内存成本变成可追踪事实，而不是把 Linux 源码读成函数名清单。
+\end{sourcereadingbox}
 
-\topic{三、mmap 的错误模型要进设计}
-\code{mmap} 简化了读取接口，但错误不一定在映射时出现。文件被截断、页读取失败、访问越界，都可能在后续内存访问中以信号或错误表现出来。普通 C++ 异常无法自然捕获这些情况。若项目使用 mmap 读取输入，就要在设计中说明文件生命周期、映射范围、并发修改和错误处理策略。
+\section{复查清单和习题}
 
-对教学项目来说，使用普通 \code{read} 加 buffer 可能更容易处理错误；使用 mmap 可以作为高级实验，重点观察 page fault、readahead 和地址序列。不要为了显得高级强行 mmap 所有输入。接口选择应服务语义和证据，而不是服务风格。
-
-\topic{四、脏页和持久化连接 I/O 章节}
-写入文件后，数据可能只在 page cache 中变脏，尚未到设备。内核会异步回写，也可以通过 \code{fsync} 等接口要求持久化。脏页太多会触发回写压力，写入线程可能被迫等待。这个机制解释了为什么写出阶段有时一开始很快，随后突然变慢：系统先吸收脏页，后来必须回写。
-
-日志项目的 shuffle block 如果只写临时文件不 fsync，在进程崩溃和机器掉电下语义不同。教学中可以先处理进程崩溃，不承诺掉电持久化；如果要承诺掉电恢复，就要把 fsync 策略写清楚。内存章先埋下这个边界，I/O 章再详细处理。
-
-\topic{五、内存压力会改变所有结论}
-当工作集接近或超过物理内存，系统开始回收页缓存、换出匿名页或触发更频繁的缺页。此时一个本来只受 cache miss 限制的程序，会变成 I/O 和内存回收问题。Benchmark 如果在不同内存压力下运行，结果可能完全不同。报告中至少要记录可用内存、输入大小、是否使用 swap、是否有其他进程占用内存。
-
-Compute Systems Engine 的 block size、batch size 和队列容量都影响内存压力。队列太大，page cache 被挤出，后续读文件变慢；batch 太大，TLB 和 cache 局部性下降；保留太多旧配置或 retired node，内存峰值上升。内存不是无限背景资源，而是所有章节共享的预算。
-
-\topic{六、源码阅读交付}
-本章的源码阅读交付不是函数调用图，而是一张“内存事件到系统影响”的表。page fault 对应首次触页和 mmap 冷读；TLB miss 对应页覆盖不足；dirty page 对应写回压力；page cache hit 对应热读；reclaim 对应内存压力；COW 对应 fork 或共享映射写入。每一项写一个项目中可能出现的位置和一个观测方法。
-
-这张表会在后续章节复用。线程池队列积压可能导致内存压力，I/O 写出可能制造脏页，分布式模拟的 shuffle block 可能挤掉输入 page cache。读者若能把这些联系起来，就不会把内存问题局限在“cache 大小”层面。
-
-\section{补强案例：哈希表查询为什么经常慢在内存}
-
-哈希表平均复杂度是常数，但系统性能常被哈希表拖慢。原因是一次查询可能包含哈希计算、bucket 访问、控制字节读取、key 比较、节点指针追踪和 value 读取。每一步都可能触发 cache miss 或分支失败。复杂度告诉你元素数量增长趋势，却不告诉你一次查询要等多少个随机地址。
-
-\topic{一、节点式哈希表的地址形状}
-节点式哈希表通常 bucket 数组连续，但节点分散分配。查找先访问 bucket，再追节点指针，再比较 key。若 key 是字符串，还要访问字符串内容。这个地址序列很难被预取器预测，也不容易被乱序执行隐藏，因为下一步地址依赖当前节点内容。工作集大时，LLC miss 和 TLB miss 会同时出现。
-
-开放寻址哈希表把控制字节和元素放得更紧凑，减少指针追踪，但会受到负载因子、探测长度和删除标记影响。它不是永远更好，但在读多写少、key 可移动、需要高局部性的场景常有优势。教材不必实现完整高性能哈希表，但要让读者理解节点分配和局部性的关系。
-
-\topic{二、字典编码改变问题形状}
-日志统计中，很多字符串 key 可以先字典编码成整数。编码阶段可能使用哈希表，但后续聚合变成数组或紧凑整数哈希，地址形状大幅改善。若同一批数据要多次查询或聚合，编码成本可以被摊销；若只处理一次且 key 很多，编码未必划算。选择取决于复用次数和 key 分布。
-
-字典编码还带来语义问题。编码表的生命周期多长，是否跨 batch 复用，是否需要稳定 id，错误 key 如何处理，输出时如何反查字符串。性能优化一旦改变数据表示，就必须同时定义这些语义。否则后面分布式阶段会出现不同 worker 编码不一致的问题。
-
-\topic{三、热点和长尾}
-若 key 分布高度倾斜，热点 key 会频繁命中同一 bucket 或同一计数器。它可能提高 cache 命中，也可能造成共享写热点。读多场景下热点有利，写多并发场景下热点危险。报告不能只写 key 数量，还要写分布，例如最大 key 占比、前十 key 占比、长尾长度。
-
-项目中可以先对热点 key 做本地特殊计数，再把长尾交给哈希表。这样减少哈希探测和共享写。这个策略连接 histogram、partition 和分布式热点 shard。一个局部哈希表问题，最终会变成系统负载均衡问题。
-
-\topic{四、实验}
-比较四种统计方式：节点式 unordered map、排序后线性合并、字典编码加数组桶、热点 key 特化加长尾哈希。输入覆盖均匀字符串、少量热点、大量长尾和批次复用。报告记录每条记录平均查询次数、分配次数、内存峰值、cache miss 替代指标和最终输出一致性。这样读者会看到复杂度、地址序列和业务分布怎样共同决定数据结构。
-
-\section{补充案例：工作集大小如何决定算法阶段}
-
-工作集是当前阶段频繁访问的数据集合。它可能是一个数组、一个哈希表、一个 block、一个 batch，也可能是任务队列和状态表。工作集能否放进 L1、L2、LLC 或内存，会直接改变算法选择。
-
-\topic{一、分块的本质是控制工作集}
-矩阵乘分块的目的，是让一小块 A、B、C 在 cache 中重复使用。日志处理也能分块：每次处理一个 batch，把热字段、局部 histogram 和输出 buffer 控制在 cache 友好的大小。分块不是矩阵专用技巧，而是让工作集适合层级存储。
-
-Batch 太小，调度和函数调用开销高；batch 太大，cache 和 TLB 压力上升，错误恢复范围变大。选择 batch size 要同时看缓存、I/O 和恢复。一个纯算法角度的最佳块大小，不一定是系统最佳块大小。
-
-\topic{二、哈希表工作集随 key 基数变化}
-事件统计中，key 数少时局部表可以留在 cache；key 数大时，每次更新可能访问随机 bucket。若 key 基数随输入变化，性能曲线会出现拐点。报告要测不同 key 基数，而不是只测一个固定分布。
-
-当局部表超过 cache，可以考虑分区处理：先按 key hash 把记录分成多个 partition，再分别聚合。这样增加一次数据重排，但每个 partition 的工作集变小。这个策略在单机和分布式 shuffle 中同源。
-
-\topic{三、工作集和并发度互相影响}
-每个线程都有自己的局部工作集。线程数增加，总工作集可能超过 LLC；每线程 partial 增加，内存峰值也增加。一个单线程 cache 友好的算法，多线程后可能因为总工作集过大而变慢。报告要记录每线程工作集和总工作集。
-
-\topic{四、实验}
-固定总输入，改变 batch size、key 基数和线程数。记录吞吐、cache miss 替代指标、TLB miss 可用性和内存峰值。让读者观察拐点，并解释它对应哪个缓存层级或内存预算。工作集分析能把“快慢变化”变成可解释现象。
-
-\section{从对象地址推导工作集模型}
-
-缓存、TLB 和虚拟内存最容易被讲成层次结构图：L1、L2、L3、内存、页表、磁盘。图有用，但还不够。工程中真正需要的是工作集模型：程序在一段时间内会反复访问哪些地址，这些地址落在多少 cache line、多少页面、多少 TLB 项里，访问顺序是否让硬件预取器看得懂，写入是否让多个核心争抢同一条 cache line。把对象名字换成地址序列以后，很多看似软件层面的选择都会变成硬件问题。
-
-\topic{一、数组快不是因为数组高级，而是地址可预测}
-连续数组的优势来自两个事实：相邻元素通常位于相邻 cache line，下一次访问地址可以由当前地址加固定步长得到。硬件预取器擅长这种模式，TLB 也能用较少项覆盖较大的连续区域。链表慢也不是因为链表这个抽象低级，而是因为下一跳地址保存在当前节点里，处理器拿到当前节点前不知道下一个地址。乱序执行可以并行处理独立 miss，却很难提前追逐单条指针链。读者应把“数组和链表复杂度都是线性”继续细分为：数组的线性扫描是带宽问题，链表的线性扫描常常是延迟问题。
-
-\topic{二、工作集大小决定局部性是否真实}
-一个算法声称有局部性，必须说清局部性窗口。若热数据只有几十 KiB，它可能长期留在 L1 或 L2；若热数据是几 MiB，就要看 L3 和内存带宽；若随机访问跨越数 GiB，TLB miss 和页表遍历会进入主路径。哈希表是很好的例子：平均复杂度看起来是 \complexity{O(1)}，但一次查询可能触发哈希计算、bucket 访问、节点访问和字符串比较，每一步都可能落在不同 cache line。若 key 很短、表负载低、bucket 连续，表现很好；若 key 很长、节点分散、rehash 频繁，常数会大到压过算法复杂度。
-
-\topic{三、页不是透明的背景}
-虚拟内存让每个进程拥有连续地址空间，但硬件执行时仍要把虚拟地址翻译成物理地址。TLB 缓存翻译结果，页表保存完整映射。大数组顺序扫描时，TLB miss 相对可控；随机访问大表时，工作集可能超过 TLB 覆盖范围，导致翻译开销和数据 miss 叠加。大页能扩大 TLB 覆盖范围，但会影响内存分配、碎片、NUMA 放置和权限粒度。教学中不能把大页讲成“开了就快”，应把它放进地址序列和部署约束里分析。
-
-\topic{四、布局优化要回答谁在同一条线}
-结构体布局的核心问题是哪些字段会一起读，哪些字段会一起写，哪些字段属于冷路径。若热循环只读 \code{id} 和 \code{score}，却把很长的错误消息、调试字段和状态字符串放在同一结构体里，每次扫描都会搬运不需要的数据。把热字段拆成列式数组可以减少带宽，但会改变接口、构造成本和缓存行为。反过来，过度列式化也会让本来一起使用的字段分散。布局优化没有固定答案，只有访问模式、对象生命周期和接口稳定性的共同约束。
-
-\topic{五、用实验建立地址直觉}
-本章实验建议把同一份数据做成三种形态：连续数组、索引数组和指针节点。每种形态都跑顺序访问、固定步长访问和随机访问，记录吞吐、cache miss、TLB miss 和内存峰值。然后再加入冷热字段拆分、arena 分配和大页配置。若结果和预期不一致，不要急着改代码，先检查编译器是否优化掉循环、数据规模是否超过缓存、线程是否被调度到不同核心、输入是否真的随机。地址直觉不是靠背层级图得到的，而是靠一次次把对象还原成可测的地址序列得到的。
-
-\section{贯穿案例：同样是线性扫描，为什么一个像顺流，一个像追尾}
-
-考虑一个日志聚合作业。版本一把每行解析成 \code{LogRecord} 对象，对象里有用户字符串、事件字符串、时间戳、错误信息和若干指针，随后把对象指针放进哈希表。版本二先把热字段抽出来：时间戳放进连续数组，事件名经过字典编码变成整数，错误信息只在需要时通过 \code{RecordId} 回查。两版都处理每条记录一次，复杂度都可以被写成线性，但机器执行完全不同。第一版像在堆上追一串路标，第二版像沿连续道路顺序前进。
-
-这个案例的目的不是说对象模型不好，而是让读者学会问：热循环真正碰了哪些字节，冷字段是否被无意搬进 cache，指针跳转跨了多少页，TLB 能否覆盖当前工作集，硬件预取器能否猜到下一地址。缓存和 TLB 不应该是章节标题里的名词，而应该是代码设计时能被追问的具体成本。
-
-\topic{一、从对象生命周期看热字段和冷字段}
-解析阶段需要原始字符串和错误上下文，聚合阶段通常只需要事件 id、时间窗口和数值。若两阶段共用同一个胖对象，聚合时会反复把冷字段所在的 cache line 带进来。冷热拆分的动机就从这里出现：不是为了追求列式布局这个名字，而是因为不同阶段需要不同字段。拆分以后，热路径更紧凑，冷数据仍可通过 record id 找回。若错误报告要求保留完整原文，冷数据不能丢，只是不能让它占据热循环带宽。
-
-\topic{二、从一次哈希查询拆出地址序列}
-一次 \code{unordered_map} 查询表面是 \complexity{O(1)}，地址序列却可能包含多步：读取 key 字节计算哈希，访问 bucket 数组，跳到节点，比较字符串长度和内容，必要时继续链表或探测。每一步都可能落在不同 cache line。若 key 很多、节点分配分散、字符串不短，常数成本会非常高。相反，字典编码后用整数 key 查询紧凑数组，可能把多次随机访问压成一次连续或近似连续访问。复杂度符号没有错，但它隐藏了地址形状。
-
-\topic{三、TLB 从“页数”而不是“元素数”进入模型}
-一百万个小对象如果分散在堆页上，热循环可能触碰大量页面；一百万个整数连续存放，页面数量仍然大，但访问顺序稳定，TLB miss 和预取行为更可控。TLB 的问题不是数据总量大这么简单，而是单位时间内活跃页面数量超过覆盖能力。Arena 分配、冷热拆分和紧凑数组都能减少活跃页面。大页也能扩大覆盖，但它不能修复乱跳的指针图，最多推迟拐点。
-
-\topic{四、把布局优化写成可逆设计}
-高质量布局改造要保留语义回路。热数组里只有 event id，不代表系统失去事件名；字典表必须能从 id 反查字符串；错误路径必须能从 record id 找到原始行和 offset；checkpoint 必须保存字典版本。若布局优化让调试、恢复或输出变得不可解释，它就是把成本转移给后续章节。经典系统设计舒服的地方在于每个抽象都能回到证据，本书也要保持这一点。
-
-\topic{五、实验要覆盖工作集拐点}
-这个案例的实验不应只测一个数据规模。应固定记录形状，逐步增加记录数和 key 基数，观察吞吐在哪些点下降。第一个拐点可能对应 L2 工作集，第二个可能对应 LLC，第三个可能对应 TLB 或内存带宽。然后改变布局：胖对象、冷热拆分、字典编码、排序合并。若拐点移动，说明布局确实改变了工作集；若不动，说明瓶颈可能在 I/O、分支或写出。实验目标是找成本迁移，而不是证明某容器永远快。
-
-\topic{六、把地址报告服务后续并发}
-单线程地址序列报告不是孤立材料。后面加线程时，热数组是否按线程分片、partial 是否 false sharing、页面是否 first touch、NUMA 节点是否远端，都依赖这里的布局。若第三章把地址地图写清，后续并发优化就不是重新猜。比如每线程写自己的连续 partial，合并时按 key 顺序扫；或者每线程哈希表分散在堆上，合并时随机访问很多页。两种并行策略在代码层面都能工作，但地址地图会提前告诉我们风险。
-
-\section{案例深化：地址序列报告如何写}
-
-缓存和 TLB 的学习要落到地址序列报告。假设同样是统计 key 出现次数，版本一为每条记录分配节点并插入 \code{unordered_map}，版本二先把 key id 压成连续数组，再做局部排序和线性合并。两者在复杂度上都能被说成接近线性，但硬件看到的路径完全不同。一个追指针、跳桶、分配节点；另一个顺序扫描、局部排序、批量合并。报告若只写大 O，就看不到差异。
-
-\topic{一、把对象图翻译成地址图}
-对象图描述程序员看到的关系：记录、字段、节点、桶、错误信息。地址图描述 CPU 看到的访问：连续数组、随机桶、堆节点、页边界、cache line。优化前后先画这两张图，读者能立刻看到热字段和冷字段是否混在一起，指针跳转是否跨页，扫描是否能被预取。地址图不是插图任务，而是性能推理工具。
-
-\topic{二、分清冷运行和热运行}
-第一次读取文件可能触发缺页和页缓存填充，第二次运行更多是在内存里扫描。若不区分冷运行和热运行，mmap、read、预读和页缓存的影响会被混合。实验应至少记录第一次运行、重复运行、改变输入文件后的运行。若冷运行慢而热运行快，瓶颈可能在 I/O 和缺页；若热运行仍慢，才更可能是 cache、TLB 或算法访问模式。
-
-\topic{三、TLB 问题经常由布局间接制造}
-TLB miss 不只来自数据大，也来自有效工作集跨越太多页面。节点对象分散在堆上，可能让一个热循环同时触碰很多页；冷热字段拆分后，热路径页数下降，TLB 覆盖就改善。大页可以扩大覆盖，但若程序仍然随机追指针，只是把问题推迟。先改善布局，再考虑大页，这个顺序通常更稳。
-
-\topic{四、哈希表报告要写分布}
-哈希表性能不能只看平均查找。要报告 key 分布、装载因子、桶长度、rehash 次数和分配次数。热点 key 多时，局部聚合可能比直接全局 hash 更稳；key 空间小且可压缩时，数组或排序合并可能比 hash 更可预测；key 很稀疏时，hash 仍然合适。不同结构的选择来自数据形状，而不是来自“某容器快”。
-
-\topic{五、把内存证据连接到后续章节}
-地址序列报告会被后面复用。SIMD 章节需要知道数据是否连续；线程章节需要知道多个 worker 是否写同一 cache line；NUMA 章节需要知道页面放在哪个节点；I/O 章节需要知道读取是顺序还是随机。第三章如果写清地址行为，后面的优化就有共同地图。
-
-\section{案例复盘：复杂度相同，地址序列不同}
-
-两个统计程序都可以声称是线性复杂度：一个把记录做成堆节点再进哈希表，一个把热字段压成连续数组后排序合并。小数据下差异不明显，数据一大，节点版出现 cache 和 TLB 拐点。原因不在大 O，而在 CPU 看到的地址序列：连续 cache line、随机桶、堆节点、页边界和缺页。
-
-\topic{把对象图翻译成地址图}
-对象图说明记录、字段、桶和错误信息的关系；地址图说明它们落在哪些页和 cache line。节点对象把热字段和冷字段散在堆上，哈希桶引入随机跳转；连续数组让热路径容易预取，但需要 record id 回溯冷数据。优化不是“换容器”，而是改变硬件访问轨迹。
-
-\topic{实验判据}
-报告要区分冷运行和热运行，记录 page fault、cache miss、TLB miss、分配次数和 key 分布。哈希表还要写装载因子和桶长度。若扫描变快但错误定位丢失，优化不合格，因为系统只是在性能和可恢复性之间做了未声明交换。
-
-\section{本章习题}
+复查必须覆盖六项事实：所有布局版本是否和 reference 的 checksum、错误摘要和输出规模一致；对象图是否已经翻译成地址图，热字段、冷字段、访问顺序、页数估计和共享写是否写清；实验是否覆盖连续、步长、随机、指针追踪、冷读和热读，并区分初始化、预热和测量；cache/TLB/page-fault 指标或替代证据是否保存并标记不可用边界；padding、列式化、字典编码、mmap、大页和分区各自的成本是否说明；\code{MemoryShape} 和 \code{AccessTrace} 是否能被后续线程、I/O 和分布式实验复用。
 
 \begin{exercisebox}
-习题一：在当前项目中为 partial 数组设计两个布局，一个紧凑，一个按 cache line 对齐。说明每个字段的大小、对齐、每个 cache line 可能容纳几个 partial，以及为什么这个设计能隔离 false sharing。
+习题一：为 Compute Systems Engine 的 partial 数组设计两个布局：紧凑布局和按 cache line 隔离布局。写出每个字段大小、结构体大小、对齐、每条 cache line 可能容纳几个 partial，以及为什么某些场景不应该使用填充。
 
-习题二：写三个遍历版本：连续数组遍历、随机索引数组遍历、链表遍历。要求三者处理相同数量的逻辑元素。报告中分别分析 cache line、TLB、预取器和内存级并行度，不允许只写“随机慢”。
+习题二：实现或设计三种遍历实验：连续数组、随机索引数组、链表或索引模拟链表。三者处理相同数量的逻辑元素，输出 checksum。报告必须分别分析 cache line 利用率、TLB 覆盖、预取器和内存级并行度，不允许只写“随机慢”。
 
-习题三：设计一个首次触页实验。说明如何分离分配、初始化、预热和计算；如何记录 page-faults；在没有 NUMA 机器时，哪些结论不能验证，哪些结论仍然可以通过 page fault 观察。
+习题三：设计首次触页实验。说明如何分离分配、初始化、预热和计算；如何记录 page-faults；若没有 NUMA 机器，哪些结论不能验证，哪些仍可通过 page fault 和规模阶梯观察。
 
-习题四：阅读 \filepath{mm/memory.c}、\filepath{mm/mmap.c} 或对应内核版本中的 fault 路径入口。写一份不超过两页的源码阅读报告，要求把用户态实验现象和内核路径联系起来，不要罗列无关函数。
+习题四：比较 read 后端和 mmap 后端读取同一份日志输入。报告至少包含冷读、热读、污染状态、错误处理边界、映射生命周期、checksum 和不可观测指标。若当前环境不能清理 page cache，写出替代对照。
+
+习题五：阅读一个 Linux 内存路径入口，例如缺页、mmap 或 page cache。写一份不超过两页的报告，把一个用户态实验现象映射到内核维护的状态，不要罗列无关函数。
 \end{exercisebox}
+
+下一步进入 NUMA、互连和缓存一致性。前面的地址路径已经看到 cache line 是搬运和争用单位，也看到页面放置会影响内存距离。单核地址路径一旦加入多个核心、多个 socket 和一致性协议，问题会从“当前核心怎样访问数据”升级为“哪些核心以什么权利访问同一份数据”。这正是 NUMA 和一致性要解决的边界。

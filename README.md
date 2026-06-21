@@ -5,7 +5,8 @@
 当前正式书籍：
 
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
-- `books/cpu-volume-2/`：CPU 计算系统教材第二册，主题是硬件原理、多核心并行、高性能计算、多线程、锁、原子、无锁数据结构、并行算法和分布式计算。
+- `books/cpu-volume-2/`：从 C++ 到计算系统第二册原理卷，主题是硬件原理、多核心并行、高性能计算、多线程、锁、原子、无锁数据结构、并行算法、运行时、异步 I/O 和分布式计算。
+- `books/compute-systems-engine-code/`：第二册配套代码实践卷，主题是 Compute Systems Engine 的完整 C++20 实现、测试、benchmark、故障注入和报告。
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 
@@ -23,12 +24,19 @@ books/
     results/           # 实验输出，默认只跟踪 .gitkeep
     tools/             # 本书专用脚本
   cpu-volume-2/
-    source/latex/      # 第二册正式 LaTeX 书稿，生成 PDF/EPUB
+    source/latex/      # 第二册原理卷正式 LaTeX 书稿，生成 PDF/EPUB
     materials/         # 草稿、课程计划、素材、参考资料
-    labs/              # 与本书绑定的代码实验
+    labs/              # 早期实验和配套实践素材
     reports/           # 报告模板和学习报告
     results/           # 实验输出
     tools/             # 本书专用脚本
+  compute-systems-engine-code/
+    source/latex/      # 代码实践卷正式 LaTeX 书稿
+    labs/              # Compute Systems Engine C++20 工程
+    materials/
+    reports/
+    results/
+    tools/
   cpu-volume-3/
     labs/              # 第三册 AI 推理引擎实验
     materials/
@@ -174,14 +182,20 @@ books/<book-id>/
 ## 当前第二册入口
 
 - 第二册说明：`books/cpu-volume-2/README.md`
-- 正式主稿：`books/cpu-volume-2/source/latex/main.tex`
+- 原理卷正式主稿：`books/cpu-volume-2/source/latex/main.tex`
 - 全书结构：`books/cpu-volume-2/source/latex/outline/book-architecture.tex`
 - 硬件执行模型：`books/cpu-volume-2/source/latex/chapters/part01-hardware-foundations/`
 - 单机高性能计算：`books/cpu-volume-2/source/latex/chapters/part02-single-node-hpc/`
 - 多线程与同步：`books/cpu-volume-2/source/latex/chapters/part03-concurrency-synchronization/`
 - 并行算法与运行时：`books/cpu-volume-2/source/latex/chapters/part04-parallel-algorithms-runtime/`
 - 分布式计算：`books/cpu-volume-2/source/latex/chapters/part05-distributed-computing/`
-- 贯穿项目：`books/cpu-volume-2/labs/compute_systems/`
+- 早期实验素材：`books/cpu-volume-2/labs/compute_systems/`
+
+## 当前代码实践卷入口
+
+- 代码实践卷说明：`books/compute-systems-engine-code/README.md`
+- 正式主稿：`books/compute-systems-engine-code/source/latex/main.tex`
+- 第一章：`books/compute-systems-engine-code/source/latex/chapters/part01-foundation/ch01-reference-and-contract.tex`
 
 ## 当前第三册入口
 

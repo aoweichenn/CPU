@@ -1,850 +1,625 @@
 \chapter{NUMA、互连与缓存一致性}
 
-先看一个并行归约事故：单线程求和很稳定，四线程以后吞吐几乎不涨，八线程还变慢。代码里没有复杂锁，只是每个线程对同一个全局 atomic 计数器做 \code{fetch_add}。从 C++ 看，它已经没有数据竞争；从硬件看，所有核心在反复争夺同一条 cache line 的修改权。再换一个版本，每个线程写自己的 partial，最后合并，吞吐突然恢复。这里逼出的不是某个协议名，而是一个事实：共享读容易复制，共享写必须协调所有权。
+先看一个很小的并行程序：输入是一批日志记录，每个 worker 解析自己负责的片段，然后把错误行数量加到一个全局计数器里。单线程时吞吐稳定；两线程时略有提升；四线程以后提升变小；八线程甚至变慢。代码没有复杂锁，只是每条记录执行一次 \code{std::atomic<std::uint64_t>::fetch_add}。从 C++ 语义看，结果正确，没有数据竞争；从硬件看，所有核心在反复争夺同一条 cache line 的修改权。
 
-本章从这个共享写热点进入 NUMA、互连和缓存一致性。多核心 CPU 不是把多个核心简单放在一起。核心之间通过片上互连通信，共享某些缓存层级，连接内存控制器，并用一致性协议维护共享内存语义。多 socket 机器还会引入 NUMA：不同核心访问不同内存节点的成本不同。只有把“哪个 cache line 被谁写、哪个页面属于哪个节点、合并阶段穿过哪条互连”说清楚，并行程序的扩展曲线才有解释。
+把程序改成每个 worker 写自己的局部计数，阶段结束后再合并，吞吐突然恢复。这个现象比任何协议名都重要：共享内存并不等于共享写没有成本。多个核心读同一份数据时，硬件可以复制 cache line；多个核心写同一条 line 时，硬件必须决定当前谁拥有写权限，并让其他副本失效或更新。写权限在核心之间来回移动，就会占用互连、缓存层级和等待时间。
 
-\section{从共享内存到一致性流量}
+本章从这个共享写热点推导缓存一致性、片上互连和 NUMA。多核心处理器不是把许多核心简单摆在一起；每个核心有私有缓存，多个核心共享更大的缓存层级，通过环、mesh、交叉开关或 socket 间链路通信，连接一个或多个内存控制器，并用一致性协议维护共享内存语义。多 socket 或多 chiplet 机器还会出现 NUMA：不同核心访问不同内存节点的延迟和带宽不同。只有把“哪条 cache line 被谁写、哪个页面属于哪个节点、合并阶段穿过哪条互连”说清楚，多线程程序的扩展曲线才有解释。
 
-在 C++ 程序里，多个线程似乎可以直接读写同一地址。但硬件上，写一个共享 cache line 需要让其他核心的副本失效或更新。一个原子自增不是普通加法，它需要获得 cache line 独占权，并按内存序约束发布结果。争用越激烈，cache line 在核心之间来回迁移越频繁。
+\section{从一个 atomic 事故推导共享写成本}
 
-这解释了为什么全局计数器扩展性差。四个线程分别做本地计数，最后合并，通常比四个线程同时 \code{fetch_add} 同一个原子变量快。前者减少共享写，后者让每次更新都进入一致性协议热路径。
+单线程计数器的成本很容易理解：寄存器里保存当前值，循环里递增，最后写回内存。多线程全局计数器看起来只是把普通加法换成原子加法，但硬件工作已经变了。原子读改写写必须在线性化点上表现得像不可分割操作；处理器不能允许两个核心同时拿着旧值各自加一再覆盖。于是原子变量所在 cache line 需要被某个核心独占修改。下一个核心要修改时，又要拿走这条 line 的修改权。
 
-\topic{MESI 的直觉}
-很多一致性协议都可以用 MESI 直觉理解：Modified 表示本核心有被修改且尚未写回的独占副本，Exclusive 表示本核心有未修改的独占副本，Shared 表示多个核心可以读，Invalid 表示副本无效。当一个核心要写 Shared 行时，需要让其他核心副本失效；当其他核心随后要读，又要重新获取数据。
+注意这里的单位是 cache line，不是变量。一个 8 字节计数器通常落在一条几十字节量级的 line 中；一致性协议管理的是整条 line 的副本状态。若全局计数器非常热，处理器做的算术很少，等待所有权迁移很多。线程数增加后，程序越来越不像并行计算，越来越像许多核心排队修改同一小块内存。
 
-软件看不到这些状态名，但能看到它们的后果。一个只读共享表可以被多个核心同时缓存，扩展性很好；一个频繁更新的共享 head 指针会让 cache line 在核心之间跳来跳去；一个包含多个线程本地字段的结构体如果没有 padding，也会因为 false sharing 触发同样的迁移。
+\topic{原子读改写写的硬件路径}
+原子自增可以拆成三件事：读旧值、计算新值、把新值写回同一地址。普通单线程加法可以让这些动作在核心内部快速完成；多核心共享时，处理器还必须保证没有另一个核心同时改写同一位置。于是原子操作在执行前要让目标 line 进入可修改状态。若这条 line 当前在别的核心处于 Modified，当前核心要等待对方交出或写回最新数据；若多个核心都有 Shared 副本，当前核心要让这些副本失效。只有这些协议动作完成后，核心才能在本地执行加法并写回 cache line。
 
-真实处理器可能使用 MESIF、MOESI 或其他变体，但教学时先抓住一个核心事实：读共享容易扩展，写共享需要取得所有权。Modified 或 Owned 这类状态的具体名称不重要，重要的是写入会触发状态迁移，状态迁移会占用互连和缓存层级资源。高性能并发设计的第一反应，不应该是“换一条更快的原子指令”，而应该是“能不能减少共享写”。
+\begin{lstlisting}[language=C++,caption={原子读改写写的抽象硬件流程}]
+void atomic_fetch_add_like(Address addr, Value delta) {
+  CacheLine line = request_line_with_write_permission(addr);
+  wait_until_other_writers_are_excluded(line);
 
-\begin{lstlisting}[numbers=none]
-read mostly table:
- core0 Shared
- core1 Shared
- core2 Shared
+  Value old_value = line.load(addr.offset());
+  Value new_value = old_value + delta;
+  line.store(addr.offset(), new_value);
 
-hot atomic counter:
- core0 Modified -> core1 Modified -> core2 Modified -> core0 Modified
+  keep_line_in_modified_state_until_evicted_or_requested();
+}
 \end{lstlisting}
 
-上面的文本图表达两种完全不同的共享。前者多个核心一起读，硬件可以复制；后者多个核心轮流写，所有权不断迁移。很多扩展性问题就藏在这条差异里。
+真实硬件会把许多步骤并行化，也会用 store buffer、锁前缀、LL/SC、缓存锁定或内部微操作处理不同 ISA 的细节；但抽象流程保留了关键成本：算术发生在核心里，写权限来自一致性协议。若每条记录都执行一次原子加法，热路径就把协议等待放进了每次循环。把更新改成局部累加，再在阶段边界合并，是把协议等待从高频路径移到低频路径。
 
-\topic{一致性和内存模型的分工}
-缓存一致性解决的是“同一内存位置的多个副本如何保持一致”，内存模型解决的是“不同内存操作之间能被哪些线程以什么顺序观察”。硬件一致性不等于程序自动无数据竞争。没有同步的普通读写仍然可能在 C++ 层面形成未定义行为。
+\begin{systemdiagram}{共享写热点的所有权迁移}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+\node[book title label] at (0,1.45) {时刻 1};
+\node[book title label] at (3.25,1.45) {时刻 2};
+\node[book title label] at (6.5,1.45) {时刻 3};
+\node[book title label] at (9.75,1.45) {时刻 4};
 
-一致性协议通常围绕状态机工作，例如 Modified、Exclusive、Shared、Invalid 这类状态。软件不需要手写这些状态，但必须理解状态迁移的成本：共享读便宜，共享写贵，频繁写同一行最贵。
+\node[book accent node,text width=2.25cm] (a0) at (0,0.55) {core 0\\Modified\\counter line};
+\node[book small node,text width=2.25cm] (a1) at (0,-0.55) {core 1\\Invalid};
+\node[book small node,text width=2.25cm] (a2) at (0,-1.65) {core 2\\Invalid};
 
-C++ 内存模型和硬件一致性的边界也要分清。硬件一致性通常保证同一 cache line 或同一地址的副本最终按协议协调，但 C++ 程序如果对普通变量并发读写而没有同步，语言层面就是数据竞争。语言规则先决定程序是否有定义，硬件规则再决定有定义的同步怎样落地。不要用“我的 CPU 有缓存一致性”来为未同步普通变量辩护。
+\node[book small node,text width=2.25cm] (b0) at (3.25,0.55) {core 0\\Invalid};
+\node[book teal node,text width=2.25cm] (b1) at (3.25,-0.55) {core 1\\Modified\\counter line};
+\node[book small node,text width=2.25cm] (b2) at (3.25,-1.65) {core 2\\Invalid};
+
+\node[book small node,text width=2.25cm] (c0) at (6.5,0.55) {core 0\\Invalid};
+\node[book small node,text width=2.25cm] (c1) at (6.5,-0.55) {core 1\\Invalid};
+\node[book amber node,text width=2.25cm] (c2) at (6.5,-1.65) {core 2\\Modified\\counter line};
+
+\node[book purple node,text width=2.25cm] (d0) at (9.75,0.55) {core 0\\Modified\\counter line};
+\node[book small node,text width=2.25cm] (d1) at (9.75,-0.55) {core 1\\Invalid};
+\node[book small node,text width=2.25cm] (d2) at (9.75,-1.65) {core 2\\Invalid};
+
+\draw[book back arrow] (a0.east) -- node[above,font=\scriptsize\sffamily,text=BookRed] {写权限迁移} (b1.west);
+\draw[book back arrow] (b1.east) -- node[above,font=\scriptsize\sffamily,text=BookRed] {再次迁移} (c2.west);
+\draw[book back arrow] (c2.east) -- node[above,font=\scriptsize\sffamily,text=BookRed] {回到 core 0} (d0.west);
+
+\node[book label,text width=10.8cm] at (4.9,-2.85) {每次 \code{fetch_add} 的算术都很小；真正反复发生的是同一条 cache line 的修改权从一个核心转移到另一个核心。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：热点 atomic 的瓶颈不是加法本身，而是同一条 cache line 的写权限在核心之间迁移。}
+\end{systemdiagram}
+
+\topic{从全局写到局部 partial}
+线程本地 partial 的本质是改变写路径。热循环里，每个 worker 只写自己的计数槽位；全局结果只在阶段边界合并。这样高频写从“所有线程争一条 line”变成“每个线程写自己的 line”。合并仍然有成本，但成本被移到低频阶段，并且可以按 worker、NUMA 节点或树形结构进一步组织。
+
+\begin{lstlisting}[language=C++,caption={从共享写热点到局部 partial 的伪代码}]
+// baseline: 每条记录都写同一个一致性热点
+for (Record r : worker_input) {
+  if (is_error(r)) {
+    global_error_count.fetch_add(1, std::memory_order_relaxed);
+  }
+}
+
+// 改造后：热路径只写本 worker 的局部状态
+std::uint64_t local_error_count = 0;
+for (Record r : worker_input) {
+  if (is_error(r)) {
+    ++local_error_count;
+  }
+}
+worker_partials[worker_id] = local_error_count;
+\end{lstlisting}
+
+\code{memory_order_relaxed} 只能放松原子操作和其他内存操作之间的排序约束，不能让同一条 cache line 同时被多个核心修改。它可能减少屏障类成本，却不会消除一致性所有权迁移。判断一个 atomic 是否合适，不能只看内存序；要问它是否位于热路径、更新频率多高、写者分散到多少核心、是否可以批量或分层合并。
+
+\topic{为什么共享读容易，共享写困难}
+共享读没有破坏副本一致性。core 0、core 1 和 core 2 都读取同一张只读表时，每个核心缓存一份相同 line，后续 load 可以在本地命中。只要没有核心写入，这些副本可以并存。共享写会破坏这个条件：一旦 core 0 写了 line，core 1 的旧副本就不能再被当作最新值。硬件必须在写发生前或写传播时处理其他副本，否则同一地址会在不同核心看到不同新旧值。
+
+这个推导能解释很多工程判断。只读配置快照适合被多个线程共享；偶尔替换配置时，可以用版本指针或阶段切换降低写频率；每个请求都写全局指标，则会把所有核心拉到同一条 line 上。不要把“共享”当作一个词，要分成共享读、低频共享写和高频共享写。
+
+\topic{正确性同步和扩展性结构不是一回事}
+Atomic、mutex 和条件变量首先解决的是程序语义：是否有数据竞争，某个不变量是否被保护，某次发布是否被另一个线程可靠观察。扩展性结构解决的是另一个问题：同一条 cache line 是否被高频写，远端节点是否反复访问同一批页面，合并阶段是否串行化。一个程序可以同步正确但扩展性很差，也可以局部跑得很快但同步语义错误。分析时要把这两层分开。
+
+这条边界会在后面的锁和原子章节继续展开。本章只固定硬件侧事实：同步原语不是魔法。它们必须落到 load、store、原子读改写写、缓存行所有权、store buffer、内存序和等待队列上。低竞争时这些路径很短；高竞争时，锁变量、队列 head/tail、全局状态位和统计计数器都会变成共享写热点。
+
+\topic{共享写的三个等级}
+共享状态可以按写入频率和共享范围分级。第一类是只读共享，例如只读配置表、编码字典、不可变输入块和常量权重。多个核心可以复制这些 line，通常扩展性很好。第二类是低频写共享，例如阶段结束时写一次完成标志、每秒刷新一次指标、偶尔替换配置快照。它需要同步，但不一定主导性能。第三类是高频写共享，例如每条记录更新全局计数器、所有生产者争一个队列 tail、多个 worker 写同一条 line 上的不同字段。这个等级最危险，常见表现是线程数越多越慢。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.36\linewidth}}
+\toprule
+共享等级 & 常见形态 & 首要问题 \\
+\midrule
+只读共享 & 配置、字典、只读输入块 & 代码和数据是否能稳定留在缓存中 \\
+低频写共享 & 完成标志、阶段状态、低频指标 & 同步语义是否清楚，发布和观察是否可靠 \\
+高频写共享 & 热 atomic、全局队列、共享统计数组 & cache line 所有权迁移和互连流量是否支配热路径 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+优化时要先判断共享等级，再选择 mutex、atomic、分片、线程本地、批量提交或分层合并。mutex 保护低频复杂状态可能完全合理；atomic 保护高频热点计数器仍然可能很慢；无锁队列如果所有生产者争同一个 tail，也逃不开一致性流量。
+
+\section{缓存一致性从哪里来}
+
+第 3 章已经说明 cache line 是数据搬运单位。多核心一加入，就多出一个必须回答的问题：若 core 0 和 core 1 都缓存了同一个地址，core 0 写入以后，core 1 还能不能继续读自己的旧副本？如果允许旧副本无限期存在，共享内存程序就会得到混乱结果；如果每次读写都绕过缓存去内存，性能又会崩掉。缓存一致性协议就是在这两个极端之间建立规则：哪些副本有效，谁有权写，写入后其他副本怎样失效或更新。
+
+最重要的推导是：一致性不能按 C++ 对象维护，也不能按变量名维护。硬件只看到物理地址和 cache line。若两个变量落在同一条 line，即使它们属于不同对象、由不同线程独占使用，硬件仍把它们当作同一个一致性单位。这就是 false sharing 的根。
+
+\topic{一致性要解决的最小反例}
+先不用任何协议名，只看一个两核心反例。内存中 \code{x=0}。core 0 读 \code{x}，把包含 \code{x} 的 line 放入自己的 cache；core 1 也读 \code{x}，也缓存一份。现在 core 0 写 \code{x=1}。如果 core 1 继续读自己的旧副本，就会得到 0；如果 core 0 的写必须立刻穿透到内存并清理所有缓存，单核写性能会被远端内存拖垮。一致性协议必须同时满足两件事：读多时允许副本存在，写时又能让旧副本失效或得到更新。
+
+\begin{lstlisting}[numbers=none,caption={没有一致性规则时的反例}]
+initial memory: x = 0
+
+core 0 loads x -> caches line X, sees 0
+core 1 loads x -> caches line X, sees 0
+core 0 stores x = 1 in its cached copy
+core 1 loads x from its old cached copy
+
+without coherence:
+  core 1 may keep seeing 0 forever
+\end{lstlisting}
+
+真实程序当然还要受语言内存模型约束。这里的反例只解释硬件为什么要维护 line 状态。没有一致性，普通共享内存就无法提供“同一地址的写最终能被其他核心观察到”的基础；有了一致性，普通无同步读写仍可能在 C++ 层面成为数据竞争。两个层次不能混。
+
+\topic{为什么粒度只能粗到 cache line}
+硬件理论上可以按字节维护一致性，但成本会过高。每个 cache line 已经是缓存标签、有效位、脏位、替换和互连传输的单位；若按每个变量维护状态，硬件就需要理解语言对象边界、结构体字段、分配器布局和类型别名，这不现实。按 line 维护一致性，是硬件复杂度和空间局部性之间的取舍。代价就是 false sharing：软件语义上不共享，硬件粒度上仍共享。
+
+这条推导直接影响结构体布局。把多个 worker 的高频计数放在相邻数组元素里，源码上看每个 worker 独占自己的元素；硬件上它们可能同属一条 line。把一个锁、一个统计计数、一个队列 head 和一个取消标志塞进同一结构体，低频字段也可能被高频字段拖进所有权迁移。布局审查必须标出每个字段的写者和频率，而不仅是字段含义。
+
+\topic{MESI 的直觉}
+许多协议可以用 MESI 直觉入门。Modified 表示当前核心有被修改且尚未写回的独占副本；Exclusive 表示当前核心有未修改的独占副本；Shared 表示多个核心可以读；Invalid 表示副本无效。一个核心想写 Shared line，需要先取得独占或修改权限，并让其他核心副本失效。其他核心随后再读，就要重新获取有效副本。
+
+真实处理器可能使用 MESIF、MOESI 或更复杂的变体，也可能在不同缓存层级使用不同优化。软件不需要背完所有状态名，但必须抓住状态迁移的成本：共享读容易扩展，共享写需要协调所有权，频繁写同一条 line 最贵。Modified、Owned、Forward 这些状态名称的差异会影响具体路径，不改变这条基本判断。
+
+\topic{为什么不每次都写回内存}
+如果每个 store 都立刻写到内存，再让其他核心从内存读最新值，一致性看起来会简单，但性能会非常差。内存比 L1/L2 缓存远得多，内存控制器带宽也有限；每次写都外推到内存，会让热循环被最慢路径支配。Modified 状态存在的意义，就是允许一个核心在拥有 line 的修改权时多次本地写入，等 line 被替换或其他核心请求时再向外传播。这样单核心或线程私有写非常快，代价是共享写必须通过协议协调所有权。
+
+这也解释了 per-core、per-thread、per-NUMA 结构为什么常见。它们不是为了让代码看起来复杂，而是让热写长期停留在一个核心或一个较近范围内，避免每次操作都把状态推出去协调。
+
+\begin{lstlisting}[numbers=none,caption={MESI 直觉下的两类共享}]
+read-mostly table:
+  core0 Shared
+  core1 Shared
+  core2 Shared
+
+hot counter:
+  core0 Modified -> core1 Modified -> core2 Modified -> core0 Modified
+\end{lstlisting}
+
+这段文本图的重点不在状态名，而在共享形态。只读表可以同时停留在多个核心的缓存里；热点计数器只能让写权限轮流移动。很多性能问题就藏在这条差异里。
+
+\topic{状态迁移账本：读、写、再读}
+把 MESI 直觉写成账本，比记状态名更有用。假设 core 0 和 core 1 轮流访问同一条 line：
+
+\begin{lstlisting}[numbers=none,caption={同一条 line 的状态迁移账本}]
+step 1: core 0 reads line X
+  core 0: Exclusive or Shared
+  core 1: Invalid
+
+step 2: core 1 reads line X
+  core 0: Shared
+  core 1: Shared
+
+step 3: core 0 writes line X
+  core 0 requests write ownership
+  core 1's Shared copy becomes Invalid
+  core 0: Modified
+
+step 4: core 1 writes line X
+  core 1 requests write ownership
+  core 0 must supply or write back the latest data
+  core 0: Invalid
+  core 1: Modified
+\end{lstlisting}
+
+这个账本解释了扩展曲线。只读阶段，副本可以扩散，多个核心本地命中；写阶段，写权限只能被一个核心持有；轮流写阶段，所有权反复迁移。高频 atomic、短临界区锁、共享队列 tail、false sharing 计数槽，都容易落入第四步的循环。
+
+\topic{一致性不保证立即全局同时可见}
+一致性保证同一地址的副本受规则约束，不等于每个 store 在同一时刻被所有核心同时看到。store buffer、写回、失效确认、内存序和编译器重排都会影响程序能否把多个地址的更新当作一个有序协议。一个核心写 \code{data} 再写 \code{flag}，另一个核心看到 \code{flag} 后是否一定看到 \code{data}，需要 release/acquire、锁或其他同步关系来保证。硬件一致性是地基，语言同步是协议。
+
+这个区别非常关键。第四章解释为什么共享写慢；第十一章解释怎样让共享状态有定义、可证明。若只学一致性，容易写出数据竞争；若只学原子 API，容易忽略 cache line 迁移。正确系统同时满足两件事：语义上有 happens-before，结构上没有把高频路径压到同一条 line。
+
+\topic{False sharing 是布局层面的共享写}
+False sharing 指的是软件层面没有共享同一个变量，硬件层面却共享同一条 cache line。最容易出错的例子是每线程计数槽位数组：\code{partials[0]} 由 worker 0 写，\code{partials[1]} 由 worker 1 写，源码上看互不干扰；如果两个槽位相邻并落在同一条 line，上述写入仍会让同一条 line 的所有权在核心之间迁移。
+
+\begin{lstlisting}[language=C++,caption={按 cache line 隔离高频写槽位的形态}]
+struct alignas(64) WorkerCounter {
+  std::uint64_t value = 0;
+  std::byte padding[64 - sizeof(std::uint64_t)] {};
+};
+
+std::vector<WorkerCounter> counters(worker_count);
+\end{lstlisting}
+
+Padding 不是默认答案。它增加对象大小，降低缓存容量利用率，扩大合并阶段扫描的字节数，也可能增加 TLB 压力。只有被不同线程高频写的字段才值得隔离；只读字段、低频状态、同一线程访问的热字段不应被无意义地填满整条 line。布局判断要看写者、频率、共享范围和对象数量。
+
+\topic{一致性和 C++ 内存模型的分工}
+硬件一致性解决的是“同一内存位置的多个缓存副本怎样协调”。C++ 内存模型解决的是“哪些跨线程访问有定义，哪些同步建立 happens-before，哪些原子操作提供怎样的排序”。二者不能互相替代。普通变量被多个线程无同步读写，即使底层 CPU 有缓存一致性，C++ 层面仍然是数据竞争。反过来，把操作改成原子，只能修复数据竞争和同步语义，不保证这个共享位置能扩展到很多核心。
+
+因此不能用“CPU 有一致性”来为未同步普通变量辩护，也不能用“我用了 atomic”来推断性能良好。语言规则先决定程序是否有定义，硬件规则再决定有定义的同步怎样落到缓存、互连和等待路径上。
 
 \topic{Store buffer 和可见性}
-核心执行 store 后，写入可能先进入 store buffer。对本线程来说，后续 load 可能通过 store forwarding 看到自己的写；对其他核心来说，这个写何时可见还受缓存一致性和内存序约束影响。锁释放、release store 和内存屏障会把这种可见性变成可依赖的同步关系。
+核心执行 store 后，写入可能先进入 store buffer。对本线程来说，后续 load 可能通过 store forwarding 看到自己的写；对其他核心来说，这个写何时可见还要经过缓存一致性和内存序约束。释放锁、release store 和内存屏障会把这种可见性变成可依赖的同步关系。
 
-这就是为什么“我在写 flag 前已经写了 data”在并发中不够。编译器和硬件都可能在允许范围内重排或延迟可见性。正确发布对象需要用 release/acquire、mutex 或其他同步机制建立 happens-before。
+这解释了为什么“我先写 data，再写 flag”在并发中不够。编译器和硬件都可能在允许范围内重排或延迟可见性。正确发布对象要用 mutex、release/acquire、condition variable 或其他同步机制建立明确关系。性能分析时也要记住：锁释放不是普通 store，获取锁也不是普通 load；它们都可能要求某条 cache line 的最新状态，并在竞争时等待所有权迁移。
 
-Store buffer 还会影响锁的性能。释放锁时，持锁线程在临界区内的写入必须以满足同步语义的方式对后续拿锁线程可见。获取锁时，线程可能需要等待锁所在 cache line 的最新状态。低竞争时这条路径很短；高竞争时，锁变量所在 cache line 会成为所有核心争夺的热点。锁的成本不是一个固定常数，而是竞争、拓扑和写入路径共同决定的结果。
+\topic{锁变量和队列元数据也是一致性对象}
+一个 mutex 内部会有原子状态、等待队列和可能的 futex 系统调用。低竞争时，获取和释放可能主要发生在用户态，成本较低；高竞争时，锁状态所在 line 会在核心之间移动，等待线程可能进入内核睡眠和唤醒。临界区很短但竞争极高时，锁变量本身的所有权迁移可能主导；临界区很长时，等待时间和调度开销可能主导。
 
-\section{从页面位置到拓扑感知}
+队列也类似。生产者主要写 tail 和槽位状态，消费者主要写 head；如果 head、tail、size 和高频统计字段挤在同一条 line，不同角色会互相干扰。SPSC ring 通常把 head 和 tail 分开对齐；MPMC 队列还会给每个槽位序号，减少集中争用。结构体布局不是装饰，而是把不同写者和不同频率的字段映射到合适的硬件单位。
 
-NUMA 机器上，内存离某些核心更近。线程在节点 A 上运行，却频繁访问节点 B 分配的内存，会产生远端访问。Linux 的 first-touch 策略让首次触碰页面的线程影响页面放置，因此并行初始化和线程绑定会影响后续计算性能。
+\section{互连：所有权消息走在哪里}
 
-NUMA 优化的基本原则是让计算靠近数据。大数组按块分给线程时，初始化也应按相同块并行完成。跨节点共享队列和全局分配器要谨慎，因为它们可能把远端访问和同步争用叠加在一起。
+当一个核心发现自己没有某条 line 的写权限时，它必须向别处请求。请求可能到达共享缓存、目录、拥有者核心或内存控制器；其他副本可能收到失效消息；拥有者可能提供最新数据；目录可能更新 sharer 集合。软件不会直接调用“互连”，但互连会出现在 cache line 迁移、远端内存访问、跨 socket 锁竞争、共享 LLC 争用和 I/O 路径上。
 
-NUMA 不只出现在多 socket 服务器上。有些桌面和移动平台也有非均匀的缓存、内存或芯片let 拓扑，只是操作系统暴露方式不同。教材里使用 NUMA 这个词，是为了让读者形成拓扑意识：核心不是一个无差别集合，内存也不是一个无差别池。线程、数据和 I/O 设备之间的位置关系会影响成本。
+小规模系统可以用广播窥探的直觉理解：一个核心要写某条 line，就通知其他核心检查自己是否有副本，并让副本失效。核心数量增加后，纯广播会变贵，因为每次写请求都可能触达许多参与者。于是很多系统使用目录式信息，记录某条 line 可能在哪些核心或节点有副本，再有针对性地发送消息。真实实现很复杂，但软件层面的结论非常朴素：共享范围越大，维护一致性的通信越难便宜；写者越分散，所有权迁移越频繁。
 
-\topic{First-touch 和并行初始化}
-Linux 常见 first-touch 策略意味着页面通常分配到第一次写入它的线程所在 NUMA 节点。如果主线程单线程初始化一个大数组，然后工作线程分布在多个节点上处理这个数组，很多工作线程可能访问远端内存。更好的方式是让每个工作线程初始化自己后续要处理的分块。
+\begin{lstlisting}[numbers=none,caption={一次写权限请求的消息形态}]
+core A wants to write line X
+  -> send Read-For-Ownership request for X
+directory or snoop fabric finds sharers/owner
+  -> invalidate shared copies, or request owner to supply data
+other cores acknowledge invalidation
+  -> core A receives writable copy
+core A stores new bytes and holds Modified ownership
+\end{lstlisting}
 
-这条规则在 benchmark 中尤其重要。若初始化方式和计算方式不一致，测到的可能是内存放置错误，而不是算法本身。实验报告必须记录初始化策略、线程绑定和 NUMA 策略。
+这段流程故意没有写具体厂商协议名。不同处理器会在缓存层级、目录位置、响应合并和数据转发上做大量优化，但软件能依赖的判断是稳定的：一次写热点不是单个核心内部事件，而是可能涉及请求、失效、确认、数据转发和目录更新。若写者在多个 socket 间来回切换，这些消息就会走更远路径。
 
-\topic{互连不是无限带宽}
-核心、缓存、内存控制器和 I/O 设备之间的互连带宽有限。一个程序即使单线程局部性很好，多线程扩展后也可能撞上内存带宽或互连带宽上限。此时继续增加线程，只会让每个线程分到更少带宽，吞吐不再提高。
+\topic{环、mesh 和 socket 间链路}
+多核心处理器内部可以使用环形互连、mesh 网络或其他片上网络连接核心、缓存切片、目录和内存控制器。单 socket 内部已经不是“零距离”；多 socket 还会通过 UPI、Infinity Fabric 或类似链路连接。不同平台名称不同，基本成本模型相同：消息要在拓扑中走路径，占用带宽，经历排队，并可能经过多个中间结构。
 
-互连瓶颈常常表现为“每个线程单独跑都快，一起跑就都慢”。原因可能是多个核心争用同一内存控制器，多个 socket 之间远端访问过多，或者共享写导致 cache line 在互连上来回移动。排查时要把线程数、绑定位置、数据放置和访问模式作为实验矩阵，而不是只改算法代码。
+这就是为什么一个全局队列在四核心开发机上看不出问题，在双 socket 服务器上可能突然变差。四核心机器上，head/tail 的 line 迁移还勉强能承受；跨 socket 后，每次迁移都可能穿过更远链路，延迟和带宽成本都更高。工程结论不能只来自最小机器上的正确性测试，还要在目标拓扑上观察扩展曲线。
 
-\section{从拓扑记录到分层资源管理}
+\topic{目录协议的工程影响}
+目录协议维护某条 line 的副本位置或所有权信息。软件不需要实现目录协议，却要理解它给程序留下的影子：把数据保持私有，成本最低；在一个 core group 或 socket 内共享，成本较低；跨 socket 高频写共享，成本高；跨机器共享，成本更高。线程本地 partial、per-NUMA partial、socket 内合并、跨 socket 合并、跨机器 reduce，就是把这个成本阶梯显式写进算法。
 
-拓扑感知不是过早优化，而是避免把硬件当作平面资源池。线程池可以按 NUMA 节点分组，内存池可以按节点分配，队列可以按生产者或消费者分片，归约可以先在 socket 内合并再跨 socket 合并。这样的层次化设计和分布式系统中的本地聚合很像：先减少近处流量，再把少量结果发到远处。
+这个阶梯还能解释许多数据结构选择。全局 hash table 如果所有线程争同一组 bucket，热点 line 会集中；分片 hash table 把写者分散到多个 shard，但全局快照和 rehash 变复杂；全局 MPMC 队列简单，但 head/tail 容易成为热点；本地队列加工作窃取让高频路径局部化，低频失衡才访问远处。所谓“更高级”的数据结构并不一定更快，关键是它是否减少了高频共享写和远距离通信。
 
-\topic{Linux 观察入口}
-在 Linux 上，拓扑可以从 \cmd{lscpu}、\filepath{/sys/devices/system/cpu/}、\filepath{/sys/devices/system/node/} 和 \cmd{numactl --hardware} 开始观察。线程绑定可以用 \cmd{taskset}、\cmd{numactl --physcpubind} 或程序内亲和性 API。内存策略可以用 \cmd{numactl --membind}、\cmd{numactl --interleave} 和 first-touch 实验观察。若权限允许，\cmd{perf c2c} 可以帮助识别 cache-to-cache 流量，\cmd{perf stat} 的 cache、LLC、context-switch 和迁核指标也能提供间接证据。
+\topic{互连上的数据和权限是两类流量}
+一次远端读取大数组，主要传输的是数据字节；一次共享写热点，传输的不只是数据，还有权限和失效消息。二者都会占用互连，却有不同表现。只读流式扫描可能随着线程数增加撞上带宽上限；热点原子可能在数据字节很少的情况下仍然扩展很差，因为每次修改都要重新安排所有权。看到“处理的数据不大但很慢”时，尤其要怀疑共享写，而不是只看内存带宽。
 
-源码阅读可以从调度拓扑、NUMA 策略和内存分配路径切入。不要试图一次看完整调度器或完整内存管理。更好的问题是：线程迁移时哪些状态会变化，first-touch 影响页面放置的路径在哪里，NUMA 策略怎样被记录和查询，某个 benchmark 的现象能不能从这些路径得到合理解释。
+\topic{内存控制器带宽也是共享资源}
+互连成本不只来自一致性消息。内存控制器本身也有带宽上限。若所有线程都扫描同一内存节点上的大数组，即使核心分布在多个节点，数据仍从少数控制器出来；线程数增加后，总吞吐可能到顶，每线程吞吐下降。此时继续增加线程只会让每个线程分到更少带宽。
 
-\topic{层次化归约案例}
-并行归约是理解拓扑的好例子。最差设计是所有线程对同一个原子变量累加。改进设计是每个线程写自己的 partial，最后一个线程合并。进一步的拓扑感知设计是每个核心或每个 worker 先本地累加，每个 NUMA 节点内再合并，最后跨节点合并。这样做减少共享写，也减少远端通信。
+带宽饱和有时和共享写很像：线程数增加后曲线停住。但修复方向不同。共享写热点要分片、局部化或批量合并；带宽饱和要减少搬运字节、改善局部性、压缩数据、分散到多个控制器或承认机器资源已经到顶。实验必须把只读扫描、局部写、共享写和合并阶段分开测，不能把所有扩展失败都归因于“线程太多”。
 
-这个结构和分布式计算中的树形聚合完全一致。不同只是成本单位变化：单机里远处是另一个 NUMA 节点，分布式里远处是另一台机器。理解这条相似性，可以帮助读者把第二册前后内容串起来。
+\topic{互连瓶颈的表现}
+互连或控制器瓶颈常见表现是“每个线程单独跑都快，一起跑都慢”。可能原因包括多个核心争同一内存控制器、跨 socket 远端访问过多、共享写导致 line 在互连上来回移动、多个任务争同一共享 LLC 切片或设备路径。排查时要把线程数、绑定位置、数据放置、访问模式、共享写位置和合并阶段做成实验矩阵。
 
-\topic{一致性流量的三个等级}
-共享内存程序里的数据共享可以分成三个等级。第一个等级是只读共享，例如配置表、只读索引、常量权重、不可变输入数组。多个核心可以同时缓存这些数据，扩展性通常很好。第二个等级是低频写共享，例如阶段结束时写一次完成标志、每秒汇总一次指标、偶尔替换一份配置快照。它需要同步，但不一定成为瓶颈。第三个等级是高频写共享，例如所有请求更新同一个原子计数器、所有 worker 争用同一个队列 tail、多个线程反复写同一 cache line 上的不同字段。这个等级最危险，往往表现为核心数越多越慢。
+\begin{center}
+\begin{tabular}{p{0.25\linewidth}p{0.33\linewidth}p{0.31\linewidth}}
+\toprule
+现象 & 可能原因 & 需要的对照 \\
+\midrule
+全局 atomic 随线程数变慢 & 同一 line 所有权迁移 & per-worker partial、padding、低频批量提交 \\
+只读大数组到某线程数后停住 & 内存带宽或控制器饱和 & 改变数据规模、节点放置、线程绑定 \\
+绑定后波动变小但均值不变 & 调度迁移是噪声，不是主瓶颈 & 记录迁移次数、分段计时 \\
+最终合并时间很长 & 串行远端读或合并树不合适 & 节点内合并、树形合并、合并字节统计 \\
+\bottomrule
+\end{tabular}
+\end{center}
 
-优化时要先判断共享等级，而不是先决定使用 mutex、atomic 还是无锁结构。mutex 保护低频复杂状态可能完全合理；atomic 保护高频热点计数器仍然可能很慢；无锁队列如果所有生产者都争用同一个 tail，也逃不开一致性流量。把共享写变成分片写、批量写、线程本地写或按 NUMA 节点写，通常比替换同步原语更根本。
+\section{NUMA：内存不是无位置的池}
 
-这也是第二册区分“正确性同步”和“扩展性设计”的原因。正确性同步回答的是数据竞争、可见性和不变量；扩展性设计回答的是共享写频率、cache line 迁移和拓扑距离。一个程序可以同步正确但扩展性很差，也可以局部很快但同步语义错误。高质量系统必须同时满足二者。
+NUMA 是 Non-Uniform Memory Access，意思是不同核心访问不同内存节点的成本不一样。最常见的服务器形态是每个 socket 或 die 连接自己的内存控制器和一部分物理内存；本 socket 核心访问本地内存延迟更低、带宽更高，访问其他 socket 的内存要经过互连。某些 chiplet、工作站、云实例和大型桌面平台也会呈现非均匀拓扑，只是操作系统暴露方式不同。
 
-\topic{目录协议和窥探协议的直觉}
-一致性协议在小规模系统中可以用广播窥探思想理解：一个核心想写某条 cache line，就向其他核心广播或通过互连通知，让其他副本失效。核心数量增加后，纯广播会变贵，因此很多系统使用目录式信息，记录某条 cache line 可能在哪些核心或节点有副本，再有针对性地发送消息。具体实现非常复杂，但软件层面的直觉很简单：共享范围越大，维护一致性的通信越难便宜。
+NUMA 不是“内存慢一点”的口号，而是页面有物理归属。虚拟地址由页表映射到物理页；物理页来自某个节点的内存。线程在 node 0 上运行，却频繁访问 node 1 的页面，就会产生远端访问。若所有页面都集中在 node 0，node 1 上的核心再多，也可能被远端链路和 node 0 内存控制器限制。
 
-这条直觉能解释为什么“全局共享结构”在小机器上看不出问题，在大机器上突然变差。四核心机器上，一个全局队列的 cache line 迁移还勉强能承受；多 socket 服务器上，迁移可能跨互连和 NUMA 节点，延迟和带宽成本都更高。工程设计不能只在开发机上看正确性测试通过，还要在目标拓扑上看扩展曲线。
+\topic{First-touch 从缺页路径推导出来}
+Linux 常见策略是 first-touch：页面通常在第一次实际写入或缺页分配时落到触碰它的 CPU 所在 NUMA 节点。调用 \code{malloc} 或 \code{reserve} 往往只获得虚拟地址范围，不一定立刻分配物理页。第一次写入触发缺页，内核选择物理页。于是初始化代码不再是无关准备工作，它决定页面最初属于哪个节点。
 
-目录和窥探的差别不需要读者背协议细节，但要形成层次化思维。让数据只在一个核心私有，成本最低；让数据在一个 socket 内共享，成本较低；让数据跨 socket 高频写共享，成本高；让数据跨机器共享，成本更高。线程本地 partial、socket 内合并、跨 socket 合并、跨机器 reduce，就是把这个成本阶梯显式写进算法。
+若主线程在 node 0 上单线程初始化一个大数组，页面可能集中在 node 0。随后 worker 分布到 node 0 和 node 1 处理这个数组，node 1 上的 worker 就要远端访问。更好的实验版本是让每个 worker 初始化自己后续要处理的块，并在计算阶段使用同样的 worker-to-range 映射。这样页面归属和热访问者一致，多个内存控制器也能共同工作。
 
-\topic{内存控制器和带宽饱和}
-NUMA 节点通常连接自己的内存控制器。一个节点上的线程大量访问本地内存，会消耗本地控制器带宽；远端访问则需要经过互连到另一个节点的内存控制器。若所有线程都访问一个节点上的内存，即使 CPU 核心分布在多个节点上，带宽也可能集中压在一个控制器上。此时线程数增加，吞吐未必提高，因为瓶颈不是核心数量，而是某个内存节点的带宽。
+\begin{lstlisting}[language=C++,caption={first-touch 缺页放置的抽象流程}]
+PhysicalPage resolve_write_fault(Thread t, VirtualPage vp) {
+  VmaPolicy policy = lookup_memory_policy(vp);
+  NumaNode preferred = policy.preferred_node_or(t.current_cpu.node);
 
-first-touch 实验的价值就在这里。主线程初始化全部页面，可能让所有页面落在一个 NUMA 节点；worker 分布到多个节点计算时，远端访问集中出现。按 worker 分块初始化，可以让页面分散到各自节点，使多个内存控制器共同工作。若实验显示 parallel first-touch 版本带宽更高，就说明优化来自页面放置和控制器并行，而不是加法本身改变。
+  PhysicalPage page = allocate_page_from(preferred);
+  map_virtual_page_to_physical_page(vp, page);
+  return page;
+}
+\end{lstlisting}
 
-带宽饱和也有反直觉现象。使用更多线程可能让总吞吐略增，但每线程吞吐下降；使用 SMT 可能让内存延迟隐藏更好，也可能只增加争用；把线程平均分到两个节点可能提高总带宽，也可能因为跨节点合并阶段变慢。结论必须来自实验矩阵，不应写成固定经验。
+这段伪代码省略了 VMA、页表锁、透明大页、回收、迁移和安全检查，但保留了实验最关心的因果：第一次写入发生在哪个执行位置，会影响物理页面来自哪个节点。主线程清零、worker 本地初始化、交错分配和显式 membind，都会通过这条路径改变后续访问距离。
 
-\topic{拓扑感知队列}
-队列是互连成本的集中点。一个全局 MPMC 队列很容易成为共享写热点：所有生产者争用 tail，所有消费者争用 head 或槽位状态。低线程数下它简单好用，高线程数下它可能把所有 worker 绑在一组 cache line 上。拓扑感知设计通常会拆成多级队列：每个 worker 或每个 NUMA 节点有本地队列，只有负载不均时才访问其他队列。
+\begin{lstlisting}[numbers=none,caption={NUMA 实验的阶段分解}]
+allocate virtual address range
+bind workers or record actual CPU placement
+initialize pages by the worker that will later use the range
+warm up if the experiment needs warm cache or stable placement
+compute with the same worker-to-range mapping
+merge worker partials by node, then merge node results
+\end{lstlisting}
 
-线程池的工作窃取就是这个思想。worker 优先使用本地 deque，空闲时才偷别人的任务。NUMA 感知线程池还可以先在同节点 worker 中窃取，再跨节点窃取。这样做不是为了复杂而复杂，而是为了让高频路径局部化、低频路径承担远端成本。
+\topic{线程绑定和 first-touch 是两件事}
+线程绑定约束执行位置；first-touch 影响页面归属。绑定线程不会自动移动页面，移动页面也不会自动固定线程。一个实验若只绑定线程，却让主线程初始化所有数据，仍然可能让远端访问进入热循环。反过来，只做并行初始化但计算时线程被调度到其他节点，也会破坏局部性。
 
-有界队列的背压也要考虑拓扑。若所有生产者把任务推到单个队列，队列满时所有生产者都等待同一个条件变量，唤醒和竞争集中；若每个分片有自己的队列，热点分片仍会背压，但无关分片可以继续执行。分片设计会增加任务路由和负载均衡复杂度，因此要先测出全局队列确实是瓶颈，再拆分。
+绑定的价值首先是减少变量。未绑定运行可能因为调度迁移导致样本波动；绑定后更容易解释线程和数据位置。但绑定也可能伤害系统：把多个 heavy worker 绑到同一核心或同一 LLC 组会变慢；容器、云实例或手机环境可能限制可用 CPU；长期固定大核可能引发频率和温度变化。实验报告要写绑定策略、可见 CPU mask 和失败时的降级，而不是把“绑定”写成绝对好事。
 
-\topic{Linux NUMA 策略和迁移}
-Linux 提供多种 NUMA 相关策略：默认 first-touch、按节点绑定、交错分配、自动 NUMA balancing 等。自动机制可以在一般场景改善局部性，但它不是性能实验的替代品。自动迁移页面本身有成本，统计窗口和迁移决策也可能与 benchmark 生命周期不匹配。短时间 benchmark 尤其容易受到初始化策略影响。
+\topic{自动 NUMA balancing 是隐藏变量}
+Linux 自动 NUMA balancing 会采样页面访问，并可能把页面迁移到更常访问它的节点。它能改善一些长期运行程序，但也会引入额外 page fault、页面迁移成本和实验不确定性。短 benchmark 可能还没等自动机制收敛就结束；长服务可能在负载变化时发生页面迁移。
 
-用户态实验应记录三类信息。第一，线程位置：线程是否绑定，绑定到哪些 CPU，是否发生迁移。第二，页面位置：是否通过 first-touch、membind 或 interleave 控制，是否能观测各节点内存使用。第三，访问形状：线程是否主要访问本地分块，是否有跨节点共享写，合并阶段是否集中到一个节点。只记录 \cmd{numactl --hardware} 不够，必须把拓扑和程序行为联系起来。
+做可控实验时，要记录自动 NUMA balancing 是否启用；若使用 \cmd{numactl}、线程绑定和明确 first-touch，就要说明这些策略是否真正生效。评估生产行为时，则应在接近真实配置下运行，并把自动迁移视为系统的一部分。关键不是永远关闭或永远依赖自动机制，而是不要让它成为看不见的变量。
 
-源码阅读可以围绕 \filepath{mm/mempolicy.c}、NUMA balancing 相关路径和调度拓扑展开。不要试图一次读懂所有内存管理。合格阅读报告应选择一个问题，例如“为什么主线程初始化会影响页面节点”，然后追踪 VMA 策略、缺页处理和页面分配之间的关系。
+\topic{大小核、容器和虚拟化的边界}
+手机常见大小核，服务器常见 NUMA。二者都意味着执行资源不均匀，但原因不同。大小核是核心性能和能耗不同，同一内存访问拓扑未必像多 socket 那样分节点；NUMA 是内存位置和访问成本不同，核心本身可能同构。线程数增加后变慢，可能是小核加入、频率下降、温度限制、调度迁移或远端内存，不能直接归因于 NUMA。
 
-\topic{C++ 接口如何表达拓扑}
-C++ 标准库不直接暴露 NUMA 拓扑，但工程代码可以在接口层表达位置意识。例如线程池可以接收 worker 拓扑描述；内存池可以按节点创建 arena；任务可以带有 preferred node；归约可以返回分层 partial；队列可以按 shard id 提交。接口不需要一开始绑定某个 Linux API，但要给后续拓扑策略留下位置。
+容器和云环境也会改变可见拓扑。cgroup 可能限制 CPU 集合、CPU 配额、内存节点和性能计数器权限；\code{std::thread::hardware_concurrency} 看到的数量未必等于实际可用核心数；\cmd{numactl --hardware} 可能不可用或只显示虚拟化后的视图。实验输出至少要记录可见 CPU 数、cpuset、worker 数、是否能读 \filepath{/sys/devices/system/node/}，以及哪些结论无法在当前设备验证。
 
-下面是一个概念性的任务描述。
+\section{把拓扑写进算法：分层 partial 和本地优先}
+
+从全局计数器改成线程本地 partial，解决的是共享写热点；从线程本地 partial 改成按 NUMA 节点分层合并，解决的是远端合并和页面归属。算法结构自然长成三层：worker 本地处理，节点内合并，跨节点合并。这个结构和分布式系统中的 local combine、node-level reduce、global reduce 是同一条思想，只是“远处”的尺度不同：单机里远处是另一个 NUMA 节点，集群里远处是另一台机器。
+
+\begin{lstlisting}[language=C++,caption={分层归约的抽象伪代码}]
+for (Worker w : workers) {
+  w.partial = compute_local_partial(w.input_range);
+}
+
+for (Group g : topology.groups) {
+  g.partial = merge_partials(g.workers);
+}
+
+Result result = merge_group_partials(topology.groups);
+\end{lstlisting}
+
+这段伪代码看起来简单，真正的设计点在数据归属。第一层要求 worker partial 由 worker 高频写；第二层要求同 group 的 partial 尽量在本地合并；第三层只处理压缩后的 group partial。若第一层 partial 全由主线程分配并触碰，页面可能已经错位；若第二层合并线程跑到远端 CPU，本地合并也会变成远端访问；若第三层合并数据很大，说明前两层没有充分压缩。
+
+\begin{systemdiagram}{NUMA 分层归约}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+\node[book lane,minimum width=5.0cm,minimum height=2.55cm] (n0) at (2.35,0) {};
+\node[book lane,minimum width=5.0cm,minimum height=2.55cm] (n1) at (8.15,0) {};
+\node[book title label] at (0.15,1.08) {NUMA node 0};
+\node[book title label] at (5.95,1.08) {NUMA node 1};
+
+\node[book small node,text width=1.45cm] (w0) at (0.55,0.35) {worker 0\\partial};
+\node[book small node,text width=1.45cm] (w1) at (2.35,0.35) {worker 1\\partial};
+\node[book small node,text width=1.45cm] (w2) at (4.15,0.35) {worker 2\\partial};
+\node[book teal node,text width=2.0cm] (p0) at (2.35,-0.85) {node partial 0};
+
+\node[book small node,text width=1.45cm] (w3) at (6.35,0.35) {worker 3\\partial};
+\node[book small node,text width=1.45cm] (w4) at (8.15,0.35) {worker 4\\partial};
+\node[book small node,text width=1.45cm] (w5) at (9.95,0.35) {worker 5\\partial};
+\node[book amber node,text width=2.0cm] (p1) at (8.15,-0.85) {node partial 1};
+
+\node[book purple node,text width=2.35cm] (global) at (5.25,-2.65) {global result\\低频跨节点合并};
+
+\draw[book strong arrow] (w0) -- (p0);
+\draw[book strong arrow] (w1) -- (p0);
+\draw[book strong arrow] (w2) -- (p0);
+\draw[book strong arrow] (w3) -- (p1);
+\draw[book strong arrow] (w4) -- (p1);
+\draw[book strong arrow] (w5) -- (p1);
+\draw[book back arrow] (p0) -- (global);
+\draw[book back arrow] (p1) -- (global);
+
+\node[book label,text width=10.8cm] at (5.25,-3.75) {热循环只写 worker partial；节点内先合并大量局部结果；跨节点阶段只移动少量摘要。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：分层归约把高频写留在近处，把远端通信压缩到低频摘要合并。}
+\end{systemdiagram}
+
+\topic{合并树改变的不只是速度}
+全局 atomic 的读取很简单：load 一个值即可。拆成 partial 后，读取全局值需要合并多个槽位；运行中展示进度时，可能只能得到近似快照。若业务要求严格单调、严格实时的全局进度，就要定义读取协议。优化不会只改变性能，也会改变可见状态的语义。
+
+浮点归约还会改变数值顺序。线程本地 partial、树形合并和 NUMA 分层会以不同顺序相加，浮点舍入误差可能不同。整数计数通常没有这个问题；浮点求和要写清误差合同、固定合并树或使用补偿求和。系统优化不能偷偷改变语义。
+
+\topic{队列的本地优先设计}
+全局 MPMC 队列常成为跨节点热点。所有生产者争 tail，所有消费者争 head 或槽位状态；队列锁、head/tail 和统计字段可能在节点之间迁移。拓扑感知线程池通常会拆成本地队列或节点队列：worker 优先从自己的 deque 取任务，空闲时先在同节点窃取，再跨节点窃取。这样高频路径局部化，低频失衡才付远端成本。
+
+本地优先不是越强越好。若任务粒度极小，频繁窃取会放大调度成本；若负载高度不均，过度坚持本地会让部分 worker 空闲；若任务访问的数据没有位置偏好，全局队列可能足够简单。设计要通过队列长度、窃取次数、远端执行次数、任务耗时分布和合并阶段来判断，而不是凭口号拆队列。
+
+\topic{分片锁和分片表}
+哈希表、计数表和状态表可以用 shard 降低协调粒度。每个 shard 有自己的锁、局部桶和统计字段，线程只竞争相关 shard。这样减少一致性流量，但引入跨 shard 操作复杂性：全局快照、关闭、rehash、迁移 key 和一致性提交都可能需要阶段协议。
+
+Shard 太少，竞争仍高；shard 太多，内存和遍历成本上升；key 倾斜会让某个 shard 仍然热点。报告要记录每个 shard 的请求分布、最大 shard 负载、锁等待时间和跨 shard 操作次数。只看总吞吐会掩盖局部热点。
+
+\topic{内存池和远端释放}
+NUMA 不只影响分配，也影响释放。对象在 node 0 分配，由 node 1 释放，分配器元数据和对象 line 可能在节点间移动。高性能分配器常使用线程本地或节点本地缓存，但跨线程释放仍然需要特殊路径。对象池可以让 owner 回收自己分配的对象；远端释放先进入 remote free 队列，再由 owner 批量回收。
+
+无锁数据结构的内存回收也会碰到这个问题。Hazard pointer 或 epoch 延迟释放后，最终由哪个线程 delete 节点？如果所有删除都集中到一个线程，可能造成远端释放和内存热点。内存管理和拓扑不能完全分开。
+
+\topic{I/O 设备也有位置}
+网卡、NVMe 和 GPU 等设备通常连接到某个 PCIe root complex，离某些 CPU/NUMA 节点更近。高性能网络和存储系统会把中断、设备队列、接收 buffer 和处理线程尽量放在同一节点。否则线程在远端节点准备 buffer，再交给近端设备 DMA，路径会绕远，cache、IOMMU 和互连成本都会增加。
+
+日志处理和 shuffle 程序同样受影响。若网卡在 node 0，接收缓冲在 node 0，但 reduce worker 在 node 1 上读取，远端内存流量会进入数据面。拓扑意识不只属于计算内核，也属于 I/O 管线、内存池和任务调度。
+
+\section{从实验矩阵区分一致性、带宽和 NUMA}
+
+线程数增加后吞吐不再提升，只是现象，不是原因。可能是全局锁，也可能是 cache line 所有权迁移、内存带宽饱和、远端内存、任务粒度过小、调度迁移、SMT 竞争或 I/O 等待。若不拆实验矩阵，NUMA 和一致性很容易被当成万能解释。
+
+\topic{四个最小对照}
+第一组对照是只读扫描。每个 worker 读取自己范围，不写共享状态。若只读扫描随线程数扩展到某点后停住，优先怀疑内存带宽、内存控制器或 NUMA 放置，而不是锁。第二组对照是本地写扫描。每个 worker 写自己的输出范围或本地 partial。若本地写扩展正常，说明 store buffer、写分配和带宽尚可。第三组对照是共享写热点。所有 worker 更新同一个 atomic 或同一条 line 上的槽位。若这里崩掉，说明一致性所有权迁移很可能参与。第四组对照是分层 partial。若它恢复扩展性，说明把高频写本地化是正确方向。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.35\linewidth}p{0.31\linewidth}}
+\toprule
+对照 & 热路径形状 & 主要观察 \\
+\midrule
+只读扫描 & 多 worker 读独立范围 & 带宽上限、远端读、预取能力 \\
+本地写扫描 & 每个 worker 写独占范围 & 写分配、store buffer、输出带宽 \\
+共享写热点 & 多 worker 写同一 line 或同一 atomic & cache line 所有权迁移、一致性流量 \\
+分层 partial & worker 本地写，节点内合并 & 本地化是否消除热点，合并是否变成新瓶颈 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些实验都要保持逻辑工作量和 checksum 可比。若共享写版本结果正确但慢，问题是扩展性；若分层 partial 结果变了，问题先回到语义。性能实验不能绕过正确性。
+
+\topic{线程绑定不是目的，是诊断工具}
+绑定线程到核心或节点，可以减少调度迁移变量，让页面 first-touch 和计算位置更容易对齐。诊断时可比较三种状态：不绑定、只绑定计算、绑定初始化和计算。若只绑定计算无改善，绑定初始化后改善，说明页面放置参与；若两者都无改善，可能是带宽、共享写、任务粒度或其他问题。若绑定后波动下降但中位数不变，调度迁移只是噪声来源，不是主瓶颈。
+
+\begin{lstlisting}[numbers=none,caption={NUMA 对照运行矩阵}]
+run A: no binding, main thread initializes all pages
+run B: compute workers bound, main thread initializes all pages
+run C: workers bound, each worker first-touches its own range
+run D: workers bound, memory interleaved across nodes
+
+record:
+  throughput, per-stage time, page faults, node placement if available,
+  worker CPU placement, checksum, remote/local evidence if available
+\end{lstlisting}
+
+当前设备可能没有 NUMA 或无法读取节点信息。此时仍可保留矩阵设计，并把 NUMA 证据标为 unavailable；不要把单 socket 结果写成“NUMA 无影响”。单 socket 能验证共享写和 false sharing，不能完整验证远端内存。
+
+\topic{用输入形状放大或缩小问题}
+共享写热点可以用单热点 key 放大：90\% 记录落到同一个 event id，全局 atomic 会被迫争同一计数槽。内存带宽可以用大只读数组放大：每个元素只读一次，几乎没有计算。TLB 可以用每页一个元素放大。NUMA 可以用大数组和跨节点 worker 放大。不同输入形状像显微镜，分别放大不同底层成本。
+
+因此第 5 章的输入矩阵不是测量章独有工具，也是 NUMA 和一致性的诊断工具。若一个优化只在单热点 key 上提升，结论是“修复共享写热点”，不是“所有输入都更快”；若只在大只读输入上停滞，结论可能是“带宽已满”，不是“锁有问题”。
+
+\topic{扩展曲线要按阶段解释}
+端到端吞吐随线程数变化时，至少拆成 parse、aggregate、merge、write、commit。共享写问题通常集中在 aggregate 或队列阶段；NUMA 远端读可能同时影响 parse 和 aggregate；内存带宽饱和会让多个流式阶段一起到顶；writeback 或 fsync 会让 write/commit 阶段长尾。只看总吞吐，会把完全不同的瓶颈折叠成一条曲线。
+
+\begin{lstlisting}[numbers=none,caption={扩展曲线报告的最小字段}]
+threads, binding_policy, first_touch_policy,
+parse_time, aggregate_time, merge_time, write_time, commit_time,
+records_per_second, p95_task_time, max_partition_time,
+checksum, unavailable_metrics
+\end{lstlisting}
+
+\code{p95_task_time} 和 \code{max_partition_time} 用来观察长尾。NUMA 和互连问题常常不是平均慢，而是某些远端任务、热点 shard 或跨节点合并特别慢。平均值会掩盖这些尾部。
+
+\section{C++ 接口怎样表达位置}
+
+C++ 标准库不直接暴露 NUMA 拓扑，但工程代码可以在接口层保留位置语义。线程池可以知道 worker 所属的逻辑组；任务可以带有 preferred group；内存池可以按组创建 arena；队列可以按 shard 或 node 分片；归约可以输出分层 partial。接口不需要一开始绑定某个 Linux API，但不能把任务看成完全无位置的函数。
 
 \begin{lstlisting}[language=C++,caption={任务元数据中保留位置偏好}]
-struct TaskPlacement {
- std::int32_t preferred_worker = -1;
- std::int32_t preferred_numa_node = -1;
+struct PlacementHint {
+  std::int32_t preferred_worker = -1;
+  std::int32_t preferred_group = -1;
+  std::uint64_t data_block_id = 0;
+  std::uint64_t expected_bytes = 0;
+  bool can_migrate = true;
 };
 
 struct ComputeTask {
- std::size_t begin = 0;
- std::size_t end = 0;
- TaskPlacement placement;
+  std::size_t begin = 0;
+  std::size_t end = 0;
+  PlacementHint placement;
 };
 \end{lstlisting}
 
-这段代码不是要读者立刻实现完整 NUMA runtime，而是提醒接口设计不要把任务看成无位置的函数。对数组块任务，\code{begin/end} 暗含数据位置；对分布式 shuffle，partition id 暗含目标节点；对线程池，本地队列暗含 worker 位置。位置语义一旦在接口中完全丢失，后面很难再补回来。
+这段结构不是要求立刻实现完整 NUMA runtime，而是让接口保留“任务最好靠近哪批数据”的表达能力。数组块任务的 \code{begin/end} 暗含数据位置；分区聚合的 partition id 暗含目标 shard；线程池本地队列暗含 worker 位置。位置语义一旦完全丢失，后面很难再补回来。
 
-\topic{拓扑不是核心数列表}
-很多程序只读取“有多少 CPU”，然后创建同样数量线程。这不足以描述现代机器。CPU 拓扑包含 socket、NUMA node、core、SMT sibling、cache 共享层级、内存控制器和 I/O 设备位置。两个逻辑 CPU 可能是同一个物理核心的 SMT sibling，也可能在同一个 socket 的不同核心，也可能跨 socket。它们之间共享资源和通信成本完全不同。
+\topic{拓扑抽象不要硬编码机器}
+项目可以定义抽象拓扑，而不是直接把某台机器的 CPU 编号写进算法。单 socket 或手机环境返回一个逻辑 group；双 socket 服务器返回多个 group；大小核设备可以按性能等级分组；容器环境按可见 CPU 集合降级。算法只依赖 group 抽象：组内先合并，组间再合并；调度器尽力满足 hint，无法满足时记录 fallback。
 
-性能报告应至少记录 \cmd{lscpu} 中的核心数、线程数、socket 数、NUMA 节点和 cache 信息。在多 socket 机器上，还应记录每个 NUMA node 的 CPU 列表。线程池设计也要区分 worker id 和 CPU id。worker id 是运行时内部编号，CPU id 是操作系统调度对象，NUMA node 是内存位置。把它们混为一谈，会让绑定和 first-touch 实验失去意义。
-
-\topic{互连成本如何出现}
-多核心之间通过片上网络、环、mesh 或 socket 间互连通信。软件不会直接调用“互连”，但互连成本会出现在 cache line 迁移、远端内存访问、跨 socket 锁竞争和共享 LLC 争用中。一个全局原子计数器在单 socket 小机器上看起来还能接受，在多 socket 上可能因为 cache line 在 socket 间来回迁移而急剧变慢。
-
-互连成本也会出现在读多写少结构中。只读共享通常可扩展，因为多个核心可以缓存副本；写入会让其他副本失效。若一个配置对象每秒更新一次，问题不大；若一个统计字段每次请求都写，问题很大。软件层面要区分只读共享、低频写共享和高频写共享。这比盲目选择 atomic 或 mutex 更重要。
-
-\topic{目录协议的工程影响}
-目录协议维护某条 cache line 的副本位置或所有权信息。软件工程师不需要实现目录协议，但要理解它的结果：共享范围越大，一致性维护越贵；写者越分散，所有权迁移越频繁；数据越能保持本地私有，扩展性越好。分片、线程本地、per-NUMA partial 和分层合并，都是把共享范围缩小。
-
-这也解释为什么“每个线程写自己的数组下标”不一定安全高效。如果这些下标落在同一 cache line，硬件仍然认为它们共享同一个一致性单位。软件的逻辑独立必须映射成硬件的物理独立，才真正减少一致性流量。
-
-\topic{First-touch 的细节}
-First-touch 通常发生在页面第一次被写入或实际分配物理页时。只调用 \code{reserve} 或 \code{malloc} 可能只获得虚拟地址，不一定分配物理页。第一次写入触发缺页，内核选择物理页所在 NUMA 节点。若主线程初始化全部数组，页面可能集中在主线程所在节点；后续其他节点线程访问就变成远端访问。
-
-因此 NUMA 实验要把分配、初始化和计算分开。分配阶段只申请地址；初始化阶段按目标线程分块写入，建立页面位置；计算阶段使用同样分块读取。若初始化也计入总时间，要单独报告，因为 parallel first-touch 可能把初始化变快或变慢。若只关心计算阶段，就要在计时前完成初始化并预热。
-
-\begin{lstlisting}[numbers=none]
-NUMA experiment phases:
- allocate virtual memory
- initialize pages by owner worker
- optionally warm up
- compute with the same worker-to-range mapping
- merge partials by node then globally
-\end{lstlisting}
-
-\topic{线程绑定的收益和风险}
-线程绑定可以减少调度迁移，让 worker 更稳定地访问本地 cache 和本地 NUMA 内存。它也可能降低操作系统调度灵活性。如果绑定策略错误，把多个 heavy worker 绑到同一个核心或同一个 NUMA 节点，就会变慢。绑定还要考虑系统上其他进程、容器配额和可用 CPU 集合。
-
-实验中，绑定的价值是减少变量。未绑定实验可能因为操作系统迁移而样本波动；绑定后更容易解释线程和数据位置。但生产系统是否绑定，要看服务类型和部署环境。批处理计算通常更适合显式绑定；通用服务可能需要给调度器更多空间。教材应要求读者记录绑定策略，而不是强制所有程序绑定。
-
-\topic{分层归约}
-NUMA 友好的归约通常分层。每个 worker 计算本地 partial；同一 NUMA 节点内先合并成 node partial；最后跨节点合并。这样高频读写发生在本地，跨节点通信只在较小 partial 上发生。这个结构也对应分布式系统中的 local combine、node-level reduce 和 global reduce。
-
-\begin{lstlisting}[numbers=none]
-hierarchical reduce:
- worker partials: no sharing during hot loop
- node partials: merge within NUMA node
- global result: merge node partials
-\end{lstlisting}
-
-分层合并的代价是代码复杂度和额外阶段。若数据很小或机器只有单 NUMA 节点，收益不明显。实验要比较平坦合并和分层合并，并记录每阶段耗时。不要把 NUMA 策略写成不可关闭的复杂路径。
-
-\topic{跨节点队列的代价}
-全局队列在 NUMA 机器上常成为跨节点热点。生产者和消费者分布在不同节点，队列锁、head/tail 和槽位状态会在节点间迁移。分片队列或每节点队列可以减少这种迁移。任务优先进入本节点队列；本节点空闲时先偷同节点任务，再跨节点偷。这个策略和分布式调度中的数据本地性一致。
-
-有界队列的容量也可以按节点分配。若每个 NUMA 节点有自己的输入队列，上游可以根据数据位置提交任务；某个节点过载时，其他节点不必被同一个全局队列阻塞。缺点是负载均衡更复杂，任务路由需要知道位置。设计要看工作负载是否有明显数据本地性。
-
-\topic{远端释放和内存池}
-NUMA 不只影响分配，也影响释放。一个对象在节点 A 分配，由节点 B 释放，可能导致分配器元数据和 cache line 在节点间移动。高性能分配器常使用线程本地或节点本地缓存，但跨线程释放仍然需要特殊路径。对象池设计应考虑 owner：对象最好由分配它的线程或节点回收，跨节点释放可以先放入 remote free 队列，再由 owner 批量回收。
-
-无锁数据结构的回收协议也会遇到这个问题。Hazard pointer 或 epoch 延迟释放后，最终由哪个线程 delete 节点？如果所有删除都集中到一个线程，可能造成远端释放和内存热点。内存管理和拓扑不能完全分开。
-
-\topic{I/O 设备和 NUMA}
-网卡、NVMe 和 GPU 等设备通常连接到某个 NUMA 节点附近。线程处理设备 I/O 时，如果运行在远端节点，可能增加 PCIe 和内存访问成本。高性能网络和存储系统常把中断、队列、缓冲区和处理线程放在同一 NUMA 节点。虽然本册第二册不深入设备驱动，但要让读者知道 I/O 也有拓扑。
-
-分布式 shuffle 如果在真实服务器上运行，网络接收线程、解压线程和 reduce worker 的位置会影响吞吐。若网卡在节点 0，接收缓冲在节点 0，但 reduce worker 在节点 1 读取，远端内存流量会增加。拓扑意识不只属于计算内核，也属于 I/O 管线。
-
-\topic{自动 NUMA balancing}
-Linux 自动 NUMA balancing 会采样页面访问，并可能迁移页面到更常访问它的节点。它能改善一些长期运行程序，但也会引入额外 page fault、迁移成本和实验不确定性。短 benchmark 可能还没等自动机制收敛就结束；长服务可能在负载变化时发生页面迁移。
-
-实验报告应记录是否启用自动 NUMA balancing，至少要知道它可能影响结果。若要做可控实验，可以使用 numactl、线程绑定和明确 first-touch。若要评估生产行为，则应在接近真实配置下测量，并记录自动迁移指标。不要让内核自动策略成为看不见的变量。
-
-\topic{容器和 cgroup 的影响}
-现代部署常在容器里运行。容器可能限制 CPU 集合、内存节点、CPU 配额和内存上限。程序看到的 \cmd{std::thread::hardware_concurrency} 未必等于实际可用核心数；cgroup 配额可能让线程周期性被 throttled；cpuset 可能只允许访问部分 CPU。性能报告若忽略容器限制，就可能误判扩展曲线。
-
-在 Termux、手机或云环境中，也要承认设备限制。手机通常没有多 socket NUMA，但有大小核、温度和频率限制；云主机可能共享物理资源；容器可能禁止读取某些性能事件。教材项目应记录环境，而不是假设每个读者都有理想服务器。
-
-\topic{拓扑感知不等于硬编码}
-接口应表达拓扑信息，但不应把某台机器的拓扑硬编码进算法。正确做法是运行时发现或配置拓扑，然后把任务、内存池和队列映射到抽象 node。算法只知道 preferred node 或 shard id，不直接写死 CPU 编号。这样同一代码可以在单 socket、双 socket、容器和手机上运行，只是策略不同。
-
-Compute Systems Engine 可以从简单配置开始：\code{worker_count}、是否绑定、每个 worker 的 node id。没有 NUMA 信息时，所有 worker 属于 node 0。后续在支持的 Linux 机器上再读取真实拓扑。这样项目不会因为缺少硬件而无法运行，也不会放弃拓扑扩展。
-
-\section{实验边界、降级和项目落地}
-
-没有 NUMA 机器时，不能声称验证了远端内存优化；但仍可以验证 false sharing、线程绑定、任务粒度和内存带宽曲线。单 socket 上 parallel first-touch 和主线程初始化可能差不多，这是正常结果，不是实验失败。报告要写清：本环境只能验证某些机制，不能验证跨 socket 页面放置。
-
-有 NUMA 机器时，也不能只跑一次。需要比较绑定与未绑定、主线程初始化与 worker 初始化、平坦合并与分层合并、单节点内存与 interleave 内存。只有多组对照一致，才能说 NUMA 放置参与了性能结果。
-
-\topic{案例：双 socket 归约}
-在双 socket 机器上，大数组归约可以展示 NUMA 的完整链条。版本一由主线程初始化数组，然后所有 worker 分块求和。版本二由每个 worker 初始化自己的块，再求和。版本三按 socket 分组：每个 socket 的 worker 求本地 partial，socket 内合并，再跨 socket 合并。若版本二和三明显更好，说明页面放置和分层合并参与了性能。
-
-实验要记录线程绑定。若 worker 在计算阶段被迁移到其他 socket，first-touch 的页面位置和线程位置又不匹配。还要记录数组大小，太小可能全部被 cache 影响，太大才体现内存控制器。这个案例把第 3 章的 page fault、第 4 章的 NUMA、第 13 章的分层 reduce 连在一起。
-
-\topic{案例：跨 socket 队列}
-另一个案例是全局任务队列。所有 worker 从同一个队列取任务，队列锁和 head/tail 位于某个内存节点。跨 socket worker 频繁访问，会让队列状态在 socket 间迁移。本地队列加工作窃取可以减少高频跨 socket 访问：worker 优先本地 pop，空闲时才偷取。
-
-实验可以构造大量短任务，让队列成本显著；再构造少量长任务，让队列成本被计算掩盖。这样读者能看到：同一个队列设计在不同任务粒度下表现不同。NUMA 优化不能脱离任务粒度。
-
-\topic{分层资源管理}
-NUMA 机器适合分层资源管理。每个节点有本地 worker、本地内存池、本地队列、本地 partial。跨节点只交换压缩后的 partial 或被窃取的任务。这个结构和分布式系统的节点本地聚合非常像。若在单机上已经学会分层，扩展到集群时会更自然。
-
-分层也会增加复杂度。每个层级都需要指标：本地队列长度、跨节点 steal 次数、节点 partial 大小、远端访问比例。没有指标，分层策略可能只是让代码复杂。项目可以先用单层实现，再在实验分支中加入分层，对比收益。
-
-\topic{大小核和 NUMA 的区别}
-手机常见大小核，服务器常见 NUMA。二者都意味着执行资源不均匀，但原因不同。大小核是核心性能和能耗不同，同一内存访问拓扑未必像多 socket 那样分节点；NUMA 是内存位置和访问延迟不同，核心本身可能同构。调度策略也不同：大小核更关注把重计算放大核、后台任务放小核；NUMA 更关注线程和内存同节点。
-
-在 Termux 环境中，读者更可能遇到大小核而不是多 socket NUMA。实验报告应避免把大小核现象误称为 NUMA。若线程数增加后性能下降，可能是小核加入、降频、温度或调度迁移，不一定是远端内存。记录环境是第一步。
-
-\topic{拓扑抽象接口}
-项目可以定义一个抽象拓扑接口，而不是直接依赖某个 Linux API。接口返回 \code{worker_count}、\code{node_count}、\code{worker_to_node}、是否支持绑定。单 socket 或手机环境返回一个 node；双 socket 服务器返回多个 node。算法根据 \code{node_count} 决定是否启用分层 partial。这样代码能在不同设备上运行。
-
-\begin{lstlisting}[language=C++,caption={拓扑描述的接口形态}]
+\begin{lstlisting}[language=C++,caption={拓扑描述的最小形态}]
 struct WorkerTopology {
- std::int32_t worker_count = 1;
- std::int32_t node_count = 1;
- std::vector<std::int32_t> worker_to_node;
+  std::int32_t worker_count = 1;
+  std::int32_t group_count = 1;
+  std::vector<std::int32_t> worker_to_group;
+  bool binding_supported = false;
 };
 \end{lstlisting}
 
-这个结构不直接包含 CPU id，是为了让教学项目先表达策略，再逐步接入真实 affinity。若绑定不可用，仍然可以使用 \code{worker_to_node} 做逻辑分层实验。接口应允许能力缺失，而不是让项目只能在服务器上运行。
-
-\topic{拓扑指标}
-拓扑感知优化需要指标验证。每个 node 的任务数、处理字节、partial 大小、队列长度、跨节点 steal 次数、远端调度次数都应记录。若启用分层后跨节点 steal 很多，说明负载不均或任务划分不好；若某个 node 长期空闲，说明调度没有利用资源；若 node partial 合并很慢，说明最终合并成为瓶颈。
-
-没有这些指标，拓扑策略容易变成不可解释的复杂代码。项目应先输出简单文本摘要，后续再画图。
-
-\topic{拓扑和故障域}
-拓扑不只影响性能，也影响故障域。单机里，一个 NUMA 节点过载可能拖慢本地 worker；集群里，一个 rack、zone 或机房故障会影响一组节点。分布式副本放置通常要跨故障域，避免一处故障丢失多数副本。单机拓扑意识可以自然扩展到集群故障域意识：不要把所有关键副本、任务或队列集中在同一个风险位置。
-
-Compute Systems Engine 的本机模拟可以先用 node id 表示逻辑故障域。后续多进程或多机版本中，node id 可以映射到主机、rack 或 zone。调度器在追求本地性的同时，也要避免把所有副本放同一域。性能和可靠性有时会冲突，系统设计要显式权衡。
-
-\topic{拓扑章节总结}
-本章的核心不是让读者背 NUMA API，而是建立位置意识。线程有位置，内存有位置，队列有位置，I/O 设备有位置，副本也有位置。位置决定通信成本和故障相关性。没有位置意识的程序在小机器上可能正常，在大机器上会遇到扩展性和可靠性问题。
-
-\topic{拓扑决策表}
-做拓扑相关设计时，先问机器是否真的有多个内存节点，是否能设置亲和性，数据是否大到超过 cache，任务是否访问固定数据块，是否有跨节点共享写，是否需要跨故障域放置副本。若没有 NUMA 或数据很小，复杂拓扑策略可能无收益；若数据大且任务固定访问某块，first-touch 和绑定值得实验；若共享写频繁，先分片再谈绑定；若是分布式副本，优先考虑故障域而不是只考虑延迟。
-
-\topic{拓扑策略的降级设计}
-拓扑感知代码必须能降级。很多读者会在手机、容器、云虚拟机或普通单 socket 机器上运行实验，程序不一定能读取完整 NUMA 信息，也不一定有权限设置 affinity。如果代码把真实 NUMA 当成必需条件，就会让教材项目难以运行。更好的策略是把拓扑能力分层：能读取真实 node 时使用真实 node；不能读取时退化成一个逻辑 node；能绑定线程时执行绑定；绑定失败时记录失败并继续运行；能控制内存策略时做 first-touch 实验；不能控制时只做普通分块。
-
-降级不等于忽略拓扑。即使只有一个逻辑 node，代码仍然可以保留 worker 到 node 的映射、分层 partial 的接口和队列分片的抽象。这样程序在小机器上正确运行，在大机器上能启用更多策略。教材项目尤其适合这种设计：先让抽象存在，再逐步接入真实硬件能力。读者不会因为没有双 socket 服务器就学不了拓扑意识。
-
-拓扑策略还要写入输出。若报告只写“启用 NUMA 优化”，但实际上 affinity 设置失败，读者会得到错误结论。程序应输出能力检测结果、降级原因和最终策略。例如 \code{node_count} 是 1，\code{binding_enabled} 是 false，\code{binding_error} 是 permission denied，\code{memory_policy} 是 default。这样实验结果才诚实。高性能系统的第一步不是让所有优化都打开，而是知道哪些优化真的生效。
-
-降级设计还有一个好处：它迫使接口表达意图，而不是表达某个平台的偶然细节。算法真正需要的是“这个任务最好靠近哪一组数据”和“这个 worker 属于哪个执行域”，不一定需要知道具体 CPU 编号。平台能力强时，执行域可以映射到真实 NUMA 节点；平台能力弱时，执行域只是逻辑分组。把意图和机制分开，代码才不会因为换设备而到处改。
-
-这种抽象也能保护学习路径。读者先在普通设备上理解任务、数据和执行域的关系，再到服务器上验证真实远端访问成本。先学清楚问题，再打开平台能力，实验结论会稳得多。
-
-NUMA 和一致性章的回归阅读应围绕一个并行归约推进。第一版所有线程更新一个全局计数器，暴露 cache line 所有权反复迁移；第二版每线程 partial，消除热写但仍可能出现 false sharing；第三版按 NUMA 节点分块初始化和合并，观察 first-touch 和远端内存；第四版把全局队列改成分层队列，减少跨节点争用。每一步都只改变一个因素，才能说明瓶颈从哪里迁移。
-
-一致性协议在本章只提供硬件背景，不替代 C++ 内存模型。它解释为什么多个核心写同一条 cache line 会贵，为什么共享只读和共享写不是一回事，为什么 padding 有时有效。但程序正确性仍要靠锁、原子和明确的同步关系。把 MESI 当作语言级保证，是本章必须避免的误区。
-
-本章验收要允许设备差异。手机或单 socket 机器可能没有可观察 NUMA，但仍能完成 false sharing、全局队列争用和线程本地 partial 实验；有多 socket 机器时，再加入 first-touch 和绑定策略。报告不能把某台机器上的绝对数字写成普遍规律，应写成“这种数据放置在这种拓扑下产生了这种成本”。
-
-一致性成本要落到 cache line 所有权。两个线程更新不同变量，如果变量落在同一条 cache line 上，硬件仍可能把这条 line 在核心之间来回转移；这就是 false sharing 的根。把字段 padding 到不同 line 可能降低转移，但也会增加内存占用和 cache footprint。教材不能只说“加 padding”，还要让读者计算对象数量、额外字节和是否真的位于热写路径。
-
-NUMA 策略要区分初始化、访问和合并。first-touch 只影响页面最初归属，后续线程迁移、重新分配和文件映射都可能改变实际成本；线程绑定只约束执行位置，不自动移动内存；本地 partial 能减少远端写，但最终合并仍然要跨节点读。项目报告应把这三步分开写：页面由谁触碰，热循环由谁访问，合并由谁执行。这样读者才能看出拓扑优化到底解决哪一段成本。
-
-互连成本还会改变数据结构选择。一个全局无锁队列在单 socket 上可能还能接受，跨 socket 时每次 head 或 tail 更新都可能拉动 cache line 所有权；一个全局 hash table 的分片锁如果没有按 NUMA 节点分层，热点 bucket 会把远端访问集中到少数 line；一个线程本地 partial 如果最后由单线程合并，合并阶段又可能变成串行远端读。拓扑意识不是只给线程绑核，而是让共享状态也分层。
-
-本章可以让读者写一个降级策略。若机器没有 NUMA，就运行 false sharing 和分层 partial；若机器有多个 NUMA 节点，就增加 first-touch、线程绑定和远端访问对照；若没有 PMU 权限，就用吞吐曲线和内存带宽估算替代计数器。高质量教材应告诉读者在不同设备上如何诚实验证，而不是假设每个人都有同一台服务器。
-
-\section{把共享内存放回拓扑和一致性协议}
-
-多核机器给人的错觉是“所有核心访问同一块内存”。程序模型可以这么说，性能模型不能这么说。不同核心有自己的私有缓存，多个核心通过一致性协议维护共享数据的可见性；多 socket 或多 NUMA 节点机器上，内存控制器和物理页面也有位置。一次读写看似普通，实际可能涉及 cache line 所有权、远端内存、互连带宽和页面迁移。NUMA 章要从共享写和页面归属推出来，而不是从硬件拓扑图开始背。
-
-最小例子是全局计数器。单线程里它只是一个变量；多线程里每个 worker 都更新它，cache line 所有权会在核心之间迁移，吞吐不会线性增长。把计数器改成 atomic 只修复数据竞争，不会消除共享写热点。把计数器改成线程本地 partial，再做分层合并，才真正改变共享模式。这里的推导非常关键：正确性原语和扩展性结构不是同一件事。
-
-\topic{一致性协议提供可见性基础，不替代内存模型}
-
-MESI 之类状态模型适合建立直觉：一条 cache line 可以被多个核心共享读取，但写入需要获得独占或修改权限。若两个核心反复写同一条 line，即使写的是不同字段，也会发生所有权迁移。这个直觉足以解释 false sharing、热点 atomic 和全局队列锁为什么扩展性差。教材不需要让读者背每个协议变种的全部状态，但要让读者理解“写共享比读共享贵得多”。
-
-硬件一致性和 C++ 内存模型分工不同。硬件负责在给定体系结构规则下维护缓存一致性，C++ 内存模型定义程序中哪些跨线程读写有数据竞争、哪些原子操作建立 happens-before。把普通变量交给硬件一致性并不能让数据竞争变成正确程序；把所有操作都改成 \code{seq_cst} 也不能消除热点 line 的性能成本。后续原子章会继续展开，本章只需要把边界立住：正确性要按语言模型证明，性能要按一致性流量和拓扑分析。
-
-一致性流量也会影响锁。一个 mutex 不只是“进入临界区”这么简单，它内部会有原子状态、等待队列和可能的 futex 系统调用。低争用时锁成本很低，高争用时锁变量所在 line 会成为热点，等待线程可能睡眠和唤醒。锁章会讲不变量和条件变量，本章先让读者看到锁的硬件侧成本：临界区越短不一定越好，若进入次数极高，锁本身的 cache line 迁移就可能主导。
-
-\topic{NUMA first-touch 和页面归属}
-
-NUMA 的第一条工程规则是 first-touch：页面通常归属第一次触碰它的节点。若主线程在 node 0 初始化一个大数组，随后 node 1 上的 worker 大量访问这批页面，worker 就会读远端内存。这个问题在小机器上可能看不出来，在双 socket 服务器上会让扩展曲线突然变差。多线程初始化不是形式主义，而是页面放置策略。
-
-实验要设计成能触发差异。版本一由主线程初始化大数组，再让所有 worker 分块求和；版本二由每个 worker 初始化自己将要处理的块，再在同一绑定策略下计算；版本三故意交换 worker 和数据块，制造远端访问。报告要记录线程绑定、页面大小、输入规模、内存带宽和 NUMA 设备情况。若当前手机或笔记本没有 NUMA，就把实验写成设计和单节点替代，不把结论伪装成已验证。
-
-NUMA 策略还要考虑迁移。Linux 的自动 NUMA balancing 可能把页面迁移到访问频繁的节点，但迁移本身有成本，也可能在 benchmark 中造成波动。生产程序不能只依赖“系统会帮我调好”。对于稳定大任务，显式 first-touch、线程绑定和数据分片更可控；对于动态任务，运行时要记录数据位置，让调度尽量先本地再远端。
-
-\topic{互连带宽、设备拓扑和分层设计}
-
-互连不是无限总线。多个核心同时访问远端内存、争用共享 line 或从同一个内存控制器读数据时，互连和内存控制器会成为瓶颈。线程数增加后变慢，不一定是算法错了，也可能是远端访问、LLC 争用或内存带宽已经到顶。分层归约和本地队列的共同思想，是先在近处完成大部分工作，再把少量结果跨节点合并。
-
-设备也有拓扑。网卡、NVMe、GPU 或其他设备连接在特定 PCIe root complex 下，离某些 CPU/NUMA 节点更近。虽然第二册第二册不进入 GPU AI 算子，但现代计算系统必须知道：I/O 线程、内存 buffer 和设备队列最好考虑拓扑。否则一个线程在远端节点准备 buffer，再交给近端设备 DMA，路径会绕远，cache 和 IOMMU 成本也可能增加。
-
-分层设计不等于硬编码拓扑。项目可以定义一个 \code{Topology} 抽象：列出 worker 所在逻辑 CPU、NUMA node、缓存组和可用设备；调度器根据抽象做本地优先策略；没有 NUMA 的设备上退化成单节点策略。这样教学代码不会把某台机器的编号写死，也能让读者理解“拓扑感知”和“不可移植硬编码”的区别。
-
-\topic{项目中的拓扑验收}
-
-贯穿项目在本章应完成 sharded counter、NUMA-aware block placement 和分层 reduce 三个检查点。Sharded counter 用来证明共享写热点；block placement 用来证明页面归属；分层 reduce 用来证明先本地合并再跨节点合并的结构。每个检查点都要保留不使用拓扑的 baseline，并写出何时 baseline 反而更好，例如小输入、单 socket、线程数少、合并成本大于远端成本。
-
-源码阅读可以从 Linux 调度域、NUMA balancing 和内存策略入口开始，不要求一次读懂内核全部路径。读者只需要建立映射：用户态的线程绑定对应内核 task 的 CPU mask，页面触碰对应 VMA 和 page fault，NUMA 统计对应页面位置和访问事件。能把用户态实验现象映射到这些对象，本章就达到了目的。
-
-本章最后要形成一句判断：凡是多个核心反复写同一份状态，先怀疑一致性流量；凡是多个节点访问大工作集，先确认页面归属；凡是线程数增加后不再加速，先画拓扑和共享写路径，再决定是改算法、改布局、改调度还是接受带宽上限。
-
-\topic{案例走查：线程本地 partial 为什么还要分层合并}
-
-把全局 atomic counter 改成每线程 partial 后，共享写热点消失，但最终合并仍可能成为单点。若线程数少、partial 小，串行合并很好；若 partial 是大数组，且线程分布在多个 NUMA 节点，单线程跨节点读取所有 partial 会访问远端内存。分层合并先在每个节点本地合并，再跨节点合并少量结果，减少远端流量。
-
-实验在单 NUMA 设备上也能做简化：把 partial 按 worker 分组，比较串行合并和树形合并的阶段耗时；若有 NUMA 设备，再加 first-touch 和绑定。指标包括每阶段合并字节、合并时间、线程空闲时间和最终 checksum。若没有 NUMA，报告写清只验证了算法结构，未验证远端内存收益。
-
-这个案例说明拓扑优化不应写死。项目代码可以提供 \code{Topology::groups()}，单节点返回一个组，多节点返回多个组。算法按组做分层，而不是硬编码 socket 编号。这样同一份代码能在手机、笔记本和服务器上降级运行。
-
-\topic{NUMA 章节的项目代码形状}
-
-拓扑感知不应散落在每个算法里。项目可以定义 \code{CpuTopology} 和 \code{PlacementHint}：前者描述 worker 属于哪个组，后者描述任务最好在哪个组运行。算法只产生 hint，例如 input block 属于 group 2；运行时负责尽力调度；无法满足时记录一次 remote execution。这样拓扑是可观测策略，而不是硬编码条件。
-
-\code{CpuTopology} 在没有 NUMA 的设备上返回一个组，所有任务本地执行。双 socket 机器上返回多个组。大小核设备可以按性能等级分组。这个抽象让同一章节能服务手机、笔记本和服务器。用户现在在 Termux 上，也可以先实现单组版本，保留接口，后续换机器再验证多组策略。
-
-代码还要避免让拓扑策略破坏正确性。任务无论在哪个 worker 执行，输出 checksum 必须相同；拓扑只影响性能和 locality，不影响语义。测试先随机打乱 placement，确认结果一致；再开启本地优先策略，测性能。这样读者知道调度策略和业务正确性是分开的。
-
-\topic{一致性流量的观测替代}
-
-不是所有设备都能直接测 cache coherency traffic。可以用反例间接观察：全局 atomic 计数器、紧凑 partial 数组、填充 partial 数组、线程本地 vector 四个版本。若全局 atomic 随线程数增加很快饱和，而线程本地版本扩展更好，说明共享写路径参与成本。若填充 partial 改善紧凑 partial，说明 false sharing 参与成本。
-
-报告要避免过度断言。没有专用 uncore 计数器时，不应写“互连流量为多少”，而应写“结果符合共享写热点假设”。若能在服务器上使用 uncore 或 numastat，再补更强证据。教材要教读者根据证据强度说话。
-
-源码阅读可以从调度拓扑和内存策略文档开始，再看 \filepath{kernel/sched/topology.c}、\filepath{mm/mempolicy.c}、\filepath{mm/huge_memory.c} 的入口。只读入口，不追求深挖每个分支。能把 first-touch、线程绑定和 page migration 映射到内核概念，本章目的就达到了。
-
-\topic{综合练习：拓扑感知归约的降级设计}
-
-本章综合题要求读者为归约写一个拓扑感知版本，并且必须支持没有 NUMA 的设备。接口先定义拓扑组，不直接暴露 socket 编号。单组设备上，所有 worker 属于组 0；多节点设备上，worker 按 NUMA node 分组；大小核设备上，可以按性能等级分组。算法只依赖组抽象：组内 partial 先合并，组间再合并。这样设计能在手机上运行，也能在服务器上验证远端成本。
-
-实现时先写不感知拓扑的 baseline，再写分层归约。分层归约不允许改变最终语义，输出 checksum 必须一致。若浮点归约顺序改变，要写误差合同或固定合并树。数据初始化也要分版本：主线程初始化、worker 本地初始化、故意交叉访问。没有 NUMA 硬件时，只验证接口和合并树；有 NUMA 时，再验证 first-touch 和绑定收益。
-
-报告中必须有降级说明。若系统无法读取 NUMA 拓扑，运行时如何退化；若线程绑定失败，是否继续运行；若拓扑组信息和实际性能不符，指标如何暴露。工程设计不能把“我的机器支持”当成前提。用户在 Termux 上也应能跑通功能，只是某些性能结论标记为未验证。
-
-这个题还能训练边界意识。拓扑感知若写入算法核心，后续每个内核都要处理平台差异；若放在运行时和 placement hint 中，算法只描述数据位置偏好。好的设计不是到处写 if，而是把硬件差异收束到少数接口。
-
-\topic{容易出错的边界：拓扑感知什么时候不值得}
-
-拓扑感知不是越复杂越好。若输入很小，所有数据都在 LLC 内，NUMA 策略可能没有收益；若任务极不均匀，强本地优先可能让某些 worker 空闲；若系统是手机或单 socket 机器，复杂 NUMA 分组只会增加代码负担；若数据很快被压缩成本地 partial，远端访问的时间占比可能很低。教材必须告诉读者：先测是否存在远端成本，再引入拓扑策略。
-
-第二个反例是“绑定线程一定稳定”。绑定可能稳定实验，也可能破坏调度器对大小核、温控和后台任务的管理。移动设备上，固定大核长时间运行会触发降频，后半段反而慢。服务器上，绑定不当可能把线程集中到同一 LLC 组或同一 NUMA 节点，造成资源争用。绑定策略必须和拓扑、输入、持续时间一起报告。
-
-第三个反例是“atomic 修复了共享写问题”。Atomic 修复数据竞争，不修复 cache line 所有权迁移。热点 atomic 仍然可能把互连打满。正确修复往往是减少共享写频率，例如线程本地 partial、分片、批量合并或改变算法。这个反例会在锁章和原子章再次出现，本章先从硬件成本角度立住。
-
-源码阅读可以把 Linux 的自动 NUMA balancing 当作反例材料。系统可能迁移页面，但迁移不是免费，也不是每个 workload 都能判断正确。用户态设计若完全依赖自动迁移，就会把性能决定权交给难以观察的后台机制。更稳的方式是让项目记录 placement 和实际执行位置，至少知道策略是否被执行。
-
-\topic{本章核心接口：PlacementHint}
-
-NUMA 章给项目留下 \code{PlacementHint}。任务可以声明 preferred group、data block id、expected bytes、can migrate 四个信息。运行时尽量按 hint 调度，但不保证一定满足；如果未满足，就在 trace 中记录 remote 或 fallback。这样语义和性能分开：任务在哪里跑都应正确，但 hint 可以帮助解释性能。
-
-后续任务运行时和分布式调度会复用这个思想。本机是 NUMA group，集群里就是数据本地节点；本机 remote execution 只是慢，集群 remote execution 可能多一次网络读取。接口稳定后，概念能自然迁移。
-
-\topic{从硬件模型进入测量模型}
-
-前四章给出硬件侧解释，但解释必须通过测量落地。知道 cache line、TLB、NUMA、互连和一致性，只能产生候选假设；要判断哪一个假设支配当前程序，还需要实验矩阵、计数器、profile 和 trace。下一部分从测量开始，是为了防止读者把硬件知识当成凭经验猜瓶颈的工具。
-
-项目在这里应暂停一次，整理前四章产生的候选指标：热循环 cycles 和 instructions，地址序列和工作集，false sharing 对照，first-touch 和线程绑定。下一章把这些指标组织成报告格式。这样硬件知识不会停留在文字，而会变成后续每次优化都能复用的证据模板。
-
-\section{项目落地}
-
-Compute Systems Engine 在本章应加入三个设计点。第一，拓扑记录：benchmark 输出可见 CPU 数、用户指定 worker 数、是否启用绑定、是否能读取 NUMA 信息。第二，分层 partial：即使当前只实现每 worker partial，也在设计文档中说明未来可以扩展成每 NUMA 节点 partial。第三，队列分片路线：线程池初版可以用全局队列，但要记录全局队列可能成为共享热点，后续工作窃取章节再拆成本地队列。
-
-本章的验收不是一定在手机或单 socket 机器上测出 NUMA 差异，而是实验设计正确。没有 NUMA 设备时，报告应写明限制：可以验证 false sharing、线程绑定和内存带宽曲线，但不能验证远端内存放置。承认证据边界，比编造一个漂亮结论更专业。
-
-\topic{一致性流量}
-多个核心读同一份数据通常容易扩展，多个核心写同一条 cache line 会制造所有权来回迁移。原子计数、共享队列尾指针、全局统计表都是典型热点。分析时先问“谁写，写在哪里，频率多少”。
-
-
-\topic{NUMA 归属}
-页面通常在首次触碰时分配到某个 NUMA node。若主线程初始化全部数据，worker 在线程绑定后访问远端页面，性能会被隐藏地拉低。first-touch 不是小技巧，而是数据归属策略。
-
-
-\topic{拓扑感知调度}
-线程绑定不是越死越好。绑定能稳定实验和保护本地性，也可能降低调度器处理负载不均的能力。工程报告要写清绑定策略、CPU 列表、容器 cpuset 和不可用时的降级。
-
-
-\topic{分层合并}
-跨 node 共享写昂贵时，应先在 core 或 node 本地生成 partial，再分层合并。这个原则后面会出现在 reduce、histogram、shuffle 和分布式 combine 里。
-
-
-\topic{远端访问预算}
-远端访问不一定绝对禁止，但要有预算。若本地 node 忙而远端空闲，远端执行也许更快；若数据巨大而计算很轻，移动线程比移动数据更合理。NUMA 策略要服务 workload。
-
-
-\topic{自动迁移}
-Linux 可能尝试自动 NUMA balancing，但迁移页面有成本，也可能判断不准。用户态项目不能把性能正确性完全交给后台机制，至少要记录页面放置和线程位置。
-
-
-\topic{容器环境}
-手机、虚拟机、容器和云实例可能隐藏部分拓扑信息。教材要教读者写“不可验证”的报告，而不是编造 NUMA 结论。可观察 CPU mask、调度迁移次数和缓存行为仍然有价值。
-
-
-\topic{项目接口}
-PlacementPlan 应描述数据分片、建议 node、执行 worker、实际 CPU、partial 合并层级和远端访问估计。它不是调度器的全部实现，却让后续运行时有可讨论的对象。
-
-
-\topic{案例：主线程初始化反例}
-先由主线程初始化大数组，再由绑定到另一个 node 的 worker 扫描；再改成 worker 本地 first-touch。比较两者，说明页面归属不是抽象名词。
-
-
-\topic{案例：共享计数器热点}
-所有线程 \code{fetch_add} 同一计数器，再改成每 node partial。观察扩展曲线，从一致性流量解释为什么线程越多越慢。
-
-
-\topic{案例：分层归约}
-core 本地 partial、node 本地 partial、全局合并三层实现同一 reduce。这个案例连接硬件拓扑和并行算法。
-
-
-\topic{源码阅读路线}
-Linux 源码阅读从 \filepath{kernel/sched/topology.c}、\filepath{mm/mempolicy.c}、\filepath{mm/huge_memory.c} 附近进入即可。阅读目标不是把整套子系统抄进书里，而是追一条和本章实验相关的路径：用户态动作怎样变成内核对象，内核对象怎样排队、等待、唤醒、计数、提交或回收。
-
-阅读报告要写证据等级。能直接测到的数字放在第一层；从源码控制流推导出的解释放在第二层；当前设备无法验证、只能作为合理猜测的内容放在第三层。这样读者会知道 拓扑放置报告 中哪些结论可复现，哪些结论需要换机器继续确认。
-
-源码阅读还要克制。看到一个复杂函数，不要把每个分支都展开；先回到本章的问题，问它能否解释一个等待点、一次状态转移或一条性能曲线。解释不了的内容可以留到索引，不要打断正文主线。
-
-\topic{主线程初始化反例}
-先由主线程初始化大数组，再由绑定到另一个 node 的 worker 扫描；再改成 worker 本地 first-touch。比较两者，说明页面归属不是抽象名词。
-
-\topic{共享计数器热点}
-所有线程 \code{fetch_add} 同一计数器，再改成每 node partial。观察扩展曲线，从一致性流量解释为什么线程越多越慢。
-
-\topic{分层归约}
-core 本地 partial、node 本地 partial、全局合并三层实现同一 reduce。这个案例连接硬件拓扑和并行算法。
-
-\topic{一致性所有权}
-
-多个核心读同一 cache line 容易扩展，多个核心反复写同一 line 会让所有权在核心之间迁移。原子热点和 false sharing 都来自这个边界。
-
-实验设计：让所有线程写同一计数器，再改成每线程槽位，比较扩展曲线。
-
-\topic{NUMA 归属}
-
-页面通常由第一次触碰的线程决定物理节点。主线程初始化全部数组后让远端 worker 访问，可能把远端内存成本藏进计算阶段。
-
-实验设计：分别用主线程初始化和 worker 本地初始化，记录带宽和线程绑定策略。
-
-\topic{first touch}
-
-first touch 不是仪式，而是把数据归属和执行位置对齐。它要求初始化循环和计算切分采用同一拓扑视角。
-
-实验设计：把分片初始化函数加入项目，要求每个分片记录建议 node 和实际 worker。
-
-\topic{拓扑感知}
-
-CPU 列表、socket、core、SMT 和容器 cpuset 都会影响实验。绑定策略不能只写线程数，要写可见 CPU 和不可见限制。
-
-实验设计：在 Termux、容器或普通 Linux 中记录可见 CPU mask，并说明哪些 NUMA 结论无法验证。
-
-\topic{分层 partial}
-
-共享写昂贵时，先在线程本地或 node 本地生成 partial，再树形合并。这个原则后来会出现在 histogram、reduce 和 shuffle combine 中。
-
-实验设计：为每个 worker 保存本地桶，再按 node 合并，最后全局合并。
-
-\topic{自动迁移}
-
-操作系统可能迁移线程或页面。迁移有时修正局部性，有时破坏可重复实验。报告要区分默认调度和人为绑定。
-
-实验设计：先跑默认策略，再跑固定亲和性，并记录迁移次数或替代指标。
-
-\topic{互连瓶颈}
-
-当核心数增加后吞吐不再增长，原因可能不是算术，而是内存控制器、互连或一致性目录压力。证据要从共享写和远端访问入手。
-
-实验设计：把任务从共享队列改成分片队列，观察是否减少所有权迁移。
-
-\topic{队列槽位}
-
-多生产者队列的 head、tail 和状态字段容易形成共享热点。队列设计必须把控制字段与数据槽位分开看。
-
-实验设计：给队列状态加对齐和分片指标，说明哪些字段被频繁写。
-
-\topic{降级策略}
-
-没有 NUMA 设备时仍能学习原则：用线程绑定、false sharing、共享计数器和队列热点模拟拓扑成本。不能验证远端内存时要诚实说明。
-
-实验设计：报告列出可验证项、替代实验和不可验证项。
-
-\topic{项目接口}
-
-PlacementPlan 不只是记录 node 编号，还要连接数据分片、worker、partial、合并层级和证据来源。没有这个对象，拓扑优化会散落在命令行里。
-
-实验设计：每个分片输出建议位置、实际位置和合并路径。
-
-\section{共享内存真正共享的是 cache line、页面和互连带宽}
-
-NUMA 和一致性章节要从一个反直觉现象开始：线程越多，程序越慢。初学者会怀疑线程池写错了，或者认为 CPU 核心不够；但如果所有线程都 \code{fetch_add} 同一个计数器，真正发生的是同一条 cache line 的所有权在核心之间来回迁移。共享内存模型让地址看起来统一，硬件却必须维护“谁能写这条线”的协议。读者理解这一点，才会知道为什么线程本地 partial 是原则，不是微优化。
-
-一致性流量和 false sharing 可以用同一张图解释。多个核心读同一条线，硬件可以复制；多个核心写同一条线，写者需要独占；多个线程写相邻数组元素，如果这些元素落在同一条 cache line，也会互相干扰。源码里变量不同，不代表硬件里位置不同。实验不要一上来讲复杂 NUMA，先让每线程计数槽位相邻，再加 \code{alignas(64)} 或填充，对比扩展曲线。这个小实验能解释大量并发性能问题。
-
-NUMA 把问题再放大一层。页面由哪个 node 提供，线程在哪个 CPU 上运行，决定了访问是本地还是远端。主线程初始化一个大数组，然后把任务分给其他 node 上的 worker，可能让所有 worker 都访问主线程所在 node 的内存。first touch 的意义就在这里：初始化和计算使用同样的切分，让页面归属靠近使用者。它不是一条命令，而是一种数据放置策略。
-
-但是绑定也不是万能。线程绑得太死，负载不均时调度器无法帮你迁移；容器或手机环境可能隐藏拓扑；云实例的 NUMA 信息也可能受虚拟化影响。教材要教读者写限制：我能看到哪些 CPU，能否看到 node，能否读 \filepath{/proc/self/numa_maps}，能否使用 \cmd{numactl}。不能验证远端访问时，就退回 false sharing、共享计数器和线程迁移实验，不要编造 NUMA 结论。
-
-本章的工程设计落到分层 partial。日志统计可以先按 worker 聚合，再按 node 合并，最后全局合并。这样做的好处不只是减少锁竞争，也是在拓扑上减少跨 node 写入。代价是合并阶段更复杂，内存占用增加，结果提交要等更多阶段完成。教材要把收益和代价一起讲：若输入很小，分层合并可能不值得；若 key 高度倾斜，分层只能缓解部分热点；若任务调度频繁跨 node，局部性仍会被破坏。
-
-源码阅读可以从调度拓扑、内存策略和 numa maps 开始。用户态不需要照搬内核调度器，但要学会它如何描述 CPU 层级、负载和亲和性。读者做报告时，应把实际 CPU、建议 node、实际 worker、partial 所在位置和合并路径写在一起。这样后续任务运行时和分布式 combine 才能复用本章知识：跨 node 的远端内存，在集群里会变成跨机器网络；线程本地 partial，在分布式里会变成 map-side combine。
-
-\topic{案例推导：全局计数器如何一步步变成分层聚合}
-
-旧版本统计错误数量时，所有 worker 对同一个 \code{std::atomic} 计数器执行 \code{fetch_add}。单线程很快，四线程也还能接受，线程再多后吞吐下降。表面看，atomic 已经避免数据竞争；实际瓶颈是所有核心争夺同一条 cache line 的修改权。这个案例适合让读者区分“正确”和“可扩展”：atomic 让结果正确，却没有让共享写变便宜。
-
-第一步改成每线程槽位。每个 worker 写自己的计数，最后合并。若槽位相邻，仍可能 false sharing，因此要让槽位按 cache line 分隔，或把多个热计数组织成线程本地结构。第二步按 NUMA node 合并。每个 node 内部先合并成本地 partial，再跨 node 合并，减少远端写。第三步把这个原则推广到 histogram：每线程本地桶、每 node 合并、最后全局合并。
-
-这个优化也有代价。读取“当前全局计数”不再是一次 load，而要合并多个槽位；内存占用增加；线程数量变化时槽位管理更复杂；若 key 数量很大，每线程桶可能爆内存。教材不能只说“分片更快”，还要告诉读者什么时候不值得。低频计数、少线程、小输入，mutex 或 atomic 可能更简单；高频共享写和多核扩展，分层 partial 才值得。
-
-实验要有扩展曲线。横轴是线程数，纵轴是吞吐和每条记录成本；版本包括全局 atomic、相邻槽位、对齐槽位、node partial。若设备没有 NUMA，就至少完成前三个版本，并在报告中写明 NUMA 不可验证。若能读取拓扑，就记录 worker 绑定、页面 first touch 和合并层级。不要只写最终数字，要写瓶颈从共享写迁移到内存带宽或合并成本的过程。
-
-Linux 源码阅读可以看调度拓扑和内存策略，但读者真正要带走的是一个工程问题：数据在哪里被首次触碰，之后由谁频繁写。贯穿项目中，PlacementPlan 应让每个分片知道建议位置和实际执行 worker。否则调度器、数据布局和合并算法会各自为政，NUMA 知识又会退回口号。
-
-\topic{第一部分综合案例：从一条记录的地址到一台机器的拓扑}
-
-第一部分四章合在一起，要让读者形成一个完整判断：一段程序慢，不一定慢在源码看起来最复杂的地方，而是慢在执行路径上最受限制的资源。我们用同一个日志解析任务贯穿。输入是一批文本行，解析器找分隔符，提取事件类型和用户 id，本地聚合后写出 partial。先单线程运行，再多线程运行，再观察缓存和 NUMA 行为。这个任务不复杂，正适合把硬件执行模型讲清。
-
-第一步看热循环。解析器逐字节扫描，如果每个字符都进入复杂状态机，前端供给、分支预测和依赖链都会影响吞吐。优化前先看输入分布：分隔符位置是否规律，错误行比例是多少，字段长度是否随机。若随机性高，分支预测失败会增加；若函数边界多，前端和调用开销会增加；若状态依赖强，自动向量化可能失败。热循环报告要记录这些观察，而不是只写“parser 慢”。
-
-第二步看地址序列。解析后如果保存大结构体数组，聚合只需要事件类型，却会搬运原始文本指针、调试字段和错误信息。冷热分离把热字段放进连续数组，减少 cache line 浪费，也让 SIMD 和预取更容易。可是冷字段不能丢，因为错误报告仍需要原始行和 offset。于是 AddressTrace 和 LayoutPlan 必须连接：热路径看连续字段，冷路径通过稳定 id 回查原始信息。硬件优化不能破坏可诊断性。
-
-第三步看 TLB 和 page cache。输入来自文件时，第一次读取和第二次读取成本可能不同；mmap 版本第一次访问页面时可能触发 minor fault；普通 read 版本把读取和解析的生命周期显式化。报告要写清楚测的是冷文件、热 page cache，还是解析后内存批次。若没有权限清理 page cache，就用不同文件或大于内存的数据集替代，并标注限制。这样的诚实比伪精确更有价值。
-
-第四步看多线程后的共享写。单线程 parser 优化完成后，多线程聚合可能不再慢在解析，而慢在共享计数器。所有 worker 更新同一个 atomic 计数器，会让同一条 cache line 的所有权来回迁移；改成本地 partial 后，瓶颈可能迁移到合并阶段或内存带宽。这里要把第二章的热循环证据和第四章的一致性证据放在一张表里：优化前慢在哪里，优化后慢到哪里去了。
-
-第五步看 NUMA 和拓扑。若主线程读取并初始化所有 batch，再把 batch 分给其他 node 上的 worker，远端访问可能隐藏在计算阶段。first touch 策略要求初始化和计算采用同样切分；线程绑定要求报告写清 CPU mask 和实际 worker。没有 NUMA 设备时，也可以用 false sharing 和线程迁移实验训练同一思维。不要因为环境限制就跳过拓扑，也不要在无证据时写“NUMA 导致”。
-
-这个综合案例的最终输出是一份硬件证据包。它至少包含：热循环反汇编摘要、输入分布、字段冷热表、地址序列说明、page cache 状态、共享写位置、partial 合并层级、线程绑定策略和不可验证边界。读者若能从这份报告解释“为什么某次优化有效、为什么下一次优化无效、瓶颈迁移到了哪里”，第一部分就达到了目标。硬件原理不是芯片图背诵，而是能把源码、地址、线程和拓扑放进同一条因果链。
+这个结构不直接要求 CPU id，是为了先表达策略，再逐步接入真实 affinity。没有 NUMA 信息时，所有 worker 属于 group 0；绑定不可用时，仍然可以做逻辑分层实验，并在报告中记录未绑定。平台能力强时，group 可以映射到真实 NUMA 节点；平台能力弱时，group 只是逻辑分组。
+
+\topic{trace 里必须有拓扑事实}
+一次运行突然变慢，如果 trace 里只有线程 id，很难判断原因。更有用的字段包括 worker id、实际 CPU、逻辑 group、建议 group、数据块 id、partial 地址范围、初始化线程、合并层级、远端执行次数和绑定失败原因。这样报告能回答：慢线程是否迁移，页面是否集中在一个节点，某个 partial 是否可能 false sharing，最终合并是否把远端读集中到一个线程。
+
+\begin{lstlisting}[language=C++,caption={拓扑运行摘要的示例形态}]
+struct PlacementTrace {
+  std::int32_t worker_id = -1;
+  std::int32_t actual_cpu = -1;
+  std::int32_t actual_group = -1;
+  std::int32_t preferred_group = -1;
+  std::uint64_t data_block_id = 0;
+  std::uint64_t processed_bytes = 0;
+  std::uint64_t local_tasks = 0;
+  std::uint64_t remote_tasks = 0;
+  std::uint64_t steal_count = 0;
+};
+\end{lstlisting}
+
+拓扑只影响性能和局部性，不应改变任务语义。任务无论在哪个 worker 上执行，checksum、错误集合和输出合同都必须相同。测试可以先随机打乱 placement，确认结果一致；再启用本地优先策略，测性能和局部性。这样调度策略和业务正确性不会纠缠。
+
+\topic{降级设计是接口质量的一部分}
+很多运行环境没有多 NUMA 节点，或没有权限设置 affinity，或不能读取性能计数器。代码必须能降级：读取不到真实 node 时退化成一个 group；绑定失败时记录失败并继续；不能控制内存策略时仍可做普通分块；不能读取 cache-to-cache 事件时用扩展曲线、padding 对照和合并耗时代替。
+
+降级不等于忽略拓扑。即使只有一个 group，程序仍然可以保留 worker-to-group 映射、分层 partial 接口、队列分片和 trace 字段。这样同一份代码在普通设备上可运行，在服务器上能启用更多策略。更重要的是，报告会诚实说明哪些策略真的生效，哪些只是逻辑结构。
+
+\section{实验：从共享计数走到分层归约}
+
+本章实验可以使用同一个日志统计任务。输入固定，语义固定，逐步改变共享形态。版本一使用全局 atomic 计数；版本二使用每 worker 计数；版本三把每 worker 计数按 cache line 隔离；版本四按 group 做分层 partial；版本五把最终合并改成树形。每个版本输出相同 checksum 和计数结果，只改变写路径和合并路径。
+
+\begin{center}
+\begin{tabular}{p{0.17\linewidth}p{0.36\linewidth}p{0.35\linewidth}}
+\toprule
+版本 & 改动 & 要观察的现象 \\
+\midrule
+全局 atomic & 每条记录更新同一计数器 & 线程数增加后共享写是否饱和 \\
+worker partial & 热路径写本地计数 & 热循环是否加速，合并是否出现 \\
+aligned partial & 隔离高频写槽位 & false sharing 对照是否明显 \\
+group partial & 先组内合并，再全局合并 & 远端合并和页面放置是否影响结果 \\
+tree merge & 固定合并树 & 最终合并长尾是否下降，语义是否保持 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{实验矩阵不要只跑一个数字}
+每个版本至少改变线程数、输入规模和任务粒度。线程数展示扩展曲线；输入规模决定数据是否超出缓存和内存带宽上限；任务粒度决定队列和调度成本是否显著。若只有一个线程数和一个输入规模，结果很容易被偶然因素支配。
+
+分段计时必须保留：读取或生成输入、初始化页面、热循环、本地合并、组内合并、跨组合并、写出结果。线程本地 partial 常让热循环变快，却可能增加合并阶段；padding 可能减少 false sharing，却增加扫描字节；NUMA 分层可能减少远端访问，却在负载不均时增加等待。没有分段计时，优化只是把成本藏到别处。
+
+\topic{共享写和远端读要分开测}
+一个扩展曲线停住，可能是共享计数器在争 line，也可能是远端读占用互连，也可能是最后合并串行化。实验要设计能拆分原因的版本：只读本地数据观察带宽和页面放置；线程本地 partial 观察本地写和合并；全局 atomic 观察一致性流量；故意交叉 worker 和数据块观察远端访问。
+
+若有 \cmd{perf c2c}、uncore 计数器、\cmd{numastat} 或平台 PMU，可以记录更强证据。若没有权限，不应写具体互连流量数字，而应写“结果符合共享写热点假设”或“当前设备无法直接验证远端访问”。结论的强度必须匹配证据。
+
+\topic{拓扑记录优先于事后猜测}
+实验开始前记录 \cmd{lscpu}、\cmd{numactl --hardware}、\filepath{/sys/devices/system/node/}、可见 CPU mask、容器 cpuset、worker 数、绑定策略、自动 NUMA balancing 状态和输入规模。受限环境中至少记录可见 CPU 数、调度限制和缺失项。没有背景材料，后面看到曲线变化只能猜。
 
 \begin{labbox}
-实验：在支持 NUMA 的机器上，用 \cmd{numactl --hardware} 查看节点。写一个大数组初始化和求和程序，比较单线程初始化、多线程初始化、线程绑定和未绑定情况下的带宽。如果没有 NUMA 机器，也要用 \cmd{lscpu} 记录拓扑并解释限制。
+实验：实现全局 atomic、worker partial、aligned partial 和 group partial 四个版本。每个版本输出相同 checksum、错误计数、线程数、worker 到 group 映射、初始化策略、热循环耗时、合并耗时和未验证边界。若当前设备没有可观察 NUMA 节点，仍然完成前三个版本，并把 group partial 作为逻辑分组运行。
 \end{labbox}
 
-\topic{从一个全局计数器推导一致性流量}
-多核程序最容易写出的错误性能模型，是认为多个核心同时加一个计数器就会线性变快。全局计数器在语义上只有一个变量，但在硬件上对应一个 cache line 的所有权反复迁移。核心 A 写完后，核心 B 要写就必须获得该 cache line 的独占状态，随后核心 C 又来抢。这个过程让互连上传输的不只是数据，还有所有权和失效消息。计数器越热，核心越多，迁移越频繁，程序越不像并行计算，越像所有核心排队修改同一小块内存。
+\topic{判读扩展曲线}
+全局 atomic 若在少线程时足够快，不说明它永远合适；若线程增加后吞吐停住，说明共享写假设值得检查。Worker partial 若大幅改善，说明热共享写很可能参与成本。Aligned partial 若比紧凑 partial 快，说明 false sharing 可能存在；若不变，瓶颈可能不在相邻槽位。Group partial 若只在多节点机器上改善，说明远端放置和合并路径参与；若在单节点机器上无收益，这是合理结果。
 
-因此本章要从全局计数器的事故讲起。第一版每条记录直接更新全局 \code{std::atomic<std::uint64_t>}，正确但可能慢。第二版每个线程一个局部计数器，最后归并，减少共享写。第三版为局部计数器加 cache line padding，避免多个线程的计数器落在同一 cache line 上造成 false sharing。第四版按 NUMA node 做分层 partial，先节点内合并，再跨节点合并。每一步都不是技巧堆叠，而是把共享写从高频路径移到低频路径。
+判读还要写成本迁移。优化后瓶颈可能从全局写迁移到内存带宽，从热循环迁移到最终合并，从共享 line 迁移到队列调度。好的报告不只写“版本四最快”，还要写“版本二消除了热路径共享写，版本三排除了相邻槽位争用，版本四在本机器上没有额外收益，因为只有一个可见 NUMA 节点”。
 
-\topic{False sharing 要用内存布局解释}
-False sharing 的本质是两个逻辑无关的变量落在同一 cache line 上。线程 A 写变量 x，线程 B 写变量 y，源码上看没有共享；硬件上它们共享同一 cache line，写入仍会导致所有权争用。很多初学者只在“共享变量”上找问题，忽略了 cache line 是一致性的基本粒度。结构体数组、相邻计数器、队列头尾字段、worker 统计字段，都可能出现这种问题。
+\section{Linux 观察入口和源码阅读}
 
-修复 false sharing 也不是到处 padding。Padding 会增加内存占用，可能降低缓存容量利用率。只有高频跨线程写字段才值得隔离。低频配置字段、只读字段或同一线程访问的字段不需要每个都占一行。项目里的 \code{WorkerStats} 应把每个 worker 高频写的 counters 放在独立 cache line，汇总线程低频读取；而共享配置和只读表可以紧凑存放。这样做体现的是访问模式驱动布局。
+Linux 上可以从用户态观察入口开始：\cmd{lscpu} 查看 CPU、socket、core、SMT 和 cache 信息；\cmd{numactl --hardware} 查看 NUMA 节点和距离；\filepath{/sys/devices/system/cpu/} 和 \filepath{/sys/devices/system/node/} 提供拓扑文件；\filepath{/proc/self/status} 可以看到部分 CPU mask；\filepath{/proc/self/numa_maps} 在可用时显示页面放置线索；\cmd{perf stat}、\cmd{perf c2c} 和 \cmd{numastat} 在权限允许时提供计数证据。
 
-\topic{NUMA 的第一原则是内存有归属}
-NUMA 不是“内存慢一点”的抽象说法，而是页面有物理归属，核心访问本地节点和远端节点的成本不同。Linux 通常采用 first touch 策略，哪个 CPU 首次写入页面，页面就可能分配到对应节点。若主线程初始化全部大数组，然后 worker 分布在多个 NUMA node 上处理，很多 worker 会访问远端页面。正确做法可能是并行初始化，让每个 worker 触摸自己负责的页；也可能是显式设置绑定和内存策略；也可能是按 node 切分任务和数据。
+线程绑定可以从 \cmd{taskset}、\cmd{numactl --physcpubind}、\cmd{numactl --cpunodebind} 或程序内 affinity API 开始。内存策略可以用 \cmd{numactl --membind}、\cmd{numactl --interleave} 和 first-touch 对照观察。工具只是入口，真正的问题仍然是：线程在哪，页面在哪，谁高频写，合并怎样跨越拓扑。
 
-贯穿项目中，输入 split、局部聚合表、shuffle buffer 和任务队列都应该有放置策略。线程本地 partial 若被分配在错误节点，局部性会丢失；work stealing 若随意跨节点偷任务，负载均衡可能换来远端内存访问；全局 merge 若集中到一个节点，会把所有 partial 拉过互连。NUMA 优化的目标不是永远不跨节点，而是把跨节点访问变成低频、批量、可解释的操作。
+\topic{源码阅读从窄问题进入}
+不要试图一次读懂完整调度器或完整内存管理。更稳的入口是带着一个实验问题追踪对象：线程迁移时哪些 mask 和调度域参与；first-touch 触发缺页后，VMA 策略怎样影响页面分配；自动 NUMA balancing 怎样采样访问并迁移页面；per-cpu 变量和 slab 本地缓存怎样减少共享写。
 
-\topic{实验：从共享计数到分层归约}
-本章实验可以统计事件类型。输入分布固定，算法语义固定，逐步改变共享形态。版本一全局 atomic 计数；版本二每线程数组；版本三 padding 每线程数组；版本四按 NUMA node 分组；版本五把最终合并改成树形。每个版本记录吞吐、cache miss、远端访问指标、线程间方差和合并时间。若缺少硬件计数器，也至少记录不同线程数下的扩展曲线。
+可以从 \filepath{kernel/sched/topology.c} 理解调度域和 CPU 层级，从 \filepath{mm/mempolicy.c} 理解 NUMA 策略，从 page fault 和页面分配路径理解 first-touch，从 per-cpu 相关代码理解“把共享状态拆到局部”的内核版本。阅读报告不需要复制所有函数名，应回答一个具体问题：某个用户态实验现象能否映射到内核对象和状态变化。
 
-这个实验要特别关注反常情况。线程少时，全局 atomic 可能足够快，分层结构反而增加合并成本；事件类型很多时，每线程数组内存变大，缓存命中下降；热点极强时，局部聚合收益明显；NUMA node 很少或移动设备上拓扑简单时，复杂放置策略没有收益。教材要教读者解释这些差异，而不是给出固定答案。
+\topic{证据等级}
+报告可以把证据分成三层。第一层是直接测到的数字：耗时、吞吐、线程数、绑定、合并时间、计数器事件。第二层是从源码或硬件模型推导出的解释：某条 line 可能发生所有权迁移，某个页面可能在 first-touch 时落到 node 0。第三层是当前设备无法验证的合理假设：没有 uncore 计数器时，不能写互连字节，只能写结果符合或不符合某个假设。
 
-\topic{Linux 源码阅读连接点}
-读 Linux NUMA 和调度相关代码时，关注任务迁移、CPU mask、内存策略和 page fault 后的放置。内核不会把“线程”当作孤立执行单元，它一直在处理任务、CPU、内存节点和负载之间的关系。读 RCU、per-cpu 变量和 slab 分配器时，也能看到把共享状态拆到 per-cpu 或局部缓存的思想。它们不是为了炫技，而是为了减少高频共享写和锁争用。
+这不是形式主义。NUMA 和一致性问题很容易被机器差异放大。把证据等级写清，别人才能知道哪些结论可复现，哪些需要换机器继续验证。
 
-把这些思想带回 C++ 项目，读者应该能设计三层统计结构：worker-local、node-local、global。worker-local 追求无共享和 cache 热；node-local 负责同节点合并；global 只在阶段边界出现。这个结构会在后续并行归约、任务运行时和分布式 combine 中反复出现，是第二册的重要主线。
+\section{贯穿案例：日志统计的拓扑化改造}
 
-\topic{事故复盘：全局 atomic 为什么把拓扑拉进来}
-一个全局 atomic 计数器在四个线程下看起来还能接受，线程数继续增加后吞吐突然停住。代码里只有一次 fetch add，表面上比加锁短很多；硬件里却发生了 cache line 所有权在核心之间来回迁移。若线程跨 NUMA 节点，迁移还要经过互连。所谓共享内存并不是没有位置，cache line 的 owner、页的 home node、线程运行在哪个 CPU，都会进入成本模型。
+把前四章连起来看，一个日志统计程序的瓶颈会沿着硬件路径迁移。第二章先看热循环：解析器的分支、指令足迹和依赖链是否让单核心前端或乱序窗口受限。第三章看地址：热字段是否连续，cache line 里有效字节比例如何，DTLB 是否被随机对象图击穿。第四章加入多核心：热计数器是否共享写，partial 是否 false sharing，页面是否在使用者附近，合并是否跨节点集中。
 
-这个事故能推出分层 partial。先让每个 worker 写自己的局部计数，避免热 cache line 在核心间抖动；再按 NUMA node 合并，减少跨节点流量；最后由一个线程汇总全局结果。这个结构改变了写路径，也改变了报告方式：不能只看最终计数，要记录每层 partial 的数量、合并时机、线程绑定和页面放置。Atomic 不是低级错误，它适合低频状态或线性化点，不适合高频共享写热点。
+\topic{第一步：固定语义 reference}
+优化前先有 reference。输入记录、错误判断、事件类型统计、输出顺序和 checksum 必须固定。后续把全局计数器拆成 partial、把合并变成树形、把队列分片，都不能改变语义。若浮点或顺序敏感结果会变化，必须先写合同，而不是用性能改动掩盖差异。
 
-实验要把拓扑写进结论。线程数、CPU 列表、NUMA node、内存首次触碰位置、绑定策略都要可复现。若关闭绑定后结果波动很大，说明调度迁移已经影响 cache 热度；若本地 partial 快但最终合并长尾，说明瓶颈迁移到了归约阶段；若远端内存访问占比高，说明 first-touch 或分配策略有问题。NUMA 章不是让读者背拓扑名，而是让共享状态重新获得物理位置。
+\topic{第二步：把热写移出主循环}
+朴素版本每条记录更新全局 \code{processed_count} 和 \code{error_count}。改造后，每个 worker 在局部变量里累加，批次结束写入自己的 partial。若需要运行中进度，可以让监控线程低频汇总 partial，并明确这只是近似快照。这样热路径不再为每条记录争同一条 line。
 
+\topic{第三步：按写者设计布局}
+\code{WorkerStats} 不应把所有字段随意放在一个结构体数组里。每个 worker 高频写的计数器应与其他 worker 隔离；只读配置可以紧凑；低频诊断字段可以单独存放；合并线程读的字段要考虑扫描成本。布局不是按对象归属决定，而是按写者、频率和阶段决定。
 
-\topic{共享写实验实验判读}
-全局 atomic、线程本地 partial 和 NUMA 分层版本的结果要放在同一张扩展曲线里看。线程数少时全局 atomic 不一定差，线程数多后若吞吐停住，就检查 cache line 迁移和合并阶段。padding 后变快说明 false sharing 可能存在；padding 后不变，说明瓶颈可能不在同一行写。NUMA 结论必须写机器拓扑，不能从普通单节点设备外推。
+\topic{第四步：把页面初始化纳入算法}
+输入 buffer、partial 表、临时聚合表和输出 block 都有页面归属。大数组若由主线程统一清零，后续 worker 可能远端访问。更稳的做法是按 worker 或 group 初始化自己将要使用的范围。初始化耗时可以单独计入，也可以作为预处理阶段报告；不能既让初始化影响页面，又在报告里假装它不存在。
 
+\topic{第五步：分层合并并记录成本}
+每个 worker 先生成本地统计；同 group worker 先合并成本组统计；最后合并全局结果。报告拆分热循环、组内合并、跨组合并和写出。若跨组合并成为长尾，可以改成树形；若组内负载不均，要调整分块或窃取策略；若输入很小，回到更简单版本。拓扑化改造不是单向加复杂度，而是在证据下选择合适层级。
 
-这一段也服务于复习。读者合上书后，应该能凭本章的判读口径重新审查自己的代码：有没有最小正确版本，有没有能击穿旧方案的输入，有没有状态记录，有没有资源指标，有没有失败后的恢复动作。若五个问题缺两个以上，就说明实现还停在演示层，而不是工程层。
+\topic{第六步：把 trace 留给后续章节}
+任务运行时、工作窃取、原子内存序、lock-free 结构、并行 reduce 和分布式 shuffle 都会复用本章对象。PlacementHint、WorkerTopology、PlacementTrace 和分层 partial 不是孤立设计，而是让后续章节能继续讨论“任务在哪里、数据在哪里、结果怎样提交”。单机里的远端 group 到分布式章节会变成远端机器；本地 partial 到分布式章节会变成 map-side combine。
 
+\section{常见误区和边界}
 
-\topic{从 false sharing 反推结构体布局}
-false sharing 的教学案例可以从 worker 统计开始。每个 worker 只写自己的 completed、failed、stolen 计数，看起来没有共享；如果这些字段在数组里连续排列，多个 worker 可能写同一条 cache line。修复不是给所有结构体都 padding，而是先确认哪些字段被不同线程高频写，再只隔离这些字段。
+\topic{误区一：atomic 一定比锁快}
+Atomic 的路径短，不代表适合高频共享写。低频状态位、任务完成标志、引用计数和线性化点可能适合 atomic；每条记录更新一次的全局计数器通常不适合。锁也不是一概错误：低频复杂不变量用 mutex 可能更清楚、更快。选择同步原语前，先判断热路径频率和共享范围。
 
-报告里应画出逻辑字段和 cache line 的关系。字段 A 和字段 B 在源码上相邻，不代表它们应该共享缓存行；字段 C 和字段 D 虽然属于同一对象，但若一个只初始化时写、另一个每个任务都写，热度不同也应分开。布局不是按面向对象归属决定，而是按写者、频率和共享粒度决定。
+\topic{误区二：padding 越多越好}
+Padding 只解决特定 false sharing，不解决内存带宽、TLB、合并长尾或负载不均。过度 padding 会扩大对象，降低缓存容量利用率，增加合并扫描字节。只隔离不同线程高频写的字段；对只读或低频字段保持紧凑。
 
-NUMA 版本继续把这个思想放大。每个 node 内先合并局部 partial，跨 node 只在阶段边界交换汇总。若工作窃取跨 node 发生，要记录被偷任务访问的数据是否仍在远端。这样读者能看到单条 cache line 的所有权迁移和跨节点内存访问是一条连续问题，而不是两个独立概念。
+\topic{误区三：绑定线程一定提升性能}
+绑定能稳定位置，也可能破坏调度灵活性。移动设备上，固定大核可能触发降频；服务器上，错误绑定可能把 worker 集中到同一 LLC 或同一内存节点；容器中，绑定可能和 cpuset 冲突。绑定是实验变量和部署策略，不是无条件优化。
 
-\topic{实验课：从一个全局计数器走到分层 partial}
-第一版让所有 worker 对一个全局 atomic 计数器做加法。第二版改成每个 worker 一个计数器，最后串行合并。第三版给每个 worker 计数器加 cache line 隔离。第四版按 NUMA node 建 node local partial，再做全局合并。第五版把合并改成树形，避免单个线程长时间处理所有 partial。
+\topic{误区四：NUMA 优化永远值得}
+若输入很小，数据在 LLC 内，NUMA 策略可能没有收益；若任务高度不均，本地优先可能让 worker 空闲；若只有单节点机器，复杂分层只会增加代码；若热路径很快压缩成小 partial，远端访问时间占比可能很低。先测远端成本和共享写成本，再引入拓扑策略。
 
-每个版本都要在不同线程数下画扩展曲线，并记录每个 worker 的任务数、写入次数、合并时间和最终 checksum。若有工具支持，再记录 cache-to-cache 或 LLC 相关事件；没有工具时，也可以用 false sharing 对照实验：相邻计数器和隔离计数器在相同输入上的差异。实验的目标不是证明某个技巧永远快，而是观察共享写频率怎样改变系统形状。
+\topic{误区五：工具数字可以脱离模型}
+计数器事件、cache miss、LLC miss、remote access 和 c2c 报告都需要上下文。一次 miss 可能有用，因为它带回后续许多字节；一次远端访问可能无害，因为发生在低频合并；一个 atomic 事件可能很贵，因为发生在每条记录。工具提供证据，不替代因果链。
 
-判读时要把合并阶段单独列出。线程本地 partial 常常让热路径变快，但增加最后合并；padding 可能减少 false sharing，但增加内存占用；NUMA 分层可能减少远端访问，但如果任务负载不均，跨节点窃取仍会出现。报告要写成本迁移：从共享写迁移到合并，从全局争用迁移到局部内存，从计算路径迁移到调度路径。
-
-这个实验还要连接分布式思想。Worker local partial 对应线程本地聚合，node local partial 对应节点内合并，最终 global merge 对应集群 reduce。读者如果理解这个层次，后面看到 map side combine、shuffle partition 和 reduce tree 时，就不会把它们当成新概念。
-
-\topic{共享写练习验收重点}
-合格答案要画出共享 cache line 或共享页面。只说“用线程本地变量”不够，必须说明全局写如何变成局部写和阶段合并，padding 保护了什么字段，first touch 怎样影响页面位置。没有 NUMA 机器时，答案要诚实写只能验证 false sharing 和扩展曲线。
-
-答案还要写“为什么不采用更复杂方案”。例如没有证据证明队列是瓶颈，就不应把锁队列换成无锁；没有证明输出顺序可变，就不应随意重排；没有证明错误路径能恢复，就不应只提交正常路径。能解释不做什么，说明读者开始具备工程判断。
-
-最后，答案必须包含可复查材料。至少有输入摘要、关键状态、期望输出、实际输出、运行命令和未验证边界。没有这些材料，老师或同伴无法判断结论是否成立。第二册的作业不是让读者写漂亮段落，而是训练读者把系统问题变成可验证证据。
-
-\topic{项目实现：NUMA、互连与缓存一致性}
-本章对应的贯穿项目实现不要求一次写成完整框架，但必须有最小可运行切片。这个切片包含三个部分：一个 reference，一个带本章机制的实现，一个能击穿 reference 之外隐含假设的测试。Reference 用来固定语义，机制实现用来展示本章知识，测试用来证明新增复杂度确实解决了问题。
-
-代码组织上，不要把所有内容放进一个大文件。基础类型、输入生成、核心机制、报告输出和测试应分开。即使当前只是教学项目，也要让目录能表达责任边界。这样后续章节接入时，不会因为找不到状态归属而重新发明一套对象。
-
-每个实现都要输出一段机器可读摘要。摘要至少包含输入规模、关键状态、错误数、输出校验、耗时和未验证边界。这里的机器可读不要求复杂格式，简单的 key value 文本也可以。关键是让脚本和读者都能复查，而不是只能看屏幕截图。
-
-测试应包含正常路径、边界路径和失败路径。正常路径证明功能可用；边界路径证明长度、容量、尾部、空输入、关闭或超时没有遗漏；失败路径证明本章机制不是装饰。若失败路径写不出来，往往说明本章概念还没有落到工程对象上。
-
-报告最后写一个取舍段。新增机制带来了什么好处，增加了什么成本，哪些场景不应该使用它，下一章会复用哪个字段或对象。这个取舍段非常重要，因为系统工程不是把所有高级机制都加进去，而是在证据和约束下选择合适的边界。
-
-\topic{调试笔记：扩展曲线停住时分离热路径和合并路径}
-多线程扩展曲线停住后，先看热路径是否还在共享写，再看合并路径是否变成长尾。全局 atomic 停住，可能是一致性流量；线程本地 partial 停住，可能是内存带宽或合并成本；NUMA 版本停住，可能是跨节点偷任务或远端页面。每个解释都需要不同证据。不要把所有扩展失败都归因于线程太多。
-
-
-\topic{复查清单：NUMA、互连与缓存一致性}
-复查本章时，先检查 reference 是否仍然存在。没有 reference，后面的并发、优化、异步或分布式改造都无法证明语义没有变。再检查压力输入是否尖锐：它应当攻击本章最核心的边界，而不是只把数据量放大。第三，检查状态是否可观察：关键对象的身份、状态、错误和提交结果应能在报告中找到。
-
-第四，检查代码示例是否说明禁止行为。调用者不能做什么，往往比能做什么更能体现工程质量。第五，检查实验是否写出未验证边界；当前设备、权限或输入无法证明的结论，必须标注。第六，检查本章对象是否能被下一章复用，不能复用就说明边界还不稳。
-
-完成这六项后，再看文字是否连贯。每个概念都应从问题推出，每个案例都应从朴素方案走到改进方案，每个实验都应能解释一个判断。若某段话放到其他章节也成立，就把它改成本章的具体对象、具体输入和具体失败。
-
-\section{工程案例：把多线程归约放回 NUMA 和一致性协议}
-
-多线程归约看起来很简单：把数组切成几段，每个线程算一段，最后合并。可是在线程数增加到跨 socket 或跨 NUMA 节点后，性能可能突然停住甚至下降。原因往往不在加法本身，而在页面放置、cache line 所有权、一致性流量、互连带宽和线程迁移。NUMA 章要把“共享内存”从抽象地址空间放回真实拓扑。
-
-\topic{一、共享地址空间不等于同等距离}
-在 NUMA 机器上，所有线程看见同一虚拟地址空间，但物理页有位置。线程访问本地节点内存和远端节点内存，延迟和带宽不同。若主线程单线程初始化整个数组，页面可能集中在一个 NUMA 节点；随后多个节点上的 worker 并行读取时，远端访问会淹没计算。这个问题在小机器上不明显，在多 socket 服务器上非常常见。
-
-first-touch 策略说明页面位置常由首次写入决定。因此并行程序不仅要并行计算，还要按最终访问计划并行初始化。若每个 worker 将来处理某个块，就让它先触碰这个块的页面。这样内存放置和执行位置一致。这个原则比背 NUMA API 更重要：数据在哪里，线程就尽量在哪里执行。
-
-\topic{二、线程本地 partial 同时解决共享写和远端写}
-全局原子计数器在多核下有两个问题。第一，所有线程写同一 cache line，造成一致性迁移。第二，若该 line 常驻某个节点，其他节点写入还要跨互连。线程本地 partial 把写入分散到每个线程或每个 NUMA 节点的本地内存，热路径只写本地 line，最后再合并。它不是单纯算法技巧，而是拓扑感知的数据放置。
-
-partial 的层次也要匹配机器。每线程 partial 可以避免线程之间写冲突，但合并时可能跨节点读很多小对象；每 NUMA 节点 partial 先在节点内合并，再跨节点做一次最终合并，往往更符合拓扑。项目中的事件计数可以按 worker、NUMA node、全局三层组织。报告要写清每一层的写入频率和合并频率。
-
-\topic{三、一致性协议保护的是 cache line 所有权}
-当多个核心读同一份只读数据时，一致性成本很低；当多个核心写同一条 cache line 时，所有权必须不断迁移。锁、原子计数、队列 head/tail、引用计数都可能成为这种热点。性能曲线的典型形状是：少量线程很快，线程继续增加后吞吐不升，甚至因为互连流量下降。这个现象不能靠增加核心解决，因为瓶颈已经在协调。
-
-减少一致性流量有几种方式。第一，减少共享写，例如 partial 和批量合并。第二，隔离热点 line，例如 padding 和 alignas。第三，改变协议，例如从全局队列改成本地队列加窃取。第四，降低实时一致要求，例如监控计数周期性汇总。每种方式都在用空间、延迟或复杂度换少量共享写。
-
-\topic{四、拓扑感知队列不是越本地越好}
-任务运行时常把队列做成本地 deque，以保留 cache 和 NUMA 本地性。可是完全不窃取会让某些 worker 空闲，完全随机窃取会破坏本地性。较好的策略通常是先本地，再同 NUMA 节点，再跨节点。任务粒度也影响选择：大任务跨节点迁移成本可能可以接受，小任务迁移成本可能超过计算。
-
-Compute Systems Engine 可以在任务 trace 里记录 worker id、NUMA node、输入块所在节点和是否窃取。这样当某个阶段不扩展时，读者可以看是本地队列不均、跨节点窃取过多，还是页面放置错误。没有拓扑 trace，NUMA 问题很容易被误判为算法不够快。
-
-\topic{五、Linux 观察入口}
-Linux 提供 \cmd{numactl}、\cmd{lscpu}、\filepath{/proc/self/numa_maps}、\cmd{perf c2c} 等观察入口，具体可用性取决于环境和权限。学习时不必一次掌握所有工具，但要知道每个工具回答什么问题。\cmd{lscpu} 看拓扑，\cmd{numactl --hardware} 看节点和距离，\filepath{numa_maps} 看映射页分布，性能计数器看远端访问和 cache line 争用。
-
-如果设备没有 NUMA，例如很多手机或单 socket 机器，也能做降级实验。用线程绑定和分片 partial 观察 false sharing，用首次触页和冷启动观察 page fault，用本地队列和全局队列观察锁竞争。报告必须写明“当前设备无法验证远端 NUMA 访问”，但仍然可以学习拓扑意识。
-
-\topic{六、C++ 结构表达拓扑}
-拓扑信息不要散落在命令行字符串里。项目可以定义 \code{TopologyPlan}：worker 数量、每个 worker 所在逻辑 CPU、NUMA node、负责的输入块、partial 存放位置。算法不一定直接操作 NUMA API，但报告和运行时可以使用这个计划解释任务放置。这样从一开始就把硬件拓扑纳入工程对象。
-
-\begin{lstlisting}[language=C++,caption={拓扑计划记录 worker 和数据块的放置}]
-struct WorkerPlacement {
-    std::uint32_t worker_id = 0;
-    std::uint32_t logical_cpu = 0;
-    std::uint32_t numa_node = 0;
-    std::uint64_t input_begin = 0;
-    std::uint64_t input_end = 0;
-};
-\end{lstlisting}
-
-这个结构不承诺一定能绑定成功。绑定是操作系统能力，可能被权限、容器或移动设备限制。计划和实际观测要分开记录：计划希望 worker 在哪里，实际运行时是否迁移，输入页是否真的落在对应节点。高质量报告不会把愿望当事实。
-
-\topic{七、实验交付：分层归约}
-本章实验从数组归约开始。版本一，单线程 reference。版本二，多个线程直接写全局原子。版本三，每线程 partial。版本四，每 NUMA 节点 partial 后全局合并。版本五，加入并行 first-touch。每个版本记录总耗时、合并耗时、线程数、绑定策略、页面放置证据和 checksum。
-
-预期结果不是固定数字。小数组可能单线程最快；单 socket 机器上 NUMA 分层收益不明显；线程太多会被内存带宽限制；绑定失败时结果可能波动。教材要让读者学会解释这些情况，而不是追求一条漂亮的线性加速曲线。NUMA 学习的目标是知道什么时候拓扑是主因，什么时候不是。
-
-\section{源码阅读：从调度域和内存策略理解拓扑}
-
-NUMA 和一致性协议不只存在于硬件手册。操作系统也在用拓扑信息做调度和内存策略。源码阅读时不需要读完整调度器，而要抓住几个概念：CPU 拓扑如何组织，任务迁移为什么影响 cache，内存策略如何决定页面放置，自动 NUMA balancing 为什么可能改变实验结果。这样读者能把“线程跑在哪里”和“数据放在哪里”连起来。
-
-\topic{一、调度域说明迁移不是免费动作}
-Linux 调度器会按拓扑组织 CPU，例如 SMT sibling、同核心、同 socket、不同 NUMA 节点。负载均衡会在这些层次之间迁移任务。迁移可以让空闲 CPU 得到工作，但也可能让任务失去 cache 热度，访问远端内存。调度器不是不知道局部性，而是在负载均衡和局部性之间取舍。
-
-项目里的任务运行时也面对同样取舍。本地队列保留局部性，但可能负载不均；跨节点窃取改善利用率，但增加远端访问。读调度域的价值，是理解成熟系统也在做分层决策，而不是简单“永远绑定”或“永远迁移”。
-
-\topic{二、内存策略影响页面归属}
-内存策略可以是默认 first-touch，也可以是绑定到某节点、交错分配或优先本地。不同策略适合不同工作负载。只读大数组按访问线程分块，first-touch 很自然；共享读多写少数据可能适合 interleave；强本地队列和 partial 适合绑定。错误策略会让线程和数据距离变远。
-
-实验时要记录策略。若用了 \cmd{numactl --interleave}，就不要再把页面分散归因于 first-touch；若容器限制了 CPU 和内存节点，结果也会不同。系统书要让读者养成记录环境的习惯。
-
-\topic{三、自动 NUMA balancing 是隐藏变量}
-某些 Linux 配置会周期性采样页面访问并迁移页面，让内存更接近访问线程。它可能改善长期运行程序，也可能让短 benchmark 波动。若实验中页面位置随时间变化，第一次运行和稳定运行结果不同，就要怀疑自动 NUMA balancing 或回收策略。报告可记录相关系统设置，至少说明没有验证。
-
-这提醒读者：硬件拓扑不是静态背景，操作系统会主动调整。性能实验不能只看代码，也要看系统策略。
-
-\topic{四、拓扑章节的复核问题}
-读完本章，面对多线程程序应能回答五个问题。线程是否固定或可能迁移；数据页由谁首次触碰；共享写是否集中到少数 cache line；任务队列是否跨节点窃取；合并阶段是否把远端数据集中到一个线程。每个问题都有证据入口，而不是凭感觉判断。
-
-\section{补强案例：一致性流量如何在锁和队列中放大}
-
-一致性协议不只影响原子计数器，也影响锁和队列。一个互斥锁变量本身是一条 cache line，等待线程反复读写它；队列的 head、tail、size 若放在同一 line，不同线程会争同一所有权；条件变量唤醒后，多个线程又会竞争同一锁。理解这些细节，才能解释为什么低竞争锁很好，高竞争锁突然很差。
-
-\topic{一、锁变量也是共享写热点}
-获取锁通常要修改锁状态。多个核心竞争同一锁时，锁所在 cache line 在核心之间迁移。临界区越短，锁变量本身的迁移占比越高；临界区越长，等待和上下文切换占比越高。两种慢法不同，优化方向也不同。短临界区高竞争可以分片或减少共享；长临界区要缩短锁内工作。
-
-这解释了为什么“锁次数”不是唯一指标。一个锁每秒被获取很多次但几乎无竞争，可能没问题；一个锁每秒次数不多但每次持有很久，尾延迟很差。报告要记录等待时间和持有时间。
-
-\topic{二、队列元数据要分离读写者}
-生产者主要写 tail 和 buffer 槽位，消费者主要写 head。若 head、tail、size 放在同一 cache line，生产者和消费者会互相干扰。SPSC ring 常把 head 和 tail 分开 padding；MPMC 队列还会让每个槽位有序号，分散状态。布局不是装饰，而是减少一致性所有权迁移。
-
-带锁队列也能受益于布局。锁、条件变量、容量、统计指标、热 head tail 和冷诊断字段不应随意堆在一起。监控计数器频繁更新时，也可能和锁变量 false sharing。队列结构体要按访问者和频率组织。
-
-\topic{三、分片锁降低协调粒度}
-哈希表、任务表和计数器都可以用分片锁。每个 shard 有自己的锁和局部状态，线程只竞争相关 shard。这样减少一致性流量，但引入跨 shard 操作复杂性。例如需要全局快照、迁移 key 或关闭全部 shard 时，要按顺序获取多个锁或使用阶段协议。
-
-分片锁不是免费午餐。Shard 太少，竞争仍高；shard 太多，内存和遍历成本上升；key 倾斜会让某个 shard 仍然热点。报告应记录每个 shard 的请求分布，而不是只看总吞吐。
-
-\topic{四、拓扑实验}
-实现全局锁队列、分片队列和每 worker 本地队列三版。输入包含均匀任务和热点生产者。记录锁等待、cache line 争用替代指标、队列长度和任务完成时间。若没有 cache-to-cache 工具，也可以通过扩展曲线和等待时间推断。目标是让读者看到一致性流量如何从硬件概念变成锁和队列的工程问题。
-
-\section{补充案例：分层合并如何减少跨节点流量}
-
-多 NUMA 节点归约时，如果所有线程把 partial 发送到一个全局合并线程，跨节点流量集中，最后阶段成为瓶颈。分层合并先在每个节点内部合并，再跨节点合并少量结果。这个结构和树形 reduce、map-side combine、分布式聚合是一条线。
-
-\topic{一、节点内合并}
-同一 NUMA 节点内的 worker 把 partial 合并到 node local partial。这个阶段尽量使用本地内存和本地队列。若 worker 被迁移或 partial 分配在远端，收益会下降。因此分层合并依赖线程放置和 first-touch。
-
-\topic{二、跨节点合并}
-跨节点合并只处理每个节点的摘要，而不是每个线程的全部细节。这样减少互连字节和 cache line 迁移。代价是增加一层合并逻辑和内存。若节点内数据极不均衡，某个节点仍可能长尾。
-
-\topic{三、和分布式聚合对应}
-节点内合并对应 worker local combine，跨节点合并对应 reduce。分布式系统中，map-side combine 减少网络字节；NUMA 系统中，node local combine 减少互连字节。尺度不同，原则相同：先在便宜通信范围内合并，再跨昂贵边界传摘要。
-
-\topic{四、实验}
-模拟两层合并，即使在单 NUMA 机器上也可用线程组模拟。比较全局合并、每线程直接全局 atomic、分组 partial 后合并。记录合并时间和扩展曲线。若有 NUMA 机器，再加入节点绑定。实验目标是理解分层思想，不是依赖某台机器的具体数字。
-
-\section{从共享变量推导拓扑感知设计}
-
-多核心程序常把共享内存看成一个均匀的大空间，仿佛任意核心读写任意地址的成本都一样。真实机器不是这样。每个核心有私有缓存，多个核心通过一致性协议维护同一地址的可见性；多个 socket 或多个 NUMA 节点之间还有不同距离的内存控制器和互连。于是“共享一个变量”这件小事，会把 cache line 所有权、页面归属、远端访问和合并策略全部牵出来。NUMA 章不应从名词开始，而应从一个扩展曲线突然停住的共享计数器开始。
-
-\topic{一、共享写的瓶颈是所有权来回移动}
-多个线程同时递增同一个计数器，看起来每次只做一次加法。硬件上，这条 cache line 必须在核心之间转移独占所有权。线程越多，算术工作没有增加多少，一致性流量却快速增加。把计数器改成每线程本地 partial 后，热路径变成各自写本地 cache line，最后再合并。这个改法的本质不是“减少锁”，而是减少同一条 cache line 的所有权争夺。读者理解了这一点，后面看到 per-CPU 统计、分层归约、map-side combine 时，就能认出同一个结构。
-
-\topic{二、false sharing 是布局层面的共享写}
-两个线程写不同变量，也可能争同一条 cache line。最容易出错的例子是数组中的相邻计数器：逻辑上每个线程有自己的槽位，物理上多个槽位可能在同一条 cache line 里。padding 可以解决，但 padding 不是免费午餐，它增加内存占用，可能降低 TLB 覆盖，也可能让扫描阶段搬运更多数据。工程上应先确认写热点确实落在同一条线，再决定是否对齐、填充或改成分层布局。不能看到并发就无脑 padding。
-
-\topic{三、页面归属来自第一次触碰和后续迁移}
-NUMA 成本常被隐藏在初始化代码里。主线程分配并清零大数组，页面可能归属主线程所在节点；后续 worker 分布在其他节点上处理这些页面，就会产生远端访问。first touch 策略要求谁将来主要使用页面，谁就先触碰页面。若任务会迁移，页面和线程的关系又会变化，自动 NUMA 平衡可能迁移页面，也可能在短作业中来不及发挥作用。报告要记录线程绑定、页面初始化方式和节点内存分布，否则 NUMA 结论没有可复现性。
-
-\topic{四、分层合并把拓扑写进算法}
-拓扑感知设计的常见形态是本地处理、节点内合并、跨节点合并。比如统计日志时，每个线程先写本地计数；同一 NUMA 节点上的线程先合并成本节点结果；最后再跨节点合并。这样做的目的不是让代码看起来复杂，而是让高频写停留在近处，让低频合并承担远端成本。若输入极小，分层结构会得不偿失；若数据巨大且线程很多，分层结构可能决定扩展上限。算法是否需要拓扑感知，要由数据规模、共享写比例、远端访问成本和调度稳定性共同决定。
-
-\topic{五、把扩展曲线分解成几段看}
-评估多核程序时，不要只画线程数到总耗时的曲线。还要把耗时拆成读取、计算、本地合并、跨节点合并和写出；把指标拆成本地内存访问、远端内存访问、cache line 争用和调度迁移。若一到八线程扩展很好，十六线程以后停住，可能是内存带宽饱和，也可能是共享写热点，也可能是跨 NUMA 访问，也可能是合并阶段串行化。只有把曲线拆段，才能知道下一步该改布局、改绑定、改合并树，还是承认机器资源已经到顶。
-
-\section{NUMA 实验如何写成可复现材料}
-
-NUMA 相关问题很容易因为机器差异而变得难以复现，所以实验设计比结论本身更重要。一个合格实验不能只说“绑定以后变快”，而要写明机器拓扑、线程绑定、内存初始化、输入大小、访问模式、合并策略和测量工具。即使读者的手机或开发机没有多 socket，也可以用同一套报告格式训练拓扑意识：哪些数据靠近哪个执行实体，哪些共享写会跨核心移动，哪些合并阶段会形成串行瓶颈。
-
-\topic{一、拓扑先记录，不要事后猜}
-实验开始前先记录核心数、逻辑线程数、缓存层级、NUMA 节点和内存分布。Linux 上可以用 \cmd{lscpu}、\cmd{numactl --hardware}、\cmd{/sys/devices/system/node} 等信息；受限环境中至少记录可见 CPU 数和调度限制。没有拓扑材料，后面看到性能曲线变化时只能猜。经典系统教材读起来舒服，原因之一就是它会先把实验背景交代清楚，让读者知道结论站在哪块地上。
-
-\topic{二、初始化方式必须和执行方式配对}
-大数组如果由主线程统一初始化，页面很可能集中在主线程所在节点；若后续多个 worker 跨节点访问，就会把远端访问带入主路径。实验应比较三种初始化：主线程初始化、worker 按分片 first touch、交错分配。每种初始化都要配同一份计算逻辑。这样读者能看到“同一算法、同一线程数”也会因页面归属不同而产生差异，NUMA 不是额外玄学，而是内存所有权的一部分。
-
-\topic{三、共享写和远端读要分开测}
-一个扩展曲线停住，可能是共享计数器在争 cache line，也可能是远端读占用互连，也可能是最后合并阶段串行化。实验要设计三个版本：只读本地数据、写线程本地 partial、写共享全局计数器。只读版本观察带宽和放置，partial 版本观察本地写和合并，全局计数器版本观察一致性流量。三个版本的差异会比单个“优化前后”更能说明问题。
-
-\topic{四、合并阶段要单独计时}
-分层归约常让主计算阶段变快，却把成本移动到合并阶段。报告应把 worker 本地处理、节点内合并、跨节点合并和最终写出拆开计时。若节点内合并很快，跨节点合并很慢，说明拓扑设计有效但最后聚合仍需优化；若本地处理时间差异巨大，说明负载切分比 NUMA 更紧急。没有分段计时，优化很容易把成本藏到结尾。
-
-\topic{五、没有 NUMA 机器也能学习同一思想}
-单 socket 机器上也有缓存层级、核心迁移和共享 cache line。可以用线程绑定、padding、线程本地 partial 和合并树训练同一套思路。等迁移到多节点机器时，只是把“近”和“远”的距离拉大。教学不应把 NUMA 作为少数服务器才需要的知识，而应把它视为局部性、所有权和拓扑成本的自然延伸。
-
-\section{贯穿案例：全局计数器怎样一步步变成分层归约}
-
-本章最适合从一个很小的错误开始：日志统计程序用一个全局 atomic 记录已处理行数，每处理一行就执行一次 \code{fetch_add}。单线程正确，两线程也正确，线程数继续增加后吞吐几乎不涨，甚至下降。这个事故不需要先背 NUMA、互连、一致性协议这些词。先看事实：所有核心都在高频写同一条 cache line。每次写都要获得该 cache line 的独占权，其他核心手里的副本失效，下一次写又把所有权迁走。算术操作很小，所有权迁移很大。
-
-从这个事故出发，分层设计自然长出来。第一层，每个线程写自己的局部计数器，让高频写停在本核心附近。第二层，同一个 NUMA 节点内先合并，减少跨节点流量。第三层，再做全局合并，把远端成本降到低频阶段。这个过程不是套用“map reduce”模式，而是根据 cache line 所有权和拓扑距离推导出来的算法结构。
-
-\topic{一、atomic 解决数据竞争，不保证扩展性}
-全局 atomic 的语义是正确的：没有数据竞争，最终值准确。但正确性和扩展性不是同一件事。Atomic 给出了线性化点，代价是所有线程争一个写位置。若这个线性化点发生在每条记录上，扩展性会被一致性协议吞掉；若它发生在每个任务完成时，频率低得多，代价可能可以接受。判断 atomic 是否合适，要先问它在热路径出现多少次，而不是看到 atomic 就删除。
-
-\topic{二、本地 partial 需要处理读取时刻}
-把计数器拆成每线程 partial 后，热写变快了，但“什么时候读取全局值”变复杂了。阶段结束后合并很简单；运行中实时展示进度，则需要读多个 partial 并求和，结果可能只是一个近似快照。若业务要求严格单调进度，就要定义读取协议。这个细节说明优化不会只改变性能，也会改变可见状态的语义。教材必须把这种交换讲出来。
-
-\topic{三、padding 要跟访问模式一起设计}
-每线程 partial 如果存在数组中，相邻元素可能落在同一 cache line，导致 false sharing。给每个 partial 对齐到 cache line 可以解决写写争用，但内存占用变大，合并扫描时也会跨更多 cache line。若 partial 很少且写频率高，padding 合理；若 partial 很多且写频率低，padding 可能浪费。设计不应是“所有结构都 padding”，而是先标出高频写字段，再对这些字段隔离。
-
-\topic{四、first touch 把初始化也纳入算法}
-局部 partial 不只是谁写的问题，还包括页面归属。若主线程创建并清零所有 partial，页面可能集中在主线程所在节点；后续 worker 即使写自己的 partial，也可能写远端页面。更好的做法是让使用该 partial 的 worker 完成初始化，或者按 NUMA 节点批量初始化。初始化不再是无关准备工作，它决定页面第一次落在哪里。报告若不写初始化方式，NUMA 结论就不可复现。
-
-\topic{五、合并树要和拓扑对应}
-最终合并可以由一个线程扫所有 partial，也可以做树形合并，也可以按 NUMA 节点先合并。本地合并减少远端读，树形合并减少单点串行时间，但会增加同步阶段。输入小的时候，复杂合并树不划算；输入大且线程多时，它能避免单线程尾部成为瓶颈。这个选择要通过分段计时判断：本地处理、节点内合并、跨节点合并分别占多少。
-
-\topic{六、把拓扑信息放进 trace}
-当一次运行突然变慢，trace 里如果只有线程 id，很难判断原因。更好的记录包括 worker id、CPU id、NUMA node、partial 地址范围、初始化线程、合并阶段和迁移次数。这样报告能回答：慢线程是否跑到远端节点，页面是否集中在一个节点，某个 partial 是否和其他线程 false sharing。拓扑信息不是低级细节，而是解释多核性能的证据。
-
-\section{案例深化：共享计数器的分层改造}
-
-NUMA 和一致性协议最适合通过共享计数器讲清楚。朴素版本让所有线程执行 \code{fetch_add} 更新全局计数。它语义清楚，也能避免数据竞争；但线程数上来以后，cache line 所有权在核心之间反复迁移，互连流量上升，吞吐停住。这个事故能把 atomic、cache line、NUMA、线程绑定和局部归约串起来。
-
-\topic{一、不要先否定 atomic}
-Atomic 的问题不是“慢”，而是不适合高频共享写热点。低频状态、线性化点、任务完成计数都可能适合 atomic。教材要让读者先判断频率和共享范围：每条记录一次的计数是高频路径，适合局部 partial；每个 task 完成一次的状态更新频率低，可以用 atomic 或锁。把所有 atomic 都视为错误，会让工程判断变粗糙。
-
-\topic{二、第一层拆到线程本地}
-线程本地 partial 让热写入落在各自 cache line 上。每个 worker 扫描自己的输入，更新自己的计数表，阶段结束后再合并。这个结构减少一致性流量，但增加合并阶段。若 key 很多，线程本地表会占用更多内存；若 task 很小，合并成本可能超过收益。报告要同时写扫描时间、合并时间和内存峰值。
-
-\topic{三、第二层按 NUMA 节点合并}
-跨 socket 合并比同节点合并更贵。可以先在每个 NUMA node 内合并，再由一个节点汇总全局。页面首次触碰也要配合：哪个 worker 初始化 partial，页面就更可能放在哪个节点。若初始化线程和使用线程分离，可能出现远端访问。实验要记录绑定策略和 first touch 策略，否则数字很难复现。
-
-\topic{四、避免 false sharing}
-即使每个线程有自己的计数，如果多个计数结构落在同一 cache line，也会发生 false sharing。结构体数组尤其容易出现这个问题。解决方法可以是按 cache line 对齐、填充或改成每线程独立分配。报告里不要只写“用了 thread local”，还要说明 hot counter 是否可能共享 cache line。这个细节能把一致性协议从抽象概念落到 C++ 对象布局。
-
-\topic{五、把拓扑写进接口}
-最终项目可以把 worker id、CPU id、NUMA node、local partial id 写进 trace。这样一次异常慢的合并能追到具体拓扑。接口不一定强制绑定，但要允许记录和控制。高性能计算不是假设机器均匀，而是在接口中保留拓扑信息，让调度器和报告有能力使用它。
-
-\section{案例复盘：一个 atomic 怎样拖出整台机器}
-
-所有线程对同一个 atomic 计数器执行 fetch add，代码很短，语义也正确。线程数增加后吞吐停住，是因为同一条 cache line 的所有权在核心之间迁移；跨 NUMA 节点时，还要经过互连。这个案例让读者看到，共享内存并不意味着没有位置，cache line、页和线程都在拓扑里。
-
-\topic{分层 partial 的推导}
-第一步把高频写拆到线程本地，第二步按 NUMA 节点合并，第三步再全局汇总。这样热写入留在本地 cache line 上，跨节点流量只发生在合并阶段。Atomic 仍可用于低频状态和线性化点，但不适合每条记录一次的共享热点。
-
-\topic{实验判据}
-报告写线程绑定、first touch、NUMA node、线程数扩展、合并时间和远端访问比例。若本地 partial 快而合并慢，瓶颈只是迁移到下一阶段；若绑定关闭后波动大，调度迁移已经进入成本模型。拓扑信息必须成为 trace 的一部分。
-
-\section{本章习题}
+\section{习题}
 
 \begin{exercisebox}
-习题一：把一个全局原子计数器、每线程计数器、每 NUMA 节点计数器画成三张数据共享图。分别标出哪些 cache line 被谁写，哪些阶段需要合并，读取全局值的成本在哪里。
+习题一：画出全局 atomic 计数器、紧凑 worker partial、按 cache line 隔离 worker partial、按 NUMA group 分层 partial 四种布局。分别标出哪些 line 被谁写，哪些阶段需要合并，读取全局值的成本在哪里。
 
-习题二：设计一个 NUMA first-touch 实验。要求写清初始化线程、计算线程、绑定策略、输入规模、测量指标和预期现象。若当前设备没有 NUMA，写出哪些部分只能作为计划保留。
+习题二：设计一个 first-touch 实验。要求写清分配、初始化、绑定、计算、合并五个阶段；记录输入规模、页面大小、worker 到 CPU 的映射和不可验证边界。若当前设备没有多个 NUMA 节点，写出可运行替代实验。
 
-习题三：为线程池设计一个两级队列方案：worker 本地队列加全局溢出队列。说明高频路径、低频路径、锁保护对象、可能的窃取顺序和关闭语义。
+习题三：为线程池设计本地队列加工作窃取方案。说明 worker 本地 pop、同 group steal、跨 group steal、全局溢出队列和关闭协议分别保护哪些状态，哪些字段可能成为共享写热点。
 
-习题四：阅读 Linux NUMA 策略或调度拓扑的一个窄入口。报告必须从一个用户态实验问题出发，不允许只复制函数名。
+习题四：给 \code{WorkerStats} 设计两种布局：紧凑布局和隔离高频写布局。计算结构体大小、对齐、每条 cache line 可能容纳几个 worker 的字段，并说明何时不应使用隔离布局。
+
+习题五：阅读 Linux 调度拓扑、NUMA 策略或 page fault 路径的一个窄入口。报告必须从一个用户态实验问题出发，例如“为什么主线程初始化会影响页面节点”或“为什么线程迁移会破坏 first-touch 假设”，不允许只罗列函数名。
 \end{exercisebox}
+
+下一章进入测量、Roofline 和性能计数器。前四章给出了硬件侧因果链：指令怎样供给，数据怎样到达核心，页面怎样翻译和放置，多核心怎样协调共享写。接下来要把这些候选解释变成可复查证据：哪一段耗时，哪一类资源饱和，哪个对照实验能排除错误假设。
