@@ -479,6 +479,159 @@ t5: wait_idle observes all affected nodes reached terminal states
 
 这三条账本分别约束 worker 内等待、关闭线性化点和失败传播。运行时实现完成后，测试应能复现这些序列，并在 trace 中看到相同状态转移。若 trace 无法表达这些事件，说明观测字段还不够。
 
+\section{运行时证据链：ready、running、blocked 和 helping}
+
+任务运行时的错误常藏在“线程还活着，但系统不推进”里。全局队列不为空，却没有 worker 执行；worker 数量足够，却全部卡在 future、条件变量或 I/O；任务图理论上有并行度，trace 里却出现长时间空洞。要定位这些问题，运行时不能只记录 task start 和 finish，还要记录 worker 状态。Worker 是执行资源，任务是工作单位，二者的关系随时间变化。只有把关系写进 trace，才能判断慢在队列、运行、阻塞、窃取还是关闭。
+
+\begin{lstlisting}[numbers=none,caption={worker trace 状态}]
+Idle
+DequeueLocal
+DequeueGlobal
+StealAttempt
+Running
+PublishingCompletion
+WaitingExternal
+Helping
+Parked
+Waking
+Shutdown
+\end{lstlisting}
+
+\code{Idle} 表示 worker 暂时没有工作；\code{StealAttempt} 表示它正在寻找别的 deque；\code{Running} 表示它正在执行用户任务；\code{PublishingCompletion} 表示用户函数已经结束，运行时正在发布结果、递减后继 ready count 和唤醒等待者；\code{WaitingExternal} 表示 worker 进入了运行时无法直接推进的阻塞，例如磁盘 I/O、网络等待或外部 mutex；\code{Helping} 表示 worker 在等待某个结果时没有睡死，而是执行运行时中其他 ready work；\code{Parked} 表示没有可执行任务时进入睡眠。
+
+\topic{隐藏阻塞：线程池最容易被自己耗尽}
+第 13 章的 stable filter 会产生 count、scan、write、commit 任务。如果 count 任务在 worker 内部等待“所有 count 完成后再继续 scan”，就可能让 worker 全部占在父任务栈上，ready 队列里的后继无人执行。这个事故不需要死锁循环，只要 worker 数等于阻塞父任务数就够了。更隐蔽的版本是任务调用 \code{future.get()}、等待条件变量、同步读文件、请求网络服务、或在锁内执行会阻塞的析构。运行时看到 worker 还没退出，但执行资源已经从 ready 队列中消失。
+
+\begin{lstlisting}[numbers=none,caption={worker 被隐藏阻塞耗尽的 trace}]
+t0 worker 0 Running parent_count_group
+t1 worker 1 Running parent_count_group
+t2 worker 2 Running parent_count_group
+t3 worker 3 Running parent_count_group
+t4 each parent submits child scan or waits for sibling count
+t5 workers enter WaitingExternal or future wait
+t6 ready queue has runnable children
+t7 no worker returns to DequeueLocal or DequeueGlobal
+\end{lstlisting}
+
+这类问题不能靠增加 \code{notify_all} 修复，因为等待的不是条件变量漏通知，而是执行资源被错误占用。修复必须改变等待协议：把后续工作写成 continuation、允许 worker helping、创建补偿 worker、把阻塞 I/O 放进单独的 blocking pool，或干脆禁止 worker 等待同一运行时的 future。
+
+\topic{四种 managed blocking 策略}
+Managed blocking 的核心是：运行时知道某个 worker 即将长期不可用，于是采取动作保持执行资源。策略不同，语义和成本也不同。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}@{}}
+\toprule
+策略 & 适用场景 & 风险 \\
+\midrule
+禁止 worker wait & 可把依赖全部改成 continuation & API 约束强，调用方需要改结构 \\
+continuation & 任务完成后发布后半段 & 状态拆分更细，错误传播要清楚 \\
+work helping & 等待者执行其他 ready task & 可能重入运行时，栈和锁顺序要审查 \\
+compensation worker & worker 阻塞时临时补一个线程 & 可能过度创建线程，CPU 过度订阅 \\
+blocking pool & 把 I/O 或长等待放到专门线程池 & 跨池调度复杂，背压必须明确 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+禁止 worker wait 是最干净的语义：任务函数不能调用同一运行时 future 的阻塞等待，只能返回、发布 continuation 或把后继节点交给任务图。Continuation 把“等待后继续执行”改成“前驱完成后新任务 ready”，正好对应第 13 章的 stage 状态机。Helping 允许 worker 在等待目标 future 时执行其他 ready task，它能避免线程池耗尽，但必须禁止在持有用户锁或运行时内部锁时进入 helping，否则会把锁顺序变成难以分析的递归图。Compensation worker 像急救措施：当 worker 声明自己将阻塞，运行时临时增加执行线程；它能保护吞吐，但会增加调度成本和内存栈成本。Blocking pool 则承认 I/O 等待和 CPU 任务不是一种资源，用单独线程承接阻塞。
+
+\topic{helping 的边界}
+Helping 不是“随便跑点别的任务”。等待者必须声明自己等待的目标、允许执行的任务范围、是否允许执行依赖当前栈帧的后继、以及如何避免重入锁。一个简化协议可以这样写：
+
+\begin{lstlisting}[numbers=none,caption={work helping 的语义边界}]
+before helping:
+  worker must not hold runtime mutex
+  worker must not hold user locks declared non-reentrant
+  waited future belongs to the same runtime
+  target task is not already terminal
+
+helping loop:
+  if target becomes terminal, return its result
+  run one ready task that is safe for this worker
+  publish completion and trace
+  periodically check cancellation and shutdown
+
+exit:
+  do not consume the waited result twice
+  restore worker state from Helping to Running or Idle
+\end{lstlisting}
+
+若 helping 可以执行任意任务，可能出现重入用户代码、递归提交、栈增长和锁顺序反转。若 helping 范围太窄，又可能找不到可执行任务，退化成忙等。实践中常给任务标注执行域：CPU task、blocking task、scheduler internal task、continuation task。等待 CPU future 的 worker 可以帮助 CPU task，但不能在持有某个用户对象锁时执行会回调同一对象的任务。
+
+\topic{park 和 wake 也要有合同}
+没有 ready work 时，worker 不能无限自旋；它应该尝试窃取、检查全局队列和关闭状态，然后 park。Park 的本质和条件变量相同：线程睡眠等待谓词变化。谓词通常是“本地队列非空、全局队列非空、某个 victim 可偷、运行时进入关闭状态”。发布 ready 任务时必须先把任务放进队列，再 wake 或 notify。若先 wake 后入队，worker 可能醒来看到空队列并再次睡眠，ready 任务就会滞留到下一次唤醒。
+
+\begin{lstlisting}[numbers=none,caption={ready 发布和 worker park 的顺序}]
+publish ready:
+  write task fields
+  push ReadyItem into a visible queue
+  update counters used by park predicate
+  wake one or more parked workers
+
+worker park:
+  check local queue
+  check global queue
+  attempt bounded stealing
+  if no work and runtime open:
+      sleep on condition variable, semaphore, or platform park primitive
+  after wake:
+      recheck queues and shutdown state
+\end{lstlisting}
+
+这正是第 10 章条件变量原则在运行时中的放大版本：通知不是任务，任务在队列和状态表里；醒来不是拥有任务，worker 仍要重新检查。Park/wake 的 bug 往往表现为低概率 hang，原因是丢失唤醒窗口、ready 计数和队列状态不一致，或者关闭状态没有进入等待谓词。
+
+\topic{运行时报告字段}
+运行时报告至少要能把“没有任务可跑”和“有任务但没人跑”区分开。前者可能是关键路径限制，后者是调度事故。
+
+\begin{lstlisting}[numbers=none,caption={任务运行时的 trace 和汇总字段}]
+runtime.ready_wait_ns.p50
+runtime.ready_wait_ns.p99
+runtime.run_ns.p50
+runtime.run_ns.p99
+runtime.blocked_worker_count
+runtime.helped_tasks
+runtime.steal_attempts
+runtime.steal_success
+runtime.critical_path_ns
+runtime.unfinished_tasks
+runtime.ready_queue_depth.max
+runtime.park_wake_count
+runtime.compensation_workers_created
+runtime.external_wait_ns
+\end{lstlisting}
+
+\code{ready_wait_ns} 是任务进入 ready 到开始 running 的时间。它高，说明 ready work 等不到 worker，可能是队列竞争、worker 阻塞、窃取失败或线程数不足。\code{run_ns} 是用户函数执行时间，能暴露任务粒度和长尾。\code{blocked_worker_count} 和 \code{external_wait_ns} 能说明 CPU worker 是否被 I/O 或 future 等待吞掉。\code{critical_path_ns} 给出任务图理论下限；若总耗时远大于关键路径，要看调度和阻塞；若总耗时接近关键路径，要改依赖结构而不是继续加线程。
+
+\topic{把第 13 章的 stage 接入运行时}
+Stable filter 接入运行时时，不应该让一个父任务顺序调用 count、等待 count、再调用 scan。更好的形状是：每个 count chunk 是独立任务；count 完成时递减 scan 的 \code{remaining_predecessors}；最后一个 count 发布 scan；scan 生成 layout 后发布 write tasks；所有 write verified 后发布 commit。整个过程没有 worker 需要阻塞等待同一 stage。
+
+\begin{lstlisting}[numbers=none,caption={stable filter 的非阻塞任务图账本}]
+count[i]:
+  reads input chunk i
+  writes CountDone block record
+  decrements scan.remaining_predecessors
+
+scan:
+  runs when every count[i] is terminal success
+  builds layout and assigns output ranges
+  publishes write[i] tasks
+
+write[i]:
+  rewrites its entire output range for its attempt
+  verifies records and checksum
+  decrements commit.remaining_predecessors
+
+commit:
+  chooses unique verified attempts
+  publishes manifest
+  marks stage Committed or Failed
+\end{lstlisting}
+
+这条链把算法合同、恢复合同和运行时合同对齐了。Count 失败时，scan 不会被错误发布；write 失败时，commit 不会读取未验证输出；commit 完成时，下游任务只依赖 manifest，而不依赖 worker 的局部变量。运行时需要做的不是理解 filter 公式，而是执行 ready count、状态发布和失败传播。
+
+\topic{阻塞 I/O 为什么要离开 CPU worker}
+第 15 章会进入 I/O。这里先建立边界：CPU worker 适合执行短而可抢占的计算任务，不适合在同步文件读、网络请求或外部服务调用上长期停住。若任务必须读文件，常见做法是提交异步 I/O，I/O 完成事件再发布 continuation；或者把同步 I/O 放到 blocking pool，完成后把 CPU 后继任务放回 CPU runtime。把同步 I/O 直接放在 work stealing worker 里，会让 steal 成功率、ready wait 和 park/wake 数据全部失真，因为 worker 不是真的没工作，而是被外部等待扣住了。
+
 \section{Work Stealing：本地性和负载均衡的折中}
 
 全局队列是最好的第一版 reference。所有任务进入同一队列，worker 从同一队列取任务。它容易证明关闭语义，也容易测试异常和未完成计数。但全局队列有两个明显问题：所有 worker 竞争同一把锁或同一组原子位置；本地生成的子任务可能被任意 worker 拿走，破坏缓存局部性。

@@ -107,6 +107,59 @@ contended path:
 
 在 compute worker 中长时间自旋会浪费核心；在持锁线程被抢占时，其他线程继续自旋只能烧 CPU；在单核或过度订阅环境中，自旋甚至会阻止持锁线程获得时间片。条件变量把长等待转成睡眠，信号量把资源额度变成可等待计数，运行时 managed blocking 则让 worker 等待时补充执行资源。同步结构必须把等待时长当作一等变量。
 
+\topic{完整竞争账本：从一把锁看 cache line、futex 和调度}
+现在把一把 mutex 的获取过程拆成可以写入报告的事件链。低竞争路径中，线程在用户态对锁字执行一次 CAS、exchange 或等价原子操作，成功后进入临界区。这个锁字通常只有几个字节，但硬件以 cache line 为单位维护所有权；锁字所在的整条 cache line 会被获取锁的核心拉到可修改状态。若同一条 cache line 上还放了别的频繁写字段，即使这些字段和锁语义无关，也可能被拖进同一条一致性流量里，这就是 false sharing 的一个来源。
+
+竞争路径从 CAS 失败开始。失败说明另一个线程已经拥有锁，当前线程可以选择短暂自旋、让出处理器、进入运行库等待队列，或通过 Linux futex 等机制进入内核睡眠。futex 的直觉是“先在用户态检查一个整数，只有确实需要睡眠时才请求内核把线程挂到等待队列”。它不是锁本身，而是用户态同步原语在竞争路径上使用的睡眠和唤醒接口。释放锁时，如果运行库知道存在等待者，就需要把锁字改成未持有状态，并唤醒一个或多个等待线程；被唤醒的线程只是变成 runnable，随后还要等调度器把它放回 CPU，再重新竞争锁。
+
+\begin{lstlisting}[numbers=none,caption={锁竞争的完整事件账本}]
+acquire attempt:
+  read or modify lock word
+  if unlocked, publish ownership and enter critical section
+
+contention:
+  fail atomic transition
+  record waiter or contended state
+  spin for a bounded budget if owner is expected to release soon
+  enter futex or runtime wait when spinning is no longer profitable
+
+unlock:
+  finish updates protected by the mutex
+  release lock word
+  wake a waiter when contended state says someone may sleep
+
+resume:
+  waiter becomes runnable
+  scheduler chooses a CPU
+  waiter retries acquisition and may still lose the race
+\end{lstlisting}
+
+这条账本能解释很多“偶发慢”。等待线程被唤醒，不等于它立刻获得锁；它可能在 runnable 队列里等待，也可能醒来后发现另一个线程已经抢先进入临界区。释放线程调用 wake，不等于等待者一定仍在睡眠；等待者可能刚好超时、被取消、被信号打断或已经重新检查状态。同步实现必须允许这些竞态，把正确性建立在共享状态和谓词上，而不是建立在通知次数上。
+
+性能报告因此不能只写一个总耗时。至少要拆出以下字段：
+
+\begin{lstlisting}[numbers=none,caption={mutex 竞争报告字段}]
+lock.acquire.count
+lock.contended.count
+lock.spin.iterations
+lock.futex.wait.count
+lock.futex.wake.count
+lock.hold_ns.p50
+lock.hold_ns.p99
+lock.wait_ns.p50
+lock.wait_ns.p99
+lock.owner_preempted.count
+critical_section.calls_unknown_code
+critical_section.bytes_touched
+\end{lstlisting}
+
+\code{lock.hold_ns} 说明持锁线程在临界区里待了多久，\code{lock.wait_ns} 说明其他线程等了多久。二者不是同一件事：临界区很短但竞争极高，等待时间仍可能很大；临界区很长但低频，吞吐可能仍可接受。若 \code{owner_preempted} 很多，说明持锁线程经常在临界区内被调度走，其他线程自旋只会浪费 CPU。若 \code{calls_unknown_code} 不为零，说明锁内执行了无法界定时长的逻辑，尾延迟没有可靠上界。
+
+\topic{从竞争账本反推设计}
+拿有界队列举例，\code{mutex} 保护 \code{head/tail/size/closed} 的不变量；\code{not_empty} 和 \code{not_full} 保护等待谓词；\code{notify} 只是提示谓词可能变化。若报告显示锁竞争高，第一反应不能是把所有字段改成 atomic，而要先问四个问题。第一，临界区里是否做了拷贝、分配、日志、回调或析构。第二，队列是否太集中，是否需要每 worker 本地队列和全局注入队列。第三，是否可以批量 push 或批量 pop，把多次状态转换合并成一次。第四，等待者是否真正需要被全部唤醒，还是只需要唤醒一个能推进状态的线程。
+
+这四个问题分别对应四类改造。缩短临界区解决持锁时间；分片队列减少锁字 cache line 迁移；批量操作降低获取次数；精确通知减少无效唤醒。只有在不变量已经收缩到单个状态字、等待协议也能由单个原子值表达时，才进入第 11 章的原子状态机设计。锁和原子不是谁替代谁，而是合同粒度不同：锁适合保护多字段一致性，原子适合承载小而明确的线性化点。
+
 \begin{lstlisting}[language=C++,caption={互斥锁保护队列状态转换}]
 class QueueState {
 public:

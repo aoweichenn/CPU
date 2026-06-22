@@ -746,6 +746,139 @@ struct PartitionCommitEntry {
 
 如果 chunk 2 的 scatter 在写到一半时失败，它的 \code{Pending} 条目不能被下游读取。重试可以生成 attempt 1；当 attempt 1 commit 成功后，attempt 0 应标记为 \code{Failed} 或 \code{Superseded}。这样恢复程序不需要猜内存里哪些位置有效，只看 manifest。这个边界会在 I/O、shuffle 和分布式重试中继续放大。
 
+\section{阶段账本：让 reduce、scan、partition 可恢复}
+
+并行算法进入系统后，目标不再只是“算完得到一个数组”。它还必须回答：哪个阶段开始了，哪个阶段完成了，失败发生在 count 之前还是 write 之后，哪些输出字节可以相信，哪些只是旧 attempt 的残留。Reduce、scan 和 partition 都可以写成阶段状态机。状态机不是额外文档，而是恢复程序、测试和运行时调度共同依赖的事实表。
+
+\begin{lstlisting}[numbers=none,caption={stable filter 或 partition 的阶段状态机}]
+StageCreated
+CountStarted
+CountDone
+ScanStarted
+ScanDone
+WriteStarted
+WriteDone
+Verified
+ManifestCandidate
+Committed
+Failed
+Superseded
+\end{lstlisting}
+
+\code{CountDone} 表示每个 chunk 的数量或 partial 已经写入局部账本，但还没有生成全局输出位置。\code{ScanDone} 表示 offsets 或 layout 已经产生，后续写入范围可以由账本推导。\code{WriteDone} 表示 worker 声称写完自己的独占范围，但还没有经过校验。\code{Verified} 表示记录数、checksum、范围边界和版本都通过检查。\code{ManifestCandidate} 表示提交条目已经准备好但尚未成为下游可见事实。\code{Committed} 才表示后续 stage 可以依赖这些结果。把这些状态压成一个布尔 \code{done}，会让恢复路径失去信息。
+
+\topic{每个 block 必须有身份}
+阶段状态机还不够，必须把每个 block 的输入、输出和 attempt 写成记录。Block 是一个可恢复单位：可能是输入 chunk、partition 的 \code{chunk x bucket} 单元、reduce 树上的一个 partial，或 scan 的一个 tile。身份字段要能回答“这条记录属于哪次输入、哪次配置、哪次重试”。
+
+\begin{lstlisting}[language=C++,caption={可恢复并行 stage 的 block 记录}]
+enum class BlockState : std::int32_t {
+  Empty,
+  CountDone,
+  LayoutAssigned,
+  WriteStarted,
+  WriteDone,
+  Verified,
+  Committed,
+  Failed,
+  Superseded,
+};
+
+struct StageBlockRecord {
+  std::uint64_t stage_id = 0;
+  std::uint64_t input_epoch = 0;
+  std::uint64_t predicate_version = 0;
+  std::uint32_t chunk_id = 0;
+  std::uint32_t bucket_id = 0;
+  std::uint32_t attempt = 0;
+  std::uint32_t worker_id = 0;
+  std::uint64_t input_begin = 0;
+  std::uint64_t input_end = 0;
+  std::uint64_t output_begin = 0;
+  std::uint64_t output_end = 0;
+  std::uint64_t records_expected = 0;
+  std::uint64_t records_written = 0;
+  std::uint64_t local_counts_checksum = 0;
+  std::uint64_t output_checksum = 0;
+  BlockState state = BlockState::Empty;
+};
+\end{lstlisting}
+
+\code{input_begin/input_end} 说明这条记录覆盖哪个输入半开区间。\code{output_begin/output_end} 说明该 block 独占哪个输出半开区间。\code{records_expected} 来自 count 和 scan，\code{records_written} 来自 write。两个数字不一致时，write 阶段不能进入 \code{Verified}。\code{local_counts_checksum} 用来确认 count 阶段的本地直方图没有被错配；\code{output_checksum} 用来在崩溃恢复后确认输出字节仍然对应这条记录。字段看似多，但每个字段都对应一个事故。
+
+\topic{失败点一：count 完成，scan 未完成}
+若程序在 \code{CountDone} 之后崩溃，恢复程序可以读取每个 chunk 的 count 或 histogram，重新执行 scan。此时不应该信任任何输出文件或输出数组，因为地址合同还没有形成。恢复动作是检查 count 记录数量是否覆盖所有 chunk、\code{input_epoch} 和 \code{predicate_version} 是否一致、count checksum 是否通过，然后重建 layout。若缺少某个 chunk 的 count，只重跑缺失 chunk，不需要重跑整个输入。
+
+\begin{lstlisting}[numbers=none,caption={CountDone 后恢复 scan 的判定}]
+if all block records for stage have CountDone:
+    verify same input_epoch and predicate_version
+    verify chunk coverage and no duplicate chunk_id
+    rebuild offsets or partition layout
+    write LayoutAssigned records
+else:
+    rerun missing or failed count blocks
+\end{lstlisting}
+
+这里不能用文件修改时间或 worker 日志推断完成状态。完成事实必须来自 block 记录。日志可以帮助诊断，但日志行不是提交协议：它可能先于数据刷出，也可能在崩溃前丢失。
+
+\topic{失败点二：scan 完成，write 只写了一半}
+\code{ScanDone} 后，输出范围已经确定。若某个 worker 在 \code{WriteStarted} 后崩溃，该 worker 负责的输出范围可能被写了一部分。恢复程序不能把这段输出直接交给下游，也不能简单继续从中间写，因为部分写的位置和校验可能无法可靠确定。最稳妥的策略是把旧 attempt 标记为 \code{Failed}，为同一输入范围生成新 attempt，从该 block 的 \code{output_begin} 重新写完整范围。由于输出区间由 layout 固定，新 attempt 可以覆盖旧 attempt 的字节；只有通过 \code{Verified} 后才能进入 manifest。
+
+\begin{lstlisting}[numbers=none,caption={WriteStarted 崩溃后的重试策略}]
+old attempt:
+  state = WriteStarted
+  output range may contain partial bytes
+  never publish to downstream readers
+
+retry attempt:
+  same stage_id, input_epoch, predicate_version, chunk_id, bucket_id
+  attempt = old attempt + 1
+  rewrite the entire output range
+  verify records_written, checksum, and boundaries
+  publish only the verified retry attempt
+\end{lstlisting}
+
+这个策略要求 write 阶段是幂等的：同一输入、同一谓词、同一 layout 重写同一输出范围，得到同一字节序列和 checksum。若 write 阶段有外部副作用，例如向共享日志追加、发送网络请求或更新全局指标，就必须把副作用移到 commit 之后，或者为副作用本身设计去重键。
+
+\topic{失败点三：重复写和重复提交}
+重试会带来另一个问题：两个 attempt 可能并发存在。也许旧 worker 没死，只是暂停很久；driver 认为它超时，于是启动 attempt 1。后来 attempt 0 恢复并试图提交。没有 attempt 字段，系统无法判断谁是合法结果。正确做法是用 manifest 的 CAS 或事务化 rename 选择唯一赢家。
+
+\begin{lstlisting}[numbers=none,caption={manifest 选择唯一赢家}]
+candidate key:
+  stage_id, chunk_id, bucket_id
+
+candidate value:
+  attempt, output range, records, checksum
+
+commit rule:
+  if no committed candidate exists for the key:
+      publish this verified attempt
+  else:
+      mark this attempt as Superseded
+\end{lstlisting}
+
+唯一赢家不一定是 attempt 编号最大的那个。若 attempt 0 已经完成验证并提交，attempt 1 即使后来也写出了相同结果，也只能标记为 \code{Superseded}。这样下游读取 manifest 时不会看到两个都声称覆盖同一区间的 block。若策略要求“较新 attempt 覆盖较旧 attempt”，也必须让覆盖本身成为 manifest 中的明确状态转换，不能让两个版本同时可见。
+
+\topic{失败点四：manifest 缺失但文件存在}
+分布式和异步 I/O 中常见一种尴尬状态：输出文件或内存段已经存在，但 manifest 里没有对应条目。可能是 write 完成后、commit 前崩溃；也可能是旧 attempt 的残留。恢复程序应默认“不在 manifest 中的输出不可见”。它可以扫描孤儿文件，把能通过 checksum 且匹配某个 \code{Verified} 记录的文件转成 \code{ManifestCandidate}；如果没有可靠记录，就删除或隔离。不能因为文件名看起来对，就把它加入结果集。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.35\linewidth}p{0.33\linewidth}@{}}
+\toprule
+观察到的状态 & 不能做什么 & 正确动作 \\
+\midrule
+有 count 记录，无 layout & 不能推断输出位置 & 重建 scan 或重跑缺失 count \\
+有 layout，无 verified write & 不能让下游读输出范围 & 重写 block 并校验 \\
+有 verified attempt，无 manifest & 不能自动视为提交 & 通过 commit 规则发布或隔离 \\
+有文件，无 block 记录 & 不能按文件名恢复事实 & 删除、隔离或人工审计 \\
+两个 attempt 都 verified & 不能让二者都可见 & manifest 选择唯一赢家 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{把阶段账本交给运行时}
+这些状态不是只给离线恢复看。第 14 章的任务运行时也要读取它们：\code{CountDone} 让 scan task 的 ready count 递减；\code{ScanDone} 让 write tasks 入队；\code{Verified} 让 commit task 入队；\code{Committed} 让下游 reduce 或 I/O stage 入队。若 worker 在任务内部阻塞等待“所有 count 都完成”，运行时就失去了调度权；正确做法是把阶段状态变成任务图边，让完成事件发布后继，而不是让线程占着 CPU 等待。
+
 \topic{常见故障路径}
 下面这些错误都不是边角料，而是并行算法进入工程系统后最常见的失效点。
 

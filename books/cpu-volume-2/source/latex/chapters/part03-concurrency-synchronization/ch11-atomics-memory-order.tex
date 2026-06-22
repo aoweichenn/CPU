@@ -105,6 +105,138 @@ lifetime ledger:
 
 三张账本缺一张，代码都可能出问题。只有语言账本，可能同步正确但热点 atomic 把吞吐打穿；只有硬件账本，可能把普通变量并发读写写成未定义行为；只有生命周期账本，可能对象活着但发布顺序不成立。原子代码之所以难，不是 API 多，而是它把语言、硬件和对象生命周期压在一两行表达式里。
 
+\topic{完整原子账本：从一条 fetch\_add 到协议变量}
+原子变量最容易被滥用在计数器上，因为 \code{fetch_add} 看起来像普通的 \code{++}。先把一条 \code{fetch_add} 放到机器路径里。x86-64 上，热点递增常见形状是带 \instruction{lock} 前缀的 \instruction{xadd} 或 \instruction{add}；核心要取得目标 cache line 的可修改所有权，把旧值读出，计算新值，再把新值写回。若八个 worker 都在更新同一个计数器，这条 line 会在核心之间来回迁移。操作仍然是正确的，但吞吐可能被互连和一致性协议限制，而不是被加法本身限制。
+
+\begin{lstlisting}[numbers=none,caption={原子递增的典型机器证据}]
+; rdi = address of atomic counter
+mov       eax, 1
+lock xadd dword ptr [rdi], eax
+; eax now contains the old value
+\end{lstlisting}
+
+\code{fetch_add(relaxed)} 适合做 telemetry：例如完成了多少个 chunk、丢弃了多少条坏记录、某个调试计数器当前是多少。它不适合做发布许可。下面这个反例很典型：
+
+\begin{lstlisting}[language=C++,caption={relaxed 完成计数不是读取结果的许可}]
+struct ChunkResult {
+  std::uint64_t checksum = 0;
+  std::uint64_t records = 0;
+};
+
+std::vector<ChunkResult> results;
+std::atomic<std::uint32_t> completed_count{0};
+
+void worker(std::uint32_t chunk_id) {
+  results[chunk_id].checksum = compute_checksum(chunk_id);
+  results[chunk_id].records = count_records(chunk_id);
+  completed_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void coordinator(std::uint32_t chunk_count) {
+  while (completed_count.load(std::memory_order_relaxed) != chunk_count) {
+  }
+  consume(results);  // 这里没有可移植同步保证。
+}
+\end{lstlisting}
+
+\code{completed_count} 的数值能告诉协调者“某些 atomic 递增发生过”，却没有建立“所有 \code{results[i]} 的普通写入都对当前线程可见”的发布关系。修复方式取决于真正的合同。若只需要等待所有 worker 结束，\code{join} 可以提供同步。若 worker 在线程池中不能 join，每个 chunk 可以有 release 状态位，协调者 acquire 读取每个状态位；也可以把结果写入受 mutex 保护的队列；还可以用任务运行时的完成状态发布结果。不能用一个 relaxed 计数器替代所有发布边。
+
+\begin{lstlisting}[language=C++,caption={每个 chunk 用状态位发布自己的结果}]
+enum class ChunkState : std::int32_t {
+  Empty,
+  Ready,
+  Failed,
+};
+
+struct PublishedChunk {
+  ChunkResult result;
+  std::atomic<ChunkState> state{ChunkState::Empty};
+};
+
+void publish_chunk(PublishedChunk& chunk, ChunkResult result) {
+  chunk.result = result;
+  chunk.state.store(ChunkState::Ready, std::memory_order_release);
+}
+
+std::optional<ChunkResult> try_read_chunk(const PublishedChunk& chunk) {
+  if (chunk.state.load(std::memory_order_acquire) != ChunkState::Ready) {
+    return std::nullopt;
+  }
+  return chunk.result;
+}
+\end{lstlisting}
+
+这里的线性化点不是 \code{result} 赋值，而是 release store 把状态改成 \code{Ready}。读取方只有 acquire 读到 \code{Ready}，才有权读取此前发布的普通字段。状态位和结果对象的生命周期也要一起审查：\code{try_read_chunk} 返回时，\code{chunk} 仍必须存活，不能被生产者复用为下一轮结果。若需要复用槽位，就必须引入 epoch 或 generation，防止读取方把上一轮 \code{Ready} 当成下一轮 \code{Ready}。
+
+\topic{协议变量必须写角色}
+审查原子代码时，不要只看变量类型，要先给每个原子变量写角色。指标计数、发布标志、状态机、指针、引用计数和等待条件的责任不同。一个变量承担多个角色时，要把每个角色的内存序和生命周期都写清，否则迟早出现“这个 relaxed 到底能不能读结果”的争论。
+
+\begin{lstlisting}[numbers=none,caption={AtomicProtocolNote 字段}]
+atomic.name
+role = metric | publication | state | pointer | refcount | wait
+linearization_point
+published_fields
+acquire_readers
+lifetime_owner
+reuse_or_epoch_rule
+contention_shape
+success_order
+failure_order
+wait_strategy
+diagnostic_counters
+\end{lstlisting}
+
+\code{role=metric} 时，\code{published_fields} 应为空，因为指标不发布普通数据。\code{role=publication} 时，必须列出哪些字段在 release 前写好、哪些读取者通过 acquire 获取。\code{role=state} 时，必须说明状态转移图和 CAS 成功者获得什么责任。\code{role=pointer} 时，生命周期比内存序更危险：读取方 acquire 得到指针后，对象如何防止被释放或复用。若这张 note 写不出来，代码通常还没到该写 lock-free 的阶段。
+
+\topic{一条 CAS 同时包含成功合同和失败合同}
+CAS 常被写成“抢到就干活，没抢到就重试”。这只描述了控制流，没有描述同步合同。成功 CAS 可能同时读取旧状态、发布新状态并接管资源；失败 CAS 可能只是发现别人改了状态，也可能需要读取赢家发布的数据。C++ 因此要求 CAS 写成功内存序和失败内存序。失败内存序不能比成功内存序更强，也不能是 release，因为失败路径没有写入目标对象。
+
+\begin{lstlisting}[language=C++,caption={CAS 状态机必须说明失败路径要不要读取赢家数据}]
+enum class CompletionState : std::int32_t {
+  Pending,
+  Succeeded,
+  Failed,
+};
+
+struct Completion {
+  Result result;
+  Error error;
+  std::atomic<CompletionState> state{CompletionState::Pending};
+};
+
+bool try_publish_success(Completion& completion, Result result) {
+  CompletionState expected = CompletionState::Pending;
+  completion.result = result;
+  return completion.state.compare_exchange_strong(
+      expected,
+      CompletionState::Succeeded,
+      std::memory_order_release,
+      std::memory_order_acquire);
+}
+\end{lstlisting}
+
+这段代码中，成功路径用 release 发布 \code{result}。失败路径用 acquire 的理由是：若失败时 \code{expected} 被更新成 \code{Succeeded}，调用者可能接着读取已经由赢家发布的 \code{result}；若失败后只是丢弃并重试，失败内存序可以更弱。内存序选择必须来自失败路径是否消费赢家事实，而不是来自“CAS 看起来重要”。
+
+\topic{原子等待：状态值和睡眠队列仍然分开}
+C++20 的 \code{atomic::wait} 让原子变量也能进入等待协议。它的底层可以使用 futex 或运行库等待结构，避免长时间忙等。但它没有改变核心原则：状态在原子值里，通知只是让等待者重新读取状态。写线程必须先改变原子值，再调用 \code{notify_one} 或 \code{notify_all}；等待线程必须在循环中检查目标值，不能把 notify 当成消息。
+
+\begin{lstlisting}[language=C++,caption={atomic::wait 仍然等待状态变化}]
+void wait_until_ready(std::atomic<ChunkState>& state) {
+  ChunkState observed = state.load(std::memory_order_acquire);
+  while (observed == ChunkState::Empty) {
+    state.wait(observed, std::memory_order_relaxed);
+    observed = state.load(std::memory_order_acquire);
+  }
+}
+
+void publish_ready(std::atomic<ChunkState>& state) {
+  state.store(ChunkState::Ready, std::memory_order_release);
+  state.notify_all();
+}
+\end{lstlisting}
+
+\code{state.wait(observed)} 的含义是“当 state 仍等于 observed 时可以睡眠”。醒来后必须重新 acquire 读取状态，因为唤醒可能来自真正发布、虚假唤醒、其他状态变化或竞争窗口。若状态发布普通数据，最终读取到 \code{Ready} 的 load 必须有 acquire 语义；\code{wait} 本身不能替代这条获取边。
+
 \topic{Memory order 是约束，不是动作名称}
 \code{memory_order_release} 这个名字容易让人误以为它“释放 cache”或“刷新内存”。更准确的理解是：它给编译器和硬件施加一个发布约束，让发布点之前的写入在与 acquire 配对时成为可依赖事实。\code{memory_order_acquire} 不是“获取锁”，而是在读取到对应发布值后约束后续访问。\code{memory_order_relaxed} 不是“可能乱写”，它仍保证 atomic 对象自身的原子性和修改顺序，只是不建立跨对象同步边。
 
