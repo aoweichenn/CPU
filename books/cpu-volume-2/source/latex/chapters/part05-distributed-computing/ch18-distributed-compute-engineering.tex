@@ -1106,6 +1106,89 @@ I/O & buffer 唯一所有，completion 分层 & CompletionRecord、buffer report
 
 这张表是全书后半部分的最终压缩。它让重构有边界：可以换 SIMD backend，但不能破坏 BatchView；可以换线程池，但不能丢 task 终态；可以换 I/O backend，但不能让 completion 直接越过 manifest；可以多进程部署，但不能改变 attempt 和 commit 语义。
 
+\topic{从对象到接口：最小可实现切片}
+最终系统的第一版不需要追求大而全，但每个模块都要有能编译、能测试、能报告的接口。接口的目标不是把所有实现细节提前固定，而是让不变量有落点。输入模块交出 \code{InputSplit} 和 \code{RecordId}；热批次模块交出 \code{BatchView}；运行时交出 \code{TaskRecord} 和 \code{WorkerSnapshot}；I/O 模块交出 \code{CompletionRecord}；提交模块交出 \code{ManifestEntry}；恢复模块交出 \code{RecoveryReport}。这些对象一旦存在，后续优化就必须围绕它们证明自己没有破坏语义。
+
+\begin{lstlisting}[language=C++,caption={最终系统第一版的核心接口}]
+struct InputSplit {
+  std::uint64_t input_generation = 0;
+  std::uint64_t byte_begin = 0;
+  std::uint64_t byte_end = 0;
+  std::uint64_t first_record = 0;
+  std::uint64_t record_count = 0;
+  std::uint64_t checksum = 0;
+};
+
+struct BatchView {
+  std::span<const std::uint32_t> record_ids;
+  std::span<const std::uint32_t> event_types;
+  std::span<const std::int64_t> values;
+};
+
+struct TaskRecord {
+  std::uint64_t logical_task = 0;
+  std::uint32_t attempt = 0;
+  std::uint32_t route_epoch = 0;
+  std::string block_id;
+};
+
+struct ManifestEntry {
+  std::uint64_t logical_task = 0;
+  std::uint32_t accepted_attempt = 0;
+  std::string block_id;
+  std::uint64_t block_checksum = 0;
+  std::uint64_t accepted_records = 0;
+  std::uint64_t rejected_records = 0;
+};
+\end{lstlisting}
+
+这段接口故意很小。它不绑定某个线程池、不绑定某个文件格式、不要求一开始支持网络，也不提前引入复杂模板。它只锁住六件不能变的事实：输入有稳定代号，batch 行之间能对齐，task 和 attempt 分开，block 有 checksum，manifest 是提交入口，记录数量和错误数量能被审计。后续把 \code{BatchView} 换成 AoSoA，把本地线程池换成多进程，把文件写入换成对象存储，都不能越过这些事实。
+
+\topic{第一版验收切片}
+第一版可运行系统只需要完成一条窄路径：三份 split，两个 worker，一个 reducer，一个 manifest 文件，一个固定故障脚本。输入中包含一条坏行和一个热点 key；故障脚本让某个 attempt 的 reply 丢失，并让另一个 block 第一次写出只完成部分字节。系统最终要输出与 reference 相同的 counts checksum 和 diagnostics checksum，同时在 RunReport 中列出短写、retry、late reply、accepted attempt 和 orphan block。这个切片覆盖了输入身份、热批次、并发任务、可靠写、manifest、恢复审计，比单纯跑一个大文件更能证明结构正确。
+
+\begin{lstlisting}[numbers=none,caption={第一版验收切片}]
+input:
+  split_count = 3
+  worker_count = 2
+  malformed_records = 1
+  hot_key_ratio = 0.70
+
+faults:
+  write_once_short(block for split 1 attempt 0)
+  drop_reply(split 2 attempt 0)
+  delay_reply(split 2 attempt 0)
+
+required report:
+  reference_checksum == final_checksum
+  diagnostics_checksum_equal = true
+  manifest_entries == split_count
+  accepted_attempts_per_task == 1
+  short_write_count >= 1
+  late_reply_count >= 1
+  orphan_blocks_classified >= 1
+\end{lstlisting}
+
+这条切片的重点是组合故障。短写证明 completion 不能直接等于 commit；丢 reply 证明 worker 成功不等于 Driver 接受；迟到 reply 证明 attempt 身份必须参与判定；坏行证明性能路径不能吞掉 diagnostics；热点 key 证明并行路径要保留 combine 和 reduce 证据。只要这条小路径稳定，后续扩大输入、换内核、加 SIMD、加 NUMA 策略，都有一条回归线。
+
+\topic{接口替换必须带迁移报告}
+最终系统会不断替换内部实现。比如把胖对象 parser 替换成热列 batch，把全局队列替换成本地队列加窃取，把普通写替换成异步写，把单进程 MessageBus 替换成多进程消息。每次替换都要提交迁移报告：保留哪些接口，不变量怎样验证，新增哪些失败输入，性能成本迁移到哪里，旧路径怎样回滚。没有迁移报告的重构，即使结果变快，也会让系统失去可解释性。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}@{}}
+\toprule
+替换方向 & 不变量检查 & 新增对照 \\
+\midrule
+对象记录到热列 batch & row 对齐、record id 回查、diagnostics checksum & 错误密集、小输入、完整对象回查 \\
+全局计数到 worker partial & reference checksum、每 task 贡献只合并一次 & 热点 key、false sharing、合并阶段耗时 \\
+mutex 队列到本地队列 & task 终态完整、关闭语义不变 & 阻塞任务、取消、work stealing 长尾 \\
+普通写到可靠异步写 & completion 不越过 manifest、buffer owner 唯一 & 短写、取消后完成、manifest 前后崩溃 \\
+单进程到多进程消息 & request/attempt/epoch 身份不变 & 丢包、重复、迟到、旧 owner \\
+\bottomrule
+\end{tabular}
+\end{center}
+
 \topic{最终系统也要保留小模式}
 大输入模式用于吞吐，小模式用于审计。项目应提供一个固定小输入和固定故障脚本，能在数秒内跑完整链路并打印所有关键表：reference、split、attempt、block、manifest、reduce、recovery。这个小模式不追求性能，它的价值是每次重构后快速确认身份链没有断。没有小模式，系统越复杂，越只能依赖大规模黑盒测试。
 

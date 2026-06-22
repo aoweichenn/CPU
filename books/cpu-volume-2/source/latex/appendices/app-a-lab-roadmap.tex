@@ -14,6 +14,88 @@
 实验报告不得只给一张耗时表。完整报告至少包含环境、输入族、命令、reference 对照、原始数据摘要、阶段报告、图表或表格、结论边界和下一步实验。若平台不支持 \cmd{perf}、NUMA 或亲和性，报告要写清限制，并用用户态 trace 或简化指标替代。
 \end{rubricbox}
 
+\section{工程目录和交付闭环}
+
+实验若只散落成若干小程序，很快会失去可复查性。Compute Systems Engine 应从第一天就按职责分目录，让每一章新增的机制都有固定落点。目录不需要一开始很复杂，但必须能区分语义、内核、运行时、I/O、分布式模拟、测试和报告。这样后续从顺序 reference 走到故障注入时，不会把所有代码堆进一个 \code{main.cpp}。
+
+\begin{lstlisting}[language={},caption={Compute Systems Engine 的建议目录形态}]
+cse/
+  include/cse/
+    input/             # InputSplit, RecordId, generators
+    report/            # RunReport, StageReport, HotKernelReport
+    memory/            # MemoryShape, AccessTrace, BatchView
+    kernels/           # filter, histogram, reduce, topk, join
+    runtime/           # ThreadPoolPlan, WorkerSnapshot, QueueContract
+    io/                # ReliableWriter, ManifestEntry, Checkpoint
+    dist/              # MessageEnvelope, OwnershipRecord, MessageBus
+  src/
+    reference/         # simple sequential implementations
+    kernels/
+    runtime/
+    io/
+    dist/
+  tests/
+    correctness/
+    concurrency/
+    recovery/
+    performance_smoke/
+  bench/
+    cases/
+    runners/
+  tools/
+    generate_input
+    run_case
+    summarize_report
+  results/
+    yyyy-mm-dd-case-name/
+      env.txt
+      commands.txt
+      input.json
+      samples.csv
+      stages.csv
+      counters.txt
+      trace.jsonl
+      notes.md
+\end{lstlisting}
+
+这棵目录表达了一个边界：原理中的对象不是装饰名词，而是代码里的接口和报告字段。比如 \code{RecordId} 不能只出现在错误日志字符串里，它要被 parser、diagnostics、manifest 和 recovery 共同使用；\code{HotKernelReport} 不能只在测量章出现，它要被 SIMD、layout、histogram 和 thread-local partial 实验复用；\code{ManifestEntry} 不能只在分布式章节出现，它从可靠写阶段就要定义外部可见事实。
+
+\topic{每次实验的最小文件包}
+每次实验都要能被后来重新打开。最小文件包包含六类文件。第一，\code{input.json} 写输入规模、seed、分布、坏行比例、冷热状态和 checksum。第二，\code{commands.txt} 保存构建命令、运行命令、环境变量和可选绑定策略。第三，\code{samples.csv} 保存每轮耗时、状态、checksum 和备注。第四，\code{stages.csv} 保存阶段时间、records in/out、bytes in/out、temporary bytes、state bytes。第五，\code{trace.jsonl} 保存任务、队列、I/O、message 和 recovery 的关键事件。第六，\code{notes.md} 只写解释、边界和下一步，不重复原始数据。
+
+\begin{lstlisting}[numbers=none,caption={一次实验结果必须能回答的问题}]
+Can the input be regenerated?
+Can the reference result be reproduced?
+Can failed samples be separated from passed samples?
+Can the timing boundary be located?
+Can a later commit compare the same stage fields?
+Can unavailable counters be distinguished from zero events?
+Can a crash/retry case replay the same attempt sequence?
+\end{lstlisting}
+
+如果这些问题答不上来，实验即使跑出了数字，也不能支撑章节结论。可复现性不是附加要求，而是系统工程的一部分：没有输入身份，就没有正确性比较；没有阶段字段，就没有瓶颈迁移；没有 trace，就无法解释等待和重试；没有 manifest，就无法判断输出何时生效。
+
+\topic{模块边界随章节逐步收紧}
+早期可以用简单实现，但接口边界要提前留好。第一阶段的 parser 可以很朴素，但输出必须包含 \code{RecordId} 和 checksum；第二阶段的 batch 可以只用 \code{std::vector}，但聚合核只能接收 \code{BatchView}；第五阶段的队列可以先用 mutex，但必须暴露 \code{QueueContract}；第七阶段的可靠写可以先用本地文件，但必须通过 \code{ManifestEntry} 发布提交事实；第八阶段的消息总线可以在同进程内模拟，但必须带 \code{MessageEnvelope}、deadline、attempt 和 delivery fault。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}@{}}
+\toprule
+阶段 & 可以先简单处理 & 不能省略的边界 \\
+\midrule
+顺序 reference & 单线程、朴素容器、稳定排序 & 输入合同、错误摘要、checksum、RecordId \\
+数据布局 & vector 存热列，冷表朴素 map & BatchView、MemoryShape、冷路径回查 \\
+热内核 & 标量循环先行 & HotKernelReport、反汇编摘要、输入族 \\
+线程同步 & mutex 队列先行 & QueueContract、关闭、drain、等待谓词 \\
+可靠写 & 本地临时文件 & ManifestEntry、checksum、短写处理 \\
+分布式模拟 & 单进程消息队列 & MessageEnvelope、AttemptId、重复和迟到消息 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表说明“先做简单版本”和“偷掉边界”不是一回事。简单版本可以慢，可以少功能，但不能让后续恢复、测量和并发语义无处接入。
+
 \section{统一对象账本}
 
 从第一阶段开始，实验就使用同一套对象语言。这样第 18 章最终项目不是突然出现的新框架，而是前面实验逐步长出来的系统。
