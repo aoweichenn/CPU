@@ -667,6 +667,72 @@ for each diagnostic in diagnostics:
 \topic{第八步：把布局报告纳入 RunReport}
 布局改造的结果必须进入报告，否则后续性能变化无法解释。RunReport 至少包含：对象大小、热列字节数、冷表字节数、每行有效热字节、record id 宽度、字典 checksum、partial 形状、selection 表示、batch 大小、峰值内存和回查失败数。这样当吞吐变化时，能知道是地址形状、输入分布还是语义路径变了。
 
+\topic{第九步：把布局选择写成状态迁移，而不是一次重构}
+真实项目很少能一次从胖对象切到完美列式。更稳的做法是把布局迁移写成几个可回滚阶段，每个阶段只改变一个地址事实，并保留同一份 reference。第一阶段只给旧 \code{LogRecord} 增加 \code{record_id} 和 checksum，让输出可比较；第二阶段抽出 \code{event_id} 热列，但错误报告仍回查旧对象；第三阶段把原始文本和错误上下文移入 \code{ColdRecordStore}；第四阶段让聚合热循环只接收 \code{BatchView}；第五阶段把 worker-local partial 和 manifest 写入同一份 RunReport。
+
+\begin{lstlisting}[numbers=none,caption={布局迁移的可回滚阶段}]
+stage 0:
+  LogRecord reference, full diagnostics, checksum
+
+stage 1:
+  add stable RecordId and input offset
+
+stage 2:
+  create event_id and value hot columns
+  keep old object path for diagnostics
+
+stage 3:
+  move raw line and parse errors into ColdRecordStore
+
+stage 4:
+  aggregate(BatchView) reads only hot columns
+
+stage 5:
+  report MemoryShape, AccessTrace, partial layout, manifest candidate
+\end{lstlisting}
+
+这样写的价值是把“改成列式”拆成可验证事实。若 stage 2 以后 checksum 变了，问题在编码或热列生成；若 stage 3 以后错误报告缺字段，问题在 cold store 生命周期；若 stage 4 以后吞吐没变，问题可能是热循环仍旧回到了对象图；若 stage 5 后内存峰值过高，问题在批次生命周期或下游背压。每一步都有退路，而不是把所有风险压到一次大重构里。
+
+\topic{布局选择要从 cache line 和 TLB 同时推导}
+AoS、SoA、AoSoA 的取舍不能只看“字段是否连续”。还要问每条 cache line 中有效热字节比例是多少，活跃页数是多少，是否同时访问多个列，是否要跨线程写 partial，是否会把 cold store 长期保留。一个 \code{LogRecord} 如果 160 字节，其中热路径只读 8 字节，那么 AoS 扫描时每搬入一条或多条 cache line，只使用很少部分；SoA 可以把热字段压紧，减少 cache line 和页覆盖。但如果后续阶段几乎每条记录都要回查完整文本，SoA 会引入大量间接回查。
+
+\begin{lstlisting}[numbers=none,caption={布局判断的硬件账本}]
+AoS candidate:
+  object_bytes = 160
+  hot_bytes_per_record = 8
+  cold_bytes_per_record = 120
+  pointer_fields = yes
+  hot loop line_utilization is low
+
+SoA candidate:
+  event_id column = 4 bytes per record
+  value column = 4 bytes per record
+  cold lookup by RecordId only on diagnostics
+  active pages for hot loop are lower
+
+AoSoA candidate:
+  block records by cache-friendly tile
+  keep several hot columns adjacent per block
+  align tile with SIMD and task grain
+\end{lstlisting}
+
+TLB 也要进入判断。SoA 把热字段集中到少数连续页，通常提高页级覆盖；但如果列很多、每列都很窄，单次处理同时跨多个列数组，活跃页数也可能上升。AoSoA 常用于折中：一个 block 内保存若干列，既让 SIMD 看到连续 lane，又把同一批记录的热字段放在相近页面中。它比纯 SoA 复杂，但能同时服务 SIMD、cache 和任务调度粒度。
+
+\topic{BatchView 是硬件合同，不只是接口包装}
+\code{BatchView} 的意义不是把参数变漂亮，而是向编译器和后续阶段表达一组硬件事实：输入连续、长度明确、热字段分开、生命周期受 batch 控制、错误回查通过 \code{record_id}。如果 \code{BatchView} 内部仍然保存 \code{std::vector<LogRecord*>}，热循环仍然要追指针；如果它暴露可变全局状态，worker-local partial 的边界又会被打破。接口形状必须服务地址形状。
+
+\begin{lstlisting}[language=C++,caption={BatchView 应表达连续热列和稳定身份}]
+struct BatchView {
+  std::span<const RecordId> record_ids;
+  std::span<const std::uint32_t> event_ids;
+  std::span<const std::int64_t> values;
+  std::uint64_t dictionary_generation = 0;
+  std::uint64_t batch_checksum = 0;
+};
+\end{lstlisting}
+
+这个结构还没有实现完整解析器，但它已经把第 3 章的地址账本落到了接口上。聚合函数接收 \code{BatchView} 后，反汇编中应出现对 \code{event_ids[i]} 和 \code{values[i]} 的连续 load，而不是对 \code{LogRecord} 指针和字符串的追踪。若反汇编与这个预期不一致，说明接口没有真正改变硬件路径。
+
 \section{排障案例：改成列式以后为什么仍然慢}
 
 有时把胖对象拆成热列以后，吞吐仍然没有明显提升。这个结果不能简单归因于“列式不适合”。更常见的原因是某条隐含地址路径没有被拆掉，或者新的表示引入了额外间接层。排障要沿着硬件账本逐层检查：热循环是否真的只读连续列，是否仍在查字符串字典，是否每条记录都回查冷表，是否 selection vector 造成随机行号访问，是否 worker-local partial 发生 false sharing，是否 batch 太小导致调度和函数调用成本压过缓存收益。

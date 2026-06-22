@@ -611,6 +611,103 @@ next direction:
 
 最后的优化报告应把决策写清：当前向量版本在长输入上受内存带宽限制，短输入由 dispatch 和尾部主导；保留 scalar 短路径、融合相邻 map、维持精确错误位置；暂不引入更宽 backend，因为证据显示瓶颈不在算术吞吐。这样的结论比盲目追求更宽指令更有工程价值。
 
+\topic{完整向量化账本：从编译器拒绝理由到接口改造}
+自动向量化失败时，最差的反应是直接改写成 intrinsics。更稳的路径是先让编译器说明拒绝理由，再判断它拒绝的是语义问题、接口问题还是成本模型问题。比如一个 stable filter 循环没有向量化，可能因为输出位置依赖前面保留数量；一个数组 map 没有向量化，可能因为输入输出可能别名；一个 parser 循环没有向量化，可能因为循环携带状态跨字节传播。三种原因对应完全不同的改法。
+
+\begin{lstlisting}[numbers=none,caption={自动向量化诊断要翻译成工程原因}]
+compiler report:
+  loop not vectorized: unsafe dependent memory operations
+
+engineering interpretation:
+  input and output ranges may overlap
+  compiler cannot prove independent lanes
+
+possible fixes:
+  split API into non-overlap fast path and safe fallback
+  materialize output positions by count/scan/write
+  keep scalar reference for overlap and boundary cases
+\end{lstlisting}
+
+这个翻译过程比“编译器不够聪明”更有用。若接口接收两个普通指针，编译器确实难以证明它们不重叠；若业务合同本来就允许原地修改，那么强行声明 non-overlap 会制造 bug；若业务合同不允许重叠，就应该把这个事实写进类型、断言或派发层。向量化从这里开始变成接口设计，而不是指令技巧。
+
+\begin{lstlisting}[language=C++,caption={把别名事实写进接口边界}]
+enum class OverlapPolicy {
+  MayOverlap,
+  NonOverlapping
+};
+
+struct TransformView {
+  std::span<const std::int32_t> input;
+  std::span<std::int32_t> output;
+  OverlapPolicy overlap = OverlapPolicy::MayOverlap;
+};
+\end{lstlisting}
+
+当 \code{overlap=NonOverlapping} 时，fast path 可以走向量版本；当调用方无法证明这一点时，走保守 reference 或先拷贝。这个设计购买的是可审计的前提，而不是把 \code{restrict} 一类假设藏进注释。报告中也要记录 fast path 被拒绝多少次，拒绝原因是什么，否则 fallback 会在生产路径里悄悄吞掉收益。
+
+\topic{标量汇编和向量汇编要对照读}
+读向量化结果时，先找标量循环的动作：每轮 load 几次、compare 几次、branch 几次、store 几次、是否有调用和栈访问。再找向量循环的动作：向量 load 宽度、比较或算术指令、mask 提取、循环步长、尾部路径、是否出现 gather、是否有 peel loop 和运行时别名检查。只有两份对照同时存在，才能说清优化改变了什么。
+
+\begin{lstlisting}[numbers=none,caption={反汇编对照记录}]
+scalar loop:
+  loads per element
+  branches per element
+  calls in loop
+  store pattern
+
+vector loop:
+  vector width and step
+  vector load/store instructions
+  compare/mask/extract path
+  tail handling
+  runtime alias checks
+  scalar fallback range
+\end{lstlisting}
+
+如果向量循环有 \code{gather}，要回到第 3 章的地址账本：gather 只是把多个随机地址放进一条指令语义里，不会让随机内存变成连续内存。若向量循环有很多栈访问，要回到寄存器压力；若主循环很短但前置检查很长，要回到短输入阈值；若尾部代码复杂，要回到 tail 策略。汇编对照不是为了炫技，而是把“用了 SIMD”拆成实际机器动作。
+
+\topic{mask/tail/dispatch 三件事必须进入同一份测试}
+很多向量 bug 分别藏在三处：mask 位和元素位置映射错，tail 越界或漏元素，dispatch 在某个平台或短输入上选错 backend。测试如果只覆盖大数组合法输入，很容易全部漏掉。最小测试矩阵应把长度、对齐、页尾、错误位置和 backend 强制组合起来。
+
+\begin{lstlisting}[numbers=none,caption={向量测试矩阵的最小维度}]
+length:
+  0, 1, lane-1, lane, lane+1, 2*lane-1, 2*lane, 2*lane+1
+
+address:
+  aligned, unaligned, near page end, padded internal batch
+
+error position:
+  first byte, middle byte, last byte, multiple bytes, no error
+
+backend:
+  force scalar, force auto-vectorized, force native if available
+\end{lstlisting}
+
+每个组合都不一定要跑巨大输入；边界矩阵关注正确性和越界，长输入矩阵关注吞吐和瓶颈。报告要把两者分开。若一个 AVX2 backend 长输入很快，但 near page end 输入失败，它不能进入默认路径；若短输入 p99 变差，可以保留长输入 fast path 和短输入 scalar path。
+
+\topic{把向量化收益绑定到阶段占比}
+一个内核快 3 倍，不等于端到端快 3 倍。若该内核只占阶段 10\%，理论上最多给端到端带来有限收益；若它改变输出布局，可能让后续阶段更快或更慢。向量化报告必须写优化前后阶段占比、输出格式是否改变、后续 I/O 和 manifest 是否受影响。这样才能防止把精力花在已经不是瓶颈的局部内核上。
+
+\begin{lstlisting}[numbers=none,caption={向量化收益的端到端账本}]
+before:
+  classify_bytes = 38% of stage time
+  parse_semantics = 44%
+  write_manifest_candidate = 8%
+  other = 10%
+
+after:
+  classify_bytes = 15%
+  parse_semantics = 59%
+  write_manifest_candidate = 12%
+  other = 14%
+
+interpretation:
+  SIMD moved bottleneck to semantic parser
+  next work should reduce state-machine cost or batch boundaries
+\end{lstlisting}
+
+这类账本会让优化方向更清楚。字节分类变快后，语义 parser 成为瓶颈，不代表 SIMD 失败；它说明下一步要研究跨块状态摘要、字段边界表示或错误回查，而不是继续扩大向量宽度。
+
 \topic{SIMD 接口要能拒绝不满足前提的输入}
 向量 backend 不应假装能处理所有输入。如果某个实现要求内部 padding，就只接受带 padding 的内部 batch；如果它只支持 ASCII，就不能被 UTF-8 parser 无条件调用；如果它只返回块级错误位置，就不能替换要求精确偏移的接口；如果它依赖非重叠输出，就要在 debug 或派发层检查。拒绝 fast path 不是失败，而是保持合同。
 

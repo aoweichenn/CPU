@@ -955,6 +955,73 @@ experiment boundary:
 \topic{受限环境的降级路径}
 手机、容器、CI 和普通用户权限下，硬件计数器可能不可用。证据链不能因此中断。降级路径包括：固定输入族和随机种子，重复多轮记录耗时分位数；保存编译器版本、优化选项和反汇编；改变输入规模做 L1/L2/LLC/内存阶梯；改变输入分布观察趋势；保存 checksum 防止被优化掉；明确写出无法读取 PMU 的原因。没有 PMU 权限，不等于可以写无证据结论。
 
+\topic{完整诊断账本：分支改写为什么可能变快，也可能变慢}
+把热循环从 C++ 推到硬件等待，最适合用分支计数案例练习。朴素版本直接写业务条件：遇到分隔符就计数，遇到非法字符就记录错误。这个版本的好处是语义直观，坏处是每个字节都带着控制流。若输入规律稳定，预测器可以学到大多数分支方向；若字符类别接近随机，核心会反复沿错误路径取指、译码和投机执行，再在分支解析后丢弃这些工作。
+
+\begin{lstlisting}[language=C++,caption={分支版本保留了最直接的语义}]
+for (std::uint8_t ch : bytes) {
+  if (ch == ',' || ch == '\n') {
+    ++separator_count;
+  } else if (ch < 0x20) {
+    record_error(ch);
+  }
+}
+\end{lstlisting}
+
+一种常见改写是查表：把字符类别预先编码成小整数，热循环只做一次表访问和少量算术。它可能减少不可预测分支，却增加一次 load，增加寄存器占用，也可能把错误路径摘要变成后处理。若表留在 L1D，随机输入收益明显；若输入本来规则，分支版本已经预测很好，查表版本可能只是增加了工作。若错误密集，错误后处理仍会进入热路径，收益又会消失。
+
+\begin{lstlisting}[language=C++,caption={查表版本把控制流转成数据流}]
+for (std::uint8_t ch : bytes) {
+  std::uint8_t cls = char_class[ch];
+  separator_count += (cls & ClassSeparator) != 0;
+  error_summary |= (cls & ClassError);
+}
+\end{lstlisting}
+
+这两个循环的比较不能停在源码层。分支版本的汇编里通常会看到若干 \instruction{cmp}/\instruction{jcc} 或 \instruction{setcc}；查表版本会出现 \code{char_class + ch} 的内存读、按位操作和加法。前者的风险集中在 bad speculation，后者的风险集中在额外 load、前端指令数、寄存器压力和表的 cache 行为。若只看指令条数，容易误判；若只看 branch-misses，也会忽略查表引入的新瓶颈。
+
+\begin{lstlisting}[numbers=none,caption={两种改写对应的硬件假设}]
+branch version:
+  expected risk:
+    unpredictable jcc, bad speculation, cold error path mixed in loop
+  evidence:
+    branch_misses per KiB grows on random input
+    regular input remains stable
+
+table version:
+  expected risk:
+    extra data load, register pressure, possible frontend growth
+  evidence:
+    branch_misses falls, instructions or cache misses may rise
+    short inputs may lose to fixed setup cost
+\end{lstlisting}
+
+成熟报告要写“瓶颈是否迁移”。如果查表版本让 branch miss per KiB 大幅下降，但 cycles per KiB 不降，说明原瓶颈已经移动。可能是表读和输入读争用 load 资源，可能是错误摘要仍在热循环里，可能是编译器没有把循环收紧，可能是短输入固定成本占主导。此时继续减少分支没有意义，下一步应看反汇编动作、输入长度矩阵和 cache/TLB 证据。
+
+\begin{lstlisting}[numbers=none,caption={一次分支改写实验的解释模板}]
+input family:
+  RegularFields, RandomFields, ErrorDense, ShortLines
+
+source change:
+  branch classifier -> table classifier
+
+assembly change:
+  fewer conditional jumps
+  one additional load from char_class
+  error construction removed from hot loop
+
+hardware hypothesis:
+  random input should reduce bad speculation
+  regular input may not improve
+  short input may lose to dispatch and setup
+
+decision:
+  keep table path for random and long inputs
+  keep branch path as reference and short-input fallback
+\end{lstlisting}
+
+这段账本也说明反汇编和计数器的分工。反汇编证明改写确实改变了机器动作：分支少了、load 多了、冷路径是否离开。计数器和耗时证明这些动作在某类输入上是否改善等待。checksum 和错误摘要证明语义没有被偷换。三者缺一项，结论都不完整。
+
 \begin{sourcereadingbox}
 源码阅读建议从三个入口任选一个。第一，阅读 Linux \filepath{kernel/events/} 和 \filepath{tools/perf/} 附近路径，解释用户态 \cmd{perf stat} 如何请求事件、内核如何管理计数器、权限如何限制结果。第二，阅读 LLVM LoopVectorize 或 SLP vectorizer 的文档和一条小循环诊断，解释为什么某个循环没有向量化。第三，阅读一个工业解析器或数据库执行器的热路径，找出 reference、fast path、slow path、batch 边界和错误回退。报告必须把源码路径映射回一个实际实验现象。
 \end{sourcereadingbox}
