@@ -332,6 +332,34 @@ compute with the same worker-to-range mapping
 merge worker partials by node, then merge node results
 \end{lstlisting}
 
+\topic{从虚拟地址推到内存节点}
+NUMA 不是在指针上贴一个节点标签。用户态指针仍然是虚拟地址；页表项把虚拟页映射到物理页框；物理页框属于某个内存节点；内存节点连接到某个内存控制器和拓扑位置。一次 load 的路径因此可以写成：虚拟地址经过 DTLB 得到物理页号，物理地址进入 cache 层级，miss 后请求被路由到拥有该 line 的缓存、LLC 切片或内存控制器；若目标物理页在远端节点，请求和数据要穿过 socket 或 die 间互连。
+
+\begin{lstlisting}[numbers=none,caption={远端内存访问的身份链}]
+user pointer:
+  virtual address
+
+page table:
+  virtual page -> physical page frame
+
+physical placement:
+  physical page frame belongs to NUMA node N
+
+execution placement:
+  current thread runs on CPU in NUMA node M
+
+access cost:
+  local if M == N
+  remote if M != N, with interconnect latency and bandwidth cost
+\end{lstlisting}
+
+这条链说明为什么单纯打印指针值没有诊断力。同一个虚拟地址范围，在不同运行中可能因 first-touch、自动迁移、membind 或内存压力落到不同节点；同一线程 id 也可能因调度迁移跑到不同 CPU。报告需要同时记录虚拟范围、初始化线程、实际 CPU、可见节点、页面放置线索和绑定策略。否则只能看到“同一程序有时快有时慢”，看不到位置身份改变。
+
+\topic{页面迁移不是免费修复}
+自动 NUMA balancing 或手工迁移可以把热页挪近执行线程，但迁移本身要复制页面、更新页表、处理 TLB shootdown，并可能扰动缓存。长时间稳定访问的服务可能从迁移中受益；短小 benchmark 或快速阶段切换的任务可能还没收回迁移成本就结束。若一个数组先由 node 0 解析、随后由 node 1 聚合、最后又由 node 0 写出，页面来回迁移可能比远端访问更糟。
+
+因此 NUMA 设计优先追求“让数据从一开始就在正确位置，且阶段之间位置变化少”。Worker 本地初始化、按 split 固定 worker-to-range、节点内合并和低频跨节点摘要，都是为了减少后续迁移需求。自动机制可以作为生产系统的一部分，但实验报告要写清它是否参与；否则一轮运行的改善可能来自内核后台迁移，而不是算法结构。
+
 \topic{线程绑定和 first-touch 是两件事}
 线程绑定约束执行位置；first-touch 影响页面归属。绑定线程不会自动移动页面，移动页面也不会自动固定线程。一个实验若只绑定线程，却让主线程初始化所有数据，仍然可能让远端访问进入热循环。反过来，只做并行初始化但计算时线程被调度到其他节点，也会破坏局部性。
 
@@ -444,6 +472,58 @@ NUMA 不只影响分配，也影响释放。对象在 node 0 分配，由 node 1
 \end{center}
 
 这些实验都要保持逻辑工作量和 checksum 可比。若共享写版本结果正确但慢，问题是扩展性；若分层 partial 结果变了，问题先回到语义。性能实验不能绕过正确性。
+
+\topic{把共享写拆到一次 store 的消息链}
+共享写问题常被一句“cache line 来回跑”概括，但工程判断需要更细的账本。一次普通 store 先在核心内计算地址，经过 DTLB 翻译，查找 L1D；若目标 line 已经在本核心 Modified 或 Exclusive 状态，写入可以进入 store buffer 并较快完成。若目标 line 不在本核心，或者只以 Shared 状态存在，核心就要发出 Read-For-Ownership 请求。RFO 的含义是：不仅要读到这条 line，还要取得未来写它的权限。
+
+\begin{lstlisting}[numbers=none,caption={一次共享 store 可能触发的消息链}]
+core A wants to store to address x
+  compute address and find cache line X
+  L1D does not hold X in writable state
+  send Read-For-Ownership request for X
+  directory or snoop fabric finds owner and sharers
+  invalidate shared copies or request owner to supply modified data
+  wait for required acknowledgements
+  receive writable copy of X
+  commit store into local cache line through store buffer
+\end{lstlisting}
+
+这条链解释两个看似矛盾的现象。第一，线程私有写可以很快，因为 writable line 长期停在本核心，store buffer 能平稳排出。第二，热点共享写可以在数据量极小的情况下很慢，因为每次写入前都可能要经过权限请求、失效、确认和数据转发。整数加法本身仍然很便宜，昂贵的是把“谁有权写这条 line”在多个核心之间重新安排。
+
+\topic{store buffer 不能消除一致性等待}
+Store buffer 让核心把尚未完全写回缓存层级的 store 暂存起来，从而减少后续指令被普通写入阻塞的机会。它不是一致性协议的替代品。若目标 line 还没有可写所有权，store buffer 里的条目不能凭空对其他核心生效；若 store buffer 被未完成共享写填满，后续 store 也会反过来阻塞前端和后端。高频原子、锁释放、共享队列 head/tail 和 false sharing 槽位，都可能把 store buffer 从隐藏延迟的结构变成等待暴露的位置。
+
+这也解释了为什么 \code{memory_order_relaxed} 只能解决排序成本的一部分。Relaxed 原子仍然要对同一原子对象建立不可分割的修改顺序，仍然要让目标 line 在执行 RMW 时处于合适的独占状态。若瓶颈是所有权迁移，放松 acquire/release 关系可能改善有限；若瓶颈是多余屏障或同步边界，内存序选择才可能明显影响热路径。先分清“排序等待”和“所有权等待”，再讨论内存序。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.34\linewidth}p{0.32\linewidth}@{}}
+\toprule
+等待来源 & 底层问题 & 常见修复方向 \\
+\midrule
+line 所有权等待 & 多核心高频写同一 line & thread-local partial、shard、padding、批量提交 \\
+排序或屏障等待 & 需要发布/观察顺序或强同步边界 & 缩小同步范围、使用恰当 memory order、阶段协议 \\
+store buffer 压力 & 未排出的 store 过多或目标 line 未就绪 & 连续私有写、减少共享写、分块输出 \\
+锁等待 & 临界区被占用或等待线程进入内核 & 缩短临界区、拆锁、局部化状态、队列化 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{False sharing 的汇编视角}
+False sharing 不会在汇编里显示为特殊指令。两个 worker 可能都执行普通的 \instruction{mov} 或 \instruction{add} 到不同地址，源码也明确写的是不同数组元素。问题藏在地址低位：两个地址落在同一条 cache line。硬件的一致性单位是 line，于是两个不同变量共享同一份所有权。
+
+\begin{lstlisting}[numbers=none,caption={两个独立槽位仍可能落在同一条 line}]
+worker 0:
+  add qword ptr [partials + 0], 1
+
+worker 1:
+  add qword ptr [partials + 8], 1
+
+if both addresses are inside the same cache line:
+  the line ownership moves between worker 0 and worker 1
+\end{lstlisting}
+
+反汇编只能告诉写入地址公式，不能单独告诉这两个地址是否同线。还要结合对象布局、对齐、元素大小、分配器返回地址和运行时 worker 数。紧凑 partial 和 aligned partial 的对照实验，就是把这件事变成可观察差异：若仅改变槽位间距就明显改善多线程扩展，false sharing 假设得到支持；若没有改善，瓶颈可能在全局合并、带宽、任务调度或其他共享结构。
 
 \topic{线程绑定不是目的，是诊断工具}
 绑定线程到核心或节点，可以减少调度迁移变量，让页面 first-touch 和计算位置更容易对齐。诊断时可比较三种状态：不绑定、只绑定计算、绑定初始化和计算。若只绑定计算无改善，绑定初始化后改善，说明页面放置参与；若两者都无改善，可能是带宽、共享写、任务粒度或其他问题。若绑定后波动下降但中位数不变，调度迁移只是噪声来源，不是主瓶颈。

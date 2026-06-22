@@ -401,6 +401,54 @@ failure:
 
 这份报告把第一章的边界变成后续实现的验收线。优化不是只让某个函数变快，而是让系统在更大规模、更差输入和可恢复故障下仍能解释自己的结果。
 
+\topic{从一行 C++ 推到完整证据链}
+把 \code{counts[event_type] += value} 写成执行账本以后，还要继续把证据链补全。第一层是源码语义：\code{event_type} 是否已经过输入合同验证，\code{value} 是否参与错误策略，\code{counts} 是全局表、worker 本地表，还是某个 shard 的局部表。第二层是编译后的机器形态：热循环里是否有边界检查、哈希函数、函数调用、容量增长、异常路径、\code{lock} 前缀或系统调用。第三层是地址形态：\code{event_type} 来自连续列还是对象字段，\code{counts} 的槽位是否连续，写入是否落在多个核心共享的 line。第四层是运行证据：不同输入分布、线程数和工作集规模下，阶段时间、反汇编、计数器或降级证据是否支持同一个解释。第五层是语义审计：优化后 accepted、rejected、diagnostics、checksum 和 manifest 是否仍然一致。
+
+\begin{lstlisting}[numbers=none,caption={从一行更新到证据链的展开}]
+source semantics:
+  counts[event_type] += value
+
+machine shape:
+  load event_type
+  compute counter address
+  load old counter
+  add value
+  store new counter
+  or execute locked read-modify-write if shared atomic
+
+address shape:
+  event_type column: contiguous or object field
+  counter table: local array, shard, hash bucket, or global atomic
+  cache line: private, false-shared, or hot shared
+
+runtime evidence:
+  stage time, scaling curve, disassembly summary,
+  counter evidence when available, checksum and diagnostics
+\end{lstlisting}
+
+这条链的价值在于防止跳跃。不能从源码一行直接跳到“需要无锁”，也不能从一次 cache miss 直接跳到“数据布局错误”。若机器形态里没有共享写，原子章节的知识暂时用不上；若地址形态是连续流式扫描，cache miss 高可能只是带宽账本；若阶段时间显示 write+commit 才是长尾，继续优化 parser 热循环就只是局部漂亮。第一章只给出方法，后续章节逐步填充每一层的物理和工程细节。
+
+\topic{热循环审查模板}
+任何准备被优化或并行化的热循环，都可以先过一张审查表。表里的问题不是代码风格，而是机器会看见什么。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}@{}}
+\toprule
+审查项 & 要回答的问题 & 常见证据 \\
+\midrule
+语义身份 & 输入、输出、错误和提交事实是否稳定 & reference、oracle、checksum、RecordId \\
+控制流 & 正常路径是否短而稳定，冷路径是否离开热循环 & 反汇编、分支输入矩阵、错误率对照 \\
+地址流 & load/store 是否连续、随机、跨页或依赖前一次 load & layout report、AccessTrace、规模阶梯 \\
+写入归属 & 写入 line 是否被单线程、单 worker、多个核心或多个节点修改 & partial 布局、padding 对照、扩展曲线 \\
+容量边界 & 热代码、热数据和活跃页是否超过近端结构 & 函数大小、工作集、TLB 覆盖估算 \\
+等待位置 & 时间耗在运行、锁、I/O、队列、缺页还是提交 & StageReport、trace、off-CPU 指标 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不要求一次拿到所有硬件计数器。普通用户环境、容器或手机上，很多 PMU 事件不可用，仍然可以通过反汇编摘要、输入对照、阶段时间、checksum 和扩展曲线建立较弱但诚实的结论。证据不足时，结论就写窄；不要把推断伪装成已经测到的硬件事实。
+
 \section{执行与等待：从一个循环到多个工作者}
 
 单线程 reference 的执行顺序很简单：读一行，解析一行，更新一次计数。并行化的诱惑也很直接：把输入切成多个 split，让多个 worker 同时处理。真正的问题是，共享状态和等待点会随之出现。

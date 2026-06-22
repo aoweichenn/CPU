@@ -862,6 +862,56 @@ Intel 的 Top-Down 思路把核心周期粗分为 retiring、bad speculation、f
 
 这个方法也有代价。PMU 事件与微架构相关，不同 CPU、虚拟化环境、权限设置和采样方式都会影响可用性。报告不能把某台机器上的事件名写成永久事实。Compute Systems Engine 只采用它的诊断结构：先分类，再深入；有计数器时记录事件，没有计数器时写替代证据和边界。
 
+\topic{Top-Down 四类怎样落到热循环}
+Top-Down 的四个一级分类可以直接映射到日志解析热循环。Retiring 高，说明很多周期在提交有用微操作；这不等于程序已经最优，只表示当前核心内部没有明显空转。Bad speculation 高，通常意味着分支预测失败或机器清空较多；解析器里最常见的原因是字符类别分布随机、错误路径进入热循环、间接分派目标不稳定。Frontend bound 高，说明后端缺少可执行微操作；可能是热函数太大、I-cache/ITLB 供给不稳、uop cache 容不下循环体、间接跳转打乱取指。Backend bound 高，说明微操作到了后端却等资源或数据；要继续区分端口压力、依赖链、L1/L2/LLC/DRAM 等待、store buffer 和一致性等待。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}@{}}
+\toprule
+分类 & 热循环里的典型原因 & 下一步证据 \\
+\midrule
+Retiring & 微操作大多成功提交，瓶颈可能在算法字节量或外部阶段 & 每记录指令数、端到端阶段耗时、reference 对照 \\
+Bad speculation & 随机分支、错误路径混入、间接目标不稳定 & 输入分布、branch miss、冷热路径版本对照 \\
+Frontend bound & 代码足迹大、I-cache/ITLB/uop cache/译码供给不足 & 函数大小、反汇编范围、调用和跳转目标、内联对照 \\
+Backend bound & load 等待、端口拥挤、依赖链、store buffer 或一致性热点 & 地址序列、工作集阶梯、局部 partial、端口和 cache 证据 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的作用是限制推理范围。例如随机输入上 bad speculation 上升，同时 branchless 版本减少 branch miss 且 checksum 不变，可以支持“分支预测是主因”的结论；若 branchless 版本指令数大增、frontend bound 上升、总时间没有下降，就说明改写只是把瓶颈从错误投机移动到前端供给。性能分析的成熟标志不是一次就猜对，而是能解释瓶颈迁移。
+
+\topic{同一指标不能脱离分母}
+PMU 计数器要和分母一起读。\code{branch-misses} 绝对值高，可能只是处理的数据更多；要看每条记录、每 KiB、每千条分支的 miss。Cache miss 也一样：一次处理 1 GiB 输入的 miss 总数必然大于处理 1 MiB；关键是每条 cache line 提供了多少有效字节，miss 是否集中在随机表、输入流、输出流或页表。IPC 低不能单独证明后端等内存，因为前端断供、同步等待和故障注入也会让 IPC 低。
+
+\begin{lstlisting}[numbers=none,caption={HotKernelReport 中的 Top-Down 摘要字段}]
+topdown:
+  retiring_percent
+  bad_speculation_percent
+  frontend_bound_percent
+  backend_bound_percent
+
+normalization:
+  records
+  input_bytes
+  instructions_per_record
+  cycles_per_record
+  branch_misses_per_kiB
+  cache_misses_per_kiB
+
+evidence_boundary:
+  counters_available: true
+  virtualized_pmu: false
+  repeated_runs: 20
+\end{lstlisting}
+
+没有标准化字段，报告会退化成工具输出截图。标准化后的指标可以跨输入族比较：规则日志和随机日志字节数相同，但 branch miss per KiB 差异明显；对象图和列式 batch 记录数相同，但 cache miss per record 差异明显；单线程和多线程处理量相同，但 locked RMW per record 或 coherence 相关事件差异明显。后续章节的并发、I/O 和分布式报告也应采用同一思想：计数必须绑定业务单位。
+
+\topic{从 Top-Down 回到代码改写}
+Top-Down 只能把方向缩窄，不能替代改写设计。若分类指向 bad speculation，第一步不是立刻写无分支代码，而是构造输入族：全都命中、全都不命中、规律交替、随机、错误密集。若只有随机输入慢，分支预测假设更强；若错误密集输入慢，冷热路径分离更可能有效；若所有输入都慢，可能是前端足迹或后端访存。若分类指向 frontend bound，先比较函数大小、内联深度、调用和间接跳转，再决定是否拆冷路径、减少模板膨胀、把逐行虚调用改成 batch dispatch。若分类指向 backend bound，先画地址序列和依赖链，再决定分块、预取、局部 partial、数据布局或向量化。
+
+这条回路让“工具输出”变成“工程动作”。每一次动作都要保留失败版本：branchless 未提升、过度展开伤害 I-cache、预取污染缓存、padding 增大 TLB 压力，这些都是有价值的负结果。负结果写清楚，下一次才能更快排除错误方向。
+
 \topic{编译器优化报告：让编译器解释拒绝理由}
 LLVM、GCC 和其他编译器能输出向量化、内联、循环优化和优化失败诊断。高性能 C++ 不是和编译器对抗，而是让真实语义进入源码：连续范围、只读输入、独占输出、明确合并合同、可见的循环边界、可内联的小函数。若报告显示因为别名、无法证明依赖或循环控制复杂而不能向量化，修复点往往是 API 和数据结构，而不是手写几条指令。
 

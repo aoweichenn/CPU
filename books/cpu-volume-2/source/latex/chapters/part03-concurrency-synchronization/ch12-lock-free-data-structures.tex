@@ -840,6 +840,48 @@ ABA 示例模型 & 小对象池 + tagged handle & 容易复现和解释身份变
 \topic{测试矩阵}
 无锁测试必须比锁版更严。测试容量一、容量二、非二次幂、wrap around、多轮循环、随机 \code{yield}、生产者快、消费者快、长时间压力。Treiber/节点结构测试要使用小对象池快速复用地址，制造 ABA 条件；开启 AddressSanitizer/ThreadSanitizer 时要理解工具限制；记录 retired 列表长度，防止回收静默失控。
 
+\topic{线性化测试和生命周期测试要分开}
+无锁结构至少要通过两类测试。线性化测试检查操作是否能排列成一个合法的顺序历史：push 成功后元素可被 pop，pop 不能凭空返回不存在的元素，empty 返回只能发生在某个合法瞬间。生命周期测试检查节点是否仍然活着：读取方拿到指针后，删除方不能提前释放；retired 节点最终能释放；线程退出不会留下永久 hazard；epoch 不会被阻塞线程无限卡住。两类测试互相独立，缺一不可。
+
+\begin{lstlisting}[numbers=none,caption={无锁结构测试分层}]
+linearizability:
+  operation history
+  begin/end interval
+  success/failure result
+  item identity
+  legal sequential model
+
+lifetime:
+  allocation id
+  generation
+  retire time
+  protection state
+  actual free time
+  sanitizer status
+\end{lstlisting}
+
+Treiber 栈可能在线性化上看似正确，却因为没有回收协议出现 use-after-free；hazard pointer 版本可能生命周期安全，却因为 CAS 失败路径没有重读状态导致返回值错误。测试报告要把这两类结果分开写，避免一个“stress passed”掩盖另一个边界。
+
+\topic{误用测试也要保留}
+无锁结构通常有强前提。SPSC ring 只允许一个生产者和一个消费者；MPSC 允许多个生产者但消费方唯一；某些结构要求元素类型移动不抛异常；某些结构不支持阻塞等待或关闭。误用测试不是为了让错误用法通过，而是为了让接口边界清楚。若两个 producer 同时调用 SPSC，测试可以断言 debug 版本触发检查，或文档明确标为未定义使用；不能悄悄表现得“偶尔也能跑”。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.32\linewidth}p{0.32\linewidth}@{}}
+\toprule
+误用场景 & 应暴露的边界 & 推荐处理 \\
+\midrule
+两个 producer 使用 SPSC & 单写者不变量被破坏 & debug 断言或测试标红 \\
+close 直接写进 ring 槽位 & 数据协议和生命周期混杂 & 外层 Channel 管理关闭 \\
+epoch 临界区内阻塞 I/O & 回收可能被无限卡住 & 禁止并记录最大临界区时间 \\
+hazard 槽位线程退出未清理 & retired 节点泄漏 & 注册/注销测试和泄漏检查 \\
+CAS 循环内写日志或分配 & 失败重试产生重复副作用 & 副作用移到 CAS 成功后 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这类测试会让接口更窄，但窄接口比模糊接口安全。无锁结构真正难的地方不在几行 CAS，而在把可用范围压到能证明的边界内。
+
 \begin{sourcereadingbox}
 源码阅读以“线性化点和回收”为主线。
 \begin{enumerate}

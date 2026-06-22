@@ -586,6 +586,79 @@ Reduce busy & partition queue 高水位 & Map 端背压，retry budget 不被放
 \end{tabular}
 \end{center}
 
+\topic{崩溃点矩阵要贴着提交路径}
+Driver 崩溃不能只测“运行中 kill 一次”。提交路径由多个边界组成：worker 写临时 block，写满字节，计算 checksum，发送 reply，Driver 校验 block，append manifest，更新内存 task table，写 checkpoint，reduce 读取 manifest。每个边界前后崩溃，恢复动作都不同。矩阵要贴着这些边界，而不是随机挑一个时间点。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}@{}}
+\toprule
+崩溃点 & 恢复时可能看到什么 & 正确动作 \\
+\midrule
+临时 block 写到一半 & 文件存在但 bytes/checksum 不匹配 & corrupt，删除或隔离，重试 task \\
+block 完整但 reply 未发送 & 完整 candidate，无 manifest & 不提交，按 task 状态重试或审计 \\
+reply 到达但 manifest 前 & candidate block，checkpoint 可能 Running & 重试或重新校验，不对 reduce 可见 \\
+manifest append 后、内存表前 & manifest 有 accepted，checkpoint 落后 & 承认提交，重建 task table \\
+内存表后、checkpoint 前 & manifest 有 accepted，checkpoint 落后 & 以 manifest 为准，更新 checkpoint \\
+checkpoint 声称 committed 但 manifest 无 & checkpoint ahead 或损坏 & audit，不直接提交 \\
+reduce 过程中崩溃 & manifest 不变，partial output 可能残留 & 清理候选输出，重新 reduce committed set \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个矩阵把提交权威固定在 manifest。Checkpoint、目录和内存表都可能落后或领先，不能反过来创造提交事实。故障注入规则应该能精确命中这些边界，例如 \code{crash_after_manifest_append_before_task_table_update}，而不是只写 \code{crash_randomly}。
+
+\topic{恢复报告要解释每个文件的命运}
+恢复扫描后，RunReport 应能回答三个问题：哪些文件进入 accepted 集合，哪些文件被拒绝，哪些文件暂时保留等待审计。每个文件都要有身份链和分类理由。否则，恢复程序虽然最终 checksum 正确，也无法证明没有把孤儿文件碰巧排除，或把旧 attempt 碰巧覆盖。
+
+\begin{lstlisting}[numbers=none,caption={RecoveryReport 的语义字段}]
+recovery:
+  manifest_generation_before
+  manifest_generation_after
+  checkpoint_generation_loaded
+  accepted_blocks
+  candidate_blocks
+  orphan_blocks
+  stale_attempt_blocks
+  stale_epoch_blocks
+  corrupt_blocks
+  bytes_reclaimed
+  audit_required
+
+block_decision:
+  block_id
+  task_id
+  attempt
+  driver_epoch
+  bytes
+  checksum_status
+  manifest_status
+  decision
+  reason
+\end{lstlisting}
+
+这份报告会让恢复从“目录里剩了什么”变成“每个材料被哪条规则处理”。当后续把单机 MessageBus 换成多进程或真实网络，恢复报告仍然有效，因为它依赖的是身份、attempt、epoch、manifest 和 checksum，不依赖传输方式。
+
+\topic{故障规则要覆盖迟到和重复的组合}
+真实事故经常不是单个故障，而是组合：reply 丢失导致 retry，旧 attempt 稍后成功，Driver 又在 manifest 后崩溃，重启时目录里有两个完整 block。若测试只覆盖单一 drop 或单一 crash，无法证明组合安全。确定性故障规则要支持顺序触发、次数限制和组合命名。
+
+\begin{lstlisting}[numbers=none,caption={组合故障规则示例}]
+FaultScenario late_attempt_after_commit_and_restart:
+  1. drop TaskReply(task=7, attempt=0) once
+  2. allow timeout and assign attempt=1
+  3. allow attempt=1 manifest commit
+  4. crash driver after manifest append before checkpoint
+  5. deliver delayed reply for attempt=0 after restart
+
+expected:
+  manifest keeps attempt=1
+  attempt=0 is stale_attempt
+  recovery accepts B7a1 only
+  RunReport records one stale reply and one checkpoint lag
+\end{lstlisting}
+
+组合规则的价值在于长期回归。后续重构 writer、MessageBus、manifest 或 checkpoint 时，这条场景都应继续通过；一旦失败，报告能指出是幂等提交、恢复优先级还是旧 reply 分类被破坏。
+
 \topic{RunReport 是最终系统的用户界面}
 RunReport 不是日志汇总，而是可审查证据。它至少包含输入摘要、reference checksum、engine checksum、错误行数、stage 耗时、queue high watermark、task 数、attempt 数、retry amplification、late reply 数、duplicate reject 数、manifest generation、checkpoint generation、故障规则、恢复动作和未验证边界。
 
