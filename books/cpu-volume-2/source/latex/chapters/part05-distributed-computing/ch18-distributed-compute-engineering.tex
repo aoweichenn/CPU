@@ -436,6 +436,70 @@ manifest 有两个同 task & manifest 损坏或提交协议错误 & 停止并报
 \end{tabular}
 \end{center}
 
+\topic{恢复扫描要先分类，不先接受}
+恢复程序启动后会看到许多材料：manifest log、checkpoint、临时 block、worker reply 日志、故障注入记录、未清理目录。错误做法是扫描目录，看到 block 文件就加入 reduce；正确做法是先重建权威状态，再把每个材料分类。Manifest 中的 accepted entry 是提交事实；与 manifest 匹配的 block 是已接受数据；没有 manifest 的完整 block 只是 candidate；旧 epoch、旧 attempt、未知 task 和 checksum 错误都是拒绝材料；格式损坏或身份不完整的材料进入 corrupt 类。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}@{}}
+\toprule
+分类 & 判定依据 & 恢复动作 \\
+\midrule
+accepted & manifest 有同 task/attempt/block，checksum 匹配 & 承认提交，供 reduce 使用 \\
+candidate & block 完整但 manifest 无记录，task 仍可重试 & 保留审计或重新调度，不直接提交 \\
+orphan & task 不存在、stage 已结束或 job generation 不匹配 & 记录并等待清理安全点 \\
+stale attempt & task 已提交其他 attempt，或 attempt 不是当前 attempt & 拒绝，计入 duplicate/stale 指标 \\
+stale epoch & driver epoch、route epoch 或 owner 已过期 & 拒绝，禁止补写 manifest \\
+corrupt & bytes/checksum/metadata 不一致或文件不完整 & 隔离，触发 retry 或失败策略 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表要进入恢复代码，而不是只出现在说明里。恢复扫描的输出应是 \code{RecoveryReport}：每个目录发现多少 accepted、candidate、orphan、stale、corrupt，分别占用多少字节，哪些被清理，哪些等待审计。只有分类稳定，恢复才不会被文件名、修改时间和目录遍历顺序支配。
+
+\topic{端到端 stale attempt 场景}
+下面把一个旧 attempt 从产生到被拒绝写成完整链路。Task 7 的 attempt 0 被派给 Worker A。A 写 block 时网络变慢，Driver 超时后派 attempt 1 给 Worker B。B 成功写出 block，reply 到达，manifest 接受 \code{T7,A1,B7a1}。稍后 A 的 attempt 0 才完成并发送成功 reply。若 Driver 只看 checksum，A0 可能覆盖 A1；若 Driver 按身份链判定，A0 会进入 stale attempt。
+
+\begin{lstlisting}[numbers=none,caption={迟到 attempt 的端到端事件链}]
+T0:
+  Driver assigns task=7 attempt=0 to worker A
+
+T1:
+  worker A writes block B7a0 slowly
+  Driver timeout expires
+
+T2:
+  Driver assigns task=7 attempt=1 to worker B
+  worker B writes block B7a1
+  Driver receives reply for attempt=1
+  manifest accepts task=7 attempt=1 block=B7a1
+
+T3:
+  worker A finally sends success reply for attempt=0
+  Driver sees task=7 already committed with attempt=1
+  reply is stale_attempt
+  block B7a0 is not visible to reduce
+\end{lstlisting}
+
+这里的关键不是“谁先完成”，而是“哪个 attempt 被 manifest 接受”。真实系统中，旧 attempt 可能在 Driver 重启后才到达；可能只有 block 文件留下而 reply 丢失；也可能旧 worker 处在旧 driver epoch。每种情况都应落到同一套分类：没有 accepted manifest 就不是提交事实，已经提交其他 attempt 就不能再改变结果。
+
+\topic{Checkpoint 提前和落后的双向事故}
+Checkpoint 和 manifest 的相对顺序会制造两种事故。第一，manifest 已提交，checkpoint 尚未更新；恢复必须承认 manifest，不能因为 checkpoint 落后就重做并产生重复 attempt。第二，checkpoint 声称 task committed，但 manifest 没有对应 entry；这可能是 checkpoint 写序错误、崩溃点落在 manifest 前，或 checkpoint 文件损坏。恢复不能直接相信 checkpoint，应进入 audit 或按未提交重试。
+
+\begin{lstlisting}[numbers=none,caption={checkpoint 与 manifest 的恢复优先级}]
+case checkpoint_lag:
+  manifest: task 7 -> attempt 1
+  checkpoint: task 7 Running
+  decision: task 7 is Committed, update recovered task table
+
+case checkpoint_ahead:
+  manifest: no entry for task 8
+  checkpoint: task 8 Committed
+  decision: audit checkpoint, do not expose block to reduce
+\end{lstlisting}
+
+这条规则让系统避免“快照覆盖日志”。在控制面里，日志或 manifest 是提交权威，checkpoint 是缓存；缓存可以落后，也可能损坏，不能反向创造提交事实。
+
 \topic{故障注入规则也要结构化}
 故障注入不是在代码里随手 \code{if random()}。规则应能匹配对象身份，并且可重放。一个规则可以表达“第一次发送 \code{TaskReply(T2,A0)} 时丢弃”，另一个规则表达“\code{block_id=B1a0} 第一次 write 只写 4096 字节”。规则应有触发计数，避免每次都触发导致系统永远无法前进。
 

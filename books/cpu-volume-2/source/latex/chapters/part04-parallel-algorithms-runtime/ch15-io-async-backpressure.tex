@@ -205,6 +205,63 @@ application sees sudden write or fsync latency spikes
 
 这张表把可靠性和性能拆开。系统可以选择某些中间 block 不做强持久化，只要 manifest 不把它们宣布为已提交；也可以选择 group commit，把多个 block 的持久化成本合并。无论选择哪种策略，都要写入恢复协议，而不是让恢复逻辑从文件名猜状态。
 
+\topic{rename 只是名字切换，不是完整提交协议}
+可靠写常用模式是：写临时文件，校验，\code{fsync} 文件，\code{rename} 到目标名，再更新 manifest。这里每一步都有不同含义。\code{rename} 在许多本地文件系统上能提供同目录下名字切换的原子性：恢复时通常看到旧名字或新名字，不会看到半个名字。但名字原子性不等于数据已经持久，也不等于目录项一定经受住掉电。若承诺掉电恢复，通常还要考虑对文件和目录的同步边界；若只承诺进程崩溃恢复，page cache 中的目录和文件状态仍可能足够，但恢复协议要明确。
+
+\begin{lstlisting}[numbers=none,caption={可靠 block 写入的提交层次}]
+write temp file:
+  bytes enter page cache or direct I/O path
+
+fsync temp file:
+  block bytes and required file metadata reach durable boundary
+
+rename temp -> final:
+  directory name now points to the final block name
+
+fsync parent directory:
+  directory entry update reaches durable boundary when required
+
+append or rewrite manifest:
+  business layer accepts this attempt as visible output
+\end{lstlisting}
+
+这个顺序不表示所有系统都必须对每个中间 shuffle block 做最强同步。批处理系统可以把中间 block 视为可重算缓存，只对最终 manifest 做更强承诺；也可以用 group commit 把多个文件和 manifest 的同步成本合并。关键是不能把 \code{rename}、\code{fsync} 和 manifest commit 混成一个“保存成功”。\code{rename} 解决名字切换，\code{fsync} 解决持久边界，manifest 解决业务可见性和 attempt 选择。
+
+\topic{Manifest 为什么比最终文件名更强}
+只靠最终文件名判断成功，会在重试和迟到 completion 中出错。假设 split 7 的 attempt 0 写出了 \filepath{part-7.tmp.0}，超时后 attempt 1 写出了 \filepath{part-7.tmp.1} 并提交 manifest。之后 attempt 0 迟到完成并被 rename 成 \filepath{part-7.final}。如果下游只按文件名读取，它可能读到旧 attempt；如果下游只读 manifest，它会知道 accepted attempt 是 1，attempt 0 即使文件完整也不能生效。
+
+\begin{lstlisting}[numbers=none,caption={manifest 条目表达的业务事实}]
+logical_partition = 7
+accepted_attempt = 1
+file_path = part-7-attempt-1.block
+records = 842193
+bytes = 67128320
+checksum = 0x8f21...
+partition_plan_version = 3
+\end{lstlisting}
+
+Manifest 的作用不是重复文件系统目录，而是把业务身份、attempt、校验、分区规则和可见性绑在一起。文件存在是物理事实；manifest 接受是业务事实。I/O 层必须把这两个事实分开，否则恢复程序无法判断哪些文件是 orphan，哪些是 late attempt，哪些才是后续 stage 的输入。
+
+\topic{系统调用边界和 C++ 内存边界不同}
+一个常见混淆是把线程间可见性和持久化可见性放在一起。C++ 的 release/acquire 或 mutex 可以保证另一个线程看到 buffer 中已经写好的字节；系统调用可以把这些字节交给内核；\code{fsync} 可以把文件推进到文件系统承诺的持久边界；manifest commit 可以让业务层承认输出。它们是不同层级的顺序关系。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}@{}}
+\toprule
+边界 & 解决的问题 & 不能替代的层级 \\
+\midrule
+C++ release/acquire & 线程看到已构造请求和 buffer 字段 & 不能保证内核接受或磁盘持久 \\
+\code{write} 返回 & 内核接受部分或全部字节 & 不能保证 durable 或业务提交 \\
+\code{fsync} 返回 & 文件系统承诺的持久边界推进 & 不能决定哪个 attempt 生效 \\
+\code{rename} 返回 & 目录命名状态改变 & 不能单独表达业务校验和分区版本 \\
+manifest commit & 业务可见输出被接受 & 依赖底层文件和恢复协议的承诺 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表能解释为什么 I/O 代码看起来“步骤很多”。每一步解决一个不同故障模型。删掉其中一步，系统未必立刻变错，但承诺边界已经改变。报告必须写明这种改变，而不是只写“优化掉 fsync 后变快”。
+
 \topic{Completion 线程不能成为新瓶颈}
 异步 I/O 常把等待从提交线程移到 completion loop。Completion loop 的职责应尽量短：取回结果、更新 request 状态、释放或转交 buffer、记录错误、推进 manifest 或通知上层。若在 completion 回调里做压缩、解析、复杂合并、同步日志格式化或长时间持锁，完成队列会被阻塞，设备已经完成的请求无法及时回收 buffer，上游看到的背压会被放大。
 

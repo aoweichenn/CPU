@@ -227,6 +227,40 @@ count + scan + write 看起来多扫了一遍输入，却常常比共享 \code{p
 
 这个判断也解释了为什么 scan 不能只用“大 O”评价。两遍顺序扫描的渐进复杂度可能比一遍共享追加更高，但它把随机同步、扩容和所有权迁移换成了顺序读写和小数组 scan。现代 CPU 上，后者通常更容易被流水线、cache、预取和内存控制器消化。若输入很小，三阶段固定成本会输；若输入很大且选择率稳定，连续写路径通常胜出。实验要同时记录阶段耗时和内存带宽，否则无法解释这类反直觉结果。
 
+\topic{共享追加在汇编层是什么形状}
+串行 \code{push_back} 看起来只是一个函数调用。进入并行热路径后，它至少包含三个共享事实：当前大小、容量边界和目标地址。简化到不扩容的情况，追加一个 8 字节元素可以抽象成：
+
+\begin{lstlisting}[numbers=none,caption={不扩容追加的抽象机器动作}]
+load size from vector metadata
+compute target = data + size * sizeof(T)
+store value to target
+store size + 1 back to vector metadata
+\end{lstlisting}
+
+单线程里这很自然。多线程要让它正确，就必须保护 \code{size}。锁版会在每次追加前后修改锁字，锁字所在 cache line 在核心间转移；原子下标版可能接近：
+
+\begin{lstlisting}[numbers=none,caption={原子抢输出位置的抽象机器动作}]
+old = atomic_fetch_add(output_size, 1)
+target = output_data + old * sizeof(T)
+store value to target
+\end{lstlisting}
+
+在 x86-64 上，\code{atomic_fetch_add} 常落成带 \code{lock} 前缀的 read-modify-write 形态，例如 \code{lock xadd} 或等价循环。即使使用 relaxed 内存序，硬件仍要对保存 \code{output_size} 的整条 cache line 取得独占所有权，并把旧值和新值作为一个不可分割的修改发布给其他核心。所有命中元素都争同一个 line，扩展性自然会被压住。
+
+Scan 的三阶段方案本质上把这条 \code{lock xadd} 从每个元素上移走。Count 阶段只写 worker-local count；exclusive scan 在小数组上计算每个 chunk 的起点；write 阶段用普通 store 写独占区间。热循环的抽象机器动作变成：
+
+\begin{lstlisting}[numbers=none,caption={scan 后写出阶段的抽象机器动作}]
+target = output_data + (chunk_begin + local_rank) * sizeof(T)
+store value to target
+\end{lstlisting}
+
+这里没有共享计数器，地址随输出区间递增，store buffer 和预取器都更容易工作。若需要稳定顺序，\code{chunk_begin} 由按输入顺序扫描出来；若允许非稳定顺序，可以改变 chunk 排列，但必须在接口里声明。这样，scan 的概念不是凭空出现，而是由“不能让每个输出元素都抢同一个元数据 line”这个硬件事实推出来的。
+
+\topic{两遍扫描为什么仍可能更快}
+Count + write 会读输入两次，直觉上似乎浪费。硬件账本显示它购买了三件东西。第一，第一次读只做谓词和局部计数，不产生随机共享写。第二，scan 数组很小，可以留在 cache 中。第三，第二次读虽然重复，但写出路径是连续独占区间。相比之下，共享追加的一次扫描每个命中元素都要经历锁、原子、容量检查或分配器元数据，且输出顺序和失败边界不清。
+
+这也是为什么选择率会改变策略。选择率极低时，selection vector 或原子按块抢区间可能可接受；选择率很高时，直接 copy 或保留原 batch 可能更好；选择率中等且需要稳定输出时，count/scan/write 往往最稳。第 5 章的输入矩阵应覆盖 0\%、1\%、10\%、50\%、90\%、100\% 选择率，因为 scan 的固定成本和共享追加的争用成本会随选择率呈现完全不同的曲线。
+
 \topic{错误边界}
 Count 阶段和 write 阶段必须使用同一谓词版本。如果谓词依赖外部状态，count 得到的数量和 write 实际写出的数量可能不一致。工程实现应在 plan 或 manifest 中记录 predicate 版本、输入范围、expected count 和 checksum。数学上的 scan 正确，不代表系统里的 scan 一定正确。
 

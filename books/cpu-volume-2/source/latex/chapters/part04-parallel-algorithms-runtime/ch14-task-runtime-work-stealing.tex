@@ -520,6 +520,61 @@ Chase-Lev deque 是经典工作窃取队列。它利用单 owner 的事实简化
 
 Compute Systems Engine 不应一开始就实现无锁 Chase-Lev。更稳的路线是先实现全局队列 reference，再用 mutex 保护每个 worker deque 验证调度策略，最后在 trace 能证明 deque 同步成为瓶颈时再研究无锁队列。这样能把“调度策略是否有效”和“无锁协议是否正确”分开。
 
+\topic{deque 竞争点从 head 和 tail 推出来}
+工作窃取 deque 的本地路径之所以能快，是因为 owner 是唯一频繁修改 tail 的线程。owner push 把任务写入数组槽位，再发布新的 tail；owner pop 从 tail 端取最近任务。Thief 只从另一端偷，竞争 head。简化状态可以写成：
+
+\begin{lstlisting}[numbers=none,caption={工作窃取 deque 的关键状态}]
+array slots:
+  task storage, usually a power-of-two circular buffer
+
+head:
+  old end, thieves compete here
+
+tail:
+  new end, owner mostly owns this cursor
+\end{lstlisting}
+
+当 deque 中有多个任务时，owner pop 和 thief steal 操作不同端点，冲突概率低。真正危险的是只剩一个任务时：owner 从 tail 端 pop，thief 从 head 端 steal，二者可能指向同一个槽位。此时必须用一个线性化点决定任务归谁。常见做法是在最后一个元素竞争时对 head 做 CAS：谁成功推进 head，谁获得任务；失败者必须把状态修正并返回空。
+
+\begin{lstlisting}[numbers=none,caption={最后一个任务竞争的语义伪代码}]
+owner pop:
+  tail = tail - 1
+  if head < tail:
+      return slot[tail]
+  if head == tail:
+      if compare_exchange(head, head, head + 1):
+          return slot[tail]
+      else:
+          restore empty state and return empty
+
+thief steal:
+  read head and tail
+  if head >= tail:
+      return empty
+  task = slot[head]
+  if compare_exchange(head, head, head + 1):
+      return task
+  return retry or empty
+\end{lstlisting}
+
+这段伪代码省略了很多细节，却保留了关键事实：无锁 deque 的正确性不是来自“数组加两个下标”，而是来自最后一个任务的 CAS 竞争、发布顺序、槽位生命周期和扩容回收协议。C++ 层面的 \code{compare_exchange} 在 x86-64 上常落成 \code{lock cmpxchg} 形态；它会让保存 head 的 cache line 成为 thief 竞争点。正常情况下 steal 频率远低于 owner 本地 pop，所以这条共享线还能接受；若任务太小导致大量偷取，head 的 CAS 争用会迅速暴露。
+
+\topic{发布顺序决定 thief 能否看见任务内容}
+owner push 不能先发布 tail，再写 slot。否则 thief 可能看到 tail 已经前进，偷到尚未构造完成的任务。正确顺序是先写任务内容，再用 release 语义发布 tail；thief 看到可偷区间后，用 acquire 语义读取并确认任务内容。使用 mutex 的第一版由锁隐含建立 happens-before；无锁版本必须把这条关系写出来。
+
+\begin{lstlisting}[numbers=none,caption={push 发布顺序的抽象}]
+slot[index] = fully constructed task descriptor
+publish tail with release ordering
+
+thief observes tail/head with acquire ordering
+read slot[index] after successful claim
+\end{lstlisting}
+
+任务描述符本身也要有生命周期。若 owner 扩容或回收旧数组，而 thief 正在读取旧 slot，就会出现悬空访问。成熟实现会用受控的数组替换、epoch/hazard 机制、延迟释放或运行时全局 quiescent point。项目第一版使用 mutex deque，并不是逃避底层，而是先避免把调度语义、内存回收和原子协议混在一起。
+
+\topic{无锁 deque 的性能报告要看偷取率}
+如果本地 pop 占绝大多数，deque 的热路径主要是 owner 私有 tail 和本地数组，性能很好；如果任务粒度太小、负载分布很不均或 worker 频繁空转，steal 尝试会增加，head CAS、随机远端访问和失败重试会进入成本。报告不能只写吞吐，还要写 local pops、steal attempts、steal successes、failed CAS、empty steals、平均任务耗时和 worker idle 时间。没有这些字段，就无法判断瓶颈是任务太小、负载不均、deque 协议争用，还是任务本身慢。
+
 \topic{任务粒度决定调度是否值得}
 任务太小，提交、入队、出队、唤醒、trace 和 ready count 成本会吃掉计算；任务太大，最后少数长任务拖住整个 stage，work stealing 也救不了已经不可拆的长尾。一个实用经验是：任务数量要明显多于 worker 数，每个任务又要有足够计算量，使调度固定成本只占小比例。
 

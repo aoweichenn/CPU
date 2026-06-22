@@ -303,6 +303,87 @@ Compute Systems Engine 的日志统计会同时遇到这三类形状。解析后
 
 报告必须保存命令、事件列表、运行时间、权限限制和是否出现 multiplex。不同 CPU 上事件名和含义可能不同，云环境和容器可能限制 PMU，手机或 Termux 环境经常不可用。不可用时，不要把缺失事件填成 0；应写 \code{Unavailable}，并使用输入规模阶梯、反汇编、阶段时间和应用指标作为降级证据。
 
+\topic{从退休指令到 IPC}
+性能计数器首先要回到一条具体循环。考虑最小整数求和：
+
+\begin{lstlisting}[language=C++,caption={整数求和的 C++ 形态}]
+std::int64_t sum_values(std::span<const std::int32_t> values) {
+  std::int64_t sum = 0;
+  for (const std::int32_t value : values) {
+    sum += value;
+  }
+  return sum;
+}
+\end{lstlisting}
+
+在未向量化、未展开的简化路径里，热循环可能接近下面的形状：
+
+\begin{lstlisting}[numbers=none,caption={求和循环的一种典型汇编形态}]
+xor     eax, eax                  ; sum = 0
+xor     ecx, ecx                  ; i = 0
+.Lloop:
+movsxd  rdx, DWORD PTR [rdi+rcx*4] ; load values[i]
+add     rax, rdx                  ; sum += value
+inc     rcx                       ; ++i
+cmp     rcx, rsi                  ; i != size
+jne     .Lloop
+\end{lstlisting}
+
+\term{退休指令}{retired instruction} 是已经走到提交点、改变了架构可见状态的指令。乱序核心内部可能执行了更多微操作，也可能沿错误分支执行了一段后来被丢弃的路径；这些工作消耗周期和能量，却不一定退休。于是 \code{instructions} 不是“硬件实际忙了多少”的完整描述，\code{cycles} 也不是“做了多少有效工作”的完整描述。二者相除得到的 IPC 只是一个入口：IPC 低可能是内存等待、分支失败、前端断供、锁等待、系统调用睡眠或频率变化；IPC 高也不保证程序好，因为它可能高效地执行了大量无用拷贝。
+
+这条循环还说明，计数器不能脱离反汇编解释。若编译器把循环向量化，单个向量 load 会覆盖多个元素，退休指令数下降；若编译器展开四路累加，分支指令变少，寄存器压力上升；若输入大小很小，函数入口、边界检查和调用开销占比上升。报告写 \code{instructions} 之前，必须知道被计数的到底是哪条机器路径。
+
+\topic{load 指令背后的事件链}
+\code{movsxd rdx, DWORD PTR [rdi+rcx*4]} 看起来是一条指令，硬件内部至少拆出几件事：用 \register{rdi}、\register{rcx} 和 scale 计算有效地址；用虚拟页号查 DTLB；命中后得到物理地址；用物理地址的 index 查 L1D set；比较 tag；命中则取出对应 4 字节并符号扩展；未命中则继续去 L2、LLC 或内存。若地址跨页或 TLB 未命中，还会走页表遍历；若页不在内存，还会进入 page fault 和调度等待。
+
+因此 \code{cache-misses}、\code{LLC-load-misses}、\code{dTLB-load-misses} 这些事件并不是源码语句级的事实，而是某个采样窗口里硬件路径的侧影。连续数组求和的 LLC miss 可能很高，却是流式扫描的正常代价；随机指针追踪的 miss 也可能很高，但它表示每一步都在等待下一地址。两者数字接近，优化方向完全不同。必须把事件和地址形状绑定：连续、固定步长、随机索引、链式依赖、共享写、系统调用，分别对应不同解释。
+
+\topic{分支计数器要结合控制流}
+循环尾部的 \code{cmp/jne} 通常非常可预测：大部分迭代跳回，最后一次不跳。条件过滤则不同：
+
+\begin{lstlisting}[language=C++,caption={可预测性取决于输入分布的分支}]
+if (event_type == target) {
+  ++count;
+}
+\end{lstlisting}
+
+如果输入先按 \code{event_type} 排序，分支结果会成段出现；如果输入完全随机，结果可能接近抛硬币。CPU 的分支预测器只能利用历史模式，不能提前知道随机数据。一次 branch miss 会让前端和乱序窗口丢弃错误路径上的工作，重新从正确目标取指。报告中看到 \code{branch-misses} 升高时，不能立刻写“分支是瓶颈”；还要看这个分支是否在热循环、miss 数量相对元素数是否大、改成 mask 或分桶后时间是否下降，以及新路径是否增加了额外 load/store。
+
+\topic{反汇编是计数器的坐标系}
+同一段 C++ 可以生成完全不同的机器路径。打开优化后，\code{std::accumulate} 可能内联成普通循环，也可能因为迭代器、别名或异常边界留下额外调用；简单 map 可能自动向量化，也可能因为指针重叠假设生成运行时检查；一次 \code{push_back} 可能在热路径里只写数组，也可能触发容量检查、分配和搬迁。计数器只能说明“这次机器路径发生了什么”，不能说明“源码理论上应该怎样”。
+
+因此性能报告应保存关键反汇编摘要，而不是只保存源码片段。摘要不必贴完整二进制，但要说明：主循环是否存在；是否向量化；是否展开；是否有函数调用；load/store 地址形态是什么；是否有 \code{lock} 前缀、系统调用、异常慢路径或运行时别名检查。没有这个坐标系，\code{cycles}、\code{instructions} 和 \code{cache-misses} 很容易被解释到错误源码位置上。
+
+\begin{lstlisting}[numbers=none,caption={计数器报告的反汇编摘要字段}]
+hot_loop:
+  vectorized: yes/no
+  unroll_factor: known/unknown
+  main_load_shape: [base + index * scale + displacement]
+  main_store_shape: contiguous/random/shared
+  calls_in_loop: none/list
+  atomic_or_lock_prefix: yes/no
+  syscall_in_timed_region: yes/no
+  tail_strategy: scalar/masked/unknown
+\end{lstlisting}
+
+\topic{事件解释的最小对照}
+单个计数器很少能单独证明原因。更稳的做法是为每个假设准备一个对照。如果怀疑内存带宽，用 stream copy、数组求和、不同输入规模和线程数扫描建立带宽边界；如果怀疑分支，用全真、全假、排序和随机输入比较；如果怀疑 TLB，用连续、固定大步长和随机页访问比较；如果怀疑同步，用全局原子、thread-local partial、padding partial 对照。计数器负责给线索，对照实验负责排除错误解释。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.35\linewidth}p{0.31\linewidth}@{}}
+\toprule
+观察 & 不能直接得出的结论 & 需要的对照 \\
+\midrule
+IPC 低 & 一定是内存慢 & 分支、前端、锁、I/O、off-CPU 时间 \\
+cache miss 高 & cache 优化一定有效 & 流式带宽基准、随机访问对照、字节账本 \\
+branch miss 高 & 应改成无分支 & 输入分布矩阵、mask 版本、额外字节成本 \\
+instructions 少 & 程序一定快 & 周期、带宽、尾部、系统调用和语义校验 \\
+context switch 多 & 调度器一定是主因 & 队列等待、I/O 等待、锁等待和线程过量对照 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
 \topic{计数器是采样窗口里的硬件事件}
 性能计数器通常统计某类硬件事件在一段时间窗口内发生了多少次，或者按采样频率记录部分事件的位置。它们不是语义级事实。一次 cache miss 可能是流式扫描的正常成本，也可能是随机指针追踪的问题；一次 branch miss 可能发生在冷错误路径，也可能发生在热循环；context switch 可能来自程序阻塞，也可能来自系统干扰。计数器必须和计时边界、输入、阶段和源码位置绑定，才有解释力。
 

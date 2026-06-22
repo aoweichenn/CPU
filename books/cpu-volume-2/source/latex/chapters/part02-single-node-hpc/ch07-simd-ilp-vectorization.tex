@@ -99,6 +99,45 @@ if value >= threshold:
 
 mask 的语义必须精确。一个 bit 到底对应输入中的哪个字节，bit 为 1 表示“分隔符”“非法字符”还是“保留记录”，后续如何从块内偏移恢复全局偏移，这些都不是实现细节。错误报告、selection vector、stable filter 和解析状态机都依赖同一份 mask 合同。
 
+\topic{从标量比较到 movemask}
+用 ASCII 数字分类可以看到 mask 从哪里来。标量循环每次读取一个字节，做两次比较：
+
+\begin{lstlisting}[language=C++,caption={标量数字分类}]
+bool is_digit(unsigned char b) {
+  return b >= '0' && b <= '9';
+}
+\end{lstlisting}
+
+典型标量机器路径是：load 一个字节，和常量 \code{'0'}、\code{'9'} 比较，生成条件码，再用条件跳转或条件设置得到布尔结果。若每个字节都要分支，随机输入会给分支预测制造压力；若改成条件设置，分支少了，但仍然是一字节一字节推进。SIMD 版本把 16、32 或更多字节放进一个向量寄存器，使用同一条比较语义同时作用在多个 lane 上。抽象形态如下：
+
+\begin{lstlisting}[numbers=none,caption={向量数字分类的机器动作抽象}]
+v = vector_load(bytes + block_begin)
+ge_zero = compare_each_lane(v, '0', >=)
+le_nine = compare_each_lane(v, '9', <=)
+digit_lanes = bitwise_and(ge_zero, le_nine)
+digit_mask = extract_lane_sign_bits(digit_lanes)
+\end{lstlisting}
+
+在 x86 SSE/AVX 路径里，字节比较常产生每个 lane 全 0 或全 1 的字节；随后类似 \code{pmovmskb/vpmovmskb} 的动作把每个 lane 的最高位提取成整数 mask。这样一个整数的第 \code{k} 位就对应块内第 \code{k} 个字节。不同 ISA 的指令名不同，但核心形状稳定：向量比较产生 lane 结果，mask 提取把 lane 结果变成可用于分支、计数和位置恢复的标量控制字。
+
+\begin{lstlisting}[numbers=none,caption={mask 到位置的映射合同}]
+block_begin = 128
+digit_mask bit 0  -> input byte 128
+digit_mask bit 7  -> input byte 135
+digit_mask bit 31 -> input byte 159
+
+first matching byte:
+  lane = index_of_lowest_set_bit(digit_mask)
+  absolute_offset = block_begin + lane
+\end{lstlisting}
+
+这一步解释了为什么 SIMD parser 常常先做“结构字符扫描”。它不是直接完成全部解析，而是用宽比较快速生成候选位置：逗号、换行、引号、非法字节、数字范围。后续语义状态机再按 mask 中的位置推进。SIMD 负责把大量独立字节分类成 mask，状态机负责解释这些位置在记录、字段和错误合同中的含义。
+
+\topic{mask 消除了短分支，不消除输出位置问题}
+向量比较可以把一组 \code{value >= threshold} 变成一个 mask，但 mask 只回答“哪些 lane 通过”。Stable filter 还必须回答“通过的元素写到 output 的哪一个位置”。这需要 popcount、块内 rank 和块间 scan。若只用一个全局 \code{fetch_add(popcount(mask))} 给每个向量块抢输出区间，块的顺序可能变成调度顺序；若每个 lane 再单独 \code{fetch_add}，又回到共享计数器热点。正确结构仍然是第 13 章的 count/scan/write：SIMD 加速 count 和块内压缩，scan 保证全局稳定位置。
+
+因此 mask 不是并行输出的完整答案，而是把控制流数据化之后交给后续位置分配。这个边界讲清楚，才能避免把“SIMD 比较很快”误写成“SIMD filter 已经完成”。宽比较降低了分支和比较指令成本，scan 和写出合同解决输出顺序、独占区间和恢复。
+
 \topic{尾部不是小角落}
 输入长度很少刚好是向量宽度的倍数。尾部策略通常有三种。第一，主体向量循环处理完整块，剩余元素用标量循环处理；它最清楚，适合公开 API 和不可信输入。第二，使用 mask load/store 处理尾部；它可以减少分支，但依赖 ISA，且必须确认被 mask 掉的 lane 不会触发非法访问。第三，在容器末尾保留 padding，让主体循环可以安全读到逻辑末尾之后；它适合内部 batch 或张量缓冲，不适合任意外部 span。
 

@@ -246,6 +246,58 @@ waiter: consumer
     not_empty.notify_all after close
 \end{lstlisting}
 
+\topic{丢失唤醒的真实时间线}
+丢失唤醒常被误解成“少调用了一次 \code{notify}”。更准确地说，它发生在等待者检查谓词和进入睡眠之间存在未受保护窗口，而通知者在这个窗口里改变状态并发出通知。通知本身不保存业务事实；若等待者睡下时没有重新检查状态，也没有被登记到等待集合，就可能永远睡眠。
+
+\begin{lstlisting}[numbers=none,caption={错误等待：检查和睡眠之间有窗口}]
+consumer locks mutex
+consumer sees size == 0
+consumer unlocks mutex
+
+producer locks mutex
+producer pushes one element
+producer unlocks mutex
+producer notifies not_empty
+
+consumer parks after notify has already happened
+consumer sleeps even though size == 1
+\end{lstlisting}
+
+条件变量的 \code{wait(lock, predicate)} 之所以重要，是因为它把三件事组合成一个库协议：持锁检查谓词；谓词不满足时，把线程加入等待路径并释放 mutex；被唤醒后重新获得 mutex，再次检查谓词。用户代码不能把这三件事拆开。若拆开，通知和睡眠之间就会出现无主窗口。
+
+\begin{lstlisting}[numbers=none,caption={正确等待：谓词和 wait 绑定}]
+consumer locks mutex
+while size == 0 and not closed:
+    condition_variable_wait(mutex)
+    ; wait returns only after re-locking mutex
+consumer rechecks predicate under the same mutex
+\end{lstlisting}
+
+这条时间线也解释了虚假唤醒。线程醒来不一定表示资源已经可用，可能因为实现、信号、广播、竞争者先拿走资源或关闭路径触发。正确代码不依赖“为什么醒”，只依赖“醒来后在锁内重新检查谓词”。因此 \code{if} 等待是错误形状，\code{while} 或带谓词重载才是正确形状。
+
+\topic{capacity-one 队列能放大所有错误}
+容量为一的队列是同步协议的放大镜。只有一个槽位，任何遗漏都会迅速变成可复现事故：生产者和消费者交替时能暴露丢失唤醒；两个生产者同时 push 时能暴露谓词错误；close 与 push 竞争时能暴露提交点不清；消费者被唤醒后另一个消费者先拿走元素时能暴露 \code{if} 等待；异常发生在写槽位之后、递增 size 之前时能暴露状态不一致。
+
+\begin{lstlisting}[numbers=none,caption={容量一队列的故障注入序列}]
+case lost_wakeup:
+  consumer reaches wait boundary
+  producer pushes element and notifies
+  scheduler parks consumer at the wrong time
+  expected: consumer must not sleep forever
+
+case close_full_queue:
+  producer fills the only slot
+  another producer waits on not_full
+  close is called
+  expected: waiting producer returns Closed, consumer may drain one element
+
+case spurious_wakeup:
+  consumer wakes while size == 0 and closed == false
+  expected: consumer waits again without changing state
+\end{lstlisting}
+
+容量小不是为了模拟真实吞吐，而是为了把状态边界压缩到最少变量。若容量一队列都不能解释每个等待者为什么醒、为什么继续睡、为什么退出，容量变大只会把错误藏进概率。
+
 \topic{超时等待不是简单返回 false}
 超时会改变协议。生产者等待空间超时后，是返回失败、重试、丢弃、记录背压，还是关闭上游？消费者等待数据超时后，是继续轮询、上报 idle、检查取消，还是触发心跳？超时不是条件变量的附加参数，而是状态机的一条边。尤其不能把超时当作“队列永久空”或“下游永久满”的证明，它只说明在这段时间内谓词没有满足。
 
