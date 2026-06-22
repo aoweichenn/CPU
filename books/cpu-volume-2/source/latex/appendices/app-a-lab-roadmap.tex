@@ -96,6 +96,175 @@ Can a crash/retry case replay the same attempt sequence?
 
 这张表说明“先做简单版本”和“偷掉边界”不是一回事。简单版本可以慢，可以少功能，但不能让后续恢复、测量和并发语义无处接入。
 
+\section{统一实验协议}
+
+实验路线如果只写“做哪些实验”，仍然不够。真正能支撑系统判断的是协议：输入怎样生成，reference 怎样产生，计时边界在哪里，反汇编怎样保存，trace 怎样对齐，故障怎样重放，回归怎样比较。每次实验都应能被另一个时间、另一台机器、另一个提交重新打开，并判断结论是否仍成立。这里给出统一协议，后续阶段只是在它上面增加字段。
+
+\topic{一、输入协议}
+输入不是一个文件名，而是一组可复现事实。每份输入至少要写入 \code{input.json}：生成器版本、随机种子、记录数、原始字节数、key 分布、坏行分布、行长分布、热点 key 比例、checksum 和 schema version。若输入来自真实文件，也要保存采样摘要和文件 checksum；不能只写“使用线上日志”。真实输入无法公开时，仍要用生成器构造同分布的可公开样本。
+
+\begin{lstlisting}[numbers=none,caption={input.json 的最小字段}]
+generator_version
+schema_version
+seed
+record_count
+raw_bytes
+key_distribution
+line_length_distribution
+malformed_record_policy
+malformed_record_count
+hot_key_ratio
+input_checksum
+expected_reference_checksum
+\end{lstlisting}
+
+输入族要覆盖三个层次。第一是语义边界：空输入、一条记录、缺字段、字段过多、整数溢出、超长行、最后一行无换行。第二是硬件边界：小工作集、跨 L1/L2/LLC、跨大量页、随机 key、长字符串、分支不稳定。第三是系统边界：热点 key、下游变慢、短写、响应丢失、旧 epoch、driver 崩溃。一个实验只需要选择相关输入族，但报告必须说明为什么这些输入能攻击本章假设。
+
+\topic{二、oracle 协议}
+Reference 生成期望结果，oracle 负责比较。不同实验的 oracle 不一定都是字节完全相等。整数计数要求完全一致；浮点 reduce 要求误差合同；稳定 filter 要求顺序一致；partition 可以要求每个 bucket 内容和 manifest 一致；运行时实验可能要求所有 accepted task 进入终态；I/O 实验要求未提交 block 不被读取。Oracle 必须写在代码和报告里，不能只靠人工肉眼看输出。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.37\linewidth}p{0.31\linewidth}@{}}
+\toprule
+实验类型 & oracle 比较对象 & 不能只比较什么 \\
+\midrule
+整数聚合 & counts、diagnostics、输出顺序或 checksum & 不能只比较总记录数 \\
+浮点归约 & 误差界、NaN/Inf 策略、固定树形可重复性 & 不能只比较一次近似值 \\
+stable filter & 输出记录 id 序列、records written、range checksum & 不能只比较输出数量 \\
+任务运行时 & task 终态、ready/run/block trace、unfinished 归零 & 不能只比较最终耗时 \\
+可靠写 & manifest、block checksum、orphan 分类、恢复动作 & 不能只看文件存在 \\
+分布式模拟 & accepted attempt、late/duplicate/stale 分类、final checksum & 不能只看 worker 返回 Ok \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Oracle 的作用是把错误缩小到某个边界。若优化版和 reference 的 counts 不同，先比较 parser 输出；parser 一致再比较 batch；batch 一致再比较 partial；partial 一致再查 manifest。每个阶段都要有 checksum 或可抽样比较字段，避免最终错误只能靠调试器从头跟。
+
+\topic{三、测量协议}
+计时必须说明边界。冷启动计时包含 page fault、文件读取、缓存预热和可能的 I/O；热循环计时只测已经准备好的内存数据；端到端计时包含 parse、aggregate、write、commit 和 report。三者都可以有价值，但不能混用。每个 \code{samples.csv} 至少保存样本编号、模式、输入 checksum、开始时间、结束时间、状态、结果 checksum 和失败原因。异常样本不能随意删除，必须用状态字段标记。
+
+\begin{lstlisting}[numbers=none,caption={samples.csv 字段}]
+sample_id,mode,input_checksum,threads,batch_size,queue_capacity,
+start_ns,end_ns,status,result_checksum,error_kind,notes
+\end{lstlisting}
+
+统计摘要要写重复次数、预热策略、是否固定 CPU、是否关闭动态频率不可控因素、是否受容器或权限限制。若平台无法使用 PMU 计数器，报告不能把 cache miss 写成已测事实，只能写“由输入对照和阶段时间推断，仍需计数器验证”。严谨的弱结论比漂亮的假结论更有价值。
+
+\topic{四、反汇编和源码证据协议}
+热循环优化必须保留机器证据。最小材料包括编译器、版本、优化选项、目标架构、符号名、关键循环反汇编摘要和源码提交号。报告不必贴满长反汇编，但要说明是否存在函数调用、边界检查、向量指令、\instruction{lock} 前缀、分支密度、load/store 形状。若编译器没有生成预期形态，性能解释要先回到编译结果。
+
+\begin{lstlisting}[numbers=none,caption={disasm.txt 摘要字段}]
+compiler
+compiler_flags
+target_arch
+source_commit
+kernel_symbol
+loop_instruction_summary
+calls_in_hot_loop
+branches_in_hot_loop
+vector_width_if_any
+locked_operations_if_any
+\end{lstlisting}
+
+这份证据把“我以为代码会这样执行”变成“机器确实大致这样执行”。例如一个数组归约如果热循环里仍有虚函数调用，不能直接讨论 SIMD；一个原子计数实验如果没有看到锁定读改写或等价同步形态，要先确认编译目标和代码路径；一个 parser 如果错误路径被内联进热循环，要先修取指形态再讨论分支预测。
+
+\topic{五、trace 协议}
+并发、运行时、I/O 和分布式实验必须输出 trace。Trace 不是普通日志，它是可排序、可聚合的事件流。每条事件至少包含 \code{time_ns}、\code{thread_id}、\code{worker_id}、\code{task_id}、\code{attempt_id}、\code{event_kind}、\code{state_before}、\code{state_after} 和可选 \code{correlation_id}。事件名要稳定，不能把人类句子当作唯一结构。
+
+\begin{lstlisting}[numbers=none,caption={trace.jsonl 事件字段}]
+time_ns
+thread_id
+worker_id
+task_id
+attempt_id
+event_kind
+state_before
+state_after
+queue_depth
+correlation_id
+payload_checksum
+\end{lstlisting}
+
+Trace 至少要能回答：任务何时 ready，何时开始执行，执行多久，是否阻塞，阻塞原因是什么，完成时发布了哪些后继，是否有 late reply，是否有 duplicate 被拒绝。若 trace 无法回答这些问题，就不能支撑“运行时调度合理”或“故障恢复正确”的结论。
+
+\topic{六、故障注入协议}
+故障实验必须可重复。每个故障用规则描述，而不是靠随机崩溃。规则应包含触发点、目标对象、触发次数、动作和期望外部事实。例如：\code{write_once_short(block=S1,A0,bytes=128)}；\code{drop_reply(task=S2,attempt=0,count=1)}；\code{crash_driver(after=manifest_append,entry=S0)}。故障脚本保存到 \code{faults.json}，RunReport 记录实际触发次数。
+
+\begin{lstlisting}[numbers=none,caption={faults.json 的示例}]
+[
+  {
+    "kind": "write_once_short",
+    "target": "split:1 attempt:0",
+    "bytes": 128,
+    "expected": "block not committed before checksum"
+  },
+  {
+    "kind": "drop_reply",
+    "target": "split:2 attempt:0",
+    "count": 1,
+    "expected": "retry and accept exactly one attempt"
+  }
+]
+\end{lstlisting}
+
+随机压力测试可以补充，但不能替代确定性故障。确定性故障证明某条状态机边界正确，随机压力只帮助发现尚未想到的组合。发现随机失败后，应把它缩成新的确定性故障脚本，再进入回归集。
+
+\topic{七、回归比较协议}
+每次优化都要和上一个稳定版本比较，不只比较耗时，还比较语义、资源和报告字段。回归比较至少包括：reference checksum 是否不变；diagnostics 是否不变；manifest 是否一致；阶段时间变化；峰值内存变化；队列高水位变化；新增或消失的 trace 事件；不可用指标是否仍被正确标记。性能变快但 diagnostics 变了，是错误；性能变慢但修复了重复提交，可能是正确交换。
+
+\begin{lstlisting}[numbers=none,caption={regression summary 字段}]
+base_commit
+candidate_commit
+input_checksum
+reference_checksum_equal
+diagnostics_checksum_equal
+manifest_equal
+stage_time_delta
+peak_memory_delta
+queue_high_watermark_delta
+new_faults_passed
+known_unverified_boundaries
+\end{lstlisting}
+
+这份协议让实验结论能跨提交生存。没有回归比较，项目很容易在某次重构中悄悄丢掉错误摘要、提交去重或关闭语义，直到后面的大实验才发现。
+
+\section{章节到实验的证据矩阵}
+
+每章都要交出可复查证据。证据可以是手工账本、伪代码状态机、反汇编摘要、用户态 trace、阶段报告、故障脚本或运行目录，但不能只停留在概念解释。下面的矩阵把正文主题和工程实验连起来。它的目的不是增加形式负担，而是保证每个机制都有输入、oracle、测量和失败样例。
+
+\begin{longtable}{@{}p{0.11\linewidth}p{0.25\linewidth}p{0.27\linewidth}p{0.27\linewidth}@{}}
+\toprule
+章节 & 实验切片 & 必留证据 & 攻击的失败 \\
+\midrule
+\endfirsthead
+\toprule
+章节 & 实验切片 & 必留证据 & 攻击的失败 \\
+\midrule
+\endhead
+1 & 五行日志到 split/partial/manifest & 输入合同、reference、RecordId、manifest 样例 & 结果定义含糊，重复 attempt 被合并 \\
+2 & parser 热循环和分支输入族 & 反汇编摘要、短行/长行/坏行对照、stage time & 把控制流波动误判成算法问题 \\
+3 & AoS/SoA、stride、TLB 覆盖 & MemoryShape、页覆盖估算、规模阶梯 & 胖对象搬运冷字段，随机页访问失控 \\
+4 & 线程放置、NUMA 首次触页、共享 line & affinity 记录、跨节点对照、coherence 现象 & 把放置问题误判成线程池问题 \\
+5 & benchmark harness 和反例复盘 & commands、samples、counter 可用性、bad benchmark & 被优化掉或测错边界 \\
+6 & HotBatch 和冷热回查 & hot/cold bytes、BatchView checksum、错误回查 & 优化后 diagnostics 断链 \\
+7 & scalar、auto-vectorized、mask 版本对照 & 编译报告、尾部输入、checksum、指令摘要 & 只测整向量长度，漏掉边界输入 \\
+8 & histogram/top-k/join/stencil/graph 内核 & reference、输入族、阶段报告、资源峰值 & 只在均匀输入上成立 \\
+9 & 线程创建、affinity、blocking 污染 & WorkerSnapshot、ThreadTimeline、上下文切换或替代指标 & ready work 有而 worker 不可用 \\
+10 & 有界队列和关闭协议 & QueueContract、wait trace、drain/cancel 测试 & 等待谓词漏关闭，析构卡死 \\
+11 & 发布标志、CAS 状态、atomic wait & AtomicProtocolNote、成功/失败路径、发布字段 & relaxed 计数被当作结果许可 \\
+12 & SPSC/MPMC 和回收策略 & 线性化点、ABA 反例、lifecycle report & 节点复用后读取旧对象 \\
+13 & stable filter 和 multiway partition & count/scan/write 账本、range checksum、故障重试 & 输出位置靠抢，部分写被当有效 \\
+14 & 任务图和 work stealing & ready/run/block/help trace、关键路径估算 & worker 阻塞等待后继，线程池耗尽 \\
+15 & 可靠写、watermark、背压 & short write 脚本、manifest、queue 水位、completion & 文件存在被误当提交，队列无界增长 \\
+16 & MessageBus、deadline、retry & request id、attempt、late reply、timeout 分类 & 超时后重复执行污染结果 \\
+17 & partition、replication、epoch & OwnershipRecord、旧 owner 测试、manifest generation & route 变化后旧响应仍提交 \\
+18 & 端到端三 split 故障演练 & RunReport、faults.json、recovery audit、最终 checksum & 模块都能单独跑，组合后不可恢复 \\
+\bottomrule
+\end{longtable}
+
+这张矩阵还提供排查顺序。若最终 checksum 错，先回到第 1 章的 reference 和 RecordId；若输入一致但 stage 慢，回到第 2 到第 8 章的机器证据；若并行后变慢或卡住，回到第 9 到第 14 章的等待和状态；若崩溃恢复错误，回到第 15 到第 18 章的 manifest、attempt、epoch 和 checkpoint。章节之间不是并列清单，而是同一条证据链的不同位置。
+
 \section{统一对象账本}
 
 从第一阶段开始，实验就使用同一套对象语言。这样第 18 章最终项目不是突然出现的新框架，而是前面实验逐步长出来的系统。

@@ -518,6 +518,167 @@ Manifest & 什么结果已经生效 & 重复 attempt 只接受一次 \\
 
 这张账本不是为了装饰，而是后续机制的索引。遇到硬件机制，回到数据路径；遇到同步机制，回到等待点；遇到运行时机制，回到 split、partial 和任务状态；遇到 I/O 或分布式机制，回到 manifest 和 attempt。这样内容不会散成并列概念。
 
+\section{版本阶梯：同一个系统怎样被迫长大}
+
+只把机制按章节排列，容易产生一种错觉：先学 cache，再学锁，再学 I/O，好像每个主题都是独立知识块。真正的系统不是这样长出来的。它通常先有一个最小正确程序，随后在规模、输入分布、线程数、故障和恢复要求下反复暴露新问题。每次升级都应由一个失败推动，并留下新的接口、报告字段和回归样例。Compute Systems Engine 的贯穿路线可以写成一条版本阶梯。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.10\linewidth}p{0.23\linewidth}p{0.31\linewidth}p{0.26\linewidth}@{}}
+\toprule
+版本 & 新能力 & 暴露的失败或成本 & 新增证据 \\
+\midrule
+V0 & 顺序 reference & 结果定义不清，坏行策略含糊 & 输入合同、oracle、diagnostics \\
+V1 & RecordId 和 split & 切分后错误无法定位，partial 来源不明 & input generation、offset、split checksum \\
+V2 & 热字段 batch & 胖对象搬运冷字段，TLB 覆盖差 & MemoryShape、hot/cold bytes \\
+V3 & 热循环审查 & parser 被分支、取指和随机 key 拖住 & 反汇编摘要、输入族、stage time \\
+V4 & 线程本地 partial & 全局锁或原子让热门 key 争一条 line & partial 来源、合并 checksum \\
+V5 & 同步合同 & 队列关闭、等待谓词和背压不明确 & QueueContract、wait trace \\
+V6 & 原子和任务状态 & 完成计数不能发布结果，CAS 失败路径不清 & AtomicProtocolNote、TaskState \\
+V7 & scan/partition & 输出位置靠抢，失败后不知道哪些字节有效 & stage ledger、attempt、range checksum \\
+V8 & 任务运行时 & worker 阻塞等待后继，ready 任务无人执行 & WorkerSnapshot、ready wait、helping trace \\
+V9 & 可靠 I/O 和 manifest & 文件存在不等于结果生效，重试会重复提交 & ManifestEntry、recovery audit \\
+V10 & 本机分布式模拟 & 超时、迟到响应和旧 epoch 让控制面分叉 & MessageEnvelope、epoch、checkpoint \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表有两个用处。第一，它阻止概念空降。比如 \code{AtomicProtocolNote} 不是因为原子章节需要一个名词，而是因为 V6 中“完成计数不能发布结果”的反例要求把原子变量的角色写清；\code{ManifestEntry} 不是 I/O 章节的格式偏好，而是 V9 中“文件存在却不能说明结果生效”的恢复边界。第二，它让每次升级都有可验收的出口：不是“代码更复杂了”，而是某个旧失败被新证据封住。
+
+\topic{V0：顺序 reference 必须先完整}
+V0 的目标不是快，而是把语义固定。它读取输入，按合同解析，统计 key，稳定排序输出，记录坏行。若这里没有定义 value 溢出、空 key、字段过多、最后一行无换行、输出排序和错误摘要，后面任何优化都会把未定义行为放大。V0 的报告必须包含 \code{accepted_records}、\code{rejected_records}、\code{counts_checksum} 和 \code{diagnostics_checksum}。这些字段以后不消失，只是被并行、I/O 和分布式路径继续携带。
+
+\begin{lstlisting}[numbers=none,caption={V0 需要先钉住的语义}]
+input contract:
+  exact fields, bad-line policy, integer range, final newline rule
+
+reference output:
+  stable key order
+  counts checksum
+  diagnostics with record identity
+
+oracle:
+  exact match for integer counts
+  exact match for diagnostics checksum
+\end{lstlisting}
+
+如果 V0 只输出一张 counts 表，而不输出 diagnostics，V4 的多线程 parser 就可能吞掉坏行；如果 V0 不规定排序，V7 的 partition 输出就可能每次顺序不同；如果 V0 不规定溢出，V13 的 reduce 合并就无法判断大输入是否仍然正确。Reference 的慢是可以接受的，含糊不可接受。
+
+\topic{V1：记录身份比线程更早出现}
+很多工程会直接从顺序程序跳到多线程。更稳的顺序是先引入 \code{RecordId} 和 \code{InputSplit}，即使仍然单线程执行。原因很简单：切分输入首先是语义问题，其次才是并行问题。Split 边界落在半行中间怎么办，错误行是全局第几行还是 split 内第几行，重试时怎样证明处理的是同一段字节，这些问题在线程出现前就已经存在。
+
+\begin{lstlisting}[numbers=none,caption={V1 的 split 审计字段}]
+InputSplit:
+  input_generation
+  file_id
+  byte_begin
+  byte_end
+  first_record_id
+  record_count_estimate
+  split_checksum
+
+Partial:
+  split_id
+  attempt_id
+  accepted_records
+  rejected_records
+  counts_checksum
+\end{lstlisting}
+
+V1 的回归样例应包括：split 从行边界开始、split 从行中间开始、最后一行没有换行、同一个输入用不同 split 大小切分。所有样例最终 counts 和 diagnostics 必须与 V0 一致。这个阶段通过后，后面再加线程时，线程只是执行 split 的实体，不再决定记录身份。
+
+\topic{V2：热字段 batch 从字节预算中推出}
+V2 把解析结果放入 \code{HotBatch}。热字段是聚合阶段反复访问的事实，例如 \code{record_id}、\code{event_type}、\code{value}；冷字段是错误诊断、原始行、用户字符串和调试上下文。冷热分离不是为了追求某种数据结构风格，而是为了让 CPU 在聚合阶段少搬不参与计算的字节。V2 的报告要写清每条记录的热字节、冷字节、总字节、每页有效记录数和 batch 大小。
+
+\begin{lstlisting}[numbers=none,caption={V2 的 MemoryShape 摘要}]
+MemoryShape:
+  raw_input_bytes
+  hot_column_bytes
+  cold_payload_bytes
+  bytes_per_hot_record
+  estimated_records_per_4k_page
+  batch_record_count
+  batch_hot_bytes
+\end{lstlisting}
+
+若 V2 比 V0 慢，不应立刻否定 batch。要先看它是否保留了太多冷字段，是否引入了额外分配，batch 是否太小，字典编码是否把字符串随机访问提前变成了新的瓶颈。布局实验不能只给耗时，它必须解释地址流怎样变化。
+
+\topic{V3：热循环必须能被机器证据解释}
+V3 开始审查 parser、encoder 和 aggregator 的热循环。这里的目标不是手写复杂汇编，而是避免从 C++ 语句直接跳到硬件结论。一个可信的热循环报告至少包含输入族、编译器选项、反汇编摘要、阶段时间、可用计数器或替代证据、结论边界。
+
+\begin{lstlisting}[numbers=none,caption={V3 HotKernelReport 的最小字段}]
+HotKernelReport:
+  kernel_name
+  input_family
+  compiler_and_flags
+  disassembly_summary
+  bytes_read
+  bytes_written
+  branch_shape
+  counter_evidence_or_reason_unavailable
+  stage_time_ns
+  conclusion_boundary
+\end{lstlisting}
+
+输入族必须攻击不同机器假设：全合法短行、全合法长行、随机坏行、热点 key、均匀 key、超长 key、空输入、小输入和大输入。若只测一份均匀随机输入，热循环报告无法区分分支问题、cache 问题和 key 分布问题。V3 的核心习惯是：任何性能结论都要能被输入变化推翻或支持。
+
+\topic{V4：线程本地 partial 先于无锁结构}
+V4 的朴素并行方案会暴露共享写：多个 worker 更新同一张全局表。全局 mutex 正确但会排队；全局 atomic 正确但热门 key 仍争 cache line；worker 本地 partial 把高频写留在本地，最后再合并。这个改造之所以靠前，是因为它不需要复杂无锁协议，却能解决最常见的共享写成本。
+
+\begin{lstlisting}[numbers=none,caption={V4 partial 的正确性账本}]
+for each split attempt:
+  build local partial
+  keep split_id and attempt_id
+  record accepted/rejected
+  compute partial checksum
+
+merge:
+  sort or order partials deterministically
+  accept each logical split once
+  compare final checksum with reference
+\end{lstlisting}
+
+Partial 不是临时数组那么简单。它必须带来源身份，否则 V9 的重试会把同一个 split 的两个 attempt 都合并进去。性能结构和恢复结构在这里第一次相遇：本地 partial 减少共享写，同时让每份贡献可命名、可去重。
+
+\topic{V5 到 V8：等待从线程栈移到状态表}
+有界队列、条件变量、任务图和 worker trace 的共同目标，是把等待从“某个线程卡住了”变成可观察状态。V5 的队列要写清容量、等待谓词、关闭模式和背压；V6 的原子状态要写清发布关系和生命周期；V7 的 scan/partition 要写清阶段状态和输出范围；V8 的运行时要写清 ready、running、blocked、helping 和 parked。
+
+\begin{lstlisting}[numbers=none,caption={等待状态的统一字段}]
+waiter:
+  worker_id or task_id
+  waiting_for
+  wait_begin_ns
+  wait_reason
+  wake_reason
+  state_rechecked
+
+task:
+  predecessor_count
+  ready_time
+  start_time
+  finish_time
+  terminal_state
+\end{lstlisting}
+
+这组字段让第 10 章的条件变量、第 11 章的原子 wait、第 14 章的 worker park 都共享同一条纪律：状态才是事实，通知只是提示状态可能变化。任何等待如果不能写出谓词或目标状态，都还没有进入可靠系统。
+
+\topic{V9 和 V10：提交事实离开进程内存}
+可靠 I/O 和分布式模拟把事实推出进程内存。V9 中，write 成功不等于 durable，不等于 manifest 接受；V10 中，远端执行成功不等于 Driver 已接受，超时不等于远端没有执行。于是 attempt、manifest、epoch、checkpoint 都从反例中出现。它们不属于“分布式专用名词”，而是同一个提交问题跨过进程、文件系统和网络后的形态。
+
+\begin{lstlisting}[numbers=none,caption={V9/V10 提交链}]
+physical execution:
+  worker runs one attempt
+  data block is written
+  completion may be delayed, duplicated, or lost
+
+control-plane acceptance:
+  driver checks task, attempt, epoch, checksum
+  manifest accepts at most one attempt per logical task
+  checkpoint accelerates recovery but does not override manifest
+\end{lstlisting}
+
+这条链完成后，Compute Systems Engine 才从“一个能跑的并行程序”变成“一个能解释自己结果的计算系统”。它不是靠复杂度取胜，而是靠每一层都有权威事实和可复查证据。
+
 \section{怎样把底层账本用于后续机制}
 
 第一层账本真正的用处，是把后续每个新名词都接回一个已经看见的问题。若后面讨论流水线，问题不是“流水线是什么”，而是 parser 热循环为什么需要连续供应指令和数据；若讨论 cache，问题不是“缓存有几级”，而是 event key 和计数表的地址序列为什么会让核心等待；若讨论锁和原子，问题不是“哪个 API 更快”，而是多个 worker 写同一个计数槽时，哪条 cache line 在核心之间移动；若讨论 manifest，问题不是“清单格式怎样设计”，而是重复 attempt 为什么不能靠扫描目录解决。
