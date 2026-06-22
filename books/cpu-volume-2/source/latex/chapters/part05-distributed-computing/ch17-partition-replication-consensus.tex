@@ -505,6 +505,198 @@ Snapshot:
 \topic{状态机必须确定}
 共识只决定日志顺序，状态机应用日志必须确定。若应用日志时读取本地时间、随机数、目录扫描顺序或不稳定的哈希遍历，不同副本会得到不同状态。C++ 实现中，生成 manifest 或 snapshot 时不要依赖 \code{std::unordered_map} 的遍历顺序；要按 key、partition id 或 log index 排序。外部 I/O 也不能在日志重放时无条件重复执行，必须通过提交表和幂等协议保护。
 
+\section{控制日志模拟器：把共识边界落到项目}
+
+前面已经说明 leader、term、log index、commit index、apply index 和 snapshot 的意义。还差一步：这些字段怎样变成 Compute Systems Engine 里能运行、能注入故障、能写报告的最小控制日志。这里不追求实现完整 Raft；目标是让 route epoch、partition owner、manifest generation 和 dedup table 都只能从一条已提交的控制日志中产生。这样第 18 章的项目代码不会把“当前内存里看见的 owner”误当成权威。
+
+\topic{控制日志只承载小而关键的事实}
+数据面仍然走高吞吐路径：shuffle block 写临时文件，checksum 和字节数进入候选元数据，真正的大字节不进控制日志。控制日志承载的是决定外部事实的小对象：哪个 route epoch 生效，哪个 owner 有提交权，哪个 manifest entry 被接受，哪个 request id 已去重，哪个 snapshot 覆盖到哪个 log index。若把所有数据字节塞进日志，吞吐会垮；若连 manifest 接受事实都不进日志，旧 leader 和恢复程序会制造分叉。
+
+\begin{lstlisting}[language=C++,caption={控制日志模拟器的核心记录}]
+enum class ControlDecision : std::uint8_t {
+  Accepted,
+  RejectedStaleTerm,
+  RejectedLogGap,
+  RejectedStaleRoute,
+  RejectedDuplicate,
+};
+
+struct ControlLogState {
+  std::uint64_t current_term = 0;
+  std::uint64_t last_log_index = 0;
+  std::uint64_t commit_index = 0;
+  std::uint64_t apply_index = 0;
+  std::uint64_t manifest_generation = 0;
+  std::uint64_t route_epoch_table_checksum = 0;
+  std::uint64_t dedup_table_checksum = 0;
+};
+\end{lstlisting}
+
+这个状态不是数据库完整 schema，只是共识边界的最小账本。\code{current_term} 拒绝旧 leader；\code{last_log_index} 和 \code{commit_index} 区分本地追加与已承诺事实；\code{apply_index} 区分已承诺与本地已执行；\code{manifest_generation} 让下游知道读到哪个 manifest 历史；两个 checksum 让 snapshot 和恢复能证明 route 表、去重表不是任意内存状态。
+
+\topic{追加、持久化、多数确认、提交、应用}
+一次控制写入至少经过五个动作。Leader 先检查 term 和输入身份，生成下一个 log index；本地持久化 entry；发送给 followers；获得当前配置多数派持久接受后推进 commit index；最后按 log 顺序应用到状态机。只有 apply 完成后，route epoch 或 manifest generation 才能对业务可见。
+
+\begin{lstlisting}[numbers=none,caption={控制日志提交链}]
+append(entry):
+  require entry.term == current_term
+  assign entry.log_index = last_log_index + 1
+  persist entry locally
+  replicate to followers with prevLogIndex and prevLogTerm
+  if quorum persisted:
+      commit_index = entry.log_index
+  while apply_index < commit_index:
+      apply log[apply_index + 1] to deterministic state machine
+      apply_index++
+\end{lstlisting}
+
+这条链把几个常见误区拆开。本地 append 成功，不代表提交；多数派持久化成功，不代表本节点状态机已经可读；状态机 apply 成功，才说明 manifest 或 route 表对外可见。若 worker 在 append 后就收到成功响应，leader 崩溃会丢承诺；若 read path 只看 commit index 不等 apply index，就可能读旧 route；若 snapshot 不记录 apply index，恢复后不知道哪些日志已经影响过 manifest。
+
+\topic{状态机不允许绕过提交入口}
+控制状态机可以小，但入口必须唯一。更新 route epoch、接受 manifest entry、推进 migration state、写 tombstone、记录 dedup request，都应通过 \code{apply_control_entry}。恢复重放、在线 commit 和测试注入不能各写一份逻辑。这样旧 leader 请求、重复 attempt、迟到 reply 和目录扫描都只能得到同一类判定。
+
+\begin{lstlisting}[numbers=none,caption={控制状态机应用入口}]
+apply_control_entry(entry):
+  if entry.kind == UpdateRouteEpoch:
+      require entry.route_epoch == current_route_epoch(partition) + 1
+      update owner and route epoch
+
+  if entry.kind == CommitManifestEntry:
+      require request_id not in dedup table
+      require entry.route_epoch == current route epoch
+      require entry.term == current term
+      append manifest record in sorted deterministic order
+      manifest_generation++
+      remember request_id in dedup table
+
+  recompute deterministic checksums for snapshot/report
+\end{lstlisting}
+
+这段伪代码故意把 manifest 接受放在控制状态机里，而不是放在 worker 文件写成功之后。Worker 写完 block 只产生候选；控制日志决定候选是否成为业务事实。重复 attempt 可以拥有完整字节和正确 checksum，但若 request id 已被 dedup 表接受，或者 route epoch 已过期，它只能进入 late 或 stale 路径。
+
+\topic{四条不变量}
+控制日志模拟器最重要的不是代码行数，而是不变量。第一，route epoch 只能通过 committed 且 applied 的日志前进，不能由本地内存修改。第二，manifest generation 只能在应用 \code{CommitManifestEntry} 后前进，不能由目录扫描或 completion 成功前进。第三，任何提交请求的 term、route epoch 和 owner 必须与当前已应用状态匹配；不匹配时返回结构化拒绝，例如 \code{RejectedStaleTerm} 或 \code{RejectedStaleRoute}。第四，snapshot 必须覆盖 \code{last_included_index/term}、route epoch 表 checksum、manifest generation、dedup table checksum 和成员配置，否则恢复后无法证明它代表哪段日志前缀。
+
+\begin{lstlisting}[numbers=none,caption={控制日志不变量}]
+invariant route_epoch:
+  visible route epoch == applied state, not local cache
+
+invariant manifest_generation:
+  generation advances only when CommitManifestEntry is applied
+
+invariant fencing:
+  request.term == applied current_term
+  request.route_epoch == applied route_epoch(partition)
+  request.owner == applied owner(partition)
+
+invariant snapshot:
+  snapshot has last_included_index, last_included_term,
+  route_epoch_table_checksum, manifest_generation,
+  dedup_table_checksum, config_generation
+\end{lstlisting}
+
+这些不变量应进入测试断言。只靠日志打印“reject stale request”不够；测试要在旧请求、旧 leader、恢复扫描和 snapshot 加载后读取状态机，确认 generation 没分叉、route epoch 没倒退、dedup 表没有丢失。
+
+\topic{确定性场景：旧 term 7 与新 term 8}
+下面的场景适合作为项目里的第一组控制日志测试。三副本 A、B、C，term 7 的 leader A 曾追加 index 51：接受 partition 12、epoch 41 的 manifest 候选，但只复制到 A 自己，没有达到多数派。随后网络分区，B 和 C 在 term 8 选出新 leader B。B 的日志停在 index 50，于是它以 index 50 term 7 作为共同前缀，追加 index 51 term 8：把 partition 12 route epoch 切到 42，owner 改为 B；多数派 B/C 持久化后提交并应用。
+
+\begin{lstlisting}[numbers=none,caption={旧 leader 尾部被新 leader 修正}]
+A log:
+  index 50 term 7  committed previous state
+  index 51 term 7  manifest candidate from old owner
+
+B log:
+  index 50 term 7  committed previous state
+
+C log:
+  index 50 term 7  committed previous state
+
+new leader B term 8:
+  append index 51 term 8 with prevLogIndex=50 prevLogTerm=7
+  followers delete conflicting uncommitted tail after index 50
+  quorum accepts index 51 term 8
+  apply route_epoch(partition 12) = 42, owner = B
+\end{lstlisting}
+
+此时旧 leader A 恢复网络，尝试把 term 7、epoch 41 的 manifest candidate 提交。正确结果不是“文件存在所以补提交”，也不是“旧 A 还活着所以让它完成”。控制面先比较 term：请求 term 7 小于 current term 8，返回 \code{RejectedStaleTerm}；即使忽略 term 再看 route epoch，也会发现 epoch 41 小于当前 epoch 42，返回 \code{RejectedStaleRoute}。这两个拒绝都应进入报告计数，且 manifest generation 不变。
+
+\begin{lstlisting}[numbers=none,caption={旧 leader 提交被结构化拒绝}]
+old request:
+  leader_term=7
+  route_epoch=41
+  partition=12
+  owner=A
+  block=BA
+
+applied state:
+  current_term=8
+  route_epoch(partition 12)=42
+  owner(partition 12)=B
+
+decision:
+  RejectedStaleTerm
+  do not append manifest
+  count stale_term_rejected++
+  classify BA as stale candidate
+\end{lstlisting}
+
+这个测试把 quorum、日志共同前缀、term fencing、route epoch fencing 和 manifest gate 合在一起。它比单独问“多数派为什么安全”更有工程价值，因为每一步都有可观测字段：哪个 index 被提交，哪个 index 被应用，旧 tail 怎样被替换，旧请求为什么被拒绝，manifest generation 是否保持单调。
+
+\topic{线性读、check-index 和 lease read 的边界}
+控制日志写清之后，读路径也要选择语义。最保守的是 leader read：请求到 leader，leader 确认自己仍处于当前 term，并等待 \code{last_applied_index >= required_index} 后返回。更常见的优化是 check-index：leader 先通过一次轻量多数确认或等价机制证明自己仍是 leader，再把当前 commit index 作为 read index，本地 apply 到该 index 后读。Lease read 更快，但依赖时钟和 lease 假设，必须记录最大时钟偏差、续租方式和暂停边界。
+
+\begin{lstlisting}[numbers=none,caption={控制面读的三种边界}]
+leader read:
+  contact leader
+  require current term
+  wait apply_index >= commit_index
+
+check-index read:
+  leader proves authority through quorum heartbeat
+  read_index = commit_index observed under that authority
+  wait apply_index >= read_index
+
+lease read:
+  rely on unexpired leader lease
+  require explicit clock and pause assumptions
+\end{lstlisting}
+
+Route 查询、manifest generation 查询、提交前 owner 检查应默认使用 leader read 或 check-index。监控统计可以使用 stale read，但响应必须带 \code{observed_term}、\code{observed_commit_index}、\code{observed_apply_index} 和 \code{replica_lag}。若接口返回一个裸 owner id，调用方无法判断它读到的是当前事实、旧事实还是未应用事实。
+
+\topic{报告字段}
+控制日志模拟器的报告应能还原上述场景。报告不需要一开始就很漂亮，但必须能回答“这个 manifest entry 是在哪个 term、哪个 index、哪个 apply 点变成事实的”。最低字段可以先固定成下面这一组，后续再扩展延迟分布、每副本 lag 和迁移耗时。
+
+\begin{lstlisting}[numbers=none,caption={控制日志报告字段}]
+control_log.appended
+control_log.persisted_local
+control_log.quorum_accepted
+control_log.commit_index
+control_log.apply_index
+control_log.conflict_truncated
+route.epoch
+manifest.generation
+stale_term_rejected
+stale_route_rejected
+duplicate_rejected
+snapshot.last_included_index
+snapshot.last_included_term
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={控制日志报告摘要示例}]
+control_log.appended=91
+control_log.quorum_accepted=88
+control_log.commit_index=88
+control_log.apply_index=88
+control_log.conflict_truncated=1
+route.epoch.partition12=42
+manifest.generation=37
+stale_term_rejected=1
+stale_route_rejected=4
+duplicate_rejected=9
+snapshot.last_included_index=64
+snapshot.last_included_term=8
+\end{lstlisting}
+
 \section{工业设计参照}
 
 \topic{工业案例的阅读口径}

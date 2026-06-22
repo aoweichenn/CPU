@@ -789,6 +789,90 @@ for each temp file:
 
 这条恢复路径把第 15 章和第 18 章连接起来。I/O 层负责不把坏字节伪装成完成；分布式提交层负责决定哪个 attempt 生效。两层都不能用“文件存在”替代 manifest。
 
+\topic{T8：I/O 到 manifest 的状态表必须能重放}
+前面的生命周期沿一个 \code{ShuffleBlock} 讲清了 submit、completion 和 commit 的边界，但实现时还缺一张能落到代码里的状态表。异步 I/O 的危险点恰好在这里：事件从多个方向进入系统，计算线程提交请求，writer 线程发起系统调用，completion loop 收到结果，commit 线程更新 manifest，关闭线程要求 cancel 或 drain，恢复程序又从磁盘扫描出旧文件。若每条路径各自改几个布尔字段，状态很快就无法重放。
+
+最小实现应把 \code{WriteRequest} 写成一条可持久化或可审计的记录。它不一定每次状态变化都同步落盘，但日志、trace 和恢复表必须能重建同一条路径。请求身份至少包含 \code{request_id}、\code{logical_task}、\code{attempt}、\code{block_id} 和 \code{buffer_id}；进度包含 \code{bytes_done}、\code{remaining}、\code{checksum} 和最后一次错误；业务身份包含 stage、partition、route epoch、manifest generation 候选和 deadline。这样 completion 回来时，系统先查请求表，而不是根据文件名猜它属于谁。
+
+\begin{lstlisting}[language=C++,caption={可重放写请求记录的示例形态}]
+enum class WriteRequestState : std::uint8_t {
+  Created,
+  Queued,
+  Submitted,
+  PartiallyCompleted,
+  Completed,
+  Verified,
+  Durable,
+  Candidate,
+  Committed,
+  Failed,
+  Canceled,
+  Reaped,
+};
+
+struct WriteRequestRecord {
+  std::uint64_t request_id = 0;
+  std::uint64_t logical_task = 0;
+  std::uint32_t attempt = 0;
+  std::uint64_t block_id = 0;
+  std::uint64_t buffer_id = 0;
+  std::uint32_t stage_id = 0;
+  std::uint32_t partition_id = 0;
+  std::uint64_t route_epoch = 0;
+  std::uint64_t manifest_generation = 0;
+  std::uint64_t bytes_total = 0;
+  std::uint64_t bytes_done = 0;
+  std::uint64_t checksum = 0;
+  std::uint64_t deadline_ns = 0;
+  WriteRequestState state = WriteRequestState::Created;
+};
+\end{lstlisting}
+
+状态转移要写成有限集合，而不是任意赋值。\code{Created} 只能进入 \code{Queued} 或 \code{Failed}；\code{Queued} 可进入 \code{Submitted}、\code{Canceled} 或 \code{Failed}；\code{Submitted} 收到短写进入 \code{PartiallyCompleted} 后重新提交，写完进入 \code{Completed}，错误进入 \code{Failed}，取消请求则进入 \code{Canceled} 但等待 reaped；\code{Completed} 通过 checksum 后进入 \code{Verified}；满足项目承诺的持久化边界后进入 \code{Durable}；只有 commit 线程检查 attempt、epoch 和 manifest 后，才从 \code{Candidate} 进入 \code{Committed}。所有未被接受的完成结果最后都要进入 \code{Reaped}，释放 buffer、容量预算和临时文件引用。
+
+\begin{lstlisting}[numbers=none,caption={状态转移不是布尔成功}]
+Created -> Queued -> Submitted
+Submitted -> PartiallyCompleted -> Submitted
+Submitted -> Completed -> Verified -> Durable -> Candidate
+Candidate -> Committed
+Candidate -> Reaped        # late attempt or stale route
+Submitted -> Failed        # fatal I/O error
+Submitted -> Canceled -> Reaped
+\end{lstlisting}
+
+这张表的价值在崩溃恢复时才完全显现。恢复不能从临时目录开始，因为目录只告诉系统“某些字节存在”。恢复顺序应先读 manifest，得到业务上已经接受的 block；再读 completion log、request table 或 checkpoint，恢复每个 request 的最后已知状态；最后扫描临时目录和最终目录，把文件分类为 accepted、candidate、late、orphan、corrupt。分类规则必须能解释所有中间状态：\code{Committed} 且 checksum 匹配的是 accepted；\code{Durable} 或 \code{Candidate} 但 manifest 未接受的是候选，需重新走 commit 判定；旧 attempt 完整但已有新 attempt accepted，是 late；无请求记录或元数据不完整是 orphan；checksum 不匹配是 corrupt。
+
+\begin{lstlisting}[numbers=none,caption={恢复重放的顺序}]
+recover:
+  load manifest and accepted attempt table
+  load request table or completion log
+  scan temp and final directories
+  for each discovered file:
+      join by block_id, attempt, checksum
+      classify accepted, candidate, late, orphan, or corrupt
+  replay candidate commit only through manifest gate
+  reap stale and orphan files after cleanup policy allows
+\end{lstlisting}
+
+注意最后一行：候选文件不能直接变成结果。恢复程序和在线 commit 线程必须调用同一个 manifest gate。若在线路径检查 attempt 和 route epoch，恢复路径却按“文件完整且较新”接受，系统仍会在重启后分叉。项目中可以把这个 gate 做成小函数，例如 \code{try_commit_manifest_candidate(record, ownership, manifest)}，让在线 completion、重试和恢复扫描都走同一条判断。
+
+背压也应使用同一张状态表计算债务。粗略的队列长度只能看到 \code{Queued}；真正的债务还包括 \code{Submitted} 的 in-flight bytes、\code{Completed} 到 \code{Candidate} 之间的未提交 bytes、\code{late/orphan} 临时文件和最老未提交时间。推荐维护一张 \code{IoDebtLedger}：\code{queued_bytes} 限制生产速度，\code{inflight_bytes} 限制 buffer pool 和取消成本，\code{completed_uncommitted_bytes} 暴露 manifest 瓶颈，\code{orphan_temp_bytes} 暴露清理和恢复窗口，\code{oldest_uncommitted_age} 暴露尾部债务。
+
+\begin{lstlisting}[language=C++,caption={I/O 债务账本的示例形态}]
+struct IoDebtLedger {
+  std::uint64_t queued_bytes = 0;
+  std::uint64_t inflight_bytes = 0;
+  std::uint64_t completed_uncommitted_bytes = 0;
+  std::uint64_t orphan_temp_bytes = 0;
+  std::uint64_t retry_backlog = 0;
+  std::uint64_t oldest_uncommitted_age_ns = 0;
+};
+\end{lstlisting}
+
+这几个字段直接决定背压打到哪里。\code{queued_bytes} 超过高水位，compute 暂停生成新 block；\code{inflight_bytes} 长期不降，writer 或设备路径需要降速、拆小 block 或增加 completion 能力；\code{completed_uncommitted_bytes} 增长，说明 manifest gate 或 group commit 是瓶颈，继续增加 writer 只会制造更多候选；\code{orphan_temp_bytes} 增长，说明恢复窗口正在扩大，清理任务要获得预算；\code{oldest_uncommitted_age} 超过 deadline，driver 应该停止制造新 attempt，先处理提交或失败传播。
+
+至此，异步 I/O 的核心不再是某个 API，而是一张能被在线路径、关闭路径和恢复路径共同解释的账本。只要账本能重放，短写、迟到 completion、崩溃扫描和背压都能落到同一个模型；账本不能重放，系统迟早会退化成“日志里说成功、目录里也有文件、但 manifest 不知道该信谁”的状态。
+
 \topic{I/O 指标要同时看吞吐和债务}
 异步 I/O 最容易制造“吞吐看起来高，债务不断增加”的假象。报告除了 bytes/s，还要记录 queued bytes、dirty bytes 近似指标、in-flight requests、oldest request age、oldest uncommitted block age、buffer pool free bytes、retry backlog 和 orphan temp bytes。吞吐表示当前流量，债务表示未来必须偿还的工作。若吞吐高但 oldest uncommitted block age 持续增长，系统实际上已经失去稳态。
 
