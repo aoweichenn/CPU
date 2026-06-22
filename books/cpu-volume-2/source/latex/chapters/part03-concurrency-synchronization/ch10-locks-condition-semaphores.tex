@@ -176,6 +176,84 @@ private:
 
 这个示例很小，但习惯要严格：成员访问使用 \code{this->}，锁对象用 RAII，锁的作用域就是临界区。后续加入 \code{head_}、\code{tail_}、\code{size_}、\code{closed_} 后，它们都应归入同一不变量边界，直到测量证明需要拆分。
 
+\section{futex 路径：用户态原子怎样变成内核等待}
+
+Linux 上许多高层同步原语的竞争慢路径会落到 futex 或类似机制。futex 可以理解为 fast userspace mutex 的底层接口：正常无竞争时，用户态原子操作完成同步；只有需要睡眠或唤醒时，才进入内核。这个设计来自一个简单事实：每次加锁都进内核太贵，但长期自旋也会浪费 CPU。futex 把“先检查用户态整数”和“必要时挂到等待队列”结合起来。
+
+\topic{wait 必须带预期值}
+futex wait 的关键不是“睡眠”，而是“只有当用户态地址仍等于预期值时才睡眠”。这能避免经典竞态：线程检查到锁被占用，准备睡眠；就在进入内核前，持锁线程释放并唤醒；如果等待方无条件睡眠，它可能错过唤醒。带预期值的 wait 让内核重新读取用户态整数，若值已经变了，就不睡眠，直接返回让用户态重试。
+
+\begin{lstlisting}[numbers=none,caption={futex wait 的竞态防护直觉}]
+user space:
+  if lock_word == locked:
+      futex_wait(address=&lock_word, expected=locked)
+
+kernel side:
+  recheck *address
+  if *address != expected:
+      return immediately
+  enqueue current thread on wait queue for address
+  schedule away
+\end{lstlisting}
+
+这条设计说明条件变量为什么必须等待谓词。无论是 futex 还是 condition variable，通知都不是状态；状态在用户态整数或受 mutex 保护的对象里。等待者醒来后必须重新检查状态，因为醒来只说明“可能有变化”，不说明自己已经获得资源。
+
+\topic{wake 不是交出锁}
+unlock 里的 wake 也常被误解。释放线程把锁字改成 unlocked，然后唤醒一个等待者。被唤醒线程只是变成 runnable；它还要等待调度器选择 CPU，还要重新执行获取锁的原子操作，还可能输给另一个正在运行的线程。wake 不保证公平，也不保证被唤醒者立刻进入临界区。
+
+\begin{lstlisting}[numbers=none,caption={unlock 到 waiter 真正进入临界区之间的路径}]
+owner thread:
+  store lock_word = unlocked with release semantics
+  if lock_word indicated waiters:
+      futex_wake(address=&lock_word, count=1)
+
+waiter thread:
+  wakes from kernel wait queue
+  becomes runnable
+  scheduler runs it later
+  retries compare-exchange on lock_word
+  enters critical section only if CAS succeeds
+\end{lstlisting}
+
+这个路径解释了 tail latency。某个线程的 \code{wait_ns} 可能很长，不只是因为持锁时间长，也可能因为调度延迟、优先级、CPU 过度订阅、cgroup 限制或唤醒后重新竞争失败。锁报告必须区分 hold time、wait time 和 runnable delay。
+
+\topic{用户态锁字和内核等待队列必须保持一致}
+futex 等待队列按用户态地址组织。若程序在等待者仍可能睡眠时销毁或复用锁对象，旧等待者可能挂在已经复用的地址语义上。高层库会通过对象生命周期规则避免这种错误；业务代码也必须保证 mutex、condition variable 和等待谓词的对象活得足够久。关闭队列时，先改状态，再通知所有等待者，再等待使用者退出，不能边销毁边唤醒。
+
+\begin{lstlisting}[numbers=none,caption={销毁同步对象前必须清空等待协议}]
+shutdown queue:
+  lock mutex
+  closed = true
+  unlock mutex
+  notify all waiters
+  join worker threads or prove no waiter remains
+  destroy mutex and condition variables
+\end{lstlisting}
+
+这不是形式主义。futex 的内核队列只知道地址，不知道 C++ 对象语义；条件变量也不会替业务证明生命周期。同步对象的生命周期是协议的一部分。
+
+\topic{futex 观测字段}
+真实系统里，futex 问题常表现为 CPU 不高但延迟高，或者线程大量处于 sleep/runnable 之间。报告可以把应用字段和系统字段对齐：
+
+\begin{lstlisting}[numbers=none,caption={futex 和锁慢路径的观测字段}]
+mutex_name
+lock_word_address_or_id
+acquire_attempts
+contended_attempts
+futex_wait_count
+futex_wake_count
+spurious_or_timeout_wake_count
+runnable_delay_ns
+hold_ns_p99
+wait_ns_p99
+owner_thread_state_when_waiters_blocked
+\end{lstlisting}
+
+如果没有系统级 trace，也要在应用里记录等待开始、进入睡眠前、醒来后、获得锁、释放锁的时间点。这样至少能判断等待发生在临界区、内核睡眠、调度还是重新竞争。后续运行时章节会把这种时间线扩展到 worker、task 和 completion。
+
+\topic{从 futex 回到设计选择}
+看到 futex wait 很多，不等于要删掉 mutex。可能的修复包括：缩短临界区、批量操作、分片队列、减少无效唤醒、把阻塞 I/O 移出 compute worker、提高任务粒度、或把复杂多字段状态保留在锁下。只有当状态机已经缩小到单个原子值、等待条件清楚、生命周期可证明时，才考虑 \code{atomic::wait} 或无锁结构。慢路径证据用来选择设计，不是用来制造对某个同步原语的偏见。
+
 \section{条件变量等待的是谓词}
 
 条件变量常被误解为事件通知系统。正确模型是：线程持锁检查共享状态；若谓词不满足，\code{wait} 原子地释放锁并睡眠；被通知或虚假唤醒后，重新持锁检查谓词。通知本身不保存状态；如果通知发生时没有等待者，它不会留在条件变量里等后来者；被唤醒也不代表条件已经成立，因为别的线程可能先拿到锁并消费资源。

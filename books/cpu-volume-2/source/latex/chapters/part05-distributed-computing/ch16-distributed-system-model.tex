@@ -191,6 +191,82 @@ trace id & 跨组件因果链 & 事故无法复盘 \\
 \topic{部分读写和消息边界}
 进入多进程后，\code{send} 和 \code{recv} 不会按消息对象自然对齐。一次 \code{recv} 可能只有半个 header，一次 \code{send} 可能只写出部分字节。第 15 章短读短写在这里再次出现：协议要有 framing，例如固定 header 加 payload length；读取方先收完整 header，校验长度，再收完整 payload。若项目从 C++ 结构体复制直接跳到 socket，很快会在部分读写、大小端、对齐和版本上出错。
 
+本机 MessageBus 可以把一个 \code{Message} 对象直接放进队列，接收方 pop 出来的仍然是同一个结构化对象。迁移到 socket 后，这个假设消失。进程之间没有共享地址空间，指针没有意义；TCP 提供的是有序字节流，不提供“这一段正好是一条业务消息”的边界；操作系统的 send buffer 和 receive buffer 会按可用空间拆分和合并字节；连接关闭也不等于某个业务请求失败。于是协议必须自己定义 frame，并把 frame parser 当作核心状态机。
+
+\begin{lstlisting}[numbers=none,caption={TCP 字节流可能呈现的接收形状}]
+sender writes:
+  [message A frame][message B frame]
+
+receiver may read:
+  [first 7 bytes of A header]
+  [rest of A header + part of A payload]
+  [rest of A payload + complete B frame]
+
+or:
+  [A and B together in one recv]
+\end{lstlisting}
+
+这就是为什么 \code{recv} 返回一次成功不等于收到一条完整消息，\code{send} 返回成功也不等于对端业务已经处理。应用层需要保存解析状态：当前是否正在读 header，header 是否通过版本和长度检查，payload 还差多少字节，checksum 是否匹配，deadline 是否已经过期，连接关闭时当前半包如何分类。缺少这层状态，网络错误会直接污染业务状态机。
+
+\topic{Frame header 是最小控制面}
+Frame header 至少要包含 magic、protocol version、message type、header length、payload length、request id、flags 和 checksum 或校验字段。Magic 用于快速拒绝明显错误流；version 用于兼容判断；type 决定 payload 的解释方式；length 让 parser 知道还要读多少字节；request id 把响应放回状态表；checksum 帮助发现截断、编码错误或内存破坏。字段越少，状态机越短，但也越难诊断；字段越多，兼容和校验成本越高。最小协议要在这两边平衡。
+
+\begin{lstlisting}[numbers=none,caption={FrameHeader 的抽象字段}]
+FrameHeader:
+  magic
+  protocol_version
+  header_bytes
+  payload_bytes
+  message_type
+  request_id
+  attempt_id
+  deadline_epoch_ms
+  flags
+  header_checksum
+  payload_checksum
+\end{lstlisting}
+
+这些字段不能被业务 payload 随意覆盖。Parser 必须先验证 header 长度、payload 长度和版本，再分配 buffer 或进入 payload 读取。否则一个错误长度就能触发巨大分配、内存耗尽或状态机越界。网络边界上的第一条安全规则是：先验证控制字段，再相信 payload。
+
+\topic{Partial write 也会改变背压}
+发送端同样不能假设一次 \code{write} 把完整 frame 放入内核。非阻塞 socket 可能只接受一部分字节，剩余部分要留在发送队列；阻塞 socket 可能在内核 buffer 满时停住当前线程；TLS 或压缩层还可能改变写入粒度。若 CPU worker 直接执行阻塞 write，它会变成第 9、14、15 章反复警告的 hidden blocking。正确做法是把待发送 frame 变成拥有偏移量的输出状态机，由 I/O loop 在 socket 可写时继续推进，并对队列水位施加背压。
+
+\begin{lstlisting}[numbers=none,caption={发送侧状态机要保存已写偏移}]
+OutboundFrame:
+  connection_id
+  request_id
+  bytes
+  bytes_written
+  deadline
+  retry_class
+  completion_target
+
+on socket writable:
+  n = write(bytes + bytes_written)
+  bytes_written += n
+  if bytes_written == bytes.size:
+      mark frame flushed to kernel buffer
+\end{lstlisting}
+
+\code{flushed to kernel buffer} 仍然不是业务成功。它只说明本进程把字节交给内核；对端是否收到、解析、执行、写出结果、提交 manifest，都需要后续响应和提交表证明。把这些事实分层，才能避免把 transport success 误当 application success。
+
+\topic{连接事件不是业务事件}
+连接建立、断开、半关闭、TLS 握手失败、对端重置，都属于传输层事件。它们会影响 in-flight 请求的状态，但不能直接替代业务判断。连接断开时，已经发送但未收到响应的请求进入 Unknown；正在解析的半包进入 TruncatedFrame 或 ConnectionClosed；已经提交 manifest 的请求保持 Committed；迟到响应若在新连接上出现，仍要经过 request id、attempt、epoch 和 deadline 检查。
+
+\begin{lstlisting}[numbers=none,caption={连接关闭时的分类顺序}]
+connection closed:
+  parser has partial frame:
+      classify TruncatedFrame
+  outbound frames not fully written:
+      classify TransportIncomplete
+  requests written but no reply:
+      classify Unknown
+  requests already committed:
+      keep Committed as authoritative
+\end{lstlisting}
+
+这个分类让网络事件进入本章前面建立的 attempt 状态机。网络失败不再是一个吞掉上下文的异常，而是一组可重放、可统计、可恢复的事件。
+
 \section{协议版本、兼容和滚动升级}
 
 协议版本不是为了在 header 里放一个好看的数字。它回答一个很具体的问题：当新旧 Driver、新旧 Worker、新旧 manifest 同时存在时，接收方如何知道这条消息能不能安全解释。没有版本规则，升级就会退化成“全系统同时停机换代码”。小型实验可以暂时忍受这种切换，长期运行系统通常不能接受。

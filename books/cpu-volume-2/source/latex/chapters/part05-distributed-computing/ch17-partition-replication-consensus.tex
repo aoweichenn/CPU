@@ -461,6 +461,41 @@ linearizable read:
 
 若把 committed 和 applied 混在一起，读路径可能返回旧状态，snapshot 可能漏掉已承诺条目，恢复可能重复外部副作用。控制面状态机通常很小，仍要保留这两个字段，因为它们是读一致性和恢复边界的证据。
 
+\topic{线性读为什么不能随便读 follower}
+读请求看似不修改状态，实际上也要选择一致性合同。若直接读任意 follower，它可能落后于 leader 的 commit index，也可能还没有 apply 最新 committed 条目；网络分区时，旧 leader 或旧 follower 还可能停在旧 term。这样的读适合明确声明为 stale read 或 cached read，不能伪装成线性读。线性读要求读结果能放进全局顺序里，并且排在读开始前已经完成的写之后。
+
+有三类常见方案。第一，把读也作为日志操作提交，简单但成本高。第二，leader 在当前 term 确认自己仍有 quorum，再等状态机 apply 到当前 commit index，然后服务读。第三，在强时间假设下使用 lease read，但 lease 必须考虑时钟漂移、暂停和网络延迟。无论哪种，读路径都要写明它依赖的权威事实，而不是因为“读不写”就绕过控制面。
+
+\begin{lstlisting}[numbers=none,caption={线性读的最小检查顺序}]
+linear read on leader:
+  confirm this node is still leader in current term
+  confirm leadership with quorum or valid lease assumption
+  choose required_index = current commit_index
+  wait until last_applied_index >= required_index
+  read from state machine snapshot at or after required_index
+\end{lstlisting}
+
+这条顺序和本地 manifest 读取同构。读取 manifest 时，不能从临时 block 目录直接推断结果；读取分布式控制面时，也不能从某个副本当前内存直接推断权威状态。必须先证明当前节点有读取权利，再证明本地状态至少应用到需要的日志位置。
+
+\topic{Follower read 的安全边界}
+Follower 不是不能服务读，但必须声明语义。Stale read 可以从 follower 返回，适合监控、近似负载信息和非关键查询；bounded stale read 需要写最大落后界限；linearizable follower read 需要向 leader 或 quorum 验证 read index，再等本地 apply 到该 index。若一个接口既想要 follower 低延迟，又想要线性一致，又不做验证，那只是把一致性成本藏起来。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.36\linewidth}p{0.28\linewidth}@{}}
+\toprule
+读类型 & 可接受事实 & 不能承诺 \\
+\midrule
+Stale read & 本副本已应用状态，可能落后 & 不能保证看到最近提交 \\
+Bounded stale read & 落后不超过声明界限或版本 & 不能超过边界仍继续返回成功 \\
+Leader linear read & 当前 leader 权利和 apply index 已验证 & 需要 quorum 或 lease 假设 \\
+Follower linear read & 通过 read index 或 quorum 验证后读取 & 不能只读本地内存 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Compute Systems Engine 的控制面读可以先实现 leader linear read 和 explicit stale read 两类。前者用于提交、路由变更和 manifest generation；后者用于 dashboard、调试和不影响外部事实的观察。接口名字和报告字段要把语义写清，避免把“快但可能旧”的结果传给需要强一致的提交路径。
+
 \begin{lstlisting}[language=C++,caption={控制日志条目的示例形态}]
 enum class ControlOperationKind : std::uint16_t {
   UpdateRouteEpoch,

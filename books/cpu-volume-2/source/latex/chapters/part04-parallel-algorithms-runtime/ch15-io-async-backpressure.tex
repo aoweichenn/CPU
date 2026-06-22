@@ -279,6 +279,126 @@ on completion:
 
 这条原则不是追求代码整洁，而是防止完成事件本身形成新的隐藏队列。异步系统真正的吞吐上限取决于 submit、device、completion、commit 和 recovery 这些阶段的共同稳态。
 
+\section{完整案例：从阻塞 write 改造成有背压的完成流水线}
+
+现在把 I/O 路径写成一次完整改造。初始版本由 compute worker 直接调用 \code{write} 写 shuffle block。小输入时它很简单；输入变大后，worker 有时卡在 \code{write}、\code{fsync} 或冷 \code{mmap} 缺页里，线程池看起来还有线程，实际可运行计算任务越来越少。第 9 章把这种现象归为 blocked worker；本章要把它改成可观测的 I/O 状态机。
+
+\topic{第一版：阻塞写把等待混进计算预算}
+朴素代码通常长这样：
+
+\begin{lstlisting}[numbers=none,caption={阻塞写版本把设备等待放进 worker}]
+for each batch assigned to worker:
+    partial = aggregate(batch)
+    block = serialize(partial)
+    write_all(output_fd, block.bytes)
+    fsync_if_required(output_fd)
+    append_manifest(block.metadata)
+\end{lstlisting}
+
+这个版本的问题不是“同步 I/O 一定错”，而是等待边界不清。Worker 既做 CPU 聚合，又做序列化，又等待存储，又提交 manifest。Profile 可能显示 worker 在系统调用或内核路径里，任务运行时却只看到 worker 忙。上游继续提交任务，dirty page 和输出队列继续增长，背压来得太晚。
+
+\topic{第二版：把请求、buffer 和 attempt 分开}
+改造第一步是定义 \code{WriteRequest}。它携带逻辑身份、attempt、buffer、目标路径、可靠性策略和状态。提交请求后，buffer 所有权转移给 I/O 子系统；compute worker 只拿到一个 request id 或 future。
+
+\begin{lstlisting}[language=C++,caption={WriteRequest 表达 I/O 状态机输入}]
+struct WriteRequest {
+  std::uint64_t logical_partition = 0;
+  std::uint32_t attempt = 0;
+  std::uint64_t request_id = 0;
+  BufferHandle buffer;
+  std::string temp_path;
+  bool requires_fsync = false;
+  std::uint64_t checksum = 0;
+};
+\end{lstlisting}
+
+\code{logical_partition} 和 \code{attempt} 防止迟到 completion 越权提交；\code{request_id} 定位 in-flight 表；\code{BufferHandle} 保护生命周期；\code{requires_fsync} 明确持久化承诺；\code{checksum} 让 completion 和 manifest 能验证数据身份。没有这些字段，异步只是把错误延迟到以后发生。
+
+\topic{第三版：completion 只推进状态}
+I/O worker 或 completion loop 负责处理 \code{WriteRequest}。它可以内部使用阻塞写线程、\code{epoll}、\code{io\_uring} 或模拟完成队列；原理卷不绑定某个接口。关键是 completion 回来时只做有界工作：校验 request 当前仍有效，记录结果，释放或转交 buffer，必要时把 manifest 候选投递给提交线程。
+
+\begin{lstlisting}[numbers=none,caption={完成流水线的状态转移}]
+compute worker:
+  build block in owned buffer
+  submit WriteRequest
+  continue CPU work or respect backpressure
+
+io subsystem:
+  write temp bytes, handle short writes
+  fsync if requested by policy
+  emit CompletionRecord(request_id, bytes, error, durable_state)
+
+completion loop:
+  validate request still current
+  recycle or transfer buffer
+  enqueue ManifestCandidate only if completion is acceptable
+\end{lstlisting}
+
+这条流水线把等待从 compute worker 移走，但没有让等待消失。设备仍然慢，fsync 仍然慢，buffer 仍然有限。区别是等待变成了可测队列，而不是混在任意 worker 的调用栈里。
+
+\topic{第四版：背压从最低吞吐阶段向上游传播}
+异步系统最危险的错觉是“提交很快，所以系统很快”。如果 submit 速率长期高于 durable 或 commit 速率，in-flight 请求、buffer、dirty pages 或临时文件会堆积。背压要从最慢的稳定阶段向上游传播。可以设多个水位线：free buffer 数量、in-flight bytes、dirty estimate、completion latency、manifest queue 长度。
+
+\begin{lstlisting}[numbers=none,caption={多层背压水位线}]
+if free_buffers < low_watermark:
+    stop accepting new serialization work
+
+if inflight_write_bytes > write_budget:
+    slow down map-side combine output
+
+if fsync_latency_p99 exceeds budget:
+    increase group commit window or reduce output concurrency
+
+if manifest_queue grows:
+    stop admitting new attempts for the same stage
+\end{lstlisting}
+
+背压不是错误路径，而是正常控制流。它的目标不是让队列永远为空，而是让每层债务有上限：buffer 不被复用过早，dirty pages 不无限增长，completion 不被 CPU 后处理堵住，manifest 不被重复 attempt 淹没。
+
+\topic{第五版：关闭和取消}
+关闭路径要比正常路径更严格。停止接收新请求，不代表已有请求不存在；取消 attempt，不代表底层 I/O 不会完成；释放 buffer，不代表设备不再访问。关闭状态机应按阶段推进：
+
+\begin{lstlisting}[numbers=none,caption={I/O 流水线关闭顺序}]
+stop admission:
+  reject new WriteRequest or mark stage closing
+
+drain or cancel:
+  choose whether in-flight requests may finish
+  mark canceled attempts so late completions cannot commit
+
+reap completions:
+  process every completion until ownership is resolved
+  recycle buffers only after completion or proven cancellation boundary
+
+commit or discard:
+  append manifest for accepted attempts
+  remove orphan temp files according to recovery policy
+\end{lstlisting}
+
+这个顺序和线程池关闭、条件变量谓词、原子状态机是一条主线：状态先改变，等待者或 completion 再观察状态，资源最后释放。若顺序反过来，就会出现 use-after-free、重复提交、孤儿文件或丢失唤醒。
+
+\topic{第六版：报告字段}
+完整报告要能解释系统是 CPU 慢、设备慢、completion 慢还是 commit 慢：
+
+\begin{lstlisting}[numbers=none,caption={异步写流水线报告字段}]
+io.submit.count
+io.submit.rejected_by_backpressure
+io.inflight.requests
+io.inflight.bytes
+io.short_write.count
+io.completion.latency_p50
+io.completion.latency_p99
+io.fsync.latency_p99
+io.buffer.free_count_min
+io.dirty_bytes_if_available
+manifest.queue_depth_max
+manifest.commit.latency_p99
+late_completion.count
+orphan_temp_files_reclaimed
+\end{lstlisting}
+
+有了这些字段，调优才不会盲目。若 free buffer 见底而设备延迟高，瓶颈在持久化；若 completion 队列增长但设备延迟不高，completion loop 太重；若 manifest 队列增长，提交路径串行化；若 late completion 多，attempt timeout 或取消策略需要复查。
+
 \section{所有权、Buffer 池和取消}
 
 异步 I/O 最常见的正确性 bug 不是系统调用用错，而是 buffer 生命周期用错。同步调用返回后，调用者通常可以复用 buffer；异步提交后，设备、内核、I/O 线程或发送队列可能仍在读取这个 buffer。若上游提前复用，磁盘或网络看到的就是后续数据。高性能系统常用 buffer pool 减少分配，但 buffer pool 只有配套状态机才安全。

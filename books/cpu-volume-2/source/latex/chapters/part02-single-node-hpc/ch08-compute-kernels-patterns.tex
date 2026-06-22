@@ -173,6 +173,82 @@ top-k & 候选集合而非最终数组位置 & 局部候选提前丢失全局信
 \topic{manifest 让中间结果可复查}
 当 partition 或 shuffle 生成多个输出块时，只返回一个 \code{std::vector} 不够。系统还需要知道每个块属于哪个 bucket、包含多少记录、写到哪里、校验和是什么、是否已经提交。\term{manifest}{清单} 就是描述这些输出对象身份和边界的记录。单机 partition 的 manifest 到第 18 章会自然变成分布式 shuffle block 的 manifest。
 
+\section{完整案例：从内核合同推导机器形状和恢复边界}
+
+为了把内核模式从名词表变成设计方法，固定一个小流水线：输入日志先做 valid filter，保留合法记录；再按 event id 做 histogram；最后输出 top-k event。三个阶段都很常见，但每个阶段的底层问题不同。Filter 的难点是输出位置未知；histogram 的难点是共享写和热点 key；top-k 的难点是信息是否可以提前丢弃。若只写“filter、histogram、top-k 三个内核”，什么都解释不了；必须逐个写合同、机器形状和恢复边界。
+
+\topic{第一步：valid filter 的核心是输出位置}
+串行版本可以直接 \code{push_back} 合法记录。并行版本若让所有 worker 共享一个输出 vector，就会把尾指针、容量和分配器变成共享热点；若每个 worker 写本地 vector，再按 worker 顺序拼接，能保持稳定顺序，但需要保存每段长度和起点；若选择率极低，selection vector 可能比材料化记录更省；若后续阶段需要连续热列，材料化 batch 更合适。因此 filter 的合同不能只写谓词，还要写稳定性、record id、错误记录是否保留、输出表示和后续字段访问。
+
+\begin{lstlisting}[numbers=none,caption={valid filter 的合同和机器形状}]
+semantic contract:
+  keep records whose parse_status is Valid
+  preserve input order among kept records
+  keep RecordId for diagnostics and manifest
+
+machine shape:
+  input read: sequential parse_status column
+  output position: count + exclusive scan
+  writes: exclusive ranges after scan
+  recovery object: FilterBlock with input range, output range, checksum
+\end{lstlisting}
+
+\topic{第二步：histogram 的核心是写者归属}
+Histogram 的输入位置已知，但输出状态共享。全局 \code{counts[event_id]++} 在单线程里很自然；多线程下，即使用 \code{memory_order_relaxed}，多个核心也会争同一批 cache line 的独占权。正确改造不是先问“用哪种原子”，而是先问每个计数槽由谁写。常见路线是 worker-local partial：每个 worker 写自己的计数表，最后固定顺序合并。若 event id 很多，完整本地表可能太大，需要稀疏 partial 或分区；若热点 key 很集中，局部表能显著降低共享写；若 key 均匀且表巨大，合并成本和内存预算会成为新瓶颈。
+
+\begin{lstlisting}[numbers=none,caption={histogram 的合同和机器形状}]
+semantic contract:
+  count every kept record exactly once
+  produce deterministic count per event id
+
+machine shape:
+  input read: sequential event_id column
+  hot write: worker-local partial[worker][event_id]
+  merge: fixed order over worker partials
+  dominant risk: partial bytes, hot-key skew, false sharing
+\end{lstlisting}
+
+\topic{第三步：top-k 的核心是信息丢弃}
+Top-k 看起来只是对 histogram 排序取前 k。优化时常见错误是每个 worker 先取局部 top-k，再合并这些候选。这个策略对近似结果可能有价值，对精确结果却不一定正确：一个 event 在每个 worker 的局部排名都在 k 之后，但全局加起来可能进入前 k。精确 top-k 要么先得到全局 count，再按稳定 tie-break 取前 k；要么证明局部候选集有覆盖性质。没有覆盖证明，就不能丢弃候选。
+
+\begin{lstlisting}[numbers=none,caption={分散强 key 反例}]
+k = 2
+worker 0 local counts: A=100, B=90, X=80
+worker 1 local counts: C=100, D=90, X=80
+worker 2 local counts: E=100, F=90, X=80
+
+local top-2 candidates:
+  {A, B}, {C, D}, {E, F}
+
+global:
+  X = 240, but X was discarded by every local top-2
+\end{lstlisting}
+
+这类反例说明，内核合同和信息论边界先于优化。若业务允许近似 heavy hitter，报告要写误差和漏报概率；若业务要求精确 top-k，局部裁剪必须有证明，或只能作为加速候选而不能作为最终裁剪。
+
+\topic{把三个阶段接成可恢复流水线}
+一旦三个内核组成流水线，就会出现 pipeline breaker。Filter 需要 count/scan/write 后才能得到稳定输出；histogram 需要所有 partial 合并后才能得到全局计数；top-k 需要全局计数后才能排序或选择。这些 breaker 都应输出可复查对象：FilterBlock、HistogramPartial、HistogramMergeReport、TopKResult。每个对象要有输入身份、输出规模、checksum、attempt 和状态。这样失败时可以重试某个 block，而不是从头猜。
+
+\begin{lstlisting}[numbers=none,caption={三阶段流水线的恢复对象}]
+FilterBlock:
+  input_range, output_range, kept_count, checksum, attempt
+
+HistogramPartial:
+  worker_id, input_block_id, event_id_count, checksum
+
+HistogramMergeReport:
+  partial_ids, merge_order, total_count, checksum
+
+TopKResult:
+  k, tie_break_rule, candidate_count, result_checksum
+\end{lstlisting}
+
+这些对象也帮助性能分析。若 filter 输出很少而 histogram 仍慢，问题可能在 selection vector 间接访问或错误回查；若 histogram partial 很大，内存预算可能压垮 cache；若 top-k \code{candidate_count} 爆炸，说明 key 空间和 tie-break 需要重新设计。恢复字段和性能字段不是两套东西，它们都在描述同一条数据路径。
+
+\begin{labbox}
+实验：实现 valid filter + histogram + top-k 的三阶段报告。Filter 必须同时提供稳定材料化版本和 selection vector 版本；histogram 必须比较全局 atomic、本地 dense partial 和本地 sparse partial；top-k 必须包含分散强 key 反例。报告写出每阶段 KernelShape、records in/out、state bytes、temporary bytes、checksum、dominant risk 和不可验证边界。
+\end{labbox}
+
 \section{一对一和多对一：Map 与 Reduce}
 
 Map 是最容易理解的内核：第 \code{i} 个输入通常产生第 \code{i} 个输出。它没有跨元素依赖，适合顺序扫描、SIMD 和线程切分。可是 map 也最容易被低估。若每个元素只做一次乘法和一次加法，它很快会受内存带宽限制；若每个元素调用复杂函数、访问冷字段或分配字符串，瓶颈又会转移到前端、分支或分配器。

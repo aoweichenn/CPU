@@ -140,6 +140,102 @@ Reduce 端最危险的错误是重复合并同一个 logical map task。Attempt 
 \topic{热点 key}
 如果某个 key 占输入 90\%，普通 hash partition 会让一个 reduce partition 长尾。第一层优化是 map-side combine，减少重复传输；第二层是热 key 拆成多个执行子 key，分给多个 reduce；第三层再做二级 reduce，把子 key 合回业务 key。子 key 是执行身份，不是业务身份。Manifest 和 RunReport 要记录 hot route version、subkey count、final merge checksum 和二级合并成本。
 
+\section{网络、序列化和 shuffle 现实成本}
+
+分布式计算不能只把单机函数调用替换成远程调用。一次 shuffle block 传输会穿过序列化、buffer 分配、压缩、系统调用、内核 socket buffer、TCP 拥塞控制、网卡队列、对端内核、反序列化和 reduce 输入队列。每一层都可能排队，每一层也可能改变背压位置。若报告只写“发送给 reduce”，就把最重的系统路径藏掉了。
+
+\topic{RPC 不是函数调用}
+本地函数调用的失败边界很窄：要么返回，要么抛异常，要么进程崩溃。RPC 的边界更复杂：请求可能没有发出，可能发出但服务端没收到，可能服务端执行成功但响应丢失，可能响应迟到，可能客户端重试后两次都执行。于是 RPC 参数必须带逻辑身份、attempt、epoch、deadline 和幂等键。
+
+\begin{lstlisting}[numbers=none,caption={Shuffle RPC 的最小身份字段}]
+ShufflePushRequest:
+  stage_id
+  logical_map_task
+  attempt
+  reduce_partition
+  block_id
+  block_checksum
+  route_epoch
+  deadline
+  idempotency_key
+\end{lstlisting}
+
+这些字段不是“分布式样板”。它们分别回答不同故障：\code{attempt} 区分物理执行；\code{route_epoch} 防止旧路由写到新 owner；\code{idempotency_key} 让服务端识别重复请求；\code{deadline} 防止无限等待；checksum 防止传输或存储错误越过提交边界。
+
+\topic{序列化是数据布局的第二次选择}
+内存里的 \code{BatchView} 适合 CPU 热循环，不一定适合网络。网络 block 需要稳定字节序、版本、字段长度、checksum 和可跳过的扩展字段。若直接把内存结构体按字节发送，会把对齐空洞、指针、平台字节序和进程内地址泄漏到协议里。正确做法是定义 wire format：字段顺序、整数宽度、编码方式、压缩策略和校验范围。
+
+\begin{lstlisting}[numbers=none,caption={ShuffleBlock wire format 的账本}]
+header:
+  magic
+  format_version
+  partition_plan_version
+  record_count
+  payload_bytes
+  payload_checksum
+
+payload:
+  encoded event_id/value pairs
+  optional compressed columns
+  no raw process pointers
+\end{lstlisting}
+
+序列化格式也会反馈到 CPU 路径。行式格式便于逐条生成，列式格式便于压缩和向量化 reduce；变长编码节省网络字节，却增加解析分支；压缩减少传输，但增加 CPU 和内存峰值。格式选择不是 I/O 细节，而是端到端成本模型。
+
+\topic{零拷贝的边界}
+零拷贝经常被过早追求。真正的问题是哪些 copy 在热点路径上，copy 的字节量相对网络和磁盘是否主导，buffer 生命周期是否允许内核或网卡继续引用。若为了减少一次 copy 引入 pinned buffer、复杂引用计数、跨线程生命周期和迟到 completion，可能把正确性成本推高。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.23\linewidth}p{0.33\linewidth}p{0.32\linewidth}@{}}
+\toprule
+策略 & 购买的能力 & 需要支付的成本 \\
+\midrule
+普通序列化到 buffer & 简单、容易校验和重试 & 多一次内存 copy \\
+writev/scatter-gather & 减少拼接 copy & buffer 生命周期更复杂 \\
+sendfile/零拷贝 & 降低用户态 copy & 文件、socket、设备和错误处理受限 \\
+registered buffer & 降低提交成本 & 对齐、pinning、回收和内存压力 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第一版系统应先把普通 buffer 的报告做完整。只有当 \code{serialize_copy_ns} 或 \code{memory_bandwidth} 成为主瓶颈，再引入更复杂路径。否则“零拷贝”容易把一个可测的 copy 成本换成不可测的生命周期 bug。
+
+\topic{shuffle 背压从 reduce 端开始}
+Reduce 端慢时，map 端继续推 block 会制造网络和磁盘债务。背压应沿着 reduce queue、network in-flight、map output buffer、task admission 逐层向上游传播。只在 map 端看本地队列是不够的，reduce partition 的队列深度和处理延迟才是下游能力。
+
+\begin{lstlisting}[numbers=none,caption={shuffle 背压字段}]
+shuffle.map_output_bytes
+shuffle.inflight_rpc_bytes
+shuffle.reduce_queue_depth
+shuffle.reduce_partition_lag
+shuffle.retry_count
+shuffle.late_reply_count
+shuffle.deserialize_ns
+shuffle.network_send_ns
+shuffle.network_receive_ns
+shuffle.spill_bytes
+\end{lstlisting}
+
+这些字段把“网络慢”拆开。若 \code{deserialize_ns} 高，问题在格式或 CPU；若 \code{reduce_queue_depth} 高，问题在下游计算；若 \code{retry_count} 高，问题在网络或 deadline；若 \code{spill_bytes} 高，问题在内存预算和 partition 形状。分布式性能必须能定位到层级。
+
+\topic{Exactly-once 是提交协议，不是传输属性}
+网络可能重复发送，RPC 可能重试，worker 可能迟到，driver 可能崩溃。所谓 exactly-once 不能靠“只发送一次”实现，而要靠幂等身份、去重表、manifest 提交点和恢复扫描。每个逻辑输出只能有一个 accepted attempt；重复到达的同一 attempt 可以确认已处理；不同 attempt 只能由 manifest 决定哪一个生效。
+
+\begin{lstlisting}[numbers=none,caption={服务端处理重复 shuffle push 的判定顺序}]
+on ShufflePushRequest(req):
+  if req.route_epoch is stale:
+      reject StaleRoute
+  if manifest already accepted another attempt for req.logical_map_task:
+      reject SupersededAttempt
+  if idempotency_key was already stored:
+      return previous result
+  validate checksum and write temp block
+  record idempotency_key before replying success
+\end{lstlisting}
+
+这段伪代码说明：传输层保证不了业务 exactly-once；业务层必须让重复和迟到成为正常输入。这个原则和第 15 章 completion、第 17 章 fencing、manifest commit 是同一条线。
+
 \section{端到端执行账本：三 split、两 worker、一个 Driver}
 
 把抽象对象放到一次具体运行里。输入被切成三个 split：\code{S0}、\code{S1}、\code{S2}。Driver 维护 task table；两个 worker 执行 map/combine/write；MessageBus 模拟远端消息；manifest 是唯一提交入口。故障规则固定为三条：\code{S1} 的第一次写出发生短写；\code{S2} 的第一次成功 reply 被丢弃；Driver 在接受 \code{S0} manifest 后崩溃并重启。

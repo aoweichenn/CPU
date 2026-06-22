@@ -413,6 +413,92 @@ consumer:
 \end{enumerate}
 能用反例句解释的内存序，才是可维护的内存序。否则，项目应退回锁版 reference 或把状态机拆窄。
 
+\section{证明工具：happens-before 图和线性化点}
+
+原子代码不能靠“看起来没问题”通过审查。最小证明要有两张图：一张 happens-before 图，说明普通数据怎样通过同步边被看见；一张线性化点图，说明并发操作在什么瞬间对外生效。前者防止读到未发布数据，后者防止两个线程都以为自己完成了同一件事。若代码无法画出这两张图，通常说明协议还没写清。
+
+\topic{Happens-before 图从普通字段开始}
+画图时先标普通字段，而不是先标 atomic。假设 producer 构造 \code{payload}，然后 release 存 \code{ready=1}；consumer acquire 读到 \code{ready=1} 后读取 \code{payload}。图中有三类边：线程内顺序边、同步边、由同步推出的 happens-before 边。
+
+\begin{lstlisting}[numbers=none,caption={message passing 的 happens-before 图}]
+producer thread:
+  A: payload.value = 42
+  B: ready.store(1, release)
+
+consumer thread:
+  C: r = ready.load(acquire)   // reads value written by B
+  D: use(payload.value)
+
+edges:
+  A sequenced-before B
+  B synchronizes-with C
+  C sequenced-before D
+
+conclusion:
+  A happens-before D
+\end{lstlisting}
+
+这张图同时说明两个边界。若 C 没有读到 B 写的值，就没有这条同步边；若 \code{payload} 在 B 之后又被无同步修改，A 到 D 的结论不能保护后续修改。Happens-before 图必须绑定具体值和具体状态转换，不能只写“这里用了 acquire”。
+
+\topic{线性化点回答操作何时生效}
+线性化点是一个并发操作在逻辑上生效的瞬间。对 mutex 保护的队列，\code{push} 的线性化点通常在锁内状态更新完成；对 CAS 状态机，成功 CAS 往往就是责任转移点；对 completion，manifest append 成功才是业务提交点。线性化点不是性能术语，而是正确性合同。
+
+\begin{lstlisting}[numbers=none,caption={TaskCompletion 的线性化点账本}]
+state Pending:
+  no result is visible
+
+complete(result):
+  prepare result object
+  CAS state Pending -> Completing
+    linearization point for winning producer
+  publish result pointer
+  store state Completed with release
+  wake waiters
+
+wait():
+  acquire state Completed
+  read result pointer
+\end{lstlisting}
+
+这份账本能抓住常见 bug。若 CAS 成功前就把 result 暴露给其他线程，失败线程可能看到半成品；若 CAS 成功后构造 result 可能抛异常，状态就进入无人能修复的中间态；若 wake 发生在发布前，等待者可能醒来却读不到结果。线性化点要求状态转换和副作用顺序都能解释。
+
+\topic{失败路径也要画出来}
+CAS 循环的失败路径不是空白。失败 load 读到了赢家写出的状态，它可能需要 acquire 才能看到赢家发布的数据；也可能只需要知道“我输了”，不读任何普通字段，此时 relaxed 或 weaker failure order 可能足够。失败路径是否获取数据，要写成协议。
+
+\begin{lstlisting}[numbers=none,caption={CAS 失败路径的两种语义}]
+case 1: failure only retries
+  compare_exchange_weak(..., success=acq_rel, failure=relaxed)
+  failed thread reads no data published by winner
+
+case 2: failure returns winner result
+  compare_exchange_strong(..., success=release, failure=acquire)
+  failed thread reads state/result written by winner
+\end{lstlisting}
+
+错误经常出在第二种场景：失败线程看到状态不是 Pending，就直接读取 result；但 failure order 使用 relaxed，没有获取赢家发布的 result。审查时要强制回答：“CAS 失败后会不会读赢家发布的数据？”答案决定失败内存序。
+
+\topic{Litmus test 是小模型，不是压力测试}
+压力测试能发现一些 bug，但不能证明没有 bug。Litmus test 用极小程序枚举允许结果，帮助判断协议是否依赖偶然硬件强度。Store buffering、message passing、IRIW、Dekker 这类小模型应该保留在项目测试或文档里。它们的价值是把“这台机器没复现”转换成“这个结果在模型上是否允许”。
+
+\begin{lstlisting}[numbers=none,caption={并发协议审查的最小证明包}]
+AtomicProtocolNote:
+  state variables
+  ordinary data protected or published
+  linearization point for each operation
+  happens-before graph for publication
+  CAS failure semantics
+  object lifetime owner
+  wait/wake condition
+  litmus tests that would fail if order is weakened
+\end{lstlisting}
+
+这份证明包比“所有原子都用 seq-cst”更有用。Seq-cst 可以减少某些跨变量顺序风险，但不能自动保护生命周期、ABA、等待谓词或对象回收。证明包迫使代码说明每个普通字段由谁发布、每个状态由谁推进、每个等待者靠什么醒来。
+
+\topic{TSAN 和模型证明的边界}
+ThreadSanitizer 能发现许多普通数据竞争，但它不会证明协议正确。一个全由 atomic 组成的错误状态机可能没有数据竞争，却仍然会丢任务、重复提交或读到已回收对象。反过来，某些低层无锁结构可能使用 TSAN 难以理解的同步模式，需要额外注解或专门测试。工具是证据，不是证明本身。
+
+成熟流程可以分层：锁版 reference 用普通单元测试保证语义；原子版用 TSAN 压力测试找显性数据竞争；litmus test 和小状态枚举检查内存序；线性化点审查检查责任转移；生命周期测试检查对象回收。缺一层，报告就要写明未验证边界。
+
 \section{从锁到原子的迁移步骤}
 
 原子协议最危险的写法，是直接把锁版代码里的字段逐个替换成 \code{std::atomic}。锁版临界区通常保护的是多字段不变量，而原子操作一次只线性化一个对象或一个窄状态转换。迁移必须先把状态机拆成可以独立证明的小协议，再决定每个协议的线性化点和内存序。

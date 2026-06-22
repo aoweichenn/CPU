@@ -728,6 +728,61 @@ read slot[index] after successful claim
 \topic{无锁 deque 的性能报告要看偷取率}
 如果本地 pop 占绝大多数，deque 的热路径主要是 owner 私有 tail 和本地数组，性能很好；如果任务粒度太小、负载分布很不均或 worker 频繁空转，steal 尝试会增加，head CAS、随机远端访问和失败重试会进入成本。报告不能只写吞吐，还要写 local pops、steal attempts、steal successes、failed CAS、empty steals、平均任务耗时和 worker idle 时间。没有这些字段，就无法判断瓶颈是任务太小、负载不均、deque 协议争用，还是任务本身慢。
 
+\topic{窃取成功不一定是好消息}
+Steal success 高通常说明负载不均被修复，但它也可能说明任务粒度太小、本地队列长期放不住工作、父任务不断制造跨 worker 迁移，或者 NUMA 本地性被牺牲。一个任务被偷走后，它携带的不只是函数指针，还携带输入 split、partial buffer、字典页、错误摘要和后续提交身份。若这些数据仍在 owner 所在 CPU 或 NUMA 节点附近，thief 执行会把第 3、4 章的地址路径拉远。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.35\linewidth}p{0.32\linewidth}@{}}
+\toprule
+观测形状 & 可能解释 & 下一步实验 \\
+\midrule
+idle 高，steal success 低 & 任务分布不可偷、victim 选择差或 park 太早 & 增加任务切分、改变 victim 策略、检查 ready 发布 \\
+idle 低，steal success 高，p99 升高 & 窃取减少空闲但破坏本地性或粒度过小 & 记录 stolen task 数据节点，增大粒度或 NUMA 分组 \\
+steal attempts 高，CAS 失败高 & head 热点竞争，任务太细或 thief 太多 & 限制偷取频率、批量偷取、调整 park/backoff \\
+local pops 高，makespan 仍高 & 关键路径或长任务主导 & 拆长任务、改 DAG 依赖，不继续调 deque \\
+global inject 队列长期高 & 外部提交超过本地吸收能力 & 分片 inject queue、背压或直接投递到目标 worker \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此，work stealing 报告要同时写调度和地址事实：任务从哪个 worker 生成，被谁执行，输入 split 在哪个 NUMA 节点，partial buffer 谁写，执行前 ready 等了多久，执行后是否触发远端合并。只有调度事实没有地址事实，会把远端访存误判成“任务本身慢”；只有地址事实没有调度事实，又会看不见 worker 空闲和窃取失败。
+
+\topic{数组扩容和悬空引用边界}
+固定容量 deque 可以把任务槽位的生命周期绑定到 runtime；可扩容 deque 则要处理数组替换。Owner 可能发现本地 deque 满了，分配新数组，复制旧槽位，发布新数组指针；同时某个 thief 可能已经读取旧数组指针并准备 steal。若旧数组立即释放，thief 会读悬空内存。这个问题和第 12 章的节点回收同构，只是节点变成了任务数组。
+
+第一版运行时可以主动避开这个复杂度：每个 worker 使用固定容量 deque，满时把任务推入全局 inject 队列，或者向上游返回背压。这样做牺牲一部分峰值性能，却让测试集中在任务图、ready count、失败传播和关闭。等 trace 显示固定容量溢出频繁且成为瓶颈，再评估扩容、分段数组、延迟释放或成熟 deque 实现。
+
+\begin{lstlisting}[numbers=none,caption={第一版 work stealing 的容量合同}]
+local deque:
+  fixed capacity per worker
+  owner push may fail when local deque is full
+
+overflow policy:
+  push to global inject queue
+  or reject submit with backpressure
+  or split less aggressively in the parent task
+
+reclamation:
+  task slot storage lives until runtime shutdown
+  no old deque array is freed while workers are running
+\end{lstlisting}
+
+\topic{批量偷取和公平性}
+一次偷一个任务的开销在任务很小的时候会很高。批量偷取可以把多个旧任务搬到 thief 本地 deque，减少 head CAS 和 victim 选择成本，也能让 thief 后续执行本地 LIFO。代价是 owner 可能被偷走太多剩余工作，局部性和公平性受影响；若被偷的是同一 NUMA 节点的大量数据，跨节点流量会放大。批量大小应由任务粒度、steal 成功率、idle 时间和 NUMA 证据决定，不应写死成“越大越好”。
+
+\begin{lstlisting}[numbers=none,caption={批量偷取的判读字段}]
+steal_batch_size
+stolen_tasks_per_batch
+stolen_task_run_ns_median
+victim_remaining_depth_after_steal
+cross_numa_steal_count
+owner_idle_after_being_stolen
+thief_local_pops_after_batch
+\end{lstlisting}
+
+若批量偷取后 thief 很快消化本地任务、owner 没有长期空闲、cross NUMA steal 不高，说明批量有价值；若 owner 被偷空而 thief 又处理远端数据变慢，批量策略应收窄或按 NUMA 分组。调度策略需要证据驱动，不能靠单个吞吐数字决定。
+
 \topic{任务粒度决定调度是否值得}
 任务太小，提交、入队、出队、唤醒、trace 和 ready count 成本会吃掉计算；任务太大，最后少数长任务拖住整个 stage，work stealing 也救不了已经不可拆的长尾。一个实用经验是：任务数量要明显多于 worker 数，每个任务又要有足够计算量，使调度固定成本只占小比例。
 

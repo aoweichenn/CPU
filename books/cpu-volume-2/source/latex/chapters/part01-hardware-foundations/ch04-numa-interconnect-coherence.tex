@@ -558,6 +558,128 @@ checksum, unavailable_metrics
 
 \code{p95_task_time} 和 \code{max_partition_time} 用来观察长尾。NUMA 和互连问题常常不是平均慢，而是某些远端任务、热点 shard 或跨节点合并特别慢。平均值会掩盖这些尾部。
 
+\section{完整案例：一条 cache line 从本地写到跨 socket 争用}
+
+把一致性、互连和 NUMA 讲清，最有效的办法是只跟踪一条 cache line。假设日志系统有一个 \code{GlobalStats}，其中 \code{accepted}、\code{rejected}、\code{bytes} 和 \code{slow_path} 四个计数器相邻。worker 0 主要更新 \code{accepted}，worker 1 主要更新 \code{rejected}，worker 2 更新 \code{bytes}，worker 3 更新 \code{slow_path}。源码层面看，四个线程写四个不同变量；硬件层面看，它们可能写同一条 cache line。
+
+\begin{lstlisting}[language=C++,caption={软件不同变量可能落在同一条 cache line}]
+struct GlobalStats {
+  std::atomic<std::uint64_t> accepted;
+  std::atomic<std::uint64_t> rejected;
+  std::atomic<std::uint64_t> bytes;
+  std::atomic<std::uint64_t> slow_path;
+};
+\end{lstlisting}
+
+若这些字段同处一条 64 字节 line，worker 0 的 \code{accepted.fetch_add} 要拿写权限；worker 1 的 \code{rejected.fetch_add} 随后也要拿同一条 line 的写权限；worker 2 和 worker 3 继续重复这件事。变量没有共享，line 共享了。这个案例比单一全局计数器更隐蔽，因为代码审查时很容易认为“每个线程写自己的字段”已经足够。
+
+\topic{第一阶段：单 socket 内的所有权迁移}
+在单 socket 内，写权限请求通常通过共享缓存、目录或窥探结构找到当前拥有者。一次写可以抽象成下面的消息链：
+
+\begin{lstlisting}[numbers=none,caption={单 socket false sharing 的消息账本}]
+worker 0 writes accepted:
+  request ownership of line L
+  invalidate other cached copies of L
+  update accepted inside L
+
+worker 1 writes rejected:
+  request ownership of the same line L
+  worker 0's copy becomes invalid or supplies data
+  update rejected inside L
+
+worker 2 writes bytes:
+  request ownership of the same line L again
+  previous owner loses write permission
+\end{lstlisting}
+
+这里最重要的事实是：每次更新的算术很轻，但所有权迁移很重。若每条记录都更新一次统计，程序就把每条记录都变成一次互连协议动作。反汇编中可能只看到短短的 \instruction{lock add} 或 \instruction{lock xadd}，但这条指令背后的 line 状态在核心间来回移动。
+
+\topic{第二阶段：跨 socket 以后等待更长}
+若 worker 分布在两个 socket 上，同一条 line 的所有权可能跨 socket 链路迁移。跨 socket 通信通常比同 socket 更慢，也更容易挤占内存控制器和互连带宽。此时线程数增加不仅不能线性扩展，还可能让远端链路成为主路径。
+
+\begin{lstlisting}[numbers=none,caption={跨 socket 写热点的等待形状}]
+socket 0, core 3 owns line L in Modified state
+socket 1, core 9 wants to update another field in L
+
+core 9:
+  sends ownership request through socket interconnect
+  waits for current owner or directory response
+  receives newest line data or permission
+  performs the atomic update
+
+next update from socket 0 repeats the reverse trip
+\end{lstlisting}
+
+这解释了为什么“绑定线程”有时能改善结果，有时没有效果。若所有写者仍然争同一条 line，绑定只改变争用发生在哪里；若先把写路径分片，让每个 socket 写自己的 local stats，再按 socket 合并，绑定才有结构意义。位置策略必须和布局策略一起出现。
+
+\topic{第三阶段：按写者重排结构}
+修复不是把所有字段都 \code{alignas(64)}。修复要先问写者是谁、写频率多高、读取方什么时候读。若四个字段都被每个 worker 高频更新，应该做 per-worker 或 per-socket partial；若字段各有固定写者，可以按写者分组；若只是低频指标，保持紧凑可能更好。
+
+\begin{lstlisting}[language=C++,caption={按 worker 隔离高频统计，再按阶段合并}]
+struct alignas(64) WorkerStats {
+  std::uint64_t accepted = 0;
+  std::uint64_t rejected = 0;
+  std::uint64_t bytes = 0;
+  std::uint64_t slow_path = 0;
+};
+
+std::vector<WorkerStats> worker_stats(worker_count);
+
+void process_worker(std::uint32_t worker_id, BatchView batch) {
+  WorkerStats& local = worker_stats[worker_id];
+  for (RecordView record : batch) {
+    local.bytes += record.bytes;
+    if (record.valid) {
+      ++local.accepted;
+    } else {
+      ++local.rejected;
+      local.slow_path += record.needs_diagnostic;
+    }
+  }
+}
+\end{lstlisting}
+
+这段结构让热循环只写本 worker 的 line。合并阶段仍要读所有 partial，但合并是低频、顺序、可分层的。若在 NUMA 机器上，还可以把 \code{worker_stats} 按 socket 分配，先 socket 内合并，再跨 socket 合并。这样跨 socket 流量从“每条记录一次”降到“每阶段一次或每批一次”。
+
+\topic{第四阶段：把页面归属也写进账本}
+布局修复后还可能慢，因为 partial 数组的物理页归属不对。若主线程一次性初始化所有 \code{worker_stats}，页面可能集中在主线程所在节点；远端 worker 每次写自己的 partial，仍然是在写远端内存。更稳的策略是让每个 worker first-touch 自己的区域，或由 NUMA-aware allocator 按节点分配。
+
+\begin{lstlisting}[numbers=none,caption={NUMA 初始化和计算要匹配}]
+bad:
+  main thread allocates and writes all partial pages
+  worker threads on other sockets update remote pages
+
+better:
+  each worker initializes its own partial storage
+  computation runs on the same or nearby CPU set
+  merge stage records local and remote bytes separately
+\end{lstlisting}
+
+这里的“页面归属”来自第 3 章的缺页路径：第一次触碰页面时，内核选择物理页；第 4 章把这个物理页放置接到线程位置；后续并发章节再把这个位置接到调度和运行时。若报告只写 \code{std::vector<WorkerStats>}，没有写 first-touch 和 CPU 绑定，NUMA 结论不完整。
+
+\topic{第五阶段：实验字段}
+这个案例的报告不应只写“padding 后快了”。它至少要记录：
+
+\begin{lstlisting}[numbers=none,caption={一致性和 NUMA 案例报告字段}]
+stats.layout
+stats.bytes_per_worker_slot
+stats.cache_line_isolation
+stats.writer_count_per_line
+stats.updates_per_record
+stats.first_touch_policy
+stats.cpu_binding_policy
+stats.socket_count
+stats.local_merge_ns
+stats.cross_socket_merge_ns
+stats.remote_access_evidence
+stats.checksum
+\end{lstlisting}
+
+\code{remote_access_evidence} 可以来自平台计数器、NUMA 工具、页放置记录或替代证据；不能得到硬件计数时，也要写明不可用。关键是把结论落到可验证事实：更新频率下降了吗，写者是否真的分离到不同 line，页面是否贴近写者，跨 socket 合并是否被限制到低频阶段。
+
+\topic{第六阶段：什么时候不应该优化}
+如果统计只在每秒刷新一次，或者 worker 数很小，padding 和 per-worker partial 可能浪费内存并增加合并复杂度。如果字段需要频繁被监控线程读取，把每个 worker 的计数分散到许多页面，监控读取也会变重。成熟设计要允许不同等级：热路径使用 worker-local；低频控制面保持紧凑；导出指标时批量快照。所有权迁移是成本，结构复杂度也是成本，二者都要写进取舍。
+
 \section{C++ 接口怎样表达位置}
 
 C++ 标准库不直接暴露 NUMA 拓扑，但工程代码可以在接口层保留位置语义。线程池可以知道 worker 所属的逻辑组；任务可以带有 preferred group；内存池可以按组创建 arena；队列可以按 shard 或 node 分片；归约可以输出分层 partial。接口不需要一开始绑定某个 Linux API，但不能把任务看成完全无位置的函数。

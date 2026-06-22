@@ -723,6 +723,111 @@ can_use_native_backend(input):
 
 这些检查会带来固定成本，所以短输入可能走标量路径。把前置条件写成接口，比在注释里说“调用者保证”更容易维护，也能让测试强制覆盖 fallback。
 
+\section{ISA 现实：宽向量不是单调收益}
+
+SIMD 常被误解成“寄存器越宽越快”。真实机器上，向量宽度只是一个变量。宽向量会改变 load/store 带宽、执行端口、寄存器压力、前端代码体积、频率策略、尾部处理和平台覆盖范围。一个 AVX2 内核可能比标量快很多，也可能被内存带宽封顶；一个 AVX-512 内核可能让 mask 处理更自然，也可能因为频率和端口压力让端到端收益变小；一个 NEON 后端可能在移动设备上更合适，但 cache 和内存带宽预算完全不同。
+
+\topic{从寄存器宽度推导 lane 数}
+假设处理 32 位整数。128 位寄存器一次容纳 4 个 lane，256 位寄存器一次容纳 8 个 lane，512 位寄存器一次容纳 16 个 lane。lane 数增加后，主循环迭代次数减少；但每次迭代要搬运的字节更多，尾部可能更复杂，mask 提取和输出压缩也可能更贵。若内核每个元素只做一两次简单操作，lane 数增加很快把瓶颈推到 load/store。
+
+\begin{lstlisting}[numbers=none,caption={向量宽度推导的第一张账本}]
+element type: int32
+
+128-bit vector:
+  lanes = 4
+  bytes per load = 16
+
+256-bit vector:
+  lanes = 8
+  bytes per load = 32
+
+512-bit vector:
+  lanes = 16
+  bytes per load = 64
+
+question:
+  does the kernel wait for arithmetic, load/store, shuffle, or memory?
+\end{lstlisting}
+
+因此平台分派不能只按“支持最宽 ISA”选择。更稳的策略是按内核类型、输入长度、数据布局和机器特征选择 backend：小输入走标量；中等输入走低开销向量；长输入且计算密度足够时才启用更宽 backend；随机访问或 gather 密集内核优先改布局。
+
+\topic{AVX 降频和阶段收益}
+某些平台执行宽向量指令时可能降低核心频率，或者让同一核心上的其他线程受影响。频率策略随架构和指令类型变化，软件不能假定所有机器一样。报告不必夸大这个问题，但必须把它纳入证据：如果 AVX-512 版本每条输入指令更少，耗时却没有下降，要检查频率、端口、内存和阶段占比。
+
+\begin{lstlisting}[numbers=none,caption={宽向量收益审计字段}]
+backend
+vector_width_bits
+input_bytes
+stage_percent_before
+stage_percent_after
+cycles_per_byte
+instructions_per_byte
+bytes_per_second
+frequency_observed_if_available
+tail_policy
+fallback_count
+\end{lstlisting}
+
+若无法读取频率，也不能直接断言降频。可以写“frequency evidence unavailable”，再用指令数、周期、带宽和阶段占比判断。性能工程要区分证据和推测。
+
+\topic{gather 和 scatter 不是随机访问解药}
+Gather 把多个地址的 load 放进一条向量指令语义里；scatter 把多个地址的 store 放进一条向量指令语义里。它们简化了代码形状，却不会把随机地址变成连续地址。若每个 lane 指向不同 cache line，硬件仍要等待多个独立地址；若每个 lane 指向不同页面，TLB 压力仍存在；若 scatter 写到共享 line，还会碰到一致性所有权。
+
+\begin{lstlisting}[numbers=none,caption={gather 账本必须回到地址序列}]
+for vector lanes:
+  lane 0 loads base[index0]
+  lane 1 loads base[index1]
+  lane 2 loads base[index2]
+  ...
+
+if indices are random:
+  line utilization may be low
+  prefetch may be weak
+  TLB coverage may dominate
+  gather instruction does not remove these costs
+\end{lstlisting}
+
+这就是为什么第 6 章的数据布局优先于第 7 章的指令技巧。连续热列让普通 vector load 足够有效；对象图或随机索引即使用 gather，也可能只是把等待包装成更复杂的指令。
+
+\topic{shuffle、permute 和 compress 的真实成本}
+很多非平凡 SIMD 内核不只是加减乘除，还要重排 lane。字节分类可能需要 \code{movemask}；stable filter 可能需要 compress 或查表压缩；UTF-8 检查可能需要跨 lane 移位；解析器可能需要把 mask 位转换成位置列表。这些动作消耗执行端口、常量表、寄存器和前端指令。若一个内核的 shuffle 成本接近或超过算术成本，继续扩大向量宽度未必有效。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.33\linewidth}p{0.31\linewidth}@{}}
+\toprule
+动作 & 购买的能力 & 常见风险 \\
+\midrule
+wide load/store & 一次搬运更多连续元素 & 内存带宽、对齐、尾部 \\
+movemask & 把 lane 判断变成位图 & mask 枚举、位置恢复成本 \\
+shuffle/permute & 重排 lane 或字节 & 端口压力、常量和寄存器压力 \\
+compress & 把保留元素压紧输出 & 平台差异、输出位置合同 \\
+gather/scatter & 表达多地址访问 & 随机地址等待仍在 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{一个后端选择矩阵}
+向量 backend 应像运行时策略一样可观测，而不是散在条件编译里。一个实用矩阵可以这样写：
+
+\begin{lstlisting}[numbers=none,caption={SIMD backend 选择矩阵}]
+if input length < short_threshold:
+  use scalar
+else if contract requires exact ordered output and compress is unavailable:
+  use scalar or two-pass count/scan/write
+else if addresses are contiguous and backend feature is available:
+  use native vector backend
+else if compiler auto-vectorized loop passes disassembly audit:
+  use auto-vectorized backend
+else:
+  use scalar reference
+\end{lstlisting}
+
+这个矩阵把性能前提和语义前提写在一起。它允许快路径拒绝不合格输入，也允许后续添加平台 backend。默认路径不应因为支持某个 ISA 就无条件进入 native backend；默认路径应该选择当前输入和合同下最可靠的实现。
+
+\topic{从 ISA 到项目报告}
+最终报告要能回答四个问题。第一，这次运行实际选择了哪个 backend。第二，选择理由是什么：长度、特性、对齐、合同、fallback。第三，主循环机器形状是否符合预期：连续 load、mask、tail、无意外调用。第四，端到端瓶颈是否真的在这个内核。若这四个问题没有答案，SIMD 代码仍是实验片段，不应成为系统默认路径。
+
 \section{上线审查：向量内核怎样进入默认路径}
 
 向量内核从实验代码进入默认路径之前，必须经过一组固定审查。审查不是为了拖慢优化，而是为了防止一个只在理想输入上很快的内核破坏边界输入、短输入、错误报告、跨平台回退和数值语义。SIMD 代码一旦散入业务层，后续修复成本很高；因此默认路径应只接受语义合同、平台前提和证据链都完整的内核。

@@ -402,6 +402,88 @@ input_split_numa_node
 \topic{移动大小核的特殊边界}
 手机或 ARM big.LITTLE 设备上，核心性能不等价，频率会随温度和电源状态变化。线程数等于核心数并不等于拥有同等执行预算。短时间 benchmark 可能在大核上获得高峰值，长时间运行后因温控降频而变慢。Termux 环境还可能缺少设置 affinity 的权限。报告应记录设备型号、电源状态、温度趋势、可见 CPU 和绑定是否成功；无法验证的结论要标注。
 
+\section{线程迁移的硬件后果：从 run queue 到 cache 热度}
+
+调度器迁移线程时，用户态看到的只是同一个 worker 继续执行任务；硬件看到的却是另一组近端状态。寄存器可以由内核保存和恢复，栈地址也仍然有效，但 L1D、L1I、L2、TLB、分支历史、uop cache 和 NUMA 本地性不一定跟随迁移。若两个 CPU 共享 LLC，部分数据可能仍在共享缓存；若跨 NUMA 节点，访问路径可能变成远端；若迁移到 SMT sibling，前端和执行端口会和另一个线程共享。线程调度因此不是单纯的队列问题，它会改变第 2、3、4 章讲过的硬件路径。
+
+迁移不是绝对错误。调度器用迁移平衡负载、避开空闲、响应优先级和处理系统其他工作。工程问题是：当前 workload 是否依赖短期局部性，迁移是否频繁到足以破坏它，绑定是否会让负载均衡更差。亲和性要从这三个问题推出，而不是从“绑定更专业”推出。
+
+\begin{lstlisting}[numbers=none,caption={一次 worker 迁移后的状态账本}]
+before migration:
+  worker_id = 3
+  cpu = 7
+  hot input range = split 42
+  local partial buffer recently written
+  parser code and data lines warm near cpu 7
+
+after migration:
+  worker_id = 3
+  cpu = 14
+  registers restored
+  stack virtual addresses unchanged
+  L1/L2/TLB/branch history near cpu 14 may be cold
+  local partial pages may be remote if first-touched near cpu 7 node
+\end{lstlisting}
+
+\topic{迁移成本取决于共享层级}
+从 CPU 7 迁移到同一物理核心的 SMT sibling、同一 L2 的另一个逻辑 CPU、同一 LLC 的另一个核心、另一个 NUMA 节点，成本不同。共享层级越近，热数据越可能仍在较近位置；越远，越可能重新填充 cache、重新建立 TLB 热度或访问远端内存。拓扑报告中的 \code{l1_l2_l3_sharing} 不是装饰字段，它决定迁移事件怎样解释。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.25\linewidth}p{0.34\linewidth}p{0.30\linewidth}@{}}
+\toprule
+迁移范围 & 可能保留的状态 & 主要风险 \\
+\midrule
+同 SMT sibling & 部分核心前端和缓存层级共享 & 执行端口和前端资源互抢 \\
+同 L2/L3 范围 & 部分数据仍在共享缓存 & L1、TLB 和分支状态重建 \\
+跨 LLC 范围 & 虚拟地址仍有效，数据可能在远处 & cache 重新填充，更多互连流量 \\
+跨 NUMA 节点 & 任务身份仍在，页面可能远端 & 远端内存、互连等待、first-touch 失配 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{把迁移写进任务 timeline}
+只记录 worker 状态不够，还要记录 worker 在哪个 CPU 上运行。若同一任务从 start 到 finish 中间跨多个 CPU，可以把 CPU 变化写成采样字段或事件。若无法低成本记录每次迁移，至少记录任务开始和结束 CPU、worker 的 migration 计数、最后 CPU 和阶段耗时。这样，p99 变慢时能判断它是否集中在迁移、远端访问或 page fault 上。
+
+\begin{lstlisting}[numbers=none,caption={迁移相关 trace 字段}]
+task_id
+worker_id
+start_cpu
+finish_cpu
+migration_count_delta
+numa_node_hint
+input_split_id
+partial_buffer_node
+ready_wait_ns
+run_ns
+blocked_ns
+\end{lstlisting}
+
+这些字段能回答一类常见事故：worker 没有明显阻塞，ready 队列也不长，但某些任务运行时间显著变长。如果慢任务同时有跨节点迁移、远端 partial buffer 或 page fault 增长，就应检查数据放置和调度；如果慢任务没有迁移，问题可能在输入倾斜、锁、I/O 或算法长尾。
+
+\topic{绑定策略要和回退一起提交}
+绑定线程属于强假设。它假设固定位置带来的局部性收益超过调度器失去自由度的成本。任何绑定策略都应有回退：关闭 affinity、按物理核心绑定、按 NUMA 节点分组、不绑定但按 split 保持软本地性。报告必须比较默认调度和绑定策略，而不是只展示绑定后的最好样本。
+
+\begin{lstlisting}[numbers=none,caption={亲和性实验的对照顺序}]
+baseline:
+  no affinity
+  record migrations, run_ns, ready_wait_ns, checksum
+
+soft locality:
+  keep split and partial buffer near the same worker when possible
+  allow migration and stealing
+
+core binding:
+  bind workers to physical cores
+  avoid SMT siblings for heavy compute when evidence supports it
+
+numa binding:
+  first-touch worker-owned pages on the target node
+  prefer local work, allow bounded cross-node stealing
+\end{lstlisting}
+
+如果 no affinity 已经稳定，绑定只降低调度器自由度，就不应引入。若 NUMA binding 提升热点输入却让倾斜输入尾延迟变差，可能需要软本地性加 work stealing，而不是硬绑定所有任务。亲和性不是目标，稳定吞吐、低尾延迟和可恢复性才是目标。
+
 \section{可观测性：WorkerSnapshot 和 ThreadTimeline}
 
 没有状态记录，线程池问题只能靠猜。Compute Systems Engine 从这里开始加入 worker 级观测。观测不是为了做监控界面，而是为了把“CPU 低”“吞吐差”“尾延迟高”拆成排队、运行、阻塞、迁移、队列满、关闭等待和异常路径。

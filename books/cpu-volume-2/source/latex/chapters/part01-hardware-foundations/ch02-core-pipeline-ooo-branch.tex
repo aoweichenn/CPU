@@ -473,6 +473,92 @@ while (core_is_running) {
 
 这段伪代码不是某一款 CPU 的真实实现。真实硬件会并行、预测、回滚、预取、对齐、融合指令、处理异常，还会按厂商和代际变化。伪代码保留的是因果关系：下一条 PC 必须提前预测；取指地址必须能翻译并通过执行权限检查；指令字节必须从 I-cache 或下层层级到达；译码或微操作缓存必须提供后端能使用的工作单元。I-cache、ITLB、BTB 和 uop cache 不是四个并列名词，而是同一条供给链上的四个压力点。
 
+\section{完整账本：一条热循环迭代怎样变成可退休结果}
+
+把前端、译码、乱序和退休分开讲，是为了降低复杂度；真正的核心在每个周期里同时推进许多半成品。要理解一个优化为什么有效，必须能把一轮循环从 PC、指令字节、微操作、寄存器重命名、调度、执行、写回和退休串成一条账本。否则很容易把局部现象误判成全局瓶颈：分支少了但端口仍满，指令少了但 load 等待仍长，循环展开了但前端供给被代码体积拖住。
+
+仍以解析器热循环为例。源码上看，一轮迭代读取一个字节、分类、更新状态和计数。硬件账本要拆得更细：取指路径先猜下一条 PC，I-cache 和 uop cache 尝试供给微操作；重命名阶段把架构寄存器映射到物理寄存器，消除名字冲突；调度器等待操作数和执行端口；load 进入地址生成、DTLB 和 L1D；分支在执行后验证预测；最后退休逻辑按程序顺序提交结果。这里每个阶段都能等待，也都能回滚。
+
+\begin{lstlisting}[numbers=none,caption={一轮热循环迭代的硬件账本}]
+frontend:
+  predict loop-back and internal branches
+  fetch instruction bytes through ITLB and I-cache
+  supply micro-ops from uop cache or decoders
+
+rename and allocate:
+  assign physical registers for temporary values
+  allocate ROB entries, load queue entries, store queue entries
+  keep precise exception and rollback metadata
+
+execute:
+  compute byte address
+  translate through DTLB
+  load input byte from L1D or lower cache
+  classify byte with branch or table lookup
+  update parser state, counters and error summary
+
+resolve:
+  verify branch prediction
+  forward store data when possible
+  wake dependent micro-ops
+
+retire:
+  commit completed micro-ops in program order
+  expose architectural state
+  handle exception or misprediction rollback precisely
+\end{lstlisting}
+
+这张账本有一个重要含义：优化不能只盯源码动作。把 \code{if} 改成查表，确实减少某些方向分支，却增加一次数据 load、一个地址生成、一个表所在 cache line 和可能的寄存器压力；展开循环确实减少回边分支，也让一轮占用更多 ROB、寄存器和前端字节；把错误对象构造移出热路径，既减少前端足迹，也减少分配器和写入路径进入热循环的机会。每个改写都必须说明它购买了哪一段硬件账本，付出了哪一段成本。
+
+\topic{ROB 保存的是尚未提交的未来}
+乱序执行让后面的独立工作先做，但不能让程序对外表现成乱序。核心需要一个结构保存已经发射、可能已经执行、但还没有按程序顺序提交的操作。这个结构通常用 reorder buffer 的概念描述。它记录每个微操作的完成状态、目标寄存器、异常信息和回滚边界。分支预测错时，预测路径之后的条目被丢弃；异常发生时，核心能把异常报告到精确的程序点；store 也要等到安全时刻再真正对外可见。
+
+ROB 的容量是隐藏延迟的预算。连续数组求和中，核心可以让许多独立 load 同时在路上；指针追踪中，下一地址依赖当前 load 返回，ROB 再大也难以制造足够独立请求。解析器如果每个字符都依赖上一状态，状态依赖会限制乱序窗口；若把输入分成块、先做结构字符候选扫描，再做少量确认，硬件能看到更长、更规则的独立工作。
+
+\topic{重命名解决名字，不解决数据事实}
+第一卷里看到的 \register{rax}、\register{rcx} 是架构寄存器名。硬件内部有更多物理寄存器，重命名把同一个架构名在不同时间的值映射到不同物理位置，避免假依赖。例如两个独立累加器都写 \register{rax} 的源码形态会被编译器或硬件变成不同物理寄存器上的工作，使它们可以重叠执行。
+
+但是重命名不能消除真实依赖。若第二条指令必须使用第一条 load 得到的地址，硬件只能等；若 store 的地址可能和后面的 load 重叠，内存消歧预测错误后需要回滚；若一个原子读改写写必须拿到 cache line 独占权，寄存器再多也不能让所有核心同时修改同一条 line。把名字依赖、地址依赖和一致性依赖分清，是分析热循环的起点。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.33\linewidth}p{0.34\linewidth}@{}}
+\toprule
+等待来源 & 账本中的位置 & 典型修复方向 \\
+\midrule
+前端供给不足 & PC、ITLB、I-cache、uop cache、译码 & 冷热路径分离、缩小热循环、稳定分支目标 \\
+真实数据依赖 & 调度器等待操作数 & 多累加器、分块、改变算法数据流 \\
+地址依赖 & 地址生成、load queue、DTLB & 连续布局、索引数组、减少指针追踪 \\
+端口拥挤 & 执行端口、load/store 端口、AGU & 减少内存操作、调整展开、拆冷热字段 \\
+一致性等待 & store buffer、原子、cache line 所有权 & 分片、thread-local partial、padding、批量合并 \\
+退休受阻 & ROB 头部未完成或异常等待 & 缩短长延迟链、减少缺页和异常路径进入热循环 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{从汇编反推硬件账本}
+反汇编给出的是账本入口，不是账本终点。看到 \instruction{cmp} 和 \instruction{jcc}，要继续问分支方向是否随输入随机；看到 \instruction{mov} 内存操作数，要继续问地址是否连续、是否跨 cache line、是否跨页；看到 \instruction{lock xadd} 或 \instruction{lock cmpxchg}，要继续问 cache line 独占权在哪里迁移；看到函数调用，要继续问调用目标是否稳定、能否内联、是否把冷路径拉进热代码。
+
+\begin{lstlisting}[numbers=none,caption={从几类汇编形状追问硬件事实}]
+cmp/jcc:
+  is the direction predictable for each input family?
+  does misprediction flush useful work?
+
+mov [base + index * scale]:
+  is the address stream sequential, strided, random or dependent?
+  how many useful bytes does each cache line provide?
+
+call or indirect jump:
+  is the target stable enough for BTB and inlining?
+  does it cross many code pages or pull cold code into the hot path?
+
+lock cmpxchg:
+  which cache line becomes exclusive?
+  how many cores are trying to modify it?
+\end{lstlisting}
+
+这种追问把“看汇编”从背指令变成工程证据。汇编证明代码形状，硬件账本解释等待位置，输入矩阵验证等待是否随数据分布变化。三者合起来，优化才不会停在猜测。
+
 \section{把前端问题落到热循环}
 
 日志解析器的热循环提供了一个完整例子。固定格式日志中，字段位置稳定，分隔符出现规律，循环回边和几个常见分支容易预测；机器码足迹小，错误路径很少执行，I-cache 和 uop cache 可以稳定服务。换成用户自定义字段后，字符类别分布更接近随机，分支方向难预测；如果错误检查和格式化仍在内层循环，冷路径机器码被拖进热取指区域；若每个字段类型用虚函数处理，还会出现间接分支和难以内联的小调用。此时“同样是扫描字节”这句话掩盖了机器看到的差异：预测历史变差、目标地址变多、热代码足迹变大、译码任务变复杂。

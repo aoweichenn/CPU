@@ -139,6 +139,46 @@ void count_worker(std::span<const std::int32_t> values,
 \end{tabular}
 \end{center}
 
+\topic{合并树是并行算法的提交顺序}
+Reduce 常被写成“局部算完再合并”，但合并不是附属步骤。它决定哪些 partial 被接受、按什么顺序组合、是否能并行、失败后从哪里恢复。对整数计数，线性和树形通常给出同样数值；对浮点、top-k、字符串拼接、诊断摘要和近似 sketch，合并顺序可能改变结果。即使操作满足结合律，工程系统仍要固定合并树，因为报告、checksum、重放和性能分析都依赖稳定结构。
+
+\begin{lstlisting}[numbers=none,caption={8 个 partial 的固定树形合并}]
+level 0:
+  p0 p1 p2 p3 p4 p5 p6 p7
+
+level 1:
+  m01 = combine(p0, p1)
+  m23 = combine(p2, p3)
+  m45 = combine(p4, p5)
+  m67 = combine(p6, p7)
+
+level 2:
+  m03 = combine(m01, m23)
+  m47 = combine(m45, m67)
+
+level 3:
+  result = combine(m03, m47)
+\end{lstlisting}
+
+这棵树购买了并行合并和较短关键路径，也带来临时对象、任务调度、cache 访问和错误处理。若 partial 很小，树形合并的任务开销可能超过收益；若 partial 很大，树形合并可以利用多个核心，但要关注内存带宽和 NUMA 放置；若 partial 是稀疏 map，合并顺序还会影响分配器、rehash 和峰值内存。合并树要进入报告，而不是藏在实现里。
+
+\topic{合并也有 cache 和 TLB 账本}
+把 64 个 worker 的 dense partial 表合并成一个全局表，表面上只是加法。硬件上可能是多次扫描大型数组。若每个 partial 表有 1 MiB，线性合并要反复读 partial、写 result；树形合并会产生中间表，读写总字节可能更多，但并行度更高；按 NUMA 分层合并可以先在节点内读取本地 partial，再跨节点合并较少结果。合并策略要用字节账本判断，而不是只用算法复杂度。
+
+\begin{lstlisting}[numbers=none,caption={partial 合并报告字段}]
+partial_count
+partial_bytes_each
+merge_tree_shape
+merge_levels
+temporary_merge_bytes
+merge_order_checksum
+numa_local_merge_bytes
+cross_numa_merge_bytes
+result_checksum
+\end{lstlisting}
+
+若 merge 时间超过局部计算时间，说明 partial 设计可能过大或合并树不合适。解决方向可能是压缩 partial、使用稀疏表示、提前 map-side combine、按 bucket 分区合并，或改变 key 编码。Reduce 的深度不在公式，而在这些字节和所有权边界。
+
 \topic{工业参照：per-cpu counter 和 map-side combine}
 Linux per-cpu counter 的核心思想，是高频写本 CPU 的局部状态，低频读取时再汇总。它牺牲了读取的即时一致性，换取写路径低争用。分布式计算中的 map-side combine 也是同一个思想：map worker 先本地聚合，把网络传输从“每条记录”降低到“每个本地 key 的 partial”。关键不在名字，而在取舍：写快了，读或合并更复杂；状态分散了，观测和恢复要更清楚。
 
