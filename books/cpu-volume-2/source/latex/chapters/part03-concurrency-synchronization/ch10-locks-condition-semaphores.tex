@@ -60,6 +60,33 @@ bounded queue invariant:
 \topic{锁的硬件路径：低竞争和高竞争不是一种东西}
 低竞争 mutex 常常只是一段很短的用户态原子状态转换：线程尝试把锁状态从 unlocked 改成 locked，成功后进入临界区；释放时把状态改回 unlocked。高竞争时，事情完全不同：多个核心反复读改写同一锁变量所在 cache line，失败线程可能自旋一段时间，然后进入内核等待队列；释放锁的线程还要唤醒等待者。于是同一个 \code{std::mutex} 在低竞争和高竞争下，成本模型完全不同。
 
+接上第一册的汇编读法，低竞争锁的快路径可以理解成“对一个锁字做原子状态转换”。不同 C++ 标准库、运行库、操作系统和架构实现不同，但机器形状常围绕 CAS、交换或带锁定语义的读改写写展开。例如一个抽象锁字从 0 表示 unlocked，1 表示 locked，快路径可能类似：
+
+\begin{lstlisting}[numbers=none,caption={mutex fast path 的典型汇编形状}]
+; rdi = address of lock word
+mov   eax, 1
+xor   ecx, ecx
+lock cmpxchg dword ptr [rdi], eax
+jne   .Lcontended
+; acquired
+\end{lstlisting}
+
+第一册可以解释这几条指令的局部语义：\instruction{cmpxchg} 比较 \register{eax} 与内存旧值，匹配时写入新值，不匹配时把旧值带回 \register{eax}；\instruction{jne} 根据 flags 进入竞争路径。这里继续向下看：带 \instruction{lock} 的 CAS 需要让锁字所在 cache line 进入可修改状态；若锁空闲且 line 已在本核心附近，成本很低；若许多核心同时抢锁，所有核心都围绕同一条 line 反复读改写写，失败路径还会污染互连和前端。锁的快路径短，不代表高竞争锁便宜。
+
+\begin{lstlisting}[numbers=none,caption={unlock 和等待路径的粗略机器形状}]
+unlock fast path:
+  store lock word = 0 with release semantics
+  if no waiter is recorded, return
+
+contended path:
+  mark lock as contended
+  spin or enter futex/runtime wait
+  sleep until unlock wakes a waiter
+  retry acquisition after scheduled
+\end{lstlisting}
+
+这段不是某个库的源码，而是成本地图。低竞争时，锁主要是一个原子状态转换；竞争出现后，问题扩展成 cache line 所有权、等待队列、系统调用、调度唤醒和重新抢锁。报告中看到 \instruction{lock cmpxchg} 或类似形状，只能说明存在原子快路径；是否慢，要看竞争率、持锁时间、等待路径和锁字共享范围。
+
 \begin{lstlisting}[numbers=none,caption={mutex 获取的粗粒度事件链}]
 fast path:
   atomic compare-exchange lock word from unlocked to locked

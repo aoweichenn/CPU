@@ -15,6 +15,31 @@
 \topic{原子读改写写的硬件路径}
 原子自增可以拆成三件事：读旧值、计算新值、把新值写回同一地址。普通单线程加法可以让这些动作在核心内部快速完成；多核心共享时，处理器还必须保证没有另一个核心同时改写同一位置。于是原子操作在执行前要让目标 line 进入可修改状态。若这条 line 当前在别的核心处于 Modified，当前核心要等待对方交出或写回最新数据；若多个核心都有 Shared 副本，当前核心要让这些副本失效。只有这些协议动作完成后，核心才能在本地执行加法并写回 cache line。
 
+接上第一册的汇编视角，\code{std::atomic<std::uint64_t>::fetch_add(1)} 在 x86-64 上常见的机器形状可能是带 \instruction{lock} 前缀的读改写写，例如：
+
+\begin{lstlisting}[numbers=none,caption={原子加法可能出现的汇编形状}]
+lock add qword ptr [rdi], 1
+
+; 或者需要旧值时：
+mov  eax, 1
+lock xadd qword ptr [rdi], rax
+\end{lstlisting}
+
+具体编译器、目标 ISA 和返回值需求会影响生成的指令。这里要抓住的是形状，而不是背某个固定助记符。没有 \instruction{lock} 的 \instruction{add qword ptr [rdi], 1} 已经是读旧值、加一、写回；加上原子语义后，硬件还必须保证其他核心不能同时对同一位置完成另一个不可分割修改。在现代缓存一致性机器上，这通常意味着目标 cache line 要进入当前核心的可写独占状态。若多个核心反复执行同一条 locked RMW，真正忙的是 line 所有权迁移和失效确认，不是整数加法器。
+
+\begin{lstlisting}[numbers=none,caption={从 locked RMW 读出 cache line 账本}]
+instruction:
+  lock add qword ptr [counter_address], 1
+
+line-level questions:
+  which cache line contains counter_address?
+  which core currently owns the line in Modified/Exclusive state?
+  which other cores hold Shared copies that must be invalidated?
+  how often does ownership move per input record?
+\end{lstlisting}
+
+这就是为什么反汇编报告不能只写“用了 atomic”。它要写原子对象所在字段、cache line 邻居、更新频率、写者数量和是否有局部化替代。若 \instruction{lock add} 每条记录出现一次，线程数增加后大概率会看到扩展性问题；若它只在阶段结束时出现一次，成本通常可以接受。
+
 \begin{lstlisting}[language=C++,caption={原子读改写写的抽象硬件流程}]
 void atomic_fetch_add_like(Address addr, Value delta) {
   CacheLine line = request_line_with_write_permission(addr);

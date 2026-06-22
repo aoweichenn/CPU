@@ -13,6 +13,40 @@
 \topic{从总线锁到缓存行所有权}
 早期处理器可以用锁总线的方式让某个读改写操作独占内存总线。现代多核机器不能把每次计数器递增都变成全系统停顿，于是原子读改写通常围绕 cache line 的独占所有权实现：核心必须先让包含目标原子对象的 cache line 进入可写独占状态，再执行读、修改、写这一组不可分割动作。其他核心若也要修改同一条线，就要通过一致性协议抢所有权。由此可以推出两个重要结论。第一，原子性有真实硬件代价，热点 atomic 会制造 cache line 所有权迁移。第二，原子性只覆盖目标对象所在的那次操作，不会自动把附近的普通对象变成同一个事务。
 
+\topic{C++ 原子和汇编不是简单一一对应}
+第一册读汇编时，可以把 \instruction{mov}、\instruction{cmp}、\instruction{lock xadd} 看作机器动作。本章还要加一层：C++ 内存序首先约束编译器和抽象机，然后再由编译器为目标 ISA 选择合适指令或屏障。x86-64 的普通 aligned load/store 已经有较强的硬件顺序，因此某些 acquire load 和 release store 在汇编上可能看起来只是普通 \instruction{mov}；ARM、POWER 等更弱内存模型机器可能需要带 acquire/release 语义的 load/store 或显式 barrier。不能因为某次 x86 反汇编没有看到 fence，就认为 acquire/release 没有意义；它仍然约束编译器，并提供可移植 C++ 同步语义。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.23\linewidth}p{0.30\linewidth}p{0.37\linewidth}@{}}
+\toprule
+C++ 操作 & x86-64 上常见形状 & 审查重点 \\
+\midrule
+relaxed load & \code{mov reg, [addr]} & 只读 atomic 自身，不发布其他数据 \\
+acquire load & 常也可能是 \code{mov reg, [addr]} & 是否读到对应 release 发布值 \\
+release store & 常也可能是 \code{mov [addr], reg} & 发布前普通写是否完整，读取方是否 acquire \\
+relaxed fetch\_add & \code{lock add/xadd [addr], reg} & 热点 line 迁移，是否需要分片 \\
+compare\_exchange & \code{lock cmpxchg [addr], reg} & 成功/失败内存序、失败路径和责任转移 \\
+seq-cst fence 或强序需求 & 可能出现 fence 或 locked op & 是否真的需要单一全局顺序 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不能当作编译器保证。它的作用是建立审查顺序：先用 C++ 语义判断同步边是否正确，再用反汇编确认编译器生成了预期形状，最后用性能证据判断硬件成本。把顺序反过来很危险：只因为看到 \instruction{mov} 就删掉 acquire，代码可能在别的架构上坏；只因为看到 \instruction{lock xadd} 就说原子一定慢，也可能忽略它在低频路径上完全可接受。
+
+\topic{CAS 汇编暴露了失败路径}
+CAS 的典型机器形状也能帮助审查协议：
+
+\begin{lstlisting}[numbers=none,caption={CAS 状态转换的典型汇编形状}]
+; eax holds expected old state
+; edx holds desired new state
+lock cmpxchg dword ptr [rdi], edx
+jne  .Lfailed
+; success path owns the transition
+\end{lstlisting}
+
+\instruction{cmpxchg} 失败时，机器会把观察到的旧内存值写回 \register{eax}。这和 C++ \code{compare_exchange} 失败后更新 \code{expected} 的语义对应。失败不是无信息的“没抢到”，而是“看到了别的状态”。若失败后要读取赢家发布的数据，失败内存序不能随意写成 relaxed；若失败后只重试，才可能更弱。汇编里的 \instruction{jne .Lfailed} 提醒我们：失败路径是协议的一半，不能只写成功路径。
+
 \topic{缓存一致性不是语言同步}
 缓存一致性协议通常以 cache line 为单位维护状态。某条线可以被多个核心共享读取；一旦某个核心要写，它必须让其他副本失效或通过目录协议取得独占权限。这个机制解决的是“同一地址最终不能同时存在两个互相矛盾的写事实”。它没有解决三件事：不同地址之间是否存在全局顺序，普通字段是否按源代码顺序对另一个线程可见，读取方拿到一个指针后对象是否仍然存活。也就是说，一致性给 atomic 的单对象修改提供硬件基础，但 C++ 仍需要用 happens-before 描述跨对象的同步关系。
 
