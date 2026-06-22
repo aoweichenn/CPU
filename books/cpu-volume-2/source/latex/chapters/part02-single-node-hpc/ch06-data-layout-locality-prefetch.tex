@@ -733,6 +733,151 @@ struct BatchView {
 
 这个结构还没有实现完整解析器，但它已经把第 3 章的地址账本落到了接口上。聚合函数接收 \code{BatchView} 后，反汇编中应出现对 \code{event_ids[i]} 和 \code{values[i]} 的连续 load，而不是对 \code{LogRecord} 指针和字符串的追踪。若反汇编与这个预期不一致，说明接口没有真正改变硬件路径。
 
+\section{完整迁移案例：从对象接口到 BatchView 内核}
+
+布局迁移最难的部分不是把字段拆成数组，而是把旧接口、语义合同、生命周期和热循环边界同时迁过去。旧代码通常从一个对象接口开始：
+
+\begin{lstlisting}[language=C++,caption={旧接口把完整对象带进热循环}]
+void aggregate(std::span<const LogRecord> records, Counts& counts) {
+  for (const LogRecord& record : records) {
+    if (!record.valid()) {
+      continue;
+    }
+    counts.add(record.event_name(), record.value());
+  }
+}
+\end{lstlisting}
+
+这段代码的问题不在函数名，而在接口形状。热循环拿到完整 \code{LogRecord}，于是字符串、错误状态、原始行、字段 offset、时间戳、调试标记都可能被带进同一个对象步长。即使当前只读 \code{event_name} 和 \code{value}，编译器也只能围绕对象布局生成地址；若 \code{event_name()} 返回字符串视图或触发字典查询，热循环还会追到冷表。接口已经把硬件路径锁住。
+
+\topic{第一阶段：引入 adapter，但保留 reference}
+第一步不直接删旧接口，而是增加 adapter。Adapter 从旧 \code{LogRecord} 生成 \code{BatchStorage}，再把只读视图交给新内核。旧 \code{aggregate} 仍作为 reference 存在，用来比较输出和诊断。
+
+\begin{lstlisting}[language=C++,caption={adapter 把旧对象转换为热列存储}]
+struct BatchStorage {
+  std::vector<RecordId> record_ids;
+  std::vector<std::uint32_t> event_ids;
+  std::vector<std::int64_t> values;
+  std::uint64_t dictionary_generation = 0;
+  std::uint64_t checksum = 0;
+};
+
+BatchView view_of(const BatchStorage& storage) {
+  return BatchView{
+    .record_ids = storage.record_ids,
+    .event_ids = storage.event_ids,
+    .values = storage.values,
+    .dictionary_generation = storage.dictionary_generation,
+    .batch_checksum = storage.checksum
+  };
+}
+\end{lstlisting}
+
+Adapter 阶段的收益可能很小，甚至更慢，因为它同时保留旧对象和新列。它的价值是建立等价性：同一输入经过旧路径和新路径，counts、diagnostics、dictionary checksum 和 record id 映射必须一致。等价性稳定后，才能把热循环迁到新内核。
+
+\topic{第二阶段：把聚合核缩成连续读取和本地写}
+新聚合核不再接收 \code{LogRecord}，也不再接收全局 \code{Counts}。它只读 \code{BatchView}，写 \code{WorkerPartial}。这样地址形状非常明确：两个或三个连续列读，一个 worker-local 计数表写。
+
+\begin{lstlisting}[language=C++,caption={BatchView 聚合核只保留热路径依赖}]
+struct WorkerPartial {
+  std::span<std::uint64_t> counts;
+  std::uint32_t worker_id = 0;
+};
+
+void aggregate_batch(BatchView batch, WorkerPartial partial) {
+  for (std::size_t i = 0; i != batch.event_ids.size(); ++i) {
+    const std::uint32_t event = batch.event_ids[i];
+    const std::int64_t value = batch.values[i];
+    partial.counts[event] += static_cast<std::uint64_t>(value);
+  }
+}
+\end{lstlisting}
+
+这段代码有意不处理错误诊断、不查字符串、不提交 manifest、不写全局计数。聚合核越窄，反汇编越容易和硬件假设对应：连续 load、简单索引、worker-local store。若需要过滤坏行，最好在构造 batch 时只放 accepted 记录，或给出紧凑 selection；不要让每条记录在聚合核里回查完整状态。
+
+\topic{第三阶段：把不变量写在构造边界}
+\code{BatchView} 是视图，不拥有内存；因此它必须由拥有者 \code{BatchStorage} 或 mmap block 保证生命周期。构造边界要检查 span 长度、字典 generation、record id 映射和 checksum。聚合核内部不反复检查这些条件，否则热循环又被控制面污染。
+
+\begin{lstlisting}[numbers=none,caption={BatchView 构造边界的不变量}]
+invariants:
+  record_ids.size == event_ids.size
+  record_ids.size == values.size
+  event_ids refer to dictionary_generation
+  record_ids map to ColdRecordStore entries
+  batch_checksum covers accepted hot records
+  storage lifetime outlives BatchView
+  each WorkerPartial is owned by one worker
+\end{lstlisting}
+
+这些不变量分别服务不同风险。长度一致防止列错位；字典 generation 防止整数 id 解释错；record id 映射保护诊断；checksum 保护语义等价；生命周期防止悬垂视图；partial 所有权防止共享写和 false sharing。
+
+\topic{第四阶段：冷表从热路径断开，但可回查}
+冷表通常保存原始行、文件 id、字节 offset、字段边界、错误类别和必要的上下文。它不应该被聚合核访问，但必须能通过 \code{RecordId} 回查。
+
+\begin{lstlisting}[numbers=none,caption={冷热路径的生命周期划分}]
+input buffer:
+  owns raw bytes until parse finishes or cold slices are persisted
+
+hot columns:
+  record_ids, event_ids, values
+  live for parse -> aggregate -> reduce
+
+cold store:
+  raw slices, offsets, parse errors
+  live until diagnostics and retry decisions finish
+
+worker partial:
+  one writer during aggregate
+  read during reduce
+\end{lstlisting}
+
+生命周期划分影响内存峰值。若输入 buffer、旧对象、热列和冷表同时保留，吞吐可能提升而峰值内存爆炸；若过早释放输入 buffer，诊断回查会失败。布局报告必须同时写热字节、冷字节和生命周期，而不是只写热循环速度。
+
+\topic{第五阶段：用 report 证明迁移真的完成}
+迁移完成的标志不是函数签名变了，而是报告能证明热路径地址形状已经改变，并且语义能力仍然存在。
+
+\begin{lstlisting}[numbers=none,caption={布局迁移报告字段}]
+layout.object_bytes_before
+layout.hot_bytes_after
+layout.cold_bytes
+layout.batch_records
+layout.partial_bytes
+layout.dictionary_generation
+layout.record_id_width
+layout.cold_lookup_failures
+layout.hot_loop_calls
+layout.hot_loop_load_shape
+layout.checksum
+layout.diagnostic_checksum
+\end{lstlisting}
+
+\code{hot_loop_calls} 用来确认内层是否仍有每记录调用；\code{hot_loop_load_shape} 可以写成 ``contiguous columns''、``indexed selection'' 或 ``pointer chase''；\code{cold_lookup_failures} 必须为零。若 object bytes 下降但 diagnostic checksum 不一致，迁移失败；若 checksum 一致但 \code{hot_loop_load_shape} 仍是 pointer chase，接口没有真正改变地址路径。
+
+\topic{第六阶段：把迁移接到后续章节}
+\code{BatchView} 不是布局章节的终点。向量化章节会利用 \code{event_ids} 和 \code{values} 的连续性；线程章节会把 batch 分配给 worker；锁和 atomics 章节会比较全局计数、worker-local partial 和分区 reduce；运行时章节会把 batch 变成任务；I/O 章节会决定热列来自 read buffer 还是 mmap block；分布式章节会把 block id、dictionary generation 和 manifest entry 写成跨机器合同。
+
+因此迁移时要避免把当前实现细节写死在接口里。聚合核需要的是连续热列和稳定身份，不需要知道底层来自 vector、arena、mmap 还是网络 buffer。接口越准确表达阶段需求，后续从单线程到多线程、从内存到 I/O、从单机到分布式的移动越少。
+
+\topic{常见失败模式}
+最后用失败模式检查迁移深度：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.26\linewidth}p{0.32\linewidth}p{0.30\linewidth}@{}}
+\toprule
+失败模式 & 机器后果 & 修复方向 \\
+\midrule
+BatchView 保存对象指针 & 仍然 pointer chase，TLB 和 cache 分散 & 改成连续热列或 AoSoA block \\
+聚合核查询字符串字典 & 变长比较和随机哈希回到热路径 & 解析阶段编码，聚合只用整数 id \\
+所有 worker 写全局 Counts & cache line 争用和同步等待 & worker-local partial 后 reduce \\
+冷表生命周期短于诊断 & 错误回查失败或悬垂视图 & record id 加分段所有权 \\
+selection 接近全量仍间接读 & 多读索引列且打散连续访问 & materialize 成新的连续 batch \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些失败模式说明，布局不是局部字段排列，而是阶段合同、地址序列、生命周期和并发写者共同决定的系统形状。
+
 \section{排障案例：改成列式以后为什么仍然慢}
 
 有时把胖对象拆成热列以后，吞吐仍然没有明显提升。这个结果不能简单归因于“列式不适合”。更常见的原因是某条隐含地址路径没有被拆掉，或者新的表示引入了额外间接层。排障要沿着硬件账本逐层检查：热循环是否真的只读连续列，是否仍在查字符串字典，是否每条记录都回查冷表，是否 selection vector 造成随机行号访问，是否 worker-local partial 发生 false sharing，是否 batch 太小导致调度和函数调用成本压过缓存收益。

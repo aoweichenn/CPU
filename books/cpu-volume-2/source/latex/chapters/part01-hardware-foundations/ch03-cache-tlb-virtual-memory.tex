@@ -572,6 +572,118 @@ protection fault:
 
 这条事实解释了为什么布局分析要分两层。虚拟地址形状决定程序能否形成连续 load/store、预取和 TLB 局部性；物理页放置决定访问距离、内存控制器和 NUMA 带宽。前者主要由数据结构和访问顺序控制，后者还受操作系统策略、线程位置和缺页时机影响。
 
+\section{完整案例：同一批记录的四条地址路径}
+
+很多内存优化讨论会把“数据量很大”当作唯一变量。硬件真正看到的是地址序列：下一次 load 的地址能否提前算出，连续字节是否被充分使用，当前窗口跨越多少 cache line 和页面，是否第一次触碰页面，页表项是否已经在 TLB 或缓存中。下面用同一批逻辑记录构造四条地址路径，把 cache、TLB、page fault 和指针依赖拆开。
+
+设每条记录有一个 \code{value} 字段。四个版本都把相同数量的 \code{value} 混入 checksum，逻辑工作量相同；改变的只是访问地址的生成方式。
+
+\begin{lstlisting}[numbers=none,caption={四条地址路径的共同语义}]
+input:
+  records[0..N)
+  each record contributes exactly one value
+
+result:
+  checksum = mix(checksum, value)
+  visited_count == N
+\end{lstlisting}
+
+共同语义非常重要。若随机版本少访问一部分记录，或指针版本因为坏链提前结束，耗时就失去可比性。每个循环都要返回 \code{checksum} 和 \code{visited_count}，报告还要保存随机 seed、页面数量、步长和预热策略。
+
+\topic{路径一：顺序扫描}
+顺序扫描的地址由基址加循环计数器生成。处理器很早就能知道后续地址，硬件预取器也容易跟上。若元素布局紧凑，每条 cache line 上有大量有效字节，TLB 也能按递增页号工作。
+
+\begin{lstlisting}[numbers=none,caption={顺序扫描的地址生成}]
+for i in 0..N:
+    address = base + i * sizeof(Record)
+    checksum = mix(checksum, load value at address)
+\end{lstlisting}
+
+这条路径慢时，首先怀疑带宽、向量化、字段间距或循环体额外工作。若 \code{Record} 很胖，顺序仍然可能慢，因为每次搬入的 cache line 中只有很少字节被使用；这时问题不是顺序性，而是有效字节比例低。
+
+\topic{路径二：固定步长}
+固定步长让地址仍可预测，但每条 cache line 的有效字节下降。步长等于 64 字节时，可能每条 line 只用一个小字段；步长等于 4096 字节时，每次都跨到下一页，TLB 覆盖很快成为变量。固定步长还可能暴露 set conflict：若地址低位模式总是落到同一 cache set，容量还没用完就发生冲突驱逐。
+
+\begin{lstlisting}[numbers=none,caption={固定步长扫描}]
+for k in 0..N:
+    offset = (k * stride_bytes) % data_bytes
+    checksum = mix(checksum, data[offset])
+\end{lstlisting}
+
+固定步长实验要画步长曲线，而不是只测一个点。64、128、256、512、4096、8192 字节可能对应不同现象：line 利用率下降、预取距离变化、页覆盖变化、set 冲突变化。曲线的拐点比单个数字更能说明层级边界。
+
+\topic{路径三：随机页访问}
+随机页版本把记录按页面打散，每页只取一个或少量值。这样能把“元素数量”从“活跃页数”中拆出来。若每页只用 8 字节，绝大多数搬入的 cache line 和页面翻译都没有被充分利用。
+
+\begin{lstlisting}[numbers=none,caption={随机页访问}]
+prepare page_order[0..page_count)
+shuffle page_order with fixed seed
+
+for p in page_order:
+    offset = p * page_size + value_offset_in_page
+    checksum = mix(checksum, data[offset])
+\end{lstlisting}
+
+这条路径慢，不能马上写成“cache miss”。它同时破坏预取、cache 局部性、TLB 局部性和页表项局部性。要区分原因，需要和固定每页访问、顺序每页访问、预热与未预热运行对照。如果冷运行远慢于热运行，并且 minor fault 增多，首次触页参与了成本；如果热运行仍在活跃页数超过某个范围后变慢，TLB 覆盖或 page walk 更可疑。
+
+\topic{路径四：指针追踪}
+指针追踪最难隐藏延迟，因为下一地址依赖当前 load 的结果。顺序数组中，地址 \code{i+1} 在本轮 load 前已经知道；链表中，下一节点地址只有当前节点到达后才知道。乱序窗口可以推进独立工作，却很难跨过这条地址依赖链。
+
+\begin{lstlisting}[numbers=none,caption={指针追踪的地址依赖}]
+node = head
+while node != null:
+    checksum = mix(checksum, node->value)
+    node = node->next
+\end{lstlisting}
+
+指针追踪的慢可能来自三层。第一，节点分散导致 cache miss 和 TLB miss；第二，下一地址依赖当前结果，内存级并行度低；第三，节点含有冷字段或虚函数，使热路径继续扩大。把链表节点放入 arena 可以改善页分散，却不能完全消除 next 指针依赖；把链表转换成索引数组或分块邻接表，才可能让地址提前计算。
+
+\topic{把四条路径放进同一张审计表}
+同一批记录的四条路径给出一组判读规则：
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.19\linewidth}p{0.31\linewidth}p{0.36\linewidth}@{}}
+\toprule
+现象 & 更可能的原因 & 下一步对照 \\
+\midrule
+顺序也慢 & 带宽、字段间距、额外计算或未向量化 & 缩小字段、看反汇编、比较字节账本 \\
+顺序快，固定步长慢 & line 利用率下降或 set conflict & 扫 stride 曲线，改变对齐和容量 \\
+每页访问出现拐点 & TLB 覆盖或 page walk 成本 & 改 \code{page_count}，记录 dTLB 或替代证据 \\
+冷运行慢很多 & minor fault、major fault 或 page cache 状态 & 记录 faults，拆分预热和正式测量 \\
+指针版最慢 & 地址依赖链和分散节点 & arena、索引化、分块邻接表对照 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不会自动给出答案，但能防止把所有慢都归因到 cache。Cache line、TLB、page fault 和指针依赖都发生在“内存访问”附近，修复方向却完全不同：line 利用率靠布局，TLB 覆盖靠页形状和分块，fault 靠测量边界和驻留状态，指针依赖靠表示法改变。
+
+\topic{报告字段要覆盖页级状态}
+一次地址路径实验至少保存下面字段：
+
+\begin{lstlisting}[numbers=none,caption={地址路径审计报告字段}]
+access.pattern
+record_count
+page_count
+stride_bytes
+random_seed
+warmed_pages
+first_touch_inside_timing
+minor_faults
+major_faults
+dtlb_misses_available
+checksum
+visited_count
+elapsed_ns_median
+\end{lstlisting}
+
+\code{first_touch_inside_timing} 用来说明首次触页是否被计入；\code{minor_faults} 和 \code{major_faults} 来自系统资源统计或工具输出；\code{dtlb_misses_available} 表示硬件计数器是否真的可用，而不是把不可用写成零。\code{checksum} 和 \code{visited_count} 是语义护栏，没有它们，任何地址实验都可能被编译器优化或数据缺失污染。
+
+\topic{RecordId 不是虚拟地址}
+布局改造常犯的错误是把指针或虚拟地址当成长期身份。虚拟地址只是当前进程当前映射中的位置；vector 重新分配、mmap 重新映射、跨进程传输、文件落盘和分布式 shuffle 都会让它失去意义。稳定身份应由 \code{RecordId}、block id、offset 或 manifest entry 表达，再由当前布局把身份映射到热列或冷表位置。
+
+这个区分会影响后续所有章节。并发阶段需要知道哪个 worker 拥有哪个 record 范围；I/O 阶段需要从文件 offset 重建记录；分布式阶段需要跨机器传递逻辑 block；故障恢复需要根据 manifest 判断哪些输出已经提交。虚拟地址可以服务当前热循环，不能充当系统合同。
+
 \section{首次触页、NUMA 与测量边界}
 
 分配内存不等于物理页面已经就位。许多系统采用按需分配：程序拿到虚拟地址范围后，第一次写某个页面时才真正分配物理页、清零页面并建立页表项。这次 page fault 可能是 minor fault，不涉及磁盘，但它仍然远比普通 load/store 昂贵。若 benchmark 把首次触页放进热循环，就会把页面分配成本误写成算法成本。
