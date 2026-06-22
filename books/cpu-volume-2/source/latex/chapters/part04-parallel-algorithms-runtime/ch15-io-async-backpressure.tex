@@ -377,10 +377,10 @@ commit or discard:
 
 这个顺序和线程池关闭、条件变量谓词、原子状态机是一条主线：状态先改变，等待者或 completion 再观察状态，资源最后释放。若顺序反过来，就会出现 use-after-free、重复提交、孤儿文件或丢失唤醒。
 
-\topic{第六版：报告字段}
-完整报告要能解释系统是 CPU 慢、设备慢、completion 慢还是 commit 慢：
+\topic{第六版：状态观测点}
+状态观测点要能解释系统是 CPU 慢、设备慢、completion 慢还是 commit 慢：
 
-\begin{lstlisting}[numbers=none,caption={异步写流水线报告字段}]
+\begin{lstlisting}[numbers=none,caption={异步写流水线观测点}]
 io.submit.count
 io.submit.rejected_by_backpressure
 io.inflight.requests
@@ -397,7 +397,7 @@ late_completion.count
 orphan_temp_files_reclaimed
 \end{lstlisting}
 
-有了这些字段，调优才不会盲目。若 free buffer 见底而设备延迟高，瓶颈在持久化；若 completion 队列增长但设备延迟不高，completion loop 太重；若 manifest 队列增长，提交路径串行化；若 late completion 多，attempt timeout 或取消策略需要复查。
+有了这些观测点，调优才不会盲目。若 free buffer 见底而设备延迟高，瓶颈在持久化；若 completion 队列增长但设备延迟不高，completion loop 太重；若 manifest 队列增长，提交路径串行化；若 late completion 多，attempt timeout 或取消策略需要复查。
 
 \section{所有权、Buffer 池和取消}
 
@@ -649,6 +649,55 @@ Compute Systems Engine 不必实现复杂网络 reactor，但要吸收 ready 语
 项目可以先用 I/O worker 模拟异步，引入 CompletionRecord、buffer ownership、backpressure 和 reliable commit；之后再把底层替换成 \code{io_uring}。这样 API 变化不会改变主线。
 \end{casebox}
 
+\topic{SQE、CQE 和业务状态不是同一层}
+\code{io_uring} 的提交队列项 SQE 描述“希望内核执行什么操作”，完成队列项 CQE 描述“内核观察到这个操作怎样结束”。业务层的 block 状态还要再往上走一层：buffer 是否仍被内核持有，短写是否已经补齐，临时文件是否完整，manifest 是否接受，迟到 completion 是否需要清理。把 CQE 直接当作业务提交，是异步 I/O 中最常见的层级错误。
+
+\begin{lstlisting}[numbers=none,caption={从 SQE 到业务提交的状态层次}]
+application:
+  allocate buffer and build WriteRequest
+
+submit:
+  fill SQE with fd, offset, buffer, length, user_data
+  publish request as InFlight
+
+complete:
+  read CQE result
+  if result is short write:
+      submit next SQE for remaining range
+  if result is error:
+      classify retryable or terminal
+  if full byte range is written:
+      verify temp block state
+      request manifest commit
+
+commit:
+  manifest accepts exactly one attempt
+  buffer may return to pool after no late user owns it
+\end{lstlisting}
+
+这里的 \code{user_data} 很关键。它不能只是一个裸指针，更不能指向可能已经释放的栈对象。它应该能定位稳定的 request record，例如 request id、attempt id 或对象池中的 generation handle。否则取消、超时和迟到 completion 会把已经复用的 buffer 或 request 错认成当前请求。底层 API 越异步，身份和生命周期越不能靠调用栈保存。
+
+\topic{注册 buffer 购买少拷贝，也购买更严格的所有权}
+Registered buffer 可以减少页固定、映射和检查开销，也更接近零拷贝路径。但注册 buffer 在 I/O 完成前不能被上层复用，取消也不保证设备或内核立刻停止访问。Buffer pool 因此必须有状态：Free、Filling、Submitted、Completed、Committing、Reclaimable。若只有一个 \code{std::vector<char>} 被多个请求轮流写，异步完成顺序稍一变化，就会把 block 内容、checksum 和 manifest 身份混在一起。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.22\linewidth}p{0.36\linewidth}p{0.31\linewidth}@{}}
+\toprule
+状态 & 谁拥有 buffer & 允许动作 \\
+\midrule
+Free & buffer pool & 分配给新的写请求 \\
+Filling & compute task & 写入 block 内容，尚未提交 I/O \\
+Submitted & kernel/device path & 上层不能复用，等待 CQE 或取消结果 \\
+Completed & completion loop & 检查短写、错误和字节范围 \\
+Committing & manifest task & 等待业务提交或拒绝 \\
+Reclaimable & buffer pool & 清理后回收，generation 前进 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张状态表比“使用 \code{io_uring} 会更快”重要得多。没有它，性能优化会把生命周期边界压扁；有了它，底层从 worker thread、\code{epoll}、\code{io_uring} 到直接 I/O 的替换，都只是完成来源改变，业务语义不变。
+
 \begin{casebox}
 \topic{Kafka、RocksDB 和 group commit}
 Kafka、RocksDB 等系统都大量使用批处理、顺序写、后台 flush、日志或 manifest 记录提交事实。它们的设计说明：高吞吐存储系统不是每条记录都立即同步到最终结构，而是把数据面和控制面分开，用日志、manifest、sequence number、flush 和 compaction 管理可见性。
@@ -703,79 +752,39 @@ TCP 接收端慢会让接收窗口缩小，本端发送最终阻塞或返回 \co
 \topic{第四版：迟到 completion 和 attempt}
 请求超时后，driver 可以创建新 attempt。旧 attempt 后来完成，只能写自己的临时文件并进入 late/reaped 状态。Commit task 检查当前 task attempt 和 manifest，只有获胜 attempt 能提交。这个结构和第 16 章“成功响应丢失后重试”的问题完全同构。
 
-\section{项目落地}
+\section{实现流程：把 I/O 代码拆成可分析状态}
 
-Compute Systems Engine 应实现一个可控 I/O 模拟器和一个有界异步写出管线。不要依赖真实磁盘偶然变慢来触发问题。模拟器参数包括生产速率、消费延迟、短写概率、错误率、队列容量、buffer 大小、batch 阈值、deadline 和重试预算。故障应可复现，报告才可复查。
+I/O 章节不需要堆很多外部实验。真正关键的是把一段看似普通的写文件代码，拆成内核路径、缓冲区所有权、完成事件和业务提交四层。第一版实现可以很小：同步可靠写作为 reference，一个有界队列，一个 writer 线程，一个 completion 处理函数，一个 commit gate。只要这四层清楚，后续把 writer 线程替换成 \code{io_uring} 或直接 I/O，都不会改变语义。
 
-\topic{项目接口}
-\begin{lstlisting}[language=C++,caption={I/O 管线计划的示例形态}]
-enum class FsyncPolicy : std::int32_t {
-  None,
-  PerBlock,
-  GroupCommit,
-};
+\topic{从同步写循环推导异步状态}
+同步版本的核心是 offset 推进。它把系统调用返回值转成请求状态，而不是把正返回值直接当成功。
 
-struct IoPipelinePlan {
-  QueueCapacity write_queue_capacity;
-  FsyncPolicy fsync_policy = FsyncPolicy::None;
-  std::uint64_t batch_bytes = 0;
-  std::uint64_t batch_timeout_ns = 0;
-  std::uint32_t max_retries = 0;
-  bool enable_fault_injection = true;
-};
+\begin{lstlisting}[language=C++,caption={可靠写循环的最小语义}]
+WriteResult write_all(int fd, std::span<const std::byte> bytes) {
+  std::uint64_t offset = 0;
+  while (offset < bytes.size()) {
+    const ssize_t n = ::write(fd, bytes.data() + offset,
+                              bytes.size() - offset);
+    if (n > 0) {
+      offset += static_cast<std::uint64_t>(n);
+      continue;
+    }
+    if (n < 0 && errno == EINTR) {
+      continue;
+    }
+    return WriteResult::failed(offset, errno);
+  }
+  return WriteResult::completed(offset);
+}
 \end{lstlisting}
 
-这个计划对象用于实验，不是要把 I/O 做成配置大杂烩。每个字段都对应一个判断：容量如何保护内存，fsync 策略承诺什么可靠性，batch 如何折中吞吐和尾延迟，重试预算如何避免风暴，故障注入如何证明失败路径。
+这段代码里已经包含异步版本需要的状态：\code{offset}、剩余字节、可重试错误、终态错误和完成字节数。异步化不是把这段循环扔给线程池，而是把调用栈里的局部变量搬到 \code{WriteRequestRecord} 中。每次 completion 回来，都相当于同步循环执行了一次系统调用，然后根据返回值决定重新提交、失败还是进入校验。
 
-\topic{实验矩阵}
-\begin{center}
-\begin{tabular}{p{0.24\linewidth}p{0.33\linewidth}p{0.31\linewidth}}
-\toprule
-实验 & 输入形状 & 要解释的现象 \\
-\midrule
-无界队列反例 & 生产速度大于写出速度 & 内存增长、尾延迟增长、压力被隐藏 \\
-有界队列背压 & item 和 bytes 双容量 & 吞吐、等待时间、内存上界 \\
-短写循环 & 每次只写部分字节 & offset 是否正确推进，checksum 是否匹配 \\
-迟到 completion & 超时后旧 attempt 完成 & 是否重复提交，buffer 是否释放 \\
-崩溃点矩阵 & 写临时文件到 manifest 各点中断 & 恢复是否只接受 committed 输出 \\
-batch 和 fsync & per-block、group commit、no fsync & 吞吐、p99、重做成本、可靠性承诺 \\
-\bottomrule
-\end{tabular}
-\end{center}
+\topic{从代码走到内核路径}
+\code{write} 进入内核后，普通文件常先走 page cache。用户态字节被复制或引用到内核维护的页中，页被标记为 dirty，真正设备写回可能稍后发生。若使用 direct I/O 或注册 buffer，复制路径和页缓存路径会改变，但“提交请求、等待完成、确认业务生效”这三层仍然存在。代码分析时要按顺序问四个问题：系统调用是否接受请求，接受了多少字节；这些字节现在归谁所有；completion 或同步返回证明了哪一层完成；业务是否已经允许 reduce 读取这份输出。
 
-\topic{IoPipelineReport}
-每次实验输出机器可读摘要。最低字段包括：输入规模、block 数、bytes、submit count、completion count、retry count、dropped count、late completion count、queue max items、queue max bytes、writer service time、queue wait time、commit wait time、manifest entries、orphan temp files。
-
-\begin{lstlisting}[numbers=none,caption={I/O 管线报告摘要示例}]
-blocks.submitted=2048
-blocks.committed=2048
-bytes.in_flight.max=268435456
-write_queue.items.max=128
-completion.late=3
-write.short_count=91
-retry.count=7
-manifest.entries=2048
-temp.orphans.cleaned=3
-\end{lstlisting}
-
-报告解释要有判断：无界队列吞吐高但内存上涨，是压力被隐藏；有界队列吞吐下降但内存稳定，是背压生效；late completion 被 reaped 且未提交，是状态机正确；\code{short_count} 高但 checksum 正确，是短写循环正确。
-
-\topic{源码阅读任务}
-\begin{sourcereadingbox}
-源码阅读任选一条窄路径：
-\begin{enumerate}
-  \item Linux 普通文件路径：从 \filepath{fs/read_write.c}、\filepath{mm/filemap.c} 和 \filepath{fs/sync.c} 选择一个问题，解释 \code{write}、page cache、dirty page 和 \code{fsync} 的关系。
-  \item Linux ready 事件：阅读 \filepath{fs/eventpoll.c} 的一个小路径，解释 ready 通知为什么不等于业务消息完整。
-  \item \code{io_uring}：围绕提交队列、完成队列、request id、取消和 completion 顺序写报告，不要求实现完整 runtime。
-  \item Kafka、RocksDB 或类似系统：阅读日志写入、manifest、flush、group commit 或 compaction 的一条路径，说明它如何分离数据面和提交事实。
-\end{enumerate}
-
-报告必须区分源码直接事实、实验测得事实和推断解释。不要泛写“Linux I/O 很复杂”，要回答核心问题：请求何时完成，buffer 何时可复用，结果何时可见，过载如何反馈。
-\end{sourcereadingbox}
-
-\begin{labbox}
-实验：实现一个慢 writer 模拟器。先用无界队列观察内存和尾延迟，再改成有界队列和高低水位线。最后加入短写、迟到 completion 和崩溃点矩阵。验收不是“程序跑完”，而是 manifest、checksum、buffer pool、queue capacity 和 completion 状态都一致。
-\end{labbox}
+\topic{只保留三个验证点}
+验证不需要铺成大矩阵，保留三个点即可。第一，短写：每次只写一部分字节，确认 offset 推进和最终 checksum。第二，迟到 completion：旧 attempt 完成后不能覆盖已经提交的新 attempt。第三，背压：writer 停住时，上游不能无限分配 buffer。这三个点分别覆盖字节状态、业务状态和资源状态，足够支撑本章主线。
 
 \section{完整案例：一次 ShuffleBlock 写出怎样变成提交事实}
 
@@ -1016,7 +1025,7 @@ temp.orphan_bytes
 
 背压还要进入用户可见报告。一次运行如果因为写出慢而主动限速，应明确写出限速次数、限速持续时间、最高水位、最低可用 buffer 和最终恢复时间。这样吞吐下降时，结论不是“程序变慢”，而是“系统按合同保护了内存和提交事实”，并能继续定位下游真正的慢点。没有这些字段，限速会被误判成随机抖动，甚至被后续优化错误地删除。
 
-报告字段本身就是 I/O 合同的一部分：没有被记录的压力，迟早会被当作不存在。
+关键观测点本身就是 I/O 合同的一部分：没有被记录的压力，迟早会被当作不存在。
 
 \section{稳态判断：吞吐、债务和恢复窗口}
 
@@ -1053,21 +1062,19 @@ recovery.scan_elapsed_ms
 cleanup.oldest_orphan_age_ms
 \end{lstlisting}
 
-\topic{稳态实验}
-稳态实验应持续到队列和债务曲线出现稳定平台，而不是只跑几十秒。输入速率固定，模拟 writer 周期性变慢，观察高水位触发、上游减速、writer 恢复后债务下降。验收不是峰值吞吐最高，而是：最大内存低于预算，oldest uncommitted block age 有上界，orphan bytes 最终回落，成功样本 checksum 不变，deadline expired 和 retry 数在预算内。
+\topic{稳态判读}
+稳态分析不必变成复杂实验表。只要沿着状态表看债务是否回落：writer 变慢时 queued bytes 上升，buffer pool 下降，上游开始等待；writer 恢复后 queued bytes 和 completed-uncommitted bytes 应下降，oldest uncommitted age 不应无限增长。若吞吐曲线好看但债务不回落，系统只是把压力藏到了内存、临时文件或恢复窗口里。
 
-\begin{lstlisting}[numbers=none,caption={稳态实验判据}]
-given:
-  input_rate = 200 MiB/s
-  writer alternates 30s fast, 30s slow
-  buffer_pool = 512 MiB
+\begin{lstlisting}[numbers=none,caption={稳态判读的最小链条}]
+writer slow
+  -> queued bytes rises
+  -> buffer pool free bytes drops
+  -> upstream waits instead of allocating more buffers
 
-expect:
-  queued bytes rises during slow window
-  backpressure reduces upstream production
-  queued bytes drains during fast window
-  oldest uncommitted age remains below budget
-  final manifest checksum equals reference
+writer recovers
+  -> queued bytes drains
+  -> completed-uncommitted bytes drains
+  -> oldest uncommitted age returns below budget
 \end{lstlisting}
 
 \topic{债务无法回落时的修复方向}

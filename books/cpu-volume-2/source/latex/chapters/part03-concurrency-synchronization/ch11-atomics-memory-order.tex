@@ -978,7 +978,7 @@ DuckDB、ClickHouse、RocksDB、Flink 等系统大量使用不可变快照、版
 高性能日志计数通常不要求每次读取都是一致快照，而是用 per-thread buffer、分片计数、批量 flush 和后台汇总。它购买的是写入热路径低成本；代价是读取滞后和近似。项目报告要区分 telemetry 指标和控制面状态，不能用近似指标驱动关闭、提交或资源释放。
 \end{casebox}
 
-\section{项目落地：AtomicProtocolNote}
+\section{实现边界：AtomicProtocolNote}
 
 Compute Systems Engine 使用 \code{AtomicProtocolNote} 约束每个原子变量。它可以是设计文档、代码旁注释或审查表，但每个 atomic 都要能填写。若填写不出来，默认改回 mutex 或把状态机重构得更窄。
 
@@ -999,11 +999,11 @@ Compute Systems Engine 使用 \code{AtomicProtocolNote} 约束每个原子变量
 \end{tabular}
 \end{center}
 
-\topic{三组必做实验}
-第一，指标实验：比较 mutex counter、atomic relaxed counter 和 sharded counter，记录吞吐、cache 热点和汇总成本。第二，发布实验：实现一次性配置发布和 shared pointer 热更新，写出 release/acquire 对应字段和生命周期边界。第三，CAS 实验：实现 \code{try_set_max} 或 \code{TaskCompletion} 状态机，记录 CAS 失败次数，证明循环内没有不可重复副作用。
+\topic{三条最小对照路径}
+第一，指标路径：比较 mutex counter、atomic relaxed counter 和 sharded counter，关注 cache 热点、汇总成本和读取滞后。它说明 relaxed 只适合不发布数据的计数事实。第二，发布路径：实现一次性配置发布和 shared pointer 热更新，写清 release 写入哪个协议变量、acquire 读取后允许访问哪些普通字段，以及旧版本什么时候能释放。第三，CAS 路径：实现 \code{try_set_max} 或 \code{TaskCompletion} 状态机，记录 CAS 失败次数和失败分支，证明循环内没有不可重复副作用。
 
-\topic{反例实验必须保留}
-反例实验要保留错误版本。至少保留 relaxed ready 发布配置、CAS 循环内写不可重复日志、多 atomic 读取伪一致快照、裸原子指针热更新后释放旧对象四个反例。报告不是只写“修复后通过”，而要写清：错误版本允许什么坏观察，为什么测试可能不稳定复现，修复版本用哪条同步边或生命周期协议消除了坏观察。
+\topic{反例必须保留}
+错误版本比成功版本更能说明内存序边界。至少保留 relaxed ready 发布配置、CAS 循环内写不可重复日志、多 atomic 读取伪一致快照、裸原子指针热更新后释放旧对象四个反例。判读不能只写“修复后通过”，而要写清：错误版本允许什么坏观察，为什么测试可能不稳定复现，修复版本用哪条同步边或生命周期协议消除了坏观察。
 
 \topic{并发验证要分层}
 并发验证不能只靠压力测试。压力测试能提高交错覆盖率，却不能证明所有交错；ThreadSanitizer 能发现很多数据竞争，却不能证明内存序足够强，也不能证明线性化点正确；AddressSanitizer 能抓 use-after-free，却未必能稳定触发 ABA；模型检查或手写小状态枚举能穷举小规模状态，却不能直接覆盖生产实现的内存分配、调度和 I/O。成熟的报告要把这些方法分层使用。
@@ -1039,15 +1039,12 @@ ConcurrentEvent:
   return_status
 \end{lstlisting}
 
-这个日志会增加测试成本，但它把“偶尔失败”变成可复盘事实。若某次运行出现重复 item，日志能显示两个 push 是否都认为自己占有同一槽位；若 wait 永久不返回，日志能显示最后一次状态变化是否通知了对应等待点；若 CAS 失败率暴涨，日志能区分真实竞争和错误重试。并发章节的所有项目报告都应保留这种事件级证据，而不是只贴吞吐曲线。
+这个日志会增加测试成本，但它把“偶尔失败”变成可复盘事实。若某次运行出现重复 item，日志能显示两个 push 是否都认为自己占有同一槽位；若 wait 永久不返回，日志能显示最后一次状态变化是否通知了对应等待点；若 CAS 失败率暴涨，日志能区分真实竞争和错误重试。并发代码应保留这种事件级证据，而不是只贴吞吐曲线。
 
 \topic{从锁版迁移到原子版}
 迁移路线要保守。先用 mutex 写 reference，测试正确性和边界；再把纯指标降为 relaxed；再实现边界清楚的 SPSC 槽位状态；最后才考虑 MPSC、MPMC 或无锁结构。每次迁移都要写 \code{AtomicProtocolNote}。不要从“这里有锁”直接跳到“这里用 CAS”，因为锁可能保护的是一组尚未列出的不变量。
 
-\begin{labbox}
-\textbf{实验：任务完成对象。}
-实现一个小型 \code{TaskCompletion}：状态为 Pending、Running、Succeeded、Failed、Canceled；worker 用 CAS 从 Pending 转 Running，完成时 release 发布结果或错误；等待者 acquire 读取终态后读取结果。要求写出状态转换表、内存序理由、异常路径、取消语义、等待策略和测试矩阵。对照版本用 mutex/condition variable 实现。
-\end{labbox}
+最小综合案例是 \code{TaskCompletion}。状态为 Pending、Running、Succeeded、Failed、Canceled；worker 用 CAS 从 Pending 转 Running；完成时用 release 发布结果或错误；等待者 acquire 读取终态后读取结果。这个案例要写状态转换表、内存序理由、异常路径、取消语义和等待策略，并保留 mutex/condition variable 版本作为语义 reference。它覆盖了本章最关键的链路：状态机、发布边、CAS 失败、等待唤醒和结果生命周期。
 
 \begin{sourcereadingbox}
 源码阅读按原子变量用途分类。
@@ -1156,6 +1153,58 @@ telemetry atomic:
 
 \topic{AtomicProtocolNote 示例}
 这个对象的 \code{AtomicProtocolNote} 应写清：\code{state} 是协议变量，发布 result/error；CAS Pending->Running 是执行权线性化点；release store 终态是结果发布点；等待者 acquire 读终态；\code{cas_failures} 和 \code{completed_count} 是 relaxed 指标；结果对象生命周期由 completion 对象持有，等待者返回前 completion 不能销毁。这样原子代码才有审查入口。
+
+\topic{x86 TSO 和 ARM 弱内存序：本机通过不等于协议成立}
+C++ 内存序是语言层合同，不是某一种处理器的说明书。同一段原子代码在 x86-64 和 ARM 上可能生成不同形状的指令。x86-64 常被概括为 TSO，total store order。它保证本核心的 store 对其他核心以较强顺序出现，但 store buffer 仍然允许本线程后续 load 先从别处取值；普通 load 的 acquire 和普通 store 的 release 在很多情况下不需要额外 fence，锁前缀 RMW 则会提供更强的原子性和排序效果。ARM 和 RISC-V 等体系通常更弱，release/acquire 往往要通过专门的 load-acquire、store-release 或 fence 指令表达。
+
+下面的消息传递协议在 C++ 层必须写 release/acquire，不能因为 x86 反汇编看起来只是普通 \instruction{mov} 就改成 relaxed：
+
+\begin{lstlisting}[numbers=none,caption={发布数据的语言层合同}]
+producer:
+  payload.x = 1
+  payload.y = 2
+  ready.store(true, release)
+
+consumer:
+  if ready.load(acquire):
+      read payload.x and payload.y
+\end{lstlisting}
+
+在 x86-64 上，编译器可能把 release store 和 acquire load 编成普通 store/load，因为硬件模型已经给出足够约束；在 ARM 上，发布和获取可能对应 \instruction{stlr} 和 \instruction{ldar}，或者在更复杂路径中出现 \instruction{dmb}。这不是 ARM “更慢”这么简单，而是两种 ISA 把排序责任放在不同层面。语言层写 release/acquire，是为了让编译器在目标 ISA 上生成足够的约束。
+
+\begin{center}
+\small
+\begin{tabular}{@{}p{0.24\linewidth}p{0.34\linewidth}p{0.31\linewidth}@{}}
+\toprule
+C++ 操作 & x86-64 常见形状 & ARM 常见形状 \\
+\midrule
+relaxed load/store & 普通 load/store & 普通 load/store \\
+release store & 多数为普通 store & store-release 或 fence + store \\
+acquire load & 多数为普通 load & load-acquire 或 load + fence \\
+seq-cst store/RMW & 可能使用锁前缀或 fence 边界 & 需要更强排序指令或序列 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此，原子协议的正确性不能靠“我在当前机器上反汇编没有 fence”来证明。正确审查顺序是：先写出共享普通数据由哪个 release 发布、由哪个 acquire 获取；再写出 CAS 成功和失败各自携带什么语义；最后才读目标平台反汇编，判断编译器是否生成了预期成本。若把顺序反过来，很容易在 x86 上偶然可用，在 ARM 上失效，或者在编译器优化后失效。
+
+\topic{Fence 不是补救所有并发问题的胶水}
+\code{atomic_thread_fence} 只建立排序约束，不会替一个普通变量制造原子性，也不会给对象生命周期兜底。典型错误是在两个普通字段之间插入 fence，然后以为另一个线程就能安全读取它们。如果没有共同参与同步的原子对象，两个线程之间仍然缺少可命名的同步边。Fence 适合少数底层场景，例如用一个 atomic flag 发布一批非原子数据，或者把设备/共享内存协议映射到语言模型；普通业务状态机更应该优先用 release/acquire 的协议变量表达。
+
+\begin{lstlisting}[numbers=none,caption={fence 不能替代协议变量}]
+bad shape:
+  writer stores ordinary fields
+  writer executes a fence
+  reader executes a fence
+  reader reads ordinary fields
+
+missing:
+  no atomic object connects writer and reader
+  no acquire observes a release sequence
+  no object lifetime transfer is defined
+\end{lstlisting}
+
+看到并发 bug 时，先问“哪个原子值被观察到后，允许读取哪些普通字段”，不要先问“要不要加一个 fence”。Fence 只能收紧已有协议的顺序，不能替代协议本身。
 
 \topic{何时退回 mutex}
 如果 \code{TaskCompletion} 继续增加多个结果槽、多个等待条件、父子任务传播、超时回调、资源清理和复杂取消，单个 atomic state 可能不再是清楚设计。退回 mutex 不是失败。Mutex 能把多字段不变量重新放进一个临界区，使语义先稳定。等 profile 证明某条状态转换是瓶颈，再把它拆成窄原子协议。原子代码的目标是缩小同步边界，不是把复杂状态硬塞进枚举。
