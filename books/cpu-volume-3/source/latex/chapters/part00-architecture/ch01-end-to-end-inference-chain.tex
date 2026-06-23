@@ -1,0 +1,358 @@
+\chapter{端到端链路：从模型文件到下一个 token}
+
+\section{先把一条请求链路钉住}
+
+第三册后续会讲很多对象：manifest、typed graph、量化、KV cache、CPU/GPU backend、oracle、profiler。若不先把它们放进同一条请求链路，读者很容易学到一堆孤立概念。这里先用一个最小对话请求把全链路钉住：用户输入一段 prompt，引擎加载模型，编译计划，执行 prefill，进入 decode 循环，最后不断产生 token。
+
+\begin{lstlisting}[numbers=none,caption={本册贯穿链路的最小形态}]
+model directory
+  -> manifest
+  -> verified typed graph
+  -> quantization and layout plan
+  -> CPU/GPU executable plan
+
+request prompt
+  -> tokenizer
+  -> prefill plan
+  -> KV cache initialized
+  -> logits
+  -> sampler
+  -> decode plan loop
+  -> next token stream
+\end{lstlisting}
+
+这条链路有两个方向。第一条是“模型到计划”：它尽量在请求前完成，把能检查的语义、shape、dtype、量化、layout 和 kernel 选择提前固定。第二条是“请求到 token”：它发生在 runtime 中，绑定 session、token buffer、KV cache、arena、workspace 和 sampler。把这两条线分开，是推理引擎不退化成图解释器的关键。
+
+\begin{keyidea}
+本册的主线不是“写几个快 kernel”，而是把模型资产编成可执行计划，再把计划安全地绑定到一次会增长的请求状态上。优化只能发生在这条链路上的某个明确位置。
+\end{keyidea}
+
+\section{从一个坏的 \code{generate()} 看边界}
+
+最容易写出的推理程序，是一个巨大的 \code{generate()} 函数：读模型、解析 tokenizer、分配 activation、判断量化格式、选择 kernel、采样 token 全挤在一个循环里。
+
+\begin{lstlisting}[numbers=none,caption={不可维护的推理主循环形态}]
+generate(prompt):
+  model = read_files()
+  tokens = tokenize(prompt)
+  for step in 0..max_new_tokens:
+    for layer in model.layers:
+      if layer.weight_format == "q4":
+        unpack_and_run_q4()
+      else:
+        run_f32()
+      maybe_allocate_more_memory()
+      maybe_move_to_gpu()
+    next = sample(logits)
+    tokens.push_back(next)
+\end{lstlisting}
+
+问题不在于代码短，而在于它把四类生命周期混在一起：模型文件和权重属于模型生命周期；packed weight 和 executable plan 属于编译生命周期；token buffer、KV cache 和 sampler 属于请求生命周期；单个 kernel 的 workspace 和 profiler event 属于算子生命周期。边界混乱以后，错误定位、内存复用和性能测量都会失真。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.31\linewidth}}
+\toprule
+生命周期 & 应该保存的对象 & 不应该做的事 \\
+\midrule
+模型生命周期 & 文件索引、manifest、原始权重视图 & 持有某次请求的 token 状态 \\
+编译生命周期 & typed graph、packed weight、backend plan & 每个 token 重新解析模型结构 \\
+请求生命周期 & session、KV cache、sampler、trace & 修改模型 manifest 或后端 capability \\
+算子生命周期 & 局部 workspace、临时 tile、计数器 & 泄漏到下一层或下一次请求 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\begin{warningbox}
+推理引擎里很多难查的问题，本质上不是数学错，而是生命周期错：静态对象在热路径重复构造，请求对象被全局共享，临时 buffer 被跨 step 使用，或者 profiler 把 prepare 成本算进 decode。
+\end{warningbox}
+
+\section{模型到计划：哪些事情应该提前做}
+
+模型加载阶段不应该只读文件。它要把外部资产变成编译器可以相信的事实。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.33\linewidth}p{0.30\linewidth}}
+\toprule
+阶段 & 产物 & 拦住的问题 \\
+\midrule
+读取资产 & raw tensor index、config、tokenizer & 文件缺失、大小不一致、checksum 错 \\
+manifest & canonical tensor roles & 模型方言、权重命名、tied weight \\
+verifier & typed graph 与诊断 & shape/dtype/quant/KV 合同错误 \\
+优化与 lowering & executable plan & 融合、layout、memory、backend 选择 \\
+prepare & packed weight、device buffer & 热路径重复 packing 或上传 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的核心是“早拒绝”。如果 tokenizer 词表大小和 embedding 行数不一致，应该在前端报错；如果 int4 scale 数量不匹配，应该在量化 verifier 报错；如果 GPU backend 不支持某种低比特格式，应该在 plan 阶段显式 fallback 或拒绝。不要等到 decode 第 128 个 token 时才用错误 logits 暴露问题。
+
+\section{请求到 token：哪些事情只能运行时知道}
+
+运行时不是编译器的替代品。它处理的是请求期才知道的状态：prompt 内容、当前 position、最大生成长度、sampler 参数、KV cache 已写入长度、当前选择的 backend、是否打开 oracle/profiler。
+
+\begin{lstlisting}[numbers=none,caption={一次请求的运行期状态}]
+Session:
+  token_buffer
+  current_position
+  kv_cache
+  activation_arena
+  workspace
+  sampler_state
+  profiler_trace
+  oracle_policy
+\end{lstlisting}
+
+prefill 和 decode 的职责不同。prefill 读取整个 prompt，批量写入 KV cache，并产出最后一个 prompt token 的 logits。decode 每次只处理一个新 token，读取历史 KV cache，追加当前位置的 K/V，再产出下一步 logits。很多后端优化之所以失败，是因为把这两种形态混成一个计划。
+
+同一个算子名字在不同阶段不一定是同一种机器工作。QKV projection 在 prefill 里更像大 GEMM，在 decode 里更像小 batch GEMV；attention 在 decode 里还要读取从 0 到当前 position 的历史 K/V；sampler 若每步强制 GPU 同步并拷回完整 logits，也会进入端到端延迟。
+
+\begin{systemdiagram}{模型编译链路与请求执行链路}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book row label] at (-0.25,2.65) {编译链};
+  \node[book accent node,text width=2.0cm] (asset) at (1.0,2.65) {模型资产};
+  \node[book teal node,text width=2.0cm] (manifest) at (3.55,2.65) {manifest};
+  \node[book purple node,text width=2.0cm] (graph) at (6.1,2.65) {typed graph};
+  \node[book amber node,text width=2.0cm] (plan) at (8.65,2.65) {executable\\plan};
+
+  \node[book row label] at (-0.25,0.85) {请求链};
+  \node[book accent node,text width=2.0cm] (prompt) at (1.0,0.85) {prompt\\tokens};
+  \node[book teal node,text width=2.0cm] (prefill) at (3.55,0.85) {prefill};
+  \node[book purple node,text width=2.0cm] (kv) at (6.1,0.85) {KV cache};
+  \node[book amber node,text width=2.0cm] (decode) at (8.65,0.85) {decode\\loop};
+  \node[book navy node,text width=2.0cm] (token) at (11.2,0.85) {next token};
+
+  \draw[book strong arrow] (asset) -- (manifest);
+  \draw[book strong arrow] (manifest) -- (graph);
+  \draw[book strong arrow] (graph) -- (plan);
+  \draw[book dashed arrow] (plan) -- (prefill);
+  \draw[book dashed arrow] (plan) -- (decode);
+  \draw[book strong arrow] (prompt) -- (prefill);
+  \draw[book strong arrow] (prefill) -- (kv);
+  \draw[book strong arrow] (kv) -- (decode);
+  \draw[book strong arrow] (decode) -- (token);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：模型编译链和请求执行链共享计划，但生命周期和错误边界不同。}
+\end{systemdiagram}
+
+\section{计划不是抽象名词，而是一份可执行合同}
+
+本册反复使用 \term{可执行计划}{executable plan} 这个词。它不是架构口号，而是一份后端和运行时都能执行的合同：语义 segment、kernel 选择、layout、packed weight、workspace、KV cache 读写、profiler event 和 fallback 规则都要落在这里。
+
+\begin{lstlisting}[numbers=none,caption={executable plan 的最小合同字段}]
+ExecutablePlan:
+  segments:
+    id
+    operator_or_fused_region
+    input_values
+    output_values
+    state_effects: reads_kv | writes_kv | none
+    backend_choice
+    kernel_descriptor
+    workspace_bytes
+    profiler_label
+    oracle_checkpoint_policy
+\end{lstlisting}
+
+这里的 \code{state_effects} 很重要。decode attention 会读历史 KV cache，同时写入当前位置的 K/V；sampler 会读 logits 并更新随机数状态。若 IR 和 plan 不表达这些状态边，memory planner 可能错误复用 buffer，profiler 可能漏掉 cache 写入，oracle 也无法定位漂移点。
+
+\section{一个真实业务接口长什么样}
+
+说“能做业务开发”，不能只说能生成文本。最小可用接口要把请求参数、资源预算、流式输出、停止原因和诊断 trace 都暴露出来。一个本地推理服务的请求可以先设计成：
+
+\begin{lstlisting}[numbers=none,caption={GenerateRequest 的最小字段}]
+GenerateRequest:
+  request_id
+  model_id
+  prompt
+  max_new_tokens
+  max_context_tokens
+  temperature
+  top_k
+  top_p
+  repetition_penalty
+  stream: true | false
+  quant_profile_id
+  backend_policy: cpu | gpu | auto
+  trace_level: none | summary | debug
+\end{lstlisting}
+
+这些字段不是接口装饰。 \code{max_context_tokens} 决定 KV cache 容量；\code{max_new_tokens} 决定最坏 decode 时长；采样参数决定结果可复现性；\code{quant_profile_id} 决定误差和性能合同；\code{backend_policy} 决定 CPU/GPU plan 选择；\code{trace_level} 决定是否允许 materialize 中间结果和更细 profiler。
+
+响应也不能只是一个字符串。流式输出至少要区分 token 事件、错误事件和结束事件：
+
+\begin{lstlisting}[numbers=none,caption={流式响应事件}]
+TokenEvent:
+  request_id
+  token_id
+  token_text
+  index
+  model_position
+  finish_reason_optional
+  trace_event_id_optional
+
+FinalResponse:
+  request_id
+  text
+  generated_tokens
+  finish_reason: stop_token | max_tokens | context_limit | cancelled | error
+  usage:
+    prompt_tokens
+    completion_tokens
+    kv_cache_bytes
+  trace_summary_optional
+\end{lstlisting}
+
+这样设计后，业务层可以实现超时、取消、计费、审计、问题定位和重试。若接口只返回一个最终字符串，就无法判断卡在 prefill、decode、sampler、KV 容量还是后端 fallback。
+
+\section{流式生成不是 \code{print} 循环}
+
+流式生成的状态机要明确。prefill 完成之前，通常还没有第一个输出 token；prefill 之后每个 decode step 产生一个候选 token，sampler 决定是否结束，然后服务层把 token 事件推给客户端。
+
+\begin{lstlisting}[numbers=none,caption={流式生成状态机}]
+state = admitted
+tokens = tokenizer.encode(prompt)
+
+run prefill(tokens)
+emit trace: first_token_ready
+
+while not stopped:
+  logits = decode_one_token(session)
+  next = sampler.sample(logits)
+  append next into session
+  emit TokenEvent(next)
+  if stop_condition(next):
+    emit FinalResponse(stop_token)
+    break
+\end{lstlisting}
+
+真实服务还要处理取消和背压。客户端断开时，runtime 必须停止后续 decode，并释放该 session 的 KV cache、arena 和 pending events。若下游消费 token 很慢，不能让输出队列无限增长；要设置队列上限，超过后暂停调度、丢弃请求或返回 backpressure 错误。否则模型算得再快，服务也会被 I/O 队列拖垮。
+
+\begin{warningbox}
+流式输出是运行时协议，不是把每个 token 打印出来。它必须和 session 生命周期、KV cache 释放、取消、超时、trace 和 backpressure 绑定。
+\end{warningbox}
+
+\section{容量预算和 admission control}
+
+业务服务最先撞到的不是“能不能生成一句话”，而是能同时服务多少请求。admission control 的职责是在请求进入 decode 前判断资源是否足够。最小预算包括权重、packed weight、KV cache、activation arena、workspace、队列和系统余量。
+
+\begin{lstlisting}[numbers=none,caption={请求进入前的容量判断}]
+required_kv_bytes =
+  layers * max_context_tokens * kv_heads * head_dim *
+  2 /* K and V */ * kv_bytes_per_element
+
+required_runtime_bytes =
+  required_kv_bytes +
+  activation_arena_bytes +
+  workspace_bytes +
+  trace_buffer_bytes
+\end{lstlisting}
+
+若使用前文 7B 级 GQA 参数，\code{L=32}、\code{kv\_heads=8}、\code{head\_dim=128}、fp16 KV、\code{4096} context，一个 session 的 KV cache 约 \code{512 MiB}。若 int4 权重约 \code{3.7 GiB}，机器剩余可用内存 \code{10 GiB}，理论上不能简单做 \code{10 GiB / 512 MiB}。还要扣掉 packed weight、arena、workspace、allocator 碎片、线程栈、页表和操作系统余量。
+
+admission decision 应该结构化：
+
+\begin{lstlisting}[numbers=none,caption={AdmissionDecision 字段}]
+AdmissionDecision:
+  accepted: true | false
+  reason:
+    ok | context_too_long | memory_budget_exceeded |
+    queue_overloaded | backend_unavailable
+  selected_plan_id
+  reserved_kv_bytes
+  reserved_workspace_bytes
+  estimated_ttft_ms
+  estimated_decode_tokens_per_s
+\end{lstlisting}
+
+这让业务层能给出明确错误：上下文太长、内存不够、队列满、GPU 后端不可用，而不是笼统返回“生成失败”。也让运维能知道是容量问题还是正确性问题。
+
+\section{SLO 要分首 token 和后续 token}
+
+推理服务的延迟目标不能只写一个平均响应时间。至少要拆成：
+
+\begin{itemize}
+  \item \term{TTFT}{time to first token}：从请求进入到第一个 token 可输出。
+  \item decode p50/p95：每个后续 token 的延迟分布。
+  \item prefill tokens/s：prompt 处理吞吐。
+  \item decode tokens/s：生成阶段吞吐。
+  \item queue wait：进入模型前等待了多久。
+  \item memory peak：请求期间峰值内存或显存。
+\end{itemize}
+
+prompt 很长但输出很短时，TTFT 主要由 tokenizer、prefill、KV 写入和首个 sampler 决定；prompt 较短但输出很长时，decode p95、KV 读流和 sampler 更重要。若服务端合批，平均 tokens/s 可能上升，但单请求 p95 可能变差，因为请求要等待同批次其他 session。
+
+\begin{lstlisting}[numbers=none,caption={业务 SLO 报告字段}]
+ServiceSloReport:
+  prompt_bucket
+  max_context_bucket
+  backend_plan_id
+  quant_profile_id
+  queue_wait_p50_p95
+  ttft_p50_p95
+  decode_step_p50_p95
+  tokens_per_second
+  rejection_rate
+  memory_peak_bytes
+  fallback_count
+\end{lstlisting}
+
+有了这些字段，才谈得上把第三册内容落到一个本地助手、RAG 服务、代码补全服务或批量摘要服务里。不同业务目标会选择不同 profile，但底层证据字段是同一套。
+
+\section{错误也要沿链路定位}
+
+链路完整的好处是错误能定位。若生成结果不对，不要直接怀疑 sampler 或模型质量，而要按链路缩小范围：
+
+\begin{itemize}
+  \item tokenizer 输出是否和 reference 一致。
+  \item manifest 中 embedding、lm head、Q/K/V、MLP 权重角色是否正确。
+  \item shape/dtype/quant verifier 是否通过。
+  \item packed weight 与 reference converter 是否一致。
+  \item 单算子 oracle 是否通过。
+  \item 层输出 oracle 从哪一层开始漂移。
+  \item logits top-k 是否变化。
+  \item sampler 固定 seed 后是否仍然分叉。
+\end{itemize}
+
+性能问题也一样。首 token 慢，不等于 decode 慢；decode 慢，不等于所有 kernel 都慢；GPU kernel 时间低，不等于端到端快。profiler 要沿链路拆：load、prepare、prefill、decode、sample、copy、sync、fallback。
+
+\section{用 trace 把链路变成证据}
+
+链路如果只存在于图里，仍然不能维护。每次运行都应该能输出一个轻量 trace，让 correctness 和 performance 共享同一套定位坐标。trace 不必一开始很复杂，但字段要稳定。
+
+\begin{lstlisting}[numbers=none,caption={端到端推理 trace 的最小字段}]
+RunTrace:
+  run_id
+  model_id
+  manifest_hash
+  backend_plan_id
+  quant_profile_id
+  prompt_tokens
+  generated_tokens
+  events:
+    stage
+    segment_id
+    layer_id
+    backend
+    context_length
+    start_ns
+    end_ns
+    bytes_read_estimate
+    bytes_written_estimate
+    oracle_status
+\end{lstlisting}
+
+\code{manifest_hash} 追溯模型语义；\code{backend_plan_id} 追溯 kernel、layout 和 fallback；\code{quant_profile_id} 追溯误差阈值和量化格式；\code{context_length} 让 decode 指标可分档。trace 坐标稳定，后续 CPU SIMD、GPU kernel 和 KV cache 量化报告才可比较。
+
+\section{本章验收线}
+
+读完本章，应该能用一条链路解释全书：
+
+\begin{itemize}
+  \item 模型资产先变成 manifest 和 typed graph，再 lowering 成 executable plan。
+  \item 请求运行时绑定 token、KV cache、arena、workspace、sampler、oracle 和 profiler。
+  \item prefill 与 decode 是两种形态，不能强行共用一个性能模型。
+  \item 模型、编译、请求和算子生命周期必须分开，否则内存、状态和测量都会串扰。
+  \item executable plan 要显式记录 segment、backend、workspace、状态读写、oracle checkpoint 和 profiler label。
+  \item 正确性和性能问题都应该沿链路定位，而不是从最终文本倒猜。
+  \item 端到端 trace 要让模型语义、后端计划、量化 profile、context length 和事件耗时可追溯。
+\end{itemize}

@@ -1,0 +1,425 @@
+\chapter{实施路线图：从最小闭环到可对标后端}
+
+\section{不要从最终形态开始}
+
+第一册和第二册体量大，是因为它们把基础、实验和系统边界都展开了。第三册也需要完整链路，但不能用“同时实现所有后端、所有量化、所有 GPU kernel”的方式推进。正确路线是先建立最小闭环，再逐步替换瓶颈路径。
+
+\begin{lstlisting}[numbers=none,caption={第三册项目的实施顺序}]
+M0: reference scalar slice
+M1: manifest + verifier + typed graph
+M2: prefill/decode runtime with KV cache
+M3: CPU packed weight + SIMD kernel
+M4: quantization descriptor + oracle
+M5: GPU hardware-aware backend plan
+M6: profiler + regression gate + framework comparison
+\end{lstlisting}
+
+每一阶段都必须能构建、能运行、能报告。否则项目会变成一堆互相等待的半成品。
+
+\section{阶段任务拆到可执行粒度}
+
+路线图只有阶段名还不够。下面把每个阶段拆成能写代码、能验收、能形成章节实验的任务。
+
+\topic{M0：reference scalar slice。} 目标是写出最小可复现推理数学，而不是追求速度。任务包括：固定 tokenizer fixture；构造一层或两层 decoder slice；实现 RMSNorm、linear、RoPE、causal attention、SwiGLU、lm head 的标量 reference；固定 prompt 和 sampler seed；输出 logits golden。验收标准是同一输入在不同机器上得到同一组 logits 或在严格阈值内一致。
+
+\topic{M1：manifest + verifier + typed graph。} 目标是让模型资产变成可检查数据。任务包括：定义 TensorDesc、QuantDesc、OperatorDesc、KVCacheDesc；读取模型 manifest；检查 shape、dtype、axis、group size、scale count、RoPE 参数、GQA head 映射；为坏资产写负例测试。验收标准不是“好模型能加载”，而是坏模型能被准确拒绝。
+
+\topic{M2：prefill/decode runtime with KV cache。} 目标是建立真正推理循环。任务包括：实现 SessionState；区分 prefill 与 decode；分配 KV cache；记录 model position；实现 append/read 合同；支持 context limit；把 logits 接给 sampler。验收标准是多轮生成不会串状态，prefix、左 padding 或截断场景能定位 position。
+
+\topic{M3：CPU packed weight + SIMD kernel。} 目标是把 decode 热路径从 reference 推到可测优化。任务包括：实现 packed weight cache；写 scalar baseline；写一个受限 dtype 的 SIMD micro-kernel；处理 tail；记录 packing time 与 kernel time；用 oracle 对比 reference。验收标准是小矩阵、非对齐、tail、不同 context length 都有测试。
+
+\topic{M4：quantization descriptor + oracle。} 目标是让低比特不是黑箱。任务包括：实现 int8/int4 converter；支持 per-channel 或 per-group scale；记录 calibration id；实现 byte oracle、operator oracle、logits oracle；报告容量、metadata、误差和 latency。验收标准是能解释量化带来的收益和误差，不只报告模型文件变小。
+
+\topic{M5：GPU hardware-aware backend plan。} 目标不是一开始写最快 GPU kernel，而是建立 GPU 后端合同。任务包括：DeviceBuffer、Stream、Event、Workspace、StagingBuffer；capability query；device 常驻权重；KV cache device layout；StepTrace；fallback report。验收标准是 prefill/decode 分开报告 launch、copy、kernel、sync、sampler 和端到端 latency。
+
+\topic{M6：profiler + regression gate + framework comparison。} 目标是让项目能长期演进。任务包括：统一 profiler event schema；固定 prompt set；固定 benchmark warmup 和迭代；记录硬件和 backend plan；建立 L0-L3 CI；与成熟框架拆项对标。验收标准是一次优化能说明改了什么、快在哪里、误差多少、是否影响 p95 和内存峰值。
+
+这些任务连起来以后，读者能做的不是一个“会打印几句话”的玩具，而是一个可解释的本地推理原型：能加载受限模型资产，能跑 prefill/decode，能维护 KV cache，能做 CPU 低比特优化，能接 GPU plan，能用 oracle/profiler 判断改动是否成立。它仍然不是完整商业框架，但已经具备业务推理服务最核心的工程骨架。
+
+\section{每个阶段交付什么}
+
+\begin{center}
+\begin{tabular}{p{0.12\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+阶段 & 交付物 & 验收 \\
+\midrule
+M0 & 小模型或模型切片 reference & 固定 prompt 的 logits 可复现 \\
+M1 & manifest、schema、verifier & 坏模型资产能给明确诊断 \\
+M2 & session、KV cache、arena & prefill/decode 状态不串扰 \\
+M3 & CPU packing、SIMD、线程初版 & 单算子和端到端都有 profiler \\
+M4 & int8/int4/KV quant 合同 & oracle 报告误差和容量收益 \\
+M5 & GPU capability、device plan & prefill/decode 分别报告 launch/copy/kernel \\
+M6 & benchmark 与对标 & 与外部框架差距可解释 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表补齐了“链路不完善”的问题：每一章讲的对象都必须落到某个阶段。manifest 不是文档，属于 M1；KV cache 不是注意力小技巧，属于 M2；SIMD 和 packing 属于 M3；量化不是脚本，属于 M4；GPU 硬件不是背景知识，属于 M5；工程验收属于 M6。
+
+\section{每阶段只允许欠一种债}
+
+路线图不能变成口号。每个阶段可以保守，但不能同时欠正确性、性能和诊断三种债。
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 可以暂缓 & 不能暂缓 \\
+\midrule
+M0 & 速度、完整模型 & reference 可复现 \\
+M1 & 激进优化 & manifest/verifier 诊断 \\
+M2 & 多后端 & prefill/decode 状态边界 \\
+M3 & GPU & CPU oracle 与 profiler \\
+M4 & 所有格式 & 量化合同和误差报告 \\
+M5 & 最优 kernel & capability、fallback、copy/sync 账本 \\
+M6 & 新功能 & 回归门禁和对标解释 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{C++20 目录怎样随阶段增长}
+
+目录应随阶段增长，而不是一开始创建一堆空模块。
+
+\begin{lstlisting}[numbers=none,caption={目录增长路线}]
+M0:
+  include/ai/reference/
+  tests/reference/
+
+M1:
+  include/ai/model/
+  include/ai/graph/
+  src/model/
+  src/graph/
+
+M2:
+  include/ai/runtime/
+  src/runtime/
+
+M3:
+  include/ai/backend/cpu/
+  src/backend/cpu/
+
+M4:
+  include/ai/quant/
+  src/quant/
+
+M5:
+  include/ai/backend/gpu/
+  src/backend/gpu/
+
+M6:
+  tools/bench/
+  tools/oracle/
+  tools/report/
+\end{lstlisting}
+
+这个路线遵守 C++20 工程纪律：所有权对象和 view 分开，descriptor 是小值对象，pass 和 analysis 分开，backend 不解析模型文件，runtime 不重新做编译。每个阶段新增目录时，都要同步新增测试和报告字段。
+
+\section{每个里程碑的最小代码形态}
+
+路线图还要能落到最小代码。下面不是完整目录，而是每个阶段至少要出现的核心类型。
+
+\begin{lstlisting}[numbers=none,caption={M0-M2 的核心类型}]
+M0:
+  TensorView
+  ReferenceLinear
+  ReferenceRmsNorm
+  ReferenceAttention
+  GoldenLogitsFixture
+
+M1:
+  ModelManifest
+  TensorDesc
+  QuantDesc
+  GraphNode
+  ShapeVerifier
+  Diagnostic
+
+M2:
+  SessionState
+  KVCache
+  ActivationArena
+  SamplerState
+  RunTrace
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={M3-M6 的核心类型}]
+M3:
+  CpuCapability
+  PackedWeight
+  MatmulKernelDesc
+  WorkPartition
+  CpuProfilerEvent
+
+M4:
+  QuantConverter
+  PackedWeightOracle
+  OperatorOracle
+  QuantErrorReport
+
+M5:
+  GpuCapability
+  DeviceBuffer
+  Stream
+  Event
+  Workspace
+  StepTrace
+
+M6:
+  BenchmarkFixture
+  PerformanceGate
+  ComparisonReport
+  CiFailure
+\end{lstlisting}
+
+这些类型的存在比目录名更重要。若项目已经有 \code{SessionState} 和 \code{KVCache}，但没有 \code{RunTrace}，说明能跑但不可解释；若有 \code{PackedWeight}，但没有 \code{PackedWeightOracle}，说明优化不可验证；若有 GPU kernel，但没有 \code{StepTrace}，说明只能看 kernel 时间，不能看端到端。
+
+\section{最小可演示业务闭环}
+
+第三册项目的第一个业务闭环不应该追求全功能聊天系统，而应该是一个可解释的本地生成服务：
+
+\begin{lstlisting}[numbers=none,caption={最小可演示业务闭环}]
+load_model(model_dir)
+compile_plan(model_id, backend_policy, quant_profile)
+
+request:
+  prompt
+  max_new_tokens
+  temperature
+  trace_level
+
+response:
+  streamed tokens
+  finish reason
+  usage
+  trace summary
+\end{lstlisting}
+
+验收不是“能回答问题”，而是：
+
+\begin{itemize}
+  \item 错模型能被 manifest/verifier 拒绝。
+  \item 正模型能输出固定 prompt 的 deterministic logits。
+  \item 开启 trace 后能看到 prefill、decode、sampler 耗时。
+  \item 超过 context limit 会被 admission control 拒绝。
+  \item 取消请求会释放 KV cache。
+  \item 改量化 profile 后能看到容量、误差和速度变化。
+\end{itemize}
+
+这个闭环已经能支撑真实业务原型：本地助手、RAG 回答、批量摘要、代码补全都可以接在它上面。后续优化只是在同一合同下替换 backend plan，而不是重写整条服务链。
+
+\section{何时算第三册链路完成}
+
+第三册不是要在一章里实现完整工业推理框架，但书稿链路应该完整。链路完成的标准是：读者能从任意一个对象追到上游语义和下游执行。
+
+\begin{itemize}
+  \item 看到 \code{QuantDescriptor}，能追到 manifest、verifier、IR、packing、oracle。
+  \item 看到 \code{KVCacheDesc}，能追到 prefill 写入、decode 读取、layout、量化、profiler。
+  \item 看到 \code{GpuKernelDesc}，能追到 GPU capability、block/warp、stream、staging、fallback。
+  \item 看到 benchmark 数字，能追到模型、prompt、backend plan、硬件、oracle 和 baseline。
+\end{itemize}
+
+这比单纯增加页数更重要。内容要补，但每一页都要服务链路。
+
+\section{八周实现节奏：每周都要有可运行产物}
+
+如果把第三册内容落实成一个学习项目，可以按八周推进。这里的“周”不是日历硬要求，而是任务切片：每一段都必须能构建、能运行、能验收。
+
+\begin{center}
+\begin{tabular}{p{0.12\linewidth}p{0.31\linewidth}p{0.39\linewidth}}
+\toprule
+阶段 & 本周交付物 & 必须证明的事 \\
+\midrule
+W1 & tiny tensor、RMSNorm、Linear reference & shape、stride、dtype 错误能被拒绝 \\
+W2 & RoPE、attention、KV cache reference & position、head 映射、causal mask 正确 \\
+W3 & tiny decoder end-to-end logits & 固定 prompt 的 logits 和 token 序列可复现 \\
+W4 & manifest、verifier、typed graph & 坏模型资产有明确诊断 \\
+W5 & executable plan、arena、trace & prefill/decode 生命周期可追踪 \\
+W6 & CPU packed weight 和一个 SIMD path & operator oracle 通过，tail path 被覆盖 \\
+W7 & int8/int4 descriptor 和量化 oracle & 容量、误差、速度能同时报告 \\
+W8 & bench、release report、框架对标 & 性能差距能拆到阶段和后端原因 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+每周都要保留一个命令行入口。比如 W1 不是“写好了类”，而是能运行：
+
+\begin{lstlisting}[numbers=none,caption={W1-W3 的命令行验收}]
+ai-oracle --fixture fixtures/tiny_rmsnorm.json
+ai-oracle --fixture fixtures/tiny_linear.json
+ai-oracle --fixture fixtures/tiny_rope_attention.json
+ai-generate --fixture fixtures/tiny_decoder.json --max-new-tokens 4
+\end{lstlisting}
+
+W4-W8 则开始进入真实工程链路：
+
+\begin{lstlisting}[numbers=none,caption={W4-W8 的命令行验收}]
+ai-inspect-model --model fixtures/tiny_model
+ai-compile-plan --model fixtures/tiny_model --backend cpu
+ai-generate --model fixtures/tiny_model --trace summary
+ai-bench --model fixtures/tiny_model --prompt-set prompts/smoke.jsonl
+ai-report --compare reports/current.json reports/baseline.json
+\end{lstlisting}
+
+命令能跑并不等于通过。每个命令都要输出结构化报告，报告里要有 fixture id、model id、backend plan id、quant profile、硬件、误差阈值、失败定位和复现命令。否则下一次回归时仍然要靠猜。
+
+\section{用户故事：从业务需求反推底层对象}
+
+第三册项目不是只给算法同学看的。一个业务开发者接本地推理服务时，会提出具体需求。每个需求都能反推出底层对象和测试。
+
+\begin{center}
+\begin{tabular}{p{0.25\linewidth}p{0.32\linewidth}p{0.27\linewidth}}
+\toprule
+业务需求 & 底层对象 & 验收方式 \\
+\midrule
+限制最长上下文 & tokenizer、admission、KV cache & 超限请求被拒绝并报告 token 数 \\
+流式返回 token & session、decode loop、event queue & token/final/error 事件顺序稳定 \\
+用户取消生成 & scheduler、KV cache、arena & 取消后资源计数归零 \\
+切换 CPU/GPU & backend policy、plan report & fallback 可见且不改变语义 \\
+切换量化 profile & QuantDesc、packed weight、oracle & 容量、误差、速度差异可见 \\
+定位响应慢 & RunTrace、ProfilerEvent & TTFT 和 decode p95 可拆分 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表说明“能不能做实例业务开发”的答案不是靠宣传，而是靠对象边界。没有 admission control，就不能可靠限制上下文；没有 session 和资源释放，就不能安全取消；没有 trace，就不能解释慢请求；没有 oracle，就不能安全切换量化和后端。
+
+\section{每个里程碑的测试夹具}
+
+测试夹具要跟随路线图增长。不要等到真实 7B 模型才开始测，那样一次失败会同时涉及 tokenizer、权重、RoPE、KV cache、量化和后端。
+
+\begin{lstlisting}[numbers=none,caption={夹具增长路线}]
+M0:
+  tiny_tensor_contiguous
+  tiny_tensor_strided
+  tiny_rmsnorm_zero_and_large
+  tiny_linear_known_answer
+
+M1:
+  manifest_good
+  manifest_bad_vocab_embedding
+  manifest_bad_qkv_shape
+  manifest_bad_quant_group
+
+M2:
+  rope_position_0
+  rope_prefix_position
+  attention_causal_mask
+  kv_append_read_gqa
+  context_limit_reject
+
+M3:
+  packed_weight_roundtrip
+  cpu_tile_tail_n
+  cpu_tile_tail_k
+  cpu_non_aligned_input
+  cpu_thread_partition
+
+M4:
+  int8_per_channel
+  int4_group32
+  int4_group64_tail
+  kv_quant_score_error
+
+M5:
+  gpu_capability_missing
+  gpu_fallback_cpu
+  gpu_staging_copy
+  gpu_stream_event_trace
+
+M6:
+  smoke_prompt_set
+  long_context_prompt_set
+  release_benchmark_set
+\end{lstlisting}
+
+每个 fixture 都要有一句解释：它保护哪条合同。比如 \code{manifest\_bad\_qkv\_shape} 保护模型导入和 head 维度，\code{kv\_append\_read\_gqa} 保护 query head 到 KV head 的映射，\code{int4\_group64\_tail} 保护最后一组不足 group size 时的 scale 和 nibble 顺序。
+
+\section{负例诊断要从第一天写}
+
+只测成功路径会让项目看起来进展快，但后期会付出更大代价。下面是必须尽早写的负例。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.35\linewidth}p{0.25\linewidth}}
+\toprule
+负例 & 正确诊断 & 不合格表现 \\
+\midrule
+tokenizer vocab 与 embedding 行数不一致 & 指出两者实际值和来源文件 & decode 时访问越界 \\
+\code{query\_heads} 不能整除 \code{kv\_heads} & 拒绝 GQA head 映射 & attention 中取整凑合 \\
+RoPE base 或 scaling 缺失 & 指出缺失字段和默认策略 & 静默使用错误默认值 \\
+int4 scale 数量不匹配 & 指出 group 数、实际 scale 数 & 解包时读越界或错 scale \\
+context 超过容量 & 返回 context limit 错误 & KV cache 自动扩容到失控 \\
+GPU 不支持某 dtype & plan 阶段 fallback 或拒绝 & kernel launch 失败才报错 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+诊断不要求长，但必须具体。读者应该从错误里知道下一步检查什么，而不是只看到 \code{invalid argument}。
+
+\section{从 M0 到 M6 的代码增长原则}
+
+路线图容易出现两种坏倾向：一开始设计过度，或者一路写临时函数不回收。比较稳的原则是：
+
+\topic{M0-M2 先保守。} 类型少、逻辑直、输出多。reference 可以慢，但不能模糊。所有 state 都显式传参，尤其是 \code{model\_position}、\code{layer\_id} 和 \code{kv\_head}。
+
+\topic{M3-M4 开始分离描述符。} 一旦出现 packed weight、SIMD、int4、scale，就必须有 descriptor。不要让 kernel 通过约定猜 layout。descriptor 要能打印到 plan report，oracle 要能使用同一 descriptor 解释字节。
+
+\topic{M5 接 GPU 时先建资源边界。} 先实现 \code{DeviceBuffer}、\code{Stream}、\code{Event}、\code{Workspace} 和 fallback report，再追求 kernel 性能。否则 GPU 路径会把 copy、sync、launch 和 kernel 时间混成一团。
+
+\topic{M6 固化报告。} 性能报告、release report 和 comparison report 的字段要稳定。优化可以变，报告坐标不能变；否则两次 benchmark 无法比较。
+
+\section{不要用这些方式推进}
+
+有几种推进方式看似快，其实会破坏全书主线。
+
+\begin{warningbox}
+\begin{itemize}
+  \item 不要先下载一个真实大模型，靠改到能跑来倒推架构。真实模型只会同时暴露太多问题。
+  \item 不要直接调用外部框架得到结果后，把项目包装成服务。那样学不到 manifest、IR、KV cache、量化和后端合同。
+  \item 不要在没有 reference 的情况下写 SIMD 或 GPU。错误会被隐藏到 logits 漂移里。
+  \item 不要把量化当文件压缩。量化必须有 scale、zero point、accumulator、requantize、oracle 和质量报告。
+  \item 不要只报平均 tokens/s。必须拆 TTFT、prefill、decode、p95、内存峰值和 fallback。
+\end{itemize}
+\end{warningbox}
+
+\section{大师级 AI Infra 的硬证据}
+
+读完第三册不应该只证明“系统学习过”。大师级 AI Infra 岗位看的是工程证据：能不能把原理落实成可运行系统、可复现实验、可解释性能差距和可维护测试。当前第三册的书稿能打基础，但仅靠书稿本身不能证明生产级能力。必须把 \filepath{labs/linux_cpu_inference/} 从教学 demo 推进到证据项目。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+证据层 & 必须交付 & 不合格表现 \\
+\midrule
+手写 kernel & scalar、packed、AVX2/AVX-512、tail、反汇编 & 只讲 GEMM 原理 \\
+推理 runtime & tensor、operator registry、executor、planner、thread pool & 只有单函数 demo \\
+系统对标 & oneDNN/OpenBLAS/ONNX Runtime/llama.cpp/ggml 至少两个 & 只报自家数字 \\
+性能报告 & latency、吞吐、IPC、cache miss、branch miss、NUMA、shape sweep & 只报平均 tokens/s \\
+测试体系 & golden、随机 shape、边界 shape、fuzz、sanitizer、CI & 只测一个 happy path \\
+开源证据 & 文档、benchmark、测试或小 bug 修复被合并 & 闭门写报告 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此，\code{linux\_cpu\_inference} 的验收线要升级。第一阶段已经有 int8 MLP、tiny reference decoder、int8 scalar baseline、packed layout 和 shape sweep benchmark；这只能说明项目开始接触真实工程边界。下一阶段必须补：
+
+\begin{itemize}
+  \item Release benchmark 固定 CSV 输出，记录 compiler、flags、CPU、thread count 和 commit。
+  \item AVX2 或 AVX-512 int8 GEMV/GEMM kernel，至少覆盖一个 decode 热路径 shape。
+  \item Linux \code{perf stat} wrapper，收集 cycles、instructions、IPC、cache misses、branches、branch misses。
+  \item oneDNN 或 OpenBLAS 对照，再选 llama.cpp 或 ggml 做推理侧对照。
+  \item random shape、tail shape、非对齐 shape、bad descriptor 和 sanitizer。
+\end{itemize}
+
+这条线不容易，但它是“刀胚开刃”的标准。没有这些证据，第三册最多是一套学习材料；补齐之后，它才会变成能拿给 AI Infra 团队看的工程作品。
+
+\section{本章验收线}
+
+读完本章，应该能把第三册项目拆成可推进的阶段：
+
+\begin{itemize}
+  \item 先 reference，再 manifest/verifier，再 runtime，再 CPU/GPU/quant 优化。
+  \item 每阶段都有交付物和验收，不把 correctness、performance 和 diagnostics 分开欠账。
+  \item C++20 目录随阶段增长，避免大而空或单文件堆叠。
+  \item 链路完成标准是对象能追溯，不是页数本身。
+\end{itemize}

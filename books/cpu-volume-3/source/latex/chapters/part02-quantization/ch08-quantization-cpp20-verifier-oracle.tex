@@ -1,0 +1,783 @@
+\chapter{量化工程实现：C++20 descriptor、校准记录、oracle 与回归门禁}
+
+\section{为什么量化实现不能只写一个转换脚本}
+
+前两章已经说明，量化不是把 \code{float} 改成 \code{int8}，也不是把两个 int4 塞进一个字节就结束。真正的工程问题是：模型文件、编译前端、IR pass、后端 packing、runtime、oracle 和 profiler 必须对同一份量化语义达成一致。只要其中一层用自己的口径解释 scale、zero point、group size 或 tail policy，输出就可能稳定地错。
+
+先看一个实际会发生的错误。转换脚本把某层 MLP 的 \code{Wup} 权重量化成 int4，每 64 个输入通道共享一个 scale。后端为了 SIMD 方便，把权重重排成 \code{16 x 64} 的 panel。若 packing 只移动 int4 code，没有把每个 group 的 scale 按同样 panel 顺序重排，kernel 会读取错误 scale。这个错误不一定崩溃，也不一定产生 NaN；它更可能让某些 token 的 logits 轻微漂移，直到长生成时才表现为质量变差。
+
+\begin{keyidea}
+量化工程实现的核心不是某个低位宽格式，而是结构化元数据和验收链路。C++20 项目必须让 descriptor、verifier、packing、kernel、oracle 和 profiler 使用同一套量化合同。
+\end{keyidea}
+
+本章把量化落到 C++20 项目结构。目标不是给出某个库的完整代码，而是讲清楚每个模块应该负责什么、哪些字段必须显式保存、哪些错误应该在编译前端拦住、哪些误差应该在 oracle 中报告、哪些性能收益必须由 profiler 证明。
+
+\section{QuantDescriptor：量化合同的最小载体}
+
+一个量化张量至少有三层身份。第一层是逻辑身份：它近似表达的是浮点权重、activation 还是 KV cache。第二层是存储身份：字节里到底是 int8、uint8、int4、nf4、fp8，scale 是 fp16 还是 fp32。第三层是计算身份：kernel 怎样反量化、累加和输出。把这三层都压进一个 \code{dtype=q4} 字符串，是后续混乱的源头。
+
+\begin{lstlisting}[numbers=none,caption={QuantDescriptor 的工程字段}]
+QuantDescriptor:
+  logical_value: weight | activation | kv_cache
+  storage_format: int8 | uint8 | int4 | nf4 | fp8
+  bit_width
+  signedness
+  scale_dtype: f16 | f32
+  zero_point_policy: none | symmetric | asymmetric
+  granularity: tensor | channel | group | token | block
+  axis
+  group_size
+  block_size
+  scale_shape
+  zero_point_shape
+  packed_order
+  tail_policy
+  calibration_id
+  error_contract_id
+\end{lstlisting}
+
+这些字段看起来多，但每一个都能对应一个真实错误。没有 \code{signedness}，int4 code 的符号扩展可能错；没有 \code{axis}，per-channel scale 会沿错维度读取；没有 \code{scale_shape}，verifier 无法判断 scale 数量是否匹配；没有 \code{packed_order}，高 nibble 和低 nibble 的解释会不一致；没有 \code{tail_policy}，最后一组不整除 group size 时会出现后端分歧。
+
+\begin{warningbox}
+descriptor 的目标不是让代码显得正规，而是禁止后端猜测。任何需要 kernel 根据 tensor name、文件路径或隐含模型家族推断的量化事实，都应该提升为 descriptor 字段。
+\end{warningbox}
+
+在 C++20 中，descriptor 应该是一个轻量、可拷贝或可引用的值对象。它不拥有大内存，不打开文件，不选择 kernel。它只描述合同，并能被 manifest、verifier、IR、packing、runtime 和报告共同引用。
+
+\begin{lstlisting}[numbers=none,caption={C++20 中 descriptor 的责任边界}]
+QuantDescriptor
+  owns: small enum fields, shape metadata, ids
+  does not own: tensor bytes, scale buffer, backend packed bytes
+
+TensorDesc
+  shape, stride, dtype, layout, device
+  optional QuantDescriptor id
+
+TensorStorage
+  byte span or owned buffer
+  file mapping or allocated memory
+\end{lstlisting}
+
+这样拆分以后，模型导入可以先建立 \code{TensorDesc} 与 \code{QuantDescriptor}；后端 prepare 阶段再用它们生成 \code{PackedWeightDesc}；runtime 执行时只绑定已经验证过的 descriptor 和 buffer。
+
+\section{CalibrationRecord：校准不是临时日志}
+
+校准选择 scale。scale 选择错了，后端再快也只是高效地产生错误近似。工程上不能只在转换脚本里打印一行 \code{calibrated}，而要保存可追溯的校准记录。
+
+\begin{lstlisting}[numbers=none,caption={校准记录需要保存的事实}]
+CalibrationRecord:
+  calibration_id
+  tensor_name_or_role
+  dataset_id
+  sample_count
+  token_length_buckets
+  algorithm: minmax | percentile | mse_search | kl | runtime
+  clipping_policy
+  observed_min
+  observed_max
+  saturation_rate
+  scale_summary
+  created_by_tool_version
+\end{lstlisting}
+
+对权重，校准记录主要说明扫描范围和算法。对 activation，校准记录必须说明代表性输入。对 KV cache，校准更复杂，因为 K/V 是运行时状态；报告应该按 prompt 类型、context length 和层/头维度统计范围。如果一个量化模型只给出 scale 文件，却没有校准记录，后续质量问题很难定位：是模型本身不适合低比特，还是校准集太偏，还是后端解释错了 metadata？
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+对象 & 校准重点 & 必须警惕的偏差 \\
+\midrule
+权重 & 每层/每通道/每组范围 & 极端值拉大 scale，尾组处理不一致 \\
+activation & 代表性 prompt 和 batch 形态 & 校准集短、语言单一、没有代码或长上下文 \\
+KV cache & position、head、context length 分布 & 短上下文通过，长上下文漂移 \\
+logits & 采样前分布稳定性 & top-k 变化被均值误差掩盖 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+校准记录要进入 manifest 或伴随 manifest 存放。verifier 不一定重新校准，但它应该能检查记录是否存在、是否与当前张量匹配、scale 数量是否一致、后端是否支持这种量化策略。
+
+\section{verifier：把格式错误停在热路径之前}
+
+量化 verifier 至少分三层。第一层检查元数据完整性；第二层检查 shape 与 scale 数量；第三层检查后端支持。不要把这些检查推给 kernel，因为 kernel 位于最难给出好诊断的地方。
+
+\begin{lstlisting}[numbers=none,caption={量化 verifier 的分层检查}]
+metadata checks:
+  bit_width is supported
+  storage format and signedness are explicit
+  scale dtype exists when format requires scale
+  zero point policy matches signedness
+
+shape checks:
+  quantized axis is valid
+  group count matches tensor shape and group size
+  scale tensor shape equals expected scale_shape
+  packed byte length matches bit_width and element count
+  tail policy exists when dimension is not divisible
+
+backend checks:
+  CPU/GPU backend supports this format
+  chosen kernel supports accumulator and output dtype
+  alignment and packed order can be represented
+\end{lstlisting}
+
+诊断要像编译错误一样具体：
+
+\begin{lstlisting}[numbers=none,caption={量化 verifier 诊断示例}]
+error: tensor layers.21.mlp.wup.weight has invalid q4 scale shape
+  weight shape: [11008, 4096]
+  quant axis: input channel
+  group size: 64
+  expected scales per output row: 64
+  expected scale shape: [11008, 64]
+  actual scale shape: [11008, 63]
+  note: input dimension 4096 requires 4096 / 64 groups
+\end{lstlisting}
+
+这样的诊断能把问题定位到转换脚本或模型资产，而不是让用户面对 \code{segmentation fault}、\code{invalid argument} 或一堆错误 token。第一册强调过二进制和 ABI 的可信边界；这里的 verifier 就是在 AI 模型资产进入二进制热路径之前建立可信边界。
+
+\section{IR 中的量化节点：显式边界胜过隐式魔法}
+
+量化进入 IR 后，有两种常见表达。第一种是显式节点：\code{quantize}、\code{dequantize}、\code{requantize}、\code{quantized_linear}。第二种是在 tensor edge 上附加 quant descriptor，让某些算子直接消费量化边。两者都可以，但不能让量化完全隐藏在后端。
+
+\begin{lstlisting}[numbers=none,caption={显式量化 IR 的形状}]
+%wq = const_weight "layers.0.attn.wq.weight" : tensor<[4096,4096], q4_group>
+%x  = rmsnorm(%hidden, %gamma)               : tensor<[T,4096], f16>
+%y  = quantized_linear(%x, %wq)
+      {accumulator=f32, output=f16, qdesc=#q4_g64}
+      : tensor<[T,4096], f16>
+\end{lstlisting}
+
+显式表达带来三个好处。第一，pass 能看到量化边界，不会错误地把 dequant 移到不安全位置。第二，memory planner 能知道 scale 和 packed weight 的生命周期。第三，oracle 能在量化算子边界挂比较点。缺点是 IR 更复杂，需要 pass 明确处理量化节点。
+
+对于初学者，可以先采用保守策略：权重量化用 \code{quantized_linear} 直接表达；activation 量化用显式 \code{quantize/dequantize/requantize} 表达；KV cache 量化用 runtime descriptor 表达。这样语义边界最清楚，后续再根据性能需求做融合。
+
+\begin{warningbox}
+不要让优化 pass 看不见量化边界。一个融合 pass 如果不知道 linear 权重是 q4 group，就可能把需要 materialize 的 scale 读流藏进大 kernel，导致 oracle 难以定位误差。
+\end{warningbox}
+
+\section{packing：descriptor 到后端物理布局的转换}
+
+packing 是 lowering 的一部分，不是加载阶段的随手优化。它把逻辑量化张量转换成后端 kernel 喜欢的物理布局。一个 C++20 后端应该把 packing 输出描述清楚：
+
+\begin{lstlisting}[numbers=none,caption={PackedQuantizedWeightDesc 的最小内容}]
+PackedQuantizedWeightDesc:
+  source_tensor_id
+  backend_id
+  isa_or_device
+  panel_rows
+  panel_cols
+  tile_k
+  data_offset
+  data_bytes
+  scale_offset
+  scale_bytes
+  bytes_per_panel
+  scales_per_panel
+  alignment
+  tail_policy
+  checksum
+\end{lstlisting}
+
+这个 descriptor 让 kernel 可以按 panel 读取，不需要知道原始模型格式；也让诊断可以从 packed bytes 追溯到原始 tensor。若 oracle 发现某层误差突然变大，报告能指出它使用了哪个 packed descriptor、哪个 backend、哪个 ISA、哪个 group size，而不是只写“linear failed”。
+
+packing 要单独计时。若 int4 packing 花了 30 秒，但用户只生成 20 个 token，热路径的加速可能无法抵消加载时间；若服务端长期复用同一个模型，packing 成本就可以摊销。profiler 必须把 \code{pack_time_ms} 和 \code{decode_tokens_per_s} 分开，避免把 prepare 成本藏起来。
+
+\section{reference converter：先证明字节解释正确}
+
+低比特量化的第一层 oracle 不是比较最终生成文本，而是证明“字节到实数”的解释正确。reference converter 应该用最清楚的标量实现，不追求速度。它读取原始 int4/int8 bytes、scale、zero point 和 tail policy，输出一段 fp32 或 fp16 参考值。
+
+\begin{lstlisting}[numbers=none,caption={reference converter 的测试输入}]
+test cases:
+  one full group
+  dimension not divisible by group size
+  positive and negative int4 codes
+  high-nibble-first and low-nibble-first packed order
+  symmetric and asymmetric zero point
+  f16 and f32 scale storage
+\end{lstlisting}
+
+只有 converter 通过，才有资格测试 quantized linear。否则单算子误差可能来自字节解释、scale 数量、tail policy、SIMD 解包、累加顺序中的任何一个点。把验证分层，是编译器工程的基本方法：先验证低层事实，再验证组合行为。
+
+\section{reference decoder layer：把整层链条跑通}
+
+前一章和第 5 章已经把单个量化张量、attention 和 KV cache 的局部原理讲清楚。真正让工程变稳的，是有一条慢但可信的 reference decoder layer 路径，能把 embedding 之后的一层完整计算串起来。它不追求快，只追求语义清楚、边界明确、可逐点对比。
+
+\begin{lstlisting}[numbers=none,caption={reference decoder layer 的最小输入}]
+ReferenceLayerInput:
+  x_in                 // [T,H] or [1,H]
+  rms_attn_gamma       // [H]
+  wq, wk, wv, wo
+  rms_ffn_gamma        // [H]
+  wgate, wup, wdown
+  rope_cos, rope_sin
+  causal_mask or visible_range
+  kv_cache_in
+  layer_config         // heads, kv_heads, head_dim, eps
+\end{lstlisting}
+
+一层 reference path 至少分成下面几步：
+
+\begin{lstlisting}[numbers=none,caption={reference decoder layer 的语义步骤}]
+1. h_attn = rmsnorm(x_in, rms_attn_gamma)
+2. q = linear(h_attn, wq)
+3. k = linear(h_attn, wk)
+4. v = linear(h_attn, wv)
+5. q, k = apply_rope(q, k, position)
+6. kv_cache_out = append(kv_cache_in, k, v)
+7. attn_out = attention(q, kv_cache_out, visible_range)
+8. x_mid = x_in + linear(attn_out, wo)
+9. h_ffn = rmsnorm(x_mid, rms_ffn_gamma)
+10. g = linear(h_ffn, wgate)
+11. u = linear(h_ffn, wup)
+12. m = silu(g) * u
+13. x_out = x_mid + linear(m, wdown)
+\end{lstlisting}
+
+这条路径的价值在于：它天然给出很多中间比较点。量化 kernel、fused kernel、paged KV cache、GQA kernel、packed int4 linear，都不需要一上来和最终文本比较；它们可以先和 reference path 的某一步比较。只要中间某一步开始漂，定位范围就会大幅缩小。
+
+\section{中间检查点应该怎么定}
+
+一个实用的 oracle 链，不会只在最后比较 \code{x\_out}。至少应该暴露这些检查点：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.28\linewidth}p{0.34\linewidth}}
+\toprule
+检查点 & 张量形状 & 能定位的问题 \\
+\midrule
+\code{h_attn} & \code{[N,H]} & RMSNorm、输入 layout、dtype 转换 \\
+\code{q/k/v} & \code{[N,heads,d]} & linear、量化权重、head reshape \\
+\code{q_rope/k_rope} & \code{[N,heads,d]} & RoPE、位置编号、左右 padding \\
+\code{score row} & \code{[visible]} & GQA 映射、mask、量化 K 误差 \\
+\code{prob row} & \code{[visible]} & softmax、online normalization \\
+\code{attn_out} & \code{[N,H]} & V 读取、KV 量化、head merge \\
+\code{x_mid} & \code{[N,H]} & residual、Wo、accumulator dtype \\
+\code{g/u/m} & \code{[N,I]} & MLP 权重、SiLU、逐元素乘 \\
+\code{x_out} & \code{[N,H]} & 单层总输出合同 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这样设计后，kernel 出现误差时就不会只得到一句“最终 logits 不一致”。例如：若 \code{q/k/v} 正确但 \code{q_rope/k_rope} 开始偏移，问题就在位置合同；若 \code{score row} 正确但 \code{prob row} 错，问题就在 softmax 或 mask；若 \code{attn_out} 正确但 \code{x_mid} 错，问题就在 \code{Wo} 或 residual。
+
+\section{单 token decode 的 reference 流程}
+
+对 decoder-only 推理，最有工程价值的不是整段 prefill 一次性 reference，而是单 token decode reference。因为大多数性能优化、KV cache 问题、长上下文问题，都发生在这个循环里。最小流程可以写成：
+
+\begin{lstlisting}[numbers=none,caption={单 token decode 的 reference 流程}]
+input:
+  x_cur      // [1,H]
+  kv_cache   // all previous positions
+  pos        // absolute model position
+
+for each layer:
+  run reference decoder layer
+  update kv_cache
+
+last_hidden = x_cur
+logits = lm_head(last_hidden)
+\end{lstlisting}
+
+对这个流程，测试不能只断言“生成 token 对”。更好的做法是固定 prompt、固定 seed，把第 \code{t} 步 decode 的以下结果都落盘或比较：
+
+\begin{lstlisting}[numbers=none,caption={decode oracle 的逐步证据}]
+step t:
+  layer 0 q checksum
+  layer 0 score top entries
+  layer 0 attn_out checksum
+  layer L-1 x_out checksum
+  logits top-k
+  chosen next token
+\end{lstlisting}
+
+这样做虽然笨，但对工程极其有效。paged KV cache、GQA、int8/int4 KV、fused attention、speculative decode 验证失败时，都能回到第一个偏离的 step/layer/checkpoint。
+
+\section{把 reference decoder layer 落成 C++20 骨架}
+
+前面的步骤表已经说明“要算什么”，但工程上还需要回答“代码骨架怎么摆”。reference 路径最怕一开始就写成巨函数，把 tensor 视图、scratch buffer、checkpoint 和比较逻辑搅在一起。更稳的做法是先把数据边界钉死。
+
+\begin{lstlisting}[numbers=none,caption={reference path 的最小数据结构骨架}]
+enum class CheckpointKind {
+  HAttn,
+  Q,
+  K,
+  V,
+  QRope,
+  KRope,
+  ScoreRow,
+  ProbRow,
+  AttnOut,
+  XMid,
+  G,
+  U,
+  M,
+  XOut
+};
+
+struct TensorView final {
+  const float* data = nullptr;
+  std::array<int, 4> shape{};
+  std::array<int, 4> stride{};
+  int rank = 0;
+};
+
+struct MutableTensorView final {
+  float* data = nullptr;
+  std::array<int, 4> shape{};
+  std::array<int, 4> stride{};
+  int rank = 0;
+};
+
+struct LayerConfig final {
+  int hidden_size = 0;
+  int num_query_heads = 0;
+  int num_kv_heads = 0;
+  int head_dim = 0;
+  int ffn_intermediate = 0;
+  float rms_eps = 1.0e-5f;
+};
+
+struct CheckpointRecord final {
+  CheckpointKind kind;
+  std::vector<float> values;
+  std::vector<int> shape;
+};
+\end{lstlisting}
+
+\code{TensorView} 的目的不是炫技，而是强行把 reference path 和某个具体 runtime tensor 类解耦。reference 只需要“从哪里读、形状是什么、怎样走 stride”。这样 production path 用 arena、mmap、NUMA page、device buffer 都无所谓；reference 仍然能吃统一视图。
+
+单层 reference 的输入输出可以进一步压成：
+
+\begin{lstlisting}[numbers=none,caption={ReferenceLayer::run 的责任边界}]
+struct ReferenceLayerInput final {
+  TensorView x_in;
+  TensorView rms_attn_gamma;
+  TensorView wq, wk, wv, wo;
+  TensorView rms_ffn_gamma;
+  TensorView wgate, wup, wdown;
+  TensorView rope_cos;
+  TensorView rope_sin;
+  int position = 0;
+  int visible_begin = 0;
+  int visible_end = 0;
+};
+
+struct ReferenceLayerOutput final {
+  std::vector<float> x_out;
+  std::vector<float> k_append;
+  std::vector<float> v_append;
+  std::vector<CheckpointRecord> checkpoints;
+};
+
+class ReferenceLayer final {
+public:
+  explicit ReferenceLayer(LayerConfig cfg) : cfg_(cfg) {}
+  ReferenceLayerOutput run(const ReferenceLayerInput& in,
+                           const KvCacheView& kv_in) const;
+private:
+  LayerConfig cfg_;
+};
+\end{lstlisting}
+
+这里故意让 \code{run()} 返回 \code{k\_append/v\_append}，而不是在内部偷偷写全局 cache。原因很直接：reference 的第一职责是把每一步算清楚，第二职责才是和 runtime 状态衔接。若一开始就把 cache 写入隐藏在内部，prefill/decode 对齐和 checkpoint 定位都会变难。
+
+真正的 \code{run()} 内部流程，可以保持和数学合同一一对应：
+
+\begin{lstlisting}[numbers=none,caption={ReferenceLayer::run 的最小伪代码}]
+ReferenceLayerOutput ReferenceLayer::run(...) const {
+  auto h_attn = rmsnorm(in.x_in, in.rms_attn_gamma, cfg_.rms_eps);
+  save(HAttn, h_attn);
+
+  auto q = linear(h_attn, in.wq);
+  auto k = linear(h_attn, in.wk);
+  auto v = linear(h_attn, in.wv);
+  save(Q, q); save(K, k); save(V, v);
+
+  auto q_rope = apply_rope(q, in.rope_cos, in.rope_sin, in.position);
+  auto k_rope = apply_rope(k, in.rope_cos, in.rope_sin, in.position);
+  save(QRope, q_rope); save(KRope, k_rope);
+
+  auto score_row = attention_scores(q_rope, kv_in, k_rope,
+                                    in.visible_begin, in.visible_end);
+  save(ScoreRow, score_row);
+
+  auto prob_row = softmax_stable(score_row);
+  save(ProbRow, prob_row);
+
+  auto attn_out = attention_reduce(prob_row, kv_in, v);
+  save(AttnOut, attn_out);
+
+  auto x_mid = residual_after_wo(in.x_in, attn_out, in.wo);
+  save(XMid, x_mid);
+
+  auto h_ffn = rmsnorm(x_mid, in.rms_ffn_gamma, cfg_.rms_eps);
+  auto g = linear(h_ffn, in.wgate);
+  auto u = linear(h_ffn, in.wup);
+  auto m = silu_mul(g, u);
+  save(G, g); save(U, u); save(M, m);
+
+  auto x_out = residual_after_wdown(x_mid, m, in.wdown);
+  save(XOut, x_out);
+  return {...};
+}
+\end{lstlisting}
+
+这段骨架要点不在“写了多少 helper 函数”，而在于每一步都能独立落 checkpoint。生产后端可以融合 \code{QKV}、融合 \code{Wo+residual}、做 online softmax、做 paged KV、做低比特量化；但 reference 层故意不融合，因为它的职责是给每一条优化提供一个可对照的语义基线。
+
+有了 layer 级骨架，还需要一层专门做比较和报告：
+
+\begin{lstlisting}[numbers=none,caption={decode oracle 的比较与报告骨架}]
+struct CheckpointDiff final {
+  CheckpointKind kind;
+  float max_abs = 0.0f;
+  float mean_abs = 0.0f;
+  bool topk_changed = false;
+};
+
+struct DecodeStepReport final {
+  int step = 0;
+  int layer = 0;
+  std::vector<CheckpointDiff> diffs;
+  bool accepted = false;
+  std::string first_failure;
+};
+
+class DecodeOracle final {
+public:
+  DecodeStepReport compare(const ReferenceLayerOutput& ref,
+                           const ProductionLayerTrace& got,
+                           const ToleranceProfile& tol) const;
+};
+\end{lstlisting}
+
+这时 reference 和 oracle 的分工就非常明确：
+
+\begin{itemize}
+  \item \code{ReferenceLayer} 只负责“算出可信结果并导出检查点”。
+  \item \code{DecodeOracle} 只负责“按检查点规则比较并生成诊断”。
+  \item production backend 只负责“按性能目标运行并暴露必要 trace”。
+\end{itemize}
+
+这个拆法在后面接 paged KV、GQA、int4 weight、int8 KV、FlashAttention 风格 softmax 时都不会塌。因为无论优化路径怎样变，最小闭环都还是：
+\[
+\text{同一输入} \rightarrow \text{reference checkpoints} \leftrightarrow \text{production checkpoints} \rightarrow \text{diff report}
+\]
+没有这条骨架，所谓“oracle”往往只剩一句最终 logits 不一致，调试价值很低。
+
+\section{paged KV、GQA 和量化 KV 的 oracle 闭环}
+
+reference layer 只保存连续逻辑 KV 还不够。真实后端会把 KV cache 放进 page/block；GQA 会让多个 query head 共享一个 K/V head；KV 量化又会让 K/V 码点和 scale metadata 分开存。三者叠加后，错误不一定出现在 attention 算术本身，而可能出现在逻辑坐标到物理地址的映射。
+
+先把生产路径必须暴露的 trace 字段列出来：
+
+\begin{lstlisting}[numbers=none,caption={paged quantized KV 的最小 trace 字段}]
+KvAccessTrace:
+  step
+  layer
+  q_head
+  kv_head
+  model_position
+  visible_begin
+  visible_end
+  page_id
+  page_offset
+  slot_epoch
+  k_code_bytes
+  v_code_bytes
+  k_scale_id
+  v_scale_id
+  rope_position
+\end{lstlisting}
+
+这些字段看起来多，但每一个都对应真实故障。若 \code{q\_head -> kv\_head} 映射错，是 GQA 错；若 \code{model\_position} 和 \code{rope\_position} 不一致，是位置合同错；若 \code{page\_id/page\_offset} 指向旧 slot，是 paged cache 或 sliding window 错；若 \code{k\_scale\_id} 指错，是 KV 量化 metadata 错。
+
+reference 侧可以继续使用连续逻辑坐标：
+
+\begin{lstlisting}[numbers=none,caption={reference KV 逻辑读}]
+for q_head in query_heads:
+  kv_head = q_head / gqa_group_size
+  for pos in visible_begin..visible_end:
+    k_ref = K_ref[layer, kv_head, pos]
+    v_ref = V_ref[layer, kv_head, pos]
+    score_ref[pos] = dot(q_ref[q_head], k_ref) / sqrt(head_dim)
+\end{lstlisting}
+
+production 侧可以使用 page table、量化码点和 scale：
+
+\begin{lstlisting}[numbers=none,caption={production KV 物理读}]
+for q_head in query_heads:
+  kv_head = q_head / gqa_group_size
+  for pos in visible_begin..visible_end:
+    slot = page_table.lookup(session, pos)
+    k_q = read_k_codes(slot, layer, kv_head)
+    k_scale = read_k_scale(slot, layer, kv_head)
+    k = dequantize(k_q, k_scale)
+    score_got[pos] = dot(q_got[q_head], k) / sqrt(head_dim)
+\end{lstlisting}
+
+oracle 的闭环不是要求这两段代码长得一样，而是要求它们在同一逻辑坐标上给出可解释的差异。比较顺序应当从“坐标和字节解释”开始，而不是直接比较 logits：
+
+\begin{lstlisting}[numbers=none,caption={paged KV oracle 的比较顺序}]
+1. check visible set:
+     reference visible positions == production visible positions
+
+2. check GQA mapping:
+     kv_head == q_head / group_size
+
+3. check page mapping:
+     logical position -> page_id/page_offset is valid
+     slot epoch matches expected sequence
+
+4. check quantized bytes:
+     code bytes and scale ids are present
+     dequantized K/V match reference tolerance
+
+5. check attention:
+     score row, prob row, attn_out
+
+6. check layer/logits/token:
+     x_out, logits top-k, chosen token
+\end{lstlisting}
+
+这套顺序能把错误压到第一个可解释边界。比如：
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+首个失败点 & 典型原因 & 不该先怀疑什么 \\
+\midrule
+visible set & mask、sliding window、prefix 保留策略 & 量化精度 \\
+GQA mapping & query head 到 KV head 映射错 & softmax \\
+page mapping & page table、slot epoch、回绕复用 & linear 权重 \\
+quantized bytes & scale id、nibble order、tail policy & RoPE \\
+score row & K 量化、RoPE、head dim stride & sampler \\
+prob row & softmax、mask、online merge & Wq/Wk \\
+attn\_out & V 读取、head merge、Wo 前布局 & logits head \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对 KV 量化，oracle 还要同时保存两类误差：反量化误差和 attention 行为误差。反量化误差回答“bytes 是否按合同解释”；attention 行为误差回答“这些误差是否已经改变 score 排名和概率分布”。一个报告可以这样组织：
+
+\begin{lstlisting}[numbers=none,caption={KV quant oracle report 的核心字段}]
+KvQuantOracleReport:
+  context_length
+  layer
+  q_head
+  kv_head
+  visible_count
+  max_k_dequant_error
+  max_v_dequant_error
+  score_max_abs_error
+  score_top1_flipped
+  prob_kl_divergence
+  attn_out_max_abs_error
+  first_bad_position
+  first_bad_page
+  first_bad_scale_id
+\end{lstlisting}
+
+这份报告比“logits mismatch”更能指导修复。若 \code{max\_k\_dequant\_error} 很小但 \code{score\_top1\_flipped} 很多，说明问题不是字节解释，而是量化 profile 对该层/head 太激进。若 \code{first\_bad\_page} 总在 page 边界，优先查 page table、block size 和 scale metadata 布局。若只在 sliding window 回绕后失败，优先查 \code{slot\_epoch}、base position 和 RoPE position。
+
+\begin{keyidea}
+paged KV、GQA、KV 量化同时存在时，oracle 的第一任务不是证明最终文本像不像，而是证明“逻辑位置、K/V head、物理 page、量化 bytes、scale metadata、RoPE position”指向的是同一个历史 token。
+\end{keyidea}
+
+\section{一个失败定位例子：不是 softmax，是 scale page 错}
+
+假设某个优化后端在 \code{4096} token 以内全部通过，到了 \code{4097} token 后 logits 开始漂。只看最终输出，很容易误判为长上下文量化精度不够。按上面的 oracle 链排查，会得到更具体的证据：
+
+\begin{lstlisting}[numbers=none,caption={失败报告示例}]
+step: 4097
+layer: 18
+q_head: 12
+kv_head: 3
+first_failure: quantized bytes
+logical_position: 4096
+page_id: 64
+page_offset: 0
+slot_epoch: expected 1, got 0
+k_scale_id: expected 524288, got 516096
+score_max_abs_error: 0.184
+score_top1_flipped: true
+\end{lstlisting}
+
+这个报告已经把方向压得很窄：第 \code{4096} 位置刚好落到新 page，\code{page\_offset=0}，\code{slot\_epoch} 和 \code{k\_scale\_id} 都错。此时不应该去改 softmax，也不应该调大 logits 容忍度；应该检查 page 分配、scale metadata page stride、以及 sliding window 或 prefix cache 是否复用了旧 slot。
+
+如果修复后同一 case 变成：
+
+\begin{lstlisting}[numbers=none,caption={修复后报告应该收敛到数值误差}]
+visible set: pass
+GQA mapping: pass
+page mapping: pass
+quantized bytes: pass
+score_max_abs_error: 0.012
+score_top1_flipped: false
+attn_out_max_abs_error: 0.006
+logits_topk_changed: false
+\end{lstlisting}
+
+这才说明错误从“合同错误”退化成“可接受的数值近似”。量化优化必须先通过合同层，再讨论误差阈值。
+
+\section{prefill reference 不能只看最后一列}
+
+prefill 常被简化成“只看最后一个 token 的 logits”。这不够。prefill 一次性处理整个 prompt，任何一个中间位置的 causal mask、RoPE 位置或 attention 分块若出错，都可能在最后一列被部分掩盖。reference prefill 至少应该能检查：
+
+\begin{itemize}
+  \item 第一个位置是否只看自己；
+  \item 中间位置是否只看左侧历史；
+  \item 最后位置的 logits 是否匹配；
+  \item prefill 写入的 KV cache 是否与逐 token reference append 一致。
+\end{itemize}
+
+最后这一点很关键。一个正确的 prefill 实现，写出的 \code{K/V[0..T-1]} 应该和“把同一段 prompt 逐 token 跑 decode-style reference append”得到的结果一致。若两者不一致，后面的 decode 再快也建立在错误状态上。
+
+\begin{warningbox}
+prefill 和 decode 不能各自有一套“差不多对”的 reference。它们必须在共享的 KV cache 逻辑合同上闭合，否则很容易出现 prefill 通过、decode 通过、但 prefill 后接 decode 的真实路径失败。
+\end{warningbox}
+
+\section{容忍度应该按检查点分层}
+
+reference oracle 不是要求所有路径 bitwise 相等。不同后端、不同累加顺序、fused kernel、online softmax 都可能带来合法的微小差异。关键是容忍度要按检查点分层，而不是用一个统一阈值糊过去。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.28\linewidth}p{0.34\linewidth}}
+\toprule
+检查点 & 更合理的比较方式 & 原因 \\
+\midrule
+字节解释 & 严格相等 & 合同层，不应漂移 \\
+\code{q/k/v} & max abs / relative error & 累加顺序和量化会有微差 \\
+score row & top entries + max error & 小误差可能改变 softmax 排名 \\
+prob row & KL 或 top-1/top-k 位置 & 概率分布比逐元素更有意义 \\
+\code{x_out} & max abs / cosine similarity & 层输出是连续值 \\
+logits & top-k 变化 + max error & 直接关系采样 \\
+token 序列 & 固定 seed 下完全一致或记录首个偏离步 & 离散行为最终验收 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+工程上最糟糕的情况是：前面所有连续值比较都在阈值内，但 logits 的 top-k 排名在某些长上下文点上开始翻转。这个时候不能简单说“误差很小所以没问题”，而应该把它报告成采样敏感点。
+
+\section{C++20 项目里 oracle 链怎么落地}
+
+reference path 不应该塞进生产 kernel 文件里，更不应该被宏条件塞得到处都是。更好的结构是：
+
+\begin{lstlisting}[numbers=none,caption={reference/oracle 的项目结构草图}]
+reference/
+  reference_linear.cpp
+  reference_rmsnorm.cpp
+  reference_rope.cpp
+  reference_attention.cpp
+  reference_decoder_layer.cpp
+
+oracle/
+  quant_byte_oracle.cpp
+  operator_oracle.cpp
+  layer_oracle.cpp
+  decode_oracle.cpp
+\end{lstlisting}
+
+这样做的好处是边界清楚。reference 模块只负责算出可信结果；oracle 模块只负责比较和报告；生产后端只负责跑快。需要时，CI 或本地 debug 可以把同一 prompt 同时送进 production path 和 reference path，在某个 checkpoint 失败后立即停止。
+
+\begin{rubricbox}
+reference decoder layer 的最低验收线：
+\begin{itemize}
+  \item 单层 decode 能输出 q/k/v、score、prob、attn\_out、x\_mid、x\_out。
+  \item prefill 写出的 KV cache 能与逐 token reference append 对齐。
+  \item 容忍度按字节解释、连续值、概率分布、logits 和 token 序列分层。
+  \item 报告能指出首个偏离的 step、layer 和 checkpoint。
+\end{itemize}
+\end{rubricbox}
+
+\section{oracle：量化误差要按层次报告}
+
+量化 oracle 不能只给一个 \code{pass/fail}。它应该按层次报告误差，因为不同层次定位的问题不同。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+oracle 层次 & 比较对象 & 能定位的问题 \\
+\midrule
+字节解释 & packed bytes 反量化值 & nibble order、scale、zero point、tail \\
+单算子 & linear/attention/MLP 输出 & kernel、累加器、requantize \\
+层输出 & decoder block hidden state & 融合、arena 覆盖、layout 转换 \\
+logits & top-k、分布、最大误差 & 质量风险和采样敏感点 \\
+生成序列 & 固定 seed 的输出 token & 端到端可见行为变化 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+初学者最容易困惑的是：为什么 logits 有小误差，生成序列却完全不同？原因是采样是离散决策。若两个 token 的概率非常接近，轻微 logits 变化就可能改变 top-k 排序或采样结果。因此量化报告不能只看平均误差，还要看 top-k 变化、KL 或分布差异，以及固定 sampler 下的序列差异。
+
+\begin{lstlisting}[numbers=none,caption={量化 oracle 报告字段}]
+QuantOracleReport:
+  model_id
+  quant_profile_id
+  prompt_set_id
+  context_length_buckets
+  tensor_decode_failures
+  operator_error_by_layer
+  layer_output_error_by_position
+  logits_max_abs_error
+  logits_topk_changed
+  generated_token_mismatch
+  tolerance_profile
+\end{lstlisting}
+
+这份报告应该和 profiler 报告一起出现。一个 int4 优化如果速度提升 35\%，但 top-k 在某些中文长上下文 prompt 中大量变化，就不能直接算合格；反过来，如果 logits 几乎不变但 decode 变慢，也不能叫优化。
+
+\section{profiler：量化收益要拆成容量、带宽和计算}
+
+量化常被宣传为“模型变小，所以更快”。这句话只说对了一部分。量化可能减少权重带宽，也可能增加解包、scale 读取和 requantize 成本。KV cache 量化可能减少 cache 容量和 attention 读带宽，也可能增加 metadata 读取和反量化成本。profiler 必须拆开这些项。
+
+\begin{lstlisting}[numbers=none,caption={量化 profiler 的关键字段}]
+QuantProfilerReport:
+  original_weight_bytes
+  quantized_weight_bytes
+  scale_metadata_bytes
+  packed_weight_bytes
+  kv_cache_bytes_by_context
+  kv_scale_metadata_bytes
+  pack_time_ms
+  prefill_latency_ms
+  decode_latency_ms_by_context
+  dequant_time_ms
+  requant_time_ms
+  kernel_time_ms
+  memory_bandwidth_estimate
+\end{lstlisting}
+
+对 CPU，量化收益经常体现在减少内存读流，但如果解包逻辑让 SIMD pipeline 停顿，收益会下降。对 GPU，低比特格式若不能进入高效 tensor core 或 vendor kernel，可能会因为自定义解包 kernel 和同步开销而变慢。第二册讲过 cache、TLB、SIMD 和线程；本章的 profiler 字段就是把那些硬件事实拉回量化优化。
+
+\section{回归门禁：哪些测试必须常跑}
+
+量化改动风险高，不能靠人工看几条生成文本。C++20 项目至少应该有四类回归门禁：
+
+\begin{itemize}
+  \item descriptor/verifier 单元测试：非法 group size、scale shape、tail policy、packed byte length 必须被拒绝。
+  \item converter 测试：固定小张量的 int4/int8 bytes 反量化结果必须匹配 reference。
+  \item kernel oracle 测试：常见 shape、tail shape、对齐/非对齐、不同 group size 都要覆盖。
+  \item 端到端小模型测试：固定 prompt、固定 seed、固定 sampler，比较 logits 和生成序列合同。
+\end{itemize}
+
+性能也要有门禁，但不能用单次运行的绝对数字硬卡所有环境。更实用的是保存硬件信息、线程数、模型片段、prompt set 和相对基线，在同一机器上做回归判断。若一次改动让 decode latency 明显上升，CI 或本地 benchmark 应该提醒，而不是等到整本引擎集成后才发现。
+
+\begin{rubricbox}
+量化功能进入主线前，至少要满足四条线：descriptor/verifier 能拒绝坏格式；reference converter 能解释 bytes；kernel oracle 能覆盖误差；profiler 能证明容量或速度收益。缺一条，就只能算实验分支。
+\end{rubricbox}
+
+\section{本章验收线}
+
+读完本章，应该能把量化从“脚本转换”提升为工程系统：
+
+\begin{itemize}
+  \item QuantDescriptor 要显式记录 bit width、signedness、scale、zero point、granularity、axis、group、packed order 和 tail policy。
+  \item CalibrationRecord 要保存校准数据、算法、范围、饱和和工具版本，不能只留下 scale 文件。
+  \item verifier 要在热路径之前检查 metadata、shape、scale 数量、packed byte length 和后端支持。
+  \item IR 要显式表达量化边界，让 pass、memory planner、lowering 和 oracle 都看得见。
+  \item packing 是后端 lowering 的物理产物，必须有 packed descriptor 和诊断映射。
+  \item oracle 要按字节解释、单算子、层输出、logits 和生成序列分层报告。
+  \item profiler 要拆开容量、metadata、packing、dequant、requant、prefill 和 decode 成本。
+\end{itemize}
+
+到这里，量化大章不再只是数值公式，而是已经能进入 C++20 项目的模块设计、测试设计和验收设计。后续讲后端 micro-kernel 时，本章的 descriptor、oracle 和 profiler 会直接成为 kernel 合同的一部分。

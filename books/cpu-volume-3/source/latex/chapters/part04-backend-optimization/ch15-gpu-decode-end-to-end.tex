@@ -1,0 +1,290 @@
+\chapter{GPU decode 端到端：常驻权重、KV 布局、sampler 与同步成本}
+
+\section{GPU 快，不代表端到端一定快}
+
+GPU 在大 GEMM 上很强，但 decode 阶段常常是小 batch、单 token、长上下文、频繁同步。若只看单个 kernel 时间，很容易误判。端到端 GPU decode 要把权重常驻、KV cache、logits、sampler、copy、stream、event 和 fallback 一起算。
+
+\begin{keyidea}
+GPU decode 的核心问题不是“能不能 launch kernel”，而是让权重、KV、activation 和 sampler 尽量留在设备侧，同时把每步同步和 host-device copy 控制到可解释范围。
+\end{keyidea}
+
+一个最小 GPU decode step 包括：
+
+\begin{lstlisting}[numbers=none,caption={GPU decode step 账本}]
+input token on host
+  -> copy token or embedding input to device
+  -> run layer kernels
+  -> read/write device KV cache
+  -> compute logits on device
+  -> sampler on device or copy logits to host
+  -> emit token event on host
+\end{lstlisting}
+
+每个箭头都有成本。若每步把所有中间 activation 拷回 CPU 做调试，GPU kernel 再快也没意义。debug oracle 可以按 trace level 打开，但默认路径应尽量减少同步。
+
+\section{权重常驻设备}
+
+GPU 后端的基本要求是权重 prepare 后常驻设备。每次请求或每个 token 重新上传权重，端到端必然崩溃。
+
+\begin{lstlisting}[numbers=none,caption={GPU prepare 阶段}]
+load model files on host
+verify manifest and quant descriptors
+pack or convert weights for GPU backend
+allocate DeviceBuffer for each weight group
+copy weights to device
+record device_weight_table in plan report
+\end{lstlisting}
+
+plan report 要记录 device weight 字节、上传时间、quant format 和 fallback。若 GPU 显存不够，应该在 compile/prepare 阶段拒绝或选择 CPU fallback，而不是在请求运行中途失败。
+
+\section{activation 和 workspace}
+
+decode 每层会产生临时 activation。GPU 后端应使用 workspace 或 arena，避免每个 step 调用设备分配器。
+
+\begin{lstlisting}[numbers=none,caption={GPU workspace 字段}]
+GpuWorkspace:
+  activation_buffers
+  attention_scratch
+  logits_buffer
+  sampler_temp
+  size_bytes
+  alignment
+  stream_owner
+\end{lstlisting}
+
+workspace 的生命周期通常是 plan 或 session。若 workspace 被多个 session 共享，调度器必须保证不会并发写同一 buffer。若每个 session 独占 workspace，并发容量要把它算进 admission control。
+
+\section{Device KV cache}
+
+若 layer kernel 在 GPU 上运行，KV cache 最好也在 GPU 上。否则每层 attention 都要在主机和设备之间传 K/V，成本不可接受。
+
+\begin{lstlisting}[numbers=none,caption={GPU KV cache 设计点}]
+DeviceKvCache:
+  layout: contiguous | paged
+  dtype: fp16 | int8 | int4
+  block_table_optional
+  scale_table_optional
+  max_context
+  resident_device
+\end{lstlisting}
+
+连续 KV 在 GPU 上地址简单，但并发浪费显存；分页 KV 更灵活，但 kernel 要通过 block table 找 K/V。长上下文下，attention kernel 的读取模式决定了 coalescing。若每个 thread 读取不连续地址，带宽会下降。
+
+\section{GPU executable plan}
+
+GPU 后端也需要 executable plan，而不是在 runtime 中临时拼 kernel。
+
+\begin{lstlisting}[numbers=none,caption={GPU segment descriptor}]
+GpuSegmentDesc:
+  segment_id
+  op_or_fused_region
+  kernel_name
+  grid_shape
+  block_shape
+  input_buffers
+  output_buffers
+  state_reads
+  state_writes
+  workspace_range
+  stream_policy
+  fallback_segment_optional
+\end{lstlisting}
+
+\code{state\_reads} 和 \code{state\_writes} 对 attention 很重要：decode attention 读历史 KV，同时写当前 K/V。若 plan 不表达状态边，调度器可能错误重排 segment；若 workspace range 不明确，多个 segment 可能覆盖同一临时区域；若 fallback segment 不记录，性能报告会失真。
+
+\section{device residency report}
+
+GPU prepare 完成后，要输出哪些对象在设备上。
+
+\begin{lstlisting}[numbers=none,caption={DeviceResidencyReport}]
+DeviceResidencyReport:
+  model_id
+  device_id
+  weights:
+    total_bytes
+    quant_profile
+    packed_layout
+  kv_cache:
+    layout
+    max_reserved_bytes
+    dtype
+  workspace:
+    bytes
+  logits:
+    device_buffer_bytes
+  fallback:
+    unsupported_segments
+\end{lstlisting}
+
+这份报告能提前发现“显存看似够，实际 packed weight 加 workspace 不够”的问题。它也能解释为什么同一模型在不同 GPU 上 plan 不同：某些设备支持某种低比特 kernel，另一些设备只能 fallback。
+
+\section{prefill 和 decode 的 GPU 策略不同}
+
+prefill 有较大的 token 维度，适合 GEMM 和 batched attention。decode 单 token 时，kernel launch、KV 读流和小矩阵效率更突出。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & GPU 机会 & GPU 风险 \\
+\midrule
+prefill & 大 GEMM、并行 attention、吞吐高 & 显存峰值、长 prompt attention \\
+decode & 多 session 合批、KV 常驻、低同步 & 小 batch 低占用、launch/copy 成本 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此 GPU 报告必须拆 prefill 和 decode。只报总 tokens/s 会掩盖问题：一个后端可能 prefill 非常快，但单用户 decode 受 launch 成本限制；也可能多 session 合批后吞吐高，但 p95 变差。
+
+\section{sampler 放设备侧的收益和代价}
+
+若 logits 在 GPU 上，CPU sampler 需要把 logits 或 top-k 候选拷回 host。完整词表 logits 可能是几十 KB 到几百 KB，每步还会同步 stream。设备侧 sampler 可以减少同步，但要实现 top-k/top-p、随机数和 stop 检查。
+
+折中做法是 GPU 先选 top-k 候选，只拷回候选 id 和分数给 CPU 最终采样。这样减少拷贝，但仍保留业务逻辑和可复现随机数在 CPU。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+策略 & 拷贝量 & 实现复杂度 \\
+\midrule
+拷完整 logits 到 CPU & 高 & 低 \\
+GPU top-k，CPU 采样 & 中低 & 中 \\
+全 GPU sampler & 低 & 高 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+贯穿项目可以先用 CPU sampler，但必须在 trace 中单独记录 \code{logits\_copy\_ns} 和 \code{sampler\_ns}。这样后续把 sampler 下沉到 GPU 时，收益能被证明。
+
+\section{stream 和 event}
+
+GPU 后端不能只用一个全局同步。最小资源模型：
+
+\begin{lstlisting}[numbers=none,caption={GPU 执行资源}]
+GpuExecutionContext:
+  device_id
+  stream
+  events:
+    prefill_start
+    prefill_end
+    decode_step_start
+    decode_step_end
+  workspace
+  error_state
+\end{lstlisting}
+
+event 用来测量 GPU 时间，host 计时用来测端到端时间。二者都要记录。若 GPU event 显示 kernel 很快，但 host 端 decode step 慢，问题可能在 copy、sync、sampler、队列或事件等待。
+
+\section{同步点要显式列出}
+
+GPU 性能问题经常藏在同步点。常见同步来源：
+
+\begin{itemize}
+  \item 拷回 logits 给 CPU sampler。
+  \item debug 模式 materialize 中间张量。
+  \item host 等待 GPU event 才能发 token。
+  \item fallback segment 在 CPU 和 GPU 之间来回搬数据。
+  \item 多 stream 之间的依赖 event。
+  \item device allocator 或临时 buffer 初始化。
+\end{itemize}
+
+每个同步点都要进入 trace。若只是看 kernel profile，可能看不到 host 在等待。端到端优化时，减少一个同步点往往比把某个小 kernel 优化 10\% 更有效。
+
+\section{合批 decode}
+
+GPU decode 要提高吞吐，通常需要合批多个 session 的当前 token。合批后，一个 step 的输入形状从 \code{[1,H]} 变成 \code{[B,H]}，权重 GEMV 变成小 GEMM，GPU 利用率提高。但合批有代价：请求要等待同批其他 session，KV cache 来自不同 session，stop 和 sampler 也各自独立。
+
+\begin{lstlisting}[numbers=none,caption={GPU decode 合批元数据}]
+DecodeBatch:
+  batch_size
+  session_ids
+  model_positions
+  kv_block_tables
+  input_token_ids
+  sampler_states
+\end{lstlisting}
+
+合批不是把 token 拼起来就完事。每个 session 的 \code{model\_position}、KV block table、stop 条件和 sampler state 都不同。kernel 可以共享权重，但不能混淆状态。调度器需要设置最大等待时间，否则为了凑 batch 会拉高 p95。
+
+\section{GPU oracle 策略}
+
+GPU 路径也要有 oracle，但不能每步都拷完整中间张量。可用策略：
+
+\begin{itemize}
+  \item smoke 模式：只比较最终 logits 和 top-k。
+  \item checkpoint 模式：抽样比较某几层输出。
+  \item debug 模式：materialize 指定 segment 的输入输出。
+  \item byte 模式：只比较 packed weight 或量化解包。
+\end{itemize}
+
+trace level 控制 oracle 成本。默认生产路径不应频繁同步中间张量；调试时可以打开指定 segment 的 checkpoint。这样既保留定位能力，又不让 oracle 扭曲性能数据。
+
+\section{fallback 不是静默降级}
+
+GPU 可能不支持某个 dtype、某个 group size、某个上下文长度或某个算子融合。fallback 可以是好策略，但必须显式记录：
+
+\begin{lstlisting}[numbers=none,caption={GpuFallbackEvent 字段}]
+GpuFallbackEvent:
+  segment_id
+  requested_backend
+  actual_backend
+  reason:
+    dtype_unsupported
+    group_size_unsupported
+    workspace_exceeded
+    kernel_missing
+    device_memory_exceeded
+  performance_impact_estimate
+\end{lstlisting}
+
+静默 fallback 会制造严重误导：用户以为在测 GPU，实际跑 CPU；或者某个 segment 来回拷贝，端到端比纯 CPU 更慢。
+
+\section{GPU StepTrace}
+
+GPU decode 每步至少要记录：
+
+\begin{lstlisting}[numbers=none,caption={GPU StepTrace 字段}]
+GpuStepTrace:
+  request_id
+  step
+  context_length
+  batch_size
+  stream_id
+  kernel_time_ns
+  copy_h2d_bytes
+  copy_d2h_bytes
+  copy_time_ns
+  sync_time_ns
+  sampler_time_ns
+  fallback_count
+  device_memory_peak
+\end{lstlisting}
+
+这些字段能定位典型问题：kernel 时间低但同步高，说明 host-device 边界有问题；copy 字节突然上升，说明某个 debug 或 fallback materialize 了中间张量；batch size 太小，说明调度器没有把 decode 合并起来。
+
+\section{发布前 GPU 检查表}
+
+\begin{rubricbox}
+\begin{itemize}
+  \item prepare 阶段完成权重上传，decode step 不重复上传权重。
+  \item device residency report 记录权重、KV、workspace、logits 和 fallback。
+  \item GPU segment descriptor 记录 kernel、buffer、state read/write、workspace 和 stream。
+  \item StepTrace 同时有 GPU event 时间和 host 端 elapsed 时间。
+  \item logits copy、sampler、sync 和 fallback 单独计时。
+  \item 合批 decode 记录 batch size、等待时间和每个 session 的 position。
+  \item debug oracle 不污染默认性能报告。
+\end{itemize}
+\end{rubricbox}
+
+\section{本章验收线}
+
+读完本章，应该能设计 GPU decode 的端到端合同：
+
+\begin{itemize}
+  \item 权重在 prepare 后常驻 device，并写入 plan report。
+  \item activation 和 workspace 不在每 step 动态分配。
+  \item KV cache 在 device 侧维护，连续或分页布局都有明确地址合同。
+  \item prefill 和 decode 分开报告，不用一个 tokens/s 混过。
+  \item sampler、logits copy、stream sync 和 fallback 都进入 StepTrace。
+  \item fallback 必须显式记录原因和实际 backend。
+  \item 用 GPU event 和 host trace 同时解释 kernel 时间与端到端时间。
+\end{itemize}

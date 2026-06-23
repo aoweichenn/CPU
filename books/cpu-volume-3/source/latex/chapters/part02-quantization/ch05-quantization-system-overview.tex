@@ -1,0 +1,310 @@
+\chapter{量化系统总览：从实数模型到低比特推理合同}
+
+\section{量化为什么必须单独成章}
+
+量化很容易被误解成“把 float 改成 int8”。如果只是换类型名，确实几行代码就能写完；但真正的推理引擎量化是一套跨越模型文件、编译前端、IR、后端 kernel、runtime、oracle 和 profiler 的系统合同。它决定权重能不能装进内存，决定 decode 阶段要读多少 KV cache，决定 CPU/GPU kernel 怎样读取 scale，决定 logits 是否还能被 sampler 正确使用。
+
+一个最小反例可以说明它为什么不能混在普通算子章节里。假设某个 linear 权重被保存成 int4，每 64 个权重共享一个 scale。若后端 packing 时只重排了 4-bit 权重，却没有按同样分组重排 scale，kernel 仍然会跑，也可能输出一堆“看起来像正常浮点数”的 logits。但这些 logits 已经被错误 scale 污染。这个错误不是普通矩阵乘错误，而是量化格式、metadata、packing 和 kernel 合同同时破裂。
+
+\begin{keyidea}
+量化是一条系统级合同：实数范围怎样选择，整数码点怎样解释，scale 和 zero point 怎样存储，accumulator 在哪里扩大，requantize 怎样舍入，packed layout 怎样保持 metadata 对齐，oracle 怎样判断误差是否可接受。
+\end{keyidea}
+
+\section{第三册里的量化流水线}
+
+本册把量化看成一条完整流水线，而不是一个局部函数。
+
+\begin{systemdiagram}{量化从校准到后端执行的系统流水线}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.2cm] (fp) at (0,2.05) {浮点模型\\fp16/bf16};
+  \node[book teal node,text width=2.2cm] (calib) at (2.8,2.05) {校准\\range};
+  \node[book purple node,text width=2.2cm] (policy) at (5.6,2.05) {量化策略\\int8/int4};
+  \node[book amber node,text width=2.2cm] (manifest) at (8.4,2.05) {manifest\\quant desc};
+  \node[book navy node,text width=2.2cm] (kernel) at (11.2,2.05) {后端 kernel\\packed plan};
+
+  \draw[book strong arrow] (fp) -- (calib);
+  \draw[book strong arrow] (calib) -- (policy);
+  \draw[book strong arrow] (policy) -- (manifest);
+  \draw[book strong arrow] (manifest) -- (kernel);
+
+  \node[book red node,text width=2.35cm] (oracle) at (5.6,0.25) {oracle\\logits/top-k\\生成质量};
+  \node[book teal node,text width=2.35cm] (profile) at (8.4,0.25) {profiler\\容量/带宽\\latency};
+
+  \draw[book weak arrow] (policy) -- (oracle);
+  \draw[book weak arrow] (kernel) -- (profile);
+  \draw[book weak arrow] (kernel) -- (oracle);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：量化不是单个 kernel，而是校准、策略、manifest、后端和验证共同组成的流水线。}
+\end{systemdiagram}
+
+\topic{校准阶段。} 校准决定实数范围。权重可以离线扫描；activation 需要代表性输入；KV cache 是动态状态，通常要在真实 prompt/context 分布上观察。校准数据不代表真实分布时，scale 会偏，饱和会增多，生成质量会漂移。
+
+\topic{策略阶段。} 策略决定使用 int8、int4、per-tensor、per-channel、per-group、对称或非对称量化。策略不是越激进越好。int4 权重能省内存，但 kernel 要处理解包、scale 读取和更复杂误差；KV cache 量化能省长上下文内存，但 decode attention 的读路径会变复杂。
+
+\topic{manifest 阶段。} 量化信息必须进入 manifest。后端不能靠张量名字猜格式，必须读 quant descriptor：bit width、signedness、scale dtype、zero point policy、group size、axis、packed byte order、tail policy、checksum 和支持的 backend。
+
+\topic{后端阶段。} 后端负责把量化格式变成机器执行。CPU 可能选择 dequant-on-the-fly、int8 dot-product 或 int4 解包加 FMA；GPU 可能使用 vendor kernel、tensor core 支持格式或自定义 kernel。不同后端可以使用不同 packed layout，但必须共享同一逻辑量化合同。
+
+\topic{验证阶段。} 量化必须同时通过 oracle 和 profiler。oracle 证明误差在合同内；profiler 证明容量、带宽或 latency 的收益真实存在。只省文件大小但 decode 变慢，或 tokens/s 变快但 logits 漂移不可接受，都不是合格优化。
+
+\section{校准：scale 不是随便选出来的}
+
+线性量化的核心参数是 scale 和 zero point。scale 由范围决定，范围由校准决定。最简单的做法是扫描张量最小值和最大值：
+
+\begin{lstlisting}[numbers=none,caption={最小最大校准的基本形状}]
+min_value = min(x[i])
+max_value = max(x[i])
+
+scale = (max_value - min_value) / (qmax - qmin)
+zero_point = round(qmin - min_value / scale)
+\end{lstlisting}
+
+这个算法容易理解，但不总是最好。若只有少数极端值，min/max 会把 scale 拉大，使大部分普通值的量化间隔变粗；若为了普通值缩小范围，极端值会被 clamp。两者都是误差，只是形态不同。量化校准的本质就是在舍入误差和饱和误差之间取舍。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+校准策略 & 优点 & 风险 \\
+\midrule
+min/max & 简单，可复现，适合第一版 & 极端值会拉大 scale \\
+percentile & 减少极端值影响 & 被截断值可能集中在关键通道 \\
+MSE/KL 搜索 & 更贴近分布误差 & 复杂，依赖校准集质量 \\
+per-channel 校准 & 减少通道间范围差异 & 元数据和 requantize 更复杂 \\
+动态校准 & 适合 activation 或 KV 状态 & 运行时成本和稳定性要验证 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+校准集必须写进报告。对图像模型，校准集可能是若干图片；对语言模型，校准集应该包含短 prompt、长 prompt、代码、中文、英文、对话、多轮上下文等场景。若只用很短英文 prompt 校准 KV cache，长中文对话的 activation 分布可能完全不同。校准不是离线脚本的附属品，而是模型合同的一部分。
+
+\section{线性量化的精确定义}
+
+先把最常见的线性量化写清楚。给定实数 \code{x}、scale \code{s} 和 zero point \code{z}，量化与反量化通常可以写成：
+
+\[
+q = clamp(round(x/s)+z,\ q_{min},\ q_{max})
+\]
+
+\[
+\tilde{x}=s(q-z)
+\]
+
+这里 \code{q} 是整数码点，\(\tilde{x}\) 是反量化后的近似实数。若使用对称量化，通常 \code{z=0}，码点范围围绕 0；若使用非对称量化，\code{z} 让非零实数范围能映射到无符号整数区间。对称量化简单，适合很多权重；非对称量化能更好表达偏移分布，但后端计算和 zero point 修正更复杂。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+形态 & 数学合同 & 工程影响 \\
+\midrule
+对称 & \code{z=0}，正负范围近似对称 & kernel 简洁，适合权重 \\
+非对称 & \code{z} 可非零 & activation 适配性强，但修正项更多 \\
+per-tensor & 整个张量共用 scale & metadata 少，误差可能大 \\
+per-channel & 每个输出通道一组 scale & 精度好，scale 读流增加 \\
+per-group & 每组权重一组 scale & int4 常见折中，packing 更复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+per-group int4 的具体含义必须避免含糊。若 \code{group_size=64}，通常表示连续 64 个权重共享一个 scale。这个“连续”必须绑定到逻辑轴：是按输入通道连续，还是按 packed 后的物理顺序连续？正确做法是 descriptor 同时记录逻辑分组轴和 packed layout，并由 verifier 检查 scale 数量。
+
+\begin{lstlisting}[numbers=none,caption={group scale 数量检查}]
+groups_per_output =
+  ceil(input_channels / group_size)
+
+expected_scale_count =
+  output_channels * groups_per_output
+\end{lstlisting}
+
+若 scale 少一个，kernel 可能越界；若 scale 多一个，说明 manifest、converter 或 packing 至少有一个环节对分组理解不同。不能让 kernel 用“能读多少读多少”的方式容错，因为这会把资产错误变成数值漂移。
+
+\section{校准算法怎样落到 C++20}
+
+校准不是只能依赖外部脚本。项目里至少应有可复现的校准结果读取和验证逻辑。对权重量化，离线 converter 可以扫描权重并写出 scale；对 activation 或 KV cache，运行时或校准工具需要收集统计量。
+
+\begin{lstlisting}[numbers=none,caption={校准统计的最小结构}]
+CalibrationStats:
+  tensor_name
+  axis
+  granularity
+  sample_count
+  min_values
+  max_values
+  histogram_optional
+  saturation_rate
+  source_prompt_set_id
+\end{lstlisting}
+
+min/max 校准只需要最小值和最大值；percentile、MSE 或 KL 搜索通常需要直方图。直方图不是为了好看，而是为了回答“截断哪些值会让总体误差更小”。一个保守 MSE 搜索可以这样理解：枚举候选范围 \code{[-a,a]}，把范围外值 clamp，把范围内值量化再反量化，选择平均平方误差最小的 \code{a}。
+
+\begin{lstlisting}[numbers=none,caption={MSE calibration 的朴素形态}]
+best_error = infinity
+for candidate_absmax in candidates:
+  scale = candidate_absmax / qmax
+  error = 0
+  for x in calibration_values:
+    q = clamp(round(x / scale), qmin, qmax)
+    x2 = q * scale
+    error += (x - x2) * (x - x2)
+  keep candidate with minimal error
+\end{lstlisting}
+
+这个朴素算法不一定是最高效实现，但它定义了语义。工程实现可以用直方图加速，而 oracle 应该能用小样本直接复现它。不要让校准工具和 runtime verifier 使用两套互相不透明的规则。
+
+\section{权重量化、activation 量化和 KV 量化不是一回事}
+
+三类量化对象生命周期不同，因此工程合同也不同。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.26\linewidth}p{0.38\linewidth}}
+\toprule
+对象 & 生命周期 & 关键风险 \\
+\midrule
+权重 & 离线静态，加载后常驻 & packed layout、scale 对齐、后端格式支持 \\
+activation & 每次推理临时产生 & 动态范围随输入变化，requantize 成本 \\
+KV cache & 跨 token 状态，随上下文增长 & 误差会被未来 token 反复读取，metadata 进入 attention 热路径 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+权重量化通常最先做，因为它直接降低模型容量和权重读流。activation 量化更难，因为每层中间值分布随 prompt 改变，且很多算子之间需要反量化/重量化边界。KV cache 量化介于两者之间：它不是静态权重，但每个 token 写入后会长期保存；它的容量收益很大，但误差会在长上下文里持续参与 attention。
+
+因此本册建议的推进顺序是：先做权重-only 量化，让 activation 仍用 fp16/fp32 近似计算；然后做局部 activation 量化实验；最后再做 KV cache 量化。这样每次只改变一个主要误差来源，oracle 更容易定位。
+
+\section{量化收益要同时算字节和指令}
+
+低比特并不自动更快。以 int4 weight-only GEMV 为例，热路径少读了权重字节，但增加了三个成本：解包 nibble、读取 scale、把整数码点乘回实数或进入整数 dot-product 路径。若当前机器瓶颈是内存带宽，少读字节可能收益明显；若瓶颈是解包指令或 scale 读流，int4 可能不如 int8。
+
+\begin{lstlisting}[numbers=none,caption={weight-only 量化的粗略收益账}]
+fp16 weight bytes:
+  params * 2
+
+int8 weight bytes:
+  params * 1 + scale_bytes
+
+int4 weight bytes:
+  params / 2 + scale_bytes + packing_padding
+
+extra work:
+  unpack integer code
+  load scale metadata
+  dequantize or use integer dot path
+\end{lstlisting}
+
+对于 7B 参数量级，fp16 权重大约 14GB；int8 约 7GB 加 metadata；int4 约 3.5GB 加 metadata。这个容量收益很直观。但 decode tokens/s 是否按比例提升，要看 effective bandwidth、cache、TLB、SIMD 指令、group size 和线程调度。量化报告必须把容量收益和 latency 收益分开写。
+
+\section{业务开发中的量化边界}
+
+用户真正关心的是“学完能不能做业务开发”。量化在业务系统里不能只说模型更小，还要说明什么时候可以用、什么时候不该用。
+
+\begin{itemize}
+  \item 搜索补全、草稿生成、离线摘要等任务，可能更能接受轻微 logits 漂移。
+  \item 法律、医疗、财务、代码自动修改等高风险任务，不能只看生成文本是否通顺，要固定评测集和人工验收。
+  \item RAG 场景要特别看引用和数字是否稳定，因为量化误差可能改变排序靠前的候选 token。
+  \item 多轮对话要看长上下文质量，KV cache 量化的误差不能只在短 prompt 上验收。
+  \item 如果使用工具调用或 JSON 输出，要验证格式稳定性，不能只看自然语言回答。
+\end{itemize}
+
+工程上可以把量化 profile 做成可选择配置：\code{quality} 使用更保守的权重格式和 fp16 KV；\code{balanced} 使用 int4 权重和 fp16/int8 KV 实验；\code{memory_saver} 使用更激进 KV 量化和较短窗口。每个 profile 都要有 oracle、benchmark 和适用说明。这样业务方选择的是有证据的配置，而不是一句“开 int4”。
+
+\section{误差来源：不是所有误差都一样}
+
+量化误差至少有五类。
+
+\topic{舍入误差。} 实数值落在两个整数码点之间，需要按某种规则舍入。舍入规则必须固定，否则 CPU reference、SIMD kernel 和 GPU kernel 可能出现系统性差异。
+
+\topic{饱和误差。} 值超出可表示范围时被 clamp 到边界。少量饱和可能可接受；某层、某通道或某类 prompt 上大量饱和，通常意味着 scale 或校准策略有问题。
+
+\topic{累加误差。} 低精度乘法后通常在 int32、fp32 或 fp16/bf16 中累加。不同累加器宽度、不同 reduction 顺序、不同 FMA 形态都会改变误差传播。
+
+\topic{元数据误差。} scale、zero point、group scale、tail padding 或 packed byte order 被错误解释，会产生结构性错误。这类错误比随机舍入更危险，因为输出可能稳定但错误。
+
+\topic{状态误差。} KV cache 量化会把误差写入跨 token 状态。一次写入后，未来很多 decode step 会读取它。它不是一次性中间 activation 误差，而是会随上下文参与后续注意力。
+
+因此，量化 oracle 不能只比较某个算子一次输出。它要能按层、按通道、按 token position、按 prompt 类别和按生成步数定位误差。
+
+\section{量化在 AI 编译器中的位置}
+
+在 AI 编译器里，量化至少影响四个阶段。
+
+\begin{lstlisting}[numbers=none,caption={量化事实在编译流水线中的流动}]
+model import:
+  parse quant metadata
+  build QuantDescriptor
+
+verifier:
+  check shape, bit width, group size, scale count
+  reject unsupported quant formats
+
+IR passes:
+  insert dequant, requant, quantized matmul
+  decide fusion and materialization boundaries
+
+backend lowering:
+  choose packed layout and kernel
+  bind scale/zero point/group metadata
+\end{lstlisting}
+
+如果导入阶段没有把量化格式读清楚，后端会被迫猜；如果 verifier 不检查 scale 数量，kernel 可能越界读 metadata；如果 IR pass 不知道某条边是量化张量，就可能错误融合或错误复用 arena；如果 lowering 不知道 group size，就无法生成正确 packed descriptor。
+
+\begin{warningbox}
+量化不是后端私有小技巧。只在 CPU kernel 里临时解释 int4 字节，而不让 manifest、verifier、IR 和 oracle 知道量化合同，会让错误绕过编译器所有安全边界。
+\end{warningbox}
+
+\section{量化 lowering 的常见形态}
+
+从 IR 到后端，量化通常有三种 lowering 形态。
+
+\topic{dequantize then compute。} 先把低比特权重或 activation 还原成 fp16/fp32 临时块，再调用普通 GEMM/GEMV。这条路径容易实现和验证，适合作 reference 或第一版 GPU fallback；缺点是会产生额外中间写回，可能抵消低比特节省。
+
+\topic{dequantize on the fly。} kernel 读取低比特码点和 scale，在寄存器里反量化后立即参与 FMA。CPU int4 weight-only GEMV 常用这种思路。它减少中间写回，但 kernel 要处理解包、scale group、tail 和 SIMD lane 对齐。
+
+\topic{integer dot-product。} 若硬件支持 int8 dot-product 或低比特矩阵指令，可以让整数码点直接进入 dot，再用 scale 和 requantize 还原输出。它可能更快，但对 zero point、accumulator、溢出和 scale 合并要求更严格。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+\toprule
+lowering & 优点 & 风险 \\
+\midrule
+dequant + compute & 简单，容易对 oracle & 额外内存流量大 \\
+on-the-fly dequant & 少写中间值，适合 weight-only & kernel 复杂，scale 热路径 \\
+integer dot & 可利用专门指令 & zero point、溢出、requantize 复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+同一量化格式可以有多个 lowering plan。executable plan 必须记录实际选择的是哪一种，否则 profiler 和误差报告无法解释差异。
+
+\section{量化在 C++20 项目中的边界}
+
+C++20 实现中，量化不应该散落成若干裸字段。建议至少有一个稳定的 descriptor：
+
+\begin{lstlisting}[numbers=none,caption={QuantDescriptor 的字段边界}]
+QuantDescriptor:
+  storage_dtype: int8 | uint8 | int4 | nf4 | fp8
+  logical_dtype: approximate_f16 | approximate_f32
+  scale_dtype: fp16 | fp32
+  zero_point_policy: none | symmetric | asymmetric
+  granularity: tensor | channel | group
+  axis
+  group_size
+  scale_count
+  packed_order
+  tail_policy
+  calibration_id
+\end{lstlisting}
+
+这个 descriptor 应该跟 tensor descriptor 一起流动，而不是藏在后端对象里。model loader 创建它，verifier 检查它，compiler pass 查询它，backend packing 消费它，oracle 报告它。这样一旦出错，日志能写清楚“某个张量使用 int4、group size 64、scale dtype fp16、tail padding zero、CPU AVX2 packed layout”，而不是只报 \code{invalid quantized tensor}。
+
+\section{本章验收线}
+
+读完本章，应该能说明：
+
+\begin{itemize}
+  \item 量化是跨模型文件、编译器、后端、runtime 和验证的系统合同。
+  \item scale 来自校准，校准策略会在舍入误差和饱和误差之间取舍。
+  \item 量化误差至少包含舍入、饱和、累加、元数据和状态误差。
+  \item QuantDescriptor 必须进入 manifest、verifier、IR pass、backend lowering 和 oracle。
+  \item 量化优化必须同时有正确性报告和性能报告。
+\end{itemize}
+
+下一章会把这套系统合同落到低比特权重和 KV cache 上：int4/group quant 怎样存储，scale 怎样跟 packed weight 对齐，KV cache 量化为什么是运行时状态问题，C++20 后端怎样把这些信息变成可测 plan。

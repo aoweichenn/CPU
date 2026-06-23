@@ -1,0 +1,1195 @@
+\chapter{AI 推理原理、KV cache 与计算账本：从一句 prompt 到本地 7B 引擎}
+
+\section{先把问题讲清楚：模型不是在“理解一句话”}
+
+本章重新从最小问题开始：用户输入一句话，本地大模型怎样生成下一个 token？如果这件事讲不清，后面的张量、量化、KV cache、CPU/GPU 后端和 benchmark 都会变成孤立名词。
+
+假设用户输入：
+
+\begin{lstlisting}[numbers=none,caption={一个最小生成请求}]
+prompt: "C++ 为什么需要内存模型？"
+\end{lstlisting}
+
+推理引擎不会直接处理这串字符。第一步是 tokenizer，把文本切成 token id。token id 是整数，不一定对应一个汉字、一个英文单词或一个完整词。第二步是 embedding，把每个 token id 映射成一个 hidden 向量。第三步是多层 decoder block，不断改写每个位置的 hidden。第四步是 \code{lm\_head}，把最后一个位置的 hidden 投影成词表大小的 logits。第五步是 sampler，从 logits 里选出下一个 token id。然后把这个新 token 追加到序列尾部，继续下一轮。
+
+\begin{lstlisting}[numbers=none,caption={从 prompt 到 next token 的主链路}]
+text
+  -> tokenizer.encode(text)
+  -> token ids
+  -> embedding vectors
+  -> repeated decoder blocks
+  -> final hidden at last position
+  -> lm_head logits over vocabulary
+  -> sampler chooses next token id
+  -> append token and repeat
+\end{lstlisting}
+
+\begin{keyidea}
+decoder-only 大模型推理的核心任务不是一次输出整篇文章，而是不断重复同一个步骤：给定已有 token 序列，预测下一个 token 的分数分布，再由 sampler 选出一个 token。
+\end{keyidea}
+
+这句话决定了本章后面的所有机器账本。因为一次只追加一个 token，decode 阶段天然有强状态性；因为每一步都要看历史 token，attention 会读取越来越长的上下文；因为历史 K/V 可以复用，KV cache 变成推理引擎的核心运行时状态；因为每步都要过所有层，权重读流和矩阵向量乘会支配 decode 性能。
+
+\section{训练目标和推理目标：为什么模型会预测下一个 token}
+
+decoder-only 语言模型在训练时常用下一个 token 预测任务。给定一段 token 序列：
+
+\begin{lstlisting}[numbers=none,caption={训练样本的移位关系}]
+input:  t0, t1, t2, t3, ...
+target: t1, t2, t3, t4, ...
+\end{lstlisting}
+
+模型在位置 \code{i} 只能看见 \code{0..i} 的历史，然后预测 \code{i+1}。这叫 \term{因果语言建模}{causal language modeling}。因果的意思是当前位置不能偷看未来 token。推理时也沿用同一规则：已有 token 是上下文，模型预测下一个 token。
+
+训练和推理的区别在于，训练知道整段 target，可以一次计算很多位置的损失；推理不知道未来，只能生成一个 token 后再把它加入上下文。因此推理有两个阶段：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+阶段 & 输入形态 & 目标 \\
+\midrule
+prefill & 用户 prompt 的多个 token & 批量处理 prompt，填好 KV cache，得到首个 logits \\
+decode & 每次一个新 token & 追加 K/V，读取历史 cache，生成下一个 logits \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这不是 API 名称差异，而是计算形态差异。prefill 能把很多 token 一起送进矩阵乘，更像 GEMM；decode 每步只有一个 token，更像 GEMV 或小 GEMM，并且要读历史 KV cache。很多人以为“模型推理就是跑一遍网络”，这句话只对 prefill 的直觉接近，对 decode 不够准确。decode 是一个带状态的循环。
+
+\section{token、embedding、hidden、logits 和 sampler}
+
+先把常见对象定义清楚。
+
+\topic{token id。} tokenizer 把文本映射成整数序列。一个中文词、英文词、标点、空格、子词片段都可能对应一个或多个 token。业务开发中经常要关心 token 数，因为计费、上下文长度、KV cache 容量和 latency 都按 token 变化。
+
+\topic{embedding。} embedding 表可以理解成一个矩阵 \code{E[vocab, H]}。token id 查表后得到长度为 \code{H} 的向量。若 prompt 有 \code{T} 个 token，embedding 输出形状就是 \code{[T, H]}。
+
+\topic{hidden。} hidden 是模型内部的向量表示。它不是概率，也不是文本。每个 decoder block 接收 hidden，输出新的 hidden。hidden size \code{H} 是计算量和内存量的核心参数之一。
+
+\topic{logits。} \code{lm\_head} 把最后位置的 hidden 投影成 \code{[vocab]} 分数。logits 没有归一化，softmax 后才变成概率。做贪心解码时选最大 logits；做温度、top-k、top-p 采样时会改变采样分布。
+
+\topic{sampler。} sampler 不是模型主体。它是从 logits 选择 token 的策略。工程上必须把“模型算错”和“采样策略不同”分开定位。固定 seed、temperature、top-k、top-p 后，同一 logits 应该产生可复现的 token 序列。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+对象 & 形状示例 & 归属 \\
+\midrule
+token ids & \code{[T]} & tokenizer/runtime \\
+embedding & \code{[T,H]} & 模型权重 + activation \\
+hidden & \code{[T,H]} 或 \code{[1,H]} & decoder block 中间状态 \\
+logits & \code{[vocab]} & \code{lm\_head} 输出 \\
+next id & 标量整数 & sampler 输出 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{decoder block 的骨架}
+
+多数 7B 级本地模型可以先按 decoder-only Transformer 解释。不同模型会在 RMSNorm/LayerNorm、RoPE、SwiGLU、GQA/MQA、量化格式和词表上有差异，但一层的骨架大致相同：
+
+\begin{lstlisting}[numbers=none,caption={一个 decoder block 的高层账本}]
+x = input hidden
+
+h = norm(x)
+q = h * Wq
+k = h * Wk
+v = h * Wv
+q, k = apply_position_encoding(q, k, position)
+append k, v to KV cache
+a = attention(q, K_cache[0..position], V_cache[0..position])
+x = x + a * Wo
+
+h = norm(x)
+g = h * Wgate
+u = h * Wup
+m = activation(g) * u
+x = x + m * Wdown
+\end{lstlisting}
+
+这段伪代码里，最重的计算通常是线性投影：\code{Wq/Wk/Wv/Wo/Wgate/Wup/Wdown}。它们本质上是矩阵乘或矩阵向量乘。RMSNorm、RoPE、激活函数和残差加法算术量小一些，但会产生 activation 读写；如果这些读写没有融合，也会消耗内存带宽。
+
+这里第一次出现了 KV cache。当前 token 产生的 \code{k} 和 \code{v} 不能像普通临时 activation 一样丢掉，因为未来 token 的 attention 会读取它们。KV cache 把推理引擎从“无状态算子流水线”变成“跨 token 状态机”。
+
+\section{单层 decoder 的数学合同}
+
+把上面的伪代码写成数学合同，才能判断一个推理引擎有没有算对。设第 \code{l} 层输入为 \code{X_l}，形状是 \code{[N,H]}。prefill 时 \code{N=T}，decode 时 \code{N=1}。RMSNorm 先对每个 token 的 hidden 做归一化：
+
+\[
+\hat{x} = \frac{x}{\sqrt{\frac{1}{H}\sum_{i=1}^{H}x_i^2 + \epsilon}} \odot \gamma
+\]
+
+然后做 Q/K/V 投影。若 query head 数是 \code{n_q}，K/V head 数是 \code{n_kv}，每个 head 的维度是 \code{d}，通常有 \code{H = n_q * d}：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+权重 & 形状 & 输出 \\
+\midrule
+\code{Wq} & \code{[H, n_q*d]} & \code{Q: [N, n_q, d]} \\
+\code{Wk} & \code{[H, n_kv*d]} & \code{K: [N, n_kv, d]} \\
+\code{Wv} & \code{[H, n_kv*d]} & \code{V: [N, n_kv, d]} \\
+\code{Wo} & \code{[n_q*d, H]} & attention 输出回到 \code{[N,H]} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+GQA 的关键是 \code{n_q} 可以大于 \code{n_kv}。若 \code{n_q=32}、\code{n_kv=8}，每 4 个 query head 共享同一个 K/V head。可以写成：
+
+\[
+g(h)=\left\lfloor \frac{h}{n_q/n_{kv}} \right\rfloor
+\]
+
+其中 \code{h} 是 query head 编号，\code{g(h)} 是它读取的 K/V head 编号。这个映射必须进入 KV cache 的逻辑合同，否则 head 读错不会立刻崩溃，只会让 logits 慢慢偏掉。
+
+对第 \code{h} 个 query head，attention 的核心公式是：
+
+\[
+score_{i,j,h} =
+\frac{Q_{i,h}\cdot K_{j,g(h)}}{\sqrt{d}} + mask_{i,j}
+\]
+
+\[
+P_{i,:,h}=\operatorname{softmax}(score_{i,:,h}), \qquad
+O_{i,h}=\sum_j P_{i,j,h}V_{j,g(h)}
+\]
+
+prefill 时 \code{i} 和 \code{j} 都在 prompt 内，\code{mask_{i,j}} 会把未来位置置为负无穷；decode 时 \code{i} 只有当前 token，\code{j} 扫描历史 cache。RoPE 通常在算 score 前作用到 \code{Q} 和 \code{K}，它不改变张量形状，但会把位置编号注入到每个 head 的二维旋转对里。位置编号错一位，shape 仍然正确，logits 会错。
+
+attention 输出拼回 \code{[N,n_q*d]} 后乘 \code{Wo}，再和残差相加。随后进入 MLP。许多 7B 级模型使用 SwiGLU：
+
+\[
+MLP(x)=\left(\operatorname{silu}(xW_{gate}) \odot xW_{up}\right)W_{down}
+\]
+
+其中 \code{Wgate} 和 \code{Wup} 的形状通常是 \code{[H,I]}，\code{Wdown} 是 \code{[I,H]}。\code{\odot} 是逐元素乘法。SwiGLU 不是“一个激活函数小算子”这么简单，它让 MLP 有三块大矩阵，也解释了为什么前面 7B 单层账本里 MLP FLOPs 是大头。
+
+\begin{keyidea}
+单层 decoder 的正确性合同可以压成一句话：norm 改尺度，Q/K/V 建立检索空间，RoPE 写入位置，mask 保证因果性，softmax 把相似度变成权重，V 汇聚内容，MLP 做逐 token 非线性变换，residual 保留主干信息。
+\end{keyidea}
+
+\section{RoPE 到底把位置写到哪里}
+
+RoPE 的全名是 rotary positional embedding。它不是把一个位置向量加到 hidden 上，而是在每个 attention head 内，把 \code{Q} 和 \code{K} 的相邻两个维度当成一个二维平面，对它们按位置编号做旋转。设某个二维对为 \code{[x_0,x_1]}，位置为 \code{p}，这个维度对的角频率为 \code{\theta}，旋转后是：
+
+\[
+\begin{bmatrix}
+x'_0\\
+x'_1
+\end{bmatrix}
+=
+\begin{bmatrix}
+\cos(p\theta) & -\sin(p\theta)\\
+\sin(p\theta) & \cos(p\theta)
+\end{bmatrix}
+\begin{bmatrix}
+x_0\\
+x_1
+\end{bmatrix}
+\]
+
+一个 head 的 \code{head\_dim=128}，就有 64 个这样的二维旋转对。低频维度转得慢，高频维度转得快。推理实现通常会预先准备 \code{cos/sin} 表，或者在 kernel 中即时计算/递推。无论实现方式怎样，位置 \code{p} 必须和 token 的真实绝对位置一致。
+
+RoPE 的关键效果体现在点积里。若 query 在位置 \code{i}，key 在位置 \code{j}，二者分别旋转后再点积，分数会携带相对位置 \code{i-j} 的信息。也就是说，模型不只知道“这两个 token 内容像不像”，还知道“它们相隔多远”。这正是 KV cache 必须保存已经加过位置的 \code{K} 的原因之一：未来 query 来时，会用自己的位置旋转 \code{Q}，再和历史位置旋转过的 \code{K} 做点积。
+
+\begin{lstlisting}[numbers=none,caption={RoPE 在 prefill 和 decode 中的位置合同}]
+prefill:
+  for position p in 0..prompt_tokens-1:
+    q[p], k[p] = rope(q[p], k[p], p)
+    store k[p] into KV cache
+
+decode:
+  p = prompt_tokens + generated_tokens
+  q_new, k_new = rope(q_new, k_new, p)
+  append k_new at KV cache position p
+  attend q_new to cached K[0..p]
+\end{lstlisting}
+
+这里最容易错的是 position 计数。左 padding、prefix cache、分页 cache、被截断的滑动窗口、批量合并请求，都会让“数组下标”和“模型位置编号”不再天然相等。实现可以把 KV 放在任意物理 page，但 RoPE 用的位置编号必须仍然是模型语义位置。
+
+\begin{warningbox}
+RoPE 错误通常不是 shape 错误。程序会正常运行，KV cache 大小也对，甚至前几个 token 看起来还行；但长上下文、prefix 复用、续写请求会出现 logits 漂移。调试时要记录每个 token 的 model position，而不是只打印 cache slot。
+\end{warningbox}
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+场景 & 容易犯的错 & 后果 \\
+\midrule
+左 padding batch & 把 batch 内数组列号当位置 & 短句和长句位置错开 \\
+prefix cache & 复用 K/V 但新 token 从 0 计数 & 续写 logits 偏移 \\
+滑动窗口 & cache slot 回绕后位置也回绕 & RoPE 相对距离语义损坏 \\
+分页 KV & page offset 当全局位置 & 跨页 attention 错 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Q、K、V 到底是什么意思}
+
+自注意力要解决的问题是：当前位置应该从历史哪些 token 中取信息。每个位置经过三个投影得到 \code{Q}、\code{K}、\code{V}：
+
+\begin{itemize}
+  \item \code{Q}：query，可以理解成当前位置提出的问题。
+  \item \code{K}：key，可以理解成历史位置用于匹配的问题索引。
+  \item \code{V}：value，可以理解成历史位置真正提供的内容。
+\end{itemize}
+
+对当前 token 的一个 attention head，计算可以写成：
+
+\begin{lstlisting}[numbers=none,caption={单 head decode attention}]
+for pos in 0..current_position:
+  score[pos] = dot(q_current, k_cache[pos]) / sqrt(head_dim)
+
+prob = softmax(score)
+
+out = 0
+for pos in 0..current_position:
+  out += prob[pos] * v_cache[pos]
+\end{lstlisting}
+
+第一轮循环计算“当前 token 和每个历史 token 有多相关”。第二步 softmax 把分数变成权重。第三轮循环把历史 \code{V} 按权重加起来，得到当前位置从历史上下文中取回的信息。
+
+如果是 prefill，模型会同时处理 prompt 中多个位置。为了保持因果约束，位置 \code{i} 只能看 \code{0..i}，不能看后面的 token。这就是 causal mask。decode 阶段每次只处理最后一个新 token，它天然只能看历史 cache，因此 mask 形态更简单，但读历史 K/V 的长度会随着上下文增长。
+
+\section{一个能手算的 attention 例子}
+
+用一个二维 head 看清 attention。设当前 query 和两个历史 key/value 为：
+
+\[
+q=[1,0],\quad k_0=[1,0],\quad k_1=[0,1]
+\]
+
+\[
+v_0=[2,0],\quad v_1=[0,4],\quad d=2
+\]
+
+两个 score 是：
+
+\[
+s_0=\frac{q\cdot k_0}{\sqrt{2}}=0.707,\qquad
+s_1=\frac{q\cdot k_1}{\sqrt{2}}=0
+\]
+
+softmax 后：
+
+\[
+p_0=\frac{e^{0.707}}{e^{0.707}+e^0}\approx 0.67,\qquad
+p_1\approx 0.33
+\]
+
+输出就是：
+
+\[
+out=p_0v_0+p_1v_1\approx 0.67[2,0]+0.33[0,4]=[1.34,1.32]
+\]
+
+这个小例子说明三件事。第一，\code{Q/K} 决定从历史位置拿多少权重；第二，\code{V} 决定真正被汇聚的内容；第三，softmax 不会只选一个 token，它通常产生一个加权混合。实际模型只是把二维 head 换成 \code{128} 维 head，把两个历史位置换成长上下文，把一个 head 换成几十个 head。
+
+\begin{warningbox}
+不要把 attention 解释成“模型查找最相关的一个词”。更准确地说，它是在每个 head 内对可见历史位置做加权汇聚。某些 head 可能很尖锐，某些 head 可能很分散；最终还要经过 \code{Wo} 和 MLP 混合。
+\end{warningbox}
+
+\section{一个能手算的最小 decoder block}
+
+只看 attention 还不够，因为读者真正要实现的是整层 decode。下面给一个极小、可以手算完的单层单 head 例子。设 hidden size \code{H=4}，query head 数和 KV head 数都为 \code{1}，\code{head\_dim=2}，当前是 decode 第 \code{1} 步，历史里已有 1 个 token。
+
+先给输入和权重。为了把账本压到最小，这里故意选近似单位选择矩阵：
+
+\begin{lstlisting}[numbers=none,caption={最小 decoder block 的输入与权重}]
+x_in = [1, 0, 1, 0]
+
+Wq =
+[[1,0],
+ [0,1],
+ [0,0],
+ [0,0]]
+
+Wk = Wq
+
+Wv =
+[[2,0],
+ [0,4],
+ [0,0],
+ [0,0]]
+
+Wo =
+[[1,0,1,0],
+ [0,1,0,1]]
+
+Wgate =
+[[1,0],
+ [0,1],
+ [0,0],
+ [0,0]]
+
+Wup =
+[[1,0],
+ [0,1],
+ [1,0],
+ [0,1]]
+
+Wdown =
+[[1,0,1,0],
+ [0,1,0,1]]
+\end{lstlisting}
+
+假设 RMSNorm 的 \code{\gamma=[1,1,1,1]}，\code{\epsilon} 足够小可忽略；历史 cache 中已经有
+\[
+k_0=[1,0],\qquad v_0=[2,0]
+\]
+当前 token 经过 \code{Wq/Wk/Wv} 后得到：
+\[
+q_1=[1,0],\qquad k_1=[1,0],\qquad v_1=[2,0]
+\]
+为了和前一节的二维 attention 例子保持一致，再假设历史里还有一个位置
+\[
+k_2=[0,1],\qquad v_2=[0,4]
+\]
+于是当前 query 实际可见的是三个位置 \code{0,1,2}，其中 \code{0} 和 \code{1} 都与 \code{q_1} 同向，\code{2} 与 \code{q_1} 正交。
+
+score 是：
+\[
+s_0=s_1=\frac{1}{\sqrt{2}}\approx 0.707,\qquad s_2=0
+\]
+稳定 softmax 后：
+\[
+p_0=p_1=\frac{e^{0.707}}{2e^{0.707}+1}\approx 0.401,\qquad
+p_2\approx 0.198
+\]
+因此 attention 输出是：
+\[
+attn\_out
+=
+0.401[2,0]+0.401[2,0]+0.198[0,4]
+\approx
+[1.604,0.792]
+\]
+
+\code{Wo} 把二维 head 拼回 \code{[4]}：
+\[
+attn\_proj = [1.604,0.792,1.604,0.792]
+\]
+做第一次残差：
+\[
+x_{mid}=x_{in}+attn\_proj=[2.604,0.792,2.604,0.792]
+\]
+
+现在进入 MLP。先做第二次 RMSNorm：
+\[
+r=\sqrt{\frac{2.604^2+0.792^2+2.604^2+0.792^2}{4}}\approx 1.939
+\]
+\[
+h_{ffn}=\frac{x_{mid}}{r}\approx[1.343,0.408,1.343,0.408]
+\]
+然后按上面的 \code{Wgate/Wup} 投影：
+\[
+g=[1.343,0.408]
+\]
+\[
+u=[1.343+1.343,\;0.408+0.408]=[2.686,0.816]
+\]
+SwiGLU 的逐元素结果是：
+\[
+\operatorname{silu}(1.343)\approx 1.064,\qquad
+\operatorname{silu}(0.408)\approx 0.245
+\]
+\[
+m=\operatorname{silu}(g)\odot u
+\approx
+[1.064\times 2.686,\;0.245\times 0.816]
+\approx
+[2.858,0.200]
+\]
+最后经 \code{Wdown} 回到 \code{[4]}：
+\[
+ffn\_out=[2.858,0.200,2.858,0.200]
+\]
+第二次残差后的层输出是：
+\[
+x_{out}=x_{mid}+ffn\_out
+\approx
+[5.462,0.992,5.462,0.992]
+\]
+
+这个例子虽然极小，但已经包含了单层 decode 的完整合同：
+
+\begin{lstlisting}[numbers=none,caption={最小 decoder block 的逐步账本}]
+1. x_in -> RMSNorm -> h_attn
+2. h_attn -> Wq/Wk/Wv -> q/k/v
+3. append current k/v into KV cache
+4. q dot historical K -> score row
+5. softmax(score) -> prob row
+6. prob weighted sum historical V -> attn_out
+7. attn_out -> Wo -> x_mid
+8. x_mid -> RMSNorm -> h_ffn
+9. h_ffn -> Wgate/Wup -> g/u
+10. silu(g) * u -> m
+11. m -> Wdown -> ffn_out
+12. x_mid + ffn_out -> x_out
+\end{lstlisting}
+
+\begin{keyidea}
+只要你能把这个最小例子逐标量复现，就已经具备了写 reference decoder layer 的能力。大模型真实工程只是把维度、head 数、层数、GQA 映射、RoPE 和量化合同扩展出去，而不是换了一套完全不同的数学。
+\end{keyidea}
+
+\section{causal mask 不是一个随手写的 if}
+
+attention 能保持“当前位置不能偷看未来”，靠的不是口头约束，而是 mask 的数学合同。对 prefill 中第 \code{i} 个位置看第 \code{j} 个位置，最基本的 causal mask 是：
+
+\[
+mask_{i,j}=
+\begin{cases}
+0, & j \le i \\
+-\infty, & j > i
+\end{cases}
+\]
+
+它加到 score 上之后，未来位置经过 softmax 的概率就会变成 0。于是：
+
+\[
+P_{i,j}=
+\frac{\exp(score_{i,j}+mask_{i,j})}
+{\sum_t \exp(score_{i,t}+mask_{i,t})}
+\]
+
+这条式子看起来简单，但实现时有三个常见坑。第一，mask 是语义合同，不是某个 kernel 私有约定；prefill、decode、reference 和 optimized kernel 的可见位置集合必须一致。第二，很多高性能实现不会真的存一个完整 \code{[T,T]} mask 矩阵，而是在 kernel 中按 \code{i,j} 规则即时判断。第三，若 softmax 在 fp32 accumulator 中做，可以直接使用 \code{-\infty}；若某条路径在低精度上直接做指数，常会改用足够小的有限负数，让它在指数后安全下溢到 0。
+
+一旦从 full attention 改到局部窗口，mask 公式也会变化。若窗口宽度是 \code{W}，则第 \code{i} 个位置只看最近 \code{W} 个可见历史：
+
+\[
+mask^{(W)}_{i,j}=
+\begin{cases}
+0, & \max(0, i-W+1) \le j \le i \\
+-\infty, & \text{otherwise}
+\end{cases}
+\]
+
+这已经不是“同一个模型只是省点内存”，而是改变了可见上下文集合。任何 sliding window、sink token、prefix LM 或者 block sparse attention，都必须先把“谁能看见谁”写成明确合同，再去实现 kernel。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.36\linewidth}p{0.24\linewidth}}
+\toprule
+形态 & 第 \code{i} 个位置的可见集合 & 复杂度直觉 \\
+\midrule
+full causal & \code{0..i} & 长度随 \code{i} 线性增长 \\
+window \code{W} & \code{max(0,i-W+1)..i} & 每行最多 \code{W} 个位置 \\
+prefix + window & 固定前缀并加最近窗口 & 语义更复杂，缓存复用更敏感 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{为什么没有 KV cache 会慢得离谱}
+
+先想一个没有 KV cache 的 decode。已经生成了 \code{S} 个 token，现在要生成第 \code{S+1} 个。如果没有 cache，模型为了让当前 token attend 到历史，必须重新把 \code{0..S} 这些 token 跑过每一层，重新计算每一层每个历史位置的 K/V。下一步 \code{S+2} 又要再算一遍 \code{0..S+1}。
+
+这会造成重复计算。历史 token 的 K/V 一旦算出来，在后续 decode 中不会因为新 token 到来而改变。它们应该保存下来。KV cache 做的正是这件事：
+
+\begin{lstlisting}[numbers=none,caption={有无 KV cache 的 decode 差异}]
+without KV cache:
+  step S:
+    recompute K/V for tokens 0..S in every layer
+    compute attention for current token
+
+with KV cache:
+  prefill:
+    compute and store K/V for prompt tokens
+  step S:
+    compute only current token K/V
+    append K/V at position S
+    read cached K/V[0..S] for attention
+\end{lstlisting}
+
+\begin{keyidea}
+KV cache 省掉的是历史 token 的重复 K/V 投影和中间层重算；它没有省掉读取历史 K/V 的成本。decode 仍然要随上下文长度读取越来越多的 K/V，所以 KV cache 同时带来性能收益和内存压力。
+\end{keyidea}
+
+这句话非常重要。KV cache 不是让 attention 变成常数时间；它让“重算历史网络”变成“读取历史 K/V”。前者会让每步重复大量矩阵乘，后者会让每步产生随上下文增长的内存读流。后续优化 KV cache 的核心，就是围绕容量、布局、读带宽、量化和分页管理做取舍。
+
+\section{KV cache 的逻辑形状和物理布局}
+
+KV cache 的逻辑形状通常可以写成：
+
+\begin{lstlisting}[numbers=none,caption={KV cache 的逻辑形状}]
+K_cache[layer, batch, kv_head, position, head_dim]
+V_cache[layer, batch, kv_head, position, head_dim]
+\end{lstlisting}
+
+每一层都有自己的 cache；每个 batch/session 有自己的 cache；每个 K/V head 有自己的历史；每个 position 保存一个 \code{head_dim} 向量。这里用 \code{kv\_head} 而不是 \code{head}，是因为一些模型使用 multi-query attention 或 grouped-query attention。它们让多个 query head 共享较少的 K/V head，以降低 KV cache 容量和读流。
+
+逻辑形状不等于物理布局。CPU 后端可能希望 \code{position, head\_dim} 连续，便于按历史顺序扫描；GPU 后端可能希望按 page、block 或 head 分组，让 warp 读取得到更好的 coalescing；分页 KV cache 还会引入 page table。无论物理布局怎样变，逻辑合同不能变：给定 \code{layer,batch,kv\_head,position,head\_dim}，读到的 K/V 必须一致。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+布局选择 & 适合的访问 & 风险 \\
+\midrule
+position 连续 & CPU 长上下文顺序扫描 & 多 session/page 管理较麻烦 \\
+head 连续 & 按 head 分工的 kernel & position 读流可能跨步 \\
+page/block & 动态增长、释放、prefix 复用 & page table 和边界处理复杂 \\
+量化 block & 降低容量和带宽 & scale metadata 进入热路径 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{KV cache 的容量账本}
+
+KV cache 容量可以用一条公式估算：
+
+\begin{lstlisting}[numbers=none,caption={KV cache 容量估算}]
+bytes =
+  layers *
+  batch *
+  context_tokens *
+  kv_heads *
+  head_dim *
+  2 /* K and V */ *
+  bytes_per_element
+\end{lstlisting}
+
+举一个接近 7B 模型的账本。假设 \code{layers = 32}，\code{kv\_heads = 8}，\code{head\_dim = 128}，上下文长度 \code{S = 4096}，batch 为 1，KV 用 fp16，也就是每个元素 2 字节：
+
+\begin{lstlisting}[numbers=none,caption={GQA 模型的 KV cache 例子}]
+bytes = 32 * 1 * 4096 * 8 * 128 * 2 * 2
+      = 536870912 bytes
+      = 512 MiB
+\end{lstlisting}
+
+如果 \code{kv\_heads} 不是 8，而是 32，容量会变成 4 倍，也就是约 2 GiB。若 batch 从 1 变成 4，再乘 4。若上下文从 4096 变成 32768，再乘 8。KV cache 不是小 buffer，它经常决定本地推理能不能跑长上下文、能跑多少并发 session、能不能放进 GPU 显存。
+
+\begin{warningbox}
+权重量化解决的是静态模型容量和权重读带宽；KV cache 量化解决的是运行时状态容量和历史 K/V 读带宽。两者对象不同、生命周期不同、误差来源不同，不能混为一谈。
+\end{warningbox}
+
+KV cache 量化也不是免费。比如 int8 KV cache 会减少 K/V 码点字节，但需要 scale metadata；per-token scale 精度较好，但 metadata 和读取更重；per-block scale 开销小一些，但误差和 block 边界要验证。报告不能只写“KV cache 减半”，必须同时写 decode latency、metadata bytes、logits 误差和长上下文质量。
+
+\section{MHA、GQA、MQA 为什么影响 KV cache}
+
+attention 的 query head 数决定输出表达能力的一部分，但 KV cache 的容量由 K/V head 数决定。三种常见形态可以这样区分：
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.22\linewidth}p{0.42\linewidth}}
+\toprule
+形态 & K/V head 数 & 含义 \\
+\midrule
+MHA & \code{n_kv = n_q} & 每个 query head 有自己的 K/V head \\
+GQA & \code{1 < n_kv < n_q} & 多个 query head 共享一组 K/V head \\
+MQA & \code{n_kv = 1} & 所有 query head 共享一个 K/V head \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+继续用 \code{n_q=32}、\code{head\_dim=128}、\code{L=32}、\code{S=4096}、fp16 KV。不同 K/V head 数的 cache 容量是：
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.20\linewidth}p{0.24\linewidth}p{0.24\linewidth}}
+\toprule
+形态 & \code{n_kv} & KV 容量 & 每 token KV 读流 \\
+\midrule
+MHA & 32 & 约 2 GiB & 约 2 GiB \\
+GQA & 8 & 约 512 MiB & 约 512 MiB \\
+MQA & 1 & 约 64 MiB & 约 64 MiB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表解释了为什么很多本地模型选择 GQA。它保留多个 K/V head，比 MQA 更有表达能力；同时把 KV cache 容量和读流从 MHA 的四分之一甚至更低。注意，GQA 降低的是 \code{Wk/Wv} 输出、KV cache 容量和历史 K/V 读流；它不降低 \code{Wq}、\code{Wo} 和 MLP 的主计算量。
+
+实现上，GQA 不能靠简单复制 K/V 到 32 个 query head 来“方便计算”。复制会把 KV cache 容量和读流重新放大，抵消 GQA 的主要收益。正确做法是在 attention kernel 中让多个 query head 映射到同一个 K/V head：
+
+\begin{lstlisting}[numbers=none,caption={GQA head 映射不能靠物理复制糊弄}]
+group_size = num_query_heads / num_kv_heads
+
+for q_head in 0..num_query_heads-1:
+  kv_head = q_head / group_size
+  k = K_cache[layer, batch, kv_head, position, :]
+  v = V_cache[layer, batch, kv_head, position, :]
+  compute_attention(q[q_head], k, v)
+\end{lstlisting}
+
+\begin{keyidea}
+GQA 是模型结构和运行时账本同时成立的设计：模型训练时学会共享较少的 K/V head，推理时才能少存、少读历史 K/V。没有这个前提，运行时强行合并 K/V head 会改变模型语义。
+\end{keyidea}
+
+\section{KV cache 缓存的不是 hidden}
+
+一个常见误解是：既然历史 token 已经算过，保存 hidden 就够了。实际不是这样。每一层 attention 需要的是这一层自己的 \code{K} 和 \code{V}，它们来自当前层输入 hidden 经过 \code{Wk/Wv} 投影，再叠加 RoPE 等位置信息。第 3 层的 \code{K/V} 不能替代第 18 层的 \code{K/V}；token embedding 也不能替代任意层的 \code{K/V}。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.22\linewidth}p{0.44\linewidth}}
+\toprule
+对象 & 是否长期保存 & 原因 \\
+\midrule
+token ids & 是 & tokenizer 结果和上下文合同，需要用于位置、日志和重放 \\
+hidden & 通常否 & 每层临时状态，下一层用完即可释放或复用 buffer \\
+K/V & 是 & 后续 token 的每一层 attention 都要读取历史 K/V \\
+logits & 通常否 & sampler 用完即可丢弃，除非调试或审计需要保存 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此 KV cache 的正确性不能只看最终文本是否“差不多”。更严格的 oracle 应该能固定 prompt、权重、采样参数和位置编号，比较某层某位置的 \code{K/V} 或最终 logits。KV cache 布局、分页、量化、batch 合并都可以改，但逻辑坐标和数值合同不能漂移。
+
+\section{每生成一个 token 要读多少 KV}
+
+KV cache 的容量公式只回答“占多少内存”，还没有回答“每步读多少”。full attention decode 下，当前 token 在每一层都要扫描历史 \code{K} 算 score，再扫描历史 \code{V} 做加权求和。粗略读流就是：
+
+\begin{lstlisting}[numbers=none,caption={decode 单 token 的 KV 读写粗账}]
+kv_read_bytes_per_token =
+  layers *
+  context_tokens *
+  kv_heads *
+  head_dim *
+  2 /* K and V */ *
+  bytes_per_kv_element
+
+kv_write_bytes_per_token =
+  layers *
+  kv_heads *
+  head_dim *
+  2 /* new K and V */ *
+  bytes_per_kv_element
+\end{lstlisting}
+
+继续使用前面的 7B 级参数，\code{L=32}，\code{kv\_heads=8}，\code{head\_dim=128}，fp16 KV：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.28\linewidth}p{0.32\linewidth}}
+\toprule
+上下文长度 & 每 token 读 KV & 每 token 写 KV \\
+\midrule
+\code{S = 4096} & 约 512 MiB & 约 128 KiB \\
+\code{S = 32768} & 约 4 GiB & 约 128 KiB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表比“KV cache 很大”更有工程意义：长上下文 decode 的热路径不是写入新 K/V，而是反复读取历史 K/V。KV int8 大致把码点读流减半；KV int4 大致降到四分之一，但 scale metadata、反量化和误差验证会进入热路径。滑动窗口、稀疏 attention、prefix cache、page attention 的价值，也要放在这条读流上判断。
+
+若 prompt 长度为 \code{P}，继续生成 \code{G} 个 token，KV 读取不是简单的 \code{G * P}。因为上下文每步增长 1，累计读流近似为：
+
+\begin{lstlisting}[numbers=none,caption={生成 G 个 token 的累计 KV 读流}]
+total_kv_read =
+  layers * kv_heads * head_dim * 2 * bytes_per_kv *
+  (G * P + G * (G - 1) / 2)
+\end{lstlisting}
+
+这解释了为什么同一个模型在短回答和长回答中的平均 tokens/s 会不同。不是 sampler 变慢了，而是 decode 后半段每步要扫描更长的历史。
+
+\section{prefix cache 和 sliding window 改变的是语义}
+
+很多工程讨论会把 prefix cache、window attention、KV eviction 都叫成“cache 优化”。这不够准确。prefix cache 在语义上仍然是 full attention，它只是复用已经算过、并且逻辑位置完全一致的前缀 K/V；sliding window 则真的改变了每一步的可见历史集合；KV eviction 若没有模型层面的对应设计，往往直接改变 logits。
+
+设用户 prompt 长度为 \code{P}，已经生成了 \code{t} 个 token。full attention decode 的可见集合是：
+
+\[
+Visible(t)=\{0,1,\dots,P+t\}
+\]
+
+如果某次请求复用了前缀缓存，只要前缀文本、tokenization 结果、RoPE 位置编号和模型权重都一致，那么前 \code{P-1} 个位置的 K/V 可以直接重用；新 token 仍然会看见完整前缀。这时变的是“算不算前缀”，不是“能不能看前缀”。
+
+若改成窗口大小为 \code{W} 的 sliding window，并保留完整前缀 \code{0..P-1}，后续第 \code{t} 步可见集合会变成：
+
+\[
+Visible_{prefix+window}(t)=
+\{0,\dots,P-1\} \cup
+\{\max(P, P+t-W+1), \dots, P+t\}
+\]
+
+若没有保留完整前缀，而是纯窗口 attention，则更激进：
+
+\[
+Visible_{window}(t)=
+\{\max(0, P+t-W+1), \dots, P+t\}
+\]
+
+这两者的差异非常大。前者还能长期保留系统提示词、指令头和固定 schema；后者在上下文够长时会把最早的系统指令也裁掉。实现上如果只是“把最旧 page 释放掉”，却没有同步修改 mask、position 合同和 benchmark 口径，那么报告里的模型已经不是原来的 full attention 模型。
+
+\begin{warningbox}
+prefix cache 的复用条件比“前缀文本一样”更严格。tokenization 版本、special token 规则、chat template、RoPE 位置起点、模型权重版本，只要有一项不同，前缀 K/V 就不能安全复用。
+\end{warningbox}
+
+\section{计算量账本：线性层、attention 和 sampler}
+
+现在把计算量讲清。设 hidden size 为 \code{H}，层数为 \code{L}，prompt token 数为 \code{T}，decode 当前上下文长度为 \code{S}。一个线性层从 \code{H} 投影到 \code{O}，处理 \code{N} 个 token，乘加量大约是：
+
+\begin{lstlisting}[numbers=none,caption={线性层 FLOPs 粗账}]
+linear_flops ~= 2 * N * H * O
+\end{lstlisting}
+
+系数 2 来自一次乘法和一次加法。这个公式足够解释 prefill 和 decode 的差别：
+
+\begin{itemize}
+  \item prefill：\code{N = T}，一次处理很多 token，线性层更像 GEMM。
+  \item decode：\code{N = 1}，一次处理一个 token，线性层更像 GEMV 或小 GEMM。
+\end{itemize}
+
+attention 的账本分两部分。第一，当前 query 和历史 K 做点积，大约是 \code{2 * S * head\_dim} 每个 head。第二，用 softmax 权重加权历史 V，也大约是 \code{2 * S * head\_dim} 每个 head。所有层和所有 head 加起来，decode attention 的读流和计算量都随 \code{S} 线性增长。
+
+sampler 也不能忽略。若词表大小是 \code{V}，贪心采样至少要扫描 \code{V} 个 logits；top-k/top-p 还会有排序、选择或前缀概率累加。对于很大的 vocab 或 GPU 后端，如果每步都把完整 logits 从 GPU 拷回 CPU，sampler 和同步也会进入端到端瓶颈。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 主要工作 & 常见瓶颈 \\
+\midrule
+prefill & 多 token 线性层、prompt attention & GEMM 吞吐、activation 峰值、workspace \\
+decode & 单 token 投影、读取历史 KV & 权重读带宽、KV cache 读流、小 kernel 开销 \\
+sampler & logits 后处理 & 词表扫描、top-k/top-p、设备同步 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{同一组 7B 参数下的 prefill/decode 对账}
+
+前面给了公式，现在把它们放进同一张账本里。仍取 \code{H=4096}、\code{L=32}、\code{I=11008}、\code{n_q=32}、\code{n_kv=8}、\code{head\_dim=128}。对 decode 单 token，单层主要线性部分大约是：
+
+\[
+Q: 2H^2,\qquad
+K/V: 2H(n_{kv}d)\times 2,\qquad
+O: 2H^2,\qquad
+MLP: 2HI\times 3
+\]
+
+代入后：
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.30\linewidth}p{0.28\linewidth}}
+\toprule
+项目 & 单层 FLOPs & 32 层 FLOPs \\
+\midrule
+Q projection & 约 33.6M & 约 1.07G \\
+K/V projection & 约 16.8M & 约 0.54G \\
+O projection & 约 33.6M & 约 1.07G \\
+MLP 三矩阵 & 约 270.5M & 约 8.66G \\
+\midrule
+合计 & 约 354.4M & 约 11.34G \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这只是线性层，不含 attention 读历史 K/V、softmax、sampler 和 runtime 调度。若 prompt 长度 \code{T=2048}，prefill 线性层会把这 \code{11.34G} 乘上 \code{2048}，得到约 \code{23.2 TFLOPs}；若 \code{T=4096}，就是约 \code{46.5 TFLOPs}。但是 prefill 的权重 tile 能被多个 token 行复用，所以它不能按“每 token 读完整模型权重”粗暴相乘。
+
+prefill attention 的二次项也要算。单 head 的 \code{QK^T} 和 \code{PV} 合起来约 \code{4T^2d}；所有 query head 和所有层合起来约：
+
+\[
+F_{prefill\_attn}\approx L \times n_q \times 4T^2d
+\]
+
+代入后得到：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+prompt 长度 & 线性层 FLOPs & attention 二次项 FLOPs \\
+\midrule
+\code{T=2048} & 约 23.2T & 约 2.2T，因果半矩阵约 1.1T \\
+\code{T=4096} & 约 46.5T & 约 8.8T，因果半矩阵约 4.4T \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表说明：长 prompt 的 TTFT 不是只由线性层决定。prompt 从 \code{2048} 到 \code{4096}，线性层约翻倍，attention 二次项约翻四倍。若一个 benchmark 只测 \code{128} token prompt，它不能证明 \code{8K} prompt 的首 token 延迟。
+
+再看 decode 长生成。假设 prompt 长度 \code{P=2048}，继续生成 \code{G=256} 个 token。线性层 FLOPs 近似是：
+
+\[
+F_{decode\_linear}\approx 11.34G \times 256 \approx 2.90TFLOPs
+\]
+
+decode attention 的累计历史长度不是 \code{256\times2048}，而是：
+
+\[
+\sum_{t=0}^{G-1}(P+t)=GP+\frac{G(G-1)}{2}=556928
+\]
+
+attention 计算量约：
+
+\[
+F_{decode\_attn}\approx L\times n_q\times4d\times556928\approx0.292TFLOPs
+\]
+
+注意这个 \code{0.292TFLOPs} 看起来不如线性层大，但它伴随大量 KV 读流。fp16 GQA KV 的累计读字节是：
+
+\[
+32\times8\times128\times2\times2\times556928
+\approx 68GiB
+\]
+
+所以长生成的 decode 后半段常常表现为两条压力叠加：每个 token 都要读权重并做线性层，同时还要随上下文增长扫描历史 KV。权重量化主要压低第一条；KV 量化、paged KV、sliding window、GQA/MQA 主要压低第二条。但任一项只要改变 mask、position 或 K/V 数值解释，就必须回到 oracle 验证。
+
+\begin{keyidea}
+prefill 的核心问题是“多 token 大矩阵 + 长 prompt 二次 attention”；decode 的核心问题是“每 token 权重流 + 随上下文增长的 KV 读流”。优化方向不同，验收指标也不能混在一个平均 tokens/s 里。
+\end{keyidea}
+
+\section{batch decode 不是免费吞吐}
+
+服务端常把多个 session 合并成 batch decode，希望让单 token GEMV 变成小 GEMM，提高权重复用。这个方向是对的，但它不是免费吞吐。设 batch 中有 \code{B} 个 session，线性层从 \code{[1,H]} 变成 \code{[B,H]}，权重 tile 可以被 \code{B} 行复用；但是每个 session 的上下文长度可能不同，KV 读流仍然要分别扫描：
+
+\[
+KVRead_{batch}
+\approx
+L\times n_{kv}\times d\times2\times bytes
+\times \sum_{b=0}^{B-1}S_b
+\]
+
+若 batch 内有一个 \code{32K} 长上下文 session 和多个短上下文 session，attention kernel、page table 和调度可能被长请求拖慢。若为了凑 batch 等待太久，吞吐提高但 p95 延迟变差。真正的服务端账本至少要同时报告：
+
+\begin{itemize}
+  \item batch size 分布，而不是只报最大 batch；
+  \item batch 内 context length 分布；
+  \item 每步实际扫描的 KV token 总数 \(\sum S_b\)；
+  \item 合批等待时间和 decode kernel 时间；
+  \item 是否出现 padding 计算、page table 间接访问和长短请求互相阻塞。
+\end{itemize}
+
+这也是 paged KV cache 的价值之一：它让不同 session 的 KV 可以分散增长和回收，调度器可以按 page 管理上下文。但 page table 引入间接寻址，kernel 必须把逻辑位置、物理 page、RoPE position、scale metadata 一起处理对。
+
+\section{logits 到 token 的算法细节}
+
+模型主体输出的是 logits，不是最终文字。设词表大小为 \code{V}，最后位置的 hidden 是 \code{h}，\code{lm\_head} 权重是 \code{W_vocab}，则：
+
+\[
+z = h W_{vocab}, \qquad z \in \mathbb{R}^{V}
+\]
+
+\code{z_i} 是第 \code{i} 个 token 的未归一化分数。softmax 概率是：
+
+\[
+p_i=\frac{\exp((z_i-m)/\tau)}{\sum_j \exp((z_j-m)/\tau)}, \qquad
+m=\max_j z_j
+\]
+
+这里减去 \code{m} 是为了避免指数溢出；\code{\tau} 是 temperature。temperature 越小，分布越尖，越接近贪心；temperature 越大，尾部 token 概率会被抬高。若实现没有先减最大值，长尾 logits 在 fp16/fp32 下都可能出现数值问题。
+
+\begin{lstlisting}[numbers=none,caption={sampler 的常见执行顺序}]
+logits = lm_head(last_hidden)
+logits = apply_repetition_penalty(logits, generated_tokens)
+logits = logits / temperature
+logits = apply_top_k_filter(logits, k)
+logits = apply_top_p_filter(logits, p)
+prob = softmax_stable(logits)
+next_id = sample(prob, rng_state)
+\end{lstlisting}
+
+top-k 是保留分数最高的 \code{k} 个 token，其他 token 置为负无穷。top-p 是先按概率从高到低排序，保留累计概率达到阈值 \code{p} 的最小集合。两者可以叠加，但顺序会影响结果。工程测试时必须固定顺序、随机数算法和 seed；否则同一个 logits 也会生成不同文本。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+策略 & 算法含义 & 典型风险 \\
+\midrule
+greedy & 取最大 logits & 稳定但容易重复和死板 \\
+temperature & 缩放 logits 分布 & 过高会放大低质量尾部 token \\
+top-k & 只在前 \code{k} 个候选中采样 & \code{k} 太小会截断合理候选 \\
+top-p & 保留累计概率核 & 排序和前缀和成本进入热路径 \\
+repeat penalty & 惩罚已生成 token & 过强会破坏术语和代码一致性 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+sampler 的 oracle 要分两层。第一层比较 logits：同一 prompt、同一权重、同一 KV cache 状态下，优化前后的 logits 误差应在阈值内。第二层比较 token 序列：固定 sampler 参数和随机数状态后，next token 应一致。只看最终自然语言文本是不够的，因为采样随机性会掩盖模型计算错误。
+
+\section{为什么 7B decode 常常像“读权重”}
+
+对 dense decoder-only 模型，decode 每生成一个 token 都要经过所有层。粗略说，每步会触碰模型的大部分权重。若权重是 fp16，7B 参数约 14GB；若是 int8，约 7GB 加 scale；若是 int4，约 3.5GB 加 group scale。实际 kernel 会有 cache、packing 和分块，但 decode batch 小，权重复用有限，内存带宽往往很显眼。
+
+这解释了为什么量化能显著影响本地 CPU 推理：它不仅降低模型容量，也降低每步权重读流。但低比特会引入解包、scale 读取和反量化成本。收益来自“少读字节”，代价来自“多做转换”。是否更快，要看当前瓶颈是带宽、指令、cache、TLB 还是线程调度。
+
+prefill 不同。prefill 有多个 token 行，权重能被多个 token 复用，GEMM kernel 更容易吃到算术吞吐。于是同一个模型可能表现为：prefill 很快，decode 慢；或者 GPU prefill 很强，但单用户 decode tokens/s 提升不如峰值算力那样夸张。
+
+\begin{keyidea}
+不要用一个“模型速度”概括推理性能。至少要分开报告：加载时间、packing 时间、time to first token、prefill tokens/s、decode tokens/s、p50/p95 单 token 延迟、KV cache bytes 和峰值内存。
+\end{keyidea}
+
+\section{7B 级模型的一层粗账}
+
+为了让账本落地，取一组常见 7B 级参数做估算：\code{H = 4096}，层数 \code{L = 32}，MLP 中间维度近似 \code{I = 11008}，query head 数 \code{32}，GQA 下 \code{kv\_heads = 8}，\code{head\_dim = 128}。不同模型数值会变，但量级判断相同。
+
+decode 单 token 时，一层的主要线性层 FLOPs 近似如下：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+子层 & FLOPs 公式 & 量级 \\
+\midrule
+Q projection & \code{2 * H * H} & 约 33.6M \\
+K/V projection & \code{2 * H * kv\_heads * head\_dim * 2} & 约 16.8M \\
+O projection & \code{2 * H * H} & 约 33.6M \\
+MLP gate/up/down & \code{2 * H * I * 3} & 约 270M \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表说明两个事实。第一，MLP 往往是单层 FLOPs 大头；第二，GQA 会显著降低 K/V projection 和 KV cache 容量，但不会降低 Q projection 和 MLP。粗略相加，一层 decode 线性部分约 350M FLOPs，32 层就是 11G FLOPs 量级。这个数字不是精确 benchmark，但足以解释为什么每 token latency 对本地机器很敏感。
+
+再看权重字节。如果一层权重按 fp16 读，Q、O 各约 \code{H * H * 2} 字节，MLP 三个矩阵约 \code{H * I * 3 * 2} 字节。仅这些线性层，一层就接近数百 MB 级权重流；32 层接近完整模型权重规模。int8、int4 的意义首先是减少这条读流，但它们会引入 scale、解包和反量化成本。
+
+\begin{lstlisting}[numbers=none,caption={单 token decode 的粗略机器判断}]
+if batch == 1:
+  projection shape is mostly GEMV
+  weight reuse is low
+  weight bandwidth and cache/TLB behavior are critical
+else:
+  projection becomes small/batched GEMM
+  weight reuse improves
+  arithmetic throughput becomes more visible
+\end{lstlisting}
+
+\section{把权重字节和带宽下限算出来}
+
+单 token decode 的线性层 FLOPs 很大，但在 batch 为 1 时，另一个更硬的约束是权重字节。可以先用最朴素的下限估算：
+
+\begin{lstlisting}[numbers=none,caption={单 token decode 的字节下限}]
+weight_bytes_per_token ~= parameter_count * bytes_per_weight
+lower_bound_ms =
+  1000 * (weight_bytes_per_token + kv_read_bytes) /
+  effective_memory_bandwidth_bytes_per_second
+\end{lstlisting}
+
+对 7B 参数模型，忽略少量非矩阵参数和格式头，权重读流大致如下：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+\toprule
+权重格式 & 码点字节 & 加上 scale 后的直觉 \\
+\midrule
+fp16 & 约 14 GB & 几乎就是完整权重流 \\
+int8 & 约 7 GB & 还要读 group scale \\
+int4 & 约 3.5 GB & scale 和解包成本更显眼 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+把它和 KV 读流合在一起看。若 int4 权重实际要读约 \code{3.7 GB}，上下文 \code{S=4096} 的 fp16 KV 每 token 约 \code{512 MiB}，那么单 token 至少要搬运约 \code{4.2 GB} 热数据。若有效内存带宽是 \code{100 GB/s}，光搬数据的下限就是约 \code{42 ms/token}，也就是最多约 \code{24 token/s}。若有效带宽是 \code{300 GB/s}，下限约 \code{14 ms/token}，最多约 \code{71 token/s}。
+
+\begin{warningbox}
+这里的数字不是 benchmark 结果，而是反证工具。如果实测声称 batch 1、7B、长上下文、低带宽机器能远超这个下限，就必须解释权重是否常驻更高层 cache、是否跳过了部分层、是否用了 speculative decoding、是否测的是 prefill，或者统计口径是否把等待时间排除了。
+\end{warningbox}
+
+\section{从账本推到可服务容量}
+
+推理引擎能不能落地，不取决于一句“7B 可以本地跑”，而取决于容量预算是否闭合。最小预算可以先拆成三项：静态权重、运行时 KV cache、临时 workspace。
+
+\begin{lstlisting}[numbers=none,caption={单机推理服务的内存预算}]
+usable_memory >=
+  model_weight_bytes +
+  max_sessions * max_context_tokens * kv_bytes_per_token +
+  workspace_bytes +
+  runtime_overhead_bytes
+\end{lstlisting}
+
+前面例子里，fp16 KV 的 \code{kv\_bytes\_per\_token} 是：
+
+\begin{lstlisting}[numbers=none,caption={每个 session 每个 token 的 KV 容量}]
+kv_bytes_per_token =
+  layers * kv_heads * head_dim * 2 * bytes_per_kv
+  = 32 * 8 * 128 * 2 * 2
+  = 131072 bytes
+  = 128 KiB
+\end{lstlisting}
+
+因此一个 \code{4096} token 上下文的 session 需要约 \code{512 MiB} KV；\code{16} 个并发 session 就是约 \code{8 GiB} KV。若模型权重 int4 后约 \code{3.7 GiB}，机器可用内存 \code{16 GiB}，再扣掉 workspace、页表、线程栈、allocator 碎片和操作系统余量，能稳定承载的并发 session 不会等于 \code{16 GiB / 512 MiB = 32}。这个除法忽略了权重和运行时开销，是错误容量评估。
+
+吞吐预算也要分 prefill 和 decode。一个请求的首 token 延迟可以粗略拆为：
+
+\begin{lstlisting}[numbers=none,caption={请求延迟拆分}]
+TTFT =
+  queue_wait +
+  tokenize_time +
+  prefill_time(prompt_tokens) +
+  first_sampler_time
+
+per_output_token_latency =
+  decode_compute_time +
+  kv_read_time(current_context) +
+  sampler_time +
+  scheduler_overhead
+\end{lstlisting}
+
+这组公式能直接指导工程取舍。prompt 很长而输出很短，优先看 prefill；prompt 不长但输出很长，优先看 decode 后半段和 KV 读流；并发 session 多，优先看 KV 容量、分页和调度；batch 合并能提升权重复用，但会增加排队等待，p95 延迟可能变差。没有这些数字，只说“部署一个问答服务”没有工程意义。
+
+\section{prefill 的账本为什么不同}
+
+prefill 假设 prompt 长度是 \code{T}。同一个 Q projection 从 \code{[1,H] * [H,H]} 变成 \code{[T,H] * [H,H]}。FLOPs 乘以 \code{T}，但权重不是读 \code{T} 份独立副本；优秀 GEMM 会让一块权重被多个 token 行复用。于是 prefill 的算术强度比 decode 高，GPU tensor core 或 CPU 高质量 GEMM 更容易发挥作用。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+阶段 & 数据复用 & 典型优化方向 \\
+\midrule
+prefill & 多个 token 复用同一权重 tile & GEMM、tile、batch、tensor core、activation planner \\
+decode & 单 token 复用弱，逐步读历史 KV & packed weight、低比特、GEMV、小 kernel、KV layout \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+attention 也不同。prefill 的 attention 处理 \code{T} 个位置，因果 mask 下每个位置看左侧历史，总体有近似 \code{T^2} 的交互；decode 每步只处理当前 token，看长度为 \code{S} 的历史，单步是 \code{S} 级别。若 prompt 很长，prefill attention 可能显著；若生成很长，decode 的累计 KV 读取会显著。
+
+\section{prefill attention 的矩阵账本}
+
+decode attention 是当前 query 扫描历史 K/V；prefill attention 是 prompt 内所有 query 同时看左侧历史。对单个 head，prefill 可以写成三个矩阵步骤：
+
+\[
+S = \frac{QK^T}{\sqrt{d}} + M,\qquad
+P = \operatorname{softmax}(S),\qquad
+O = PV
+\]
+
+其中 \code{Q/K/V} 的形状都是 \code{[T,d]}，\code{S/P} 的形状是 \code{[T,T]}，\code{M} 是 causal mask。第 \code{i} 行只能保留 \code{0..i} 列，未来列被设为负无穷。这个 \code{[T,T]} 分数矩阵解释了为什么长 prompt 的 prefill attention 会突然变重。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.28\linewidth}p{0.34\linewidth}}
+\toprule
+步骤 & 形状 & 粗略 FLOPs \\
+\midrule
+\code{QK^T} & \code{[T,d] * [d,T]} & \code{2*T*T*d} \\
+\code{softmax} & 每行长度 \code{T} & 指数、求和、归一化 \\
+\code{PV} & \code{[T,T] * [T,d]} & \code{2*T*T*d} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+若 \code{T=4096}，\code{d=128}，单个 head 的 \code{QK^T} 就约 \code{4.3G FLOPs}，\code{PV} 也是同量级。32 个 query head 合起来是数百 GFLOPs 级别。实际高性能实现不会天真地把完整 \code{[T,T]} 矩阵长期写到内存里，而会分块计算、在线 softmax、尽量减少 HBM/DRAM 流量。这就是 FlashAttention 这类算法的核心方向：数学结果不变，改变中间矩阵的物理存取方式。
+
+CPU 本地推理也要理解这一点。短 prompt 时，prefill 主要看线性层 GEMM；长 prompt 时，attention 的二次项会变明显。若 benchmark 只用 32 token prompt，就不能推断 8K prompt 的 TTFT。反过来，decode 单步没有 \code{[T,T]} 分数矩阵，但它会随着上下文增长持续读 KV cache。
+
+\begin{warningbox}
+不要把 prefill tokens/s 和 decode tokens/s 混在一起平均。prefill 的主项包含批量线性层和 \code{T^2} attention；decode 的主项包含单 token 权重流和 \code{S} 级 KV 读取。两个数代表不同问题。
+\end{warningbox}
+
+\section{softmax 为什么能在线分块算}
+
+前面写了 prefill attention 的主式：
+\[
+S = \frac{QK^T}{\sqrt{d}} + M
+\]
+若天真实现，先把完整 \code{[T,T]} score 矩阵写到内存，再逐行做 softmax，再把概率矩阵乘 \code{V}。这样数学上没错，但内存流量很大。高性能 attention 的关键观察是：softmax 可以在不物化整行的情况下分块计算。
+
+先看一行 score \code{s_1,\dots,s_n} 的稳定 softmax：
+
+\[
+p_i = \frac{e^{s_i-m}}{\sum_j e^{s_j-m}}, \qquad
+m = \max_j s_j
+\]
+
+若把一整行拆成多个 block，可以对每个 block 先算局部最大值和局部指数和，再合并。设 block A 的局部最大值和局部和是 \code{m_A,l_A}，block B 的是 \code{m_B,l_B}，则合并后的全局值是：
+
+\[
+m = \max(m_A, m_B)
+\]
+
+\[
+l = e^{m_A-m}l_A + e^{m_B-m}l_B
+\]
+
+输出向量也能按同样的缩放关系合并。若 block A 的加权值和 block B 的加权值分别是 \code{o_A,o_B}，则：
+
+\[
+o = \frac{e^{m_A-m}l_A}{l} o_A +
+\frac{e^{m_B-m}l_B}{l} o_B
+\]
+
+这说明 attention 不需要把完整概率矩阵 \code{P} 永久落到内存里。只要每处理一个 block 时维护“当前行的最大值、归一化分母和累计输出”，就能得到与稳定 softmax 相同的数学结果。FlashAttention 这一类算法的核心就是这个思想：不改变结果，改变中间矩阵的物理存取路径。
+
+\begin{lstlisting}[numbers=none,caption={一行 attention 的 online softmax 直觉}]
+row_max = -inf
+row_sum = 0
+row_out = 0
+
+for each score/value block:
+  block_max = max(scores)
+  new_max = max(row_max, block_max)
+
+  row_sum = exp(row_max - new_max) * row_sum +
+            sum(exp(scores - new_max))
+
+  row_out = exp(row_max - new_max) * row_out +
+            sum(exp(scores - new_max) * values)
+
+  row_max = new_max
+
+output = row_out / row_sum
+\end{lstlisting}
+
+\begin{keyidea}
+online softmax 的价值不是“少做了 softmax”，而是避免把巨大中间矩阵写回再读回。attention 的数学没有变，变的是内存交通组织方式。
+\end{keyidea}
+
+\section{roofline 判断：算力瓶颈还是带宽瓶颈}
+
+第二册讲过 roofline 思路：性能取决于算术强度，也就是每读写一个字节做多少计算。把它放到推理里：
+
+\begin{lstlisting}[numbers=none,caption={推理阶段的算术强度直觉}]
+prefill GEMM:
+  many FLOPs per reused weight byte
+  more likely compute-bound on strong backend
+
+decode GEMV:
+  fewer FLOPs per weight byte
+  often bandwidth/cache/TLB sensitive
+
+KV attention:
+  reads K/V proportional to context length
+  bandwidth grows with S
+\end{lstlisting}
+
+所以“加 GPU”不是万能解释。GPU 对 prefill 大 GEMM 很强；但单用户 decode 若 batch 小，可能被 launch、KV 读流、logits 拷贝和 sampler 同步限制。CPU 优化也一样：SIMD 指令很重要，但若主要时间在权重读流和 KV cache 读流上，单纯增加 FMA 吞吐不会线性提升 tokens/s。
+
+\begin{rubricbox}
+一个高质量推理报告至少要回答：
+\begin{itemize}
+  \item 当前测的是 prefill、decode，还是混合端到端。
+  \item 模型参数、量化格式、上下文长度、batch、线程/GPU 配置是什么。
+  \item 每 token 权重读流和 KV cache 读流大致是多少。
+  \item 主要瓶颈更像算力、带宽、cache/TLB、同步，还是 sampler。
+  \item 优化后 logits/oracle 是否仍然通过。
+\end{itemize}
+\end{rubricbox}
+
+\section{CPU 后端、GPU 后端和同一份算子合同}
+
+理解原理后，再谈后端。CPU 和 GPU 不应该各自定义一套模型语义。它们应该共享同一份算子合同：输入 shape、dtype、layout、量化 profile、误差界、KV cache 逻辑坐标一致。不同的是物理实现。
+
+\begin{lstlisting}[numbers=none,caption={共享算子合同，分离后端实现}]
+OperatorContract:
+  op_name
+  input_shape
+  output_shape
+  dtype
+  quant_profile
+  logical_layout
+  accuracy_tolerance
+
+CpuKernel:
+  packed_weight_layout
+  simd_width
+  thread_plan
+  numa_policy
+
+GpuKernel:
+  device_layout
+  block_shape
+  stream
+  workspace
+  copy_policy
+\end{lstlisting}
+
+CPU 后端的优势是可观察：可以看汇编、cache miss、TLB miss、线程扩展曲线和 NUMA 行为。GPU 后端的优势是吞吐：prefill 大 GEMM、attention kernel 和显存带宽更强，但 kernel launch、host-device 同步和小 batch decode 会带来固定成本。第三册的工程路线应该先让 CPU reference 和 CPU optimized path 把语义、oracle、profiler 建稳，再把同一合同挂到 GPU 后端。
+
+\section{本章验收线}
+
+读完本章，应该能回答下面问题：
+
+\begin{itemize}
+  \item 文本怎样变成 token id，token id 怎样变成 hidden，hidden 怎样变成 logits。
+  \item logits 和 sampler 的关系是什么，为什么 sampler 不应该掩盖模型计算错误。
+  \item decoder block 中 Q/K/V、attention、MLP、residual、norm 分别做什么。
+  \item KV cache 省掉了哪些重复计算，又引入了哪些内存和读带宽压力。
+  \item 写出 KV cache 的逻辑形状和容量公式，并能做 7B 级粗略估算。
+  \item 解释 prefill 为什么更像 GEMM，decode 为什么更像 GEMV 加历史 KV 读取。
+  \item 说明为什么 decode 常常受权重带宽、KV cache 读流、小 kernel 和 sampler 同步影响。
+  \item 用一组 7B 级参数粗算单层投影、MLP、KV cache 容量和 decode 权重读流。
+  \item 用 roofline 思路判断当前问题更像算力瓶颈、带宽瓶颈还是同步/采样瓶颈。
+\end{itemize}
+
+本章之后再看量化、memory planner、AI 编译器和后端优化，才有稳定落点：不是为了堆名词，而是为了让这条从 prompt 到 next token 的链路更正确、更快、更可测、更能落地成服务。

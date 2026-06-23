@@ -1,0 +1,454 @@
+\chapter{工程验收与回归体系：reference、测试、覆盖率、性能门禁和框架对标}
+
+\section{为什么“能跑”不是完成}
+
+一台本地大模型推理引擎最容易给人错觉：只要 prompt 能生成文字，项目就算跑通。对学习项目来说，这只是第一步；对高质量 AI infra 来说，这远远不够。生成文本看起来正常，不代表 tokenizer 合同正确，不代表量化 scale 正确，不代表 KV cache 没有越界，不代表 SIMD tail path 被覆盖，不代表 GPU fallback 没有偷偷发生，也不代表性能优化真的击中了瓶颈。
+
+工程验收要回答四个问题：
+
+\begin{enumerate}
+  \item 正确性由哪个 reference 定义。
+  \item 哪些层次的 oracle 已经比较过。
+  \item 哪些性能指标和硬件环境可复现。
+  \item 哪些回归测试会在后续改动时保护这些事实。
+\end{enumerate}
+
+\begin{keyidea}
+AI infra 的完成标准不是“输出了 token”，而是 reference、oracle、profiler、覆盖率、性能回归和外部框架对标形成闭环。没有闭环，优化无法被信任，也无法长期维护。
+\end{keyidea}
+
+\section{reference 分层：先有正确答案}
+
+reference 是不追求速度的正确性来源。它应该清晰、可读、可调试。后端优化越激进，reference 越重要。项目中至少需要下面几类 reference：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+reference 层次 & 作用 & 不追求的东西 \\
+\midrule
+字节/量化 converter & 定义 int4/int8 bytes 如何还原 & SIMD 和吞吐 \\
+单算子 reference & 定义 RMSNorm/linear/attention 输出 & cache 和线程效率 \\
+层级 reference & 定义 decoder block 输出 & 融合和内存复用 \\
+端到端 reference & 定义 logits/生成序列合同 & 生产级速度 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+reference 代码要尽量少依赖后端复杂路径。比如 int4 reference converter 不应该复用 AVX2 解包函数；否则 SIMD 解包错了，reference 也跟着错。单算子 reference 可以用标量循环和 fp32 累加；端到端 reference 可以只跑小模型、小层数或模型切片，保证测试可承受。
+
+\section{oracle 分层：从字节到生成序列}
+
+oracle 消费 reference 和被测实现，判断误差是否在合同内。不同层 oracle 关注不同问题：
+
+\begin{lstlisting}[numbers=none,caption={oracle 层次与定位能力}]
+byte oracle:
+  packed bytes -> decoded values
+  catches nibble order, zero point, scale, tail
+
+operator oracle:
+  optimized kernel output vs scalar reference
+  catches SIMD, accumulation, layout, quant
+
+layer oracle:
+  decoder block output vs reference block
+  catches fusion, arena overwrite, state edge
+
+logits oracle:
+  final logits distribution
+  catches visible model quality drift
+
+sequence oracle:
+  fixed sampler and seed token sequence
+  catches end-to-end behavior changes
+\end{lstlisting}
+
+误差容忍度必须和 dtype、量化、后端和 reduction 顺序匹配。fp32 reference 对 fp32 scalar 可以要求很严；fp16、bf16、int8、int4、KV cache 量化都需要不同 tolerance profile。oracle 报告里要写清使用的是哪个 profile，不要把阈值埋在测试代码里。
+
+\section{测试矩阵：不要只测漂亮形状}
+
+AI 后端最容易漏测的是边界形状。测试矩阵要覆盖整齐形状，也要覆盖 tail、非对齐、不同 group size、不同 context length 和不同阶段。
+
+\begin{lstlisting}[numbers=none,caption={后端测试矩阵示例}]
+shapes:
+  H = 4096
+  H = 4097 for tail test
+  O not divisible by tile_n
+  prompt length: 1, 7, 32, 512
+  context length: 1, 128, 1024, 4096
+
+dtypes:
+  f32 reference
+  f16/bf16 style
+  int8 per-channel
+  int4 group-size 32/64/128
+
+layouts:
+  contiguous
+  padded
+  packed CPU panel
+  device layout
+
+backends:
+  scalar
+  CPU SIMD
+  CPU threaded
+  GPU kernel
+  fallback path
+\end{lstlisting}
+
+这些测试不一定全部在每次提交跑。可以分层：快速单元测试常跑，较大的端到端和性能测试在夜间或发布前跑。但测试矩阵必须被设计出来，否则项目只会在“常见 happy path”上看起来稳定。
+
+\section{coverage：覆盖率要服务风险，不服务数字}
+
+用户要求每一步优化都做好，C++20 项目也应该有覆盖率意识。但覆盖率不是盲目追数字。高风险路径要优先覆盖：verifier 错误诊断、descriptor 解析、quant converter、tail path、arena liveness、KV cache position、fallback、sampler 和 profiler report。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+模块 & 高风险分支 & 覆盖重点 \\
+\midrule
+model/verifier & 坏 shape、坏 dtype、坏 quant & 拒绝输入和诊断质量 \\
+quant & tail、scale shape、packed order & reference converter 和 oracle \\
+memory planner & last use、alignment、debug materialization & offset 不重叠和生命周期 \\
+backend CPU & tail、非对齐、多线程分区 & 正确性和性能回归 \\
+backend GPU & fallback、staging、sync & 端到端 latency 和资源释放 \\
+runtime & prefill/decode 切换、stop、context limit & session 状态不串扰 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果项目工具链支持覆盖率，核心模块应该接近或超过 90\% 的有意义覆盖。若某些 GPU 分支或硬件计数器难以在 CI 中覆盖，要用 fake backend、mock event、small fixture 或本地验收脚本补充。重要的是把不可覆盖原因写清，而不是假装没有风险。
+
+\section{CI 分层：不是所有测试都每次全跑}
+
+AI 推理项目的测试成本差异很大。字节级 quant converter 可以毫秒级完成；7B 模型长上下文 benchmark 可能需要专门机器。工程上要分层，而不是把所有检查都塞进每次提交，也不能因为全量测试太慢就放弃测试。
+
+\begin{center}
+\begin{tabular}{p{0.12\linewidth}p{0.30\linewidth}p{0.38\linewidth}}
+\toprule
+层级 & 触发时机 & 内容 \\
+\midrule
+L0 & 本地开发频繁运行 & 格式化、编译、descriptor/verifier 单测、字节级 quant 测试 \\
+L1 & 每次提交或 PR & 小模型 reference、单算子 oracle、memory planner、CPU scalar/SIMD 小矩阵 \\
+L2 & 夜间或合并前 & 模型切片端到端、长 context、paged KV、fallback、覆盖率报告 \\
+L3 & 发布前或专用机器 & 真实模型 benchmark、GPU、框架对标、p50/p95、峰值内存、质量回归 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+失败报告也要结构化。不要只贴一段日志。最小字段可以是：
+
+\begin{lstlisting}[numbers=none,caption={CI failure 结构}]
+CiFailure:
+  layer: L0 | L1 | L2 | L3
+  component: verifier | quant | backend | runtime | benchmark
+  fixture_id
+  backend
+  expected
+  actual
+  tolerance_or_gate
+  first_bad_artifact
+  reproduction_command
+\end{lstlisting}
+
+这样开发者能直接知道问题属于哪层合同。若 byte oracle 失败，先查 nibble order、scale 和 tail；若 layer oracle 失败，查 fusion、arena 和状态边；若 L3 benchmark 回归，先看硬件、热身、频率、prompt set 和 profiler breakdown。CI 的作用不是制造红叉，而是把问题定位到正确工程层。
+
+\section{性能门禁：基线、阈值和报告要稳定}
+
+性能回归比功能回归更难测，因为机器负载、频率、温度和系统噪声都会影响数字。工程上不能用单次最好成绩做门禁，而要固定环境、固定输入、固定 warmup 和迭代，并报告分位数。
+
+\begin{lstlisting}[numbers=none,caption={性能门禁报告字段}]
+PerformanceGate:
+  hardware_id
+  backend_plan_id
+  model_fixture_id
+  quant_profile_id
+  prompt_set_id
+  thread_count_or_device
+  warmup_iterations
+  measurement_iterations
+  baseline_version
+  current_version
+  allowed_regression_percent
+  metrics:
+    time_to_first_token
+    prefill_tokens_per_s
+    decode_tokens_per_s
+    p50_step_latency
+    p95_step_latency
+    peak_memory
+\end{lstlisting}
+
+门禁阈值要分指标。比如 peak memory 回归 20\% 可能不能接受；单次 p50 latency 回归 3\% 可能在噪声内；p95 latency 回归 15\% 需要调查；pack time 变慢但 decode 变快是否可接受，要看目标场景是短请求还是长期服务。性能门禁不是机械判分，而是让退化可见。
+
+\section{profiler schema：优化证据要可比较}
+
+profiler 输出不能每章一个格式。统一 schema 让不同优化可以比较。最小 schema 应该覆盖 stage、segment、backend、context、耗时、内存和可选硬件计数器。
+
+\begin{lstlisting}[numbers=none,caption={统一 profiler event schema}]
+ProfilerEvent:
+  run_id
+  stage: load | prepare | prefill | decode | sample
+  segment_id
+  layer_id
+  backend
+  kernel_or_operation
+  start_ns
+  end_ns
+  input_tokens
+  context_length
+  bytes_read_estimate
+  bytes_written_estimate
+  arena_peak_bytes
+  workspace_bytes
+  kv_cache_bytes
+  counters_optional
+\end{lstlisting}
+
+同一 schema 可以服务 CPU 和 GPU。CPU 可能填硬件计数器；GPU 可能填 stream event 时间和 staging bytes；reference 路径也可以填 stage 和耗时。这样后续报告不需要人工拼日志。
+
+\section{诊断质量：错误要能定位到合同}
+
+高质量工程不是永远不出错，而是出错时能定位。诊断应该回到合同，而不是只报底层异常。
+
+\begin{lstlisting}[numbers=none,caption={诊断应该包含的信息}]
+Diagnostic:
+  severity
+  component: manifest | verifier | compiler | backend | runtime
+  object: tensor/operator/segment/session
+  expected
+  actual
+  derived_from
+  suggested_next_check
+\end{lstlisting}
+
+例如 backend 不支持某个 q4 格式时，应该写明 tensor、format、group size、backend capability 和 fallback 选择；KV cache 越界时，应该写明 session position、capacity、max context 和触发的 token；arena 复用冲突时，应该写明两个 value 的生命周期和 offset。这样的诊断能让读者把错误和书中讲过的合同对应起来。
+
+\section{框架对标：尊重成熟实现，也要知道差距在哪里}
+
+自研引擎需要对标成熟框架，但对标不能只贴一个 tokens/s。成熟框架可能使用不同量化格式、不同 tokenizer、不同线程数、不同 GPU kernel、不同 batch 策略。对标前要固定变量：
+
+\begin{itemize}
+  \item 同一模型或同一模型切片。
+  \item 同一 tokenizer 和 prompt set。
+  \item 同一量化格式或明确说明格式差异。
+  \item 同一线程数、亲和策略或同一 GPU。
+  \item 同样区分加载、prepare、prefill、decode 和 sampler。
+  \item 同样报告正确性或至少 logits/生成差异。
+\end{itemize}
+
+对标表应该能说明差距：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.24\linewidth}p{0.24\linewidth}p{0.20\linewidth}}
+\toprule
+指标 & 本项目 & 成熟框架 & 解释 \\
+\midrule
+load/prepare & A & B & mmap、packing、上传差异 \\
+prefill & A & B & GEMM/attention kernel 差异 \\
+decode & A & B & GEMV、KV cache、launch 差异 \\
+memory peak & A & B & arena、packed weight、KV 策略 \\
+quality drift & A & B & 量化和 sampler 差异 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果差距很大，也不是失败。高质量书稿应该教读者定位差距：是算法、layout、kernel、线程、设备同步、量化、还是 runtime 调度。只要能定位，就能进入下一轮优化。
+
+\section{发布前验收清单}
+
+第三册对应的 C++20 项目在发布一个阶段性版本前，至少应该完成下面清单：
+
+\begin{rubricbox}
+\begin{itemize}
+  \item 模型 manifest、tokenizer 合同、shape/dtype/quant verifier 有负例测试。
+  \item reference converter、单算子 reference、层级 reference 和小端到端 reference 可运行。
+  \item CPU scalar、CPU optimized、GPU 或 fallback 后端都通过 oracle。
+  \item activation arena、workspace、packed weight、KV cache 有生命周期和容量测试。
+  \item prefill/decode 分别有 benchmark，报告 time to first token、tokens/s、latency 分位数和内存峰值。
+  \item 量化报告同时包含容量、scale metadata、logits/top-k、生成序列和性能。
+  \item profiler event schema 稳定，报告能追溯到 segment、kernel、backend 和 context length。
+  \item 性能回归门禁记录硬件、线程、prompt、baseline 和允许退化阈值。
+  \item 与成熟框架的对标至少能解释最大差距来源。
+\end{itemize}
+\end{rubricbox}
+
+这份清单看起来严格，但它正是 AI infra 工程和普通 demo 的区别。demo 证明“能跑”；验收体系证明“能长期改、能定位错、能解释快慢、能对用户负责”。
+
+\section{阶段发布报告模板}
+
+每个阶段发布时都应该留一份短报告。模板可以固定，内容不需要冗长，但必须能复现。
+
+\begin{lstlisting}[numbers=none,caption={阶段发布报告模板}]
+ReleaseReport:
+  version
+  model_scope
+  supported_backends
+  supported_quant_profiles
+  correctness:
+    reference_commit
+    oracle_profiles
+    failed_or_skipped_cases
+  performance:
+    hardware
+    prompt_set
+    prefill_tokens_per_s
+    ttft_ms
+    decode_tokens_per_s
+    p95_step_latency_ms
+    memory_peak_bytes
+  known_limits:
+    max_context
+    unsupported_dtypes
+    unsupported_shapes
+    fallback_paths
+  comparison:
+    baseline_version
+    mature_framework_reference
+    largest_gap_explanation
+\end{lstlisting}
+
+这个报告能直接回答三个问题：能跑哪些模型和 profile，正确性证据是什么，性能瓶颈还在哪里。若报告写不出来，说明项目某些合同还没有建立好。
+
+\section{验收失败时的处理顺序}
+
+失败后不要直接调阈值。处理顺序应该是：
+
+\begin{enumerate}
+  \item 先确认 fixture、模型、prompt、backend plan 和量化 profile 是否一致。
+  \item 再确认 reference 是否可信，尤其 byte converter 和 tokenizer。
+  \item 定位最早失败层级：byte、operator、layer、logits、sequence、performance。
+  \item 若是 correctness，先修实现或合同；若是性能，先确认测量口径和硬件状态。
+  \item 只有在误差来源被解释后，才调整 tolerance profile。
+\end{enumerate}
+
+阈值是合同，不是让测试通过的旋钮。尤其是量化和 GPU fallback，不能因为输出文本看起来还行就放宽 logits/top-k 检查。
+
+\section{一次 CPU kernel 优化的发布门禁示例}
+
+假设本周把 \code{linear} 的 CPU 路径从标量 baseline 换成 packed int8 SIMD kernel。一个合格发布门禁不应该只跑一个 benchmark，而要按证据链通过。
+
+\begin{lstlisting}[numbers=none,caption={CPU int8 kernel 发布门禁}]
+1. byte oracle:
+   int8 weights and scale metadata decode to expected values
+
+2. packed weight oracle:
+   packed panel maps back to original W[out, in]
+
+3. operator oracle:
+   scalar reference vs packed SIMD output
+
+4. layer oracle:
+   decoder block output under fixed fixture
+
+5. logits oracle:
+   final logits and top-k overlap
+
+6. performance gate:
+   decode latency, p95, memory peak and pack time
+
+7. fallback check:
+   unsupported ISA falls back to scalar or refuses at plan time
+\end{lstlisting}
+
+这条门禁能定位失败。例如 byte oracle 失败，说明量化字节解释有错；packed weight oracle 失败，说明 layout 转换有错；operator oracle 失败，说明 SIMD lane、accumulator、tail 或 scale 有错；layer oracle 失败，可能是 arena 复用、fusion 或状态边；performance gate 失败，才进入 cache、线程、NUMA、带宽和反汇编分析。
+
+\section{一次 KV cache bug 的定位示例}
+
+KV cache bug 很常见，因为它跨 token 存活，且 shape 往往看起来正确。假设长上下文续写时 logits 从第 200 个 token 开始漂移，可以按下面顺序定位：
+
+\begin{lstlisting}[numbers=none,caption={KV cache 漂移定位流程}]
+check tokenizer:
+  token ids match reference
+
+check model position:
+  each token position is monotonic and not reset by cache slot
+
+check RoPE checkpoint:
+  q/k after rope match reference at positions 0, 1, 127, 200
+
+check KV append:
+  key/value written at expected logical position
+
+check KV read:
+  query head maps to correct kv head
+  attention reads positions 0..current_position
+
+check attention probability:
+  score and softmax drift starts at which position
+\end{lstlisting}
+
+如果只比较最终生成文本，很难知道问题在哪。把 checkpoint 放在 RoPE、KV append、KV read 和 attention probability，能把“长文本质量差”拆成具体合同错误。
+
+\section{一次性能回归的排查示例}
+
+性能回归也要按阶段拆。假设版本 B 比版本 A 的 decode tokens/s 下降 18\%，不要直接改 kernel。先确认报告坐标一致：
+
+\begin{itemize}
+  \item 模型、prompt set、quant profile、backend plan 是否相同。
+  \item 线程数、亲和、频率、温度和系统负载是否可比。
+  \item pack time 是否被算进 decode。
+  \item fallback count 是否增加。
+  \item context length 分布是否变化。
+  \item p50 和 p95 是否一起下降，还是只有尾延迟变差。
+\end{itemize}
+
+随后看 profiler breakdown：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+现象 & 可能原因 & 下一步证据 \\
+\midrule
+权重 segment 变慢 & packing layout、SIMD path、NUMA & packed oracle、perf counters \\
+KV segment 随 context 变差 & KV layout、cache miss、TLB & context bucket 报告 \\
+sampler 时间上升 & logits copy、top-k 实现 & sampler trace \\
+p95 上升但 p50 稳定 & 调度、队列、页错误 & queue wait、page fault \\
+GPU kernel 快但端到端慢 & copy、sync、launch、fallback & stream event trace \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这类排查流程应该写进 release report 的失败处理说明。否则团队会在每次回归时重新发明定位方法。
+
+\section{验收报告中的最小可读示例}
+
+报告不需要长，但要能回答“这次改动可信吗”。下面是一个压缩示例：
+
+\begin{lstlisting}[numbers=none,caption={release gate 摘要示例}]
+ReleaseGateSummary:
+  change: cpu int8 packed linear kernel
+  model_fixture: tiny_decoder_v3
+  backend_plan: cpu_avx2_int8_pack_v1
+  correctness:
+    byte_oracle: pass
+    packed_weight_oracle: pass
+    operator_oracle_max_abs: 0.0061
+    logits_topk_overlap: 9/10
+  performance:
+    decode_tokens_per_s: 18.4 -> 24.7
+    p95_step_latency_ms: 68.2 -> 49.5
+    pack_time_ms: 143
+    memory_peak_mb: 812 -> 856
+  risk:
+    only group size 64 covered
+    avx512 path not implemented
+\end{lstlisting}
+
+这样的摘要比“快了 34\%”更有价值。它同时暴露了收益、误差、内存代价和限制。
+
+\section{本章验收线}
+
+读完本章，应该能建立工程闭环：
+
+\begin{itemize}
+  \item reference 定义正确答案，oracle 分层比较误差，profiler 证明性能变化。
+  \item 测试矩阵必须覆盖 tail、非对齐、量化 group、context length、fallback 和不同后端。
+  \item 覆盖率要优先服务 verifier、quant、memory planner、backend、runtime 等高风险路径。
+  \item 性能门禁要固定硬件、输入、warmup、迭代、baseline 和允许退化阈值。
+  \item profiler schema 要统一，让 CPU/GPU/reference/fallback 报告可以比较。
+  \item 诊断要回到 manifest、IR、descriptor、backend plan 和 session 状态这些合同。
+  \item 框架对标要拆开 load、prepare、prefill、decode、memory 和 quality，而不是只报一个总分。
+\end{itemize}
+
+至此，第六部分形成闭环：CPU 和 GPU 后端不是孤立优化技巧，而是以 C++20 资源边界为基础，以编译器 lowering 为入口，以 oracle/profiler/回归门禁为出口的工程系统。

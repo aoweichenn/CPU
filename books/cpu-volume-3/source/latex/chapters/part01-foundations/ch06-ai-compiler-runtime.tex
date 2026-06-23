@@ -1,0 +1,286 @@
+\chapter{AI 编译器：从推理图到机器执行计划}
+
+\section{推理引擎里为什么会出现编译器}
+
+前一章把本地 7B 级推理引擎拆成模型加载、tokenizer、decoder graph、KV cache、CPU/GPU 后端和证据报告。这里要再向下压一层：真实引擎不能每次遇到一个算子就临时解释执行。它必须把模型结构、张量形状、量化格式、设备能力和运行时状态编成一个可执行计划。这个过程就是 AI 编译器在推理引擎中的位置。
+
+不要把 AI 编译器理解成“把 Python 变成机器码”的窄概念。推理场景里，输入通常已经不是普通源代码，而是模型文件、配置、tokenizer 规则、权重量化元数据和一张 decoder-only 计算图。编译器要做的事情是把这张图降到后端能高效执行的 kernel 序列，同时保持 logits、KV cache 和采样状态的语义不变。
+
+\begin{lstlisting}[numbers=none,caption={推理引擎中的 AI 编译流水线}]
+model/config/tokenizer
+  -> graph import and shape checking
+  -> typed tensor IR
+  -> graph rewrite and operator fusion
+  -> memory planning and lifetime analysis
+  -> backend lowering
+  -> kernel selection and packed layout generation
+  -> executable plan
+  -> runtime dispatch for prefill/decode
+\end{lstlisting}
+
+这条流水线和传统编译器很像。模型文件相当于源程序，图导入相当于 parsing，shape/dtype/quantization 检查相当于 semantic analysis，typed tensor IR 相当于中间表示，fusion 和 layout 选择相当于优化，CPU/GPU lowering 相当于后端代码生成，executable plan 则相当于目标程序。区别在于它编译的对象不是标量控制流为主的 C++ 函数，而是张量、状态、量化参数和设备 kernel 组成的推理程序。
+
+\begin{keyidea}
+AI 编译器在推理引擎中的核心职责，是把稳定的模型语义编成稳定的机器执行计划。它既不是单个 kernel，也不是普通 runtime 调度器，而是连接图语义、张量布局、内存生命周期、后端能力和正确性证据的编译流水线。
+\end{keyidea}
+
+\section{前端：导入图时先建立语义合同}
+
+普通编译器前端会把源代码变成 token、AST 和符号表。AI 编译器的前端面对的是模型结构。以 decoder-only Transformer 为例，前端至少要确认这些事实：
+
+\begin{itemize}
+  \item 每层有哪些算子：RMSNorm、Q/K/V projection、RoPE、attention、Wo projection、MLP gate/up/down、残差。
+  \item 每个张量的 dtype、shape、stride、量化参数和驻留位置。
+  \item 每个权重是否已经按某种 group size、scale 类型和物理布局保存。
+  \item prefill 和 decode 是否共享同一张图，还是需要两套 specialization。
+  \item KV cache 的逻辑 shape、最大上下文、当前位置和写入规则。
+\end{itemize}
+
+这些检查不是文档整理，而是编译器不变量。若 \code{Wq} 的输入维度和 hidden size 对不上，后端 kernel 不应该继续猜；若某个 int4 权重缺少 group scale，量化 lowering 不能把它当 int8；若 KV cache 的 head 数和当前 layer 的 attention head 数不一致，decode 会在很晚的位置产生错误 logits。前端要么拒绝模型，要么产出满足合同的 typed tensor IR。
+
+\begin{lstlisting}[numbers=none,caption={typed tensor IR 的最小信息}]
+%0 = input_tokens       : tensor<[T], i32>
+%1 = embedding(%0)      : tensor<[T,H], f16>
+%2 = rmsnorm(%1, gamma) : tensor<[T,H], f16>
+%3 = linear(%2, Wq_i4)  : tensor<[T,Q], f16>
+%4 = linear(%2, Wk_i4)  : tensor<[T,K], f16>
+%5 = linear(%2, Wv_i4)  : tensor<[T,V], f16>
+%6q, %6k = rope(%3, %4, pos) : tensor<[T,Q], f16>, tensor<[T,K], f16>
+%7 = kv_append(%6k, %5)      : state<KVCache>
+%8 = attention(%6q, %7)      : tensor<[T,H], f16>
+\end{lstlisting}
+
+这段 IR 不是为了好看。它让每条边都带上类型、形状和状态含义。没有这些信息，后面的融合、内存复用、layout 转换和后端选择都只能靠脆弱约定。
+
+\section{IR：图 IR、张量 IR 和循环 IR 要分层}
+
+AI 编译器最容易犯的错误，是用一层表示承载所有事情。图 IR 擅长表达算子依赖：RMSNorm 后接 Q/K/V projection，RoPE 后写 KV cache，attention 后接 Wo projection。张量 IR 擅长表达 shape、stride、dtype、broadcast、reduction 和 layout。循环 IR 或 kernel IR 才适合表达 tile、向量宽度、展开、线程划分和寄存器累加器。
+
+\begin{systemdiagram}{AI 编译器的三层 IR}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.35cm] (graph) at (0,1.35) {Graph IR\\算子依赖};
+  \node[book teal node,text width=2.35cm] (tensor) at (3.15,1.35) {Tensor IR\\shape/layout};
+  \node[book purple node,text width=2.35cm] (loop) at (6.3,1.35) {Loop IR\\tile/vector};
+  \node[book amber node,text width=2.35cm] (target) at (9.45,1.35) {Target plan\\CPU/GPU};
+
+  \node[book label,text width=2.35cm] at (0,-0.25) {fusion\\state edges\\dependency};
+  \node[book label,text width=2.35cm] at (3.15,-0.25) {dtype\\stride\\quant};
+  \node[book label,text width=2.35cm] at (6.3,-0.25) {unroll\\SIMD\\threads};
+  \node[book label,text width=2.35cm] at (9.45,-0.25) {kernel\\layout\\sync};
+
+  \draw[book strong arrow] (graph) -- (tensor);
+  \draw[book strong arrow] (tensor) -- (loop);
+  \draw[book strong arrow] (loop) -- (target);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：AI 编译器不能把算子图、张量布局和机器循环混成一层，否则优化会互相污染。}
+\end{systemdiagram}
+
+分层的好处是边界清楚。Graph IR 可以做无关后端的代数改写，例如把连续的 reshape 消掉，或把 RMSNorm 与后续线性层之间的临时 buffer 标成可融合候选。Tensor IR 可以决定某个 \code{[tokens, hidden]} 张量是否连续、某个 int4 权重是否要按 group 解码、某个 broadcast 是否会制造隐式 stride 0。Loop IR 再决定 CPU 上一个 tile 处理多少列、用几个累加器、尾部怎样 mask，或者 GPU 上一个 block 负责多少 token 和 head。
+
+传统编译器也有类似分层。AST 不应该直接塞寄存器分配细节；SSA IR 不应该直接保存源代码排版；机器 IR 才关心调用约定和寄存器。AI 编译器同理：高层 graph 不应该知道 AVX2 的寄存器数，低层 kernel 也不应该重新推断模型层数和 KV cache 语义。
+
+\section{优化：融合不是越多越好}
+
+算子融合是 AI 编译器最常见的优化，但它经常被误讲成“把算子合在一起就快”。实际判断必须回到内存流和生命周期。若两个算子之间的中间张量很大、只被消费一次、且融合后不会增加过多寄存器压力，那么融合可以减少一次写回和一次读取。若中间结果还被 residual、debug oracle、另一个分支或 KV cache 使用，盲目融合会破坏语义或让 buffer 生命周期变复杂。
+
+\begin{lstlisting}[numbers=none,caption={融合决策要检查的事实}]
+candidate: RMSNorm -> Linear
+
+check:
+  output of RMSNorm has exactly one consumer
+  no oracle boundary requires materialized RMSNorm output
+  fused kernel can stream input and gamma without spilling too much
+  quantized Linear still has access to scale/group metadata
+  backend supports the fused dtype/layout combination
+
+if all true:
+  lower to fused_rmsnorm_linear
+else:
+  keep two operators and expose the materialized buffer
+\end{lstlisting}
+
+attention 更能说明问题。prefill attention 可能是大块矩阵计算，decode attention 是一个 query 读取越来越长的 K/V cache。它们的形状不同，适合的 kernel 不同，融合边界也不同。prefill 可以倾向于高吞吐 tile；decode 更在意小 batch latency、KV cache 读流和 softmax 的数值稳定。一个“通用 attention 融合”若不区分这两种模式，很容易在其中一种场景下退化。
+
+\begin{warningbox}
+融合优化必须由数据依赖、生命周期、数值误差和后端能力共同决定。只看算子名字相邻，就把它们写进一个大 kernel，是把编译器优化退化成手工拼接。
+\end{warningbox}
+
+\section{内存规划：生命周期分析是推理编译器的核心}
+
+本地推理最贵的不只是算术，还有内存容量和带宽。权重、packed weight、activation、KV cache、临时 workspace 和输出 logits 的生命周期完全不同。AI 编译器要像传统编译器做寄存器分配一样，为张量做内存分配。
+
+\begin{lstlisting}[numbers=none,caption={张量生命周期的简化账本}]
+weights:
+  live from model load to session destroy
+  read-only, often mmap or packed once
+
+packed weights:
+  live after backend preparation
+  backend-specific physical layout
+
+activation:
+  live inside one layer or a small operator group
+  can often reuse arena slots
+
+KV cache:
+  live across all decode steps
+  grows by position and cannot be reused as scratch
+
+workspace:
+  live during one kernel or one scheduled segment
+  size depends on backend algorithm
+\end{lstlisting}
+
+这就是为什么内存规划不能靠 \code{new}/\code{delete} 随手分配。activation 可以进入 arena 并按生命周期复用；KV cache 必须按最大上下文或可增长策略预留；packed weight 可能比原始权重多占一份内存，但换来热路径布局稳定；GPU workspace 要考虑 stream 同步和设备内存峰值。若编译器没有显式生命周期，runtime 只能在执行时保守分配，结果是峰值内存上升、cache locality 变差、调试也更困难。
+
+这一步和传统编译器的 liveness analysis 很接近。变量最后一次使用后可以释放寄存器；张量最后一次消费后可以释放 arena slot。区别在于张量尺寸大得多，KV cache 还跨 token 存活，后端 layout 可能要求额外对齐和 padding。
+
+\section{后端 lowering：CPU 和 GPU 的目标不同}
+
+同一个 Tensor IR 降到 CPU 和 GPU 时，目标函数不同。CPU 后端关心 cache line、TLB、SIMD 宽度、指令吞吐、分支、线程划分、NUMA 和 false sharing。GPU 后端关心 device memory、coalesced load、shared memory、warp/block 划分、kernel launch、stream 同步和 tensor core 格式。AI 编译器的后端 lowering 不能假装它们只是两个函数指针。
+
+\begin{lstlisting}[numbers=none,caption={同一 linear 算子的两个 lowering 方向}]
+linear(input[T,H], weight[O,H]):
+
+CPU decode lowering:
+  choose GEMV or small-batch GEMM
+  use packed weight panels
+  select SIMD width and tail handling
+  partition output rows across worker threads
+
+GPU prefill lowering:
+  choose batched GEMM kernel
+  ensure device-resident input and weight
+  select vendor layout or internal tile layout
+  schedule stream dependencies
+\end{lstlisting}
+
+这里的关键是 specialization。prefill 的 \code{T} 可能较大，decode 的 \code{T} 通常是 1；长上下文 attention 和短上下文 attention 也不该强行共享同一个计划。编译器可以为不同 shape、batch、上下文上限和后端生成多个 executable plan，再让 runtime 在请求进入时选择。这样做比每次动态判断更复杂，但能把热路径从“解释图”变成“执行计划”。
+
+\section{运行时：编译计划仍然需要调度}
+
+编译器生成计划后，runtime 仍然有工作。它要管理 session，接收 prompt，维护当前 position，选择 prefill 或 decode 计划，推进 KV cache，处理 sampler，记录 profiler 事件，并在必要时切换后端或回退到 reference。编译器负责把能提前决定的事情提前决定，runtime 负责处理请求期才知道的状态。
+
+\begin{lstlisting}[numbers=none,caption={编译期和运行期的责任划分}]
+compile time:
+  validate model
+  build typed graph
+  choose layouts and fusion
+  allocate static arenas
+  prepare packed weights
+  build backend executable plans
+
+run time:
+  tokenize prompt
+  choose prefill/decode plan by shape and backend
+  bind session buffers and KV position
+  dispatch kernels
+  sample next token
+  collect correctness and performance evidence
+\end{lstlisting}
+
+这个划分也解释了为什么“推理引擎”和“AI 编译器”不是二选一。没有编译器，引擎会在每次请求中重复解释图、判断 layout、临时选择 kernel；没有 runtime，编译器生成的计划没有 session、KV cache 和 sampler 可以驱动。成熟系统通常是二者配合：前者把模型变成计划，后者把计划用在一个个真实请求上。
+
+\section{runtime 调度器：执行计划怎样变成 token 流}
+
+编译器产出 executable plan 后，runtime 调度器要把它用在真实请求上。调度器至少处理五件事：请求进入、prefill 排队、decode 循环、取消/超时、资源释放。它不是简单循环调用 \code{plan.run()}。
+
+\begin{lstlisting}[numbers=none,caption={runtime 调度器的最小状态}]
+Scheduler:
+  loaded_models
+  plan_cache
+  ready_prefill_queue
+  active_decode_sessions
+  memory_reservations
+  backend_contexts
+  trace_sink
+\end{lstlisting}
+
+prefill 和 decode 队列要分开。prefill 可能是长 prompt 的大块计算，decode 是很多 session 的单 token 步进。若长 prefill 一直占住所有工作线程或 GPU stream，已经在交互中的请求会断流；若 decode 过度优先，长 prompt 首 token 会等太久。调度策略要根据业务目标取舍。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+策略 & 优点 & 风险 \\
+\midrule
+prefill 优先 & 首 token 更快进入模型 & 活跃会话 decode 抖动 \\
+decode 优先 & 流式输出更平滑 & 新请求 TTFT 上升 \\
+分配时间片 & 两者较平衡 & 实现复杂，profile 更难读 \\
+按 deadline & 符合 SLO & 需要更准的耗时估计 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{取消、超时和资源释放}
+
+业务服务必须支持取消。用户关闭连接、上游超时、内容策略中止、队列过载，都可能要求停止某个 session。取消不是只设置一个 bool。runtime 要保证：
+
+\begin{itemize}
+  \item 不再为该 session 提交新的 decode step。
+  \item 已提交到 GPU stream 的工作要么等待完成再释放 buffer，要么走后端支持的安全取消路径。
+  \item KV cache page、activation arena、workspace reservation 和 trace buffer 被释放。
+  \item sampler state 和 token buffer 不再被其他线程访问。
+  \item FinalResponse 标出 \code{cancelled} 或 \code{timeout}，方便业务层区分。
+\end{itemize}
+
+\begin{lstlisting}[numbers=none,caption={取消路径的资源顺序}]
+cancel(session):
+  mark session as cancelling
+  stop scheduling new decode steps
+  wait or fence backend work using this session buffers
+  release KV pages and arena reservations
+  close stream with final cancelled event
+  write trace summary
+\end{lstlisting}
+
+这个顺序和第二册讲过的异步生命周期一致：释放资源之前，必须证明没有异步执行还会读写它。CPU 后端也有类似问题，只是表现为线程池任务；GPU 后端表现为 stream/event。
+
+\section{plan cache 和 shape bucket}
+
+如果每个请求都重新编译 plan，热路径会很慢。runtime 通常需要 plan cache。cache key 至少包含模型、backend、量化 profile、stage、shape bucket 和 debug/oracle 配置。
+
+\begin{lstlisting}[numbers=none,caption={PlanCacheKey 字段}]
+PlanCacheKey:
+  model_id
+  manifest_hash
+  backend
+  quant_profile_id
+  stage: prefill | decode
+  prompt_length_bucket
+  context_length_bucket
+  oracle_policy
+  trace_level
+\end{lstlisting}
+
+shape bucket 是折中。完全为每个 prompt length 编译一个计划，cache 会爆；所有长度共用一个计划，kernel 可能低效。可以把 prompt length 分成 \code{1-32}、\code{33-128}、\code{129-512}、\code{513+} 等桶，把 decode context 也按 \code{0-512}、\code{512-2048}、\code{2048+} 分桶。每个桶对应不同 attention plan、workspace 和 profiler baseline。
+
+debug/oracle 配置也要进入 key。因为打开 layer oracle 可能强制 materialize 某些中间张量，导致 fusion 和 memory planning 不同。不能把 debug plan 和 production plan 混用。
+
+\section{正确性：优化后的计划必须能被验证}
+
+AI 编译器的优化会改变执行顺序、buffer 物化点、累加精度、量化缩放和后端 kernel。它不一定能做到 bitwise identical，但必须有可解释的误差合同。对一个本地推理引擎来说，至少要比较这些层次：
+
+\begin{itemize}
+  \item 单算子输出：RMSNorm、linear、RoPE、attention、MLP 与 reference 的误差。
+  \item 层输出：一个 decoder block 前后 hidden state 的误差。
+  \item logits：最大绝对误差、top-k 排名变化和采样前分布变化。
+  \item 生成序列：固定 seed 和固定 sampler 下 token 序列是否在合同内。
+  \item 性能证据：每个优化计划的 prefill/decode 分项耗时和峰值内存。
+\end{itemize}
+
+传统编译器有 verifier、IR dump、debug info 和测试套件；AI 编译器也需要对应工具。Graph IR dump 用来查融合是否正确，memory plan dump 用来查 buffer 生命周期，backend plan dump 用来查 kernel 选择，oracle report 用来查误差，profiler report 用来查优化是否真的改善瓶颈。
+
+\section{本章验收线}
+
+读完本章，应该能把“AI 编译器”和“推理引擎”的关系讲清楚：
+
+\begin{itemize}
+  \item AI 编译器把模型、图、张量合同和后端能力编成 executable plan。
+  \item 推理引擎在运行期维护 prompt、session、KV cache、sampler 和 profiler。
+  \item Graph IR、Tensor IR 和 Loop IR 分别负责算子依赖、张量布局和机器循环。
+  \item 融合优化必须检查消费者、生命周期、误差边界和后端支持。
+  \item 内存规划本质上是张量级生命周期分析，KV cache 不能当普通 scratch buffer。
+  \item CPU/GPU lowering 共享语义合同，但按不同硬件目标选择不同物理布局和 kernel。
+\end{itemize}
+
+后续进入真实模型加载、tokenizer 和具体算子时，这套编译视角会反复出现：每个优化都要说明它在哪一层 IR 生效，改变了哪条地址流或生命周期，后端计划如何验证，以及 runtime 怎样在 prefill 和 decode 中使用它。

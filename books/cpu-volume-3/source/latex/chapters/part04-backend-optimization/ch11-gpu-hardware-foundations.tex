@@ -1,0 +1,256 @@
+\chapter{GPU 硬件基础：SM、warp、显存层级、tensor core 与推理瓶颈}
+
+\section{为什么第三册必须讲 GPU 硬件}
+
+只讲 GPU API 和 stream 还不够。推理引擎的 GPU 后端最终跑在硬件上：线程如何成组执行，访存如何合并，shared memory 为什么快，tensor core 适合什么形态，显存带宽和 PCIe 传输怎样限制 decode，这些都会决定 AI 编译器 lowering 的选择。如果不了解这些硬件事实，GPU 后端很容易停在“能 launch kernel”的层面。
+
+可以先把 GPU 和第二册里的 CPU 对比。CPU 少量强核心，靠大 cache、乱序执行、分支预测和 SIMD 处理复杂控制流；GPU 大量较简单执行单元，靠海量线程隐藏内存延迟，适合规则、密集、数据并行的工作。两者都要关心内存层级和并行，但并行粒度和瓶颈不同。
+
+\begin{keyidea}
+GPU 快不快，取决于工作是否能匹配它的执行模型：大量线程、规则访存、高算术强度、少同步、少 host-device 往返。prefill 往往更匹配，decode 单 token 往往更难匹配。
+\end{keyidea}
+
+\section{SM/CU：GPU 的基本执行岛}
+
+不同厂商术语不同，NVIDIA 常说 SM，AMD 常说 CU。本册用 SM/CU 表示 GPU 上一组局部执行资源：它包含调度器、寄存器文件、若干向量/标量执行单元、shared memory 或 local data share、load/store 单元，以及可能的 tensor core 或 matrix core。
+
+一个 kernel launch 后，工作会被切成许多 thread block 或 workgroup。每个 block 被调度到某个 SM/CU 上执行。一个 block 内的线程共享一块 shared memory，并能做 block 内同步；不同 block 通常不能直接同步，只能通过全局内存和 kernel 边界间接协作。
+
+\begin{lstlisting}[numbers=none,caption={GPU 执行层级的简化账本}]
+kernel launch
+  grid: many blocks
+    block/workgroup
+      warps/wavefronts
+        lanes/threads
+          registers
+      shared memory
+  global memory
+\end{lstlisting}
+
+这解释了为什么 GPU lowering 要选择 block 形状。一个 attention kernel 可以让一个 block 处理一个 head 的一段 position，也可以让一个 block 处理一组 token 和 head。选择不同，shared memory 用量、寄存器压力、访存合并和 occupancy 都会变。
+
+\section{warp/wavefront：线程不是完全独立执行}
+
+GPU 上的线程通常以 warp 或 wavefront 为单位执行。可以把它理解成“一组 lane 同时执行同一条指令，但每个 lane 处理不同数据”。这和 CPU SIMD 有相似性：CPU SIMD 是一条指令处理多个 lane；GPU warp 是多个线程 lockstep 执行同一指令。区别是 GPU 编程模型把 lane 暴露成线程。
+
+如果 warp 内线程走不同分支，会发生 divergence：一部分 lane 先执行分支 A，另一部分 lane 再执行分支 B，吞吐下降。若相邻 lane 访问连续地址，硬件可以合并内存请求；若访问分散，global memory 事务变多。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 类比 & 推理后端影响 \\
+\midrule
+warp lockstep & SIMD lane 同步执行 & 分支越规则越好 \\
+divergence & lane mask 分裂 & sampler/稀疏路径不适合热 kernel \\
+coalescing & 连续向量 load & KV cache 和权重 layout 要顺序 \\
+occupancy & 同时驻留的 warp 数 & 寄存器/shared memory 过多会降并发 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第二册讲 SIMD 时强调“相邻 lane 和规则控制流”。GPU 这里是同一原则的放大版。prefill 的大矩阵乘通常规则；decode 中某些小 batch、变长 context、条件路径和 host 同步更容易破坏规则性。
+
+\section{coalescing：连续地址决定一次访存能带回多少有效数据}
+
+GPU global memory 带宽很高，但前提是 warp/wavefront 里的 lane 访问足够连续。若 32 个 lane 分别访问相邻的 fp16 元素，硬件可以用较少内存事务带回一整段数据；若 32 个 lane 访问相隔很远的位置，就会产生更多事务，实际带宽下降。
+
+\begin{lstlisting}[numbers=none,caption={coalesced 与 scattered 访问的差异}]
+coalesced:
+  lane 0 reads base + 0
+  lane 1 reads base + 1
+  lane 2 reads base + 2
+  ...
+
+scattered:
+  lane 0 reads page_table[a]
+  lane 1 reads page_table[b]
+  lane 2 reads page_table[c]
+  ...
+\end{lstlisting}
+
+KV cache layout 直接影响 coalescing。若一个 warp 负责同一个 head 的连续 \code{head_dim}，那么 \code{head_dim} 连续布局有利；若一个 warp 负责多个 position 的同一维度，那么 position 连续更有利。paged KV 会引入 page table，长上下文和多 session 调度更灵活，但 kernel 必须小心把 page 内连续读和跨页边界分开处理。
+
+\begin{warningbox}
+GPU 上“逻辑上连续”不等于“lane 访问连续”。descriptor 只写 shape 不够，lowering 必须知道 warp mapping 和物理 stride。
+\end{warningbox}
+
+\section{显存层级：global、shared、register 和 cache}
+
+GPU 的 global memory 容量大、带宽高，但延迟也高。shared memory 在 SM/CU 内部，容量小但速度快，适合 tile 复用。register 是每个线程私有，最快但数量有限。L2 cache 连接多个 SM/CU，L1 或 texture cache 细节随架构不同。
+
+\begin{systemdiagram}{GPU 推理中的内存层级}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.2cm] (host) at (0,1.9) {host memory\\CPU};
+  \node[book teal node,text width=2.2cm] (global) at (3.0,1.9) {global memory\\HBM/GDDR};
+  \node[book purple node,text width=2.2cm] (l2) at (6.0,1.9) {L2/cache\\跨 SM};
+  \node[book amber node,text width=2.2cm] (shared) at (9.0,2.75) {shared\\memory};
+  \node[book navy node,text width=2.2cm] (reg) at (9.0,1.05) {registers\\per thread};
+
+  \draw[book strong arrow] (host) -- node[book label,above]{PCIe/NVLink} (global);
+  \draw[book strong arrow] (global) -- (l2);
+  \draw[book strong arrow] (l2) -- (shared);
+  \draw[book strong arrow] (l2) -- (reg);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：GPU kernel 性能不只取决于算力，还取决于数据在哪一层内存里移动。}
+\end{systemdiagram}
+
+对推理来说，权重和 KV cache 通常在 global memory；tile 化 GEMM 会把输入/权重片段搬到 shared memory 或寄存器；accumulator 放在寄存器；logits 可能需要 staging 到 host。若每个 decode step 都把完整 logits 从 global memory 拷回 host，PCIe 或同步开销可能比某个小 kernel 更显眼。
+
+\section{shared memory：它解决的是复用，不是容量}
+
+shared memory 适合保存一个 block 内多个线程都会反复使用的小 tile。矩阵乘中，一个 input tile 和 weight tile 被多个 lane 复用，搬到 shared memory 后可以减少 global memory 读流。attention 中，也可以把 K/V 的一段 block 或 softmax 中间量放到 shared memory，减少重复读写。
+
+但 shared memory 容量小，而且占用越多，每个 SM/CU 能同时驻留的 block 可能越少。用它之前要问三个问题：
+
+\begin{itemize}
+  \item 这个 tile 会被多少次复用，是否值得从 global memory 搬进来。
+  \item tile 大小是否会让 occupancy 明显下降。
+  \item shared memory 的访问是否会发生 bank conflict。
+\end{itemize}
+
+例如 decode attention 读取历史 K/V 时，如果每个 K/V 元素只被一个 query head 用一次，把整段历史搬进 shared memory 可能不划算；若同一 K/V block 会被多个 query head 或多个 batch row 复用，就有价值。GQA 的共享 K/V head 也会改变这个判断：多个 query head 读同一个 K/V head，理论上有复用机会，但具体能否利用取决于 kernel mapping。
+
+\section{tensor core：不是所有矩阵都天然吃满}
+
+现代 GPU 常有 tensor core 或 matrix core，专门加速小矩阵块乘加。它们对 dtype、矩阵形状、对齐和 layout 有要求，常见于 fp16/bf16/tf32/int8/fp8 等路径。prefill 的大 GEMM 更容易使用 tensor core；decode 单 token 的 GEMV 不一定能有效使用。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+场景 & tensor core 适配性 & 关键条件 \\
+\midrule
+prefill QKV/MLP GEMM & 通常较好 & batch/token 足够大，layout 对齐 \\
+decode GEMV & 通常较难 & M 维太小，launch 和访存占比高 \\
+int4 权重 & 取决于格式支持 & packed layout 和 scale 处理 \\
+attention & 取决于 kernel 设计 & softmax、mask、KV 读流复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这解释了一个常见现象：GPU prefill 很快，但 decode tokens/s 未必按峰值算力提升。decode 阶段每次只有一个 token，矩阵形态小，KV cache 读历史，logits 还要进 sampler。算力不是唯一瓶颈。
+
+\section{用 roofline 判断 GPU 推理瓶颈}
+
+roofline 的核心是算术强度：
+
+\[
+AI=\frac{FLOPs}{Bytes}
+\]
+
+若 \code{AI} 很低，即使 GPU 峰值 FLOPS 很高，也会被显存带宽限制；若 \code{AI} 很高，才更可能接近计算单元上限。prefill GEMM 的权重 tile 被多个 token 行复用，算术强度高；decode GEMV 的 batch 通常很小，权重复用弱，算术强度低。KV attention 还要随上下文读取历史 K/V，常常更像带宽问题。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+路径 & 算术强度直觉 & 常见瓶颈 \\
+\midrule
+prefill GEMM & 高，tile 复用好 & tensor core、workspace、activation \\
+decode GEMV & 低到中，权重复用弱 & 显存带宽、launch、小矩阵效率 \\
+decode attention & 随 context 读 KV & KV 布局、带宽、softmax 归约 \\
+logits staging & 计算少，传输和同步明显 & host-device copy、sampler boundary \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个简单反证方法是先算字节下限。若某个 decode step 至少要读 4GB 权重和 KV，而有效显存带宽是 800GB/s，那么单步光读数据就至少 5ms，还没算 kernel launch、softmax、MLP、staging 和 sampler。若 benchmark 报告低于这个数量级，就要检查是否统计了完整 step、是否用了 batch、是否跳过了某些层、是否缓存命中口径不同。
+
+\begin{keyidea}
+GPU 性能分析不能只问“有没有 tensor core”。先算 FLOPs、bytes、launch、copy、sync，再判断瓶颈更像计算、带宽、调度还是 host-device 边界。
+\end{keyidea}
+
+\section{occupancy：并发多不等于一定快}
+
+occupancy 指一个 SM/CU 上同时驻留的 warp/block 相对硬件上限的比例。高 occupancy 可以帮助隐藏 global memory 延迟，但不是越高越好。寄存器用太多、shared memory 用太多、block 太大，都会降低 occupancy；反过来，为了提高 occupancy 把 tile 做得太小，也可能降低数据复用。
+
+推理 kernel 要平衡：
+
+\begin{itemize}
+  \item 寄存器：accumulator 多，复用好，但 occupancy 可能降。
+  \item shared memory：tile 大，global memory 读少，但可驻留 block 少。
+  \item block 大小：并行度高，但同步和资源压力上升。
+  \item 算术强度：每读一个字节做多少计算，决定更像算力瓶颈还是带宽瓶颈。
+\end{itemize}
+
+因此 GPU 后端的 profiler 不应只报告 occupancy。一个 kernel occupancy 很高但访存不合并，仍然慢；一个 tensor core kernel occupancy 不高但计算吞吐高，也可能很快。指标要和具体瓶颈一起看。
+
+\section{GPU profiler 指标怎样读}
+
+不同工具名字不同，但读法相近。不要孤立看一个百分比，而要把指标放回 kernel 目标。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.32\linewidth}p{0.28\linewidth}}
+\toprule
+指标 & 可能说明什么 & 需要结合什么看 \\
+\midrule
+achieved occupancy & 驻留 warp 是否足够 & 寄存器、shared memory、block size \\
+memory throughput & 是否接近带宽上限 & coalescing、cache hit、字节估算 \\
+tensor core utilization & 矩阵单元是否忙 & dtype、layout、tile、GEMM 形态 \\
+warp stall & 等内存、同步或依赖 & global load、barrier、寄存器依赖 \\
+launch count & 小 kernel 数量 & decode step latency、fusion 机会 \\
+copy time & host-device 传输 & staging 大小、sampler 位置 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如 memory throughput 很高而 tensor core utilization 低，不一定是坏事；decode attention 可能本来就是读 KV 的带宽路径。反过来，occupancy 很高但 throughput 很低，可能是访问不合并、分支发散或 page table 间接访问导致。报告必须把这些指标和 executable plan 中的 kernel desc 对上。
+
+\section{prefill 和 decode 的 GPU 瓶颈不同}
+
+把前面硬件事实放回推理链路，可以得到一个清晰判断：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & GPU 优势 & 主要风险 \\
+\midrule
+prefill & 大 GEMM、并行 token、tensor core & activation 峰值、attention workspace、显存占用 \\
+decode & 权重常驻、KV cache 常驻、可融合小算子 & launch、同步、GEMV 小形态、KV 读流、logits staging \\
+采样 & 可做 top-k 或局部 sampler & 完整 logits 回传和 CPU 同步 \\
+量化 & 降低显存和带宽 & 格式不支持、scale metadata、dequant 开销 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表是 GPU lowering 的基础。prefill plan 应优先选择高吞吐 GEMM/attention；decode plan 应优先减少 launch 和 host-device 同步，优化 KV cache layout，并按 context length 分档。若把 prefill 的大矩阵思路直接套到 decode，通常会失望。
+
+\section{GPU 硬件事实怎样进入 AI 编译器}
+
+GPU 硬件不应该散落成后端里的魔法数字。它应该进入 capability 和 kernel descriptor：
+
+\begin{lstlisting}[numbers=none,caption={GPU capability 和 kernel descriptor 字段}]
+GpuCapability:
+  backend_name
+  max_threads_per_block
+  warp_or_wavefront_size
+  shared_memory_per_block
+  register_file_limits
+  supported_matrix_dtypes
+  supported_quant_formats
+  host_device_link
+
+GpuKernelDesc:
+  operator
+  stage: prefill | decode
+  block_shape
+  warp_mapping
+  shared_memory_bytes
+  registers_estimate
+  supported_layouts
+  sync_points
+\end{lstlisting}
+
+编译器 lowering 使用这些字段选择 plan；verifier 用它们拒绝不支持的 shape 或 dtype；profiler 用它们解释瓶颈；benchmark 报告用它们保证可复现。这样 GPU 硬件知识就进入了工程合同，而不是停留在“这个 kernel 在我机器上更快”的经验。
+
+\section{本章验收线}
+
+读完本章，应该能把 GPU 硬件和推理后端连接起来：
+
+\begin{itemize}
+  \item SM/CU 是 GPU 的局部执行资源，block/workgroup 被调度到其上。
+  \item warp/wavefront 类似放大的 SIMD，喜欢规则控制流和连续访存。
+  \item global memory、shared memory、register、cache 和 host-device 链路共同决定数据移动成本。
+  \item tensor core 适合满足 dtype/layout/shape 条件的大矩阵块，不自动解决 decode GEMV。
+  \item occupancy 要和寄存器、shared memory、访存合并、算术强度一起看。
+  \item prefill 和 decode 的 GPU 瓶颈不同，lowering 和 profiler 必须分开。
+  \item GPU capability 应进入 descriptor、verifier、lowering 和报告。
+\end{itemize}

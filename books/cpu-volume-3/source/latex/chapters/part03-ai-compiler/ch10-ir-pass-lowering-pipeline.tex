@@ -1,0 +1,446 @@
+\chapter{AI 编译器细化：IR、pass、lowering 与 executable plan}
+
+\section{先把 IR 讲清楚：它是可检查的中间账本}
+
+如果没有学过编译原理，\term{IR}{中间表示} 这个词容易显得抽象。可以先把它理解成“机器可读、可检查、可改写的中间账本”。源代码、模型文件或 JSON 配置都不是优化的好对象，因为它们包含太多外部格式细节。最终机器代码或 kernel 调用又太低层，已经失去了很多语义。IR 站在中间：保留足够语义让优化安全发生，又足够结构化让程序可以分析和改写。
+
+传统 C++ 编译器不会直接从字符生成机器指令。它先把字符切成 token，组成 AST，做语义检查，降成 IR，再进入优化和后端。AI 编译器也是同一个思路，只是输入换成模型资产，输出换成 executable plan。
+
+\begin{keyidea}
+IR 的价值不是“多一层抽象”，而是让每个优化都有检查对象。没有 IR，融合、layout 选择、内存复用、量化 lowering 和后端选择都会退化成分散在运行时代码里的猜测。
+\end{keyidea}
+
+本章把 AI 编译器从“概念流水线”细化到工程结构：Graph IR 表示算子依赖，Tensor IR 表示 shape/layout/dtype/quant，Loop IR 表示 tile/vector/thread，pass pipeline 表示改写顺序，lowering 表示逐步靠近 CPU/GPU 后端，executable plan 表示 runtime 真正执行的结果。
+
+\section{Graph IR：先表达依赖和状态}
+
+Graph IR 关心的是“谁依赖谁”。在 decoder-only Transformer 中，RMSNorm 的输出进入 Q/K/V projection，RoPE 的输出写入 KV cache，attention 读取 KV cache 并输出 hidden state，MLP 读取 residual 后的 hidden state。Graph IR 不应该关心 AVX2 有几个寄存器，也不应该关心 GPU block 有多少线程。
+
+\begin{lstlisting}[numbers=none,caption={Graph IR 节点的最小字段}]
+GraphNode:
+  id
+  opcode: rmsnorm | linear | rope | attention | mlp | sampler
+  inputs
+  outputs
+  state_reads
+  state_writes
+  stage: load | prefill | decode | both
+  debug_name
+\end{lstlisting}
+
+\code{state_reads} 和 \code{state_writes} 很重要。KV cache 不是普通张量边；它跨 token 存活，会被 decode 反复读取。若 Graph IR 把 KV cache 当成普通 activation，memory planner 可能错误复用它的存储。传统编译器里，内存写、异常、volatile 和函数调用都需要特殊建模；AI 编译器里，KV cache、sampler state 和 profiler/oracle materialization 也需要特殊建模。
+
+\begin{systemdiagram}{Graph IR 表达数据边和状态边}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.1cm] (norm) at (0,1.9) {RMSNorm};
+  \node[book teal node,text width=2.1cm] (qkv) at (2.8,1.9) {QKV\\Linear};
+  \node[book purple node,text width=2.1cm] (rope) at (5.6,1.9) {RoPE};
+  \node[book amber node,text width=2.1cm] (attn) at (8.4,1.9) {Attention};
+  \node[book navy node,text width=2.1cm] (out) at (11.2,1.9) {Hidden\\Output};
+  \node[book red node,text width=2.25cm] (kv) at (5.6,0.15) {KV cache\\state};
+
+  \draw[book strong arrow] (norm) -- (qkv);
+  \draw[book strong arrow] (qkv) -- (rope);
+  \draw[book strong arrow] (rope) -- (attn);
+  \draw[book strong arrow] (attn) -- (out);
+  \draw[book weak arrow] (rope) -- (kv);
+  \draw[book weak arrow] (kv) -- (attn);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：Graph IR 不只记录张量数据流，还要显式记录 KV cache 这样的跨 token 状态边。}
+\end{systemdiagram}
+
+\section{Tensor IR：shape、stride、layout 和 dtype 是语义的一部分}
+
+Graph IR 知道有一个 \code{linear} 节点，但还不够。后端需要知道输入是 \code{[T,H]} 还是 \code{[H]}，是否连续，stride 是多少，权重是 fp16 还是 q4 group，输出要放在 CPU 内存还是 GPU 显存。这些属于 Tensor IR。
+
+\begin{lstlisting}[numbers=none,caption={Tensor IR value descriptor}]
+Value:
+  id
+  element_type
+  shape
+  stride
+  logical_layout
+  physical_layout
+  quant_descriptor_id
+  device
+  alias_info
+  lifetime_info
+\end{lstlisting}
+
+初学者常把 shape 当作数组长度，把 stride 当作底层细节。实际不是。shape 决定算子数学语义；stride 决定地址公式；layout 决定 cache 和 SIMD 读流；dtype 决定数值误差和 kernel 选择；quant descriptor 决定 scale/zero point 和反量化规则。它们都是编译器需要理解的合同。
+
+例如连续的 \code{[T,H]} hidden state 和转置视图可能拥有同样 shape，但地址流完全不同。一个 pass 如果只看 shape，不看 stride，就可能把一个本来连续的 kernel 应用到非连续视图上。第一册讲过对象布局和指针地址；这里就是把那些知识用于张量。
+
+\section{Loop IR：机器优化从循环账本开始}
+
+当 Tensor IR 已经确定某个 \code{linear} 的输入、权重和输出，后端还要决定怎样循环。Loop IR 表示 tile、向量化、展开、线程划分和 memory access。它不再关心模型层名，而是关心循环变量和地址流。
+
+\begin{lstlisting}[numbers=none,caption={一个 GEMV lowering 后的循环账本}]
+for out_tile in output_channels step TILE_N:
+  accum[TILE_N] = 0
+  for k in input_channels step TILE_K:
+    x_vec = load input[k : k + TILE_K]
+    w_panel = load packed_weight[out_tile, k]
+    accum += dot_or_fma(x_vec, w_panel)
+  store output[out_tile]
+\end{lstlisting}
+
+这里的每个选择都对应第二册的硬件账本。TILE 的大小影响 cache line、SIMD 寄存器和预取；\code{out_tile} 的划分影响线程任务；\code{packed_weight} 的布局影响 TLB 和顺序读；tail path 影响分支和 mask；accumulator 数量影响 dependency chain 和寄存器压力。
+
+Loop IR 不一定要做成复杂编译器基础设施。对于本册 C++20 项目，可以先用结构化 descriptor 和少量 lowering 规则表达它：
+
+\begin{lstlisting}[numbers=none,caption={LoopPlanDesc 的保守工程形态}]
+LoopPlanDesc:
+  operator_id
+  backend
+  tile_m
+  tile_n
+  tile_k
+  vector_width
+  unroll_k
+  tail_policy
+  thread_partition
+  packed_weight_desc
+  accumulator_dtype
+\end{lstlisting}
+
+重点不是形式，而是让后端选择可见、可测试、可报告。不要把 tile 和 tail 都埋在某个巨大 \code{matmul.cpp} 里。
+
+\section{Pass 是带前置条件和后置条件的改写}
+
+\term{Pass}{编译遍} 不是“随便遍历图改一改”。一个合格 pass 应该声明它读什么、要求什么、产出什么、会让哪些分析失效。传统编译器这样管理优化顺序；AI 编译器同样需要。
+
+\begin{lstlisting}[numbers=none,caption={pass 合同的最小字段}]
+PassContract:
+  name
+  input_ir
+  required_analyses
+  preconditions
+  transformations
+  produced_analyses
+  invalidated_analyses
+  verifier_after_pass
+\end{lstlisting}
+
+例如 \code{FuseRmsNormLinearPass} 的前置条件可能是：RMSNorm 输出只有一个消费者；consumer 是 linear；debug/oracle 不要求 materialize RMSNorm 输出；后端支持 fused dtype/layout；量化权重的 scale 可以在 fused kernel 中正确读取。后置条件是：原来的两个节点替换成 fused node；输出 shape 不变；lifetime 信息失效，需要重新计算。
+
+\begin{warningbox}
+pass 如果不声明前置条件，就会把 bug 伪装成优化。特别是量化、KV cache 和 oracle materialization 相关 pass，必须明确哪些边界不能跨。
+\end{warningbox}
+
+\section{一个具体 pass pipeline}
+
+把 pass 讲成抽象概念还不够。一个能支撑本册推理引擎的保守 pipeline 可以先写成下面这样：
+
+\begin{lstlisting}[numbers=none,caption={第三册项目的保守 pass pipeline}]
+ImportCanonicalization
+ShapeDtypeInference
+QuantContractAttach
+GraphVerification
+SimpleCanonicalize
+UseDefAndLivenessAnalysis
+ConservativeFusion
+MemoryPlanning
+BackendLowering
+PlanVerification
+\end{lstlisting}
+
+\topic{ImportCanonicalization。} 模型导入后，先把外部格式里的名字、轴顺序、常量表示和算子别名统一成项目内部格式。比如某些模型文件里 Q/K/V 是三个权重，某些是一个 packed QKV 权重；某些图里 RMSNorm 写成多个基础算子，某些直接写成一个算子。canonicalization 的目标不是优化，而是让后续 pass 面对稳定输入。
+
+\topic{ShapeDtypeInference。} 这一遍推导每条 value 的 shape、dtype、layout 和 device。它必须能解释 prefill 的 \code{[T,H]} 和 decode 的 \code{[1,H]}，也必须能解释 GQA 中 \code{n_q} 与 \code{n_kv} 不同的情况。若 shape 推导失败，不能让后端自己猜。
+
+\topic{QuantContractAttach。} 量化不是后端小技巧。导入器读到的 int8、int4、group scale、zero point、packed order、tail policy，要在这一阶段附到 Tensor IR 的 descriptor 上。后续 pass 做 fusion、memory planning 和 lowering 时都要能查到。
+
+\topic{GraphVerification。} 在任何优化前先检查图：输入存在、输出唯一、状态读写合法、KV cache position 合法、sampler 只消费 logits、debug/oracle 要求的 materialization 点存在。这个阶段发现的问题通常是模型资产或导入逻辑问题。
+
+\topic{SimpleCanonicalize。} 做不会改变语义的小整理，比如删除恒等 reshape、合并连续 view、把等价 dtype 标记统一。它不应该跨过状态边，也不应该改量化解释。
+
+\topic{UseDefAndLivenessAnalysis。} 收集每个 value 的定义点、使用者和最后使用位置。memory planner 和 fusion 都要消费这些事实。不要在 fusion pass 里临时扫描一遍再自己做决定；这样会让测试粒度变差。
+
+\topic{ConservativeFusion。} 只做前置条件足够明确的融合。比如 RMSNorm 与 Linear 融合可以减少一次 activation 写回，但前提是 RMSNorm 输出没有被 oracle 要求物化、没有被多个消费者使用、后端支持对应 dtype/layout、量化 scale 读取顺序仍然正确。
+
+\topic{MemoryPlanning。} 根据 liveness、alignment、backend workspace 和 debug/oracle materialization 点分配 arena offset。KV cache、packed weight、workspace 和 activation arena 不属于同一类生命周期，不能混在一个简单线性 buffer 里。
+
+\topic{BackendLowering。} 把语义节点降到 CPU/GPU plan。CPU 计划包含 packed weight、tile、SIMD kernel、线程划分；GPU 计划包含 device buffer、stream、workspace、staging 和 sync。
+
+\topic{PlanVerification。} 最后一遍检查 executable plan：segment 顺序是否满足依赖，arena offset 是否冲突，kernel 是否支持实际 dtype/layout/quant，KV cache state binding 是否完整，profiler schema 是否能覆盖端到端指标。
+
+这个 pipeline 故意保守。它没有一开始就做复杂图重写、自动调参或跨层大融合。原因是第三册的目标不是堆优化名词，而是让每个阶段都有可验证产物。等 reference、oracle、profiler 和回归门禁稳定后，再增加更激进的 pass 才有意义。
+
+\section{RMSNorm + Linear 融合的前置条件}
+
+用一个具体融合说明 pass 合同。RMSNorm 后面常接 QKV projection 或 MLP projection。若把 RMSNorm 输出写回 arena，再由 linear 读出，会多一次 \code{[N,H]} 的内存读写。融合后的 kernel 可以一边算归一化，一边把结果喂给矩阵乘。
+
+\begin{lstlisting}[numbers=none,caption={融合前后的图形态}]
+before:
+  y = rmsnorm(x, gamma)
+  z = linear(y, packed_weight)
+
+after:
+  z = fused_rmsnorm_linear(x, gamma, packed_weight)
+\end{lstlisting}
+
+这个融合的前置条件至少包括：
+
+\begin{itemize}
+  \item \code{y} 只有一个真实消费者，或者额外消费者只是可关闭的 profiler 统计。
+  \item oracle 当前配置不要求比较 \code{y} 的逐元素输出。
+  \item \code{x}、\code{gamma} 和 \code{packed_weight} 的 dtype/layout 被后端 fused kernel 支持。
+  \item quantized weight 的 scale metadata 能在 fused kernel 中按相同逻辑顺序读取。
+  \item RMSNorm 的 \code{epsilon}、累加类型和舍入规则与 reference profile 一致。
+  \item 融合后 \code{z} 的 shape、dtype、device 和 quant contract 不变。
+\end{itemize}
+
+后置条件也要写清：原 \code{rmsnorm} 和 \code{linear} 被一个 fused node 替代；\code{z} 的逻辑 value id 可以保持或映射到新 id；use-def、liveness、cost analysis 和 memory plan 失效；shape/dtype 推导可以复用，但 pass verifier 必须重新检查输出合同。
+
+\begin{keyidea}
+融合不是把两个函数塞进一个大函数。融合是一个受 use-def、oracle、dtype、layout、quant metadata 和后端能力共同约束的 IR 改写。
+\end{keyidea}
+
+\section{一个错误 fusion 的反例}
+
+再看一个不能随便融合的例子。假设图里有 RoPE、KV append 和 attention：
+
+\begin{lstlisting}[numbers=none,caption={RoPE、KV append 与 attention 的状态边}]
+q_rot, k_rot = rope(q, k, position)
+kv_cache.append(layer, position, k_rot, v)
+out = attention(q_rot, kv_cache.read(layer, 0..position))
+\end{lstlisting}
+
+有人可能想把它们全部融合成一个 \code{rope_attention} kernel，减少中间张量写回：
+
+\begin{lstlisting}[numbers=none,caption={错误融合：丢掉了状态写入}]
+out = fused_rope_attention(q, k, v, kv_cache, position)
+\end{lstlisting}
+
+如果这个 fused kernel 只在内部使用 \code{k_rot} 参与当前 attention，却没有把 \code{k_rot/v} 写入 KV cache，那么当前 token 可能看起来没错，但下一个 token 会读不到这一位置的 K/V。这个 bug 不一定立刻崩溃，因为 cache slot 里可能有旧值或零值；它会表现为后续 logits 漂移。
+
+正确的融合必须把状态写入保留下来：
+
+\begin{lstlisting}[numbers=none,caption={正确融合必须保留 state write}]
+out = fused_rope_kv_append_attention(
+  q, k, v,
+  kv_cache_write_binding,
+  kv_cache_read_binding,
+  position)
+\end{lstlisting}
+
+pass verifier 要检查两件事。第一，融合前后的状态读写集合等价：\code{KVCache[layer, position]} 仍然被写入，attention 仍然读取 \code{0..position}。第二，执行顺序等价：当前位置写入必须在未来 token 读取前可见；若 GPU 上异步执行，还要有 stream/event 或 segment 顺序保证。
+
+\begin{warningbox}
+AI 编译器里的状态边不能被当成普通 activation 边优化掉。KV cache、sampler state、随机数状态、debug/oracle materialization 都属于会影响后续行为的边界。
+\end{warningbox}
+
+\section{分析 pass：先收集事实，再做决定}
+
+很多优化应该先跑分析 pass，再跑变换 pass。分析 pass 不改 IR，只产出事实。变换 pass 使用这些事实做决定。把两者混在一个大函数里，后面很难调试和测试。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+分析 & 产出事实 & 后续用途 \\
+\midrule
+Shape analysis & 每条边 shape/dtype/layout & verifier、kernel 选择 \\
+Use-def analysis & 每个 value 的消费者 & fusion、liveness \\
+Liveness analysis & defined/last use & activation arena \\
+Alias analysis & 是否共享存储或视图 & in-place、内存复用 \\
+Quant analysis & scale/group/format 支持 & quant lowering、oracle \\
+Cost analysis & 估算内存流和计算量 & pass 决策、plan 选择 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如 fusion pass 不应该自己顺手扫描所有消费者并猜内存生命周期。它应该消费 use-def 和 liveness 结果。这样测试可以分别验证 use-def 是否正确、liveness 是否正确、fusion 是否尊重这些事实。
+
+\section{lowering：从语义逐步靠近后端}
+
+lowering 是把高层语义变成低层执行计划的过程。它不是一步到位，也不是直接把 graph node 换成函数指针。更稳妥的做法是分阶段：
+
+\begin{lstlisting}[numbers=none,caption={AI 编译器 lowering 阶段}]
+Graph IR:
+  decoder block, attention, linear, mlp
+
+Tensor IR:
+  concrete shapes, layouts, quant descriptors
+
+Backend-independent plan:
+  fusion boundaries, liveness, memory plan
+
+Backend-specific plan:
+  CPU packed panels, SIMD kernel desc, thread partition
+  GPU device buffers, kernel adapter, stream dependencies
+
+Executable plan:
+  segments, kernel calls, arena offsets, state bindings
+\end{lstlisting}
+
+分阶段的好处是：高层 verifier 可以检查语义，低层 verifier 可以检查机器合同。比如在 backend-independent plan 中，attention 仍然是语义操作；到了 CPU plan，decode attention 可能降低为按 head 和 position 分块读取 KV cache 的 kernel；到了 executable plan，runtime 只看到 segment、buffer offset、kernel handle 和 state binding。
+
+\section{CPU lowering：从 tensor 到 SIMD plan}
+
+以 decode 阶段的 quantized linear 为例，CPU lowering 要做的事情包括：
+
+\begin{itemize}
+  \item 判断当前 shape 更像 GEMV 还是 small-batch GEMM。
+  \item 查询 CPU feature，选择 scalar、AVX2、AVX-512 或其他 ISA plan。
+  \item 确认权重是否已经按目标 ISA packed，必要时触发 prepare。
+  \item 根据 output channel、group size、tail 和 cache 选择 tile。
+  \item 选择单线程或多线程分区策略。
+  \item 生成 kernel 调用参数和 profiler 标签。
+\end{itemize}
+
+\begin{lstlisting}[numbers=none,caption={CPU lowering 输出的计划片段}]
+CpuKernelCall:
+  kernel_id: q4_gemv_avx2_g64
+  input_binding: arena.hidden_norm
+  packed_weight: packed.layers.12.mlp.wup
+  output_binding: arena.mlp_up
+  tile_n: 16
+  tile_k: 64
+  threads: partition_by_output_rows
+  tolerance_profile: q4_weight_f16_output
+\end{lstlisting}
+
+这里和第一册、第二册的连接很直接。第一册帮助我们理解 ABI、函数调用、指针和反汇编；第二册帮助我们理解 AVX、cache、TLB、线程和 NUMA；第三册把它们组织成 lowering 计划。
+
+\section{GPU lowering：把同步和 staging 写进计划}
+
+GPU lowering 不应该只输出一个 \code{launch(kernel)}。它还要表达 device buffer、stream、workspace、host-device staging 和同步点。特别是 logits 通常需要回到 CPU 采样，KV cache 可能常驻 GPU，某些 fallback 可能回到 CPU，这些边界都要在计划里显式出现。
+
+\begin{lstlisting}[numbers=none,caption={GPU lowering 输出的计划片段}]
+GpuSegment:
+  stream: decode_stream
+  device_inputs:
+    hidden_buffer
+    packed_weight_buffer
+    kv_cache_buffer
+  workspace: attention_workspace
+  kernels:
+    rmsnorm_linear_fused
+    rope_kv_append
+    attention_decode
+    mlp_fused
+  staging:
+    copy logits top-k to host
+  sync:
+    wait before sampler
+\end{lstlisting}
+
+如果计划不记录 staging 和 sync，profiler 就会只看到 kernel 时间，看不到端到端 decode latency。第二册讲过异步 I/O、背压和运行时调度；GPU 后端里的 stream 和 host-device 同步就是同类问题在 AI infra 中的具体形态。
+
+\section{Executable Plan：runtime 执行的是计划，不是重新解释图}
+
+executable plan 是 AI 编译器交给 runtime 的产物。它应该把已经决定的事情固化下来：segment 顺序、kernel 选择、arena offset、packed weight、KV cache 绑定点、workspace 需求、profiler 标签和 oracle 边界。
+
+\begin{lstlisting}[numbers=none,caption={ExecutablePlan 的核心结构}]
+ExecutablePlan:
+  plan_id
+  stage: prefill | decode
+  backend
+  assumptions:
+    max_tokens
+    context_bucket
+    dtype_profile
+    quant_profile
+  memory_plan:
+    arena_size
+    value_offsets
+    workspace_requirements
+  segments:
+    Segment[]
+  oracle_points:
+    layer_output
+    logits
+  profiler_schema
+\end{lstlisting}
+
+runtime 拿到 plan 后，不再做 shape inference，不再做 fusion，不再选择 tile，不再 packing。它只绑定 session 状态，例如当前 token、KV cache position、arena 基址、backend context，然后执行 segment。这样热路径才不会退回解释器形态。
+
+\begin{systemdiagram}{IR 到 executable plan 的编译流水线}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.1cm] (g) at (0,1.6) {Graph IR};
+  \node[book teal node,text width=2.1cm] (t) at (2.75,1.6) {Tensor IR};
+  \node[book purple node,text width=2.1cm] (a) at (5.5,1.6) {Analyses\\use/live/cost};
+  \node[book amber node,text width=2.1cm] (l) at (8.25,1.6) {Lowering\\CPU/GPU};
+  \node[book navy node,text width=2.1cm] (p) at (11.0,1.6) {Executable\\Plan};
+
+  \draw[book strong arrow] (g) -- (t);
+  \draw[book strong arrow] (t) -- (a);
+  \draw[book strong arrow] (a) -- (l);
+  \draw[book strong arrow] (l) -- (p);
+
+  \node[book label,text width=2.1cm] at (0,0.05) {依赖和状态};
+  \node[book label,text width=2.1cm] at (2.75,0.05) {shape/layout};
+  \node[book label,text width=2.1cm] at (5.5,0.05) {事实账本};
+  \node[book label,text width=2.1cm] at (8.25,0.05) {后端物理化};
+  \node[book label,text width=2.1cm] at (11.0,0.05) {runtime 执行};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：AI 编译器的最终产物不是一个抽象图，而是 runtime 可以直接绑定和执行的计划。}
+\end{systemdiagram}
+
+\section{Verifier 要贯穿每一层}
+
+前端有 verifier，IR pass 之后也要有 verifier，lowering 后还要有 verifier。不同层检查不同不变量：
+
+\begin{itemize}
+  \item Graph verifier：节点输入输出存在，状态边合法，没有非法循环依赖。
+  \item Tensor verifier：shape、stride、dtype、layout、quant descriptor 一致。
+  \item Pass verifier：改写前后输出语义和边界没有被破坏。
+  \item Memory verifier：arena offset 不错误重叠，alignment 满足后端要求。
+  \item Backend verifier：kernel 支持 dtype/layout/tail/quant，packed descriptor 完整。
+  \item Plan verifier：segment 顺序、state binding、workspace 和 sync 边界完整。
+\end{itemize}
+
+这些 verifier 不一定都很复杂，但必须存在。它们让错误在编译期或 prepare 阶段暴露，而不是进入运行时热路径后才以崩溃或质量漂移形式出现。
+
+\section{C++20 实现边界}
+
+工程上，AI 编译器模块可以按下面方式组织：
+
+\begin{lstlisting}[numbers=none,caption={AI 编译器模块组织建议}]
+include/ai/graph/
+  graph_ir.hpp
+  tensor_desc.hpp
+  verifier.hpp
+
+include/ai/compile/
+  pass.hpp
+  pass_pipeline.hpp
+  analyses.hpp
+  memory_plan.hpp
+  lowering.hpp
+  executable_plan.hpp
+
+src/compile/analysis/
+  use_def_analysis.cpp
+  liveness_analysis.cpp
+  cost_analysis.cpp
+
+src/compile/passes/
+  fuse_rmsnorm_linear.cpp
+  eliminate_redundant_reshape.cpp
+  quant_lowering.cpp
+
+src/compile/lowering/
+  cpu_lowering.cpp
+  gpu_lowering.cpp
+\end{lstlisting}
+
+接口上要保持几条纪律。pass 接收已验证 IR，返回改写结果和诊断；analysis 产出不可变事实，不偷偷改图；lowering 消费 descriptor 和 analysis，不重新解析模型文件；executable plan 是 runtime 的稳定输入，不暴露临时编译器内部指针。C++20 中可以用 \code{std::span} 表示节点序列和 value 序列，用 RAII 管理 arena 和 backend 资源，用显式 enum 和小值对象表达 opcode、dtype、layout 和 backend capability。
+
+\section{本章验收线}
+
+读完本章，应该能真正理解 AI 编译器的内部结构：
+
+\begin{itemize}
+  \item IR 是可检查、可改写的中间账本，不是为了抽象而抽象。
+  \item Graph IR 表达算子依赖和 KV cache 等状态边。
+  \item Tensor IR 表达 shape、stride、layout、dtype、device 和 quant descriptor。
+  \item Loop IR 或 LoopPlanDesc 表达 tile、vector、tail、thread 和 packed weight。
+  \item pass 必须声明前置条件、后置条件、依赖分析和失效分析。
+  \item lowering 要分阶段从语义计划走到 CPU/GPU 后端物理计划。
+  \item executable plan 固化 segment、kernel、arena、workspace、state binding、oracle 和 profiler。
+  \item verifier 要贯穿 Graph、Tensor、Pass、Memory、Backend 和 Plan 每一层。
+\end{itemize}
+
+这就是把编译原理落到 AI infra 的方式：不是背名词，而是用 IR 和 pass 把模型语义、量化合同、内存生命周期和后端机器事实串成一条可验证的工程流水线。

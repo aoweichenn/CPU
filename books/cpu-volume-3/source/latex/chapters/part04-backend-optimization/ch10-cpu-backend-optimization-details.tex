@@ -1,0 +1,377 @@
+\chapter{CPU 后端优化细讲：地址流、SIMD、线程、NUMA 与 C++20 工程边界}
+
+\section{后端优化的第一原则：先解释慢在哪里}
+
+CPU 后端优化很容易被写成一串术语：AVX、packing、thread pool、NUMA、prefetch。对初学者来说，这些词如果没有机器账本支撑，只会变成新的黑箱。真正的优化要先回答一个朴素问题：这段推理为什么慢？
+
+对 7B 级 decoder-only 模型，慢可能来自不同位置。prefill 阶段可能慢在大 GEMM、attention 和 activation 峰值；decode 阶段可能慢在 GEMV、KV cache 读流、小 kernel 调度和线程 barrier；量化路径可能慢在 int4 解包、scale 读取和 requantize；多线程可能慢在 false sharing、内存带宽和 NUMA 远端访问。优化不能一上来就写 intrinsic，而要先用 profiler 拆开这些来源。
+
+\begin{keyidea}
+CPU 后端优化不是“把代码写得像汇编”，而是建立地址流、指令流、内存层级、线程调度和数值合同之间的证据链。每个优化都要能说明它减少了哪种机器成本。
+\end{keyidea}
+
+本章把 CPU 后端细化到实现层。它会反复连接第一册和第二册：第一册提供 ABI、对象布局、对齐、汇编和 benchmark 身份；第二册提供 cache、TLB、SIMD、线程、NUMA 和运行时调度；第三册把这些基础应用到张量、量化、KV cache 和 executable plan。
+
+\section{C++20 后端对象：所有权和视图必须分开}
+
+后端代码最先要避免的是裸指针混乱。权重、packed weight、activation、KV cache 和 workspace 生命周期不同。C++20 中应该把所有权对象和非拥有视图区分开。
+
+\begin{lstlisting}[numbers=none,caption={后端对象的所有权边界}]
+Owned objects:
+  AlignedBuffer        owns CPU aligned memory
+  MappedFile           owns file mapping
+  PackedWeight         owns backend-specific packed bytes
+  ThreadPool           owns worker threads
+  ProfilerTrace        owns event storage
+
+Non-owning views:
+  TensorView           span + shape + stride + dtype
+  ByteSpan             std::span<std::byte>
+  KernelArgs           views bound for one call
+\end{lstlisting}
+
+这条边界可以避免两个常见错误。第一，kernel 把某个临时指针缓存到对象里，arena 下一次复用地址后读到错误数据。第二，某个 descriptor 以为自己拥有 scale buffer，实际 scale buffer 已经随加载临时对象释放。所有权对象用 RAII 管理生命周期；kernel 只拿当次调用有效的 view。
+
+\begin{warningbox}
+高性能代码也必须有清楚所有权。越是 SIMD、线程和异步后端，越不能依赖“这个指针应该还活着”的隐含约定。
+\end{warningbox}
+
+\section{TensorView：地址公式要显式}
+
+一个 tensor view 至少要包含元素类型、shape、stride 和数据指针。连续内存只是特殊情况。后端 kernel 可以要求某些输入连续，但这个要求必须写在 kernel descriptor 中，由 verifier 检查。
+
+\begin{lstlisting}[numbers=none,caption={TensorView 的语义字段}]
+TensorView:
+  data
+  dtype
+  shape
+  stride
+  layout
+  device
+  alignment
+\end{lstlisting}
+
+地址公式要能从 view 推导出来：
+
+\begin{lstlisting}[numbers=none,caption={二维 view 的地址公式}]
+address(i, j) = base + (i * stride0 + j * stride1) * sizeof(element)
+\end{lstlisting}
+
+为什么这很重要？因为很多优化只对连续内存成立。若 \code{stride1 = 1}，内层循环可以顺序 load；若 \code{stride1} 很大，SIMD load 可能变成 gather 或标量读；若输出 stride 不连续，store 也会变慢。第一册讲过指针和对象布局；在张量后端中，这些知识直接决定 kernel 合同。
+
+\section{GEMV 和 GEMM：prefill 与 decode 的不同账本}
+
+prefill 通常处理多个 prompt token，线性层形态接近 GEMM：
+
+\begin{lstlisting}[numbers=none,caption={prefill linear 的抽象形态}]
+X[T, H] * W[O, H]^T -> Y[T, O]
+\end{lstlisting}
+
+decode 通常一次处理一个新 token，形态更接近 GEMV：
+
+\begin{lstlisting}[numbers=none,caption={decode linear 的抽象形态}]
+x[H] * W[O, H]^T -> y[O]
+\end{lstlisting}
+
+这两个形态的优化重点不同。GEMM 有更多数据复用机会，tile 可以同时复用 X 和 W；GEMV 中输入向量 \code{x} 较小，可以驻留 cache，但权重每步都要读很多，常常受权重带宽和 packed layout 影响。一个只为 GEMM 优化的 kernel，不一定适合 decode；一个只为 GEMV 优化的 kernel，也不一定吃满 prefill。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+阶段 & 主要形态 & 优化重点 \\
+\midrule
+prefill & GEMM / batched GEMM & tile 复用、cache blocking、线程吞吐 \\
+decode & GEMV / small GEMM & 权重读流、packing、低调度开销、KV cache \\
+MLP & 大线性层组合 & gate/up/down 的融合边界和 activation 流 \\
+attention & softmax + KV 读取 & 数值稳定、历史读流、context 分档 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以 executable plan 应该区分 prefill plan 和 decode plan。后端优化报告也应该分别给出 prefill tokens/s、time to first token、decode tokens/s 和单 token latency。
+
+\section{packing：让热循环读到它想读的顺序}
+
+模型文件布局通常服务于通用存储，不服务于某个 SIMD micro-kernel。packing 的目标是把权重重排成热循环顺序读取的布局。对 decode GEMV，常见目标是让一个 output tile 的若干行权重按 \code{K} 方向连续读取，便于向量 load 和累加多个输出。
+
+\begin{lstlisting}[numbers=none,caption={packing 前后的思维差异}]
+logical:
+  weight[out, in]
+
+packed for kernel:
+  panel[out_tile, in_tile, lane]
+  scales[out_tile, group]
+  tail padding for vector width
+\end{lstlisting}
+
+packing 的收益来自减少热路径地址计算、增加顺序读、避免跨 cache line 的随机访问，并让 scale metadata 与权重 code 靠近。但 packing 也有成本：准备时间、额外内存、可能的 TLB 压力、诊断复杂度。因此报告要区分 \code{pack_time_ms}、\code{packed_bytes} 和热路径收益。
+
+\begin{systemdiagram}{CPU packed weight 与 micro-kernel 的关系}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.25cm] (logical) at (0,2.0) {逻辑权重\\out/in};
+  \node[book teal node,text width=2.25cm] (pack) at (3.0,2.0) {packing\\panel 化};
+  \node[book purple node,text width=2.25cm] (panel) at (6.0,2.0) {packed panel\\对齐/padding};
+  \node[book amber node,text width=2.25cm] (kernel) at (9.0,2.0) {SIMD\\micro-kernel};
+
+  \node[book navy node,text width=2.25cm] (scale) at (6.0,0.25) {scale\\metadata};
+  \node[book red node,text width=2.25cm] (report) at (9.0,0.25) {oracle/profiler\\证据};
+
+  \draw[book strong arrow] (logical) -- (pack);
+  \draw[book strong arrow] (pack) -- (panel);
+  \draw[book strong arrow] (panel) -- (kernel);
+  \draw[book weak arrow] (scale) -- (kernel);
+  \draw[book weak arrow] (kernel) -- (report);
+  \draw[book weak arrow] (pack) -- (scale);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：packing 是 kernel 合同的一部分，权重 panel、scale metadata 和 profiler/oracle 必须一起设计。}
+\end{systemdiagram}
+
+\section{SIMD micro-kernel：先设计寄存器账本}
+
+SIMD 优化不是把循环改成 intrinsic。要先设计寄存器账本：哪些寄存器放输入向量，哪些放权重，哪些放 accumulator，scale 在哪里乘，尾部怎样处理。以 fp32 GEMV 为例，一个 micro-kernel 可能同时累加 4 个输出通道：
+
+\begin{lstlisting}[numbers=none,caption={GEMV micro-kernel 的寄存器账本}]
+acc0, acc1, acc2, acc3 = 0
+for k in 0..H step vector_width:
+  x = load input[k]
+  w0 = load weight[out0, k]
+  w1 = load weight[out1, k]
+  w2 = load weight[out2, k]
+  w3 = load weight[out3, k]
+  acc0 += x * w0
+  acc1 += x * w1
+  acc2 += x * w2
+  acc3 += x * w3
+horizontal_reduce acc0..acc3
+\end{lstlisting}
+
+对 int8 或 int4，账本更复杂。int8 可能使用 dot-product 指令或扩展到更宽类型累加；int4 要先解包 nibble，做符号扩展或 zero point 处理，再乘 scale 或进入整数累加。若 scale 每 64 个输入共享一次，micro-kernel 要在 group 边界加载 scale，并保证 packed layout 与 group 边界一致。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+路径 & 热点 & 主要风险 \\
+\midrule
+fp32/fp16 风格 & load、FMA、reduce & accumulator 依赖链、tail \\
+int8 dot & dot 指令、int32 累加 & requantize、饱和、scale \\
+int4 dequant & nibble 解包、scale 乘法 & 解包开销、metadata 读流 \\
+KV attention & 历史 K/V 读取、softmax & context 增长、数值稳定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+micro-kernel descriptor 必须声明这些合同：ISA、tile、alignment、tail、accumulator dtype、输出 dtype、quant group size 和误差容忍。否则 lowering、verifier、oracle 和 benchmark 都无法正确选择和解释它。
+
+\section{int8 linear 的算术合同}
+
+int8 权重量化的 CPU 内核不能只写“把 int8 乘回 float”。至少有两条路线。第一条是教学和 reference 友好的路线：输入仍是 fp32/fp16，权重 int8 反量化成浮点参与 FMA。第二条是性能路线：输入也量化或分块量化，使用整数 dot 指令累加到 int32，再按 scale 还原到目标 dtype。
+
+\begin{lstlisting}[numbers=none,caption={float input + int8 weight 的合同}]
+real_w[out, k] = int8_w[out, k] * scale[out or group]
+acc_float += input_float[k] * real_w[out, k]
+\end{lstlisting}
+
+这条路线容易验证，但每个权重都要转换或乘 scale。若 scale 是 per-channel，scale 读取较轻；若 scale 是 per-group，内层每到 group 边界要换 scale。若 scale 与 packed weight 不同布局，cache locality 会变差。
+
+整数 dot 路线可以写成：
+
+\begin{lstlisting}[numbers=none,caption={int8 dot + int32 accumulator 的合同}]
+q_x = quantize(input_float, input_scale)
+q_w = int8_w
+acc_i32 += int32(q_x) * int32(q_w)
+real_acc = acc_i32 * input_scale * weight_scale
+output = cast_or_requantize(real_acc)
+\end{lstlisting}
+
+这条路线的难点更多：输入 scale 从哪里来，activation 是否逐 token 量化，zero point 是否为 0，accumulator 是否溢出，输出是 fp16/fp32 还是再量化。它可能更快，但必须有更强的 verifier 和 oracle。第三册的工程路线应该先让 float-input/int8-weight 路径稳定，再引入 activation quantization 和整数 dot。
+
+\begin{warningbox}
+不要把 int8 weight-only 和 int8 activation 混成一个词。前者主要节省权重容量和读带宽；后者改变输入表示、accumulator 合同和 requantize 路径，正确性风险更高。
+\end{warningbox}
+
+\section{用硬件计数器判断问题类型}
+
+CPU 优化不能只看 wall time。至少要能把慢分成几类：前端指令供应不足、后端执行端口饱和、cache miss、TLB miss、分支或同步。不同机器可用事件不同，但思路一致。
+
+\begin{center}
+\begin{tabular}{p{0.25\linewidth}p{0.32\linewidth}p{0.27\linewidth}}
+\toprule
+现象 & 可能原因 & 下一步 \\
+\midrule
+IPC 低且 cache miss 高 & 权重/KV 读流不连续 & 查 layout、packing、page 大小 \\
+IPC 低但 miss 不高 & 依赖链、指令混乱、解包开销 & 看反汇编和 uops \\
+多线程不扩展 & 带宽饱和、barrier、false sharing & 改分区和线程数 \\
+长上下文尾延迟高 & KV page 分散、TLB miss & 查 paged KV 和大页策略 \\
+int4 不如 int8 快 & 解包和 scale 读取压过带宽收益 & 重排 scale 或改 kernel \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+benchmark 报告里最好同时写“性能数字”和“解释数字”。例如：\code{decode tokens/s} 提升 18\%，同时 LLC miss 降低、pack time 增加多少、logits top-k 是否变化。只有这样，优化才不是偶然跑快一次。
+
+\section{tail path：不要把边界条件当小事}
+
+真实模型 shape 不总是整齐满足 vector width 或 tile size。即使 hidden size 常常是 4096，intermediate size、vocab size、head 数、group size、batch 和 prompt 长度也可能产生尾部。tail path 写错会导致越界读、漏算或错误 padding。
+
+\begin{lstlisting}[numbers=none,caption={tail path 需要覆盖的情况}]
+K dimension not divisible by vector width
+output channels not divisible by tile_n
+group size does not divide logical tail
+prompt token count not divisible by tile_m
+vocab size not divisible by sampler block
+\end{lstlisting}
+
+优化代码常见坏味道是：主路径很快，tail path 用一堆临时判断散在热循环里。更好的做法是把 tail policy 写进 descriptor，并在 lowering 阶段选择专门主路径和尾部路径。测试必须覆盖 tail shape，不能只测漂亮的 \code{4096 x 4096}。
+
+\section{线程划分：decode 不一定适合细粒度并行}
+
+CPU 线程优化要先看任务粒度。prefill 的 GEMM 和 attention 块通常有足够工作量，可以按 token、output channel、head 或 tile 划分。decode 的单 token 路径包含许多小 kernel，若每个 kernel 都投递一批小任务，barrier 和线程唤醒可能抵消计算收益。
+
+\begin{lstlisting}[numbers=none,caption={线程调度要记录的字段}]
+ThreadPlan:
+  stage: prefill | decode
+  partition_axis: token | output_channel | head | layer | batch
+  min_work_per_task
+  barrier_count
+  scratch_per_thread
+  output_write_policy
+  affinity_policy
+\end{lstlisting}
+
+false sharing 是一个具体风险。若多个线程写相邻很小的输出或 profiler counter，它们可能反复抢同一 cache line。第二册讲过 cache coherence；在推理后端里，它会表现为多线程不升反降。输出分区、per-thread scratch、counter padding 和归约策略都要考虑 cache line。
+
+\begin{warningbox}
+不要用“CPU 利用率接近 100\%”证明推理快。线程都忙可能是在抢 cache line、等内存带宽或反复 barrier。真正指标是端到端 latency、tokens/s、硬件计数器和可解释 scaling 曲线。
+\end{warningbox}
+
+\section{NUMA、TLB 与大页：长上下文会放大内存事实}
+
+当模型权重、packed weight 和 KV cache 变大，NUMA 和 TLB 开始影响尾延迟。若线程跑在一个 NUMA node，而权重页主要分配在另一个 node，远端访问会拖慢。若 KV cache 分散在很多小页，长上下文 attention 会放大 TLB miss。若多请求同时增长 KV cache，内存分配策略还会影响碎片和局部性。
+
+后端报告至少要记录：
+
+\begin{itemize}
+  \item CPU 型号、核心数、NUMA node、线程亲和策略。
+  \item 权重和 KV cache 的分配策略，是否 first-touch。
+  \item 是否使用大页或特定页大小。
+  \item 长 prompt 和长 decode 下的 tail latency。
+  \item cache miss、TLB miss、远端访问等可用硬件计数器。
+\end{itemize}
+
+这部分不能凭空优化。先测，再做策略。比如固定线程亲和可能改善稳定性，也可能降低操作系统调度弹性；大页可能减少 TLB miss，也可能增加分配失败或内存浪费。教材强调的是把这些选择纳入报告，而不是给出一个永远正确的开关。
+
+\section{KV cache CPU 路径：读流比写入更关键}
+
+KV cache 每生成一个 token 写一次当前 K/V，但 decode attention 每步要读取历史 K/V。上下文越长，读流越大。CPU 后端要围绕读取模式设计 layout。
+
+\begin{lstlisting}[numbers=none,caption={decode attention 的读流}]
+for head in heads:
+  for pos in 0..context_length:
+    k = load K[layer, head, pos, dim]
+    score[pos] = dot(q[head], k)
+  probs = softmax(score)
+  for pos in 0..context_length:
+    v = load V[layer, head, pos, dim]
+    out[head] += probs[pos] * v
+\end{lstlisting}
+
+这里至少有三类优化。第一，layout 让 \code{pos, dim} 读取尽量连续，减少跨页和跨 cache line。第二，按 context length 分档，小上下文用简单路径，长上下文用分块路径。第三，若 KV cache 量化，需要把 dequant 和 attention 结合，但不能让 scale metadata 破坏读流。
+
+数值上，softmax 需要稳定实现，通常要先减最大值。优化 attention 时不能只看速度，还要比较 logits 和生成质量。一个更快但数值不稳定的 attention kernel，会在长上下文下放大误差。
+
+\section{benchmark harness：测量要能复现}
+
+后端优化最终要落到 benchmark。一个合格 harness 至少固定这些变量：
+
+\begin{lstlisting}[numbers=none,caption={CPU 后端 benchmark 输入}]
+model_or_fixture_id
+quantization_profile
+backend_plan_id
+cpu_feature_path
+thread_count
+affinity_policy
+prompt_set_id
+prompt_lengths
+decode_lengths
+context_length_buckets
+warmup_iterations
+measurement_iterations
+\end{lstlisting}
+
+输出要同时包含性能和正确性：
+
+\begin{lstlisting}[numbers=none,caption={CPU 后端 benchmark 输出}]
+load_time_ms
+pack_time_ms
+prefill_tokens_per_s
+time_to_first_token_ms
+decode_tokens_per_s
+p50_decode_latency_ms
+p95_decode_latency_ms
+arena_peak_bytes
+kv_cache_bytes
+max_logit_abs_error
+topk_changed_count
+hardware_counters_optional
+\end{lstlisting}
+
+测量本身也要避免常见误区：没有 warmup、把模型加载混入 decode、把 packing 成本藏进首次 token、只测一个短 prompt、没有固定线程数、没有记录 CPU 频率状态、只报最好一次。第一册已经讲过可信测量；这里要把同样纪律应用到 AI 后端。
+
+\section{自研后端怎样对标成熟框架}
+
+用户要求“每一步每一个优化都做好”，这不等于一开始就超过成熟框架。正确路线是分阶段对标：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 本项目目标 & 对标重点 \\
+\midrule
+reference & 正确、可解释 & logits 与参考一致 \\
+baseline & 能端到端跑固定模型片段 & 找到最大瓶颈差距 \\
+packing/SIMD & 单算子接近合理吞吐 & microbenchmark 和反汇编 \\
+线程化 & 多核扩展稳定 & scaling 曲线和尾延迟 \\
+量化 & 容量和速度同时改善 & 质量报告和 tokens/s \\
+runtime plan & 端到端稳定 & prefill/decode 分项差距 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对标报告应该同时写“我们还差在哪里”。例如：prefill 接近成熟框架 70\%，decode 只有 40\%，原因可能是 KV cache attention 读流没有优化；或者 int4 权重容量下降明显，但 scale metadata 布局导致解包路径慢。这样的报告比一个孤立 tokens/s 数字更有工程价值。
+
+\section{优化判定表：看到现象后查什么}
+
+后端优化最需要的是排查顺序。下面这张表把常见现象、优先假设和验证动作连起来。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+现象 & 优先假设 & 验证动作 \\
+\midrule
+decode batch 1 慢 & 权重读流或小 kernel 调度 & 算 weight bytes、看 pack layout、拆 kernel count \\
+长上下文变慢明显 & KV cache 读流/TLB/page table & 按 context bucket 画 latency，查 TLB/cache \\
+int4 不如 int8 & 解包和 scale metadata 太重 & 分开测 unpack、scale load、FMA 时间 \\
+多线程不扩展 & 内存带宽、barrier、false sharing & 画线程数曲线，记录 barrier wait \\
+prefill 快但 TTFT 慢 & tokenizer、prepare、packing 或 queue wait & 分拆 load、prepare、prefill、sampler \\
+GPU kernel 快但端到端慢 & launch、copy、sync 或 sampler & 看 StepTrace，不只看 kernel profiler \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的用法很直接：不要先改代码，先证明假设。若 decode 慢但 weight bytes 下限已经接近实测，继续优化 FMA 指令可能收益有限；若 int4 慢在 scale 读取，换更激进的位宽没有意义；若 p95 主要是 queue wait，kernel micro-optimization 不会解决业务 SLO。
+
+\section{本章验收线}
+
+读完本章，应该能把 CPU 后端优化拆成可实现、可验证的步骤：
+
+\begin{itemize}
+  \item 后端对象要分清 RAII 所有权和 \code{std::span}/TensorView 非拥有视图。
+  \item TensorView 的 shape、stride、layout 和 alignment 决定地址公式和 kernel 合同。
+  \item prefill 更像 GEMM，decode 更像 GEMV，两者应使用不同 plan 和指标。
+  \item packing 要同时组织权重 panel、scale metadata、padding、对齐和诊断映射。
+  \item SIMD micro-kernel 要先设计寄存器账本，再声明 dtype、tile、tail、accumulator 和误差合同。
+  \item tail path 是必须测试的正确性边界，不是附属小分支。
+  \item 线程、NUMA、TLB 和 KV cache 读流必须用 profiler 和硬件事实解释。
+  \item benchmark harness 要固定模型、量化、线程、prompt、context、warmup 和正确性指标。
+\end{itemize}
+
+这章的核心结论很简单：高质量 AI infra 后端不是某段神秘快代码，而是一套从 C++20 对象生命周期到机器地址流、从 SIMD micro-kernel 到 runtime plan、从 oracle 到 profiler 的完整证据系统。

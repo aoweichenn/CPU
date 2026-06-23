@@ -1,18 +1,30 @@
 # Linux CPU Quantized Inference
 
-这是第三册的贯穿大作业第一阶段：Linux 本地 CPU 量化推理引擎。第二册只讨论硬件原理、多核并行、同步、无锁结构、并行算法和分布式计算；AI 模型、算子开发和量化推理引擎从第三册开始。
+这是第三册贯穿项目的第一阶段切片：Linux 本地 CPU 量化线性层和最小推理流程。第三册的贯穿目标不是这个 MLP 本身，而是一台能推理开源 7B 左右 decoder-only 大模型的本地引擎，并逐步覆盖 tokenizer、模型加载、Transformer 层、KV cache、CPU/GPU 后端、正确性报告和性能对标。
 
-目标平台是本地 Linux 机器。普通 x86-64 Linux 台式机、笔记本或服务器是完整实验环境；Termux 可以用于阅读、构建小模型和跑基础 CTest，但 perf、NUMA、线程亲和性和硬件性能计数器通常会受系统权限与内核能力限制。
+目标平台是本地 Linux 机器。普通 x86-64 Linux 台式机、笔记本或服务器是完整实验环境；Termux 可以用于阅读、构建小模型和跑基础 CTest，但 perf、NUMA、线程亲和性和硬件性能计数器通常会受系统权限与内核能力限制。后续 GPU 后端会作为独立 backend 接入，不改变当前切片的语义合同。
 
 当前版本支持：
 
 - 教学文本模型格式 `LCQI_MODEL_V1`
-- 两层 MLP
+- 两层 MLP 教学切片
 - int8 权重加 per-layer scale
 - float 输入和激活
 - 量化线性层、ReLU、分类 argmax
+- int8 linear scalar baseline、packed layout 路径和 shape sweep benchmark
+- tiny reference decoder：RMSNorm、float linear、RoPE、GQA KV cache、decode attention、SwiGLU、lm head
 - CLI 推理和简单 benchmark
 - CTest 正确性测试
+
+后续扩展方向：
+
+- 真实 7B 级模型 metadata 和 tokenizer
+- tokenizer 与真实模型权重导入
+- 多层 decoder-only Transformer reference path
+- KV cache 分页、内存规划和可选量化
+- CPU packed weight、SIMD、线程和 NUMA 优化
+- GPU backend adapter 和 device kernel
+- 与现有框架的 prefill/decode/内存/误差对标报告
 
 构建：
 
@@ -29,3 +41,17 @@ books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_cli \
   books/cpu-volume-3/labs/linux_cpu_inference/models/tiny_mlp_i8.txt \
   1.0 2.0 -1.0 0.5 1000
 ```
+
+kernel benchmark：
+
+```bash
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_bench 200
+```
+
+输出 CSV 字段：
+
+```text
+input_size,output_size,output_block,repeat,scalar_us,packed_us,max_abs_diff,scalar_checksum,packed_checksum
+```
+
+这还不是生产级高性能 kernel。当前 benchmark 只建立 scalar baseline、packed layout 正确性和 shape sweep 口径。要达到大师级 AI Infra 证据，还必须继续补 AVX2/AVX-512 kernel、perf counter、反汇编分析、oneDNN/OpenBLAS/llama.cpp/ggml 对照、sanitizer、fuzz 和 CI。

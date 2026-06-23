@@ -1,0 +1,742 @@
+\chapter{低比特权重与 KV cache 量化：int4、group scale 与运行时状态}
+
+\section{从 int8 走到 int4，问题变在哪里}
+
+int8 量化已经把 fp16 权重容量减半；int4 继续把 int8 再减半。对 7B 模型，容量差异非常直接：
+
+\begin{lstlisting}[numbers=none,caption={7B 权重容量和元数据压力}]
+fp16 weight: 7e9 * 2 bytes  ~= 14 GB
+int8 weight: 7e9 * 1 byte   ~=  7 GB + scales
+int4 weight: 7e9 * 0.5 byte ~=  3.5 GB + group scales
+\end{lstlisting}
+
+但 int4 不是“更小的 int8”。一个 int8 元素天然占一个字节；两个 int4 值通常打包在一个字节里。kernel 读取后要解包 nibble，处理符号扩展或 zero point，再乘 scale。为了精度，int4 权重很少整层共用一个 scale，通常按 group 保存 scale，例如每 32、64 或 128 个连续权重共享一个 scale。于是后端要同时处理两条流：压缩权重流和 scale metadata 流。
+
+\begin{keyidea}
+int4 的主要难点不是 4-bit 算术本身，而是 packed byte order、group scale、尾部 padding、解包成本、scale 读取局部性和 oracle 合同必须同时正确。
+\end{keyidea}
+
+\section{先看一个会悄悄算错的实现}
+
+下面的伪代码看起来很自然，但它省略了 packed order、signedness、zero point、scale 粒度、tail policy 和后端重排合同。
+
+\begin{lstlisting}[numbers=none,caption={容易算错的 int4 解包形态}]
+for in in 0..input_channels:
+  byte = packed[in / 2]
+  q = (in % 2 == 0) ? (byte & 0xF) : (byte >> 4)
+  w = (q - zero_point) * scale[in / group_size]
+  acc += x[in] * w
+\end{lstlisting}
+
+\begin{warningbox}
+低比特实现最危险的错误，是 reference、converter、packing 和 kernel 各自持有一份隐含解释。正确做法是先定义一个可序列化的量化合同，再让 converter、verifier、packing、kernel 和 oracle 全部读取同一份合同。
+\end{warningbox}
+
+\section{group quant 的逻辑格式}
+
+以 group size 64 为例，一个输出通道的一段权重可以分成若干组。每组有 64 个 4-bit code 和一个 scale：
+
+\begin{lstlisting}[numbers=none,caption={group-wise int4 权重的逻辑形状}]
+weight[out, in]
+
+group_size = 64
+group_id = in / 64
+offset_in_group = in % 64
+
+q4_code = packed_weight[out, group_id, offset_in_group]
+scale = group_scale[out, group_id]
+real_weight ~= decode_int4(q4_code) * scale
+\end{lstlisting}
+
+若 \code{in} 维度不能整除 group size，就需要 tail policy。常见选择是补零、补中性码点或单独记录尾组长度。tail policy 必须进入 descriptor。否则不同 kernel 会对最后一组有不同解释。
+
+\begin{center}
+\begin{tabular}{p{0.21\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+字段 & 含义 & 错误后果 \\
+\midrule
+bit width & 每个码点占几位 & 解包错位，全部权重错误 \\
+signedness & 有符号还是无符号码点 & 零点和符号扩展错误 \\
+group size & 多少权重共享 scale & scale 索引错误 \\
+scale dtype & scale 存 fp16/fp32 等 & metadata 读取宽度错误 \\
+packed order & 低 nibble 先还是高 nibble 先 & 每两个权重交换或错解 \\
+tail policy & 尾组如何补齐 & 最后一块输出异常 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{量化合同要进入 manifest}
+
+如果 manifest 只写“这个权重是 int4”，后端仍然无法安全执行。manifest 需要把量化格式拆成可检查字段。
+
+\begin{lstlisting}[numbers=none,caption={manifest 中的量化字段草图}]
+QuantTensorManifest:
+  tensor_name
+  logical_shape
+  role: q_proj | k_proj | v_proj | mlp_up | ...
+  storage_bits
+  code_signedness
+  zero_point_policy
+  scale_granularity
+  group_size
+  scale_tensor_name
+  packed_order
+  tail_policy
+  calibration_record_id
+\end{lstlisting}
+
+verifier 的任务不是重新做量化，而是拒绝不自洽的资产：packed byte 数、scale 数量、group size、tail policy、后端支持能力和角色一致性都要提前检查。
+
+\begin{center}
+\begin{tabular}{p{0.23\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+检查项 & 计算方式 & 失败时说明 \\
+\midrule
+packed bytes & \code{ceil(elements * bits / 8)} & 权重文件截断或格式解释错 \\
+group count & \code{ceil(input\_channels / group\_size) * output\_channels} & scale 数量不匹配 \\
+backend support & capability 中是否支持该 profile & 需要 fallback 或拒绝 \\
+tail policy & 尾组是否有明确规则 & 最后一块输出不可验证 \\
+role consistency & 同一逻辑角色是否 dtype/shape 一致 & manifest 映射错误 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{packing 必须带着 scale 一起走}
+
+后端为了提高 cache locality 和 SIMD 利用率，通常会把权重从模型文件布局重排成 packed layout。对 int4/group quant，packing 不能只移动 4-bit 码点，还必须同步移动或重新索引 group scale。
+
+\begin{systemdiagram}{int4 packing 同时重排权重码点和 scale}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.25cm] (logical) at (0,2.1) {逻辑权重\\out/in};
+  \node[book teal node,text width=2.25cm] (groups) at (3.0,2.1) {group 切分\\64 values};
+  \node[book purple node,text width=2.25cm] (codes) at (6.0,2.1) {int4 codes\\packed bytes};
+  \node[book amber node,text width=2.25cm] (panels) at (9.0,2.1) {后端 panel\\tile layout};
+
+  \node[book red node,text width=2.25cm] (scale0) at (3.0,0.35) {scale\\per group};
+  \node[book navy node,text width=2.25cm] (scale1) at (6.0,0.35) {scale layout\\随 panel};
+  \node[book teal node,text width=2.25cm] (kernel) at (9.0,0.35) {kernel\\同步读取};
+
+  \draw[book strong arrow] (logical) -- (groups);
+  \draw[book strong arrow] (groups) -- (codes);
+  \draw[book strong arrow] (codes) -- (panels);
+  \draw[book weak arrow] (groups) -- (scale0);
+  \draw[book strong arrow] (scale0) -- (scale1);
+  \draw[book strong arrow] (scale1) -- (kernel);
+  \draw[book weak arrow] (panels) -- (kernel);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：int4 packing 不是只重排权重字节，scale metadata 必须跟着后端 panel 同步组织。}
+\end{systemdiagram}
+
+一个好的 packed descriptor 应该让 kernel 不需要查字符串、不需要理解原始文件格式，只需要按 descriptor 读取 panel：
+
+\begin{lstlisting}[numbers=none,caption={int4 packed descriptor 草图}]
+PackedInt4Weight:
+  data: byte span
+  scales: byte span
+  output_channels
+  input_channels
+  group_size
+  panel_rows
+  panel_cols
+  bytes_per_panel
+  scales_per_panel
+  nibble_order
+  tail_policy
+\end{lstlisting}
+
+这个 descriptor 是第一册 ABI/对象布局知识和第二册 cache/SIMD 知识在第三册中的结合点。它既要在 C++20 中有明确对象生命周期和无拷贝视图，又要让后端按 cache line、SIMD 宽度和 tile 形状高效读取。
+
+\section{packing 要有字节级 oracle}
+
+只比较最终 logits，packing 错误定位会很晚。更可靠的办法是在 packed layout 形成后，抽取逻辑坐标，沿 descriptor 反查 packed byte、nibble、scale，再和 reference converter 比较。
+
+\begin{lstlisting}[numbers=none,caption={packed int4 字节级 oracle}]
+for sample in coordinate_samples:
+  logical = {out, in}
+  reference = convert_from_original_file(logical)
+
+  packed_location = descriptor.locate(out, in)
+  code = read_nibble(descriptor.data, packed_location)
+  scale = read_scale(descriptor.scales, packed_location.group)
+  actual = decode(code, scale, descriptor.zero_point_policy)
+
+  compare(actual, reference, tolerance)
+\end{lstlisting}
+
+\begin{rubricbox}
+int4 packed weight 的最低验收线：
+\begin{itemize}
+  \item verifier 能计算 packed bytes、group count 和 scale count。
+  \item byte oracle 覆盖高/低 nibble、group 边界、tail 和 panel 边界。
+  \item 单算子 oracle 至少覆盖 input channel 非 group size 整数倍的形状。
+  \item profiler 分开报告 packing time、packed bytes、scale bytes 和 kernel time。
+\end{itemize}
+\end{rubricbox}
+
+\section{dequant-on-the-fly 还是预反量化}
+
+int4 权重进入计算时，有两种基本路线。第一种是 dequant-on-the-fly：kernel 每次读取 int4，解包、乘 scale，再参与 FMA 或 dot。第二种是预反量化：加载或 prepare 阶段把 int4 转回 fp16/bf16/fp32 的 packed buffer，热路径按浮点权重计算。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+路线 & 优点 & 代价 \\
+\midrule
+dequant-on-the-fly & 内存带宽低，容量小 & 解包和 scale 乘法进入热路径 \\
+预反量化 & kernel 简单，可复用浮点路径 & 内存容量回升，prepare 成本高 \\
+混合路线 & 热层或热 tile 单独缓存 & 缓存策略和一致性更复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+CPU decode 常常受权重读流和小 batch 形态影响，dequant-on-the-fly 可能有价值；但如果解包成本和 scale 读取打断 SIMD pipeline，收益会消失。prefill 阶段 GEMM 更大，预反量化或 vendor kernel 可能更合适。没有 profiler，不能靠直觉判断。
+
+评估 dequant-on-the-fly 时，不要只看“每个权重少读多少字节”。还要看 scale metadata、unpack/extend/convert、shuffle、寄存器压力和 tail path。低比特节省的是带宽，也可能增加指令压力。
+
+\section{KV cache 量化是运行时问题}
+
+权重量化是静态问题：模型加载前后，权重不变。KV cache 量化是运行时问题：每个 token 生成后，所有层都会写入新的 K/V；后续 attention 会反复读取历史 K/V。
+
+\begin{lstlisting}[numbers=none,caption={KV cache 量化写入和读取路径}]
+on kv_append(layer, position, k_f16, v_f16):
+  scale_k = choose_scale(k_f16)
+  scale_v = choose_scale(v_f16)
+  k_q = quantize(k_f16, scale_k)
+  v_q = quantize(v_f16, scale_v)
+  store k_q, v_q, scale_k, scale_v
+
+on attention_decode(layer, q, context_length):
+  for pos in 0..context_length:
+    k = dequantize(load_k_q(pos), load_scale_k(pos))
+    v = dequantize(load_v_q(pos), load_scale_v(pos))
+    use k, v in attention
+\end{lstlisting}
+
+这段路径暴露三个关键问题。第一，scale 选择发生在 runtime，不能完全离线。第二，metadata 会随 position 增长，不能只统计 K/V 码点大小。第三，decode 每步会读取从 0 到当前 position 的历史；若每个 position 都有独立 scale，metadata 读取会变成热路径的一部分。
+
+\begin{warningbox}
+KV cache 量化不能只报告“内存减半”。必须同时报告写入成本、metadata 成本、decode attention 耗时、logits 漂移和长上下文生成质量。
+\end{warningbox}
+
+\section{KV 量化误差先进入哪里}
+
+很多人会把 KV cache 量化想成“把历史 K/V 反量化回来，后面照常算 attention”。这句话只描述了数据流，没有描述误差流。真正先被扰动的不是最终输出文本，而是每个 head 的 attention score：
+
+\[
+score_{i,j,h}=
+\frac{Q_{i,h}\cdot K_{j,g(h)}}{\sqrt{d}}
+\]
+
+若量化后的 key 变成
+\[
+\tilde{K}_{j,g(h)} = K_{j,g(h)} + \Delta K_{j,g(h)}
+\]
+则 score 误差是：
+
+\[
+\Delta score_{i,j,h}
+=
+\frac{Q_{i,h}\cdot \Delta K_{j,g(h)}}{\sqrt{d}}
+\]
+
+这条式子比“量化会有误差”更重要，因为它说明了三件事。第一，误差会被当前 query 的方向放大或缩小，不是所有 token 位置都同样敏感。第二，同一个量化 profile，在不同 head、不同层、不同 query 上误差大小可能完全不同。第三，score 误差进入 softmax 后，会重新分配整行概率，而不是只影响一个位置。
+
+如果 value 也量化，
+\[
+\tilde{V}=V+\Delta V
+\]
+则最终 attention 输出误差不只来自 \(\Delta V\)，还来自概率本身被改写。把概率写成
+\[
+\tilde{P}=P+\Delta P
+\]
+则：
+
+\[
+\tilde{O}
+=
+\sum_j \tilde{P}_j \tilde{V}_j
+=
+\sum_j (P_j+\Delta P_j)(V_j+\Delta V_j)
+\]
+
+展开后至少有三类误差项：
+
+\[
+\Delta O
+\approx
+\sum_j P_j \Delta V_j
++
+\sum_j \Delta P_j V_j
++
+\sum_j \Delta P_j \Delta V_j
+\]
+
+第一项是“value 被量化”的直接误差；第二项通常更危险，因为它表示 softmax 权重已经被改写，模型开始从历史中“看错位置”；第三项通常更小，但在长上下文和高压缩率下也不能忽略。
+
+\begin{keyidea}
+KV cache 量化最敏感的地方往往不是 \(V\) 本身，而是 \(K\) 进入点积后对 softmax 排序和归一化的扰动。只看反量化后的 L2 误差，不足以判断生成质量。
+\end{keyidea}
+
+\section{softmax 为什么会放大量化误差}
+
+softmax 不是线性函数。若某一行 score 中本来有两个位置非常接近，比如：
+
+\[
+s_a = 12.10,\qquad s_b = 12.04
+\]
+
+那么一个很小的量化误差就可能改变它们的排名。假设量化后变成：
+
+\[
+\tilde{s}_a = 12.00,\qquad \tilde{s}_b = 12.08
+\]
+
+表面上每个位置只改了不到 \code{0.1}，但 attention 概率最大的那个位置已经从 \code{a} 变成 \code{b}。如果这两个位置对应的是两个不同语义片段，后续层读到的内容就会完全不同。长链条 decode 中，这种细小排序翻转会沿层数和 token 数累积。
+
+再看稳定 softmax 的分母：
+
+\[
+p_j=\frac{e^{s_j-m}}{\sum_t e^{s_t-m}}
+\]
+
+当一行中存在几个接近最大值的位置时，\(\Delta score\) 会通过指数放大为概率差异；当某个位置明显比其余位置大很多时，小误差反而可能不敏感。也就是说，量化误差的危害和“当前这行 attention 是尖锐分布还是接近平局”直接相关。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+行分布形态 & 对 score 小误差的敏感性 & 典型现象 \\
+\midrule
+单峰明显领先 & 较低 & top-1 不变，概率小幅扰动 \\
+多个位置接近 & 很高 & 排名翻转，读错历史片段 \\
+长尾很平 & 中等 & 概率整体重分配，输出更发散 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此 KV cache 量化评估不能只做 token 级平均误差。至少还要观察：
+
+\begin{itemize}
+  \item attention score 的最大误差和分位数；
+  \item top-1 attention 位置是否翻转；
+  \item 重要 head/层是否在长上下文上更敏感；
+  \item logits top-k 是否在长 context 档位下明显变化。
+\end{itemize}
+
+\section{一个具体的 KV 量化误差数值例子}
+
+上面讲的是误差路径，现在把它压到可以手算的数字。设某个 head 的 query 和某一历史 key 为：
+\[
+q=[0.60,-0.20,0.50,0.10]
+\]
+\[
+K=[0.80,-0.35,1.10,-0.50]
+\]
+head 维度 \code{d=4}，所以原始 attention score 是：
+\[
+score=\frac{q\cdot K}{\sqrt{4}}
+=
+\frac{0.60\times 0.80+(-0.20)\times(-0.35)+0.50\times1.10+0.10\times(-0.50)}{2}
+=0.525
+\]
+
+现在先看一种“局部范围较准”的 int4 对称量化。若这一个量化块的最大绝对值就是 \code{1.10}，则 scale 可取：
+\[
+\alpha_{local}=\frac{1.10}{7}\approx 0.157
+\]
+量化码点是：
+\[
+q_K=\operatorname{round}(K/\alpha_{local})=[5,-2,7,-3]
+\]
+反量化后：
+\[
+\tilde{K}_{local}=q_K\alpha_{local}
+\approx
+[0.786,-0.314,1.100,-0.471]
+\]
+新的 score 变成：
+\[
+\tilde{score}_{local}
+=
+\frac{q\cdot \tilde{K}_{local}}{2}
+\approx 0.519
+\]
+所以：
+\[
+\Delta score_{local}\approx -0.006
+\]
+
+再看一种更粗的情况。若这个 key 被塞进一个更大 block，block 内别的位置把最大绝对值拉到 \code{1.50}，则 scale 变成：
+\[
+\alpha_{block}=\frac{1.50}{7}\approx 0.214
+\]
+这时码点是：
+\[
+q'_K=\operatorname{round}(K/\alpha_{block})=[4,-2,5,-2]
+\]
+反量化结果变成：
+\[
+\tilde{K}_{block}
+\approx
+[0.857,-0.429,1.071,-0.429]
+\]
+新的 score 是：
+\[
+\tilde{score}_{block}
+=
+\frac{q\cdot \tilde{K}_{block}}{2}
+\approx 0.546
+\]
+于是：
+\[
+\Delta score_{block}\approx +0.021
+\]
+
+这组数字说明两个关键事实。第一，误差大小不只由 bit width 决定，还强烈依赖 scale 粒度和同块中的动态范围共享。第二，同一个原始 key，在两个都“合法”的 int4 配置下，score 偏移方向都可能相反：一个向下漂，一个向上漂。
+
+现在把它放回 attention 排名。假设同一行里另一个候选位置的原始 score 是：
+\[
+score_{rival}=0.520
+\]
+则原始情况下当前 key 领先：
+\[
+0.525 > 0.520
+\]
+局部量化后变成：
+\[
+0.519 < 0.520
+\]
+排名翻转；而粗 block 量化后又变成：
+\[
+0.546 > 0.520
+\]
+不但没翻转，领先还更大。
+
+\begin{warningbox}
+这就是为什么很多人只看反量化后的均方误差会误判 KV 量化质量。真正决定 attention 行为的不是“整体误差小不小”，而是“关键候选位置之间的 score 排名会不会被改写”。
+\end{warningbox}
+
+若继续往下一步看 softmax，排名翻转的影响会直接进入概率分配。尤其当一行里几个位置本来就接近时，\code{0.01} 到 \code{0.03} 级别的 score 扰动已经足以改写 top-1 attention 位置。对长上下文生成，这种翻转不是一次性的，它会把错误读出的上下文写回后续层 hidden，再影响下一步 query。
+
+\section{KV cache 的容量账本}
+
+先不考虑量化，一个 decoder-only 模型的 KV cache 容量可以用一条式子估算：
+
+\begin{lstlisting}[numbers=none,caption={KV cache 基本容量估算}]
+bytes =
+  layers *
+  batch *
+  context_tokens *
+  kv_heads *
+  head_dim *
+  2 /* K and V */ *
+  bytes_per_element
+\end{lstlisting}
+
+这里的 \code{kv_heads} 不一定等于 attention heads。多查询注意力或分组查询注意力会减少 K/V head 数量，但不会消除 context length 线性增长。量化后还要把 scale metadata、page table、padding、对齐浪费和临时 dequant buffer 算进去。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.29\linewidth}}
+\toprule
+项目 & 进入容量账本吗 & 说明 \\
+\midrule
+K/V 码点 & 是 & 最大主体，随 context 增长 \\
+scale metadata & 是 & 粒度越细越大，也影响热路径 \\
+page table & 是 & 分页 cache 或 sliding window 需要 \\
+padding/alignment & 是 & block、head 和设备对齐会产生浪费 \\
+临时 dequant buffer & 视策略而定 & 若 attention 前反量化，峰值内存上升 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{把 metadata 字节也算出来}
+
+继续使用 7B 级 GQA 参数：\code{layers=32}，\code{kv_heads=8}，\code{head_dim=128}，\code{context=4096}，batch 为 1。fp16 KV 码点容量前面算过是 \code{512 MiB}。如果把 K/V 码点改成 int8，码点主体约为：
+
+\begin{lstlisting}[numbers=none,caption={int8 KV 码点主体容量}]
+code_bytes =
+  32 * 4096 * 8 * 128 * 2 * 1
+  = 268435456 bytes
+  = 256 MiB
+\end{lstlisting}
+
+但是 scale metadata 要看粒度。若每个 \code{layer, position, kv_head} 为 K 和 V 各存一个 fp16 scale，则：
+
+\begin{lstlisting}[numbers=none,caption={per-token-per-head fp16 scale 容量}]
+scale_bytes =
+  layers * context * kv_heads *
+  2 /* K and V */ *
+  2 /* fp16 scale */
+
+scale_bytes =
+  32 * 4096 * 8 * 2 * 2
+  = 4194304 bytes
+  = 4 MiB
+\end{lstlisting}
+
+这个 metadata 相对 256 MiB 码点不大，但它在 attention 热路径中被反复读取。若改成 per-channel scale，每个 \code{head_dim} 都有 scale，则 metadata 变成：
+
+\begin{lstlisting}[numbers=none,caption={per-token-per-channel fp16 scale 容量}]
+scale_bytes =
+  layers * context * kv_heads * head_dim *
+  2 /* K and V */ *
+  2 /* fp16 scale */
+
+scale_bytes =
+  32 * 4096 * 8 * 128 * 2 * 2
+  = 536870912 bytes
+  = 512 MiB
+\end{lstlisting}
+
+这就完全改变了账本：KV 码点降到 256 MiB，但 scale metadata 自己达到 512 MiB，容量反而比 fp16 KV 更差，还让 kernel 读取更多元数据。per-channel 可能精度好，但不能不算 metadata。
+
+若使用 int4 KV，码点主体再减半到约 \code{128 MiB}。但如果 scale 粒度太细，metadata 会吞掉大部分收益。因此 KV 量化报告必须同时列出 \code{code_bytes}、\code{scale_bytes}、\code{page_table_bytes} 和 \code{alignment_waste_bytes}。
+
+\begin{keyidea}
+KV cache 量化的核心不是 bit width 越低越好，而是码点容量、scale metadata、读取热路径和误差共同闭合。metadata 不进入账本的量化报告没有工程意义。
+\end{keyidea}
+
+\section{KV dequant buffer 要不要物化}
+
+attention 读取量化 KV 时有两种路线。第一种是 on-the-fly dequant：读一个 block 的量化 K/V 和 scale，在寄存器或 shared memory 中还原并立即参与 score 和加权求和。第二种是先把一段历史 K/V 反量化到临时 buffer，再按普通 fp16 attention 处理。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+路线 & 优点 & 风险 \\
+\midrule
+on-the-fly & 不增加大临时 buffer，容量优势保留 & kernel 复杂，scale 读流和解包进入热路径 \\
+物化 dequant buffer & 可复用现有 attention kernel & 峰值内存上升，额外写回和读取 \\
+分块物化 & 折中，适合 tiled attention & block 边界和 softmax 状态更复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果物化整个 context 的 K/V，临时 buffer 大小接近 fp16 KV 的读取窗口。对 \code{4096} context、GQA 参数，单个 session 全层物化会非常大，通常不可接受。实际更可能按层、按 head 或按 block 物化，处理完立即释放。descriptor 和 memory planner 必须知道这个 workspace，否则峰值内存报告会少算。
+
+\section{KV cache scale 粒度}
+
+KV cache 的 scale 可以按不同粒度设计：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+粒度 & 含义 & 风险 \\
+\midrule
+per-tensor & 整个 cache 或整层共享 scale & 范围过粗，误差可能大 \\
+per-head & 每个 head 共享 scale & metadata 适中，但 position 差异被忽略 \\
+per-token & 每个 position 一组 scale & 精度好，metadata 热路径更重 \\
+per-block & 每个 position block 一组 scale & 精度与开销折中，需要 page/block 管理 \\
+per-channel & \code{head_dim} 内不同维度独立 scale & 精度更细，metadata 和 kernel 复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对长上下文 decode，per-token 或 per-block 常更有解释力，因为不同 token 的 K/V 范围可能变化。但 scale 粒度越细，metadata 越多，attention kernel 的读取也越复杂。GPU 上还要考虑 coalesced load；CPU 上要考虑 cache line 和 TLB。这个选择必须由模型质量和 profiler 共同决定。
+
+\section{为什么 scale 粒度会改变误差分布}
+
+scale 粒度不是单纯的 metadata 体积选择，它直接决定误差怎样分布到 \code{head\_dim} 和 \code{position} 上。设某个量化块的真实值向量为 \code{x}，scale 为 \(\alpha\)，码点为 \code{q}，则量化过程可以抽象成：
+
+\[
+q = \operatorname{clip}\left(\operatorname{round}(x / \alpha)\right),\qquad
+\tilde{x} = \alpha q
+\]
+
+误差是：
+
+\[
+\Delta x = \tilde{x} - x
+\]
+
+若一个 scale 覆盖的数值范围太大，较小分量会被粗糙舍入；若 scale 覆盖范围太小，极值分量容易饱和。于是不同粒度的本质区别是：它们是在什么维度上共享动态范围。
+
+\topic{per-head。} 一个 head 的所有位置或某个大块共用 scale。优点是 metadata 轻；缺点是如果这个 head 某几个 token 的 K/V 振幅特别大，其余位置的量化分辨率会被拖粗。
+
+\topic{per-token。} 每个 position 各自选 scale。它能较好适应不同 token 的振幅变化，尤其适合长上下文中不同段落、代码块、表格或多语言文本混合时的局部范围变化；但每个 position 都要带 metadata，decode 热路径会反复读取这些 scale。
+
+\topic{per-channel。} \code{head\_dim} 内不同维度各自选 scale。它能照顾某些维度长期幅值大、某些维度长期幅值小的情况，但 metadata 非常重，而且 kernel 需要更细粒度反量化。
+
+\topic{per-block。} 在 position 和 dim 之间取一个折中块。它经常是工程上最实用的选择，因为既能比 per-head 更贴近局部范围，又不会像 per-token/per-channel 那么重。
+
+可以把不同粒度理解成“谁共享同一个动态范围预算”。共享得越广，metadata 越省，但误差耦合越强；共享得越细，精度越好，但热路径越重。KV cache 和静态权重不同，它还要考虑历史长度增长后的累计读取成本，所以最优粒度往往不是权重量化里最优的那一个。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.24\linewidth}p{0.22\linewidth}p{0.24\linewidth}}
+\toprule
+粒度 & 动态范围共享对象 & metadata 成本 & 误差特征 \\
+\midrule
+per-head & 整个 head 的较大区域 & 低 & 局部极值拖粗整体分辨率 \\
+per-token & 每个 position & 中高 & 适应 token 间范围变化 \\
+per-channel & dim 维度 & 很高 & 适应维度间长期振幅差异 \\
+per-block & 局部块 & 中等 & 在局部适应性和成本间折中 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{长上下文为什么更容易暴露 KV 量化问题}
+
+短上下文下，decode 每步只看很少历史位置，attention 的候选集合小，很多误差还没有充分积累。长上下文下，问题会同时从三个方向放大。
+
+第一，候选位置数变多。只要某些历史位置的 score 因量化误差发生排序翻转，softmax 就可能把注意力分到不同 token 上。第二，历史分布更复杂。长上下文里往往混有多段主题、代码、表格、指令头、自然语言解释，K/V 的局部动态范围比短 prompt 更不均匀。第三，误差会跨 token 累积。一次 decode 读错历史，不一定当步就输出错误 token，但它会把错误信息写入后续层 hidden，再生成下一步的 query。
+
+这也是为什么 KV cache 量化报告必须按 context length 分桶，而不是只报一个全局平均值。一个合理的最小报告形态至少应包含：
+
+\begin{lstlisting}[numbers=none,caption={长上下文量化报告的最小分桶}]
+context buckets:
+  0-512
+  512-2048
+  2048-8192
+  8192+
+
+for each bucket report:
+  logits_topk_change
+  attention_top1_flip_rate
+  decode_tokens_per_second
+  kv_metadata_bytes
+\end{lstlisting}
+
+\begin{warningbox}
+如果一个 KV 量化方案只在 256 或 512 token 上验证“几乎无损”，这个结论对 8K、32K 长上下文没有证明力。KV cache 是随上下文长度增长的运行时状态，不是一次性离线张量。
+\end{warningbox}
+
+\section{分页 KV cache 和 sliding window}
+
+真实请求不会总是从长度 0 开始生成固定短文本。服务端可能同时维护多个 session，每个 session 的 context length 不同，还可能触发上下文截断、prefix cache 复用或 sliding window。此时 KV cache 不再是一个简单的大连续数组，而更像一组 page 或 block。
+
+\begin{lstlisting}[numbers=none,caption={分页 KV cache 的逻辑映射}]
+logical position:
+  session_id
+  layer
+  kv_head
+  token_position
+  head_dim_range
+
+physical location:
+  page_id = page_table[session_id, block_index]
+  offset = position_in_block * stride_token + head * stride_head
+\end{lstlisting}
+
+分页设计便于增长、回收和 prefix 复用，但 attention kernel 要处理 page table，scale metadata 也要跟随 page 管理。sliding window 还需要逻辑 position 到物理 slot 的环形映射；descriptor 若不记录 epoch 或 base position，很容易读到旧 token。
+
+\begin{casebox}
+一个常见长上下文 bug 是：KV cache 物理 slot 被复用后，scale metadata 没有同步更新，或者 profiler 仍按旧 position 汇总。短 prompt 下这个 bug 不出现；只有 context 超过一个 page 或 sliding window 回绕后，logits 才开始漂移。
+\end{casebox}
+
+\section{C++20 runtime 中的 KV cache descriptor}
+
+KV cache 量化需要 runtime descriptor，而不是只存在模型 manifest 中。
+
+\begin{lstlisting}[numbers=none,caption={量化 KV cache 的运行时 descriptor}]
+QuantizedKVCacheDesc:
+  layers
+  batch
+  kv_heads
+  head_dim
+  capacity_tokens
+  storage_dtype
+  scale_dtype
+  scale_granularity
+  block_size
+  layout
+  page_table_policy
+  dequant_policy
+\end{lstlisting}
+
+如果 KV cache 使用 page/block 增长，descriptor 还要指向 page table。若使用 sliding window，descriptor 必须记录逻辑 position 到物理 slot 的映射。若 CPU/GPU 各自维护 cache，runtime 必须知道数据在哪个设备上，什么时候需要同步或迁移。
+
+\begin{lstlisting}[numbers=none,caption={KV cache append 的边界检查}]
+append(layer, session, position, k, v):
+  if position >= capacity_tokens:
+    return context_limit_error
+  slot = map_logical_to_physical(session, position)
+  if slot.epoch != expected_epoch:
+    return stale_slot_error
+  quantize_and_store(k, v, slot)
+  mark_written(layer, session, position)
+\end{lstlisting}
+
+KV cache 写入不是普通数组赋值。它至少要处理 capacity、逻辑到物理映射、epoch、量化数据、metadata 和 written 状态。
+
+\section{低比特量化的 oracle}
+
+低比特量化 oracle 至少要分四层：
+
+\begin{itemize}
+  \item 权重还原层：随机抽查 packed int4 权重和 scale，确认反量化值匹配 reference converter。
+  \item 单算子层：linear、attention、MLP 输出与 fp16/fp32 reference 比较。
+  \item logits 层：比较 top-k、最大误差、KL 或分布差异。
+  \item 生成层：固定 prompt、sampler 和 seed，比较 token 序列、困惑度或小验证集指标。
+\end{itemize}
+
+对 KV cache，oracle 还要增加 position 维度。短上下文正确不代表长上下文正确；前 32 个 token 正常不代表 2048 之后不漂移。报告必须包含 context length 分档。
+
+\begin{lstlisting}[numbers=none,caption={低比特量化验收报告字段}]
+quant_format:
+  weight_bits
+  group_size
+  scale_dtype
+  kv_cache_bits
+  kv_scale_granularity
+
+correctness:
+  packed_weight_sample_errors
+  layer_error_by_name
+  logits_topk_change
+  decode_mismatch_by_context_length
+
+performance:
+  model_load_time
+  packing_time
+  prefill_latency
+  decode_tokens_per_second
+  kv_cache_bytes
+  metadata_bytes
+\end{lstlisting}
+
+\section{量化决策要接回后端计划}
+
+量化 profile 最终必须影响 executable plan。后端可能支持 int8 GEMM，但不支持 int4 group size 128；可能支持 q4 权重，但要求 scale 连续对齐；可能支持 fp16 KV cache，但不支持 int8 KV cache attention。这些能力必须进入 plan。
+
+\begin{lstlisting}[numbers=none,caption={量化 profile 与后端选择}]
+QuantProfile:
+  weight_format
+  activation_format
+  kv_cache_format
+  error_tolerance_profile
+
+BackendCapability:
+  supported_weight_formats
+  supported_kv_formats
+  preferred_group_sizes
+  requires_packed_scales
+
+Plan decision:
+  if backend supports profile:
+    choose optimized kernel
+  else if fallback allowed:
+    choose reference or dequantized kernel
+  else:
+    reject with diagnostic
+\end{lstlisting}
+
+这让低比特量化成为编译器问题，而不是 kernel 小技巧：manifest 描述资产，verifier 检查自洽，compiler 根据 backend capability 选择计划，runtime 执行计划，oracle 和 profiler 证明收益。
+
+\section{本章验收线}
+
+读完本章，应该能说明：
+
+\begin{itemize}
+  \item int4 的难点在 packed byte order、group scale、tail policy、解包和 scale 读取。
+  \item 量化合同必须进入 manifest 和 verifier，而不是由 kernel 隐式猜测。
+  \item packing 必须同时组织权重码点和 scale metadata。
+  \item packed int4 要有字节级 oracle，覆盖 nibble、group、tail 和 panel 边界。
+  \item dequant-on-the-fly 与预反量化各有容量、带宽和计算成本取舍。
+  \item KV cache 量化是运行时状态问题，不等同于静态权重量化。
+  \item KV cache 容量账本必须包含码点、scale metadata、page table、padding 和临时 buffer。
+  \item KV cache scale 粒度会同时影响误差、metadata 大小和 attention kernel 热路径。
+  \item 分页 KV cache 和 sliding window 需要显式记录逻辑到物理映射和 stale slot 防护。
+  \item 低比特量化 oracle 必须覆盖 packed weight、单算子、logits、生成序列和 context length。
+  \item 量化 profile 必须参与 backend capability 检查和 executable plan 选择。
+\end{itemize}
+
+后续进入具体 C++20 后端实现时，本章的 descriptor 和报告字段会直接变成代码结构、测试 fixture 和 benchmark 输出，而不是停留在文字说明。

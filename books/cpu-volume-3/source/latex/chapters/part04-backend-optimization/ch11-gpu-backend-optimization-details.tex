@@ -1,0 +1,327 @@
+\chapter{GPU 后端优化细讲：device buffer、stream、kernel launch 与端到端延迟}
+
+\section{GPU 后端不是把 CPU 指针换成 device pointer}
+
+GPU 对 AI 推理很重要，但它也很容易被误解。初学者常以为只要把权重放到显存、把算子换成 GPU kernel，就一定更快。真实情况更细：大 prefill 可能非常适合 GPU，因为矩阵乘规模大、并行度高；decode 单 token 却可能被 kernel launch、同步、KV cache 读流、logits 回传和 sampler 边界限制。GPU 峰值 FLOPS 很高，不等于一次本地对话的端到端 latency 一定低。
+
+从编译器角度看，GPU 后端是另一个 lowering 目标。它和 CPU 后端共享模型语义、shape、dtype、quant descriptor、KV cache 合同和 oracle，但物理执行完全不同。CPU 后端关心 cache line、SIMD 寄存器和线程池；GPU 后端关心 device memory、coalesced load、shared memory、warp/block、stream、kernel launch 和 host-device staging。
+
+\begin{keyidea}
+GPU 后端优化的核心是端到端计划，不是单个 kernel 时间。device buffer、stream、workspace、staging、同步点和 fallback 都必须进入 executable plan 和 profiler。
+\end{keyidea}
+
+本章不会依赖某个具体 GPU API。无论使用 CUDA、HIP、Metal、Vulkan compute 还是厂商库，工程边界都类似：资源要 RAII 管理，host/device 所有权要明确，异步执行要有 event 证据，kernel launch 要进入 profiler，fallback 不能悄悄打断语义合同。
+
+\section{GPU 后端的 C++20 RAII 边界}
+
+GPU 后端首先要把资源生命周期写清楚。下面这些对象不应该以裸句柄和裸指针散落在 runtime 中：
+
+\begin{lstlisting}[numbers=none,caption={GPU 后端 RAII 对象}]
+GpuContext:
+  owns device selection and backend capability query
+
+DeviceBuffer:
+  owns device memory allocation and free
+
+Stream:
+  owns asynchronous execution queue
+
+Event:
+  owns timestamp/synchronization marker
+
+Workspace:
+  owns temporary device memory for algorithms
+
+StagingBuffer:
+  owns pinned or mapped host memory for transfers
+
+KernelAdapter:
+  binds executable plan descriptors to launch calls
+\end{lstlisting}
+
+这些对象的价值不是包装 API，而是建立工程不变量。DeviceBuffer 的析构释放显存；Stream 的生命周期覆盖异步 kernel；Event 让 profiler 能测真实 device 时间；StagingBuffer 显式表示 host-device 边界；KernelAdapter 把高层 descriptor 转换成具体 launch 参数。没有这些边界，GPU 后端很快会变成一堆到处传递的 \code{void*} 和句柄。
+
+\begin{warningbox}
+异步后端最怕生命周期伪装。CPU 代码返回不代表 GPU kernel 已经读完输入；arena 或 staging buffer 不能在相关 stream/event 完成前复用。
+\end{warningbox}
+
+\section{host/device 驻留：数据在哪里比函数在哪里更重要}
+
+GPU 推理的第一条账本是数据驻留。权重、packed weight、activation、KV cache、logits、token id、sampler state 分别在 host 还是 device？什么时候传输？传输是否同步？这些问题往往比单个 kernel 代码更影响端到端延迟。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.26\linewidth}p{0.36\linewidth}}
+\toprule
+数据 & 理想驻留 & 风险 \\
+\midrule
+packed weight & device 常驻 & 首次上传/显存峰值/多 GPU 分片 \\
+activation & device arena & 跨 stream 生命周期和 workspace 冲突 \\
+KV cache & device 常驻或分层 & 长上下文显存占用、page table、量化 \\
+logits & device 计算，少量回传 & 完整 vocab 回传太贵，sampler 边界同步 \\
+token id & host/device 双方可见 & 每步小传输和同步放大 latency \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个常见坏路径是：每个 decode step 在 GPU 上算 logits，然后把完整 vocab logits 拷回 CPU，再在 CPU 上做 sampler，再把下一个 token 拷回 GPU。对于大词表，这个回传可能成为固定开销。更好的计划可能是在 GPU 上做 top-k 或 sampler 的一部分，只回传 next token 或少量调试数据。但这会改变 sampler 的执行位置，必须进入 executable plan 和 oracle。
+
+\section{stream 和 event：异步不是自动并行}
+
+GPU API 往往是异步的。向 stream 提交 kernel 后，CPU 线程可以继续走；但这不等于工作已经完成，也不等于不同操作可以随便重排。stream 和 event 是计划中的同步语义。
+
+\begin{lstlisting}[numbers=none,caption={GPU plan 中需要记录的同步边界}]
+GpuPlan:
+  stream decode_stream
+  events:
+    after_kv_append
+    after_attention
+    before_logits_staging
+  dependencies:
+    attention waits for kv_append
+    sampler waits for logits staging
+    arena slot reuse waits for producing kernels
+\end{lstlisting}
+
+profiler 也必须区分 CPU 提交时间和 GPU 执行时间。只测 kernel 内部时间，会漏掉 launch overhead、host-device copy、stream wait、CPU sampler 和计划选择。只测 CPU 墙钟时间，又难以定位慢在 device kernel 还是同步。两者都要记录。
+
+\begin{systemdiagram}{GPU executable plan 中的 stream、event 与 staging}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.25cm] (host) at (0,2.15) {host runtime\\select plan};
+  \node[book teal node,text width=2.25cm] (launch) at (3.0,2.15) {launch kernels\\stream};
+  \node[book purple node,text width=2.25cm] (dev) at (6.0,2.15) {device compute\\attention/MLP};
+  \node[book amber node,text width=2.25cm] (stage) at (9.0,2.15) {staging\\logits/top-k};
+
+  \node[book navy node,text width=2.25cm] (event) at (6.0,0.35) {events\\timestamps};
+  \node[book red node,text width=2.25cm] (sample) at (9.0,0.35) {sampler\\sync boundary};
+
+  \draw[book strong arrow] (host) -- (launch);
+  \draw[book strong arrow] (launch) -- (dev);
+  \draw[book strong arrow] (dev) -- (stage);
+  \draw[book weak arrow] (dev) -- (event);
+  \draw[book strong arrow] (stage) -- (sample);
+  \draw[book weak arrow] (event) -- (sample);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：GPU 后端的端到端延迟由 launch、device compute、event、staging 和 sampler 同时决定。}
+\end{systemdiagram}
+
+\section{kernel launch：小算子会被固定开销吞掉}
+
+GPU kernel launch 有固定成本。prefill 的大 GEMM 能摊薄 launch 成本；decode 的许多小算子不一定能。如果每层都单独 launch RMSNorm、QKV、RoPE、KV append、attention、Wo、MLP gate、activation、down projection，decode 每个 token 会产生大量 launch 和同步。
+
+解决方向有几类：
+
+\begin{itemize}
+  \item 算子融合：把 RMSNorm 与 linear、RoPE 与 KV append 等合并。
+  \item segment 调度：减少 host 侧逐算子解释和 profiler 细粒度开销。
+  \item persistent 或批处理策略：对服务端多请求场景减少重复 launch。
+  \item GPU sampler：减少 logits 完整回传和 host 同步。
+\end{itemize}
+
+融合仍然要受语义约束。比如 oracle 需要某层中间输出时，debug plan 不能完全隐藏物化点；量化权重需要 scale metadata，融合 kernel 必须正确读取；KV append 写入状态，后续 attention 必须看到正确 position。GPU fusion 不是“把越多函数塞进一个 kernel 越好”，而是减少内存流和 launch 开销，同时控制寄存器、shared memory 和调试边界。
+
+\section{prefill GPU plan：吞吐和 workspace}
+
+prefill 的输入 token 多，矩阵乘和 attention 更大，GPU 通常更有优势。编译器 lowering 要为 prefill 选择合适的 batched GEMM、attention kernel 和 workspace。workspace 是后端算法的临时内存，不能和 activation arena 随意混用。
+
+\begin{lstlisting}[numbers=none,caption={prefill GPU plan 的主要字段}]
+PrefillGpuPlan:
+  prompt_length_bucket
+  device_weight_layout
+  activation_arena_size
+  attention_workspace_size
+  gemm_algorithm_id
+  attention_algorithm_id
+  stream_dependencies
+  kv_cache_write_layout
+\end{lstlisting}
+
+prefill 指标也要拆开。time to first token 包含 tokenizer、权重准备、KV cache 初始化、prefill graph 和 logits/sampler；prompt tokens/s 只描述 prompt 处理吞吐。若报告只写一个“GPU prefill 很快”，但没有说明 prompt 长度、batch、workspace、是否包含权重上传，就无法对标。
+
+\section{decode GPU plan：小 batch、KV cache 与同步}
+
+decode 的输入通常是一个 token。即使 GPU 算力强，单 token 路径也可能被固定开销限制。decode GPU plan 要重点处理三件事：
+
+\begin{itemize}
+  \item 减少每 token launch 和同步次数。
+  \item 让 KV cache 读取尽量连续或分块，避免长上下文下显存读流退化。
+  \item 减少 logits 回传，只同步 sampler 真正需要的数据。
+\end{itemize}
+
+\begin{lstlisting}[numbers=none,caption={decode GPU profiler 应拆分的事件}]
+decode_step:
+  host_plan_select_ns
+  launch_overhead_ns
+  rmsnorm_linear_kernel_ns
+  kv_append_kernel_ns
+  attention_kernel_ns
+  mlp_kernel_ns
+  logits_staging_ns
+  sampler_ns
+  total_step_latency_ns
+\end{lstlisting}
+
+如果只看 \code{attention_kernel_ns}，可能会误以为 GPU 很快；如果 \code{logits_staging_ns + sampler_ns} 很大，用户感受到的 tokens/s 仍然不高。端到端报告必须包含 \code{total_step_latency_ns}。
+
+\section{一个 decode step 的端到端时序}
+
+GPU decode 不能只看 kernel profiler。单 token 生成是一条 host 和 device 共同参与的流水线。即使每个 device kernel 都很快，host 侧计划选择、kernel launch、event wait、logits staging 和 sampler 也可能支配端到端延迟。
+
+\begin{lstlisting}[numbers=none,caption={GPU decode step 的最小时序}]
+host:
+  bind current token and position
+  submit rmsnorm/qkv/rope/attention/mlp kernels
+  submit logits or top-k staging
+  wait for sampler boundary
+  sample next token
+
+device stream:
+  rmsnorm_qkv_kernel
+  rope_kv_append_kernel
+  attention_decode_kernel
+  mlp_kernel
+  logits_topk_kernel
+  copy top-k or logits slice to host
+\end{lstlisting}
+
+这条时序里至少有三个同步边界。第一，KV append 与 attention 之间要有顺序，attention 必须看到当前 token 写入后的 K/V。第二，logits 或 top-k 结果回到 host 前，sampler 不能读。第三，arena 或 workspace 复用前，相关 stream 上的 kernel 必须完成。若这些边界只靠“代码看起来按顺序写”维持，就很容易在异步后端出错。
+
+\begin{lstlisting}[numbers=none,caption={StepTrace 应记录的字段}]
+StepTrace:
+  request_id
+  step_index
+  model_position
+  context_length
+  selected_plan_id
+  host_submit_begin_ns
+  host_submit_end_ns
+  device_kernel_begin_ns
+  device_kernel_end_ns
+  staging_begin_ns
+  staging_end_ns
+  sampler_begin_ns
+  sampler_end_ns
+  sync_wait_ns
+  total_step_latency_ns
+\end{lstlisting}
+
+有了这个结构，报告才能回答具体问题：慢在 host 提交、device kernel、staging、wait，还是 sampler。没有这个拆分，只拿 GPU 工具里某个 kernel 的耗时去推断用户感受到的 tokens/s，是不完整的。
+
+\section{GPU decode 的最小可用优化顺序}
+
+GPU 后端优化也要分阶段，不要一开始就写一个巨大的 fused kernel。一个更稳的顺序是：
+
+\begin{enumerate}
+  \item 先让所有权重和 KV cache 常驻 device，消除每步大块 host-device 传输。
+  \item 把 logits staging 从完整 vocab 缩小到 sampler 需要的最小集合，或把 top-k 放到 device。
+  \item 合并小算子，优先融合 RMSNorm+Linear、RoPE+KV append 这类语义边界清晰的路径。
+  \item 对 attention decode 按 context length 分档，短上下文、长上下文、paged KV 使用不同 plan。
+  \item 最后再做更激进的 persistent kernel、跨层 segment 或多请求 batch decode。
+\end{enumerate}
+
+每一级都要同时看 oracle 和 StepTrace。比如把 top-k 放到 GPU 后，logits 全量 oracle 可能不再自然可得，这时 debug plan 要保留可选的 full logits materialization；生产 plan 可以只回传 top-k，但必须声明 sampler 语义没有改变。
+
+\section{GPU 量化：格式支持比位宽口号更重要}
+
+GPU 上的低比特量化并不天然快。关键是目标硬件和库是否支持该格式，以及支持发生在哪一层。如果 int4 权重格式能直接进入高效矩阵乘路径，收益可能明显；如果每次都要先用自定义 kernel 解包成 fp16，再调用 GEMM，收益要重新计算。scale metadata 的布局也会影响 coalesced load。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+路线 & 优点 & 风险 \\
+\midrule
+vendor quant kernel & 利用硬件和库优化 & 格式受限，descriptor 适配复杂 \\
+自定义 dequant + GEMM & 实现直接，易验证 & 解包和额外写回可能很贵 \\
+fused dequant matmul & 减少中间写回 & kernel 复杂，寄存器/shared memory 压力 \\
+KV cache 量化 & 降低长上下文显存和带宽 & scale metadata 和 attention 精度风险 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+量化 verifier 要知道 GPU 后端实际支持什么。不能因为 manifest 写了 \code{q4}，就假设 GPU plan 可用。若 GPU 不支持该格式，应明确 fallback 到 CPU、fallback 到 dequant path，或拒绝该 plan，并在报告里写出原因。
+
+\section{fallback：不能悄悄改变执行位置}
+
+真实工程中，某些算子或格式 GPU 后端暂时不支持，需要 fallback。fallback 可以是 CPU reference、CPU optimized path、GPU 上的慢路径，或者 vendor 库之外的自定义 kernel。关键是不能悄悄发生。
+
+\begin{lstlisting}[numbers=none,caption={fallback report 字段}]
+FallbackEvent:
+  operator_id
+  reason: unsupported_dtype | unsupported_shape | workspace_limit | debug_oracle
+  from_backend
+  to_backend
+  data_transfer_bytes
+  added_sync_points
+  correctness_profile
+\end{lstlisting}
+
+如果某层 attention fallback 到 CPU，会发生 device-to-host 拷贝、CPU 计算、host-to-device 拷贝和同步，端到端 latency 可能大幅上升。profiler 必须把它显示出来。oracle 也要知道 fallback 路径的误差合同可能不同。
+
+\section{多 GPU 和分片：先建立单设备合同}
+
+多 GPU 推理涉及权重分片、KV cache 分布、通信、pipeline/tensor parallel 和跨设备同步。本册后续可以扩展，但工程顺序应该先把单设备合同建立好。原因很简单：如果单 GPU 的 descriptor、stream、workspace、oracle 和 profiler 都不清楚，多 GPU 只会把错误放大。
+
+单设备稳定后，多 GPU 至少要新增这些事实：
+
+\begin{itemize}
+  \item 张量分片轴和每个 shard 的 shape。
+  \item 跨设备通信算子和同步点。
+  \item KV cache 是复制、分片还是按层分布。
+  \item logits 聚合和 sampler 所在设备。
+  \item profiler 能拆分 compute、communication 和 wait。
+\end{itemize}
+
+这些内容和第二册分布式边界、背压、运行时调度有关。它们不是本章主要目标，但要从一开始为 descriptor 和 plan 留出扩展空间。
+
+\section{GPU 后端验收报告}
+
+GPU 后端优化的报告至少要覆盖：
+
+\begin{lstlisting}[numbers=none,caption={GPU 后端验收报告字段}]
+hardware:
+  gpu_model
+  driver_runtime_version
+  device_memory
+  enabled_backend_features
+
+plan:
+  backend_plan_id
+  device_layouts
+  stream_count
+  workspace_bytes
+  fallback_events
+
+performance:
+  weight_upload_time_ms
+  pack_or_convert_time_ms
+  prefill_tokens_per_s
+  time_to_first_token_ms
+  decode_tokens_per_s
+  total_step_latency_ms
+  launch_time_ms
+  staging_time_ms
+  device_kernel_breakdown
+
+correctness:
+  oracle_profile
+  logits_error
+  topk_changed
+  generated_token_mismatch
+\end{lstlisting}
+
+注意 \code{launch_time_ms} 和 \code{staging_time_ms} 必须出现。它们正是很多 GPU decode 路径慢的原因。如果报告只有 device kernel breakdown，就还不是端到端推理报告。
+
+\section{本章验收线}
+
+读完本章，应该能说明 GPU 后端的真实工程边界：
+
+\begin{itemize}
+  \item GPU 后端共享 AI 编译器的语义合同，但拥有自己的 device buffer、stream、event、workspace、staging 和 kernel adapter。
+  \item 数据驻留和 host-device 传输常常比单个 kernel 更影响端到端 latency。
+  \item stream/event 必须进入 executable plan，arena 和 staging buffer 复用要等待异步工作完成。
+  \item kernel launch 是 decode 小算子的固定成本，fusion 和 segment 调度要围绕它设计。
+  \item prefill 关注吞吐和 workspace，decode 关注 launch、KV cache 读流、logits staging 和 sampler 同步。
+  \item GPU 量化要看硬件和库是否真正支持目标格式，fallback 必须显式报告。
+  \item GPU benchmark 必须同时报告 device kernel 时间、launch、staging、同步、端到端 tokens/s 和 oracle。
+\end{itemize}
+
+到这里，CPU 和 GPU 后端有了共同的工程语言：descriptor 表达语义，lowering 选择物理计划，runtime 绑定状态，oracle 证明正确，profiler 证明性能。两者的差异不是谁更“高级”，而是机器账本不同。

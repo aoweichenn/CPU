@@ -1,0 +1,313 @@
+\chapter{从矩阵向量乘走向 GEMM、packing 与 SIMD}
+
+\section{为什么不能直接从 matvec 跳到最快 GEMM}
+
+上一章把一层矩阵向量乘拆成了 shape、stride、地址公式、基本块、地址流和机器账本，并把它接回了 decoder-only Transformer 的 Q/K/V projection、KV cache 写入和 MLP 子层。那条路径故意很小，因为它让每个性能判断都有落点：\code{input[i]} 从哪里读，\code{row[i]} 是否连续，\code{acc} 为什么形成归约依赖，activation 和写回发生在什么边界。
+
+本章继续沿同一条路径推进，但不直接背某个 BLAS 接口。真正的高性能矩阵乘不是一句“调用 GEMM”就结束。它要解决三个逐层出现的问题：
+
+\begin{lstlisting}[numbers=none,caption={从 matvec 到 GEMM 的三个新问题}]
+matvec:
+  one input vector times many weight rows
+  output is one hidden vector
+
+prefill or batched inference:
+  many token rows share the same weight matrix
+  output becomes a token-by-channel matrix
+
+GEMM kernel:
+  compute a tile C[m,n] from panels A[m,k] and B[k,n]
+  choose loop order, packing layout, SIMD lanes and accumulators
+\end{lstlisting}
+
+第一个问题是复用。matvec 中，同一个 input 会被每个输出行复用；prefill 中多个 token 行共享同一份权重，batch 服务时多个请求也共享权重。第二个问题是布局。数学上都是矩阵乘，机器上却要决定哪一块连续、哪一块预打包、哪一块留在 cache 或显存。第三个问题是寄存器和 SIMD。向量指令一次处理多个 lane，但只有当地址流、对齐、数据类型和累加器安排都配合时，它才会变成吞吐提升，而不是更复杂的写法。
+
+\begin{keyidea}
+GEMM 优化的核心不是“矩阵乘很快”，而是把重复使用的数据切成能留在 cache 和寄存器里的小块，并让内层循环产生稳定、连续、可向量化的地址流。
+\end{keyidea}
+
+\section{把 token 维度加回模型}
+
+上一章把 token 行固定为 1。若 prefill 一次处理 \code{T} 个 prompt token，或者服务端把 \code{B} 个请求合批，线性层语义可以写成：
+
+\begin{lstlisting}[numbers=none,caption={多 token 版线性层 reference 语义}]
+for t in 0..T:
+  for out in 0..N:
+    acc = bias[out]
+    for k in 0..K:
+      acc += input[t, k] * weight[out, k]
+    output[t, out] = activation(acc)
+\end{lstlisting}
+
+这仍然是 reference，不是最终内核。它暴露了两个复用方向。固定 \code{t}、遍历 \code{out} 时，一个 token hidden 行会被多次读取；固定 \code{out}、遍历 \code{t} 时，一个 weight 行会被多次读取。若 decode 每次只有一个 token，权重复用不明显，GEMV 或小 batch GEMM 可能是主形态；若 prefill token 多，权重矩阵成为多个 token 共享的热数据，GEMM 风格就有意义。
+
+常见的矩阵表示可以写成：
+
+\begin{lstlisting}[numbers=none,caption={第一层的矩阵形状}]
+A = input   shape [T, K]
+W = weight  shape [N, K]  row-major by output channel
+C = output  shape [T, N]
+
+semantic:
+  C[t, out] = dot(A[t, :], W[out, :]) + bias[out]
+\end{lstlisting}
+
+如果把右侧矩阵看成 \code{W_T[K, N]}，语义就接近 \code{C = A * W_T}。这一步很容易在纸上完成，却不能在机器上忽略布局：\code{W[out,k]} 行主序连续适合 matvec 的内层 \code{k}；但 GEMM 常希望在一个小 tile 里同时取多个 \code{out}，也就是读取 \code{W[out0,k]}、\code{W[out1,k]}、\code{W[out2,k]}。这些地址在原始行主序中相隔 \code{K} 个元素，不一定适合内层 SIMD。
+
+\begin{systemdiagram}{prefill 把复用方向从一条行扩成一个 tile}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.2cm] (matvec) at (0,0.95) {matvec\\B = 1};
+  \node[book teal node,text width=2.25cm] (batch) at (3.0,0.95) {prefill\\T rows};
+  \node[book purple node,text width=2.25cm] (tile) at (6.0,0.95) {GEMM tile\\BM x BN};
+  \node[book amber node,text width=2.25cm] (kernel) at (9.0,0.95) {micro-kernel\\register block};
+
+  \draw[book strong arrow] (matvec) -- (batch);
+  \draw[book strong arrow] (batch) -- (tile);
+  \draw[book strong arrow] (tile) -- (kernel);
+
+  \node[book label,text width=2.45cm] at (0,-0.65) {一个 input 行被 N 个输出行复用};
+  \node[book label,text width=2.45cm] at (3.0,-0.65) {一块 weight 被多个 token 复用};
+  \node[book label,text width=2.45cm] at (6.0,-0.65) {A panel 和 W panel 共同留近};
+  \node[book label,text width=2.45cm] at (9.0,-0.65) {多个 accumulator 常驻寄存器};
+
+  \node[book label,text width=10.4cm] at (4.5,-1.72) {prefill token 数不只是 API 维度；它改变了权重、输入和输出的复用账本，也改变了哪些数据值得 packing。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：从 decode matvec 到 prefill GEMM 的关键变化是复用单位从一条向量扩大为一个可驻留的 tile。}
+\end{systemdiagram}
+
+\section{三层循环不是任意交换}
+
+矩阵乘 reference 通常有三层循环。初学者容易把循环顺序理解成纯数学等价：只要结果相同，怎么换都可以。性能分析要更具体：谁在内层，谁就决定高频地址流；谁跨 tile 复用，谁就决定 cache 工作集；谁留在寄存器，谁就决定 accumulator 数量。
+
+\begin{lstlisting}[numbers=none,caption={三种循环顺序的地址含义}]
+t-out-k:
+  for each token t:
+    for each output out:
+      scan A[t, k] and W[out, k]
+
+t-k-out:
+  for each token t:
+    for each k:
+      reuse A[t, k] across many out
+      touch many W[out, k] and C[t, out]
+
+tile-t-out-k:
+  for blocks of tokens and out:
+    keep C tile accumulators
+    stream K panels of A and packed W
+\end{lstlisting}
+
+第一种像上一章的 matvec：每个输出行顺序扫描权重，简单、可验证，但每次只产生一个输出。第二种把 \code{A[b,k]} 复用到多个 \code{out}，但如果 \code{W[out,k]} 在原始行主序中跨步很大，内层访问会变差。第三种把问题切成 tile：一次只处理 \code{BM} 个样本和 \code{BN} 个输出通道，用多个 accumulator 保存一个 \code{C} 小块，沿 \code{K} 扫描输入和权重面板。
+
+这就是为什么 GEMM 教材经常出现 \code{BM}、\code{BN}、\code{BK}。它们不是玄学参数，而是三个工作集边界：
+
+\begin{itemize}
+  \item \code{BM}：一次处理多少输入行，影响输入 panel 和输出 tile。
+  \item \code{BN}：一次处理多少输出列，影响 accumulator 数量和权重 panel。
+  \item \code{BK}：一次沿归约维度推进多少元素，影响 packing 块和 cache 复用。
+\end{itemize}
+
+\section{Packing 的本质：把坏地址流变成后端友好的地址流}
+
+\term{packing}{预打包} 指把原始张量中的一块数据复制成内核更喜欢的布局。它不是为了让模型文件好看，而是为了让热循环简单。以权重为例，原始行主序 \code{W[out,k]} 对单个输出行很好；但一个微内核若想同时算 \code{BN} 个输出，内层可能需要在同一个 \code{k} 下读多条输出行的权重。原始布局给出的地址是：
+
+\begin{lstlisting}[numbers=none,caption={原始权重在同一个 k 下访问多个 out}]
+W[out0, k] = base + (out0 * K + k)
+W[out1, k] = base + (out1 * K + k)
+W[out2, k] = base + (out2 * K + k)
+
+distance between neighboring out values: K elements
+\end{lstlisting}
+
+若把一个 \code{BN x BK} 的权重块打包成 \code{k-major}，内核看到的就可以是：
+
+\begin{lstlisting}[numbers=none,caption={packed weight panel 的一种形状}]
+for k in 0..BK:
+  packed[k, 0] = W[out0, k]
+  packed[k, 1] = W[out1, k]
+  packed[k, 2] = W[out2, k]
+  ...
+
+inner kernel reads packed[k, 0..BN)
+\end{lstlisting}
+
+这样做付出了一次复制、额外内存和格式管理成本，换来内层循环的连续读取、更少地址计算和更稳定的 SIMD lane。是否值得 packing，取决于这块权重会被复用多少次。7B 模型权重会在每个 token、每一层反复使用，所以在加载阶段或首次运行阶段打包常常合理；但不同后端喜欢的 packed layout 不一定相同。CPU 后端关心 cache panel、SIMD lane 和预取；GPU 后端关心 coalesced load、shared memory tile、tensor core 数据格式和显存对齐。runtime 因此不能把唯一一种 CPU packed layout 写死成模型格式。
+
+\begin{systemdiagram}{packing 把原始布局改造成内核布局}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.35cm] (orig) at (0,1.0) {原始权重\\row-major W[out,k]};
+  \node[book teal node,text width=2.3cm] (panel) at (3.05,1.0) {选择 panel\\BN x BK};
+  \node[book purple node,text width=2.35cm] (pack) at (6.1,1.0) {packed panel\\k-major lanes};
+  \node[book amber node,text width=2.35cm] (kernel) at (9.15,1.0) {micro-kernel\\连续 load};
+
+  \draw[book strong arrow] (orig) -- (panel);
+  \draw[book strong arrow] (panel) -- (pack);
+  \draw[book strong arrow] (pack) -- (kernel);
+
+  \node[book red node,text width=2.35cm] (cost) at (3.05,-1.05) {成本\\复制 + 内存};
+  \node[book navy node,text width=2.35cm] (gain) at (6.1,-1.05) {收益\\少跨步/少地址};
+  \node[book teal node,text width=2.35cm] (reuse) at (9.15,-1.05) {成立条件\\重复使用足够多};
+
+  \draw[book weak arrow] (panel) -- (cost);
+  \draw[book weak arrow] (pack) -- (gain);
+  \draw[book weak arrow] (kernel) -- (reuse);
+
+  \node[book label,text width=10.2cm] at (4.6,-2.25) {packing 不是数学变换，而是把原始地址图复制成微内核更容易连续读取的地址图。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：packing 的价值来自热循环地址流改善，必须和复用次数一起判断。}
+\end{systemdiagram}
+
+\section{SIMD 需要多条独立账本配合}
+
+\term{SIMD}{单指令多数据} 可以理解为一条指令同时处理多个 lane。例如一个 float32 向量寄存器可以装多个相邻浮点数，FMA 指令可以对多个 lane 同时做乘加。但 SIMD 对地址流有要求：连续 load 最容易，固定可预测步长次之，随机 gather 或指针追踪通常更难。
+
+在 GEMM 微内核里，SIMD 常见两种方向。第一种是沿 \code{K} 维度装载多个相邻元素，做向量乘加，最后水平归约到一个输出。第二种是同时维护多个输出通道，让一个输入标量广播到多个 lane，与 packed 权重 lane 相乘，更新多个 accumulator。哪种方向更好，取决于 ISA、寄存器数量、数据类型、矩阵尺寸和权重布局。
+
+\begin{lstlisting}[numbers=none,caption={一个抽象 micro-kernel 账本}]
+for k in 0..BK:
+  a0 = load A[b0, k]
+  a1 = load A[b1, k]
+  wv = load packed_W[k, out0..outN]
+  acc0[0..N] += broadcast(a0) * wv
+  acc1[0..N] += broadcast(a1) * wv
+
+store C[b0, out0..outN]
+store C[b1, out0..outN]
+\end{lstlisting}
+
+这段账本看起来已经像高性能内核，但仍然不能脱离前两册的方法。要问：\code{packed_W} 是否真的连续；\code{A[b,k]} 是否能留在 cache；accumulator 数量是否超过寄存器预算；输出 store 是否连续；尾部 \code{N} 不能整除 SIMD 宽度时怎样处理；反汇编是否真的生成了向量 load、广播和 FMA，而不是退回标量循环。
+
+\section{从标量 reference 到 micro-kernel 的切分路线}
+
+真正写后端时，不应该一上来就写最大化的 SIMD intrinsic。更稳的路线是把同一个 linear 语义切成四个阶段，每个阶段都能被 oracle 验证。
+
+\begin{lstlisting}[numbers=none,caption={linear 内核的四阶段演进}]
+stage 0: scalar reference
+  one output channel at a time
+  easiest to audit, slowest
+
+stage 1: scalar tiled
+  compute a small C[BM, BN] tile
+  prove tile boundary and tail are correct
+
+stage 2: packed weight
+  keep scalar arithmetic
+  prove packed descriptor maps to the same weights
+
+stage 3: SIMD micro-kernel
+  replace inner loop with vector loads/FMA/dot
+  keep the same descriptor and oracle cases
+\end{lstlisting}
+
+这个顺序有一个好处：当 stage 3 出错时，问题范围很小。若 stage 2 已经证明 packed descriptor 的字节解释正确，stage 3 的错误就更可能来自 SIMD lane 顺序、accumulator、尾部 mask 或 dtype 转换，而不是模型导入或 shape verifier。
+
+以 \code{BM=2}、\code{BN=4} 的小 tile 为例，标量 tiled 版本可以先写成：
+
+\begin{lstlisting}[numbers=none,caption={标量 tiled GEMM 的参考形态}]
+for b in 0..B step 2:
+  for out in 0..O step 4:
+    acc[2][4] = 0
+    for k in 0..K:
+      for bi in 0..1:
+        for oi in 0..3:
+          acc[bi][oi] += A[b + bi, k] * W[out + oi, k]
+    store acc into C[b..b+1, out..out+3]
+\end{lstlisting}
+
+这段代码不快，但它已经有了微内核的形状：\code{acc[2][4]} 是寄存器账本的影子，\code{b/out/k} 是 tile 循环骨架，尾块可以独立测。后续把 \code{W[out+oi,k]} 换成 packed 地址，把 \code{oi} 方向换成 SIMD lane，就不会改变上层语义。
+
+一个 micro-kernel 的 descriptor 至少要把这些事实写清：
+
+\begin{lstlisting}[numbers=none,caption={micro-kernel descriptor 的最小字段}]
+MicroKernelDesc:
+  bm
+  bn
+  bk
+  input_dtype
+  weight_dtype
+  accumulator_dtype
+  output_dtype
+  weight_packed_layout
+  required_alignment
+  tail_policy
+  supported_isa
+\end{lstlisting}
+
+这让内核选择变成编译器问题，而不是一堆 \code{if cpu has avx} 散落在调用点。typed graph 给出 shape 和 dtype，backend capability 给出 ISA 和支持格式，lowering 选择 descriptor，oracle 用同一 descriptor 解释 packed bytes。
+
+\begin{rubricbox}
+一个 linear micro-kernel 进入主线前，至少要通过四组测试：整齐尺寸、\code{K} 维尾部、\code{O} 维尾部、非默认 stride。若是量化权重，还要额外覆盖 group 边界和 scale 尾组。
+\end{rubricbox}
+
+\section{尾块、对齐和小尺寸陷阱}
+
+工业 GEMM 内核会花大量代码处理边界。教材如果只展示整齐尺寸，会让读者误以为优化就是把主循环写出来。实际推理中，隐藏层大小、输出类别数、batch size 和量化 block 不一定刚好整除 tile。
+
+\topic{尾块不是异常路径。} 若 \code{N} 不能整除 \code{BN}，最后一个输出 tile 是窄 tile；若 \code{B} 不能整除 \code{BM}，最后一个 batch tile 是矮 tile；若 \code{K} 不能整除向量宽度，归约尾部需要标量补齐、mask load 或专门小内核。尾块很常见，不能只靠“输入尺寸都规整”逃避。
+
+\topic{对齐是性能条件，不是语义条件。} 非对齐 load 通常仍然能得到正确结果，但可能跨 cache line 或页，成本更高。packing 阶段可以选择对齐缓冲，减少内核里处理复杂地址的机会。报告中要写清：对齐要求是硬性合同，还是只是 fast path 条件；不满足时是复制、降级还是报错。
+
+\topic{小矩阵可能被 packing 成本吞掉。} 一个只有几行几列的小层，打包和调度的固定成本可能大于内核收益。第三册后续讲推理图和运行时时会反复遇到这个问题：大算子适合重内核，小算子更需要融合、批处理或减少中间内存流。
+
+\section{prefill、decode 与后端合同}
+
+把 GEMM 放回 7B 推理引擎后，性能不能只写一个“矩阵乘耗时”。同一个权重矩阵在 prefill 和 decode 中的形状不同：
+
+\begin{lstlisting}[numbers=none,caption={同一层在 prefill 和 decode 中的矩阵形态}]
+prefill:
+  A = tokens x hidden
+  W = out x hidden
+  C = tokens x out
+  weight reuse across many token rows
+
+decode:
+  A = 1 x hidden
+  W = out x hidden
+  C = 1 x out
+  weight stream dominates, KV cache also grows
+\end{lstlisting}
+
+CPU 后端通常先把 decode 的单 token latency 做稳，再逐步优化 prefill 吞吐：标量 reference、普通线程切分、SIMD micro-kernel、packed weight、NUMA-aware weight placement、算子融合、量化内核。GPU 后端则更依赖批量和 tile：prefill 往往容易吃到大 GEMM 吞吐，decode 若 batch 太小就可能被 kernel launch、内存访问和 KV cache 读写限制。真实 runtime 要把这些差异放到 backend contract，而不是让上层 graph 直接知道每个后端的细节。
+
+\begin{lstlisting}[numbers=none,caption={GEMM 后端合同的最小字段}]
+op: linear
+input:  dtype, shape, layout, device
+weight: dtype, shape, packed_layout, scale_policy
+output: dtype, shape, layout, device
+mode: prefill or decode
+backend: cpu_scalar, cpu_simd, cpu_threaded, gpu
+evidence: latency, tokens_per_second, error_report
+\end{lstlisting}
+
+这份合同让第三册后续能一步一步把性能提高，而不是一次跳到“对标成熟框架”。每次优化都必须说明它改变了哪一栏：是 dtype 从 fp32 变成 int8，还是 packed layout 变了；是 mode 只覆盖 prefill，还是 decode 也受益；是 CPU 后端新增 SIMD path，还是 GPU 后端新增 kernel；是降低了 latency，还是提高了 batch 吞吐。
+
+\section{把现有 lab 放进这条路线}
+
+当前 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/} 里的 \code{linear_i8} 是一个故意朴素的内核。它按输出行遍历 int8 权重，把每个权重乘以 scale 后与 float 输入相乘，并把结果累加到 float：
+
+\begin{lstlisting}[numbers=none,caption={当前 lab 的线性层机器账本}]
+for out in output_size:
+  acc = bias[out]
+  row_base = out * input_size
+  for in in input_size:
+    weight_i8 = weights[row_base + in]
+    acc += float(weight_i8) * layer.scale * input[in]
+  output[out] = acc
+\end{lstlisting}
+
+这段代码适合作为 reference 风格的本地推理入口，因为它的语义清楚，测试能手工验证。但它只是第一阶段切片，不是第三册最终引擎。它没有 token tile，没有 packed weight panel，没有 int32 accumulator，没有 requantize，也没有 CPU/GPU 后端选择。下一章会专门讲 int8 的真实量化账本：为什么当前 lab 选择了“int8 权重 + float 输入 + float 累加”的简化路径，以及 7B 推理引擎需要怎样扩展到 per-channel/per-group quantization、packed weights、KV cache 量化和后端共享的误差报告。
+
+\section{本章验收线}
+
+读完本章，应该能把“GEMM 很快”拆成下面几条可检查事实：
+
+\begin{itemize}
+  \item 说明 batch 怎样改变 input、weight 和 output 的复用账本。
+  \item 写出 \code{BM}、\code{BN}、\code{BK} 分别约束哪一块工作集。
+  \item 解释 packing 改善的是哪条地址流，以及它为什么需要足够复用才能抵消复制成本。
+  \item 区分 SIMD lane、accumulator 寄存器、连续 load、广播和尾块处理。
+  \item 说明同一个 projection 在 prefill 中为什么更像 GEMM，在 decode 中为什么更像 GEMV 或小 GEMM。
+  \item 能把当前 lab 的 \code{linear_i8} 定位成清晰 reference/教学内核，而不是最终 7B 推理引擎的 GEMM 微内核。
+\end{itemize}
+
+下一章沿着同一个 \code{linear_i8} 继续推进，但落点会放大到 7B 模型：权重为什么能用 int8 或 int4 保存，scale 怎样进入计算，accumulator 为什么要更宽，重新量化到底在做什么，KV cache 能不能量化，oracle 又应该怎样判定误差。

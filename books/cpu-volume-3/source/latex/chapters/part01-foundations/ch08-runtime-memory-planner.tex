@@ -1,0 +1,452 @@
+\chapter{推理运行时与内存规划：typed graph 如何服务一次真实请求}
+
+\section{先从一个会抖动的请求开始}
+
+第 6 章把 AI 编译器讲成从推理图到 executable plan 的流水线，第 7 章把模型导入、manifest 和 verifier 固定下来。现在看计划真正落到一次请求时会遇到什么问题。假设用户输入 512 个 token 的 prompt，希望继续生成 128 个 token，本地引擎已经通过 verifier，权重也能被 kernel 读取。一个最朴素的 runtime 可能这样写：
+
+\begin{lstlisting}[numbers=none,caption={朴素 runtime 的热路径}]
+tokens = tokenizer.encode(prompt)
+
+for op in graph:
+  input_tensors = lookup_inputs(op)
+  output_tensor = allocate(op.output_shape, op.output_dtype)
+  run_kernel(op, input_tensors, output_tensor)
+
+for step in 0..max_new_tokens:
+  for op in graph:
+    input_tensors = lookup_inputs(op)
+    output_tensor = allocate(op.output_shape, op.output_dtype)
+    run_kernel(op, input_tensors, output_tensor)
+  next_token = sample(logits)
+\end{lstlisting}
+
+这段代码很容易在小模型上“跑通”，也很容易在 7B 级模型上暴露几个实际问题。第一，每个算子动态分配输出，会把 allocator、缺页、清零和碎片化放进热路径；decode 每生成一个 token 都重复这些成本，尾延迟会抖。第二，每次遍历 graph 时还在解释 op、查 dtype、查 layout、判断 shape，分支和间接调用压进最热循环。第三，所有 activation 都当作独立对象存活，内存峰值会被中间张量堆起来。第四，KV cache 是跨 token 状态，却被朴素代码混在普通临时张量里，容易出现覆盖、重复分配或错误增长。
+
+真实推理运行时要做的不是“按图执行一遍”，而是把第 6、7 章的 typed graph、shape 合同、layout 合同和后端计划绑定到一个 session 状态上。编译期已经能决定的事情，不能留到每个 token 再判断；每个 token 才知道的事情，也不能假装编译期已经固定。
+
+\begin{keyidea}
+推理运行时的核心任务，是把编译器产出的 executable plan 绑定到一次会增长、会采样、会持有 KV cache 的真实请求。内存规划不是运行时小优化，而是让计划稳定执行的前提。
+\end{keyidea}
+
+\section{runtime state：请求不是一串独立 kernel}
+
+一次本地对话请求至少包含下面这些运行期状态：
+
+\begin{itemize}
+  \item session：模型实例、后端实例、编译计划、线程池、设备句柄和错误报告上下文。
+  \item token buffer：prompt token、已生成 token、当前位置、最大上下文和 stop 条件。
+  \item KV cache：每层已经写入的 K/V、当前可读长度、容量、布局和可能的 page table。
+  \item activation arena：prefill 或 decode 当前阶段可复用的临时张量区域。
+  \item workspace：某些后端 kernel 需要的临时区，例如 attention scratch、GEMM packing scratch 或 GPU workspace。
+  \item sampler state：temperature、top-k、top-p、seed、重复惩罚和 logits 后处理状态。
+  \item profiler/oracle：记录事件、内存峰值、kernel 耗时和可选 reference 对比。
+\end{itemize}
+
+这些状态不属于同一种生命周期。权重从模型加载活到模型卸载；packed weight 从后端准备完成活到后端销毁；activation arena 通常只活在一个 plan invocation 内；KV cache 活在整个 session 内，并且随 token 增长；sampler state 随生成循环推进；profiler 事件则是运行期证据。把它们全部塞进一个“tensor map”会让内存所有权模糊，后续优化也没有安全边界。
+
+\begin{lstlisting}[numbers=none,caption={推理 runtime 的核心对象关系}]
+Engine
+  ModelManifest
+  TypedGraph
+  ExecutablePlans
+  BackendContext
+
+Session
+  TokenBuffer
+  KVCache
+  ActivationArena
+  WorkspacePool
+  SamplerState
+  ProfilerTrace
+\end{lstlisting}
+
+注意这里的分层。Engine 持有模型级事实和编译计划，多个 session 可以共享它；Session 持有请求级状态，不能被另一个请求随意复用。CPU 后端的 packed weight、线程池和 NUMA 放置属于 Engine/BackendContext；某个用户这次对话的 KV cache 和 token buffer 属于 Session。这个边界一旦错了，多请求并发时会出现更隐蔽的问题：一个 session 覆盖另一个 session 的 cache，或者一个用户的 profiler/oracle 开关拖慢所有用户的热路径。
+
+\section{内存分类：先分清谁能复用}
+
+内存 planner 的第一步不是写分配器，而是给所有数据分类。下面这张表比“都叫 tensor”更接近真实运行时：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.23\linewidth}p{0.26\linewidth}p{0.22\linewidth}}
+\toprule
+类别 & 生命周期 & 典型位置 & 复用规则 \\
+\midrule
+原始权重 & 模型加载到卸载 & mmap 文件或主内存 & 只读，不能当 scratch \\
+packed weight & 后端准备到卸载 & CPU 对齐内存或 GPU 显存 & 后端私有布局，按 kernel 合同读取 \\
+activation & 一段执行计划内部 & arena 或 device buffer & last use 后可复用 \\
+workspace & 单个 kernel 或 segment 内部 & workspace pool & 按算法临时借用，调用后归还 \\
+KV cache & session 生命周期 & 主内存、显存或分层缓存 & 追加写入，历史可读，不能被普通 arena 覆盖 \\
+logits & 每步采样前后 & 小 buffer 或 device-to-host staging & 可能需要保留 top-k 或完整分布 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表背后是编译器理论里的 liveness analysis。一个 activation 的定义点是某个算子的输出，最后一次使用点是最后一个消费者；最后一次使用之后，它占用的内存槽可以给别的 activation。原始权重和 KV cache 不满足这个条件：权重会被每层、每步反复读取；KV cache 的旧 position 虽然不会再被写入，却会在后续 attention 中反复读取。因此它们不能进入普通 activation arena。
+
+\begin{systemdiagram}{推理内存的生命周期分类}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book row label] at (-0.35,3.15) {模型级};
+  \node[book accent node,text width=2.25cm] (w0) at (1.25,3.15) {原始权重\\mmap/load};
+  \node[book teal node,text width=2.25cm] (w1) at (4.05,3.15) {packed\\weight};
+  \node[book label,text width=2.4cm] at (7.05,3.15) {只读或后端私有\\跨请求共享};
+
+  \node[book row label] at (-0.35,1.75) {请求级};
+  \node[book purple node,text width=2.25cm] (kv) at (1.25,1.75) {KV cache\\跨 token};
+  \node[book amber node,text width=2.25cm] (tok) at (4.05,1.75) {token/sampler\\状态};
+  \node[book label,text width=2.4cm] at (7.05,1.75) {随 session 增长\\不能互相覆盖};
+
+  \node[book row label] at (-0.35,0.35) {计划级};
+  \node[book navy node,text width=2.25cm] (arena) at (1.25,0.35) {activation\\arena};
+  \node[book red node,text width=2.25cm] (ws) at (4.05,0.35) {workspace\\scratch};
+  \node[book label,text width=2.4cm] at (7.05,0.35) {按 last use\\和 kernel 调用复用};
+
+  \draw[book strong arrow] (w0) -- (w1);
+  \draw[book weak arrow] (kv) -- (tok);
+  \draw[book weak arrow] (arena) -- (ws);
+
+  \draw[book boundary] (-0.05,2.55) rectangle (5.45,3.75);
+  \draw[book boundary] (-0.05,1.15) rectangle (5.45,2.35);
+  \draw[book boundary] (-0.05,-0.25) rectangle (5.45,0.95);
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：推理内存不能按“都是张量”统一处理，模型级、请求级和计划级生命周期必须分开。}
+\end{systemdiagram}
+
+底层机器后果也直接来自这张分类。packed weight 需要对齐到 cache line、页或 GPU backend 要求的边界；activation arena 希望少量大块内存重复使用，减少 allocator 和 TLB 抖动；KV cache 希望读流连续，避免 decode attention 每步跨太多页面；workspace pool 要能处理不同算法的最大临时需求，而不是每次 kernel 调用分配释放。
+
+\section{activation arena：把生命周期分析落到地址}
+
+activation arena 的目标很明确：预先申请一块或少数几块大内存，让所有短生命周期 activation 在里面复用。它类似传统编译器里的寄存器分配和栈槽复用，只是单位从标量变量变成了大张量。
+
+planner 至少要知道每个中间值的这些字段：
+
+\begin{lstlisting}[numbers=none,caption={arena planner 使用的 value descriptor}]
+ValueDesc:
+  id
+  shape
+  dtype
+  layout
+  byte_size
+  alignment
+  defined_at
+  last_used_at
+  materialization_required
+  backend_location
+\end{lstlisting}
+
+\code{defined_at} 和 \code{last_used_at} 来自 typed graph 或 lowered plan 的拓扑顺序。若一个值被 residual 分支、oracle dump 或多个后续算子消费，它的 \code{last_used_at} 必须延长。若某个 debug 模式要求保存层输出用于 reference 比较，\code{materialization_required} 会阻止 planner 提前覆盖它。若某个值在 GPU device 上，不能被 CPU arena 的地址复用。
+
+一个简化的 arena planner 可以用线性扫描实现：
+
+\begin{lstlisting}[numbers=none,caption={线性扫描式 activation arena 规划}]
+events = values sorted by defined_at
+free_list = []
+active = []
+
+for v in events:
+  expire all active values with last_used_at < v.defined_at
+  if v is stateful or materialization escapes plan:
+    allocate dedicated storage or mark external
+    continue
+  block = find_free_block(free_list, v.byte_size, v.alignment)
+  if no block:
+    block = grow_arena(v.byte_size, v.alignment)
+  assign v.offset = block.offset
+  add v to active
+\end{lstlisting}
+
+工业实现会更复杂：要处理 in-place 更新、别名、跨 stream 同步、不同 device、best-fit/first-fit 策略、碎片回收和峰值优化。但教材先抓住主线：只要 typed graph 告诉我们每个值何时产生、何时最后使用，就可以把多个不重叠生命周期的 activation 放在同一段物理内存上。
+
+\topic{对齐不是语义细节。} CPU kernel 往往希望输入和输出至少按 32 或 64 字节对齐，便于向量 load/store 和 cache line 行为稳定。GPU 后端可能要求更大的 alignment 或特定 pitch。arena planner 若只按 byte size 紧密拼接，最后会把复杂的 unaligned 处理推给每个 kernel。
+
+\topic{清零不是免费操作。} 有些临时 buffer 不需要初始化，因为 kernel 会完整写入；有些 accumulator 或 mask buffer 必须清零。planner 应该把 zero-fill 作为 buffer 属性，而不是让每个算子默认 \code{memset}。否则一个看起来很小的 scratch 可能在长 prompt prefill 时变成可观带宽成本。
+
+\topic{debug/oracle 会改变生命周期。} 打开 oracle 对比时，某些中间结果需要物化并保留到 reference 比较之后。生产模式下能复用的 arena slot，在验证模式下可能不能复用。这不是“debug 模式慢一点”这么简单，而是 planner 必须显式支持不同 materialization policy。
+
+\begin{warningbox}
+不要让 kernel 自己偷偷缓存输入指针。arena planner 会复用地址，如果某个异步 kernel 或 debug hook 在生命周期结束后仍持有旧指针，就会读到另一个张量的数据。异步后端必须把 stream/event 同步也纳入生命周期边界。
+\end{warningbox}
+
+\section{一个小图的 liveness 手算例子}
+
+内存规划不是抽象名词。看一个最小 residual block：
+
+\begin{lstlisting}[numbers=none,caption={最小 residual block 的值流}]
+v0 = input_hidden
+v1 = rmsnorm(v0)
+v2 = linear_qkv(v1)
+v3 = attention(v2, kv_cache)
+v4 = linear_wo(v3)
+v5 = add(v0, v4)
+v6 = rmsnorm(v5)
+v7 = mlp(v6)
+v8 = add(v5, v7)
+\end{lstlisting}
+
+若只看最后输出，\code{v1/v2/v3/v4/v6/v7} 都是短生命周期 activation；\code{v0} 必须活到第一次 residual；\code{v5} 必须活到第二次 residual；\code{kv_cache} 是外部状态，不进入 arena。可以把生命周期写成：
+
+\begin{center}
+\begin{tabular}{p{0.14\linewidth}p{0.16\linewidth}p{0.18\linewidth}p{0.36\linewidth}}
+\toprule
+值 & 定义点 & 最后使用 & 规划含义 \\
+\midrule
+\code{v0} & 输入 & \code{add(v0,v4)} & 不能在 attention 前覆盖 \\
+\code{v1} & RMSNorm & \code{linear\_qkv} & QKV 后可复用 \\
+\code{v2} & QKV & \code{attention} & attention 后可复用 \\
+\code{v3} & attention & \code{linear\_wo} & Wo 后可复用 \\
+\code{v5} & residual & \code{add(v5,v7)} & MLP 期间必须保留 \\
+\code{v7} & MLP & \code{add(v5,v7)} & 输出后可复用 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+于是 planner 可以让 \code{v1} 和 \code{v3} 复用同一块 arena，让 \code{v2} 和 \code{v6} 复用另一块，只要它们的 shape/alignment 兼容。这个手算例子也解释了为什么 oracle/debug 会改变峰值内存：若要求保存 \code{v2} 的 Q/K/V 检查点，它的 last use 就不再是 attention，而是 oracle compare。
+
+\begin{lstlisting}[numbers=none,caption={debug policy 对生命周期的影响}]
+production:
+  v2 last_use = attention
+
+oracle mode:
+  v2 last_use = compare_checkpoint_after_layer
+  materialization_required = true
+\end{lstlisting}
+
+所以运行时不能把“打开 oracle”当成单纯多打印日志。它会改变 materialization policy、arena 峰值和调度同步点。
+
+\section{packed weight：把文件布局变成内核布局}
+
+权重是只读的，但这不代表它可以直接以文件布局进入热路径。模型文件常按通用格式存储：张量名、shape、dtype、连续字节。高性能 kernel 需要的却是物理布局：按 tile 重排、按 SIMD 宽度分组、把 scale 和 weight 放在合适距离、补齐尾部、甚至为不同后端生成不同 packed format。
+
+\begin{lstlisting}[numbers=none,caption={从 manifest 到 packed weight 的准备过程}]
+for each linear weight tensor:
+  verify logical shape and quantization metadata
+  choose backend packing format
+  allocate aligned packed buffer
+  reorder or decode metadata into kernel-friendly panels
+  record mapping: logical tensor -> packed descriptor
+  keep checksum and source offset for diagnostics
+\end{lstlisting}
+
+packed descriptor 不是简单指针。它至少要告诉 kernel：每个 panel 的行列范围、stride、group scale 位置、tail padding、原始 dtype、计算 dtype、对齐和是否允许并行读取。对 int4/group quant 权重来说，scale 与 packed nibble 的关系尤其关键：如果 packing 只重排了 4-bit 数据，却没有同步重排 scale，kernel 会用错量化比例，输出仍然可能看起来“数值正常”。
+
+这一步和传统编译器的后端 lowering 很像。高层 IR 中的 \code{linear(h, Wq)} 是语义；packed weight 是目标机器上的物理表示。语义值相同，不代表物理布局相同。CPU AVX2、AVX-512、ARM NEON 和 GPU tensor core 可能需要完全不同的 packed descriptor；runtime 选择 plan 时必须同时选择对应的 packed weight。
+
+\section{KV cache planner：跨 token 状态不能当 scratch}
+
+KV cache 是 decoder-only 推理的核心状态。prefill 会批量写入 prompt 中所有 position 的 K/V；decode 每步追加一个 position，并让 attention 读取从开头到当前位置的历史 K/V。它的生命周期跨越整个 session，不能像 activation 一样在 last use 后复用，因为“last use”会随着未来 token 增长而不断后移。
+
+\begin{lstlisting}[numbers=none,caption={KV cache 的逻辑合同}]
+append(layer, batch, kv_head, position, k_vector, v_vector)
+read(layer, batch, kv_head, range[0..position])
+
+invariants:
+  position is monotonically increasing inside one session
+  every readable position has been written exactly once
+  layout maps logical (layer, head, position, dim) deterministically
+  cache capacity is checked before write
+\end{lstlisting}
+
+planner 需要先回答容量问题。若直接按最大上下文一次性分配，地址简单，性能稳定，但峰值内存高。若按 page 或 block 增长，短对话更省内存，但 attention kernel 要通过 page table 读取，读流可能变碎。若使用 sliding window 或 KV eviction，必须把语义写进模型合同：并不是所有模型都允许丢弃远处 token；即使允许，position encoding 和 attention mask 也要同步处理。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.28\linewidth}p{0.34\linewidth}}
+\toprule
+策略 & 优点 & 风险 \\
+\midrule
+固定最大容量 & 地址简单，kernel 容易优化 & 空间峰值高，短请求浪费大 \\
+按 block/page 增长 & 多请求场景更省内存 & page table、碎片和跨页读取增加复杂度 \\
+滑动窗口 & 长对话空间可控 & 改变可见上下文，必须匹配模型语义 \\
+KV 量化 & 降低 cache 带宽和容量 & attention 精度、scale 存储和反量化成本要验证 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+KV cache 的物理 layout 要围绕后端访问方式设计。CPU decode 常常让一个线程或一组线程处理部分 head/output 行，连续读取某个 head 的历史 position；此时 \code{position} 和 \code{head_dim} 的局部连续性很重要。GPU kernel 可能按 block/warp 分摊 position 或 head，需要 coalesced load。两者可以使用不同物理 layout，但必须由同一个 logical descriptor 描述，不能让业务层知道后端私有排列。
+
+\begin{systemdiagram}{prefill/decode 与 KV cache 的状态迁移}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.25cm] (tok) at (0,2.65) {tokens\\T prompt};
+  \node[book teal node,text width=2.25cm] (prefill) at (3.0,2.65) {prefill plan\\批量算层};
+  \node[book purple node,text width=2.25cm] (cache1) at (6.0,2.65) {KV cache\\写 0..T-1};
+  \node[book amber node,text width=2.25cm] (logits) at (9.0,2.65) {last logits\\采样入口};
+
+  \node[book navy node,text width=2.25cm] (one) at (0,0.8) {sampled token\\T};
+  \node[book teal node,text width=2.25cm] (decode) at (3.0,0.8) {decode plan\\单 token};
+  \node[book purple node,text width=2.25cm] (cache2) at (6.0,0.8) {KV cache\\追加 T};
+  \node[book amber node,text width=2.25cm] (next) at (9.0,0.8) {next logits\\继续循环};
+
+  \draw[book strong arrow] (tok) -- (prefill);
+  \draw[book strong arrow] (prefill) -- (cache1);
+  \draw[book strong arrow] (cache1) -- (logits);
+  \draw[book strong arrow] (one) -- (decode);
+  \draw[book strong arrow] (decode) -- (cache2);
+  \draw[book strong arrow] (cache2) -- (next);
+  \draw[book weak arrow] (cache1.south) -- (cache2.north);
+
+  \node[book label,text width=9.3cm] at (4.5,-0.55) {last logits 经 sampler 产生下一行的 decode 输入；prefill 写入的历史在 decode 阶段继续可读，decode 每步再追加一个位置。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：prefill 和 decode 不是同一形状下的两次执行，而是围绕 KV cache 读写合同形成的两个计划。}
+\end{systemdiagram}
+
+\section{paged KV allocator：不是 vector push back}
+
+固定最大 KV cache 简单，但并发请求一多就浪费。paged KV cache 把每个 session 的上下文切成固定 token 数的 block，例如每 page 存 \code{16} 或 \code{32} 个 token 的所有层/head K/V。allocator 管理空闲 page，session 的 page table 把逻辑 block 映射到物理 page。
+
+\begin{lstlisting}[numbers=none,caption={paged KV allocator 的状态}]
+KvPage:
+  page_id
+  capacity_tokens
+  owner_session
+  logical_block
+  epoch
+  written_mask
+  k_bytes
+  v_bytes
+  scale_bytes_optional
+
+SessionPageTable:
+  logical_block -> page_id
+  base_position
+  window_size_optional
+\end{lstlisting}
+
+append 不能只是 \code{push_back}。它要先计算逻辑 block 和 block 内 offset，缺 page 时向 allocator 申请，写入 K/V 和 scale metadata，然后标记 written。读取时必须检查 page 属主、epoch 和 written bit，否则回收后的旧 page 会被当成当前上下文读取。
+
+\begin{lstlisting}[numbers=none,caption={paged KV append/read 的核心检查}]
+append(position, k, v):
+  block = position / page_tokens
+  offset = position % page_tokens
+  page = page_table.get_or_allocate(block)
+  require page.owner_session == session_id
+  require page.epoch == expected_epoch(block)
+  store k/v/scale at offset
+  page.written_mask.set(offset)
+
+read(position):
+  block = position / page_tokens
+  offset = position % page_tokens
+  page = page_table.lookup(block)
+  require page.written_mask.test(offset)
+  return K/V view at offset
+\end{lstlisting}
+
+这套检查在 debug/oracle 模式必须严格执行；生产模式可以把部分检查移到 page 分配边界，但不能取消语义。否则一旦出现 sliding window 回绕、请求取消、page 复用或 prefix cache 共享，错误会表现成“长上下文偶发漂移”，极难定位。
+
+\section{prefill 和 decode：两套计划，两套指标}
+
+prefill 和 decode 的差异不是参数不同，而是计算形态不同。prefill 输入多个 prompt token，Q/K/V projection 和 MLP 更像 GEMM，attention 要处理较大的 token 块；decode 通常一次只处理一个新 token，线性层更像 GEMV 或 small-batch GEMM，attention 主要压力变成读取越来越长的 KV cache。一个 plan 若试图同时覆盖两者，通常会在其中一个阶段浪费机器资源。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+\toprule
+维度 & prefill & decode \\
+\midrule
+输入形状 & 多 token prompt & 通常 1 个新 token \\
+主要矩阵形态 & GEMM / batched GEMM & GEMV / small-batch GEMM \\
+attention 压力 & 块内计算和写 cache & 读历史 KV，随 context 增长 \\
+关键指标 & time to first token、prompt 吞吐 & tokens/s、单 token latency、尾延迟 \\
+内存行为 & activation 大，arena 峰值高 & activation 小，KV cache 带宽关键 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+runtime scheduler 需要把请求分成两个阶段，并在每个阶段选择对应 executable plan：
+
+\begin{lstlisting}[numbers=none,caption={prefill/decode 调度主循环}]
+plan_prefill = select_plan(stage=prefill, tokens=T, backend)
+bind(plan_prefill, session.kv_cache, session.arena)
+logits = run(plan_prefill, prompt_tokens)
+
+while not stop:
+  next_id = sample(logits, sampler_state)
+  session.tokens.append(next_id)
+  plan_decode = select_plan(stage=decode, context=session.position, backend)
+  bind(plan_decode, session.kv_cache, session.arena)
+  logits = run(plan_decode, next_id)
+\end{lstlisting}
+
+这里有两个容易忽略的细节。第一，\code{select_plan} 不应该在热路径里重新做 shape inference、fusion 和 packing；它只是在已经编译好的候选计划里选一个。第二，decode plan 可能按 context 长度分档，例如短上下文使用一个简单 kernel，长上下文使用分块 attention 或不同线程划分。分档选择要足够便宜，否则优化收益会被 dispatch 开销吃掉。
+
+\topic{单请求调度和多请求调度不同。} 教材前半部分可以先把一个 session 跑稳；服务端批量推理还要处理多个 session 的 prefill/decode 交错、batching、优先级、取消、超时和 backpressure。无论是否做连续批处理，底层不变量相同：每个 session 的 KV cache 和 token position 不能混，跨请求共享的只有模型级计划和权重。
+
+\topic{线程池不是越满越好。} CPU decode 的单 token latency 常被小 kernel、同步和内存带宽限制。盲目让每个小算子都抢满线程池，可能增加 barrier 和 cache 竞争。scheduler 应该知道哪些 segment 值得并行，哪些 segment 用单线程或少量线程更稳。
+
+\topic{GPU launch 也是成本。} GPU 对大 prefill 很有吸引力，但 decode 的单 token 阶段可能被 kernel launch、host-device 同步和 logits 取回成本影响。runtime 不能只看峰值 FLOPS，必须记录每个阶段的真实事件时间。
+
+\section{调度边界：segment 比单算子更适合热路径}
+
+如果 runtime 仍然按单算子逐个 dispatch，就算内存已经规划好，也会留下大量固定开销：查表、虚调用、线程池 barrier、设备同步和 profiler 事件过细。编译器可以把多个已经确定顺序和 buffer 绑定的节点合成 segment。segment 不是融合成一个 kernel，而是一个更粗的调度单元。
+
+\begin{lstlisting}[numbers=none,caption={executable plan 中的 segment 草图}]
+Segment layer_0_attention_prefill:
+  inputs: hidden, position, kv_cache
+  arena_bindings:
+    norm_out  -> arena + 0x000000
+    q_buffer  -> arena + 0x410000
+    k_buffer  -> arena + 0x820000
+    v_buffer  -> arena + 0xC30000
+  kernels:
+    rmsnorm_linear_qkv_fused
+    rope_and_kv_append
+    attention_prefill
+    linear_wo
+  sync:
+    none on CPU
+    stream event before host logits read on GPU
+\end{lstlisting}
+
+segment 的价值是把“计划已经决定”这件事落到数据结构里。runtime 执行 segment 时，不再解析 graph，也不重新分配 activation；它只绑定 session 中的外部状态，按预定 kernel 序列推进。profiler 也可以按 segment 汇总，再在需要时打开 kernel 级事件。这样既保留调试能力，又不让热路径永远停留在解释器形态。
+
+这和传统编译器里的基本块、trace 或机器指令调度有相似之处。单条 IR 指令适合分析，最终执行时却希望形成更稳定的机器代码或调度块。AI 推理计划也一样：Graph IR 适合表达语义，segment 适合表达运行期调度。
+
+\section{profiler 和 oracle：运行时要留下证据}
+
+没有 profiler，内存 planner 的改动很容易变成主观优化；没有 oracle，融合、量化和 layout 改动很容易悄悄改变 logits。运行时应该把证据作为一等输出，而不是出了问题才临时加日志。
+
+一个最低可用的 profiler 事件可以这样设计：
+
+\begin{lstlisting}[numbers=none,caption={推理 profiler 事件字段}]
+event:
+  session_id
+  stage: load | prefill | decode | sample
+  segment_id
+  layer
+  backend
+  start_time_ns
+  end_time_ns
+  input_tokens
+  context_length
+  arena_peak_bytes
+  workspace_bytes
+  kv_cache_bytes
+  kernel_name_optional
+\end{lstlisting}
+
+这些字段能回答几个关键问题：首 token 慢在 tokenizer、prefill 还是权重 packing；decode 慢在 linear、attention 还是 sampler；上下文变长后 attention 是否按预期变慢；arena 峰值是否符合 memory plan；某个后端切换是否真的改善了当前阶段。
+
+oracle 则回答正确性问题。生产模式不可能每步都跑 reference，但开发和回归测试应该支持可控开关：
+
+\begin{itemize}
+  \item 单算子 oracle：比较 RMSNorm、linear、RoPE、attention、MLP 的输出误差。
+  \item 层级 oracle：比较某一层输入/输出 hidden state，定位误差扩散起点。
+  \item logits oracle：比较 top-k、最大绝对误差、相对误差和采样前分布变化。
+  \item 序列 oracle：固定 seed 和 sampler 后，比较生成 token 序列是否满足合同。
+  \item 内存 oracle：检查 arena offset 是否重叠错误、KV position 是否越界、debug materialization 是否被提前覆盖。
+\end{itemize}
+
+oracle 不是简单打印浮点数。它要知道误差合同：fp32 reference 对 fp16/bf16/int8/int4 后端的容忍度不同；不同 reduction 顺序可能不 bitwise identical；量化 KV cache 会改变 attention 输出，需要单独设误差边界。把这些合同写进测试和报告，才能让优化有可追溯的安全线。
+
+\section{本章验收线}
+
+读完本章，应该能把 typed graph 到真实请求之间的运行时边界讲清楚：
+
+\begin{itemize}
+  \item runtime state 至少包含 session、token buffer、KV cache、activation arena、workspace、sampler 和 profiler/oracle。
+  \item 权重、packed weight、activation、workspace、KV cache 和 logits 的生命周期不同，不能放进同一种分配策略。
+  \item activation arena 依赖 liveness analysis、last use、alignment、materialization policy 和后端位置。
+  \item packed weight 是后端 lowering 的物理产物，必须保存 layout、scale、padding、对齐和诊断映射。
+  \item KV cache 是跨 token 状态，容量、layout、page/block、sliding window 和量化策略都必须受模型语义约束。
+  \item prefill 和 decode 应该使用不同 executable plan，并用不同指标评估：time to first token、prompt 吞吐、tokens/s 和尾延迟。
+  \item segment 把图解释开销移出热路径，profiler 和 oracle 则把性能与正确性证据留在运行时。
+\end{itemize}
+
+下一章继续进入具体执行阶段时，就可以用本章的账本判断每个优化是否站得住：它缩短的是哪段生命周期，减少的是哪条地址流，改变的是哪个后端 layout，profiler 应该看到什么，oracle 又必须保证什么。

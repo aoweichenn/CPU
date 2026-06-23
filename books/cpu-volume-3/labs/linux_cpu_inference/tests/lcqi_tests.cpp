@@ -1,5 +1,7 @@
 #include <lcqi/inference.hpp>
+#include <lcqi/int8_kernels.hpp>
 #include <lcqi/model.hpp>
+#include <lcqi/reference_decoder.hpp>
 
 #include <cmath>
 #include <cstdlib>
@@ -21,6 +23,11 @@ constexpr float LCQI_TEST_LOGIT_1 = 1.06F;
 constexpr float LCQI_TEST_HIDDEN_0 = 0.0F;
 constexpr float LCQI_TEST_HIDDEN_1 = 0.4F;
 constexpr float LCQI_TEST_HIDDEN_2 = 1.4F;
+constexpr float LCQI_RMS_EXPECTED_0 = 0.848528F;
+constexpr float LCQI_RMS_EXPECTED_1 = 0.565685F;
+constexpr float LCQI_ATTENTION_EXPECTED_0 = 2.0F;
+constexpr float LCQI_ATTENTION_EXPECTED_1 = 3.0F;
+constexpr float LCQI_KERNEL_MAX_DIFF = 1.0e-5F;
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -39,30 +46,105 @@ std::filesystem::path test_model_path() {
            "models" / "tiny_mlp_i8.txt";
 }
 
+void test_tiny_mlp() {
+    const lcqi::TinyMlpModel model = lcqi::load_model(test_model_path());
+    require(model.input_size == LCQI_TEST_INPUT_SIZE, "input size mismatch");
+    require(model.hidden_size == LCQI_TEST_HIDDEN_SIZE, "hidden size mismatch");
+    require(model.output_size == LCQI_TEST_OUTPUT_SIZE, "output size mismatch");
+
+    const std::vector<float> input{1.0F, 2.0F, -1.0F, 0.5F};
+    const lcqi::InferenceResult result = lcqi::run_inference(model, input);
+
+    require(result.predicted_class == LCQI_TEST_PREDICTED_CLASS, "unexpected predicted class");
+    require(result.logits.size() == static_cast<std::size_t>(LCQI_TEST_OUTPUT_SIZE),
+            "unexpected logits size");
+    require_close(result.logits[0], LCQI_TEST_LOGIT_0, "logit 0 mismatch");
+    require_close(result.logits[1], LCQI_TEST_LOGIT_1, "logit 1 mismatch");
+
+    std::vector<float> hidden(static_cast<std::size_t>(LCQI_TEST_HIDDEN_SIZE), 0.0F);
+    lcqi::linear_i8(model.hidden, input, hidden);
+    lcqi::relu_inplace(hidden);
+    require_close(hidden[0], LCQI_TEST_HIDDEN_0, "hidden 0 mismatch");
+    require_close(hidden[1], LCQI_TEST_HIDDEN_1, "hidden 1 mismatch");
+    require_close(hidden[2], LCQI_TEST_HIDDEN_2, "hidden 2 mismatch");
+}
+
+void test_reference_rms_norm() {
+    const std::vector<float> input{3.0F, 4.0F};
+    const std::vector<float> weight{1.0F, 0.5F};
+    std::vector<float> output(2, 0.0F);
+    lcqi::rms_norm(input, weight, 0.0F, output);
+    require_close(output[0], LCQI_RMS_EXPECTED_0, "RMSNorm output 0 mismatch");
+    require_close(output[1], LCQI_RMS_EXPECTED_1, "RMSNorm output 1 mismatch");
+}
+
+void test_reference_rope() {
+    std::vector<float> heads{1.0F, 0.0F, 0.0F, 1.0F};
+    lcqi::apply_rope(heads, 1, 4, 1, 10000.0F);
+    require_close(heads[0], std::cos(1.0F), "RoPE pair 0 cosine mismatch");
+    require_close(heads[1], std::sin(1.0F), "RoPE pair 0 sine mismatch");
+    require_close(heads[2], -std::sin(0.01F), "RoPE pair 1 negative sine mismatch");
+    require_close(heads[3], std::cos(0.01F), "RoPE pair 1 cosine mismatch");
+}
+
+void test_reference_kv_attention() {
+    lcqi::DecoderConfig config;
+    config.hidden_size = 4;
+    config.query_heads = 2;
+    config.kv_heads = 1;
+    config.head_dim = 2;
+    config.intermediate_size = 4;
+    config.vocab_size = 4;
+    config.max_context = 4;
+
+    lcqi::ReferenceKVCache cache(config, 1);
+    const std::vector<float> key{1.0F, 0.0F};
+    const std::vector<float> value{LCQI_ATTENTION_EXPECTED_0, LCQI_ATTENTION_EXPECTED_1};
+    cache.append(0, 0, key, value);
+    require(cache.filled_tokens() == 1, "KV filled token count mismatch");
+    require_close(cache.key(0, 0, 0)[0], 1.0F, "KV key read mismatch");
+
+    const std::vector<float> query{1.0F, 0.0F, 0.0F, 1.0F};
+    std::vector<float> output(4, 0.0F);
+    lcqi::attention_decode(config, cache, 0, 0, query, output);
+    require_close(output[0], LCQI_ATTENTION_EXPECTED_0, "attention head 0 dim 0 mismatch");
+    require_close(output[1], LCQI_ATTENTION_EXPECTED_1, "attention head 0 dim 1 mismatch");
+    require_close(output[2], LCQI_ATTENTION_EXPECTED_0, "attention head 1 dim 0 mismatch");
+    require_close(output[3], LCQI_ATTENTION_EXPECTED_1, "attention head 1 dim 1 mismatch");
+}
+
+void test_reference_decoder_end_to_end() {
+    const lcqi::ReferenceDecoderModel model = lcqi::make_tiny_reference_decoder_model();
+    const std::vector<std::int32_t> tokens{1, 2, 3};
+    const lcqi::ReferenceDecodeResult result = lcqi::run_reference_decode(model, tokens);
+    require(result.logits.size() == static_cast<std::size_t>(model.config.vocab_size),
+            "reference decoder logits size mismatch");
+    require(result.predicted_token >= 0 && result.predicted_token < model.config.vocab_size,
+            "reference decoder predicted token out of range");
+}
+
+void test_packed_i8_kernel_matches_scalar() {
+    const lcqi::QuantizedLinearLayer layer = lcqi::make_deterministic_i8_layer(17, 19, 0.03125F);
+    const lcqi::PackedLinearI8 packed = lcqi::pack_linear_i8(layer, 8);
+    const std::vector<float> input = lcqi::make_deterministic_input(layer.input_size);
+    std::vector<float> scalar_output(static_cast<std::size_t>(layer.output_size), 0.0F);
+    std::vector<float> packed_output(static_cast<std::size_t>(layer.output_size), 0.0F);
+    lcqi::linear_i8(layer, input, scalar_output);
+    lcqi::linear_i8_packed(packed, input, packed_output);
+    require(lcqi::max_abs_diff(scalar_output, packed_output) <= LCQI_KERNEL_MAX_DIFF,
+            "packed int8 kernel output differs from scalar");
+}
+
 }  // namespace
 
 int main() {
     try {
-        const lcqi::TinyMlpModel model = lcqi::load_model(test_model_path());
-        require(model.input_size == LCQI_TEST_INPUT_SIZE, "input size mismatch");
-        require(model.hidden_size == LCQI_TEST_HIDDEN_SIZE, "hidden size mismatch");
-        require(model.output_size == LCQI_TEST_OUTPUT_SIZE, "output size mismatch");
-
-        const std::vector<float> input{1.0F, 2.0F, -1.0F, 0.5F};
-        const lcqi::InferenceResult result = lcqi::run_inference(model, input);
-
-        require(result.predicted_class == LCQI_TEST_PREDICTED_CLASS, "unexpected predicted class");
-        require(result.logits.size() == static_cast<std::size_t>(LCQI_TEST_OUTPUT_SIZE),
-                "unexpected logits size");
-        require_close(result.logits[0], LCQI_TEST_LOGIT_0, "logit 0 mismatch");
-        require_close(result.logits[1], LCQI_TEST_LOGIT_1, "logit 1 mismatch");
-
-        std::vector<float> hidden(static_cast<std::size_t>(LCQI_TEST_HIDDEN_SIZE), 0.0F);
-        lcqi::linear_i8(model.hidden, input, hidden);
-        lcqi::relu_inplace(hidden);
-        require_close(hidden[0], LCQI_TEST_HIDDEN_0, "hidden 0 mismatch");
-        require_close(hidden[1], LCQI_TEST_HIDDEN_1, "hidden 1 mismatch");
-        require_close(hidden[2], LCQI_TEST_HIDDEN_2, "hidden 2 mismatch");
+        test_tiny_mlp();
+        test_reference_rms_norm();
+        test_reference_rope();
+        test_reference_kv_attention();
+        test_reference_decoder_end_to_end();
+        test_packed_i8_kernel_matches_scalar();
 
         std::cout << "lcqi tests passed\n";
         return EXIT_SUCCESS;

@@ -1,0 +1,264 @@
+\chapter{业务服务实战：请求、调度、队列、取消与资源预算}
+
+\section{业务开发不是把 \code{generate()} 暴露成接口}
+
+很多本地大模型 demo 的接口只有一个输入 prompt 和一个输出 text。它能演示模型效果，却不能承载真实业务。业务开发要面对的问题更具体：多个用户同时请求怎么办，长 prompt 是否允许，用户断开后是否继续烧算力，队列满了怎样拒绝，CPU/GPU 后端不可用怎样降级，怎么知道慢在排队、prefill、decode 还是 sampler。
+
+\begin{keyidea}
+推理服务的核心对象不是一个字符串函数，而是请求状态机、资源预留、调度策略、session 生命周期、流式事件和可追溯 trace。没有这些对象，模型能输出文本也不能算可交付业务服务。
+\end{keyidea}
+
+本章把贯穿项目放到服务视角。目标是设计一个最小但完整的本地推理服务：它接收请求，验证参数，估算资源，决定是否接纳，运行 prefill 和 decode，流式返回 token，处理取消和超时，最后输出 usage 与 trace。
+
+\section{请求字段要表达资源和语义}
+
+一个业务接口必须把会影响资源、质量和延迟的字段显式暴露出来。
+
+\begin{lstlisting}[numbers=none,caption={GenerateRequest 的业务字段}]
+GenerateRequest:
+  request_id
+  user_id_optional
+  model_id
+  prompt
+  max_new_tokens
+  max_context_tokens
+  temperature
+  top_k
+  top_p
+  repetition_penalty
+  stop_token_ids
+  stream
+  timeout_ms
+  backend_policy
+  quant_profile_id
+  trace_level
+\end{lstlisting}
+
+\code{max\_context\_tokens} 不是普通参数，它决定 KV cache 上限；\code{max\_new\_tokens} 决定最坏 decode 步数；\code{timeout\_ms} 决定调度器能否中止；\code{backend\_policy} 决定 CPU/GPU plan 选择；\code{quant\_profile\_id} 决定质量和容量；\code{trace\_level} 决定是否允许记录更多中间证据。
+
+请求验证要分两层。第一层是 API 参数验证，例如 \code{top\_p} 是否在合法范围、\code{max\_new\_tokens} 是否为正。第二层是模型相关验证，例如请求的 context 是否超过模型最大上下文，选择的量化 profile 是否存在，后端是否支持该 profile。不要把这两类错误都混成 \code{bad request}。
+
+\section{响应也要表达停止原因}
+
+响应不能只返回文本。最小响应应该能告诉业务层为什么结束。
+
+\begin{lstlisting}[numbers=none,caption={GenerateResponse 的业务字段}]
+TokenEvent:
+  request_id
+  index
+  token_id
+  text_fragment
+  model_position
+  trace_event_id_optional
+
+FinalEvent:
+  request_id
+  finish_reason:
+    stop_token | max_tokens | context_limit |
+    timeout | cancelled | backend_error | internal_error
+  prompt_tokens
+  completion_tokens
+  kv_cache_bytes
+  prefill_ms
+  decode_ms
+  trace_summary_optional
+\end{lstlisting}
+
+业务逻辑会依赖 \code{finish\_reason}。若是 \code{max\_tokens}，可以提示用户继续生成；若是 \code{context\_limit}，应该让用户缩短输入；若是 \code{timeout}，可能需要重试或调小输出长度；若是 \code{backend\_error}，要看 fallback 和后端日志。没有停止原因，服务层只能猜。
+
+\section{Admission control：先预算，再接纳}
+
+服务端最重要的保护机制是 admission control。它在请求进入模型前决定是否接纳。最小预算包括 KV cache、activation arena、workspace、trace buffer 和队列 slot。
+
+\begin{lstlisting}[numbers=none,caption={AdmissionRequest 字段}]
+AdmissionRequest:
+  model_id
+  prompt_tokens
+  max_context_tokens
+  max_new_tokens
+  backend_policy
+  quant_profile_id
+  trace_level
+\end{lstlisting}
+
+决策输出要结构化：
+
+\begin{lstlisting}[numbers=none,caption={AdmissionDecision 字段}]
+AdmissionDecision:
+  accepted
+  rejection_reason_optional:
+    context_too_long
+    memory_budget_exceeded
+    queue_full
+    backend_unavailable
+    quant_profile_unsupported
+  selected_plan_id
+  reserved_kv_bytes
+  reserved_workspace_bytes
+  estimated_ttft_ms
+  estimated_decode_tokens_per_s
+\end{lstlisting}
+
+一个常见错误是按当前 prompt 长度分配 KV cache，而不是按请求允许的最大上下文预算。若 prompt 是 500 token，\code{max\_new\_tokens} 是 3500，最终可能增长到 4000 token。admission 若只看 500，会在 decode 中途撞内存，业务体验比直接拒绝更差。
+
+\section{队列：排队时间也是用户延迟}
+
+推理服务中的队列至少有两类：等待进入模型的请求队列，以及流式输出事件队列。二者都必须有限。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+队列 & 风险 & 控制方式 \\
+\midrule
+请求队列 & 排队时间吞掉 SLO & 上限、优先级、超时、拒绝 \\
+decode ready 队列 & 某些 session 饿死 & 公平调度、step budget \\
+流式事件队列 & 客户端慢导致内存膨胀 & backpressure、断开检测 \\
+trace 队列 & debug 模式产生日志洪峰 & 采样、等级、大小上限 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+排队时间要进入 trace。否则用户看到 TTFT 很慢时，工程师可能错误优化 prefill kernel，而真正的问题是请求在队列里等了 800ms。
+
+\section{调度粒度：一次跑完整请求还是一 token 一调度}
+
+最简单的调度方式是一个请求跑到结束再处理下一个请求。它容易实现，但对长输出请求不公平：一个用户生成 2048 token，会阻塞其他短请求。更合理的最小策略是 step-level 调度：每个活跃 session 每次执行一个或几个 decode step，然后让出。
+
+\begin{lstlisting}[numbers=none,caption={step-level decode 调度}]
+while active_sessions not empty:
+  session = pick_next_session()
+  if session.need_prefill:
+    run_prefill(session)
+  else:
+    run_decode_step(session)
+    emit_token_event(session)
+
+  if session.finished:
+    release_resources(session)
+  else:
+    requeue(session)
+\end{lstlisting}
+
+这不是完整动态 batching，但已经把“一个请求独占模型”的问题拆开。后续可以在 \code{pick\_next\_session} 和 \code{run\_decode\_step} 之间加入小批量合并：把多个 session 的当前 token 合成 batch，执行同一层 decode，再拆回各自 session。合批会提高吞吐，也会引入等待和复杂状态，因此必须由 trace 报告收益和 p95 代价。
+
+\section{prefill 调度和 decode 调度不同}
+
+prefill 通常更重，且 prompt 长度差异大。一个长 prompt prefill 可能占用较长时间，影响其他请求 TTFT。decode 每步较短，但会重复很多次。调度器至少要区分：
+
+\begin{itemize}
+  \item 新请求的 prefill 是否允许插队。
+  \item 长 prompt 是否拆块 prefill。
+  \item decode session 是否按公平轮转。
+  \item 是否允许为了 batch 吞吐牺牲单请求 p95。
+  \item CPU 和 GPU 后端是否使用不同队列。
+\end{itemize}
+
+最保守的实现可以先不做复杂合批，但要把调度决策记录下来：
+
+\begin{lstlisting}[numbers=none,caption={SchedulerEvent 字段}]
+SchedulerEvent:
+  request_id
+  state
+  queue_wait_ns
+  selected_backend
+  batch_size
+  prompt_tokens
+  context_length
+  reason
+\end{lstlisting}
+
+这样后续优化调度时，能判断吞吐提升是否以 p95 变差为代价。
+
+\section{取消和超时：资源释放是合同}
+
+用户关闭页面、网络断开、业务层超时，都应该触发取消。取消不是设置一个标志就完事。runtime 必须让正在运行的 session 到达安全点，然后释放资源。
+
+\begin{lstlisting}[numbers=none,caption={取消处理的资源清单}]
+on_cancel(request_id):
+  mark session cancel_requested
+  stop scheduling new decode steps
+  drain or discard stream events
+  release KV cache reservation
+  release activation arena
+  release workspace
+  write final event with cancelled
+  write trace summary
+\end{lstlisting}
+
+如果正在 GPU kernel 中，不能随意销毁底层 buffer。可以把取消点放在 step 边界：当前 kernel 完成后不再调度下一步。CPU 后端也类似，线程池任务要检查取消标志，但不能在持有共享结构时直接抛出异常导致资源计数不平衡。
+
+\begin{warningbox}
+取消路径必须有测试。只测正常完成，会漏掉最真实的服务问题：客户端断开后继续生成、KV cache 不释放、事件队列持续增长、trace 文件缺 final event。
+\end{warningbox}
+
+\section{流式输出与 backpressure}
+
+流式 token 事件通常比模型计算慢得多，也可能被网络、客户端渲染或上游代理阻塞。服务端不能让事件队列无限增长。最小策略：
+
+\begin{itemize}
+  \item 每个 session 设置事件队列上限。
+  \item 队列满时暂停该 session 的 decode 调度。
+  \item 超过最大阻塞时间后取消请求或返回 backpressure 错误。
+  \item 客户端断开时立即进入取消路径。
+\end{itemize}
+
+backpressure 要进入调度器，而不是只在 I/O 层处理。否则模型会继续生成 token，I/O 层只是堆积事件，内存仍然失控。
+
+\section{错误分类：给业务可处理的错误}
+
+错误要分层返回。下面是一套最小分类：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.38\linewidth}p{0.28\linewidth}}
+\toprule
+错误类别 & 例子 & 业务处理 \\
+\midrule
+请求错误 & 参数范围错、prompt 为空 & 直接提示用户修改 \\
+容量错误 & context 超限、队列满、内存不足 & 稍后重试或缩短输入 \\
+模型错误 & manifest 不合法、tokenizer 不匹配 & 运维修模型资产 \\
+后端错误 & GPU 不可用、dtype 不支持 & fallback 或切 CPU \\
+运行时错误 & KV 越界、arena 冲突 & 记录 trace，阻断发布 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不要把所有错误都变成 500。业务系统要根据错误类型决定重试、降级、提示、告警还是阻断部署。
+
+\section{服务级 SLO 报告}
+
+服务的 SLO 不只是一条平均延迟。最小报告：
+
+\begin{lstlisting}[numbers=none,caption={ServiceSloReport 字段}]
+ServiceSloReport:
+  model_id
+  backend_plan_id
+  quant_profile_id
+  prompt_bucket
+  context_bucket
+  request_count
+  rejection_rate
+  queue_wait_p50_p95
+  ttft_p50_p95
+  decode_step_p50_p95
+  tokens_per_second
+  cancel_count
+  timeout_count
+  memory_peak_bytes
+  fallback_count
+\end{lstlisting}
+
+这份报告能指导业务选择。例如 RAG 问答更关注 TTFT 和长 prompt prefill；代码补全更关注短 prompt 低延迟 decode；批量摘要更关注吞吐；离线任务可以接受更高延迟换取更大 batch。不同业务可以使用同一引擎，但 SLO 和调度策略不同。
+
+\section{本章验收线}
+
+读完本章，应该能把第三册项目接成业务服务：
+
+\begin{itemize}
+  \item 请求和响应字段能表达资源、采样、后端、量化、trace 和停止原因。
+  \item admission control 在请求进入模型前预算 KV、workspace、arena 和队列。
+  \item 调度器区分 prefill 与 decode，并能记录 queue wait、batch size 和 context。
+  \item 取消、超时和客户端断开都能释放 KV cache 与事件队列。
+  \item backpressure 会影响调度，而不是只在 I/O 层堆积。
+  \item 错误分类能让业务决定重试、降级、提示或告警。
+  \item SLO 报告拆开 queue、TTFT、decode、内存、fallback 和拒绝率。
+\end{itemize}

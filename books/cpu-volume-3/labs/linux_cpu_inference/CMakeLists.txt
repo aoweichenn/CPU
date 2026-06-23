@@ -1,6 +1,8 @@
 add_library(lcqi STATIC
     src/inference.cpp
+    src/int8_kernels.cpp
     src/model.cpp
+    src/reference_decoder.cpp
 )
 
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
@@ -26,6 +28,16 @@ target_link_libraries(lcqi_cli PRIVATE lcqi)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi_cli PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(lcqi_bench
+    src/bench.cpp
+)
+
+target_link_libraries(lcqi_bench PRIVATE lcqi)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lcqi_bench PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 add_executable(lcqi_tests

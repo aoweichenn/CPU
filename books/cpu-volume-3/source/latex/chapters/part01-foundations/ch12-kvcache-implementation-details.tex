@@ -1,0 +1,329 @@
+\chapter{KV cache 实现细节：布局、分页、位置、量化与故障模式}
+
+\section{KV cache 是运行时数据结构，不只是公式}
+
+前面已经讲过 KV cache 的数学作用：历史 token 的 K/V 被保存下来，未来 decode step 可以复用。真正写引擎时，KV cache 不是一句“缓存 K/V”，而是一个运行时数据结构。它要回答：内存按什么布局放，逻辑 position 如何映射到物理槽，GQA head 怎样映射，多个 session 如何分配，超过上下文怎么办，量化后 scale 放哪里，取消时怎样释放。
+
+\begin{keyidea}
+KV cache 的正确性由三个坐标共同决定：layer、model position、KV head。物理内存可以连续、分页或回绕，但不能破坏这三个语义坐标。
+\end{keyidea}
+
+最朴素的 fp16 KV cache 形状是：
+
+\begin{lstlisting}[numbers=none,caption={连续 KV cache 形状}]
+key:   [layers, max_context, kv_heads, head_dim]
+value: [layers, max_context, kv_heads, head_dim]
+\end{lstlisting}
+
+这个布局容易理解，适合 reference 和早期实现。但生产级 runtime 常会遇到变长 session、并发、内存碎片、长上下文和 prefix 复用，连续大块内存不一定够灵活。
+
+\section{逻辑 position 和物理 slot 分开}
+
+模型语义使用 \code{model\_position}。内存使用 \code{slot}。连续布局里二者常常相等，但实现不要依赖这个巧合。
+
+\begin{lstlisting}[numbers=none,caption={KV 逻辑到物理映射}]
+KvAddress:
+  layer_id
+  model_position
+  kv_head
+  head_offset
+
+PhysicalAddress:
+  block_id
+  slot_in_block
+  byte_offset
+\end{lstlisting}
+
+RoPE 使用的是 \code{model\_position}，attention mask 使用的是历史逻辑范围，内存读写使用的是物理地址。若滑动窗口把物理 slot 回绕，\code{model\_position} 不能跟着回到 0。若 prefix cache 复用前 1024 个 token，新 token 的 position 应该从 1024 开始，而不是从新 session 的局部数组下标开始。
+
+\section{连续布局的优点和限制}
+
+连续布局可以按 session 一次分配最大上下文：
+
+\begin{lstlisting}[numbers=none,caption={连续 KV 分配}]
+bytes =
+  layers * max_context * kv_heads * head_dim *
+  2 /* K,V */ * bytes_per_element
+\end{lstlisting}
+
+优点是地址计算简单，cache locality 可预测，debug 容易。缺点是浪费：很多请求实际不会用满 \code{max\_context}，但 admission 为了安全会预留整块。并发多时，大量未使用 KV 空间会占住内存。
+
+连续布局适合本册早期项目，因为它能先把正确性和账本讲清。等到并发和长上下文成为主要问题，再引入分页 KV。
+
+\section{分页 KV：把上下文拆成 block}
+
+分页 KV 把每个 session 的上下文拆成固定大小 block，例如每个 block 容纳 16 或 32 个 token。session 维护一个 block table：
+
+\begin{lstlisting}[numbers=none,caption={分页 KV 元数据}]
+KvBlock:
+  block_id
+  capacity_tokens
+  used_tokens
+  device_or_host
+  ref_count
+
+SessionKvTable:
+  logical_block_index -> block_id
+\end{lstlisting}
+
+逻辑 position 到 block：
+
+\begin{lstlisting}[numbers=none,caption={分页 KV 地址计算}]
+logical_block = model_position / block_tokens
+slot = model_position % block_tokens
+block_id = session_table[logical_block]
+address = block_base(block_id, layer, kv_head, slot, head_offset)
+\end{lstlisting}
+
+分页的优点是按需增长，便于 prefix block 共享，也便于释放。缺点是 attention 读历史 K/V 时不再是一个完全连续区间，kernel 要读取 block table。GPU 上还要考虑 block table 访问、coalescing 和 shared memory staging。
+
+\section{prefix cache 和引用计数}
+
+多个请求可能共享同一段 prompt，例如系统提示词或 RAG 模板前缀。prefix cache 可以复用这段 K/V。实现上，prefix block 应该只读共享，引用计数记录多少 session 使用它。
+
+\begin{lstlisting}[numbers=none,caption={prefix cache 生命周期}]
+build prefix:
+  run prefill for shared prompt
+  store KV blocks
+  mark blocks read-only
+
+new session:
+  attach prefix blocks
+  increase ref_count
+  model_position starts after prefix length
+
+session release:
+  decrease ref_count
+  free block when ref_count becomes zero
+\end{lstlisting}
+
+prefix cache 最容易错的位置是 RoPE 和 model position。复用 prefix K/V 时，新 token 的 position 不能从 0 开始；attention 也必须把 prefix token 算进历史长度。
+
+\section{滑动窗口和上下文截断}
+
+有些模型或服务会限制最近窗口，例如只保留最近 \code{W} 个 token 的 KV。此时物理内存可以回绕，但语义要明确：
+
+\begin{itemize}
+  \item attention 只能读窗口内 token。
+  \item RoPE position 是否继续增长，取决于模型的长上下文策略。
+  \item 被淘汰 token 的 K/V 不能被读到。
+  \item stop sequence 和业务 token buffer 可能仍需保留完整文本。
+\end{itemize}
+
+不要把滑动窗口实现成“数组下标取模”就结束。取模只是物理槽复用；语义上还要维护窗口起点、逻辑 position、可读范围和 RoPE 策略。
+
+\section{KV cache 量化}
+
+KV cache 量化的目标是减少容量和读带宽。fp16 KV 一个 4096 context session 约 512 MiB；int8 可接近减半；int4 可进一步降低。但 KV 是动态 activation，比权重量化更敏感。
+
+\begin{lstlisting}[numbers=none,caption={KV 量化 descriptor}]
+KvQuantDesc:
+  bit_width
+  scale_policy:
+    per_token_head
+    per_block_head
+    per_channel
+  group_size
+  scale_dtype
+  store_k_quantized
+  store_v_quantized
+  dequant_stage:
+    before_score
+    inside_attention_kernel
+\end{lstlisting}
+
+K 的误差会进入 dot product，再被 softmax 放大；V 的误差会在线性加权中传播。二者敏感度不同。有些实现可能只量化 V，或对 K 使用更高精度。不能简单把权重量化策略照搬到 KV。
+
+\section{KV 量化的 scale 放哪里}
+
+量化不只是压缩数据，还要保存 scale。若按 token/head 存 scale，metadata 随上下文增长；若按 block/head 存 scale，metadata 少，但误差可能增大。
+
+\begin{center}
+\begin{tabular}{p{0.23\linewidth}p{0.33\linewidth}p{0.28\linewidth}}
+\toprule
+scale 策略 & 优点 & 风险 \\
+\midrule
+per token/head & 精度较好，适配动态范围 & metadata 多，读流增加 \\
+per block/head & metadata 少，分页友好 & block 内动态范围差异大 \\
+per channel & 某些维度更稳定 & 实现和访问更复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+报告不能只写 KV 从 512 MiB 变成 256 MiB，还要写 scale metadata 字节、attention 误差、logits top-k 和 decode latency。若 metadata 访问破坏 coalescing，实际速度可能不升反降。
+
+\section{KV cache 的 oracle}
+
+KV cache 需要专门 oracle，不要只看最终文本。
+
+\begin{lstlisting}[numbers=none,caption={KV oracle 层次}]
+append oracle:
+  written K/V equals reference at model_position
+
+address oracle:
+  logical position maps to expected physical block and slot
+
+read oracle:
+  attention reads exactly positions in visible range
+
+quant oracle:
+  dequantized K/V within tolerance
+
+score oracle:
+  q dot k score drift within profile
+\end{lstlisting}
+
+score oracle 很重要。K 的小误差经过 dot product 和 softmax 后，可能改变 attention 分布。直接比较最终 logits 会太晚。
+
+\section{KV cache descriptor}
+
+为了让编译器、runtime 和后端使用同一套合同，KV cache 应该有 descriptor，而不是把参数散落在构造函数里。
+
+\begin{lstlisting}[numbers=none,caption={KVCacheDesc 字段}]
+KVCacheDesc:
+  layers
+  max_context
+  query_heads
+  kv_heads
+  head_dim
+  element_dtype
+  layout:
+    contiguous
+    paged
+    sliding_window
+  block_tokens_optional
+  quant_desc_optional
+  rope_position_policy
+  device_residency:
+    host
+    device
+    unified
+\end{lstlisting}
+
+\code{query\_heads} 和 \code{kv\_heads} 同时出现，是为了让 verifier 检查 GQA 映射；\code{layout} 决定地址计算；\code{block\_tokens} 只对分页布局有意义；\code{quant\_desc} 决定 K/V 的存储 dtype 和 scale；\code{rope\_position\_policy} 说明 position 是否绝对递增、滑动窗口内重映射或使用模型特定 scaling；\code{device\_residency} 决定后端是否需要 copy。
+
+这份 descriptor 要进入 plan report。后端 kernel 不应该从 session 对象里临时读取一堆字段再猜 layout。若 CPU 和 GPU 使用不同 KV layout，也应该产生两个不同 plan，而不是一个 descriptor 被不同后端解释成不同含义。
+
+\section{KV append 和 read 的接口}
+
+KV cache 至少需要两个热路径接口：append 当前 token 的 K/V，读取历史可见范围。
+
+\begin{lstlisting}[numbers=none,caption={KV append/read 合同}]
+append(layer_id, model_position, key, value):
+  require model_position < max_context or window policy allows it
+  require key.shape == [kv_heads, head_dim]
+  require value.shape == [kv_heads, head_dim]
+  write into physical storage
+  update logical length
+
+read_range(layer_id, query_head, visible_begin, visible_end):
+  kv_head = map_query_head(query_head)
+  return K/V view for visible logical positions
+\end{lstlisting}
+
+\code{append} 是写状态，\code{read\_range} 是读状态。它们要分别打 trace。比如一个 decode step 中，某层应该先 append 当前 token 的 K/V，再让当前 query 读 \code{0..position}。有些实现会先读历史再写当前 token，再单独把 self attention 加进去；这也可以，但 plan 必须明确。不要让调用顺序成为隐式约定。
+
+\section{多 session 分配器}
+
+业务服务里不止一个 session。KV cache manager 要负责分配、释放和统计。
+
+\begin{lstlisting}[numbers=none,caption={KVCacheManager 职责}]
+KVCacheManager:
+  reserve(request_id, KVCacheDesc, max_tokens)
+  attach_prefix(request_id, prefix_id)
+  append(request_id, layer, position, k, v)
+  release(request_id)
+  stats()
+\end{lstlisting}
+
+\code{reserve} 要和 admission control 绑定；\code{release} 要在 completed、cancelled、timeout 和 backend error 路径都执行；\code{stats} 要输出已预留、已使用、空闲、碎片和共享 prefix block。若只在正常完成路径释放，长时间服务一定会出现内存只涨不降。
+
+\section{KV cache 与 memory planner 的边界}
+
+activation arena 可以按一层或一个 step 复用；KV cache 不能这样复用，因为它跨 token 存活。memory planner 必须知道哪些 value 是普通临时 activation，哪些是 session state。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.35\linewidth}p{0.29\linewidth}}
+\toprule
+内存对象 & 生命周期 & planner 策略 \\
+\midrule
+临时 activation & 一个 segment 或一层内 & last-use 后复用 \\
+workspace & 一个 step 或一个 plan & 后端独占或按 stream 分配 \\
+packed weight & 模型/plan 生命周期 & prepare 后常驻 \\
+KV cache & session 生命周期 & 不参与普通 activation 复用 \\
+trace buffer & 请求生命周期 & 有大小上限 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果 planner 把 K/V 当普通 activation，单步测试可能通过，第二个 decode token 就会读到被覆盖的数据。这类 bug 很隐蔽，必须通过 state effect 和 layer oracle 抓住。
+
+\section{容量压力下的策略}
+
+当内存不足时，有几种策略：
+
+\begin{itemize}
+  \item 直接拒绝新请求，最简单也最可控。
+  \item 降低 max context，但需要业务明确接受。
+  \item 使用 KV 量化，减少每 session 容量。
+  \item 使用分页 KV，减少未使用预留。
+  \item 使用 prefix 共享，减少重复 prompt。
+  \item 把部分 session 排队，而不是立即分配。
+\end{itemize}
+
+这些策略都要体现在 admission decision 中。不要在 runtime 中途偷偷把 KV 从 fp16 改成 int8，也不要静默截断上下文。容量策略改变的是语义或质量边界，必须对业务可见。
+
+\section{常见故障模式}
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.34\linewidth}p{0.24\linewidth}}
+\toprule
+故障 & 表现 & 定位证据 \\
+\midrule
+position 重置 & prefix 后输出漂移 & RoPE checkpoint \\
+GQA head 映射错 & 某些 head 输出异常 & head-level oracle \\
+物理 slot 覆盖 & 长文本中途突然漂移 & address oracle \\
+context off-by-one & 第一个新 token 或最后 token 错 & visible range trace \\
+scale metadata 错位 & 量化 KV 长上下文变差 & quant oracle \\
+取消未释放 & 并发后内存只涨不降 & resource counter \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些故障都可能在 shape 正确、程序不崩溃的情况下发生。因此 KV cache 必须有自己的 trace 和 oracle。
+
+\section{KV trace 示例}
+
+一条 KV trace 不需要记录完整张量，但要记录坐标和容量。
+
+\begin{lstlisting}[numbers=none,caption={KV trace event}]
+KvTraceEvent:
+  request_id
+  layer_id
+  operation: reserve | append | read | release
+  model_position
+  visible_begin
+  visible_end
+  kv_head_count
+  head_dim
+  layout
+  physical_block_optional
+  bytes_reserved
+  bytes_used
+  quant_profile_optional
+\end{lstlisting}
+
+当长上下文性能变差时，可以按 \code{visible\_end-visible\_begin} 分桶；当内存泄漏时，可以看 \code{reserve} 和 \code{release} 是否配对；当 prefix 复用错位时，可以看 \code{model\_position} 是否从 prefix 长度后继续。
+
+\section{本章验收线}
+
+读完本章，应该能设计一个可靠 KV cache：
+
+\begin{itemize}
+  \item 区分 layer、model position、KV head 和物理 slot。
+  \item 能实现连续 KV，并知道它在并发下的浪费。
+  \item 能解释分页 KV 的 block table、地址计算和 prefix 共享。
+  \item 能处理 prefix cache、滑动窗口、取消释放和 context limit。
+  \item 能设计 KV 量化 descriptor，并估算 metadata 成本。
+  \item 能用 append、address、read、quant、score oracle 定位 KV 错误。
+\end{itemize}

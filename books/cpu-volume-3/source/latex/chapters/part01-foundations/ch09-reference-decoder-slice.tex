@@ -1,0 +1,385 @@
+\chapter{Reference decoder 实现：先把一层算对}
+
+\section{为什么必须先写 reference decoder}
+
+很多推理项目失败，不是因为没有 SIMD 或 GPU，而是因为一开始没有可信 reference。后端越快，越难调；量化越低，越难判断误差来源；KV cache 越复杂，越容易把位置、head 映射和缓存槽混在一起。reference decoder 的作用是把数学合同写成最朴素、最容易审计的 C++20 代码，让后续所有优化都有比较对象。
+
+\begin{keyidea}
+reference decoder 不是低质量版本，而是正确性基准。它可以慢，但必须清楚、可复现、少隐藏状态、少复用复杂优化代码。
+\end{keyidea}
+
+本章目标不是实现完整 7B 框架，而是实现一个小型 decoder slice：token embedding、RMSNorm、Q/K/V linear、RoPE、causal attention、MLP、lm head 和 sampler 前 logits。这个 slice 可以用极小维度，例如 \code{H=16}、\code{heads=2}、\code{head\_dim=8}、\code{layers=1}，也可以用真实 shape 的小权重 fixture。重点是每一步都能输出中间张量并被 oracle 比较。
+
+\section{reference 的边界}
+
+reference decoder 应该故意避开复杂优化：
+
+\begin{itemize}
+  \item 不做 packed weight，直接读普通 row-major 权重。
+  \item 不做 SIMD intrinsic，使用普通循环。
+  \item 不做线程并行，避免浮点归约顺序变化。
+  \item 不复用优化后端的 int4 解包或 GPU kernel。
+  \item 不把多个算子融合成一个不可观察的大函数。
+\end{itemize}
+
+它应该保留的能力是检查和观察：
+
+\begin{itemize}
+  \item 每个张量都有 shape、dtype 和 layout。
+  \item 每个阶段能选择性 dump 中间结果。
+  \item 每个算子能独立运行 fixture。
+  \item 每个错误能指出哪一层、哪一个 head、哪一个 position。
+  \item 固定 seed 的 sampler 能复现。
+\end{itemize}
+
+\section{最小类型：先让 shape 说话}
+
+不要让裸指针和裸长度在 reference 中到处流动。最小实现也需要一个张量视图。
+
+\begin{lstlisting}[numbers=none,caption={reference TensorView 的语义字段}]
+TensorViewF32:
+  data: span<float>
+  shape: vector<int64>
+  stride: vector<int64>
+  name: string_view
+
+requirements:
+  shape.size == stride.size
+  every index is checked in debug mode
+  view does not own memory
+  owner outlives view
+\end{lstlisting}
+
+reference 里可以接受 debug 检查稍慢，因为它换来定位能力。优化后端可以在 verifier 通过后走 unchecked fast path，但 reference 不应该这样做。每次 oracle 报错时，张量名、shape 和索引比一个段错误有用得多。
+
+模型参数也要结构化，不要用字符串 map 在热路径查。
+
+\begin{lstlisting}[numbers=none,caption={一层 decoder 的 reference 权重集合}]
+DecoderLayerWeights:
+  rms_attn_weight: [H]
+  wq: [Q, H]
+  wk: [KV, H]
+  wv: [KV, H]
+  wo: [H, Q]
+  rms_mlp_weight: [H]
+  w_gate: [I, H]
+  w_up: [I, H]
+  w_down: [H, I]
+
+ModelWeights:
+  token_embedding: [V, H]
+  layers: array<DecoderLayerWeights>
+  final_norm_weight: [H]
+  lm_head: [V, H]
+\end{lstlisting}
+
+这里使用 \code{[out,in]} 形式表达线性层权重，和前面 matvec 章节一致：输出通道是行，输入通道是列。若模型文件来自别的布局，导入阶段应该转换或记录 layout，不要让 reference 每次猜。
+
+\section{RMSNorm：第一个数值合同}
+
+RMSNorm 的公式是：
+
+\[
+y_i = x_i \cdot \frac{1}{\sqrt{\frac{1}{H}\sum_j x_j^2+\epsilon}} \cdot w_i
+\]
+
+reference 实现要固定三件事：累加精度、epsilon、输出 dtype。建议 reference 用 fp32 累加，即使真实后端用 fp16/bf16。原因是 reference 要更接近数学定义，而不是模仿某个硬件的舍入。
+
+\begin{lstlisting}[numbers=none,caption={RMSNorm reference 伪代码}]
+sum_sq = 0
+for i in 0..H:
+  sum_sq += x[i] * x[i]
+
+scale = rsqrt(sum_sq / H + epsilon)
+
+for i in 0..H:
+  y[i] = x[i] * scale * weight[i]
+\end{lstlisting}
+
+RMSNorm 的测试不要只测随机数。至少包含全零输入、极小值、大值、负值和 \code{H} 不能被 SIMD 宽度整除的形状。虽然 reference 不用 SIMD，但后续 optimized path 会用这些 fixture。
+
+\section{Linear：所有大算子的共同骨架}
+
+decoder 中多数重计算都是 linear。reference 版本应尽量朴素：
+
+\begin{lstlisting}[numbers=none,caption={Linear reference 语义}]
+for out in 0..OUT:
+  acc = bias_or_zero(out)
+  for in in 0..IN:
+    acc += weight[out, in] * x[in]
+  y[out] = acc
+\end{lstlisting}
+
+这段代码要配 shape 检查：
+
+\begin{lstlisting}[numbers=none,caption={Linear shape 合同}]
+x.shape == [IN]
+weight.shape == [OUT, IN]
+y.shape == [OUT]
+if bias exists:
+  bias.shape == [OUT]
+\end{lstlisting}
+
+后续 CPU 后端的 packed weight、int8、int4、SIMD micro-kernel 都要和这个 reference 比较。若 reference 自己也绕过 shape 或复用 packed descriptor，oracle 就失去意义。
+
+\section{RoPE：位置编号必须作为参数传入}
+
+RoPE 不能从数组下标偷偷推导位置。reference 函数应该显式接收 \code{model\_position}：
+
+\begin{lstlisting}[numbers=none,caption={RoPE reference 合同}]
+apply_rope(q_or_k, head_count, head_dim, model_position, rope_config):
+  for head in 0..head_count:
+    for pair in 0..head_dim/2:
+      theta = frequency(pair, rope_config)
+      angle = model_position * theta
+      rotate two adjacent dimensions by angle
+\end{lstlisting}
+
+测试要覆盖下面几类错误：
+
+\begin{itemize}
+  \item position 为 0 时旋转应保持不变。
+  \item 同一向量在不同 position 输出不同。
+  \item prefix 长度为 \code{P} 时，新 token 的 position 是 \code{P}，不是 0。
+  \item 滑动窗口或分页 cache 改变物理槽时，position 不随槽回绕。
+\end{itemize}
+
+RoPE 的 oracle 不只比较最终 logits。最好在 tiny fixture 里直接比较旋转后的 Q/K。这样一旦长上下文漂移，可以更早定位到位置合同。
+
+\section{KV cache：reference 也要严格建模状态}
+
+即使 reference 很慢，也不能每步重新计算所有历史 K/V 后假装有 KV cache。那样无法测试真实运行时状态。reference 的 KV cache 可以用普通连续数组：
+
+\begin{lstlisting}[numbers=none,caption={KV cache reference 字段}]
+KVCache:
+  layers
+  max_context
+  kv_heads
+  head_dim
+  key:   [layers, max_context, kv_heads, head_dim]
+  value: [layers, max_context, kv_heads, head_dim]
+  filled_tokens
+\end{lstlisting}
+
+append 合同必须检查：
+
+\begin{itemize}
+  \item 写入 position 小于 \code{max\_context}。
+  \item K/V 的 head 数是 \code{kv\_heads}，不是 query head 数。
+  \item 写入后 \code{filled\_tokens} 和 session position 一致。
+  \item debug 模式下不能覆盖已经写入但未被窗口策略淘汰的槽。
+\end{itemize}
+
+GQA 读取时要从 query head 映射到 KV head：
+
+\begin{lstlisting}[numbers=none,caption={GQA head 映射}]
+group_size = query_heads / kv_heads
+kv_head = query_head / group_size
+\end{lstlisting}
+
+这个公式必须由 verifier 保证整除。若 \code{query\_heads} 不能整除 \code{kv\_heads}，模型资产应在加载阶段被拒绝，而不是让 attention 函数自己补救。
+
+\section{Causal attention：先写能看懂的版本}
+
+decode 阶段的单 token attention 最适合作为 reference 起点：
+
+\begin{lstlisting}[numbers=none,caption={单 token decode attention reference}]
+for q_head in 0..query_heads:
+  kv_head = map_query_to_kv(q_head)
+
+  for pos in 0..current_position:
+    score[pos] = dot(q[q_head], key_cache[pos, kv_head]) / sqrt(head_dim)
+
+  prob = softmax(score[0..current_position])
+
+  out[q_head] = 0
+  for pos in 0..current_position:
+    out[q_head] += prob[pos] * value_cache[pos, kv_head]
+\end{lstlisting}
+
+softmax 要做数值稳定处理：
+
+\begin{lstlisting}[numbers=none,caption={稳定 softmax}]
+max_score = max(score)
+sum = 0
+for i:
+  e[i] = exp(score[i] - max_score)
+  sum += e[i]
+for i:
+  p[i] = e[i] / sum
+\end{lstlisting}
+
+prefill reference 可以先用同一函数逐位置执行，再逐步加批量版本。这样容易证明 causal mask：第 \code{i} 个 prompt token 只能看 \code{0..i}。后续优化可以把 prefill attention 做成矩阵形式或 fused kernel，但 oracle 仍然回到这个语义。
+
+\section{MLP：SwiGLU 的中间值不能丢}
+
+SwiGLU 的 reference 要保留 gate、up 和乘积中间值：
+
+\begin{lstlisting}[numbers=none,caption={SwiGLU MLP reference}]
+gate = linear(w_gate, x)
+up = linear(w_up, x)
+
+for i in 0..I:
+  hidden[i] = silu(gate[i]) * up[i]
+
+down = linear(w_down, hidden)
+\end{lstlisting}
+
+\code{silu(x)=x/(1+exp(-x))}。这里的中间值很重要，因为 MLP 往往是 FLOPs 大头。若最终 logits 漂移，保留 gate/up/down 的 oracle checkpoint 能迅速判断是第一段线性、激活、逐元素乘，还是 down projection 出错。
+
+\section{单层 forward：把状态边写出来}
+
+一层 decoder forward 可以写成下面的形态：
+
+\begin{lstlisting}[numbers=none,caption={单层 decoder reference forward}]
+forward_layer(layer_id, x, model_position, kv_cache):
+  h = rms_norm(x, rms_attn_weight)
+
+  q = linear(wq, h)
+  k = linear(wk, h)
+  v = linear(wv, h)
+
+  apply_rope(q, query_heads, head_dim, model_position)
+  apply_rope(k, kv_heads, head_dim, model_position)
+
+  kv_cache.append(layer_id, model_position, k, v)
+
+  attn = attention_decode(q, kv_cache, layer_id, model_position)
+  x = x + linear(wo, attn)
+
+  h = rms_norm(x, rms_mlp_weight)
+  mlp = swiglu_mlp(h)
+  x = x + mlp
+
+  return x
+\end{lstlisting}
+
+注意 \code{kv\_cache.append} 是状态写入，\code{attention\_decode} 是状态读取。reference 也要把这两步分开记录。若后续 memory planner 错误复用 buffer，或者 decode step 提前读取未写完的 K/V，trace 才能定位。
+
+\section{端到端 reference decode loop}
+
+端到端 reference 可以先只输出 logits，不做复杂采样：
+
+\begin{lstlisting}[numbers=none,caption={reference decode loop}]
+tokens = tokenizer_fixture.encode(prompt)
+
+for pos in 0..tokens.size:
+  x = embedding[tokens[pos]]
+  for layer in 0..layers:
+    x = forward_layer(layer, x, pos, kv_cache)
+
+last_hidden = x
+normed = rms_norm(last_hidden, final_norm_weight)
+logits = linear(lm_head, normed)
+\end{lstlisting}
+
+prefill 的最后一个 token 产生首个 logits。之后 decode 追加 sampler 选出的 token：
+
+\begin{lstlisting}[numbers=none,caption={decode 生成循环 reference}]
+for step in 0..max_new_tokens:
+  next_id = sampler(logits, seed, params)
+  tokens.push_back(next_id)
+
+  pos = tokens.size - 1
+  x = embedding[next_id]
+  for layer in 0..layers:
+    x = forward_layer(layer, x, pos, kv_cache)
+
+  logits = linear(lm_head, rms_norm(x, final_norm_weight))
+\end{lstlisting}
+
+这里故意没有 batch、线程和 fusion。它的价值是每个 token、每层、每个中间值都能被检查。
+
+\section{Golden fixture 怎么设计}
+
+reference 必须配 golden fixture。一个高质量 fixture 至少包含：
+
+\begin{lstlisting}[numbers=none,caption={tiny decoder fixture 内容}]
+model_dims:
+  vocab
+  hidden
+  layers
+  query_heads
+  kv_heads
+  head_dim
+  intermediate
+  max_context
+
+weights:
+  token_embedding
+  layer weights
+  final_norm
+  lm_head
+
+input:
+  prompt_token_ids
+  sampler_params
+  seed
+
+expected:
+  checkpoints
+  logits
+  generated_token_ids
+\end{lstlisting}
+
+权重不要全用随机数。建议混合使用小整数、正负数、接近零的值和非对称值。全随机 fixture 容易覆盖到计算路径，却不容易人工定位错误。比如 RoPE 可以用只有两个维度非零的向量，attention 可以用能手算 softmax 排序的 Q/K/V。
+
+\section{checkpoint 策略}
+
+不要只保存最终 logits。推荐 checkpoint 分层：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+checkpoint & 目的 & 常见错误 \\
+\midrule
+embedding & tokenizer 和查表 & token id 错、词表错 \\
+norm output & RMSNorm & epsilon、累加精度 \\
+q/k/v & linear 与 head reshape & 权重转置、shape 错 \\
+rope q/k & 位置编码 & position、维度配对 \\
+attention prob & mask 与 softmax & 未来泄漏、溢出 \\
+attention out & KV cache 读取 & head 映射、cache slot \\
+mlp hidden & SwiGLU & 激活、逐元素乘 \\
+layer output & residual & 加法位置、覆盖 buffer \\
+logits top-k & 可见输出 & lm head、采样差异 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+checkpoint 太多会增加文件体积，可以通过 \code{trace\_level} 控制。日常测试比较关键 checkpoint；调试漂移时打开 debug 全量输出。
+
+\section{reference 和优化后端怎样比较}
+
+比较不能只看完全相等。不同 dtype 和不同归约顺序会造成微小差异。oracle 应按层级使用不同阈值：
+
+\begin{lstlisting}[numbers=none,caption={oracle tolerance profile}]
+f32_scalar:
+  absolute: 1e-5
+  relative: 1e-5
+
+f16_or_bf16:
+  absolute: 2e-2
+  relative: 2e-2
+
+int8_weight:
+  per_operator_absolute: profile dependent
+  logits_topk_overlap: required
+
+int4_weight:
+  compare logits, top-k and generation under fixed prompt set
+\end{lstlisting}
+
+阈值必须随 profile 记录到报告里。不要让测试代码里一个魔法数决定所有后端。特别是量化后端，operator 误差、logits top-k 和生成序列要一起看；单个最终文本“看起来不错”不能证明模型没有漂移。
+
+\section{本章验收线}
+
+读完本章，应该能动手写一个小型 reference decoder：
+
+\begin{itemize}
+  \item 用 \code{TensorView} 和结构化权重表达 shape，而不是裸指针乱传。
+  \item 分别实现 RMSNorm、Linear、RoPE、KV append/read、attention、SwiGLU 和 lm head。
+  \item 显式传入 \code{model\_position}，不把物理 cache slot 当 RoPE 位置。
+  \item 用 tiny fixture 保存 checkpoint 和 logits golden。
+  \item 用 oracle profile 比较 reference 与优化后端。
+  \item 把 reference 当正确性基准，而不是被优化路径污染的慢版本。
+\end{itemize}

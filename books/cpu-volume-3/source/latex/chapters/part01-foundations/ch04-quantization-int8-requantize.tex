@@ -1,0 +1,366 @@
+\chapter{int8 量化、累加器与重新量化}
+
+\section{从当前 lab 的简化路径开始，但落点是 7B 权重}
+
+第三册的 lab 里已经有一个最小切片。模型文件 \filepath{tiny_mlp_i8.txt} 保存 int8 权重、float bias 和每层一个 scale。当前 \code{linear_i8} 的核心路径可以概括为：
+
+\begin{lstlisting}[numbers=none,caption={当前 lab 的简化量化路径}]
+weight_i8 = load int8 weight
+weight_f32 = float(weight_i8) * layer.scale
+acc_f32 += weight_f32 * input_f32
+output_f32 = acc_f32 + bias
+\end{lstlisting}
+
+这条路径只量化了权重，输入和输出仍然是 float32，累加器也是 float32。它非常适合教学的第一步：模型文件已经变小，权重地址流已经是 int8，结果又能用普通浮点误差比较。但它不是完整 int8 推理，更不是 7B 大模型的最终量化方案。真实本地推理要同时面对权重容量、内存带宽、CPU/GPU kernel、activation 精度、KV cache 容量和生成质量。完整路径通常还会量化 activation，用 int32 做 dot-product 累加，再把 int32 累加结果重新映射到目标输出类型；更激进的权重量化还会进入 int4、group-wise scale 和 dequant-on-the-fly。
+
+\begin{keyidea}
+量化不是把类型名从 float 改成 int8。它是一份数值合同和后端合同：实数怎样映射到整数，乘加在哪个宽度里累加，bias 属于哪个尺度，输出怎样重新量化，KV cache 是否压缩，CPU/GPU kernel 怎样读 scale，误差怎样被 oracle 接受。
+\end{keyidea}
+
+\section{为什么 7B 推理绕不开量化}
+
+先只看权重容量，不看临时 activation、KV cache、allocator overhead 和 packed weight。一个 7B 参数模型若按不同 dtype 保存，大致账本是：
+
+\begin{lstlisting}[numbers=none,caption={7B 权重容量的粗略账本}]
+fp32: 7e9 * 4 bytes  ~= 28 GB
+fp16: 7e9 * 2 bytes  ~= 14 GB
+int8: 7e9 * 1 byte   ~=  7 GB, plus scales
+int4: 7e9 * 0.5 byte ~=  3.5 GB, plus group scales
+\end{lstlisting}
+
+这个账本解释了为什么本地推理不会只讨论 fp32。许多普通机器装不下 fp32 权重；即使装得下，权重流也会压垮内存带宽。fp16/bf16 是常见精度基线，int8 和 int4 是本地部署的重要路径。量化的目标不是让文件更小这么简单，而是让模型能被加载、能在 cache/内存/显存带宽下持续供数，并且让 CPU/GPU kernel 能把压缩格式转化成可计算的乘加流。
+
+\section{线性量化的合同}
+
+最常见的线性量化把实数 \code{x} 映射到整数 \code{q}：
+
+\begin{lstlisting}[numbers=none,caption={线性量化合同}]
+q = clamp(round(x / scale) + zero_point, qmin, qmax)
+x_approx = (q - zero_point) * scale
+\end{lstlisting}
+
+\code{scale} 是整数相邻刻度之间代表的实数间隔，\code{zero_point} 是实数零对应的整数位置。对称量化常让 \code{zero_point = 0}，权重可以落在 \code{-128..127} 或 \code{-127..127} 附近；非对称量化允许零点偏移，适合 activation 范围不以零为中心的情况。
+
+这个公式有三个必须写清的边界。第一，\code{round} 采用哪种舍入规则；不同实现可能选择 ties-to-even、away-from-zero 或固定点近似。第二，\code{clamp} 会吞掉超出范围的值；校准阶段若低估范围，极端值就会饱和。第三，反量化不是恢复原值，只是得到近似值；oracle 必须允许合同内误差。
+
+\begin{systemdiagram}{实数、整数码点和误差合同}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.15cm] (real) at (0,0.95) {实数张量\\float values};
+  \node[book teal node,text width=2.15cm] (range) at (2.85,0.95) {校准范围\\min/max};
+  \node[book purple node,text width=2.15cm] (params) at (5.7,0.95) {量化参数\\scale + zp};
+  \node[book amber node,text width=2.15cm] (codes) at (8.55,0.95) {整数码点\\int8/uint8};
+
+  \draw[book strong arrow] (real) -- (range);
+  \draw[book strong arrow] (range) -- (params);
+  \draw[book strong arrow] (params) -- (codes);
+
+  \node[book red node,text width=2.25cm] (round) at (2.85,-1.05) {舍入误差\\rounding};
+  \node[book red node,text width=2.25cm] (clamp) at (5.7,-1.05) {饱和误差\\clamp};
+  \node[book navy node,text width=2.25cm] (oracle) at (8.55,-1.05) {oracle\\允许误差界};
+
+  \draw[book weak arrow] (range) -- (round);
+  \draw[book weak arrow] (params) -- (clamp);
+  \draw[book weak arrow] (codes) -- (oracle);
+
+  \node[book label,text width=9.8cm] at (4.3,-2.25) {量化参数是数值合同的一部分；没有舍入、饱和和误差边界，int8 输出不能被可靠判定。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：量化误差来自范围选择、舍入和饱和，必须进入正确性合同。}
+\end{systemdiagram}
+
+\section{为什么 accumulator 不能用 int8}
+
+两个 int8 数相乘，中间乘积已经不适合继续装在 int8。若 \code{a} 和 \code{w} 都接近 127，单次乘积约为 16129；再沿 \code{K} 累加，范围会继续扩大。因此 int8 dot-product 通常使用 int32 accumulator：
+
+\begin{lstlisting}[numbers=none,caption={int8 dot-product 的整数账本}]
+int32 acc = 0
+for k in 0..K:
+  int32 a = int32(input_i8[k]) - zero_input
+  int32 w = int32(weight_i8[k]) - zero_weight
+  acc += a * w
+\end{lstlisting}
+
+accumulator 的上界可以粗略估计：
+
+\begin{lstlisting}[numbers=none,caption={accumulator 范围估计}]
+worst_product ~= 127 * 127
+worst_acc     ~= K * worst_product
+
+if K = 4096:
+  worst_acc is about 66 million
+  int8 and int16 are not enough
+\end{lstlisting}
+
+真实模型不一定达到最坏情况，但内核不能依赖“通常不会”。溢出一旦发生，结果可能仍然像正常数字，不会崩溃，却会悄悄改变分类边界。使用 int32 accumulator 是把正确性边界先守住，再考虑指令吞吐和 requantize 成本。
+
+\section{Scale 怎样穿过乘加}
+
+若输入和权重都被量化，反量化语义是：
+
+\begin{lstlisting}[numbers=none,caption={从量化值恢复 dot-product 语义}]
+real_a[k] = (qa[k] - za) * scale_a
+real_w[k] = (qw[k] - zw) * scale_w
+
+real_acc = sum_k real_a[k] * real_w[k]
+         = scale_a * scale_w *
+           sum_k (qa[k] - za) * (qw[k] - zw)
+\end{lstlisting}
+
+这说明 int32 accumulator 保存的是无量纲整数和，真正的实数尺度在 \code{scale_a * scale_w} 上。bias 必须进入同一个尺度。常见做法是把 float bias 预先量化成 int32 bias：
+
+\begin{lstlisting}[numbers=none,caption={bias 折叠到 int32 accumulator}]
+bias_i32[out] = round(bias_f32[out] / (scale_a * scale_w[out]))
+acc_i32 += bias_i32[out]
+\end{lstlisting}
+
+若使用 per-tensor weight scale，所有输出通道共用一个 \code{scale_w}；若使用 per-channel weight scale，每个 \code{out} 有自己的 scale，精度通常更好，但 requantize 和参数管理更复杂。第三册在这一章先讲清账本，后面再讨论不同 scale 粒度对模型精度和内核复杂度的影响。
+
+\section{重新量化不是简单右移}
+
+如果下一层还希望接收 int8 activation，就要把 int32 accumulator 映射回 int8 或 uint8：
+
+\begin{lstlisting}[numbers=none,caption={重新量化的数学形状}]
+real_out = acc_i32 * scale_a * scale_w
+q_out = clamp(round(real_out / scale_out) + zero_out, qmin, qmax)
+
+combined_multiplier = scale_a * scale_w / scale_out
+q_out = clamp(round(acc_i32 * combined_multiplier) + zero_out, qmin, qmax)
+\end{lstlisting}
+
+这里的 \code{combined_multiplier} 很少刚好是 2 的幂。高性能实现通常把它近似成固定点乘法加 shift，再处理舍入和饱和。于是重新量化至少包含四步：乘以缩放因子、舍入、加输出零点、clamp 到目标整数范围。若还有 ReLU 或 ReLU6，activation clamp 也可以融合进最后的范围限制。
+
+\begin{systemdiagram}{int32 accumulator 到 int8 输出的重新量化路径}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.1cm] (acc) at (0,0.95) {int32 acc\\dot + bias};
+  \node[book teal node,text width=2.1cm] (mul) at (2.75,0.95) {固定点乘\\combined scale};
+  \node[book purple node,text width=2.1cm] (round) at (5.5,0.95) {舍入\\round};
+  \node[book amber node,text width=2.1cm] (zp) at (8.25,0.95) {加零点\\zero\_out};
+  \node[book navy node,text width=2.1cm] (clamp) at (11.0,0.95) {饱和\\int8 range};
+
+  \draw[book strong arrow] (acc) -- (mul);
+  \draw[book strong arrow] (mul) -- (round);
+  \draw[book strong arrow] (round) -- (zp);
+  \draw[book strong arrow] (zp) -- (clamp);
+
+  \node[book label,text width=2.3cm] at (0,-0.55) {累加宽度保护正确性};
+  \node[book label,text width=2.3cm] at (2.75,-0.55) {实数乘法变成整数近似};
+  \node[book label,text width=2.3cm] at (5.5,-0.55) {规则必须固定};
+  \node[book label,text width=2.3cm] at (8.25,-0.55) {输出整数零点};
+  \node[book label,text width=2.3cm] at (11.0,-0.55) {可融合 activation};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：requantize 是一条数值和整数实现共同参与的路径，不是把 int32 截断成 int8。}
+\end{systemdiagram}
+
+\section{固定点 requantize 的边界}
+
+实际 int8 kernel 里不希望每个输出都做慢速浮点乘法。常见做法是把 \code{combined_multiplier} 近似为整数乘法和右移：
+
+\begin{lstlisting}[numbers=none,caption={固定点 requantize 的形态}]
+scaled = round(acc_i32 * multiplier / 2^shift)
+q = clamp(scaled + zero_out, qmin, qmax)
+\end{lstlisting}
+
+这里要固定三件事。第一，\code{multiplier} 和 \code{shift} 怎样从实数 multiplier 生成。第二，右移前怎样舍入，负数是否对称处理。第三，乘法中间结果需要多宽，通常要用 64 位临时值避免溢出。
+
+\begin{lstlisting}[numbers=none,caption={requantize 测试必须覆盖的值}]
+acc_i32:
+  0
+  1
+  -1
+  near positive saturation
+  near negative saturation
+  values around rounding half
+  large values requiring int64 intermediate
+\end{lstlisting}
+
+若这些边界没测，量化输出可能在普通样本上看起来正常，却在某些通道长期偏一。对分类模型，偏一可能不改变 top-1；对语言模型 logits，长期偏差可能改变 top-k 排名。
+
+\section{zero point 修正项为什么会拖慢内核}
+
+非对称量化中 dot-product 是：
+
+\[
+\sum_k (q_a[k]-z_a)(q_w[k]-z_w)
+\]
+
+展开后：
+
+\[
+\sum_k q_a[k]q_w[k]
+- z_w\sum_k q_a[k]
+- z_a\sum_k q_w[k]
++ K z_a z_w
+\]
+
+这条式子说明，非对称 zero point 不是免费字段。kernel 要么每次乘法前减 zero point，要么预计算某些和，例如每个权重行的 \(\sum q_w[k]\)。权重 zero point 若为 0，可以少掉一部分修正；activation zero point 若固定，也可以把某些项合并进 bias 或预处理。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+选择 & 内核影响 & 常见用途 \\
+\midrule
+权重对称 & 少一个权重零点修正 & weight-only 或 per-channel weight \\
+activation 非对称 & 更好利用 activation 范围 & int8 activation pipeline \\
+二者非对称 & 精度可能好 & 修正项和测试更复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这也是很多推理后端先做对称权重量化的原因：收益明显，内核合同较清楚。等 reference、oracle 和 profiler 稳定后，再引入 activation 非对称量化更稳。
+
+\section{bias 的尺度错误会稳定污染输出}
+
+bias 常被忽略，但量化路径里它非常敏感。若 int32 accumulator 表示的是：
+
+\[
+acc_i32 = \sum_k q_a[k]q_w[k]
+\]
+
+则它对应的实数尺度是 \code{scale_a * scale_w}。bias 若仍是 float，需要先除以这个尺度再加入 accumulator，或在 accumulator 变回实数后加入。两种做法语义都可以，但不能混用。
+
+\begin{lstlisting}[numbers=none,caption={两种 bias 路径不能混用}]
+path A:
+  acc_i32 += round(bias_f32 / (scale_a * scale_w))
+  output = requantize(acc_i32)
+
+path B:
+  real = acc_i32 * scale_a * scale_w
+  real += bias_f32
+  output = quantize(real)
+\end{lstlisting}
+
+若 path A 的 bias 被当成 path B 使用，或者 per-channel \code{scale_w[out]} 被错用成 per-tensor scale，输出会出现稳定偏移。它不像随机舍入误差，而是每次都朝同一方向偏。oracle 应该单独测 bias-only、zero-input、one-hot-input 这些样本，便于定位。
+
+\section{对称、非对称、per-tensor、per-channel 与 per-group}
+
+量化参数的粒度会影响误差和内核复杂度。
+
+\topic{对称权重量化。} 权重通常正负都有，使用 \code{zero_point = 0} 可以减少内核里的减零点操作，也让 dot-product 更简单。当前 lab 的模型就是这种教学形状：int8 权重乘以一个 float scale。
+
+\topic{非对称 activation 量化。} activation 可能范围偏正，例如 ReLU 后没有负数。使用非对称 zero point 可以更充分利用整数码点，但内核要处理 \code{qa - za}，有时还要展开零点修正项。
+
+\topic{per-tensor scale。} 整个张量共用一个 scale，实现简单，元数据少，但某些输出通道如果范围差异很大，小范围通道会损失精度。
+
+\topic{per-channel scale。} 每个输出通道拥有自己的权重 scale，常用于权重量化。它改善精度，但 requantize 阶段每个通道的 multiplier 不同，packing 和参数读取也要配合。
+
+\topic{per-group scale。} 大模型权重量化常按一小组连续权重共享 scale，例如每 32、64 或 128 个元素一组。它比 per-tensor 更能贴近局部范围，又比 per-element 元数据少。代价是 kernel 必须在读取权重块时同步读取 group scale，并且 packing 时不能把 scale 和数据关系打散。
+
+工程上没有一个永远正确的选择。小型教学切片可以先使用 per-tensor scale，让模型文件、内核和 oracle 都清楚；7B 推理引擎要逐步引入 per-channel 或 per-group scale、校准数据集、后训练量化报告，以及 CPU/GPU 后端都能理解的 packed quantized layout。
+
+\begin{systemdiagram}{7B 权重量化格式必须同时服务数值和后端}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.2cm] (fp) at (0,1.2) {原始权重\\fp16/bf16};
+  \node[book teal node,text width=2.2cm] (group) at (2.9,1.2) {分组\\channel/group};
+  \node[book purple node,text width=2.2cm] (q) at (5.8,1.2) {整数码点\\int8/int4};
+  \node[book amber node,text width=2.2cm] (pack) at (8.7,1.2) {packed layout\\CPU/GPU};
+
+  \draw[book strong arrow] (fp) -- (group);
+  \draw[book strong arrow] (group) -- (q);
+  \draw[book strong arrow] (q) -- (pack);
+
+  \node[book red node,text width=2.25cm] (scale) at (2.9,-0.75) {scale 元数据\\不可丢};
+  \node[book navy node,text width=2.25cm] (kernel) at (5.8,-0.75) {kernel 读取\\dequant 或 dot};
+  \node[book teal node,text width=2.25cm] (oracle) at (8.7,-0.75) {oracle\\误差/生成质量};
+
+  \draw[book weak arrow] (group) -- (scale);
+  \draw[book weak arrow] (q) -- (kernel);
+  \draw[book weak arrow] (pack) -- (oracle);
+
+  \node[book label,text width=9.6cm] at (4.35,-2.0) {量化格式不是文件压缩格式；它必须同时让数值误差可解释、让 CPU/GPU kernel 能高效读取。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：7B 权重量化的 scale 粒度、整数码点和 packed layout 必须一起设计。}
+\end{systemdiagram}
+
+\section{量化 oracle 要比较什么}
+
+浮点 reference 和 int8 实现不应该逐 bit 相等。对于分类切片，oracle 至少要比较三类结果：
+
+\begin{itemize}
+  \item 数值误差：每个输出元素的绝对误差、相对误差或反量化误差是否在合同内。
+  \item 排名稳定性：分类任务的 top-1 或 top-k 是否保持，边界样本是否被标记。
+  \item 饱和统计：有多少值被 clamp 到最小或最大码点，是否集中在某一层或某一通道。
+\end{itemize}
+
+如果只看 top-1，很多数值错误会被掩盖；如果只看逐元素误差，分类边界变化又可能被低估。对 7B 生成模型，还要增加层级 logits 检查和生成质量检查：固定 prompt、固定 sampler、固定随机种子时，logits 的 top-k 排名是否稳定；量化前后的困惑度或小验证集损失是否在阈值内；长上下文时 KV cache 量化是否导致后半段输出明显漂移。成熟报告应该同时写出 reference 版本、量化参数、输入样本集合、误差阈值、top-k 结果、饱和计数、logits 对比和生成样本摘要。
+
+\begin{lstlisting}[numbers=none,caption={量化误差报告的最小字段}]
+model_id
+input_set_id
+layer_name
+scale_policy: per_tensor or per_channel
+max_abs_error
+mean_abs_error
+top1_changed_count
+clamped_min_count
+clamped_max_count
+logits_topk_changed_count
+decode_token_mismatch_count
+accepted: true or false
+\end{lstlisting}
+
+\section{KV cache 能不能量化}
+
+KV cache 和权重不同。权重在加载后基本不变，可以离线量化、打包、校准；KV cache 是推理过程中不断写入的状态。每生成一个 token，每一层都会追加新的 K 和 V。若上下文很长，KV cache 会成为显著内存开销，也会成为 decode attention 的读取流。
+
+\begin{lstlisting}[numbers=none,caption={KV cache 的状态账本}]
+K_cache[layer, batch, head, position, head_dim]
+V_cache[layer, batch, head, position, head_dim]
+
+on each decoded token:
+  compute k, v for current position
+  write k, v into cache
+  attention reads positions 0..current_position
+\end{lstlisting}
+
+是否量化 KV cache，要分开判断容量、带宽和误差。量化后 cache 更小，长上下文可能明显受益；但每次写入要量化，每次 attention 读取可能要反量化或使用支持低精度的 kernel。若 scale 按 token、head 或 block 变化，元数据读写也会进入热路径。KV cache 量化因此不能只看“省了多少字节”，还要看 decode tokens/s、logits 漂移和长上下文质量。
+
+\begin{warningbox}
+权重量化成功不代表 KV cache 也能用同一套策略。权重是静态参数，KV cache 是动态状态；权重误差在每层固定存在，KV cache 误差会随着上下文读取方式进入后续 token。
+\end{warningbox}
+
+\section{当前 lab 到 7B 量化路径的升级点}
+
+现在的 \code{linear_i8} 可以作为第一阶段验收：模型加载、shape 检查、int8 权重读取、float scale 和 bias、activation、argmax 都已经有清楚边界。要把它升级成 7B 推理引擎里的量化路径，应分阶段推进，而不是一次重写：
+
+\begin{lstlisting}[numbers=none,caption={从教学线性层到完整 int8 kernel 的阶段}]
+stage 1:
+  int8 weights, float input, float accumulator
+  easy oracle and model parsing
+
+stage 2:
+  int8 weights, int8 activation, int32 accumulator
+  explicit input scale and zero point
+
+stage 3:
+  int32 bias folded into accumulator scale
+  requantize output to int8 activation
+
+stage 4:
+  packed weights, SIMD dot-product, per-channel scales
+  benchmark and error report tied to one model id
+
+stage 5:
+  group-wise int4 or int8 weights for transformer projections
+  dequant-on-the-fly and backend-specific packed layout
+
+stage 6:
+  optional KV cache quantization
+  long-context error and decode throughput report
+\end{lstlisting}
+
+每个阶段都必须保持同一件事：reference 语义不变。若引入 int8 activation 后 top-1 变化，或 7B 模型的 logits/top-k/token 序列变化，要能判断是量化误差超出合同，还是实现 bug，例如 scale 用错、zero point 漏减、bias 尺度不一致、requantize 舍入规则不匹配、group scale 读错、packed layout 和 kernel 解释不一致。
+
+\section{本章验收线}
+
+读完本章，应该能完成下面几件事：
+
+\begin{itemize}
+  \item 写出线性量化和反量化公式，并说明 scale、zero point、round 和 clamp 的作用。
+  \item 解释 int8 dot-product 为什么需要 int32 accumulator。
+  \item 把 \code{scale_a * scale_w / scale_out} 推导成 requantize 的 combined multiplier。
+  \item 区分当前 lab 的简化路径和完整 int8 activation 路径。
+  \item 解释 7B 权重在 fp16、int8、int4 下的容量压力，并说明 per-channel/per-group scale 的取舍。
+  \item 说明 KV cache 量化为什么不同于权重量化。
+  \item 设计一个量化 oracle，至少包含数值误差、top-k 稳定性、饱和统计、logits 对比和生成 token 变化。
+\end{itemize}
+
+后续章节会把这些量化账本放回算子实现：当权重被 packing、SIMD dot-product 指令被使用、GPU kernel 接入、多个层融合、activation buffer 被复用、KV cache 被压缩时，scale、zero point、accumulator、group metadata 和 oracle 仍然必须能被追踪。

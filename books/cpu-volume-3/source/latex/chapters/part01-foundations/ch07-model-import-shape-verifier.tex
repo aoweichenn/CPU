@@ -1,0 +1,319 @@
+\chapter{AI 编译器前端：模型导入、manifest 与 shape verifier}
+
+\section{先从一个会悄悄跑错的模型开始}
+
+推理引擎最危险的失败，不是程序立刻崩溃，而是模型能跑、速度也正常、生成结果却已经被污染。假设一个 7B 模型目录里有这些文件：
+
+\begin{lstlisting}[numbers=none,caption={一个本地模型目录的最小文件组}]
+config.json
+tokenizer.model
+tokenizer_config.json
+weights-00001.bin
+weights-00002.bin
+quantization.json
+\end{lstlisting}
+
+如果 \code{config.json} 写着 \code{hidden_size = 4096}，但某个 \code{Wq} 权重实际按 \code{[4096, 4096]} 以外的形状保存，后端 linear kernel 仍然可能读到连续字节并给出一个输出。若 tokenizer 的词表大小和 \code{lm_head} 的输出维度差一个特殊 token，采样器也可能只在极少数 prompt 上出错。若某个 int4 权重缺少 group scale，kernel 甚至能按照错误 scale 反量化出一串“看起来像数”的浮点值。
+
+这就是 AI 编译器前端存在的理由。它不只是把文件读进内存，而是要把模型文件转换成一个已检查的 \term{manifest}{清单} 和 typed graph。manifest 不是随手写的说明文档，而是“后端可以相信哪些事实”的合同：有哪些张量、每个张量在哪里、形状是什么、dtype 是什么、量化参数是什么、哪个算子消费它、输出应该是什么。
+
+\begin{keyidea}
+模型导入阶段的目标不是“加载成功”，而是建立可验证的语义合同。没有 manifest、shape verifier 和 typed graph，后端 kernel 只能在热路径里猜测输入是否正确。
+\end{keyidea}
+
+\section{manifest：把文件事实变成编译器事实}
+
+传统编译器的源文件需要词法和语法分析；AI 编译器的模型文件需要 manifest。manifest 至少要收集四类事实：
+
+\begin{itemize}
+  \item 模型结构：层数、hidden size、intermediate size、head 数、KV head 数、head dimension、最大上下文长度。
+  \item tokenizer 合同：词表大小、特殊 token、BOS/EOS/PAD 规则、是否需要加入前缀空格、byte fallback 或 normalizer。
+  \item 权重目录：每个权重张量的名字、文件偏移、字节长度、dtype、shape、逻辑 layout 和 checksum。
+  \item 量化元数据：量化格式、group size、scale dtype、zero point 策略、per-tensor/per-channel/per-group 边界。
+\end{itemize}
+
+下面是一个压缩后的 manifest 草图。真实工程里可以来自 JSON、二进制索引或模型格式内置 metadata；教材先写成文本，是为了看清不变量。
+
+\begin{lstlisting}[numbers=none,caption={模型 manifest 的核心字段}]
+model:
+  architecture: decoder_only_transformer
+  layers: 32
+  hidden_size: 4096
+  intermediate_size: 11008
+  attention_heads: 32
+  kv_heads: 8
+  head_dim: 128
+  max_context: 4096
+
+tokenizer:
+  vocab_size: 32000
+  bos_id: 1
+  eos_id: 2
+
+tensor:
+  name: layers.0.attn.wq.weight
+  role: linear_weight
+  shape: [4096, 4096]
+  dtype: q4_group
+  group_size: 64
+  scale_dtype: f16
+  file: weights-00001.bin
+  offset: 1048576
+  bytes: 9437184
+\end{lstlisting}
+
+manifest 的作用不是增加格式复杂度，而是把“文件里有什么”变成“编译器知道什么”。后续 graph import 不再直接扫文件名；它查询 manifest。后续 shape verifier 不再靠字符串约定；它读 tensor descriptor。后续 backend lowering 不再猜某个权重是不是 int4；它读 dtype 和 quantization descriptor。
+
+\section{导入不是字符串匹配}
+
+许多教学代码会用简单规则找权重名，例如看到 \code{wq} 就当作 Q projection，看到 \code{w1} 就当作 MLP gate。真实模型格式会让这种做法很快崩掉：不同模型使用不同命名，某些权重已经被合并为 QKV packed projection，某些模型有 grouped-query attention，某些模型把 \code{lm_head} 和 embedding tied 在一起，某些模型的 RoPE scaling 规则也不同。
+
+前端应该把导入分成三步：
+
+\begin{lstlisting}[numbers=none,caption={模型导入的三阶段}]
+parse_files:
+  read config, tokenizer config, tensor index, quant metadata
+  build raw manifest entries
+
+resolve_schema:
+  map model-specific names to canonical roles
+  detect tied weights and packed projections
+  attach tokenizer and generation contracts
+
+verify_and_import:
+  run shape/dtype/quant checks
+  produce typed graph nodes and tensor descriptors
+\end{lstlisting}
+
+第一步只读事实，不解释太多。第二步把模型方言映射到本引擎的 canonical roles，例如 \code{q_proj.weight}、\code{attention.wq.weight}、\code{layers.0.attention.wq} 都可能被解析为同一个角色。第三步才产生 typed graph。这个顺序很重要：如果一边扫文件一边直接创建 graph node，错误通常会散落在导入代码、运行时代码和后端代码里。
+
+\section{schema resolution：把模型方言翻译成统一角色}
+
+不同模型家族最烦人的地方不是数学完全不同，而是同一数学对象有不同名字、不同转置约定和不同融合方式。前端必须把它们翻译成本引擎内部的统一角色。否则每个后端 kernel 都会开始识别模型名字，系统很快失控。
+
+\begin{center}
+\begin{tabular}{p{0.28\linewidth}p{0.25\linewidth}p{0.31\linewidth}}
+\toprule
+外部命名示例 & canonical role & verifier 要确认 \\
+\midrule
+\code{model.embed_tokens.weight} & token embedding & 行数等于 vocab size，列数等于 hidden \\
+\code{self_attn.q_proj.weight} & attention Q & 输出维等于 \code{n_q * head_dim} \\
+\code{self_attn.k_proj.weight} & attention K & 输出维等于 \code{n_kv * head_dim} \\
+\code{mlp.gate_proj.weight} & MLP gate & 输出维等于 intermediate \\
+\code{lm_head.weight} & logits projection & 是否 tied embedding，词表大小一致 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+有些模型把 Q/K/V 合并成一个大张量，例如 \code{qkv_proj.weight}。这时 schema resolution 不能简单把它当成普通 linear，而要记录切片规则：
+
+\begin{lstlisting}[numbers=none,caption={QKV packed projection 的导入合同}]
+PackedQKV:
+  source_tensor
+  q_range: [0, n_q * head_dim)
+  k_range: [q_end, q_end + n_kv * head_dim)
+  v_range: [k_end, k_end + n_kv * head_dim)
+  storage_layout: row_major | col_major | backend_packed
+\end{lstlisting}
+
+如果这个合同不显式保存，后端就可能把 \code{Q/K/V} 的切片顺序写死在 kernel 里。等另一个模型把顺序改成 \code{Q/V/K}，程序仍然能跑，但 attention 会稳定地错。
+
+\section{一层 decoder 的 shape 推导例子}
+
+把 shape verifier 写成代码之前，要能在纸上推导一层。设配置为：
+
+\begin{lstlisting}[numbers=none,caption={一组 7B 级 decoder 配置}]
+hidden_size = 4096
+intermediate_size = 11008
+attention_heads = 32
+kv_heads = 8
+head_dim = 128
+\end{lstlisting}
+
+则 verifier 应该推出：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.28\linewidth}p{0.34\linewidth}}
+\toprule
+张量角色 & 期望形状 & 推导来源 \\
+\midrule
+Q weight & \code{[4096,4096]} & \code{n_q * d = 32 * 128} \\
+K weight & \code{[1024,4096]} & \code{n_kv * d = 8 * 128} \\
+V weight & \code{[1024,4096]} & 同 K \\
+O weight & \code{[4096,4096]} & query heads 拼回 hidden \\
+MLP gate/up & \code{[11008,4096]} & intermediate by hidden \\
+MLP down & \code{[4096,11008]} & hidden by intermediate \\
+RMSNorm gamma & \code{[4096]} & 每个 hidden 维度一个权重 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个例子很重要，因为它能立即抓住 GQA 配置错误。若 K/V 权重被导入成 \code{[4096,4096]}，但配置写着 \code{kv_heads=8}，前端必须拒绝或明确标记这是非 GQA 模型；不能让 attention kernel 到运行时才发现 \code{kv_head} 索引和权重输出维度对不上。
+
+\section{shape verifier：让每条边都有可证明的形状}
+
+shape verifier 是 AI 编译器前端的语义分析器。它的输入是 manifest 和 graph schema，输出是带 shape 的 typed graph，或者一组明确诊断。以一层 decoder block 为例，若 hidden size 记为 \code{H}，head 数为 \code{A}，KV head 数为 \code{KVA}，head dimension 为 \code{D}，那么至少有：
+
+\begin{lstlisting}[numbers=none,caption={decoder 层 shape 约束}]
+H == A * D
+K_shape == [KVA * D, H]
+V_shape == [KVA * D, H]
+Q_shape == [A * D, H]
+Wo_shape == [H, A * D]
+Wgate_shape == [I, H]
+Wup_shape == [I, H]
+Wdown_shape == [H, I]
+RMSNorm_gamma_shape == [H]
+KV_cache_shape == [layers, batch, KVA, max_context, D]
+\end{lstlisting}
+
+这些约束决定的不只是正确性，还决定性能路径。若 \code{KVA < A}，这是 grouped-query attention，decode attention kernel 要知道多个 query head 共享一组 K/V head；若 \code{D} 不是 SIMD-friendly 的倍数，CPU 后端要准备尾部处理；若 \code{I} 和 tile size 不对齐，MLP kernel 需要 remainder path。shape verifier 把这些事实提前暴露出来，而不是让后端在热循环里临时发现。
+
+\begin{systemdiagram}{manifest 到 typed graph 的前端流水线}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.35cm] (files) at (0,1.45) {模型文件\\config/weights};
+  \node[book teal node,text width=2.35cm] (manifest) at (3.15,1.45) {manifest\\张量清单};
+  \node[book purple node,text width=2.35cm] (schema) at (6.3,2.35) {schema\\角色映射};
+  \node[book amber node,text width=2.35cm] (verify) at (6.3,0.55) {verifier\\shape\\dtype/quant};
+  \node[book navy node,text width=2.35cm] (graph) at (9.45,1.45) {typed graph\\后端输入};
+
+  \draw[book strong arrow] (files) -- (manifest);
+  \draw[book strong arrow] (manifest) -- (schema);
+  \draw[book strong arrow] (manifest) -- (verify);
+  \draw[book weak arrow] (schema) -- (verify);
+  \draw[book strong arrow] (verify) -- (graph);
+
+  \node[book label,text width=9.8cm] at (4.75,-0.95) {前端先把文件事实稳定成 manifest，再把模型方言解析成角色，最后由 verifier 产出可被后端相信的 typed graph。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：模型导入不是直接读权重跑 kernel，而是 manifest、schema 和 verifier 共同建立编译器事实。}
+\end{systemdiagram}
+
+\section{dtype verifier：不是每个字节数组都能进 kernel}
+
+shape 对了，dtype 仍然可能错。一个 linear 权重可能是 fp16、bf16、int8、int4 group-wise，也可能是某个后端专用 packed format。dtype verifier 要检查三层事实：
+
+\begin{itemize}
+  \item 逻辑 dtype：算子语义中权重代表什么数值类型，例如 f16 weight 或 q4 group weight。
+  \item 存储 dtype：文件中每个元素或压缩块怎样编码，例如 4-bit pair、int8、f16 scale。
+  \item 计算 dtype：kernel 中使用什么累加器和输出类型，例如 fp32 accumulator、int32 dot accumulator、f16 output。
+\end{itemize}
+
+这三层不能混为一谈。int4 权重的逻辑值是近似浮点权重，存储上可能两个 4-bit value 打包在一个字节，计算时可能先反量化到寄存器再做 FMA，也可能走整数 dot 再 requantize。若 manifest 只写 \code{dtype=int4}，后端还不知道 group size、scale layout、zero point、padding 和尾部怎么处理。
+
+\begin{lstlisting}[numbers=none,caption={量化权重 verifier 要检查的边界}]
+for each quantized weight tensor:
+  require group_size > 0
+  require input_channels % group_size == 0 or tail_policy exists
+  require scale tensor exists
+  require scale length matches groups
+  require packed byte length matches shape and bit width
+  require backend supports this quant format
+\end{lstlisting}
+
+这些检查看似繁琐，但比在 kernel 中读越界 scale 或错误解码权重便宜得多。前端拒绝模型是清晰错误；后端悄悄算错 logits 是高成本错误。
+
+\section{verifier 负例矩阵}
+
+前端测试不能只加载一个正确模型。必须构造坏 manifest，证明 verifier 会在正确层次拒绝它。最小负例矩阵如下：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.36\linewidth}p{0.24\linewidth}}
+\toprule
+负例 & 应报位置 & 典型风险 \\
+\midrule
+embedding 行数少于 vocab & tokenizer/embedding verifier & token id 越界 \\
+K/V head 数与权重维度不一致 & shape verifier & GQA attention 读错 head \\
+QKV packed 切片顺序缺失 & schema verifier & Q/K/V 语义交换 \\
+int4 scale 数量不足 & quant verifier & kernel 越界或误反量化 \\
+group size 为 0 或不支持 & quant verifier & 除零或 unsupported plan \\
+RoPE head dim 为奇数 & position verifier & 二维旋转对不完整 \\
+max context 小于 prompt & runtime admission & KV cache 越界 \\
+GPU 不支持目标 dtype & backend capability & 静默 fallback 或失败 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+每个负例都应该检查诊断内容，而不只是“失败了”。比如 K/V head 维度错误的诊断要写出 \code{kv_heads * head_dim} 的推导；int4 scale 数量错误要写出 expected scale count；GPU dtype 不支持要写出 requested profile 和 backend capability。
+
+\section{RoPE 和位置参数也要验证}
+
+RoPE 参数如果错，shape 仍然可能全部正确。前端至少要检查：
+
+\begin{itemize}
+  \item \code{head_dim} 是否能拆成二维旋转对，通常要求偶数。
+  \item RoPE base、scaling 类型、原始最大位置和扩展规则是否存在。
+  \item prefill 与 decode 使用同一 position 语义。
+  \item sliding window 或 prefix cache 是否记录 base position。
+\end{itemize}
+
+\begin{lstlisting}[numbers=none,caption={RoPE verifier 字段}]
+RopeDesc:
+  head_dim
+  base_theta
+  scaling_policy
+  original_max_position
+  effective_max_position
+  position_base_policy
+\end{lstlisting}
+
+如果模型使用扩展上下文策略，而 manifest 没记录 scaling policy，引擎可以选择拒绝，而不是默认用基础 RoPE。默认继续跑会得到 shape 正确但长上下文错误的结果。
+
+\section{tokenizer 也是编译合同的一部分}
+
+很多人把 tokenizer 当作预处理，但本地推理引擎不能这样切开。tokenizer 决定 token id 序列，token id 决定 embedding 访问和位置编码，最终影响每一步 logits。若 tokenizer 的 BOS/EOS 规则、normalizer 或特殊 token 与模型训练时不一致，后端再快也只是高效地产生错误输入。
+
+前端至少要验证：
+
+\begin{itemize}
+  \item tokenizer 词表大小等于 embedding 行数，或有明确扩展规则。
+  \item \code{bos_id}、\code{eos_id}、\code{unk_id} 等特殊 token 在词表范围内。
+  \item generation config 中的 stop token 与 tokenizer 合同一致。
+  \item prompt encode 后的 token 数不会超过当前 session 的 max context。
+  \item tokenizer 输出 dtype 能被 embedding kernel 接受，通常是 32 位整数索引。
+\end{itemize}
+
+这部分和编译器的符号解析有相似性。源代码里的名字必须解析到某个声明；prompt 里的文本必须解析到模型词表中的 token id。若解析规则错了，后面所有 IR 和 kernel 都建立在错误输入上。
+
+\section{诊断：错误要停在前端，而不是后端崩溃}
+
+shape verifier 的诊断要像编译器错误，而不是像运行时崩溃。一个有用诊断应该包含：哪个 tensor、期望形状、实际形状、这个期望来自哪个 config 字段或上游算子，以及可能的修复方向。
+
+\begin{lstlisting}[numbers=none,caption={好的模型导入诊断示例}]
+error: tensor layers.12.attn.wk.weight has incompatible shape
+  expected: [1024, 4096]
+    reason: kv_heads(8) * head_dim(128), hidden_size(4096)
+  actual:   [4096, 4096]
+  note: this looks like full multi-head K projection,
+        but config declares grouped-query attention
+\end{lstlisting}
+
+这类诊断让使用者知道是模型文件、config、转换脚本还是引擎 schema 出了问题。反过来，如果只在后端报 \code{invalid argument} 或 \code{segmentation fault}，调试会被迫从机器码和二进制文件倒推语义，成本完全不对等。
+
+\section{前端产物：typed graph 必须足够给后端使用}
+
+前端通过后，输出不应该只是“一个 graph 指针”。它至少要包含：
+
+\begin{itemize}
+  \item Graph nodes：算子类型、输入输出边、状态边和执行阶段标签。
+  \item Tensor descriptors：shape、stride、dtype、layout、quantization、file location、ownership。
+  \item Symbol table：canonical tensor name 到 descriptor 的映射。
+  \item State descriptors：KV cache、position、session buffer 和 sampler state。
+  \item Verification report：通过了哪些约束，哪些路径需要 fallback 或 tail handling。
+\end{itemize}
+
+这些产物会直接进入第 6 章讲过的后续流水线：Graph IR rewrite、Tensor IR layout 选择、memory planning、CPU/GPU lowering 和 runtime dispatch。前端如果偷懒，后端就会被迫补课；而后端补课通常发生在最难调试、最要求性能稳定的地方。
+
+\section{本章验收线}
+
+读完本章，应该能说明 AI 编译器前端在本地推理引擎中的职责：
+
+\begin{itemize}
+  \item manifest 把模型目录、权重文件、tokenizer 和量化 metadata 转换成编译器事实。
+  \item schema resolution 把不同模型的命名方言映射到统一算子角色。
+  \item shape verifier 用 config 和算子合同推导每条边的形状，不让后端猜。
+  \item dtype 和 quant verifier 区分逻辑 dtype、存储 dtype 和计算 dtype。
+  \item tokenizer 合同必须和 embedding、generation config、max context 一起检查。
+  \item 好诊断应该指出 tensor、期望、实际、推导来源和可能错因。
+\end{itemize}
+
+下一步进入 runtime 和 memory planner 时，这些前端产物会成为所有优化的前提：只有 typed graph 的边界稳定，内存生命周期、kernel selection 和 CPU/GPU 后端计划才有可信输入。
