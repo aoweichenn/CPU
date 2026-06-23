@@ -55,6 +55,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi_bench PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(lcqi_trace
+    src/trace.cpp
+)
+
+target_link_libraries(lcqi_trace PRIVATE lcqi)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lcqi_trace PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 find_package(dnnl QUIET)
 if(dnnl_FOUND)
     add_executable(lcqi_onednn_bench
@@ -78,3 +88,7 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 add_test(NAME lcqi_tests COMMAND $<TARGET_FILE:lcqi_tests>)
+add_test(NAME lcqi_trace COMMAND $<TARGET_FILE:lcqi_trace>)
+set_tests_properties(lcqi_trace PROPERTIES
+    PASS_REGULAR_EXPRESSION "generated_token,3,-1,scalar,scalar,i32,generated,0,0,0"
+)

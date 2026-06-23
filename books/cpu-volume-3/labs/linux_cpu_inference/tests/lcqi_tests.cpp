@@ -39,6 +39,9 @@ constexpr std::array<float, LCQI_REFERENCE_DECODER_VOCAB_SIZE> LCQI_REFERENCE_DE
     -0.29797405F,
     0.127030417F,
 };
+constexpr std::int32_t LCQI_REFERENCE_TRACE_TOKEN_COUNT = 3;
+constexpr std::int32_t LCQI_REFERENCE_TRACE_HIDDEN_SIZE = 4;
+constexpr std::int32_t LCQI_REFERENCE_TRACE_FIRST_TOKEN = 0;
 
 struct KernelShapeCase {
     std::int32_t input_size = 0;
@@ -152,6 +155,57 @@ void test_reference_decoder_end_to_end() {
     }
 }
 
+void test_reference_decoder_trace_contract() {
+    const lcqi::ReferenceDecoderModel model = lcqi::make_tiny_reference_decoder_model();
+    const std::vector<std::int32_t> tokens{1, 2, 3};
+    const lcqi::ReferenceDecodeTraceResult trace =
+        lcqi::run_reference_decode_with_trace(model, tokens);
+
+    require(trace.result.predicted_token == LCQI_REFERENCE_DECODER_PREDICTED_TOKEN,
+            "reference trace predicted token mismatch");
+    require(!trace.checkpoints.empty(), "reference trace checkpoints missing");
+
+    const lcqi::ReferenceTensorCheckpoint& first = trace.checkpoints.front();
+    require(first.name == "embedding", "first checkpoint should be embedding");
+    require(first.token_position == LCQI_REFERENCE_TRACE_FIRST_TOKEN,
+            "first checkpoint token position mismatch");
+    require(first.dtype == "f32", "first checkpoint dtype mismatch");
+    require(first.layout == "row_major", "first checkpoint layout mismatch");
+    require(first.shape.size() == 1 &&
+                first.shape[0] == LCQI_REFERENCE_TRACE_HIDDEN_SIZE,
+            "first checkpoint shape mismatch");
+    require(first.stride.size() == 1 && first.stride[0] == 1,
+            "first checkpoint stride mismatch");
+
+    bool saw_logits = false;
+    bool saw_kv_slot = false;
+    for (const lcqi::ReferenceTensorCheckpoint& checkpoint : trace.checkpoints) {
+        if (checkpoint.name == "kv_cache_key_slot") {
+            saw_kv_slot = true;
+            require(checkpoint.shape.size() == 4, "KV checkpoint rank mismatch");
+            require(checkpoint.layout == "kv_contiguous", "KV checkpoint layout mismatch");
+        }
+        if (checkpoint.name == "logits") {
+            saw_logits = true;
+            require(checkpoint.token_position == LCQI_REFERENCE_TRACE_TOKEN_COUNT - 1,
+                    "logits checkpoint token position mismatch");
+            require(checkpoint.shape.size() == 1 &&
+                        checkpoint.shape[0] ==
+                            static_cast<std::int32_t>(LCQI_REFERENCE_DECODER_VOCAB_SIZE),
+                    "logits checkpoint shape mismatch");
+            require(checkpoint.values.size() == LCQI_REFERENCE_DECODER_LOGITS.size(),
+                    "logits checkpoint value size mismatch");
+            for (std::size_t index = 0; index < LCQI_REFERENCE_DECODER_LOGITS.size(); ++index) {
+                require_close(checkpoint.values[index],
+                              LCQI_REFERENCE_DECODER_LOGITS[index],
+                              "trace logits checkpoint mismatch");
+            }
+        }
+    }
+    require(saw_kv_slot, "KV checkpoint missing");
+    require(saw_logits, "logits checkpoint missing");
+}
+
 void test_packed_i8_kernel_matches_scalar() {
     for (const KernelShapeCase& shape_case : LCQI_KERNEL_SHAPE_CASES) {
         const lcqi::QuantizedLinearLayer layer =
@@ -194,6 +248,7 @@ int main() {
         test_reference_rope();
         test_reference_kv_attention();
         test_reference_decoder_end_to_end();
+        test_reference_decoder_trace_contract();
         test_packed_i8_kernel_matches_scalar();
 
         std::cout << "lcqi tests passed\n";

@@ -323,9 +323,10 @@ predicted_token = argmax(logits)
   \item \code{ReferenceKVCache::append/key/value}：按 \code{layer,position,kv\_head,dim} 寻址。
   \item \code{attention\_decode}：实现 GQA head 映射和稳定 softmax。
   \item \code{run\_reference\_decode}：从 token ids 跑到 logits 和 argmax。
+  \item \code{run\_reference\_decode\_with\_trace}：输出逐 checkpoint 的 shape、stride、dtype、layout、checksum、max abs 和 values 摘要。
 \end{itemize}
 
-测试入口在 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/tests/lcqi_tests.cpp}。目前它覆盖 RMSNorm、RoPE、KV attention、reference decode end-to-end、packed int8 kernel 与 scalar 对齐。下一步要把 TinyTrace-16 的每个 checkpoint 固化成 golden 文件，而不是只检查最终 \code{predicted\_token}。
+测试入口在 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/tests/lcqi_tests.cpp}。目前它覆盖 RMSNorm、RoPE、KV attention、reference decode end-to-end、reference trace contract、packed int8 kernel 与 scalar 对齐。trace contract 会检查关键 checkpoint 的 shape、stride、dtype、layout 和 logits golden，避免 reference decoder 只验证最终 token。
 
 当前仓库已经把 tiny reference decoder 的最终 logits 固化成 golden，而不是只检查输出范围。固定输入 \code{tokens=[1,2,3]}，\code{make\_tiny\_reference\_decoder\_model()} 的输出是：
 
@@ -340,21 +341,45 @@ logits[4] =  0.127030417
 
 对应测试常量在 \code{lcqi\_tests.cpp} 中记录为 \code{LCQI\_REFERENCE\_DECODER\_LOGITS}。这仍然不是完整 oracle，但它比“predicted token 在 vocab 范围内”强得多：任何 RMSNorm、RoPE、KV append/read、attention、SwiGLU 或 lm head 的语义漂移，都会先撞到这个 logits golden。
 
-\subsection{逐张量 checkpoint 应该长什么样}
+\subsection{逐张量 checkpoint 已经能导出}
 
-最终 logits 只能说明端到端错了，不能说明错在哪里。TinyTrace-16 的 checkpoint 应该记录每个阶段的 shape、少量数值摘要和可选完整 tensor。最小格式可以这样设计：
+最终 logits 只能说明端到端错了，不能说明错在哪里。当前 lab 新增了 \code{lcqi\_trace} 命令，固定 prompt fixture \code{tok1 tok2 tok3}，tokenizer 输出 \code{tokens=[1,2,3]}，然后导出逐 checkpoint CSV：
+
+\begin{lstlisting}[numbers=none,caption={reference trace 复现命令}]
+books/cpu-volume-3/build/lcqi-release/labs/linux_cpu_inference/lcqi_trace \
+  > books/cpu-volume-3/results/lcqi-reference-trace-2026-06-23.csv
+\end{lstlisting}
+
+CSV 字段如下：
 
 \begin{lstlisting}[numbers=none,caption={TinyTrace checkpoint 记录}]
-Checkpoint:
-  token_position
-  layer_id
-  name
-  shape
-  dtype
-  max_abs
-  checksum
-  values_optional
+name,token_position,layer_id,shape,stride,dtype,layout,checksum,max_abs,values
 \end{lstlisting}
+
+前几行真实输出如下：
+
+\begin{lstlisting}[numbers=none,caption={lcqi reference trace CSV 摘要}]
+prompt,0,-1,scalar,scalar,utf8,text,0,0,tok1 tok2 tok3
+tokenizer,0,-1,3,1,i32,contiguous,6,3,1;2;3
+embedding,0,-1,4,1,f32,row_major,-0.25,0.4,-0.4;0.1;0.25;-0.2
+attn_norm,0,0,4,1,f32,contiguous,-0.900291,1.53241,-1.53241;0.344792;1.05353;-0.766205
+q_before_rope,0,0,2x2,2x1,f32,contiguous,-0.769078,0.518146,-0.518146;0.459723;-0.367778;-0.342877
+k_before_rope,0,0,1x2,2x1,f32,contiguous,0.317017,0.544963,-0.227946;0.544963
+kv_cache_key_slot,0,0,1x1x1x2,2x2x2x1,f32,kv_contiguous,0.317017,0.544963,-0.227946;0.544963
+\end{lstlisting}
+
+这里已经包含 shape、stride、dtype、layout 和少量 values。比如 \code{q\_before\_rope} 的 shape 是 \code{2x2}，stride 是 \code{2x1}，说明它按 \code{[query\_head,head\_dim]} 连续布局解释；\code{kv\_cache\_key\_slot} 的 shape 是 \code{1x1x1x2}，对应 \code{[layer,position,kv\_head,dim]} 的单槽切片，layout 显式标成 \code{kv\_contiguous}。
+
+CSV 末尾会把 logits 接到 sampler 和新 token：
+
+\begin{lstlisting}[numbers=none,caption={lcqi reference trace 的输出尾部}]
+final_norm,2,-1,4,1,f32,contiguous,0.760889,1.72225,1.72225;-0.745899;0.342036;-0.557496
+logits,2,-1,5,1,f32,contiguous,0.134473,0.352517,0.352517;-0.126884;0.0797838;-0.297974;0.12703
+sampler_argmax,2,-1,5,1,f32,argmax,0,0,token=0
+generated_token,3,-1,scalar,scalar,i32,generated,0,0,0
+\end{lstlisting}
+
+这就把 \code{prompt -> tokenizer -> embedding -> RMSNorm -> QKV -> RoPE -> attention -> KV cache -> MLP -> logits -> sampler -> token} 放进同一个可复现实验。它仍然是 tiny fixture，不是生产 tokenizer 或采样器；但它已经足够用来训练读者逐步定位 shape、layout 和数值漂移。
 
 例如 position 2、layer 0 的关键 checkpoint：
 

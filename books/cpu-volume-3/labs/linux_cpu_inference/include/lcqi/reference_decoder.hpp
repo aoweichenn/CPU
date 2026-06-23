@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace lcqi {
@@ -48,6 +49,24 @@ struct ReferenceDecoderModel {
 struct ReferenceDecodeResult {
     std::vector<float> logits;
     std::int32_t predicted_token = 0;
+};
+
+struct ReferenceTensorCheckpoint {
+    std::string name;
+    std::int32_t token_position = 0;
+    std::int32_t layer_id = 0;
+    std::vector<std::int32_t> shape;
+    std::vector<std::int32_t> stride;
+    std::string dtype;
+    std::string layout;
+    float checksum = 0.0F;
+    float max_abs = 0.0F;
+    std::vector<float> values;
+};
+
+struct ReferenceDecodeTraceResult {
+    ReferenceDecodeResult result;
+    std::vector<ReferenceTensorCheckpoint> checkpoints;
 };
 
 class ReferenceKVCache {
@@ -110,6 +129,10 @@ void attention_decode(const DecoderConfig& config,
 
 ReferenceDecodeResult run_reference_decode(const ReferenceDecoderModel& model,
                                            std::span<const std::int32_t> token_ids);
+
+ReferenceDecodeTraceResult run_reference_decode_with_trace(
+    const ReferenceDecoderModel& model,
+    std::span<const std::int32_t> token_ids);
 
 ReferenceDecoderModel make_tiny_reference_decoder_model();
 

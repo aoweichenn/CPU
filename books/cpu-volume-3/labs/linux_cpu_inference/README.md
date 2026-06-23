@@ -13,6 +13,7 @@
 - 量化线性层、ReLU、分类 argmax
 - int8 linear scalar baseline、packed layout、AVX2/NEON 路径和 shape sweep benchmark
 - tiny reference decoder：RMSNorm、float linear、RoPE、GQA KV cache、decode attention、SwiGLU、lm head
+- reference trace CSV：从 prompt/tokenizer 到 logits/sampler/token，逐 checkpoint 输出 shape、stride、dtype、layout、checksum、max_abs、values 摘要
 - CLI 推理和简单 benchmark
 - CTest 正确性测试
 
@@ -57,3 +58,17 @@ target_arch,input_size,output_size,output_block,repeat,backend,available,average
 当前 benchmark 按 backend 逐行输出：`scalar`、`packed_scalar`、`avx2`、`neon`。x86-64 构建会编译 AVX2 路径；aarch64 构建会编译 NEON 路径。不可用 backend 保留行但 `available=0`，避免把跨平台源码误报成本机实测性能。
 
 这还不是生产级高性能 kernel。当前 benchmark 建立 scalar baseline、packed layout、AVX2/NEON 基线正确性和 shape sweep 口径。要达到大师级 AI Infra 证据，还必须继续补反汇编分析、AVX-512、perf counter、oneDNN/OpenBLAS/llama.cpp/ggml 对照、sanitizer、fuzz 和 CI。
+
+reference decoder trace：
+
+```bash
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_trace
+```
+
+输出 CSV 字段：
+
+```text
+name,token_position,layer_id,shape,stride,dtype,layout,checksum,max_abs,values
+```
+
+这条 trace 固定 prompt fixture `tok1 tok2 tok3`，tokenizer 输出 `tokens=[1,2,3]`，再把 embedding、RMSNorm、Q/K/V、RoPE、KV cache slot、attention、SwiGLU、layer output、final norm、logits、argmax sampler 和 generated token 串成可回归检查的硬链路。`lcqi_tests` 会检查关键 checkpoint 的 shape、stride、dtype、layout 和 logits golden，CTest 也会直接运行 `lcqi_trace`。
