@@ -1,6 +1,6 @@
-\chapter{Reference decoder 实现：先把一层算对}
+\section{Reference decoder 实现：先把一层算对}
 
-\section{为什么必须先写 reference decoder}
+\subsection{为什么必须先写 reference decoder}
 
 很多推理项目失败，不是因为没有 SIMD 或 GPU，而是因为一开始没有可信 reference。后端越快，越难调；量化越低，越难判断误差来源；KV cache 越复杂，越容易把位置、head 映射和缓存槽混在一起。reference decoder 的作用是把数学合同写成最朴素、最容易审计的 C++20 代码，让后续所有优化都有比较对象。
 
@@ -8,9 +8,9 @@
 reference decoder 不是低质量版本，而是正确性基准。它可以慢，但必须清楚、可复现、少隐藏状态、少复用复杂优化代码。
 \end{keyidea}
 
-本章目标不是实现完整 7B 框架，而是实现一个小型 decoder slice：token embedding、RMSNorm、Q/K/V linear、RoPE、causal attention、MLP、lm head 和 sampler 前 logits。这个 slice 可以用极小维度，例如 \code{H=16}、\code{heads=2}、\code{head\_dim=8}、\code{layers=1}，也可以用真实 shape 的小权重 fixture。重点是每一步都能输出中间张量并被 oracle 比较。
+本节目标不是实现完整 7B 框架，而是实现一个小型 decoder slice：token embedding、RMSNorm、Q/K/V linear、RoPE、causal attention、MLP、lm head 和 sampler 前 logits。这个 slice 可以用极小维度，例如 \code{H=16}、\code{heads=2}、\code{head\_dim=8}、\code{layers=1}，也可以用真实 shape 的小权重 fixture。重点是每一步都能输出中间张量并被 oracle 比较。
 
-\section{reference 的边界}
+\subsection{reference 的边界}
 
 reference decoder 应该故意避开复杂优化：
 
@@ -32,7 +32,7 @@ reference decoder 应该故意避开复杂优化：
   \item 固定 seed 的 sampler 能复现。
 \end{itemize}
 
-\section{最小类型：先让 shape 说话}
+\subsection{最小类型：先让 shape 说话}
 
 不要让裸指针和裸长度在 reference 中到处流动。最小实现也需要一个张量视图。
 
@@ -75,7 +75,7 @@ ModelWeights:
 
 这里使用 \code{[out,in]} 形式表达线性层权重，和前面 matvec 章节一致：输出通道是行，输入通道是列。若模型文件来自别的布局，导入阶段应该转换或记录 layout，不要让 reference 每次猜。
 
-\section{RMSNorm：第一个数值合同}
+\subsection{RMSNorm：第一个数值合同}
 
 RMSNorm 的公式是：
 
@@ -98,7 +98,7 @@ for i in 0..H:
 
 RMSNorm 的测试不要只测随机数。至少包含全零输入、极小值、大值、负值和 \code{H} 不能被 SIMD 宽度整除的形状。虽然 reference 不用 SIMD，但后续 optimized path 会用这些 fixture。
 
-\section{Linear：所有大算子的共同骨架}
+\subsection{Linear：所有大算子的共同骨架}
 
 decoder 中多数重计算都是 linear。reference 版本应尽量朴素：
 
@@ -122,7 +122,7 @@ if bias exists:
 
 后续 CPU 后端的 packed weight、int8、int4、SIMD micro-kernel 都要和这个 reference 比较。若 reference 自己也绕过 shape 或复用 packed descriptor，oracle 就失去意义。
 
-\section{RoPE：位置编号必须作为参数传入}
+\subsection{RoPE：位置编号必须作为参数传入}
 
 RoPE 不能从数组下标偷偷推导位置。reference 函数应该显式接收 \code{model\_position}：
 
@@ -146,7 +146,7 @@ apply_rope(q_or_k, head_count, head_dim, model_position, rope_config):
 
 RoPE 的 oracle 不只比较最终 logits。最好在 tiny fixture 里直接比较旋转后的 Q/K。这样一旦长上下文漂移，可以更早定位到位置合同。
 
-\section{KV cache：reference 也要严格建模状态}
+\subsection{KV cache：reference 也要严格建模状态}
 
 即使 reference 很慢，也不能每步重新计算所有历史 K/V 后假装有 KV cache。那样无法测试真实运行时状态。reference 的 KV cache 可以用普通连续数组：
 
@@ -179,7 +179,7 @@ kv_head = query_head / group_size
 
 这个公式必须由 verifier 保证整除。若 \code{query\_heads} 不能整除 \code{kv\_heads}，模型资产应在加载阶段被拒绝，而不是让 attention 函数自己补救。
 
-\section{Causal attention：先写能看懂的版本}
+\subsection{Causal attention：先写能看懂的版本}
 
 decode 阶段的单 token attention 最适合作为 reference 起点：
 
@@ -211,7 +211,7 @@ for i:
 
 prefill reference 可以先用同一函数逐位置执行，再逐步加批量版本。这样容易证明 causal mask：第 \code{i} 个 prompt token 只能看 \code{0..i}。后续优化可以把 prefill attention 做成矩阵形式或 fused kernel，但 oracle 仍然回到这个语义。
 
-\section{MLP：SwiGLU 的中间值不能丢}
+\subsection{MLP：SwiGLU 的中间值不能丢}
 
 SwiGLU 的 reference 要保留 gate、up 和乘积中间值：
 
@@ -227,7 +227,7 @@ down = linear(w_down, hidden)
 
 \code{silu(x)=x/(1+exp(-x))}。这里的中间值很重要，因为 MLP 往往是 FLOPs 大头。若最终 logits 漂移，保留 gate/up/down 的 oracle checkpoint 能迅速判断是第一段线性、激活、逐元素乘，还是 down projection 出错。
 
-\section{单层 forward：把状态边写出来}
+\subsection{单层 forward：把状态边写出来}
 
 一层 decoder forward 可以写成下面的形态：
 
@@ -256,7 +256,7 @@ forward_layer(layer_id, x, model_position, kv_cache):
 
 注意 \code{kv\_cache.append} 是状态写入，\code{attention\_decode} 是状态读取。reference 也要把这两步分开记录。若后续 memory planner 错误复用 buffer，或者 decode step 提前读取未写完的 K/V，trace 才能定位。
 
-\section{端到端 reference decode loop}
+\subsection{端到端 reference decode loop}
 
 端到端 reference 可以先只输出 logits，不做复杂采样：
 
@@ -290,7 +290,7 @@ for step in 0..max_new_tokens:
 
 这里故意没有 batch、线程和 fusion。它的价值是每个 token、每层、每个中间值都能被检查。
 
-\section{Golden fixture 怎么设计}
+\subsection{Golden fixture 怎么设计}
 
 reference 必须配 golden fixture。一个高质量 fixture 至少包含：
 
@@ -324,7 +324,7 @@ expected:
 
 权重不要全用随机数。建议混合使用小整数、正负数、接近零的值和非对称值。全随机 fixture 容易覆盖到计算路径，却不容易人工定位错误。比如 RoPE 可以用只有两个维度非零的向量，attention 可以用能手算 softmax 排序的 Q/K/V。
 
-\section{checkpoint 策略}
+\subsection{checkpoint 策略}
 
 不要只保存最终 logits。推荐 checkpoint 分层：
 
@@ -348,7 +348,7 @@ logits top-k & 可见输出 & lm head、采样差异 \\
 
 checkpoint 太多会增加文件体积，可以通过 \code{trace\_level} 控制。日常测试比较关键 checkpoint；调试漂移时打开 debug 全量输出。
 
-\section{reference 和优化后端怎样比较}
+\subsection{reference 和优化后端怎样比较}
 
 比较不能只看完全相等。不同 dtype 和不同归约顺序会造成微小差异。oracle 应按层级使用不同阈值：
 
@@ -371,9 +371,9 @@ int4_weight:
 
 阈值必须随 profile 记录到报告里。不要让测试代码里一个魔法数决定所有后端。特别是量化后端，operator 误差、logits top-k 和生成序列要一起看；单个最终文本“看起来不错”不能证明模型没有漂移。
 
-\section{本章验收线}
+\subsection{本节验收线}
 
-读完本章，应该能动手写一个小型 reference decoder：
+读完本节，应该能动手写一个小型 reference decoder：
 
 \begin{itemize}
   \item 用 \code{TensorView} 和结构化权重表达 shape，而不是裸指针乱传。

@@ -1,6 +1,6 @@
-\chapter{CPU decode 实战：从标量 GEMV 到 packed 低比特微内核}
+\section{CPU decode 实战：从标量 GEMV 到 packed 低比特微内核}
 
-\section{decode 优化先看形态}
+\subsection{decode 优化先看形态}
 
 7B 推理的 decode 阶段每次只处理一个新 token。对线性层来说，输入是一个 hidden 向量，权重是一个大矩阵，输出是一个新向量。这更像 GEMV，而不是大 batch GEMM。CPU 优化要先承认这个形态：每 token 反复流过大块权重，权重字节和 KV 字节很容易支配延迟。
 
@@ -8,9 +8,9 @@
 CPU decode 微内核的目标不是写一个“通用最快矩阵乘”，而是为单 token 或小 batch 的固定权重读流建立可验证的 packed layout、累加策略、tail path、线程切分和性能账本。
 \end{keyidea}
 
-本章沿同一个 linear 语义推进：标量 fp32 reference，普通 int8 baseline，packed int8，int4 packed，SIMD 微内核，线程切分，NUMA 和 profiler。每一步都要能回到 oracle。
+本节沿同一个 linear 语义推进：标量 fp32 reference，普通 int8 baseline，packed int8，int4 packed，SIMD 微内核，线程切分，NUMA 和 profiler。每一步都要能回到 oracle。
 
-\section{标量 reference 不是性能 baseline}
+\subsection{标量 reference 不是性能 baseline}
 
 reference 的职责是正确，不是代表可接受性能。
 
@@ -24,7 +24,7 @@ for out in 0..O:
 
 性能 baseline 可以仍然是标量，但要固定测量条件：连续内存、关闭 debug 检查、固定线程数、固定输入、warmup、重复次数和输出校验。否则 benchmark 比较的是调试开销或缓存偶然性。
 
-\section{int8 权重 baseline}
+\subsection{int8 权重 baseline}
 
 最简单的 int8 权重实现是边读边反量化：
 
@@ -53,7 +53,7 @@ QuantDesc:
 
 没有 descriptor，kernel 无法知道 scale 怎样对应权重，也无法写通用 oracle。
 
-\section{packed int8：先改变地址流}
+\subsection{packed int8：先改变地址流}
 
 原始权重按 \code{[out,k]} 行主序存储，对单输出行扫描友好。但 SIMD 微内核通常想一次计算多个 \code{out}，让同一个输入 \code{input[k]} 广播到多个输出 accumulator。为了让多个输出通道的权重连续，需要把小面板打包。
 
@@ -78,7 +78,7 @@ for out_block in 0..O step BN:
 
 packing 的成本应发生在模型 prepare 阶段，而不是每次请求 decode 阶段。plan report 要记录 packed weight 字节数、packing 时间和 layout id。否则上线后可能发现首个请求很慢，却不知道慢在 prepare。
 
-\section{int4 packed：字节减少，解包增加}
+\subsection{int4 packed：字节减少，解包增加}
 
 int4 把两个 4-bit 权重放进一个 byte。常见 signed int4 范围是 \code{-8..7} 或通过 zero point 表示。解包需要取低四位和高四位，再做符号扩展或减 zero point。
 
@@ -96,7 +96,7 @@ signed value:
 
 int4 的优势是权重字节减半，风险是解包、scale metadata 和误差。group quant 下每 \code{G} 个权重共享一个 scale。若 \code{K} 不能整除 \code{G}，最后一组是 tail group。byte oracle 必须覆盖 nibble 顺序、符号扩展、group tail 和 scale 索引。
 
-\section{累加器：低比特不等于低精度累加}
+\subsection{累加器：低比特不等于低精度累加}
 
 低比特权重不代表可以用低精度累加。常见策略有两类：
 
@@ -111,7 +111,7 @@ int4 的优势是权重字节减半，风险是解包、scale metadata 和误差
 不要把 int4 权重直接乘成 int8 accumulator。归约维度 \code{K=4096} 时，误差和溢出风险都不可接受。accumulator dtype 是 kernel descriptor 的核心字段。
 \end{warningbox}
 
-\section{SIMD 微内核的寄存器账本}
+\subsection{SIMD 微内核的寄存器账本}
 
 假设一次计算 \code{BN=16} 个输出通道。内核维护 16 个 accumulator lane。每个 \code{k}：
 
@@ -137,7 +137,7 @@ store output block
 
 这个账本要和 ISA 绑定。AVX2、AVX-512、NEON、SVE 的向量宽度、转换指令、整数 dot 能力和 mask tail 都不同。因此代码结构应分成 capability、descriptor、kernel 实现和 fallback，不要在业务调用点写一堆 ISA 分支。
 
-\section{tail path：最后一块经常出错}
+\subsection{tail path：最后一块经常出错}
 
 若输出通道 \code{O} 不是 \code{BN} 的倍数，最后一个 block 需要 tail。常见策略：
 
@@ -149,7 +149,7 @@ store output block
 
 若归约维度 \code{K} 不是 group size、解包块或向量宽度的倍数，也需要 tail。对 int4，\code{K} 为奇数还会出现半个 byte 的语义问题。虽然真实 7B 的很多维度规整，测试必须包含不规整维度，因为模型变体、lm head、adapter 或小 fixture 都可能触发。
 
-\section{线程切分：按输出通道还是按层}
+\subsection{线程切分：按输出通道还是按层}
 
 decode 的单个 linear 可以按输出通道切分：不同线程计算不同 \code{out} block，共享同一 input，读取不同权重。优点是没有输出写冲突；缺点是每个线程都读一遍 input，且小层线程开销可能过大。
 
@@ -172,7 +172,7 @@ parallel_for out_block_range:
 \end{tabular}
 \end{center}
 
-\section{NUMA 和权重放置}
+\subsection{NUMA 和权重放置}
 
 多路 CPU 或 NUMA 机器上，权重放在哪个 NUMA node 会影响带宽。若线程在 node 0，权重页却在 node 1，远端内存访问会增加延迟。最小工程策略：
 
@@ -185,7 +185,7 @@ parallel_for out_block_range:
 
 NUMA 优化不要太早做，但 trace 要保留足够字段。否则后期发现 p95 抖动，只能猜测是调度还是内存放置。
 
-\section{perf counters：用证据判断瓶颈}
+\subsection{perf counters：用证据判断瓶颈}
 
 CPU 优化不能只看耗时。至少要观察：
 
@@ -199,9 +199,9 @@ CPU 优化不能只看耗时。至少要观察：
 
 如果引入 SIMD 后 instructions 降了但 LLC miss 上升，可能 packing layout 破坏了局部性。如果线程数增加后 tokens/s 不升反降，可能已经带宽饱和或 NUMA 远端访问增加。如果 int4 比 int8 不快，可能解包和 scale 成本抵消了字节收益。
 
-\section{当前 lab 的真实验收口径}
+\subsection{当前 lab 的真实验收口径}
 
-本仓库的 \code{linux\_cpu\_inference} 已经把本章的一部分落成代码：同一个 int8 linear 语义下有四个 benchmark backend：
+本仓库的 \code{linux\_cpu\_inference} 已经把本节的一部分落成代码：同一个 int8 linear 语义下有四个 benchmark backend：
 
 \begin{itemize}
   \item \code{scalar}：普通 row-major 标量循环，是 correctness 和耗时基线。
@@ -237,7 +237,7 @@ shape & scalar us & packed scalar us & NEON us \\
 
 这些数字的解释要克制。packed scalar 在小 shape 上可能更慢，因为它增加了 block 级循环和 workspace 写入；它的价值是证明 packed 地址流正确。NEON 才是本机 SIMD 证据：它在这些 shape 上输出误差为 0，并且显著快于 scalar。下一步不能再停留在平均耗时，而要补 \code{perf stat}、反汇编摘要、cache miss、branch miss、IPC 和真实系统对照。
 
-\section{微内核进入主线的验收}
+\subsection{微内核进入主线的验收}
 
 一个 CPU decode 微内核进入主线前，至少要满足：
 
@@ -255,9 +255,9 @@ shape & scalar us & packed scalar us & NEON us \\
 
 这条验收线比“benchmark 快了”严格，但它能保护项目长期演进。否则下一次改量化、改 layout、接 GPU fallback 时，很容易破坏 CPU 路径而不自知。
 
-\section{本章验收线}
+\subsection{本节验收线}
 
-读完本章，应该能把 CPU decode 优化拆成可实现任务：
+读完本节，应该能把 CPU decode 优化拆成可实现任务：
 
 \begin{itemize}
   \item 从 fp32 reference 建立正确性基准，再写 int8/int4 baseline。

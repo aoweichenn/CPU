@@ -1,12 +1,12 @@
-\chapter{张量布局、地址流与第一个矩阵向量内核}
+\section{张量布局、地址流与第一个矩阵向量内核}
 
-\section{为什么先讲布局再讲算子优化}
+\subsection{为什么先讲布局再讲算子优化}
 
 第一章把第三册的主线钉在真实本地大模型推理引擎上：模型文件、tokenizer、decoder graph、KV cache、CPU/GPU 后端和性能证据都要被同一套 runtime 管住。但不能从这些大词直接跳到最快 kernel。接下来先拿最小切片中的一层矩阵向量乘做显微镜，因为每个 Transformer projection、MLP 子层和 decode 阶段的小 batch 路径，最终都会回到同一组问题：张量在内存里到底怎样排布，热循环每一步访问哪些地址，累加器和输出缓冲怎样被机器指令更新。
 
-本章先放大最小切片中的第一层：
+本节先放大最小切片中的第一层：
 
-\begin{lstlisting}[numbers=none,caption={本章先追踪这一层}]
+\begin{lstlisting}[numbers=none,caption={本节先追踪这一层}]
 hidden = relu(input * W0 + b0)
 \end{lstlisting}
 
@@ -28,7 +28,7 @@ for out in 0..N:
 AI 算子的第一层机器事实不是“矩阵乘很重要”，而是：循环次序决定地址流，地址流决定 cache/TLB 和 SIMD 能否工作，累加器宽度决定正确性边界，reference 和 oracle 决定优化是否可信。
 \end{keyidea}
 
-\section{张量元数据必须落到地址公式}
+\subsection{张量元数据必须落到地址公式}
 
 一个张量视图至少包含 dtype、shape、stride 和 data pointer。以二维权重矩阵 \code{W0[N, K]} 为例，若按行主序连续存储，地址公式是：
 
@@ -65,7 +65,7 @@ row-major contiguous:
 \diagramnote{本图要证明的命题是：张量布局不是 API 信息，而是热循环地址流的来源。}
 \end{systemdiagram}
 
-\section{第一个 float32 矩阵向量内核}
+\subsection{第一个 float32 矩阵向量内核}
 
 先写一个朴素但清楚的 float32 内核：
 
@@ -102,7 +102,7 @@ branch back to inner loop
 
 这不是要求某个编译器必须生成标量 \instruction{mul}/\instruction{add}。在合适目标上，优化器可能生成向量 load、FMA、循环展开和水平归约。这里的重点是：无论标量还是向量，内核都必须消耗 input 地址流、weight 地址流和 acc 依赖链；SIMD 只是一次处理多个相邻元素，不能替代布局和地址分析。
 
-\section{把内层循环切成基本块}
+\subsection{把内层循环切成基本块}
 
 为了把第一册和第二册的方法接进 AI 算子，不能只停在 C++ 循环。下面这份伪反汇编把同一个 \code{matvec_relu_f32} 切成三个基本块：外层准备一行权重，内层做 dot product，尾部做 ReLU 和写回。
 
@@ -156,7 +156,7 @@ B2_activate_store:
 
 按这张图读后续优化，很多术语会自然归位。循环展开不是“让代码更长”，而是让 \code{B1_dot} 中出现多条相互独立的 acc 链；SIMD 不是“自动快”，而是要求 \code{input} 和 \code{weight} 至少在热路径上形成可装载的相邻 lane；packing 不是“拷贝一份权重”，而是把 \code{weight} 的跨步或间接地址改造成内层连续流；ReLU 融合不是“少一个函数”，而是移动 \code{B2_activate_store} 的边界，减少中间张量的写回和读回。
 
-\section{用一张图同时看语义、地址和机器形态}
+\subsection{用一张图同时看语义、地址和机器形态}
 
 \begin{systemdiagram}{矩阵向量内核的语义、地址流和硬件账本}
 \begin{pdfdiagram}[x=1cm,y=1cm]
@@ -186,7 +186,7 @@ B2_activate_store:
 
 按这张图读代码，bias 不是循环外的装饰，它是每个输出通道的一次初始 load；activation 不是数学符号，它要落成 \instruction{max}、条件移动、近似函数或查表路径；输出 store 不是性能主体，但它决定 hidden buffer 的生命周期和后续层的输入布局。若把 activation 与 matvec 融合，可以少一次写出再读回 hidden 的中间流；但融合后 oracle 必须仍能解释输出误差，调试路径也要能定位是哪一层出错。
 
-\section{布局错误怎样伪装成算子慢}
+\subsection{布局错误怎样伪装成算子慢}
 
 常见误判是看到 \code{matvec} 慢，就直接想“需要 SIMD”。但如果权重不是行主序连续，或者每个输出行通过指针数组间接访问，SIMD 也只能在更差的地址流上工作。下面两种形状语义相同，机器成本不同：
 
@@ -202,7 +202,7 @@ pointer rows:
 
 第一种形状让内层循环沿着连续权重流前进；第二种形状先追一层指针，再进入某个堆块。若块很小、分配分散或页很多，TLB 和 cache line 利用率都会变差。对于 7B 级推理引擎，模型加载阶段把权重转换为内核友好的 packed layout 往往比在每次推理时容忍任意布局更合理。代价是加载时间、额外内存和格式版本；收益是热路径简单、可测、可向量化。CPU 后端可能选择 cache-friendly panel，GPU 后端可能选择显存连续、coalesced load 或 tensor-core 友好的 tile；两者都必须从同一份张量元数据出发。
 
-\section{TensorView 的 C++20 合同}
+\subsection{TensorView 的 C++20 合同}
 
 工程里不能把张量参数写成一堆裸指针和整数。至少需要一个只观察内存、不拥有内存的 view；真正拥有内存的对象可以是 arena、mmap weight、DeviceBuffer 或 aligned buffer。view 的责任是描述地址公式。
 
@@ -239,7 +239,7 @@ return true
 
 这个检查看起来简单，但能拦住大量错误。比如一个 \code{[T,H]} 视图经过转置后 shape 仍然可能是二维，但 stride 不再是 row-major contiguous；若后端把它送进只支持连续输入的 GEMM kernel，输出就会错或性能极差。正确路线是：verifier 标出非连续，compiler 插入 layout conversion 或选择支持 stride 的 reference/slow path。
 
-\section{layout conversion 也要进入 profiler}
+\subsection{layout conversion 也要进入 profiler}
 
 很多推理代码把 layout conversion 当成“准备工作”，没有计入耗时。实际它可能非常贵。若每个 decode step 都把某个 activation 从非连续转换成连续，转换成本会进入热路径；若模型加载时一次性把权重 pack 好，成本属于 prepare 阶段，应该和 decode 分开报告。
 
@@ -256,7 +256,7 @@ LayoutConversionEvent:
 
 这能避免一种常见误判：kernel 本身很快，但前后各有一次 layout conversion，端到端反而慢。profiler 若只记录 kernel 时间，就会把瓶颈藏起来。
 
-\section{layout 测试矩阵}
+\subsection{layout 测试矩阵}
 
 张量布局相关测试不能只测连续 happy path。最小测试矩阵应该包含：
 
@@ -278,7 +278,7 @@ for each logical coordinate:
 
 这个测试不是性能测试，而是证明地址公式正确。只要地址公式错，后面 SIMD、GPU、量化都只是更快地读错数据。
 
-\section{从 float32 路径过渡到 int8 路径}
+\subsection{从 float32 路径过渡到 int8 路径}
 
 量化路径不是把 \code{float} 替换成 \code{int8_t} 那么简单。同一层 matvec 进入 int8 后，机器账本变成：
 
@@ -295,9 +295,9 @@ store output
 
 权重字节变小，cache 能容纳更多参数；某些 CPU 有专门的 dot-product 或 madd 指令，能提高吞吐。但累加器必须更宽，重新量化必须处理 scale、舍入和饱和，oracle 也必须从“逐元素几乎相同”变成“误差在合同范围内”。这就是第三册的基本节奏：每个算子先有 float reference，再有地址账本，再有量化语义，最后才进入特定 ISA 和 kernel 优化。
 
-\section{把这条账本接回 Transformer}
+\subsection{把这条账本接回 Transformer}
 
-现在把本章的 \code{matvec} 账本放回 decoder-only Transformer 的一个 decode 步骤。假设当前层输入是一条 hidden 向量 \code{x[hidden]}，这一层至少要做下面几组投影：
+现在把本节的 \code{matvec} 账本放回 decoder-only Transformer 的一个 decode 步骤。假设当前层输入是一条 hidden 向量 \code{x[hidden]}，这一层至少要做下面几组投影：
 
 \begin{lstlisting}[numbers=none,caption={decode 单 token 中反复出现的投影账本}]
 q = matvec(x, Wq)
@@ -313,7 +313,7 @@ up   = matvec(norm(x), Wup)
 x = x + matvec(silu(gate) * up, Wdown)
 \end{lstlisting}
 
-这里的每个 \code{matvec} 都可以用本章的方法拆开：输入向量地址、权重行地址、accumulator 依赖、输出 store、量化 scale 和 oracle。不同的是，真实模型把尺寸和状态放大了。Q/K/V 的输出还要 reshape 成 \code{[heads, head_dim]}；K/V 不是普通临时输出，而要写入第 \code{layer} 层、第 \code{position} 个 token 的 KV cache；attention 会在后续 token 中反复读取这些 cache 行。
+这里的每个 \code{matvec} 都可以用本节的方法拆开：输入向量地址、权重行地址、accumulator 依赖、输出 store、量化 scale 和 oracle。不同的是，真实模型把尺寸和状态放大了。Q/K/V 的输出还要 reshape 成 \code{[heads, head_dim]}；K/V 不是普通临时输出，而要写入第 \code{layer} 层、第 \code{position} 个 token 的 KV cache；attention 会在后续 token 中反复读取这些 cache 行。
 
 \begin{systemdiagram}{从 matvec 切片接回 decoder 层状态}
 \begin{pdfdiagram}[x=1cm,y=1cm]
@@ -339,9 +339,9 @@ x = x + matvec(silu(gate) * up, Wdown)
 
 prefill 阶段则把 \code{x} 从一条向量扩成多条 token 行。此时 \code{matvec} 账本会变成下一章的 GEMM/GEMV 问题：prompt token 越多，权重复用越明显，packing、tile、SIMD 和 GPU kernel 的价值越容易体现；decode 阶段每次只处理一个或少数 token，权重流和 KV cache 读写又会成为另一种瓶颈。因此后续性能报告必须把 prefill tokens/s、decode tokens/s 和首 token 延迟分开写。
 
-\section{本章验收线}
+\subsection{本节验收线}
 
-读完本章，应该能对最小切片的一层 matvec，以及 Transformer 中的 Q/K/V 或 MLP projection，写出下面几件事：
+读完本节，应该能对最小切片的一层 matvec，以及 Transformer 中的 Q/K/V 或 MLP projection，写出下面几件事：
 
 \begin{itemize}
   \item 用 shape 和 stride 推导 \code{input[k]}、\code{weight[out,k]}、\code{bias[out]}、\code{hidden[out]} 和 KV cache 写入位置的地址公式。

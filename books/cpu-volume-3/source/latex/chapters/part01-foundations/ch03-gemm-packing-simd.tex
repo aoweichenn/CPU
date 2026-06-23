@@ -1,10 +1,10 @@
-\chapter{从矩阵向量乘走向 GEMM、packing 与 SIMD}
+\section{从矩阵向量乘走向 GEMM、packing 与 SIMD}
 
-\section{为什么不能直接从 matvec 跳到最快 GEMM}
+\subsection{为什么不能直接从 matvec 跳到最快 GEMM}
 
 上一章把一层矩阵向量乘拆成了 shape、stride、地址公式、基本块、地址流和机器账本，并把它接回了 decoder-only Transformer 的 Q/K/V projection、KV cache 写入和 MLP 子层。那条路径故意很小，因为它让每个性能判断都有落点：\code{input[i]} 从哪里读，\code{row[i]} 是否连续，\code{acc} 为什么形成归约依赖，activation 和写回发生在什么边界。
 
-本章继续沿同一条路径推进，但不直接背某个 BLAS 接口。真正的高性能矩阵乘不是一句“调用 GEMM”就结束。它要解决三个逐层出现的问题：
+本节继续沿同一条路径推进，但不直接背某个 BLAS 接口。真正的高性能矩阵乘不是一句“调用 GEMM”就结束。它要解决三个逐层出现的问题：
 
 \begin{lstlisting}[numbers=none,caption={从 matvec 到 GEMM 的三个新问题}]
 matvec:
@@ -26,7 +26,7 @@ GEMM kernel:
 GEMM 优化的核心不是“矩阵乘很快”，而是把重复使用的数据切成能留在 cache 和寄存器里的小块，并让内层循环产生稳定、连续、可向量化的地址流。
 \end{keyidea}
 
-\section{把 token 维度加回模型}
+\subsection{把 token 维度加回模型}
 
 上一章把 token 行固定为 1。若 prefill 一次处理 \code{T} 个 prompt token，或者服务端把 \code{B} 个请求合批，线性层语义可以写成：
 
@@ -75,7 +75,7 @@ semantic:
 \diagramnote{本图要证明的命题是：从 decode matvec 到 prefill GEMM 的关键变化是复用单位从一条向量扩大为一个可驻留的 tile。}
 \end{systemdiagram}
 
-\section{三层循环不是任意交换}
+\subsection{三层循环不是任意交换}
 
 矩阵乘 reference 通常有三层循环。初学者容易把循环顺序理解成纯数学等价：只要结果相同，怎么换都可以。性能分析要更具体：谁在内层，谁就决定高频地址流；谁跨 tile 复用，谁就决定 cache 工作集；谁留在寄存器，谁就决定 accumulator 数量。
 
@@ -107,7 +107,7 @@ tile-t-out-k:
   \item \code{BK}：一次沿归约维度推进多少元素，影响 packing 块和 cache 复用。
 \end{itemize}
 
-\section{Packing 的本质：把坏地址流变成后端友好的地址流}
+\subsection{Packing 的本质：把坏地址流变成后端友好的地址流}
 
 \term{packing}{预打包} 指把原始张量中的一块数据复制成内核更喜欢的布局。它不是为了让模型文件好看，而是为了让热循环简单。以权重为例，原始行主序 \code{W[out,k]} 对单个输出行很好；但一个微内核若想同时算 \code{BN} 个输出，内层可能需要在同一个 \code{k} 下读多条输出行的权重。原始布局给出的地址是：
 
@@ -157,7 +157,7 @@ inner kernel reads packed[k, 0..BN)
 \diagramnote{本图要证明的命题是：packing 的价值来自热循环地址流改善，必须和复用次数一起判断。}
 \end{systemdiagram}
 
-\section{SIMD 需要多条独立账本配合}
+\subsection{SIMD 需要多条独立账本配合}
 
 \term{SIMD}{单指令多数据} 可以理解为一条指令同时处理多个 lane。例如一个 float32 向量寄存器可以装多个相邻浮点数，FMA 指令可以对多个 lane 同时做乘加。但 SIMD 对地址流有要求：连续 load 最容易，固定可预测步长次之，随机 gather 或指针追踪通常更难。
 
@@ -177,7 +177,7 @@ store C[b1, out0..outN]
 
 这段账本看起来已经像高性能内核，但仍然不能脱离前两册的方法。要问：\code{packed_W} 是否真的连续；\code{A[b,k]} 是否能留在 cache；accumulator 数量是否超过寄存器预算；输出 store 是否连续；尾部 \code{N} 不能整除 SIMD 宽度时怎样处理；反汇编是否真的生成了向量 load、广播和 FMA，而不是退回标量循环。
 
-\section{从标量 reference 到 micro-kernel 的切分路线}
+\subsection{从标量 reference 到 micro-kernel 的切分路线}
 
 真正写后端时，不应该一上来就写最大化的 SIMD intrinsic。更稳的路线是把同一个 linear 语义切成四个阶段，每个阶段都能被 oracle 验证。
 
@@ -239,7 +239,7 @@ MicroKernelDesc:
 一个 linear micro-kernel 进入主线前，至少要通过四组测试：整齐尺寸、\code{K} 维尾部、\code{O} 维尾部、非默认 stride。若是量化权重，还要额外覆盖 group 边界和 scale 尾组。
 \end{rubricbox}
 
-\section{尾块、对齐和小尺寸陷阱}
+\subsection{尾块、对齐和小尺寸陷阱}
 
 工业 GEMM 内核会花大量代码处理边界。教材如果只展示整齐尺寸，会让读者误以为优化就是把主循环写出来。实际推理中，隐藏层大小、输出类别数、batch size 和量化 block 不一定刚好整除 tile。
 
@@ -249,7 +249,7 @@ MicroKernelDesc:
 
 \topic{小矩阵可能被 packing 成本吞掉。} 一个只有几行几列的小层，打包和调度的固定成本可能大于内核收益。第三册后续讲推理图和运行时时会反复遇到这个问题：大算子适合重内核，小算子更需要融合、批处理或减少中间内存流。
 
-\section{prefill、decode 与后端合同}
+\subsection{prefill、decode 与后端合同}
 
 把 GEMM 放回 7B 推理引擎后，性能不能只写一个“矩阵乘耗时”。同一个权重矩阵在 prefill 和 decode 中的形状不同：
 
@@ -281,7 +281,7 @@ evidence: latency, tokens_per_second, error_report
 
 这份合同让第三册后续能一步一步把性能提高，而不是一次跳到“对标成熟框架”。每次优化都必须说明它改变了哪一栏：是 dtype 从 fp32 变成 int8，还是 packed layout 变了；是 mode 只覆盖 prefill，还是 decode 也受益；是 CPU 后端新增 SIMD path，还是 GPU 后端新增 kernel；是降低了 latency，还是提高了 batch 吞吐。
 
-\section{把现有 lab 放进这条路线}
+\subsection{把现有 lab 放进这条路线}
 
 当前 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/} 里的 \code{linear_i8} 是一个故意朴素的内核。它按输出行遍历 int8 权重，把每个权重乘以 scale 后与 float 输入相乘，并把结果累加到 float：
 
@@ -297,9 +297,9 @@ for out in output_size:
 
 这段代码适合作为 reference 风格的本地推理入口，因为它的语义清楚，测试能手工验证。但它只是第一阶段切片，不是第三册最终引擎。它没有 token tile，没有 packed weight panel，没有 int32 accumulator，没有 requantize，也没有 CPU/GPU 后端选择。下一章会专门讲 int8 的真实量化账本：为什么当前 lab 选择了“int8 权重 + float 输入 + float 累加”的简化路径，以及 7B 推理引擎需要怎样扩展到 per-channel/per-group quantization、packed weights、KV cache 量化和后端共享的误差报告。
 
-\section{本章验收线}
+\subsection{本节验收线}
 
-读完本章，应该能把“GEMM 很快”拆成下面几条可检查事实：
+读完本节，应该能把“GEMM 很快”拆成下面几条可检查事实：
 
 \begin{itemize}
   \item 说明 batch 怎样改变 input、weight 和 output 的复用账本。

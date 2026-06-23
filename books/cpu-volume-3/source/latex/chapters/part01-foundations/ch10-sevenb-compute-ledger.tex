@@ -1,8 +1,8 @@
-\chapter{7B 推理计算账本：FLOPs、字节、KV cache 与延迟上限}
+\section{7B 推理计算账本：FLOPs、字节、KV cache 与延迟上限}
 
-\section{为什么必须算账}
+\subsection{为什么必须算账}
 
-讨论本地 7B 推理时，最常见的空话是“优化矩阵乘”“减少显存”“提高 tokens/s”。这些话如果不落到 FLOPs、字节、cache、带宽和延迟，就无法指导实现。本章用一个典型 7B decoder-only GQA 模型建立账本。具体模型可能略有差异，但方法通用。
+讨论本地 7B 推理时，最常见的空话是“优化矩阵乘”“减少显存”“提高 tokens/s”。这些话如果不落到 FLOPs、字节、cache、带宽和延迟，就无法指导实现。本节用一个典型 7B decoder-only GQA 模型建立账本。具体模型可能略有差异，但方法通用。
 
 \begin{lstlisting}[numbers=none,caption={典型 7B 账本参数}]
 layers L = 32
@@ -17,7 +17,7 @@ context S = 4096
 
 这些数字不是装饰。它们决定每个 token 要读多少权重、KV cache 占多少内存、attention 随上下文怎样增长、CPU/GPU 后端为什么在 prefill 和 decode 阶段表现不同。
 
-\section{参数量账本}
+\subsection{参数量账本}
 
 先算一层主要权重。Q projection 输出 \code{n\_q*d=4096}，K/V projection 各输出 \code{n\_kv*d=1024}。
 
@@ -45,7 +45,7 @@ context S = 4096
 
 32 层约 \code{5.67B} 参数。加上 embedding、lm head、norm 和少量元数据，就接近 7B 级别。这个账本直接解释了 decode 为什么常常被权重读流支配：每生成一个 token，主要线性权重基本都要参与一次。
 
-\section{权重字节账本}
+\subsection{权重字节账本}
 
 参数量乘以每个权重的字节数，就是权重读流的粗略下界。
 
@@ -69,7 +69,7 @@ int4 & 约 \code{3.5 GB} & metadata 和 packing 会增加一些 \\
 
 这还没有算 KV cache 读取、activation、线程同步、解包、scale、sampler、allocator 和调度开销。真实速度低于这个上限并不奇怪。这个公式比单纯说“CPU 慢”更有用，因为它告诉我们应该优先减少权重字节、改善 packing、提高带宽利用率，而不是盲目堆线程。
 
-\section{decode 每层 FLOPs 账本}
+\subsection{decode 每层 FLOPs 账本}
 
 一次 decode 只处理一个新 token。线性层 MAC 数大约等于权重参数量。每层主要线性 MAC：
 
@@ -105,7 +105,7 @@ attention\_macs \approx 2 \times n_q \times S \times d
 
 32 层约 \code{1.07B MACs}。所以在长上下文下，attention 计算也很可观；但在很多 CPU decode 场景，低比特权重的解包和权重/KV 字节流仍然是更早撞到的墙。
 
-\section{KV cache 容量账本}
+\subsection{KV cache 容量账本}
 
 KV cache 每个 token、每层要保存 K 和 V。GQA 下保存的是 \code{n\_kv} 个 head，不是 \code{n\_q} 个 head。
 
@@ -143,7 +143,7 @@ context & 单 session fp16 KV & 8 session fp16 KV \\
 
 这就是为什么 admission control 必须在请求进入前估算 KV cache，而不是等到 decode 过程中分配失败。
 
-\section{KV cache 读取账本}
+\subsection{KV cache 读取账本}
 
 容量只是第一半。decode 每步还要读取历史 K/V。当前 token 在每层 attention 中读取长度为 \code{S} 的 K 和 V：
 
@@ -161,7 +161,7 @@ S \times 2 \times n_{kv} \times d \times bytes
 
 但 KV 量化比权重量化更敏感。权重是固定的，可以离线校准；KV 是动态 activation，每个请求、每个位置都不同。若 scale 选择不好，attention score 会被放大后进入 softmax，少量误差可能改变 top-k。后面的低比特 KV 章节会专门展开。
 
-\section{prefill 和 decode 不是同一账本}
+\subsection{prefill 和 decode 不是同一账本}
 
 prefill 处理整个 prompt。若 prompt 长度 \code{T=512}，一层 linear 变成 \code{[512,H] x [H,O]} 的矩阵乘。权重被同一批 token 复用，GEMM 能更好利用计算单元。decode 每步 \code{T=1}，权重复用少，容易被权重读流限制。
 
@@ -178,7 +178,7 @@ decode & GEMV/小 GEMM、KV 读取 & 权重带宽、KV 带宽、launch/同步 \\
 
 这就是为什么一个后端可能 prefill 很快、decode 一般；也可能 CPU decode 经过 int4 和线程优化后可用，但长 prompt prefill 明显慢。报告必须分开写 TTFT、prefill tokens/s 和 decode tokens/s。
 
-\section{roofline：用带宽和算力约束 tokens/s}
+\subsection{roofline：用带宽和算力约束 tokens/s}
 
 粗略上限可以用 roofline 思路判断。对每个 decode token，假设需要读：
 
@@ -212,7 +212,7 @@ tokens/s \le
 
 若同一机器由于解包、NUMA、TLB、线程调度只能达到 \code{55 GB/s} 有效带宽，上限就是 \code{13 tokens/s}。这比“开更多线程”更能解释问题：线程只能提高并行利用率，不能凭空减少每 token 字节数。
 
-\section{量化为什么有效，为什么也危险}
+\subsection{量化为什么有效，为什么也危险}
 
 权重量化主要减少静态权重字节。int8 把 fp16 权重从 2 字节变成 1 字节；int4 变成 0.5 字节，再加 scale metadata。若 decode 被权重带宽限制，低比特能直接提高上限。
 
@@ -241,7 +241,7 @@ generation_diff_under_fixed_seed
 
 低比特格式能不能进入业务服务，必须由容量、速度和质量三者共同决定。
 
-\section{并发容量账本}
+\subsection{并发容量账本}
 
 业务服务要算的是总内存，不是单请求。一个粗略公式：
 
@@ -264,7 +264,7 @@ total =
 
 每 session 约 \code{640 MiB}，最多约 10 个，还要考虑 allocator 碎片和峰值。因此 admission control 应该保守，并按 \code{max\_context\_tokens} 预留，而不是按当前 prompt 长度乐观估计。
 
-\section{把账本写进 trace}
+\subsection{把账本写进 trace}
 
 计算账本如果只在书里，工程上仍然不可用。trace event 应该包含估计字节和实际耗时：
 
@@ -292,9 +292,9 @@ TraceEvent:
   \item 某层异常慢是否因为 layout 转换或 workspace 分配。
 \end{itemize}
 
-\section{本章验收线}
+\subsection{本节验收线}
 
-读完本章，应该能自己给一个 7B 模型算粗账：
+读完本节，应该能自己给一个 7B 模型算粗账：
 
 \begin{itemize}
   \item 根据 \code{L,H,n\_q,n\_kv,d,I,S} 估算每层参数量和 decode FLOPs。

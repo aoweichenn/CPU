@@ -1,6 +1,6 @@
-\chapter{从真实本地大模型推理引擎开始}
+\section{从真实本地大模型推理引擎开始}
 
-\section{第三册的主线不是玩具模型}
+\subsection{第三册的主线不是玩具模型}
 
 AI 推理最容易被讲成一组名词：tensor、operator、layer、quantization、GEMM、SIMD、attention、KV cache、runtime、scheduler。名词本身没有错，但如果没有机器账本，它们很快会变成框架文档的索引。第三册的主线必须更具体：写出一台本地推理引擎，让它能加载开源 7B 左右 decoder-only Transformer 权重，把 prompt 分词成 token id，完成 prefill 和 decode，在 CPU 后端先跑通，再逐步优化，并且让同一套 runtime 能挂接 GPU 后端。
 
@@ -29,7 +29,7 @@ prompt text
 第三册的贯穿项目是一台真实本地大模型推理引擎。最小 MLP 只是第一块显微镜切片，用来手工检查张量、矩阵乘、量化和 oracle；它不是本册目标，也不是最终架构。
 \end{keyidea}
 
-\section{先画清楚引擎边界}
+\subsection{先画清楚引擎边界}
 
 一台本地大模型引擎至少有七个边界。第一，模型文件边界：权重、shape、dtype、量化参数、层数、hidden size、head 数、词表大小和 tokenizer 配置必须能被一致读取。第二，runtime 边界：session 保存当前 token 序列、position、KV cache、临时 activation buffer 和采样状态。第三，算子边界：RMSNorm、matmul、RoPE、attention、softmax、MLP、sampler 都要有独立语义合同。第四，后端边界：同一个算子可以由 CPU kernel 或 GPU kernel 执行，但输入输出合同不能变化。第五，内存边界：权重、packed weight、activation、KV cache 和后端工作区有不同生命周期。第六，调度边界：prefill、decode、batch、线程池、GPU stream 和拷贝同步不能混成一团。第七，证据边界：正确性、误差、性能、峰值内存和对标对象必须写进报告。
 
@@ -62,9 +62,9 @@ prompt text
 
 这张图也解释了为什么第三册不能只讲 CPU。CPU 是第一条完整落地路径，因为它最适合把地址流、cache、SIMD、多线程、NUMA 和反汇编讲清楚；GPU 是第二条后端路径，因为真实本地 7B 推理经常需要显存带宽和矩阵吞吐。两条路径共享同一份模型语义和算子合同，只是在 kernel 实现、内存驻留、调度同步和 profiler 证据上不同。
 
-\section{用最小切片建立显微镜}
+\subsection{用最小切片建立显微镜}
 
-虽然主线是真实大模型引擎，第一部分仍然从一个极小 MLP 切片开始。原因不是降低目标，而是建立显微镜。一个只有线性层、bias、activation、量化权重和 argmax 的模型，可以把推理引擎中最重要的几件事压缩到一页纸上：
+虽然主线是真实大模型引擎，第二章仍然从一个极小 MLP 切片开始。原因不是降低目标，而是建立显微镜。一个只有线性层、bias、activation、量化权重和 argmax 的模型，可以把推理引擎中最重要的几件事压缩到一页纸上：
 
 \begin{lstlisting}[numbers=none,caption={最小切片的推理语义}]
 hidden = relu(input * W0 + b0)
@@ -74,9 +74,9 @@ class_id = argmax(logits)
 
 这段伪代码看起来只是在做矩阵和向量运算，但机器实际看到的是输入向量的连续字节、权重矩阵的布局、bias 的加载、乘加累加器、激活函数的分支或 \instruction{max} 指令、输出缓冲的写入，以及最终 \code{argmax} 的比较序列。若模型使用 int8 权重量化，核心问题又会变成：8 位权重怎样解码，输入 scale 和权重 scale 怎样组合，累加器为什么通常使用 32 位，重新量化时怎样舍入和饱和。
 
-这些问题在 7B 模型里不会消失，只会被放大。MLP 切片中的 \code{input * W0} 对应 Transformer 里的 Q/K/V projection、output projection 和 MLP gate/up/down projection；\code{hidden} 对应 activation buffer；量化权重对应数十亿参数的压缩格式；oracle 对应每层输出、logits 和生成 token 的误差验证。后续章节会不断把显微镜下的局部机制接回真实大模型引擎。
+这些问题在 7B 模型里不会消失，只会被放大。MLP 切片中的 \code{input * W0} 对应 Transformer 里的 Q/K/V projection、output projection 和 MLP gate/up/down projection；\code{hidden} 对应 activation buffer；量化权重对应数十亿参数的压缩格式；oracle 对应每层输出、logits 和生成 token 的误差验证。后续内容会不断把显微镜下的局部机制接回真实大模型引擎。
 
-\section{张量不是数组别名}
+\subsection{张量不是数组别名}
 
 \term{tensor}{张量} 可以先理解为“带形状的多维数据视图”，但这个说法还不够。对推理引擎来说，张量至少包含五类信息：
 
@@ -98,7 +98,7 @@ address = base + (i * stride_row + j) * sizeof(element)
 
 在大模型推理里，张量还会变成状态。KV cache 不是普通临时张量：它跨 decode 步骤持续存在，每生成一个 token 都要向每层的 K/V 区域追加一行，并在后续 attention 中被重新读取。它的 shape、stride、容量、有效长度和后端驻留位置都属于模型正确性与性能合同。
 
-\section{算子合同：先定义结果，再谈 kernel}
+\subsection{算子合同：先定义结果，再谈 kernel}
 
 \term{operator}{算子} 是有输入合同和输出合同的计算单元。以矩阵乘为例，语义可以写成：
 
@@ -117,7 +117,7 @@ for m in 0..M:
 不要先写“高性能 kernel”再倒推语义。AI 推理里很多 bug 并不崩溃，而是悄悄改变 logits、概率、排名或边界 token。没有 reference 和误差 oracle，速度数字没有意义。
 \end{warningbox}
 
-\section{量化从哪里来}
+\subsection{量化从哪里来}
 
 \term{quantization}{量化} 的基本动机不是神秘技巧，而是机器账本约束。一个 7B 模型如果权重按 float32 保存，仅权重就接近 28GB；按 fp16/bf16 保存约 14GB；按 int8 保存约 7GB；若使用 int4 或分组量化，权重字节还能继续下降，但会引入更复杂的 scale、zero point、group metadata 和反量化开销。权重变小可以降低内存容量压力、cache/TLB 压力、内存带宽压力和 GPU 显存压力，但量化不是免费压缩，它引入表示误差和重新缩放成本。
 
@@ -141,7 +141,7 @@ out = requantize(acc, scale_a, scale_w, scale_out, zero_out)
 
 累加器不能仍然用 int8，因为 \code{K} 稍大就会溢出。重新量化也不是简单右移：真实 scale 往往不是 2 的幂，需要乘法、舍入、饱和和边界处理。第三册后续会把这些步骤分别落到 C++ 类型、CPU/GPU 指令形态和测试 oracle。
 
-\section{从算子到推理引擎}
+\subsection{从算子到推理引擎}
 
 单个算子正确还不等于推理引擎正确。decoder-only 推理会把多个算子按层重复连接起来：上一层输出成为下一层输入，中间 activation 可以被复用，权重可能预打包，某些算子可以融合，某些布局转换必须插入，KV cache 要跨 token 保留。推理引擎至少要管理五类状态：
 
@@ -173,9 +173,9 @@ return tokenizer.decode(generated_ids)
 
 这段流程故意没有隐藏工程边界。加载模型时要校验文件；选择 kernel 时要检查 dtype、layout 和 backend capability；复用 activation buffer 时要保证生命周期不重叠；更新 KV cache 时要保证层号、head、position 和 batch 维度一致；记录 timing 时要把 prefill tokens/s、decode tokens/s、首 token 延迟、内存峰值和对标对象分开。
 
-\section{学完这一册能做出的业务原型}
+\subsection{学完这一册能做出的业务原型}
 
-把本章这些边界连起来，读者能做出的不是完整商业平台，而是一个严肃的本地推理原型。它应该具备：
+把本节这些边界连起来，读者能做出的不是完整商业平台，而是一个严肃的本地推理原型。它应该具备：
 
 \begin{itemize}
   \item 加载一个受限 decoder-only 模型或模型切片。
@@ -194,7 +194,7 @@ return tokenizer.decode(generated_ids)
 第三册要教的不是“调用一个大模型 API”，而是实现本地推理系统的关键骨架：模型合同、张量地址、量化数值、KV 状态、后端计划、oracle 和 profiler。
 \end{keyidea}
 
-\section{本章收束}
+\subsection{本节收束}
 
 第三册从真实 7B 级本地推理引擎立题，再用小 MLP 切片建立显微镜。张量把内存、形状、量化和驻留位置连接起来；算子合同把语义和测试连接起来；量化把表示范围、内存容量和机器成本连接起来；KV cache 把单次算子变成跨 token 状态；后端合同把 CPU SIMD、多线程和 GPU kernel 放进同一个 runtime；性能报告把每一步优化放到当前基线和成熟框架旁边比较。
 
