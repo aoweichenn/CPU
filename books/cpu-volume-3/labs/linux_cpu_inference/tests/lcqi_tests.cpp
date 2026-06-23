@@ -30,6 +30,15 @@ constexpr float LCQI_ATTENTION_EXPECTED_0 = 2.0F;
 constexpr float LCQI_ATTENTION_EXPECTED_1 = 3.0F;
 constexpr float LCQI_KERNEL_MAX_DIFF = 1.0e-5F;
 constexpr std::int32_t LCQI_SIMD_TEST_BLOCK = 8;
+constexpr std::int32_t LCQI_REFERENCE_DECODER_PREDICTED_TOKEN = 0;
+constexpr std::size_t LCQI_REFERENCE_DECODER_VOCAB_SIZE = 5;
+constexpr std::array<float, LCQI_REFERENCE_DECODER_VOCAB_SIZE> LCQI_REFERENCE_DECODER_LOGITS{
+    0.352516979F,
+    -0.126884326F,
+    0.0797837451F,
+    -0.29797405F,
+    0.127030417F,
+};
 
 struct KernelShapeCase {
     std::int32_t input_size = 0;
@@ -132,10 +141,15 @@ void test_reference_decoder_end_to_end() {
     const lcqi::ReferenceDecoderModel model = lcqi::make_tiny_reference_decoder_model();
     const std::vector<std::int32_t> tokens{1, 2, 3};
     const lcqi::ReferenceDecodeResult result = lcqi::run_reference_decode(model, tokens);
-    require(result.logits.size() == static_cast<std::size_t>(model.config.vocab_size),
+    require(result.logits.size() == LCQI_REFERENCE_DECODER_VOCAB_SIZE,
             "reference decoder logits size mismatch");
-    require(result.predicted_token >= 0 && result.predicted_token < model.config.vocab_size,
-            "reference decoder predicted token out of range");
+    require(result.predicted_token == LCQI_REFERENCE_DECODER_PREDICTED_TOKEN,
+            "reference decoder predicted token mismatch");
+    for (std::size_t index = 0; index < LCQI_REFERENCE_DECODER_LOGITS.size(); ++index) {
+        require_close(result.logits[index],
+                      LCQI_REFERENCE_DECODER_LOGITS[index],
+                      "reference decoder golden logit mismatch");
+    }
 }
 
 void test_packed_i8_kernel_matches_scalar() {

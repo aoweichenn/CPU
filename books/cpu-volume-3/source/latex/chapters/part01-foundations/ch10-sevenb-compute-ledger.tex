@@ -178,6 +178,20 @@ decode & GEMV/小 GEMM、KV 读取 & 权重带宽、KV 带宽、launch/同步 \\
 
 这就是为什么一个后端可能 prefill 很快、decode 一般；也可能 CPU decode 经过 int4 和线程优化后可用，但长 prompt prefill 明显慢。报告必须分开写 TTFT、prefill tokens/s 和 decode tokens/s。
 
+用一个 \code{4096x4096} fp16 projection 看 arithmetic intensity，差异会更直观。decode 时 \code{T=1}：
+
+\[
+flops = 2 \times 1 \times 4096 \times 4096 \approx 33.6M
+\]
+
+只读权重就约 \code{32 MiB}，输入和输出各约 \code{16 KiB}，所以强度约 \code{1 FLOP/byte}。prefill 若 \code{T=512}，同一个权重矩阵被 512 个 token 复用：
+
+\[
+flops = 2 \times 512 \times 4096 \times 4096 \approx 17.2G
+\]
+
+权重约 \code{32 MiB}，输入和输出各约 \code{4 MiB}，粗略强度超过 \code{400 FLOP/byte}。真实 GEMM 会因为 cache、tiling、layout 和 batch 细节打折，但方向不会变：prefill 更容易吃满算力，decode 更容易被字节流、launch 和同步支配。
+
 \subsection{roofline：用带宽和算力约束 tokens/s}
 
 粗略上限可以用 roofline 思路判断。对每个 decode token，假设需要读：
@@ -211,6 +225,90 @@ tokens/s \le
 \]
 
 若同一机器由于解包、NUMA、TLB、线程调度只能达到 \code{55 GB/s} 有效带宽，上限就是 \code{13 tokens/s}。这比“开更多线程”更能解释问题：线程只能提高并行利用率，不能凭空减少每 token 字节数。
+
+\subsection{decode tokens/s 上限表}
+
+把上面的账本压成一张表。这里使用十进制 GB 粗算，\code{S=4096} 时 fp16 KV 读取约 \code{0.5 GB/token}；权重按 \code{fp16=14 GB}、\code{int8=7 GB}、\code{int4+metadata=3.7 GB} 估算。因此 decode 每 token 最少读：
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+格式 & 权重 GB/token & KV GB/token & 合计 GB/token \\
+\midrule
+fp16 & 14.0 & 0.5 & 14.5 \\
+int8 & 7.0 & 0.5 & 7.5 \\
+int4 & 3.7 & 0.5 & 4.2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+只按带宽算，理论上限如下：
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+有效带宽 & fp16 tok/s & int8 tok/s & int4 tok/s \\
+\midrule
+\code{50 GB/s} CPU & 3.4 & 6.7 & 11.9 \\
+\code{100 GB/s} CPU & 6.9 & 13.3 & 23.8 \\
+\code{200 GB/s} 高端 CPU & 13.8 & 26.7 & 47.6 \\
+\code{600 GB/s} 入门 GPU & 41.4 & 80.0 & 142.9 \\
+\code{1000 GB/s} GPU & 69.0 & 133.3 & 238.1 \\
+\code{1600 GB/s} 高带宽 GPU & 110.3 & 213.3 & 381.0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不是性能承诺，而是上限。实际系统会继续扣掉：低比特解包、scale metadata、cache miss、TLB miss、线程同步、sampler、batch 调度、GPU launch、host-device staging 和 fallback。若实测 int4 decode 只有 \code{8 tok/s}，不能直接说实现失败；要先看有效带宽是不是只有 \code{35 GB/s}，以及时间是否被解包或调度吃掉。
+
+\subsection{算力上限通常不是 decode 的第一堵墙}
+
+前面估算 \code{S=4096} 时，线性层和 attention 合起来约 \code{13.5 GFLOPs/token}。若只按算力上限：
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+有效算力 & 理论 tok/s & 解释 \\
+\midrule
+\code{0.5 TFLOP/s} CPU & 37 & 标量/低效 SIMD 可能达不到 \\
+\code{1 TFLOP/s} CPU & 74 & 已经高于很多带宽上限 \\
+\code{10 TFLOP/s} GPU & 740 & decode 小 batch 未必能吃满 \\
+\code{50 TFLOP/s} GPU & 3700 & launch/KV/带宽可能先限制 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果同一配置的带宽上限只有 \code{24 tok/s}，而算力上限是 \code{74 tok/s}，首要问题就不是“FLOPs 不够”，而是每 token 读了太多字节或没有把带宽用起来。CPU micro-kernel 章节里的 \code{4096x4096} 实测会继续把这个差距拆开：同样是 int8 权重，标量、packed scalar 和 NEON 的有效带宽差异很大。
+
+\subsection{prefill 上限要按 prompt 维度重算}
+
+prefill 不能套用 decode 的 \code{GB/token}。若 \code{T=512}，权重读流被 512 个 token 分摊，单 token 的权重字节近似变成：
+
+\begin{center}
+\begin{tabular}{lrr}
+\toprule
+格式 & 权重总字节 & 摊到每 prompt token \\
+\midrule
+fp16 & \code{14 GB} & \code{27 MB/token} \\
+int8 & \code{7 GB} & \code{14 MB/token} \\
+int4 & \code{3.7 GB} & \code{7 MB/token} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+但 prefill 的 attention 是 \code{O(T^2)}，而且 TTFT 还包含 tokenizer、模型 prepare、KV cache 初始化、可能的 packing 和调度排队。因此 prefill report 至少要拆成：
+
+\begin{lstlisting}[numbers=none,caption={prefill report 最少字段}]
+prompt_tokens
+tokenizer_ms
+prepare_or_pack_ms
+prefill_compute_ms
+prefill_tokens_per_s
+kv_write_bytes
+ttft_ms
+\end{lstlisting}
+
+只报“首 token 很慢”没有诊断价值。若慢在 \code{prepare_or_pack_ms}，优化 kernel 没用；若慢在 \code{prefill_compute_ms}，要看 GEMM/attention；若慢在 \code{tokenizer_ms} 或排队，问题已经进入 serving 层。
 
 \subsection{量化为什么有效，为什么也危险}
 

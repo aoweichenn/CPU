@@ -347,6 +347,30 @@ AVX2 & 0 & 0 & aarch64 上不可用，不能当实测 \\
 
 这些数字的解释要克制。packed scalar 变慢，说明 packing 本身不是魔法；如果没有 SIMD 消费这个布局，它只增加了循环和地址转换成本。NEON 变快，说明连续 lane + 向量扩展/乘加击中了当前瓶颈的一部分。它还没有证明达到了硬件上限，因为缺少 PMU 计数器、内存带宽、CPU 频率和 NUMA 信息。
 
+\subsection{把 4096x4096 实测换成带宽和吞吐}
+
+单次 \code{4096x4096} int8 GEMV 至少读取 \code{16 MiB} 权重，输入和输出各约 \code{16 KiB}。忽略很小的 input/output，按权重读流估算有效带宽：
+
+\[
+effective\_bandwidth \approx \frac{16MiB}{time}
+\]
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+backend & average us & 有效权重带宽 & 相对 scalar \\
+\midrule
+scalar & 20188.1 & \code{0.83 GB/s} & \code{1.00x} \\
+packed scalar & 25052.9 & \code{0.67 GB/s} & \code{0.81x} \\
+NEON & 4322.2 & \code{3.88 GB/s} & \code{4.67x} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个带宽数字明显低于现代 CPU 的内存带宽，所以当前 micro-kernel 还不是纯 DRAM 带宽上限。瓶颈更可能在标量循环开销、int8 到 fp32 转换链、FMA 指令吞吐、未展开的热循环、编译器调度、cache/TLB 和缺少多线程。换句话说，NEON 已经证明 SIMD path 生效，但还没有证明 micro-kernel 接近硬件 roofline。
+
+如果把它放回 7B 账本，单个 \code{4096x4096} projection 的 NEON 延迟约 \code{4.3 ms}。一层 decoder 有 QKV、O 和 MLP 多个 projection，完整 32 层绝不可能简单乘一个小常数就变成可用 tokens/s。这个样板的价值是拆开一块热路径，不是宣称完整模型速度。
+
 反汇编 artifact 如下。热循环关键片段随后列出：
 
 \begin{lstlisting}[numbers=none,caption={objdump artifact}]
@@ -371,6 +395,27 @@ fadd    v30.4s, v30.4s, v28.4s
 
 这段反汇编证明当前路径确实进入 NEON 向量计算；也证明它还不是成熟 int8 dot-product kernel。一个更强实现应减少 \code{scvtf/fmul/fadd} 链路，尝试整数 dot、更多 unroll、prefetch、线程分区和 per-channel/per-group scale 的更低开销组织。
 
+\subsection{从反汇编看下一步优化点}
+
+当前热循环每个 \code{k} 至少包含：读取 input、读取 8 个 int8 权重、符号扩展到 int16、再扩展到 int32、转 fp32、乘 scale、乘 input、累加。它的优点是语义直观，oracle 容易对齐；缺点是每 8 个权重要走一串转换指令。
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.32\linewidth}p{0.28\linewidth}}
+\toprule
+优化方向 & 可能收益 & 必须补的证据 \\
+\midrule
+unroll \code{k} 循环 & 减少 loop overhead，提高调度空间 & objdump、instructions、latency \\
+更多输出 block & 提高 input 复用 & register pressure、spill 检查 \\
+整数 dot path & 减少 int8->fp32 转换链 & accumulator 语义、requant oracle \\
+prefetch packed weight & 降低 miss stall & LLC miss、bandwidth counter \\
+多线程 out block & 提高吞吐 & p50/p95、带宽饱和点、NUMA \\
+per-channel scale 外提 & 降低内层 scale 成本 & scale layout、误差和反汇编 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些优化不能一起上。下一轮应该只选一个变量，例如 \code{k} unroll 或整数 dot path，保持同一 CSV schema、同一 golden、同一 shape sweep，再比较耗时、反汇编和 perf counters。否则数字变快了也不知道是哪一项起作用。
+
 \subsection{oneDNN 对照：只能比较坐标，不能混淆 dtype}
 
 本次还加入了可选 oneDNN 对标目标 \code{lcqi\_onednn\_bench}。它在安装 \code{onednn-devel} 的机器上编译，执行 \code{1x4096} 乘 \code{4096x4096} 的 f32 matmul。CSV artifact 是 \filepath{books/cpu-volume-3/results/lcqi-onednn-f32-4096-2026-06-23.csv}：
@@ -388,6 +433,24 @@ LCQI NEON & int8 weight + fp32 input & \code{4096x4096} & 4322.2 \\
 \end{center}
 
 这张表不能读成“LCQI 已经比 oneDNN 强”，因为 dtype、权重表示、primitive 选择和线程策略不同。它只能说明本仓库已经有了外部 primitive 坐标，并暴露下一步对标要求：要么实现同 dtype f32 GEMV/GEMM 与 oneDNN 比，要么找 oneDNN 支持的同量化路径；同时固定线程数、ISA、warmup、输出误差和 perf counters。
+
+\subsection{ggml/llama.cpp 对标应比较什么}
+
+成熟推理系统的 CPU decode 不是只靠一个 micro-kernel。ggml/llama.cpp 这类项目还包含 tensor descriptor、低比特 block 格式、线程池、NUMA/亲和、KV cache、sampler、模型加载和 prompt/runtime 调度。对标时至少拆三层：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+层级 & 比较内容 & 不合格比较 \\
+\midrule
+单算子 & 同 shape、同 dtype、同线程数、同误差 & 拿 int8 对 f32 直接宣布胜负 \\
+decoder block & RMSNorm、QKV、RoPE、KV、MLP、lm head & 只比较一个 linear kernel \\
+端到端 & TTFT、decode tok/s、p95、内存峰值、质量 & 只报平均 tokens/s \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+本章当前只完成第一层的一小部分：LCQI int8 scalar/packed/NEON 与 oneDNN f32 坐标对照。下一步若要对标 ggml/llama.cpp，必须固定模型切片和 prompt，报告加载/prepare/prefill/decode/sampler 分段，并把 logits 或 top-k 差异写出来。没有 correctness 对照的 tokens/s，只是吞吐数字，不是 AI Infra 证据。
 
 \subsection{微内核进入主线的验收}
 

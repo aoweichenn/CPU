@@ -327,6 +327,78 @@ predicted_token = argmax(logits)
 
 测试入口在 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/tests/lcqi_tests.cpp}。目前它覆盖 RMSNorm、RoPE、KV attention、reference decode end-to-end、packed int8 kernel 与 scalar 对齐。下一步要把 TinyTrace-16 的每个 checkpoint 固化成 golden 文件，而不是只检查最终 \code{predicted\_token}。
 
+当前仓库已经把 tiny reference decoder 的最终 logits 固化成 golden，而不是只检查输出范围。固定输入 \code{tokens=[1,2,3]}，\code{make\_tiny\_reference\_decoder\_model()} 的输出是：
+
+\begin{lstlisting}[numbers=none,caption={lcqi reference decoder golden logits}]
+predicted_token = 0
+logits[0] =  0.352516979
+logits[1] = -0.126884326
+logits[2] =  0.0797837451
+logits[3] = -0.29797405
+logits[4] =  0.127030417
+\end{lstlisting}
+
+对应测试常量在 \code{lcqi\_tests.cpp} 中记录为 \code{LCQI\_REFERENCE\_DECODER\_LOGITS}。这仍然不是完整 oracle，但它比“predicted token 在 vocab 范围内”强得多：任何 RMSNorm、RoPE、KV append/read、attention、SwiGLU 或 lm head 的语义漂移，都会先撞到这个 logits golden。
+
+\subsection{逐张量 checkpoint 应该长什么样}
+
+最终 logits 只能说明端到端错了，不能说明错在哪里。TinyTrace-16 的 checkpoint 应该记录每个阶段的 shape、少量数值摘要和可选完整 tensor。最小格式可以这样设计：
+
+\begin{lstlisting}[numbers=none,caption={TinyTrace checkpoint 记录}]
+Checkpoint:
+  token_position
+  layer_id
+  name
+  shape
+  dtype
+  max_abs
+  checksum
+  values_optional
+\end{lstlisting}
+
+例如 position 2、layer 0 的关键 checkpoint：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.22\linewidth}p{0.34\linewidth}}
+\toprule
+checkpoint & shape & 定位能力 \\
+\midrule
+\code{emb} & \code{[8]} & token id 和 embedding 行 \\
+\code{attn\_norm} & \code{[8]} & RMSNorm epsilon 和权重 \\
+\code{q\_before\_rope} & \code{[2,4]} & Q projection 和 reshape \\
+\code{k\_after\_rope} & \code{[1,4]} & K projection、RoPE position \\
+\code{kv\_slot} & \code{[layer,pos,kv\_head]} & cache 地址和 GQA head \\
+\code{attn\_prob\_h1} & \code{[3]} & causal mask 和 softmax \\
+\code{mlp\_gate} & \code{[16]} & gate projection \\
+\code{mlp\_hidden} & \code{[16]} & silu 和逐元素乘 \\
+\code{layer\_out} & \code{[8]} & residual 和 buffer 覆盖 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些 checkpoint 不要求每次 CI 都存完整向量。常跑测试可以只比 \code{checksum/max\_abs/topk}；漂移调试时再打开完整 dump。关键是 checkpoint 名称和 shape 要稳定，否则两次报告无法对齐。
+
+\subsection{误差边界要随 checkpoint 分层}
+
+不同 checkpoint 对误差的容忍度不同。reference 对 reference 应该接近完全一致；优化后端若只改变循环顺序，可以用很小阈值；量化后端必须看更高层语义。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.24\linewidth}p{0.34\linewidth}}
+\toprule
+比较对象 & 推荐阈值 & 失败解释 \\
+\midrule
+f32 reference vs f32 scalar & \code{1e-5} abs/rel & shape、权重布局、代码错误 \\
+f32 scalar vs SIMD f32 & \code{1e-4} abs/rel & 归约顺序或 SIMD lane 错 \\
+int8 operator & profile dependent & scale、zero point、累加策略 \\
+RoPE checkpoint & \code{1e-5} abs/rel & position、pairing、base 错 \\
+attention prob & \code{1e-4} abs/rel & mask、softmax 稳定性、KV 映射 \\
+logits top-k & overlap gate & 量化质量和可见输出漂移 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不要用一个全局 \code{epsilon} 盖住所有层。RMSNorm 的小误差可能还能接受；attention score 的小误差经过 softmax 后可能改变概率；logits 的小差异若正好发生在 top-1/top-2 附近，会直接改变采样结果。
+
 \subsection{端到端 reference decode loop}
 
 端到端 reference 可以先只输出 logits，不做复杂采样：
