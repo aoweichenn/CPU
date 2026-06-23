@@ -24,13 +24,17 @@ struct KernelBenchmarkCase {
     std::int32_t repeat = 0;
 };
 
+struct KernelBackendBenchmark {
+    const char* name = "";
+    bool available = false;
+    double average_us = 0.0;
+    float max_abs_diff = 0.0F;
+    float checksum = 0.0F;
+};
+
 struct KernelBenchmarkResult {
     KernelBenchmarkCase benchmark_case;
-    double scalar_average_us = 0.0;
-    double packed_average_us = 0.0;
-    float max_abs_diff = 0.0F;
-    float scalar_checksum = 0.0F;
-    float packed_checksum = 0.0F;
+    std::vector<KernelBackendBenchmark> backends;
 };
 
 PackedLinearI8 pack_linear_i8(const QuantizedLinearLayer& layer,
@@ -44,6 +48,18 @@ void linear_i8_packed_with_workspace(const PackedLinearI8& layer,
                                      std::span<const float> input,
                                      std::span<float> output,
                                      std::span<float> accumulator_workspace);
+
+bool linear_i8_packed_avx2_available() noexcept;
+
+void linear_i8_packed_avx2(const PackedLinearI8& layer,
+                           std::span<const float> input,
+                           std::span<float> output);
+
+bool linear_i8_packed_neon_available() noexcept;
+
+void linear_i8_packed_neon(const PackedLinearI8& layer,
+                           std::span<const float> input,
+                           std::span<float> output);
 
 QuantizedLinearLayer make_deterministic_i8_layer(std::int32_t input_size,
                                                  std::int32_t output_size,

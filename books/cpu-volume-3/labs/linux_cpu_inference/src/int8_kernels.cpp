@@ -17,6 +17,12 @@ constexpr std::int32_t LCQI_INPUT_PATTERN_MODULUS = 17;
 constexpr std::int32_t LCQI_INPUT_PATTERN_CENTER = 8;
 constexpr float LCQI_INPUT_PATTERN_SCALE = 0.125F;
 constexpr double LCQI_SECONDS_TO_MICROSECONDS = 1000000.0;
+constexpr std::int32_t LCQI_SIMD_OUTPUT_BLOCK = 8;
+constexpr std::size_t LCQI_BENCHMARK_BACKEND_COUNT = 4;
+constexpr const char* LCQI_BACKEND_SCALAR = "scalar";
+constexpr const char* LCQI_BACKEND_PACKED_SCALAR = "packed_scalar";
+constexpr const char* LCQI_BACKEND_AVX2 = "avx2";
+constexpr const char* LCQI_BACKEND_NEON = "neon";
 
 void require_positive(std::int32_t value, const char* name) {
     if (value <= 0) {
@@ -57,6 +63,16 @@ float checksum(std::span<const float> values) {
         sum += value;
     }
     return sum;
+}
+
+void add_unavailable_backend(KernelBenchmarkResult& result, const char* name) {
+    result.backends.push_back(KernelBackendBenchmark{
+        .name = name,
+        .available = false,
+        .average_us = 0.0,
+        .max_abs_diff = 0.0F,
+        .checksum = 0.0F,
+    });
 }
 
 template <typename Callable>
@@ -249,10 +265,12 @@ KernelBenchmarkResult benchmark_linear_i8_case(const KernelBenchmarkCase& benchm
                                     benchmark_case.output_size,
                                     0.015625F);
     const PackedLinearI8 packed = pack_linear_i8(layer, benchmark_case.output_block_size);
+    const PackedLinearI8 packed_simd = pack_linear_i8(layer, LCQI_SIMD_OUTPUT_BLOCK);
     const std::vector<float> input = make_deterministic_input(benchmark_case.input_size);
     std::vector<float> scalar_output(checked_size(benchmark_case.output_size, "output_size"),
                                      0.0F);
     std::vector<float> packed_output(scalar_output.size(), 0.0F);
+    std::vector<float> simd_output(scalar_output.size(), 0.0F);
     std::vector<float> packed_workspace(
         checked_size(benchmark_case.output_block_size, "output_block_size"),
         0.0F);
@@ -262,15 +280,84 @@ KernelBenchmarkResult benchmark_linear_i8_case(const KernelBenchmarkCase& benchm
 
     KernelBenchmarkResult result;
     result.benchmark_case = benchmark_case;
-    result.max_abs_diff = max_abs_diff(scalar_output, packed_output);
-    result.scalar_average_us =
-        measure_average_us(benchmark_case.repeat, [&]() { linear_i8(layer, input, scalar_output); });
-    result.scalar_checksum = checksum(scalar_output);
-    result.packed_average_us = measure_average_us(
-        benchmark_case.repeat,
-        [&]() { linear_i8_packed_with_workspace(packed, input, packed_output, packed_workspace); });
-    result.packed_checksum = checksum(packed_output);
+    result.backends.reserve(LCQI_BENCHMARK_BACKEND_COUNT);
+    result.backends.push_back(KernelBackendBenchmark{
+        .name = LCQI_BACKEND_SCALAR,
+        .available = true,
+        .average_us = measure_average_us(benchmark_case.repeat,
+                                         [&]() { linear_i8(layer, input, scalar_output); }),
+        .max_abs_diff = 0.0F,
+        .checksum = checksum(scalar_output),
+    });
+    result.backends.push_back(KernelBackendBenchmark{
+        .name = LCQI_BACKEND_PACKED_SCALAR,
+        .available = true,
+        .average_us = measure_average_us(
+            benchmark_case.repeat,
+            [&]() { linear_i8_packed_with_workspace(packed,
+                                                    input,
+                                                    packed_output,
+                                                    packed_workspace); }),
+        .max_abs_diff = max_abs_diff(scalar_output, packed_output),
+        .checksum = checksum(packed_output),
+    });
+    if (linear_i8_packed_avx2_available()) {
+        linear_i8_packed_avx2(packed_simd, input, simd_output);
+        result.backends.push_back(KernelBackendBenchmark{
+            .name = LCQI_BACKEND_AVX2,
+            .available = true,
+            .average_us = measure_average_us(
+                benchmark_case.repeat,
+                [&]() { linear_i8_packed_avx2(packed_simd, input, simd_output); }),
+            .max_abs_diff = max_abs_diff(scalar_output, simd_output),
+            .checksum = checksum(simd_output),
+        });
+    } else {
+        add_unavailable_backend(result, LCQI_BACKEND_AVX2);
+    }
+    if (linear_i8_packed_neon_available()) {
+        linear_i8_packed_neon(packed_simd, input, simd_output);
+        result.backends.push_back(KernelBackendBenchmark{
+            .name = LCQI_BACKEND_NEON,
+            .available = true,
+            .average_us = measure_average_us(
+                benchmark_case.repeat,
+                [&]() { linear_i8_packed_neon(packed_simd, input, simd_output); }),
+            .max_abs_diff = max_abs_diff(scalar_output, simd_output),
+            .checksum = checksum(simd_output),
+        });
+    } else {
+        add_unavailable_backend(result, LCQI_BACKEND_NEON);
+    }
     return result;
 }
 
 }  // namespace lcqi
+
+#if !defined(LCQI_ENABLE_AVX2)
+namespace lcqi {
+
+bool linear_i8_packed_avx2_available() noexcept {
+    return false;
+}
+
+void linear_i8_packed_avx2(const PackedLinearI8&, std::span<const float>, std::span<float>) {
+    throw std::runtime_error("AVX2 packed kernel is not enabled in this build");
+}
+
+}  // namespace lcqi
+#endif
+
+#if !defined(LCQI_ENABLE_NEON)
+namespace lcqi {
+
+bool linear_i8_packed_neon_available() noexcept {
+    return false;
+}
+
+void linear_i8_packed_neon(const PackedLinearI8&, std::span<const float>, std::span<float>) {
+    throw std::runtime_error("NEON packed kernel is not enabled in this build");
+}
+
+}  // namespace lcqi
+#endif

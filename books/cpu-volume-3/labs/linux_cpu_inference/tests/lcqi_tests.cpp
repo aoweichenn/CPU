@@ -3,6 +3,7 @@
 #include <lcqi/model.hpp>
 #include <lcqi/reference_decoder.hpp>
 
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
@@ -28,6 +29,20 @@ constexpr float LCQI_RMS_EXPECTED_1 = 0.565685F;
 constexpr float LCQI_ATTENTION_EXPECTED_0 = 2.0F;
 constexpr float LCQI_ATTENTION_EXPECTED_1 = 3.0F;
 constexpr float LCQI_KERNEL_MAX_DIFF = 1.0e-5F;
+constexpr std::int32_t LCQI_SIMD_TEST_BLOCK = 8;
+
+struct KernelShapeCase {
+    std::int32_t input_size = 0;
+    std::int32_t output_size = 0;
+    std::int32_t output_block_size = 0;
+};
+
+constexpr std::array<KernelShapeCase, 4> LCQI_KERNEL_SHAPE_CASES{{
+    {17, 19, 8},
+    {33, 7, 8},
+    {64, 32, 16},
+    {65, 31, 16},
+}};
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -124,15 +139,36 @@ void test_reference_decoder_end_to_end() {
 }
 
 void test_packed_i8_kernel_matches_scalar() {
-    const lcqi::QuantizedLinearLayer layer = lcqi::make_deterministic_i8_layer(17, 19, 0.03125F);
-    const lcqi::PackedLinearI8 packed = lcqi::pack_linear_i8(layer, 8);
-    const std::vector<float> input = lcqi::make_deterministic_input(layer.input_size);
-    std::vector<float> scalar_output(static_cast<std::size_t>(layer.output_size), 0.0F);
-    std::vector<float> packed_output(static_cast<std::size_t>(layer.output_size), 0.0F);
-    lcqi::linear_i8(layer, input, scalar_output);
-    lcqi::linear_i8_packed(packed, input, packed_output);
-    require(lcqi::max_abs_diff(scalar_output, packed_output) <= LCQI_KERNEL_MAX_DIFF,
-            "packed int8 kernel output differs from scalar");
+    for (const KernelShapeCase& shape_case : LCQI_KERNEL_SHAPE_CASES) {
+        const lcqi::QuantizedLinearLayer layer =
+            lcqi::make_deterministic_i8_layer(shape_case.input_size,
+                                             shape_case.output_size,
+                                             0.03125F);
+        const lcqi::PackedLinearI8 packed =
+            lcqi::pack_linear_i8(layer, shape_case.output_block_size);
+        const std::vector<float> input = lcqi::make_deterministic_input(layer.input_size);
+        std::vector<float> scalar_output(static_cast<std::size_t>(layer.output_size), 0.0F);
+        std::vector<float> packed_output(static_cast<std::size_t>(layer.output_size), 0.0F);
+        lcqi::linear_i8(layer, input, scalar_output);
+        lcqi::linear_i8_packed(packed, input, packed_output);
+        require(lcqi::max_abs_diff(scalar_output, packed_output) <= LCQI_KERNEL_MAX_DIFF,
+                "packed int8 kernel output differs from scalar");
+
+        const lcqi::PackedLinearI8 simd_packed =
+            lcqi::pack_linear_i8(layer, LCQI_SIMD_TEST_BLOCK);
+        if (lcqi::linear_i8_packed_avx2_available()) {
+            std::vector<float> avx2_output(static_cast<std::size_t>(layer.output_size), 0.0F);
+            lcqi::linear_i8_packed_avx2(simd_packed, input, avx2_output);
+            require(lcqi::max_abs_diff(scalar_output, avx2_output) <= LCQI_KERNEL_MAX_DIFF,
+                    "AVX2 int8 kernel output differs from scalar");
+        }
+        if (lcqi::linear_i8_packed_neon_available()) {
+            std::vector<float> neon_output(static_cast<std::size_t>(layer.output_size), 0.0F);
+            lcqi::linear_i8_packed_neon(simd_packed, input, neon_output);
+            require(lcqi::max_abs_diff(scalar_output, neon_output) <= LCQI_KERNEL_MAX_DIFF,
+                    "NEON int8 kernel output differs from scalar");
+        }
+    }
 }
 
 }  // namespace

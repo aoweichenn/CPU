@@ -31,7 +31,14 @@ source/latex/main.epub
 labs/linux_cpu_inference/
 ```
 
-该目录目前包含最小 MLP/int8 权重教学切片、tiny reference decoder、int8 scalar baseline、packed layout 路径和 shape sweep benchmark，用来验证张量、线性层、量化权重、KV cache、oracle 和 benchmark 的基本边界。它仍然不是生产级 AI Infra。生产级门禁见：
+该目录目前包含最小 MLP/int8 权重教学切片、tiny reference decoder、int8 scalar baseline、packed layout、AVX2/NEON SIMD 路径和 shape sweep benchmark，用来验证张量、线性层、量化权重、KV cache、oracle 和 benchmark 的基本边界。当前 aarch64 本机 NEON 结果见：
+
+```text
+reports/lcqi-aarch64-neon-benchmark-2026-06-23.md
+results/lcqi-aarch64-neon-2026-06-23.csv
+```
+
+它仍然不是生产级 AI Infra。生产级门禁见：
 
 ```text
 reports/ai-infra-maturity-audit.md
