@@ -55,6 +55,18 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi_bench PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+find_package(dnnl QUIET)
+if(dnnl_FOUND)
+    add_executable(lcqi_onednn_bench
+        src/onednn_bench.cpp
+    )
+    target_link_libraries(lcqi_onednn_bench PRIVATE DNNL::dnnl)
+    target_compile_features(lcqi_onednn_bench PRIVATE cxx_std_20)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_compile_options(lcqi_onednn_bench PRIVATE -Wall -Wextra -Wpedantic)
+    endif()
+endif()
+
 add_executable(lcqi_tests
     tests/lcqi_tests.cpp
 )

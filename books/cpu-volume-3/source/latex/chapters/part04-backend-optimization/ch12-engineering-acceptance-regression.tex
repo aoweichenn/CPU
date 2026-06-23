@@ -181,6 +181,52 @@ PerformanceGate:
 
 门禁阈值要分指标。比如 peak memory 回归 20\% 可能不能接受；单次 p50 latency 回归 3\% 可能在噪声内；p95 latency 回归 15\% 需要调查；pack time 变慢但 decode 变快是否可接受，要看目标场景是短请求还是长期服务。性能门禁不是机械判分，而是让退化可见。
 
+\subsection{服务化 SLO：把 kernel 数字换成线上账本}
+
+底层 kernel 快，不等于服务能扛业务。推理服务还要处理排队、取消、流式返回、上下文容量、KV cache 内存和 OOM。最小 serving 验收要把单请求 trace 聚合成下面的账本：
+
+\begin{lstlisting}[numbers=none,caption={ServingSloEnvelope}]
+ServingSloEnvelope:
+  max_waiting_requests
+  max_running_requests
+  admission_policy: reject | queue | degrade
+  ttft_p50_ms
+  ttft_p95_ms
+  decode_step_p95_ms
+  end_to_end_p95_ms
+  queue_wait_p95_ms
+  kv_cache_reserved_bytes
+  kv_cache_used_bytes
+  oom_reject_count
+  cancel_reclaim_p95_ms
+\end{lstlisting}
+
+用 7B 典型 shape 粗算一次 KV 容量：\code{layers=32, kv\_heads=32, head\_dim=128, fp16} 时，每 token KV 字节为：
+
+\[
+2 \times 32 \times 32 \times 128 \times 2 = 524288 \text{ bytes} = 512 \text{ KiB}
+\]
+
+一个 4K context session 约 \code{2 GiB} KV cache。若机器只给 serving 预留 \code{16 GiB} KV 空间，理论上最多同时容纳 8 个满长 session；实际还要扣除 allocator 碎片、paged metadata、workspace 和安全水位。admission control 因此不能只看请求数，必须看 \code{prompt\_tokens + max\_new\_tokens} 对 KV budget 的占用。
+
+调度也要定量。若单请求 decode step p95 是 \code{40 ms}，同一 worker 串行跑 4 个活跃 session，最坏情况下某个 session 下一个 token 要等另外 3 个 step，队列等待可接近 \code{120 ms}。若业务要求流式 token 间隔 p95 小于 \code{80 ms}，就必须降低同 worker 并发、改 continuous batching、或把长请求降级/拒绝。这里的重点不是精确排队论，而是 SLO 要能反推出调度策略。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+线上现象 & 应记录的字段 & 常见根因 \\
+\midrule
+TTFT 高 & queue wait、load、prefill、pack time & 冷启动、长 prompt、排队 \\
+token 间隔抖动 & decode p95、active sessions、batch size & 调度过载、同步点、抢占 \\
+OOM 或频繁拒绝 & KV reserved/used、workspace、arena peak & admission 不看 token 预算 \\
+取消后内存不降 & cancel reclaim、session state、KV refcount & 资源生命周期错 \\
+p50 正常但 p95 差 & queue wait、page fault、fallback count & 尾部排队、缺页、后端降级 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此服务化验收至少要有三条故障演练：超长上下文被 admission 拒绝并返回 token budget；取消请求后 KV、arena、workspace 在限定时间内释放；强制注入慢请求后，报告能拆出 queue wait 与 kernel time，而不是只看到端到端超时。
+
 \subsection{profiler schema：优化证据要可比较}
 
 profiler 输出不能每章一个格式。统一 schema 让不同优化可以比较。最小 schema 应该覆盖 stage、segment、backend、context、耗时、内存和可选硬件计数器。

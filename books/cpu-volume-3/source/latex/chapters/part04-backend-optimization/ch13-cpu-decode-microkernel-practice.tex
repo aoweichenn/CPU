@@ -10,6 +10,19 @@ CPU decode 微内核的目标不是写一个“通用最快矩阵乘”，而是
 
 本节沿同一个 linear 语义推进：标量 fp32 reference，普通 int8 baseline，packed int8，int4 packed，SIMD 微内核，线程切分，NUMA 和 profiler。每一步都要能回到 oracle。
 
+本节固定一个 decode 形状作为样板，不再泛泛谈“某个矩阵”：
+
+\begin{lstlisting}[numbers=none,caption={CPU decode 样板形状}]
+input hidden K = 4096
+output channels O = 4096
+batch/token T = 1
+semantic: y[out] = sum_{k=0}^{4095} W[out,k] * x[k]
+weight layout before packing: row-major [O,K]
+packed output block: BN = 8 for SIMD kernel, benchmark block field uses 16
+\end{lstlisting}
+
+这个 shape 对应 7B decoder 里的典型 hidden-to-hidden projection。它还不是完整一层，因为没有 RMSNorm、attention、MLP 和 KV cache，但它是 decode 阶段最容易被权重读流支配的核心切片。
+
 \subsection{标量 reference 不是性能 baseline}
 
 reference 的职责是正确，不是代表可接受性能。
@@ -53,6 +66,18 @@ QuantDesc:
 
 没有 descriptor，kernel 无法知道 scale 怎样对应权重，也无法写通用 oracle。
 
+仓库中的 baseline 落在 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/src/int8_kernels.cpp}：\code{linear\_i8} 使用 \code{int8 weight + fp32 input + fp32 accumulator}。它不是完整整数推理，但它有清晰合同：
+
+\begin{lstlisting}[numbers=none,caption={lcqi 当前 int8 scalar 语义}]
+row_base = out * input_size
+acc = bias[out]
+for k in 0..input_size:
+  acc += float(weights[row_base + k]) * scale * input[k]
+output[out] = acc
+\end{lstlisting}
+
+对 \code{4096x4096}，每次调用至少读取约 \code{16 MiB} int8 权重、\code{16 KiB} fp32 input、写 \code{16 KiB} fp32 output。scale 当前是 per-layer 标量，所以它不是主要读流。这个账本解释了为什么 decode GEMV 首先要盯权重读流和 SIMD 转换，而不是盲目增加复杂图优化。
+
 \subsection{packed int8：先改变地址流}
 
 原始权重按 \code{[out,k]} 行主序存储，对单输出行扫描友好。但 SIMD 微内核通常想一次计算多个 \code{out}，让同一个输入 \code{input[k]} 广播到多个输出 accumulator。为了让多个输出通道的权重连续，需要把小面板打包。
@@ -77,6 +102,45 @@ for out_block in 0..O step BN:
 \end{lstlisting}
 
 packing 的成本应发生在模型 prepare 阶段，而不是每次请求 decode 阶段。plan report 要记录 packed weight 字节数、packing 时间和 layout id。否则上线后可能发现首个请求很慢，却不知道慢在 prepare。
+
+当前 packed layout 使用 \code{out\_block -> k -> lane} 顺序。原始 row-major 在固定 \code{k=0} 时，连续 8 个输出通道的地址是：
+
+\begin{lstlisting}[numbers=none,caption={原始 row-major 多输出地址}]
+W[0,0]    addr = 0
+W[1,0]    addr = 4096
+W[2,0]    addr = 8192
+...
+W[7,0]    addr = 28672
+\end{lstlisting}
+
+packed 后，固定 \code{k=0} 的 8 个输出通道变成连续地址：
+
+\begin{lstlisting}[numbers=none,caption={packed panel 多输出地址}]
+packed block out0..7, k=0:
+  paddr 0..7 = W[0,0], W[1,0], ..., W[7,0]
+
+packed block out0..7, k=1:
+  paddr 8..15 = W[0,1], W[1,1], ..., W[7,1]
+\end{lstlisting}
+
+\begin{systemdiagram}{4096x4096 decode GEMV 的地址流变化}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.55cm] (raw) at (0,1.6) {row-major W\\\code{addr=out*K+k}};
+  \node[book label,text width=3.2cm] (stride) at (3.25,1.6) {同一 \code{k} 取 8 个 \code{out}\\地址相隔 \code{4096} 元素};
+  \node[book teal node,text width=2.65cm] (pack) at (6.55,1.6) {packed panel\\\code{out\_block,k,lane}};
+  \node[book purple node,text width=2.65cm] (simd) at (9.75,1.6) {NEON kernel\\load 8 int8 lanes};
+
+  \draw[book strong arrow] (raw) -- (stride);
+  \draw[book strong arrow] (stride) -- (pack);
+  \draw[book strong arrow] (pack) -- (simd);
+
+  \node[book label,text width=2.6cm] at (0,-0.15) {适合单输出行扫描};
+  \node[book label,text width=2.9cm] at (3.25,-0.15) {不适合一次更新多个输出};
+  \node[book label,text width=2.9cm] at (6.55,-0.15) {复制成连续 lane};
+  \node[book label,text width=2.9cm] at (9.75,-0.15) {扩展到 fp32 后累加};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：当前 packed int8 的直接收益是把跨步多输出读取变成连续 lane 读取。}
+\end{systemdiagram}
 
 \subsection{int4 packed：字节减少，解包增加}
 
@@ -136,6 +200,22 @@ store output block
 \end{lstlisting}
 
 这个账本要和 ISA 绑定。AVX2、AVX-512、NEON、SVE 的向量宽度、转换指令、整数 dot 能力和 mask tail 都不同。因此代码结构应分成 capability、descriptor、kernel 实现和 fallback，不要在业务调用点写一堆 ISA 分支。
+
+当前 aarch64 NEON 实现位于 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/src/int8_kernels_neon.cpp}。它一次处理 8 个输出通道，用两个 \code{float32x4\_t} accumulator 保存低 4 lane 和高 4 lane：
+
+\begin{lstlisting}[numbers=none,caption={当前 NEON kernel 的核心语义}]
+weights_i8 = vld1_s8(packed_weights + packed_index)
+weights_i16 = vmovl_s8(weights_i8)
+weights_i32_low  = vmovl_s16(low(weights_i16))
+weights_i32_high = vmovl_s16(high(weights_i16))
+weights_f32_low  = vcvtq_f32_s32(weights_i32_low)
+weights_f32_high = vcvtq_f32_s32(weights_i32_high)
+input_scaled = vdupq_n_f32(input[k] * scale)
+acc_low  = vmlaq_f32(acc_low,  weights_f32_low,  input_scaled)
+acc_high = vmlaq_f32(acc_high, weights_f32_high, input_scaled)
+\end{lstlisting}
+
+这段代码的价值是把 \code{8} 个输出通道的标量乘加合并成两个 4-lane NEON 累加账本；它的限制也很明确：它先把 int8 扩展成 fp32，再做 fp32 乘加，并没有使用 \code{sdot} 这类整数 dot 指令，也没有做 int32 accumulator + requantize。
 
 \subsection{tail path：最后一块经常出错}
 
@@ -199,6 +279,21 @@ CPU 优化不能只看耗时。至少要观察：
 
 如果引入 SIMD 后 instructions 降了但 LLC miss 上升，可能 packing layout 破坏了局部性。如果线程数增加后 tokens/s 不升反降，可能已经带宽饱和或 NUMA 远端访问增加。如果 int4 比 int8 不快，可能解包和 scale 成本抵消了字节收益。
 
+本次环境已经安装 \code{perf 7.0.12}，但容器没有暴露可用 PMU events，\code{perf stat} 对 \code{cycles,instructions,cache-misses,branches,branch-misses} 返回：
+
+\begin{lstlisting}[numbers=none,caption={本机 perf 结果，不伪造计数器}]
+Error:
+No supported events found.
+Access to performance monitoring and observability operations is limited.
+\end{lstlisting}
+
+这个结果记录在下面的 perf artifact。它不是通过项，而是缺口证据：当前样板章已经有源码、CSV 和反汇编，但还没有 cycles、IPC、cache miss、branch miss。下一次必须在有 PMU 权限的裸机或授权容器上补齐。
+
+\begin{lstlisting}[numbers=none,caption={perf artifact}]
+books/cpu-volume-3/results/
+  lcqi-aarch64-neon-decode4096-2026-06-23.perf.txt
+\end{lstlisting}
+
 \subsection{当前 lab 的真实验收口径}
 
 本仓库的 \code{linux\_cpu\_inference} 已经把本节的一部分落成代码：同一个 int8 linear 语义下有四个 benchmark backend：
@@ -235,7 +330,64 @@ shape & scalar us & packed scalar us & NEON us \\
 \end{tabular}
 \end{center}
 
-这些数字的解释要克制。packed scalar 在小 shape 上可能更慢，因为它增加了 block 级循环和 workspace 写入；它的价值是证明 packed 地址流正确。NEON 才是本机 SIMD 证据：它在这些 shape 上输出误差为 0，并且显著快于 scalar。下一步不能再停留在平均耗时，而要补 \code{perf stat}、反汇编摘要、cache miss、branch miss、IPC 和真实系统对照。
+新增固定 decode 样板 \code{4096x4096} 后，CSV artifact 是 \filepath{books/cpu-volume-3/results/lcqi-aarch64-neon-decode4096-2026-06-23.csv}：
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+backend & average us & max abs diff & 解释 \\
+\midrule
+scalar & 20188.1 & 0 & row-major 标量基线 \\
+packed scalar & 25052.9 & 0 & 证明 layout，但本机更慢 \\
+NEON & 4322.2 & 0 & 本机 SIMD 路径，约 4.67x 快于 scalar \\
+AVX2 & 0 & 0 & aarch64 上不可用，不能当实测 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些数字的解释要克制。packed scalar 变慢，说明 packing 本身不是魔法；如果没有 SIMD 消费这个布局，它只增加了循环和地址转换成本。NEON 变快，说明连续 lane + 向量扩展/乘加击中了当前瓶颈的一部分。它还没有证明达到了硬件上限，因为缺少 PMU 计数器、内存带宽、CPU 频率和 NUMA 信息。
+
+反汇编 artifact 如下。热循环关键片段随后列出：
+
+\begin{lstlisting}[numbers=none,caption={objdump artifact}]
+books/cpu-volume-3/results/
+  lcqi-neon-linear-i8-objdump-2026-06-23.txt
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={NEON objdump 摘要}]
+ldr     s26, [x20, x0, lsl #2]   // load input[k]
+ldr     d28, [x2, x1]             // load 8 packed int8 weights
+fmul    s26, s26, s29             // input * scale
+sxtl    v28.8h, v28.8b            // int8 -> int16
+sxtl    v27.4s, v28.4h            // low lanes int16 -> int32
+sxtl2   v28.4s, v28.8h            // high lanes int16 -> int32
+scvtf   v27.4s, v27.4s            // int32 -> fp32
+scvtf   v28.4s, v28.4s
+fmul    v27.4s, v27.4s, v26.s[0]
+fmul    v28.4s, v28.4s, v26.s[0]
+fadd    v31.4s, v31.4s, v27.4s
+fadd    v30.4s, v30.4s, v28.4s
+\end{lstlisting}
+
+这段反汇编证明当前路径确实进入 NEON 向量计算；也证明它还不是成熟 int8 dot-product kernel。一个更强实现应减少 \code{scvtf/fmul/fadd} 链路，尝试整数 dot、更多 unroll、prefetch、线程分区和 per-channel/per-group scale 的更低开销组织。
+
+\subsection{oneDNN 对照：只能比较坐标，不能混淆 dtype}
+
+本次还加入了可选 oneDNN 对标目标 \code{lcqi\_onednn\_bench}。它在安装 \code{onednn-devel} 的机器上编译，执行 \code{1x4096} 乘 \code{4096x4096} 的 f32 matmul。CSV artifact 是 \filepath{books/cpu-volume-3/results/lcqi-onednn-f32-4096-2026-06-23.csv}：
+
+\begin{center}
+\begin{tabular}{lrrr}
+\toprule
+library & dtype & shape & average us \\
+\midrule
+oneDNN matmul & f32 & \code{1x4096 * 4096x4096} & 17187.8 \\
+LCQI scalar & int8 weight + fp32 input & \code{4096x4096} & 20188.1 \\
+LCQI NEON & int8 weight + fp32 input & \code{4096x4096} & 4322.2 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不能读成“LCQI 已经比 oneDNN 强”，因为 dtype、权重表示、primitive 选择和线程策略不同。它只能说明本仓库已经有了外部 primitive 坐标，并暴露下一步对标要求：要么实现同 dtype f32 GEMV/GEMM 与 oneDNN 比，要么找 oneDNN 支持的同量化路径；同时固定线程数、ISA、warmup、输出误差和 perf counters。
 
 \subsection{微内核进入主线的验收}
 

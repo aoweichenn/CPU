@@ -8,6 +8,21 @@
 KV cache 的正确性由三个坐标共同决定：layer、model position、KV head。物理内存可以连续、分页或回绕，但不能破坏这三个语义坐标。
 \end{keyidea}
 
+本册后续用一个固定 tiny trace 贯穿 KV cache、reference decoder、memory planner 和 oracle：
+
+\begin{lstlisting}[numbers=none,caption={TinyTrace-16 的 KV 参数}]
+vocab = 16
+hidden H = 8
+layers L = 2
+query_heads = 2
+kv_heads = 1
+head_dim = 4
+sequence tokens = [3, 1, 4, 2]
+max_context = 4
+\end{lstlisting}
+
+这个例子故意小到可以手算，但它保留了真实 decoder 的关键结构：\code{query\_heads != kv\_heads}，所以有 GQA；\code{seq=4}，所以每一步 decode 读到的历史长度不同；\code{layers=2}，所以地址公式必须带 layer 维度，不能只看一个数组。
+
 最朴素的 fp16 KV cache 形状是：
 
 \begin{lstlisting}[numbers=none,caption={连续 KV cache 形状}]
@@ -16,6 +31,92 @@ value: [layers, max_context, kv_heads, head_dim]
 \end{lstlisting}
 
 这个布局容易理解，适合 reference 和早期实现。但生产级 runtime 常会遇到变长 session、并发、内存碎片、长上下文和 prefix 复用，连续大块内存不一定够灵活。
+
+\subsection{从第 0 个 token 手算到第 3 个 token}
+
+在 TinyTrace-16 中，每层、每个 token 写入一条 K 和一条 V。因为 \code{kv\_heads=1, head\_dim=4}，一条 K 是 4 个元素，一条 V 也是 4 个元素。fp16 下每元素 2 字节，所以每层每 token 的 KV 字节是：
+
+\[
+2 \times kv\_heads \times head\_dim \times 2
+= 2 \times 1 \times 4 \times 2 = 16 \text{ bytes}
+\]
+
+两层就是每 token 32 字节；4 个 token 的整个 session KV cache 是 128 字节。这个数字很小，但公式和 7B 完全一样。
+
+\begin{center}
+\begin{tabular}{c|c|c|c}
+\toprule
+decode step & 写入 & attention 可读逻辑位置 & 每层读 KV 字节(fp16) \\
+\midrule
+0 & \code{K0,V0 -> pos0} & \code{0} & \code{16} \\
+1 & \code{K1,V1 -> pos1} & \code{0,1} & \code{32} \\
+2 & \code{K2,V2 -> pos2} & \code{0,1,2} & \code{48} \\
+3 & \code{K3,V3 -> pos3} & \code{0,1,2,3} & \code{64} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里的关键不是 128 字节，而是增长规律：decode 第 \code{p} 步会读取 \code{p+1} 个历史位置的 K/V。长上下文变慢，不只是因为 softmax 更长，也是因为 KV 读字节随上下文线性增长。
+
+\subsection{连续布局地址公式}
+
+连续布局下，\code{key[layer, position, kv\_head, dim]} 的元素偏移是：
+
+\[
+offset =
+(((layer \times max\_context + position) \times kv\_heads + kv\_head)
+\times head\_dim + dim)
+\]
+
+TinyTrace-16 中 \code{max\_context=4, kv\_heads=1, head\_dim=4}，所以：
+
+\[
+offset = ((layer \times 4 + position) \times 1 + 0) \times 4 + dim
+\]
+
+\begin{center}
+\begin{tabular}{c|c|c|c}
+\toprule
+坐标 & 元素偏移 & fp16 byte offset & 含义 \\
+\midrule
+\code{key[0,0,0,0]} & 0 & 0 & 第 0 层第 0 个 token 的 K 起点 \\
+\code{key[0,1,0,0]} & 4 & 8 & 第 0 层第 1 个 token 的 K 起点 \\
+\code{key[1,0,0,0]} & 16 & 32 & 第 1 层第 0 个 token 的 K 起点 \\
+\code{key[1,3,0,2]} & 30 & 60 & 第 1 层第 3 个 token 的第 2 维 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+value 数组用同一套偏移公式，但 base pointer 不同。真实 runtime 可以把 K 和 V 分开，也可以交错存；无论哪种布局，都必须能把 \code{layer, position, kv\_head, dim} 映射回确定地址。
+
+\subsection{GQA head 映射的最小例子}
+
+TinyTrace-16 有 2 个 query head、1 个 KV head，因此：
+
+\[
+group\_size = query\_heads / kv\_heads = 2
+\]
+
+\[
+kv\_head = query\_head / group\_size
+\]
+
+\begin{center}
+\begin{tabular}{c|c|c}
+\toprule
+query head & kv head & 读哪些 K/V \\
+\midrule
+0 & 0 & \code{key[layer, 0..pos, 0, :]} \\
+1 & 0 & \code{key[layer, 0..pos, 0, :]} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这说明 GQA 不是少算 attention head，而是多个 query head 共享同一组 K/V。若代码把 \code{kv\_head=query\_head}，在 TinyTrace-16 的 query head 1 上就会越界；在某些更大的模型上则可能读到错误 head，程序不一定崩，但 logits 会漂移。
+
+\begin{warningbox}
+KV cache 最危险的 bug 往往不是 shape mismatch，而是语义坐标错位：RoPE 用了物理 slot、GQA head 映射错、prefix 后 position 从 0 重启、或 sliding window 读到了已经淘汰的槽。这些错误都可能输出“看起来像中文/英文”的文本，但长上下文质量会突然下降。
+\end{warningbox}
 
 \subsection{逻辑 position 和物理 slot 分开}
 

@@ -18,6 +18,7 @@ constexpr std::int32_t LCQI_DEFAULT_REPEAT = 200;
 constexpr int LCQI_REPEAT_ARG_INDEX = 1;
 constexpr std::int32_t LCQI_LARGE_CASE_REPEAT_DIVISOR = 4;
 constexpr std::int32_t LCQI_MIN_LARGE_CASE_REPEAT = 1;
+constexpr std::int32_t LCQI_DECODE_SHAPE_SIZE = 4096;
 
 const char* target_arch() noexcept {
 #if defined(__aarch64__)
@@ -52,6 +53,8 @@ std::vector<lcqi::KernelBenchmarkCase> make_cases(std::int32_t repeat) {
         {513, 257, 16, repeat},
         {1024, 4096, 16, std::max(LCQI_MIN_LARGE_CASE_REPEAT,
                                    repeat / LCQI_LARGE_CASE_REPEAT_DIVISOR)},
+        {LCQI_DECODE_SHAPE_SIZE, LCQI_DECODE_SHAPE_SIZE, 16,
+         std::max(LCQI_MIN_LARGE_CASE_REPEAT, repeat / LCQI_LARGE_CASE_REPEAT_DIVISOR)},
     };
 }
 
