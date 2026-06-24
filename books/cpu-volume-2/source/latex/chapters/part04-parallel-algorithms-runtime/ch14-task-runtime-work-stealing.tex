@@ -103,6 +103,103 @@ struct CompletionRecord {
 
 这段代码不是完整 future 实现，而是在固定语义。一个可靠运行时必须能区分成功、失败和取消；也必须能让等待者在所有终态下醒来。生产实现还要保存异常对象、结果存储、等待队列、引用计数和内存同步关系。
 
+\topic{运行时 FutureState：结果、异常、等待者和 continuation}
+线程池如果提供 \code{submit -> future}，就必须有一份比 \code{CompletionRecord} 更具体的结果状态。它不一定要复刻标准库实现，但要表达同一组事实：生产端是否还存在，结果是否 ready，结果或异常存在哪里，谁在等待，哪些 continuation 要在 ready 后调度，以及这份状态何时可以释放。
+
+\begin{lstlisting}[language=C++,caption={运行时 FutureState 的语义字段}]
+enum class FutureStateKind : std::int32_t {
+  Pending,
+  ValueReady,
+  ExceptionReady,
+  Canceled,
+  BrokenProducer,
+  Consumed,
+};
+
+struct FutureStateHeader {
+  std::uint64_t task_id = 0;
+  FutureStateKind state = FutureStateKind::Pending;
+  std::uint32_t waiter_count = 0;
+  std::uint32_t continuation_count = 0;
+  bool producer_alive = true;
+  bool consumer_alive = true;
+};
+\end{lstlisting}
+
+真实的结果存储可以是类型擦除、模板化 storage、\code{std::variant} 或标准库 \code{std::promise} 包装；本章先关心状态边界。任务被接纳后，FutureState 必须活到 producer 进入终态，并且活到 consumer 取走结果或放弃句柄。若任务完成后立即释放任务对象，而 future 还没 \code{get()}，调用者会读到悬垂状态。若 consumer 放弃 future，任务仍可能继续运行；运行时可以选择继续计算、协作取消，或在背压策略里丢弃后继，但必须写成合同。
+
+\topic{submit 到 future ready 的完整链路}
+\code{submit} 返回 future 时，接纳、入队、执行、完成和读取必须连成一条线。下面的账本比“把 callable 放进队列”更严格：
+
+\begin{lstlisting}[numbers=none,caption={submit -> FutureState -> worker -> get 的账本}]
+submit(callable):
+  lock runtime
+  if state != Open:
+      return RejectedDraining or RejectedStopped
+  allocate FutureState and TaskNode
+  producer endpoint is owned by the task wrapper
+  consumer endpoint is returned to caller
+  unfinished_tasks += 1
+  enqueue ReadyItem
+  unlock runtime
+  notify worker
+
+worker runs task wrapper:
+  try:
+      value = callable()
+      complete_future_with_value(future_state, value)
+  catch:
+      complete_future_with_exception(future_state, current_exception)
+  complete_task and decrement unfinished_tasks exactly once
+
+future.get from caller:
+  wait until FutureState is terminal
+  ValueReady -> move result and mark Consumed
+  ExceptionReady -> rethrow in caller thread
+  Canceled/BrokenProducer -> report a defined error
+\end{lstlisting}
+
+这条链有三个容易错的提交点。第一，\code{submit} 只有在任务和 FutureState 都被接纳后才能返回成功；否则调用者会拿到一个无人满足的 future。第二，worker 必须捕获所有逃逸异常并写入 FutureState；否则异常停在 worker 线程，调用者只会永远等待或得到静默失败。第三，未完成计数和 FutureState 终态要一起提交；不能 future 已 ready 但 \code{wait\_idle} 还永远等，也不能 \code{wait\_idle} 返回但 future 仍 Pending。
+
+\topic{阻塞等待、helping 等待和非阻塞 continuation}
+等待 FutureState 有三种工程形态。外部线程可以阻塞等待，因为它不是运行时的执行资源；compute worker 阻塞等待同一 runtime 的 future 会吃掉 worker；coroutine 或 continuation 则把等待者保存为后续任务，不占线程。它们不是性能微调，而是三种不同合同。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+等待形态 & 语义 & 主要风险 \\
+\midrule
+外部 \code{get()} & 调用线程睡眠，直到 future ready & 调用方延迟增加，但不耗 compute worker \\
+worker \code{get()} & worker 睡眠或忙等同池结果 & ready 任务无人执行，形成饥饿 \\
+worker helping & 等待时执行允许范围内 ready 任务 & 重入、锁顺序、栈增长、范围选择复杂 \\
+continuation & future ready 后把后继放入队列 & 控制流拆分，异常和取消要沿边传播 \\
+coroutine \code{co\_await} & suspend frame，ready 后调度恢复 & coroutine frame 生命周期和恢复 executor 要清楚 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个严格的最小运行时可以先禁止 worker 内部阻塞 \code{get()}，只允许外部 \code{get()} 和 continuation。这样错误更早暴露：若用户在 worker 里等待同池 future，接口直接失败或诊断，而不是偶发卡死。等任务图、trace 和执行域稳定后，再决定是否购买 helping 或 compensation worker 的复杂度。
+
+\topic{异常传播不能绕开任务图}
+FutureState 保存异常只是第一步。任务图还要决定后继如何处理异常。若节点 A 失败，依赖 A 的 B 不能永远保持 Waiting；它必须变成 Canceled、Failed、RetryPending，或由上层策略改接到补偿节点。FutureState 面向调用者传播一次结果；TaskState 面向运行时传播调度事实。两者要一致。
+
+\begin{lstlisting}[numbers=none,caption={异常从 callable 传播到 future 和后继}]
+callable throws:
+  FutureState: Pending -> ExceptionReady(exception_ptr)
+  TaskState: Running -> Failed
+  successors:
+    if policy == fail_fast:
+        Waiting/Ready successors -> Canceled
+    if policy == retry:
+        create retry attempt or RetryPending
+  waiters:
+    external future.get rethrows
+    wait_idle wakes when all affected nodes are terminal
+\end{lstlisting}
+
+若只设置 FutureState 异常，不更新 TaskState，任务图可能还在等后继 ready count；若只把 TaskState 标为 Failed，不写 FutureState，调用者会拿不到异常。运行时完成路径必须同时处理两边，而且只能处理一次。
+
 \topic{worker 内等待为什么危险}
 外部线程等待 future 通常只是让调用者停住；worker 等待同一个运行时里的 future 则可能消耗执行资源。若被等待的任务还需要 worker 执行，等待者就挡住了被等待者。这不是“future 有问题”，而是“等待发生在错误的位置”。
 
@@ -114,6 +211,55 @@ struct CompletionRecord {
 Continuation 把“等 B 完成后继续做 A 的后半段”变成一个新的 task。B 完成时，运行时更新 shared state，递减后继的依赖计数，计数归零后把 continuation 放入 ready 队列。这样等待不占线程，worker 可以去执行其他 ready task。
 
 Continuation 也有代价。控制流不如同步代码直观，异常和取消需要沿依赖边传播，深层 continuation 可能造成调试困难。可靠运行时不是盲目禁止同步，而是明确区分：外部同步等待可以简化调用者；worker 内同步等待必须被运行时理解，或者被接口禁止。
+
+\topic{Coroutine：把 future 等待编译成 continuation}
+C++ coroutine 可以把“等待结果后继续执行”的代码写成顺序形态，但运行时看到的仍然是 continuation。Coroutine frame 保存局部变量、暂停点和返回对象；\code{co\_await} 某个 future-like 对象时，awaiter 决定是否立即继续、是否挂起、挂起后把 coroutine handle 注册到哪里、恢复时如何返回值或重抛异常。
+
+\begin{lstlisting}[numbers=none,caption={future-like awaiter 的运行时语义}]
+await_ready:
+  if FutureState is terminal:
+      return true
+  return false
+
+await_suspend(coroutine_handle h):
+  lock FutureState
+  if state became terminal:
+      enqueue h to current executor
+  else:
+      append h to continuations
+  unlock
+  return to worker without blocking the worker thread
+
+future completion:
+  store value, exception, or cancellation
+  detach continuation handles
+  enqueue handles onto the selected runtime queue
+
+await_resume:
+  if ValueReady: return value
+  if ExceptionReady: rethrow exception
+  if Canceled: throw or return canceled result according to API
+\end{lstlisting}
+
+这段语义有两个硬边界。第一，\code{await\_suspend} 不能在持有 FutureState 锁时直接恢复 coroutine，因为恢复会执行用户代码，可能重新进入运行时或拿用户锁。第二，恢复必须有执行域：恢复到 compute runtime、I/O completion loop、调用线程，还是专用 executor。若没有恢复 executor，coroutine 只是把阻塞等待换成了不可控回调。
+
+\begin{lstlisting}[numbers=none,caption={coroutine 和线程池集成的错误形态}]
+bad completion:
+  lock future_state
+  mark ready
+  for each coroutine handle:
+      handle.resume()     # runs user code under future_state lock
+  unlock
+
+robust completion:
+  lock future_state
+  mark ready
+  move continuation handles to local list
+  unlock
+  enqueue handles as ReadyItem into the chosen executor
+\end{lstlisting}
+
+Coroutine 购买的是可读的非阻塞控制流：业务代码看起来像 \code{Load -> Parse -> Compute}，运行时实际看到的是多个 ready continuation。它不自动解决背压、取消、异常传播、执行域和生命周期。若 \code{co\_await} 的对象没有把取消和异常写进 FutureState，coroutine 只会把错误藏得更深。
 
 \section{任务图：把等待变成状态}
 

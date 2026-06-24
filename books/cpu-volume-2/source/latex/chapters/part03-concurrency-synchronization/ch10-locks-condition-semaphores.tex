@@ -1247,6 +1247,129 @@ future.get():
 
 这里的“ready”只表示结果槽位已被填充，不表示某个队列关闭、不表示所有任务完成、不表示运行时 idle。\code{std::future::get} 对普通 future 只能调用一次，因为它消费结果；多个观察者需要 \code{std::shared\_future}。生产端也只能满足一次：重复 \code{set\_value} 或先 \code{set\_value} 后 \code{set\_exception} 都是协议错误，标准库会以 \code{future\_error} 报告。
 
+\topic{shared state 不是 future 对象本身}
+\code{std::future} 和 \code{std::promise} 都只是访问同一份 shared state 的句柄。Shared state 才保存 ready 标志、结果存储、异常对象、等待队列、引用关系和同步边界。\code{promise.get\_future()} 只是在这份状态上创建消费端；\code{future} 移动之后，旧 future 变成 invalid，shared state 仍然存在；\code{promise} 移动之后，生产端责任也随之移动。把 future 对象本身当成结果槽，会导致生命周期判断错误。
+
+\begin{lstlisting}[numbers=none,caption={future shared state 的概念字段}]
+FutureSharedState<T>:
+  producer_present: bool
+  consumer_present: bool
+  ready: bool
+  result_storage: optional<T>
+  exception_storage: exception_ptr
+  waiters: condition_variable/futex waiters
+  continuations: callbacks or coroutine handles
+  mutex_or_atomic_protocol: publishes ready and result
+
+std::promise<T>:
+  owns producer endpoint of the shared state
+
+std::future<T>:
+  owns single-consumer endpoint of the shared state
+
+std::shared_future<T>:
+  shares read-only access after ready
+\end{lstlisting}
+
+这解释了几个标准库现象。\code{future.valid()} 只说明这个句柄是否还关联 shared state，不说明结果是否 ready。\code{wait()} 只等待 ready，不消费结果；\code{get()} 等待 ready 后消费普通 future 的结果；\code{shared\_future::get()} 可以被多次调用，因为它不把共享状态从消费者侧移走。Shared state 的生命周期通常持续到最后一个相关句柄释放，而不是到任务函数返回那一刻。
+
+\topic{异常传播是 shared state 的终态}
+跨线程异常不能靠 worker 日志完成。生产端必须把异常捕获成 \code{std::exception\_ptr} 写入 shared state；消费端 \code{get()} 看到异常终态时在调用线程重新抛出。这样调用者能用普通 \code{try/catch} 处理后台任务失败，错误也不会被 worker 线程吞掉。
+
+\begin{lstlisting}[language=C++,caption={异常必须进入 promise，而不是停在 worker 日志}]
+std::promise<LoadReport> promise;
+std::future<LoadReport> future = promise.get_future();
+
+worker:
+  try {
+    promise.set_value(load_metadata());
+  } catch (...) {
+    promise.set_exception(std::current_exception());
+  }
+
+caller:
+  try {
+    LoadReport report = future.get();
+    use(report);
+  } catch (const std::exception& e) {
+    handle_background_failure(e);
+  }
+\end{lstlisting}
+
+若 producer 在 shared state 仍为 Empty 时析构，consumer 不应永远等待；标准库会让 consumer 观察到 broken promise，并在 \code{get()} 时抛出 \code{std::future\_error}。这不是小角落，而是生命周期协议：每个被接纳的异步任务都必须以 value、exception、canceled 或 broken promise 之一结束。若运行时取消任务，也要把取消转成 shared state 中可观察的终态，而不是只从 ready queue 删除任务。
+
+\topic{阻塞等待的语义边界}
+\code{wait()}、\code{wait\_for()}、\code{wait\_until()} 和 \code{get()} 都围绕同一件事：等待 shared state 进入 ready 终态。它们不保证哪个线程执行生产者，不保证队列被排空，不保证运行时仍有 worker 可用，也不保证超时后任务已经取消。超时只说明本次等待期限内没有观察到 ready；任务可能稍后成功、失败或取消。
+
+\begin{lstlisting}[numbers=none,caption={future 等待不能被误读成调度保证}]
+future.wait:
+  blocks current thread until shared_state.ready may be true
+  does not execute queued tasks
+  does not create worker threads
+  does not cancel the producer on timeout
+
+future.get:
+  waits until ready
+  returns value, rethrows exception, or reports broken promise
+  consumes ordinary future result
+
+wait_for timeout:
+  means caller stopped waiting for now
+  producer may still be running
+  shared state must remain valid
+\end{lstlisting}
+
+因此，持有 mutex 时调用 \code{get()} 是危险形状：producer 可能需要同一把锁才能写结果或推进状态，consumer 却在锁内睡眠。在线程池 worker 内调用同池 future 的 \code{get()} 也危险：等待者占住了执行被等待任务的 worker。外部控制线程阻塞等待一次后台结果通常可以接受；compute worker 内长期阻塞等待必须被运行时显式管理。
+
+\topic{线程池集成：submit 返回 future 不是自动安全}
+线程池常见接口是 \code{submit(callable) -> future<R>}。这个接口只在语义上承诺“一次被接纳的 callable 会满足 shared state”。它没有自动解决容量、关闭、取消、同池等待和异常传播。正确集成至少要保证四件事：提交被拒绝时不给调用者一个永远不 ready 的 future；任务函数正常返回时写 value；任务函数抛异常时写 exception；运行时取消已接纳任务时写取消终态或异常。
+
+\begin{lstlisting}[numbers=none,caption={submit 返回 future 的最低合同}]
+submit:
+  if runtime is not Open:
+      return Rejected, no pending future
+  create shared state
+  enqueue task wrapper that owns producer endpoint
+  return future endpoint to caller
+
+task wrapper:
+  try:
+      result = callable()
+      shared_state.set_value(result)
+  catch:
+      shared_state.set_exception(current_exception)
+
+cancel accepted task before running:
+  shared_state.set_exception(task_canceled)
+  decrement unfinished count
+  wake waiters
+\end{lstlisting}
+
+\code{std::packaged\_task} 可以把 callable 和 future shared state 包在一起，适合写最小线程池。但它仍然只是“callable 执行一次后满足结果”的工具，不是运行时。任务队列容量、worker 是否能阻塞等待、取消如何传播、shutdown drain 是否执行已接纳任务，都必须由线程池自己的状态机定义。第 14 章会把这条线推进到 task node、continuation 和 coroutine。
+
+\topic{coroutine：把等待端变成 continuation 注册}
+C++ coroutine 不是另一种线程，也不是自动并行。它把函数的局部状态放进 coroutine frame，在 \code{co\_await} 处可以暂停当前函数，把恢复动作注册到某个 awaitable 上；生产者完成时再恢复这个 coroutine。换句话说，coroutine 把“线程阻塞在 \code{get()}”改成“shared state ready 后调度 continuation”。这正好对应 future 的 shared state 模型。
+
+\begin{lstlisting}[numbers=none,caption={co\_await future-like 状态的语义}]
+await_ready:
+  if shared_state.ready:
+      continue without suspension
+
+await_suspend(coroutine_handle h):
+  register h as continuation in shared_state
+  return to scheduler without occupying worker thread
+
+producer completion:
+  store value or exception
+  mark shared_state ready
+  schedule registered coroutine handles
+
+await_resume:
+  return value or rethrow exception
+\end{lstlisting}
+
+这里的关键边界是调度位置。恢复 coroutine 不应在持有 shared state 锁时直接执行用户代码；更稳的做法是把 coroutine handle 作为 continuation 放回 executor 或 runtime 队列。否则一个完成路径可能在锁内重入用户代码，制造锁顺序反转、长临界区和难以追踪的递归调用。Coroutine 购买的是非阻塞等待表达能力，不是替代运行时调度。
+
 \begin{lstlisting}[language=C++,caption={promise 必须在成功和失败路径都满足共享状态}]
 std::promise<LoadReport> promise;
 std::future<LoadReport> result = promise.get_future();
