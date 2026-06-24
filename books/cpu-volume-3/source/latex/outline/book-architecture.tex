@@ -21,6 +21,155 @@ model files / tokenizer / weights
 \end{minipage}
 \end{center}
 
+\section*{纵向样板：MiniLLM-CPU 从 toy 到 production slice}
+
+第三册不再把“toy demo”和“生产系统”割裂。贯穿样板叫 MiniLLM-CPU，它分三层尺度推进：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+尺度 & 固定内容 & 训练目标 \\
+\midrule
+Tiny 数值层 & \code{vocab=16, H=8, L=2, heads=2, kv\_heads=1, seq=4} & 手算 shape、stride、KV offset、logits golden \\
+Kernel 工程层 & \code{T=2,K=8,N=6} 和 \code{H=4096,K=4096,O=4096} & scalar、packing、SIMD、tail、perf/objdump \\
+7B 系统层 & \code{L=32,H=4096,heads=32,kv\_heads=8,ctx=4096} & 权重字节、KV 容量、tokens/s 上限、SLO \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这三层不是三个项目。Tiny 层定义正确性，kernel 层训练热路径，7B 层训练工程判断。每个章节都要说明自己在哪一层留下证据。例如 RoPE/KV cache 先用 tiny 层手算 position 和 offset，再用 7B 层计算每 token KV 字节；GEMV 先用 \code{T=2,K=8,N=6} 画 packed layout，再用 \code{4096} 级 shape 做带宽上限和 benchmark；serving 先用 tiny session 验证取消和事件顺序，再用 7B KV 预算推 admission。
+
+\section*{固定端到端 trace}
+
+第三册最重要的链路不是目录，而是一条 token trace：
+
+\begin{lstlisting}[numbers=none,caption={MiniLLM-CPU 固定端到端 trace}]
+prompt
+  -> tokenizer ids
+  -> embedding [T,H]
+  -> RMSNorm [T,H]
+  -> Q/K/V projection
+  -> RoPE(Q,K,position)
+  -> KV cache append/read
+  -> causal attention with GQA
+  -> residual + RMSNorm
+  -> SwiGLU MLP
+  -> lm_head logits
+  -> sampler
+  -> next token
+\end{lstlisting}
+
+每一步都要能回答七个问题：
+
+\begin{enumerate}
+  \item shape 是什么。
+  \item dtype 是什么。
+  \item stride 和物理 layout 是什么。
+  \item C++ 对象是谁拥有这块内存。
+  \item reference 输出或 oracle checkpoint 在哪里。
+  \item 优化后端怎样改变地址流或执行计划。
+  \item trace/report 怎样证明这一步没有漂移、没有偷换后端、没有把成本算错。
+\end{enumerate}
+
+如果某章不能把自己放进这条 trace，就应删减或重写。AI Infra 不是名词覆盖面，而是同一个 token 从业务输入一路走到机器执行、再走回可解释输出。
+
+\section*{AI compiler 的硬交付}
+
+第四章不能只说 manifest、IR、pass、lowering。它必须产出可检查文件：
+
+\begin{lstlisting}[numbers=none,caption={AI compiler 必须导出的 artifact}]
+manifest-report.json:
+  tensors, tokenizer contract, dtype, quant profile
+
+ir-before.json:
+  imported graph, tensor values, state edges
+
+ir-after-passes.json:
+  canonical graph, fusion, view, liveness facts
+
+memory-plan.json:
+  arena size, offsets, workspace, KV cache binding
+
+executable-plan.json:
+  prefill/decode segments, backend kernels, profiler labels
+\end{lstlisting}
+
+这些 artifact 要覆盖正例和负例。正例证明 tiny 模型能编译成 CPU plan；负例证明坏 embedding 行数、坏 QKV shape、坏 \code{kv\_heads}、坏 quant group、fusion 删除 oracle checkpoint 都能被准确拒绝。若 compiler 只在内存里悄悄做事，读者无法学习 pass pipeline，也无法在面试或作品集中展示工程证据。
+
+\section*{CPU microkernel 的硬交付}
+
+第五章 CPU 部分的最低样板是 int8 linear/GEMV。它不能只写“用 SIMD 优化”，必须形成完整证据链：
+
+\begin{lstlisting}[numbers=none,caption={CPU int8 linear 样板交付}]
+1. fp32 reference GEMV
+2. int8 scalar baseline
+3. packed int8 layout and roundtrip oracle
+4. AVX2/AVX-512 or NEON kernel path
+5. tail path for K/N not divisible by tile
+6. benchmark shape sweep
+7. objdump or compiler assembly evidence
+8. perf stat or substitute counters
+9. bandwidth/roofline gap analysis
+10. comparison with oneDNN, OpenBLAS, ggml or llama.cpp
+\end{lstlisting}
+
+固定两个 shape。小 shape \code{T=2,K=8,N=6} 用来画原始 layout 到 packed layout 的地址变化，并手工验证输出；大 shape \code{H=4096,K=4096,O=4096} 用来估算权重读流、带宽上限、cache/TLB 压力和实际 tokens/s。这样读者既不会被大模型数字淹没，也不会停在没有工程意义的小例子。
+
+\section*{Runtime/serving 的硬交付}
+
+第三册必须明确：AI Infra 不只是 kernel。一个本地推理服务至少要有下面对象：
+
+\begin{lstlisting}[numbers=none,caption={serving runtime 最小对象}]
+SessionState:
+  request id, token buffer, position, KV cache, sampler state
+
+AdmissionController:
+  context limit, KV budget, workspace, queue capacity
+
+Scheduler:
+  prefill queue, decode ready queue, cancellation, backpressure
+
+StreamEvent:
+  token, final, error, trace, finish reason
+
+ServiceSloReport:
+  queue wait, TTFT, TPOT, p95, rejection rate, cancel reclaim
+\end{lstlisting}
+
+服务化章节要使用固定 workload：短 prompt、长 RAG prompt、取消请求、超长拒绝、慢客户端 backpressure、后端 fallback。每个 workload 都要输出 trace。否则“能做业务开发”只是说法，不能证明。
+
+\section*{GPU 和分布式的边界}
+
+第三册当前主线是本地推理和 CPU-first 后端，因此 GPU 和分布式不能空喊“也支持”。它们的边界要写清：
+
+\begin{itemize}
+  \item GPU 最低要求是 device residency、stream/event、workspace、copy/sync、fallback、StepTrace；不要求一开始写完整 CUDA 生产 kernel，但必须知道端到端延迟不等于 kernel 时间。
+  \item 分布式推理最低要求是说明张量并行、pipeline 并行、KV cache 分片、跨节点通信、失败和 SLO 会引入什么新合同；若不实现，就必须在路线图中标为未覆盖，而不是暗示已经具备。
+  \item serving 最低要求是单机多 session 的 admission、调度、取消、backpressure 和 SLO；多机 serving 是下一阶段，不应混进当前证据。
+\end{itemize}
+
+这种边界不是降标准，而是防止作品集虚胖。强团队更看重你能准确说明“已经证明什么、还没证明什么、下一步怎么证明”。
+
+\section*{工业对标的最低标准}
+
+第三册必须对成熟系统保持敬畏。对标不是只报一个 tokens/s，而是拆阶段：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+阶段 & 本项目应报告 & 对标时要问 \\
+\midrule
+load/prepare & mmap/load、packing、device upload & 成熟框架是否预处理或缓存权重 \\
+prefill & prompt tokens/s、TTFT 拆分 & 是否使用高质量 GEMM/attention kernel \\
+decode & TPOT、p50/p95、context bucket & KV layout、batch、thread/GPU 策略差异 \\
+memory & weights、packed、KV、arena peak & 是否使用 paging、quant KV、共享 prefix \\
+quality & logits/top-k/sequence drift & tokenizer、quant、sampler 是否一致 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+至少选择 oneDNN/OpenBLAS/ggml/llama.cpp/ONNX Runtime 中的两个做拆项对照。对照结果落后并不可怕；无法解释差距才可怕。
+
 本册重新分为六个大章。
 
 \topic{第一章：总架构与业务闭环。} 先解释编译器到底在做什么，再把传统编译流水线映射到 AI 推理引擎，并明确第三册怎样继承第一册的 ABI/汇编/测量能力和第二册的硬件/并发/运行时能力。这里会定义全书五层架构：模型资产层、编译前端层、IR 与优化层、后端层、运行时层，并用一条端到端链路把模型文件、manifest、typed graph、executable plan、prefill、KV cache、decode、sampler、oracle 和 profiler 串起来。本册还会明确贯穿项目：一个可解释的 C++20 本地推理服务原型，包含 CLI、服务接口、报告文件、测试夹具、reference、oracle、profiler、资源预算、业务状态机、队列、调度、取消和 backpressure。读者先理解“语义合同”和“机器账本”，后续内容才不会把 manifest、IR、kernel 和 runtime 混成一团。

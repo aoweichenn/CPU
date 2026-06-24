@@ -34,6 +34,73 @@ prove:
 
 这个项目能支撑真实业务原型，例如本地问答、RAG 检索增强回答、批量摘要、代码补全或内部文档助手。但业务能力必须建立在底层合同之上：上下文长度要能预算，取消要能释放 KV cache，trace 要能定位慢点，错误要能说明是模型资产、后端能力、量化 profile 还是请求参数的问题。
 
+\subsection{先固定 MiniLLM-CPU，而不是每章换例子}
+
+贯穿项目使用一个固定 tiny 模型作为显微镜。它不是为了模拟真实质量，而是让每一步都能被手算、dump、oracle 和回归测试固定。
+
+\begin{lstlisting}[numbers=none,caption={MiniLLM-CPU tiny fixture 固定参数}]
+MiniLLM-CPU tiny:
+  vocab_size = 16
+  hidden_size = 8
+  layers = 2
+  query_heads = 2
+  kv_heads = 1
+  head_dim = 4
+  max_seq = 4
+  prompt = [1, 2, 3]
+  decode_steps = 1..4
+\end{lstlisting}
+
+这个配置故意让 \code{hidden = query\_heads * head\_dim} 成立，同时让 GQA 可见：2 个 query head 共享 1 个 KV head。每个 token 经过的固定 shape trace 如下：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.28\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & tiny shape & 必须检查的事实 \\
+\midrule
+token ids & \code{[T]} & tokenizer/id 边界、vocab 范围 \\
+embedding & \code{[T,8]} & 行选择、stride、dtype \\
+RMSNorm & \code{[T,8]} & fp32 累加、epsilon、gamma \\
+Q projection & \code{[T,2,4]} & reshape/head layout \\
+K/V projection & \code{[T,1,4]} & GQA 的 KV head 数 \\
+RoPE & Q/K 同 shape & position、sin/cos、偶奇维度 \\
+KV append & \code{[layer,pos,1,4]} & 写入 offset 和容量 \\
+attention & \code{[T,8]} & causal mask、GQA head 映射 \\
+MLP/SwiGLU & \code{[T,8]} & gate/up/down shape 和激活 \\
+lm head & \code{[T,16]} & logits golden、top-k \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+同一张表在后续章节反复使用。张量章节要给每一行的 stride 和地址公式；KV cache 章节要给 \code{layer,pos,kv\_head,dim} 的 offset；compiler 章节要把每一行变成 IR value；backend 章节要把 Q/K/V 和 MLP 的 linear 降成 scalar、packed 和 SIMD kernel；serving 章节要把 \code{T + max\_new\_tokens} 变成 admission 预算。
+
+\begin{warningbox}
+不要把 tiny fixture 当作低水平 demo。它的作用是让每个错误都能被定位：embedding 行错、RoPE position 错、GQA head 映射错、KV offset 错、tail path 错、量化 scale 错，都必须能在这个小模型中复现和修复。
+\end{warningbox}
+
+\subsection{真实尺度锚点：7B 账本不能省}
+
+tiny fixture 解决可理解和可验证，不能替代真实账本。本册固定使用一组 7B 级 shape 做容量和性能锚点：
+
+\begin{lstlisting}[numbers=none,caption={7B shape-only fixture 固定参数}]
+7B shape-only:
+  layers = 32
+  hidden_size = 4096
+  query_heads = 32
+  kv_heads = 8
+  head_dim = 128
+  context = 4096
+  vocab = 32000 or model-specific
+\end{lstlisting}
+
+所有“快”“省内存”“能服务”的结论都要能回到这组参数。比如 fp16 权重大约按 \code{params * 2} 字节估算，int8 约 \code{params * 1} 字节再加 scale metadata，int4 约 \code{params / 2} 字节再加 group metadata；KV cache 每 token 字节至少为：
+
+\[
+2 \times layers \times kv\_heads \times head\_dim \times bytes\_per\_element
+\]
+
+代入 \code{32,8,128,fp16}，每 token 约 \code{128 KiB}，4K context 约 \code{512 MiB}。若换成 MHA 的 \code{kv\_heads=32}，直接变成 \code{2 GiB}。这类数字决定 admission、并发、GPU 显存和服务 SLO，不是附录小知识。
+
 \subsection{不是完整框架，但必须完整闭环}
 
 一个学习项目不需要一开始覆盖所有工业功能。可以暂缓的东西包括：全部模型方言、分布式推理、复杂动态 batching、PagedAttention 的生产级调度、所有 GPU kernel、所有低比特格式、服务多租户隔离。不能暂缓的是闭环本身。
@@ -122,6 +189,30 @@ fixtures/
 \end{lstlisting}
 
 \code{tiny\_end\_to\_end} 可以只包含极小参数和固定 token，不需要真实 7B 权重；\code{7b\_shape\_only} 用来验证真实规模 shape、KV 容量和 plan，不必包含完整权重。这样项目既能快速测试数学正确性，也能训练读者面对真实 7B 规模的资源账本。
+
+\subsection{每章交付物矩阵}
+
+后续章节不再允许“讲完概念就结束”。每章都要把 MiniLLM-CPU 推进一小步，并留下可检查 artifact。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+章节主题 & 推进的项目对象 & 最低证据 \\
+\midrule
+张量布局 & \code{TensorDesc/TensorView} & tiny shape trace、stride、地址公式、坏 stride 测试 \\
+量化 & \code{QuantDesc/PackedBytes} & byte roundtrip、scale 表、误差阈值、容量表 \\
+Reference decoder & \code{ReferenceDecoder} & 中间 tensor dump、logits golden、top-k 对比 \\
+KV cache & \code{KVCacheDesc/KVCache} & append/read offset、GQA 映射、越界负例 \\
+AI compiler & \code{GraphNode/Value/Pass} & IR dump、pass 前后 diff、verifier 诊断 \\
+Memory planner & \code{MemoryPlan/Arena} & lifetime 表、offset 不重叠、debug materialization \\
+CPU backend & \code{PackedWeight/KernelDesc} & scalar/SIMD oracle、benchmark CSV、反汇编或 perf \\
+GPU backend & \code{DevicePlan/StepTrace} & residency、launch/copy/sync、fallback 事件 \\
+Serving runtime & \code{Session/Scheduler} & queue、TTFT、TPOT、取消、拒绝率 CSV \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果某章缺少 artifact，它最多算概念说明，不能算贯穿项目进展。读者也应按这个矩阵检查自己：是否真的写出了对象，是否能跑测试，是否能解释错误和性能。
 
 \subsection{建议目录结构}
 

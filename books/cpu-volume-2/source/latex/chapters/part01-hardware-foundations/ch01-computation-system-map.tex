@@ -195,6 +195,45 @@ store new counter
 
 把五行输入放大到一亿行后，瓶颈很少只来自“循环次数多”。CPU 执行一次日志解析，会同时处理两类流：指令流和数据流。指令流来自 parser、hash、compare、branch、counter update 这些机器指令；数据流来自输入缓冲区、字段字节、事件名字典、计数表和输出缓冲。指令流走 I-cache，数据流走 D-cache 和 TLB；分支预测决定下一段指令能否提前取入；store buffer 暂存尚未完全提交的写入；coherence 协议决定多核心写同一位置时谁拥有 cache line。
 
+\begin{systemdiagram}{硬件拓扑先作为坐标系}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book lane,minimum width=4.35cm,minimum height=2.5cm] (core0box) at (1.9,0.75) {};
+  \node[book title label] at (0.05,1.75) {core 0};
+  \node[book accent node,text width=1.65cm] (f0) at (0.85,1.05) {前端\\I-cache};
+  \node[book teal node,text width=1.65cm] (e0) at (2.95,1.05) {执行\\寄存器};
+  \node[book purple node,text width=1.65cm] (d0) at (0.85,0.05) {D-cache\\DTLB};
+  \node[book amber node,text width=1.65cm] (s0) at (2.95,0.05) {store\\buffer};
+
+  \node[book lane,minimum width=4.35cm,minimum height=2.5cm] (core1box) at (7.45,0.75) {};
+  \node[book title label] at (5.6,1.75) {core 1};
+  \node[book accent node,text width=1.65cm] (f1) at (6.4,1.05) {前端\\I-cache};
+  \node[book teal node,text width=1.65cm] (e1) at (8.5,1.05) {执行\\寄存器};
+  \node[book purple node,text width=1.65cm] (d1) at (6.4,0.05) {D-cache\\DTLB};
+  \node[book amber node,text width=1.65cm] (s1) at (8.5,0.05) {store\\buffer};
+
+  \node[book navy node,text width=2.4cm] (llc) at (4.75,-1.25) {共享 LLC\\互连/目录};
+  \node[book teal node,text width=2.4cm] (mem0) at (1.9,-2.9) {node 0 内存\\本地页面};
+  \node[book red node,text width=2.4cm] (mem1) at (7.45,-2.9) {node 1 内存\\远端页面};
+
+  \draw[book strong arrow] (f0.east) -- (e0.west);
+  \draw[book strong arrow] (d0.east) -- (e0.south west);
+  \draw[book strong arrow] (f1.east) -- (e1.west);
+  \draw[book strong arrow] (d1.east) -- (e1.south west);
+  \draw[book strong arrow] (d0.south) -- (llc.north west);
+  \draw[book strong arrow] (d1.south) -- (llc.north east);
+  \draw[book strong arrow] (s0.south) -- (llc.north west);
+  \draw[book strong arrow] (s1.south) -- (llc.north east);
+  \draw[book strong arrow] (llc) -- (mem0);
+  \draw[book back arrow] (llc) -- (mem1);
+
+  \node[book label,text width=3.4cm] at (1.9,-4.0) {顺序输入流通常先考验数据路径和带宽。};
+  \node[book label,text width=3.6cm] at (7.45,-4.0) {跨节点页面或共享写会把等待推到互连。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：第二册后面的前端、cache/TLB、NUMA 和一致性不是并列名词，而是同一条日志热路径经过的不同位置。}
+\end{systemdiagram}
+
+读这张图时要把三件事分开。第一，指令流从每个核心的前端进入：parser 的热循环、分支目标和机器码足迹决定 I-cache、ITLB、预测器和译码是否能稳定供给，第二章会展开这一层。第二，数据流从 load/store 进入：输入 buffer、热字段、哈希桶和计数槽的地址序列决定 D-cache、DTLB、cache line 和 page walk 的等待，第三章会展开这一层。第三，多个核心共享写或跨节点访问时，等待不再只在单个核心内部：cache line 所有权、互连路径、页面 first-touch 和 NUMA 放置会进入解释，第四章会展开这一层。
+
 \topic{取指：代码本身也要被搬运}
 程序运行前，编译器已经把 C++ 代码变成机器指令。CPU 核心执行热循环时，需要先从内存层级中取出这些指令。最靠近核心的是 \term{I-cache}{instruction cache，指令缓存}，它缓存最近执行过的指令字节。若 parser 热循环很小、分支路径稳定，I-cache 命中率通常很高；若把大量错误处理、日志格式化、虚函数分派和罕见路径塞进同一个热函数，指令工作集会膨胀，前端可能开始等待指令供应。
 
@@ -235,6 +274,31 @@ store counter back through store buffer
 \end{lstlisting}
 
 每一行都可能成为瓶颈：I-cache 前端断供、D-cache miss、TLB miss、分支预测失败、哈希表随机访问、共享 cache line 迁移、store buffer 等待。后续章节看似在讲不同主题，其实都在放大这张账本中的某一行。这样概念就不是凭空出现的：I-cache 来自取指瓶颈，D-cache 来自数据搬运，TLB 来自地址翻译，分支预测来自控制流，原子和锁来自共享写，scan 和 partition 来自输出位置和恢复边界。
+
+\topic{等待账本怎样变成优化判断}
+硬件账本不是为了把术语列得更完整，而是为了约束优化顺序。一个成熟的优化判断通常按三步走：先定位等待发生在哪条账本线上，再提出只改变这一条线的设计，最后用机器证据验证等待是否真的移动或减少。若没有这三步，优化很容易退化成“把代码写得更复杂，然后希望它更快”。
+
+仍然看日志统计。假设单线程 reference 正确，但吞吐很低。第一种可能是 parser 热循环前端供给不足：反汇编显示正常路径里夹着大量错误格式化、日志字符串构造和罕见分支，profile 显示热点分散在多个冷函数入口附近。此时合理设计不是先加线程，而是把错误路径拆到冷函数，正常路径只留下字段边界推进和少量状态转移。验证材料也不只是总时间：还要看热循环指令长度、分支目标、前端停顿相关计数，以及坏行比例变化时吞吐是否更稳定。
+
+第二种可能是数据等待。若 parser 已经很短，但聚合阶段每条记录都追哈希表节点，硬件账本指向 D-cache/TLB miss。此时加锁、换线程池或调大队列都不能触及主因。更直接的设计是先把字符串事件名编码成小整数，再用连续数组保存局部计数。验证材料应当包括地址路径变化：从 \code{bucket -> node -> key bytes -> counter} 变成 \code{event_type[i] -> local_counts[event_type[i]]}，再配合缓存 miss、TLB miss 和吞吐变化观察。
+
+第三种可能是共享写等待。若单线程已经接近内存带宽，多线程后吞吐反而下降，且热门 key 被多个 worker 同时更新，全局原子计数器很可能让 cache line 在核心间来回迁移。此时“原子是无锁的，所以应该更快”是错误直觉。硬件账本要求把高频写改成本地写：每个 worker 维护自己的 partial，最后合并。验证材料应当看扩展曲线、每线程 partial 的 cache line 对齐、合并阶段占比，以及热门 key 分布改变时吞吐是否仍然稳定。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.28\linewidth}p{0.34\linewidth}}
+\toprule
+账本线索 & 优先考虑的改造 & 需要补的证据 \\
+\midrule
+前端供给不足 & 热路径收缩，冷路径外提，减少间接跳转 & 反汇编长度、分支目标、前端停顿、坏行敏感性 \\
+D-cache/TLB miss & 连续热列、小整数编码、开放寻址或数组计数 & 地址路径、cache/TLB 计数、每页有效记录数 \\
+分支预测失败 & 状态机分层、错误路径分离、批量 mask & 输入分布、mispredict、正常/异常路径比例 \\
+共享写争用 & 线程本地 partial，按 cache line 隔离，延后合并 & 扩展曲线、coherence 相关事件、合并成本 \\
+输出提交不清 & 临时文件、checksum、fsync、manifest 提交 & 崩溃点、恢复扫描、重复提交语义 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不是优化配方，而是判断顺序。先找等待，再改数据形状或执行形状；先证明语义不变，再证明机器形态改变；先解释单机，再解释并发和分布式。第二册后面的每一章都应当回到这条方法。
 
 \topic{为什么会有缓存层级}
 如果核心每条 load 都直接等 DRAM，算术单元会大部分时间空转。现代核心的频率远高于主存响应速度，流水线一次能容纳很多尚未完成的指令，乱序执行也只能在可见窗口内寻找不依赖慢 load 的工作。因此机器在核心旁边放多级缓存：L1 最近、容量小、延迟低；L2 更大但更慢；LLC 容量更大、被多个核心共享；再往外才是内存控制器和 DRAM。缓存层级不是为了抽象整洁，而是为了让“最近用过、附近会用、反复会用”的字节尽量停在离核心更近的地方。
@@ -363,6 +427,112 @@ counts[event_type] += value;
 \end{lstlisting}
 
 在单线程、小数组、热缓存情况下，它确实很接近一次普通更新。换成大表、多线程、热点 key 和冷缓存后，这句代码会拆成一串硬件事件：计算索引地址，翻译虚拟地址，加载计数所在 cache line，等待该 line 处于可读或可写状态，在寄存器中相加，再把结果写回 store buffer。若计数槽位被多个核心同时写，核心还要竞争该 line 的独占所有权。正确性、吞吐和尾延迟都藏在这些步骤里。
+
+后面三章会反复回到同一行代码，只是每章放大的位置不同。第二章看它所在基本块怎样被前端取指、预测和乱序窗口消化；第三章看 \code{event_type[i]}、\code{value[i]} 和 \code{counts[event_type]} 这些地址怎样穿过 TLB、L1D、cache line 和页；第四章看当多个 worker 写同一张表时，cache line 所有权怎样跨核心、跨互连和跨 NUMA 节点移动。读者若没有这张路线图，就会感觉术语一章一章跳出来；有了它，后续章节只是沿同一个热块向不同方向放大。
+
+\begin{systemdiagram}{同一更新块在第二册前三个硬件章节中的放大位置}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.25cm] (cpp) at (0,1.05) {C++ 语句\\\code{counts[e]+=v}};
+  \node[book teal node,text width=2.25cm] (bb) at (3.0,1.05) {基本块 B1\\load/add/store};
+  \node[book purple node,text width=2.25cm] (asm) at (6.0,1.05) {典型汇编\\load/load/update};
+  \node[book amber node,text width=2.25cm] (evidence) at (9.0,1.05) {证据包\\反汇编/输入/计数};
+
+  \draw[book strong arrow] (cpp) -- (bb);
+  \draw[book strong arrow] (bb) -- (asm);
+  \draw[book strong arrow] (asm) -- (evidence);
+
+  \node[book accent node,text width=2.55cm] (ch2) at (0,-1.15) {第 2 章\\前端/分支/乱序};
+  \node[book teal node,text width=2.55cm] (ch3) at (3.25,-1.15) {第 3 章\\cache/TLB/页面};
+  \node[book red node,text width=2.55cm] (ch4) at (6.5,-1.15) {第 4 章\\coherence/NUMA};
+  \node[book navy node,text width=2.55cm] (later) at (9.75,-1.15) {后续章节\\SIMD/线程/I/O};
+
+  \draw[book dashed arrow] (bb.south) -- (ch2.north);
+  \draw[book dashed arrow] (asm.south) -- (ch3.north);
+  \draw[book dashed arrow] (asm.south east) -- (ch4.north);
+  \draw[book weak arrow] (evidence.south) -- (later.north);
+
+  \node[book label,text width=2.7cm] at (0,-2.55) {循环体大小、回边、错误边、依赖链};
+  \node[book label,text width=2.9cm] at (3.25,-2.55) {地址公式、cache line、活跃页、page walk};
+  \node[book label,text width=2.9cm] at (6.5,-2.55) {写者数量、line 所有权、远端页面};
+  \node[book label,text width=2.9cm] at (9.75,-2.55) {把同一证据链交给更高层机制};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：第二册不是按术语跳转，而是把同一个更新块分别放大到前端、地址路径和多核心拓扑。}
+\end{systemdiagram}
+
+\topic{先切基本块，再贴硬件路径}
+第一册已经讲过基本块和控制流图。第二册继续使用同一套读法，只是每个基本块还要附上地址流和等待位置。以一条记录的聚合为例，热路径大致可以切成四个块：读取记录字段，判断记录是否有效，执行计数更新，进入下一条记录。源码里它可能只是一个 \code{for} 循环；机器层面却是一组普通顺序边、条件边和循环回边。
+
+\begin{lstlisting}[numbers=none,caption={一条记录聚合的基本块形状}]
+B0 loop_head:
+  load event_type[i]
+  load value[i]
+  test valid flag or parser state
+  if invalid goto B2_error
+
+B1_update:
+  counts[event_type] += value
+  goto B3_next
+
+B2_error:
+  append diagnostic identity
+
+B3_next:
+  i = i + 1
+  if i != n goto B0_loop_head
+\end{lstlisting}
+
+这张 CFG 的价值不只是说明程序走哪条路。它还把硬件问题分组：\code{B0} 的输入 load 是否连续，决定 D-cache 和 TLB 是否友好；\code{B0} 到 \code{B2} 的条件边是否稳定，决定分支预测是否容易；\code{B1} 的写入目标是否线程私有，决定 store buffer 和 cache line 所有权是否平稳；\code{B3} 的回边是否规律，决定前端能否持续取回热循环。没有基本块，硬件账本会变成一串散乱名词；有了基本块，每个等待都能挂到某条边或某段顺序指令上。
+
+\begin{systemdiagram}{从 CFG 到硬件账本}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.05cm] (b0) at (0,0.75) {B0\\load 字段\\test};
+  \node[book teal node,text width=2.05cm] (b1) at (3.1,0.75) {B1\\更新计数\\load/add/store};
+  \node[book red node,text width=2.05cm] (b2) at (3.1,-1.05) {B2\\错误诊断\\冷路径};
+  \node[book amber node,text width=2.05cm] (b3) at (6.2,0.75) {B3\\下标递增\\循环回边};
+  \node[book navy node,text width=2.05cm] (hw) at (9.35,0.75) {硬件账本\\前端/地址/写入};
+
+  \draw[book strong arrow] (b0) -- node[above,font=\scriptsize\sffamily,text=BookMuted] {valid} (b1);
+  \draw[book back arrow] (b0) -- node[left,font=\scriptsize\sffamily,text=BookRed] {invalid} (b2);
+  \draw[book strong arrow] (b1) -- (b3);
+  \draw[book weak arrow] (b2) -- (b3);
+  \draw[book strong arrow] (b3) to[bend left=22] node[above,font=\scriptsize\sffamily,text=BookMuted] {next} (b0);
+  \draw[book strong arrow] (b3) -- (hw);
+
+  \node[book label,text width=2.3cm] at (0,-0.75) {输入地址是否连续\\分支是否稳定};
+  \node[book label,text width=2.45cm] at (3.1,1.95) {计数槽是否本地\\是否共享写};
+  \node[book label,text width=2.4cm] at (6.2,-0.65) {循环体大小\\回边预测};
+  \node[book label,text width=2.4cm] at (9.35,-0.65) {证据来自反汇编、输入矩阵、计数器或替代实验};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：CFG 决定执行路径，硬件账本决定每条路径在真实机器上等什么。}
+\end{systemdiagram}
+
+\topic{再把更新块落到汇编形状}
+\code{B1_update} 在一个整数编码、本地计数数组的版本中，可能接近下面这种机器形状：
+
+\begin{lstlisting}[numbers=none,caption={本地计数更新的一种典型汇编形状}]
+; rdi = event_type column
+; rsi = value column
+; rdx = local_counts
+; rcx = i
+mov   eax, dword ptr [rdi + rcx*4]      ; event_type[i]
+mov   r8d, dword ptr [rsi + rcx*4]      ; value[i]
+add   qword ptr [rdx + rax*8], r8       ; local_counts[event] += value
+\end{lstlisting}
+
+这段汇编不是要求编译器必须生成同样文本，而是让读者看到执行账本怎样落地。前两条 load 若来自连续列，地址是短步长；第三条更新的目标由 \register{rax} 决定，可能落在小型本地数组，也可能因为 key 分布变成随机槽位。若 \code{local_counts} 换成全局原子计数，机器形态可能出现带锁定语义的读改写写；若 \code{event_type} 仍是字符串，前面还会多出哈希、比较和节点追踪。第二册后面的优化都围绕这种形状变化展开，而不是围绕 C++ 源码行数展开。
+
+\begin{lstlisting}[numbers=none,caption={同一更新块的硬件读法}]
+instruction stream:
+  loop body size, branch targets, decode pressure
+
+address stream:
+  event_type[i] and value[i] are stride loads
+  local_counts[event] may be a small local table or a random table
+
+write ownership:
+  worker-local table stays mostly private
+  global atomic table may move cache lines between cores
+\end{lstlisting}
 
 \topic{语义账本和执行账本要同时存在}
 语义账本回答“结果是什么”，执行账本回答“结果怎样被机器推进”。两者缺一不可。只有语义账本，优化无法判断是否破坏正确性；只有执行账本，系统可能很快地产生错误结果。对日志统计，语义账本记录 accepted、rejected、counts、diagnostics 和 manifest；执行账本记录输入字节、热字段布局、cache/TLB、任务等待、I/O completion 和提交状态。

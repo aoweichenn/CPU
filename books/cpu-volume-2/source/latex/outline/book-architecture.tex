@@ -16,6 +16,227 @@
 第二册的主线是一条从硬件到集群的因果链：硬件决定局部成本，共享内存决定协作边界，运行时决定任务怎样推进，I/O 决定结果何时完成，分布式系统决定失败后谁是权威事实。
 \end{keyidea}
 
+\section*{纵向样板：从 TinyTensor 到可扩展 Kernel}
+
+第二册不重新发明一个孤立项目。它继续使用第一册的 TinyTensor 热路径，并把它放进 Compute Systems Engine 的现代系统环境中。第一册回答“这段 C++ 到底怎样变成机器执行”；第二册回答“同一段机器工作为什么在真实硬件和运行时里变快、变慢、抖动或失效”。
+
+固定样板可以从一个 \code{linear_ref} 扩展为四个候选：
+
+\begin{lstlisting}[numbers=none,caption={第二册 TinyTensor kernel 候选}]
+linear_scalar_baseline:
+  straightforward loops, single thread
+
+linear_layout_aware:
+  choose row-major/column-major/packed layout
+
+linear_simd_candidate:
+  vectorized inner loop or explicit SIMD wrapper
+
+linear_parallel_candidate:
+  split output rows/channels across worker threads
+\end{lstlisting}
+
+四个候选必须共享同一个 reference、输入 fixture、checksum、报告 schema。否则性能比较会变成“换了程序以后数字不同”，而不是解释同一个语义在不同机器策略下的成本差异。
+
+\section*{第二册的定量账本}
+
+每个性能章节都要训练读者先算账，再测量。以 \code{M=1,K=4096,N=4096} 的 GEMV 形态为例，单次输出大约需要：
+
+\[
+2 \times K \times N \approx 33.6M \text{ FLOPs}
+\]
+
+若权重是 fp32，权重读流约：
+
+\[
+K \times N \times 4 \approx 64MiB
+\]
+
+输入向量只有 \code{16KiB}，输出约 \code{16KiB}，真正压垮 decode 的通常是权重读流，而不是输入和输出。若内存带宽是 \code{50GB/s}，只按权重读流粗算，理论上限约 \code{50GB/s / 64MiB \approx 780} 次 GEMV/s。实际数字低于它，可能来自 cache/TLB、SIMD 利用率、线程同步、频率、NUMA 或测量口径。
+
+这类账本要形成固定模板：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+\toprule
+账本字段 & GEMV 示例 & 解释作用 \\
+\midrule
+FLOPs & \code{2*K*N} & 判断计算上限 \\
+bytes read & 权重、输入、scale、KV & 判断带宽上限 \\
+bytes written & 输出、临时 buffer & 判断写回和带宽压力 \\
+arithmetic intensity & \code{FLOPs/bytes} & 判断更像 compute bound 还是 memory bound \\
+working set & 权重块、输入、输出 tile & 判断 cache 层级 \\
+parallel partition & 行、列、batch、token、head & 判断负载均衡和同步 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第二册的重点不是把每个数字算得像芯片模拟器一样精确，而是让读者养成习惯：性能结论必须先有数量级模型。没有这个模型，就无法判断一个优化是击中瓶颈，还是只是在不重要的地方变漂亮。
+
+\section*{PMU 和替代证据矩阵}
+
+真实机器上不一定每次都能拿到完整 PMU 权限，但第二册必须教会读者设计证据矩阵。一次 kernel 调优报告至少应该尝试收集：
+
+\begin{lstlisting}[numbers=none,caption={第二册 kernel 证据矩阵}]
+identity:
+  git commit, binary hash, compiler, flags, CPU model
+
+correctness:
+  reference checksum, max error, failed shapes
+
+timing:
+  wall time, p50, p95, warmup, iterations
+
+pmu if available:
+  cycles, instructions, IPC
+  branches, branch-misses
+  cache-references, cache-misses
+  dTLB-load-misses
+
+fallback evidence:
+  objdump hot loop
+  perf record/report
+  thread scaling curve
+  bandwidth estimate
+  context switch and CPU frequency notes
+\end{lstlisting}
+
+如果 \code{perf stat} 不可用，也不能直接放弃分析。可以用输入规模 sweep、线程数 sweep、layout 对照、反汇编、带宽估算和分位数延迟作为替代证据。关键是报告必须诚实标注“这是推断，不是 PMU 证明”。
+
+\section*{SIMD、线程和 NUMA 的升级顺序}
+
+第二册的优化顺序要保守。不要一上来同时改 layout、SIMD、线程和 NUMA，否则结果无法解释。推荐顺序如下：
+
+\begin{enumerate}
+  \item 固定 scalar baseline，证明 correctness。
+  \item 做 shape sweep，确认随 \code{K/N/M} 变化的趋势。
+  \item 改 layout 或 packing，只改变地址流。
+  \item 引入 SIMD，只改变单核指令形态。
+  \item 做 thread partition，只改变并行调度。
+  \item 做 NUMA pinning/first touch，只改变内存放置。
+  \item 接入队列和 runtime，只改变请求组织方式。
+\end{enumerate}
+
+每一步都要保留上一版作为 baseline。若同时改变 packing 和 SIMD，无法判断收益来自连续读流还是向量指令；若同时改变线程和 NUMA，无法判断扩展差是锁争用、false sharing、远端内存还是调度噪声。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+升级 & 主要风险 & 必测负例 \\
+\midrule
+packing & layout 转换错、tail 漏处理 & \code{K/N} 非 tile 倍数 \\
+SIMD & lane 顺序错、累加精度错 & 非对齐输入、极小 shape \\
+线程 & 输出竞争、false sharing & 1/2/4/8 线程扩展曲线 \\
+NUMA & 远端内存、首次触页错 & 绑定/不绑定对照 \\
+runtime queue & p50 好但 p95 坏 & 长短任务混合、取消、关闭 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section*{从 Kernel 到 Runtime：SLO 不是第三册才有}
+
+第二册后半部分要把 kernel 放进运行时。单个 kernel 快，不代表系统快。Compute Systems Engine 和 MiniLLM-CPU 都会遇到同一类问题：任务进入队列，worker 取任务，热路径运行，结果提交，取消或失败时释放资源。
+
+最小 runtime trace 应包含：
+
+\begin{lstlisting}[numbers=none,caption={第二册 runtime trace 最小字段}]
+RunEvent:
+  run_id
+  task_id
+  stage: enqueue | start | kernel | wait | io | commit | cancel
+  worker_id
+  thread_id
+  queue_depth
+  input_size
+  start_ns
+  end_ns
+  bytes_read_estimate
+  bytes_written_estimate
+  status
+\end{lstlisting}
+
+这套 trace 直接迁移到第三册：\code{stage=kernel} 会变成 prefill/decode segment，\code{queue\_depth} 会变成 serving queue，\code{cancel} 会释放 KV cache，\code{commit} 会变成 token/final event。第二册如果不训练 runtime 证据，第三册 serving 就会只剩接口字段。
+
+\section*{第二册出口报告}
+
+读完第二册，读者应能提交一份“TinyTensor kernel 系统调优报告”。报告不要求击败成熟库，但必须证明方法正确：
+
+\begin{lstlisting}[numbers=none,caption={第二册出口报告目录}]
+1. semantic reference and input fixtures
+2. scalar baseline timing and correctness
+3. FLOPs/bytes/arithmetic-intensity ledger
+4. shape sweep and working-set interpretation
+5. layout or packing change with address-flow explanation
+6. SIMD candidate with objdump or compiler-vectorization evidence
+7. thread scaling and false-sharing/partition analysis
+8. NUMA or memory-placement experiment if hardware supports it
+9. queue/runtime trace with p50/p95 and cancellation case
+10. remaining gap to OpenBLAS/oneDNN/hand-tuned implementation
+\end{lstlisting}
+
+这份报告是第三册的直接前置能力。AI Infra 里的 int8 GEMV、KV cache attention、sampler、serving scheduler，本质上都需要同样的系统调优方法。
+
+\section*{第二册实验矩阵：一次只改变一个变量}
+
+第二册的训练必须逼迫读者做 sweep，而不是跑一次 benchmark。TinyTensor kernel 至少要覆盖下面矩阵：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+维度 & 必跑取值 & 目的 \\
+\midrule
+shape & \code{K,N=128,256,512,1024,4096} & 观察工作集跨 cache 的拐点 \\
+tail & \code{K=513,N=257} & 暴露 tile、SIMD、packing tail 错误 \\
+layout & row-major、packed panel & 分离地址流收益和计算收益 \\
+thread & \code{1,2,4,8,16} & 找到扩展拐点和带宽饱和点 \\
+affinity & unpinned、pinned、NUMA-aware & 分离调度迁移和远端内存 \\
+queue & 单任务、长短混合、取消任务 & 观察 p50/p95 和资源释放 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对应命令可以压成一个脚本，但报告必须保留展开后的行：
+
+\begin{lstlisting}[numbers=none,caption={第二册 shape/thread sweep 命令模板}]
+for shape in 128 256 512 1024 4096 513x257; do
+  for layout in row_major packed; do
+    for threads in 1 2 4 8 16; do
+      ./build/tiny_kernel_bench \
+        --shape ${shape} \
+        --layout ${layout} \
+        --threads ${threads} \
+        --warmup 30 \
+        --repeat 200 \
+        --csv reports/kernel_sweep.csv
+    done
+  done
+done
+\end{lstlisting}
+
+PMU 可用时，至少为代表性 shape 跑：
+
+\begin{lstlisting}[numbers=none,caption={第二册 perf stat 模板}]
+perf stat -r 5 \
+  -e cycles,instructions,branches,branch-misses,cache-references,cache-misses,dTLB-load-misses \
+  ./build/tiny_kernel_bench --shape 4096 --layout packed --threads 1
+\end{lstlisting}
+
+若 PMU 不可用，报告要写明原因，并用替代证据补位：反汇编、shape sweep、线程扩展曲线、带宽估算、CPU 频率、系统负载和原始 CSV。不能把“没有权限”写成“性能已经证明”。
+
+\section*{第二册作业：解释一个反直觉结果}
+
+第二册最重要的作业不是让数字好看，而是解释反直觉结果。比如 packed scalar 可能比 row-major scalar 慢；4 线程可能比 2 线程慢；p50 变好但 p95 变坏。作业要求：
+
+\begin{enumerate}
+  \item 先确认 correctness、输入、二进制、线程数和机器环境一致。
+  \item 用字节账本判断是否可能已经内存带宽受限。
+  \item 用反汇编或 PMU 判断 SIMD path 是否真的执行。
+  \item 用线程扩展曲线判断是否出现同步、false sharing、NUMA 或带宽饱和。
+  \item 写出一个下一步实验，只改变一个变量。
+\end{enumerate}
+
+这个作业直接对应 AI Infra 面试中最常见的问题：不是“你会不会写优化”，而是“数字不符合预期时，你能不能用证据把原因缩小到可验证范围”。
+
 \section*{原理卷与代码卷}
 
 本册正文是原理卷。它使用伪代码、状态表、机制图、实验矩阵和关键 C++ 片段来解释问题，不把完整工程实现塞入每章。完整代码单独进入配套代码实践卷。代码卷负责实现 Compute Systems Engine：输入生成、顺序 reference、parser、HotBatch、benchmark harness、thread-local histogram、stable filter、partition manifest、线程池、有界队列、AtomicProtocolNote、SPSC/MPMC 候选、任务图、可靠写、MessageBus、Checkpoint、RunReport 和故障注入。

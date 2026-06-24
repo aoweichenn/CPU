@@ -249,6 +249,86 @@ ServiceSloReport:
 
 这份报告能指导业务选择。例如 RAG 问答更关注 TTFT 和长 prompt prefill；代码补全更关注短 prompt 低延迟 decode；批量摘要更关注吞吐；离线任务可以接受更高延迟换取更大 batch。不同业务可以使用同一引擎，但 SLO 和调度策略不同。
 
+\subsection{真实 workload trace：不要只测单请求}
+
+单请求 demo 无法证明服务可用。最小 workload trace 应该同时包含短 prompt、长 prompt、取消、超限、慢客户端和后端 fallback。这样才能暴露队列、KV 预算、backpressure 和错误分类。
+
+\begin{lstlisting}[numbers=none,caption={MiniLLM-CPU serving workload fixture}]
+workload minillm_serving_smoke:
+  req_short:
+    prompt_tokens=32
+    max_new_tokens=4
+    stream=true
+
+  req_rag:
+    prompt_tokens=512
+    max_new_tokens=8
+    stream=true
+
+  req_cancel:
+    prompt_tokens=128
+    max_new_tokens=128
+    cancel_after_decode_steps=0
+
+  req_too_long:
+    prompt_tokens=4096
+    max_new_tokens=512
+    expect_reject=memory_budget_exceeded
+
+  req_slow_client:
+    prompt_tokens=64
+    max_new_tokens=16
+    event_consume_delay_ms=200
+    expect_backpressure=true
+\end{lstlisting}
+
+这组 workload 很小，但覆盖真实服务最容易出问题的路径。它不是为了模拟所有线上流量，而是为了保证服务对象存在：admission、queue、session、KV reservation、stream event、cancel、backpressure、final event 和 trace summary。
+
+\subsection{线上故障演练：每个故障都要有字段证明}
+
+服务化章节必须训练读者处理故障，而不是只讲正常路径。下面四个演练应该进入回归：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+故障 & 注入方式 & 必须证明的字段 \\
+\midrule
+上下文超限 & \code{prompt + max\_new > max\_context} & \code{rejection\_reason=context\_too\_long}，没有分配 KV \\
+KV 预算不足 & 降低 serving KV budget & \code{memory\_budget\_exceeded}，reserved bytes 不增加 \\
+客户端取消 & decode 前或 decode 中取消 & \code{finish\_reason=cancelled}，KV/arena/workspace 归还 \\
+慢客户端 & 限制 event queue 消费速度 & backpressure 计数增加，调度器暂停或取消 session \\
+后端降级 & 禁用目标 ISA/GPU kernel & fallback event 可见，plan/report 标出原因 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+故障演练的重点是“字段能不能证明”。如果取消后只看到函数返回，不能证明资源释放；如果 fallback 没有事件，不能证明性能数字对应哪个后端；如果慢客户端只堆积队列，不能证明 backpressure 真的进入调度器。
+
+\subsection{连续合批的保守边界}
+
+生产 LLM serving 常用 continuous batching，把多个 session 的当前 decode step 合成小 batch。第三册可以先实现 step-level 调度和 trace，不必立即做生产级 PagedAttention；但要把连续合批的接口留对。
+
+\begin{lstlisting}[numbers=none,caption={连续合批需要的最小调度对象}]
+DecodeReadySession:
+  request_id
+  model_position
+  kv_cache_binding
+  input_token_id
+  sampler_state
+  deadline_ns
+  priority
+
+DecodeBatchPlan:
+  batch_id
+  sessions[]
+  max_wait_ns
+  backend_plan_id
+  kv_bindings[]
+  expected_shape: [B,H]
+\end{lstlisting}
+
+合批必须保护两个边界。第一，batch 只共享权重和 kernel，不共享 session 状态；每个 session 的 KV binding、position、stop 条件和 sampler state 都独立。第二，合批等待时间要进入 SLO。吞吐变高但 \code{queue\_wait\_p95} 和 \code{decode\_step\_p95} 失控，不是服务优化。
+
 \subsection{把服务化 SLO 绑定到可运行 probe}
 
 本节不能只停在接口字段。当前 lab 新增了 \code{lcqi\_serving\_probe}，用固定请求集模拟 admission、排队、prefill、decode、取消和拒绝，并导出 CSV：

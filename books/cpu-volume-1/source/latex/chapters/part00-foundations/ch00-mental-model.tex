@@ -77,6 +77,54 @@ int sum(int const* a, int n)
 \end{enumerate}
 \end{mentalmodel}
 
+\section{先给硬件名词一个坐标系}
+
+上面的四个视角里，最容易混乱的是机器视角。原因不是名词太少，而是名词来自不同位置：\instruction{add}、\instruction{mov} 属于 ISA 和汇编阅读；L1、L2、LLC、TLB 和 cache line 属于数据与指令靠近核心的路径；store buffer、分支预测、乱序执行属于核心内部怎样排队、猜测和提交；NUMA、coherence 和 false sharing 则要等多个核心和多个内存位置一起出现时才真正有意义。
+
+第一册不会把这些主题全部展开，但读者需要先有一张坐标图。否则看到 \code{a[i]}、\instruction{mov eax, dword ptr [rdi+rcx*4]}、cache line 或 benchmark 噪声时，容易把所有东西都塞进一个含糊的“CPU 很复杂”。下面这张图只承担定位作用：它说明一条循环同时消耗指令流和数据流，而线程位置、内存位置和测量状态会改变这些流经过的距离。
+
+\begin{systemdiagram}{第一册需要的硬件坐标系}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.05cm] (source) at (0,1.15) {C/C++ 语义\\\code{s += a[i]}};
+  \node[book teal node,text width=2.05cm] (asm) at (2.65,1.15) {汇编/机器码\\load/add};
+  \node[book purple node,text width=2.05cm] (front) at (5.3,1.15) {取指前端\\I-cache/预测};
+  \node[book amber node,text width=2.05cm] (core) at (7.95,1.15) {核心后端\\寄存器/执行};
+  \node[book navy node,text width=1.95cm] (commit) at (10.55,1.15) {提交\\架构状态};
+
+  \draw[book strong arrow] (source) -- (asm);
+  \draw[book strong arrow] (asm) -- (front);
+  \draw[book strong arrow] (front) -- (core);
+  \draw[book strong arrow] (core) -- (commit);
+
+  \node[book accent node,text width=2.05cm] (addr) at (0,-1.05) {地址公式\\base + i*4};
+  \node[book amber node,text width=2.05cm] (tlb) at (2.65,-1.05) {TLB\\虚拟页翻译};
+  \node[book purple node,text width=2.05cm] (l1d) at (5.3,-1.05) {L1D\\cache line};
+  \node[book teal node,text width=2.05cm] (llc) at (7.95,-1.05) {L2/LLC\\更大更远};
+  \node[book navy node,text width=1.95cm] (dram) at (10.55,-1.05) {内存控制器\\DRAM};
+
+  \draw[book strong arrow] (addr) -- (tlb);
+  \draw[book strong arrow] (tlb) -- (l1d);
+  \draw[book strong arrow] (l1d) -- (llc);
+  \draw[book strong arrow] (llc) -- (dram);
+  \draw[book dashed arrow] (asm.south) -- (addr.north);
+  \draw[book dashed arrow] (l1d.north) -- (core.south);
+
+  \node[book red node,text width=2.35cm] (shared) at (7.95,-2.65) {多核心共享写\\coherence/false sharing};
+  \node[book red node,text width=2.35cm] (place) at (10.55,-2.65) {线程和页面位置\\NUMA/调度};
+  \draw[book back arrow] (shared) -- (llc);
+  \draw[book back arrow] (place) -- (dram);
+
+  \node[book label,text width=10.6cm] at (5.3,-3.75) {第一册先训练源码、汇编、地址和测量证据；第二册再系统展开前端、cache/TLB、NUMA、一致性和并行优化。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：性能名词不是同一层东西；读汇编时必须同时标出指令流、数据地址和运行位置。}
+\end{systemdiagram}
+
+用数组求和来读这张图。源码层的 \code{a[i]} 给出语言语义；编译器把它降低成某种地址公式和 load 指令；取指前端负责把循环机器码字节送进核心；load/store 路径根据虚拟地址查 TLB 和数据 cache；如果数据已经在 L1D，整数加法很快就能继续；如果数据要从更远层级回来，后续依赖这次 load 的加法就要等。多个线程加入以后，还要继续问：每个线程写不写同一条 cache line，线程是否迁移，页面是否在本地 NUMA 节点。第一册现在只要求你会提出这些问题，并能用反汇编、地址和实验记录支撑基本判断。
+
+\begin{keyidea}
+第一册的机器视角不是背缓存参数，而是建立三个基本动作：读出实际机器指令，写出它访问的地址路径，再把测量结果放回这条路径上解释。第二册会把这张坐标系中的每个硬件结构放大。
+\end{keyidea}
+
 \section{算法复杂度不是机器成本}
 
 很多读者已经学过算法复杂度，会用 $O(n)$、$O(n \log n)$、$O(1)$ 描述算法规模变化。这当然重要，但它不是性能工程的全部。复杂度告诉我们输入规模变大时增长趋势如何，却不直接告诉我们某个真实程序在某台机器上花多少时间，也不告诉我们瓶颈在哪里。
@@ -118,6 +166,52 @@ for (std::size_t i = 0; i < n; ++i) {
 \begin{keyidea}
 算法复杂度回答“规模增长会怎样”，机器成本回答“这台机器实际怎样执行”。高质量性能分析必须同时包含两者。
 \end{keyidea}
+
+\section{证据链：从源码到结论}
+
+本册不会把“看源码”“看汇编”“跑 benchmark”当成三件互不相干的事。它们必须组成一条证据链。证据链的作用，是防止性能结论停在感觉上：你说某段代码慢，必须能说明慢的是哪份源码、哪组编译参数生成的哪份二进制、在什么输入和机器状态下运行、执行了哪些关键指令、测量数据是否排除了明显误差。
+
+以数组求和为例，源码层只能说明语义：
+
+\begin{lstlisting}[language=C++,caption={源码层语义}]
+int sum_i32(int const* p, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        s += p[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+这段代码给出一个顺序累加的语言合同，但它不能直接证明机器执行形态。编译器可能展开循环，可能把多个元素合并成向量寄存器操作，也可能因为别名、溢出语义、目标指令集或优化级别不同而生成完全不同的代码。因此第一步不是急着解释时间，而是固定编译条件并保留二进制身份：
+
+\begin{lstlisting}[numbers=none,caption={固定构建和二进制身份}]
+c++ -O3 -march=native -g -c sum.cpp -o sum.o
+objdump -drwC sum.o
+sha256sum sum.o
+\end{lstlisting}
+
+\code{objdump} 给出的是目标文件层证据：循环是否仍然存在，地址计算是否是 \code{base + index * scale}，累加变量是否留在寄存器，是否出现 SIMD 指令，是否有函数调用或额外边界检查。\code{sha256sum} 看起来只是文件摘要，但它解决的是另一个关键问题：以后报告里的测量数据到底对应哪份二进制。若源码改过、编译参数改过、链接库改过，时间数字不能再直接比较。
+
+第二步是把目标文件放进进程语境。目标文件中的重定位、符号和节还不是最终运行地址；可执行文件经过链接和加载后，代码段、只读数据段、栈、堆和共享库会进入进程虚拟地址空间。此时调试器、\code{/proc/<pid>/maps}、\code{readelf} 和反汇编看到的是运行边界：函数入口在哪里，栈是否按 ABI 对齐，调用是否经过 PLT，数据对象到底在栈上、全局区还是堆上。
+
+第三步才是测量。一个循环运行得快，可能是因为机器码更短，也可能是因为输入已经在 cache 中，可能是因为编译器删掉了无用计算，还可能是因为测量区域没有包含真正的工作。可信测量必须先消费结果、校验正确性，再控制输入规模、重复次数、预热方式和统计口径。时间数据只有在前两步证据成立后，才有解释价值。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+证据层 & 要固定的问题 & 常见材料 \\
+\midrule
+源码语义 & 程序承诺计算什么，是否有未定义行为 & 源码、类型、对象生命周期、测试 oracle \\
+构建产物 & 编译器实际生成了什么 & 编译命令、目标文件、反汇编、符号表、摘要 \\
+运行边界 & 二进制怎样进入进程 & ELF、动态链接、地址空间、ABI、栈和寄存器 \\
+测量数据 & 数字是否支持结论 & 正确性校验、重复测量、统计、环境记录 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+后续章节会反复使用这条链。讨论 ABI 时，源码函数签名必须落到寄存器和栈；讨论对象布局时，类定义必须落到偏移、对齐和内存字节；讨论 benchmark 时，时间数字必须落到二进制身份和输入合同。只要证据链断开，结论就只能算猜测。
 
 \section{抽象层错位：许多误判从这里开始}
 

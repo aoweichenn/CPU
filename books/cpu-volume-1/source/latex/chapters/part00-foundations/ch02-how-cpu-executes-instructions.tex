@@ -41,6 +41,38 @@ C/C++ 表达式 $\rightarrow$ 汇编文本 $\rightarrow$ 机器码字节 $\right
 本章不是把 CPU 讲成神秘黑盒，而是把 CPU 拆成若干可观察、可推理、可实验验证的层次。性能工程的第一原则是：先确认机器真正执行了什么，再讨论优化。
 \end{keyidea}
 
+\section{本章阅读路线：不要一开始就跳到 cache}
+
+这一章会同时出现寄存器、flags、\register{rip}、load/store、TLB、cache、分支预测、流水线和乱序执行。它们不是同一层概念，也不应该一次性背下来。更稳的读法是从最小状态转移开始，每次只增加一个新问题：先看寄存器加法如何改变架构状态，再看 load 如何把地址路径带进来，然后看分支如何改变 \register{rip}，最后把这些动作合在一个求和循环的基本块里。
+
+\begin{systemdiagram}{从一条 add 到一个热循环的阅读路线}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=1.85cm] (add) at (0,0.9) {寄存器指令\\\instruction{add}};
+  \node[book teal node,text width=1.85cm] (load) at (2.45,0.9) {内存指令\\load/store};
+  \node[book purple node,text width=1.85cm] (branch) at (4.9,0.9) {控制流\\flags + jump};
+  \node[book amber node,text width=1.85cm] (loop) at (7.35,0.9) {循环基本块\\body + backedge};
+  \node[book navy node,text width=1.85cm] (hyp) at (9.8,0.9) {性能假设\\证据链};
+
+  \draw[book strong arrow] (add) -- (load);
+  \draw[book strong arrow] (load) -- (branch);
+  \draw[book strong arrow] (branch) -- (loop);
+  \draw[book strong arrow] (loop) -- (hyp);
+
+  \node[book label,text width=2.05cm] at (0,-0.55) {读写哪些寄存器和 flags};
+  \node[book label,text width=2.05cm] at (2.45,-0.55) {地址公式、权限、cache line};
+  \node[book label,text width=2.05cm] at (4.9,-0.55) {下一条指令地址从哪里来};
+  \node[book label,text width=2.05cm] at (7.35,-0.55) {汇编、CFG、地址流同时出现};
+  \node[book label,text width=2.05cm] at (9.8,-0.55) {用反汇编和实验验证};
+
+  \node[book label,text width=10.2cm] at (4.9,-1.65) {先建立 ISA 状态追踪，再加入微架构等待位置；否则看到 cache、TLB 或乱序执行时，很容易把正确性语义和性能解释混在一起。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：CPU 执行模型应按问题逐层扩展，而不是从硬件名词清单开始。}
+\end{systemdiagram}
+
+所以本章前半部分会显得“慢”：先逐条追踪 \instruction{mov}、\instruction{add} 和 \instruction{ret}。这是故意的。若不能说清一条指令读什么、写什么、怎样改变 \register{rip}，后面看到乱序执行时就不知道什么可以提前做、什么必须等待；若不能从 \instruction{mov eax, dword ptr [rdi + rcx*4]} 写出地址公式，后面看到 cache line 和 TLB 时就没有落点。
+
+到本章后半部分，求和循环会把这些基础重新合并：循环体需要取指，load 需要地址和数据，累加器形成跨迭代依赖，循环回边依赖分支预测，测量结果还要回到反汇编和输入规模。读完本章的合格输出不是“记住 CPU 很复杂”，而是能对一个小热循环写出：源码语义、关键汇编、基本块、地址路径、依赖边和可验证的性能假设。
+
 \section{从一个最小函数开始}
 
 考虑这个 C++ 函数：
@@ -723,7 +755,37 @@ ret
 \register{eax} $\leftarrow$ memory[\register{rdi} ... \register{rdi}+3]
 \end{center}
 
-从微架构看，它可能经过很多步骤：
+从微架构看，它不是直接伸手到“内存”里拿一个整数，而是一条从地址到数据的路径：
+
+\begin{systemdiagram}{一条 load 从地址到寄存器}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.1cm] (inst) at (0,0.95) {汇编指令\\\instruction{mov eax,[rdi]}};
+  \node[book teal node,text width=2.0cm] (addr) at (2.55,0.95) {地址生成\\virtual addr};
+  \node[book amber node,text width=2.0cm] (tlb) at (5.1,0.95) {TLB\\页翻译/权限};
+  \node[book purple node,text width=2.0cm] (l1) at (7.65,0.95) {L1D\\cache line};
+  \node[book navy node,text width=2.0cm] (reg) at (10.2,0.95) {寄存器\\\register{eax}};
+
+  \draw[book strong arrow] (inst) -- (addr);
+  \draw[book strong arrow] (addr) -- (tlb);
+  \draw[book strong arrow] (tlb) -- (l1);
+  \draw[book strong arrow] (l1) -- (reg);
+
+  \node[book red node,text width=2.15cm] (fault) at (2.55,-0.85) {地址非法\\page fault};
+  \node[book red node,text width=2.15cm] (walk) at (5.1,-0.85) {TLB miss\\page walk};
+  \node[book red node,text width=2.15cm] (miss) at (7.65,-0.85) {L1 miss\\L2/LLC/DRAM};
+  \node[book label,text width=2.05cm] (line) at (10.2,-0.85) {取回整条 cache line，再抽出 4 字节};
+
+  \draw[book dashed arrow] (addr) -- (fault);
+  \draw[book dashed arrow] (tlb) -- (walk);
+  \draw[book dashed arrow] (l1) -- (miss);
+  \draw[book weak arrow] (l1) -- (line);
+
+  \node[book label,text width=10.4cm] at (5.1,-2.0) {同一条 \instruction{mov} 在 L1 命中、TLB miss、L3 miss、缺页或远端内存时，指令文本不变，等待位置完全不同。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：load 的成本由地址生成、翻译、cache 查找和 miss 恢复串联决定，不能只看助记符。}
+\end{systemdiagram}
+
+这张图可以拆成很多步骤：
 
 \begin{enumerate}
   \item 地址生成单元计算有效地址。
@@ -1344,7 +1406,45 @@ ret
   \item 如果编译器能证明安全并且目标支持 SIMD，优化版本可能向量化。
 \end{itemize}
 
-这就是从源代码到性能模型的第一步。你不需要在本章就优化它，但必须能把它拆成寄存器、内存、控制流和依赖。
+这就是从源代码到性能模型的第一步。你不需要在本章就优化它，但必须能把它拆成寄存器、内存、控制流和依赖。拆分时不要只写“有一条 load”。更好的读法是先切出循环基本块，再把汇编指令、地址公式、cache line 和循环回边放到同一张图上。
+
+\begin{systemdiagram}{求和循环的基本块、汇编和地址流}
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[book accent node,text width=2.05cm] (src) at (0,1.2) {C++ 循环\\\code{s += a[i]}};
+  \node[book teal node,text width=2.05cm] (asm) at (2.55,1.2) {汇编形状\\\instruction{add [addr]}};
+  \node[book purple node,text width=2.05cm] (cfg) at (5.1,1.2) {基本块\\body + branch};
+  \node[book amber node,text width=2.05cm] (front) at (7.65,1.2) {指令流\\I-cache/预测};
+  \node[book navy node,text width=2.0cm] (state) at (10.2,1.2) {架构状态\\eax/rcx/rip};
+
+  \draw[book strong arrow] (src) -- (asm);
+  \draw[book strong arrow] (asm) -- (cfg);
+  \draw[book strong arrow] (cfg) -- (front);
+  \draw[book strong arrow] (front) -- (state);
+
+  \node[book accent node,text width=2.05cm] (addr) at (2.55,-0.85) {地址公式\\\code{rdi + rcx*4}};
+  \node[book amber node,text width=2.05cm] (tlb) at (5.1,-0.85) {地址路径\\TLB + L1D};
+  \node[book teal node,text width=2.05cm] (line) at (7.65,-0.85) {cache line\\相邻元素};
+  \node[book red node,text width=2.0cm] (dep) at (10.2,-0.85) {累加依赖\\old eax -> new eax};
+
+  \draw[book dashed arrow] (asm.south) -- (addr.north);
+  \draw[book strong arrow] (addr) -- (tlb);
+  \draw[book strong arrow] (tlb) -- (line);
+  \draw[book strong arrow] (line) -- (dep);
+  \draw[book back arrow] (dep.north) -- (state.south);
+
+  \node[book small node,text width=2.35cm] (branch) at (5.1,-2.45) {\instruction{cmp}/\instruction{jl}\\循环回边};
+  \node[book small node,text width=2.35cm] (branchcost) at (7.65,-2.45) {预测稳定时便宜\\预测失败时清空};
+  \draw[book dashed arrow] (cfg.south) -- (branch.north);
+  \draw[book arrow] (branch) -- (branchcost);
+
+  \node[book label,text width=10.5cm] at (5.1,-3.55) {顺序数组求和的关键不是“只有一行加法”，而是同一基本块里同时存在取指、地址生成、cache line 搬运、累加依赖和循环控制。};
+\end{pdfdiagram}
+\diagramnote{本图要证明的命题是：读一个热循环时，汇编、CFG、地址流和 cache 位置必须同时出现，不能分散成互不相连的术语。}
+\end{systemdiagram}
+
+按这张图读循环，\instruction{add eax, dword ptr [rdi + rcx*4]} 同时暴露两条账本。第一条是指令流：循环体的机器码要被取指、预测回边、译码并送到后端。第二条是数据流：\code{rdi + rcx*4} 给出连续地址，TLB 负责页翻译，L1D 按 cache line 搬运数据，目标字节再进入加法。若常见 cache line 是 64 字节，它一次能覆盖 16 个 \code{int32_t}；具体数值是平台事实，需要用机器资料确认，但“按整行搬运、相邻元素受益”这件事是读图时必须保留的结构。
+
+这也说明哪些概念此时不该提前泛化。单线程求和通常不涉及 NUMA 或 false sharing，除非输入页面分布、线程迁移或多线程切分被引入；它也不要求读者背每级 cache 的固定延迟。第一册在这里要完成的是坐标训练：先看基本块和汇编，再写地址公式，再问数据在哪一级，最后才把时间数字放回这条路径解释。
 
 \subsection{给求和循环画一张简化依赖图}
 
