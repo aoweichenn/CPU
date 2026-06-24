@@ -2299,6 +2299,92 @@ perf stat -e page-faults,minor-faults,major-faults ./app
 
 page fault 也要纳入系统调用边界的思维。它不是程序主动调用内核，而是 CPU 在取指、load 或 store 时发现页表状态不满足，转入异常处理。合法的首次触页、COW、文件映射缺页和非法地址崩溃，在机器层都从异常入口开始，但业务含义完全不同。若第一册不把 syscall、vDSO、page fault、signal 分清，后面做 benchmark 和服务 p99 分析一定会混层。
 
+\subsection{七、signal：内核怎样异步改变用户态控制流}
+
+信号是第一册必须单独建模的系统边界。它不像普通函数调用由当前源码位置主动发起，也不像 \code{syscall} 由用户态显式进入内核。信号可以来自硬件异常、终端、另一个进程、定时器、管道错误或内核事件；内核在合适的返回用户态时机，把用户线程的上下文改造成“先执行 signal handler，再回到原来位置或终止进程”。因此，signal 是异步控制流：它打断的可能是热循环、阻塞系统调用、库函数、内存分配器或 C++ 对象更新中间状态。
+
+\begin{lstlisting}[numbers=none,caption={signal 的压缩状态机}]
+UserRunning:
+  thread executes ordinary user code or waits in a syscall
+
+SignalGenerated:
+  hardware exception, kill, terminal, timer, SIGPIPE or kernel event
+
+Pending:
+  signal is recorded for the process or a particular thread
+
+DeliveryPoint:
+  kernel chooses a thread and prepares user-space delivery
+
+HandlerRunning:
+  handler runs on the user stack or alternate signal stack
+
+ReturnOrTerminate:
+  sigreturn restores context, syscall may return EINTR,
+  or default action terminates, stops or ignores the process
+\end{lstlisting}
+
+这个状态机解释两个常见现象。第一，程序收到 \code{SIGSEGV} 时，信号不是“随机函数回调”，而是 CPU 访问地址失败，内核无法修复 page fault，于是按信号机制报告给进程。第二，阻塞 \code{read}、\code{write}、\code{waitpid} 或 \code{futex} 期间收到信号，系统调用可能提前返回 \code{-1,EINTR}，也可能在 \code{SA\_RESTART} 和具体接口允许时被内核或 libc 重启。写系统代码时，\code{EINTR} 不是噪声，而是控制流边界。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.33\linewidth}p{0.33\linewidth}}
+\toprule
+信号 & 常见来源 & 工程含义 \\
+\midrule
+\code{SIGSEGV} & 非法地址、权限错误、无法处理的 page fault & 看 fault address、\register{rip}、maps，不要只猜空指针 \\
+\code{SIGBUS} & 某些映射文件访问、对齐或设备映射错误 & \code{mmap} 文件被截断时尤其要检查 \\
+\code{SIGPIPE} & 向关闭的 pipe/socket 写入 & 服务端写路径要决定忽略、处理或用 \code{MSG\_NOSIGNAL} \\
+\code{SIGINT}/\code{SIGTERM} & 终端或进程管理器请求退出 & 只能触发有序 shutdown，不能在 handler 里做复杂清理 \\
+\code{SIGALRM}/定时器信号 & 计时器到期 & 会打断阻塞调用，benchmark 中要写明是否启用 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+安装 handler 应优先使用 \code{sigaction}，而不是把 signal 当成普通 C++ callback。handler 运行时的限制非常强：只能调用 async-signal-safe 的函数；不能随便 \code{new}、\code{delete}、锁 mutex、写 \code{std::string}、调用日志库或抛 C++ 异常。最稳的模式是 handler 只设置 \code{std::sig\_atomic\_t} 标志，或向专门 fd 写一个字节唤醒事件循环；真正清理工作回到普通控制流执行。
+
+\begin{lstlisting}[language=C++,caption={signal handler 只做最小动作}]
+#include <atomic>
+#include <csignal>
+
+static volatile std::sig_atomic_t stop_requested = 0;
+
+extern "C" void on_signal(int signo) {
+    if (signo == SIGTERM || signo == SIGINT) {
+        stop_requested = 1;
+    }
+}
+
+int install_signal_handlers() {
+    struct sigaction sa {};
+    sa.sa_handler = on_signal;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    if (sigaction(SIGTERM, &sa, nullptr) != 0) return -1;
+    if (sigaction(SIGINT, &sa, nullptr) != 0) return -1;
+    return 0;
+}
+\end{lstlisting}
+
+这个例子故意不在 handler 中打印日志。原因不是保守风格，而是运行时事实：信号可能打断正在持有 libc 内部锁、malloc 锁或日志锁的线程；handler 再调用同一套库函数，可能死锁或破坏状态。若需要把信号接入事件循环，Linux 工程常用 self-pipe trick、\code{eventfd} 或 \code{signalfd}，把异步信号转换成普通 fd 事件，再由主循环按普通状态机处理。
+
+\begin{lstlisting}[numbers=none,caption={signal 证据包}]
+# 观察崩溃信号和 fault address。
+gdb -q ./app core
+(gdb) info signals
+(gdb) p $_siginfo
+(gdb) info registers
+(gdb) x/i $rip
+
+# 观察系统调用是否被信号打断。
+strace -f -ttT -e trace=read,write,ppoll,rt_sigaction,rt_sigprocmask ./app
+
+# 观察当前进程的 signal mask 和 pending 状态。
+cat /proc/$PID/status | grep -E 'SigBlk|SigIgn|SigCgt|SigPnd|ShdPnd'
+\end{lstlisting}
+
+signal 报告也要写证据边界。看到 \code{SIGSEGV}，只能说明进程因为内存访问或相关异常被终止，不能自动推出“空指针”。要结合 fault address、\register{rip} 指令、寄存器、\filepath{/proc/<pid>/maps}、对象生命周期和 sanitizer 结果。看到 \code{EINTR}，只能说明某个阻塞边界被信号打断，不能自动重试所有接口；有些调用已经部分完成，有些调用有超时语义，有些业务正是用信号请求取消。看到 \code{SIGPIPE}，也不能只把它关掉：要先说明写入对象是 pipe、socket 还是普通文件，对端关闭时业务应该丢弃、重连、还是报告失败。
+
 \subsection{深水链路的统一验收}
 
 本节不是要求读者立刻成为 LLVM、ELF、DWARF 或内核专家，而是要求形成工程闭环意识。一个合格的第一册实验报告，至少要能回答：
