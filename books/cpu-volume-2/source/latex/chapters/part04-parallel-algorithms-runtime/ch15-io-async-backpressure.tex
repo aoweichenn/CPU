@@ -216,6 +216,144 @@ manifest commit records which block is externally visible
 
 这条链解释了两个常见误判。第一，\code{write} 很快不代表设备很快，它可能只是内存 copy 快。第二，进程崩溃和机器掉电不是同一类故障：进程崩溃后 page cache 仍在内核中，掉电后易失缓存可能消失。可靠性承诺必须说明恢复边界：只承诺进程崩溃恢复，还是承诺掉电后也能恢复；只承认 \code{fsync} 后的数据，还是允许未同步中间结果重算。
 
+\topic{案例：一次 \code{write} 穿过 VFS 和 page cache}
+现在把普通文件写入固定成一个可分析案例。Compute Systems Engine 要写出一个 64 MiB 的 \code{ShuffleBlock} 到本地文件系统。业务代码看到的是 \code{write_all(fd, buffer)}；内核看到的是 fd 对应的 open file description、VFS 文件对象、文件系统方法、page cache 页、脏页队列、writeback 和块层请求。这个案例的目标不是背 Linux 源码函数名，而是训练读者分清：哪一步证明用户态请求被接受，哪一步证明数据进入内核缓存，哪一步证明文件系统推进持久边界，哪一步才是业务提交。
+
+\begin{lstlisting}[language=C++,caption={write VFS probe：固定一个写入案例}]
+int fd = ::open("shuffle-block.tmp",
+                O_CREAT | O_TRUNC | O_WRONLY | O_CLOEXEC,
+                0644);
+if (fd < 0) {
+    return error_from_errno(errno);
+}
+
+std::vector<std::byte> block(64ull * 1024 * 1024);
+fill_shuffle_block(block);
+
+std::uint64_t off = 0;
+while (off < block.size()) {
+    ssize_t n = ::write(fd, block.data() + off, block.size() - off);
+    if (n > 0) {
+        off += static_cast<std::uint64_t>(n);
+        continue;
+    }
+    if (n < 0 && errno == EINTR) {
+        continue;
+    }
+    return error_from_errno(errno);
+}
+
+if (require_durable) {
+    if (::fsync(fd) != 0) {
+        return error_from_errno(errno);
+    }
+}
+if (::close(fd) != 0) {
+    return error_from_errno(errno);
+}
+\end{lstlisting}
+
+这段代码故意使用普通 \code{write}，不使用 direct I/O、\code{io_uring} 或 mmap。原因是普通路径最容易误判：\code{write} 返回很快时，读者容易以为“磁盘很快”；实际可能只是用户态字节被复制到 page cache 并标成 dirty。若不调用 \code{fsync}，短时间 benchmark 很可能测的是内存带宽、页分配、VFS 锁和 dirty throttling 前的提交速度，而不是设备持久化吞吐。
+
+\begin{lstlisting}[numbers=none,caption={本案例的 VFS/page cache 逻辑路径}]
+fd number in process
+  -> open file description: current offset and status flags
+  -> VFS file object and file operations
+  -> filesystem write path
+  -> address_space page cache pages
+  -> dirty page accounting
+  -> background writeback
+  -> block layer request queue
+  -> device completion
+  -> fsync/fdatasync waits for the promised durability boundary
+\end{lstlisting}
+
+VFS 的作用是把“对 fd 写字节”转成“对某个文件系统对象执行写方法”。应用不应假设 ext4、xfs、tmpfs、FUSE、NFS 和 overlayfs 的细节相同。VFS 层提供统一入口，具体文件系统决定 page cache、metadata、日志、权限、copy、direct I/O 和同步语义如何落地。因此报告必须写明文件系统、挂载选项、是否 tmpfs、是否容器 overlay、是否网络文件系统。没有这些字段，\code{write} 案例就不能迁移。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+层级 & 观察到的事实 & 不能推出的结论 \\
+\midrule
+\code{write} 返回正数 & 内核接受了这些字节进入写路径 & 设备已写完，掉电可恢复 \\
+文件大小变大 & inode size 或目录可见状态更新 & 数据页已经 durable \\
+dirty bytes 增长 & page cache 中有未回写债务 & 业务 block 已提交 \\
+writeback 活跃 & 内核正在把脏页推向设备 & 本次请求已经完成 durable \\
+\code{fsync} 返回 0 & 文件系统承诺的同步边界完成 & manifest 已经接受该 attempt \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{案例证据包：命令要证明哪一层}
+这个案例至少要收集四类证据。第一类证明应用确实调用了 \code{open/write/fsync/close}。第二类证明写入不是一次魔法设备操作，而是经过 page cache 和 dirty accounting。第三类观察 writeback 或同步等待。第四类记录业务层是否已经发布 manifest。每类证据都有边界，不能互相替代。
+
+\begin{lstlisting}[language=bash,caption={write/VFS 案例的观测命令}]
+# 系统调用边界：证明用户态请求形状。
+strace -tt -e trace=openat,write,fsync,fdatasync,close ./write_vfs_probe
+
+# 文件系统和挂载事实：证明案例跑在哪个语义环境。
+findmnt -T ./shuffle-block.tmp
+stat -f .
+
+# page cache / dirty 债务：观察内核是否积累脏页。
+grep -E 'Dirty|Writeback|Cached' /proc/meminfo
+cat /proc/vmstat | grep -E 'nr_dirty|nr_writeback|pgpgout'
+
+# 进程级 I/O 账本：观察写入字节和系统调用数量。
+cat /proc/$PID/io
+
+# 调度和阻塞：观察 fsync/write 是否让线程睡眠。
+perf trace -e sys_enter_write,sys_exit_write,sys_enter_fsync,sys_exit_fsync ./write_vfs_probe
+\end{lstlisting}
+
+\code{strace} 能证明 \code{write} 调用次数、返回值和 \code{fsync} 是否发生，但它不能证明数据已经到设备。\code{/proc/meminfo} 和 \code{/proc/vmstat} 能看到系统级 dirty/writeback 变化，却不能把每个脏页精确归因到某个业务 block。\code{/proc/<pid>/io} 能说明进程发起的 I/O 账本，但字段含义受内核路径和缓存影响。若有权限，可以再用 ftrace、eBPF 或文件系统 tracepoint 细化路径；没有权限时，报告必须写明证据边界。
+
+\topic{两个对照：无 \code{fsync} 和有 \code{fsync}}
+同一段写入代码要至少跑两个模式。无 \code{fsync} 模式回答“应用把字节交给内核有多快”；有 \code{fsync} 模式回答“文件系统同步承诺有多贵”。二者不是同一个指标。
+
+\begin{lstlisting}[numbers=none,caption={write/VFS 对照报告字段}]
+write_vfs_report:
+  filesystem
+  mount_options
+  file_size_bytes
+  block_size_bytes
+  write_call_count
+  write_returned_bytes
+  write_elapsed_ms
+  fsync_enabled
+  fsync_elapsed_ms
+  close_elapsed_ms
+  dirty_before_bytes
+  dirty_after_write_bytes
+  dirty_after_fsync_bytes
+  proc_io_write_bytes
+  manifest_committed
+  evidence_limitations
+\end{lstlisting}
+
+若无 \code{fsync} 模式吞吐很高，而有 \code{fsync} 模式 p99 很差，结论不是“\code{fsync} 可删”。正确结论是：同步承诺成本高，需要决定哪些输出必须 durable、哪些中间结果可重算，是否使用 group commit，是否把 fsync 从 compute worker 隔离到 I/O worker。若两个模式都很慢，瓶颈可能是内存 copy、文件系统锁、dirty throttling、设备队列或容器存储层。只有把对照字段写全，才知道要优化哪一层。
+
+\topic{VFS 案例的错误结论清单}
+这个案例最重要的训练价值，是防止把不同层级证据混用。看到 \code{write} 返回 64 MiB，不得写“64 MiB 已经落盘”；看到文件大小变大，不得写“崩溃后一定可恢复”；看到 \code{fsync} 慢，不得写“线程池调度器慢”；看到 dirty bytes 增长，不得写“进程内存泄漏”；看到 \code{write} 偶尔变慢，不得只怀疑磁盘，也要考虑 dirty page 阈值、回写限速、文件系统日志和同步写策略。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.28\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+错误结论 & 更准确的解释 & 需要补的证据 \\
+\midrule
+\code{write} 快，所以磁盘快 & 可能只是 page cache 接受快 & \code{fsync}、dirty/writeback、设备指标 \\
+\code{write} 慢，所以 CPU 算法慢 & 线程可能睡在 VFS、回写或 dirty throttling & syscall latency、worker state \\
+RSS 没涨，所以没有 I/O 债务 & dirty page 属于系统缓存，不一定计入进程 RSS & \code{/proc/meminfo}、vmstat \\
+\code{fsync} 慢，所以删掉它 & 删除会改变持久化承诺 & crash matrix、manifest 策略 \\
+tmpfs 上很快，所以实现很好 & tmpfs 主要是内存路径 & 真实文件系统和设备对照 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个 \code{write/VFS} 案例应成为后续所有 I/O 优化的 reference。换成 \code{io_uring}、direct I/O、registered buffer 或异步 writer 后，仍要能回答同样的问题：请求被哪一层接受，字节在哪一层，谁拥有 buffer，哪些错误可重试，哪一步推进 durable，哪一步推进 business commit。
+
 \topic{读路径和 page fault}
 读取也不一定真的触碰设备。热 page cache 中的 \code{read} 可以只做内存 copy；冷 page cache 的 \code{read} 会触发设备 I/O；\code{mmap} 顺序访问表面上是普通 load，底层可能在 page fault 中等待磁盘。若 compute worker 直接访问冷 mmap 区域，线程可能在缺页路径上睡眠，表现为 CPU 空闲但 ready task 堆积。
 
