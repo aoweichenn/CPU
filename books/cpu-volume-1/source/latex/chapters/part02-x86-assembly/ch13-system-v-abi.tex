@@ -343,6 +343,133 @@ Relocation section '.rela.text' contains 1 entry:
 
 如果报告只写“第一个参数在 \register{rdi}”，它还不是证据包。合格的 x86-64 ABI evidence pack 至少要保存源码、编译命令、目标 triple、优化级别、反汇编、符号表和重定位表。若代码跨动态库，还要继续保存 \cmd{readelf -d}、PLT/GOT 反汇编和运行时加载库路径。
 
+\subsection{x86-64 动态链接 evidence pack：PLT、GOT 和 JUMP\_SLOT}
+
+上一组证据停在目标文件层：调用点有 \code{R\_X86\_64\_PLT32}，链接器以后会修正。真实共享库调用还要再跨一层：可执行文件启动时不一定已经知道 \code{add\_i32} 在共享库中的最终运行地址。最终可执行文件会保留动态段、PLT、GOT 和运行时重定位，让动态链接器在启动或第一次调用时绑定符号。
+
+下面的最小样例故意不用 C 运行时入口，而用一个很小的 \code{\_start}。这样证据只集中在“按 ABI 放参数、经过 PLT 调用共享库、用 \instruction{syscall} 退出”这条路径上：
+
+\begin{lstlisting}[language=C++,caption={共享库导出的函数}]
+// libadd.cpp
+extern "C" int add_i32(int a, int b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={x86-64 \_start 调用共享库函数}]
+.intel_syntax noprefix
+.globl _start
+.type _start,@function
+_start:
+  mov edi, 7
+  mov esi, 5
+  call add_i32@PLT
+  mov edi, eax
+  mov eax, 60
+  syscall
+\end{lstlisting}
+
+构建命令要把目标平台写死，否则在 ARM 机器上会生成 AArch64 证据，不能拿来证明 x86-64 ABI：
+
+\begin{lstlisting}[language=bash,caption={交叉生成 x86-64 共享库调用样例}]
+clang++ --target=x86_64-linux-gnu -O2 -fPIC -c libadd.cpp -o libadd.o
+clang++ --target=x86_64-linux-gnu -fuse-ld=lld -nostdlib \
+  -shared libadd.o -o libadd.so
+
+clang --target=x86_64-linux-gnu -c start.S -o start.o
+clang --target=x86_64-linux-gnu -fuse-ld=lld -nostdlib start.o \
+  -L. -ladd -Wl,-rpath,'$ORIGIN' \
+  -Wl,--dynamic-linker,/lib64/ld-linux-x86-64.so.2 \
+  -o app
+\end{lstlisting}
+
+先确认文件身份。没有这一行，后面的反汇编和 relocation 都可能被误读成当前主机架构：
+
+\begin{lstlisting}[numbers=none,caption={ELF header 证明目标是 x86-64}]
+Class:                             ELF64
+Type:                              EXEC (Executable file)
+Machine:                           Advanced Micro Devices X86-64
+Entry point address:               0x201330
+\end{lstlisting}
+
+动态段说明这个可执行文件依赖 \filepath{libadd.so}，运行时搜索路径是 \code{\$ORIGIN}，并且有 PLT/GOT 相关信息：
+
+\begin{lstlisting}[numbers=none,caption={readelf -d 中的动态链接字段}]
+0x000000000000001d (RUNPATH) Library runpath: [$ORIGIN]
+0x0000000000000001 (NEEDED)  Shared library: [libadd.so]
+0x0000000000000017 (JMPREL)  0x200318
+0x0000000000000002 (PLTRELSZ) 24 (bytes)
+0x0000000000000003 (PLTGOT)  0x203440
+\end{lstlisting}
+
+真正把符号和 GOT slot 联系起来的是 \code{.rela.plt}：
+
+\begin{lstlisting}[numbers=none,caption={readelf -r 看到的动态调用重定位}]
+Relocation section '.rela.plt' contains 1 entry:
+  Offset      Type              Sym. Name + Addend
+  0000203458  R_X86_64_JUMP_SLOT add_i32 + 0
+\end{lstlisting}
+
+\code{Offset=0x203458} 不是函数地址，而是 GOT 中等待被填充的槽位地址。符号表中 \code{add\_i32} 仍是 undefined，因为它要从共享库解析：
+
+\begin{lstlisting}[numbers=none,caption={可执行文件符号表中的 undefined 动态符号}]
+Num: Value Size Type Bind   Ndx Name
+  1: 0     0    FUNC GLOBAL UND add_i32
+\end{lstlisting}
+
+反汇编把这条链路连起来：
+
+\begin{lstlisting}[numbers=none,caption={\_start 到 add\_i32@plt 的 x86-64 控制流}]
+0000000000201330 <_start>:
+  201330: bf 07 00 00 00      mov    edi,0x7
+  201335: be 05 00 00 00      mov    esi,0x5
+  20133a: e8 21 00 00 00      call   201360 <add_i32@plt>
+  20133f: 89 c7               mov    edi,eax
+  201341: b8 3c 00 00 00      mov    eax,0x3c
+  201346: 0f 05               syscall
+
+0000000000201360 <add_i32@plt>:
+  201360: ff 25 f2 20 00 00   jmp QWORD PTR [rip+0x20f2] # 203458
+  201366: 68 00 00 00 00      push 0x0
+  20136b: e9 e0 ff ff ff      jmp 201350 <.plt>
+\end{lstlisting}
+
+这段输出有四个关键点。第一，\code{\_start} 仍然按 System V AMD64 函数 ABI 把两个 \code{int} 参数放进 \register{edi} 和 \register{esi}。第二，调用目标不是共享库真实地址，而是本可执行文件里的 \code{add\_i32@plt}。第三，PLT 第一条指令从 GOT slot \code{0x203458} 间接跳转；这个 slot 正是 \code{R\_X86\_64\_JUMP\_SLOT} 要修补的位置。第四，若该 slot 还没绑定，后续 \instruction{push 0x0} 和跳回 PLT 头部会进入动态链接器解析流程；若已经绑定，第一条间接跳转会直接到共享库函数。
+
+可以把 lazy binding 看成一个小状态机：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.35\linewidth}p{0.34\linewidth}}
+\toprule
+状态 & GOT slot 含义 & 证据位置 \\
+\midrule
+Unresolved & 指向 PLT resolver 路径 & \code{add\_i32@plt} 后半段仍可到达 \\
+Resolving & 动态链接器查找符号和库 & \cmd{LD\_DEBUG=bindings} 或动态链接器 trace \\
+Patched & GOT slot 写入共享库函数地址 & 运行后内存中的 GOT 内容变化 \\
+Bound & 后续调用直接间接跳到函数 & 热路径只走 PLT 第一条 \instruction{jmp} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\code{LD\_BIND\_NOW=1} 或链接选项 \code{-Wl,-z,now} 会把许多绑定提前到加载阶段；\code{-fno-plt} 可能让编译器生成不同的 GOT 间接调用形态；静态链接则不会走普通共享库 PLT 路径。因此，动态链接证据不能只贴一段 \instruction{call foo@plt}。报告必须写清：
+
+\begin{lstlisting}[numbers=none,caption={动态链接 evidence pack 的最小字段}]
+target_triple: x86_64-linux-gnu
+link_model: dynamic
+pie: yes | no
+bind_policy: lazy | now
+needed_libraries: readelf -d
+runpath_or_rpath: readelf -d
+plt_disassembly: objdump -d
+jump_slot_relocations: readelf -r .rela.plt
+loaded_library_path: LD_DEBUG / ldd / proc maps
+call_site_abi: argument registers and return register
+\end{lstlisting}
+
+这组证据的边界也要写清。上面的交叉构建可以静态证明 x86-64 ELF、动态段、PLT/GOT 和 relocation 形态；若要证明运行时真实绑定路径，还需要在 x86-64 主机或可靠模拟器上执行，并保存 \cmd{LD\_DEBUG=bindings}、\filepath{/proc/<pid>/maps} 或调试器中 GOT slot 的前后值。没有运行证据时，只能说“该二进制将通过 \code{R\_X86\_64\_JUMP\_SLOT} 支持动态绑定”，不能声称已经观测到某次运行的 lazy binding。
+
 \section{窄整数参数和高位问题}
 
 很多函数参数不是 64 位整数，而是 \code{bool}、\code{char}、\code{short}、\code{int}、枚举、小整数 typedef。它们在 ABI 层仍然占用通用寄存器位置，但有效位宽和高位解释需要小心。读汇编时，如果只看到 \register{rdi}、\register{rsi} 这类 64 位寄存器名，就直接把参数当成完整 64 位值，很容易误判。

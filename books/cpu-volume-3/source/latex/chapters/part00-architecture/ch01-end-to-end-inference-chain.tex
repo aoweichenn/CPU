@@ -298,6 +298,75 @@ ServiceSloReport:
 
 有了这些字段，才谈得上把第三册内容落到一个本地助手、RAG 服务、代码补全服务或批量摘要服务里。不同业务目标会选择不同 profile，但底层证据字段是同一套。
 
+\subsection{排队模型：吞吐够不等于 p95 够}
+
+Serving 最容易被平均值骗。一个模型离线测得 \code{20 tok/s}，不代表线上每个请求都能稳定低延迟。请求到达有波动，prompt 长度有波动，decode 长度有波动，prefill 和 decode 还会争同一组后端资源。只要利用率接近 1，排队等待就会迅速放大，p95/p99 会先崩。
+
+先用最小模型描述单个服务台：
+
+\[
+\rho = \lambda \times E[S]
+\]
+
+其中 \(\lambda\) 是请求到达率，\(E[S]\) 是平均服务时间，\(\rho\) 是利用率。若 \(\rho \ge 1\)，长期看队列必然增长；若 \(\rho\) 虽小于 1 但接近 1，稍微有长 prompt 或长输出，尾延迟就会明显上升。Little's Law 给出另一个必须检查的关系：
+
+\[
+L = \lambda \times W
+\]
+
+\(L\) 是系统中平均请求数，\(W\) 是请求在系统里的平均停留时间。这个式子不能直接告诉 p99，但能抓住一个硬约束：如果到达率不变而平均停留时间上升，系统内在途请求数一定上升；在推理服务里，这通常意味着 KV cache、队列内存和取消恢复压力一起上升。
+
+LLM serving 还要把一次请求拆成 prefill 和 decode：
+
+\begin{lstlisting}[numbers=none,caption={请求服务时间的最小拆分}]
+service_time_ms =
+  queue_wait_ms +
+  tokenizer_ms +
+  prefill_ms(prompt_tokens) +
+  first_sample_ms +
+  sum(decode_step_ms(context_i) for each generated token) +
+  stream_flush_ms
+\end{lstlisting}
+
+这里的 \code{decode\_step\_ms(context\_i)} 不是常数。前面 KV 账本已经说明，context 越长，每步至少要读更多历史 K/V。因此，同样生成 128 个 token，短 prompt 和长 prompt 的 decode 时间分布不同；同样 prompt，输出越长，后面的 token 也会越来越贵。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.25\linewidth}p{0.30\linewidth}p{0.31\linewidth}}
+\toprule
+现象 & 排队模型解释 & 工程动作 \\
+\midrule
+平均 tokens/s 高，p95 TTFT 高 & prefill 在队列里等待合批或后端空闲 & 分离 prefill/decode 队列，限制 batch 等待 \\
+decode p99 随并发突增 & 利用率接近 1，长输出占住 decode slot & admission control，max new tokens，抢占或分片 \\
+长上下文请求拖慢全部请求 & 单步 decode 服务时间随 \(S\) 上升 & context 分桶调度，KV 预算隔离 \\
+取消后内存仍高 & in-flight 请求未及时释放 KV/page & cancellation barrier，session epoch，回收审计 \\
+队列满但 GPU 利用率不高 & CPU tokenizer、sampler、拷贝或锁成为服务台 & 分阶段 trace，拆服务台利用率 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{continuous batching 的取舍。} Continuous batching 把不同请求的 decode step 组合到同一批执行，提高后端利用率。它的代价是调度器每步都要决定哪些 session 进入 batch，如何处理刚完成 prefill 的请求，如何处理取消、超时和不同 context 长度。它改善吞吐，但可能增加单请求等待，尤其是短请求被长请求反复同批拖住时。
+
+\topic{paged KV 的 SLO 意义。} Paged KV 不只是 kernel layout。它让 session 的 KV cache 可以按 block 分配、释放和复用，降低变长请求造成的碎片；也让 prefix cache 和迁移更容易。但它把一个连续地址公式换成 block table 查找，profile 必须同时记录 block 命中、page 分布、释放延迟和 slot epoch。否则，paged KV 的正确性 bug 会表现成偶发 logits 漂移，性能 bug 会表现成 p99 decode 抖动。
+
+\topic{admission control 不是简单限流。} 接收请求前要估算两类资源：静态资源是否够，例如 KV 最大容量、workspace 和队列长度；动态资源是否会把利用率推到危险区，例如预计 prefill 时间、预计 decode token 数、当前 in-flight decode step。一个实用的 admission report 至少要多写几行：
+
+\begin{lstlisting}[numbers=none,caption={带排队模型的 admission report}]
+AdmissionEstimate:
+  arrival_rate_1m
+  inflight_requests
+  queue_depth
+  estimated_prefill_ms
+  estimated_decode_ms_p50
+  estimated_decode_ms_p95
+  estimated_kv_bytes
+  projected_utilization
+  projected_ttft_p95
+  decision: accept | reject | shed | retry_after
+\end{lstlisting}
+
+若报告没有 \code{projected\_utilization} 和 \code{queue\_depth}，它只能解释“内存够不够”，不能解释“接了这个请求后 p95 会不会炸”。若没有 \code{estimated\_kv\_bytes}，它只能解释排队，不能解释为什么取消恢复和长上下文会造成内存压力。
+
 \subsection{错误也要沿链路定位}
 
 链路完整的好处是错误能定位。若生成结果不对，不要直接怀疑 sampler 或模型质量，而要按链路缩小范围：

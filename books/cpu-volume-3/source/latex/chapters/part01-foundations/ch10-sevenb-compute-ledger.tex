@@ -266,6 +266,102 @@ MQA & 1 & 64 MiB & 64 MiB \\
 
 但这不是免费午餐。更少的 KV heads 改变模型结构和质量边界；更少的唯一 KV 元素也不保证 kernel 实际读流等比例下降。报告必须同时写“模型结构账本”和“kernel 实测账本”：前者来自 descriptor，后者来自 benchmark、profile 或至少来自代码地址流审计。
 
+\subsection{三种 decode attention 读流：朴素、分组复用和分页}
+
+上一节的表只给出容量和唯一元素下界。真正做后端时，还要把 kernel 的读取顺序写出来。对 GQA 7B，\code{n\_q=32,n\_kv=8}，每个 KV head 服务 4 个 query head。三种实现的字节账本完全不同。
+
+\topic{朴素 per-query-head 扫描。} 最直接的写法是外层遍历 query head，内层扫全部历史位置：
+
+\begin{lstlisting}[numbers=none,caption={朴素 GQA decode attention 读流}]
+for qh in 0..n_q:
+  kvh = qh / (n_q / n_kv)
+  for pos in 0..S:
+    read K[layer, pos, kvh, :]
+    score[pos] = dot(Q[qh, :], K[pos, kvh, :])
+  probs = softmax(score)
+  for pos in 0..S:
+    read V[layer, pos, kvh, :]
+    out[qh, :] += probs[pos] * V[pos, kvh, :]
+\end{lstlisting}
+
+这个版本数学上正确，却可能把同一个 KV head 的 K/V 为同组 4 个 query head 重读 4 次。模型结构用了 GQA，kernel 读流却接近 MHA。
+
+\topic{按 KV head 分组复用。} 更好的 CPU/GPU kernel 会把同一个 KV head 下的 query head 分成一组。每次读取一个历史 K/V 向量后，给 4 个 query head 同时使用。这样唯一 K/V 读流接近下界，但代价是寄存器、accumulator 和 softmax 状态更多：
+
+\begin{lstlisting}[numbers=none,caption={按 KV head 分组的读流}]
+for kvh in 0..n_kv:
+  q_group = query_heads_mapped_to(kvh)  // 4 heads
+  for pos in 0..S:
+    k = read K[layer, pos, kvh, :]
+    update score for all qh in q_group
+  online_softmax_or_materialized_softmax(q_group)
+  for pos in 0..S:
+    v = read V[layer, pos, kvh, :]
+    update out for all qh in q_group
+\end{lstlisting}
+
+分组复用不是免费。若 4 个 query head 的 score 全部物化，临时内存仍是 \([group,S]\)；若用 online softmax，要维护每个 query head 的 running max、running sum 和 partial output。它节省的是历史 K/V 重读，不是消除 attention 计算。
+
+\topic{paged KV attention。} Paged KV 把连续逻辑位置映射到物理 block/page。它解决的是多 session、变长上下文、prefix 共享和内存碎片问题，不会让历史 K/V 本身消失。读流会多一层 block table：
+
+\begin{lstlisting}[numbers=none,caption={paged KV 的额外地址流}]
+for logical_pos in visible_range:
+  block_id     = block_table[logical_pos / block_size]
+  block_offset = logical_pos % block_size
+  physical     = kv_pages[block_id] + block_offset * kv_stride
+  read K/V from physical
+\end{lstlisting}
+
+如果 block table 常驻 cache，这层开销可能很小；如果 session 很多、block table 和 KV page 分散、访问跨 NUMA 或跨 GPU page，paged layout 会增加 TLB、cache 和地址计算压力。paged attention 的正确评价不是“分页一定快”，而是看它用少量间接寻址换来了更高并发和更低碎片。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.23\linewidth}p{0.25\linewidth}p{0.25\linewidth}p{0.15\linewidth}}
+\toprule
+实现形态 & K/V 主读流 & 额外读写 & 适合场景 \\
+\midrule
+per-query 扫描 & 接近 \code{n\_q} 重读 & score 临时简单 & 教学 baseline \\
+按 KV head 分组 & 接近 \code{n\_kv} 下界 & 多 head softmax 状态 & GQA/MQA decode \\
+online softmax & 不物化完整 score & running max/sum/out & 长上下文、显存紧张 \\
+paged KV & K/V 仍按历史读取 & block table、page stride & 多 session serving \\
+FlashAttention 风格 tile & 减少 score/HBM 往返 & tile 状态和同步 & prefill、大块 attention \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里要小心一个常见误解：FlashAttention 风格的在线 softmax/tile 技术主要减少 score 矩阵和中间概率的物化、提高片上复用。对 decode 单 token，它通常不能突破“历史 K/V 必须被读到”的下界；它能做的是避免把 \([n_q,S]\) score/prob 写回大内存，并改善 query head 分组、tile 和 cache/shared memory 复用。长上下文 decode 的第一性瓶颈仍然要从 KV bytes/token 开始算。
+
+\subsection{把 attention 读流写进 profiler schema}
+
+Attention benchmark 只报 \code{tokens/s} 不够。至少要让 profiler 输出下面这些字段，才能区分“模型结构账本”和“kernel 实际读流”：
+
+\begin{lstlisting}[numbers=none,caption={decode attention profile 的关键字段}]
+DecodeAttentionProfile:
+  layer
+  context_length
+  q_heads
+  kv_heads
+  head_dim
+  kv_dtype
+  layout: contiguous | paged
+  kernel_mode: per_query | grouped_kv | online_softmax | library
+  kv_unique_bytes_lower_bound
+  kv_estimated_read_bytes
+  score_temp_bytes
+  block_table_bytes
+  q_group_size
+  tile_size
+  elapsed_us
+  effective_kv_bandwidth_gbps
+  correctness_oracle: score | prob | attn_out | logits
+\end{lstlisting}
+
+若 \code{kv\_estimated\_read\_bytes / kv\_unique\_bytes\_lower\_bound} 接近 \(n_q/n_{kv}\)，说明 GQA 的结构收益没有被 kernel 读流吃到。若 \code{score\_temp\_bytes} 随 \(S\) 很大，说明没有使用 online softmax 或 tile 内归约。若 \code{block\_table\_bytes} 很小但耗时仍高，问题更可能在 K/V 主读流、TLB、NUMA、GPU page locality 或线程组织，而不是 block table 本身。
+
+\begin{warningbox}
+Paged KV、FlashAttention 风格 online softmax 和 GQA 是三类不同优化：paged KV 管内存管理和并发，online softmax 管中间矩阵物化，GQA 管模型结构里的 KV heads 数量。把它们混成一句“attention 优化了”，会让性能报告失去诊断能力。
+\end{warningbox}
+
 \subsection{prefill 和 decode 不是同一账本}
 
 prefill 处理整个 prompt。若 prompt 长度 \code{T=512}，一层 linear 变成 \code{[512,H] x [H,O]} 的矩阵乘。权重被同一批 token 复用，GEMM 能更好利用计算单元。decode 每步 \code{T=1}，权重复用少，容易被权重读流限制。
