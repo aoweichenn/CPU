@@ -2,9 +2,21 @@ CPU_BOOK_DIR := books/cpu-volume-1
 CPU_LATEX_DIR := $(CPU_BOOK_DIR)/source/latex
 CPU2_BOOK_DIR := books/cpu-volume-2
 CPU2_LATEX_DIR := $(CPU2_BOOK_DIR)/source/latex
+CPU3_BOOK_DIR := books/cpu-volume-3
+CPU3_LATEX_DIR := $(CPU3_BOOK_DIR)/source/latex
 ALGO_BOOK_DIR := books/algorithm-interview
+EXPORT_ROOT := book-exports
+CPU_EXPORT_DIR := $(EXPORT_ROOT)/从C++到计算系统第一册
+CPU2_EXPORT_DIR := $(EXPORT_ROOT)/从C++到计算系统第二册
+CPU3_EXPORT_DIR := $(EXPORT_ROOT)/从C++到AI计算第三册
+CPU_EXPORT_NAME := 从C++到计算系统第一册
+CPU2_EXPORT_NAME := 从C++到计算系统第二册
+CPU3_EXPORT_NAME := 从C++到AI计算第三册
+CPU_EPUB_NAME := cpu-volume-1
+CPU2_EPUB_NAME := cpu-volume-2
+CPU3_EPUB_NAME := cpu-volume-3
 
-.PHONY: all cpu-check cpu-pdf cpu-epub cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu2-check cpu2-pdf cpu2-epub cpu2-text-count cpu2-text-count-chapters cpu2-text-target algo-check algo-pdf algo-epub algo-text-count algo-text-target algo-test clean
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-text-count cpu3-text-count-chapters cpu3-text-target books-export algo-check algo-pdf algo-epub algo-text-count algo-text-target algo-test clean
 
 all: cpu-pdf cpu-epub
 
@@ -16,6 +28,9 @@ cpu-pdf:
 
 cpu-epub:
 	$(MAKE) -C $(CPU_LATEX_DIR) epub
+
+cpu-export: cpu-pdf cpu-epub
+	python3 tools/export_book.py --source $(CPU_LATEX_DIR) --dest "$(CPU_EXPORT_DIR)" --pdf-name "$(CPU_EXPORT_NAME)" --epub-name "$(CPU_EPUB_NAME)"
 
 cpu-text-count:
 	$(MAKE) -C $(CPU_LATEX_DIR) text-count
@@ -38,6 +53,9 @@ cpu2-pdf:
 cpu2-epub:
 	$(MAKE) -C $(CPU2_LATEX_DIR) epub
 
+cpu2-export: cpu2-pdf cpu2-epub
+	python3 tools/export_book.py --source $(CPU2_LATEX_DIR) --dest "$(CPU2_EXPORT_DIR)" --pdf-name "$(CPU2_EXPORT_NAME)" --epub-name "$(CPU2_EPUB_NAME)"
+
 cpu2-text-count:
 	$(MAKE) -C $(CPU2_LATEX_DIR) text-count
 
@@ -46,6 +64,29 @@ cpu2-text-count-chapters:
 
 cpu2-text-target:
 	$(MAKE) -C $(CPU2_LATEX_DIR) text-target
+
+cpu3-check:
+	$(MAKE) -C $(CPU3_LATEX_DIR) check
+
+cpu3-pdf:
+	$(MAKE) -C $(CPU3_LATEX_DIR) pdf
+
+cpu3-epub:
+	$(MAKE) -C $(CPU3_LATEX_DIR) epub
+
+cpu3-export: cpu3-pdf cpu3-epub
+	python3 tools/export_book.py --source $(CPU3_LATEX_DIR) --dest "$(CPU3_EXPORT_DIR)" --pdf-name "$(CPU3_EXPORT_NAME)" --epub-name "$(CPU3_EPUB_NAME)"
+
+cpu3-text-count:
+	$(MAKE) -C $(CPU3_LATEX_DIR) text-count
+
+cpu3-text-count-chapters:
+	$(MAKE) -C $(CPU3_LATEX_DIR) text-count-chapters
+
+cpu3-text-target:
+	$(MAKE) -C $(CPU3_LATEX_DIR) text-target
+
+books-export: cpu-export cpu2-export cpu3-export
 
 algo-check:
 	$(MAKE) -C $(ALGO_BOOK_DIR) check
@@ -68,4 +109,5 @@ algo-test:
 clean:
 	$(MAKE) -C $(CPU_LATEX_DIR) clean
 	$(MAKE) -C $(CPU2_LATEX_DIR) clean
+	$(MAKE) -C $(CPU3_LATEX_DIR) clean
 	$(MAKE) -C $(ALGO_BOOK_DIR) clean
