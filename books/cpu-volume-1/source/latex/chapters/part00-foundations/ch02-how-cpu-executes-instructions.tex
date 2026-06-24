@@ -214,6 +214,159 @@ x86-64 传统上有 ring 0 到 ring 3 的特权级。现代通用操作系统通
 
 这个边界不是 C++ 类型系统提供的，而是 CPU 和操作系统共同维护的。页表项里有 present、read/write、user/supervisor、execute disable 等权限位；CPU 在取指、load 和 store 时做地址翻译和权限检查。用户态访问 supervisor-only 页面，即使指针数值看起来是一个合法地址，也会触发异常；用户态向只读映射写入，或者从 NX 页面取指，也会触发异常。这就是为什么 \filepath{/proc/<pid>/maps} 中的 \code{r-xp}、\code{rw-p} 和匿名映射权限，不只是调试显示，而是会被硬件检查真正执行。
 
+\subsection{ring 0、ring 3 和 CPL：权限不是口头约定}
+
+x86-64 的特权级不是“内核更厉害”这种口头约定，而是进入每条指令时 CPU 都能看到的状态。当前代码段选择子 \register{cs} 的低两位给出 \term{CPL}{current privilege level，当前特权级}。Linux 用户进程通常在 CPL=3，内核代码通常在 CPL=0。ring 1 和 ring 2 在现代通用 Linux 用户/内核模型里基本不用。
+
+long mode 下，分段地址转换大多被弱化，但代码段选择子和特权检查仍然存在。CPU 取指时知道当前 \register{cs}，因此知道当前 CPL；执行某些敏感指令时，会检查 CPL 是否足够高。比如修改 \register{cr3}、加载 IDT/GDT、关中断、执行某些 I/O 指令、改控制寄存器，都不是普通 ring 3 程序可以随便做的事。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.30\linewidth}p{0.36\linewidth}}
+\toprule
+概念 & 它来自哪里 & 工程含义 \\
+\midrule
+CPL & 当前 \register{cs} 选择子的低两位 & 当前代码以哪个特权级执行 \\
+DPL & descriptor 或 gate 中的目标特权级/访问要求 & 用户态能否通过某个门或访问某类段描述符 \\
+RPL & selector 中请求方显式携带的低两位 & 参与某些权限检查，防止借高权限 selector 绕过检查 \\
+ring 3 & 用户态代码常用 CPL & 不能直接改全局机器状态或访问 supervisor 页 \\
+ring 0 & 内核代码常用 CPL & 可以管理页表、中断、设备和调度，但仍要验证用户输入 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这解释了为什么系统调用、异常和中断不是“跳到另一个函数”这么简单。普通 \instruction{call} 不会改变 CPL；它只是按 ABI 在同一特权级内修改 \register{rip} 和用户栈。真正从 ring 3 到 ring 0，要通过 CPU 认可的入口机制：\instruction{syscall}、IDT gate、某些 \instruction{int n} 软件陷入，或硬件异常/中断。入口机制必须同时解决三件事：目标内核地址从哪里来、内核栈从哪里来、用户态返回状态保存在哪里。
+
+\subsection{页表权限位：P、R/W、U/S、NX 怎样约束每次访问}
+
+用户进程看到的是虚拟地址。x86-64 通过多级页表把虚拟地址翻译成物理页框，\register{cr3} 指向当前地址空间的顶层页表。TLB 缓存最近的翻译结果，但缓存的不只是物理地址，也包括权限。一次取指、load 或 store 是否允许，取决于页表路径上各级 entry 的组合权限，而不是只看最后一级 PTE。
+
+最小读法如下：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.16\linewidth}p{0.35\linewidth}p{0.33\linewidth}}
+\toprule
+权限位 & 含义 & 失败时常见现象 \\
+\midrule
+P/present & 页表项是否有效 & P=0 时访问触发 not-present page fault；可能是合法缺页，也可能是非法地址 \\
+R/W & 是否允许写入 & 用户或内核写只读页会触发 protection fault，COW 也从写只读页开始 \\
+U/S & 是否允许用户态访问 & CPL=3 访问 supervisor 页触发 fault，即使虚拟地址存在 \\
+NX/XD & 是否禁止取指执行 & 数据页取指、栈上执行代码、W\&X 违规会触发取指 fault \\
+A/D & accessed/dirty 记录 & OS 可用来做换页、回收和脏页管理，通常不是用户直接设置 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+多级页表权限要按路径理解：如果任一级把页面标成 supervisor，用户态就不能访问；如果任一级不允许写，最终写入也不能通过；如果最终可执行性被 NX 禁止，取指会失败。大页映射只是把较高层 entry 当作叶子，权限检查原则不变。
+
+\begin{lstlisting}[numbers=none,caption={页表权限检查的更细状态机}]
+AddressGenerated:
+  instruction forms a canonical virtual address
+
+PageWalkOrTLB:
+  translate through CR3-rooted page tables or cached TLB entry
+
+PermissionFold:
+  combine present, writable, user/supervisor and NX permissions
+
+AccessKindCheck:
+  fetch checks execute permission
+  load checks read/user permission
+  store checks write/user permission
+
+Result:
+  access completes, or CPU raises #PF with an error code
+\end{lstlisting}
+
+\#PF 的 error code 也有结构，不是一个普通 errno。它至少区分“页不存在”还是“权限保护失败”、访问是读还是写、访问发生在用户态还是内核态、是否是取指失败等。不同资料和 CPU 扩展会增加更多位，但第一册要先掌握下面这些最常用字段：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.13\linewidth}p{0.25\linewidth}p{0.45\linewidth}}
+\toprule
+位 & 常见名字 & 解释 \\
+\midrule
+0 & P & 0 表示 not-present，1 表示 protection violation \\
+1 & W/R & 1 表示写访问导致，0 表示读或取指相关访问 \\
+2 & U/S & 1 表示 CPL=3 用户态访问导致，0 表示 supervisor 访问导致 \\
+3 & RSVD & 页表保留位被错误设置 \\
+4 & I/D & 取指访问导致，常见于 NX 或不可执行映射 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以看到 \code{SIGSEGV} 或 page fault 计数时，系统性分析要问：虚拟地址是否 canonical；VMA 是否存在；页表项是否 present；访问类型是读、写还是取指；当前 CPL 是用户态还是内核态；失败是权限还是缺页。只有这些问题回答完，才谈得上空指针、越界、UAF、NX、COW 或栈保护页。
+
+\subsection{IDT、trap gate 和 interrupt gate：异常/中断怎样进入内核}
+
+x86-64 用 \term{IDT}{interrupt descriptor table，中断描述符表} 描述异常和中断入口。IDT 中每个向量对应一个 gate，gate 里有目标代码段、目标入口地址、DPL、present 位以及 gate 类型。CPU 收到事件后，根据向量查 IDT，做权限和状态切换，然后把控制流转到内核入口。
+
+常见入口可以分成三类：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.27\linewidth}p{0.37\linewidth}}
+\toprule
+入口 & 触发方式 & 关键区别 \\
+\midrule
+fault/trap exception & 当前指令导致，例如 page fault、breakpoint、divide error & 和当前 \register{rip} 有精确关系，有些会压入 error code \\
+external interrupt & 时钟、设备、IPI、PMU 等外部事件 & 异步打断当前控制流，常通过 interrupt gate 进入 \\
+software trap & 用户执行 \instruction{int n} 或调试断点 & gate DPL 决定用户态是否允许触发该入口 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+trap gate 和 interrupt gate 的一个重要差异是 IF 标志。通过 interrupt gate 进入时，CPU 会清除 RFLAGS.IF，避免普通可屏蔽中断立刻嵌套打进来；trap gate 通常不清 IF。调试断点这类 trap 更希望保留中断状态；设备中断路径则通常希望先屏蔽同级普通中断，等内核准备好后再重新打开。真实内核还会有更复杂的抢占、软中断和中断嵌套规则，但第一层模型要知道 gate 类型会改变入口状态。
+
+当事件从 ring 3 进入 ring 0，CPU 还必须换栈。x86-64 通常通过 TSS 中的 RSP0 或 IST 项选择一个内核栈，把用户态返回状态保存到内核栈上。若异常本身非常危险，例如 double fault，内核可能使用 IST 提供的专用栈，避免原内核栈也坏掉。
+
+\begin{lstlisting}[numbers=none,caption={IDT 入口的压缩状态机}]
+EventVector:
+  CPU identifies an exception or interrupt vector
+
+GateLookup:
+  read IDT[vector], check present bit, gate type, target segment and DPL
+
+PrivilegeChange:
+  if CPL changes from 3 to 0, load kernel stack from TSS.RSP0 or IST
+
+FrameBuild:
+  push/save user SS, RSP, RFLAGS, CS, RIP and maybe an error code
+
+KernelEntry:
+  jump to the gate target address in ring 0
+
+Return:
+  kernel eventually returns through iretq or delivers a signal/schedules away
+\end{lstlisting}
+
+这里的“push/save”是架构入口帧，不是 C++ 函数 prologue。普通函数 prologue 由编译器生成；IDT 入口帧由 CPU 按异常/中断规则建立；内核进入 C 函数前还会运行一段汇编入口代码保存更多寄存器。把这三者混为“栈帧”，会直接导致 backtrace、signal 和上下文切换分析混乱。
+
+\subsection{\instruction{syscall} 和 \instruction{int n}：两种陷入不是一回事}
+
+用户态进入内核不只有一种形态。现代 x86-64 Linux 的普通系统调用主要走 \instruction{syscall}/\instruction{sysret} 快路径；老式或特殊路径可能出现 \instruction{int 0x80}；调试断点常见 \instruction{int3}。它们都能从用户态转到内核或调试路径，但机制不同。
+
+\instruction{syscall} 不通过普通 IDT gate。CPU 从 MSR 中取得内核入口，例如 \code{IA32\_LSTAR}；把用户返回 \register{rip} 保存到 \register{rcx}，把用户 RFLAGS 保存到 \register{r11}，按 \code{IA32\_FMASK} 屏蔽一部分 flags，然后进入内核入口。它不自动在用户栈上压一个普通返回地址，也不自动构造和 IDT 完全一样的栈帧。内核入口汇编必须自己切换到合适内核栈、保存寄存器、处理 \code{swapgs} 等平台细节。
+
+\instruction{int n} 则通过 IDT gate。CPU 根据向量 n 查 gate，检查 DPL 是否允许当前 CPL 触发。例如用户态可以触发 DPL 允许的某些软件陷入；不允许的向量会触发保护异常。调试用的 \instruction{int3} 还有单字节编码 \code{cc}，便于调试器临时把某条指令第一个字节替换成断点。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+入口指令/事件 & 入口来源 & 保存和返回重点 \\
+\midrule
+\instruction{call} & 普通用户态目标地址 & 用户栈保存返回地址，\instruction{ret} 返回，不变 CPL \\
+\instruction{syscall} & MSR 配置的系统调用入口 & \register{rcx}/\register{r11} 保存返回信息，内核入口负责切栈 \\
+\instruction{int n} & IDT[n] gate & IDT 权限检查，可压入异常入口帧，通过 \instruction{iretq} 类路径返回 \\
+硬件中断 & IDT 向量 & 异步入口，可能切换到内核栈或 IST，返回或触发调度 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这也是为什么只看反汇编里的“跳转到某地址”不够。看到 \instruction{syscall}，要知道它跨越了普通 ABI；看到 \instruction{int3}，要知道它是调试 trap；看到 page fault，要知道那不是程序主动陷入，而是当前取指/load/store 无法完成。入口机制不同，能解释的性能、调试和安全结论也不同。
+
 \subsection{统一控制流边界模型：先问六个问题}
 
 普通程序不是只靠 \instruction{call}、\instruction{jmp} 和 \instruction{ret} 改变控制流。真实执行里还有系统调用、同步异常、异步中断、signal delivery、C++ 异常展开和调度切换。它们都能让当前线程离开“下一条源码语句”的直觉路径，但机制完全不同。若不先建立统一分类，后面看到 \code{SIGSEGV}、\code{EINTR}、page fault、perf 样本、栈回溯缺失和 p99 抖动时，很容易把不同层次混成一团。

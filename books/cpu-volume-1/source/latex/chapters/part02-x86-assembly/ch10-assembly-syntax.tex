@@ -1346,6 +1346,220 @@ return z - 2 = 3*x + 1
 本章不要求手工编码 x86 指令，但要求你不再把汇编文本当作最终执行物。机器码字节、指令长度和地址，是后续理解 \register{rip}、跳转、代码布局和前端性能的基础。
 \end{deepdive}
 
+\subsection{x86 编码的最小结构：prefix、opcode、ModRM、SIB、disp、imm}
+
+x86-64 编码历史很长，完整规则足够写成手册。本书不要求背表，但必须知道一条指令的字节通常由哪些字段拼成。否则你无法解释为什么 \instruction{mov eax, edi} 是 2 字节，\instruction{mov rax, rdi} 是 3 字节，\instruction{mov eax, dword ptr [rdi + rsi*4 + 8]} 又更长。
+
+一条常见指令可按下面顺序阅读：
+
+\begin{lstlisting}[numbers=none,caption={x86-64 指令编码的常见字段顺序}]
+legacy prefixes / REX prefix
+opcode bytes
+ModRM byte
+SIB byte
+displacement bytes
+immediate bytes
+\end{lstlisting}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+\toprule
+字段 & 作用 & 阅读重点 \\
+\midrule
+prefix & 改变宽度、段、重复、锁、向量扩展等 & \code{lock}、operand-size、REX、VEX/EVEX 都会影响语义或寄存器空间 \\
+opcode & 指令种类和一部分方向/宽度信息 & 决定这是 \instruction{mov}、\instruction{add}、\instruction{ret} 还是别的指令族 \\
+ModRM & 寄存器编号和寻址模式 & reg 字段、r/m 字段、mod 字段常决定寄存器或内存操作数 \\
+SIB & scale-index-base 地址公式 & 用于表达 \code{base + index * scale + displacement} \\
+displacement & 地址中的常量偏移 & 1/4 字节常见，RIP-relative 也用 disp32 \\
+immediate & 指令中的字面常量 & 如 \code{add eax, 7} 中的 7，或 \code{mov eax, 0x1234} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不是每条指令都有所有字段。\instruction{ret} 的 near return 是单字节 \code{c3}；\instruction{mov eax, edi} 有 opcode 和 ModRM；复杂内存寻址通常会有 ModRM、SIB 和 displacement；64 位寄存器或 \register{r8} 到 \register{r15} 往往需要 REX 前缀。
+
+\subsection{REX 前缀：64 位宽度和扩展寄存器从哪里来}
+
+x86-64 增加了 64 位寄存器和 \register{r8} 到 \register{r15}，但旧编码空间不够直接表达所有信息，于是引入 REX 前缀。REX 是 \code{0x40} 到 \code{0x4f} 的单字节前缀，低 4 位可理解为 W、R、X、B：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.12\linewidth}p{0.30\linewidth}p{0.42\linewidth}}
+\toprule
+位 & 作用 & 例子 \\
+\midrule
+W & 选择 64 位操作数宽度 & \code{48 89 f8} 常见为 \instruction{mov rax, rdi} \\
+R & 扩展 ModRM.reg 字段 & 访问 \register{r8}--\register{r15} 的某些位置 \\
+X & 扩展 SIB.index 字段 & 扩展 index 寄存器编号 \\
+B & 扩展 ModRM.r/m 或 SIB.base 字段 & 扩展 base 或 r/m 寄存器编号 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对比两个例子：
+
+\begin{lstlisting}[numbers=none,caption={32 位和 64 位 move 的字节差异}]
+89 f8        mov eax, edi
+48 89 f8     mov rax, rdi
+\end{lstlisting}
+
+第二条多出的 \code{48} 是 REX.W=1，表示 64 位操作数宽度。没有它，\code{89 f8} 写的是 \register{eax}，并按 x86-64 规则清零 \register{rax} 高 32 位；有 \code{48}，写的是完整 \register{rax}。这不是反汇编显示风格差异，而是实际机器码语义差异。
+
+扩展寄存器也依赖 REX。例如：
+
+\begin{lstlisting}[numbers=none,caption={扩展寄存器需要 REX 扩展位}]
+44 89 c0     mov eax, r8d
+41 89 f8     mov r8d, edi
+4c 89 c0     mov rax, r8
+\end{lstlisting}
+
+具体字节可能随汇编器选择的等价编码而变化，但原则稳定：看到 \register{r8}--\register{r15} 或 64 位通用寄存器操作时，要检查 REX 前缀。报告里只贴助记符不贴字节，就无法证明这些宽度和寄存器扩展细节。
+
+\subsection{ModRM：寄存器和寻址模式的三段位域}
+
+很多 x86 指令在 opcode 后跟一个 ModRM 字节。ModRM 可拆成三段：
+
+\begin{lstlisting}[numbers=none,caption={ModRM 字节的位域}]
+bits 7..6: mod
+bits 5..3: reg
+bits 2..0: r/m
+\end{lstlisting}
+
+以 \code{89 f8} 为例，\code{89} 是 \instruction{mov r/m32, r32} 一类编码；\code{f8} 二进制是 \code{11111000}：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.18\linewidth}p{0.46\linewidth}}
+\toprule
+字段 & 位值 & 含义 \\
+\midrule
+mod & \code{11} & 操作数是寄存器，不是内存寻址 \\
+reg & \code{111} & 源寄存器编号 7，即 \register{edi} \\
+r/m & \code{000} & 目标寄存器编号 0，即 \register{eax} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以 \code{89 f8} 可读成：把 reg 字段代表的 32 位寄存器 \register{edi} 移到 r/m 字段代表的 32 位寄存器 \register{eax}。同一个 ModRM 字段在不同 opcode 下可能扮演不同方向或含义，所以不能只看 ModRM，必须和 opcode 一起读。
+
+\subsection{SIB：base + index * scale + displacement 的来源}
+
+当内存操作数需要 base/index/scale 形式时，ModRM 后可能跟一个 SIB 字节。SIB 拆成：
+
+\begin{lstlisting}[numbers=none,caption={SIB 字节的位域}]
+bits 7..6: scale
+bits 5..3: index
+bits 2..0: base
+\end{lstlisting}
+
+例如下面这类指令：
+
+\begin{lstlisting}
+mov eax, dword ptr [rdi + rsi*4 + 8]
+\end{lstlisting}
+
+常见编码形态会包含 opcode、ModRM、SIB 和 1 字节 displacement。你可以用：
+
+\begin{lstlisting}[language=bash,caption={生成并拆一条 SIB 寻址指令}]
+cat > /tmp/sib.s <<'ASM'
+.intel_syntax noprefix
+.text
+.globl f
+f:
+    mov eax, dword ptr [rdi + rsi*4 + 8]
+    ret
+ASM
+clang -c /tmp/sib.s -o /tmp/sib.o
+objdump -drwC -Mintel /tmp/sib.o
+\end{lstlisting}
+
+报告里不要求你背出所有寄存器编号，但要能指出：某些字节在表达“这是内存操作数”；某个 SIB 字节在表达 scale=4、index=\register{rsi}、base=\register{rdi}；最后的 \code{08} 之类字节表达 displacement=8。这样你才能把汇编地址公式和机器码字节接上。
+
+注意两个常见陷阱。第一，\register{rsp} 或 \register{r12} 作为 base 时，经常强制出现 SIB 字节，即使你没有显式 index。第二，某些 r/m 编码组合表示 RIP-relative 或 disp32 特例，不是普通 base 寄存器。x86 编码是历史兼容产物，不能用“看起来应该规则”替代反汇编证据。
+
+\subsection{RIP-relative：位移相对下一条指令，不是当前地址}
+
+x86-64 常用 RIP-relative 访问全局数据、常量或 GOT 表项。语法可能显示为：
+
+\begin{lstlisting}
+mov eax, dword ptr [rip + 0x2f3a]
+\end{lstlisting}
+
+这里的有效地址不是“当前指令起始地址 + 0x2f3a”，而是“下一条指令地址 + 0x2f3a”。原因是 x86 相对位移通常以当前指令结束位置作为基准。跳转、调用和 RIP-relative data access 都要保留这个直觉。
+
+\begin{lstlisting}[numbers=none,caption={RIP-relative 地址计算模板}]
+instruction_start = A
+instruction_length = L
+next_rip = A + L
+encoded_disp32 = D
+effective_address = next_rip + sign_extend_64(D)
+\end{lstlisting}
+
+这会直接影响调试。若 \register{rip} 附近反汇编显示访问 \code{[rip + disp]}，你要先看该指令长度，再算目标地址；如果目标文件尚未链接，还要看重定位记录，因为 disp 可能只是占位。正确报告应同时贴：
+
+\begin{lstlisting}[numbers=none,caption={RIP-relative 证据包}]
+objdump -drwC -Mintel file.o
+readelf -r file.o
+nm -n file.o
+\end{lstlisting}
+
+只贴 \code{mov eax, [rip+0x0]} 往往是不完整的。目标文件里 \code{0x0} 可能只是等待链接器修补的 relocation 占位；链接后可执行文件里才会出现最终位移。
+
+\subsection{位移和立即数：小端序也会出现在指令里}
+
+x86 是小端机器，不只数据内存如此，指令中的多字节 displacement 和 immediate 也按小端顺序编码。例如：
+
+\begin{lstlisting}
+add eax, 0x12345678
+\end{lstlisting}
+
+机器码里的立即数字节通常会按 \code{78 56 34 12} 出现，而不是按文本顺序 \code{12 34 56 78}。这能解释为什么反汇编里的十六进制字节和助记符常量看起来“反过来”。
+
+\begin{lstlisting}[language=bash,caption={观察立即数小端编码}]
+cat > /tmp/imm.s <<'ASM'
+.intel_syntax noprefix
+.text
+.globl g
+g:
+    add eax, 0x12345678
+    ret
+ASM
+clang -c /tmp/imm.s -o /tmp/imm.o
+objdump -drwC -Mintel /tmp/imm.o
+\end{lstlisting}
+
+读机器码字节时要把“字节流顺序”和“数值显示”分开。CPU 按地址顺序取字节；解码器按 ISA 规则把后续若干字节解释成 little-endian 的位移或立即数；反汇编器再把数值显示成人类习惯的十六进制。
+
+\subsection{编码证据报告：最少要贴什么}
+
+如果一份报告声称“这里用了 RIP-relative”“这里是 64 位寄存器写”“这里访问 \register{r8}”“这里的分支目标是某个地址”，最少应给出：
+
+\begin{itemize}
+  \item 反汇编命令和工具版本。
+  \item 指令地址、机器码字节和反汇编文本。
+  \item 若有符号或全局访问，附 \code{readelf -r} 的重定位记录。
+  \item 对 REX、ModRM、SIB、disp、imm 中和结论相关的字段做最小解释。
+  \item 写清哪些是机器码直接证明的事实，哪些是结合源码或符号表的推论。
+\end{itemize}
+
+例如：
+
+\begin{lstlisting}[numbers=none,caption={编码证据记录示例}]
+bytes:
+  48 8b 44 b7 08
+text:
+  mov rax, qword ptr [rdi + rsi*4 + 8]
+claim:
+  REX.W proves 64-bit destination width.
+  SIB proves scaled-index addressing is present.
+  objdump text gives the authoritative decoded address formula.
+boundary:
+  This proves the machine address formula, not the C++ source type.
+\end{lstlisting}
+
+最后一句很重要。编码可以证明“机器码如何寻址”，不能单独证明“这是某个结构体字段”或“访问一定安全”。类型、安全性和性能瓶颈仍要回到源码、对象布局、运行时输入和测量证据。
+
 \section{读汇编的固定流程}
 
 以后每次读一个函数，按下面流程做笔记：
