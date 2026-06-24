@@ -13,6 +13,9 @@ pdf:
 
 epub:
 	@BOOK_TITLE="从 C++ 到 AI 计算：第三册" \
+	BOOK_IMPORT_TITLE="CPU Volume 3 AI Computing" \
+	BOOK_ID_SEED="cpu-volume-3-weread-20260624" \
+	EPUB_ASCII_TITLES=1 \
 	BOOK_SUBTITLE="张量、算子、量化与本地大模型推理引擎" \
 	BOOK_AUTHOR="CPU Performance Study" \
 	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables --wechat-compatible --no-embed-fonts

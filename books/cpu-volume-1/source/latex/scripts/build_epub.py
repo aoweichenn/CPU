@@ -27,8 +27,11 @@ BOOK_TITLE = os.environ.get("BOOK_TITLE", "从 C++ 到机器执行：第一册")
 BOOK_SUBTITLE = os.environ.get("BOOK_SUBTITLE", "底层原理、汇编接口与可信性能测量")
 BOOK_AUTHOR = os.environ.get("BOOK_AUTHOR", "CPU Performance Study")
 BOOK_LANG = os.environ.get("BOOK_LANG", "zh-CN")
+BOOK_IMPORT_TITLE = os.environ.get("BOOK_IMPORT_TITLE", BOOK_TITLE)
+BOOK_ID_SEED = os.environ.get("BOOK_ID_SEED", BOOK_IMPORT_TITLE)
 EPUB_LINEARIZE_TABLES = os.environ.get("EPUB_LINEARIZE_TABLES", "").lower() in {"1", "true", "yes", "on"}
 WECHAT_COMPATIBLE = os.environ.get("EPUB_WECHAT_COMPATIBLE", "").lower() in {"1", "true", "yes", "on"}
+EPUB_ASCII_TITLES = os.environ.get("EPUB_ASCII_TITLES", "").lower() in {"1", "true", "yes", "on"}
 
 BOX_TITLES = {
     "keyidea": "核心思想",
@@ -1009,7 +1012,14 @@ def safe_output_name(source: Path, book_dir: Path) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", "-".join(rel.parts)) + ".xhtml"
 
 
-def xhtml_page(title: str, body: str, legacy_markup: bool = False, inline_css: str = "") -> str:
+def display_title(title: str, fallback: str) -> str:
+    if not EPUB_ASCII_TITLES:
+        return title
+    return fallback
+
+
+def xhtml_page(title: str, body: str, legacy_markup: bool = False, inline_css: str = "", file_title: str = "") -> str:
+    page_title = display_title(title, file_title or "item")
     doctype = "" if legacy_markup else "<!DOCTYPE html>"
     charset_meta = (
         '<meta http-equiv="Content-Type" content="application/xhtml+xml; charset=utf-8" />'
@@ -1026,7 +1036,7 @@ def xhtml_page(title: str, body: str, legacy_markup: bool = False, inline_css: s
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{BOOK_LANG}" lang="{BOOK_LANG}">
 <head>
   {charset_meta}
-  <title>{html.escape(title)}</title>
+  <title>{html.escape(page_title)}</title>
 {stylesheet_markup}
 </head>
 <body>
@@ -1061,7 +1071,7 @@ def cover_page(legacy_markup: bool = False, inline_css: str = "") -> str:
   <p class="author">{html.escape(BOOK_AUTHOR)}</p>
 </{wrapper}>
 '''
-    return xhtml_page(BOOK_TITLE, body, legacy_markup=legacy_markup, inline_css=inline_css)
+    return xhtml_page(BOOK_TITLE, body, legacy_markup=legacy_markup, inline_css=inline_css, file_title="cover")
 
 
 def part_page(part: PartNode, legacy_markup: bool = False, inline_css: str = "") -> str:
@@ -1077,7 +1087,7 @@ def part_page(part: PartNode, legacy_markup: bool = False, inline_css: str = "")
   <ol>{items}</ol>
 </{wrapper}>
 '''
-    return xhtml_page(part.title, body, legacy_markup=legacy_markup, inline_css=inline_css)
+    return xhtml_page(part.title, body, legacy_markup=legacy_markup, inline_css=inline_css, file_title=part.output)
 
 
 def convert_source(entry: SourceEntry, legacy_markup: bool = False, inline_css: str = "") -> str:
@@ -1091,7 +1101,10 @@ def convert_source(entry: SourceEntry, legacy_markup: bool = False, inline_css: 
         legacy_markup=legacy_markup,
     )
     body = converter.convert(source)
-    return xhtml_page(entry.nav_title or entry.title, body, legacy_markup=legacy_markup, inline_css=inline_css)
+    title = entry.nav_title or entry.title
+    if legacy_markup and entry.kind == "chapter" and entry.label and "<h1>" not in body:
+        body = f"<h1>{LatexInline().convert(title)}</h1>\n{body}"
+    return xhtml_page(title, body, legacy_markup=legacy_markup, inline_css=inline_css, file_title=entry.output)
 
 
 def find_book_dir(source: Path) -> Path:
@@ -1158,6 +1171,19 @@ def build_nav(entries: list[SourceEntry], parts: list[PartNode]) -> str:
   {"".join(lines)}
 </nav>
 '''
+    return f'''<?xml version="1.0" encoding="utf-8"?>
+<!DOCTYPE html>
+<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{BOOK_LANG}" lang="{BOOK_LANG}">
+<head>
+  <meta charset="utf-8" />
+  <title>目录</title>
+  <link rel="stylesheet" type="text/css" href="styles/book.css" />
+</head>
+<body>
+{body}
+</body>
+</html>
+'''
 
 
 def build_legacy_toc(entries: list[SourceEntry], parts: list[PartNode], inline_css: str) -> str:
@@ -1184,20 +1210,7 @@ def build_legacy_toc(entries: list[SourceEntry], parts: list[PartNode], inline_c
     for entry in back:
         lines.append(f'<li><a href="{html.escape(entry.output, quote=True)}">{html.escape(entry.nav_title)}</a></li>')
     lines.append("</ol>")
-    return xhtml_page("目录", "\n".join(lines), legacy_markup=True, inline_css=inline_css)
-    return f'''<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html>
-<html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{BOOK_LANG}" lang="{BOOK_LANG}">
-<head>
-  <meta charset="utf-8" />
-  <title>目录</title>
-  <link rel="stylesheet" type="text/css" href="styles/book.css" />
-</head>
-<body>
-{body}
-</body>
-</html>
-'''
+    return xhtml_page("目录", "\n".join(lines), legacy_markup=True, inline_css=inline_css, file_title="toc")
 
 
 def flatten_nav(entries: list[SourceEntry]) -> list[SourceEntry]:
@@ -1222,7 +1235,7 @@ def build_ncx(entries: list[SourceEntry], uid: str) -> str:
     <meta name="dtb:totalPageCount" content="0"/>
     <meta name="dtb:maxPageNumber" content="0"/>
   </head>
-  <docTitle><text>{html.escape(BOOK_TITLE)}</text></docTitle>
+  <docTitle><text>{html.escape(BOOK_IMPORT_TITLE)}</text></docTitle>
   <navMap>
     {"".join(nav_points)}
   </navMap>
@@ -1278,7 +1291,7 @@ def build_opf(
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
     <dc:identifier id="bookid" opf:scheme="UUID">{uid}</dc:identifier>
-    <dc:title>{html.escape(BOOK_TITLE)}</dc:title>
+    <dc:title>{html.escape(BOOK_IMPORT_TITLE)}</dc:title>
     <dc:creator>{html.escape(BOOK_AUTHOR)}</dc:creator>
     <dc:language>{BOOK_LANG}</dc:language>
     <dc:date>{modified[:10]}</dc:date>
@@ -1296,7 +1309,7 @@ def build_opf(
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
     <dc:identifier id="bookid">urn:uuid:{uid}</dc:identifier>
-    <dc:title>{html.escape(BOOK_TITLE)}</dc:title>
+    <dc:title>{html.escape(BOOK_IMPORT_TITLE)}</dc:title>
     <dc:creator>{html.escape(BOOK_AUTHOR)}</dc:creator>
     <dc:language>{BOOK_LANG}</dc:language>
     <meta property="dcterms:modified">{modified}</meta>
@@ -1656,7 +1669,7 @@ def build_epub(
     entries, parts = collect_entries(book_dir, include_cover=include_cover, legacy_names=WECHAT_COMPATIBLE)
     fonts = [] if WECHAT_COMPATIBLE or not embed_fonts else collect_embedded_fonts()
     inline_css = legacy_stylesheet() if WECHAT_COMPATIBLE else ""
-    uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{BOOK_TITLE}"))
+    uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{BOOK_ID_SEED}"))
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     pages: dict[str, str] = {}
