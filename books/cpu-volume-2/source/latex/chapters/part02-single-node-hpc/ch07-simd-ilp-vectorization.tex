@@ -1095,6 +1095,65 @@ performance audit:
 
 SIMD 的工程成熟度不取决于写了多少 intrinsic，而取决于能否证明：语义相同，地址流更好，资源账本合理，端到端真的移动了瓶颈。
 
+\subsection{证据包：AArch64 NEON dot-product 的真实反汇编}
+
+下面这段 evidence 不是伪代码，而是在 AArch64 设备上编译一个 \code{dot4\_neon} 后得到的关键片段。输入长度为 8 时，程序输出 \code{240.0}，先证明语义没有丢。
+
+\begin{lstlisting}[numbers=none,caption={NEON dot-product 的源码轮廓}]
+extern "C" __attribute__((noinline))
+float dot4_neon(const float* a, const float* b, std::size_t n) {
+  float32x4_t acc = vdupq_n_f32(0.0f);
+  for (; i + 4 <= n; i += 4) {
+    float32x4_t va = vld1q_f32(a + i);
+    float32x4_t vb = vld1q_f32(b + i);
+    acc = vfmaq_f32(acc, va, vb);
+  }
+  float sum = vaddvq_f32(acc);
+  for (; i < n; ++i) sum += a[i] * b[i];
+  return sum;
+}
+\end{lstlisting}
+
+反汇编中能看到三个事实：主循环连续读取两个 \code{q} 向量，使用向量 FMA，最后做水平归约和 tail。
+
+\begin{lstlisting}[numbers=none,caption={objdump 关键片段}]
+00000000004007a0 <dot4_neon>:
+  4007c0: 3ce3681e  ldr   q30, [x0, x3]
+  4007c4: 3ce36822  ldr   q2,  [x1, x3]
+  4007c8: 91004063  add   x3, x3, #0x10
+  4007cc: 4e22cfc1  fmla  v1.4s, v30.4s, v2.4s
+  4007d0: eb04007f  cmp   x3, x4
+  4007d4: 54ffff61  b.ne  4007c0 <dot4_neon+0x20>
+  4007d8: 6e21d421  faddp v1.4s, v1.4s, v1.4s
+  4007e4: 6e21d421  faddp v1.4s, v1.4s, v1.4s
+\end{lstlisting}
+
+这段反汇编比“用了 NEON”更有信息量。每轮读取 \(2 \times 16\) 字节，做 4 个乘加，若按 multiply 和 add 分开算是 8 FLOPs。字节账本约为 \(8/32=0.25\) FLOP/byte，因此大数组上仍可能受内存带宽限制。向量指令降低的是循环和指令开销，不会消除输入数组的读流。
+
+tail path 也值得看。当前编译器在目标机器上为剩余元素生成了 predicate 风格的尾部：
+
+\begin{lstlisting}[numbers=none,caption={tail path 证据片段}]
+  4007f8: 25a20fe7  whilelo p7.s, wzr, w2
+  4007fc: a5435c1d  ld1w   {z29.s}, p7/z, [x0, x3, lsl #2]
+  400800: a5435c3f  ld1w   {z31.s}, p7/z, [x1, x3, lsl #2]
+  400804: 65829ffd  fmul   z29.s, p7/m, z29.s, z31.s
+  400808: 65983fa0  fadda  s0, p7, s0, z29.s
+\end{lstlisting}
+
+这说明“NEON 版本”在具体编译选项和机器能力下，可能混入 SVE 风格 tail。报告必须记录编译命令、ISA flag 和反汇编，而不是只写源码用了哪个 intrinsic。
+
+\subsection{PMU 降级：没有 counters 时怎样保留证据}
+
+同一环境下执行 \cmd{perf stat -e cycles,instructions} 返回：
+
+\begin{lstlisting}[numbers=none,caption={perf 不可用时的报告方式}]
+Error:
+No supported events found.
+Access to performance monitoring and observability operations is limited.
+\end{lstlisting}
+
+这不是“无法写报告”的理由。可用证据仍包括：输出 checksum、长度阶梯、反汇编指令形态、每轮 bytes/FLOPs 账本、wall time 多轮样本、编译命令和机器特征。结论要改写成“从反汇编和字节账本看，该 kernel 对大输入可能接近带宽路径；当前环境无法用 PMU 验证 IPC/cache miss”。这比伪造 IPC 更接近工程事实。
+
 \section{状态机：从标量循环到 SIMD kernel}
 
 向量化也可以写成状态机。这样能把“编译器是否向量化”和“手写 intrinsic 是否正确”放到同一张验收表里。

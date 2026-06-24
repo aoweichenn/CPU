@@ -488,6 +488,66 @@ fix:
 
 这个反例对应 AI 里的真实问题：tensor layout 若让 warp lane 跨 head 或跨 token 跳跃访问，GPU 后端会把显存带宽浪费在不合并访问上。layout propagation 不是 compiler 装饰，而是 GPU 性能条件。
 
+\subsection{证据包：没有 GPU profiler 时也能先算地址}
+
+GPU 工程不能等到有完整 profiler 才开始严谨。先用地址账本排除明显错误。假设 warp 有 32 个 lane，元素是 fp16，cache/memory transaction 粗略按 128B 对齐段理解。若 lane \(i\) 读取：
+
+\[
+addr_i = base + i \times 2
+\]
+
+32 个 lane 共读取 64B，通常落在一个 128B 段内，有效载荷至少在同一数量级。若 lane \(i\) 读取：
+
+\[
+addr_i = base + i \times 4096 \times 2
+\]
+
+每个 lane 跨 8192B，可能触碰 32 个不同段。两者计算量相同，访存事务数量却不是同一级别。即使没有 Nsight 或 rocprof，这个地址模型也足以判定第二种 warp mapping 很可疑。
+
+\begin{lstlisting}[numbers=none,caption={GPU 地址账本检查表}]
+lane_mapping:
+  lane id -> tensor index
+
+address_formula:
+  addr_i = base + logical_offset(i) * sizeof(dtype)
+
+transaction_estimate:
+  touched_segments
+  useful_bytes
+  loaded_bytes
+  useful_ratio
+
+required_profiler_fields:
+  global load efficiency
+  memory throughput
+  dram transactions
+  shared bank conflicts
+\end{lstlisting}
+
+这份账本和 AI compiler 的 layout propagation 直接相连。若 IR 只保存 shape，不保存 layout 和 stride，lowering 阶段无法判断 lane 是否连续；若 compiler 随意插入 transpose 或 view，GPU 后端可能从 coalesced 变成 scattered。
+
+\subsection{occupancy 账本的可手算示例}
+
+设一个 SM 最多 2048 threads、最多 32 resident blocks、寄存器总数 65536，每个 block 256 threads，每线程 64 registers，不用 shared memory。resident block 上限为：
+
+\[
+\left\lfloor\frac{2048}{256}\right\rfloor = 8
+\]
+
+\[
+\left\lfloor\frac{65536}{256 \times 64}\right\rfloor = 4
+\]
+
+因此寄存器把 resident blocks 限到 4。若把每线程寄存器降到 32，寄存器上限变成 8，但如果因此发生 spill，把局部值溢出到 global/local memory，性能可能更差。报告不能只写“occupancy 从 50\% 提到 100\%”，还要写 spill、memory throughput 和端到端阶段收益。
+
+\begin{lstlisting}[numbers=none,caption={occupancy 报告中的拒绝条件}]
+reject optimization if:
+  occupancy increases but local memory spill appears
+  achieved memory throughput drops
+  correctness oracle cannot dump intermediate tensor
+  TTFT/TPOT SLO worsens despite kernel microbenchmark win
+\end{lstlisting}
+
 \subsection{工业取舍：tensor core、launch 和可复现性}
 
 tensor core 适合形状足够大、dtype/layout 符合要求、tile 能铺满的矩阵。prefill 常能满足；单 session decode 常常是小 batch GEMV，利用率差。把多个 session 合批可以提高 tile 利用，但会引入排队等待、KV gather、变长 mask 和 SLO 取舍。若把 sampler 也搬到 GPU，还要处理 RNG 状态、top-k/top-p 排序稳定性和跨设备复现。

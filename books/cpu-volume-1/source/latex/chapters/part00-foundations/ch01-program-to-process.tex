@@ -1925,6 +1925,69 @@ cat /proc/$(pgrep app)/maps
 
 实验报告要回答五个问题：入口 interpreter 是谁；哪些共享库被加载；是否存在 lazy binding；\code{main} 前是否有全局构造日志；第一次业务调用是否和第二次调用处于同一状态。能回答这些问题，才算把“从文件到进程”的状态机真正跑通。
 
+\subsection{证据包：真实 ELF、符号和反汇编}
+
+本章的验收不能只停在“知道有 ELF”。下面是一台 AArch64 Linux 环境上对一个最小程序的真实证据片段。程序中保留一个 \code{noinline} 的 \code{add\_noinline}，目的是让符号和反汇编中有可追踪目标。
+
+\begin{lstlisting}[numbers=none,caption={最小证据命令}]
+g++ -O2 -g tiny.cpp -o tiny
+readelf -h tiny
+readelf -l tiny
+readelf -d tiny
+nm -C tiny
+objdump -d --demangle tiny
+perf stat -e cycles,instructions ./tiny
+\end{lstlisting}
+
+真实输出中最关键的字段如下：
+
+\begin{lstlisting}[numbers=none,caption={ELF 和动态链接证据片段}]
+ELF Header:
+  Class:   ELF64
+  Data:    2's complement, little endian
+  Type:    EXEC (Executable file)
+  Machine: AArch64
+  Entry point address: 0x400640
+
+INTERP:
+  [Requesting program interpreter: /lib/ld-linux-aarch64.so.1]
+
+Dynamic section:
+  NEEDED Shared library: [libstdc++.so.6]
+  NEEDED Shared library: [libm.so.6]
+  NEEDED Shared library: [libgcc_s.so.1]
+  NEEDED Shared library: [libc.so.6]
+\end{lstlisting}
+
+这些字段把状态机落到文件事实：\code{Entry point} 不是 \code{main}；\code{INTERP} 说明先由动态加载器接手；\code{NEEDED} 说明启动路径包含共享库解析。若冷启动 benchmark 没记录这些字段，就无法区分“业务 kernel 慢”和“加载/绑定/初始化慢”。
+
+\begin{lstlisting}[numbers=none,caption={符号和反汇编证据片段}]
+nm -C tiny:
+  0000000000400780 T add_noinline
+  00000000004005c0 T main
+
+objdump:
+  4005e8: 94000066  bl  400780 <add_noinline>
+
+0000000000400780 <add_noinline>:
+  400780: 0b010000  add w0, w0, w1
+  400784: d65f03c0  ret
+\end{lstlisting}
+
+这里可以把 C++、ABI 和机器指令连起来：AArch64 的整数参数在 \code{w0/w1}，返回值在 \code{w0}，\code{bl} 写入返回地址并跳转，\code{ret} 返回调用点。若优化器把函数 inline 掉，\code{nm} 和 \code{objdump} 会出现不同证据；这不是工具坏了，而是优化状态变了。
+
+\subsection{PMU 不可用也是证据}
+
+同一环境中，\cmd{perf stat} 可能返回：
+
+\begin{lstlisting}[numbers=none,caption={PMU 权限或平台受限时的真实形态}]
+Error:
+No supported events found.
+Access to performance monitoring and observability operations is limited.
+\end{lstlisting}
+
+这时报告不能编造 cycles、instructions 或 cache miss。正确降级是保存 \code{readelf}/\code{objdump}、输入 checksum、阶段时间、循环次数、机器信息和源码版本；结论也要写窄：可以说“反汇编显示热循环确实调用了目标函数”，不能说“IPC 证明瓶颈在前端”。经典系统教材强调证据边界，原因就在这里。
+
 \section{反例：看似合理但错误的理解}
 
 \begin{warningbox}

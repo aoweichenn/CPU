@@ -624,6 +624,46 @@ TPOT =
 
 因此“GPU 利用率提高”不自动等于 SLO 改善。若连续合批把 TPOT p50 降低，却让 TTFT p95 暴涨，就要按业务目标重新设置 admission 和 batching window。
 
+\subsection{证据包：一份可复查的 serving CSV}
+
+服务化章节必须落到 artifact。下面的 CSV 不是为了模拟完整线上系统，而是规定最小证据字段：队列、prefill、decode、stream、KV 预算和结束原因必须分开。
+
+\begin{lstlisting}[numbers=none,caption={最小 serving trace CSV}]
+request_id,prompt_tokens,max_new,arrival_ms,admit_ms,finish_ms,ttft_ms,tpot_p95_ms,kv_reserved,kv_written,queue_wait_ms,prefill_ms,decode_steps,finish_reason
+r1,32,16,0,0,185,42,8.9,1572864,393216,0,31,16,completed
+r2,2048,8,3,18,620,440,18.5,100663296,8421376,15,401,8,completed
+r3,64,128,4,0,97,0,0,12582912,0,0,0,0,rejected_kv_budget
+r4,128,64,9,21,260,73,12.1,12582912,2097152,12,52,17,client_gone
+\end{lstlisting}
+
+这份表能训练三个判断。第一，\code{r2} 的 TTFT 高主要来自长 prompt 的 prefill，而不是 decode step 慢；第二，\code{r3} 在 admission 阶段被拒绝，比 decode 中途 OOM 更可控；第三，\code{r4} 必须能证明客户端断开后释放了未写入的 KV 预留。若 trace 没有 \code{kv\_reserved} 和 \code{kv\_written}，事故复盘会退化成猜。
+
+\subsection{队列验收：用公式压住“平均值幻觉”}
+
+给定一个 60 秒窗口，若到达 1200 个请求，则 \(\lambda=20\) requests/s。若平均端到端停留时间 \(W=180ms=0.18s\)，Little's Law 给出平均系统内请求数：
+
+\[
+L=\lambda W = 20 \times 0.18 = 3.6
+\]
+
+这个数若和 trace 中平均 in-flight 请求数差很远，说明窗口、时间戳或采样口径有问题。再看 tail：如果 p50 TTFT 是 40ms，p95 TTFT 是 440ms，不能用平均 tokens/s 宣称服务健康。服务报告至少要包含：
+
+\begin{lstlisting}[numbers=none,caption={SLO 验收字段}]
+arrival_rate_rps
+admission_reject_rate
+queue_wait_p50_p95_p99
+ttft_p50_p95_p99
+tpot_p50_p95_p99
+prefill_batch_size_histogram
+decode_batch_size_histogram
+kv_reserved_peak
+kv_written_peak
+client_cancel_count
+fallback_backend_count
+\end{lstlisting}
+
+continuous batching 的正确目标不是“batch 越大越好”，而是在业务 SLO 下最大化吞吐。若 batching window 从 2ms 增到 20ms，让吞吐提升 15\%，但 TTFT p95 从 120ms 变成 700ms，这可能对离线任务合理，对交互式聊天不合理。调度器必须把业务目标写进 policy，而不是只追硬件利用率。
+
 \subsection{工程事故：KV 预算只算已用，不算已预留}
 
 一个常见线上事故是：系统只统计已经写入的 KV bytes，没有统计 admitted request 未来保留的 token。短时间内多个长上下文请求同时进入，decode 到一半才发现 KV 不够，只能中止请求或触发 OOM。正确做法是在 admission 阶段按最大上下文或保守 token budget 预留，并在取消、结束或缩短输出时归还。
