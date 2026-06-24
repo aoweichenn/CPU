@@ -1009,17 +1009,17 @@ def safe_output_name(source: Path, book_dir: Path) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", "-".join(rel.parts)) + ".xhtml"
 
 
-def xhtml_page(title: str, body: str, legacy_markup: bool = False) -> str:
-    doctype = (
-        '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
-        '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
-        if legacy_markup
-        else "<!DOCTYPE html>"
-    )
+def xhtml_page(title: str, body: str, legacy_markup: bool = False, inline_css: str = "") -> str:
+    doctype = "" if legacy_markup else "<!DOCTYPE html>"
     charset_meta = (
         '<meta http-equiv="Content-Type" content="application/xhtml+xml; charset=utf-8" />'
         if legacy_markup
         else '<meta charset="utf-8" />'
+    )
+    stylesheet_markup = (
+        f'  <style type="text/css">\n{html.escape(inline_css)}\n  </style>'
+        if inline_css
+        else '  <link rel="stylesheet" type="text/css" href="styles/book.css" />'
     )
     page = f'''<?xml version="1.0" encoding="utf-8"?>
 {doctype}
@@ -1027,7 +1027,7 @@ def xhtml_page(title: str, body: str, legacy_markup: bool = False) -> str:
 <head>
   {charset_meta}
   <title>{html.escape(title)}</title>
-  <link rel="stylesheet" type="text/css" href="styles/book.css" />
+{stylesheet_markup}
 </head>
 <body>
 {body}
@@ -1052,7 +1052,7 @@ def normalize_legacy_xhtml(page: str) -> str:
     return page
 
 
-def cover_page(legacy_markup: bool = False) -> str:
+def cover_page(legacy_markup: bool = False, inline_css: str = "") -> str:
     wrapper = "div" if legacy_markup else "section"
     body = f'''
 <{wrapper} class="cover">
@@ -1061,10 +1061,10 @@ def cover_page(legacy_markup: bool = False) -> str:
   <p class="author">{html.escape(BOOK_AUTHOR)}</p>
 </{wrapper}>
 '''
-    return xhtml_page(BOOK_TITLE, body, legacy_markup=legacy_markup)
+    return xhtml_page(BOOK_TITLE, body, legacy_markup=legacy_markup, inline_css=inline_css)
 
 
-def part_page(part: PartNode, legacy_markup: bool = False) -> str:
+def part_page(part: PartNode, legacy_markup: bool = False, inline_css: str = "") -> str:
     wrapper = "div" if legacy_markup else "section"
     items = "\n".join(
         f'<li><a href="{html.escape(child.output, quote=True)}">{html.escape(child.nav_title)}</a></li>'
@@ -1077,10 +1077,10 @@ def part_page(part: PartNode, legacy_markup: bool = False) -> str:
   <ol>{items}</ol>
 </{wrapper}>
 '''
-    return xhtml_page(part.title, body, legacy_markup=legacy_markup)
+    return xhtml_page(part.title, body, legacy_markup=legacy_markup, inline_css=inline_css)
 
 
-def convert_source(entry: SourceEntry, legacy_markup: bool = False) -> str:
+def convert_source(entry: SourceEntry, legacy_markup: bool = False, inline_css: str = "") -> str:
     assert entry.source is not None
     source = expand_source_inputs(entry.source, find_book_dir(entry.source))
     converter = LatexBlockConverter(
@@ -1091,7 +1091,7 @@ def convert_source(entry: SourceEntry, legacy_markup: bool = False) -> str:
         legacy_markup=legacy_markup,
     )
     body = converter.convert(source)
-    return xhtml_page(entry.nav_title or entry.title, body, legacy_markup=legacy_markup)
+    return xhtml_page(entry.nav_title or entry.title, body, legacy_markup=legacy_markup, inline_css=inline_css)
 
 
 def find_book_dir(source: Path) -> Path:
@@ -1158,6 +1158,33 @@ def build_nav(entries: list[SourceEntry], parts: list[PartNode]) -> str:
   {"".join(lines)}
 </nav>
 '''
+
+
+def build_legacy_toc(entries: list[SourceEntry], parts: list[PartNode], inline_css: str) -> str:
+    front = [e for e in entries if e.kind == "chapter" and e.state == "frontmatter"]
+    appendices = [e for e in entries if e.kind == "chapter" and e.state == "appendix"]
+    back = [e for e in entries if e.kind == "chapter" and e.state == "backmatter"]
+
+    lines = ["<h1>目录</h1>", "<ol>"]
+    for entry in front:
+        lines.append(f'<li><a href="{html.escape(entry.output, quote=True)}">{html.escape(entry.nav_title)}</a></li>')
+    for part in parts:
+        lines.append(f'<li><a href="{html.escape(part.output, quote=True)}">{html.escape(part.title)}</a>')
+        if part.children:
+            lines.append("<ol>")
+            for child in part.children:
+                lines.append(f'<li><a href="{html.escape(child.output, quote=True)}">{html.escape(child.nav_title)}</a></li>')
+            lines.append("</ol>")
+        lines.append("</li>")
+    if appendices:
+        lines.append("<li>附录<ol>")
+        for entry in appendices:
+            lines.append(f'<li><a href="{html.escape(entry.output, quote=True)}">{html.escape(entry.nav_title)}</a></li>')
+        lines.append("</ol></li>")
+    for entry in back:
+        lines.append(f'<li><a href="{html.escape(entry.output, quote=True)}">{html.escape(entry.nav_title)}</a></li>')
+    lines.append("</ol>")
+    return xhtml_page("目录", "\n".join(lines), legacy_markup=True, inline_css=inline_css)
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
 <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops" xml:lang="{BOOK_LANG}" lang="{BOOK_LANG}">
@@ -1209,11 +1236,14 @@ def build_opf(
     modified: str,
     fonts: list[EmbeddedFont],
     epub_version: str = "3.0",
+    include_css: bool = True,
+    include_legacy_toc: bool = False,
 ) -> str:
-    manifest_items = [
-        '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
-        '<item id="css" href="styles/book.css" media-type="text/css"/>',
-    ]
+    manifest_items = ['<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>']
+    if include_css:
+        manifest_items.append('<item id="css" href="styles/book.css" media-type="text/css"/>')
+    if include_legacy_toc:
+        manifest_items.append('<item id="toc-html" href="toc.xhtml" media-type="application/xhtml+xml"/>')
     if epub_version == "3.0":
         manifest_items.insert(0, '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
     for idx, font in enumerate(fonts, start=1):
@@ -1221,14 +1251,29 @@ def build_opf(
             f'<item id="font-{idx}" href="{html.escape(font.href, quote=True)}" media-type="{font.media_type}"/>'
         )
     spine_items = []
+    if include_legacy_toc:
+        spine_items.append('<itemref idref="toc-html"/>')
+    first_content_href = ""
     for idx, entry in enumerate(flatten_nav(entries), start=1):
         item_id = f"item-{idx}"
         manifest_items.append(
             f'<item id="{item_id}" href="{html.escape(entry.output, quote=True)}" media-type="application/xhtml+xml"/>'
         )
         spine_items.append(f'<itemref idref="{item_id}"/>')
+        if not first_content_href:
+            first_content_href = entry.output
+
+    manifest_block = "\n    ".join(manifest_items)
+    spine_block = "\n    ".join(spine_items)
 
     if epub_version == "2.0":
+        guide = ""
+        if include_legacy_toc:
+            guide = f'''
+  <guide>
+    <reference type="toc" title="目录" href="toc.xhtml"/>
+    <reference type="text" title="正文" href="{html.escape(first_content_href, quote=True)}"/>
+  </guide>'''
         return f'''<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
   <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
@@ -1239,11 +1284,11 @@ def build_opf(
     <dc:date>{modified[:10]}</dc:date>
   </metadata>
   <manifest>
-    {"".join(manifest_items)}
+    {manifest_block}
   </manifest>
   <spine toc="ncx">
-    {"".join(spine_items)}
-  </spine>
+    {spine_block}
+  </spine>{guide}
 </package>
 '''
 
@@ -1257,10 +1302,10 @@ def build_opf(
     <meta property="dcterms:modified">{modified}</meta>
   </metadata>
   <manifest>
-    {"".join(manifest_items)}
+    {manifest_block}
   </manifest>
   <spine toc="ncx">
-    {"".join(spine_items)}
+    {spine_block}
   </spine>
 </package>
 '''
@@ -1453,6 +1498,51 @@ a {
     return f"{font_faces}\n\n{base_css}"
 
 
+def legacy_stylesheet() -> str:
+    return """
+body {
+  line-height: 1.7;
+  margin: 0;
+  padding: 0 0.8em;
+}
+h1 {
+  font-size: 1.5em;
+  margin: 1.1em 0 0.6em;
+}
+h2, h3 {
+  font-size: 1.15em;
+  margin: 1em 0 0.5em;
+}
+p {
+  margin: 0.6em 0;
+  text-indent: 2em;
+}
+pre {
+  font-family: monospace;
+  font-size: 0.9em;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  margin: 0.8em 0;
+}
+code {
+  font-family: monospace;
+}
+ul, ol {
+  margin: 0.6em 0 0.8em 1.4em;
+}
+li {
+  margin: 0.25em 0;
+}
+.box, .book-table-list {
+  margin: 0.9em 0;
+}
+.box-title {
+  font-weight: bold;
+  text-indent: 0;
+}
+""".strip()
+
+
 def collect_embedded_fonts() -> list[EmbeddedFont]:
     specs = [
         ("Maple Mono NL NF CN", "Maple Mono NL NF CN", "normal", "400"),
@@ -1510,6 +1600,14 @@ def container_xml() -> str:
 '''
 
 
+def zip_info(name: str, compress_type: int = zipfile.ZIP_DEFLATED) -> zipfile.ZipInfo:
+    info = zipfile.ZipInfo(name, (2026, 1, 1, 0, 0, 0))
+    info.compress_type = compress_type
+    info.create_system = 0
+    info.external_attr = 0
+    return info
+
+
 IMAGE_EXTENSIONS = {".apng", ".avif", ".bmp", ".gif", ".jpeg", ".jpg", ".png", ".svg", ".webp"}
 IMAGE_MARKUP = re.compile(
     r"(<\s*(?:img|svg|picture|source|figure)\b|image/|data:image|background-image|cover-image)",
@@ -1557,41 +1655,54 @@ def build_epub(
 
     entries, parts = collect_entries(book_dir, include_cover=include_cover, legacy_names=WECHAT_COMPATIBLE)
     fonts = [] if WECHAT_COMPATIBLE or not embed_fonts else collect_embedded_fonts()
+    inline_css = legacy_stylesheet() if WECHAT_COMPATIBLE else ""
     uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{BOOK_TITLE}"))
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     pages: dict[str, str] = {}
     if include_cover:
-        pages["cover.xhtml"] = cover_page(legacy_markup=WECHAT_COMPATIBLE)
+        pages["cover.xhtml"] = cover_page(legacy_markup=WECHAT_COMPATIBLE, inline_css=inline_css)
+    if WECHAT_COMPATIBLE:
+        pages["toc.xhtml"] = build_legacy_toc(entries, parts, inline_css=inline_css)
     part_by_output = {part.output: part for part in parts}
     for entry in entries:
         if entry.kind == "cover":
             continue
         if entry.kind == "part":
-            pages[entry.output] = part_page(part_by_output[entry.output], legacy_markup=WECHAT_COMPATIBLE)
+            pages[entry.output] = part_page(
+                part_by_output[entry.output],
+                legacy_markup=WECHAT_COMPATIBLE,
+                inline_css=inline_css,
+            )
         elif entry.kind == "chapter":
-            pages[entry.output] = convert_source(entry, legacy_markup=WECHAT_COMPATIBLE)
+            pages[entry.output] = convert_source(entry, legacy_markup=WECHAT_COMPATIBLE, inline_css=inline_css)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w") as archive:
-        mimetype = zipfile.ZipInfo("mimetype")
-        mimetype.compress_type = zipfile.ZIP_STORED
-        archive.writestr(mimetype, "application/epub+zip")
-        archive.writestr("META-INF/container.xml", container_xml(), compress_type=zipfile.ZIP_DEFLATED)
-        archive.writestr("OEBPS/styles/book.css", stylesheet(fonts), compress_type=zipfile.ZIP_DEFLATED)
+        archive.writestr(zip_info("mimetype", zipfile.ZIP_STORED), "application/epub+zip")
+        archive.writestr(zip_info("META-INF/container.xml"), container_xml())
         if not WECHAT_COMPATIBLE:
-            archive.writestr("OEBPS/nav.xhtml", build_nav(entries, parts), compress_type=zipfile.ZIP_DEFLATED)
-        archive.writestr("OEBPS/toc.ncx", build_ncx(entries, uid), compress_type=zipfile.ZIP_DEFLATED)
+            archive.writestr(zip_info("OEBPS/styles/book.css"), stylesheet(fonts))
+        if not WECHAT_COMPATIBLE:
+            archive.writestr(zip_info("OEBPS/nav.xhtml"), build_nav(entries, parts))
+        archive.writestr(zip_info("OEBPS/toc.ncx"), build_ncx(entries, uid))
         epub_version = "2.0" if WECHAT_COMPATIBLE else "3.0"
         archive.writestr(
-            "OEBPS/content.opf",
-            build_opf(entries, uid, modified, fonts, epub_version=epub_version),
-            compress_type=zipfile.ZIP_DEFLATED,
+            zip_info("OEBPS/content.opf"),
+            build_opf(
+                entries,
+                uid,
+                modified,
+                fonts,
+                epub_version=epub_version,
+                include_css=not WECHAT_COMPATIBLE,
+                include_legacy_toc=WECHAT_COMPATIBLE,
+            ),
         )
         for font in fonts:
-            archive.write(font.source, f"OEBPS/{font.href}", compress_type=zipfile.ZIP_DEFLATED)
+            archive.writestr(zip_info(f"OEBPS/{font.href}"), font.source.read_bytes())
         for name, content in pages.items():
-            archive.writestr(f"OEBPS/{name}", content, compress_type=zipfile.ZIP_DEFLATED)
+            archive.writestr(zip_info(f"OEBPS/{name}"), content)
     if forbid_images:
         validate_no_embedded_images(output)
 
