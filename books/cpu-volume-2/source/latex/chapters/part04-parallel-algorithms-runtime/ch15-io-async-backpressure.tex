@@ -314,6 +314,194 @@ event_loop_callback_ns_p99
 
 这些字段能区分几种不同瓶颈：eventfd 写很多但队列很浅，说明唤醒合并策略差；epoll 返回很多 writable 但写不完，说明下游慢或输出 buffer 过大；read ready 很多但 messages parsed 少，说明消息分片或 framing 成本高；callback p99 很高，说明 event loop 执行了不该由它执行的 CPU 工作。
 
+\topic{eventfd 的读写合同}
+eventfd 的基础合同很小，但细节足以制造 bug。创建时通常选择 \code{EFD\_NONBLOCK} 和 \code{EFD\_CLOEXEC}：前者避免 event loop 或生产者在 fd 操作上意外阻塞，后者避免子进程继承控制 fd。普通模式下，读一次返回当前计数并把计数清零；semaphore 模式下，读一次返回 1 并把计数减 1。写入会增加计数，但计数有上限；非阻塞写在无法增加时返回 \code{EAGAIN}。
+
+\begin{lstlisting}[numbers=none,caption={eventfd read/write 的基本语义}]
+create:
+  fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)
+
+write side:
+  write uint64 value > 0
+  counter += value
+  fd becomes readable
+  nonblocking write may fail with EAGAIN if counter would overflow
+
+read side, normal mode:
+  if counter > 0:
+      read returns counter
+      counter = 0
+  else if nonblocking:
+      read fails with EAGAIN
+
+read side, semaphore mode:
+  if counter > 0:
+      read returns 1
+      counter -= 1
+\end{lstlisting}
+
+因此 eventfd wake 的正确用法通常是“合并唤醒”。用户态队列保存真实工作；eventfd 只负责把 event loop 从 \code{epoll\_wait} 里拉出来。若需要每个请求都有身份，就在队列元素里保存 request id；若需要每个完成都有状态，就用 CompletionRecord；不要把 eventfd counter 当 request id、字节数或完成次数的权威来源。
+
+\topic{实测证据：eventfd 合并计数和 semaphore 模式}
+下面的最小实验在 x86-64 Linux 环境中运行，系统内核为 \code{Linux 6.6.87.2-microsoft-standard-WSL2 x86\_64 GNU/Linux}，glibc 为 \code{2.42}。实验只验证用户可见的 \code{eventfd} 读写合同和 \code{epoll} readiness 行为，不声称分析内核内部实现。
+
+\begin{lstlisting}[numbers=none,caption={eventfd/epoll 合同实验命令}]
+gcc -std=c11 -O2 -Wall -Wextra eventfd_epoll_probe.c \
+  -o eventfd_epoll_probe
+./eventfd_epoll_probe
+perf stat -e cycles,instructions ./eventfd_epoll_probe
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={eventfd 读写实验输出摘要}]
+case=eventfd_normal_writes write1=8 write2=8
+case=eventfd_normal_read_merged read_n=8 errno=OK value=5
+case=eventfd_normal_read_empty read_n=-1 errno=EAGAIN value=0
+case=eventfd_semaphore_write write_n=8
+case=eventfd_semaphore_read1 read_n=8 errno=OK value=1
+case=eventfd_semaphore_read2 read_n=8 errno=OK value=1
+case=eventfd_semaphore_read3 read_n=8 errno=OK value=1
+case=eventfd_semaphore_empty read_n=-1 errno=EAGAIN value=0
+\end{lstlisting}
+
+两次普通写入 \code{2} 和 \code{3} 后，一次 read 返回 \code{5}，证明普通模式读的是合并后的 counter，并把 counter 清空；第二次读返回 \code{EAGAIN}，证明非阻塞空读不会睡眠。semaphore 模式下，写入 \code{3} 后连续三次 read 都返回 \code{1}，第四次空读返回 \code{EAGAIN}。这就是为什么 eventfd 适合作为“有工作了”的唤醒 fd，而不适合作为工作身份或完成记录本身。
+
+\topic{eventfd 的常见竞态：队列先还是写 fd 先}
+生产者必须先发布用户态队列中的工作，再写 eventfd。若顺序反过来，event loop 可能醒来、读掉 eventfd 计数、检查队列为空，然后回到 \code{epoll\_wait}；生产者随后才把工作放入队列，这个工作就可能一直等到下一次唤醒。和 condition variable 一样，通知必须跟在状态变化之后。
+
+\begin{lstlisting}[numbers=none,caption={eventfd 唤醒顺序的对错}]
+wrong:
+  write(eventfd, 1)
+  push request into queue
+
+right:
+  push request into queue with release semantics or under queue mutex
+  write(eventfd, 1)
+
+event loop:
+  read(eventfd)
+  drain queue with acquire semantics or under queue mutex
+\end{lstlisting}
+
+如果队列本身用 mutex 保护，push 和 drain 通过锁建立可见性；如果用无锁 MPSC 队列，发布节点和消费节点必须有 acquire/release 关系。eventfd 不替队列建立内存序，它只让等待线程变成 runnable 或让 epoll 返回。
+
+\topic{epoll 的 interest、ready 和 user data}
+epoll 有三层状态。第一层是 interest list：应用通过 \code{epoll\_ctl} 注册 fd 和关注的事件掩码，例如 readable、writable、hangup、edge-triggered、one-shot。第二层是内核观察到的 ready 状态。第三层是应用自己的 connection/request 状态。事件返回时携带的 \code{data} 字段应该能定位稳定的连接对象或 id，而不是指向可能已经释放的栈对象。
+
+\begin{lstlisting}[numbers=none,caption={epoll fd 注册要能回到稳定状态对象}]
+connection table:
+  conn_id -> ConnectionState {
+    fd
+    input_buffer
+    output_buffer
+    parse_state
+    subscribed_events
+    generation
+  }
+
+epoll_ctl add:
+  event.events = EPOLLIN | EPOLLET
+  event.data.u64 = pack(conn_id, generation)
+
+event loop:
+  unpack conn_id and generation
+  find ConnectionState
+  reject stale event if generation changed
+  advance fd and connection state
+\end{lstlisting}
+
+generation 很重要。fd number 会被内核复用；连接关闭后，同一个整数 fd 可能很快属于另一条连接。若 event loop 中还有旧事件或业务队列里还有旧任务，裸 fd 可能把旧事件投给新连接。稳定的 id/generation 句柄能把迟到事件识别为 stale。
+
+\topic{EPOLLIN、EPOLLOUT、HUP 和 ERR 的边界}
+readable 和 writable 不是唯一事件。对端关闭、错误、半关闭、连接失败都可能通过 hangup 或 error 事件进入循环。健壮的 reactor 不应只在 \code{EPOLLIN} 时读、只在 \code{EPOLLOUT} 时写；它要在每次事件后检查错误状态，并让 ConnectionState 进入 Closing、Draining 或 Failed。
+
+\begin{lstlisting}[numbers=none,caption={epoll 事件处理的边界检查}]
+for event in epoll_wait results:
+  if event has EPOLLERR:
+      read socket error with getsockopt(SO_ERROR)
+      mark connection Failed
+  if event has EPOLLHUP or EPOLLRDHUP:
+      mark peer close or half-close
+      drain remaining readable bytes if protocol allows
+  if event has EPOLLIN:
+      read until EAGAIN or budget
+  if event has EPOLLOUT:
+      write until EAGAIN or output empty
+  if output empty:
+      remove EPOLLOUT interest to avoid writable wake storms
+\end{lstlisting}
+
+可写事件尤其容易误用。大多数 socket 大部分时间都 writable；若一直订阅 \code{EPOLLOUT}，event loop 会被“可以写但没有东西写”的事件淹没。常见策略是：只有 output buffer 非空且上次写到 \code{EAGAIN} 后，才订阅 writable；buffer 清空后取消 writable interest。
+
+\topic{实测证据：epoll readiness、one-shot 和半关闭}
+同一个实验还验证了 \code{epoll} 的几条用户可见边界：
+
+\begin{lstlisting}[numbers=none,caption={epoll 合同实验输出摘要}]
+case=epoll_ctl_eventfd_add rc=0
+case=epoll_eventfd_ready epoll_n=1 errno=OK events=0x1 data=0xfeed0011
+case=epoll_eventfd_drain read_n=8 errno=OK value=1
+case=epoll_eventfd_after_drain epoll_n=0 errno=OK events=0x0 data=0x0
+case=epoll_ctl_pipe_oneshot_add rc=0
+case=oneshot_first_ready epoll_n=1 errno=OK events=0x1 data=0xabc00001
+case=oneshot_without_rearm epoll_n=0 errno=OK events=0x0 data=0x0
+case=epoll_ctl_pipe_oneshot_rearm rc=0
+case=oneshot_after_rearm epoll_n=1 errno=OK events=0x1 data=0xabc00002
+case=oneshot_drain read_n=2 errno=OK
+case=epoll_ctl_socket_add rc=0
+case=socket_peer_half_close epoll_n=1 errno=OK events=0x2001 data=0xbeef0001
+\end{lstlisting}
+
+第一段证明 eventfd 进入 readable 后会让 \code{epoll\_wait} 返回 \code{EPOLLIN}，读掉 counter 后再次等待返回 0。第二段证明 \code{EPOLLONESHOT} 触发一次后会暂时禁用该 fd：即使管道又写入了字节，不 rearm 的 \code{epoll\_wait} 仍返回 0；执行 \code{EPOLL\_CTL\_MOD} 重新 armed 后，同一个 fd 再次返回 ready。第三段用 \code{socketpair} 和 \code{shutdown(SHUT\_WR)} 观察半关闭，事件位 \code{0x2001} 表示 \code{EPOLLRDHUP | EPOLLIN}。这说明 reactor 不能只处理读写，还要把 half-close、hangup 和 error 统一纳入连接状态机。
+
+本次环境不能采集 \code{cycles,instructions}：
+
+\begin{lstlisting}[numbers=none,caption={perf 计数器边界}]
+Error:
+No supported events found.
+The cycles:u event is not supported.
+\end{lstlisting}
+
+因此这些结果只支持 I/O 合同和 readiness 状态分析，不能支持 event loop 开销、IPC 或 cache 行为结论。若要讨论性能，需要另补可用 PMU、调度 trace、callback p99 和队列水位。
+
+\topic{EPOLLONESHOT 和跨线程处理}
+如果多个线程同时消费同一个 epoll fd，或者 event loop 把 fd 事件交给 worker 处理，就要防止同一个 fd 的事件被并发处理。一个常见模式是 \code{EPOLLONESHOT}：事件触发后，内核暂时禁用这个 fd 的后续通知，应用处理完并更新 ConnectionState 后，再用 \code{epoll\_ctl MOD} 重新 armed。它购买的是“同一连接同一时间只有一个处理者”的边界，代价是每次处理后都要正确 rearm。
+
+\begin{lstlisting}[numbers=none,caption={one-shot reactor 的 rearm 协议}]
+on event:
+  mark connection Handling
+  process bounded read/write work
+  compute next interest mask from ConnectionState
+  if connection still open:
+      epoll_ctl MOD fd with EPOLLONESHOT | next mask
+      mark connection Armed
+  else:
+      epoll_ctl DEL fd
+      close fd after no owner remains
+\end{lstlisting}
+
+若忘记 rearm，连接会永久沉默；若在处理尚未结束时 rearm，另一个线程可能并发处理同一 ConnectionState；若 close 后没有删除或识别 generation，迟到事件可能打到新连接。epoll 编程的难点不在 API 名字，而在 fd 生命周期、事件订阅和用户态状态三者必须一致。
+
+\topic{从 epoll 到任务运行时的边界}
+event loop 不应该直接执行重 CPU work。更稳的结构是：event loop 只推进 fd 状态和消息 framing；完整消息变成 MessageEnvelope 或 TaskInput；compute executor 处理 CPU 逻辑；结果再以 OutputBuffer 或 WriteRequest 回到 I/O 层。这样可观测性也清楚：ready 延迟、parse 延迟、compute 排队、write backpressure 是不同阶段。
+
+\begin{lstlisting}[numbers=none,caption={reactor 和 compute executor 的分层}]
+event loop:
+  fd readiness -> ConnectionState progress
+  complete message -> enqueue TaskInput
+  task output available -> enqueue OutputBuffer and arm EPOLLOUT
+
+compute executor:
+  TaskInput -> CPU work -> TaskOutput
+  never blocks in epoll_wait
+  never owns fd readiness state
+
+I/O state:
+  owns fd, input buffer, output buffer, parse offset
+  owns event subscription mask
+  owns connection close/drain/fail state
+\end{lstlisting}
+
+这条边界和第 14 章 scheduler/awaiter 边界一致：ready 事件只是把某个状态推进了一步，不能直接变成任意用户代码。否则 event loop 的 tail latency 会污染所有连接，系统看起来像 I/O 慢，实际是事件线程被 CPU continuation 占住。
+
 \topic{异步 I/O 和 coroutine：completion 才能恢复 awaiter}
 把 I/O 接到 coroutine 时，关键不是把 \code{read} 包在 \code{co\_await} 后面，而是让 awaiter 等真正的 I/O completion。若 \code{await\_suspend} 里调用阻塞 \code{read}，这个 coroutine 只是换了一种写法，compute worker 仍被设备等待占住。正确模型是：提交请求，保存 buffer 所有权和 coroutine handle，worker 返回调度器；completion 到达后，I/O 层更新请求状态，再把 handle 入恢复 executor。
 

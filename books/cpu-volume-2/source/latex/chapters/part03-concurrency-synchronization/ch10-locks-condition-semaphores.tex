@@ -358,6 +358,90 @@ Waker:
 
 这个状态机有三个重要边界。第一，\code{futex\_wait} 返回不等于条件满足；它只表示线程不再睡在内核队列上，返回原因可能是 wake、超时、信号或值不匹配。第二，\code{futex\_wake} 返回不等于业务完成；它只说明内核尝试唤醒了若干等待者。第三，futex key 是用户态地址和相关映射身份，不是 C++ 对象名；对象销毁、地址复用和跨进程共享都会让生命周期约束变得更硬。
 
+\topic{futex 系统调用合同：返回码也是状态}
+只说“调用 futex 睡眠”还不够。futex 的基本合同是：用户态传入一个地址、一个操作和一个预期值；内核只在这个地址上的值仍等于预期值时把线程挂起。等待返回后，用户态不能根据返回值直接认为资源可用，而要把返回值当作“为什么不再睡眠”的线索，再重新读取共享状态。
+
+\begin{lstlisting}[numbers=none,caption={futex wait/wake 的系统调用层合同}]
+wait side, simplified:
+  rc = futex(uaddr, FUTEX_WAIT_PRIVATE, expected, timeout)
+  if rc == 0:
+      some wake path ran, but condition may still be false
+  if rc == -EAGAIN:
+      *uaddr did not match expected at kernel recheck
+  if rc == -EINTR:
+      signal interrupted the sleep
+  if rc == -ETIMEDOUT:
+      timeout expired
+  always re-read user-space state before deciding next step
+
+wake side, simplified:
+  store new user-space state first
+  n = futex(uaddr, FUTEX_WAKE_PRIVATE, wake_count)
+  n tells how many waiters the kernel made runnable
+  n does not tell how many acquired the mutex or consumed work
+\end{lstlisting}
+
+\code{PRIVATE} 版本表示等待地址只在同一进程内使用，内核可以走更便宜的路径；跨进程共享 mutex 或 process-shared condition variable 不能随便使用 private 语义。这个细节解释了为什么同步原语的“是否跨进程共享”不是装饰字段：它会改变 futex key 的解释，也会改变调试时看到的等待路径。
+
+返回码还解释了虚假唤醒的工程来源。即使没有业务通知，等待也可能因为信号、超时或实现内部原因返回；即使收到了 wake，醒来的线程也可能重新竞争失败。因此正确循环永远是：
+
+\begin{lstlisting}[numbers=none,caption={futex 用户态循环必须以状态为准}]
+while true:
+  state = load shared word
+  if protocol says progress is possible:
+      try progress with atomic operation
+      if success:
+          return
+  futex_wait(shared word address, expected=state)
+  // return reason is not the protocol; state is the protocol
+\end{lstlisting}
+
+\topic{实测证据：futex 返回码和 wake 数量}
+下面这组最小实验在 x86-64 Linux 环境中运行，系统内核为 \code{Linux 6.6.87.2-microsoft-standard-WSL2 x86\_64 GNU/Linux}，glibc 为 \code{2.42}。实验代码直接调用 \code{SYS\_futex}，只验证用户可见的返回码、\code{errno} 和 \code{FUTEX\_WAKE\_PRIVATE} 返回数量；它不声称证明内核内部队列实现。
+
+\begin{lstlisting}[numbers=none,caption={futex 合同实验命令}]
+gcc -std=c11 -O2 -Wall -Wextra -pthread futex_probe.c -o futex_probe
+./futex_probe
+perf stat -e cycles,instructions ./futex_probe
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={futex 合同实验输出摘要}]
+case=eagain rc=-1 errno=EAGAIN word=1 expected=0
+case=timeout rc=-1 errno=ETIMEDOUT word=0 timeout_ns=1000000
+case=wake wake_count=1 waiter_rc=0 waiter_errno=OK observed=1
+case=signal waiter_rc=-1 waiter_errno=EINTR
+case=wake_without_waiter wake_count=0
+\end{lstlisting}
+
+这份输出把前面的合同钉住了。第一，用户态地址上的值已经不是 expected 时，等待不会真正睡下，返回 \code{EAGAIN}。第二，超时和信号中断都只是“离开等待”的原因，不表示业务条件成立。第三，\code{wake\_count=1} 表示内核让一个等待者重新变为 runnable；等待者醒来后观察到 \code{word=1}，仍然要回到用户态协议重新判断。第四，没有等待者时，wake 返回 \code{0}，这不是错误，而是说明该地址上没有可唤醒线程。
+
+本次环境不能采集 \code{cycles,instructions}：
+
+\begin{lstlisting}[numbers=none,caption={perf 计数器边界}]
+Error:
+No supported events found.
+The cycles:u event is not supported.
+\end{lstlisting}
+
+因此这组实验只能支持 futex 合同和返回码分析，不能支持 IPC、cycles 或调度开销结论。要分析锁竞争的性能，还需要在能访问 PMU 的环境里补 \code{perf stat}、off-CPU profile 或调度 trace。
+
+\topic{futex 不替你建立内存序}
+futex 只负责睡眠和唤醒，不自动把业务数据发布给等待者。业务状态仍要用 mutex、atomic acquire/release 或其他同步关系建立可见性。典型顺序是：生产者先写业务数据，再用 release 语义发布状态，最后 wake；消费者醒来后用 acquire 语义重新读取状态，确认条件满足后再读业务数据。若状态发布和数据写入没有同步关系，futex wake 只能让线程醒来，不能保证它看到正确数据。
+
+\begin{lstlisting}[numbers=none,caption={futex 和内存序的分工}]
+producer:
+  write payload fields
+  store ready = 1 with release semantics
+  futex_wake(&ready, 1)
+
+consumer:
+  while load ready with acquire semantics == 0:
+      futex_wait(&ready, expected=0)
+  read payload fields
+\end{lstlisting}
+
+这个例子故意很窄：单一 ready 标志可以用 atomic wait 或 futex 风格协议表达。若状态跨多个字段，例如 \code{size/closed/error/head/tail}，就不要把每个字段都硬塞进 futex word。更清楚的实现通常是 mutex 保护不变量，condition variable 等待谓词，底层库再决定是否使用 futex 睡眠。
+
 \topic{mutex 底层怎样从用户态快路径走到睡眠}
 高层 \code{std::mutex} 或 pthread mutex 通常不是每次都进内核。无竞争时，它只是对锁字做原子转换：从 unlocked 改成 locked，成功后进入临界区。竞争时，库会把锁字推进到“有人等待”或类似状态，可能短暂自旋，然后才用 futex 或平台等待对象睡眠。释放时，持锁线程用 release 语义发布临界区写入，把锁字改回可获取状态；若锁字表明可能有等待者，再走 wake 路径。
 
@@ -388,6 +472,32 @@ unlock:
 
 真实库的锁字编码会更复杂，可能包含自适应自旋、robust mutex、priority inheritance、owner 信息或平台差异，但教学上这三个状态足够说明核心原则：锁的正确性来自用户态锁字的状态转移，futex 只是把“等待锁字变化”从忙等变成睡眠。若锁字没有 waiter 信息，unlock 可能不知道是否需要 wake；若 waiter 信息维护错，可能出现无效唤醒或睡眠者没人唤醒。
 
+\topic{直接用 futex 写 mutex 为什么危险}
+直接封装 futex 很诱人，因为接口看起来只有一个整数。但完整 mutex 还要处理所有权、递归策略、析构时是否仍有等待者、进程退出、优先级反转、超时、信号、取消和调试可见性。更关键的是，futex wait 的 expected 值必须和用户态状态机严格匹配；只要有一条状态边没有 wake，等待者就可能睡到超时或永远不醒。
+
+\begin{lstlisting}[numbers=none,caption={简化 futex mutex 的审查清单}]
+state word:
+  what values exist?
+  which thread may write each value?
+  which value means waiters may exist?
+
+acquire path:
+  where is the linearization point?
+  when does a thread decide to sleep?
+  what exact expected value does it pass to futex_wait?
+
+release path:
+  does it publish protected writes before unlocking?
+  does every path that may satisfy waiters call wake?
+  can a woken thread race with a new fast-path acquirer?
+
+lifetime:
+  who proves no thread is sleeping on this address before destroy?
+  can the address be reused while a late waiter still exists?
+\end{lstlisting}
+
+如果这些问题答不出来，使用标准库 mutex 或 pthread mutex 更可靠。系统书讲 futex 的目的不是鼓励读者重写锁，而是让读者能解释 \code{strace}、\code{perf sched}、off-CPU profile 和线程 dump 里的等待现象。
+
 \topic{condition variable 底层怎样避免丢失唤醒}
 条件变量比 mutex 更容易误解，因为它等待的不是一个锁字，而是“受 mutex 保护的谓词”。等待者调用 \code{wait(lock)} 时，库必须完成一个复合动作：把当前线程登记到条件变量等待集合，然后释放用户 mutex，然后睡眠。醒来后，它还必须重新获取 mutex，才把控制权还给用户代码。用户手写“先 unlock，再 park”会在登记等待者之前暴露丢失唤醒窗口。
 
@@ -407,6 +517,47 @@ cv_notify_one:
 \end{lstlisting}
 
 这就是为什么条件变量必须配合 \code{while} 谓词。底层实现可以用序号、等待队列、内部锁和 futex 把“登记等待者 + 释放 mutex + 睡眠”做成一个库协议，但它不能替业务保存通知次数，也不能保证醒来的线程就是拿到资源的线程。被 \code{notify\_one} 唤醒的线程还要重新竞争 mutex；在它拿到锁之前，别的线程可能已经消费了资源。因此条件变量语义不是“通知一次，消费一次”，而是“状态可能变化，请在锁内重新判断”。
+
+\topic{condition variable 的序号模型}
+很多实现会把 condition variable 的等待集合抽象成一个或多个序号。等待者在持有用户 mutex 时观察当前序号和谓词；若谓词不满足，就把自己关联到这个序号，然后由库释放 mutex 并等待序号变化。通知者在改变业务状态后推进序号并唤醒等待者。序号不是业务状态，它只是帮助等待者判断“我睡觉期间可能发生过通知”。
+
+\begin{lstlisting}[numbers=none,caption={用序号理解 condition variable}]
+waiter:
+  lock user mutex
+  while predicate is false:
+      seq = cv.sequence
+      cv registers this waiter for seq
+      atomically unlock user mutex and sleep while sequence == seq
+      lock user mutex again
+      // predicate must be checked again
+
+notifier:
+  lock user mutex
+  modify business state
+  unlock user mutex
+  increment or publish cv.sequence
+  wake one or many waiters
+\end{lstlisting}
+
+这个模型能解释两个常见现象。第一，\code{notify} 可以在不持用户 mutex 的情况下调用，但状态修改必须和等待谓词使用同一把 mutex 建立顺序；否则等待者可能看见旧状态或错过退出条件。第二，\code{notify\_all} 可能造成惊群：很多等待者被唤醒，最终只有少数能使谓词成立，其余线程重新睡下。惊群是性能问题，不是正确性问题；正确性仍然来自谓词循环。
+
+\topic{condvar、mutex 和 futex 地址为什么可能不一样}
+调试时常看到同一段条件变量代码在多个 futex 地址上等待或唤醒：有的地址属于 mutex 锁字，有的属于 condition variable 内部序号或等待字。等待者从 condvar 醒来后还要重新获取 mutex；如果 mutex 被别的线程持有，它可能马上又睡到 mutex 的 futex 地址上。于是一次 \code{notify\_one} 后的慢请求，可能同时包含 condvar wake、调度延迟、mutex 重新竞争和业务谓词失败。
+
+\begin{lstlisting}[numbers=none,caption={一次条件变量唤醒可能经过多段等待}]
+consumer:
+  sleep on condition-variable wait word
+  wake after notify
+  try to re-lock user mutex
+  if mutex is owned:
+      sleep on mutex lock word
+  after mutex acquired:
+      check predicate again
+      if predicate false:
+          sleep on condition-variable wait word again
+\end{lstlisting}
+
+这就是为什么只看一条 futex 地址很容易误判。报告要把应用等待点、mutex 名称、condition variable 名称、线程状态和业务队列状态一起记录。否则“futex 很多”只是现象，不是瓶颈解释。
 
 \topic{mutex、condvar 和 futex 的职责分层}
 这三者的职责不要混在一起。Mutex 保护共享不变量；condition variable 定义哪些线程在等待哪些谓词；futex 或平台等待对象负责让线程在慢路径睡眠。把 futex 直接当业务事件用，会失去谓词、关闭和对象生命周期；把 condition variable 当消息队列用，会丢通知语义；把 mutex 当背压机制用，会把容量、关闭和错误路径塞进临界区。
