@@ -1205,6 +1205,99 @@ checkable:
 
 回归门还要保存失败样本。一次性能失败如果只打印“超过阈值”，没有输入 seed、机器状态、阶段拆分和原始样本，就无法复现。性能回归和正确性回归一样，都需要最小可重放证据和审计记录。
 
+\section{状态机：一次性能结论怎样从假设走到验收}
+
+性能分析也应该有状态机。否则报告很容易从“观察到变快”直接跳到“知道原因”。本书建议把每次优化结论固定成下面的状态转移：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 进入条件 & 退出条件 \\
+\midrule
+Observation & 看到耗时、吞吐或延迟变化 & 保存原始样本和环境 \\
+Hypothesis & 提出一个可证伪瓶颈解释 & 写出会推翻它的输入或指标 \\
+Model & 建立 FLOPs、bytes、同步或排队账本 & 数量级和实测不矛盾 \\
+Experiment & 运行单变量对照和反证输入 & correctness 全部通过 \\
+Evidence & 阶段、计数器、反汇编或 trace 支持假设 & 替代解释被逐项排除 \\
+Decision & 写出上线、保留、回退或继续验证 & 边界和回归门明确 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这台状态机能防止两类常见错误。第一类是“测到了变化但没有模型”：比如三倍加速，却不知道是 I/O、parser、histogram 还是写出阶段变化。第二类是“有模型但没有反证”：比如声称 cache miss 下降，却没有输入阶梯、layout 对照或计数器证据。
+
+\subsection{数学模型：Roofline 只是下限，不是预言}
+
+对一个 kernel，最基本的下限是：
+
+\[
+T \ge \max\left(\frac{bytes}{BW_{sustained}}, \frac{ops}{Throughput_{sustained}}\right)
+\]
+
+但真实程序还要加上固定成本和系统成本：
+
+\[
+T_{observed} = T_{kernel} + T_{launch} + T_{sync} + T_{alloc} + T_{io} + T_{noise}
+\]
+
+因此 Roofline 的正确用法不是预测精确耗时，而是做数量级审计。若模型说流式读写至少 80ms，报告声称 5ms 完成，就要先怀疑 bytes 口径、cache 热度、计时范围或编译器删除。若模型说算力上限 1000GFLOP/s，实测 50GFLOP/s，则要查访存、依赖链、向量化、分支、线程和调度，而不是直接说“机器不行”。
+
+\subsection{PMU 判读的反例矩阵}
+
+同一个 PMU 现象可能有多个原因。下面的矩阵用于训练“不要只看一个指标”。
+
+\begin{center}
+\begin{tabular}{p{0.23\linewidth}p{0.35\linewidth}p{0.28\linewidth}}
+\toprule
+现象 & 可能原因 & 反证实验 \\
+\midrule
+IPC 低 & 内存等待、分支错误、长依赖链、调度干扰 & 固定输入、减少工作集、看分支输入、检查 context switch \\
+cache miss 高 & 工作集大、stride 差、无用预取、随机访问 & 改连续输入、缩小到 L2、计算 cache line 利用率 \\
+branch miss 高 & 输入随机、错误路径混入、状态机分支复杂 & all-true/all-false/周期输入对照 \\
+instructions 高 & 多做工作、未内联、未向量化、诊断路径进入热区 & 反汇编、阶段计时、关闭诊断对照 \\
+cycles 高但 PMU 不完整 & 频率、抢占、I/O、page fault、权限限制 & trace、fault 计数、raw samples、环境记录 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表要求每个结论至少有一个“替代解释排除”。如果不能排除，就把结论写窄：不是“branch miss 是根因”，而是“随机输入下 branch miss 与阶段耗时同时上升，证据支持分支预测参与”。
+
+\subsection{工程事故：把 debug 日志留在 timed region}
+
+一个常见事故是优化版本看起来变慢，最后发现候选代码在热循环中保留了 debug 计数和日志格式化。日志在默认级别下不输出，但字符串拼接、状态检查、原子计数或分支仍在计时范围内。修复不是简单删除日志，而是把观测点移到阶段边界，热路径只写低成本 counters，采样或批量导出。
+
+\begin{lstlisting}[numbers=none,caption={测量事故复盘模板}]
+incident:
+  candidate slower by 18% in hot-key benchmark
+
+semantic:
+  checksum equal
+  diagnostics equal
+
+stage:
+  parse unchanged
+  histogram slower
+
+binary evidence:
+  extra formatting call remains in hot loop
+  branch to logging guard is executed per record
+
+fix:
+  move diagnostic string construction out of hot loop
+  keep numeric counters only
+  add regression check for instructions_per_record
+\end{lstlisting}
+
+\subsection{实验：用反证输入训练 PMU 判读}
+
+\begin{exercisebox}
+实验一：选择一个分支密集循环，构造 all-true、all-false、周期、随机和真实 trace 五种输入。记录 branch miss rate、cycles/item、checksum。说明哪种输入推翻“算法本身慢”的解释。
+
+实验二：选择一个 stride 访问循环，构造 stride=1、cache line、page、随机四种访问。记录有效字节利用率、TLB 替代证据和 wall time。用公式说明为什么每次只用 8/64 字节会浪费带宽。
+
+实验三：写一份“证据不足”的性能报告，然后按 Observation -> Hypothesis -> Model -> Experiment -> Evidence -> Decision 状态机补全。最终报告必须列出至少两个未验证边界。
+\end{exercisebox}
+
 \section{复查清单和习题}
 
 复查必须覆盖六项事实：reference、oracle、checksum、错误摘要和边界输入是否完整；端到端、阶段和热循环是否分清，预热、冷启动和计时范围是否写明；输入矩阵是否能证伪假设，单变量对照、运行轮次和统计方法是否合理；字节账本、操作数账本和 Roofline 判断是否有数量级依据；计数器、profile、trace 或降级证据是否能支持瓶颈解释，并写出不可用边界；原始命令、输入、样本、环境和报告是否可追溯。

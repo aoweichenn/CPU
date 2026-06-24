@@ -567,6 +567,92 @@ resource_released
 
 这份 trace 把第三册的 AI Infra 和生产系统连接起来。没有它，模型能跑只是 demo；有它，才开始接近线上工程。
 
+\section{状态机：请求从到达到释放资源}
+
+推理服务必须把请求生命周期写成状态机。否则 admission、取消、超时、stream backpressure 和 KV 释放都会散落在 if 分支里，线上事故很难复盘。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 持有资源 & 合法转移 \\
+\midrule
+Arrived & request metadata & AdmitQueued 或 Rejected \\
+AdmitQueued & 队列位置、deadline & Admitted 或 Rejected \\
+Admitted & KV 预算、workspace 预算、session id & PrefillRunning 或 Cancelled \\
+PrefillRunning & prefill batch slot、KV write range & DecodeReady 或 Failed \\
+DecodeReady & session KV、sampler state & DecodeRunning、Finished、Cancelled \\
+DecodeRunning & decode batch slot、backend plan & DecodeReady 或 Streaming \\
+Streaming & output buffer、client flow-control & DecodeReady、Finished、ClientGone \\
+Released & 无运行时资源 & 终态 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表要求每个状态都回答“谁释放资源”。若客户端断开时 session 仍停在 \code{DecodeReady}，KV cache 会泄漏；若 \code{Streaming} 被慢客户端堵住，decode scheduler 可能继续生成 token，输出队列膨胀；若 \code{PrefillRunning} 失败没有回滚 KV range，后续 session 可能读到脏状态。
+
+\subsection{排队模型：SLO 不是平均 tokens/s}
+
+设请求到达率为 \(\lambda\)，平均服务时间为 \(S\)，利用率粗略为：
+
+\[
+\rho = \lambda S
+\]
+
+当 \(\rho\) 接近 1，排队等待会非线性上升。Little's Law 给出长期平均关系：
+
+\[
+L = \lambda W
+\]
+
+\(L\) 是系统内平均请求数，\(W\) 是平均停留时间。它不能替代 tail latency 模型，但能提醒一个事实：吞吐接近极限时，队列一定涨。continuous batching 能提高吞吐，降低单位 token 成本，但会给单个请求引入 batching wait；prefill 大请求还会阻塞 decode 小步，影响 TPOT。
+
+\begin{lstlisting}[numbers=none,caption={SLO 报告必须分阶段}]
+TTFT =
+  queue_wait_before_admit
+  + batching_wait_prefill
+  + prefill_compute
+  + first_decode_wait
+  + first_decode_compute
+  + first_token_stream_wait
+
+TPOT =
+  decode_batch_wait
+  + decode_compute
+  + sampler
+  + stream_backpressure
+\end{lstlisting}
+
+因此“GPU 利用率提高”不自动等于 SLO 改善。若连续合批把 TPOT p50 降低，却让 TTFT p95 暴涨，就要按业务目标重新设置 admission 和 batching window。
+
+\subsection{工程事故：KV 预算只算已用，不算已预留}
+
+一个常见线上事故是：系统只统计已经写入的 KV bytes，没有统计 admitted request 未来保留的 token。短时间内多个长上下文请求同时进入，decode 到一半才发现 KV 不够，只能中止请求或触发 OOM。正确做法是在 admission 阶段按最大上下文或保守 token budget 预留，并在取消、结束或缩短输出时归还。
+
+\begin{lstlisting}[numbers=none,caption={KV 预算事故复盘}]
+bad accounting:
+  kv_used counts written tokens only
+  long requests pass admission
+  OOM happens during decode
+
+fixed accounting:
+  kv_reserved counts admitted future slots
+  kv_written tracks actual progress
+  cancellation releases reserved - written
+  incident trace records release reason
+\end{lstlisting}
+
+这个事故说明 serving 的“状态”不只是 tensor。预算、预留、队列位置、deadline、客户端连接和 sampler RNG 都是状态。AI Infra 如果不讲这些，系统只能停留在本地 demo。
+
+\subsection{实验：调度策略的反证输入}
+
+\begin{exercisebox}
+实验一：构造三类请求：短 prompt 短输出、长 prompt 短输出、短 prompt 长输出。比较 FIFO、prefill/decode 分离、continuous batching 三种策略的 TTFT、TPOT、p95、拒绝率和 KV 使用曲线。
+
+实验二：模拟慢客户端。让 streaming 队列持续阻塞，验证 scheduler 是否停止继续生成、是否释放取消请求的 KV、是否记录 \code{stream\_backpressure\_ms}。
+
+实验三：把 admission 从 \code{kv\_used} 改成 \code{kv\_reserved}。构造多个长上下文请求，证明中途 OOM 变成 admission reject，并给出可行动错误原因。
+\end{exercisebox}
+
 \subsection{本节验收线}
 
 读完本节，应该能把第三册项目接成业务服务：

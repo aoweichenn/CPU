@@ -727,6 +727,124 @@ TensorRT-LLM & engine、plugin、kernel fusion、KV cache 和多 GPU & 后端 pl
 
 借鉴不等于复制。教学项目不必实现完整 MLIR 或 vLLM，但必须回答相同问题：tensor 如何描述，layout 如何传播，state 如何建模，memory 如何复用，kernel 如何选择，serving 如何满足 SLO，错误如何复现。工业参照的作用是防止自研词汇脱离真实战场。
 
+\section{状态机：一个 pass 从候选到可上线}
+
+AI compiler 最危险的写法，是把 pass 当作“遍历图然后改一改”。生产级 pass 应该有状态机：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 必须持有的事实 & 失败时动作 \\
+\midrule
+Candidate & 匹配到可改写子图 & 记录不匹配原因 \\
+Legal & shape、dtype、layout、state、alias 均合法 & 拒绝改写，保留原图 \\
+Profitable & 成本模型显示值得改 & 保留原图并记录原因 \\
+Rewritten & 新节点、新边和 metadata 生成 & 立即 verifier \\
+Invalidated & use-def、liveness、cost 等失效集合明确 & 禁止后续 pass 使用旧事实 \\
+OracleOK & 小输入或 golden trace 通过 & 回退该 pass 或标记 experimental \\
+Enabled & backend、shape、debug flag 允许 & 运行时选择原路径或新路径 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这台状态机让 pass 的失败变得可解释。一个 fusion 没触发，不应该只剩“pattern not found”；报告要说明是 shape 不匹配、layout 不兼容、state edge 阻止、debug materialization 要求保留，还是成本模型不划算。
+
+\subsection{严格规则：fusion legality}
+
+以 RMSNorm + Linear fusion 为例，合法性至少要检查：
+
+\[
+shape(out(RMSNorm)) = shape(in(Linear))
+\]
+
+\[
+dtype/path(RMSNorm) \rightarrow dtype/path(Linear)\quad \text{在误差界内}
+\]
+
+还要检查 layout、alias、debug 和 state：
+
+\begin{lstlisting}[numbers=none,caption={Fusion legality checklist}]
+shape compatible
+dtype and quant profile compatible
+layout stride supported by fused kernel
+no state edge crossed
+no oracle materialization required between ops
+no alias requiring in-place preservation
+error tolerance declared
+fallback kernel exists
+\end{lstlisting}
+
+若中间 tensor 被 oracle dump 要求保存，就不能简单删除；若 Linear 需要 packed weight layout，而 RMSNorm 输出是非 contiguous view，fusion 可能需要额外 copy；若量化 scale 在两者之间有语义，fusion 必须保持 scale path。
+
+\subsection{alias/liveness/buffer reuse 的数学模型}
+
+Memory planner 可以把每个 value 看成区间：
+
+\[
+I_v = [first\_use(v), last\_use(v)]
+\]
+
+两个 buffer 复用的必要条件是：
+
+\[
+I_a \cap I_b = \emptyset
+\]
+
+但 AI runtime 还要加三条约束：
+
+\[
+\neg alias(a,b) \land \neg state(a) \land \neg materialized(a)
+\]
+
+\code{state(a)} 表示它属于 KV cache、sampler state、RNG 或跨 token 状态；\code{materialized(a)} 表示调试、oracle、profile 或外部 API 要求保留。这个模型能解释为什么 activation 可以激进复用，KV cache 不能当普通临时 tensor 复用。
+
+\subsection{反例：错误 fusion 丢掉了 oracle 和 state}
+
+\begin{lstlisting}[numbers=none,caption={错误 pass 的事故形状}]
+before:
+  q = linear_q(hidden)
+  k = linear_k(hidden)
+  k_rope = rope(k, model_position)
+  kv_append(layer, position, k_rope)
+  dump("k_rope", k_rope)
+
+bad fusion:
+  fused_qk = fused_linear_rope(hidden)
+  attention(fused_qk.q, fused_qk.k)
+  // kv_append disappeared
+  // dump disappeared
+\end{lstlisting}
+
+这个 pass 可能在单 token 测试里看似正确，因为当前 attention 仍拿到了 K；但下一个 token 读取历史 KV 时会错，debug oracle 也丢失。正确 verifier 必须检查融合前后 state read/write 集合和 materialization 集合等价。
+
+\subsection{工业取舍：为什么不直接上 MLIR/TVM}
+
+教学项目自研轻量 IR 的价值，是让读者看清 shape、layout、state、memory 和 lowering 的因果；工业系统使用 MLIR/TVM/XLA 的价值，是成熟 pass 基础设施、dialect、legalization、codegen 和生态。两者不矛盾。第三册可以先用轻量 IR 完成可解释闭环，再在源码阅读中对比 MLIR 的 dialect/operation/pass manager、TVM 的 schedule/lowering、oneDNN 的 primitive descriptor。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.32\linewidth}p{0.30\linewidth}}
+\toprule
+选择 & 优点 & 代价 \\
+\midrule
+教学轻量 IR & 易读、可控、适合贯穿项目 & codegen 和优化能力有限 \\
+MLIR/TVM/XLA & 基础设施强，工业谱系清楚 & 学习和集成成本高 \\
+直接调库 & 快速得到性能 & 编译器原理和错误边界不可见 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{实验：pass 前后 IR dump}
+
+\begin{exercisebox}
+实验一：实现或设计一个 \code{EliminateRedundantReshape} pass。给出 pass 前 IR、pass 后 IR、preserved analyses、invalidated analyses 和 verifier 输出。
+
+实验二：实现或设计 RMSNorm+Linear fusion 的 legality checker。构造四个拒绝用例：shape 不匹配、layout 非 contiguous、debug dump 要求 materialize、跨 KV state edge。
+
+实验三：给 memory planner 一个 value lifetime 表，手工做 interval coloring。标出哪些 buffer 可复用，哪些因为 oracle/state/alias 不可复用。
+
+实验四：阅读 ggml/llama.cpp、oneDNN 或 MLIR 中一个相近概念。报告必须回答：它如何表达 tensor/layout/state/pass 或 primitive，本书轻量 IR 借鉴哪一点，拒绝哪一点。
+\end{exercisebox}
+
 \subsection{C++20 实现边界}
 
 工程上，AI 编译器模块可以按下面方式组织：

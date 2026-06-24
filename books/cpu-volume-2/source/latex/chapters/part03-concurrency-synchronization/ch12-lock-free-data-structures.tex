@@ -1274,6 +1274,94 @@ ConcurrencyContract:
 
 如果这份合同写不出来，说明还没有资格把无锁结构放进生产路径。锁版实现也许慢一点，但它的失败模式更容易理解；无锁版本必须用证明和指标买回复杂度。
 
+\section{状态机：SPSC、MPMC 和关闭协议}
+
+无锁结构真正难的地方，是同一个对象同时有“槽位状态”“元素生命周期”“队列关闭状态”和“等待者状态”。下面先用 SPSC ring 固定最小状态机。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+槽位状态 & 所有者 & 合法转移 \\
+\midrule
+Empty & producer & producer 构造元素后发布 Ready \\
+Ready & consumer & consumer 读取或移动元素后发布 Empty \\
+Closing & 外层 channel & 阻止新 push，允许 drain 或 cancel \\
+Poisoned & debug/test harness & 检测误用后拒绝继续运行 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+SPSC 的简洁来自单写者：producer 写 tail 和 Empty->Ready；consumer 写 head 和 Ready->Empty。若第二个 producer 加入，tail 和槽位构造就变成多写者，原状态机失效。这个反例比“文档说不支持”更有训练价值：读者要指出哪个状态从单写者变成多写者。
+
+\subsection{MPMC 的状态机更像预留和提交协议}
+
+有界 MPMC 队列不能只靠 head/tail。producer 先抢一个序号，得到的只是预留权；元素构造完成后，还要发布 slot ready。consumer 也类似，抢到读取位置后，必须确认该 slot 属于当前轮次。
+
+\begin{lstlisting}[numbers=none,caption={MPMC slot 状态机}]
+Empty(seq = k):
+  producer CAS/reserve position k
+
+Reserved:
+  producer owns construction
+  element not visible to consumer
+
+Ready(seq = k):
+  release publish slot
+  consumer may acquire and read
+
+Consumed:
+  consumer destroys or moves element
+  slot sequence advances to next round
+\end{lstlisting}
+
+这个状态机解释了为什么 MPSC/MPMC 中“tail 增加”不等于“数据可读”。若 producer A 预留早槽位后暂停，producer B 预留晚槽位并提交，consumer 是否能越过 A，取决于队列语义。FIFO 队列不能随便越过；乱序队列可以，但必须在接口里写清。
+
+\subsection{关闭协议的工程事故}
+
+很多无锁 demo 没有关闭状态。生产系统一定有：服务退出、上游取消、超时、错误恢复、消费者提前结束。没有关闭协议时，常见事故是 producer 还在 \code{try\_push}，consumer 已销毁队列；或者关闭后 Ready 元素没 drain，资源泄漏；或者等待线程永远等一个不会变化的状态。
+
+\begin{lstlisting}[numbers=none,caption={Channel 关闭状态机}]
+Open:
+  push and pop allowed
+
+ClosingDrain:
+  new push rejected
+  existing Ready items are drained
+
+ClosingCancel:
+  new push rejected
+  Reserved items must complete or roll back
+  Ready items may be discarded with destructor
+
+Closed:
+  all waiters woken
+  storage can be destroyed
+\end{lstlisting}
+
+底层 ring 可以只提供非阻塞 \code{try\_push}/\code{try\_pop}；外层 Channel 必须补齐 wait、close、drain、cancel 和 wake。把关闭语义塞进几个布尔 flag，往往会产生不可线性化的历史。
+
+\subsection{数学模型：CAS 风暴的代价}
+
+假设 \(P\) 个 producer 争同一个 tail，每个失败 CAS 都要读写同一条 cache line。若成功率为 \(1/P\)，每个成功 push 平均伴随约 \(P-1\) 次失败尝试：
+
+\[
+attempts\_per\_success \approx P
+\]
+
+这不是严格预测，但足以说明为什么高竞争 MPMC 可能吞吐差、尾延迟高、功耗高。退避能减少无效尝试，但会增加单操作等待；分片队列能降低竞争，但引入全局顺序和负载均衡问题。工业取舍不是“无锁一定快”，而是选择哪条状态线允许被多少线程争。
+
+\subsection{实验：证明和压力测试要分工}
+
+\begin{exercisebox}
+实验一：为 SPSC ring 写并发历史表。至少包含一个 push 成功、一个 pop 成功、一个 empty 失败、一个 full 失败。标出每个操作的线性化点。
+
+实验二：故意用两个 producer 调用 SPSC ring。加入 debug owner 检查，证明错误不是随机，而是破坏了 tail 单写者状态。
+
+实验三：实现小对象池加 tagged index，构造 ABA trace。日志必须打印 index、generation、next 和线程步骤，不能只打印地址。
+
+实验四：给一个队列库填写 \code{ConcurrencyContract}。若无法回答关闭、回收、元素异常和 progress guarantee，就判定它只能作为实验依赖，不能进入主路径。
+\end{exercisebox}
+
 \section{接口延伸}
 
 无锁结构的本质不是“没有锁”，而是用更细的原子协议维护并发对象。SPSC ring 依靠单写者所有权和 release/acquire 发布；MPSC/MPMC 需要预留、提交和槽位序号；Treiber 栈展示 CAS 线性化点，也暴露 ABA 和回收难题；hazard pointer、epoch 和 RCU 都是在回答“旧节点何时安全释放”。Lock-free 保证系统整体进展，不保证每个线程低延迟；无锁代码必须可证明、可测试、可回退。

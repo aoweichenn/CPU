@@ -1095,6 +1095,92 @@ performance audit:
 
 SIMD 的工程成熟度不取决于写了多少 intrinsic，而取决于能否证明：语义相同，地址流更好，资源账本合理，端到端真的移动了瓶颈。
 
+\section{状态机：从标量循环到 SIMD kernel}
+
+向量化也可以写成状态机。这样能把“编译器是否向量化”和“手写 intrinsic 是否正确”放到同一张验收表里。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 需要证明 & 失败模式 \\
+\midrule
+ScalarContract & 标量 reference 语义、边界和错误报告稳定 & 优化目标本身语义不清 \\
+IndepOK & 迭代间无破坏性依赖，别名合同明确 & 输入输出重叠、写后读依赖 \\
+VectorBody & 主循环地址连续，lane 映射正确 & shuffle/gather 太多，地址流变差 \\
+TailHandled & 0 到 lane-1 的剩余元素被合法处理 & 越界宽读、漏处理末尾 \\
+DispatchSelected & 运行时选择正确 ISA，fallback 存在 & 不支持平台崩溃或走错路径 \\
+ResourceAudited & bytes、uops、端口、带宽和阶段收益可解释 & 只看 microbenchmark，不看端到端 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这台状态机说明，SIMD kernel 不是从 intrinsic 开始，而是从标量合同开始。若 scalar reference 没有定义 NaN、overflow、tail、错误位置和重叠输入，后面的向量化无法证明正确。
+
+\subsection{数学模型：lane 利用率和尾部成本}
+
+设向量宽度为 \(W\)，输入长度为 \(N\)，完整向量次数为 \(\lfloor N/W \rfloor\)，尾部为 \(N \bmod W\)。主循环 lane 利用率可粗略写成：
+
+\[
+util = \frac{N}{W \times \lceil N/W \rceil}
+\]
+
+当 \(N\) 很小或常落在 \(W+1\) 附近时，尾部、dispatch 和 horizontal reduction 的固定成本会吞掉收益。短字符串分类、小 batch decode、很短的 tensor tail 都是这种形状。报告不能只给大输入吞吐，还要给长度阶梯：0、1、\(W-1\)、\(W\)、\(W+1\)、\(2W-1\)、大输入。
+
+\subsection{反例：向量化后更慢}
+
+一个 AoS 结构体包含 \code{x,y,z,flag} 四个字段，kernel 只需要 \code{x}。手写 AVX2 后，代码每次载入多个结构体，再用 shuffle 抽取 \code{x}。反汇编看起来有很多向量指令，但每条 cache line 里只有一部分字节有用，shuffle 占用额外资源。把数据改成 SoA 后，即使标量代码也可能先变快，向量化才有更好上限。
+
+\begin{lstlisting}[numbers=none,caption={SIMD 变慢事故复盘字段}]
+symptom:
+  AVX2 path slower than scalar for medium input
+
+semantic:
+  checksum equal
+  tail tests pass
+
+address evidence:
+  AoS load brings unused y/z/flag bytes
+  vector path uses multiple shuffle instructions
+
+model:
+  useful_bytes_per_cache_line is low
+  shuffle cost replaces scalar load simplicity
+
+fix:
+  convert hot path to SoA or AoSoA
+  rerun scalar, auto-vectorized, intrinsic variants
+\end{lstlisting}
+
+这个反例训练一个重要判断：SIMD 不是替代数据布局的工具。布局错误时，SIMD 可能只是更快地搬运无用字节。
+
+\subsection{工业取舍：多 ISA 分发不能破坏可复现性}
+
+生产库常同时提供 scalar、SSE/NEON、AVX2、AVX-512、VNNI 或 AMX 路径。分发层必须记录选择结果，否则一次性能回归无法判断走的是哪个 backend。更麻烦的是数值可复现性：浮点归约在不同 lane 宽和合并树下可能不 bitwise 相同。工程上要把“允许误差”和“必须 bitwise 一致”写进合同。
+
+\begin{lstlisting}[numbers=none,caption={SIMD backend dispatch report}]
+input_shape
+dtype
+required_semantics: bitwise | tolerance
+selected_backend
+isa_features_detected
+alignment_path: aligned | unaligned
+tail_path
+scalar_reference_status
+max_abs_error
+cycles_per_element
+bytes_per_element
+\end{lstlisting}
+
+\subsection{实验：指令资源账本}
+
+\begin{exercisebox}
+实验一：实现数组 map 的 scalar、auto-vectorized、AVX2 或 NEON 版本。记录每元素 bytes、FLOPs、cycles、反汇编中的 load/store/shuffle 数量。说明它更像带宽瓶颈还是算术瓶颈。
+
+实验二：实现 float 求和的单累加器、四累加器、向量归约和 pairwise 版本。报告速度和误差，并说明为什么合并树改变会改变浮点结果。
+
+实验三：为一个 ASCII 分类 kernel 写长度阶梯 benchmark。长度覆盖 0、1、\(W-1\)、\(W\)、\(W+1\)、\(2W-1\)、大输入；报告 scalar fallback 阈值。
+\end{exercisebox}
+
 \section{习题}
 
 \begin{exercisebox}

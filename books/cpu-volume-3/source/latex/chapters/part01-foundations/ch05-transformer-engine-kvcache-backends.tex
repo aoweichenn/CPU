@@ -1317,6 +1317,81 @@ top-p & 累计概率和排序敏感 & 固定 logits，验证保留集合 \\
 
 工程上应先用 greedy 或固定 sampler 验证 decoder logits，再验证 sampler。若优化后 token 不同，第一步不是争论“采样随机”，而是比较 logits、top candidates、概率集合和 RNG 状态。
 
+\section{状态机：一个 token 穿过 decoder}
+
+Transformer 章节不能只列公式，还要让读者跟踪同一个 token 的状态。下面这台状态机是 reference decoder、KV cache、compiler state edge 和 serving scheduler 的共同底图。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 张量形状示例 & 关键合同 \\
+\midrule
+TokenId & \([1]\) int32 & tokenizer 输出稳定，位置已知 \\
+Embedding & \([1,H]\) fp16/fp32 & token id 不越界，dtype 转换明确 \\
+NormedHidden & \([1,H]\) & RMSNorm epsilon 和精度合同 \\
+QKVProjected & \(q:[n_q,d], k/v:[n_{kv},d]\) & GQA head 映射明确 \\
+RopeApplied & 同 Q/K & model position 不等于 physical slot \\
+KvAppended & cache 写入 \([layer,pos,kv\_head,d]\) & state write 不可删除 \\
+AttentionOut & \([1,H]\) & 读取历史 \([0..pos]\)，mask 正确 \\
+MlpOut & \([1,H]\) & SwiGLU/activation 数值稳定 \\
+Logits & \([V]\) & lm head 和 tolerance 明确 \\
+SampledToken & \([1]\) int32 & sampler state 和 RNG 可复现 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的训练价值在于：每一步都能 dump、比较和定位。若最终 token 错，不要从自然语言文本猜原因，而是沿状态机比较 embedding、RMSNorm、Q/K/V、RoPE 后 Q/K、KV append、attention score、MLP、logits、sampler state。
+
+\subsection{小模型手算：GQA head 映射和 KV 地址}
+
+设 \(n_q=4,n_{kv}=2,d=2,seq=3\)。GQA 映射通常是：
+
+\[
+kv\_head = \left\lfloor q\_head \times \frac{n_{kv}}{n_q} \right\rfloor
+\]
+
+因此 \(q\_head=0,1\) 读 \(kv\_head=0\)，\(q\_head=2,3\) 读 \(kv\_head=1\)。若 KV cache layout 是 \([layer, position, kv\_head, dim]\)，地址偏移为：
+
+\[
+offset = (((layer \times S + position) \times n_{kv} + kv\_head) \times d + dim)
+\]
+
+当 \(layer=1, position=2, kv\_head=1, dim=0, S=3,n_{kv}=2,d=2\)：
+
+\[
+offset = (((1 \times 3 + 2) \times 2 + 1) \times 2 + 0)=22
+\]
+
+这个手算例子能暴露两类真实 bug：把 \(q\_head\) 直接当 \(kv\_head\) 会越界或读错；把 physical slot 当 model position 会在 paged cache、prefix reuse 或 sliding window 下旋转错误。
+
+\subsection{数值边界：RMSNorm、softmax 和低精度误差传播}
+
+RMSNorm 的核心是：
+
+\[
+y_i = x_i \cdot \frac{w_i}{\sqrt{\frac{1}{H}\sum_j x_j^2 + \epsilon}}
+\]
+
+\(\epsilon\) 不是装饰。它决定接近零向量时的稳定性，也影响低精度路径和 reference 的误差界。softmax 也必须用 max-subtraction：
+
+\[
+softmax(z_i)=\frac{e^{z_i-m}}{\sum_j e^{z_j-m}},\quad m=\max_j z_j
+\]
+
+若直接对大 logits 求 \(\exp\)，会 overflow；若低精度 accumulation 太粗，top-k 边界可能变化。量化误差、RoPE 三角表误差、attention score 误差和 MLP 误差会层层传播；因此第三册的 oracle 要比较中间 tensor，而不是只看最终 token。
+
+\subsection{实验：固定 token trace}
+
+\begin{exercisebox}
+实验一：固定 tiny transformer 参数 \(vocab=16,H=8,layers=2,n_q=2,n_{kv}=1,d=4,seq=4\)。输出每个 token 在每层的 shape、dtype、stride、KV offset 和 checksum。
+
+实验二：故意把 GQA 映射写成 \(kv\_head=q\_head\)。要求测试在 \(n_q>n_{kv}\) 时失败，并打印错误 head、position 和 offset。
+
+实验三：构造 left padding 或 prefix reuse trace。验证 \code{model\_position}、\code{kv\_physical\_slot} 和 \code{rope\_table\_index} 三者分离。
+
+实验四：比较 naive softmax 和 max-subtraction softmax。输入包含大正数、大负数和接近 top-k 边界的 logits，报告 overflow、underflow 和 token 变化。
+\end{exercisebox}
+
 \subsection{CPU 后端、GPU 后端和同一份算子合同}
 
 理解原理后，再谈后端。CPU 和 GPU 不应该各自定义一套模型语义。它们应该共享同一份算子合同：输入 shape、dtype、layout、量化 profile、误差界、KV cache 逻辑坐标一致。不同的是物理实现。

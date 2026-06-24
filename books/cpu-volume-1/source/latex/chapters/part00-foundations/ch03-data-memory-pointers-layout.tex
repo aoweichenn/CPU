@@ -3506,6 +3506,103 @@ BufferContract:
 
 这个合同比裸指针繁琐，但它能直接回答事故问题：谁释放，谁还在读，是否允许 in-place，是否能给 SIMD，是否能跨线程，是否能写入文件格式，是否能被 memory planner 复用。底层工程的“高级感”不在于少写字段，而在于每个字段都对应一条正确性或性能边界。
 
+\section{状态机：storage、lifetime、type 和 alias}
+
+对象模型最容易被讲成若干规则。更有效的方式是把一块内存的状态写成状态机。因为工程事故通常不是“某条规则忘了”，而是对象从一个状态转到另一个状态时，旧指针、旧 view 或旧类型假设还在被使用。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 合法操作 & 典型错误 \\
+\midrule
+RawStorage & 作为字节观察、按对齐切片、等待构造 & 直接当作 \code{T*} 解引用 \\
+ObjectAlive & 按对象类型访问、读写值、创建合法 view & 错误类型访问、越界、破坏性别名 \\
+ObjectEnded & 释放资源、复用 storage、保留调试记录 & 旧指针继续读写，旧 span 进入 kernel \\
+StorageReused & 新对象开始生命周期，旧身份失效 & 地址相同就认为对象相同 \\
+BytesCopied & 表示被复制，目标是否成对象取决于类型规则 & 把 memcpy 当成任意构造机制 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个状态机把 C++ 规则和第三册 runtime 连接起来。activation arena 中，一个 buffer slice 可以从 \code{RawStorage} 进入某个 tensor view 的 \code{ObjectAlive}，在 layer 结束后进入 \code{ObjectEnded}，再被 memory planner 分配给另一个 tensor。若 oracle dump 要求保留中间值，它的生命周期就被延长；若 view alias 仍存在，复用就是 bug。memory planner 的 correctness 不是只看字节区间，而是看状态转移是否互斥。
+
+\subsection{数学模型：区间不重叠还不够}
+
+可以把一个 buffer view 表示成：
+
+\[
+V = (base, offset, bytes, align, type, lifetime, alias\_set)
+\]
+
+两个 view 可以复用同一段 storage，至少要满足：
+
+\[
+[offset_a, offset_a + bytes_a) \cap [offset_b, offset_b + bytes_b) = \emptyset
+\]
+
+或者在字节区间重叠时：
+
+\[
+lifetime_a \cap lifetime_b = \emptyset
+\]
+
+但这还不够。若 \code{alias\_set} 表示二者来自同一个外部输入、debug dump、KV state 或 view 链，memory planner 还要拒绝覆盖。形式化写法是：
+
+\[
+\begin{aligned}
+reuse(a,b) \Rightarrow{}&
+  (no\_byte\_overlap(a,b) \lor no\_lifetime\_overlap(a,b))\\
+& \land no\_state\_edge(a,b)\\
+& \land no\_oracle\_hold(a,b)
+\end{aligned}
+\]
+
+这条公式比“节省内存”更重要。它说明了为什么优秀 runtime 会有 liveness analysis、alias analysis、state edge 和 materialization point，而不是靠一个 bump allocator 随便复用。
+
+\subsection{反例：地址相同导致的错误复用}
+
+\begin{lstlisting}[numbers=none,caption={同一地址、不同对象身份的错误复用}]
+step 1:
+  tensor A uses arena[0..4096)
+  debug dump stores span<float> pointing to A
+
+step 2:
+  planner marks A dead after op 7
+  tensor B reuses arena[0..4096)
+
+step 3:
+  oracle compares saved span for A
+  it now reads B's bytes
+\end{lstlisting}
+
+这个错误在小模型里可能不暴露，因为 A 和 B 数值偶然接近，或者 debug 只在失败时打开。生产事故会表现为“打开诊断后结果变化”“只在某些 batch size 崩溃”“ASan 下正常但 release 错”。根因不是 allocator 慢，而是对象状态机没有把 oracle 持有的 view 算进生命周期。
+
+\subsection{工业取舍：内部 unsafe 必须被描述器包住}
+
+工业系统不会完全避免 \code{reinterpret\_cast}、手工对齐和 packed layout，但它们会把危险操作关在边界内：外部看到的是 \code{TensorDesc}、\code{BufferContract}、\code{Layout} 和 \code{DType}；内部 kernel 拿到的是已经验证过的指针、stride、alignment 和 tail policy。这样做的代价是描述器字段多，收益是错误可定位。
+
+\begin{lstlisting}[numbers=none,caption={对象状态机实验的检查项}]
+for every buffer reuse:
+  print old tensor name, new tensor name
+  print byte interval and alignment
+  print lifetime begin/end op
+  print alias_set and state_edge flag
+  print oracle_hold flag
+  reject reuse if any invariant fails
+\end{lstlisting}
+
+\subsection{习题：把对象模型用于 AI runtime}
+
+\begin{exercisebox}
+习题一：给三个 tensor \code{hidden0}、\code{qkv}、\code{attn\_out} 设计 lifetime 区间。判断哪些可以复用同一 arena 区间，哪些因为 debug dump 或 residual 依赖不能复用。
+
+习题二：写出一个错误示例：\code{std::span<float>} 在对象生命周期结束后仍被保存。说明为什么地址打印看起来正常，语义仍然错误。
+
+习题三：为 packed int8 weight cache 写 \code{BufferContract}。至少包含原始权重、packed 权重、scale、alignment、owner、生命周期和是否可写。
+
+习题四：比较 \code{std::memcpy}、\code{std::bit\_cast}、placement new 和 \code{reinterpret\_cast}。分别说明它们改变的是“字节”“值”“生命周期”还是“类型解释”。
+\end{exercisebox}
+
 \section{验收标准}
 
 本章收束时，应能做到：

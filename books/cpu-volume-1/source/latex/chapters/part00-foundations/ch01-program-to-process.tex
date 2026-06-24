@@ -1845,6 +1845,86 @@ build-id & 绑定二进制与符号文件 & core dump 与正确符号匹配 \\
 
 生产系统中，符号、build-id、unwind 信息和编译选项是事故分析材料的一部分。没有这些材料，性能火焰图可能只剩地址，崩溃栈可能断掉，异常路径可能被误读。第一册讲 ELF 的目的不是背字段，而是让读者知道这些“元数据”会决定真实工程能否诊断。
 
+\section{状态机：从 \code{execve} 到第一条业务指令}
+
+经典教材厚，不是因为把术语重复很多遍，而是把“程序开始运行”拆成可验证状态。下面这台状态机可以作为所有启动、冷启动、动态链接和首个请求分析的底图。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+状态 & 进入条件 & 可观察证据 \\
+\midrule
+FileChosen & shell 或父进程给出路径和 argv/envp & 命令行、工作目录、环境变量 \\
+ElfValidated & 内核读取 ELF header 并检查格式 & \cmd{readelf -h}、错误码 \\
+SegmentsMapped & 内核建立 \code{PT\_LOAD} 虚拟映射 & \filepath{/proc/self/maps}、权限位 \\
+InterpreterMapped & 动态链接器被映射并取得控制权 & \cmd{readelf -l} 的 interpreter \\
+RelocationPending & 共享库和重定位表已知但未完全解析 & \cmd{readelf -d}、\cmd{readelf -r} \\
+RuntimeInit & TLS、init array、全局构造和 libc 状态初始化 & 构造日志、\cmd{LD\_DEBUG}、trace \\
+MainEntered & 用户 \code{main} 获得控制权 & 断点、日志、采样栈 \\
+HotLoopReady & 输入和工作区准备完毕，进入被测区域 & benchmark harness 的 timed region \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的用处是排除错误归因。若首个请求慢发生在 \code{RuntimeInit} 或 \code{RelocationPending}，就不能把它算成模型 decode 慢；若慢发生在 \code{HotLoopReady} 之后，再去看汇编、cache 和 PMU 才有意义。状态机也能解释为什么同一个二进制在两台机器上冷启动差异很大：动态库路径、页缓存、ASLR、符号绑定、CPU 频率和全局构造都可能不同。
+
+\subsection{动态绑定的状态机}
+
+PLT/GOT 的第一次调用也可以写成状态机。这样比一句“第一次会慢”更可审查。
+
+\begin{lstlisting}[numbers=none,caption={lazy binding 状态机}]
+Unresolved:
+  GOT slot points to resolver trampoline
+  first call enters PLT
+
+Resolving:
+  dynamic linker searches loaded objects
+  symbol version and visibility are checked
+  relocation target is computed
+
+Patched:
+  GOT slot is updated to real function address
+  later calls skip resolver
+
+Bound:
+  hot path contains normal indirect jump/call through GOT
+\end{lstlisting}
+
+对应反例也很重要。若设置 \code{LD\_BIND\_NOW=1}，许多符号会在启动阶段解析，首个业务调用不再承担 lazy binding；若静态链接，路径又不同；若启用 \code{-fno-plt}，调用形态也会变化。报告不能只写“第一次慢”，而要写动态绑定策略和观测证据。
+
+\subsection{page fault 的状态机}
+
+page fault 不是一种单一错误，而是虚拟内存状态机中的一次转移。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+状态 & 触发 & 后果 \\
+\midrule
+MappedNoPte & VMA 存在，但页表项尚未建立 & 首次访问进入内核 \\
+MinorFault & 物理页已在内存或可零页建立 & 更新页表，重试指令 \\
+MajorFault & 需要从文件或设备读入页 & I/O 进入延迟账本 \\
+CowFault & 写共享只读页 & 复制物理页，再重试 store \\
+ProtectionFault & 权限不符或非法地址 & 信号、崩溃或异常处理路径 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+性能后果可以用一个简单实验验证：同一块 1GiB 匿名内存，第一次顺序写包含缺页和清零，第二次顺序写更多反映内存带宽；若每次 benchmark 都重新分配并首次触碰，就测到了 VM 成本，不是纯粹 store 吞吐。工程事故常发生在这里：服务上线后首个大请求 p99 高，被误判为模型 kernel 慢，实际是权重 mmap 后首次触页、透明大页整理或 COW 路径进入了计时范围。
+
+\subsection{实验：把启动路径变成证据}
+
+\begin{lstlisting}[numbers=none,caption={启动路径实验命令}]
+readelf -h ./app
+readelf -l ./app
+readelf -d ./app
+readelf -r ./app | head
+LD_DEBUG=libs,bindings ./app 2>ld-debug.txt
+cat /proc/$(pgrep app)/maps
+\end{lstlisting}
+
+实验报告要回答五个问题：入口 interpreter 是谁；哪些共享库被加载；是否存在 lazy binding；\code{main} 前是否有全局构造日志；第一次业务调用是否和第二次调用处于同一状态。能回答这些问题，才算把“从文件到进程”的状态机真正跑通。
+
 \section{反例：看似合理但错误的理解}
 
 \begin{warningbox}

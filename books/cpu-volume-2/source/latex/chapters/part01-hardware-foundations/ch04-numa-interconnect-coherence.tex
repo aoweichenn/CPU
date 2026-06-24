@@ -1009,6 +1009,85 @@ T_{local} \ge \frac{4\ \mathrm{GiB}}{100\ \mathrm{GiB/s}} = 40\ \mathrm{ms}
 NUMA 优化的第一步不是写 \code{numactl}，而是把字节、页面、线程位置和阶段时间写成账本。账本不精确也比没有账本强，因为它能排除数量级错误。
 \end{keyidea}
 
+\section{状态机和事故：MESI 直觉如何变成生产诊断}
+
+把一致性协议写成完整硬件实现会很复杂，但软件工程需要的最小状态机并不大。对一条 cache line，读者至少要能跟踪四种抽象状态：
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+状态 & 软件直觉 & 性能含义 \\
+\midrule
+Invalid & 本核心没有可用副本 & 下次访问要向外请求 \\
+Shared & 多核心可读，当前核心不能直接写 & 读可扩展，写要升级权限 \\
+Exclusive & 只有当前核心有干净副本 & 写可本地转 Modified \\
+Modified & 当前核心有最新且已修改副本 & 其他核心读写要经过当前拥有者或目录 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一次只读共享通常是 \code{Invalid -> Shared}；一次私有写可能是 \code{Invalid -> Exclusive -> Modified}；一次共享写热点则反复在不同核心之间迁移 Modified 所有权。这个状态机能解释两个看起来矛盾的事实：不可变大权重可以被许多核心同时读而扩展不错；一个 8 字节 atomic 计数器却能让 32 个核心排队。
+
+\subsection{工程事故：指标系统拖垮热路径}
+
+某个日志服务上线后，CPU 使用率升高但吞吐下降。火焰图显示业务函数仍在热路径，\code{perf stat} 显示 cycles 增加，context switch 不高，锁等待也不明显。代码审查发现每处理一条记录都会更新四个全局 atomic 指标。指标系统本来是为了可观测性，却把每条记录变成跨核心共享写。
+
+正确复盘不能只写“atomic 慢”。要按状态机写证据：
+
+\begin{lstlisting}[numbers=none,caption={共享写事故复盘字段}]
+symptom:
+  throughput drops after metrics patch
+  CPU busy but useful records/s lower
+
+code evidence:
+  hot loop updates global atomic counters per record
+  counters share one cache line or one shard
+
+model evidence:
+  every update requires writable ownership of line L
+  multiple cores rotate ownership
+
+experiment:
+  disable metrics
+  per-worker metrics
+  compact partial vs alignas(64) partial
+  hot-key input vs uniform input
+
+fix:
+  worker-local counters
+  batch export every N milliseconds
+  control-plane snapshot accepts approximate value
+\end{lstlisting}
+
+这类事故的教训是：可观测性字段也属于数据布局。指标、日志、trace id、引用计数和状态位若进入每条记录热路径，就要像业务数据一样做 cache line 和写者分析。
+
+\subsection{目录协议和 HITM：证据边界}
+
+多 socket 机器常用目录或类似机制追踪哪条 line 在哪里。软件通常看不到完整协议状态，只能通过替代证据推断，例如 remote HITM、c2c 报告、uncore 计数器、线程绑定对照、跨 socket 和同 socket 对照。报告中的严谨措辞应是“证据支持 line 所有权跨 socket 迁移”，而不是“我证明了某条 line 一定处于 M 状态”。
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+证据 & 支持的解释 & 不能单独证明 \\
+\midrule
+per-worker padding 后改善 & false sharing 或共享写参与 & 具体 MESI 转移 \\
+同 socket 快于跨 socket & 远端路径或互连参与 & 所有慢都来自 NUMA \\
+remote HITM 上升 & 远端核心持有修改 line & C++ 层语义正确 \\
+global atomic 扩展差 & 共享写热点参与 & memory order 选择就是根因 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{实验：四种布局的扩展曲线}
+
+\begin{exercisebox}
+实验一：实现四个版本的计数器：单全局 atomic、紧凑 per-worker partial、\code{alignas(64)} per-worker partial、per-socket partial。输入包含均匀 key 和 90\% 热点 key。记录 1、2、4、8、16 线程吞吐、checksum、合并时间和可用 PMU/c2c 指标。
+
+实验二：在支持 NUMA 的机器上分别测试主线程初始化和 worker first-touch。记录页面放置证据、绑定策略和远端访问替代指标。若当前机器没有 NUMA，报告必须写清“无法验证远端路径”，并保留单 socket false sharing 对照。
+
+实验三：把指标导出从每条记录更新改为每批次合并。比较吞吐、指标新鲜度和监控读取成本，说明性能收益换来了哪种可观测性延迟。
+\end{exercisebox}
+
 \section{常见误区和边界}
 
 \topic{误区一：atomic 一定比锁快}
