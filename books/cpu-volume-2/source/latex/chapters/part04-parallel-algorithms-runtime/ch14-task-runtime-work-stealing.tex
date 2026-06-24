@@ -504,6 +504,114 @@ await_resume after cancellation:
 
 这里没有免费的强制杀线程。C++ coroutine 取消通常是协作式的：运行中的用户代码必须在某些点观察 stop token 或被等待对象返回取消结果。运行时能做的是不再调度尚未运行的 continuation，唤醒等待者，并确保所有状态进入终态。
 
+\topic{Awaiter 合同：它是调度器边界，不是语法装饰}
+一个 awaiter 同时面对三方：当前 coroutine frame、被等待的状态对象、恢复它的 executor。只写 \code{await\_ready/await\_suspend/await\_resume} 三个函数名还不够，运行时必须写清它们分别持有什么锁、是否允许 inline resume、completion 发生在哪个线程、恢复后异常如何传播。下面是 Compute Systems Engine 可以采用的最小 awaiter 合同。
+
+\begin{lstlisting}[numbers=none,caption={运行时 awaiter 的最低合同}]
+RuntimeAwaiter:
+  observed_state:
+    FutureState, IoRequestState, TimerState, or TaskDependency
+  await_ready:
+    read terminal state with acquire semantics
+    return true only if await_resume can complete immediately
+  await_suspend:
+    register coroutine_handle exactly once
+    record resume_executor
+    never block the current worker
+    never call user code under observed_state lock
+  completion path:
+    publish terminal state with release semantics
+    detach continuation handles
+    enqueue handles to resume_executor
+  await_resume:
+    read terminal result
+    return value, return cancellation result, or rethrow exception
+\end{lstlisting}
+
+这个合同把 awaiter 和普通回调区分开。回调常常由 completion 线程直接调用，容易在不可控线程和锁内执行用户代码；awaiter 应该把恢复动作交给 executor。这样运行时 trace 能看到“哪个请求完成，哪个 coroutine 被入队，哪个 worker 恢复了它”。没有这条 trace，\code{co\_await} 后面的延迟很难归因：可能是 I/O 慢、completion loop 慢、executor 队列堵，也可能是 coroutine 自己执行慢。
+
+\topic{Awaitable 的四种来源}
+运行时会遇到多种 awaitable，但它们都应被降低成“状态对象 + continuation 注册 + executor 恢复”。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+awaitable 来源 & 状态对象 & completion 由谁产生 \\
+\midrule
+任务 future & FutureState & worker 完成 task wrapper \\
+任务依赖 & TaskState/ready count & 最后一个前驱完成线程 \\
+timer/sleep & TimerState & timer wheel 或 event loop \\
+异步 I/O & IoRequestState 或 CompletionRecord & I/O completion loop 或 blocking I/O domain \\
+远端 RPC & RpcCallState & network event loop 或 RPC runtime \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+表里每一行都能用同一个调度动作结束：把 coroutine handle 包成 ReadyItem，进入某个 executor 队列。不同的只是状态对象和 completion 来源。这个统一模型非常重要，因为它让 future、timer、I/O、RPC 都走同一套取消、trace、背压和 shutdown 规则。
+
+\topic{Scheduler 看到的是 ReadyItem，不是 C++ 语法}
+协程恢复时，scheduler 不需要知道源代码写的是 \code{co\_await read()} 还是 \code{co\_await sleep()}。它看到的应是一条 ReadyItem：恢复哪个 coroutine、属于哪个 request/task、恢复到哪个执行域、是否带取消或异常摘要。
+
+\begin{lstlisting}[language=C++,caption={协程恢复 ReadyItem 的语义字段}]
+enum class ReadyItemKind : std::int32_t {
+  TaskFunction,
+  CoroutineResume,
+  IoCompletionContinuation,
+  TimerContinuation,
+};
+
+struct CoroutineResumeItem {
+  std::uint64_t coroutine_id = 0;
+  std::uint64_t source_state_id = 0;
+  ReadyItemKind kind = ReadyItemKind::CoroutineResume;
+  ExecutorId resume_executor;
+  FutureErrorKind error_kind = FutureErrorKind::None;
+};
+\end{lstlisting}
+
+这段结构不是为了限制实现，而是为了固定观测字段。若恢复项没有 \code{source\_state\_id}，trace 只能看到 coroutine 突然运行，无法知道它等的是哪个 I/O 或 future。若没有 \code{resume\_executor}，跨执行域恢复就会变成隐式回调。若没有 \code{error\_kind}，异常路径只能靠用户日志追。
+
+\topic{调度器和操作系统调度器的边界}
+项目里的 scheduler 调度的是用户态工作项；Linux scheduler 调度的是内核线程。Coroutine suspend 只让用户态工作项离开 ready 队列，不会让操作系统知道“这个业务请求在等 I/O”。只有当某个 worker 队列为空、线程进入 CV/futex sleep，或者执行阻塞系统调用时，内核才看到线程睡眠。
+
+\begin{lstlisting}[numbers=none,caption={两层调度器的边界}]
+user-level scheduler:
+  owns ready task queue
+  owns coroutine ready handles
+  decides which worker executes which ReadyItem
+  records task/coroutine/request trace
+
+OS scheduler:
+  owns native threads
+  runs or parks worker threads
+  observes futex sleep, blocking syscall, runnable delay
+  does not know task dependency graph
+\end{lstlisting}
+
+这解释了为什么“CPU 线程数很多”不等于“任务运行时有执行资源”。所有 worker 都在 futex 上睡，说明 ready 队列可能为空；所有 worker 都在阻塞 I/O，说明 runtime 把设备等待放错执行域；所有 worker 都在 \code{future.get} 等同池任务，说明用户态调度器还有 ready work，但执行槽被隐藏等待占住。报告必须同时记录 OS 线程状态和用户态 worker/task 状态。
+
+\topic{Awaiter 的失败模式清单}
+协程相关 bug 经常不是语法错误，而是运行时合同破坏。最小失败模式清单如下：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.27\linewidth}p{0.34\linewidth}p{0.25\linewidth}}
+\toprule
+失败模式 & 具体错误 & 证据 \\
+\midrule
+双恢复 & ready fast path 和 completion path 都 resume & coroutine id resume count 大于 1 \\
+丢恢复 & completion 发生在注册窗口，handle 未入队 & FutureState terminal 但 coroutine Suspended \\
+锁内恢复 & completion 持锁直接执行用户代码 & lock hold ns 包含用户函数 \\
+错执行域恢复 & I/O loop 直接跑 CPU continuation & worker trace 显示 event loop 被占住 \\
+取消不终态 & stop flag 设置但 FutureState Pending & waiters 不醒，shutdown 卡住 \\
+frame 过早销毁 & task 析构 destroy 仍可能被 resume 的 frame & use-after-free 或 handle stale \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些失败模式应该进入测试矩阵：并发注册和 completion、ready fast path、late completion、取消、shutdown、跨 executor 恢复、锁内恢复检测。只测试 \code{co\_await} 成功返回值，没有覆盖协程运行时真正危险的边界。
+
 \section{任务图：把等待变成状态}
 
 第 13 章的 reduce、scan、partition 已经把算法拆成阶段。count 必须先完成，scan 才能计算 offsets；scan 完成后，write 才能写入独占区间；所有 write 完成后，manifest 才能提交。这种结构天然是任务图。若运行时只提供 \code{submit}，程序很容易写成 barrier 或 worker 内等待；若运行时支持任务图，依赖就能成为调度事实。

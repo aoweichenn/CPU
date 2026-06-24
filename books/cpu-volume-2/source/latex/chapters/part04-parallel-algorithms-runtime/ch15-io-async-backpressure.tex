@@ -198,6 +198,135 @@ thread 1: read(fd, buf1, 4096)   // offset already advanced
 
 \code{epoll} 这类 ready 机制只说明 fd 可能可读或可写，不说明业务消息已经完整。Socket 可读可能只有半个 header；可写也不保证整个响应一次写完。\code{io_uring} 更接近提交队列和完成队列模型，但仍然要处理 buffer 生命周期、短读短写、错误码、取消和完成顺序。必须避免把具体 API 神化，核心是状态机。
 
+\topic{异步 I/O 和 coroutine：completion 才能恢复 awaiter}
+把 I/O 接到 coroutine 时，关键不是把 \code{read} 包在 \code{co\_await} 后面，而是让 awaiter 等真正的 I/O completion。若 \code{await\_suspend} 里调用阻塞 \code{read}，这个 coroutine 只是换了一种写法，compute worker 仍被设备等待占住。正确模型是：提交请求，保存 buffer 所有权和 coroutine handle，worker 返回调度器；completion 到达后，I/O 层更新请求状态，再把 handle 入恢复 executor。
+
+\begin{lstlisting}[numbers=none,caption={异步 I/O awaiter 的事件链}]
+co_await async_read(request):
+  await_ready:
+    return request state is already completed
+
+  await_suspend(handle h):
+    allocate or find IoRequestState
+    record buffer_id, offset, remaining, attempt
+    record h and resume_executor
+    submit request to I/O backend
+    return to scheduler without blocking worker
+
+I/O completion loop:
+  receive CompletionRecord
+  update bytes_done, status, error_code
+  if request needs more bytes:
+      resubmit next slice or enqueue retry
+  else:
+      mark request terminal
+      detach coroutine handle
+      enqueue handle to resume_executor
+
+await_resume:
+  return completed byte count
+  or throw/read error/canceled according to request state
+\end{lstlisting}
+
+这条链把第 14 章的 awaiter 合同和本章的 CompletionRecord 接起来。awaiter 的 observed state 是 \code{IoRequestState}；completion 来源是 I/O backend；恢复动作是向 executor 投递 \code{CoroutineResumeItem}。其中任何一步直接执行用户代码，都会把 I/O completion loop 变成业务执行线程，背压和尾延迟都会失真。
+
+\topic{ready、completion 和 await resume 的区别}
+非阻塞 fd 的 ready、异步 I/O 的 completion、coroutine 的 resume 是三件事。Ready 表示“现在重试系统调用可能推进”；completion 表示“某个已经提交的请求有结果”；resume 表示“用户态 coroutine 可以继续执行”。把三者混起来，会导致半包、短写、重复提交和错执行域恢复。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.35\linewidth}p{0.31\linewidth}}
+\toprule
+事件 & 它证明什么 & 不证明什么 \\
+\midrule
+epoll readable & fd 可能读到一些字节 & 不证明完整消息或请求完成 \\
+epoll writable & fd 可能接受一些字节 & 不证明整个 buffer 已发送 \\
+io completion & 某个 request 有 bytes/status & 不证明业务 manifest 可见 \\
+awaiter ready & \code{await\_resume} 可立即完成 & 不证明一定 inline 恢复安全 \\
+coroutine resume & executor 开始执行 frame & 不证明 I/O 层还有 buffer 所有权 \\
+manifest commit & 业务结果可见 & 不证明底层临时文件都已清理 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此，I/O coroutine 的 trace 至少要记录三组时间：request submit 到 completion 的 I/O 时间，completion 到 coroutine resume 的调度时间，resume 到 manifest commit 的业务时间。只看总耗时，无法判断慢在设备、completion loop、executor 队列还是业务提交。
+
+\topic{IoRequestState：把 awaiter 和 CompletionRecord 串起来}
+\code{CompletionRecord} 是一次完成事件，\code{IoRequestState} 是请求跨多次 completion 的状态。短读短写、重试、取消和迟到 completion 都要求这个状态对象稳定存在。Coroutine awaiter 不应直接等一个裸 fd，也不应只等一个布尔 ready，而应等这条请求状态进入终态。
+
+\begin{lstlisting}[language=C++,caption={I/O awaitable 的请求状态字段}]
+enum class IoRequestStateKind : std::int32_t {
+  Created,
+  Submitted,
+  WaitingCompletion,
+  Partial,
+  RetryScheduled,
+  Completed,
+  Failed,
+  Canceled,
+  Late,
+};
+
+struct IoRequestState {
+  std::uint64_t request_id = 0;
+  std::uint64_t buffer_id = 0;
+  std::uint64_t bytes_total = 0;
+  std::uint64_t bytes_done = 0;
+  IoRequestStateKind state = IoRequestStateKind::Created;
+  ExecutorId resume_executor;
+  CoroutineHandleId awaiting_coroutine = 0;
+};
+\end{lstlisting}
+
+真实 C++ 实现会用平台的 \code{std::coroutine\_handle<>}、类型擦除 handle 或自定义 handle id；书稿里用 \code{CoroutineHandleId} 是为了强调状态边界。关键点是：completion handler 更新 \code{bytes\_done/state}；awaiter 注册 \code{awaiting\_coroutine/resume\_executor}；scheduler 只恢复 terminal request 对应的 coroutine。若 \code{bytes\_done < bytes\_total}，awaiter 不能恢复为成功，只能继续提交剩余字节或返回 partial 语义。
+
+\topic{Blocking pool、event loop 和 compute executor 的分工}
+不是所有平台都直接用 \code{io\_uring}。有些实现会用 dedicated blocking I/O thread pool 包装同步系统调用；有些用 epoll event loop；有些用真正的异步提交/完成队列。无论后端怎样，compute executor 都不应该执行长期阻塞 I/O。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.23\linewidth}p{0.34\linewidth}p{0.29\linewidth}}
+\toprule
+执行域 & 负责什么 & 不应该做什么 \\
+\midrule
+compute executor & CPU task、短 continuation、coroutine resume & 阻塞磁盘、网络、长 fsync \\
+blocking I/O pool & 包装可能阻塞的 syscall & 执行大量 CPU continuation \\
+event loop & epoll ready、timer、轻量状态推进 & 在回调里跑重业务代码 \\
+completion loop & 消费 I/O completion，更新请求表 & 持锁恢复 coroutine 或提交 manifest 重活 \\
+commit executor & checksum、manifest gate、批量提交 & 无限积压 completion buffer \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表对应第 14 章的 resume executor 选择。I/O completion loop 可以把 coroutine 恢复项投到 compute executor，也可以投到专用 continuation executor；但它不应在 completion 回调里直接运行用户 coroutine。否则一个慢 continuation 会阻塞后续 completion，buffer 归还变慢，背压链失真。
+
+\topic{异步 I/O awaiter 的关闭和取消}
+关闭时最危险的是“请求已经提交，coroutine 等着，buffer 也被 I/O 层持有”。Cancel request 可能成功，也可能请求已经完成，还可能稍后返回 late completion。awaiter 必须把这些路径都推到终态。
+
+\begin{lstlisting}[numbers=none,caption={I/O awaiter 取消和关闭路径}]
+shutdown drain:
+  reject new IoRequestState
+  keep submitted requests alive
+  process completions until request table empty
+  resume awaiting coroutines with value or error
+
+shutdown cancel:
+  reject new IoRequestState
+  request cancellation for submitted entries
+  mark not-yet-submitted entries Canceled
+  keep buffers and states until completion or reap
+  resume awaiting coroutines with canceled or final result
+
+late completion:
+  find request_id
+  if request already terminal:
+      classify as Late
+      return or retire buffer exactly once
+      do not resume coroutine twice
+\end{lstlisting}
+
+这和 future 的取消语义一致：取消请求不是终态，终态必须能被等待者观察。若 cancel 后直接销毁 \code{IoRequestState}，迟到 completion 会找不到归属；若直接销毁 coroutine frame，completion 可能恢复悬垂 handle；若不恢复 coroutine，调用者会永久挂起。I/O awaiter 的正确性就是请求表、buffer 所有权、completion 和 coroutine frame 四者同时闭合。
+
 \topic{短读短写是正常路径}
 \code{read} 和 \code{write} 返回的字节数可能小于请求字节数。网络、管道、非阻塞 fd、信号中断、设备队列和某些文件系统路径都可能出现 partial completion。正确代码必须维护 \code{offset} 和 \code{remaining}，直到完成、出错、超时或进入等待。把一次返回当作完整消息，是 I/O 程序最常见的边界错误。
 

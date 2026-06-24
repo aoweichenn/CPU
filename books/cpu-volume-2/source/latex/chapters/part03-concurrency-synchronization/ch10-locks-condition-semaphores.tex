@@ -363,6 +363,73 @@ owner_thread_state_when_waiters_blocked
 \topic{从 futex 回到设计选择}
 看到 futex wait 很多，不等于要删掉 mutex。可能的修复包括：缩短临界区、批量操作、分片队列、减少无效唤醒、把阻塞 I/O 移出 compute worker、提高任务粒度、或把复杂多字段状态保留在锁下。只有当状态机已经缩小到单个原子值、等待条件清楚、生命周期可证明时，才考虑 \code{atomic::wait} 或无锁结构。慢路径证据用来选择设计，不是用来制造对某个同步原语的偏见。
 
+\topic{futex、CV、atomic wait 和 coroutine await 的同一张等待地图}
+到这里可以把几种“等待”放在一张地图里。futex 是线程睡眠的底层慢路径；condition variable 把“多字段谓词 + mutex + 等待队列”组织起来；\code{atomic::wait} 把等待条件收缩到一个原子值；future 的阻塞 \code{get} 会让当前线程 park；coroutine 的 \code{co\_await} 则不 park 线程，而是把 coroutine frame 作为 continuation 注册到某个完成状态上。它们都在等状态变化，但保存等待上下文的位置不同。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.28\linewidth}p{0.24\linewidth}p{0.18\linewidth}}
+\toprule
+机制 & 等待上下文放在哪里 & 唤醒或恢复条件 & 是否占住线程 \\
+\midrule
+futex wait & 内核等待队列中的线程 & 用户态地址值变化后 wake & 不占 CPU，但占线程身份 \\
+CV wait & CV 等待队列中的线程 & 谓词可能变化后 notify & 不占 CPU，但占线程身份 \\
+\code{atomic::wait} & 原子地址对应的等待队列 & 原子值不再等于 old value & 不占 CPU，但占线程身份 \\
+future \code{get} & 当前线程栈和 shared state waiter & shared state terminal & 不占 CPU，但占线程身份 \\
+\code{co\_await} & coroutine frame 和 continuation list & awaitable ready 后调度 handle & 不占线程，只占 frame \\
+I/O completion & 请求表和 completion queue & 内核或 I/O worker 返回结果 & 不占 compute worker \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表解释为什么“把阻塞等待换成 coroutine”并不是简单替换 API。阻塞等待保存的是线程调用栈，调度器看到的是一个 sleeping thread；协程等待保存的是 coroutine frame，调度器看到的是一个尚未 ready 的 continuation。若 awaitable 最终仍在 compute worker 上调用阻塞 \code{read} 或 \code{future.get}，它只是把阻塞包进协程，执行资源仍会被耗尽。真正的非阻塞等待必须让完成事件来自 I/O completion、timer、FutureState completion 或任务图 ready 边，而不是让 worker 在 awaiter 里睡眠。
+
+\begin{lstlisting}[numbers=none,caption={等待机制选择的底层事件链}]
+blocking mutex/CV/future:
+  user code keeps a native thread as the waiting context
+  slow path may enter futex or kernel wait object
+  wake makes the thread runnable
+  scheduler later runs it
+  user code resumes on the same thread stack
+
+coroutine await:
+  user code stores live locals in coroutine frame
+  await_suspend registers coroutine_handle as continuation
+  current worker returns to scheduler immediately
+  completion enqueues the handle
+  some executor later resumes the frame
+
+async I/O await:
+  submit request and transfer buffer ownership
+  await_suspend records coroutine_handle in request state
+  I/O completion records bytes/status
+  completion loop enqueues coroutine_handle to executor
+  await_resume returns bytes or throws error
+\end{lstlisting}
+
+从这个角度看，futex 和 coroutine 不是竞争关系。futex 是“线程需要睡眠时”常见的内核路径；coroutine 是“不要把等待上下文绑在线程上”的语言机制。线程池、I/O runtime 和 coroutine scheduler 可以同时使用 futex：例如 executor 队列为空时，worker 线程可能用 CV/futex 睡眠；但某个业务 coroutine 等 I/O 时，不应占住这个 worker。能否区分这两层，是异步运行时设计的关键。
+
+\topic{什么时候保留线程等待，什么时候改成 awaiter}
+不是所有等待都要改成 coroutine。外部控制线程等一次初始化结果，用 \code{future.get} 或 CV 很直接；低频 shutdown 等待也可以阻塞。需要改成 awaiter 的，是那些发生在有限 compute worker 内、可能等待设备、网络、定时器、远端 RPC 或同一运行时任务的路径。判断标准不是“API 新不新”，而是等待期间这个线程是否本来应该继续推进 ready work。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.30\linewidth}p{0.30\linewidth}p{0.26\linewidth}}
+\toprule
+场景 & 合适形态 & 原因 \\
+\midrule
+主线程等初始化完成 & 阻塞 future 或 latch & 不占 compute worker，语义简单 \\
+worker 等同池子任务 & continuation 或 coroutine await & 阻塞会耗尽执行槽 \\
+worker 等磁盘或网络 & async I/O await 或 blocking pool & 设备等待不应占 compute worker \\
+executor 队列为空 & worker 线程 CV/futex sleep & 等的是调度器内部队列，不是业务 I/O \\
+单原子版本发布 & \code{atomic::wait} & 状态足够窄，避免 mutex/CV 复杂度 \\
+多字段队列关闭 & mutex + CV & 谓词跨 size、closed、error、unfinished \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此，报告里不能只写“这里用了 coroutine”。要写：等待对象是什么，completion 从哪里来，awaiter 是否会阻塞线程，恢复到哪个 executor，取消时谁把状态推到终态，底层 worker 什么时候才需要 futex sleep。否则 coroutine 只会把阻塞和生命周期错误藏进更深的状态机。
+
 \section{条件变量等待的是谓词}
 
 条件变量常被误解为事件通知系统。正确模型是：线程持锁检查共享状态；若谓词不满足，\code{wait} 原子地释放锁并睡眠；被通知或虚假唤醒后，重新持锁检查谓词。通知本身不保存状态；如果通知发生时没有等待者，它不会留在条件变量里等后来者；被唤醒也不代表条件已经成立，因为别的线程可能先拿到锁并消费资源。
