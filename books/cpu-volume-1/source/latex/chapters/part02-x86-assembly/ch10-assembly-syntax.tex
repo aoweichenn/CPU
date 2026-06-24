@@ -740,6 +740,159 @@ boundary:
   It does not prove the source loop had no aliasing problem.
 \end{lstlisting}
 
+\subsection{IEEE 754：浮点数是有格式的位串，不是实数}
+
+读到 \instruction{addss}、\instruction{addsd}、\instruction{mulps}、\instruction{vfmadd231ps} 时，不能把它们当成数学实数运算。x86-64 上常见的 \code{float} 和 \code{double} 通常使用 IEEE 754 二进制浮点格式。它们首先是固定宽度位串，然后才按符号位、指数和尾数解释成数值。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.16\linewidth}p{0.16\linewidth}p{0.16\linewidth}p{0.16\linewidth}p{0.22\linewidth}}
+\toprule
+类型 & 总位数 & 符号位 & 指数字段 & 尾数字段 \\
+\midrule
+\code{float} & 32 & 1 & 8 & 23，隐藏 leading 1 只对规格化数成立 \\
+\code{double} & 64 & 1 & 11 & 52，隐藏 leading 1 只对规格化数成立 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个格式直接解释了几个工程现象。第一，浮点有正零和负零。它们比较时通常相等，但某些运算、打印、倒数和符号传播会区分。第二，浮点有无穷大，除以零、溢出或某些库函数可能产生 \code{+inf} 或 \code{-inf}。第三，浮点有 NaN，表示不是普通数值的结果，例如 \code{0.0 / 0.0} 或无效运算。第四，浮点还有非规格化数，也叫 subnormal 或 denormal，用来表示非常接近 0 的小数，但可能触发慢路径或被运行环境刷成 0。
+
+\begin{warningbox}
+不要把 \code{float} 解释成“32 位实数”。它是 32 位 IEEE 754 编码。有限精度、特殊值、舍入模式和浮点环境都是语义的一部分。
+\end{warningbox}
+
+\subsection{舍入模式：为什么浮点加法不满足普通代数直觉}
+
+IEEE 754 运算的结果通常要舍入到目标格式。默认舍入模式常见为 round to nearest, ties to even，也就是最接近可表示值，正好居中时选尾数最低位为偶数的那个结果。除此之外，浮点环境还可能选择向零、向正无穷、向负无穷舍入。
+
+舍入会破坏很多数学直觉：
+
+\begin{lstlisting}[language=C++]
+float a = 1.0e20f;
+float b = -1.0e20f;
+float c = 3.14f;
+
+float x = (a + b) + c;
+float y = a + (b + c);
+\end{lstlisting}
+
+数学实数里两者相等；浮点里未必。因为 \code{b + c} 可能先把 \code{c} 舍掉，后续再和 \code{a} 相加就得到不同结果。优化器、向量化和 FMA 都会遇到这个边界：如果编译选项允许重关联或 fast-math，编译器可能把表达式改成数学上等价但 IEEE 结果不同的形态；如果要求严格浮点语义，编译器必须更保守。
+
+FMA 是另一个典型例子。表达式：
+
+\begin{lstlisting}[language=C++]
+float r = a * b + c;
+\end{lstlisting}
+
+可能生成分离的乘法和加法，也可能生成 fused multiply-add。分离版本先把 \code{a * b} 舍入成 \code{float}，再加 \code{c} 并再次舍入；FMA 通常在更高精度中完成乘加，只舍入一次。因此 FMA 往往更准，也可能和非 FMA 结果最后几位不同。报告中若看到 \instruction{vfmadd231ps}，不能只写“等价于乘法再加法”，而要写清它是一次 fused operation。
+
+\subsection{MXCSR：SSE/AVX 浮点环境的关键状态}
+
+整数汇编常常只需要看通用寄存器和 flags；浮点/SIMD 汇编还要知道 MXCSR。MXCSR 是 SSE/AVX 浮点环境中的控制和状态寄存器，包含舍入控制、异常标志、异常 mask，以及常见实现中的 FTZ/DAZ 控制。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+字段或概念 & 含义 & 工程影响 \\
+\midrule
+rounding control & 控制浮点结果如何舍入 & 可改变边界结果和测试 oracle \\
+exception flags & 记录 invalid、divide-by-zero、overflow、underflow、inexact 等事件 & 可用于诊断数值问题，但常被忽略 \\
+exception masks & 控制异常是置标志还是触发 trap & 默认多数环境会 mask，程序继续运行 \\
+FTZ & flush-to-zero，把某些 underflow 结果刷成 0 & 可避免 subnormal 慢路径，但改变严格结果 \\
+DAZ & denormals-are-zero，把输入 subnormal 当 0 & 可提升速度，但改变输入语义 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这解释了为什么“同一段浮点代码”在不同运行环境下可能不完全一致。一个 HPC 或 AI kernel 可能为了速度打开 FTZ/DAZ；一个数值库可能要求更严格的 IEEE 行为；一个测试如果没有记录 MXCSR，就可能在某台机器通过，在另一台机器最后几位不同或 denormal 路径耗时异常。
+
+第一册不要求手写 MXCSR 管理代码，但报告要知道怎么提问：
+
+\begin{lstlisting}[numbers=none,caption={浮点环境报告字段}]
+floating_environment:
+  target_format: f32 / f64
+  rounding_mode:
+  fma_allowed:
+  fast_math_flags:
+  mxcsr:
+    ftz:
+    daz:
+    exception_masks:
+    exception_flags_before_after:
+\end{lstlisting}
+
+\subsection{NaN、无穷大和 unordered 比较}
+
+NaN 是浮点错误分析里最容易被低估的值。NaN 与任何值比较都不满足普通全序关系，包括它自己。常见现象是：
+
+\begin{lstlisting}[language=C++]
+double x = std::numeric_limits<double>::quiet_NaN();
+bool a = (x == x);   // usually false
+bool b = (x <  1.0); // false
+bool c = (x >  1.0); // false
+\end{lstlisting}
+
+x86 SSE 比较指令会把 NaN 情况归为 unordered。你可能看到 \instruction{ucomiss}、\instruction{ucomisd}、\instruction{comiss}、\instruction{comisd} 后接条件跳转。读这类代码时不能只套整数比较直觉，因为 NaN 会影响 flags 组合和跳转选择。编译器为了实现 \code{std::isnan}、\code{x == x}、\code{x < y} 等语义，可能生成看起来不直观的条件码序列。
+
+无穷大也不是普通大数。有限数乘到溢出可能变成 \code{inf}；\code{1.0 / +0.0} 可能得到 \code{+inf}；\code{1.0 / -0.0} 可能得到 \code{-inf}。如果优化把某个分母认为“不可能为 0”，那通常需要语言前提、范围分析或 fast-math 许可。没有这些前提，直接把除法、比较或异常路径删除可能改变 IEEE 语义。
+
+\subsection{denormal/subnormal：正确性值和性能慢路径}
+
+非规格化数用于表示比最小规格化数更接近 0 的值。它们让浮点下溢附近不会突然断崖式变成 0，这叫 gradual underflow。但硬件处理 subnormal 可能明显慢，尤其是在旧 CPU 或某些指令路径上。许多实时音频、HPC 和推理 kernel 会选择打开 FTZ/DAZ，避免小值进入 denormal 慢路径。
+
+这带来一个工程取舍：
+
+\begin{itemize}
+  \item 严格 IEEE 路径保留 subnormal，结果更符合标准语义。
+  \item FTZ/DAZ 路径把极小值当 0，通常更快，但结果边界不同。
+  \item benchmark 如果输入包含大量极小值，可能测到的不是普通算术吞吐，而是 denormal 处理成本。
+\end{itemize}
+
+AI Infra 中常见的 fp32/fp16/bf16 kernel 也有类似问题。很多模型计算不要求 bit-exact，但必须写清误差边界和浮点环境。否则一个 kernel 在随机常规输入上很快，在接近 0 的 adversarial 输入上突然变慢或结果不一致，报告会无法解释。
+
+\subsection{搬运位模式和数值转换不是一回事}
+
+XMM/YMM 指令里有很多看起来都像“移动”的操作，但语义不同。下面这些要分清：
+
+\begin{lstlisting}
+movss  xmm0, dword ptr [rdi]   ; load low f32 lane as bits
+movsd  xmm0, qword ptr [rdi]   ; load low f64 lane as bits
+movd   xmm0, eax               ; move 32 raw bits between GPR and XMM
+cvtss2sd xmm0, xmm1            ; convert f32 value to f64 value
+cvtsi2sd xmm0, edi             ; convert integer value to f64 value
+\end{lstlisting}
+
+\instruction{movd} 搬的是位模式，不把整数数值“变成浮点数”。\instruction{cvtsi2sd} 才是整数到 double 的数值转换。反过来，\instruction{cvttsd2si} 这类指令把浮点转换成整数，并涉及舍入或截断、溢出和异常边界。读汇编时如果把 bit move 和 numeric conversion 混掉，就会把 ABI glue、类型转换和优化序列全部看错。
+
+\subsection{XMM/YMM 高位：标量低 lane 不代表高 lane 有意义}
+
+标量浮点指令通常只把业务值放在低 lane。高 lane 可能保留旧值，也可能被清零，具体取决于 legacy SSE、VEX/EVEX 编码和指令规则。比如 \instruction{addss} 的核心业务值是低 32 位标量；\instruction{vaddss} 的三操作数形态还涉及高位从哪个源寄存器继承。阅读时应避免把整个 \register{xmm0} 都解释成一个“干净对象”。
+
+常见清零 idiom：
+
+\begin{lstlisting}
+vxorps xmm0, xmm0, xmm0
+xorps  xmm0, xmm0
+\end{lstlisting}
+
+它们通常用于把寄存器置零，但在 AVX/SSE 混合代码中，VEX 编码的零 idiom 还可能帮助处理上半寄存器状态。函数从 AVX 代码返回到可能使用 legacy SSE 的调用者前，编译器或库函数常见 \instruction{vzeroupper}，用于避免某些微架构上的 SSE/AVX 过渡惩罚。第一册不要求深入性能细节，但报告要能识别这不是“无意义清零”。
+
+\subsection{浮点反例：为什么 bit-exact 测试经常不合适}
+
+浮点优化的正确性不能简单套整数 bit-exact 习惯。下面几个变化都可能让最后几位不同：
+
+\begin{itemize}
+  \item 标量循环改成 SIMD reduction，改变求和顺序。
+  \item 分离乘加改成 FMA，改变舍入次数。
+  \item 开启 \code{-ffast-math}，允许重关联、忽略部分 NaN/Inf 语义。
+  \item 打开 FTZ/DAZ，改变 subnormal 输入或输出。
+  \item 使用不同 libm 实现或目标 ISA，改变近似函数结果。
+\end{itemize}
+
+因此，浮点测试报告要写清：本函数要求 bit-exact，还是允许绝对误差/相对误差/ULP 误差；是否允许 FMA；是否允许 fast-math；是否测试 NaN、Inf、signed zero、subnormal 和极大值。没有这些字段，只说“结果差一点”或“结果一致”都不够专业。
+
 \section{内存寻址模式：地址公式如何写进指令}
 
 x86-64 最常见的内存操作数形式是：
