@@ -2696,6 +2696,133 @@ g++ -std=c++20 -O1 -g -fsanitize=address,undefined \
 \end{itemize}
 \end{labbox}
 
+\section{实验：系统边界、vDSO 与 unwind 证据包}
+
+前面的实验已经能让你观察源码、目标文件、进程身份和动态链接。还差一层很容易被初学者忽略：用户态代码跨到系统边界时，证据不再只来自反汇编。一次 \code{clock\_gettime} 可能走 vDSO 快路径，也可能退化为 syscall；一次崩溃的 backtrace 可能依赖 frame pointer，也可能依赖 DWARF CFI；一次异常传播是否能清理 RAII 对象，取决于编译器生成的 unwind metadata 和 ABI 约定。若这些事实没有进入报告，后面做 benchmark、线程池、I/O 和推理 runtime 时，很容易把系统边界成本误判成 C++ 函数成本。
+
+\subsection{syscall 不是普通函数调用}
+
+用户态函数调用的证据主要来自 ABI：参数寄存器、返回寄存器、栈对齐、caller-saved/callee-saved。系统调用的边界不同。用户态要通过专门指令进入内核，内核按 syscall number 分派，可能检查权限、访问文件描述符、修改页表、阻塞当前线程或触发调度。于是同样是“调用一个接口”，普通函数、PLT 外部调用、vDSO 快路径和真正 syscall 的证据层级不同。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.33\linewidth}p{0.33\linewidth}}
+\toprule
+路径 & 主要证据 & 不能直接推出 \\
+\midrule
+普通函数 & \code{call}、符号、ABI 寄存器 & 系统边界成本 \\
+PLT/GOT & \code{@plt}、\code{JUMP\_SLOT}、动态段 & 每次都解析符号 \\
+vDSO & \filepath{/proc/<pid>/maps} 中 \code{[vdso]}、无对应 syscall trace & 一定比所有用户态函数便宜 \\
+syscall & \code{strace}、返回 errno、内核边界 & 热循环一定慢在内核 \\
+page fault & fault 计数、\code{maps/smaps}、首次触页对照 & 普通 load 本身变慢 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个表要求报告写窄结论。例如 \code{strace} 没看到 \code{clock\_gettime}，只能说明当前路径可能由 vDSO 或用户态库处理；不能推出所有计时器调用都没有成本。反过来，\code{strace} 看到大量 \code{futex}，也不能直接说锁是唯一瓶颈，还要结合线程状态、等待时间、调用点和输入。
+
+\subsection{vDSO：像函数调用，但身份来自内核映射}
+
+vDSO 是内核映射到用户进程地址空间的一小段只读代码，用来让某些查询不必每次陷入内核。例如常见的时间查询可能通过 vDSO 读取内核维护的只读数据和硬件时钟信息。它的工程意义很直接：benchmark 计时器调用不是零成本，但也不一定是完整 syscall 成本。
+
+\begin{lstlisting}[language=bash,caption={观察 vDSO 和计时器路径}]
+cat /proc/self/maps | grep -E 'vdso|vvar'
+strace -e clock_gettime,gettimeofday ./timer_probe
+objdump -T /lib/x86_64-linux-gnu/libc.so.6 | grep clock_gettime
+\end{lstlisting}
+
+报告应记录三类结果。第一，\filepath{/proc/self/maps} 是否存在 \code{[vdso]} 和 \code{[vvar]}。第二，\code{strace} 是否看到目标计时系统调用。第三，计时器调用的微基准开销是否相对被测 kernel 足够小。若被测函数只有几十纳秒，而计时器本身也在这个量级，就必须改用批量循环、硬件计数器或更粗的阶段计时。
+
+\begin{warningbox}
+\textbf{证据边界：} vDSO 是否被使用随架构、内核、libc、时钟类型和容器环境变化。书中给的是证据路径，不是保证所有机器输出一样。
+\end{warningbox}
+
+\subsection{DWARF CFI：调试器怎样找回调用者}
+
+当 GDB、profiler 或异常运行时需要从当前指令位置回到调用者时，它必须知道当前函数如何移动了栈指针、返回地址在哪里、哪些寄存器被保存在哪里。最直观的做法是使用 frame pointer；优化构建可能省略 frame pointer，此时工具依赖 unwind table 和 DWARF CFI。
+
+\begin{lstlisting}[language=bash,caption={保存 unwind 证据的命令}]
+g++ -O2 -g -fno-omit-frame-pointer unwind_demo.cpp -o fp_on
+g++ -O2 -g -fomit-frame-pointer unwind_demo.cpp -o fp_off
+
+readelf --debug-dump=frames fp_on  > results/fp_on.frames.txt
+readelf --debug-dump=frames fp_off > results/fp_off.frames.txt
+objdump -drwC -Mintel fp_on  > results/fp_on.objdump.txt
+objdump -drwC -Mintel fp_off > results/fp_off.objdump.txt
+\end{lstlisting}
+
+比较这两个二进制时，不要只看“能不能 backtrace”。更好的报告会同时写：函数序言是否保存 \register{rbp}；\code{.eh\_frame} 或 debug frame 中是否存在 FDE；崩溃点落在函数中间时，CFI 如何描述 CFA；采样 profiler 是否能在优化构建下恢复稳定调用栈。
+
+\begin{lstlisting}[numbers=none,caption={unwind 证据包字段}]
+unwind_evidence:
+  binary_path
+  build_flags
+  frame_pointer_policy
+  has_eh_frame
+  has_debug_info
+  sample_pc
+  recovered_backtrace
+  failure_boundary
+\end{lstlisting}
+
+\subsection{异常展开和 RAII：控制流不只从 return 返回}
+
+C++ 异常会沿调用栈寻找 handler，并在经过的栈帧中执行需要析构的对象。若手写汇编函数没有正确 unwind 信息，或者 C++ 与汇编互操作破坏了栈约定，异常路径可能无法正确穿过该函数。第一册不要求完整掌握异常 ABI，但必须知道异常展开不是“跳到 catch”这么简单。
+
+\begin{lstlisting}[language=C++,caption={用于观察异常展开的小程序}]
+struct Guard {
+  const char* name;
+  ~Guard() { std::puts(name); }
+};
+
+void leaf() {
+  Guard g{"leaf cleanup"};
+  throw std::runtime_error("boom");
+}
+
+void middle() {
+  Guard g{"middle cleanup"};
+  leaf();
+}
+\end{lstlisting}
+
+这个程序的报告要包含：正常异常路径打印哪些 cleanup；关闭异常或破坏 unwind 信息后会怎样失败；\code{readelf --debug-dump=frames} 能看到什么；GDB 的 \code{bt} 是否能恢复 \code{leaf -> middle -> main}。这样读者会知道 RAII 的可靠性依赖语言语义、编译器生成、ABI 和运行时元数据共同成立。
+
+\subsection{一个合格的系统边界报告}
+
+系统边界报告不需要很长，但必须把“工具看到什么”和“我们能推出什么”分开。下面是推荐模板：
+
+\begin{lstlisting}[numbers=none,caption={系统边界报告模板}]
+program:
+  source_commit
+  build_flags
+  binary_build_id
+
+runtime_identity:
+  argv
+  cwd
+  exe
+  maps_summary
+
+system_boundary:
+  vdso_present
+  syscalls_observed_by_strace
+  page_faults_from_time_or_perf
+  context_switches
+
+unwind_debug:
+  frame_pointer_policy
+  eh_frame_present
+  backtrace_quality
+
+conclusion:
+  facts
+  supported_inference
+  unsupported_claims
+\end{lstlisting}
+
+这个模板直接服务后面的性能章节。若一个 benchmark 的长尾来自 major fault、futex wait、首次动态绑定或计时器扰动，而报告没有记录系统边界，优化方向就会错。
+
 \section{本章作业}
 
 \begin{exercisebox}

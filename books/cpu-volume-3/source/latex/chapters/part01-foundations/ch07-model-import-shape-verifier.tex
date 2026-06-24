@@ -303,6 +303,203 @@ error: tensor layers.12.attn.wk.weight has incompatible shape
 
 这些产物会直接进入第 6 章讲过的后续流水线：Graph IR rewrite、Tensor IR layout 选择、memory planning、CPU/GPU lowering 和 runtime dispatch。前端如果偷懒，后端就会被迫补课；而后端补课通常发生在最难调试、最要求性能稳定的地方。
 
+\subsection{真实模型资产闭环：从目录到第一条 token trace}
+
+一个本地推理引擎不能只验证 toy fixture。真正有求职说服力的前端报告，应能把一个真实模型目录推进到第一条可解释 token trace。这里的“真实”不是必须一开始支持所有格式，而是至少支持一种明确资产形态，并把文件事实、tokenizer、权重索引、typed graph 和 reference decoder 连接起来。
+
+\begin{lstlisting}[numbers=none,caption={真实模型导入的最小验收路径}]
+model_asset
+  -> parse metadata and tokenizer contract
+  -> build tensor index with offsets, byte lengths, dtype
+  -> verify shapes, quant descriptors, checksums
+  -> create typed graph and state descriptors
+  -> mmap or load weights under ownership rules
+  -> run tokenizer on fixed prompt
+  -> run one reference decode step
+  -> dump checkpoint trace and logits checksum
+\end{lstlisting}
+
+这条路径比“模型能加载”更严格。它要求每个阶段都有可保存的产物：\filepath{manifest.json}、\filepath{tensor-index.csv}、\filepath{verify-report.txt}、\filepath{graph-ir.txt}、\filepath{trace.csv} 和 \filepath{logits-golden.txt}。后端优化可以晚一点做，但前端资产闭环必须先稳住，否则后面的 kernel benchmark 很可能在错误输入上跑得很快。
+
+\subsection{GGUF 和 safetensors：两类不同边界}
+
+真实模型常见资产形态至少有两类。GGUF 更像一个把 metadata、tensor directory 和权重字节放在同一容器里的本地推理资产；safetensors 更强调安全的张量存储和 metadata，tokenizer/config 通常以旁路 JSON 文件存在。教材不要求一开始同时实现两者，但要把它们的工程边界讲清楚。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+资产形态 & 前端要提取 & 常见错误边界 \\
+\midrule
+GGUF & metadata、tensor name、offset、dtype、shape、quant type & metadata 方言、量化块解释、tokenizer 字段不完整 \\
+safetensors & JSON header、tensor offsets、dtype、shape、metadata & config/tokenizer 分离，权重名方言需要 schema resolution \\
+tokenizer JSON/model & vocab、normalizer、pre-tokenizer、special tokens & BOS/EOS 规则、byte fallback、词表和 embedding 不一致 \\
+generation config & stop token、max length、sampling defaults & sampler 和 tokenizer 合同不一致 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的结论是：模型格式不是普通文件读取问题。GGUF 的 tensor directory 能帮你快速建立权重索引，但你仍要解释量化块；safetensors 的张量边界清晰，但模型结构和 tokenizer 合同往往要从其他文件合并。无论哪种格式，前端最终都必须产出同一种内部 manifest，否则后端会被格式细节污染。
+
+\subsection{tensor index：mmap 之前先证明字节范围}
+
+权重文件最好不要一开始就读成一堆 \code{std::vector<float>}。真实模型可能十几 GB，前端需要先建立 tensor index：每个张量的文件、偏移、字节长度、对齐、dtype、shape、checksum 和逻辑角色。只有 index 通过验证后，runtime 才能决定 mmap、按需加载、预取或复制到 backend packed cache。
+
+\begin{lstlisting}[numbers=none,caption={tensor index 的最低字段}]
+TensorIndexEntry:
+  canonical_name
+  source_name
+  file_path
+  offset_bytes
+  length_bytes
+  alignment
+  shape
+  storage_dtype
+  logical_dtype
+  quant_descriptor_id
+  checksum
+  mmap_allowed
+\end{lstlisting}
+
+验证规则要非常机械。张量字节范围不能越过文件大小；两个张量范围不能意外重叠，除非格式明确允许 alias 或 tied weight；offset 要满足格式和后端对齐要求；packed quant tensor 的字节长度要能由 shape、bit width、block size 和 scale metadata 推导出来。若这些规则不通过，错误必须停在导入阶段。
+
+\begin{lstlisting}[numbers=none,caption={字节范围 verifier 的拒绝条件}]
+reject if offset + length > file_size
+reject if range overlaps another tensor without alias record
+reject if length != expected_storage_bytes(shape, dtype, quant)
+reject if checksum exists and does not match
+reject if backend requires alignment and offset violates it
+\end{lstlisting}
+
+这一步能阻止很多“后端崩溃”。例如 int4 权重少了最后一个 scale block，kernel 可能只在某个 output tile 读到越界；如果 tensor index 阶段已经计算 expected bytes，错误会变成一条清楚诊断，而不是随机 logits 漂移。
+
+\subsection{tokenizer golden：真实 prompt 的第一道 oracle}
+
+真实模型链路的第一个 golden output 不应该是最终生成文本，而应该是 tokenizer 输出。固定一个短 prompt，例如 \code{"Hello"} 或中文短句，保存 token id 序列、BOS/EOS 插入规则和特殊 token 处理。若 tokenizer 都不一致，后续 embedding、RoPE、KV cache 和 logits 全部没有比较意义。
+
+\begin{lstlisting}[numbers=none,caption={tokenizer golden 报告}]
+tokenizer_golden:
+  model_id
+  tokenizer_hash
+  prompt_utf8_hex
+  add_bos: true
+  add_eos: false
+  tokens: [1, 15043]
+  token_count: 2
+  vocab_size: 32000
+  embedding_rows: 32000
+\end{lstlisting}
+
+报告里保存 \code{prompt\_utf8\_hex} 是为了避免不可见空格、换行、全角字符、Unicode normalization 和编辑器编码把实验搞乱。中文 prompt 尤其要保存原始 UTF-8 字节，因为不同 tokenizer 对空格、字节 fallback 和 normalization 的处理差异会直接改变 token id。
+
+\subsection{第一条真实 trace：不要直接对最终文本}
+
+前端闭环的第一条 trace 可以只跑一层或一个 decode step，但必须包含中间 checkpoint。建议固定字段如下：
+
+\begin{lstlisting}[numbers=none,caption={真实模型 first-token trace schema}]
+trace_row:
+  stage
+  layer
+  position
+  tensor_name
+  shape
+  stride
+  dtype
+  layout
+  checksum
+  max_abs
+  max_rel_error_vs_reference
+\end{lstlisting}
+
+最小 checkpoint 顺序为：
+
+\begin{lstlisting}[numbers=none,caption={first-token trace checkpoint}]
+tokenizer
+embedding
+layer0.input_rmsnorm
+layer0.qkv_linear
+layer0.rope_q
+layer0.rope_k
+layer0.kv_append
+layer0.attention_scores
+layer0.attention_out
+layer0.mlp_gate_up
+layer0.block_out
+final_norm
+lm_head_logits
+sampler_selected_token
+\end{lstlisting}
+
+如果项目暂时没有完整真实模型后端，也可以先只执行 reference path 和 shape trace。关键是产物要固定下来：同一模型资产、同一 prompt、同一 commit 应输出同一批 checkpoint checksum。后续 SIMD kernel、paged KV、int4 weight 或 GPU backend 只要在某一步开始偏离，就能定位到具体阶段。
+
+\subsection{mmap 权重加载的所有权合同}
+
+真实权重导入通常会使用 mmap 或分块读取。mmap 的好处是避免一次性复制整个文件，并允许按需触页；代价是生命周期、page fault、文件替换和错误边界更复杂。前端 manifest 必须把“张量视图”和“文件映射”分开建模。
+
+\begin{lstlisting}[numbers=none,caption={mmap 权重所有权状态机}]
+Mapped:
+  file descriptor validated
+  mapping created
+  tensor index ranges point into mapping
+
+PinnedForPlan:
+  executable plan holds references to tensor views
+  file identity and checksum recorded
+
+Packed:
+  backend-specific packed weights created
+  packed cache has its own ownership
+
+Released:
+  no live tensor view may point into unmapped bytes
+\end{lstlisting}
+
+错误案例很具体：如果 runtime 在 packing 后释放 mmap，但某个 fallback kernel 仍指向原始 weight view，短测试可能不触发，长请求或错误路径才崩溃。解决办法不是“别释放”，而是让 executable plan 明确记录每个 segment 使用原始 view、packed cache 还是 device buffer。所有权状态必须能被 verifier 检查。
+
+\subsection{真实模型导入的负例包}
+
+toy 模型负例不够。真实资产导入要构造能模拟转换器错误的负例包：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.26\linewidth}p{0.35\linewidth}p{0.25\linewidth}}
+\toprule
+负例 & 应该被谁拒绝 & 若漏掉会怎样 \\
+\midrule
+tokenizer vocab 比 embedding 多 1 & tokenizer/embedding verifier & 特殊 token 偶发越界 \\
+QKV packed 顺序写错 & schema resolver & attention 语义交换但形状正确 \\
+tensor offset 少 16 字节对齐 & tensor index verifier & SIMD load 或 mmap view 边界异常 \\
+q4 scale block 少一个 & quant verifier & 某个 tile 反量化读错 \\
+RoPE scaling metadata 缺失 & position verifier & 短上下文通过，长上下文漂移 \\
+lm head tied weight 未声明 alias & alias verifier & memory planner 误释放或重复加载 \\
+config max context 大于 KV plan 容量 & admission/runtime verifier & decode 中途越界或拒绝太晚 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些负例训练的是“错误停在哪一层”。如果 QKV 顺序错被 attention kernel 才发现，说明 schema 解析太弱；如果 vocab mismatch 到 sampler 才发现，说明 tokenizer 合同没有前置；如果 q4 scale 缺失到 AVX2 kernel 才崩，说明 quant verifier 没有完成字节账本。
+
+\subsection{导入报告和求职证据}
+
+第三册项目的导入报告应当可以直接放进作品集。它不需要夸大支持所有模型，但必须诚实且可复现：
+
+\begin{lstlisting}[numbers=none,caption={真实模型导入报告目录}]
+model-import-report/
+  asset-summary.txt
+  commands.txt
+  environment.txt
+  manifest.json
+  tensor-index.csv
+  verifier-report.txt
+  tokenizer-golden.txt
+  graph-ir.txt
+  first-token-trace.csv
+  logits-checksum.txt
+  unsupported-features.txt
+\end{lstlisting}
+
+\filepath{unsupported-features.txt} 很重要。若当前只支持 fp16 safetensors，不支持 GGUF q4；只支持独立 Q/K/V，不支持 packed QKV；只支持基础 RoPE，不支持某种 scaling；都应该明确写出来。生产级工程不是永远支持一切，而是知道自己支持什么、拒绝什么、如何诊断。
+
 \subsection{本节验收线}
 
 读完本节，应该能说明 AI 编译器前端在本地推理引擎中的职责：
@@ -314,6 +511,9 @@ error: tensor layers.12.attn.wk.weight has incompatible shape
   \item dtype 和 quant verifier 区分逻辑 dtype、存储 dtype 和计算 dtype。
   \item tokenizer 合同必须和 embedding、generation config、max context 一起检查。
   \item 好诊断应该指出 tensor、期望、实际、推导来源和可能错因。
+  \item 真实模型导入要产出 manifest、tensor index、tokenizer golden、typed graph 和 first-token trace。
+  \item mmap 权重视图、packed weight cache 和 device buffer 要有明确所有权状态。
+  \item 负例包要证明错误停在前端，而不是落到后端 kernel 或 sampler 才暴露。
 \end{itemize}
 
 下一步进入 runtime 和 memory planner 时，这些前端产物会成为所有优化的前提：只有 typed graph 的边界稳定，内存生命周期、kernel selection 和 CPU/GPU 后端计划才有可信输入。
