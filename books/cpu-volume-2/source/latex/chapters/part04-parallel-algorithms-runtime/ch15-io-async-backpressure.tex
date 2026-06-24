@@ -40,6 +40,100 @@
 
 异步 I/O 的目标不是让设备变快，而是把等待从执行线程上移走。提交请求后，CPU 可以继续处理其他工作；完成事件稍后返回，告诉系统这次请求成功、失败、短写、取消还是超时。这个分离提升并发度，也引入新的状态机。任何异步设计都要先回答：请求提交后谁拥有 buffer，completion 由谁消费，失败如何传播，取消后迟到 completion 怎么处理。
 
+\topic{文件 I/O 的第一层对象：path、fd、open file description、inode}
+文件 I/O 不能只记住 \code{read(fd,...)} 和 \code{write(fd,...)}。应用传入的是 path，内核打开后返回 file descriptor，fd 指向一个 open file description，open file description 再引用文件对象、当前 offset、打开标志和访问模式，底层文件系统对象通常可理解为 inode 或类似结构。多个 fd 可能指向同一个 open file description，也可能分别打开同一个 path 得到不同 description。
+
+\begin{lstlisting}[numbers=none,caption={文件 I/O 对象关系}]
+path string
+  -> pathname lookup
+  -> inode or filesystem object
+  -> open file description: flags, current offset, status
+  -> file descriptor number in this process
+\end{lstlisting}
+
+这条链解释了很多并发 I/O bug。复制 fd 的 \code{dup}、\code{fork} 继承或把同一个 fd 传给多个线程，可能共享同一个 current offset；两个线程同时用 \code{read} 读取同一个 fd，读到的位置由共享 offset 推进顺序决定。若每个线程单独 \code{open} 同一个文件，通常得到各自的 open file description，offset 不共享。若要并行读取固定区间，应优先使用带显式 offset 的 \code{pread}，避免把文件位置当成隐藏共享状态。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.35\linewidth}p{0.29\linewidth}}
+\toprule
+操作 & offset 行为 & 并发后果 \\
+\midrule
+\code{read(fd)} & 使用并推进 open file description 的 current offset & 多线程共享 fd 时顺序变成隐藏状态 \\
+\code{pread(fd, off)} & 使用显式 offset，不改变 current offset & 更适合分片并行读取 \\
+\code{dup(fd)} & 新 fd 指向同一 open file description & offset 和状态仍共享 \\
+\code{open(path)} 两次 & 通常得到两个 description & offset 通常分离，底层文件相同 \\
+\code{O_APPEND} 写 & 每次写追加到文件末尾 & 避免手动 seek 竞争，但仍要处理短写和错误 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+报告里如果只写“多线程读同一个文件”，信息不够。要写清：是共享一个 fd，还是每线程独立 open；是 \code{read}，还是 \code{pread}；是否使用 \code{O_APPEND}；是否有 \code{dup}/\code{fork}；是否把 fd 交给了库函数。否则很多“随机错位”“重复读取”“漏读”的 bug 会被误判成 parser 问题。
+
+\topic{\code{open}、\code{read}、\code{write}、\code{close} 的最小合同}
+\code{open} 的返回值不是文件内容，而是进程 fd 表中的一个小整数句柄。它可能失败，失败原因包括路径不存在、权限不足、fd 数量耗尽、目录不存在、文件系统只读、路径太长等。成功后，fd 必须在所有路径上关闭；但 \code{close} 本身也可能返回错误，尤其是写出路径中，某些错误可能延迟到 \code{close} 或 \code{fsync} 才暴露。写可靠输出时，不能只检查 \code{write} 返回值而忽略 \code{fsync/close}。
+
+\begin{lstlisting}[language=C++,caption={同步文件读取的基础合同，不是高性能版本}]
+int fd = ::open(path, O_RDONLY | O_CLOEXEC);
+if (fd < 0) {
+    return error_from_errno(errno);
+}
+
+std::uint64_t done = 0;
+while (done < size) {
+    ssize_t n = ::read(fd, buffer + done, size - done);
+    if (n > 0) {
+        done += static_cast<std::uint64_t>(n);
+        continue;
+    }
+    if (n == 0) {
+        break; // EOF
+    }
+    if (errno == EINTR) {
+        continue;
+    }
+    return error_from_errno(errno);
+}
+
+if (::close(fd) != 0) {
+    return error_from_errno(errno);
+}
+\end{lstlisting}
+
+这段代码故意保留循环，因为短读是正常路径。它也区分 \code{n == 0} 的 EOF、\code{EINTR} 的可重试中断、和真实错误。写路径同理：\code{write} 返回正数但小于请求长度时必须继续写；返回 \code{-1} 且 \code{errno == EINTR} 可重试；非阻塞 fd 的 \code{EAGAIN} 表示当前不能推进，应该进入等待机制，而不是当成 fatal error。
+
+\topic{stdio 缓冲和系统调用不是同一层}
+\code{FILE*}、\code{fread}、\code{fprintf}、\code{std::ofstream} 这类接口通常在用户态有缓冲。用户调用 \code{fprintf} 成功，可能只是写入了 libc 或 C++ iostream 缓冲；真正的 \code{write} 系统调用稍后才发生。\code{fflush} 把用户态缓冲推给内核，不等于数据持久化；\code{fsync} 针对 fd 的内核侧脏数据和 metadata 才讨论持久边界。混用 \code{FILE*} 缓冲和底层 fd 系统调用时，如果不 \code{fflush} 或不理解 offset，同一文件的读写顺序很容易错乱。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.23\linewidth}p{0.37\linewidth}p{0.28\linewidth}}
+\toprule
+层次 & 成功说明 & 不说明什么 \\
+\midrule
+\code{fprintf}/\code{ofstream} & 用户态库接受了数据 & 不说明已进入内核 page cache \\
+\code{fflush} & 用户态缓冲尝试写给内核 & 不说明已经落盘 \\
+\code{write} & 内核接受了部分或全部字节 & 不说明 durable \\
+\code{fsync} & 推进文件持久化边界 & 不说明业务 manifest 已提交 \\
+\code{close} & 释放 fd，可能报告延迟错误 & 不等同于完整恢复协议 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+工程建议很直接：热路径和可靠写路径尽量不要混用多层 I/O 抽象。同一个 fd 上如果既用 \code{FILE*} 又用 \code{read/write/lseek}，必须明确缓冲刷新、offset 和错误传播。性能报告也要写清使用的是 raw syscall、stdio、iostream、mmap 还是库封装；否则“文件 I/O 慢”这个结论不可比较。
+
+\topic{文件 offset 是隐藏共享状态}
+线程安全不等于语义正确。两个线程同时调用 \code{read(fd)}，内核可以让每次读取按某种顺序推进共享 offset，数据竞争未必发生在 C++ 对象上，但业务分片可能已经错了。更隐蔽的是一个线程 \code{lseek(fd, off)}，另一个线程随后 \code{read(fd)}；如果中间有第三个线程改变 offset，读取位置就不是调用者以为的位置。并行扫描文件时，显式 offset 比共享 offset 更可靠。
+
+\begin{lstlisting}[numbers=none,caption={共享 offset 导致分片语义不稳定}]
+thread 0: lseek(fd, 0)
+thread 1: lseek(fd, 4096)
+thread 0: read(fd, buf0, 4096)   // may read from 4096, not 0
+thread 1: read(fd, buf1, 4096)   // offset already advanced
+\end{lstlisting}
+
+正确的并行读设计通常让分片计划先产生 \code{(offset, length)}，worker 使用 \code{pread} 或独立 fd 读取自己的范围。若文件是日志或变长记录，还要处理边界：每个 split 从某个 offset 附近开始，但第一条完整记录可能要向前或向后找换行。I/O 基础和第 13 章 partition 的联系就在这里：分片不仅是计算问题，也是文件位置和记录边界问题。
+
 \topic{阻塞、非阻塞和异步}
 阻塞 I/O 调用可能让当前线程睡眠，直到有结果。非阻塞 I/O 调用立即返回，若当前不能读写，返回 \code{EAGAIN} 或类似状态；应用需要等待 ready 事件后再试。异步 I/O 提交请求，完成队列稍后返回结果。三者不是“低级到高级”的线性关系，而是控制流和资源模型不同。
 
