@@ -252,6 +252,97 @@ ret
 \register{rcx} 在 System V ABI 中是第 4 个整数参数；在 Windows x64 ABI 中，\register{rcx} 是第 1 个整数参数。看资料或反汇编时必须先确认目标 ABI。
 \end{warningbox}
 
+\subsection{x86-64 evidence pack：从函数签名到重定位}
+
+ABI 规则不能只停在表格里。下面把一个最小函数生成 x86-64 目标文件，并保留汇编、符号和重定位证据。这个证据包可以在原生 x86-64 Linux 上运行；也可以在其他架构机器上用 clang 交叉生成 \code{x86\_64-linux-gnu} 目标文件。后者只能证明二进制产物形状，不能证明本机执行性能。
+
+\begin{lstlisting}[language=C++,caption={被测函数：add\_i32}]
+extern "C" int add_i32(int a, int b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+生成汇编和目标文件：
+
+\begin{lstlisting}[language=bash,caption={生成 x86-64 汇编和目标文件}]
+clang++ -x c++ -std=c++20 -O3 -target x86_64-linux-gnu \
+  -S -masm=intel -o add_i32.s add_i32.cpp
+
+clang++ -x c++ -std=c++20 -O3 -target x86_64-linux-gnu \
+  -c -o add_i32.o add_i32.cpp
+
+nm -C add_i32.o
+llvm-objdump -dr --x86-asm-syntax=intel add_i32.o
+readelf -s add_i32.o
+\end{lstlisting}
+
+一份真实输出的核心部分如下：
+
+\begin{lstlisting}[numbers=none,caption={add\_i32 的 x86-64 优化汇编}]
+add_i32:
+    lea eax, [rdi + rsi]
+    ret
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={objdump 看到的机器码和符号}]
+0000000000000000 <add_i32>:
+       0: 8d 04 37        lea eax, [rdi + rsi]
+       3: c3              ret
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={readelf 符号表中的函数记录}]
+Symbol table '.symtab' contains 4 entries:
+   Num:    Value          Size Type    Bind   Vis      Ndx Name
+     3: 0000000000000000     4 FUNC    GLOBAL DEFAULT    2 add_i32
+\end{lstlisting}
+
+这三段输出要一起读。函数签名告诉我们两个 \code{int} 参数使用前两个整数参数位置；System V AMD64 ABI 告诉我们它们在 \register{edi} 和 \register{esi}；反汇编中出现 \register{rdi} 和 \register{rsi} 是因为 \instruction{lea} 使用 64 位寻址寄存器形式，但结果写入 \register{eax}，也就是 \code{int} 返回寄存器。符号表中的 \code{FUNC GLOBAL} 说明 \code{add\_i32} 是可被链接器解析的全局函数符号，大小为 4 字节，正好对应三字节 \instruction{lea} 加一字节 \instruction{ret}。
+
+再看调用方：
+
+\begin{lstlisting}[language=C++,caption={调用方翻译单元}]
+extern "C" int add_i32(int, int);
+
+extern "C" int call_add()
+{
+    return add_i32(7, 5);
+}
+\end{lstlisting}
+
+调用方单独编译成目标文件时，并不知道 \code{add\_i32} 的最终地址，所以会留下重定位：
+
+\begin{lstlisting}[numbers=none,caption={调用方目标文件的反汇编和重定位}]
+0000000000000000 <call_add>:
+       0: bf 07 00 00 00  mov edi, 0x7
+       5: be 05 00 00 00  mov esi, 0x5
+       a: e9 00 00 00 00  jmp 0xf <call_add+0xf>
+          000000000000000b: R_X86_64_PLT32 add_i32-0x4
+\end{lstlisting}
+
+\begin{lstlisting}[numbers=none,caption={readelf -r 看到的 relocation entry}]
+Relocation section '.rela.text' contains 1 entry:
+  Offset          Info           Type           Sym. Name + Addend
+00000000000b  ...0004 R_X86_64_PLT32    add_i32 - 4
+\end{lstlisting}
+
+这段输出里有三个训练点。第一，\code{mov edi, 7} 和 \code{mov esi, 5} 是调用者按 ABI 准备参数。第二，优化器把 \code{return add\_i32(7,5)} 变成尾调用，所以目标文件里是 \instruction{jmp}，不是普通 \instruction{call}；这仍然是 ABI 合法路径，因为 \code{call\_add} 不需要在 \code{add\_i32} 返回后继续做事。第三，\code{jmp} 后面的立即数暂时是 0，不表示跳到地址 0；真正含义由 \code{R\_X86\_64\_PLT32 add\_i32-0x4} 这个重定位记录决定，链接器稍后会修正。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+证据 & 能证明什么 & 不能证明什么 \\
+\midrule
+函数签名 & 参数和返回类型 & 实际机器指令形状 \\
+反汇编 & 寄存器、指令和尾调用形态 & 源码变量名和所有优化原因 \\
+符号表 & 函数符号是否可被链接 & 调用点最终走静态还是动态路径 \\
+重定位表 & 目标文件哪里等待链接修正 & 链接后运行时是否触发 lazy binding \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果报告只写“第一个参数在 \register{rdi}”，它还不是证据包。合格的 x86-64 ABI evidence pack 至少要保存源码、编译命令、目标 triple、优化级别、反汇编、符号表和重定位表。若代码跨动态库，还要继续保存 \cmd{readelf -d}、PLT/GOT 反汇编和运行时加载库路径。
+
 \section{窄整数参数和高位问题}
 
 很多函数参数不是 64 位整数，而是 \code{bool}、\code{char}、\code{short}、\code{int}、枚举、小整数 typedef。它们在 ABI 层仍然占用通用寄存器位置，但有效位宽和高位解释需要小心。读汇编时，如果只看到 \register{rdi}、\register{rsi} 这类 64 位寄存器名，就直接把参数当成完整 64 位值，很容易误判。

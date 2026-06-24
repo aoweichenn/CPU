@@ -798,6 +798,127 @@ I_a \cap I_b = \emptyset
 
 \code{state(a)} 表示它属于 KV cache、sampler state、RNG 或跨 token 状态；\code{materialized(a)} 表示调试、oracle、profile 或外部 API 要求保留。这个模型能解释为什么 activation 可以激进复用，KV cache 不能当普通临时 tensor 复用。
 
+\subsection{可手算的 liveness 与 buffer reuse 例子}
+
+只写公式还不够。以 tiny decode 的一层为例，把 segment 编号固定下来：
+
+\begin{lstlisting}[numbers=none,caption={tiny decode segment 顺序}]
+s00 embedding
+s01 rmsnorm_attn
+s02 qkv_linear
+s03 rope_kv_append
+s04 attention_decode
+s05 residual_add
+s06 rmsnorm_mlp
+s07 swiglu_mlp
+s08 residual_add
+\end{lstlisting}
+
+若没有 debug dump，部分 activation 的生命周期可以写成：
+
+\begin{center}
+\begin{tabular}{p{0.16\linewidth}p{0.18\linewidth}p{0.18\linewidth}p{0.34\linewidth}}
+\toprule
+value & defined & last use & reuse 判断 \\
+\midrule
+\code{\%x} & s00 & s05 & 不能和 s05 前的输出复用 \\
+\code{\%x\_norm} & s01 & s02 & s03 后可复用 \\
+\code{\%q} & s02 & s03 & s04 后可复用，若不保留 q dump \\
+\code{\%k\_rot} & s03 & s03 & 写入 KV 后可释放临时 view \\
+\code{\%attn} & s04 & s05 & s06 后可复用 \\
+\code{\%h\_norm} & s06 & s07 & s08 前可复用旧短生命周期 buffer \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+现在打开 oracle，要求 dump \code{\%q} 和 \code{\%attn}。生命周期立刻改变：
+
+\begin{lstlisting}[numbers=none,caption={oracle materialization 会延长生命周期}]
+dump %q after s04:
+  %q live range becomes [s02, s04]
+
+dump %attn after layer:
+  %attn live range becomes [s04, s08]
+\end{lstlisting}
+
+这会拒绝原本合法的复用。若 memory planner 不知道 oracle materialization，它可能让 \code{\%h\_norm} 覆盖 \code{\%attn}，结果最终 logits 仍可能正确，但中间 dump 和回归定位全部错。大师级 AI compiler 不是只让模型跑起来，还要让证据点和优化共同存在。
+
+\subsection{buffer reuse 冲突矩阵}
+
+实际 planner 不应只比较两个区间。它要同时检查生命周期、alias、alignment、device、async barrier、state 和 materialization。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.38\linewidth}p{0.24\linewidth}}
+\toprule
+冲突类型 & 例子 & planner 动作 \\
+\midrule
+live range overlap & \code{\%x} 在 residual 前仍要读 & 拒绝复用 \\
+alias set overlap & \code{\%x\_view} 与 \code{\%x} 共享 storage & 按同一 storage 处理 \\
+alignment mismatch & AVX2 kernel 要 32B，AMX tile 要 64B & 提升 offset alignment 或分配新槽 \\
+device mismatch & CPU host tensor 与 GPU device tensor & 不在同一 arena 复用 \\
+async barrier & GPU kernel 仍可能读取旧 buffer & 等 event 或拒绝复用 \\
+state lifetime & KV cache 跨 token 存活 & 从 activation arena 排除 \\
+oracle materialized & 中间张量要 dump 到报告 & 延长生命周期 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张矩阵直接连接工程事故。很多“内存优化后偶发错”的问题，不是 malloc/free 错，而是 planner 漏掉了一个隐含读者：debug dump、异步 kernel、host copy、KV cache state 或 profiler。
+
+\subsection{layout propagation 的 worklist 规则}
+
+Layout propagation 应该像类型推导一样跑到不动点，而不是后端临时猜。每个 op 声明支持 layout、偏好 layout、保留 layout 和转换成本。编译器用 worklist 在图上传播约束：
+
+\begin{lstlisting}[numbers=none,caption={layout propagation 的 worklist 伪代码}]
+initialize each value.layout_candidates from tensor descriptor
+push all ops into worklist
+
+while worklist is not empty:
+  op = pop(worklist)
+  input_layouts = meet(producer candidates, op requirements)
+  output_layouts = infer_outputs(op, input_layouts)
+  if any candidate set changed:
+    push users(output values)
+
+if any candidate set is empty:
+  report layout conflict with producer, consumer, and required layout
+\end{lstlisting}
+
+例如 \code{RoPE} 要求 \code{head\_dim} 连续，\code{AttentionDecode} 偏好按 \code{position,kv\_head,dim} 顺序读 KV，\code{Linear} 输出既可以是 \code{token\_hidden}，也可以直接 view 成 \code{token\_head\_dim}。如果 \code{Linear} 后面只有 \code{RoPE}，直接生成 \code{token\_head\_dim} view 可能最便宜；如果同一个输出还被一个需要 \code{token\_hidden} 的 oracle dump 消费，就可能需要 materialize 或拒绝融合。
+
+\begin{lstlisting}[numbers=none,caption={layout conflict 诊断应包含的字段}]
+value: %q
+producer: q_linear
+producer_candidates: token_hidden, token_head_dim
+consumer: rope_q
+consumer_requires: head_dim_contiguous
+other_consumer: oracle_dump
+materialization_required: true
+decision: keep view plus dump materialization, no destructive layout rewrite
+\end{lstlisting}
+
+好的诊断告诉读者“为什么没有融合/为什么插入 copy”。差的诊断只说 \code{layout mismatch}，无法指导修复。
+
+\subsection{shape inference 的错误诊断边界}
+
+Shape inference 失败时，不要把错误推给 backend。下面这些错误都应该在 compiler 阶段拒绝：
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+错误 & 诊断字段 & 为什么不能放到 runtime \\
+\midrule
+\(n_q \% n_{kv} \ne 0\) & query heads、kv heads、模型路径 & GQA 映射无定义 \\
+RoPE head dim 为奇数 & head dim、op name、position edge & sin/cos 对偶维度不成立 \\
+QKV packed 输出维度不等于 \(n_qD+2n_{kv}D\) & expected、actual、weight name & split 会读错权重 \\
+int4 group size 不整除 K 且无 tail policy & K、group、tail policy & dequant 地址流不合法 \\
+state write 缺失 position & layer、session、model position & KV cache 语义不完整 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些诊断必须包含对象名、期望值、实际值和来源。AI compiler 的用户不是只想知道“模型坏了”，而是要知道坏在 \code{layers.12.attention.wk}、manifest、shape verifier、quant descriptor 还是后端 capability。
+
 \subsection{反例：错误 fusion 丢掉了 oracle 和 state}
 
 \begin{lstlisting}[numbers=none,caption={错误 pass 的事故形状}]

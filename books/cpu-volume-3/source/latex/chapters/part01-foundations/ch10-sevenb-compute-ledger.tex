@@ -161,6 +161,111 @@ S \times 2 \times n_{kv} \times d \times bytes
 
 但 KV 量化比权重量化更敏感。权重是固定的，可以离线校准；KV 是动态 activation，每个请求、每个位置都不同。若 scale 选择不好，attention score 会被放大后进入 softmax，少量误差可能改变 top-k。后面的低比特 KV 章节会专门展开。
 
+\subsection{Attention 每 token 的字节账本}
+
+上一节的 \code{512 MiB/token} 是“唯一 K/V 元素至少要读到”的下界。真正 kernel 的流量还要看实现是否能在 query head 之间复用 K/V、是否物化 score、是否把 softmax 临时写到内存、是否分页读取 KV。先把 decode attention 拆成四段：
+
+\begin{enumerate}
+  \item 读取历史 K，计算 \(q \cdot k\) score。
+  \item 对 score 加 mask、scale，并做 softmax。
+  \item 读取历史 V，做加权求和。
+  \item 写当前 token 的 K/V 到 cache，写 attention 输出。
+\end{enumerate}
+
+对本节 7B 形状：
+
+\begin{lstlisting}[numbers=none,caption={7B attention 参数}]
+L = 32
+n_q = 32
+n_kv = 8
+d = 128
+S = 4096
+KV dtype = fp16, bytes = 2
+\end{lstlisting}
+
+每层唯一 K 读取下界是：
+
+\[
+K_{unique} = S \times n_{kv} \times d \times bytes
+=4096 \times 8 \times 128 \times 2 = 8MiB
+\]
+
+V 也是 \code{8 MiB}，所以每层唯一 K/V 读取下界是 \code{16 MiB}，32 层就是 \code{512 MiB/token}。但一个朴素 per-query-head kernel 可能按 \code{n\_q} 重新读取 K/V：
+
+\[
+KV_{logical\_per\_q} =
+S \times 2 \times n_q \times d \times bytes
+=4096 \times 2 \times 32 \times 128 \times 2 = 64MiB/layer
+\]
+
+32 层就是 \code{2 GiB/token}。两者差了 4 倍，正好是 \(n_q/n_{kv}=4\)。这不是数学语义差异，而是 kernel 数据复用差异：GQA 降低了唯一 KV 容量；kernel 还要真正把同一个 KV head 在同组 query heads 之间复用，才能接近下界。
+
+\begin{center}
+\begin{tabular}{p{0.25\linewidth}r r p{0.24\linewidth}}
+\toprule
+账本项 & 每层 & 32 层 & 说明 \\
+\midrule
+写当前 K/V & 4 KiB & 128 KiB & 每 token 新增状态 \\
+唯一 K 读 & 8 MiB & 256 MiB & score 阶段下界 \\
+唯一 V 读 & 8 MiB & 256 MiB & weighted sum 下界 \\
+唯一 K/V 合计 & 16 MiB & 512 MiB & 理想复用下界 \\
+per-query 逻辑 K/V & 64 MiB & 2 GiB & 朴素 head 循环可能接近 \\
+score 临时 fp32 & 512 KiB & 16 MiB & 若物化 \([n_q,S]\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表解释了为什么“KV cache 已经用了 GQA”并不自动等于 attention 带宽最优。容量账本按 \code{n\_kv} 算；坏 kernel 的实际读流可能更接近 \code{n\_q}。因此 attention benchmark 不能只报 KV cache 总容量，还要报告 kernel 的读流组织：按 query head 单独扫历史，按 KV head 分组扫历史，还是 tile 后把 K/V 放入 cache/shared memory 再给同组 query heads 复用。
+
+\subsection{context length 的斜率}
+
+decode attention 的关键不是某个固定数，而是随上下文长度 \(S\) 线性增长的斜率。对 fp16 GQA 7B，下界是：
+
+\[
+bytes/token = L \times S \times 2 \times n_{kv} \times d \times bytes
+\]
+
+代入 \(L=32,n_{kv}=8,d=128,bytes=2\)：
+
+\[
+bytes/token = S \times 131072\ bytes
+\]
+
+也就是上下文每增加 1024 token，decode 每个新 token 至少多读约 \code{128 MiB} 的 KV。
+
+\begin{center}
+\begin{tabular}{r r r}
+\toprule
+context \(S\) & fp16 GQA KV 读下界 & 只按 100 GB/s 带宽的时间下界 \\
+\midrule
+1024 & 128 MiB/token & 1.34 ms/token \\
+4096 & 512 MiB/token & 5.37 ms/token \\
+8192 & 1 GiB/token & 10.7 ms/token \\
+16384 & 2 GiB/token & 21.5 ms/token \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个时间下界只算 KV 读，还没有算权重读取、解包、RMSNorm、MLP、sampler、线程同步、分页 block table 和调度排队。若长上下文 TPOT 随 \(S\) 接近线性增长，首先要检查这个 KV 斜率，而不是直接怀疑 sampler 或 tokenizer。
+
+\subsection{MHA、GQA、MQA 的容量和读流差异}
+
+GQA/MQA 的直接收益是减少 KV heads。若其他参数不变，\(n_{kv}\) 从 32 降到 8，KV 容量和唯一 KV 读下界都减少 4 倍；降到 1，则减少 32 倍。
+
+\begin{center}
+\begin{tabular}{l r r r}
+\toprule
+形态 & \(n_{kv}\) & 4096 context 单 session KV & decode 唯一 KV 读/token \\
+\midrule
+MHA & 32 & 2 GiB & 2 GiB \\
+GQA & 8 & 512 MiB & 512 MiB \\
+MQA & 1 & 64 MiB & 64 MiB \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+但这不是免费午餐。更少的 KV heads 改变模型结构和质量边界；更少的唯一 KV 元素也不保证 kernel 实际读流等比例下降。报告必须同时写“模型结构账本”和“kernel 实测账本”：前者来自 descriptor，后者来自 benchmark、profile 或至少来自代码地址流审计。
+
 \subsection{prefill 和 decode 不是同一账本}
 
 prefill 处理整个 prompt。若 prompt 长度 \code{T=512}，一层 linear 变成 \code{[512,H] x [H,O]} 的矩阵乘。权重被同一批 token 复用，GEMM 能更好利用计算单元。decode 每步 \code{T=1}，权重复用少，容易被权重读流限制。

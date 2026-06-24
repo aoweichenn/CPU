@@ -1127,6 +1127,117 @@ decision:
 
 注意最后的 decision。性能分析不是为了把所有指标变漂亮，而是为了根据输入分布选择工程策略。一个 parser 对常见日志格式分支预测很好，对恶意随机输入很差，可能需要分 bucket，而不是无条件改成更重的 branchless 路径。
 
+\subsection{一份成功 PMU/Top-Down 报告应该长什么样}
+
+Top-Down 采集成功时，报告不能只贴一屏 \cmd{perf stat}。它至少要证明四件事：事件确实可用，采样窗口覆盖了正确阶段，计数器和输入规模归一化，Top-Down 分类能被反汇编或对照实验支持。下面是本书建议的成功报告结构。
+
+\begin{lstlisting}[numbers=none,caption={PMU/Top-Down 成功报告字段}]
+environment:
+  cpu_model
+  microarchitecture_if_known
+  kernel_version
+  perf_version
+  native_or_container
+  frequency_policy
+  affinity_policy
+
+command:
+  build command and commit
+  perf stat command
+  event list or metric group
+  repetitions and warmup policy
+
+workload:
+  stage name
+  input shape and checksum
+  bytes moved and operations
+  reference checksum
+
+raw counters:
+  cycles
+  instructions
+  branches
+  branch-misses
+  cache and TLB events if available
+  top-down slots or metric percentages if available
+
+derived:
+  ipc
+  cycles_per_element
+  instructions_per_element
+  branch_miss_rate
+  effective_bandwidth
+  attained_gflops
+  top-down interpretation
+
+evidence boundary:
+  multiplex status
+  unavailable events
+  uncore/kernel/user filtering
+  unsupported conclusions
+\end{lstlisting}
+
+在支持 Top-Down 的 x86-64 Intel 环境中，命令可能长这样：
+
+\begin{lstlisting}[language=bash,caption={Top-Down 成功采集的命令形态}]
+taskset -c 2 ./bench_reduce --case stride1 --size 268435456 \
+  --warmup 3 --repeat 20 --csv out.csv
+
+perf stat -r 10 -- \
+  ./bench_reduce --case stride1 --size 268435456 --repeat 1
+
+perf stat -r 10 --topdown -- \
+  ./bench_reduce --case stride1 --size 268435456 --repeat 1
+\end{lstlisting}
+
+不同 \cmd{perf} 版本和 CPU 暴露的 Top-Down metric 名字不完全相同。有的平台使用 \cmd{--topdown}，有的平台需要从 \cmd{perf list} 中选择 TMA 或 topdown metric group。报告必须保存实际命令和 \cmd{perf list} 证据，不能把别的机器上的事件名复制过来。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+Top-Down 结果 & 可以优先怀疑 & 必须继续验证 \\
+\midrule
+frontend bound 高 & I-cache、decode、uop cache、间接跳转 & 热循环反汇编、代码体积、分支目标 \\
+bad speculation 高 & 分支输入难预测、错误路径混入 & all-true、all-false、random 输入矩阵 \\
+backend memory 高 & L1、L2、LLC、DRAM、TLB、NUMA 等待 & 工作集阶梯、stride、带宽 roof \\
+backend core 高 & 端口、依赖链、shuffle、除法、store buffer & 多累加器、指令替换、uop/端口审计 \\
+retiring 高 & 指令能顺利提交 & 是否多做工作，是否语义缩水 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表有意把“结果”和“结论”分开。Top-Down 只能告诉第一批嫌疑人。若 \code{backend memory} 高，但把工作集缩到 L2 后时间不变，就不能继续说 DRAM 是根因；若 \code{bad speculation} 高，但随机输入和真实输入没有差异，可能是错误路径布局或间接跳转，而不只是某个 if。
+
+\subsection{当前受限环境的真实降级证据}
+
+很多手机、容器、云沙箱和普通用户环境即使 \cmd{perf} 存在，也拿不到 PMU。一次真实受限输出可能是：
+
+\begin{lstlisting}[numbers=none,caption={PMU 不可用时的输出形态}]
+Error:
+No supported events found.
+Access to performance monitoring and observability operations is limited.
+perf_event_paranoid setting is -1
+\end{lstlisting}
+
+这段输出的读法很重要。\code{perf\_event\_paranoid=-1} 表面上放开了很多权限，但容器能力、内核配置、平台 PMU 支持或用户空间环境仍可能让事件不可用。此时报告可以继续做性能分析，但必须降级：
+
+\begin{center}
+\begin{tabular}{p{0.25\linewidth}p{0.33\linewidth}p{0.28\linewidth}}
+\toprule
+缺失证据 & 可替代证据 & 结论边界 \\
+\midrule
+cycles/instructions & wall time、CPU time、反汇编、输入阶梯 & 不能声称 IPC 改善 \\
+cache miss & 工作集大小、stride 对照、有效带宽 & 不能声称 miss 下降 \\
+branch miss & 可预测/随机输入、CFG、反汇编 & 只能说符合分支假设 \\
+Top-Down & Roofline、阶段时间、源码对照、trace & 不能写 frontend/backend 百分比 \\
+NUMA/uncore & 线程绑定、first-touch、扩展曲线 & 不能证明 remote HITM \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+降级报告不是低质量报告。低质量是把缺失事件填成 0，或把“符合假设”写成“已经证明”。如果 PMU 不可用，一份合格报告仍应保存：原始错误输出、环境记录、反汇编摘要、输入矩阵、checksum、阶段时间、字节账本和未验证边界。
+
 \subsection{端口压力和 uops：当 backend 不是内存}
 
 若数据都在 L1，branch miss 很少，但周期仍高，就要看核心执行资源。现代核心有多个执行端口，不同指令占用不同端口；load、store、整数 ALU、浮点 FMA、shuffle、branch、除法等资源不一样。没有具体 uops 工具时，也可以用指令形态做保守判断。
