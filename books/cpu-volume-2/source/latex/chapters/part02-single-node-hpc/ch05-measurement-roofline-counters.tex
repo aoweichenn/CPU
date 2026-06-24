@@ -1076,6 +1076,105 @@ retiring & 指令被顺利提交 & 检查是否做了多余工作 \\
 \topic{不能用 PMU 替代 reference}
 如果候选版本指令数下降 40\%，但 checksum 也变了，这不是优化。若候选版本 cache miss 下降，因为它跳过了错误记录或少写了 manifest，也不是优化。性能证据永远排在 correctness 证据之后。报告结构应先写 reference/oracle/checksum，再写时间和 PMU。
 
+\subsection{PMU 判读树：从症状到验证实验}
+
+PMU 指标最适合做假设生成，不适合单独当判决。一个可复用的判读树应该先问阶段，再问数量级，再问对照实验。下面这张表是本书后续性能报告的最小判读框架。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+症状 & 候选瓶颈 & 验证实验 \\
+\midrule
+IPC 低、LLC miss 高 & DRAM 或 LLC miss 等待 & 改工作集大小、顺序/随机对照、带宽下限 \\
+IPC 低、branch miss 高 & 错误推测 & 构造可预测输入、拆热分支、看错误路径占比 \\
+IPC 低、指令少但周期多 & 长延迟依赖链或内存等待 & 多累加器、prefetch、load-use 距离对照 \\
+instructions 高、IPC 正常 & 多做了工作或前端压力 & 反汇编、阶段拆分、去掉 diagnostics 对照 \\
+dTLB miss 高 & 页覆盖或随机访问 & huge page、压缩对象、按页局部性分组 \\
+context switch 高 & 阻塞、抢占或同步等待 & 绑定、减少线程数、记录等待谓词 \\
+cycles 波动大 & 频率、调度、热状态、I/O & 固定输入、多轮样本、温度/频率记录 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的重点是“验证实验”。例如 IPC 低不能自动归因到内存；如果把循环改成多累加器后显著变快，可能是依赖链限制；如果随机输入变慢而顺序输入不慢，才更像地址局部性；如果减小工作集到 L2 后变快，说明层级位置影响明显。
+
+\subsection{Top-down 的四类周期怎样落到代码}
+
+Top-down 分类常把周期分成 retiring、bad speculation、frontend bound、backend bound。入门时可以把它们映射成四个问题：
+
+\begin{enumerate}
+  \item 退休了很多有用指令吗？如果是，先查算法和多余工作。
+  \item 取错路了吗？如果是，查分支输入分布和错误路径。
+  \item 指令供不上吗？如果是，查 I-cache、decode、间接跳转和代码体积。
+  \item 后端等资源吗？如果是，再拆内存、端口、依赖链、除法和同步。
+\end{enumerate}
+
+\begin{lstlisting}[numbers=none,caption={一个热循环报告的 top-down 叙述模板}]
+stage: parse_hot_loop
+correctness: checksum matched reference
+time share: 72% of end-to-end
+top-down:
+  bad speculation high on random input
+  frontend acceptable after code-size audit
+  backend memory moderate, not bandwidth-saturated
+evidence:
+  predictable input branch_miss_rate drops
+  branchless version reduces p95 but adds instructions
+decision:
+  keep branchy path for common input
+  add branchless backend for adversarial input bucket
+\end{lstlisting}
+
+注意最后的 decision。性能分析不是为了把所有指标变漂亮，而是为了根据输入分布选择工程策略。一个 parser 对常见日志格式分支预测很好，对恶意随机输入很差，可能需要分 bucket，而不是无条件改成更重的 branchless 路径。
+
+\subsection{端口压力和 uops：当 backend 不是内存}
+
+若数据都在 L1，branch miss 很少，但周期仍高，就要看核心执行资源。现代核心有多个执行端口，不同指令占用不同端口；load、store、整数 ALU、浮点 FMA、shuffle、branch、除法等资源不一样。没有具体 uops 工具时，也可以用指令形态做保守判断。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+代码形态 & 可能资源 & 改写方向 \\
+\midrule
+每元素多次 shuffle & shuffle/permute 端口 & 改布局，减少跨 lane 重排 \\
+单累加变量归约 & 加法依赖链 & 多累加器，树形归约 \\
+大量整数除法/取模 & 长延迟除法单元 & strength reduction、容量取 2 的幂 \\
+load 后立刻使用 & load-use 延迟 & 展开，提前 load，软件预取 \\
+store 很多且写分散 & store buffer、写合并差 & 批量写、连续输出、分阶段 compact \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这部分连接到下一章 SIMD。向量化并不只增加 lane；它也可能增加 shuffle、mask、tail 和寄存器压力。若 bottleneck 是 shuffle 端口而不是算术吞吐，换更宽向量未必改善。
+
+\subsection{性能报告里的反证输入}
+
+一个结论至少要有反证输入。若你说“瓶颈是内存带宽”，要有小工作集输入证明数据进 cache 后变快；若说“瓶颈是 branch miss”，要有可预测输入证明 branch miss 和时间一起下降；若说“瓶颈是 TLB”，要有 huge page、页内连续或压缩对象的对照；若说“瓶颈是锁竞争”，要有单线程、分片、thread-local 或无共享写版本。
+
+\begin{lstlisting}[numbers=none,caption={反证输入矩阵}]
+memory hypothesis:
+  tiny_in_L1
+  fits_L2
+  exceeds_LLC
+  streaming_large
+  random_large
+
+branch hypothesis:
+  all_true
+  all_false
+  periodic
+  random
+  real_trace
+
+contention hypothesis:
+  one_thread
+  per_thread_partial
+  padded_partial
+  global_atomic
+\end{lstlisting}
+
+没有反证输入的报告很容易变成故事。经典性能教材厚，不是因为术语多，而是因为每个判断都留下“如果我错了，哪个输入会推翻我”的入口。
+
 \section{测量报告的反面案例}
 
 坏报告最常见的形式是：“优化后耗时从 12 秒降到 4 秒，提升三倍。”这句话缺少语义、输入、环境、统计、边界和原因。它可能是真的，也可能来自 page cache 预热、少写了 manifest、跳过了坏行、线程数不同、编译选项不同、CPU 频率不同、输出校验关闭，或者只挑了最好的样本。测量章要建立的不是写报告格式，而是把这种句子拆到无法藏错。

@@ -980,6 +980,121 @@ decision:
 \topic{上线后仍要保留 reference}
 Native backend 进入默认路径后，reference 不能删除。Reference 用于回归、故障复现、跨平台验证和语义变更审查。若后来输入合同从 ASCII 扩展到 UTF-8，或错误报告从第一个错误扩展到全部错误，reference 是判断 native backend 是否仍可使用的锚点。删除 reference 等于删除对优化路径的约束。
 
+\section{展开：SIMD 的指令级资源账本}
+
+SIMD 不是“一个指令顶多个指令”这么简单。每个向量指令仍然要经过前端取指和解码，占用执行端口，读写寄存器，访问 load/store 单元，处理跨 lane 重排和尾部。高质量 SIMD 报告至少要把每元素资源账本写出来。
+
+\subsection{latency 和 throughput 不是同一个量}
+
+指令 latency 是一个结果从输入可用到输出可用的时间；throughput 是流水线稳定后每周期能发射或完成多少同类指令。一个内核如果有长依赖链，就受 latency 限制；如果有很多独立操作，就更接近 throughput 限制。
+
+\begin{lstlisting}[numbers=none,caption={单累加和多累加的差异}]
+single accumulator:
+  s = s + a[i]
+  next add depends on previous s
+  latency chain is exposed
+
+four accumulators:
+  s0 += a[i+0]
+  s1 += a[i+1]
+  s2 += a[i+2]
+  s3 += a[i+3]
+  independent chains overlap
+\end{lstlisting}
+
+向量化归约也有同样问题。向量寄存器内先做多 lane 累加，最后 horizontal reduce。主循环可能很快，尾部和最终横向归约却不可忽略。短输入上，横向归约和 dispatch 成本可能吃掉收益。
+
+\subsection{load/store 吞吐和 cache line 账本}
+
+对简单 map 内核，例如 \code{y[i]=a*x[i]+b}，每个元素读 4 字节、写 4 字节，做 1 次乘法和 1 次加法。AVX2 每次 8 个 \code{float}：
+
+\begin{lstlisting}[numbers=none,caption={AVX2 float map 的单迭代账本}]
+per vector iteration:
+  load x:  32 bytes
+  store y: 32 bytes
+  arithmetic: 8 mul + 8 add
+
+per element:
+  bytes moved: 8 bytes
+  flops: 2
+  arithmetic intensity: 0.25 flop/byte
+\end{lstlisting}
+
+若目标机器持续内存带宽是 50GB/s，这个内核的带宽上限约为 \code{12.5GFLOP/s}。即使用再宽的向量，只要每元素字节量不变、数据来自内存，它也会碰到带宽上限。宽向量能降低指令开销，但不能把 8 字节/元素变成 0。
+
+\subsection{shuffle 和 gather 是常见隐藏成本}
+
+许多 SIMD 代码慢在非算术指令。AoS 到 SoA 的字段抽取需要 shuffle；stable filter 需要 mask、rank、compress；随机索引需要 gather；稀疏输出需要 scatter。它们的吞吐、延迟和端口占用通常比普通 add/mul 更难看。
+
+\begin{center}
+\begin{tabular}{p{0.23\linewidth}p{0.34\linewidth}p{0.29\linewidth}}
+\toprule
+操作 & 资源风险 & 更好的上游改法 \\
+\midrule
+AoS 字段抽取 & shuffle 多，load 有效载荷低 & 改 SoA 或 AoSoA \\
+gather 随机读 & 多 cache line、多 TLB miss & 重排索引，批量化，压缩工作集 \\
+scatter 写 & store 合并差，可能 false sharing & 先生成局部 buffer，再合并 \\
+horizontal reduce & 跨 lane 合并成本 & 多累加器，树形归约，批量输出 \\
+mask compress & 平台差异和输出位置计算 & count/scan/write 两阶段 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这就是为什么数据布局章节先于 SIMD 章节。若 layout 错，SIMD 只能用昂贵指令弥补；若 layout 对，普通连续 load/store 就能吃到大部分收益。
+
+\subsection{AVX2、AVX-512、VNNI、AMX 的正确位置}
+
+ISA 名词要落到 kernel 形态。AVX2 提供 256 位向量，适合通用 float/int 处理；AVX-512 提供更宽寄存器和 mask 机制，尾部和 compress 更方便，但可能带来频率、代码体积和平台覆盖问题；VNNI 把低精度 dot-product 形态做成更合适的指令，适合 int8 推理；AMX 更像 tile 级矩阵单元，适合足够大的块乘，编程模型和状态保存成本都不同。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+能力 & 适合的问题 & 不适合被神化的原因 \\
+\midrule
+AVX2 & 连续向量 map、reduce、基础 GEMV & mask/tail 和 int8 dot 不如新 ISA 直接 \\
+AVX-512 & 宽向量、mask、compress、更多寄存器 & 平台覆盖、频率、短输入成本 \\
+VNNI & int8 dot-product、量化 linear & 仍受权重读流和 packing 影响 \\
+AMX & 大 tile GEMM、int8/bf16 矩阵块 & 小 batch decode GEMV 利用率可能低 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第三册的 int8 GEMV/GEMM 会复用这张表。decode 单 token 常是 GEMV，权重读流大、复用弱；prefill 多 token 更像 GEMM，能更好利用 VNNI/AMX/tensor core 类单元。若报告只写“用了 AVX-512/VNNI 所以快”，证据不够；必须写 shape、bytes、packing、tail、线程和 roofline。
+
+\subsection{反汇编审查清单}
+
+编译器报告说 vectorized 不等于最终运行路径满意。最小反汇编审查包括：
+
+\begin{itemize}
+  \item 主循环是否存在连续 vector load/store。
+  \item 是否有意外函数调用、除法、复杂 gather 或频繁 shuffle。
+  \item 是否存在 runtime alias/alignment check，失败路径是否可能常走。
+  \item tail path 是否正确处理 0、lane-1、lane、lane+1。
+  \item 多 backend dispatch 是否真的选择到目标实现。
+\end{itemize}
+
+\begin{lstlisting}[numbers=none,caption={SIMD 报告的最小证据字段}]
+source contract:
+  no destructive overlap
+  alignment guarantee or unaligned path
+  tail policy
+
+assembly audit:
+  vector loop instruction shape
+  load/store count
+  shuffle/gather/scatter count
+  fallback branches
+
+performance audit:
+  bytes per element
+  cycles per element
+  bandwidth
+  stage share
+  scalar/reference comparison
+\end{lstlisting}
+
+SIMD 的工程成熟度不取决于写了多少 intrinsic，而取决于能否证明：语义相同，地址流更好，资源账本合理，端到端真的移动了瓶颈。
+
 \section{习题}
 
 \begin{exercisebox}

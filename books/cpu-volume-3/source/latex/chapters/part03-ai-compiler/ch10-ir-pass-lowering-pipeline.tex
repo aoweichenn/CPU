@@ -630,6 +630,103 @@ AttentionDecode:
 
 这些规则让 compiler 能解释“为什么插入 layout conversion”。如果转换成本大于融合收益，plan verifier 应能指出优化被拒绝的原因，而不是静默生成慢路径。
 
+\subsection{展开：shape inference、in-place 和 stateful op 的严格规则}
+
+AI compiler 章节要避免停在“有一个 verifier”。真正的 verifier 要有可写成规则的推导。以 decoder block 为例，shape inference 至少要覆盖 linear、split、reshape、RoPE、attention、MLP 和 lm head。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+op & 输入条件 & 输出规则 \\
+\midrule
+Linear & \(X=[T,K]\), \(W=[O,K]\) & \(Y=[T,O]\) \\
+QKV split & \(Y=[T,n_qD+2n_{kv}D]\) & \(Q=[T,n_q,D]\), \(K/V=[T,n_{kv},D]\) \\
+RoPE & last dim \(D\) even & shape 不变，position edge 必须存在 \\
+GQA attention & \(n_q \% n_{kv}=0\) & \(O=[T,n_q,D]\) 或 merge 后 \([T,H]\) \\
+SwiGLU & gate/up 同 shape & elementwise 后 shape 不变 \\
+LM head & \(X=[T,H]\), \(W=[V,H]\) & logits \([T,V]\) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+规则失败要给出诊断，而不是让后端崩溃。例如 \(n_q=32,n_{kv}=7\) 时，GQA head mapping 不整除；\(\code{head\_dim}\) 为奇数时，RoPE 对偶维度不成立；QKV packed weight 的输出维度对不上时，导入阶段就应拒绝模型。
+
+\subsection{in-place legality：省 buffer 不能破坏读写顺序}
+
+in-place 优化看起来诱人，例如把 RMSNorm 输出写回 hidden，或让 residual add 覆盖输入。但它必须满足读写顺序、alias、liveness 和 oracle 条件。若某个输入后续还要被另一个节点读取，in-place 会提前破坏值；若 debug 要 dump 原输入，in-place 会丢证据；若后端异步执行，host 以为可复用时 device 可能还没读完。
+
+\begin{lstlisting}[numbers=none,caption={in-place 改写的拒绝条件}]
+reject in-place if:
+  input has another live consumer
+  input aliases a state buffer
+  oracle/debug requires original value
+  op is not mathematically safe for overwrite
+  backend may read input after writing output
+  dtype/layout conversion changes element size
+\end{lstlisting}
+
+in-place pass 的输出不能只是“复用 offset”。它应输出一个原因表：哪些 value 被覆盖，覆盖发生在哪个 segment，哪些原值最后使用点在覆盖之前，哪个 verifier 证明了 alias 不冲突。没有原因表的 in-place 优化很难调试。
+
+\subsection{stateful op：KV cache 和 sampler 是副作用边}
+
+传统图优化容易假设节点是纯函数：输入相同，输出相同，没有副作用。LLM decode 不完全满足。KV append 会修改 session state；sampler 会消费和更新 RNG state；profiler 会记录事件；streaming 会写 event queue。这些边必须进 IR，否则 pass 会错误重排或删除它们。
+
+\begin{lstlisting}[numbers=none,caption={stateful op 的 IR 边}]
+kv_append:
+  data_inputs: k_current, v_current
+  state_read: kv_cache[layer, session]
+  state_write: kv_cache[layer, session]
+  ordering: after rope, before attention_read_next
+
+sampler:
+  data_inputs: logits
+  state_read: sampler_state
+  state_write: sampler_state
+  output: next_token
+\end{lstlisting}
+
+有了 state edge，compiler 才知道 KV append 不能被死代码删除，sampler 不能跨 logits 改写，两个 token 的 decode 不能随意交换。第三册把 KV cache 当 state edge，是 AI compiler 从“矩阵图”走向“推理 runtime”的关键。
+
+\subsection{pass pipeline 的失效分析}
+
+每个 pass 都应声明会使哪些 analysis 失效。Fusion 改 use-def 和 liveness；layout conversion 改 stride 和 cost；quant lowering 改 dtype、scale 和 kernel selection；memory planning 消费 liveness 但不应改变 Graph IR。没有失效分析，后续 pass 可能拿旧事实做错误决定。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.32\linewidth}p{0.30\linewidth}}
+\toprule
+pass & 保留的事实 & 失效的事实 \\
+\midrule
+Shape inference & graph topology & tensor dtype/layout facts 被更新 \\
+Fusion & 部分 shape & use-def、liveness、cost、memory plan \\
+Layout propagation & graph semantics & stride、cost、kernel capability match \\
+Quant lowering & logical shape & dtype、scale path、backend support \\
+Memory planning & graph/tensor semantics & arena offset 旧结果 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这和 C++ 编译器优化是同一个工程原则：analysis 和 transform 分离，transform 后明确 preserved analyses。否则 pass pipeline 会变成一串不可局部验证的脚本。
+
+\subsection{工业实现参照：不要只发明自己的词}
+
+第三册项目可以自研教学 runtime，但要知道工业系统的设计谱系。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+系统 & 关键设计 & 本书借鉴点 \\
+\midrule
+ggml/llama.cpp & tensor 描述、quant 格式、backend kernel、轻量 graph & 本地推理、packed weight、CPU/GPU dispatch \\
+oneDNN & primitive、memory descriptor、post-op、layout 选择 & 算子合同和 layout 是一等对象 \\
+TVM/XLA/MLIR & IR、pass、lowering、schedule/codegen 分层 & analysis/transform/verifier 分离 \\
+vLLM & paged KV cache、continuous batching、serving scheduler & KV state 和调度是系统核心 \\
+TensorRT-LLM & engine、plugin、kernel fusion、KV cache 和多 GPU & 后端 plan 与运行时强绑定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+借鉴不等于复制。教学项目不必实现完整 MLIR 或 vLLM，但必须回答相同问题：tensor 如何描述，layout 如何传播，state 如何建模，memory 如何复用，kernel 如何选择，serving 如何满足 SLO，错误如何复现。工业参照的作用是防止自研词汇脱离真实战场。
+
 \subsection{C++20 实现边界}
 
 工程上，AI 编译器模块可以按下面方式组织：

@@ -1202,6 +1202,121 @@ SwiGLU 中 \code{silu(g) * u} 是逐元素乘法。若 \code{g} 很大，\code{s
 Transformer 的数值正确性要按中间合同验证：RMSNorm 的平方和、RoPE 的位置、softmax 的 max/sum、SwiGLU 的激活范围、量化的 accumulator 和 scale。最终 logits 是结果，不是足够细的诊断。
 \end{keyidea}
 
+\subsection{attention 数据移动账本：从 \(O(S^2)\) 到 bytes/token}
+
+只说 attention 复杂度是 \(O(S^2)\) 不够。推理系统更关心每个阶段读写多少字节。设 hidden 为 \(H\)，query heads 为 \(n_q\)，KV heads 为 \(n_{kv}\)，head dim 为 \(D\)，上下文长度为 \(S\)，元素字节为 \(b\)。decode 单 token 时，当前 token 的 Q 只是一小块，但 attention 要读取历史 K/V：
+
+\[
+Bytes_{KV/read} \approx S \times n_{kv} \times D \times 2 \times b
+\]
+
+其中 \(2\) 表示 K 和 V。以 7B 常见形状 \(n_{kv}=8, D=128, S=4096, b=2\) 估算：
+
+\[
+4096 \times 8 \times 128 \times 2 \times 2 = 16\ \mathrm{MiB}
+\]
+
+这只是单层 decode attention 读取 KV 的量级；32 层就是约 512MiB/token 的 KV 读流，还没算权重、激活、softmax 和 logits。这个数量级解释了为什么长上下文 decode latency 会随 context 增长，为什么 KV layout、paging、quantization 和 batching 会成为系统问题。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+阶段 & 主要读写 & 典型瓶颈 \\
+\midrule
+prefill attention & QK 分数矩阵、softmax、PV，token 间并行 & 算力、workspace、activation 带宽 \\
+decode attention & 读历史 K/V，写当前输出 & KV 带宽、cache/TLB、softmax 归约 \\
+GQA/MQA & 减少 KV heads 数量 & head 映射、layout、质量/模型约束 \\
+paged KV & 非连续 slot 映射 & page table、跨页 coalescing、调度复杂度 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+若使用 MHA，\(n_{kv}=n_q\)。GQA 把多个 query head 共享到较少 KV head，KV cache 容量和读流按 \(n_{kv}/n_q\) 下降。若 \(n_q=32,n_{kv}=8\)，KV 字节降为 MHA 的四分之一。这个节省不是“免费优化”：模型结构必须支持 GQA，kernel 必须正确实现 \(q\_head \rightarrow kv\_head\) 映射，oracle 必须覆盖 head mapping 错误。
+
+\subsection{prefill 和 decode 的 FLOPs/bytes 分阶段上限}
+
+对一个线性层 \(y = xW\)，prefill 输入是 \([T,H]\)，权重是 \([H,O]\)，FLOPs 约为 \(2THO\)。权重读入后可被 \(T\) 个 token 复用；T 越大，算术强度越高。decode 输入是 \([1,H]\)，FLOPs 约为 \(2HO\)，同一层权重通常只服务一个 token 或小 batch，权重复用弱。
+
+\[
+AI_{prefill} \approx \frac{2T H O}{bytes(W) + bytes(X) + bytes(Y)}
+\]
+
+\[
+AI_{decode} \approx \frac{2H O}{bytes(W) + bytes(x) + bytes(y)}
+\]
+
+当 \(H=O=4096\)，fp16 权重约 32MiB，单 token decode 约 33.5M FLOPs。若只看权重读，算术强度约：
+
+\[
+\frac{33.5M}{32MiB} \approx 1\ \mathrm{FLOP/byte}
+\]
+
+这很容易被内存带宽限制。int8 把权重字节减半，算术强度提高；int4 再减半，但 scale、解包、group 元数据和 kernel 支持会吃掉一部分收益。真正报告要同时列权重 bytes、metadata bytes、dequant 成本和实际带宽。
+
+\begin{lstlisting}[numbers=none,caption={decode token 的最小带宽账本}]
+for each layer:
+  read RMSNorm weights
+  read QKV/O projection weights
+  read MLP gate/up/down weights
+  read KV cache for current context
+  write updated K/V
+  write hidden/logits intermediates
+
+token lower bound:
+  max(weight_bytes / weight_bandwidth,
+      kv_bytes / kv_bandwidth,
+      flops / compute_throughput)
+\end{lstlisting}
+
+\subsection{RoPE 位置缩放和长上下文错误}
+
+RoPE 的基础公式可以看成对偶维度旋转。对一对维度 \((x_{2i}, x_{2i+1})\)，位置 \(p\) 和频率 \(\theta_i\) 给出：
+
+\[
+x'_{2i}=x_{2i}\cos(p\theta_i)-x_{2i+1}\sin(p\theta_i)
+\]
+
+\[
+x'_{2i+1}=x_{2i}\sin(p\theta_i)+x_{2i+1}\cos(p\theta_i)
+\]
+
+错误常发生在三个位置。第一，把 batch 内列号当作真实 model position，left padding 时错。第二，把 paged KV 的 physical slot 当作 position，cache 回收或滑窗时错。第三，长上下文扩展使用 position scaling 或不同 base，却没有和训练/模型配置一致。短 prompt 下这些错误可能几乎看不出来，长上下文才表现为质量下降。
+
+\begin{lstlisting}[numbers=none,caption={RoPE trace 必须拆开的三个位置}]
+token_index_in_request
+model_position
+kv_physical_slot
+rope_table_index
+sliding_window_base
+\end{lstlisting}
+
+因此 RoPE 的验收不应只比较一句短 prompt logits。要固定一个带 left padding、prefix reuse、sliding window 或 paged slot 的 trace，dump 旋转前后 Q/K 的小片段，并验证 \code{model\_position} 与 \code{physical\_slot} 分离。
+
+\subsection{采样数值边界：temperature、top-k、top-p 不应掩盖 logits 错误}
+
+采样把 logits 转成 token，但它不是模型 correctness 的替代品。temperature 会缩放 logits：
+
+\[
+z_i' = \frac{z_i}{T}
+\]
+
+当 \(T\) 很小，最大 logit 的微小误差可能改变 argmax；当 \(T\) 很大，分布变平，低概率 token 更容易出现。top-k 截断保留前 k 个 token；top-p 保留累计概率达到阈值的最小集合。它们都对排序和概率归一化敏感。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+采样参数 & 数值敏感点 & 测试方式 \\
+\midrule
+temperature 小 & logit 排名微小变化影响输出 & 比较 logits/top candidates，不只比较 token \\
+top-k & 第 k/k+1 名边界敏感 & 构造接近分数 \\
+top-p & 累计概率和排序敏感 & 固定 logits，验证保留集合 \\
+随机采样 & RNG 状态影响复现 & seed、counter、sampler state dump \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+工程上应先用 greedy 或固定 sampler 验证 decoder logits，再验证 sampler。若优化后 token 不同，第一步不是争论“采样随机”，而是比较 logits、top candidates、概率集合和 RNG 状态。
+
 \subsection{CPU 后端、GPU 后端和同一份算子合同}
 
 理解原理后，再谈后端。CPU 和 GPU 不应该各自定义一套模型语义。它们应该共享同一份算子合同：输入 shape、dtype、layout、量化 profile、误差界、KV cache 逻辑坐标一致。不同的是物理实现。

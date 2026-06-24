@@ -1155,6 +1155,125 @@ close_drain_time
 \topic{回退方案必须随无锁结构一起提交}
 任何无锁结构都要有回退方案：锁版 reference、成熟库替代、或分片降低竞争的设计。回退不是失败预案，而是上线条件。若线上发现某个 ARM 平台内存序 bug、某个输入导致 retired 节点堆积、某个关闭路径卡住，系统必须能切回已验证的锁版队列，同时保留同一 \code{QueueContract}。接口稳定，内部实现才有优化空间。
 
+\section{展开：linearizability、progress 和 reclamation 的证明模板}
+
+无锁结构要同时证明三件事。第一，线性化正确：并发操作看起来像按某个顺序瞬间发生。第二，进展保证成立：系统不会因为某个线程失败而整体停住。第三，内存回收安全：没有线程还可能访问的对象不会被释放。少证明任何一件，都不是生产级无锁结构。
+
+\subsection{linearizability：给每个成功操作找一个瞬间}
+
+线性化点是操作在并发历史中“生效”的瞬间。对 SPSC ring，push 的线性化点可以是发布 tail；pop 的线性化点可以是发布 head。对 Treiber stack，push/pop 的线性化点通常是 CAS head 成功。失败操作也要定义线性化点，例如 pop 看到 empty 的瞬间。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+结构/操作 & 成功线性化点 & 失败线性化点 \\
+\midrule
+SPSC push & release store tail & 读取 head 后判断 full \\
+SPSC pop & release store head & acquire load tail 后判断 empty \\
+Treiber push & CAS head 成功 & 通常重试，不暴露失败 \\
+Treiber pop & CAS head 成功 & 读取 head 为 null \\
+MPMC slot push & slot sequence 发布 ready & 发现 slot 不可预留 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+证明时要拿一条并发历史逐步标注：每个操作开始时间、结束时间、观察到的共享状态、线性化点、返回值。若找不到一个顺序能解释所有返回值，结构就不是 linearizable。压力测试能发现 bug，但不能替代这个证明。
+
+\subsection{progress：lock-free 不等于每个线程都不饿}
+
+进展保证有层级。Obstruction-free 表示一个线程单独运行足够久能完成；lock-free 表示系统整体总有某个线程能完成；wait-free 表示每个线程在有限步内完成。很多工程队列只是 lock-free，不是 wait-free。若一个线程不断 CAS 失败，它可能饿死，但只要其他线程在成功，系统仍满足 lock-free。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.36\linewidth}p{0.26\linewidth}}
+\toprule
+保证 & 含义 & 常见代价 \\
+\midrule
+blocking & 某线程持锁停住可阻塞其他线程 & 简单，尾延迟受持锁者影响 \\
+obstruction-free & 无竞争时可完成 & 需要冲突管理 \\
+lock-free & 总有线程取得进展 & 个体可能饥饿，CAS 风暴 \\
+wait-free & 每个线程有限步完成 & 实现复杂，常有更高常数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+报告不能只写“无锁”。应写清是哪一级保证、哪些路径违反保证。例如 CAS 循环中分配内存、写日志、等待条件变量、扫描无限 retired list，都可能把进展保证降级。退避策略也要纳入合同：指数退避降低总线争用，但可能增加单请求尾延迟。
+
+\subsection{memory reclamation：保护的是对象历史，不只是地址}
+
+Treiber pop 的危险窗口是：线程 A 读到 \code{head}，准备读 \code{head->next}；线程 B pop 并释放这个节点；分配器把同一地址复用；线程 A 再解引用旧地址。这里同时有两个问题：地址历史可能 ABA，节点释放时机可能过早。
+
+\begin{lstlisting}[numbers=none,caption={Treiber pop 的危险窗口}]
+Thread A:
+  p = head.load()
+  // paused before reading p->next
+
+Thread B:
+  pop p
+  delete p
+  allocate q at same address
+  push q
+
+Thread A:
+  reads p->next through stale object identity
+\end{lstlisting}
+
+Hazard pointer 的证明思路是：线程 A 在解引用前先发布“我可能访问 p”，释放线程扫描所有 hazard slot，只有没有任何线程保护 p 时才回收。Epoch 的证明思路是：释放不立即发生，节点进入 retired list；等所有线程都离开可能持有旧指针的 epoch 后，再批量释放。RCU 的证明思路类似：读侧临界区很轻，写侧等待 grace period。
+
+\subsection{三种回收协议的状态机}
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+协议 & 状态机核心 & 主要失败模式 \\
+\midrule
+Hazard pointer & publish hazard -> validate pointer -> dereference -> clear hazard -> retire scan & 忘 clear 泄漏，publish 后不复查 \\
+Epoch & enter epoch -> operate -> leave epoch；retire node with epoch -> wait all advance & 暂停线程阻塞回收，retired 堆积 \\
+RCU & read lock/unlock；writer publish new version -> wait grace period -> reclaim old & 读侧不能阻塞太久，更新延迟 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+每个协议都要测试线程退出。线程退出时 hazard slot 是否清理？epoch 是否离开？retired list 归谁处理？如果测试只覆盖正常 push/pop，不覆盖线程中途停止、异常退出、关闭和析构，就没有验证生命周期。
+
+\subsection{ABA 和回收不是同一个修复}
+
+Tagged pointer 给 head 加版本号，可以发现“地址离开又回来”的历史变化。但如果线程在读 \code{p->next} 前，\code{p} 已经被释放，版本号也救不了解引用。Hazard pointer 保护解引用时对象不被释放，但如果算法语义还依赖“head 没有离开又回来”，仍可能需要版本或其他设计。两者解决的问题不同。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+技术 & 主要解决 & 不自动解决 \\
+\midrule
+Tagged pointer & CAS 比较看见部分历史 & 旧节点是否可安全解引用 \\
+Hazard pointer & 被保护节点暂不释放 & 所有 ABA 语义历史 \\
+Epoch & 延迟释放旧节点 & 暂停线程导致内存增长 \\
+Object pool handle & index+generation 防旧句柄 & 多线程发布和回收协议 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表是审查无锁代码的底线。看到“我们用了 CAS，所以无锁安全”不够；看到“我们加了版本号，所以解决 ABA”也不够；看到“我们用了 epoch，所以性能好”仍然不够。要问它分别证明了线性化、进展和回收哪一部分。
+
+\subsection{工业取舍：成熟库也要写外层合同}
+
+直接使用成熟队列库可以减少算法错误，但不能免除外层合同。你仍要写清生产者/消费者模型、阻塞/非阻塞语义、关闭协议、元素移动/析构要求、内存分配策略、backpressure、统计字段和 fallback。成熟库只解决内部并发协议；业务系统还要解决生命周期和故障语义。
+
+\begin{lstlisting}[numbers=none,caption={无锁结构引入前的审查单}]
+ConcurrencyContract:
+  supported model: SPSC | MPSC | MPMC
+  bounded or unbounded
+  progress guarantee
+  allocation behavior
+  reclamation strategy
+  close/cancel semantics
+  element exception policy
+  fallback implementation
+  metrics exposed
+  misuse behavior in debug build
+\end{lstlisting}
+
+如果这份合同写不出来，说明还没有资格把无锁结构放进生产路径。锁版实现也许慢一点，但它的失败模式更容易理解；无锁版本必须用证明和指标买回复杂度。
+
 \section{接口延伸}
 
 无锁结构的本质不是“没有锁”，而是用更细的原子协议维护并发对象。SPSC ring 依靠单写者所有权和 release/acquire 发布；MPSC/MPMC 需要预留、提交和槽位序号；Treiber 栈展示 CAS 线性化点，也暴露 ABA 和回收难题；hazard pointer、epoch 和 RCU 都是在回答“旧节点何时安全释放”。Lock-free 保证系统整体进展，不保证每个线程低延迟；无锁代码必须可证明、可测试、可回退。

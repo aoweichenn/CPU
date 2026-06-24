@@ -417,6 +417,156 @@ summary,all,0,summary,0,0,0,0,0,0,0,0,0,summary,0,ttft_p95_ms,62.960
 
 这不是生产调度器，只是最小 probe。但它已经把 DDIA/MLSys 风格的问题压到了 artifact：请求分布、队列等待、TTFT、TPOT、KV 预算、取消回收和拒绝率必须被记录。后续真实 serving runtime 可以替换 probe 的模拟耗时，但 CSV 合同不应随意改变。
 
+\subsection{排队模型：SLO 先被利用率击穿}
+
+服务化推理的第一个定量模型不是 Transformer，而是排队。设请求到达率为 \(\lambda\)，服务率为 \(\mu\)，单服务台利用率为：
+
+\[
+\rho = \frac{\lambda}{\mu}
+\]
+
+当 \(\rho\) 接近 1，平均等待时间会非线性上升；即使单次推理 kernel 没变慢，队列等待也会把 TTFT 和 p95/p99 打爆。多 worker、多 GPU、多 batch 会改变有效 \(\mu\)，但不会取消这个规律。
+
+\begin{lstlisting}[numbers=none,caption={一个最小 SLO 账本}]
+arrival_rate_rps = 20
+mean_service_time_ms = 40
+service_rate_rps = 25
+utilization = 20 / 25 = 0.80
+
+if mean_service_time_ms grows to 48:
+  service_rate_rps = 20.8
+  utilization = 0.96
+  queue wait becomes unstable
+\end{lstlisting}
+
+这说明服务报告不能只报模型 tokens/s。tokens/s 可能很好，但请求到达率、prompt 分布、max new tokens、取消率、慢客户端和 fallback 会把有效服务率拉低。Admission control 的任务是在进入不稳定区之前拒绝、排队、降级或缩短请求。
+
+\subsection{Little's Law：队列长度不是孤立指标}
+
+Little's Law 给出一个简单约束：
+
+\[
+L = \lambda W
+\]
+
+\(L\) 是系统中平均请求数，\(\lambda\) 是吞吐，\(W\) 是平均停留时间。若平均系统内请求数持续增长，而吞吐没有增长，平均停留时间必然增长。服务监控里队列长度、in-flight、TTFT 和吞吐必须一起看。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+现象 & 可能解释 & 应检查 \\
+\midrule
+队列增长，吞吐不变 & 到达率超过服务率 & admission、请求桶、fallback \\
+队列稳定，TTFT 高 & prefill 或 batch 等待过长 & prompt length、batch wait \\
+TPOT 高，TTFT 正常 & decode step 慢或 KV 读流重 & context、KV layout、backend \\
+吞吐高，p99 高 & 长请求或慢客户端拖尾 & 分桶、取消、backpressure \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表把线上症状连回引擎对象：queue、batch、session、KV cache、sampler、stream event。没有这层模型，服务化章节会变成字段清单。
+
+\subsection{TTFT 和 TPOT 的分解公式}
+
+TTFT 是用户看到第一个 token 的时间，通常包含排队、admission、tokenizer、prefill、第一次 decode、sampler 和 streaming flush：
+
+\[
+TTFT = T_{queue} + T_{admit} + T_{tokenize} + T_{prefill} + T_{decode0} + T_{sample0} + T_{flush0}
+\]
+
+TPOT 是后续每个 token 的平均或分位时间：
+
+\[
+TPOT \approx T_{schedule} + T_{decode\_step} + T_{sample} + T_{stream}
+\]
+
+优化必须针对分量。如果 TTFT 主要来自 prefill，优化 KV decode 没用；如果 TPOT 主要来自 stream backpressure，优化 GEMV 也不会改善用户体验；如果 queue wait 占一半，模型 kernel 再快也无法满足 SLO。
+
+\begin{lstlisting}[numbers=none,caption={SLO trace 必须拆分的阶段}]
+queue_wait_ms
+admission_ms
+tokenize_ms
+prefill_ms
+decode_step_ms
+sampler_ms
+stream_flush_ms
+kv_reserve_ms
+fallback_ms
+\end{lstlisting}
+
+\subsection{continuous batching 的数学取舍}
+
+连续合批提高吞吐，是因为多个 session 共享一次权重读取和更大的矩阵形态；但它引入等待。设 batch 等待窗口为 \(w\)，合批后 decode step 从单请求 \(t_1\) 降到 batch 平均 \(t_b\)。对某个 session，若等待成本大于节省成本，SLO 反而变差。
+
+\[
+\Delta = w + t_b - t_1
+\]
+
+若 \(\Delta < 0\)，该请求受益；若 \(\Delta > 0\)，该请求变慢。系统可能仍因吞吐提高而整体受益，但低延迟业务不一定接受。调度器必须按业务桶设置不同 \code{max\_wait\_ns}：代码补全短等待，离线摘要长等待，RAG 长 prompt 可能优先 prefill throughput。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+业务桶 & 合批策略 & 风险 \\
+\midrule
+代码补全 & 小窗口，优先 TTFT/TPOT & 吞吐低，GPU 利用率不足 \\
+RAG 问答 & prefill 分桶，decode 适中窗口 & 长 prompt 占用资源 \\
+批量摘要 & 大窗口，优先吞吐 & 单请求延迟高 \\
+交互聊天 & 限制上下文和队列等待 & 长上下文用户被拒绝或降级 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{admission control 的资源不等式}
+
+请求进入模型前，至少要满足 KV、workspace、队列和截止时间约束。以 KV 为例：
+
+\[
+KV_{needed} = layers \times reserved\_tokens \times kv\_heads \times head\_dim \times 2 \times bytes
+\]
+
+若当前已预留 \(KV_{used}\)，总预算 \(KV_{budget}\)，则：
+
+\[
+KV_{used} + KV_{needed} \le KV_{budget}
+\]
+
+这条不等式要在 prefill 前检查，而不是 decode 到一半才 OOM。类似地，workspace、event queue、stream buffer 和 backend slot 都要有预算。拒绝请求不是坏事；没有字段证明的中途失败才是坏事。
+
+\begin{lstlisting}[numbers=none,caption={admission 失败应给出可行动原因}]
+reject:
+  context_too_long
+  kv_budget_exceeded
+  queue_deadline_exceeded
+  backend_unavailable
+  unsupported_quant_profile
+  request_cancelled_before_admit
+\end{lstlisting}
+
+\subsection{线上故障复盘字段}
+
+生产级 serving 不是没有故障，而是故障可解释。一次 p99 抖动复盘至少要能回答：请求属于哪个桶，排队多久，进入哪个 batch，prefill/decode 各多久，KV 是否触顶，是否 fallback，是否遇到慢客户端，取消是否释放资源，后端当时的 selected plan 是什么。
+
+\begin{lstlisting}[numbers=none,caption={ServingIncidentTrace 最小字段}]
+request_id
+prompt_bucket
+max_new_tokens
+arrival_time
+admit_time
+batch_id_sequence
+selected_backend_plan
+kv_reserved_bytes
+queue_wait_ms
+prefill_ms
+decode_step_p95_ms
+stream_backpressure_ms
+fallback_reason
+finish_reason
+resource_released
+\end{lstlisting}
+
+这份 trace 把第三册的 AI Infra 和生产系统连接起来。没有它，模型能跑只是 demo；有它，才开始接近线上工程。
+
 \subsection{本节验收线}
 
 读完本节，应该能把第三册项目接成业务服务：

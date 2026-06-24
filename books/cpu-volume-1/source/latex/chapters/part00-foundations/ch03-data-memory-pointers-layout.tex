@@ -3394,6 +3394,118 @@ TensorBufferSlice:
 
 第三册 memory planner 复用 activation 时，不能只看两个 tensor 字节范围是否相同，还要看生命周期是否重叠、是否被 oracle dump 要求保留、是否有 view alias、是否跨状态边。C++ 对象模型在这里变成 AI runtime 的 correctness 规则。
 
+\section{展开：C++ 抽象机器为什么敢不同于真实机器}
+
+硬件只执行 load、store、add、branch；C++ 抽象机器还规定对象生命周期、类型访问、求值顺序、异常边界和未定义行为。优化器利用的是 C++ 抽象机器，不是“我眼里的汇编会怎么跑”。这就是很多底层 bug 难以理解的原因：在机器层看起来只是读了几个字节，在语言层却可能已经失去对象、类型或 provenance。
+
+\subsection{pointer provenance：地址值相同不代表访问权相同}
+
+工程上可以先把 provenance 理解成“这个指针值从哪个对象或分配结果来”。两个指针的整数值相同，不一定都拥有合法访问同一对象的语言层依据。把指针转成整数、做复杂运算、再转回指针，在某些实现上可能碰巧工作，但它把优化器可依赖的信息变得模糊。安全底线是：用指针表达对象内移动，用 \code{std::uintptr\_t} 只做观测或哈希，不把整数当作创建新访问权的办法。
+
+\begin{lstlisting}[language=C++,caption={地址数值相同不等于语言访问仍合法}]
+int* p = new int(7);
+std::uintptr_t raw = reinterpret_cast<std::uintptr_t>(p);
+delete p;
+
+int* q = reinterpret_cast<int*>(raw); // 数值像原地址
+// *q 不是合法访问：原 int 对象生命周期已经结束。
+\end{lstlisting}
+
+这个例子和无锁 ABA、对象池复用、tensor arena reuse 是同一种形状：地址可能重复出现，但对象历史不同。性能库越接近手写 allocator，越要把“地址稳定”和“对象仍然存在”分开证明。
+
+\subsection{implicit lifetime 和 placement new：什么时候字节变成对象}
+
+现代 C++ 对某些隐式生命周期类型提供了更友好的规则，但工程上仍应保守：原始字节 buffer 不是任意类型对象；创建非平凡对象需要构造；结束生命周期后需要析构；复用存储后旧指针可能需要重新取得对象指针。对平凡张量数据，通常把 storage 当作 \code{std::byte} 区域，再通过明确的 typed view 建立访问合同；对含构造/析构语义的 C++ 对象，不要把它们塞进 arena 后跳过生命周期。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+场景 & 更安全的表达 & 风险 \\
+\midrule
+搬运 float 数据 & \code{std::span<float>} 指向已创建数组 & 越界、对齐、别名 \\
+观察任意对象字节 & \code{std::span<std::byte const>} & 不能任意改类型解释 \\
+构造非平凡对象 & placement new + 显式析构 & 忘析构、复用后旧指针 \\
+复用 arena 切片 & 记录 lifetime begin/end & 活跃对象重叠、oracle 延寿 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第三册 runtime 可以把 activation、workspace、packed weight cache 和 KV cache 都放进内存系统，但它们不是同一种生命周期。activation 可能每层复用，packed weight 跟模型生命周期一致，KV cache 跟 session 生命周期一致，workspace 跟 kernel 调用一致。若只用 \code{void* + size} 描述它们，迟早会把生命周期不同的对象混在一起。
+
+\subsection{effective type 和 strict aliasing：优化器如何删掉你以为必要的 load}
+
+别名规则的核心不是“C++ 禁止奇技淫巧”，而是让优化器能建立内存依赖图。若一个 \code{float*} 写入不可能改变一个 \code{int} 对象，编译器就可以把 \code{int} load 缓存在寄存器里。错误类型解引用破坏的是这个证明系统。
+
+\begin{lstlisting}[language=C++,caption={错误类型访问可能让优化器保留旧值}]
+int read_after_float_write(int* ip, float* fp)
+{
+    int before = *ip;
+    *fp = 0.0f;
+    int after = *ip;
+    return after - before;
+}
+\end{lstlisting}
+
+若 \code{ip} 和 \code{fp} 按合法程序规则不能指向同一个 \code{int} 对象，优化器可能认为 \code{after == before}。若调用者通过强转让两者指向同一地址，就是调用者破坏了语言合同，不是优化器“错误”。需要观察或复制位模式时，用 \code{std::memcpy}、\code{std::bit\_cast} 或字节视图；需要共享 storage 时，用清楚的 union/variant/对象生命周期设计，而不是随手 \code{reinterpret\_cast}。
+
+\subsection{未定义行为释放了哪些优化自由}
+
+UB 的关键后果是：优化器可以假设合法程序不会走到 UB。下面几类 UB 对性能代码影响最大：
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+UB 来源 & 优化器可能利用的假设 & 常见误判 \\
+\midrule
+有符号溢出 & 算术满足数学整数单调性 & 以硬件回绕反驳优化结果 \\
+越界访问 & 指针只在对象或 one-past 范围内移动 & speculative overread 越过对象边界 \\
+悬垂指针 & 生命周期结束后不再访问 & 对象池复用后旧句柄仍可用 \\
+违反对齐 & \code{T*} 满足 \code{alignof(T)} & 未对齐 load 只是慢一点 \\
+错误类型访问 & 不相关类型不别名 & 强转改对象位模式 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些自由会进入真实机器码。例如边界检查可能被消掉，循环条件可能被简化，两个 load 可能合并，store 可能被删除。调试时若看到 \code{-O0} 正常、\code{-O3} 异常，不应先怪优化器；要先查 UB、别名、生命周期、数据竞争和未初始化值。
+
+\subsection{反例：fast memcpy 也要有语言边界}
+
+高性能代码常写宽 load/store，一次复制 16、32 或 64 字节。若它读取对象末尾之后的字节，即使没有跨页 fault，语言层也可能越界。库实现可以依赖实现内部特权、目标平台和严格证明；普通项目不能照抄“多读一点没事”。安全做法是把主循环限制在完整块内，tail 用合法范围内的标量或 mask 路径。
+
+\begin{lstlisting}[numbers=none,caption={宽复制的边界账本}]
+main vector loop:
+  only reads bytes [0, n - vector_width] in full chunks
+
+tail path:
+  reads exactly remaining bytes
+  or uses masked load with documented no-fault guarantee
+
+never assume:
+  reading past object end is fine because hardware usually tolerates it
+\end{lstlisting}
+
+这条规则会在第二册 SIMD 和第三册 GEMV kernel 中反复出现。高性能实现不是忽略边界，而是把边界拆成可证明的主循环和 tail path。
+
+\subsection{工业取舍：内部布局可以激进，外部合同必须保守}
+
+成熟系统会在内部做 packed layout、arena reuse、SIMD 对齐、object pool、tagged handle 和 lazy materialization，但对外接口保持保守：明确 owner、lifetime、alias、alignment、shape 和 dtype。这样优化可以在内部替换，外部调用者不需要理解每个微架构细节。
+
+\begin{lstlisting}[numbers=none,caption={内存对象的工业级描述字段}]
+BufferContract:
+  owner
+  lifetime
+  base_pointer
+  size_bytes
+  alignment_bytes
+  element_type
+  mutable_or_const
+  alias_set
+  external_format_or_internal_layout
+  debug_name
+\end{lstlisting}
+
+这个合同比裸指针繁琐，但它能直接回答事故问题：谁释放，谁还在读，是否允许 in-place，是否能给 SIMD，是否能跨线程，是否能写入文件格式，是否能被 memory planner 复用。底层工程的“高级感”不在于少写字段，而在于每个字段都对应一条正确性或性能边界。
+
 \section{验收标准}
 
 本章收束时，应能做到：

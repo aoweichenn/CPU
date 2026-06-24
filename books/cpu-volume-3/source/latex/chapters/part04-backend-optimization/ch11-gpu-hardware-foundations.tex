@@ -281,6 +281,148 @@ GpuKernelDesc:
 
 编译器 lowering 使用这些字段选择 plan；verifier 用它们拒绝不支持的 shape 或 dtype；profiler 用它们解释瓶颈；benchmark 报告用它们保证可复现。这样 GPU 硬件知识就进入了工程合同，而不是停留在“这个 kernel 在我机器上更快”的经验。
 
+\subsection{coalescing 的地址公式：warp 访问不是自然合并}
+
+GPU global memory 喜欢一个 warp 的 lane 访问连续、对齐、少量内存事务能覆盖的地址。若 lane \(i\) 访问：
+
+\[
+addr_i = base + (offset + i) \times sizeof(T)
+\]
+
+通常更容易合并。若 lane \(i\) 访问：
+
+\[
+addr_i = base + index_i \times sizeof(T)
+\]
+
+且 \(index_i\) 随机，硬件仍要发出多个内存事务。coalescing 不是“用了 GPU 就自动发生”，它来自 layout、warp mapping 和地址公式。
+
+\begin{lstlisting}[numbers=none,caption={KV cache 两种 warp 地址流}]
+good for lane covers head_dim:
+  lane i reads kv[layer][pos][kv_head][dim + i]
+  addresses are contiguous inside head_dim
+
+bad if lane covers random sessions:
+  lane i reads kv[session_i][page_i][slot_i][dim]
+  addresses may scatter across pages
+\end{lstlisting}
+
+paged KV cache 提高调度灵活性，但会让地址公式多一次 page table 间接。高质量 kernel 通常要把 page 内连续读和跨页边界分开处理，避免每个 lane 都走完全随机路径。
+
+\subsection{shared memory bank conflict 的手算模型}
+
+shared memory 被拆成多个 bank。简化地说，若有 \(B\) 个 bank，地址按 word 映射到：
+
+\[
+bank = word\_index \bmod B
+\]
+
+若一个 warp 中多个 lane 同时访问同一 bank 的不同地址，就可能冲突。连续访问通常较好；按某个 stride 访问可能让所有 lane 落到少数 bank。
+
+\begin{lstlisting}[numbers=none,caption={bank conflict 的 stride 直觉}]
+bank_count = 32
+
+lane i reads shared[i]:
+  bank = i mod 32
+  lanes spread across banks
+
+lane i reads shared[i * 32]:
+  bank = 0 for all lanes
+  worst conflict shape
+\end{lstlisting}
+
+实际硬件有广播、bank 宽度和访问粒度等细节，但这个模型能解释为什么 shared memory tile layout 需要 padding 或 swizzle。把 global memory 读连续搬进 shared 只是第一步；shared 内部消费也要看 bank。
+
+\subsection{occupancy calculator 的最小公式}
+
+occupancy 受 threads per block、registers per thread、shared memory per block 和硬件上限共同限制。简化账本如下：
+
+\begin{lstlisting}[numbers=none,caption={occupancy 限制项}]
+blocks_by_threads = max_threads_per_sm / threads_per_block
+blocks_by_registers = registers_per_sm /
+  (registers_per_thread * threads_per_block)
+blocks_by_shared = shared_memory_per_sm / shared_memory_per_block
+resident_blocks = min(blocks_by_threads,
+                      blocks_by_registers,
+                      blocks_by_shared,
+                      hardware_block_limit)
+\end{lstlisting}
+
+优化时常见交换是：增大 tile 提高复用，但增加 registers/shared，降低 resident blocks；减小 tile 提高 occupancy，但每个 global load 被复用次数下降。报告里只写 occupancy 百分比不够，必须写是哪一项限制了驻留。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+限制项 & 表面现象 & 可能改法 \\
+\midrule
+registers/thread 高 & resident warp 少，可能 spill & 缩小 tile，分阶段累加 \\
+shared/block 高 & resident block 少 & 压缩 tile，重用 shared buffer \\
+threads/block 不合适 & 并行度或调度粒度差 & 调整 block shape \\
+memory coalescing 差 & throughput 低、stall memory & 改 warp mapping/layout \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{decode 小 batch 为什么难吃满 GPU}
+
+LLM decode 常见痛点是 batch 小、每步依赖上一步 token、kernel 多、同步多。单 session decode 的 GEMV 形态 \(M=1\)，很难像 prefill GEMM 那样提供大矩阵给 tensor core。即使权重常驻显存，每一步仍要调度多个 kernel，读大量权重和 KV，最后 sampler 可能还要同步 logits。
+
+\begin{lstlisting}[numbers=none,caption={单 session decode 的 GPU 固定成本}]
+for each token:
+  launch or dispatch many small kernels
+  read layer weights
+  read KV cache up to context
+  run reductions for attention
+  produce logits
+  synchronize sampler or copy top candidates
+  feed next token to next step
+\end{lstlisting}
+
+连续合批能提高 \(M\)，让 GEMV 更像小 GEMM，也能摊薄 launch 成本；代价是 queue wait、KV binding、变长 session 和 SLO 复杂度。GPU backend 不能只追求吞吐，它必须和第三章的 scheduler 一起设计。
+
+\subsection{host-device 边界和 sampler 位置}
+
+如果每步把完整 logits 从 GPU 拷回 CPU 再采样，词表大小 \(V\) 很大时会产生明显传输和同步成本。更好的路径可能是在 GPU 上做 logits processor、top-k/top-p 或至少取 top candidates，再只传小结果；但这会把采样语义、RNG 状态和可复现性带进 GPU plan。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+采样位置 & 优点 & 风险 \\
+\midrule
+CPU 完整 logits & 易调试，复现简单 & 大拷贝、同步、TPOT 增加 \\
+GPU top-k/top-p & 传输少，减少同步 & kernel 复杂，RNG/排序合同 \\
+混合 top candidates & 折中，保留 CPU sampler & 需要误差和截断边界 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这也是为什么 executable plan 要记录 sampler boundary。否则 benchmark 的 TPOT 可能测的是 GPU kernel，而用户体验卡在 logits staging 和 CPU sampler。
+
+\subsection{GPU 报告的工业级最小字段}
+
+GPU benchmark 报告至少包含：
+
+\begin{lstlisting}[numbers=none,caption={GPU backend report 最小字段}]
+model_shape
+stage: prefill | decode
+batch_size
+context_length
+kernel_count_per_token
+selected_kernels
+block_shape
+warp_mapping
+registers_per_thread
+shared_memory_per_block
+achieved_occupancy
+memory_throughput
+tensor_core_utilization
+host_device_copy_bytes
+sampler_boundary
+correctness_oracle
+\end{lstlisting}
+
+这些字段让 GPU 优化回到证据链：kernel 是否真的对应目标阶段，shape 是否足够吃满硬件，访存是否合并，tensor core 是否被使用，host-device 是否拖尾，结果是否仍对。
+
 \subsection{本节验收线}
 
 读完本节，应该能把 GPU 硬件和推理后端连接起来：
