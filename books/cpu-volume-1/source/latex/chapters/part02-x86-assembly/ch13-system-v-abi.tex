@@ -2253,6 +2253,362 @@ conclusion:
 
 这份报告的结论很硬：同一个 C++ 函数声明，在两个 x86-64 平台上可以拥有不同入口寄存器、不同栈合同、不同保存责任和不同 unwind 元数据。跨平台工程的正确做法不是用宏把一份汇编“凑到能编”，而是为每个 ABI 写清独立入口合同，用 C++ wrapper 调度，并用对应平台证据验证。
 
+\subsection{Windows x64 参数槽位：不是两条独立通道}
+
+System V AMD64 最容易记成“两条队列”：整数/指针参数进通用寄存器队列，浮点参数进 SSE 队列。Windows x64 不能这样记。Windows x64 更适合记成“四个参数槽位”：第 1、2、3、4 个参数各有一个通用寄存器位置和一个 XMM 位置，具体使用哪个由该参数类型决定。超过四个参数后，后续参数走栈。
+
+看这个声明：
+
+\begin{lstlisting}[language=C++]
+extern "C" double slot_demo(int a, double b, float c, long long d);
+\end{lstlisting}
+
+Windows x64 的入口位置应按槽位推导：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 参数槽位推导}]
+slot 0: int a       -> ecx
+slot 1: double b    -> xmm1 low f64
+slot 2: float c     -> xmm2 low f32
+slot 3: long long d -> r9
+return double       -> xmm0 low f64
+\end{lstlisting}
+
+这和 System V 完全不同。System V 会把 \code{a} 放 \register{edi}，\code{b} 放 \register{xmm0}，\code{c} 放 \register{xmm1}，\code{d} 放 \register{rsi}。如果你用 System V 的“浮点独立队列”理解 Windows，第二个参数 \code{b} 会被错写成 \register{xmm0}，第三个参数 \code{c} 会被错写成 \register{xmm1}。这种错误在手写汇编里不会被 CPU 拦住，只会表现为结果错、NaN、随机值或偶发崩溃。
+
+\begin{keyidea}
+Windows x64 先按参数序号占槽，再按类型选择 RCX/RDX/R8/R9 或 XMM0--XMM3。System V 先按类型分类，再分别压入整数队列和 SSE 队列。二者不是同一套规则的两个名字。
+\end{keyidea}
+
+\subsection{shadow space 的真实栈图}
+
+shadow space 不能只背“32 字节”。它的关键是所有权和时间点。Windows x64 调用者在执行 \instruction{call} 前预留 32 字节；\instruction{call} 再压入 8 字节返回地址；被调用者入口处，\register{rsp} 指向返回地址，shadow space 位于 \code{[rsp+8]} 到 \code{[rsp+39]}。
+
+调用者视角：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 调用者准备一次调用}]
+; before nested call, rsp must satisfy the call alignment rule
+sub rsp, 40              ; 32-byte shadow space + 8-byte alignment fix
+mov ecx, 1               ; arg0
+mov edx, 2               ; arg1
+mov r8d, 3               ; arg2
+mov r9d, 4               ; arg3
+call target
+add rsp, 40
+\end{lstlisting}
+
+被调用者入口的简化栈图：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 callee entry stack map}]
+rsp + 00: return address
+rsp + 08: home slot for arg0 / shadow space byte 0..7
+rsp + 16: home slot for arg1 / shadow space byte 8..15
+rsp + 24: home slot for arg2 / shadow space byte 16..23
+rsp + 32: home slot for arg3 / shadow space byte 24..31
+rsp + 40: stack argument 4, if any
+rsp + 48: stack argument 5, if any
+\end{lstlisting}
+
+这里最容易错的是把 \code{[rsp+8]} 当成第一个栈上传参。对 Windows x64 来说，\code{[rsp+8]} 首先属于 shadow space；第五个参数才通常在 \code{[rsp+40]}。对 System V 来说，没有这块固定 shadow space，第七个整数类参数常从 \code{[rsp+8]} 读。二者刚好容易形成灾难性错位。
+
+\subsection{Windows x64 的五个参数：第五个为什么在 \code{[rsp+40]}}
+
+用一个固定例子训练：
+
+\begin{lstlisting}[language=C++]
+extern "C" long long sum5(long long a, long long b, long long c,
+                          long long d, long long e)
+{
+    return a + b + c + d + e;
+}
+\end{lstlisting}
+
+Windows x64 入口状态：
+
+\begin{lstlisting}[numbers=none,caption={sum5 的 Windows x64 入口状态}]
+rcx        = a
+rdx        = b
+r8         = c
+r9         = d
+[rsp + 00] = return address
+[rsp + 08] = shadow slot 0
+[rsp + 16] = shadow slot 1
+[rsp + 24] = shadow slot 2
+[rsp + 32] = shadow slot 3
+[rsp + 40] = e
+\end{lstlisting}
+
+对应手写汇编的核心计算可以是：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 sum5 栈参数读取}]
+sum5 PROC
+    lea rax, [rcx + rdx]
+    add rax, r8
+    add rax, r9
+    add rax, qword ptr [rsp + 40]
+    ret
+sum5 ENDP
+\end{lstlisting}
+
+这段代码如果放到 System V 上完全不对。System V 的第五个整数类参数在 \register{r8}，而不是 \code{[rsp+40]}；第一个参数也不是 \register{rcx}，而是 \register{rdi}。同一个源函数签名，手写汇编必须按目标 ABI 重写入口。
+
+\subsection{Windows x64 的 leaf 和 non-leaf：shadow space 仍由调用者提供}
+
+leaf function 是不调用其他函数的函数。Windows x64 leaf function 可以非常短，例如：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 leaf function}]
+add2 PROC
+    lea eax, [ecx + edx]
+    ret
+add2 ENDP
+\end{lstlisting}
+
+这个 leaf function 自己没有调用别人，所以它不需要为了 nested call 再预留 shadow space。但它的调用者在调用它之前仍然必须预留 shadow space。被调用者可以选择不用这 32 字节，但调用者不能因为“我猜它不用”就省掉。ABI 约定的是调用边界，不是某次实现的内部习惯。
+
+non-leaf function 要调用 helper，就必须作为调用者满足 Windows x64 规则。比如一个 wrapper 调用 \code{helper}：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 non-leaf 调用形态}]
+wrapper PROC
+    sub rsp, 40          ; 32 shadow + alignment
+    ; arrange helper arguments in rcx, rdx, r8, r9 / stack
+    call helper
+    add rsp, 40
+    ret
+wrapper ENDP
+\end{lstlisting}
+
+如果 wrapper 还要保存 nonvolatile 寄存器，或者分配局部变量，\code{sub rsp, N} 要一起覆盖 shadow space、局部空间和对齐需求。不要机械认为永远是 40。正确报告应写清每一段栈空间的用途。
+
+\subsection{Windows x64 的返回值：小整数、浮点和聚合}
+
+Windows x64 常见标量返回规则与直觉接近：整数、指针返回通常在 \register{rax}；\code{float}/\code{double} 返回通常在 \register{xmm0} 低 lane。但聚合类型不能只凭大小猜，尤其要区分“能放进寄存器的简单小对象”和“需要调用者提供返回存储的对象”。
+
+工程上可以先记一个保守规则：跨 Windows x64 手写汇编边界时，公开接口尽量避免直接返回复杂 C++ 对象；用整数、指针、浮点或显式输出指针更清楚。比如：
+
+\begin{lstlisting}[language=C++]
+struct Pair64 {
+    std::uint64_t a;
+    std::uint64_t b;
+};
+
+extern "C" void make_pair64(std::uint64_t x, Pair64* out);
+\end{lstlisting}
+
+这比直接写 \code{extern "C" Pair64 make_pair64(std::uint64_t);} 更容易稳定，因为输出地址显式占一个普通参数位置。直接返回聚合时，MSVC ABI、MinGW、Clang 目标和类型性质都可能影响实际返回方式；若你没有保存反汇编和调用点证据，后续维护很容易错。
+
+\subsection{Windows x64 的结构体传参：不要把 System V eightbyte 分类搬过去}
+
+System V AMD64 有一套复杂的 eightbyte 分类规则，小结构体可能拆成通用寄存器和 SSE 寄存器组合。Windows x64 的规则不是这套。许多不符合简单寄存器传递条件的聚合会通过地址传递，调用者在临时存储中放对象，再把地址作为参数传给被调用者。
+
+因此，下面这种接口在跨 ABI 时风险很高：
+
+\begin{lstlisting}[language=C++]
+struct Mixed {
+    int tag;
+    double value;
+};
+
+extern "C" double use_mixed(Mixed x);
+\end{lstlisting}
+
+System V 可能把它拆到一个通用寄存器和一个 XMM 寄存器；Windows x64 可能使用完全不同的形态。正确做法不是凭记忆猜，而是生成目标 triple 的反汇编，保存调用点和入口证据。公开 ABI 中更稳妥的设计是：
+
+\begin{lstlisting}[language=C++]
+extern "C" double use_mixed_ptr(Mixed const* x);
+\end{lstlisting}
+
+指针 ABI 形态简单，布局仍需 \code{static_assert} 保护，但至少调用边界不再涉及聚合分类。
+
+\subsection{Windows x64 变参：不要套用 System V 的 \register{al}}
+
+System V 变参调用常见 \register{al} 元信息；Windows x64 不是这条规则。Windows x64 的变参和未原型化函数为了让被调用者能从统一位置取值，会让前四个参数的寄存器槽位和 home slots 扮演不同角色；浮点值在某些调用形态下还需要在对应通用寄存器中有副本。具体细节要以 Windows x64 ABI 文档和编译器输出为准。
+
+第一册要训练的是边界意识：
+
+\begin{itemize}
+  \item 分析 Windows x64 \code{printf} 调用，不要寻找 System V 的 \register{al} 规则。
+  \item 看浮点变参时，检查 XMM 寄存器、对应通用寄存器、shadow space 和栈参数。
+  \item 手写汇编调用变参函数时，优先让 C++ wrapper 处理；若必须手写，按 Windows ABI 逐项摆放并保存反汇编证据。
+\end{itemize}
+
+\subsection{Windows x64 保存寄存器：XMM6--XMM15 也要进入清单}
+
+Windows x64 常见 nonvolatile 通用寄存器包括 \register{rbx}、\register{rbp}、\register{rdi}、\register{rsi}、\register{r12}--\register{r15}。这和 System V 不同：System V 下 \register{rdi}、\register{rsi} 是参数寄存器并且通常 caller-saved；Windows x64 下它们属于 nonvolatile，函数若修改就要恢复。
+
+向量寄存器也不同。Windows x64 中 \register{xmm6}--\register{xmm15} 的低 128 位通常是 nonvolatile。一个手写 AVX/SSE kernel 如果把 \register{xmm8} 当临时寄存器随便改，System V 下可能没问题，Windows x64 下就可能破坏调用者状态。若使用 \register{ymm6}--\register{ymm15}，还要注意 ABI 对低 128 位保存的要求和高位状态的处理边界。
+
+Windows x64 汇编函数报告至少要列：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 保存责任清单}]
+modified_gpr:
+  volatile:
+  nonvolatile_saved_restored:
+
+modified_xmm:
+  xmm0_xmm5_volatile:
+  xmm6_xmm15_nonvolatile_saved_restored:
+
+stack:
+  shadow_space_for_nested_calls:
+  local_stack_size:
+  alignment_at_each_call:
+\end{lstlisting}
+
+\subsection{SEH unwind 元数据：能返回不等于能展开}
+
+Windows x64 对函数序言、尾声和 unwind metadata 有严格要求。调试器、异常处理、栈回溯和 profiler 需要这些元数据恢复调用链。一个函数如果只写：
+
+\begin{lstlisting}
+push rbx
+sub rsp, 32
+...
+add rsp, 32
+pop rbx
+ret
+\end{lstlisting}
+
+它从 CPU 执行角度可能能返回，但 Windows 异常展开器未必知道你保存了 \register{rbx}、移动了 \register{rsp}。MASM 里常见 \code{PROC}、\code{ENDP}、\code{.allocstack}、\code{.pushreg}、\code{.endprolog} 一类机制；Clang/GAS 风格也有面向 Windows SEH 的指令。它们和 Linux 上的 \code{.cfi\_*} 不是同一套。
+
+第一册不要求你掌握全部 SEH 语法，但要知道验收标准：Windows x64 手写汇编不能只通过功能测试，还要通过 unwind 证据。至少要能回答：
+
+\begin{itemize}
+  \item 这个函数是否可能出现在异常展开路径或 profiler 采样栈里。
+  \item 是否保存了 nonvolatile 寄存器，unwind metadata 是否描述了保存位置。
+  \item 是否分配了栈空间，unwind metadata 是否描述了栈大小。
+  \item 是否有多个返回路径，每条尾声是否符合 unwind 规则。
+\end{itemize}
+
+\subsection{MSVC、MinGW 和 Clang target triple 都要写进报告}
+
+“Windows x64 ABI”不是说所有工具输出都长得一样。MSVC、Clang targeting \code{x86\_64-windows-msvc}、Clang targeting \code{x86\_64-w64-windows-gnu}、MinGW-w64 工具链，在符号、异常模型、C++ ABI、库边界和汇编语法上都可能不同。C 函数调用核心约定很接近，但 C++ 对象、异常、name mangling 和运行时库边界不能混说。
+
+跨平台报告必须写：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 目标身份字段}]
+target_os: windows
+target_abi: msvc / gnu
+target_triple:
+compiler:
+assembler_syntax: masm / gas-intel / llvm
+object_format: COFF
+exception_unwind: SEH / other
+runtime_library:
+\end{lstlisting}
+
+没有这些字段，看到 \code{.seh\_*}、COFF 符号、MSVC name mangling 或 MinGW 导入库时，就很容易把工具链差异误判成 ABI 规则差异。
+
+\subsection{Windows x64 错误案例：把 \code{[rsp+8]} 当第五个参数}
+
+错误实现：
+
+\begin{lstlisting}[numbers=none,caption={错误：把 shadow slot 当第五个参数}]
+; extern "C" long long sum5(long long,long long,long long,long long,long long)
+bad_sum5 PROC
+    lea rax, [rcx + rdx]
+    add rax, r8
+    add rax, r9
+    add rax, qword ptr [rsp + 8]   ; wrong on Windows x64
+    ret
+bad_sum5 ENDP
+\end{lstlisting}
+
+为什么错？因为 \code{[rsp+8]} 是 shadow space 的第一个 home slot，不是第五个参数。第五个参数通常在 \code{[rsp+40]}。这个 bug 可能在某些调用点上“看起来有值”，因为编译器可能把 \register{rcx} spill 到 home slot；但那只是实现细节，不是第五个参数。正确实现应读取 \code{[rsp+40]}。
+
+这类错误很适合写成实验：先用 C++ reference 计算 \code{1+2+3+4+5=15}，再调用错误汇编，观察它把 home slot 当参数导致结果不稳定；最后修复偏移，并用反汇编确认调用者确实预留了 shadow space。
+
+\subsection{Windows x64 错误案例：忘记为嵌套调用预留 shadow space}
+
+错误 wrapper：
+
+\begin{lstlisting}[numbers=none,caption={错误：调用 helper 前未预留 shadow space}]
+bad_wrapper PROC
+    ; rcx already holds first argument
+    call helper      ; wrong: no 32-byte shadow space reserved here
+    ret
+bad_wrapper ENDP
+\end{lstlisting}
+
+如果 \code{helper} 在入口把参数保存到 home slots，例如写 \code{[rsp+8]}、\code{[rsp+16]}，它会覆盖 \code{bad\_wrapper} 栈上的未知位置。程序可能立刻崩溃，也可能污染某个返回地址附近的数据，稍后才坏。正确 wrapper 至少要在调用前分配调用所需栈空间，并保持对齐：
+
+\begin{lstlisting}[numbers=none,caption={正确方向：为嵌套调用准备调用帧}]
+good_wrapper PROC
+    sub rsp, 40
+    call helper
+    add rsp, 40
+    ret
+good_wrapper ENDP
+\end{lstlisting}
+
+实际工程里如果还保存 nonvolatile 寄存器或分配局部变量，栈大小要重新计算，不能机械复制 40。
+
+\subsection{Windows x64 最小实验：生成 COFF 目标文件并审计}
+
+即使在 Linux 主机上，也可以用 Clang 生成 Windows x64 汇编和 COFF 目标文件，训练静态证据：
+
+\begin{lstlisting}[language=bash,caption={生成 Windows x64 ABI 静态证据}]
+clang++ --target=x86_64-windows-msvc -std=c++20 -O2 \
+  -S -masm=intel winabi.cpp -o winabi.win64.s
+
+clang++ --target=x86_64-windows-msvc -std=c++20 -O2 \
+  -c winabi.cpp -o winabi.win64.obj
+
+llvm-objdump -d --x86-asm-syntax=intel winabi.win64.obj
+llvm-nm -C winabi.win64.obj
+\end{lstlisting}
+
+这个实验能证明：目标是 COFF/Windows x64，参数寄存器如何出现，函数是否使用 shadow space，符号如何命名。它不能证明：该函数已经在 Windows 上运行，SEH unwind 已经被真实异常路径验证，或者 MSVC runtime 交互完全正确。运行证据必须在 Windows 主机、Wine、CI runner 或可靠目标环境中补上。
+
+\subsection{Windows x64 ABI 报告模板}
+
+一份合格 Windows x64 ABI 报告至少包含：
+
+\begin{lstlisting}[numbers=none,caption={Windows x64 ABI report}]
+windows_x64_abi_report:
+  target:
+    triple:
+    compiler:
+    object_format: COFF
+    assembler_syntax:
+
+  function:
+    exact_declaration:
+    exported_symbol:
+    return_location:
+
+  parameters:
+    slot0:
+      source:
+      register_or_stack:
+    slot1:
+    slot2:
+    slot3:
+    stack_args_from_rsp_plus_40:
+
+  stack_contract:
+    caller_shadow_space:
+    callee_entry_rsp_map:
+    nested_call_rsp_adjustment:
+    red_zone: none
+
+  preservation:
+    nonvolatile_gpr:
+    nonvolatile_xmm:
+    unwind_metadata:
+
+  evidence:
+    assembly:
+    objdump:
+    symbols:
+    run_or_static_only:
+
+  failure_cases_checked:
+    wrong_register_order:
+    missing_shadow_space:
+    wrong_stack_arg_offset:
+    missing_nonvolatile_restore:
+\end{lstlisting}
+
+这份模板比“Windows 第一个参数在 RCX”厚得多。它要求读者把目标身份、参数槽位、栈图、保存责任、unwind 和证据边界全部写出来。做到这一步，Windows x64 ABI 才从“被提到”变成“可用知识”。
+
 \subsection{系统调用 ABI 和函数调用 ABI 不同}
 
 即使在同一台 Linux x86-64 机器上，普通函数调用 ABI 和系统调用 ABI 也不同。普通函数把第四个整数参数放在 \register{rcx}；Linux syscall 使用 \register{r10} 传第四个参数，且 \instruction{syscall} 会破坏 \register{rcx} 和 \register{r11}。如果把普通 C 函数调用规则套到 syscall 上，参数会错。
