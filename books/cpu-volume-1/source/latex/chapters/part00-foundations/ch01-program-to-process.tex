@@ -2756,6 +2756,281 @@ signal_report:
 
 能回答这些问题，第一册才真正从“看懂汇编”进入“解释 C++ 程序如何被机器、运行时和操作系统共同执行”的层次。
 
+\section{第一册样板链路：FirstTrace-CPU}
+
+前面的章节已经给出许多机制，但第一册要变强，必须有一条固定样板链路反复训练。这里定义一个极小实验 \term{FirstTrace-CPU}{第一册贯穿证据链实验}。它只包含两个翻译单元，却能同时暴露 C++ 语义、优化器视野、ABI、机器码、符号、重定位、链接和运行时边界。
+
+这个实验故意不用复杂业务。复杂业务会让读者把注意力放在算法上；第一册的目标是先把“从源码到进程”的证据链钉牢。
+
+\subsection{固定源码：必须拆成两个翻译单元}
+
+第一个文件提供定义：
+
+\begin{lstlisting}[language=C++,caption={add\_i32\_def.cpp}]
+extern "C" int add_i32(int a, int b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+第二个文件只看见声明，并调用它：
+
+\begin{lstlisting}[language=C++,caption={add\_i32\_caller.cpp}]
+extern "C" int add_i32(int a, int b);
+
+extern "C" int call_add(int x)
+{
+    return add_i32(x, 5);
+}
+\end{lstlisting}
+
+拆成两个翻译单元不是形式主义。如果把定义和调用放在同一个文件里，优化器能直接看到 \code{add\_i32} 的函数体，\code{call\_add} 很可能被改写成：
+
+\begin{lstlisting}
+lea eax, [rdi + 5]
+ret
+\end{lstlisting}
+
+这时你看不到外部调用、未定义符号和 \code{R\_X86\_64\_PLT32} 重定位。若本实验的目标是训练链接证据，单文件版本就是错误实验设计。
+
+\begin{keyidea}
+实验输入必须保留你要观察的机制。想观察跨翻译单元调用，就不能把函数体暴露给同一个翻译单元的优化器；想观察动态链接，就不能静态链接后还声称在看 lazy binding；想观察 page fault，就不能提前把页面全部预热。
+\end{keyidea}
+
+\subsection{第一层：C++ 语义合同}
+
+源码层能证明的事实很少，但很关键：
+
+\begin{itemize}
+  \item \code{add\_i32} 接收两个 \code{int}，返回一个 \code{int}。
+  \item \code{return a + b;} 的有符号溢出仍属于 C++ 未定义行为边界。
+  \item \code{extern "C"} 只改变语言链接名，不改变函数调用 ABI、整数宽度或溢出规则。
+  \item \code{call\_add} 的当前翻译单元只能看见 \code{add\_i32} 声明，看不见函数体。
+\end{itemize}
+
+这层不能证明参数在哪个寄存器，不能证明有 \instruction{call} 或 \instruction{jmp}，也不能证明最终有独立机器码。它只给后续层提供语言合同。
+
+\subsection{第二层：LLVM IR 证据}
+
+用 Clang 可以生成优化后的 LLVM IR：
+
+\begin{lstlisting}[numbers=none,caption={生成 IR}]
+clang++ --target=x86_64-linux-gnu -std=c++20 -O2 \
+  -S -emit-llvm add_i32_def.cpp -o add_i32_def.ll
+
+clang++ --target=x86_64-linux-gnu -std=c++20 -O2 \
+  -S -emit-llvm add_i32_caller.cpp -o add_i32_caller.ll
+\end{lstlisting}
+
+定义方的关键 IR 形态可能是：
+
+\begin{lstlisting}[numbers=none,caption={定义方 IR 的关键片段}]
+define dso_local i32 @add_i32(i32 noundef %0, i32 noundef %1) {
+  %3 = add nsw i32 %1, %0
+  ret i32 %3
+}
+\end{lstlisting}
+
+调用方的关键 IR 形态可能是：
+
+\begin{lstlisting}[numbers=none,caption={调用方 IR 的关键片段}]
+define dso_local i32 @call_add(i32 noundef %0) {
+  %2 = tail call i32 @add_i32(i32 noundef %0, i32 noundef 5)
+  ret i32 %2
+}
+\end{lstlisting}
+
+这里有两个训练点。第一，\code{add nsw} 里的 \code{nsw} 不是装饰，它表示 no signed wrap，来自 C++ 有符号溢出未定义这个语言前提。第二，调用方 IR 里仍是对 \code{add\_i32} 的调用，因为当前翻译单元没有函数体。若打开 LTO 或把定义放入头文件，IR 和最终机器码可能完全不同。
+
+\subsection{第三层：汇编证据}
+
+生成 x86-64 Intel 语法汇编：
+
+\begin{lstlisting}[numbers=none,caption={生成 x86-64 汇编}]
+clang++ --target=x86_64-linux-gnu -std=c++20 -O2 \
+  -S -masm=intel add_i32_def.cpp -o add_i32_def.s
+
+clang++ --target=x86_64-linux-gnu -std=c++20 -O2 \
+  -S -masm=intel add_i32_caller.cpp -o add_i32_caller.s
+\end{lstlisting}
+
+定义方可能生成：
+
+\begin{lstlisting}[numbers=none,caption={add\_i32 的典型汇编}]
+add_i32:
+  lea eax, [rdi + rsi]
+  ret
+\end{lstlisting}
+
+调用方可能生成：
+
+\begin{lstlisting}[numbers=none,caption={call\_add 的典型汇编}]
+call_add:
+  mov esi, 5
+  jmp add_i32       # TAILCALL
+\end{lstlisting}
+
+这不是普通 \instruction{call}，而是尾调用。因为 \code{call\_add} 调用 \code{add\_i32} 后没有剩余工作，编译器可以把它变成 \instruction{jmp}。这个结果非常适合作为第一册样板：读者会发现“跨函数调用”不一定在汇编里表现为 \instruction{call}；必须根据 ABI 和控制流语义判断。
+
+\begin{warningbox}
+不要把“源码里写了函数调用”机械翻译成“汇编里一定有 call”。优化器可能内联、尾调用、常量传播、删除或改变调用形态。报告里必须写“当前构建下观察到的调用形态”，不能把源码意图当机器事实。
+\end{warningbox}
+
+\subsection{第四层：目标文件、机器码和重定位}
+
+生成目标文件：
+
+\begin{lstlisting}[numbers=none,caption={生成目标文件并观察}]
+clang++ --target=x86_64-linux-gnu -std=c++20 -O2 \
+  -c add_i32_def.cpp -o add_i32_def.o
+
+clang++ --target=x86_64-linux-gnu -std=c++20 -O2 \
+  -c add_i32_caller.cpp -o add_i32_caller.o
+
+llvm-objdump --triple=x86_64 -dr --x86-asm-syntax=intel add_i32_caller.o
+llvm-nm -C add_i32_caller.o
+readelf -r add_i32_caller.o
+\end{lstlisting}
+
+调用方目标文件的关键输出可以是：
+
+\begin{lstlisting}[numbers=none,caption={调用方目标文件的机器码和 relocation}]
+0000000000000000 <call_add>:
+   0: be 05 00 00 00        mov esi, 0x5
+   5: e9 00 00 00 00        jmp 0xa <call_add+0xa>
+      0000000000000006: R_X86_64_PLT32 add_i32-0x4
+\end{lstlisting}
+
+符号表会显示：
+
+\begin{lstlisting}[numbers=none,caption={调用方符号表}]
+                 U add_i32
+0000000000000000 T call_add
+\end{lstlisting}
+
+重定位表会显示：
+
+\begin{lstlisting}[numbers=none,caption={调用方重定位表}]
+Relocation section '.rela.text' contains 1 entry:
+  Offset     Type             Sym. Name + Addend
+  00000006   R_X86_64_PLT32   add_i32 - 4
+\end{lstlisting}
+
+这三份输出共同证明：
+
+\begin{itemize}
+  \item \code{call\_add} 在这个目标文件中有独立机器码。
+  \item \code{add\_i32} 在调用方目标文件中是未定义符号，需要链接器以后解析。
+  \item \code{jmp} 后面的 4 字节全 0 不是最终目标地址，而是等待重定位修正的占位。
+  \item \code{-0x4} 或 \code{-4} addend 来自 x86 rel32 以“下一条指令地址”为基准的编码规则。
+\end{itemize}
+
+如果报告只贴反汇编，不贴 \code{readelf -r}，就不能解释这个 0。若报告看到 \code{jmp 0xa} 就说“跳到函数末尾”，也是错误的，因为目标文件层的占位还没有被链接器修正。
+
+\subsection{第五层：链接后的二进制}
+
+在可链接的 x86-64 环境中，可以继续生成可执行文件：
+
+\begin{lstlisting}[numbers=none,caption={链接后继续观察}]
+clang++ -std=c++20 -O2 add_i32_def.cpp add_i32_caller.cpp driver.cpp -o app
+
+file app
+readelf -h -l -d app
+nm -C app | grep -E 'add_i32|call_add|main'
+objdump -drwC -Mintel app | grep -A8 -E '<add_i32>|<call_add>'
+ldd ./app
+\end{lstlisting}
+
+链接后要重新解释证据。目标文件里的 \code{U add\_i32} 应该已经被某个定义或动态符号解决；\code{R\_X86\_64\_PLT32} 可能消失，也可能转换为动态链接相关的 PLT/GOT 路径；最终可执行文件有 ELF header、program headers、entry point、interpreter 和动态段。此时你可以讨论二进制文件如何被加载，但还不能声称某次运行已经触发了 lazy binding 或 page fault，除非继续保存运行时证据。
+
+\subsection{第六层：进程和运行时证据}
+
+运行时证据至少包括：
+
+\begin{lstlisting}[numbers=none,caption={运行时证据命令}]
+./app
+cat /proc/$PID/maps
+cat /proc/$PID/status | grep -E 'VmRSS|Threads|SigBlk|SigCgt'
+LD_DEBUG=libs,bindings ./app 2>ld-debug.txt
+strace -f -ttT -e trace=execve,mmap,mprotect,brk,munmap ./app
+\end{lstlisting}
+
+这些命令回答的是另一层问题：可执行文件被哪些虚拟地址映射；动态链接器加载了哪些共享库；是否发生 \code{mmap}、\code{mprotect}、\code{brk}；进程有多少线程；信号 mask 状态如何。它们不能替代 IR 或反汇编，但能解释启动、冷路径和系统边界。
+
+如果本机不是 x86-64，仍然可以做两件事：第一，使用 \code{--target=x86\_64-linux-gnu} 生成 x86-64 目标文件，训练 IR、汇编、符号和重定位证据；第二，用本机目标生成可运行程序，训练 \code{/proc}、\code{strace}、loader 和 core dump 证据。报告要明确区分“交叉目标对象证据”和“本机运行证据”，不能混写。
+
+\subsection{统一报告模板}
+
+FirstTrace-CPU 的报告模板如下：
+
+\begin{lstlisting}[numbers=none,caption={FirstTrace-CPU 报告模板}]
+first_trace_cpu_report:
+  source:
+    files:
+    why_two_translation_units:
+    language_contract:
+
+  compiler:
+    compiler_version:
+    target_triple:
+    flags:
+    lto_enabled:
+
+  ir:
+    def_ir:
+    caller_ir:
+    optimization_facts:
+    language_assumptions:
+
+  assembly:
+    def_asm:
+    caller_asm:
+    abi_argument_mapping:
+    call_shape: call / tail_jmp / inline / deleted
+
+  object:
+    file_identity:
+    symbols:
+    disassembly_with_bytes:
+    relocations:
+    evidence_boundary:
+
+  linked_binary:
+    elf_header:
+    program_headers:
+    dynamic_section:
+    entry_point:
+    plt_got_if_any:
+
+  runtime:
+    command:
+    maps:
+    strace:
+    ld_debug:
+    page_fault_or_signal_evidence:
+
+  conclusion:
+    facts:
+    interpretation:
+    not_proven:
+\end{lstlisting}
+
+这就是第一册的硬标准：每个结论都要标注它来自哪一层。语言层说 \code{add\_i32} 有两个 \code{int} 参数；IR 层说调用方是否仍保留调用；汇编层说是 \instruction{call} 还是尾 \instruction{jmp}；目标文件层说符号和重定位是否存在；链接层说最终地址和动态链接如何成立；运行层说进程怎样被加载和执行。
+
+\subsection{五个必须写进报告的反例}
+
+第一，单翻译单元反例。把定义和调用放进同一个文件，\code{call\_add} 可能变成 \code{lea eax, [rdi + 5]}。这证明优化器视野改变了实验对象。
+
+第二，优化级别反例。用 \code{-O0} 可能看到保守栈槽和普通调用；用 \code{-O2} 可能看到尾调用。不能用 Debug 形态解释 Release 性能。
+
+第三，重定位反例。目标文件中的 \code{e9 00 00 00 00} 不是最终跳转目标。必须结合 \code{R\_X86\_64\_PLT32 add\_i32-0x4} 解释。
+
+第四，工具目标反例。在 AArch64 主机上用默认 \code{clang++} 可能生成 AArch64 对象；要观察 x86-64，就必须写清 \code{--target=x86\_64-linux-gnu} 和反汇编 triple。
+
+第五，运行时反例。目标文件证据不能证明某次运行的动态链接、缺页或信号路径。运行事实必须来自 \code{/proc}、\code{strace}、\code{LD\_DEBUG}、GDB/core 或性能计数器。
+
+到这里，第一册的训练对象就清楚了：不是“会背编译流程”，而是能把一个小函数在不同层中的身份逐层追踪，并知道每层证据能证明什么、不能证明什么。
+
 \section{反例：看似合理但错误的理解}
 
 \begin{warningbox}
