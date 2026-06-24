@@ -771,6 +771,225 @@ SyncPrimitiveDecision:
 
 写出 \code{rejected\_alternatives} 很有用。例如“没有选 semaphore，因为关闭时需要同时唤醒空等待和满等待，并保留 drain 语义”；“没有选 atomic wait，因为等待谓词跨 queue size 和 unfinished count”；“使用 eventfd 只是为了唤醒 epoll，completion 数据仍在队列中”。这些句子就是工程判断。
 
+\topic{五类等待对象的手算规则}
+同步原语最容易被误用，是因为代码只看到“我要等一下”，却没有把等待对象分类。下面这五类要能手算：
+
+\begin{lstlisting}[numbers=none,caption={等待对象分类}]
+invariant wait:
+  I need exclusive access while several fields temporarily disagree.
+  primitive: mutex
+
+predicate wait:
+  I need to sleep until a predicate over protected fields may be true.
+  primitive: condition_variable
+
+permit wait:
+  I need one unit from a counted resource budget.
+  primitive: counting_semaphore
+
+version wait:
+  I need one atomic value to differ from the value I observed.
+  primitive: atomic::wait
+
+event-loop wake:
+  I need to wake a poll/epoll/io_uring owner through an fd.
+  primitive: eventfd or pipe, payload stored elsewhere
+\end{lstlisting}
+
+这五类不是互斥的工程模块，而是不同层次。一个连接池可能同时使用 semaphore 限制借出许可，用 mutex 保护空闲连接链表，用 condition variable 管理关闭时的 drain，用 eventfd 唤醒事件循环。错误不在于“用了多种原语”，而在于没有写清每种原语表达哪一层事实。
+
+\topic{semaphore 只表达许可，不表达所有权和生命周期}
+信号量的计数是抽象许可，不是对象本身。拿到许可说明容量预算允许继续，不说明你已经拥有某个 C++ 对象，也不说明系统没有关闭。比如连接池：
+
+\begin{lstlisting}[numbers=none,caption={semaphore 许可和连接对象是两份状态}]
+borrow:
+  permits.acquire()          # budget says one borrower may proceed
+  lock pool mutex            # object list still needs protection
+  if closing:
+      unlock
+      permits.release()
+      return Closed
+  take one connection from free list
+  unlock
+
+return:
+  lock pool mutex
+  put connection back, or mark it broken
+  unlock
+  permits.release()
+\end{lstlisting}
+
+这个例子暴露两个常见事故。第一，\code{borrow} 拿到许可后发现池已关闭，必须归还许可；否则系统会泄漏许可，最终所有线程都睡在 \code{acquire}。第二，连接坏了不能简单 \code{release} 后塞回池里；许可计数和对象健康状态是两层。信号量适合表达“最多 N 个 in-flight”，不适合单独表达“这些对象的列表、状态和生命周期都正确”。
+
+\topic{condition variable 只保存等待队列，不保存业务事实}
+条件变量不记住业务事件。队列里有没有元素、线程池是否 idle、运行时是否关闭，都在受 mutex 保护的字段里。条件变量只让等待者在谓词暂时不满足时睡眠，并在状态可能变化后回来重查。
+
+\begin{lstlisting}[numbers=none,caption={CV 谓词必须写完整}]
+bad:
+  wait until queue_size > 0
+
+better:
+  wait until queue_size > 0 or closed or cancelled or error
+
+why:
+  empty + closed should exit
+  empty + cancelled should exit
+  empty + error should report failure
+  wakeup without data should continue waiting
+\end{lstlisting}
+
+因此，新增一个状态字段就必须重新审查所有 CV 谓词。给队列加 \code{cancelled}，却只在 \code{push} 路径检查取消，消费者仍可能睡在 \code{not\_empty}；给线程池加 \code{failed}，却不唤醒 \code{wait\_idle}，控制线程会永远等待。CV 的正确性不来自 \code{notify} 次数，而来自完整谓词和所有状态变化的通知覆盖。
+
+\topic{\code{atomic::wait} 适合版本，不适合复杂谓词}
+\code{atomic::wait} 的强项是单个原子值。它等待的是“这个值不再等于我看到的旧值”。这非常适合版本号、单状态枚举、一次性发布标志和窄 ready bit。它不适合跨多个字段的队列状态。
+
+\begin{lstlisting}[numbers=none,caption={atomic wait 的合适形态}]
+reader:
+  old = version.load(acquire)
+  version.wait(old)
+  new = version.load(acquire)
+  reload immutable snapshot
+
+writer:
+  publish immutable snapshot
+  version.fetch_add(1, acq_rel)
+  version.notify_all()
+\end{lstlisting}
+
+反例是把线程池 idle 压成一个原子布尔：
+
+\begin{lstlisting}[numbers=none,caption={错误：idle 不是单个布尔事实}]
+wrong_idle_flag:
+  ready_queue_empty = true
+  running_count may still be nonzero
+  submitter may be between increment and enqueue
+  a completion callback may enqueue more work
+  shutdown may be draining accepted tasks
+\end{lstlisting}
+
+这里等待谓词跨 ready queue、running count、submission in progress、shutdown state 和 failure state。把它压成一个 atomic bool 会制造提前返回。正确路径是先用 mutex 写清多字段谓词；若后续发现某个窄版本发布路径是热点，再把那个路径单独改成 atomic wait。
+
+\topic{\code{eventfd} 唤醒事件循环，不承载 payload}
+\code{eventfd} 是 Linux fd 形式的计数器，适合把“有 completion 了”通知给 epoll/io\_uring 所在的线程。它不保存业务数据，不表达队列容量，也不替代 mutex。正确形态通常是：业务数据写入 completion queue；再写 eventfd 唤醒事件循环；事件循环读 eventfd 后 drain completion queue。
+
+\begin{lstlisting}[numbers=none,caption={eventfd 的正确分层}]
+worker thread:
+  lock completion queue
+  push completion record
+  unlock
+  write eventfd counter by 1
+
+event loop:
+  epoll_wait returns eventfd readable
+  read eventfd counter
+  lock completion queue
+  drain completion records
+  unlock
+\end{lstlisting}
+
+错误形态是把 eventfd 当业务消息队列。eventfd 只有一个 64-bit counter；多次写入可以合并成一个可读计数，它不会保存每个请求的 id、错误码、buffer 所有权或完成顺序。payload 必须在另一个受保护的数据结构中，eventfd 只负责把事件循环从睡眠中叫醒。
+
+\topic{futex 是等待慢路径，不是业务抽象}
+futex 的核心是“用户态地址上的整数状态 + 内核等待队列”。它解决的是高层同步原语的睡眠慢路径：用户态先检查值，若值仍等于 expected，再让内核把线程挂到该地址对应的等待队列上。它不懂 C++ 对象生命周期、不懂队列 close、不懂元素所有权。
+
+\begin{lstlisting}[numbers=none,caption={futex 语义边界}]
+what futex knows:
+  user address
+  expected integer value
+  wait queue keyed by address
+  wake count
+
+what futex does not know:
+  C++ object lifetime
+  queue closed/draining/cancelled state
+  whether a task was accepted
+  whether a permit leaked
+  whether a wake is business-complete
+\end{lstlisting}
+
+因此，直接拿 futex 写业务队列时，最难的不是系统调用语法，而是证明地址生命周期、等待谓词、关闭唤醒和对象复用都正确。高层代码通常应先用标准库 mutex/CV/semaphore 建立合同，再通过性能证据决定是否需要更底层的等待协议。
+
+\topic{四个错误案例：为什么“能跑”不等于选对原语}
+下面四个案例适合写进实验报告：
+
+\begin{lstlisting}[numbers=none,caption={同步原语错误选择案例}]
+case semaphore_as_mutex:
+  use a binary semaphore to protect a vector
+  forget owner/lifetime rules
+  destructor runs while a waiter still holds or waits
+  result: race, permit leak, or use-after-free
+
+case cv_without_close_predicate:
+  consumer waits for size > 0
+  controller sets closed = true and notifies
+  consumer wakes, sees size == 0, waits again
+  result: shutdown hangs
+
+case atomic_wait_for_thread_pool_idle:
+  worker pops last ready task and sets queue_empty = true
+  controller observes idle flag
+  running task has not finished
+  result: wait_idle returns before work is complete
+
+case eventfd_as_payload_queue:
+  worker writes eventfd for each completion
+  event loop reads only aggregate counter
+  no completion record exists elsewhere
+  result: request identity and error state are lost
+\end{lstlisting}
+
+这些案例的共同点是：原语表面上都能“等”，但等待对象错了。同步设计要先写业务事实，再选原语；不能先选一个看起来高级的 API，再倒推业务语义。
+
+\topic{同步原语 evidence pack}
+一份合格同步报告至少保存这些字段：
+
+\begin{lstlisting}[numbers=none,caption={SyncPrimitiveEvidencePack}]
+sync_primitive_evidence_pack:
+  state_model:
+    protected_fields:
+    invariant:
+    lifecycle_owner:
+
+  wait_model:
+    wait_object: invariant / predicate / permit / version / event_fd
+    predicate_or_expected_value:
+    close_cancel_error_timeout:
+
+  primitive_choice:
+    chosen:
+    rejected:
+      mutex:
+      condition_variable:
+      semaphore:
+      atomic_wait:
+      eventfd:
+      futex_direct:
+
+  wake_model:
+    who_changes_state:
+    who_notifies:
+    notify_one_or_all:
+    spurious_wakeup_policy:
+    lost_wakeup_defense:
+
+  failure_injection:
+    close_while_empty:
+    close_while_full:
+    cancel_while_waiting:
+    timeout:
+    exception_or_early_return:
+    object_destruction_with_waiters:
+
+  metrics:
+    wait_count:
+    wake_count:
+    timeout_count:
+    max_wait_ns:
+    shutdown_ns:
+\end{lstlisting}
+
+这份报告的价值在于边界清楚。看到 semaphore，读者知道它只负责 permit；看到 CV，读者知道谓词在哪里；看到 atomic wait，读者知道只等哪个原子值；看到 eventfd，读者知道 payload 在哪里；看到 futex，读者知道这是底层等待路径，不是业务语义本身。
+
 \section{锁顺序、性能路径和工业现实}
 
 单个锁保护单个队列容易证明；多个锁组合后，死锁和尾延迟变得真实。死锁的必要条件包括互斥、持有并等待、不可抢占和循环等待。工程上最常见的破坏方式是规定锁顺序，或者把组合操作改成消息传递/两阶段提交，避免同时持有多把锁。

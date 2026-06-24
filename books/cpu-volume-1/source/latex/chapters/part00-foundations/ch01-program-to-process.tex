@@ -3017,6 +3017,188 @@ first_trace_cpu_report:
 
 这就是第一册的硬标准：每个结论都要标注它来自哪一层。语言层说 \code{add\_i32} 有两个 \code{int} 参数；IR 层说调用方是否仍保留调用；汇编层说是 \instruction{call} 还是尾 \instruction{jmp}；目标文件层说符号和重定位是否存在；链接层说最终地址和动态链接如何成立；运行层说进程怎样被加载和执行。
 
+\subsection{第七层：运行时系统证据包}
+
+很多报告在链接层就停住：有 ELF、有符号、有反汇编，于是以为“程序如何执行”已经讲完。真实运行还要经过动态加载器、C 运行时、线程库、调试信息、异常展开、系统调用、缺页和信号。第一册若只停在“源码到汇编/ABI”，读者能看懂机器码，却仍解释不了冷启动慢、GDB 看不到变量、C++ 析构为何能穿过异常、\code{clock\_gettime} 为什么有时不像系统调用、\code{SIGSEGV} 为什么不是普通回调。
+
+运行时系统证据包要回答的是另一组问题：
+
+\begin{lstlisting}[numbers=none,caption={RuntimeEvidencePack 的问题边界}]
+RuntimeEvidencePack:
+  loader:
+    which interpreter mapped the program
+    which DSOs were loaded
+    which relocations were resolved before main
+    whether lazy binding remains
+
+  initialization:
+    which code runs before main
+    init_array and global constructors
+    TLS setup and thread runtime setup
+
+  debugger_view:
+    line table
+    variable locations
+    frame unwind rules
+    build-id and separated debug file identity
+
+  exception_runtime:
+    eh_frame
+    gcc_except_table
+    personality routine
+    cleanup landing pads
+
+  kernel_boundary:
+    libc wrapper
+    syscall instruction or vDSO path
+    errno and cancellation point
+    page fault and signal delivery
+\end{lstlisting}
+
+这份清单把第一册的主线补完整：源码语义说明“应该发生什么”；IR 说明优化器如何重写；目标文件说明还欠哪些符号和重定位；动态加载说明进程启动前后哪些地址被映射和修正；调试器说明机器状态怎样还原成源码视图；异常运行时说明栈怎样被展开；系统调用和异常说明控制流怎样越过用户态边界。
+
+\subsubsection{动态加载：不是 readelf 静态输出的重复}
+
+\code{readelf -d} 能说明二进制声明了哪些 \code{NEEDED} 库、解释器和动态段条目，但它不能证明某次运行中动态链接器实际搜索了哪些路径、加载了哪些具体文件、懒绑定是否发生、第一次调用是否触发了 resolver。运行证据必须来自运行时工具。
+
+\begin{lstlisting}[numbers=none,caption={动态加载运行证据}]
+# 静态身份：这个二进制要求哪个 interpreter 和哪些动态库。
+readelf -l ./app | grep 'Requesting program interpreter'
+readelf -d ./app | grep -E 'NEEDED|RUNPATH|RPATH|BIND_NOW|FLAGS'
+
+# 运行路径：动态链接器实际装载和绑定了什么。
+LD_DEBUG=libs,bindings ./app 2>ld-debug.txt
+LD_BIND_NOW=1 ./app
+
+# 进程地址空间：装载后真正映射到了哪些地址。
+cat /proc/$PID/maps
+\end{lstlisting}
+
+结论要分层写。看到 \code{NEEDED libc.so.6}，只能说明二进制有这个动态依赖；看到 \code{LD\_DEBUG=libs} 输出，才能说明动态链接器在哪些目录找到具体文件；看到 \code{LD\_DEBUG=bindings}，才能讨论某个符号是否懒绑定；看到 \filepath{/proc/<pid>/maps}，才能讨论该次运行中各段地址、ASLR 和共享库映射。把这些混成一句“动态链接会加载库”，对性能分析不够。
+
+\subsubsection{main 之前：初始化代码要单独计时}
+
+程序不是从 \code{main} 第一行裸启动。内核把控制权交给 ELF interpreter 或入口代码；动态链接器装载依赖库并处理必要重定位；C 运行时建立调用 \code{main} 所需的环境；\code{.init\_array} 和 C++ 全局对象构造可能已经打开文件、分配内存、注册插件或初始化日志。若 benchmark 把进程启动时间当 kernel 时间，就会把这些成本算进算法。
+
+\begin{lstlisting}[numbers=none,caption={main 之前成本的观察入口}]
+readelf -x .init_array ./app
+nm -C ./app | grep -E '__libc_start_main|_start|GLOBAL__sub_I'
+strace -f -ttT -e trace=execve,mmap,mprotect,brk,openat,read ./app
+perf stat -e page-faults,minor-faults,major-faults ./app
+\end{lstlisting}
+
+报告中至少要区分三段时间：进程启动到进入 \code{main}；\code{main} 中初始化到热循环开始；热循环本身。第一段受 loader、全局构造和冷 page fault 影响；第二段受业务初始化、内存分配和文件读取影响；第三段才适合分析指令、cache 和算法路径。若只给一个 elapsed time，读者无法判断慢在运行时系统还是核心代码。
+
+\subsubsection{调试器视图：源码变量不是机器事实}
+
+优化后调试最容易误判。GDB 显示 \code{optimized out}，不是因为变量“消失得不合理”，而是源码变量没有稳定机器位置。一个变量可能在某个 PC 范围内位于寄存器，另一个范围内变成常量，第三个范围内被拆成多个 SSA 值，最后完全没有可恢复位置。DWARF location list 才是调试器能否显示它的依据。
+
+\begin{lstlisting}[numbers=none,caption={调试器视图证据}]
+clang++ -O2 -g -fno-omit-frame-pointer app.cpp -o app
+llvm-dwarfdump --debug-line app | head -80
+llvm-dwarfdump --debug-info app | grep -E 'DW_TAG_variable|DW_AT_location'
+readelf --debug-dump=frames app | head -120
+objdump --dwarf=decodedline app | head -80
+\end{lstlisting}
+
+一份严肃报告不能只贴 GDB 截图。它要写清：当前二进制是否带 \code{-g}；是否省略 frame pointer；是否有 \code{.eh\_frame} 或 \code{.debug\_frame}；源码行和机器地址是否因为优化而多对一或一对多；变量位置是否有 location list。调试器是证据解释器，不是运行时事实本身。
+
+\subsubsection{异常展开：析构不是自动发生的魔法}
+
+C++ 异常路径是第一册必须补厚的运行时边界。源代码里 \code{throw} 看起来像控制流跳转，机器层面却要构造异常对象、调用运行时入口、沿栈查找 handler、运行 cleanup landing pad、执行析构，最后进入匹配的 \code{catch} 或调用 \code{terminate}。这条链依赖 ABI、unwind table 和运行时库。
+
+\begin{lstlisting}[numbers=none,caption={异常展开证据包}]
+clang++ -O2 -g exception_demo.cpp -o exception_demo
+nm -C exception_demo | grep -E '__cxa_throw|personality|Unwind|terminate'
+readelf -S exception_demo | grep -E 'eh_frame|gcc_except_table'
+readelf --debug-dump=frames exception_demo | head -120
+objdump -drwC -Mintel exception_demo | grep -E '__cxa_throw|landing|personality'
+\end{lstlisting}
+
+正确结论应该像这样写：源码层有一个离开作用域需要析构的对象；IR 或汇编层存在异常边或 cleanup 代码；ELF 层有展开信息和异常表；运行时层会通过 personality routine 判断 handler 和 cleanup；手写汇编或 C ABI 边界若没有可展开描述，就可能切断回溯或破坏析构。这样读者才会理解“禁止异常穿过某些边界”不是编码偏好，而是 ABI 合同。
+
+\subsubsection{系统调用、vDSO 和 page fault：三种不同的内核边界}
+
+用户态进入内核不只有显式 \instruction{syscall}。调用 \code{write} 常经过 libc wrapper 和 syscall ABI；调用 \code{clock\_gettime} 可能走 vDSO，避免真正陷入内核；访问尚未建立 PTE 的地址会触发 page fault，由内核修复或转成信号。这三条路径都可能出现在性能报告里，但含义完全不同。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.35\linewidth}p{0.29\linewidth}}
+\toprule
+路径 & 关键机制 & 证据边界 \\
+\midrule
+libc syscall wrapper & 普通函数 ABI 到 syscall ABI 的适配、\code{errno}、取消点 & \cmd{strace}、libc 反汇编、源码阅读 \\
+vDSO & 内核映射只读数据和小段用户态代码，减少陷入内核 & \filepath{/proc/self/maps}、\code{linux-vdso.so.1}、\cmd{strace} 是否缺少调用 \\
+minor page fault & 虚拟页合法，但 PTE 尚未建立或 COW 需要复制 & \cmd{perf stat -e minor-faults}、maps、触页实验 \\
+major page fault & 需要等待磁盘或后端 I/O 取页 & \cmd{perf stat -e major-faults}、I/O trace \\
+protection fault & 访问权限不允许，可能转成 \code{SIGSEGV} & fault address、\register{rip}、maps、core dump \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此，报告里不能把“进入内核”写成一个桶。一次显式 \code{write} 的成本可能主要是用户态复制、VFS 和 page cache；一次 \code{clock\_gettime} 可能没有真正 syscall；一次普通 load 可能因为文件映射冷页而睡在缺页路径上。第一册读者必须学会把这些边界拆开，否则后面做 p99、I/O 和服务化时会把系统成本误判成算子成本。
+
+\subsubsection{统一运行时报告模板}
+
+把这组内容压成一份报告，能防止结论漂浮：
+
+\begin{lstlisting}[numbers=none,caption={RuntimeEvidencePack 报告模板}]
+runtime_evidence_pack:
+  binary_identity:
+    path:
+    build_id:
+    compiler_flags:
+    target_triple:
+
+  loader:
+    interpreter:
+    needed_libraries:
+    rpath_runpath:
+    bind_now_or_lazy:
+    ld_debug_summary:
+    proc_maps_snapshot:
+
+  before_main:
+    entry_symbol:
+    init_array_entries:
+    global_constructors:
+    tls_usage:
+    startup_syscalls:
+
+  debugger_and_unwind:
+    debug_info_present:
+    frame_pointer:
+    eh_frame:
+    variable_location_example:
+    backtrace_quality:
+
+  exception_path:
+    throw_sites:
+    cleanup_or_destructor_path:
+    personality:
+    exception_tables:
+    boundary_where_exception_must_not_cross:
+
+  kernel_boundary:
+    syscall_trace:
+    vdso_usage:
+    page_fault_counts:
+    signal_or_core_evidence:
+
+  measurement_boundary:
+    process_start_to_main:
+    init_to_hot_loop:
+    hot_loop_only:
+    first_iteration_excluded:
+
+  conclusion:
+    proven:
+    suspected:
+    not_proven:
+\end{lstlisting}
+
+这份模板比“源码语义 -> 汇编”更长，但它正是第一册走向完整系统书的缺口。第一册的最终能力不是背工具命令，而是知道每个工具证明哪一层事实，并能把语言、编译器、二进制、加载器、调试器、异常运行时和内核边界放进同一条因果链。
+
 \subsection{五个必须写进报告的反例}
 
 第一，单翻译单元反例。把定义和调用放进同一个文件，\code{call\_add} 可能变成 \code{lea eax, [rdi + 5]}。这证明优化器视野改变了实验对象。
