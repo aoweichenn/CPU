@@ -194,6 +194,145 @@ ISA 不规定 CPU 内部必须如何实现。例如同样是执行 \instruction{
 ISA 决定正确性语义，微架构决定性能表现。同一份 x86-64 程序在不同 CPU 上结果应该一致，但速度可能差很多，因为内部实现不同。
 \end{keyidea}
 
+\section{CPU 特权级：为什么普通程序不能直接控制整台机器}
+
+ISA 不只规定 \instruction{add}、\instruction{mov} 和 \instruction{ret} 这类普通指令，也规定哪些状态只有高特权代码才能改。没有特权级，任何用户程序都可以改页表、关中断、访问任意物理内存、直接操作设备端口或覆盖内核代码，操作系统也就无法隔离进程、保护文件、统计资源或处理故障。
+
+x86-64 传统上有 ring 0 到 ring 3 的特权级。现代通用操作系统通常只使用两档：内核运行在 ring 0，用户进程运行在 ring 3。当前代码特权级常称为 CPL。用户态代码可以执行普通算术、分支、load/store 到自己有权限的虚拟地址；但不能执行许多控制机器全局状态的指令，也不能访问页表标记为 supervisor-only 的页面。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+层次 & 能做什么 & 不能让用户态随意做什么 \\
+\midrule
+用户态 ring 3 & 普通指令、访问用户页、通过 ABI 调库、通过系统调用请求内核服务 & 改页表、关中断、直接访问内核页、任意 I/O 指令、修改关键控制寄存器 \\
+内核态 ring 0 & 管理页表、调度线程、处理中断异常、访问设备、维护内核对象 & 仍必须验证用户指针、权限、资源限制和并发状态 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个边界不是 C++ 类型系统提供的，而是 CPU 和操作系统共同维护的。页表项里有 present、read/write、user/supervisor、execute disable 等权限位；CPU 在取指、load 和 store 时做地址翻译和权限检查。用户态访问 supervisor-only 页面，即使指针数值看起来是一个合法地址，也会触发异常；用户态向只读映射写入，或者从 NX 页面取指，也会触发异常。这就是为什么 \filepath{/proc/<pid>/maps} 中的 \code{r-xp}、\code{rw-p} 和匿名映射权限，不只是调试显示，而是会被硬件检查真正执行。
+
+\subsection{系统调用：受控进入内核，不是普通函数调用}
+
+系统调用是用户态请求内核服务的受控入口。以 Linux/x86-64 为例，用户代码通常把系统调用号放入 \register{rax}，把参数放入约定寄存器，然后执行 \instruction{syscall}。CPU 按架构规则切换到内核配置好的入口地址，进入 ring 0；内核保存必要上下文，验证系统调用号、参数、用户指针、权限和资源状态；完成后把返回值放回寄存器，再通过 \instruction{sysret} 或等价返回路径回到用户态。
+
+\begin{lstlisting}[numbers=none,caption={系统调用的压缩状态机}]
+UserMode:
+  ordinary ring-3 code prepares syscall number and arguments
+
+SyscallInstruction:
+  CPU enters a configured kernel entry path with controlled state changes
+
+KernelEntry:
+  kernel saves context, switches to kernel stack, validates arguments
+
+KernelService:
+  filesystem, memory manager, scheduler, network or futex code runs
+
+ReturnToUser:
+  return value or -errno is placed in registers, user rip resumes
+\end{lstlisting}
+
+把系统调用理解成普通 \instruction{call} 会导致很多错误。普通函数调用仍在用户态，使用用户栈，遵守用户态 ABI，不能绕过页表权限；系统调用跨越特权边界，可能切换栈，可能被审计、阻塞、抢占、重启或返回 \code{EINTR}，还可能因为用户指针无效返回 \code{EFAULT}。一次 \code{read(fd, buf, n)} 不是“内核相信 \code{buf} 是好指针”，而是内核在复制到用户空间时必须处理页表、权限、缺页和异常边界。
+
+\begin{lstlisting}[numbers=none,caption={观察 syscall 边界的证据}]
+# 看 libc wrapper 最终是否走 syscall 指令、PLT 或 vDSO。
+objdump -drwC -Mintel ./app | rg 'syscall|@plt|clock_gettime|getpid'
+
+# 看运行时实际进入了哪些系统调用以及耗时。
+strace -f -ttT -e trace=read,write,mmap,munmap,futex,clock_gettime ./app
+
+# 对比可能走 vDSO 的调用和真实 syscall。
+ldd ./app
+cat /proc/self/maps | rg 'vdso|vvar'
+\end{lstlisting}
+
+vDSO 是这个边界的一个重要特例。某些只读内核信息或时间读取路径可以通过内核映射到用户态的只读代码/数据完成，避免每次都陷入内核。于是 \code{clock\_gettime} 可能不是每次都有真实 \instruction{syscall}。做 benchmark 时，如果把 timer 成本、vDSO 路径和真实 syscall 混在一起，就会误判热路径成本。
+
+\subsection{异常和中断：普通控制流之外的硬件入口}
+
+系统调用是用户态主动请求进入内核；异常和中断则可以在普通控制流之外改变执行路径。异常通常由当前指令引起，例如 page fault、除零、非法指令、断点或 general protection fault；中断通常来自外部事件，例如时钟、设备、IPI 或性能监控事件。它们都不是 C++ 源码里的普通分支，却会让 CPU 转入内核定义的入口。
+
+x86-64 使用 IDT 这类表描述异常/中断向量的入口、门类型和权限。CPU 检测到事件后，根据向量查入口，切换到合适的内核上下文，保存返回所需状态，然后执行内核 handler。内核处理完后，可能恢复原用户态位置，可能唤醒调度器切换到另一个线程，也可能把异常转换成 UNIX signal 交给进程，例如无法修复的 page fault 变成 \code{SIGSEGV}。
+
+\begin{lstlisting}[numbers=none,caption={异常、中断和信号的关系}]
+OrdinaryInstruction:
+  load, store, divide, branch, syscall, ...
+
+HardwareEvent:
+  page fault, invalid opcode, breakpoint, timer interrupt, device IRQ
+
+KernelHandler:
+  CPU transfers to an IDT-selected kernel entry
+
+Resolution:
+  fix the condition, schedule, deliver a signal, or terminate
+
+Return:
+  iret/sysret-like path restores an architectural user context
+\end{lstlisting}
+
+这里要分清同步异常和异步中断。同步异常和某条指令有直接关系：哪条 load 访问了无效页，哪条除法除以零，哪条取指命中 NX 页面。精确异常要求软件看到清晰的故障 \register{rip}。异步中断则不由当前源码语句主动触发：时钟中断可以在循环中任意位置到来，设备中断可以打断用户进程，PMU 采样中断可以记录当前 \register{rip} 作为样本。它们会影响延迟分布，但不能简单归因到“这条 C++ 语句主动调用了内核”。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+入口类型 & 触发者 & 性能和调试含义 \\
+\midrule
+\instruction{syscall} & 用户代码显式执行系统调用指令 & 可用 strace 观察，成本来自特权切换和内核服务 \\
+同步异常 & 当前指令违反翻译、权限或指令语义 & \register{rip}、fault address、error code 是第一证据 \\
+异步中断 & 时钟、设备、IPI、PMU 等外部事件 & 会造成噪声、抢占、样本和尾延迟，需要统计解释 \\
+signal delivery & 内核准备返回用户态时改写用户上下文 & handler 不是普通调用，会打断普通控制流 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{页表权限：ELF 权限最终怎样变成 CPU 检查}
+
+上一章讲 ELF segment、\code{mmap} 和进程地址空间时，已经看到代码段、只读数据段、堆、栈和共享库映射。CPU 执行时并不读取 ELF 文件里的文字说明；它读取的是当前进程页表。加载器和内核把 ELF segment 映射成虚拟内存区域，再通过页表项表达读、写、执行、用户/内核等权限。之后每次取指或访存，硬件翻译路径都会检查这些权限。
+
+\begin{lstlisting}[numbers=none,caption={虚拟地址权限检查的压缩路径}]
+VirtualAddress:
+  rip fetch, load address, or store address
+
+TLBLookup:
+  hit returns physical frame and cached permissions
+  miss walks page tables and fills translation
+
+PermissionCheck:
+  present, user/supervisor, read/write, execute-disable, canonical address
+
+AccessOrFault:
+  access cache/memory, or raise page fault / protection exception
+\end{lstlisting}
+
+这条路径把“CPU 特权级”和“内存 bug”连在一起。空指针、use-after-free、写只读页、执行数据页、用户态访问内核页、栈保护页命中、映射文件被截断，都可能在机器层表现为异常入口。内核能修复的情况，例如首次触碰匿名页、COW、文件页缺页，会建立映射后返回；不能修复或不允许的情况，会把异常报告给进程，通常表现为信号或进程终止。
+
+\subsection{为什么性能工程必须理解特权级}
+
+特权级不是只服务安全课的概念。它直接影响性能测量和系统调优。
+
+第一，系统调用不是普通函数成本。循环里每次 \code{write} 一个小块，成本可能主要来自用户态/内核态切换、VFS、锁、设备队列和调度，而不是 C++ 循环本身。第二，page fault 和中断会制造长尾。一个看似纯用户态的数组扫描，首次触页时可能进入内核建立页表；一个低延迟线程可能被时钟中断或 I/O 中断打断。第三，性能计数器本身有权限边界。某些 \code{rdpmc}、perf event、kernel samples、uncore counter 需要内核配置或特权；没有权限时，报告不能声称已经证明了 kernel/user 分解或 Top-Down 归因。
+
+\begin{lstlisting}[numbers=none,caption={特权级相关的最小证据包}]
+# 映射和权限：先看用户地址空间长什么样。
+cat /proc/self/maps
+
+# 缺页：区分首次触页、COW、文件映射和非法访问。
+perf stat -e page-faults,minor-faults,major-faults ./app
+
+# 系统调用：确认热路径是否频繁跨越特权边界。
+strace -c -f ./app
+
+# perf 权限：不同机器可能限制 kernel samples 或 raw PMU。
+cat /proc/sys/kernel/perf_event_paranoid
+\end{lstlisting}
+
+一个严谨报告应该写清证据边界：看到了 \code{strace} 中大量 \code{futex}，能说明线程在同步边界频繁进入内核或等待；不能直接说明哪把业务锁设计错。看到了 page fault 计数升高，能说明地址翻译路径进入内核处理过缺页；不能自动推出是 bug，可能只是合法首次触页。看不到 kernel samples，也不能把 CPU 时间全部归给用户态热循环。
+
 \section{三台机器：抽象机器、架构机器和实现机器}
 
 学习 CPU 执行时，最容易混乱的地方不是某个寄存器名字，而是把不同层次的“机器”混成一个概念。为了后面不反复犯错，本书把机器分成三层。

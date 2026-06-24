@@ -2511,6 +2511,153 @@ int install_signal_handlers() {
 
 这个例子故意不在 handler 中打印日志。原因不是保守风格，而是运行时事实：信号可能打断正在持有 libc 内部锁、malloc 锁或日志锁的线程；handler 再调用同一套库函数，可能死锁或破坏状态。若需要把信号接入事件循环，Linux 工程常用 self-pipe trick、\code{eventfd} 或 \code{signalfd}，把异步信号转换成普通 fd 事件，再由主循环按普通状态机处理。
 
+\subsubsection{signal frame：handler 为什么能回到被打断的位置}
+
+信号处理函数看起来像普通函数：它有入口地址，执行完会返回。但它不是由用户代码里的 \instruction{call} 调用的。典型 Linux/x86-64 路径是：CPU 因异常、中断或系统调用返回路径进入内核；内核发现该线程有可投递信号；内核在用户栈上构造一个 \term{signal frame}{信号帧}，保存被打断时的寄存器、signal mask、故障信息和恢复所需的上下文；然后把即将返回用户态的 \register{rip} 改成 handler 地址，把用户栈调整到这个新 frame。handler 执行完后，不是普通地 \instruction{ret} 回到被打断函数，而是通过 C 运行时提供的 trampoline 发起 \code{rt\_sigreturn}，请求内核从 signal frame 恢复原来的寄存器、mask 和 \register{rip}。
+
+\begin{lstlisting}[numbers=none,caption={signal delivery 的用户栈视角}]
+Before delivery:
+  user rsp -> ordinary user stack
+  user rip -> instruction that was running or will resume
+
+Kernel delivery:
+  push/build rt signal frame on user stack
+  save interrupted registers, fp state, mask, siginfo, ucontext
+  set user rip = handler address
+  set user rsp = signal frame top
+
+Handler return:
+  handler returns to trampoline
+  trampoline performs rt_sigreturn syscall
+  kernel validates frame and restores interrupted context
+\end{lstlisting}
+
+这解释了三个容易误判的事实。
+
+第一，signal frame 不是 C++ 函数栈帧，但它占用用户栈。若线程栈已经接近耗尽，普通 handler 可能连 signal frame 都放不下，栈溢出本身的 \code{SIGSEGV} handler 也可能再次崩溃。需要可靠处理栈溢出、崩溃记录或 profiling 信号时，应考虑 \code{sigaltstack} 和 \code{SA\_ONSTACK}，让 handler 在预先准备的备用栈上运行。
+
+第二，handler 打断的位置可能是任意普通控制流边界。它可能出现在一条 C++ 语句中间、一个 \code{malloc} 内部、一个日志库持锁区、一个无锁结构的更新窗口，或一个阻塞系统调用返回前。源码层“我没有调用这个函数”的直觉没有意义；信号投递是内核改写返回用户态上下文，不是源代码显式调用。
+
+第三，signal frame 是安全边界。内核恢复上下文前要验证 frame；调试器和崩溃分析也要区分普通调用栈帧、signal trampoline 和被打断帧。若 unwinder、profiler 或手写汇编不能识别 signal frame，就可能把栈回溯切断，误以为 handler 是从某个普通函数直接调用出来的。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+栈帧类型 & 由谁建立 & 调试重点 \\
+\midrule
+C++ 普通栈帧 & 编译器按 ABI 生成 prologue/epilogue & 返回地址、callee-saved 寄存器、局部变量位置 \\
+系统调用内核栈 & CPU/内核在进入内核后使用 & 用户态通常看不到，只能通过 trace/perf 间接观察 \\
+signal frame & 内核在用户栈或 alternate stack 上构造 & \code{siginfo}、\code{ucontext}、被打断 \register{rip}、\code{rt\_sigreturn} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsubsection{mask、pending 和 delivery：信号不是普通队列}
+
+信号还有一层状态经常被忽略：每个线程都有 signal mask，进程和线程有 pending 信号集合，某些信号的处理方式是进程级 disposition。一个信号生成后，若当前目标线程屏蔽了它，它不会立刻运行 handler，而是变成 pending；等 mask 解除或内核选择了可投递线程，才进入 delivery。传统非实时信号通常按“是否 pending”合并，多个同类信号不一定形成多个排队事件；实时信号才有更接近排队的语义。
+
+\begin{lstlisting}[numbers=none,caption={signal mask 和 pending 的状态机}]
+Unblocked:
+  signal can be delivered at a return-to-user or interruptible boundary
+
+Blocked:
+  generated signal becomes pending, handler does not run yet
+
+Pending:
+  signal is remembered for a process or thread
+
+Unmasked:
+  kernel may select a target thread and build a signal frame
+
+HandledOrDefaulted:
+  handler runs, or default action terminates/stops/ignores
+\end{lstlisting}
+
+多线程程序里还要分清“发给进程”和“发给线程”。\code{kill(pid, signo)} 面向进程；\code{pthread\_kill(thread, signo)} 面向线程；硬件异常通常属于触发异常的那个线程。一个服务若有 worker 线程池，最好明确哪些线程屏蔽终止信号，哪个控制线程通过 \code{sigwait}、\code{signalfd} 或 event loop 统一接管。否则同一个 \code{SIGTERM} 可能落在任意未屏蔽线程上，handler 打断的位置也就不可预测。
+
+\begin{lstlisting}[numbers=none,caption={观察 mask、pending 和投递路径}]
+# /proc 中的十六进制位图能说明哪些信号被阻塞、忽略、捕获或 pending。
+cat /proc/$PID/status | grep -E 'SigBlk|SigIgn|SigCgt|SigPnd|ShdPnd'
+
+# strace 能看到安装 handler、改变 mask 和信号实际投递。
+strace -f -ttT -e trace=rt_sigaction,rt_sigprocmask,rt_sigsuspend,rt_sigreturn ./app
+\end{lstlisting}
+
+这也是为什么“临时屏蔽信号保护临界区”不是通用同步方案。它只能影响信号投递，不能阻止其他线程访问共享数据，也不能替代 mutex、atomic 或内存序。信号 mask 是异步控制流工具，不是普通并发互斥工具。
+
+\subsubsection{async-signal-safe：根因是可重入性，不是函数表迷信}
+
+POSIX 列出 async-signal-safe 函数表，但背后的根因更重要：handler 可以在任意指令边界重入当前线程。如果普通控制流正在执行一个非可重入函数，内部状态可能处于“锁已持有、链表改到一半、buffer 指针暂时不一致、TLS 缓存正在更新”的中间态；handler 再调用同一个库或依赖同一把锁，就可能死锁或破坏状态。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.25\linewidth}p{0.32\linewidth}p{0.29\linewidth}}
+\toprule
+handler 中的动作 & 风险 & 更稳的替代 \\
+\midrule
+\code{printf}/日志库 & stdio 或日志锁可能已被打断线程持有 & \code{write} 固定 fd，或只设置标志 \\
+\code{malloc}/\code{new} & allocator 内部状态可能正在更新 & 预分配 buffer，或回到普通控制流处理 \\
+\code{pthread\_mutex\_lock} & handler 可能重入同一线程已持有的锁 & 使用 \code{sig\_atomic\_t} 标志或 self-pipe \\
+抛 C++ 异常 & 跨 signal frame 展开不是普通 C++ 调用语义 & 记录请求，普通控制流检查后退出 \\
+修改复杂对象 & 可能打断对象不变量维护窗口 & 只写原子标志或单字节通知 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+即使使用 \code{std::atomic}，也不能把 handler 当成普通线程函数。C++ 标准、POSIX、libc 实现和硬件原子之间有边界；最可移植的最小模式仍是 \code{volatile sig\_atomic\_t} 标志，或 Linux 工程中常见的 \code{write} 到 pipe/eventfd，让主循环在普通上下文里完成复杂工作。追求“handler 里直接做完清理”通常会把 shutdown 写成偶发死锁源。
+
+\subsubsection{EINTR 和 SA\_RESTART：阻塞调用怎样被信号切开}
+
+信号也会把“普通阻塞控制流”切开。线程可能正在 \code{read}、\code{ppoll}、\code{accept}、\code{waitpid}、\code{futex} 或带超时的等待里睡眠；信号到达后，内核需要先让 handler 运行。handler 返回后，原系统调用有三类结果：已经完成并返回成功；返回 \code{-1} 且 \code{errno=EINTR}；或在 \code{SA\_RESTART} 和接口语义允许时自动重启。
+
+\begin{lstlisting}[numbers=none,caption={被信号打断的阻塞调用不能机械重试}]
+BlockingSyscall:
+  thread sleeps in read, ppoll, waitpid, futex, accept, ...
+
+SignalDelivered:
+  handler runs before syscall result is reported to user code
+
+AfterHandler:
+  syscall may have completed
+  syscall may fail with EINTR
+  syscall may be restarted if SA_RESTART and the API allow it
+
+CallerPolicy:
+  retry, recompute timeout, handle cancellation, or report partial progress
+\end{lstlisting}
+
+因此，处理 \code{EINTR} 的正确问题不是“要不要 while 重试”，而是“这个接口的业务语义是什么”。读写类调用可能已经发生部分进度；带 deadline 的等待必须重算剩余时间；取消语义可能正是通过信号触发；\code{ppoll}/\code{pselect} 还可能故意把 mask 切换和等待合成一个原子边界，避免“解除屏蔽后、真正睡眠前”丢信号。服务端 p99 报告若出现信号、超时和重试，必须把这些路径写进 trace，而不是只看用户态热循环。
+
+\subsubsection{备用信号栈：为什么栈溢出 handler 不能依赖原栈}
+
+默认情况下，handler 使用被打断线程的用户栈。大多数终止信号处理和轻量通知可以接受这个事实；但栈溢出、深递归、坏指针破坏栈、profiling 信号打断极深调用链时，原栈可能已经不可靠。 \code{sigaltstack} 允许线程注册一块独立内存，配合 \code{SA\_ONSTACK} 让指定 handler 在备用栈上运行。
+
+\begin{lstlisting}[language=C++,caption={备用 signal stack 的最小骨架}]
+#include <signal.h>
+#include <stdlib.h>
+
+static stack_t alt_stack;
+
+int install_alt_stack() {
+    alt_stack.ss_sp = malloc(SIGSTKSZ);
+    if (alt_stack.ss_sp == nullptr) return -1;
+    alt_stack.ss_size = SIGSTKSZ;
+    alt_stack.ss_flags = 0;
+    return sigaltstack(&alt_stack, nullptr);
+}
+
+int install_crash_handler(void (*handler)(int, siginfo_t*, void*)) {
+    struct sigaction sa {};
+    sa.sa_sigaction = handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_ONSTACK;
+    return sigaction(SIGSEGV, &sa, nullptr);
+}
+\end{lstlisting}
+
+这个骨架只说明机制，不代表可以在崩溃 handler 里安全做复杂诊断。崩溃时 heap、锁、TLS、stdio 和 C++ 对象都可能处于损坏状态；高质量 crash reporter 通常预分配资源，用 async-signal-safe 的最小写路径记录寄存器、fault address、线程 id 和少量上下文，然后让进程终止或交给外部收集 core dump。
+
 \begin{lstlisting}[numbers=none,caption={signal 证据包}]
 # 观察崩溃信号和 fault address。
 gdb -q ./app core
@@ -2518,12 +2665,17 @@ gdb -q ./app core
 (gdb) p $_siginfo
 (gdb) info registers
 (gdb) x/i $rip
+(gdb) bt
 
 # 观察系统调用是否被信号打断。
-strace -f -ttT -e trace=read,write,ppoll,rt_sigaction,rt_sigprocmask ./app
+strace -f -ttT -e trace=read,write,ppoll,rt_sigaction,rt_sigprocmask,rt_sigreturn ./app
 
 # 观察当前进程的 signal mask 和 pending 状态。
 cat /proc/$PID/status | grep -E 'SigBlk|SigIgn|SigCgt|SigPnd|ShdPnd'
+
+# 观察 core dump 中 signal trampoline 和被打断帧。
+eu-stack -p $PID
+coredumpctl gdb ./app
 \end{lstlisting}
 
 signal 报告也要写证据边界。看到 \code{SIGSEGV}，只能说明进程因为内存访问或相关异常被终止，不能自动推出“空指针”。要结合 fault address、\register{rip} 指令、寄存器、\filepath{/proc/<pid>/maps}、对象生命周期和 sanitizer 结果。看到 \code{EINTR}，只能说明某个阻塞边界被信号打断，不能自动重试所有接口；有些调用已经部分完成，有些调用有超时语义，有些业务正是用信号请求取消。看到 \code{SIGPIPE}，也不能只把它关掉：要先说明写入对象是 pipe、socket 还是普通文件，对端关闭时业务应该丢弃、重连、还是报告失败。
