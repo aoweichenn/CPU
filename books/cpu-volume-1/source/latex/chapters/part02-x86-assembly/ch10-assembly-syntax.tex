@@ -601,6 +601,145 @@ C++ 类型信息在汇编中大多已经消失。你看到 \code{dword ptr [rdi]
 
 宽度还直接影响正确性。读取 1 字节后如果要变成 32 位整数，就必须决定高位如何处理：零扩展还是符号扩展。读取 4 字节到 \register{eax} 会清零 \register{rax} 高位，但读取到 \register{al} 不会。很多 C/C++ 类型转换、数组元素读取和字符处理的汇编差异，都来自这个问题。下一章讲整数指令时会系统展开 \instruction{movzx}、\instruction{movsx} 和各种扩展规则，本章先把“宽度必须标清”作为基本习惯。
 
+\section{浮点和 SIMD 基础：看到 xmm0 时先问什么}
+
+第一册不会把 SIMD 优化讲成第二册那样深，但读 x86-64 汇编时必须先认识浮点和向量指令。原因很简单：现代编译器即使编译很普通的 C++，也可能用 SSE/AVX 指令处理浮点、拷贝、小结构体、自动向量化循环或库函数调用。若读者只认识 \register{rax}、\register{rdi} 和整数 \instruction{add}，看到 \register{xmm0} 或 \instruction{vaddps} 就会把真实热路径跳过去。
+
+\subsection{XMM、YMM、ZMM：同一组向量寄存器的不同宽度视图}
+
+x86-64 上常见的浮点和 SIMD 寄存器包括：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.16\linewidth}p{0.18\linewidth}p{0.46\linewidth}}
+\toprule
+寄存器名 & 常见宽度 & 读汇编时的重点 \\
+\midrule
+\register{xmm0}--\register{xmm15} & 128 bit & SSE 和标量浮点常用；System V ABI 中浮点参数和返回值也常走 \register{xmm0} 起 \\
+\register{ymm0}--\register{ymm15} & 256 bit & AVX/AVX2 常用；低 128 bit 与对应 XMM 视图重叠 \\
+\register{zmm0}--\register{zmm31} & 512 bit & AVX-512 常用；还会配合 \register{k0}--\register{k7} mask 寄存器 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些名字不是三套互不相干的寄存器。可以先把它们理解成同一条物理/架构向量寄存器的不同宽度视图：\register{xmm0} 是低 128 位，\register{ymm0} 包含低 256 位，\register{zmm0} 包含低 512 位。实际 CPU 内部实现会更复杂，但汇编阅读的第一层先抓住这个视图关系。
+
+\begin{warningbox}
+不要把 \register{xmm0} 简单理解成“一个 float”。它可以装一个标量 \code{float}，也可以装两个 \code{double}、四个 \code{float}、十六个字节，甚至只是被当作位模式搬运。解释来自指令后缀和上下文。
+\end{warningbox}
+
+\subsection{ss、sd、ps、pd：后缀就是 lane 语义}
+
+浮点指令名里的后缀通常直接告诉你元素类型和是否 packed：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.15\linewidth}p{0.26\linewidth}p{0.43\linewidth}}
+\toprule
+后缀 & 含义 & 例子 \\
+\midrule
+\code{ss} & scalar single，一个低位 \code{float} & \instruction{addss xmm0, xmm1} 只对低 32 位单精度元素做加法 \\
+\code{sd} & scalar double，一个低位 \code{double} & \instruction{addsd xmm0, xmm1} 只对低 64 位双精度元素做加法 \\
+\code{ps} & packed single，多个 \code{float} lane & \instruction{addps xmm0, xmm1} 对 4 个 \code{float} lane 分别加法 \\
+\code{pd} & packed double，多个 \code{double} lane & \instruction{addpd xmm0, xmm1} 对 2 个 \code{double} lane 分别加法 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+同样是加法，下面两条含义完全不同：
+
+\begin{lstlisting}
+addss xmm0, xmm1    ; one scalar f32 in the low lane
+addps xmm0, xmm1    ; four packed f32 lanes in xmm0/xmm1
+\end{lstlisting}
+
+\instruction{addss} 不是“慢一点的 \instruction{addps}”，它的语义就是只更新低位单精度标量。高位部分如何保留或清零，还要看是 legacy SSE 编码还是 VEX/EVEX 编码，以及具体指令规则。第一层读法不要猜：看到标量后缀，就在笔记里写“低 lane 是业务值，高 lane 不一定有业务意义”。
+
+\subsection{SSE 二操作数和 AVX 三操作数：目的寄存器是否被破坏}
+
+legacy SSE 指令通常是二操作数形式，目的操作数同时也是输入：
+
+\begin{lstlisting}
+addps xmm0, xmm1    ; xmm0 = xmm0 + xmm1
+\end{lstlisting}
+
+AVX 的 VEX 编码通常提供三操作数形式：
+
+\begin{lstlisting}
+vaddps ymm0, ymm1, ymm2    ; ymm0 = ymm1 + ymm2
+\end{lstlisting}
+
+这个差异对读数据流很重要。第一条会消耗旧 \register{xmm0}，再把结果写回 \register{xmm0}；第二条把 \register{ymm1} 和 \register{ymm2} 作为输入，把结果写到 \register{ymm0}。如果你把二者都注释成“向量相加”，就漏掉了依赖链。
+
+\begin{keyidea}
+读 SIMD 指令时，先写 lane 类型，再写 lane 数，再写目的寄存器是否也是输入。性能分析之前，先把这三个语义事实写清楚。
+\end{keyidea}
+
+\subsection{最小 SIMD 词典：load、算术、shuffle、reduce、mask}
+
+第一册只要求建立词典，不要求优化。看到 SIMD 反汇编时，先把指令粗分成几类：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+类别 & 常见形态 & 阅读重点 \\
+\midrule
+load/store & \instruction{movups}、\instruction{movaps}、\instruction{vmovdqu}、\instruction{vmovaps} & 地址、宽度、是否要求对齐、是否跨 cache line 或页 \\
+lane 算术 & \instruction{addps}、\instruction{mulps}、\instruction{vaddps}、\instruction{vfmadd231ps} & 每个 lane 独立计算，FMA 通常按乘加两个浮点操作计 \\
+shuffle/permute & \instruction{shufps}、\instruction{unpcklps}、\instruction{vpermps} & 改变 lane 位置，常比普通加法更难吞吐 \\
+horizontal reduce & \instruction{haddps} 或若干 shuffle + add & 把多个 lane 合成一个标量，常是 dot/sum 的尾部成本 \\
+mask/tail & AVX-512 \register{k} mask，或 AVX2 blend/标量尾部 & 处理长度不是向量宽度整数倍的尾部元素 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如 \instruction{vfmadd231ps ymm0, ymm1, ymm2} 通常表示 packed single FMA，但 \code{132}、\code{213}、\code{231} 的操作数顺序不适合凭名字猜。报告里应直接引用反汇编器注释或查手册，并写成明确公式。若工具显示：
+
+\begin{lstlisting}
+vfmadd231ps ymm0, ymm1, ymm2   # ymm0 = (ymm1 * ymm2) + ymm0
+\end{lstlisting}
+
+就把这条公式写进分析。不要只写“FMA”，因为不同 FMA 变体的累加寄存器位置不同，错误理解会直接把 dot product 数据流看错。
+
+\subsection{对齐、上半寄存器和浮点语义边界}
+
+SIMD 入门有三个常见坑。
+
+第一，对齐不是装饰。某些 aligned load/store 形式要求地址对齐，例如 \instruction{movaps} 或 \instruction{vmovaps} 的内存操作数；不满足时可能 fault，或者至少说明接口合同不清。对应的 unaligned 形式如 \instruction{movups}、\instruction{vmovups} 更宽容，但性能仍可能受跨 cache line、跨页和地址生成影响。报告不能只写“加载 xmmword”，还要写具体指令和地址对齐前提。
+
+第二，legacy SSE 和 AVX 混用可能涉及 upper-lane 状态。简化地说，旧 SSE 指令经常只写 XMM 低 128 位视图，而 AVX/VEX 指令有更明确的向量宽度和上半部分处理规则。真实性能问题中还会遇到 SSE/AVX transition penalty、\instruction{vzeroupper} 等内容；第一册只要求建立边界：看到 \register{xmm} 和 \register{ymm} 混用时，不要只看低 128 位结果，还要记录这是 legacy SSE 还是 VEX 编码。
+
+第三，浮点不是实数。NaN、Inf、signed zero、舍入模式、非规格化数、MXCSR 中的 FTZ/DAZ、\code{-ffast-math} 都可能改变结果边界。第一册的汇编阅读只要求你知道：\instruction{addss}、\instruction{mulps} 和 \instruction{vfmadd} 不是数学实数运算，它们遵守浮点环境和指令语义。做 benchmark 或优化时，必须有误差模型。
+
+\subsection{浮点/SIMD 反汇编报告最少字段}
+
+读到浮点或 SIMD 指令时，报告至少写：
+
+\begin{itemize}
+  \item 寄存器宽度：XMM、YMM 还是 ZMM。
+  \item lane 类型和 lane 数：例如 \code{ymm} 上的 \code{ps} 是 8 个 \code{float} lane。
+  \item 指令形态：legacy SSE 二操作数，还是 VEX/EVEX 三操作数。
+  \item load/store 宽度和地址公式。
+  \item 对齐要求和尾部处理方式。
+  \item 浮点误差边界：bit-exact、容差、是否允许 FMA 或 fast-math。
+\end{itemize}
+
+例如：
+
+\begin{lstlisting}[numbers=none,caption={SIMD 指令阅读记录示例}]
+instruction:
+  vaddps ymm0, ymm1, ymm2
+facts:
+  vector width = 256 bit
+  lane type = f32
+  lane count = 8
+  data flow = ymm0 receives ymm1 + ymm2
+boundary:
+  This proves packed f32 lane-wise add.
+  It does not prove the source loop had no aliasing problem.
+\end{lstlisting}
+
 \section{内存寻址模式：地址公式如何写进指令}
 
 x86-64 最常见的内存操作数形式是：
@@ -1346,6 +1485,40 @@ return z - 2 = 3*x + 1
 本章不要求手工编码 x86 指令，但要求你不再把汇编文本当作最终执行物。机器码字节、指令长度和地址，是后续理解 \register{rip}、跳转、代码布局和前端性能的基础。
 \end{deepdive}
 
+\subsection{反汇编器怎样从字节流切出一条指令}
+
+反汇编不是“把助记符翻回源码”，而是从某个起始地址开始，按 ISA 规则消费字节。对 x86-64，可以把反汇编器的最小状态机写成：
+
+\begin{lstlisting}[numbers=none,caption={x86-64 反汇编的压缩状态机}]
+StartAtAddress:
+  pc = current byte address
+
+ReadPrefixes:
+  consume legacy prefixes, REX, VEX or EVEX if present
+
+ReadOpcode:
+  consume one or more opcode bytes
+
+DecodeOperandEncoding:
+  decide whether this opcode requires ModRM, SIB, disp or imm
+
+ReadModRM:
+  if required, split mod/reg/rm and maybe consume SIB
+
+ReadDisplacementAndImmediate:
+  consume disp8/disp32 and imm bytes according to opcode and ModRM
+
+EmitInstruction:
+  instruction_length = bytes_consumed
+  next_pc = pc + instruction_length
+\end{lstlisting}
+
+这个流程有两个直接后果。第一，同一串字节如果从错误地址开始解码，后面的指令边界可能全错。第二，\register{rip} 相关的相对地址、短跳转和长跳转，都依赖 \code{next_pc}，也就是当前指令结束后的地址。反汇编器显示的每条指令地址不是装饰，它是计算控制流和 RIP-relative 地址的输入。
+
+\begin{warningbox}
+x86 没有天然的“每 4 字节一条指令”边界。反汇编必须从可信入口开始，例如符号表、函数入口、跳转目标或调试信息。把数据区、跳转表或字符串从中间拿来反汇编，工具也可能给出看似合法的指令文本，但那不代表程序真的会执行这些字节。
+\end{warningbox}
+
 \subsection{x86 编码的最小结构：prefix、opcode、ModRM、SIB、disp、imm}
 
 x86-64 编码历史很长，完整规则足够写成手册。本书不要求背表，但必须知道一条指令的字节通常由哪些字段拼成。否则你无法解释为什么 \instruction{mov eax, edi} 是 2 字节，\instruction{mov rax, rdi} 是 3 字节，\instruction{mov eax, dword ptr [rdi + rsi*4 + 8]} 又更长。
@@ -1378,6 +1551,48 @@ immediate & 指令中的字面常量 & 如 \code{add eax, 7} 中的 7，或 \cod
 \end{center}
 
 不是每条指令都有所有字段。\instruction{ret} 的 near return 是单字节 \code{c3}；\instruction{mov eax, edi} 有 opcode 和 ModRM；复杂内存寻址通常会有 ModRM、SIB 和 displacement；64 位寄存器或 \register{r8} 到 \register{r15} 往往需要 REX 前缀。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.25\linewidth}p{0.26\linewidth}p{0.33\linewidth}}
+\toprule
+字节示例 & 反汇编 & 字段切分 \\
+\midrule
+\code{c3} & \instruction{ret} & opcode only，长度 1 \\
+\code{89 f8} & \instruction{mov eax, edi} & opcode \code{89} + ModRM \code{f8}，长度 2 \\
+\code{48 89 f8} & \instruction{mov rax, rdi} & REX \code{48} + opcode \code{89} + ModRM \code{f8}，长度 3 \\
+\code{05 78 56 34 12} & \instruction{add eax, 0x12345678} & opcode \code{05} + imm32，小端立即数，长度 5 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的作用不是让你背编码，而是训练“长度来自字段”的直觉。若某条指令有 5 字节，下一条指令地址就从当前地址加 5 开始；若某条 RIP-relative 访问带有 disp32，它的目标地址也要用指令结束地址计算。
+
+\subsection{legacy prefix、REX、VEX、EVEX：前缀不是注释}
+
+x86 前缀分几类。legacy prefix 继承自早期 x86，例如 \code{66} operand-size override、\code{f2}/\code{f3} repeat 或某些 SSE 标量浮点含义、segment override、\code{lock} 等。REX 是 x86-64 引入的单字节前缀，扩展寄存器和 64 位操作数宽度。VEX/EVEX 是 AVX/AVX-512 时代的多字节前缀，能编码更多寄存器、向量长度、三操作数形式、mask 和更多 opcode map 信息。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+\toprule
+前缀类别 & 常见字节/形式 & 读法 \\
+\midrule
+legacy & \code{66}、\code{f2}、\code{f3}、\code{f0} & 可能改变宽度、重复、锁语义或 SSE 标量指令含义 \\
+REX & \code{40}--\code{4f} & W/R/X/B 扩展宽度和寄存器编号 \\
+VEX & \code{c4 ...} 或 \code{c5 ...} & AVX 常见，携带向量长度、源寄存器、opcode map 等 \\
+EVEX & \code{62 ...} & AVX-512 常见，携带 mask、广播、rounding、更多寄存器等 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如 \code{f3 0f 10 07} 常见反汇编为：
+
+\begin{lstlisting}
+movss xmm0, dword ptr [rdi]
+\end{lstlisting}
+
+这里的 \code{f3} 不能随便忽略。它不是普通字符串前缀，而是这条 SSE 指令编码的一部分，参与决定这是 \instruction{movss}，不是另一个 \code{0f 10} 指令形态。类似地，\code{c5 f4 58 c2} 的 \code{c5 f4} 是 VEX 前缀，决定 \instruction{vaddps ymm0, ymm1, ymm2} 的 AVX 三操作数和向量长度。
 
 \subsection{REX 前缀：64 位宽度和扩展寄存器从哪里来}
 
@@ -1416,6 +1631,10 @@ B & 扩展 ModRM.r/m 或 SIB.base 字段 & 扩展 base 或 r/m 寄存器编号 \
 
 具体字节可能随汇编器选择的等价编码而变化，但原则稳定：看到 \register{r8}--\register{r15} 或 64 位通用寄存器操作时，要检查 REX 前缀。报告里只贴助记符不贴字节，就无法证明这些宽度和寄存器扩展细节。
 
+\begin{deepdive}
+REX 前缀还会影响传统高 8 位寄存器 \register{ah}、\register{bh}、\register{ch}、\register{dh} 的可编码性。现代 64 位代码通常避免主动使用这些寄存器。读到涉及 8 位寄存器和 REX 的手写汇编时，要格外谨慎；它不是纯语法问题，而是编码空间的历史限制。
+\end{deepdive}
+
 \subsection{ModRM：寄存器和寻址模式的三段位域}
 
 很多 x86 指令在 opcode 后跟一个 ModRM 字节。ModRM 可拆成三段：
@@ -1442,6 +1661,22 @@ r/m & \code{000} & 目标寄存器编号 0，即 \register{eax} \\
 \end{center}
 
 所以 \code{89 f8} 可读成：把 reg 字段代表的 32 位寄存器 \register{edi} 移到 r/m 字段代表的 32 位寄存器 \register{eax}。同一个 ModRM 字段在不同 opcode 下可能扮演不同方向或含义，所以不能只看 ModRM，必须和 opcode 一起读。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.13\linewidth}p{0.35\linewidth}p{0.36\linewidth}}
+\toprule
+mod & r/m 含义概略 & 后续可能还有什么 \\
+\midrule
+\code{11} & r/m 是寄存器编号 & 通常没有 displacement \\
+\code{00} & r/m 描述内存地址形态 & 特定 r/m 组合可能表示 SIB 或 RIP-relative/disp32 \\
+\code{01} & 内存地址加 disp8 & 后面消费 1 字节 displacement \\
+\code{10} & 内存地址加 disp32 & 后面消费 4 字节 displacement \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+上表故意写成“概略”，因为完整 x86 编码有很多特例。但这已经足够建立阅读习惯：看到 ModRM 后，先看 \code{mod} 决定是寄存器还是内存；若是内存，再看 r/m 是否触发 SIB 或 RIP-relative；最后根据 \code{mod} 消费 displacement。
 
 \subsection{SIB：base + index * scale + displacement 的来源}
 
@@ -1477,6 +1712,43 @@ objdump -drwC -Mintel /tmp/sib.o
 报告里不要求你背出所有寄存器编号，但要能指出：某些字节在表达“这是内存操作数”；某个 SIB 字节在表达 scale=4、index=\register{rsi}、base=\register{rdi}；最后的 \code{08} 之类字节表达 displacement=8。这样你才能把汇编地址公式和机器码字节接上。
 
 注意两个常见陷阱。第一，\register{rsp} 或 \register{r12} 作为 base 时，经常强制出现 SIB 字节，即使你没有显式 index。第二，某些 r/m 编码组合表示 RIP-relative 或 disp32 特例，不是普通 base 寄存器。x86 编码是历史兼容产物，不能用“看起来应该规则”替代反汇编证据。
+
+\subsection{完整手拆一条：48 8b 44 b7 08}
+
+下面这条来自最小 x86-64 目标文件：
+
+\begin{lstlisting}[numbers=none]
+0: 48 8b 44 b7 08    mov rax, qword ptr [rdi + 4*rsi + 0x8]
+\end{lstlisting}
+
+按字段拆：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.15\linewidth}p{0.20\linewidth}p{0.49\linewidth}}
+\toprule
+字节 & 字段 & 含义 \\
+\midrule
+\code{48} & REX & W=1，选择 64 位操作数宽度 \\
+\code{8b} & opcode & \instruction{mov r64, r/m64} 形态，方向是从 r/m 读到 reg \\
+\code{44} & ModRM & mod=\code{01}，reg=\code{000}，r/m=\code{100}；目标 reg 是 \register{rax}，r/m=\code{100} 表示后面有 SIB，且有 disp8 \\
+\code{b7} & SIB & scale=\code{10} 表示乘 4，index=\code{110} 是 \register{rsi}，base=\code{111} 是 \register{rdi} \\
+\code{08} & disp8 & 地址再加 8 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以它不是凭文本猜出来的 \code{[rdi + rsi*4 + 8]}，而是字节字段共同证明的地址公式：
+
+\begin{lstlisting}[numbers=none]
+effective_address = rdi + rsi * 4 + 8
+load_width = 8 bytes
+destination = rax
+instruction_length = 5 bytes
+next_rip = current_rip + 5
+\end{lstlisting}
+
+注意最后两行。读反汇编时，指令长度和下一条指令地址同样是证据。它们会进入 RIP-relative 地址、跳转目标、patch 点、断点覆盖和前端取指分析。
 
 \subsection{RIP-relative：位移相对下一条指令，不是当前地址}
 
@@ -1531,15 +1803,30 @@ objdump -drwC -Mintel /tmp/imm.o
 
 读机器码字节时要把“字节流顺序”和“数值显示”分开。CPU 按地址顺序取字节；解码器按 ISA 规则把后续若干字节解释成 little-endian 的位移或立即数；反汇编器再把数值显示成人类习惯的十六进制。
 
+\subsection{AVX/VEX 字节长什么样：先识别，不急着手拆}
+
+现代 SIMD 指令常用 VEX 或 EVEX 前缀，字段比普通 REX/ModRM 复杂得多。第一册不要求手工拆完 VEX 每一位，但必须能识别“这些前缀字节决定了 AVX 语义”。例如：
+
+\begin{lstlisting}[numbers=none]
+c5 f4 58 c2       vaddps ymm0, ymm1, ymm2
+c4 e2 75 b8 c2    vfmadd231ps ymm0, ymm1, ymm2
+\end{lstlisting}
+
+第一条以 \code{c5} 开始，是 2 字节 VEX 前缀；第二条以 \code{c4} 开始，是 3 字节 VEX 前缀。它们把传统 SSE 的二操作数模型扩展成 AVX 的三操作数模型，并编码向量长度、源寄存器和 opcode map 等信息。报告里如果声称“这是 AVX 指令”“这是三操作数 packed float 加法”，至少要贴出反汇编文本和机器码字节，说明 VEX 前缀存在。
+
+到第二册做 SIMD 性能时，再继续追 VEX/EVEX 细节：向量长度位、mask、broadcast、rounding、zeroing/merging、EVEX 压缩 displacement 等。第一册现在只建立边界：看到 \code{c4}、\code{c5}、\code{62} 这类前缀，不要把它们当成可忽略的“乱码”；它们正是现代向量指令语义的一部分。
+
 \subsection{编码证据报告：最少要贴什么}
 
 如果一份报告声称“这里用了 RIP-relative”“这里是 64 位寄存器写”“这里访问 \register{r8}”“这里的分支目标是某个地址”，最少应给出：
 
 \begin{itemize}
   \item 反汇编命令和工具版本。
+  \item 目标架构和文件格式，例如 \code{elf64-x86-64}。交叉编译或在 AArch64 主机上分析 x86 文件时尤其要写。
   \item 指令地址、机器码字节和反汇编文本。
   \item 若有符号或全局访问，附 \code{readelf -r} 的重定位记录。
   \item 对 REX、ModRM、SIB、disp、imm 中和结论相关的字段做最小解释。
+  \item 若是 SSE/AVX/AVX-512，说明 legacy/VEX/EVEX 编码、向量宽度和操作数数量。
   \item 写清哪些是机器码直接证明的事实，哪些是结合源码或符号表的推论。
 \end{itemize}
 
