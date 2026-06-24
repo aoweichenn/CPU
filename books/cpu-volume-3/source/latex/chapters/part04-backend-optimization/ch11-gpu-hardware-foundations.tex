@@ -173,6 +173,46 @@ occupancy 指一个 SM/CU 上同时驻留的 warp/block 相对硬件上限的比
 
 因此 GPU 后端的 profiler 不应只报告 occupancy。一个 kernel occupancy 很高但访存不合并，仍然慢；一个 tensor core kernel occupancy 不高但计算吞吐高，也可能很快。指标要和具体瓶颈一起看。
 
+\subsection{warp 映射和 tensor core 账本}
+
+GPU kernel 设计必须写清 warp mapping：lane 维度对应 token、head、head\_dim、output channel 还是 K tile。不同映射会改变 coalescing、shared memory 复用、reduction 方式和 divergence。只写 \code{blockDim=256} 没有解释力。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+warp mapping & 优点 & 风险 \\
+\midrule
+lane 覆盖连续 \code{head\_dim} & K/V 读连续，coalescing 好 & head\_dim 小时并行度有限 \\
+lane 覆盖 position & 长上下文并行度高 & softmax reduction 和 mask 更复杂 \\
+warp 覆盖 output channels & GEMV 权重读规则 & batch=1 时复用弱 \\
+warp 覆盖 batch rows & 权重复用好 & 小 batch 或变长 session 难凑齐 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{shared memory bank conflict}
+shared memory 虽然快，但不是“无成本数组”。它由多个 bank 组成，若一个 warp 的多个 lane 同时访问同一 bank 的不同地址，访问会被串行化或降效。Tile layout 要同时满足 global memory coalescing 和 shared memory bank 访问。一个从 global 读连续的布局，搬到 shared 后若按错误 stride 读取，仍可能慢。
+
+\topic{tensor core 的形状合同}
+Tensor core 通常执行固定小矩阵块的乘加，例如某种 \code{m x n x k} tile。后端要把大 GEMM 切成这些 tile，并满足 dtype、对齐、layout 和 accumulator 要求。若 decode 是 \code{M=1} 的 GEMV，很多 tensor core tile 的 M 维利用率很低；把多个 session 合批可以提高 M，但会引入 queue wait 和 KV binding 复杂度。
+
+\begin{lstlisting}[numbers=none,caption={tensor core 使用前的账本}]
+matrix shape:
+  M = batch_or_tokens
+  N = output_channels
+  K = hidden
+
+requirements:
+  dtype supported by matrix core
+  M/N/K aligned to tile or tail handled
+  input/weight layout matches fragment loader
+  accumulator dtype and scale path defined
+  batch wait cost included in SLO
+\end{lstlisting}
+
+\topic{register pressure 和 occupancy 的交换}
+更大的 tile 会增加寄存器 accumulator，可能提升复用，也可能让每个 SM 驻留 warp 变少。更高 occupancy 能隐藏内存延迟，但如果每个 warp 都在读不合并的 global memory，occupancy 只是让更多慢请求同时排队。GPU 报告要同时写 registers per thread、shared memory per block、achieved occupancy、memory throughput 和 tensor core utilization。
+
 \subsection{GPU profiler 指标怎样读}
 
 不同工具名字不同，但读法相近。不要孤立看一个百分比，而要把指标放回 kernel 目标。

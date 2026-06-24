@@ -1581,6 +1581,105 @@ g++ -O0 -g scratch/ch01/address.cpp -o scratch/ch01/address
 \end{enumerate}
 \end{labbox}
 
+\section{把源码到进程压成因果链}
+
+前面已经把预处理、编译、汇编、链接和加载分开讲过。真正做系统分析时，还要再往下压一层：每一层为什么必须存在，它保留什么信息，丢弃什么信息，下一层又根据这些信息作出什么决定。否则读者会知道很多工具名，却不能解释一个真实现象：源码里有一行函数调用，为什么目标文件里是一个重定位占位；链接后为什么地址变了；运行时为什么第一次访问某页才触发 page fault；调试器为什么有时看不到某个变量。
+
+可以把 \code{add\_i32} 这个最小函数的生命周期写成一张因果账本：
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+层次 & 保留的信息 & 失去或改写的信息 \\
+\midrule
+翻译单元 & 宏展开后的完整文本、声明和定义 & 头文件边界、原始宏调用位置可能变弱 \\
+AST & 名字解析、类型、表达式树、作用域 & 文本排版、注释、许多 token 细节 \\
+IR & 控制流、数据流、类型化操作、副作用边界 & C++ 语法形状、部分临时对象名字 \\
+优化 IR & 等价变换后的数据依赖和副作用顺序 & 未使用计算、可内联函数边界、源码局部结构 \\
+汇编 & 寄存器、栈槽、指令、标签 & 高层类型、模板、对象名字的大部分语义 \\
+目标文件 & 机器码字节、符号表、重定位记录、section & 最终虚拟地址、跨文件符号归属尚未确定 \\
+链接后 ELF & program header、动态段、入口、最终符号绑定 & 单个目标文件的局部布局自由度 \\
+进程 & 虚拟内存映射、栈、堆、共享库、线程状态 & 文件只是模板，运行状态开始独立变化 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的重点不是背术语，而是知道证据应该在哪一层找。若怀疑函数被内联，不能只看源码；要看优化后 IR 或反汇编。若看到目标文件里 \code{call 0x0}，不能断言程序会跳到地址 0；要看重定位。若程序第一次请求很慢，不能只看 hot loop 汇编；要看动态链接、首次触页、页缓存、全局构造和 CPU 频率。每个问题都有合适的证据层。
+
+\subsection{AST 到 IR：优化器到底看见什么}
+
+AST 仍然接近 C++ 语法。它知道一个表达式是二元加法，知道函数参数类型，知道名字属于哪个作用域。优化器通常不直接在完整 C++ AST 上做机器级优化，而是在更规整的 IR 上工作。IR 会把控制流、数据依赖、内存访问和调用副作用表达成更适合分析的形式。
+
+例如：
+
+\begin{lstlisting}[language=C++,caption={源码层的局部变量形状}]
+int f(int x)
+{
+    int y = x + 1;
+    int z = y * 2;
+    return z - 2;
+}
+\end{lstlisting}
+
+源码里有 \code{y} 和 \code{z}，但优化器看到的是一条可化简的数据链：\code{((x + 1) * 2) - 2} 等价于 \code{x * 2}，前提是这种变换没有违反语言语义。若有符号溢出参与，C++ 未定义行为会给优化器更大自由度；若使用无符号整数，回绕语义又会限制某些代数化简。这里第一册的语言语义和机器执行第一次连上：优化器不是按数学实数优化，而是按 C++ 抽象机器允许的行为优化。
+
+\begin{keyidea}
+编译器优化不是“猜 CPU 喜欢什么”这么简单。它先利用语言语义证明某些变换保持可观察行为，再把结果交给目标后端。C++ 语义越强，优化空间越大；程序触碰未定义行为时，优化器可以利用这个前提生成看起来反直觉的机器码。
+\end{keyidea}
+
+\subsection{目标文件：为什么重定位是核心证据}
+
+单独编译时，编译器只能处理当前翻译单元。它知道调用了外部函数，却不知道外部函数最后放在哪里。因此目标文件必须保存两类信息：一类是已经生成的机器码和数据，另一类是“以后需要链接器修正的位置”。后一类就是重定位。
+
+\begin{lstlisting}[numbers=none,caption={目标文件阶段的三类证据}]
+nm -C caller.o
+readelf -s caller.o
+objdump -drwC -Mintel caller.o
+\end{lstlisting}
+
+若 \code{caller.o} 调用 \code{add\_i32}，反汇编里可能看到一个近似 \code{call 0x0} 的占位，同时 \code{objdump -r} 或 \code{readelf -r} 会显示该位置关联到符号 \code{add\_i32}。这说明机器码字节和最终地址还没有闭合。链接器读取所有目标文件和库后，才把这个位置修正为相对位移、PLT 入口或其他目标相关形式。
+
+这个机制解释了两个常见误判。第一，目标文件反汇编不是最终运行地址，不能直接拿它解释进程中的 \register{rip}。第二，符号是否存在、调用是否经过 PLT、函数是否被静态链接或动态链接，都会改变第一次调用成本和 profile 样子。性能报告只贴源码和最终耗时，不贴符号和重定位证据，就缺少关键一层。
+
+\subsection{execve 到 page fault：文件怎样变成运行状态}
+
+用户在 shell 中输入命令后，关键系统调用通常是 \code{execve}。内核读取 ELF header，并不把整个文件一次性复制进内存。更常见的路径是建立虚拟内存映射：哪些文件偏移映射到进程的哪些虚拟地址，权限是只读、可执行还是可写。真正的物理页可以等到第一次访问时再通过 page fault 建立。
+
+\begin{lstlisting}[numbers=none,caption={加载和首次触页的压缩因果链}]
+execve(path)
+  -> kernel validates ELF header
+  -> map PT_LOAD segments into virtual address ranges
+  -> map dynamic linker if needed
+  -> prepare initial user stack
+  -> transfer control to entry point
+  -> first instruction/data access may fault
+  -> kernel resolves page fault and installs page table entry
+\end{lstlisting}
+
+这条链路直接影响测量。第一次执行某段代码可能包括 I-cache 冷启动和 text page fault；第一次访问大数组可能包括匿名页分配和清零；第一次调用动态库函数可能包括 lazy binding；第一次触发 C++ 异常可能加载 unwind 相关路径。若 benchmark 把这些成本混进 hot loop，就会把 loader、VM 和 runtime 成本误判成算法成本。
+
+\subsection{系统边界：syscall、异常和中断不是普通函数调用}
+
+用户态函数调用遵循 ABI：参数寄存器、返回寄存器、caller-saved/callee-saved 和栈对齐。系统调用跨越的是权限边界。用户态通过专门指令进入内核，CPU 切换到更高权限级别，内核根据 syscall number 分派处理，完成后再返回用户态。这个路径涉及寄存器约定、内核栈、权限检查、可能的调度和安全隔离，不能用普通函数调用成本类比。
+
+page fault 也不是普通错误返回。CPU 执行 load/store 或取指时发现页表项缺失、权限不允许或地址非法，会进入异常处理。内核判断这是合法按需分配、文件映射缺页、写时复制，还是非法访问。如果合法，内核修复页表并回到触发异常的指令重新执行；如果非法，向进程发送信号。于是同一条 \instruction{mov} 指令，可能在热路径中只是 L1 load，也可能第一次触页时跨入内核。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+边界 & 触发原因 & 性能和调试含义 \\
+\midrule
+普通函数调用 & \instruction{call} 到用户态函数 & ABI、栈帧、内联和 PLT 影响成本 \\
+系统调用 & 用户态请求内核服务 & 权限切换、内核路径、可能阻塞 \\
+page fault & 虚拟地址翻译失败或权限不符 & 可能是正常按需分页，也可能是 bug \\
+硬件中断 & 设备或定时器事件 & 可打断用户线程，影响延迟分布 \\
+信号 & 内核向进程投递事件 & 控制流异步改变，调试要看上下文 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+成熟的底层报告必须区分这些边界。若一次请求 p99 偶发升高，可能不是 C++ 函数突然慢，而是 page fault、调度、I/O、中断或系统调用长尾进入了计时范围。
+
 \section{反例：看似合理但错误的理解}
 
 \begin{warningbox}

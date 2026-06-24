@@ -1146,6 +1146,62 @@ KV attention:
 \end{itemize}
 \end{rubricbox}
 
+\subsection{数值稳定性：Transformer 不是只看 shape}
+
+shape 正确只能证明张量尺寸对得上，不能证明数值正确。Transformer 推理里最容易出现“程序不崩但 logits 漂”的位置，是 RMSNorm、RoPE、softmax、SwiGLU、量化反量化和采样边界。它们的错误常常不会立刻变成 NaN，而是在长上下文、低温采样或 prefix 复用时放大。
+
+\topic{RMSNorm 的稳定边界}
+RMSNorm 的分母是 hidden 向量均方根加 \code{\epsilon}：
+
+\[
+r=\sqrt{\frac{1}{H}\sum_i x_i^2+\epsilon}
+\]
+
+实现时至少有三个选择会影响误差。第一，平方和用 fp32 还是 fp16/bf16 累加；第二，\code{\epsilon} 加在 sqrt 前还是其他位置；第三，scale \code{\gamma} 与除法的顺序是否改变舍入。对 7B 级 hidden \code{H=4096}，若用低精度累加平方和，误差会被 4096 项累计放大。reference path 应使用 fp32 累加，optimized path 的误差要相对 reference 验证。
+
+\begin{lstlisting}[numbers=none,caption={RMSNorm oracle 应记录的中间量}]
+input hidden checksum
+sum_square_fp32
+rms_denominator
+normalized_hidden checksum
+gamma_applied_hidden checksum
+max_abs_error_vs_reference
+\end{lstlisting}
+
+\topic{softmax 必须先减最大值}
+attention score 进入 softmax 前可能有很大正负范围。直接计算 \code{exp(score)} 容易 overflow；全是很小负数又可能 underflow。稳定写法是先减去本行最大值：
+
+\[
+softmax(x_i)=\frac{e^{x_i-m}}{\sum_j e^{x_j-m}}, \qquad m=\max_j x_j
+\]
+
+causal mask 或 padding mask 通常把非法位置设为很大的负数。实现要保证 masked lane 不参与最大值，也不参与分母。若把 mask 值设得不够小，非法位置可能获得非零概率；若整行全 mask，分母为 0，需要由上层合同禁止或定义结果。
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+错误 & 表面现象 & 检测输入 \\
+\midrule
+不减最大值 & NaN/inf 或概率全 0 & 大正 score、大负 score \\
+mask 参与 max & 合法概率被压扁 & 左 padding、短序列 batch \\
+分母低精度累加 & 长上下文概率漂移 & context=1、128、4096 sweep \\
+全 mask 未定义 & NaN 扩散到 logits & 空上下文或非法 batch \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{RoPE 的误差来自位置和三角函数表}
+RoPE 数值错误有两类。一类是位置语义错：把 physical slot 当 model position，把滑动窗口回绕位置当绝对位置，把 left padding 列号当 token position。另一类是三角函数表或 dtype 错：\code{cos/sin} 表精度不足、索引错、head dim 对偶维度配错。前者 shape 完全正确但语义错；后者短上下文可能不明显，长上下文会扩大。
+
+RoPE oracle 不应只比较最终 logits。它要能 dump 某个 layer、head、position 的旋转前后 \code{q/k} 片段，并记录 \code{model\_position}、\code{physical\_slot} 和 \code{rope\_table\_index}。这三个数必须分开。
+
+\topic{SwiGLU 的溢出和量化边界}
+SwiGLU 中 \code{silu(g) * u} 是逐元素乘法。若 \code{g} 很大，\code{silu(g)} 接近 \code{g}；若 \code{g} 很小负，\code{silu(g)} 接近 0。低精度路径要注意激活值范围、乘法精度和 down projection 前的 dtype。量化 MLP 时，\code{Wgate/Wup/Wdown} 的 scale 误差会穿过非线性，不能简单把三块线性层的误差相加。
+
+\begin{keyidea}
+Transformer 的数值正确性要按中间合同验证：RMSNorm 的平方和、RoPE 的位置、softmax 的 max/sum、SwiGLU 的激活范围、量化的 accumulator 和 scale。最终 logits 是结果，不是足够细的诊断。
+\end{keyidea}
+
 \subsection{CPU 后端、GPU 后端和同一份算子合同}
 
 理解原理后，再谈后端。CPU 和 GPU 不应该各自定义一套模型语义。它们应该共享同一份算子合同：输入 shape、dtype、layout、量化 profile、误差界、KV cache 逻辑坐标一致。不同的是物理实现。

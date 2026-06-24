@@ -1017,6 +1017,65 @@ Compute Systems Engine 在这里形成三个对象：\code{BenchmarkCase} 描述
 \topic{后续章节的连接}
 测量不会直接给出改法，它给出瓶颈位置、证据强度和被排除的解释。若字节账本显示冷字段被大量搬运，就进入数据布局；若反汇编和计数器显示分支和指令供给问题，就进入 SIMD 和 ILP；若扩展曲线显示同步热点，就进入线程、锁、原子和无锁结构；若阶段报告显示 write 和 commit 长尾，就进入异步 I/O 和背压；若 trace 显示 partition 长尾和重试，就进入分布式。后续每一次优化，都应回到同一套证据链。
 
+\section{PMU 指标的因果表：从数字回到结构}
+
+性能计数器最危险的用法，是看到一个数字高就直接下结论。正确做法是把指标放回硬件结构、代码区域和对照实验。下面这张表给出本书后续反复使用的读法。
+
+\begin{center}
+\begin{tabular}{p{0.27\linewidth}p{0.27\linewidth}p{0.32\linewidth}}
+\toprule
+指标或派生量 & 第一层含义 & 必须补的上下文 \\
+\midrule
+\code{cycles} & CPU 周期消耗 & 频率、是否被调度走、计时边界 \\
+\code{instructions} & retired 指令数量 & CPI、是否优化掉工作、是否路径改变 \\
+\code{IPC} & 每周期退休指令数 & 前端/后端/内存瓶颈不能只靠 IPC 判定 \\
+\code{branches} & 分支数量 & 分支是否在 hot loop，是否可预测 \\
+\code{branch-misses} & 分支预测失败线索 & 输入分布、分支位置、错误路径 \\
+\code{cache-misses} & 某级 cache 未命中线索 & miss 是否有用、字节账本、访问模式 \\
+\code{dTLB-load-misses} & 地址翻译压力线索 & page size、工作集、随机访问 \\
+\code{context-switches} & 调度干扰或阻塞线索 & 线程状态、锁/I/O/睡眠路径 \\
+\code{cpu-migrations} & 线程位置变化 & affinity、NUMA、cache 热度丢失 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+IPC 低不自动等于“代码差”。内存带宽受限的流式扫描，IPC 可能低；分支错误多的 parser，IPC 也可能低；系统调用和调度干扰也会让 IPC 难看。反过来，IPC 高也不代表程序接近最优：一个无用循环可能退休很多简单指令。PMU 只能和 correctness、字节账本、阶段拆分、反汇编一起解释。
+
+\topic{派生指标比原始数字更接近模型}
+原始 \code{cache-misses=1000000} 没有独立意义。更有用的是每处理一个元素多少 miss、每个 miss 带回多少有效字节、miss 增加是否对应运行时间增加、改变 layout 后 miss 是否随预期变化。例如矩阵按列扫描若每次只使用 cache line 中一个 \code{double}，有效利用率只有 \code{8/64=12.5\%}。这比“cache miss 很多”更能指导改法。
+
+\begin{lstlisting}[numbers=none,caption={报告中更有解释力的派生字段}]
+cycles_per_element
+instructions_per_element
+bytes_moved_per_element
+misses_per_ki_elements
+branch_miss_rate
+tlb_misses_per_mib
+effective_bandwidth_gib_s
+attained_gflop_s
+arithmetic_intensity_flop_per_byte
+\end{lstlisting}
+
+\topic{Top-down 不是口号}
+许多现代 CPU 可以把周期粗分成 frontend bound、bad speculation、backend bound 和 retiring。即使当前设备没有完整 top-down 事件，也可以用同样思路组织证据。前端问题看 I-cache、指令体积、分支目标和 decode；错误推测看 branch miss 和输入分布；后端问题再分内存、端口、依赖链；retiring 高说明大量周期在提交有用或至少可退休的指令，但仍要看这些指令是否必要。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+分类 & 常见原因 & 对照实验 \\
+\midrule
+frontend bound & 代码体积、I-cache、decode、间接跳转 & 缩小热路径、减少模板膨胀、看反汇编 \\
+bad speculation & 分支难预测、错误路径多 & 构造可预测/随机输入对照 \\
+backend memory & cache/TLB/DRAM/NUMA 等待 & 改布局、改变工作集、测带宽下限 \\
+backend core & 端口、依赖链、除法、shuffle & 多累加器、改指令形态、看 uops \\
+retiring & 指令被顺利提交 & 检查是否做了多余工作 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{不能用 PMU 替代 reference}
+如果候选版本指令数下降 40\%，但 checksum 也变了，这不是优化。若候选版本 cache miss 下降，因为它跳过了错误记录或少写了 manifest，也不是优化。性能证据永远排在 correctness 证据之后。报告结构应先写 reference/oracle/checksum，再写时间和 PMU。
+
 \section{测量报告的反面案例}
 
 坏报告最常见的形式是：“优化后耗时从 12 秒降到 4 秒，提升三倍。”这句话缺少语义、输入、环境、统计、边界和原因。它可能是真的，也可能来自 page cache 预热、少写了 manifest、跳过了坏行、线程数不同、编译选项不同、CPU 频率不同、输出校验关闭，或者只挑了最好的样本。测量章要建立的不是写报告格式，而是把这种句子拆到无法藏错。

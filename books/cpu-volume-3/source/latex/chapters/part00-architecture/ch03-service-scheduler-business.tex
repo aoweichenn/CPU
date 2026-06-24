@@ -120,6 +120,56 @@ trace 队列 & debug 模式产生日志洪峰 & 采样、等级、大小上限 \
 
 排队时间要进入 trace。否则用户看到 TTFT 很慢时，工程师可能错误优化 prefill kernel，而真正的问题是请求在队列里等了 800ms。
 
+\subsection{队列模型：SLO 不是平均值}
+
+服务化推理需要一个最小 queueing model。即使不做复杂排队论，也必须知道三个量：到达率 \code{\lambda}、服务率 \code{\mu}、利用率 \code{\rho=\lambda/\mu}。当 \code{\rho} 接近 1 时，平均服务时间只增加一点，排队时间可能急剧上升。LLM serving 更复杂，因为 prefill 和 decode 服务时间差异大，长输出请求会占用很多 step；但基本判断不变：系统不能长期以接近满载运行还期待稳定 p95。
+
+\[
+TTFT = queue\_wait + admission + prefill + first\_decode + first\_emit
+\]
+
+\[
+TPOT \approx decode\_step\_wait + decode\_kernel + sampler + emit
+\]
+
+这两个公式把“慢”拆开。TTFT 慢可能是排队，也可能是长 prompt prefill；TPOT 慢可能是 decode kernel，也可能是为了合批等待、sampler 回传或客户端 backpressure。若只报端到端平均延迟，工程师无法知道该优化 kernel、调度、队列上限还是 I/O。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+指标 & 主要含义 & 常见错误解释 \\
+\midrule
+\code{queue\_wait\_p95} & admission 后等待模型资源 & 误判为 prefill 慢 \\
+\code{ttft\_p95} & 首 token 用户体验 & 忽略 prompt 长度分桶 \\
+\code{tpot\_p95} & 持续生成速度 & 忽略合批等待和 backpressure \\
+\code{active\_sessions} & decode 竞争程度 & 不等于 batch size 一定大 \\
+\code{rejection\_rate} & 容量保护触发频率 & 不等于服务失败，可能是正确保护 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{批处理的收益和代价}
+合批提高吞吐，因为多个 session 可以共享权重读流和 kernel launch。但合批需要等待更多请求凑齐，这会增加 queue wait 或 decode step wait。保守调度器应有 \code{max\_batch\_size} 和 \code{max\_wait\_ns} 两个边界。吞吐报告必须同时给 tokens/s 和 p95/p99，否则很容易用长尾换吞吐。
+
+\begin{lstlisting}[numbers=none,caption={合批调度的最小数学字段}]
+BatchingPolicy:
+  max_batch_size
+  max_wait_ns
+  prefill_token_budget
+  decode_session_budget
+  deadline_ordering
+
+BatchingMetrics:
+  formed_batch_size
+  wait_ns_before_launch
+  tokens_per_second
+  ttft_p95
+  tpot_p95
+\end{lstlisting}
+
+\topic{SLO 需要分桶}
+prompt=32 和 prompt=4096 的 TTFT 不应放在同一个平均值里；context=128 和 context=8192 的 decode attention 也不应混在一起。最小分桶维度是 prompt tokens、current context、max new tokens、backend、quant profile 和 batch size。分桶后才能判断某个优化改善了谁、伤害了谁。
+
 \subsection{调度粒度：一次跑完整请求还是一 token 一调度}
 
 最简单的调度方式是一个请求跑到结束再处理下一个请求。它容易实现，但对长输出请求不公平：一个用户生成 2048 token，会阻塞其他短请求。更合理的最小策略是 step-level 调度：每个活跃 session 每次执行一个或几个 decode step，然后让出。

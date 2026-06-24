@@ -559,6 +559,77 @@ ai-compile-plan --model fixtures/minillm_tiny --backend cpu \
 
 这些 verifier 不一定都很复杂，但必须存在。它们让错误在编译期或 prepare 阶段暴露，而不是进入运行时热路径后才以崩溃或质量漂移形式出现。
 
+\subsection{合法性规则：alias、liveness、fusion 和 layout propagation}
+
+AI compiler 的难点不只是“能不能把两个算子合起来”。真正的问题是：这个改写在所有合法输入、layout、dtype、quant profile、debug/oracle 和状态边下是否保持语义。为此，需要把 alias analysis、liveness、buffer reuse、fusion legality 和 layout propagation 写成规则，而不是写成后端里的 if。
+
+\topic{Alias analysis：谁共享同一块 storage}
+Tensor view、reshape、slice、transpose、KV cache state 和 in-place output 都可能共享底层 storage。Alias analysis 要给每个 value 分配 alias set，并标记只读、写入、view、state 和 external buffer。若两个 value 可能别名，memory planner 不能随意重叠它们；fusion pass 也不能把会改变读写顺序的节点合并。
+
+\begin{lstlisting}[numbers=none,caption={AliasAnalysis 输出示例}]
+AliasSet 7:
+  %x        read_write storage=arena0 offset=0 bytes=96
+  %x_view   read_only  view_of=%x stride=[8,4,1]
+
+AliasSet 12:
+  state kv_cache.layer0 session_lifetime
+  state_read attention0
+  state_write kv_append0
+\end{lstlisting}
+
+KV cache 的 alias set 必须是 session lifetime，不能被当成普通 activation。若 memory planner 把它和临时 hidden 复用，短测试可能通过，第二个 token 就会读到被覆盖的历史 K/V。
+
+\topic{Liveness：buffer reuse 的唯一安全入口}
+Buffer reuse 只能在生命周期不重叠时发生。生命周期不是源码顺序，而是 executable plan 中定义点到最后使用点。debug/oracle materialization 会延长生命周期；异步 GPU kernel 和 host-device copy 也会延长生命周期；state edge 更是跨 token 存活。Liveness analysis 要输出每个 value 的 \code{defined\_at}、\code{last\_used\_at} 和 barrier。
+
+\begin{lstlisting}[numbers=none,caption={buffer reuse 的拒绝条件}]
+cannot reuse if:
+  live ranges overlap
+  values may alias
+  alignment requirements differ and cannot be met
+  oracle requires both dumps
+  async kernel may still read old buffer
+  one value is session state
+\end{lstlisting}
+
+\topic{Fusion legality：减少内存写不等于合法}
+RMSNorm+Linear 融合看起来简单：少写一次 normalized hidden。但若 RMSNorm 输出有两个消费者，融合会重复计算或改变物化点；若 oracle 要 dump RMSNorm 输出，融合必须保留可 materialize 结果；若量化 linear 需要特定 scale 读取顺序，融合 kernel 要证明误差边界仍成立；若 backend 不支持当前 layout，不能为了融合强行转 layout 又不计成本。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+检查项 & 为什么需要 & 失败时动作 \\
+\midrule
+单消费者 & 避免重复计算或语义改变 & 拒绝融合 \\
+无状态边跨越 & KV/sampler state 不能被隐藏 & 切断 fusion 边界 \\
+oracle 允许 & 保留调试和回归证据 & materialize 或拒绝 \\
+dtype/layout 支持 & 后端 kernel 有能力执行 & 选择未融合路径 \\
+误差合同 & 数值变化在阈值内 & 降级或扩大 oracle 检查 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{Layout propagation：layout 是会传播的类型}
+如果 QKV linear 输出选择 \code{token\_head\_dim}，RoPE 和 attention 就要消费这个 layout；如果 attention kernel 需要 \code{head\_token\_dim}，中间需要 transpose/view/copy。Layout propagation 要像类型推导一样，把每个 op 的支持 layout、偏好 layout 和转换成本传播出来。不能只在某个 kernel 里发现 stride 不合适再临时 copy。
+
+\begin{lstlisting}[numbers=none,caption={layout propagation 的规则形态}]
+RMSNorm:
+  preserves input layout
+
+Linear:
+  input layout: token_hidden
+  output candidates: token_hidden | token_head_dim
+
+RoPE:
+  requires head_dim contiguous
+
+AttentionDecode:
+  prefers kv layout: layer_position_kvhead_dim
+  requires q layout: token_head_dim
+\end{lstlisting}
+
+这些规则让 compiler 能解释“为什么插入 layout conversion”。如果转换成本大于融合收益，plan verifier 应能指出优化被拒绝的原因，而不是静默生成慢路径。
+
 \subsection{C++20 实现边界}
 
 工程上，AI 编译器模块可以按下面方式组织：

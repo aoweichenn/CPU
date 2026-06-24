@@ -198,6 +198,81 @@ SimdDispatchReport:
 
 这个报告会防止两个常见问题。第一，在开发机上只验证 AVX2，部署到无 AVX2 环境时 silently fallback 到未经测试路径。第二，标量 fallback 只在短输入上跑过，没有覆盖错误语义。高性能路径和回退路径都属于同一个接口合同；回退不应被当成“慢但无所谓”的角落。
 
+\section{端口、lane 利用率和 reduction 成本}
+
+SIMD 宽度只是上限，不是实际性能。一个 AVX2 寄存器能放 8 个 \code{float}，不等于吞吐一定 8 倍。真实速度还受 load/store 端口、FMA/ALU 端口、shuffle 端口、前端 uop 供给、寄存器压力和尾部 mask 控制。向量化报告必须写机器资源账本。
+
+\topic{每元素资源账本}
+考虑 \code{out[i] = a[i] * scale + b[i]}。标量每元素大致需要两个 load、一个乘加、一个 store。AVX2 每条向量指令处理 8 个 \code{float}，但每个向量仍要读取 32 字节 \code{a}、32 字节 \code{b}，写 32 字节 \code{out}。若数据不在 cache 中，主瓶颈可能仍是字节流量，而不是乘法器。
+
+\begin{lstlisting}[numbers=none,caption={一对一 float 变换的向量账本}]
+per 8 float elements:
+  load a:   32 bytes
+  load b:   32 bytes
+  store out:32 bytes
+  compute:  8 multiply-add operations
+
+per element:
+  bytes ~= 12
+  flops ~= 2
+  AI ~= 0.167 FLOP/byte
+\end{lstlisting}
+
+这个 AI 很低。若没有数据复用，它更像带宽 kernel。把标量换成 SIMD 可以减少指令数和分支成本，但不会减少必要字节。若 benchmark 显示接近内存带宽上限，再继续手写复杂 intrinsic 可能收益很小。
+
+\topic{lane 利用率}
+向量宽度为 8，但尾部、mask、分支和数据选择可能让有效 lane 远小于 8。若每 8 个 lane 只有 1 个满足条件，向量比较仍然很快，但后续 compact、scatter 或随机写可能主导成本。报告要区分“比较阶段 lane 满载”和“写出阶段有效 lane 稀疏”。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+形态 & lane 利用率风险 & 常见补救 \\
+\midrule
+连续 map & 尾部和对齐 & 标量尾部或安全 mask \\
+filter & 选择率低或波动大 & count/scan/write，分块压缩 \\
+histogram & lane 写同一桶 & 局部 partial，冲突检测 \\
+parser & 分支和跨块状态 & SIMD 找候选，标量确认 \\
+reduction & 水平合并成本 & 多 accumulator，树形合并 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{horizontal reduction 不是免费}
+向量寄存器内部求和最终要把多个 lane 合成一个标量。这个 horizontal reduce 需要 shuffle、permute 或专门水平加法指令。若每处理很少元素就做一次水平合并，shuffle 成本会吃掉向量化收益。正确形态通常是多个向量 accumulator 在长循环中累加，循环结束后再少量水平合并。
+
+\begin{lstlisting}[numbers=none,caption={reduction 的成本边界}]
+bad shape:
+  load vector
+  reduce vector to scalar immediately
+  add scalar to sum
+
+better shape:
+  keep several vector accumulators
+  accumulate many vectors
+  reduce accumulators at the end
+\end{lstlisting}
+
+浮点 reduction 还要声明误差合同。多 accumulator 和树形合并改变加法顺序，结果可能与标量逐项求和最后几位不同。若业务要求 bitwise identical，就要固定合并树或保留标量 reference；若只要求误差边界，就要写出绝对/相对误差阈值和测试输入。
+
+\topic{端口压力来自指令混合}
+同一个 \code{vaddps}、\code{vmulps}、\code{vpermps}、\code{vmovups} 不占用同一种资源。连续 load/store 受 load/store 端口和缓存带宽限制；shuffle/permute 常走专门端口；FMA 走浮点执行端口；地址计算需要 AGU。一个 kernel 若每轮有大量 gather、permute 和 masked store，就不能用“FMA 峰值”估算。
+
+\begin{lstlisting}[numbers=none,caption={SIMD 报告必须写的资源问题}]
+instruction mix:
+  vector loads/stores
+  arithmetic ops
+  shuffles/permutations
+  masks/blends
+  gathers/scatters
+
+resource questions:
+  are loads contiguous?
+  do shuffles dominate?
+  is tail path frequent?
+  do accumulators exceed registers?
+  does unrolling overflow I-cache or registers?
+\end{lstlisting}
+
 \section{指令级并行：不用 SIMD 也能变快的原因}
 
 SIMD 关注一条指令覆盖多个元素，指令级并行关注多个互不依赖的指令同时推进。现代乱序核心不会机械地按源代码逐行等待；只要依赖允许，它会让加载、算术、地址生成和存储在不同端口上重叠。代码要给乱序窗口足够多的独立工作。
