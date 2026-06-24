@@ -1273,6 +1273,78 @@ std::shared_future<T>:
 
 这解释了几个标准库现象。\code{future.valid()} 只说明这个句柄是否还关联 shared state，不说明结果是否 ready。\code{wait()} 只等待 ready，不消费结果；\code{get()} 等待 ready 后消费普通 future 的结果；\code{shared\_future::get()} 可以被多次调用，因为它不把共享状态从消费者侧移走。Shared state 的生命周期通常持续到最后一个相关句柄释放，而不是到任务函数返回那一刻。
 
+\topic{端点生命周期：\code{promise} 和 \code{future} 不是两个对象互相等}
+把 shared state 看成中心对象之后，\code{promise} 和 \code{future} 就只是两个端点。生产端负责把 Pending 推到某个终态；消费端负责观察终态并取出值或异常。端点可以移动，shared state 不会因为句柄移动而移动。端点可以提前析构，shared state 也不一定立刻销毁；它必须活到所有可能观察它的句柄和等待者都结束。
+
+\begin{lstlisting}[numbers=none,caption={future shared state 的端点生命周期}]
+create promise:
+  allocate shared state
+  producer endpoint is present
+
+promise.get_future:
+  create exactly one ordinary future endpoint
+  repeated get_future is a protocol error
+
+move promise:
+  producer endpoint moves to the new promise object
+  old promise no longer owns producer responsibility
+
+move future:
+  consumer endpoint moves to the new future object
+  old future.valid() becomes false
+
+destroy promise while Pending:
+  Pending -> BrokenPromise
+  wake waiters
+
+destroy future before ready:
+  consumer endpoint disappears
+  producer may still run unless runtime has a cancellation contract
+
+destroy last endpoint after terminal state:
+  shared state storage may be reclaimed
+\end{lstlisting}
+
+这几个转移决定了很多工程边界。第一，\code{promise.get\_future()} 通常只能调用一次，因为普通 \code{future} 是单消费端；要广播结果，应先转成 \code{shared\_future} 或用发布快照。第二，consumer 提前析构不等于 producer 被取消；标准 future 没有取消语义。第三，producer 析构且还没满足结果，不是静默丢弃，而是 broken promise。运行时若把 rejected task、canceled task、abandoned future 都混成一个布尔值，就无法给调用者正确错误。
+
+\topic{标准操作表：每个 API 都是状态转移}
+下面这张表不是背 API，而是给代码审查用的状态账本。任何线程池封装 \code{std::promise}、\code{std::packaged\_task} 或自研 future-like 类型，都应逐项回答这些操作在 Pending、Ready、Canceled、Broken、Consumed 下如何表现。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.23\linewidth}p{0.34\linewidth}p{0.29\linewidth}}
+\toprule
+操作 & 状态影响 & 工程边界 \\
+\midrule
+\code{promise::get\_future} & 创建普通消费端 & 只能一次；重复调用是协议错误 \\
+\code{promise::set\_value} & Pending -> ValueReady & 必须发布结果后再唤醒等待者 \\
+\code{promise::set\_exception} & Pending -> ExceptionReady & 异常对象进入 shared state，不停在 worker 栈 \\
+\code{promise} 析构 & Pending -> BrokenPromise & 等待者必须醒来并得到可诊断错误 \\
+\code{future::wait} & 只等待 ready & 不消费结果，不执行任务，不取消 producer \\
+\code{future::wait\_for} & 在期限内尝试观察 ready & timeout 不表示任务结束或取消 \\
+\code{future::get} & 观察终态并消费普通 future & 第二次 \code{get} 不是合法读取 \\
+\code{future::valid} & 查询句柄是否有关联状态 & 不等于 ready，不等于任务仍在运行 \\
+\code{shared\_future::get} & 多观察者读取 ready 状态 & 适合广播结果，不适合事件流 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+最容易错的是把 \code{wait\_for(timeout)} 的 timeout 当成取消成功。Timeout 只是调用者本轮停止等待。producer 可能还在执行，结果稍后仍然会进入 shared state。若 timeout 后上层释放了 producer 需要写入的 buffer，后续 completion 就会写悬垂内存。正确做法是把 timeout、stop request、producer acknowledgement 和 shared state 终态分成四个事实，不要让一个返回值承担所有语义。
+
+\begin{lstlisting}[numbers=none,caption={timeout 不等于取消完成}]
+caller:
+  if future.wait_for(10 ms) == timeout:
+      request_stop()
+      keep shared state and captured storage alive
+      decide whether to wait, detach, or observe cancellation later
+
+producer:
+  if stop requested:
+      publish Canceled or ExceptionReady
+  else:
+      publish ValueReady or ExceptionReady
+\end{lstlisting}
+
 \topic{异常传播是 shared state 的终态}
 跨线程异常不能靠 worker 日志完成。生产端必须把异常捕获成 \code{std::exception\_ptr} 写入 shared state；消费端 \code{get()} 看到异常终态时在调用线程重新抛出。这样调用者能用普通 \code{try/catch} 处理后台任务失败，错误也不会被 worker 线程吞掉。
 
@@ -1320,6 +1392,50 @@ wait_for timeout:
 \end{lstlisting}
 
 因此，持有 mutex 时调用 \code{get()} 是危险形状：producer 可能需要同一把锁才能写结果或推进状态，consumer 却在锁内睡眠。在线程池 worker 内调用同池 future 的 \code{get()} 也危险：等待者占住了执行被等待任务的 worker。外部控制线程阻塞等待一次后台结果通常可以接受；compute worker 内长期阻塞等待必须被运行时显式管理。
+
+\topic{阻塞等待的真实时间线}
+阻塞等待不是一个魔法暂停点。普通 mutex/CV 实现通常可以按下面的时间线理解；futex 或平台事件对象只是把 sleep/wake 的慢路径换成内核设施，语义仍然是“状态先改变，通知后观察”。
+
+\begin{lstlisting}[numbers=none,caption={future.get 的 park/unpark 时间线}]
+consumer future.get:
+  lock shared_state
+  if state is terminal:
+      consume or rethrow
+      unlock
+      return
+  register waiter
+  while state is Pending:
+      atomically release lock and park current thread
+      wake up and reacquire lock
+  remove waiter
+  consume or rethrow terminal state
+  unlock
+
+producer set_value/set_exception:
+  lock shared_state
+  write result or exception storage
+  state = ValueReady or ExceptionReady
+  detach waiters and continuations
+  unlock
+  notify waiters
+  schedule continuations
+\end{lstlisting}
+
+这条线有三个审查点。第一，consumer 必须在检查 Pending 和进入等待队列之间保持原子性；否则 producer 可能已经通知，而 consumer 还没登记，形成丢失唤醒。第二，producer 必须先写结果、再改 ready、再通知；否则 consumer 可能醒来读到未构造完成的结果。第三，通知和调度 continuation 应在释放 shared state 锁之后发生，避免在内部锁下执行未知代码。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.27\linewidth}p{0.34\linewidth}p{0.25\linewidth}}
+\toprule
+错误时间线 & 表现 & 应检查的证据 \\
+\midrule
+先通知后写 ready & 偶发等待者继续睡眠或读旧状态 & 状态写入与 notify 的顺序 \\
+锁内执行 continuation & 长临界区、锁顺序反转、重入运行时 & completion trace 和锁等待时间 \\
+timeout 后释放 captured storage & producer 稍后写悬垂对象 & 捕获对象生命周期和 stop ack \\
+worker 内 park 等同池 future & ready 队列有任务但无 worker 执行 & worker state trace 与 ready depth \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 \topic{线程池集成：submit 返回 future 不是自动安全}
 线程池常见接口是 \code{submit(callable) -> future<R>}。这个接口只在语义上承诺“一次被接纳的 callable 会满足 shared state”。它没有自动解决容量、关闭、取消、同池等待和异常传播。正确集成至少要保证四件事：提交被拒绝时不给调用者一个永远不 ready 的 future；任务函数正常返回时写 value；任务函数抛异常时写 exception；运行时取消已接纳任务时写取消终态或异常。
@@ -1370,6 +1486,90 @@ await_resume:
 
 这里的关键边界是调度位置。恢复 coroutine 不应在持有 shared state 锁时直接执行用户代码；更稳的做法是把 coroutine handle 作为 continuation 放回 executor 或 runtime 队列。否则一个完成路径可能在锁内重入用户代码，制造锁顺序反转、长临界区和难以追踪的递归调用。Coroutine 购买的是非阻塞等待表达能力，不是替代运行时调度。
 
+\topic{coroutine lowering：顺序写法背后是 frame 和状态机}
+C++ coroutine 的难点不在 \code{co\_await} 这个关键字，而在编译器把函数拆成了可暂停状态机。一个 coroutine 调用不会简单创建线程；它通常分配或嵌入一个 coroutine frame，frame 里保存参数、局部变量、当前暂停点、返回对象的 \code{promise\_type} 和恢复入口。每次 \code{co\_await} 都是在问 awaitable 三个问题：现在能不能继续，若不能继续把我挂到哪里，恢复时给我什么结果或异常。
+
+\begin{lstlisting}[numbers=none,caption={coroutine frame 的概念字段}]
+CoroutineFrame:
+  promise_object
+  parameters and live locals
+  current_suspend_point
+  continuation_handle
+  exception_slot
+  result_slot or reference to FutureState
+  allocator and destroy protocol
+
+promise_type:
+  get_return_object
+  initial_suspend
+  final_suspend
+  return_value or return_void
+  unhandled_exception
+\end{lstlisting}
+
+\code{initial\_suspend} 决定 coroutine 创建后是立刻运行，还是先把 handle 交给调用者或 executor。\code{final\_suspend} 决定 coroutine 结束时如何通知等待者或恢复 continuation。\code{return\_value} 把普通返回值写入 promise 或 FutureState。\code{unhandled\_exception} 把逃逸异常保存起来，让 \code{await\_resume} 或最终 \code{get} 能在正确线程重新抛出。若这些函数没有定义清楚，coroutine 代码看起来像同步函数，错误传播却比回调更难诊断。
+
+\begin{lstlisting}[numbers=none,caption={co\_await 的三段合同}]
+co_await expression:
+  awaiter = get awaiter from expression
+  if awaiter.await_ready():
+      result = awaiter.await_resume()
+      continue in the same call path
+  else:
+      suspend current coroutine frame
+      decision = awaiter.await_suspend(current_handle)
+      if decision means suspended:
+          return to caller or scheduler
+      later, executor resumes current_handle
+      result = awaiter.await_resume()
+\end{lstlisting}
+
+\code{await\_suspend} 是最危险的点。它运行在 coroutine 已经暂停、但还没有完全交出控制权的边界上。若 awaitable 在这里把 handle 注册到 shared state 后，producer 同时完成，就会出现竞态：completion 可能试图恢复一个刚注册的 handle。健壮实现需要在同一把锁或同一个原子状态机下处理“注册 continuation”和“发现已经 ready”两条路径。
+
+\begin{lstlisting}[numbers=none,caption={await\_suspend 的竞态处理}]
+await_suspend(handle h):
+  lock shared_state
+  if state is terminal:
+      unlock
+      enqueue h to executor
+      return suspended_or_transfer
+  append h to continuation list
+  unlock
+  return suspended
+
+completion:
+  lock shared_state
+  state = terminal
+  continuations = move continuation list
+  unlock
+  enqueue continuations to executor
+\end{lstlisting}
+
+\topic{final suspend：结束点不能把 frame 过早销毁}
+很多 coroutine 事故发生在结束路径。用户代码执行完并不等于 frame 可以立刻销毁，因为还有等待者可能需要读取结果、异常或恢复 continuation。可靠的 \code{final\_suspend} 往往返回一个 awaiter：它在 coroutine 终态发布后，把 continuation 放回 executor，然后让外部 owner 在安全时机销毁 frame。
+
+\begin{lstlisting}[numbers=none,caption={coroutine 结束路径的状态账本}]
+body returns value:
+  promise_type.return_value stores result
+  enter final_suspend
+  publish terminal state
+  schedule continuation
+  frame remains until owner destroys it
+
+body throws:
+  promise_type.unhandled_exception stores exception_ptr
+  enter final_suspend
+  publish ExceptionReady
+  schedule continuation
+  await_resume later rethrows
+
+consumer destroys task object before ready:
+  according to API:
+    request cancellation, detach, or destroy only if coroutine is not running
+\end{lstlisting}
+
+因此，coroutine 类型的析构合同必须非常明确。若 task 对象析构就直接 \code{destroy()} frame，而 producer 线程或 executor 还可能恢复它，就是 use-after-free。若 task 析构只 detach，却没有任何 owner 最终销毁 frame，就是泄漏。若取消只是丢掉 continuation，不把 FutureState 推到终态，等待者会永久 pending。协程不是免生命周期的语法糖，它把生命周期从调用栈搬到了 heap 或运行时管理的 frame。
+
 \begin{lstlisting}[language=C++,caption={promise 必须在成功和失败路径都满足共享状态}]
 std::promise<LoadReport> promise;
 std::future<LoadReport> result = promise.get_future();
@@ -1392,6 +1592,30 @@ controller:
 \end{lstlisting}
 
 \code{std::async} 也返回 \code{future}，但它不是生产级 task runtime。未显式指定策略时，实现可以选择异步执行，也可以选择 deferred：任务直到 \code{get} 或 \code{wait} 才在等待线程上运行。指定 \code{std::launch::async} 可以要求异步执行，但仍然缺少队列容量、任务分类、worker 可观测性、取消、背压和调度策略。\code{std::packaged\_task} 可以把 callable 包成 future 生产端；它仍然只解决“一次 callable 产生一次结果”，不解决运行时调度。
+
+\topic{future/coroutine 的最低验收矩阵}
+如果一段运行时宣称支持 future 或 coroutine，不能只跑成功返回值。最低验收应覆盖下面这些边界：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.27\linewidth}p{0.36\linewidth}p{0.23\linewidth}}
+\toprule
+用例 & 必须观察到的事实 & 常见失败 \\
+\midrule
+成功 \code{set\_value} & \code{wait} 醒来，\code{get} 返回值，只能消费一次 & 结果发布顺序错误 \\
+生产者抛异常 & \code{get} 在 caller 线程重新抛出 & worker 吞异常或崩溃 \\
+promise 未满足析构 & consumer 观察 broken promise & 永远 pending \\
+\code{wait\_for} 超时 & timeout 后 producer 仍可完成 & 把 timeout 当 cancel \\
+\code{shared\_future} 多读 & 多个 reader 都能读 ready 结果 & 误用普通 future 广播 \\
+提交被拒绝 & 返回 Rejected，不返回 pending future & 调用者拿到无人满足状态 \\
+已接纳任务取消 & FutureState 进入取消或异常终态 & 从队列删除但不唤醒 \\
+worker 同池等待 & trace 显示执行资源耗尽或接口拒绝 & 偶发饥饿 \\
+coroutine ready-fast path & \code{await\_ready} 为真时不注册 continuation & 重复恢复 \\
+coroutine late completion & 注册和 completion 并发仍只恢复一次 & 丢 continuation 或双 resume \\
+final suspend & continuation 入 executor，frame 不被过早销毁 & 锁内 resume 或 use-after-free \\
+\bottomrule
+\end{tabular}
+\end{center}
 
 \begin{center}
 \small
