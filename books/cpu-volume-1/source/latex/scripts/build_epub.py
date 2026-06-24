@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a phone-friendly EPUB3 from the project's LaTeX book sources.
+"""Build a phone-friendly EPUB from the project's LaTeX book sources.
 
 This is intentionally a small project-specific converter, not a general
 LaTeX engine. It supports the macros and environments used by this book and
@@ -28,6 +28,7 @@ BOOK_SUBTITLE = os.environ.get("BOOK_SUBTITLE", "底层原理、汇编接口与�
 BOOK_AUTHOR = os.environ.get("BOOK_AUTHOR", "CPU Performance Study")
 BOOK_LANG = os.environ.get("BOOK_LANG", "zh-CN")
 EPUB_LINEARIZE_TABLES = os.environ.get("EPUB_LINEARIZE_TABLES", "").lower() in {"1", "true", "yes", "on"}
+WECHAT_COMPATIBLE = os.environ.get("EPUB_WECHAT_COMPATIBLE", "").lower() in {"1", "true", "yes", "on"}
 
 BOX_TITLES = {
     "keyidea": "核心思想",
@@ -374,11 +375,14 @@ class LatexBlockConverter:
         heading_prefix: str = "",
         chapter_no: int | None = None,
         linearize_tables: bool = False,
+        legacy_markup: bool = False,
     ) -> None:
         self.inline = inline
         self.heading_prefix = heading_prefix
         self.chapter_no = chapter_no
         self.linearize_tables = linearize_tables
+        self.legacy_markup = legacy_markup
+        self.box_tag = "div" if legacy_markup else "aside"
         self.section_no = 0
         self.out: list[str] = []
         self.paragraph: list[str] = []
@@ -423,7 +427,9 @@ class LatexBlockConverter:
                 if env in BOX_TITLES:
                     self.flush_paragraph()
                     title = BOX_TITLES[env]
-                    self.out.append(f'<aside class="box {env}"><p class="box-title">{html.escape(title)}</p>')
+                    self.out.append(
+                        f'<{self.box_tag} class="box {env}"><p class="box-title">{html.escape(title)}</p>'
+                    )
                     i += 1
                     continue
                 if env == "principlebox":
@@ -434,7 +440,7 @@ class LatexBlockConverter:
                         raw_title, _ = read_group(rest, 0)
                         title = latex_plain(raw_title) or title
                     self.out.append(
-                        f'<aside class="box {env}"><p class="box-title">{self.inline.convert(title)}</p>'
+                        f'<{self.box_tag} class="box {env}"><p class="box-title">{self.inline.convert(title)}</p>'
                     )
                     i += 1
                     continue
@@ -450,9 +456,9 @@ class LatexBlockConverter:
                 if env in LIST_ENV:
                     self.close_list()
                 elif env in BOX_TITLES:
-                    self.out.append("</aside>")
+                    self.out.append(f"</{self.box_tag}>")
                 elif env == "principlebox":
-                    self.out.append("</aside>")
+                    self.out.append(f"</{self.box_tag}>")
                 i += 1
                 continue
 
@@ -475,7 +481,11 @@ class LatexBlockConverter:
                 elif level == "subsection":
                     self.out.append(f"<h3>{self.inline.convert(title)}</h3>")
                 elif level == "topic":
-                    self.out.append(f'<h4 class="topic-heading">{self.inline.convert(title)}</h4>')
+                    text = self.inline.convert(title)
+                    if self.legacy_markup:
+                        self.out.append(f'<p class="topic-heading"><strong>{text}</strong></p>')
+                    else:
+                        self.out.append(f'<h4 class="topic-heading">{text}</h4>')
                 i += 1
                 continue
 
@@ -890,7 +900,11 @@ def latex_math_plain(text: str) -> str:
     return text.strip()
 
 
-def collect_entries(book_dir: Path, include_cover: bool = True) -> tuple[list[SourceEntry], list[PartNode]]:
+def collect_entries(
+    book_dir: Path,
+    include_cover: bool = True,
+    legacy_names: bool = False,
+) -> tuple[list[SourceEntry], list[PartNode]]:
     main = (book_dir / "main.tex").read_text(encoding="utf-8")
     entries: list[SourceEntry] = []
     if include_cover:
@@ -901,6 +915,12 @@ def collect_entries(book_dir: Path, include_cover: bool = True) -> tuple[list[So
     appendix = False
     chapter_no = 0
     appendix_no = 0
+    output_no = 0
+
+    def next_output_name(prefix: str = "item") -> str:
+        nonlocal output_no
+        output_no += 1
+        return f"{prefix}-{output_no:03d}.xhtml"
 
     for raw in main.splitlines():
         line = strip_comment(raw).strip()
@@ -923,7 +943,7 @@ def collect_entries(book_dir: Path, include_cover: bool = True) -> tuple[list[So
         if line.startswith(r"\part"):
             title = command_first_arg(line, "part")
             ident = f"part-{len(parts) + 1}"
-            output = f"{ident}.xhtml"
+            output = next_output_name("part") if legacy_names else f"{ident}.xhtml"
             current_part = PartNode(ident=ident, title=title, output=output)
             parts.append(current_part)
             entries.append(SourceEntry(kind="part", title=title, nav_title=title, output=output, part_id=ident))
@@ -945,7 +965,7 @@ def collect_entries(book_dir: Path, include_cover: bool = True) -> tuple[list[So
             elif appendix:
                 label = f"附录 {chr(ord('A') + appendix_no)}"
                 appendix_no += 1
-            output = safe_output_name(source, book_dir)
+            output = next_output_name() if legacy_names else safe_output_name(source, book_dir)
             nav_title = f"{label} {title}".strip()
             entry = SourceEntry(
                 kind="chapter",
@@ -989,12 +1009,23 @@ def safe_output_name(source: Path, book_dir: Path) -> str:
     return re.sub(r"[^A-Za-z0-9_.-]+", "-", "-".join(rel.parts)) + ".xhtml"
 
 
-def xhtml_page(title: str, body: str) -> str:
-    return f'''<?xml version="1.0" encoding="utf-8"?>
-<!DOCTYPE html>
+def xhtml_page(title: str, body: str, legacy_markup: bool = False) -> str:
+    doctype = (
+        '<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.1//EN" '
+        '"http://www.w3.org/TR/xhtml11/DTD/xhtml11.dtd">'
+        if legacy_markup
+        else "<!DOCTYPE html>"
+    )
+    charset_meta = (
+        '<meta http-equiv="Content-Type" content="application/xhtml+xml; charset=utf-8" />'
+        if legacy_markup
+        else '<meta charset="utf-8" />'
+    )
+    page = f'''<?xml version="1.0" encoding="utf-8"?>
+{doctype}
 <html xmlns="http://www.w3.org/1999/xhtml" xml:lang="{BOOK_LANG}" lang="{BOOK_LANG}">
 <head>
-  <meta charset="utf-8" />
+  {charset_meta}
   <title>{html.escape(title)}</title>
   <link rel="stylesheet" type="text/css" href="styles/book.css" />
 </head>
@@ -1003,35 +1034,53 @@ def xhtml_page(title: str, body: str) -> str:
 </body>
 </html>
 '''
+    if legacy_markup:
+        page = normalize_legacy_xhtml(page)
+    return page
 
 
-def cover_page() -> str:
+def normalize_legacy_xhtml(page: str) -> str:
+    """Keep XHTML lines short for importers that use fragile line-based parsing."""
+    page = page.replace("</p><p", "</p>\n<p")
+    page = page.replace("</li><li", "</li>\n<li")
+    page = page.replace("</dt><dd", "</dt>\n<dd")
+    page = page.replace("</dd><dt", "</dd>\n<dt")
+    page = page.replace("</div><div", "</div>\n<div")
+    page = page.replace("</pre><p", "</pre>\n<p")
+    page = page.replace("</h1><h2", "</h1>\n<h2")
+    page = page.replace("</h2><p", "</h2>\n<p")
+    return page
+
+
+def cover_page(legacy_markup: bool = False) -> str:
+    wrapper = "div" if legacy_markup else "section"
     body = f'''
-<section class="cover">
+<{wrapper} class="cover">
   <h1>{html.escape(BOOK_TITLE)}</h1>
   <p class="subtitle">{html.escape(BOOK_SUBTITLE)}</p>
   <p class="author">{html.escape(BOOK_AUTHOR)}</p>
-</section>
+</{wrapper}>
 '''
-    return xhtml_page(BOOK_TITLE, body)
+    return xhtml_page(BOOK_TITLE, body, legacy_markup=legacy_markup)
 
 
-def part_page(part: PartNode) -> str:
+def part_page(part: PartNode, legacy_markup: bool = False) -> str:
+    wrapper = "div" if legacy_markup else "section"
     items = "\n".join(
         f'<li><a href="{html.escape(child.output, quote=True)}">{html.escape(child.nav_title)}</a></li>'
         for child in part.children
     )
     body = f'''
-<section class="part-page">
+<{wrapper} class="part-page">
   <p class="part-label">部分</p>
   <h1>{html.escape(part.title)}</h1>
   <ol>{items}</ol>
-</section>
+</{wrapper}>
 '''
-    return xhtml_page(part.title, body)
+    return xhtml_page(part.title, body, legacy_markup=legacy_markup)
 
 
-def convert_source(entry: SourceEntry) -> str:
+def convert_source(entry: SourceEntry, legacy_markup: bool = False) -> str:
     assert entry.source is not None
     source = expand_source_inputs(entry.source, find_book_dir(entry.source))
     converter = LatexBlockConverter(
@@ -1039,9 +1088,10 @@ def convert_source(entry: SourceEntry) -> str:
         heading_prefix=entry.label,
         chapter_no=entry.chapter_no,
         linearize_tables=EPUB_LINEARIZE_TABLES,
+        legacy_markup=legacy_markup,
     )
     body = converter.convert(source)
-    return xhtml_page(entry.nav_title or entry.title, body)
+    return xhtml_page(entry.nav_title or entry.title, body, legacy_markup=legacy_markup)
 
 
 def find_book_dir(source: Path) -> Path:
@@ -1153,12 +1203,19 @@ def build_ncx(entries: list[SourceEntry], uid: str) -> str:
 '''
 
 
-def build_opf(entries: list[SourceEntry], uid: str, modified: str, fonts: list[EmbeddedFont]) -> str:
+def build_opf(
+    entries: list[SourceEntry],
+    uid: str,
+    modified: str,
+    fonts: list[EmbeddedFont],
+    epub_version: str = "3.0",
+) -> str:
     manifest_items = [
-        '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>',
         '<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>',
         '<item id="css" href="styles/book.css" media-type="text/css"/>',
     ]
+    if epub_version == "3.0":
+        manifest_items.insert(0, '<item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>')
     for idx, font in enumerate(fonts, start=1):
         manifest_items.append(
             f'<item id="font-{idx}" href="{html.escape(font.href, quote=True)}" media-type="{font.media_type}"/>'
@@ -1170,6 +1227,25 @@ def build_opf(entries: list[SourceEntry], uid: str, modified: str, fonts: list[E
             f'<item id="{item_id}" href="{html.escape(entry.output, quote=True)}" media-type="application/xhtml+xml"/>'
         )
         spine_items.append(f'<itemref idref="{item_id}"/>')
+
+    if epub_version == "2.0":
+        return f'''<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="bookid">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:identifier id="bookid" opf:scheme="UUID">{uid}</dc:identifier>
+    <dc:title>{html.escape(BOOK_TITLE)}</dc:title>
+    <dc:creator>{html.escape(BOOK_AUTHOR)}</dc:creator>
+    <dc:language>{BOOK_LANG}</dc:language>
+    <dc:date>{modified[:10]}</dc:date>
+  </metadata>
+  <manifest>
+    {"".join(manifest_items)}
+  </manifest>
+  <spine toc="ncx">
+    {"".join(spine_items)}
+  </spine>
+</package>
+'''
 
     return f'''<?xml version="1.0" encoding="utf-8"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="bookid">
@@ -1191,6 +1267,11 @@ def build_opf(entries: list[SourceEntry], uid: str, modified: str, fonts: list[E
 
 
 def stylesheet(fonts: list[EmbeddedFont]) -> str:
+    mono_font_stack = (
+        '"Maple Mono NL NF CN", "Maple Mono", "Source Code Pro", monospace'
+        if fonts
+        else 'ui-monospace, "Cascadia Mono", "Noto Sans Mono", "Liberation Mono", monospace'
+    )
     font_faces = "\n".join(
         f'''@font-face {{
   font-family: "{font.family}";
@@ -1238,7 +1319,7 @@ h3 + p {
   text-indent: 2em;
 }
 code {
-  font-family: "Maple Mono NL NF CN", "Maple Mono", "Source Code Pro", monospace;
+  font-family: __MONO_FONT_STACK__;
   font-size: 0.95em;
   background: #f1f3f5;
   color: #174e70;
@@ -1246,7 +1327,7 @@ code {
   border-radius: 2px;
 }
 pre {
-  font-family: "Maple Mono NL NF CN", "Maple Mono", "Source Code Pro", monospace;
+  font-family: __MONO_FONT_STACK__;
   font-size: 0.92em;
   line-height: 1.52;
   white-space: pre;
@@ -1368,6 +1449,7 @@ a {
   color: inherit;
 }
 """
+    base_css = base_css.replace("__MONO_FONT_STACK__", mono_font_stack)
     return f"{font_faces}\n\n{base_css}"
 
 
@@ -1464,27 +1546,31 @@ def build_epub(
     include_cover: bool = True,
     forbid_images: bool = False,
     linearize_tables: bool | None = None,
+    wechat_compatible: bool = False,
+    embed_fonts: bool = True,
 ) -> None:
-    global EPUB_LINEARIZE_TABLES
+    global EPUB_LINEARIZE_TABLES, WECHAT_COMPATIBLE
     if linearize_tables is not None:
         EPUB_LINEARIZE_TABLES = linearize_tables
+    if wechat_compatible:
+        WECHAT_COMPATIBLE = True
 
-    entries, parts = collect_entries(book_dir, include_cover=include_cover)
-    fonts = collect_embedded_fonts()
+    entries, parts = collect_entries(book_dir, include_cover=include_cover, legacy_names=WECHAT_COMPATIBLE)
+    fonts = [] if WECHAT_COMPATIBLE or not embed_fonts else collect_embedded_fonts()
     uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{BOOK_TITLE}"))
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     pages: dict[str, str] = {}
     if include_cover:
-        pages["cover.xhtml"] = cover_page()
+        pages["cover.xhtml"] = cover_page(legacy_markup=WECHAT_COMPATIBLE)
     part_by_output = {part.output: part for part in parts}
     for entry in entries:
         if entry.kind == "cover":
             continue
         if entry.kind == "part":
-            pages[entry.output] = part_page(part_by_output[entry.output])
+            pages[entry.output] = part_page(part_by_output[entry.output], legacy_markup=WECHAT_COMPATIBLE)
         elif entry.kind == "chapter":
-            pages[entry.output] = convert_source(entry)
+            pages[entry.output] = convert_source(entry, legacy_markup=WECHAT_COMPATIBLE)
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w") as archive:
@@ -1493,9 +1579,15 @@ def build_epub(
         archive.writestr(mimetype, "application/epub+zip")
         archive.writestr("META-INF/container.xml", container_xml(), compress_type=zipfile.ZIP_DEFLATED)
         archive.writestr("OEBPS/styles/book.css", stylesheet(fonts), compress_type=zipfile.ZIP_DEFLATED)
-        archive.writestr("OEBPS/nav.xhtml", build_nav(entries, parts), compress_type=zipfile.ZIP_DEFLATED)
+        if not WECHAT_COMPATIBLE:
+            archive.writestr("OEBPS/nav.xhtml", build_nav(entries, parts), compress_type=zipfile.ZIP_DEFLATED)
         archive.writestr("OEBPS/toc.ncx", build_ncx(entries, uid), compress_type=zipfile.ZIP_DEFLATED)
-        archive.writestr("OEBPS/content.opf", build_opf(entries, uid, modified, fonts), compress_type=zipfile.ZIP_DEFLATED)
+        epub_version = "2.0" if WECHAT_COMPATIBLE else "3.0"
+        archive.writestr(
+            "OEBPS/content.opf",
+            build_opf(entries, uid, modified, fonts, epub_version=epub_version),
+            compress_type=zipfile.ZIP_DEFLATED,
+        )
         for font in fonts:
             archive.write(font.source, f"OEBPS/{font.href}", compress_type=zipfile.ZIP_DEFLATED)
         for name, content in pages.items():
@@ -1534,6 +1626,17 @@ def parse_args(argv: Iterable[str]) -> argparse.Namespace:
         default=EPUB_LINEARIZE_TABLES,
         help="Render LaTeX tabular environments as text definition lists instead of XHTML tables.",
     )
+    parser.add_argument(
+        "--wechat-compatible",
+        action="store_true",
+        default=WECHAT_COMPATIBLE,
+        help="Generate a conservative EPUB2-style package for WeChat Reading import.",
+    )
+    parser.add_argument(
+        "--no-embed-fonts",
+        action="store_true",
+        help="Do not embed local font files in the EPUB.",
+    )
     return parser.parse_args(list(argv))
 
 
@@ -1545,6 +1648,8 @@ def main(argv: Iterable[str]) -> int:
         include_cover=not args.no_cover_page,
         forbid_images=args.forbid_images,
         linearize_tables=args.linearize_tables,
+        wechat_compatible=args.wechat_compatible,
+        embed_fonts=not args.no_embed_fonts,
     )
     print(args.output.resolve())
     return 0

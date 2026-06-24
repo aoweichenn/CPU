@@ -14,7 +14,7 @@ epub:
 	@BOOK_TITLE="Compute Systems Engine：代码实践卷" \
 	BOOK_SUBTITLE="从 reference 到可恢复分布式计算引擎" \
 	BOOK_AUTHOR="CPU Performance Study" \
-	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables
+	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables --wechat-compatible --no-embed-fonts
 
 clean:
 	$(LATEXMK) -C

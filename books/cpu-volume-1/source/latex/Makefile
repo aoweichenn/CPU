@@ -10,7 +10,7 @@ pdf:
 	$(LATEXMK) $(ENGINE) -interaction=nonstopmode -halt-on-error $(MAIN)
 
 epub:
-	@python3 scripts/build_epub.py --output main.epub --no-cover-page --forbid-images --linearize-tables
+	@python3 scripts/build_epub.py --output main.epub --no-cover-page --forbid-images --linearize-tables --wechat-compatible --no-embed-fonts
 
 clean:
 	$(LATEXMK) -C

@@ -15,7 +15,7 @@ epub:
 	@BOOK_TITLE="从 C++ 到 AI 计算：第三册" \
 	BOOK_SUBTITLE="张量、算子、量化与本地大模型推理引擎" \
 	BOOK_AUTHOR="CPU Performance Study" \
-	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables
+	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables --wechat-compatible --no-embed-fonts
 
 clean:
 	$(LATEXMK) -C

@@ -15,7 +15,7 @@ epub:
 	@BOOK_TITLE="从 C++ 到计算系统：第二册" \
 	BOOK_SUBTITLE="硬件原理、多核并行、高性能计算、同步、无锁结构与分布式计算" \
 	BOOK_AUTHOR="CPU Performance Study" \
-	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables
+	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables --wechat-compatible --no-embed-fonts
 
 clean:
 	$(LATEXMK) -C
