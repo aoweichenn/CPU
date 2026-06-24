@@ -626,6 +626,151 @@ void ThreadPoolState::finish_task() {
 \end{tabular}
 \end{center}
 
+\section{同步原语选择族谱：状态、许可、阶段、事件和内核等待}
+
+只会说“mutex 慢，atomic 快”不是并发能力。同步原语的选择要从被等待的事实出发：你是在保护多字段不变量，还是等待一个谓词变真；是在发放资源许可，还是推进阶段；是在唤醒 epoll 事件循环，还是实现一个用户态原子等待的慢路径。原语选错时，代码可能短，但状态机会残缺。
+
+\topic{先问等待的对象是什么}
+选择原语前，先把等待对象写成一句话：
+
+\begin{itemize}
+  \item 等待“某个共享对象的不变量可被安全修改”：通常需要 \code{mutex}。
+  \item 等待“受锁保护的谓词变真”：通常需要 \code{condition\_variable}。
+  \item 等待“还有几个可用资源许可”：通常需要 \code{counting\_semaphore}。
+  \item 等待“一个原子状态或版本号变化”：可以考虑 \code{atomic::wait}。
+  \item 等待“N 个参与者一次性完成”：使用 \code{latch}。
+  \item 等待“多轮阶段边界”：使用 \code{barrier}。
+  \item 从 worker 唤醒 Linux I/O 事件循环：考虑 \code{eventfd}。
+  \item 为用户态同步原语实现内核睡眠慢路径：底层可能使用 futex。
+  \item 等待时间确定极短且不能睡眠：才考虑短暂 spin/yield。
+\end{itemize}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.19\linewidth}p{0.25\linewidth}p{0.24\linewidth}p{0.20\linewidth}}
+\toprule
+原语 & 状态位置 & 唤醒语义 & 常见坏用法 \\
+\midrule
+\code{mutex} & 被锁保护的对象字段 & unlock 后其他线程可竞争 & 锁内做 I/O、日志或用户回调 \\
+\code{condition\_variable} & mutex 下的谓词 & notify 只表示可能有变化 & 不写谓词，或谓词不含 close \\
+\code{counting\_semaphore} & 原语内部的许可计数 & release 增加许可，acquire 消耗许可 & 当 mutex 保护复杂对象生命周期 \\
+\code{atomic::wait} & 单个 atomic 值 & 值变化后唤醒重读 & 多字段不变量拆成一个 flag \\
+\code{latch} & 一次性倒计数 & 计数归零后全部通过 & 用来做可重复阶段同步 \\
+\code{barrier} & 阶段和参与者数 & 每轮所有参与者到达后推进 & 参与者数量动态变化却不建协议 \\
+\code{eventfd} & 内核维护的 64-bit counter & 文件描述符可被 epoll 观察 & 把业务 payload 塞进 eventfd \\
+futex & 用户态地址上的整数状态 & 值仍等于 expected 才睡眠 & 直接当业务锁协议使用 \\
+spin/yield & CPU 上的短期等待 & 不保证公平或节能 & 等 I/O、等长临界区、过度订阅 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的核心是：同步原语不是按 API 名字选，而是按状态模型选。状态跨度越大，越应该先用 mutex 和清楚谓词写对；状态越窄，才有机会下沉到 atomic wait 或特化结构。
+
+\topic{semaphore 的正确位置}
+连接池是信号量的好例子。假设最多允许 16 个连接同时被借出，\code{counting\_semaphore<16>} 可以表达“还有几个借用许可”。但连接对象列表仍然需要 mutex 保护，因为列表里有空闲连接、正在关闭的连接、失败连接和所有权转移。拿到许可不等于安全访问共享 vector；它只说明容量预算允许你继续。
+
+\begin{lstlisting}[numbers=none,caption={连接池中的许可和对象不变量是两层}]
+borrow:
+  permits.acquire()
+  lock pool mutex
+  remove one connection from free list
+  unlock
+  return handle
+
+return:
+  lock pool mutex
+  put connection back or mark broken
+  unlock
+  permits.release()
+\end{lstlisting}
+
+如果 \code{return} 路径因为异常、取消或析构漏掉 \code{release}，系统会慢慢丢许可，最后所有借用者都睡眠。若连接坏了但仍释放许可，也可能让后续请求拿到无效连接。信号量让资源额度清楚，但对象生命周期和错误路径仍要写成状态机。
+
+\topic{condition variable 的正确位置}
+条件变量适合“谓词在 mutex 保护下变化”的场景。bounded queue 的谓词不是 \code{notify}，而是 \code{size < capacity || closed} 和 \code{size > 0 || closed}。通知只是让等待者回来检查谓词。若谓词没有写完整，通知再多也只是碰运气。
+
+因此队列、线程池、completion queue、MessageBus 这类多字段对象，默认先用 \code{mutex + condition\_variable} 写清合同。等正确性、关闭和异常路径稳定后，再决定某个窄路径是否可以用 semaphore 或 atomic wait 特化。
+
+\topic{atomic wait 的正确位置}
+\code{std::atomic::wait} 适合围绕单个原子状态或版本号等待。例如配置快照发布可以用一个不可变 shared pointer 加一个版本号：写者构造新快照，发布指针，增加版本；读者发现版本未变化时等待。这里等待对象是“版本号变化”，不是一组复杂队列不变量。
+
+\begin{lstlisting}[numbers=none,caption={atomic wait 适合单状态版本等待}]
+reader:
+  old = version.load(acquire)
+  while (version.load(acquire) == old) {
+      version.wait(old)
+  }
+  snapshot = current.load(acquire)
+
+writer:
+  new_snapshot = build()
+  current.store(new_snapshot, release)
+  version.fetch_add(1, acq_rel)
+  version.notify_all()
+\end{lstlisting}
+
+反例是把线程池 idle 写成一个 atomic bool。线程池 idle 取决于 ready queue、running count、正在提交的任务、关闭状态和失败状态。把它压成一个 bool 后，等待者可能在任务刚被取出但未完成时提前返回。多字段不变量不能靠一个 atomic wait 自然变正确。
+
+\topic{eventfd 和 futex 的边界}
+\code{eventfd} 是 Linux 文件描述符形式的事件计数器，适合跨线程唤醒 epoll/io\_uring 所在的事件循环。worker 完成某个请求后，可以写 eventfd，让 I/O 线程从 epoll 返回并读取 completion queue。eventfd 传递的是“有事件发生”的计数，不是业务数据本身；业务 payload 应该放在受保护队列、ring 或 completion record 里。
+
+futex 更底层。它不是业务层应直接建模的“队列”或“锁语义”，而是用户态同步原语常用的内核等待接口：先检查用户态整数，只有仍等于 expected 才睡眠。理解 futex 是为了理解丢失唤醒、等待地址生命周期和竞争慢路径，不是鼓励把应用队列直接写成 futex 调用。
+
+\topic{错误选择案例库}
+下面这些错误比 API 拼写错误危险，因为它们经常通过小测试：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+错误选择 & 为什么错 & 正确方向 \\
+\midrule
+用 semaphore 当 mutex & 没有所有者、递归和对象不变量语义 & mutex 保护对象，semaphore 限制许可 \\
+CV wait 没有谓词 & notify 丢失或虚假唤醒后状态不成立 & 在锁下循环检查完整谓词 \\
+atomic wait 等多字段状态 & 一个原子值不能代表队列和 running 状态 & 先用 mutex 写状态机，再窄化热点 \\
+eventfd 存业务数据 & eventfd 只有计数，不保存 payload & eventfd 唤醒，队列保存 completion \\
+futex 地址被提前复用 & 内核等待队列按地址组织，不懂 C++ 生命周期 & 等待者退出后再销毁或复用对象 \\
+spin 等待长 I/O & 浪费 CPU，过度订阅下拖垮系统 & 阻塞等待或事件驱动 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{SyncPrimitiveDecision 报告}
+每个非平凡同步对象都应留下选择报告。报告不是文档负担，而是防止半年后团队只记得“这里用了 semaphore”，却忘了它表达的是资源许可还是状态谓词。
+
+\begin{lstlisting}[numbers=none,caption={SyncPrimitiveDecision}]
+SyncPrimitiveDecision:
+  protected_state:
+    fields
+    invariant
+  waited_predicate
+  permits_or_capacity
+  waiters:
+    producer
+    consumer
+    controller
+    event_loop
+  wake_source:
+    push
+    pop
+    close
+    cancel
+    completion
+  timeout_or_cancellation
+  shutdown_path
+  lifecycle_owner
+  metrics:
+    wait_count
+    wait_ns
+    wake_count
+    timeout_count
+    shutdown_ns
+  chosen_primitive
+  rejected_alternatives
+\end{lstlisting}
+
+写出 \code{rejected\_alternatives} 很有用。例如“没有选 semaphore，因为关闭时需要同时唤醒空等待和满等待，并保留 drain 语义”；“没有选 atomic wait，因为等待谓词跨 queue size 和 unfinished count”；“使用 eventfd 只是为了唤醒 epoll，completion 数据仍在队列中”。这些句子就是工程判断。
+
 \section{锁顺序、性能路径和工业现实}
 
 单个锁保护单个队列容易证明；多个锁组合后，死锁和尾延迟变得真实。死锁的必要条件包括互斥、持有并等待、不可抢占和循环等待。工程上最常见的破坏方式是规定锁顺序，或者把组合操作改成消息传递/两阶段提交，避免同时持有多把锁。
@@ -923,5 +1068,7 @@ max_size
   \item 设计 \code{QueueContract} 文档，分别填写 compute task queue、I/O byte queue、MessageBus queue 三种队列的容量、满队列、空队列、close、drain 和取消语义。
   \item 分析一个锁顺序死锁：线程 A 持有队列锁后等待指标锁，线程 B 持有指标锁后等待队列锁。给出锁顺序表和重构方案。
   \item 阅读 futex 或 pthread condition variable 的资料，解释为什么“修改状态”和“进入等待”必须配合，不能只靠一次 \code{notify}。
+  \item 为连接池、bounded queue、配置快照发布、epoll completion loop 各写一份 \code{SyncPrimitiveDecision}，明确什么时候用 semaphore、condition variable、atomic wait 和 eventfd。
+  \item 构造一个错误版本：用 semaphore 替代队列 mutex，并在 close/drain 路径中复现生命周期或许可泄漏问题。说明 semaphore 只能表达许可，不能保护多字段不变量。
 \end{enumerate}
 \end{exercisebox}

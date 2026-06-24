@@ -1988,6 +1988,103 @@ Access to performance monitoring and observability operations is limited.
 
 这时报告不能编造 cycles、instructions 或 cache miss。正确降级是保存 \code{readelf}/\code{objdump}、输入 checksum、阶段时间、循环次数、机器信息和源码版本；结论也要写窄：可以说“反汇编显示热循环确实调用了目标函数”，不能说“IPC 证明瓶颈在前端”。经典系统教材强调证据边界，原因就在这里。
 
+\section{编译器和运行时深水区：从规则到事故}
+
+第一册如果只讲“源码变成汇编”，仍然不够。真实系统事故经常发生在更深的连接处：C++ 抽象机给优化器提供了什么前提；IR 如何保存别名、异常和副作用；ELF 元数据如何影响加载、符号解析和回溯；运行时库、分配器、线程库和内核边界如何改变一次请求的成本。本节把这些深水区压成一张地图，后续章节和实验可以逐项展开。
+
+\subsection{优化器深水区：不是所有源码事实都会留到机器码}
+
+优化器做任何改写，都依赖某种可证明事实。问题在于，很多事实不是程序员的直觉，而是 C++ 标准、编译器 IR 和目标平台共同给出的合同。下面的表把常见深水区和证据层对齐：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+深水区 & 优化器可能利用的前提 & 应保留的证据 \\
+\midrule
+signed overflow & 合法 C++ 程序不会让有符号整数溢出 & UBSan、优化 IR、\code{-O0/-O3} 汇编对照 \\
+strict aliasing & 不相容类型的对象通常不会互相别名 & 源码类型、IR alias metadata、错误强转反例 \\
+object lifetime & 只有 alive object 可以按其类型访问 & placement new、\code{std::launder}、ASan/UBSan 报告 \\
+escape analysis & 未逃逸对象可放入寄存器或消除分配 & IR alloc 消除前后、反汇编、分配计数 \\
+exception edge & 可能抛异常的表达式限制移动和删除 & landing pad、unwind table、优化 remark \\
+atomic/volatile & 可观察副作用限制重排和删除 & IR memory order、反汇编、线程测试 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如一个越界访问在 Debug 下似乎只读到相邻内存，Release 下却把整个分支删掉；这不应该先解释成“编译器 bug”。正确路径是：确认源码是否有未定义行为，打开 sanitizer，查看优化前后 IR，再看汇编是否基于“合法程序不会走到这里”的前提改写。只有这条链闭合，才有资格讨论编译器是否违反语义。
+
+\begin{lstlisting}[numbers=none,caption={优化器证据包的最小命令}]
+clang++ -O0 -g -fsanitize=address,undefined bug.cpp -o bug_asan
+clang++ -O3 -S -emit-llvm bug.cpp -o bug_O3.ll
+clang++ -O3 -S -masm=intel bug.cpp -o bug_O3.s
+clang++ -O3 -Rpass=loop-vectorize bug.cpp -c -o bug.o
+objdump -drwC -Mintel bug.o
+\end{lstlisting}
+
+报告中要把“语言错误”“优化事实”和“机器路径”分开写。Sanitizer 抓到越界，只能证明程序违反合同；IR 说明优化器看到什么；反汇编说明最终执行什么。把三者混成一句“Release 崩了”没有工程价值。
+
+\subsection{运行时深水区：main 之外还有很多状态机}
+
+运行时不是一个模糊词。它包含动态链接器、C/C++ 运行时、异常运行时、分配器、线程库、系统调用包装、vDSO、信号处理和内核对象。它们共同决定程序进入 \code{main} 前、热路径外和故障路径上的行为。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+运行时边界 & 它负责什么 & 典型误判 \\
+\midrule
+dynamic linker & 映射共享库、处理重定位、符号绑定 & 把首次 lazy binding 算成 kernel 时间 \\
+TLS runtime & 为每个线程准备线程局部存储 & 把 TLS 访问当普通全局 load \\
+exception runtime & 查找 handler、执行析构、栈展开 & 崩溃栈缺失时只怪 GDB \\
+allocator & 管理 heap、arena、mmap、缓存和回收 & 把分配器锁竞争误判为算法慢 \\
+pthread runtime & 创建线程、阻塞、唤醒、join、TLS 清理 & 把线程启动成本混进 steady state \\
+syscall/vDSO & 跨内核边界或走用户态快捷页 & 把 \code{clock_gettime} 成本当普通函数调用 \\
+signal/page fault & 异步控制流、缺页和权限异常 & 把偶发 p99 都归咎于 C++ 代码 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这些边界会直接影响后两册。第二册讨论线程池和同步时，\code{pthread}、futex、调度和 TLS 析构都是运行时账本；第三册讨论模型服务时，权重 \code{mmap}、首次触页、allocator arena、线程池启动、backend context 和 tokenizer 初始化都会进入 TTFT。若报告只写 \code{main} 里的函数耗时，就无法解释生产中的冷启动和尾延迟。
+
+\subsection{深水区报告字段}
+
+遇到 Release-only 崩溃、冷启动慢、第一次请求慢、栈回溯断裂、函数在符号表中消失、benchmark 数字异常时，报告至少应包含下面字段：
+
+\begin{lstlisting}[numbers=none,caption={CompilerRuntimeDeepReport}]
+CompilerRuntimeDeepReport:
+  source_commit
+  compiler_and_flags
+  sanitizer_result
+  optimization_ir_or_remark
+  object_symbols_and_relocations
+  final_binary_headers
+  dynamic_linking_mode
+  startup_state:
+    loader
+    relocations
+    init_array
+    tls
+  runtime_state:
+    allocator
+    thread_count
+    syscall_or_vdso_path
+    page_fault_count
+  machine_evidence:
+    objdump
+    maps
+    backtrace_or_unwind
+    timing_scope
+\end{lstlisting}
+
+这份报告不是为了繁琐，而是为了避免错误层级。若符号在目标文件中存在、链接后被内联消失，这是编译/链接问题；若二进制正确但运行时加载了旧共享库，这是部署问题；若 warmup 后速度正常但首个请求慢，这是加载、触页或初始化问题；若 sanitizer 失败，先修定义性问题，再谈性能。
+
+\subsection{最小验收：一个问题至少跨三层证明}
+
+本册后续每次解释一个底层问题，至少要跨三层。解释优化，必须有 C++ 规则、IR 或优化 remark、反汇编；解释链接，必须有符号、重定位、最终 ELF；解释运行时，必须有 \code{/proc/<pid>/maps}、动态库或 syscall/page fault 证据；解释崩溃，必须有寄存器、地址、对象生命周期和符号化栈。
+
+这样做会让章节变厚，但厚度来自必要证据。大师级系统教材不满足于“知道一个概念”，而是训练读者在源码、二进制、运行时和机器状态之间来回闭合。
+
 \section{反例：看似合理但错误的理解}
 
 \begin{warningbox}

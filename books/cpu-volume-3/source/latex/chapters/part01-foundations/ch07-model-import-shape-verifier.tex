@@ -500,6 +500,114 @@ model-import-report/
 
 \filepath{unsupported-features.txt} 很重要。若当前只支持 fp16 safetensors，不支持 GGUF q4；只支持独立 Q/K/V，不支持 packed QKV；只支持基础 RoPE，不支持某种 scaling；都应该明确写出来。生产级工程不是永远支持一切，而是知道自己支持什么、拒绝什么、如何诊断。
 
+\subsection{真实 LLM 工业链条：从资产到第一条 token trace}
+
+第三册不能只停在“manifest 应该有什么”。真实 LLM 工业链条至少跨过 tokenizer、权重格式、metadata、mmap、shape verifier、graph import、memory plan、backend plan、KV cache 和 sampler。任何一环靠猜，后面的 kernel 再快也只是把错误更快地扩散。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.21\linewidth}p{0.33\linewidth}p{0.30\linewidth}}
+\toprule
+链条阶段 & 必须建立的事实 & 典型工业格式或系统 \\
+\midrule
+asset discovery & 文件集合、分片、checksum、版本 & safetensors index、GGUF metadata \\
+tokenizer import & vocab、normalizer、special token、byte fallback & tokenizer.json、SentencePiece、GGUF tokenizer \\
+tensor index & name、offset、bytes、dtype、shape、checksum & safetensors header、GGUF tensor table \\
+schema resolution & 外部名字映射到 canonical role & Llama/Mistral/Qwen 等方言 \\
+quant descriptor & group size、scale、zero point、packing order & GGUF q4/q5/q8、GPTQ/AWQ 产物 \\
+typed graph & 每个 op 的 shape/dtype/layout/state edge & 本书 Graph IR、ONNX/MLIR 类系统 \\
+memory plan & activation、workspace、KV、packed cache & arena、mmap、device buffer \\
+backend plan & CPU/GPU kernel、ISA、fallback、packing & ggml/llama.cpp、oneDNN、TensorRT-LLM \\
+first token trace & 每层 checkpoint、logits、top-k、sampler & oracle CSV、profiler event \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表给了工程边界。safetensors 的优势是头部记录 tensor 名、dtype、shape 和 data offsets，适合安全地 mmap 和校验范围；GGUF 的优势是把模型 metadata、tokenizer、量化格式和 tensor table 放在一个文件里，适合本地推理分发。无论选择哪一种，本引擎内部都不应该让后端直接依赖外部文件格式。外部格式先转换成 manifest 和 tensor descriptor，后端只消费已验证合同。
+
+\subsection{工业导入的负载顺序}
+
+真实导入流程应按“先轻后重”组织，避免读了几十 GB 权重后才发现 tokenizer 或 shape 不匹配。
+
+\begin{lstlisting}[numbers=none,caption={真实模型导入的推荐顺序}]
+1. read small metadata:
+   config, tokenizer metadata, tensor index, quant metadata
+
+2. verify global contracts:
+   vocab_size, hidden_size, layers, heads, kv_heads,
+   head_dim, rope config, max_context, tied weights
+
+3. verify tensor table:
+   names, canonical roles, offsets, byte ranges,
+   dtype, shape, quant scale ranges, checksums
+
+4. build typed graph:
+   op nodes, tensor descriptors, state edges,
+   tokenizer contract, generation contract
+
+5. build memory and backend plan:
+   mmap views, packed weight cache, KV cache budget,
+   CPU/GPU kernel selection, fallback rules
+
+6. run first-token trace:
+   tokenizer ids, embedding, each decoder checkpoint,
+   logits checksum, top-k, sampled token
+\end{lstlisting}
+
+这个顺序的关键是：metadata 和 tensor index 先闭合，权重字节后进入热路径。若 \code{lm\_head} 和 tokenizer vocab 不一致，应在读取 tensor table 时拒绝；若 RoPE scaling metadata 缺失，应在 graph import 时拒绝；若 q4 scale 数量不对，应在 quant descriptor 验证时拒绝；不能等到 AVX2 kernel 读错 scale 后才崩。
+
+\subsection{GGUF 和 safetensors 的导入差异}
+
+两类格式的工程取舍不同。safetensors 更像“安全 tensor 容器”：它强调 header、shape、dtype 和 data offsets，不执行任意代码，适合 HuggingFace 生态权重分片。GGUF 更像“本地推理包”：它把模型 metadata、tokenizer、量化类型和 tensor table 一起打包，适合 llama.cpp/ggml 风格的本地加载。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.33\linewidth}p{0.33\linewidth}}
+\toprule
+维度 & safetensors & GGUF \\
+\midrule
+metadata & 通常还要结合 config/tokenizer 文件 & 文件内包含大量模型和 tokenizer metadata \\
+tensor table & header 中有 name/shape/dtype/offset & header 和 tensor info 记录 name/type/offset \\
+量化 & 常见 fp16/bf16 或外部量化产物 & 内建多种 ggml quant type \\
+tokenizer & 通常来自 tokenizer.json 或 tokenizer.model & 可随文件存储 tokenizer 字段 \\
+mmap & 可按 data offsets 建 view & 可按 tensor offset 建 view，但需处理 alignment \\
+主要风险 & 多文件版本不一致、tokenizer/config 漂移 & 量化类型解释、metadata 兼容、版本差异 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+本书项目可以先支持一种格式，但报告必须写明支持边界。只支持 safetensors fp16，并不丢人；声称支持 GGUF 却不解释 q4 block layout、scale 元数据和 tokenizer 字段，才是危险。工业链条的第一原则是可拒绝、可诊断、可复现。
+
+\subsection{第一条 token trace 是导入闭环的验收}
+
+导入成功不能只看“模型文件打开了”。最小验收是一条固定 prompt 的 first-token trace。它应该记录从 prompt 到 sampled token 的每个关键边界：
+
+\begin{lstlisting}[numbers=none,caption={first-token trace 的核心字段}]
+FirstTokenTrace:
+  model_asset_id
+  tokenizer_id
+  prompt_text
+  token_ids
+  graph_digest
+  memory_plan_digest
+  backend_plan_id
+  checkpoints:
+    embedding_checksum
+    layer0_rmsnorm_checksum
+    layer0_qkv_checksum
+    layer0_rope_checksum
+    layer0_attention_checksum
+    layer0_mlp_checksum
+    final_logits_checksum
+  topk:
+    ids
+    values
+  sampled_token
+  tolerance_profile
+\end{lstlisting}
+
+这条 trace 同时服务正确性和求职作品集。它能证明 tokenizer、模型 metadata、张量 shape、layout、KV state、后端计划和 sampler 确实连上了。若以后换量化格式、换 packed layout 或换 GPU backend，trace 能指出漂移从哪一层开始。
+
 \subsection{本节验收线}
 
 读完本节，应该能说明 AI 编译器前端在本地推理引擎中的职责：
@@ -514,6 +622,7 @@ model-import-report/
   \item 真实模型导入要产出 manifest、tensor index、tokenizer golden、typed graph 和 first-token trace。
   \item mmap 权重视图、packed weight cache 和 device buffer 要有明确所有权状态。
   \item 负例包要证明错误停在前端，而不是落到后端 kernel 或 sampler 才暴露。
+  \item 真实 LLM 工业链条要从外部资产导入到 first-token trace，而不是只加载一个二进制权重数组。
 \end{itemize}
 
 下一步进入 runtime 和 memory planner 时，这些前端产物会成为所有优化的前提：只有 typed graph 的边界稳定，内存生命周期、kernel selection 和 CPU/GPU 后端计划才有可信输入。

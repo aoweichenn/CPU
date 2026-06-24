@@ -237,6 +237,164 @@ CiFailure:
 
 这样开发者能直接知道问题属于哪层合同。若 byte oracle 失败，先查 nibble order、scale 和 tail；若 layer oracle 失败，查 fusion、arena 和状态边；若 L3 benchmark 回归，先看硬件、热身、频率、prompt set 和 profiler breakdown。CI 的作用不是制造红叉，而是把问题定位到正确工程层。
 
+\subsection{fuzz、sanitizer、CI 和性能回归系统}
+
+AI infra 项目不能只靠几个 golden case。Golden case 证明固定路径能跑；fuzz 负责攻击输入空间；sanitizer 负责抓 C++ 未定义行为和并发错误；CI 负责把这些检查分层执行；性能回归系统负责防止优化被后续改动悄悄吃掉。这四者合起来，才是长期维护的工程底座。
+
+\subsubsection{fuzz 分层：攻击 descriptor、shape、state 和 scheduler}
+
+Fuzz 不是随机喂一堆字节给整个模型。更有效的做法是按合同分层，让每个 fuzz target 都有清楚 oracle 和拒绝边界。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.36\linewidth}p{0.24\linewidth}}
+\toprule
+fuzz 层 & 生成或扰动什么 & 必须证明什么 \\
+\midrule
+manifest fuzz & config 字段、tensor 名、offset、bytes、checksum & verifier 拒绝坏资产，不越界读 \\
+shape/stride fuzz & rank、shape、stride、layout、broadcast & 地址公式不溢出，错误诊断稳定 \\
+quant fuzz & group size、scale 数量、zero point、packing tail & converter 不越界，oracle 能定位字节错误 \\
+tokenizer fuzz & 特殊 token、空 prompt、非法 UTF-8、长 prompt & token ids 不越界，context policy 明确 \\
+KV fuzz & position、slot、page table、prefix、sliding window & 逻辑位置和物理 slot 不串扰 \\
+sampler fuzz & NaN、Inf、极端 logits、top-k/top-p 边界 & 数值稳定，拒绝非法概率 \\
+scheduler fuzz & admission、cancel、timeout、late completion & session 状态可回收，不双释放 KV \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+每个 fuzz target 都要避免两个极端：一是只生成合法输入，永远碰不到拒绝路径；二是生成完全无结构的垃圾，让 verifier 只在第一层失败。好的 fuzz 会生成“接近合法”的坏输入，例如 tensor byte range 只差一个 block、q4 scale 少一组、KV slot 合法但 position 复用、tokenizer vocab 与 embedding 差一个特殊 token。这类输入最接近真实转换器和服务系统事故。
+
+\begin{lstlisting}[numbers=none,caption={fuzz target 的报告字段}]
+FuzzCaseReport:
+  target: manifest | tensor | quant | tokenizer | kv | sampler | scheduler
+  seed
+  input_digest
+  expected_result: accept | reject | bounded_error
+  earliest_contract
+  sanitizer_enabled
+  minimized_artifact
+  reproduction_command
+\end{lstlisting}
+
+Fuzz 失败后，最小化 artifact 必须保存。若一个 30 KB manifest 触发越界，最终报告应尽量保留一个更小的 manifest 片段，能稳定复现同一错误。没有 seed、输入摘要和复现命令，fuzz 只会制造一次性噪声。
+
+\subsubsection{sanitizer 矩阵：正确性工具不是性能工具}
+
+Sanitizer 构建必须进入常规验收，但不能拿 sanitizer 下的耗时做性能结论。它们会插入检查代码、改变内存布局和线程调度。正确做法是把 sanitizer 作为 correctness lane。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.16\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+工具 & 能抓什么 & 不能声称什么 \\
+\midrule
+ASan & 越界、use-after-free、栈/堆红区错误 & Release 内存布局和性能 \\
+UBSan & signed overflow、非法 shift、对齐、枚举等 UB & 程序没有所有逻辑错误 \\
+TSan & 数据竞争、部分同步错误 & 无锁结构性能或实时行为 \\
+MSan & 未初始化数据传播 & 所有平台都易部署 \\
+LSan & 泄漏和未释放对象 & 资源生命周期业务语义全正确 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+AI runtime 特别要跑 ASan/UBSan：packed int4 tail、SIMD load 边界、arena reuse、mmap view、scale metadata、KV cache page table 都容易出现越界或对齐问题。TSan 要用于 scheduler、session、cancel、completion queue、metrics 聚合和 lazy initialization。TSan 变慢很正常，不能据此评价 runtime 吞吐。
+
+\subsubsection{CI lanes：把检查按成本和风险分层}
+
+CI 不是一条命令，而是一组 lane。每条 lane 回答不同问题：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+lane & 触发 & 内容 \\
+\midrule
+quick & 每次 push/PR & configure、build、unit、tiny golden、descriptor 负例 \\
+sanitizer & PR 或 nightly & ASan+UBSan、TSan、关键 fuzz seed 回放 \\
+fuzz smoke & PR 或 nightly & 每个 target 固定 seed + 短时间随机探索 \\
+benchmark smoke & 受控机器或手动 & tiny model、小矩阵、稳定输入的性能冒烟 \\
+nightly & 夜间 & shape sweep、长 context、scheduler cancel、覆盖率 \\
+manual evidence & 发布前 & perf stat、objdump、火焰图、框架对标 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个压缩的 workflow 可以这样组织。真实仓库可以按机器和权限拆得更细：
+
+\begin{lstlisting}[numbers=none,caption={CI workflow 形态草图}]
+jobs:
+  quick:
+    cmake -S books/cpu-volume-3 -B build/lcqi-ci
+    cmake --build build/lcqi-ci
+    ctest --test-dir build/lcqi-ci --output-on-failure
+
+  sanitizer:
+    cmake -S books/cpu-volume-3 -B build/lcqi-asan \
+      -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined"
+    cmake --build build/lcqi-asan
+    ctest --test-dir build/lcqi-asan --output-on-failure
+
+  fuzz_smoke:
+    run fixed seeds for manifest, tensor, quant, kv, sampler
+
+  benchmark_smoke:
+    run tiny decoder benchmark and compare with same-host baseline
+\end{lstlisting}
+
+CI 中最容易犯的错误是把不稳定性能数字放进普通共享 runner。性能门禁需要固定机器、频率策略、亲和、输入和历史 baseline；普通 CI 只能跑 benchmark smoke，证明命令还能跑、schema 还稳定，不能证明性能没有 3\% 回归。
+
+\subsubsection{性能回归系统：只能和同一硬件身份比较}
+
+性能回归要固定坐标。不同 CPU、不同内核、不同频率策略、不同容器限制、不同 NUMA 绑定之间的数字不能直接作为门禁。最小 baseline key 应包含：
+
+\begin{lstlisting}[numbers=none,caption={性能 baseline key}]
+PerfBaselineKey:
+  hardware_id
+  cpu_model
+  microcode_or_kernel
+  compiler_id
+  backend_plan_id
+  model_fixture_id
+  quant_profile_id
+  prompt_set_id
+  thread_count
+  affinity_policy
+  context_bucket
+\end{lstlisting}
+
+报告不能只保存平均值。至少保存 raw samples、median、p95、min/max、warmup 次数和异常样本说明。门禁可以采用保守规则：
+
+\begin{lstlisting}[numbers=none,caption={性能回归判定规则示例}]
+fail if same_host and:
+  median_latency > baseline_median * 1.10
+  and p95_latency > baseline_p95 * 1.15
+  and two consecutive runs reproduce the regression
+
+warn if:
+  peak_memory > baseline_peak * 1.20
+  or fallback_count increases
+  or pack_time increases while decode improvement is absent
+\end{lstlisting}
+
+这个规则故意要求同一 host 和连续复现，避免一次噪声让 CI 误杀。反过来，若 fallback count 增加，即使 latency 暂时没变，也应该警告，因为某些输入或机器会放大问题。性能门禁的价值不是把数字变成迷信，而是让退化有固定入口。
+
+\subsubsection{最小仓库 artifact}
+
+书稿中讲验收体系，仓库里也应该有对应 artifact。最小集合可以是：
+
+\begin{lstlisting}[numbers=none,caption={验收体系最小 artifact}]
+.github/workflows/cpu-books-lcqi.yml
+tests/fuzz/manifest_fuzz.cpp
+tests/fuzz/tensor_descriptor_fuzz.cpp
+tests/fuzz/kv_cache_fuzz.cpp
+sanitizer-presets.json
+scripts/bench_regression.py
+results/perf-baselines/<hardware-id>.json
+reports/release-gate/<version>.md
+\end{lstlisting}
+
+这些 artifact 的目标不是一次性做全，而是固定扩展方向。新增 tokenizer、quant format、memory planner pass、CPU kernel、GPU backend 或 serving scheduler 时，都要接入相同的 fuzz seed、sanitizer lane 和性能 baseline 系统。没有统一入口，后续每个优化都会重新发明一套报告，最后无法比较。
+
 \subsection{性能门禁：基线、阈值和报告要稳定}
 
 性能回归比功能回归更难测，因为机器负载、频率、温度和系统噪声都会影响数字。工程上不能用单次最好成绩做门禁，而要固定环境、固定输入、固定 warmup 和迭代，并报告分位数。
@@ -610,6 +768,6 @@ books/cpu-volume-3/build/lcqi-release/labs/linux_cpu_inference/lcqi_serving_prob
   > books/cpu-volume-3/results/lcqi-serving-slo-probe-2026-06-24.csv
 \end{lstlisting}
 
-这还没有覆盖 fuzz、sanitizer、perf stat、火焰图和工业框架完整对标；但它把第三册从“知道要验收什么”推进到“仓库里已经有最小验收证据”。下一步任何新增 kernel、memory planner 或 serving runtime，都应该把输出接到这三个口径，而不是重新发明报告格式。
+这三个 artifact 是最小验收入口；本章进一步规定 fuzz、sanitizer、CI lane、性能回归、perf stat、火焰图和工业框架对标要接到同一套 release gate。下一步任何新增 kernel、memory planner 或 serving runtime，都应该把输出接到这些口径，而不是重新发明报告格式。
 
 至此，第六章形成闭环：CPU 和 GPU 后端不是孤立优化技巧，而是以 C++20 资源边界为基础，以编译器 lowering 为入口，以 oracle/profiler/回归门禁为出口的工程系统。
