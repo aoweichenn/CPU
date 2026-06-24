@@ -601,6 +601,25 @@ void ThreadPoolState::finish_task() {
 
 信号量表达“还有多少许可”。它适合连接池、I/O in-flight 限额、同时写文件数量、令牌桶、空槽/元素数量等资源计数。Mutex 保护复杂状态关系，semaphore 控制有多少个并发使用权。拿到许可后，线程仍可能需要 mutex 修改共享队列；释放许可时，还要保证失败和取消路径归还资源。
 
+\topic{先分清四种 semaphore}
+工程里说“信号量”时，至少可能指四件不同的东西：抽象计数信号量、二值信号量、POSIX \code{sem\_t} 或 C++20 \code{std::counting\_semaphore}。它们共享“许可计数”这个核心模型，但生命周期、进程边界、API 错误处理、取消/信号语义和调试方式不同。把这四者混在一起，会让读者误以为“会 \code{acquire/release} 就掌握了 semaphore”。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.24\linewidth}p{0.25\linewidth}p{0.21\linewidth}}
+\toprule
+类型 & 核心状态 & 典型接口 & 适合场景 \\
+\midrule
+计数信号量 & \code{permits >= 0} & \code{acquire/release(n)} & 连接池、I/O in-flight、容量预算 \\
+二值信号量 & \code{permits} 为 0 或 1 & \code{acquire/release} & 一次事件许可、单个后台阶段完成 \\
+POSIX semaphore & \code{sem\_t} 或 named semaphore & \code{sem\_wait/sem\_post} & C/POSIX 代码、跨进程共享许可 \\
+C++20 semaphore & 模板化标准库对象 & \code{acquire/try\_acquire/release} & C++ 线程内资源预算和 RAII 封装 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表不是 API 速查，而是状态边界。计数信号量和二值信号量是语义模型；POSIX 和 C++20 是具体接口族。具体接口不能改变底层事实：semaphore 只保存许可，不保存业务对象、不保存关闭原因、不保存 payload，也不证明等待者的生命周期。
+
 \topic{计数信号量的形式化状态}
 计数信号量的核心状态可以抽象成一个非负整数 \code{permits} 和一组等待者。构造时给定初始许可数；\code{acquire} 尝试消耗一个许可；\code{release} 增加一个或多个许可，并使等待者有机会继续。这个整数不是业务对象数量，而是预算。连接池里许可数可以等于“最多允许借出多少连接”，但真实连接对象还在 free list、closing list 或 broken list 中；I/O 系统里许可数可以等于“最多允许多少个请求同时提交”，但请求 buffer、completion record 和错误状态仍在其他结构里。
 
@@ -649,8 +668,140 @@ borrow connection:
 
 这段账本能解释两个常见 bug。第一，拿到许可后发现系统关闭，必须释放许可；否则许可泄漏，所有后来者最终睡眠。第二，从 free list 取出对象失败时，不能假装许可就是对象；许可只是预算，真正的对象状态仍要在 mutex 下检查。很多 semaphore 事故不是 \code{acquire/release} API 用错，而是没有分清两个线性化点。
 
-\topic{C++20 中的边界：没有 close，也没有 ownership}
-\code{std::counting_semaphore} 和 \code{std::binary_semaphore} 是 C++20 的轻量同步原语。它们支持 \code{acquire}、\code{try_acquire}、带超时的尝试获取以及 \code{release}。它们不绑定线程所有者：一个线程可以 \code{acquire}，另一个线程可以 \code{release}。这与 mutex 完全不同。Mutex 表达的是“这个线程进入临界区并负责退出”；semaphore 表达的是“系统预算增加或减少一份”。因此用 binary semaphore 当 mutex，通常会丢掉所有权、调试和不变量语义。
+\topic{计数信号量：资源预算的正确用法}
+计数信号量最自然的用法是把外部资源转成一个明确预算。例如最多 64 个请求进入压缩阶段，最多 8 个文件同时执行 \code{fsync}，最多 16 个连接被借出。预算耗尽时，调用方要么等待，要么超时，要么拒绝请求。这个选择由业务 SLO 决定，不由 semaphore 自动决定。
+
+\begin{lstlisting}[numbers=none,caption={计数信号量的资源预算账本}]
+resource budget:
+  capacity = 64
+  permits = 64 - in_flight
+
+request enters expensive stage:
+  if try_acquire succeeds:
+      in_flight += 1 logically
+      run stage
+      release exactly once
+  else:
+      wait, timeout, reject, or shed load according to SLO
+\end{lstlisting}
+
+计数信号量的核心审查问题是“许可守恒”。如果系统没有关闭、取消和超时，长期运行后应满足：
+
+\begin{lstlisting}[numbers=none,caption={许可守恒检查}]
+initial_permits + release_count - acquire_success_count == current_permits
+logical_in_flight == acquire_success_count - release_count
+0 <= logical_in_flight <= capacity
+\end{lstlisting}
+
+真实实现不一定能直接读取准确的 \code{current\_permits}，但可以在业务层维护调试计数。若 \code{logical\_in\_flight} 长期低于容量而请求仍卡在 \code{acquire}，优先怀疑许可泄漏、等待者被旧对象挂住、或异常路径没有归还许可。
+
+\topic{二值信号量：一次许可，不是 mutex}
+\code{std::binary_semaphore} 可以看成最大计数为 1 的计数信号量。它适合表达“一个事件许可”或“最多一个后台阶段运行”。例如主线程启动后台 warmup，后台线程完成后 \code{release}，主线程 \code{acquire} 等待一次完成。这种场景中，release 的线程和 acquire 的线程本来就不是同一个线程，二值信号量的无所有者语义正好合适。
+
+\begin{lstlisting}[numbers=none,caption={binary semaphore 适合一次完成信号}]
+initial:
+  ready = binary_semaphore(0)
+
+background:
+  build immutable table
+  publish table pointer
+  ready.release()
+
+foreground:
+  ready.acquire()
+  read published table
+\end{lstlisting}
+
+反过来，用二值信号量保护 \code{vector}、map、队列或线程池状态，通常是坏设计。Mutex 的关键语义是所有者和临界区：同一线程 lock，完成受保护状态转换，再 unlock。二值信号量没有 owner，不阻止另一个线程 release；工具也更难判断谁持有临界区。若代码需要保护多字段不变量，默认用 mutex；若代码只需要一次事件许可，二值信号量才合适。
+
+\begin{lstlisting}[numbers=none,caption={binary semaphore 和 mutex 的边界}]
+binary semaphore:
+  no owner
+  release may happen on a different thread
+  good for event permit or single in-flight budget
+
+mutex:
+  owner enters and leaves critical section
+  protects object invariant while fields temporarily disagree
+  better for containers, queues, pools, and runtime state
+\end{lstlisting}
+
+\topic{POSIX semaphore：C 接口、进程边界和信号中断}
+POSIX semaphore 是 C/POSIX 世界里的具体接口族，常见对象是 \code{sem\_t}。未命名 semaphore 通常由 \code{sem\_init} 初始化，由 \code{sem\_destroy} 销毁；命名 semaphore 通过 \code{sem\_open} 获取，通过 \code{sem\_close} 关闭句柄，通过 \code{sem\_unlink} 删除名字。它比 C++20 semaphore 更靠近操作系统边界，也因此有更多系统级错误条件。
+
+\begin{lstlisting}[numbers=none,caption={POSIX unnamed semaphore 的基本形态}]
+sem_t sem;
+
+sem_init(&sem, pshared, initial_value);
+
+producer or releaser:
+  sem_post(&sem);
+
+consumer or acquirer:
+  while sem_wait(&sem) == -1:
+      if errno == EINTR:
+          continue or handle cancellation policy
+      else:
+          report fatal synchronization error
+
+shutdown:
+  prove no waiter can still use sem
+  sem_destroy(&sem);
+\end{lstlisting}
+
+\code{pshared} 为 0 时，semaphore 用于同一进程内线程；非 0 时，semaphore 必须放在可被多个进程共享的内存中，用于进程间同步。这个边界很重要：把进程共享 semaphore 放在普通进程私有堆内存里，不能让另一个进程看到同一个对象。命名 semaphore 则通过系统名字定位，适合不方便共享内存中放置 \code{sem\_t} 的场景，但也引入名字清理、权限和崩溃后残留的问题。
+
+POSIX \code{sem\_wait} 可能因为 signal 返回 \code{-1} 并设置 \code{errno = EINTR}。这与 C++20 \code{acquire} 不同；C++20 接口不会把 EINTR 暴露给业务。POSIX 代码必须显式决定：收到 signal 后继续等待、返回取消、还是进入关闭路径。另一个常见错误是用 \code{sem\_getvalue} 做并发决策。它最多适合诊断，不适合作为“如果值大于 0 就一定能继续”的正确性依据，因为读取后状态可能立刻被其他线程改变。
+
+\begin{lstlisting}[numbers=none,caption={POSIX semaphore 的工程边界}]
+must handle:
+  sem_wait may return EINTR
+  sem_trywait may return EAGAIN when no permit exists
+  sem_timedwait needs a timeout policy
+  sem_destroy requires no thread can still wait or post
+  process-shared sem_t must live in shared memory
+  named semaphore needs close/unlink lifecycle
+\end{lstlisting}
+
+\topic{C++20 counting\_semaphore：标准库接口和限制}
+\code{std::counting_semaphore<LeastMaxValue>} 是 C++20 对计数信号量的标准化封装。\code{LeastMaxValue} 是实现必须至少支持的最大计数下界，不应被误读成“这个对象运行时一定只允许这么多业务资源”。构造函数给出初始计数；\code{release(update)} 增加许可；\code{acquire} 阻塞直到成功消耗许可；\code{try_acquire} 尝试获取；\code{try_acquire_for} 和 \code{try_acquire_until} 提供超时等待。\code{std::binary_semaphore} 是 \code{std::counting_semaphore<1>} 的别名。
+
+\begin{lstlisting}[language=C++,caption={C++20 counting\_semaphore 的最小接口形状}]
+class InFlightLimit {
+public:
+  explicit InFlightLimit(std::ptrdiff_t initial)
+      : permits_(initial) {}
+
+  bool try_enter() {
+    return this->permits_.try_acquire();
+  }
+
+  void leave() {
+    this->permits_.release();
+  }
+
+private:
+  std::counting_semaphore<1024> permits_;
+};
+\end{lstlisting}
+
+C++20 semaphore 对象不可复制，通常也不应被随意移动进容器；它的地址和生命周期应稳定。标准没有给它业务关闭语义，也不承诺严格 FIFO 公平。若要支持取消、关闭、超时错误码和 drain，必须在外层状态机实现。还要注意 \code{try_acquire} 允许失败，业务代码不能把一次失败解释成永久无资源；带超时接口也必须记录 timeout 是正常背压、用户取消还是系统关闭。
+
+\begin{lstlisting}[numbers=none,caption={C++20 semaphore 审查清单}]
+C++20 counting_semaphore checklist:
+  initial count matches resource budget
+  every successful acquire has exactly one release
+  timeout path records whether work was accepted
+  close/cancel state is stored outside the semaphore
+  object outlives all waiting and releasing threads
+  code does not depend on FIFO fairness
+  try_acquire failure is not treated as a correctness proof
+\end{lstlisting}
+
+从内存可见性看，semaphore 也不能替代对象协议。一个线程在 release 前写入某个对象，另一个线程 acquire 后读取该对象，通常可以建立生产者到消费者的同步边界；但对象本身的所有权、生命周期和别名仍要由外层合同证明。不要因为用了 semaphore，就在没有互斥或单所有权协议的情况下并发修改同一个容器。
+
+\topic{C++20 中的共同边界：没有 close，也没有 ownership}
+\code{std::counting_semaphore} 和 \code{std::binary_semaphore} 都不绑定线程所有者：一个线程可以 \code{acquire}，另一个线程可以 \code{release}。这与 mutex 完全不同。Mutex 表达的是“这个线程进入临界区并负责退出”；semaphore 表达的是“系统预算增加或减少一份”。因此用 binary semaphore 当 mutex，通常会丢掉所有权、调试和不变量语义。
 
 \begin{center}
 \small
@@ -764,9 +915,7 @@ why bad:
 这不是说 semaphore 不能用于队列，而是说关闭协议要显式设计。常见选择有三种。第一，队列核心仍用 \code{mutex + condition_variable}，把 semaphore 只用于外层 in-flight 限额。第二，使用支持停止令牌或超时的获取路径，等待者周期性检查 \code{closed}，但要接受超时轮询成本和复杂性。第三，向队列插入结束哨兵，但这要求元素类型和消费者数量能承载该协议，且必须证明哨兵不会与业务数据混淆。对通用线程池队列，默认选择仍应是 CV，因为 close/drain/cancel 是业务谓词，不是资源额度。
 
 \topic{二值信号量、mutex 和 latch 不要混用}
-\code{std::binary_semaphore} 的计数上限是 1，看起来像 mutex，但语义不同。它没有 owner，不要求同一线程 release；它可以表达“一次事件许可”或“一个外部完成信号”，但不适合保护对象不变量。Mutex 的 unlock 必须由持有它的线程执行，且工具、调试器和静态审查都围绕这个所有权语义工作。把对象保护改成 binary semaphore，会让“谁持有临界区”变模糊。
-
-二值信号量也不是 latch。Latch 是一次性倒计数，计数归零后所有等待者通过，不能重新关闭；binary semaphore 可以反复 acquire/release，表达可重复许可。若要等 N 个 worker 初始化完成，用 latch；若要限制最多一个后台 flush in-flight，用 binary semaphore 或普通 mutex，取决于是否需要 owner 和对象不变量。
+二值信号量、mutex 和 latch 都可能让线程“等一下”，但等待对象不同。二值信号量等一个可重复的一份许可；mutex 等对象临界区；latch 等一次性倒计数归零。若要等 N 个 worker 初始化完成，用 latch；若要限制最多一个后台 flush in-flight，用 binary semaphore 或普通 mutex，取决于是否需要 owner 和对象不变量；若要保护 \code{head/tail/size/closed}，用 mutex。
 
 \topic{令牌桶和背压：semaphore 是容量控制，不是排队策略}
 在服务端，semaphore 常用于 admission control：同时最多允许 N 个请求进入某个昂贵阶段。拿不到许可时，可以等待、拒绝、降级或排队。选择哪一种不是 semaphore 决定的，而是 SLO 决定的。等待会保护下游但增加队列延迟；直接拒绝能保护尾延迟但牺牲成功率；按优先级排队需要额外调度结构。
@@ -786,13 +935,111 @@ request finishes:
 
 因此 semaphore 相关指标至少要包括 \code{permit_acquire_count}、\code{permit_wait_ns}、\code{permit_timeout_count}、\code{permit_reject_count}、\code{permit_leak_check} 和 \code{in_flight_high_watermark}。若只记录吞吐，无法区分“下游慢导致等待增加”和“许可泄漏导致并发度下降”。
 
-\topic{用信号量理解 bounded buffer}
-有界队列可以用两个信号量理解：\code{empty_slots} 初始为 capacity，\code{filled_slots} 初始为 0。生产者先获取空槽许可，再写入；消费者先获取元素许可，再读取。环形索引仍需要 mutex 或单生产者/单消费者特化协议保护。这个模型能把“容量”是一种资源。
-
-但信号量版本同样需要关闭语义。消费者阻塞在 \code{filled_slots.acquire()} 时，\code{close} 如何唤醒？生产者阻塞在 \code{empty_slots.acquire()} 时，关闭后如何返回失败？已经拿到许可但任务取消，许可是否归还？标准信号量本身不携带 \code{closed} 状态，因此还需要额外状态和取消/唤醒机制。信号量不是条件变量的万能替代品，只是更直接地表达数量资源。
-
 \topic{令牌和队列容量不是一回事}
 令牌可以限制并发 I/O 数量，但不等于队列容量。一个系统可能允许队列里积压 100 个待写 block，但同时只允许 4 个 fsync in-flight；也可能允许 32 个 RPC in-flight，但请求队列容量按内存字节控制。把所有限制都写成一个队列长度，会混淆内存预算、设备并发度和业务优先级。第 15 章的异步 I/O 会复用这个区分。
+
+\topic{latch：一次性倒计数}
+\code{std::latch} 表达的是一次性完成门闩。它内部有一个计数；参与者完成某个一次性阶段后调用 \code{count\_down}；等待者调用 \code{wait}，直到计数归零后通过。归零之后，latch 永远保持打开，不能重置到下一轮。这一点决定了它适合“等待所有 worker 初始化完成”“等待 N 个分片加载完 metadata”“等待测试线程同时准备好后开始压测”这类一次性边界。
+
+\begin{lstlisting}[numbers=none,caption={latch 的状态机}]
+state:
+  count = N
+  opened = false
+
+count_down:
+  if count > 0:
+      count -= 1
+  if count == 0:
+      opened = true
+      wake all waiters
+
+wait:
+  if opened:
+      return immediately
+  else:
+      block until opened
+\end{lstlisting}
+
+Latch 的关键不是互斥，也不是资源许可，而是“一次性归零”。它不保护对象不变量；它不保存每个参与者的结果；它不处理某个参与者失败后如何取消其他参与者。若 worker 初始化可能失败，外层仍要有错误状态，例如 \code{init_error}、错误队列或异常聚合。Latch 只保证所有成功或失败路径都调用了倒计数时，等待者不会早于计数归零继续。
+
+\begin{lstlisting}[language=C++,caption={latch 等待所有 worker 完成初始化}]
+std::latch initialized(worker_count);
+std::atomic<bool> failed{false};
+
+worker:
+  try {
+    initialize_local_state();
+  } catch (...) {
+    failed.store(true, std::memory_order_release);
+  }
+  initialized.count_down();
+
+controller:
+  initialized.wait();
+  if (failed.load(std::memory_order_acquire)) {
+    enter_startup_failure_path();
+  }
+\end{lstlisting}
+
+常见错误是把 latch 当 condition variable 使用。队列从空到非空会发生很多次，线程池 idle 也会在 busy 和 idle 之间反复切换；latch 一旦打开就不会再次关闭，无法表达这些可重复谓词。另一个错误是漏掉失败路径的 \code{count\_down}。如果某个 worker 初始化抛异常后直接退出，控制线程会永久等待。可靠代码应使用 scope guard 或统一的 worker 入口，保证所有路径都会倒计数。
+
+\topic{barrier：多轮阶段同步}
+\code{std::barrier} 表达的是多轮阶段边界。它有参与者数量和当前阶段。每个参与者完成本阶段工作后调用 \code{arrive\_and\_wait}；最后一个到达者触发阶段完成函数，然后所有参与者进入下一阶段。与 latch 不同，barrier 会重复使用，每轮结束后进入下一代 phase。
+
+\begin{lstlisting}[numbers=none,caption={barrier 的多轮状态机}]
+state:
+  expected = participant_count
+  arrived = 0
+  phase = 0
+
+arrive_and_wait:
+  local_phase = phase
+  arrived += 1
+  if arrived == expected:
+      run completion step for local_phase
+      arrived = 0
+      phase += 1
+      wake all waiters for local_phase
+  else:
+      wait until phase != local_phase
+\end{lstlisting}
+
+Barrier 适合 stencil、仿真、多阶段流水和分片批处理：所有分片先完成本轮计算，再统一交换边界或提交下一轮。它不适合动态任务队列，因为参与者数量和每轮到达次数必须被协议定义。若某个参与者提前退出，其他参与者可能永远卡在当前 phase；若一个线程在同一 phase 到达两次，状态机也会被破坏。C++20 \code{barrier} 支持 \code{arrive\_and\_drop}，允许参与者永久退出后减少后续 phase 的 expected count，但这必须是显式生命周期事件，不是异常路径随手漏掉一次等待。
+
+\begin{lstlisting}[language=C++,caption={barrier 表达多轮分片阶段}]
+std::barrier step_done(worker_count, [] {
+  publish_phase_summary();
+});
+
+worker:
+  for (std::size_t phase = 0; phase != phase_count; ++phase) {
+    compute_local_partition(phase);
+    step_done.arrive_and_wait();
+    consume_published_summary(phase);
+  }
+\end{lstlisting}
+
+完成函数不是任意回调仓库。它运行在阶段切换的关键路径上，应该短、确定、不能阻塞 I/O，不能提交新一轮需要同一个 barrier 的工作，也不能抛出让参与者状态不一致的异常。若完成函数需要聚合大量数据，应让每个 worker 在到达前写入本地结果，完成函数只做轻量发布或版本推进。
+
+\topic{latch、barrier、semaphore、CV 的选择边界}
+四个原语都能让线程等待，但等待对象完全不同。Latch 等一次性归零；barrier 等每一轮所有参与者到达；semaphore 等资源许可；condition variable 等受 mutex 保护的业务谓词。把它们互换，代码通常还能编译，状态机却会错。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.30\linewidth}p{0.36\linewidth}}
+\toprule
+等待对象 & 合适原语 & 反例 \\
+\midrule
+N 个初始化任务都完成 & \code{std::latch} & 用 semaphore 计数后忘记失败路径 release \\
+每轮所有 worker 到达阶段边界 & \code{std::barrier} & 用 latch，第一轮后无法重新关闭 \\
+最多 K 个请求进入昂贵阶段 & \code{counting\_semaphore} & 用 barrier 等固定参与者，动态请求会卡死 \\
+队列非空、未关闭、未取消 & \code{condition\_variable} & 用 semaphore 后 close 必须制造假许可 \\
+单个版本号变化 & \code{atomic::wait} & 用 CV 也能写，但状态已窄到单原子 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表应该在代码审查中反复使用。问题不是哪个 API 更现代，而是等待事实是否被它完整表达。若事实是阶段，选 barrier；若事实是一次性完成，选 latch；若事实是额度，选 semaphore；若事实是对象谓词，选 CV；若事实是单个原子值变化，选 atomic wait。
 
 \topic{C++20 同步原语的适用边界}
 \code{std::latch} 适合一次性等待 N 个参与者完成，例如主线程等待所有 worker 初始化；\code{std::barrier} 适合多轮阶段同步，例如每轮模拟都要等所有分片完成再进入下一轮；\code{std::jthread} 和 \code{std::stop_token} 适合把协作停止变成显式参数；\code{std::atomic::wait} 适合围绕单个原子状态等待。它们都不能替代队列合同：队列仍要定义容量、所有权、关闭、drain 和异常路径。
