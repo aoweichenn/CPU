@@ -65,6 +65,22 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi_trace PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(lcqi_ledger
+    src/ledger.cpp
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lcqi_ledger PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(lcqi_serving_probe
+    src/serving_probe.cpp
+)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lcqi_serving_probe PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 find_package(dnnl QUIET)
 if(dnnl_FOUND)
     add_executable(lcqi_onednn_bench
@@ -91,4 +107,12 @@ add_test(NAME lcqi_tests COMMAND $<TARGET_FILE:lcqi_tests>)
 add_test(NAME lcqi_trace COMMAND $<TARGET_FILE:lcqi_trace>)
 set_tests_properties(lcqi_trace PROPERTIES
     PASS_REGULAR_EXPRESSION "generated_token,3,-1,scalar,scalar,i32,generated,0,0,0"
+)
+add_test(NAME lcqi_ledger COMMAND $<TARGET_FILE:lcqi_ledger>)
+set_tests_properties(lcqi_ledger PROPERTIES
+    PASS_REGULAR_EXPRESSION "bandwidth_limit,int4_at_100_gbps,23.602,tokens/s"
+)
+add_test(NAME lcqi_serving_probe COMMAND $<TARGET_FILE:lcqi_serving_probe>)
+set_tests_properties(lcqi_serving_probe PROPERTIES
+    PASS_REGULAR_EXPRESSION "request,req_too_long,0,memory_budget_exceeded"
 )

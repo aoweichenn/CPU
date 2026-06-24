@@ -14,6 +14,8 @@
 - int8 linear scalar baseline、packed layout、AVX2/NEON 路径和 shape sweep benchmark
 - tiny reference decoder：RMSNorm、float linear、RoPE、GQA KV cache、decode attention、SwiGLU、lm head
 - reference trace CSV：从 prompt/tokenizer 到 logits/sampler/token，逐 checkpoint 输出 shape、stride、dtype、layout、checksum、max_abs、values 摘要
+- 7B ledger CSV：输出典型 7B shape 的 FLOPs、KV 容量、权重/KV 字节和 bandwidth-only tokens/s 上限
+- serving SLO probe CSV：输出 admission、KV 预算、queue wait、TTFT、TPOT、取消回收和拒绝率
 - CLI 推理和简单 benchmark
 - CTest 正确性测试
 
@@ -72,3 +74,33 @@ name,token_position,layer_id,shape,stride,dtype,layout,checksum,max_abs,values
 ```
 
 这条 trace 固定 prompt fixture `tok1 tok2 tok3`，tokenizer 输出 `tokens=[1,2,3]`，再把 embedding、RMSNorm、Q/K/V、RoPE、KV cache slot、attention、SwiGLU、layer output、final norm、logits、argmax sampler 和 generated token 串成可回归检查的硬链路。`lcqi_tests` 会检查关键 checkpoint 的 shape、stride、dtype、layout 和 logits golden，CTest 也会直接运行 `lcqi_trace`。
+
+7B ledger：
+
+```bash
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_ledger \
+  > books/cpu-volume-3/results/lcqi-sevenb-ledger-2026-06-24.csv
+```
+
+输出 CSV 字段：
+
+```text
+section,item,value,unit,notes
+```
+
+这份账本固定 `L=32,H=4096,n_q=32,n_kv=8,head_dim=128,context=4096`，报告 decode FLOPs、KV 容量、fp16/int8/int4 每 token 字节和不同有效带宽下的 tokens/s 上限。CTest 会检查 `int4_at_100_gbps=23.602 tokens/s` 这一行，防止账本公式漂移。
+
+serving SLO probe：
+
+```bash
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_serving_probe \
+  > books/cpu-volume-3/results/lcqi-serving-slo-probe-2026-06-24.csv
+```
+
+输出 CSV 字段：
+
+```text
+row_type,request_id,accepted,rejection_reason,prompt_tokens,reserved_tokens,kv_reserved_mib,queue_wait_ms,prefill_ms,ttft_ms,decode_step_p95_ms,tpot_ms,completion_tokens,finish_reason,cancel_reclaim_ms,metric_name,metric_value
+```
+
+probe 固定四个请求：短请求、RAG 请求、取消请求和超长请求。它演示 admission 先按 `prompt_tokens + max_new_tokens` 预留 KV，取消请求释放预算，超长请求返回 `memory_budget_exceeded`，并输出 `ttft_p95_ms`、`queue_wait_p95_ms`、`rejection_rate` 等服务化指标。
