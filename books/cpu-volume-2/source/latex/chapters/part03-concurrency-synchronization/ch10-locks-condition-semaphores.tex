@@ -326,6 +326,105 @@ waiter thread:
 
 这个路径解释了 tail latency。某个线程的 \code{wait_ns} 可能很长，不只是因为持锁时间长，也可能因为调度延迟、优先级、CPU 过度订阅、cgroup 限制或唤醒后重新竞争失败。锁报告必须区分 hold time、wait time 和 runnable delay。
 
+\topic{futex wait/wake 的最小状态机}
+把 futex 看成“按用户态地址组织的条件睡眠”更准确。用户态先读一个整数，决定自己愿意在它仍保持某个值时睡眠；进入内核后，内核再读一次这个地址。若值已经变化，等待者不能睡，必须返回用户态重试；若值仍等于 expected，内核把当前线程挂到这个地址对应的等待队列，然后调度走。wake 只是在同一地址的等待队列上唤醒若干线程，不转移业务所有权。
+
+\begin{lstlisting}[numbers=none,caption={futex wait/wake 的状态机}]
+WaiterUserCheck:
+  read *uaddr
+  if value != expected:
+      retry in user space
+  call futex_wait(uaddr, expected, optional_timeout)
+
+KernelRecheck:
+  read *uaddr again
+  if value != expected:
+      return without sleeping
+  enqueue current thread on wait queue keyed by uaddr
+
+Sleeping:
+  thread is not runnable
+  wake, timeout, signal, or cancellation may end the sleep
+
+RunnableAgain:
+  futex_wait returns to user space
+  user code must re-read state and retry protocol
+
+Waker:
+  change user-space state first
+  call futex_wake(uaddr, count)
+  selected waiters become runnable, not owners
+\end{lstlisting}
+
+这个状态机有三个重要边界。第一，\code{futex\_wait} 返回不等于条件满足；它只表示线程不再睡在内核队列上，返回原因可能是 wake、超时、信号或值不匹配。第二，\code{futex\_wake} 返回不等于业务完成；它只说明内核尝试唤醒了若干等待者。第三，futex key 是用户态地址和相关映射身份，不是 C++ 对象名；对象销毁、地址复用和跨进程共享都会让生命周期约束变得更硬。
+
+\topic{mutex 底层怎样从用户态快路径走到睡眠}
+高层 \code{std::mutex} 或 pthread mutex 通常不是每次都进内核。无竞争时，它只是对锁字做原子转换：从 unlocked 改成 locked，成功后进入临界区。竞争时，库会把锁字推进到“有人等待”或类似状态，可能短暂自旋，然后才用 futex 或平台等待对象睡眠。释放时，持锁线程用 release 语义发布临界区写入，把锁字改回可获取状态；若锁字表明可能有等待者，再走 wake 路径。
+
+\begin{lstlisting}[numbers=none,caption={mutex 的典型三态锁字模型}]
+lock word states:
+  0 = unlocked
+  1 = locked, no known waiters
+  2 = locked, waiters may exist
+
+lock fast path:
+  if compare_exchange(0 -> 1) succeeds:
+      enter critical section
+
+lock contended path:
+  if state is 1:
+      try mark state as 2
+  while state != 0:
+      futex_wait(&lock_word, expected=2)
+      re-read lock_word
+  acquire by changing 0 -> 2 or 0 -> 1
+
+unlock:
+  if exchange(lock_word, 0) was 1:
+      no known waiter
+  else:
+      futex_wake(&lock_word, 1)
+\end{lstlisting}
+
+真实库的锁字编码会更复杂，可能包含自适应自旋、robust mutex、priority inheritance、owner 信息或平台差异，但教学上这三个状态足够说明核心原则：锁的正确性来自用户态锁字的状态转移，futex 只是把“等待锁字变化”从忙等变成睡眠。若锁字没有 waiter 信息，unlock 可能不知道是否需要 wake；若 waiter 信息维护错，可能出现无效唤醒或睡眠者没人唤醒。
+
+\topic{condition variable 底层怎样避免丢失唤醒}
+条件变量比 mutex 更容易误解，因为它等待的不是一个锁字，而是“受 mutex 保护的谓词”。等待者调用 \code{wait(lock)} 时，库必须完成一个复合动作：把当前线程登记到条件变量等待集合，然后释放用户 mutex，然后睡眠。醒来后，它还必须重新获取 mutex，才把控制权还给用户代码。用户手写“先 unlock，再 park”会在登记等待者之前暴露丢失唤醒窗口。
+
+\begin{lstlisting}[numbers=none,caption={condition variable wait 的库协议}]
+cv_wait(mutex):
+  user already holds mutex
+  register current thread or sequence number in cv wait set
+  unlock mutex with release semantics
+  block on cv wait object, often through futex-like primitive
+  wake because notify, timeout, signal, or spurious reason
+  re-lock mutex with acquire semantics
+  return to user code so predicate can be checked again
+
+cv_notify_one:
+  select one waiter or advance notify sequence
+  wake corresponding futex/runtime wait object
+\end{lstlisting}
+
+这就是为什么条件变量必须配合 \code{while} 谓词。底层实现可以用序号、等待队列、内部锁和 futex 把“登记等待者 + 释放 mutex + 睡眠”做成一个库协议，但它不能替业务保存通知次数，也不能保证醒来的线程就是拿到资源的线程。被 \code{notify\_one} 唤醒的线程还要重新竞争 mutex；在它拿到锁之前，别的线程可能已经消费了资源。因此条件变量语义不是“通知一次，消费一次”，而是“状态可能变化，请在锁内重新判断”。
+
+\topic{mutex、condvar 和 futex 的职责分层}
+这三者的职责不要混在一起。Mutex 保护共享不变量；condition variable 定义哪些线程在等待哪些谓词；futex 或平台等待对象负责让线程在慢路径睡眠。把 futex 直接当业务事件用，会失去谓词、关闭和对象生命周期；把 condition variable 当消息队列用，会丢通知语义；把 mutex 当背压机制用，会把容量、关闭和错误路径塞进临界区。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+层级 & 它负责什么 & 它不负责什么 \\
+\midrule
+mutex & 保护多字段不变量和线性化点 & 记录业务消息、保存通知次数 \\
+condition variable & 等待谓词可能变真 & 保证资源仍然可用、替代 while 检查 \\
+futex/wait object & 让线程按地址或对象睡眠/唤醒 & 理解 C++ 对象生命周期和业务状态 \\
+业务状态机 & close、cancel、drain、error、capacity & 直接操作内核等待队列 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
 \topic{用户态锁字和内核等待队列必须保持一致}
 futex 等待队列按用户态地址组织。若程序在等待者仍可能睡眠时销毁或复用锁对象，旧等待者可能挂在已经复用的地址语义上。高层库会通过对象生命周期规则避免这种错误；业务代码也必须保证 mutex、condition variable 和等待谓词的对象活得足够久。关闭队列时，先改状态，再通知所有等待者，再等待使用者退出，不能边销毁边唤醒。
 

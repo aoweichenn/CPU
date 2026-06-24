@@ -198,6 +198,122 @@ thread 1: read(fd, buf1, 4096)   // offset already advanced
 
 \code{epoll} 这类 ready 机制只说明 fd 可能可读或可写，不说明业务消息已经完整。Socket 可读可能只有半个 header；可写也不保证整个响应一次写完。\code{io_uring} 更接近提交队列和完成队列模型，但仍然要处理 buffer 生命周期、短读短写、错误码、取消和完成顺序。必须避免把具体 API 神化，核心是状态机。
 
+\topic{eventfd：把用户态状态变化变成 fd 可读}
+\code{eventfd} 常被用来唤醒 \code{epoll} 线程。它的语义不是传输业务消息，而是维护一个内核计数器：写入一个 64 位值会增加计数；读取会取走计数并让它回到零，或者在 semaphore 模式下一次读走一个单位。于是 eventfd 适合表达“有事情需要 event loop 回来检查”，不适合把每个任务 payload 塞进 fd。
+
+\begin{lstlisting}[numbers=none,caption={eventfd 唤醒的正确分层}]
+producer thread:
+  push request into user-space queue
+  if queue was previously empty:
+      write(eventfd, 1)        // wake event loop
+
+event loop:
+  epoll_wait returns eventfd readable
+  read(eventfd)                // drain wake counter
+  pop all available requests from user-space queue
+  process bounded amount of control work
+\end{lstlisting}
+
+这条链里，业务事实在用户态队列中；eventfd 只是把“队列状态可能变了”转成 fd readiness。若生产者每 push 一个请求都无条件写 eventfd，event loop 可能收到大量重复唤醒；若 event loop 只读 eventfd 却不 drain 用户态队列，计数器清零后仍有工作积压；若把 request id 当作 eventfd 计数写进去，多个写会被合并，身份信息会丢失。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+对象 & 保存什么状态 & 常见误用 \\
+\midrule
+用户态队列 & request、buffer、attempt、deadline & 不加容量，无法背压 \\
+eventfd 计数器 & 至少一次唤醒事实或计数 & 当消息队列或 payload 通道 \\
+epoll interest list & 关注哪些 fd 的 ready 事件 & 当 completion queue \\
+业务状态表 & request 是否完成、取消、提交 & 只靠 fd ready 推导业务完成 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{epoll：ready 事件不是 completion}
+\code{epoll} 管的是 fd readiness。它告诉事件循环“这个 fd 现在做某类 I/O 操作可能推进”，不是“某个业务请求完成”。TCP socket readable 可能只够读半个 header；writable 可能只够写响应的一部分；eventfd readable 只说明计数器非零；管道 readable 只说明至少有字节可读。应用必须在 fd ready 后推进自己的状态机，直到遇到 \code{EAGAIN}、完成一个业务消息、达到本轮预算或进入错误路径。
+
+\begin{lstlisting}[numbers=none,caption={epoll reactor 的基本状态循环}]
+event loop:
+  events = epoll_wait(epoll_fd)
+  for each event:
+    if event.fd is listen socket:
+        accept until EAGAIN
+    if event.fd is data socket and readable:
+        read into connection buffer until EAGAIN or budget exhausted
+        parse zero or more complete messages
+        enqueue CPU work to compute executor
+    if event.fd is data socket and writable:
+        flush output buffer until EAGAIN or buffer empty
+    if event.fd is eventfd:
+        read eventfd counter
+        drain user-space control queue
+\end{lstlisting}
+
+这个循环里有两个预算。I/O 预算防止单个热 fd 独占 event loop；CPU 预算防止事件回调直接变成业务执行线程。解析出完整消息后，重 CPU 工作应该作为 task 进入 compute executor；event loop 只保留连接状态、buffer offset、订阅的读写兴趣和必要的轻量协议推进。
+
+\topic{水平触发、边沿触发和 drain 规则}
+水平触发下，只要 fd 仍 ready，\code{epoll\_wait} 之后还可能继续报告它。边沿触发下，内核只在 ready 状态变化时提示；应用若没有一直读写到 \code{EAGAIN}，可能把剩余数据留在 fd 里，却再也等不到下一次边沿通知。边沿触发常见于高性能 reactor，但它购买的是更严格的 drain 责任，不是自动更快。
+
+\begin{lstlisting}[numbers=none,caption={边沿触发必须 drain 到 EAGAIN}]
+on EPOLLIN for edge-triggered socket:
+  loop:
+    n = read(fd, buffer)
+    if n > 0:
+        append to connection input buffer
+        parse complete messages
+        continue
+    if n == -1 and errno == EAGAIN:
+        stop reading; wait for next edge
+    if n == 0:
+        peer closed
+    else:
+        handle error
+\end{lstlisting}
+
+这条规则同样适用于 eventfd：event loop 看到 eventfd readable 后应读取计数器，并检查对应用户态队列。若多个 producer 写入 eventfd，读到的计数可能是合并值；它只能告诉你“至少发生过这些唤醒写”，不能替代队列长度。真正的 drain 条件是用户态队列空、连接 buffer 没有完整消息、输出 buffer 暂时写不动，或者本轮处理预算耗尽。
+
+\topic{eventfd/epoll 和条件变量的相似点}
+eventfd/epoll 和 condition variable 看起来一个是 fd，一个是线程同步原语，但它们共享同一条原则：通知不是状态。条件变量的通知要求等待者回到锁内检查谓词；epoll 的 ready 要求 event loop 回到 fd 和用户态连接状态检查进度；eventfd 的可读要求 event loop 回到用户态队列检查真实工作。把通知当事实，是两类系统都会犯的错误。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+机制 & 通知含义 & 必须重新检查的状态 \\
+\midrule
+condition variable & 谓词可能变化 & mutex 保护的队列/关闭/error \\
+eventfd & 有线程写过唤醒计数 & 用户态请求队列和 shutdown flag \\
+epoll readable & fd 可能可读 & connection buffer 和 message framing \\
+epoll writable & fd 可能可写 & output buffer、short write offset、backpressure \\
+io completion & 请求返回 bytes/status & request record、buffer owner、commit state \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{event loop 唤醒报告字段}
+如果一个 I/O runtime 只记录 \code{epoll\_wait} 次数，很难解释延迟。报告应把 eventfd、epoll、用户态队列和业务 completion 对齐。最小字段如下：
+
+\begin{lstlisting}[numbers=none,caption={eventfd/epoll runtime 的观测字段}]
+epoll_wait_count
+epoll_wait_timeout_count
+epoll_events_returned
+eventfd_write_count
+eventfd_read_count
+eventfd_counter_sum
+control_queue_depth_max
+control_queue_drain_items
+socket_read_ready_count
+socket_write_ready_count
+read_until_eagain_count
+write_until_eagain_count
+messages_parsed_count
+cpu_tasks_enqueued_from_event_loop
+event_loop_callback_ns_p99
+\end{lstlisting}
+
+这些字段能区分几种不同瓶颈：eventfd 写很多但队列很浅，说明唤醒合并策略差；epoll 返回很多 writable 但写不完，说明下游慢或输出 buffer 过大；read ready 很多但 messages parsed 少，说明消息分片或 framing 成本高；callback p99 很高，说明 event loop 执行了不该由它执行的 CPU 工作。
+
 \topic{异步 I/O 和 coroutine：completion 才能恢复 awaiter}
 把 I/O 接到 coroutine 时，关键不是把 \code{read} 包在 \code{co\_await} 后面，而是让 awaiter 等真正的 I/O completion。若 \code{await\_suspend} 里调用阻塞 \code{read}，这个 coroutine 只是换了一种写法，compute worker 仍被设备等待占住。正确模型是：提交请求，保存 buffer 所有权和 coroutine handle，worker 返回调度器；completion 到达后，I/O 层更新请求状态，再把 handle 入恢复 executor。
 
