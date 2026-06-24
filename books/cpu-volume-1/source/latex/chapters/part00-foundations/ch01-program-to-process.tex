@@ -2085,6 +2085,236 @@ CompilerRuntimeDeepReport:
 
 这样做会让章节变厚，但厚度来自必要证据。大师级系统教材不满足于“知道一个概念”，而是训练读者在源码、二进制、运行时和机器状态之间来回闭合。
 
+\section{六条必须打穿的深水链路}
+
+前面已经建立了源码到进程的大地图。现在把第一册仍然容易薄的部分继续压深：优化器、IR、ELF 运行时元数据、DWARF 调试信息、C++ 异常 ABI 和系统调用边界。它们不是孤立高级主题，而是同一条问题链的不同断面：一段 C++ 为什么会变成这段机器行为，工具为什么这样显示，运行时为什么在这里花时间或崩溃。
+
+\subsection{一、从 AST 到 IR、pass 和汇编的闭环}
+
+只看最终汇编，读者容易把优化器当成黑箱；只看源码，又无法解释机器行为。合格的第一册应该让同一个函数依次经过 AST、IR、优化 pass 和汇编。下面固定一个小函数：
+
+\begin{lstlisting}[language=C++,caption={用于观察优化链路的小函数}]
+int sum_positive(int const* p, int n)
+{
+    int sum = 0;
+    for (int i = 0; i < n; ++i) {
+        if (p[i] > 0) {
+            sum += p[i];
+        }
+    }
+    return sum;
+}
+\end{lstlisting}
+
+源码层能看到变量、循环和 \code{if}；AST 能看到语法树和类型；未优化 IR 往往还能看到栈槽、\code{load} 和 \code{store}；优化后 IR 更接近 SSA 数据流；后端再把 SSA 值分配到寄存器、生成分支或条件移动，最后才形成汇编。观察命令可以固定为：
+
+\begin{lstlisting}[numbers=none,caption={同一函数的编译器证据链}]
+clang++ -O0 -Xclang -ast-dump -fsyntax-only sum.cpp > ast.txt
+clang++ -O0 -S -emit-llvm sum.cpp -o sum_O0.ll
+clang++ -O3 -S -emit-llvm sum.cpp -o sum_O3.ll
+clang++ -O3 -S -masm=intel sum.cpp -o sum_O3.s
+clang++ -O3 -Rpass=loop-vectorize -Rpass-missed=loop-vectorize \
+  -c sum.cpp -o sum.o 2>remarks.txt
+objdump -drwC -Mintel sum.o > sum.objdump.txt
+\end{lstlisting}
+
+这组证据回答不同问题。AST 说明编译器前端理解到什么语法和类型；\code{sum\_O0.ll} 说明源代码被降低成怎样的内存和控制流；\code{sum\_O3.ll} 说明优化器证明了哪些值、分支和内存访问关系；\code{remarks.txt} 说明循环是否向量化以及为什么失败；反汇编说明最终机器路径。只有这五层对齐，才能说“我理解这段 C++ 如何执行”。
+
+\subsection{二、LLVM IR/GCC GIMPLE：SSA、load/store 和 pass 的真实对象}
+
+LLVM IR 和 GCC GIMPLE 都不是汇编的漂亮写法，而是优化器工作的对象。IR 的重点不是保留源码外观，而是显式表示值、控制流、内存访问和副作用。未优化 LLVM IR 中常见 \code{alloca/load/store}，因为它先把局部变量保守地放进栈槽；\term{mem2reg}{memory to register promotion} 会把可证明没有地址逃逸的栈槽提升成 SSA 值。
+
+\begin{lstlisting}[numbers=none,caption={mem2reg 前后的直觉}]
+before mem2reg:
+  %sum.addr = alloca i32
+  store i32 0, ptr %sum.addr
+  %old = load i32, ptr %sum.addr
+  %new = add i32 %old, %x
+  store i32 %new, ptr %sum.addr
+
+after mem2reg:
+  %sum.0 = phi [0, %entry], [%sum.1, %loop.latch]
+  %sum.1 = add i32 %sum.0, %x
+\end{lstlisting}
+
+\code{phi} 不是机器指令，而是控制流汇合处的值选择。后端会把它消成寄存器移动、分支布局、条件移动或别的机器实现。理解这一点后，调试优化代码里“变量消失”就不奇怪：源码变量可能已经不再对应一个稳定栈地址，而是分裂成多个 SSA 值。
+
+几个核心 pass 要能从前提、改写和证据三方面解释：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+\toprule
+pass & 它证明什么 & 证据应该看哪里 \\
+\midrule
+mem2reg & 栈槽没有复杂地址逃逸，可提升成 SSA 值 & \code{alloca/load/store} 是否减少，是否出现 \code{phi} \\
+inline & 调用目标可见且收益足够 & IR 中调用是否消失，符号表中函数是否仍独立存在 \\
+DCE & 计算结果无使用且无可观察副作用 & 无用循环或临时值是否被删除 \\
+LICM & 表达式循环内不变，提前不改变异常和副作用 & load 是否被外提，别名和调用是否阻止外提 \\
+vectorize & 迭代间独立，内存访问可描述，尾部可处理 & remark、向量 IR、\instruction{vmov}/\instruction{vadd} 等指令 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+GCC 的 GIMPLE 也服务同类目标，只是术语和 dump 形态不同。可以用：
+
+\begin{lstlisting}[numbers=none,caption={GCC 观察优化阶段的入口}]
+g++ -O3 -fdump-tree-gimple -fdump-tree-optimized sum.cpp -c
+g++ -O3 -fopt-info-vec-optimized -fopt-info-vec-missed sum.cpp -c
+\end{lstlisting}
+
+不要把 LLVM IR 或 GIMPLE 当作跨版本稳定教材语法背诵。它们的具体输出会随编译器版本变化。教学重点是：优化器不是按源码行工作，而是按控制流图、SSA 值、内存依赖、别名事实、异常边和副作用事实工作。
+
+\subsection{三、ELF 深水区：\code{.init\_array}、TLS、可见性和动态链接器}
+
+ELF 深水区不止 \code{.text}、符号表和 PLT/GOT。很多“main 之前”和“第一次调用”的问题来自 \code{.init\_array}、TLS、符号可见性、动态段和动态链接器策略。
+
+\code{.init\_array} 保存运行时进入 \code{main} 前要调用的初始化函数地址，C++ 全局对象构造、某些库初始化和编译器生成的启动钩子都可能进入这里。一个 benchmark 若在全局对象构造里分配大内存、打开文件、注册插件或初始化日志，整个进程时间就已经包含这些成本。
+
+\begin{lstlisting}[numbers=none,caption={观察 init array 和动态段}]
+readelf -S ./app | rg 'init_array|fini_array|dynamic|dynsym'
+readelf -x .init_array ./app
+readelf -d ./app
+objdump -drwC -Mintel ./app | rg '@plt|init_array|__libc_start'
+\end{lstlisting}
+
+TLS 也不是普通全局变量。线程局部对象需要每个线程有自己的存储实例；不同 TLS 模型会生成不同访问序列。主可执行文件中本地 exec 模型可能很轻；动态库中的 general dynamic 模型可能要调用 TLS helper。若热路径频繁访问 \code{thread\_local} 大对象或复杂对象，不能只按普通全局 load 理解。
+
+符号可见性决定动态链接边界，也会影响优化。默认可见的共享库符号可能被外部引用、插桩或替换，编译器和链接器就要保留更强 ABI 边界；隐藏符号给优化器和链接器更多自由。库工程里常见：
+
+\begin{lstlisting}[numbers=none,caption={符号可见性证据}]
+readelf -Ws libfoo.so | rg 'GLOBAL|LOCAL|HIDDEN|DEFAULT'
+objdump -T libfoo.so | rg foo
+clang++ -fvisibility=hidden -fvisibility-inlines-hidden ...
+\end{lstlisting}
+
+动态链接器的证据不能只靠猜。若怀疑首次调用慢，可以打开：
+
+\begin{lstlisting}[numbers=none,caption={动态链接器运行时证据}]
+LD_DEBUG=libs,bindings ./app 2>ld-debug.txt
+LD_BIND_NOW=1 ./app
+readelf -d ./app | rg 'NEEDED|RUNPATH|RPATH|BIND_NOW|FLAGS'
+\end{lstlisting}
+
+\code{LD\_BIND\_NOW=1} 把许多 lazy binding 提前到加载阶段，能帮助区分“第一次业务调用慢”到底来自动态绑定，还是来自页面首次触碰、cache 冷启动或真正算法路径。符号可见性、RPATH/RUNPATH、\code{NEEDED} 版本和加载顺序，都是生产事故材料，不是文件格式细枝末节。
+
+\subsection{四、DWARF、CFI 和 optimized out：工具为什么看不到变量}
+
+DWARF 调试信息把机器地址、源码行、变量、类型和栈展开规则联系起来。它不是 CPU 执行程序所需的东西，却决定 GDB、crash dump、profiler 和异常展开能否把机器状态解释回人能理解的调用栈。
+
+调试信息至少包含几类重要事实：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+DWARF/展开事实 & 它说明什么 & 典型工具 \\
+\midrule
+line table & 指令地址和源码行的大致关系 & \cmd{llvm-dwarfdump} \\
+location list & 变量在某段 PC 范围内位于哪里 & GDB、\cmd{llvm-dwarfdump} \\
+CFI/\code{.eh\_frame} & 如何恢复调用者 CFA、返回地址和保存寄存器 & \cmd{readelf} \\
+type DIE & 类型、字段、作用域和模板实例信息 & GDB、\cmd{llvm-dwarfdump} \\
+build-id & 二进制和符号文件的身份绑定 & core dump、符号服务器 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\code{optimized out} 通常不是调试器偷懒，而是变量没有稳定位置。一个源码变量可能在入口处位于 \register{edi}，循环中变成某个 SSA 值，后来被常量传播，最终完全没有机器位置。调试器只能按 DWARF location list 在某个 PC 范围内恢复它；若该范围没有位置，就显示 optimized out。
+
+\begin{lstlisting}[numbers=none,caption={调试信息和展开信息证据}]
+clang++ -O2 -g f.cpp -o f
+llvm-dwarfdump --debug-line f | head
+llvm-dwarfdump --debug-info f | rg 'DW_TAG_variable|DW_AT_location'
+readelf --debug-dump=frames f | head -80
+objdump --dwarf=decodedline f | head
+\end{lstlisting}
+
+CFI 的核心概念是 \term{CFA}{canonical frame address}。它告诉展开器：在当前指令位置，调用者栈帧的基准地址如何计算，返回地址在哪里，哪些 callee-saved 寄存器保存在哪里。若编译器省略帧指针，CFI 更重要；若手写汇编没有正确 CFI，GDB 回溯、perf 采样栈和异常穿越该帧都可能失败。
+
+\subsection{五、C++ exception ABI：throw 不是长跳转这么简单}
+
+C++ 异常机制跨越语言语义、ABI、运行时库和 unwind metadata。一个 \code{throw} 通常会构造异常对象，调用运行时入口，例如 Itanium C++ ABI 系列实现中的 \code{\_\_cxa\_throw}；展开器沿栈查找 handler；每一帧的 personality routine 和 LSDA 描述该帧有哪些 landing pad、catch 类型和 cleanup；离开作用域的对象析构通过 cleanup 路径执行。
+
+\begin{lstlisting}[numbers=none,caption={异常传播的压缩状态机}]
+ThrowCreated:
+  exception object and type info are prepared
+
+SearchPhase:
+  unwinder walks frames and asks personality routines
+  whether a handler exists
+
+CleanupPhase:
+  frames are unwound
+  destructors and cleanup landing pads run
+
+HandlerEntered:
+  matching catch receives control
+
+Unhandled:
+  terminate is called if no handler is found
+\end{lstlisting}
+
+这条链解释 RAII 为什么能在异常中成立：不是异常自动懂资源，而是编译器为作用域对象生成了 cleanup 边，异常运行时按 unwind 表穿过这些边。也解释为什么裸汇编和 C ABI 边界危险：如果栈帧没有可展开信息，或者让 C++ 异常穿过不理解异常 ABI 的边界，析构和回溯都可能出错。
+
+异常证据可以这样采集：
+
+\begin{lstlisting}[numbers=none,caption={异常 ABI 证据入口}]
+clang++ -O2 -g -fno-omit-frame-pointer throw.cpp -o throw_app
+nm -C throw_app | rg '__cxa_throw|personality|Unwind'
+readelf -S throw_app | rg 'eh_frame|gcc_except_table'
+readelf --debug-dump=frames throw_app | head -120
+objdump -drwC -Mintel throw_app | rg 'landing|personality|__cxa_throw'
+\end{lstlisting}
+
+很多工程会规定热路径不抛异常，但“不在热路径抛异常”和“不理解异常机制”是两回事。即使你用错误码做业务错误，RAII 析构、栈回溯、崩溃报告、手写汇编边界和第三方库仍然会遇到 unwind。第一册必须把异常视为运行时合同，而不是语法糖。
+
+\subsection{六、系统调用：libc wrapper、syscall、vDSO 和 page fault 边界}
+
+系统调用不是普通函数调用。调用 \code{write} 时，源码层看起来是一个 C 函数；libc wrapper 内部可能处理 \code{errno}、线程取消点、重试和 ABI 适配；真正进入内核时，x86-64 Linux 使用 \instruction{syscall} 指令和 syscall ABI。普通函数 ABI 的第四个整数参数在 \register{rcx}，Linux syscall 常用 \register{r10}，并且 \instruction{syscall} 会破坏 \register{rcx} 和 \register{r11}。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+边界 & 发生了什么 & 证据 \\
+\midrule
+libc wrapper & 普通函数调用，处理库级语义 & 反汇编、符号、\cmd{ltrace} 或源码阅读 \\
+syscall entry & 用户态切到内核态，使用 syscall ABI & \cmd{strace}、反汇编中的 \instruction{syscall} \\
+vDSO & 某些查询走用户态映射页，避免真正陷入内核 & \filepath{/proc/self/maps}、\code{linux-vdso.so.1} \\
+page fault & 指令访问虚拟地址时触发异常，内核修复或发信号 & \cmd{perf stat -e page-faults}、\cmd{strace -c}、maps \\
+signal & 内核异步改变用户态控制流 & GDB signal、siginfo、core dump \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\code{clock\_gettime} 是理解 vDSO 的好例子。它有时不需要真正 syscall，而是通过内核映射到用户空间的 vDSO 页面读取时间相关数据。于是同样叫“系统时间”，成本可能远低于普通陷入内核。报告里若测量几十纳秒级 kernel，必须知道计时器本身走什么路径。
+
+\begin{lstlisting}[numbers=none,caption={系统边界证据包}]
+strace -e trace=write,read,mmap,brk,clock_gettime ./app
+strace -c ./app
+cat /proc/self/maps | rg 'vdso|vvar'
+objdump -drwC -Mintel /lib/x86_64-linux-gnu/libc.so.6 | rg 'syscall'
+perf stat -e page-faults,minor-faults,major-faults ./app
+\end{lstlisting}
+
+page fault 也要纳入系统调用边界的思维。它不是程序主动调用内核，而是 CPU 在取指、load 或 store 时发现页表状态不满足，转入异常处理。合法的首次触页、COW、文件映射缺页和非法地址崩溃，在机器层都从异常入口开始，但业务含义完全不同。若第一册不把 syscall、vDSO、page fault、signal 分清，后面做 benchmark 和服务 p99 分析一定会混层。
+
+\subsection{深水链路的统一验收}
+
+本节不是要求读者立刻成为 LLVM、ELF、DWARF 或内核专家，而是要求形成工程闭环意识。一个合格的第一册实验报告，至少要能回答：
+
+\begin{itemize}
+  \item 这段源码在 AST/IR 层的核心控制流和数据流是什么。
+  \item 哪些 pass 改写了它，哪些 pass 被别名、异常、副作用或目标 ISA 阻止。
+  \item 最终汇编是否和 IR 结论一致，是否出现意外 PLT、间接调用或栈槽。
+  \item ELF 中是否存在 \code{.init\_array}、TLS、动态段和需要运行时绑定的符号。
+  \item 调试器看到的变量、栈和源码行是否由 DWARF/CFI 支持。
+  \item 异常路径是否有 unwind table、personality、cleanup 和 RAII 证据。
+  \item 计时范围是否混入 syscall、vDSO、page fault、signal、动态链接或初始化成本。
+\end{itemize}
+
+能回答这些问题，第一册才真正从“看懂汇编”进入“解释 C++ 程序如何被机器、运行时和操作系统共同执行”的层次。
+
 \section{反例：看似合理但错误的理解}
 
 \begin{warningbox}
