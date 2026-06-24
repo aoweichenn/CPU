@@ -291,6 +291,145 @@ struct ByteLedger {
 
 Compute Systems Engine 的日志统计会同时遇到这三类形状。解析后的 event id 列适合 sum/map 式扫描；字段变换适合 saxpy 式字节账本；事件计数则变成 histogram，受 key 分布和共享写影响。Roofline 能解释规则流式内核，但对 histogram、锁等待、I/O 和分布式重试不够直接，需要配合计数器和 trace。
 
+\topic{dot product 的完整手算}
+Roofline 必须能落到一个小 kernel。考虑最小 dot product：
+
+\begin{lstlisting}[language=C++,caption={dot product 的标量语义}]
+float dot_product(std::span<const float> a, std::span<const float> b)
+{
+  float sum = 0.0F;
+  for (std::size_t i = 0; i < a.size(); ++i) {
+    sum += a[i] * b[i];
+  }
+  return sum;
+}
+\end{lstlisting}
+
+每个元素做一次乘法和一次加法，通常按 2 FLOPs 计；每个元素至少读取两个 float，共 8 字节。忽略 \code{sum} 在寄存器中的归约和最终写回：
+
+\[
+AI = \frac{2\ FLOPs}{8\ bytes} = 0.25\ FLOP/byte
+\]
+
+若可持续内存带宽是 \code{50 GB/s}，带宽 roof 是：
+
+\[
+50\ GB/s \times 0.25\ FLOP/byte = 12.5\ GFLOP/s
+\]
+
+若 CPU 峰值浮点吞吐是 \code{500 GFLOP/s}，这个 kernel 也不会因此接近 500 GFLOP/s；它先被带宽 roof 压住。实测若只有 8 GFLOP/s，不应直接说“SIMD 不够强”，而要问：实际 GB/s 是多少，是否接近 50 GB/s；循环是否向量化；归约依赖是否被多累加器打散；输入是否对齐；工作集是在 L3、DRAM 还是 page fault 路径上。
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+账本项 & dot product & 解释 \\
+\midrule
+FLOPs/element & 2 & multiply + add \\
+bytes/element & 8 & 读两个 float 输入 \\
+AI & 0.25 FLOP/byte & 低算术强度 \\
+50 GB/s 带宽 roof & 12.5 GFLOP/s & memory-bound 上限 \\
+500 GFLOP/s compute roof & 不主导 & 计算峰值高于带宽约束 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{矩阵遍历的 cache/TLB 账本}
+二维数组遍历可以把 cache line 和 TLB 压力讲清。假设 C/C++ row-major 存储 \code{float a[M][N]}：
+
+\[
+addr(i,j) = base + (i \times N + j) \times 4
+\]
+
+行优先遍历中，内层 \code{j} 每次让地址增加 4 字节。若 cache line 是 64 字节，一条 line 覆盖 16 个 float，硬件预取也容易工作。列优先遍历中，内层 \code{i} 每次让地址增加 \code{N * 4} 字节。若 \code{N=4096}，步长是 16 KiB；相邻访问通常落在不同 cache line，甚至不同页面，TLB 覆盖压力也更大。
+
+\begin{lstlisting}[language=C++,caption={两个遍历方向的地址差异}]
+// row-major friendly: inner stride = 4 bytes
+for (std::size_t i = 0; i < M; ++i) {
+  for (std::size_t j = 0; j < N; ++j) {
+    sum += a[i][j];
+  }
+}
+
+// row-major hostile when N is large: inner stride = N * 4 bytes
+for (std::size_t j = 0; j < N; ++j) {
+  for (std::size_t i = 0; i < M; ++i) {
+    sum += a[i][j];
+  }
+}
+\end{lstlisting}
+
+这不是死记“行优先快”。如果 layout 是 column-major、blocked layout 或 view/stride 张量，结论会跟地址公式一起改变。报告必须写 layout、shape、stride 和 element size，否则 cache/TLB 分析没有对象。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.28\linewidth}p{0.36\linewidth}}
+\toprule
+遍历方式 & 内层地址步长 & 机器后果 \\
+\midrule
+row-major 行优先 & 4 bytes & spatial locality 好，预取容易 \\
+row-major 列优先 & \code{N * 4} bytes & 跨 line/跨页，cache/TLB 压力高 \\
+blocked traversal & tile 内连续 & 用小工作集换复用 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{perf stat 要接回 Roofline}
+\cmd{perf stat} 输出不能孤立解释。先把计数器转成派生指标：
+
+\[
+IPC = instructions / cycles
+\]
+
+\[
+branch\ miss\ rate = branch\_misses / branches
+\]
+
+\[
+cache\ miss\ rate = cache\_misses / cache\_references
+\]
+
+再把它们接到字节账本和反汇编。dot product 若 measured GB/s 接近带宽 roof、IPC 偏低、cache miss 随工作集变大而上升，memory-bound 解释较强。若 instructions 很多、GFLOP/s 低、反汇编没有向量指令，优化方向是 SIMD 和多累加器。若 branch misses 高，说明被测代码可能不是纯 dot，而是含数据相关分支或错误路径。
+
+\begin{center}
+\begin{tabular}{p{0.26\linewidth}p{0.36\linewidth}p{0.24\linewidth}}
+\toprule
+观察 & 可能解释 & 需要反证 \\
+\midrule
+IPC 低、cache miss 高 & memory-bound、TLB 或随机访问 & 工作集阶梯、stride 对照 \\
+IPC 高、GB/s 低 & 数据在 cache 或字节账本错 & 冷/热状态、bytes moved 核对 \\
+branch miss 高 & 输入相关分支或错误路径热 & 输入分布、CFG/反汇编 \\
+instructions 暴涨 & 未向量化、额外检查、函数调用 & objdump、优化报告 \\
+context switches 高 & 调度干扰或线程等待 & affinity、trace、CPU time \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+如果 PMU 不可用，报告要降级而不是伪造。可以使用输入规模阶梯、stride 对照、阶段时间、反汇编、checksum、线程扩展曲线和应用 trace。证据等级降低，结论就要写窄：可以说“结果符合内存带宽瓶颈假设”，不能说“cache miss 已下降”。
+
+\topic{RooflineReport 最小字段}
+每个核心 kernel 都应能产出一份小报告：
+
+\begin{lstlisting}[numbers=none,caption={RooflineReport 最小字段}]
+kernel_name
+input_shape
+dtype
+semantic_oracle
+flops_formula
+bytes_formula
+arithmetic_intensity
+measured_elapsed_ns
+measured_gflops
+measured_gb_per_s
+machine_bandwidth_roof
+machine_compute_roof
+roofline_bound: memory_bound or compute_bound or mixed
+perf_counters_available
+counter_summary
+gap_explanation
+unverified_boundaries
+\end{lstlisting}
+
+这份结构迫使优化结论回答“改变了哪条上限”。减少几条指令不会让 DRAM-bound kernel 大幅变快；改变 layout 可能让 cache/TLB 证据变化；SIMD 提升 GFLOP/s 时也要看 GB/s 和 correctness oracle 是否保持。
+
 \topic{单线程 Roofline 和多线程 Roofline}
 单线程可能受加载端口、预取能力、乱序窗口或依赖链限制，远低于平台总内存带宽；多线程逐步增加后，可能接近内存控制器带宽，然后加线程不再提升。报告应同时展示单线程曲线和多线程曲线。若 1 到 4 线程提升明显，8 线程后停滞，可能是带宽、LLC、NUMA 或同步热点；若 2 线程就不提升，可能是串行部分、任务粒度或全局锁。
 

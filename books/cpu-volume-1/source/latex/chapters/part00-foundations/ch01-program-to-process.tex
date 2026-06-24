@@ -176,6 +176,122 @@ source file
 
 当你阅读大型项目时，不要只看一个源文件。你要追问：这个函数的定义在哪里，调用点是否能看到函数体，宏是否改变了源代码形态，某个配置宏是否选择了不同实现，同一个头文件进入了多少翻译单元。后续学习高性能库时，你会看到许多实现被放入头文件，不只是为了方便发布，更是为了让编译器在调用点看到常量、类型、维度、对齐和目标指令集条件，从而生成专门化代码。
 
+\section{固定 add\_i32：从源码到 ELF 的证据链}
+
+本章最小贯穿函数固定为：
+
+\begin{lstlisting}[language=C++,caption={贯穿本章的最小函数}]
+extern "C" int add_i32(int a, int b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+它足够小，小到可以手工追踪；也足够真实，因为它会经历完整的预处理、编译、汇编、目标文件、符号、重定位、链接和加载。先把每层证据列出来：
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+层次 & 产物 & 需要观察什么 \\
+\midrule
+源码 & \code{add.cpp} & C++ 函数语义、参数和返回类型 \\
+预处理 & \code{add.i} & 头文件和宏展开后的翻译单元 \\
+前端/IR & AST 或 IR dump & 函数、参数、返回表达式的语义结构 \\
+汇编 & \code{add.s} & 参数寄存器、\code{add} 或 \code{lea}、返回寄存器 \\
+目标文件 & \code{add.o} & 符号表、机器码字节、重定位记录 \\
+可执行文件 & ELF executable & 段、节、入口、动态链接信息 \\
+进程 & \code{/proc/<pid>/maps} & text/data/stack/heap/shared libraries 的虚拟地址 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{源码语义}
+\code{extern "C"} 让函数名使用 C linkage，避免 C++ name mangling。这样目标文件里更容易看到符号 \code{add\_i32}。参数 \code{a} 和 \code{b} 是两个 \code{int}，返回值也是 \code{int}。源码层还没有寄存器、栈地址或机器码；它只规定可观察语义：返回两个参数的和，若有有符号溢出则进入 C++ 未定义行为边界。
+
+\subsection{汇编语义}
+在 x86-64 System V ABI 下，前两个 \code{int} 参数通常通过 \register{edi} 和 \register{esi} 传入，\code{int} 返回值在 \register{eax}。优化后可能出现这种形状：
+
+\begin{lstlisting}[numbers=none,caption={add\_i32 的典型优化汇编形状}]
+add_i32:
+  lea eax, [rdi + rsi]
+  ret
+\end{lstlisting}
+
+也可能是：
+
+\begin{lstlisting}[numbers=none,caption={另一种等价形状}]
+add_i32:
+  mov eax, edi
+  add eax, esi
+  ret
+\end{lstlisting}
+
+两者都能实现同一 C++ 语义。第一种用 \instruction{lea} 计算地址形式的整数加法，不更新 flags；第二种用 \instruction{add}，会更新 flags。若后续代码不需要 flags，编译器可以选择任意更合适的形态。这里要训练的不是背某条指令，而是知道同一源码语义可以有多个机器实现。
+
+\subsection{目标文件：符号和重定位}
+若 \code{add\_i32} 被编译成目标文件，它会有符号表项。可以用：
+
+\begin{lstlisting}[numbers=none,caption={观察目标文件身份}]
+c++ -O3 -c add.cpp -o add.o
+nm -C add.o
+objdump -drwC -Mintel add.o
+readelf -s add.o
+\end{lstlisting}
+
+如果另一个翻译单元只声明并调用它：
+
+\begin{lstlisting}[language=C++,caption={调用方翻译单元}]
+extern "C" int add_i32(int a, int b);
+
+int call_add()
+{
+    return add_i32(7, 5);
+}
+\end{lstlisting}
+
+调用方目标文件在编译时还不知道 \code{add\_i32} 最终地址，只能留下一个未定义符号和重定位位置。链接器把调用点修正到实际函数地址，或通过 PLT/GOT 等动态链接机制间接跳转。看到反汇编里的 \code{call 0x0} 时，不要误以为真的调用地址 0；在目标文件里它常常只是等待链接器修正的占位。
+
+\subsection{ELF 和 loader}
+链接后的 ELF 不只是代码字节。它还包含 program headers，告诉内核和动态链接器哪些区域要映射成可执行、只读、可写；包含 dynamic section，说明依赖哪些共享库；包含入口地址，通常指向运行时启动代码，而不是直接指向 \code{main}。当 shell 调用 \code{execve} 后，内核读取 ELF header，建立新的虚拟地址空间，映射 text/data 段，准备初始栈，把 \code{argv}、\code{envp} 和 auxiliary vector 放上去，然后把控制权交给入口或动态链接器。
+
+\begin{lstlisting}[numbers=none,caption={启动时间线的压缩版}]
+shell parses command
+  -> execve(path, argv, envp)
+  -> kernel reads ELF header
+  -> map PT_LOAD segments into virtual address space
+  -> map interpreter if dynamically linked
+  -> dynamic linker maps shared libraries and relocates symbols
+  -> runtime startup prepares C/C++ environment
+  -> global constructors run
+  -> runtime calls main(argc, argv, envp)
+\end{lstlisting}
+
+这解释了为什么 \code{main} 之前也可能发生错误或耗时：共享库缺失、符号解析、TLS 初始化、全局构造、首次触页、lazy binding，都不在 \code{main} 源码里，却在进程启动路径上。
+
+\subsection{本节验收命令}
+一个合格报告至少保存：
+
+\begin{lstlisting}[numbers=none,caption={add\_i32 证据包}]
+source:
+  add.cpp and caller.cpp
+
+commands:
+  c++ -E add.cpp -o add.i
+  c++ -S -O0 -masm=intel add.cpp -o add_O0.s
+  c++ -S -O3 -masm=intel add.cpp -o add_O3.s
+  c++ -c -O3 add.cpp -o add.o
+  c++ -O3 add.cpp caller.cpp -o app
+
+binary evidence:
+  nm -C add.o
+  objdump -drwC -Mintel add.o
+  readelf -h -l -S -s app
+  ldd ./app if dynamically linked
+  /proc/<pid>/maps during execution
+\end{lstlisting}
+
+学完这一节，不要求你背所有 ELF 字段，但要求你能把“源码里有一个函数”追到“目标文件里有什么符号、链接后地址如何成立、进程中它位于哪个虚拟映射”。
+
 \section{声明、定义和链接属性：名字如何跨文件成立}
 
 程序从一个源文件走向多个目标文件时，最核心的问题是名字如何被不同阶段理解。源码层的名字给程序员阅读，编译器前端用它做语义分析；目标文件层的符号给链接器解析；运行时的地址给 CPU 执行。声明、定义和链接属性就是把这些层连接起来的规则。

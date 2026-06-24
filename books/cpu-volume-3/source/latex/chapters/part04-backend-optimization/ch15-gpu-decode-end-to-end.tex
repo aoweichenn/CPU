@@ -261,6 +261,130 @@ GpuStepTrace:
 
 这些字段能定位典型问题：kernel 时间低但同步高，说明 host-device 边界有问题；copy 字节突然上升，说明某个 debug 或 fallback materialize 了中间张量；batch size 太小，说明调度器没有把 decode 合并起来。
 
+\subsection{为什么 decode 小 batch 难吃满 GPU}
+
+GPU 适合大量独立工作并行推进。prefill 有较大的 token 维度，linear 和 attention 可以形成大 GEMM 或大 batch attention；decode 单用户、单 token 时，很多算子形状退化成 \code{[1,H]} 乘权重，或者一个 query 读长 KV。问题不是 GPU 算不动，而是并行度、数据复用和固定开销不匹配。
+
+可以把 GPU decode 的一个 step 拆成四类成本：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+成本 & 来源 & 小 batch 风险 \\
+\midrule
+kernel launch & host 提交 kernel 到 device & 每步许多小 kernel，固定开销占比高 \\
+global memory & 权重、KV、activation、logits 读写 & 权重/KV 字节大，算术强度低 \\
+occupancy & SM 上活跃 warp 数和资源使用 & grid 太小或寄存器/shared memory 占用高 \\
+sync/copy & logits、sampler、fallback、debug materialize & host 等待 device，stream 被切断 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此“GPU 峰值 TFLOP/s 很高”不能直接推出“单用户 decode 很快”。报告必须拆 prefill 和 decode，还要记录 batch size、context length、kernel 数量、launch/sync/copy 时间和 device 端实际 kernel 时间。
+
+\subsection{occupancy 的原理边界}
+
+\term{occupancy}{占用率} 粗略表示一个 SM 上同时驻留的 active warps 与硬件上限的比例。它受 block size、每线程寄存器数量、每 block shared memory、线程块数量和硬件限制影响。更高 occupancy 能帮助隐藏 memory latency，但不是越高越快；如果为了提高 occupancy 减少寄存器导致 spill，或让每个线程做更少有用工作，性能可能下降。
+
+decode 小 batch 常见的 occupancy 问题有两类。第一，grid 本身太小：batch=1，某些小算子只发出很少 block，很多 SM 没有工作。第二，单个 kernel 资源占用高：attention kernel 为了处理长 context 使用较多寄存器或 shared memory，每个 SM 能驻留的 block 少，隐藏延迟能力下降。
+
+\begin{lstlisting}[numbers=none,caption={occupancy 报告要保存的字段}]
+kernel_name
+grid_dim
+block_dim
+registers_per_thread
+shared_memory_per_block
+estimated_active_warps_per_sm
+achieved_occupancy_if_available
+dram_bytes
+elapsed_us
+\end{lstlisting}
+
+occupancy 只能解释“是否有足够并行工作隐藏等待”，不能单独证明瓶颈。若 achieved occupancy 很高但 DRAM bandwidth 接近上限，继续提高 occupancy 不会有太大收益；若 occupancy 低且每步 kernel 很短，可能要做算子融合、合批或 persistent kernel，而不是只调 block size。
+
+\subsection{tensor core 为什么更偏爱 prefill}
+
+Tensor core 擅长固定 tile 的矩阵乘加，例如 FP16/BF16/TF32/INT8 的矩阵 tile。prefill 的 \code{A[T,H] x W[O,H]} 中，\code{T} 足够大时，可以形成大矩阵 tile，权重和 activation 都能在 tile 内复用。decode batch=1 时，\code{A[1,H]} 让矩阵的一维太小，tile 利用率低；即使使用 tensor core，很多 lane 可能没有足够有效工作。
+
+\begin{center}
+\begin{tabular}{p{0.20\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & tensor core 机会 & 常见限制 \\
+\midrule
+prefill & 大 GEMM，tile 饱满，权重复用高 & activation 峰值和 attention workspace \\
+decode 单用户 & 小 GEMM/GEMV，tile 不饱满 & launch、权重流、KV 读、低 batch \\
+decode 合批 & \code{B x H} 变大，可转小 GEMM & 等待凑 batch，p95/SLO 压力 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以 GPU serving 的关键是调度：在不破坏 SLO 的前提下，把多个 session 的 decode step 合并成更适合 GPU 的小 batch。batch 大了，吞吐可能上升；等待时间也可能上升。报告必须同时写 tokens/s、TTFT、TPOT、p50/p95/p99，而不是只写平均吞吐。
+
+\subsection{memory bandwidth 下界}
+
+延续 CPU 章节的 7B KV 账本。若 context=4096，fp16 KV 对一个 session 约 512 MiB。GPU attention kernel 不一定每 step 从 DRAM 读完整 512 MiB；cache、分块和并行归约会改变实际流量。但下界分析仍然有用：只要某个 step 的有效 KV 读取接近数百 MiB，latency 就会受到显存带宽约束。
+
+假设有效读流为 \code{400 MiB}，实际可用带宽 \code{800 GB/s}：
+
+\[
+time_{min} \approx 0.4 / 800 = 0.0005s = 0.5ms
+\]
+
+这只是 KV 读取，不含 projection、MLP、lm head、softmax、kernel launch 和 sampler。如果 profiler 显示 kernel 时间低于这个数量级，需要核对实际读字节、是否使用了更低精度 KV、是否只读窗口、是否 batch 共享了某些 prefix、计时边界是否只覆盖了部分 kernel。
+
+\subsection{kernel launch overhead 和融合}
+
+decode 每个 token 要经过多层，每层又有 RMSNorm、QKV projection、RoPE、attention、output projection、MLP、residual 等操作。如果每个小操作都是独立 kernel，launch overhead 和 stream 同步会变成显著成本。融合的目标不是让代码更炫，而是减少中间内存流和 kernel 数量。
+
+\begin{center}
+\begin{tabular}{p{0.25\linewidth}p{0.33\linewidth}p{0.27\linewidth}}
+\toprule
+融合方向 & 可能收益 & 风险 \\
+\midrule
+RMSNorm + QKV 前处理 & 减少 activation 读写 & kernel 专用化增加 \\
+RoPE + Q/K 写 cache & 减少一次 K/Q materialize & position/layout bug 更难查 \\
+attention score + softmax + V reduce & 减少中间 score 存储 & 数值稳定和 debug 成本 \\
+bias + activation + residual & 减少小 kernel 和内存流 & tail/广播规则复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+融合前必须有 reference 和 checkpoint oracle。否则 fused kernel 输出错了，很难判断是 RoPE position、softmax 稳定性、KV address、tail mask 还是 dtype 转换出错。
+
+\subsection{小 batch GPU decode 的实验矩阵}
+
+GPU decode 报告至少要做 shape sweep，而不是只测一个 prompt：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.30\linewidth}p{0.32\linewidth}}
+\toprule
+变量 & 建议取值 & 观察目的 \\
+\midrule
+batch size & 1, 2, 4, 8, 16 & 找到吞吐和 p95 的拐点 \\
+context length & 128, 512, 2048, 4096 & 分离 KV 读流影响 \\
+kernel fusion & off/on & 判断 launch 和中间内存流成本 \\
+sampler 位置 & CPU, GPU top-k, GPU sampler & 判断 copy/sync 成本 \\
+KV dtype & fp16, int8 if available & 判断容量、带宽和误差权衡 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+每组都要输出 \code{GpuStepTrace}，至少包含 kernel time、copy time、sync time、sampler time、fallback count、batch wait time 和 p95/p99。只有这样才能回答：GPU 慢是 kernel 本身慢，还是 batch 太小、launch 太多、copy 太多、fallback 静默发生，或者 scheduler 为吞吐牺牲了尾延迟。
+
+\subsection{GPU 原理展开模板}
+
+本书只把 GPU 作为 AI Infra 后端边界，不把它写成完整 CUDA 教材。但凡本书提到 GPU kernel，都必须按下面模板说明：
+
+\begin{itemize}
+  \item thread/block/warp/SM 如何映射到 tensor 维度。
+  \item global memory 读写字节和 coalescing 条件。
+  \item shared memory 或寄存器保存了什么 tile。
+  \item occupancy 受哪些资源限制。
+  \item 是否使用 tensor core，tile 是否饱满。
+  \item kernel launch、copy、sync 是否进入端到端 trace。
+  \item 小 batch、长 context 和 fallback 的边界是什么。
+\end{itemize}
+
 \subsection{发布前 GPU 检查表}
 
 \begin{rubricbox}

@@ -317,6 +317,210 @@ on each decoded token:
 权重量化成功不代表 KV cache 也能用同一套策略。权重是静态参数，KV cache 是动态状态；权重误差在每层固定存在，KV cache 误差会随着上下文读取方式进入后续 token。
 \end{warningbox}
 
+\subsection{三元素 dot-product 手算}
+
+量化如果不能手算，就很容易变成“把 float 压成 int8”的口号。固定一个最小 dot-product：
+
+\[
+x = [0.2,\ -0.5,\ 1.0], \quad
+w = [0.1,\ -0.3,\ 0.7]
+\]
+
+浮点 reference 是：
+
+\[
+0.2 \times 0.1 + (-0.5) \times (-0.3) + 1.0 \times 0.7
+= 0.02 + 0.15 + 0.7 = 0.87
+\]
+
+先用对称 int8 量化。对称量化选择 \code{zero\_point = 0}，scale 由最大绝对值决定：
+
+\[
+scale = \frac{\max(|values|)}{127}
+\]
+
+对输入 \code{x}，最大绝对值是 \code{1.0}，所以：
+
+\[
+scale_x = 1.0 / 127 \approx 0.007874
+\]
+
+量化值：
+
+\[
+q_x = round(x / scale_x) = [25,\ -64,\ 127]
+\]
+
+对权重 \code{w}，最大绝对值是 \code{0.7}：
+
+\[
+scale_w = 0.7 / 127 \approx 0.005512
+\]
+
+量化值：
+
+\[
+q_w = round(w / scale_w) = [18,\ -54,\ 127]
+\]
+
+整数 dot-product 用 int32 accumulator：
+
+\[
+acc = 25 \times 18 + (-64) \times (-54) + 127 \times 127
+= 450 + 3456 + 16129 = 20035
+\]
+
+反量化：
+
+\[
+y_q = acc \times scale_x \times scale_w
+\approx 20035 \times 0.007874 \times 0.005512
+\approx 0.870
+\]
+
+这个例子说明三件事。第一，int8 乘法的结果不能继续留在 int8，三个乘积相加已经到 20035，需要 int32 accumulator。第二，scale 的乘积是 accumulator 的真实单位。第三，误差来自 scale 选择、round、clamp 和有限码点，不是来自某个神秘的“量化损失”。
+
+\subsection{为什么 accumulator 要用 int32}
+
+最坏情况下，int8 乘积最大约为：
+
+\[
+127 \times 127 = 16129
+\]
+
+若 \code{K = 4096}，全为同号最大值，则：
+
+\[
+acc_{max} = 4096 \times 16129 \approx 66,064,384
+\]
+
+这个数远超 int16 的范围，但在 int32 范围内。若是 signed int8 的 \code{-128} 也进入计算，边界还要单独检查。量化 kernel 不能只在普通输入上测试；它必须测 near saturation、全正、全负、交替正负、大 \code{K} 和 bias 叠加后的边界。
+
+\begin{lstlisting}[numbers=none,caption={int8 dot-product 的溢出边界}]
+K = 4096
+max_product = 127 * 127
+max_acc = K * max_product
+
+int16 max = 32767        // not enough
+int32 max = 2147483647   // enough for this K
+\end{lstlisting}
+
+若后续引入 int4，单个乘积小很多，但 group scale、dequant-on-the-fly 和 packing 复杂度会上升。不要只按 bit width 判断速度；真正的内核要看 unpack 成本、scale 读取、向量指令支持和内存带宽。
+
+\subsection{非对称量化的手算边界}
+
+非对称量化用 \code{zero\_point} 表示实数 0 落在哪个整数码点。常见公式是：
+
+\[
+q = clamp(round(real / scale) + zero\_point)
+\]
+
+\[
+real \approx (q - zero\_point) \times scale
+\]
+
+它适合范围明显偏正的 activation。例如 activation 范围是 \([0.0, 1.0]\)，用 uint8 表示，scale 可以取：
+
+\[
+scale = \frac{1.0 - 0.0}{255}, \quad zero\_point = 0
+\]
+
+如果范围是 \([-0.2, 1.0]\)，zero point 会落在正整数附近，用来表达 0。问题是 dot-product 里每次都要处理 \((q_x-z_x)(q_w-z_w)\)，否则整数积不是原始实数积。前文展开式中的修正项，就是非对称量化的工程成本来源。
+
+\subsection{per-channel scale 的真实作用}
+
+per-tensor scale 用整个权重矩阵的最大绝对值决定一个 scale。若某一行权重范围很小，它会被大范围行拖累。以两行权重为例：
+
+\[
+w_0 = [0.01,\ -0.02,\ 0.03], \quad
+w_1 = [2.0,\ -1.5,\ 1.0]
+\]
+
+per-tensor scale 由 \code{2.0} 决定：
+
+\[
+scale = 2.0 / 127 \approx 0.01575
+\]
+
+\code{w_0} 里的 \code{0.01} 量化后约为 1，\code{-0.02} 约为 -1，\code{0.03} 约为 2，信息很粗。per-channel scale 则每个输出行单独选 scale，\code{w_0} 的 scale 由 \code{0.03} 决定：
+
+\[
+scale_0 = 0.03 / 127 \approx 0.000236
+\]
+
+小行的细节保留更多。代价是每个输出通道都要有自己的 scale，requantize 或 dequant 时不能只用一个 multiplier。CPU packed weight 也要保证第 \code{out} 行的 scale 与 packed 数据一起可定位；GPU kernel 则要避免 scale 读取破坏 coalescing。
+
+\subsection{从数值公式到 C++ quantizer}
+
+教学 quantizer 应该短到可以审查，但要把 round 和 clamp 写清。
+
+\begin{lstlisting}[language=C++,caption={对称 int8 量化的教学实现}]
+struct SymmetricQuantParams {
+    float scale = 1.0F;
+};
+
+std::int8_t quantize_symmetric_i8(float value, SymmetricQuantParams params)
+{
+    float scaled = std::round(value / params.scale);
+    float clamped = std::clamp(scaled, -127.0F, 127.0F);
+    return static_cast<std::int8_t>(clamped);
+}
+
+float dequantize_symmetric_i8(std::int8_t value, SymmetricQuantParams params)
+{
+    return static_cast<float>(value) * params.scale;
+}
+\end{lstlisting}
+
+这段代码故意不用 \code{-128}，是为了让正负范围对称，便于推导。工业实现可能使用 \code{-128}，也可能针对特定指令或格式选择不同边界；关键是格式合同必须写进模型 manifest 和 oracle，不能让不同 kernel 各自猜。
+
+\subsection{量化错误如何进入 logits}
+
+量化误差不是只停留在线性层输出。一个 transformer block 中，投影误差会进入 attention score、softmax、attention output、MLP、residual 和下一层。K 的误差会影响 score：
+
+\[
+score = \frac{q \cdot k}{\sqrt{d}}
+\]
+
+若 score 的两个候选位置非常接近，微小误差可能改变 softmax 排名。V 的误差进入加权和：
+
+\[
+out = \sum_i softmax(score_i) \times v_i
+\]
+
+MLP 权重量化误差则可能改变某些 hidden 维度的激活。最终 lm head 输出 logits，sampler 对 top-k、top-p、temperature 和随机数敏感。因此 7B 量化报告不能只写单层 \code{max_abs_error}。至少要同时看：
+
+\begin{itemize}
+  \item 每层输出误差是否随层数放大。
+  \item logits top-k 是否稳定。
+  \item 固定 prompt、固定 seed 的 token 序列在哪一步开始分叉。
+  \item 长上下文下 KV 量化是否比短上下文更容易漂移。
+  \item 饱和值是否集中在某个层、某个 head 或某个 group。
+\end{itemize}
+
+\subsection{量化章节的原理展开模板}
+
+以后每引入一种量化格式，都按同一张表验收：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.58\linewidth}}
+\toprule
+项目 & 必须回答的问题 \\
+\midrule
+问题来源 & 要省权重容量、activation 带宽、KV 容量，还是提高某条 kernel 吞吐 \\
+抽象模型 & real、q、scale、zero point、group、accumulator 分别是什么 \\
+数学公式 & quant、dequant、dot、requant、bias fold 的公式 \\
+C++ 表示 & manifest 字段、descriptor、quantizer、oracle 输入输出 \\
+内存布局 & 整数码点和 scale metadata 如何排列，packing 是否改变它们的对应关系 \\
+机器执行 & 使用 int32 dot、dequant-on-the-fly、固定点 requant，还是查表/特化 kernel \\
+性能模型 & 少读多少字节，多做多少 unpack/scale 操作，瓶颈从哪里迁到哪里 \\
+正确性边界 & round、clamp、overflow、bias scale、top-k/logits 阈值 \\
+错误案例 & scale 用错、zero point 漏减、group scale 错位、bias 尺度混用 \\
+工业处理 & 权重离线量化，activation 校准，KV 单独评估，后端特化 layout \\
+\bottomrule
+\end{tabular}
+\end{center}
+
 \subsection{当前 lab 到 7B 量化路径的升级点}
 
 现在的 \code{linear_i8} 可以作为第一阶段验收：模型加载、shape 检查、int8 权重读取、float scale 和 bias、activation、argmax 都已经有清楚边界。要把它升级成 7B 推理引擎里的量化路径，应分阶段推进，而不是一次重写：

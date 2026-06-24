@@ -416,6 +416,239 @@ KvTraceEvent:
 
 当长上下文性能变差时，可以按 \code{visible\_end-visible\_begin} 分桶；当内存泄漏时，可以看 \code{reserve} 和 \code{release} 是否配对；当 prefix 复用错位时，可以看 \code{model\_position} 是否从 prefix 长度后继续。
 
+\subsection{从 4 个 token 手算 KV cache}
+
+把 KV cache 讲清楚，不能只说“避免重复计算历史 token”。先固定一个小模型：
+
+\begin{lstlisting}[numbers=none,caption={KV cache 手算模型}]
+layers = 2
+query_heads = 2
+kv_heads = 1
+head_dim = 2
+sequence positions = 0, 1, 2, 3
+dtype = fp16
+\end{lstlisting}
+
+每一层、每个 token 都会生成当前 token 的 \code{K} 和 \code{V}。因为 \code{kv\_heads = 1}，两个 query head 共享同一个 KV head。这就是 GQA 的最小形状。第 0 个 token decode 时，cache 为空，当前层计算出 \code{K0,V0}，写入 position 0，然后 attention 只能读 position 0。第 1 个 token 计算出 \code{K1,V1}，写入 position 1，然后读 position 0 和 1。第 2 个 token 读 0、1、2。第 3 个 token 读 0、1、2、3。
+
+\begin{center}
+\begin{tabular}{p{0.12\linewidth}p{0.26\linewidth}p{0.38\linewidth}p{0.12\linewidth}}
+\toprule
+step & 写入 & 本 step 可读范围 & 读 token 数 \\
+\midrule
+0 & K[0], V[0] & 0..0 & 1 \\
+1 & K[1], V[1] & 0..1 & 2 \\
+2 & K[2], V[2] & 0..2 & 3 \\
+3 & K[3], V[3] & 0..3 & 4 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表解释了 decode latency 为什么随 context 增长。每个新 token 只写一个位置，但它要读越来越长的历史。prefill 和 decode 的差异也在这里：prefill 一次处理一段 prompt，可以把多个 token 的 Q、K、V 当作矩阵批量计算；decode 每次只有当前 token 的 Q，但 attention score 要和历史所有 K 做点积。
+
+\subsection{GQA 的 head 映射公式}
+
+当 \code{query\_heads > kv\_heads} 时，不是每个 query head 都有独立 K/V。常用映射是：
+
+\[
+kv\_head = \left\lfloor
+  \frac{query\_head \times kv\_heads}{query\_heads}
+\right\rfloor
+\]
+
+对上面的最小模型，\code{query\_heads = 2}，\code{kv\_heads = 1}，所以：
+
+\begin{center}
+\begin{tabular}{p{0.22\linewidth}p{0.22\linewidth}p{0.38\linewidth}}
+\toprule
+query head & kv head & 含义 \\
+\midrule
+0 & 0 & 第 0 个 query head 读唯一 KV head \\
+1 & 0 & 第 1 个 query head 也读唯一 KV head \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+更真实的 7B 形状常见 \code{query\_heads = 32}、\code{kv\_heads = 8}，则每 4 个 query head 共享 1 个 KV head：
+
+\[
+kv\_head = query\_head / 4
+\]
+
+这不是性能细节，而是语义合同。若映射写错，shape 仍然能对上，程序也可能不崩溃，但某些 head 会读到错误历史，表现为 logits 漂移、长上下文回答变差、特定 prompt 复现不稳定。KV oracle 必须能按 \code{query\_head} 打印映射结果。
+
+\subsection{连续布局的地址公式}
+
+假设连续 KV cache 使用 layout：
+
+\begin{lstlisting}[numbers=none,caption={连续 KV cache layout}]
+K[layer, position, kv_head, head_dim]
+V[layer, position, kv_head, head_dim]
+\end{lstlisting}
+
+令 \code{L} 是层数，\code{S} 是最大 context，\code{Hkv} 是 KV head 数，\code{D} 是 head dim。若元素是 fp16，单元素 2 字节。K 的线性 offset 是：
+
+\[
+offset_K =
+(((layer \times S + position) \times Hkv + kv\_head) \times D + dim)
+\]
+
+地址是：
+
+\[
+addr_K = base_K + offset_K \times sizeof(element)
+\]
+
+对手算模型，\code{S=4}、\code{Hkv=1}、\code{D=2}。第 1 层、position 3、kv head 0、dim 1 的 K offset 为：
+
+\[
+(((1 \times 4 + 3) \times 1 + 0) \times 2 + 1) = 15
+\]
+
+若 fp16，则地址距离 \code{base\_K} 为 \code{30} 字节。这个小数值例子很重要：它逼着读者区分 layer、position、head 和 dim。很多 KV bug 不是公式很难，而是把 \code{position} 和物理 slot、把 \code{query\_head} 和 \code{kv\_head} 混在一起。
+
+\subsection{layout A/B 为什么会影响 decode}
+
+连续布局至少有两种常见方向：
+
+\begin{lstlisting}[numbers=none,caption={两种 KV layout}]
+layout A:
+  K[layer, position, kv_head, dim]
+
+layout B:
+  K[layer, kv_head, position, dim]
+\end{lstlisting}
+
+对单个 query head 做 decode attention 时，通常固定 \code{layer} 和 \code{kv\_head}，沿 \code{position} 读取所有历史 K，再沿 \code{dim} 做 dot product。layout A 中，相邻 position 之间距离是 \code{Hkv * D} 个元素；layout B 中，固定 head 后 position 更连续，距离是 \code{D} 个元素。若 \code{Hkv} 较大，layout A 的历史扫描会跨更大步长；若 append 当前 token 要同时写所有 KV heads，layout A 的写入更接近一段连续块。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+layout & 优点 & 风险 \\
+\midrule
+\code{[layer,pos,head,dim]} & 当前 token append 多 head 较自然 & 单 head 扫历史时 position 跨步为 \code{Hkv * D} \\
+\code{[layer,head,pos,dim]} & 单 head 历史扫描更连续 & append 所有 head 可能分散到多个区域 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+所以 layout 选择不能脱离 kernel。CPU decode attention 若按 head 扫历史，可能偏好 head-major；GPU kernel 若按 block 组织 token 和 head，可能选择分页或分块布局，让一组线程读取连续位置。成熟系统的关键不是“某个 layout 永远最好”，而是 descriptor、kernel 和 oracle 必须使用同一地址解释。
+
+\subsection{每 token KV 字节账本}
+
+7B 形状取 \code{layers=32}、\code{kv\_heads=8}、\code{head\_dim=128}、fp16。每个 token 每层写 K 和 V：
+
+\[
+bytes\_per\_layer\_token = 2 \times kv\_heads \times head\_dim \times 2
+\]
+
+代入：
+
+\[
+2 \times 8 \times 128 \times 2 = 4096\ bytes = 4\ KiB
+\]
+
+所有 32 层：
+
+\[
+4096 \times 32 = 131072\ bytes = 128\ KiB/token
+\]
+
+4096 context：
+
+\[
+128\ KiB \times 4096 = 512\ MiB
+\]
+
+这只是一个 session 的 KV，不含权重、workspace、logits、allocator 碎片和 metadata。若 10 个并发长上下文 session 同时存在，KV 容量就是数 GB 级。这个账本解释了为什么 KV cache 是 serving 的 admission control 问题，而不是 attention kernel 的一个局部数组。
+
+\subsection{decode 读写字节和 latency 下界}
+
+每生成一个新 token，写入当前 token 的 K/V 是固定的 \code{128 KiB/token}。但 attention 读取历史 KV 与 context 长度成正比。对 position 为 \code{t} 的 token，粗略读取量是：
+
+\[
+read\_bytes(t) \approx layers \times 2 \times kv\_heads \times head\_dim \times sizeof(dtype) \times (t+1)
+\]
+
+在上面的 7B 形状下，每个历史 token 对所有层贡献约 \code{128 KiB} 的可读 K/V。context 为 4096 时，单步 attention 可能面对约 \code{512 MiB} 的 KV 读流。实际 kernel 会分层执行、分块读取、复用 cache 或 shared memory，并且不一定每一步都把全部字节以最坏方式经过 DRAM；但数量级告诉我们：长上下文 decode 很容易被内存带宽和访存组织限制。
+
+若设备有效 KV 读取带宽只有 \code{100 GB/s}，单步读 \code{512 MiB} 的理论下界约为：
+
+\[
+0.5\ GB / 100\ GB/s = 5\ ms
+\]
+
+这个下界还没有算 QKV projection、MLP、lm head、softmax、采样和调度。若报告声称 4096 context 的单 session decode 达到极高 tokens/s，就必须解释 KV 读流如何被减少、压缩、分页复用、合批或落在更高有效带宽上。
+
+\subsection{C++ descriptor 和 append/read 验证代码}
+
+KV cache 的 C++ 表示应把地址合同放在一个地方，而不是散落在 kernel 调用点。一个教学版 descriptor 可以写成：
+
+\begin{lstlisting}[language=C++,caption={连续 KV cache descriptor 的教学形态}]
+enum class KvLayout {
+    LayerPositionHeadDim,
+    LayerHeadPositionDim,
+};
+
+struct KvCacheDesc {
+    std::int32_t layers = 0;
+    std::int32_t max_context = 0;
+    std::int32_t query_heads = 0;
+    std::int32_t kv_heads = 0;
+    std::int32_t head_dim = 0;
+    std::int32_t element_bytes = 2;
+    KvLayout layout = KvLayout::LayerPositionHeadDim;
+};
+
+std::int64_t map_query_head(const KvCacheDesc& desc, std::int32_t query_head)
+{
+    return static_cast<std::int64_t>(query_head) * desc.kv_heads / desc.query_heads;
+}
+
+std::int64_t k_offset_lpdh(
+    const KvCacheDesc& desc,
+    std::int32_t layer,
+    std::int32_t position,
+    std::int32_t kv_head,
+    std::int32_t dim)
+{
+    return (((static_cast<std::int64_t>(layer) * desc.max_context + position)
+             * desc.kv_heads + kv_head)
+            * desc.head_dim + dim);
+}
+\end{lstlisting}
+
+这段代码不是最终高性能实现，但它能成为 address oracle。任何分页、量化、GPU layout 都应有类似的地址解释函数，用于在 debug 模式下检查 \code{append} 是否写到预期位置，\code{read\_range} 是否读了正确历史。
+
+\subsection{错误案例：position、head 和 slot 三种混淆}
+
+KV cache 最常见的错误可以用同一个 4 token 例子复现。
+
+\begin{lstlisting}[numbers=none,caption={KV cache 三类典型错误}]
+position bug:
+  prefix length = 2
+  next decoded token should use model_position = 2
+  wrong implementation restarts at position = 0
+
+GQA bug:
+  query_head = 5, query_heads = 32, kv_heads = 8
+  expected kv_head = 1
+  wrong implementation uses kv_head = 5
+
+slot bug:
+  paged cache physical slot wraps to 0
+  logical position is still 4096
+  wrong implementation feeds slot id into RoPE position
+\end{lstlisting}
+
+第一类错误会让 prefix 后输出突然漂移。第二类错误通常只污染部分 head，最终 logits 变化不一定每次都巨大，但长文本会越来越差。第三类错误最隐蔽：物理 slot 可以复用，模型 position 不能随便回绕。RoPE 使用的是语义位置，不是存储槽编号。
+
+\subsection{工业系统如何处理这类问题}
+
+成熟推理系统通常把 KV cache 当成 session state，而不是普通 activation。它们会把 KV layout、block table、prefix 共享、context limit、量化策略和设备位置写进 runtime plan 或 session metadata。分页 KV 的核心思想是把长上下文切成固定 token block，session 保存逻辑 position 到物理 block 的表；这样可以减少大块连续预留，支持 prefix 共享和更灵活的回收。代价是 attention kernel 必须读 block table，地址计算更复杂，oracle 也必须能解释 logical-to-physical 映射。
+
+本书的工程标准是：即使暂时不实现完整 paged attention，也要把 descriptor 和 trace 设计到能表达它。否则连续 KV 写死在接口里，后面再接 batching、prefix cache、KV 量化或 GPU backend，会出现大面积重构。
+
 \subsection{本节验收线}
 
 读完本节，应该能设计一个可靠 KV cache：

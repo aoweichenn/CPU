@@ -281,6 +281,219 @@ evidence: latency, tokens_per_second, error_report
 
 这份合同让第三册后续能一步一步把性能提高，而不是一次跳到“对标成熟框架”。每次优化都必须说明它改变了哪一栏：是 dtype 从 fp32 变成 int8，还是 packed layout 变了；是 mode 只覆盖 prefill，还是 decode 也受益；是 CPU 后端新增 SIMD path，还是 GPU 后端新增 kernel；是降低了 latency，还是提高了 batch 吞吐。
 
+\subsection{用 T=2, K=8, N=6 手算一次 GEMM}
+
+固定一个小矩阵，避免 GEMM 只停在符号层：
+
+\[
+A[T,K] = A[2,8], \quad W[N,K] = W[6,8], \quad C[T,N] = C[2,6]
+\]
+
+这里 \code{T} 是 token 或 batch 行数，\code{K} 是 hidden/input 维度，\code{N} 是输出通道数。采用推理里常见的权重表示 \code{W[out,k]}，计算公式是：
+
+\[
+C[t,n] = \sum_{k=0}^{K-1} A[t,k] \times W[n,k]
+\]
+
+例如：
+
+\[
+C[1,4] =
+A[1,0]W[4,0] + A[1,1]W[4,1] + \cdots + A[1,7]W[4,7]
+\]
+
+若原始 row-major 存储，地址 offset 为：
+
+\[
+offset_A(t,k) = t \times K + k
+\]
+
+\[
+offset_W(n,k) = n \times K + k
+\]
+
+\[
+offset_C(t,n) = t \times N + n
+\]
+
+计算 \code{C[0,0..5]} 时，\code{A[0,0..7]} 会被每个输出通道重复使用 6 次，权重则按行读取 \code{W[0,0..7]}、\code{W[1,0..7]}，直到 \code{W[5,0..7]}。计算 \code{C[1,0..5]} 时，权重完全相同，又被复用一次。这就是 prefill 或 batch GEMM 的核心机会：\code{T} 越大，权重复用越多。
+
+\subsection{原始 layout 到 packed layout 的地址变化}
+
+假设 micro-kernel 想一次算 \code{BN=4} 个输出通道。对某个 \code{k}，它想连续拿到：
+
+\[
+W[0,k], W[1,k], W[2,k], W[3,k]
+\]
+
+但原始 row-major \code{W[n,k]} 中，相邻输出通道的地址差是 \code{K=8} 个元素：
+
+\begin{lstlisting}[numbers=none,caption={原始 W 在同一个 k 下跨输出通道}]
+W[0,k] offset = 0 * 8 + k
+W[1,k] offset = 1 * 8 + k
+W[2,k] offset = 2 * 8 + k
+W[3,k] offset = 3 * 8 + k
+
+stride between W[n,k] and W[n+1,k] = 8 elements
+\end{lstlisting}
+
+packing 可以把 \code{out=0..3, k=0..7} 的 panel 改成 \code{k-major}：
+
+\begin{lstlisting}[numbers=none,caption={BN=4 的 packed panel}]
+packed offset for panel(out_base=0):
+  k=0: W[0,0], W[1,0], W[2,0], W[3,0]
+  k=1: W[0,1], W[1,1], W[2,1], W[3,1]
+  ...
+  k=7: W[0,7], W[1,7], W[2,7], W[3,7]
+\end{lstlisting}
+
+此时 micro-kernel 每个 \code{k} 读取 \code{packed[k,0..3]} 是连续的。若 SIMD lane 正好能容纳 4 个 int8、int16 或 float 元素的一组处理，地址流就变简单了。第二个 panel \code{out=4..5} 是尾部 panel，只有 2 个输出通道；它可以走 mask/tail kernel，也可以在 packing 时补零，但补零必须让 oracle 知道真实 \code{N=6}，不能把补出来的输出当成有效通道。
+
+\subsection{decode GEMV 的字节账本}
+
+decode 时常见形状是：
+
+\[
+A[1,K] \times W[N,K] \rightarrow C[1,N]
+\]
+
+令 \code{K=4096}、\code{N=4096}、fp16 权重和 fp16 activation。一次 GEMV 的主要账本是：
+
+\[
+weight\ bytes = N \times K \times 2 = 4096 \times 4096 \times 2 \approx 32\ MiB
+\]
+
+\[
+activation\ bytes = K \times 2 = 8\ KiB
+\]
+
+\[
+output\ bytes = N \times 2 = 8\ KiB
+\]
+
+每个输出做 \code{K} 次乘加，共：
+
+\[
+flops = 2 \times N \times K \approx 33.6\ MFLOP
+\]
+
+算术强度粗略为：
+
+\[
+AI \approx \frac{33.6\ MFLOP}{32\ MiB} \approx 1.0\ FLOP/byte
+\]
+
+这说明 decode GEMV 很容易被权重读取带宽限制。activation 很小，可以留在 cache 或寄存器附近；输出也小；真正大的是每个 token 都要扫一遍权重。int8 权重把权重字节减半到约 \code{16 MiB}，int4 再减半到约 \code{8 MiB}，但会引入 scale、unpack 和 dequant 成本。
+
+\subsection{prefill GEMM 为什么更容易吃满算力}
+
+prefill 若一次处理 \code{T=128} 个 token，形状变成：
+
+\[
+A[128,4096] \times W[4096,4096] \rightarrow C[128,4096]
+\]
+
+权重仍然约 \code{32 MiB}，但被 128 行输入复用。FLOPs 变为：
+
+\[
+2 \times 128 \times 4096 \times 4096 \approx 4.29\ GFLOP
+\]
+
+只按权重字节估算，算术强度从约 \code{1 FLOP/byte} 提升到约 \code{128 FLOP/byte}。实际还要读 activation、写 output、处理 cache blocking 和 attention 中间量，但方向很清楚：prefill 更像大 GEMM，适合 tile、packing、线程并行、GPU tensor core；decode 单 token 更像 GEMV 或小 GEMM，权重流和调度固定成本更突出。
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.25\linewidth}p{0.25\linewidth}p{0.20\linewidth}}
+\toprule
+阶段 & 典型形状 & 权重复用 & 常见瓶颈 \\
+\midrule
+prefill & \code{T x K} by \code{N x K} & 高，复用到多 token & compute、tile、activation 峰值 \\
+decode & \code{1 x K} by \code{N x K} & 低，单 token 扫权重 & memory bandwidth、launch、KV 读 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{register tiling 不是玄学}
+
+以 \code{BM=2, BN=4} 为例，micro-kernel 需要维护 8 个 accumulator：
+
+\[
+acc[0,0], acc[0,1], acc[0,2], acc[0,3],
+acc[1,0], acc[1,1], acc[1,2], acc[1,3]
+\]
+
+每个 \code{k}，读取两个 activation：
+
+\[
+a_0 = A[t+0,k], \quad a_1 = A[t+1,k]
+\]
+
+再读取四个 packed 权重：
+
+\[
+w_0,w_1,w_2,w_3 = W[out+0..3,k]
+\]
+
+然后执行 8 次乘加：
+
+\[
+acc[0,i] += a_0 \times w_i,\quad
+acc[1,i] += a_1 \times w_i
+\]
+
+这些 accumulator 最好留在寄存器里。如果 \code{BM} 和 \code{BN} 取得太大，accumulator、输入临时值、权重向量、指针和 loop counter 会超过寄存器预算，编译器或手写汇编就会 spill 到栈，性能反而下降。因此 tile 大小要同时满足 cache 工作集和寄存器账本，不是越大越好。
+
+\subsection{反汇编要验证什么}
+
+GEMM/GEMV 优化报告里的反汇编不是装饰。至少要验证：
+
+\begin{itemize}
+  \item 内层循环是否真的使用目标 SIMD/dot 指令，而不是标量乘加。
+  \item packed 权重是否连续 load，是否出现意外 gather 或复杂地址。
+  \item accumulator 是否留在寄存器，是否有明显 spill/load/store。
+  \item 尾部路径是否分离，主循环是否被尾部判断污染。
+  \item int8/int4 路径是否把 unpack、scale 读取和 dot-product 放在合理位置。
+\end{itemize}
+
+\begin{lstlisting}[numbers=none,caption={micro-kernel 报告必须贴出的材料}]
+source:
+  scalar reference and optimized kernel
+
+descriptor:
+  BM, BN, BK, dtype, packed layout, tail policy
+
+assembly:
+  inner loop disassembly
+  load/FMA/dot/reduce instructions
+  tail path disassembly
+
+perf:
+  elapsed ns, bytes, FLOPs, GB/s, GFLOP/s
+  cycles, instructions, IPC if available
+  cache/TLB counters if available
+\end{lstlisting}
+
+\subsection{错误案例：packing 正确但解释错误}
+
+packing 最危险的 bug 是“字节确实被复制了，但 kernel 和 oracle 对它的解释不同”。例如 packing 写入顺序是：
+
+\begin{lstlisting}[numbers=none]
+packed[k, lane] = W[out_base + lane, k]
+\end{lstlisting}
+
+但 kernel 读取时以为：
+
+\begin{lstlisting}[numbers=none]
+packed[lane, k] = W[out_base + lane, k]
+\end{lstlisting}
+
+对某些小矩阵，若数据恰好对称或测试只用了全 1 权重，这个错误可能不暴露。因此 GEMM/GEMV oracle 必须使用非对称、非重复、带尾部的测试数据。例如令：
+
+\[
+W[n,k] = 100n + k
+\]
+
+这样只要 \code{n} 和 \code{k} 被交换，输出会立刻错。测试数据要故意让地址维度可辨认，而不是只用随机数或全零全一。
+
 \subsection{把现有 lab 放进这条路线}
 
 当前 \filepath{books/cpu-volume-3/labs/linux_cpu_inference/} 里的 \code{linear_i8} 是一个故意朴素的内核。它按输出行遍历 int8 权重，把每个权重乘以 scale 后与 float 输入相乘，并把结果累加到 float：

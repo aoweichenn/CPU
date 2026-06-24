@@ -440,6 +440,161 @@ conclusion:
 
 这张图同时说明两个边界。若 C 没有读到 B 写的值，就没有这条同步边；若 \code{payload} 在 B 之后又被无同步修改，A 到 D 的结论不能保护后续修改。Happens-before 图必须绑定具体值和具体状态转换，不能只写“这里用了 acquire”。
 
+\topic{手算一次 message passing}
+把上面的图变成逐步审查。初始状态：
+
+\begin{lstlisting}[numbers=none,caption={message passing 初始状态}]
+payload.value = 0
+ready = false
+\end{lstlisting}
+
+生产者执行：
+
+\begin{lstlisting}[numbers=none]
+A: payload.value = 42
+B: ready.store(true, release)
+\end{lstlisting}
+
+消费者执行：
+
+\begin{lstlisting}[numbers=none]
+C: while (!ready.load(acquire)) {}
+D: read payload.value
+\end{lstlisting}
+
+若 C 的某次 acquire load 读到 \code{false}，它只说明还没观察到发布值，不能读取 payload。若 C 读到 B 写入的 \code{true}，C 与 B 建立 synchronizes-with；再加上 A 在线程内先于 B，C 在线程内先于 D，于是 A happens-before D。结论是：D 读取 payload 时必须看到 A 或 A 之后在同一同步保护下的写入。
+
+如果 B 改成 relaxed，C 即使用 acquire load 读到 \code{true}，也没有对应 release 可同步；如果 C 改成 relaxed，B 的 release 没有被 acquire 获取；如果 A 被移到 B 之后，release 只发布 B 之前的写，D 仍然没有理由看到 A。内存序不是变量装饰，而是语句位置和读取值共同决定的边。
+
+\begin{center}
+\begin{tabular}{p{0.24\linewidth}p{0.36\linewidth}p{0.26\linewidth}}
+\toprule
+错误改动 & 缺失的边 & 可能后果 \\
+\midrule
+B 用 relaxed & release 不存在 & ready 为 true 但 payload 未发布 \\
+C 用 relaxed & acquire 不存在 & 读到 ready 也不能依赖 payload \\
+A 在 B 之后 & 发布点太早 & 发布的是旧 payload 状态 \\
+C 读到 false & 没读到发布值 & 不能建立同步边 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\topic{SPSC 槽位状态的最小协议}
+单生产者单消费者队列比 message passing 多一个问题：槽位会复用。一个槽位不能只有 \code{ready}，还要有 generation 或者严格的 head/tail 规则，避免消费者把上一轮 ready 当成下一轮 ready。
+
+\begin{lstlisting}[language=C++,caption={SPSC 槽位的教学协议}]
+enum class SlotState {
+  Empty,
+  Ready
+};
+
+template <class T>
+struct SpscSlot {
+  T value;
+  std::atomic<SlotState> state{SlotState::Empty};
+};
+
+template <class T>
+void produce(SpscSlot<T>& slot, const T& value)
+{
+  while (slot.state.load(std::memory_order_acquire) != SlotState::Empty) {
+  }
+  slot.value = value;
+  slot.state.store(SlotState::Ready, std::memory_order_release);
+}
+
+template <class T>
+T consume(SpscSlot<T>& slot)
+{
+  while (slot.state.load(std::memory_order_acquire) != SlotState::Ready) {
+  }
+  T value = slot.value;
+  slot.state.store(SlotState::Empty, std::memory_order_release);
+  return value;
+}
+\end{lstlisting}
+
+生产者写 \code{value} 后 release 发布 \code{Ready}；消费者 acquire 读到 \code{Ready} 后才能读 \code{value}。消费者读完 \code{value} 后 release 发布 \code{Empty}；生产者 acquire 读到 \code{Empty} 后才能覆盖 \code{value}。这是一条双向协议，不是一个 relaxed flag。若扩展到环形队列，还要把每个槽位的 generation、head/tail 单写者、wrap-around 和析构责任写进协议。
+
+\topic{double checked locking 的真正边界}
+双重检查锁定常被写错：
+
+\begin{lstlisting}[numbers=none,caption={危险形状：指针可见不代表对象构造已发布}]
+if (ptr.load(relaxed) == nullptr) {
+  lock(m);
+  if (ptr.load(relaxed) == nullptr) {
+    ptr.store(new Object(...), relaxed);
+  }
+  unlock(m);
+}
+use(*ptr.load(relaxed));
+\end{lstlisting}
+
+问题不是“用了两次 if”，而是指针发布和对象构造之间缺少可移植同步。正确设计通常有三个选择。第一，直接用 \code{std::call_once}，把复杂性交给库；第二，用 mutex 覆盖读取和构造，牺牲一点读路径成本；第三，用 release store 发布完整构造后的指针，读取方 acquire load 获取指针，并且对象生命周期必须保证不被提前释放。
+
+\begin{lstlisting}[numbers=none,caption={原子指针发布至少要写清的合同}]
+writer:
+  construct object completely
+  published.store(ptr, release)
+
+reader:
+  ptr = published.load(acquire)
+  if ptr != null:
+      object fields published before release are readable
+
+lifetime:
+  object is never deleted until all readers are stopped
+  or protected by shared_ptr, epoch, hazard pointer, or RCU
+\end{lstlisting}
+
+Acquire/release 只能发布构造完成事实，不能解决释放时机。很多 DCL bug 不是读到半构造对象，而是热更新后旧对象被释放，读者仍持有裸指针。
+
+\topic{ABA 是生命周期问题，不只是 CAS 问题}
+Treiber stack 之类结构常见 ABA：线程 A 读取 head 为节点 X，准备 CAS；线程 B pop X，再 push X 或复用同一地址；线程 A 的 CAS 看到 head 仍是 X，于是误以为状态没变。CAS 比较的是位模式，不知道对象是否经历过出栈、释放和复用。
+
+\begin{lstlisting}[numbers=none,caption={ABA 的时间线}]
+T1: old = head.load()        // old == X
+T1: next = old->next
+
+T2: pop X
+T2: free or reuse X
+T2: push X at same address
+
+T1: CAS(head, old, next) succeeds by address equality
+    but logical stack changed
+\end{lstlisting}
+
+解决思路包括 tagged pointer、hazard pointer、epoch based reclamation、引用计数或退回锁。选择哪一种，要看对象复用频率、读者数量、延迟边界和实现复杂度。单纯把 CAS 内存序改成 \code{seq\_cst} 不能解决 ABA，因为问题不在排序，而在对象身份和生命周期。
+
+\topic{MemoryModelReport 模板}
+任何非平凡原子协议都应附一份报告：
+
+\begin{lstlisting}[numbers=none,caption={MemoryModelReport 最小字段}]
+shared_objects
+ordinary_fields_protected
+atomic_protocol_variables
+for_each_atomic:
+  role: metric | publication | state | pointer | slot
+  writers
+  readers
+  success_order
+  failure_order_if_CAS
+  published_fields
+  lifetime_rule
+happens_before_edges
+linearization_points
+allowed_stale_observations
+forbidden_observations
+fallback_lock_reference
+tests:
+  litmus
+  stress
+  sanitizer
+  linearization_log
+\end{lstlisting}
+
+这份报告不是形式主义。它能直接暴露问题：若 \code{published\_fields} 为空，这个 atomic 也许只是 relaxed 指标；若 \code{lifetime\_rule} 写不出来，不能发布裸指针；若 \code{forbidden\_observations} 不明确，就无法判断是否需要 acquire/release 或 seq-cst。
+
 \topic{线性化点回答操作何时生效}
 线性化点是一个并发操作在逻辑上生效的瞬间。对 mutex 保护的队列，\code{push} 的线性化点通常在锁内状态更新完成；对 CAS 状态机，成功 CAS 往往就是责任转移点；对 completion，manifest append 成功才是业务提交点。线性化点不是性能术语，而是正确性合同。
 
