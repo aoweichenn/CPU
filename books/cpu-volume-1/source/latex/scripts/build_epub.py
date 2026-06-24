@@ -10,6 +10,7 @@ contents: front matter, parts, chapters, appendices, and glossary.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import html
 import os
 import re
@@ -1251,6 +1252,7 @@ def build_opf(
     epub_version: str = "3.0",
     include_css: bool = True,
     include_legacy_toc: bool = False,
+    include_legacy_toc_in_spine: bool = True,
 ) -> str:
     manifest_items = ['<item id="ncx" href="toc.ncx" media-type="application/x-dtbncx+xml"/>']
     if include_css:
@@ -1264,7 +1266,7 @@ def build_opf(
             f'<item id="font-{idx}" href="{html.escape(font.href, quote=True)}" media-type="{font.media_type}"/>'
         )
     spine_items = []
-    if include_legacy_toc:
+    if include_legacy_toc and include_legacy_toc_in_spine:
         spine_items.append('<itemref idref="toc-html"/>')
     first_content_href = ""
     for idx, entry in enumerate(flatten_nav(entries), start=1):
@@ -1669,7 +1671,6 @@ def build_epub(
     entries, parts = collect_entries(book_dir, include_cover=include_cover, legacy_names=WECHAT_COMPATIBLE)
     fonts = [] if WECHAT_COMPATIBLE or not embed_fonts else collect_embedded_fonts()
     inline_css = legacy_stylesheet() if WECHAT_COMPATIBLE else ""
-    uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{BOOK_ID_SEED}"))
     modified = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
     pages: dict[str, str] = {}
@@ -1689,6 +1690,13 @@ def build_epub(
             )
         elif entry.kind == "chapter":
             pages[entry.output] = convert_source(entry, legacy_markup=WECHAT_COMPATIBLE, inline_css=inline_css)
+
+    content_digest = hashlib.sha256()
+    content_digest.update(BOOK_ID_SEED.encode("utf-8"))
+    for name in sorted(pages):
+        content_digest.update(name.encode("utf-8"))
+        content_digest.update(pages[name].encode("utf-8"))
+    uid = str(uuid.uuid5(uuid.NAMESPACE_URL, f"https://github.com/aoweichenn/CPU/{content_digest.hexdigest()}"))
 
     output.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output, "w") as archive:
@@ -1710,6 +1718,7 @@ def build_epub(
                 epub_version=epub_version,
                 include_css=not WECHAT_COMPATIBLE,
                 include_legacy_toc=WECHAT_COMPATIBLE,
+                include_legacy_toc_in_spine=not WECHAT_COMPATIBLE,
             ),
         )
         for font in fonts:
