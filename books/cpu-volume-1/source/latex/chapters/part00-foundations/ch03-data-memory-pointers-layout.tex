@@ -2720,6 +2720,124 @@ padding 也需要谨慎。结构体中的 padding 字节是布局的一部分，
 
 arena 或 pool 分配器常用于性能场景，因为它们能减少单个对象分配成本，提高局部性，并让批量释放更便宜。但 arena 也改变生命周期模型：单个对象可能不再单独析构，指针在 arena reset 后全部失效。若把 arena 分配出的对象指针保存到 arena 外部，就会产生悬空访问。性能优化不能绕过生命周期说明。
 
+\subsection{malloc/new 到内核内存的完整路径}
+
+\code{new} 和 \code{malloc} 不是直接向 CPU 要内存，也不一定每次进入内核。C++ \code{new T} 通常分成两层：先调用 \code{operator new} 获得足够且满足对齐要求的 storage，再在这段 storage 中构造 \code{T} 对象。\code{malloc} 只返回未类型化 storage，不负责 C++ 对象构造。标准库容器又会在这些接口之上批量申请 capacity，并管理元素生命周期。
+
+\begin{lstlisting}[numbers=none,caption={堆分配的分层路径}]
+std::vector<T>::reserve
+  -> allocator_traits<Alloc>::allocate
+      -> operator new / malloc-like allocator
+          -> size class / thread cache / arena
+              -> existing free block
+              -> brk/sbrk heap growth
+              -> mmap large allocation
+                  -> first touch page fault
+\end{lstlisting}
+
+这条链说明为什么“分配 1 MiB”不等于“立刻获得 1 MiB 物理内存”。分配器可能只在虚拟地址空间中保留一段范围，真正物理页可能等到第一次写入时才通过缺页建立。也说明为什么 \code{malloc} 时间和后续初始化时间要分开测：前者可能主要是分配器元数据和系统调用，后者可能混入 page fault、清零、cache/TLB 填充和带宽成本。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+层次 & 它负责什么 & 常见误判 \\
+\midrule
+C++ 对象层 & 构造、析构、异常安全、生命周期 & 以为 \code{malloc} 创建了 \code{T} 对象 \\
+分配器层 & 切块、复用、size class、arena/cache & 以为每次分配都 syscall \\
+虚拟内存层 & VMA、\code{brk}、\code{mmap}、权限 & 以为有地址就有物理页 \\
+缺页处理层 & 首次触页、清零、建立页表 & 把 first touch 算成算法成本 \\
+硬件层 & cache、TLB、带宽、对齐 & 把分配策略和访问成本混成一个数 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{size class、thread cache 和 arena}
+
+通用分配器通常不会为每个小对象单独向内核申请页面。更常见的做法是从操作系统拿到较大的区域，再按大小类别切成块。小对象可能进入 size class；释放后的块可能进入 thread-local cache 或 arena 的 free list；大对象可能直接走 \code{mmap}。不同分配器实现细节不同，但工程判断的重点相同：分配成本取决于大小、线程、复用状态、对齐、是否跨 arena、是否触发向内核要新页面。
+
+\begin{lstlisting}[numbers=none,caption={分配器状态机的简化模型}]
+Request(bytes, align):
+  normalize to size class
+
+FastReuse:
+  pop a block from thread cache or arena free list
+
+ArenaSlowPath:
+  lock or coordinate with arena metadata
+  split or coalesce blocks
+
+SystemMemory:
+  grow heap with brk or map region with mmap
+
+FirstTouch:
+  user code writes page, kernel handles minor fault
+
+Free:
+  return to cache/free list, maybe release large mapping
+\end{lstlisting}
+
+这解释了三种常见现象。第一，同样的 \code{malloc(64)}，第一次可能慢，后续可能快，因为分配器和页面都热了。第二，多线程分配可能在低竞争时很好，但某些大小或跨线程释放会进入共享元数据路径。第三，释放不等于内存立刻还给操作系统；进程 RSS、虚拟地址空间和分配器可复用内存是不同指标。
+
+\subsection{free 之后发生了什么}
+
+\code{free(p)} 或 \code{delete p} 的语言后果是对象生命周期结束，storage 归还给对应分配器。它不保证字节被清零，不保证虚拟地址取消映射，不保证下一次不会返回同一个地址。分配器可能把块放入缓存，稍后复用；也可能对大块执行 \code{munmap}；也可能为了调试或安全填充特殊模式。程序不能依赖任何一种偶然行为。
+
+\begin{lstlisting}[language=C++,caption={地址复用不是对象复活}]
+auto* a = new int(1);
+auto old = reinterpret_cast<std::uintptr_t>(a);
+delete a;
+
+auto* b = new int(2);
+if (reinterpret_cast<std::uintptr_t>(b) == old) {
+    // 地址可能相同，但这是另一个对象生命周期。
+}
+\end{lstlisting}
+
+这条规则直接连接对象模型和调试工具。ASan 的 quarantine 会延迟复用释放块，所以 use-after-free 更容易被抓到；Release 分配器可能很快复用同一地址，所以 bug 表现成数据偶发变化；某些安全分配器会清零或填充释放块，所以调试现象又不同。工具改变分配器状态，因此功能诊断结论不能直接变成性能结论。
+
+\subsection{分配器如何影响 benchmark}
+
+如果被测目标是算法热循环，分配和释放通常应放在 setup/teardown，而不是 timed region。否则你测到的是算法、allocator、page fault、cache 状态和构造析构的混合物。反过来，如果目标就是比较分配策略，就要把 workload 写清楚：对象大小分布、分配/释放比例、线程数、跨线程释放、对象生命周期分布、是否触页、是否调用构造析构。
+
+\begin{lstlisting}[numbers=none,caption={allocator benchmark 必须说明的字段}]
+allocator_workload:
+  allocator_name
+  object_size_distribution
+  alignment
+  allocate_free_pattern
+  threads
+  cross_thread_free
+  touch_policy: no_touch / first_byte / every_page / full_init
+  constructors_destructors
+  warmup_iterations
+  rss_and_fault_counters
+\end{lstlisting}
+
+仅报告 \code{ops/s} 不够。小对象分配可能受 thread cache 命中率支配；大对象可能受 \code{mmap}/\code{munmap} 和 VMA 管理影响；初始化大 buffer 可能主要受写带宽和首次触页影响；释放后 RSS 不降可能是分配器保留内存以便复用。若报告没有把这些因素拆开，就无法判断是算法变慢、分配器变慢，还是测量边界错误。
+
+\subsection{分配器证据包}
+
+分配器问题要用多层证据，而不是只看一条崩溃栈。最小证据包可以包括：
+
+\begin{lstlisting}[numbers=none,caption={分配器证据包}]
+allocator_evidence:
+  source_call_site: vector reserve / new / malloc / custom arena
+  requested_bytes
+  requested_alignment
+  object_lifetime: constructed / raw storage / destroyed
+  allocation_pattern
+  deallocation_owner
+  strace_mmap_brk_munmap
+  proc_maps_or_smaps_snapshot
+  page_faults
+  rss_before_after
+  sanitizer_or_debug_allocator_result
+  benchmark_boundary: setup / timed / teardown
+\end{lstlisting}
+
+这份证据包会在后两册反复出现。第二册讨论线程池和队列时，allocator 可能成为锁争用和尾延迟来源；第三册讨论张量 runtime 时，activation arena、workspace、packed weight cache 和 KV cache 都是特殊分配器问题。第一册只要把分层路径讲清，读者就不会再把“有一个指针”误认为“对象、物理内存、性能成本都已经确定”。
+
 \subsection{释放后地址仍然像地址}
 
 use after free 的迷惑性在于，释放后的指针值通常仍然是一个看起来合理的地址。硬件不知道这个地址曾经属于哪个 C++ 对象；分配器也可能暂时没有复用这块内存。所以程序可能在测试中继续读到旧值。语言层却已经结束了对象生命周期，继续访问就是错误。

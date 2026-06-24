@@ -2737,6 +2737,143 @@ objdump -T /lib/x86_64-linux-gnu/libc.so.6 | grep clock_gettime
 \textbf{证据边界：} vDSO 是否被使用随架构、内核、libc、时钟类型和容器环境变化。书中给的是证据路径，不是保证所有机器输出一样。
 \end{warningbox}
 
+\subsection{errno：返回值、线程局部错误码和重试边界}
+
+很多 Linux C 接口失败时返回 \code{-1}，再通过 \code{errno} 给出错误原因。这个模型容易被初学者误读。第一，\code{errno} 不是系统调用返回的第二个值，而是 libc 维护的线程局部错误码。内核系统调用通常以负错误码形式返回失败；libc wrapper 再把它转换成 \code{-1}，并设置当前线程的 \code{errno}。第二，只有在接口约定说明失败时，\code{errno} 才有意义。成功调用不保证清零 \code{errno}。第三，\code{errno} 值只说明失败类别，不说明完整业务原因。
+
+\begin{lstlisting}[language=C++,caption={errno 只在失败后读取}]
+#include <cerrno>
+#include <cstring>
+#include <fcntl.h>
+#include <unistd.h>
+
+int fd = open("/not/exist", O_RDONLY);
+if (fd == -1) {
+    int e = errno; // 立刻保存，后续库调用可能覆盖
+    std::fprintf(stderr, "open failed: %s\n", std::strerror(e));
+}
+\end{lstlisting}
+
+\code{EINTR} 和 \code{EAGAIN} 是系统边界里最重要的两个错误码。前者说明阻塞调用被信号打断，调用者通常要按接口语义决定重试、取消或向上报告；后者常见于非阻塞 fd，说明“现在不能完成”，不是永久失败。把它们当普通错误退出，会造成服务在信号、非阻塞 I/O 或高负载下偶发失败；无脑重试又可能造成 busy loop。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.25\linewidth}p{0.30\linewidth}p{0.31\linewidth}}
+\toprule
+错误码 & 常见含义 & 正确报告要写清 \\
+\midrule
+\code{EINTR} & 被信号中断 & 调用是否可安全重试，是否已有部分完成 \\
+\code{EAGAIN}/\code{EWOULDBLOCK} & 非阻塞路径暂时不可完成 & 等待什么事件，是否进入 poll/epoll \\
+\code{EPIPE} & 管道或 socket 对端关闭 & 是否收到 \code{SIGPIPE}，写入边界是什么 \\
+\code{ENOMEM} & 内核或进程资源不足 & 是虚拟地址、物理页、限制还是 overcommit 边界 \\
+\code{EINVAL} & 参数不满足接口合同 & 哪个参数、flag 或对齐要求错误 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+因此，系统调用报告不能只贴 \code{strace} 一行。它要说明调用点、返回值、\code{errno}、fd 状态、是否非阻塞、是否可能部分完成、是否安全重试。比如 \code{read} 返回 \code{-1,EINTR} 和返回 \code{5} 后再被信号打断，是两种不同状态；\code{write} 对普通文件、pipe、socket 的部分写入语义也不同。
+
+\subsection{阻塞路径：从用户态调用到等待队列}
+
+阻塞不是“函数很慢”的同义词。阻塞表示当前线程不能继续取得所需条件，于是进入内核或运行时等待，CPU 可以转去运行别的任务。一次 \code{read} 可能因为 fd 没有数据而阻塞；一次 \code{pthread\_mutex\_lock} 可能因为锁被占用而阻塞；一次 page fault 可能因为需要 I/O 或分配物理页而等待；一次 \code{waitpid} 可能因为目标进程尚未退出而等待。
+
+\begin{lstlisting}[numbers=none,caption={阻塞调用的状态路径}]
+UserRunning:
+  executes libc wrapper or runtime code
+
+CannotCompleteNow:
+  fd not ready, lock held, child not exited, page not resident
+
+KernelWait:
+  task state changes, wait queue or scheduler object records waiter
+
+Wakeup:
+  device, another thread, signal, timeout or kernel event changes condition
+
+UserResumed:
+  wrapper returns success, partial result, timeout, EINTR or error
+\end{lstlisting}
+
+这条路径解释了为什么墙钟时间和 CPU time 会分叉。线程阻塞期间，用户等待的 elapsed time 增加，但线程不一定消耗 CPU。性能报告若只写“函数耗时 10 ms”，没有写 CPU time、context switch、\code{strace -T}、\code{perf sched} 或等待事件，就无法区分 CPU 算慢、I/O 等待、锁等待和调度延迟。
+
+\begin{lstlisting}[language=bash,caption={观察阻塞路径的最小证据}]
+strace -f -ttT -e trace=read,write,poll,epoll_wait,futex,nanosleep ./app
+/usr/bin/time -v ./app
+perf sched record -- ./app
+perf sched latency
+\end{lstlisting}
+
+\code{strace -T} 能显示系统调用花了多久，但它本身会显著扰动程序，尤其是高频 syscall。它适合定位“是否频繁进入内核”和“哪个调用可能阻塞”，不适合直接作为最终性能数字。\code{/usr/bin/time -v} 给出 voluntary/involuntary context switches 和 page faults，可以帮助区分等待和被抢占。若需要更细的调度时间线，第二册会继续使用 tracepoint、\code{perf sched} 和 eBPF。
+
+\subsection{futex：用户态 fast path 和内核 slow path 的分界}
+
+\code{futex} 是理解 Linux 同步性能的关键。它的名字来自 fast userspace mutex，核心思想是：无竞争时同步操作尽量在用户态用原子指令完成；只有竞争或等待时，才通过 \code{futex} 系统调用进入内核睡眠或唤醒。pthread mutex、condition variable、\code{std::mutex} 和某些 \code{std::atomic::wait} 实现，都可能在慢路径上使用 futex 或类似机制。
+
+\begin{lstlisting}[numbers=none,caption={一个互斥锁的简化路径}]
+lock fast path:
+  atomic compare_exchange 0 -> 1 succeeds
+  enter critical section without syscall
+
+lock slow path:
+  atomic compare_exchange fails
+  record waiter state
+  futex(FUTEX_WAIT, expected_value)
+  scheduler parks current task
+
+unlock path:
+  atomic store unlocked or decrement waiter state
+  if waiters may exist:
+      futex(FUTEX_WAKE, count)
+\end{lstlisting}
+
+这个模型说明两个重要边界。第一，\code{strace} 没看到 futex，不代表没有同步，只说明没有走到内核等待路径；用户态原子争用、cache line bouncing 和 spin 仍可能很贵。第二，看到大量 futex，也不等于“futex 慢”是根因。根因可能是临界区太长、锁粒度太粗、条件变量谓词设计错误、线程数过多、生产消费不平衡，或者等待对象被错误共享。
+
+\begin{lstlisting}[language=C++,caption={条件变量必须围绕谓词等待}]
+std::mutex mu;
+std::condition_variable cv;
+bool ready = false;
+
+void consumer()
+{
+    std::unique_lock<std::mutex> lk(mu);
+    cv.wait(lk, [] { return ready; }); // handles spurious wakeup
+    consume();
+}
+\end{lstlisting}
+
+条件变量的正确性不在 \code{wait} 这一行，而在谓词。线程被唤醒只说明“应该重新检查条件”，不说明条件必然为真。若写成 \code{if (!ready) cv.wait(lk);}，遇到 spurious wakeup、丢失通知、取消和关闭路径时都可能错。第二册会系统讲 happens-before 和等待协议；第一册至少要让读者知道，\code{futex} 是阻塞证据，不是同步语义本身。
+
+\subsection{把 syscall、errno、阻塞和 futex 合成一份报告}
+
+一个合格的系统边界报告要把四件事分开：用户态接口、libc 或 runtime wrapper、内核入口和等待状态。下面的字段可以直接放进实验记录：
+
+\begin{lstlisting}[numbers=none,caption={syscall/futex 证据包字段}]
+syscall_boundary:
+  user_api: read / write / pthread_mutex_lock / clock_gettime
+  fd_or_object_state
+  blocking_mode: blocking / nonblocking / timeout
+  wrapper_layer: libc / libpthread / libstdc++ / direct syscall
+  observed_syscalls:
+    name
+    return_value
+    errno_if_failed
+    elapsed_time_from_strace_T
+  retry_policy:
+    EINTR
+    EAGAIN
+    partial_read_or_write
+  wait_evidence:
+    futex_seen
+    context_switches
+    cpu_time_vs_elapsed_time
+  conclusion_boundary:
+    facts
+    likely_explanation
+    unproven_claims
+\end{lstlisting}
+
+这份报告的价值在于防止混层。看到 \code{EAGAIN}，不能说磁盘慢；看到 \code{futex}，不能直接说内核锁慢；看到 elapsed time 长，不能直接说 CPU 算慢；看到 vDSO，不能说没有计时成本。第一册把这些边界讲清，第二册的线程、锁、I/O 和 runtime 调优才有地基。
+
 \subsection{DWARF CFI：调试器怎样找回调用者}
 
 当 GDB、profiler 或异常运行时需要从当前指令位置回到调用者时，它必须知道当前函数如何移动了栈指针、返回地址在哪里、哪些寄存器被保存在哪里。最直观的做法是使用 frame pointer；优化构建可能省略 frame pointer，此时工具依赖 unwind table 和 DWARF CFI。
