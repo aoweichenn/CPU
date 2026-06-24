@@ -601,6 +601,191 @@ void ThreadPoolState::finish_task() {
 
 信号量表达“还有多少许可”。它适合连接池、I/O in-flight 限额、同时写文件数量、令牌桶、空槽/元素数量等资源计数。Mutex 保护复杂状态关系，semaphore 控制有多少个并发使用权。拿到许可后，线程仍可能需要 mutex 修改共享队列；释放许可时，还要保证失败和取消路径归还资源。
 
+\topic{计数信号量的形式化状态}
+计数信号量的核心状态可以抽象成一个非负整数 \code{permits} 和一组等待者。构造时给定初始许可数；\code{acquire} 尝试消耗一个许可；\code{release} 增加一个或多个许可，并使等待者有机会继续。这个整数不是业务对象数量，而是预算。连接池里许可数可以等于“最多允许借出多少连接”，但真实连接对象还在 free list、closing list 或 broken list 中；I/O 系统里许可数可以等于“最多允许多少个请求同时提交”，但请求 buffer、completion record 和错误状态仍在其他结构里。
+
+\begin{lstlisting}[numbers=none,caption={counting semaphore 的最小状态机}]
+state:
+  permits >= 0
+  waiters = threads blocked because permits == 0
+
+acquire:
+  if permits > 0:
+      permits -= 1
+      return acquired
+  else:
+      block until a release may make permits > 0
+      retry acquisition
+
+try_acquire:
+  if permits > 0:
+      permits -= 1
+      return true
+  else:
+      return false
+
+release(n):
+  permits += n
+  wake up to n waiters, or make permits visible to future acquirers
+\end{lstlisting}
+
+这份状态机刻意没有 \code{closed}、\code{cancelled}、\code{owner}、\code{payload}、\code{free list}。这些事实不属于信号量本身。Semaphore 的强项正是窄：它只回答“预算还有没有”。它的弱点也正是窄：只靠它不能证明对象生命周期、关闭语义和业务错误路径。
+
+\topic{acquire 和 release 的线性化点}
+线性化点是并发操作在抽象历史中“真正生效”的瞬间。对计数信号量来说，成功 \code{acquire} 的线性化点是许可计数被消耗；\code{release} 的线性化点是许可被归还并对其他线程可见。等待线程从睡眠中醒来不是线性化点，因为醒来后它还可能输给另一个线程，或发现关闭状态要求退出。正确代码必须把“拿到许可”和“拿到业务对象”分成两个提交点。
+
+\begin{lstlisting}[numbers=none,caption={许可提交点和对象提交点不能混在一起}]
+borrow connection:
+  acquire permit                 # permit commit point
+  lock pool mutex
+  if pool is closing:
+      unlock
+      release permit             # undo the budget claim
+      return closed
+  remove object from free list    # object ownership commit point
+  unlock
+  return connection handle
+\end{lstlisting}
+
+这段账本能解释两个常见 bug。第一，拿到许可后发现系统关闭，必须释放许可；否则许可泄漏，所有后来者最终睡眠。第二，从 free list 取出对象失败时，不能假装许可就是对象；许可只是预算，真正的对象状态仍要在 mutex 下检查。很多 semaphore 事故不是 \code{acquire/release} API 用错，而是没有分清两个线性化点。
+
+\topic{C++20 中的边界：没有 close，也没有 ownership}
+\code{std::counting_semaphore} 和 \code{std::binary_semaphore} 是 C++20 的轻量同步原语。它们支持 \code{acquire}、\code{try_acquire}、带超时的尝试获取以及 \code{release}。它们不绑定线程所有者：一个线程可以 \code{acquire}，另一个线程可以 \code{release}。这与 mutex 完全不同。Mutex 表达的是“这个线程进入临界区并负责退出”；semaphore 表达的是“系统预算增加或减少一份”。因此用 binary semaphore 当 mutex，通常会丢掉所有权、调试和不变量语义。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.23\linewidth}p{0.30\linewidth}p{0.35\linewidth}}
+\toprule
+能力 & semaphore 提供吗 & 工程后果 \\
+\midrule
+计数许可 & 提供 & 适合容量、in-flight 和令牌桶 \\
+线程所有权 & 不提供 & 不能替代 mutex 的 owner 语义 \\
+复杂谓词 & 不提供 & close/drain/cancel 仍要额外状态 \\
+业务 payload & 不提供 & 数据必须在队列、pool 或 record 中 \\
+公平性保证 & 标准不承诺强公平 & 不能把它当严格 FIFO 调度器 \\
+对象生命周期证明 & 不提供 & 等待者退出前不能销毁关联状态 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+公平性尤其容易被误解。实现可能让等待者大体按某种队列醒来，也可能允许正在运行的线程在释放后很快再次获取许可。标准层面不应依赖“最早等待者一定最早获得许可”。若业务需要严格顺序，应在受 mutex 保护的队列或调度器里表达顺序，而不是把公平性寄托给 semaphore。
+
+\topic{许可守卫：异常路径必须自动归还}
+凡是 \code{acquire} 后有多个返回路径，就应把许可归还写进 RAII。否则异常、取消、早返回和错误分支会慢慢吞掉许可。许可泄漏不像崩溃那样明显：系统会先变慢，然后并发度越来越低，最后所有线程阻塞在 \code{acquire}，看起来像下游服务挂住。
+
+\begin{lstlisting}[language=C++,caption={许可守卫把 release 绑定到作用域}]
+class PermitGuard {
+public:
+  explicit PermitGuard(std::counting_semaphore<1024>& permits)
+      : permits_(&permits), owns_(true) {
+    this->permits_->acquire();
+  }
+
+  PermitGuard(const PermitGuard&) = delete;
+  PermitGuard& operator=(const PermitGuard&) = delete;
+
+  PermitGuard(PermitGuard&& other) noexcept
+      : permits_(std::exchange(other.permits_, nullptr)),
+        owns_(std::exchange(other.owns_, false)) {}
+
+  ~PermitGuard() {
+    if (this->owns_) {
+      this->permits_->release();
+    }
+  }
+
+  void dismiss() noexcept {
+    this->owns_ = false;
+  }
+
+private:
+  std::counting_semaphore<1024>* permits_;
+  bool owns_;
+};
+\end{lstlisting}
+
+\code{dismiss} 只能在许可所有权已经转移到另一个对象时调用，例如连接 handle 接管归还责任。不要为了“避免析构 release”随手调用 \code{dismiss}。这类 guard 的代码审查问题很明确：每个 \code{acquire} 是否有唯一归还路径；所有权转移后谁负责 release；失败路径是否归还；对象析构是否可能在等待者仍存在时发生。
+
+\begin{lstlisting}[numbers=none,caption={许可泄漏的证据形状}]
+symptom:
+  request throughput gradually decreases
+  active in-flight count is below configured limit
+  many threads blocked in semaphore acquire
+  no downstream saturation is visible
+
+likely cause:
+  acquired permits - released permits keeps growing
+  early return, exception, timeout, or cancellation skipped release
+\end{lstlisting}
+
+\topic{双信号量 bounded buffer 的严格账本}
+用两个信号量写有界队列时，\code{empty_slots} 代表可写槽预算，\code{filled_slots} 代表可读元素预算。它的好处是容量和元素数量的等待对象很清楚；代价是关闭语义更难，因为标准 semaphore 不知道 \code{closed}。先看不含关闭的正常路径：
+
+\begin{lstlisting}[numbers=none,caption={双信号量 bounded buffer 的正常路径}]
+initial:
+  empty_slots = capacity
+  filled_slots = 0
+  head, tail, buffer protected by mutex
+
+push:
+  empty_slots.acquire()
+  lock mutex
+  write buffer[tail]
+  tail = next(tail)
+  unlock mutex
+  filled_slots.release()
+
+pop:
+  filled_slots.acquire()
+  lock mutex
+  read buffer[head]
+  head = next(head)
+  unlock mutex
+  empty_slots.release()
+\end{lstlisting}
+
+这条账本里有三个必须保持的关系。第一，\code{empty_slots + filled_slots == capacity}，除非某个线程已经拿到许可但尚未完成锁内提交；这段短窗口必须被代码审查标出来。第二，\code{filled_slots} 的 release 必须发生在元素写入并提交之后，否则消费者可能拿到“可读许可”却读到未初始化槽。第三，\code{empty_slots} 的 release 必须发生在元素读出并槽位重新可写之后，否则生产者可能覆盖尚未被安全移出的元素。
+
+\topic{关闭语义：semaphore 不能广播一个不存在的许可}
+条件变量可以在 \code{closed = true} 后 \code{notify_all}，等待者醒来检查 \code{size > 0 || closed}。Semaphore 没有“状态变化但不增加资源”的通知语义。若消费者睡在 \code{filled_slots.acquire()}，队列关闭且没有元素时，应该让它退出；但调用 \code{filled_slots.release()} 会制造一个看起来真实的元素许可。生产者睡在 \code{empty_slots.acquire()} 时也有同样问题：关闭后唤醒它们，不等于真的多了空槽。
+
+\begin{lstlisting}[numbers=none,caption={semaphore 队列关闭时最容易写错的地方}]
+bad close:
+  closed = true
+  filled_slots.release(number_of_consumers)
+
+why bad:
+  fake filled permits look like real elements
+  consumers must add another check after acquire
+  permit accounting becomes tied to waiter count
+  a late consumer may consume a fake permit after close logic changes
+\end{lstlisting}
+
+这不是说 semaphore 不能用于队列，而是说关闭协议要显式设计。常见选择有三种。第一，队列核心仍用 \code{mutex + condition_variable}，把 semaphore 只用于外层 in-flight 限额。第二，使用支持停止令牌或超时的获取路径，等待者周期性检查 \code{closed}，但要接受超时轮询成本和复杂性。第三，向队列插入结束哨兵，但这要求元素类型和消费者数量能承载该协议，且必须证明哨兵不会与业务数据混淆。对通用线程池队列，默认选择仍应是 CV，因为 close/drain/cancel 是业务谓词，不是资源额度。
+
+\topic{二值信号量、mutex 和 latch 不要混用}
+\code{std::binary_semaphore} 的计数上限是 1，看起来像 mutex，但语义不同。它没有 owner，不要求同一线程 release；它可以表达“一次事件许可”或“一个外部完成信号”，但不适合保护对象不变量。Mutex 的 unlock 必须由持有它的线程执行，且工具、调试器和静态审查都围绕这个所有权语义工作。把对象保护改成 binary semaphore，会让“谁持有临界区”变模糊。
+
+二值信号量也不是 latch。Latch 是一次性倒计数，计数归零后所有等待者通过，不能重新关闭；binary semaphore 可以反复 acquire/release，表达可重复许可。若要等 N 个 worker 初始化完成，用 latch；若要限制最多一个后台 flush in-flight，用 binary semaphore 或普通 mutex，取决于是否需要 owner 和对象不变量。
+
+\topic{令牌桶和背压：semaphore 是容量控制，不是排队策略}
+在服务端，semaphore 常用于 admission control：同时最多允许 N 个请求进入某个昂贵阶段。拿不到许可时，可以等待、拒绝、降级或排队。选择哪一种不是 semaphore 决定的，而是 SLO 决定的。等待会保护下游但增加队列延迟；直接拒绝能保护尾延迟但牺牲成功率；按优先级排队需要额外调度结构。
+
+\begin{lstlisting}[numbers=none,caption={用 semaphore 表达 in-flight 预算}]
+request arrives:
+  if permits.try_acquire():
+      enter expensive stage
+  else if latency_slo_is_strict:
+      reject or shed load
+  else:
+      wait with timeout and record queue_wait_ns
+
+request finishes:
+  release permit exactly once
+\end{lstlisting}
+
+因此 semaphore 相关指标至少要包括 \code{permit_acquire_count}、\code{permit_wait_ns}、\code{permit_timeout_count}、\code{permit_reject_count}、\code{permit_leak_check} 和 \code{in_flight_high_watermark}。若只记录吞吐，无法区分“下游慢导致等待增加”和“许可泄漏导致并发度下降”。
+
 \topic{用信号量理解 bounded buffer}
 有界队列可以用两个信号量理解：\code{empty_slots} 初始为 capacity，\code{filled_slots} 初始为 0。生产者先获取空槽许可，再写入；消费者先获取元素许可，再读取。环形索引仍需要 mutex 或单生产者/单消费者特化协议保护。这个模型能把“容量”是一种资源。
 
