@@ -2444,7 +2444,20 @@ page fault 也要纳入系统调用边界的思维。它不是程序主动调用
 
 \subsection{七、signal：内核怎样异步改变用户态控制流}
 
-信号是第一册必须单独建模的系统边界。它不像普通函数调用由当前源码位置主动发起，也不像 \code{syscall} 由用户态显式进入内核。信号可以来自硬件异常、终端、另一个进程、定时器、管道错误或内核事件；内核在合适的返回用户态时机，把用户线程的上下文改造成“先执行 signal handler，再回到原来位置或终止进程”。因此，signal 是异步控制流：它打断的可能是热循环、阻塞系统调用、库函数、内存分配器或 C++ 对象更新中间状态。
+信号是第一册必须单独建模的系统边界。下一章会把控制流边界系统分成普通调用、系统调用、同步异常、异步中断、signal delivery、C++ unwind 和调度切换；本节先用同一组问题看 signal。signal 位于这张表的交汇处：它可能由同步异常产生，例如非法内存访问；也可能由异步事件产生，例如终端、定时器或另一个进程；最终又通过内核改写用户态返回上下文，让用户代码先进入 handler。
+
+因此，signal 不能被理解成“操作系统帮我调用一个 C++ 回调”。它不是普通函数调用，也不是用户态显式执行 \code{syscall} 的结果。内核在合适的返回用户态时机，把线程上下文改造成“先执行 signal handler，再回到原来位置或终止进程”。这就是异步控制流：它打断的可能是热循环、阻塞系统调用、库函数、内存分配器或 C++ 对象更新中间状态。
+
+系统分析 signal 时要先问六件事：
+
+\begin{enumerate}
+  \item 信号是谁产生的：硬件异常、\code{kill}、终端、定时器、管道错误，还是内核事件。
+  \item 信号面向进程还是具体线程，当前线程 mask 是否屏蔽它。
+  \item 它何时从 pending 变成 delivery，内核选择了哪个线程。
+  \item handler 使用普通用户栈还是 alternate signal stack。
+  \item handler 返回后，原系统调用是成功、\code{EINTR}、重启，还是进程终止。
+  \item 证据来自 \code{siginfo}、\register{rip}、fault address、\filepath{/proc/<pid>/status}、\code{strace} 还是 core dump。
+\end{enumerate}
 
 \begin{lstlisting}[numbers=none,caption={signal 的压缩状态机}]
 UserRunning:
@@ -2679,6 +2692,53 @@ coredumpctl gdb ./app
 \end{lstlisting}
 
 signal 报告也要写证据边界。看到 \code{SIGSEGV}，只能说明进程因为内存访问或相关异常被终止，不能自动推出“空指针”。要结合 fault address、\register{rip} 指令、寄存器、\filepath{/proc/<pid>/maps}、对象生命周期和 sanitizer 结果。看到 \code{EINTR}，只能说明某个阻塞边界被信号打断，不能自动重试所有接口；有些调用已经部分完成，有些调用有超时语义，有些业务正是用信号请求取消。看到 \code{SIGPIPE}，也不能只把它关掉：要先说明写入对象是 pipe、socket 还是普通文件，对端关闭时业务应该丢弃、重连、还是报告失败。
+
+\subsubsection{signal 专用报告模板}
+
+signal 章节的验收不是“知道几个信号名”，而是能把一次信号事故写成完整报告。最小模板如下：
+
+\begin{lstlisting}[numbers=none,caption={signal 事故报告模板}]
+signal_report:
+  signal:
+    signo:
+    name:
+    default_action:
+    origin: hardware_fault / kill / terminal / timer / pipe / kernel
+
+  target:
+    process_or_thread:
+    signal_mask_before:
+    pending_state:
+    disposition: default / ignore / handler / sigwait / signalfd
+
+  delivery:
+    delivered_thread:
+    interrupted_state: user_hot_loop / blocking_syscall / library_code
+    interrupted_rip:
+    interrupted_rsp:
+    stack: user_stack / alternate_signal_stack
+    siginfo:
+    ucontext:
+
+  handler_contract:
+    async_signal_safe_actions_only:
+    writes_flag_or_fd:
+    forbidden_work_observed:
+
+  after_handler:
+    rt_sigreturn:
+    syscall_result: completed / EINTR / restarted / partial_progress
+    process_result: resumed / terminated / core_dumped
+
+  evidence:
+    gdb_core:
+    strace_signal_path:
+    proc_status_masks:
+    maps_and_fault_address:
+    sanitizer_or_reproducer:
+\end{lstlisting}
+
+这个模板会逼出关键区别：\code{SIGSEGV} 来自当前线程的同步异常，通常有 fault address；\code{SIGTERM} 往往是外部管理器请求退出，可能投递给任意未屏蔽线程；\code{SIGPIPE} 是写路径的协议事件；\code{SIGALRM} 或 profiling 信号会周期性打断普通控制流。它们都叫 signal，但工程处理策略完全不同。
 
 \subsection{深水链路的统一验收}
 

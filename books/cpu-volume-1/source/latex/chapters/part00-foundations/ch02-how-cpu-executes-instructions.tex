@@ -214,6 +214,146 @@ x86-64 传统上有 ring 0 到 ring 3 的特权级。现代通用操作系统通
 
 这个边界不是 C++ 类型系统提供的，而是 CPU 和操作系统共同维护的。页表项里有 present、read/write、user/supervisor、execute disable 等权限位；CPU 在取指、load 和 store 时做地址翻译和权限检查。用户态访问 supervisor-only 页面，即使指针数值看起来是一个合法地址，也会触发异常；用户态向只读映射写入，或者从 NX 页面取指，也会触发异常。这就是为什么 \filepath{/proc/<pid>/maps} 中的 \code{r-xp}、\code{rw-p} 和匿名映射权限，不只是调试显示，而是会被硬件检查真正执行。
 
+\subsection{统一控制流边界模型：先问六个问题}
+
+普通程序不是只靠 \instruction{call}、\instruction{jmp} 和 \instruction{ret} 改变控制流。真实执行里还有系统调用、同步异常、异步中断、signal delivery、C++ 异常展开和调度切换。它们都能让当前线程离开“下一条源码语句”的直觉路径，但机制完全不同。若不先建立统一分类，后面看到 \code{SIGSEGV}、\code{EINTR}、page fault、perf 样本、栈回溯缺失和 p99 抖动时，很容易把不同层次混成一团。
+
+本书后面遇到任何控制流边界，都按六个问题分析：
+
+\begin{enumerate}
+  \item \textbf{谁触发？} 是当前指令、用户代码显式请求、硬件设备、内核定时器、另一个线程，还是语言运行时。
+  \item \textbf{是否跨特权级？} 是仍在用户态，还是从 ring 3 进入 ring 0。
+  \item \textbf{保存什么上下文？} 至少要知道 \register{rip}、\register{rsp}、RFLAGS、通用寄存器、signal mask、errno 或异常对象由谁保存。
+  \item \textbf{使用哪种栈？} 是普通用户栈、alternate signal stack、内核栈，还是语言运行时沿用户栈展开。
+  \item \textbf{怎样返回？} 是 \instruction{ret}、\instruction{sysret}/\instruction{iret}、\code{rt\_sigreturn}、unwind landing pad、还是调度器返回到另一个线程。
+  \item \textbf{怎么证明？} 用反汇编、GDB 寄存器、\filepath{/proc/<pid>/maps}、\code{strace}、core dump、\code{perf}、DWARF/CFI 还是内核 trace。
+\end{enumerate}
+
+\begin{lstlisting}[numbers=none,caption={控制流边界的统一记录格式}]
+control_flow_boundary:
+  trigger: current instruction / syscall instruction / timer irq / signal / throw
+  privilege_transition: none / user_to_kernel / kernel_to_user_delivery
+  saved_context: rip, rsp, rflags, registers, mask, fault_address, errno, object
+  stack_used: user_stack / alt_signal_stack / kernel_stack / unwound_user_stack
+  return_path: ret / sysret_or_iret / rt_sigreturn / landing_pad / schedule
+  evidence: objdump, gdb, strace, perf, maps, core, readelf, trace
+\end{lstlisting}
+
+这份格式比背术语更重要。它强迫读者把“控制流为什么变了”落到机器状态和证据上，而不是停在“程序跳到别处了”。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.22\linewidth}p{0.24\linewidth}p{0.22\linewidth}}
+\toprule
+边界 & 触发者 & 保存/依赖的状态 & 返回路径 \\
+\midrule
+普通函数调用 & 用户代码执行 \instruction{call} & 返回地址在用户栈，ABI 保存寄存器 & \instruction{ret} \\
+PLT/动态调用 & 用户态间接跳转或首次绑定 & PLT/GOT、动态链接器状态 & 用户态返回，可能夹带 lazy binding \\
+系统调用 & 用户代码执行 \instruction{syscall} & syscall 号、参数、用户上下文、内核栈 & \instruction{sysret} 或等价路径 \\
+同步异常 & 当前指令触发 fault/trap & faulting \register{rip}、错误码、fault address & 修复后重试/继续，或转 signal \\
+异步中断 & 时钟、设备、IPI、PMU & 被打断上下文、内核中断入口状态 & 返回原线程或触发调度 \\
+signal delivery & 内核准备返回用户态时投递 & 用户 signal frame、mask、\code{siginfo}、\code{ucontext} & \code{rt\_sigreturn} 或终止 \\
+C++ 异常展开 & \code{throw} 和运行时 unwinder & 异常对象、unwind table、析构路径 & landing pad/catch，或 terminate \\
+调度切换 & 内核调度器选择任务 & 线程寄存器、内核栈、调度状态 & 返回同一线程或另一个线程 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表也说明“栈帧”不是单一概念。普通 C++ 栈帧由编译器按 ABI 建立；signal frame 由内核写到用户栈或备用信号栈上；内核 trap frame/entry frame 保存的是进入内核时的用户上下文，通常在内核栈上；C++ 异常展开依赖 \code{.eh\_frame} 和 personality routine，而不是某条普通 \instruction{ret}。报告里只写“看栈”是不够的，必须说明看到的是哪一种 frame。
+
+\subsection{三种栈：用户栈、内核栈和备用信号栈}
+
+要把控制流边界讲系统，必须先把栈分清。
+
+\textbf{用户栈} 是普通 C++ 调用、局部变量、返回地址和 ABI 保存寄存器所在的位置。它存在于用户虚拟地址空间，受普通页表权限保护。函数调用、C++ 异常展开、GDB backtrace 和大多数 profiler 调用栈都从这里开始解释。
+
+\textbf{内核栈} 是线程进入内核后使用的栈。系统调用、异常、中断和调度路径都可能在内核栈上保存入口状态、调用内核函数、阻塞或切换任务。用户态通常不能直接读取它；只能通过 \code{strace}、\code{perf}、tracepoint、core dump 中的用户上下文或内核符号间接观察。系统调用不是把用户栈借给内核随便用。
+
+\textbf{备用信号栈} 是用户进程通过 \code{sigaltstack} 注册的一块用户态内存。它仍然属于用户地址空间，但专门给 \code{SA\_ONSTACK} handler 使用，避免原用户栈耗尽或损坏时连 signal frame 都放不下。它不是内核栈，也不让 handler 变得可以安全调用任意函数。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+栈 & 谁使用 & 常见误判 \\
+\midrule
+用户栈 & 普通调用、局部对象、返回地址、C++ unwind & 以为每个源码变量都有稳定栈位置 \\
+内核栈 & syscall、异常、中断、调度的内核路径 & 以为 syscall 只是用户栈上的普通函数 \\
+备用信号栈 & 指定 signal handler 和 signal frame & 以为有 alt stack 就能在 handler 中复杂清理 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一个线程可能在一次事故里同时涉及三种栈：用户栈即将溢出；CPU 触发 page fault 进入内核栈；内核无法修复后投递 \code{SIGSEGV}；handler 在备用信号栈上运行；handler 返回时通过 \code{rt\_sigreturn} 请求内核恢复或终止。若报告不能把这些栈分开，后面的根因分析就会混乱。
+
+\subsection{一条完整链路：从普通指令到 signal handler}
+
+下面这条链路把特权级、异常、中断、signal 和普通控制流接在一起。假设用户态执行：
+
+\begin{lstlisting}[language=C++]
+int x = *p;
+\end{lstlisting}
+
+若 \code{p} 指向一个尚未建立物理页的合法匿名映射，机器路径可能是：
+
+\begin{lstlisting}[numbers=none,caption={合法 minor fault 后恢复同一条指令}]
+UserInstruction:
+  load from virtual address p
+
+PageFault:
+  CPU cannot complete translation; enters kernel fault handler
+
+KernelFixup:
+  kernel allocates/maps a physical page and updates page tables
+
+ReturnToUser:
+  CPU resumes the faulting instruction; load is retried and succeeds
+\end{lstlisting}
+
+若 \code{p} 指向没有映射的非法地址，路径就变成：
+
+\begin{lstlisting}[numbers=none,caption={无法修复的 fault 转成 signal}]
+UserInstruction:
+  load from invalid virtual address p
+
+PageFault:
+  CPU enters kernel with faulting rip and fault address
+
+KernelDecision:
+  address is not valid for this process; cannot fix
+
+SignalDelivery:
+  kernel records SIGSEGV and builds a signal frame for user-space delivery
+
+HandlerOrDefault:
+  user handler runs, or default action terminates and core may be written
+\end{lstlisting}
+
+注意这两条路径的开头都是同一条 load，机器层都先进入 page fault 异常入口；差异在内核是否能根据 VMA、权限和资源状态修复。只有第二条路径才应该被叫作崩溃或非法访问。把所有 page fault 都当作 bug，或者把所有 \code{SIGSEGV} 都当作空指针，都是不系统的分析。
+
+\subsection{中断如何打断普通控制流但不改变程序语义}
+
+异步中断是另一类必须系统化的边界。假设用户态正在执行一个没有系统调用的热循环，时钟中断仍然可能在两条指令之间到来。CPU 保存必要返回状态，进入内核中断入口；内核更新计时、运行调度逻辑，可能马上返回，也可能切换到另一个线程。对单线程程序语义来说，这像是循环“慢了一下”；对性能报告来说，这可能表现为 involuntary context switch、p99 抖动、PMU 样本或 cache 状态变化。
+
+\begin{lstlisting}[numbers=none,caption={异步中断的普通控制流视角}]
+UserHotLoop:
+  executes instructions without explicit syscall
+
+TimerInterrupt:
+  hardware transfers control to kernel interrupt entry
+
+KernelWork:
+  account time, run scheduler, maybe handle softirq or wakeups
+
+ReturnChoice:
+  resume the same thread, or context-switch to another runnable thread
+
+UserObservation:
+  source code sees no branch, but elapsed time and cache state changed
+\end{lstlisting}
+
+因此，“代码里没有系统调用”不等于“运行期间没有进入内核”；“perf 样本落在某条指令”也不等于“那条指令主动调用了内核”。系统性报告要把同步异常、异步中断和主动系统调用分开记录。
+
 \subsection{系统调用：受控进入内核，不是普通函数调用}
 
 系统调用是用户态请求内核服务的受控入口。以 Linux/x86-64 为例，用户代码通常把系统调用号放入 \register{rax}，把参数放入约定寄存器，然后执行 \instruction{syscall}。CPU 按架构规则切换到内核配置好的入口地址，进入 ring 0；内核保存必要上下文，验证系统调用号、参数、用户指针、权限和资源状态；完成后把返回值放回寄存器，再通过 \instruction{sysret} 或等价返回路径回到用户态。
@@ -332,6 +472,58 @@ cat /proc/sys/kernel/perf_event_paranoid
 \end{lstlisting}
 
 一个严谨报告应该写清证据边界：看到了 \code{strace} 中大量 \code{futex}，能说明线程在同步边界频繁进入内核或等待；不能直接说明哪把业务锁设计错。看到了 page fault 计数升高，能说明地址翻译路径进入内核处理过缺页；不能自动推出是 bug，可能只是合法首次触页。看不到 kernel samples，也不能把 CPU 时间全部归给用户态热循环。
+
+\subsection{控制流边界报告模板}
+
+本节最后给一个统一验收模板。以后分析崩溃、卡顿、p99 抖动、信号退出、线程阻塞、异常展开和 syscall 成本，都应先填这张表，再写结论。
+
+\begin{lstlisting}[numbers=none,caption={控制流边界报告模板}]
+boundary_report:
+  symptom:
+    crash / EINTR / long tail / blocked thread / bad backtrace / syscall cost
+
+  boundary_type:
+    ordinary_call / plt_call / syscall / sync_exception /
+    async_interrupt / signal_delivery / cxx_unwind / context_switch
+
+  trigger:
+    instruction_address:
+    source_location:
+    external_event:
+    signal_or_errno:
+
+  privilege_and_stack:
+    user_mode_or_kernel_mode:
+    user_stack:
+    kernel_stack_observable:
+    alt_signal_stack:
+    frame_kind:
+
+  saved_state:
+    rip:
+    rsp:
+    rflags:
+    registers:
+    fault_address:
+    signal_mask:
+
+  return_or_termination:
+    ret / sysret / iret / rt_sigreturn / landing_pad / scheduler / core_dump
+
+  evidence:
+    objdump:
+    gdb_or_core:
+    proc_maps:
+    strace:
+    perf_or_time:
+    readelf_dwarf_cfi:
+
+  conclusion_boundary:
+    what_this_proves:
+    what_it_does_not_prove:
+\end{lstlisting}
+
+这个模板的作用是防止跨层误判。比如看到 \code{EINTR}，模板会强迫你写清是哪个阻塞调用被哪个信号切开、是否允许重启、是否有部分进度；看到 \code{SIGSEGV}，模板会强迫你写 fault address、\register{rip} 和 maps，而不是直接说“空指针”；看到 p99 抖动，模板会强迫你区分 syscall、page fault、异步中断、调度切换和 cache 冷启动。
 
 \section{三台机器：抽象机器、架构机器和实现机器}
 
