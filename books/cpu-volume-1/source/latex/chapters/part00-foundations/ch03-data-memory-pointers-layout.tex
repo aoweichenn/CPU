@@ -2779,6 +2779,114 @@ Free:
 
 这解释了三种常见现象。第一，同样的 \code{malloc(64)}，第一次可能慢，后续可能快，因为分配器和页面都热了。第二，多线程分配可能在低竞争时很好，但某些大小或跨线程释放会进入共享元数据路径。第三，释放不等于内存立刻还给操作系统；进程 RSS、虚拟地址空间和分配器可复用内存是不同指标。
 
+\subsection{ptmalloc 和 tcache：glibc malloc 的最小心智模型}
+
+Linux 上常见的 glibc \code{malloc} 实现属于 ptmalloc 家族。版本细节会变化，本书不要求背内部结构体字段，但必须建立一张足够工程化的地图：ptmalloc 用 arena 减少多线程全局锁争用，用 chunk 元数据描述分配块，用 bin 保存可复用空闲块，用 top chunk 表示当前堆顶剩余空间，用 \code{brk} 和 \code{mmap} 从内核取得虚拟内存范围。现代 glibc 还引入 tcache，让每个线程缓存一小批常见大小的空闲块，降低小对象分配释放的锁成本。
+
+\begin{lstlisting}[numbers=none,caption={ptmalloc 的压缩版路径}]
+malloc(bytes):
+  normalize request to chunk size
+  if tcache for this size has an entry:
+      pop from per-thread tcache
+  else if fastbin/smallbin/unsorted bin can satisfy:
+      detach reusable chunk from arena bins
+  else if top chunk has enough space:
+      split from top chunk
+  else if request is large:
+      mmap a separate region
+  else:
+      grow heap with brk and retry
+
+free(ptr):
+  recover chunk header from user pointer
+  if tcache accepts this size:
+      push to per-thread tcache
+  else:
+      return to arena bin, maybe coalesce neighbors
+  if large mmap chunk:
+      munmap region
+\end{lstlisting}
+
+这段伪代码省略了大量安全检查、加锁、合并和版本差异，但足以解释现象。小对象反复分配释放可能完全命中 tcache，几乎看不到系统调用；tcache 满了或跨线程释放，路径会回到 arena；大对象可能直接 \code{mmap}，释放时可能 \code{munmap}；很多中等对象释放后留在进程里供后续复用，RSS 不一定下降。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.35\linewidth}p{0.29\linewidth}}
+\toprule
+组件 & 作用 & 性能或调试后果 \\
+\midrule
+tcache & 线程本地小块缓存 & 快，但会让释放后复用更隐蔽 \\
+arena & 一组堆和 bin 元数据 & 多线程降低全局锁，但跨 arena 复杂 \\
+fastbin/smallbin & 保存常见大小空闲 chunk & 分配快，碎片和合并有策略差异 \\
+unsorted bin & 新释放块的过渡区 & 后续分配可能重用或整理 \\
+top chunk & 当前 heap 顶部剩余空间 & 不够时可能触发 \code{brk} 增长 \\
+\code{mmap} chunk & 大块独立映射 & 释放时更可能还给内核 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+不要把这张表当作 glibc ABI。真实分配器内部不是稳定接口，调试时要以当前 glibc 版本、源码和工具输出为准。工程上真正需要的是判断路径：这次分配是否命中线程缓存，是否进入 arena 锁，是否向内核申请新映射，是否只是复用旧块，是否因为大小类别变化导致行为突变。
+
+\subsection{\code{brk} 和 \code{mmap}：两种向内核要虚拟内存的方式}
+
+分配器向内核扩展地址空间常见有两类路径。\code{brk}/\code{sbrk} 调整传统 heap 的末端，把一段连续虚拟地址范围交给分配器管理；\code{mmap} 创建新的虚拟内存映射，常用于大块分配、匿名映射、文件映射和特殊对齐需求。二者拿到的是虚拟地址范围，不等价于物理页已经全部分配。
+
+\begin{lstlisting}[language=bash,caption={观察 brk/mmap 和地址空间变化}]
+strace -e trace=brk,mmap,mmap2,munmap ./alloc_probe
+cat /proc/$(pidof alloc_probe)/maps
+cat /proc/$(pidof alloc_probe)/smaps_rollup
+\end{lstlisting}
+
+观察分配器时，\code{strace} 有一个常见陷阱：没有看到 \code{brk} 或 \code{mmap}，不代表没有发生分配；它可能命中 tcache、bin 或已有 arena。反过来，看到 \code{mmap} 也不代表用户代码已经触碰了所有页面；真正的 page fault 可能发生在后续初始化循环。报告应把“取得虚拟范围”“分配器返回指针”“用户首次写入”“RSS 增长”分成四个时间点。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+现象 & 可能解释 & 需要补的证据 \\
+\midrule
+\code{malloc} 很快但初始化慢 & 只拿到地址，首次触页在写入时发生 & page faults、触页循环对照 \\
+\code{free} 后 RSS 不降 & 块留在 tcache/arena/bin 中复用 & smaps、后续复用实验 \\
+大块释放后 RSS 下降 & 大块走独立 \code{mmap}/\code{munmap} & strace、maps diff \\
+多线程分配抖动 & arena 锁、跨线程释放、NUMA 位置 & 线程绑定、allocator 指标 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{碎片：有空闲内存但不一定有合适内存}
+
+碎片不是“内存泄漏”的同义词。内存泄漏是对象或块不再需要却仍然不可释放；碎片是总空闲空间存在，但形状不适合未来请求，或者分散在不能合并的位置。内部碎片来自 size class 向上取整，例如请求 33 字节却占用 48 或 64 字节 chunk；外部碎片来自空闲块分散，中间夹着仍活跃的块，无法合并成大块。虚拟地址空间、RSS、allocator retained memory 和业务 live bytes 因此会分离。
+
+\begin{lstlisting}[numbers=none,caption={碎片的最小例子}]
+allocate A: 64 KiB
+allocate B: 64 KiB
+allocate C: 64 KiB
+free A
+free C
+request D: 128 KiB
+
+total free is 128 KiB, but no adjacent 128 KiB block exists
+unless allocator can grow, move, or use another mapping.
+\end{lstlisting}
+
+C/C++ 分配器通常不能移动已经返回给用户的对象，因为用户持有原地址。于是它不能像某些移动式 GC 那样紧凑内存。工程上减少碎片的方法包括：按生命周期分 arena，按大小分 pool，避免把长寿命对象和短寿命对象混在同一分配域，批量释放同生命周期对象，避免跨线程频繁释放所有权不清的对象。第三册的 activation arena 和 KV cache allocator 本质上也是在控制碎片形状。
+
+\begin{lstlisting}[numbers=none,caption={碎片报告字段}]
+fragmentation_report:
+  live_bytes
+  requested_bytes_total
+  allocated_chunk_bytes_total
+  rss_bytes
+  virtual_mapped_bytes
+  largest_observed_allocation
+  allocation_size_histogram
+  lifetime_groups
+  free_pattern
+  retained_after_free
+\end{lstlisting}
+
+这份报告可以防止一个常见误判：进程 RSS 高，不一定是泄漏；也可能是 allocator 保留、碎片、page cache、mmap 文件、线程栈或 JIT/共享库映射。反过来，RSS 稳定也不证明没有泄漏，小对象泄漏可能被其它释放掩盖。要判断分配器问题，必须同时看业务 live set、分配模式、释放模式、映射和页错误。
+
 \subsection{free 之后发生了什么}
 
 \code{free(p)} 或 \code{delete p} 的语言后果是对象生命周期结束，storage 归还给对应分配器。它不保证字节被清零，不保证虚拟地址取消映射，不保证下一次不会返回同一个地址。分配器可能把块放入缓存，稍后复用；也可能对大块执行 \code{munmap}；也可能为了调试或安全填充特殊模式。程序不能依赖任何一种偶然行为。

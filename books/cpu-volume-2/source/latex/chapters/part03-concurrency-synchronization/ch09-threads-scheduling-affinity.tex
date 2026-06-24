@@ -60,6 +60,129 @@ join and release thread resources
 
 这条链解释了为什么“每个小任务一个线程”很快会失控。即使线程函数只做几百纳秒计算，栈、内核对象、调度、join 和异常路径仍然存在。线程池把这条生命周期从每个 task 移到 worker 初始化和关闭阶段，但 task 自身的生命周期并不会消失：它仍然要有提交、入队、执行、完成、失败和取消状态。线程池优化的是执行实体复用，不是取消了状态管理。
 
+\topic{\code{std::thread}、pthread 和内核线程不是同一层对象}
+初学线程时最容易混淆三层对象。\code{std::thread} 是 C++ 标准库对象，负责表达“这个 C++ 程序拥有一个可 join 或可 detach 的执行句柄”；pthread 是 POSIX 线程 API，负责创建线程、设置属性、同步和 TLS 等平台接口；Linux 内核调度的是 task 结构里的线程执行上下文，常由 \code{clone} 或 \code{clone3} 创建，并出现在 \code{/proc/<pid>/task/<tid>} 下。三者通常一一相关，但语义重点不同。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.19\linewidth}p{0.32\linewidth}p{0.35\linewidth}}
+\toprule
+层次 & 它回答的问题 & 典型证据 \\
+\midrule
+\code{std::thread} & C++ 对象是否 joinable，析构时合同是什么 & \code{joinable()}、析构行为、异常路径 \\
+pthread & 栈大小、detach 状态、线程名、亲和性、TLS 等属性 & \code{pthread_attr_*}、\code{pthread_setname_np} \\
+Linux thread & 是否 runnable/running/sleeping，调度到哪个 CPU，阻塞在哪里 & \code{/proc/<pid>/task}、\code{perf sched}、\code{strace -f} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表能解释一个常见误判：\code{std::thread} 对象销毁了，不等于底层线程已经安全完成；只有 join 或 detach 才把所有权合同说清楚。反过来，\code{/proc/<pid>/task} 里看到一个 TID，也不代表业务 task 正在运行，它可能睡在 futex、I/O、page fault 或条件变量上。写线程报告时，必须同时记录 C++ 层的 join/detach 合同、pthread 属性和内核状态。
+
+\topic{join、detach 和析构是所有权合同}
+\code{std::thread} 的危险之处不在创建语法，而在生命周期。一个 joinable 的 \code{std::thread} 对象析构时会调用 \code{std::terminate}，因为标准库不能替你猜测：是应该阻塞等待线程结束，还是把线程留在后台继续跑。C++ 把这个决定强制交给程序员：要么 \code{join}，明确等待完成并回收线程资源；要么 \code{detach}，明确放弃句柄，让线程独立结束。
+
+\begin{lstlisting}[language=C++,caption={线程所有权错误：析构 joinable thread}]
+void bad() {
+    std::thread t([] {
+        do_work();
+    });
+    if (early_error()) {
+        return;          // t is still joinable: std::terminate
+    }
+    t.join();
+}
+\end{lstlisting}
+
+正确设计不是到处补 \code{detach}。Detach 适合极少数真正独立、生命周期不依赖调用者、且有自己关闭协议的后台线程。大多数系统线程都应该有明确 owner：线程池对象、service 对象或 runtime 对象。Owner 负责请求停止、通知 worker、drain 队列、join 线程，并保证线程函数不再访问已经析构的队列、allocator、日志器或配置对象。第 10 章的条件变量和第 14 章的运行时关闭协议，都建立在这个所有权合同上。
+
+\begin{lstlisting}[numbers=none,caption={join/detach 的最小状态机}]
+NoThread
+  -> JoinableRunning       create succeeds
+JoinableRunning
+  -> JoinableFinished      thread function returns
+JoinableRunning
+  -> Detached              detach, owner gives up handle
+JoinableFinished
+  -> Joined                join observes completion and releases handle
+JoinableRunning
+  -> Terminate             std::thread object destructor while joinable
+\end{lstlisting}
+
+这不是语言细节，而是工程边界。若线程函数捕获 \code{this}，而对象析构时没有先停止并 join，后台线程可能访问已经释放的内存。若线程池析构时只设置 \code{stop=true}，却不通知条件变量，worker 可能永远睡着，析构线程卡在 join。若异常路径提前返回，joinable 线程会触发 terminate。线程基础章节必须先把这些合同讲清楚，否则后面讨论调度和亲和性会掩盖更基本的生命周期错误。
+
+\topic{每个线程都有自己的栈、TLS 和退出清理}
+线程不是“多一个函数在跑”这么简单。每个线程有自己的栈，用来保存函数调用链、局部变量、返回地址、异常展开信息和一部分运行时状态；还有线程本地存储 TLS，用来放 \code{thread_local} 对象、errno、某些库的线程状态和 allocator 的线程缓存。pthread 创建线程时可以设置栈大小和 guard page；\code{std::thread} 通常使用平台默认属性。栈太小会在深调用、巨大局部数组或递归中撞到 guard page；栈太大又会消耗虚拟地址空间，并在大量线程时加重页表和映射压力。
+
+\begin{lstlisting}[language=C++,caption={线程栈和 TLS 的两个基础事实}]
+thread_local std::uint64_t worker_events = 0;
+
+void worker_entry() {
+    std::array<char, 64 * 1024> scratch{}; // lives on this thread's stack
+    ++worker_events;                       // lives in this thread's TLS
+    run_worker_loop(scratch);
+}
+\end{lstlisting}
+
+\code{scratch} 的地址随线程栈变化，不应逃逸到线程结束之后；\code{worker_events} 看起来像全局变量，却是每个线程一份。线程退出时，TLS 对象会按实现规定的顺序析构。若 TLS 析构函数访问已经关闭的日志器、allocator、runtime 或动态库状态，就可能出现很晚才爆的退出期错误。工程上应避免让复杂拥有关系藏进 TLS；若必须使用 TLS 缓存，要明确它在线程退出、fork、动态库卸载和运行时 shutdown 时的行为。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.23\linewidth}p{0.34\linewidth}p{0.29\linewidth}}
+\toprule
+对象 & 常见错误 & 证据或防线 \\
+\midrule
+线程栈 & 大局部数组、深递归、栈地址逃逸 & \code{/proc/<pid>/maps}、guard page、ASan \\
+TLS & 退出期析构访问已销毁对象 & 简化 TLS、显式 shutdown、TSan/ASan \\
+tcache & 线程退出时缓存释放路径被误判为泄漏 & allocator 统计、退出前后 RSS 对照 \\
+errno & 跨线程读取错误码，以为是全局状态 & 每线程错误码，立即保存 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+第一册讲 allocator 时说过 tcache 是线程本地小块缓存，这里要把它接回来：线程退出不是只从 run queue 消失，还会触发线程相关 runtime 状态清理。大量短生命周期线程会反复创建栈、TLS、tcache 和内核调度对象；即使业务函数很短，系统开销也会变成主成本。这是线程池存在的第一性原因之一。
+
+\topic{线程基础证据包：先证明线程事实，再解释性能}
+线程报告不应只写“开了 16 个线程”。最低限度要能证明：进程里有多少内核线程，每个线程叫什么，线程是否在睡眠，是否发生过 futex 等待，是否频繁迁移，是否有大量 voluntary/involuntary context switch。没有这些事实，后面的亲和性、阻塞隔离和任务粒度结论都容易变成猜测。
+
+\begin{lstlisting}[language=bash,caption={线程基础证据包}]
+# 1. 看内核线程身份。每个目录名是一个 TID。
+ls /proc/$PID/task
+cat /proc/$PID/task/$TID/status
+cat /proc/$PID/task/$TID/sched
+
+# 2. 看创建、等待和唤醒路径。
+strace -f -e trace=clone,clone3,futex,nanosleep,read,write ./thread_probe
+
+# 3. 看线程栈和映射。
+cat /proc/$PID/maps | grep -E 'stack|vdso|vvar'
+
+# 4. 看调度时间线，需要权限和内核支持。
+perf sched record -- ./thread_probe
+perf sched latency
+\end{lstlisting}
+
+证据边界也要写清。看到 \code{clone} 只能说明创建了新的内核执行实体，不能说明它已经运行了业务 task；看到 \code{futex} 只能说明线程进入了或唤醒了某类等待路径，不能自动证明锁竞争就是瓶颈；看到 \code{/proc/<tid>/status} 里的 state 是 sleeping，只是采样瞬间，不是完整时间线；\code{perf sched} 能解释 run queue 延迟和迁移，但它需要足够权限，且会引入采集开销。严肃报告要把命令、权限、采样窗口、负载输入和未验证边界一起写出来。
+
+\begin{lstlisting}[numbers=none,caption={线程基础报告字段}]
+thread_foundation_report:
+  process_id
+  thread_count
+  thread_names
+  stack_size_policy
+  join_detach_policy
+  worker_owner_object
+  shutdown_protocol
+  clone_count
+  futex_wait_count
+  voluntary_context_switches
+  involuntary_context_switches
+  migrations
+  max_runnable_threads
+  evidence_limitations
+\end{lstlisting}
+
+这份报告的目的不是炫耀工具，而是防止三类误判。第一，把 \code{std::thread} 对象数量当成真实运行线程数量。第二，把线程 sleeping 当成没有工作，而不检查 worker 是否被错误等待占住。第三，把线程创建成功当成任务已经开始运行，而不记录从 submit 到 running 的中间状态。线程基础做扎实之后，后面的调度章节才有可验证的地基。
+
 \topic{Worker loop 的底层事件链}
 一个最小 worker 循环表面上只是“取任务并运行”，底层其实跨过用户态队列、条件变量、内核等待和 CPU 调度。可以先写成事件链：
 
