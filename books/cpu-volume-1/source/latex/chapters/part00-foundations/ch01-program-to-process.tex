@@ -1001,11 +1001,154 @@ C++ 程序员习惯把 \code{main} 看成入口，这是语言层面的入口，
 
 进程不只是指令流。一个进程是操作系统管理的资源集合。它有虚拟地址空间，有一个或多个线程，有文件描述符表，有信号处理状态，有当前工作目录，有权限和资源限制，有调度属性，有环境变量。一个程序运行得快或慢，可能与这些资源状态有关。
 
-文件描述符是进程与外部世界交互的重要接口。标准输入、标准输出、标准错误通常就是前三个文件描述符。打开文件、socket、管道、事件对象，都可以表现为文件描述符。输出到终端、输出到文件和输出到管道，成本和阻塞行为都可能不同。因此，把打印放进计时区域，会让测量受外部设备和内核缓冲状态影响。
+如果只记住“程序有一段机器码”，后面所有系统问题都会混层。文件找不到可能不是 \code{open} 语义问题，而是当前工作目录错了；benchmark 波动可能不是算法问题，而是 \code{OMP\_NUM\_THREADS} 或 CPU 亲和性不同；服务重启失败可能不是业务逻辑问题，而是 fd 泄漏、权限、\code{RLIMIT\_NOFILE} 或 \code{umask}。第一册必须先把进程基础合同讲清楚：一个运行实例到底带着哪些身份和资源进入 \code{main}。
 
-环境变量会影响程序行为。动态库搜索、线程库设置、内存分配器行为、OpenMP 线程数、某些高性能库的 ISA 分发策略，都可能通过环境变量控制。两个运行命令看起来一样，如果环境变量不同，实际执行路径可能不同。高质量实验报告应记录关键环境变量，至少说明没有依赖特殊环境，或者明确列出影响性能的设置。
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+进程资源 & 它回答的问题 & 常见事故 \\
+\midrule
+\code{argv} & 本次运行被传入哪些参数 & 脚本参数和手工命令不一致 \\
+\code{envp}/环境变量 & 动态库、线程数、allocator、ISA 分发怎样被配置 & 两台机器同命令不同路径 \\
+当前工作目录 & 相对路径从哪里开始解析 & 输入、配置或模型文件读错 \\
+fd table & 进程持有哪些打开对象 & fd 泄漏、标准输出阻塞、close-on-exec 漏掉 \\
+权限和 \code{umask} & 能否访问文件，创建文件默认权限是什么 & 本地成功，服务账号失败 \\
+资源限制 & fd、栈、core、地址空间等上限是多少 & 高并发下突然 \code{EMFILE} 或无 core dump \\
+父子关系和退出状态 & 谁启动了谁，结果如何回收 & 僵尸进程、脚本忽略失败 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{参数、环境和工作目录：同一个二进制可以跑成不同程序}
+
+\code{argv} 是命令行参数，不是源码常量。Shell、脚本、测试框架、IDE、systemd、容器入口和在线服务管理器都可能传入不同参数。报告中写“运行了 \code{app}”不够，必须写完整命令。若程序根据参数选择输入规模、线程数、配置文件或后端实现，少一个参数就可能变成另一个实验。
+
+环境变量会影响程序行为。动态库搜索、线程库设置、内存分配器行为、OpenMP 线程数、BLAS/oneDNN/推理库的线程数、某些高性能库的 ISA 分发策略，都可能通过环境变量控制。两个运行命令看起来一样，如果环境变量不同，实际执行路径可能不同。高质量实验报告应记录关键环境变量，至少说明没有依赖特殊环境，或者明确列出影响性能的设置。
 
 当前工作目录和文件路径也会影响运行。相对路径从当前工作目录解析；程序可能读取配置文件、模型文件、输入数据或动态插件。如果你在不同目录运行同一个可执行文件，加载的数据可能不同，甚至链接到的插件也可能不同。性能实验应把输入数据来源和工作目录说清楚。
+
+\begin{lstlisting}[numbers=none,caption={参数、环境和工作目录的证据}]
+cat /proc/$PID/cmdline | tr '\0' ' '
+tr '\0' '\n' < /proc/$PID/environ | sort
+readlink /proc/$PID/cwd
+readlink /proc/$PID/exe
+\end{lstlisting}
+
+这些命令的证据边界也要清楚。\filepath{cmdline} 证明内核记录的启动参数，不证明程序内部没有再读配置文件。\filepath{environ} 证明进程启动时和运行中保留的环境，不证明所有库都使用这些变量。\filepath{cwd} 证明当前工作目录，但线程和库函数仍可能使用绝对路径、临时目录或已经打开的 fd。证据要组合起来看。
+
+\subsection{fd table：标准输入输出也是资源，不是普通变量}
+
+文件描述符是进程与外部世界交互的重要接口。标准输入、标准输出、标准错误通常就是前三个文件描述符：\code{0}、\code{1}、\code{2}。打开文件、socket、管道、事件对象、epoll 对象、timerfd、eventfd，都可以表现为文件描述符。输出到终端、输出到文件和输出到管道，成本和阻塞行为都可能不同。因此，把打印放进计时区域，会让测量受外部设备和内核缓冲状态影响。
+
+\begin{lstlisting}[numbers=none,caption={fd table 的最小观察}]
+ls -l /proc/$PID/fd
+cat /proc/$PID/fdinfo/1
+strace -f -e trace=openat,close,dup,dup2,fcntl,execve ./app
+\end{lstlisting}
+
+fd table 的关键细节有三个。第一，fd 是进程局部小整数，不是文件本身。第二，多个 fd 可能通过 \code{dup}、\code{fork} 或库封装指向同一个 open file description，共享 offset 和状态。第三，\code{execve} 默认会保留未设置 close-on-exec 的 fd。若服务在启动子进程时忘记设置 \code{O\_CLOEXEC} 或 \code{FD\_CLOEXEC}，子进程可能意外持有监听 socket、日志文件、pipe 写端或临时文件，使父进程无法正确观察 EOF、端口无法释放，或者敏感 fd 泄漏给不该拥有的程序。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+现象 & 可能的 fd 根因 & 需要补的证据 \\
+\midrule
+服务无法退出 & 子进程仍持有 pipe/socket fd & \filepath{/proc/<pid>/fd}、\code{O\_CLOEXEC} \\
+日志写入卡住 & stdout/stderr 指向慢终端或阻塞 pipe & fd 链接目标、\code{strace -T} \\
+\code{EMFILE} & 进程 fd 用尽 & \code{ls /proc/$PID/fd | wc -l}、\code{RLIMIT\_NOFILE} \\
+读写位置错乱 & 多线程共享 open file description offset & \code{dup/fork} 证据、是否用 \code{pread} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这就是为什么系统程序常把 fd 生命周期写成显式协议：谁打开，谁拥有，是否跨线程，是否跨 \code{exec}，是否允许继承，错误路径谁关闭。fd 管理不好，问题常常表现为 I/O、服务退出、测试挂住或资源泄漏，而不是“fd 管理错误”这几个字。
+
+\subsection{权限、\code{umask} 和资源限制：本地能跑不代表服务账号能跑}
+
+进程有真实用户 ID、有效用户 ID、组、补充组、能力和命名空间上下文。普通开发命令在自己的用户下运行，线上服务可能在专用账号、容器、chroot、只读文件系统或不同挂载命名空间中运行。一次 \code{open} 失败，可能不是路径拼错，而是权限、目录执行位、SELinux/AppArmor、只读挂载或文件系统策略不同。
+
+\code{umask} 会改变新建文件和目录的默认权限。程序调用 \code{open(path, O\_CREAT, 0666)}，最终权限还会被 \code{umask} 去掉一些位。若可靠输出、临时文件、模型缓存或 Unix domain socket 的权限没有写清，换一个启动环境就可能失败。实验报告至少要记录当前用户、工作目录权限、目标文件权限和 \code{umask}。
+
+资源限制同样属于基础合同。常见限制包括 \code{RLIMIT\_NOFILE}、\code{RLIMIT\_STACK}、\code{RLIMIT\_CORE}、\code{RLIMIT\_AS}、\code{RLIMIT\_NPROC}。高并发服务最容易撞到 fd 上限；深递归或大栈对象可能撞到栈限制；崩溃后没有 core dump，可能只是 \code{RLIMIT\_CORE=0}。不要把这些问题解释成 C++ 语义错误。
+
+\begin{lstlisting}[numbers=none,caption={权限和资源限制证据}]
+id
+umask
+ulimit -a
+cat /proc/$PID/limits
+namei -l /path/to/input/or/output
+stat -c '%A %U %G %n' /path/to/input/or/output
+\end{lstlisting}
+
+\subsection{\code{fork}、\code{execve}、\code{waitpid} 和退出状态}
+
+很多系统程序不是单进程孤岛。Shell、构建系统、测试框架、服务器守护进程都会启动子进程。最小模型是：\code{fork} 复制出一个子进程，子进程通常再用 \code{execve} 替换成另一个程序，父进程用 \code{waitpid} 回收退出状态。这个模型直接影响构建脚本、测试驱动、服务拉起、进程池和工具链。
+
+\begin{lstlisting}[numbers=none,caption={fork/exec/wait 的状态机}]
+ParentRunning:
+  process has address space, fd table, signal dispositions, cwd and environment
+
+Forked:
+  child gets a new process id
+  many resources are inherited or copy-on-write
+
+ChildBeforeExec:
+  child may adjust fd table, cwd, environment and signal mask
+
+Execed:
+  child address space is replaced by a new executable image
+  selected resources such as cwd, environment and non-CLOEXEC fd remain
+
+Exited:
+  child terminates with exit code or signal
+
+Reaped:
+  parent waitpid collects status; zombie is removed
+\end{lstlisting}
+
+\code{fork} 后父子进程不是两个线程。它们有不同进程 ID 和不同地址空间；内存页面通常通过 COW 共享，直到写入才复制。fd table 里的条目会被继承，且可能引用同一个 open file description。信号处理、环境、工作目录也有继承规则。子进程 \code{execve} 后，旧地址空间消失，但当前工作目录、环境变量、部分 fd、权限和资源限制等仍然影响新程序。理解这些继承关系，才能解释“为什么子进程拿到了不该拿的 fd”“为什么脚本运行的是另一个环境”“为什么父进程看到 pipe 永远不 EOF”。
+
+退出状态也是基础合同。C/C++ 的 \code{return 0}、\code{std::exit(0)} 和 shell 中的成功状态相连；非零退出码表示失败类别；若进程被信号终止，父进程通过 wait status 能区分退出码和终止信号。脚本忽略退出状态，会在编译失败后继续运行旧二进制；测试框架错误解释退出状态，会把崩溃当成普通失败或把失败当成成功。
+
+\begin{lstlisting}[language=C++,caption={父进程必须解释 wait status}]
+int status = 0;
+pid_t child = ::waitpid(pid, &status, 0);
+if (child < 0) {
+    return error_from_errno(errno);
+}
+if (WIFEXITED(status)) {
+    int code = WEXITSTATUS(status);
+    // code == 0 means success by convention.
+}
+if (WIFSIGNALED(status)) {
+    int signo = WTERMSIG(status);
+    // The child died from a signal such as SIGSEGV or SIGKILL.
+}
+\end{lstlisting}
+
+\subsection{进程基础报告字段}
+
+从这一章开始，凡是涉及运行、调试或测量的报告，都应该至少能回答下面这些问题：
+
+\begin{lstlisting}[numbers=none,caption={进程基础报告字段}]
+process_identity:
+  pid
+  parent_pid
+  executable_path
+  argv
+  cwd
+  selected_environment
+  uid_gid
+  umask
+  resource_limits
+  open_fd_summary
+  signal_dispositions_or_masks_if_relevant
+  exit_status_or_terminating_signal
+\end{lstlisting}
+
+这些字段不是形式主义。它们防止最基础的错误归因：运行旧程序、读错输入、写错目录、环境变量改变库行为、fd 泄漏、权限不一致、资源限制触发、信号终止被当成普通返回。后面讲 ELF、syscall、signal、I/O、线程和 benchmark 时，都默认读者已经能建立这张进程资源底图。
 
 调度状态也属于进程运行环境。操作系统会把线程安排到 CPU 核心上运行，也可能中断、迁移或抢占它。线程迁移会改变缓存热度；抢占会让墙钟时间变长；后台任务会争用内存带宽、共享缓存和执行资源；电源管理会改变频率。后续测量章节会系统讨论这些噪声，但本章先建立一个原则：进程不是独占机器，性能数据总是运行环境和程序共同作用的结果。
 
