@@ -13,13 +13,6 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
     endif()
 endif()
 
-if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
-    if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-        target_sources(lcqi PRIVATE src/int8_kernels_neon.cpp)
-        target_compile_definitions(lcqi PRIVATE LCQI_ENABLE_NEON=1)
-    endif()
-endif()
-
 if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(WARNING "LCQI is written for the book's local Linux CPU target; current system is ${CMAKE_SYSTEM_NAME}.")
 endif()

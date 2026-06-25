@@ -9,8 +9,6 @@
 
 namespace {
 
-constexpr const char* LCQI_TARGET_ARCH_AARCH64 = "aarch64";
-constexpr const char* LCQI_TARGET_ARCH_ARM64 = "arm64";
 constexpr const char* LCQI_TARGET_ARCH_X86_64 = "x86_64";
 constexpr const char* LCQI_TARGET_ARCH_I386 = "i386";
 constexpr const char* LCQI_TARGET_ARCH_UNKNOWN = "unknown";
@@ -21,11 +19,7 @@ constexpr std::int32_t LCQI_MIN_LARGE_CASE_REPEAT = 1;
 constexpr std::int32_t LCQI_DECODE_SHAPE_SIZE = 4096;
 
 const char* target_arch() noexcept {
-#if defined(__aarch64__)
-    return LCQI_TARGET_ARCH_AARCH64;
-#elif defined(__arm64__)
-    return LCQI_TARGET_ARCH_ARM64;
-#elif defined(__x86_64__) || defined(_M_X64)
+#if defined(__x86_64__) || defined(_M_X64)
     return LCQI_TARGET_ARCH_X86_64;
 #elif defined(__i386__) || defined(_M_IX86)
     return LCQI_TARGET_ARCH_I386;

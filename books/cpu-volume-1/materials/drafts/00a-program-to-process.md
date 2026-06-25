@@ -315,7 +315,7 @@ ret
 
 ```text
 x86-64
-ARM64
+other-isa
 RISC-V
 ```
 

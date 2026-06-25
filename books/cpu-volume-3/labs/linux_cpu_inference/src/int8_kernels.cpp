@@ -18,11 +18,10 @@ constexpr std::int32_t LCQI_INPUT_PATTERN_CENTER = 8;
 constexpr float LCQI_INPUT_PATTERN_SCALE = 0.125F;
 constexpr double LCQI_SECONDS_TO_MICROSECONDS = 1000000.0;
 constexpr std::int32_t LCQI_SIMD_OUTPUT_BLOCK = 8;
-constexpr std::size_t LCQI_BENCHMARK_BACKEND_COUNT = 4;
+constexpr std::size_t LCQI_BENCHMARK_BACKEND_COUNT = 3;
 constexpr const char* LCQI_BACKEND_SCALAR = "scalar";
 constexpr const char* LCQI_BACKEND_PACKED_SCALAR = "packed_scalar";
 constexpr const char* LCQI_BACKEND_AVX2 = "avx2";
-constexpr const char* LCQI_BACKEND_NEON = "neon";
 
 void require_positive(std::int32_t value, const char* name) {
     if (value <= 0) {
@@ -315,20 +314,6 @@ KernelBenchmarkResult benchmark_linear_i8_case(const KernelBenchmarkCase& benchm
     } else {
         add_unavailable_backend(result, LCQI_BACKEND_AVX2);
     }
-    if (linear_i8_packed_neon_available()) {
-        linear_i8_packed_neon(packed_simd, input, simd_output);
-        result.backends.push_back(KernelBackendBenchmark{
-            .name = LCQI_BACKEND_NEON,
-            .available = true,
-            .average_us = measure_average_us(
-                benchmark_case.repeat,
-                [&]() { linear_i8_packed_neon(packed_simd, input, simd_output); }),
-            .max_abs_diff = max_abs_diff(scalar_output, simd_output),
-            .checksum = checksum(simd_output),
-        });
-    } else {
-        add_unavailable_backend(result, LCQI_BACKEND_NEON);
-    }
     return result;
 }
 
@@ -343,20 +328,6 @@ bool linear_i8_packed_avx2_available() noexcept {
 
 void linear_i8_packed_avx2(const PackedLinearI8&, std::span<const float>, std::span<float>) {
     throw std::runtime_error("AVX2 packed kernel is not enabled in this build");
-}
-
-}  // namespace lcqi
-#endif
-
-#if !defined(LCQI_ENABLE_NEON)
-namespace lcqi {
-
-bool linear_i8_packed_neon_available() noexcept {
-    return false;
-}
-
-void linear_i8_packed_neon(const PackedLinearI8&, std::span<const float>, std::span<float>) {
-    throw std::runtime_error("NEON packed kernel is not enabled in this build");
 }
 
 }  // namespace lcqi

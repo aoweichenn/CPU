@@ -11,7 +11,7 @@
 - int8 权重加 per-layer scale
 - float 输入和激活
 - 量化线性层、ReLU、分类 argmax
-- int8 linear scalar baseline、packed layout、AVX2/NEON 路径和 shape sweep benchmark
+- int8 linear scalar baseline、packed layout、AVX2 路径和 shape sweep benchmark
 - tiny reference decoder：RMSNorm、float linear、RoPE、GQA KV cache、decode attention、SwiGLU、lm head
 - reference trace CSV：从 prompt/tokenizer 到 logits/sampler/token，逐 checkpoint 输出 shape、stride、dtype、layout、checksum、max_abs、values 摘要
 - 7B ledger CSV：输出典型 7B shape 的 FLOPs、KV 容量、权重/KV 字节和 bandwidth-only tokens/s 上限
@@ -57,9 +57,9 @@ books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_bench 200
 target_arch,input_size,output_size,output_block,repeat,backend,available,average_us,max_abs_diff,checksum
 ```
 
-当前 benchmark 按 backend 逐行输出：`scalar`、`packed_scalar`、`avx2`、`neon`。x86-64 构建会编译 AVX2 路径；aarch64 构建会编译 NEON 路径。不可用 backend 保留行但 `available=0`，避免把跨平台源码误报成本机实测性能。
+当前 benchmark 按 backend 逐行输出：`scalar`、`packed_scalar`、`avx2`。x86-64 构建会编译 AVX2 路径；不支持 AVX2/FMA 的机器会把该 backend 标为 `available=0`，避免把源码存在误报成本机实测性能。
 
-这还不是生产级高性能 kernel。当前 benchmark 建立 scalar baseline、packed layout、AVX2/NEON 基线正确性和 shape sweep 口径。要达到大师级 AI Infra 证据，还必须继续补反汇编分析、AVX-512、perf counter、oneDNN/OpenBLAS/llama.cpp/ggml 对照、sanitizer、fuzz 和 CI。
+这还不是生产级高性能 kernel。当前 benchmark 建立 scalar baseline、packed layout、AVX2 基线正确性和 shape sweep 口径。要达到大师级 AI Infra 证据，还必须继续补反汇编分析、AVX-512、perf counter、oneDNN/OpenBLAS/llama.cpp/ggml 对照、sanitizer、fuzz 和 CI。
 
 reference decoder trace：
 

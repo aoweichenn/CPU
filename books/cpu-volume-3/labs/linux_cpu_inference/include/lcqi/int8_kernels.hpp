@@ -55,12 +55,6 @@ void linear_i8_packed_avx2(const PackedLinearI8& layer,
                            std::span<const float> input,
                            std::span<float> output);
 
-bool linear_i8_packed_neon_available() noexcept;
-
-void linear_i8_packed_neon(const PackedLinearI8& layer,
-                           std::span<const float> input,
-                           std::span<float> output);
-
 QuantizedLinearLayer make_deterministic_i8_layer(std::int32_t input_size,
                                                  std::int32_t output_size,
                                                  float scale);

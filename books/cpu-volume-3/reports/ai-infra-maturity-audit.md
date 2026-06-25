@@ -9,7 +9,7 @@
 - 书稿已经建立本地推理引擎的完整知识地图。
 - `linux_cpu_inference` 已有 int8 MLP 教学切片。
 - 新增 tiny reference decoder，覆盖 RMSNorm、float linear、RoPE、GQA KV cache、decode attention、SwiGLU、lm head。
-- 新增 int8 scalar baseline、packed layout 路径、AVX2/NEON 路径和 shape sweep benchmark。
+- 新增 int8 scalar baseline、packed layout 路径、AVX2 路径和 shape sweep benchmark。
 
 当前最大短板是：
 
@@ -31,7 +31,7 @@
 
 - scalar reference。
 - packed int8 layout。
-- AVX2、AVX-512 或 NEON kernel，至少一个必须在当前机器上实测。
+- AVX2 或 AVX-512 kernel，至少一个必须在当前机器上实测。
 - tiling、packing、cache blocking 说明。
 - tail path：K tail、N tail、非对齐输入。
 - 反汇编截图或摘要。
@@ -134,7 +134,7 @@
 
 1. 把 `lcqi_bench` 扩成 Release benchmark，并固定 CSV 输出。
 2. 加 Linux `perf stat` wrapper，收集 cycles、instructions、cache misses、branches、branch misses。
-3. 给 AVX2/NEON kernel 增加反汇编摘要和 shape 分档解释。
+3. 给 AVX2 kernel 增加反汇编摘要和 shape 分档解释。
 4. 加 OpenBLAS 或 oneDNN 对照脚本。
 5. 加 random/boundary shape tests。
 6. 加 sanitizer CMake preset。

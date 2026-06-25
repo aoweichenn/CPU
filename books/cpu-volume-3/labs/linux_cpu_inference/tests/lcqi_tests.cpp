@@ -230,12 +230,6 @@ void test_packed_i8_kernel_matches_scalar() {
             require(lcqi::max_abs_diff(scalar_output, avx2_output) <= LCQI_KERNEL_MAX_DIFF,
                     "AVX2 int8 kernel output differs from scalar");
         }
-        if (lcqi::linear_i8_packed_neon_available()) {
-            std::vector<float> neon_output(static_cast<std::size_t>(layer.output_size), 0.0F);
-            lcqi::linear_i8_packed_neon(simd_packed, input, neon_output);
-            require(lcqi::max_abs_diff(scalar_output, neon_output) <= LCQI_KERNEL_MAX_DIFF,
-                    "NEON int8 kernel output differs from scalar");
-        }
     }
 }
 
