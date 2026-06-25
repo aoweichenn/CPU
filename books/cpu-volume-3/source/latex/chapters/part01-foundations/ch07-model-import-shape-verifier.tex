@@ -274,6 +274,55 @@ RopeDesc:
 
 这部分和编译器的符号解析有相似性。源代码里的名字必须解析到某个声明；prompt 里的文本必须解析到模型词表中的 token id。若解析规则错了，后面所有 IR 和 kernel 都建立在错误输入上。
 
+\subsection{tokenizer.json、SentencePiece 和 chat template 的细节合同}
+
+真实 tokenizer 不是一张 \code{string -> id} 的 map。常见 tokenizer 至少包含 normalizer、pre-tokenizer、model、post-processor、added tokens 和 special token 规则。BPE、WordPiece、SentencePiece unigram 或 byte fallback 的内部算法不同，但导入器最终要产出同一种合同：给定一段 UTF-8 字节和一组 encode 选项，输出确定的 token id 序列、特殊 token 插入位置和反解码边界。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+组件 & 决定的事实 & 常见漂移 \\
+\midrule
+normalizer & Unicode 规范化、大小写、空白处理 & 可见文本相同，UTF-8 字节或 token 不同 \\
+pre-tokenizer & 如何按空格、标点或字节切分 & 中文、emoji、全角符号切分变化 \\
+model & BPE merge、unigram score、vocab id & merge 表版本或 vocab 顺序漂移 \\
+post-processor & BOS/EOS、role token、模板片段 & chat template 改版改变 prompt \\
+added tokens & 新增特殊 token 和普通 token & token id 超过 embedding 行数 \\
+byte fallback & 未登录字符如何落到字节 token & OOV 文本不再可逆 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+chat template 尤其不能靠人工直觉处理。用户给的是 messages：system、user、assistant、tool；模型吃的是一串带角色标记、换行、终止标记和特殊 token 的文本或 token。不同模板可能都“看起来合理”，但 token ids 完全不同。导入器要把模板版本纳入 manifest：
+
+\begin{lstlisting}[numbers=none,caption={chat template 合同字段}]
+ChatTemplateContract:
+  template_hash
+  roles_supported: [system, user, assistant, tool]
+  bos_policy
+  eos_policy
+  assistant_prefix
+  tool_call_marker
+  tool_result_marker
+  stop_token_ids
+  stop_string_fallbacks
+\end{lstlisting}
+
+这也解释了为什么上层 LangChain 类框架接入本地引擎时，不能只传一个最终 prompt 字符串。如果框架负责渲染 chat template，引擎仍要记录 \code{template\_hash} 和 tokenizer golden；如果引擎负责渲染，框架必须传结构化 messages 和模板策略。两边都默认自己“懂模板”，最容易造成训练格式和推理格式不一致。
+
+\begin{lstlisting}[numbers=none,caption={tokenizer 负例应覆盖的输入}]
+1. same visible text, different UTF-8 normalization
+2. leading space vs no leading space
+3. Chinese punctuation and full-width characters
+4. emoji or byte fallback character
+5. added special token in prompt body
+6. tool-call JSON with braces, quotes and newlines
+7. stop string crossing token boundary
+\end{lstlisting}
+
+这些负例的目标是让错误停在 tokenizer verifier。若 stop string 只按字符扫描，可能跨 token 边界误停；若 added token id 没检查 embedding 行数，只有包含该特殊 token 的少数 prompt 会越界；若中文 prompt 不保存 UTF-8 hex，编辑器或网页复制产生的不可见变化会让 golden 失效。
+
 \subsection{诊断：错误要停在前端，而不是后端崩溃}
 
 shape verifier 的诊断要像编译器错误，而不是像运行时崩溃。一个有用诊断应该包含：哪个 tensor、期望形状、实际形状、这个期望来自哪个 config 字段或上游算子，以及可能的修复方向。

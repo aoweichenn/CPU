@@ -512,6 +512,72 @@ Diagnostic:
 
 例如 backend 不支持某个 q4 格式时，应该写明 tensor、format、group size、backend capability 和 fallback 选择；KV cache 越界时，应该写明 session position、capacity、max context 和触发的 token；arena 复用冲突时，应该写明两个 value 的生命周期和 offset。这样的诊断能让读者把错误和书中讲过的合同对应起来。
 
+\subsection{上层编排回归：RAG、tool call 和 agent trace}
+
+第三册的验收不能只停在 kernel、logits 和 tokens/s。真实 AI 应用常通过 LangChain 类框架、LangGraph 类状态机或 LlamaIndex 类数据编排层进入推理服务。底层引擎没有变，上层 prompt template、retriever、tool schema 或 streaming callback 变了，也足以让质量、延迟和资源预算漂移。因此 release gate 要把“应用编排事实”也纳入回归。
+
+\begin{lstlisting}[numbers=none,caption={上层编排回归 fixture}]
+OrchestrationFixture:
+  fixture_id
+  messages_json
+  chat_template_hash
+  tokenizer_hash
+  retriever_fixture_id
+  retrieved_chunk_ids
+  citation_map_expected
+  tool_schema_hash
+  tool_responses
+  max_tool_steps
+  expected_prompt_token_count
+  expected_stop_reason
+  expected_stream_event_types
+\end{lstlisting}
+
+这份 fixture 的目标不是测试某个 Python 框架，而是固定跨层合同。若 \code{messages\_json} 相同但 \code{chat\_template\_hash} 变了，token ids 可能完全不同；若 retriever 返回同一批 chunk 但 citation map 变了，RAG 答案的可审计性就变了；若 tool schema 从字符串字段改成枚举字段，structured output 的验证路径和错误恢复都会改变。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+回归层级 & 检查对象 & 失败含义 \\
+\midrule
+prompt & token ids、token count、template hash & 模板或 tokenizer 漂移 \\
+retrieval & chunk ids、rank、citation span & RAG 上下文不再可复现 \\
+tool call & JSON schema、idempotency key、timeout & agent loop 事务边界改变 \\
+streaming & event 顺序、finish reason、cancel event & UI/callback 状态机漂移 \\
+quality & answer diff、citation diff、schema validity & 应用输出质量漂移 \\
+SLO & TTFT、TPOT、tool wait、queue wait & 上层编排改变了资源形状 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这里的质量检查要分层。纯生成任务可以比较 logits diff、top-k overlap 和固定 seed 下的 token sequence；RAG 任务要检查答案是否引用了允许 chunk，引用 id 是否能回到 prompt span；tool-call 任务要检查 JSON 是否满足 schema，工具是否按 idempotency key 执行一次，取消后是否没有迟到结果写回上下文。若只比较最终文本，很多危险漂移会被自然语言表面的相似性掩盖。
+
+\begin{lstlisting}[numbers=none,caption={上层编排 release gate}]
+1. tokenizer gate:
+   messages -> prompt bytes -> token ids are unchanged
+
+2. retrieval gate:
+   query -> chunk ids -> citation map are reproducible
+
+3. tool gate:
+   tool calls validate against schema and step budget
+
+4. trace gate:
+   stream events preserve order, parent span and finish reason
+
+5. context budget gate:
+   history + retrieval + tool result + output reserve <= max context
+
+6. quality gate:
+   answer, citation, structured output and refusal behavior pass fixture
+
+7. SLO gate:
+   queue wait, TTFT, TPOT and tool wait remain under thresholds
+\end{lstlisting}
+
+这条门禁把上层框架和底层引擎接在一起。底层 kernel 优化若改变 tokenizer golden 或 stop token 行为，应在 prompt gate 就失败；retriever 改版若让 prompt 多出 2000 token，应在 context budget gate 暴露；tool timeout 策略若让请求排队更久，应在 SLO gate 暴露。AI Infra 的工程边界不是“模型服务 API 返回 200”，而是从输入消息到输出事件的整条链路可复现、可度量、可回滚。
+
 \subsection{框架对标：尊重成熟实现，也要知道差距在哪里}
 
 自研引擎需要对标成熟框架，但对标不能只贴一个 tokens/s。成熟框架可能使用不同量化格式、不同 tokenizer、不同线程数、不同 GPU kernel、不同 batch 策略。对标前要固定变量：

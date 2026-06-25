@@ -219,6 +219,86 @@ shuffle.spill_bytes
 
 这些字段把“网络慢”拆开。若 \code{deserialize_ns} 高，问题在格式或 CPU；若 \code{reduce_queue_depth} 高，问题在下游计算；若 \code{retry_count} 高，问题在网络或 deadline；若 \code{spill_bytes} 高，问题在内存预算和 partition 形状。分布式性能必须能定位到层级。
 
+\topic{观测性：metrics、logs、traces 三件事不要混}
+分布式 shuffle 的调试不能只靠日志。Metrics 给趋势，logs 给离散事实，traces 给一次请求跨进程的因果链。三者缺一项，复盘都会失真：只有 metrics 看不到哪次 attempt 出错；只有 logs 很难看 p95；只有 trace 没有聚合指标，无法判断是否全局退化。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+观测对象 & 适合回答 & 不适合回答 \\
+\midrule
+Metrics & 队列深度、吞吐、p95、错误率趋势 & 单个 attempt 的完整因果链 \\
+Logs & 某次状态转移、错误码、恢复动作 & 大规模分位数和跨服务耗时分解 \\
+Traces & request/span 的父子关系和时间线 & 长窗口容量规划和低基数告警 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+一条 shuffle trace 至少要能把 map 端序列化、发送、reduce 端接收、反序列化、入队和提交连起来。字段可以参考 OpenTelemetry 风格的 span 模型，但重点不是依赖某个库，而是固定跨进程身份和时间边界。
+
+\begin{lstlisting}[numbers=none,caption={ShuffleSpan 最小字段}]
+trace_id
+span_id
+parent_span_id
+stage_id
+logical_task
+attempt
+reduce_partition
+route_epoch
+block_id
+bytes
+record_count
+queue_wait_ns
+serialize_ns
+send_ns
+network_wait_ns
+recv_ns
+deserialize_ns
+reduce_queue_depth
+retry_reason
+status
+\end{lstlisting}
+
+这份 trace 能回答“慢在哪里”。若 \code{serialize\_ns} 高，优先查 wire format、压缩和内存分配；若 \code{network\_wait\_ns} 高，查 RTT、拥塞、重试和 route；若 \code{reduce\_queue\_depth} 高，查下游算子或热点 key；若 \code{retry\_reason} 集中在 deadline，查 SLO 和 backpressure。没有这些字段，工程师只能把所有问题归咎为“网络不稳定”。
+
+\topic{RDMA 不是跳过状态机}
+RDMA 和高速互联会出现在 AI Infra、参数同步、shuffle 和多机推理中，但它不是分布式正确性的捷径。RDMA verbs 的基本对象包括 protection domain、memory region、queue pair、send/receive queue、completion queue 和 completion entry。它能让网卡直接 DMA 到注册内存，减少内核参与和 copy，但它也把 buffer 生命周期、注册成本、对齐、权限和 completion 处理变得更硬。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+RDMA 对象 & 购买的能力 & 新增约束 \\
+\midrule
+Memory Region & 网卡可访问用户内存 & pin/register 成本、权限、生命周期 \\
+Queue Pair & 连接和发送/接收队列 & 状态转移、重连、队列深度 \\
+Completion Queue & 获取完成事件 & CQ overflow、轮询成本、错误处理 \\
+RDMA Write/Read & 绕过远端 CPU 的数据搬运 & 远端内存布局和可见性协议 \\
+Send/Recv & 消息式语义 & receive buffer 预投递和背压 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+最容易犯的错误，是以为 RDMA write 成功就等于业务提交。它只说明某个工作请求产生了 completion，或者本端观察到对应完成；远端应用是否已经把这段内存解释成一个 block、是否校验 checksum、是否接受 attempt、是否写入 manifest，仍然需要协议。RDMA 减少了数据路径成本，没有消除 logical task、attempt、route epoch、checksum、backpressure 和 commit point。
+
+\begin{lstlisting}[numbers=none,caption={RDMA shuffle 仍然需要的业务状态}]
+RdmaBlockTransfer:
+  logical_map_task
+  attempt
+  route_epoch
+  remote_buffer_id
+  remote_offset
+  bytes
+  checksum
+  qp_id
+  work_request_id
+  completion_status
+  manifest_commit_status
+\end{lstlisting}
+
+第一版分布式计算项目不应该先上 RDMA。更稳的路线是先用普通 TCP/RPC 把身份、重试、背压、manifest、观测性和恢复协议做对；当报告证明 copy、syscall 或 TCP stack 成为主瓶颈，再引入 registered buffer、zero-copy 或 RDMA。否则你会把一个还没写清的状态机搬到更难调试的网卡 completion 路径里。
+
 \topic{Exactly-once 是提交协议，不是传输属性}
 网络可能重复发送，RPC 可能重试，worker 可能迟到，driver 可能崩溃。所谓 exactly-once 不能靠“只发送一次”实现，而要靠幂等身份、去重表、manifest 提交点和恢复扫描。每个逻辑输出只能有一个 accepted attempt；重复到达的同一 attempt 可以确认已处理；不同 attempt 只能由 manifest 决定哪一个生效。
 
