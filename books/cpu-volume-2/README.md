@@ -72,6 +72,18 @@ labs/compute_systems/
 
 - 顺序归约和并行归约
 - mutex 计数器和 atomic 计数器
-- bounded MPMC 队列
+- bounded MPMC 队列和关闭唤醒测试
+- semaphore、barrier、future、atomic wait、eventfd/epoll 和 futex 合同探针
+- same-pool future 阻塞风险和 continuation 运行时探针
 - CLI demo
 - CTest 正确性测试
+
+常用验证入口：
+
+```bash
+cmake -S books/cpu-volume-2 -B books/cpu-volume-2/build/compsys-debug \
+  -DCMAKE_BUILD_TYPE=Debug
+cmake --build books/cpu-volume-2/build/compsys-debug
+ctest --test-dir books/cpu-volume-2/build/compsys-debug --output-on-failure
+books/cpu-volume-2/build/compsys-debug/labs/compute_systems/compsys_futex_lab_probe
+```

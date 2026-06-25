@@ -14,6 +14,7 @@ books/compute-systems-engine-code/
 - 可关闭 bounded MPMC 队列：阻塞 `push`、阻塞 `pop`、`close`、drain 和等待报告
 - 同步原语语义切片：`counting_semaphore` 许可限制、`barrier` 多阶段同步、`future/promise` 值/异常/broken-promise、`atomic::wait` 版本发布
 - `eventfd`/`epoll` 唤醒合同：用户态队列、单次唤醒、drain 和 semaphore 模式
+- futex 合同探针：用户态锁字、`FUTEX_WAIT_PRIVATE` 返回码、`FUTEX_WAKE_PRIVATE` 唤醒数量和 ready 状态重读
 - 最小 task runtime：same-pool future 等待风险、ready 子任务饥饿和 continuation 修复路径
 - CTest 正确性测试
 
@@ -31,6 +32,7 @@ books/compute-systems-engine-code/
 - future/promise 表达一次结果或异常，broken promise 是独立失败路径
 - atomic wait 等待单个原子版本变化，不适合跨字段队列谓词
 - eventfd/epoll 表达唤醒和 ready，不表达业务 payload 或 completion
+- futex 表达底层睡眠/唤醒路径，不表达 C++ 对象生命周期或业务谓词
 - task runtime 实验把 worker、ready queue、unfinished task、same-pool 等待和 continuation 分开，避免把 `future.get()` 当作安全的调度原语
 
 构建：
@@ -51,6 +53,12 @@ eventfd/epoll 合同探针：
 
 ```bash
 books/cpu-volume-2/build/compsys-debug/labs/compute_systems/compsys_wait_channels_probe
+```
+
+futex 合同探针：
+
+```bash
+books/cpu-volume-2/build/compsys-debug/labs/compute_systems/compsys_futex_lab_probe
 ```
 
 task runtime 合同探针：

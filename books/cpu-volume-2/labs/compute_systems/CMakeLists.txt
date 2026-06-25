@@ -1,5 +1,6 @@
 add_library(compsys STATIC
     src/parallel_reduce.cpp
+    src/futex_lab.cpp
     src/sync_primitives.cpp
     src/task_runtime.cpp
     src/wait_channels.cpp
@@ -66,4 +67,19 @@ endif()
 add_test(NAME compsys_task_runtime_probe COMMAND $<TARGET_FILE:compsys_task_runtime_probe>)
 set_tests_properties(compsys_task_runtime_probe PROPERTIES
     PASS_REGULAR_EXPRESSION "task_runtime,3,3,3,0,1,5,5,15,"
+)
+
+add_executable(compsys_futex_lab_probe
+    src/futex_lab_probe.cpp
+)
+
+target_link_libraries(compsys_futex_lab_probe PRIVATE compsys)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(compsys_futex_lab_probe PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(NAME compsys_futex_lab_probe COMMAND $<TARGET_FILE:compsys_futex_lab_probe>)
+set_tests_properties(compsys_futex_lab_probe PROPERTIES
+    PASS_REGULAR_EXPRESSION "futex_mutex,"
 )

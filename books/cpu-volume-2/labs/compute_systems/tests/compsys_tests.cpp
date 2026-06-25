@@ -1,3 +1,4 @@
+#include <compsys/futex_lab.hpp>
 #include <compsys/parallel_reduce.hpp>
 #include <compsys/sync_primitives.hpp>
 #include <compsys/task_runtime.hpp>
@@ -20,6 +21,8 @@ constexpr std::int32_t COMPSYS_TEST_COUNTER_THREADS = 4;
 constexpr std::int32_t COMPSYS_TEST_COUNTER_STEPS = 250;
 constexpr std::int32_t COMPSYS_TEST_QUEUE_CAPACITY = 3;
 constexpr std::int32_t COMPSYS_TEST_WAIT_SPIN_LIMIT = 100000;
+constexpr std::int32_t COMPSYS_TEST_FUTEX_MUTEX_WORKERS = 4;
+constexpr std::int32_t COMPSYS_TEST_FUTEX_MUTEX_INCREMENTS = 50;
 constexpr std::int32_t COMPSYS_TEST_RUNTIME_WORKERS = 3;
 constexpr std::int32_t COMPSYS_TEST_CONTINUATION_ROOTS = 5;
 constexpr std::int64_t COMPSYS_TEST_CONTINUATION_SUM = 15;
@@ -293,6 +296,46 @@ void test_eventfd_epoll_contract() {
     require(report.semaphore_empty_after_reads, "eventfd semaphore empty contract failed");
 }
 
+void test_futex_lab_probe() {
+    const compsys::FutexMutexProbeReport mutex_report =
+        compsys::run_futex_mutex_probe(COMPSYS_TEST_FUTEX_MUTEX_WORKERS,
+                                       COMPSYS_TEST_FUTEX_MUTEX_INCREMENTS);
+    const std::int32_t expected_final_value =
+        COMPSYS_TEST_FUTEX_MUTEX_WORKERS * COMPSYS_TEST_FUTEX_MUTEX_INCREMENTS;
+
+    require(mutex_report.worker_count == COMPSYS_TEST_FUTEX_MUTEX_WORKERS,
+            "futex mutex worker count mismatch");
+    require(mutex_report.increments_per_worker ==
+                COMPSYS_TEST_FUTEX_MUTEX_INCREMENTS,
+            "futex mutex increment count mismatch");
+    require(mutex_report.final_value == expected_final_value,
+            "futex mutex final value mismatch");
+    require(mutex_report.contended_count > 0,
+            "futex mutex should observe contention");
+    require(mutex_report.wait_count > 0,
+            "futex mutex should enter the wait slow path");
+    require(mutex_report.wake_count > 0,
+            "futex mutex should wake a waiting thread");
+
+    const compsys::FutexContractProbeReport contract_report =
+        compsys::run_futex_contract_probe();
+
+    require(contract_report.waiter_count == 1,
+            "futex contract waiter count mismatch");
+    require(contract_report.wake_count > 0,
+            "futex contract should wake a waiter");
+    require(contract_report.eagain_count == 1,
+            "futex contract EAGAIN path mismatch");
+    require(contract_report.timeout_count == 1,
+            "futex contract timeout path mismatch");
+    require(contract_report.eintr_count == 1,
+            "futex contract signal interruption path mismatch");
+    require(contract_report.observed_ready_count == 1,
+            "futex contract ready observation mismatch");
+    require(contract_report.wait_released_on_ready,
+            "futex contract ready release mismatch");
+}
+
 void test_same_pool_future_wait_probe() {
     const compsys::SamePoolFutureWaitReport report =
         compsys::run_same_pool_future_wait_probe(COMPSYS_TEST_RUNTIME_WORKERS);
@@ -355,6 +398,7 @@ int main() {
         test_future_result_paths();
         test_atomic_wait_version_counter();
         test_eventfd_epoll_contract();
+        test_futex_lab_probe();
         test_same_pool_future_wait_probe();
         test_continuation_runtime_probe();
         std::cout << "compsys tests passed\n";
