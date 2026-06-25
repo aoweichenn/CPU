@@ -35,7 +35,7 @@ bool run_task_once(std::uint32_t task_id) {
 
 这段代码至少有四个漏洞。第一，timeout 是本地等待结束，不是远端失败事实。第二，重试不是撤销第一次执行后再试一次，而是制造新的物理 attempt。第三，\code{Ok} 只说明某个远端执行声称成功，不说明它属于当前 attempt、当前 Driver epoch、当前 deadline，也不说明它有权进入 manifest。第四，manifest 写入前后崩溃的恢复语义完全不同，内存状态不能成为权威事实。
 
-分析沿九条线展开：远端 timeout 只能说明 unknown，不能直接说明 failed；logical task、physical attempt、request、reply、epoch、deadline 和 commit 必须分开；消息信封要让响应携带足够证据进入状态机，而不是直接改业务结果；协议版本和兼容规则要说明哪些字段变化可以滚动升级，哪些变化必须拒绝；状态表和提交表要处理重试、迟到响应、重复响应、Driver 重启和旧 epoch；exactly-once 的工程边界是执行可以重复，外部可见提交只能唯一；deadline、重试预算、busy/backpressure 必须写进协议，而不是藏在 sleep 和日志里；事件日志要能重放响应丢失、乱序、重复和重启事故；本机 MessageBus 和故障矩阵先复现分布式错误，再迁移到多进程和真实网络。
+本章沿几条边界展开：远端 timeout 只能说明 unknown；logical task、physical attempt、request、reply、epoch、deadline 和 commit 必须分开；响应进入状态机前要带足消息身份；状态表、提交表和事件日志要处理重试、迟到响应、重复响应、Driver 重启和旧 epoch。先用可控 MessageBus 复现分布式错误，再迁移到多进程和真实网络。
 
 \section{从响应丢失开始}
 
@@ -165,7 +165,7 @@ struct MessageEnvelope {
 };
 \end{lstlisting}
 
-这个结构不是 wire format。真实网络协议要明确大小端、变长字段、版本兼容、长度限制、校验位置和错误处理。Compute Systems Engine 可以在本机 MessageBus 中复制这个结构；一旦进入 socket、文件或跨版本存储，就不能把 C++ 对象内存直接发送出去。
+这个结构不是 wire format。真实网络协议要明确大小端、变长字段、版本兼容、长度限制、校验位置和错误处理。Compute Systems Engine 可以在单进程 MessageBus 中复制这个结构；一旦进入 socket、文件或跨版本存储，就不能把 C++ 对象内存直接发送出去。
 
 \topic{字段对应的失败问题}
 没有 \code{task_id}，响应不知道属于哪个逻辑工作单元；没有 \code{attempt}，旧 attempt 和当前 attempt 无法区分；没有 \code{request_id}，重复消息和迟到 completion 无法去重；没有 \code{driver_epoch}，Driver 重启或控制面切换后的旧响应可能污染新状态；没有 \code{deadline_ns}，过期请求仍可能被错误提交；没有 \code{trace_id}，跨组件日志无法串联。
@@ -191,7 +191,7 @@ trace id & 跨组件因果链 & 事故无法复盘 \\
 \topic{部分读写和消息边界}
 进入多进程后，\code{send} 和 \code{recv} 不会按消息对象自然对齐。一次 \code{recv} 可能只有半个 header，一次 \code{send} 可能只写出部分字节。第 15 章短读短写在这里再次出现：协议要有 framing，例如固定 header 加 payload length；读取方先收完整 header，校验长度，再收完整 payload。若项目从 C++ 结构体复制直接跳到 socket，很快会在部分读写、大小端、对齐和版本上出错。
 
-本机 MessageBus 可以把一个 \code{Message} 对象直接放进队列，接收方 pop 出来的仍然是同一个结构化对象。迁移到 socket 后，这个假设消失。进程之间没有共享地址空间，指针没有意义；TCP 提供的是有序字节流，不提供“这一段正好是一条业务消息”的边界；操作系统的 send buffer 和 receive buffer 会按可用空间拆分和合并字节；连接关闭也不等于某个业务请求失败。于是协议必须自己定义 frame，并把 frame parser 当作核心状态机。
+单进程 MessageBus 可以把一个 \code{Message} 对象直接放进队列，接收方 pop 出来的仍然是同一个结构化对象。迁移到 socket 后，这个假设消失。进程之间没有共享地址空间，指针没有意义；TCP 提供的是有序字节流，不提供“这一段正好是一条业务消息”的边界；操作系统的 send buffer 和 receive buffer 会按可用空间拆分和合并字节；连接关闭也不等于某个业务请求失败。于是协议必须自己定义 frame，并把 frame parser 当作核心状态机。
 
 \begin{lstlisting}[numbers=none,caption={TCP 字节流可能呈现的接收形状}]
 sender writes:
@@ -716,9 +716,9 @@ Epoch 是控制面版本，不是墙钟时间。Driver 每次重启、leader 切
 \topic{Driver commit 前后崩溃}
 commit 前崩溃：worker 输出可能存在，但没有权威记录，恢复时不能自动接纳。commit 后崩溃：manifest 已经接受结果，恢复时必须承认，即使内存状态丢失。这个边界和第 15 章写 manifest 前后崩溃完全一致，只是现在旧响应和远端 worker 也会迟到。
 
-\section{本机 MessageBus：可控故障先于真实网络}
+\section{单进程 MessageBus：可控故障先于真实网络}
 
-真实网络故障很多，直接上多机器会同时引入 socket、序列化、线程、日志和协议 bug。更好的路线是先实现本机 MessageBus：显式消息队列、可配置延迟、丢包、乱序、重复、Busy、队列容量和 timer。它不是真实网络，但能稳定复现分布式协议错误。
+真实网络故障很多，直接上多机器会同时引入 socket、序列化、线程、日志和协议 bug。更稳的训练入口是先实现单进程 MessageBus：显式消息队列、可配置延迟、丢包、乱序、重复、Busy、队列容量和 timer。它不是真实网络，但能稳定复现分布式协议错误。
 
 \topic{故障规则是核心功能}
 MessageBus 不是一个简单队列，而是故障注入器。每条消息可以按规则 drop、delay、duplicate、reorder。Timer 驱动状态表，而不是业务线程 sleep。Inbox 有界，队列满时返回 Busy 或 backpressure。只要这些规则足够明确，故障就能复现响应丢失、迟到 reply、重复 reply 和 Driver 重启。
@@ -741,22 +741,22 @@ struct MessageFaultRule {
 \end{lstlisting}
 
 \topic{多进程会暴露新的边界}
-本机 MessageBus 仍然会掩盖一部分问题：Driver 和 Worker 可能不小心共享同一个全局变量，配置更新看起来同时生效，C++ 指针在日志里似乎能代表对象身份，队列里的消息也像完整对象一样一次到达。因此本机阶段要主动约束自己：消息只通过 envelope 和 payload 传递，状态只通过显式事件改变，测试禁止 Worker 直接读 Driver 的状态表。这样迁移到多进程时，协议语义不会重写。
+单进程 MessageBus 仍然会掩盖一部分问题：Driver 和 Worker 可能不小心共享同一个全局变量，配置更新看起来同时生效，C++ 指针在日志里似乎能代表对象身份，队列里的消息也像完整对象一样一次到达。因此模拟阶段要主动约束自己：消息只通过 envelope 和 payload 传递，状态只通过显式事件改变，测试禁止 Worker 直接读 Driver 的状态表。这样迁移到多进程时，协议语义不会重写。
 
 \topic{Linux 观察只服务协议问题}
 \cmd{ss} 可以看连接状态，但不能证明业务请求安全；\cmd{tcpdump} 可以看包，但 TCP 字节流不等于应用消息边界；\cmd{strace} 可以看系统调用，但不能替代状态表；\cmd{tc netem} 可以制造延迟和丢包，但测试通过仍要看 manifest 和提交表。工具是证据来源，不是协议设计本身。
 
-\section{从本机 MessageBus 到多进程}
+\section{从单进程 MessageBus 到多进程}
 
-多进程迁移不是“把队列换成 socket”这么简单。它会把本机模拟阶段被隐藏的边界一次性暴露出来：地址空间隔离、进程生命周期、字节流 framing、配置一致性、部分读写、连接关闭、权限和临时文件清理。若前面的协议身份、状态表和 manifest 做得扎实，多进程只是更真实的传输层；若前面靠共享内存和对象引用偷懒，多进程会迫使设计重写。
+多进程迁移不是“把队列换成 socket”这么简单。它会把单进程模拟阶段被隐藏的边界一次性暴露出来：地址空间隔离、进程生命周期、字节流 framing、配置一致性、部分读写、连接关闭、权限和临时文件清理。若前面的协议身份、状态表和 manifest 做得扎实，多进程只是更真实的传输层；若前面靠共享内存和对象引用偷懒，多进程会迫使设计重写。
 
 \topic{地址空间隔离会消灭隐式依赖}
-本机版本里，一个 \code{TaskRequest} 也许偷偷带着指向输入 buffer 的指针；一个 worker 也许能调用全局单例读取最新配置；一个测试也许直接检查 Driver 内存对象。多进程以后这些路径全断了。跨进程只能传值、文件描述符、路径、block id 或网络地址，不能传对象身份。这反而是好事：它迫使协议说清楚什么是事实，什么只是进程内部实现细节。
+单进程版本里，一个 \code{TaskRequest} 也许偷偷带着指向输入 buffer 的指针；一个 worker 也许能调用全局单例读取最新配置；一个测试也许直接检查 Driver 内存对象。多进程以后这些路径全断了。跨进程只能传值、文件描述符、路径、block id 或网络地址，不能传对象身份。这反而是好事：它迫使协议说清楚什么是事实，什么只是进程内部实现细节。
 
 \begin{center}
 \begin{tabular}{p{0.30\linewidth}p{0.30\linewidth}p{0.28\linewidth}}
 \toprule
-本机阶段容易偷懒的地方 & 多进程暴露的问题 & 正确设计动作 \\
+单进程阶段容易偷懒的地方 & 多进程暴露的问题 & 正确设计动作 \\
 \midrule
 共享全局配置 & 节点看到的配置版本不同 & 配置带 epoch/version，消息记录使用版本 \\
 传递对象指针 & 地址空间不同，指针无意义 & 传递稳定 id、offset、path 或 serialized value \\
@@ -847,9 +847,9 @@ Kubernetes 控制器处理的是另一类分布式问题：观察到的事件可
 
 \section{实现路径}
 
-Compute Systems Engine 在这一章不需要立刻写真实集群。目标是把单机 completion 模型扩展成本机分布式模拟：Driver、Worker、MessageBus、CommitTable、Manifest 和 Trace 全部显式化。重点是状态语义，而不是网络框架体积。
+Compute Systems Engine 在这一章不需要立刻写真实集群。目标是把单机 completion 模型扩展成单节点分布式模拟：Driver、Worker、MessageBus、CommitTable、Manifest 和 Trace 全部显式化。重点是状态语义，而不是网络框架体积。
 
-\topic{实现路线}
+\topic{实现边界}
 第一版，把远程调用改成显式消息：Driver 发送 \code{TaskRequest}，Worker 返回 \code{TaskReply}。第二版，加入协议版本和 feature 检查，但只支持一个版本。第三版，加入状态表和提交表，但先不重试。第四版，加入故障注入，只开一个故障：成功响应丢失。第五版，加入 retry、attempt、deadline 和 late reply 处理。第六版，加入 Busy 和 per-worker backpressure。第七版，把状态表和 manifest 写成可恢复文件。第八版，加入 replay log。第九版，把 MessageBus 的一个路径迁移到多进程 frame parser。
 
 \topic{消息判读矩阵}

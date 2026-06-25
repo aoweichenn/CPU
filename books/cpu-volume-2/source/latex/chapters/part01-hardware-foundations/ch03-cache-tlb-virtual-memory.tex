@@ -9,10 +9,10 @@
 分析沿六条线展开：把 C++ 对象图翻译成 CPU 看到的地址序列，区分连续扫描、固定步长、随机索引、指针追踪和冷热字段混读；解释 cache line 为什么既是空间局部性的机会，也是 false sharing 和写共享的争用单位；用工作集、活跃页数、TLB 覆盖、page walk 和 first-touch 解释同一算法在不同输入规模下的性能拐点；区分分配、触页、预热、热循环、mmap 冷读、page cache 热读和持久化写回，避免把系统状态混进算法结论；为日志统计、哈希聚合、partial 数组、输入读取和 checkpoint 写出地址路径实验，而不是只给容器名和耗时；在 Compute Systems Engine 中形成 \code{MemoryShape} 和 \code{AccessTrace} 报告，让后续数据布局、线程、I/O 和分布式机制复用同一张地址地图。
 
 \begin{casebox}
-贯穿案例是同一份日志输入的四种地址形状：胖对象数组、指针对象图、热字段列式 batch、按 key 分区后的局部聚合。四种形状必须输出同样的统计结果、错误摘要和 checksum。比较它们时，不只记录总时间，还要记录热字段字节数、冷字段是否进入热路径、活跃页面、访问顺序、是否预热、是否存在共享写和可用的 cache/TLB 证据。
+核心案例是同一份日志输入的四种地址形状：胖对象数组、指针对象图、热字段列式 batch、按 key 分区后的局部聚合。四种形状必须输出同样的统计结果、错误摘要和 checksum。比较它们时，不只记录总时间，还要记录热字段字节数、冷字段是否进入热路径、活跃页面、访问顺序、是否预热、是否存在共享写和可用的 cache/TLB 证据。
 \end{casebox}
 
-接着第一章和第二章的同一段热块，本章只把其中的 load/store 地址拿出来。第二章问“这些指令能否被核心持续消化”；本章问“这些指令访问的地址到底是什么形状”。例如：
+沿用同一段热块时，这里只把其中的 load/store 地址拿出来。核心内部问题问“这些指令能否被持续消化”；地址问题问“这些指令访问的地址到底是什么形状”。例如：
 
 \begin{lstlisting}[numbers=none,caption={同一更新块在本章中的地址账本}]
 event_type[i]:
@@ -63,7 +63,7 @@ diagnostic path:
 
 程序里的指针看起来像一个整数，源码里写的是 \code{records[i].event_id} 或 \code{node->next}。硬件面对的不是字段名，而是一组地址位。地址位进入译码电路，选择某个 cache set、某个 TLB 项、某条总线请求、某个内存控制器队列，最后落到 DRAM 的行、列和 bank。缓存、TLB、预取器和页表之所以存在，是因为核心不能每次都把完整地址请求送到远处主存再等待答案。地址必须先在近处被筛选、缓存和预测。
 
-从这个角度看，内存访问不是“读一个变量”这么简单。一次 load 至少包含五个问题：虚拟地址是否合法；虚拟页能否翻译成物理页；目标 cache line 是否在 L1D；若不在，是否在 L2、LLC 或其他核心的缓存中；取回 line 后，指令需要的是其中哪些字节。写入还要多问几个问题：是否需要先取得独占权限；是否需要把旧 line 读入；其他核心是否持有这条 line；写入何时对其他核心可见。后续会展开一致性和内存序，这里先把单核地址路径讲清。
+从这个角度看，内存访问不是“读一个变量”这么简单。一次 load 至少包含五个问题：虚拟地址是否合法；虚拟页能否翻译成物理页；目标 cache line 是否在 L1D；若不在，是否在 L2、LLC 或其他核心的缓存中；取回 line 后，指令需要的是其中哪些字节。写入还要多问几个问题：是否需要先取得独占权限；是否需要把旧 line 读入；其他核心是否持有这条 line；写入何时对其他核心可见。先把单核地址路径讲清，一致性和内存序才有落点。
 
 \topic{为什么不能直接访问主存}
 执行单元附近的寄存器很小但极快；片上 SRAM 可以做成 L1/L2 cache，容量较小但延迟低；主存容量大，距离远，延迟和能耗都高。若一个循环每次 load 都等待主存，乱序窗口很快被未完成 load 填满，执行端口没有可发射的独立工作。缓存层级的动机不是“多做几层表”，而是在核心附近保存最近和附近的字节，让常见访问不必走到远处。
@@ -246,7 +246,7 @@ mov dword ptr [rdi + rcx*4], eax
 add qword ptr [rdi], 1
 \end{lstlisting}
 
-从 ISA 语义看，它读取 \code{[rdi]} 的旧值，加一，再写回同一地址。单线程时它仍可能由多个内部动作完成；多核心时，如果它是普通非原子访问，C++ 同步语义仍然不成立。若编译器为 \code{std::atomic::fetch_add} 生成带锁定语义的读改写写，硬件还必须保证该操作在线性化点上不可被其他核心穿插。第 4 章和第 11 章会继续展开。这里先固定区分：\instruction{mov [mem], reg} 是普通 store，\instruction{add [mem], imm} 是读改写写形状，带锁定语义的原子读改写写还会加入跨核心排他要求。
+从 ISA 语义看，它读取 \code{[rdi]} 的旧值，加一，再写回同一地址。单线程时它仍可能由多个内部动作完成；多核心时，如果它是普通非原子访问，C++ 同步语义仍然不成立。若编译器为 \code{std::atomic::fetch_add} 生成带锁定语义的读改写写，硬件还必须保证该操作在线性化点上不可被其他核心穿插。这里先固定区分：\instruction{mov [mem], reg} 是普通 store，\instruction{add [mem], imm} 是读改写写形状，带锁定语义的原子读改写写还会加入跨核心排他要求。
 
 \begin{center}
 \small
@@ -383,12 +383,12 @@ static_assert(sizeof(WorkerPartial) <= CACHE_LINE_BYTES);
 \topic{写分配和一次性输出}
 写入也会消耗内存带宽。普通写 miss 往往采用 write allocate：先把目标 line 读入缓存，再修改，之后再写回。若程序写的是一次性大块输出，旧内容没有价值，这个读入可能浪费带宽。某些架构提供 non-temporal store，用于减少缓存污染和写分配，但它不是普遍优化；如果输出马上被下一阶段读取，绕过缓存可能更慢。
 
-Compute Systems Engine 的 \code{ShuffleBlock} 就有这个取舍。若写出后立刻在本机 reduce，普通缓存路径可能有用；若写完交给磁盘或网络，缓存污染可能更明显。这里不手写特殊指令，但问题必须说清：写也有地址路径，写入目标是否会再读，决定了缓存策略是否值得讨论。
+Compute Systems Engine 的 \code{ShuffleBlock} 就有这个取舍。若写出后立刻在同一节点 reduce，普通缓存路径可能有用；若写完交给磁盘或网络，缓存污染可能更明显。这里不手写特殊指令，但问题必须说清：写也有地址路径，写入目标是否会再读，决定了缓存策略是否值得讨论。
 
 \topic{store buffer 让写入不等于已经全局可见}
 核心执行 store 时，常常先把写入放进 store buffer，让本线程继续向前执行。这样可以隐藏一部分写延迟，也能把多个写合并到同一 line。可是 store buffer 里的内容什么时候对其他核心可见，和本线程什么时候继续执行，不是同一件事。单线程程序通常看不见这个差异；多线程程序若用普通变量通信，就会踩到可见性边界。锁、原子和内存序的价值，正是把这些硬件缓冲和重排边界变成语言层面的 happens-before。
 
-这里先固定一个事实：写路径也会占用 cache line、store buffer、一致性权限和写回带宽。并行程序里一个热计数器可能比一大段只读输入更贵，因为它把许多核心聚集到同一条 line 上反复争夺修改权。后面讲线程本地 partial、分区聚合和 lock-free 队列时，都会回到这条写路径。
+写路径也会占用 cache line、store buffer、一致性权限和写回带宽。并行程序里一个热计数器可能比一大段只读输入更贵，因为它把许多核心聚集到同一条 line 上反复争夺修改权。线程本地 partial、分区聚合和 lock-free 队列的性能边界，都会回到这条写路径。
 
 \section{工作集、预取和分块}
 
@@ -407,7 +407,7 @@ Compute Systems Engine 的 \code{ShuffleBlock} 就有这个取舍。若写出后
 \topic{分块的本质}
 矩阵乘法用 blocking 控制缓存工作集。日志统计也需要同样思想：一次处理一个 batch，让热字段、局部 histogram、错误摘要和输出缓冲保持在可控范围内。Batch 太小，函数调用、调度和 I/O 边界成本占比高；batch 太大，cache、TLB 和恢复范围都变差。一个只看算法循环的最佳 batch size，不一定是系统最佳 batch size。
 
-数据布局、预取和 kernel suite 后面会继续展开。这里先建立原则：分块不是为了好看，而是让昂贵搬运服务更多有用工作，让局部状态在被驱逐前完成足够计算。单机 cache block、I/O buffer、网络 batch 和分布式 shuffle block 在不同尺度上解决同一个问题：控制工作集和边界成本。
+分块不是为了好看，而是让昂贵搬运服务更多有用工作，让局部状态在被驱逐前完成足够计算。单机 cache block、I/O buffer、网络 batch 和分布式 shuffle block 在不同尺度上解决同一个问题：控制工作集和边界成本。
 
 \topic{分块同时控制容量和复用距离}
 复用距离是同一数据两次使用之间，程序访问了多少其他数据。若复用距离超过某个缓存层级容量，第一次搬入的数据在第二次使用前可能已经被驱逐。分块通过改变循环顺序或阶段边界，把会互相复用的数据放在较短时间窗口内。矩阵乘法里，tile 让一小块 A/B/C 在缓存中反复使用；日志聚合里，batch 让事件 id、局部计数表和错误摘要在可控窗口内完成足够工作。
@@ -599,7 +599,7 @@ struct AccessTrace {
 };
 \end{lstlisting}
 
-这个结构不会预测性能，它只是强迫报告说清地址形状。后续章节可以继续扩展：线程章节加入 worker id 和 cache line 写共享，NUMA 章节加入节点放置，I/O 章节加入 mmap 和 page cache 状态，分布式章节加入 block identity 和 manifest。
+这个结构不会预测性能，它只是强迫报告说清地址形状。报告可以按系统层次扩展：线程分析加入 worker id 和 cache line 写共享，NUMA 分析加入节点放置，I/O 分析加入 mmap 和 page cache 状态，分布式分析加入 block identity 和 manifest。
 
 \topic{从 AccessTrace 到 MemoryShape}
 \code{AccessTrace} 记录动态访问；\code{MemoryShape} 记录静态布局。两者必须配套。一个结构体可能静态上有 128 字节，但热循环只读其中 8 字节；一个数组可能静态连续，但访问索引是随机；一个哈希表可能元素总数不大，却跨很多页。MemoryShape 解释“字节在哪里”，AccessTrace 解释“循环怎样走过这些字节”。
@@ -1092,7 +1092,7 @@ measure:
 
 \subsection{输入规模阶梯}
 
-规模阶梯要覆盖 L1、L2、LLC、DRAM 和大量页。具体容量随机器不同，报告至少要写本机 cache 信息来源。一个通用阶梯可以先这样设计：
+规模阶梯要覆盖 L1、L2、LLC、DRAM 和大量页。具体容量随机器不同，报告至少要写实验环境中的 cache 信息来源。一个通用阶梯可以先这样设计：
 
 \begin{center}
 \small
@@ -1131,7 +1131,7 @@ perf stat -r 5 \
        --bytes 1073741824 --repeat 1
 \end{lstlisting}
 
-事件名会随平台变化。Intel、AMD、ARM、虚拟机、容器和手机环境都可能不支持这些名字。报告的第一行应该保存 \cmd{perf list} 或至少保存不可用错误。若 DTLB 事件不可用，可以用 page size、访问页数、stride 曲线、huge page 对照和 wall time 作为替代证据；但不能写“DTLB miss 下降了”。
+事件名会随平台变化。Intel、AMD、ARM、虚拟机、容器和受限环境都可能不支持这些名字。报告的第一行应该保存 \cmd{perf list} 或至少保存不可用错误。若 DTLB 事件不可用，可以用 page size、访问页数、stride 曲线、huge page 对照和 wall time 作为替代证据；但不能写“DTLB miss 下降了”。
 
 \begin{center}
 \small
@@ -1191,7 +1191,7 @@ hugepage_experiment:
 
 \subsection{NUMA first-touch 和 cache/TLB 的交叉}
 
-NUMA 实验虽然在下一章展开，但 cache/TLB 章已经需要给出边界：页面放置会改变同一个地址模式的物理距离。first-touch 实验至少有两个版本：
+cache/TLB 报告也需要给出 NUMA 边界：页面放置会改变同一个地址模式的物理距离。first-touch 实验至少有两个版本：
 
 \begin{lstlisting}[numbers=none,caption={first-touch 最小对照}]
 main_touch:

@@ -6,7 +6,7 @@
 
 判断标准很简单：程序不能只跑通，还要能解释程序为什么可信。解释必须落到具体对象：\code{InputSplit}、\code{TaskId}、\code{AttemptId}、\code{ShuffleBlock}、\code{ManifestEntry}、\code{MessageEnvelope}、\code{Checkpoint} 和 \code{RunReport}。如果一个结果出错，报告应能把它缩小到解析、分区、写出、提交或恢复中的某个边界，而不是让人翻日志猜。
 
-\section{最终系统的第一条主线：Reference 先行}
+\section{Reference 先行}
 
 任何分布式计算项目都要先有可验证 reference。Reference 可以慢，但必须定义语义：输入格式是什么，坏行如何处理，key 如何规范化，计数类型是否溢出，输出顺序是否稳定，错误摘要如何记录。没有 reference，后面的线程池、shuffle、重试、checkpoint 和热点优化都没有正确性锚点。
 
@@ -112,7 +112,7 @@ std::vector<std::int64_t> combine_events(
 真实项目不能静默忽略越界 event type。示例片段只突出 combine 结构；生产版应把非法 key 进入错误摘要，并让 reference 和优化路径共享同一错误合同。
 
 \topic{ShuffleBlock 和 Manifest}
-Shuffle 可以先用本机内存队列模拟，也可以写本地文件再由 reduce 拉取。无论哪种方式，都要有 manifest 描述哪些 block 有效。Reduce 不应扫描临时目录，也不应接受 MessageBus 里随机到达的所有 partial。它只读取 manifest 接受的 block。
+Shuffle 可以先用单进程内存队列模拟，也可以写本地文件再由 reduce 拉取。无论哪种方式，都要有 manifest 描述哪些 block 有效。Reduce 不应扫描临时目录，也不应接受 MessageBus 里随机到达的所有 partial。它只读取 manifest 接受的 block。
 
 \begin{lstlisting}[language=C++,caption={Shuffle block 和 Manifest entry}]
 struct ShuffleBlock {
@@ -917,7 +917,7 @@ boundaries:
   multi_socket_numa: Unverified
 \end{lstlisting}
 
-把未验证边界写出来，不会削弱项目，反而说明结论没有越界。单机 MessageBus 验证了消息乱序、丢弃和迟到的控制逻辑；它没有验证真实网络拥塞、内核 socket buffer 和跨主机时钟。普通文件模拟验证了短写和 manifest；它不一定验证掉电持久化。边界越清楚，后续扩展越稳。
+把未验证边界写出来，不会削弱项目，反而说明结论没有越界。单进程 MessageBus 验证了消息乱序、丢弃和迟到的控制逻辑；它没有验证真实网络拥塞、内核 socket buffer 和跨主机时钟。普通文件模拟验证了短写和 manifest；它不一定验证掉电持久化。边界越清楚，后续扩展越稳。
 
 \section{里程碑：每一步都能失败、解释和回退}
 
@@ -939,7 +939,7 @@ boundaries:
 把本地调用改成消息事件。加入 request id、attempt、deadline、retry budget、Busy 和 late reply。测试响应丢失后只提交一个 attempt。这个阶段回答“远端执行成功为什么不是外部生效”。
 
 \topic{六、Checkpoint、热点 key 和两进程边界}
-加入 checkpoint generation、恢复 audit、热点 key 拆分和可选两进程部署。两进程部署不追求性能，而是检查序列化、framing、process crash 和共享状态假设。这个阶段回答“系统重启后谁说了算，以及本机模拟有没有偷共享内存的懒”。
+加入 checkpoint generation、恢复 audit、热点 key 拆分和可选两进程部署。两进程部署不追求性能，而是检查序列化、framing、process crash 和共享状态假设。这个阶段回答“系统重启后谁说了算，以及单进程模拟有没有偷共享内存的懒”。
 
 \section{一次失败排查日记}
 
@@ -1127,7 +1127,7 @@ try_accept(task, attempt, block, checksum):
 
 \section{模块边界：代码可以换，语义不能换}
 
-最终系统可以持续替换内部实现，但不能替换语义边界。Parser 可以从对象数组改成列式 batch；runtime 可以从全局队列改成本地 deque；I/O 可以从同步 write 改成 \code{io_uring}；MessageBus 可以从本机模拟改成 TCP。每次替换都要问同一个问题：哪条底层路径变短，哪条状态边界变复杂，原来的线性化点在哪里。
+最终系统可以持续替换内部实现，但不能替换语义边界。Parser 可以从对象数组改成列式 batch；runtime 可以从全局队列改成本地 deque；I/O 可以从同步 write 改成 \code{io_uring}；MessageBus 可以从单进程模拟改成 TCP。每次替换都要问同一个问题：哪条底层路径变短，哪条状态边界变复杂，原来的线性化点在哪里。
 
 \topic{模块边界的最终不变量}
 最终系统可以分成输入、热批次、运行时、I/O、提交、恢复六个模块。每个模块都要交出一个不变量，而不是只交出一组函数。输入模块保证 RecordId 稳定；热批次模块保证同一 row index 的字段来自同一记录；运行时保证 accepted task 最终进入终态；I/O 模块保证 completion 不等于 commit 且 buffer 有唯一所有者；提交模块保证一个 logical split 只接受一个 attempt；恢复模块保证 manifest 是权威入口。只要这些不变量守住，内部实现可以替换。
@@ -1203,7 +1203,7 @@ struct ManifestEntry {
 全局计数到 worker partial & 共享写减少，cache line 迁移减少 & 合并顺序、partial 生命周期 \\
 全局队列到本地 deque & 常见 push/pop 本地化 & steal 边界、任务迁移、NUMA 本地性 \\
 同步写到异步写 & CPU worker 不被 I/O 等待占住 & buffer owner、completion、迟到结果 \\
-本机消息到多进程消息 & 共享内存假设被移除 & framing、序列化、旧 epoch 消息 \\
+单进程消息到多进程消息 & 共享内存假设被移除 & framing、序列化、旧 epoch 消息 \\
 \bottomrule
 \end{tabular}
 \end{center}
