@@ -1,0 +1,182 @@
+\chapter{无锁正确性证明、回收与实现边界}
+
+\section{为什么原理之后还要证明}
+
+第 12 章已经说明了 SPSC、MPSC、MPMC、ABA、hazard pointer 和 epoch 的核心问题。但无锁结构只讲直觉仍然不够。真正能进入工程的无锁实现，必须给出三个证明面：线性化证明、进展证明和内存回收证明。缺少任意一面，结构都可能在小测试中正确，在压力、取消、线程暂停或对象池复用时失败。
+
+\begin{lstlisting}[numbers=none,caption={无锁实现的三份证明}]
+correctness:
+  linearizability
+  memory_order_happens_before
+  reclamation_safety
+
+progress:
+  blocking / obstruction-free / lock-free / wait-free
+  allocator_dependency
+  backoff_and_starvation
+
+engineering:
+  stress_test
+  sanitizer
+  model_or_litmus_test
+  metrics
+  failure_replay
+\end{lstlisting}
+
+\section{Linearizability：每个操作在哪一瞬间生效}
+
+线性化证明的任务，是为每个公开操作找一个瞬间，使并发历史等价于某个串行历史。对栈而言，push 成功 CAS 通常是线性化点；pop 成功 CAS 通常是线性化点；pop 发现空的线性化点是读取到空 head 的那个观察点，但前提是没有并发 push 已经在线性化。失败返回同样需要证明。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+操作 & 候选线性化点 & 证明要点 \\
+\midrule
+SPSC push 成功 & release 写 tail & slot 数据先于 tail 可见 \\
+SPSC pop 成功 & release 写 head 或 acquire 观察 tail & 数据读取属于已发布区间 \\
+Treiber push 成功 & CAS head 成功 & 新节点 next 指向旧 head \\
+Treiber pop 成功 & CAS head 成功 & 被弹节点从结构中唯一移除 \\
+MPMC enqueue & slot sequence 发布 Ready & 预留和可读提交要分开 \\
+MPMC dequeue & 消费者 CAS 或 sequence 更新 & 元素只被一个消费者取得 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+证明不能停在“CAS 成功”。CAS 成功只是修改了某个原子对象。你还要证明这个修改与普通数据写入之间有 release/acquire 关系，证明没有另一个线程能同时取得同一元素，证明失败路径没有把未发布数据当成可见事实。
+
+\section{内存序证明：发布的是普通数据，不是心情}
+
+无锁结构通常用 relaxed 读写索引，用 release/acquire 发布数据。关键问题是：哪个普通写必须先于哪个普通读可见？SPSC push 中，生产者先写槽位，再 release 存储 tail；消费者 acquire 读取 tail 后读槽位。这样 slot 写入 happens-before 消费者读取。
+
+\begin{lstlisting}[numbers=none,caption={SPSC push/pop 的 happens-before 证明}]
+producer:
+  buffer[tail] = value
+  tail.store(next, release)
+
+consumer:
+  observed_tail = tail.load(acquire)
+  value = buffer[head]
+
+proof:
+  release tail synchronizes-with acquire tail
+  buffer write is sequenced-before release
+  buffer read is sequenced-after acquire
+  therefore consumer sees published value
+\end{lstlisting}
+
+若把 tail 存储放到写槽位之前，或者把消费者 acquire 改成没有同步关系的普通读，就可能读到未初始化或旧值。内存序不是装饰参数，而是把普通内存和原子状态连接起来的合同。
+
+\section{ABA：地址相同不代表对象相同}
+
+ABA 的本质是历史丢失。线程 T1 观察到 head 是地址 A；T2 把 A 弹出并释放；allocator 又把同一地址给了新节点；T1 再看 head 仍是 A，于是 CAS 成功。CAS 只比较位模式，不比较对象生命周期。解决 ABA 可以用 tagged pointer、hazard pointer、epoch reclamation、引用计数或固定数组 sequence。每种方案都转移成本。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+方案 & 解决方式 & 代价 \\
+\midrule
+tagged pointer & 指针加版本号 & 位宽、溢出、平台约束 \\
+hazard pointer & 读者声明正在保护的地址 & 每线程槽位、扫描成本、保护顺序严格 \\
+epoch reclamation & 旧 epoch 无活动读者后回收 & 暂停线程会阻塞回收 \\
+固定数组 sequence & 地址不释放，用轮次区分状态 & 有界容量、槽位状态更复杂 \\
+引用计数 & 对象存活由计数控制 & 原子成本和循环引用问题 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Hazard pointer：保护窗口必须重新读取}
+
+Hazard pointer 的关键顺序是：先读取候选指针，发布到 hazard 槽位，再重新读取共享指针确认没有变化。少了重新读取，就可能保护了已经不再是结构头的对象；发布 hazard 太晚，就可能在发布前对象已经被回收。
+
+\begin{lstlisting}[numbers=none,caption={hazard pointer 的最小保护顺序}]
+retry:
+  p = head.load(acquire)
+  hazard_slot.store(p, release)
+  if (head.load(acquire) != p):
+      goto retry
+  // p is protected while hazard_slot == p
+  next = p->next
+  if (CAS(head, p, next)):
+      hazard_slot.store(nullptr, release)
+      retire(p)
+\end{lstlisting}
+
+回收线程扫描所有 hazard 槽位。retired list 中不被任何 hazard 保护的节点才能真正 delete。这个算法不是免费：线程越多，扫描越贵；retired list 太小会频繁扫描，太大又占内存；线程退出时必须清理 hazard 槽位；异常和取消路径必须释放保护。
+
+\section{Epoch reclamation：快，但怕暂停线程}
+
+Epoch based reclamation 把时间分成 epoch。线程进入无锁读临界区时声明自己处于当前 epoch；节点 retired 时记录 retire epoch；当所有活动线程都离开旧 epoch 后，旧节点可以回收。它的 fast path 通常比 hazard pointer 轻，但一个线程如果长时间停在临界区或被暂停，可能阻止旧 epoch 回收，导致 retired list 增长。
+
+\begin{lstlisting}[numbers=none,caption={epoch 回收的状态机}]
+ThreadOutside
+  -> enter critical section, publish local epoch
+ThreadActive(epoch)
+  -> read lock-free structure
+  -> leave, clear active flag
+ThreadOutside
+
+NodeLinked
+  -> removed by successful CAS
+Retired(epoch)
+  -> all active threads are newer or inactive
+Reclaimed
+\end{lstlisting}
+
+Epoch 适合短读临界区和受控线程集合。若线程可能在临界区里做 I/O、等待 future、阻塞系统调用或长期暂停，epoch 回收会失去边界。工程报告要记录最大 retired list、最长 active epoch、线程退出清理和压力下内存峰值。
+
+\section{RCU：读多写少的另一种选择}
+
+RCU 的核心是让读者几乎不阻塞，写者发布新版本，并等待 grace period 后回收旧版本。它适合读多写少、读路径极短、更新可以复制或延迟发布的场景。RCU 不是通用队列替代品。若更新频繁、对象很大或读者可能长期停留，写者延迟和内存占用会增加。
+
+教学项目中，RCU 可用于配置表、路由表或模型版本指针：请求读取当前版本，更新线程构造新版本后原子发布，旧版本等无读者后释放。它不适合把每个 token 的 KV cache 更新都做成 RCU；那会把高频写路径变成版本垃圾制造器。
+
+\section{进展证明要包含 allocator 和等待策略}
+
+很多论文算法假设内存分配不会阻塞，节点不会耗尽，线程不会在临界区暂停。工程实现不能忽略这些条件。若 push 在循环中调用 \code{new}，而 allocator 内部拿锁或 mmap，那么整体进展性质已经依赖 blocking allocator。若队列满时自旋等待，系统在下游停顿时会烧 CPU。若关闭路径等待所有线程退出，取消和析构也属于进展证明的一部分。
+
+\begin{lstlisting}[numbers=none,caption={进展证明字段}]
+progress_proof:
+  public_operations
+  shared_atomic_fields
+  possible_retry_loops
+  allocation_in_fast_path
+  full_or_empty_behavior
+  blocking_calls_inside_operation
+  cancellation_and_close_path
+  starvation_risk
+  backoff_strategy
+\end{lstlisting}
+
+\section{测试矩阵：无锁需要压力和反例}
+
+无锁测试不能只跑一次吞吐。至少要覆盖：
+
+\begin{itemize}
+  \item 单线程退化路径：空、满、容量边界、环绕。
+  \item 多线程压力：不同生产者/消费者比例、不同线程绑定、不同输入速率。
+  \item 生命周期压力：对象池复用、快速 allocate/free、retired list 增长。
+  \item 取消和关闭：生产者退出、消费者退出、drain、stop。
+  \item sanitizer：TSAN 能发现部分数据竞争，但不能证明线性化。
+  \item model/litmus：小容量、小步数穷举或随机调度重放。
+  \item 指标：CAS 失败次数、平均重试、p99 重试、retired list 峰值、CPU 占用。
+\end{itemize}
+
+\section{验收标准}
+
+一个无锁结构进入默认路径前，必须提交：
+
+\begin{enumerate}
+  \item 公开接口语义和失败语义。
+  \item 每个操作的线性化点。
+  \item 每个普通数据发布的 release/acquire 证明。
+  \item ABA 和内存回收策略。
+  \item 进展保证和不满足保证的条件。
+  \item 压力测试、sanitizer、模型测试或故障重放。
+  \item 与 mutex/condition variable 版本的吞吐、CPU 占用和尾延迟对比。
+\end{enumerate}
+
+\begin{keyidea}
+无锁结构的门槛不在 CAS 语法，而在证明。不能写出线性化点、回收安全和进展边界的无锁代码，不应进入生产路径。
+\end{keyidea}

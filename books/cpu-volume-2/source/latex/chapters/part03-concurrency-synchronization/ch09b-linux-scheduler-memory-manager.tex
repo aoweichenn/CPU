@@ -1,0 +1,165 @@
+\chapter{Linux 调度、内存管理与系统瓶颈边界}
+
+\section{为什么性能书必须讲内核边界}
+
+第二册前面的章节已经讲了线程、亲和、NUMA、cache 和同步。但真实系统里，用户态线程不是直接占有 CPU，用户态地址也不是直接等于物理内存。调度器决定线程何时运行、在哪个 CPU 上运行；内存管理决定虚拟地址何时获得物理页、页面何时回收、脏页何时写回；cgroup 和容器可能改变可见资源；I/O、page fault、signal 和内核线程会改变尾延迟。若只看用户态代码，很多瓶颈会被误判成“算法慢”。
+
+本章不试图把 Linux 内核写成一本书，而是给性能工程建立必要边界：哪些现象属于用户态 runtime 能直接控制，哪些现象必须通过内核证据解释，哪些结论在没有权限时只能保守表达。
+
+\section{调度器看到的是 thread，不是业务 task}
+
+用户态 runtime 看到的是 task、future、queue、deadline、priority 和 dependency；内核调度器看到的是 schedulable entity、线程状态、runqueue、优先级、时间账本、CPU 拓扑、NUMA、cgroup 和负载均衡。两者信息不同，所以调优必须把两张图接起来。
+
+\begin{lstlisting}[numbers=none,caption={用户态事实和内核事实的对应关系}]
+runtime:
+  task ready
+  worker idle
+  queue length
+  blocking reason
+  deadline and priority
+
+kernel:
+  thread runnable
+  thread running
+  sleeping on futex or I/O
+  runqueue delay
+  CPU migration
+  cgroup throttling
+\end{lstlisting}
+
+一个 task ready，不代表正在运行；一个 worker thread runnable，不代表已经拿到 CPU；一个 CPU 使用率低，不代表没有业务工作，可能是 worker 全在 I/O、future 或 page fault 上睡眠。反过来，CPU 使用率高也不代表有效吞吐高，可能是 CAS 重试、锁竞争、线程过多或 busy poll。
+
+\section{CFS/EEVDF、runqueue 和 cgroup 的最小模型}
+
+Linux 调度策略会随版本演进，CFS 和 EEVDF 的具体实现细节也不是应用程序应仿写的对象。性能工程需要抓住稳定模型：每个 CPU 有运行队列；可运行线程进入某个 runqueue；调度器按策略选择下一个线程；线程可能被抢占、唤醒、迁移或受 cgroup 配额限制；负载均衡尝试把工作分布到合适 CPU。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+内核对象/现象 & 工程含义 & 常见误判 \\
+\midrule
+runqueue & runnable 线程在等待 CPU & 只看 worker 数，不看 runnable 延迟 \\
+wakeup & 睡眠线程变得可运行 & 以为 notify 后立刻 running \\
+preemption & 当前线程被切走 & 把长尾全归因于代码慢 \\
+migration & 线程换 CPU & 忽略 cache/TLB/NUMA 热状态丢失 \\
+cgroup quota & 容器或服务 CPU 配额 & 误以为硬件不够强 \\
+load balance & 跨 CPU 调整 runnable 工作 & 错误绑核导致局部拥塞 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+调度报告不需要复现内核源码，但要能回答：线程有没有 runnable 但没 running；是否频繁迁移；是否发生大量自愿或非自愿 context switch；是否被 cgroup 限流；是否某些 worker 长时间睡在 futex、I/O 或 page fault。
+
+\section{上下文切换和 off-CPU 时间}
+
+热循环慢通常看 on-CPU 指标，服务尾延迟则常常需要 off-CPU 视角。一个请求的 wall time 可能大部分不在 CPU 上执行，而是在等待锁、条件变量、磁盘、网络、page fault、下游服务或 cgroup 配额。若只看 \code{perf record} 的 CPU 采样，可能只看到请求真正运行的短窗口，完全漏掉等待原因。
+
+\begin{lstlisting}[numbers=none,caption={请求延迟分解}]
+request wall time:
+  queue_wait
+  runnable_wait
+  on_cpu_execute
+  blocked_futex
+  blocked_io
+  page_fault
+  downstream_wait
+  cancellation_or_cleanup
+\end{lstlisting}
+
+运行时应在业务 trace 中记录 block reason。系统工具若可用，可以用调度 trace、off-CPU profiling 或 eBPF 辅助定位。若工具不可用，至少要在应用层记录 worker state：RunningTask、BlockedOnMutex、BlockedOnFuture、BlockedOnIo、BlockedOnPageFault、Stopped。把所有等待都写成 Blocked，仍然无法行动。
+
+\section{虚拟内存：VMA、PTE 和物理页}
+
+用户态指针是虚拟地址。一个虚拟地址属于某个 VMA；访问时 MMU 通过页表项找到物理页；TLB 缓存最近翻译；没有有效 PTE 时进入 page fault；权限不匹配时产生保护错误；匿名页第一次写入可能分配物理页；文件 mmap 第一次访问可能从 page cache 或存储中建立映射。
+
+\begin{lstlisting}[numbers=none,caption={一次用户态 load 背后的内存边界}]
+virtual address
+  -> VMA lookup and permission
+  -> page table entry
+  -> TLB hit or page walk
+  -> physical page
+  -> cache hierarchy
+  -> register value
+\end{lstlisting}
+
+性能报告要区分四件事：分配虚拟地址范围、建立页表映射、真正分配物理页、数据进入 cache。一个 \code{malloc} 很快，不代表物理内存已经准备好；一次 \code{mmap} 成功，不代表文件内容已经读入；RSS 不下降，不一定是泄漏，可能是 allocator 缓存、page cache 或映射仍在。
+
+\section{buddy、SLUB、reclaim、swap 和 OOM 的工程直觉}
+
+内核物理内存管理通常通过 buddy allocator 管理页框，通过 slab/slub 管理小内核对象。用户态不直接调用这些结构，但会受到它们影响：page fault 需要物理页；网络和文件系统需要内核对象；大量小对象、socket、buffer、page cache 和匿名页共同竞争内存。
+
+当内存紧张时，内核可能回收 page cache、写回脏页、回收匿名页、触发 swap、压缩内存或最终 OOM。应用看到的可能是突然变慢、major fault 增加、writeback 抖动、分配失败或进程被杀。把这些都归因于“算法慢”是错误的。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 可能内核路径 & 应用层对策 \\
+\midrule
+minor fault 多 & 首次触页、COW、匿名页建立 & 预触页、分阶段计时、减少突发分配 \\
+major fault 多 & 文件页不在内存或 swap-in & 改读取策略、预取、控制内存压力 \\
+dirty writeback 抖动 & 脏页超过阈值或 fsync 集中 & 批量写、限速、分离提交路径 \\
+RSS 不降 & allocator 保留或 mmap 未释放 & 区分 live set、arena、page cache \\
+OOM 或 kill & 总内存/限制耗尽 & admission、内存预算、降级策略 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{NUMA migration 和 first-touch}
+
+NUMA 章节已经讲了远端访问。本章补内核边界：页面初次由哪个线程写入，通常会影响它被放在哪个 NUMA node；自动 NUMA balancing 可能迁移页面；线程迁移可能让原本本地页面变成远端访问。性能报告若只写“用了 32 线程”，没有写 first-touch、线程绑定和内存绑定，就无法解释跨 socket 扩展性。
+
+\begin{lstlisting}[numbers=none,caption={NUMA 实验报告字段}]
+numa_report:
+  topology
+  thread_affinity
+  memory_policy
+  first_touch_thread
+  input_size_per_node
+  local_vs_remote_case
+  migrations_if_observable
+  bandwidth_and_latency
+\end{lstlisting}
+
+若无法读取 uncore 或 NUMA counters，也可以做对照：主线程初始化再多 worker 读取；每个 worker first-touch 自己分片；绑定线程不绑定内存；绑定线程并绑定内存。结论要写成“对照支持远端访问解释”，而不是伪装成证明了具体硬件事务。
+
+\section{page cache、direct I/O 和可靠写}
+
+文件 I/O 性能不能只看 \code{read/write} 返回时间。Buffered I/O 可能只把数据复制到 page cache；后续 writeback 才真正写设备。Direct I/O 绕过 page cache，但需要对齐和更严格的 buffer 管理；它减少缓存污染，却不自动更快。可靠写还要区分 \code{write}、\code{fdatasync}、\code{fsync}、临时文件 rename 和 manifest commit。
+
+\begin{lstlisting}[numbers=none,caption={写出路径状态机}]
+UserBuffer
+  -> KernelPageCache
+  -> DirtyPage
+  -> WritebackSubmitted
+  -> DeviceCompleted
+  -> DirectoryOrManifestCommitted
+\end{lstlisting}
+
+Compute Systems Engine 的输出报告必须写清可见性边界：只返回给用户态、进入 page cache、设备完成、还是 manifest 已提交。否则“写很快”可能只是把风险推给了崩溃恢复。
+
+\section{源码阅读路径}
+
+本章的源码阅读不要追求一次读完整内核，而是从现象入口读局部路径：
+
+\begin{itemize}
+  \item 调度：从 wakeup、runqueue、context switch、cgroup quota 入口读起。
+  \item 内存：从 page fault、VMA、匿名页、file-backed page、reclaim 入口读起。
+  \item I/O：从 page cache、writeback、fsync 和 block layer completion 入口读起。
+  \item futex：从 wait/wake、哈希队列和用户态原子 fast path 的边界读起。
+\end{itemize}
+
+源码阅读报告不要求解释每一行，而要回答：这个内核路径接收什么状态，改变什么状态，对用户态暴露什么现象，哪些指标能观察到，哪些指标观察不到。
+
+\section{实验与验收}
+
+实验一：线程调度报告。固定一个线程池 workload，记录 worker state、context switch、迁移、runnable/running 边界和队列长度。解释 CPU 使用率低或高的具体原因。
+
+实验二：page fault 报告。比较匿名大数组首次写、第二次写、文件 mmap 首次读和热读。记录 minor/major fault、耗时和字节吞吐。
+
+实验三：page cache 写出报告。比较普通 write、write 加 fsync、临时文件 rename 加 manifest 的耗时和崩溃语义。
+
+实验四：NUMA first-touch 对照。比较主线程初始化和 worker 分片初始化，记录带宽、线程绑定和未验证边界。
+
+验收标准：报告必须把用户态现象映射到内核边界，不能只写“系统有波动”。每个结论都要说明它依赖哪些可观察证据，哪些还只是合理假设。

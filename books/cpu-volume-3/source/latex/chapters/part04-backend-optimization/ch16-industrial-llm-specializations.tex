@@ -1,0 +1,227 @@
+\section{工业 LLM 专项：投机解码、MoE、LoRA、多 GPU 与源码对照}
+
+\section{为什么需要这一章}
+
+前面的章节已经把本地推理主链路讲清：tokenizer、decoder、KV cache、量化、AI compiler、CPU/GPU backend、serving 和验收。工业系统还会遇到一批专项能力：speculative decoding、MoE、LoRA/adapters、复杂低比特格式、CUDA/HIP/Tensor Core、多 GPU 并行，以及成熟框架源码对照。它们不一定都要在教学项目中实现到生产级，但必须知道状态、公式、代价和验证边界，否则读者面对真实岗位会断层。
+
+本章的原则是：每个专项都按同一模板展开。
+
+\begin{lstlisting}[numbers=none,caption={工业专项分析模板}]
+specialization:
+  problem_it_solves
+  state_added_to_runtime
+  math_or_protocol
+  memory_and_compute_cost
+  correctness_oracle
+  failure_cases
+  industrial_reference
+  minimal_project_scope
+\end{lstlisting}
+
+\section{Speculative decoding：用验证换吞吐}
+
+投机解码的核心思想是用较小 draft model 先提出多个候选 token，再用 target model 一次性验证这些候选。若候选被接受，就减少 target model 的逐 token 调用次数；若候选被拒绝，就回退到 target model 的分布。它不是简单“开两个模型并行跑”，而是一个带接受率、KV 管理和采样一致性的状态机。
+
+\begin{lstlisting}[numbers=none,caption={投机解码状态机}]
+TargetReady(prefix)
+  -> DraftPropose(k tokens)
+  -> TargetVerify(prefix + draft_tokens)
+  -> AcceptPrefix(m tokens)
+  -> if m < k: SampleCorrection
+  -> CommitAcceptedTokens
+  -> UpdateTargetKVAndDraftKV
+  -> TargetReady(new_prefix)
+\end{lstlisting}
+
+关键账本包括：draft 生成成本、target 验证成本、平均接受 token 数、target KV 如何追加或回滚、draft KV 是否复用、采样分布是否保持正确。若接受率低，投机解码可能更慢；若 KV 管理错，后续 token 会在错误上下文上生成；若采样修正公式错，输出分布改变。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+字段 & 必须记录 & 错误后果 \\
+\midrule
+draft tokens & 候选 token id 和概率 & 无法复现接受/拒绝 \\
+target logits & 验证位置 logits & 接受率不可解释 \\
+accepted count & 每轮接受多少 & 吞吐模型失真 \\
+KV mutation & 追加、回滚、提交边界 & 状态串扰 \\
+sampler state & RNG、temperature、top-k/top-p & 分布不可复现 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+教学项目的最小范围是：在 tiny target/draft 上实现 greedy 或受限采样投机解码，记录每轮接受数和 KV 状态。生产级实现还要处理 batching、paged KV、不同模型 tokenizer 对齐、draft/target 并发和服务 SLO。
+
+\section{MoE：算力稀疏，系统不稀疏}
+
+MoE 模型用 router 为 token 选择少量 expert。数学上每个 token 只经过 top-k expert，看起来节省计算；系统上却引入路由、分组、负载均衡、expert 权重布局、跨设备通信和尾延迟。MoE 的难点不只是写一个 expert MLP，而是让 token 到 expert 的映射在 batch、GPU 和网络之间可控。
+
+\begin{lstlisting}[numbers=none,caption={MoE 层状态}]
+MoELayer:
+  router_logits: [tokens, experts]
+  selected_experts: [tokens, top_k]
+  combine_weights: [tokens, top_k]
+  dispatch_plan:
+    expert_id
+    token_indices
+    capacity
+    device_owner
+  expert_outputs
+  combine_output
+\end{lstlisting}
+
+MoE 报告要同时写：router top-k 分布、每个 expert token 数、容量溢出策略、负载均衡 loss 或辅助约束、跨设备 all-to-all 成本、expert 权重驻留位置和尾延迟。若只报告平均 FLOPs，会漏掉最重要的系统瓶颈：热点 expert 让某个设备成为长尾。
+
+教学项目可以先做单机单设备 MoE trace：固定 8 个 expert、top-2 routing、记录每个 expert 的 token 数和 combine checksum。多 GPU expert parallel 属于更高阶项目，需要通信账本。
+
+\section{LoRA 和 adapter：低秩增量也是 runtime 状态}
+
+LoRA 把权重增量表示成低秩矩阵乘积。对一个线性层，原始输出为 \(Wx\)，LoRA 后变成：
+
+\[
+  y = Wx + \alpha B(Ax)
+\]
+
+这里 \(A\) 和 \(B\) 是低秩 adapter 权重，\(\alpha\) 是缩放。系统难点在于：服务端可能同时加载多个 adapter，不同请求选择不同 adapter；有些场景选择 merge 到主权重，有些场景选择 on-the-fly 叠加；量化主权重和 LoRA 浮点权重混合时，误差和 kernel 路径更复杂。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+策略 & 优点 & 代价 \\
+\midrule
+merge & 推理路径简单 & 切换 adapter 慢，占用多份权重 \\
+unmerge & 恢复基座方便 & 需要管理数值误差和版本 \\
+on-the-fly & 多租户灵活 & 每步多一次低秩计算和调度 \\
+adapter batch & 多请求共享 adapter & batching 复杂，KV 与 adapter 绑定 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+LoRA 进入 serving 后，request state 必须包含 adapter id、adapter version、rank、dtype、merge state 和 oracle 误差。取消、热更新和多租户隔离都要考虑 adapter 生命周期。不能把 adapter 当成 prompt 附件；它改变的是模型权重路径。
+
+\section{量化算法谱系：格式比论文名更重要}
+
+GPTQ、AWQ、SmoothQuant、NF4、K-quants 等名词很多。第三册不应追逐名字，而要训练读者看四件事：实数如何映射到码点，scale/zero point 如何存，kernel 如何解释，oracle 如何判定误差。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+方向 & 关注点 & 工程字段 \\
+\midrule
+GPTQ 类 & 后训练权重量化，逐层误差补偿 & group size、order、scale、zero、permute \\
+AWQ 类 & 保护重要 activation/通道 & activation statistics、protected channels \\
+SmoothQuant 类 & 在 activation 和 weight 间迁移 scale & smoothing factor、folded scale \\
+NF4 类 & 非均匀 4-bit codebook & codebook id、block scale、dequant table \\
+K-quants 类 & 本地推理 block 格式 & block type、metadata layout、kernel support \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+验收不是“支持某个名字”，而是能解析 descriptor，证明 packed bytes、scale metadata、dequant 公式和 reference oracle 一致。若 kernel 只支持某种 group size 或 block type，verifier 要拒绝不支持的资产。
+
+\section{CUDA/HIP 与 Tensor Core：从 kernel 到 plan}
+
+GPU 章节已经讲了 warp、block、shared memory、coalescing、occupancy 和 tensor core 原理。工业闭环还要把这些落到 executable plan。一个 GPU backend 不只是一组 kernel，它包括 device buffer、stream、event、workspace、copy、kernel launch、synchronization、fallback 和 profiler。
+
+\begin{lstlisting}[numbers=none,caption={GPU step plan}]
+GpuStepPlan:
+  stream_id
+  resident_weights
+  kv_cache_layout
+  staging_buffers
+  kernels:
+    rmsnorm
+    qkv_gemm
+    rope
+    attention
+    mlp
+    logits
+    sampler_or_topk
+  events:
+    h2d_copy
+    kernel_time
+    d2h_copy
+    sync
+  fallback:
+    unsupported_dtype
+    unsupported_shape
+    workspace_limit
+\end{lstlisting}
+
+Tensor Core 的使用条件必须写成 descriptor：dtype、tile shape、layout、alignment、accumulator type 和 scale 路径。prefill 的矩阵形状通常更容易吃满 tensor core；decode batch 1 常常变成小 GEMV，利用率差，需要 batching 或 fused kernels 改善。报告必须分 prefill 和 decode，不能用 prefill tokens/s 掩盖 decode TPOT。
+
+\section{多 GPU：并行不是把模型复制几份}
+
+多 GPU 推理至少有三类并行：tensor parallel 把单层矩阵切到多个设备，pipeline parallel 把层切到多个设备，expert parallel 把 MoE expert 分布到多个设备。它们都引入通信和调度状态。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+并行方式 & 通信形态 & 主要风险 \\
+\midrule
+tensor parallel & all-reduce、all-gather、reduce-scatter & 小 batch 通信占比高 \\
+pipeline parallel & stage 间 activation 传递 & bubble、调度复杂、KV 分布 \\
+expert parallel & token dispatch/all-to-all & 热点 expert、负载不均、尾延迟 \\
+KV 分片 & 按层、head、sequence 或 page 分布 & attention gather 和一致性复杂 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+多 GPU 报告要写：切分维度、每步通信字节、collective 类型、设备拓扑、KV cache owner、失败恢复边界和 SLO 影响。NCCL 或其他 collective 不是魔法黑盒；它只是实现通信，不能替你决定模型状态如何分片。
+
+\section{工业源码对照：看设计理由，不贴 logo}
+
+源码阅读要围绕问题，而不是围绕项目名。建议每次只读一个概念：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+系统 & 阅读问题 & 对应本书概念 \\
+\midrule
+llama.cpp/ggml & tensor、quant block、backend dispatch 如何表达 & descriptor、packed weight、kernel registry \\
+vLLM & paged KV 和 continuous batching 如何绑定 & block table、sequence state、scheduler \\
+TensorRT-LLM & engine、plugin、KV cache 和多 GPU 怎样组织 & executable plan、plugin、collective \\
+ONNX Runtime & graph、execution provider、allocator 如何协作 & typed graph、backend select、memory planner \\
+oneDNN & primitive descriptor 怎样选择 layout 和 kernel & layout propagation、post-op、reorder \\
+MLIR/TVM & IR/pass/lowering/schedule 如何分层 & verifier、pass pipeline、lowering \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+源码阅读报告必须包含：读了哪个版本、哪个文件或模块、它如何表达状态、它解决什么问题、它付出什么复杂度、本书轻量实现借鉴什么、暂时拒绝什么。只写“参考 vLLM”没有意义。
+
+\section{专项能力的作品集边界}
+
+这些专项可以成为求职作品集，但边界要诚实：
+
+\begin{itemize}
+  \item spec decoding：必须有接受率、KV 状态和分布正确性报告。
+  \item MoE：必须有 routing 分布、expert 负载和 combine oracle。
+  \item LoRA：必须有 adapter 生命周期、多 adapter 切换和 logits diff。
+  \item 量化：必须有格式 descriptor、byte oracle、operator oracle 和质量回归。
+  \item GPU：必须有 kernel profiler、copy/sync 分解和 fallback。
+  \item 多 GPU：必须有通信字节账本和 SLO 影响，不只启动多进程。
+  \item 源码对照：必须有设计拆解，不是链接列表。
+\end{itemize}
+
+\section{验收标准}
+
+本章不要求一次实现所有工业能力，但每个被写进作品集的专项必须满足：
+
+\begin{enumerate}
+  \item 有明确问题和收益模型。
+  \item 有新增 runtime state 和生命周期。
+  \item 有数学公式或协议状态机。
+  \item 有内存、计算或通信账本。
+  \item 有 correctness oracle 和失败案例。
+  \item 有至少一个工业系统的源码对照。
+  \item 有不支持场景和 fallback 说明。
+\end{enumerate}
+
+\begin{keyidea}
+工业 LLM 系统不是“Transformer 加几个优化名词”。每个专项都会增加状态、验证、调度和证据负担。能把这些负担讲清楚，才说明真正理解 AI Infra。
+\end{keyidea}

@@ -1,0 +1,229 @@
+\chapter{PMU、Top-Down 与 SIMD 资源账本}
+
+\section{从耗时数字走向硬件归因}
+
+上一章建立了可信测量和 Roofline 方法，但真实性能工程还需要继续下沉：当一个 kernel 慢时，慢在前端取指、分支错误、执行端口、load/store、cache miss、TLB miss、内存带宽，还是调度等待？单个 elapsed time 无法回答。PMU 和 Top-Down 方法的价值，是把“慢”拆成更接近硬件结构的证据。
+
+Top-Down 不应被理解成一组固定百分比截图，而是一棵诊断树。它先问每个 pipeline slot 最终归到哪里：retiring、bad speculation、frontend bound、backend bound。然后继续下钻：backend bound 是 core bound 还是 memory bound；memory bound 是 L1、L2、LLC、DRAM、DTLB 还是 store 相关等待；core bound 是端口压力、除法、shuffle、FMA、load/store 单元还是寄存器依赖。
+
+\begin{lstlisting}[numbers=none,caption={Top-Down 诊断树的报告形态}]
+topdown:
+  level_1:
+    retiring
+    bad_speculation
+    frontend_bound
+    backend_bound
+  level_2:
+    frontend_latency
+    frontend_bandwidth
+    core_bound
+    memory_bound
+  drilldown:
+    branch_miss
+    icache_or_itlb
+    l1_l2_llc_miss
+    dtlb_miss
+    port_pressure
+    store_buffer_or_load_block
+\end{lstlisting}
+
+如果环境没有权限采集这些事件，报告必须降级：可以写“无法证明 IPC 改善”，不能把 wall time 变化解释成 IPC 改善；可以写“耗时下降且字节账本不变”，不能声称 LLC miss 下降。严肃的性能书必须教会读者区分可证据支持的结论和合理猜测。
+
+\section{PMU 事件到瓶颈类型的映射}
+
+PMU 事件名称随架构变化，但诊断逻辑稳定。下面的表不是某个平台的完整事件清单，而是报告里的解释模板。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.22\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+观察 & 可能解释 & 下一步验证 \\
+\midrule
+IPC 低、cache miss 高 & 内存等待或工作集过大 & 改工作集、stride、prefetch、带宽账本 \\
+IPC 低、branch miss 高 & 分支预测失败 & 构造可预测/随机输入，对照分支消除 \\
+IPC 低、L1 命中但周期高 & core bound 或依赖链 & 看端口压力、uops、latency、反汇编 \\
+instructions 大幅增加 & 算法或编译路径变了 & 对照汇编、循环体、函数调用和 tail \\
+cycles 高但 CPU time 低 & 可能有睡眠或抢占 & 看 context switch、off-CPU、trace \\
+LLC miss 低但带宽高 & streaming 命中预期 & Roofline 字节账本和内存带宽 \\
+DTLB miss 高 & 页面跨度大或随机访问 & huge page、blocking、访问顺序、页数估计 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+事件不是定罪证据。比如 LLC miss 高可能是坏事，也可能是 streaming workload 的正常结果；IPC 高也不一定端到端快，可能做了更多无用指令。每个解释都要回到语义、字节、操作数和反例输入。
+
+\section{完整 PMU 报告模板}
+
+高质量 PMU 报告至少包含下面字段：
+
+\begin{lstlisting}[numbers=none,caption={PMU/Top-Down 报告字段}]
+pmu_report:
+  environment:
+    os_kernel
+    cpu_model
+    microarchitecture_if_known
+    perf_or_profiler_version
+    permission_status
+    frequency_governor
+    affinity_policy
+    smt_status
+  binary:
+    compiler
+    flags
+    target_cpu
+    symbol_under_test
+    objdump_path
+  workload:
+    input_shape
+    input_bytes
+    operations
+    checksum
+    warmup
+    repetitions
+  counters:
+    cycles
+    instructions
+    branches
+    branch_misses
+    cache_references
+    cache_misses
+    l1_l2_llc_if_available
+    dtlb_if_available
+    topdown_if_available
+  derived:
+    ipc
+    cycles_per_element
+    bytes_per_second
+    flops_or_ops_per_second
+    arithmetic_intensity
+  conclusion:
+    supported_claims
+    rejected_claims
+    evidence_boundary
+\end{lstlisting}
+
+报告里最重要的是 \code{rejected\_claims}。如果没有 branch event，就不能写“分支预测改善”；如果没有 cache event，就不能写“缓存 miss 降低”；如果没有反汇编，就不能写“AVX2 路径被使用”。工程上，知道不能证明什么，和证明了什么一样重要。
+
+\section{SIMD 资源账本：宽寄存器只是起点}
+
+SIMD 不是“一个指令处理 8 个 float 所以快 8 倍”。一个 AVX2 \code{ymm} 寄存器确实能放 8 个 \code{float}，但 kernel 还要读取内存、做地址计算、处理 tail、归约 lane、可能 shuffle、写回结果。真实瓶颈可能是 load/store 端口、FMA 端口、shuffle 端口、前端 uop 带宽、寄存器压力、数据依赖或内存带宽。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+资源 & 典型成本 & 常见误判 \\
+\midrule
+load/store & 每个向量仍要搬字节 & 只数 FLOPs，不数 bytes \\
+FMA/ALU & throughput 和 latency 不同 & 把延迟当吞吐 \\
+shuffle/permute & lane 重排可能很贵 & 忽略 layout 对指令的影响 \\
+horizontal reduce & 跨 lane 合并需要额外步骤 & 以为向量加完就得到标量 \\
+gather/scatter & 地址分散，吞吐常差 & 把它当普通 load/store \\
+mask/tail & AVX-512 mask 方便但不免费 & 认为 tail 完全无成本 \\
+前端 uops & 宽向量指令也要解码和发射 & 只看寄存器位宽 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{dot product 的四级资源账本}
+
+以 dot product 为例。标量 C++ 看起来很简单：
+
+\begin{lstlisting}[language=C++]
+float dot(const float* a, const float* b, int n)
+{
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        s += a[i] * b[i];
+    }
+    return s;
+}
+\end{lstlisting}
+
+从资源账本看，每个元素至少读 \code{a[i]} 和 \code{b[i]} 两个 float，也就是 8 字节，做一个乘法和一个加法，约 2 FLOPs。算术强度约为 \(2 / 8 = 0.25\) FLOP/byte。若数据远超 cache，内存带宽很容易成为上限。
+
+\subsection{标量路径}
+
+标量路径每轮通常有两个 load、一个乘、一个加、一个 loop branch。若编译器不重关联，累加变量形成长依赖链：下一次加法依赖上一次结果。即使所有数据在 L1，add latency 也会限制吞吐。多累加器可以把依赖链拆开，让 CPU 同时推进多个 partial sum。
+
+\subsection{AVX2 路径}
+
+AVX2 每次处理 8 个 float。热循环可能形如：
+
+\begin{lstlisting}[numbers=none,caption={AVX2 dot 的资源账本形态}]
+loop:
+  load 32B from a
+  load 32B from b
+  fused multiply-add into vector accumulator
+  advance pointers
+tail:
+  handle n % 8
+reduce:
+  horizontal reduce vector lanes
+\end{lstlisting}
+
+这减少了循环控制开销，并提高了乘加吞吐，但每 8 个元素仍要读 64 字节。若数据来自 DRAM，带宽上限仍然决定最终吞吐。若数据在 L1，FMA 端口、load 端口和 reduction 成本更重要。
+
+\subsection{AVX-512 路径}
+
+AVX-512 每个 \code{zmm} 可以处理 16 个 float，并能用 mask 处理 tail。优势是更宽、更自然的 mask 和一些更强的整数/低精度指令；代价是可能增加寄存器压力、代码体积、前端压力，并在某些平台触发频率变化。报告不能只写“AVX-512 更宽”，必须保存实际路径、频率状态、吞吐和端到端收益。
+
+\subsection{VNNI/AMX 与 int8 dot}
+
+AI 推理常见的 int8 dot 不只是把 float 换成 int8。VNNI 把多个低精度乘加合并到更少指令，AMX 进一步引入 tile 资源。它们的资源账本包括：码点读取、scale metadata、累加器宽度、requantization、tile 配置、tile load/store、对齐和 fallback。若模型格式是 int4，还要加 nibble 解包和 group scale 读取。低比特的瓶颈常从“读权重字节”转移到“解包、scale 和指令支持”。
+
+\section{反汇编证据：证明 fast path 真的执行}
+
+SIMD 报告必须证明二进制里有目标指令，还要证明运行时真的走到这条路径。仅仅打开 \code{-mavx2} 不够；编译器可能因为别名、对齐、浮点语义或目标函数不可见而未向量化。仅仅在文件里找到 \code{vaddps} 也不够；运行时 dispatch 可能进入 scalar fallback。
+
+\begin{lstlisting}[numbers=none,caption={SIMD 证据字段}]
+simd_evidence:
+  requested_backend: scalar / auto / avx2 / avx512 / neon
+  compiled_flags
+  cpu_feature_detection
+  dispatch_decision
+  symbol_name
+  objdump_excerpt
+  vector_instructions_seen
+  tail_path_seen
+  forced_backend_test
+  fallback_test
+\end{lstlisting}
+
+如果输入长度很短，dispatch 可能故意选择 scalar；如果指针不满足对齐，kernel 可能转入 unaligned path；如果 CPU 不支持目标 ISA，程序必须安全 fallback。所有这些都要进入测试矩阵。
+
+\section{端口压力和 uop 思维}
+
+现代核心有多个执行端口。load、store、FMA、整数 ALU、branch、shuffle 和除法不是使用同一资源。一个 kernel 即使没有 cache miss，也可能因为某类端口饱和而慢。比如大量 shuffle 的 AoS 到 SoA 转换可能受 shuffle/permute 限制；大量 gather 可能受内存地址生成和 load 端口限制；horizontal reduction 可能受跨 lane 合并和依赖链限制。
+
+报告不要求读者背每代微架构端口表，但要形成资源账本：
+
+\begin{lstlisting}[numbers=none,caption={端口压力账本}]
+per_vector_iteration:
+  loads: count and bytes
+  stores: count and bytes
+  fma_or_alu_ops: count
+  shuffles_or_permutes: count
+  branches: count
+  address_generation: simple / indexed / gather
+  dependency_chains:
+    accumulator
+    pointer_updates
+    reduction
+  likely_bottleneck:
+    memory_bandwidth / load_ports / fma_ports / shuffle / frontend
+\end{lstlisting}
+
+这个账本的作用是提出可验证假设。若怀疑 shuffle 过重，可以改 layout 或预打包；若怀疑 load 端口，可以减少读流或 blocking；若怀疑前端，可以看代码体积和 uop cache；若怀疑依赖链，可以多累加器或重排归约。
+
+\section{实验矩阵}
+
+实验一：对同一个 dot kernel 生成 scalar、auto-vectorized、AVX2 或平台可用 SIMD 版本。每个版本保存汇编、输入长度、checksum、耗时、cycles、instructions 和可用 cache 事件。
+
+实验二：构造 L1-fit、LLC-fit、DRAM-stream 三类输入。用相同代码比较 IPC、有效带宽和 cycles/element。解释为什么同一 SIMD 优化在不同工作集上收益不同。
+
+实验三：构造需要 horizontal reduction 的 kernel 和纯 elementwise kernel。比较向量化收益，指出 reduction 成本来自哪里。
+
+实验四：构造连续 load 和 gather-like 访问。即使操作数相同，也要报告地址流、cache/TLB 事件和吞吐差异。
+
+验收标准：报告必须包含语义 oracle、反汇编、运行时 dispatch、字节账本、PMU 可用性和未验证边界。没有这些字段的“SIMD 加速表”，不能作为本书的性能证据。

@@ -1,0 +1,266 @@
+\chapter{编译器 IR、优化 pass 与汇编证据链}
+
+\section{为什么还要专门讲优化器}
+
+前面已经把源码、目标文件、ELF、加载和运行时启动连成一条链。现在还缺中间最容易被误解的一层：优化器。很多工程事故并不是汇编语法读错，而是把 C++ 源码当成 CPU 会照字执行的脚本。优化器看到的不是你屏幕上的缩进和变量名，而是经过语义分析后的中间表示；它按语言规则、别名信息、控制流、数据流和目标机器代价模型改写程序。若源码里包含未定义行为、对象生命周期错误、别名假设错误或不可观察的计算，优化器生成的机器码可能和初学者直觉完全不同。
+
+本章的目标不是让读者背 LLVM 或 GCC 内部所有 pass 名称，而是建立一条可复查的证据链：
+
+\begin{lstlisting}[numbers=none,caption={优化器证据链}]
+C++ source
+  -> preprocessed translation unit
+  -> AST or frontend semantic dump
+  -> IR with types, loads, stores, calls and branches
+  -> SSA/value graph and control-flow graph
+  -> optimization pass before/after
+  -> target assembly
+  -> object code and debug/unwind side effects
+\end{lstlisting}
+
+只要这条链路清楚，读者就能解释三个常见问题：为什么某段代码在 \code{-O0} 和 \code{-O2} 下行为不同；为什么 benchmark 循环消失；为什么看起来“只是改了类型转换”却导致向量化或别名结果变化。
+
+\section{从源码到 AST：语言语义先于优化}
+
+编译器前端的第一项工作是把文本变成有语义的树。语法树不是性能优化结果，而是语言规则的载体。名字查找、重载解析、模板实例化、常量表达式、对象生命周期、访问控制和异常规范，都在这一层确定。优化器后面能做什么，取决于前端已经证明了什么。
+
+考虑下面的代码：
+
+\begin{lstlisting}[language=C++,caption={看似普通的循环}]
+int sum_positive(const int* xs, int n)
+{
+    int s = 0;
+    for (int i = 0; i < n; ++i) {
+        if (xs[i] > 0) {
+            s += xs[i];
+        }
+    }
+    return s;
+}
+\end{lstlisting}
+
+前端至少要确定这些事实：\code{xs} 是指向 \code{const int} 的指针；\code{n} 是有符号整数；\code{i < n} 是有符号比较；\code{xs[i]} 是指针加偏移后的对象访问；\code{s += xs[i]} 可能发生有符号溢出，而有符号溢出在标准 C++ 中是未定义行为。最后这一点很关键。优化器不是“假装机器整数会回绕”，而是可以利用“正确程序不会发生 signed overflow”这个前提做改写。
+
+因此，AST dump 的价值不只是看树形结构，而是确认编译器理解的类型和语义是否与你一致。高质量报告应保存：
+
+\begin{lstlisting}[numbers=none,caption={AST 证据字段}]
+frontend:
+  compiler_and_version
+  language_standard
+  target_triple
+  source_file
+  preprocessed_file_hash
+  ast_dump_path
+  warnings_enabled
+  sanitizer_configuration
+\end{lstlisting}
+
+如果报告里只有最终汇编，没有前端语义，就很难判断某个优化是目标机器选择，还是语言层已经允许了。
+
+\section{IR 是优化器的工作面}
+
+IR 可以粗略理解为“优化器容易分析和改写的程序表示”。真实编译器的 IR 有很多种：Clang/LLVM 常用 LLVM IR，GCC 有 GIMPLE 和 RTL，后端还会有机器 IR。不同 IR 的语法不同，但工程问题相同：它们把源码里的表达式拆成更显式的 load、store、branch、call、phi、metadata 和控制流。
+
+下面用伪 LLVM IR 表达一个最小分支：
+
+\begin{lstlisting}[numbers=none,caption={分支在 IR 中变成基本块和 phi}]
+define i32 @select_add(i32 %x, i32 %y, i1 %cond) {
+entry:
+  br i1 %cond, label %then, label %else
+
+then:
+  %a = add nsw i32 %x, 1
+  br label %merge
+
+else:
+  %b = add nsw i32 %y, 1
+  br label %merge
+
+merge:
+  %r = phi i32 [ %a, %then ], [ %b, %else ]
+  ret i32 %r
+}
+\end{lstlisting}
+
+\code{phi} 不是 CPU 指令。它表示“这个值来自哪个前驱基本块”。SSA 形式要求每个虚拟值只定义一次，于是控制流合并处需要 phi 节点。优化器通过 SSA 更容易做常量传播、死代码删除、循环不变外提和公共子表达式消除。读 IR 时要分清：IR 是编译器的证明和改写平面，不是机器最终执行平面。
+
+\subsection{load/store 比变量名更重要}
+
+源码中的局部变量名在优化后可能消失。IR 更关心值流和内存流。若一个局部变量从不被取地址，前端可能先把它放在栈槽，随后 \code{mem2reg} 把它提升成 SSA 值。这样汇编里可能根本没有这个变量的内存地址。
+
+\begin{lstlisting}[numbers=none,caption={mem2reg 前后的思路}]
+before:
+  %s.addr = alloca i32
+  store i32 0, ptr %s.addr
+  %old = load i32, ptr %s.addr
+  %new = add i32 %old, %x
+  store i32 %new, ptr %s.addr
+
+after:
+  %s0 = 0
+  %s1 = add i32 %s0, %x
+\end{lstlisting}
+
+这解释了为什么调试器会显示 \code{optimized out}。变量不是被“弄丢了”，而是源码变量和机器状态之间不再一一对应。优化构建里的调试信息只能尽力把源层变量映射回寄存器、栈槽或表达式；当值被合并、删除、重排或只存在于某些路径上时，调试器无法凭空恢复它。
+
+\section{核心 pass：每个 pass 都在证明一类事实}
+
+不要把优化 pass 当成魔法列表。每个 pass 都依赖一类可证明事实，也有明确失效边界。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+pass & 依赖的事实 & 常见边界 \\
+\midrule
+常量传播 & 某些值在所有路径上已知 & 输入、volatile、未知调用会打断 \\
+死代码删除 & 结果不可观察且无副作用 & I/O、原子、volatile、异常、析构 \\
+内联 & 调用目标和体积收益可接受 & ABI 边界、递归、动态派发、代码膨胀 \\
+循环不变外提 & 表达式跨迭代不变且移动安全 & 别名、异常、越界、函数副作用 \\
+向量化 & 迭代独立且内存访问可证明 & 别名、对齐、tail、浮点语义、数据依赖 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{DCE：不可观察计算会消失}
+
+下面的 benchmark 是坏的：
+
+\begin{lstlisting}[language=C++,caption={结果不被消费的 benchmark}]
+void bad_bench(const float* xs, int n)
+{
+    float s = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        s += xs[i];
+    }
+}
+\end{lstlisting}
+
+如果 \code{s} 的值没有影响返回值、内存、I/O、volatile、原子或异常路径，优化器可以删除循环。它不是作弊，而是在执行语言规则允许的等价变换。正确实验应该把结果交给 oracle 或 sink，并确保 sink 本身不成为热循环主要成本。
+
+\subsection{LICM：循环外提需要移动安全}
+
+下面的写法看起来 \code{scale()} 每轮都调用：
+
+\begin{lstlisting}[language=C++]
+for (int i = 0; i < n; ++i) {
+    out[i] = in[i] * scale();
+}
+\end{lstlisting}
+
+若编译器能证明 \code{scale()} 无副作用、不抛异常、返回值不随迭代变化，并且不与 \code{in/out} 的访问产生别名关系，它可以把调用外提。若 \code{scale()} 可能读全局变量、访问 volatile、抛异常或修改 \code{out} 指向的数据，外提就不安全。报告不能只说“编译器没有优化”，要说明阻止外提的是副作用、异常、别名还是可见调用边界。
+
+\subsection{向量化：不是把标量循环自动乘以寄存器宽度}
+
+向量化需要证明迭代之间没有破坏语义的数据依赖。下面两段循环形状相似，但性质不同：
+
+\begin{lstlisting}[language=C++]
+// 容易向量化：每次迭代读写不同元素
+for (int i = 0; i < n; ++i) {
+    y[i] = a * x[i] + y[i];
+}
+
+// 前缀和：后一次依赖前一次
+for (int i = 1; i < n; ++i) {
+    y[i] += y[i - 1];
+}
+\end{lstlisting}
+
+前者是典型 map 形状；后者是递推，不能简单按 lane 并行。即使前者也要处理别名：如果 \code{x} 和 \code{y} 指向重叠区域，重排 load/store 可能改变结果。编译器可能生成运行时别名检查，也可能拒绝向量化。高质量报告要保存 vectorization remark、汇编和尾部路径，而不只看耗时。
+
+\section{别名分析：优化器为什么敢或不敢重排}
+
+别名分析回答“两个内存访问是否可能指向同一对象”。这是性能和正确性的交叉点。若编译器知道两个指针不别名，就能更大胆地缓存值、重排 load/store 和向量化；若不能证明，就必须保守。
+
+\begin{lstlisting}[language=C++,caption={别名会阻止简单缓存}]
+void add_arrays(float* out, const float* a, const float* b, int n)
+{
+    for (int i = 0; i < n; ++i) {
+        out[i] = a[i] + b[i];
+    }
+}
+\end{lstlisting}
+
+人通常假设 \code{out/a/b} 是三段不同数组，但函数签名没有表达这个事实。C 的 \code{restrict}、某些编译器扩展、\code{span} 加接口约束、运行时检查或更高层 descriptor，都可以提供别名证据。AI tensor runtime 里，memory planner 也必须记录 buffer 区间、lifetime 和 alias set，否则编译器或手写 kernel 都无法安全复用内存。
+
+\subsection{strict aliasing 和 effective type}
+
+严格别名规则不是书面主义，它直接影响机器码。若代码通过不兼容类型的指针读写同一对象，优化器可能假设这些访问不别名，从而缓存旧值或重排访问。例外包括 \code{char/std::byte} 访问对象表示、某些标准允许的类型关系和显式构造的对象生命周期边界。错误代码在 \code{-O0} 下能跑，不代表在优化构建下有语义。
+
+\begin{warningbox}
+不要用“我在内存里看到字节就是这样”反驳优化器。C++ 程序首先受语言对象模型约束；机器内存只是实现这个抽象的一种方式。若源码越过对象生命周期、类型访问或对齐边界，优化器可以基于语言前提生成与你直觉不同的机器码。
+\end{warningbox}
+
+\section{UB 到汇编变化：报告必须能闭合}
+
+有符号溢出、越界访问、悬空指针、错误别名、未初始化读取和对象生命周期错误，都可能给优化器释放自由度。报告这类问题时，不应只贴“优化后结果错了”，而要沿下面链路闭合：
+
+\begin{lstlisting}[numbers=none,caption={UB 优化事故报告模板}]
+ub_optimization_case:
+  source_snippet
+  language_rule
+  compiler_version_and_flags
+  sanitizer_result
+  ir_before_optimization
+  ir_after_optimization
+  assembly_difference
+  observed_output_O0
+  observed_output_O2
+  corrected_source
+  corrected_ir_or_assembly_summary
+\end{lstlisting}
+
+例如 signed overflow 的关键不是“CPU 加法会回绕”，而是 C++ 允许优化器假设正确程序不会发生 signed overflow。若需要回绕语义，应使用无符号整数、显式溢出检查或编译器提供的 checked arithmetic。若只是写 \code{int} 然后依赖二进制补码回绕，源码层已经把自己放在了不稳定地带。
+
+\section{真实证据命令：保存输入和边界}
+
+下面是一组适合第一册实验的命令形状。它们是公开工具链方法，不绑定某台机器。
+
+\begin{lstlisting}[language=bash,caption={保存预处理、IR、汇编和目标文件证据}]
+clang++ -std=c++20 -O2 -Wall -Wextra -E add.cpp -o add.ii
+clang++ -std=c++20 -O2 -S -emit-llvm add.cpp -o add.ll
+clang++ -std=c++20 -O2 -S add.cpp -o add.s
+clang++ -std=c++20 -O2 -c add.cpp -o add.o
+llvm-objdump -dr add.o > add.objdump.txt
+readelf -s add.o > add.symbols.txt
+readelf -r add.o > add.relocations.txt
+\end{lstlisting}
+
+若使用 GCC，可以保存 GIMPLE dump：
+
+\begin{lstlisting}[language=bash,caption={GCC/GIMPLE 证据形态}]
+g++ -std=c++20 -O2 -fdump-tree-all -c add.cpp -o add.o
+objdump -dr add.o > add.objdump.txt
+readelf -s add.o > add.symbols.txt
+\end{lstlisting}
+
+不要在正文里把某一次机器输出神化成普遍规律。编译器版本、目标三元组、优化级别、标准库、目标 CPU 和 flags 都会改变结果。书稿里的证据应写成“这次构建看到的事实”，并保留边界。
+
+\section{优化报告的最低验收}
+
+一份合格的优化器报告至少回答七个问题：
+
+\begin{enumerate}
+  \item 源码的语言语义是什么，是否存在 UB 或实现定义行为。
+  \item 前端看到的类型、对象和调用边界是什么。
+  \item IR 中有哪些 load、store、call、branch、phi 和 metadata。
+  \item 关键 pass 改写了什么，依据是什么。
+  \item 汇编是否体现了这些改写。
+  \item 调试信息、栈展开或异常路径是否受到影响。
+  \item 修复或优化后的代码如何用 sanitizer、oracle 和 benchmark 证明。
+\end{enumerate}
+
+\begin{keyidea}
+第一册到这里才真正闭合：源码不是机器码，IR 不是汇编，语言 UB 不是硬件异常，优化不是玄学。读者必须能把一个结论从 C++ 规则追到 IR，再追到汇编和运行时证据。
+\end{keyidea}
+
+\section{实验与习题}
+
+实验一：选择一个包含分支的小函数，分别保存 \code{-O0} 和 \code{-O2} 的 LLVM IR 与汇编。指出哪些局部变量消失、哪些分支被折叠、哪些 load/store 被提升或删除。
+
+实验二：构造一个 benchmark 循环，先让结果不被消费，再加入 checksum。比较 IR 和汇编中循环是否存在，并解释为什么。
+
+实验三：写一个可能 signed overflow 的函数。用 sanitizer 捕获问题，再改成无符号或显式检查版本。报告源码、IR、汇编和输出差异。
+
+实验四：写两个数组相加函数，一个没有别名约束，一个提供明确 non-alias 证据。保存 vectorization remark 和汇编，说明编译器是否生成运行时别名检查。
+
+验收标准：报告不能只写“编译器优化了”。必须能指出优化器使用的语言前提、IR 证据、pass 结果、汇编变化和未验证边界。

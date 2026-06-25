@@ -1,0 +1,190 @@
+\section{真实模型加载闭环：Tokenizer、权重格式与首 token trace}
+
+\section{为什么真实模型加载是第三册的分水岭}
+
+第三册已经有 tensor、KV cache、量化、IR、runtime 和 backend 账本。但如果模型资产仍然停留在手写 manifest 或 tiny fixture，读者还没有真正进入 AI Infra。真实推理系统的第一道工业边界，是把磁盘上的 tokenizer、config、权重分片、量化 metadata 和 chat template 变成一个可验证的 executable plan。任何一个字段错了，后面的 kernel 再快也只是更快地产生错误 logits。
+
+本章目标是建立“真实模型加载闭环”的验收标准：
+
+\begin{lstlisting}[numbers=none,caption={真实模型加载闭环}]
+model directory or package
+  -> tokenizer contract
+  -> config and architecture contract
+  -> tensor table and weight shards
+  -> quant descriptor
+  -> name mapping and shape verifier
+  -> typed graph
+  -> memory map or staged load
+  -> first token trace
+  -> logits oracle
+\end{lstlisting}
+
+完成这条链路以后，第三册才从“推理原理书稿”进入“能训练 AI Infra 工程能力”的阶段。
+
+\section{Tokenizer 是模型合同的一部分}
+
+Tokenizer 不是服务边缘的小工具。它决定 token id、special token、BOS/EOS、padding、chat template、位置编号和 embedding 行索引。tokenizer 版本变化，可能让同一个 prompt 变成不同 token 序列；chat template 变化，可能让角色、换行和特殊标记不同；special token id 错，可能直接访问错误 embedding 行。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+字段 & 必须验证什么 & 错误后果 \\
+\midrule
+vocab size & embedding/lm head 行数匹配 & 越界或 logits 维度错 \\
+token id mapping & special token id 稳定 & BOS/EOS/UNK 错误 \\
+normalizer & 文本归一化规则 & 同一文本 token 不同 \\
+pre-tokenizer & 空格、字节、unicode 处理 & prompt 重放失败 \\
+chat template & role 到文本的展开规则 & 对话语义漂移 \\
+padding side & position id 和 mask & RoPE/KV 位置错 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+报告不能只写“加载 tokenizer 成功”。它要固定一个 prompt fixture，输出 token ids、special token 位置、chat template 展开文本 hash 和 tokenizer 配置 hash。若 tokenizer.json、SentencePiece model 或 GGUF 内嵌 tokenizer 互相冲突，verifier 必须拒绝或明确选择优先级。
+
+\section{GGUF、safetensors 和分片权重}
+
+GGUF 更像本地推理包：metadata、tokenizer、tensor table 和量化类型常放在同一文件中。safetensors 更像安全 tensor 容器：header 描述 dtype、shape 和 data offsets，权重可能分片，config 和 tokenizer 通常在旁边文件中。两者都不是“读一堆 float”这么简单。
+
+\begin{lstlisting}[numbers=none,caption={模型资产清单}]
+model_asset:
+  format: gguf / safetensors / custom_fixture
+  architecture: llama_like / qwen_like / other
+  config:
+    layers
+    hidden
+    intermediate
+    attention_heads
+    kv_heads
+    rope_theta
+    vocab_size
+  tokenizer:
+    source
+    vocab_hash
+    chat_template_hash
+  tensors:
+    name
+    dtype
+    shape
+    data_offset
+    shard_id
+    quant_type
+    checksum
+\end{lstlisting}
+
+真实加载器最容易错的是名字映射。不同生态对同一权重可能命名不同：\code{layers.0.attention.wq.weight}、\code{model.layers.0.self\_attn.q\_proj.weight}、\code{blk.0.attn\_q.weight}。加载器不能靠字符串猜完就算成功；它要把每个外部 tensor 映射到内部 graph value，并记录 unmapped、duplicate、shape mismatch、dtype mismatch 和 transpose requirement。
+
+\section{shape verifier 要从 config 推导，而不是照抄文件}
+
+验证器不能只检查“文件里写了 shape”。它要从模型 config 推导每个 tensor 的期望 shape，再和文件形状比对。例如 decoder-only GQA 模型中：
+
+\begin{lstlisting}[numbers=none,caption={LLaMA-like shape 推导}]
+hidden = H
+intermediate = I
+layers = L
+query_heads = QH
+kv_heads = KVH
+head_dim = H / QH
+
+tok_embeddings.weight: [vocab, H]
+layers.i.attn.wq.weight: [QH * head_dim, H]
+layers.i.attn.wk.weight: [KVH * head_dim, H]
+layers.i.attn.wv.weight: [KVH * head_dim, H]
+layers.i.attn.wo.weight: [H, H]
+layers.i.ffn.w1.weight: [I, H]
+layers.i.ffn.w2.weight: [H, I]
+layers.i.ffn.w3.weight: [I, H]
+output.weight: [vocab, H]
+\end{lstlisting}
+
+如果 \code{H \% QH != 0}，\code{head\_dim} 不合法；如果 \code{KVH} 不能整除或被 \code{QH} 映射，GQA 关系不合法；如果 vocab 与 tokenizer 不一致，embedding 和 logits 语义不合法。verifier 应输出诊断，而不是让后端 kernel 在运行时越界。
+
+\section{mmap、lazy load 和 prepare 的边界}
+
+真实模型通常很大。加载策略至少有三类：一次性读入内存，mmap 文件并按需触页，mmap 后 prepare 阶段主动触碰和打包。mmap 成功不代表权重已经进入内存；第一次 decode 若触发大量缺页，会把 cold fault 混进 TPOT。prepare 阶段若做 packed weight、NUMA first-touch、checksum 和量化 metadata 解析，也必须和 request latency 分开报告。
+
+\begin{lstlisting}[numbers=none,caption={加载阶段边界}]
+OpenPackage
+  -> ParseMetadata
+  -> VerifyTokenizerAndConfig
+  -> BuildTensorTable
+  -> MapOrReadWeights
+  -> VerifyShapesAndDTypes
+  -> BuildTypedGraph
+  -> PreparePackedWeights
+  -> WarmPagesIfRequired
+  -> ReadyForPrefill
+\end{lstlisting}
+
+服务报告要区分 load time、prepare time、first prefill time、steady decode time。若把 prepare 放进第一个请求，TTFT 会很高；若把 prepare 从报告中删掉，系统容量和冷启动成本又被隐藏。正确做法是两个数字都保留。
+
+\section{首 token trace：加载闭环的最终证据}
+
+真实加载闭环的第一份硬证据，不是回答自然语言问题，而是固定 prompt 的首 token trace。它应该记录每层关键中间值的 shape、dtype、layout、checksum 或小片段，以及最终 logits/top-k。trace 不需要保存巨大 tensor，但必须足以定位第一个偏离点。
+
+\begin{lstlisting}[numbers=none,caption={first token trace 字段}]
+first_token_trace:
+  model_id
+  asset_hashes
+  tokenizer_hash
+  config_hash
+  prompt_text_hash
+  token_ids
+  backend_plan
+  for each layer:
+    rmsnorm_checksum
+    qkv_shape_dtype_layout
+    rope_position
+    kv_append_slot
+    attention_score_summary
+    mlp_checksum
+  logits:
+    shape
+    dtype
+    checksum
+    top_k
+  sampler:
+    temperature
+    seed
+    selected_token
+\end{lstlisting}
+
+如果首 token trace 能稳定复现，后续优化才有基准。换 tokenizer、换权重格式、换量化 profile、换 backend，都应先对齐这个 trace。否则“生成结果看起来差不多”无法支撑工程判断。
+
+\section{错误案例库}
+
+\begin{center}
+\small
+\begin{tabular}{p{0.26\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+错误 & 现象 & 应有诊断 \\
+\midrule
+tokenizer vocab 与 embedding 不一致 & 访问越界或 logits 维度错 & 报告两者来源和实际值 \\
+chat template 缺失 & 对话 prompt 语义不同 & 报告模板 hash 和展开文本 hash \\
+Q/K/V shape 映射错 & shape 可能仍能乘，但 head 语义错 & 指出 layer、tensor、期望 shape \\
+RoPE theta 缺失或默认错 & 短 prompt 近似，长上下文漂移 & 报告 config 来源和默认策略 \\
+weight transpose 方向错 & logits 大幅偏离 & name mapping 中记录 layout 转换 \\
+量化 group size 错 & 输出可运行但误差大 & QuantDesc scale count 失败 \\
+mmap 冷触页混入请求 & 首次 TTFT 异常高 & load/prepare/request 分段报告 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{验收标准}
+
+第三册的真实模型加载闭环至少要交付：
+
+\begin{enumerate}
+  \item tokenizer fixture：文本、展开文本 hash、token ids、special token 位置。
+  \item asset manifest：config、tensor table、dtype、shape、offset、checksum。
+  \item name mapping report：外部 tensor 到内部 graph value 的映射。
+  \item shape verifier：正例通过，坏例准确拒绝。
+  \item load/prepare/request 分段时间。
+  \item first token trace：中间 checkpoint、logits top-k 和 sampler 状态。
+  \item 回归门禁：tokenizer、config、权重、量化和 backend 任一变化都触发 trace 对比。
+\end{enumerate}
+
+\begin{keyidea}
+真实模型加载不是附属功能，而是 AI Infra 的入口合同。没有 tokenizer、权重格式、shape verifier 和首 token trace，后端优化没有可信基线。
+\end{keyidea}
