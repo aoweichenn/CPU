@@ -68,7 +68,7 @@ make text-target
 - 核心算法主线：`source/latex/chapters/part02-core-algorithms/`
 - 题单地图：`materials/problem-map.md`
 - 写作标准：`materials/writing-standard.md`
-- 示例代码：`labs/cpp20-examples/`
+- 示例代码：`labs/cpp20-examples/`，覆盖双指针、滑动窗口、前缀和哈希计数和 BFS。
 
 ## 质量规则
 

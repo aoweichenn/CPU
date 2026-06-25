@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdint>
 #include <limits>
 #include <stdexcept>
 #include <unordered_map>
@@ -106,6 +107,45 @@ int min_subarray_len_sliding_window(int target, const std::vector<int>& nums)
     }
 
     return best == std::numeric_limits<int>::max() ? 0 : best;
+}
+
+int subarray_sum_equals_k_bruteforce(const std::vector<int>& nums, int target)
+{
+    int answer_count = 0;
+
+    for (int left = 0; left < static_cast<int>(nums.size()); ++left) {
+        std::int64_t sum = 0;
+        for (int right = left; right < static_cast<int>(nums.size()); ++right) {
+            sum += nums[right];
+            if (sum == target) {
+                ++answer_count;
+            }
+        }
+    }
+
+    return answer_count;
+}
+
+int subarray_sum_equals_k_prefix_hash(const std::vector<int>& nums, int target)
+{
+    std::unordered_map<std::int64_t, int> prefix_count;
+    prefix_count.reserve(nums.size() + 1);
+    prefix_count.emplace(0, 1);
+
+    std::int64_t prefix_sum = 0;
+    int answer_count = 0;
+
+    for (const int value : nums) {
+        prefix_sum += value;
+        const auto found =
+            prefix_count.find(prefix_sum - static_cast<std::int64_t>(target));
+        if (found != prefix_count.end()) {
+            answer_count += found->second;
+        }
+        ++prefix_count[prefix_sum];
+    }
+
+    return answer_count;
 }
 
 int longest_substring_without_repeat_bruteforce(const std::string& s)

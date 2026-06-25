@@ -70,8 +70,26 @@ def leetcode_title(problem: Problem) -> str:
     return f"LeetCode {problem.number} {problem.title}"
 
 
+def label_leetcode_reference(text: str) -> str:
+    stripped = text.lstrip()
+    if stripped.startswith("LeetCode "):
+        return text
+    if stripped.startswith("剑指 56 数组中数字出现次数"):
+        return text[: len(text) - len(stripped)] + "LeetCode 剑指 Offer 56-I 数组中数字出现次数"
+    if re.match(r"^\d{1,4}(?=\s+)", stripped):
+        return text[: len(text) - len(stripped)] + "LeetCode " + stripped
+    return text
+
+
+def label_leetcode_references(text: str) -> str:
+    parts = re.split(r"([、，,；;])", text)
+    for index in range(0, len(parts), 2):
+        parts[index] = label_leetcode_reference(parts[index])
+    return "".join(parts)
+
+
 def label_leetcode_paragraph(paragraph: str) -> str:
-    return re.sub(r"^(\d+)\s+", r"LeetCode \1 ", paragraph)
+    return label_leetcode_reference(paragraph)
 
 
 def problem_sort_key(problem: Problem) -> tuple[int, str]:
@@ -1322,6 +1340,7 @@ def family_scenarios(family_key: str, family: Family) -> str:
     ]
     for title, condition, method, cases, caution in scenarios:
         lines.append(f"\\textbf{{{escape_text(title)}。}}")
+        cases = label_leetcode_references(cases)
         lines.append(
             escape_text(
                 f"判断条件：{condition}。处理方式：{method}。代表案例：{cases}。风险点：{caution}。"
@@ -1371,8 +1390,6 @@ def write_deep_sections() -> None:
     for filename, title, paragraphs in DEEP_SECTIONS:
         body = [f"\\section{{{escape_text(title)}}}", ""]
         for paragraph in paragraphs:
-            if filename == "generated-advanced-problem-cards.tex":
-                paragraph = label_leetcode_paragraph(paragraph)
             body.append(escape_text(paragraph))
             body.append("")
         body.append("\\begin{principlebox}{专题复盘要求}")
@@ -1472,6 +1489,8 @@ def write_extra_lectures() -> None:
     for filename, title, paragraphs in EXTRA_LECTURES:
         body = [f"\\section{{{escape_text(title)}}}", ""]
         for paragraph in paragraphs:
+            if filename == "generated-advanced-problem-cards.tex":
+                paragraph = label_leetcode_paragraph(paragraph)
             body.append(escape_text(paragraph))
             body.append("")
         body.append("\\begin{principlebox}{本节复盘}")

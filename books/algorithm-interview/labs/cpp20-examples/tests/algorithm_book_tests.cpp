@@ -41,6 +41,20 @@ void test_min_subarray_len()
     require(algobook::min_subarray_len_sliding_window(100, nums) == 0, "min_subarray_len no answer");
 }
 
+void test_subarray_sum_equals_k()
+{
+    const std::vector<int> sample = {1, 1, 1};
+    require(algobook::subarray_sum_equals_k_bruteforce(sample, 2) == 2, "subarray_sum brute sample");
+    require(algobook::subarray_sum_equals_k_prefix_hash(sample, 2) == 2, "subarray_sum prefix sample");
+
+    const std::vector<int> with_negative = {1, -1, 0, 2, -2, 2};
+    require(algobook::subarray_sum_equals_k_bruteforce(with_negative, 0) == 7, "subarray_sum brute negatives");
+    require(algobook::subarray_sum_equals_k_prefix_hash(with_negative, 0) == 7, "subarray_sum prefix negatives");
+
+    const std::vector<int> zeroes = {0, 0, 0};
+    require(algobook::subarray_sum_equals_k_prefix_hash(zeroes, 0) == 6, "subarray_sum prefix zeroes");
+}
+
 void test_longest_substring()
 {
     require(algobook::longest_substring_without_repeat_bruteforce("abcabcbb") == 3, "substring bruteforce sample");
@@ -92,6 +106,7 @@ int main()
     test_two_sum();
     test_container_with_most_water();
     test_min_subarray_len();
+    test_subarray_sum_equals_k();
     test_longest_substring();
     test_oranges_rotting();
     test_number_of_islands();
