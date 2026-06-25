@@ -71,7 +71,7 @@ build/lab00-release/bin/cpu-volume-1/lab00/
 ## 写作入口
 
 - 正式书稿：`source/latex/main.tex`
-- 全书蓝图：`source/latex/outline/master-outline.md`
+- 正式主稿：`source/latex/main.tex`
 - 16 周计划：`materials/x86_64_hpc_ai_16_week_bootcamp.md`
 - 扩展手册：`materials/x86_64_hpc_ai_detailed_curriculum.md`
 - 长期计划：`materials/x86_64_hpc_ai_master_plan.md`

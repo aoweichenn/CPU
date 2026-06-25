@@ -235,6 +235,189 @@ readelf -s add.o > add.symbols.txt
 
 不要把某一次机器输出神化成普遍规律。编译器版本、目标三元组、优化级别、标准库、目标 CPU 和 flags 都会改变结果。报告中的证据应写成“这次构建看到的事实”，并保留边界。
 
+\section{TinyTensor 全链路案例：从 C++ 语义到进程证据}
+
+\code{add\_i32} 适合解释最小 ABI 和重定位，但它太小，暴露不出真实工程里的对象布局、循环优化、别名、异常边界、调试信息和 benchmark 删除问题。第一册还需要一个稍大的闭环案例：\code{TensorViewF32} 加一个 \code{linear\_ref}。这个案例应贯穿后续实验，而不是每章换一个新玩具。
+
+\begin{lstlisting}[language=C++,caption={TinyTensor 的最小源程序骨架}]
+struct TensorViewF32 {
+    float* data;
+    std::uint64_t rows;
+    std::uint64_t cols;
+    std::uint64_t stride;
+};
+
+extern "C" void linear_ref(TensorViewF32 x,
+                           TensorViewF32 w,
+                           TensorViewF32 y)
+{
+    for (std::uint64_t m = 0; m < x.rows; ++m) {
+        for (std::uint64_t n = 0; n < w.cols; ++n) {
+            float acc = 0.0f;
+            for (std::uint64_t k = 0; k < x.cols; ++k) {
+                acc += x.data[m * x.stride + k] *
+                       w.data[k * w.stride + n];
+            }
+            y.data[m * y.stride + n] = acc;
+        }
+    }
+}
+\end{lstlisting}
+
+这段代码要回答的不是“矩阵乘最快怎样写”，而是“同一个 C++ 对象怎样穿过编译器、ABI、对象文件、loader、debugger 和测量”。报告应按下面矩阵闭合。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.36\linewidth}p{0.31\linewidth}}
+\toprule
+层次 & 必须保存的证据 & 失败案例 \\
+\midrule
+源码语义 & \code{TensorViewF32} 定义、输入 fixture、checksum oracle & \code{stride < cols} 越界但小输入未崩溃 \\
+前端/AST & 预处理文件、AST dump、模板和宏展开边界 & 宏重复求值或头文件配置改变语义 \\
+IR/优化 & \code{-O0/-O2} LLVM IR、\code{mem2reg}、DCE、vectorize remark & 输出未消费导致 hot loop 被删除 \\
+ABI & \code{linear\_ref} 参数传递、结构体按值还是内存传递 & 手写 wrapper 误判参数位置 \\
+目标文件 & \code{nm}、\code{objdump}、\code{readelf -r}、二进制 hash & 把重定位占位地址当作最终调用目标 \\
+进程运行 & \filepath{/proc/<pid>/maps}、GDB 断点、buffer 地址 & 把虚拟地址误认为物理地址 \\
+调试/展开 & DWARF、CFI、变量 location、backtrace 质量 & \code{-O2} 下变量 optimized out 被误判为丢值 \\
+测量 & correctness、timed region、CSV、反汇编摘要、环境字段 & 把初始化、I/O、首次缺页算入 kernel 时间 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+推荐的命令分三组。第一组固定前端和 IR：
+
+\begin{lstlisting}[numbers=none,caption={TinyTensor 前端和 IR 证据}]
+clang++ -std=c++20 -O2 -Wall -Wextra -E tiny_tensor.cpp \
+  -o reports/tiny_tensor.ii
+clang++ -std=c++20 -O2 -Xclang -ast-dump -fsyntax-only \
+  tiny_tensor.cpp > reports/tiny_tensor.ast.txt
+clang++ -std=c++20 -O0 -S -emit-llvm tiny_tensor.cpp \
+  -o reports/tiny_tensor_O0.ll
+clang++ -std=c++20 -O2 -S -emit-llvm tiny_tensor.cpp \
+  -o reports/tiny_tensor_O2.ll
+\end{lstlisting}
+
+第二组固定目标文件和二进制身份：
+
+\begin{lstlisting}[numbers=none,caption={TinyTensor 对象文件和 ELF 证据}]
+clang++ -std=c++20 -O2 -g -c tiny_tensor.cpp \
+  -o build/tiny_tensor.o
+clang++ -std=c++20 -O2 -g tiny_tensor.cpp \
+  -o build/tiny_tensor
+sha256sum build/tiny_tensor build/tiny_tensor.o \
+  > reports/tiny_tensor.sha256
+nm -C build/tiny_tensor.o > reports/tiny_tensor.nm.txt
+readelf -h -l -S -s -r build/tiny_tensor \
+  > reports/tiny_tensor.readelf.txt
+objdump -drwC -Mintel build/tiny_tensor \
+  > reports/tiny_tensor.objdump.txt
+\end{lstlisting}
+
+第三组固定运行时边界：
+
+\begin{lstlisting}[numbers=none,caption={TinyTensor 运行时和测量证据}]
+./build/tiny_tensor --fixture fixtures/linear_2x8x6.json --check
+./build/tiny_tensor --fixture fixtures/linear_2x8x6.json \
+  --bench --warmup 20 --repeat 200 \
+  --csv reports/tiny_tensor_bench.csv
+./build/tiny_tensor --print-maps > reports/tiny_tensor.maps.txt
+gdb -q ./build/tiny_tensor \
+  -ex 'break linear_ref' -ex run -ex 'info registers' \
+  -ex 'bt' -ex quit > reports/tiny_tensor.gdb.txt
+\end{lstlisting}
+
+这三组命令训练一个原则：同一个结论必须能跨层对齐。例如，“优化器把局部变量放进寄存器”要能在 IR 中看到 \code{alloca} 消失，在汇编中看到内层累加器寄存器，在 GDB 中承认源码变量可能没有稳定地址；“benchmark 测的是 hot loop”要能在反汇编中定位循环，在 CSV 中区分 warmup 与 repeat，在报告中说明 fixture、checksum 和二进制 hash。
+
+\subsection{运行时深水区：同一个案例还要穿过这些边界}
+
+源码、IR、汇编和 ELF 只说明程序怎样被构建；真正运行时还会经过 loader、分配器、虚拟内存、系统调用、线程库、调试信息和异常展开。第一册不要求读者实现这些系统，但要求能把它们从报告里分出来。TinyTensor 的完整证据包应继续扩展为下面几组字段：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+边界 & 推荐证据 & 不能据此夸大的结论 \\
+\midrule
+动态链接 & \code{readelf -d/-r}、\code{LD\_DEBUG=libs,bindings}、PLT/GOT 反汇编 & 看到 PLT 不等于每次调用都 lazy bind \\
+启动与构造 & \code{\_start}、\code{\_\_libc\_start\_main}、\code{.init\_array}、constructor trace & \code{main} 前成本不能算进 hot kernel \\
+TLS & \code{readelf -s} 中 TLS 符号、访问反汇编、线程数对照 & TLS 快慢取决于模型和动态库位置 \\
+分配器 & \code{strace brk/mmap/munmap}、\filepath{/proc/<pid>/smaps}、ASan 报告 & 没有 syscall 不代表没有分配成本 \\
+缺页与 COW & minor/major fault、maps/smaps、first-touch 对照 & mmap 成功不代表页面已经常驻 \\
+syscall/vDSO & \code{strace -T}、\code{clock\_gettime} 路径、errno/partial I/O & syscall 时间不是 CPU kernel 时间 \\
+futex/阻塞 & \code{strace -e futex}、context switch、等待谓词 & futex 只证明睡眠路径，不证明同步设计正确 \\
+DWARF/unwind & \code{readelf --debug-dump=frames}、GDB backtrace、frame-pointer 对照 & backtrace 好看不等于变量都有稳定地址 \\
+异常路径 & RAII cleanup trace、unwind table、异常穿过 wrapper 的策略 & 异常不是普通跳转，手写汇编不能随意穿过 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的用法是“为结论选择证据”，不是一次实验全跑。若要解释首次请求慢，优先看动态链接、page fault、allocator 和 cold cache；若要解释 backtrace 断裂，优先看 frame pointer、DWARF CFI 和手写汇编；若要解释 benchmark 抖动，优先看 syscall、futex、page fault 和频率状态。不要把这些边界混成一句“系统开销”。
+
+\begin{lstlisting}[numbers=none,caption={TinyTensor 运行时边界报告模板}]
+runtime_boundary_report:
+  binary_identity:
+    build_id
+    sha256
+    compiler_and_flags
+  loader:
+    interpreter
+    shared_libraries
+    relocations
+    lazy_binding_policy
+  process_map:
+    text_mapping
+    heap_mapping
+    stack_mapping
+    mmap_weight_or_fixture_mapping
+  allocator:
+    allocation_sites
+    brk_mmap_munmap_seen
+    first_touch_policy
+    rss_before_after
+  syscall:
+    observed_syscalls
+    errno_or_partial_io
+    vdso_fast_path_if_relevant
+  blocking:
+    futex_or_poll_seen
+    voluntary_context_switches
+    wait_condition
+  debug_unwind:
+    frame_pointer_policy
+    eh_frame_present
+    backtrace_quality
+  conclusion:
+    supported_facts
+    likely_explanation
+    unsupported_claims
+\end{lstlisting}
+
+例如，若 \code{linear\_ref} 第一次运行比后续慢，报告不能直接写“cache 冷”。至少要排除三类更基础的解释：第一，是否有首次动态绑定或共享库初始化；第二，输入、输出或权重 buffer 是否首次触页；第三，timed region 是否包含 allocator 和文件 I/O。只有这些边界被记录后，cache/TLB 的解释才有资格进入第二册的性能模型。
+
+\subsection{sanitizer、fuzz 和 CI：第一册就要建立的工程门槛}
+
+底层学习不能等到第三册才补工程验证。第一册的 TinyTensor 至少要有三类自动化门禁。
+
+\begin{lstlisting}[numbers=none,caption={TinyTensor 的最低 CI 矩阵}]
+ci_debug_asan_ubsan:
+  -O1 -g -fsanitize=address,undefined
+  fixtures: empty, 1x1, tail, bad_stride, overflow_shape
+
+ci_release_oracle:
+  -O2 -g
+  compare reference checksum and candidate checksum
+  save binary hash and objdump summary
+
+ci_fuzz_shape:
+  random rows, cols, stride, alignment, seed
+  reject invalid shape before running kernel
+  preserve failing seed as regression fixture
+\end{lstlisting}
+
+Sanitizer 的作用是把对象生命周期、越界、未对齐和整数边界尽早变成确定性失败；fuzz 的作用是让 shape、stride、tail、空输入、奇数维度和异常输入持续攻击接口；CI 的作用是保证每次改动都能重新生成同一类证据。性能数字不适合在所有 CI 环境中硬比较，但 correctness、sanitizer、fuzz seed、二进制身份和反汇编摘要可以作为最低门槛。
+
+不要把这些写成“以后再做”。一段底层代码如果没有 sanitizer 和失败 fixture，只能证明它在当前输入上看起来能跑；一段优化代码如果没有 oracle 和二进制身份，只能证明它输出了一个时间数字。第一册的出口报告应把工具链、运行时和验证系统一起交付。
+
 \section{优化报告的最低验收}
 
 一份合格的优化器报告至少回答七个问题：

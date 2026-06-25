@@ -3,6 +3,8 @@ add_library(lcqi STATIC
     src/int8_kernels.cpp
     src/model.cpp
     src/reference_decoder.cpp
+    src/safetensors.cpp
+    src/tokenizer.cpp
 )
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
@@ -99,7 +101,7 @@ endif()
 add_test(NAME lcqi_tests COMMAND $<TARGET_FILE:lcqi_tests>)
 add_test(NAME lcqi_trace COMMAND $<TARGET_FILE:lcqi_trace>)
 set_tests_properties(lcqi_trace PROPERTIES
-    PASS_REGULAR_EXPRESSION "generated_token,3,-1,scalar,scalar,i32,generated,0,0,0"
+    PASS_REGULAR_EXPRESSION "tokenizer,0,-1,5,1,i32,contiguous,10,4,0;1;2;3;4"
 )
 add_test(NAME lcqi_ledger COMMAND $<TARGET_FILE:lcqi_ledger>)
 set_tests_properties(lcqi_ledger PROPERTIES

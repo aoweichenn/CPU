@@ -2,14 +2,18 @@
 #include <lcqi/int8_kernels.hpp>
 #include <lcqi/model.hpp>
 #include <lcqi/reference_decoder.hpp>
+#include <lcqi/safetensors.hpp>
+#include <lcqi/tokenizer.hpp>
 
 #include <array>
 #include <cmath>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <span>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
@@ -42,6 +46,15 @@ constexpr std::array<float, LCQI_REFERENCE_DECODER_VOCAB_SIZE> LCQI_REFERENCE_DE
 constexpr std::int32_t LCQI_REFERENCE_TRACE_TOKEN_COUNT = 3;
 constexpr std::int32_t LCQI_REFERENCE_TRACE_HIDDEN_SIZE = 4;
 constexpr std::int32_t LCQI_REFERENCE_TRACE_FIRST_TOKEN = 0;
+constexpr std::uint64_t LCQI_TOKENIZER_HASH_EXPECTED = 13452902845388333734ULL;
+constexpr std::int32_t LCQI_SAFETENSORS_PREFIX_BYTES = 8;
+constexpr std::int32_t LCQI_TEST_BYTE_BITS = 8;
+constexpr std::uint64_t LCQI_SAFETENSORS_VALID_PAYLOAD_BYTES = 48;
+constexpr std::uint64_t LCQI_SAFETENSORS_EMBED_BEGIN = 0;
+constexpr std::uint64_t LCQI_SAFETENSORS_EMBED_END = 24;
+constexpr std::uint64_t LCQI_SAFETENSORS_QPROJ_BEGIN = 24;
+constexpr std::uint64_t LCQI_SAFETENSORS_QPROJ_END = 48;
+constexpr unsigned int LCQI_BYTE_MASK = 0xFFU;
 
 struct KernelShapeCase {
     std::int32_t input_size = 0;
@@ -73,6 +86,38 @@ std::filesystem::path test_model_path() {
            "models" / "tiny_mlp_i8.txt";
 }
 
+std::filesystem::path test_tokenizer_path() {
+    return std::filesystem::path(__FILE__).parent_path().parent_path() /
+           "models" / "tiny_tokenizer.txt";
+}
+
+std::filesystem::path temp_file_path(const std::string& name) {
+    return std::filesystem::temp_directory_path() / name;
+}
+
+void write_le_u64(std::ofstream& output, std::uint64_t value) {
+    for (std::int32_t i = 0; i < LCQI_SAFETENSORS_PREFIX_BYTES; ++i) {
+        const char byte = static_cast<char>(
+            (value >> (LCQI_TEST_BYTE_BITS * i)) & LCQI_BYTE_MASK);
+        output.write(&byte, 1);
+    }
+}
+
+void write_safetensors_fixture(const std::filesystem::path& path,
+                               const std::string& header,
+                               std::uint64_t payload_bytes) {
+    std::ofstream output(path, std::ios::binary);
+    if (!output) {
+        throw std::runtime_error("cannot create safetensors test fixture");
+    }
+    write_le_u64(output, static_cast<std::uint64_t>(header.size()));
+    output.write(header.data(), static_cast<std::streamsize>(header.size()));
+    for (std::uint64_t i = 0; i < payload_bytes; ++i) {
+        const char byte = static_cast<char>(i & 0xFFU);
+        output.write(&byte, 1);
+    }
+}
+
 void test_tiny_mlp() {
     const lcqi::TinyMlpModel model = lcqi::load_model(test_model_path());
     require(model.input_size == LCQI_TEST_INPUT_SIZE, "input size mismatch");
@@ -94,6 +139,111 @@ void test_tiny_mlp() {
     require_close(hidden[0], LCQI_TEST_HIDDEN_0, "hidden 0 mismatch");
     require_close(hidden[1], LCQI_TEST_HIDDEN_1, "hidden 1 mismatch");
     require_close(hidden[2], LCQI_TEST_HIDDEN_2, "hidden 2 mismatch");
+}
+
+void test_tokenizer_contract() {
+    const lcqi::TokenizerModel tokenizer = lcqi::load_tokenizer(test_tokenizer_path());
+    require(tokenizer.bos_id == 0, "tokenizer BOS id mismatch");
+    require(tokenizer.eos_id == 4, "tokenizer EOS id mismatch");
+    require(tokenizer.unk_id == -1, "tokenizer UNK id mismatch");
+    require(tokenizer.chat_template_hash == "tiny-chat-template-v1",
+            "tokenizer template hash mismatch");
+
+    const std::vector<std::int32_t> token_ids =
+        lcqi::encode_prompt(tokenizer, "tok1 tok2 tok3");
+    const std::vector<std::int32_t> expected{0, 1, 2, 3, 4};
+    require(token_ids == expected, "tokenizer prompt ids mismatch");
+    require(lcqi::tokenizer_contract_hash(tokenizer) == LCQI_TOKENIZER_HASH_EXPECTED,
+            "tokenizer contract hash mismatch");
+}
+
+void test_tokenizer_rejects_unknown_without_unk() {
+    const lcqi::TokenizerModel tokenizer = lcqi::load_tokenizer(test_tokenizer_path());
+    bool threw = false;
+    try {
+        static_cast<void>(lcqi::encode_prompt(tokenizer, "tok1 missing_token"));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    require(threw, "tokenizer should reject unknown token when unk id is absent");
+}
+
+void test_safetensors_manifest_contract() {
+    const std::filesystem::path path =
+        temp_file_path("lcqi_safetensors_manifest_contract.safetensors");
+    const std::string header =
+        R"({"__metadata__":{"format":"lcqi-fixture"},"model.embed_tokens.weight":{"dtype":"F32","shape":[2,3],"data_offsets":[0,24]},"model.layers.0.attn.q_proj.weight":{"dtype":"F16","shape":[4,3],"data_offsets":[24,48]}})";
+    write_safetensors_fixture(path, header, LCQI_SAFETENSORS_VALID_PAYLOAD_BYTES);
+
+    const lcqi::SafeTensorManifest manifest = lcqi::load_safetensors_manifest(path);
+    std::filesystem::remove(path);
+
+    require(manifest.header_size == static_cast<std::uint64_t>(header.size()),
+            "safetensors header size mismatch");
+    require(manifest.data_start_offset ==
+                static_cast<std::uint64_t>(LCQI_SAFETENSORS_PREFIX_BYTES) +
+                    static_cast<std::uint64_t>(header.size()),
+            "safetensors data start mismatch");
+    require(manifest.metadata.size() == 1, "safetensors metadata count mismatch");
+    require(manifest.metadata[0].first == "format" &&
+                manifest.metadata[0].second == "lcqi-fixture",
+            "safetensors metadata mismatch");
+    require(manifest.tensors.size() == 2, "safetensors tensor count mismatch");
+
+    const lcqi::SafeTensorEntry* embedding =
+        manifest.find_tensor("model.embed_tokens.weight");
+    require(embedding != nullptr, "safetensors embedding tensor missing");
+    require(embedding->dtype == "F32", "safetensors embedding dtype mismatch");
+    require(embedding->shape == std::vector<std::int64_t>({2, 3}),
+            "safetensors embedding shape mismatch");
+    require(embedding->data_begin == LCQI_SAFETENSORS_EMBED_BEGIN &&
+                embedding->data_end == LCQI_SAFETENSORS_EMBED_END,
+            "safetensors embedding offset mismatch");
+    require(embedding->byte_size() ==
+                LCQI_SAFETENSORS_EMBED_END - LCQI_SAFETENSORS_EMBED_BEGIN,
+            "safetensors embedding byte size mismatch");
+
+    const lcqi::SafeTensorEntry* q_proj =
+        manifest.find_tensor("model.layers.0.attn.q_proj.weight");
+    require(q_proj != nullptr, "safetensors q projection tensor missing");
+    require(q_proj->dtype == "F16", "safetensors q projection dtype mismatch");
+    require(q_proj->data_begin == LCQI_SAFETENSORS_QPROJ_BEGIN &&
+                q_proj->data_end == LCQI_SAFETENSORS_QPROJ_END,
+            "safetensors q projection offset mismatch");
+}
+
+void test_safetensors_rejects_bad_offsets() {
+    const std::filesystem::path path =
+        temp_file_path("lcqi_safetensors_bad_offsets.safetensors");
+    const std::string header =
+        R"({"tensor":{"dtype":"F32","shape":[4],"data_offsets":[0,32]}})";
+    write_safetensors_fixture(path, header, 4);
+
+    bool threw = false;
+    try {
+        static_cast<void>(lcqi::load_safetensors_manifest(path));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    std::filesystem::remove(path);
+    require(threw, "safetensors parser should reject offsets beyond payload");
+}
+
+void test_safetensors_rejects_bad_dtype_shape_size() {
+    const std::filesystem::path path =
+        temp_file_path("lcqi_safetensors_bad_dtype_shape_size.safetensors");
+    const std::string header =
+        R"({"tensor":{"dtype":"F32","shape":[4],"data_offsets":[0,8]}})";
+    write_safetensors_fixture(path, header, 8);
+
+    bool threw = false;
+    try {
+        static_cast<void>(lcqi::load_safetensors_manifest(path));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    std::filesystem::remove(path);
+    require(threw, "safetensors parser should reject dtype/shape byte mismatch");
 }
 
 void test_reference_rms_norm() {
@@ -238,6 +388,11 @@ void test_packed_i8_kernel_matches_scalar() {
 int main() {
     try {
         test_tiny_mlp();
+        test_tokenizer_contract();
+        test_tokenizer_rejects_unknown_without_unk();
+        test_safetensors_manifest_contract();
+        test_safetensors_rejects_bad_offsets();
+        test_safetensors_rejects_bad_dtype_shape_size();
         test_reference_rms_norm();
         test_reference_rope();
         test_reference_kv_attention();

@@ -49,7 +49,6 @@ source/latex/
   chapters/
   appendices/
   backmatter/
-  outline/
 ```
 
 ## 排版规则
@@ -63,7 +62,7 @@ source/latex/
 - 提示、误区、深入理解等块使用黑灰教材风格，不使用彩色网页卡片。
 - 实验和习题块使用白底左线式材料块，避免大面积灰底和框套框。
 - 代码清单使用 Maple Mono NL NF CN，保持等宽缩进、细线分隔和长行换行标记。
-- EPUB 由 `scripts/build_epub.py` 从正式 LaTeX 源生成，导航只保留前置内容、部、章、附录和术语表，适合手机阅读；默认使用微信读书兼容模式，不嵌入本地字体文件。
+- EPUB 由 `scripts/build_epub.py` 从正式 LaTeX 源生成，导航只保留前置内容、部、章、附录和术语表，适合移动端阅读；默认使用微信读书兼容模式，不嵌入本地字体文件。
 
 ## 写作规则
 
@@ -81,7 +80,7 @@ source/latex/
 更详细规则见：
 
 - `books/cpu-volume-1/materials/drafts/book-style-guide.md`
-- `books/cpu-volume-1/source/latex/outline/book-architecture.tex`
+- `books/cpu-volume-1/source/latex/backmatter/capability-checklist.tex`
 
 ## 与 16 周计划的关系
 

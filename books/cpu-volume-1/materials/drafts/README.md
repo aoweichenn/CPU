@@ -5,7 +5,7 @@
 这个目录现在作为 Markdown 草稿和实验素材库保留。正式教材书稿已经迁移到：
 
 - `books/cpu-volume-1/source/latex/`
-- `books/cpu-volume-1/source/latex/outline/master-outline.md`
+- `books/cpu-volume-1/source/latex/main.tex`
 
 配套执行计划是：
 

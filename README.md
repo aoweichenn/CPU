@@ -182,7 +182,7 @@ books/<book-id>/
 
 - 第一册说明：`books/cpu-volume-1/README.md`
 - 正式 LaTeX 工程：`books/cpu-volume-1/source/latex/README.md`
-- 全书扩写蓝图：`books/cpu-volume-1/source/latex/outline/master-outline.md`
+- 正式主稿：`books/cpu-volume-1/source/latex/main.tex`
 - 16 周执行计划：`books/cpu-volume-1/materials/x86_64_hpc_ai_16_week_bootcamp.md`
 - Markdown 草稿素材：`books/cpu-volume-1/materials/drafts/README.md`
 - Lab 00：`books/cpu-volume-1/labs/lab00_benchmark_foundation/README.md`
@@ -191,7 +191,7 @@ books/<book-id>/
 
 - 第二册说明：`books/cpu-volume-2/README.md`
 - 原理卷正式主稿：`books/cpu-volume-2/source/latex/main.tex`
-- 全书结构：`books/cpu-volume-2/source/latex/outline/book-architecture.tex`
+- 实验路线：`books/cpu-volume-2/source/latex/appendices/app-a-lab-roadmap.tex`
 - 硬件执行模型：`books/cpu-volume-2/source/latex/chapters/part01-hardware-foundations/`
 - 单机高性能计算：`books/cpu-volume-2/source/latex/chapters/part02-single-node-hpc/`
 - 多线程与同步：`books/cpu-volume-2/source/latex/chapters/part03-concurrency-synchronization/`

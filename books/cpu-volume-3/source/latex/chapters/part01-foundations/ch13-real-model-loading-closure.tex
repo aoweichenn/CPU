@@ -1,4 +1,4 @@
-\section{真实模型加载闭环：Tokenizer、权重格式与首 token trace}
+\subsection*{真实模型加载闭环：Tokenizer、权重格式与首 token trace}
 
 \section{为什么真实模型加载是第三册的分水岭}
 
@@ -43,6 +43,51 @@ padding side & position id 和 mask & RoPE/KV 位置错 \\
 
 报告不能只写“加载 tokenizer 成功”。它要固定一个 prompt fixture，输出 token ids、special token 位置、chat template 展开文本 hash 和 tokenizer 配置 hash。若 tokenizer.json、SentencePiece model 或 GGUF 内嵌 tokenizer 互相冲突，verifier 必须拒绝或明确选择优先级。
 
+\subsection{当前 lab 的 tokenizer 合同}
+
+当前 \filepath{books/cpu-volume-3/labs/linux\_cpu\_inference} 已经把 tokenizer 从“正文要求”推进到可运行 fixture。它不是完整 BPE 或 SentencePiece 实现，而是一个最小合同：BOS/EOS、UNK 策略、chat template hash、词表、prompt fixture 和合同 hash。
+
+\begin{lstlisting}[numbers=none,caption={tiny tokenizer fixture 的核心字段}]
+LCQI_TOKENIZER_V1
+bos_id 0
+eos_id 4
+unk_id -1
+chat_template_hash tiny-chat-template-v1
+vocab_size 5
+vocab:
+  0 <bos>
+  1 tok1
+  2 tok2
+  3 tok3
+  4 <eos>
+\end{lstlisting}
+
+运行 \code{lcqi\_trace} 时，trace 会先输出完整 tokenizer 结果，再把 decoder 输入单独传给 reference decoder：
+
+\begin{lstlisting}[numbers=none,caption={tokenizer trace 的最小硬证据}]
+tokenizer,0,-1,5,1,i32,contiguous,10,4,0;1;2;3;4
+tokenizer_contract,0,-1,scalar,scalar,u64,fnv1a,13452902845388333734,0,tiny-chat-template-v1
+\end{lstlisting}
+
+这个设计故意把两层分开。Tokenizer 合同包含 BOS/EOS、template 和词表身份；decoder 合同只接收本次 tiny 模型需要的正文 token。真实 LLaMA/Qwen 类模型也要做同样分层：chat template、special token、padding、position id 和 decoder input ids 都要在 trace 中可见。否则换了 tokenizer 或 template 后，后端 kernel 仍然能运行，却已经不再处理同一个请求。
+
+下一步从 fixture 走向真实格式时，不应删除这个合同，而是扩展它：
+
+\begin{lstlisting}[numbers=none,caption={从 fixture 扩展到真实 tokenizer 的门禁}]
+tokenizer_gate:
+  tokenizer_source: tokenizer.json / sentencepiece.model / gguf metadata
+  version_or_hash:
+  normalizer:
+  pre_tokenizer:
+  special_tokens:
+  chat_template_hash:
+  prompt_fixture_ids:
+  detokenize_roundtrip:
+  embedding_vocab_match:
+\end{lstlisting}
+
+完整 BPE/SentencePiece 的复杂度在分词算法本身；工程风险在合同漂移。实验代码先固定合同，是为了让后续替换真实 tokenizer 时有可回归的出口。
+
 \section{GGUF、safetensors 和分片权重}
 
 GGUF 更像本地推理包：metadata、tokenizer、tensor table 和量化类型常放在同一文件中。safetensors 更像安全 tensor 容器：header 描述 dtype、shape 和 data offsets，权重可能分片，config 和 tokenizer 通常在旁边文件中。两者都不是“读一堆 float”这么简单。
@@ -74,6 +119,43 @@ model_asset:
 \end{lstlisting}
 
 真实加载器最容易错的是名字映射。不同生态对同一权重可能命名不同：\code{layers.0.attention.wq.weight}、\code{model.layers.0.self\_attn.q\_proj.weight}、\code{blk.0.attn\_q.weight}。加载器不能靠字符串猜完就算成功；它要把每个外部 tensor 映射到内部 graph value，并记录 unmapped、duplicate、shape mismatch、dtype mismatch 和 transpose requirement。
+
+\subsection{当前 lab 的 safetensors manifest gate}
+
+当前 lab 已经补了一个很小的 safetensors header 解析器。它不声称能加载完整 LLaMA/Qwen 权重，也不处理所有 JSON 细节；它只把真实模型格式最关键的目录事实落到可测试代码：header 长度、\code{\_\_metadata\_\_}、tensor name、dtype、shape、\code{data\_offsets}、payload 边界，以及 dtype/shape 推导出的字节数是否等于 offset 区间。
+
+\begin{lstlisting}[numbers=none,caption={safetensors manifest gate 的最小证据}]
+SafeTensorManifest:
+  header_size
+  data_start_offset
+  metadata:
+    format -> lcqi-fixture
+  tensors:
+    model.embed_tokens.weight:
+      dtype = F32
+      shape = [2, 3]
+      data_offsets = [0, 24]
+    model.layers.0.attn.q_proj.weight:
+      dtype = F16
+      shape = [4, 3]
+      data_offsets = [24, 48]
+\end{lstlisting}
+
+测试会运行时生成一个合法 fixture，并验证两个 tensor 的名称、dtype、shape 和 offset；还会生成 \code{data\_offsets} 超出 payload、dtype/shape 字节数不匹配的坏文件，要求加载器拒绝。这个 gate 的意义是把“权重格式导入”从口号压到第一层工程边界：任何后续 name mapping、shape verifier、mmap 或分片加载，都必须先建立可信 tensor table。若连 offset 范围和字节数都不检查，后端 kernel 读到的只是任意字节流。
+
+下一阶段应在这个 gate 上继续扩展，而不是绕开它：
+
+\begin{lstlisting}[numbers=none,caption={从 safetensors header 到真实加载器的下一层}]
+safetensors_manifest
+  -> shard index and tensor table merge
+  -> external name to canonical role mapping
+  -> config-derived expected shape
+  -> dtype and quant descriptor verification
+  -> mmap/read policy
+  -> first token trace
+\end{lstlisting}
+
+这样写能保持边界诚实：当前 lab 已经验证真实格式的目录合同，但还没有完成完整权重解释和首 token 真实模型 oracle。
 
 \section{shape verifier 要从 config 推导，而不是照抄文件}
 
