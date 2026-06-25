@@ -1,0 +1,507 @@
+\section{上层 AI 应用编排：RAG、Agent、工具和状态图}
+
+本册前面把本地推理引擎拆成 tokenizer、模型导入、KV cache、scheduler、backend 和 profiler。真实应用还会在引擎上面再叠一层：prompt template、retrieval、reranker、tool calling、agent loop、memory、stream callback、trace 和 evaluation。LangChain 类框架提供 agent harness 和模型/工具抽象，LangGraph 类运行时强调长时间、可恢复的状态图，LlamaIndex 类系统强调数据导入、索引、检索和 RAG 查询。名字会变，API 会变，但它们共同暴露的工程问题不会变：上层编排会改变 token、上下文、队列、KV 预算、质量和失败语义。
+
+因此 AI Infra 工程师不能只会写 decode kernel。一个 production request 到达模型前，可能已经执行过文档解析、chunk、embedding、向量检索、权限过滤、rerank、prompt packing、tool schema 验证和 agent checkpoint。若这些环节没有证据，底层 tokens/s 再高，也无法解释“为什么这次回答慢、为什么引用错、为什么工具重复执行、为什么上下文超限”。
+
+\subsection{三类上层框架对应三类系统合同}
+
+上层框架可以先按职责拆，而不是按库名记。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+类别 & 典型职责 & 推理引擎必须看到的合同 \\
+\midrule
+Agent harness & messages、prompt、tools、middleware、structured output & token budget、tool schema、stop 规则、trace id \\
+状态图 runtime & durable execution、checkpoint、human-in-the-loop、恢复 & state version、step id、checkpoint id、取消和重放边界 \\
+RAG/data layer & ingestion、chunk、embedding、index、retrieve、rerank & chunk id、embedding version、citation span、ACL、freshness \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这个表的关键是：上层框架不是“业务代码之外的装饰”。它们输出的字段会进入第三册所有底层模型。Prompt 变长会提高 prefill 成本；retrieval chunk 变多会提高 KV 预留；tool loop 变深会提高请求停留时间；状态图 checkpoint 不正确会导致重复工具调用；stream callback 背压会让 decode 结果堆积。
+
+\subsection{从用户请求到模型输入的完整状态机}
+
+一个上层 AI 请求可以写成下面的状态机。它比裸 serving 状态机更长，因为模型调用只是其中一段。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 产物 & 主要错误边界 \\
+\midrule
+MessageReceived & messages、tenant、deadline & 格式、权限、超时 \\
+TemplateRendered & prompt bytes、template hash & 模板漂移、角色丢失 \\
+QueryPlanned & retrieval query、tool plan & 查询改写漂移、计划失控 \\
+ContextRetrieved & chunk ids、scores、ACL proof & 召回不足、越权、过期索引 \\
+ContextPacked & token spans、citation map & context 超限、引用错位 \\
+AdmittedToModel & KV 预算、backend plan & 队列超时、资源不足 \\
+ModelRunning & token stream、tool call proposal & stop 错误、schema 错误 \\
+ToolExecuting & tool result、side-effect receipt & 重复执行、迟到结果 \\
+StateCheckpointed & graph state、step result & 崩溃恢复、重放一致性 \\
+Finalized & answer、usage、trace、quality flags & 引用不成立、输出不合规 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表要求每个状态有可保存产物。尤其是 \code{TemplateRendered}、\code{ContextPacked} 和 \code{StateCheckpointed}。如果只保存最终 answer，之后无法判断错误来自模板、检索、上下文拼接、模型、工具，还是状态恢复。
+
+\subsection{文档导入不是普通文件读取}
+
+RAG 的第一条链路是 ingestion。输入可能是 PDF、HTML、Markdown、代码仓库、数据库行、工单、聊天记录或日志。它们不能直接变成 embedding。导入器必须先建立文档身份、解析版本、权限、时间和可复现内容。
+
+\begin{lstlisting}[numbers=none,caption={DocumentRecord 最小字段}]
+DocumentRecord:
+  doc_id
+  source_uri
+  source_type
+  tenant_id
+  acl_policy_id
+  content_hash
+  parser_version
+  created_at
+  updated_at
+  visibility_epoch
+  raw_bytes
+  parsed_text
+  parse_warnings
+\end{lstlisting}
+
+\code{content\_hash} 是数据事实，\code{parser\_version} 是解释事实，\code{acl\_policy\_id} 是权限事实，\code{visibility\_epoch} 是索引可见性事实。缺任意一个，恢复和审计都会变弱。例如 PDF 解析器升级后，同一个文件可能抽出不同换行；权限系统更新后，旧索引里的 chunk 可能不该再被检索；文档更新后，旧 chunk 的 citation 可能指向过期内容。
+
+\subsection{chunking 的合同：token、语义和引用必须同时成立}
+
+Chunk 不是随便按字符切。它必须同时满足 token 预算、语义边界、引用可回溯和检索粒度。太短会召回碎片，太长会挤占 context；只按字符切会断开代码块、表格和定义；只按语义切可能产生过长 chunk。
+
+\begin{lstlisting}[numbers=none,caption={ChunkRecord 最小字段}]
+ChunkRecord:
+  chunk_id
+  doc_id
+  source_span_bytes
+  source_span_lines
+  text
+  token_count
+  tokenizer_hash
+  chunker_version
+  overlap_prev_tokens
+  overlap_next_tokens
+  section_path
+  citation_label
+  acl_policy_id
+\end{lstlisting}
+
+Chunker 的验收要有反例。代码文档要保持函数签名和说明在同一 chunk；FAQ 要避免把问题和答案切开；表格要保存列名；中文文档要按 tokenizer 统计 token，而不是按字符猜；多租户数据要让每个 chunk 带 ACL，而不是只给文档带 ACL。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.25\linewidth}p{0.34\linewidth}p{0.29\linewidth}}
+\toprule
+错误切法 & 线上表现 & 应补证据 \\
+\midrule
+按字符固定长度切 & prompt 中引用缺上下文 & source span、section path \\
+忽略 tokenizer & 实际 token 超预算 & tokenizer hash、token count \\
+重叠过大 & 重复 chunk 挤占 context & overlap tokens、dedup report \\
+表格行列拆散 & 答案引用无法验证 & table parser version \\
+权限只在 doc 层检查 & chunk 被迁移后越权 & chunk ACL、visibility epoch \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\subsection{Embedding 和 vector store 是数据库问题}
+
+Embedding 不是“调用一次模型得到向量”。它是一个带版本、维度、归一化、距离度量、批处理、索引构建和可见性切换的数据系统。
+
+\begin{lstlisting}[numbers=none,caption={EmbeddingRecord 最小字段}]
+EmbeddingRecord:
+  chunk_id
+  embedding_model_id
+  embedding_model_version
+  embedding_dim
+  distance_metric: cosine | dot | l2
+  normalized: true
+  vector_dtype: f32 | f16 | int8
+  vector_checksum
+  index_partition
+  visible_epoch
+\end{lstlisting}
+
+如果 embedding 模型升级，旧向量和新向量通常不能混在同一个距离空间里直接比较；如果 cosine 检索要求单位向量，却忘了归一化，分数排序会漂移；如果向量量化成 int8，召回率和存储带宽都要重新评估。Vector store 的 schema 必须把这些事实写出来。
+
+\begin{lstlisting}[numbers=none,caption={IndexBuild 状态机}]
+RawDocument
+  -> ParsedDocument
+  -> ChunkedDocument
+  -> EmbeddedChunks
+  -> IndexBuilding
+  -> ShadowIndexReady
+  -> VisibleIndex
+  -> RetiredIndex
+\end{lstlisting}
+
+这条状态机避免半成品索引对线上可见。新索引应先在 shadow 状态完成 build、校验、抽样查询和权限检查，再通过 \code{visible\_epoch} 切换；旧索引保留一段时间用于回滚。删除文档也不能只删原文件，要向索引写 tombstone 或推进 visibility epoch，保证旧 chunk 不再被召回。
+
+\subsection{检索路径：召回、过滤、重排和打包是四个阶段}
+
+Query-time RAG 不应写成一个 \code{retrieve(prompt)}。至少拆成四个阶段：
+
+\begin{lstlisting}[numbers=none,caption={RAG query pipeline}]
+1. query rewrite:
+   messages -> retrieval query
+
+2. candidate recall:
+   dense vector / sparse BM25 / metadata filter -> candidates
+
+3. rerank:
+   candidates -> ordered evidence with scores
+
+4. context packing:
+   evidence -> prompt spans under token budget
+\end{lstlisting}
+
+召回阶段追求覆盖，重排阶段追求精度，打包阶段追求上下文预算和引用可审计。把这三件事混在一起，会出现很难解释的质量问题：召回不足被误判为模型幻觉，reranker 慢被误判为 prefill 慢，context packing 截断导致引用看起来存在但答案用不到。
+
+\begin{lstlisting}[numbers=none,caption={RetrievalTrace 最小字段}]
+RetrievalTrace:
+  query_id
+  rewrite_version
+  embedding_model_version
+  index_epoch
+  recall_top_k
+  candidates_before_acl
+  candidates_after_acl
+  rerank_model_id
+  rerank_top_k
+  packed_chunk_ids
+  packed_token_count
+  dropped_relevant_candidates
+  citation_map_checksum
+\end{lstlisting}
+
+这份 trace 让质量评估可以定位。若 \code{candidates\_before\_acl} 很多但 after ACL 很少，可能是权限或租户过滤导致召回不足；若 \code{dropped\_relevant\_candidates} 不为 0，说明 token budget 太紧或 packing 策略有问题；若 rerank top-k 改变但 final answer 变差，要看 reranker 版本和分数分布。
+
+\subsection{Context packing：别把长上下文当垃圾桶}
+
+长上下文不是免费的。第三册前面已经算过 KV bytes/token 和 context length 对 TPOT 的线性影响。上层 context packing 要把检索、历史、工具结果和输出预留放进同一条不等式：
+
+\[
+T_{system}+T_{history}+T_{query}+T_{retrieved}+T_{tools}+T_{reserved}
+  \le T_{max}
+\]
+
+如果预算不够，不能简单截断尾部。更合理的策略是按优先级压缩：保留 system 和安全策略；保留当前 query；保留高分证据和 citation span；压缩旧历史；截断低分 chunk；对超长 tool result 摘要。每一次压缩都要留下报告。
+
+\begin{lstlisting}[numbers=none,caption={ContextPackingReport}]
+max_context: 8192
+system_tokens: 180
+query_tokens: 44
+history_original_tokens: 3200
+history_packed_tokens: 900
+retrieved_original_tokens: 4096
+retrieved_packed_tokens: 1536
+tool_original_tokens: 1200
+tool_packed_tokens: 300
+reserved_output_tokens: 1024
+dropped_chunks: [doc8:0012, doc9:0003]
+compression_policy: summarize_history_keep_recent_4
+\end{lstlisting}
+
+这份报告直接解释 TTFT、KV 预算和质量边界。若 answer 缺少某个事实，先看该 chunk 是否被召回、是否通过 ACL、是否被 rerank 保留、是否被 packing 丢弃，而不是立刻怀疑模型。
+
+\subsection{Hybrid retrieval 和 rerank 的系统取舍}
+
+很多生产 RAG 会组合 dense retrieval、sparse retrieval、metadata filter 和 reranker。Dense 向量擅长语义相似，BM25 类稀疏检索擅长关键词和专有名词，metadata filter 处理租户、时间和类型，reranker 用更贵模型在小候选集上重排。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 购买的能力 & 代价 \\
+\midrule
+Dense recall & 语义召回、同义表达 & embedding 成本、向量索引内存 \\
+Sparse recall & 精确词、编号、错误码 & 词法匹配弱语义 \\
+Metadata filter & 权限、时间、类型约束 & 过滤太早可能伤召回 \\
+Rerank & 小集合精排 & 额外模型延迟和成本 \\
+MMR/diversity & 减少重复 chunk & 可能牺牲最高相关分 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表要和 SLO 合起来看。若 RAG 查询 p95 高，不能只看模型 TPOT。可能是 embedding 服务慢、vector store p95 高、reranker batch 不稳定、或者 context packing 太大导致 prefill 变慢。RAG 的 SLO 报告必须分段。
+
+\begin{lstlisting}[numbers=none,caption={RAG SLO 分段}]
+rag_slo:
+  rewrite_ms
+  embedding_ms
+  vector_search_ms
+  sparse_search_ms
+  acl_filter_ms
+  rerank_ms
+  context_pack_ms
+  model_queue_wait_ms
+  prefill_ms
+  decode_tpot_p95_ms
+\end{lstlisting}
+
+\subsection{Agent 状态图：持久化比循环代码重要}
+
+Agent loop 最小形态是 LLM -> tool -> LLM，但 production agent 更接近状态图。每一步都可能失败、暂停、等待人工确认、重试或恢复。状态图的核心对象不是函数，而是 \code{AgentState}。
+
+\begin{lstlisting}[numbers=none,caption={AgentState 最小字段}]
+AgentState:
+  thread_id
+  run_id
+  step_id
+  messages
+  scratchpad_summary
+  tool_calls_pending
+  tool_results_committed
+  memory_refs
+  budget:
+    max_steps
+    remaining_steps
+    deadline_ms
+    remaining_tokens
+  checkpoint_id
+  state_version
+\end{lstlisting}
+
+这里的 \code{thread\_id} 表示长期会话，\code{run\_id} 表示一次执行，\code{step\_id} 表示状态图中的一步。Checkpoint 不能只保存 messages；还要保存预算、pending tool、已经提交的 tool result、memory 引用和 state version。否则崩溃恢复时可能重复调用有副作用的工具，或把迟到工具结果写到错误步骤。
+
+\begin{lstlisting}[numbers=none,caption={Agent step 状态机}]
+Planned
+  -> ModelCalling
+  -> ToolProposed
+  -> ToolValidated
+  -> ToolExecuting
+  -> ToolCommitted
+  -> Checkpointed
+  -> NextStepOrFinished
+\end{lstlisting}
+
+每个转移都要有幂等身份。尤其是 \code{ToolExecuting -> ToolCommitted}，必须区分“工具返回了”和“工具结果被状态图接受”。外部支付、发邮件、改数据库这类工具必须有 idempotency key 或补偿策略；没有幂等键的工具应默认禁止自动重试。
+
+\subsection{Tool calling 的 schema、权限和副作用}
+
+Tool calling 的风险不是 JSON 解析，而是把模型输出当成可信指令。工具执行前至少要通过四类检查：
+
+\begin{itemize}
+  \item schema：字段类型、枚举、范围、必填项和默认值。
+  \item permission：当前用户、租户、工具和资源是否匹配。
+  \item budget：工具耗时、输出字节、输出 token 和重试次数。
+  \item side effect：是否幂等，失败后是否可补偿，是否需要人工确认。
+\end{itemize}
+
+\begin{lstlisting}[numbers=none,caption={ToolPolicy}]
+ToolPolicy:
+  tool_name
+  input_schema_hash
+  output_schema_hash
+  allowed_tenants
+  requires_human_approval
+  idempotency_mode: required | optional | forbidden
+  max_output_bytes
+  max_output_tokens
+  timeout_ms
+  retry_policy
+  redaction_policy
+\end{lstlisting}
+
+工具输出也不能无限进入上下文。长输出要摘要，敏感字段要脱敏，二进制或 HTML 要转成安全文本，错误信息要分类。否则一次工具异常可能把巨大的 stack trace 塞进 prompt，既浪费 KV，又泄漏内部信息。
+
+\subsection{Memory：短期上下文和长期记忆不是一回事}
+
+Agent 框架常说 memory，但 memory 至少分三类。短期 memory 是当前 messages 和 scratchpad；压缩 memory 是旧对话摘要；长期 memory 是跨会话保存的用户偏好、事实或任务状态。三者的生命周期、权限和召回方式不同。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+memory 类型 & 用途 & 风险 \\
+\midrule
+Short-term & 当前推理步骤上下文 & token 膨胀、scratchpad 泄漏 \\
+Compressed & 长对话摘要 & 摘要丢失细节、不可审计 \\
+Long-term & 用户偏好、项目事实、任务状态 & 隐私、过期、错误记忆污染 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+长期 memory 应像 RAG 文档一样有来源、时间、权限和删除机制。不能因为模型说“用户喜欢 X”就永久写入。写 memory 需要 evidence：来自哪条用户消息，是否需要确认，何时过期，如何删除。否则 memory 会成为不可控的隐形 prompt。
+
+\subsection{Human-in-the-loop 是状态转移，不是弹窗}
+
+需要人工确认时，系统不应把请求卡在某个线程里等待。正确做法是把 agent state 转到 \code{WaitingForHuman}，释放模型和 KV 资源，保存 checkpoint，并让外部事件恢复执行。
+
+\begin{lstlisting}[numbers=none,caption={HumanInterrupt}]
+HumanInterrupt:
+  run_id
+  step_id
+  reason
+  proposed_action
+  required_role
+  expires_at
+  checkpoint_id
+  resume_policy
+\end{lstlisting}
+
+恢复时要检查 state version、权限、deadline 和工具副作用。若人工批准发生在旧 checkpoint 上，而状态图已被取消或重试，批准不能直接生效。Human-in-the-loop 的难点不是 UI，而是让暂停、恢复和取消都保持一次性语义。
+
+\subsection{结构化输出：schema 是接口，不是提示词愿望}
+
+Structured output 常被写成“请按 JSON 输出”。这不够。Schema 必须成为 release gate。模型输出要经过解析、校验、修复策略和失败分类；修复不能无限循环；错误要能回传给业务。
+
+\begin{lstlisting}[numbers=none,caption={StructuredOutputReport}]
+schema_hash
+raw_output_bytes
+parse_status: ok | json_error | schema_error | repaired | rejected
+repair_attempts
+fields_missing
+fields_out_of_range
+enum_violations
+final_object_checksum
+\end{lstlisting}
+
+如果 schema 是外部 API 的输入，还要做语义检查。例如金额不能为负，日期不能在过去，用户 id 必须属于当前租户。JSON 合法不代表业务安全。工具调用尤其如此：schema gate 只能证明形状，permission gate 和 side-effect gate 才证明能执行。
+
+\subsection{质量评估：RAG 和 agent 不能只看最终文本}
+
+上层链路的 evaluation 要拆成多层，不同层用不同 oracle。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+层级 & 指标 & 失败定位 \\
+\midrule
+Retrieval & recall@k、MRR、nDCG、ACL pass & 索引/召回/过滤 \\
+Rerank & pairwise preference、top-k overlap & reranker 版本或特征 \\
+Context & packed relevant tokens、citation coverage & packing/压缩 \\
+Generation & answer exactness、refusal、format validity & 模型/模板/sampler \\
+Citation & citation precision/recall、span match & 引用映射/截断 \\
+Tool & schema pass、side-effect once、timeout & agent/tool policy \\
+SLO & TTFT、TPOT、tool wait、retrieval p95 & 系统瓶颈 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+RAG 的一个合格 fixture 应保存 query、gold relevant chunk、允许答案要点、禁止答案要点、citation 要求和 token budget。Agent fixture 应保存工具响应、期望 tool call 序列、最大步数和取消点。这样才能判断是召回错、引用错、工具错，还是模型生成错。
+
+\begin{lstlisting}[numbers=none,caption={RAGEvalCase}]
+case_id
+query
+tenant_id
+gold_relevant_chunk_ids
+forbidden_chunk_ids
+expected_answer_facts
+expected_citation_ids
+max_prompt_tokens
+expected_failure_mode_optional
+\end{lstlisting}
+
+\subsection{安全和稳定性：上层链路的硬边界}
+
+上层编排要有明确拒绝路径。常见硬边界包括 prompt 长度、检索权限、工具权限、输出 schema、PII、越权引用、外部请求速率、模型热更新和 OOM 降级。
+
+\begin{lstlisting}[numbers=none,caption={上层请求拒绝原因}]
+reject:
+  prompt_too_long
+  retrieval_acl_denied
+  index_epoch_unavailable
+  tool_not_allowed
+  tool_schema_invalid
+  tool_requires_human_approval
+  context_budget_exceeded
+  structured_output_failed
+  unsafe_memory_write
+  tenant_rate_limited
+\end{lstlisting}
+
+拒绝不是失败，模糊继续才是失败。若 retrieval ACL 不确定，不能把未过滤 chunk 塞进 prompt；若 tool schema 不合法，不能让模型“猜着修”；若 context budget 超限，不能静默截掉 system policy；若 memory 写入不安全，不能把未确认偏好永久保存。
+
+\subsection{对接本地推理引擎的接口边界}
+
+上层框架最终要调用第三册的本地推理引擎。接口应避免把上层框架对象直接泄漏进后端。后端只接受规范化请求：
+
+\begin{lstlisting}[numbers=none,caption={NormalizedGenerationRequest}]
+NormalizedGenerationRequest:
+  request_id
+  model_id
+  tokenizer_hash
+  prompt_token_ids
+  token_spans:
+    - source: system | history | retrieval | tool
+      start_token
+      end_token
+      evidence_id_optional
+  sampling_policy
+  stop_token_ids
+  max_new_tokens
+  kv_budget_hint
+  deadline_ms
+  stream_event_policy
+\end{lstlisting}
+
+这样做的好处是后端不需要理解 LangChain、LangGraph、LlamaIndex 或某个业务 SDK。它只理解 token、span、预算、停止规则和 trace。框架可以换，底层合同不换；模型可以换，tokenizer hash 和 template hash 会暴露差异；RAG 可以换检索器，citation span 仍然可审计。
+
+\subsection{一份完整上层 trace 应该长什么样}
+
+最终证据不应散在日志里。一次请求的 trace 至少要能串起：
+
+\begin{lstlisting}[numbers=none,caption={UpperAITrace 最小结构}]
+UpperAITrace:
+  request_id
+  conversation_id
+  trace_id
+  messages_hash
+  template_hash
+  tokenizer_hash
+  retrieval:
+    query_id
+    index_epoch
+    candidate_counts
+    packed_chunk_ids
+    citation_map_checksum
+  agent:
+    run_id
+    step_count
+    checkpoint_ids
+    tool_call_ids
+  model:
+    prompt_tokens
+    max_new_tokens
+    ttft_ms
+    tpot_p95_ms
+    finish_reason
+  quality:
+    citation_pass
+    schema_pass
+    safety_flags
+\end{lstlisting}
+
+这份 trace 让团队能做三类复盘：质量复盘看 retrieval、citation 和 schema；性能复盘看 embedding、rerank、prefill、decode 和 streaming；可靠性复盘看 checkpoint、tool idempotency、取消和资源释放。没有这条 trace，上层框架越强，系统越像黑盒。
+
+\subsection{本章实验和验收}
+
+\begin{exercisebox}
+实验一：构造一个 20 篇文档的小 RAG 集合。为每篇文档生成 \code{DocumentRecord}、\code{ChunkRecord}、\code{EmbeddingRecord} 和 \code{RetrievalTrace}，故意加入一个过期 chunk、一个越权 chunk 和一个 tokenizer 版本变化样例，验证它们被拒绝或标记。
+
+实验二：实现一个最小 hybrid retrieval pipeline：dense candidate、sparse candidate、metadata filter、rerank、context packing。报告 recall@k、packed token count、citation coverage、embedding latency、vector search latency 和 rerank latency。
+
+实验三：实现一个有两个工具的 agent 状态图。一个工具无副作用，一个工具需要 idempotency key。注入超时、迟到 completion、人工确认和取消，验证 checkpoint 恢复不会重复提交副作用。
+
+实验四：建立 10 条 RAG/agent release fixtures。每条保存 query、gold chunk、tool response、expected citation、structured output schema 和 SLO 阈值。任何 prompt template、retriever、tool schema 或 tokenizer 改动都必须跑过这些 fixtures。
+\end{exercisebox}
+
+\begin{rubricbox}
+\begin{itemize}
+  \item 能区分 agent harness、状态图 runtime、RAG data layer 对底层引擎的不同合同。
+  \item 文档导入、chunk、embedding、index build 有版本、权限、hash 和可见性状态。
+  \item 检索报告能拆开 recall、ACL、rerank、context packing 和 citation map。
+  \item Agent tool call 有 schema、权限、幂等、预算、checkpoint 和迟到结果处理。
+  \item Memory 写入有来源、权限、过期和删除策略。
+  \item 结构化输出和工具调用进入 release gate，而不是只靠提示词。
+  \item 本地推理接口只消费规范化 token/span/budget/trace，不依赖上层框架对象。
+\end{itemize}
+\end{rubricbox}

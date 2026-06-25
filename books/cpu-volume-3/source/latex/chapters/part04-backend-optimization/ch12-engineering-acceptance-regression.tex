@@ -578,6 +578,91 @@ SLO & TTFT、TPOT、tool wait、queue wait & 上层编排改变了资源形状 \
 
 这条门禁把上层框架和底层引擎接在一起。底层 kernel 优化若改变 tokenizer golden 或 stop token 行为，应在 prompt gate 就失败；retriever 改版若让 prompt 多出 2000 token，应在 context budget gate 暴露；tool timeout 策略若让请求排队更久，应在 SLO gate 暴露。AI Infra 的工程边界不是“模型服务 API 返回 200”，而是从输入消息到输出事件的整条链路可复现、可度量、可回滚。
 
+\subsection{上层框架对标：比 API 更重要的是证据合同}
+
+对标上层框架时，不能写成“某框架支持 agent，某框架支持 RAG”。这类描述对工程能力帮助很小。真正要比较的是：它如何表达状态，如何保存 checkpoint，如何把文档变成 chunk 和 index，如何处理工具副作用，如何暴露 trace，如何让底层推理服务看到 token budget 和取消。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+系统类型 & 值得拆的设计 & 本项目需要迁移的合同 \\
+\midrule
+Agent framework & model/tool/message/middleware 抽象 & tool schema、step budget、stream event \\
+State graph runtime & durable step、checkpoint、resume、interrupt & run id、step id、checkpoint id、重放边界 \\
+RAG/data framework & ingestion、node/chunk、index、retriever、query engine & doc/chunk/embedding/index epoch、citation map \\
+Serving engine & batching、KV、scheduler、streaming & TTFT、TPOT、KV budget、cancel/backpressure \\
+Local inference engine & tokenizer、model load、quant、backend & manifest、tokenizer hash、backend plan、oracle \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+对标报告应固定同一组应用场景，而不是每个框架跑不同 demo。推荐至少四个 fixture：
+
+\begin{lstlisting}[numbers=none,caption={上层框架对标 fixture}]
+1. plain chat:
+   messages -> prompt -> streaming tokens
+
+2. RAG QA:
+   documents -> chunks -> retrieve -> rerank -> answer with citations
+
+3. tool call:
+   model proposes tool -> schema validate -> execute -> continue
+
+4. durable agent:
+   model/tool/checkpoint -> crash or pause -> resume exactly once
+\end{lstlisting}
+
+每个 fixture 都要报告相同字段：
+
+\begin{lstlisting}[numbers=none,caption={UpperFrameworkComparisonReport}]
+framework_name
+fixture_id
+template_hash_visible
+tokenizer_hash_visible
+prompt_token_count
+retrieval_trace_available
+citation_map_available
+tool_schema_enforced
+checkpoint_available
+cancel_propagates_to_model
+cancel_propagates_to_tool
+stream_event_schema
+ttft_ms
+end_to_end_p95_ms
+failure_diagnosis_quality
+\end{lstlisting}
+
+这份表能把“好用”拆成工程事实。某框架 prompt 体验很好，但不暴露 token span，本地引擎就难以做 citation oracle；某状态图 runtime checkpoint 完整，但 tool 输出没有 token budget，长结果仍会压垮 context；某 RAG 框架索引方便，但若 index epoch 和 ACL 不进入 trace，多租户审计就不够。对标的目标不是选边站，而是把成熟系统的合同吸收进自己的项目。
+
+\subsection{RAG/Agent 回归集的最小目录}
+
+第三册项目如果要展示上层能力，仓库里应有一组可运行 fixture，而不是只在正文描述。最小目录可以这样组织：
+
+\begin{lstlisting}[numbers=none,caption={上层回归集目录结构}]
+tests/orchestration/
+  rag/
+    docs/
+    chunks-golden.jsonl
+    embeddings-manifest.json
+    retrieval-cases.jsonl
+    citation-golden.jsonl
+  agents/
+    tool-schemas/
+    tool-fixtures.jsonl
+    durable-state-cases.jsonl
+    cancellation-cases.jsonl
+  prompts/
+    chat-template-golden.jsonl
+    tokenizer-golden.jsonl
+  reports/
+    rag-eval.csv
+    agent-eval.csv
+    slo-eval.csv
+\end{lstlisting}
+
+这套目录不要求一开始支持真实外部向量库。第一版可以用内存向量索引和固定 embedding fixture，但合同要完整：doc id、chunk id、embedding version、index epoch、query id、citation map、tool call id、checkpoint id 都要出现。之后换成真正的向量库、reranker 或 LangChain/LlamaIndex 接入层时，测试对象可以替换，oracle 不需要重写。
+
 \subsection{框架对标：尊重成熟实现，也要知道差距在哪里}
 
 自研引擎需要对标成熟框架，但对标不能只贴一个 tokens/s。成熟框架可能使用不同量化格式、不同 tokenizer、不同线程数、不同 GPU kernel、不同 batch 策略。对标前要固定变量：
