@@ -569,7 +569,7 @@ DEEP_SECTIONS: list[tuple[str, str, list[str]]] = [
             "unordered_map 的平均常数时间不是无条件承诺。哈希冲突、负载因子过高、频繁 rehash 都会让性能波动。刷题时调用 reserve 可以减少 rehash，使用 find 可以避免 operator[] 的默认插入副作用。当前缀和计数题里，哈希表语义是历史前缀频次，如果用 operator[] 随意读取不存在键，就可能把调试输出和真实状态混在一起。",
             "map 和 set 基于有序结构，常用于前驱、后继、区间查询和动态有序集合。它们的查询是对数复杂度，不如哈希表平均常数快，但能回答哈希表回答不了的顺序问题。区间覆盖、日程安排、滑动窗口有序统计、离线扫描线，都可能需要有序容器。选择 map 不是因为它高级，而是因为题目需要顺序语义。",
             "priority_queue 是容器适配器，不是完整排序容器。它只承诺堆顶极值，不承诺遍历顺序。需要频繁删除任意元素时，普通 priority_queue 不支持直接删除，常见办法是懒删除：另一个哈希表记录应该删除的元素，真正取堆顶前不断弹出过期项。理解这个限制，才能写好滑动窗口中位数、任务调度和带过期时间的事件模拟。",
-            "Linux 内核的数据结构会在独立专题中系统展开。这里先只保留一个接口判断：STL 容器强调泛型接口、异常安全和所有权封装；内核结构强调嵌入式节点、明确生命周期、分配控制和并发语义。两者都不是模板清单，核心仍然是访问模式。",
+            "Linux 内核的数据结构会在独立专题中系统展开。这里先只保留一个接口判断：STL 容器强调泛型接口、异常安全和所有权封装；内核结构强调嵌入式节点、明确生命周期、分配控制和并发语义。两者都要回到 LeetCode 146 LRU 缓存这类节点生命周期案例，核心仍然是访问模式。",
             "读源码时不要从模板细节硬啃。先读接口语义和复杂度承诺，再找核心成员，最后追一条热路径。vector 看 push_back 和扩容，deque 看段表如何定位下标，unordered_map 看查找和 rehash，map 看 lower_bound 如何沿树下降，priority_queue 看 push_heap 和 pop_heap。每次阅读只回答一个问题：这个 API 为什么是这个复杂度，什么时候会让迭代器失效，题目里用它是否合适。",
         ],
     ),
@@ -760,7 +760,7 @@ def detailed_problem_card(problem: Problem, family: Family) -> str:
     derivation = case_derivation(problem, family)
     return "\n\n".join(
         [
-            f"\\noindent\\textbf{{{escape_text(title)}。}} 题面翻译：{sentence(problem.model)}。优化抓手：{sentence(problem.focus)}。",
+            f"\\noindent\\textbf{{{escape_text(title)}。}}",
             derivation,
         ]
     )
@@ -1411,32 +1411,40 @@ CASE_DERIVATION_BRIDGES: dict[str, str] = {
 
 def case_derivation(problem: Problem, family: Family) -> str:
     family_key = problem.family
-    reading = format_workshop(CASE_READING_GUIDES[family_key], problem)
-    brute = format_workshop(CASE_BRUTE_BASELINES[family_key], problem)
     mini = mini_derivation(problem)
-    bridge = format_workshop(CASE_DERIVATION_BRIDGES[family_key], problem)
-    trace = format_workshop(CASE_TRACE_PROTOCOLS[family_key], problem)
-    state = format_workshop(CASE_STATE_UPGRADES[family_key], problem)
-    fields = format_workshop(CASE_STATE_FIELDS[family_key], problem)
-    implementation = format_workshop(CASE_IMPLEMENTATION_CHECKPOINTS[family_key], problem)
-    proof = format_workshop(CASE_PROOF_CHECKS[family_key], problem)
-    invariant = sentence(family.invariant)
-    cpp = sentence(family.cpp)
     model = sentence(problem.model)
     focus = sentence(problem.focus)
     edge = sentence(problem.edge)
     variant = sentence(problem.variant)
     paragraphs = [
-        f"\\textbf{{读题拆解。}} {reading}。一句话模型是：{model}。这里要先确认答案对象、合法性条件和优化目标，不要把题型名字当成推导。",
-        f"\\textbf{{暴力基线。}} {brute}。这个慢版本的任务是保证不漏答案；它不追求快，只负责给优化版提供对拍基准。随后再引入优化抓手：{focus}。",
-        f"\\textbf{{特例推到规律。}} {mini}。{bridge}。推导完成后，把状态字段收束为：{fields}；再用 {edge} 逐项回查，确认每个边界都能按同一套状态解释。",
-        f"\\textbf{{手算样例。}} {trace}。手算表至少记录输入位置、状态变化、答案更新和停止条件。只写最终答案看不出边界，逐轮记录才能发现状态更新顺序是否错。",
-        f"\\textbf{{状态升级。}} {state}。状态字段建议写成：{fields}。不变量要落到代码上：{invariant}。",
-        f"\\textbf{{代码落点。}} {implementation}。C++ 侧还要落实：{cpp}。",
-        f"\\textbf{{正确性检查。}} {proof}。证明时把算法和暴力版对齐：暴力能覆盖的合法候选仍然会被考虑，优化结构只替代重复检查，不改变答案集合。",
-        f"\\textbf{{边界和变体。}} 先用{edge}做对拍，再回答变体：{variant}。",
+        f"\\textbf{{模型和抓手。}} 题面模型：{model}。优化只替换最贵一步：{focus}。",
+        f"\\textbf{{特例推到规律。}} {mini}。",
+        f"\\textbf{{边界和变体。}} 用{edge}做反例检查；变体：{variant}。",
     ]
     return "\n\n".join(paragraphs)
+
+
+def family_method_note(family_key: str, family: Family) -> str:
+    fields = escape_text(CASE_STATE_FIELDS[family_key])
+    implementation = escape_text(CASE_IMPLEMENTATION_CHECKPOINTS[family_key])
+    proof = escape_text(CASE_PROOF_CHECKS[family_key])
+    brute = sentence(family.brute)
+    bottleneck = sentence(family.bottleneck)
+    invariant = sentence(family.invariant)
+    cpp = sentence(family.cpp)
+    return "\n".join(
+        [
+            "\\begin{principlebox}{本组共性落点}",
+            f"\\textbf{{慢版本。}} {brute}。",
+            f"\\textbf{{瓶颈。}} {bottleneck}。",
+            f"\\textbf{{状态字段。}} {fields}。",
+            f"\\textbf{{不变量。}} {invariant}。",
+            f"\\textbf{{实现检查。}} {implementation}。",
+            f"\\textbf{{C++ 落地。}} {cpp}。",
+            f"\\textbf{{证明抓手。}} {proof}。",
+            "\\end{principlebox}",
+        ]
+    )
 
 
 def format_workshop(template: str, problem: Problem) -> str:
@@ -1969,23 +1977,57 @@ def problem_card(problem: Problem, family: Family) -> str:
     derivation = case_derivation(problem, family)
     return "\n\n".join(
         [
-            f"\\noindent\\textbf{{{escape_text(title)}。}} 题目模型：{sentence(problem.model)}。推导重点：{sentence(problem.focus)}。",
+            f"\\noindent\\textbf{{{escape_text(title)}。}}",
             derivation,
         ]
+    )
+
+
+def family_case_names(problems: list[Problem], limit: int = 3) -> str:
+    selected = problems[:limit]
+    return "、".join(leetcode_title(problem) for problem in selected)
+
+
+def family_case_observation(problems: list[Problem], limit: int = 3) -> str:
+    selected = problems[:limit]
+    parts = [
+        f"{leetcode_title(problem)}：模型是“{problem.model}”，优化抓手是“{problem.focus}”"
+        for problem in selected
+    ]
+    return "；".join(parts)
+
+
+def family_case_led_paragraphs(family_key: str, problems: list[Problem]) -> list[str]:
+    cases = family_case_names(problems)
+    observations = family_case_observation(problems)
+    return [
+        (
+            f"以 {cases} 为主线：{observations}。这些案例共同推出的规律是："
+            f"{FAMILY_METHODS[family_key]} 方法名只是复盘后的标签，真正要掌握的是从题面约束、"
+            "暴力失败、状态设计到边界反例的推导链。"
+        ),
+    ]
+
+
+def family_case_bridge(problems: list[Problem]) -> str:
+    cases = family_case_names(problems, limit=3)
+    return (
+        f"复盘本节时先从 {cases} 开始：每道题都先手写一个能覆盖全部候选的暴力版，"
+        "再指出优化结构具体保存了哪一段历史信息，最后用相邻案例比较为什么不能互换解法。"
     )
 
 
 def family_scenarios(family_key: str, family: Family) -> str:
     scenarios = FAMILY_SCENARIOS[family_key]
     lines: list[str] = [
-        f"\\begin{{principlebox}}{{题型分流：{escape_text(family.name)}}}"
+        f"\\begin{{principlebox}}{{从 LeetCode 案例分流：{escape_text(family.name)}}}"
     ]
     for title, condition, method, cases, caution in scenarios:
         lines.append(f"\\textbf{{{escape_text(title)}。}}")
         cases = label_leetcode_references(cases)
         lines.append(
             escape_text(
-                f"判断条件：{condition}。处理方式：{method}。代表案例：{cases}。风险点：{caution}。"
+                f"代表案例：{cases}。先看这些题的题面条件：{condition}。由此推出的处理方式是：{method}。风险点：{caution}。"
             )
         )
         lines.append("")
@@ -2015,7 +2057,7 @@ def family_case_matrix(problems: list[Problem]) -> str:
 def family_diagram(family: Family) -> str:
     return dedent(
         f"""
-        \\begin{{principlebox}}{{图示：{escape_text(family.name)}推导链}}
+        \\begin{{principlebox}}{{图示：从 LeetCode 案例到 {escape_text(family.name)}推导链}}
         \\begin{{tabular}}{{@{{}}p{{0.18\\linewidth}}p{{0.74\\linewidth}}@{{}}}}
         暴力基线 & 枚举候选、完整模拟或逐个检查，先保证覆盖全部可能答案。\\\\
         瓶颈定位 & {sentence(family.bottleneck)}。\\\\
@@ -2037,7 +2079,7 @@ def write_deep_sections() -> None:
         body.append("\\begin{principlebox}{专题复盘要求}")
         body.append(
             escape_text(
-                "读完本节后，不要只记结论。请把每个结论还原成一个可验证的问题：它解决了哪一步重复工作，依赖哪个题目条件，使用哪个容器或状态，边界条件如何破坏错误写法。"
+                "读完本节后，不要只记结论。请至少回到 LeetCode 53 最大子数组和、LeetCode 560 和为 K 的子数组、LeetCode 875 爱吃香蕉、LeetCode 312 戳气球这类代表题，把每个结论还原成一个可验证的问题：它解决了哪一步重复工作，依赖哪个题目条件，使用哪个容器或状态，边界条件如何破坏错误写法。"
             )
         )
         body.append("\\end{principlebox}")
@@ -2049,17 +2091,18 @@ def append_family_section(body: list[str], family_key: str, problems: list[Probl
     body.append(f"\\section{{{escape_text(family.name)}}}")
     body.append(
         escape_text(
-            "这一节把同一题型整理成少数几个层次，而不是把题目标题堆满页面。阅读顺序是先理解原理，再看场景分流，再用案例矩阵建立索引，最后进入单题推导和实验复盘。"
+            f"这一节先看 {family_case_names(problems)} 这几道 LeetCode 题，再整理同一题型的分流和推导。阅读顺序不是先背原理，而是先看案例的暴力瓶颈，再把重复出现的观察抽象成方法。"
         )
     )
     body.append("")
     body.append("\\subsection{原理和适用条件}")
     body.append("")
-    body.append(escape_text(FAMILY_METHODS[family_key]))
-    body.append("")
+    for paragraph in family_case_led_paragraphs(family_key, problems):
+        body.append(escape_text(paragraph))
+        body.append("")
     body.append(family_diagram(family))
     body.append("")
-    body.append("\\subsection{题型分流}")
+    body.append("\\subsection{LeetCode 案例分流}")
     body.append("")
     body.append(family_scenarios(family_key, family))
     body.append("")
@@ -2068,6 +2111,10 @@ def append_family_section(body: list[str], family_key: str, problems: list[Probl
     body.append(family_case_index(problems))
     body.append("")
     body.append(family_case_matrix(problems))
+    body.append("")
+    body.append("\\subsection{共性落点}")
+    body.append("")
+    body.append(family_method_note(family_key, family))
     body.append("")
     body.append("\\subsection{案例推导}")
     body.append("")
@@ -2080,7 +2127,7 @@ def append_family_section(body: list[str], family_key: str, problems: list[Probl
     body.append("")
     body.append(
         escape_text(
-            "复盘时先挑一个最小样例手算暴力版本，再挑一个会打破错误模板的反例，最后用本节案例矩阵中的相邻题互相比较。能说清楚相邻题为什么不能共用同一状态，才算掌握这一类题。"
+            family_case_bridge(problems)
         )
     )
     body.append("")
@@ -2093,7 +2140,7 @@ def write_problem_groups() -> None:
         title = GROUP_TITLES[filename]
         body: list[str] = [
             escape_text(
-                f"{title} 按题型拆成章内大节，每个大节内部固定分成原理、分流、案例矩阵、案例推导和实验复盘几个小节。这样读者先建立结构，再读案例，不会被题号清单打断。"
+                f"{title} 按题型拆成章内大节，但每个大节都先从 LeetCode 案例切入，再进入分流、案例矩阵、案例推导和实验复盘。这样读者看到的是从具体题推到规律，而不是先读抽象方法再猜它能用在哪。"
             ),
             "",
         ]
@@ -2121,7 +2168,7 @@ def write_expansion_topics() -> None:
             "\\section{数据结构变种、工程应用和实验专题}",
             "",
             escape_text(
-                "这一组专题补齐数据结构的变种、工程应用和实验要求。它不是题号清单，而是把同一类结构放到刷题、C++ 容器和系统源码之间比较，帮助读者理解为什么同一个复杂度在不同场景下表现差异很大。"
+                "这一组专题补齐数据结构的变种、工程应用和实验要求。每个专题都把 LeetCode 案例、C++ 容器和系统源码放在一起比较，帮助读者理解为什么同一个复杂度在不同场景下表现差异很大。"
             ),
             "",
         ]
@@ -2147,7 +2194,7 @@ def write_extra_lectures() -> None:
         body.append("\\begin{principlebox}{本节复盘}")
         body.append(
             escape_text(
-                "阅读本节后，请回到相邻章节的例题，把暴力瓶颈、优化依据、状态不变量、C++ 容器成本和边界测试重新写一遍。能把同一思想迁移到变体题，才算真正掌握。"
+                "阅读本节后，请回到相邻章节的 LeetCode 案例，例如 LeetCode 875 爱吃香蕉、LeetCode 72 编辑距离、LeetCode 743 网络延迟时间、LeetCode 215 数组第 K 大，把暴力瓶颈、优化依据、状态不变量、C++ 容器成本和边界测试重新写一遍。能从这些具体题迁移到变体题，才算真正掌握。"
             )
         )
         body.append("\\end{principlebox}")
@@ -2284,7 +2331,7 @@ def write_leetcode_index() -> None:
         "\\chapter{LeetCode 题目索引}",
         "",
         escape_text(
-            f"本附录由案例题库自动生成，和正文、二刷卡、工作坊共用同一份 {len(PROBLEMS)} 道题清单。使用本附录时，不要按题号背答案，而要按主题复盘：暴力枚举对象是什么，瓶颈在哪里，使用的数据结构保存了什么信息，优化为什么不会漏解，边界和复杂度如何证明。"
+            f"本附录由案例题库自动生成，和正文、二刷卡、工作坊共用同一份 {len(PROBLEMS)} 道 LeetCode 案例。使用本附录时，不要按题号背答案，而要任选相邻三题做案例复盘：暴力枚举对象是什么，瓶颈在哪里，使用的数据结构保存了什么信息，优化为什么不会漏解，边界和复杂度如何证明。"
         ),
         "",
     ]
@@ -2315,27 +2362,34 @@ def write_leetcode_index() -> None:
 
 def append_second_pass_family(body: list[str], family_key: str, problems: list[Problem]) -> None:
     family = FAMILIES[family_key]
+    review_problems = problems[:3]
     body.append(f"\\section{{{escape_text(family.name)}：二刷复盘卡}}")
     body.append(
         escape_text(
-            "这一大节只围绕一个题型复盘，不把题号直接铺成目录。阅读时先看复盘目标，再读核心题卡，最后用自测标准检查自己是否能独立重讲。"
+            f"这一大节不重复正文题解，只用 {family_case_names(review_problems)} 做代表抽查。完整题号回附录索引，详细推导回对应主章节题卡。"
         )
     )
     body.append("")
     body.append("\\subsection{复盘目标}")
     body.append("")
+    body.append(escape_text(family_case_bridge(problems)))
+    body.append("")
     body.append(escape_text(SECOND_PASS_PROMPTS[family_key]))
     body.append("")
-    body.append("\\subsection{核心题卡}")
+    body.append("\\subsection{抽查题目}")
     body.append("")
-    for problem in problems:
-        body.append(second_pass_card(problem, family))
+    for problem in review_problems:
+        body.append(
+            escape_text(
+                f"{leetcode_title(problem)}：遮住正文题解，先说题面模型“{problem.model}”，再说暴力瓶颈“{problem.focus}”，最后补一个边界“{problem.edge}”。"
+            )
+        )
         body.append("")
     body.append("\\subsection{自测标准}")
     body.append("")
     body.append(
         escape_text(
-            "二刷时不要只确认自己见过这道题。请遮住答案，先讲题面模型，再讲暴力基线和瓶颈，然后说出优化结构保存了什么、不变量如何排除错误候选、边界实验如何打破错误实现。"
+            f"二刷时不要只确认自己见过这道题。请从 {family_case_names(problems, limit=3)} 中任选一道遮住答案，先讲题面模型，再讲暴力基线和瓶颈，然后说出优化结构保存了什么、不变量如何排除错误候选、边界实验如何打破错误实现。"
         )
     )
     body.append("")
@@ -2347,7 +2401,7 @@ def write_second_pass_cards() -> None:
         "\\section{二刷复盘总览}",
         "",
         escape_text(
-            f"这一组材料用于第二遍和第三遍复习。结构上不再把 {len(PROBLEMS)} 道题直接堆成题号列表，而是按题型分成若干大节；每个题型大节内部只保留复盘目标、核心题卡和自测标准几个小节。"
+            f"这一组材料用于第二遍和第三遍复习，只保留每个题型的代表抽查任务，不再重复 {len(PROBLEMS)} 道题的逐题讲解。完整题目清单在附录索引，完整推导在各主章节题卡。"
         ),
         "",
     ]
@@ -2358,131 +2412,11 @@ def write_second_pass_cards() -> None:
     body.append("\\begin{principlebox}{二刷标准}")
     body.append(
         escape_text(
-            "二刷不是重新看一遍答案，而是把题目变成可讲、可证、可调试、可迁移的知识块。每道题至少回答：暴力瓶颈、优化依据、不变量、复杂度、边界、C++ 成本和一个变体。"
+            "二刷不是重新看一遍答案，而是把每个 LeetCode 案例变成可讲、可证、可调试、可迁移的知识块。每道题至少回答：暴力瓶颈、优化依据、不变量、复杂度、边界、C++ 成本和一个变体。"
         )
     )
     body.append("\\end{principlebox}")
     (OUT_DIR / "generated-second-pass-cards.tex").write_text("\n".join(body) + "\n", encoding="utf-8")
-
-
-def append_detailed_manual_family(body: list[str], family_key: str, problems: list[Problem]) -> None:
-    family = FAMILIES[family_key]
-    body.append(f"\\section{{{escape_text(family.name)}：单点推导手册}}")
-    body.append(
-        escape_text(
-            "这一大节只处理一个题型。小节顺序固定为问题模型、案例矩阵、逐题推导、边界和变体复盘，避免把题目标题变成一堵墙。"
-        )
-    )
-    body.append("")
-    body.append("\\subsection{问题模型}")
-    body.append("")
-    body.append(escape_text(FAMILY_METHODS[family_key]))
-    body.append("")
-    body.append(family_diagram(family))
-    body.append("")
-    body.append("\\subsection{案例矩阵}")
-    body.append("")
-    body.append(family_case_index(problems))
-    body.append("")
-    body.append(family_case_matrix(problems))
-    body.append("")
-    body.append("\\subsection{逐题推导}")
-    body.append("")
-    for problem in problems:
-        body.append(detailed_problem_card(problem, family))
-        body.append("")
-    body.append("\\subsection{边界和变体复盘}")
-    body.append("")
-    body.append(escape_text(SECOND_PASS_PROMPTS[family_key]))
-    body.append("")
-    body.append(
-        escape_text(
-            "复盘时请至少挑三道相邻案例比较：一个用来解释暴力瓶颈，一个用来解释优化结构，一个用来解释边界反例。能讲出它们为什么不能互换解法，才说明题型边界清楚。"
-        )
-    )
-    body.append("")
-
-
-def write_detailed_problem_manual() -> None:
-    problems_by_family = group_problems_by_family()
-    body: list[str] = [
-        "\\section{单点推导手册总览}",
-        "",
-        escape_text(
-            "这一组材料专门解决“每一题思路都要讲清楚”的问题。它按题型拆成大节，每个大节内先讲模型和案例矩阵，再进入逐题段落推导；题号只作为正文案例出现，不再进入标题层级。"
-        ),
-        "",
-    ]
-    for family_key in FAMILY_ORDER:
-        problems = problems_by_family.get(family_key, [])
-        if problems:
-            append_detailed_manual_family(body, family_key, problems)
-    (OUT_DIR / "generated-problem-derivation-manual.tex").write_text("\n".join(body) + "\n", encoding="utf-8")
-
-
-def append_workshop_family(body: list[str], family_key: str, problems: list[Problem], index: int) -> int:
-    family = FAMILIES[family_key]
-    body.append(f"\\section{{{escape_text(family.name)}：推导与实验工作坊}}")
-    body.append(
-        escape_text(
-            "这一大节把同一题型的题目放在同一条推导线上。小节固定为原理回顾、暴力到优化、案例推导、实验复盘；每道题只作为正文案例段落，不再占一个标题。"
-        )
-    )
-    body.append("")
-    body.append("\\subsection{原理回顾}")
-    body.append("")
-    body.append(escape_text(FAMILY_METHODS[family_key]))
-    body.append("")
-    body.append(family_diagram(family))
-    body.append("")
-    body.append("\\subsection{暴力到优化}")
-    body.append("")
-    body.append(family_scenarios(family_key, family))
-    body.append("")
-    body.append("\\subsection{案例推导}")
-    body.append("")
-    for problem in problems:
-        body.append(problem_workshop_card(problem, family, index))
-        body.append("")
-        index += 1
-    body.append("\\subsection{实验复盘}")
-    body.append("")
-    body.append(escape_text(SECOND_PASS_PROMPTS[family_key]))
-    body.append("")
-    body.append(
-        escape_text(
-            "实验不要只跑样例。请准备最小输入、极端输入、重复元素、溢出或失效条件，再和暴力版对拍。若优化版和暴力版结果不同，优先检查状态更新顺序和不变量是否被破坏。"
-        )
-    )
-    body.append("")
-    return index
-
-
-def write_problem_workshop() -> None:
-    problems_by_family = group_problems_by_family()
-    body: list[str] = [
-        "\\section{推导与实验工作坊总览}",
-        "",
-        escape_text(
-            "这一组工作坊把前面的题号索引继续展开，但结构不再是一个总标题下面铺满题目。每个题型单独作为大节，大节内部只保留少数固定小节，案例在正文中连续推导。"
-        ),
-        "",
-    ]
-    index = 0
-    for family_key in FAMILY_ORDER:
-        problems = problems_by_family.get(family_key, [])
-        if not problems:
-            continue
-        index = append_workshop_family(body, family_key, problems, index)
-
-    body.append("\\begin{principlebox}{工作坊使用方式}")
-    body.append(
-        escape_text(
-            "不要一次性把本节当题解背完。建议每次选一个题型，先遮住优化落点，只看题面模型和暴力基线，自己写出慢在哪里；再看结构观察和正确性；最后用边界实验做对拍。能完成这个过程，才说明题目进入了自己的知识体系。"
-        )
-    )
-    body.append("\\end{principlebox}")
-    (OUT_DIR / "generated-problem-workshop.tex").write_text("\n".join(body) + "\n", encoding="utf-8")
 
 
 def main() -> int:
@@ -2494,8 +2428,6 @@ def main() -> int:
     write_expansion_topics()
     write_extra_lectures()
     write_second_pass_cards()
-    write_detailed_problem_manual()
-    write_problem_workshop()
     write_leetcode_index()
     return 0
 
