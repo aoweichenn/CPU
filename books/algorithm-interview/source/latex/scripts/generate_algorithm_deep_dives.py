@@ -734,9 +734,14 @@ FAMILY_SCENARIOS: dict[str, list[tuple[str, str, str, str, str]]] = {
 
 def detailed_problem_card(problem: Problem, family: Family) -> str:
     title = leetcode_title(problem)
+    derivation = case_derivation(problem, family)
     return dedent(
         f"""
-        \\noindent\\textbf{{{escape_text(title)}。}} 题面模型：{sentence(problem.model)}。暴力瓶颈：{sentence(problem.focus)}。边界反例：{sentence(problem.edge)}。变体迁移：{sentence(problem.variant)}。
+        \\noindent\\textbf{{{escape_text(title)}。}} 题面模型：{sentence(problem.model)}。暴力瓶颈：{sentence(problem.focus)}。
+
+        {derivation}
+
+        边界反例：{sentence(problem.edge)}。变体迁移：{sentence(problem.variant)}。
         """
     ).strip()
 
@@ -806,7 +811,7 @@ def choose(items: list[str], index: int, offset: int = 0) -> str:
 
 
 WORKSHOP_BRUTE: dict[str, str] = {
-    "array": "先从位置关系入手。本题的单点模型是{model}。朴素版可以为每个位置重新寻找最终状态，或者用辅助数组把答案先做出来；它虽然慢，却能说明哪些位置必须被覆盖。本题真正浪费的部分是{focus}，后面的优化只能消掉这部分重复，不能改变输出语义",
+    "array": "先从位置关系入手。本题的模型是{model}。朴素版可以完整枚举题目要求的对象：单个位置、连续片段、矩阵边界、回文中心或最终排列；它虽然慢，却能先说明答案空间没有漏。本题真正浪费的部分是{focus}，后面的优化只能消掉这部分重复，不能改变输出语义",
     "window": "先枚举所有连续窗口，明确左端、右端和窗口内容怎样决定答案。本题的模型是{model}；暴力版会反复统计相邻窗口中相同的内容。慢点具体落在{focus}，所以后面要证明左端或右端移动时不会漏掉可能答案",
     "prefix_hash": "先用双层循环枚举区间或候选对，再把条件写成历史状态和当前状态的关系。本题的模型是{model}；暴力版的问题不是不会找，而是每个当前位置都回头扫太多历史。优化目标就是把{focus}变成一次查表或一次状态读取",
     "binary": "先用线性扫描或线性试答案保证正确，再找边界。本题的模型是{model}；二分不是为了套循环，而是因为{focus}给出了一条能排除候选的边界线。若这条边界线说不清，宁愿先保留线性版本",
@@ -910,6 +915,104 @@ WORKSHOP_EXPERIMENT: dict[str, str] = {
 }
 
 
+CASE_BRUTE_BASELINES: dict[str, str] = {
+    "array": "先不要急着套数组技巧。把题目对象完整列出来：它可能是某个位置的最终值、一个连续片段、一个中心扩展、一个矩阵边界，或者一个字典序后缀；这样能先确认{model}覆盖了哪些候选，再看哪些重复检查属于{focus}",
+    "window": "先枚举所有左端和右端，把每个窗口的内容、合法条件和答案更新时机写出来。只有手工枚举后确认{model}确实是连续区间问题，才能继续讨论窗口",
+    "prefix_hash": "先双层枚举所有候选区间或候选对。对每个当前位置，写出它需要向历史询问什么；本题的历史询问来自{model}，慢点正是{focus}",
+    "binary": "先线性扫描或从最小答案试到最大答案，明确第一个满足条件的边界在哪里。二分只是把这个边界查找加速，不改变{model}定义的答案",
+    "stack": "先让每个位置向左或向右逐个找答案，记录它等待哪个未来事件。暴力表格会显示哪些候选长期未完成，这正是栈要保存的对象",
+    "heap": "先每一轮从所有候选里线性找最大或最小，写出这一轮被选中的对象和下一轮候选集合如何变化。堆只是在替换这一步动态极值扫描",
+    "greedy": "先用搜索或 DP 思想枚举选择顺序，哪怕只能处理很小输入。然后观察是否存在一个局部选择能被交换到最优解前面，本题要证明的是{focus}",
+    "linked": "先把链表节点顺序写成数组，手动得到目标顺序，再回到节点指针。暴力数组版让{model}清楚，优化版才讨论如何不丢节点地重连",
+    "tree": "先在每个节点暴力重新求子树信息，观察同一棵子树被重复求了多少次。树形优化就是让节点一次性向父节点汇报{focus}需要的信息",
+    "graph": "先画出节点和边，不先选 DFS 或 BFS。把一个状态的完整内容写出来，再用暴力搜索验证{model}会到达哪些状态，之后才谈去重和扩展顺序",
+    "shortest": "先枚举路径或用普通队列试跑一个小图，观察步数最少和代价最小是否一致。只要边权或路径代价不同，{focus}就要求按代价组织扩展",
+    "dsu": "先用 DFS 或 BFS 回答每次连通性查询，观察合并以后哪些关系以后都会保持。并查集只是把这些稳定关系压成集合代表",
+    "backtrack": "先画搜索树前三层：路径里已经选了什么，下一层还能选什么，何时形成答案。本题的{model}必须先在搜索树里出现，剪枝才有对象",
+    "dp": "先写递归搜索树，不写公式。每个节点标出处理到哪里、剩余资源是什么、已经做过哪些选择；重复出现的节点就是状态候选",
+    "knapsack": "先枚举每个物品选或不选、选几次，写出阶段和剩余容量。只要同一阶段同一容量反复出现，就说明可以把搜索压成背包表",
+    "interval": "先两两比较区间，手工判断相交、覆盖或冲突。排序优化只能在端点语义已经清楚之后使用，否则{focus}会被错误排序规则破坏",
+    "bit": "先用集合、数组或布尔表表示状态，确认每个状态字段的含义。位运算只是把这些布尔字段压进整数，不是省略建模过程",
+}
+
+
+CASE_TRACE_PROTOCOLS: dict[str, str] = {
+    "array": "手算时把下标语义写在纸上：当前候选来自哪个位置、哪段区间、哪个中心或哪条边界；每轮状态变化后，都要能指出哪些候选已经确定、哪些候选还没有看",
+    "window": "手算时画一张表，列出 left、right、窗口内容、窗口状态和答案。每次右端进入只加一个元素，每次左端离开只删一个元素",
+    "prefix_hash": "手算时按下标列出当前状态、需要的历史 key、查到的 value、更新后的哈希表。这样能看出先查后插还是先插后查",
+    "binary": "手算时列出 left、mid、right 和谓词真假。每一步都要写出被丢弃的一侧为什么不含答案",
+    "stack": "手算时记录栈内元素的业务含义，不只记录数值。入栈表示答案未定，弹栈表示当前事件已经让它的答案定下来",
+    "heap": "手算时记录堆顶、候选集合和是否有过期元素。每次使用堆顶前都要确认它仍然属于当前问题",
+    "greedy": "手算时同时写一个非贪心选择，与贪心选择比较剩余资源。若无法说明贪心后剩余资源不差，就不能直接下结论",
+    "linked": "手算时画出 prev、cur、next 和下一段头节点。每次改 next 前先保存后继，这是链表推导的安全线",
+    "tree": "手算时从叶子开始写返回值，或者从根开始写传入约束。不要只写访问顺序，要写每条边上传递的信息",
+    "graph": "手算时画队列或栈，状态必须包含题目需要的所有资源。入队时标记还是出队时标记，要和去重语义一致",
+    "shortest": "手算时记录每次弹出的代价、当前距离数组和松弛结果。旧状态被弹出时为什么跳过，也要写在表里",
+    "dsu": "手算时写 parent 表和集合代表。每次 union 只改变根之间的关系，find 后代表相同才说明连通",
+    "backtrack": "手算时给每层标出选择列表和路径。剪枝发生前要指出被剪分支为什么已经不可能得到合法答案",
+    "dp": "手算时先写一个很小的 DP 表或记忆化搜索记录。每个格子旁边写它来自哪些更小状态",
+    "knapsack": "手算时用一个容量很小的例子比较正序和倒序。只要循环方向改变后同一物品能否重复使用发生变化，就说明方向不是细节",
+    "interval": "手算时先排序，再逐个区间写当前结果尾部、当前右端或资源堆。每个区间离开视野时都要说明它不会再影响后续",
+    "bit": "手算时把整数写成二进制，并在每一位旁边标注含义。状态转移只允许改变题目动作允许改变的那些位",
+}
+
+
+CASE_STATE_UPGRADES: dict[str, str] = {
+    "array": "把重复工作收进边界变量、前后缀值、中心扩展结果或慢指针中；状态只保存已经被证明稳定的信息，不让相同区间或相同位置被反复完整检查",
+    "window": "把完整窗口检查改成增量维护；右端负责引入新信息，左端负责恢复合法性或压缩答案，窗口状态必须始终和边界一致",
+    "prefix_hash": "把回头扫描历史改成查表；key 是当前状态需要的历史状态，value 根据目标选择次数、最早位置、最近位置或存在性",
+    "binary": "把逐个试候选改成维护答案所在区间；谓词为真或假时，必须能一次排除一半候选",
+    "stack": "把反复寻找最近边界改成维护未完成候选；新元素只和栈顶比较，连续弹出一批已经被当前元素解决的对象",
+    "heap": "把每轮全量扫描改成堆顶查询；插入、弹出和过期清理共同维护动态候选集",
+    "greedy": "把指数级选择压成一个可证明安全的局部选择；状态通常是当前最远边界、最早结束时间、最小代价或剩余资源",
+    "linked": "把数组辅助结构换成几个稳定指针角色；重连顺序必须保证已处理链合法、未处理链仍可达",
+    "tree": "把对子树的重复扫描压成返回值或队列状态；每个节点只合并孩子给出的稳定信息",
+    "graph": "把重复搜索压成访问标记、距离数组或拓扑状态；邻居生成也要从全量扫描变成结构化枚举",
+    "shortest": "把路径枚举压成距离数组和优先队列；每次只扩展当前最有希望的未过期状态",
+    "dsu": "把连通分量压成代表元；查询只比较代表，合并只发生在两个根之间",
+    "backtrack": "把完整搜索树加上合法性检查、剩余资源剪枝和同层去重；路径状态进入和退出要成对恢复",
+    "dp": "把重复递归节点命名为状态；遍历顺序只是在保证依赖状态已经算完",
+    "knapsack": "把选择树压成阶段和容量；物品是否可重复使用决定一维表的遍历方向",
+    "interval": "把两两比较压成排序后的相邻关系、当前边界或动态有序结构；远离当前边界的区间要被安全归档",
+    "bit": "把集合状态压成掩码；包含、加入、删除、枚举子集都变成位操作，但每一位的题目含义不能丢",
+}
+
+
+CASE_PROOF_CHECKS: dict[str, str] = {
+    "array": "证明从区间不变量开始：已处理区域已经满足题意，未知区域还没有承诺，每次推进不会破坏已处理区域",
+    "window": "证明从左端淘汰开始：被移走的左端对应窗口已经检查完，或继续保留只会让状态更差",
+    "prefix_hash": "证明从代数等价开始：任意合法答案都对应当前状态和某个历史 key，查到的历史 key 也能反推出合法答案",
+    "binary": "证明从排除一半开始：被丢弃区间和目标边界的关系已经由谓词保证，不是靠经验猜测",
+    "stack": "证明从弹出时机开始：被弹出的对象在当前时刻答案已经确定，未来元素无法再改变它",
+    "heap": "证明从候选覆盖开始：所有可能成为下一步答案的对象都在堆中，堆顶过期时不会被使用",
+    "greedy": "证明从交换或领先性开始：任意最优解都能替换成当前贪心选择而不变差，或贪心状态始终不落后",
+    "linked": "证明从链结构开始：已处理链连通、未处理链可达、二者连接点明确，节点没有丢失也没有成环",
+    "tree": "证明从子树归纳开始：孩子状态正确时，父节点按题目规则合并后也正确",
+    "graph": "证明从可达性开始：搜索覆盖所有合法边能到达的状态，访问标记只删除重复状态而不删除不同未来能力",
+    "shortest": "证明从扩展顺序开始：当前弹出的状态在代价规则下已经不会被未来路径改得更优",
+    "dsu": "证明从等价关系开始：合并维护连通性的传递性，find 返回的代表元就是当前集合身份",
+    "backtrack": "证明从搜索树覆盖开始：每个合法答案有且只有一条路径，剪枝只删掉不可能成功的分支",
+    "dp": "证明从最后一步开始：任意最优解的最后一步都在转移枚举中，转移来源已经由更小状态正确计算",
+    "knapsack": "证明从当前物品使用次数开始：0-1、完全、计数和最值的循环语义必须和题意一致",
+    "interval": "证明从排序后的邻接关系开始：已经合并、选择或丢弃的区间不会被更后面的区间重新影响",
+    "bit": "证明从逐位独立或子集归纳开始：被压缩到位里的信息足以决定未来转移",
+}
+
+
+def case_derivation(problem: Problem, family: Family) -> str:
+    family_key = problem.family
+    brute = format_workshop(CASE_BRUTE_BASELINES[family_key], problem)
+    trace = format_workshop(CASE_TRACE_PROTOCOLS[family_key], problem)
+    state = format_workshop(CASE_STATE_UPGRADES[family_key], problem)
+    proof = format_workshop(CASE_PROOF_CHECKS[family_key], problem)
+    invariant = sentence(family.invariant)
+    return (
+        f"从零推导：{brute}。{trace}。"
+        f"瓶颈定位后，{state}。不变量要落到代码上：{invariant}。"
+        f"正确性检查：{proof}。"
+    )
+
+
 def format_workshop(template: str, problem: Problem) -> str:
     values = {
         "model": problem.model.rstrip("。.!！；; "),
@@ -927,12 +1030,15 @@ def problem_workshop_card(problem: Problem, family: Family, index: int) -> str:
     state = format_workshop(WORKSHOP_STATE[family_key], problem)
     proof = format_workshop(WORKSHOP_PROOF[family_key], problem)
     experiment = format_workshop(WORKSHOP_EXPERIMENT[family_key], problem)
+    trace = format_workshop(CASE_TRACE_PROTOCOLS[family_key], problem)
     cpp = escape_text(WORKSHOP_CPP[family_key])
     variant = sentence(problem.variant)
 
     return dedent(
         f"""
         \\noindent\\textbf{{{escape_text(title)}。}} {brute}。
+
+        手算路线：{trace}。
 
         {state}。放到“{escape_text(family.name)}”这条主线里看，关键原则是：{sentence(family.optimization)}。
 
@@ -1208,6 +1314,113 @@ bool is_valid_bst(TreeNode* root)
 }
 
 
+FULL_CASE_DERIVATIONS = r"""
+\section{完整案例推导样例}
+
+下面六个案例不是为了增加题量，而是给全书提供一套可模仿的案例讲法。每个案例都按同一条线展开：先翻译题面，写暴力基线，再定位最贵的重复工作，随后设计状态、不变量和边界测试。以后读到题卡时，请用这一节的粒度要求自己，而不是只记“用什么算法”。
+
+\subsection{LeetCode 76 最小覆盖子串：窗口从暴力检查中长出来}
+
+题目给两个字符串 \code{s} 和 \code{t}，要求在 \code{s} 中找一个最短连续子串，使它包含 \code{t} 中每个字符及其次数。先把题意翻译成算法语言：答案对象是连续区间，合法性由字符频次决定，目标是在合法区间中找最短长度。暴力做法是枚举所有左端和右端，每得到一个子串就重新统计频次并判断是否覆盖 \code{t}。若字符串长度为 \code{n}、字符集大小为 \code{|\Sigma|}，这个做法至少是 \complexity{O(n^2|\Sigma|)}，如果每次重新切片或排序，还会更慢。
+
+以 \code{s = "ADOBECODEBANC"}、\code{t = "ABC"} 为例，暴力从左端 0 开始会先找到 \code{"ADOBEC"}。它已经覆盖 A、B、C，继续向右扩张只会让当前左端对应的窗口更长，所以对“最短”没有帮助。于是可以尝试移动左端。移走 \code{A} 后窗口变成 \code{"DOBEC"}，A 不足，窗口不合法，必须继续右扩直到重新遇到 A。这个手算过程说明了窗口策略：右端负责让窗口获得覆盖能力，左端负责在已经覆盖时尽量缩短。
+
+\begin{center}
+\begin{tabular}{@{}p{0.18\linewidth}p{0.22\linewidth}p{0.44\linewidth}@{}}
+阶段 & 当前窗口 & 结论\\
+右端扩张到 C & \code{ADOBEC} & 第一次覆盖目标，记录长度 6。\\
+左端收缩 & \code{DOBEC} & 移走 A 后不再覆盖，停止收缩。\\
+继续扩张到 A & \code{DOBECODEBA} & 重新覆盖，左侧无关字符可以继续删除。\\
+继续扩张到 C & \code{BANC} & 得到长度 4 的更短合法窗口。\\
+\end{tabular}
+\end{center}
+
+现在再设计状态。若每次判断覆盖都全量比较计数表，仍然比暴力好，但还可以更清楚。 \code{need[ch]} 表示目标需要多少个字符 \code{ch}，\code{window[ch]} 表示当前窗口里有多少个。 \code{required} 是目标中不同字符种类数，\code{formed} 是当前已经满足需求的字符种类数。当某个字符从不足变成刚好满足，\code{formed} 加一；当左端移出字符导致它从满足变成不足，\code{formed} 减一。窗口合法条件就变成 \code{formed == required}。
+
+不变量是：每次进入内层 \code{while} 时，当前窗口覆盖 \code{t}；内层循环每收缩一次都先记录合法答案，再移走左端字符并更新状态；一旦窗口不合法，停止收缩，交给右端继续扩张。每个字符最多进入窗口一次、离开窗口一次，所以时间是 \complexity{O(n + |\Sigma|)}。边界测试要包含 \code{t} 有重复字符、\code{s} 缺少目标字符、最短窗口在开头或结尾、大小写混合、\code{s} 比 \code{t} 短。这个案例的关键不是“用窗口”，而是证明连续区间合法性可以用增删字符维护。
+
+\subsection{LeetCode 560 和为 K 的子数组：前缀哈希不是窗口替代品}
+
+题目要求统计和为 \code{k} 的连续子数组数量，数组中可以有负数。先写暴力：枚举左端 \code{left}，再枚举右端 \code{right}，维护当前区间和，等于 \code{k} 就计数。这个版本覆盖所有连续子数组，复杂度 \complexity{O(n^2)}。它已经比每个区间重新求和的 \complexity{O(n^3)} 好，因为固定左端时复用了当前和；但每个右端仍然要回头看很多历史左端。
+
+为什么不能直接用滑动窗口？因为负数会破坏单调性。右端加入一个负数，窗口和可能变小；左端移走一个负数，窗口和可能变大。于是“和太大就左移、和太小就右移”的判断不再可靠。真正可用的是前缀和代数：若 \code{prefix[j] - prefix[i] == k}，那么区间 \code{[i, j)} 的和就是 \code{k}。扫描到当前前缀 \code{prefix[j]} 时，只需要知道历史里有多少个 \code{prefix[j] - k}。
+
+\begin{center}
+\begin{tabular}{@{}p{0.12\linewidth}p{0.12\linewidth}p{0.14\linewidth}p{0.18\linewidth}p{0.30\linewidth}@{}}
+下标 & 数值 & 当前前缀 & 需要历史 & 新增答案\\
+初始 & -- & 0 & -- & 先记录空前缀一次。\\
+0 & 1 & 1 & -2 & 没有。\\
+1 & 2 & 3 & 0 & 找到 \code{[0,1]}。\\
+2 & 1 & 4 & 1 & 找到 \code{[1,2]}。\\
+3 & 2 & 6 & 3 & 找到 \code{[2,3]}。\\
+\end{tabular}
+\end{center}
+
+哈希表的 key 是历史前缀和，value 是出现次数。为什么是次数？因为同一个前缀和可能出现多次，每一次都对应一个不同左端。为什么 \code{prefix_count[0] = 1}？它表示空前缀出现一次，让从下标 0 开始的合法区间能被统计到。为什么先查询再更新？当前前缀应该和历史前缀配对；如果先更新，在 \code{k = 0} 时会把空区间误算进去。
+
+不变量是：处理当前元素之前，哈希表保存所有当前下标之前的前缀和出现次数；处理当前元素后，先用当前前缀查询答案，再把当前前缀加入历史。时间 \complexity{O(n)}，空间 \complexity{O(n)}。边界测试要包含负数、零、\code{k = 0}、从下标 0 开始的答案、多个相同前缀和、答案数量大于 1。这个案例的迁移点是 value 语义：问数量保存次数，问最长长度保存最早下标，问是否存在保存布尔或下标。
+
+\subsection{LeetCode 875 爱吃香蕉的珂珂：答案二分先证明谓词}
+
+题目给若干堆香蕉和小时数 \code{h}，要求找最小整数速度 \code{k}，使得能在 \code{h} 小时内吃完。先写暴力：速度从 1 开始试到最大堆大小，每个速度都计算总耗时，第一次可行就是答案。这个做法正确，因为答案一定在这个范围内；慢点是速度值域可能很大，每次只排除一个速度。
+
+二分之前必须先定义谓词：\code{can_finish(speed)} 表示以这个速度能否在 \code{h} 小时内吃完。速度越大，每堆耗时 \code{ceil(pile / speed)} 越小或不变，所以如果某个速度可行，所有更大的速度也可行；如果某个速度不可行，所有更小的速度也不可行。答案空间呈现 false、false、true、true 的形状，我们要找第一个 true。
+
+检查函数也要从题意推出来。每小时只能吃同一堆中的香蕉，一堆 \code{pile} 需要的小时数是向上取整的 \code{pile / speed}。整数写法是 \code{(pile + speed - 1) / speed}，但要注意溢出；稳妥做法是用 \code{std::int64_t} 计算。答案下界是 1，上界是最大堆大小，因为速度达到最大堆时，每堆最多一小时。
+
+不变量可以使用左闭右开或左闭右闭，本书对“第一个可行值”常用闭区间收缩写法：\code{left} 和 \code{right} 都可能是答案；若 \code{mid} 可行，答案不在 \code{mid} 右侧，令 \code{right = mid}；若不可行，\code{mid} 及其左侧都不可行，令 \code{left = mid + 1}。循环结束时两者相等，就是最小可行速度。边界测试要包含只有一堆、\code{h} 等于堆数、速度需要等于最大堆、堆值接近 \code{int} 上限。这个案例的关键是：二分不是模板，真正的核心是谓词单调性和边界覆盖。
+
+\subsection{LeetCode 84 柱状图中最大的矩形：弹栈时答案才确定}
+
+题目给一排柱子，要求找最大矩形面积。先从暴力开始：枚举每根柱子作为矩形的最矮柱，向左找第一个比它矮的位置，向右找第一个比它矮的位置，宽度由这两个边界决定。这个做法正确，但每根柱子都可能向两边扫很远，最坏 \complexity{O(n^2)}。慢点在于“第一个更矮边界”被重复寻找。
+
+单调栈的状态来自这个边界需求。维护一个下标栈，栈内柱高严格递增。扫描到新柱子 \code{i} 时，如果它比栈顶更矮，说明栈顶柱子的右侧第一个更矮位置已经找到，就是当前 \code{i}。弹出栈顶 \code{mid} 后，新的栈顶就是 \code{mid} 左侧第一个更矮位置；若栈空，说明左侧没有更矮位置。于是以 \code{heights[mid]} 为最矮柱的最大矩形可以结算。
+
+\begin{center}
+\begin{tabular}{@{}p{0.18\linewidth}p{0.24\linewidth}p{0.40\linewidth}@{}}
+事件 & 栈含义 & 结算逻辑\\
+新柱更高 & 递增关系保持 & 入栈，等待未来右边界。\\
+新柱更矮 & 栈顶右边界确定 & 弹栈，当前下标是右侧更矮位置。\\
+弹栈后 & 新栈顶是左边界 & 宽度为 \code{right-left-1}。\\
+扫描结束 & 仍有柱子未结算 & 用哨兵高度 0 统一弹出。\\
+\end{tabular}
+\end{center}
+
+为什么每根柱子只结算一次？因为它入栈时右侧更矮边界未知，弹出时右侧更矮边界第一次出现，之后它的最大矩形已经确定，未来不会再改变。每个下标最多入栈一次、出栈一次，所以时间 \complexity{O(n)}。相等高度可以用 \code{>=} 或 \code{>} 的不同策略处理，但必须保持宽度计算一致；常见写法是加一个尾部哨兵 0，让所有柱子在最后被弹出。边界测试要包含严格递增、严格递减、全相等、单柱、空数组、包含 0 的高度。
+
+\subsection{LeetCode 994 腐烂的橘子：多源 BFS 是同时扩散}
+
+题目给网格，腐烂橘子每分钟让四邻域的新鲜橘子腐烂，问全部腐烂最少分钟数。暴力模拟很自然：每分钟扫描整张网格，找旁边有腐烂橘子的新鲜橘子，把它们变烂。这个做法正确，但会反复扫描空格、已经腐烂的格子和本分钟不会变化的格子。
+
+把题目翻译成图：每个新鲜或腐烂橘子格子是节点，四方向相邻是无权边，初始腐烂橘子都是源点。一个新鲜橘子的腐烂时间，就是它到最近源点的最短距离。因为所有边的代价都是一分钟，所以 BFS 第一次到达某个新鲜橘子时，就是它最早腐烂时间。多源 BFS 只是把所有源点一开始都放进队列，距离都设为 0。
+
+队列层次就是时间。每轮外层循环开始时，队列里保存的是同一分钟会向外扩散的全部腐烂橘子。记录 \code{level_size}，只处理这一层；本层造成的新腐烂橘子入队，但要等下一分钟再扩散。每腐烂一个新鲜橘子就减少 \code{fresh_count}，最后若新鲜数为 0，分钟数就是答案；若队列空了还有新鲜橘子，说明它们不可达，返回 -1。
+
+不变量是：队列中已经入队的格子都已经被标记为腐烂，避免同一格子被多个邻居重复入队；处理完第 \code{t} 层后，所有最短距离不超过 \code{t} 的可达新鲜橘子已经腐烂。边界测试要包含没有新鲜橘子、没有腐烂橘子、单个格子、被空格隔开的新鲜橘子、多个初始源点同时扩散。这个案例的迁移点是所有多源最短步数问题：先把所有源点以距离 0 入队，而不是为每个源点单独 BFS。
+
+\subsection{LeetCode 72 编辑距离：DP 转移来自最后一步操作}
+
+题目允许插入、删除、替换，把 \code{word1} 变成 \code{word2}，问最少操作数。暴力搜索会在每一步尝试三种操作，搜索树很快膨胀；更重要的是，不同操作序列会反复遇到同一个问题，例如“把 \code{word1} 的前 \code{i} 个字符变成 \code{word2} 的前 \code{j} 个字符”。这就是状态。
+
+定义 \code{dp[i][j]}：把 \code{word1[0..i)} 变成 \code{word2[0..j)} 的最少操作数。初始化由空串决定：\code{dp[i][0] = i}，因为只能删除 \code{i} 次；\code{dp[0][j] = j}，因为只能插入 \code{j} 次。转移看最后一步。若末尾字符相同，最后一个字符不用动，继承 \code{dp[i-1][j-1]}。若不同，最后一步只有三种：删除 \code{word1} 末尾，来自 \code{dp[i-1][j] + 1}；插入 \code{word2} 末尾，来自 \code{dp[i][j-1] + 1}；替换末尾，来自 \code{dp[i-1][j-1] + 1}。
+
+\begin{center}
+\begin{tabular}{@{}p{0.16\linewidth}p{0.42\linewidth}p{0.24\linewidth}@{}}
+操作 & 操作前已经解决的问题 & 候选值\\
+删除 & 少一个 \code{word1} 字符时已能变成目标前缀 & \code{dp[i-1][j] + 1}\\
+插入 & 当前 \code{word1} 已能变成少一个目标字符的前缀 & \code{dp[i][j-1] + 1}\\
+替换 & 两边都少一个末尾字符时已经互相转换 & \code{dp[i-1][j-1] + 1}\\
+\end{tabular}
+\end{center}
+
+遍历顺序按 \code{i}、\code{j} 递增即可，因为每个格子只依赖上方、左方和左上方。时间和空间都是 \complexity{O(mn)}。如果要压缩空间，必须保存左上角旧值，否则 \code{dp[j]} 被覆盖后会丢失替换来源。边界测试要包含空串、完全相同、完全不同、一个字符、前缀相同但后缀不同、后缀相同但前缀不同。这个案例的关键是：DP 公式不是背出来的，而是从最后一步操作逐项推出来的。
+
+\begin{principlebox}{完整案例复盘要求}
+读完一个案例后，请检查自己是否能回答六个问题：暴力枚举对象是什么，暴力为什么保证不漏答案，最贵的重复工作是哪一步，优化状态保存了什么，不变量如何证明不会漏答案，哪三个边界能打破错误写法。回答不出其中任何一个，就说明这题还只是“见过”，没有变成能力。
+\end{principlebox}
+"""
+
+
 EXTRA_LECTURES: list[tuple[str, str, list[str]]] = [
     (
         "generated-sorting-selection-lecture.tex",
@@ -1326,9 +1539,14 @@ EXTRA_LECTURES: list[tuple[str, str, list[str]]] = [
 
 def problem_card(problem: Problem, family: Family) -> str:
     title = leetcode_title(problem)
+    derivation = case_derivation(problem, family)
     return dedent(
         f"""
-        \\noindent\\textbf{{{escape_text(title)}。}} 题目模型：{sentence(problem.model)}。推导重点：{sentence(problem.focus)}。边界：{sentence(problem.edge)}。变体追问：{sentence(problem.variant)}。
+        \\noindent\\textbf{{{escape_text(title)}。}} 题目模型：{sentence(problem.model)}。推导重点：{sentence(problem.focus)}。
+
+        {derivation}
+
+        边界：{sentence(problem.edge)}。变体追问：{sentence(problem.variant)}。
         """
     ).strip()
 
@@ -1466,6 +1684,13 @@ def write_code_snippets() -> None:
         (OUT_DIR / filename).write_text(content.strip() + "\n", encoding="utf-8")
 
 
+def write_full_case_derivations() -> None:
+    (OUT_DIR / "generated-full-case-derivations.tex").write_text(
+        FULL_CASE_DERIVATIONS.strip() + "\n",
+        encoding="utf-8",
+    )
+
+
 def write_expansion_topics() -> None:
     for filename, sections in EXPANSION_TOPICS:
         body: list[str] = [
@@ -1505,9 +1730,10 @@ def write_extra_lectures() -> None:
 
 def second_pass_card(problem: Problem, family: Family) -> str:
     title = leetcode_title(problem)
+    trace = format_workshop(CASE_TRACE_PROTOCOLS[problem.family], problem)
     return dedent(
         f"""
-        \\textbf{{{escape_text(title)}。}} 模型：{sentence(problem.model)}。推导重点：{sentence(problem.focus)}。边界：{sentence(problem.edge)}。变体：{sentence(problem.variant)}。
+        \\textbf{{{escape_text(title)}。}} 模型：{sentence(problem.model)}。推导重点：{sentence(problem.focus)}。手算路线：{trace}。边界：{sentence(problem.edge)}。变体：{sentence(problem.variant)}。
         """
     ).strip()
 
@@ -1698,6 +1924,7 @@ def main() -> int:
     write_deep_sections()
     write_problem_groups()
     write_code_snippets()
+    write_full_case_derivations()
     write_expansion_topics()
     write_extra_lectures()
     write_second_pass_cards()
