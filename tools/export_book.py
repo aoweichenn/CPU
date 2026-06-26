@@ -30,8 +30,8 @@ HYPHEN_LIKE_CHARS = ("-", "‐", "‑", "‒", "–", "—", "―", "－", "−"
 def validate_export_name(name: str, label: str) -> None:
     if not name:
         raise SystemExit(f"{label} name must not be empty")
-    if any(ch in name for ch in (" ", "/", "\\")):
-        raise SystemExit(f"{label} name must not contain spaces or path separators: {name}")
+    if any(ch in name for ch in (" ", "+", "/", "\\")):
+        raise SystemExit(f"{label} name must not contain spaces, '+', or path separators: {name}")
     if any(ch in name for ch in HYPHEN_LIKE_CHARS):
         raise SystemExit(f"{label} name must not contain hyphen-like characters: {name}")
 

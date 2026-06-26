@@ -91,13 +91,13 @@ make cpu2-epub
 make cpu2-text-count
 ```
 
-统一导出第一册、第二册和第三册：
+统一导出第一册、第二册、第三册和算法面试书：
 
 ```bash
 make books-export
 ```
 
-该命令会重新构建三册 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份中文书名 PDF 和一份中文书名 EPUB。EPUB 不再使用 `cpu-volume-1.epub`、`cpu-volume-2.epub`、`cpu-volume-3.epub` 这类带短横线的机器名，避免微信读书导入链路误处理短横线。
+该命令会重新构建四本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
 
 检查和测试算法面试书：
 
