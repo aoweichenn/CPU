@@ -735,15 +735,12 @@ FAMILY_SCENARIOS: dict[str, list[tuple[str, str, str, str, str]]] = {
 def detailed_problem_card(problem: Problem, family: Family) -> str:
     title = leetcode_title(problem)
     derivation = case_derivation(problem, family)
-    return dedent(
-        f"""
-        \\noindent\\textbf{{{escape_text(title)}。}} 题面模型：{sentence(problem.model)}。暴力瓶颈：{sentence(problem.focus)}。
-
-        {derivation}
-
-        边界反例：{sentence(problem.edge)}。变体迁移：{sentence(problem.variant)}。
-        """
-    ).strip()
+    return "\n\n".join(
+        [
+            f"\\noindent\\textbf{{{escape_text(title)}。}} 题面翻译：{sentence(problem.model)}。优化抓手：{sentence(problem.focus)}。",
+            derivation,
+        ]
+    )
 
 
 BRUTE_STEPS = [
@@ -916,23 +913,23 @@ WORKSHOP_EXPERIMENT: dict[str, str] = {
 
 
 CASE_BRUTE_BASELINES: dict[str, str] = {
-    "array": "先不要急着套数组技巧。把题目对象完整列出来：它可能是某个位置的最终值、一个连续片段、一个中心扩展、一个矩阵边界，或者一个字典序后缀；这样能先确认{model}覆盖了哪些候选，再看哪些重复检查属于{focus}",
-    "window": "先枚举所有左端和右端，把每个窗口的内容、合法条件和答案更新时机写出来。只有手工枚举后确认{model}确实是连续区间问题，才能继续讨论窗口",
-    "prefix_hash": "先双层枚举所有候选区间或候选对。对每个当前位置，写出它需要向历史询问什么；本题的历史询问来自{model}，慢点正是{focus}",
-    "binary": "先线性扫描或从最小答案试到最大答案，明确第一个满足条件的边界在哪里。二分只是把这个边界查找加速，不改变{model}定义的答案",
-    "stack": "先让每个位置向左或向右逐个找答案，记录它等待哪个未来事件。暴力表格会显示哪些候选长期未完成，这正是栈要保存的对象",
-    "heap": "先每一轮从所有候选里线性找最大或最小，写出这一轮被选中的对象和下一轮候选集合如何变化。堆只是在替换这一步动态极值扫描",
-    "greedy": "先用搜索或 DP 思想枚举选择顺序，哪怕只能处理很小输入。然后观察是否存在一个局部选择能被交换到最优解前面，本题要证明的是{focus}",
-    "linked": "先把链表节点顺序写成数组，手动得到目标顺序，再回到节点指针。暴力数组版让{model}清楚，优化版才讨论如何不丢节点地重连",
-    "tree": "先在每个节点暴力重新求子树信息，观察同一棵子树被重复求了多少次。树形优化就是让节点一次性向父节点汇报{focus}需要的信息",
-    "graph": "先画出节点和边，不先选 DFS 或 BFS。把一个状态的完整内容写出来，再用暴力搜索验证{model}会到达哪些状态，之后才谈去重和扩展顺序",
-    "shortest": "先枚举路径或用普通队列试跑一个小图，观察步数最少和代价最小是否一致。只要边权或路径代价不同，{focus}就要求按代价组织扩展",
-    "dsu": "先用 DFS 或 BFS 回答每次连通性查询，观察合并以后哪些关系以后都会保持。并查集只是把这些稳定关系压成集合代表",
-    "backtrack": "先画搜索树前三层：路径里已经选了什么，下一层还能选什么，何时形成答案。本题的{model}必须先在搜索树里出现，剪枝才有对象",
-    "dp": "先写递归搜索树，不写公式。每个节点标出处理到哪里、剩余资源是什么、已经做过哪些选择；重复出现的节点就是状态候选",
-    "knapsack": "先枚举每个物品选或不选、选几次，写出阶段和剩余容量。只要同一阶段同一容量反复出现，就说明可以把搜索压成背包表",
-    "interval": "先两两比较区间，手工判断相交、覆盖或冲突。排序优化只能在端点语义已经清楚之后使用，否则{focus}会被错误排序规则破坏",
-    "bit": "先用集合、数组或布尔表表示状态，确认每个状态字段的含义。位运算只是把这些布尔字段压进整数，不是省略建模过程",
+    "array": "慢版本从下标枚举开始：把每个可能位置、片段、中心或边界都按题意检查一遍。它能直接验证{model}，缺点是同一段信息会被重复读取、重复搬移或重复比较",
+    "window": "慢版本枚举所有左端和右端，或在排序后枚举固定点与另一侧配对。它能验证{model}没有漏掉候选；真正浪费的是相邻候选之间有大量状态可以复用，却被重新统计或重新搜索",
+    "prefix_hash": "慢版本枚举所有区间或候选对，再逐个检查条件。把检查式写出来后，可以看到当前状态只缺一个历史状态；这正是从平方枚举走向哈希表的入口",
+    "binary": "慢版本按顺序扫描下标或逐个试答案值，直到遇到目标边界。它能保证找到{model}对应的答案，但每次只排除一个候选，浪费了单调性",
+    "stack": "慢版本让每个位置向左或向右线性寻找边界，或者让每个结构反复等待匹配。它能算出答案，但很多尚未完成的候选会被未来同一个事件一起解决",
+    "heap": "慢版本每轮扫描全部候选来找最大或最小，再更新候选集合。它的答案选择过程清楚，但动态集合每变化一次就重新找极值，代价太高",
+    "greedy": "慢版本枚举选择顺序或用 DP 保留多个可能方案，先确认最优值存在。随后才检查局部选择是否能通过交换或领先性固定下来",
+    "linked": "慢版本可以先把节点顺序抄到数组里，按数组推导目标顺序。回到链表后，难点不再是值的顺序，而是节点身份和 next 指针不能丢",
+    "tree": "慢版本在每个节点重新扫描子树或路径，先求出局部答案。重复扫描暴露了真正状态：每个节点只需要从孩子或父亲那里拿到少量信息",
+    "graph": "慢版本先按题意画出完整状态图，用普通搜索跑通可达性。这个过程用于确认{model}的节点和边，之后再讨论访问标记、层次或代价顺序",
+    "shortest": "慢版本可以枚举路径，或先用普通队列试跑一个小图。它会暴露步数最少和代价最小是否一致；一旦不一致，就必须围绕代价组织状态",
+    "dsu": "慢版本每次合并后用 DFS 或 BFS 重新判断连通性。它正确但重复遍历已有连接；当关系只会合并不会拆开时，可以压成集合代表",
+    "backtrack": "慢版本就是完整搜索树：每层列出选择列表，路径到达终止条件时检查答案。它先保证覆盖所有可能，再把明显无效或重复的分支剪掉",
+    "dp": "慢版本先写递归搜索树：节点表示处理位置、剩余资源和当前选择。只要不同路径反复到达同一个节点，就说明需要把这个节点命名成 DP 状态",
+    "knapsack": "慢版本枚举每个物品选不选、选几次，并记录阶段和剩余容量。相同阶段和容量反复出现时，就可以把指数搜索压成表",
+    "interval": "慢版本对新区间和所有旧区间两两比较，手工判断相交、覆盖或冲突。它能验证端点语义，但排序后很多远离当前边界的区间无需再看",
+    "bit": "慢版本先用集合、数组或布尔表保存状态，逐步执行题目动作。确认每个布尔字段的含义后，才能把它压缩成位，而不是直接写位运算公式",
 }
 
 
@@ -978,6 +975,69 @@ CASE_STATE_UPGRADES: dict[str, str] = {
 }
 
 
+CASE_READING_GUIDES: dict[str, str] = {
+    "array": "读题时先问答案落在哪些下标上，是保留元素、重排元素、计算片段，还是从两侧合成贡献。本题可以压成“{model}”，所以后续所有指针都必须有区间语义",
+    "window": "读题时先确认左右端的语义：它们可能表示连续窗口，也可能表示排序后的双指针候选。本题可以压成“{model}”，因此左右端不是模板变量，而是候选排除和状态变化的触发点",
+    "prefix_hash": "读题时先把条件改写成当前状态与历史状态的关系。本题可以压成“{model}”，所以重点是历史表的 key 和 value 分别代表什么",
+    "binary": "读题时先找候选空间和目标边界。本题可以压成“{model}”，如果{focus}能给出单调谓词，才进入二分",
+    "stack": "读题时先找未完成候选：哪些对象必须等到右侧、未来字符或后续运算符出现。本题可以压成“{model}”，栈只保存这些尚未结算的对象",
+    "heap": "读题时先找动态候选集合以及每一步需要的极值。本题可以压成“{model}”，堆顶必须正好回答下一步选择",
+    "greedy": "读题时先找局部选择消耗什么资源，以及选择之后给未来留下什么边界。本题可以压成“{model}”，{focus}必须能被证明安全",
+    "linked": "读题时先区分节点值、节点身份和连接关系。本题可以压成“{model}”，后续推导要围绕哪些指针会断开、哪些节点仍要可达",
+    "tree": "读题时先判断状态方向：父到子、子到父，还是按层传播。本题可以压成“{model}”，每个节点的输入和输出状态必须写清",
+    "graph": "读题时先定义状态图。本题可以压成“{model}”，状态节点和题目原始位置不一定相同",
+    "shortest": "读题时先区分可达、最少边数和最小代价。本题可以压成“{model}”，{focus}决定扩展顺序",
+    "dsu": "读题时先确认关系是否只增加不删除，且问题只关心同组关系。本题可以压成“{model}”，并查集的代表元就是集合身份",
+    "backtrack": "读题时先画搜索树：层数代表什么，路径保存什么，终止条件是什么。本题可以压成“{model}”，剪枝只能在这个搜索树上说明",
+    "dp": "读题时先找重复子问题，而不是直接背公式。本题可以压成“{model}”，{focus}就是状态之间的依赖关系",
+    "knapsack": "读题时先找阶段、容量、物品使用次数和状态值类型。本题可以压成“{model}”，循环方向由这些条件决定",
+    "interval": "读题时先定义端点语义和冲突条件。本题可以压成“{model}”，排序或有序表只是在利用端点关系",
+    "bit": "读题时先用普通状态解释每一项布尔信息。本题可以压成“{model}”，位运算只是更紧凑的编码",
+}
+
+
+CASE_STATE_FIELDS: dict[str, str] = {
+    "array": "当前下标、已处理前缀边界、未知区边界、答案变量；若有前后缀贡献，还要说明左侧累计值和右侧累计值分别何时更新",
+    "window": "左端、右端、窗口计数或当前双指针和、合法性指标、当前答案；每次移动边界后，状态必须和候选区间或窗口内容一致",
+    "prefix_hash": "当前前缀状态、需要查询的历史 key、哈希表 value 语义、答案累计值；初始化的空前缀必须单独说明",
+    "binary": "left、right、mid、谓词返回值、答案边界含义；每一轮更新都要保留第一个可行值或目标位置",
+    "stack": "栈内对象的业务含义、当前输入、弹出时结算的对象、左边界和右边界；栈中存下标还是值要明确",
+    "heap": "堆元素字段、堆顶比较规则、候选是否过期、答案读取时机；如果需要懒删除，还要保存删除计数",
+    "greedy": "排序后的候选、当前已选方案、剩余资源或最远边界、答案计数；每次局部选择后要能说明当前状态不落后",
+    "linked": "虚拟头、上一段尾、当前段头、当前节点、后继节点；任何改 next 的操作之前都要保存后续入口",
+    "tree": "节点指针、传入约束或返回值、当前答案、层号或路径状态；空节点的返回值必须和状态定义匹配",
+    "graph": "状态编号、邻接生成方式、访问标记、距离或层数、队列内容；若状态含资源，visited 不能只按位置记录",
+    "shortest": "距离数组、优先队列状态、松弛候选、旧状态判定、不可达哨兵；资源约束题还要把资源维度放进状态",
+    "dsu": "parent、size 或 rank、find 返回的代表元、合并时的附加信息；带权或奇偶并查集还要维护到根的关系",
+    "backtrack": "路径、起点或使用标记、剩余目标、答案集合、剪枝条件；进入递归和退出递归必须成对恢复",
+    "dp": "状态下标、状态值语义、初始化、转移来源、遍历顺序；空间压缩时还要指出读到的是旧值还是新值",
+    "knapsack": "物品阶段、容量、状态值、循环方向、取模或不可达哨兵；组合和排列必须用不同循环顺序表达",
+    "interval": "排序后的区间、当前结果尾、扫描右端或资源堆、端点比较规则；动态版本还要保存前驱后继",
+    "bit": "掩码含义、当前位、目标位集合、状态转移和答案读取；负数或高位参与时要说明整数宽度",
+}
+
+
+CASE_IMPLEMENTATION_CHECKPOINTS: dict[str, str] = {
+    "array": "先写清数组长度为 0 或 1 的入口；主循环只推进一个明确边界；答案更新位置要和已处理区间一致",
+    "window": "先更新右端进入，再判断合法性，收缩时先记录答案还是先移走左端要固定；不要让左端回退",
+    "prefix_hash": "先查询还是先插入必须由是否允许空区间决定；哈希表 value 的默认插入副作用要可控",
+    "binary": "检查函数单独写出，mid 不溢出，循环退出条件和返回值配套；每个分支都要解释丢弃区间",
+    "stack": "弹栈前确认栈非空，弹出后再读取新的左边界；相等元素和哨兵高度要有统一策略",
+    "heap": "比较器方向先用小样例验证；每次使用堆顶前清理过期项；堆中保存下标时要能回查原数据",
+    "greedy": "排序键写成业务规则并处理相同关键字；循环中只维护证明需要的状态，不把局部选择和答案更新混在一起",
+    "linked": "所有重连步骤按保存后继、断开或反转、接回前缀、接回后缀的顺序写；最后检查是否形成环或丢节点",
+    "tree": "递归版本先处理空节点；迭代版本的栈元素要带完整状态；全负值、重复值和极端深树要单独测",
+    "graph": "入队时标记还是出队时标记必须一致；方向数组集中定义；多源 BFS 要一次性把所有源点放入初始队列",
+    "shortest": "松弛时只在候选更优时更新；priority_queue 弹出旧状态要跳过；距离加法用更宽整数",
+    "dsu": "find 路径压缩不能破坏附加权值；union 只能连接两个根；合并失败和重复边要保留题意解释",
+    "backtrack": "剪枝条件写在扩展前；同层去重不要误写成全局去重；保存答案时复制当前路径",
+    "dp": "先写未压缩版本校验转移；压缩前后用小表对拍；不可达哨兵参与加法前要检查溢出",
+    "knapsack": "0-1 倒序、完全正序、排列外层容量、组合外层物品；每种循环方向都要能用一个小例子解释",
+    "interval": "排序比较器满足严格弱序；端点相等的处理和题意一致；扫描时只和当前结果尾或当前资源集合交互",
+    "bit": "移位表达式加括号；使用无符号或足够宽类型；枚举子集时确认空集和全集是否包含",
+}
+
+
 CASE_PROOF_CHECKS: dict[str, str] = {
     "array": "证明从区间不变量开始：已处理区域已经满足题意，未知区域还没有承诺，每次推进不会破坏已处理区域",
     "window": "证明从左端淘汰开始：被移走的左端对应窗口已经检查完，或继续保留只会让状态更差",
@@ -1001,16 +1061,29 @@ CASE_PROOF_CHECKS: dict[str, str] = {
 
 def case_derivation(problem: Problem, family: Family) -> str:
     family_key = problem.family
+    reading = format_workshop(CASE_READING_GUIDES[family_key], problem)
     brute = format_workshop(CASE_BRUTE_BASELINES[family_key], problem)
     trace = format_workshop(CASE_TRACE_PROTOCOLS[family_key], problem)
     state = format_workshop(CASE_STATE_UPGRADES[family_key], problem)
+    fields = format_workshop(CASE_STATE_FIELDS[family_key], problem)
+    implementation = format_workshop(CASE_IMPLEMENTATION_CHECKPOINTS[family_key], problem)
     proof = format_workshop(CASE_PROOF_CHECKS[family_key], problem)
     invariant = sentence(family.invariant)
-    return (
-        f"从零推导：{brute}。{trace}。"
-        f"瓶颈定位后，{state}。不变量要落到代码上：{invariant}。"
-        f"正确性检查：{proof}。"
-    )
+    cpp = sentence(family.cpp)
+    model = sentence(problem.model)
+    focus = sentence(problem.focus)
+    edge = sentence(problem.edge)
+    variant = sentence(problem.variant)
+    paragraphs = [
+        f"\\textbf{{读题拆解。}} {reading}。一句话模型是：{model}。这里要先确认答案对象、合法性条件和优化目标，不要把题型名字当成推导。",
+        f"\\textbf{{暴力基线。}} {brute}。这个慢版本的任务是保证不漏答案；它不追求快，只负责给优化版提供对拍基准。随后再引入优化抓手：{focus}。",
+        f"\\textbf{{手算样例。}} {trace}。手算表至少记录输入位置、状态变化、答案更新和停止条件。只写最终答案看不出边界，逐轮记录才能发现状态更新顺序是否错。",
+        f"\\textbf{{状态升级。}} {state}。状态字段建议写成：{fields}。不变量要落到代码上：{invariant}。",
+        f"\\textbf{{代码落点。}} {implementation}。C++ 侧还要落实：{cpp}。",
+        f"\\textbf{{正确性检查。}} {proof}。证明时把算法和暴力版对齐：暴力能覆盖的合法候选仍然会被考虑，优化结构只替代重复检查，不改变答案集合。",
+        f"\\textbf{{边界和变体。}} 先用{edge}做对拍，再回答变体：{variant}。",
+    ]
+    return "\n\n".join(paragraphs)
 
 
 def format_workshop(template: str, problem: Problem) -> str:
@@ -1540,15 +1613,12 @@ EXTRA_LECTURES: list[tuple[str, str, list[str]]] = [
 def problem_card(problem: Problem, family: Family) -> str:
     title = leetcode_title(problem)
     derivation = case_derivation(problem, family)
-    return dedent(
-        f"""
-        \\noindent\\textbf{{{escape_text(title)}。}} 题目模型：{sentence(problem.model)}。推导重点：{sentence(problem.focus)}。
-
-        {derivation}
-
-        边界：{sentence(problem.edge)}。变体追问：{sentence(problem.variant)}。
-        """
-    ).strip()
+    return "\n\n".join(
+        [
+            f"\\noindent\\textbf{{{escape_text(title)}。}} 题目模型：{sentence(problem.model)}。推导重点：{sentence(problem.focus)}。",
+            derivation,
+        ]
+    )
 
 
 def family_scenarios(family_key: str, family: Family) -> str:
