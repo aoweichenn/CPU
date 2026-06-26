@@ -12,9 +12,9 @@ CPU3_EXPORT_DIR := $(EXPORT_ROOT)/从C++到AI计算第三册
 CPU_EXPORT_NAME := 从C++到计算系统第一册
 CPU2_EXPORT_NAME := 从C++到计算系统第二册
 CPU3_EXPORT_NAME := 从C++到AI计算第三册
-CPU_EPUB_NAME := cpu-volume-1
-CPU2_EPUB_NAME := cpu-volume-2
-CPU3_EPUB_NAME := cpu-volume-3
+CPU_EPUB_NAME := $(CPU_EXPORT_NAME)
+CPU2_EPUB_NAME := $(CPU2_EXPORT_NAME)
+CPU3_EPUB_NAME := $(CPU3_EXPORT_NAME)
 
 .PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-text-count cpu3-text-count-chapters cpu3-text-target books-export algo-check algo-pdf algo-epub algo-text-count algo-text-target algo-test clean
 

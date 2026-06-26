@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export one book as one title-named PDF and one ASCII-named EPUB."""
+"""Export one book as one title-named PDF and one title-named EPUB."""
 
 from __future__ import annotations
 
@@ -24,13 +24,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def validate_epub_name(name: str) -> None:
+HYPHEN_LIKE_CHARS = ("-", "‐", "‑", "‒", "–", "—", "―", "－", "−")
+
+
+def validate_export_name(name: str, label: str) -> None:
     if not name:
-        raise SystemExit("EPUB name must not be empty")
-    if name != name.encode("ascii", errors="ignore").decode("ascii"):
-        raise SystemExit(f"EPUB name must be ASCII for WeRead import compatibility: {name}")
-    if any(ch in name for ch in (" ", "+", "/", "\\")):
-        raise SystemExit(f"EPUB name must not contain spaces, '+', or path separators: {name}")
+        raise SystemExit(f"{label} name must not be empty")
+    if any(ch in name for ch in (" ", "/", "\\")):
+        raise SystemExit(f"{label} name must not contain spaces or path separators: {name}")
+    if any(ch in name for ch in HYPHEN_LIKE_CHARS):
+        raise SystemExit(f"{label} name must not contain hyphen-like characters: {name}")
 
 
 def ensure_under_allowed_root(path: Path) -> None:
@@ -54,7 +57,8 @@ def clean_dest(dest: Path) -> None:
 
 
 def export_book(source: Path, dest: Path, pdf_name: str, epub_name: str) -> None:
-    validate_epub_name(epub_name)
+    validate_export_name(pdf_name, "PDF")
+    validate_export_name(epub_name, "EPUB")
     missing = [source_file for source_file in SOURCE_FILES if not (source / source_file).is_file()]
     if missing:
         raise SystemExit(f"missing build artifacts in {source}: {', '.join(missing)}")
