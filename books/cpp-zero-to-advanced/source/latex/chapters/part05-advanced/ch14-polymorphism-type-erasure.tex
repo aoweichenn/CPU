@@ -1,0 +1,211 @@
+\chapter{继承、多态和类型擦除}
+
+\section{问题入口：多个数据源如何统一使用}
+
+假设一个服务需要读取用户信息。测试时从内存读取，生产环境从文件读取，未来可能从数据库读取。最差的写法是在业务逻辑里写分支：
+
+\begin{lstlisting}[language=C++,caption={业务逻辑直接判断数据源类型}]
+if (mode == "memory") {
+    // 从内存找用户
+} else if (mode == "file") {
+    // 从文件找用户
+} else if (mode == "database") {
+    // 从数据库找用户
+}
+\end{lstlisting}
+
+这个写法让业务逻辑知道太多环境细节。每新增一种数据源，都要修改业务代码。更好的方向是定义共同接口，让业务只依赖“能按 ID 查用户”这个能力。
+
+\section{虚函数接口}
+
+经典运行期多态用抽象基类：
+
+\begin{lstlisting}[language=C++,caption={用户仓库接口}]
+class UserRepository {
+public:
+    virtual ~UserRepository() = default;
+    [[nodiscard]] virtual std::optional<UserRecord> find_by_id(int id) const = 0;
+};
+\end{lstlisting}
+
+内存实现：
+
+\begin{lstlisting}[language=C++,caption={内存仓库实现}]
+class InMemoryUserRepository final : public UserRepository {
+public:
+    void add(UserRecord user)
+    {
+        this->users_[user.id] = std::move(user);
+    }
+
+    [[nodiscard]] std::optional<UserRecord> find_by_id(int id) const override
+    {
+        const auto found = this->users_.find(id);
+        if (found == this->users_.end()) {
+            return std::nullopt;
+        }
+        return found->second;
+    }
+
+private:
+    std::unordered_map<int, UserRecord> users_;
+};
+\end{lstlisting}
+
+业务服务只依赖接口：
+
+\begin{lstlisting}[language=C++,caption={业务逻辑不关心数据源}]
+class GreetingService {
+public:
+    explicit GreetingService(const UserRepository& repository)
+        : repository_{repository}
+    {
+    }
+
+    [[nodiscard]] std::string greeting_for(int id) const
+    {
+        const std::optional<UserRecord> user = this->repository_.find_by_id(id);
+        if (!user.has_value()) {
+            return "unknown user";
+        }
+        return "hello, " + user->name;
+    }
+
+private:
+    const UserRepository& repository_;
+};
+\end{lstlisting}
+
+虚函数的价值是运行期替换实现。测试和生产可以传不同对象，业务代码不用重新编译成模板实例。
+
+\section{继承不是为了复用字段}
+
+很多继承层次出问题，是因为把继承当成“共享成员变量”的工具。比如 \code{Cat} 和 \code{Dog} 都有名字，就让它们继承 \code{AnimalBase}。如果没有真正的多态行为，这种继承往往只会增加耦合。
+
+优先组合：
+
+\begin{lstlisting}[language=C++,caption={组合共享数据}]
+struct NamedEntity {
+    std::string name;
+};
+
+class Cat {
+public:
+    explicit Cat(std::string name)
+        : identity_{std::move(name)}
+    {
+    }
+
+private:
+    NamedEntity identity_;
+};
+\end{lstlisting}
+
+继承应当表达“可以通过基类接口使用派生对象”。如果没有这个需求，不要为了少写一个字段引入继承。
+
+\section{虚析构函数为什么必要}
+
+如果通过基类指针删除派生对象，基类析构函数必须是虚的：
+
+\begin{lstlisting}[language=C++,caption={多态基类需要虚析构}]
+class Plugin {
+public:
+    virtual ~Plugin() = default;
+    virtual void run() = 0;
+};
+\end{lstlisting}
+
+否则删除 \code{Plugin*} 时，派生类析构可能不执行，资源泄漏。只要一个类有虚函数并打算作为基类使用，虚析构通常就是必要的。
+
+\section{override 和 final}
+
+\code{override} 让编译器检查你确实重写了基类虚函数：
+
+\begin{lstlisting}[language=C++,caption={override 防止签名写错}]
+class FileUserRepository final : public UserRepository {
+public:
+    [[nodiscard]] std::optional<UserRecord> find_by_id(int id) const override;
+};
+\end{lstlisting}
+
+如果你不小心少写 \code{const}，编译器会报错，而不是悄悄定义一个新函数。\code{final} 表示这个类不再作为基类继续派生，能让设计意图更明确。
+
+\section{类型擦除：不暴露具体类型}
+
+\code{std::function} 是一种类型擦除：调用者只知道它能按某个签名调用，不知道里面是函数指针、lambda 还是函数对象。我们也可以用它替代简单接口：
+
+\begin{lstlisting}[language=C++,caption={用函数包装查找能力}]
+using FindUser = std::function<std::optional<UserRecord>(int)>;
+
+class GreetingService2 {
+public:
+    explicit GreetingService2(FindUser find_user)
+        : find_user_{std::move(find_user)}
+    {
+    }
+
+    [[nodiscard]] std::string greeting_for(int id) const
+    {
+        const std::optional<UserRecord> user = this->find_user_(id);
+        if (!user.has_value()) {
+            return "unknown user";
+        }
+        return "hello, " + user->name;
+    }
+
+private:
+    FindUser find_user_;
+};
+\end{lstlisting}
+
+这种方式适合只有一两个操作的小接口。操作很多、需要共享状态和清晰生命周期时，抽象基类可能更合适。类型擦除不是继承的替代宗教，而是另一个工具。
+
+\section{variant：封闭集合的多态}
+
+如果可能类型是封闭的，比如输入可以是文件、标准输入或内存字符串，可以用 \code{std::variant}：
+
+\begin{lstlisting}[language=C++,caption={封闭类型集合用 variant}]
+struct FileInput {
+    std::filesystem::path path;
+};
+
+struct StdinInput {
+};
+
+struct MemoryInput {
+    std::string text;
+};
+
+using InputSource = std::variant<FileInput, StdinInput, MemoryInput>;
+\end{lstlisting}
+
+处理时用 \code{std::visit}：
+
+\begin{lstlisting}[language=C++,caption={访问 variant}]
+std::string load_input(const InputSource& source)
+{
+    return std::visit([](const auto& item) -> std::string {
+        return load_from(item);
+    }, source);
+}
+\end{lstlisting}
+
+新增一种输入类型时，编译器会帮助你找到需要处理的地方。虚函数适合开放集合，\code{variant} 适合封闭集合。先判断变化方向，再选机制。
+
+\section{多态选择表}
+
+\begin{longtable}{p{0.28\linewidth}p{0.28\linewidth}p{0.34\linewidth}}
+\toprule
+场景 & 机制 & 取舍 \\
+\midrule
+运行期替换多个实现 & 虚函数接口 & 稳定边界，有间接调用成本 \\
+小型回调或策略 & \code{std::function} & 简单灵活，可能类型擦除开销 \\
+编译期已知策略 & 模板参数 & 可内联，编译膨胀和报错更重 \\
+封闭类型集合 & \code{std::variant} & 编译期穷尽检查，新增类型需改访问点 \\
+共享少量字段 & 组合 & 耦合低，不提供运行期多态 \\
+\bottomrule
+\end{longtable}
+
+\begin{exercisebox}
+把问候服务分别用虚函数接口、\code{std::function} 和 \code{std::variant} 写三版。比较测试代码、生产组装代码和新增一种数据源时要改哪些地方。不要只看代码行数，要看依赖方向和错误暴露位置。
+\end{exercisebox}

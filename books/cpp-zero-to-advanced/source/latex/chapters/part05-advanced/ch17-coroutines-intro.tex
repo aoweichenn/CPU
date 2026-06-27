@@ -1,0 +1,101 @@
+\chapter{协程入门：异步流程不是线程}
+
+\section{问题入口：回调嵌套为什么难维护}
+
+异步 I/O 常见写法是回调：
+
+\begin{lstlisting}[language=C++,caption={回调嵌套示意}]
+read_request(socket, [socket](Request request) {
+    query_database(request.user_id, [socket](User user) {
+        write_response(socket, make_response(user));
+    });
+});
+\end{lstlisting}
+
+逻辑顺序是“读请求、查数据库、写响应”，但代码结构变成嵌套。错误处理、取消和资源释放会更复杂。协程提供一种把异步流程写得像顺序代码的机制。
+
+\section{协程不是自动多线程}
+
+\cpp20 协程是语言机制，不等于线程池，也不等于事件循环。协程可以暂停和恢复，但谁来恢复它，取决于 awaiter、调度器或库。没有运行时库，语言本身不会替你完成异步 I/O。
+
+伪代码形态：
+
+\begin{lstlisting}[language=C++,caption={协程式异步流程示意}]
+Task<Response> handle(Socket socket)
+{
+    Request request = co_await read_request(socket);
+    User user = co_await query_database(request.user_id);
+    co_return make_response(user);
+}
+\end{lstlisting}
+
+这段代码表达的是控制流形态，不是本书要实现完整协程库。学习重点是理解 \code{co_await}、\code{co_return} 和生命周期边界。
+
+\section{co\_await 的直觉}
+
+\code{co_await something} 大致表示：如果结果还没准备好，当前协程可以暂停，把控制权还给调度器；等结果准备好，再从这里继续。它不是阻塞当前线程等待。阻塞会占住线程，暂停协程则可以让线程去做别的工作。
+
+这也是协程适合 I/O 密集任务的原因：大量请求都在等待网络或磁盘时，不需要为每个请求占一个线程。
+
+\section{协程帧和生命周期}
+
+协程暂停时，局部变量必须保存起来。编译器会把协程的状态放进协程帧。于是协程里的引用、指针和视图仍然要遵守生命周期规则：
+
+\begin{lstlisting}[language=C++,caption={协程中捕获引用的风险示意}]
+Task<void> bad(std::string_view text)
+{
+    co_await delay();
+    use(text); // text 指向的字符串可能已经销毁
+}
+\end{lstlisting}
+
+如果协程会跨越调用者作用域继续运行，就不要保存指向调用者临时数据的视图。需要长期使用的数据应该复制或转移所有权。
+
+\section{取消和异常}
+
+协程流程看起来像同步代码，但错误边界仍然要设计。异步操作可能失败，\code{co_await} 处可能抛异常或返回错误。取消也不是强制销毁一切，而是协作协议：正在等待的操作要能收到取消请求，并让协程走到清理路径。
+
+伪代码：
+
+\begin{lstlisting}[language=C++,caption={协程中的错误边界示意}]
+Task<void> serve_one(Socket socket)
+{
+    try {
+        Request request = co_await read_request(socket);
+        Response response = co_await build_response(request);
+        co_await write_response(socket, response);
+    } catch (const std::exception& error) {
+        log_error(error.what());
+    }
+}
+\end{lstlisting}
+
+捕获异常必须有目的。这里是在请求边界记录错误，防止一个请求失败影响整个服务循环。
+
+\section{什么时候不需要协程}
+
+协程不是所有异步问题的默认答案。下面场景普通代码更合适：
+
+\begin{itemize}
+  \item 简单后台任务，用 \code{std::jthread} 足够。
+  \item CPU 密集并行，用线程池和任务分解更直接。
+  \item 项目没有成熟协程库或调度器。
+  \item 团队还无法调试协程栈和生命周期问题。
+\end{itemize}
+
+协程适合大量异步等待、流程嵌套严重、已有可靠异步运行时的场景。
+
+\section{从回调到状态机}
+
+即使不用协程，也可以把异步流程看成状态机：
+
+\begin{lstlisting}[caption={请求处理状态}]
+ReadRequest -> QueryUser -> WriteResponse -> Done
+                          -> Failed
+\end{lstlisting}
+
+协程的一个价值，是让编译器帮你保存状态机的局部状态。理解这一点，就不会把协程误解成神秘语法。它是在帮你表达“可暂停的函数”。
+
+\begin{exercisebox}
+把“读文件、解析配置、启动服务”写成三步伪异步流程。先用回调写，再用协程伪代码写。比较错误处理放在哪里更清楚。重点不是编译运行，而是理解控制流形状。
+\end{exercisebox}

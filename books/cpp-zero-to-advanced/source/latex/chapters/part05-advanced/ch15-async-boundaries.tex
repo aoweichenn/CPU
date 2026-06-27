@@ -1,0 +1,156 @@
+\chapter{异步边界、取消和背压}
+
+\section{问题入口：任务提交得比处理快怎么办}
+
+任务队列项目里，生产者可以无限 \code{push}。如果生产速度长期超过消费速度，内存会一直增长。并发系统不能只问“怎么让线程跑起来”，还要问“过载时怎么办”。这就是背压：系统用某种方式让上游知道下游处理不过来。
+
+最简单的背压是有界队列：
+
+\begin{lstlisting}[language=C++,caption={有界队列状态}]
+class BoundedQueue {
+public:
+    explicit BoundedQueue(std::size_t capacity)
+        : capacity_{capacity}
+    {
+    }
+
+private:
+    std::size_t capacity_ = 0;
+    std::queue<Task> tasks_;
+    bool closed_ = false;
+    std::mutex mutex_;
+    std::condition_variable not_empty_;
+    std::condition_variable not_full_;
+};
+\end{lstlisting}
+
+有界队列必须定义队列满时的行为：阻塞等待、返回失败、丢弃旧任务还是丢弃新任务。不同业务答案不同。
+
+\section{阻塞提交}
+
+阻塞提交会等待队列有空间：
+
+\begin{lstlisting}[language=C++,caption={队列满时等待}]
+bool push(Task task)
+{
+    std::unique_lock<std::mutex> lock{this->mutex_};
+    this->not_full_.wait(lock, [this] {
+        return this->closed_ || this->tasks_.size() < this->capacity_;
+    });
+    if (this->closed_) {
+        return false;
+    }
+    this->tasks_.push(std::move(task));
+    this->not_empty_.notify_one();
+    return true;
+}
+\end{lstlisting}
+
+这里返回 \code{false} 表示队列已关闭。等待谓词同时检查关闭和容量，否则关闭后生产者可能永久阻塞。
+
+\section{消费后通知空间}
+
+消费者取走任务后，要通知可能等待的生产者：
+
+\begin{lstlisting}[language=C++,caption={取任务后通知未满条件}]
+std::optional<Task> pop()
+{
+    std::unique_lock<std::mutex> lock{this->mutex_};
+    this->not_empty_.wait(lock, [this] {
+        return this->closed_ || !this->tasks_.empty();
+    });
+    if (this->tasks_.empty()) {
+        return std::nullopt;
+    }
+    Task task = std::move(this->tasks_.front());
+    this->tasks_.pop();
+    this->not_full_.notify_one();
+    return task;
+}
+\end{lstlisting}
+
+两个条件变量分别表达“非空”和“未满”。用一个条件变量也能做，但两个名字更清楚。并发代码里的名字是文档，能减少误用。
+
+\section{取消是协作协议}
+
+\cpp20 的 \code{std::stop_token} 表达协作取消。它不会强行杀线程，工作代码必须检查：
+
+\begin{lstlisting}[language=C++,caption={检查停止请求}]
+void worker(std::stop_token token, BoundedQueue& queue)
+{
+    while (!token.stop_requested()) {
+        std::optional<Task> task = queue.pop();
+        if (!task.has_value()) {
+            return;
+        }
+        (*task)();
+    }
+}
+\end{lstlisting}
+
+如果 \code{pop} 会长期阻塞，还需要在停止时关闭队列或通知条件变量。取消信号和阻塞等待必须配套设计。
+
+\section{future 的异常传播}
+
+异步任务如果抛异常，调用者应该能拿到。可以用 \code{std::promise} 和 \code{std::future}：
+
+\begin{lstlisting}[language=C++,caption={用 promise 传递异常}]
+std::future<void> submit(TaskQueue& queue, std::function<void()> task)
+{
+    auto promise = std::make_shared<std::promise<void>>();
+    std::future<void> future = promise->get_future();
+    queue.push([promise, task = std::move(task)] {
+        try {
+            task();
+            promise->set_value();
+        } catch (...) {
+            promise->set_exception(std::current_exception());
+        }
+    });
+    return future;
+}
+\end{lstlisting}
+
+调用者执行 \code{future.get()} 时，如果任务失败，会重新抛出异常。这个边界比在工作线程里打印错误更可组合。
+
+\section{异步接口要说明生命周期}
+
+如果异步任务捕获引用，就要保证引用对象活到任务执行结束：
+
+\begin{lstlisting}[language=C++,caption={异步引用捕获风险}]
+std::string message = "hello";
+executor.submit([&message] {
+    write_log(message);
+});
+\end{lstlisting}
+
+如果 \code{message} 在任务执行前销毁，lambda 就悬空。更安全的是按值捕获：
+
+\begin{lstlisting}[language=C++,caption={异步任务按值捕获数据}]
+std::string message = "hello";
+executor.submit([message = std::move(message)] {
+    write_log(message);
+});
+\end{lstlisting}
+
+异步边界的保守规则：任务跨线程、跨时间保存时，捕获自己需要的数据；需要共享对象时，用明确的共享所有权或生命周期管理协议。
+
+\section{过载策略表}
+
+\begin{longtable}{p{0.25\linewidth}p{0.30\linewidth}p{0.35\linewidth}}
+\toprule
+策略 & 行为 & 适用场景 \\
+\midrule
+阻塞生产者 & 队列满时等待 & 不能丢任务，允许上游变慢 \\
+返回失败 & 队列满时提交失败 & 调用者能降级或重试 \\
+丢弃新任务 & 满时拒绝新任务 & 实时刷新类任务 \\
+丢弃旧任务 & 保留最新任务 & 状态采样、监控刷新 \\
+扩容队列 & 临时吸收峰值 & 峰值短、内存可控 \\
+\bottomrule
+\end{longtable}
+
+不要默认无限队列。无限队列只是把过载问题延后成内存问题。
+
+\begin{exercisebox}
+把任务队列改成有界队列，容量为 \code{2}。写测试验证：队列满时 \code{try_push} 返回失败；关闭后等待中的生产者被唤醒；消费者取走任务后生产者可以继续提交。
+\end{exercisebox}

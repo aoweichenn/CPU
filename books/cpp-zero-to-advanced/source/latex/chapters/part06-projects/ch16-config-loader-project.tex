@@ -1,0 +1,252 @@
+\chapter{项目三：配置加载器}
+
+\section{项目目标}
+
+这个项目实现一个小型配置加载器。输入是 \code{key=value} 文件，支持注释、空行、重复 key 覆盖、类型转换和必填项校验。输出是一个强类型配置对象。
+
+示例配置：
+
+\begin{lstlisting}[caption={配置文件示例}]
+# server config
+host = 127.0.0.1
+port = 8080
+workers = 4
+log_level = info
+\end{lstlisting}
+
+目标不是写一个通用配置库，而是把字符串处理、错误接口、类型建模、文件 I/O 和测试组织合在一起。配置加载器是非常适合练基本功的项目，因为它看起来简单，但边界很多。
+
+\section{先定义业务配置}
+
+不要让整个程序到处传 \code{unordered_map<string, string>}。读取阶段可以用字符串映射，业务阶段应该使用强类型：
+
+\begin{lstlisting}[language=C++,caption={强类型服务器配置}]
+enum class LogLevel {
+    debug,
+    info,
+    warning,
+    error,
+};
+
+struct ServerConfig {
+    std::string host;
+    int port = 0;
+    int workers = 0;
+    LogLevel log_level = LogLevel::info;
+};
+\end{lstlisting}
+
+这一步把业务要求显式化：\code{port} 是整数，\code{workers} 是整数，\code{log_level} 只能是枚举值。后续代码不需要反复解析字符串。
+
+\section{错误类型要能定位问题}
+
+配置错误需要带上下文：
+
+\begin{lstlisting}[language=C++,caption={配置错误}]
+enum class ConfigErrorKind {
+    file_not_found,
+    invalid_line,
+    missing_key,
+    invalid_value,
+};
+
+struct ConfigError {
+    ConfigErrorKind kind = ConfigErrorKind::invalid_line;
+    int line = 0;
+    std::string key;
+    std::string message;
+};
+
+struct ConfigResult {
+    std::optional<ServerConfig> config;
+    std::optional<ConfigError> error;
+};
+\end{lstlisting}
+
+为什么要有 \code{line} 和 \code{key}？因为用户修配置时需要知道哪里错。错误结构不是为了程序员自娱自乐，而是为了让调用者能做出具体动作。
+
+\section{解析阶段：从行到映射}
+
+先把文件解析成键值映射：
+
+\begin{lstlisting}[language=C++,caption={解析配置条目}]
+using RawConfig = std::unordered_map<std::string, std::string>;
+
+struct RawConfigResult {
+    RawConfig values;
+    std::optional<ConfigError> error;
+};
+
+RawConfigResult parse_raw_config(std::istream& input)
+{
+    RawConfigResult result;
+    std::string line;
+    int line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        try {
+            std::optional<ConfigEntry> entry = parse_config_line(line);
+            if (entry.has_value()) {
+                result.values[entry->key] = entry->value;
+            }
+        } catch (const std::exception& error) {
+            return {.error = ConfigError{
+                .kind = ConfigErrorKind::invalid_line,
+                .line = line_number,
+                .message = error.what(),
+            }};
+        }
+    }
+    return result;
+}
+\end{lstlisting}
+
+重复 key 的规则在这里定义：后者覆盖前者。真实项目也可以记录警告，但规则必须写清楚，不能让行为由容器偶然决定。
+
+\section{类型转换阶段}
+
+字符串转整数要检查完整消费和范围：
+
+\begin{lstlisting}[language=C++,caption={解析整数配置}]
+std::optional<int> parse_int_value(std::string_view text)
+{
+    int value = 0;
+    const char* begin = text.data();
+    const char* end = text.data() + text.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, value);
+    if (ec != std::errc{} || ptr != end) {
+        return std::nullopt;
+    }
+    return value;
+}
+\end{lstlisting}
+
+日志级别是有限集合：
+
+\begin{lstlisting}[language=C++,caption={解析日志级别}]
+std::optional<LogLevel> parse_log_level(std::string_view text)
+{
+    if (text == "debug") {
+        return LogLevel::debug;
+    }
+    if (text == "info") {
+        return LogLevel::info;
+    }
+    if (text == "warning") {
+        return LogLevel::warning;
+    }
+    if (text == "error") {
+        return LogLevel::error;
+    }
+    return std::nullopt;
+}
+\end{lstlisting}
+
+用 \code{enum class} 的好处是后续 \code{switch} 不会把日志级别和普通整数混用。
+
+\section{从映射构造强类型配置}
+
+构造 \code{ServerConfig} 时处理必填项、默认值和范围：
+
+\begin{lstlisting}[language=C++,caption={构造强类型配置}]
+std::optional<std::string_view> find_raw(const RawConfig& raw, std::string_view key)
+{
+    const auto found = raw.find(std::string{key});
+    if (found == raw.end()) {
+        return std::nullopt;
+    }
+    return std::string_view{found->second};
+}
+
+ConfigResult build_server_config(const RawConfig& raw)
+{
+    ServerConfig config;
+
+    const std::optional<std::string_view> host = find_raw(raw, "host");
+    if (!host.has_value()) {
+        return {.error = ConfigError{.kind = ConfigErrorKind::missing_key,
+                                     .key = "host",
+                                     .message = "missing host"}};
+    }
+    config.host = *host;
+
+    const std::optional<std::string_view> port_text = find_raw(raw, "port");
+    const std::optional<int> port = port_text.has_value()
+        ? parse_int_value(*port_text)
+        : std::nullopt;
+    if (!port.has_value() || *port < 1 || *port > 65535) {
+        return {.error = ConfigError{.kind = ConfigErrorKind::invalid_value,
+                                     .key = "port",
+                                     .message = "port must be 1..65535"}};
+    }
+    config.port = *port;
+
+    config.workers = 1;
+    if (const std::optional<std::string_view> workers = find_raw(raw, "workers")) {
+        const std::optional<int> parsed = parse_int_value(*workers);
+        if (!parsed.has_value() || *parsed <= 0) {
+            return {.error = ConfigError{.kind = ConfigErrorKind::invalid_value,
+                                         .key = "workers",
+                                         .message = "workers must be positive"}};
+        }
+        config.workers = *parsed;
+    }
+
+    if (const std::optional<std::string_view> level = find_raw(raw, "log_level")) {
+        const std::optional<LogLevel> parsed = parse_log_level(*level);
+        if (!parsed.has_value()) {
+            return {.error = ConfigError{.kind = ConfigErrorKind::invalid_value,
+                                         .key = "log_level",
+                                         .message = "invalid log level"}};
+        }
+        config.log_level = *parsed;
+    }
+
+    return {.config = std::move(config)};
+}
+\end{lstlisting}
+
+这段代码刻意分阶段：先把文本读成原始映射，再把映射转换成强类型对象。这样解析行格式和业务校验可以分别测试。
+
+\section{文件入口}
+
+最终文件入口很薄：
+
+\begin{lstlisting}[language=C++,caption={加载配置文件}]
+ConfigResult load_config_file(const std::filesystem::path& path)
+{
+    std::ifstream input{path};
+    if (!input) {
+        return {.error = ConfigError{.kind = ConfigErrorKind::file_not_found,
+                                     .message = "cannot open config file"}};
+    }
+
+    RawConfigResult raw = parse_raw_config(input);
+    if (raw.error.has_value()) {
+        return {.error = raw.error};
+    }
+    return build_server_config(raw.values);
+}
+\end{lstlisting}
+
+这里没有把所有逻辑塞进一个函数。文件打开、行解析、类型转换各有边界，错误也能保留上下文。
+
+\section{测试计划}
+
+这个项目至少要覆盖：
+
+\begin{itemize}
+  \item 空行和注释行被忽略。
+  \item 缺少等号返回行号错误。
+  \item 重复 key 使用后者。
+  \item 缺少必填 \code{host} 或 \code{port} 报错。
+  \item \code{port=abc}、\code{port=0}、\code{port=65536} 报错。
+  \item \code{workers} 缺失时使用默认值 \code{1}。
+  \item 非法 \code{log_level} 报错。
+\end{itemize}
+
+测试尽量用 \code{std::istringstream}，不要每个单元测试都创建真实文件。只有 \code{load_config_file} 这一层需要文件系统测试。
+
+\begin{exercisebox}
+给配置加载器增加 \code{include=other.conf}。要求避免递归实现，使用显式队列或栈处理待加载文件，并检测重复包含。写清楚相对路径以哪个目录为基准。
+\end{exercisebox}

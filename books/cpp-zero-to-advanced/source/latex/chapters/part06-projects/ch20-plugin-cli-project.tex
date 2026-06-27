@@ -1,0 +1,164 @@
+\chapter{项目七：插件式命令行工具}
+
+\section{项目目标}
+
+本项目实现一个插件式命令行工具骨架。它支持多个子命令，例如 \code{wordfreq}、\code{fileindex}、\code{configcheck}。每个子命令有自己的参数解析和执行逻辑，主程序只负责分发。
+
+目标用法：
+
+\begin{lstlisting}[language=bash,caption={插件式 CLI 用法}]
+tool wordfreq --input article.txt --top 20
+tool fileindex --root ./src --top 10
+tool configcheck --path server.conf
+\end{lstlisting}
+
+这个项目训练大型代码组织：接口、注册表、命令边界、错误码和测试替身。
+
+\section{命令接口}
+
+每个命令都实现同一个接口：
+
+\begin{lstlisting}[language=C++,caption={命令接口}]
+struct CommandContext {
+    std::ostream& output;
+    std::ostream& error;
+};
+
+class Command {
+public:
+    virtual ~Command() = default;
+    [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+    [[nodiscard]] virtual int run(std::span<const std::string_view> args,
+                                  CommandContext context) const = 0;
+};
+\end{lstlisting}
+
+为什么 \code{CommandContext} 里放输出流？这样测试命令时可以传 \code{std::ostringstream}，不用真的写终端。接口从一开始就为测试留出边界。
+
+\section{命令注册表}
+
+\begin{lstlisting}[language=C++,caption={命令注册表}]
+class CommandRegistry {
+public:
+    void add(std::unique_ptr<Command> command)
+    {
+        const std::string key{command->name()};
+        this->commands_[key] = std::move(command);
+    }
+
+    [[nodiscard]] const Command* find(std::string_view name) const
+    {
+        const auto found = this->commands_.find(std::string{name});
+        if (found == this->commands_.end()) {
+            return nullptr;
+        }
+        return found->second.get();
+    }
+
+private:
+    std::unordered_map<std::string, std::unique_ptr<Command>> commands_;
+};
+\end{lstlisting}
+
+注册表拥有命令对象，所以用 \code{std::unique_ptr<Command>}。查找返回裸指针，只表示观察，不转移所有权。这个接口把拥有和观察区分开了。
+
+\section{主分发逻辑}
+
+\begin{lstlisting}[language=C++,caption={命令分发}]
+int dispatch(const CommandRegistry& registry,
+             std::span<const std::string_view> args,
+             CommandContext context)
+{
+    if (args.empty()) {
+        context.error << "missing command\n";
+        return 2;
+    }
+
+    const Command* command = registry.find(args.front());
+    if (command == nullptr) {
+        context.error << "unknown command: " << args.front() << '\n';
+        return 2;
+    }
+
+    return command->run(args.subspan(1), context);
+}
+\end{lstlisting}
+
+分发器不关心 \code{wordfreq} 怎么解析参数，也不关心 \code{fileindex} 怎么扫描文件。这就是边界。新增命令时，主分发逻辑不需要修改。
+
+\section{实现一个 configcheck 命令}
+
+\begin{lstlisting}[language=C++,caption={配置检查命令}]
+class ConfigCheckCommand final : public Command {
+public:
+    [[nodiscard]] std::string_view name() const noexcept override
+    {
+        return "configcheck";
+    }
+
+    [[nodiscard]] int run(std::span<const std::string_view> args,
+                          CommandContext context) const override
+    {
+        if (args.size() != 2 || args[0] != "--path") {
+            context.error << "usage: configcheck --path FILE\n";
+            return 2;
+        }
+
+        const ConfigResult result = load_config_file(std::filesystem::path{args[1]});
+        if (result.error.has_value()) {
+            context.error << result.error->message << '\n';
+            return 1;
+        }
+        context.output << "ok\n";
+        return 0;
+    }
+};
+\end{lstlisting}
+
+命令内部可以调用配置加载器项目。这样前面的项目不是孤立练习，而是能组合进更大的工具。
+
+\section{注册命令}
+
+\begin{lstlisting}[language=C++,caption={组装命令}]
+CommandRegistry build_registry()
+{
+    CommandRegistry registry;
+    registry.add(std::make_unique<ConfigCheckCommand>());
+    registry.add(std::make_unique<WordFreqCommand>());
+    registry.add(std::make_unique<FileIndexCommand>());
+    return registry;
+}
+\end{lstlisting}
+
+这里的 \code{build_registry} 是装配层。它知道具体命令类型，业务分发器不知道。装配层集中依赖具体实现，是大型项目常见组织方式。
+
+\section{测试分发器}
+
+可以写一个假命令：
+
+\begin{lstlisting}[language=C++,caption={测试用假命令}]
+class FakeCommand final : public Command {
+public:
+    [[nodiscard]] std::string_view name() const noexcept override
+    {
+        return "fake";
+    }
+
+    [[nodiscard]] int run(std::span<const std::string_view> args,
+                          CommandContext context) const override
+    {
+        context.output << "args=" << args.size() << '\n';
+        return 0;
+    }
+};
+\end{lstlisting}
+
+测试分发器时，不需要真实扫描文件或读取配置。只验证：缺命令报错，未知命令报错，已知命令收到剩余参数。这就是依赖抽象的测试价值。
+
+\section{插件化的下一步}
+
+本章的“插件式”还是编译期注册。真正动态插件还涉及动态库加载、ABI 稳定、版本协商和安全边界。不要一开始就做动态插件。先把命令接口、注册表和测试边界做好，已经能支撑大多数内部工具。
+
+\begin{exercisebox}
+给 CLI 增加 \code{help} 命令。要求每个命令提供 \code{usage()}，\code{help} 能列出所有命令。思考注册表是否应该保留命令顺序；如果需要稳定顺序，应该增加什么数据结构？
+\end{exercisebox}

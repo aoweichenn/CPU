@@ -1,0 +1,160 @@
+\chapter{表达式、作用域和常量}
+
+\section{问题入口：一行表达式为什么读不懂}
+
+初学者经常写出能编译但难读的表达式：
+
+\begin{lstlisting}[language=C++,caption={压缩过度的表达式}]
+if (i++ < values.size() && values[i] > limit || force) {
+    process(values[i]);
+}
+\end{lstlisting}
+
+这行代码的问题不只是运算符优先级。它同时修改 \code{i}、访问容器、判断开关，还混合了 \code{&&} 和 \code{||}。读者必须在脑子里模拟执行顺序。更严重的是，\code{i++} 后再访问 \code{values[i]}，访问的是递增后的下标，可能不是作者想要的。
+
+第一条规则：表达式不是越短越好。只要一行表达式同时做“修改状态”和“判断业务”，就值得拆开。
+
+\section{副作用要显式}
+
+副作用指表达式除了计算值，还改变了某些状态。自增、赋值、函数调用都可能有副作用。把副作用拆出来：
+
+\begin{lstlisting}[language=C++,caption={拆开状态推进和判断}]
+const std::size_t current = i;
+++i;
+
+const bool in_range = current < values.size();
+const bool accepted = in_range && values[current] > limit;
+if (accepted || force) {
+    process(values[current]);
+}
+\end{lstlisting}
+
+这个版本更长，但每一步都能命名。命名不是废话，它把中间含义固定下来，也让调试器里能直接观察。
+
+\section{作用域限制变量生命}
+
+变量作用域越大，读者越难判断它在哪里被修改。先看反例：
+
+\begin{lstlisting}[language=C++,caption={变量作用域过大}]
+int result = 0;
+// 很多代码
+for (int value : values) {
+    result += value;
+}
+// 又有很多代码使用 result
+\end{lstlisting}
+
+如果 \code{result} 只用于求和后立即返回，就让它待在小作用域里：
+
+\begin{lstlisting}[language=C++,caption={把变量限制在使用附近}]
+int sum_values(std::span<const int> values)
+{
+    int result = 0;
+    for (int value : values) {
+        result += value;
+    }
+    return result;
+}
+\end{lstlisting}
+
+函数本身也是作用域工具。把独立计算抽成函数，变量生命周期自然缩短，错误传播范围也缩小。
+
+\section{const 和 constexpr}
+
+\code{const} 表示对象初始化后不能通过这个名字修改：
+
+\begin{lstlisting}[language=C++,caption={const 表达不再修改}]
+const int max_retry_count = 3;
+\end{lstlisting}
+
+\code{constexpr} 表示值可以在编译期求出：
+
+\begin{lstlisting}[language=C++,caption={编译期常量}]
+constexpr int PORT_MIN = 1;
+constexpr int PORT_MAX = 65535;
+\end{lstlisting}
+
+两者不是同义词。运行时读到的配置值可以是 \code{const}，但不是 \code{constexpr}：
+
+\begin{lstlisting}[language=C++,caption={运行时 const}]
+const int port = read_port_from_config();
+\end{lstlisting}
+
+它不能被修改，但它的值要运行时才知道。理解这个区别，后面学习数组大小、模板参数和编译期计算会轻松很多。
+
+\section{enum class 防止常量混用}
+
+裸整数常量容易混：
+
+\begin{lstlisting}[language=C++,caption={裸整数状态不清楚}]
+constexpr int STATE_OPEN = 1;
+constexpr int COLOR_RED = 1;
+
+int state = COLOR_RED; // 编译器无法阻止
+\end{lstlisting}
+
+用 \code{enum class}：
+
+\begin{lstlisting}[language=C++,caption={强类型枚举}]
+enum class ConnectionState {
+    closed,
+    connecting,
+    open,
+};
+
+enum class Color {
+    red,
+    green,
+};
+\end{lstlisting}
+
+\code{ConnectionState} 和 \code{Color} 是不同类型，不能随便互相赋值。类型系统替你挡住一类低级错误。
+
+\section{switch 要处理完整状态}
+
+枚举常配合 \code{switch}：
+
+\begin{lstlisting}[language=C++,caption={处理连接状态}]
+std::string_view describe(ConnectionState state)
+{
+    switch (state) {
+    case ConnectionState::closed:
+        return "closed";
+    case ConnectionState::connecting:
+        return "connecting";
+    case ConnectionState::open:
+        return "open";
+    }
+    return "unknown";
+}
+\end{lstlisting}
+
+这里保留最后的 \code{return} 是为了满足编译器路径分析。开启警告后，如果以后给枚举增加新状态却忘了处理，编译器通常会提醒。不要随便写 \code{default} 把所有遗漏吞掉；对封闭枚举，显式列出每个状态更利于维护。
+
+\section{完整案例：重试策略}
+
+实现一个重试策略：最多重试三次，只对临时错误重试。
+
+\begin{lstlisting}[language=C++,caption={重试策略}]
+enum class ErrorKind {
+    none,
+    temporary_failure,
+    permanent_failure,
+};
+
+constexpr int RETRY_MAX_ATTEMPTS = 3;
+
+bool should_retry(ErrorKind error, int attempts)
+{
+    if (error != ErrorKind::temporary_failure) {
+        return false;
+    }
+    return attempts < RETRY_MAX_ATTEMPTS;
+}
+\end{lstlisting}
+
+这个小函数看起来简单，但它体现了本章规则：错误类型用枚举表达，魔法数字变成常量，表达式拆成业务判断。测试也很清楚：无错误不重试，永久错误不重试，临时错误在次数内重试，达到上限不重试。
+
+\begin{exercisebox}
+把一个复杂 \code{if} 条件拆成三个具名布尔变量。要求变量名表达业务含义，而不是 \code{a}、\code{b}、\code{flag1}。然后给每个条件组合写测试，确认拆分没有改变行为。
+\end{exercisebox}

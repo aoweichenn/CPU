@@ -1,0 +1,121 @@
+\chapter{原子操作和内存模型入门}
+
+\section{问题入口：atomic 不是万能锁}
+
+原子计数器很简单：
+
+\begin{lstlisting}[language=C++,caption={原子计数器}]
+std::atomic<int> counter{0};
+counter.fetch_add(1);
+\end{lstlisting}
+
+但如果有两个相关字段，单独把它们都做成 atomic 并不自动保护不变量：
+
+\begin{lstlisting}[language=C++,caption={多个 atomic 仍可能不一致}]
+std::atomic<int> used{0};
+std::atomic<int> capacity{100};
+\end{lstlisting}
+
+如果业务不变量是 \code{used <= capacity}，你仍然要设计同步方式。atomic 保证单个原子对象的访问规则，不自动把多个字段组成事务。
+
+\section{数据竞争和逻辑竞争}
+
+atomic 可以消除数据竞争，但不一定消除逻辑竞争。比如库存扣减：
+
+\begin{lstlisting}[language=C++,caption={检查再扣减不是一个原子事务}]
+if (stock.load() > 0) {
+    stock.fetch_sub(1);
+}
+\end{lstlisting}
+
+两个线程可能都看到库存为 \code{1}，然后都扣减。结果变成 \code{-1}。需要用比较交换循环：
+
+\begin{lstlisting}[language=C++,caption={用比较交换做条件更新}]
+bool try_take_one(std::atomic<int>& stock)
+{
+    int current = stock.load();
+    while (current > 0) {
+        if (stock.compare_exchange_weak(current, current - 1)) {
+            return true;
+        }
+    }
+    return false;
+}
+\end{lstlisting}
+
+\code{compare_exchange_weak} 失败时会把当前值写回 \code{current}，循环继续判断。这个例子说明：atomic 代码也要围绕不变量设计。
+
+\section{memory\_order 先保守}
+
+默认原子操作使用顺序一致模型，最容易推理。你可以把它理解成所有线程看到一个全局一致的原子操作顺序。它可能不是最快，但通常是正确起点。
+
+\code{memory_order_relaxed} 只保证这个原子变量本身的读写原子，不建立跨变量同步关系。适合统计计数这类不需要用计数值保护其他数据的场景：
+
+\begin{lstlisting}[language=C++,caption={relaxed 适合统计计数}]
+requests.fetch_add(1, std::memory_order_relaxed);
+\end{lstlisting}
+
+如果一个线程写数据，再用 atomic 标志通知另一个线程读数据，就不能随便用 relaxed。你需要 release/acquire 关系。
+
+\section{release/acquire 的直觉}
+
+生产者写数据，然后发布 ready：
+
+\begin{lstlisting}[language=C++,caption={发布数据}]
+data = make_data();
+ready.store(true, std::memory_order_release);
+\end{lstlisting}
+
+消费者等待 ready，再读数据：
+
+\begin{lstlisting}[language=C++,caption={获取数据}]
+while (!ready.load(std::memory_order_acquire)) {
+}
+use(data);
+\end{lstlisting}
+
+release/acquire 建立同步：消费者看到 \code{ready == true} 后，也能看到生产者在 release 之前完成的数据写入。这个例子只是入门直觉；真实代码里，忙等通常不如条件变量或 latch。
+
+\section{不要用 atomic 拼复杂协议}
+
+一旦协议涉及队列、多个字段、等待和关闭，互斥量往往更清楚：
+
+\begin{lstlisting}[language=C++,caption={复杂共享状态优先 mutex}]
+std::mutex mutex;
+std::queue<Task> tasks;
+bool closed = false;
+\end{lstlisting}
+
+锁不是低级，atomic 也不是高级。锁保护一组不变量；atomic 适合简单共享状态或精心设计的无锁结构。无锁代码要有非常强的测试、审查和测量理由。
+
+\section{伪共享}
+
+两个不同 atomic 变量如果落在同一个缓存行，两个线程频繁写它们，也可能互相拖慢。这叫伪共享。解决方法可能是分离数据布局或填充到缓存行大小。但不要一上来手写填充，先用 profiler 或基准确认问题。
+
+\section{完整案例：停止标志}
+
+一个后台线程只需要知道是否停止，可以用 atomic bool：
+
+\begin{lstlisting}[language=C++,caption={停止标志}]
+class StopFlag {
+public:
+    void request_stop() noexcept
+    {
+        this->stopped_.store(true);
+    }
+
+    [[nodiscard]] bool stop_requested() const noexcept
+    {
+        return this->stopped_.load();
+    }
+
+private:
+    std::atomic<bool> stopped_{false};
+};
+\end{lstlisting}
+
+如果线程可能阻塞在条件变量上，仅设置标志还不够，还要通知条件变量。停止协议要覆盖“正在运行”和“正在等待”两种状态。
+
+\begin{exercisebox}
+实现一个线程安全库存计数器，提供 \code{try_take(int count)}。要求不能扣成负数。先用 \code{mutex} 写一版，再用 \code{compare_exchange} 写一版。比较哪一版更容易证明正确。
+\end{exercisebox}

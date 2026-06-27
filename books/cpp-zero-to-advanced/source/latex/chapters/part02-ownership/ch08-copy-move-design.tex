@@ -1,0 +1,252 @@
+\chapter{复制、移动和对象设计}
+
+\section{问题入口：为什么有些对象不能复制}
+
+先看一个直觉上危险的类：
+
+\begin{lstlisting}[language=C++,caption={手写资源类的复制风险}]
+class FileHandle {
+public:
+    explicit FileHandle(FILE* file)
+        : file_{file}
+    {
+    }
+
+    ~FileHandle()
+    {
+        if (this->file_ != nullptr) {
+            std::fclose(this->file_);
+        }
+    }
+
+private:
+    FILE* file_ = nullptr;
+};
+\end{lstlisting}
+
+如果这个类允许默认复制，会发生什么？两个 \code{FileHandle} 对象会保存同一个 \code{FILE*}。它们析构时都会调用 \code{fclose}，同一个资源被释放两次。这就是复制语义和资源所有权冲突。
+
+这个反例推出第一条规则：拥有独占资源的对象通常不应该复制，除非你能定义“复制资源”到底是什么意思。
+
+\section{明确禁止复制}
+
+禁止复制要写在类型接口上：
+
+\begin{lstlisting}[language=C++,caption={禁止复制独占资源对象}]
+class FileHandle {
+public:
+    explicit FileHandle(FILE* file)
+        : file_{file}
+    {
+    }
+
+    FileHandle(const FileHandle&) = delete;
+    FileHandle& operator=(const FileHandle&) = delete;
+
+    ~FileHandle()
+    {
+        if (this->file_ != nullptr) {
+            std::fclose(this->file_);
+        }
+    }
+
+private:
+    FILE* file_ = nullptr;
+};
+\end{lstlisting}
+
+现在调用者不能误复制。编译错误比运行时双重释放更早、更清楚。禁止复制不是“限制用户”，而是类型诚实表达所有权规则。
+
+\section{移动构造：把资源交给新对象}
+
+独占资源虽然不能复制，但可以移动。移动的关键是：新对象接管资源，旧对象不再负责释放。
+
+\begin{lstlisting}[language=C++,caption={资源类的移动构造}]
+class FileHandle {
+public:
+    explicit FileHandle(FILE* file)
+        : file_{file}
+    {
+    }
+
+    FileHandle(const FileHandle&) = delete;
+    FileHandle& operator=(const FileHandle&) = delete;
+
+    FileHandle(FileHandle&& other) noexcept
+        : file_{other.file_}
+    {
+        other.file_ = nullptr;
+    }
+
+    FileHandle& operator=(FileHandle&& other) noexcept
+    {
+        if (this == &other) {
+            return *this;
+        }
+        this->close();
+        this->file_ = other.file_;
+        other.file_ = nullptr;
+        return *this;
+    }
+
+    ~FileHandle()
+    {
+        this->close();
+    }
+
+private:
+    void close() noexcept
+    {
+        if (this->file_ != nullptr) {
+            std::fclose(this->file_);
+            this->file_ = nullptr;
+        }
+    }
+
+    FILE* file_ = nullptr;
+};
+\end{lstlisting}
+
+移动赋值里先释放当前资源，再接管对方资源。最后把对方置空，防止对方析构时再次释放。这个过程必须异常安全，所以移动构造和移动赋值通常标成 \code{noexcept}。标准容器在扩容时也会利用这个信息。
+
+\section{零法则：优先让成员自己管理资源}
+
+上面的例子是为了理解规则。真实代码里，优先使用标准库 RAII 类型，让类不需要手写析构、复制和移动：
+
+\begin{lstlisting}[language=C++,caption={用标准库成员获得零法则}]
+class ReportWriter {
+public:
+    explicit ReportWriter(std::filesystem::path path)
+        : path_{std::move(path)}
+    {
+    }
+
+    void write(std::string_view text) const
+    {
+        std::ofstream output{this->path_};
+        if (!output) {
+            throw std::runtime_error{"cannot open report"};
+        }
+        output << text;
+    }
+
+private:
+    std::filesystem::path path_;
+};
+\end{lstlisting}
+
+这个类没有手写析构、复制构造、移动构造。它的成员 \code{std::filesystem::path} 自己知道如何复制和移动。只要不直接管理裸资源，就能让编译器生成正确的特殊成员函数。这叫零法则：能不手写特殊成员，就不手写。
+
+\section{值对象应该容易复制}
+
+不是所有对象都要禁止复制。像 \code{Money}、\code{TemperatureRange}、\code{ScoreSummary} 这类值对象，复制语义自然、成本可控，应该像普通值一样使用：
+
+\begin{lstlisting}[language=C++,caption={值对象可以自然复制}]
+TemperatureRange morning{10.0, 18.0};
+TemperatureRange backup = morning;
+backup.expand_to_include(20.0);
+\end{lstlisting}
+
+修改 \code{backup} 不应该影响 \code{morning}。如果一个看起来像值的对象复制后还共享内部状态，读者会很难推理。设计值对象时，要么让副本独立，要么明确改成共享所有权模型。
+
+\section{按值接收再移动的适用边界}
+
+构造函数保存字符串时，常见写法是按值接收：
+
+\begin{lstlisting}[language=C++,caption={按值接收适合保存副本}]
+class User {
+public:
+    explicit User(std::string name)
+        : name_{std::move(name)}
+    {
+    }
+
+private:
+    std::string name_;
+};
+\end{lstlisting}
+
+调用者传临时字符串时，参数可以移动；传已有字符串时，会复制一份再移动进成员。这个语义很清楚：对象要保存自己的名字。反过来，如果函数只打印名字，就不要按值接收：
+
+\begin{lstlisting}[language=C++,caption={只观察时用字符串视图}]
+void print_user_name(std::string_view name)
+{
+    std::cout << name << '\n';
+}
+\end{lstlisting}
+
+按值接收不是性能技巧，而是所有权语义。保存副本时合理，只观察时不合理。
+
+\section{自赋值和自移动}
+
+复制赋值和移动赋值都可能遇到自己赋给自己。复制赋值常见写法可以用 copy-and-swap，但入门阶段先理解原则：不要在还没拿到新资源之前破坏旧资源。移动赋值则至少要处理 \code{this == &other}，否则可能把自己资源关闭后再接管空资源。
+
+\begin{warningbox}
+如果你发现自己在多个类里手写析构、复制和移动，先停下来问：是不是应该用 \code{std::unique_ptr}、\code{std::vector}、\code{std::string}、\code{std::fstream} 等标准库成员承担资源管理？手写特殊成员函数越多，越容易出生命周期错误。
+\end{warningbox}
+
+\section{完整案例：不可复制的临时目录}
+
+临时目录对象拥有一个目录路径，析构时删除目录。它不应该复制，因为两个对象删除同一目录很危险；它可以移动，因为所有权可以转移：
+
+\begin{lstlisting}[language=C++,caption={临时目录所有权类型}]
+class TemporaryDirectory {
+public:
+    explicit TemporaryDirectory(std::filesystem::path path)
+        : path_{std::move(path)}
+    {
+        std::filesystem::create_directories(this->path_);
+    }
+
+    TemporaryDirectory(const TemporaryDirectory&) = delete;
+    TemporaryDirectory& operator=(const TemporaryDirectory&) = delete;
+
+    TemporaryDirectory(TemporaryDirectory&& other) noexcept
+        : path_{std::move(other.path_)}, active_{other.active_}
+    {
+        other.active_ = false;
+    }
+
+    TemporaryDirectory& operator=(TemporaryDirectory&& other) noexcept
+    {
+        if (this == &other) {
+            return *this;
+        }
+        this->cleanup();
+        this->path_ = std::move(other.path_);
+        this->active_ = other.active_;
+        other.active_ = false;
+        return *this;
+    }
+
+    ~TemporaryDirectory()
+    {
+        this->cleanup();
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const noexcept
+    {
+        return this->path_;
+    }
+
+private:
+    void cleanup() noexcept
+    {
+        if (!this->active_) {
+            return;
+        }
+        std::error_code ignored;
+        std::filesystem::remove_all(this->path_, ignored);
+        this->active_ = false;
+    }
+
+    std::filesystem::path path_;
+    bool active_ = true;
+};
+\end{lstlisting}
+
+这里删除目录使用 \code{std::error_code}，因为析构函数不应该抛异常。这个例子把本章几条线合在一起：独占资源禁止复制，允许移动，析构释放资源，析构失败不能让异常逃出。
+
+\begin{exercisebox}
+设计一个 \code{SocketHandle}，假设关闭函数是 \code{close_socket(int fd)}。要求禁止复制、允许移动、析构关闭。再写出移动后对象的状态不变量：它是否还拥有有效 fd？析构时会不会重复关闭？
+\end{exercisebox}

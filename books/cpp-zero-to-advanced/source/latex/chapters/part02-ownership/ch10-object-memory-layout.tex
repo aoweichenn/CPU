@@ -1,0 +1,128 @@
+\chapter{对象内存、对齐和数据布局}
+
+\section{问题入口：同样的字段为什么对象大小不同}
+
+看两个结构体：
+
+\begin{lstlisting}[language=C++,caption={字段顺序影响对象大小}]
+struct A {
+    char flag;
+    int count;
+    char tag;
+};
+
+struct B {
+    int count;
+    char flag;
+    char tag;
+};
+\end{lstlisting}
+
+它们保存的信息一样，但 \code{sizeof(A)} 和 \code{sizeof(B)} 可能不同。原因是对齐。许多平台要求 \code{int} 放在特定地址边界上，编译器会在字段之间插入填充字节。这个例子说明：对象不是抽象字段列表，它最终要落到内存布局上。
+
+\section{对齐不是优化细节}
+
+对齐让 CPU 更高效地访问数据，有些平台甚至要求未对齐访问会失败。可以观察：
+
+\begin{lstlisting}[language=C++,caption={观察大小和对齐}]
+std::cout << sizeof(A) << " " << alignof(A) << '\n';
+std::cout << sizeof(B) << " " << alignof(B) << '\n';
+\end{lstlisting}
+
+不要为了省几个字节盲目重排所有结构体。字段顺序也影响可读性和 ABI。只有当对象数量巨大、内存确实成为瓶颈时，才把布局优化作为明确任务。
+
+\section{栈、堆和对象生命周期}
+
+“栈上对象”和“堆上对象”不是对象类型，而是存储位置和生命周期管理方式不同：
+
+\begin{lstlisting}[language=C++,caption={自动存储期对象}]
+void run()
+{
+    std::vector<int> values{1, 2, 3};
+}
+\end{lstlisting}
+
+\code{values} 这个 vector 对象本身是局部对象，离开作用域析构。但它内部元素通常存放在动态分配的内存里，由 vector 管理。不要简单说“vector 在栈上所以数据也在栈上”。对象本体和它拥有的资源要分开看。
+
+\section{new 和 delete 为什么不该到处写}
+
+手写 \code{new} 和 \code{delete} 容易在异常路径泄漏：
+
+\begin{lstlisting}[language=C++,caption={手写 delete 容易遗漏}]
+User* user = new User{"Ada"};
+do_something_that_may_throw();
+delete user;
+\end{lstlisting}
+
+如果中间函数抛异常，\code{delete} 不会执行。用 \code{std::unique_ptr}：
+
+\begin{lstlisting}[language=C++,caption={独占指针自动释放}]
+auto user = std::make_unique<User>(User{"Ada"});
+do_something_that_may_throw();
+\end{lstlisting}
+
+离开作用域时，\code{unique_ptr} 析构释放对象。现代 \cpp 不是不能动态分配，而是动态资源应该由对象管理。
+
+\section{连续布局和指针追逐}
+
+性能章节提到过局部性。这里用内存结构再看一次。数组结构：
+
+\begin{lstlisting}[language=C++,caption={连续点数组}]
+std::vector<Point> points;
+for (const Point& point : points) {
+    total += point.x;
+}
+\end{lstlisting}
+
+链式结构：
+
+\begin{lstlisting}[language=C++,caption={节点指针追逐}]
+for (const Node* node = head; node != nullptr; node = node->next) {
+    total += node->value;
+}
+\end{lstlisting}
+
+两者都是线性遍历，但连续数组更容易被 CPU 预取。链表每一步都要读取下一个地址，节点可能分散在内存各处。选择数据结构时，不能只看大 O，也要看数据如何摆放。
+
+\section{对象表示和未定义行为}
+
+\cpp 允许你查看对象的字节表示：
+
+\begin{lstlisting}[language=C++,caption={查看对象字节}]
+int value = 42;
+const auto* bytes = reinterpret_cast<const unsigned char*>(&value);
+for (std::size_t i = 0; i < sizeof(value); ++i) {
+    std::cout << static_cast<int>(bytes[i]) << '\n';
+}
+\end{lstlisting}
+
+但这不意味着可以随意把任意字节解释成任意对象。类型别名规则、对齐、对象生命周期都会影响是否合法。入门阶段记住保守规则：序列化和解析二进制格式时，不要直接把网络字节流 \code{reinterpret_cast} 成结构体；应该逐字段读写，明确大小端和字段长度。
+
+\section{完整案例：二进制头解析}
+
+假设协议头是 4 字节魔数加 2 字节版本。不要直接映射结构体：
+
+\begin{lstlisting}[language=C++,caption={逐字段解析协议头}]
+struct Header {
+    std::array<unsigned char, 4> magic{};
+    std::uint16_t version = 0;
+};
+
+std::optional<Header> parse_header(std::span<const unsigned char> bytes)
+{
+    if (bytes.size() < 6) {
+        return std::nullopt;
+    }
+    Header header;
+    std::copy_n(bytes.begin(), 4, header.magic.begin());
+    header.version = static_cast<std::uint16_t>(bytes[4]) << 8 |
+                     static_cast<std::uint16_t>(bytes[5]);
+    return header;
+}
+\end{lstlisting}
+
+这里明确使用大端解析版本号。代码长一点，但跨平台行为清楚。二进制处理最怕“我机器上正好可以”。
+
+\begin{exercisebox}
+写两个字段顺序不同的结构体，打印 \code{sizeof} 和 \code{alignof}。再设计一个解析 8 字节消息头的函数，要求不用 \code{reinterpret_cast}，逐字段解析并检查长度。
+\end{exercisebox}

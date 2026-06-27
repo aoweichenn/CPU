@@ -1,0 +1,174 @@
+\chapter{项目六：命令行文件索引器}
+
+\section{项目目标}
+
+文件索引器扫描一个目录，统计每种扩展名的文件数量和总字节数，输出排序后的报表。这个项目覆盖文件系统遍历、错误处理、路径处理、容器聚合、排序、命令行参数和性能边界。
+
+目标命令：
+
+\begin{lstlisting}[language=bash,caption={文件索引器用法}]
+fileindex --root ./src --top 20
+\end{lstlisting}
+
+输出示例：
+
+\begin{lstlisting}[caption={文件索引器输出}]
+.cpp 128 files 240000 bytes
+.hpp 96 files 120000 bytes
+.md 12 files 34000 bytes
+\end{lstlisting}
+
+\section{数据模型}
+
+\begin{lstlisting}[language=C++,caption={扩展名统计}]
+struct ExtensionStats {
+    std::uint64_t file_count = 0;
+    std::uint64_t total_bytes = 0;
+};
+
+using ExtensionIndex = std::unordered_map<std::string, ExtensionStats>;
+\end{lstlisting}
+
+这里用 \code{std::uint64_t}，因为文件数量和字节数可能超过 \code{int} 范围。类型选择来自值域，不是随手写。
+
+\section{路径和扩展名规则}
+
+扩展名规则要先写清楚：
+
+\begin{itemize}
+  \item 没有扩展名的文件归为 \code{<none>}。
+  \item 扩展名保留点号，例如 \code{.cpp}。
+  \item 大小写是否合并由项目决定；本项目统一转小写。
+\end{itemize}
+
+实现：
+
+\begin{lstlisting}[language=C++,caption={提取扩展名}]
+std::string normalized_extension(const std::filesystem::path& path)
+{
+    std::string extension = path.extension().string();
+    if (extension.empty()) {
+        return "<none>";
+    }
+    for (char& ch : extension) {
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    return extension;
+}
+\end{lstlisting}
+
+这个函数可以单独测试，不需要扫描真实目录。
+
+\section{遍历目录}
+
+\begin{lstlisting}[language=C++,caption={扫描目录}]
+ExtensionIndex build_index(const std::filesystem::path& root)
+{
+    ExtensionIndex index;
+    std::error_code error;
+    std::filesystem::recursive_directory_iterator it{
+        root,
+        std::filesystem::directory_options::skip_permission_denied,
+        error};
+    std::filesystem::recursive_directory_iterator end;
+
+    for (; it != end; it.increment(error)) {
+        if (error) {
+            error.clear();
+            continue;
+        }
+        if (!it->is_regular_file(error) || error) {
+            error.clear();
+            continue;
+        }
+
+        const std::uint64_t size = it->file_size(error);
+        if (error) {
+            error.clear();
+            continue;
+        }
+        ExtensionStats& stats = index[normalized_extension(it->path())];
+        ++stats.file_count;
+        stats.total_bytes += size;
+    }
+    return index;
+}
+\end{lstlisting}
+
+这里用 \code{std::error_code} 避免权限问题直接抛异常终止扫描。项目选择是：跳过无法访问的文件。生产工具应记录警告；教材版本先保留核心流程。
+
+\section{排序报表}
+
+\begin{lstlisting}[language=C++,caption={排序扩展名统计}]
+struct ExtensionRow {
+    std::string extension;
+    ExtensionStats stats;
+};
+
+std::vector<ExtensionRow> sort_index(const ExtensionIndex& index)
+{
+    std::vector<ExtensionRow> rows;
+    rows.reserve(index.size());
+    for (const auto& [extension, stats] : index) {
+        rows.push_back(ExtensionRow{extension, stats});
+    }
+
+    std::ranges::sort(rows, [](const ExtensionRow& lhs, const ExtensionRow& rhs) {
+        if (lhs.stats.total_bytes != rhs.stats.total_bytes) {
+            return lhs.stats.total_bytes > rhs.stats.total_bytes;
+        }
+        return lhs.extension < rhs.extension;
+    });
+    return rows;
+}
+\end{lstlisting}
+
+排序规则必须稳定可解释：总字节数大的排前面，字节数相同按扩展名字典序。这样测试输出不会因为哈希表顺序变化而随机变化。
+
+\section{输出层}
+
+\begin{lstlisting}[language=C++,caption={写报表}]
+void write_report(std::ostream& output, std::span<const ExtensionRow> rows, std::size_t limit)
+{
+    const std::size_t count = std::min(rows.size(), limit);
+    for (std::size_t i = 0; i < count; ++i) {
+        const ExtensionRow& row = rows[i];
+        output << row.extension << " "
+               << row.stats.file_count << " files "
+               << row.stats.total_bytes << " bytes\n";
+    }
+}
+\end{lstlisting}
+
+输出函数接受 \code{std::ostream&}，因此可以用字符串流测试，不必真正打印到终端。
+
+\section{性能边界}
+
+目录遍历是 I/O 密集型。优化前先明确瓶颈：
+
+\begin{itemize}
+  \item 文件数量很大时，遍历系统调用是主要成本。
+  \item 扩展名种类通常不多，哈希表不是瓶颈。
+  \item 输出 top k 可以全排序，也可以用堆；当扩展名种类少时全排序足够。
+  \item 并行遍历可能受磁盘和文件系统限制，不一定更快。
+\end{itemize}
+
+第一版不要急着并行。先让错误处理和结果稳定。等测量证明遍历慢，再考虑多线程扫描。
+
+\section{测试计划}
+
+测试可以创建临时目录：
+
+\begin{itemize}
+  \item 空目录输出为空。
+  \item 没有扩展名的文件归为 \code{<none>}。
+  \item \code{.CPP} 和 \code{.cpp} 合并。
+  \item 多个扩展名按总字节数排序。
+  \item 权限错误不让整个扫描崩溃。
+\end{itemize}
+
+临时目录要用 RAII 管理，测试结束自动删除。这样测试不会污染工作区。
+
+\begin{exercisebox}
+给文件索引器增加 \code{--min-size N}，只统计至少 \code{N} 字节的文件。要求参数解析拒绝负数和非数字；扫描逻辑不关心命令行字符串，只接收已经解析好的整数。
+\end{exercisebox}

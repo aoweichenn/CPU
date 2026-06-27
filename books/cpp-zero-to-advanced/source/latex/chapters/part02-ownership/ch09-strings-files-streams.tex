@@ -1,0 +1,166 @@
+\chapter{字符串、文件和流式处理}
+
+\section{问题入口：读取一整个文件是否总是好主意}
+
+很多教程会直接把文件全部读进字符串：
+
+\begin{lstlisting}[language=C++,caption={一次性读取文件的思路}]
+std::string read_all(std::istream& input)
+{
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
+}
+\end{lstlisting}
+
+这段代码简洁，也适合小文件。但如果文件很大，内存占用会随着文件大小增长；如果只需要逐行处理，一次性读取就没有必要。这个反例推出第一条规则：I/O 设计要先问数据规模和处理方式。需要全局分析时可以读入内存；可以逐步处理时优先流式处理。
+
+\section{string、string\_view 和字符编码边界}
+
+\code{std::string} 拥有一段字节序列。它不自动理解中文字符、Unicode 字符簇或文件编码。下面的 \code{size()} 返回字节数，不是用户感知的字符数：
+
+\begin{lstlisting}[language=C++,caption={string 的 size 是字节数量}]
+std::string text = "Cpp";
+std::cout << text.size() << '\n';
+\end{lstlisting}
+
+在本书示例里，我们主要处理 ASCII 命令行、配置和英文单词。遇到中文分词、Unicode 大小写转换、规范化比较，就应该使用专门库，而不是把 \code{std::tolower} 当成万能工具。
+
+\section{逐行读取的基本形态}
+
+逐行处理日志或配置时，用 \code{std::getline}：
+
+\begin{lstlisting}[language=C++,caption={逐行读取文件}]
+std::vector<std::string> read_lines(const std::filesystem::path& path)
+{
+    std::ifstream input{path};
+    if (!input) {
+        throw std::runtime_error{"cannot open file"};
+    }
+
+    std::vector<std::string> lines;
+    std::string line;
+    while (std::getline(input, line)) {
+        lines.push_back(line);
+    }
+    if (input.bad()) {
+        throw std::runtime_error{"failed while reading file"};
+    }
+    return lines;
+}
+\end{lstlisting}
+
+循环结束不一定是错误。读到 EOF 会让循环停止，这是正常情况。\code{bad()} 表示底层 I/O 错误，才需要报告。不要把所有流状态都混成“读取失败”。
+
+\section{解析 key=value 配置}
+
+假设配置文件每行是 \code{key=value}，空行和 \code{#} 开头的行忽略。先写一个解析单行的纯函数：
+
+\begin{lstlisting}[language=C++,caption={解析一行配置}]
+struct ConfigEntry {
+    std::string key;
+    std::string value;
+};
+
+std::optional<ConfigEntry> parse_config_line(std::string_view line)
+{
+    line = trim(line);
+    if (line.empty() || line.front() == '#') {
+        return std::nullopt;
+    }
+
+    const std::size_t pos = line.find('=');
+    if (pos == std::string_view::npos) {
+        throw std::runtime_error{"missing '=' in config line"};
+    }
+
+    std::string_view key = trim(line.substr(0, pos));
+    std::string_view value = trim(line.substr(pos + 1));
+    if (key.empty()) {
+        throw std::runtime_error{"empty config key"};
+    }
+    return ConfigEntry{std::string{key}, std::string{value}};
+}
+\end{lstlisting}
+
+这里返回 \code{std::optional} 是因为空行和注释行不是错误，只是没有条目。缺少等号或 key 为空才是格式错误。这个区别来自需求，而不是语法。
+
+\section{为什么 trim 返回视图}
+
+\code{trim} 可以不分配新字符串，只返回原文本的子视图：
+
+\begin{lstlisting}[language=C++,caption={返回子视图的 trim}]
+std::string_view trim(std::string_view text)
+{
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.front()))) {
+        text.remove_prefix(1);
+    }
+    while (!text.empty() && std::isspace(static_cast<unsigned char>(text.back()))) {
+        text.remove_suffix(1);
+    }
+    return text;
+}
+\end{lstlisting}
+
+\code{remove_prefix} 和 \code{remove_suffix} 只移动视图边界，不修改原字符串。返回的 \code{string_view} 仍然依赖原始 \code{line} 的生命周期。因此在 \code{parse_config_line} 里，如果要把结果保存到容器，就必须复制成 \code{std::string}。
+
+\section{输出格式也要测试}
+
+输出不是随手 \code{cout}。如果一个函数负责生成文本，优先让它写入 \code{std::ostream&}，这样测试可以用 \code{std::ostringstream}：
+
+\begin{lstlisting}[language=C++,caption={输出到任意流}]
+void write_entries(std::ostream& output, std::span<const ConfigEntry> entries)
+{
+    for (const ConfigEntry& entry : entries) {
+        output << entry.key << "=" << entry.value << '\n';
+    }
+}
+\end{lstlisting}
+
+测试时不需要真实文件：
+
+\begin{lstlisting}[language=C++,caption={用字符串流测试输出}]
+std::ostringstream output;
+std::vector<ConfigEntry> entries{{"port", "8080"}, {"host", "localhost"}};
+write_entries(output, entries);
+assert(output.str() == "port=8080\nhost=localhost\n");
+\end{lstlisting}
+
+这就是流抽象的价值：同一段代码可以写到终端、文件、内存字符串或网络缓冲，只要它们提供相同的流接口。
+
+\section{错误报告要带上下文}
+
+解析配置时，只说“格式错误”不够。调用者需要知道哪一行错：
+
+\begin{lstlisting}[language=C++,caption={读取配置时补充行号}]
+std::vector<ConfigEntry> read_config_entries(const std::filesystem::path& path)
+{
+    std::ifstream input{path};
+    if (!input) {
+        throw std::runtime_error{"cannot open config file"};
+    }
+
+    std::vector<ConfigEntry> entries;
+    std::string line;
+    int line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        try {
+            std::optional<ConfigEntry> entry = parse_config_line(line);
+            if (entry.has_value()) {
+                entries.push_back(std::move(*entry));
+            }
+        } catch (const std::exception& error) {
+            throw std::runtime_error{"line " + std::to_string(line_number) +
+                                     ": " + error.what()};
+        }
+    }
+    return entries;
+}
+\end{lstlisting}
+
+这里捕获异常不是为了吞掉错误，而是补充上下文后继续向上抛。错误处理必须有目的：恢复、转换、补上下文或终止。
+
+\begin{exercisebox}
+扩展配置解析：支持同一个 key 重复时后者覆盖前者，并记录一条警告。要求解析单行、合并条目、输出警告分别是不同函数。写测试覆盖注释、空行、缺等号、空 key、重复 key。
+\end{exercisebox}

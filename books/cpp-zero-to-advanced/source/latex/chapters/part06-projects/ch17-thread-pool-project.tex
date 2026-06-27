@@ -1,0 +1,196 @@
+\chapter{项目四：一个小型任务队列}
+
+\section{项目目标}
+
+本项目实现一个小型任务队列：多个生产者提交任务，一个或多个工作线程取任务执行，关闭时不丢任务、不让线程永久阻塞。它不是完整线程池库，但足够训练并发代码最重要的几个问题：共享状态、条件变量、关闭协议、异常边界和生命周期。
+
+目标接口：
+
+\begin{lstlisting}[language=C++,caption={任务队列接口}]
+class TaskQueue {
+public:
+    void push(std::function<void()> task);
+    std::optional<std::function<void()>> pop();
+    void close();
+};
+\end{lstlisting}
+
+\code{pop} 返回 \code{std::nullopt} 表示队列已经关闭且没有剩余任务。这个返回值就是线程退出协议。
+
+\section{共享状态和不变量}
+
+队列内部状态：
+
+\begin{lstlisting}[language=C++,caption={任务队列状态}]
+class TaskQueue {
+public:
+    void push(std::function<void()> task);
+    std::optional<std::function<void()>> pop();
+    void close();
+
+private:
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::queue<std::function<void()>> tasks_;
+    bool closed_ = false;
+};
+\end{lstlisting}
+
+不变量是：\code{tasks_} 和 \code{closed_} 只能在持有 \code{mutex_} 时访问。条件变量等待的条件是“队列非空，或已经关闭”。只要这个不变量破了，并发错误就会变得很难复现。
+
+\section{push：关闭后不能继续提交}
+
+关闭后继续提交任务，语义必须明确。本项目选择抛异常：
+
+\begin{lstlisting}[language=C++,caption={提交任务}]
+void TaskQueue::push(std::function<void()> task)
+{
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        if (this->closed_) {
+            throw std::runtime_error{"cannot push to closed queue"};
+        }
+        this->tasks_.push(std::move(task));
+    }
+    this->ready_.notify_one();
+}
+\end{lstlisting}
+
+通知放在释放锁之后，通常能减少被唤醒线程马上又阻塞在同一把锁上的机会。放在锁内也常常正确，但要理解取舍。
+
+\section{pop：谓词等待}
+
+\begin{lstlisting}[language=C++,caption={取任务}]
+std::optional<std::function<void()>> TaskQueue::pop()
+{
+    std::unique_lock<std::mutex> lock{this->mutex_};
+    this->ready_.wait(lock, [this] {
+        return this->closed_ || !this->tasks_.empty();
+    });
+
+    if (this->tasks_.empty()) {
+        return std::nullopt;
+    }
+
+    std::function<void()> task = std::move(this->tasks_.front());
+    this->tasks_.pop();
+    return task;
+}
+\end{lstlisting}
+
+醒来后队列可能为空，只有一种合理解释：队列关闭且任务已经取完。因此返回 \code{std::nullopt}。如果不用谓词，虚假唤醒会让线程在队列为空时继续执行错误逻辑。
+
+\section{close：唤醒所有等待线程}
+
+\begin{lstlisting}[language=C++,caption={关闭队列}]
+void TaskQueue::close()
+{
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        this->closed_ = true;
+    }
+    this->ready_.notify_all();
+}
+\end{lstlisting}
+
+为什么是 \code{notify_all}？因为可能有多个工作线程都阻塞在 \code{pop}。关闭时所有线程都应该醒来检查条件，然后在任务耗尽后退出。
+
+\section{Worker：线程生命周期}
+
+工作线程循环取任务：
+
+\begin{lstlisting}[language=C++,caption={工作线程循环}]
+void worker_loop(TaskQueue& queue)
+{
+    while (true) {
+        std::optional<std::function<void()>> task = queue.pop();
+        if (!task.has_value()) {
+            return;
+        }
+        try {
+            (*task)();
+        } catch (const std::exception& error) {
+            std::cerr << "task failed: " << error.what() << '\n';
+        }
+    }
+}
+\end{lstlisting}
+
+任务异常不能让工作线程悄悄结束，至少要在任务边界捕获并记录。真实系统可能把错误发送到监控或结果队列。
+
+\section{用 jthread 管理工作线程}
+
+\begin{lstlisting}[language=C++,caption={小型任务执行器}]
+class TaskExecutor {
+public:
+    explicit TaskExecutor(std::size_t worker_count)
+    {
+        for (std::size_t i = 0; i < worker_count; ++i) {
+            this->workers_.emplace_back([this] {
+                worker_loop(this->queue_);
+            });
+        }
+    }
+
+    ~TaskExecutor()
+    {
+        this->queue_.close();
+    }
+
+    void submit(std::function<void()> task)
+    {
+        this->queue_.push(std::move(task));
+    }
+
+private:
+    TaskQueue queue_;
+    std::vector<std::jthread> workers_;
+};
+\end{lstlisting}
+
+\code{std::jthread} 析构会 join。析构函数先关闭队列，让所有工作线程最终退出。成员析构顺序也重要：成员按声明逆序析构。这里 \code{workers_} 在 \code{queue_} 之后声明，所以析构时先销毁 \code{workers_}，等待线程结束，再销毁 \code{queue_}。工作线程不会访问已经销毁的队列。
+
+\section{析构顺序的隐藏坑}
+
+如果把成员顺序写反：
+
+\begin{lstlisting}[language=C++,caption={危险的成员顺序}]
+std::vector<std::jthread> workers_;
+TaskQueue queue_;
+\end{lstlisting}
+
+析构时会先销毁 \code{queue_}，再销毁 \code{workers_}。工作线程可能还在访问队列，造成悬空引用。并发类的成员顺序不是排版问题，而是生命周期协议的一部分。
+
+\section{测试并发代码}
+
+并发测试要尽量验证确定性结果：
+
+\begin{lstlisting}[language=C++,caption={任务执行器测试思路}]
+TaskExecutor executor{4};
+std::atomic<int> counter{0};
+for (int i = 0; i < 1000; ++i) {
+    executor.submit([&counter] {
+        counter.fetch_add(1, std::memory_order_relaxed);
+    });
+}
+\end{lstlisting}
+
+这个测试还需要等待任务完成，否则析构时才关闭队列，可能很难在中途断言。可以给执行器增加 \code{drain}，或者在测试里使用 \code{std::promise}、\code{std::latch} 等同步工具。测试并发代码的重点是避免靠睡眠猜时间。
+
+\section{扩展方向}
+
+完整线程池还需要：
+
+\begin{itemize}
+  \item 返回任务结果，例如 \code{std::future<T>}。
+  \item 限制队列长度，避免生产者无限堆积任务。
+  \item 支持取消和停止令牌。
+  \item 记录任务异常。
+  \item 避免析构时在工作线程内部 join 自己。
+\end{itemize}
+
+每个扩展都牵涉接口语义。比如队列满了时，\code{submit} 是阻塞、返回失败还是丢弃任务？这些规则必须先写清楚，再写代码。
+
+\begin{exercisebox}
+给 \code{TaskExecutor} 增加 \code{submit_counting}，提交任务后返回一个 \code{std::future<void>}，调用者可以等待任务完成并接收异常。要求任务异常传给 future，而不是只打印日志。
+\end{exercisebox}

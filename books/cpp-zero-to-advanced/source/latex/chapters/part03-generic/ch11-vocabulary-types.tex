@@ -1,0 +1,187 @@
+\chapter{optional、variant、expected 风格和标准库词汇类型}
+
+\section{问题入口：返回值为什么不能只靠特殊值}
+
+查找用户时，找不到用户不是程序崩溃，也不是用户 ID 为 \code{-1}：
+
+\begin{lstlisting}[language=C++,caption={特殊值会污染语义}]
+int find_user_id(std::string_view name)
+{
+    if (name == "Ada") {
+        return 1;
+    }
+    return -1;
+}
+\end{lstlisting}
+
+\code{-1} 是约定，不是类型。调用者可能忘记检查，也可能把 \code{-1} 当成普通 ID 继续传。标准库词汇类型的价值，是把常见语义放进类型：可能没有值、若干类型之一、共享文本视图、连续区间视图。
+
+\section{optional：可能没有值}
+
+\code{std::optional<T>} 表达“有一个 \code{T}，或没有”：
+
+\begin{lstlisting}[language=C++,caption={optional 表达查找结果}]
+std::optional<User> find_user(std::string_view name)
+{
+    if (name == "Ada") {
+        return User{.id = 1, .name = "Ada"};
+    }
+    return std::nullopt;
+}
+\end{lstlisting}
+
+调用者必须面对没有值：
+
+\begin{lstlisting}[language=C++,caption={检查 optional}]
+const std::optional<User> user = find_user("Grace");
+if (!user.has_value()) {
+    std::cout << "not found\n";
+    return;
+}
+std::cout << user->name << '\n';
+\end{lstlisting}
+
+\code{optional} 不适合表达复杂错误原因。如果调用者需要知道“文件不存在、格式错误、权限不足”，就需要错误类型。
+
+\section{variant：若干类型之一}
+
+命令行参数可以是不同形态：
+
+\begin{lstlisting}[language=C++,caption={命令行值的 variant}]
+struct Flag {
+    std::string name;
+};
+
+struct KeyValue {
+    std::string key;
+    std::string value;
+};
+
+using Argument = std::variant<Flag, KeyValue>;
+\end{lstlisting}
+
+处理时用 \code{std::visit}：
+
+\begin{lstlisting}[language=C++,caption={访问 variant 参数}]
+void print_argument(const Argument& argument)
+{
+    std::visit([](const auto& item) {
+        print_one(item);
+    }, argument);
+}
+\end{lstlisting}
+
+\code{variant} 适合类型集合固定的情况。它让编译器知道所有可能形态，也能在新增形态时提醒处理点。
+
+\section{expected 风格：值或错误}
+
+\cpp23 有 \code{std::expected}，但很多 \cpp20 工程会自己定义简单结果类型，或使用成熟库。核心思想是一样的：成功时有值，失败时有错误。
+
+\begin{lstlisting}[language=C++,caption={expected 风格结果}]
+template <typename T, typename E>
+struct Result {
+    std::optional<T> value;
+    std::optional<E> error;
+};
+\end{lstlisting}
+
+这个简化版本不能阻止同时有值和错误。更严谨可以用 \code{std::variant<T, E>}：
+
+\begin{lstlisting}[language=C++,caption={variant 表达二选一}]
+template <typename T, typename E>
+class Result2 {
+public:
+    static Result2 success(T value)
+    {
+        return Result2{std::move(value)};
+    }
+
+    static Result2 failure(E error)
+    {
+        return Result2{std::move(error)};
+    }
+
+private:
+    explicit Result2(std::variant<T, E> state)
+        : state_{std::move(state)}
+    {
+    }
+
+    std::variant<T, E> state_;
+};
+\end{lstlisting}
+
+教材里经常用简单结构，是为了降低语法负担；工程里要根据风险选择更严谨的表示。
+
+\section{pair 和 tuple 不要滥用}
+
+\code{std::pair} 和 \code{std::tuple} 适合临时组合值，但不适合长期表达业务对象：
+
+\begin{lstlisting}[language=C++,caption={tuple 让含义消失}]
+std::tuple<std::string, int, bool> user;
+\end{lstlisting}
+
+读者不知道三个字段分别是什么。更好的写法是结构体：
+
+\begin{lstlisting}[language=C++,caption={结构体保留字段含义}]
+struct UserRow {
+    std::string name;
+    int age = 0;
+    bool active = false;
+};
+\end{lstlisting}
+
+如果返回两个迭代器、两个坐标、键值对，\code{pair} 合理；如果字段有业务名，就写类型。
+
+\section{span 和 string\_view 也是词汇类型}
+
+\code{std::span<const T>} 表达非拥有连续区间，\code{std::string_view} 表达非拥有文本视图。它们减少复制，但也把生命周期要求推给调用者。词汇类型不是越轻越好，而是要准确表达语义。
+
+例如解析函数只观察文本：
+
+\begin{lstlisting}[language=C++,caption={解析只需要观察文本}]
+std::optional<int> parse_port(std::string_view text);
+\end{lstlisting}
+
+配置对象要保存文本：
+
+\begin{lstlisting}[language=C++,caption={保存文本要拥有字符串}]
+struct ServerConfig {
+    std::string host;
+};
+\end{lstlisting}
+
+不要把 \code{string_view} 存进长期配置对象，除非你清楚底层字符串的生命周期。
+
+\section{完整案例：解析命令行参数}
+
+一个参数可以是标志、键值对或位置参数：
+
+\begin{lstlisting}[language=C++,caption={参数词汇类型}]
+struct Positional {
+    std::string value;
+};
+
+using ParsedArgument = std::variant<Flag, KeyValue, Positional>;
+
+ParsedArgument parse_argument(std::string_view text)
+{
+    if (text.starts_with("--")) {
+        const std::size_t equal = text.find('=');
+        if (equal == std::string_view::npos) {
+            return Flag{.name = std::string{text.substr(2)}};
+        }
+        return KeyValue{
+            .key = std::string{text.substr(2, equal - 2)},
+            .value = std::string{text.substr(equal + 1)},
+        };
+    }
+    return Positional{.value = std::string{text}};
+}
+\end{lstlisting}
+
+这个函数把不同形态显式化。后续处理参数时，编译器知道所有可能情况，而不是让一堆字符串约定散在代码里。
+
+\begin{exercisebox}
+把前面的 \code{ParseResult} 改成 \code{std::variant<Options, ParseError>} 风格。写一个辅助函数判断成功或失败。比较这种写法和两个 \code{optional} 字段的优缺点。
+\end{exercisebox}

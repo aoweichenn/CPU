@@ -1,0 +1,145 @@
+\chapter{编译期计算、type traits 和约束边界}
+
+\section{问题入口：有些错误能不能提前到编译期}
+
+运行期检查很重要，但有些规则在编译期就知道。例如固定容量缓冲区的容量不能为 \code{0}。如果等运行到取模时才失败，错误出现得太晚。模板参数和 \code{constexpr} 让一部分规则可以提前：
+
+\begin{lstlisting}[language=C++,caption={编译期容量检查}]
+template <typename T, std::size_t CAPACITY>
+    requires(CAPACITY > 0)
+class RingBuffer {
+    // ...
+};
+\end{lstlisting}
+
+这不是为了炫技，而是把“不可能正确”的类型直接挡在编译期。编译期计算的价值在于更早暴露错误、更清楚表达常量关系，以及减少运行期分支。
+
+\section{constexpr 函数}
+
+\code{constexpr} 函数可以在编译期求值，也可以在运行期调用：
+
+\begin{lstlisting}[language=C++,caption={端口范围检查}]
+constexpr bool is_valid_port(int port) noexcept
+{
+    return 1 <= port && port <= 65535;
+}
+
+static_assert(is_valid_port(80));
+static_assert(!is_valid_port(70000));
+\end{lstlisting}
+
+\code{static_assert} 是编译期断言。它适合检查常量规则、模板约束和平台假设。不要把运行期输入塞进 \code{static_assert}，因为运行期输入编译时并不存在。
+
+\section{用 type traits 观察类型能力}
+
+type traits 是一组在编译期回答类型问题的工具。例如：
+
+\begin{lstlisting}[language=C++,caption={检查类型属性}]
+static_assert(std::is_integral_v<int>);
+static_assert(!std::is_integral_v<std::string>);
+static_assert(std::is_move_constructible_v<std::vector<int>>);
+\end{lstlisting}
+
+这些工具常用于泛型库内部。普通业务代码不应该到处堆 traits；如果可以用 concept 表达接口，优先用 concept。traits 更像底层零件，concept 更像公开合同。
+
+\section{enable\_if 到 concept 的演进}
+
+\cpp20 以前常用 \code{std::enable_if} 限制模板：
+
+\begin{lstlisting}[language=C++,caption={传统 SFINAE 写法}]
+template <typename T, typename = std::enable_if_t<std::is_integral_v<T>>>
+bool is_even(T value)
+{
+    return value % 2 == 0;
+}
+\end{lstlisting}
+
+\cpp20 可以写得更直接：
+
+\begin{lstlisting}[language=C++,caption={concept 写法更接近意图}]
+template <std::integral T>
+bool is_even(T value)
+{
+    return value % 2 == 0;
+}
+\end{lstlisting}
+
+两者本质都在限制类型，但 concept 把错误消息和接口意图都变清楚。学习 traits 是为了能读懂旧代码和写底层库，不是为了把所有新代码写复杂。
+
+\section{if constexpr：编译期分支}
+
+有些分支取决于类型，不取决于运行期值：
+
+\begin{lstlisting}[language=C++,caption={根据类型选择实现}]
+template <typename T>
+std::string to_debug_string(const T& value)
+{
+    if constexpr (std::is_same_v<T, std::string>) {
+        return value;
+    } else if constexpr (std::is_arithmetic_v<T>) {
+        return std::to_string(value);
+    } else {
+        return "<object>";
+    }
+}
+\end{lstlisting}
+
+\code{if constexpr} 未选择的分支不会被实例化。这和普通 \code{if} 不同。普通 \code{if} 的两个分支都必须语法和类型正确；\code{if constexpr} 可以根据类型裁掉不适用分支。
+
+\section{编译期表和运行期表}
+
+如果一组数据固定不变，可以用 \code{constexpr std::array}：
+
+\begin{lstlisting}[language=C++,caption={编译期关键字表}]
+constexpr std::array<std::string_view, 4> KEYWORDS{
+    "class",
+    "const",
+    "return",
+    "while",
+};
+
+constexpr bool is_keyword(std::string_view word)
+{
+    for (std::string_view keyword : KEYWORDS) {
+        if (keyword == word) {
+            return true;
+        }
+    }
+    return false;
+}
+\end{lstlisting}
+
+这里的表很小，线性扫描足够。如果关键字很多，可以排序后二分，但不要为了“编译期”牺牲可读性。编译期优化也要有规模依据。
+
+\section{模板错误如何设计得更友好}
+
+一个泛型函数如果没有约束，用户传错类型时可能看到几十行错误。用 concept 或 \code{static_assert} 可以把错误变近：
+
+\begin{lstlisting}[language=C++,caption={用编译期断言给出明确错误}]
+template <typename T>
+T median(std::span<const T> values)
+{
+    static_assert(std::totally_ordered<T>,
+                  "median requires an ordered value type");
+    // ...
+}
+\end{lstlisting}
+
+更好的方式是直接写到模板头上：
+
+\begin{lstlisting}[language=C++,caption={约束排序能力}]
+template <std::totally_ordered T>
+T median(std::span<const T> values);
+\end{lstlisting}
+
+公开接口优先用约束，函数内部再用 \code{static_assert} 检查更细的不变量。
+
+\section{不要把运行期问题硬搬到编译期}
+
+编译期计算有成本：模板实例化更复杂，编译时间可能增加，错误信息可能变长。配置文件、用户输入、网络数据、数据库记录都天然是运行期信息，不要为了“高级”硬做成模板参数。
+
+一个实用判断：如果错误和类型或固定常量有关，考虑编译期；如果错误和外部输入有关，运行期处理更自然。
+
+\begin{exercisebox}
+实现一个 \code{FixedString<N>}，保存固定长度字符串，并写一个 \code{constexpr} 函数判断它是否为空。然后回答：哪些检查发生在编译期，哪些仍然只能运行期处理？
+\end{exercisebox}

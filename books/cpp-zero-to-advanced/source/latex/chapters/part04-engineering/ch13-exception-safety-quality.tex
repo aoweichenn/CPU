@@ -1,0 +1,144 @@
+\chapter{异常安全、代码质量和工具链}
+
+\section{问题入口：异常发生时对象还可信吗}
+
+异常安全不是“是否使用异常”的争论，而是异常发生后程序状态是否仍然可信。看一个转账函数：
+
+\begin{lstlisting}[language=C++,caption={中途失败会破坏状态}]
+void transfer(Account& from, Account& to, int amount)
+{
+    from.withdraw(amount);
+    to.deposit(amount);
+}
+\end{lstlisting}
+
+如果 \code{withdraw} 成功，\code{deposit} 抛异常，钱从 \code{from} 扣了，却没有加到 \code{to}。这不是异常的问题，而是操作没有设计事务边界。异常安全要从不变量出发：函数失败后，哪些状态必须仍然成立？
+
+\section{三种常见保证}
+
+异常安全常用三个层级描述：
+
+\begin{itemize}
+  \item 基本保证：异常后对象仍然有效，不泄漏资源，但值可能改变。
+  \item 强保证：异常后状态像函数没被调用过。
+  \item 不抛保证：函数承诺不抛异常，常用 \code{noexcept} 表达。
+\end{itemize}
+
+例如 \code{std::vector::push_back} 在很多情况下提供强保证：如果扩容或元素构造失败，原向量仍保持原样。要做到这一点，通常需要先准备新资源，成功后再提交状态。
+
+\section{先准备，后提交}
+
+假设要更新配置对象，解析新配置可能失败。不要边解析边修改当前配置：
+
+\begin{lstlisting}[language=C++,caption={边解析边修改会留下半更新状态}]
+void reload_bad(Config& config, std::istream& input)
+{
+    input >> config.host;
+    input >> config.port;
+    input >> config.thread_count;
+}
+\end{lstlisting}
+
+更好的做法是先解析到临时对象，全部成功后再赋值：
+
+\begin{lstlisting}[language=C++,caption={先构造临时配置再提交}]
+void reload(Config& config, std::istream& input)
+{
+    Config next;
+    input >> next.host;
+    input >> next.port;
+    input >> next.thread_count;
+    validate(next);
+    config = std::move(next);
+}
+\end{lstlisting}
+
+如果解析或校验失败，\code{config} 没有被修改。这就是强保证的基本形状。它通常会多一个临时对象，但换来更清楚的失败语义。
+
+\section{析构函数不要抛异常}
+
+析构函数常在栈展开期间执行。如果析构函数再抛异常，程序可能直接终止。因此析构函数应该吞掉或记录清理失败，而不是让异常逃出：
+
+\begin{lstlisting}[language=C++,caption={析构中使用错误码清理}]
+class TempFile {
+public:
+    ~TempFile()
+    {
+        std::error_code ignored;
+        std::filesystem::remove(this->path_, ignored);
+    }
+
+private:
+    std::filesystem::path path_;
+};
+\end{lstlisting}
+
+如果清理失败必须报告，就提供显式 \code{close} 或 \code{commit} 函数，让调用者在可处理错误的位置调用。析构负责兜底清理，不负责复杂错误恢复。
+
+\section{noexcept 是接口承诺}
+
+\code{noexcept} 不是优化装饰，而是承诺。移动构造如果不抛，标准容器在扩容时更愿意移动元素：
+
+\begin{lstlisting}[language=C++,caption={移动构造通常应 noexcept}]
+Buffer(Buffer&& other) noexcept
+    : data_{other.data_}, size_{other.size_}
+{
+    other.data_ = nullptr;
+    other.size_ = 0;
+}
+\end{lstlisting}
+
+不要随便给可能抛异常的函数标 \code{noexcept}。如果 \code{noexcept} 函数内部真的抛出异常，程序会调用 \code{std::terminate}。所以它必须和实现事实一致。
+
+\section{编译警告和静态检查}
+
+基础构建至少打开警告：
+
+\begin{lstlisting}[language=CMake,caption={目标级警告选项}]
+target_compile_options(my_target PRIVATE
+    -Wall
+    -Wextra
+    -Wpedantic
+    -Wconversion)
+\end{lstlisting}
+
+警告不是绝对真理，但它们是便宜的质量信号。比如未使用变量、隐式窄化转换、缺少返回值，经常能提前暴露真实 bug。不要把警告全局关掉，也不要为了“清零”写无意义代码。每个警告都要分类：真实问题、风格问题、工具误报，还是需要局部抑制。
+
+\section{消毒器：让未定义行为早点爆}
+
+地址消毒器可以发现越界、use-after-free 等问题：
+
+\begin{lstlisting}[language=bash,caption={用消毒器构建测试}]
+cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+cmake --build build-asan
+ctest --test-dir build-asan --output-on-failure
+\end{lstlisting}
+
+线程消毒器可以发现数据竞争，但通常不能和地址消毒器一起使用。并发代码要单独跑：
+
+\begin{lstlisting}[language=bash,caption={线程消毒器构建}]
+cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug \
+  -DCMAKE_CXX_FLAGS="-fsanitize=thread -fno-omit-frame-pointer"
+\end{lstlisting}
+
+工具不是证明程序正确，而是扩大测试能抓到的问题范围。没有测试输入，消毒器也无事可做。
+
+\section{代码审查清单}
+
+自查一段 \cpp 代码时，可以按这个顺序看：
+
+\begin{enumerate}
+  \item 所有权：谁拥有资源，谁只是观察？
+  \item 生命周期：引用、指针、视图是否可能悬空？
+  \item 错误路径：异常或错误返回后对象不变量是否仍成立？
+  \item 复制移动：是否有无意大对象复制？移动后对象是否被错误使用？
+  \item 复杂度：主要循环是否重复扫描历史数据？
+  \item 测试：空输入、单元素、边界值、失败路径是否覆盖？
+\end{enumerate}
+
+这个顺序不是固定流程，但它能避免只看语法风格。真正影响可维护性的，通常是所有权、错误边界和数据结构选择。
+
+\begin{exercisebox}
+选择前面 LRU 缓存项目，给每个公开函数写异常安全说明：容量为零、哈希表分配失败、Value 移动失败时，对象是否仍满足不变量？如果无法提供强保证，说明它至少能提供什么保证。
+\end{exercisebox}

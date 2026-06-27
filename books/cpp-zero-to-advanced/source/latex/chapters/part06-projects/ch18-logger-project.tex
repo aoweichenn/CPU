@@ -1,0 +1,211 @@
+\chapter{项目五：异步日志器}
+
+\section{项目目标}
+
+日志器是一个综合项目：它接收多线程提交的日志消息，后台线程写入文件，关闭时刷新剩余消息。这个项目覆盖字符串格式化、时间、互斥量、条件变量、文件 RAII、异常边界和背压策略。
+
+目标接口：
+
+\begin{lstlisting}[language=C++,caption={日志器接口}]
+class AsyncLogger {
+public:
+    explicit AsyncLogger(std::filesystem::path path);
+    ~AsyncLogger();
+
+    void info(std::string message);
+    void error(std::string message);
+};
+\end{lstlisting}
+
+接口按值接收 \code{std::string}，因为日志器要保存消息到后台队列。调用者传临时字符串时可以移动，传左值时复制一份，语义清楚。
+
+\section{日志消息类型}
+
+\begin{lstlisting}[language=C++,caption={日志消息}]
+enum class LogLevel {
+    info,
+    error,
+};
+
+struct LogMessage {
+    LogLevel level = LogLevel::info;
+    std::chrono::system_clock::time_point time;
+    std::string text;
+};
+\end{lstlisting}
+
+不要把日志级别保存成裸字符串。枚举让内部逻辑更稳定，输出时再转换成文本。
+
+\section{队列和关闭协议}
+
+日志器内部和任务队列类似：
+
+\begin{lstlisting}[language=C++,caption={日志器内部状态}]
+class AsyncLogger {
+public:
+    explicit AsyncLogger(std::filesystem::path path);
+    ~AsyncLogger();
+
+    void info(std::string message);
+    void error(std::string message);
+
+private:
+    void push(LogLevel level, std::string message);
+    void run();
+
+    std::ofstream output_;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::queue<LogMessage> messages_;
+    bool closed_ = false;
+    std::jthread worker_;
+};
+\end{lstlisting}
+
+成员顺序要注意：\code{worker_} 最后声明，析构时最先析构并 join。但析构函数会先设置关闭状态并通知线程，让后台线程自然退出。
+
+\section{构造和析构}
+
+\begin{lstlisting}[language=C++,caption={构造和析构日志器}]
+AsyncLogger::AsyncLogger(std::filesystem::path path)
+    : output_{path}, worker_{[this] { this->run(); }}
+{
+    if (!this->output_) {
+        throw std::runtime_error{"cannot open log file"};
+    }
+}
+
+AsyncLogger::~AsyncLogger()
+{
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        this->closed_ = true;
+    }
+    this->ready_.notify_all();
+}
+\end{lstlisting}
+
+这里有一个细节：构造函数先初始化 \code{output_}，再启动 \code{worker_}。成员按声明顺序初始化，而不是按初始化列表顺序。构造期间启动线程要非常小心，确保线程访问的成员已经构造完成。
+
+\section{提交日志}
+
+\begin{lstlisting}[language=C++,caption={提交日志消息}]
+void AsyncLogger::info(std::string message)
+{
+    this->push(LogLevel::info, std::move(message));
+}
+
+void AsyncLogger::error(std::string message)
+{
+    this->push(LogLevel::error, std::move(message));
+}
+
+void AsyncLogger::push(LogLevel level, std::string message)
+{
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        if (this->closed_) {
+            return;
+        }
+        this->messages_.push(LogMessage{
+            .level = level,
+            .time = std::chrono::system_clock::now(),
+            .text = std::move(message),
+        });
+    }
+    this->ready_.notify_one();
+}
+\end{lstlisting}
+
+关闭后提交日志，本项目选择静默忽略。也可以选择抛异常或返回 \code{bool}，但规则必须写进接口文档。析构期间再抛异常通常不是好主意。
+
+\section{后台写入}
+
+\begin{lstlisting}[language=C++,caption={后台写日志}]
+void AsyncLogger::run()
+{
+    while (true) {
+        std::optional<LogMessage> message;
+        {
+            std::unique_lock<std::mutex> lock{this->mutex_};
+            this->ready_.wait(lock, [this] {
+                return this->closed_ || !this->messages_.empty();
+            });
+            if (this->messages_.empty()) {
+                return;
+            }
+            message = std::move(this->messages_.front());
+            this->messages_.pop();
+        }
+        this->write_message(*message);
+    }
+}
+\end{lstlisting}
+
+取出消息后立刻释放锁，再写文件。文件 I/O 可能慢，如果持锁写文件，提交日志的线程也会被阻塞。锁只保护队列，不保护所有操作。
+
+\section{格式化输出}
+
+\begin{lstlisting}[language=C++,caption={格式化日志级别}]
+std::string_view level_name(LogLevel level)
+{
+    switch (level) {
+    case LogLevel::info:
+        return "INFO";
+    case LogLevel::error:
+        return "ERROR";
+    }
+    return "UNKNOWN";
+}
+\end{lstlisting}
+
+写消息：
+
+\begin{lstlisting}[language=C++,caption={写日志消息}]
+void AsyncLogger::write_message(const LogMessage& message)
+{
+    this->output_ << level_name(message.level)
+                  << " "
+                  << message.text
+                  << '\n';
+}
+\end{lstlisting}
+
+时间格式化可以继续扩展。第一版先保证线程和关闭协议正确，不要把所有功能一次塞进去。
+
+\section{背压和丢日志策略}
+
+当前日志器队列无限增长。如果日志产生速度超过写盘速度，会占用越来越多内存。可以增加最大队列长度：
+
+\begin{lstlisting}[language=C++,caption={日志队列背压策略}]
+constexpr std::size_t LOGGER_MAX_QUEUE_SIZE = 8192;
+\end{lstlisting}
+
+队列满时常见策略：
+
+\begin{itemize}
+  \item 阻塞调用者：日志不能丢，但业务线程可能变慢。
+  \item 丢弃新日志：业务不阻塞，但可能缺关键信息。
+  \item 丢弃低级别日志：保留错误，丢掉 info。
+  \item 同步写入：队列满时调用者自己写文件，复杂度更高。
+\end{itemize}
+
+日志系统没有完美策略，只有适合业务的取舍。教学版可以先选“队列满时丢弃 info，保留 error”，并统计丢弃数量。
+
+\section{测试计划}
+
+日志器测试不应该依赖睡眠。可以把后台写入逻辑拆成可测试的 \code{LogSink}，或者给日志器提供 \code{flush}：
+
+\begin{itemize}
+  \item 单线程写入一条 info，文件中出现一行。
+  \item 多线程提交固定数量日志，最终行数正确。
+  \item 析构后剩余消息被写完。
+  \item 文件打不开时构造失败。
+  \item 队列满时策略符合文档。
+\end{itemize}
+
+并发测试要避免“睡 100ms 应该写完”。更可靠的是用 \code{std::promise}、\code{std::latch} 或显式 \code{flush} 建立同步点。
+
+\begin{exercisebox}
+给异步日志器增加 \code{flush()}：调用后等待当前已经提交的日志全部写完。不要用睡眠。提示：可以向队列提交一个特殊消息，后台线程处理到它时通知 \code{promise}。
+\end{exercisebox}
