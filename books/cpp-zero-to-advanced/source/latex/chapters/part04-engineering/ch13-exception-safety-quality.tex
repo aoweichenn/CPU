@@ -14,6 +14,43 @@ void transfer(Account& from, Account& to, int amount)
 
 如果 \code{withdraw} 成功，\code{deposit} 抛异常，钱从 \code{from} 扣了，却没有加到 \code{to}。这不是异常的问题，而是操作没有设计事务边界。异常安全要从不变量出发：函数失败后，哪些状态必须仍然成立？
 
+\section{先把失败路径写成账本}
+
+不要一上来背“基本保证、强保证”。先把转账函数的每一步列出来：
+
+\begin{enumerate}
+  \item 检查 \code{from} 余额是否足够。
+  \item 从 \code{from} 扣钱。
+  \item 给 \code{to} 加钱。
+  \item 写审计日志或通知外部系统。
+\end{enumerate}
+
+如果第 \code{2} 步之后第 \code{3} 步失败，账户总额被破坏；如果第 \code{3} 步之后第 \code{4} 步失败，账户余额已经正确，但审计缺失。两个失败点的性质不同：前者破坏核心不变量，后者是外部副作用缺失。异常安全分析必须把“不变量”和“附加动作”分开。
+
+一种更稳的转账接口，是让单个账户的余额修改本身不抛异常，所有可能失败的检查都在修改前完成：
+
+\begin{lstlisting}[language=C++,caption={先验证再做不抛提交}]
+class Account {
+public:
+    [[nodiscard]] bool can_withdraw(int amount) const noexcept;
+    void withdraw_checked(int amount) noexcept;
+    void deposit_checked(int amount) noexcept;
+};
+
+bool transfer(Account& from, Account& to, int amount)
+{
+    if (!from.can_withdraw(amount)) {
+        return false;
+    }
+
+    from.withdraw_checked(amount);
+    to.deposit_checked(amount);
+    return true;
+}
+\end{lstlisting}
+
+这个版本不是靠异常恢复，而是改变设计：提交阶段只做不会失败的内存内状态修改。真实系统里如果涉及数据库、远程服务、审计日志，就需要更强的事务机制；普通 \cpp 对象的异常安全不能自动覆盖外部世界。
+
 \section{三种常见保证}
 
 异常安全常用三个层级描述：
@@ -54,6 +91,93 @@ void reload(Config& config, std::istream& input)
 \end{lstlisting}
 
 如果解析或校验失败，\code{config} 没有被修改。这就是强保证的基本形状。它通常会多一个临时对象，但换来更清楚的失败语义。
+
+\section{强保证背后的普通代码模型}
+
+强保证可以还原成三步普通代码：
+
+\begin{enumerate}
+  \item 在临时状态里完成所有可能失败的工作。
+  \item 检查临时状态满足不变量。
+  \item 用一个尽量不抛的操作提交新状态。
+\end{enumerate}
+
+配置热更新就是典型例子。坏版本直接改当前配置：
+
+\begin{lstlisting}[language=C++,caption={半更新配置的失败路径}]
+void reload_bad(Config& config, std::istream& input)
+{
+    input >> config.host;          // 可能已经改了 host
+    input >> config.port;          // 这里失败
+    input >> config.thread_count;  // 没执行
+}
+\end{lstlisting}
+
+如果第二行失败，\code{config} 处在“新 host、旧 port、旧线程数”的混合状态。调用者不知道这个状态是否能继续使用。强保证版本把这种混合状态限制在局部变量里：
+
+\begin{lstlisting}[language=C++,caption={临时状态承担失败风险}]
+Config parse_config(std::istream& input)
+{
+    Config next;
+    input >> next.host;
+    input >> next.port;
+    input >> next.thread_count;
+    validate(next);
+    return next;
+}
+
+void reload(Config& config, std::istream& input)
+{
+    Config next = parse_config(input);
+    config = std::move(next);
+}
+\end{lstlisting}
+
+现在失败只会发生在 \code{parse_config} 内部，原 \code{config} 还没被碰。如果 \code{Config} 的移动赋值可能抛异常，最后一步仍然有风险；这时可以把 \code{Config} 设计成用 \code{std::shared_ptr<const ConfigData>} 持有不可变数据，提交时只交换指针，或者提供不抛的 \code{swap}：
+
+\begin{lstlisting}[language=C++,caption={用不抛 swap 提交}]
+void reload_with_swap(Config& config, std::istream& input)
+{
+    Config next = parse_config(input);
+    using std::swap;
+    swap(config, next); // 应当设计为 noexcept
+}
+\end{lstlisting}
+
+这不是模板口号，而是一条能检查的实现规则：失败风险集中在临时对象，公开对象只在最后一步切换。
+
+\section{回滚对象适合局部状态，不适合所有副作用}
+
+有时无法做到“提交前不修改”。可以用一个小的回滚对象保存旧值，失败时恢复：
+
+\begin{lstlisting}[language=C++,caption={局部回滚对象}]
+class BalanceRollback {
+public:
+    explicit BalanceRollback(Account& account)
+        : account_{account}, old_balance_{account.balance()}
+    {
+    }
+
+    void commit() noexcept
+    {
+        this->committed_ = true;
+    }
+
+    ~BalanceRollback()
+    {
+        if (!this->committed_) {
+            this->account_.set_balance_for_rollback(this->old_balance_);
+        }
+    }
+
+private:
+    Account& account_;
+    int old_balance_ = 0;
+    bool committed_ = false;
+};
+\end{lstlisting}
+
+这个模型只适合恢复内存内、可逆、恢复过程不抛异常的状态。已经发出去的网络请求、已经打印的日志、已经写入另一个进程的数据，不能靠析构函数“撤回”。所以异常安全不是魔法回滚，它要求你先判断哪些动作可逆，哪些动作必须放到提交点之后，哪些动作需要外部事务系统。
 
 \section{析构函数不要抛异常}
 

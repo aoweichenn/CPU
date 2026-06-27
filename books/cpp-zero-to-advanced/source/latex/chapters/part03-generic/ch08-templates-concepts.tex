@@ -213,3 +213,132 @@ void report_average(std::span<const Number> values)
 \begin{exercisebox}
 给 \code{RingBuffer} 补两个测试：容量为 \code{2} 时连续 \code{push} 三次，第三次应失败；连续 \code{pop} 三次，第三次应返回 \code{std::nullopt}。再尝试声明 \code{RingBuffer<int, 0>}，确认编译期约束生效。
 \end{exercisebox}
+
+\section{模板背后的实例化模型}
+
+模板也要用“普通代码形状”理解。下面这个函数模板：
+
+\begin{lstlisting}[language=C++,caption={函数模板}]
+template <typename T>
+T max_value(T lhs, T rhs)
+{
+    return lhs < rhs ? rhs : lhs;
+}
+\end{lstlisting}
+
+当你写：
+
+\begin{lstlisting}[language=C++,caption={两个调用点}]
+int a = max_value(1, 2);
+double b = max_value(1.5, 2.5);
+\end{lstlisting}
+
+可以近似理解为编译器生成了两个普通函数：
+
+\begin{lstlisting}[language=C++,caption={近似生成的普通函数}]
+int max_value_int(int lhs, int rhs)
+{
+    return lhs < rhs ? rhs : lhs;
+}
+
+double max_value_double(double lhs, double rhs)
+{
+    return lhs < rhs ? rhs : lhs;
+}
+\end{lstlisting}
+
+模板不是运行时拿着一个“任意类型”在跑。它是在编译期按具体类型生成代码。这解释了三个现象：模板定义通常要放头文件；模板错误常在使用点爆出；模板过大可能增加编译时间和二进制体积。
+
+\section{concept 背后是编译期门禁}
+
+给模板加 concept，可以理解为在生成具体函数前先检查类型能力：
+
+\begin{lstlisting}[language=C++,caption={有约束的模板}]
+template <std::totally_ordered T>
+T median(std::span<const T> values);
+\end{lstlisting}
+
+近似的普通语言描述是：只有当 \code{T} 支持完整排序关系时，编译器才允许实例化这个模板。它不是运行时 \code{if}，不会在程序启动后检查；它是编译期门禁。传入不能排序的类型，程序根本不生成对应函数。
+
+\section{从调用点推导模板参数}
+
+模板参数通常由调用点推导：
+
+\begin{lstlisting}[language=C++,caption={模板参数推导}]
+auto value = max_value(1, 2); // T 推导为 int
+\end{lstlisting}
+
+但这句会失败：
+
+\begin{lstlisting}[language=C++,caption={两个实参推导出不同类型}]
+auto value = max_value(1, 2.0);
+\end{lstlisting}
+
+第一个实参希望 \code{T} 是 \code{int}，第二个希望 \code{T} 是 \code{double}。编译器不会随便替你决定。你可以显式指定：
+
+\begin{lstlisting}[language=C++,caption={显式指定模板参数}]
+auto value = max_value<double>(1, 2.0);
+\end{lstlisting}
+
+这时 \code{1} 会转换成 \code{double}。这个例子说明模板推导不是“自动变聪明”，它有严格规则。遇到模板报错时，先问：每个参数把模板参数推成了什么？
+
+\section{模板和普通函数如何配合}
+
+如果模板里有大量与类型无关的逻辑，可以把它移到普通函数。再给一个更完整的例子：格式化错误报告时，只有“把值转成字符串”与类型相关，其余拼接都无关。
+
+\begin{lstlisting}[language=C++,caption={非模板函数承接共同逻辑}]
+std::string make_error_message(std::string_view field,
+                               std::string_view value_text)
+{
+    std::string message;
+    message.reserve(field.size() + value_text.size() + 32);
+    message += "invalid ";
+    message += field;
+    message += ": ";
+    message += value_text;
+    return message;
+}
+
+template <typename T>
+std::string make_typed_error(std::string_view field, const T& value)
+{
+    return make_error_message(field, to_debug_string(value));
+}
+\end{lstlisting}
+
+这样模板层很薄，实例化负担小，报错也更集中。泛型设计不是把所有东西都模板化，而是把真正依赖类型的部分模板化。
+
+\section{类模板展开也会生成不同类型}
+
+\code{RingBuffer<int, 8>} 和 \code{RingBuffer<int, 16>} 不是同一个类型。近似理解是：
+
+\begin{lstlisting}[language=C++,caption={不同容量生成不同类}]
+class RingBufferInt8 {
+    std::array<int, 8> data_;
+    // ...
+};
+
+class RingBufferInt16 {
+    std::array<int, 16> data_;
+    // ...
+};
+\end{lstlisting}
+
+这就是为什么容量能参与编译期检查，也解释了为什么不同容量的缓冲区不能直接互相赋值。容量不只是成员值，它已经进入类型身份。
+
+\section{模板错误诊断练习}
+
+当模板报错很长时，按这个模板账本定位：
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+问题 & 要看哪里 & 例子 \\
+\midrule
+推导失败 & 调用点实参类型 & \code{int} 和 \code{double} 混传 \\
+约束失败 & concept 条件 & 类型不能排序或不能相加 \\
+实例化失败 & 模板函数体 & 类型没有 \code{size()} 成员 \\
+链接失败 & 定义是否可见 & 模板定义只放在 \code{.cpp} \\
+\bottomrule
+\end{longtable}
+
+模板不是黑箱。把它还原成“按类型生成普通代码”的模型后，报错就能逐层拆开。

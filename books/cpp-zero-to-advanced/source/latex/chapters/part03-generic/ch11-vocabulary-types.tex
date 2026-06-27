@@ -185,3 +185,118 @@ ParsedArgument parse_argument(std::string_view text)
 \begin{exercisebox}
 把前面的 \code{ParseResult} 改成 \code{std::variant<Options, ParseError>} 风格。写一个辅助函数判断成功或失败。比较这种写法和两个 \code{optional} 字段的优缺点。
 \end{exercisebox}
+
+\section{optional 背后的状态模型}
+
+\code{std::optional<T>} 可以用普通代码近似理解成“一个是否有值的标志，加上一块能放 \code{T} 的存储”。它不是把 \code{T} 初始化成某个特殊值。
+
+\begin{lstlisting}[language=C++,caption={optional 的近似模型}]
+template <typename T>
+class OptionalLike {
+public:
+    [[nodiscard]] bool has_value() const noexcept
+    {
+        return this->has_value_;
+    }
+
+private:
+    bool has_value_ = false;
+    // 真实 optional 会用合适的未初始化存储保存 T
+};
+\end{lstlisting}
+
+这解释了为什么 \code{optional<int>} 能区分“没有值”和“值为 \code{0}”。特殊值方案把状态塞进值域；\code{optional} 把状态单独拿出来。
+
+\section{variant 背后的标签联合体}
+
+\code{std::variant<Flag, KeyValue, Positional>} 可以理解成“一个标签，加上一块足够大的存储”。标签记录当前里面是哪一种类型：
+
+\begin{lstlisting}[language=C++,caption={variant 的近似状态}]
+enum class ArgumentKind {
+    flag,
+    key_value,
+    positional,
+};
+
+struct ArgumentLike {
+    ArgumentKind kind = ArgumentKind::flag;
+    // 真实 variant 会管理构造、析构、对齐和异常安全
+};
+\end{lstlisting}
+
+手写这种结构很容易漏析构、拷贝和异常安全，所以标准库提供 \code{variant}。但理解“标签加存储”很重要：处理 variant 时必须看标签，也就是用 \code{std::visit} 或 \code{std::get_if} 分支处理当前形态。
+
+\section{visit 背后是按标签分发}
+
+下面的 \code{visit}：
+
+\begin{lstlisting}[language=C++,caption={visit 处理三种参数}]
+std::visit([](const auto& item) {
+    print_one(item);
+}, argument);
+\end{lstlisting}
+
+可以近似理解成：
+
+\begin{lstlisting}[language=C++,caption={按当前标签分发}]
+switch (argument.kind()) {
+case ArgumentKind::flag:
+    print_one(argument.as_flag());
+    break;
+case ArgumentKind::key_value:
+    print_one(argument.as_key_value());
+    break;
+case ArgumentKind::positional:
+    print_one(argument.as_positional());
+    break;
+}
+\end{lstlisting}
+
+标准库帮你保证类型安全。新增一种参数形态时，访问器如果处理不了，编译器会在相应调用点报错。这比字符串里塞一个 \code{"kind"} 字段更早暴露遗漏。
+
+\section{expected 风格要保证二选一}
+
+两个 \code{optional} 字段的简化 \code{Result} 有一个设计漏洞：它可能同时有值和错误，也可能两者都没有。用 \code{variant<T, E>} 表达二选一更严谨，因为状态空间只允许成功或失败。
+
+\begin{lstlisting}[language=C++,caption={二选一结果的最小接口}]
+template <typename T, typename E>
+class Result {
+public:
+    [[nodiscard]] bool has_value() const noexcept
+    {
+        return std::holds_alternative<T>(this->state_);
+    }
+
+    [[nodiscard]] const T& value() const
+    {
+        return std::get<T>(this->state_);
+    }
+
+    [[nodiscard]] const E& error() const
+    {
+        return std::get<E>(this->state_);
+    }
+
+private:
+    std::variant<T, E> state_;
+};
+\end{lstlisting}
+
+真实项目还要处理构造函数、移动、错误访问策略和易用性。本章重点是模型：如果业务语义是二选一，类型最好也只允许二选一。
+
+\section{词汇类型选择表}
+
+\begin{longtable}{p{0.25\linewidth}p{0.29\linewidth}p{0.36\linewidth}}
+\toprule
+语义 & 类型 & 不要误用成 \\
+\midrule
+可能没有值 & \code{std::optional<T>} & 特殊值 \code{-1}、空字符串 \\
+固定几种形态之一 & \code{std::variant<A, B>} & 手写 \code{kind} 加裸字段 \\
+值或错误 & expected 风格结果 & 打印错误后返回默认值 \\
+非拥有连续区间 & \code{std::span<T>} & 指针加长度分离传参 \\
+非拥有文本 & \code{std::string_view} & 长期保存的配置字段 \\
+业务字段集合 & \code{struct} & 长期使用的 \code{tuple} \\
+\bottomrule
+\end{longtable}
+
+词汇类型的价值是让读者在函数签名里看见语义。签名越诚实，调用者越不容易猜错。

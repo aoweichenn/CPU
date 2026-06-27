@@ -31,6 +31,42 @@ std::cout << sizeof(B) << " " << alignof(B) << '\n';
 
 不要为了省几个字节盲目重排所有结构体。字段顺序也影响可读性和 ABI。只有当对象数量巨大、内存确实成为瓶颈时，才把布局优化作为明确任务。
 
+\section{结构体布局的账本推导}
+
+把结构体布局想成编译器在填一张地址账本。假设某个平台上 \code{char} 对齐为 \code{1}，\code{int} 对齐为 \code{4}。结构体 \code{A} 的字段顺序是 \code{char}、\code{int}、\code{char}：
+
+\begin{lstlisting}[language=C++,caption={按字段顺序推导布局}]
+struct A {
+    char flag;   // offset 0
+    int count;   // must start at an address divisible by 4
+    char tag;    // after count
+};
+\end{lstlisting}
+
+推导过程如下：
+
+\begin{enumerate}
+  \item \code{flag} 放在偏移 \code{0}，占 \code{1} 字节。
+  \item 下一个字段 \code{count} 要求偏移能被 \code{4} 整除。当前偏移是 \code{1}，所以编译器补 \code{3} 个填充字节，把 \code{count} 放到偏移 \code{4}。
+  \item \code{count} 占 \code{4} 字节，结束后偏移到 \code{8}。
+  \item \code{tag} 放在偏移 \code{8}，占 \code{1} 字节。
+  \item 整个对象的大小通常还要补齐到最大对齐 \code{4} 的倍数，所以末尾再补 \code{3} 个字节。
+\end{enumerate}
+
+这就是为什么 \code{A} 常见大小是 \code{12}。再看 \code{B}：
+
+\begin{lstlisting}[language=C++,caption={把大对齐字段提前}]
+struct B {
+    int count;   // offset 0
+    char flag;   // offset 4
+    char tag;    // offset 5
+};
+\end{lstlisting}
+
+\code{count} 从偏移 \code{0} 开始，天然满足 \code{4} 字节对齐；两个 \code{char} 接在后面，最后只需要把整体大小补到 \code{8}。字段没有变，内存账本变了。这个例子推出来的规律是：大对齐字段夹在小字段中间时，容易制造中间填充；把大字段放在一起，常能减少空洞。
+
+但是这个规律不是“永远重排字段”。如果结构体对外暴露为二进制 ABI、写入文件格式、被别的语言绑定，字段顺序就是接口的一部分。优化布局前先问：这个类型是不是内部实现细节？对象数量是否足够多？有没有测量证明内存或缓存是瓶颈？
+
 \section{栈、堆和对象生命周期}
 
 “栈上对象”和“堆上对象”不是对象类型，而是存储位置和生命周期管理方式不同：
@@ -43,6 +79,41 @@ void run()
 \end{lstlisting}
 
 \code{values} 这个 vector 对象本身是局部对象，离开作用域析构。但它内部元素通常存放在动态分配的内存里，由 vector 管理。不要简单说“vector 在栈上所以数据也在栈上”。对象本体和它拥有的资源要分开看。
+
+\section{vector 背后的普通对象形状}
+
+\code{std::vector<int>} 可以近似理解成一个很小的对象，里面保存三类信息：元素起始位置、当前结束位置、容量结束位置。真实标准库实现细节不要求完全长这样，但心智模型很有用：
+
+\begin{lstlisting}[language=C++,caption={vector 的近似本体}]
+class IntVectorShape {
+public:
+    int* begin = nullptr;
+    int* end = nullptr;
+    int* capacity_end = nullptr;
+};
+\end{lstlisting}
+
+因此这段代码里有两块东西：
+
+\begin{lstlisting}[language=C++,caption={对象本体和元素资源分离}]
+void run()
+{
+    std::vector<int> values{1, 2, 3};
+}
+\end{lstlisting}
+
+\code{values} 这个本体在当前函数的自动存储期里；元素 \code{1}、\code{2}、\code{3} 通常在 \code{vector} 申请的动态存储里。离开作用域时，先调用 \code{values} 的析构函数，再由析构函数释放元素资源。把它还原成普通代码，大概是：
+
+\begin{lstlisting}[language=C++,caption={RAII 的普通代码形状}]
+void run_shape()
+{
+    IntVectorShape values = allocate_and_fill_ints({1, 2, 3});
+    // 使用 values
+    destroy_ints(values);
+}
+\end{lstlisting}
+
+真实 \code{std::vector} 把 \code{destroy_ints} 放进析构函数，所以调用者不用手写清理。这就是 RAII 的价值：资源清理跟对象生命周期绑定，而不是散落在每条返回路径和异常路径上。
 
 \section{new 和 delete 为什么不该到处写}
 
@@ -97,6 +168,30 @@ for (std::size_t i = 0; i < sizeof(value); ++i) {
 \end{lstlisting}
 
 但这不意味着可以随意把任意字节解释成任意对象。类型别名规则、对齐、对象生命周期都会影响是否合法。入门阶段记住保守规则：序列化和解析二进制格式时，不要直接把网络字节流 \code{reinterpret_cast} 成结构体；应该逐字段读写，明确大小端和字段长度。
+
+\section{为什么不能把协议头直接转成结构体}
+
+很多初学者会想：协议头不是正好有字段吗？那就定义结构体，然后强转：
+
+\begin{lstlisting}[language=C++,caption={把字节流强转成结构体的问题}]
+struct WireHeader {
+    char magic[4];
+    std::uint16_t version;
+};
+
+const auto* header = reinterpret_cast<const WireHeader*>(bytes.data());
+\end{lstlisting}
+
+这个写法看起来省事，但问题有四层：
+
+\begin{enumerate}
+  \item 长度不一定够。只有 \code{bytes.data()}，不能证明后面至少有 \code{sizeof(WireHeader)} 字节。
+  \item 对齐不一定满足。字节缓冲区起始地址可能不适合直接读取 \code{std::uint16_t}。
+  \item 填充字节不受协议控制。结构体里的字段之间可能有 padding，而协议通常按紧凑字节定义。
+  \item 字节序不明确。网络协议常用大端，本机可能是小端。
+\end{enumerate}
+
+所以解析二进制协议时，安全模型不是“这段内存像结构体”，而是“我从第几个字节读几位，按协议规则组装成值”。这也是从底层推导出的工程规则：内存布局服务于本机对象，协议布局服务于跨机器交换，两者不能混为一谈。
 
 \section{完整案例：二进制头解析}
 

@@ -178,3 +178,126 @@ assert(rejected);
 \begin{exercisebox}
 实现一个 \code{Date} 类，要求月份在 \code{1} 到 \code{12}，日期必须符合月份天数。先不处理闰年，再把闰年规则加进去。练习重点不是背日期算法，而是把“不允许出现的状态”挡在构造函数外。
 \end{exercisebox}
+
+\section{Date 案例：从非法状态推导类}
+
+温度区间只有两个字段，规则也简单。日期更接近真实业务：年、月、日三个字段一起决定对象是否有效。朴素结构体很容易制造坏对象：
+
+\begin{lstlisting}[language=C++,caption={日期坏对象}]
+struct DateData {
+    int year = 0;
+    int month = 0;
+    int day = 0;
+};
+
+DateData impossible{.year = 2026, .month = 2, .day = 31};
+\end{lstlisting}
+
+编译器不知道二月没有三十一日。于是日期不能长期只靠裸 \code{struct} 表达。先写规则函数：
+
+\begin{lstlisting}[language=C++,caption={日期规则函数}]
+constexpr bool is_leap_year(int year) noexcept
+{
+    return (year % 400 == 0) ||
+           (year % 4 == 0 && year % 100 != 0);
+}
+
+constexpr int days_in_month(int year, int month) noexcept
+{
+    constexpr int DAYS_IN_MONTH[] = {
+        0, 31, 28, 31, 30, 31, 30,
+        31, 31, 30, 31, 30, 31,
+    };
+    if (month == 2 && is_leap_year(year)) {
+        return 29;
+    }
+    return DAYS_IN_MONTH[month];
+}
+\end{lstlisting}
+
+规则函数单独存在，类负责调用它建立有效状态：
+
+\begin{lstlisting}[language=C++,caption={Date 构造边界}]
+class Date {
+public:
+    Date(int year, int month, int day)
+        : year_{year}, month_{month}, day_{day}
+    {
+        if (month < 1 || month > 12) {
+            throw std::invalid_argument{"month must be 1..12"};
+        }
+        if (day < 1 || day > days_in_month(year, month)) {
+            throw std::invalid_argument{"day is invalid for month"};
+        }
+    }
+
+    [[nodiscard]] int year() const noexcept { return this->year_; }
+    [[nodiscard]] int month() const noexcept { return this->month_; }
+    [[nodiscard]] int day() const noexcept { return this->day_; }
+
+private:
+    int year_ = 0;
+    int month_ = 1;
+    int day_ = 1;
+};
+\end{lstlisting}
+
+这个类没有 setter。不是因为 setter 永远不好，而是因为单独改月份或日期可能瞬间破坏不变量。更合适的接口是业务动作，例如 \code{next_day()} 或 \code{add_days()}，由类内部维护规则。
+
+\section{类背后的普通对象模型}
+
+类不是魔法。可以把它理解成“数据字段加一组只能通过对象调用的函数”。下面的成员函数：
+
+\begin{lstlisting}[language=C++,caption={成员函数}]
+[[nodiscard]] bool contains(double value) const noexcept
+{
+    return this->low_ <= value && value <= this->high_;
+}
+\end{lstlisting}
+
+近似等价于一个接收当前对象地址的普通函数：
+
+\begin{lstlisting}[language=C++,caption={成员函数的近似展开}]
+bool TemperatureRange_contains(const TemperatureRange* self,
+                               double value) noexcept
+{
+    return self->low_ <= value && value <= self->high_;
+}
+\end{lstlisting}
+
+真实 \code{private} 成员不能被外部普通函数访问，这里只是帮助理解：\code{this} 就是当前对象的入口。构造函数则是在对象创建时运行的一段初始化代码，用来把字段放到有效状态。析构函数是在对象离开生命周期时运行的清理代码。用这个普通代码模型看类，封装和生命周期会更具体。
+
+\section{不变量让调用者少做防御}
+
+如果 \code{Date} 保证自己永远有效，那么格式化函数就不需要每次重新检查月份范围：
+
+\begin{lstlisting}[language=C++,caption={建立在不变量上的函数}]
+std::string format_date(const Date& date)
+{
+    return std::format("{:04}-{:02}-{:02}",
+                       date.year(),
+                       date.month(),
+                       date.day());
+}
+\end{lstlisting}
+
+这个函数可以信任 \code{date.month()} 在 \code{1..12}，因为坏对象无法构造出来。不变量的价值就在这里：检查集中在边界，内部逻辑不必到处防御。
+
+\section{测试 Date 的规则矩阵}
+
+日期测试要覆盖规则，而不是只测 getter：
+
+\begin{longtable}{p{0.25\linewidth}p{0.28\linewidth}p{0.35\linewidth}}
+\toprule
+场景 & 输入 & 期望 \\
+\midrule
+普通日期 & \code{2026, 6, 27} & 构造成功 \\
+月份过小 & \code{2026, 0, 1} & 拒绝 \\
+月份过大 & \code{2026, 13, 1} & 拒绝 \\
+普通二月 & \code{2026, 2, 29} & 拒绝 \\
+闰年二月 & \code{2024, 2, 29} & 构造成功 \\
+日期为零 & \code{2026, 1, 0} & 拒绝 \\
+\bottomrule
+\end{longtable}
+
+有了这个矩阵，类的职责就很清楚：任何公开可见的 \code{Date} 对象都必须是真实日历日期。

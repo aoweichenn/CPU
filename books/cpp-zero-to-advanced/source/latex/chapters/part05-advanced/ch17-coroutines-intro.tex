@@ -99,3 +99,122 @@ ReadRequest -> QueryUser -> WriteResponse -> Done
 \begin{exercisebox}
 把“读文件、解析配置、启动服务”写成三步伪异步流程。先用回调写，再用协程伪代码写。比较错误处理放在哪里更清楚。重点不是编译运行，而是理解控制流形状。
 \end{exercisebox}
+
+\section{协程背后的手写状态机}
+
+协程最容易被误解成魔法。先把这段伪代码拆开：
+
+\begin{lstlisting}[language=C++,caption={协程顺序写法}]
+Task<Response> handle(Socket socket)
+{
+    Request request = co_await read_request(socket);
+    User user = co_await query_database(request.user_id);
+    co_return make_response(user);
+}
+\end{lstlisting}
+
+如果不用协程，可以手写一个状态机：
+
+\begin{lstlisting}[caption={手写状态机形态}]
+state = ReadRequest;
+保存 socket;
+
+当 read_request 完成:
+    保存 request;
+    state = QueryDatabase;
+    发起 query_database;
+
+当 query_database 完成:
+    保存 user;
+    state = Done;
+    生成 response;
+\end{lstlisting}
+
+协程的作用，是让编译器帮你生成和维护这套状态机。局部变量 \code{request}、\code{user}、\code{socket} 如果跨越暂停点还要使用，就会被保存到协程帧里。所谓协程帧，可以理解成“堆上或运行时管理的一块状态机存储”。
+
+\section{co await 近似展开}
+
+\code{co_await read_request(socket)} 大致做三件事：
+
+\begin{enumerate}
+  \item 问 awaiter：结果是否已经准备好。
+  \item 如果没准备好，保存当前协程状态并把控制权还给调度器。
+  \item 等外部事件完成后，调度器恢复协程，从暂停点继续。
+\end{enumerate}
+
+这和阻塞调用不同。阻塞调用会让当前线程卡住；协程暂停通常让线程回到事件循环或调度器，去处理别的任务。具体行为由库实现决定，语言只提供暂停和恢复的协议。
+
+\section{生命周期问题为什么更隐蔽}
+
+普通函数返回后，局部变量销毁，调用栈消失。协程暂停后，局部状态可能还活在协程帧里。于是下面的函数看起来只是接收一个 \code{string_view}，但暂停后风险变大：
+
+\begin{lstlisting}[language=C++,caption={跨暂停点保存视图}]
+Task<void> log_later(std::string_view message)
+{
+    co_await delay();
+    write_log(message);
+}
+\end{lstlisting}
+
+如果调用者传入临时字符串，暂停期间临时对象早就销毁。更稳的接口是拥有数据：
+
+\begin{lstlisting}[language=C++,caption={协程跨暂停点拥有字符串}]
+Task<void> log_later(std::string message)
+{
+    co_await delay();
+    write_log(message);
+}
+\end{lstlisting}
+
+这不是说协程里不能用视图，而是要看视图是否跨越暂停点。跨暂停点的数据，生命周期要求要按异步任务处理。
+
+\section{协程库边界}
+
+C++20 只给语言机制，不给完整任务类型。教材里的 \code{Task<T>} 是伪类型，真实项目需要库来定义：
+
+\begin{itemize}
+  \item 协程如何启动。
+  \item 暂停后由谁保存句柄。
+  \item I/O 完成后由谁恢复协程。
+  \item 异常如何存储和传播。
+  \item 取消如何通知等待中的操作。
+\end{itemize}
+
+所以学习协程时要分清两层：语言层的 \code{co_await}、\code{co_return}、协程帧；库层的 \code{Task}、调度器、事件循环和 I/O awaiter。没有库层，语言层不能单独完成服务器。
+
+\section{把回调错误处理改成协程错误边界}
+
+回调版本里，错误处理容易散落：
+
+\begin{lstlisting}[language=C++,caption={回调错误散落}]
+read_request(socket,
+    [socket](Request request) {
+        query_database(request.user_id,
+            [socket](User user) {
+                write_response(socket, make_response(user));
+            },
+            [](Error error) {
+                log_error(error);
+            });
+    },
+    [](Error error) {
+        log_error(error);
+    });
+\end{lstlisting}
+
+协程版本可以把一个请求的错误边界集中起来：
+
+\begin{lstlisting}[language=C++,caption={协程请求边界}]
+Task<void> serve_one(Socket socket)
+{
+    try {
+        Request request = co_await read_request(socket);
+        User user = co_await query_database(request.user_id);
+        co_await write_response(socket, make_response(user));
+    } catch (const RequestError& error) {
+        log_request_error(error);
+    }
+}
+\end{lstlisting}
+
+这就是协程的实际价值：不是自动更快，而是把异步流程恢复成接近顺序代码的形状，让错误、取消和资源释放更容易放在同一个边界里。

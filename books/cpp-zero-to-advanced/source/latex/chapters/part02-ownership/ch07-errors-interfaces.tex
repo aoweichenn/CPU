@@ -192,3 +192,118 @@ public:
 \begin{exercisebox}
 把 \code{read_port_config} 拆成两个函数：一个从 \code{std::string_view} 解析端口文本，一个负责读文件。要求文本解析函数不做任何 I/O，并覆盖空字符串、字母、\code{0}、\code{65536}、合法端口五个测试。
 \end{exercisebox}
+
+\section{Result 背后的状态机}
+
+错误接口也可以用普通代码形状理解。一个“值或错误”的结果，本质是两个状态：
+
+\begin{lstlisting}[caption={Result 状态}]
+Success(PortConfig)
+Failure(ConfigError)
+\end{lstlisting}
+
+如果用两个 \code{optional} 字段表达，状态空间会变成四种：
+
+\begin{longtable}{p{0.25\linewidth}p{0.25\linewidth}p{0.35\linewidth}}
+\toprule
+有 config & 有 error & 含义 \\
+\midrule
+否 & 否 & 无意义状态 \\
+是 & 否 & 成功 \\
+否 & 是 & 失败 \\
+是 & 是 & 矛盾状态 \\
+\bottomrule
+\end{longtable}
+
+所以工程里更严谨的写法是让类型只能处在成功或失败之一：
+
+\begin{lstlisting}[language=C++,caption={variant 实现二选一 Result}]
+template <typename T, typename E>
+class Result {
+public:
+    static Result success(T value)
+    {
+        return Result{std::variant<T, E>{std::move(value)}};
+    }
+
+    static Result failure(E error)
+    {
+        return Result{std::variant<T, E>{std::move(error)}};
+    }
+
+    [[nodiscard]] bool has_value() const noexcept
+    {
+        return std::holds_alternative<T>(this->state_);
+    }
+
+private:
+    explicit Result(std::variant<T, E> state)
+        : state_{std::move(state)}
+    {
+    }
+
+    std::variant<T, E> state_;
+};
+\end{lstlisting}
+
+这段代码比两个 \code{optional} 麻烦，但它消除了无意义状态。教学早期可以用简单结构降低门槛；一旦接口要长期维护，就应该让类型替你挡住矛盾状态。
+
+\section{从异常到错误码的边界}
+
+异常和显式错误不是敌人。一个常见分层是：
+
+\begin{itemize}
+  \item 解析一段用户文本：返回结构化错误，调用者要展示具体原因。
+  \item 打开一个必须存在的内部资源：失败时抛异常，当前层无法恢复。
+  \item 程序入口：捕获异常，转换成日志和退出码。
+\end{itemize}
+
+也就是说，选择错误机制前先问“谁能处理”。如果当前调用者能根据错误类型做分支，返回 \code{Result} 清楚；如果只能向上层传播，异常更直接；如果错误只是“查不到”，\code{optional} 足够。
+
+\section{parse\_port\_text 的完整推导}
+
+把端口解析从文件读取里拆出来：
+
+\begin{lstlisting}[language=C++,caption={只解析文本的端口函数}]
+Result<PortConfig, ConfigError> parse_port_text(std::string_view text)
+{
+    text = trim(text);
+    if (text.empty()) {
+        return Result<PortConfig, ConfigError>::failure(ConfigError::empty_file);
+    }
+
+    const std::optional<int> parsed = parse_int_fast(text);
+    if (!parsed.has_value()) {
+        return Result<PortConfig, ConfigError>::failure(ConfigError::invalid_number);
+    }
+    if (*parsed < PORT_MIN || *parsed > PORT_MAX) {
+        return Result<PortConfig, ConfigError>::failure(ConfigError::out_of_range);
+    }
+    return Result<PortConfig, ConfigError>::success(PortConfig{.port = *parsed});
+}
+\end{lstlisting}
+
+这个函数不打开文件、不打印错误、不启动服务。它只把一段文本变成端口配置或错误。因此测试可以完全不碰文件系统：
+
+\begin{lstlisting}[language=C++,caption={端口文本测试样本}]
+assert(!parse_port_text("").has_value());
+assert(!parse_port_text("abc").has_value());
+assert(!parse_port_text("0").has_value());
+assert(!parse_port_text("65536").has_value());
+assert(parse_port_text("8080").has_value());
+\end{lstlisting}
+
+这就是错误处理和接口设计的关系：接口越小，错误越具体，测试越便宜。
+
+\section{错误上下文不要丢}
+
+如果文件层调用 \code{parse_port_text}，错误还应补充路径：
+
+\begin{lstlisting}[language=C++,caption={文件层补充上下文}]
+struct PortFileError {
+    ConfigError kind = ConfigError::invalid_number;
+    std::filesystem::path path;
+};
+\end{lstlisting}
+
+底层解析不知道路径，文件层知道路径。不要让底层为了错误消息去依赖文件系统；也不要在文件层把解析错误简化成 \code{false}。每层补充自己知道的上下文，错误信息才完整。

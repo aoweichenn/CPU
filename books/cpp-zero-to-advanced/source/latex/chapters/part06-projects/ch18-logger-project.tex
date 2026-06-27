@@ -36,6 +36,45 @@ struct LogMessage {
 
 不要把日志级别保存成裸字符串。枚举让内部逻辑更稳定，输出时再转换成文本。
 
+\section{从同步日志推到异步日志}
+
+先写最直接的同步版本：
+
+\begin{lstlisting}[language=C++,caption={同步日志器}]
+class SyncLogger {
+public:
+    explicit SyncLogger(std::filesystem::path path)
+        : output_{path}
+    {
+        if (!this->output_) {
+            throw std::runtime_error{"cannot open log file"};
+        }
+    }
+
+    void info(std::string_view message)
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        this->output_ << "INFO " << message << '\n';
+    }
+
+private:
+    std::ofstream output_;
+    std::mutex mutex_;
+};
+\end{lstlisting}
+
+这个版本容易验证：调用 \code{info} 时，当前线程直接写文件。缺点也明显：文件 I/O 慢时，业务线程会卡在 \code{info} 里。异步日志器不是为了让代码更花，而是把慢 I/O 从调用线程移到后台线程。
+
+从同步到异步，本质上多了三件事：
+
+\begin{enumerate}
+  \item 调用线程只构造消息并放入队列。
+  \item 后台线程从队列取消息并写文件。
+  \item 关闭时要让后台线程写完剩余消息再退出。
+\end{enumerate}
+
+所以异步日志器首先是一个队列协议项目，其次才是格式化项目。
+
 \section{队列和关闭协议}
 
 日志器内部和任务队列类似：
@@ -64,6 +103,30 @@ private:
 
 成员顺序要注意：\code{worker_} 最后声明，析构时最先析构并 join。但析构函数会先设置关闭状态并通知线程，让后台线程自然退出。
 
+\section{关闭协议的状态推导}
+
+关闭不是简单把 \code{closed_} 设成 \code{true}。要先定义规则：
+
+\begin{itemize}
+  \item 关闭前已经进入队列的消息必须写完。
+  \item 关闭后新的 \code{info} 和 \code{error} 不再进入队列。
+  \item 后台线程在队列为空且已关闭时退出。
+  \item 析构函数不能抛异常。
+\end{itemize}
+
+由这四条规则推出后台线程的退出条件：
+
+\begin{lstlisting}[language=C++,caption={退出条件由关闭规则推出}]
+this->ready_.wait(lock, [this] {
+    return this->closed_ || !this->messages_.empty();
+});
+if (this->messages_.empty() && this->closed_) {
+    return;
+}
+\end{lstlisting}
+
+如果只写 \code{if (this->closed_) return;}，会丢掉关闭前已经排队的消息。正确判断是“队列空并且关闭”才退出。这个边界是异步日志器最容易写错的地方。
+
 \section{构造和析构}
 
 \begin{lstlisting}[language=C++,caption={构造和析构日志器}]
@@ -86,6 +149,34 @@ AsyncLogger::~AsyncLogger()
 \end{lstlisting}
 
 这里有一个细节：构造函数先初始化 \code{output_}，再启动 \code{worker_}。成员按声明顺序初始化，而不是按初始化列表顺序。构造期间启动线程要非常小心，确保线程访问的成员已经构造完成。
+
+\section{构造函数里启动线程的风险}
+
+更稳的构造方式是先打开文件，确认成功后再启动线程。因为 \code{std::jthread} 一旦构造，后台函数就可能立刻运行：
+
+\begin{lstlisting}[language=C++,caption={显式 start 降低构造风险}]
+class AsyncLogger {
+public:
+    explicit AsyncLogger(std::filesystem::path path)
+        : output_{path}
+    {
+        if (!this->output_) {
+            throw std::runtime_error{"cannot open log file"};
+        }
+        this->worker_ = std::jthread{[this] { this->run(); }};
+    }
+
+private:
+    std::ofstream output_;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::queue<LogMessage> messages_;
+    bool closed_ = false;
+    std::jthread worker_;
+};
+\end{lstlisting}
+
+这种写法要求 \code{worker_} 可以默认构造，然后在构造函数体里赋值启动。好处是失败路径更清楚：文件打不开时对象构造失败，后台线程根本没有启动。教学项目可以先用这种形态，降低半构造对象被线程访问的风险。
 
 \section{提交日志}
 
@@ -119,6 +210,47 @@ void AsyncLogger::push(LogLevel level, std::string message)
 
 关闭后提交日志，本项目选择静默忽略。也可以选择抛异常或返回 \code{bool}，但规则必须写进接口文档。析构期间再抛异常通常不是好主意。
 
+\section{有界队列和丢弃计数}
+
+无限队列把压力藏进内存。教学版可以增加容量，并定义简单策略：队列满时丢弃 \code{info}，尽量保留 \code{error}。为避免静默丢失，还要统计丢弃数量：
+
+\begin{lstlisting}[language=C++,caption={带容量和丢弃计数的状态}]
+class AsyncLogger {
+private:
+    static constexpr std::size_t LOGGER_MAX_QUEUE_SIZE = 8192;
+
+    std::queue<LogMessage> messages_;
+    std::uint64_t dropped_info_count_ = 0;
+};
+\end{lstlisting}
+
+\code{push} 的策略可以写成明确分支：
+
+\begin{lstlisting}[language=C++,caption={队列满时丢弃 info}]
+void AsyncLogger::push(LogLevel level, std::string message)
+{
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        if (this->closed_) {
+            return;
+        }
+        if (this->messages_.size() >= LOGGER_MAX_QUEUE_SIZE &&
+            level == LogLevel::info) {
+            ++this->dropped_info_count_;
+            return;
+        }
+        this->messages_.push(LogMessage{
+            .level = level,
+            .time = std::chrono::system_clock::now(),
+            .text = std::move(message),
+        });
+    }
+    this->ready_.notify_one();
+}
+\end{lstlisting}
+
+这段代码还没有解决“队列满但来了 \code{error}”时怎么办。可以选择阻塞、同步写入、或者丢掉最旧的 \code{info} 给 \code{error} 腾位置。教材里故意把这个问题暴露出来：背压策略必须按业务定义，不能靠容器自动决定。
+
 \section{后台写入}
 
 \begin{lstlisting}[language=C++,caption={后台写日志}]
@@ -143,6 +275,56 @@ void AsyncLogger::run()
 \end{lstlisting}
 
 取出消息后立刻释放锁，再写文件。文件 I/O 可能慢，如果持锁写文件，提交日志的线程也会被阻塞。锁只保护队列，不保护所有操作。
+
+\section{flush 的完整实现思路}
+
+为了让测试和调用者知道“当前已经提交的日志写完了”，可以把队列项从单一 \code{LogMessage} 扩展成命令：
+
+\begin{lstlisting}[language=C++,caption={日志队列命令}]
+struct FlushCommand {
+    std::shared_ptr<std::promise<void>> done;
+};
+
+using LoggerCommand = std::variant<LogMessage, FlushCommand>;
+\end{lstlisting}
+
+队列从 \code{std::queue<LogMessage>} 改成 \code{std::queue<LoggerCommand>}。提交 \code{flush}：
+
+\begin{lstlisting}[language=C++,caption={提交 flush 命令}]
+void AsyncLogger::flush()
+{
+    auto done = std::make_shared<std::promise<void>>();
+    std::future<void> future = done->get_future();
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        if (this->closed_) {
+            return;
+        }
+        this->messages_.push(FlushCommand{.done = done});
+    }
+    this->ready_.notify_one();
+    future.get();
+}
+\end{lstlisting}
+
+后台线程处理命令：
+
+\begin{lstlisting}[language=C++,caption={后台处理 flush 命令}]
+void AsyncLogger::handle_command(LoggerCommand command)
+{
+    std::visit([this](auto& item) {
+        using Item = std::decay_t<decltype(item)>;
+        if constexpr (std::is_same_v<Item, LogMessage>) {
+            this->write_message(item);
+        } else {
+            this->output_.flush();
+            item.done->set_value();
+        }
+    }, command);
+}
+\end{lstlisting}
+
+这里的顺序很关键：\code{flush} 命令在队列中的位置保证它前面的日志消息已经被处理；\code{output_.flush()} 保证文件缓冲被刷新；\code{promise} 保证调用线程有明确等待点。测试就可以调用 \code{flush()}，再读取文件断言内容，而不是睡一段时间碰运气。
 
 \section{格式化输出}
 
@@ -191,6 +373,21 @@ constexpr std::size_t LOGGER_MAX_QUEUE_SIZE = 8192;
 \end{itemize}
 
 日志系统没有完美策略，只有适合业务的取舍。教学版可以先选“队列满时丢弃 info，保留 error”，并统计丢弃数量。
+
+\section{最终验收标准}
+
+这个项目完成后，不应该只看“能打印几行日志”。要按协议验收：
+
+\begin{enumerate}
+  \item 构造失败时不启动后台线程。
+  \item 多线程提交后，调用 \code{flush()} 能稳定看到已提交日志。
+  \item 析构时队列中已有消息被写完。
+  \item 关闭后提交不会抛出异常，也不会写入新消息。
+  \item 队列满时的行为和文档一致，丢弃计数可观察。
+  \item 后台写文件时不持有队列锁。
+\end{enumerate}
+
+这些标准都是从异步对象的状态机推出来的。项目代码再小，只要跨线程、跨生命周期，就要用协议而不是运气来设计。
 
 \section{测试计划}
 

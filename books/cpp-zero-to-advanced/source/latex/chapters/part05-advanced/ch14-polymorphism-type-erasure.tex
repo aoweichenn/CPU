@@ -78,6 +78,61 @@ private:
 
 虚函数的价值是运行期替换实现。测试和生产可以传不同对象，业务代码不用重新编译成模板实例。
 
+\section{虚函数背后的函数表模型}
+
+虚函数不要只理解成“加一个 \code{virtual}”。它背后可以近似想成：每个多态对象能找到一张函数表，调用虚函数时先查表，再调用对应实现。标准不规定具体实现必须长这样，但主流实现很接近这个模型。
+
+先看业务调用：
+
+\begin{lstlisting}[language=C++,caption={通过接口调用虚函数}]
+std::optional<UserRecord> user = repository.find_by_id(id);
+\end{lstlisting}
+
+可以近似展开成：
+
+\begin{lstlisting}[language=C++,caption={虚调用的近似展开}]
+struct UserRepositoryVTable {
+    std::optional<UserRecord> (*find_by_id)(const void* self, int id);
+};
+
+struct UserRepositoryObjectShape {
+    const UserRepositoryVTable* vtable = nullptr;
+    void* object = nullptr;
+};
+
+std::optional<UserRecord> call_find_by_id(
+    const UserRepositoryObjectShape& repository,
+    int id)
+{
+    return repository.vtable->find_by_id(repository.object, id);
+}
+\end{lstlisting}
+
+派生类会提供自己的表项：
+
+\begin{lstlisting}[language=C++,caption={派生实现进入函数表}]
+std::optional<UserRecord> find_in_memory(const void* self, int id)
+{
+    const auto* repository =
+        static_cast<const InMemoryUserRepository*>(self);
+    return repository->find_by_id(id);
+}
+
+const UserRepositoryVTable IN_MEMORY_REPOSITORY_TABLE{
+    .find_by_id = find_in_memory,
+};
+\end{lstlisting}
+
+真实对象通常不是显式保存 \code{object} 指针，而是对象本体里带一个隐藏的 \code{vptr} 指向 \code{vtable}。这个模型解释了三个现象：
+
+\begin{itemize}
+  \item 虚调用通常不能像普通非虚函数那样直接内联，因为运行期才知道表项。
+  \item 多态基类需要虚析构，因为删除时也要通过表找到正确的派生析构逻辑。
+  \item 不同派生类可以放进同一个接口引用或指针里，因为调用点只依赖表形状。
+\end{itemize}
+
+这也说明继承的核心不是“共享字段”，而是“共享一组可被运行期分发的操作”。
+
 \section{继承不是为了复用字段}
 
 很多继承层次出问题，是因为把继承当成“共享成员变量”的工具。比如 \code{Cat} 和 \code{Dog} 都有名字，就让它们继承 \code{AnimalBase}。如果没有真正的多态行为，这种继承往往只会增加耦合。
@@ -160,6 +215,60 @@ private:
 
 这种方式适合只有一两个操作的小接口。操作很多、需要共享状态和清晰生命周期时，抽象基类可能更合适。类型擦除不是继承的替代宗教，而是另一个工具。
 
+\section{std::function 背后的类型擦除}
+
+\code{std::function} 能保存普通函数、lambda、函数对象，是因为它把“具体类型”藏起来，只保留“如何调用、如何复制、如何销毁”这组操作。可以用一个简化版模型理解：
+
+\begin{lstlisting}[language=C++,caption={类型擦除的近似形状}]
+class AnyFindUser {
+public:
+    template <typename Callable>
+    explicit AnyFindUser(Callable callable)
+        : object_{new Callable{std::move(callable)}},
+          table_{&table_for<Callable>()}
+    {
+    }
+
+    ~AnyFindUser()
+    {
+        this->table_->destroy(this->object_);
+    }
+
+    [[nodiscard]] std::optional<UserRecord> operator()(int id) const
+    {
+        return this->table_->call(this->object_, id);
+    }
+
+private:
+    struct Table {
+        std::optional<UserRecord> (*call)(const void* object, int id);
+        void (*destroy)(void* object);
+    };
+
+    template <typename Callable>
+    static const Table& table_for()
+    {
+        static const Table table{
+            .call = [](const void* object, int id) {
+                const auto* callable = static_cast<const Callable*>(object);
+                return (*callable)(id);
+            },
+            .destroy = [](void* object) {
+                delete static_cast<Callable*>(object);
+            },
+        };
+        return table;
+    }
+
+    void* object_ = nullptr;
+    const Table* table_ = nullptr;
+};
+\end{lstlisting}
+
+真实 \code{std::function} 还要处理复制、移动、小对象优化、空状态和异常安全，但骨架就是这两部分：一块不知道真实类型的对象存储，一张知道怎么操作它的表。
+
+这个模型能推导出选择边界：如果调用发生在热循环里，而且 callable 类型编译期已知，模板参数常常更便宜；如果需要把不同 callable 放进同一个容器、跨模块保存、运行期替换，那么类型擦除的成本换来了接口稳定。
+
 \section{variant：封闭集合的多态}
 
 如果可能类型是封闭的，比如输入可以是文件、标准输入或内存字符串，可以用 \code{std::variant}：
@@ -191,6 +300,44 @@ std::string load_input(const InputSource& source)
 \end{lstlisting}
 
 新增一种输入类型时，编译器会帮助你找到需要处理的地方。虚函数适合开放集合，\code{variant} 适合封闭集合。先判断变化方向，再选机制。
+
+\section{variant 背后是标签加存储}
+
+\code{std::variant<FileInput, StdinInput, MemoryInput>} 可以近似理解成两部分：一个标签记录当前是哪种类型，一块足够大的存储放当前对象：
+
+\begin{lstlisting}[language=C++,caption={variant 的近似状态}]
+enum class InputTag {
+    file,
+    stdin_input,
+    memory,
+};
+
+class InputSourceShape {
+public:
+    InputTag tag = InputTag::stdin_input;
+    // storage must be large and aligned enough for every alternative
+    std::aligned_storage_t<64, 8> storage;
+};
+\end{lstlisting}
+
+\code{std::visit} 的近似逻辑就是根据标签分发：
+
+\begin{lstlisting}[language=C++,caption={visit 的近似分发}]
+std::string load_input_shape(const InputSourceShape& source)
+{
+    switch (source.tag) {
+    case InputTag::file:
+        return load_from(read_as<FileInput>(source.storage));
+    case InputTag::stdin_input:
+        return load_from(read_as<StdinInput>(source.storage));
+    case InputTag::memory:
+        return load_from(read_as<MemoryInput>(source.storage));
+    }
+    std::terminate();
+}
+\end{lstlisting}
+
+这个展开模型解释了 \code{variant} 和虚函数的根本差异。虚函数把“新增类型”变容易：新增派生类，旧调用点不动；\code{variant} 把“穷尽处理”变明确：所有类型写在一个类型列表里，访问点必须考虑每种情况。如果输入来源由你自己的程序封闭控制，\code{variant} 很合适；如果插件或外部模块未来会不断新增实现，虚函数接口通常更合适。
 
 \section{多态选择表}
 

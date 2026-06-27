@@ -214,3 +214,211 @@ rules.push_back([allowed_domain](const Registration& item) {
 \begin{exercisebox}
 给验证流水线增加错误消息，不要只返回 \code{bool}。设计 \code{RuleResult}，让每条规则失败时返回原因。要求规则仍然可组合，验证函数返回第一条错误或全部错误列表。
 \end{exercisebox}
+
+\section{lambda 背后的普通代码形状}
+
+只会写 lambda 还不够。要真正理解它，必须知道编译器大致会把它变成什么。先看一个不捕获任何变量的 lambda：
+
+\begin{lstlisting}[language=C++,caption={不捕获变量的 lambda}]
+auto by_id = [](const User& lhs, const User& rhs) {
+    return lhs.id < rhs.id;
+};
+\end{lstlisting}
+
+可以把它理解成一个匿名类对象，里面有一个调用运算符：
+
+\begin{lstlisting}[language=C++,caption={近似展开成函数对象}]
+class ByIdComparator {
+public:
+    [[nodiscard]] bool operator()(const User& lhs,
+                                  const User& rhs) const
+    {
+        return lhs.id < rhs.id;
+    }
+};
+
+ByIdComparator by_id;
+\end{lstlisting}
+
+\code{std::ranges::sort(users, by_id)} 并不关心 \code{by_id} 是普通函数、lambda 还是手写函数对象；它只关心这个对象能不能被调用，并返回排序所需的布尔结果。这就是“可调用对象”的统一模型。
+
+\section{按值捕获就是成员变量副本}
+
+再看按值捕获：
+
+\begin{lstlisting}[language=C++,caption={按值捕获阈值}]
+int threshold = 60;
+auto passed = [threshold](const Student& student) {
+    return student.score >= threshold;
+};
+\end{lstlisting}
+
+近似展开：
+
+\begin{lstlisting}[language=C++,caption={按值捕获展开为成员副本}]
+class PassedByValue {
+public:
+    explicit PassedByValue(int threshold)
+        : threshold_{threshold}
+    {
+    }
+
+    [[nodiscard]] bool operator()(const Student& student) const
+    {
+        return student.score >= this->threshold_;
+    }
+
+private:
+    int threshold_ = 0;
+};
+
+PassedByValue passed{threshold};
+\end{lstlisting}
+
+这解释了为什么外部 \code{threshold} 后续改变，不影响已经创建好的 \code{passed}。lambda 对象里保存的是一份成员副本，不是名字本身。
+
+\section{按引用捕获就是成员引用}
+
+按引用捕获：
+
+\begin{lstlisting}[language=C++,caption={按引用捕获阈值}]
+int threshold = 60;
+auto passed = [&threshold](const Student& student) {
+    return student.score >= threshold;
+};
+\end{lstlisting}
+
+近似展开：
+
+\begin{lstlisting}[language=C++,caption={按引用捕获展开为引用成员}]
+class PassedByReference {
+public:
+    explicit PassedByReference(int& threshold)
+        : threshold_{threshold}
+    {
+    }
+
+    [[nodiscard]] bool operator()(const Student& student) const
+    {
+        return student.score >= this->threshold_;
+    }
+
+private:
+    int& threshold_;
+};
+
+PassedByReference passed{threshold};
+\end{lstlisting}
+
+现在风险就清楚了：如果 \code{passed} 活得比 \code{threshold} 更久，它内部的引用成员就悬空。所谓“lambda 生命周期问题”，本质就是普通对象成员引用的生命周期问题。
+
+\section{mutable lambda 是非 const 调用运算符}
+
+默认情况下，lambda 的 \code{operator()} 是 \code{const}，不能修改按值捕获的成员副本。要修改副本，需要 \code{mutable}：
+
+\begin{lstlisting}[language=C++,caption={mutable lambda 修改自己的副本}]
+int count = 0;
+auto next = [count]() mutable {
+    ++count;
+    return count;
+};
+\end{lstlisting}
+
+近似展开：
+
+\begin{lstlisting}[language=C++,caption={mutable 展开成非 const 调用}]
+class Counter {
+public:
+    explicit Counter(int count)
+        : count_{count}
+    {
+    }
+
+    int operator()()
+    {
+        ++this->count_;
+        return this->count_;
+    }
+
+private:
+    int count_ = 0;
+};
+\end{lstlisting}
+
+注意外部 \code{count} 不会变。变的是 lambda 对象自己的 \code{count_} 成员。把这个展开模型记住，就不会把 \code{mutable} 误解成“允许修改外部变量”。
+
+\section{泛型 lambda 背后是模板调用运算符}
+
+C++14 起，lambda 参数可以写 \code{auto}：
+
+\begin{lstlisting}[language=C++,caption={泛型 lambda}]
+auto less_by_size = [](const auto& lhs, const auto& rhs) {
+    return lhs.size() < rhs.size();
+};
+\end{lstlisting}
+
+近似展开：
+
+\begin{lstlisting}[language=C++,caption={泛型 lambda 展开成模板调用运算符}]
+class LessBySize {
+public:
+    template <typename Lhs, typename Rhs>
+    [[nodiscard]] bool operator()(const Lhs& lhs,
+                                  const Rhs& rhs) const
+    {
+        return lhs.size() < rhs.size();
+    }
+};
+\end{lstlisting}
+
+这也解释了泛型 lambda 的报错：如果传入的类型没有 \code{size()}，错误会出现在模板实例化时。它不是神秘特性，只是编译器生成了一个带模板 \code{operator()} 的类。
+
+\section{捕获 this 的真实含义}
+
+成员函数里常写：
+
+\begin{lstlisting}[language=C++,caption={捕获 this}]
+this->button_.on_click([this] {
+    this->save();
+});
+\end{lstlisting}
+
+近似意思是 lambda 对象里保存了当前对象的指针：
+
+\begin{lstlisting}[language=C++,caption={this 捕获近似展开}]
+class SaveCallback {
+public:
+    explicit SaveCallback(Editor* self)
+        : self_{self}
+    {
+    }
+
+    void operator()() const
+    {
+        this->self_->save();
+    }
+
+private:
+    Editor* self_ = nullptr;
+};
+\end{lstlisting}
+
+如果回调执行时 \code{Editor} 已经销毁，\code{self_} 就是悬空指针。异步任务、GUI 回调、线程池任务里，捕获 \code{this} 必须非常谨慎。更稳的方式可能是捕获需要的数据副本，或捕获 \code{std::weak_ptr} 并在执行时检查对象是否还存在。
+
+\section{选择 lambda、函数对象还是普通函数}
+
+有了展开模型，选择就不再靠感觉：
+
+\begin{longtable}{p{0.24\linewidth}p{0.30\linewidth}p{0.36\linewidth}}
+\toprule
+形态 & 适合场景 & 关键判断 \\
+\midrule
+普通函数 & 无状态、可复用规则 & 名字能表达稳定概念 \\
+lambda & 局部一次性规则 & 规则贴近使用点更清楚 \\
+函数对象类 & 有状态、要复用或单测 & 状态和行为值得命名 \\
+\code{std::function} & 运行期保存不同 callable & 接受类型擦除成本 \\
+模板 callable & 热路径、类型编译期已知 & 追求内联和零额外抽象成本 \\
+\bottomrule
+\end{longtable}
+
+lambda 不是“更高级的函数”，而是编译器帮你快速生成一个函数对象。知道这一点，捕获、生命周期、性能和错误信息都更容易推导。

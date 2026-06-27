@@ -26,6 +26,39 @@ private:
 
 有界队列必须定义队列满时的行为：阻塞等待、返回失败、丢弃旧任务还是丢弃新任务。不同业务答案不同。
 
+\section{有界队列背后的状态机}
+
+队列满不只是一个 \code{if}，它是一组状态转换。一个有界队列至少有四类状态：
+
+\begin{longtable}{p{0.22\linewidth}p{0.28\linewidth}p{0.40\linewidth}}
+\toprule
+状态 & 条件 & 允许的动作 \\
+\midrule
+空且未关闭 & \code{tasks_.empty()} & 消费者等待，生产者可提交 \\
+非空且未满 & \code{0 < size < capacity} & 生产者和消费者都可继续 \\
+满且未关闭 & \code{size == capacity} & 生产者按策略阻塞、失败或丢弃 \\
+已关闭 & \code{closed_ == true} & 唤醒等待者，拒绝新提交，消费剩余任务 \\
+\bottomrule
+\end{longtable}
+
+写并发代码时，先把状态表列出来，再写条件变量谓词。否则很容易漏掉“关闭时唤醒等待者”这种边界。比如生产者等待“未满”，但关闭也应该让它醒来：
+
+\begin{lstlisting}[language=C++,caption={等待条件包含关闭状态}]
+this->not_full_.wait(lock, [this] {
+    return this->closed_ || this->tasks_.size() < this->capacity_;
+});
+\end{lstlisting}
+
+消费者等待“非空”，但关闭也应该让它醒来：
+
+\begin{lstlisting}[language=C++,caption={消费者等待条件也包含关闭状态}]
+this->not_empty_.wait(lock, [this] {
+    return this->closed_ || !this->tasks_.empty();
+});
+\end{lstlisting}
+
+这两个谓词不是模板，而是由状态表推出来的结果：任何可能让等待者继续判断下一步的状态变化，都必须通知等待者。
+
 \section{阻塞提交}
 
 阻塞提交会等待队列有空间：
@@ -112,6 +145,36 @@ std::future<void> submit(TaskQueue& queue, std::function<void()> task)
 \end{lstlisting}
 
 调用者执行 \code{future.get()} 时，如果任务失败，会重新抛出异常。这个边界比在工作线程里打印错误更可组合。
+
+\section{flush 也是一种消息协议}
+
+异步系统里，“等前面的任务都处理完”不能靠睡眠。睡眠只是猜测后台线程可能处理完了。更可靠的做法是把 \code{flush} 变成队列里的一个特殊消息：当工作线程处理到这条消息时，说明它之前的消息都已经处理过。
+
+\begin{lstlisting}[language=C++,caption={flush 消息的队列协议}]
+struct FlushRequest {
+    std::promise<void> done;
+};
+
+using QueueItem = std::variant<Task, FlushRequest>;
+\end{lstlisting}
+
+提交 \code{flush}：
+
+\begin{lstlisting}[language=C++,caption={提交 flush 并等待完成}]
+void flush(BoundedQueue& queue)
+{
+    auto request = std::make_shared<std::promise<void>>();
+    std::future<void> done = request->get_future();
+
+    queue.push([request] {
+        request->set_value();
+    });
+
+    done.get();
+}
+\end{lstlisting}
+
+这个简化版本把 \code{flush} 做成一个任务。只要队列保持 FIFO，\code{flush} 任务执行时，它前面的任务已经执行完。真实日志器里还要在设置 \code{promise} 前刷新文件缓冲。这里的关键推导是：异步等待点要通过明确的同步对象建立因果关系，而不是靠时间估计。
 
 \section{异步接口要说明生命周期}
 
