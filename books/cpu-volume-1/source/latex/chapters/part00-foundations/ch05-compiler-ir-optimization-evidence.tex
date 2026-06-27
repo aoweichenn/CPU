@@ -19,6 +19,23 @@ C++ source
 
 只要这条链路清楚，读者就能解释三个常见问题：为什么某段代码在 \code{-O0} 和 \code{-O2} 下行为不同；为什么 benchmark 循环消失；为什么看起来“只是改了类型转换”却导致向量化或别名结果变化。
 
+先把本章几个名词压成一个小例子。假设源码是：
+
+\begin{lstlisting}[language=C++,caption={贯穿优化器章节的最小分支}]
+extern "C" int choose(int x, int y, bool use_x)
+{
+    int r = 0;
+    if (use_x) {
+        r = x + 1;
+    } else {
+        r = y + 1;
+    }
+    return r;
+}
+\end{lstlisting}
+
+AST 适合回答“这个 \code{if} 的 then/else 结构和表达式类型是什么”；IR 适合回答“控制流被拆成哪些基本块，值从哪里流到哪里”；SSA 适合回答“每个虚拟值在哪里被定义，合流处怎样选择值”；pass 适合回答“哪些值能传播、哪些分支能折叠、哪些内存访问能删除”；汇编适合回答“最后目标机器执行哪些指令”。这些名字不是并列术语清单，而是一条从源码语义到机器证据的推理路径。
+
 \section{从源码到 AST：语言语义先于优化}
 
 编译器前端的第一项工作是把文本变成有语义的树。语法树不是性能优化结果，而是语言规则的载体。名字查找、重载解析、模板实例化、常量表达式、对象生命周期、访问控制和异常规范，都在这一层确定。优化器后面能做什么，取决于前端已经证明了什么。
@@ -38,7 +55,28 @@ int sum_positive(const int* xs, int n)
 }
 \end{lstlisting}
 
-前端至少要确定这些事实：\code{xs} 是指向 \code{const int} 的指针；\code{n} 是有符号整数；\code{i < n} 是有符号比较；\code{xs[i]} 是指针加偏移后的对象访问；\code{s += xs[i]} 可能发生有符号溢出，而有符号溢出在标准 C++ 中是未定义行为。最后这一点很关键。优化器不是“假装机器整数会回绕”，而是可以利用“正确程序不会发生 signed overflow”这个前提做改写。
+先不要急着问它会不会向量化。前端首先要把源码里的词和结构变成语言事实：
+
+\begin{enumerate}
+  \item \code{xs} 的类型是 \code{const int*}，所以 \code{xs[i]} 是一次按 \code{sizeof(int)} 缩放的对象访问。
+  \item \code{n} 和 \code{i} 都是 \code{int}，所以 \code{i < n} 是有符号比较，不是无符号比较。
+  \item \code{xs[i] > 0} 需要先读取 \code{xs[i]}，再按有符号整数解释这个值。
+  \item \code{s += xs[i]} 可能发生有符号溢出，而有符号溢出在标准 C++ 中是未定义行为。
+  \item \code{xs} 是否为空、\code{n} 是否为负、数组是否足够长，不是这段函数签名自动保证的事实。
+\end{enumerate}
+
+最后两点尤其关键。优化器不是“假装机器整数会回绕”，而是可以利用“正确程序不会发生 signed overflow”这个前提做改写。它也不能凭空知道 \code{xs} 指向多少个元素；如果调用者传入非法范围，源码层已经越过语言边界。高质量优化报告必须先写清这些语义前提，否则后面的 IR 和汇编分析没有根。
+
+一个最小 AST 观察可以这样做：
+
+\begin{lstlisting}[language=bash,caption={保存 sum\_positive 的 AST 证据}]
+clang++ -std=c++20 -O2 -Xclang -ast-dump -fsyntax-only sum.cpp \
+  > reports/sum.ast.txt
+rg -n "FunctionDecl|ParmVarDecl|IfStmt|ArraySubscriptExpr|BinaryOperator" \
+  reports/sum.ast.txt
+\end{lstlisting}
+
+这份证据能支持的结论是：“前端把 \code{xs[i]} 理解为数组下标表达式，把 \code{i < n} 理解为有符号比较，并把 \code{s += xs[i]} 放在 then 分支里。”它不能支持“循环一定存在于最终机器码里”，也不能支持“这个循环一定慢”。那些要继续看 IR、汇编和测量。
 
 因此，AST dump 的价值不只是看树形结构，而是确认编译器理解的类型和语义是否与你一致。高质量报告应保存：
 
@@ -59,6 +97,8 @@ frontend:
 \section{IR 是优化器的工作面}
 
 IR 可以粗略理解为“优化器容易分析和改写的程序表示”。真实编译器的 IR 有很多种：Clang/LLVM 常用 LLVM IR，GCC 有 GIMPLE 和 RTL，后端还会有机器 IR。不同 IR 的语法不同，但工程问题相同：它们把源码里的表达式拆成更显式的 load、store、branch、call、phi、metadata 和控制流。
+
+仍然用 \code{choose} 来建立从源码到 IR 的直觉。源码里只有一个 \code{if} 和一个局部变量 \code{r}；IR 更关心的是控制流怎样分叉、每条路径产生哪个值、合流后返回哪个值。因此它会把程序拆成几个 \term{基本块}{basic block}。基本块是一段中间没有跳入跳出的顺序指令，通常以 \code{br} 或 \code{ret} 结尾。这个概念很重要：优化器分析循环、分支和支配关系时，操作对象不是“源码第几行”，而是基本块和块之间的边。
 
 下面用伪 LLVM IR 表达一个最小分支：
 
@@ -81,7 +121,40 @@ merge:
 }
 \end{lstlisting}
 
-\code{phi} 不是 CPU 指令。它表示“这个值来自哪个前驱基本块”。SSA 形式要求每个虚拟值只定义一次，于是控制流合并处需要 phi 节点。优化器通过 SSA 更容易做常量传播、死代码删除、循环不变外提和公共子表达式消除。读 IR 时要分清：IR 是编译器的证明和改写平面，不是机器最终执行平面。
+\code{entry} 块根据 \code{\%cond} 跳到 \code{then} 或 \code{else}。\code{then} 块定义 \code{\%a}，\code{else} 块定义 \code{\%b}。两个块最后都跳到 \code{merge}。问题来了：\code{merge} 块里返回的值到底是 \code{\%a} 还是 \code{\%b}？源码里用同一个局部变量 \code{r} 表达“不同路径给它赋不同值”，但 SSA 形式要求每个虚拟值只定义一次，不能反复给同一个 \code{r} 赋值。于是 IR 用 \code{phi} 节点表达合流选择：
+
+\begin{lstlisting}[numbers=none]
+%r = phi i32 [ %a, %then ], [ %b, %else ]
+\end{lstlisting}
+
+这行的意思是：如果控制流从 \code{then} 来，\code{\%r} 取 \code{\%a}；如果从 \code{else} 来，\code{\%r} 取 \code{\%b}。\code{phi} 不是 CPU 指令，它不会在最终汇编里原样出现。后端会根据控制流、寄存器分配和目标机器，把它实现成寄存器选择、移动、条件移动或分支路径上的赋值。
+
+SSA 的核心收益是让“值从哪里来”非常明确。常量传播可以沿定义使用链传播；死代码删除可以看某个虚拟值有没有被使用；循环优化可以识别循环中每次迭代变化的归纳变量；公共子表达式消除可以判断两个计算是否真的相同。读 IR 时要分清：IR 是编译器的证明和改写平面，不是机器最终执行平面。
+
+\begin{warningbox}
+不要把 \code{\%a}、\code{\%b}、\code{\%r} 当成真实寄存器。它们是 IR 虚拟值。真实 x86-64 寄存器要等后端寄存器分配后才确定。把 IR 虚拟值和 \register{rax}、\register{rdi} 这类机器寄存器混在一起，会直接读错优化结果。
+\end{warningbox}
+
+\subsection{IR 里最先要认的五类东西}
+
+第一次看 IR，不要试图理解所有属性和 metadata。先找五类东西：
+
+\begin{center}
+\small
+\begin{tabular}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+IR 元素 & 它回答什么 & 不能直接说明什么 \\
+\midrule
+\code{load} & 从哪个指针读值，读出的虚拟值给谁用 & 数据是否命中 cache \\
+\code{store} & 把哪个值写到哪个指针位置 & 写入是否立刻到达内存条 \\
+\code{call} & 调用了哪个函数或间接目标 & 函数一定没有被后续内联 \\
+\code{br} & 控制流怎样分叉或跳回循环 & 分支预测是否成功 \\
+\code{phi} & 合流处的值来自哪个前驱块 & CPU 有一条 phi 指令 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这五类元素足够解释很多初学者困惑：源码变量为什么消失、循环为什么被删、分支为什么折叠、load 为什么被提前、函数调用为什么不见。等这些能读稳，再去看 alias metadata、range metadata、vectorization remark 和 target-specific IR。
 
 \subsection{load/store 比变量名更重要}
 
@@ -101,6 +174,10 @@ after:
 \end{lstlisting}
 
 这解释了为什么调试器会显示 \code{optimized out}。变量不是被“弄丢了”，而是源码变量和机器状态之间不再一一对应。优化构建里的调试信息只能尽力把源层变量映射回寄存器、栈槽或表达式；当值被合并、删除、重排或只存在于某些路径上时，调试器无法凭空恢复它。
+
+从零推导一下 \code{mem2reg}。在未优化 IR 里，前端常把局部变量 \code{s} 做成一个栈槽：先 \code{alloca} 一块空间，再用 \code{store} 写入，用 \code{load} 读出。这种形式容易保留源码变量位置，但对优化器不友好，因为每次读写都像是内存访问。若优化器能证明 \code{s} 从未被取地址、没有别名指针能碰到这个栈槽、生命周期只在当前函数内，它就可以把 \code{s} 从“内存里的槽”提升成“SSA 虚拟值”。提升后，许多 load/store 消失，汇编里也可能没有 \code{s} 的栈地址。
+
+这不是为了让调试困难，而是因为机器执行不需要那个栈槽。性能报告如果看到 \code{-O0} 下有很多栈访问，不能直接说“程序本来就频繁访问内存”；要再看 \code{-O2/-O3}，确认这些访问是不是调试构建为了保留变量形态而产生的。
 
 \section{核心 pass：每个 pass 都在证明一类事实}
 

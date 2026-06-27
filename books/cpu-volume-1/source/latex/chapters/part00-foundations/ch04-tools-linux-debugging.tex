@@ -32,6 +32,34 @@
 
 这些能力看似朴素，却是底层实验的地基。不会使用这些工具，就很难真正学懂汇编；不会保存实验记录，就很难写出可信 benchmark；不会区分构建类型，就容易把调试版本的行为误当成性能事实。
 
+\section{先选问题，再选工具}
+
+工具多时，初学者最容易陷入两种极端：一种是只会复制命令，不知道输出说明什么；另一种是遇到问题就把所有工具都跑一遍，最后被输出淹没。正确顺序应该是：先把问题说窄，再选择能回答这个问题的工具。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.28\linewidth}p{0.28\linewidth}p{0.30\linewidth}}
+\toprule
+你要问的问题 & 先用什么 & 看到结果后怎么继续 \\
+\midrule
+这条命令有没有运行成功 & 退出状态、构建日志、时间戳 & 失败就停止，不运行旧二进制 \\
+实际运行的是哪个文件 & \code{pwd}、\code{readlink /proc/<pid>/exe}、\code{file} & 确认路径和架构，再看内部结构 \\
+函数名还在不在二进制里 & \code{nm -C}、\code{readelf -s} & 若不存在，检查内联、优化删除、符号可见性 \\
+函数生成了哪些指令 & \code{objdump -drwC -Mintel} & 对照源码和构建参数，标出 load/store/call/branch \\
+ELF 如何被加载 & \code{readelf -l -d}、\code{ldd}、\filepath{/proc/<pid>/maps} & 区分文件结构、库依赖和运行时映射 \\
+程序为什么崩溃 & GDB、core dump、sanitizer & 先看信号、\register{rip}、当前指令、地址和调用栈 \\
+程序访问了哪些系统调用 & \code{strace} & 判断文件、网络、\code{mmap}、\code{futex} 等内核边界 \\
+性能数字是否可信 & benchmark 记录、\code{/usr/bin/time}、\code{perf stat} & 先确认正确性和二进制身份，再解释计数器 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+这张表的重点是“先后顺序”。比如程序崩溃时，不要第一步就跑 \code{perf}；先用 GDB 看当前指令和寄存器。怀疑链接库错了时，不要先改 C++ 代码；先用 \code{ldd}、\code{readelf -d} 和 \filepath{/proc/<pid>/maps} 确认实际加载的库。怀疑函数被优化没了时，不要只在源码里找；先看符号和反汇编。
+
+\begin{keyidea}
+工具输出必须变成窄结论。好的结论长这样：“\code{nm -C} 显示 \code{add_i32} 在 \code{app} 中是 \code{T} 符号，说明最终二进制里有独立函数体。”坏的结论长这样：“我跑了 \code{nm}，所以链接没问题。”后者把一个工具输出夸大成了全局判断。
+\end{keyidea}
+
 \section{命令行不是障碍，而是可复现实验接口}
 
 图形化 IDE 可以提高编码效率，但底层实验必须学会命令行。原因很简单：命令行是可复制、可粘贴、可记录、可自动化的实验接口。报告里写“我点了某个按钮”没有复现价值；写出完整命令，别人才能在另一台机器上重复你的实验。
@@ -814,6 +842,31 @@ address:  bytes              instruction
 
 地址告诉你指令位于二进制中的位置；bytes 是 CPU 真正取到的机器码字节；instruction 是反汇编器给人的解释。读汇编时要记住：CPU 执行 bytes，不执行这一行文字。
 
+\subsection{第一眼怎样读一行反汇编}
+
+先不要试图理解整个文件。只拿一行反汇编拆开：
+
+\begin{lstlisting}[numbers=none,caption={一行反汇编的四个部分}]
+1140:  8d 04 37   lea eax, [rdi+rsi]
+\end{lstlisting}
+
+\code{1140} 是地址。它说明这条指令在当前二进制视角里的位置。若二进制是 PIE，运行时真实地址可能还要加上加载基址；若这是目标文件，地址可能只是节内偏移，不是最终运行地址。
+
+\code{8d 04 37} 是机器码字节。CPU 取指时读的是这些字节。反汇编器根据 x86-64 编码规则把这些字节解释成后面的指令。如果你怀疑两个构建是否真的不同，机器码字节是非常硬的证据。
+
+\code{lea} 是助记符，表示这条指令的种类。\code{eax} 是目的操作数，\code{[rdi+rsi]} 是源操作数的地址形式。注意这里 \instruction{lea} 不访问内存，它计算地址表达式的整数结果；而 \instruction{mov eax, dword ptr [rdi+rsi*4]} 才是从内存读取 4 字节。只看方括号还不够，必须结合助记符判断是否真的 load/store。
+
+读反汇编时，第一轮只标四类指令：
+
+\begin{itemize}
+  \item \textbf{数据移动}：\instruction{mov}、\instruction{lea}、\instruction{push}、\instruction{pop}。
+  \item \textbf{算术逻辑}：\instruction{add}、\instruction{sub}、\instruction{imul}、\instruction{and}、\instruction{xor}。
+  \item \textbf{内存访问}：带 \code{ptr [...]} 且语义是 load/store 的指令。
+  \item \textbf{控制流}：\instruction{call}、\instruction{ret}、\instruction{jmp}、\instruction{je}、\instruction{jne} 等。
+\end{itemize}
+
+等这四类能稳定分出来，再讨论流水线、cache、分支预测和性能。否则一上来看到寄存器名和方括号，就会把地址计算、内存访问和控制流混成一团。
+
 \subsection{阅读 objdump 的顺序}
 
 阅读 \code{objdump} 输出时，不建议从文件第一行一直读到最后。更有效的顺序是：
@@ -870,6 +923,53 @@ nm -C app | rg "add|main"
 
 如果优化后某个函数在 \code{nm} 中消失，不一定是错误。它可能被内联、删除、合并或变成局部符号。性能报告不能只说“源码里有这个函数”，必须确认二进制里是否有独立函数体，以及热路径是否真的调用它。
 
+\subsection{\code{T}、\code{U} 和 undefined reference 怎么连起来}
+
+看一个两文件例子。调用方只有声明：
+
+\begin{lstlisting}[language=C++,caption={调用方只知道声明}]
+extern "C" int add_i32(int a, int b);
+
+int call_add()
+{
+    return add_i32(1, 2);
+}
+\end{lstlisting}
+
+定义方提供函数体：
+
+\begin{lstlisting}[language=C++,caption={定义方提供实体}]
+extern "C" int add_i32(int a, int b)
+{
+    return a + b;
+}
+\end{lstlisting}
+
+分别编译后，调用方目标文件里可能看到：
+
+\begin{lstlisting}[numbers=none,caption={调用方目标文件中的未定义符号}]
+                 U add_i32
+0000000000000000 T call_add
+\end{lstlisting}
+
+\code{U add_i32} 的意思是：当前目标文件引用了 \code{add_i32}，但没有定义它，需要链接时从别的目标文件或库里找到。定义方目标文件里可能看到：
+
+\begin{lstlisting}[numbers=none,caption={定义方目标文件中的 text 符号}]
+0000000000000000 T add_i32
+\end{lstlisting}
+
+链接器的任务之一，就是把调用方的 \code{U add_i32} 和定义方的 \code{T add_i32} 配起来。如果链接命令忘了带定义方目标文件，就会出现 undefined reference。这个错误不是“C++ 语法错”，而是“整个程序范围内找不到需要的定义”。
+
+因此，遇到链接错误时，先问三件事：
+
+\begin{enumerate}
+  \item 调用方目标文件是否真的有 \code{U} 符号。
+  \item 定义方目标文件或库里是否有对应 \code{T}、\code{W} 或其他可解析符号。
+  \item 链接命令是否把定义方目标文件或库放进来了。
+\end{enumerate}
+
+这样读 \code{nm}，它就不是一堆字母，而是链接器问题的证据。
+
 \subsection{符号不是函数存在的全部证据}
 
 符号表回答的是“二进制中有哪些名字和地址关系”，但它不是程序行为的完整描述。一个函数可能存在符号，却从来不在热路径被调用；一个函数可能没有独立符号，因为已经被内联到多个调用点；一个模板函数可能实例化出多个版本；一个 weak symbol 可能被别的定义覆盖。
@@ -909,6 +1009,25 @@ readelf -r app
 \end{itemize}
 
 第一册不要求你精通 ELF，但必须知道：可执行文件不是“纯机器码数组”。它是一个结构化文件，包含代码、数据、符号、重定位、调试/展开信息和加载描述。后续学习 ABI、动态链接、C++ 与汇编互操作时，这个认识会反复用到。
+
+\subsection{先分清 \code{-S} 和 \code{-l}}
+
+\code{readelf -S app} 看 section，站在链接器和文件组织视角。你会看到类似 \code{.text}、\code{.rodata}、\code{.data}、\code{.bss}、\code{.symtab}、\code{.rela.plt} 这样的名字。它回答：“这个 ELF 文件内部按什么逻辑分类保存内容？”
+
+\code{readelf -l app} 看 program headers，站在加载器视角。你会看到 \code{LOAD} 项和权限，比如可读可执行、可读可写。它回答：“运行时哪些文件范围会被映射到进程虚拟地址空间，权限是什么？”
+
+同一段代码可能在 \code{-S} 里属于 \code{.text} section，在 \code{-l} 里落入某个 \code{LOAD} segment。section 是给链接器、调试器和分析工具组织文件用的；segment 是给加载器创建进程映射用的。二者不是互相替代关系。
+
+一个实用读法：
+
+\begin{enumerate}
+  \item 想知道有没有 \code{.text}、\code{.rodata}、\code{.data}、\code{.bss}，看 \code{readelf -S}。
+  \item 想知道运行时哪些范围可执行、哪些范围可写，看 \code{readelf -l}。
+  \item 想知道依赖哪些共享库，看 \code{readelf -d} 里的 \code{NEEDED}。
+  \item 想知道目标文件里哪些地址还等链接器修补，看 \code{readelf -r}。
+\end{enumerate}
+
+如果一个崩溃地址落在 \filepath{/proc/<pid>/maps} 的 \code{rw-p} 区间，却被当作指令执行，那么问题是运行时映射和取指权限；这时 \code{readelf -l}、\filepath{/proc/<pid>/maps} 和 GDB 当前 \register{rip} 比 \code{readelf -S} 更接近答案。
 
 \subsection{section 和 segment 的区别}
 
@@ -978,6 +1097,30 @@ quit
 \end{itemize}
 
 源码级调试和指令级调试要区分。源码级 \code{next} 以源代码行为为单位，指令级 \code{stepi} 以机器指令为单位。学习汇编和 ABI 时，必须会用 \code{stepi}。
+
+\subsection{第一次 GDB 会话到底在看什么}
+
+下面这组命令不是要背，而是要知道每一步拿到哪类证据：
+
+\begin{lstlisting}[numbers=none,caption={第一次 GDB 会话的证据流}]
+break main          # 告诉调试器在 main 入口停住
+run                 # 创建并运行被调试进程
+info registers      # 读取当前机器寄存器快照
+x/10i $rip          # 从当前指令地址开始反汇编 10 条指令
+x/32xb $rsp         # 从栈指针地址开始读取 32 个字节
+bt                  # 根据栈和 unwind 信息恢复调用链
+\end{lstlisting}
+
+\code{break main} 依赖符号和调试信息。如果二进制被 strip，或者 \code{main} 被特殊处理，断点设置方式可能不同。\code{run} 不是“继续看文件”，而是真的启动一个进程。\code{info registers} 读到的是停住那一刻的寄存器，不是源码变量。\code{x/10i \$rip} 是从当前 \register{rip} 指向的地址读取内存字节并反汇编。\code{x/32xb \$rsp} 是把栈内存按字节显示出来；它不会自动告诉你哪个字节对应哪个 C++ 变量。\code{bt} 依赖调用约定、栈状态、frame pointer 或 unwind 信息；栈被破坏时，回溯也可能坏。
+
+所以 GDB 初学报告不要只贴一串命令。至少要写清：
+
+\begin{itemize}
+  \item 当前停在哪个函数、哪条指令。
+  \item 关键寄存器为什么和 ABI 预期一致或不一致。
+  \item 当前栈顶附近是什么，是否能看到返回地址。
+  \item 这个观察来自 Debug 构建还是优化构建。
+\end{itemize}
 
 \subsection{断点、观察点和条件断点}
 
@@ -1278,6 +1421,30 @@ perf stat -e cycles,instructions,branches,branch-misses ./app
 
 所以，当前验收不是给出完整性能结论，而是能运行、保存输出并写清限制。没有这个边界，后续 benchmark 很容易把工具输出误当成事实。
 
+\subsection{第一眼怎样读 \code{perf stat}}
+
+\code{perf stat} 输出常见字段包括 \code{cycles}、\code{instructions}、\code{branches}、\code{branch-misses}、\code{page-faults}、\code{seconds time elapsed}。这些词很诱人，但不能直接自动翻译成“根因”。
+
+\begin{center}
+\small
+\begin{tabular}{p{0.20\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+字段 & 能说明什么 & 常见误读 \\
+\midrule
+\code{cycles} & 计数期间 CPU 周期相关事件数量 & 周期多就一定是某条源码慢 \\
+\code{instructions} & retired 指令数量的近似证据 & 指令少就一定更快 \\
+\code{branches} & 分支指令数量 & 分支多就一定慢 \\
+\code{branch-misses} & 分支预测失败相关事件 & 所有波动都来自分支预测 \\
+\code{page-faults} & 缺页处理次数 & 缺页一定是 bug，或一定是主瓶颈 \\
+\code{time elapsed} & 墙钟时间 & 等同于线程实际占用 CPU 的时间 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+例如两个版本 \code{instructions} 变少但时间没变快，可能是内存等待占主导；\code{branch-misses} 上升但总时间没明显变化，可能该分支不在瓶颈路径；\code{page-faults} 高，可能只是首次触碰大量页面，不一定是非法访问。性能报告要把计数器当作证据线索，而不是自动结论。
+
+第一册阶段，\code{perf stat} 的合格用法是：保存完整命令、重复次数、原始输出、运行环境和二进制身份；写出一个窄判断，例如“当前构建下版本 B 的 retired instructions 少于版本 A”，而不是直接写“B 的算法更好”。算法解释还需要源码、反汇编、输入规模和 correctness 共同支撑。
+
 \section{\code{strace}：观察程序和内核的边界}
 
 有些问题不是单靠源码和反汇编能快速看出来的。程序为什么找不到文件？为什么启动时读了很多路径？为什么一直阻塞？为什么动态库加载失败？这类问题常发生在用户程序和操作系统边界，\code{strace} 可以记录系统调用。
@@ -1295,6 +1462,37 @@ strace -e trace=openat,read,write,execve ./app
 \code{strace} 的定位价值在于分层。比如程序运行失败，GDB 看到的可能只是某个库函数返回错误；\code{strace} 能告诉你底层系统调用返回了什么错误码。再比如 benchmark 结果异常慢，\code{strace} 可以帮助确认 timed region 外是否意外发生大量 I/O 或系统调用。
 
 但 \code{strace} 会显著改变程序运行速度，不适合直接做性能测量。它是诊断工具，不是 benchmark 工具。报告中使用 \code{strace} 时，应说明它用于解释行为，不用于给出时间结论。
+
+\subsection{第一眼怎样读一行 \code{strace}}
+
+看一行典型输出：
+
+\begin{lstlisting}[numbers=none,caption={打开文件失败的一行系统调用}]
+openat(AT_FDCWD, "data/input.txt", O_RDONLY) = -1 ENOENT
+\end{lstlisting}
+
+它可以拆成四部分：
+
+\begin{itemize}
+  \item \code{openat}：系统调用名，表示程序请求内核打开路径。
+  \item \code{AT_FDCWD, "data/input.txt", O_RDONLY}：参数，说明相对当前工作目录打开只读文件。
+  \item \code{= -1}：返回值，\code{-1} 通常表示失败。
+  \item \code{ENOENT}：错误码，表示路径中的文件或目录不存在。
+\end{itemize}
+
+这行能支持的窄结论是：“这次运行中，进程确实向内核请求打开 \filepath{data/input.txt}，内核返回不存在。”它不能自动说明“源码里的路径拼接逻辑错了”，因为还要检查当前工作目录、命令行参数、配置文件、符号链接和测试数据是否存在。
+
+再看一行等待相关输出：
+
+\begin{lstlisting}[numbers=none,caption={线程等待相关的 futex 调用}]
+futex(0x7f..., FUTEX_WAIT_PRIVATE, 2, NULL) = 0
+\end{lstlisting}
+
+它说明线程进入了 futex 等待路径，通常和互斥量、条件变量或运行时同步有关。它能提示“这里可能有等待或同步边界”，但不能直接推出“futex 是性能根因”。根因可能是锁粒度太大、生产者太慢、消费者太少、条件变量谓词错误，或者只是程序正常等待输入。
+
+\begin{keyidea}
+\code{strace} 的强项是证明“用户态请求了哪些内核服务，以及内核返回了什么”。它不解释 C++ 对象生命周期，不解释用户态指令成本，也不提供无扰动性能数字。
+\end{keyidea}
 
 \begin{warningbox}
 \code{strace} 看到的是用户态程序请求内核服务的边界，不是 CPU 执行的全部细节。它能解释文件、进程、内存映射和系统调用问题，但不能替代反汇编、GDB 或 PMU。
