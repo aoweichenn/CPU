@@ -15,7 +15,7 @@ epub:
 	@BOOK_TITLE="Cpp 从零到高级" \
 	BOOK_SUBTITLE="语法、资源管理、泛型、并发、性能与工程实践" \
 	BOOK_AUTHOR="Cpp Systems Study" \
-	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables --wechat-compatible --no-embed-fonts
+	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --linearize-tables --wechat-compatible --no-embed-fonts
 
 text-count:
 	@python3 scripts/count_text_units.py

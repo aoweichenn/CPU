@@ -216,6 +216,13 @@ class EmbeddedFont:
     media_type: str
 
 
+@dataclass(frozen=True)
+class EpubAsset:
+    source: Path
+    href: str
+    media_type: str
+
+
 class LatexInline:
     def __init__(self) -> None:
         self.today = datetime.now(timezone.utc).date().isoformat()
@@ -380,12 +387,16 @@ class LatexBlockConverter:
         chapter_no: int | None = None,
         linearize_tables: bool = False,
         legacy_markup: bool = False,
+        book_dir: Path | None = None,
+        assets: dict[Path, EpubAsset] | None = None,
     ) -> None:
         self.inline = inline
         self.heading_prefix = heading_prefix
         self.chapter_no = chapter_no
         self.linearize_tables = linearize_tables
         self.legacy_markup = legacy_markup
+        self.book_dir = book_dir
+        self.assets = assets
         self.box_tag = "div" if legacy_markup else "aside"
         self.section_no = 0
         self.out: list[str] = []
@@ -494,6 +505,15 @@ class LatexBlockConverter:
                 continue
 
             if line.startswith("\\addcontentsline"):
+                i += 1
+                continue
+
+            figure = parse_book_figure_command(line)
+            if figure is not None:
+                self.flush_paragraph()
+                path, caption = figure
+                if self.book_dir is not None and self.assets is not None:
+                    self.out.append(render_book_figure(self.book_dir, self.assets, path, caption, self.inline))
                 i += 1
                 continue
 
@@ -659,6 +679,78 @@ def render_code_block(code: str, env: str, options: str) -> str:
     if env == "lstlisting" and language in {"c++", "cpp"}:
         return f'<pre class="code-block language-cpp"><code>{highlight_cpp(code)}</code></pre>'
     return f'<pre class="code-block"><code>{html.escape(code)}</code></pre>'
+
+
+def parse_book_figure_command(line: str) -> tuple[str, str] | None:
+    prefix = r"\bookfigure"
+    if not line.startswith(prefix):
+        return None
+    i = skip_ws(line, len(prefix))
+    if i < len(line) and line[i] == "[":
+        _, i = read_group(line, i, "[", "]")
+        i = skip_ws(line, i)
+    if i >= len(line) or line[i] != "{":
+        return None
+    path, i = read_group(line, i)
+    i = skip_ws(line, i)
+    caption = ""
+    if i < len(line) and line[i] == "{":
+        caption, _ = read_group(line, i)
+    return latex_plain(path), caption
+
+
+def render_book_figure(
+    book_dir: Path,
+    assets: dict[Path, EpubAsset],
+    path: str,
+    caption: str,
+    inline: LatexInline,
+) -> str:
+    source = (book_dir / path).resolve()
+    asset = register_epub_asset(assets, source)
+    alt = html.escape(latex_plain(caption), quote=True)
+    rendered_caption = inline.convert(caption)
+    return (
+        '<div class="book-figure">'
+        f'<img src="{html.escape(asset.href, quote=True)}" alt="{alt}" />'
+        f'<p class="figure-caption">图示：{rendered_caption}</p>'
+        "</div>"
+    )
+
+
+def register_epub_asset(assets: dict[Path, EpubAsset], source: Path) -> EpubAsset:
+    if source in assets:
+        return assets[source]
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(source)
+    suffix = source.suffix.lower()
+    media_type = image_media_type(suffix)
+    used_hrefs = {asset.href for asset in assets.values()}
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "-", source.name)
+    href = f"images/{safe_name}"
+    if href in used_hrefs:
+        digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:8]
+        href = f"images/{source.stem}-{digest}{suffix}"
+    asset = EpubAsset(source=source, href=href, media_type=media_type)
+    assets[source] = asset
+    return asset
+
+
+def image_media_type(suffix: str) -> str:
+    mapping = {
+        ".apng": "image/apng",
+        ".avif": "image/avif",
+        ".bmp": "image/bmp",
+        ".gif": "image/gif",
+        ".jpeg": "image/jpeg",
+        ".jpg": "image/jpeg",
+        ".png": "image/png",
+        ".svg": "image/svg+xml",
+        ".webp": "image/webp",
+    }
+    if suffix not in mapping:
+        raise ValueError(f"unsupported image asset type: {suffix}")
+    return mapping[suffix]
 
 
 def highlight_cpp(code: str) -> str:
@@ -1093,13 +1185,16 @@ def part_page(part: PartNode, legacy_markup: bool = False, inline_css: str = "")
 
 def convert_source(entry: SourceEntry, legacy_markup: bool = False, inline_css: str = "") -> str:
     assert entry.source is not None
-    source = expand_source_inputs(entry.source, find_book_dir(entry.source))
+    book_dir = find_book_dir(entry.source)
+    source = expand_source_inputs(entry.source, book_dir)
     converter = LatexBlockConverter(
         LatexInline(),
         heading_prefix=entry.label,
         chapter_no=entry.chapter_no,
         linearize_tables=EPUB_LINEARIZE_TABLES,
         legacy_markup=legacy_markup,
+        book_dir=book_dir,
+        assets=EPUB_ASSETS,
     )
     body = converter.convert(source)
     title = entry.nav_title or entry.title
@@ -1249,6 +1344,7 @@ def build_opf(
     uid: str,
     modified: str,
     fonts: list[EmbeddedFont],
+    assets: list[EpubAsset],
     epub_version: str = "3.0",
     include_css: bool = True,
     include_legacy_toc: bool = False,
@@ -1264,6 +1360,10 @@ def build_opf(
     for idx, font in enumerate(fonts, start=1):
         manifest_items.append(
             f'<item id="font-{idx}" href="{html.escape(font.href, quote=True)}" media-type="{font.media_type}"/>'
+        )
+    for idx, asset in enumerate(assets, start=1):
+        manifest_items.append(
+            f'<item id="asset-{idx}" href="{html.escape(asset.href, quote=True)}" media-type="{asset.media_type}"/>'
         )
     spine_items = []
     if include_legacy_toc and include_legacy_toc_in_spine:
@@ -1480,6 +1580,26 @@ li {
 .book-table-list dd p {
   text-indent: 0;
 }
+.book-figure {
+  margin: 1em 0;
+  text-align: center;
+  page-break-inside: avoid;
+}
+.book-figure img {
+  display: block;
+  width: auto;
+  max-width: 100%;
+  max-height: 22em;
+  margin: 0 auto;
+}
+.figure-caption {
+  text-indent: 0;
+  text-align: left;
+  color: #5b5f66;
+  font-size: 0.9em;
+  line-height: 1.45;
+  margin: 0.45em 0 0;
+}
 .cover {
   min-height: 80vh;
   display: flex;
@@ -1550,6 +1670,19 @@ li {
 }
 .box, .book-table-list {
   margin: 0.9em 0;
+}
+.book-figure {
+  margin: 0.9em 0;
+  text-align: center;
+}
+.book-figure img {
+  width: auto;
+  max-width: 100%;
+  max-height: 20em;
+}
+.figure-caption {
+  text-indent: 0;
+  font-size: 0.9em;
 }
 .box-title {
   font-weight: bold;
@@ -1628,6 +1761,7 @@ IMAGE_MARKUP = re.compile(
     r"(<\s*(?:img|svg|picture|source|figure)\b|image/|data:image|background-image|cover-image)",
     re.IGNORECASE,
 )
+EPUB_ASSETS: dict[Path, EpubAsset] = {}
 
 
 def validate_no_embedded_images(output: Path) -> None:
@@ -1667,6 +1801,7 @@ def build_epub(
         EPUB_LINEARIZE_TABLES = linearize_tables
     if wechat_compatible:
         WECHAT_COMPATIBLE = True
+    EPUB_ASSETS.clear()
 
     entries, parts = collect_entries(book_dir, include_cover=include_cover, legacy_names=WECHAT_COMPATIBLE)
     fonts = [] if WECHAT_COMPATIBLE or not embed_fonts else collect_embedded_fonts()
@@ -1715,6 +1850,7 @@ def build_epub(
                 uid,
                 modified,
                 fonts,
+                list(EPUB_ASSETS.values()),
                 epub_version=epub_version,
                 include_css=not WECHAT_COMPATIBLE,
                 include_legacy_toc=WECHAT_COMPATIBLE,
@@ -1723,6 +1859,8 @@ def build_epub(
         )
         for font in fonts:
             archive.writestr(zip_info(f"OEBPS/{font.href}"), font.source.read_bytes())
+        for asset in EPUB_ASSETS.values():
+            archive.writestr(zip_info(f"OEBPS/{asset.href}"), asset.source.read_bytes())
         for name, content in pages.items():
             archive.writestr(zip_info(f"OEBPS/{name}"), content)
     if forbid_images:
