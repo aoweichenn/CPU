@@ -172,3 +172,112 @@ void write_report(std::ostream& output, std::span<const ExtensionRow> rows, std:
 \begin{exercisebox}
 给文件索引器增加 \code{--min-size N}，只统计至少 \code{N} 字节的文件。要求参数解析拒绝负数和非数字；扫描逻辑不关心命令行字符串，只接收已经解析好的整数。
 \end{exercisebox}
+
+\section{扫描策略要先定义错误政策}
+
+文件系统遍历会遇到权限不足、符号链接循环、文件在扫描中被删除、路径太长等问题。如果不先定义错误政策，代码就会在异常和忽略之间摇摆。本项目采用：
+
+\begin{itemize}
+  \item 根目录打不开：命令失败。
+  \item 子目录权限不足：跳过并记录警告。
+  \item 单个文件读取大小失败：跳过并记录警告。
+  \item 符号链接：第一版不跟随。
+\end{itemize}
+
+这些政策会影响接口。只返回 \code{ExtensionIndex} 不够，还应返回警告：
+
+\begin{lstlisting}[language=C++,caption={索引结果带警告}]
+struct IndexWarning {
+    std::filesystem::path path;
+    std::string message;
+};
+
+struct IndexResult {
+    ExtensionIndex index;
+    std::vector<IndexWarning> warnings;
+};
+\end{lstlisting}
+
+这样 CLI 可以把警告写到错误流，测试也能断言权限问题没有让整个扫描失败。
+
+\section{遍历循环的证据字段}
+
+\code{recursive_directory_iterator} 使用 \code{error_code} 时，每一步都要检查。可以把循环理解成三段：
+
+\begin{enumerate}
+  \item 迭代器推进是否成功。
+  \item 当前条目是否是普通文件。
+  \item 文件大小是否可读。
+\end{enumerate}
+
+每段失败都产生不同警告。不要把所有失败都简单 \code{continue}，否则用户不知道为什么统计少了文件。教材里可以先简化，但工程版本必须留下错误证据。
+
+\section{top k 是否需要堆}
+
+输出前 \code{k} 个扩展名时有两种做法。第一种是全部排序，复杂度 \complexity{O(m \log m)}，其中 \code{m} 是扩展名种类数。第二种是维护大小为 \code{k} 的堆，复杂度 \complexity{O(m \log k)}。听起来堆更高级，但文件扩展名种类通常很少，全部排序简单、稳定、可读，完全足够。
+
+这个例子训练算法选择：不要因为知道更复杂的数据结构就立刻使用。先估计 \code{m} 的规模。如果 \code{m} 只有几十或几百，排序成本远小于文件系统遍历成本。真正热点在系统调用和磁盘 I/O。
+
+\section{min-size 参数贯穿三层}
+
+增加 \code{--min-size N} 时，要分三层：
+
+\begin{longtable}{p{0.22\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+层 & 输入 & 责任 \\
+\midrule
+参数解析 & 字符串 \code{N} & 完整解析非负整数 \\
+扫描配置 & \code{std::uint64_t min_size} & 保存已经验证的阈值 \\
+扫描逻辑 & 文件大小 & 小于阈值则跳过 \\
+\bottomrule
+\end{longtable}
+
+扫描函数不应该知道 \code{"--min-size"} 这个字符串。它只接收配置对象：
+
+\begin{lstlisting}[language=C++,caption={扫描配置对象}]
+struct IndexOptions {
+    std::filesystem::path root;
+    std::uint64_t min_size = 0;
+    std::size_t top = 20;
+};
+\end{lstlisting}
+
+这样命令行、配置文件或图形界面都可以复用同一个扫描逻辑。
+
+\section{临时目录测试}
+
+文件索引器需要真实文件系统测试，但要控制范围。测试可以创建临时目录：
+
+\begin{lstlisting}[language=C++,caption={临时目录测试思路}]
+TemporaryDirectory temp;
+write_file(temp.path() / "a.cpp", "1234");
+write_file(temp.path() / "b.HPP", "12");
+write_file(temp.path() / "README", "x");
+
+const IndexResult result = build_index(IndexOptions{.root = temp.path()});
+assert(result.index.at(".cpp").file_count == 1);
+assert(result.index.at(".hpp").file_count == 1);
+assert(result.index.at("<none>").file_count == 1);
+\end{lstlisting}
+
+\code{TemporaryDirectory} 应使用 RAII：构造时创建目录，析构时删除。这样测试失败时也尽量清理现场。不要把测试文件散落到仓库根目录。
+
+\section{输出稳定性}
+
+因为 \code{unordered_map} 遍历顺序不稳定，任何面向用户或测试的输出都必须先排序。排序规则要覆盖平局情况：字节数相同按扩展名升序，扩展名相同不可能出现。只要平局规则不完整，测试就可能在不同平台或不同运行中随机失败。
+
+\section{项目验收清单}
+
+文件索引器完成时至少验收：
+
+\begin{itemize}
+  \item 空目录输出为空。
+  \item 大小写扩展名合并。
+  \item 无扩展名归入固定名称。
+  \item top 限制生效。
+  \item min-size 拒绝非法参数。
+  \item 单文件错误产生警告而不是崩溃。
+  \item 输出顺序稳定。
+\end{itemize}
+
+这些验收项覆盖了文件系统项目最容易出错的边界：路径、错误、排序、参数和可重复测试。

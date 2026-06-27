@@ -164,3 +164,104 @@ std::vector<ConfigEntry> read_config_entries(const std::filesystem::path& path)
 \begin{exercisebox}
 扩展配置解析：支持同一个 key 重复时后者覆盖前者，并记录一条警告。要求解析单行、合并条目、输出警告分别是不同函数。写测试覆盖注释、空行、缺等号、空 key、重复 key。
 \end{exercisebox}
+
+\section{流状态要分清 EOF 和错误}
+
+\code{std::getline} 循环结束有多种原因。最常见是正常读到 EOF，这不是错误。如果底层设备出错，才是 I/O 错误。可以把读取循环写成固定形态：
+
+\begin{lstlisting}[language=C++,caption={读取结束后检查 bad 状态}]
+std::string line;
+while (std::getline(input, line)) {
+    handle_line(line);
+}
+
+if (input.bad()) {
+    throw std::runtime_error{"I/O error while reading"};
+}
+\end{lstlisting}
+
+不要在循环结束后简单说“读取失败”。空文件、正常 EOF、格式错误、磁盘错误是四种不同情况。错误分类越细，调用者越容易修复。
+
+\section{大文件处理要控制内存上界}
+
+如果只统计日志行数，不需要把所有行放进 \code{vector}：
+
+\begin{lstlisting}[language=C++,caption={流式统计行数}]
+std::size_t count_lines(std::istream& input)
+{
+    std::size_t count = 0;
+    std::string line;
+    while (std::getline(input, line)) {
+        ++count;
+    }
+    if (input.bad()) {
+        throw std::runtime_error{"failed while counting lines"};
+    }
+    return count;
+}
+\end{lstlisting}
+
+这个函数的内存上界接近一行文本，而不是整个文件。流式处理的代价是不能随意回看历史数据；如果后续算法需要全局排序或随机访问，就必须收集。设计 I/O 时先问：处理是否能单向完成？是否需要全局视图？内存上限是多少？
+
+\section{解析单行要保留原始文本}
+
+配置错误最好带原始行。比如缺少等号：
+
+\begin{lstlisting}[caption={错误配置行}]
+port 8080
+\end{lstlisting}
+
+错误消息可以写成：
+
+\begin{lstlisting}[caption={带原始行的错误}]
+line 12: missing '=': port 8080
+\end{lstlisting}
+
+为此，错误类型可以保存行号和片段：
+
+\begin{lstlisting}[language=C++,caption={带上下文的行错误}]
+struct LineError {
+    int line = 0;
+    std::string text;
+    std::string message;
+};
+\end{lstlisting}
+
+不要只返回 \code{false}。布尔值说明不了用户该改哪里。文件处理程序的可用性，很大程度取决于错误信息是否能定位。
+
+\section{编码边界要写进需求}
+
+本章示例主要处理 ASCII 风格的配置和命令。如果需求变成“读取用户提交的中文文本，按用户感知字符截断到二十个字”，\code{std::string::size()} 就不够了。它返回字节数，不是 Unicode 字符数，也不是字形簇数量。正确做法是引入专门文本处理库，或者明确系统只按字节处理。
+
+这不是逃避问题，而是工程边界。标准 \code{std::string} 是字节容器；文本国际化是更大的主题。项目需求必须写清楚编码假设，否则后面会出现截断乱码、大小写转换错误、排序顺序不符合用户语言等问题。
+
+\section{文件写入也要有失败检查}
+
+很多代码只检查打开，不检查写入过程：
+
+\begin{lstlisting}[language=C++,caption={只检查打开不够}]
+std::ofstream output{path};
+if (!output) {
+    throw std::runtime_error{"cannot open output"};
+}
+output << data;
+\end{lstlisting}
+
+磁盘满、权限变化、网络文件系统异常都可能让写入失败。更稳的写法：
+
+\begin{lstlisting}[language=C++,caption={写入后检查流状态}]
+std::ofstream output{path};
+if (!output) {
+    throw std::runtime_error{"cannot open output"};
+}
+output << data;
+if (!output) {
+    throw std::runtime_error{"failed to write output"};
+}
+\end{lstlisting}
+
+如果写的是重要配置或索引文件，还应结合 RAII 章节的临时文件提交策略，避免失败时留下半截文件。
+
+\section{本章验收：I/O 函数可替换输入输出}
+
+一个文件处理函数如果直接依赖真实文件和终端，就很难测试。优先把核心逻辑写成接收 \code{std::istream&}、\code{std::ostream&} 或 \code{std::span<const std::string>} 的函数；只有最外层负责打开文件。这样同一套逻辑可以用字符串流测试，也可以在真实命令里使用。I/O 边界越薄，程序越容易验证。

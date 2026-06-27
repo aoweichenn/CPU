@@ -168,3 +168,117 @@ std::vector<int> active_user_ids(std::span<const User> users)
 \begin{exercisebox}
 给 \code{active_user_ids} 加测试：空列表、没有活跃用户、重复 ID、已排序输入、逆序输入。然后用普通循环重写一版，对比哪一版更容易在代码里看出“筛选、转换、排序、去重”四个步骤。
 \end{exercisebox}
+
+\section{从循环账本选择算法}
+
+判断一个循环是否适合换成算法，可以把循环账本写出来：
+
+\begin{longtable}{p{0.22\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+循环维护的东西 & 标准词汇 & 典型问题 \\
+\midrule
+是否存在某元素 & \code{any_of} & 谓词是否表达完整条件 \\
+所有元素是否满足 & \code{all_of} & 空区间时语义是否符合需求 \\
+找到第一个匹配 & \code{find_if} & 找不到时如何处理 \\
+把每个元素变成新值 & \code{transform} & 输出容器是否预留空间 \\
+只保留一部分元素 & \code{copy_if} 或视图过滤 & 是否需要拥有结果 \\
+把元素合成一个值 & \code{accumulate} 或 \code{reduce} & 操作是否满足结合律 \\
+\bottomrule
+\end{longtable}
+
+这张表能避免两个极端：一端是所有简单循环都手写，读者要自己推意图；另一端是为了“现代”把复杂状态机硬塞进算法，反而难懂。算法的边界是：当循环账本正好对应一个标准词汇时，用它。
+
+\section{归约不是随便相加}
+
+\code{std::accumulate} 看起来简单，但初值类型会影响结果。错误版本：
+
+\begin{lstlisting}[language=C++,caption={初值类型导致截断或溢出}]
+std::vector<double> values{0.1, 0.2, 0.3};
+auto total = std::accumulate(values.begin(), values.end(), 0);
+\end{lstlisting}
+
+初值 \code{0} 是 \code{int}，归约结果会按整数累加路径推导，结果不是你想要的。应该写：
+
+\begin{lstlisting}[language=C++,caption={初值类型表达归约类型}]
+auto total = std::accumulate(values.begin(), values.end(), 0.0);
+\end{lstlisting}
+
+对大整数也一样。如果元素是 \code{int}，但总和可能超过 \code{int}，初值应使用更宽类型。算法没有取消类型责任，它只是把循环形态变成标准接口。
+
+\section{ranges 管道的调试方法}
+
+ranges 管道写长后，新手会觉得像魔法。调试时不要盯着整条管道，按阶段拆：
+
+\begin{lstlisting}[language=C++,caption={把管道拆成命名阶段}]
+auto active_users = users | std::views::filter([](const User& user) {
+    return user.active;
+});
+
+auto ids = active_users | std::views::transform([](const User& user) {
+    return user.id;
+});
+
+std::vector<int> result(ids.begin(), ids.end());
+\end{lstlisting}
+
+每个阶段都有一个问题：过滤条件是否正确，转换字段是否正确，最终是否需要拥有容器。拆开以后再合并成管道，代码就不是模板，而是从证据一步步压缩出来的表达。
+
+\section{稳定排序与业务语义}
+
+排序时要问：相同 key 的元素原顺序是否有意义？例如用户列表先按注册时间排列，现在要把活跃用户排在前面，但同为活跃的用户仍保留注册先后。普通 \code{sort} 不保证相等元素的原顺序，应该使用稳定排序：
+
+\begin{lstlisting}[language=C++,caption={稳定排序保留相等元素原相对顺序}]
+std::ranges::stable_sort(users, [](const User& lhs, const User& rhs) {
+    return lhs.active && !rhs.active;
+});
+\end{lstlisting}
+
+这个比较器只表达“活跃用户排在非活跃用户前”。两个都活跃或两个都不活跃时返回 \code{false}，稳定排序就保留原相对顺序。如果业务不关心相等元素顺序，普通排序可能更合适。选择算法也要写清业务语义。
+
+\section{完整案例：报表流水线和验收}
+
+假设报表需求变成：从用户列表中找出活跃且分数不低于阈值的用户，按分数降序、ID 升序输出前十个 ID。先不要写代码，先拆步骤：
+
+\begin{enumerate}
+  \item 过滤活跃用户。
+  \item 过滤分数达到阈值的用户。
+  \item 收集成拥有结果，因为后面要排序和截断。
+  \item 按分数降序、ID 升序排序。
+  \item 截断到十个。
+  \item 转换成 ID 列表。
+\end{enumerate}
+
+实现可以这样写：
+
+\begin{lstlisting}[language=C++,caption={活跃高分用户报表}]
+std::vector<int> top_active_user_ids(std::span<const User> users,
+                                     int min_score)
+{
+    auto candidates_view = users
+        | std::views::filter([](const User& user) {
+              return user.active;
+          })
+        | std::views::filter([min_score](const User& user) {
+              return user.score >= min_score;
+          });
+
+    std::vector<User> candidates(candidates_view.begin(), candidates_view.end());
+    std::ranges::sort(candidates, [](const User& lhs, const User& rhs) {
+        if (lhs.score != rhs.score) {
+            return lhs.score > rhs.score;
+        }
+        return lhs.id < rhs.id;
+    });
+
+    if (candidates.size() > 10) {
+        candidates.resize(10);
+    }
+
+    std::vector<int> ids;
+    ids.reserve(candidates.size());
+    std::ranges::transform(candidates, std::back_inserter(ids), &User::id);
+    return ids;
+}
+\end{lstlisting}
+
+这里没有为了管道而管道。需要排序时，必须先拥有一份候选列表；需要返回 ID 时，再转换成结果。标准算法、ranges 和普通容器在同一个函数里协作，才是可维护的现代 \cpp。

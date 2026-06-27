@@ -194,3 +194,113 @@ for (int i = 0; i < 1000; ++i) {
 \begin{exercisebox}
 给 \code{TaskExecutor} 增加 \code{submit_counting}，提交任务后返回一个 \code{std::future<void>}，调用者可以等待任务完成并接收异常。要求任务异常传给 future，而不是只打印日志。
 \end{exercisebox}
+
+\section{为什么这个项目先叫任务队列}
+
+很多人一上来想写“线程池”，结果很快被 future、取消、优先级、动态扩缩容、任务窃取压垮。本项目先叫任务队列，是为了把最核心的协议讲清：生产者如何提交，消费者如何等待，关闭时如何退出，异常如何越过任务边界。线程池只是建立在这些协议之上的更大结构。
+
+\section{背压：队列不能无限长}
+
+当前 \code{TaskQueue} 没有限制长度。生产者比消费者快时，任务会无限堆积，内存可能被耗尽。一个工程版本通常需要背压。先定义策略：
+
+\begin{itemize}
+  \item 队列未满时，\code{push} 成功。
+  \item 队列已满时，\code{push} 阻塞等待空间。
+  \item 队列关闭时，\code{push} 失败或抛异常。
+\end{itemize}
+
+状态增加一个容量和一个条件变量：
+
+\begin{lstlisting}[language=C++,caption={有界任务队列状态}]
+std::mutex mutex_;
+std::condition_variable not_empty_;
+std::condition_variable not_full_;
+std::queue<std::function<void()>> tasks_;
+std::size_t capacity_ = 0;
+bool closed_ = false;
+\end{lstlisting}
+
+\code{push} 等待“不关闭且未满”，\code{pop} 取走任务后通知 \code{not_full_}。这里有两个等待条件，所以用两个条件变量能让意图更清楚。
+
+\section{有界 push 的协议}
+
+可以让 \code{push} 返回布尔值而不是抛异常：
+
+\begin{lstlisting}[language=C++,caption={有界队列提交任务}]
+bool push(std::function<void()> task)
+{
+    std::unique_lock<std::mutex> lock{this->mutex_};
+    this->not_full_.wait(lock, [this] {
+        return this->closed_ || this->tasks_.size() < this->capacity_;
+    });
+
+    if (this->closed_) {
+        return false;
+    }
+
+    this->tasks_.push(std::move(task));
+    lock.unlock();
+    this->not_empty_.notify_one();
+    return true;
+}
+\end{lstlisting}
+
+等待谓词里必须包含 \code{closed_}。否则队列满时，如果另一个线程关闭队列，生产者可能永远睡在“等待空间”上。关闭时也必须同时 \code{notify_all} 两个条件变量，让等待任务和等待空间的线程都醒来。
+
+\section{drain 不是 sleep}
+
+测试里最常见坏味道是：
+
+\begin{lstlisting}[language=C++,caption={不要靠睡眠等待任务完成}]
+std::this_thread::sleep_for(std::chrono::milliseconds{100});
+assert(counter == 1000);
+\end{lstlisting}
+
+这在快机器上可能过，在慢机器或 CI 上可能失败。更好的测试使用同步原语。例如提交一批任务，每个任务倒数一个 latch：
+
+\begin{lstlisting}[language=C++,caption={用 latch 等待任务完成}]
+std::latch done{1000};
+for (int i = 0; i < 1000; ++i) {
+    executor.submit([&done] {
+        done.count_down();
+    });
+}
+done.wait();
+\end{lstlisting}
+
+并发测试要等待明确事件，而不是等待一段时间。时间只能作为超时保护，不应作为正确性依据。
+
+\section{future 版本的任务提交}
+
+如果调用者需要接收异常，可以用 \code{std::packaged_task}：
+
+\begin{lstlisting}[language=C++,caption={提交任务并返回 future}]
+std::future<void> submit_future(std::function<void()> task)
+{
+    auto packaged = std::make_shared<std::packaged_task<void()>>(
+        [task = std::move(task)] {
+            task();
+        });
+    std::future<void> result = packaged->get_future();
+    this->queue_.push([packaged] {
+        (*packaged)();
+    });
+    return result;
+}
+\end{lstlisting}
+
+如果任务抛异常，\code{packaged_task} 会把异常存进 future，调用者在 \code{get()} 时重新收到。这比工作线程直接打印日志更适合库接口，因为错误回到了提交者手里。
+
+\section{项目验收：关闭路径最重要}
+
+任务队列的验收重点不是“能跑几个任务”，而是关闭路径：
+
+\begin{itemize}
+  \item 空队列关闭后，所有 worker 退出。
+  \item 有剩余任务时关闭，已提交任务是否执行完，规则要明确。
+  \item 队列满且生产者阻塞时关闭，生产者能醒来。
+  \item 任务抛异常时，worker 不应无声死亡。
+  \item 析构时不会访问已经销毁的队列。
+\end{itemize}
+
+并发项目最贵的 bug 往往在退出路径。把退出协议测透，比多加一个功能更重要。

@@ -242,3 +242,110 @@ while (queue.empty() && !closed) {
 \begin{exercisebox}
 给 \code{ClosableQueue} 增加一个 \code{push} 规则：关闭后不允许再插入。设计返回值或异常策略，并测试三个场景：正常 push/pop、关闭空队列、关闭后 push。
 \end{exercisebox}
+
+\section{并发事故从时间线开始}
+
+并发 bug 的难点是“代码顺序”和“实际交错顺序”不是一回事。两个线程丢更新的时间线可以写得更细：
+
+\begin{longtable}{p{0.12\linewidth}p{0.28\linewidth}p{0.28\linewidth}p{0.14\linewidth}}
+\toprule
+时刻 & 线程 A & 线程 B & 共享值 \\
+\midrule
+1 & 读取 counter &  & 10 \\
+2 &  & 读取 counter & 10 \\
+3 & 计算 11 &  & 10 \\
+4 &  & 计算 11 & 10 \\
+5 & 写回 11 &  & 11 \\
+6 &  & 写回 11 & 11 \\
+\bottomrule
+\end{longtable}
+
+这个表说明，问题不在循环次数，也不在某个线程“抢占了 CPU”。问题是两个线程同时读写同一个共享状态，且没有同步建立互斥或顺序。任何并发问题都先写时间线：谁读，谁写，哪个状态被共享，哪个同步原语保护它。
+
+\section{锁保护的是状态集合}
+
+只说“给变量加锁”太粗。锁真正保护的是一组状态和它们之间的不变量。以关闭队列为例，共享状态至少有两个：队列内容和关闭标志。
+
+\begin{lstlisting}[language=C++,caption={队列内容和关闭状态必须一起保护}]
+std::queue<int> queue_;
+bool closed_ = false;
+std::mutex mutex_;
+\end{lstlisting}
+
+不变量包括：关闭后消费者如果发现队列空，应退出；关闭后是否允许生产者继续 push，要有明确规则；通知必须发生在状态改变之后。于是 \code{closed_} 和 \code{queue_} 应该由同一个互斥量保护。把队列用一个锁、关闭标志用另一个锁，或者把关闭标志改成 atomic 而队列仍用 mutex，都会让推理复杂很多。
+
+\section{push 也需要关闭协议}
+
+前面的 \code{ClosableQueue} 只展示了 \code{close} 和 \code{pop}。完整队列还要定义关闭后 \code{push} 怎么办。这里选择返回 \code{false}：
+
+\begin{lstlisting}[language=C++,caption={关闭后拒绝插入}]
+bool push(int value)
+{
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        if (this->closed_) {
+            return false;
+        }
+        this->queue_.push(value);
+    }
+    this->ready_.notify_one();
+    return true;
+}
+\end{lstlisting}
+
+为什么通知放在释放锁之后？这样等待线程被唤醒后，更可能直接拿到锁继续执行，减少无谓竞争。放在锁内通常也能正确，但要知道自己在做什么。并发代码里，“正确”和“减少等待”是两层问题，先保证正确，再谈性能。
+
+\section{等待谓词是协议文档}
+
+消费者等待的谓词：
+
+\begin{lstlisting}[language=C++,caption={等待条件写成谓词}]
+this->ready_.wait(lock, [this] {
+    return this->closed_ || !this->queue_.empty();
+});
+\end{lstlisting}
+
+这行代码是协议文档。它告诉读者：消费者醒来的合法原因有两个，要么有任务，要么队列关闭。醒来后还要分支：
+
+\begin{lstlisting}[language=C++,caption={醒来后区分任务和关闭}]
+if (this->queue_.empty()) {
+    return std::nullopt;
+}
+const int value = this->queue_.front();
+this->queue_.pop();
+return value;
+\end{lstlisting}
+
+如果忘了把 \code{closed_} 放进谓词，关闭空队列时消费者可能永远睡下去。如果忘了在 \code{close} 里 \code{notify_all}，等待者也可能看不到关闭事件。条件变量要同时检查三件事：状态在哪里改，谓词怎么写，谁负责通知。
+
+\section{线程生命周期要有所有者}
+
+启动线程也属于资源管理。裸 \code{std::thread} 如果对象析构时仍然 joinable，会调用 \code{std::terminate}。所以线程所有者必须定义退出协议：
+
+\begin{lstlisting}[language=C++,caption={工作线程所有者的基本形状}]
+class Worker {
+public:
+    Worker()
+        : thread_{[this](std::stop_token token) {
+              this->run(token);
+          }}
+    {
+    }
+
+private:
+    void run(std::stop_token token)
+    {
+        while (!token.stop_requested()) {
+            do_one_unit_of_work();
+        }
+    }
+
+    std::jthread thread_;
+};
+\end{lstlisting}
+
+\code{std::jthread} 帮你做析构时请求停止和 join，但它不能替你设计 \code{run} 如何从阻塞等待中醒来。如果工作线程在条件变量上等待，析构或关闭函数必须修改共享状态并通知。线程生命周期同样要有账本：谁启动，谁请求停止，谁唤醒，谁 join。
+
+\section{本章验收：给每个共享状态标注保护者}
+
+审查并发代码时，在每个共享字段旁边写一句“由谁保护”。例如：\code{queue_} 和 \code{closed_} 由 \code{mutex_} 保护；\code{requests_} 是 relaxed atomic 统计计数，不保护其他数据；\code{stop_} 是停止信号，但阻塞等待还需要条件变量通知。标注不出来的共享状态，就是事故候选。

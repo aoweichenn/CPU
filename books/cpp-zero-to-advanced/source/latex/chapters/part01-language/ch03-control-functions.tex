@@ -205,3 +205,111 @@ int run(std::span<char* const> args)
 \begin{exercisebox}
 给参数解析器补上重复选项规则：\code{--limit 10 --limit 20} 是报错，还是后者覆盖前者？先写出你的规则，再修改 \code{has_limit} 分支，让测试覆盖这两种输入。
 \end{exercisebox}
+
+\section{把参数解析看成状态机}
+
+命令行解析最容易写成一堆互相穿插的 \code{if}。CPU 卷处理复杂控制流时会先把状态列出来，这里也一样。对 \code{tool --input data.txt --limit 100} 来说，解析器的状态可以很小：
+
+\begin{longtable}{p{0.22\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+当前看到 & 需要检查 & 下一步 \\
+\midrule
+\code{--input} & 后面是否还有参数 & 消耗下一个参数作为路径 \\
+\code{--limit} & 后面是否还有参数，是否完整整数 & 消耗下一个参数作为限制 \\
+未知选项 & 是否允许透传 & 本工具不允许，直接报错 \\
+普通文本 & 是否处在等待值状态 & 本工具不接受裸参数，报错 \\
+扫描结束 & 必填项是否齐全 & 缺什么报什么 \\
+\bottomrule
+\end{longtable}
+
+有了这张表，循环怎么写就清楚了：下标只向右推进；每次消耗值都先检查边界；遇到错误立即返回；循环结束后统一检查必填项。控制流的质量不在于用了多少语法，而在于状态推进是否单调、失败位置是否可解释。
+
+\section{为什么要避免半截解析}
+
+数字解析有一个隐蔽坑：\code{12abc} 不应该被当成 \code{12}。如果工具用于截断日志、限制扫描数量或控制删除范围，半截成功可能造成严重后果。下面的测试应当失败：
+
+\begin{lstlisting}[language=C++,caption={半截数字应当报错}]
+assert(!parse_int_fast("12abc").has_value());
+assert(!parse_int_fast("").has_value());
+assert(parse_int_fast("12").value() == 12);
+\end{lstlisting}
+
+这个测试矩阵推导出实现必须同时检查两个条件：转换错误码为成功，返回指针正好到达字符串末尾。只检查错误码不够；只检查非空也不够。控制流里很多 bug 都来自这种“少检查一个证据字段”。
+
+\section{重复参数是一条业务规则}
+
+重复选项没有天然答案。不同工具可能选择“后者覆盖前者”“报错”“收集成列表”。教材里选择报错，是为了让用户更早发现命令写错：
+
+\begin{lstlisting}[language=bash,caption={重复选项样本}]
+tool --input a.txt --input b.txt --limit 10
+\end{lstlisting}
+
+如果静默取后者，用户可能以为两个文件都被处理。报错版本可以这样写：
+
+\begin{lstlisting}[language=C++,caption={重复选项检查}]
+if (arg == "--input") {
+    if (has_input) {
+        return {.error = ParseError{"duplicate --input"}};
+    }
+    if (i + 1 >= args.size()) {
+        return {.error = ParseError{"--input requires a value"}};
+    }
+    options.input_path = args[++i];
+    has_input = true;
+    continue;
+}
+\end{lstlisting}
+
+注意这不是模板，而是从需求推导出来的规则。如果以后要支持多个输入文件，接口就不应该叫 \code{input_path}，而应该变成 \code{input_paths}，类型也应从 \code{std::string} 变成 \code{std::vector<std::string>}。状态变量和数据结构要跟业务合同一起变化。
+
+\section{错误消息也是用户界面}
+
+“unknown option” 对程序员可能够用，对用户不够。更有用的错误应该包含原始参数和期望格式：
+
+\begin{lstlisting}[language=C++,caption={带上下文的未知选项错误}]
+return {.error = ParseError{
+    .message = "unknown option: " + std::string{arg}
+}};
+\end{lstlisting}
+
+如果工具有很多选项，错误还可以补上 \code{try --help}。错误消息的标准是：用户看到后能不能立刻改输入。不要只写 \code{parse failed}，它没有定位价值。
+
+\section{从 run 函数建立测试边界}
+
+一个命令行工具至少有三层：解析参数、执行业务、连接终端。测试解析器时，不需要真的跑业务；测试业务时，不需要从 \code{argv} 解析；测试入口时，只验证错误码和输出流连接。
+
+\begin{lstlisting}[language=C++,caption={入口函数适合测试}]
+int run(std::span<char* const> argv,
+        std::ostream& output,
+        std::ostream& error)
+{
+    const ParseResult parsed = parse_options(argv);
+    if (parsed.error.has_value()) {
+        error << parsed.error->message << '\n';
+        return 2;
+    }
+
+    return execute(*parsed.options, output, error);
+}
+\end{lstlisting}
+
+这段代码看起来比直接在 \code{main} 里写多了一层，但测试收益很大。你可以构造假参数数组，传入 \code{std::ostringstream}，断言返回码和错误文本。真正的 \code{main} 只负责把系统边界转接进来。
+
+\section{验收练习：为解析器画一张失败表}
+
+完成一个解析器后，不要只测成功命令。至少列出失败表：
+
+\begin{longtable}{p{0.36\linewidth}p{0.44\linewidth}}
+\toprule
+输入 & 应报告 \\
+\midrule
+\code{tool} & 缺少 \code{--input} 或 \code{--limit} \\
+\code{tool --input} & \code{--input} 缺少值 \\
+\code{tool --limit abc} & 限制必须是整数 \\
+\code{tool --limit 12abc} & 限制必须完整解析 \\
+\code{tool --input a --input b} & 重复输入参数 \\
+\code{tool --limt 10} & 未知选项，提示拼写错误 \\
+\bottomrule
+\end{longtable}
+
+能把失败表写出来，控制流才算有边界。否则程序只是碰巧处理了几个样例。

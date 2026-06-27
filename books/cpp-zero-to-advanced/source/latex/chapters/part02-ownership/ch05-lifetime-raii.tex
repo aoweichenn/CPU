@@ -257,3 +257,118 @@ struct Node {
 \begin{exercisebox}
 写一个 \code{Timer} 类，在构造时记录开始时间，在析构时打印耗时。然后把它放进一个有多个 \code{return} 分支的函数里，观察每条路径都会打印耗时。这个练习能帮助你把 RAII 从“文件关闭”推广到任意成对动作。
 \end{exercisebox}
+
+\section{从提交失败推导事务式 RAII}
+
+文件关闭只是 RAII 的入门样本。更接近工程的场景是：写配置文件时不能把旧文件写坏。错误版本通常直接覆盖目标文件：
+
+\begin{lstlisting}[language=C++,caption={直接覆盖配置文件的风险}]
+void save_config(const Config& config, const std::filesystem::path& path)
+{
+    std::ofstream output{path};
+    output << render(config);
+}
+\end{lstlisting}
+
+如果程序写到一半崩溃，目标文件可能只剩半截。更稳的策略是先写临时文件，成功后再重命名替换：
+
+\begin{lstlisting}[language=C++,caption={先写临时文件再提交}]
+void save_config_atomically(const Config& config,
+                            const std::filesystem::path& path)
+{
+    const std::filesystem::path temporary = path.string() + ".tmp";
+    {
+        std::ofstream output{temporary};
+        if (!output) {
+            throw std::runtime_error{"cannot open temporary config"};
+        }
+        output << render(config);
+        if (!output) {
+            throw std::runtime_error{"cannot write temporary config"};
+        }
+    }
+    std::filesystem::rename(temporary, path);
+}
+\end{lstlisting}
+
+这里大括号不是装饰。它让 \code{ofstream} 在重命名前析构，确保文件先关闭。否则在某些平台上，打开的文件可能影响替换操作。RAII 的推理链条变成：临时文件对象负责写入期间的文件句柄；作用域结束释放句柄；提交步骤只在完整写入之后发生。
+
+\section{回滚动作也能交给对象}
+
+如果提交前出错，临时文件应该清理。可以写一个小的作用域守卫：
+
+\begin{lstlisting}[language=C++,caption={作用域守卫负责失败清理}]
+class TemporaryFileCleanup {
+public:
+    explicit TemporaryFileCleanup(std::filesystem::path path)
+        : path_{std::move(path)}
+    {
+    }
+
+    void release() noexcept
+    {
+        this->active_ = false;
+    }
+
+    ~TemporaryFileCleanup()
+    {
+        if (this->active_) {
+            std::error_code ignored;
+            std::filesystem::remove(this->path_, ignored);
+        }
+    }
+
+private:
+    std::filesystem::path path_;
+    bool active_ = true;
+};
+\end{lstlisting}
+
+使用方式如下：
+
+\begin{lstlisting}[language=C++,caption={提交成功后取消清理}]
+const std::filesystem::path temporary = path.string() + ".tmp";
+TemporaryFileCleanup cleanup{temporary};
+write_full_file(temporary, render(config));
+std::filesystem::rename(temporary, path);
+cleanup.release();
+\end{lstlisting}
+
+析构函数里故意吞掉删除错误，因为析构函数不应随意抛异常。真正需要报告的错误应发生在显式步骤里，例如打开失败、写入失败、重命名失败。RAII 对象负责“无论路径怎么退出都尽量收尾”，不是负责隐藏核心业务错误。
+
+\section{析构顺序也是设计工具}
+
+局部对象按构造逆序析构。这个规则可以用来安排资源依赖：
+
+\begin{lstlisting}[language=C++,caption={依赖对象要晚构造早析构}]
+void write_with_lock()
+{
+    std::ofstream output{"out.txt"};
+    std::lock_guard<std::mutex> lock{global_mutex};
+    output << "message\n";
+}
+\end{lstlisting}
+
+这段代码里 \code{lock} 比 \code{output} 后构造，所以先析构。是否合理要看需求：如果你希望整个文件写入和关闭都在锁内，应调整作用域；如果只需要保护写入语句，当前写法可能足够。关键是不要把析构顺序当成偶然。它是 \cpp 资源管理的一部分。
+
+\section{所有权图：谁负责释放}
+
+判断智能指针时，可以画一张很小的所有权图：
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+关系 & 推荐表达 & 解释 \\
+\midrule
+对象属于当前作用域 & 直接值对象 & 离开作用域自动析构 \\
+对象唯一属于某个所有者 & \code{std::unique_ptr} & 所有权移动可见 \\
+对象被多个异步任务共同延寿 & \code{std::shared_ptr} & 最后一个所有者释放 \\
+对象只是被观察 & 引用、指针、视图 & 不负责释放 \\
+反向引用不延寿 & \code{std::weak_ptr} & 避免循环所有权 \\
+\bottomrule
+\end{longtable}
+
+如果画不出谁拥有谁，就不要急着选 \code{shared_ptr}。很多共享指针滥用，本质是所有权图没想清楚。
+
+\section{本章验收：每个资源都要有退出路径}
+
+看到资源代码时，把所有退出路径列出来：正常返回、提前返回、异常、对象移动、容器扩容、线程取消。每条路径都要能回答资源如何释放。RAII 的价值就是让这些路径共享同一套析构规则，而不是在每个分支复制清理代码。

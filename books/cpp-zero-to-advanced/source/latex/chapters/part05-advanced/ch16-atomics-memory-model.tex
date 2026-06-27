@@ -119,3 +119,120 @@ private:
 \begin{exercisebox}
 实现一个线程安全库存计数器，提供 \code{try_take(int count)}。要求不能扣成负数。先用 \code{mutex} 写一版，再用 \code{compare_exchange} 写一版。比较哪一版更容易证明正确。
 \end{exercisebox}
+
+\section{库存扣减从互斥版本开始}
+
+学习 atomic 之前，先写互斥版本，因为它更容易证明不变量：
+
+\begin{lstlisting}[language=C++,caption={互斥量版本库存扣减}]
+class StockCounter {
+public:
+    explicit StockCounter(int initial)
+        : stock_{initial}
+    {
+    }
+
+    bool try_take(int count)
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        if (count <= 0 || this->stock_ < count) {
+            return false;
+        }
+        this->stock_ -= count;
+        return true;
+    }
+
+private:
+    std::mutex mutex_;
+    int stock_ = 0;
+};
+\end{lstlisting}
+
+锁内的临界区很短，但不变量清楚：检查和扣减在同一个互斥区域里完成，其他线程看不到中间状态。这个版本也更容易扩展错误消息、审计日志或多字段库存。先能写对这个版本，再考虑 atomic。
+
+\section{比较交换版本的推理}
+
+atomic 版本要把“检查旧值”和“写入新值”合成一次条件更新：
+
+\begin{lstlisting}[language=C++,caption={支持扣减多个库存的比较交换}]
+class AtomicStockCounter {
+public:
+    explicit AtomicStockCounter(int initial)
+        : stock_{initial}
+    {
+    }
+
+    bool try_take(int count)
+    {
+        if (count <= 0) {
+            return false;
+        }
+
+        int current = this->stock_.load();
+        while (current >= count) {
+            const int desired = current - count;
+            if (this->stock_.compare_exchange_weak(current, desired)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+private:
+    std::atomic<int> stock_;
+};
+\end{lstlisting}
+
+关键点在 \code{compare_exchange_weak} 失败后会更新 \code{current}。所以循环不需要手动再 \code{load} 一次；它拿到最新观察值后重新判断 \code{current >= count}。如果另一个线程已经把库存扣到不足，本线程自然返回失败。
+
+这个版本只适合单个整数不变量。如果扣减还要同时写订单记录、限制每个用户购买数量、更新多个仓库，互斥量会更清楚。
+
+\section{relaxed 统计和发布数据不是一回事}
+
+请求计数可以用 relaxed：
+
+\begin{lstlisting}[language=C++,caption={统计计数不发布其他数据}]
+requests.fetch_add(1, std::memory_order_relaxed);
+\end{lstlisting}
+
+因为它只回答“发生了多少次”，不要求看到其他内存写入。但下面这个模式不能用 relaxed 当同步：
+
+\begin{lstlisting}[language=C++,caption={标志发布数据需要同步关系}]
+payload = build_payload();
+ready.store(true, std::memory_order_release);
+\end{lstlisting}
+
+消费者：
+
+\begin{lstlisting}[language=C++,caption={读取标志后使用数据}]
+if (ready.load(std::memory_order_acquire)) {
+    use(payload);
+}
+\end{lstlisting}
+
+这里 \code{ready} 不只是布尔值，它还是“payload 已经写好”的发布证据。release/acquire 的意义就是让消费者看到 \code{ready} 为真时，也能看到发布前对 \code{payload} 的写入。把这类标志写成 relaxed，就切断了证据链。
+
+\section{atomic 不能让复合对象自动安全}
+
+两个 atomic 字段仍然可能产生不一致快照：
+
+\begin{lstlisting}[language=C++,caption={两个 atomic 字段不能自动组成事务}]
+std::atomic<int> x{0};
+std::atomic<int> y{0};
+\end{lstlisting}
+
+线程 A 写 \code{x=1} 再写 \code{y=1}，线程 B 可能读到 \code{x=1, y=0}。这不是数据竞争，但可能违反业务语义。如果业务要求两个字段一起变化，就需要锁、版本号协议，或把状态编码进一个原子对象。不要把“没有数据竞争”误认为“业务状态一致”。
+
+\section{内存序选择流程}
+
+入门阶段可以按这个流程：
+
+\begin{enumerate}
+  \item 能不用共享就不用共享。
+  \item 共享的是一组状态和不变量时，优先用 mutex。
+  \item 共享的是单个计数、标志或指针，并且协议很小，再考虑 atomic。
+  \item 默认先用顺序一致。
+  \item 只有测量证明需要，并且能写出 release/acquire 或 relaxed 的证据链，才降低内存序。
+\end{enumerate}
+
+这个流程保守，但能让项目活下来。无锁代码的价值在极少数热点路径里很大，但它的证明成本、测试成本和维护成本也很高。

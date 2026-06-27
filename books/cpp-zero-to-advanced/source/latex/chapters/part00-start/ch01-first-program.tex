@@ -253,3 +253,147 @@ assert(single->average == 88.0);
 \begin{exercisebox}
 把成绩限制为 \code{0} 到 \code{100}。不要在统计函数里偷偷忽略非法值，而是设计一个读取或校验阶段，让非法输入能被明确报告。完成后再给空输入、负数、超过 \code{100}、单元素和普通多元素各写一个测试。
 \end{exercisebox}
+
+\section{从需求合同推到代码形状}
+
+CPU 卷讲程序时会先建立“账本”：输入是什么，状态是什么，输出是什么，失败怎么记录。这个成绩统计程序也应当这样学。不要一上来写循环，先写合同：
+
+\begin{longtable}{p{0.22\linewidth}p{0.66\linewidth}}
+\toprule
+项目 & 合同 \\
+\midrule
+输入 & 零个或多个整数成绩，允许空白分隔 \\
+合法范围 & 每个成绩必须在 \code{0} 到 \code{100} 之间 \\
+成功输出 & 人数、总分、最小值、最大值、平均值 \\
+空输入 & 没有统计结果，不能伪装成平均值 \code{0} \\
+非法输入 & 明确报告第几个 token 或哪一行有问题 \\
+核心逻辑 & 不依赖终端，不直接读写文件，便于测试 \\
+\bottomrule
+\end{longtable}
+
+合同写完后，代码形状就不是凭感觉决定的。读入阶段负责把文本变成整数并校验范围；统计阶段只接收已经合法的整数；输出阶段把结果变成人能读的文本。这样拆开后，任何一个阶段出错，都能知道该改哪里。
+
+\section{错误版本为什么危险}
+
+很多入门代码会这样处理非法输入：
+
+\begin{lstlisting}[language=C++,caption={静默跳过坏数据的危险版本}]
+std::vector<int> read_scores()
+{
+    std::vector<int> scores;
+    int value = 0;
+    while (std::cin >> value) {
+        if (value >= 0 && value <= 100) {
+            scores.push_back(value);
+        }
+    }
+    return scores;
+}
+\end{lstlisting}
+
+它的问题不是语法，而是业务语义：如果输入是 \code{90 -1 100}，程序会悄悄统计 \code{90} 和 \code{100}。用户以为三条数据都参与了统计，结果却被吞掉一条。对于学习者来说，这种代码尤其坏，因为它把“数据不合法”变成了“看似成功”。更好的接口要能表达读取失败：
+
+\begin{lstlisting}[language=C++,caption={读取结果显式表达失败}]
+struct ReadError {
+    std::string token;
+    std::string message;
+};
+
+struct ReadScoresResult {
+    std::vector<int> scores;
+    std::optional<ReadError> error;
+};
+\end{lstlisting}
+
+有了这个类型，调用者必须面对两种情况：要么拿到合法成绩列表，要么拿到错误。入门阶段先用这种简单结果类型，后续可以换成 \code{std::expected} 或项目自己的错误模型。
+
+\section{把输入解析也做成可测试核心}
+
+为了测试方便，读取函数不要直接绑死 \code{std::cin}。它可以接收任意输入流：
+
+\begin{lstlisting}[language=C++,caption={从输入流读取并校验成绩}]
+constexpr int SCORE_MIN = 0;
+constexpr int SCORE_MAX = 100;
+
+ReadScoresResult read_scores(std::istream& input)
+{
+    ReadScoresResult result;
+    std::string token;
+    while (input >> token) {
+        const std::optional<int> parsed = parse_int_fast(token);
+        if (!parsed.has_value()) {
+            return {.error = ReadError{.token = token,
+                                       .message = "score must be an integer"}};
+        }
+        if (*parsed < SCORE_MIN || *parsed > SCORE_MAX) {
+            return {.error = ReadError{.token = token,
+                                       .message = "score must be 0..100"}};
+        }
+        result.scores.push_back(*parsed);
+    }
+    return result;
+}
+\end{lstlisting}
+
+这个函数仍然简单，但它已经有工程味道：输入来源被抽象成 \code{std::istream&}，范围常量有名字，错误带着原始 token。现在测试非法文本时，不需要在终端手动输入：
+
+\begin{lstlisting}[language=C++,caption={用字符串流测试读取阶段}]
+std::istringstream input{"90 abc 100"};
+const ReadScoresResult result = read_scores(input);
+assert(result.error.has_value());
+assert(result.error->token == "abc");
+\end{lstlisting}
+
+这就是“从零”阶段最该建立的能力：把看似只能手动试的程序，拆成可以自动验证的函数。
+
+\section{从样例推到测试矩阵}
+
+一个案例讲细，不是只给一组样例。要把边界列成矩阵：
+
+\begin{longtable}{p{0.25\linewidth}p{0.3\linewidth}p{0.35\linewidth}}
+\toprule
+场景 & 输入 & 期望 \\
+\midrule
+空输入 & 空字符串 & 统计阶段返回无结果 \\
+单个成绩 & \code{88} & 最小、最大、平均都为 \code{88} \\
+普通成绩 & \code{90 80 100} & 人数 \code{3}，平均 \code{90.0} \\
+非法文本 & \code{90 abc} & 读取阶段报整数错误 \\
+范围过小 & \code{-1} & 读取阶段报范围错误 \\
+范围过大 & \code{101} & 读取阶段报范围错误 \\
+小数文本 & \code{99.5} & 如果合同只收整数，应报错 \\
+\bottomrule
+\end{longtable}
+
+这个矩阵能反推实现。如果 \code{99.5} 被 \code{std::stoi} 解析成 \code{99}，说明数字解析没有检查完整消费；如果空输入输出平均值 \code{0}，说明统计接口把“无数据”和“真实为零”混淆了。
+
+\section{主程序最后才组装}
+
+当读取和统计都可测试后，\code{main} 才负责组装：
+
+\begin{lstlisting}[language=C++,caption={主程序只连接阶段}]
+int run(std::istream& input, std::ostream& output, std::ostream& error)
+{
+    const ReadScoresResult read = read_scores(input);
+    if (read.error.has_value()) {
+        error << read.error->message << ": " << read.error->token << '\n';
+        return 2;
+    }
+
+    const std::optional<ScoreSummary> summary = summarize_scores(read.scores);
+    if (!summary.has_value()) {
+        error << "no scores\n";
+        return 1;
+    }
+
+    output << "count: " << summary->count << '\n';
+    output << "sum: " << summary->sum << '\n';
+    output << "average: " << summary->average << '\n';
+    return 0;
+}
+\end{lstlisting}
+
+这段代码的价值是边界清晰：\code{run} 可以在测试里传 \code{std::istringstream} 和 \code{std::ostringstream}，真正的 \code{main} 只需要把 \code{std::cin}、\code{std::cout}、\code{std::cerr} 传进去。以后换成文件输入、网络输入或图形界面，核心统计逻辑都不用重写。
+
+\begin{exercisebox}
+把本章程序改成“每行一个学生，格式为姓名和成绩”。要求错误消息带行号；统计仍然只统计合法成绩；姓名不能为空。先写测试矩阵，再改代码。不要让 \code{main} 直接承担解析细节。
+\end{exercisebox}

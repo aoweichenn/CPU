@@ -163,3 +163,93 @@ std::vector<std::pair<int, int>> top_scores(const Scores& scores)
 \begin{exercisebox}
 给 \code{deduplicate_keep_order} 写三组测试：全重复、全不重复、混合重复。再把 \code{unordered_set} 去掉，手写朴素版本，对比两者在 \code{1000}、\code{10000}、\code{100000} 个随机 ID 下的运行时间。
 \end{exercisebox}
+
+\section{从需求字段推导容器组合}
+
+容器选择不能只背“vector 快、map 有序”。先把需求字段列出来。去重并保持顺序这个问题有两条互相独立的需求：第一，能快速判断一个 ID 是否已经出现；第二，输出按第一次出现的顺序排列。单个容器很难同时把这两条都表达得最好。
+
+\begin{longtable}{p{0.24\linewidth}p{0.28\linewidth}p{0.38\linewidth}}
+\toprule
+需求字段 & 合适结构 & 原因 \\
+\midrule
+快速判断出现过 & \code{std::unordered_set} & 平均常数时间查询和插入 \\
+保留第一次出现顺序 & \code{std::vector} & 追加顺序就是输出顺序 \\
+输出结果连续存放 & \code{std::vector} & 方便遍历、返回和测试 \\
+\bottomrule
+\end{longtable}
+
+这样得到的解法不是“用了高级容器”，而是两个容器各自负责一个需求字段。以后做 LRU 缓存，会看到类似组合：哈希表负责按 key 找节点，链表负责维护最近使用顺序。
+
+\section{地址稳定不是小细节}
+
+如果代码保存了容器元素的地址，容器选择就进入另一个层次。看一个任务队列索引：
+
+\begin{lstlisting}[language=C++,caption={保存 vector 元素指针的风险}]
+std::vector<Task> tasks;
+tasks.push_back(Task{.id = 1});
+Task* first = &tasks[0];
+tasks.push_back(Task{.id = 2});
+first->done = true; // 如果扩容发生，first 可能已经失效
+\end{lstlisting}
+
+这不是 \code{vector} 的缺点，而是它的合同：为了保持连续存储，扩容时可以搬走所有元素。你要的是遍历快和紧凑内存，就接受地址可能变化；你要的是节点地址稳定，就选择别的结构或保存索引而不是指针。
+
+一个实用替代是保存下标：
+
+\begin{lstlisting}[language=C++,caption={保存下标而不是元素指针}]
+std::size_t first_index = 0;
+tasks.push_back(Task{.id = 2});
+tasks[first_index].done = true;
+\end{lstlisting}
+
+下标也不是永远安全：如果删除或重排元素，它指向的逻辑任务可能变化。但它不会因为扩容变成悬空地址。容器合同要和修改操作一起看。
+
+\section{rehash 也会改变迭代环境}
+
+\code{unordered_map} 平均查找快，但插入很多元素时可能 rehash。rehash 会重新组织桶，迭代器会失效。假设你一边遍历一边插入：
+
+\begin{lstlisting}[language=C++,caption={遍历哈希表时插入要小心}]
+for (auto it = counts.begin(); it != counts.end(); ++it) {
+    counts[new_key()] += 1; // 可能 rehash，使 it 失效
+}
+\end{lstlisting}
+
+这类代码危险，因为循环变量本身可能被插入操作破坏。常见修复是先收集要插入的内容，遍历结束后统一插入；或者在已知规模时提前 \code{reserve}，并确认仍不违反容器规则。不要凭“我这次测试没崩”判断安全。
+
+\section{erase 循环要让容器返回下一个位置}
+
+删除元素时，迭代器推进规则也要严格。错误版本：
+
+\begin{lstlisting}[language=C++,caption={删除后继续使用失效迭代器}]
+for (auto it = values.begin(); it != values.end(); ++it) {
+    if (*it < 0) {
+        values.erase(it);
+    }
+}
+\end{lstlisting}
+
+\code{erase} 后 \code{it} 已经失效，循环末尾的 \code{++it} 不可靠。正确版本使用返回值：
+
+\begin{lstlisting}[language=C++,caption={erase 返回下一个有效位置}]
+for (auto it = values.begin(); it != values.end();) {
+    if (*it < 0) {
+        it = values.erase(it);
+    } else {
+        ++it;
+    }
+}
+\end{lstlisting}
+
+如果删除条件简单，优先使用 \code{std::erase_if}：
+
+\begin{lstlisting}[language=C++,caption={用标准库表达删除条件}]
+std::erase_if(values, [](int value) {
+    return value < 0;
+});
+\end{lstlisting}
+
+标准库算法不是为了炫技，而是把容易写错的迭代器协议封装成一个清晰意图。
+
+\section{本章验收：写出容器账本}
+
+选择容器前写出四列：主要操作、顺序要求、地址稳定要求、规模。比如“十万个用户，按 ID 查找，偶尔输出按注册顺序排列”，很可能需要 \code{unordered_map} 加 \code{vector} 或在对象里保存注册序号。比如“几百个规则，按优先级顺序扫描”，简单 \code{vector} 可能比树和哈希都好。容器选择的高级感不来自名字，而来自你能说清楚每个合同。

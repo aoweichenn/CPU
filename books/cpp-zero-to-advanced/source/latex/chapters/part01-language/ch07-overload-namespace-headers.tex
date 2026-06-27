@@ -186,3 +186,110 @@ std::optional<AverageResult> average(std::span<const int> values);
 \begin{exercisebox}
 把成绩统计函数放进 \code{score} 命名空间，并拆成头文件、源文件、测试文件。要求头文件不包含 \code{iostream}，测试通过公开接口调用，不直接包含 \code{.cpp} 文件。
 \end{exercisebox}
+
+\section{头文件是编译依赖合同}
+
+头文件里的每个 \code{#include} 都会传播给所有包含它的源文件。假设 \code{statistics.hpp} 为了一个实现细节包含了 \code{<iostream>}，那么所有使用统计接口的文件都会间接依赖 I/O 头。小项目看不出来，大项目会变成编译时间和耦合问题。
+
+判断一个头文件该包含什么，可以问：公开声明是否需要这个类型的完整定义？例如：
+
+\begin{lstlisting}[language=C++,caption={公开接口需要 span 和 optional}]
+#include <optional>
+#include <span>
+
+std::optional<AverageResult> average(std::span<const int> values);
+\end{lstlisting}
+
+这里 \code{std::optional} 和 \code{std::span} 出现在函数签名里，头文件必须包含相应头。实现里才用到的 \code{numeric}、\code{algorithm}、\code{iostream} 应放到 \code{.cpp}。
+
+\section{前置声明不是万能省 include}
+
+有时可以用前置声明减少依赖：
+
+\begin{lstlisting}[language=C++,caption={类指针可以前置声明}]
+class Database;
+
+class UserRepository {
+public:
+    explicit UserRepository(Database& database);
+
+private:
+    Database& database_;
+};
+\end{lstlisting}
+
+因为这里只保存引用，不需要知道 \code{Database} 的大小。但如果成员是值对象，就必须有完整定义：
+
+\begin{lstlisting}[language=C++,caption={值成员需要完整定义}]
+class UserRepository {
+private:
+    Database database_; // 头文件必须知道 Database 大小
+};
+\end{lstlisting}
+
+前置声明是依赖管理工具，不是躲避 include 的魔法。用错会造成编译错误或更难懂的边界。
+
+\section{重载要避免语义漂移}
+
+同名重载应该共享同一概念。下面的接口就有语义漂移：
+
+\begin{lstlisting}[language=C++,caption={同名函数语义不一致}]
+void open(std::filesystem::path path);
+void open(int flags);
+\end{lstlisting}
+
+第一个像打开文件，第二个可能是打开功能开关。读者看到 \code{open(3)} 很难知道发生什么。更好的名字应当把概念分开：
+
+\begin{lstlisting}[language=C++,caption={不同概念用不同名字}]
+void open_file(const std::filesystem::path& path);
+void enable_features(FeatureFlags flags);
+\end{lstlisting}
+
+重载不是为了少起名，而是为了同一概念在不同输入形态下自然表达。面积函数的正方形和矩形可以共享 \code{area}；文件打开和功能开关不应该共享。
+
+\section{选项对象如何演进}
+
+连接函数如果一开始只有 host 和 port，用两个参数可以接受。但当参数增加到 TLS、超时、重试、代理时，选项对象更稳：
+
+\begin{lstlisting}[language=C++,caption={可演进的连接选项}]
+struct ConnectOptions {
+    std::string host;
+    int port = 80;
+    bool use_tls = false;
+    std::chrono::milliseconds timeout{3000};
+    int retry_count = 0;
+};
+\end{lstlisting}
+
+调用点更清楚：
+
+\begin{lstlisting}[language=C++,caption={具名字段调用}]
+connect(ConnectOptions{
+    .host = "example.com",
+    .port = 443,
+    .use_tls = true,
+    .timeout = std::chrono::seconds{5},
+});
+\end{lstlisting}
+
+这比 \code{connect("example.com", 443, true, 5000, 3)} 更不容易把参数顺序搞错。选项对象也方便以后增加字段，而不制造一堆相近重载。
+
+\section{拆库案例的构建边界}
+
+一个小数学库的 CMake 也应该体现边界：
+
+\begin{lstlisting}[language=cmake,caption={小库目标和测试目标}]
+add_library(mathlib src/statistics.cpp)
+target_compile_features(mathlib PUBLIC cxx_std_20)
+target_include_directories(mathlib PUBLIC include)
+
+add_executable(statistics_tests tests/statistics_tests.cpp)
+target_link_libraries(statistics_tests PRIVATE mathlib)
+add_test(NAME statistics_tests COMMAND statistics_tests)
+\end{lstlisting}
+
+测试链接库目标，而不是直接包含源文件。这样测试使用的路径和普通用户一致：都通过公开头文件和链接库访问。如果内部函数需要测试，可以考虑把它提升为公开的可测试小模块，或者通过公开行为间接覆盖，而不是破坏边界。
+
+\section{本章验收：依赖方向能画出来}
+
+完成一个模块后，应该能画出依赖方向：\code{main} 依赖应用层，应用层依赖库接口，库实现依赖标准库和内部细节，测试依赖公开接口。头文件越干净，依赖图越清楚。依赖图画不出来时，通常说明头文件、命名空间或模块边界已经混在一起。

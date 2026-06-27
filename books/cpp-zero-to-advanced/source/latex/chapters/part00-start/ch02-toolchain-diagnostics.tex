@@ -110,3 +110,122 @@ ctest --test-dir build --output-on-failure
 \begin{exercisebox}
 建立一个 \filepath{demo} 项目，实现 \code{sum(std::span<const int>)}。先故意不写 \code{-std=c++20}，观察错误；再加上标准选项。然后加入一个会触发 \code{-Wconversion} 的例子，写下警告真正提醒了什么风险。
 \end{exercisebox}
+
+\section{一次完整诊断演练}
+
+只讲“读第一条错误”还不够。我们做一个完整演练。源文件如下：
+
+\begin{lstlisting}[language=C++,caption={含有多类错误的实验程序}]
+#include <iostream>
+#include <vector>
+
+int total(std::vector<int> values)
+{
+    int sum = 0;
+    for (int value : values) {
+        sum += value;
+    }
+    return sum;
+}
+
+int main()
+{
+    std::vector<double> values{1.2, 2.8};
+    std::cout << total(values) << '\n';
+}
+\end{lstlisting}
+
+编译器会报类型不匹配：\code{total} 需要 \code{std::vector<int>}，调用者给的是 \code{std::vector<double>}。新手常问：“里面都是数字，为什么不能传？”因为 \code{std::vector<int>} 和 \code{std::vector<double>} 是两个不同类型的容器，不能自动把整组元素逐个转换。这个错误推动我们重新设计接口：如果函数只求和整数，就调用者必须给整数；如果函数应该支持多种数字类型，就要进入模板或 ranges 的设计，而不是期待容器自动变形。
+
+再看函数参数 \code{std::vector<int> values}。即使调用类型正确，这里也会复制整个容器。只观察时应该写成：
+
+\begin{lstlisting}[language=C++,caption={诊断后修正接口}]
+int total(std::span<const int> values)
+{
+    int sum = 0;
+    for (int value : values) {
+        sum += value;
+    }
+    return sum;
+}
+\end{lstlisting}
+
+同一次诊断里，我们同时看到了类型合同和性能合同。高质量读错误信息，不是把报错消掉就结束，而是追问接口是否表达了真实意图。
+
+\section{链接错误演练}
+
+再故意制造一个链接错误：
+
+\begin{lstlisting}[language=C++,caption={只有声明没有定义}]
+int multiply(int lhs, int rhs);
+
+int main()
+{
+    return multiply(6, 7);
+}
+\end{lstlisting}
+
+这段代码能编译成目标文件，因为编译器只需要知道 \code{multiply} 的声明就能检查调用。但链接时会失败，因为最终程序需要函数体。诊断链条是：
+
+\begin{enumerate}
+  \item 当前源文件语法和类型检查通过。
+  \item 目标文件里留下一个未解析符号。
+  \item 链接器找遍参与链接的目标文件和库，找不到实现。
+  \item 报告未定义引用。
+\end{enumerate}
+
+修复方法不是在调用点乱改，而是提供实现并确保实现文件参与构建：
+
+\begin{lstlisting}[language=C++,caption={提供函数定义}]
+int multiply(int lhs, int rhs)
+{
+    return lhs * rhs;
+}
+\end{lstlisting}
+
+当项目有多个源文件时，链接错误经常来自 CMake 漏加源文件、库链接顺序不对、声明和定义签名不一致。看到链接错误，先查“实现在哪里、有没有被编进目标”。
+
+\section{警告分级处理}
+
+不是所有警告严重程度相同，但都要分类。可以按四类处理：
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+类别 & 例子 & 处理 \\
+\midrule
+正确性风险 & 未初始化变量、悬空引用、符号比较混乱 & 立即修复 \\
+信息丢失 & 窄化转换、浮点到整数 & 明确业务意图，必要时显式转换 \\
+可维护性 & 未使用变量、遮蔽名字 & 删除或重命名 \\
+平台差异 & 类型宽度、格式化占位不匹配 & 用标准类型和正确格式 \\
+\bottomrule
+\end{longtable}
+
+如果某个警告确实是误报，也不要随手全局关闭。优先用更清楚的代码让警告消失；实在需要抑制，也应该局部、带原因。
+
+\section{最小复现能力}
+
+工程里遇到复杂错误时，要学会把问题缩到最小复现。最小复现不是把整项目发给别人，而是保留触发问题的最少文件、最少命令和最少输入。例如：
+
+\begin{lstlisting}[caption={最小复现记录}]
+compiler: g++ 13.2
+command: g++ -std=c++20 -Wall -Wextra main.cpp -o app
+input: empty file
+expected: report no scores
+actual: segmentation fault
+\end{lstlisting}
+
+这份记录能让别人快速进入同一现场。你自己调试时也一样：把不可控因素减到最少，错误才会暴露出真正形状。
+
+\section{工具链验收清单}
+
+进入后续章节前，你应该能独立完成：
+
+\begin{itemize}
+  \item 写出固定编译命令并解释每个选项。
+  \item 区分编译错误、链接错误、运行错误和警告。
+  \item 根据第一条自己文件路径定位错误位置。
+  \item 用 Debug 构建调试，用 Release 构建测性能。
+  \item 把复杂错误缩成可重复的最小复现。
+\end{itemize}
+
+这些能力比会背某个语法点更基础。不会诊断，写得越多，问题堆得越快。

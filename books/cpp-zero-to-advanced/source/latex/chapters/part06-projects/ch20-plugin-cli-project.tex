@@ -162,3 +162,152 @@ public:
 \begin{exercisebox}
 给 CLI 增加 \code{help} 命令。要求每个命令提供 \code{usage()}，\code{help} 能列出所有命令。思考注册表是否应该保留命令顺序；如果需要稳定顺序，应该增加什么数据结构？
 \end{exercisebox}
+
+\section{项目从目录结构开始}
+
+插件式 CLI 如果只停留在一个文件里，很快会变成大杂烩。一个可维护的最小目录可以这样安排：
+
+\begin{lstlisting}[caption={命令行工具目录结构}]
+src/
+  main.cpp
+  cli/
+    command.hpp
+    command_registry.hpp
+    dispatch.cpp
+  commands/
+    config_check_command.cpp
+    word_freq_command.cpp
+    file_index_command.cpp
+  app/
+    build_registry.cpp
+tests/
+  cli/
+    dispatch_tests.cpp
+  commands/
+    config_check_command_tests.cpp
+\end{lstlisting}
+
+\code{cli} 目录只放抽象接口和分发逻辑；\code{commands} 放具体命令；\code{app} 是装配层，知道要注册哪些命令；\code{main.cpp} 只连接系统入口。目录结构不是形式，它让依赖方向清楚：核心分发不依赖具体命令，具体命令依赖各自项目能力，装配层把它们拼起来。
+
+\section{注册表还需要顺序}
+
+前面的 \code{CommandRegistry} 用哈希表查找命令，适合分发。但 \code{help} 命令需要稳定列出命令。如果直接遍历 \code{unordered_map}，输出顺序不稳定。可以同时维护一个顺序数组：
+
+\begin{lstlisting}[language=C++,caption={同时支持查找和稳定顺序}]
+class CommandRegistry {
+public:
+    void add(std::unique_ptr<Command> command)
+    {
+        const std::string key{command->name()};
+        this->ordered_.push_back(command.get());
+        this->commands_[key] = std::move(command);
+    }
+
+    [[nodiscard]] std::span<Command* const> ordered() const noexcept
+    {
+        return this->ordered_;
+    }
+
+private:
+    std::unordered_map<std::string, std::unique_ptr<Command>> commands_;
+    std::vector<Command*> ordered_;
+};
+\end{lstlisting}
+
+这里 \code{commands_} 拥有对象，\code{ordered_} 只保存观察指针。这个设计成立的前提是：命令对象由 \code{unique_ptr} 管理，移动 \code{unique_ptr} 本身不会移动被拥有的命令对象；注册表析构时，两个成员一起销毁，外部不能长期保存 \code{ordered} 返回的指针。如果你觉得这个生命周期证明太绕，可以改成 \code{std::vector<std::string>} 保存命令名，用名字再查找，牺牲一点效率换更简单的所有权。
+
+\section{usage 是接口的一部分}
+
+为了支持 \code{help}，命令接口应扩展：
+
+\begin{lstlisting}[language=C++,caption={命令提供用法说明}]
+class Command {
+public:
+    virtual ~Command() = default;
+    [[nodiscard]] virtual std::string_view name() const noexcept = 0;
+    [[nodiscard]] virtual std::string_view usage() const noexcept = 0;
+    [[nodiscard]] virtual int run(std::span<const std::string_view> args,
+                                  CommandContext context) const = 0;
+};
+\end{lstlisting}
+
+然后 \code{HelpCommand} 可以依赖注册表的只读视图：
+
+\begin{lstlisting}[language=C++,caption={help 命令列出所有命令}]
+class HelpCommand final : public Command {
+public:
+    explicit HelpCommand(const CommandRegistry& registry)
+        : registry_{registry}
+    {
+    }
+
+    [[nodiscard]] std::string_view name() const noexcept override
+    {
+        return "help";
+    }
+
+    [[nodiscard]] std::string_view usage() const noexcept override
+    {
+        return "help";
+    }
+
+    [[nodiscard]] int run(std::span<const std::string_view>,
+                          CommandContext context) const override
+    {
+        for (const Command* command : this->registry_.ordered()) {
+            context.output << command->usage() << '\n';
+        }
+        return 0;
+    }
+
+private:
+    const CommandRegistry& registry_;
+};
+\end{lstlisting}
+
+这个版本引入了一个新生命周期要求：\code{HelpCommand} 引用的注册表必须比它活得久。如果 \code{HelpCommand} 本身也被放进注册表，就会形成自引用结构，设计要更谨慎。更简单的方案是让 \code{help} 不是普通命令，而是分发器内置逻辑。工程设计没有唯一答案，关键是把所有权和生命周期写清楚。
+
+\section{错误码合同}
+
+命令行工具的返回码也要统一：
+
+\begin{longtable}{p{0.18\linewidth}p{0.62\linewidth}}
+\toprule
+返回码 & 含义 \\
+\midrule
+\code{0} & 成功 \\
+\code{1} & 命令执行失败，例如文件不存在、配置非法 \\
+\code{2} & 用法错误，例如未知命令、参数缺失、参数格式错误 \\
+\bottomrule
+\end{longtable}
+
+有了这个合同，测试就能写得具体：
+
+\begin{lstlisting}[language=C++,caption={分发器错误码测试}]
+std::ostringstream output;
+std::ostringstream error;
+const int code = dispatch(registry, {}, CommandContext{output, error});
+assert(code == 2);
+assert(error.str().find("missing command") != std::string::npos);
+\end{lstlisting}
+
+返回码不是小事。脚本、CI 和其他程序都会依赖它判断工具是否成功。
+
+\section{从编译期插件到动态插件}
+
+本章的插件是编译期插件：所有命令在编译时链接进程序，只是在运行时通过注册表分发。它已经足够训练抽象边界。动态插件则是另一个项目：要考虑动态库加载、符号导出、ABI 稳定、版本协商、崩溃隔离和安全策略。不要把“可扩展”一上来理解成“必须加载动态库”。大多数内部 CLI 先做到编译期可扩展、测试清楚、错误码稳定，就已经很有价值。
+
+\section{项目验收清单}
+
+完成这个项目时，至少验收：
+
+\begin{itemize}
+  \item 缺命令返回 \code{2}，错误输出可读。
+  \item 未知命令返回 \code{2}，包含原始命令名。
+  \item 已知命令只收到自己的剩余参数。
+  \item 命令可以用假输出流测试，不依赖真实终端。
+  \item \code{help} 输出顺序稳定。
+  \item 新增命令只需要改装配层和测试，不需要改分发器。
+\end{itemize}
+
+如果这些都成立，这个 CLI 骨架就不只是“能跑”，而是能承受后续项目继续接入。

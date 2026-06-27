@@ -250,3 +250,129 @@ ConfigResult load_config_file(const std::filesystem::path& path)
 \begin{exercisebox}
 给配置加载器增加 \code{include=other.conf}。要求避免递归实现，使用显式队列或栈处理待加载文件，并检测重复包含。写清楚相对路径以哪个目录为基准。
 \end{exercisebox}
+
+\section{从一行配置推导解析边界}
+
+配置加载器看起来只是字符串切分，但边界很多。以这一行为例：
+
+\begin{lstlisting}[caption={带空白的配置行}]
+  port = 8080
+\end{lstlisting}
+
+解析步骤应该明确：
+
+\begin{enumerate}
+  \item 去掉整行首尾空白。
+  \item 如果为空或以 \code{#} 开头，返回无条目。
+  \item 查找第一个等号。
+  \item 等号左边 trim 成 key。
+  \item 等号右边 trim 成 value。
+  \item key 不能为空。
+\end{enumerate}
+
+这六步就是 \code{parse_config_line} 的合同。不要在同一个函数里顺手解析端口范围、打开 include 文件、构造业务对象。单行解析只负责行格式，业务校验交给下一层。
+
+\section{重复 key 规则要可见}
+
+本项目选择“后者覆盖前者”。这条规则不能只靠 \code{unordered_map} 的赋值行为隐藏起来。可以显式记录警告：
+
+\begin{lstlisting}[language=C++,caption={合并配置条目并记录覆盖}]
+struct MergeWarning {
+    std::string key;
+    int previous_line = 0;
+    int new_line = 0;
+};
+
+struct RawConfigValue {
+    std::string value;
+    int line = 0;
+};
+
+using RawConfig = std::unordered_map<std::string, RawConfigValue>;
+\end{lstlisting}
+
+合并时：
+
+\begin{lstlisting}[language=C++,caption={重复 key 后者覆盖}]
+void merge_entry(RawConfig& config,
+                 std::vector<MergeWarning>& warnings,
+                 ConfigEntry entry,
+                 int line)
+{
+    if (const auto found = config.find(entry.key); found != config.end()) {
+        warnings.push_back(MergeWarning{.key = entry.key,
+                                        .previous_line = found->second.line,
+                                        .new_line = line});
+    }
+    config[entry.key] = RawConfigValue{.value = std::move(entry.value),
+                                       .line = line};
+}
+\end{lstlisting}
+
+现在覆盖行为是项目规则，不是容器偶然效果。用户也能看到“第几行覆盖了第几行”。
+
+\section{错误对象要服务调用者}
+
+配置错误要能被 CLI 打印，也能被测试断言。错误对象至少包含 kind、line、key、message。测试不要只断言“失败了”，而要断言失败类型：
+
+\begin{lstlisting}[language=C++,caption={配置错误测试关注类型和上下文}]
+const ConfigResult result = load_config_text("port=abc\n");
+assert(result.error.has_value());
+assert(result.error->kind == ConfigErrorKind::invalid_value);
+assert(result.error->key == "port");
+\end{lstlisting}
+
+这样未来修改错误文本时，测试不会因为文案微调全部失败；但错误类型和 key 改错时，测试能挡住。
+
+\section{include 支持的显式栈}
+
+扩展 \code{include=other.conf} 时，不要用递归函数无限调用自己。用显式栈或队列更容易控制深度和重复包含：
+
+\begin{lstlisting}[language=C++,caption={用显式栈处理 include}]
+std::vector<std::filesystem::path> pending;
+std::unordered_set<std::string> visited;
+pending.push_back(root_path);
+
+while (!pending.empty()) {
+    const std::filesystem::path current = pending.back();
+    pending.pop_back();
+
+    const std::string canonical = canonical_key(current);
+    if (!visited.insert(canonical).second) {
+        continue;
+    }
+
+    RawConfigResult parsed = parse_one_file(current);
+    if (parsed.error.has_value()) {
+        return {.error = parsed.error};
+    }
+    for (const std::filesystem::path& include : parsed.includes) {
+        pending.push_back(resolve_include(current.parent_path(), include));
+    }
+}
+\end{lstlisting}
+
+这里的关键规则是：相对 include 以当前配置文件所在目录为基准；已访问文件不再重复加载；错误带着当前文件和行号。显式栈让这些规则都能被测试。
+
+\section{配置加载器验收矩阵}
+
+项目验收不要只跑一个正常配置。至少覆盖：
+
+\begin{longtable}{p{0.34\linewidth}p{0.44\linewidth}}
+\toprule
+场景 & 期望 \\
+\midrule
+空文件 & 缺少必填项错误 \\
+注释和空行 & 被忽略 \\
+缺少等号 & invalid line，带行号 \\
+空 key & invalid line，带行号 \\
+重复 key & 后者覆盖，产生警告 \\
+port 不是数字 & invalid value，key 为 \code{port} \\
+port 越界 & invalid value \\
+workers 缺失 & 使用默认值 \code{1} \\
+非法 log level & invalid value，key 为 \code{log_level} \\
+include 循环 & 不死循环，规则明确 \\
+\bottomrule
+\end{longtable}
+
+有了这个矩阵，配置加载器才像一个可以交给别人用的小工具，而不是演示字符串切分的片段。

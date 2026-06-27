@@ -158,3 +158,112 @@ bool should_retry(ErrorKind error, int attempts)
 \begin{exercisebox}
 把一个复杂 \code{if} 条件拆成三个具名布尔变量。要求变量名表达业务含义，而不是 \code{a}、\code{b}、\code{flag1}。然后给每个条件组合写测试，确认拆分没有改变行为。
 \end{exercisebox}
+
+\section{表达式要能被审查}
+
+复杂表达式最大的问题是审查困难。看一个文件过滤条件：
+
+\begin{lstlisting}[language=C++,caption={难以审查的文件过滤条件}]
+if (!path.empty() && path.extension() == ".log" && size > 0 &&
+    size < max_size || include_empty && path.extension() == ".txt") {
+    process(path);
+}
+\end{lstlisting}
+
+读者必须同时记住优先级：\code{&&} 高于 \code{||}。但业务上真正想表达的可能是：处理非空日志文件，或者在允许空文件时处理文本文件。把它拆成名字：
+
+\begin{lstlisting}[language=C++,caption={用名字表达业务条件}]
+const bool is_log_file = path.extension() == ".log";
+const bool is_text_file = path.extension() == ".txt";
+const bool has_allowed_size = size > 0 && size < max_size;
+const bool can_process_log = is_log_file && has_allowed_size;
+const bool can_process_empty_text = include_empty && is_text_file;
+
+if (!path.empty() && (can_process_log || can_process_empty_text)) {
+    process(path);
+}
+\end{lstlisting}
+
+拆开后，审查者能逐个检查业务名是否对应实现。括号也让组合关系不依赖读者背优先级。高质量表达式不是最短，而是能被别人可靠审查。
+
+\section{短路求值不能隐藏副作用}
+
+\code{&&} 和 \code{||} 有短路求值：左边已经决定结果时，右边不会执行。这对空指针检查很有用：
+
+\begin{lstlisting}[language=C++,caption={短路保护指针解引用}]
+if (user != nullptr && user->active) {
+    send_message(*user);
+}
+\end{lstlisting}
+
+但不要把副作用藏在右侧：
+
+\begin{lstlisting}[language=C++,caption={短路隐藏副作用}]
+if (ready || load_cache()) {
+    use_cache();
+}
+\end{lstlisting}
+
+这里 \code{load_cache()} 是否执行取决于 \code{ready}。如果它只是查询还好，如果它会修改全局缓存或写日志，读者很难从条件表达式看出状态变化。更清楚的写法是先显式处理：
+
+\begin{lstlisting}[language=C++,caption={把副作用变成步骤}]
+if (!ready) {
+    ready = load_cache();
+}
+if (ready) {
+    use_cache();
+}
+\end{lstlisting}
+
+这就是本章的主线：会改变状态的动作应当像步骤，而不是藏在条件里。
+
+\section{常量命名要表达领域}
+
+常量不是把数字换成大写就结束。比较两个名字：
+
+\begin{lstlisting}[language=C++,caption={弱常量名}]
+constexpr int MAX = 3;
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption={带领域的常量名}]
+constexpr int RETRY_MAX_ATTEMPTS = 3;
+\end{lstlisting}
+
+第二个名字告诉读者这是重试次数上限，不是数组长度、端口数量或线程数。大型项目里常量很多，名字必须带上下文。对于本书里的练习，也要从一开始养成这个习惯。
+
+\section{switch 的遗漏要让编译器发现}
+
+前面说不要随便写 \code{default}。再展开一点。假设枚举新增了状态：
+
+\begin{lstlisting}[language=C++,caption={新增状态}]
+enum class ConnectionState {
+    closed,
+    connecting,
+    open,
+    failed,
+};
+\end{lstlisting}
+
+如果原来的 \code{switch} 没有 \code{default}，并开启警告，编译器更容易提醒 \code{failed} 没处理。如果你写了 \code{default: return "unknown";}，新增状态可能悄悄走默认路径，测试没覆盖就漏掉。对封闭枚举，显式处理所有枚举值通常更好；对真正来自外部的不可信整数，才需要默认错误路径。
+
+\section{重试策略推导到测试}
+
+重试策略的测试可以直接从业务表推导：
+
+\begin{longtable}{p{0.26\linewidth}p{0.22\linewidth}p{0.22\linewidth}p{0.18\linewidth}}
+\toprule
+错误 & 已尝试次数 & 上限 & 是否重试 \\
+\midrule
+\code{none} & \code{0} & \code{3} & 否 \\
+\code{permanent_failure} & \code{0} & \code{3} & 否 \\
+\code{temporary_failure} & \code{0} & \code{3} & 是 \\
+\code{temporary_failure} & \code{2} & \code{3} & 是 \\
+\code{temporary_failure} & \code{3} & \code{3} & 否 \\
+\bottomrule
+\end{longtable}
+
+这个表比“测一下 \code{should_retry}”更具体。它让你看到边界在 \code{attempts < RETRY_MAX_ATTEMPTS}，不是 \code{<=}。很多 off-by-one 错误都能通过这种表提前发现。
+
+\section{本章验收：减少读者脑内执行}
+
+表达式、作用域和常量的共同目标，是减少读者在脑子里模拟程序的负担。变量靠近使用点，状态改变单独成句，业务条件有名字，数字有身份，枚举状态被穷尽处理。做到这些，代码才容易审查、调试和修改。

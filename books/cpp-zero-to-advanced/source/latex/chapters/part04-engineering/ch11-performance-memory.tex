@@ -201,3 +201,90 @@ void measure_many(std::string_view name, Func func)
 \begin{exercisebox}
 实现两个版本的字符串拼接：一个不 \code{reserve}，一个先计算总长度再 \code{reserve}。用 Release 构建分别测试 \code{100}、\code{10000}、\code{100000} 个片段。记录时间和输出长度，确认优化没有改变结果。
 \end{exercisebox}
+
+\section{性能事故要先写观察记录}
+
+性能问题不能只说“感觉慢”。假设一个日志导出工具在测试数据上只跑一秒，到生产的一百万行日志上跑了两分钟。第一步不是马上改成多线程，而是写观察记录：
+
+\begin{longtable}{p{0.24\linewidth}p{0.64\linewidth}}
+\toprule
+字段 & 记录 \\
+\midrule
+输入规模 & 行数、平均每行字段数、总字节数 \\
+构建模式 & Debug 还是 Release，优化选项是什么 \\
+指标 & 总耗时、峰值内存、分配次数、输出大小 \\
+环境 & 机器型号、磁盘类型、是否写终端 \\
+正确性 & 优化前后输出是否字节级一致 \\
+\bottomrule
+\end{longtable}
+
+这张表的作用是防止把问题想歪。很多“字符串慢”其实是终端输出慢，很多“算法慢”其实是 Debug 构建慢，很多“多线程能解决”其实被磁盘 I/O 限制。没有观察记录，优化就只是猜谜。
+
+\section{把字符串拼接拆成分配账本}
+
+再看 \code{build_line}。它的热路径不是 \code{for} 这个语法，而是容量变化。可以为它写分配账本：
+
+\begin{itemize}
+  \item 初始容量可能很小。
+  \item 每追加一个片段都检查容量。
+  \item 容量不足时申请新缓冲区。
+  \item 旧内容复制到新缓冲区。
+  \item 旧缓冲区释放。
+\end{itemize}
+
+如果最终输出长度是十几 MB，这个账本里的“旧内容复制”可能重复发生多次。预先计算总长度后 \code{reserve}，就是把多次扩容尽量变成一次扩容。这个优化的好处是局部、可解释、容易验证；坏处是需要先扫一遍输入。对于内存中的字符串片段，额外一遍扫描通常很便宜；对于流式输入，可能就不能这样做。
+
+\section{Release 构建和 Debug 构建不是一回事}
+
+测性能时，Debug 构建经常完全不可信。标准库迭代器检查、未优化函数调用、断言和调试符号都会改变结果。至少用这样的命令做一个 Release 版本：
+
+\begin{lstlisting}[language=bash,caption={用优化构建测量样本}]
+g++ -std=c++20 -O2 -DNDEBUG bench.cpp -o bench
+./bench
+\end{lstlisting}
+
+如果项目使用 CMake，则固定构建类型：
+
+\begin{lstlisting}[language=bash,caption={CMake Release 构建}]
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+./build-release/bench
+\end{lstlisting}
+
+测量报告里必须写清构建模式。否则“优化前后快了三倍”可能只是一次用 Debug、一次用 Release。
+
+\section{优化后也要防回归}
+
+性能优化不能只跑一次手工命令。至少要给正确性加测试，给性能留下可重复脚本。比如字符串拼接可以先验证输出完全一致：
+
+\begin{lstlisting}[language=C++,caption={优化前后结果必须一致}]
+const std::vector<std::string> parts = make_parts(1000);
+assert(build_line(parts) == build_line_reserved(parts));
+\end{lstlisting}
+
+然后性能脚本输出机器可读的记录：
+
+\begin{lstlisting}[caption={性能记录示例}]
+case=reserved parts=100000 bytes=1200000 micros=8300 checksum=1200000
+case=plain parts=100000 bytes=1200000 micros=46200 checksum=1200000
+\end{lstlisting}
+
+有了这些字段，下次改代码时才能判断是输入变了、机器变了，还是性能真的回退。高质量优化的标准不是写了更底层的代码，而是改动有证据、结果可复现、正确性没变。
+
+\section{内存布局案例：对象数组还是指针数组}
+
+假设要处理一百万个点。两个表示都能工作：
+
+\begin{lstlisting}[language=C++,caption={连续对象数组}]
+std::vector<Point> points;
+\end{lstlisting}
+
+\begin{lstlisting}[language=C++,caption={指针数组}]
+std::vector<std::unique_ptr<Point>> points;
+\end{lstlisting}
+
+如果只是批量求和坐标，第一种通常更合适：对象连续存放，遍历时内存访问可预测。第二种每个点单独分配，遍历时先读指针，再跳到对象地址，缓存局部性更差，还增加分配和释放成本。第二种不是永远错；如果对象需要多态、稳定地址、独立生命周期，它可能合理。但仅仅为了“对象很大”就把所有东西放到堆上，通常会让内存访问更差。
+
+\begin{keyidea}
+性能推理要同时看算法复杂度、分配次数、内存局部性和接口语义。只看一个维度，容易把代码优化到错误方向。
+\end{keyidea}

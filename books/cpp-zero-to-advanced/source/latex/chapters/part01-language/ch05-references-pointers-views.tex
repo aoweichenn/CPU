@@ -171,3 +171,127 @@ bool is_valid_username(std::string_view name)
 \begin{exercisebox}
 实现 \code{trim(std::string_view text)}，返回去掉首尾空白后的 \code{std::string_view}。要求不分配新字符串。写测试覆盖空字符串、全空白、无空白、只有左空白、只有右空白。然后回答：返回的视图依赖谁的生命周期？
 \end{exercisebox}
+
+\section{生命周期事故账本}
+
+引用、指针和视图之所以难，不是因为符号多，而是因为它们把“访问入口”和“对象生命”分开了。CPU 卷会为并发事故列事件链；这里也给生命周期列账本。看这个函数：
+
+\begin{lstlisting}[language=C++,caption={返回悬空字符串视图}]
+std::string_view make_label()
+{
+    std::string text = "score";
+    return std::string_view{text};
+}
+\end{lstlisting}
+
+事件链如下：
+
+\begin{longtable}{p{0.16\linewidth}p{0.36\linewidth}p{0.38\linewidth}}
+\toprule
+时刻 & 发生了什么 & 证据 \\
+\midrule
+进入函数 & 创建局部 \code{text} & \code{std::string} 拥有字符缓冲区 \\
+返回语句 & 创建 \code{string_view} & 视图只保存地址和长度，不拥有字符 \\
+函数结束 & \code{text} 析构 & 字符缓冲区被释放 \\
+调用者使用返回值 & 视图仍保存旧地址 & 地址已经不再指向有效字符串对象 \\
+\bottomrule
+\end{longtable}
+
+这个表比一句“不要返回局部变量视图”更重要。它告诉你错误发生在哪个边界：返回值本身还活着，但它借看的底层对象死了。以后判断 \code{std::span}、\code{std::string_view}、裸指针、引用时，都按这个账本走。
+
+\section{接口身份：观察、修改、拥有、可缺失}
+
+同一个 \code{User} 对象可以有四种完全不同的接口：
+
+\begin{lstlisting}[language=C++,caption={同一个对象的四种接口身份}]
+void print_user(const User& user);
+void rename_user(User& user, std::string new_name);
+void store_user(std::unique_ptr<User> user);
+void maybe_print_user(const User* user);
+\end{lstlisting}
+
+\code{print_user} 要求对象必定存在，只观察；\code{rename_user} 要求对象必定存在，并会修改；\code{store_user} 接管所有权；\code{maybe_print_user} 允许没有对象。函数签名就是调用合同。不要把这四种关系都写成 \code{User*}，否则调用者只能靠注释猜：能不能为空？会不会删除？会不会保存？
+
+一个常见坏接口如下：
+
+\begin{lstlisting}[language=C++,caption={含义不清的裸指针接口}]
+void process(User* user);
+\end{lstlisting}
+
+它至少有四种解释：可能为空、必定不为空、只观察、会修改、甚至可能保存指针到以后用。这样的接口会把风险推给调用者。改接口时先说清楚身份，再选参数形态。
+
+\section{视图不能越过拥有者的改变}
+
+\code{std::span} 和 \code{std::string_view} 还会被“底层容器改变”影响。看这个例子：
+
+\begin{lstlisting}[language=C++,caption={vector 扩容后 span 可能失效}]
+std::vector<int> values{1, 2, 3};
+std::span<int> view{values};
+values.push_back(4); // 可能扩容
+view[0] = 10;        // 如果扩容发生，view 可能悬空
+\end{lstlisting}
+
+问题不在 \code{span} 自己。它只是忠实保存了原来那段连续内存的地址和长度。真正改变的是 \code{vector}：尾部追加时如果容量不足，\code{vector} 会申请新内存，把元素搬过去，释放旧内存。旧地址不再属于当前元素，视图就失效了。
+
+所以视图适合短时间传参，不适合长期保存。尤其不要在类成员里保存 \code{std::span} 或 \code{std::string_view}，除非类的文档和构造方式能严格保证底层对象活得更久，并且不会发生破坏地址稳定性的修改。
+
+\section{完整案例：不分配的 trim}
+
+前面的练习现在展开讲。需求是去掉字符串首尾空白，不分配新字符串，返回原文本中的一段视图。先写合同：
+
+\begin{itemize}
+  \item 输入视图只被观察，不被修改。
+  \item 返回视图借用同一段底层字符。
+  \item 空字符串和全空白字符串都返回空视图。
+  \item 调用者必须保证原字符串在返回视图使用期间仍然有效。
+\end{itemize}
+
+实现如下：
+
+\begin{lstlisting}[language=C++,caption={返回子串视图的 trim}]
+bool is_space(unsigned char ch)
+{
+    return std::isspace(ch) != 0;
+}
+
+std::string_view trim(std::string_view text)
+{
+    std::size_t first = 0;
+    while (first < text.size() &&
+           is_space(static_cast<unsigned char>(text[first]))) {
+        ++first;
+    }
+
+    std::size_t last = text.size();
+    while (last > first &&
+           is_space(static_cast<unsigned char>(text[last - 1]))) {
+        --last;
+    }
+
+    return text.substr(first, last - first);
+}
+\end{lstlisting}
+
+为什么这里不用 \code{std::string} 返回？因为需求明确“不分配”，且返回内容是输入的一段。为什么 \code{is_space} 接收 \code{unsigned char}？因为字符分类函数对负的 \code{char} 值不安全。一个小工具函数，仍然能体现生命周期、类型和边界。
+
+\section{trim 的反例测试}
+
+这个函数的测试不应该只有 \code{" abc "}。至少要覆盖：
+
+\begin{lstlisting}[language=C++,caption={trim 的边界测试}]
+assert(trim("") == "");
+assert(trim("   ") == "");
+assert(trim("abc") == "abc");
+assert(trim("  abc") == "abc");
+assert(trim("abc  ") == "abc");
+assert(trim("  abc  def  ") == "abc  def");
+\end{lstlisting}
+
+再写一个不能做的调用：
+
+\begin{lstlisting}[language=C++,caption={不要保存临时字符串的 trim 结果}]
+std::string_view bad = trim(std::string{"  Ada  "});
+// 这一行之后临时 string 已销毁，bad 悬空
+\end{lstlisting}
+
+看到这个反例，就能理解为什么“函数返回 \code{string_view}”不是永远好。它只在调用者能管理底层生命周期时好。性能和安全从来不是分开的两本账。

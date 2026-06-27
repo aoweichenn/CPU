@@ -178,3 +178,123 @@ Money price{.cents = 1299};
 \begin{exercisebox}
 设计一个 \code{Percent} 类型表示折扣百分比，要求范围是 \code{0} 到 \code{100}。先写一个能被误用的裸 \code{int} 版本，再把它改成类型。重点观察：哪些错误从运行期判断提前到了构造边界。
 \end{exercisebox}
+
+\section{金额案例要从业务事故讲起}
+
+只说“金额不要用 double”还不够。我们从一个实际账单事故推导：购物车有三件商品，每件 \code{0.10} 元，页面显示总价 \code{0.30}，结算服务却在比较优惠门槛时认为它不等于 \code{0.30}。这类 bug 最糟糕的地方是样子很正常，只有在等值比较、四舍五入或跨系统传输时才暴露。
+
+错误版本如下：
+
+\begin{lstlisting}[language=C++,caption={金额浮点事故}]
+double price = 0.10;
+double total = price + price + price;
+bool eligible = total == 0.30;
+\end{lstlisting}
+
+这段代码的推理链条是错的：业务世界里的 \code{0.10} 是十进制金额，机器里的 \code{double} 是二进制浮点近似值。近似值可以做科学计算，但不适合表达需要精确计账的最小货币单位。于是设计不应该从“怎么比较 double”开始，而应该从“账本的最小单位是什么”开始。人民币账单通常可以用“分”作为最小单位：
+
+\begin{lstlisting}[language=C++,caption={金额以最小单位入账}]
+struct Money {
+    std::int64_t cents = 0;
+};
+\end{lstlisting}
+
+这还只是第一步。真正的类型设计要回答：能不能为负，能不能乘数量，折扣如何舍入，是否允许不同币种相加。每多一个业务问题，就应该在类型边界上留下证据。
+
+\section{从裸整数到强类型}
+
+裸整数版本仍然容易把“分”和“件数”相加。我们可以把构造边界收紧：
+
+\begin{lstlisting}[language=C++,caption={用工厂函数建立金额}]
+class Money {
+public:
+    [[nodiscard]] static Money from_cents(std::int64_t cents)
+    {
+        return Money{cents};
+    }
+
+    [[nodiscard]] std::int64_t cents() const noexcept
+    {
+        return this->cents_;
+    }
+
+private:
+    explicit Money(std::int64_t cents)
+        : cents_{cents}
+    {
+    }
+
+    std::int64_t cents_ = 0;
+};
+\end{lstlisting}
+
+现在调用点必须写出 \code{Money::from_cents(1299)}。这看似多几个字符，实际上是在给读者和编译器提供业务标签。下一步再定义允许的运算：
+
+\begin{lstlisting}[language=C++,caption={只开放有意义的金额运算}]
+Money add(Money lhs, Money rhs)
+{
+    return Money::from_cents(lhs.cents() + rhs.cents());
+}
+
+Money multiply(Money price, int quantity)
+{
+    return Money::from_cents(price.cents() * quantity);
+}
+\end{lstlisting}
+
+注意这里没有定义 \code{Money + int}。如果业务上没有意义，就不要为了方便给错误开门。强类型不是“把字段藏起来”，而是让非法组合更难写出来。
+
+\section{溢出不是理论问题}
+
+把金额放进整数后，仍然要面对溢出。假设单笔金额用 \code{int} 表示分，一个订单批量导入了很多大额项目，求和可能超过 \code{int} 上限。更稳妥的做法是用足够宽的类型，并在边界处检查：
+
+\begin{lstlisting}[language=C++,caption={累加前先选择足够宽的类型}]
+std::optional<Money> total_price(std::span<const Money> items)
+{
+    std::int64_t total = 0;
+    for (Money item : items) {
+        if (item.cents() > std::numeric_limits<std::int64_t>::max() - total) {
+            return std::nullopt;
+        }
+        total += item.cents();
+    }
+    return Money::from_cents(total);
+}
+\end{lstlisting}
+
+这个例子不是让你每次加法都写这么长，而是训练一种意识：类型选了整数，不代表所有风险消失。建模、范围、运算和错误表达必须一起设计。对于金额，溢出通常应该是明确错误，而不是绕回负数或得到一个看似正常的总价。
+
+\section{单位也应该进入类型}
+
+类型设计不仅适用于金额。下面是一个常见事故：函数要求毫秒，调用者传了秒。
+
+\begin{lstlisting}[language=C++,caption={时间单位混淆}]
+void set_timeout_ms(int timeout);
+
+set_timeout_ms(5); // 是 5 毫秒，还是调用者以为的 5 秒？
+\end{lstlisting}
+
+标准库已经给了更好的词汇：
+
+\begin{lstlisting}[language=C++,caption={用 chrono 表达时间单位}]
+void set_timeout(std::chrono::milliseconds timeout);
+
+set_timeout(std::chrono::seconds{5});
+\end{lstlisting}
+
+调用者写 \code{std::chrono::seconds{5}}，接口收 \code{std::chrono::milliseconds}，转换关系由类型系统表达。这里的教训和 Money 一样：如果一个数字带单位，就尽量不要让它长期裸奔。裸整数越多，代码审查时越难看出错在哪里。
+
+\section{初始化形式背后的安全边界}
+
+大括号初始化拒绝窄化转换，这不是语法癖好，而是安全边界。看两个版本：
+
+\begin{lstlisting}[language=C++,caption={两个初始化版本的差别}]
+int count = 3.14;
+// int strict_count{3.14};
+\end{lstlisting}
+
+第一个版本把 \code{3.14} 截成 \code{3}，代码仍然能跑。第二个版本直接在编译期拒绝。学习阶段应该喜欢这种“早失败”的形式，因为它把 bug 从运行期提前到编译期。不是所有转换都禁止，但每次需要窄化时，都应该写出显式转换，让读者知道你承担了信息丢失。
+
+\section{本章验收：为每个数字写出身份}
+
+看见一个数字变量时，至少问四个问题：它的单位是什么，它的范围是什么，它是否允许缺失，它和哪些数字能运算。成绩、端口、毫秒、字节数、金额、比例、数组下标，看起来都能用整数，但它们不是同一种东西。现代 \cpp 的类型系统足够强，真正的训练是学会把业务身份交给类型，而不是把所有含义塞进变量名和注释。
