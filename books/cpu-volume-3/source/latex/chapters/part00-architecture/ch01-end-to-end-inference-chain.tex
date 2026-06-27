@@ -21,6 +21,25 @@ request prompt
   -> next token stream
 \end{lstlisting}
 
+先把这些词落到一个能检查的最小目录里。假设磁盘上有一个教学模型目录：
+
+\begin{lstlisting}[numbers=none,caption={最小模型目录里每个文件的责任}]
+mini-model/
+  config.json          hidden size, layers, heads, vocab size
+  tokenizer.json       text <-> token id
+  tensors.bin          raw weight bytes
+  tensors.index.json   tensor name, dtype, shape, offset, checksum
+  manifest.json        canonical model contract
+\end{lstlisting}
+
+\code{manifest} 不是“又一个配置文件”。它把外部文件名、权重命名、shape、dtype、量化格式、tokenizer 版本和校验和整理成引擎内部可以相信的合同。没有 manifest，后端只能靠字符串猜 \code{model.layers.0.attn.q.weight} 到底是不是第 0 层 Q projection；一旦模型方言换名，错误会延迟到运行时。manifest 能证明“这些文件和权重按本引擎认识的规则组成同一个模型”，但它不能证明算子实现正确，也不能证明生成文本质量好。
+
+\code{typed graph} 是把 manifest 里的张量和配置连成有类型的计算图。最小 decoder 层里，它会记录：hidden 输入是 \code{[1,H]}，Q/K/V projection 输出是什么 shape，attention 读取和写入哪些 KV cache state，MLP 输出仍回到 \code{[1,H]}。typed graph 能证明 shape、dtype、layout 和状态边在图层面说得通；它不能证明某个 AVX2 kernel 足够快。
+
+\code{KV cache} 是请求状态，不是模型权重。prefill 处理 prompt 时，把每一层每个历史 token 的 K/V 写进去；decode 第一步之后，每生成一个新 token，都要读取旧 K/V 并追加当前位置的 K/V。若把 KV cache 当成普通临时 activation，memory planner 可能复用或覆盖它，短 prompt 也许不炸，第二个 token 以后 logits 就会漂。
+
+\code{backend} 是执行计划落到机器的选择：CPU scalar、AVX2、AVX-512、GPU kernel 或库调用。它只负责按合同执行 segment，不应该在热路径重新猜 shape。 \code{oracle} 是裁判，用 reference 或分层检查比较结果；\code{profiler} 是账本，记录 prepare、prefill、decode、copy、sampler 和 fallback 的成本。oracle 证明“结果在误差合同内”，profiler 证明“时间花在哪里”；二者不能互相替代。
+
 这条链路有两个方向。第一条是“模型到计划”：它尽量在请求前完成，把能检查的语义、shape、dtype、量化、layout 和 kernel 选择提前固定。第二条是“请求到 token”：它发生在 runtime 中，绑定 session、token buffer、KV cache、arena、workspace 和 sampler。把这两条线分开，是推理引擎不退化成图解释器的关键。
 
 \begin{keyidea}
