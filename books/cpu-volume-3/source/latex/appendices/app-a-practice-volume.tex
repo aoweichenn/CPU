@@ -1,0 +1,34 @@
+\chapter{实践卷：本地 CPU 推理引擎切片}
+
+第三册的实践卷入口是 \filepath{books/cpu-volume-3/labs/linux_cpu_inference}。它不是一个玩具分类器的终点，而是本地 CPU 量化推理引擎的第一条可验证切片：模型 manifest、tokenizer 合同、int8 线性层、reference decoder trace、7B 账本和 serving SLO probe。每个实践都要回答“这个结果由哪个合同保证”，而不是只看能否输出一个 token。
+
+\section{实践一：模型和 tokenizer 合同}
+
+\code{safetensors} manifest 解析检查 tensor name、dtype、shape、data offsets 和 payload 边界。manifest 是模型资产目录表，说明有哪些张量、每个张量怎样解释字节；它不是完整模型执行。tokenizer 合同固定 BOS、EOS、UNK、词表和 chat template hash。若 tokenizer 输出的 token 数组不稳定，后续 decoder trace 再漂亮也不能说明真实输入被正确处理。
+
+\begin{lstlisting}[language=bash,caption={第三册 LCQI 实验构建和测试}]
+cmake -S books/cpu-volume-3 -B books/cpu-volume-3/build/lcqi-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build books/cpu-volume-3/build/lcqi-debug
+ctest --test-dir books/cpu-volume-3/build/lcqi-debug --output-on-failure
+\end{lstlisting}
+
+\section{实践二：从 kernel 到 trace}
+
+\code{lcqi_bench} 比较 scalar、packed scalar 和 AVX2 路径。报告必须写清当前机器是否支持 AVX2/FMA，benchmark 是 Debug 还是 Release，输入 shape 是多少，max abs diff 是否通过。若 AVX2 backend 标为 unavailable，不能把源码里有 AVX2 文件当作性能证据。
+
+\begin{lstlisting}[language=bash,caption={LCQI benchmark 和 trace 入口}]
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_bench 200
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_trace
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_ledger
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_serving_probe
+\end{lstlisting}
+
+\code{lcqi_trace} 把 tokenizer、embedding、RMSNorm、Q/K/V、RoPE、KV cache slot、attention、SwiGLU、final norm、logits 和 sampler 串成 CSV。trace 的价值是定位错误边界：如果 logits 不对，先看 tokenizer 和 embedding；如果 attention 不对，先查 KV slot 和 RoPE；如果服务指标不对，先查 admission 和 KV 预算。
+
+\section{实践三：7B 账本和服务验收}
+
+\code{lcqi_ledger} 给出典型 7B decoder-only 模型的 FLOPs、KV 容量和带宽上限估算。ledger 是账本，不是实测吞吐；它告诉你性能目标大概受什么约束。服务化入口 \code{lcqi_serving_probe} 固定短请求、RAG 请求、取消请求和超长请求，检查 admission、queue wait、TTFT、TPOT、取消回收和拒绝原因。
+
+\begin{labbox}
+扩展任务：为一个新增 decode shape 写完整验收。至少包含 safetensors manifest 样例、tokenizer 输入、reference trace golden、kernel max diff、ledger 行和 serving probe 中的内存预算变化。任何一项缺失，都只能算局部实验，不能写成完整推理链路能力。
+\end{labbox}

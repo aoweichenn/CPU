@@ -1,0 +1,48 @@
+\chapter{实践卷：Reference Pipeline 工程化}
+
+上一章定义了输入合同、reference 和报告字段。本章把它落成可构建工程，目录是：
+
+\begin{lstlisting}[language=bash]
+books/compute-systems-engine-code/labs/reference_pipeline
+\end{lstlisting}
+
+代码使用 C++20，单元测试使用 GTest/GMock，性能入口使用 Google Benchmark。这样做不是为了追逐工具名，而是为了让正确性断言、结构化匹配和性能测量有统一入口。
+
+\section{工程入口}
+
+工程的核心头文件是 \filepath{include/cse/reference_pipeline.hpp}。其中 \code{RecordId} 描述输入身份，\code{ParsedRecord} 描述成功解析的记录，\code{ParseDiagnostic} 描述坏行，\code{ReferenceResult} 汇总 accepted、diagnostics、counts 和 checksum，\code{ManifestRow} 给后续可靠写和恢复阶段保留稳定发布格式。
+
+\begin{lstlisting}[language=bash,caption={代码实践卷 reference pipeline 构建}]
+cmake -S books/compute-systems-engine-code -B books/compute-systems-engine-code/build/reference-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build books/compute-systems-engine-code/build/reference-debug
+ctest --test-dir books/compute-systems-engine-code/build/reference-debug --output-on-failure
+books/compute-systems-engine-code/build/reference-debug/labs/reference_pipeline/cse_reference_bench --benchmark_min_time=0.01s
+\end{lstlisting}
+
+\section{为什么先做 reference}
+
+reference 是可信但不追求快的实现。它逐行扫描输入，要求每行是 \code{event,value}；缺字段、字段过多、空事件名和非整数 value 都进入 diagnostics。只有通过合同的记录才更新 counts。这样后续无论改成 SIMD parser、线程切分、异步 I/O 还是分布式执行，都能和 reference 对照。
+
+\begin{lstlisting}[language=C++,caption={reference result 的语义字段}]
+struct ReferenceResult {
+    std::string input_name;
+    std::uint64_t input_generation = 0;
+    std::uint64_t records_total = 0;
+    std::uint64_t accepted = 0;
+    std::vector<ParseDiagnostic> diagnostics;
+    std::map<std::string, std::uint64_t> counts;
+    std::uint64_t checksum = 0;
+};
+\end{lstlisting}
+
+这里使用 \code{std::map} 是为了让输出 key 顺序稳定。稳定顺序不是小事：报告、checksum、manifest 和回归测试都依赖它。等后续进入热路径优化，可以用哈希表或分片结构提高吞吐，但发布报告前仍要回到稳定顺序。
+
+\section{测试和 benchmark 的边界}
+
+\filepath{tests/reference_pipeline_tests.cpp} 检查正常五行输入、坏行诊断、报告格式、manifest 行和空输入。测试使用 GTest/GMock 的好处是断言能保留上下文，例如 \code{EXPECT_THAT(report, HasSubstr(...))} 可以明确说明报告缺了哪个字段。benchmark 在 \filepath{bench/reference_pipeline_bench.cpp}，只测 \code{run_reference} 在不同记录数下的成本。
+
+Debug benchmark 只能说明 benchmark target 能运行，不能说明吞吐。正式性能报告必须使用 Release 构建，并记录 CPU、编译器、输入规模、负载、是否开启 CPU scaling、重复次数和异常样本处理。若远端机器负载很高或频率不可控，报告应写“噪声较大，只作为 smoke benchmark”。
+
+\begin{labbox}
+下一步扩展：把 input split 加入工程。要求每个 split 保留 \code{RecordId} 的 input name、generation、byte offset 和 line number；并写一个测试证明 split 边界落在行中间时不会丢行、重行或错报 line number。
+\end{labbox}
