@@ -1,0 +1,215 @@
+\chapter{模板、concept 和泛型设计}
+
+\section{问题入口：同一段逻辑支持不同数字类型}
+
+假设要写一个求平均值函数。只支持 \code{std::vector<int>} 很窄：
+
+\begin{lstlisting}[language=C++,caption={只能处理 int vector}]
+double average(const std::vector<int>& values)
+{
+    int sum = 0;
+    for (int value : values) {
+        sum += value;
+    }
+    return static_cast<double>(sum) / static_cast<double>(values.size());
+}
+\end{lstlisting}
+
+如果输入是 \code{double}、\code{long long} 或 \code{std::array<int, 4>}，这段函数就不能复用。模板让我们把“类型差异”变成参数。
+
+\section{函数模板}
+
+\begin{lstlisting}[language=C++,caption={用 span 写数字平均值}]
+#include <concepts>
+#include <numeric>
+#include <span>
+
+template <std::floating_point Result = double, typename Number>
+Result average(std::span<const Number> values)
+{
+    if (values.empty()) {
+        return Result{};
+    }
+    const Number sum = std::accumulate(values.begin(), values.end(), Number{});
+    return static_cast<Result>(sum) / static_cast<Result>(values.size());
+}
+\end{lstlisting}
+
+这个模板还有局限：\code{Number} 应该支持加法和默认构造。C++20 的 concept 可以把约束写出来。
+
+\section{用 concept 写约束}
+
+\begin{lstlisting}[language=C++,caption={定义可累加数字概念}]
+#include <concepts>
+
+template <typename T>
+concept AddableNumber = std::default_initializable<T> &&
+                        requires(T lhs, T rhs) {
+                            { lhs + rhs } -> std::convertible_to<T>;
+                        };
+
+template <std::floating_point Result = double, AddableNumber Number>
+Result checked_average(std::span<const Number> values)
+{
+    if (values.empty()) {
+        return Result{};
+    }
+    Number sum{};
+    for (const Number& value : values) {
+        sum = sum + value;
+    }
+    return static_cast<Result>(sum) / static_cast<Result>(values.size());
+}
+\end{lstlisting}
+
+约束不是为了炫技，而是为了把错误提前、把报错变短、把接口意图写清楚。
+
+\section{模板不是复制粘贴}
+
+模板会在使用点实例化。不同类型会生成不同实例，编译时间和错误信息都可能变重。因此模板代码要更克制：不要把巨大业务逻辑塞进模板；能用普通函数处理的部分，放到普通函数里。
+
+\begin{lstlisting}[language=C++,caption={模板只负责薄薄的类型适配}]
+double average_vector(const std::vector<int>& values)
+{
+    return checked_average(std::span<const int>{values});
+}
+\end{lstlisting}
+
+真实项目中，可以把模板放在接口层，把复杂实现放进非模板函数，减少编译膨胀。
+
+\section{模板报错怎么读}
+
+模板报错常常很长，因为编译器会把实例化链条全部打印出来。读这种报错不要从第一行硬啃到最后一行，而是按三步：
+
+\begin{enumerate}
+  \item 找到你自己的文件路径和行号。
+  \item 找到第一个“不满足约束”或“没有匹配函数”的位置。
+  \item 回到模板接口，看传入类型缺少哪种能力。
+\end{enumerate}
+
+例如把 \code{std::string} 传给只接受数值累加的模板，错误本质不是“编译器讨厌字符串”，而是字符串加法结果、默认值、除法转换等能力不符合平均值函数的合同。concept 的价值就是把这种合同前移，让错误更靠近调用点。
+
+\section{类模板：固定容量缓冲区}
+
+\begin{lstlisting}[language=C++,caption={简单固定容量缓冲区}]
+#include <array>
+#include <optional>
+
+template <typename T, std::size_t CAPACITY>
+class RingBuffer {
+public:
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return this->size_ == 0;
+    }
+
+    [[nodiscard]] bool full() const noexcept
+    {
+        return this->size_ == CAPACITY;
+    }
+
+    bool push(const T& value)
+    {
+        if (this->full()) {
+            return false;
+        }
+        this->data_[this->tail_] = value;
+        this->tail_ = (this->tail_ + 1) % CAPACITY;
+        ++this->size_;
+        return true;
+    }
+
+    std::optional<T> pop()
+    {
+        if (this->empty()) {
+            return std::nullopt;
+        }
+        T value = this->data_[this->head_];
+        this->head_ = (this->head_ + 1) % CAPACITY;
+        --this->size_;
+        return value;
+    }
+
+private:
+    std::array<T, CAPACITY> data_{};
+    std::size_t head_ = 0;
+    std::size_t tail_ = 0;
+    std::size_t size_ = 0;
+};
+\end{lstlisting}
+
+这个例子展示了非类型模板参数 \code{CAPACITY}。容量成为类型的一部分，\code{RingBuffer<int, 8>} 和 \code{RingBuffer<int, 16>} 是不同类型。
+
+\begin{keyidea}
+泛型设计的目标不是让一段代码接受所有类型，而是让它接受满足某组明确能力的类型。concept 就是在接口上写出这组能力。
+\end{keyidea}
+
+\section{从重复函数推导模板}
+
+模板不是一上来就该用。先看重复出现在哪里：
+
+\begin{lstlisting}[language=C++,caption={重复的平均值函数}]
+double average_ints(std::span<const int> values);
+double average_doubles(std::span<const double> values);
+double average_longs(std::span<const long long> values);
+\end{lstlisting}
+
+这三个函数的控制流程相同，只有元素类型不同。于是可以把元素类型提成模板参数。反过来，如果两个函数只是名字相似，但业务规则、错误处理、返回含义都不同，就不应该硬做模板。
+
+\section{concept 从失败调用里长出来}
+
+如果没有约束，下面的调用可能触发很长的模板报错：
+
+\begin{lstlisting}[language=C++,caption={错误类型不满足平均值语义}]
+std::vector<std::string> names{"Ada", "Grace"};
+const double result = checked_average(std::span<const std::string>{names});
+\end{lstlisting}
+
+字符串可以默认构造，也能相加，但不能自然地除以元素个数并转换成浮点平均值。这个反例说明 \code{AddableNumber} 还不够严格。可以把“可转换成结果类型”也写进约束：
+
+\begin{lstlisting}[language=C++,caption={更贴近平均值语义的约束}]
+template <typename T, typename Result>
+concept AveragableAs = std::default_initializable<T> &&
+                       requires(T lhs, T rhs, std::size_t count) {
+                           { lhs + rhs } -> std::convertible_to<T>;
+                           { static_cast<Result>(lhs) / static_cast<Result>(count) }
+                               -> std::convertible_to<Result>;
+                       };
+\end{lstlisting}
+
+约束来自真实失败样本，而不是为了把概念写得复杂。每加一个约束，都应该能说出它挡住了哪类误用。
+
+\section{类模板里的容量边界}
+
+\code{RingBuffer<T, CAPACITY>} 还有一个遗漏：\code{CAPACITY} 为 \code{0} 时，取模会出问题。非类型模板参数也需要约束：
+
+\begin{lstlisting}[language=C++,caption={用 requires 排除零容量}]
+template <typename T, std::size_t CAPACITY>
+    requires(CAPACITY > 0)
+class RingBuffer {
+    // ...
+};
+\end{lstlisting}
+
+这个约束把错误提前到编译期。如果用户写 \code{RingBuffer<int, 0>}，问题不是运行到“对零取模”才暴露，而是在类型实例化时就被拒绝。模板的一个优势就是把一部分不变量放到类型层。
+
+\section{模板实现如何避免膨胀}
+
+假设一个模板函数里有大段日志、文件处理和复杂业务逻辑。每个类型实例都会生成一份代码，编译也更慢。常见做法是把与类型无关的部分抽到普通函数：
+
+\begin{lstlisting}[language=C++,caption={模板层只做类型相关转换}]
+void report_average_result(double value);
+
+template <typename Number>
+void report_average(std::span<const Number> values)
+{
+    const double value = checked_average(values);
+    report_average_result(value);
+}
+\end{lstlisting}
+
+这样模板只负责把不同数字类型汇总成 \code{double}，报告格式等无关逻辑只有一份。泛型代码越靠近基础设施，越要注意编译时间、错误信息和二进制体积。
+
+\begin{exercisebox}
+给 \code{RingBuffer} 补两个测试：容量为 \code{2} 时连续 \code{push} 三次，第三次应失败；连续 \code{pop} 三次，第三次应返回 \code{std::nullopt}。再尝试声明 \code{RingBuffer<int, 0>}，确认编译期约束生效。
+\end{exercisebox}

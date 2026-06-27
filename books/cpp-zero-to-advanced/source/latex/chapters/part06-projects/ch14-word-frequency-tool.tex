@@ -1,0 +1,271 @@
+\chapter{项目一：命令行词频统计器}
+
+\section{项目目标}
+
+这一章把前面学过的内容放进一个小工具：读取文本文件，统计单词出现次数，输出出现次数最高的前 \code{k} 个单词。这个项目覆盖文件 RAII、字符串处理、哈希表、排序、错误处理和命令行参数。
+
+目标命令如下：
+
+\begin{lstlisting}[language=bash,caption={词频工具目标用法}]
+wordfreq --input article.txt --top 20
+\end{lstlisting}
+
+输出示例：
+
+\begin{lstlisting}[caption={词频输出示例}]
+the 128
+system 42
+memory 31
+\end{lstlisting}
+
+\section{第一版：把文件读进字符串}
+
+最简单的做法是逐词读取：
+
+\begin{lstlisting}[language=C++,caption={逐词读取文件}]
+#include <fstream>
+#include <string>
+#include <vector>
+
+std::vector<std::string> read_words(const std::string& path)
+{
+    std::ifstream input{path};
+    std::vector<std::string> words;
+    std::string word;
+    while (input >> word) {
+        words.push_back(word);
+    }
+    return words;
+}
+\end{lstlisting}
+
+这段代码利用 \code{std::ifstream} 的 RAII 自动关闭文件。但它还不够：文件打不开时返回空数组，调用者无法区分“空文件”和“文件不存在”；标点也没有处理，\code{"system"} 和 \code{"system,"} 会被当成两个词。
+
+\section{定义错误和清洗规则}
+
+先定义读取结果：
+
+\begin{lstlisting}[language=C++,caption={读取结果类型}]
+struct WordReadError {
+    std::string message;
+};
+
+struct WordReadResult {
+    std::vector<std::string> words;
+    std::optional<WordReadError> error;
+};
+\end{lstlisting}
+
+单词清洗规则先保持简单：保留字母和数字，统一转小写，其他字符当作分隔。
+
+\begin{lstlisting}[language=C++,caption={清洗一行文本}]
+#include <cctype>
+
+std::vector<std::string> split_words(std::string_view line)
+{
+    std::vector<std::string> words;
+    std::string current;
+    for (unsigned char ch : line) {
+        if (std::isalnum(ch)) {
+            current.push_back(static_cast<char>(std::tolower(ch)));
+            continue;
+        }
+        if (!current.empty()) {
+            words.push_back(current);
+            current.clear();
+        }
+    }
+    if (!current.empty()) {
+        words.push_back(current);
+    }
+    return words;
+}
+\end{lstlisting}
+
+这里用 \code{unsigned char} 是细节。很多 \code{ctype} 函数要求参数能表示为 \code{unsigned char} 或 EOF，直接传负的 \code{char} 可能出问题。
+
+\section{统计和排序}
+
+统计用 \code{unordered_map}，排序用 \code{vector}。
+
+\begin{lstlisting}[language=C++,caption={统计词频}]
+#include <unordered_map>
+
+using WordCounts = std::unordered_map<std::string, int>;
+
+WordCounts count_words(std::span<const std::string> words)
+{
+    WordCounts counts;
+    for (const std::string& word : words) {
+        ++counts[word];
+    }
+    return counts;
+}
+\end{lstlisting}
+
+为了排序，把哈希表转成数组：
+
+\begin{lstlisting}[language=C++,caption={取 top k 高频词}]
+#include <algorithm>
+
+struct WordCount {
+    std::string word;
+    int count = 0;
+};
+
+std::vector<WordCount> top_words(const WordCounts& counts, std::size_t limit)
+{
+    std::vector<WordCount> items;
+    items.reserve(counts.size());
+    for (const auto& [word, count] : counts) {
+        items.push_back(WordCount{.word = word, .count = count});
+    }
+
+    std::ranges::sort(items, [](const WordCount& lhs, const WordCount& rhs) {
+        if (lhs.count != rhs.count) {
+            return lhs.count > rhs.count;
+        }
+        return lhs.word < rhs.word;
+    });
+
+    if (items.size() > limit) {
+        items.resize(limit);
+    }
+    return items;
+}
+\end{lstlisting}
+
+排序规则必须完整：次数高的排前面；次数相同按字典序。这让输出稳定，测试也稳定。
+
+\section{复杂度和替代方案}
+
+设单词总数为 \code{n}，不同单词数为 \code{m}。统计平均复杂度是 \complexity{O(n)}，排序是 \complexity{O(m log m)}。如果 \code{k} 很小而 \code{m} 很大，可以用小顶堆把排序降到 \complexity{O(m log k)}。但第一版项目更重视正确性和可读性，全排序完全可以接受。
+
+\section{测试清单}
+
+\begin{itemize}
+  \item 空文件：输出为空。
+  \item 大小写：\code{Cpp} 和 \code{cpp} 合并。
+  \item 标点：\code{memory, memory.} 计为同一个词。
+  \item 次数相同：按字典序输出。
+  \item 文件不存在：返回明确错误。
+\end{itemize}
+
+\begin{keyidea}
+一个小工具也要有结构：输入和清洗、统计、排序、输出分开。这样每一步都能单独测试，后续替换算法也不会牵动整段程序。
+\end{keyidea}
+
+\section{把需求拆成可测试流水线}
+
+词频工具看起来是一个命令，其实可以拆成五步：
+
+\begin{enumerate}
+  \item 解析命令行，得到输入路径和 \code{top} 数量。
+  \item 读取文件，每次拿到一行文本。
+  \item 把一行文本清洗成单词。
+  \item 统计所有单词出现次数。
+  \item 排序、截断并输出。
+\end{enumerate}
+
+拆分的标准是：每一步都有清楚输入输出，可以单独测试。比如 \code{split_words("Cpp, CPP!")} 应该得到两个 \code{cpp}；这个测试不需要真实文件。等清洗规则可靠后，再测试文件读取。
+
+\section{读取文件时保留错误}
+
+前面的 \code{read_words} 会把文件不存在和空文件都变成空数组。改进版应该显式检查文件打开：
+
+\begin{lstlisting}[language=C++,caption={逐行读取并返回错误}]
+WordReadResult read_words_from_file(const std::string& path)
+{
+    std::ifstream input{path};
+    if (!input) {
+        return {.error = WordReadError{"cannot open input file"}};
+    }
+
+    WordReadResult result;
+    std::string line;
+    while (std::getline(input, line)) {
+        std::vector<std::string> words = split_words(line);
+        result.words.insert(result.words.end(),
+                            std::make_move_iterator(words.begin()),
+                            std::make_move_iterator(words.end()));
+    }
+    if (input.bad()) {
+        return {.error = WordReadError{"failed while reading input file"}};
+    }
+    return result;
+}
+\end{lstlisting}
+
+这里用 \code{std::getline} 是为了按行清洗标点；用 \code{make_move_iterator} 是因为临时 \code{words} 里的字符串已经不再需要，可以移动到结果里。即便如此，第一版仍然把所有单词存进内存。若文件很大，下一步可以改成边读边统计。
+
+\section{流式版本减少内存}
+
+更好的结构是读取一行就更新计数，不必保存所有单词：
+
+\begin{lstlisting}[language=C++,caption={边读边统计}]
+struct CountResult {
+    WordCounts counts;
+    std::optional<WordReadError> error;
+};
+
+CountResult count_words_in_file(const std::string& path)
+{
+    std::ifstream input{path};
+    if (!input) {
+        return {.error = WordReadError{"cannot open input file"}};
+    }
+
+    CountResult result;
+    std::string line;
+    while (std::getline(input, line)) {
+        for (std::string& word : split_words(line)) {
+            ++result.counts[word];
+        }
+    }
+    if (input.bad()) {
+        return {.error = WordReadError{"failed while reading input file"}};
+    }
+    return result;
+}
+\end{lstlisting}
+
+这个版本的峰值内存主要由不同单词数决定，而不是所有单词总数。我们不是为了炫耀优化，而是从数据规模推出结构：如果文本很大，保存全部中间单词没有必要。
+
+\section{主程序如何连接模块}
+
+入口函数把前面步骤串起来：
+
+\begin{lstlisting}[language=C++,caption={词频工具主流程}]
+int run_wordfreq(const Options& options)
+{
+    const CountResult counted = count_words_in_file(options.input_path);
+    if (counted.error.has_value()) {
+        std::cerr << counted.error->message << '\n';
+        return 2;
+    }
+
+    const std::vector<WordCount> top = top_words(counted.counts, options.top);
+    for (const WordCount& item : top) {
+        std::cout << item.word << " " << item.count << '\n';
+    }
+    return 0;
+}
+\end{lstlisting}
+
+这个函数仍然很短，因为细节已经在可测试函数里。入口处理错误消息和输出，核心函数处理数据规则。以后如果要输出 JSON，只需要替换输出层；如果要支持停用词，只需要在清洗或统计之间加一步过滤。
+
+\section{项目验收标准}
+
+一个可交付的小工具不只是“我本机能跑”。至少要满足：
+
+\begin{itemize}
+  \item 命令行缺少 \code{--input} 或 \code{--top} 时给出错误。
+  \item 文件打不开时返回非零退出码。
+  \item 标点、大小写、空行处理符合文档规则。
+  \item 次数相同时输出顺序稳定。
+  \item 核心函数有测试，测试不依赖真实工作目录。
+\end{itemize}
+
+\begin{exercisebox}
+给词频工具增加 \code{--min-length N} 参数，只统计长度至少为 \code{N} 的单词。先写清楚 \code{N = 0}、缺值、非数字、负数分别怎么处理，再改参数解析和统计流程。
+\end{exercisebox}

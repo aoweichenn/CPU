@@ -1,0 +1,199 @@
+\chapter{构建、测试和调试}
+
+\section{问题入口：一份源文件走不远}
+
+单文件程序适合学习语法，但真实项目很快需要多个源文件、测试和构建脚本。假设项目有一个统计库：
+
+\begin{lstlisting}[caption={最小项目结构}]
+score_tool/
+  CMakeLists.txt
+  include/score/summary.hpp
+  src/summary.cpp
+  tests/summary_tests.cpp
+\end{lstlisting}
+
+目录结构表达所有权：公开头文件在 \code{include}，实现放 \code{src}，测试放 \code{tests}。不要把所有文件堆在一个目录里。
+
+\section{CMake 的基本边界}
+
+\begin{lstlisting}[language=CMake,caption={库和测试目标分开}]
+cmake_minimum_required(VERSION 3.20)
+project(score_tool LANGUAGES CXX)
+
+add_library(score_summary src/summary.cpp)
+target_compile_features(score_summary PUBLIC cxx_std_20)
+target_include_directories(score_summary PUBLIC include)
+
+add_executable(summary_tests tests/summary_tests.cpp)
+target_link_libraries(summary_tests PRIVATE score_summary)
+enable_testing()
+add_test(NAME summary_tests COMMAND summary_tests)
+\end{lstlisting}
+
+目标是 CMake 的核心。不要把编译选项、include 路径和库依赖全局乱撒。谁需要依赖，谁声明依赖。
+
+\section{测试不是最后补}
+
+统计函数天然适合测试：
+
+\begin{lstlisting}[language=C++,caption={不用测试框架也能先写断言}]
+#include <cassert>
+#include <vector>
+
+int main()
+{
+    const std::vector<int> scores{90, 80, 100};
+    const auto summary = summarize_scores(scores);
+    assert(summary.has_value());
+    assert(summary->count == 3);
+    assert(summary->sum == 270);
+    assert(summary->min_score == 80);
+    assert(summary->max_score == 100);
+}
+\end{lstlisting}
+
+真实项目可以使用 Catch2、GoogleTest 或 doctest。框架不是重点，重点是测试要覆盖边界：空输入、单元素、多元素、极值和错误路径。
+
+\section{调试先缩小问题}
+
+调试不等于到处打印。更可靠的流程是：
+
+\begin{enumerate}
+  \item 复现问题，固定输入。
+  \item 写一个最小失败测试。
+  \item 确认失败位置：输入解析、核心逻辑、输出格式还是环境。
+  \item 修正后保留测试，防止回归。
+\end{enumerate}
+
+调试器可以观察变量、调用栈和线程状态；日志可以保留运行历史；断言可以检查不变量。三者用途不同。
+
+\begin{lstlisting}[language=C++,caption={断言用于检查内部不变量}]
+#include <cassert>
+
+void push_value(std::vector<int>& values, int value)
+{
+    const std::size_t old_size = values.size();
+    values.push_back(value);
+    assert(values.size() == old_size + 1);
+}
+\end{lstlisting}
+
+断言不是用户错误处理。它适合检查“代码内部本应永远成立”的条件。
+
+\section{本章边界检查}
+
+一个能长期维护的 \cpp 项目至少要有：
+
+\begin{itemize}
+  \item 清晰目标：库、程序、测试分别是什么。
+  \item 目标级 include 路径和依赖。
+  \item 可重复运行的测试命令。
+  \item Debug 和 Release 两种构建。
+  \item 编译警告作为质量输入。
+\end{itemize}
+
+\begin{keyidea}
+工程化不是等项目变大后才需要。构建边界、测试入口和调试习惯越早建立，后面修改成本越低。
+\end{keyidea}
+
+\section{从一条编译命令演进到 CMake}
+
+单文件时可以直接编译：
+
+\begin{lstlisting}[language=bash,caption={单文件编译}]
+g++ -std=c++20 -Wall -Wextra -pedantic main.cpp -o score_tool
+\end{lstlisting}
+
+当项目拆成头文件、源文件和测试后，手写命令会越来越长，而且容易漏依赖。CMake 的价值不是“多一个工具”，而是把目标关系记录下来：库由哪些源文件组成，公开哪些头文件路径，测试链接哪个库。
+
+推荐的构建流程如下：
+
+\begin{lstlisting}[language=bash,caption={独立构建目录}]
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Debug
+cmake --build build
+ctest --test-dir build --output-on-failure
+\end{lstlisting}
+
+\code{-S} 指源码目录，\code{-B} 指构建目录。不要把生成文件混进源码目录。Debug 构建适合调试，Release 构建适合性能测量。
+
+\section{头文件和源文件怎么拆}
+
+以成绩统计库为例，头文件只放接口和必要类型：
+
+\begin{lstlisting}[language=C++,caption={summary.hpp 暴露稳定接口}]
+#pragma once
+
+#include <optional>
+#include <span>
+
+struct ScoreSummary {
+    std::size_t count = 0;
+    int sum = 0;
+    int min_score = 0;
+    int max_score = 0;
+    double average = 0.0;
+};
+
+std::optional<ScoreSummary> summarize_scores(std::span<const int> scores);
+\end{lstlisting}
+
+实现文件放算法细节：
+
+\begin{lstlisting}[language=C++,caption={summary.cpp 放实现}]
+#include <score/summary.hpp>
+
+#include <algorithm>
+#include <numeric>
+
+std::optional<ScoreSummary> summarize_scores(std::span<const int> scores)
+{
+    if (scores.empty()) {
+        return std::nullopt;
+    }
+    const auto [min_it, max_it] = std::minmax_element(scores.begin(), scores.end());
+    const int sum = std::accumulate(scores.begin(), scores.end(), 0);
+    return ScoreSummary{scores.size(), sum, *min_it, *max_it,
+                        static_cast<double>(sum) / scores.size()};
+}
+\end{lstlisting}
+
+调用者只需要包含头文件，不应该依赖实现文件里的私有细节。这个边界越干净，后面替换实现越容易。
+
+\section{测试要覆盖失败路径}
+
+很多测试只测普通输入，结果错误路径一直没人碰。成绩统计至少要有这些测试：
+
+\begin{lstlisting}[language=C++,caption={最小测试集合}]
+void test_empty_scores()
+{
+    const std::vector<int> scores;
+    assert(!summarize_scores(scores).has_value());
+}
+
+void test_single_score()
+{
+    const std::vector<int> scores{90};
+    const auto summary = summarize_scores(scores);
+    assert(summary.has_value());
+    assert(summary->min_score == 90);
+    assert(summary->max_score == 90);
+    assert(summary->average == 90.0);
+}
+\end{lstlisting}
+
+测试函数命名要说清行为，而不是叫 \code{test1}、\code{test2}。失败时，名字就是第一条诊断信息。
+
+\section{调试工具各自解决什么}
+
+编译警告帮你发现可疑代码；单元测试帮你固定行为；调试器帮你观察某次运行；消毒器帮助发现越界、悬空引用和数据竞争。可以给 Debug 构建加上地址消毒器：
+
+\begin{lstlisting}[language=CMake,caption={为测试目标打开地址消毒器}]
+target_compile_options(summary_tests PRIVATE -fsanitize=address -fno-omit-frame-pointer)
+target_link_options(summary_tests PRIVATE -fsanitize=address)
+\end{lstlisting}
+
+这不是替代测试，而是让测试失败得更早、更明确。比如越界访问可能平时“看起来能跑”，在消毒器下会直接报出位置。
+
+\begin{exercisebox}
+把成绩统计项目拆成 \filepath{include/score/summary.hpp}、\filepath{src/summary.cpp}、\filepath{tests/summary_tests.cpp}。要求 \code{ctest} 能运行测试；再故意把空输入检查删掉，确认测试能失败。
+\end{exercisebox}

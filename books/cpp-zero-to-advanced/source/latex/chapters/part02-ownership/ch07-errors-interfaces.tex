@@ -1,0 +1,194 @@
+\chapter{错误处理和接口设计}
+
+\section{问题入口：读取配置文件}
+
+假设要读取一个配置文件，里面只有一行端口号。可能发生的错误有：文件不存在、内容为空、不是数字、数字超出范围。朴素写法容易把错误吞掉：
+
+\begin{lstlisting}[language=C++,caption={吞掉错误的读取函数}]
+int read_port()
+{
+    std::ifstream input{"server.conf"};
+    int port = 0;
+    input >> port;
+    return port;
+}
+\end{lstlisting}
+
+如果文件不存在，函数返回 \code{0}。但 \code{0} 是错误还是合法端口？调用者不知道。
+
+\section{错误要进入接口}
+
+先定义错误类型：
+
+\begin{lstlisting}[language=C++,caption={配置读取错误}]
+enum class ConfigError {
+    file_not_found,
+    empty_file,
+    invalid_number,
+    out_of_range,
+};
+
+struct PortConfig {
+    int port = 0;
+};
+
+struct PortConfigResult {
+    std::optional<PortConfig> config;
+    std::optional<ConfigError> error;
+};
+\end{lstlisting}
+
+然后实现读取逻辑：
+
+\begin{lstlisting}[language=C++,caption={显式返回错误}]
+#include <fstream>
+#include <optional>
+#include <string>
+
+constexpr int PORT_MIN = 1;
+constexpr int PORT_MAX = 65535;
+
+PortConfigResult read_port_config(const std::string& path)
+{
+    std::ifstream input{path};
+    if (!input) {
+        return {.error = ConfigError::file_not_found};
+    }
+
+    std::string text;
+    if (!(input >> text)) {
+        return {.error = ConfigError::empty_file};
+    }
+
+    const std::optional<int> parsed = parse_int(text);
+    if (!parsed.has_value()) {
+        return {.error = ConfigError::invalid_number};
+    }
+    if (*parsed < PORT_MIN || *parsed > PORT_MAX) {
+        return {.error = ConfigError::out_of_range};
+    }
+    return {.config = PortConfig{.port = *parsed}};
+}
+\end{lstlisting}
+
+这里没有说异常不好。异常适合无法就地处理、需要跨层传播的错误；显式结果适合调用者马上需要分支处理的错误。关键是不要让错误伪装成普通值。
+
+\section{接口越小，错误越少}
+
+接口设计的第一原则是少暴露。比如一个缓存类不应该同时负责读取文件、解析 JSON、网络刷新、过期策略和日志输出。先定义一个小接口：
+
+\begin{lstlisting}[language=C++,caption={小接口降低耦合}]
+class PortProvider {
+public:
+    explicit PortProvider(PortConfig config)
+        : config_{config}
+    {
+    }
+
+    [[nodiscard]] int port() const noexcept
+    {
+        return this->config_.port;
+    }
+
+private:
+    PortConfig config_;
+};
+\end{lstlisting}
+
+它只表达“我能提供端口”。至于端口来自文件、命令行还是测试固定值，不应该被这个类知道。
+
+\section{异常边界}
+
+异常不是洪水猛兽，但要有边界。底层函数可以抛出 \code{std::runtime_error}，但程序入口应该捕获并转换成可理解的错误消息。
+
+\begin{lstlisting}[language=C++,caption={程序入口处建立异常边界}]
+int main()
+{
+    try {
+        return run_application();
+    } catch (const std::exception& error) {
+        std::cerr << "fatal: " << error.what() << '\n';
+        return 1;
+    }
+}
+\end{lstlisting}
+
+不要在每一层都捕获再抛出同样的异常。捕获必须有目的：恢复、补充上下文、转换错误类型或终止程序。
+
+\begin{warningbox}
+最差的错误处理是“打印一下然后继续”。如果状态已经不可信，继续执行可能制造更隐蔽的数据损坏。
+\end{warningbox}
+
+\section{从端口号反例推导错误类型}
+
+为什么 \code{read_port} 返回 \code{0} 不够？因为我们至少有四种不同处理方式。文件不存在时，用户可能需要检查路径；空文件时，可能需要补配置；不是数字时，要指出格式错误；超出范围时，要告诉合法范围。一个 \code{0} 抹掉了这些差别。
+
+因此错误类型不是为了形式完整，而是为了保留决策所需的信息。还可以给错误转换成人类可读消息：
+
+\begin{lstlisting}[language=C++,caption={错误枚举转消息}]
+std::string_view describe(ConfigError error)
+{
+    switch (error) {
+    case ConfigError::file_not_found:
+        return "config file not found";
+    case ConfigError::empty_file:
+        return "config file is empty";
+    case ConfigError::invalid_number:
+        return "port must be a number";
+    case ConfigError::out_of_range:
+        return "port must be between 1 and 65535";
+    }
+    return "unknown config error";
+}
+\end{lstlisting}
+
+这个 \code{switch} 应该靠编译警告帮助维护。如果以后新增错误枚举，却忘了补消息，警告会提醒你。
+
+\section{错误处理分层}
+
+同一个错误在不同层有不同表达。底层读取函数返回结构化错误；命令行入口把错误转换成文本和退出码；测试直接断言错误枚举：
+
+\begin{lstlisting}[language=C++,caption={入口层转换错误}]
+int run_server(std::string_view config_path)
+{
+    const PortConfigResult result = read_port_config(std::string{config_path});
+    if (result.error.has_value()) {
+        std::cerr << describe(*result.error) << '\n';
+        return 2;
+    }
+    return start_server(result.config->port);
+}
+\end{lstlisting}
+
+不要让底层函数直接 \code{std::cerr}。一旦底层打印，图形界面、服务进程和测试环境都被迫接受同一种输出方式。接口返回错误，调用者才有选择。
+
+\section{optional 适合什么，不适合什么}
+
+\code{std::optional<T>} 适合表达“可能没有值，但没有更多错误信息”。例如按 ID 查找用户：
+
+\begin{lstlisting}[language=C++,caption={查不到不是异常}]
+std::optional<UserRecord> find_user(int id);
+\end{lstlisting}
+
+如果失败原因会影响处理，就不要只用 \code{optional}。读取配置失败显然有不同原因，所以需要错误类型。异常则适合跨多层传播、当前层无法恢复的错误，例如配置语义严重错误、数据库连接失败、程序无法继续启动。
+
+\section{接口大小与测试成本}
+
+比较两个接口：
+
+\begin{lstlisting}[language=C++,caption={过大的接口难测试}]
+class ServerManager {
+public:
+    void load_config();
+    void open_log();
+    void connect_database();
+    void start_threads();
+    void run();
+};
+\end{lstlisting}
+
+这个类每个测试都可能需要文件、日志、数据库和线程。把端口读取拆成纯函数后，测试只需要临时文件或字符串解析。接口越小，构造测试环境越容易；测试越容易，错误路径越可能被覆盖。
+
+\begin{exercisebox}
+把 \code{read_port_config} 拆成两个函数：一个从 \code{std::string_view} 解析端口文本，一个负责读文件。要求文本解析函数不做任何 I/O，并覆盖空字符串、字母、\code{0}、\code{65536}、合法端口五个测试。
+\end{exercisebox}

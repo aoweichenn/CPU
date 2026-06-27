@@ -9,8 +9,9 @@
 - `books/compute-systems-engine-code/`：第二册配套代码实践卷，主题是 Compute Systems Engine 的完整 C++20 实现、测试、benchmark、故障注入和报告。
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
+- `books/cpp-zero-to-advanced/`：Cpp 从零到高级教材，主题是执行模型、值和类型、RAII、标准库、泛型、构建测试、性能、并发、大型代码组织和综合项目。
 
-规划中的新书可以继续放到 `books/` 下，例如 C++ 语言、编译器、操作系统、AI 系统等方向。
+规划中的新书可以继续放到 `books/` 下，例如编译器、操作系统、AI 系统等方向。
 
 ## 仓库结构
 
@@ -50,6 +51,8 @@ books/
     reports/           # 周报和复盘模板
     results/           # 实验输出
     tools/             # 本书检查脚本
+  cpp-zero-to-advanced/
+    source/latex/      # Cpp 从零到高级正式 LaTeX 主稿，生成 PDF/EPUB
 CMakeLists.txt         # 仓库级 C++ 实验入口
 Makefile               # 仓库级常用命令入口
 ```
@@ -91,13 +94,13 @@ make cpu2-epub
 make cpu2-text-count
 ```
 
-统一导出第一册、第二册、第三册和算法面试书：
+统一导出第一册、第二册、第三册、算法面试书和 Cpp 从零到高级：
 
 ```bash
 make books-export
 ```
 
-该命令会重新构建四本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
+该命令会重新构建五本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
 
 检查和测试算法面试书：
 
@@ -123,6 +126,15 @@ cd books/algorithm-interview
 make check
 make pdf
 make test
+```
+
+Cpp 从零到高级也可以进入单本书目录执行：
+
+```bash
+cd books/cpp-zero-to-advanced
+make check
+make pdf
+make epub
 ```
 
 第二册也可以进入单本书目录执行：

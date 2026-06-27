@@ -1,0 +1,170 @@
+\chapter{标准算法、ranges 和可组合代码}
+
+\section{问题入口：筛选活跃用户}
+
+给定一组用户，筛选活跃用户 ID，并按 ID 排序。朴素写法通常是一堆循环：
+
+\begin{lstlisting}[language=C++,caption={手写循环筛选和排序}]
+struct User {
+    int id = 0;
+    bool active = false;
+};
+
+std::vector<int> active_ids;
+for (const User& user : users) {
+    if (user.active) {
+        active_ids.push_back(user.id);
+    }
+}
+std::sort(active_ids.begin(), active_ids.end());
+\end{lstlisting}
+
+这段代码没错。标准算法不是为了消灭所有循环，而是把常见意图变成可读的词汇。
+
+\section{算法表达意图}
+
+\begin{lstlisting}[language=C++,caption={标准算法表达筛选}]
+std::vector<User> active_users;
+std::copy_if(users.begin(), users.end(), std::back_inserter(active_users),
+             [](const User& user) {
+                 return user.active;
+             });
+\end{lstlisting}
+
+如果最终只要 ID，还需要一次转换。C++20 ranges 可以写成管道式视图：
+
+\begin{lstlisting}[language=C++,caption={ranges 视图组合}]
+#include <ranges>
+
+auto active_id_view =
+    users
+    | std::views::filter([](const User& user) { return user.active; })
+    | std::views::transform([](const User& user) { return user.id; });
+
+std::vector<int> ids(active_id_view.begin(), active_id_view.end());
+std::ranges::sort(ids);
+\end{lstlisting}
+
+视图通常是惰性的：它描述计算，不立即生成新容器。最终构造 \code{ids} 时才真正遍历。
+
+\section{谓词和投影}
+
+\code{std::ranges::sort} 支持投影，可以直接按字段排序：
+
+\begin{lstlisting}[language=C++,caption={按字段排序}]
+std::ranges::sort(users, std::less<>{}, &User::id);
+\end{lstlisting}
+
+这比手写比较器更短，也更不容易写错。比较器仍然有用，尤其当排序规则涉及多个字段。
+
+\section{避免悬空视图}
+
+ranges 的危险点是生命周期。视图不拥有底层数据，如果底层容器销毁，视图就悬空。
+
+\begin{lstlisting}[language=C++,caption={不要返回依赖局部容器的视图}]
+auto bad_view()
+{
+    std::vector<User> users = load_users();
+    return users | std::views::filter([](const User& user) {
+        return user.active;
+    });
+}
+\end{lstlisting}
+
+正确做法是返回拥有结果的容器，或者让调用者传入数据并保证生命周期。
+
+\section{什么时候保留普通循环}
+
+普通循环仍然重要。涉及复杂状态机、多个输出、短路返回、详细错误上下文时，强行使用算法反而会降低可读性。比如解析协议时，一个明确的 \code{for} 或 \code{while} 循环通常比嵌套算法清楚。
+
+\begin{keyidea}
+标准算法和 ranges 的价值是表达常见意图：查找、计数、转换、筛选、排序、归约。不是所有循环都要替换，但每个简单循环都值得问一句：这里是不是已有标准词汇？
+\end{keyidea}
+
+\section{从循环变量推导算法词汇}
+
+判断一个循环能不能换成标准算法，可以先问它在维护什么状态。下面的循环只维护一个布尔结果：
+
+\begin{lstlisting}[language=C++,caption={手写检查是否存在活跃用户}]
+bool has_active = false;
+for (const User& user : users) {
+    if (user.active) {
+        has_active = true;
+        break;
+    }
+}
+\end{lstlisting}
+
+这正是 \code{std::ranges::any_of} 的语义：
+
+\begin{lstlisting}[language=C++,caption={标准算法表达是否存在}]
+const bool has_active = std::ranges::any_of(users, [](const User& user) {
+    return user.active;
+});
+\end{lstlisting}
+
+如果循环维护的是计数，用 \code{count_if}；维护的是查找位置，用 \code{find_if}；维护的是转换结果，用 \code{transform} 或视图。算法不是为了显得高级，而是让读者少读循环细节，直接看到意图。
+
+\section{视图是借来的计算}
+
+ranges 视图通常不拥有数据。可以把它理解成一张“计算计划单”：等你遍历它时，它才从原容器取元素、过滤、转换。这个特性节省中间容器，但也带来生命周期要求。
+
+\begin{lstlisting}[language=C++,caption={视图会反映底层容器变化}]
+std::vector<User> users{{1, true}, {2, false}};
+auto active = users | std::views::filter([](const User& user) {
+    return user.active;
+});
+
+users.push_back(User{3, true});
+// 后续遍历 active 时，可能看到新加入的用户
+\end{lstlisting}
+
+这段代码是否安全，还要看 \code{push_back} 是否导致底层迭代器失效、视图对象如何保存范围。入门阶段先保守：视图不要跨越会修改底层容器结构的代码段长期保存。需要稳定结果时，立刻收集到 \code{vector}。
+
+\section{排序规则必须是严格弱序}
+
+比较器不是随便返回布尔值。排序要求比较关系稳定、可传递。反例：
+
+\begin{lstlisting}[language=C++,caption={错误比较器破坏排序语义}]
+std::ranges::sort(users, [](const User& lhs, const User& rhs) {
+    return lhs.id <= rhs.id; // 错误：相等时也返回 true
+});
+\end{lstlisting}
+
+当 \code{lhs.id == rhs.id} 时，\code{lhs < rhs} 和 \code{rhs < lhs} 都不应该成立。正确写法是：
+
+\begin{lstlisting}[language=C++,caption={相等时返回 false}]
+std::ranges::sort(users, [](const User& lhs, const User& rhs) {
+    return lhs.id < rhs.id;
+});
+\end{lstlisting}
+
+多字段排序也要按顺序推导：先比较主字段，主字段相等时再比较次字段。
+
+\section{完整案例：活跃用户报表}
+
+把本章内容合成一个小函数：输入用户列表，输出活跃用户 ID，按 ID 升序，不修改原列表。
+
+\begin{lstlisting}[language=C++,caption={活跃用户 ID 报表}]
+std::vector<int> active_user_ids(std::span<const User> users)
+{
+    auto ids_view = users
+        | std::views::filter([](const User& user) {
+              return user.active;
+          })
+        | std::views::transform([](const User& user) {
+              return user.id;
+          });
+
+    std::vector<int> ids(ids_view.begin(), ids_view.end());
+    std::ranges::sort(ids);
+    ids.erase(std::ranges::unique(ids).begin(), ids.end());
+    return ids;
+}
+\end{lstlisting}
+
+这里先用视图表达筛选和转换，再收集成拥有结果的 \code{vector}，最后排序去重。返回值拥有自己的生命周期，不依赖传入的 \code{users}。
+
+\begin{exercisebox}
+给 \code{active_user_ids} 加测试：空列表、没有活跃用户、重复 ID、已排序输入、逆序输入。然后用普通循环重写一版，对比哪一版更容易在代码里看出“筛选、转换、排序、去重”四个步骤。
+\end{exercisebox}

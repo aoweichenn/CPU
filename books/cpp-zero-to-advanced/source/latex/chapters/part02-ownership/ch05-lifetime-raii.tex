@@ -1,0 +1,259 @@
+\chapter{生命周期、所有权和 RAII}
+
+\section{问题入口：文件忘记关闭}
+
+资源不只是内存。文件句柄、锁、网络连接、临时目录、线程都属于资源。C 风格写法常见模式是打开后手动关闭：
+
+\begin{lstlisting}[language=C++,caption={手动管理文件资源容易遗漏}]
+#include <cstdio>
+
+void write_message()
+{
+    FILE* file = std::fopen("out.txt", "w");
+    if (file == nullptr) {
+        return;
+    }
+    std::fprintf(file, "hello\n");
+    std::fclose(file);
+}
+\end{lstlisting}
+
+这段代码看起来没问题，但一旦中间出现多个返回路径或异常，\code{fclose} 就容易漏。现代 \cpp 的核心习惯是 RAII：资源获取即初始化，对象析构即释放。
+
+\section{RAII 的基本形状}
+
+\begin{lstlisting}[language=C++,caption={用 ofstream 自动管理文件}]
+#include <fstream>
+
+void write_message()
+{
+    std::ofstream output{"out.txt"};
+    if (!output) {
+        return;
+    }
+    output << "hello\n";
+}
+\end{lstlisting}
+
+\code{std::ofstream} 对象离开作用域时会关闭文件。你不需要在每个分支手写关闭逻辑。RAII 的关键不是某个类，而是一个原则：资源的生命周期绑定到对象生命周期。
+
+\begin{keyidea}
+如果一个资源需要释放，就应该有一个对象负责释放。不要让调用者记住“用完后一定要调用 cleanup”。这种规则靠人记，迟早会漏。
+\end{keyidea}
+
+\section{unique\_ptr 表达独占所有权}
+
+动态对象不是不能用，而是要表达谁拥有它。独占所有权用 \code{std::unique_ptr}。
+
+\begin{lstlisting}[language=C++,caption={独占智能指针表达唯一拥有者}]
+#include <memory>
+#include <string>
+
+struct User {
+    std::string name;
+};
+
+std::unique_ptr<User> make_user(std::string name)
+{
+    return std::make_unique<User>(User{.name = std::move(name)});
+}
+\end{lstlisting}
+
+\code{unique_ptr} 不能复制，只能移动。这个限制非常有价值：它让所有权转移在代码里可见。
+
+\begin{lstlisting}[language=C++,caption={移动表示所有权转移}]
+std::unique_ptr<User> first = make_user("Ada");
+std::unique_ptr<User> second = std::move(first);
+// first 现在不再拥有对象
+\end{lstlisting}
+
+如果一个函数只观察用户，不要接收 \code{unique_ptr}，而应该接收引用或指针：
+
+\begin{lstlisting}[language=C++,caption={观察对象不要夺取所有权}]
+void print_user(const User& user);
+void maybe_print_user(const User* user);
+\end{lstlisting}
+
+\section{shared\_ptr 不是默认选择}
+
+\code{std::shared_ptr} 表达共享所有权。共享所有权意味着对象最后由谁释放取决于所有引用计数的生命周期。这在图结构、缓存、异步回调中有用，但也更难推理。
+
+\begin{warningbox}
+不要因为“不知道谁拥有”就默认用 \code{shared_ptr}。这通常说明设计边界还没想清楚。优先用值、引用、\code{unique_ptr}；确实有共享生命周期时再用 \code{shared_ptr}。
+\end{warningbox}
+
+\section{移动语义解决的不是“更快复制”}
+
+移动语义经常被误解成一种性能魔法。它真正表达的是：一个对象内部拥有的资源可以转交给另一个对象，原对象进入仍然有效但内容不再依赖的状态。以字符串为例：
+
+\begin{lstlisting}[language=C++,caption={移动字符串}]
+std::string source = "large payload";
+std::string target = std::move(source);
+\end{lstlisting}
+
+移动后 \code{source} 仍然可以析构、赋新值、调用不要求具体内容的成员函数；但不要继续假设它还保存 \code{"large payload"}。移动不是复制，移动后的对象也不是被销毁的对象。
+
+设计构造函数时，一个常用模式是“按值接收，然后移动进成员”。调用者传右值时可以移动；传左值时会复制一份，语义也清楚。
+
+\begin{lstlisting}[language=C++,caption={按值接收并移动进成员}]
+class UserProfile {
+public:
+    explicit UserProfile(std::string name)
+        : name_{std::move(name)}
+    {
+    }
+
+private:
+    std::string name_;
+};
+\end{lstlisting}
+
+这个模式适合构造函数或明确要保存副本的 API。不适合只观察参数的函数。只观察时仍然应该用 \code{std::string_view} 或 \code{const std::string&}。
+
+\section{悬空引用}
+
+生命周期错误里最危险的是悬空引用：引用或指针指向的对象已经销毁。
+
+\begin{lstlisting}[language=C++,caption={返回局部变量引用是错误}]
+const std::string& bad_name()
+{
+    std::string name = "Ada";
+    return name; // 错误：函数返回后 name 已销毁
+}
+\end{lstlisting}
+
+正确做法通常是返回值。现代编译器会做返回值优化或移动，没必要为了“省一次复制”返回悬空引用。
+
+\begin{lstlisting}[language=C++,caption={返回值拥有自己的生命周期}]
+std::string make_name()
+{
+    return "Ada";
+}
+\end{lstlisting}
+
+\section{本章边界检查}
+
+看到资源管理代码时，问四个问题：
+
+\begin{itemize}
+  \item 谁拥有资源？
+  \item 资源什么时候释放？
+  \item 出错或提前返回时是否释放？
+  \item 接口是在观察资源，还是转移所有权？
+\end{itemize}
+
+这四个问题比背智能指针 API 更重要。
+
+\section{异常路径下 RAII 为什么成立}
+
+手动释放资源最怕“中间退出”。下面这个版本只要第二步失败，就必须记得关闭文件：
+
+\begin{lstlisting}[language=C++,caption={多出口函数里的手动清理压力}]
+void write_two_lines_c_style()
+{
+    FILE* file = std::fopen("out.txt", "w");
+    if (file == nullptr) {
+        return;
+    }
+    if (std::fprintf(file, "first\n") < 0) {
+        std::fclose(file);
+        return;
+    }
+    if (std::fprintf(file, "second\n") < 0) {
+        std::fclose(file);
+        return;
+    }
+    std::fclose(file);
+}
+\end{lstlisting}
+
+这个例子里每个失败分支都要重复 \code{fclose}。分支越多，遗漏概率越高。RAII 把重复规则变成对象析构规则：
+
+\begin{lstlisting}[language=C++,caption={RAII 让退出路径统一}]
+void write_two_lines()
+{
+    std::ofstream output{"out.txt"};
+    if (!output) {
+        return;
+    }
+    output << "first\n";
+    if (!output) {
+        return;
+    }
+    output << "second\n";
+}
+\end{lstlisting}
+
+无论函数从哪个 \code{return} 离开，\code{output} 都会析构。异常路径也一样：栈展开时已经构造成功的局部对象会按逆序析构。这个性质是现代 \cpp 资源管理的地基。
+
+\section{所有权转移要在接口上可见}
+
+观察下面两个函数签名：
+
+\begin{lstlisting}[language=C++,caption={签名暴露所有权语义}]
+void inspect_user(const User& user);
+void store_user(std::unique_ptr<User> user);
+\end{lstlisting}
+
+\code{inspect_user} 告诉调用者：函数只观察对象，调用结束后对象仍归调用者所有。\code{store_user} 告诉调用者：函数会接管对象所有权，调用后原来的 \code{unique_ptr} 不再拥有对象。调用点必须写出 \code{std::move}：
+
+\begin{lstlisting}[language=C++,caption={调用点显式转移所有权}]
+auto user = make_user("Ada");
+inspect_user(*user);
+store_user(std::move(user));
+\end{lstlisting}
+
+这个 \code{std::move} 不是把内存“立刻搬走”的命令，它是一个把左值转换成可移动表达式的标记。真正的移动由目标类型的移动构造或移动赋值完成。写 \code{std::move} 的价值是让读代码的人看见所有权边界。
+
+\section{移动后的对象该怎么用}
+
+移动后的对象仍然有效，但值通常不再值得假设。最安全的后续操作是销毁、重新赋值或调用明确允许的查询：
+
+\begin{lstlisting}[language=C++,caption={移动后重新赋值再使用}]
+std::string name = "Ada";
+std::string stored = std::move(name);
+
+name = "Grace";
+std::cout << name << '\n';
+\end{lstlisting}
+
+不要写依赖移动后内容的代码：
+
+\begin{lstlisting}[language=C++,caption={不要依赖移动后的旧内容}]
+std::string name = "Ada";
+std::string stored = std::move(name);
+// 不要假设 name.empty() 一定为 true
+\end{lstlisting}
+
+标准只保证 \code{name} 处在可析构、可赋值的有效状态，不保证它具体等于什么。这个规则在容器、字符串、智能指针里都要记住。
+
+\section{shared\_ptr 的典型陷阱：循环引用}
+
+共享所有权最大的陷阱是循环引用：
+
+\begin{lstlisting}[language=C++,caption={共享指针循环引用会阻止释放}]
+struct Node {
+    std::shared_ptr<Node> next;
+    std::shared_ptr<Node> prev;
+};
+
+auto first = std::make_shared<Node>();
+auto second = std::make_shared<Node>();
+first->next = second;
+second->prev = first;
+\end{lstlisting}
+
+即使外部的 \code{first} 和 \code{second} 离开作用域，两个节点仍然互相持有对方，引用计数不能归零。反向边如果只是观察关系，应该用 \code{std::weak_ptr}：
+
+\begin{lstlisting}[language=C++,caption={弱指针表达非拥有反向引用}]
+struct Node {
+    std::shared_ptr<Node> next;
+    std::weak_ptr<Node> prev;
+};
+\end{lstlisting}
+
+这再次说明：智能指针不是“高级指针替代品”，而是所有权词汇。选错词汇，生命周期仍然会错。
+
+\begin{exercisebox}
+写一个 \code{Timer} 类，在构造时记录开始时间，在析构时打印耗时。然后把它放进一个有多个 \code{return} 分支的函数里，观察每条路径都会打印耗时。这个练习能帮助你把 RAII 从“文件关闭”推广到任意成对动作。
+\end{exercisebox}

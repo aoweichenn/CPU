@@ -1,0 +1,203 @@
+\chapter{性能、内存和测量}
+
+\section{问题入口：字符串拼接为什么慢}
+
+性能优化不能靠感觉。先看一个常见例子：拼接很多小字符串。
+
+\begin{lstlisting}[language=C++,caption={反复拼接可能频繁分配}]
+std::string build_line(const std::vector<std::string>& parts)
+{
+    std::string line;
+    for (const std::string& part : parts) {
+        line += part;
+        line += ',';
+    }
+    return line;
+}
+\end{lstlisting}
+
+这段代码可能多次扩容。每次扩容都可能分配新内存、复制旧内容。优化前先确认瓶颈，如果它在热路径，可以先预估长度并 \code{reserve}。
+
+\begin{lstlisting}[language=C++,caption={预留容量减少分配}]
+std::string build_line_reserved(const std::vector<std::string>& parts)
+{
+    std::size_t total_size = 0;
+    for (const std::string& part : parts) {
+        total_size += part.size() + 1;
+    }
+
+    std::string line;
+    line.reserve(total_size);
+    for (const std::string& part : parts) {
+        line += part;
+        line += ',';
+    }
+    return line;
+}
+\end{lstlisting}
+
+\section{复杂度和常数都要看}
+
+\code{O(n)} 不等于一定快，\code{O(n log n)} 不等于一定慢。数据规模、内存局部性、分配次数和分支预测都会影响实际时间。比如 \code{std::vector} 线性查找小数组，可能比 \code{std::unordered_set} 更快，因为连续内存和低常数优势明显。
+
+\section{避免不必要复制}
+
+性能问题里最常见的是无意复制：
+
+\begin{lstlisting}[language=C++,caption={range-for 中复制字符串}]
+for (auto name : names) {
+    use(name);
+}
+\end{lstlisting}
+
+如果 \code{use} 只观察，应该写：
+
+\begin{lstlisting}[language=C++,caption={只读遍历用 const 引用}]
+for (const auto& name : names) {
+    use(name);
+}
+\end{lstlisting}
+
+函数参数同理。大的字符串、向量、路径、映射和业务对象，不要在只读场景按值传递。
+
+\section{测量要可重复}
+
+一个最小 benchmark 要避免三个错误：测量太短、把 I/O 算进去、编译器把结果优化掉。下面只是示意：
+
+\begin{lstlisting}[language=C++,caption={用稳定时钟做粗略测量}]
+#include <chrono>
+#include <iostream>
+
+template <typename Func>
+void measure(std::string_view name, Func func)
+{
+    const auto start = std::chrono::steady_clock::now();
+    const auto result = func();
+    const auto finish = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        finish - start);
+    std::cout << name << ": " << elapsed.count()
+              << " us, result=" << result << '\n';
+}
+\end{lstlisting}
+
+严肃 benchmark 应使用专门框架，并固定编译选项、输入规模、运行次数和机器状态。本章先建立测量意识。
+
+\section{优化前后的检查单}
+
+优化不是把代码写得更低级。每次优化前后都应该记录：
+
+\begin{itemize}
+  \item 输入规模：小数据、中数据和目标大数据分别是多少。
+  \item 编译模式：Debug 结果通常不能代表性能。
+  \item 指标：延迟、吞吐、内存占用还是分配次数。
+  \item 正确性：优化后是否跑过同一组测试。
+  \item 可维护性：复杂度增加是否值得。
+\end{itemize}
+
+例如给字符串拼接加 \code{reserve}，复杂度没有改变，但减少了分配次数，代码仍然容易理解。反过来，如果为了省一个小对象复制引入手写内存池，就必须有测量证明它在目标场景中值得。
+
+\section{内存布局}
+
+对象布局会影响缓存。把频繁一起访问的数据放在连续内存里，通常比到处跳指针更友好。
+
+\begin{lstlisting}[language=C++,caption={连续数组适合批量处理}]
+struct Point {
+    double x = 0.0;
+    double y = 0.0;
+};
+
+double sum_x(std::span<const Point> points)
+{
+    double total = 0.0;
+    for (const Point& point : points) {
+        total += point.x;
+    }
+    return total;
+}
+\end{lstlisting}
+
+更高级场景会讨论结构数组和数组结构。本书先记住：性能不仅是算法，也包括数据如何摆放。
+
+\begin{warningbox}
+不要先优化再证明。先写清楚正确性和边界，再用测量找瓶颈。没有测量的优化，经常只是把代码变复杂。
+\end{warningbox}
+
+\section{从分配次数理解 reserve}
+
+字符串拼接慢，根本原因常常不是 \code{+=} 这个符号，而是容量不够时需要重新分配。假设目标字符串最终长度是 \code{100000}，如果容量从很小开始逐步增长，就会多次申请新内存，并把旧内容搬过去。每搬一次，历史内容又被读写一遍。
+
+\code{reserve} 的推理链条是：我们能提前算出最终长度；最终长度给了容器容量上界；提前申请一次能减少后续扩容；扩容减少后，总复制量和分配次数下降。这个优化仍然保持同样的接口和同样的复杂度，维护成本很低，所以优先级高。
+
+\section{局部性案例：vector 与 list}
+
+很多人以为 \code{std::list} 插入删除快，所以应该更快。对大量顺序遍历来说，事实常常相反：
+
+\begin{lstlisting}[language=C++,caption={顺序求和更适合连续内存}]
+int sum_vector(const std::vector<int>& values)
+{
+    int total = 0;
+    for (int value : values) {
+        total += value;
+    }
+    return total;
+}
+\end{lstlisting}
+
+\code{vector} 的元素连续，CPU 能更好地预取。链表每个节点可能分散在内存各处，遍历时不断追指针。算法复杂度同样是 \complexity{O(n)}，但常数和缓存局部性差很多。除非你真的需要稳定节点和频繁中间插入删除，否则不要默认选择链表。
+
+\section{避免复制要看语义}
+
+不是所有按值都是错。构造函数保存一个字符串时，按值接收再移动是合理的；只读函数按值接收大对象就不合理。判断标准是：函数是否需要拥有一份独立副本。
+
+\begin{lstlisting}[language=C++,caption={有意按值接收用于保存}]
+class LogMessage {
+public:
+    explicit LogMessage(std::string text)
+        : text_{std::move(text)}
+    {
+    }
+
+private:
+    std::string text_;
+};
+\end{lstlisting}
+
+如果只是打印：
+
+\begin{lstlisting}[language=C++,caption={只观察时不要复制}]
+void print_message(std::string_view text)
+{
+    std::cout << text << '\n';
+}
+\end{lstlisting}
+
+\code{std::string_view} 不拥有字符内容，所以不能长期保存到对象里，除非你能证明底层字符串活得更久。性能优化和生命周期安全必须一起看。
+
+\section{benchmark 的最小可信做法}
+
+粗略测量时，至少让函数重复多次，并把结果用掉：
+
+\begin{lstlisting}[language=C++,caption={重复运行降低偶然波动}]
+template <typename Func>
+void measure_many(std::string_view name, Func func)
+{
+    constexpr int RUNS = 50;
+    std::int64_t checksum = 0;
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < RUNS; ++i) {
+        checksum += func();
+    }
+    const auto finish = std::chrono::steady_clock::now();
+    const auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+        finish - start);
+    std::cout << name << ": " << elapsed.count()
+              << " us, checksum=" << checksum << '\n';
+}
+\end{lstlisting}
+
+\code{checksum} 的作用是让计算结果参与可观察输出，降低编译器把整个计算优化掉的可能。真正严肃的性能分析还要用 profiler、benchmark 框架和固定环境；但这个最小版本已经比凭感觉强很多。
+
+\begin{exercisebox}
+实现两个版本的字符串拼接：一个不 \code{reserve}，一个先计算总长度再 \code{reserve}。用 Release 构建分别测试 \code{100}、\code{10000}、\code{100000} 个片段。记录时间和输出长度，确认优化没有改变结果。
+\end{exercisebox}

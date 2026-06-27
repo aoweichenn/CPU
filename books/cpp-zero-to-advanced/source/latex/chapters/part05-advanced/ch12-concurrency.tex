@@ -1,0 +1,244 @@
+\chapter{并发、线程和同步}
+
+\section{问题入口：两个线程同时计数}
+
+并发最容易制造“偶尔错”的程序。看一个简单计数器：
+
+\begin{lstlisting}[language=C++,caption={数据竞争}]
+#include <thread>
+
+int counter = 0;
+
+void increment_many()
+{
+    for (int i = 0; i < 100000; ++i) {
+        ++counter;
+    }
+}
+\end{lstlisting}
+
+如果两个线程同时执行，结果未必是 \code{200000}。\code{++counter} 不是不可分割动作，它通常包含读取、加一、写回。两个线程交错时会丢更新。这是数据竞争，行为不可靠。
+
+\section{mutex 保护共享状态}
+
+\begin{lstlisting}[language=C++,caption={用 mutex 保护计数器}]
+#include <mutex>
+
+class Counter {
+public:
+    void increment()
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        ++this->value_;
+    }
+
+    [[nodiscard]] int value() const
+    {
+        std::lock_guard<std::mutex> lock{this->mutex_};
+        return this->value_;
+    }
+
+private:
+    mutable std::mutex mutex_;
+    int value_ = 0;
+};
+\end{lstlisting}
+
+\code{std::lock_guard} 是 RAII：构造时加锁，析构时解锁。即使中途抛异常，也会释放锁。
+
+\section{atomic 适合简单共享变量}
+
+简单计数可以用原子类型：
+
+\begin{lstlisting}[language=C++,caption={atomic 计数}]
+#include <atomic>
+
+std::atomic<int> counter{0};
+
+void increment_many()
+{
+    for (int i = 0; i < 100000; ++i) {
+        counter.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+\end{lstlisting}
+
+\code{memory_order_relaxed} 只保证计数本身原子，不建立额外同步关系。入门阶段不要随意选择内存序。默认顺序一致最容易推理；只有在测量证明需要时，才进入更细的内存序设计。
+
+\section{条件变量表达等待}
+
+线程间等待不要忙等。生产者消费者可以用 \code{std::condition_variable}。
+
+\begin{lstlisting}[language=C++,caption={条件变量等待队列非空}]
+#include <condition_variable>
+#include <mutex>
+#include <queue>
+
+class WorkQueue {
+public:
+    void push(int value)
+    {
+        {
+            std::lock_guard<std::mutex> lock{this->mutex_};
+            this->queue_.push(value);
+        }
+        this->ready_.notify_one();
+    }
+
+    int pop()
+    {
+        std::unique_lock<std::mutex> lock{this->mutex_};
+        this->ready_.wait(lock, [this] {
+            return !this->queue_.empty();
+        });
+        const int value = this->queue_.front();
+        this->queue_.pop();
+        return value;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::queue<int> queue_;
+};
+\end{lstlisting}
+
+\code{wait} 必须带谓词，因为线程可能被虚假唤醒。谓词是等待条件的正式表达。
+
+\section{线程退出也是协议}
+
+生产者消费者队列如果没有退出协议，消费者可能永远阻塞。可以加入关闭标志：
+
+\begin{lstlisting}[language=C++,caption={带关闭协议的队列片段}]
+class ClosableQueue {
+public:
+    void close()
+    {
+        {
+            std::lock_guard<std::mutex> lock{this->mutex_};
+            this->closed_ = true;
+        }
+        this->ready_.notify_all();
+    }
+
+    std::optional<int> pop()
+    {
+        std::unique_lock<std::mutex> lock{this->mutex_};
+        this->ready_.wait(lock, [this] {
+            return this->closed_ || !this->queue_.empty();
+        });
+        if (this->queue_.empty()) {
+            return std::nullopt;
+        }
+        const int value = this->queue_.front();
+        this->queue_.pop();
+        return value;
+    }
+
+private:
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::queue<int> queue_;
+    bool closed_ = false;
+};
+\end{lstlisting}
+
+关闭不是简单地杀线程，而是让等待方能观察到“不会再有新任务”的状态，并自然退出循环。
+
+\section{本章边界检查}
+
+写并发代码时至少检查：
+
+\begin{itemize}
+  \item 哪些状态被多个线程共享？
+  \item 每个共享状态由哪个锁或原子保护？
+  \item 是否存在锁顺序反转导致死锁？
+  \item 条件变量是否用谓词等待？
+  \item 线程退出和资源释放路径是否明确？
+\end{itemize}
+
+\begin{keyidea}
+并发编程的第一原则是减少共享。能在线程内拥有的数据，不共享；必须共享的数据，用清晰同步边界保护。
+\end{keyidea}
+
+\section{从一次丢更新推导数据竞争}
+
+\code{++counter} 可以拆成三步：读取旧值、计算新值、写回新值。假设两个线程都看到旧值是 \code{10}：
+
+\begin{lstlisting}[caption={一次丢更新的交错过程}]
+线程 A: read counter -> 10
+线程 B: read counter -> 10
+线程 A: write 11
+线程 B: write 11
+\end{lstlisting}
+
+执行了两次自增，结果却只增加一次。这不是“线程不够快”，而是没有同步保护共享状态。只要两个线程同时访问同一内存位置，至少一个写，并且没有同步，就形成数据竞争。
+
+\section{锁保护的是不变量，不是一行代码}
+
+给计数器加锁很简单，但真实对象往往有多个成员。锁要保护的是这些成员之间的不变量。比如银行账户转账，不能只给扣款和加款分别加锁后随意组合，还要考虑两个账户的锁顺序。
+
+死锁的典型反例：
+
+\begin{lstlisting}[language=C++,caption={锁顺序反转可能死锁}]
+void transfer(Account& from, Account& to, int amount)
+{
+    std::lock_guard<std::mutex> first{from.mutex};
+    std::lock_guard<std::mutex> second{to.mutex};
+    from.balance -= amount;
+    to.balance += amount;
+}
+\end{lstlisting}
+
+如果线程一执行 \code{transfer(a, b, 10)}，线程二同时执行 \code{transfer(b, a, 20)}，两个线程可能各自拿住一个锁，然后等待对方释放。可以用 \code{std::scoped_lock} 一次锁住多个互斥量：
+
+\begin{lstlisting}[language=C++,caption={作用域锁同时获取多个锁}]
+void transfer(Account& from, Account& to, int amount)
+{
+    std::scoped_lock lock{from.mutex, to.mutex};
+    from.balance -= amount;
+    to.balance += amount;
+}
+\end{lstlisting}
+
+更完整的设计还要处理 \code{from} 和 \code{to} 是同一个账户、余额不足、异常安全等业务规则。并发代码不能脱离不变量讨论。
+
+\section{jthread 让线程生命周期更安全}
+
+\cpp20 提供 \code{std::jthread}，析构时会请求停止并自动 join。相比裸 \code{std::thread}，它更符合 RAII：
+
+\begin{lstlisting}[language=C++,caption={jthread 自动 join}]
+#include <chrono>
+#include <thread>
+
+void worker(std::stop_token token)
+{
+    while (!token.stop_requested()) {
+        do_one_unit_of_work();
+    }
+}
+
+void run_background()
+{
+    std::jthread thread{worker};
+    std::this_thread::sleep_for(std::chrono::seconds{1});
+} // thread 析构时请求停止并 join
+\end{lstlisting}
+
+这不等于可以随便启动后台线程。停止请求只是协作信号，工作函数必须定期检查它。如果线程阻塞在条件变量或 I/O 上，还需要设计唤醒和关闭协议。
+
+\section{条件变量为什么要谓词}
+
+条件变量可能虚假唤醒，也可能在通知前条件已经变化。谓词把“醒来后是否真的能继续”写成可重复检查的条件：
+
+\begin{lstlisting}[language=C++,caption={wait 等价于循环检查}]
+while (queue.empty() && !closed) {
+    ready.wait(lock);
+}
+\end{lstlisting}
+
+带谓词的 \code{wait} 帮你写出这个循环。不要用 \code{if} 替代 \code{while}，因为醒来不代表条件一定满足。
+
+\begin{exercisebox}
+给 \code{ClosableQueue} 增加一个 \code{push} 规则：关闭后不允许再插入。设计返回值或异常策略，并测试三个场景：正常 push/pop、关闭空队列、关闭后 push。
+\end{exercisebox}

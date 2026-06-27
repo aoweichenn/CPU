@@ -1,0 +1,180 @@
+\chapter{类、封装和不变量}
+
+\section{问题入口：温度范围}
+
+类不是把几个变量包起来。类的价值在于维护不变量。\term{不变量}{invariant} 指对象在任何对外可见状态下都必须成立的条件。假设要表示一个温度区间，要求最低温不能高于最高温。
+
+朴素结构体写法如下：
+
+\begin{lstlisting}[language=C++,caption={没有保护不变量的结构体}]
+struct TemperatureRange {
+    double low = 0.0;
+    double high = 0.0;
+};
+
+TemperatureRange range{.low = 30.0, .high = 10.0}; // 逻辑错误
+\end{lstlisting}
+
+编译器不知道业务规则，所以这段代码能编译。要把规则放进类型里。
+
+\section{构造函数建立有效状态}
+
+\begin{lstlisting}[language=C++,caption={构造函数检查不变量}]
+#include <stdexcept>
+
+class TemperatureRange {
+public:
+    TemperatureRange(double low, double high)
+        : low_{low}, high_{high}
+    {
+        if (high < low) {
+            throw std::invalid_argument{"high must not be lower than low"};
+        }
+    }
+
+    [[nodiscard]] double low() const noexcept
+    {
+        return this->low_;
+    }
+
+    [[nodiscard]] double high() const noexcept
+    {
+        return this->high_;
+    }
+
+    [[nodiscard]] bool contains(double value) const noexcept
+    {
+        return this->low_ <= value && value <= this->high_;
+    }
+
+private:
+    double low_ = 0.0;
+    double high_ = 0.0;
+};
+\end{lstlisting}
+
+数据成员是私有的，调用者不能绕过构造函数随意改。成员函数里使用 \code{this->}，目的是把“当前对象的成员”写清楚。
+
+\section{setter 不一定是封装}
+
+很多人把封装理解成“成员私有，再给每个成员写 getter 和 setter”。这只是形式。如果写出下面的接口，不变量又被破坏了：
+
+\begin{lstlisting}[language=C++,caption={危险的 setter}]
+void set_low(double value)
+{
+    this->low_ = value; // 可能让 low_ > high_
+}
+\end{lstlisting}
+
+更好的接口应该表达业务动作。例如扩展范围：
+
+\begin{lstlisting}[language=C++,caption={用业务动作维护不变量}]
+void expand_to_include(double value) noexcept
+{
+    if (value < this->low_) {
+        this->low_ = value;
+    }
+    if (value > this->high_) {
+        this->high_ = value;
+    }
+}
+\end{lstlisting}
+
+调用者不需要知道内部如何保存，只知道对象会把某个值纳入范围。
+
+\section{值语义优先}
+
+\code{TemperatureRange} 可以复制、赋值、放进 \code{std::vector}。这是值语义。值语义让对象像数字和字符串一样好用。
+
+\begin{lstlisting}[language=C++,caption={值语义让对象易组合}]
+std::vector<TemperatureRange> ranges;
+ranges.emplace_back(10.0, 20.0);
+ranges.emplace_back(-5.0, 8.0);
+\end{lstlisting}
+
+不要过早把所有类都设计成继承体系。许多业务概念更适合小而明确的值对象。
+
+\section{本章边界检查}
+
+设计类时至少问：
+
+\begin{itemize}
+  \item 对象什么时候有效？
+  \item 哪些状态绝对不允许出现？
+  \item 构造函数能否一次建立有效状态？
+  \item 对外接口是业务动作，还是裸字段修改？
+  \item 对象是否应该支持复制和移动？
+\end{itemize}
+
+\begin{keyidea}
+类的核心不是语法里的 \code{class}，而是把数据和规则放在同一个边界内。好的类让错误状态难以构造，让正确用法自然出现。
+\end{keyidea}
+
+\section{从坏对象推导构造边界}
+
+继续看温度区间。为什么不能让调用者先默认构造，再分别设置上下界？因为中间状态可能已经被观察到：
+
+\begin{lstlisting}[language=C++,caption={分步设置制造临时坏状态}]
+TemperatureRange range;
+range.set_high(10.0);
+range.set_low(30.0); // 如果允许，就破坏 low <= high
+if (range.contains(20.0)) {
+    // 这里的判断已经没有可信含义
+}
+\end{lstlisting}
+
+这个反例推出一条类设计规则：如果一个对象必须同时拥有几项数据才有效，就让构造函数一次收齐这些数据，并在构造边界检查。不应该把“不完整但暂时别用”的对象暴露给普通调用者。
+
+\section{成员函数应该维护对象语义}
+
+假设业务需要把两个温度区间合并。不要把内部字段拿出来让调用者自己算，而是提供表达业务的函数：
+
+\begin{lstlisting}[language=C++,caption={合并两个有效区间}]
+TemperatureRange merge(TemperatureRange lhs, TemperatureRange rhs)
+{
+    const double low = std::min(lhs.low(), rhs.low());
+    const double high = std::max(lhs.high(), rhs.high());
+    return TemperatureRange{low, high};
+}
+\end{lstlisting}
+
+因为 \code{lhs} 和 \code{rhs} 都已经是有效对象，\code{min(low)} 和 \code{max(high)} 构造出来的新对象也应当有效。这里的推理链条很重要：类不变量让函数可以建立在更少的防御性检查上。
+
+\section{什么时候用 struct，什么时候用 class}
+
+\cpp 里 \code{struct} 和 \code{class} 的主要语法差异是默认访问权限；真正的设计差异来自意图。只承载数据、没有复杂不变量的聚合，适合 \code{struct}：
+
+\begin{lstlisting}[language=C++,caption={简单结果适合 struct}]
+struct ScoreSummary {
+    std::size_t count = 0;
+    int sum = 0;
+    double average = 0.0;
+};
+\end{lstlisting}
+
+需要保护规则、隐藏表示、控制修改路径的概念，适合 \code{class}。这不是硬性宗教，而是让读者一看到类型形态，就能大致知道它的使用方式。
+
+\section{类的测试不是只测 getter}
+
+测试 \code{TemperatureRange} 时，不要只检查 \code{low()} 和 \code{high()} 返回原值。更重要的是不变量：
+
+\begin{lstlisting}[language=C++,caption={围绕不变量测试类}]
+const TemperatureRange normal{10.0, 20.0};
+assert(normal.contains(10.0));
+assert(normal.contains(15.0));
+assert(!normal.contains(21.0));
+
+bool rejected = false;
+try {
+    const TemperatureRange invalid{30.0, 10.0};
+} catch (const std::invalid_argument&) {
+    rejected = true;
+}
+assert(rejected);
+\end{lstlisting}
+
+如果一个类的测试只是在验证字段保存和取出，说明这个类可能没有承担真正职责；它也许只是一个 \code{struct}，或者需要重新思考业务动作。
+
+\begin{exercisebox}
+实现一个 \code{Date} 类，要求月份在 \code{1} 到 \code{12}，日期必须符合月份天数。先不处理闰年，再把闰年规则加进去。练习重点不是背日期算法，而是把“不允许出现的状态”挡在构造函数外。
+\end{exercisebox}

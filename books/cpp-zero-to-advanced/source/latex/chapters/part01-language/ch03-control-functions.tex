@@ -1,0 +1,207 @@
+\chapter{控制流、函数和错误路径}
+
+\section{问题入口：命令行参数解析}
+
+控制流不是只会写 \code{if} 和 \code{for}。真正的训练是把正常路径和错误路径写清楚。假设程序支持：
+
+\begin{lstlisting}[language=bash,caption={命令行需求}]
+tool --input data.txt --limit 100
+\end{lstlisting}
+
+朴素写法会在 \code{main} 里一边循环一边判断：
+
+\begin{lstlisting}[language=C++,caption={混乱的参数解析}]
+for (int i = 1; i < argc; ++i) {
+    std::string arg = argv[i];
+    if (arg == "--input") {
+        input = argv[++i];
+    } else if (arg == "--limit") {
+        limit = std::stoi(argv[++i]);
+    }
+}
+\end{lstlisting}
+
+这段代码漏了很多边界：\code{--input} 后面没有值会越界，\code{--limit abc} 会抛异常，重复参数如何处理也不明确。
+
+\section{先定义结果}
+
+参数解析的结果应该是一个类型：
+
+\begin{lstlisting}[language=C++,caption={参数解析结果}]
+#include <optional>
+#include <string>
+
+struct Options {
+    std::string input_path;
+    int limit = 0;
+};
+
+struct ParseError {
+    std::string message;
+};
+\end{lstlisting}
+
+标准库直到 C++23 才有 \code{std::expected}。为了保持 C++20，本章用一个简单结构表达“成功或失败”：
+
+\begin{lstlisting}[language=C++,caption={C++20 下的简单结果类型}]
+struct ParseResult {
+    std::optional<Options> options;
+    std::optional<ParseError> error;
+};
+\end{lstlisting}
+
+真实项目可以使用成熟的 \code{expected} 实现；教材这里先把控制流讲清楚。
+
+\section{让循环只做推进}
+
+解析函数可以按下标推进。每次遇到需要值的选项，都先检查后面是否还有参数。
+
+\begin{lstlisting}[language=C++,caption={明确错误路径的参数解析}]
+#include <cstdlib>
+#include <string_view>
+#include <vector>
+
+ParseResult parse_options(std::span<char* const> args)
+{
+    Options options;
+    bool has_input = false;
+    bool has_limit = false;
+
+    for (std::size_t i = 1; i < args.size(); ++i) {
+        const std::string_view arg = args[i];
+        if (arg == "--input") {
+            if (i + 1 >= args.size()) {
+                return {.error = ParseError{"--input requires a value"}};
+            }
+            options.input_path = args[++i];
+            has_input = true;
+            continue;
+        }
+        if (arg == "--limit") {
+            if (i + 1 >= args.size()) {
+                return {.error = ParseError{"--limit requires a value"}};
+            }
+            const std::string value = args[++i];
+            try {
+                options.limit = std::stoi(value);
+            } catch (const std::exception&) {
+                return {.error = ParseError{"--limit must be an integer"}};
+            }
+            has_limit = true;
+            continue;
+        }
+        return {.error = ParseError{"unknown option"}};
+    }
+
+    if (!has_input) {
+        return {.error = ParseError{"missing --input"}};
+    }
+    if (!has_limit) {
+        return {.error = ParseError{"missing --limit"}};
+    }
+    return {.options = options};
+}
+\end{lstlisting}
+
+这段代码不追求最短。它追求每个错误路径都能解释。工程代码里，错误消息是接口的一部分。
+
+\section{函数大小和责任边界}
+
+当解析规则继续增多，可以把“取下一个值”抽成辅助函数，把“字符串转整数”抽成辅助函数。拆函数不是为了好看，而是为了隔离可测试的决策点。
+
+\begin{lstlisting}[language=C++,caption={把字符串转整数变成独立函数}]
+std::optional<int> parse_int(std::string_view text)
+{
+    try {
+        std::size_t consumed = 0;
+        const int value = std::stoi(std::string{text}, &consumed);
+        if (consumed != text.size()) {
+            return std::nullopt;
+        }
+        return value;
+    } catch (const std::exception&) {
+        return std::nullopt;
+    }
+}
+\end{lstlisting}
+
+这里有一个小成本：\code{std::stoi} 接受 \code{std::string}，所以我们从 \code{string_view} 构造了字符串。性能敏感场景可以用 \code{std::from_chars}。入门阶段先把正确性和接口讲清楚。
+
+\section{本章边界检查}
+
+控制流代码要重点检查：
+
+\begin{itemize}
+  \item 选项缺值。
+  \item 未知选项。
+  \item 数字格式错误。
+  \item 重复选项是否允许。
+  \item 默认值是否真实表达业务需求。
+\end{itemize}
+
+\begin{keyidea}
+控制流的高级能力不是写复杂分支，而是让每条路径都有清晰含义。正常路径短，错误路径明确，状态推进单调，函数边界可测试。
+\end{keyidea}
+
+\section{从缺值反例推到下标推进规则}
+
+参数解析最容易错在 \code{++i}。看这个输入：
+
+\begin{lstlisting}[language=bash,caption={缺少参数值的输入}]
+tool --input
+\end{lstlisting}
+
+如果代码直接写 \code{input = argv[++i]}，\code{i} 会越过最后一个参数。这个反例推出第一条规则：任何消耗下一个参数的选项，都必须先检查 \code{i + 1 < args.size()}。再看另一个输入：
+
+\begin{lstlisting}[language=bash,caption={未知选项不能静默忽略}]
+tool --input data.txt --limt 100
+\end{lstlisting}
+
+\code{--limt} 是拼写错误。如果解析器静默忽略未知选项，程序可能用默认限制继续跑，结果比直接失败更危险。这个反例推出第二条规则：未知选项应该成为错误，除非需求明确允许透传。
+
+\section{让数字解析没有半截成功}
+
+\code{std::stoi("12abc")} 会解析出 \code{12}，如果不检查消费长度，就会把坏输入当成好输入。前面 \code{parse_int} 里检查 \code{consumed != text.size()}，就是为了排除这种半截成功。
+
+在 \cpp20 中也可以用 \code{std::from_chars}，它不抛异常，也不受本地化影响：
+
+\begin{lstlisting}[language=C++,caption={用字符转换解析整数}]
+#include <charconv>
+
+std::optional<int> parse_int_fast(std::string_view text)
+{
+    int value = 0;
+    const char* begin = text.data();
+    const char* end = text.data() + text.size();
+    const auto [ptr, ec] = std::from_chars(begin, end, value);
+    if (ec != std::errc{} || ptr != end) {
+        return std::nullopt;
+    }
+    return value;
+}
+\end{lstlisting}
+
+这个版本更适合底层解析。它的接口仍然返回 \code{std::optional<int>}，因为调用者关心的是“是否完整解析成功”，而不是底层用了异常还是错误码。
+
+\section{把主流程写成可读句子}
+
+解析函数写好后，\code{main} 不应该继续塞满细节。入口可以保持很薄：
+
+\begin{lstlisting}[language=C++,caption={入口只负责连接步骤}]
+int run(std::span<char* const> args)
+{
+    const ParseResult parsed = parse_options(args);
+    if (parsed.error.has_value()) {
+        std::cerr << parsed.error->message << '\n';
+        return 2;
+    }
+
+    return run_with_options(*parsed.options);
+}
+\end{lstlisting}
+
+这里有一个隐含要求：\code{ParseResult} 不能同时既有 \code{options} 又有 \code{error}。更严谨的项目会用 \code{expected} 或自定义变体类型表达二选一。教材这里先用简单结构，是为了把控制流看清楚；真正工程里可以进一步收紧类型。
+
+\begin{exercisebox}
+给参数解析器补上重复选项规则：\code{--limit 10 --limit 20} 是报错，还是后者覆盖前者？先写出你的规则，再修改 \code{has_limit} 分支，让测试覆盖这两种输入。
+\end{exercisebox}
