@@ -1,10 +1,28 @@
 \chapter{实践卷：从 C++ 代码到机器证据}
 
-第一册的实践卷围绕 \filepath{books/cpu-volume-1/labs/lab00_benchmark_foundation}。这一卷不追求堆很多实验，而是训练一条硬链路：C++ 源码、编译选项、可执行文件、输入规模、计时边界、checksum、CSV 报告和反汇编线索。没有这条链路，任何“这个写法更快”的判断都只是感觉。
+第一册实践卷围绕：
 
-\section{实践一：先固定正确性，再测时间}
+\begin{lstlisting}[language=bash]
+books/cpu-volume-1/labs/lab00_benchmark_foundation
+\end{lstlisting}
 
-\code{lab00_tests} 先检查 \code{sum_i32}、\code{sum_f32}、\code{dot_f32}、\code{fill_u8}、\code{copy_u8} 和 benchmark runner 的基本合同。这里的 \code{checksum} 是输出摘要，用来阻止编译器把无用工作优化掉，也用来证明不同实现处理的是同一批输入。若 checksum 不稳定，计时结果没有解释价值。
+这一卷训练一条硬链路：C++ 源码、编译选项、可执行文件、输入规模、计时边界、checksum、CSV 报告和反汇编线索。没有这条链路，任何“这个写法更快”的判断都只是感觉。
+
+\section{一、工程入口}
+
+实践工程的核心文件如下：
+
+\begin{lstlisting}[language=bash]
+include/lab00/kernels.hpp
+include/lab00/benchmark.hpp
+src/kernels.cpp
+src/benchmark.cpp
+src/main.cpp
+src/bad_benchmarks.cpp
+tests/lab00_tests.cpp
+\end{lstlisting}
+
+构建和测试命令如下：
 
 \begin{lstlisting}[language=bash,caption={第一册实践工程构建和测试}]
 cmake -S books/cpu-volume-1 -B books/cpu-volume-1/build/lab00-debug -DCMAKE_BUILD_TYPE=Debug
@@ -12,9 +30,45 @@ cmake --build books/cpu-volume-1/build/lab00-debug
 ctest --test-dir books/cpu-volume-1/build/lab00-debug --output-on-failure
 \end{lstlisting}
 
-\section{实践二：测量报告必须说明边界}
+\section{二、阶段 0：先写 kernel 合同}
 
-正式测量建议用 Release 构建。报告至少写清 CPU 型号、编译器版本、构建类型、输入规模、预热次数、测量次数、是否有后台负载、是否固定频率。不能只贴“耗时多少纳秒”。同一个循环在 Debug 和 Release 下可能完全不同；同一份 Release 二进制在动态频率、虚拟机或手机远程环境下也可能出现噪声。
+\code{kernels.hpp} 中的函数故意很小：
+
+\begin{lstlisting}[language=C++]
+std::int64_t sum_i32(std::span<const std::int32_t> values);
+float sum_f32(std::span<const float> values);
+float dot_f32(std::span<const float> left, std::span<const float> right);
+std::uint64_t fill_u8(std::span<std::uint8_t> output, std::uint8_t value);
+std::uint64_t copy_u8(std::span<const std::uint8_t> input,
+                      std::span<std::uint8_t> output);
+\end{lstlisting}
+
+\code{std::span} 是“连续内存的一段视图”：它不拥有数据，只描述起点和长度。这样函数既能接收 \code{std::vector}，也能接收数组切片，而不复制数据。第一阶段只问正确性：求和是否正确，点积长度不一致是否拒绝，填充和复制是否覆盖每个字节。
+
+\section{三、阶段 1：checksum 先守住正确性}
+
+benchmark 最容易犯的错误是“测到的代码其实没做事”。编译器看到某段计算结果没人使用，可能把整段循环删掉。工程里的 \code{checksum_i64}、\code{checksum_f32} 以及每个 workload 返回的 \code{checksum}，就是为了让结果成为可观察事实。
+
+checksum 不是密码学哈希，它在这里是输出摘要。它要满足两个要求：同一输入同一实现反复运行要稳定；不同实现处理同一批输入时，应能用 checksum 检查是否在测同一件事。若 checksum 变化解释不清，时间数据没有资格进入结论。
+
+\section{四、阶段 2：benchmark runner 的边界}
+
+\code{BenchmarkRunner} 的合同包含四个字段：预热次数、测量次数、输入规模和可选的 benchmark 名称过滤。预热不记录结果，测量才写入 \code{BenchmarkResult}。
+
+阶段化实现顺序如下：
+
+\begin{enumerate}
+  \item 先实现 \code{parse_size_list}，让 \code{"16, 32,64"} 变成三个正数，并拒绝 0。
+  \item 再实现 \code{BenchmarkRunner::add} 和 \code{cases}，确认注册的 case 不丢。
+  \item 然后实现 \code{run}，检查 warmup 加 measured 的调用次数，但只记录 measured 结果。
+  \item 最后实现 \code{write_csv}，固定表头 \code{name,input_size,iteration,elapsed_ns,checksum}。
+\end{enumerate}
+
+测试 \code{test_benchmark_runner_records_measured_iterations_only} 用一个计数 workload 证明 warmup 被执行但不进入结果；\code{test_benchmark_runner_only_filter} 证明过滤条件不会误跑其他 case。
+
+\section{五、阶段 3：正式测量必须说明环境}
+
+Release 构建命令如下：
 
 \begin{lstlisting}[language=bash,caption={运行 Lab 00 benchmark}]
 cmake -S books/cpu-volume-1 -B books/cpu-volume-1/build/lab00-release -DCMAKE_BUILD_TYPE=Release
@@ -23,10 +77,42 @@ ctest --test-dir books/cpu-volume-1/build/lab00-release --output-on-failure
 books/cpu-volume-1/build/lab00-release/bin/cpu-volume-1/lab00/lab00_bench --sizes 1024,65536,1048576
 \end{lstlisting}
 
-\section{实践三：从源码回到汇编}
+报告至少写清 CPU 型号、编译器版本、构建类型、输入规模、预热次数、测量次数、是否有后台负载、是否固定频率。Debug 和 Release 的机器码可能完全不同；虚拟机、远端机器和手机环境也可能因为调度、温度或频率策略带来噪声。
 
-第一册正文讲 C++ 到汇编、ABI 和机器执行。实践卷要求每个性能结论至少给出一个源码到机器证据的回看：热循环里有没有函数调用，是否出现向量指令，是否有意外分支，load/store 是连续还是跨步，编译器有没有把循环删掉。可以用 \cmd{objdump -d}、\cmd{perf} 或编译器生成汇编；若平台没有这些工具，报告要写“未验证”，不能把推断写成事实。
+\section{六、阶段 4：从源码回到汇编}
+
+第一册正文讲 C++、ABI、汇编和机器执行，实践卷就不能只停在 CSV。每个性能结论至少要回看一个机器证据：
+
+\begin{enumerate}
+  \item 热循环里有没有意外函数调用；
+  \item 是否出现向量指令；
+  \item load/store 是否连续；
+  \item 分支是否在内层循环里；
+  \item 编译器是否把计算删除或合并。
+\end{enumerate}
+
+可以用 \cmd{objdump -d}、\cmd{perf} 或编译器生成汇编。若平台没有工具，报告要写“未验证”，不能把推断写成事实。
+
+\section{七、阶段 5：坏 benchmark 也要入书}
+
+\code{src/bad_benchmarks.cpp} 的作用是教你识别坏测量。典型坏例子是在计时循环里反复分配大向量，结果仍然可能有正确 checksum，但测到的主要是分配器、缺页、缓存扰动和初始化成本，不是 \code{dot_f32} 本身。
+
+写坏 benchmark 报告时分三步：先证明它的输出语义没有错；再说明它把哪些额外工作放进了计时边界；最后给出修正版，把输入准备移到计时循环之外。这样读者不会把“代码能跑”误解为“测量可信”。
+
+\section{八、项目阶段清单}
+
+\begin{longtable}{p{0.16\linewidth}p{0.28\linewidth}p{0.46\linewidth}}
+阶段 & 代码切片 & 验收证据 \\
+\hline
+0 & \code{sum_i32/sum_f32/dot_f32/fill_u8/copy_u8} & 单元测试检查数值、长度错误和字节结果 \\
+1 & \code{checksum_i64/checksum_f32} & benchmark workload 返回稳定摘要 \\
+2 & \code{BenchmarkRunner} & warmup 不入结果，measured 写入结果 \\
+3 & \code{write_csv} 与命令行 sizes & CSV 表头稳定，非法 sizes 被拒绝 \\
+4 & Release benchmark & 报告记录环境、输入、迭代和 checksum \\
+5 & 反汇编或 perf 回看 & 至少解释一个热循环机器证据 \\
+6 & \code{lab00_bad_benchmarks} & 说明坏测量把哪些无关成本放进边界 \\
+\end{longtable}
 
 \begin{labbox}
-扩展任务：给 \code{dot_f32} 增加一个“错误 benchmark”版本，例如在测量循环中重复分配向量。先证明它也能得到正确 checksum，再解释为什么它测到的是分配器和缓存扰动，不是纯 dot product。这个任务的价值在于学会识别坏测量。
+扩展任务：给 \code{dot_f32} 增加一个“错误 benchmark”版本，例如在测量循环中重复分配向量。先证明它也能得到正确 checksum，再解释为什么它测到的是分配器和缓存扰动，不是纯 dot product。最后写出修正版，并把两者 CSV 放在报告中对比。
 \end{labbox}

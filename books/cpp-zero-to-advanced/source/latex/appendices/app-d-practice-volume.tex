@@ -1,21 +1,48 @@
 \chapter{实践卷：从语法到工程切片}
 
-本册新增一个可运行实践工程，目录是：
+本册的实践工程目录是：
 
 \begin{lstlisting}[language=bash]
 books/cpp-zero-to-advanced/labs/cpp_practice_workbook
 \end{lstlisting}
 
-它把前面章节里的值类型、字符串视图、容器、异常、类不变量、RAII 思维、泛型算法、测试和 benchmark 放进同一个小项目。项目不是大而空的综合作业，而是一个文本分析工作簿：解析配置、清洗文本、统计词频、排序输出，并用 LRU 缓存保存最近结果。
+它把值类型、字符串视图、容器、异常、类不变量、RAII、泛型算法、GTest/GMock 和 Google Benchmark 放进同一个小项目。项目目标很具体：解析文本分析配置，清洗输入文本，统计词频，输出稳定排序结果，并用 LRU 缓存保存最近分析结果。本卷按阶段写，不把“学了某个语法”停在概念层。
 
-\section{实践一：配置解析不是字符串游戏}
+\section{一、工程边界}
 
-入口文件 \filepath{include/cppbook/practice_workbook.hpp} 定义 \code{TextConfig}、\code{Diagnostic} 和 \code{ParseConfigResult}。这里的 \code{Diagnostic} 是结构化诊断，意思是错误不只是一行打印，而是包含行号和消息的对象。读者要先理解三个边界：配置行可以有注释和空白；\code{min_word_length} 必须是正数；\code{keep_numbers} 只能是 \code{true/false} 或 \code{1/0}。
+核心文件如下：
+
+\begin{lstlisting}[language=bash]
+include/cppbook/practice_workbook.hpp
+src/practice_workbook.cpp
+src/main.cpp
+tests/practice_workbook_tests.cpp
+bench/practice_workbook_bench.cpp
+\end{lstlisting}
+
+构建、测试和 benchmark smoke 命令如下。Debug benchmark 只证明入口可运行；正式性能结论要换 Release 构建并记录机器信息。
+
+\begin{lstlisting}[language=bash,caption={C++ 实践工程的测试和 benchmark}]
+cmake -S books/cpp-zero-to-advanced -B books/cpp-zero-to-advanced/build/practice-debug -DCMAKE_BUILD_TYPE=Debug
+cmake --build books/cpp-zero-to-advanced/build/practice-debug
+ctest --test-dir books/cpp-zero-to-advanced/build/practice-debug --output-on-failure
+books/cpp-zero-to-advanced/build/practice-debug/labs/cpp_practice_workbook/cppbook_practice_bench --benchmark_min_time=0.01s
+\end{lstlisting}
+
+\section{二、阶段 0：先定义数据合同}
+
+配置解析入口是 \code{parse_text_config}。它不直接打印错误，也不退出程序，而是返回 \code{ParseConfigResult}。这种写法把库和命令行隔开：库负责结构化结果，调用者决定如何展示。
 
 \begin{lstlisting}[language=C++,caption={配置解析的最小合同}]
 struct Diagnostic {
     std::int32_t line_number = 0;
     std::string message;
+};
+
+struct TextConfig {
+    std::size_t min_word_length = 1;
+    bool keep_numbers = false;
+    std::set<std::string> stop_words;
 };
 
 struct ParseConfigResult {
@@ -25,26 +52,83 @@ struct ParseConfigResult {
 };
 \end{lstlisting}
 
-这个结构刻意不让解析函数直接退出程序。函数返回结果对象，调用者决定是继续、报错还是展示所有诊断。这样能把“库代码”和“命令行程序”分开，也能让 GTest/GMock 测试精确检查坏输入。
+这里有几个初学者必须先弄清楚的名词。\code{struct} 是把相关字段放在一起的值类型；\code{std::vector} 是连续动态数组；\code{std::set} 是按 key 排序且不重复的集合；\code{std::string_view} 是不拥有字符串内容的只读视图，适合函数观察文本，但不能保存到比原字符串更久的对象里。
 
-\section{实践二：文本统计要拆成可测试步骤}
+\section{三、阶段 1：配置解析从样例到失败样本}
 
-\code{TextAnalyzer} 的核心不是“统计词频”四个字，而是四步：扫描字符、归一化小写、过滤停用词、稳定排序。每一步都能构造反例。比如 \code{42} 在 \code{keep_numbers=false} 时应被过滤；\code{C++} 会被拆成 \code{c}，若最小长度为 3 就不会保留；两个词频相同时按字典序排序，保证输出稳定。
+先写最小输入：
 
-\begin{lstlisting}[language=bash,caption={C++ 实践工程的测试和 benchmark}]
-cmake -S books/cpp-zero-to-advanced -B books/cpp-zero-to-advanced/build/practice-debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build books/cpp-zero-to-advanced/build/practice-debug
-ctest --test-dir books/cpp-zero-to-advanced/build/practice-debug --output-on-failure
-books/cpp-zero-to-advanced/build/practice-debug/labs/cpp_practice_workbook/cppbook_practice_bench --benchmark_min_time=0.01s
+\begin{lstlisting}
+min_word_length = 3
+keep_numbers = false
+stop_words = the, and, Cpp
 \end{lstlisting}
 
-单元测试在 \filepath{tests/practice_workbook_tests.cpp}，使用 GTest/GMock 表达期望，例如 \code{EXPECT_THAT(tokens, ElementsAre(...))}。benchmark 在 \filepath{bench/practice_workbook_bench.cpp}，使用 Google Benchmark 测量 \code{top_words} 在不同文本规模下的成本。Debug 构建的 benchmark 只能证明可执行和相对路径正确，不能当作性能结论；要写性能报告，应另建 Release 构建并记录 CPU、编译器、负载和频率策略。
+手算合同：最小词长是 3；数字不保留；停用词统一转小写后包含 \code{the}、\code{and}、\code{cpp}。对应测试是 \code{ConfigParserAcceptsCommentsAndStopWords}。
 
-\section{实践三：LRU 缓存训练对象不变量}
+再写失败样本：
 
-\code{AnalysisCache} 用 \code{std::list} 保存最近访问顺序，用 \code{std::unordered_map} 从 key 找到链表迭代器。这里可以复习“迭代器、引用、生命周期、移动语义”这些术语。迭代器是指向容器位置的对象；哈希表保存迭代器后，链表节点不能随便失效；\code{splice} 能移动链表节点而不复制 \code{WordCount} 向量。
+\begin{lstlisting}
+min_word_length=0
+keep_numbers=maybe
+unknown=value
+missing_equals
+\end{lstlisting}
 
-实践报告必须画出三个状态：插入 \code{a,b} 后的顺序；访问 \code{a} 后的顺序；再插入 \code{c} 后谁被淘汰。若解释不清这个状态变化，代码即使通过样例，也不算真正理解 LRU。
+这四行分别产生“最小长度必须为正数”“布尔值非法”“未知 key”“缺少等号”。实践重点是一次返回所有诊断，而不是遇到第一个错误就丢掉后续信息。这样用户修配置时不用反复运行四次。
+
+实现时按阶段拆函数：去掉注释和空白，查找 \code{=}，解析 key/value，按 key 更新 \code{TextConfig}，坏行追加 \code{Diagnostic}。如果一个函数同时做文件读取、解析、打印和退出，就很难测试；本工程把这些责任留在不同层。
+
+\section{四、阶段 2：文本扫描不是一句“统计词频”}
+
+\code{TextAnalyzer} 的代码路径可以拆成四步：字符扫描、归一化、过滤、排序。
+
+第一步扫描字符。字母和数字可以进入 token，标点作为分隔符。例子 \code{"C++ cache 42"} 会被拆成 \code{"c"}、\code{"cache"}、\code{"42"}，其中 \code{"c"} 是否保留取决于 \code{min_word_length}。
+
+第二步归一化。归一化是把不同写法变成同一比较形式，本工程把大写转小写，所以 \code{CPU} 和 \code{cpu} 计为同一个词。
+
+第三步过滤。若 \code{keep_numbers=false}，纯数字 token 过滤；若 token 在 \code{stop_words} 中，也过滤；若长度小于 \code{min_word_length}，过滤。每一条过滤规则都应有测试样例，否则后续重构很容易破坏。
+
+第四步排序。词频高的排前面；词频相同按字典序排。稳定输出不是为了好看，而是为了让报告、测试和 benchmark 对照可重复。\code{TextAnalyzerTokenizesCountsAndSorts} 和 \code{TextAnalyzerCanKeepNumericTokens} 覆盖了这条路径。
+
+\section{五、阶段 3：LRU 缓存训练对象不变量}
+
+\code{AnalysisCache} 用 \code{std::list} 保存访问顺序，用 \code{std::unordered_map} 从 key 找到链表迭代器。这里集中复习三个 C++ 概念。
+
+第一，迭代器是“容器中某个位置”的对象，不是裸下标。哈希表保存链表迭代器后，链表节点的生命周期就变成缓存不变量的一部分。
+
+第二，\code{std::list::splice} 可以移动链表节点而不复制 \code{std::vector<WordCount>}。这比“取出来再插回去”更符合 LRU 的数据结构意图。
+
+第三，不变量是对象始终必须满足的规则。本缓存的不变量是：\code{entries_} 中的每个 key 都在 \code{index_} 中；\code{index_} 中每个迭代器都指向有效节点；链表头部是最近访问项；大小不超过 \code{capacity_}。
+
+手算状态变化如下。容量为 2，插入 \code{a,b} 后最近顺序是 \code{b,a}；访问 \code{a} 后顺序变成 \code{a,b}；插入 \code{c} 后必须淘汰 \code{b}，最终是 \code{c,a}。测试 \code{AnalysisCacheEvictionAndRecency} 正是在检查这条链。
+
+\section{六、阶段 4：测试先覆盖行为，再覆盖工具名}
+
+GTest/GMock 在本工程里不是为了追工具，而是为了把行为断言写清楚。\code{EXPECT_EQ} 适合精确数值；\code{EXPECT_THAT(tokens, ElementsAre(...))} 适合顺序集合；\code{HasSubstr} 适合检查诊断是否包含行动信息。
+
+每个功能至少要有三类测试：正常输入、边界输入、错误输入。配置解析的边界是空白、注释、大小写、缺等号；文本分析的边界是空文本、纯标点、数字、停用词和同频排序；缓存的边界是容量为 0、重复 put、get 后更新最近顺序和淘汰。
+
+代码实践里不建议先写 CLI 再测命令行输出。更稳的顺序是先测纯库函数，再让 \code{src/main.cpp} 只负责拼接输入输出。CLI 层越薄，越不容易把业务错误藏在字符串打印里。
+
+\section{七、阶段 5：benchmark 只测一个问题}
+
+\code{bench/practice_workbook_bench.cpp} 测的是 \code{top_words} 在不同文本规模下的成本。benchmark 报告必须说明输入生成方式、文本规模、构建类型、CPU、编译器和重复次数。
+
+不要把解析配置、读取文件、打印报告和词频统计混在一个 benchmark 里。混在一起后，时间变快或变慢都解释不清：可能是 I/O，可能是分配，可能是排序，也可能是哈希表 rehash。阶段化 benchmark 的原则是一次只问一个问题。
+
+\section{八、项目继续扩展的阶段表}
+
+\begin{longtable}{p{0.16\linewidth}p{0.28\linewidth}p{0.46\linewidth}}
+阶段 & 要写的代码 & 验收方式 \\
+\hline
+0 & \code{TextConfig}、\code{Diagnostic}、\code{ParseConfigResult} & 能描述输入、错误和默认值 \\
+1 & \code{parse_text_config} & 正常配置和四类坏配置都有测试 \\
+2 & \code{TextAnalyzer} 分析步骤 & token、过滤、排序均可单独断言 \\
+3 & \code{AnalysisCache} & 手算 LRU 状态与测试一致 \\
+4 & \code{cppbook_practice_demo} & CLI 只调用库，不复制业务逻辑 \\
+5 & benchmark 入口 & 只测 \code{top_words}，不混入 I/O 结论 \\
+\end{longtable}
 
 \begin{labbox}
 扩展任务：给工作簿增加文件入口，但不要让文件 I/O 混入 \code{TextAnalyzer}。建议新增一个很薄的 CLI 层读取文件，然后调用现有库函数。测试仍然优先覆盖纯函数；文件测试只覆盖“文件不存在”和“正常读取”两类边界。

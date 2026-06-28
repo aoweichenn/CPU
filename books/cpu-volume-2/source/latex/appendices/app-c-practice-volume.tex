@@ -1,10 +1,36 @@
 \chapter{实践卷：并发、运行时和系统合同}
 
-第二册的实践卷分两层。第一层是本册已有实验 \filepath{books/cpu-volume-2/labs/compute_systems}，覆盖并行归约、同步原语、有限队列、wait channel、任务运行时和 futex 切片。第二层是配套代码实践卷 \filepath{books/compute-systems-engine-code}，负责把 reference、manifest、恢复和报告继续做成完整工程。本附录先说明本册实验如何跑、如何查、什么情况下不能把结果写进结论。
+第二册实践卷分两层。第一层是本册已有实验：
 
-\section{实践一：并发代码先验合同}
+\begin{lstlisting}[language=bash]
+books/cpu-volume-2/labs/compute_systems
+\end{lstlisting}
 
-并发实验不能只看最终数字。有限队列要检查 \code{push}、\code{pop}、\code{close}、等待次数和关闭唤醒；任务运行时要检查 submitted、completed、failed、rejected、unfinished 和 max queue depth；futex 切片要明确用户态快路径和内核等待路径的边界。若只写“多线程跑完了”，没有证明没有丢任务、重复执行或关停遗漏。
+第二层是配套代码实践卷：
+
+\begin{lstlisting}[language=bash]
+books/compute-systems-engine-code/labs/reference_pipeline
+\end{lstlisting}
+
+本附录先把第一层并发实验拆成阶段。并发代码不能只看最终数字；它必须证明没有丢任务、重复执行、等待泄漏、关闭遗漏或把失败样本误当正常吞吐。
+
+\section{一、工程入口}
+
+本册实验的主要文件如下：
+
+\begin{lstlisting}[language=bash]
+include/compsys/parallel_reduce.hpp
+include/compsys/sync_primitives.hpp
+include/compsys/task_runtime.hpp
+include/compsys/wait_channels.hpp
+include/compsys/futex_lab.hpp
+tests/compsys_tests.cpp
+src/wait_channels_probe.cpp
+src/task_runtime_probe.cpp
+src/futex_lab_probe.cpp
+\end{lstlisting}
+
+构建和测试命令如下：
 
 \begin{lstlisting}[language=bash,caption={第二册 compute systems 实验构建和测试}]
 cmake -S books/cpu-volume-2 -B books/cpu-volume-2/build/compsys-debug -DCMAKE_BUILD_TYPE=Debug
@@ -12,16 +38,81 @@ cmake --build books/cpu-volume-2/build/compsys-debug
 ctest --test-dir books/cpu-volume-2/build/compsys-debug --output-on-failure
 \end{lstlisting}
 
-\section{实践二：每个机制都要有失败样本}
+\section{二、阶段 0：并行归约先对照串行 reference}
 
-第二册正文里的术语必须落到失败样本上。backpressure 是下游变慢时上游被限制，而不是“队列满了”一句话；wait channel 是等待者和唤醒条件的组合，而不是“睡眠”；attempt 是一次可区分的尝试，重试时不能和旧结果混在一起；epoch 是一段配置或所有权的版本边界，旧 epoch 消息不能覆盖新状态。
+\code{sequential_sum} 是 reference，\code{parallel_sum} 是优化版。reference 是可信但不追求快的版本；并行版必须和它对同一份输入返回同一结果。
 
-实践报告要为每个机制写一个失败样本。有限队列：消费者阻塞后 \code{close} 是否唤醒；任务运行时：同池 future wait 是否会造成 worker 饥饿；futex：锁竞争下计数是否仍稳定；并行归约：不同 worker 数是否和顺序 reference 一致。失败样本不是为了证明代码差，而是为了证明合同足够清楚。
+最小推导如下：把数组切成若干连续块，每个 worker 求一段局部和，最后主线程把局部和相加。若每个元素恰好属于一个块，且最终汇总不漏块、不重复块，那么并行结果等于串行结果。
 
-\section{实践三：和代码实践卷衔接}
+失败样本也要写进报告：worker 数大于元素数时，不能生成空范围越界；worker 数为 1 时，应等价于串行；包含负数时，不能只测试自然数递增数组；空输入的语义必须明确。测试 \code{test_parallel_sum} 用含负数的固定数组对照 \code{sequential_sum} 和 \code{parallel_sum}。
 
-当实验开始需要输入身份、诊断、manifest、checkpoint 或恢复报告时，应转入 \filepath{books/compute-systems-engine-code/labs/reference_pipeline}。本册原理解释机制，代码实践卷负责把机制做成可复查工程。二者的连接规则很简单：原理卷中的对象如果已经有 C++ 类型，就引用类型名；如果还没有类型，就不能把它当作已实现能力。
+\section{三、阶段 1：计数器和同步原语}
+
+\code{MutexCounter} 和 \code{AtomicCounter} 都实现 \code{add/value}，但它们的保护方式不同。mutex 是互斥锁，一次只允许一个线程进入临界区；atomic 是原子变量，单个读改写操作不能被其他线程切开。
+
+实践时不要只说“线程安全”。要写一个多线程样本：4 个线程，每个线程加 250 次，期望最终值是 1000。若少于 1000，说明更新丢失；若 value 读取没有同步，可能读到不一致状态。测试 \code{test_counters} 正是这条验收。
+
+\section{四、阶段 2：有限队列和 backpressure}
+
+\code{BoundedMpmcQueue} 是有容量上限的多生产者多消费者队列。MPMC 表示 multiple producers, multiple consumers。backpressure 是下游处理慢时，上游被容量限制住；它不是“队列满了”一句话，而是一个可观察合同：生产者等待次数、等待时间、关闭后返回值都要能报告。
+
+队列实践按四步写：
+
+\begin{enumerate}
+  \item 单线程 \code{push/try_pop}：验证 FIFO 顺序、size 和 \code{max_size}。
+  \item 消费者空队列阻塞后 \code{close}：验证 \code{pop} 返回空、\code{pop_closed} 增加、等待时间被记录。
+  \item 生产者满队列阻塞后 \code{close}：验证第二次 \code{push} 返回 false、\code{push_closed} 增加。
+  \item 多生产者多消费者 drain：容量为 1 时仍然不能丢值、重值或越界。
+\end{enumerate}
+
+这些测试对应 \code{test_queue}、\code{test_queue_close_wakes_consumer}、\code{test_queue_close_wakes_blocked_producer} 和 \code{test_queue_multi_producer_consumer_drain}。如果报告只写“push/pop 正常”，没有证明 close 唤醒，队列合同是不完整的。
+
+\section{五、阶段 3：permit、barrier、future 和 atomic wait}
+
+\code{run_permit_limiter} 训练“许可证”概念：最多允许 \code{permit_count} 个任务同时进入关键区域。测试要检查 \code{max_in_flight<=permit_count}，否则限流只是装饰。
+
+\code{run_phase_barrier} 训练 barrier。barrier 是阶段边界：所有 worker 到达同一阶段后，才能一起进入下一阶段。报告中的 \code{arrival_count} 应等于 \code{worker_count*phase_count}，否则有人没到或被重复统计。
+
+\code{run_future_result_paths} 训练 future 的三种结果：正常值、异常、broken promise。broken promise 指承诺方消失或没有设置结果，等待方不能永远挂住。
+
+\code{run_atomic_wait_version_counter} 训练版本号等待。version 是单调增长的状态编号；等待者看到版本变化才继续。这里的 \code{wake_count} 和 \code{observed_sum} 证明等待路径真的被走到，而不是只靠忙等碰巧结束。
+
+\section{六、阶段 4：wait channel 和 eventfd/epoll}
+
+wait channel 是“等待者、唤醒条件和唤醒通道”的组合。只说“线程睡眠”不够，因为系统程序真正关心的是谁能唤醒、唤醒后读到什么、队列是否被完整 drain。
+
+\code{run_eventfd_epoll_contract} 检查两类事实：eventfd 计数被读到几次，队列和信号量语义是否被 drain。报告字段 \code{epoll_ready_observations}、\code{epoll_empty_observations}、\code{queue_fifo_ok} 和 \code{semaphore_empty_after_reads} 都是合同的一部分。若只检查 epoll 返回“可读”，就还没证明数据结构本身正确。
+
+\section{七、阶段 5：任务运行时和同池等待事故}
+
+\code{TaskRuntime} 的报告字段包括 submitted、completed、failed、rejected、unfinished、max queue depth、active workers 和 accepting/stopping 状态。实践时要覆盖三类场景：正常完成、任务抛异常、shutdown 后提交被拒绝。
+
+同池 future wait 是一个典型事故：worker 执行父任务，父任务又提交子任务并在同一个 worker 池中等待子任务；如果所有 worker 都被父任务占住，子任务没有 worker 可运行，就会饥饿。函数 \code{run_same_pool_future_wait_probe} 用报告字段描述这个停滞点，\code{run_continuation_runtime_probe} 则展示用 continuation 拆开等待边界后的路径。
+
+这类实验的结论不能写成“future 不好”或“线程池不好”。正确结论是：同一执行池里阻塞等待自己提交的后续任务，会把 worker 资源耗尽；解决办法是改变调度结构、拆 continuation，或使用独立等待资源。
+
+\section{八、阶段 6：futex 快路径和慢路径}
+
+futex 的核心边界是用户态快路径和内核等待路径。无竞争时，锁应主要在用户态完成；有竞争时，等待者进入 futex wait，释放者 futex wake。报告中的 \code{contended_count}、\code{wait_count} 和 \code{wake_count} 用来证明慢路径真的发生过。
+
+\code{run_futex_contract_probe} 还要覆盖三个容易被忽略的路径：值不匹配返回 \code{EAGAIN}，超时返回 timeout，被信号打断返回 \code{EINTR}。如果只测“最后计数正确”，就没有证明 futex 合同完整。
+
+\section{九、和代码实践卷衔接}
+
+当实验开始需要输入身份、诊断、manifest、checkpoint 或恢复报告时，应转入 \filepath{books/compute-systems-engine-code/labs/reference_pipeline}。本册原理解释机制，代码实践卷负责把机制做成可复查工程。连接规则很简单：原理卷中的对象如果已经有 C++ 类型，就引用类型名；如果还没有类型，就不能把它当作已实现能力。
+
+\begin{longtable}{p{0.16\linewidth}p{0.28\linewidth}p{0.46\linewidth}}
+阶段 & 代码切片 & 必须回答的问题 \\
+\hline
+0 & \code{sequential_sum/parallel_sum} & 每个元素是否恰好参与一次归约 \\
+1 & \code{MutexCounter/AtomicCounter} & 多线程更新是否丢失 \\
+2 & \code{BoundedMpmcQueue} & 满队列、空队列和 close 是否都能唤醒 \\
+3 & permit 等同步对象 & 失败路径是否都被测试 \\
+4 & eventfd 与 epoll & 唤醒后数据是否按合同 drain \\
+5 & \code{TaskRuntime} probes & 是否有任务丢失、失败、拒绝或饥饿 \\
+6 & futex probes & 快路径、慢路径和错误返回是否都可观察 \\
+\end{longtable}
 
 \begin{labbox}
-扩展任务：把 \code{TaskRuntime::Report} 输出为 CSV，并给每个字段写一个能改变它的测试场景。不要只测 happy path；至少覆盖正常完成、任务抛异常、关停后提交被拒绝三类情况。
+扩展任务：把 \code{TaskRuntime::Report} 输出为 CSV，并给每个字段写一个能改变它的测试场景。不要只测 happy path；至少覆盖正常完成、任务抛异常、关停后提交被拒绝、同池等待饥饿四类情况。
 \end{labbox}
