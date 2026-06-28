@@ -8,24 +8,29 @@ ALGO_BOOK_DIR := books/algorithm-interview
 ALGO_LATEX_DIR := $(ALGO_BOOK_DIR)/source/latex
 CPP_BOOK_DIR := books/cpp-zero-to-advanced
 CPP_LATEX_DIR := $(CPP_BOOK_DIR)/source/latex
+CSE_BOOK_DIR := books/compute-systems-engine-code
+CSE_LATEX_DIR := $(CSE_BOOK_DIR)/source/latex
 EXPORT_ROOT := book-exports
 CPU_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第一册
 CPU2_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第二册
 CPU3_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册
 ALGO_EXPORT_DIR := $(EXPORT_ROOT)/算法刷题与Cpp面试教材
 CPP_EXPORT_DIR := $(EXPORT_ROOT)/Cpp从零到高级
+CSE_EXPORT_DIR := $(EXPORT_ROOT)/计算系统引擎代码实践卷
 CPU_EXPORT_NAME := 从Cpp到计算系统第一册
 CPU2_EXPORT_NAME := 从Cpp到计算系统第二册
 CPU3_EXPORT_NAME := 从Cpp到AI计算第三册
 ALGO_EXPORT_NAME := 算法刷题与Cpp面试教材
 CPP_EXPORT_NAME := Cpp从零到高级
+CSE_EXPORT_NAME := 计算系统引擎代码实践卷
 CPU_EPUB_NAME := $(CPU_EXPORT_NAME)
 CPU2_EPUB_NAME := $(CPU2_EXPORT_NAME)
 CPU3_EPUB_NAME := $(CPU3_EXPORT_NAME)
 ALGO_EPUB_NAME := $(ALGO_EXPORT_NAME)
 CPP_EPUB_NAME := $(CPP_EXPORT_NAME)
+CSE_EPUB_NAME := $(CSE_EXPORT_NAME)
 
-.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-text-count cpu3-text-count-chapters cpu3-text-target books-export algo-check algo-pdf algo-epub algo-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-text-count cpp-text-target clean
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-text-count cpu3-text-count-chapters cpu3-text-target books-export algo-check algo-pdf algo-epub algo-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export clean
 
 all: cpu-pdf cpu-epub
 
@@ -95,7 +100,7 @@ cpu3-text-count-chapters:
 cpu3-text-target:
 	$(MAKE) -C $(CPU3_LATEX_DIR) text-target
 
-books-export: cpu-export cpu2-export cpu3-export algo-export cpp-export
+books-export: cpu-export cpu2-export cpu3-export algo-export cpp-export cse-export
 
 algo-check:
 	$(MAKE) -C $(ALGO_BOOK_DIR) check
@@ -136,9 +141,22 @@ cpp-text-count:
 cpp-text-target:
 	$(MAKE) -C $(CPP_BOOK_DIR) text-target
 
+cse-check:
+	$(MAKE) -C $(CSE_LATEX_DIR) check
+
+cse-pdf:
+	$(MAKE) -C $(CSE_LATEX_DIR) pdf
+
+cse-epub:
+	$(MAKE) -C $(CSE_LATEX_DIR) epub
+
+cse-export: cse-pdf cse-epub
+	python3 tools/export_book.py --source $(CSE_LATEX_DIR) --dest "$(CSE_EXPORT_DIR)" --pdf-name "$(CSE_EXPORT_NAME)" --epub-name "$(CSE_EPUB_NAME)"
+
 clean:
 	$(MAKE) -C $(CPU_LATEX_DIR) clean
 	$(MAKE) -C $(CPU2_LATEX_DIR) clean
 	$(MAKE) -C $(CPU3_LATEX_DIR) clean
 	$(MAKE) -C $(ALGO_BOOK_DIR) clean
 	$(MAKE) -C $(CPP_BOOK_DIR) clean
+	$(MAKE) -C $(CSE_LATEX_DIR) clean

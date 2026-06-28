@@ -517,6 +517,14 @@ class LatexBlockConverter:
                 i += 1
                 continue
 
+            listing = parse_lstinputlisting_command(line)
+            if listing is not None:
+                self.flush_paragraph()
+                options, path = listing
+                self.out.append(render_input_listing(self.book_dir, path, options))
+                i += 1
+                continue
+
             if line.startswith("\\item"):
                 self.flush_paragraph()
                 self.open_item(line)
@@ -679,6 +687,30 @@ def render_code_block(code: str, env: str, options: str) -> str:
     if env == "lstlisting" and language in {"c++", "cpp"}:
         return f'<pre class="code-block language-cpp"><code>{highlight_cpp(code)}</code></pre>'
     return f'<pre class="code-block"><code>{html.escape(code)}</code></pre>'
+
+
+def parse_lstinputlisting_command(line: str) -> tuple[str, str] | None:
+    prefix = r"\lstinputlisting"
+    if not line.startswith(prefix):
+        return None
+    i = skip_ws(line, len(prefix))
+    options = ""
+    if i < len(line) and line[i] == "[":
+        options, i = read_group(line, i, "[", "]")
+        i = skip_ws(line, i)
+    if i >= len(line) or line[i] != "{":
+        return None
+    path, _ = read_group(line, i)
+    return options, latex_plain(path)
+
+
+def render_input_listing(book_dir: Path | None, path: str, options: str) -> str:
+    if book_dir is None:
+        return render_code_block(f"missing book directory for listing: {path}", "lstlisting", "")
+    source = (book_dir / path).resolve()
+    if not source.exists() or not source.is_file():
+        return render_code_block(f"missing listing source: {path}", "lstlisting", "")
+    return render_code_block(source.read_text(encoding="utf-8").rstrip(), "lstlisting", options)
 
 
 def parse_book_figure_command(line: str) -> tuple[str, str] | None:
