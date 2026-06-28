@@ -1,95 +1,52 @@
-\chapter{实践卷：Reference Pipeline 工程化}
+\chapter{实践卷：两条代码主线怎样落地}
 
-上一章定义了输入合同、reference 和报告字段。本章把它落成可构建工程，目录是：
+上一章先把 reference、contract、diagnostic 和 report 讲成代码边界。本章把边界落成两个可以独立构建、独立测试、互相衔接的 lab：
 
 \begin{lstlisting}[language=bash]
 books/compute-systems-engine-code/labs/reference_pipeline
+books/compute-systems-engine-code/labs/compute_systems
 \end{lstlisting}
 
-代码使用 C++20，单元测试使用 GTest/GMock，性能入口使用 Google Benchmark。这里的重点不是工具名，而是把输入身份、解析诊断、稳定报告和 manifest 发布格式做成可复查工程。
+\filepath{reference_pipeline} 从一份文本输入开始，训练“先定义正确结果，再固定诊断和发布格式”。\filepath{compute_systems} 承接第二册原理卷，把每章的 CPU、内存、并发、运行时、异步 I/O 和分布式概念变成可运行小模型。二者不是两套无关示例：前者负责把输入、结果和验收合同讲清楚；后者负责把系统机制一章一章接到可执行代码上。
 
-\section{零、贯穿主线工程}
+\section{一、两个 lab 如何组成代码卷}
 
-代码实践卷的主线工程就是 \filepath{reference_pipeline}。它从一行 \code{event,value} 输入开始，逐步扩展到输入身份、结构化诊断、reference 结果、报告、manifest、split、partial result 和 merge。每个阶段都必须留下三类证据：公共头文件中的合同、实现文件中的可运行逻辑、测试文件中的失败样本。
+代码实践卷的主线不是“贴一堆源码”，而是让每段源码回答一个清楚问题：这个类型承诺什么，这个函数把哪条机制跑起来，这个测试证明什么失败不会漏掉。每个阶段都要留下四类证据。
 
-\begin{longtable}{p{0.20\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
-阶段 & 主线代码 & 学到的工程能力 \\
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.42\linewidth}}
+证据 & 在工程里的位置 & 为什么必须保留 \\
 \hline
-合同层 & 公共头文件 & 输入身份、诊断、结果、manifest 和 split 先变成类型 \\
-实现层 & pipeline 实现 & parser、reference、report、manifest、split 和 merge 分层实现 \\
-命令行层 & \code{main.cpp} & CLI 只拼接输入和输出，不复制业务逻辑 \\
-测试层 & 单元测试 & 正常、坏行、空输入、split 边界和 merge 都有断言 \\
-性能层 & benchmark & benchmark 只测 reference 主路径，不混入文件读取 \\
+接口合同 & \code{include/.../*.hpp} & 类型名、字段名和函数签名先固定语义边界；读者不用猜“输入是谁、输出是什么、失败怎样表达” \\
+可运行实现 & \code{src/*.cpp} & 机制必须跑起来，而不是停在模板；实现要能处理正常输入、边界输入和错误输入 \\
+测试与探针 & \code{tests/*.cpp} 和 \code{*_probe.cpp} & 测试固定行为，probe 固定章节模型的可观察输出，避免书里结论和代码脱节 \\
+报告与清单 & CLI 输出、manifest、benchmark 输出 & 结果要能被人复查，也要能被脚本比较；没有报告，就无法说明一次运行到底通过了什么 \\
 \end{longtable}
 
-\section{一、工程入口}
+先看构建入口。顶层 \filepath{CMakeLists.txt} 只做三件事：要求 C++20，打开测试，把两个 lab 加进来。这样读者可以一次构建整本代码卷，也可以进入单个 lab 看局部目标。常用命令如下：
 
-核心文件如下：
-
-\begin{lstlisting}[language=bash]
-include/cse/reference_pipeline.hpp
-src/reference_pipeline.cpp
-src/main.cpp
-tests/reference_pipeline_tests.cpp
-bench/reference_pipeline_bench.cpp
-\end{lstlisting}
-
-构建、测试和 benchmark smoke 命令如下：
-
-\begin{lstlisting}[language=bash,caption={代码实践卷 reference pipeline 构建}]
-cmake -S books/compute-systems-engine-code -B books/compute-systems-engine-code/build/reference-debug -DCMAKE_BUILD_TYPE=Debug
+\begin{lstlisting}[language=bash,caption={代码实践卷完整构建与测试}]
+cmake -S books/compute-systems-engine-code \
+      -B books/compute-systems-engine-code/build/reference-debug \
+      -DCMAKE_BUILD_TYPE=Debug
 cmake --build books/compute-systems-engine-code/build/reference-debug
-ctest --test-dir books/compute-systems-engine-code/build/reference-debug --output-on-failure
-books/compute-systems-engine-code/build/reference-debug/labs/reference_pipeline/cse_reference_bench --benchmark_min_time=0.01s
+ctest --test-dir books/compute-systems-engine-code/build/reference-debug \
+      --output-on-failure
 \end{lstlisting}
 
-\section{二、阶段 0：输入身份先独立成类型}
+这三条命令是进入正文结论的最低门槛。若本地构建不过，书中不能声称代码可运行；若测试不过，书中不能声称语义已经固定；若只跑 demo 不跑测试，很多边界失败会被漂亮输出盖住。
 
-\code{RecordId} 描述一条记录从哪里来：
+\section{二、Reference Pipeline：从输入合同推到 split 和 merge}
 
-\begin{lstlisting}[language=C++]
+\filepath{reference_pipeline} 的起点是一行 \code{event,value} 文本。先不要急着想性能，先问四个问题：这行来自哪份输入，位于哪个位置，怎样算合法，非法时怎样报告。代码用 \code{RecordId}、\code{InputCase}、\code{ParseDiagnostic} 和 \code{ReferenceResult} 把这四件事变成类型。
+
+\begin{lstlisting}[language=C++,caption={输入身份和 reference 结果的核心字段}]
 struct RecordId {
     std::string input_name;
     std::uint64_t input_generation = 0;
     std::uint64_t byte_offset = 0;
     std::uint64_t line_number = 0;
 };
-\end{lstlisting}
 
-\code{input_name} 是输入名，\code{input_generation} 是同一输入的版本号，\code{byte_offset} 是该行在原始文本里的字节偏移，\code{line_number} 是行号。generation 不是时间戳装饰，它用于区分“同名输入的第几代”。如果后续做 retry、checkpoint 或恢复，旧 generation 的结果不能覆盖新 generation。
-
-\code{InputCase} 把输入身份和文本放在一起。实践时不要直接传裸字符串，因为裸字符串没有来源，坏行诊断也无法说明是哪份输入、哪一代、哪个位置出错。
-
-\section{三、阶段 1：解析合同从一行开始}
-
-reference pipeline 的输入格式是每行 \code{event,value}。合法行有两个字段：事件名非空，value 是整数。坏行进入 \code{ParseDiagnostic}，不能混入 accepted 计数。
-
-手算样例：
-
-\begin{lstlisting}
-view,1
-click,1
-view,2
-\end{lstlisting}
-
-这三行的 \code{records_total} 是 3，\code{accepted} 是 3，\code{counts["view"]} 是 2，\code{counts["click"]} 是 1。
-
-坏行样例：
-
-\begin{lstlisting}
-missing
-click,1,extra
-,2
-login,abc
-\end{lstlisting}
-
-它们分别对应 \code{missing_field}、\code{extra_field}、\code{empty_event} 和 \code{bad_value}。测试 \code{BadLinesReturnStructuredDiagnostics} 不只检查错误个数，还检查 line number、error kind 和 byte offset。这样后续换 parser 时，不能把诊断精度降级。
-
-\section{四、阶段 2：reference 先可信，再考虑快}
-
-\code{run_reference} 是可信但不追求快的实现。它逐行扫描输入，只有合法记录才更新 \code{counts} 和 checksum。checksum 是结果摘要，用来证明同一输入反复运行稳定，也用于后续优化版对照。
-
-\begin{lstlisting}[language=C++,caption={reference result 的语义字段}]
 struct ReferenceResult {
     std::string input_name;
     std::uint64_t input_generation = 0;
@@ -101,84 +58,91 @@ struct ReferenceResult {
 };
 \end{lstlisting}
 
-这里使用 \code{std::map} 是为了让输出 key 顺序稳定。稳定顺序不是小事：报告、checksum、manifest 和回归测试都依赖它。等后续进入热路径优化，可以用哈希表或分片结构提高吞吐，但发布报告前仍要回到稳定顺序。
+为什么一开始就要这些字段？拿三行输入手算：
 
-\section{五、阶段 3：报告和 manifest 是发布合同}
+\begin{lstlisting}
+view,1
+click,1
+view,2
+\end{lstlisting}
 
-\code{format_report} 面向人读，必须包含输入名、记录数、accepted、checksum、每个事件计数和错误统计。\code{ManifestRow} 面向机器读，字段固定为 input name、generation、records total、accepted、rejected 和 checksum。
+三行都合法，所以 \code{records_total=3}，\code{accepted=3}，\code{counts["view"]=2}，\code{counts["click"]=1}。这只是正常路径。真正能暴露设计质量的是坏行：
 
-manifest 是发布清单。它回答“这次处理发布了哪份输入、哪一代、多少记录、多少接受、多少拒绝、摘要是什么”。后续可靠写、恢复和分布式提交都会依赖它；因此 manifest 格式不能随手改。测试 \code{ReportAndManifestAreDeterministic} 固定了 report 子串和 manifest 前缀。
+\begin{lstlisting}
+missing
+click,1,extra
+,2
+login,abc
+\end{lstlisting}
 
-\section{六、阶段 4：测试覆盖正常、坏行、空输入和诊断质量}
+第一行缺字段，第二行多字段，第三行事件名为空，第四行 value 不是整数。朴素实现可能只返回“解析失败 4 次”，但这样的错误无法重放，也无法定位。实践卷要求每条坏行进入 \code{ParseDiagnostic}，并保留 \code{line_number}、\code{byte_offset}、\code{error_kind} 和可读说明。这样后续换 parser、加并行 split 或把结果写入 manifest，都不能偷偷降低诊断精度。
 
-当前测试分五类：
+接着看 reference。reference 是参考实现，不是“慢版本”的随意别名。它的责任是给出清楚、确定、可复查的正确结果：合法记录才进入 \code{accepted} 和 \code{counts}，坏行只进入 \code{diagnostics}，输出用 \code{std::map} 保持 key 顺序稳定，\code{checksum} 用于对照优化实现。选择 \code{std::map} 不是因为它最快，而是因为报告和回归测试需要稳定顺序。等进入热路径优化，可以把内部统计换成哈希表或分片结构，但发布报告前仍要回到稳定顺序。
 
-\begin{enumerate}
-  \item \code{NormalInputCountsAndChecksumAreStable}：正常五行输入，检查 counts 和 checksum 稳定；
-  \item \code{BadLinesReturnStructuredDiagnostics}：四类坏行，检查错误类型和位置；
-  \item \code{ReportAndManifestAreDeterministic}：检查报告和 manifest 输出稳定；
-  \item \code{EmptyInputHasZeroRecordsButStableChecksum}：空输入没有记录但 checksum 稳定；
-  \item \code{DiagnosticDetailNamesTheContract}：诊断 detail 必须说清合同，例如“exactly two fields”。
-\end{enumerate}
-
-测试不是附属品。reference pipeline 后续每次优化，都必须先跑这些测试，再用优化结果对照 reference。若优化后报告字段变少、错误位置变粗或 checksum 不稳定，即使吞吐更高，也不能进入书中的“正确实现”。
-
-\section{七、阶段 5：benchmark 只测 reference 主路径}
-
-\code{bench/reference_pipeline_bench.cpp} 只测 \code{run_reference} 在不同记录数下的成本。Debug benchmark 只能说明 target 可运行；正式性能报告必须使用 Release 构建，并记录 CPU、编译器、输入规模、负载、是否开启 CPU scaling、重复次数和异常样本处理。
-
-不要把文件读取、随机输入生成、报告打印和 parser 统计混在同一个 benchmark。一次 benchmark 只回答一个问题：在已给定输入文本的情况下，\code{run_reference} 的成本怎样随记录数增长。
-
-\section{八、阶段 6：input split 已进入工程}
-
-input split 是把大输入切成多个片段并行处理的单位。它不能破坏 \code{RecordId}：每条记录仍要保留 input name、generation、byte offset 和 line number。当前工程已经提供 \code{InputSplit}、\code{split_input_case}、\code{run_reference_split}、\code{merge_reference_results} 和 \code{run_reference_with_splits}。
-
-正确实现必须处理“split 边界落在行中间”的情况。不能让前一个 split 和后一个 split 同时处理同一行，也不能让两边都跳过这行。测试 \code{SplitInputMatchesWholeReferenceWhenBoundaryFallsInsideLine} 构造切点落在记录中间的输入，并证明总记录数、accepted、诊断行号和 checksum 与整文件 reference 一致。测试 \code{SplitInputKeepsLongLineWhole} 证明单行超过目标 split 大小时仍按整行保留。
-
-\section{九、项目阶段清单}
-
-\begin{longtable}{p{0.16\linewidth}p{0.28\linewidth}p{0.46\linewidth}}
-阶段 & 代码切片 & 验收证据 \\
-\hline
-0 & \code{RecordId/InputCase} & 每条记录有输入名、generation、offset、line \\
-1 & line parser & 四类坏行进入结构化 diagnostics \\
-2 & \code{run_reference} & accepted、counts、checksum 稳定 \\
-3 & report/manifest & 人读报告和机器清单格式固定 \\
-4 & GTest/GMock tests & 正常、坏行、空输入、诊断质量全覆盖 \\
-5 & benchmark & 只测 \code{run_reference}，不混入 I/O \\
-6 & input split & split 落在行中间不丢行、不重行、不错行号 \\
-\end{longtable}
-
-\section{十、每章代码任务矩阵}
-
-代码实践卷只有两章，但每一章都要给出工程边界。第一章建立 reference 合同，第二章把合同做成可运行 pipeline，并继续推进到 split 和 merge。
-
-\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
-章节 & 代码任务 & 验收证据 \\
-\hline
-reference 与合同 & 定义 \code{RecordId}、\code{InputCase}、\code{ReferenceResult} & 字段能解释输入身份、位置、结果和诊断 \\
-解析合同 & 写 line parser 和结构化诊断 & missing、extra、empty、bad value 都有测试 \\
-reference 主路径 & \code{run_reference} 统计 accepted、counts、checksum & 正常输入和空输入稳定 \\
-发布合同 & \code{format_report}、\code{ManifestRow} & 人读报告和机器清单格式固定 \\
-测试合同 & GTest/GMock 覆盖正常、坏行、空输入、诊断质量 & 测试名能读出行为边界 \\
-benchmark 合同 & \code{cse_reference_bench} 只测 reference 主路径 & 不混入文件读取或随机生成 \\
-split 合同 & \code{split_input_case} 与 \code{run_reference_with_splits} & 切点落在行中间时和整文件 reference 一致 \\
-\end{longtable}
-
-\section{十一、递进大作业：Reference Pipeline}
-
-\begin{longtable}{p{0.16\linewidth}p{0.30\linewidth}p{0.44\linewidth}}
-阶段 & 交付物 & 通过标准 \\
-\hline
-0 & 输入身份 & 每条记录有 input name、generation、offset、line \\
-1 & line parser & 错误进入 diagnostics，不污染 accepted \\
-2 & reference 统计 & counts、accepted、checksum 可重复 \\
-3 & 发布格式 & report 和 manifest 字段顺序稳定 \\
-4 & benchmark & 测量边界只包含 reference 主路径 \\
-5 & input split & split、partial result、merge 全部保留身份和 checksum \\
-6 & 工程报告 & 说明每个字段如何支持恢复、并行或分布式扩展 \\
-\end{longtable}
+最后推进到 split 和 merge。大输入不能永远整块处理，必须切成 \code{InputSplit}。难点不是“按字节切几段”，而是切点落在行中间时不能丢行、重行或错报行号。例如目标大小刚好落在 \code{view,2} 中间，前一个 split 不能处理半行，后一个 split 也不能从半行继续误解析。当前工程提供 \code{split_input_case}、\code{run_reference_split}、\code{merge_reference_results} 和 \code{run_reference_with_splits}，测试用整文件 reference 对照 split 后 merge 的结果，固定记录数、accepted、诊断和 checksum 都一致。
 
 \begin{labbox}
-本轮大作业已经把 input split 加入工程。提交前必须运行 \code{cse_reference_tests}，并在报告里说明 split 边界落在行中间时为什么不会丢行、重行或错报 line number。
+Reference Pipeline 的阶段验收：先运行 \code{cse_reference_tests}，再运行 \code{cse_reference_bench --benchmark_min_time=0.01s} 做 benchmark smoke。benchmark 只证明入口可运行；正式性能结论必须用 Release 构建，并记录 CPU、编译器、输入规模、重复次数和结果校验。
+\end{labbox}
+
+\section{三、Compute Systems：把每章机制变成可运行模型}
+
+\filepath{compute_systems} 是第二册原理卷的代码化主线。它不把“缓存、TLB、NUMA、SIMD、线程池、futex、epoll、checkpoint”当成词表，而是给每章一个小模型：输入是什么，输出哪些计数字段，哪个探针能跑出结果，哪个测试能挡住错误实现。核心头文件是 \filepath{include/compsys/chapter_models.hpp}，实现是 \filepath{src/chapter_models.cpp}，章节探针是 \filepath{src/chapter_models_probe.cpp}。
+
+\begin{longtable}{p{0.12\linewidth}p{0.34\linewidth}p{0.44\linewidth}}
+章节 & 模型函数 & 这章固定的工程事实 \\
+\hline
+1 & \code{model_ch01_input_pipeline} & 输入记录分 accepted/rejected，checksum 证明结果稳定 \\
+2 & \code{model_ch02_branch_predictor} & 分支历史、实际 taken 次数和 misprediction 数量分开统计 \\
+3 & \code{model_ch03_cache_tlb} & cache line、page 和 TLB miss 不是同一个指标 \\
+4 & \code{model_ch04_numa_coherence} & local/remote 访问与 coherence transfer 分开解释 \\
+5, 5b & \code{model_ch05_roofline}、\code{model_ch05b_pmu_simd_evidence} & roofline 需要 FLOPs、字节量、带宽和 PMU/SIMD 证据，不只看耗时 \\
+6, 7, 8 & layout、SIMD、map/filter/reduce 模型 & 数据布局、lane 利用率和算子语义都能手算对照 \\
+9, 9b, 10 & 调度、Linux wait/wake、backpressure 模型 & 线程负载、虚假唤醒、容量压力要有计数，不靠感觉判断 \\
+11, 12, 12b & atomic、SPSC ring、epoch reclamation 模型 & 发布顺序、队列边界和回收安全必须可观察 \\
+13, 14, 15 & reduce/scan/partition、work stealing、async I/O 模型 & 并行算法、偷取调度和 I/O 队列深度进入同一验收链 \\
+16, 17, 18 & attempts、quorum、checkpoint/recovery 模型 & 分布式重试、副本提交和恢复范围用字段固定，不能只讲概念 \\
+\end{longtable}
+
+这些模型故意很小，因为它们用于推导规律。以第 3 章为例，输入是一组字节 offset，模型分别计算访问次数、唯一 cache line、唯一 page 和 TLB miss。若两个 offset 落在同一 cache line，它们不应该算两条 cache line；若 page 超过 TLB 容量，就会产生额外 miss。这样读者先能手算，再跑 probe，再回到原理卷理解为什么局部性会影响吞吐。
+
+并发和运行时部分也同样处理。队列不是只展示 \code{push/pop}，而是记录 \code{push_wait_count}、\code{pop_wait_count}、\code{close_count} 和等待耗时；wait channel 不是只说“等待被唤醒”，而是分别跑 semaphore、barrier、future/promise 和 atomic wait；异步 I/O 模型不把 submit、completion 和 commit 混成一个动作，而是统计 submitted、completed、backpressure 和 max in flight。读这些代码时，先看报告字段，再看测试如何让字段变成承诺。
+
+\begin{lstlisting}[language=bash,caption={Compute Systems 探针入口}]
+books/compute-systems-engine-code/build/reference-debug/labs/compute_systems/cse_compsys_demo
+books/compute-systems-engine-code/build/reference-debug/labs/compute_systems/cse_compsys_chapter_models_probe
+books/compute-systems-engine-code/build/reference-debug/labs/compute_systems/cse_compsys_wait_channels_probe
+books/compute-systems-engine-code/build/reference-debug/labs/compute_systems/cse_compsys_task_runtime_probe
+books/compute-systems-engine-code/build/reference-debug/labs/compute_systems/cse_compsys_futex_lab_probe
+\end{lstlisting}
+
+\section{四、递进大作业和验收方式}
+
+代码卷的大作业分两条线推进。第一条线从 \filepath{reference_pipeline} 出发，目标是做出一个可以解释输入身份、坏行诊断、reference 结果、report、manifest、split 和 merge 的数据处理骨架。第二条线从 \filepath{compute_systems} 出发，目标是把第二册每章机制做成可运行模型，并用测试和 probe 固定输出。两个项目最后合在一起：系统机制服务一条有合同、有恢复边界、有报告证据的工程流水线。
+
+\begin{longtable}{p{0.16\linewidth}p{0.32\linewidth}p{0.42\linewidth}}
+阶段 & 交付物 & 通过标准 \\
+\hline
+0 & 输入身份与 reference 合同 & 每条记录有 input name、generation、offset、line；坏行进入结构化 diagnostics \\
+1 & report、manifest、checksum & 人读报告和机器清单字段顺序稳定；同一输入重复运行 checksum 一致 \\
+2 & split、partial result、merge & split 落在行中间时，与整文件 reference 的 records、accepted、diagnostics 和 checksum 一致 \\
+3 & 逐章 compute systems 模型 & 章节 probe 输出 21 个模型结果，字段能回到原理卷逐项解释 \\
+4 & 并发、wait、futex、runtime 探针 & 队列关闭、等待唤醒、future/promise、atomic wait、futex 和任务运行时都有测试证据 \\
+5 & 端到端工程报告 & 报告写清构建命令、测试结果、probe 输出、benchmark 边界和未验证假设 \\
+\end{longtable}
+
+提交前按下面顺序验收。第一步构建整本代码卷，第二步跑全部 CTest，第三步单独跑 compute systems 章节 probe，第四步把 PDF/EPUB 重新生成并导出。任何一步失败，都说明书里的代码、解释或构建环境还没有对齐。
+
+\begin{lstlisting}[language=bash,caption={提交前最小验收命令}]
+cmake -S books/compute-systems-engine-code \
+      -B books/compute-systems-engine-code/build/reference-debug \
+      -DCMAKE_BUILD_TYPE=Debug
+cmake --build books/compute-systems-engine-code/build/reference-debug
+ctest --test-dir books/compute-systems-engine-code/build/reference-debug \
+      --output-on-failure
+books/compute-systems-engine-code/build/reference-debug/labs/compute_systems/cse_compsys_chapter_models_probe
+\end{lstlisting}
+
+\begin{labbox}
+章节结构约定：正文每章只保留三到四个大节。更细的推导、例子、反例和验收点放进大节内部，用表格、代码和段落承载；不要把每个小动作都拆成独立 section。这样目录不会碎，正文仍然能从具体案例推到规律。
 \end{labbox}

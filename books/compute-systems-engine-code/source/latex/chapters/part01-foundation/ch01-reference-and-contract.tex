@@ -1,27 +1,20 @@
 \chapter{输入合同、Reference 与第一组测试}
 
-\section{本章目标}
+\section{为什么先写 reference}
 
-本章实现 Compute Systems Engine 的第一个可运行切片：输入合同、顺序 reference、诊断结果、稳定输出和测试。它对应原理卷第一章的内容。此时不做并行、不做 SIMD、不做 manifest，也不追求吞吐；目标只有一个：让项目拥有一把可信尺子。后续所有优化都必须先通过这把尺子。
+本章实现 Compute Systems Engine 的第一个可运行切片：输入合同、顺序 reference、诊断结果、稳定输出和测试。它对应原理卷第一章。此时不做并行、不做 SIMD、不做 manifest，也不追求吞吐；目标只有一个：让项目拥有一把可信尺子。后续所有优化都必须先通过这把尺子。
 
-先把本章几个词落到代码对象上。合同不是抽象口号，而是函数边界的承诺：输入记录长什么样，缺字段算什么错误，输出 key 是否排序，计数溢出是否允许。reference 是最朴素但可信的实现，用来定义正确结果；后面 SIMD、线程池或异步 I/O 版本都必须和它对齐。diagnostic 是结构化错误事实，不是随手打印的日志；它要能指出哪条记录、哪个字段、为什么失败。checksum 是输出摘要，用来证明同一输入、同一合同下结果稳定。
+\term{reference}{参考实现} 是可信但不追求快的版本。它的价值不是“代码短”，而是定义正确结果。后面无论换成 SIMD、线程池、异步 I/O 还是分布式 attempt，都必须回答同一个问题：新版本是否仍然和 reference 表达同一份语义。若 reference 自身含糊，后面的性能数字只是在测一个没有定义清楚的程序。
 
-第一版工程应至少包含四个模块：
+\term{contract}{合同} 不是法律文件，而是函数边界的承诺：输入记录长什么样，缺字段算什么错误，输出 key 是否排序，计数溢出是否允许。合同必须落到字段、返回值、错误类型和测试断言里。只写“输入是日志”没有工程价值；写出 \code{event,value}、缺字段为 \code{missing_field}、多字段为 \code{extra_field}，才算进入代码。
 
-\begin{center}
-\begin{tabular}{lll}
-\toprule
-模块 & 职责 & 不负责 \\
-\midrule
-\code{input} & 读取固定测试输入，分配 \code{RecordId} & 并行切分和异步 I/O \\
-\code{reference} & 顺序解析和计数 & 优化、缓存布局和线程 \\
-\code{report} & 输出 accepted、rejected、counts 和 checksum & 性能归因 \\
-\code{tests} & 固定正常输入、坏行和稳定输出 & 压力 benchmark \\
-\bottomrule
-\end{tabular}
-\end{center}
+\term{diagnostic}{诊断记录} 是结构化错误事实，不是随手打印的日志。它要说明哪份输入、哪一代、哪一行、哪个字节位置、为什么失败。诊断质量会直接决定后续并行 split、恢复 replay 和分布式重试能不能复现事故。第一版若只输出“parse error”，后面所有复杂机制都会失去定位基础。
 
-\section{第一版接口}
+\begin{keyidea}
+第一章只买四种能力：输入身份、顺序 reference、结构化诊断和稳定报告。任何不能服务这四件事的复杂度，都应留到后续章节。
+\end{keyidea}
+
+\section{第一版接口怎样定}
 
 第一版接口要小，但不能含糊。建议先定义四个概念：\code{RecordId}、\code{ParseDiagnostic}、\code{ReferenceResult} 和 \code{InputCase}。完整字段可以随项目扩展，但第一版必须能回答三件事：哪条记录被接受，哪条记录被拒绝，最终计数是否稳定。
 
@@ -45,15 +38,42 @@ struct ReferenceResult {
 };
 \end{lstlisting}
 
-\section{测试先于优化}
+\code{RecordId} 是记录身份。它把一条输入记录定位到 input name、generation、byte offset 和 line number。generation 是“同名输入的第几代”，不是装饰字段。后续 retry、checkpoint 或恢复时，旧 generation 的结果不能覆盖新 generation。
+
+\code{ParseDiagnostic} 只保存可复查事实，不保存临时调试字符串。错误类型应稳定，例如 \code{missing_field}、\code{extra_field}、\code{empty_event}、\code{bad_value}。这样测试可以断言错误类别，报告可以聚合错误分布，用户也能根据错误类型定位合同违反点。
+
+\code{ReferenceResult} 使用 \code{std::map} 保存 counts，是为了让输出 key 顺序稳定。稳定顺序不是小事：报告、checksum、manifest 和回归测试都依赖它。等后续进入热路径优化，可以用哈希表或分片结构提高吞吐，但发布报告前仍要回到稳定顺序。
+
+\section{测试先固定语义}
 
 第一组测试不追求覆盖所有未来功能，只固定最核心语义。正常五行输入应得到 \code{view=2}；缺字段输入应进入 diagnostics；字段过多、空事件名和 value 非整数都应有明确错误类型；输出 key 顺序必须稳定。若这些测试不稳定，后续任何性能实验都应暂停。
+
+手算样例如下：
+
+\begin{lstlisting}
+view,1
+click,1
+view,2
+\end{lstlisting}
+
+这三行的 \code{records_total} 是 3，\code{accepted} 是 3，\code{counts["view"]} 是 2，\code{counts["click"]} 是 1。这个例子很小，但它固定了两条语义：同一个 event 的多条记录要累加；value 字段存在并可解析时，记录才算 accepted。
+
+坏行样例如下：
+
+\begin{lstlisting}
+missing
+click,1,extra
+,2
+login,abc
+\end{lstlisting}
+
+它们分别对应 \code{missing_field}、\code{extra_field}、\code{empty_event} 和 \code{bad_value}。测试不只检查错误个数，还检查 line number、error kind 和 byte offset。这样后续换 parser 时，不能把诊断精度降级。
 
 \begin{exercisebox}
 本章实现任务：建立 CMake target、顺序 reference 和测试。测试至少包含 normal five lines、missing field、extra field、empty event name、bad value 五类输入。每个测试同时检查 accepted、diagnostics、counts 和稳定 checksum。
 \end{exercisebox}
 
-\section{报告格式}
+\section{报告是第一份证据}
 
 第一版报告可以是简单 key-value 文本，不需要复杂 UI。最低字段包括输入名、输入版本、总行数、accepted、rejected、输出 checksum 和错误类型计数。报告不是给人截图看的，而是后续脚本和读者复查用的证据。
 
@@ -70,4 +90,6 @@ count.logout=1
 count.view=2
 \end{lstlisting}
 
-本章结束时，项目还很小，但它已经具备工程地基：语义明确、测试可跑、报告可查。下一章才能开始讨论 split 和 RecordId 在并行输入中的作用。
+\term{checksum}{校验和} 把结果压成可比较摘要。它不能替代完整输出，但能让回归测试快速发现“看起来差不多”的变化。后续并行归约、split merge、manifest 发布都要继续保留 checksum，因为性能优化不能只证明自己更快，还要证明自己没有改变语义。
+
+本章结束时，项目还很小，但它已经具备工程地基：语义明确、测试可跑、报告可查。下一章会把它扩展成两个独立 lab：\filepath{reference_pipeline} 固定输入和报告合同，\filepath{compute_systems} 为原理卷每章提供可运行模型和系统并发探针。

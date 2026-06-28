@@ -11,4 +11,5 @@ option(COMPUTE_SYSTEMS_ENGINE_CODE_BUILD_LABS "Build Compute Systems Engine code
 if(COMPUTE_SYSTEMS_ENGINE_CODE_BUILD_LABS)
     enable_testing()
     add_subdirectory(labs/reference_pipeline)
+    add_subdirectory(labs/compute_systems)
 endif()
