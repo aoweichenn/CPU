@@ -20,4 +20,7 @@ int subarray_sum_equals_k_prefix_hash(const std::vector<int>& nums, int target);
 int longest_substring_without_repeat_bruteforce(const std::string& s);
 int longest_substring_without_repeat_window(const std::string& s);
 
+int max_subarray_bruteforce(const std::vector<int>& nums);
+int max_subarray_kadane(const std::vector<int>& nums);
+
 }  // namespace algobook

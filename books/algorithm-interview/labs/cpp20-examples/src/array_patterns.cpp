@@ -187,4 +187,41 @@ int longest_substring_without_repeat_window(const std::string& s)
     return best;
 }
 
+int max_subarray_bruteforce(const std::vector<int>& nums)
+{
+    if (nums.empty()) {
+        throw std::invalid_argument("max_subarray requires a non-empty input");
+    }
+
+    int best = std::numeric_limits<int>::min();
+
+    for (int left = 0; left < static_cast<int>(nums.size()); ++left) {
+        int sum = 0;
+        for (int right = left; right < static_cast<int>(nums.size()); ++right) {
+            sum += nums[right];
+            best = std::max(best, sum);
+        }
+    }
+
+    return best;
+}
+
+int max_subarray_kadane(const std::vector<int>& nums)
+{
+    if (nums.empty()) {
+        throw std::invalid_argument("max_subarray requires a non-empty input");
+    }
+
+    int best_end_here = nums.front();
+    int best_overall = nums.front();
+
+    for (int index = 1; index < static_cast<int>(nums.size()); ++index) {
+        const int value = nums[index];
+        best_end_here = std::max(value, best_end_here + value);
+        best_overall = std::max(best_overall, best_end_here);
+    }
+
+    return best_overall;
+}
+
 }  // namespace algobook

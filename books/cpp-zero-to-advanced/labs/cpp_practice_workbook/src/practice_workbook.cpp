@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <charconv>
 #include <cctype>
+#include <fstream>
+#include <sstream>
 #include <stdexcept>
 #include <utility>
 
@@ -190,6 +192,18 @@ ParseConfigResult parse_text_config(std::string_view text)
     }
 
     return result;
+}
+
+std::string read_text_file(const std::filesystem::path& path)
+{
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open file: " + path.string());
+    }
+
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    return buffer.str();
 }
 
 TextAnalyzer::TextAnalyzer(TextConfig config)

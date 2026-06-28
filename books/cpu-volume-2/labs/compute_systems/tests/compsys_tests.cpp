@@ -9,6 +9,7 @@
 #include <iostream>
 #include <mutex>
 #include <optional>
+#include <sstream>
 #include <stdexcept>
 #include <thread>
 #include <vector>
@@ -382,6 +383,24 @@ void test_continuation_runtime_probe() {
             "continuation probe wait_idle should finish with no unfinished work");
 }
 
+void test_task_runtime_report_csv() {
+    compsys::TaskRuntime runtime(COMPSYS_TEST_RUNTIME_WORKERS);
+    const bool accepted = runtime.submit([]() {});
+    require(accepted, "task runtime should accept first task");
+    runtime.wait_idle();
+    runtime.shutdown();
+
+    const compsys::TaskRuntime::Report report = runtime.report();
+    std::ostringstream output;
+    compsys::write_task_runtime_report_csv(output, report);
+
+    const std::string csv = output.str();
+    require(csv.find("worker_count,active_workers,queued_tasks,max_queue_depth") == 0,
+            "task runtime CSV header mismatch");
+    require(csv.find(",1,") != std::string::npos,
+            "task runtime CSV should include a completed count");
+}
+
 }  // namespace
 
 int main() {
@@ -401,6 +420,7 @@ int main() {
         test_futex_lab_probe();
         test_same_pool_future_wait_probe();
         test_continuation_runtime_probe();
+        test_task_runtime_report_csv();
         std::cout << "compsys tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

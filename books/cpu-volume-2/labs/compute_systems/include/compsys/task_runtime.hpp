@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <mutex>
+#include <ostream>
 #include <thread>
 #include <vector>
 
@@ -84,5 +85,8 @@ struct ContinuationRuntimeReport {
 [[nodiscard]] ContinuationRuntimeReport run_continuation_runtime_probe(
     std::int32_t worker_count,
     std::int32_t root_task_count);
+
+void write_task_runtime_report_csv(std::ostream& output,
+                                   const TaskRuntime::Report& report);
 
 }  // namespace compsys

@@ -3,6 +3,8 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
+#include <fstream>
 #include <stdexcept>
 #include <string_view>
 #include <vector>
@@ -11,6 +13,39 @@ namespace {
 
 using ::testing::ElementsAre;
 using ::testing::HasSubstr;
+
+[[nodiscard]] std::filesystem::path temp_file_path(const std::string& name)
+{
+    return std::filesystem::temp_directory_path() / name;
+}
+
+class ScopedTempFile {
+public:
+    explicit ScopedTempFile(std::string name)
+        : path_(temp_file_path(name))
+    {
+        std::filesystem::remove(this->path_);
+    }
+
+    ScopedTempFile(const ScopedTempFile&) = delete;
+    ScopedTempFile& operator=(const ScopedTempFile&) = delete;
+
+    ScopedTempFile(ScopedTempFile&&) = delete;
+    ScopedTempFile& operator=(ScopedTempFile&&) = delete;
+
+    ~ScopedTempFile()
+    {
+        std::filesystem::remove(this->path_);
+    }
+
+    [[nodiscard]] const std::filesystem::path& path() const
+    {
+        return this->path_;
+    }
+
+private:
+    std::filesystem::path path_;
+};
 
 TEST(CppPracticeWorkbookTest, ConfigParserAcceptsCommentsAndStopWords)
 {
@@ -109,6 +144,24 @@ TEST(CppPracticeWorkbookTest, DiagnosticMessagesRemainActionable)
 
     ASSERT_THAT(parsed.diagnostics, testing::SizeIs(1));
     EXPECT_THAT(parsed.diagnostics[0].message, HasSubstr("true or false"));
+}
+
+TEST(CppPracticeWorkbookTest, ReadTextFileReturnsFullContent)
+{
+    const ScopedTempFile file("cppbook_practice_read_text_file.txt");
+    {
+        std::ofstream output(file.path());
+        output << "first line\nsecond line\n";
+    }
+
+    EXPECT_EQ(cppbook::read_text_file(file.path()), "first line\nsecond line\n");
+}
+
+TEST(CppPracticeWorkbookTest, ReadTextFileReportsMissingFile)
+{
+    const ScopedTempFile file("cppbook_practice_missing_text_file.txt");
+
+    EXPECT_THROW((void)cppbook::read_text_file(file.path()), std::runtime_error);
 }
 
 }  // namespace

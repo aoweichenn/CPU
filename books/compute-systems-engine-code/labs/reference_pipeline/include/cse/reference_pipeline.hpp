@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -33,6 +34,14 @@ struct InputCase {
     std::string text;
 };
 
+struct InputSplit {
+    std::string input_name;
+    std::uint64_t input_generation = 0;
+    std::uint64_t byte_begin = 0;
+    std::uint64_t first_line_number = 1;
+    std::string text;
+};
+
 struct ReferenceResult {
     std::string input_name;
     std::uint64_t input_generation = 0;
@@ -53,6 +62,12 @@ struct ManifestRow {
 };
 
 [[nodiscard]] ReferenceResult run_reference(const InputCase& input);
+[[nodiscard]] std::vector<InputSplit> split_input_case(const InputCase& input,
+                                                       std::size_t target_bytes);
+[[nodiscard]] ReferenceResult run_reference_split(const InputSplit& split);
+[[nodiscard]] ReferenceResult merge_reference_results(const std::vector<ReferenceResult>& partials);
+[[nodiscard]] ReferenceResult run_reference_with_splits(const InputCase& input,
+                                                        std::size_t target_bytes);
 [[nodiscard]] ManifestRow make_manifest_row(const ReferenceResult& result);
 [[nodiscard]] std::string format_report(const ReferenceResult& result);
 [[nodiscard]] std::string format_manifest_row(const ManifestRow& row);

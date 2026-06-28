@@ -1,6 +1,8 @@
 #include <algobook/array_patterns.hpp>
+#include <algobook/backtracking_patterns.hpp>
 #include <algobook/graph_patterns.hpp>
 
+#include <array>
 #include <cstdlib>
 #include <iostream>
 #include <string>
@@ -63,6 +65,21 @@ void test_longest_substring()
     require(algobook::longest_substring_without_repeat_window("") == 0, "substring empty");
 }
 
+void test_max_subarray()
+{
+    const std::vector<int> sample = {-2, 1, -3, 4, -1, 2, 1, -5, 4};
+    require(algobook::max_subarray_bruteforce(sample) == 6, "max_subarray brute sample");
+    require(algobook::max_subarray_kadane(sample) == 6, "max_subarray kadane sample");
+
+    const std::vector<int> all_negative = {-8, -3, -6, -2, -5, -4};
+    require(algobook::max_subarray_bruteforce(all_negative) == -2, "max_subarray brute all negative");
+    require(algobook::max_subarray_kadane(all_negative) == -2, "max_subarray kadane all negative");
+
+    const std::vector<int> zeroes = {0, 0, 0};
+    require(algobook::max_subarray_bruteforce(zeroes) == 0, "max_subarray brute zeroes");
+    require(algobook::max_subarray_kadane(zeroes) == 0, "max_subarray kadane zeroes");
+}
+
 void test_oranges_rotting()
 {
     const std::vector<std::vector<int>> grid = {
@@ -99,6 +116,19 @@ void test_number_of_islands()
     require(algobook::number_of_islands_bfs(many) == 3, "number of islands sample three");
 }
 
+void test_judge_point_24()
+{
+    require(algobook::judge_point_24_iterative(
+                std::array<int, algobook::POINT_24_CARD_COUNT>{4, 1, 8, 7}),
+            "judge point 24 true sample");
+    require(!algobook::judge_point_24_iterative(
+                std::array<int, algobook::POINT_24_CARD_COUNT>{1, 2, 1, 2}),
+            "judge point 24 false sample");
+    require(algobook::judge_point_24_iterative(
+                std::array<int, algobook::POINT_24_CARD_COUNT>{3, 3, 8, 8}),
+            "judge point 24 division sample");
+}
+
 }  // namespace
 
 int main()
@@ -108,8 +138,10 @@ int main()
     test_min_subarray_len();
     test_subarray_sum_equals_k();
     test_longest_substring();
+    test_max_subarray();
     test_oranges_rotting();
     test_number_of_islands();
+    test_judge_point_24();
     std::cout << "algorithm book tests passed\n";
     return 0;
 }

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <list>
 #include <map>
 #include <optional>
@@ -37,6 +38,7 @@ struct WordCount {
 };
 
 [[nodiscard]] ParseConfigResult parse_text_config(std::string_view text);
+[[nodiscard]] std::string read_text_file(const std::filesystem::path& path);
 
 class TextAnalyzer {
 public:

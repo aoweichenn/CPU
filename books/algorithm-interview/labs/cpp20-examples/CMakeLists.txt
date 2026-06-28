@@ -1,5 +1,6 @@
 add_library(algorithm_book_examples STATIC
     src/array_patterns.cpp
+    src/backtracking_patterns.cpp
     src/graph_patterns.cpp
 )
 

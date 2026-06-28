@@ -6,6 +6,7 @@
 #include <future>
 #include <latch>
 #include <memory>
+#include <ostream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -300,6 +301,25 @@ ContinuationRuntimeReport run_continuation_runtime_probe(std::int32_t worker_cou
     report.final_sum = final_sum.load(std::memory_order_relaxed);
     report.wait_idle_completed = runtime_report.unfinished_count == 0;
     return report;
+}
+
+void write_task_runtime_report_csv(std::ostream& output,
+                                   const TaskRuntime::Report& report)
+{
+    output << "worker_count,active_workers,queued_tasks,max_queue_depth,"
+              "unfinished_count,submitted_count,completed_count,failed_count,"
+              "rejected_count,accepting,stopping\n";
+    output << report.worker_count << ','
+           << report.active_workers << ','
+           << report.queued_tasks << ','
+           << report.max_queue_depth << ','
+           << report.unfinished_count << ','
+           << report.submitted_count << ','
+           << report.completed_count << ','
+           << report.failed_count << ','
+           << report.rejected_count << ','
+           << (report.accepting ? 1 : 0) << ','
+           << (report.stopping ? 1 : 0) << '\n';
 }
 
 }  // namespace compsys

@@ -3,6 +3,7 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <stdexcept>
 #include <string>
 
 namespace {
@@ -92,6 +93,57 @@ TEST(CseReferencePipelineTest, DiagnosticDetailNamesTheContract)
     ASSERT_EQ(result.diagnostics.size(), 1U);
     EXPECT_EQ(result.diagnostics[0].error_kind, "extra_field");
     EXPECT_THAT(result.diagnostics[0].detail, HasSubstr("exactly two fields"));
+}
+
+TEST(CseReferencePipelineTest, SplitInputMatchesWholeReferenceWhenBoundaryFallsInsideLine)
+{
+    const cse::InputCase input{
+        "split_middle",
+        9,
+        "view,1\nclick,1\nview,2\nmissing\nlogout,1\n",
+    };
+
+    const cse::ReferenceResult whole = cse::run_reference(input);
+    const cse::ReferenceResult split = cse::run_reference_with_splits(input, 10);
+
+    EXPECT_EQ(split.records_total, whole.records_total);
+    EXPECT_EQ(split.accepted, whole.accepted);
+    EXPECT_EQ(split.counts, whole.counts);
+    ASSERT_EQ(split.diagnostics.size(), whole.diagnostics.size());
+    EXPECT_EQ(split.diagnostics[0].record.line_number, 4U);
+    EXPECT_EQ(split.diagnostics[0].record.byte_offset, 22U);
+    EXPECT_EQ(split.checksum, whole.checksum);
+}
+
+TEST(CseReferencePipelineTest, SplitInputKeepsLongLineWhole)
+{
+    const cse::InputCase input{
+        "long_line",
+        2,
+        "very_long_event_name,123456789\nclick,1\n",
+    };
+
+    const std::vector<cse::InputSplit> splits = cse::split_input_case(input, 4);
+
+    ASSERT_EQ(splits.size(), 2U);
+    EXPECT_EQ(splits[0].byte_begin, 0U);
+    EXPECT_EQ(splits[0].first_line_number, 1U);
+    EXPECT_EQ(splits[0].text, "very_long_event_name,123456789\n");
+    EXPECT_EQ(splits[1].byte_begin, 31U);
+    EXPECT_EQ(splits[1].first_line_number, 2U);
+
+    const cse::ReferenceResult whole = cse::run_reference(input);
+    const cse::ReferenceResult split = cse::run_reference_with_splits(input, 4);
+    EXPECT_EQ(split.records_total, whole.records_total);
+    EXPECT_EQ(split.accepted, whole.accepted);
+    EXPECT_EQ(split.counts, whole.counts);
+    EXPECT_EQ(split.checksum, whole.checksum);
+}
+
+TEST(CseReferencePipelineTest, SplitInputRejectsZeroTargetBytes)
+{
+    const cse::InputCase input{"bad_split", 1, "view,1\n"};
+    EXPECT_THROW((void)cse::split_input_case(input, 0), std::invalid_argument);
 }
 
 }  // namespace
