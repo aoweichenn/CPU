@@ -1,11 +1,14 @@
+#include <compsys/chapter_models.hpp>
 #include <compsys/futex_lab.hpp>
 #include <compsys/parallel_reduce.hpp>
 #include <compsys/sync_primitives.hpp>
 #include <compsys/task_runtime.hpp>
 #include <compsys/wait_channels.hpp>
 
+#include <array>
 #include <cstdint>
 #include <cstdlib>
+#include <cmath>
 #include <iostream>
 #include <mutex>
 #include <optional>
@@ -27,6 +30,13 @@ constexpr std::int32_t COMPSYS_TEST_FUTEX_MUTEX_INCREMENTS = 50;
 constexpr std::int32_t COMPSYS_TEST_RUNTIME_WORKERS = 3;
 constexpr std::int32_t COMPSYS_TEST_CONTINUATION_ROOTS = 5;
 constexpr std::int64_t COMPSYS_TEST_CONTINUATION_SUM = 15;
+constexpr double COMPSYS_TEST_DOUBLE_TOLERANCE = 0.000001;
+
+void require_near(double actual, double expected, const char* message) {
+    if (std::fabs(actual - expected) > COMPSYS_TEST_DOUBLE_TOLERANCE) {
+        throw std::runtime_error(message);
+    }
+}
 
 void require(bool condition, const char* message) {
     if (!condition) {
@@ -401,6 +411,190 @@ void test_task_runtime_report_csv() {
             "task runtime CSV should include a completed count");
 }
 
+void test_chapter_models_pipeline_branch_and_memory() {
+    const std::vector<std::int32_t> records{4, -1, 7};
+    const compsys::Chapter01PipelineReport pipeline =
+        compsys::model_ch01_input_pipeline(records);
+    require(pipeline.records_total == 3, "chapter 1 total mismatch");
+    require(pipeline.accepted == 2, "chapter 1 accepted mismatch");
+    require(pipeline.rejected == 1, "chapter 1 rejected mismatch");
+
+    const std::vector<std::int32_t> branch_values{1, 9, 2, 10};
+    const compsys::Chapter02BranchReport branch =
+        compsys::model_ch02_branch_predictor(branch_values, 5);
+    require(branch.iterations == 4, "chapter 2 iteration mismatch");
+    require(branch.actual_taken == 2, "chapter 2 actual taken mismatch");
+    require(branch.mispredictions > 0, "chapter 2 should expose branch misses");
+
+    const std::vector<std::uint64_t> offsets{0, 64, 4096, 8192, 0};
+    const compsys::Chapter03MemoryAccessReport memory =
+        compsys::model_ch03_cache_tlb(offsets, 64, 4096, 2);
+    require(memory.access_count == 5, "chapter 3 access count mismatch");
+    require(memory.unique_cache_lines == 4, "chapter 3 cache line mismatch");
+    require(memory.unique_pages == 3, "chapter 3 unique page mismatch");
+    require(memory.tlb_misses == 4, "chapter 3 TLB miss mismatch");
+}
+
+void test_chapter_models_numa_roofline_and_layout() {
+    const std::vector<std::int32_t> worker_nodes{0, 1, 1};
+    const std::vector<std::int32_t> memory_nodes{0, 0, 1};
+    const compsys::Chapter04NumaReport numa =
+        compsys::model_ch04_numa_coherence(worker_nodes, memory_nodes);
+    require(numa.local_accesses == 2, "chapter 4 local access mismatch");
+    require(numa.remote_accesses == 1, "chapter 4 remote access mismatch");
+    require(numa.coherence_transfers == 1, "chapter 4 transfer mismatch");
+
+    const compsys::Chapter05RooflineReport roofline =
+        compsys::model_ch05_roofline(200.0, 100.0, 10.0, 20.0);
+    require_near(roofline.arithmetic_intensity, 2.0,
+                 "chapter 5 arithmetic intensity mismatch");
+    require_near(roofline.memory_bound_gflops, 40.0,
+                 "chapter 5 memory roof mismatch");
+    require_near(roofline.attainable_gflops, 10.0,
+                 "chapter 5 attainable mismatch");
+    require(!roofline.memory_bound, "chapter 5 should be compute-bound");
+
+    const compsys::Chapter05bPmuSimdReport simd_evidence =
+        compsys::model_ch05b_pmu_simd_evidence(80, 20, true);
+    require(simd_evidence.retired_instructions == 100,
+            "chapter 5b retired instruction mismatch");
+    require_near(simd_evidence.vector_fraction, 0.2,
+                 "chapter 5b vector fraction mismatch");
+    require(simd_evidence.evidence_complete,
+            "chapter 5b evidence should be complete");
+
+    const compsys::Chapter06LayoutReport layout =
+        compsys::model_ch06_layout_locality(10, 4, 1, 8);
+    require(layout.aos_bytes_touched == 320, "chapter 6 AoS bytes mismatch");
+    require(layout.soa_bytes_touched == 80, "chapter 6 SoA bytes mismatch");
+    require(layout.saved_bytes == 240, "chapter 6 saved bytes mismatch");
+}
+
+void test_chapter_models_kernels_and_scheduling() {
+    const compsys::Chapter07SimdReport simd =
+        compsys::model_ch07_simd_ilp(10, 4);
+    require(simd.vector_iterations == 2, "chapter 7 vector iteration mismatch");
+    require(simd.scalar_tail == 2, "chapter 7 scalar tail mismatch");
+
+    const std::vector<std::int32_t> kernel_values{1, 2, 3, 4};
+    const compsys::Chapter08KernelReport kernel =
+        compsys::model_ch08_map_filter_reduce(kernel_values);
+    require(kernel.filtered_count == 2, "chapter 8 filtered count mismatch");
+    require(kernel.mapped_sum == 20, "chapter 8 mapped sum mismatch");
+    require(kernel.reduced_sum == 20, "chapter 8 reduced sum mismatch");
+
+    const std::vector<std::int32_t> task_costs{5, 1, 4, 2};
+    const compsys::Chapter09SchedulingReport scheduling =
+        compsys::model_ch09_thread_scheduling(task_costs, 2);
+    require(scheduling.task_count == 4, "chapter 9 task count mismatch");
+    require(scheduling.imbalance > 0, "chapter 9 should expose imbalance");
+
+    const std::array<bool, 3> ready_observations{false, false, true};
+    const compsys::Chapter09bLinuxWaitReport wait =
+        compsys::model_ch09b_linux_wait_wake(ready_observations);
+    require(wait.spurious_wakeups == 2, "chapter 9b spurious wake mismatch");
+    require(wait.completed, "chapter 9b should complete");
+}
+
+void test_chapter_models_sync_atomic_and_reclamation() {
+    const compsys::Chapter10BackpressureReport backpressure =
+        compsys::model_ch10_sync_backpressure(3, 4, 1, 5);
+    require(backpressure.backpressure_events > 0,
+            "chapter 10 should observe backpressure");
+    require(backpressure.max_depth <= backpressure.capacity,
+            "chapter 10 max depth exceeded capacity");
+
+    const std::vector<std::int32_t> observed_versions{1, 2, 2, 3};
+    const compsys::Chapter11AtomicPublicationReport atomic =
+        compsys::model_ch11_atomic_publication(observed_versions, 3);
+    require(atomic.stale_reads == 3, "chapter 11 stale read mismatch");
+    require(atomic.monotonic_observations,
+            "chapter 11 observations should be monotonic");
+
+    const std::vector<std::int32_t> ring_operations{1, 1, 1, -1, -1, -1};
+    const compsys::Chapter12LockFreeQueueReport ring =
+        compsys::model_ch12_spsc_ring(ring_operations, 2);
+    require(ring.pushed == 2, "chapter 12 pushed mismatch");
+    require(ring.rejected_full == 1, "chapter 12 rejected mismatch");
+    require(ring.popped == 2, "chapter 12 popped mismatch");
+    require(ring.empty_pops == 1, "chapter 12 empty pop mismatch");
+
+    const std::vector<std::int32_t> retired_nodes{1, 2, 3};
+    const std::vector<std::int32_t> protected_nodes{2};
+    const compsys::Chapter12bReclamationReport reclamation =
+        compsys::model_ch12b_epoch_reclamation(retired_nodes, protected_nodes);
+    require(reclamation.reclaimed_nodes == 2, "chapter 12b reclaimed mismatch");
+    require(reclamation.deferred_nodes == 1, "chapter 12b deferred mismatch");
+}
+
+void test_chapter_models_runtime_io_and_distributed() {
+    const std::vector<std::int32_t> scan_values{1, 2, 3};
+    const compsys::Chapter13ReduceScanPartitionReport scan =
+        compsys::model_ch13_reduce_scan_partition(scan_values, 2);
+    require(scan.reduce_sum == 6, "chapter 13 reduce sum mismatch");
+    require(scan.last_prefix == 6, "chapter 13 last prefix mismatch");
+    require(scan.partition_true_count == 2, "chapter 13 partition true mismatch");
+
+    const std::vector<std::int32_t> worker_queues{6, 0, 0};
+    const compsys::Chapter14WorkStealingReport stealing =
+        compsys::model_ch14_work_stealing(worker_queues);
+    require(stealing.stolen_tasks > 0, "chapter 14 should steal tasks");
+    require(stealing.completed_tasks == 6, "chapter 14 completed mismatch");
+
+    const compsys::Chapter15AsyncIoReport io =
+        compsys::model_ch15_async_io_backpressure(5, 2, 1);
+    require(io.submitted == 5, "chapter 15 submitted mismatch");
+    require(io.completed == 5, "chapter 15 completed mismatch");
+    require(io.max_in_flight == 2, "chapter 15 max in-flight mismatch");
+    require(io.backpressure_events > 0,
+            "chapter 15 should observe backpressure");
+
+    const std::vector<std::int32_t> task_ids{1, 1, 2, 3};
+    const std::vector<std::int32_t> generations{2, 2, 1, 2};
+    const compsys::Chapter16DistributedModelReport distributed =
+        compsys::model_ch16_distributed_attempts(task_ids, generations, 2);
+    require(distributed.logical_tasks == 2, "chapter 16 logical task mismatch");
+    require(distributed.duplicate_attempts == 1,
+            "chapter 16 duplicate attempt mismatch");
+    require(distributed.stale_generation_attempts == 1,
+            "chapter 16 stale generation mismatch");
+
+    const std::array<bool, 3> acknowledgements{true, true, false};
+    const compsys::Chapter17ReplicationReport replication =
+        compsys::model_ch17_quorum_commit(3, acknowledgements);
+    require(replication.quorum_size == 2, "chapter 17 quorum mismatch");
+    require(replication.committed, "chapter 17 should commit");
+
+    const compsys::Chapter18RecoveryReport recovery =
+        compsys::model_ch18_checkpoint_recovery(100, 25, 63);
+    require(recovery.checkpoints == 4, "chapter 18 checkpoint mismatch");
+    require(recovery.replay_from_record == 50,
+            "chapter 18 replay start mismatch");
+    require(recovery.replay_records == 50, "chapter 18 replay count mismatch");
+}
+
+void test_chapter_model_error_paths() {
+    bool saw_invalid_ring = false;
+    try {
+        const std::vector<std::int32_t> invalid_operations{1, 0};
+        static_cast<void>(compsys::model_ch12_spsc_ring(invalid_operations, 2));
+    } catch (const std::runtime_error&) {
+        saw_invalid_ring = true;
+    }
+    require(saw_invalid_ring, "chapter 12 should reject unknown operations");
+
+    bool saw_mismatched_spans = false;
+    try {
+        const std::vector<std::int32_t> task_ids{1};
+        const std::vector<std::int32_t> generations{1, 1};
+        static_cast<void>(
+            compsys::model_ch16_distributed_attempts(task_ids, generations, 1));
+    } catch (const std::runtime_error&) {
+        saw_mismatched_spans = true;
+    }
+    require(saw_mismatched_spans, "chapter 16 should reject mismatched spans");
+}
+
 }  // namespace
 
 int main() {
@@ -421,6 +615,12 @@ int main() {
         test_same_pool_future_wait_probe();
         test_continuation_runtime_probe();
         test_task_runtime_report_csv();
+        test_chapter_models_pipeline_branch_and_memory();
+        test_chapter_models_numa_roofline_and_layout();
+        test_chapter_models_kernels_and_scheduling();
+        test_chapter_models_sync_atomic_and_reclamation();
+        test_chapter_models_runtime_io_and_distributed();
+        test_chapter_model_error_paths();
         std::cout << "compsys tests passed\n";
         return EXIT_SUCCESS;
     } catch (const std::exception& error) {

@@ -1,4 +1,5 @@
 add_library(compsys STATIC
+    src/chapter_models.cpp
     src/parallel_reduce.cpp
     src/futex_lab.cpp
     src/sync_primitives.cpp
@@ -38,6 +39,21 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 add_test(NAME compsys_tests COMMAND $<TARGET_FILE:compsys_tests>)
+
+add_executable(compsys_chapter_models_probe
+    src/chapter_models_probe.cpp
+)
+
+target_link_libraries(compsys_chapter_models_probe PRIVATE compsys)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(compsys_chapter_models_probe PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_test(NAME compsys_chapter_models_probe COMMAND $<TARGET_FILE:compsys_chapter_models_probe>)
+set_tests_properties(compsys_chapter_models_probe PROPERTIES
+    PASS_REGULAR_EXPRESSION "chapter_models,21"
+)
 
 add_executable(compsys_wait_channels_probe
     src/wait_channels_probe.cpp
