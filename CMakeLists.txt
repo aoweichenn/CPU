@@ -9,6 +9,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_executable(book_workspace main.cpp)
 
 option(BOOKS_BUILD_CPU_VOLUME_1 "Build CPU Volume 1 labs" ON)
+option(BOOKS_BUILD_CPU_VOLUME_1_PRACTICE "Build CPU Volume 1 practice labs" ON)
 option(BOOKS_BUILD_CPU_VOLUME_2 "Build CPU Volume 2 labs" ON)
 option(BOOKS_BUILD_CPU_VOLUME_3 "Build CPU Volume 3 labs" ON)
 option(BOOKS_BUILD_ALGORITHM_INTERVIEW "Build algorithm interview book labs" ON)
@@ -18,6 +19,11 @@ option(BOOKS_BUILD_COMPUTE_SYSTEMS_ENGINE_CODE "Build Compute Systems Engine cod
 if(BOOKS_BUILD_CPU_VOLUME_1)
     enable_testing()
     add_subdirectory(books/cpu-volume-1)
+endif()
+
+if(BOOKS_BUILD_CPU_VOLUME_1_PRACTICE)
+    enable_testing()
+    add_subdirectory(books/cpu-volume-1-practice)
 endif()
 
 if(BOOKS_BUILD_CPU_VOLUME_2)

@@ -1,0 +1,84 @@
+\chapter{Executable Evidence Kit：从问题推出工程边界}
+
+第一册正文里有一个反复出现的问题：我们说“C++ 代码编译成机器指令”“函数遵守 ABI”“benchmark 要可信”，但读者真正动手时，常常不知道从哪里开始验证。最糟的学习路径是直接背结论：\code{.text} 放代码，System V ABI 用寄存器传参，Release 比 Debug 快，perf 能看性能。结论没有错，但没有证据链时，读者只会复述名词。
+
+本章从一个具体任务开始：给定一个本地可执行文件，写一个 C++20 工具输出它的基本证据。第一版只支持 ELF64 little-endian，也就是 Linux 上常见的 64 位小端 ELF 文件。输入是一串字节；输出是一份 report，包括 magic 是否正确、是否 ELF64、是否小端、machine 字段、entry address、section 列表、symbol 列表、checksum 和 diagnostics。这个任务足够小，能完整实现；也足够贴近第一册，能自然牵出编译、链接、装载、ABI、汇编和测量。
+
+\section{一、从一个最小问题开始}
+
+设想你编译了一个程序：
+
+\begin{lstlisting}[language=bash]
+g++ -O2 -g hello.cpp -o hello
+\end{lstlisting}
+
+你想回答六个问题：
+
+\begin{enumerate}
+  \item 它到底是不是 ELF 文件？
+  \item 它面向哪种机器架构？
+  \item 程序入口地址是多少？
+  \item 哪些 section 存在，\code{.text} 在文件中从哪里开始，占多少字节？
+  \item 符号表里有没有你写的函数名，它属于哪个 section？
+  \item 这份报告对应的是哪个具体文件内容，而不是同名旧文件？
+\end{enumerate}
+
+最直接的做法是用 \cmd{readelf -h}、\cmd{readelf -S}、\cmd{readelf -s} 和 \cmd{objdump -d}。这些工具很强，但如果读者从工具输出开始，容易只会看结果，不知道字段为什么这样组织。本卷让你先实现一个小切片，再拿成熟工具交叉验证。实现不是为了替代 readelf，而是为了让每个字段都经过你自己的手。
+
+\begin{keyidea}
+实践卷的第一条规则：工具输出不是魔法。能自己解析一小段格式，才知道成熟工具在帮你省掉哪些细节，也知道它的输出不应该被盲信。
+\end{keyidea}
+
+\section{二、为什么先做 ELF，而不是先做 benchmark}
+
+第一册有性能测量内容，为什么新实践卷不直接扩展 benchmark？原因是 benchmark 也需要二进制证据。你说一个循环更快，至少要知道当前跑的是 Debug 还是 Release，热函数是否还存在，符号是否被 inline 或 strip，\code{.text} 是否变化，反汇编里有没有意外调用。若不理解二进制结构，benchmark 报告很容易只剩时间数字。
+
+Executable Evidence Kit 先建立“文件事实”：字节、checksum、header、section、symbol。然后再进入“运行事实”：命令行参数、输入规模、计时边界、perf 事件、反汇编片段。两类事实要互相支撑。比如同一个源码函数在 Debug 中保留独立符号，在 Release 中可能被 inline；这不是“工具坏了”，而是优化改变了机器证据的形态。
+
+\begin{warningbox}
+不要把文件名当作证据。报告里写 \code{hello} 没有意义，因为同名文件可能被重编译覆盖。至少要保存 byte size 和 checksum，必要时保存构建命令、编译器版本和 git commit。
+\end{warningbox}
+
+\section{三、合同：第一版支持什么，不支持什么}
+
+第一版合同要窄，但必须清楚。本卷实现的解析器只承诺：
+
+\begin{enumerate}
+  \item 输入是内存中的字节序列，不直接绑定文件系统；
+  \item 支持 ELF magic 检查；
+  \item 支持 ELF64 little-endian；
+  \item 读取 object type、machine、entry address；
+  \item 读取 section header table 和 section-name string table；
+  \item 读取 \code{SHT\_SYMTAB} 与 \code{SHT\_DYNSYM} 的符号摘要；
+  \item 输出稳定文本 report 和 section CSV；
+  \item 对不支持或越界的输入给 diagnostics，而不是假装成功。
+\end{enumerate}
+
+它暂不承诺解析 program header、relocation、DWARF 调试信息、动态链接器状态、PIE 装载后的真实运行地址，也不承诺支持 32 位、大端或非 ELF 格式。限制不是缺陷，限制写清楚就是合同的一部分。
+
+\section{四、从特例推到规律}
+
+先看最小特例。一个合格 ELF 文件开头四个字节必须是 \code{0x7F 'E' 'L' 'F'}。如果这四个字节不对，后面任何字段都不能读，因为你不知道它是什么格式。第二个特例是文件只有 magic，却不足 64 字节。magic 正确只能说明“像 ELF”，不能说明 ELF64 header 完整；此时继续读 entry address 就是在越界解释垃圾。
+
+由这两个特例可以推出第一条规律：每读一个结构前，先证明字节范围存在。代码里的 \code{has\_range} 就是这个规律。再看 section table：header 会告诉我们 section header offset、entry size、count 和 section-name string table index。若 entry size 小于 ELF64 section header，说明当前解析器不能安全读取；若 string table index 越界，就不能把 name offset 翻译成名字。
+
+符号表也是同一套规律。symbol 的 name 字段不是字符串，而是字符串表偏移；symbol 的 section index 也不是名字，而是 section table 下标。因此解析顺序不能乱：先 header，再 section table，再 section-name string table，再 symbol table 和 symbol string table。这个顺序就是工程结构，不是格式细节。
+
+\begin{mentalmodel}
+ELF 解析像读一张地图的目录。header 告诉你目录在哪里，section table 告诉你每个区域的偏移和大小，string table 把数字偏移翻译成名字，symbol table 再把函数名、section 和地址连起来。
+\end{mentalmodel}
+
+\section{五、验收：代码、测试、工具、报告四件事一起过}
+
+本卷不接受“我写了一个函数但没跑”的实践。每个阶段都有四类证据：
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.42\linewidth}}
+证据 & 形式 & 通过标准 \\
+\hline
+代码 & C++20 library 与 CLI & 接口清楚，输入和错误路径不混在 main 里 \\
+测试 & GTest/GMock & synthetic ELF、坏 magic、短 header、符号上限都有断言 \\
+工具 & readelf/objdump/perf 或替代命令 & 至少交叉验证 header、section、symbol 中的三个字段 \\
+报告 & Markdown 或 CSV & 写清构建命令、输入 checksum、结论和限制 \\
+\end{longtable}
+
+最终研究项目不是把本卷代码抄一遍，而是选择一个自己编译的小程序，生成二进制证据报告。报告必须把第一册正文里的概念落到同一个对象上：源码函数对应哪个 symbol，symbol 落在哪个 section，section 在文件里的偏移是多少，反汇编能否看到函数机器码，benchmark 结论是否和当前构建产物一致。

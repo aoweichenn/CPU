@@ -5,6 +5,7 @@
 当前正式书籍：
 
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
+- `books/cpu-volume-1-practice/`：第一册配套实践卷，主题是 Executable Evidence Kit、ELF64 解析、ABI/符号观察、Linux 工具链、GTest/GMock、Google Benchmark 和研究报告。
 - `books/cpu-volume-2/`：从 C++ 到计算系统第二册原理卷，主题是硬件原理、多核心并行、高性能计算、多线程、锁、原子、无锁数据结构、并行算法、运行时、异步 I/O 和分布式计算。
 - `books/compute-systems-engine-code/`：第二册配套代码实践卷，主题是 Compute Systems Engine 的完整 C++20 实现、测试、benchmark、故障注入和报告。
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
@@ -23,6 +24,12 @@ books/
     labs/              # 与本书绑定的代码实验
     reports/           # 报告模板和学习报告
     results/           # 实验输出，默认只跟踪 .gitkeep
+    tools/             # 本书专用脚本
+  cpu-volume-1-practice/
+    source/latex/      # 第一册实践卷正式 LaTeX 书稿，生成 PDF/EPUB
+    labs/              # Executable Evidence Kit C++20 工程
+    reports/           # 研究报告输出
+    results/           # 实验输出
     tools/             # 本书专用脚本
   cpu-volume-2/
     source/latex/      # 第二册原理卷正式 LaTeX 书稿，生成 PDF/EPUB
@@ -85,6 +92,15 @@ make cpu-lab00
 make cpu-coverage
 ```
 
+生成并测试第一册实践卷：
+
+```bash
+make cpu1p-check
+make cpu1p-pdf
+make cpu1p-epub
+make cpu1p-test
+```
+
 生成第二册 PDF 和 EPUB：
 
 ```bash
@@ -94,13 +110,13 @@ make cpu2-epub
 make cpu2-text-count
 ```
 
-统一导出第一册、第二册、第三册、算法面试书和 Cpp 从零到高级：
+统一导出第一册、第一册实践卷、第二册、第三册、算法面试书和 Cpp 从零到高级：
 
 ```bash
 make books-export
 ```
 
-该命令会重新构建五本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
+该命令会重新构建各本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
 
 检查和测试算法面试书：
 
