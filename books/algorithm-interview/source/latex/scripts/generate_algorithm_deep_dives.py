@@ -1691,7 +1691,7 @@ EXPANSION_TOPICS: list[tuple[str, list[tuple[str, list[str]]]]] = [
 
 CODE_SNIPPETS = {
     "generated-code-patterns.tex": r"""
-\section{代表性 C++20 代码骨架}
+\topic{代表性 C++20 代码骨架}
 
 下面这些代码骨架不是为了替代题解，而是给读者提供可复用的实现基准。每段代码都尽量把状态命名清楚，把边界放在显式位置，把容器成本控制在题目需要的范围内。真正刷题时不要机械复制，而要先说清楚题目的不变量，再决定是否使用这些骨架。
 
@@ -1853,7 +1853,7 @@ bool is_valid_bst(TreeNode* root)
 
 
 FULL_CASE_DERIVATIONS = r"""
-\section{完整案例推导样例}
+\topic{完整案例推导样例}
 
 下面六个案例不是为了增加题量，而是给全书提供一套可模仿的案例讲法。每个案例都按同一条线展开：先翻译题面，写暴力基线，再定位最贵的重复工作，随后设计状态、不变量和边界测试。以后读到题卡时，请用这一节的粒度要求自己，而不是只记“用什么算法”。
 
@@ -2191,7 +2191,7 @@ def write_deep_sections() -> None:
 
 def append_family_section(body: list[str], family_key: str, problems: list[Problem]) -> None:
     family = FAMILIES[family_key]
-    body.append(f"\\section{{{escape_text(family.name)}}}")
+    body.append(f"\\topic{{{escape_text(family.name)}}}")
     body.append(
         escape_text(
             f"这一节先看 {family_case_names(problems)} 这几道 LeetCode 题，再整理同一题型的分流和推导。阅读顺序不是先背原理，而是先看案例的暴力瓶颈，再把重复出现的观察抽象成方法。"
@@ -2268,7 +2268,7 @@ def write_full_case_derivations() -> None:
 def write_expansion_topics() -> None:
     for filename, sections in EXPANSION_TOPICS:
         body: list[str] = [
-            "\\section{数据结构变种、工程应用和实验专题}",
+            "\\topic{数据结构变种、工程应用和实验专题}",
             "",
             escape_text(
                 "这一组专题补齐数据结构的变种、工程应用和实验要求。每个专题都把 LeetCode 案例、C++ 容器和系统源码放在一起比较，帮助读者理解为什么同一个复杂度在不同场景下表现差异很大。"
@@ -2286,7 +2286,7 @@ def write_expansion_topics() -> None:
 
 def write_extra_lectures() -> None:
     for filename, title, paragraphs in EXTRA_LECTURES:
-        body = [f"\\section{{{escape_text(title)}}}", ""]
+        body = [f"\\topic{{{escape_text(title)}}}", ""]
         for paragraph in paragraphs:
             if filename == "generated-advanced-problem-cards.tex":
                 body.append(advanced_problem_card(paragraph))
@@ -2451,7 +2451,7 @@ def write_leetcode_index() -> None:
         if not problems:
             continue
         family = FAMILIES[family_key]
-        lines.append(f"\\section{{{escape_text(family.name)}}}")
+        lines.append(f"\\topic{{{escape_text(family.name)}}}")
         lines.append("")
         lines.append("\\begin{longtable}{@{}p{0.16\\linewidth}p{0.32\\linewidth}p{0.44\\linewidth}@{}}")
         lines.append("\\toprule")
@@ -2474,7 +2474,7 @@ def write_leetcode_index() -> None:
 def append_second_pass_family(body: list[str], family_key: str, problems: list[Problem]) -> None:
     family = FAMILIES[family_key]
     review_problems = problems[:3]
-    body.append(f"\\section{{{escape_text(family.name)}：二刷复盘卡}}")
+    body.append(f"\\topic{{{escape_text(family.name)}：二刷复盘卡}}")
     body.append(
         escape_text(
             f"这一大节不重复正文题解，只用 {family_case_names(review_problems)} 做代表抽查。完整题号回附录索引，详细推导回对应主章节题卡。"
@@ -2509,7 +2509,7 @@ def append_second_pass_family(body: list[str], family_key: str, problems: list[P
 def write_second_pass_cards() -> None:
     problems_by_family = group_problems_by_family()
     body: list[str] = [
-        "\\section{二刷复盘总览}",
+        "\\topic{二刷复盘总览}",
         "",
         escape_text(
             f"这一组材料用于第二遍和第三遍复习，只保留每个题型的代表抽查任务，不再重复 {len(PROBLEMS)} 道题的逐题讲解。完整题目清单在附录索引，完整推导在各主章节题卡。"
