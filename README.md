@@ -10,15 +10,23 @@
 - `books/compute-systems-engine-code/`：第二册配套代码实践卷，主题是 Compute Systems Engine 的完整 C++20 实现、测试、benchmark、故障注入和报告。
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
 - `books/cpu-volume-3-practice/`：第三册配套实践卷，主题是 Linux 本地量化推理引擎、KV Cache、reference trace、7B 账本、服务 SLO、CPU/GPU 后端边界和验收门禁。
+- `books/cpu-volume-3-source/`：第三册源码卷，主题是 LCQI 本地 CPU 推理工程的完整源码、测试、benchmark 和阅读路径。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 - `books/cpp-zero-to-advanced/`：Cpp 从零到高级教材，主题是执行模型、值和类型、RAII、标准库、泛型、构建测试、性能、并发、大型代码组织和综合项目。
 
-规划中的新书可以继续放到 `books/` 下，例如编译器、操作系统、AI 系统等方向。
+规划中的新书继续放到 `books/<book-id>/` 下。分类入口已经预留：
+
+- `books/by_type/`：按原理卷、实践卷、源码卷或代码卷分类。
+- `books/by_topic/`：按 C++、算法、计算系统、AI 计算、计算机组成原理、操作系统和网络分类。
+
+分类目录只作为入口和索引，不放正文、实验或构建产物。真实书稿、代码、测试和导出仍以 `books/<book-id>/` 为准。
 
 ## 仓库结构
 
 ```text
 books/
+  by_type/             # 按原理卷、实践卷、源码卷或代码卷整理入口
+  by_topic/            # 按 C++、算法、计算系统、AI、组成原理、OS、网络整理入口
   cpu-volume-1/
     source/latex/      # 正式 LaTeX 书稿，生成 PDF/EPUB
     materials/         # 草稿、课程计划、素材、参考资料
@@ -57,6 +65,8 @@ books/
     reports/
     results/
     tools/
+  cpu-volume-3-source/
+    source/latex/      # 第三册源码卷正式 LaTeX 书稿
   algorithm-interview/
     source/latex/      # 算法面试书正式 LaTeX 主稿
     materials/         # 题单、写作标准和素材
@@ -69,6 +79,28 @@ books/
 CMakeLists.txt         # 仓库级 C++ 实验入口
 Makefile               # 仓库级常用命令入口
 ```
+
+## 分类入口
+
+按卷类型查找：
+
+- 原理卷：`books/by_type/theory/`
+- 实践卷：`books/by_type/practice/`
+- 源码卷或代码卷：`books/by_type/code/`
+- 计划中书籍：`books/by_type/planned/`
+
+按内容领域查找：
+
+- C++ 语言与工程：`books/by_topic/cpp_language/`
+- 算法与面试：`books/by_topic/algorithms/`
+- 计算系统：`books/by_topic/computer_systems/`
+- AI 计算：`books/by_topic/ai_computing/`
+- 计算机组成原理预留：`books/by_topic/computer_organization/`
+- 操作系统预留：`books/by_topic/operating_systems/`
+- 计算机网络预留：`books/by_topic/computer_networks/`
+
+新增书籍时，先建立真实目录，再把入口登记到 `books/by_type/README.md` 和
+`books/by_topic/README.md`。不要把分类目录当成构建目录。
 
 ## 常用命令
 
@@ -229,6 +261,7 @@ books/<book-id>/
 - `results/` 放实验输出，通常不提交大批运行结果。
 - `tools/` 放本书专用脚本，跨书共享脚本再考虑提升到仓库级。
 - 根目录只维护书库级索引和一键命令，不直接塞单本书的章节、实验或结果。
+- 同一个主题需要原理、实践、源码或代码三类产物时，优先拆成独立书籍目录，再通过 `books/by_type/` 和 `books/by_topic/` 聚合入口。
 
 ## 当前第一册入口
 
