@@ -30,13 +30,18 @@ BOOKS = (
     Book("从Cpp到计算系统第一册", "原理卷", ("计算系统",)),
     Book("从Cpp到计算系统第二册", "原理卷", ("计算系统",)),
     Book("从Cpp到AI计算第三册", "原理卷", ("AI计算",)),
-    Book("从Cpp到计算系统第一册实践卷", "实践卷", ("计算系统",)),
-    Book("从Cpp到AI计算第三册实践卷", "实践卷", ("AI计算",)),
-    Book("从Cpp到AI计算第三册源码卷", "代码卷", ("AI计算",)),
-    Book("计算系统引擎代码实践卷", "代码卷", ("计算系统",)),
+    Book("从Cpp到计算系统第一册实践卷", "实践与代码卷", ("计算系统",)),
+    Book("从Cpp到AI计算第三册实践与代码卷", "实践与代码卷", ("AI计算",)),
+    Book("计算系统引擎代码实践卷", "实践与代码卷", ("计算系统",)),
 )
 
-VOLUME_TYPES = ("原理卷", "实践卷", "代码卷", "规划卷")
+RETIRED_BOOK_TITLES = (
+    "从Cpp到AI计算第三册实践卷",
+    "从Cpp到AI计算第三册源码卷",
+)
+
+RETIRED_VOLUME_TYPES = ("实践卷", "代码卷")
+VOLUME_TYPES = ("原理卷", "实践与代码卷", "规划卷")
 TOPICS = (
     "Cpp语言与工程",
     "算法与面试",
@@ -52,6 +57,11 @@ PLANNED_BOOKS = ("计算机组成原理", "操作系统", "计算机网络")
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=PHONE_EXPORT_ROOT)
+    parser.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="organize existing exports without requiring every known book directory",
+    )
     return parser.parse_args()
 
 
@@ -99,7 +109,7 @@ def compare_book_dirs(left: Path, right: Path, title: str) -> bool:
     return True
 
 
-def move_or_merge_book(root: Path, book: Book) -> Path:
+def move_or_merge_book(root: Path, book: Book, *, allow_missing: bool) -> Path | None:
     ensure_safe_title(book.title)
     source = root / book.title
     dest = canonical_book_dir(root, book)
@@ -115,6 +125,8 @@ def move_or_merge_book(root: Path, book: Book) -> Path:
         shutil.move(str(source), str(dest))
 
     if not dest.is_dir():
+        if allow_missing:
+            return None
         raise SystemExit(f"missing phone export directory for {book.title}: {dest}")
     ensure_expected_book_files(dest, book.title)
     return dest
@@ -135,11 +147,24 @@ def clean_index_trees(root: Path) -> None:
             path.unlink()
 
 
+def remove_retired_book_dirs(root: Path) -> None:
+    for title in RETIRED_BOOK_TITLES:
+        for path in root.rglob(title):
+            if path.is_dir():
+                shutil.rmtree(path)
+            elif path.exists():
+                path.unlink()
+    for volume_type in RETIRED_VOLUME_TYPES:
+        path = root / "按卷类型" / volume_type
+        if path.exists():
+            shutil.rmtree(path)
+
+
 def write_root_index(root: Path) -> None:
     lines = [
         "手机导出目录",
         "",
-        "真实 PDF/EPUB 只放在：按卷类型/原理卷、按卷类型/实践卷、按卷类型/代码卷。",
+        "真实 PDF/EPUB 只放在：按卷类型/原理卷、按卷类型/实践与代码卷。",
         "按内容领域只放索引说明，不复制书文件，避免微信读书把同一本书识别成多本。",
         "每本书目录内只保留一个同名 PDF 和一个同名 EPUB。",
         "",
@@ -151,14 +176,14 @@ def write_root_index(root: Path) -> None:
     write_text(root / INDEX_FILE_NAME, "\n".join(lines) + "\n")
 
 
-def write_type_indexes(root: Path) -> None:
+def write_type_indexes(root: Path, books: tuple[Book, ...]) -> None:
     write_text(
         root / "按卷类型" / INDEX_FILE_NAME,
         "\n".join(
             [
                 "按卷类型",
                 "",
-                "真实 PDF/EPUB 保存在本目录下的原理卷、实践卷、代码卷。",
+                "真实 PDF/EPUB 保存在本目录下的原理卷、实践与代码卷。",
                 "每本书目录只保留一个同名 PDF 和一个同名 EPUB。",
             ]
         )
@@ -166,7 +191,7 @@ def write_type_indexes(root: Path) -> None:
     )
 
     books_by_type = {
-        volume_type: [book for book in BOOKS if book.volume_type == volume_type]
+        volume_type: [book for book in books if book.volume_type == volume_type]
         for volume_type in VOLUME_TYPES
     }
     for volume_type, books in books_by_type.items():
@@ -188,7 +213,7 @@ def write_type_indexes(root: Path) -> None:
         write_text(type_dir / INDEX_FILE_NAME, "\n".join(lines) + "\n")
 
 
-def write_topic_indexes(root: Path) -> None:
+def write_topic_indexes(root: Path, books: tuple[Book, ...]) -> None:
     topic_root = root / "按内容领域"
     topic_root.mkdir(parents=True, exist_ok=True)
     write_text(
@@ -205,7 +230,7 @@ def write_topic_indexes(root: Path) -> None:
     )
 
     for topic in TOPICS:
-        topic_books = [book for book in BOOKS if topic in book.topics]
+        topic_books = [book for book in books if topic in book.topics]
         lines = [topic, "", "真实文件位置："]
         if topic_books:
             for book in topic_books:
@@ -239,13 +264,18 @@ def main() -> int:
     for volume_type in VOLUME_TYPES:
         (root / "按卷类型" / volume_type).mkdir(parents=True, exist_ok=True)
 
+    remove_retired_book_dirs(root)
+
+    exported_books: list[Book] = []
     for book in BOOKS:
-        move_or_merge_book(root, book)
+        if move_or_merge_book(root, book, allow_missing=args.allow_missing) is not None:
+            exported_books.append(book)
 
     clean_index_trees(root)
     write_root_index(root)
-    write_type_indexes(root)
-    write_topic_indexes(root)
+    index_books = tuple(exported_books) if args.allow_missing else BOOKS
+    write_type_indexes(root, index_books)
+    write_topic_indexes(root, index_books)
     ensure_no_duplicate_exports(root)
 
     print(root)

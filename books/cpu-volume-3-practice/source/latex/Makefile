@@ -11,11 +11,11 @@ pdf:
 	$(LATEXMK) $(ENGINE) -interaction=nonstopmode -halt-on-error $(MAIN)
 
 epub:
-	@BOOK_TITLE="从 C++ 到 AI 计算：第三册实践卷" \
-	BOOK_IMPORT_TITLE="CPU Volume 3 Practice" \
-	BOOK_ID_SEED="cpu-volume-3-practice-weread-20260629" \
+	@BOOK_TITLE="从 C++ 到 AI 计算：第三册实践与代码卷" \
+	BOOK_IMPORT_TITLE="CPU Volume 3 Practice Code" \
+	BOOK_ID_SEED="cpu-volume-3-practice-code-weread-20260629" \
 	EPUB_ASCII_TITLES=1 \
-	BOOK_SUBTITLE="本地量化推理引擎、KV Cache、后端优化与验收" \
+	BOOK_SUBTITLE="本地量化推理引擎、完整源码、KV Cache、后端优化与验收" \
 	BOOK_AUTHOR="CPU Performance Study" \
 	python3 $(EPUB_BUILDER) --book-dir . --output main.epub --no-cover-page --forbid-images --linearize-tables --wechat-compatible --no-embed-fonts
 

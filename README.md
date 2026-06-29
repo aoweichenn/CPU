@@ -7,16 +7,16 @@
 - `books/cpu-volume-1/`：CPU 底层原理教材第一册，主题是程序、C++、二进制、x86-64、汇编、Linux 工具链和可信性能测量。
 - `books/cpu-volume-1-practice/`：第一册配套实践卷，主题是 Executable Evidence Kit、ELF64 解析、ABI/符号观察、Linux 工具链、GTest/GMock、Google Benchmark 和研究报告。
 - `books/cpu-volume-2/`：从 C++ 到计算系统第二册原理卷，主题是硬件原理、多核心并行、高性能计算、多线程、锁、原子、无锁数据结构、并行算法、运行时、异步 I/O 和分布式计算。
-- `books/compute-systems-engine-code/`：第二册配套代码实践卷，主题是 Compute Systems Engine 的完整 C++20 实现、测试、benchmark、故障注入和报告。
+- `books/compute-systems-engine-code/`：第二册配套实践与代码卷，主题是 Compute Systems Engine 的完整 C++20 实现、测试、benchmark、故障注入和报告。
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
-- `books/cpu-volume-3-practice/`：第三册配套实践卷，主题是 Linux 本地量化推理引擎、KV Cache、reference trace、7B 账本、服务 SLO、CPU/GPU 后端边界和验收门禁。
-- `books/cpu-volume-3-source/`：第三册源码卷，主题是 LCQI 本地 CPU 推理工程的完整源码、测试、benchmark 和阅读路径。
+- `books/cpu-volume-3-practice/`：第三册配套实践与代码卷，主题是 Linux 本地量化推理引擎、完整源码、KV Cache、reference trace、7B 账本、服务 SLO、CPU/GPU 后端边界和验收门禁。
+- `books/cpu-volume-3-source/`：第三册源码卷历史素材目录；默认导出已合并到第三册实践与代码卷。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 - `books/cpp-zero-to-advanced/`：Cpp 从零到高级教材，主题是执行模型、值和类型、RAII、标准库、泛型、构建测试、性能、并发、大型代码组织和综合项目。
 
 规划中的新书继续放到 `books/<book-id>/` 下。分类入口已经预留：
 
-- `books/by_type/`：按原理卷、实践卷、源码卷或代码卷分类。
+- `books/by_type/`：按原理卷、实践与代码卷分类。
 - `books/by_topic/`：按 C++、算法、计算系统、AI 计算、计算机组成原理、操作系统和网络分类。
 
 分类目录只作为入口和索引，不放正文、实验或构建产物。真实书稿、代码、测试和导出仍以 `books/<book-id>/` 为准。
@@ -25,7 +25,7 @@
 
 ```text
 books/
-  by_type/             # 按原理卷、实践卷、源码卷或代码卷整理入口
+  by_type/             # 按原理卷、实践与代码卷整理入口
   by_topic/            # 按 C++、算法、计算系统、AI、组成原理、OS、网络整理入口
   cpu-volume-1/
     source/latex/      # 正式 LaTeX 书稿，生成 PDF/EPUB
@@ -48,7 +48,7 @@ books/
     results/           # 实验输出
     tools/             # 本书专用脚本
   compute-systems-engine-code/
-    source/latex/      # 代码实践卷正式 LaTeX 书稿
+    source/latex/      # 实践与代码卷正式 LaTeX 书稿
     labs/              # Compute Systems Engine C++20 工程
     materials/
     reports/
@@ -61,12 +61,12 @@ books/
     results/
     tools/
   cpu-volume-3-practice/
-    source/latex/      # 第三册实践卷正式 LaTeX 书稿
+    source/latex/      # 第三册实践与代码卷正式 LaTeX 书稿
     reports/
     results/
     tools/
   cpu-volume-3-source/
-    source/latex/      # 第三册源码卷正式 LaTeX 书稿
+    source/latex/      # 第三册源码卷历史素材 LaTeX 书稿
   algorithm-interview/
     source/latex/      # 算法面试书正式 LaTeX 主稿
     materials/         # 题单、写作标准和素材
@@ -85,8 +85,7 @@ Makefile               # 仓库级常用命令入口
 按卷类型查找：
 
 - 原理卷：`books/by_type/theory/`
-- 实践卷：`books/by_type/practice/`
-- 源码卷或代码卷：`books/by_type/code/`
+- 实践与代码卷：`books/by_type/practice_code/`
 - 计划中书籍：`books/by_type/planned/`
 
 按内容领域查找：
@@ -148,7 +147,7 @@ make cpu2-epub
 make cpu2-text-count
 ```
 
-统一导出第一册、第一册实践卷、第二册、第三册、第三册实践卷、第三册源码卷、算法面试书和 Cpp 从零到高级：
+统一导出第一册、第一册实践卷、第二册、第三册、第三册实践与代码卷、算法面试书和 Cpp 从零到高级：
 
 ```bash
 make books-export
@@ -162,7 +161,7 @@ make books-export
 make phone-export-organize
 ```
 
-手机目录使用 `/mnt/sdcard/STU/BOOKS/按卷类型/{原理卷,实践卷,代码卷}/书名/` 保存真实 PDF/EPUB；`按内容领域/` 只保存 Markdown 索引说明，不复制书文件，也不生成 `.txt` 索引，避免微信读书把同一本书或目录说明扫描成多份。
+手机目录使用 `/mnt/sdcard/STU/BOOKS/按卷类型/{原理卷,实践与代码卷}/书名/` 保存真实 PDF/EPUB；`按内容领域/` 只保存 Markdown 索引说明，不复制书文件，也不生成 `.txt` 索引，避免微信读书把同一本书或目录说明扫描成多份。
 
 直接导出到手机：
 
@@ -172,7 +171,7 @@ make phone-books-export
 
 该命令会把每本书复制到分类后的手机目录，并在复制后重新生成手机索引。
 
-生成并测试第三册实践卷：
+生成并测试第三册实践与代码卷：
 
 ```bash
 make cpu3p-check
@@ -181,14 +180,7 @@ make cpu3p-epub
 make cpu3p-test
 ```
 
-生成第三册源码卷：
-
-```bash
-make cpu3s-check
-make cpu3s-pdf
-make cpu3s-epub
-make cpu3s-test
-```
+第三册源码阅读和完整代码清单已经并入 `cpu3p-*` 目标。`cpu3s-*` 目标仅保留为历史素材构建入口，不再进入默认导出。
 
 检查和测试算法面试书：
 
@@ -300,9 +292,9 @@ books/<book-id>/
 - 分布式计算：`books/cpu-volume-2/source/latex/chapters/part05-distributed-computing/`
 - 早期实验素材：`books/cpu-volume-2/labs/compute_systems/`
 
-## 当前代码实践卷入口
+## 当前实践与代码卷入口
 
-- 代码实践卷说明：`books/compute-systems-engine-code/README.md`
+- 实践与代码卷说明：`books/compute-systems-engine-code/README.md`
 - 正式主稿：`books/compute-systems-engine-code/source/latex/main.tex`
 - 第一章：`books/compute-systems-engine-code/source/latex/chapters/part01-foundation/ch01-reference-and-contract.tex`
 

@@ -22,25 +22,24 @@ CPU_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第一册
 CPU1P_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第一册实践卷
 CPU2_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第二册
 CPU3_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册
-CPU3P_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册实践卷
+CPU3P_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册实践与代码卷
 CPU3S_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册源码卷
 ALGO_EXPORT_DIR := $(EXPORT_ROOT)/算法刷题与Cpp面试教材
 CPP_EXPORT_DIR := $(EXPORT_ROOT)/Cpp从零到高级
 CSE_EXPORT_DIR := $(EXPORT_ROOT)/计算系统引擎代码实践卷
 CPU_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/从Cpp到计算系统第一册
-CPU1P_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践卷/从Cpp到计算系统第一册实践卷
+CPU1P_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践与代码卷/从Cpp到计算系统第一册实践卷
 CPU2_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/从Cpp到计算系统第二册
 CPU3_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/从Cpp到AI计算第三册
-CPU3P_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践卷/从Cpp到AI计算第三册实践卷
-CPU3S_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/代码卷/从Cpp到AI计算第三册源码卷
+CPU3P_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践与代码卷/从Cpp到AI计算第三册实践与代码卷
 ALGO_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/算法刷题与Cpp面试教材
 CPP_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/Cpp从零到高级
-CSE_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/代码卷/计算系统引擎代码实践卷
+CSE_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践与代码卷/计算系统引擎代码实践卷
 CPU_EXPORT_NAME := 从Cpp到计算系统第一册
 CPU1P_EXPORT_NAME := 从Cpp到计算系统第一册实践卷
 CPU2_EXPORT_NAME := 从Cpp到计算系统第二册
 CPU3_EXPORT_NAME := 从Cpp到AI计算第三册
-CPU3P_EXPORT_NAME := 从Cpp到AI计算第三册实践卷
+CPU3P_EXPORT_NAME := 从Cpp到AI计算第三册实践与代码卷
 CPU3S_EXPORT_NAME := 从Cpp到AI计算第三册源码卷
 ALGO_EXPORT_NAME := 算法刷题与Cpp面试教材
 CPP_EXPORT_NAME := Cpp从零到高级
@@ -55,7 +54,7 @@ ALGO_EPUB_NAME := $(ALGO_EXPORT_NAME)
 CPP_EPUB_NAME := $(CPP_EXPORT_NAME)
 CSE_EPUB_NAME := $(CSE_EXPORT_NAME)
 
-.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-phone-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-phone-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-phone-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-phone-export cpu3-smollm2-smoke cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-phone-export cpu3p-test cpu3s-check cpu3s-pdf cpu3s-epub cpu3s-export cpu3s-phone-export cpu3s-test books-export phone-books-export phone-export-organize algo-check algo-pdf algo-epub algo-export algo-phone-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-phone-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export cse-phone-export clean
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-phone-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-phone-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-phone-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-phone-export cpu3-smollm2-smoke cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-phone-export cpu3p-test cpu3s-check cpu3s-pdf cpu3s-epub cpu3s-export cpu3s-phone-export cpu3s-test books-export phone-books-export phone-export-organize phone-export-organize-allow-missing algo-check algo-pdf algo-epub algo-export algo-phone-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-phone-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export cse-phone-export clean
 
 all: cpu-pdf cpu-epub
 
@@ -73,7 +72,7 @@ cpu-export: cpu-pdf cpu-epub
 
 cpu-phone-export: cpu-pdf cpu-epub
 	python3 tools/export_book.py --source $(CPU_LATEX_DIR) --dest "$(CPU_PHONE_EXPORT_DIR)" --pdf-name "$(CPU_EXPORT_NAME)" --epub-name "$(CPU_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 cpu-text-count:
 	$(MAKE) -C $(CPU_LATEX_DIR) text-count
@@ -101,7 +100,7 @@ cpu1p-export: cpu1p-pdf cpu1p-epub
 
 cpu1p-phone-export: cpu1p-pdf cpu1p-epub
 	python3 tools/export_book.py --source $(CPU1P_LATEX_DIR) --dest "$(CPU1P_PHONE_EXPORT_DIR)" --pdf-name "$(CPU1P_EXPORT_NAME)" --epub-name "$(CPU1P_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 cpu1p-test:
 	$(MAKE) -C $(CPU1P_BOOK_DIR) test
@@ -120,7 +119,7 @@ cpu2-export: cpu2-pdf cpu2-epub
 
 cpu2-phone-export: cpu2-pdf cpu2-epub
 	python3 tools/export_book.py --source $(CPU2_LATEX_DIR) --dest "$(CPU2_PHONE_EXPORT_DIR)" --pdf-name "$(CPU2_EXPORT_NAME)" --epub-name "$(CPU2_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 cpu2-text-count:
 	$(MAKE) -C $(CPU2_LATEX_DIR) text-count
@@ -145,7 +144,7 @@ cpu3-export: cpu3-pdf cpu3-epub
 
 cpu3-phone-export: cpu3-pdf cpu3-epub
 	python3 tools/export_book.py --source $(CPU3_LATEX_DIR) --dest "$(CPU3_PHONE_EXPORT_DIR)" --pdf-name "$(CPU3_EXPORT_NAME)" --epub-name "$(CPU3_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 cpu3-smollm2-smoke:
 	python3 $(CPU3_BOOK_DIR)/tools/run_smollm2_small_smoke.py
@@ -170,7 +169,7 @@ cpu3p-export: cpu3p-pdf cpu3p-epub
 
 cpu3p-phone-export: cpu3p-pdf cpu3p-epub
 	python3 tools/export_book.py --source $(CPU3P_LATEX_DIR) --dest "$(CPU3P_PHONE_EXPORT_DIR)" --pdf-name "$(CPU3P_EXPORT_NAME)" --epub-name "$(CPU3P_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 cpu3p-test:
 	$(MAKE) -C $(CPU3P_BOOK_DIR) test
@@ -187,9 +186,8 @@ cpu3s-epub:
 cpu3s-export: cpu3s-pdf cpu3s-epub
 	python3 tools/export_book.py --source $(CPU3S_LATEX_DIR) --dest "$(CPU3S_EXPORT_DIR)" --pdf-name "$(CPU3S_EXPORT_NAME)" --epub-name "$(CPU3S_EPUB_NAME)"
 
-cpu3s-phone-export: cpu3s-pdf cpu3s-epub
-	python3 tools/export_book.py --source $(CPU3S_LATEX_DIR) --dest "$(CPU3S_PHONE_EXPORT_DIR)" --pdf-name "$(CPU3S_EXPORT_NAME)" --epub-name "$(CPU3S_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+cpu3s-phone-export:
+	@echo "cpu-volume-3-source is historical; phone export is merged into cpu3p-phone-export"
 
 cpu3s-test:
 	$(MAKE) -C $(CPU3S_BOOK_DIR) test
@@ -203,7 +201,7 @@ cpu3-text-count-chapters:
 cpu3-text-target:
 	$(MAKE) -C $(CPU3_LATEX_DIR) text-target
 
-books-export: cpu-export cpu1p-export cpu2-export cpu3-export cpu3p-export cpu3s-export algo-export cpp-export cse-export
+books-export: cpu-export cpu1p-export cpu2-export cpu3-export cpu3p-export algo-export cpp-export cse-export
 
 phone-books-export:
 	$(MAKE) cpu-phone-export
@@ -211,13 +209,16 @@ phone-books-export:
 	$(MAKE) cpu2-phone-export
 	$(MAKE) cpu3-phone-export
 	$(MAKE) cpu3p-phone-export
-	$(MAKE) cpu3s-phone-export
 	$(MAKE) algo-phone-export
 	$(MAKE) cpp-phone-export
 	$(MAKE) cse-phone-export
+	$(MAKE) phone-export-organize
 
 phone-export-organize:
 	python3 tools/organize_phone_exports.py --root "$(PHONE_EXPORT_ROOT)"
+
+phone-export-organize-allow-missing:
+	python3 tools/organize_phone_exports.py --root "$(PHONE_EXPORT_ROOT)" --allow-missing
 
 algo-check:
 	$(MAKE) -C $(ALGO_BOOK_DIR) check
@@ -233,7 +234,7 @@ algo-export: algo-pdf algo-epub
 
 algo-phone-export: algo-pdf algo-epub
 	python3 tools/export_book.py --source $(ALGO_LATEX_DIR) --dest "$(ALGO_PHONE_EXPORT_DIR)" --pdf-name "$(ALGO_EXPORT_NAME)" --epub-name "$(ALGO_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 algo-text-count:
 	$(MAKE) -C $(ALGO_BOOK_DIR) text-count
@@ -258,7 +259,7 @@ cpp-export: cpp-pdf cpp-epub
 
 cpp-phone-export: cpp-pdf cpp-epub
 	python3 tools/export_book.py --source $(CPP_LATEX_DIR) --dest "$(CPP_PHONE_EXPORT_DIR)" --pdf-name "$(CPP_EXPORT_NAME)" --epub-name "$(CPP_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 cpp-text-count:
 	$(MAKE) -C $(CPP_BOOK_DIR) text-count
@@ -280,7 +281,7 @@ cse-export: cse-pdf cse-epub
 
 cse-phone-export: cse-pdf cse-epub
 	python3 tools/export_book.py --source $(CSE_LATEX_DIR) --dest "$(CSE_PHONE_EXPORT_DIR)" --pdf-name "$(CSE_EXPORT_NAME)" --epub-name "$(CSE_EPUB_NAME)"
-	$(MAKE) phone-export-organize
+	$(MAKE) phone-export-organize-allow-missing
 
 clean:
 	$(MAKE) -C $(CPU_LATEX_DIR) clean
