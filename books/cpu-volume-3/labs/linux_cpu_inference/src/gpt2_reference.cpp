@@ -10,7 +10,6 @@
 #include <cmath>
 #include <cstddef>
 #include <fstream>
-#include <functional>
 #include <limits>
 #include <mutex>
 #include <optional>
@@ -97,10 +96,11 @@ public:
         return this->worker_count_;
     }
 
+    template <typename Function>
     void parallel_for_rows(std::size_t begin,
                            std::size_t end,
                            std::size_t grain,
-                           const std::function<void(std::size_t, std::size_t)>& function) {
+                           Function&& function) {
         if (end <= begin) {
             return;
         }
@@ -118,6 +118,7 @@ public:
             return;
         }
 
+        auto task_context = ParallelTaskContext<Function>{function};
         {
             std::lock_guard<std::mutex> lock(this->mutex_);
             this->task_begin_ = begin;
@@ -125,7 +126,8 @@ public:
             this->task_count_ = task_count;
             this->next_worker_index_ = 0;
             this->active_workers_ = task_count - 1;
-            this->task_function_ = &function;
+            this->task_context_ = &task_context;
+            this->task_invoke_ = &ParallelTaskContext<Function>::invoke;
             ++this->generation_;
         }
         this->condition_.notify_all();
@@ -136,10 +138,21 @@ public:
 
         std::unique_lock<std::mutex> lock(this->mutex_);
         this->finished_.wait(lock, [this]() { return this->active_workers_ == 0; });
-        this->task_function_ = nullptr;
+        this->task_context_ = nullptr;
+        this->task_invoke_ = nullptr;
     }
 
 private:
+    template <typename Function>
+    struct ParallelTaskContext {
+        Function& function;
+
+        static void invoke(void* context, std::size_t begin, std::size_t end) {
+            auto* typed_context = static_cast<ParallelTaskContext*>(context);
+            typed_context->function(begin, end);
+        }
+    };
+
     std::int32_t worker_count_ = 1;
     std::vector<std::thread> threads_;
     std::mutex mutex_;
@@ -152,7 +165,8 @@ private:
     std::size_t task_count_ = 0;
     std::size_t next_worker_index_ = 0;
     std::size_t active_workers_ = 0;
-    const std::function<void(std::size_t, std::size_t)>* task_function_ = nullptr;
+    void* task_context_ = nullptr;
+    void (*task_invoke_)(void*, std::size_t, std::size_t) = nullptr;
 
     [[nodiscard]] static std::int32_t normalize_worker_count(std::int32_t requested_workers) {
         if (requested_workers > 0) {
@@ -185,7 +199,8 @@ private:
             std::size_t worker_index = 0;
             std::size_t begin = 0;
             std::size_t end = 0;
-            const std::function<void(std::size_t, std::size_t)>* function = nullptr;
+            void* task_context = nullptr;
+            void (*task_invoke)(void*, std::size_t, std::size_t) = nullptr;
             {
                 std::unique_lock<std::mutex> lock(this->mutex_);
                 this->condition_.wait(lock, [this, observed_generation]() {
@@ -195,7 +210,7 @@ private:
                     return;
                 }
                 observed_generation = this->generation_;
-                if (this->task_function_ == nullptr ||
+                if (this->task_context_ == nullptr || this->task_invoke_ == nullptr ||
                     this->next_worker_index_ >= this->task_count_ - 1) {
                     continue;
                 }
@@ -208,10 +223,11 @@ private:
                                        worker_index);
                 begin = bounds.first;
                 end = bounds.second;
-                function = this->task_function_;
+                task_context = this->task_context_;
+                task_invoke = this->task_invoke_;
             }
 
-            (*function)(begin, end);
+            task_invoke(task_context, begin, end);
 
             {
                 std::lock_guard<std::mutex> lock(this->mutex_);
@@ -699,15 +715,10 @@ void linear_f32_unchecked(const Gpt2LinearF32& linear,
                           std::span<float> output) {
     const std::size_t input_size = static_cast<std::size_t>(linear.input_size);
     const std::size_t output_size = static_cast<std::size_t>(linear.output_size);
-    const bool has_bias = !linear.bias.empty();
     const float* weights = linear.weights.data();
-    const float* bias = linear.bias.data();
+    const float* bias = linear.bias.empty() ? nullptr : linear.bias.data();
     const float* input_data = input.data();
-    for (std::size_t out = 0; out < output_size; ++out) {
-        const float* row = weights + out * input_size;
-        output[out] =
-            dot_f32_unchecked(row, input_data, input_size) + (has_bias ? bias[out] : 0.0F);
-    }
+    linear_f32_rows_unchecked(weights, input_data, bias, input_size, 0, output_size, output.data());
 }
 
 [[nodiscard]] bool should_parallelize_rows(const Gpt2ExecutionOptions& options,
@@ -794,21 +805,20 @@ void linear_f32_unchecked_parallel(const Gpt2LinearF32& linear,
         return;
     }
 
-    const bool has_bias = !linear.bias.empty();
     const float* weights = linear.weights.data();
-    const float* bias = linear.bias.data();
+    const float* bias = linear.bias.empty() ? nullptr : linear.bias.data();
     const float* input_data = input.data();
     float* output_data = output.data();
-    const std::function<void(std::size_t, std::size_t)> rows_fn =
-        [input_size, has_bias, weights, bias, input_data, output_data](
-            std::size_t begin,
-            std::size_t end) {
-            for (std::size_t out = begin; out < end; ++out) {
-                const float* row = weights + out * input_size;
-                output_data[out] =
-                    dot_f32_unchecked(row, input_data, input_size) +
-                    (has_bias ? bias[out] : 0.0F);
-            }
+    const auto rows_fn =
+        [input_size, weights, bias, input_data, output_data](std::size_t begin,
+                                                             std::size_t end) {
+            linear_f32_rows_unchecked(weights,
+                                      input_data,
+                                      bias,
+                                      input_size,
+                                      begin,
+                                      end,
+                                      output_data);
         };
     worker_pool->parallel_for_rows(0, output_size, parallel_row_grain(output_size, *worker_pool), rows_fn);
 }
@@ -1100,14 +1110,17 @@ void compute_logits(const Gpt2ReferenceModel& model,
     const std::size_t vocab_size = checked_size(model.config.vocab_size, "vocab_size");
     const float* weight_data = weight.data();
     const float* hidden_data = hidden.data();
-    const std::function<void(std::size_t, std::size_t)> rows_fn =
+    const auto rows_fn =
         [hidden_size, weight_data, hidden_data, logits_data = logits.data()](
             std::size_t begin,
             std::size_t end) {
-            for (std::size_t token = begin; token < end; ++token) {
-                const float* row = weight_data + token * hidden_size;
-                logits_data[token] = dot_f32_unchecked(row, hidden_data, hidden_size);
-            }
+            linear_f32_rows_unchecked(weight_data,
+                                      hidden_data,
+                                      nullptr,
+                                      hidden_size,
+                                      begin,
+                                      end,
+                                      logits_data);
         };
     if (should_parallelize_rows(options, vocab_size, hidden_size, worker_pool)) {
         worker_pool->parallel_for_rows(0,
@@ -1138,15 +1151,10 @@ struct Gpt2TokenScore {
                                                            std::size_t begin,
                                                            std::size_t end) {
     Gpt2TokenScore best;
-    best.token = static_cast<std::int32_t>(begin);
-    for (std::size_t token = begin; token < end; ++token) {
-        const float* row = weight_data + token * hidden_size;
-        const float sum = dot_f32_unchecked(row, hidden_data, hidden_size);
-        if (token == begin || sum > best.value) {
-            best.value = sum;
-            best.token = static_cast<std::int32_t>(token);
-        }
-    }
+    const F32RowMax row_max =
+        max_dot_f32_rows_unchecked(weight_data, hidden_data, hidden_size, begin, end);
+    best.token = static_cast<std::int32_t>(row_max.row);
+    best.value = row_max.value;
     return best;
 }
 
@@ -1169,7 +1177,7 @@ std::int32_t compute_predicted_token(const Gpt2ReferenceModel& model,
     const std::size_t worker_count = checked_size(worker_pool->worker_count(), "worker_count");
     const std::size_t chunk_count = std::min(worker_count, vocab_size);
     std::vector<Gpt2TokenScore> partials(chunk_count);
-    const std::function<void(std::size_t, std::size_t)> rows_fn =
+    const auto rows_fn =
         [chunk_count, hidden_size, vocab_size, weight_data, hidden_data, &partials](
             std::size_t begin,
             std::size_t end) {

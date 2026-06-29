@@ -41,6 +41,8 @@ constexpr float LCQI_KERNEL_MAX_DIFF = 1.0e-5F;
 constexpr float LCQI_F32_KERNEL_MAX_DIFF = 1.0e-4F;
 constexpr std::int32_t LCQI_SIMD_TEST_BLOCK = 8;
 constexpr std::size_t LCQI_F32_DOT_TEST_SIZE = 257;
+constexpr std::size_t LCQI_F32_ROW_TEST_INPUT_SIZE = 65;
+constexpr std::size_t LCQI_F32_ROW_TEST_OUTPUT_SIZE = 17;
 constexpr std::int32_t LCQI_REFERENCE_DECODER_PREDICTED_TOKEN = 0;
 constexpr std::size_t LCQI_REFERENCE_DECODER_VOCAB_SIZE = 5;
 constexpr std::array<float, LCQI_REFERENCE_DECODER_VOCAB_SIZE> LCQI_REFERENCE_DECODER_LOGITS{
@@ -843,6 +845,92 @@ void test_f32_dot_kernel_matches_scalar() {
     require(rejected_mismatch, "F32 dot kernel accepted mismatched sizes");
 }
 
+void test_f32_row_kernels_match_scalar() {
+    std::vector<float> weights(LCQI_F32_ROW_TEST_INPUT_SIZE *
+                                   LCQI_F32_ROW_TEST_OUTPUT_SIZE,
+                               0.0F);
+    std::vector<float> input(LCQI_F32_ROW_TEST_INPUT_SIZE, 0.0F);
+    std::vector<float> bias(LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+    for (std::size_t index = 0; index < weights.size(); ++index) {
+        weights[index] = static_cast<float>(static_cast<std::int32_t>(index % 29U) - 14) *
+                         0.015625F;
+    }
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<std::int32_t>(index % 13U) - 6) *
+                       0.03125F;
+    }
+    for (std::size_t index = 0; index < bias.size(); ++index) {
+        bias[index] = static_cast<float>(static_cast<std::int32_t>(index % 7U) - 3) *
+                      0.125F;
+    }
+
+    std::vector<float> scalar_output(LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+    std::vector<float> dispatched_output(LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+    lcqi::linear_f32_rows_scalar_unchecked(weights.data(),
+                                           input.data(),
+                                           bias.data(),
+                                           input.size(),
+                                           0,
+                                           LCQI_F32_ROW_TEST_OUTPUT_SIZE,
+                                           scalar_output.data());
+    lcqi::linear_f32_rows_unchecked(weights.data(),
+                                    input.data(),
+                                    bias.data(),
+                                    input.size(),
+                                    0,
+                                    LCQI_F32_ROW_TEST_OUTPUT_SIZE,
+                                    dispatched_output.data());
+    for (std::size_t index = 0; index < scalar_output.size(); ++index) {
+        require(std::fabs(scalar_output[index] - dispatched_output[index]) <=
+                    LCQI_F32_KERNEL_MAX_DIFF,
+                "F32 linear row kernel output differs from scalar");
+    }
+
+    const lcqi::F32RowMax scalar_max =
+        lcqi::max_dot_f32_rows_scalar_unchecked(weights.data(),
+                                                input.data(),
+                                                input.size(),
+                                                0,
+                                                LCQI_F32_ROW_TEST_OUTPUT_SIZE);
+    const lcqi::F32RowMax dispatched_max =
+        lcqi::max_dot_f32_rows_unchecked(weights.data(),
+                                         input.data(),
+                                         input.size(),
+                                         0,
+                                         LCQI_F32_ROW_TEST_OUTPUT_SIZE);
+    require(scalar_max.row == dispatched_max.row,
+            "F32 row max kernel selected a different row");
+    require(std::fabs(scalar_max.value - dispatched_max.value) <= LCQI_F32_KERNEL_MAX_DIFF,
+            "F32 row max kernel value differs from scalar");
+
+    if (lcqi::dot_f32_avx2_available()) {
+        std::vector<float> avx2_output(LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+        lcqi::linear_f32_rows_avx2_unchecked(weights.data(),
+                                             input.data(),
+                                             bias.data(),
+                                             input.size(),
+                                             0,
+                                             LCQI_F32_ROW_TEST_OUTPUT_SIZE,
+                                             avx2_output.data());
+        for (std::size_t index = 0; index < scalar_output.size(); ++index) {
+            require(std::fabs(scalar_output[index] - avx2_output[index]) <=
+                        LCQI_F32_KERNEL_MAX_DIFF,
+                    "AVX2 F32 linear row kernel output differs from scalar");
+        }
+
+        const lcqi::F32RowMax avx2_max =
+            lcqi::max_dot_f32_rows_avx2_unchecked(weights.data(),
+                                                  input.data(),
+                                                  input.size(),
+                                                  0,
+                                                  LCQI_F32_ROW_TEST_OUTPUT_SIZE);
+        require(scalar_max.row == avx2_max.row,
+                "AVX2 F32 row max kernel selected a different row");
+        require(std::fabs(scalar_max.value - avx2_max.value) <= LCQI_F32_KERNEL_MAX_DIFF,
+                "AVX2 F32 row max kernel value differs from scalar");
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -865,6 +953,7 @@ int main() {
         test_reference_decoder_trace_contract();
         test_packed_i8_kernel_matches_scalar();
         test_f32_dot_kernel_matches_scalar();
+        test_f32_row_kernels_match_scalar();
 
         std::cout << "lcqi tests passed\n";
         return EXIT_SUCCESS;
