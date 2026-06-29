@@ -483,7 +483,8 @@ class LatexBlockConverter:
                 self.flush_paragraph()
                 if level == "chapter":
                     self.section_no = 0
-                    text = f"{self.heading_prefix} {self.inline.convert(title)}".strip()
+                    title_text = self.inline.convert(title)
+                    text = title_text if title_has_visible_chapter_label(latex_plain(title)) else f"{self.heading_prefix} {title_text}".strip()
                     self.out.append(f"<h1>{text}</h1>")
                 elif level == "section":
                     self.section_no += 1
@@ -493,6 +494,9 @@ class LatexBlockConverter:
                         self.out.append(f'<h2><span class="section-number">{number}</span> {text}</h2>')
                     else:
                         self.out.append(f"<h2>{text}</h2>")
+                elif level == "practicesection":
+                    self.section_no += 1
+                    self.out.append(f"<h2>{self.inline.convert(title)}</h2>")
                 elif level == "subsection":
                     self.out.append(f"<h3>{self.inline.convert(title)}</h3>")
                 elif level == "topic":
@@ -878,8 +882,16 @@ def span(css_class: str, text: str) -> str:
 
 
 def parse_heading(line: str) -> tuple[str, str] | None:
-    for level in ("chapter", "section", "subsection", "topic"):
-        prefix = "\\" + level
+    commands = (
+        ("chapter", "chapter"),
+        ("section", "section"),
+        ("subsection", "subsection"),
+        ("topic", "topic"),
+        ("practicechapter", "chapter"),
+        ("practicesection", "practicesection"),
+    )
+    for command, level in commands:
+        prefix = "\\" + command
         if line.startswith(prefix):
             i = len(prefix)
             if i < len(line) and line[i] == "*":
@@ -889,6 +901,15 @@ def parse_heading(line: str) -> tuple[str, str] | None:
                 title, _ = read_group(line, i)
                 return level, title
     return None
+
+
+def title_has_visible_chapter_label(title: str) -> bool:
+    return bool(
+        re.match(
+            r"^(第\s*[\d零〇一二三四五六七八九十百千]+\s*章|附录\s*[A-Za-z零〇一二三四五六七八九十百千]+)",
+            title.strip(),
+        )
+    )
 
 
 def render_table(source: str, inline: LatexInline, linearize: bool = False) -> str:
@@ -1094,7 +1115,7 @@ def collect_entries(
                 label = f"附录 {chr(ord('A') + appendix_no)}"
                 appendix_no += 1
             output = next_output_name() if legacy_names else safe_output_name(source, book_dir)
-            nav_title = f"{label} {title}".strip()
+            nav_title = title if title_has_visible_chapter_label(title) else f"{label} {title}".strip()
             entry = SourceEntry(
                 kind="chapter",
                 source=source,
