@@ -536,6 +536,55 @@ void project_qkv(const Gpt2Config& config,
                 v.begin());
 }
 
+void attention_cached_position(const Gpt2Config& config,
+                               const Gpt2KvCache& cache,
+                               std::int32_t layer_id,
+                               std::int32_t model_position,
+                               std::span<const float> query,
+                               std::span<float> output) {
+    const std::int32_t local_head_dim = head_dim(config);
+    const float score_scale = 1.0F / std::sqrt(static_cast<float>(local_head_dim));
+    std::fill(output.begin(), output.end(), 0.0F);
+    std::vector<float> scores(checked_size(model_position + 1, "model_position"),
+                              LCQI_GPT2_SOFTMAX_NEGATIVE_INFINITY);
+
+    for (std::int32_t head = 0; head < config.head_count; ++head) {
+        float max_score = LCQI_GPT2_SOFTMAX_NEGATIVE_INFINITY;
+        for (std::int32_t past = 0; past <= model_position; ++past) {
+            const std::span<const float> key = cache.key(layer_id, past, head);
+            float dot = 0.0F;
+            for (std::int32_t dim = 0; dim < local_head_dim; ++dim) {
+                const std::size_t query_index =
+                    matrix_size(head, local_head_dim) + checked_size(dim, "head dim");
+                dot += query[query_index] * key[checked_size(dim, "head dim")];
+            }
+            const float score = dot * score_scale;
+            scores[checked_size(past, "past")] = score;
+            max_score = std::max(max_score, score);
+        }
+
+        float denominator = 0.0F;
+        for (std::int32_t past = 0; past <= model_position; ++past) {
+            const std::size_t index = checked_size(past, "past");
+            scores[index] = std::exp(scores[index] - max_score);
+            denominator += scores[index];
+        }
+        if (denominator <= 0.0F) {
+            throw std::runtime_error("GPT-2 cached attention denominator is invalid");
+        }
+
+        for (std::int32_t past = 0; past <= model_position; ++past) {
+            const float probability = scores[checked_size(past, "past")] / denominator;
+            const std::span<const float> value = cache.value(layer_id, past, head);
+            for (std::int32_t dim = 0; dim < local_head_dim; ++dim) {
+                const std::size_t output_index =
+                    matrix_size(head, local_head_dim) + checked_size(dim, "head dim");
+                output[output_index] += probability * value[checked_size(dim, "head dim")];
+            }
+        }
+    }
+}
+
 void attention_full_sequence(const Gpt2Config& config,
                              std::span<const float> q_by_pos,
                              std::span<const float> k_by_pos,
@@ -650,6 +699,46 @@ void forward_gpt2_layer(const Gpt2Config& config,
         linear_f32(layer.mlp_c_proj, mlp_fc, mlp_out);
         add_inplace(hidden, mlp_out);
     }
+}
+
+void forward_gpt2_layer_cached(const Gpt2Config& config,
+                               const Gpt2LayerWeightsF32& layer,
+                               std::int32_t layer_id,
+                               std::int32_t model_position,
+                               Gpt2KvCache& cache,
+                               std::vector<float>& hidden) {
+    std::vector<float> normed(checked_size(config.hidden_size, "hidden_size"), 0.0F);
+    std::vector<float> query(checked_size(config.hidden_size, "hidden_size"), 0.0F);
+    std::vector<float> key(checked_size(config.hidden_size, "hidden_size"), 0.0F);
+    std::vector<float> value(checked_size(config.hidden_size, "hidden_size"), 0.0F);
+    std::vector<float> attention(checked_size(config.hidden_size, "hidden_size"), 0.0F);
+    std::vector<float> projected(checked_size(config.hidden_size, "hidden_size"), 0.0F);
+    std::vector<float> mlp_fc(checked_size(config.intermediate_size, "intermediate_size"), 0.0F);
+    std::vector<float> mlp_out(checked_size(config.hidden_size, "hidden_size"), 0.0F);
+
+    layer_norm(hidden,
+               layer.ln_1_weight,
+               layer.ln_1_bias,
+               config.layer_norm_epsilon,
+               normed);
+    project_qkv(config, layer, normed, query, key, value);
+    cache.append(layer_id, model_position, key, value);
+    attention_cached_position(config, cache, layer_id, model_position, query, attention);
+
+    linear_f32(layer.c_proj, attention, projected);
+    add_inplace(hidden, projected);
+
+    layer_norm(hidden,
+               layer.ln_2_weight,
+               layer.ln_2_bias,
+               config.layer_norm_epsilon,
+               normed);
+    linear_f32(layer.c_fc, normed, mlp_fc);
+    for (float& value_ref : mlp_fc) {
+        value_ref = gelu_new(value_ref);
+    }
+    linear_f32(layer.mlp_c_proj, mlp_fc, mlp_out);
+    add_inplace(hidden, mlp_out);
 }
 
 void compute_logits(const Gpt2ReferenceModel& model,
@@ -1324,6 +1413,115 @@ Gpt2ReferenceModel load_gpt2_from_directory(const std::filesystem::path& model_d
                                      find_gpt2_weight_file(model_directory));
 }
 
+Gpt2KvCache::Gpt2KvCache(const Gpt2Config& config) : config_(config) {
+    validate_config(this->config_);
+    const std::size_t element_count =
+        checked_size(this->config_.layer_count, "layer_count") *
+        checked_size(this->config_.max_positions, "max_positions") *
+        checked_size(this->config_.head_count, "head_count") *
+        checked_size(head_dim(this->config_), "head_dim");
+    this->keys_.assign(element_count, 0.0F);
+    this->values_.assign(element_count, 0.0F);
+    this->written_.assign(
+        checked_size(this->config_.layer_count, "layer_count") *
+            checked_size(this->config_.max_positions, "max_positions"),
+        0);
+}
+
+void Gpt2KvCache::append(std::int32_t layer_id,
+                         std::int32_t model_position,
+                         std::span<const float> key,
+                         std::span<const float> value) {
+    const std::size_t hidden_size = checked_size(this->config_.hidden_size, "hidden_size");
+    if (key.size() != hidden_size || value.size() != hidden_size) {
+        throw std::runtime_error("GPT-2 KV key/value size mismatch");
+    }
+    this->validate_address(layer_id, model_position, 0);
+    const std::int32_t local_head_dim = head_dim(this->config_);
+    for (std::int32_t head = 0; head < this->config_.head_count; ++head) {
+        const std::size_t source =
+            checked_size(head, "head") * checked_size(local_head_dim, "head_dim");
+        const std::size_t target = this->base_offset(layer_id, model_position, head);
+        std::copy_n(key.begin() + static_cast<std::ptrdiff_t>(source),
+                    local_head_dim,
+                    this->keys_.begin() + static_cast<std::ptrdiff_t>(target));
+        std::copy_n(value.begin() + static_cast<std::ptrdiff_t>(source),
+                    local_head_dim,
+                    this->values_.begin() + static_cast<std::ptrdiff_t>(target));
+    }
+    const std::size_t written_index =
+        checked_size(layer_id, "layer_id") *
+            checked_size(this->config_.max_positions, "max_positions") +
+        checked_size(model_position, "model_position");
+    this->written_[written_index] = 1;
+    this->filled_tokens_ = std::max(this->filled_tokens_, model_position + 1);
+}
+
+std::span<const float> Gpt2KvCache::key(std::int32_t layer_id,
+                                        std::int32_t model_position,
+                                        std::int32_t head) const {
+    this->validate_address(layer_id, model_position, head);
+    this->validate_written(layer_id, model_position);
+    const std::size_t offset = this->base_offset(layer_id, model_position, head);
+    return std::span<const float>(this->keys_.data() + offset,
+                                  checked_size(head_dim(this->config_), "head_dim"));
+}
+
+std::span<const float> Gpt2KvCache::value(std::int32_t layer_id,
+                                          std::int32_t model_position,
+                                          std::int32_t head) const {
+    this->validate_address(layer_id, model_position, head);
+    this->validate_written(layer_id, model_position);
+    const std::size_t offset = this->base_offset(layer_id, model_position, head);
+    return std::span<const float>(this->values_.data() + offset,
+                                  checked_size(head_dim(this->config_), "head_dim"));
+}
+
+std::int32_t Gpt2KvCache::filled_tokens() const noexcept {
+    return this->filled_tokens_;
+}
+
+std::size_t Gpt2KvCache::byte_size() const noexcept {
+    return (this->keys_.size() + this->values_.size()) * sizeof(float) +
+           this->written_.size() * sizeof(std::uint8_t);
+}
+
+std::size_t Gpt2KvCache::base_offset(std::int32_t layer_id,
+                                     std::int32_t model_position,
+                                     std::int32_t head) const {
+    return (((checked_size(layer_id, "layer_id") *
+              checked_size(this->config_.max_positions, "max_positions")) +
+             checked_size(model_position, "model_position")) *
+                checked_size(this->config_.head_count, "head_count") +
+            checked_size(head, "head")) *
+           checked_size(head_dim(this->config_), "head_dim");
+}
+
+void Gpt2KvCache::validate_address(std::int32_t layer_id,
+                                   std::int32_t model_position,
+                                   std::int32_t head) const {
+    if (layer_id < 0 || layer_id >= this->config_.layer_count) {
+        throw std::runtime_error("GPT-2 KV layer_id out of range");
+    }
+    if (model_position < 0 || model_position >= this->config_.max_positions) {
+        throw std::runtime_error("GPT-2 KV model_position out of range");
+    }
+    if (head < 0 || head >= this->config_.head_count) {
+        throw std::runtime_error("GPT-2 KV head out of range");
+    }
+}
+
+void Gpt2KvCache::validate_written(std::int32_t layer_id,
+                                   std::int32_t model_position) const {
+    const std::size_t written_index =
+        checked_size(layer_id, "layer_id") *
+            checked_size(this->config_.max_positions, "max_positions") +
+        checked_size(model_position, "model_position");
+    if (written_index >= this->written_.size() || this->written_[written_index] == 0) {
+        throw std::runtime_error("GPT-2 KV slot has not been written");
+    }
+}
+
 Gpt2ForwardResult run_gpt2_forward(const Gpt2ReferenceModel& model,
                                    std::span<const std::int32_t> token_ids) {
     validate_model(model);
@@ -1375,6 +1573,53 @@ Gpt2ForwardResult run_gpt2_forward(const Gpt2ReferenceModel& model,
     return result;
 }
 
+Gpt2ForwardResult run_gpt2_forward_cached(const Gpt2ReferenceModel& model,
+                                          Gpt2KvCache& cache,
+                                          std::int32_t token_id) {
+    validate_model(model);
+    if (token_id < 0 || token_id >= model.config.vocab_size) {
+        throw std::runtime_error("GPT-2 token id out of range");
+    }
+    const std::int32_t model_position = cache.filled_tokens();
+    if (model_position >= model.config.max_positions) {
+        throw std::runtime_error("GPT-2 cached forward would exceed max_positions");
+    }
+
+    std::vector<float> hidden(checked_size(model.config.hidden_size, "hidden_size"), 0.0F);
+    const std::span<const float> token =
+        row_span(model.token_embedding, token_id, model.config.hidden_size);
+    const std::span<const float> position_embedding =
+        row_span(model.position_embedding, model_position, model.config.hidden_size);
+    for (std::int32_t dim = 0; dim < model.config.hidden_size; ++dim) {
+        hidden[checked_size(dim, "dim")] =
+            token[checked_size(dim, "dim")] + position_embedding[checked_size(dim, "dim")];
+    }
+
+    for (std::int32_t layer_id = 0;
+         layer_id < static_cast<std::int32_t>(model.layers.size());
+         ++layer_id) {
+        forward_gpt2_layer_cached(model.config,
+                                  model.layers[checked_size(layer_id, "layer_id")],
+                                  layer_id,
+                                  model_position,
+                                  cache,
+                                  hidden);
+    }
+
+    std::vector<float> normed(checked_size(model.config.hidden_size, "hidden_size"), 0.0F);
+    layer_norm(hidden,
+               model.final_ln_weight,
+               model.final_ln_bias,
+               model.config.layer_norm_epsilon,
+               normed);
+
+    Gpt2ForwardResult result;
+    result.logits.assign(checked_size(model.config.vocab_size, "vocab_size"), 0.0F);
+    compute_logits(model, normed, result.logits);
+    result.predicted_token = argmax(result.logits);
+    return result;
+}
+
 std::vector<std::int32_t> gpt2_generate_greedy(const Gpt2ReferenceModel& model,
                                                std::span<const std::int32_t> prompt_token_ids,
                                                std::int32_t max_new_tokens) {
@@ -1390,6 +1635,44 @@ std::vector<std::int32_t> gpt2_generate_greedy(const Gpt2ReferenceModel& model,
         tokens.push_back(result.predicted_token);
         if (model.config.eos_token_id >= 0 && result.predicted_token == model.config.eos_token_id) {
             break;
+        }
+    }
+    return tokens;
+}
+
+std::vector<std::int32_t> gpt2_generate_greedy_cached(
+    const Gpt2ReferenceModel& model,
+    std::span<const std::int32_t> prompt_token_ids,
+    std::int32_t max_new_tokens) {
+    if (prompt_token_ids.empty()) {
+        throw std::runtime_error("GPT-2 generation needs at least one prompt token");
+    }
+    if (max_new_tokens < 0) {
+        throw std::runtime_error("max_new_tokens cannot be negative");
+    }
+    if (prompt_token_ids.size() > checked_size(model.config.max_positions, "max_positions")) {
+        throw std::runtime_error("GPT-2 prompt exceeds max_positions");
+    }
+
+    Gpt2KvCache cache(model.config);
+    std::vector<std::int32_t> tokens(prompt_token_ids.begin(), prompt_token_ids.end());
+    if (max_new_tokens == 0) {
+        return tokens;
+    }
+    Gpt2ForwardResult result;
+    for (const std::int32_t token_id : prompt_token_ids) {
+        result = run_gpt2_forward_cached(model, cache, token_id);
+    }
+    for (std::int32_t step = 0; step < max_new_tokens; ++step) {
+        if (tokens.size() >= checked_size(model.config.max_positions, "max_positions")) {
+            throw std::runtime_error("GPT-2 generation would exceed max_positions");
+        }
+        tokens.push_back(result.predicted_token);
+        if (model.config.eos_token_id >= 0 && result.predicted_token == model.config.eos_token_id) {
+            break;
+        }
+        if (step + 1 < max_new_tokens) {
+            result = run_gpt2_forward_cached(model, cache, result.predicted_token);
         }
     }
     return tokens;

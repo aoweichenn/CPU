@@ -69,7 +69,7 @@ def default_cache_dir() -> Path:
 
 
 def default_build_dir() -> Path:
-    return volume_dir() / "build" / "lcqi-debug"
+    return volume_dir() / "build" / "lcqi-release"
 
 
 def default_report_path() -> Path:
@@ -197,7 +197,7 @@ def build_lcqi_gpt2(build_dir: Path, jobs: int) -> Path:
             str(volume_dir()),
             "-B",
             str(build_dir),
-            "-DCMAKE_BUILD_TYPE=Debug",
+            "-DCMAKE_BUILD_TYPE=Release",
         ],
         timeout_seconds=DEFAULT_TIMEOUT_SECONDS,
     )
@@ -228,6 +228,7 @@ def write_report(
     binary: Path,
     prompt: str,
     max_new_tokens: int,
+    engine: str,
     result: CommandResult,
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -248,6 +249,7 @@ def write_report(
             f"binary={binary}",
             f"prompt={prompt}",
             f"max_new_tokens={max_new_tokens}",
+            f"engine={engine}",
             f"command={command_line(result.args)}",
             f"exit_code={result.returncode}",
             "stdout_begin",
@@ -272,6 +274,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, default=default_report_path())
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--engine", choices=("cached", "full"), default="cached")
+    parser.add_argument("--benchmark", action="store_true")
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     parser.add_argument("--jobs", type=int, default=DEFAULT_BUILD_JOBS)
     parser.add_argument("--no-download", action="store_true")
@@ -291,10 +295,14 @@ def main() -> int:
         binary = build_lcqi_gpt2(args.build_dir, args.jobs)
         command = [
             str(binary),
+            "--engine",
+            args.engine,
             str(args.cache_dir),
             args.prompt,
             str(args.max_new_tokens),
         ]
+        if args.benchmark:
+            command.insert(1, "--benchmark")
         result = run_command(command, cwd=repo_dir(), timeout_seconds=args.timeout_seconds)
         write_report(
             args.report,
@@ -302,6 +310,7 @@ def main() -> int:
             binary=binary,
             prompt=args.prompt,
             max_new_tokens=args.max_new_tokens,
+            engine=args.engine,
             result=result,
         )
         print(f"[lcqi-gpt2] report: {args.report}")

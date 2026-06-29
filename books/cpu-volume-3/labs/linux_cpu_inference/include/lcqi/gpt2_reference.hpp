@@ -57,6 +57,43 @@ struct Gpt2ForwardResult {
     std::int32_t predicted_token = 0;
 };
 
+class Gpt2KvCache {
+public:
+    explicit Gpt2KvCache(const Gpt2Config& config);
+
+    void append(std::int32_t layer_id,
+                std::int32_t model_position,
+                std::span<const float> key,
+                std::span<const float> value);
+
+    [[nodiscard]] std::span<const float> key(std::int32_t layer_id,
+                                             std::int32_t model_position,
+                                             std::int32_t head) const;
+
+    [[nodiscard]] std::span<const float> value(std::int32_t layer_id,
+                                               std::int32_t model_position,
+                                               std::int32_t head) const;
+
+    [[nodiscard]] std::int32_t filled_tokens() const noexcept;
+    [[nodiscard]] std::size_t byte_size() const noexcept;
+
+private:
+    [[nodiscard]] std::size_t base_offset(std::int32_t layer_id,
+                                          std::int32_t model_position,
+                                          std::int32_t head) const;
+    void validate_address(std::int32_t layer_id,
+                          std::int32_t model_position,
+                          std::int32_t head) const;
+    void validate_written(std::int32_t layer_id,
+                          std::int32_t model_position) const;
+
+    Gpt2Config config_;
+    std::int32_t filled_tokens_ = 0;
+    std::vector<float> keys_;
+    std::vector<float> values_;
+    std::vector<std::uint8_t> written_;
+};
+
 struct Gpt2Tokenizer {
     std::int32_t bos_token_id = -1;
     std::int32_t eos_token_id = -1;
@@ -92,7 +129,17 @@ struct Gpt2Tokenizer {
     const Gpt2ReferenceModel& model,
     std::span<const std::int32_t> token_ids);
 
+[[nodiscard]] Gpt2ForwardResult run_gpt2_forward_cached(
+    const Gpt2ReferenceModel& model,
+    Gpt2KvCache& cache,
+    std::int32_t token_id);
+
 [[nodiscard]] std::vector<std::int32_t> gpt2_generate_greedy(
+    const Gpt2ReferenceModel& model,
+    std::span<const std::int32_t> prompt_token_ids,
+    std::int32_t max_new_tokens);
+
+[[nodiscard]] std::vector<std::int32_t> gpt2_generate_greedy_cached(
     const Gpt2ReferenceModel& model,
     std::span<const std::int32_t> prompt_token_ids,
     std::int32_t max_new_tokens);

@@ -15,11 +15,12 @@
 - 量化线性层、ReLU、分类 argmax
 - int8 linear scalar baseline、packed layout、AVX2 路径和 shape sweep benchmark
 - tiny reference decoder：RMSNorm、float linear、RoPE、GQA KV cache、decode attention、SwiGLU、lm head
-- GPT-2 reference path：byte-level BPE tokenizer、`config.json`、F32/F16/BF16 safetensors 张量读取、HuggingFace GPT-2 name mapping、LayerNorm、绝对位置嵌入、packed QKV、causal attention、GELU、tied lm head 和 greedy generation
+- GPT-2 reference path：byte-level BPE tokenizer、`config.json`、F32/F16/BF16 safetensors 张量读取、HuggingFace GPT-2 name mapping、LayerNorm、绝对位置嵌入、packed QKV、causal attention、GELU、tied lm head、full-prefix greedy generation、KV cache greedy generation 和分阶段 benchmark
 - reference trace CSV：从 prompt/tokenizer 合同到 logits/sampler/token，逐 checkpoint 输出 shape、stride、dtype、layout、checksum、max_abs、values 摘要
 - 7B ledger CSV：输出典型 7B shape 的 FLOPs、KV 容量、权重/KV 字节和 bandwidth-only tokens/s 上限
 - serving SLO probe CSV：输出 admission、batch state、KV 预算、queue wait、TTFT、TPOT、取消回收和拒绝率
 - 自研 GPT-2 冒烟：加载 `openai-community/gpt2` 的 `config.json`、`vocab.json`、`merges.txt`、`model.safetensors`，在 LCQI C++ reference path 上生成 1 个 token，并把文件 hash、prompt ids、generated ids 和文本输出写入报告
+- 自研 GPT-2 benchmark 对比：同一个 GPT-2 F32 safetensors 模型分别跑 full-prefix 和 cached-KV，并在可用时附带 llama.cpp/SmolLM2 Q4_K_M 作为成熟引擎参考
 - 真实 small 开源模型冒烟：通过 llama.cpp 加载 SmolLM2-135M-Instruct 的 GGUF 量化文件，在本地 CPU 上生成一段 assistant 文本，并把模型 hash、命令、输出和性能行写入报告
 - CLI 推理和简单 benchmark
 - CTest 正确性测试
@@ -28,7 +29,7 @@
 
 - 真实 7B 级模型 metadata、tokenizer 和量化权重导入
 - SentencePiece tokenizer、GGUF 权重导入、safetensors 分片加载和更多模型方言 name mapping
-- GPT-2 reference path 的 KV cache、prefill/decode 分离和 golden logits 对齐报告
+- GPT-2 reference path 的 Transformers/PyTorch golden logits 对齐报告
 - KV cache 分页、内存规划和可选量化
 - CPU packed weight、SIMD、线程和 NUMA 优化
 - GPU backend adapter 和 device kernel
@@ -96,6 +97,7 @@ GPT-2 自研 reference smoke：
 ```bash
 books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_gpt2
 make cpu3-gpt2-smoke
+make cpu3-gpt2-benchmark-compare
 ```
 
 第一条命令不需要下载模型，直接运行仓库内 tiny GPT-2 fixture，输出固定 prompt ids、logits、predicted token 和 greedy generated ids。`lcqi_tests` 会覆盖 tiny GPT-2 forward/generation、byte-level BPE 编码解码、F32/F16/BF16 safetensors 读取、HuggingFace 风格 tiny GPT-2 checkpoint 加载和坏 shape 拒绝。
@@ -121,7 +123,24 @@ generated_text Hello, my name is John
 validation=PASS
 ```
 
-这说明 LCQI 自研 C++ reference path 已经能跑标准 GPT-2 safetensors 的 tokenizer、权重导入、forward 和 greedy generation。它仍然不是高性能推理引擎：当前实现为便于验证会重跑完整前缀，没有 KV cache、没有 packed weight、没有线程并行，也还没有把 logits 和 Transformers/PyTorch 逐数值对齐成外部 golden 报告。
+这说明 LCQI 自研 C++ reference path 已经能跑标准 GPT-2 safetensors 的 tokenizer、权重导入、forward 和 greedy generation。默认真实模型路径现在使用 `cached_kv`，也可以用 `--engine full` 复现旧的 full-prefix 重算路径：
+
+```bash
+books/cpu-volume-3/build/lcqi-release/labs/linux_cpu_inference/lcqi_gpt2 \
+  --benchmark --engine cached \
+  ~/.cache/lcqi-gpt2-smoke/openai-community--gpt2 \
+  "Hello, my name is" 4
+```
+
+`make cpu3-gpt2-benchmark-compare` 会生成：
+
+```text
+books/cpu-volume-3/results/lcqi-gpt2-benchmark-compare.txt
+```
+
+最近一次本机 aarch64/Qualcomm 报告中，LCQI full-prefix 在 GPT-2 F32 上生成 4 个 token 的生成阶段为 `2522.81 ms`，约 `1.586 token/s`；LCQI cached-KV 同样输出 `Hello, my name is John. I'm`，生成阶段为 `826.152 ms`，约 `4.842 token/s`。cached-KV 的第一个新 token 来自 prefill 最后一步，后续 decode 实际执行 3 个 forward step，耗时 `309.524 ms`，约 `9.692 step/s`。同机 llama.cpp 使用 SmolLM2-135M-Instruct Q4_K_M 的 `llama-bench -p 5 -n 4` 作为成熟引擎参照，prefill `76.41 token/s`、decode `27.83 token/s`。这个对照不是同模型质量排名：LCQI 跑的是 GPT-2 F32 reference path，llama.cpp 跑的是 GGUF 量化 small instruct 模型。它揭示的是工程差距：LCQI 已经消除了“每步重算前缀”的主要算法错误，但还缺 packed weight、量化 matmul、SIMD/SVE/NEON kernel、线程并行、mmap/lazy load、采样器和成熟的内存调度。
+
+它仍然不是生产级推理引擎：当前 GPT-2 路径还没有把 logits 和 Transformers/PyTorch 逐数值对齐成外部 golden 报告，也没有 GGUF 自研导入、分页 KV cache、量化权重执行和高性能多线程 kernel。
 
 7B ledger：
 

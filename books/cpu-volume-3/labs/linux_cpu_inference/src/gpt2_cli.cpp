@@ -1,5 +1,6 @@
 #include <lcqi/gpt2_reference.hpp>
 
+#include <chrono>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
@@ -7,6 +8,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -18,6 +20,33 @@ constexpr std::int32_t LCQI_GPT2_TINY_PROMPT_0 = 1;
 constexpr std::int32_t LCQI_GPT2_TINY_PROMPT_1 = 2;
 constexpr std::int32_t LCQI_GPT2_TINY_PROMPT_2 = 3;
 
+enum class Gpt2EngineMode {
+    full_prefix,
+    cached_kv,
+};
+
+struct Gpt2CliOptions {
+    Gpt2EngineMode engine = Gpt2EngineMode::cached_kv;
+    bool benchmark = false;
+    std::filesystem::path model_dir;
+    std::string prompt;
+    std::int32_t max_new_tokens = LCQI_GPT2_DEFAULT_MAX_NEW_TOKENS;
+};
+
+struct Gpt2BenchmarkTimings {
+    double load_ms = 0.0;
+    double tokenize_ms = 0.0;
+    double prefill_ms = 0.0;
+    double decode_ms = 0.0;
+    double generate_ms = 0.0;
+    double total_ms = 0.0;
+    std::size_t prefill_steps = 0;
+    std::size_t decode_steps = 0;
+    std::size_t kv_cache_bytes = 0;
+};
+
+using Clock = std::chrono::steady_clock;
+
 void print_ids(std::span<const std::int32_t> ids) {
     for (std::size_t index = 0; index < ids.size(); ++index) {
         if (index != 0) {
@@ -27,15 +56,181 @@ void print_ids(std::span<const std::int32_t> ids) {
     }
 }
 
-std::int32_t parse_max_new_tokens(int argc, char** argv) {
-    if (argc <= 3) {
-        return LCQI_GPT2_DEFAULT_MAX_NEW_TOKENS;
-    }
-    const std::int32_t value = static_cast<std::int32_t>(std::stoi(argv[3]));
+[[nodiscard]] double elapsed_ms(Clock::time_point start, Clock::time_point end) {
+    return std::chrono::duration<double, std::milli>(end - start).count();
+}
+
+[[nodiscard]] std::size_t checked_size(std::int64_t value, const char* name) {
     if (value < 0) {
-        throw std::runtime_error("max_new_tokens cannot be negative");
+        throw std::runtime_error(std::string(name) + " cannot be negative");
+    }
+    return static_cast<std::size_t>(value);
+}
+
+[[nodiscard]] const char* engine_name(Gpt2EngineMode engine) {
+    switch (engine) {
+        case Gpt2EngineMode::full_prefix:
+            return "full_prefix";
+        case Gpt2EngineMode::cached_kv:
+            return "cached_kv";
+    }
+    return "unknown";
+}
+
+[[nodiscard]] Gpt2EngineMode parse_engine(std::string_view value) {
+    if (value == "full" || value == "full_prefix") {
+        return Gpt2EngineMode::full_prefix;
+    }
+    if (value == "cached" || value == "cached_kv") {
+        return Gpt2EngineMode::cached_kv;
+    }
+    throw std::runtime_error("unknown --engine value, expected cached or full");
+}
+
+[[nodiscard]] std::int32_t parse_non_negative_i32(const std::string& text,
+                                                  const char* name) {
+    const std::int32_t value = static_cast<std::int32_t>(std::stoi(text));
+    if (value < 0) {
+        throw std::runtime_error(std::string(name) + " cannot be negative");
     }
     return value;
+}
+
+[[nodiscard]] Gpt2CliOptions parse_options(int argc, char** argv) {
+    Gpt2CliOptions options;
+    std::vector<std::string> positional;
+    for (int index = 1; index < argc; ++index) {
+        const std::string arg = argv[index];
+        if (arg == "--benchmark") {
+            options.benchmark = true;
+        } else if (arg == "--engine") {
+            if (index + 1 >= argc) {
+                throw std::runtime_error("--engine requires a value");
+            }
+            ++index;
+            options.engine = parse_engine(argv[index]);
+        } else if (arg.rfind("--engine=", 0) == 0) {
+            options.engine = parse_engine(std::string_view(arg).substr(std::string("--engine=").size()));
+        } else if (arg == "--full") {
+            options.engine = Gpt2EngineMode::full_prefix;
+        } else if (arg == "--cached") {
+            options.engine = Gpt2EngineMode::cached_kv;
+        } else if (!arg.empty() && arg.front() == '-') {
+            throw std::runtime_error("unknown option: " + arg);
+        } else {
+            positional.push_back(arg);
+        }
+    }
+
+    if (positional.size() < 2 || positional.size() > 3) {
+        throw std::runtime_error(
+            "usage: lcqi_gpt2 [--engine cached|full] [--benchmark] "
+            "model_dir prompt [max_new_tokens]");
+    }
+    options.model_dir = positional[0];
+    options.prompt = positional[1];
+    if (positional.size() == 3) {
+        options.max_new_tokens = parse_non_negative_i32(positional[2], "max_new_tokens");
+    }
+    return options;
+}
+
+[[nodiscard]] std::vector<std::int32_t> generate_full_prefix(
+    const lcqi::Gpt2ReferenceModel& model,
+    std::span<const std::int32_t> prompt_ids,
+    std::int32_t max_new_tokens,
+    Gpt2BenchmarkTimings& timings) {
+    const Clock::time_point generate_start = Clock::now();
+    std::vector<std::int32_t> tokens(prompt_ids.begin(), prompt_ids.end());
+    for (std::int32_t step = 0; step < max_new_tokens; ++step) {
+        if (tokens.size() >= checked_size(model.config.max_positions, "max_positions")) {
+            throw std::runtime_error("GPT-2 generation would exceed max_positions");
+        }
+        const lcqi::Gpt2ForwardResult result = lcqi::run_gpt2_forward(model, tokens);
+        ++timings.decode_steps;
+        tokens.push_back(result.predicted_token);
+        if (model.config.eos_token_id >= 0 && result.predicted_token == model.config.eos_token_id) {
+            break;
+        }
+    }
+    const Clock::time_point generate_end = Clock::now();
+    timings.generate_ms = elapsed_ms(generate_start, generate_end);
+    timings.decode_ms = timings.generate_ms;
+    return tokens;
+}
+
+[[nodiscard]] std::vector<std::int32_t> generate_cached(
+    const lcqi::Gpt2ReferenceModel& model,
+    std::span<const std::int32_t> prompt_ids,
+    std::int32_t max_new_tokens,
+    Gpt2BenchmarkTimings& timings) {
+    if (prompt_ids.empty()) {
+        throw std::runtime_error("GPT-2 generation needs at least one prompt token");
+    }
+    lcqi::Gpt2KvCache cache(model.config);
+    timings.kv_cache_bytes = cache.byte_size();
+    std::vector<std::int32_t> tokens(prompt_ids.begin(), prompt_ids.end());
+    if (max_new_tokens == 0) {
+        return tokens;
+    }
+
+    const Clock::time_point generate_start = Clock::now();
+    lcqi::Gpt2ForwardResult result;
+    const Clock::time_point prefill_start = Clock::now();
+    for (const std::int32_t token_id : prompt_ids) {
+        result = lcqi::run_gpt2_forward_cached(model, cache, token_id);
+        ++timings.prefill_steps;
+    }
+    const Clock::time_point prefill_end = Clock::now();
+    timings.prefill_ms = elapsed_ms(prefill_start, prefill_end);
+
+    const Clock::time_point decode_start = Clock::now();
+    for (std::int32_t step = 0; step < max_new_tokens; ++step) {
+        if (tokens.size() >= checked_size(model.config.max_positions, "max_positions")) {
+            throw std::runtime_error("GPT-2 generation would exceed max_positions");
+        }
+        tokens.push_back(result.predicted_token);
+        if (model.config.eos_token_id >= 0 && result.predicted_token == model.config.eos_token_id) {
+            break;
+        }
+        if (step + 1 < max_new_tokens) {
+            result = lcqi::run_gpt2_forward_cached(model, cache, result.predicted_token);
+            ++timings.decode_steps;
+        }
+    }
+    const Clock::time_point decode_end = Clock::now();
+    const Clock::time_point generate_end = Clock::now();
+    timings.decode_ms = elapsed_ms(decode_start, decode_end);
+    timings.generate_ms = elapsed_ms(generate_start, generate_end);
+    return tokens;
+}
+
+void print_benchmark(const Gpt2BenchmarkTimings& timings,
+                     std::size_t prompt_tokens,
+                     std::size_t generated_tokens) {
+    const double new_tokens = static_cast<double>(generated_tokens);
+    const double generated_tokens_per_second =
+        timings.generate_ms > 0.0 ? new_tokens * 1000.0 / timings.generate_ms : 0.0;
+    const double decode_tokens_per_second =
+        timings.decode_ms > 0.0
+            ? static_cast<double>(timings.decode_steps) * 1000.0 / timings.decode_ms
+            : 0.0;
+
+    std::cout << "benchmark_load_ms " << timings.load_ms << "\n";
+    std::cout << "benchmark_tokenize_ms " << timings.tokenize_ms << "\n";
+    std::cout << "benchmark_prefill_ms " << timings.prefill_ms << "\n";
+    std::cout << "benchmark_decode_ms " << timings.decode_ms << "\n";
+    std::cout << "benchmark_generate_ms " << timings.generate_ms << "\n";
+    std::cout << "benchmark_total_ms " << timings.total_ms << "\n";
+    std::cout << "benchmark_prompt_tokens " << prompt_tokens << "\n";
+    std::cout << "benchmark_generated_tokens " << generated_tokens << "\n";
+    std::cout << "benchmark_prefill_steps " << timings.prefill_steps << "\n";
+    std::cout << "benchmark_decode_steps " << timings.decode_steps << "\n";
+    std::cout << "benchmark_generate_tokens_per_second "
+              << generated_tokens_per_second << "\n";
+    std::cout << "benchmark_decode_tokens_per_second "
+              << decode_tokens_per_second << "\n";
+    std::cout << "benchmark_kv_cache_bytes " << timings.kv_cache_bytes << "\n";
 }
 
 int run_tiny_mode() {
@@ -67,24 +262,37 @@ int run_tiny_mode() {
 int run_real_model_mode(int argc, char** argv) {
     if (argc < LCQI_GPT2_MIN_REAL_ARGC) {
         throw std::runtime_error(
-            "usage: lcqi_gpt2 [model_dir prompt [max_new_tokens]]");
+            "usage: lcqi_gpt2 [--engine cached|full] [--benchmark] "
+            "model_dir prompt [max_new_tokens]");
     }
-    const std::filesystem::path model_dir = argv[1];
-    const std::string prompt = argv[2];
-    const std::int32_t max_new_tokens = parse_max_new_tokens(argc, argv);
+    const Clock::time_point total_start = Clock::now();
+    const Gpt2CliOptions options = parse_options(argc, argv);
 
-    const lcqi::Gpt2ReferenceModel model = lcqi::load_gpt2_from_directory(model_dir);
+    Gpt2BenchmarkTimings timings;
+    const Clock::time_point load_start = Clock::now();
+    const lcqi::Gpt2ReferenceModel model = lcqi::load_gpt2_from_directory(options.model_dir);
     const lcqi::Gpt2Tokenizer tokenizer = lcqi::load_gpt2_tokenizer(
-        model_dir / "vocab.json",
-        model_dir / "merges.txt",
+        options.model_dir / "vocab.json",
+        options.model_dir / "merges.txt",
         model.config.bos_token_id,
         model.config.eos_token_id);
-    const std::vector<std::int32_t> prompt_ids = lcqi::gpt2_encode(tokenizer, prompt);
-    const std::vector<std::int32_t> generated =
-        lcqi::gpt2_generate_greedy(model, prompt_ids, max_new_tokens);
+    timings.load_ms = elapsed_ms(load_start, Clock::now());
+
+    const Clock::time_point tokenize_start = Clock::now();
+    const std::vector<std::int32_t> prompt_ids = lcqi::gpt2_encode(tokenizer, options.prompt);
+    timings.tokenize_ms = elapsed_ms(tokenize_start, Clock::now());
+
+    std::vector<std::int32_t> generated;
+    if (options.engine == Gpt2EngineMode::full_prefix) {
+        generated = generate_full_prefix(model, prompt_ids, options.max_new_tokens, timings);
+    } else {
+        generated = generate_cached(model, prompt_ids, options.max_new_tokens, timings);
+    }
+    timings.total_ms = elapsed_ms(total_start, Clock::now());
 
     std::cout << "mode gpt2_directory\n";
-    std::cout << "model_dir " << model_dir.string() << "\n";
+    std::cout << "engine " << engine_name(options.engine) << "\n";
+    std::cout << "model_dir " << options.model_dir.string() << "\n";
     std::cout << "prompt_ids ";
     print_ids(prompt_ids);
     std::cout << "\n";
@@ -92,6 +300,10 @@ int run_real_model_mode(int argc, char** argv) {
     print_ids(generated);
     std::cout << "\n";
     std::cout << "generated_text " << lcqi::gpt2_decode(tokenizer, generated) << "\n";
+    if (options.benchmark) {
+        const std::size_t generated_tokens = generated.size() - prompt_ids.size();
+        print_benchmark(timings, prompt_ids.size(), generated_tokens);
+    }
     return EXIT_SUCCESS;
 }
 

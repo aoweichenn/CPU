@@ -498,6 +498,28 @@ void test_gpt2_tiny_forward_and_generation() {
     require(generated == expected, "GPT-2 greedy generation mismatch");
     require(static_cast<std::int32_t>(generated.size()) == LCQI_GPT2_GENERATED_LENGTH,
             "GPT-2 generated length mismatch");
+
+    lcqi::Gpt2KvCache cache(model.config);
+    lcqi::Gpt2ForwardResult cached_result;
+    for (const std::int32_t token : tokens) {
+        cached_result = lcqi::run_gpt2_forward_cached(model, cache, token);
+    }
+    require(cache.filled_tokens() == static_cast<std::int32_t>(tokens.size()),
+            "GPT-2 KV cache filled token count mismatch");
+    require(cache.byte_size() > 0, "GPT-2 KV cache byte size should be non-zero");
+    require(cached_result.predicted_token == result.predicted_token,
+            "cached GPT-2 predicted token mismatch");
+    require(cached_result.logits.size() == result.logits.size(),
+            "cached GPT-2 logits size mismatch");
+    for (std::size_t index = 0; index < result.logits.size(); ++index) {
+        require_close(cached_result.logits[index],
+                      result.logits[index],
+                      "cached GPT-2 logit mismatch");
+    }
+
+    const std::vector<std::int32_t> cached_generated =
+        lcqi::gpt2_generate_greedy_cached(model, tokens, 2);
+    require(cached_generated == expected, "cached GPT-2 greedy generation mismatch");
 }
 
 void test_gpt2_byte_bpe_tokenizer() {

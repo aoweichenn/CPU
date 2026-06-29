@@ -42,12 +42,19 @@ results/lcqi-x86-avx2-decode4096-2026-06-25.csv
 
 ```bash
 make cpu3-gpt2-smoke
+make cpu3-gpt2-benchmark-compare
 ```
 
-它下载 `openai-community/gpt2` 的标准 safetensors 资产到用户缓存目录，用 LCQI C++ reference path 生成 1 个 token，并把报告写入：
+第一条命令下载 `openai-community/gpt2` 的标准 safetensors 资产到用户缓存目录，用 LCQI C++ reference path 生成 1 个 token，并把报告写入：
 
 ```text
 results/lcqi-gpt2-smoke.txt
+```
+
+第二条命令用同一个 GPT-2 F32 模型对比 LCQI full-prefix 和 cached-KV 生成路径，并在本机存在 llama.cpp/SmolLM2 缓存时附带成熟引擎参考，报告写入：
+
+```text
+results/lcqi-gpt2-benchmark-compare.txt
 ```
 
 它仍然不是生产级 AI Infra。生产级门禁见：
