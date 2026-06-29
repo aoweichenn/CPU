@@ -41,6 +41,10 @@ BOX_TITLES = {
     "labbox": "实验",
     "exercisebox": "习题与作业",
     "deepdive": "深入理解",
+    "learninggoals": "学习目标",
+    "casebox": "工程案例",
+    "sourcereadingbox": "源码阅读任务",
+    "rubricbox": "验收与评分标准",
 }
 
 SKIP_ENVIRONMENTS = {
@@ -427,7 +431,7 @@ class LatexBlockConverter:
                     self.flush_paragraph()
                     self.out.append(render_code_block(code.rstrip(), env, begin.group(2)))
                     continue
-                if env == "tabular":
+                if env in {"tabular", "longtable"}:
                     table, i = collect_environment(lines, i, env)
                     self.flush_paragraph()
                     self.out.append(render_table(table, self.inline, linearize=self.linearize_tables))
@@ -914,14 +918,22 @@ def title_has_visible_chapter_label(title: str) -> bool:
 
 def render_table(source: str, inline: LatexInline, linearize: bool = False) -> str:
     cleaned = re.sub(r"\\(toprule|midrule|bottomrule|hline)", "\n", source)
+    cleaned = re.sub(r"\\end(first)?head", "\n", cleaned)
+    cleaned = re.sub(r"\\endfoot", "\n", cleaned)
+    cleaned = re.sub(r"\\endlastfoot", "\n", cleaned)
     cleaned = cleaned.replace(r"\tabularnewline", r"\\")
     rows = [row.strip() for row in re.split(r"\\\\", cleaned) if row.strip()]
     parsed_rows: list[list[str]] = []
+    seen_rows: set[tuple[str, ...]] = set()
     for row in rows:
         if row.startswith(r"\end"):
             continue
         cells = [cell.strip() for cell in split_table_row(row)]
         if cells:
+            row_key = tuple(cells)
+            if row_key in seen_rows:
+                continue
+            seen_rows.add(row_key)
             parsed_rows.append(cells)
 
     if linearize:

@@ -9,6 +9,7 @@
 - `books/cpu-volume-2/`：从 C++ 到计算系统第二册原理卷，主题是硬件原理、多核心并行、高性能计算、多线程、锁、原子、无锁数据结构、并行算法、运行时、异步 I/O 和分布式计算。
 - `books/compute-systems-engine-code/`：第二册配套代码实践卷，主题是 Compute Systems Engine 的完整 C++20 实现、测试、benchmark、故障注入和报告。
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
+- `books/cpu-volume-3-practice/`：第三册配套实践卷，主题是 Linux 本地量化推理引擎、KV Cache、reference trace、7B 账本、服务 SLO、CPU/GPU 后端边界和验收门禁。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 - `books/cpp-zero-to-advanced/`：Cpp 从零到高级教材，主题是执行模型、值和类型、RAII、标准库、泛型、构建测试、性能、并发、大型代码组织和综合项目。
 
@@ -48,6 +49,11 @@ books/
   cpu-volume-3/
     labs/              # 第三册 AI 推理引擎实验
     materials/
+    reports/
+    results/
+    tools/
+  cpu-volume-3-practice/
+    source/latex/      # 第三册实践卷正式 LaTeX 书稿
     reports/
     results/
     tools/
@@ -117,6 +123,15 @@ make books-export
 ```
 
 该命令会重新构建各本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
+
+生成并测试第三册实践卷：
+
+```bash
+make cpu3p-check
+make cpu3p-pdf
+make cpu3p-epub
+make cpu3p-test
+```
 
 检查和测试算法面试书：
 
