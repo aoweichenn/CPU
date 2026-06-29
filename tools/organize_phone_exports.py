@@ -12,9 +12,8 @@ from pathlib import Path
 
 PHONE_EXPORT_ROOT = Path("/mnt/sdcard/STU/BOOKS")
 PDF_EPUB_SUFFIXES = {".pdf", ".epub"}
+PHONE_STALE_TEXT_SUFFIXES = {".md", ".txt"}
 HYPHEN_LIKE_CHARS = ("-", "‐", "‑", "‒", "–", "—", "―", "－", "−")
-INDEX_FILE_NAME = "README.md"
-STALE_INDEX_FILE_NAME = "目录.txt"
 
 
 @dataclass(frozen=True)
@@ -132,18 +131,13 @@ def move_or_merge_book(root: Path, book: Book, *, allow_missing: bool) -> Path |
     return dest
 
 
-def write_text(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text, encoding="utf-8")
-
-
 def clean_index_trees(root: Path) -> None:
     for dirname in ("按内容领域",):
         path = root / dirname
         if path.exists():
             shutil.rmtree(path)
-    for path in root.rglob(STALE_INDEX_FILE_NAME):
-        if path.is_file():
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in PHONE_STALE_TEXT_SUFFIXES:
             path.unlink()
 
 
@@ -158,87 +152,6 @@ def remove_retired_book_dirs(root: Path) -> None:
         path = root / "按卷类型" / volume_type
         if path.exists():
             shutil.rmtree(path)
-
-
-def write_root_index(root: Path) -> None:
-    lines = [
-        "手机导出目录",
-        "",
-        "真实 PDF/EPUB 只放在：按卷类型/原理卷、按卷类型/实践与代码卷。",
-        "按内容领域只放索引说明，不复制书文件，避免微信读书把同一本书识别成多本。",
-        "每本书目录内只保留一个同名 PDF 和一个同名 EPUB。",
-        "",
-        "当前分组：",
-    ]
-    for volume_type in VOLUME_TYPES:
-        lines.append(f"- 按卷类型/{volume_type}")
-    lines.append("- 按内容领域")
-    write_text(root / INDEX_FILE_NAME, "\n".join(lines) + "\n")
-
-
-def write_type_indexes(root: Path, books: tuple[Book, ...]) -> None:
-    write_text(
-        root / "按卷类型" / INDEX_FILE_NAME,
-        "\n".join(
-            [
-                "按卷类型",
-                "",
-                "真实 PDF/EPUB 保存在本目录下的原理卷、实践与代码卷。",
-                "每本书目录只保留一个同名 PDF 和一个同名 EPUB。",
-            ]
-        )
-        + "\n",
-    )
-
-    books_by_type = {
-        volume_type: [book for book in books if book.volume_type == volume_type]
-        for volume_type in VOLUME_TYPES
-    }
-    for volume_type, books in books_by_type.items():
-        type_dir = root / "按卷类型" / volume_type
-        type_dir.mkdir(parents=True, exist_ok=True)
-        lines = [volume_type, ""]
-        if books:
-            lines.append("本目录保存真实书文件：")
-            for book in books:
-                lines.append(f"- {book.title}/{book.title}.pdf")
-                lines.append(f"- {book.title}/{book.title}.epub")
-        else:
-            lines.append("当前没有已导出的书。")
-            if volume_type == "规划卷":
-                lines.append("")
-                lines.append("预留方向：")
-                for title in PLANNED_BOOKS:
-                    lines.append(f"- {title}")
-        write_text(type_dir / INDEX_FILE_NAME, "\n".join(lines) + "\n")
-
-
-def write_topic_indexes(root: Path, books: tuple[Book, ...]) -> None:
-    topic_root = root / "按内容领域"
-    topic_root.mkdir(parents=True, exist_ok=True)
-    write_text(
-        topic_root / INDEX_FILE_NAME,
-        "\n".join(
-            [
-                "按内容领域",
-                "",
-                "这里是索引层，不保存 PDF/EPUB。",
-                "真实文件位置以每个领域目录里的路径为准。",
-            ]
-        )
-        + "\n",
-    )
-
-    for topic in TOPICS:
-        topic_books = [book for book in books if topic in book.topics]
-        lines = [topic, "", "真实文件位置："]
-        if topic_books:
-            for book in topic_books:
-                path = Path("..") / ".." / "按卷类型" / book.volume_type / book.title
-                lines.append(f"- {book.title}: {path.as_posix()}")
-        else:
-            lines.append("- 暂未导出，目录已预留。")
-        write_text(topic_root / topic / INDEX_FILE_NAME, "\n".join(lines) + "\n")
 
 
 def ensure_no_duplicate_exports(root: Path) -> None:
@@ -272,10 +185,6 @@ def main() -> int:
             exported_books.append(book)
 
     clean_index_trees(root)
-    write_root_index(root)
-    index_books = tuple(exported_books) if args.allow_missing else BOOKS
-    write_type_indexes(root, index_books)
-    write_topic_indexes(root, index_books)
     ensure_no_duplicate_exports(root)
 
     print(root)
