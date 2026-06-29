@@ -1,3 +1,5 @@
+find_package(Threads REQUIRED)
+
 add_library(lcqi STATIC
     src/gpt2_reference.cpp
     src/inference.cpp
@@ -26,6 +28,7 @@ target_include_directories(lcqi
 )
 
 target_compile_features(lcqi PUBLIC cxx_std_20)
+target_link_libraries(lcqi PUBLIC Threads::Threads)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi PRIVATE -Wall -Wextra -Wpedantic)

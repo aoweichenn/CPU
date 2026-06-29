@@ -1,4 +1,4 @@
-# LCQI GPT-2 Hotspot Profile Summary
+# LCQI GPT-2 Pre-Threading Hotspot Profile Summary
 
 Command on `caw`:
 
@@ -37,7 +37,11 @@ Interpretation:
 
 A coarse `perf record -F 99 -g` run on `caw` collected 70 task-clock samples for one cached 4-token run. With model loading included, samples were roughly split as `run_gpt2_cached_step_unchecked` 55.71%, `transpose_hf_conv1d` 28.57%, `read_safetensor_f32_tensor` 7.14%, and `__memset_avx2_unaligned_erms` 2.86%. That is useful for separating startup/loading cost from generation cost, but it is too coarse for deciding which decode kernel to optimize. The generation-stage profile above isolates the runtime decode loop and is the correct evidence for the next inference-kernel optimization.
 
-Next optimization priority:
+This is the pre-threading profile used to choose the next optimization target. The
+accepted threaded implementation and after-profile are summarized in
+`books/cpu-volume-3/reports/lcqi-gpt2-threaded-optimization-summary.md`.
+
+Next optimization priority from this profile:
 
 1. Optimize `lm_head` greedy argmax first: it is one independent dot product per vocab row and is a clean target for row parallelism, SIMD dot products, packed layout, or quantized weights.
 2. Optimize the GPT-2 F32 linear kernel used by MLP and QKV: current code is scalar row-major matvec with no threading and no platform-specific vector kernel.

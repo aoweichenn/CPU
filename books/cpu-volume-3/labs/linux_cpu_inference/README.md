@@ -32,7 +32,7 @@
 - SentencePiece tokenizer、GGUF 权重导入、safetensors 分片加载和更多模型方言 name mapping
 - GPT-2 reference path 的 Transformers/PyTorch golden logits 对齐报告
 - KV cache 分页、内存规划和可选量化
-- CPU packed weight、SIMD、线程和 NUMA 优化
+- CPU packed weight、SIMD、NUMA 和线程亲和优化
 - GPU backend adapter 和 device kernel
 - 与现有框架的 prefill/decode/内存/误差对标报告
 
@@ -131,10 +131,12 @@ validation=PASS
 
 ```bash
 books/cpu-volume-3/build/lcqi-release/labs/linux_cpu_inference/lcqi_gpt2 \
-  --benchmark --engine cached \
+  --benchmark --engine cached --threads 0 \
   ~/.cache/lcqi-gpt2-smoke/openai-community--gpt2 \
   "Hello, my name is" 4
 ```
+
+`--threads 0` 表示自动选择 cached decoder worker 数；`--threads 1` 强制串行；`--threads N` 固定 worker 数。当前 auto 上限是 16，避免在短 decode 上把线程调度开销放大到超过收益。
 
 `make cpu3-gpt2-benchmark-compare` 会生成：
 
@@ -148,15 +150,15 @@ books/cpu-volume-3/results/lcqi-gpt2-benchmark-compare.txt
 books/cpu-volume-3/results/lcqi-gpt2-optimization-ab.txt
 ```
 
-这个 A/B 报告专门回答“当前 LCQI 代码相对指定 baseline 改快了吗”。脚本默认 baseline 是 `4febf3f`，会临时创建 baseline worktree，分别构建 baseline 和当前工作区的 Release `lcqi_gpt2`，再多轮运行同一条 prompt。最近一次 2 轮 smoke 摘要保存在 `books/cpu-volume-3/reports/lcqi-gpt2-optimization-ab-summary.md`：cached-KV 的生成阶段中位数从 baseline `847.353 ms` 降到 current `764.604 ms`，生成吞吐从 `4.85652 token/s` 到 `5.23178 token/s`；full-prefix 中位数基本在 `1.8 s` 左右波动，不是这轮优化的目标。端到端 GPT-2 数字受调度、温度和共享机器状态影响很大，因此正式结论必须看多轮中位数、min/max 和生成文本一致性，不能只挑一次最快结果。
+这个 A/B 报告专门回答“当前 LCQI 代码相对指定 baseline 改快了吗”。脚本默认 baseline 是 `4febf3f`，会临时创建 baseline worktree，分别构建 baseline 和当前工作区的 Release `lcqi_gpt2`，再多轮运行同一条 prompt。上一轮工作区复用优化的 2 轮 smoke 摘要保存在 `books/cpu-volume-3/reports/lcqi-gpt2-optimization-ab-summary.md`；本轮线程优化的正式 raw 报告保存在 `books/cpu-volume-3/reports/lcqi-gpt2-threaded-manual-ab-caw.txt`，汇总保存在 `books/cpu-volume-3/reports/lcqi-gpt2-threaded-optimization-summary.md`。以 `73f40c7` 作为 baseline，在 `caw` 上 5 轮中位数显示：4 token cached-KV 生成阶段从 `395.397 ms` 降到 `76.4141 ms`，16 token 从 `989.060 ms` 降到 `185.479 ms`，生成吞吐分别提升到 `52.3464 token/s` 和 `86.2633 token/s`。端到端 GPT-2 数字受调度、温度和共享机器状态影响很大，因此正式结论必须看多轮中位数、min/max 和生成文本一致性，不能只挑一次最快结果。
 
 `run_gpt2_hotspot_profile.py` 专门回答“现在热点到底在哪”。它通过 `--profile-hotspots` 打开 cached decode 内部计时，字段包括 `hotspot_lm_head_pct`、`hotspot_mlp_fc_pct`、`hotspot_mlp_projection_pct`、`hotspot_qkv_projection_pct` 和 `hotspot_attention_pct`。`caw` 上的 3 轮 Release profile 摘要保存在 `books/cpu-volume-3/reports/lcqi-gpt2-hotspot-profile-summary.md`，原始报告保存在 `books/cpu-volume-3/reports/lcqi-gpt2-hotspot-profile-caw.txt`。关键结论是：4 token 与 16 token 两个口径下，`lm_head` 中位数约 `30.2%`，MLP 两个线性投影合计约 `46%`，QKV 投影约 `17%`，cached attention 本体只有 `0.06%` 到 `0.11%`。所以当前短上下文 GPT-2 的慢点不是 KV attention，而是标量 F32 matvec 和 `50257 x 768` vocab 扫描。
 
-当前优化点集中在 cached-KV generation：`Gpt2CachedGreedyDecoder` 把模型级 shape validation、KV cache 和临时 workspace 的生命周期提升到整段生成；`Gpt2ForwardWorkspace` 复用 hidden、normed、Q/K/V、packed QKV、attention、MLP、scores 和 logits 缓冲区；生成路径只需要 greedy token 时走 logits-free argmax，避免把完整 logits vector 作为 API 结果反复分配；KV cache 的 checked public API 仍保留，内部 cached attention 在一次边界校验后使用私有 unchecked span 扫描热路径。它提升的是分配次数、重复校验和 hot loop 地址计算，不改变 GPT-2 数学语义。
+当前优化点集中在 cached-KV generation：`Gpt2CachedGreedyDecoder` 把模型级 shape validation、KV cache、临时 workspace 和 worker pool 的生命周期提升到整段生成；`Gpt2ForwardWorkspace` 复用 hidden、normed、Q/K/V、packed QKV、attention、MLP、scores 和 logits 缓冲区；生成路径只需要 greedy token 时走 logits-free argmax，避免把完整 logits vector 作为 API 结果反复分配；QKV、attention output projection、MLP 两个 projection 和 tied `lm_head` 都在 cached session 内按输出行并行。KV cache 的 checked public API 仍保留，内部 cached attention 在一次边界校验后使用私有 unchecked span 扫描热路径。它不改变 GPT-2 数学语义，只改变会话生命周期、任务分片和热循环调度。
 
-`make cpu3-gpt2-benchmark-compare` 仍用于和外部成熟引擎放在同一报告里看工程差距。同机 llama.cpp/SmolLM2 Q4_K_M 是成熟引擎参照，不是同模型质量排名：LCQI 跑的是 GPT-2 F32 reference path，llama.cpp 跑的是 GGUF 量化 small instruct 模型。它揭示的是工程差距：LCQI 已经消除了“每步重算前缀”的主要算法错误，但还缺 packed/quantized weight、SIMD/SVE/NEON/AVX 高性能 matmul、线程并行、mmap/lazy load、采样器、分页 KV cache 和成熟调度。
+`make cpu3-gpt2-benchmark-compare` 仍用于和外部成熟引擎放在同一报告里看工程差距。同机 llama.cpp/SmolLM2 Q4_K_M 是成熟引擎参照，不是同模型质量排名：LCQI 跑的是 GPT-2 F32 reference path，llama.cpp 跑的是 GGUF 量化 small instruct 模型。它揭示的是工程差距：LCQI 已经消除了“每步重算前缀”的主要算法错误，并补上 cached F32 row parallelism，但还缺 packed/quantized weight、SIMD/SVE/NEON/AVX 高性能 matmul、mmap/lazy load、采样器、分页 KV cache、NUMA/亲和和成熟调度。
 
-它仍然不是生产级推理引擎：当前 GPT-2 路径还没有把 logits 和 Transformers/PyTorch 逐数值对齐成外部 golden 报告，也没有 GGUF 自研导入、分页 KV cache、量化权重执行和高性能多线程 kernel。
+它仍然不是生产级推理引擎：当前 GPT-2 路径还没有把 logits 和 Transformers/PyTorch 逐数值对齐成外部 golden 报告，也没有 GGUF 自研导入、分页 KV cache、量化权重执行和高性能 SIMD/packed kernel。
 
 7B ledger：
 

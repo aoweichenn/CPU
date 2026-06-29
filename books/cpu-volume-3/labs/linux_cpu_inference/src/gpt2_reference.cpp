@@ -5,15 +5,19 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
+#include <functional>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <utility>
 
@@ -44,8 +48,184 @@ constexpr float LCQI_GPT2_GELU_SQRT_2_OVER_PI = 0.7978845608028654F;
 constexpr float LCQI_GPT2_GELU_CUBIC_COEFF = 0.044715F;
 constexpr float LCQI_GPT2_SOFTMAX_NEGATIVE_INFINITY =
     -std::numeric_limits<float>::infinity();
+constexpr std::int32_t LCQI_GPT2_MAX_AUTO_WORKERS = 16;
+constexpr std::int32_t LCQI_GPT2_DEFAULT_PARALLEL_MIN_ROWS = 512;
+constexpr std::int32_t LCQI_GPT2_PARALLEL_MIN_COLUMNS = 512;
+constexpr std::int64_t LCQI_GPT2_PARALLEL_MIN_OPS = 1'000'000;
+constexpr std::size_t LCQI_GPT2_PARALLEL_ROW_BLOCK_MULTIPLIER = 4;
 
 using Gpt2ProfileClock = std::chrono::steady_clock;
+
+}  // namespace
+
+namespace detail {
+
+class Gpt2ParallelWorkerPool {
+public:
+    explicit Gpt2ParallelWorkerPool(std::int32_t requested_workers)
+        : worker_count_(Gpt2ParallelWorkerPool::normalize_worker_count(requested_workers)) {
+        if (this->worker_count_ <= 1) {
+            return;
+        }
+        const std::size_t background_count =
+            static_cast<std::size_t>(this->worker_count_ - 1);
+        this->threads_.reserve(background_count);
+        for (std::size_t index = 0; index < background_count; ++index) {
+            this->threads_.emplace_back([this]() { this->worker_loop(); });
+        }
+    }
+
+    ~Gpt2ParallelWorkerPool() {
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->stopping_ = true;
+            ++this->generation_;
+        }
+        this->condition_.notify_all();
+        for (std::thread& thread : this->threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
+    Gpt2ParallelWorkerPool(const Gpt2ParallelWorkerPool&) = delete;
+    Gpt2ParallelWorkerPool& operator=(const Gpt2ParallelWorkerPool&) = delete;
+
+    [[nodiscard]] std::int32_t worker_count() const noexcept {
+        return this->worker_count_;
+    }
+
+    void parallel_for_rows(std::size_t begin,
+                           std::size_t end,
+                           std::size_t grain,
+                           const std::function<void(std::size_t, std::size_t)>& function) {
+        if (end <= begin) {
+            return;
+        }
+        const std::size_t row_count = end - begin;
+        if (this->worker_count_ <= 1 || row_count <= grain) {
+            function(begin, end);
+            return;
+        }
+
+        const std::size_t task_count =
+            std::min<std::size_t>(static_cast<std::size_t>(this->worker_count_),
+                                  (row_count + grain - 1) / grain);
+        if (task_count <= 1) {
+            function(begin, end);
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(this->mutex_);
+            this->task_begin_ = begin;
+            this->task_end_ = end;
+            this->task_count_ = task_count;
+            this->next_worker_index_ = 0;
+            this->active_workers_ = task_count - 1;
+            this->task_function_ = &function;
+            ++this->generation_;
+        }
+        this->condition_.notify_all();
+
+        const std::size_t main_worker = task_count - 1;
+        const auto [main_begin, main_end] = this->chunk_bounds(begin, end, task_count, main_worker);
+        function(main_begin, main_end);
+
+        std::unique_lock<std::mutex> lock(this->mutex_);
+        this->finished_.wait(lock, [this]() { return this->active_workers_ == 0; });
+        this->task_function_ = nullptr;
+    }
+
+private:
+    std::int32_t worker_count_ = 1;
+    std::vector<std::thread> threads_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    std::condition_variable finished_;
+    bool stopping_ = false;
+    std::uint64_t generation_ = 0;
+    std::size_t task_begin_ = 0;
+    std::size_t task_end_ = 0;
+    std::size_t task_count_ = 0;
+    std::size_t next_worker_index_ = 0;
+    std::size_t active_workers_ = 0;
+    const std::function<void(std::size_t, std::size_t)>* task_function_ = nullptr;
+
+    [[nodiscard]] static std::int32_t normalize_worker_count(std::int32_t requested_workers) {
+        if (requested_workers > 0) {
+            return requested_workers;
+        }
+        const unsigned int hardware_workers = std::thread::hardware_concurrency();
+        if (hardware_workers == 0) {
+            return 1;
+        }
+        const std::int32_t capped =
+            std::min<std::int32_t>(static_cast<std::int32_t>(hardware_workers),
+                                   LCQI_GPT2_MAX_AUTO_WORKERS);
+        return std::max(capped, 1);
+    }
+
+    [[nodiscard]] std::pair<std::size_t, std::size_t> chunk_bounds(
+        std::size_t begin,
+        std::size_t end,
+        std::size_t task_count,
+        std::size_t worker_index) const {
+        const std::size_t row_count = end - begin;
+        const std::size_t chunk_begin = begin + row_count * worker_index / task_count;
+        const std::size_t chunk_end = begin + row_count * (worker_index + 1) / task_count;
+        return {chunk_begin, chunk_end};
+    }
+
+    void worker_loop() {
+        std::uint64_t observed_generation = 0;
+        while (true) {
+            std::size_t worker_index = 0;
+            std::size_t begin = 0;
+            std::size_t end = 0;
+            const std::function<void(std::size_t, std::size_t)>* function = nullptr;
+            {
+                std::unique_lock<std::mutex> lock(this->mutex_);
+                this->condition_.wait(lock, [this, observed_generation]() {
+                    return this->stopping_ || this->generation_ != observed_generation;
+                });
+                if (this->stopping_) {
+                    return;
+                }
+                observed_generation = this->generation_;
+                if (this->task_function_ == nullptr ||
+                    this->next_worker_index_ >= this->task_count_ - 1) {
+                    continue;
+                }
+                worker_index = this->next_worker_index_;
+                ++this->next_worker_index_;
+                const auto bounds =
+                    this->chunk_bounds(this->task_begin_,
+                                       this->task_end_,
+                                       this->task_count_,
+                                       worker_index);
+                begin = bounds.first;
+                end = bounds.second;
+                function = this->task_function_;
+            }
+
+            (*function)(begin, end);
+
+            {
+                std::lock_guard<std::mutex> lock(this->mutex_);
+                --this->active_workers_;
+                if (this->active_workers_ == 0) {
+                    this->finished_.notify_one();
+                }
+            }
+        }
+    }
+};
+
+}  // namespace detail
+
+namespace {
 
 class JsonCursor {
 public:
@@ -528,6 +708,111 @@ void linear_f32_unchecked(const Gpt2LinearF32& linear,
     }
 }
 
+[[nodiscard]] bool should_parallelize_rows(const Gpt2ExecutionOptions& options,
+                                           std::size_t rows,
+                                           std::size_t columns,
+                                           const detail::Gpt2ParallelWorkerPool* worker_pool) {
+    if (worker_pool == nullptr || worker_pool->worker_count() <= 1) {
+        return false;
+    }
+    const std::int32_t min_rows =
+        options.parallel_min_rows > 0 ? options.parallel_min_rows
+                                      : LCQI_GPT2_DEFAULT_PARALLEL_MIN_ROWS;
+    if (rows < checked_size(min_rows, "parallel_min_rows")) {
+        return false;
+    }
+    if (options.worker_count > 1) {
+        return true;
+    }
+    return columns >= checked_size(LCQI_GPT2_PARALLEL_MIN_COLUMNS, "parallel_min_columns") ||
+           rows * columns >= static_cast<std::size_t>(LCQI_GPT2_PARALLEL_MIN_OPS);
+}
+
+[[nodiscard]] std::size_t parallel_row_grain(std::size_t rows,
+                                             const detail::Gpt2ParallelWorkerPool& worker_pool) {
+    const std::size_t workers = checked_size(worker_pool.worker_count(), "worker_count");
+    const std::size_t target_tasks = workers * LCQI_GPT2_PARALLEL_ROW_BLOCK_MULTIPLIER;
+    return std::max<std::size_t>(1, (rows + target_tasks - 1) / target_tasks);
+}
+
+[[nodiscard]] bool model_has_parallel_work(const Gpt2ReferenceModel& model,
+                                           const Gpt2ExecutionOptions& options) {
+    const std::size_t hidden_size = checked_size(model.config.hidden_size, "hidden_size");
+    const std::size_t vocab_size = checked_size(model.config.vocab_size, "vocab_size");
+    const std::size_t intermediate_size =
+        checked_size(model.config.intermediate_size, "intermediate_size");
+    const std::size_t qkv_rows =
+        checked_size(model.config.hidden_size * LCQI_GPT2_ATTENTION_PROJECTIONS,
+                     "qkv output rows");
+    const std::int32_t min_rows =
+        options.parallel_min_rows > 0 ? options.parallel_min_rows
+                                      : LCQI_GPT2_DEFAULT_PARALLEL_MIN_ROWS;
+    const auto large_enough = [min_rows](std::size_t rows, std::size_t columns) {
+        if (rows < checked_size(min_rows, "parallel_min_rows")) {
+            return false;
+        }
+        return columns >= checked_size(LCQI_GPT2_PARALLEL_MIN_COLUMNS,
+                                       "parallel_min_columns") ||
+               rows * columns >= static_cast<std::size_t>(LCQI_GPT2_PARALLEL_MIN_OPS);
+    };
+    if (options.worker_count > 1) {
+        return vocab_size >= checked_size(min_rows, "parallel_min_rows") ||
+               qkv_rows >= checked_size(min_rows, "parallel_min_rows") ||
+               intermediate_size >= checked_size(min_rows, "parallel_min_rows") ||
+               hidden_size >= checked_size(min_rows, "parallel_min_rows");
+    }
+    if (options.worker_count == 1) {
+        return false;
+    }
+    return large_enough(vocab_size, hidden_size) ||
+           large_enough(qkv_rows, hidden_size) ||
+           large_enough(hidden_size, hidden_size) ||
+           large_enough(intermediate_size, hidden_size) ||
+           large_enough(hidden_size, intermediate_size);
+}
+
+[[nodiscard]] std::unique_ptr<detail::Gpt2ParallelWorkerPool> make_worker_pool(
+    const Gpt2ReferenceModel& model,
+    const Gpt2ExecutionOptions& options) {
+    if (!model_has_parallel_work(model, options)) {
+        return nullptr;
+    }
+    return std::make_unique<detail::Gpt2ParallelWorkerPool>(options.worker_count);
+}
+
+void linear_f32_unchecked_parallel(const Gpt2LinearF32& linear,
+                                   std::span<const float> input,
+                                   std::span<float> output,
+                                   const Gpt2ExecutionOptions& options,
+                                   detail::Gpt2ParallelWorkerPool* worker_pool) {
+    const std::size_t input_size = static_cast<std::size_t>(linear.input_size);
+    const std::size_t output_size = static_cast<std::size_t>(linear.output_size);
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        linear_f32_unchecked(linear, input, output);
+        return;
+    }
+
+    const bool has_bias = !linear.bias.empty();
+    const float* weights = linear.weights.data();
+    const float* bias = linear.bias.data();
+    const float* input_data = input.data();
+    float* output_data = output.data();
+    const std::function<void(std::size_t, std::size_t)> rows_fn =
+        [input_size, has_bias, weights, bias, input_data, output_data](
+            std::size_t begin,
+            std::size_t end) {
+            for (std::size_t out = begin; out < end; ++out) {
+                float sum = has_bias ? bias[out] : 0.0F;
+                const float* row = weights + out * input_size;
+                for (std::size_t in = 0; in < input_size; ++in) {
+                    sum += row[in] * input_data[in];
+                }
+                output_data[out] = sum;
+            }
+        };
+    worker_pool->parallel_for_rows(0, output_size, parallel_row_grain(output_size, *worker_pool), rows_fn);
+}
+
 float gelu_new(float value) {
     const float cubic = value * value * value;
     return 0.5F * value *
@@ -577,8 +862,10 @@ void project_qkv_reuse_workspace(const Gpt2Config& config,
                                  std::span<float> packed,
                                  std::span<float> q,
                                  std::span<float> k,
-                                 std::span<float> v) {
-    linear_f32_unchecked(layer.c_attn, hidden, packed);
+                                 std::span<float> v,
+                                 const Gpt2ExecutionOptions& options,
+                                 detail::Gpt2ParallelWorkerPool* worker_pool) {
+    linear_f32_unchecked_parallel(layer.c_attn, hidden, packed, options, worker_pool);
     const std::size_t width = checked_size(config.hidden_size, "hidden_size");
     std::copy_n(packed.begin(), config.hidden_size, q.begin());
     std::copy_n(packed.begin() + static_cast<std::ptrdiff_t>(width),
@@ -712,7 +999,9 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
                                Gpt2KvCache& cache,
                                Gpt2ForwardWorkspace& workspace,
                                std::span<float> hidden,
-                               Gpt2HotspotProfile* hotspot_profile) {
+                               Gpt2HotspotProfile* hotspot_profile,
+                               const Gpt2ExecutionOptions& options,
+                               detail::Gpt2ParallelWorkerPool* worker_pool) {
     if (hotspot_profile != nullptr) {
         ++hotspot_profile->layer_steps;
     }
@@ -737,7 +1026,15 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::layer_norm_ms, start);
 
     start = profile_start(hotspot_profile);
-    project_qkv_reuse_workspace(config, layer, normed, qkv_packed, query, key, value);
+    project_qkv_reuse_workspace(config,
+                                layer,
+                                normed,
+                                qkv_packed,
+                                query,
+                                key,
+                                value,
+                                options,
+                                worker_pool);
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::qkv_projection_ms, start);
 
     start = profile_start(hotspot_profile);
@@ -754,7 +1051,7 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::attention_ms, start);
 
     start = profile_start(hotspot_profile);
-    linear_f32_unchecked(layer.c_proj, attention, projected);
+    linear_f32_unchecked_parallel(layer.c_proj, attention, projected, options, worker_pool);
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::attention_projection_ms, start);
 
     start = profile_start(hotspot_profile);
@@ -770,7 +1067,7 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::layer_norm_ms, start);
 
     start = profile_start(hotspot_profile);
-    linear_f32_unchecked(layer.c_fc, normed, mlp_fc);
+    linear_f32_unchecked_parallel(layer.c_fc, normed, mlp_fc, options, worker_pool);
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::mlp_fc_ms, start);
 
     start = profile_start(hotspot_profile);
@@ -780,7 +1077,7 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::gelu_ms, start);
 
     start = profile_start(hotspot_profile);
-    linear_f32_unchecked(layer.mlp_c_proj, mlp_fc, mlp_out);
+    linear_f32_unchecked_parallel(layer.mlp_c_proj, mlp_fc, mlp_out, options, worker_pool);
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::mlp_projection_ms, start);
 
     start = profile_start(hotspot_profile);
@@ -790,7 +1087,9 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
 
 void compute_logits(const Gpt2ReferenceModel& model,
                     std::span<const float> hidden,
-                    std::span<float> logits) {
+                    std::span<float> logits,
+                    const Gpt2ExecutionOptions& options,
+                    detail::Gpt2ParallelWorkerPool* worker_pool) {
     if (logits.size() != checked_size(model.config.vocab_size, "vocab_size")) {
         throw std::runtime_error("GPT-2 logits size mismatch");
     }
@@ -801,18 +1100,67 @@ void compute_logits(const Gpt2ReferenceModel& model,
     const std::size_t vocab_size = checked_size(model.config.vocab_size, "vocab_size");
     const float* weight_data = weight.data();
     const float* hidden_data = hidden.data();
-    for (std::size_t token = 0; token < vocab_size; ++token) {
+    const std::function<void(std::size_t, std::size_t)> rows_fn =
+        [hidden_size, weight_data, hidden_data, logits_data = logits.data()](
+            std::size_t begin,
+            std::size_t end) {
+            for (std::size_t token = begin; token < end; ++token) {
+                float sum = 0.0F;
+                const float* row = weight_data + token * hidden_size;
+                for (std::size_t dim = 0; dim < hidden_size; ++dim) {
+                    sum += row[dim] * hidden_data[dim];
+                }
+                logits_data[token] = sum;
+            }
+        };
+    if (should_parallelize_rows(options, vocab_size, hidden_size, worker_pool)) {
+        worker_pool->parallel_for_rows(0,
+                                       vocab_size,
+                                       parallel_row_grain(vocab_size, *worker_pool),
+                                       rows_fn);
+    } else {
+        rows_fn(0, vocab_size);
+    }
+}
+
+void compute_logits(const Gpt2ReferenceModel& model,
+                    std::span<const float> hidden,
+                    std::span<float> logits) {
+    Gpt2ExecutionOptions options;
+    options.worker_count = 1;
+    compute_logits(model, hidden, logits, options, nullptr);
+}
+
+struct Gpt2TokenScore {
+    std::int32_t token = 0;
+    float value = -std::numeric_limits<float>::infinity();
+};
+
+[[nodiscard]] Gpt2TokenScore compute_predicted_token_range(const float* weight_data,
+                                                           const float* hidden_data,
+                                                           std::size_t hidden_size,
+                                                           std::size_t begin,
+                                                           std::size_t end) {
+    Gpt2TokenScore best;
+    best.token = static_cast<std::int32_t>(begin);
+    for (std::size_t token = begin; token < end; ++token) {
         float sum = 0.0F;
         const float* row = weight_data + token * hidden_size;
         for (std::size_t dim = 0; dim < hidden_size; ++dim) {
             sum += row[dim] * hidden_data[dim];
         }
-        logits[token] = sum;
+        if (token == begin || sum > best.value) {
+            best.value = sum;
+            best.token = static_cast<std::int32_t>(token);
+        }
     }
+    return best;
 }
 
 std::int32_t compute_predicted_token(const Gpt2ReferenceModel& model,
-                                     std::span<const float> hidden) {
+                                     std::span<const float> hidden,
+                                     const Gpt2ExecutionOptions& options,
+                                     detail::Gpt2ParallelWorkerPool* worker_pool) {
     const std::span<const float> weight =
         model.tie_lm_head_to_embedding ? std::span<const float>(model.token_embedding)
                                        : std::span<const float>(model.lm_head_weight);
@@ -820,20 +1168,38 @@ std::int32_t compute_predicted_token(const Gpt2ReferenceModel& model,
     const std::size_t vocab_size = checked_size(model.config.vocab_size, "vocab_size");
     const float* weight_data = weight.data();
     const float* hidden_data = hidden.data();
-    std::int32_t best_token = 0;
-    float best_value = -std::numeric_limits<float>::infinity();
-    for (std::size_t token = 0; token < vocab_size; ++token) {
-        float sum = 0.0F;
-        const float* row = weight_data + token * hidden_size;
-        for (std::size_t dim = 0; dim < hidden_size; ++dim) {
-            sum += row[dim] * hidden_data[dim];
-        }
-        if (token == 0 || sum > best_value) {
-            best_value = sum;
-            best_token = static_cast<std::int32_t>(token);
+    if (!should_parallelize_rows(options, vocab_size, hidden_size, worker_pool)) {
+        return compute_predicted_token_range(weight_data, hidden_data, hidden_size, 0, vocab_size)
+            .token;
+    }
+
+    const std::size_t worker_count = checked_size(worker_pool->worker_count(), "worker_count");
+    const std::size_t chunk_count = std::min(worker_count, vocab_size);
+    std::vector<Gpt2TokenScore> partials(chunk_count);
+    const std::function<void(std::size_t, std::size_t)> rows_fn =
+        [chunk_count, hidden_size, vocab_size, weight_data, hidden_data, &partials](
+            std::size_t begin,
+            std::size_t end) {
+            for (std::size_t chunk = begin; chunk < end; ++chunk) {
+                const std::size_t token_begin = vocab_size * chunk / chunk_count;
+                const std::size_t token_end = vocab_size * (chunk + 1) / chunk_count;
+                partials[chunk] = compute_predicted_token_range(
+                    weight_data,
+                    hidden_data,
+                    hidden_size,
+                    token_begin,
+                    token_end);
+            }
+        };
+    worker_pool->parallel_for_rows(0, chunk_count, 1, rows_fn);
+
+    Gpt2TokenScore best = partials.front();
+    for (std::size_t index = 1; index < partials.size(); ++index) {
+        if (partials[index].value > best.value) {
+            best = partials[index];
         }
     }
-    return best_token;
+    return best.token;
 }
 
 Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model,
@@ -841,7 +1207,9 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
                                                  Gpt2ForwardWorkspace& workspace,
                                                  std::int32_t token_id,
                                                  bool need_logits,
-                                                 Gpt2HotspotProfile* hotspot_profile) {
+                                                 Gpt2HotspotProfile* hotspot_profile,
+                                                 const Gpt2ExecutionOptions& options,
+                                                 detail::Gpt2ParallelWorkerPool* worker_pool) {
     const Gpt2ProfileClock::time_point step_start = profile_start(hotspot_profile);
     if (hotspot_profile != nullptr) {
         ++hotspot_profile->decoder_steps;
@@ -876,7 +1244,9 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
                                   cache,
                                   workspace,
                                   hidden,
-                                  hotspot_profile);
+                                  hotspot_profile,
+                                  options,
+                                  worker_pool);
     }
 
     std::span<float> normed = workspace.normed();
@@ -892,7 +1262,7 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
     if (need_logits) {
         std::span<float> logits = workspace.logits();
         start = profile_start(hotspot_profile);
-        compute_logits(model, normed, logits);
+        compute_logits(model, normed, logits, options, worker_pool);
         add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::lm_head_ms, start);
         start = profile_start(hotspot_profile);
         result.logits.assign(logits.begin(), logits.end());
@@ -900,7 +1270,7 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
         add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::logits_result_ms, start);
     } else {
         start = profile_start(hotspot_profile);
-        result.predicted_token = compute_predicted_token(model, normed);
+        result.predicted_token = compute_predicted_token(model, normed, options, worker_pool);
         add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::lm_head_ms, start);
     }
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::total_step_ms, step_start);
@@ -1835,12 +2205,28 @@ Gpt2CachedGreedyDecoder::Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model
 Gpt2CachedGreedyDecoder::Gpt2CachedGreedyDecoder(
     const Gpt2ReferenceModel& model,
     Gpt2HotspotProfile* hotspot_profile)
+    : Gpt2CachedGreedyDecoder(model, hotspot_profile, Gpt2ExecutionOptions{}) {}
+
+Gpt2CachedGreedyDecoder::Gpt2CachedGreedyDecoder(
+    const Gpt2ReferenceModel& model,
+    Gpt2HotspotProfile* hotspot_profile,
+    const Gpt2ExecutionOptions& execution_options)
     : model_(&model),
       hotspot_profile_(hotspot_profile),
+      execution_options_(execution_options),
       cache_(model.config),
-      workspace_(model.config) {
+      workspace_(model.config),
+      worker_pool_(make_worker_pool(model, execution_options)) {
     validate_model(*this->model_);
 }
+
+Gpt2CachedGreedyDecoder::~Gpt2CachedGreedyDecoder() = default;
+
+Gpt2CachedGreedyDecoder::Gpt2CachedGreedyDecoder(Gpt2CachedGreedyDecoder&&) noexcept =
+    default;
+
+Gpt2CachedGreedyDecoder& Gpt2CachedGreedyDecoder::operator=(
+    Gpt2CachedGreedyDecoder&&) noexcept = default;
 
 std::int32_t Gpt2CachedGreedyDecoder::step(std::int32_t token_id) {
     return run_gpt2_cached_step_unchecked(*this->model_,
@@ -1848,7 +2234,9 @@ std::int32_t Gpt2CachedGreedyDecoder::step(std::int32_t token_id) {
                                           this->workspace_,
                                           token_id,
                                           false,
-                                          this->hotspot_profile_)
+                                          this->hotspot_profile_,
+                                          this->execution_options_,
+                                          this->worker_pool_.get())
         .predicted_token;
 }
 
@@ -1858,7 +2246,9 @@ Gpt2ForwardResult Gpt2CachedGreedyDecoder::step_with_logits(std::int32_t token_i
                                           this->workspace_,
                                           token_id,
                                           true,
-                                          this->hotspot_profile_);
+                                          this->hotspot_profile_,
+                                          this->execution_options_,
+                                          this->worker_pool_.get());
 }
 
 const Gpt2KvCache& Gpt2CachedGreedyDecoder::cache() const noexcept {
@@ -1871,6 +2261,10 @@ std::int32_t Gpt2CachedGreedyDecoder::filled_tokens() const noexcept {
 
 std::size_t Gpt2CachedGreedyDecoder::kv_cache_bytes() const noexcept {
     return this->cache_.byte_size();
+}
+
+std::int32_t Gpt2CachedGreedyDecoder::worker_count() const noexcept {
+    return this->worker_pool_ == nullptr ? 1 : this->worker_pool_->worker_count();
 }
 
 Gpt2ForwardResult run_gpt2_forward(const Gpt2ReferenceModel& model,
@@ -1929,7 +2323,17 @@ Gpt2ForwardResult run_gpt2_forward_cached(const Gpt2ReferenceModel& model,
                                           std::int32_t token_id) {
     validate_model(model);
     Gpt2ForwardWorkspace workspace(model.config);
-    return run_gpt2_cached_step_unchecked(model, cache, workspace, token_id, true, nullptr);
+    Gpt2ExecutionOptions options;
+    options.worker_count = 1;
+    return run_gpt2_cached_step_unchecked(
+        model,
+        cache,
+        workspace,
+        token_id,
+        true,
+        nullptr,
+        options,
+        nullptr);
 }
 
 std::vector<std::int32_t> gpt2_generate_greedy(const Gpt2ReferenceModel& model,

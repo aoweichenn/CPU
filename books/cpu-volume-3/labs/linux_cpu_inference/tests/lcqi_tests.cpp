@@ -536,6 +536,26 @@ void test_gpt2_tiny_forward_and_generation() {
                       "optimized cached GPT-2 logit mismatch");
     }
 
+    lcqi::Gpt2ExecutionOptions parallel_options;
+    parallel_options.worker_count = 2;
+    parallel_options.parallel_min_rows = 1;
+    lcqi::Gpt2CachedGreedyDecoder parallel_decoder(model, nullptr, parallel_options);
+    lcqi::Gpt2ForwardResult parallel_result;
+    for (const std::int32_t token : tokens) {
+        parallel_result = parallel_decoder.step_with_logits(token);
+    }
+    require(parallel_decoder.worker_count() == parallel_options.worker_count,
+            "parallel GPT-2 decoder worker count mismatch");
+    require(parallel_result.predicted_token == result.predicted_token,
+            "parallel cached GPT-2 predicted token mismatch");
+    require(parallel_result.logits.size() == result.logits.size(),
+            "parallel cached GPT-2 logits size mismatch");
+    for (std::size_t index = 0; index < result.logits.size(); ++index) {
+        require_close(parallel_result.logits[index],
+                      result.logits[index],
+                      "parallel cached GPT-2 logit mismatch");
+    }
+
     lcqi::Gpt2CachedGreedyDecoder greedy_decoder(model);
     std::int32_t greedy_predicted = 0;
     for (const std::int32_t token : tokens) {

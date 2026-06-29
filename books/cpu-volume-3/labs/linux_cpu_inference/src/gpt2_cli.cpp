@@ -32,6 +32,7 @@ struct Gpt2CliOptions {
     std::filesystem::path model_dir;
     std::string prompt;
     std::int32_t max_new_tokens = LCQI_GPT2_DEFAULT_MAX_NEW_TOKENS;
+    std::int32_t worker_count = 0;
 };
 
 struct Gpt2BenchmarkTimings {
@@ -44,6 +45,7 @@ struct Gpt2BenchmarkTimings {
     std::size_t prefill_steps = 0;
     std::size_t decode_steps = 0;
     std::size_t kv_cache_bytes = 0;
+    std::int32_t worker_count = 1;
 };
 
 using Clock = std::chrono::steady_clock;
@@ -115,6 +117,15 @@ void print_ids(std::span<const std::int32_t> ids) {
             options.engine = parse_engine(argv[index]);
         } else if (arg.rfind("--engine=", 0) == 0) {
             options.engine = parse_engine(std::string_view(arg).substr(std::string("--engine=").size()));
+        } else if (arg == "--threads") {
+            if (index + 1 >= argc) {
+                throw std::runtime_error("--threads requires a value");
+            }
+            ++index;
+            options.worker_count = parse_non_negative_i32(argv[index], "--threads");
+        } else if (arg.rfind("--threads=", 0) == 0) {
+            options.worker_count =
+                parse_non_negative_i32(arg.substr(std::string("--threads=").size()), "--threads");
         } else if (arg == "--full") {
             options.engine = Gpt2EngineMode::full_prefix;
         } else if (arg == "--cached") {
@@ -128,7 +139,7 @@ void print_ids(std::span<const std::int32_t> ids) {
 
     if (positional.size() < 2 || positional.size() > 3) {
         throw std::runtime_error(
-            "usage: lcqi_gpt2 [--engine cached|full] [--benchmark] "
+            "usage: lcqi_gpt2 [--engine cached|full] [--threads N] [--benchmark] "
             "model_dir prompt [max_new_tokens]");
     }
     options.model_dir = positional[0];
@@ -168,12 +179,16 @@ void print_ids(std::span<const std::int32_t> ids) {
     std::span<const std::int32_t> prompt_ids,
     std::int32_t max_new_tokens,
     Gpt2BenchmarkTimings& timings,
-    lcqi::Gpt2HotspotProfile* hotspot_profile) {
+    lcqi::Gpt2HotspotProfile* hotspot_profile,
+    std::int32_t worker_count) {
     if (prompt_ids.empty()) {
         throw std::runtime_error("GPT-2 generation needs at least one prompt token");
     }
-    lcqi::Gpt2CachedGreedyDecoder decoder(model, hotspot_profile);
+    lcqi::Gpt2ExecutionOptions execution_options;
+    execution_options.worker_count = worker_count;
+    lcqi::Gpt2CachedGreedyDecoder decoder(model, hotspot_profile, execution_options);
     timings.kv_cache_bytes = decoder.kv_cache_bytes();
+    timings.worker_count = decoder.worker_count();
     std::vector<std::int32_t> tokens(prompt_ids.begin(), prompt_ids.end());
     if (max_new_tokens == 0) {
         return tokens;
@@ -231,6 +246,7 @@ void print_benchmark(const Gpt2BenchmarkTimings& timings,
     std::cout << "benchmark_generated_tokens " << generated_tokens << "\n";
     std::cout << "benchmark_prefill_steps " << timings.prefill_steps << "\n";
     std::cout << "benchmark_decode_steps " << timings.decode_steps << "\n";
+    std::cout << "benchmark_worker_count " << timings.worker_count << "\n";
     std::cout << "benchmark_generate_tokens_per_second "
               << generated_tokens_per_second << "\n";
     std::cout << "benchmark_decode_tokens_per_second "
@@ -291,7 +307,7 @@ int run_tiny_mode() {
 int run_real_model_mode(int argc, char** argv) {
     if (argc < LCQI_GPT2_MIN_REAL_ARGC) {
         throw std::runtime_error(
-            "usage: lcqi_gpt2 [--engine cached|full] [--benchmark] "
+            "usage: lcqi_gpt2 [--engine cached|full] [--threads N] [--benchmark] "
             "model_dir prompt [max_new_tokens]");
     }
     const Clock::time_point total_start = Clock::now();
@@ -323,7 +339,8 @@ int run_real_model_mode(int argc, char** argv) {
                                     prompt_ids,
                                     options.max_new_tokens,
                                     timings,
-                                    options.profile_hotspots ? &hotspot_profile : nullptr);
+                                    options.profile_hotspots ? &hotspot_profile : nullptr,
+                                    options.worker_count);
     }
     timings.total_ms = elapsed_ms(total_start, Clock::now());
 

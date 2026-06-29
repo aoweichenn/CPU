@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -76,9 +77,16 @@ struct Gpt2HotspotProfile {
     double logits_result_ms = 0.0;
 };
 
+struct Gpt2ExecutionOptions {
+    std::int32_t worker_count = 0;
+    std::int32_t parallel_min_rows = 512;
+};
+
 class Gpt2KvCache;
 
 namespace detail {
+class Gpt2ParallelWorkerPool;
+
 void attend_cached_position(const Gpt2KvCache& cache,
                             std::int32_t layer_id,
                             std::int32_t model_position,
@@ -180,23 +188,30 @@ public:
     explicit Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model);
     Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model,
                             Gpt2HotspotProfile* hotspot_profile);
+    Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model,
+                            Gpt2HotspotProfile* hotspot_profile,
+                            const Gpt2ExecutionOptions& execution_options);
+    ~Gpt2CachedGreedyDecoder();
 
     Gpt2CachedGreedyDecoder(const Gpt2CachedGreedyDecoder&) = delete;
     Gpt2CachedGreedyDecoder& operator=(const Gpt2CachedGreedyDecoder&) = delete;
-    Gpt2CachedGreedyDecoder(Gpt2CachedGreedyDecoder&&) noexcept = default;
-    Gpt2CachedGreedyDecoder& operator=(Gpt2CachedGreedyDecoder&&) noexcept = default;
+    Gpt2CachedGreedyDecoder(Gpt2CachedGreedyDecoder&&) noexcept;
+    Gpt2CachedGreedyDecoder& operator=(Gpt2CachedGreedyDecoder&&) noexcept;
 
     [[nodiscard]] std::int32_t step(std::int32_t token_id);
     [[nodiscard]] Gpt2ForwardResult step_with_logits(std::int32_t token_id);
     [[nodiscard]] const Gpt2KvCache& cache() const noexcept;
     [[nodiscard]] std::int32_t filled_tokens() const noexcept;
     [[nodiscard]] std::size_t kv_cache_bytes() const noexcept;
+    [[nodiscard]] std::int32_t worker_count() const noexcept;
 
 private:
     const Gpt2ReferenceModel* model_;
     Gpt2HotspotProfile* hotspot_profile_;
+    Gpt2ExecutionOptions execution_options_;
     Gpt2KvCache cache_;
     Gpt2ForwardWorkspace workspace_;
+    std::unique_ptr<detail::Gpt2ParallelWorkerPool> worker_pool_;
 };
 
 struct Gpt2Tokenizer {

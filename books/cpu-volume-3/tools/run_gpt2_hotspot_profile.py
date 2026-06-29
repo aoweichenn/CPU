@@ -146,6 +146,7 @@ def parse_stdout(stdout: str) -> tuple[dict[str, float], str]:
             generated_text = value
     required = {
         "benchmark_generate_ms",
+        "benchmark_worker_count",
         "hotspot_total_step_ms",
         "hotspot_lm_head_pct",
         "hotspot_mlp_fc_pct",
@@ -168,6 +169,7 @@ def run_sample(
     prompt: str,
     max_new_tokens: int,
     round_id: int,
+    threads: int,
     timeout_seconds: int,
 ) -> HotspotSample:
     completed = run_command(
@@ -176,6 +178,8 @@ def run_sample(
             "--profile-hotspots",
             "--engine",
             "cached",
+            "--threads",
+            str(threads),
             str(model_dir),
             prompt,
             str(max_new_tokens),
@@ -201,6 +205,7 @@ def summarize(samples: list[HotspotSample]) -> list[str]:
         "benchmark_generate_tokens_per_second",
         "benchmark_decode_tokens_per_second",
         "hotspot_total_step_ms",
+        "benchmark_worker_count",
         "hotspot_lm_head_pct",
         "hotspot_mlp_fc_pct",
         "hotspot_mlp_projection_pct",
@@ -233,6 +238,7 @@ def write_report(
     prompt: str,
     token_counts: list[int],
     rounds: int,
+    threads: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -243,6 +249,7 @@ def write_report(
         f"prompt={prompt}",
         f"token_counts={','.join(str(value) for value in token_counts)}",
         f"rounds={rounds}",
+        f"requested_threads={threads}",
         "engine=cached",
         "build=CMAKE_BUILD_TYPE=Release through books/cpu-volume-3-practice",
         "",
@@ -273,6 +280,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--token-counts", default=DEFAULT_TOKEN_COUNTS)
     parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
+    parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=DEFAULT_BUILD_JOBS)
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     return parser.parse_args()
@@ -282,6 +290,9 @@ def main() -> int:
     args = parse_args()
     if args.rounds <= 0:
         print("[lcqi-hotspot] --rounds must be positive")
+        return 1
+    if args.threads < 0:
+        print("[lcqi-hotspot] --threads cannot be negative")
         return 1
     if not args.model_dir.exists():
         print(f"[lcqi-hotspot] model directory not found: {args.model_dir}")
@@ -297,12 +308,14 @@ def main() -> int:
                 prompt=args.prompt,
                 max_new_tokens=token_count,
                 round_id=round_id,
+                threads=args.threads,
                 timeout_seconds=args.timeout_seconds,
             )
             samples.append(sample)
             print(
                 f"round={round_id} max_new_tokens={token_count} "
                 f"generate_ms={sample.metrics['benchmark_generate_ms']:.3f} "
+                f"workers={sample.metrics['benchmark_worker_count']:.0f} "
                 f"lm_head_pct={sample.metrics['hotspot_lm_head_pct']:.3f} "
                 f"mlp_pct={sample.metrics['hotspot_mlp_fc_pct'] + sample.metrics['hotspot_mlp_projection_pct']:.3f}"
             )
@@ -313,6 +326,7 @@ def main() -> int:
         prompt=args.prompt,
         token_counts=token_counts,
         rounds=args.rounds,
+        threads=args.threads,
     )
     print(f"report={args.report}")
     return 0

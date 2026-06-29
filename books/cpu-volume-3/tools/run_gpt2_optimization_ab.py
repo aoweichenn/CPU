@@ -23,6 +23,7 @@ METRIC_KEYS = [
     "benchmark_prefill_ms",
     "benchmark_decode_ms",
     "benchmark_generate_ms",
+    "benchmark_worker_count",
     "benchmark_generate_tokens_per_second",
     "benchmark_decode_tokens_per_second",
 ]
@@ -155,6 +156,7 @@ def parse_metrics(stdout: str) -> tuple[dict[str, float], str]:
             metrics[key] = float(value)
         elif key == "generated_text":
             generated_text = value
+    metrics.setdefault("benchmark_worker_count", 1.0)
     missing = sorted(set(METRIC_KEYS) - metrics.keys())
     if missing:
         raise RuntimeError(f"missing benchmark metrics: {missing}")
@@ -170,18 +172,24 @@ def run_sample(
     model_dir: Path,
     prompt: str,
     max_new_tokens: int,
+    threads: int,
     timeout_seconds: int,
 ) -> RunSample:
+    command = [
+        str(binary),
+        "--benchmark",
+        "--engine",
+        engine,
+    ]
+    if variant == "current":
+        command.extend(["--threads", str(threads)])
+    command.extend([
+        str(model_dir),
+        prompt,
+        str(max_new_tokens),
+    ])
     completed = run_command(
-        [
-            str(binary),
-            "--benchmark",
-            "--engine",
-            engine,
-            str(model_dir),
-            prompt,
-            str(max_new_tokens),
-        ],
+        command,
         cwd=repo_dir(),
         timeout_seconds=timeout_seconds,
     )
@@ -231,6 +239,7 @@ def write_report(
     prompt: str,
     max_new_tokens: int,
     rounds: int,
+    current_threads: int,
 ) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     lines = [
@@ -244,6 +253,8 @@ def write_report(
         f"prompt={prompt}",
         f"max_new_tokens={max_new_tokens}",
         f"rounds={rounds}",
+        f"baseline_threads=1",
+        f"current_threads={current_threads}",
         "",
         "scope=Both variants are built through books/cpu-volume-3-practice with "
         "CMAKE_BUILD_TYPE=Release and run on the same GPT-2 F32 safetensors model. "
@@ -275,6 +286,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prompt", default=DEFAULT_PROMPT)
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--rounds", type=int, default=DEFAULT_ROUNDS)
+    parser.add_argument("--threads", type=int, default=0)
     parser.add_argument("--jobs", type=int, default=DEFAULT_BUILD_JOBS)
     parser.add_argument("--timeout-seconds", type=int, default=DEFAULT_TIMEOUT_SECONDS)
     return parser.parse_args()
@@ -287,6 +299,9 @@ def main() -> int:
         return 1
     if args.max_new_tokens < 0:
         print("[lcqi-ab] --max-new-tokens cannot be negative", file=sys.stderr)
+        return 1
+    if args.threads < 0:
+        print("[lcqi-ab] --threads cannot be negative", file=sys.stderr)
         return 1
     if not args.model_dir.exists():
         print(f"[lcqi-ab] model directory not found: {args.model_dir}", file=sys.stderr)
@@ -336,12 +351,14 @@ def main() -> int:
                             model_dir=args.model_dir,
                             prompt=args.prompt,
                             max_new_tokens=args.max_new_tokens,
+                            threads=1 if variant == "baseline" else args.threads,
                             timeout_seconds=args.timeout_seconds,
                         )
                         samples.append(sample)
                         print(
                             f"round={round_id} variant={variant} engine={engine} "
                             f"generate_ms={sample.metrics['benchmark_generate_ms']:.3f} "
+                            f"workers={sample.metrics['benchmark_worker_count']:.0f} "
                             f"gen_tps={sample.metrics['benchmark_generate_tokens_per_second']:.5f}"
                         )
             write_report(
@@ -353,6 +370,7 @@ def main() -> int:
                 prompt=args.prompt,
                 max_new_tokens=args.max_new_tokens,
                 rounds=args.rounds,
+                current_threads=args.threads,
             )
         finally:
             subprocess.run(
