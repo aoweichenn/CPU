@@ -156,6 +156,22 @@ make books-export
 
 该命令会重新构建各本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
 
+整理手机导出目录：
+
+```bash
+make phone-export-organize
+```
+
+手机目录使用 `/mnt/sdcard/STU/BOOKS/按卷类型/{原理卷,实践卷,代码卷}/书名/` 保存真实 PDF/EPUB；`按内容领域/` 只保存 Markdown 索引说明，不复制书文件，也不生成 `.txt` 索引，避免微信读书把同一本书或目录说明扫描成多份。
+
+直接导出到手机：
+
+```bash
+make phone-books-export
+```
+
+该命令会把每本书复制到分类后的手机目录，并在复制后重新生成手机索引。
+
 生成并测试第三册实践卷：
 
 ```bash
