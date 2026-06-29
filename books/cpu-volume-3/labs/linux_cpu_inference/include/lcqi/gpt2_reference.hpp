@@ -57,6 +57,25 @@ struct Gpt2ForwardResult {
     std::int32_t predicted_token = 0;
 };
 
+struct Gpt2HotspotProfile {
+    std::int64_t decoder_steps = 0;
+    std::int64_t layer_steps = 0;
+    double total_step_ms = 0.0;
+    double embedding_ms = 0.0;
+    double layer_norm_ms = 0.0;
+    double final_norm_ms = 0.0;
+    double qkv_projection_ms = 0.0;
+    double kv_append_ms = 0.0;
+    double attention_ms = 0.0;
+    double attention_projection_ms = 0.0;
+    double residual_add_ms = 0.0;
+    double mlp_fc_ms = 0.0;
+    double gelu_ms = 0.0;
+    double mlp_projection_ms = 0.0;
+    double lm_head_ms = 0.0;
+    double logits_result_ms = 0.0;
+};
+
 class Gpt2KvCache;
 
 namespace detail {
@@ -159,6 +178,8 @@ private:
 class Gpt2CachedGreedyDecoder {
 public:
     explicit Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model);
+    Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model,
+                            Gpt2HotspotProfile* hotspot_profile);
 
     Gpt2CachedGreedyDecoder(const Gpt2CachedGreedyDecoder&) = delete;
     Gpt2CachedGreedyDecoder& operator=(const Gpt2CachedGreedyDecoder&) = delete;
@@ -173,6 +194,7 @@ public:
 
 private:
     const Gpt2ReferenceModel* model_;
+    Gpt2HotspotProfile* hotspot_profile_;
     Gpt2KvCache cache_;
     Gpt2ForwardWorkspace workspace_;
 };

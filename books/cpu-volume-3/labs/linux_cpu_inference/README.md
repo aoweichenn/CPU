@@ -99,7 +99,9 @@ GPT-2 自研 reference smoke：
 books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_gpt2
 make cpu3-gpt2-smoke
 make cpu3-gpt2-benchmark-compare
+make cpu3-gpt2-hotspot-profile
 python3 books/cpu-volume-3/tools/run_gpt2_optimization_ab.py --rounds 3
+python3 books/cpu-volume-3/tools/run_gpt2_hotspot_profile.py --token-counts 4,16 --rounds 3
 ```
 
 第一条命令不需要下载模型，直接运行仓库内 tiny GPT-2 fixture，输出固定 prompt ids、logits、predicted token 和 greedy generated ids。`lcqi_tests` 会覆盖 tiny GPT-2 forward/generation、byte-level BPE 编码解码、F32/F16/BF16 safetensors 读取、HuggingFace 风格 tiny GPT-2 checkpoint 加载和坏 shape 拒绝。
@@ -147,6 +149,8 @@ books/cpu-volume-3/results/lcqi-gpt2-optimization-ab.txt
 ```
 
 这个 A/B 报告专门回答“当前 LCQI 代码相对指定 baseline 改快了吗”。脚本默认 baseline 是 `4febf3f`，会临时创建 baseline worktree，分别构建 baseline 和当前工作区的 Release `lcqi_gpt2`，再多轮运行同一条 prompt。最近一次 2 轮 smoke 摘要保存在 `books/cpu-volume-3/reports/lcqi-gpt2-optimization-ab-summary.md`：cached-KV 的生成阶段中位数从 baseline `847.353 ms` 降到 current `764.604 ms`，生成吞吐从 `4.85652 token/s` 到 `5.23178 token/s`；full-prefix 中位数基本在 `1.8 s` 左右波动，不是这轮优化的目标。端到端 GPT-2 数字受调度、温度和共享机器状态影响很大，因此正式结论必须看多轮中位数、min/max 和生成文本一致性，不能只挑一次最快结果。
+
+`run_gpt2_hotspot_profile.py` 专门回答“现在热点到底在哪”。它通过 `--profile-hotspots` 打开 cached decode 内部计时，字段包括 `hotspot_lm_head_pct`、`hotspot_mlp_fc_pct`、`hotspot_mlp_projection_pct`、`hotspot_qkv_projection_pct` 和 `hotspot_attention_pct`。`caw` 上的 3 轮 Release profile 摘要保存在 `books/cpu-volume-3/reports/lcqi-gpt2-hotspot-profile-summary.md`，原始报告保存在 `books/cpu-volume-3/reports/lcqi-gpt2-hotspot-profile-caw.txt`。关键结论是：4 token 与 16 token 两个口径下，`lm_head` 中位数约 `30.2%`，MLP 两个线性投影合计约 `46%`，QKV 投影约 `17%`，cached attention 本体只有 `0.06%` 到 `0.11%`。所以当前短上下文 GPT-2 的慢点不是 KV attention，而是标量 F32 matvec 和 `50257 x 768` vocab 扫描。
 
 当前优化点集中在 cached-KV generation：`Gpt2CachedGreedyDecoder` 把模型级 shape validation、KV cache 和临时 workspace 的生命周期提升到整段生成；`Gpt2ForwardWorkspace` 复用 hidden、normed、Q/K/V、packed QKV、attention、MLP、scores 和 logits 缓冲区；生成路径只需要 greedy token 时走 logits-free argmax，避免把完整 logits vector 作为 API 结果反复分配；KV cache 的 checked public API 仍保留，内部 cached attention 在一次边界校验后使用私有 unchecked span 扫描热路径。它提升的是分配次数、重复校验和 hot loop 地址计算，不改变 GPT-2 数学语义。
 

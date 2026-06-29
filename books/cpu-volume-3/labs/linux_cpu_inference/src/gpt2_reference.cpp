@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
@@ -43,6 +44,8 @@ constexpr float LCQI_GPT2_GELU_SQRT_2_OVER_PI = 0.7978845608028654F;
 constexpr float LCQI_GPT2_GELU_CUBIC_COEFF = 0.044715F;
 constexpr float LCQI_GPT2_SOFTMAX_NEGATIVE_INFINITY =
     -std::numeric_limits<float>::infinity();
+
+using Gpt2ProfileClock = std::chrono::steady_clock;
 
 class JsonCursor {
 public:
@@ -376,6 +379,23 @@ std::size_t matrix_size(std::int32_t rows, std::int32_t columns) {
     return checked_size(rows, "rows") * checked_size(columns, "columns");
 }
 
+Gpt2ProfileClock::time_point profile_start(const Gpt2HotspotProfile* profile) {
+    if (profile == nullptr) {
+        return Gpt2ProfileClock::time_point{};
+    }
+    return Gpt2ProfileClock::now();
+}
+
+void add_profile_ms(Gpt2HotspotProfile* profile,
+                    double Gpt2HotspotProfile::*field,
+                    Gpt2ProfileClock::time_point start) {
+    if (profile == nullptr) {
+        return;
+    }
+    (*profile).*field +=
+        std::chrono::duration<double, std::milli>(Gpt2ProfileClock::now() - start).count();
+}
+
 void validate_vector_size(std::size_t actual, std::int32_t expected, const char* name) {
     if (actual != checked_size(expected, name)) {
         throw std::runtime_error(std::string(name) + " size mismatch");
@@ -691,7 +711,11 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
                                std::int32_t model_position,
                                Gpt2KvCache& cache,
                                Gpt2ForwardWorkspace& workspace,
-                               std::span<float> hidden) {
+                               std::span<float> hidden,
+                               Gpt2HotspotProfile* hotspot_profile) {
+    if (hotspot_profile != nullptr) {
+        ++hotspot_profile->layer_steps;
+    }
     std::span<float> normed = workspace.normed();
     std::span<float> query = workspace.query();
     std::span<float> key = workspace.key();
@@ -703,34 +727,65 @@ void forward_gpt2_layer_cached(const Gpt2Config& config,
     std::span<float> mlp_out = workspace.mlp_out();
     std::span<float> scores = workspace.scores_prefix(model_position + 1);
 
+    Gpt2ProfileClock::time_point start =
+        profile_start(hotspot_profile);
     layer_norm(hidden,
                layer.ln_1_weight,
                layer.ln_1_bias,
                config.layer_norm_epsilon,
                normed);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::layer_norm_ms, start);
+
+    start = profile_start(hotspot_profile);
     project_qkv_reuse_workspace(config, layer, normed, qkv_packed, query, key, value);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::qkv_projection_ms, start);
+
+    start = profile_start(hotspot_profile);
     cache.append(layer_id, model_position, key, value);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::kv_append_ms, start);
+
+    start = profile_start(hotspot_profile);
     detail::attend_cached_position(cache,
                                    layer_id,
                                    model_position,
                                    query,
                                    scores,
                                    attention);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::attention_ms, start);
 
+    start = profile_start(hotspot_profile);
     linear_f32_unchecked(layer.c_proj, attention, projected);
-    add_inplace(hidden, projected);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::attention_projection_ms, start);
 
+    start = profile_start(hotspot_profile);
+    add_inplace(hidden, projected);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::residual_add_ms, start);
+
+    start = profile_start(hotspot_profile);
     layer_norm(hidden,
                layer.ln_2_weight,
                layer.ln_2_bias,
                config.layer_norm_epsilon,
                normed);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::layer_norm_ms, start);
+
+    start = profile_start(hotspot_profile);
     linear_f32_unchecked(layer.c_fc, normed, mlp_fc);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::mlp_fc_ms, start);
+
+    start = profile_start(hotspot_profile);
     for (float& value_ref : mlp_fc) {
         value_ref = gelu_new(value_ref);
     }
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::gelu_ms, start);
+
+    start = profile_start(hotspot_profile);
     linear_f32_unchecked(layer.mlp_c_proj, mlp_fc, mlp_out);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::mlp_projection_ms, start);
+
+    start = profile_start(hotspot_profile);
     add_inplace(hidden, mlp_out);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::residual_add_ms, start);
 }
 
 void compute_logits(const Gpt2ReferenceModel& model,
@@ -785,7 +840,12 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
                                                  Gpt2KvCache& cache,
                                                  Gpt2ForwardWorkspace& workspace,
                                                  std::int32_t token_id,
-                                                 bool need_logits) {
+                                                 bool need_logits,
+                                                 Gpt2HotspotProfile* hotspot_profile) {
+    const Gpt2ProfileClock::time_point step_start = profile_start(hotspot_profile);
+    if (hotspot_profile != nullptr) {
+        ++hotspot_profile->decoder_steps;
+    }
     if (token_id < 0 || token_id >= model.config.vocab_size) {
         throw std::runtime_error("GPT-2 token id out of range");
     }
@@ -799,10 +859,12 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
         row_span(model.token_embedding, token_id, model.config.hidden_size);
     const std::span<const float> position_embedding =
         row_span(model.position_embedding, model_position, model.config.hidden_size);
+    Gpt2ProfileClock::time_point start = profile_start(hotspot_profile);
     for (std::int32_t dim = 0; dim < model.config.hidden_size; ++dim) {
         hidden[checked_size(dim, "dim")] =
             token[checked_size(dim, "dim")] + position_embedding[checked_size(dim, "dim")];
     }
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::embedding_ms, start);
 
     for (std::int32_t layer_id = 0;
          layer_id < static_cast<std::int32_t>(model.layers.size());
@@ -813,25 +875,35 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
                                   model_position,
                                   cache,
                                   workspace,
-                                  hidden);
+                                  hidden,
+                                  hotspot_profile);
     }
 
     std::span<float> normed = workspace.normed();
+    start = profile_start(hotspot_profile);
     layer_norm(hidden,
                model.final_ln_weight,
                model.final_ln_bias,
                model.config.layer_norm_epsilon,
                normed);
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::final_norm_ms, start);
 
     Gpt2ForwardResult result;
     if (need_logits) {
         std::span<float> logits = workspace.logits();
+        start = profile_start(hotspot_profile);
         compute_logits(model, normed, logits);
+        add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::lm_head_ms, start);
+        start = profile_start(hotspot_profile);
         result.logits.assign(logits.begin(), logits.end());
         result.predicted_token = argmax(result.logits);
+        add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::logits_result_ms, start);
     } else {
+        start = profile_start(hotspot_profile);
         result.predicted_token = compute_predicted_token(model, normed);
+        add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::lm_head_ms, start);
     }
+    add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::total_step_ms, step_start);
     return result;
 }
 
@@ -1758,7 +1830,13 @@ void Gpt2KvCache::validate_written(std::int32_t layer_id,
 }
 
 Gpt2CachedGreedyDecoder::Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model)
+    : Gpt2CachedGreedyDecoder(model, nullptr) {}
+
+Gpt2CachedGreedyDecoder::Gpt2CachedGreedyDecoder(
+    const Gpt2ReferenceModel& model,
+    Gpt2HotspotProfile* hotspot_profile)
     : model_(&model),
+      hotspot_profile_(hotspot_profile),
       cache_(model.config),
       workspace_(model.config) {
     validate_model(*this->model_);
@@ -1769,7 +1847,8 @@ std::int32_t Gpt2CachedGreedyDecoder::step(std::int32_t token_id) {
                                           this->cache_,
                                           this->workspace_,
                                           token_id,
-                                          false)
+                                          false,
+                                          this->hotspot_profile_)
         .predicted_token;
 }
 
@@ -1778,7 +1857,8 @@ Gpt2ForwardResult Gpt2CachedGreedyDecoder::step_with_logits(std::int32_t token_i
                                           this->cache_,
                                           this->workspace_,
                                           token_id,
-                                          true);
+                                          true,
+                                          this->hotspot_profile_);
 }
 
 const Gpt2KvCache& Gpt2CachedGreedyDecoder::cache() const noexcept {
@@ -1849,7 +1929,7 @@ Gpt2ForwardResult run_gpt2_forward_cached(const Gpt2ReferenceModel& model,
                                           std::int32_t token_id) {
     validate_model(model);
     Gpt2ForwardWorkspace workspace(model.config);
-    return run_gpt2_cached_step_unchecked(model, cache, workspace, token_id, true);
+    return run_gpt2_cached_step_unchecked(model, cache, workspace, token_id, true, nullptr);
 }
 
 std::vector<std::int32_t> gpt2_generate_greedy(const Gpt2ReferenceModel& model,

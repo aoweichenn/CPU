@@ -54,7 +54,7 @@ ALGO_EPUB_NAME := $(ALGO_EXPORT_NAME)
 CPP_EPUB_NAME := $(CPP_EXPORT_NAME)
 CSE_EPUB_NAME := $(CSE_EXPORT_NAME)
 
-.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-phone-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-phone-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-phone-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-phone-export cpu3-smollm2-smoke cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-phone-export cpu3p-test cpu3s-check cpu3s-pdf cpu3s-epub cpu3s-export cpu3s-phone-export cpu3s-test books-export phone-books-export phone-export-organize phone-export-organize-allow-missing algo-check algo-pdf algo-epub algo-export algo-phone-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-phone-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export cse-phone-export clean
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-phone-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-phone-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-phone-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-phone-export cpu3-smollm2-smoke cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-gpt2-hotspot-profile cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-phone-export cpu3p-test cpu3s-check cpu3s-pdf cpu3s-epub cpu3s-export cpu3s-phone-export cpu3s-test books-export phone-books-export phone-export-organize phone-export-organize-allow-missing algo-check algo-pdf algo-epub algo-export algo-phone-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-phone-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export cse-phone-export clean
 
 all: cpu-pdf cpu-epub
 
@@ -154,6 +154,9 @@ cpu3-gpt2-smoke:
 
 cpu3-gpt2-benchmark-compare:
 	python3 $(CPU3_BOOK_DIR)/tools/run_gpt2_benchmark_compare.py
+
+cpu3-gpt2-hotspot-profile:
+	python3 $(CPU3_BOOK_DIR)/tools/run_gpt2_hotspot_profile.py
 
 cpu3p-check:
 	$(MAKE) -C $(CPU3P_LATEX_DIR) check

@@ -28,6 +28,7 @@ enum class Gpt2EngineMode {
 struct Gpt2CliOptions {
     Gpt2EngineMode engine = Gpt2EngineMode::cached_kv;
     bool benchmark = false;
+    bool profile_hotspots = false;
     std::filesystem::path model_dir;
     std::string prompt;
     std::int32_t max_new_tokens = LCQI_GPT2_DEFAULT_MAX_NEW_TOKENS;
@@ -103,6 +104,9 @@ void print_ids(std::span<const std::int32_t> ids) {
         const std::string arg = argv[index];
         if (arg == "--benchmark") {
             options.benchmark = true;
+        } else if (arg == "--profile-hotspots") {
+            options.profile_hotspots = true;
+            options.benchmark = true;
         } else if (arg == "--engine") {
             if (index + 1 >= argc) {
                 throw std::runtime_error("--engine requires a value");
@@ -163,11 +167,12 @@ void print_ids(std::span<const std::int32_t> ids) {
     const lcqi::Gpt2ReferenceModel& model,
     std::span<const std::int32_t> prompt_ids,
     std::int32_t max_new_tokens,
-    Gpt2BenchmarkTimings& timings) {
+    Gpt2BenchmarkTimings& timings,
+    lcqi::Gpt2HotspotProfile* hotspot_profile) {
     if (prompt_ids.empty()) {
         throw std::runtime_error("GPT-2 generation needs at least one prompt token");
     }
-    lcqi::Gpt2CachedGreedyDecoder decoder(model);
+    lcqi::Gpt2CachedGreedyDecoder decoder(model, hotspot_profile);
     timings.kv_cache_bytes = decoder.kv_cache_bytes();
     std::vector<std::int32_t> tokens(prompt_ids.begin(), prompt_ids.end());
     if (max_new_tokens == 0) {
@@ -233,6 +238,30 @@ void print_benchmark(const Gpt2BenchmarkTimings& timings,
     std::cout << "benchmark_kv_cache_bytes " << timings.kv_cache_bytes << "\n";
 }
 
+void print_hotspot_profile(const lcqi::Gpt2HotspotProfile& profile) {
+    const double total = profile.total_step_ms > 0.0 ? profile.total_step_ms : 1.0;
+    const auto print_ms = [total](std::string_view name, double value) {
+        std::cout << "hotspot_" << name << "_ms " << value << "\n";
+        std::cout << "hotspot_" << name << "_pct " << (value * 100.0 / total) << "\n";
+    };
+    std::cout << "hotspot_decoder_steps " << profile.decoder_steps << "\n";
+    std::cout << "hotspot_layer_steps " << profile.layer_steps << "\n";
+    print_ms("total_step", profile.total_step_ms);
+    print_ms("embedding", profile.embedding_ms);
+    print_ms("layer_norm", profile.layer_norm_ms);
+    print_ms("final_norm", profile.final_norm_ms);
+    print_ms("qkv_projection", profile.qkv_projection_ms);
+    print_ms("kv_append", profile.kv_append_ms);
+    print_ms("attention", profile.attention_ms);
+    print_ms("attention_projection", profile.attention_projection_ms);
+    print_ms("residual_add", profile.residual_add_ms);
+    print_ms("mlp_fc", profile.mlp_fc_ms);
+    print_ms("gelu", profile.gelu_ms);
+    print_ms("mlp_projection", profile.mlp_projection_ms);
+    print_ms("lm_head", profile.lm_head_ms);
+    print_ms("logits_result", profile.logits_result_ms);
+}
+
 int run_tiny_mode() {
     const lcqi::Gpt2ReferenceModel model = lcqi::make_tiny_gpt2_reference_model();
     const std::vector<std::int32_t> prompt{
@@ -283,10 +312,18 @@ int run_real_model_mode(int argc, char** argv) {
     timings.tokenize_ms = elapsed_ms(tokenize_start, Clock::now());
 
     std::vector<std::int32_t> generated;
+    lcqi::Gpt2HotspotProfile hotspot_profile;
     if (options.engine == Gpt2EngineMode::full_prefix) {
+        if (options.profile_hotspots) {
+            throw std::runtime_error("--profile-hotspots currently supports cached engine only");
+        }
         generated = generate_full_prefix(model, prompt_ids, options.max_new_tokens, timings);
     } else {
-        generated = generate_cached(model, prompt_ids, options.max_new_tokens, timings);
+        generated = generate_cached(model,
+                                    prompt_ids,
+                                    options.max_new_tokens,
+                                    timings,
+                                    options.profile_hotspots ? &hotspot_profile : nullptr);
     }
     timings.total_ms = elapsed_ms(total_start, Clock::now());
 
@@ -303,6 +340,9 @@ int run_real_model_mode(int argc, char** argv) {
     if (options.benchmark) {
         const std::size_t generated_tokens = generated.size() - prompt_ids.size();
         print_benchmark(timings, prompt_ids.size(), generated_tokens);
+    }
+    if (options.profile_hotspots) {
+        print_hotspot_profile(hotspot_profile);
     }
     return EXIT_SUCCESS;
 }

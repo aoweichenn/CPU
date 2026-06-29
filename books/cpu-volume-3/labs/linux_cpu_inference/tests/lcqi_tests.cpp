@@ -544,6 +544,22 @@ void test_gpt2_tiny_forward_and_generation() {
     require(greedy_predicted == result.predicted_token,
             "optimized logits-free GPT-2 predicted token mismatch");
 
+    lcqi::Gpt2HotspotProfile hotspot_profile;
+    lcqi::Gpt2CachedGreedyDecoder profiled_decoder(model, &hotspot_profile);
+    std::int32_t profiled_predicted = 0;
+    for (const std::int32_t token : tokens) {
+        profiled_predicted = profiled_decoder.step(token);
+    }
+    require(profiled_predicted == result.predicted_token,
+            "profiled GPT-2 predicted token mismatch");
+    require(hotspot_profile.decoder_steps == static_cast<std::int64_t>(tokens.size()),
+            "profiled GPT-2 decoder step count mismatch");
+    require(hotspot_profile.layer_steps ==
+                static_cast<std::int64_t>(tokens.size()) * model.config.layer_count,
+            "profiled GPT-2 layer step count mismatch");
+    require(hotspot_profile.total_step_ms >= hotspot_profile.lm_head_ms,
+            "profiled GPT-2 total time should include lm head time");
+
     const std::vector<std::int32_t> cached_generated =
         lcqi::gpt2_generate_greedy_cached(model, tokens, 2);
     require(cached_generated == expected, "cached GPT-2 greedy generation mismatch");
