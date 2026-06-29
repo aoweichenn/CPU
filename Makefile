@@ -8,6 +8,8 @@ CPU3_BOOK_DIR := books/cpu-volume-3
 CPU3_LATEX_DIR := $(CPU3_BOOK_DIR)/source/latex
 CPU3P_BOOK_DIR := books/cpu-volume-3-practice
 CPU3P_LATEX_DIR := $(CPU3P_BOOK_DIR)/source/latex
+CPU3S_BOOK_DIR := books/cpu-volume-3-source
+CPU3S_LATEX_DIR := $(CPU3S_BOOK_DIR)/source/latex
 ALGO_BOOK_DIR := books/algorithm-interview
 ALGO_LATEX_DIR := $(ALGO_BOOK_DIR)/source/latex
 CPP_BOOK_DIR := books/cpp-zero-to-advanced
@@ -20,6 +22,7 @@ CPU1P_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第一册实践卷
 CPU2_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第二册
 CPU3_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册
 CPU3P_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册实践卷
+CPU3S_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册源码卷
 ALGO_EXPORT_DIR := $(EXPORT_ROOT)/算法刷题与Cpp面试教材
 CPP_EXPORT_DIR := $(EXPORT_ROOT)/Cpp从零到高级
 CSE_EXPORT_DIR := $(EXPORT_ROOT)/计算系统引擎代码实践卷
@@ -28,6 +31,7 @@ CPU1P_EXPORT_NAME := 从Cpp到计算系统第一册实践卷
 CPU2_EXPORT_NAME := 从Cpp到计算系统第二册
 CPU3_EXPORT_NAME := 从Cpp到AI计算第三册
 CPU3P_EXPORT_NAME := 从Cpp到AI计算第三册实践卷
+CPU3S_EXPORT_NAME := 从Cpp到AI计算第三册源码卷
 ALGO_EXPORT_NAME := 算法刷题与Cpp面试教材
 CPP_EXPORT_NAME := Cpp从零到高级
 CSE_EXPORT_NAME := 计算系统引擎代码实践卷
@@ -36,11 +40,12 @@ CPU1P_EPUB_NAME := $(CPU1P_EXPORT_NAME)
 CPU2_EPUB_NAME := $(CPU2_EXPORT_NAME)
 CPU3_EPUB_NAME := $(CPU3_EXPORT_NAME)
 CPU3P_EPUB_NAME := $(CPU3P_EXPORT_NAME)
+CPU3S_EPUB_NAME := $(CPU3S_EXPORT_NAME)
 ALGO_EPUB_NAME := $(ALGO_EXPORT_NAME)
 CPP_EPUB_NAME := $(CPP_EXPORT_NAME)
 CSE_EPUB_NAME := $(CSE_EXPORT_NAME)
 
-.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-smollm2-smoke cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-test books-export algo-check algo-pdf algo-epub algo-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export clean
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-smollm2-smoke cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-test cpu3s-check cpu3s-pdf cpu3s-epub cpu3s-export cpu3s-test books-export algo-check algo-pdf algo-epub algo-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export clean
 
 all: cpu-pdf cpu-epub
 
@@ -140,6 +145,21 @@ cpu3p-export: cpu3p-pdf cpu3p-epub
 cpu3p-test:
 	$(MAKE) -C $(CPU3P_BOOK_DIR) test
 
+cpu3s-check:
+	$(MAKE) -C $(CPU3S_LATEX_DIR) check
+
+cpu3s-pdf:
+	$(MAKE) -C $(CPU3S_LATEX_DIR) pdf
+
+cpu3s-epub:
+	$(MAKE) -C $(CPU3S_LATEX_DIR) epub
+
+cpu3s-export: cpu3s-pdf cpu3s-epub
+	python3 tools/export_book.py --source $(CPU3S_LATEX_DIR) --dest "$(CPU3S_EXPORT_DIR)" --pdf-name "$(CPU3S_EXPORT_NAME)" --epub-name "$(CPU3S_EPUB_NAME)"
+
+cpu3s-test:
+	$(MAKE) -C $(CPU3S_BOOK_DIR) test
+
 cpu3-text-count:
 	$(MAKE) -C $(CPU3_LATEX_DIR) text-count
 
@@ -149,7 +169,7 @@ cpu3-text-count-chapters:
 cpu3-text-target:
 	$(MAKE) -C $(CPU3_LATEX_DIR) text-target
 
-books-export: cpu-export cpu1p-export cpu2-export cpu3-export cpu3p-export algo-export cpp-export cse-export
+books-export: cpu-export cpu1p-export cpu2-export cpu3-export cpu3p-export cpu3s-export algo-export cpp-export cse-export
 
 algo-check:
 	$(MAKE) -C $(ALGO_BOOK_DIR) check
@@ -208,6 +228,7 @@ clean:
 	$(MAKE) -C $(CPU2_LATEX_DIR) clean
 	$(MAKE) -C $(CPU3_LATEX_DIR) clean
 	$(MAKE) -C $(CPU3P_LATEX_DIR) clean
+	$(MAKE) -C $(CPU3S_LATEX_DIR) clean
 	$(MAKE) -C $(ALGO_BOOK_DIR) clean
 	$(MAKE) -C $(CPP_BOOK_DIR) clean
 	$(MAKE) -C $(CSE_LATEX_DIR) clean

@@ -116,7 +116,7 @@ make cpu2-epub
 make cpu2-text-count
 ```
 
-统一导出第一册、第一册实践卷、第二册、第三册、算法面试书和 Cpp 从零到高级：
+统一导出第一册、第一册实践卷、第二册、第三册、第三册实践卷、第三册源码卷、算法面试书和 Cpp 从零到高级：
 
 ```bash
 make books-export
@@ -131,6 +131,15 @@ make cpu3p-check
 make cpu3p-pdf
 make cpu3p-epub
 make cpu3p-test
+```
+
+生成第三册源码卷：
+
+```bash
+make cpu3s-check
+make cpu3s-pdf
+make cpu3s-epub
+make cpu3s-test
 ```
 
 检查和测试算法面试书：
