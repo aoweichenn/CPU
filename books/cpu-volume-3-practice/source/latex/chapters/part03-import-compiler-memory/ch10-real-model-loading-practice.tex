@@ -2,33 +2,64 @@
 
 本章对应原书中的第三册“真实模型加载闭环：Tokenizer、权重格式与首 token trace”。不要把它当作概念复述，本章要把 tokenizer、weight mapping、chat template、first token trace、checksum 放到同一个可运行项目里检查。贯穿代码仍然是 \filepath{books/cpu-volume-3/labs/linux\_cpu\_inference}；如果某个实验在当前机器上不能验证，报告必须写清降级原因，不能把源码存在当作实测证据。
 
+本章新增一个明确边界：tiny fixture 负责手算和逐层 oracle，真实 small 模型负责证明“开源模型资产确实能在本机 CPU 上加载并生成”。二者不能互相冒充。tiny MLP 算对，不等于真实 GGUF 加载器完成；真实 small 模型能输出文本，也不等于回答质量正确或 LCQI 自研后端已经支持完整 GGUF。
+
 \practicesection{一、对应原书问题：概念必须落到对象和命令}
 
-原书讲的是系统边界，本章实践要回答三个问题。第一，哪个代码对象承载这个概念；第二，哪个命令能产生可复查输出；第三，哪个坏输入或缺失字段能证明边界不是空话。这里的核心对象包括 \code{tiny_tokenizer.txt}，核心命令或测试入口是 \cmd{lcqi_trace}。
+原书讲的是系统边界，本章实践要回答三个问题。第一，哪个代码对象承载这个概念；第二，哪个命令能产生可复查输出；第三，哪个坏输入或缺失字段能证明边界不是空话。这里有两组核心对象。第一组是 \code{tiny_tokenizer.txt}、reference decoder 和 \cmd{lcqi_trace}，用于手算 token 合同和逐 checkpoint 追踪。第二组是 \filepath{tools/run\_smollm2\_small\_smoke.py}，用于下载并校验 SmolLM2-135M-Instruct 的 GGUF 量化文件，再通过 llama.cpp 在 CPU 上实际生成 assistant 文本。
 
 \begin{lstlisting}[numbers=none,caption={第 10 章实践：真实模型加载闭环与首 Token Trace 的最小命令入口}]
 cmake -S books/cpu-volume-3 -B books/cpu-volume-3/build/lcqi-debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build books/cpu-volume-3/build/lcqi-debug
 ctest --test-dir books/cpu-volume-3/build/lcqi-debug --output-on-failure
 # chapter focus: lcqi_trace / tiny_tokenizer.txt
+make cpu3-smollm2-smoke
 \end{lstlisting}
 
 \practicesection{二、从特例推到规律：先抓一个能手算的切片}
 
 本章先看特例：从 tokenizer fixture 开始，不跳到真实 7B。读者要先手写预期结果，再运行项目观察输出。动作是：解释 BOS/EOS、UNK、template hash 和 decoder 输入 tokens 的边界。如果输出里没有 \code{tokens=[0,1,2,3,4]} 或对应字段无法解释，就不要继续优化；先回到 reference、输入合同和 trace 字段。
 
-从这个特例推出的规律是：真实模型加载不是下载权重；必须先让 tokenizer 合同、权重 role、shape verifier 和首 token trace 形成闭环 这条规律要写进报告，不要只写“运行成功”。运行成功只说明某条路径没崩，解释清楚输入、输出、错误路径和不可验证边界，才说明学会了这个知识点。
+从这个特例推出的规律是：真实模型加载不是下载权重；必须先让 tokenizer 合同、权重 role、shape verifier 和首 token trace 形成闭环。这条规律要写进报告，不要只写“运行成功”。运行成功只说明某条路径没崩，解释清楚输入、输出、错误路径和不可验证边界，才说明学会了这个知识点。
 
-\practicesection{三、实践任务：把观察固定成报告字段}
+\practicesection{三、真实 small 模型 smoke：不用 tiny，先让开源模型实际跑起来}
+
+本章的真实模型 smoke 固定为 \code{SmolLM2-135M-Instruct}，规模是 135M 参数，不是 tiny 随机夹具。脚本使用 GGUF 文件 \code{SmolLM2-135M-Instruct-Q4\_K\_M.gguf}，来源仓库是 \code{bartowski/SmolLM2-135M-Instruct-GGUF}，原模型组织是 \code{HuggingFaceTB}，license 字段为 \code{apache-2.0}。脚本不会把模型文件提交到仓库，而是缓存到用户目录；验收时检查文件大小 \code{105454432} 字节和 SHA256：
+
+\begin{lstlisting}[numbers=none,caption={SmolLM2 small GGUF 文件身份}]
+model_source_id=HuggingFaceTB/SmolLM2-135M-Instruct
+model_gguf_repo_id=bartowski/SmolLM2-135M-Instruct-GGUF
+model_file=SmolLM2-135M-Instruct-Q4_K_M.gguf
+model_expected_bytes=105454432
+model_expected_sha256=2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d
+\end{lstlisting}
+
+运行命令是：
+
+\begin{lstlisting}[numbers=none,caption={真实 small 模型 CPU 冒烟}]
+make cpu3-smollm2-smoke
+\end{lstlisting}
+
+这条命令会做四步。第一，下载或复用 GGUF 文件，并校验 SHA256，防止“文件名对了但内容不对”。第二，拉取固定 commit 的 \code{llama.cpp} 并构建 \code{llama-simple-chat}，避免依赖本机临时安装。第三，用 \code{-ngl 0} 强制 CPU 路径，输入一个短 prompt，确认程序能走过 tokenizer、chat template、prefill、decode 和 sampler。第四，把报告写到：
+
+\begin{lstlisting}[numbers=none,caption={真实模型 smoke 报告路径}]
+books/cpu-volume-3/results/lcqi-smollm2-small-model-smoke.txt
+\end{lstlisting}
+
+报告里必须至少出现这些字段：\code{model_expected_sha256}、\code{llama_cpp_commit}、\code{command}、\code{exit_code=0}、\code{validation=PASS} 和 \code{assistant_response}。如果只有下载日志，没有 assistant response，不能算通过；如果 assistant response 内容答错了，也不能改写成“质量通过”。本章只验证真实模型资产可加载、可 tokenize、可 decode、可生成非空文本。
+
+\practicesection{四、实践任务：把观察固定成报告字段}
 
 任务一：定位源码。至少阅读 \filepath{books/cpu-volume-3/labs/linux\_cpu\_inference/README.md}、相关 \filepath{include/lcqi} 头文件和一个 \filepath{src} 实现文件。报告要写出函数入口、输入对象、输出对象和错误处理方式。
 
 任务二：运行命令。保存构建命令、测试命令、核心输出和环境字段。若命令依赖 AVX2、perf、GPU、NUMA 或外部库，必须记录当前机器是否支持；不支持时把结论降级为“接口已设计，性能未验证”。
 
-任务三：构造反例。围绕本章知识点设计一个坏输入、缺失字段或不满足前提的场景，说明系统应拒绝、降级、fallback 还是继续执行。只给正常路径不合格。
+任务三：运行真实 small 模型 smoke。报告不许只贴“命令执行成功”，必须解释脚本为什么校验模型 hash、为什么固定 \code{llama.cpp} commit、为什么使用 \code{-ngl 0}，以及为什么 assistant response 非空只是 smoke，不是质量评测。
 
-\practicesection{四、验收和递进大作业}
+任务四：构造反例。围绕本章知识点设计一个坏输入、缺失字段或不满足前提的场景，说明系统应拒绝、降级、fallback 还是继续执行。只给正常路径不合格。真实模型 smoke 的反例可以是：模型 SHA256 不匹配、网络不可用、\code{cmake} 缺失、assistant response 为空、命令超时。每个反例都要写清期望处理方式。
 
-验收标准：报告能从一个具体输入推到工程规则；命令可以在仓库中复跑；输出字段能对应到源码；失败路径说得清；未验证边界不伪装成结论。
+\practicesection{五、验收和递进大作业}
+
+验收标准：报告能从一个具体输入推到工程规则；命令可以在仓库中复跑；输出字段能对应到源码；失败路径说得清；未验证边界不伪装成结论。新增真实模型 smoke 后，最低验收还包括：模型身份有 hash，模型规模不是 tiny，CPU 路径实际运行，报告里有非空 assistant response，并明确声明这不是自研 LCQI 完整 GGUF 支持。
 
 递进大作业：提交真实模型迁移清单：需要新增哪些 tokenizer、name mapping、quant descriptor 和 golden trace。这个作业会被后续章节继续引用，命名、目录和字段不要随意变化。
