@@ -517,6 +517,33 @@ void test_gpt2_tiny_forward_and_generation() {
                       "cached GPT-2 logit mismatch");
     }
 
+    lcqi::Gpt2CachedGreedyDecoder decoder_with_logits(model);
+    lcqi::Gpt2ForwardResult decoder_result;
+    for (const std::int32_t token : tokens) {
+        decoder_result = decoder_with_logits.step_with_logits(token);
+    }
+    require(decoder_with_logits.filled_tokens() == static_cast<std::int32_t>(tokens.size()),
+            "GPT-2 optimized decoder filled token count mismatch");
+    require(decoder_with_logits.kv_cache_bytes() == cache.byte_size(),
+            "GPT-2 optimized decoder KV byte size mismatch");
+    require(decoder_result.predicted_token == result.predicted_token,
+            "optimized cached GPT-2 predicted token mismatch");
+    require(decoder_result.logits.size() == result.logits.size(),
+            "optimized cached GPT-2 logits size mismatch");
+    for (std::size_t index = 0; index < result.logits.size(); ++index) {
+        require_close(decoder_result.logits[index],
+                      result.logits[index],
+                      "optimized cached GPT-2 logit mismatch");
+    }
+
+    lcqi::Gpt2CachedGreedyDecoder greedy_decoder(model);
+    std::int32_t greedy_predicted = 0;
+    for (const std::int32_t token : tokens) {
+        greedy_predicted = greedy_decoder.step(token);
+    }
+    require(greedy_predicted == result.predicted_token,
+            "optimized logits-free GPT-2 predicted token mismatch");
+
     const std::vector<std::int32_t> cached_generated =
         lcqi::gpt2_generate_greedy_cached(model, tokens, 2);
     require(cached_generated == expected, "cached GPT-2 greedy generation mismatch");

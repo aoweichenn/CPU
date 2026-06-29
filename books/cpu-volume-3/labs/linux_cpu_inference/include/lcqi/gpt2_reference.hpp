@@ -57,6 +57,52 @@ struct Gpt2ForwardResult {
     std::int32_t predicted_token = 0;
 };
 
+class Gpt2KvCache;
+
+namespace detail {
+void attend_cached_position(const Gpt2KvCache& cache,
+                            std::int32_t layer_id,
+                            std::int32_t model_position,
+                            std::span<const float> query,
+                            std::span<float> scores,
+                            std::span<float> output);
+}  // namespace detail
+
+class Gpt2ForwardWorkspace {
+public:
+    explicit Gpt2ForwardWorkspace(const Gpt2Config& config);
+
+    void reset_for_config(const Gpt2Config& config);
+
+    [[nodiscard]] std::span<float> hidden() noexcept;
+    [[nodiscard]] std::span<float> normed() noexcept;
+    [[nodiscard]] std::span<float> query() noexcept;
+    [[nodiscard]] std::span<float> key() noexcept;
+    [[nodiscard]] std::span<float> value() noexcept;
+    [[nodiscard]] std::span<float> attention() noexcept;
+    [[nodiscard]] std::span<float> projected() noexcept;
+    [[nodiscard]] std::span<float> qkv_packed() noexcept;
+    [[nodiscard]] std::span<float> mlp_fc() noexcept;
+    [[nodiscard]] std::span<float> mlp_out() noexcept;
+    [[nodiscard]] std::span<float> logits() noexcept;
+    [[nodiscard]] std::span<float> scores_prefix(std::int32_t count);
+
+private:
+    Gpt2Config config_;
+    std::vector<float> hidden_;
+    std::vector<float> normed_;
+    std::vector<float> query_;
+    std::vector<float> key_;
+    std::vector<float> value_;
+    std::vector<float> attention_;
+    std::vector<float> projected_;
+    std::vector<float> qkv_packed_;
+    std::vector<float> mlp_fc_;
+    std::vector<float> mlp_out_;
+    std::vector<float> logits_;
+    std::vector<float> scores_;
+};
+
 class Gpt2KvCache {
 public:
     explicit Gpt2KvCache(const Gpt2Config& config);
@@ -78,9 +124,25 @@ public:
     [[nodiscard]] std::size_t byte_size() const noexcept;
 
 private:
+    friend void detail::attend_cached_position(const Gpt2KvCache& cache,
+                                               std::int32_t layer_id,
+                                               std::int32_t model_position,
+                                               std::span<const float> query,
+                                               std::span<float> scores,
+                                               std::span<float> output);
+
     [[nodiscard]] std::size_t base_offset(std::int32_t layer_id,
                                           std::int32_t model_position,
                                           std::int32_t head) const;
+    [[nodiscard]] std::size_t base_offset_unchecked(std::int32_t layer_id,
+                                                    std::int32_t model_position,
+                                                    std::int32_t head) const noexcept;
+    [[nodiscard]] std::span<const float> key_unchecked(std::int32_t layer_id,
+                                                       std::int32_t model_position,
+                                                       std::int32_t head) const noexcept;
+    [[nodiscard]] std::span<const float> value_unchecked(std::int32_t layer_id,
+                                                         std::int32_t model_position,
+                                                         std::int32_t head) const noexcept;
     void validate_address(std::int32_t layer_id,
                           std::int32_t model_position,
                           std::int32_t head) const;
@@ -92,6 +154,27 @@ private:
     std::vector<float> keys_;
     std::vector<float> values_;
     std::vector<std::uint8_t> written_;
+};
+
+class Gpt2CachedGreedyDecoder {
+public:
+    explicit Gpt2CachedGreedyDecoder(const Gpt2ReferenceModel& model);
+
+    Gpt2CachedGreedyDecoder(const Gpt2CachedGreedyDecoder&) = delete;
+    Gpt2CachedGreedyDecoder& operator=(const Gpt2CachedGreedyDecoder&) = delete;
+    Gpt2CachedGreedyDecoder(Gpt2CachedGreedyDecoder&&) noexcept = default;
+    Gpt2CachedGreedyDecoder& operator=(Gpt2CachedGreedyDecoder&&) noexcept = default;
+
+    [[nodiscard]] std::int32_t step(std::int32_t token_id);
+    [[nodiscard]] Gpt2ForwardResult step_with_logits(std::int32_t token_id);
+    [[nodiscard]] const Gpt2KvCache& cache() const noexcept;
+    [[nodiscard]] std::int32_t filled_tokens() const noexcept;
+    [[nodiscard]] std::size_t kv_cache_bytes() const noexcept;
+
+private:
+    const Gpt2ReferenceModel* model_;
+    Gpt2KvCache cache_;
+    Gpt2ForwardWorkspace workspace_;
 };
 
 struct Gpt2Tokenizer {

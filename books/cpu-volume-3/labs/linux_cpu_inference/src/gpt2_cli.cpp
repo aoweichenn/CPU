@@ -167,18 +167,18 @@ void print_ids(std::span<const std::int32_t> ids) {
     if (prompt_ids.empty()) {
         throw std::runtime_error("GPT-2 generation needs at least one prompt token");
     }
-    lcqi::Gpt2KvCache cache(model.config);
-    timings.kv_cache_bytes = cache.byte_size();
+    lcqi::Gpt2CachedGreedyDecoder decoder(model);
+    timings.kv_cache_bytes = decoder.kv_cache_bytes();
     std::vector<std::int32_t> tokens(prompt_ids.begin(), prompt_ids.end());
     if (max_new_tokens == 0) {
         return tokens;
     }
 
     const Clock::time_point generate_start = Clock::now();
-    lcqi::Gpt2ForwardResult result;
+    std::int32_t predicted_token = 0;
     const Clock::time_point prefill_start = Clock::now();
     for (const std::int32_t token_id : prompt_ids) {
-        result = lcqi::run_gpt2_forward_cached(model, cache, token_id);
+        predicted_token = decoder.step(token_id);
         ++timings.prefill_steps;
     }
     const Clock::time_point prefill_end = Clock::now();
@@ -189,12 +189,12 @@ void print_ids(std::span<const std::int32_t> ids) {
         if (tokens.size() >= checked_size(model.config.max_positions, "max_positions")) {
             throw std::runtime_error("GPT-2 generation would exceed max_positions");
         }
-        tokens.push_back(result.predicted_token);
-        if (model.config.eos_token_id >= 0 && result.predicted_token == model.config.eos_token_id) {
+        tokens.push_back(predicted_token);
+        if (model.config.eos_token_id >= 0 && predicted_token == model.config.eos_token_id) {
             break;
         }
         if (step + 1 < max_new_tokens) {
-            result = lcqi::run_gpt2_forward_cached(model, cache, result.predicted_token);
+            predicted_token = decoder.step(predicted_token);
             ++timings.decode_steps;
         }
     }
