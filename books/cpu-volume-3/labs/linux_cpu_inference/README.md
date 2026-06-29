@@ -15,18 +15,20 @@
 - 量化线性层、ReLU、分类 argmax
 - int8 linear scalar baseline、packed layout、AVX2 路径和 shape sweep benchmark
 - tiny reference decoder：RMSNorm、float linear、RoPE、GQA KV cache、decode attention、SwiGLU、lm head
+- GPT-2 reference path：byte-level BPE tokenizer、`config.json`、F32/F16/BF16 safetensors 张量读取、HuggingFace GPT-2 name mapping、LayerNorm、绝对位置嵌入、packed QKV、causal attention、GELU、tied lm head 和 greedy generation
 - reference trace CSV：从 prompt/tokenizer 合同到 logits/sampler/token，逐 checkpoint 输出 shape、stride、dtype、layout、checksum、max_abs、values 摘要
 - 7B ledger CSV：输出典型 7B shape 的 FLOPs、KV 容量、权重/KV 字节和 bandwidth-only tokens/s 上限
 - serving SLO probe CSV：输出 admission、batch state、KV 预算、queue wait、TTFT、TPOT、取消回收和拒绝率
+- 自研 GPT-2 冒烟：加载 `openai-community/gpt2` 的 `config.json`、`vocab.json`、`merges.txt`、`model.safetensors`，在 LCQI C++ reference path 上生成 1 个 token，并把文件 hash、prompt ids、generated ids 和文本输出写入报告
 - 真实 small 开源模型冒烟：通过 llama.cpp 加载 SmolLM2-135M-Instruct 的 GGUF 量化文件，在本地 CPU 上生成一段 assistant 文本，并把模型 hash、命令、输出和性能行写入报告
 - CLI 推理和简单 benchmark
 - CTest 正确性测试
 
 后续扩展方向：
 
-- 真实 7B 级模型 metadata 和 tokenizer
-- 完整 BPE/SentencePiece tokenizer、GGUF/safetensors 权重导入、分片加载和 name mapping
-- 多层 decoder-only Transformer reference path
+- 真实 7B 级模型 metadata、tokenizer 和量化权重导入
+- SentencePiece tokenizer、GGUF 权重导入、safetensors 分片加载和更多模型方言 name mapping
+- GPT-2 reference path 的 KV cache、prefill/decode 分离和 golden logits 对齐报告
 - KV cache 分页、内存规划和可选量化
 - CPU packed weight、SIMD、线程和 NUMA 优化
 - GPU backend adapter 和 device kernel
@@ -88,6 +90,38 @@ name,token_position,layer_id,shape,stride,dtype,layout,checksum,max_abs,values
 tokenizer,0,-1,5,1,i32,contiguous,10,4,0;1;2;3;4
 tokenizer_contract,0,-1,scalar,scalar,u64,fnv1a,13452902845388333734,0,tiny-chat-template-v1
 ```
+
+GPT-2 自研 reference smoke：
+
+```bash
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_gpt2
+make cpu3-gpt2-smoke
+```
+
+第一条命令不需要下载模型，直接运行仓库内 tiny GPT-2 fixture，输出固定 prompt ids、logits、predicted token 和 greedy generated ids。`lcqi_tests` 会覆盖 tiny GPT-2 forward/generation、byte-level BPE 编码解码、F32/F16/BF16 safetensors 读取、HuggingFace 风格 tiny GPT-2 checkpoint 加载和坏 shape 拒绝。
+
+第二条命令显式依赖网络，只下载 `openai-community/gpt2` 的 `config.json`、`vocab.json`、`merges.txt`、`model.safetensors` 到 `~/.cache/lcqi-gpt2-smoke/openai-community--gpt2`，模型文件不进入 Git。脚本会校验四个文件的 bytes 和 SHA256，构建 `lcqi_gpt2`，运行：
+
+```text
+Hello, my name is
+```
+
+当前验证报告写到：
+
+```text
+books/cpu-volume-3/results/lcqi-gpt2-smoke.txt
+```
+
+最近一次本机报告的关键行是：
+
+```text
+prompt_ids 15496 11 616 1438 318
+generated_ids 15496 11 616 1438 318 1757
+generated_text Hello, my name is John
+validation=PASS
+```
+
+这说明 LCQI 自研 C++ reference path 已经能跑标准 GPT-2 safetensors 的 tokenizer、权重导入、forward 和 greedy generation。它仍然不是高性能推理引擎：当前实现为便于验证会重跑完整前缀，没有 KV cache、没有 packed weight、没有线程并行，也还没有把 logits 和 Transformers/PyTorch 逐数值对齐成外部 golden 报告。
 
 7B ledger：
 

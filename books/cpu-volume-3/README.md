@@ -31,11 +31,23 @@ source/latex/main.epub
 labs/linux_cpu_inference/
 ```
 
-该目录目前包含最小 MLP/int8 权重教学切片、tiny reference decoder、int8 scalar baseline、packed layout、AVX2 SIMD 路径和 shape sweep benchmark，用来验证张量、线性层、量化权重、KV cache、oracle 和 benchmark 的基本边界。当前 x86-64 AVX2 结果见：
+该目录目前包含最小 MLP/int8 权重教学切片、tiny reference decoder、GPT-2 reference path、int8 scalar baseline、packed layout、AVX2 SIMD 路径和 shape sweep benchmark，用来验证张量、线性层、量化权重、tokenizer、safetensors、GPT-2 forward、KV cache、oracle 和 benchmark 的基本边界。当前 x86-64 AVX2 结果见：
 
 ```text
 results/lcqi-x86-avx2-benchmark-2026-06-25.csv
 results/lcqi-x86-avx2-decode4096-2026-06-25.csv
+```
+
+自研 GPT-2 smoke 入口如下：
+
+```bash
+make cpu3-gpt2-smoke
+```
+
+它下载 `openai-community/gpt2` 的标准 safetensors 资产到用户缓存目录，用 LCQI C++ reference path 生成 1 个 token，并把报告写入：
+
+```text
+results/lcqi-gpt2-smoke.txt
 ```
 
 它仍然不是生产级 AI Infra。生产级门禁见：

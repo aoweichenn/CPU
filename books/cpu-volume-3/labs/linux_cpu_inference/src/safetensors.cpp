@@ -3,11 +3,14 @@
 #include <algorithm>
 #include <cctype>
 #include <cstddef>
+#include <cmath>
+#include <cstring>
 #include <fstream>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace lcqi {
 namespace {
@@ -27,6 +30,15 @@ constexpr std::uint64_t LCQI_DTYPE_BYTES_I32 = 4;
 constexpr std::uint64_t LCQI_DTYPE_BYTES_I16 = 2;
 constexpr std::uint64_t LCQI_DTYPE_BYTES_I8 = 1;
 constexpr std::uint64_t LCQI_DTYPE_BYTES_U8 = 1;
+constexpr std::uint32_t LCQI_F32_EXPONENT_MASK = 0x7F800000U;
+constexpr std::uint32_t LCQI_F16_SIGN_MASK = 0x8000U;
+constexpr std::uint32_t LCQI_F16_EXPONENT_MASK = 0x7C00U;
+constexpr std::uint32_t LCQI_F16_MANTISSA_MASK = 0x03FFU;
+constexpr std::uint32_t LCQI_F16_EXPONENT_BIAS = 15U;
+constexpr std::uint32_t LCQI_F32_EXPONENT_BIAS = 127U;
+constexpr std::uint32_t LCQI_F32_MANTISSA_BITS = 23U;
+constexpr std::uint32_t LCQI_F16_MANTISSA_BITS = 10U;
+constexpr std::uint32_t LCQI_F16_TO_F32_SIGN_SHIFT = 16U;
 
 class HeaderCursor {
 public:
@@ -171,15 +183,13 @@ private:
     }
 };
 
-std::uint64_t read_le_u64(const std::string& bytes) {
+std::uint64_t read_le_u64(std::span<const std::uint8_t> bytes) {
     if (bytes.size() < LCQI_SAFETENSORS_PREFIX_BYTES) {
         throw std::runtime_error("safetensors file is too small");
     }
     std::uint64_t value = 0;
     for (std::size_t i = 0; i < LCQI_SAFETENSORS_PREFIX_BYTES; ++i) {
-        value |= static_cast<std::uint64_t>(
-                     static_cast<unsigned char>(bytes[i]))
-                 << (LCQI_BYTE_BITS * i);
+        value |= static_cast<std::uint64_t>(bytes[i]) << (LCQI_BYTE_BITS * i);
     }
     return value;
 }
@@ -197,6 +207,26 @@ std::string read_file_bytes(const std::filesystem::path& path) {
     input.seekg(0, std::ios::beg);
     std::string bytes(static_cast<std::size_t>(size), '\0');
     if (!bytes.empty() && !input.read(bytes.data(), static_cast<std::streamsize>(bytes.size()))) {
+        throw std::runtime_error("cannot read safetensors file");
+    }
+    return bytes;
+}
+
+std::vector<std::uint8_t> read_file_u8(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open safetensors file: " + path.string());
+    }
+    input.seekg(0, std::ios::end);
+    const std::streamoff size = input.tellg();
+    if (size < 0) {
+        throw std::runtime_error("cannot determine safetensors file size");
+    }
+    input.seekg(0, std::ios::beg);
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size), 0);
+    if (!bytes.empty() &&
+        !input.read(reinterpret_cast<char*>(bytes.data()),
+                    static_cast<std::streamsize>(bytes.size()))) {
         throw std::runtime_error("cannot read safetensors file");
     }
     return bytes;
@@ -381,6 +411,95 @@ std::uint64_t expected_tensor_bytes(const SafeTensorEntry& entry) {
     return element_count * dtype_bytes;
 }
 
+SafeTensorManifest parse_manifest_from_bytes(std::span<const std::uint8_t> bytes) {
+    const std::uint64_t header_size = read_le_u64(bytes);
+    if (header_size == 0 || header_size > LCQI_SAFETENSORS_MAX_HEADER_BYTES) {
+        throw std::runtime_error("safetensors header size is invalid");
+    }
+    const std::uint64_t data_start_offset =
+        static_cast<std::uint64_t>(LCQI_SAFETENSORS_PREFIX_BYTES) + header_size;
+    if (data_start_offset > bytes.size()) {
+        throw std::runtime_error("safetensors header extends beyond file size");
+    }
+
+    SafeTensorManifest manifest;
+    manifest.header_size = header_size;
+    manifest.data_start_offset = data_start_offset;
+    const char* header_begin =
+        reinterpret_cast<const char*>(bytes.data() + LCQI_SAFETENSORS_PREFIX_BYTES);
+    const std::string_view header(header_begin, static_cast<std::size_t>(header_size));
+    parse_header(header, manifest);
+    validate_manifest(manifest, static_cast<std::uint64_t>(bytes.size()));
+    return manifest;
+}
+
+std::uint16_t read_le_u16(std::span<const std::uint8_t> bytes, std::size_t offset) {
+    return static_cast<std::uint16_t>(
+        static_cast<std::uint16_t>(bytes[offset]) |
+        (static_cast<std::uint16_t>(bytes[offset + 1]) << LCQI_BYTE_BITS));
+}
+
+std::uint32_t read_le_u32(std::span<const std::uint8_t> bytes, std::size_t offset) {
+    std::uint32_t value = 0;
+    for (std::size_t i = 0; i < LCQI_DTYPE_BYTES_F32; ++i) {
+        value |= static_cast<std::uint32_t>(bytes[offset + i]) << (LCQI_BYTE_BITS * i);
+    }
+    return value;
+}
+
+float bits_to_float(std::uint32_t bits) {
+    float value = 0.0F;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+float f16_to_f32(std::uint16_t bits) {
+    const std::uint32_t sign = (static_cast<std::uint32_t>(bits) & LCQI_F16_SIGN_MASK)
+                               << LCQI_F16_TO_F32_SIGN_SHIFT;
+    const std::uint32_t exponent = static_cast<std::uint32_t>(bits) & LCQI_F16_EXPONENT_MASK;
+    const std::uint32_t mantissa = static_cast<std::uint32_t>(bits) & LCQI_F16_MANTISSA_MASK;
+
+    if (exponent == 0U) {
+        if (mantissa == 0U) {
+            return bits_to_float(sign);
+        }
+        float value = static_cast<float>(mantissa) /
+                      static_cast<float>(1U << LCQI_F16_MANTISSA_BITS);
+        value = std::ldexp(value, 1 - static_cast<int>(LCQI_F16_EXPONENT_BIAS));
+        return (sign == 0U) ? value : -value;
+    }
+
+    if (exponent == LCQI_F16_EXPONENT_MASK) {
+        const std::uint32_t f32_mantissa =
+            mantissa << (LCQI_F32_MANTISSA_BITS - LCQI_F16_MANTISSA_BITS);
+        return bits_to_float(sign | LCQI_F32_EXPONENT_MASK | f32_mantissa);
+    }
+
+    const std::uint32_t f32_exponent =
+        ((exponent >> LCQI_F16_MANTISSA_BITS) - LCQI_F16_EXPONENT_BIAS +
+         LCQI_F32_EXPONENT_BIAS)
+        << LCQI_F32_MANTISSA_BITS;
+    const std::uint32_t f32_mantissa =
+        mantissa << (LCQI_F32_MANTISSA_BITS - LCQI_F16_MANTISSA_BITS);
+    return bits_to_float(sign | f32_exponent | f32_mantissa);
+}
+
+float bf16_to_f32(std::uint16_t bits) {
+    return bits_to_float(static_cast<std::uint32_t>(bits) << 16U);
+}
+
+std::span<const std::uint8_t> tensor_payload_span(const SafeTensorFile& file,
+                                                  const SafeTensorEntry& entry) {
+    const std::uint64_t begin = file.manifest.data_start_offset + entry.data_begin;
+    const std::uint64_t end = file.manifest.data_start_offset + entry.data_end;
+    if (begin > end || end > file.bytes.size()) {
+        throw std::runtime_error("safetensors tensor byte range is invalid");
+    }
+    return std::span<const std::uint8_t>(
+        file.bytes.data() + static_cast<std::size_t>(begin),
+        static_cast<std::size_t>(end - begin));
+}
+
 }  // namespace
 
 std::uint64_t SafeTensorEntry::byte_size() const {
@@ -402,25 +521,63 @@ const SafeTensorEntry* SafeTensorManifest::find_tensor(std::string_view name) co
 
 SafeTensorManifest load_safetensors_manifest(const std::filesystem::path& path) {
     const std::string bytes = read_file_bytes(path);
-    const std::uint64_t header_size = read_le_u64(bytes);
-    if (header_size == 0 || header_size > LCQI_SAFETENSORS_MAX_HEADER_BYTES) {
-        throw std::runtime_error("safetensors header size is invalid");
-    }
-    const std::uint64_t data_start_offset =
-        static_cast<std::uint64_t>(LCQI_SAFETENSORS_PREFIX_BYTES) + header_size;
-    if (data_start_offset > bytes.size()) {
-        throw std::runtime_error("safetensors header extends beyond file size");
-    }
+    return parse_manifest_from_bytes(
+        std::span<const std::uint8_t>(
+            reinterpret_cast<const std::uint8_t*>(bytes.data()),
+            bytes.size()));
+}
 
-    SafeTensorManifest manifest;
-    manifest.header_size = header_size;
-    manifest.data_start_offset = data_start_offset;
-    const std::string_view header(
-        bytes.data() + LCQI_SAFETENSORS_PREFIX_BYTES,
-        static_cast<std::size_t>(header_size));
-    parse_header(header, manifest);
-    validate_manifest(manifest, static_cast<std::uint64_t>(bytes.size()));
-    return manifest;
+SafeTensorFile load_safetensors_file(const std::filesystem::path& path) {
+    SafeTensorFile file;
+    file.path = path;
+    file.bytes = read_file_u8(path);
+    file.manifest = parse_manifest_from_bytes(file.bytes);
+    return file;
+}
+
+std::span<const std::uint8_t> read_safetensor_tensor_bytes(
+    const SafeTensorFile& file,
+    std::string_view name) {
+    const SafeTensorEntry* entry = file.manifest.find_tensor(name);
+    if (entry == nullptr) {
+        throw std::runtime_error("missing safetensors tensor: " + std::string(name));
+    }
+    return tensor_payload_span(file, *entry);
+}
+
+std::vector<float> read_safetensor_f32_tensor(const SafeTensorFile& file,
+                                              std::string_view name) {
+    const SafeTensorEntry* entry = file.manifest.find_tensor(name);
+    if (entry == nullptr) {
+        throw std::runtime_error("missing safetensors tensor: " + std::string(name));
+    }
+    const std::span<const std::uint8_t> bytes = tensor_payload_span(file, *entry);
+    std::vector<float> values;
+    if (entry->dtype == "F32") {
+        values.resize(bytes.size() / LCQI_DTYPE_BYTES_F32);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = bits_to_float(
+                read_le_u32(bytes, index * LCQI_DTYPE_BYTES_F32));
+        }
+        return values;
+    }
+    if (entry->dtype == "F16") {
+        values.resize(bytes.size() / LCQI_DTYPE_BYTES_F16);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = f16_to_f32(
+                read_le_u16(bytes, index * LCQI_DTYPE_BYTES_F16));
+        }
+        return values;
+    }
+    if (entry->dtype == "BF16") {
+        values.resize(bytes.size() / LCQI_DTYPE_BYTES_F16);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] = bf16_to_f32(
+                read_le_u16(bytes, index * LCQI_DTYPE_BYTES_F16));
+        }
+        return values;
+    }
+    throw std::runtime_error("safetensors tensor is not float-compatible: " + entry->name);
 }
 
 }  // namespace lcqi

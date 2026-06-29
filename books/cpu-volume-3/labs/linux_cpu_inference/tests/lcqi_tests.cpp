@@ -1,3 +1,4 @@
+#include <lcqi/gpt2_reference.hpp>
 #include <lcqi/inference.hpp>
 #include <lcqi/int8_kernels.hpp>
 #include <lcqi/model.hpp>
@@ -7,13 +8,16 @@
 
 #include <array>
 #include <cmath>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <span>
+#include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -55,11 +59,40 @@ constexpr std::uint64_t LCQI_SAFETENSORS_EMBED_END = 24;
 constexpr std::uint64_t LCQI_SAFETENSORS_QPROJ_BEGIN = 24;
 constexpr std::uint64_t LCQI_SAFETENSORS_QPROJ_END = 48;
 constexpr unsigned int LCQI_BYTE_MASK = 0xFFU;
+constexpr std::int32_t LCQI_GPT2_PREDICTED_TOKEN = 3;
+constexpr std::size_t LCQI_GPT2_VOCAB_SIZE = 6;
+constexpr std::array<float, LCQI_GPT2_VOCAB_SIZE> LCQI_GPT2_LOGITS{
+    0.407358F,
+    -0.504049F,
+    -0.107834F,
+    0.840337F,
+    -0.450123F,
+    -0.156763F,
+};
+constexpr std::int32_t LCQI_GPT2_GENERATED_LENGTH = 5;
+constexpr std::int32_t LCQI_GPT2_TOKENIZER_HELLO_ID = 7;
+constexpr std::uint16_t LCQI_TEST_F16_ONE = 0x3C00U;
+constexpr std::uint16_t LCQI_TEST_F16_NEGATIVE_TWO = 0xC000U;
+constexpr std::uint16_t LCQI_TEST_BF16_ONE_POINT_FIVE = 0x3FC0U;
+constexpr std::uint16_t LCQI_TEST_BF16_NEGATIVE_HALF = 0xBF00U;
 
 struct KernelShapeCase {
     std::int32_t input_size = 0;
     std::int32_t output_size = 0;
     std::int32_t output_block_size = 0;
+};
+
+struct RawTensorFixture {
+    std::string name;
+    std::string dtype;
+    std::vector<std::int64_t> shape;
+    std::vector<std::uint8_t> bytes;
+};
+
+struct FloatTensorFixture {
+    std::string name;
+    std::vector<std::int64_t> shape;
+    std::vector<float> values;
 };
 
 constexpr std::array<KernelShapeCase, 4> LCQI_KERNEL_SHAPE_CASES{{
@@ -103,6 +136,20 @@ void write_le_u64(std::ofstream& output, std::uint64_t value) {
     }
 }
 
+void append_le_u16(std::vector<std::uint8_t>& output, std::uint16_t value) {
+    output.push_back(static_cast<std::uint8_t>(value & LCQI_BYTE_MASK));
+    output.push_back(static_cast<std::uint8_t>((value >> LCQI_TEST_BYTE_BITS) & LCQI_BYTE_MASK));
+}
+
+void append_le_f32(std::vector<std::uint8_t>& output, float value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    for (std::int32_t i = 0; i < 4; ++i) {
+        output.push_back(static_cast<std::uint8_t>(
+            (bits >> (LCQI_TEST_BYTE_BITS * i)) & LCQI_BYTE_MASK));
+    }
+}
+
 void write_safetensors_fixture(const std::filesystem::path& path,
                                const std::string& header,
                                std::uint64_t payload_bytes) {
@@ -116,6 +163,162 @@ void write_safetensors_fixture(const std::filesystem::path& path,
         const char byte = static_cast<char>(i & 0xFFU);
         output.write(&byte, 1);
     }
+}
+
+std::string json_shape(std::span<const std::int64_t> shape) {
+    std::ostringstream stream;
+    stream << '[';
+    for (std::size_t index = 0; index < shape.size(); ++index) {
+        if (index != 0) {
+            stream << ',';
+        }
+        stream << shape[index];
+    }
+    stream << ']';
+    return stream.str();
+}
+
+void write_safetensors_raw_fixture(const std::filesystem::path& path,
+                                   std::span<const RawTensorFixture> tensors) {
+    std::ostringstream header;
+    header << "{\"__metadata__\":{\"format\":\"lcqi-test\"}";
+    std::uint64_t offset = 0;
+    for (const RawTensorFixture& tensor : tensors) {
+        header << ",\"" << tensor.name << "\":{\"dtype\":\"" << tensor.dtype
+               << "\",\"shape\":" << json_shape(tensor.shape)
+               << ",\"data_offsets\":[" << offset << ','
+               << offset + tensor.bytes.size() << "]}";
+        offset += tensor.bytes.size();
+    }
+    header << '}';
+
+    std::ofstream output(path, std::ios::binary);
+    if (!output) {
+        throw std::runtime_error("cannot create safetensors raw test fixture");
+    }
+    const std::string header_text = header.str();
+    write_le_u64(output, static_cast<std::uint64_t>(header_text.size()));
+    output.write(header_text.data(), static_cast<std::streamsize>(header_text.size()));
+    for (const RawTensorFixture& tensor : tensors) {
+        output.write(reinterpret_cast<const char*>(tensor.bytes.data()),
+                     static_cast<std::streamsize>(tensor.bytes.size()));
+    }
+}
+
+std::vector<std::uint8_t> f32_payload(std::span<const float> values) {
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(values.size() * 4);
+    for (const float value : values) {
+        append_le_f32(bytes, value);
+    }
+    return bytes;
+}
+
+std::vector<float> transpose_linear_to_hf_conv1d(const lcqi::Gpt2LinearF32& linear) {
+    std::vector<float> transposed(
+        static_cast<std::size_t>(linear.input_size) *
+            static_cast<std::size_t>(linear.output_size),
+        0.0F);
+    for (std::int32_t out = 0; out < linear.output_size; ++out) {
+        for (std::int32_t in = 0; in < linear.input_size; ++in) {
+            transposed[static_cast<std::size_t>(in) *
+                           static_cast<std::size_t>(linear.output_size) +
+                       static_cast<std::size_t>(out)] =
+                linear.weights[static_cast<std::size_t>(out) *
+                                   static_cast<std::size_t>(linear.input_size) +
+                               static_cast<std::size_t>(in)];
+        }
+    }
+    return transposed;
+}
+
+void add_f32_tensor(std::vector<RawTensorFixture>& tensors,
+                    std::string name,
+                    std::vector<std::int64_t> shape,
+                    std::span<const float> values) {
+    tensors.push_back(RawTensorFixture{
+        std::move(name),
+        "F32",
+        std::move(shape),
+        f32_payload(values),
+    });
+}
+
+void write_text_file(const std::filesystem::path& path, const std::string& text) {
+    std::ofstream output(path);
+    if (!output) {
+        throw std::runtime_error("cannot create text fixture");
+    }
+    output << text;
+}
+
+void write_tiny_gpt2_safetensors(const std::filesystem::path& path,
+                                 const lcqi::Gpt2ReferenceModel& model) {
+    std::vector<RawTensorFixture> tensors;
+    add_f32_tensor(tensors,
+                   "transformer.wte.weight",
+                   {model.config.vocab_size, model.config.hidden_size},
+                   model.token_embedding);
+    add_f32_tensor(tensors,
+                   "transformer.wpe.weight",
+                   {model.config.max_positions, model.config.hidden_size},
+                   model.position_embedding);
+    for (std::int32_t layer_id = 0; layer_id < model.config.layer_count; ++layer_id) {
+        const lcqi::Gpt2LayerWeightsF32& layer =
+            model.layers[static_cast<std::size_t>(layer_id)];
+        const std::string prefix = "transformer.h." + std::to_string(layer_id) + ".";
+        add_f32_tensor(tensors, prefix + "ln_1.weight", {model.config.hidden_size}, layer.ln_1_weight);
+        add_f32_tensor(tensors, prefix + "ln_1.bias", {model.config.hidden_size}, layer.ln_1_bias);
+        const std::vector<float> c_attn_hf = transpose_linear_to_hf_conv1d(layer.c_attn);
+        add_f32_tensor(tensors,
+                       prefix + "attn.c_attn.weight",
+                       {model.config.hidden_size,
+                        model.config.hidden_size * 3},
+                       c_attn_hf);
+        add_f32_tensor(tensors,
+                       prefix + "attn.c_attn.bias",
+                       {model.config.hidden_size * 3},
+                       layer.c_attn.bias);
+        const std::vector<float> c_proj_hf = transpose_linear_to_hf_conv1d(layer.c_proj);
+        add_f32_tensor(tensors,
+                       prefix + "attn.c_proj.weight",
+                       {model.config.hidden_size, model.config.hidden_size},
+                       c_proj_hf);
+        add_f32_tensor(tensors,
+                       prefix + "attn.c_proj.bias",
+                       {model.config.hidden_size},
+                       layer.c_proj.bias);
+        add_f32_tensor(tensors, prefix + "ln_2.weight", {model.config.hidden_size}, layer.ln_2_weight);
+        add_f32_tensor(tensors, prefix + "ln_2.bias", {model.config.hidden_size}, layer.ln_2_bias);
+        const std::vector<float> c_fc_hf = transpose_linear_to_hf_conv1d(layer.c_fc);
+        add_f32_tensor(tensors,
+                       prefix + "mlp.c_fc.weight",
+                       {model.config.hidden_size, model.config.intermediate_size},
+                       c_fc_hf);
+        add_f32_tensor(tensors,
+                       prefix + "mlp.c_fc.bias",
+                       {model.config.intermediate_size},
+                       layer.c_fc.bias);
+        const std::vector<float> mlp_proj_hf =
+            transpose_linear_to_hf_conv1d(layer.mlp_c_proj);
+        add_f32_tensor(tensors,
+                       prefix + "mlp.c_proj.weight",
+                       {model.config.intermediate_size, model.config.hidden_size},
+                       mlp_proj_hf);
+        add_f32_tensor(tensors,
+                       prefix + "mlp.c_proj.bias",
+                       {model.config.hidden_size},
+                       layer.mlp_c_proj.bias);
+    }
+    add_f32_tensor(tensors,
+                   "transformer.ln_f.weight",
+                   {model.config.hidden_size},
+                   model.final_ln_weight);
+    add_f32_tensor(tensors,
+                   "transformer.ln_f.bias",
+                   {model.config.hidden_size},
+                   model.final_ln_bias);
+    write_safetensors_raw_fixture(path, tensors);
 }
 
 void test_tiny_mlp() {
@@ -244,6 +447,143 @@ void test_safetensors_rejects_bad_dtype_shape_size() {
     }
     std::filesystem::remove(path);
     require(threw, "safetensors parser should reject dtype/shape byte mismatch");
+}
+
+void test_safetensors_reads_float_tensors() {
+    const std::filesystem::path path =
+        temp_file_path("lcqi_safetensors_float_read.safetensors");
+    std::vector<std::uint8_t> f16_bytes;
+    append_le_u16(f16_bytes, LCQI_TEST_F16_ONE);
+    append_le_u16(f16_bytes, LCQI_TEST_F16_NEGATIVE_TWO);
+    std::vector<std::uint8_t> bf16_bytes;
+    append_le_u16(bf16_bytes, LCQI_TEST_BF16_ONE_POINT_FIVE);
+    append_le_u16(bf16_bytes, LCQI_TEST_BF16_NEGATIVE_HALF);
+
+    const std::array<RawTensorFixture, 3> tensors{{
+        {"f32", "F32", {2}, f32_payload(std::array<float, 2>{1.25F, -2.5F})},
+        {"f16", "F16", {2}, f16_bytes},
+        {"bf16", "BF16", {2}, bf16_bytes},
+    }};
+    write_safetensors_raw_fixture(path, tensors);
+
+    const lcqi::SafeTensorFile file = lcqi::load_safetensors_file(path);
+    std::filesystem::remove(path);
+    const std::vector<float> f32 = lcqi::read_safetensor_f32_tensor(file, "f32");
+    const std::vector<float> f16 = lcqi::read_safetensor_f32_tensor(file, "f16");
+    const std::vector<float> bf16 = lcqi::read_safetensor_f32_tensor(file, "bf16");
+
+    require_close(f32[0], 1.25F, "safetensors F32 value 0 mismatch");
+    require_close(f32[1], -2.5F, "safetensors F32 value 1 mismatch");
+    require_close(f16[0], 1.0F, "safetensors F16 value 0 mismatch");
+    require_close(f16[1], -2.0F, "safetensors F16 value 1 mismatch");
+    require_close(bf16[0], 1.5F, "safetensors BF16 value 0 mismatch");
+    require_close(bf16[1], -0.5F, "safetensors BF16 value 1 mismatch");
+}
+
+void test_gpt2_tiny_forward_and_generation() {
+    const lcqi::Gpt2ReferenceModel model = lcqi::make_tiny_gpt2_reference_model();
+    const std::vector<std::int32_t> tokens{1, 2, 3};
+    const lcqi::Gpt2ForwardResult result = lcqi::run_gpt2_forward(model, tokens);
+
+    require(result.logits.size() == LCQI_GPT2_VOCAB_SIZE, "GPT-2 logits size mismatch");
+    require(result.predicted_token == LCQI_GPT2_PREDICTED_TOKEN,
+            "GPT-2 predicted token mismatch");
+    for (std::size_t index = 0; index < LCQI_GPT2_LOGITS.size(); ++index) {
+        require_close(result.logits[index], LCQI_GPT2_LOGITS[index], "GPT-2 logit mismatch");
+    }
+
+    const std::vector<std::int32_t> generated =
+        lcqi::gpt2_generate_greedy(model, tokens, 2);
+    const std::vector<std::int32_t> expected{1, 2, 3, 3, 3};
+    require(generated == expected, "GPT-2 greedy generation mismatch");
+    require(static_cast<std::int32_t>(generated.size()) == LCQI_GPT2_GENERATED_LENGTH,
+            "GPT-2 generated length mismatch");
+}
+
+void test_gpt2_byte_bpe_tokenizer() {
+    const std::filesystem::path vocab_path = temp_file_path("lcqi_gpt2_vocab.json");
+    const std::filesystem::path merges_path = temp_file_path("lcqi_gpt2_merges.txt");
+    const std::string space_marker = "\xC4\xA0";
+    const std::string vocab =
+        "{\"Hello\":7,\",\":8,\"" + space_marker + "world\":9,\"!\":10}";
+    const std::string merges =
+        "#version: 0.2\n"
+        "H e\n"
+        "He l\n"
+        "Hel l\n"
+        "Hell o\n" +
+        space_marker + " w\n" +
+        space_marker + "w o\n" +
+        space_marker + "wo r\n" +
+        space_marker + "wor l\n" +
+        space_marker + "worl d\n";
+    write_text_file(vocab_path, vocab);
+    write_text_file(merges_path, merges);
+
+    const lcqi::Gpt2Tokenizer tokenizer =
+        lcqi::load_gpt2_tokenizer(vocab_path, merges_path, -1, -1);
+    std::filesystem::remove(vocab_path);
+    std::filesystem::remove(merges_path);
+
+    const std::vector<std::int32_t> ids =
+        lcqi::gpt2_encode(tokenizer, "Hello, world!");
+    const std::vector<std::int32_t> expected{
+        LCQI_GPT2_TOKENIZER_HELLO_ID,
+        8,
+        9,
+        10,
+    };
+    require(ids == expected, "GPT-2 BPE ids mismatch");
+    require(lcqi::gpt2_decode(tokenizer, ids) == "Hello, world!",
+            "GPT-2 BPE decode mismatch");
+}
+
+void test_gpt2_loads_hf_style_tiny_checkpoint() {
+    const std::filesystem::path directory =
+        temp_file_path("lcqi_gpt2_tiny_checkpoint_dir");
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+
+    const lcqi::Gpt2ReferenceModel original = lcqi::make_tiny_gpt2_reference_model();
+    write_text_file(
+        directory / "config.json",
+        R"({"model_type":"gpt2","n_embd":4,"n_head":2,"n_layer":1,"n_positions":8,"n_ctx":8,"vocab_size":6,"n_inner":8,"layer_norm_epsilon":0.00001,"activation_function":"gelu_new","bos_token_id":0,"eos_token_id":5})");
+    write_tiny_gpt2_safetensors(directory / "model.safetensors", original);
+
+    const lcqi::Gpt2ReferenceModel loaded = lcqi::load_gpt2_from_directory(directory);
+    const std::vector<std::int32_t> tokens{1, 2, 3};
+    const lcqi::Gpt2ForwardResult result = lcqi::run_gpt2_forward(loaded, tokens);
+    std::filesystem::remove_all(directory);
+
+    require(result.predicted_token == LCQI_GPT2_PREDICTED_TOKEN,
+            "loaded GPT-2 predicted token mismatch");
+    for (std::size_t index = 0; index < LCQI_GPT2_LOGITS.size(); ++index) {
+        require_close(result.logits[index],
+                      LCQI_GPT2_LOGITS[index],
+                      "loaded GPT-2 logit mismatch");
+    }
+}
+
+void test_gpt2_loader_rejects_bad_shape() {
+    const std::filesystem::path directory =
+        temp_file_path("lcqi_gpt2_bad_shape_dir");
+    std::filesystem::remove_all(directory);
+    std::filesystem::create_directories(directory);
+
+    const lcqi::Gpt2ReferenceModel original = lcqi::make_tiny_gpt2_reference_model();
+    write_text_file(
+        directory / "config.json",
+        R"({"model_type":"gpt2","n_embd":5,"n_head":1,"n_layer":1,"n_positions":8,"n_ctx":8,"vocab_size":6,"n_inner":8,"layer_norm_epsilon":0.00001,"activation_function":"gelu_new","bos_token_id":0,"eos_token_id":5})");
+    write_tiny_gpt2_safetensors(directory / "model.safetensors", original);
+
+    bool threw = false;
+    try {
+        static_cast<void>(lcqi::load_gpt2_from_directory(directory));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    std::filesystem::remove_all(directory);
+    require(threw, "GPT-2 loader should reject bad tensor shape");
 }
 
 void test_reference_rms_norm() {
@@ -393,6 +733,11 @@ int main() {
         test_safetensors_manifest_contract();
         test_safetensors_rejects_bad_offsets();
         test_safetensors_rejects_bad_dtype_shape_size();
+        test_safetensors_reads_float_tensors();
+        test_gpt2_tiny_forward_and_generation();
+        test_gpt2_byte_bpe_tokenizer();
+        test_gpt2_loads_hf_style_tiny_checkpoint();
+        test_gpt2_loader_rejects_bad_shape();
         test_reference_rms_norm();
         test_reference_rope();
         test_reference_kv_attention();

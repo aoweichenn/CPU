@@ -43,9 +43,9 @@ padding side & position id 和 mask & RoPE/KV 位置错 \\
 
 报告不能只写“加载 tokenizer 成功”。它要固定一个 prompt fixture，输出 token ids、special token 位置、chat template 展开文本 hash 和 tokenizer 配置 hash。若 tokenizer.json、SentencePiece model 或 GGUF 内嵌 tokenizer 互相冲突，verifier 必须拒绝或明确选择优先级。
 
-\subsection{当前 lab 的 tokenizer 合同}
+\subsection{当前 lab 的 tokenizer 合同与 GPT-2 BPE}
 
-当前 \filepath{books/cpu-volume-3/labs/linux\_cpu\_inference} 已经把 tokenizer 从“正文要求”推进到可运行 fixture。它不是完整 BPE 或 SentencePiece 实现，而是一个最小合同：BOS/EOS、UNK 策略、chat template hash、词表、prompt fixture 和合同 hash。
+当前 \filepath{books/cpu-volume-3/labs/linux\_cpu\_inference} 先把 tokenizer 从“正文要求”推进到可运行 fixture。这个 fixture 不是完整 BPE 或 SentencePiece 实现，而是一个最小合同：BOS/EOS、UNK 策略、chat template hash、词表、prompt fixture 和合同 hash。
 
 \begin{lstlisting}[numbers=none,caption={tiny tokenizer fixture 的核心字段}]
 LCQI_TOKENIZER_V1
@@ -86,7 +86,16 @@ tokenizer_gate:
   embedding_vocab_match:
 \end{lstlisting}
 
-完整 BPE/SentencePiece 的复杂度在分词算法本身；工程风险在合同漂移。实验代码先固定合同，是为了让后续替换真实 tokenizer 时有可回归的出口。
+在这个最小合同之后，lab 进一步新增了 GPT-2 byte-level BPE 路径。GPT-2 的 tokenizer 不是按空格查词表，而是先把 UTF-8 字节映射到可逆 unicode 符号，再按 \code{merges.txt} 的 rank 做 BPE 合并，最后查 \code{vocab.json}。因此真实报告要同时保存 prompt ids 和 detokenize 结果，否则只看生成文本会掩盖 tokenizer 错误。
+
+\begin{lstlisting}[numbers=none,caption={GPT-2 tokenizer smoke 的关键证据}]
+prompt: Hello, my name is
+prompt_ids: 15496 11 616 1438 318
+generated_ids: 15496 11 616 1438 318 1757
+generated_text: Hello, my name is John
+\end{lstlisting}
+
+完整 SentencePiece、tokenizer.json 的所有 normalizer/pre-tokenizer 组合、chat template 和 GGUF 内嵌 tokenizer 仍然是后续工作。当前状态应准确写成：LCQI 已支持 GPT-2 byte-level BPE 的 reference path；还没有支持所有主流 tokenizer 方言。
 
 \section{GGUF、safetensors 和分片权重}
 
@@ -120,9 +129,9 @@ model_asset:
 
 真实加载器最容易错的是名字映射。不同生态对同一权重可能命名不同：\code{layers.0.attention.wq.weight}、\code{model.layers.0.self\_attn.q\_proj.weight}、\code{blk.0.attn\_q.weight}。加载器不能靠字符串猜完就算成功；它要把每个外部 tensor 映射到内部 graph value，并记录 unmapped、duplicate、shape mismatch、dtype mismatch 和 transpose requirement。
 
-\subsection{当前 lab 的 safetensors manifest gate}
+\subsection{当前 lab 的 safetensors manifest gate 与 GPT-2 权重读取}
 
-当前 lab 已经补了一个很小的 safetensors header 解析器。它不声称能加载完整 LLaMA/Qwen 权重，也不处理所有 JSON 细节；它只把真实模型格式最关键的目录事实落到可测试代码：header 长度、\code{\_\_metadata\_\_}、tensor name、dtype、shape、\code{data\_offsets}、payload 边界，以及 dtype/shape 推导出的字节数是否等于 offset 区间。
+当前 lab 已经补了一个 safetensors header 解析器。它把真实模型格式最关键的目录事实落到可测试代码：header 长度、\code{\_\_metadata\_\_}、tensor name、dtype、shape、\code{data\_offsets}、payload 边界，以及 dtype/shape 推导出的字节数是否等于 offset 区间。
 
 \begin{lstlisting}[numbers=none,caption={safetensors manifest gate 的最小证据}]
 SafeTensorManifest:
@@ -141,7 +150,7 @@ SafeTensorManifest:
       data_offsets = [24, 48]
 \end{lstlisting}
 
-测试会运行时生成一个合法 fixture，并验证两个 tensor 的名称、dtype、shape 和 offset；还会生成 \code{data\_offsets} 超出 payload、dtype/shape 字节数不匹配的坏文件，要求加载器拒绝。这个 gate 的意义是把“权重格式导入”从口号压到第一层工程边界：任何后续 name mapping、shape verifier、mmap 或分片加载，都必须先建立可信 tensor table。若连 offset 范围和字节数都不检查，后端 kernel 读到的只是任意字节流。
+测试会运行时生成一个合法 fixture，并验证两个 tensor 的名称、dtype、shape 和 offset；还会生成 \code{data\_offsets} 超出 payload、dtype/shape 字节数不匹配的坏文件，要求加载器拒绝。新增 GPT-2 路径后，测试还会读取 F32/F16/BF16 tensor，临时写出一个 HuggingFace 风格 tiny GPT-2 \code{model.safetensors}，再通过 loader 读回并对齐 logits。这个 gate 的意义是把“权重格式导入”从口号压到工程边界：name mapping、shape verifier、dtype 转换和 Conv1D 转置都必须可测。若连 offset 范围和字节数都不检查，后端 kernel 读到的只是任意字节流。
 
 下一阶段应在这个 gate 上继续扩展，而不是绕开它：
 
@@ -155,7 +164,34 @@ safetensors_manifest
   -> first token trace
 \end{lstlisting}
 
-这样写能保持边界诚实：当前 lab 已经验证真实格式的目录合同，但还没有完成完整权重解释和首 token 真实模型 oracle。
+这样写能保持边界诚实：当前 lab 已经完成 GPT-2 子集的真实权重解释和生成 smoke，但还没有完成 7B 级模型、GGUF 自研解析、分片 safetensors、量化 block、KV cache 优化和外部框架逐 logits 对齐。
+
+\subsection{GPT-2 reference path：为什么要单独实现}
+
+GPT-2 与第三册早期的 LLaMA-like tiny decoder 不同。它使用 LayerNorm，而不是 RMSNorm；使用 learned absolute position embedding，而不是 RoPE；attention projection 在 HuggingFace 权重里是 packed QKV Conv1D；MLP 使用 GELU；\code{lm\_head} 通常与 token embedding 共享权重。若把 GPT-2 硬塞进原 decoder，读者会误以为这些结构差异只是变量名不同。
+
+因此 LCQI 新增 \code{gpt2\_reference.hpp/.cpp}。它的第一目标是正确性，不是吞吐：读取 \code{config.json}，加载 \code{vocab.json} 和 \code{merges.txt}，从 \code{model.safetensors} 读取 F32/F16/BF16 张量，解析两类 HuggingFace 权重名前缀，执行 LayerNorm、绝对位置嵌入、packed QKV、causal attention、GELU、tied lm head 和 greedy generation。
+
+\begin{lstlisting}[numbers=none,caption={运行 LCQI 自研 GPT-2 smoke}]
+make cpu3-gpt2-smoke
+\end{lstlisting}
+
+脚本下载 \code{openai-community/gpt2} 的标准资产到用户缓存目录，构建 \code{lcqi\_gpt2}，并把报告写入：
+
+\begin{lstlisting}[numbers=none,caption={GPT-2 smoke 报告路径}]
+books/cpu-volume-3/results/lcqi-gpt2-smoke.txt
+\end{lstlisting}
+
+最近一次本机报告显示：
+
+\begin{lstlisting}[numbers=none,caption={GPT-2 smoke 关键输出}]
+prompt_ids 15496 11 616 1438 318
+generated_ids 15496 11 616 1438 318 1757
+generated_text Hello, my name is John
+validation=PASS
+\end{lstlisting}
+
+这条 smoke 的结论也必须写窄。它证明 LCQI 自研 C++ reference path 已经能跑标准 GPT-2 safetensors 的 tokenizer、权重导入、forward 和 greedy generation；它不证明高性能，不证明 KV cache 已优化，不证明 7B 模型已支持，也不证明所有 HuggingFace 架构都能加载。下一步才是把 GPT-2 logits 与 Transformers/PyTorch golden 对齐、加入 KV cache、prefill/decode 分离、packed weight、线程并行和性能报告。
 
 \subsection{真实 small 模型 smoke：先证明开源资产能在本机跑}
 

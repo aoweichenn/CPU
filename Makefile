@@ -40,7 +40,7 @@ ALGO_EPUB_NAME := $(ALGO_EXPORT_NAME)
 CPP_EPUB_NAME := $(CPP_EXPORT_NAME)
 CSE_EPUB_NAME := $(CSE_EXPORT_NAME)
 
-.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-smollm2-smoke cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-test books-export algo-check algo-pdf algo-epub algo-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export clean
+.PHONY: all cpu-check cpu-pdf cpu-epub cpu-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-epub cpu1p-export cpu1p-test cpu2-check cpu2-pdf cpu2-epub cpu2-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-epub cpu3-export cpu3-smollm2-smoke cpu3-gpt2-smoke cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-epub cpu3p-export cpu3p-test books-export algo-check algo-pdf algo-epub algo-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-epub cpp-export cpp-text-count cpp-text-target cse-check cse-pdf cse-epub cse-export clean
 
 all: cpu-pdf cpu-epub
 
@@ -118,6 +118,9 @@ cpu3-export: cpu3-pdf cpu3-epub
 
 cpu3-smollm2-smoke:
 	python3 $(CPU3_BOOK_DIR)/tools/run_smollm2_small_smoke.py
+
+cpu3-gpt2-smoke:
+	python3 $(CPU3_BOOK_DIR)/tools/run_gpt2_smoke.py
 
 cpu3p-check:
 	$(MAKE) -C $(CPU3P_LATEX_DIR) check

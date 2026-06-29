@@ -1,4 +1,5 @@
 add_library(lcqi STATIC
+    src/gpt2_reference.cpp
     src/inference.cpp
     src/int8_kernels.cpp
     src/model.cpp
@@ -60,6 +61,16 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi_trace PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
+add_executable(lcqi_gpt2
+    src/gpt2_cli.cpp
+)
+
+target_link_libraries(lcqi_gpt2 PRIVATE lcqi)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lcqi_gpt2 PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
 add_executable(lcqi_ledger
     src/ledger.cpp
 )
@@ -99,6 +110,10 @@ if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
 endif()
 
 add_test(NAME lcqi_tests COMMAND $<TARGET_FILE:lcqi_tests>)
+add_test(NAME lcqi_gpt2_tiny COMMAND $<TARGET_FILE:lcqi_gpt2>)
+set_tests_properties(lcqi_gpt2_tiny PROPERTIES
+    PASS_REGULAR_EXPRESSION "generated_ids 1 2 3 3 3"
+)
 add_test(NAME lcqi_trace COMMAND $<TARGET_FILE:lcqi_trace>)
 set_tests_properties(lcqi_trace PROPERTIES
     PASS_REGULAR_EXPRESSION "tokenizer,0,-1,5,1,i32,contiguous,10,4,0;1;2;3;4"

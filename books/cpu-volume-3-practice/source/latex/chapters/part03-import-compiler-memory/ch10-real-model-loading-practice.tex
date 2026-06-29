@@ -2,17 +2,19 @@
 
 本章对应原书中的第三册“真实模型加载闭环：Tokenizer、权重格式与首 token trace”。不要把它当作概念复述，本章要把 tokenizer、weight mapping、chat template、first token trace、checksum 放到同一个可运行项目里检查。贯穿代码仍然是 \filepath{books/cpu-volume-3/labs/linux\_cpu\_inference}；如果某个实验在当前机器上不能验证，报告必须写清降级原因，不能把源码存在当作实测证据。
 
-本章新增一个明确边界：tiny fixture 负责手算和逐层 oracle，真实 small 模型负责证明“开源模型资产确实能在本机 CPU 上加载并生成”。二者不能互相冒充。tiny MLP 算对，不等于真实 GGUF 加载器完成；真实 small 模型能输出文本，也不等于回答质量正确或 LCQI 自研后端已经支持完整 GGUF。
+本章新增一个明确边界：tiny fixture 负责手算和逐层 oracle；LCQI GPT-2 reference path 负责证明自研代码已经能加载标准 GPT-2 safetensors、执行 byte-level BPE、跑 GPT-2 forward 并 greedy 生成；SmolLM2 small smoke 负责证明外部 llama.cpp 路径能加载 GGUF small 模型。三者不能互相冒充。tiny MLP 算对，不等于 GPT-2 完成；GPT-2 reference 能出一个 token，不等于高性能 KV cache runtime 完成；SmolLM2 能输出文本，也不等于 LCQI 自研 GGUF 后端完成。
 
 \practicesection{一、对应原书问题：概念必须落到对象和命令}
 
-原书讲的是系统边界，本章实践要回答三个问题。第一，哪个代码对象承载这个概念；第二，哪个命令能产生可复查输出；第三，哪个坏输入或缺失字段能证明边界不是空话。这里有两组核心对象。第一组是 \code{tiny_tokenizer.txt}、reference decoder 和 \cmd{lcqi_trace}，用于手算 token 合同和逐 checkpoint 追踪。第二组是 \filepath{tools/run\_smollm2\_small\_smoke.py}，用于下载并校验 SmolLM2-135M-Instruct 的 GGUF 量化文件，再通过 llama.cpp 在 CPU 上实际生成 assistant 文本。
+原书讲的是系统边界，本章实践要回答三个问题。第一，哪个代码对象承载这个概念；第二，哪个命令能产生可复查输出；第三，哪个坏输入或缺失字段能证明边界不是空话。这里有三组核心对象。第一组是 \code{tiny_tokenizer.txt}、reference decoder 和 \cmd{lcqi_trace}，用于手算 token 合同和逐 checkpoint 追踪。第二组是 \code{gpt2_reference.hpp/.cpp}、\cmd{lcqi_gpt2} 和 \filepath{tools/run\_gpt2\_smoke.py}，用于自研 GPT-2 safetensors 路径。第三组是 \filepath{tools/run\_smollm2\_small\_smoke.py}，用于下载并校验 SmolLM2-135M-Instruct 的 GGUF 量化文件，再通过 llama.cpp 在 CPU 上实际生成 assistant 文本。
 
 \begin{lstlisting}[numbers=none,caption={第 10 章实践：真实模型加载闭环与首 Token Trace 的最小命令入口}]
 cmake -S books/cpu-volume-3 -B books/cpu-volume-3/build/lcqi-debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build books/cpu-volume-3/build/lcqi-debug
 ctest --test-dir books/cpu-volume-3/build/lcqi-debug --output-on-failure
 # chapter focus: lcqi_trace / tiny_tokenizer.txt
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_gpt2
+make cpu3-gpt2-smoke
 make cpu3-smollm2-smoke
 \end{lstlisting}
 
@@ -22,7 +24,37 @@ make cpu3-smollm2-smoke
 
 从这个特例推出的规律是：真实模型加载不是下载权重；必须先让 tokenizer 合同、权重 role、shape verifier 和首 token trace 形成闭环。这条规律要写进报告，不要只写“运行成功”。运行成功只说明某条路径没崩，解释清楚输入、输出、错误路径和不可验证边界，才说明学会了这个知识点。
 
-\practicesection{三、真实 small 模型 smoke：不用 tiny，先让开源模型实际跑起来}
+\practicesection{三、自研 GPT-2 reference smoke：先把标准 safetensors 跑通}
+
+GPT-2 不是 LLaMA。它使用 LayerNorm，不是 RMSNorm；使用 learned absolute position embedding，不是 RoPE；attention 里的 Q/K/V 在 HuggingFace 权重中是 packed Conv1D 权重；MLP 使用 GELU，不是 SwiGLU；\code{lm\_head} 通常和 token embedding 共享权重。把 GPT-2 硬塞进原来的 LLaMA-like tiny decoder，会让概念混乱，所以 LCQI 新增了独立的 \code{gpt2\_reference} 模块。
+
+仓库内最小验收分两层。第一层不下载模型，运行 tiny GPT-2 fixture：
+
+\begin{lstlisting}[numbers=none,caption={仓库内 tiny GPT-2 数学闭环}]
+books/cpu-volume-3/build/lcqi-debug/labs/linux_cpu_inference/lcqi_gpt2
+\end{lstlisting}
+
+它固定 prompt ids 为 \code{1 2 3}，检查 logits、predicted token 和 greedy generated ids。对应测试还会临时写出一个 HuggingFace 风格 \code{model.safetensors}，再用 loader 读回来，覆盖 tensor name mapping、shape verifier、Conv1D 转置和 tied lm head。坏 shape 必须在 loader 阶段被拒绝。
+
+第二层下载真实 GPT-2 资产：
+
+\begin{lstlisting}[numbers=none,caption={LCQI 自研 GPT-2 smoke}]
+make cpu3-gpt2-smoke
+\end{lstlisting}
+
+脚本下载 \code{openai-community/gpt2} 的 \code{config.json}、\code{vocab.json}、\code{merges.txt} 和 \code{model.safetensors} 到用户缓存目录，不提交模型文件。最近一次报告写到：
+
+\begin{lstlisting}[numbers=none,caption={GPT-2 smoke 报告关键字段}]
+books/cpu-volume-3/results/lcqi-gpt2-smoke.txt
+prompt_ids 15496 11 616 1438 318
+generated_ids 15496 11 616 1438 318 1757
+generated_text Hello, my name is John
+validation=PASS
+\end{lstlisting}
+
+这说明自研 LCQI C++ reference path 已经能跑标准 GPT-2 safetensors 的 tokenizer、权重导入、forward 和 greedy generation。边界也要写清：当前实现为了可读和可验证，会重跑完整前缀，没有 KV cache、没有 packed weight、没有多线程，也没有把 logits 与 PyTorch/Transformers 的逐数值 golden 报告纳入仓库。因此它是正确性闭环，不是性能结论。
+
+\practicesection{四、真实 small 模型 smoke：不用 tiny，先让开源模型实际跑起来}
 
 本章的真实模型 smoke 固定为 \code{SmolLM2-135M-Instruct}，规模是 135M 参数，不是 tiny 随机夹具。脚本使用 GGUF 文件 \code{SmolLM2-135M-Instruct-Q4\_K\_M.gguf}，来源仓库是 \code{bartowski/SmolLM2-135M-Instruct-GGUF}，原模型组织是 \code{HuggingFaceTB}，license 字段为 \code{apache-2.0}。脚本不会把模型文件提交到仓库，而是缓存到用户目录；验收时检查文件大小 \code{105454432} 字节和 SHA256：
 
@@ -48,18 +80,20 @@ books/cpu-volume-3/results/lcqi-smollm2-small-model-smoke.txt
 
 报告里必须至少出现这些字段：\code{model_expected_sha256}、\code{llama_cpp_commit}、\code{command}、\code{exit_code=0}、\code{validation=PASS} 和 \code{assistant_response}。如果只有下载日志，没有 assistant response，不能算通过；如果 assistant response 内容答错了，也不能改写成“质量通过”。本章只验证真实模型资产可加载、可 tokenize、可 decode、可生成非空文本。
 
-\practicesection{四、实践任务：把观察固定成报告字段}
+\practicesection{五、实践任务：把观察固定成报告字段}
 
 任务一：定位源码。至少阅读 \filepath{books/cpu-volume-3/labs/linux\_cpu\_inference/README.md}、相关 \filepath{include/lcqi} 头文件和一个 \filepath{src} 实现文件。报告要写出函数入口、输入对象、输出对象和错误处理方式。
 
 任务二：运行命令。保存构建命令、测试命令、核心输出和环境字段。若命令依赖 AVX2、perf、GPU、NUMA 或外部库，必须记录当前机器是否支持；不支持时把结论降级为“接口已设计，性能未验证”。
 
-任务三：运行真实 small 模型 smoke。报告不许只贴“命令执行成功”，必须解释脚本为什么校验模型 hash、为什么固定 \code{llama.cpp} commit、为什么使用 \code{-ngl 0}，以及为什么 assistant response 非空只是 smoke，不是质量评测。
+任务三：运行 GPT-2 smoke。报告不许只贴“生成了 John”，必须解释 \code{config.json}、\code{vocab.json}、\code{merges.txt}、\code{model.safetensors} 各自对应哪段代码，为什么 GPT-2 需要 byte-level BPE，为什么 HuggingFace Conv1D 权重要转置，为什么 \code{lm\_head} 可以 tied 到 embedding。
 
-任务四：构造反例。围绕本章知识点设计一个坏输入、缺失字段或不满足前提的场景，说明系统应拒绝、降级、fallback 还是继续执行。只给正常路径不合格。真实模型 smoke 的反例可以是：模型 SHA256 不匹配、网络不可用、\code{cmake} 缺失、assistant response 为空、命令超时。每个反例都要写清期望处理方式。
+任务四：运行真实 small 模型 smoke。报告不许只贴“命令执行成功”，必须解释脚本为什么校验模型 hash、为什么固定 \code{llama.cpp} commit、为什么使用 \code{-ngl 0}，以及为什么 assistant response 非空只是 smoke，不是质量评测。
 
-\practicesection{五、验收和递进大作业}
+任务五：构造反例。围绕本章知识点设计一个坏输入、缺失字段或不满足前提的场景，说明系统应拒绝、降级、fallback 还是继续执行。只给正常路径不合格。GPT-2 反例可以是：tensor name 缺失、shape 和 config 不一致、vocab 中缺少 BPE merge 后 token、\code{max\_new\_tokens} 超过 context。真实模型 smoke 的反例可以是：模型 SHA256 不匹配、网络不可用、\code{cmake} 缺失、assistant response 为空、命令超时。每个反例都要写清期望处理方式。
 
-验收标准：报告能从一个具体输入推到工程规则；命令可以在仓库中复跑；输出字段能对应到源码；失败路径说得清；未验证边界不伪装成结论。新增真实模型 smoke 后，最低验收还包括：模型身份有 hash，模型规模不是 tiny，CPU 路径实际运行，报告里有非空 assistant response，并明确声明这不是自研 LCQI 完整 GGUF 支持。
+\practicesection{六、验收和递进大作业}
 
-递进大作业：提交真实模型迁移清单：需要新增哪些 tokenizer、name mapping、quant descriptor 和 golden trace。这个作业会被后续章节继续引用，命名、目录和字段不要随意变化。
+验收标准：报告能从一个具体输入推到工程规则；命令可以在仓库中复跑；输出字段能对应到源码；失败路径说得清；未验证边界不伪装成结论。新增 GPT-2 smoke 后，最低验收还包括：真实 GPT-2 文件身份有 hash，prompt ids 可解释，generated ids 可解释，文本反解码可解释，并明确声明这不是高性能推理结论。新增 SmolLM2 smoke 后，最低验收还包括：模型身份有 hash，模型规模不是 tiny，CPU 路径实际运行，报告里有非空 assistant response，并明确声明这不是自研 LCQI 完整 GGUF 支持。
+
+递进大作业：提交 GPT-2 reference path 的下一阶段迁移清单：KV cache、prefill/decode 分离、packed weight、线程并行、Transformers golden logits、更多模型方言 name mapping、分片 safetensors 和性能报告。这个作业会被后续章节继续引用，命名、目录和字段不要随意变化。
