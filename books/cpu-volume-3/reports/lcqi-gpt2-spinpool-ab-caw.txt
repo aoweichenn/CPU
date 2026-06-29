@@ -1,0 +1,93 @@
+# LCQI GPT-2 spin/yield worker-pool A/B on caw
+
+timestamp_utc=2026-06-29
+host=caw
+os=Linux 6.6.87.2-microsoft-standard-WSL2
+compiler=GCC 15.2.1
+build=CMAKE_BUILD_TYPE=Release through books/cpu-volume-3-practice
+model=/home/aoweichen/.cache/lcqi-gpt2-smoke
+prompt=Hello, my name is
+rounds=9
+engine=cached_kv
+
+Compared builds:
+
+- baseline_auto16: /tmp/cpu-lcqi-current-build/linux_cpu_inference/lcqi_gpt2
+- auto8_condvar: /tmp/cpu-lcqi-auto8-final-build/linux_cpu_inference/lcqi_gpt2
+- spinpool_auto8: /tmp/cpu-lcqi-spinpool-build/linux_cpu_inference/lcqi_gpt2
+- fixed8 cases pass --threads 8 to the same binaries.
+
+All compared runs produced identical generated token ids and text for each token count.
+
+## Accepted candidate
+
+The accepted code changes are:
+
+- Cap automatic GPT-2 worker count at 8 on caw-class CPUs.
+- Replace the cached-decoder worker pool's mutex/condition_variable hand-off with an atomic generation hand-off and bounded spin/yield wait.
+- Keep the worker pool scoped to one cached decoder session. Model loading, tokenizer work, and public model objects do not gain a global busy-wait service.
+
+This target matches the measured hotspot: each generated token runs many small row-parallel matvec regions across QKV, attention projection, MLP fc, MLP projection, and lm head. The old condition-variable hand-off was paid hundreds of times per short generation.
+
+## Auto threads: baseline_auto16 -> spinpool_auto8
+
+| max new tokens | baseline generate ms | spinpool generate ms | speedup | baseline decode ms | spinpool decode ms | hotspot total speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 53.7887 | 37.5403 | 30.21% | 22.4061 | 16.4644 | 30.21% |
+| 16 | 146.930 | 104.107 | 29.15% | 114.456 | 82.7741 | 29.15% |
+| 64 | 510.650 | 377.233 | 26.13% | 479.386 | 356.059 | 26.13% |
+
+Hotspot medians, auto threads:
+
+| max new tokens | qkv speedup | attn proj speedup | mlp fc speedup | mlp proj speedup | lm head speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 33.58% | 63.30% | 30.36% | 29.08% | 8.57% |
+| 16 | 34.46% | 61.16% | 29.82% | 31.20% | 6.88% |
+| 64 | 32.84% | 59.62% | 27.25% | 29.78% | 6.60% |
+
+## Auto threads: auto8_condvar -> spinpool_auto8
+
+This isolates the worker-pool hand-off change from the worker-count cap.
+
+| max new tokens | auto8 condvar generate ms | spinpool generate ms | speedup | auto8 condvar decode ms | spinpool decode ms | hotspot total speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 50.5068 | 37.5403 | 25.67% | 21.0790 | 16.4644 | 25.67% |
+| 16 | 147.796 | 104.107 | 29.56% | 116.631 | 82.7741 | 29.56% |
+| 64 | 474.141 | 377.233 | 20.44% | 447.116 | 356.059 | 20.44% |
+
+## Fixed --threads 8: auto8_fixed8 -> spinpool_fixed8
+
+This confirms the result is not only an automatic worker-count artifact.
+
+| max new tokens | auto8 fixed8 generate ms | spinpool fixed8 generate ms | speedup | auto8 fixed8 decode ms | spinpool fixed8 decode ms | hotspot total speedup |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 4 | 47.5870 | 38.9927 | 18.06% | 20.2389 | 16.4548 | 18.06% |
+| 16 | 135.136 | 103.683 | 23.28% | 107.971 | 83.1084 | 23.28% |
+| 64 | 463.330 | 373.601 | 19.37% | 436.541 | 353.065 | 19.37% |
+
+## Rejected 8-row AVX2 candidate
+
+A follow-up candidate changed the AVX2 row-range kernel from a 4-row block to an 8-row block while keeping the accepted spin/yield worker pool. It did not show stable benefit on caw and was not retained.
+
+Auto thread medians, spinpool row4 -> spinpool row8:
+
+| max new tokens | row4 generate ms | row8 generate ms | speedup |
+| ---: | ---: | ---: | ---: |
+| 4 | 37.4937 | 37.7082 | -0.57% |
+| 16 | 103.714 | 103.178 | 0.52% |
+| 64 | 374.439 | 374.457 | -0.00% |
+
+Fixed --threads 8 medians, spinpool row4 -> spinpool row8:
+
+| max new tokens | row4 generate ms | row8 generate ms | speedup |
+| ---: | ---: | ---: | ---: |
+| 4 | 36.8123 | 36.9807 | -0.46% |
+| 16 | 102.928 | 102.376 | 0.54% |
+| 64 | 371.807 | 377.053 | -1.41% |
+
+Conclusion: row8 is noise-level or worse for this CPU/model shape. Keeping the existing 4-row AVX2 row-range kernel is the better mainline choice.
+
+## Related rejected packed F32 candidate
+
+The earlier packed F32 path is documented in `books/cpu-volume-3/reports/lcqi-gpt2-packed-f32-ab-caw.txt`. It was not accepted because caw fixed-thread and microbenchmark evidence showed no stable end-to-end win, and row-major AVX2 was faster for the measured matvec shapes.
+

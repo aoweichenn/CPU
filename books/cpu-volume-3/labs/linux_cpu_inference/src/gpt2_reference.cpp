@@ -5,13 +5,12 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cmath>
 #include <cstddef>
 #include <fstream>
 #include <limits>
-#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -48,13 +47,25 @@ constexpr float LCQI_GPT2_GELU_SQRT_2_OVER_PI = 0.7978845608028654F;
 constexpr float LCQI_GPT2_GELU_CUBIC_COEFF = 0.044715F;
 constexpr float LCQI_GPT2_SOFTMAX_NEGATIVE_INFINITY =
     -std::numeric_limits<float>::infinity();
-constexpr std::int32_t LCQI_GPT2_MAX_AUTO_WORKERS = 16;
+constexpr std::int32_t LCQI_GPT2_MAX_AUTO_WORKERS = 8;
 constexpr std::int32_t LCQI_GPT2_DEFAULT_PARALLEL_MIN_ROWS = 512;
 constexpr std::int32_t LCQI_GPT2_PARALLEL_MIN_COLUMNS = 512;
 constexpr std::int64_t LCQI_GPT2_PARALLEL_MIN_OPS = 1'000'000;
 constexpr std::size_t LCQI_GPT2_PARALLEL_ROW_BLOCK_MULTIPLIER = 4;
+constexpr std::size_t LCQI_GPT2_WORKER_SPIN_PAUSES_BEFORE_YIELD = 4096;
 
 using Gpt2ProfileClock = std::chrono::steady_clock;
+
+void pause_worker_spin(std::size_t& pause_count) noexcept {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_ia32_pause();
+#endif
+    ++pause_count;
+    if (pause_count >= LCQI_GPT2_WORKER_SPIN_PAUSES_BEFORE_YIELD) {
+        pause_count = 0;
+        std::this_thread::yield();
+    }
+}
 
 }  // namespace
 
@@ -71,17 +82,13 @@ public:
             static_cast<std::size_t>(this->worker_count_ - 1);
         this->threads_.reserve(background_count);
         for (std::size_t index = 0; index < background_count; ++index) {
-            this->threads_.emplace_back([this]() { this->worker_loop(); });
+            this->threads_.emplace_back([this, index]() { this->worker_loop(index); });
         }
     }
 
     ~Gpt2ParallelWorkerPool() {
-        {
-            std::lock_guard<std::mutex> lock(this->mutex_);
-            this->stopping_ = true;
-            ++this->generation_;
-        }
-        this->condition_.notify_all();
+        this->stopping_.store(true, std::memory_order_release);
+        this->generation_.fetch_add(1, std::memory_order_release);
         for (std::thread& thread : this->threads_) {
             if (thread.joinable()) {
                 thread.join();
@@ -119,27 +126,27 @@ public:
         }
 
         auto task_context = ParallelTaskContext<Function>{function};
-        {
-            std::lock_guard<std::mutex> lock(this->mutex_);
-            this->task_begin_ = begin;
-            this->task_end_ = end;
-            this->task_count_ = task_count;
-            this->next_worker_index_ = 0;
-            this->active_workers_ = task_count - 1;
-            this->task_context_ = &task_context;
-            this->task_invoke_ = &ParallelTaskContext<Function>::invoke;
-            ++this->generation_;
-        }
-        this->condition_.notify_all();
+        // Publish all task metadata before the generation bump; workers use the
+        // generation acquire load as the hand-off point for this stack context.
+        this->task_begin_.store(begin, std::memory_order_release);
+        this->task_end_.store(end, std::memory_order_release);
+        this->task_count_.store(task_count, std::memory_order_release);
+        this->task_context_.store(&task_context, std::memory_order_release);
+        this->task_invoke_.store(&ParallelTaskContext<Function>::invoke,
+                                 std::memory_order_release);
+        this->active_workers_.store(task_count - 1, std::memory_order_release);
+        this->generation_.fetch_add(1, std::memory_order_release);
 
         const std::size_t main_worker = task_count - 1;
         const auto [main_begin, main_end] = this->chunk_bounds(begin, end, task_count, main_worker);
         function(main_begin, main_end);
 
-        std::unique_lock<std::mutex> lock(this->mutex_);
-        this->finished_.wait(lock, [this]() { return this->active_workers_ == 0; });
-        this->task_context_ = nullptr;
-        this->task_invoke_ = nullptr;
+        std::size_t pause_count = 0;
+        while (this->active_workers_.load(std::memory_order_acquire) != 0) {
+            pause_worker_spin(pause_count);
+        }
+        this->task_context_.store(nullptr, std::memory_order_release);
+        this->task_invoke_.store(nullptr, std::memory_order_release);
     }
 
 private:
@@ -155,18 +162,14 @@ private:
 
     std::int32_t worker_count_ = 1;
     std::vector<std::thread> threads_;
-    std::mutex mutex_;
-    std::condition_variable condition_;
-    std::condition_variable finished_;
-    bool stopping_ = false;
-    std::uint64_t generation_ = 0;
-    std::size_t task_begin_ = 0;
-    std::size_t task_end_ = 0;
-    std::size_t task_count_ = 0;
-    std::size_t next_worker_index_ = 0;
-    std::size_t active_workers_ = 0;
-    void* task_context_ = nullptr;
-    void (*task_invoke_)(void*, std::size_t, std::size_t) = nullptr;
+    std::atomic<bool> stopping_ = false;
+    std::atomic<std::uint64_t> generation_ = 0;
+    std::atomic<std::size_t> task_begin_ = 0;
+    std::atomic<std::size_t> task_end_ = 0;
+    std::atomic<std::size_t> task_count_ = 0;
+    std::atomic<std::size_t> active_workers_ = 0;
+    std::atomic<void*> task_context_ = nullptr;
+    std::atomic<void (*)(void*, std::size_t, std::size_t)> task_invoke_ = nullptr;
 
     [[nodiscard]] static std::int32_t normalize_worker_count(std::int32_t requested_workers) {
         if (requested_workers > 0) {
@@ -193,49 +196,53 @@ private:
         return {chunk_begin, chunk_end};
     }
 
-    void worker_loop() {
+    void worker_loop(std::size_t worker_index) {
         std::uint64_t observed_generation = 0;
+        std::size_t pause_count = 0;
         while (true) {
-            std::size_t worker_index = 0;
-            std::size_t begin = 0;
-            std::size_t end = 0;
-            void* task_context = nullptr;
-            void (*task_invoke)(void*, std::size_t, std::size_t) = nullptr;
-            {
-                std::unique_lock<std::mutex> lock(this->mutex_);
-                this->condition_.wait(lock, [this, observed_generation]() {
-                    return this->stopping_ || this->generation_ != observed_generation;
-                });
-                if (this->stopping_) {
+            const std::uint64_t current_generation =
+                this->generation_.load(std::memory_order_acquire);
+            if (current_generation == observed_generation) {
+                if (this->stopping_.load(std::memory_order_acquire)) {
                     return;
                 }
-                observed_generation = this->generation_;
-                if (this->task_context_ == nullptr || this->task_invoke_ == nullptr ||
-                    this->next_worker_index_ >= this->task_count_ - 1) {
-                    continue;
-                }
-                worker_index = this->next_worker_index_;
-                ++this->next_worker_index_;
-                const auto bounds =
-                    this->chunk_bounds(this->task_begin_,
-                                       this->task_end_,
-                                       this->task_count_,
-                                       worker_index);
-                begin = bounds.first;
-                end = bounds.second;
-                task_context = this->task_context_;
-                task_invoke = this->task_invoke_;
+                pause_worker_spin(pause_count);
+                continue;
             }
 
+            observed_generation = current_generation;
+            pause_count = 0;
+            if (this->stopping_.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            const std::size_t task_count = this->task_count_.load(std::memory_order_acquire);
+            if (this->generation_.load(std::memory_order_acquire) != current_generation) {
+                continue;
+            }
+            const std::size_t background_task_count = task_count - 1;
+            if (worker_index >= background_task_count) {
+                continue;
+            }
+            void* task_context = this->task_context_.load(std::memory_order_acquire);
+            void (*task_invoke)(void*, std::size_t, std::size_t) =
+                this->task_invoke_.load(std::memory_order_acquire);
+            if (task_context == nullptr || task_invoke == nullptr) {
+                continue;
+            }
+            const std::size_t task_begin = this->task_begin_.load(std::memory_order_acquire);
+            const std::size_t task_end = this->task_end_.load(std::memory_order_acquire);
+            if (this->generation_.load(std::memory_order_acquire) != current_generation) {
+                continue;
+            }
+            const auto [begin, end] =
+                this->chunk_bounds(task_begin,
+                                   task_end,
+                                   task_count,
+                                   worker_index);
             task_invoke(task_context, begin, end);
 
-            {
-                std::lock_guard<std::mutex> lock(this->mutex_);
-                --this->active_workers_;
-                if (this->active_workers_ == 0) {
-                    this->finished_.notify_one();
-                }
-            }
+            this->active_workers_.fetch_sub(1, std::memory_order_acq_rel);
         }
     }
 };
