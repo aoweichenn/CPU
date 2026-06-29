@@ -1,5 +1,6 @@
 #include <lcqi/gpt2_reference.hpp>
 
+#include <lcqi/f32_kernels.hpp>
 #include <lcqi/safetensors.hpp>
 
 #include <algorithm>
@@ -698,13 +699,14 @@ void linear_f32_unchecked(const Gpt2LinearF32& linear,
                           std::span<float> output) {
     const std::size_t input_size = static_cast<std::size_t>(linear.input_size);
     const std::size_t output_size = static_cast<std::size_t>(linear.output_size);
+    const bool has_bias = !linear.bias.empty();
+    const float* weights = linear.weights.data();
+    const float* bias = linear.bias.data();
+    const float* input_data = input.data();
     for (std::size_t out = 0; out < output_size; ++out) {
-        float sum = linear.bias.empty() ? 0.0F : linear.bias[out];
-        const std::size_t row_base = out * input_size;
-        for (std::size_t in = 0; in < input_size; ++in) {
-            sum += linear.weights[row_base + in] * input[in];
-        }
-        output[out] = sum;
+        const float* row = weights + out * input_size;
+        output[out] =
+            dot_f32_unchecked(row, input_data, input_size) + (has_bias ? bias[out] : 0.0F);
     }
 }
 
@@ -802,12 +804,10 @@ void linear_f32_unchecked_parallel(const Gpt2LinearF32& linear,
             std::size_t begin,
             std::size_t end) {
             for (std::size_t out = begin; out < end; ++out) {
-                float sum = has_bias ? bias[out] : 0.0F;
                 const float* row = weights + out * input_size;
-                for (std::size_t in = 0; in < input_size; ++in) {
-                    sum += row[in] * input_data[in];
-                }
-                output_data[out] = sum;
+                output_data[out] =
+                    dot_f32_unchecked(row, input_data, input_size) +
+                    (has_bias ? bias[out] : 0.0F);
             }
         };
     worker_pool->parallel_for_rows(0, output_size, parallel_row_grain(output_size, *worker_pool), rows_fn);
@@ -1105,12 +1105,8 @@ void compute_logits(const Gpt2ReferenceModel& model,
             std::size_t begin,
             std::size_t end) {
             for (std::size_t token = begin; token < end; ++token) {
-                float sum = 0.0F;
                 const float* row = weight_data + token * hidden_size;
-                for (std::size_t dim = 0; dim < hidden_size; ++dim) {
-                    sum += row[dim] * hidden_data[dim];
-                }
-                logits_data[token] = sum;
+                logits_data[token] = dot_f32_unchecked(row, hidden_data, hidden_size);
             }
         };
     if (should_parallelize_rows(options, vocab_size, hidden_size, worker_pool)) {
@@ -1144,11 +1140,8 @@ struct Gpt2TokenScore {
     Gpt2TokenScore best;
     best.token = static_cast<std::int32_t>(begin);
     for (std::size_t token = begin; token < end; ++token) {
-        float sum = 0.0F;
         const float* row = weight_data + token * hidden_size;
-        for (std::size_t dim = 0; dim < hidden_size; ++dim) {
-            sum += row[dim] * hidden_data[dim];
-        }
+        const float sum = dot_f32_unchecked(row, hidden_data, hidden_size);
         if (token == begin || sum > best.value) {
             best.value = sum;
             best.token = static_cast<std::int32_t>(token);

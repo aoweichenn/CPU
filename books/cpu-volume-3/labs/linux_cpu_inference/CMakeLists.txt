@@ -1,6 +1,7 @@
 find_package(Threads REQUIRED)
 
 add_library(lcqi STATIC
+    src/f32_kernels.cpp
     src/gpt2_reference.cpp
     src/inference.cpp
     src/int8_kernels.cpp
@@ -12,7 +13,9 @@ add_library(lcqi STATIC
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+        target_sources(lcqi PRIVATE src/f32_kernels_avx2.cpp)
         target_sources(lcqi PRIVATE src/int8_kernels_avx2.cpp)
+        set_source_files_properties(src/f32_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
         set_source_files_properties(src/int8_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
         target_compile_definitions(lcqi PRIVATE LCQI_ENABLE_AVX2=1)
     endif()

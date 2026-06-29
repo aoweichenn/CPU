@@ -1,4 +1,5 @@
 #include <lcqi/gpt2_reference.hpp>
+#include <lcqi/f32_kernels.hpp>
 #include <lcqi/inference.hpp>
 #include <lcqi/int8_kernels.hpp>
 #include <lcqi/model.hpp>
@@ -37,7 +38,9 @@ constexpr float LCQI_RMS_EXPECTED_1 = 0.565685F;
 constexpr float LCQI_ATTENTION_EXPECTED_0 = 2.0F;
 constexpr float LCQI_ATTENTION_EXPECTED_1 = 3.0F;
 constexpr float LCQI_KERNEL_MAX_DIFF = 1.0e-5F;
+constexpr float LCQI_F32_KERNEL_MAX_DIFF = 1.0e-4F;
 constexpr std::int32_t LCQI_SIMD_TEST_BLOCK = 8;
+constexpr std::size_t LCQI_F32_DOT_TEST_SIZE = 257;
 constexpr std::int32_t LCQI_REFERENCE_DECODER_PREDICTED_TOKEN = 0;
 constexpr std::size_t LCQI_REFERENCE_DECODER_VOCAB_SIZE = 5;
 constexpr std::array<float, LCQI_REFERENCE_DECODER_VOCAB_SIZE> LCQI_REFERENCE_DECODER_LOGITS{
@@ -808,6 +811,38 @@ void test_packed_i8_kernel_matches_scalar() {
     }
 }
 
+void test_f32_dot_kernel_matches_scalar() {
+    std::vector<float> lhs(LCQI_F32_DOT_TEST_SIZE, 0.0F);
+    std::vector<float> rhs(LCQI_F32_DOT_TEST_SIZE, 0.0F);
+    for (std::size_t index = 0; index < LCQI_F32_DOT_TEST_SIZE; ++index) {
+        lhs[index] = static_cast<float>(static_cast<std::int32_t>(index % 19U) + 1) *
+                     0.03125F;
+        rhs[index] = static_cast<float>(static_cast<std::int32_t>(index % 23U) - 11) *
+                     0.0625F;
+    }
+
+    const float scalar =
+        lcqi::dot_f32_scalar_unchecked(lhs.data(), rhs.data(), lhs.size());
+    const float dispatched = lcqi::dot_f32(lhs, rhs);
+    require(std::fabs(scalar - dispatched) <= LCQI_F32_KERNEL_MAX_DIFF,
+            "F32 dot kernel output differs from scalar");
+
+    if (lcqi::dot_f32_avx2_available()) {
+        const float avx2 =
+            lcqi::dot_f32_avx2_unchecked(lhs.data(), rhs.data(), lhs.size());
+        require(std::fabs(scalar - avx2) <= LCQI_F32_KERNEL_MAX_DIFF,
+                "AVX2 F32 dot kernel output differs from scalar");
+    }
+
+    bool rejected_mismatch = false;
+    try {
+        (void)lcqi::dot_f32(std::span<const float>(lhs.data(), lhs.size() - 1U), rhs);
+    } catch (const std::runtime_error&) {
+        rejected_mismatch = true;
+    }
+    require(rejected_mismatch, "F32 dot kernel accepted mismatched sizes");
+}
+
 }  // namespace
 
 int main() {
@@ -829,6 +864,7 @@ int main() {
         test_reference_decoder_end_to_end();
         test_reference_decoder_trace_contract();
         test_packed_i8_kernel_matches_scalar();
+        test_f32_dot_kernel_matches_scalar();
 
         std::cout << "lcqi tests passed\n";
         return EXIT_SUCCESS;
