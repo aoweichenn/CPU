@@ -195,12 +195,13 @@ void print_ids(std::span<const std::int32_t> ids) {
     }
 
     const Clock::time_point generate_start = Clock::now();
-    std::int32_t predicted_token = 0;
     const Clock::time_point prefill_start = Clock::now();
-    for (const std::int32_t token_id : prompt_ids) {
-        predicted_token = decoder.step(token_id);
+    for (std::size_t index = 0; index + 1 < prompt_ids.size(); ++index) {
+        decoder.advance_without_prediction(prompt_ids[index]);
         ++timings.prefill_steps;
     }
+    std::int32_t predicted_token = decoder.step(prompt_ids.back());
+    ++timings.prefill_steps;
     const Clock::time_point prefill_end = Clock::now();
     timings.prefill_ms = elapsed_ms(prefill_start, prefill_end);
 

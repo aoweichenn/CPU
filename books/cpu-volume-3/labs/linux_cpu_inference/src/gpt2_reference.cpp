@@ -1145,6 +1145,12 @@ struct Gpt2TokenScore {
     float value = -std::numeric_limits<float>::infinity();
 };
 
+enum class Gpt2CachedStepMode {
+    advance_only,
+    predict_token,
+    logits,
+};
+
 [[nodiscard]] Gpt2TokenScore compute_predicted_token_range(const float* weight_data,
                                                            const float* hidden_data,
                                                            std::size_t hidden_size,
@@ -1207,7 +1213,7 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
                                                  Gpt2KvCache& cache,
                                                  Gpt2ForwardWorkspace& workspace,
                                                  std::int32_t token_id,
-                                                 bool need_logits,
+                                                 Gpt2CachedStepMode mode,
                                                  Gpt2HotspotProfile* hotspot_profile,
                                                  const Gpt2ExecutionOptions& options,
                                                  detail::Gpt2ParallelWorkerPool* worker_pool) {
@@ -1250,6 +1256,12 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
                                   worker_pool);
     }
 
+    Gpt2ForwardResult result;
+    if (mode == Gpt2CachedStepMode::advance_only) {
+        add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::total_step_ms, step_start);
+        return result;
+    }
+
     std::span<float> normed = workspace.normed();
     start = profile_start(hotspot_profile);
     layer_norm(hidden,
@@ -1259,8 +1271,7 @@ Gpt2ForwardResult run_gpt2_cached_step_unchecked(const Gpt2ReferenceModel& model
                normed);
     add_profile_ms(hotspot_profile, &Gpt2HotspotProfile::final_norm_ms, start);
 
-    Gpt2ForwardResult result;
-    if (need_logits) {
+    if (mode == Gpt2CachedStepMode::logits) {
         std::span<float> logits = workspace.logits();
         start = profile_start(hotspot_profile);
         compute_logits(model, normed, logits, options, worker_pool);
@@ -2229,12 +2240,23 @@ Gpt2CachedGreedyDecoder::Gpt2CachedGreedyDecoder(Gpt2CachedGreedyDecoder&&) noex
 Gpt2CachedGreedyDecoder& Gpt2CachedGreedyDecoder::operator=(
     Gpt2CachedGreedyDecoder&&) noexcept = default;
 
+void Gpt2CachedGreedyDecoder::advance_without_prediction(std::int32_t token_id) {
+    static_cast<void>(run_gpt2_cached_step_unchecked(*this->model_,
+                                                    this->cache_,
+                                                    this->workspace_,
+                                                    token_id,
+                                                    Gpt2CachedStepMode::advance_only,
+                                                    this->hotspot_profile_,
+                                                    this->execution_options_,
+                                                    this->worker_pool_.get()));
+}
+
 std::int32_t Gpt2CachedGreedyDecoder::step(std::int32_t token_id) {
     return run_gpt2_cached_step_unchecked(*this->model_,
                                           this->cache_,
                                           this->workspace_,
                                           token_id,
-                                          false,
+                                          Gpt2CachedStepMode::predict_token,
                                           this->hotspot_profile_,
                                           this->execution_options_,
                                           this->worker_pool_.get())
@@ -2246,7 +2268,7 @@ Gpt2ForwardResult Gpt2CachedGreedyDecoder::step_with_logits(std::int32_t token_i
                                           this->cache_,
                                           this->workspace_,
                                           token_id,
-                                          true,
+                                          Gpt2CachedStepMode::logits,
                                           this->hotspot_profile_,
                                           this->execution_options_,
                                           this->worker_pool_.get());
@@ -2331,7 +2353,7 @@ Gpt2ForwardResult run_gpt2_forward_cached(const Gpt2ReferenceModel& model,
         cache,
         workspace,
         token_id,
-        true,
+        Gpt2CachedStepMode::logits,
         nullptr,
         options,
         nullptr);
@@ -2376,10 +2398,10 @@ std::vector<std::int32_t> gpt2_generate_greedy_cached(
     if (max_new_tokens == 0) {
         return tokens;
     }
-    std::int32_t predicted_token = 0;
-    for (const std::int32_t token_id : prompt_token_ids) {
-        predicted_token = decoder.step(token_id);
+    for (std::size_t index = 0; index + 1 < prompt_token_ids.size(); ++index) {
+        decoder.advance_without_prediction(prompt_token_ids[index]);
     }
+    std::int32_t predicted_token = decoder.step(prompt_token_ids.back());
     for (std::int32_t step = 0; step < max_new_tokens; ++step) {
         if (tokens.size() >= checked_size(model.config.max_positions, "max_positions")) {
             throw std::runtime_error("GPT-2 generation would exceed max_positions");

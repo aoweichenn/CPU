@@ -569,6 +569,19 @@ void test_gpt2_tiny_forward_and_generation() {
     require(greedy_predicted == result.predicted_token,
             "optimized logits-free GPT-2 predicted token mismatch");
 
+    lcqi::Gpt2CachedGreedyDecoder prefill_decoder(model);
+    for (std::size_t index = 0; index + 1 < tokens.size(); ++index) {
+        prefill_decoder.advance_without_prediction(tokens[index]);
+    }
+    require(prefill_decoder.filled_tokens() ==
+                static_cast<std::int32_t>(tokens.size() - 1U),
+            "GPT-2 prefill-only decoder filled token count mismatch");
+    const std::int32_t prefill_predicted = prefill_decoder.step(tokens.back());
+    require(prefill_decoder.filled_tokens() == static_cast<std::int32_t>(tokens.size()),
+            "GPT-2 prefill decoder final filled token count mismatch");
+    require(prefill_predicted == result.predicted_token,
+            "GPT-2 prefill-skipped predicted token mismatch");
+
     lcqi::Gpt2HotspotProfile hotspot_profile;
     lcqi::Gpt2CachedGreedyDecoder profiled_decoder(model, &hotspot_profile);
     std::int32_t profiled_predicted = 0;

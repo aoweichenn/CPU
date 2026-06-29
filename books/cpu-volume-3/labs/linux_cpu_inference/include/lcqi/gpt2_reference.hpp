@@ -198,6 +198,7 @@ public:
     Gpt2CachedGreedyDecoder(Gpt2CachedGreedyDecoder&&) noexcept;
     Gpt2CachedGreedyDecoder& operator=(Gpt2CachedGreedyDecoder&&) noexcept;
 
+    void advance_without_prediction(std::int32_t token_id);
     [[nodiscard]] std::int32_t step(std::int32_t token_id);
     [[nodiscard]] Gpt2ForwardResult step_with_logits(std::int32_t token_id);
     [[nodiscard]] const Gpt2KvCache& cache() const noexcept;
