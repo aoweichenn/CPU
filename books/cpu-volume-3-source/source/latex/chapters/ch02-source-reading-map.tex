@@ -1,0 +1,113 @@
+\section{为什么要先讲调用链}
+
+源码卷如果只把 \code{*.cpp} 和 \code{*.hpp} 全部贴出来，读者仍然不知道从哪里下手。LCQI 的代码同时包含 tiny MLP、int8 kernel、tokenizer、safetensors、reference decoder、GPT-2、benchmark、trace、ledger、serving probe 和外部模型脚本；这些文件不是平铺关系，而是几条调用链。先讲调用链，再给完整源码，读者才能把每个文件放到正确位置。
+
+\begin{keyidea}
+读 LCQI 的顺序不是“哪个文件长先读哪个”，而是“入口、合同、资产、执行、证据”。入口说明目标怎样构建，合同说明类型怎样连接，资产说明模型从哪里来，执行说明 token 或张量怎样流动，证据说明测试和报告守住了哪些边界。
+\end{keyidea}
+
+\section{一、全工程入口：哪些文件决定能不能复现}
+
+\begin{longtable}{p{0.20\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+文件 & 负责什么 & 读源码时要确认什么 \\
+\hline
+\filepath{第三册 README} & 第三册 AI 计算工程路线、当前 LCQI 能力、GPT-2 smoke 和结果报告位置。 & 能力声明必须能在 \filepath{labs/linux_cpu_inference}、\filepath{tools} 和 \filepath{results} 中找到证据。 \\
+\filepath{第三册 CMake} & 第三册根 CMake，负责把 \filepath{linux_cpu_inference} 接入。 & 根 CMake 应保持薄层；真正 target 定义必须在 lab 内部，避免入口文件承担实现细节。 \\
+\filepath{实践卷 CMake} & 实践卷复用同一份 LCQI lab。 & 实践卷不复制源码，只把同一工程接入自己的测试构建，防止两份代码漂移。 \\
+\filepath{源码卷 Makefile} & 源码卷的书籍构建入口。 & 它构建 PDF/EPUB，也提供 \code{test} 目标去构建第三册 LCQI；源码卷不能只排版不验证。 \\
+\filepath{LCQI CMake} & \code{lcqi} 库、CLI、benchmark、trace、GPT-2、ledger、serving probe、CTest 目标。 & 读这里能看到哪些文件进入库，哪些是可执行程序，哪些依赖可选外部库。 \\
+\filepath{LCQI README} & 本地构建、tiny 推理、benchmark、trace、GPT-2、SmolLM2 smoke 的命令。 & 先按 README 跑命令，再读源码；否则不知道某个函数是否真的能从命令行触达。 \\
+\end{longtable}
+
+上表里的短标签对应这些真实路径：\filepath{cpu-volume-3/README.md}、\filepath{cpu-volume-3/CMakeLists.txt}、\filepath{cpu-volume-3-practice/CMakeLists.txt}、\filepath{cpu-volume-3-source/Makefile}、\filepath{linux_cpu_inference/CMakeLists.txt} 和 \filepath{linux_cpu_inference/README.md}。
+
+这些入口文件回答“代码在哪里”和“怎样运行”。读者打开源码卷时，先不要直接跳到 \filepath{gpt2_reference.cpp}。先确认 \code{lcqi} 静态库包含 \filepath{model.cpp}、\filepath{inference.cpp}、\filepath{int8_kernels.cpp}、\filepath{reference_decoder.cpp}、\filepath{tokenizer.cpp}、\filepath{safetensors.cpp} 和 \filepath{gpt2_reference.cpp}；再确认 \code{lcqi_cli}、\code{lcqi_bench}、\code{lcqi_trace}、\code{lcqi_gpt2}、\code{lcqi_ledger}、\code{lcqi_serving_probe} 和 \code{lcqi_tests} 分别从哪条路径进入。
+
+\section{二、Tiny MLP 调用链：最短闭环怎样跑通}
+
+Tiny MLP 是最小推理闭环，用来证明“模型资产、shape 检查、int8 linear、激活函数、logits、argmax、CLI 输出”可以完整连起来。它不是大模型能力本身，但它是后面所有复杂路径的可手算底座。
+
+\begin{longtable}{p{0.24\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+文件 & 关键类型或函数 & 这段代码的意思 \\
+\hline
+\filepath{models/tiny_mlp_i8.txt} & 输入维度、hidden 维度、输出维度、int8 权重、scale、bias。 & 这是模型资产。测试中的 golden logits 来自这里，资产改动必须带着测试改动。 \\
+\filepath{include/lcqi/model.hpp} & \code{QuantizedLinearLayer}、\code{TinyMlpModel}、\code{load_model}。 & 定义 tiny MLP 如何在内存中表示；只负责模型结构和加载入口，不做推理。 \\
+\filepath{src/model.cpp} & \code{read_i8_vector}、\code{validate_layer}、\code{load_model}。 & 解析文本模型，拒绝坏 key、坏维度、权重数量不匹配和非法 scale，把错误挡在执行前。 \\
+\filepath{include/lcqi/inference.hpp} & \code{InferenceResult}、\code{linear_i8}、\code{relu_inplace}、\code{run_inference}。 & 定义推理输出要包含 hidden、logits 和 predicted class，方便测试定位错误层。 \\
+\filepath{src/inference.cpp} & 输入 shape 检查、两层 int8 linear、ReLU、argmax。 & 最短执行路径：模型加输入变成 logits。这里的代码应保持清楚，不能混入 CLI 或文件解析。 \\
+\filepath{src/main.cpp} & 解析命令行输入并打印结果。 & CLI 是薄层；它只接模型路径和输入，不复制 \code{run_inference} 逻辑。 \\
+\end{longtable}
+
+这条链路按下面顺序读：\code{main()} 取得模型路径和输入向量，调用 \code{load_model()} 把 \filepath{tiny_mlp_i8.txt} 变成 \code{TinyMlpModel}，再调用 \code{run_inference()}。在 \code{run_inference()} 内部，第一层 \code{linear_i8()} 把 float 输入和 int8 权重相乘，乘以 scale 后加 bias；\code{relu_inplace()} 把负 hidden 截断；第二层 \code{linear_i8()} 得到 logits；最后 \code{argmax()} 给出 predicted class。
+
+读这个路径时要抓住边界条件。输入长度不等于 \code{input_size} 要立即拒绝；权重数量不是 \code{rows * columns} 要在加载时拒绝；logits 为空不能取 argmax。这些错误如果拖到 SIMD kernel 或 benchmark 里才暴露，定位成本会高很多。
+
+\section{三、Int8 Kernel 调用链：reference、packed、AVX2 和 benchmark 怎样对照}
+
+\begin{longtable}{p{0.24\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+文件 & 关键代码 & 这段代码的意思 \\
+\hline
+\filepath{include/lcqi/int8_kernels.hpp} & \code{PackedLinearI8}、\code{KernelBenchmarkCase}、\code{benchmark_linear_i8_case}。 & 定义 kernel 对标口径：shape、repeat、backend、平均耗时、checksum、max diff。 \\
+\filepath{src/int8_kernels.cpp} & \code{pack_linear_i8}、\code{linear_i8_packed}、\code{linear_i8_packed_with_workspace}、deterministic fixture。 & scalar 和 packed 路径是正确性基线，workspace 路径减少重复分配，fixture 让 benchmark 和测试可复现。 \\
+\filepath{src/int8_kernels_avx2.cpp} & \code{linear_i8_packed_avx2_available}、\code{linear_i8_packed_avx2}。 & 平台优化路径。必须先判断机器能力，再执行 AVX2/FMA；不可用时报告 unavailable，而不是假装测过。 \\
+\filepath{src/bench.cpp} & shape 列表、repeat 参数、backend 输出。 & benchmark 程序只负责测 kernel 入口。性能结论必须和 \code{max_abs_diff}、CPU、编译器、构建类型一起报告。 \\
+\end{longtable}
+
+kernel 文件要按“可信基线到优化路径”的顺序读。先看 deterministic layer 和 input 怎么生成，保证每次运行输入相同；再看 \code{linear_i8_packed()} 怎样把 int8 权重、scale、bias 和 float 输入算成输出；再看 workspace 路径怎样复用临时缓冲；最后看 AVX2 路径怎样在支持平台上替换内层循环。测试用 packed 与 scalar 的 \code{max_abs_diff} 对照，benchmark 再比较耗时。
+
+\section{四、Tokenizer、Safetensors 与 Reference Decoder：真实模型前的三道门}
+
+\begin{longtable}{p{0.24\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+文件 & 关键类型或函数 & 这段代码的意思 \\
+\hline
+\filepath{models/tiny_tokenizer.txt} & BOS、EOS、UNK、词表、模板 hash。 & 固定 tokenizer 合同，避免 prompt 到 token id 的规则漂移。 \\
+\filepath{include/lcqi/tokenizer.hpp} 与 \filepath{src/tokenizer.cpp} & \code{TokenizerModel}、\code{load_tokenizer}、\code{encode_prompt}、\code{tokenizer_contract_hash}。 & 把 prompt 切成稳定 token id；未知 token 是否允许，必须由 UNK 合同决定。 \\
+\filepath{include/lcqi/safetensors.hpp} 与 \filepath{src/safetensors.cpp} & \code{SafeTensorManifest}、\code{SafeTensorFile}、manifest parser、dtype 转换。 & 解析模型字节之前先验证 header、dtype、shape、offset 和 payload 边界，防止坏资产进入数学层。 \\
+\filepath{include/lcqi/reference_decoder.hpp} 与 \filepath{src/reference_decoder.cpp} & embedding、RMSNorm、RoPE、KV cache、attention、SwiGLU、trace checkpoint。 & Tiny decoder-only reference path。它用 checkpoint 解释每一步张量状态，不只返回最终 token。 \\
+\filepath{src/trace.cpp} & trace CSV 输出。 & 把 reference decoder 的 checkpoint 打印成可复查表格，定位错误发生在哪个阶段。 \\
+\end{longtable}
+
+这三道门分别解决三个问题。Tokenizer 解决“人写的 prompt 如何变成 token id”；Safetensors 解决“磁盘里的模型字节如何变成带 shape 的张量”；Reference Decoder 解决“token 和权重如何经过 decoder-only 层生成 logits”。任何一层含糊，后面的 GPT-2 路径都会变成看似能跑、实则无法定位的黑盒。
+
+\section{五、GPT-2 调用链：从 HuggingFace 资产到生成 token}
+
+GPT-2 路径是源码卷里最长的一条链，因为它要处理真实模型格式。读 \filepath{gpt2_reference.cpp} 时按模块读，不要从第一行一路滚到最后。
+
+\begin{longtable}{p{0.24\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+文件 & 关键代码 & 这段代码的意思 \\
+\hline
+\filepath{include/lcqi/gpt2_reference.hpp} & \code{Gpt2Config}、\code{Gpt2ReferenceModel}、\code{Gpt2KvCache}、\code{Gpt2Tokenizer}、forward/generate API。 & 公开 GPT-2 reference path 的合同：配置、权重、KV cache、tokenizer、full-prefix 和 cached generation。 \\
+\filepath{src/gpt2_reference.cpp} & JSON parser、byte-level BPE、safetensors loader、LayerNorm、QKV、causal attention、GELU、lm head、KV cache。 & 正确性优先实现。它把 HuggingFace GPT-2 权重名、Conv1D 转置、tokenizer 和 forward 规则全部显式写出来。 \\
+\filepath{src/gpt2_cli.cpp} & tiny mode、真实模型目录模式、generation、benchmark 输出。 & 命令行入口。无参数跑 tiny fixture；传模型目录时加载真实 GPT-2 资产；benchmark 对比 full-prefix 和 cached-KV。 \\
+\filepath{tools/run_gpt2_smoke.py} & 下载标准 GPT-2 资产，调用 \code{lcqi_gpt2}。 & 证明自研 safetensors、BPE、forward、KV cache 和 greedy generation 能跑真实开源模型。 \\
+\filepath{tools/run_gpt2_benchmark_compare.py} & 运行 LCQI full-prefix、cached-KV，并可附带成熟引擎参考。 & 用同一模型口径比较算法差距和 kernel 差距，不把不同模型的速度混成一个结论。 \\
+\end{longtable}
+
+GPT-2 代码按五段读。第一段是配置和权重加载：\code{load_gpt2_config()} 读 \filepath{config.json}，\code{load_gpt2_reference_model()} 从 safetensors 中取 embedding、每层 LayerNorm、QKV、MLP 和 final norm。HuggingFace GPT-2 的 Conv1D 权重形状和普通线性层方向不同，所以代码显式调用转置函数，不能跳过。
+
+第二段是 tokenizer：\code{load_gpt2_tokenizer()} 读 \filepath{vocab.json} 和 \filepath{merges.txt}，\code{gpt2_encode()} 执行 byte-level BPE，\code{gpt2_decode()} 把 id 还原为文本。这里的重点是字节到 Unicode 映射、BPE merge rank 和 unknown token 边界。
+
+第三段是 full-prefix forward：\code{run_gpt2_forward()} 每生成一个新 token 都用完整 token 前缀重新跑所有层。它慢，但容易验证。流程是 token embedding 加 position embedding，逐层执行 LayerNorm、packed QKV、causal attention、残差、MLP、残差，最后 final LayerNorm 和 tied lm head 得到 logits。
+
+第四段是 cached-KV forward：\code{Gpt2KvCache} 保存每层每个 position 的 key/value，\code{run_gpt2_forward_cached()} 每次只处理最新 token，并让 attention 读取过去 cache。这里要特别看 \code{validate_written()}：读取未写入 cache slot 必须报错，否则生成错误会很难定位。
+
+第五段是 greedy generation：\code{gpt2_generate_greedy()} 用 full-prefix 路径，\code{gpt2_generate_greedy_cached()} 用 KV cache 路径。两个函数都要检查 prompt 非空、\code{max_new_tokens} 非负、不会超过 \code{max_positions}，并在生成 EOS 时停止。
+
+\section{六、报告、服务探针、外部对标和测试}
+
+\begin{longtable}{p{0.24\linewidth}p{0.31\linewidth}p{0.35\linewidth}}
+文件 & 关键代码 & 这段代码的意思 \\
+\hline
+\filepath{src/ledger.cpp} & 7B 参数量、KV cache、bandwidth-only 上限。 & 输出的是工程账本，不是实测速度；它帮助读者估算权重和 KV 内存压力。 \\
+\filepath{src/serving_probe.cpp} & 短请求、RAG 请求、取消请求、超长请求，TTFT/TPOT 字段。 & 把服务层边界变成字段：哪些请求接受，哪些拒绝，取消后资源是否回收。 \\
+\filepath{src/onednn_bench.cpp} & oneDNN matmul benchmark。 & 可选外部库对标入口。没有 oneDNN 环境时不能声称已验证。 \\
+\filepath{tools/run_smollm2_small_smoke.py} & 下载 SmolLM2-135M-Instruct GGUF，构建固定 commit 的 llama.cpp smoke。 & 这是成熟外部引擎上的真实 small 模型 smoke，用来建立外部参照，不代表 LCQI 已具备同等能力。 \\
+\filepath{tools/run_lcqi_benchmark.sh} & 收集 LCQI 本地 benchmark。 & 在固定机器上重复运行同一组 shape，形成可复查 CSV 或文本报告。 \\
+\filepath{tests/lcqi_tests.cpp} & tiny MLP、tokenizer、safetensors、GPT-2 tiny、HF-style checkpoint、bad shape、decoder、trace、kernel。 & 这是源码卷最重要的证据。新增功能如果没有进入这里，就不能写成已经守住的能力。 \\
+\end{longtable}
+
+读测试文件时，不要只看最后是否返回 0。它里面的 fixture 本身就是源码讲解的一部分：测试会手写 safetensors header，构造 F16/BF16/F32 payload，生成 tiny GPT-2 权重，验证 bad shape 会被拒绝，比较 packed int8 kernel 和 scalar 路径。这些测试告诉读者“代码真正承诺了什么”。如果一个能力只出现在 README 或 CLI 输出里，却没有进入测试或 smoke 报告，就只能算实验入口，不能算稳定能力。
+
+\begin{sourcereadingbox}
+读完本章后，再去读后面的完整源码。每看到一个文件，都把它归到五类之一：入口、合同、资产解析、执行路径、证据。归不进去的文件，就说明工程边界需要重新解释或重构。
+\end{sourcereadingbox}

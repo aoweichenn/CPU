@@ -1,0 +1,114 @@
+\chapter{逐文件源码导读：每个文件到底在做什么}
+
+前两章解释了为什么要从 reference、contract、diagnostic 和 report 开始。本章把代码卷里的每个工程文件逐一讲清楚。读源码时不要把“完整源码”理解成把仓库打印出来就算完成；完整源码必须配上阅读路径：先看入口，再看合同，再看实现，再看测试和 benchmark。否则读者只会看到一堆类名和函数名，不知道它们在工程链条里负责哪一段。
+
+\begin{keyidea}
+代码卷的标准是：每个文件都要回答四个问题。第一，它解决什么具体问题；第二，它公开了哪些类型或命令；第三，它最容易出错的边界在哪里；第四，哪组测试、probe 或 benchmark 证明它不是纸面代码。
+\end{keyidea}
+
+\section{一、仓库入口：先确认工程怎样被构建}
+
+代码实践卷顶层只有三个入口文件，但它们决定后面所有源码能不能被复现。读者先看这些文件，目的不是背 CMake 语法，而是确认“这本代码卷到底构建哪些目标、测试怎样被挂进 CTest、PDF/EPUB 清单从哪里读源码”。
+
+\begin{longtable}{p{0.24\linewidth}p{0.30\linewidth}p{0.36\linewidth}}
+文件 & 这个文件负责什么 & 读源码时要检查什么 \\
+\hline
+\filepath{README.md} & 说明本卷和第二册原理卷的关系，列出 Compute Systems Engine 的阶段能力。 & 看阶段清单是否能在 \filepath{labs/} 下找到真实代码和测试；如果 README 声称有能力，源码、测试和报告必须跟上。 \\
+\filepath{CMakeLists.txt} & 设置 C++20、打开 \code{CTest}，把 \filepath{reference_pipeline} 和 \filepath{compute_systems} 加进构建。 & 确认公共入口足够薄；真正目标定义必须留在各 lab 自己的 CMake，避免全仓库入口变成杂物堆。 \\
+\filepath{Makefile} & 给书稿构建提供 \code{check}、\code{pdf}、\code{epub} 和 \code{clean}。 & 这是书籍交付入口，不是 C++ 工程测试入口；C++ 测试必须走 CMake/CTest。 \\
+\end{longtable}
+
+这三个文件的关系可以这样理解：\filepath{README.md} 说明目标，\filepath{CMakeLists.txt} 证明代码能被编译和测试，\filepath{Makefile} 负责把讲解和源码清单排成书。若只读实现文件而不读入口，很容易不知道某段代码是不是默认构建目标，也不知道它有没有进入测试。
+
+\section{二、Reference Pipeline：从一行文本到稳定报告}
+
+\filepath{reference_pipeline} 是第一条主线。它故意从很小的问题开始：输入是一批 \code{event,value} 文本行，输出是按 event 聚合的稳定计数。小问题不是为了降低要求，而是为了让每个工程边界都能手算：坏行怎样诊断，split 落在行中间怎么办，多个 partial result 合并后 checksum 是否仍然一致。
+
+\begin{longtable}{p{0.24\linewidth}p{0.30\linewidth}p{0.36\linewidth}}
+文件 & 核心代码 & 讲的工程问题 \\
+\hline
+\filepath{labs/reference_pipeline/README.md} & 构建命令、测试命令和 benchmark 入口。 & 先确认读者可以独立跑通本 lab；没有可复现命令，源码讲解就没有证据。 \\
+\filepath{labs/reference_pipeline/CMakeLists.txt} & \code{cse_reference_pipeline} 库、CLI、测试、benchmark 目标。 & 库目标只放可复用逻辑；CLI、测试和 benchmark 分开，避免业务逻辑藏在 \code{main()} 里。 \\
+\filepath{include/cse/reference_pipeline.hpp} & \code{RecordId}、\code{InputCase}、\code{InputSplit}、\code{ReferenceResult}、\code{ManifestRow}。 & 这是合同层。字段名先把输入身份、诊断、输出和发布清单说清楚，后面实现不能随意改变语义。 \\
+\filepath{src/reference_pipeline.cpp} & \code{run_reference}、\code{split_input_case}、\code{merge_reference_results}、\code{format_report}。 & 这是语义层。它把一行文本解析成记录或诊断，再把完整输入、split 输入和合并结果统一到同一份 checksum 口径。 \\
+\filepath{src/main.cpp} & 构造一份示例输入，调用 \code{run_reference} 并打印 report。 & CLI 只负责连接输入和输出，不复制解析逻辑；这能防止 demo 和库行为不一致。 \\
+\filepath{tests/reference_pipeline_tests.cpp} & 正常输入、坏行、split/merge、manifest 和 checksum 测试。 & 测试固定合同：坏行不能被吞掉，split 不能改变结果，报告字段顺序不能漂移。 \\
+\filepath{bench/reference_pipeline_bench.cpp} & Google Benchmark 入口。 & benchmark 只测入口成本，不替代正确性测试；性能数字必须先建立在 reference 语义稳定之上。 \\
+\end{longtable}
+
+阅读 \filepath{reference_pipeline.cpp} 时按函数链读。第一步是 \code{run_reference}：它创建结果对象，把输入文本交给 \code{process_text_lines}。第二步是 \code{process_text_lines}：它逐行维护 \code{byte_offset} 和 \code{line_number}，为每一行构造 \code{RecordId}。第三步是 \code{process_line}：它拆 CSV 字段，分别拒绝 \code{missing_field}、\code{extra_field}、\code{empty_event} 和 \code{bad_value}，只有合法记录才进入 \code{counts}。第四步是 \code{compute_checksum}：它按稳定顺序把 input、counts 和 diagnostics 压成摘要。
+
+这条链路最重要的不是“能解析 CSV”，而是每个失败都有可复查位置。比如输入：
+
+\begin{lstlisting}[numbers=none]
+view,1
+bad
+click,2,extra
+\end{lstlisting}
+
+第一行进入 \code{counts["view"]}，第二行进入 \code{missing_field}，第三行进入 \code{extra_field}。测试必须同时检查 \code{records_total=3}、\code{accepted=1}、两个 diagnostics 的 \code{line_number} 和 \code{error_kind}。如果后续 parser 重写后只剩一个“parse failed”，就算输出计数没错，也是不合格的工程退化。
+
+split/merge 是第二个阅读重点。\code{split_input_case} 不是按固定字节粗暴切块，而是把切点推进到完整行边界；\code{run_reference_split} 保留 split 的 \code{byte_begin} 和 \code{first_line_number}；\code{merge_reference_results} 再把 partial 的 records、accepted、diagnostics 和 counts 合回完整结果。测试用整文件 reference 对照 split 结果，证明“切开处理”和“一次处理”语义相同。
+
+\begin{sourcereadingbox}
+读完 Reference Pipeline 后，读者应能从任意一条坏输入追到四个位置：\code{RecordId} 怎样定位它，\code{process_line} 怎样分类它，\code{ReferenceResult} 怎样保存它，测试怎样断言它没有被优化路径吞掉。
+\end{sourcereadingbox}
+
+\section{三、Compute Systems 合同层：每个头文件先定义可观察事实}
+
+\filepath{compute_systems/include} 是第二条主线的合同层。头文件不是为了让代码“看起来正规”，而是先规定每章模型、并发原语和运行时探针能输出什么事实。读者先读头文件，再读实现，才知道实现里那些计数器、锁和条件变量到底服务哪个承诺。
+
+\begin{longtable}{p{0.25\linewidth}p{0.31\linewidth}p{0.34\linewidth}}
+头文件 & 公开合同 & 为什么要这样拆 \\
+\hline
+\filepath{chapter_models.hpp} & 21 组 \code{ChapterXX...Report} 和对应模型函数。 & 把第二册每章抽象成可手算、可打印、可测试的字段，例如 cache line、TLB miss、quorum、checkpoint replay。 \\
+\filepath{parallel_reduce.hpp} & \code{sequential_sum}、\code{parallel_sum}、\code{MutexCounter}、\code{AtomicCounter}、\code{BoundedMpmcQueue}。 & 从最简单的并行求和推到共享计数和有界队列；接口让并发正确性和等待指标都可观察。 \\
+\filepath{sync_primitives.hpp} & \code{PermitLimiterReport}、\code{PhaseBarrierReport}、\code{FutureResultReport}、\code{AtomicWaitReport}。 & 同步原语不能只说“能用”，必须输出最大并发、阶段推进、异常传播和版本唤醒次数。 \\
+\filepath{wait_channels.hpp} & \code{EventFdEpollReport} 和 \code{run_eventfd_epoll_contract}。 & Linux wait/wake 必须落到文件描述符、事件计数和 epoll 唤醒语义。 \\
+\filepath{task_runtime.hpp} & \code{TaskRuntime}、same-pool future wait probe、continuation runtime probe、CSV report。 & 任务运行时要暴露提交、完成、失败、拒绝、队列深度和关闭状态，不只给一个线程池模板。 \\
+\filepath{futex_lab.hpp} & futex mutex probe 和 futex contract probe 报告。 & futex 是内核等待合同，必须区分用户态快路径、内核 wait、wake、EINTR 和超时。 \\
+\end{longtable}
+
+合同层的读法是“先字段，后算法”。例如 \code{BoundedMpmcQueue::Report} 里有 \code{push_wait_count}、\code{pop_wait_count} 和 \code{close_count}，这说明队列实现必须能观察 backpressure、空队列等待和关闭唤醒。若实现只有 \code{push/pop} 而没有报告字段，读者就无法把第二册的 backpressure 概念对应到运行证据。
+
+\section{四、Compute Systems 实现层：从小模型到并发运行时}
+
+实现文件要按机制读，不要按文件长度读。最长的文件不一定最先读；先读可手算模型，再读并发队列和运行时，最后读 futex 这种平台相关路径。
+
+\begin{longtable}{p{0.25\linewidth}p{0.31\linewidth}p{0.34\linewidth}}
+实现文件 & 关键函数或类 & 这段代码怎样读 \\
+\hline
+\filepath{src/chapter_models.cpp} & \code{model_ch01_input_pipeline} 到 \code{model_ch18_checkpoint_recovery}。 & 每个函数都是一章的最小可运行模型。先用小输入手算字段，再跑 probe 对照输出。 \\
+\filepath{src/chapter_models_probe.cpp} & 打印全部章节模型。 & 它是原理卷和代码卷之间的桥：正文里的概念必须能在这里看到字段。 \\
+\filepath{src/parallel_reduce.cpp} & \code{parallel_sum}、\code{MutexCounter}、\code{AtomicCounter}、\code{BoundedMpmcQueue}。 & 先看顺序求和，再看按 worker 切分，再看共享状态怎样用 mutex 或 atomic 保护，最后看队列如何处理满、空和关闭。 \\
+\filepath{src/sync_primitives.cpp} & permit limiter、phase barrier、future/promise、atomic wait。 & 每个函数都对应一种同步失败：超额并发、阶段不同步、异常传播丢失、版本变化唤醒不可靠。 \\
+\filepath{src/wait_channels.cpp} & RAII fd、eventfd、epoll。 & 先看 \code{UniqueFd} 怎样避免 fd 泄漏，再看写 eventfd、epoll wait 和事件计数如何形成 Linux wait/wake 合同。 \\
+\filepath{src/task_runtime.cpp} & \code{TaskRuntime::submit}、\code{worker_loop}、\code{wait_idle}、same-pool probe、continuation probe。 & 这是运行时核心。先看任务生命周期，再看等待同一线程池 future 为什么会饥饿，最后看 continuation 如何避免阻塞 worker。 \\
+\filepath{src/futex_lab.cpp} & futex signal guard、futex mutex、contract probe。 & 先看原子状态如何做用户态快路径，再看 futex wait/wake 如何处理 signal、timeout 和竞争。 \\
+\filepath{src/main.cpp} & compute systems demo。 & 只用于把几个核心能力跑起来；真正验收看测试和 probe。 \\
+\filepath{src/wait_channels_probe.cpp} & eventfd/epoll 探针。 & 用稳定输出证明 Linux wait channel 不是口头概念。 \\
+\filepath{src/task_runtime_probe.cpp} & runtime 探针。 & 打印 same-pool future wait 和 continuation runtime 的对照结果。 \\
+\filepath{src/futex_lab_probe.cpp} & futex 探针。 & 在支持 Linux futex 的环境里验证 wait/wake、signal 和 timeout 边界。 \\
+\end{longtable}
+
+以 \code{BoundedMpmcQueue} 为例，源码里有三个必须连起来看的动作。\code{push} 在队列满时等待 \code{not_full_}，并记录等待次数和等待时长；\code{pop} 在队列空且未关闭时等待 \code{not_empty_}，关闭后返回 \code{std::nullopt}；\code{close} 同时唤醒生产者和消费者，避免一方永久睡眠。测试必须覆盖“消费者等待后被关闭唤醒”和“生产者因为队列满而等待，关闭后退出”，否则这个队列只证明了 happy path。
+
+再看 \code{TaskRuntime}。普通线程池最容易隐藏的错误是“worker 内部等待同一个池里的子任务”。\code{run_same_pool_future_wait_probe} 故意让每个 parent 占住一个 worker，再提交 child 并等待 future；如果 worker 数刚好等于 parent 数，child 排在队列里却没有 worker 执行，形成饥饿。这个 probe 的价值不是推荐这种写法，而是用字段证明这种写法为什么危险。随后 \code{run_continuation_runtime_probe} 用 continuation 把“等待 child”改成“child 完成后继续做”，让 worker 不被阻塞。
+
+\begin{warningbox}
+不要把 probe 输出当成单元测试的替代品。probe 用来教学和观察，测试用来固定语义。新增一个机制时，至少要同时补三处：头文件报告字段、实现逻辑、测试断言；probe 只是第四处证据。
+\end{warningbox}
+
+\section{五、测试和 Benchmark：哪些结论已经被守住}
+
+最后读测试和 benchmark。原因很简单：源码里写了什么不等于系统承诺了什么，测试断言过的行为才是当前版本真正守住的边界。
+
+\begin{longtable}{p{0.25\linewidth}p{0.31\linewidth}p{0.34\linewidth}}
+文件 & 覆盖内容 & 读者应检查什么 \\
+\hline
+\filepath{tests/reference_pipeline_tests.cpp} & reference 正常输入、坏行、split/merge、manifest、checksum。 & 看每个坏输入是否有明确 \code{error_kind}；看 split 结果是否和整文件结果一致。 \\
+\filepath{bench/reference_pipeline_bench.cpp} & reference pipeline benchmark smoke。 & 看 benchmark 是否只测已被测试固定的语义；不要从这里推生产性能结论。 \\
+\filepath{tests/compsys_tests.cpp} & 并行求和、计数器、队列关闭、同步原语、eventfd/epoll、futex、runtime、章节模型错误路径。 & 重点看失败路径：无效 worker、无效容量、队列关闭、future 异常、futex timeout、章节模型非法输入。 \\
+\end{longtable}
+
+代码卷的阅读闭环到这里才完整：头文件告诉你“承诺什么”，实现告诉你“怎么做到”，测试告诉你“哪些承诺不能再被破坏”，benchmark 和 probe 告诉你“怎样观察成本和运行证据”。如果未来新增计算机组成原理、操作系统或网络代码卷，也必须按这套标准写：每个文件都有职责说明，每条主线都有调用链，每个实验都有测试和报告。
