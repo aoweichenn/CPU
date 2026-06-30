@@ -24,6 +24,24 @@ SRAM write:
 
 物理地址不是自然存在的数字，而是系统设计给内存控制器和设备译码的编号。哪些地址连到 DRAM，哪些地址连到固件 ROM，哪些地址连到 PCIe MMIO 或 APIC 寄存器，由芯片组、PCIe root complex、固件表和硬件设计共同决定。OS 通过内存地图知道哪些物理页可用，哪些必须保留。
 
+\subsection{五种地址：名字相似，边界完全不同}
+
+I/O 章节里最容易混的是地址。用户指针、内核指针、物理地址、MMIO 地址、DMA 地址不是同一种东西换个名字。它们由不同主体使用，走不同翻译路径，错误也由不同机制报告。
+
+\begin{longtable}{p{0.18\linewidth}p{0.22\linewidth}p{0.24\linewidth}p{0.24\linewidth}}
+\toprule
+地址类型 & 谁使用 & 如何翻译或解释 & 常见错误 \\
+\midrule
+用户虚拟地址 & Ring 3 程序和内核拷贝路径 & 当前进程页表、VMA/PTE 权限 & 直接交给设备，设备看不懂 \\
+内核虚拟地址 & 内核代码 & 内核页表映射到物理页或 MMIO & 当成用户指针检查，或泄漏给用户 \\
+物理地址 & 内存控制器和平台地址译码 & 地址范围决定 DRAM、APIC、PCIe MMIO 等目标 & 误以为用户态可直接访问 \\
+MMIO 地址 & 驱动经 \code{ioremap} 后访问 & 物理地址窗口连到设备寄存器 & 当普通 RAM cache/合并/重排 \\
+DMA/IOVA & 设备发出的地址 & IOMMU domain 翻译到物理页 & unmap 后设备迟到写、方向标错 \\
+\bottomrule
+\end{longtable}
+
+一次用户 \code{read(fd, buf, len)} 可能同时出现这五种地址：\code{buf} 是用户虚拟地址；内核临时缓冲区是内核虚拟地址；页框有物理地址；设备寄存器在 MMIO BAR 中；描述符里放的是 DMA 地址或 IOVA。讲清地址类型，I/O 路径的一半混乱就消失了。
+
 \subsection{地址空间地图：同一个 load 可以读内存也可以读设备}
 
 CPU 执行 load/store 时只发出地址和访问类型。地址译码决定这个请求去 DRAM、ROM、PCIe MMIO 窗口，还是本地 APIC 寄存器。于是同一条 store 指令，写 DRAM 是保存数据，写设备寄存器可能是启动 DMA，写中断控制器可能是发送 IPI。
@@ -144,6 +162,25 @@ pci enumeration:
 
 BAR 是 Base Address Register。设备通过 BAR 告诉系统“我需要一段 MMIO 地址空间”。内核分配物理地址范围后，驱动再 ioremap 到内核虚拟地址。用户进程不能直接访问这个 MMIO，除非内核通过受控接口映射并检查权限。
 
+\subsection{BAR、寄存器、doorbell 和 descriptor 不是一回事}
+
+PCIe 设备常被一句“通过 BAR 做 MMIO”带过，但里面有几层对象。BAR 是设备申请的地址窗口；寄存器是窗口内有定义的偏移；doorbell 是某些寄存器的用途，写它表示“有新工作”；descriptor 是内存中的请求记录，通常不在 BAR 里，而在普通 RAM 中，设备通过 DMA 读取。
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
+\toprule
+概念 & 位于哪里 & 作用 \\
+\midrule
+BAR & PCIe 配置空间中的资源描述 & 告诉 OS 设备需要多大的 MMIO 地址窗口 \\
+MMIO window & 物理地址空间中的一段范围 & CPU load/store 会被路由到设备 \\
+register & MMIO window 内的具体偏移 & 控制设备、读取状态、配置队列 \\
+doorbell & 一类寄存器用途 & 通知设备队列 tail 或新命令已发布 \\
+descriptor & 普通 RAM 或设备可 DMA 的内存 & 描述 buffer 地址、长度、命令、标志 \\
+completion entry & 普通 RAM 中的完成记录或设备队列 & 设备写回状态、tag、字节数、错误码 \\
+\bottomrule
+\end{longtable}
+
+错误顺序通常发生在 descriptor 和 doorbell 之间。CPU 必须先把 descriptor 写完整，并用 DMA 写屏障保证设备可见，然后再写 doorbell。若先敲 doorbell，设备可能立刻 DMA 读取半初始化 descriptor；若 completion 读完前就释放 buffer，设备或上层可能仍在使用旧对象。
+
 \subsection{描述符环：CPU 和设备共享队列}
 
 高性能设备不希望 CPU 每个请求都写一堆寄存器。更常见的做法是：内存在 RAM 中建立 descriptor ring，CPU 作为生产者填写描述符，设备作为消费者读取描述符；完成后设备写回 status 或 completion ring，再中断或让 CPU 轮询。
@@ -165,6 +202,44 @@ submit:
 
 环形队列有几个不变量：不能覆盖设备尚未消费的描述符；不能回收设备尚未完成的 buffer；发布 tail 前描述符必须完整可见；处理 completion 后必须 unmap DMA 并释放上层资源。网络、NVMe、virtio、io\_uring 都可以用这个模型理解。
 
+\subsection{descriptor ring 的所有权状态机}
+
+描述符环不是数组循环使用这么简单。每个 slot 都在 CPU 和设备之间转移所有权。只有拥有者可以改 slot 内容；不拥有的一方只能等待状态变化或读取协议允许的字段。
+
+\begin{lstlisting}
+Free:
+  CPU owns slot, no in-flight request
+
+Prepared:
+  CPU filled descriptor but has not published tail
+
+Submitted:
+  CPU published tail and rang doorbell
+  device may read descriptor by DMA
+  CPU must not rewrite descriptor or free buffer
+
+Completed:
+  device wrote completion entry
+  CPU may consume status, unmap DMA, wake waiter
+
+Free again:
+  CPU has released request and buffer ownership
+\end{lstlisting}
+
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+状态 & 谁拥有 & 不能做什么 \\
+\midrule
+Free & CPU & 设备不能读取无效 descriptor \\
+Prepared & CPU & 不能让设备看到半初始化字段 \\
+Submitted & 设备/硬件路径 & CPU 不能复用 buffer 或覆盖 slot \\
+Completed & CPU 正在回收 & 不能重复完成同一请求 \\
+Resetting & 驱动收敛故障 & 不能接受新提交，必须处理 in-flight \\
+\bottomrule
+\end{longtable}
+
+这个状态机解释了为什么驱动要有 request tag、队列深度和超时处理。completion 到来时，驱动通过 tag 找回 request；超时时，驱动必须判断请求是否还可能完成；reset 时，驱动要把所有 Submitted 状态收敛到失败、重试或已取消。
+
 \subsection{DMA 地址不等于用户虚拟地址}
 
 用户程序传给 \code{read/write} 的是用户虚拟地址。CPU 访问它要通过当前进程页表。设备不能直接理解这个地址。驱动要么复制数据到内核 buffer，要么 pin 用户页，拿到物理页，再通过 DMA API 得到设备可用的 DMA 地址。若有 IOMMU，DMA 地址通常是设备虚拟地址 IOVA。
@@ -180,6 +255,58 @@ user pointer
 \end{lstlisting}
 
 这条路径很容易出 bug。用户 buffer 长度可能溢出；页可能跨多个物理页，需要 scatter-gather list；设备 DMA mask 可能只能访问低 32 位地址；IOMMU 映射可能失败；用户取消请求时，in-flight DMA 不能简单释放。
+
+\subsection{pin、copy、map 三个动作的区别}
+
+用户 buffer 进入 I/O 路径时，内核有三种常见处理方式。copy 是把用户数据复制到内核 buffer；pin 是暂时阻止用户页被回收或迁移；map 是把物理页授权给设备 DMA。三者经常连续出现，但语义不同。
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
+\toprule
+动作 & 改变了什么 & 没有改变什么 \\
+\midrule
+copy & 产生一份内核拥有的数据副本 & 用户原页仍可变化，设备不一定可见 \\
+pin & 增加页的长期或短期固定约束 & 设备仍不能自动访问该页 \\
+dma map & 建立设备可用的 DMA 地址和方向权限 & 不代表请求已经完成或 buffer 可释放 \\
+unmap & 撤销设备访问授权并做必要同步 & 不自动释放用户页或 request 对象 \\
+unpin & 解除页固定，允许回收/迁移 & 不说明设备是否成功处理数据 \\
+\bottomrule
+\end{longtable}
+
+因此“零拷贝”不是零管理。它少了一次 CPU 复制，却增加了 pin 生命周期、IOMMU 映射、scatter-gather、取消和 completion 回收。高性能 I/O 的难点不在少写几行拷贝代码，而在把这些生命周期全部收敛正确。
+
+\subsection{一次块设备 read 中地址如何换手}
+
+把 \code{read(fd, buf, len)} 放到 NVMe 这类块设备路径里，可以看到五种地址如何逐步换手。用户 API 只有 \code{buf}，但硬件完成一次 I/O 需要用户虚拟地址、内核虚拟地址、物理页、DMA/IOVA 和 MMIO doorbell 共同参与。
+
+\begin{lstlisting}
+read(fd, user_buf, len):
+  kernel validates user virtual range
+  page cache chooses or allocates kernel pages
+  block layer builds request from page fragments
+  DMA API maps physical pages to device IOVA
+  driver writes descriptor with IOVA and length
+  dma_wmb()
+  driver writes MMIO doorbell
+  device DMA writes data into mapped pages
+  device writes completion entry
+  interrupt handler completes request
+  kernel copies bytes to user_buf if needed
+\end{lstlisting}
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+阶段 & 地址或对象 & 错误后果 \\
+\midrule
+用户参数检查 & 用户虚拟地址和长度 & 越界、溢出、坏指针导致错误访问 \\
+page cache/bio & 内核页和物理页片段 & 页生命周期不清导致 use-after-free \\
+DMA map & IOVA、方向、长度、设备 domain & IOMMU fault 或设备读写旧数据 \\
+descriptor & RAM 中的队列项 & 设备读到半初始化命令 \\
+doorbell & MMIO 寄存器偏移 & 顺序错会让设备提前消费队列 \\
+completion & completion queue entry 和 request tag & 找不回请求，重复完成或永久等待 \\
+\bottomrule
+\end{longtable}
+
+这里最容易被误解的是“设备完成”。设备 completion 只说明设备按协议处理了某个 descriptor，并把结果写回 completion queue；它不自动说明用户 buffer 已经可见，也不自动说明文件系统状态已经持久化。内核还要撤销 DMA 映射、处理错误码、更新 page cache 或 bio 状态、唤醒等待者，并把结果翻译成系统调用返回值。
 
 \subsection{scatter-gather：物理内存不连续怎么办}
 

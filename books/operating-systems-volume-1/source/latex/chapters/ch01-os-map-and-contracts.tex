@@ -37,6 +37,26 @@ request/bio/skb & DMA buffer、队列位置、completion & 设备异步完成，
 
 这张表背后的规则是：只要某个硬件状态会被多个程序共享，或者失败后需要恢复，就不能让应用直接操作原始硬件。内核必须建立一个对象，给它身份、权限、生命周期、等待队列和可观测证据。对象不是为了“面向对象”而存在，而是为了让硬件状态可命名、可授权、可回收、可诊断。
 
+\section{容易混淆的三层语义}
+
+OS 教材里很多概念看起来相同，是因为它们在不同层次上都叫“完成”“可读”“地址”“上下文”。读源码时必须把用户 API 语义、内核对象语义和硬件事件语义分开。
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.26\linewidth}p{0.18\linewidth}}
+\toprule
+说法 & 用户 API 层 & 内核对象层 & 硬件层 \\
+\midrule
+地址 & 指针值 & VMA/PTE 和权限 & TLB、物理地址、MMIO/IOVA \\
+可读 & \code{read} 不会立刻阻塞 & buffer/队列中有数据或状态满足 & 中断、completion、DMA 写入 \\
+写完成 & 系统调用返回字节数 & page cache/socket buffer/request 状态更新 & 设备队列接受、介质 flush 可能还没发生 \\
+上下文 & 用户调用链和线程身份 & task、trap frame、switch context & RIP/RSP/RFLAGS、CR3、PCID \\
+错误 & errno 或信号 & 对象状态拒绝、权限失败、生命周期结束 & fault、IRQ error、DMA/IOMMU fault \\
+\bottomrule
+\end{longtable}
+
+例如“可读”在 pipe、socket、文件和设备上含义不同。普通文件几乎总是可读，因为内核可以从 page cache 或磁盘推进；socket 可读表示接收队列有数据或连接关闭/错误；设备 fd 可读可能表示驱动队列里有 completion。用户只看到 \code{poll} 返回，但内核必须把对象状态和硬件事件翻译成统一接口。
+
+再看“写完成”。写入 pipe 只表示数据进入内核 pipe buffer；写入 TCP socket 只表示数据进入发送路径，不等于对端应用收到；写入普通文件只表示 page cache 被修改，不等于稳定落盘；写入带 \code{O\_DIRECT} 的块设备也可能只表示设备接受了请求，仍要理解 flush/FUA 和错误返回。把这些层混在一起，是很多系统设计错误的源头。
+
 \section{四条完整路径：从硬件事件到内核决策}
 
 下面用四条路径把本章的地图落到具体步骤。它们不是后续章节的替代品，而是读完整本书时不断回看的骨架。
@@ -181,7 +201,7 @@ interrupt/bottom half:
 \toprule
 组成原理事实 & OS 抽象 & 关键问题 \\
 \midrule
-PC、寄存器和栈可保存 & 线程上下文 & 切走后如何从同一位置恢复 \\
+RIP、寄存器和栈可保存 & 线程上下文 & 切走后如何从同一位置恢复 \\
 特权级限制敏感指令 & 用户态/内核态 & 用户如何安全请求内核服务 \\
 异常入口保存 trap frame & page fault、signal、debug & 错误能否修复并返回原指令 \\
 定时器可强制中断 & 抢占式调度 & 不合作任务如何被收回 CPU \\
@@ -193,6 +213,25 @@ DMA 异步访问内存 & 高性能 I/O & buffer 何时归 CPU，何时归设备 
 \end{longtable}
 
 本册后文所有章节都按这张映射阅读。看到“进程”，不要只想 pid，要想到一组保存的 CPU 上下文、地址空间和内核对象。看到“文件”，不要只想路径，要想到 fd 表、file、inode、page cache、块层和设备队列。看到“权限”，不要只想用户 ID，要想到 CPU 特权级、页表 U/S 位、capability、namespace、LSM 和对象引用。
+
+\section{同一个词在 POSIX、内核和硬件中的落点}
+
+读手册时常见的是 POSIX 词，例如 process、file descriptor、signal、pipe、socket。读内核时看到的是 task、file、inode、skb、wait queue。读硬件时又变成 RIP、CR3、IRQ、DMA、MMIO。三套词不是互相替代，而是同一条路径的不同层。
+
+\begin{longtable}{p{0.18\linewidth}p{0.24\linewidth}p{0.26\linewidth}p{0.22\linewidth}}
+\toprule
+用户语义 & 内核对象 & 硬件支点 & 关键边界 \\
+\midrule
+process & task、mm、files、cred & RIP/RSP、CR3、PCID & 身份、地址空间、权限分离 \\
+thread & task、kernel stack、thread info & 寄存器、RSP、FPU state & 可调度上下文，不复制全部资源 \\
+fd & fd table、struct file & 设备队列、page cache、DMA & 整数句柄不是文件本体 \\
+signal & pending signal、signal frame & trap frame、用户栈、\code{iretq} & 异步交付但必须恢复用户现场 \\
+socket & socket、skbuff、wait queue & NIC ring、MSI-X、DMA & 协议状态和设备完成分离 \\
+timer & hrtimer、timer wheel & local APIC timer、TSC deadline & 未来事件需要硬件唤醒入口 \\
+\bottomrule
+\end{longtable}
+
+例如 fd 是一个用户态整数，但内核要通过当前进程的 fd table 找到 \code{struct file}，再通过 file operations 调到 pipe/socket/inode/device 的具体实现。若底层是网卡，最终还会走 skb、驱动队列、DMA 和 MSI-X completion。把 fd 当成“文件本体”，就解释不了 \code{dup}、\code{fork} 后共享 offset、socket readiness、设备拔出后旧 fd 返回错误这些现象。
 
 \section{为什么从单片机开始}
 

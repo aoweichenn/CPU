@@ -169,12 +169,41 @@ void switch_to(Task* prev, Task* next) {
 \midrule
 trap frame & 用户 RIP、RSP、RFLAGS、系统调用参数、错误码 & 中断、异常、系统调用入口 \\
 switch context & 内核栈指针、callee-saved 寄存器、返回地址 & scheduler 切换内核线程 \\
-地址空间上下文 & 页表根、ASID/PCID、TLB 状态 & 切换进程地址空间 \\
+地址空间上下文 & 页表根、PCID、TLB 状态 & 切换进程地址空间 \\
 浮点/SIMD 上下文 & FPU、向量寄存器、控制字 & 用户使用浮点/SIMD 或信号处理 \\
 \bottomrule
 \end{longtable}
 
 把这几类上下文混在一起会导致很多误解。例如中断打断用户程序时，内核需要 trap frame 才能返回用户态；调度器在两个都已进入内核的线程之间切换时，通常只需要保存内核执行所需的最小寄存器集合。地址空间切换还要改页表根和处理 TLB。
+
+\subsection{trap frame、switch context 和 stack frame 的区别}
+
+“保存现场”这个说法太粗，会掩盖三种完全不同的结构。trap frame 是硬件入口和汇编入口为异常/中断/系统调用保存的用户或被打断现场；switch context 是调度器在内核线程之间切换时保存的最小恢复信息；stack frame 是普通函数调用在栈上的返回地址、旧帧指针和局部变量布局。
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
+\toprule
+结构 & 谁创建 & 用来回答什么问题 \\
+\midrule
+trap frame & CPU 硬件入口 + 低级汇编入口 & 从哪个 RIP/RSP/RFLAGS 返回用户态或被打断点 \\
+switch context & 调度器和架构切换代码 & 下次调度到该线程时，从哪个内核位置继续 \\
+stack frame & 编译器按 ABI 生成的函数调用代码 & 当前函数返回到哪里，局部变量在哪里 \\
+signal frame & 内核在用户栈上构造 & 用户态 signal handler 结束后如何恢复原现场 \\
+\bottomrule
+\end{longtable}
+
+一个线程在系统调用中睡眠时，通常同时拥有这些结构：用户态曾经有 stack frame；进入内核后有 trap frame；内核 C 函数有自己的 stack frame；调度出去时还要保存 switch context。调度器切换的是“当前内核执行点”，不是直接切换到用户程序入口；返回用户态时才消费 trap frame。
+
+\begin{lstlisting}
+user calls read()
+  -> user stack frame exists
+  -> syscall creates trap frame
+  -> kernel functions create kernel stack frames
+  -> task sleeps, scheduler saves switch context
+  -> later scheduler restores switch context
+  -> syscall completes and return path restores trap frame
+\end{lstlisting}
+
+这也解释了为什么每个线程需要独立内核栈。线程睡在内核里时，它的内核 stack frames 和 trap frame 都还活着；另一个线程进入内核不能覆盖这段栈。
 
 \section{算法与实现分析}
 
@@ -231,6 +260,24 @@ end_of_interrupt(vector):
 \end{lstlisting}
 
 若忘记 EOI，控制器可能不再投递后续同类中断；若过早 EOI，同一个设备可能在 handler 尚未处理完共享状态时再次打断。驱动通常先读取设备状态并清设备侧中断源，再向控制器确认完成。顺序错误会导致中断风暴或丢事件。
+
+\subsection{IRQ、vector、handler 和 completion 的区别}
+
+设备 I/O 里还有一组容易混的词。IRQ 是“有中断事件需要处理”的硬件/内核资源；vector 是 CPU 入口编号；handler 是内核注册的处理函数；completion 是某个具体 I/O 请求完成的事实。一个 IRQ 可以对应一个队列，一次 handler 可以处理多个 completion，一个 completion 也可能在轮询模式下被发现而不是靠中断发现。
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
+\toprule
+概念 & 表示什么 & 常见误解 \\
+\midrule
+IRQ line/vector & CPU 被通知有事件 & 误以为它等于某个请求完成 \\
+handler & 处理该类事件的函数 & 误以为 handler 只能处理一个事件 \\
+completion entry & 设备写回的请求结果 & 误以为一定伴随一次中断 \\
+wait queue & 等待某个条件的任务集合 & 误以为中断直接唤醒某个用户函数 \\
+poll budget & 一次下半部最多处理多少完成 & 误以为只要有中断就会处理完所有包/请求 \\
+\bottomrule
+\end{longtable}
+
+高吞吐设备通常把中断当成“提醒你去看队列”，而不是“这个请求完成了”的一对一消息。网卡可能一次中断后处理几十个 RX completion；NVMe 可能一个 MSI-X vector 对应一个 completion queue；NAPI 甚至会暂时关闭中断，改用轮询批量处理。这样吞吐更好，但延迟、budget、队列深度和背压都必须进入设计。
 
 \subsection{电平触发、边沿触发和 MSI}
 

@@ -107,21 +107,33 @@ unmap page:
   now physical page can be freed
 \end{lstlisting}
 
-这涉及跨 CPU 中断和等待，所以昂贵。现代内核会批量 unmap、延迟释放、使用 ASID/PCID 减少全局刷新。页表不是普通 map，TLB 让它变成多核协议。
+这涉及跨 CPU 中断和等待，所以昂贵。x86-64 内核会批量 unmap、延迟释放、使用 PCID 减少全局刷新。页表不是普通 map，TLB 让它变成多核协议。
 
-\subsection{ASID/PCID：避免每次切换都清空 TLB}
+\subsection{PCID：避免每次切换都清空 TLB}
 
-若 TLB 只缓存虚拟页到物理页，不区分进程，那么切换地址空间时必须清空，否则进程 B 的虚拟地址可能命中进程 A 的翻译。ASID/PCID 给 TLB 项加地址空间标签，让不同进程的同一虚拟地址可共存。
+若 TLB 只缓存虚拟页到物理页，不区分进程，那么切换地址空间时必须清空，否则进程 B 的虚拟地址可能命中进程 A 的翻译。x86-64 的 PCID 给 TLB 项加地址空间标签，让不同进程的同一虚拟地址可共存。PCID 不是进程 ID，也不是 pid；它是处理器用于区分 TLB 项归属的短标签，由内核分配、复用和失效。
 
 \begin{lstlisting}
 TLB entry:
   virtual_page
-  address_space_id
+  pcid
   physical_page
   permissions
 \end{lstlisting}
 
-这降低上下文切换成本，但没有消除页表修改成本。若某个地址空间自己的 PTE 改了，对应 ASID/PCID 的旧项仍要失效。
+这降低上下文切换成本，但没有消除页表修改成本。若某个地址空间自己的 PTE 改了，对应 PCID 的旧项仍要失效。PCID 解决的是“不同地址空间的旧翻译不要互相污染”，不解决“同一地址空间的 PTE 更新后旧翻译仍然存在”。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+问题 & PCID 能否解决 & 还需要什么 \\
+\midrule
+进程切换后保留部分 TLB 热度 & 能 & 正确设置 CR3/PCID 和保留策略 \\
+进程 A 的虚拟页误命中进程 B 的翻译 & 能 & TLB key 必须包含 PCID \\
+\code{mprotect} 把页从可写改为只读 & 不能自动解决 & invalidate 当前 PCID 的目标页 \\
+\code{munmap} 后释放物理页 & 不能自动解决 & shootdown 所有可能持有旧翻译的 CPU \\
+PCID 被复用给另一个地址空间 & 不能自动解决 & 复用前清理旧 PCID 相关 TLB 项 \\
+\bottomrule
+\end{longtable}
 
 \subsection{NUMA：物理内存也有远近}
 
@@ -155,6 +167,96 @@ read(file, buf):
 
 这解释了为什么 \code{write} 返回成功不等于落盘。它可能只是写入 page cache。可靠持久化需要 \code{fsync}、日志、flush/FUA 等机制把数据推进到稳定介质。
 
+\subsection{四种 cache 不要混在一起}
+
+很多读者看到 cache 就只想到“快一点的内存”。在 OS 里至少要区分四种名字相似但语义完全不同的缓存。
+
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+缓存 & 缓存的是什么 & 谁负责一致性 \\
+\midrule
+CPU data cache & 物理内存中的 cache line & 硬件一致性协议，DMA 时还要驱动/API 配合 \\
+I-cache & 指令字节 & 硬件和内核在代码修改、JIT、模块加载时配合 \\
+TLB & 虚拟页到物理页和权限 & MMU 填充，内核在改 PTE 后失效旧项 \\
+page cache & 文件内容的内存副本 & 内核文件系统、回写线程、fsync 和设备 flush \\
+设备缓存 & SSD/NIC/磁盘控制器内部队列或缓存 & 驱动命令、flush/FUA、设备完成语义 \\
+\bottomrule
+\end{longtable}
+
+这几种缓存的错误后果不同。CPU data cache 错了，CPU 可能读到旧字节；TLB 错了，权限或物理页可能错；page cache 错了，文件语义和落盘语义错；设备缓存错了，崩溃恢复可能错。调试时必须先问“哪一层缓存给了旧答案”，不能把所有现象都叫 cache miss。
+
+\subsection{一条 load 的完整时间线}
+
+把 \asmcode{mov rax, qword ptr [rdi]} 拆成时间线，可以看清 cache、TLB、页表和异常的先后关系。
+
+\begin{lstlisting}
+1. decode instruction and read rdi
+2. compute virtual address
+3. check canonical form
+4. lookup D-TLB by virtual page and PCID
+5. if TLB miss, walk x86-64 page tables from CR3
+6. check PTE present, user/supervisor, writable, NX as needed
+7. combine physical frame with page offset
+8. access L1 data cache by physical line
+9. on cache miss, fetch line from lower cache or DRAM
+10. only if all checks pass, write loaded value into rax
+\end{lstlisting}
+
+异常可能发生在多个位置：非 canonical 地址在 page walk 前失败；PTE 不存在或权限不符时 page fault；物理地址命中 MMIO 时变成设备访问；普通 DRAM cache miss 只是性能事件，不是异常。OS 处理 page fault 时，面对的是第 5/6 步失败，不是第 8/9 步变慢。
+
+\subsection{三条页表修改路径：COW、mprotect 和 munmap}
+
+页表修改不能只说“改 PTE”。不同路径要维护的所有权不同，因此 TLB 和物理页生命周期也不同。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+路径 & 页表动作 & 必须同步的事实 \\
+\midrule
+COW 写 fault & 分配新物理页，把当前进程 PTE 改到新页并设 writable & 旧共享页引用计数减少；当前 CPU 旧只读翻译要失效或被覆盖 \\
+\code{mprotect} 收紧权限 & 原 PTE 保留同一物理页，但清 writable 或 executable & 所有 CPU 的旧权限翻译必须失效 \\
+\code{munmap} & 删除 PTE，并可能释放物理页 & 释放前必须等远端 TLB 不再能访问旧页 \\
+进程退出 & 批量拆整棵地址空间 & 可以批量 shootdown，但页释放仍要等旧翻译安全消失 \\
+\bottomrule
+\end{longtable}
+
+用状态机写会更清楚：
+
+\begin{lstlisting}
+unmap_and_free(mm, va):
+  lock page table
+  pte = clear_pte(mm, va)
+  page = pte.physical_page
+  record tlb_flush(mm.pcid, va)
+  unlock page table
+
+  send shootdown to CPUs that may run mm
+  wait for acknowledgements
+
+  drop page reference
+  if page.refcount == 0:
+    free physical page
+\end{lstlisting}
+
+这段顺序中，最不能提前的是释放物理页。如果先把页交给分配器，远端 CPU 又用旧 TLB 写了一次，就会把新对象写坏。很多内存安全问题并不是“页表 map 写错了”，而是页表、TLB、引用计数和跨 CPU 确认之间少了一步。
+
+\subsection{PCID 的复用为什么也要有生命周期}
+
+PCID 数量有限，不可能永远给每个历史进程一个新标签。内核复用 PCID 时，要保证旧地址空间留下的 TLB 项不会被新地址空间误用。简单模型如下：
+
+\begin{lstlisting}
+assign_pcid(mm):
+  if mm has active pcid on this CPU:
+    return mm.pcid
+
+  pcid = choose reusable pcid
+  if pcid belonged to another mm:
+    invalidate all non-global TLB entries for pcid
+  bind pcid to mm on this CPU
+  return pcid
+\end{lstlisting}
+
+PCID 的局部性也很重要。同一个进程在 CPU 0 上的 PCID 状态，不能直接等价于 CPU 7 上的状态；每个 CPU 有自己的 TLB 和 PCID 使用历史。于是 shootdown 既要知道地址空间，也要知道哪些 CPU 可能缓存过这个地址空间。调度器、地址空间切换和 TLB 子系统因此耦合在一起。
+
 \subsection{本节验收}
 
 \begin{rubricbox}
@@ -164,7 +266,7 @@ read(file, buf):
 \item 能解释伪共享为什么会让两个独立计数器互相拖慢。
 \item 能画出虚拟地址访问经过 TLB、页表、cache、内存的路径。
 \item 能说明修改页表后为什么要 TLB shootdown。
-\item 能解释 ASID/PCID 解决什么，不解决什么。
+\item 能解释 PCID 解决什么，不解决什么。
 \item 能解释 NUMA 为什么让线程迁移和页分配有关。
 \item 能区分 page cache 写入、设备 completion、稳定落盘。
 \end{itemize}
