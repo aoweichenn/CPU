@@ -1,0 +1,157 @@
+\chapter{调度器深入：时间、等待与多核}
+
+\section{原理}
+
+上一章讲了基本调度算法，本章把调度器当成内核子系统看。调度器不是一个简单的 \code{pick\_next()} 函数，它维护可运行队列、睡眠队列、时间片账本、优先级、CPU 亲和性、负载均衡、抢占标志和统计数据。它还必须和锁、定时器、中断、系统调用返回路径配合。
+
+调度器的核心循环是：当前任务运行；某个事件改变任务状态；如果当前任务不能继续运行或应该让出 CPU，内核选择下一个 runnable 任务；保存当前上下文，恢复下一个上下文。事件可能来自时间片耗尽、任务阻塞、任务退出、任务被唤醒、高优先级任务到达或 CPU 负载均衡。
+
+调度器维护两个不同问题。第一是选择：在 runnable 集合里选谁。第二是状态转换：任务如何进入 runnable、running、sleeping、stopped、zombie。很多 bug 不在选择算法，而在状态转换，例如任务已经 sleeping 却仍留在 runqueue，或者唤醒丢失导致任务永远睡眠。
+
+\section{实践}
+
+实践报告要把调度器拆成四张表：
+
+\begin{longtable}{p{0.2\linewidth}p{0.68\linewidth}}
+\toprule
+表 & 内容 \\
+\midrule
+任务表 & pid/tid、状态、优先级、时间片、等待原因 \\
+runqueue & 每个 CPU 的 runnable 任务和顺序 \\
+sleep queue & 等待对象、超时时间、唤醒条件 \\
+统计表 & on-CPU 时间、runnable wait、context switch、迁移次数 \\
+\bottomrule
+\end{longtable}
+
+当报告说“调度不公平”时，必须给出 runnable wait 分布；当报告说“线程没运行”时，必须说明它是 runnable 但没拿到 CPU，还是 sleeping 等事件。
+
+\section{算法与实现分析}
+
+\subsection{睡眠和唤醒}
+
+阻塞系统调用和条件变量最终都要把任务放入某个等待队列。正确顺序是：持有保护等待条件的锁，检查条件，不满足则把当前任务加入等待队列并把状态改为 sleeping，然后原子地释放锁并调度。唤醒方改变条件后，从等待队列取任务，改为 runnable，放入 runqueue。
+
+\begin{lstlisting}
+sleep(wait_queue, lock):
+  current.state = SLEEPING
+  wait_queue.push(current)
+  unlock(lock)
+  schedule()
+  lock(lock)
+
+wake_one(wait_queue):
+  task = wait_queue.pop()
+  if task != null:
+    task.state = RUNNABLE
+    enqueue(runqueue_for(task), task)
+\end{lstlisting}
+
+这里最危险的是 lost wakeup。如果等待者检查条件后、真正入队前，唤醒者改变条件并发出唤醒，那么等待者可能永远睡眠。解决方法是用同一把锁保护“检查条件”和“加入等待队列”。
+
+\subsection{抢占点}
+
+内核不能在任意机器指令之间随便切换。抢占点通常出现在中断返回、系统调用返回、显式阻塞、时间片耗尽或内核允许抢占的位置。如果当前代码持有自旋锁或处于中断上下文，就不能睡眠调度。
+
+\begin{lstlisting}
+maybe_preempt():
+  if need_reschedule
+     and preempt_count == 0
+     and !in_interrupt():
+       schedule()
+\end{lstlisting}
+
+\code{preempt\_count} 是实现边界的典型例子。它不是业务概念，而是内核用来防止在不可抢占区域切走任务的计数。进入自旋锁或中断上下文时增加，退出时减少。若计数错误，可能在持锁时调度，导致死锁。
+
+\subsection{每 CPU runqueue}
+
+多核系统若使用一个全局 runqueue，所有 CPU 都要争同一把锁。每 CPU runqueue 降低锁竞争：每个 CPU 主要从自己的队列取任务；周期性负载均衡把任务从繁忙 CPU 迁到空闲 CPU。
+
+\begin{lstlisting}
+schedule_on_cpu(cpu):
+  rq = cpu.runqueue
+  lock(rq.lock)
+  next = pick_next(rq)
+  unlock(rq.lock)
+  switch_to(next)
+
+load_balance():
+  busiest = find_busiest_cpu()
+  idle = find_idle_cpu()
+  migrate_some_tasks(busiest.rq, idle.rq)
+\end{lstlisting}
+
+多核调度的取舍是局部性和均衡。任务留在原 CPU，cache/TLB 更热；迁移到空闲 CPU，等待时间更低。调度器不能只看队列长度，还要看任务亲和性、NUMA 节点、迁移成本和负载类型。
+
+\subsection{实时任务}
+
+实时调度关注 deadline，而不只是平均公平。Rate Monotonic 适合周期任务，周期越短优先级越高；Earliest Deadline First 总是选择绝对 deadline 最近的任务。单处理器上，在理想条件下 EDF 可以达到更高利用率，但实现要维护按 deadline 排序的队列。
+
+\begin{lstlisting}
+pick_edf(runqueue):
+  return min_by(runqueue, task.absolute_deadline)
+\end{lstlisting}
+
+实时系统必须做可调度性分析。若任务集合的最坏执行时间总和超过 CPU 能力，任何调度算法都无法保证 deadline。操作系统只能执行策略，不能创造时间。
+
+\subsection{唤醒抢占}
+
+一个高优先级或交互任务被 I/O 唤醒时，如果只是放到 runqueue 尾部，可能仍要等当前 CPU 密集任务用完整个时间片。唤醒抢占的思想是：唤醒路径比较新任务和当前任务，若新任务更应该运行，就设置 \code{need\_reschedule}，让返回路径尽快切换。
+
+\begin{lstlisting}
+try_wake_task(task):
+  rq = select_runqueue(task)
+  lock(rq.lock)
+  task.state = RUNNABLE
+  enqueue(rq, task)
+  if should_preempt(task, rq.current):
+    rq.current.need_reschedule = true
+    send_reschedule_ipi_if_remote(rq.cpu)
+  unlock(rq.lock)
+\end{lstlisting}
+
+这里有两个风险。第一，过度抢占会增加上下文切换，降低吞吐。第二，跨 CPU 唤醒需要 IPI，若频率过高，会把多核机器变成互相打断的系统。调度器必须在响应延迟和扰动成本之间折中。
+
+\subsection{负载均衡的粒度}
+
+负载均衡不是简单平均任务数量。一个 CPU 上有 1 个 CPU 密集任务，另一个 CPU 上有 20 个大部分睡眠的任务，按数量看不平衡，按实际负载可能合理。更好的指标是 runnable load、最近 CPU 使用、任务权重和亲和性。
+
+\begin{lstlisting}
+load_balance_domain(domain):
+  busiest = cpu with highest runnable_load
+  idle = cpu with lowest runnable_load
+  if busiest.load <= idle.load + imbalance_threshold:
+    return
+  task = choose_migratable_task(busiest, idle)
+  if task != null:
+    migrate(task, busiest, idle)
+\end{lstlisting}
+
+迁移必须持有源和目标 runqueue 锁，并规定锁顺序，例如按 CPU id 从小到大加锁。否则两个 CPU 同时互相迁移任务，会在 runqueue 锁上形成死锁。
+
+\subsection{调度器不变量}
+
+调度器测试要检查不变量，而不是只看任务有没有输出。
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 每个 RUNNABLE 线程恰好在一个 runqueue 中。
+\item RUNNING 线程只能是某个 CPU 的 current。
+\item SLEEPING 线程必须在一个等待队列中，或带有可解释超时。
+\item ZOMBIE 进程不能再获得 CPU，但退出状态必须可被父进程读取。
+\item 同一线程不能同时出现在迁移源队列和目标队列。
+\item 持有自旋锁、关中断或 \code{preempt\_count > 0} 时不能调度到会睡眠的路径。
+\end{itemize}
+\end{rubricbox}
+
+\section{测试}
+
+\begin{itemize}
+\tightlist
+\item lost wakeup 测试：唤醒和睡眠并发发生时，等待者不会永久睡眠。
+\item 持有自旋锁时不能进入会睡眠的路径。
+\item 每 CPU runqueue 中，同一任务不能同时出现在两个队列。
+\item 任务迁移后，旧 CPU 不再能调度该任务。
+\item 时间片耗尽、阻塞、退出和唤醒都能触发正确重调度。
+\item 实时任务 deadline miss 必须被记录，而不是静默忽略。
+\end{itemize}

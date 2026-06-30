@@ -1,0 +1,270 @@
+\chapter{从单片机裸机程序开始}
+
+\section{原理}
+
+理解操作系统，最稳的起点不是 Linux，也不是进程和虚拟内存，而是一块最小单片机。假设机器只有一个 CPU 核、一段 Flash、一段 SRAM、几个内存映射寄存器、一个 GPIO 灯、一个串口和一个定时器。上电后 CPU 从固定地址取第一条指令，初始化栈指针，清零 BSS，设置外设寄存器，然后进入 \code{while (true)} 主循环。
+
+这时还没有“操作系统”。程序直接拥有整台机器：所有内存都能读写，所有外设寄存器都能访问，任何函数都可以关中断、改时钟、写串口、改 GPIO。裸机程序的优点是简单、可预测、启动快；缺点也同样清楚：只要任务变多，主循环就开始混乱；只要某个操作阻塞，整个系统就停住；只要某段代码写坏内存，没有隔离层能救它。
+
+最小裸机程序通常是轮询模型。代码不断检查输入设备是否有数据、检查定时器是否到点、更新输出设备。轮询的本质是 CPU 主动问外设“你准备好了吗”。如果事件很频繁，轮询很直接；如果事件很稀疏，CPU 大量时间都浪费在重复检查；如果轮询顺序写错，高优先级事件可能被低优先级慢操作延迟。
+
+\begin{lstlisting}
+init_clock();
+init_gpio();
+init_uart();
+
+while (true) {
+  if (uart_has_byte()) {
+    byte b = uart_read();
+    handle_command(b);
+  }
+  if (timer_expired()) {
+    update_control_loop();
+  }
+  flush_logs_if_needed();
+}
+\end{lstlisting}
+
+这段代码看起来不像 OS，但它已经暴露了 OS 的胚胎问题。第一，多个活动共享一个 CPU，谁先执行？第二，事件到达时间不可控，怎样避免漏事件？第三，某个处理函数太慢，怎样不拖死其他工作？第四，共享状态由谁保护？第五，故障后怎样恢复到可解释状态？操作系统只是把这些问题系统化。
+
+\subsection{从超级循环到任务表}
+
+裸机主循环通常被称为超级循环。它的结构是一个大循环里按固定顺序调用多个任务函数。第一版可以直接写：
+
+\begin{lstlisting}
+while (true) {
+  task_read_sensor();
+  task_control_motor();
+  task_send_telemetry();
+  task_blink_led();
+}
+\end{lstlisting}
+
+这种写法的问题是隐含了调度策略：每个任务的优先级就是它在代码里的顺序；每个任务的时间预算完全靠自觉；任何任务卡住，后面的任务都不会运行。要让它可分析，第一步是把任务放进表里，并给每个任务明确的周期、deadline 和上次运行时间。
+
+\begin{lstlisting}
+struct Task {
+  const char* name;
+  uint32_t period_ms;
+  uint32_t next_release_ms;
+  void (*run)();
+};
+
+while (true) {
+  uint32_t now = ticks_ms();
+  for each task in tasks:
+    if (now >= task.next_release_ms) {
+      task.run();
+      task.next_release_ms += task.period_ms;
+    }
+}
+\end{lstlisting}
+
+这个算法是最小合作式调度器。它没有抢占，任务只有在自己返回后才把 CPU 交出来。它的复杂度是每轮扫描 \code{O(n)}，n 是任务数量；它的关键不变量是 \code{next\_release\_ms} 单调前进，每个任务函数必须短小、不能无限循环、不能执行不可控阻塞。
+
+合作式调度器已经比手写超级循环好，因为任务的释放条件变成数据。但它仍然无法处理一个任务超时的问题。如果 \code{task\_send\_telemetry} 等串口缓冲区空等了 50ms，那么 1ms 周期的控制任务就会迟到。于是我们需要区分“能立刻做的计算”和“需要等待的 I/O”，这会把系统推向事件队列和中断。
+
+\subsection{状态机替代阻塞函数}
+
+裸机程序最常见的灾难是阻塞等待：
+
+\begin{lstlisting}
+void send_packet(Packet p) {
+  for each byte in p:
+    while (!uart_tx_ready()) {
+      // busy wait
+    }
+    uart_write(byte);
+}
+\end{lstlisting}
+
+这段代码在功能上正确，但会占住整个 CPU。更好的写法是把发送过程改成状态机：如果硬件暂时不能发送，就保存进度并返回，让其他任务继续运行。
+
+\begin{lstlisting}
+enum TxState { Idle, Sending };
+
+void uart_tx_step() {
+  if (tx_state == Idle || !uart_tx_ready()) {
+    return;
+  }
+  uart_write(tx_buffer[tx_pos++]);
+  if (tx_pos == tx_len) {
+    tx_state = Idle;
+  }
+}
+\end{lstlisting}
+
+状态机的核心代价是复杂性。阻塞函数把“下一步在哪里”藏在调用栈里；状态机把下一步显式放在 \code{tx\_state} 和 \code{tx\_pos} 里。操作系统中的线程，就是另一种保存“下一步在哪里”的方法：线程把寄存器、栈和程序计数器保存为上下文，使阻塞代码看起来仍像顺序代码。但线程要付出调度和栈内存成本。
+
+\subsection{资源所有权和最小内核对象}
+
+没有 OS 时，所有模块都能直接操作硬件寄存器。小程序可以这样写；程序变大后，它会造成所有权混乱。串口驱动、日志模块、命令行模块如果都直接写 UART 寄存器，就无法保证输出顺序，也无法处理并发写入。
+
+于是我们引入最小内核对象：一个对象拥有硬件资源，其他模块只能通过它的接口请求操作。比如串口对象维护发送队列、接收队列、错误计数和当前硬件状态。它不一定需要特权级，但已经有了内核思想：资源集中管理，状态对外封装，错误通过接口返回。
+
+\begin{lstlisting}
+struct UartDevice {
+  RingBuffer rx;
+  RingBuffer tx;
+  uint32_t overrun_count;
+  bool tx_busy;
+};
+
+bool uart_submit(UartDevice* dev, Span bytes);
+bool uart_read(UartDevice* dev, byte* out);
+\end{lstlisting}
+
+从这里可以看到后续 fd、socket、设备文件的影子。用户不应该直接改设备寄存器，而应该持有一个句柄，请求拥有者执行操作。差别只是大型 OS 里这个拥有者运行在内核态，并且有硬件权限保护。
+
+\section{实践}
+
+本章实践不需要复杂环境。拿任意一个单片机或模拟器，写三版程序：
+
+\begin{enumerate}
+\tightlist
+\item 超级循环：固定顺序调用四个任务。
+\item 周期任务表：每个任务有 period 和 next release。
+\item 非阻塞状态机：把串口发送或传感器读取改成 step 函数。
+\end{enumerate}
+
+报告要记录每个任务最长运行时间、周期、deadline、是否可能阻塞、是否访问共享状态。对于每个任务，写出下面的表：
+
+\begin{longtable}{p{0.2\linewidth}p{0.66\linewidth}}
+\toprule
+字段 & 内容 \\
+\midrule
+输入 & 读取哪些寄存器、队列或全局状态 \\
+输出 & 写哪些寄存器、队列或全局状态 \\
+时间预算 & 最坏执行时间和周期 \\
+等待点 & 是否忙等硬件、锁或缓冲区 \\
+失败 & 超时、溢出、校验失败、设备错误 \\
+\bottomrule
+\end{longtable}
+
+\section{测试}
+
+最低测试不是“灯会闪”，而是证明调度和状态机边界：
+
+\begin{itemize}
+\tightlist
+\item 任一任务执行一次后必须返回主循环。
+\item 周期任务的 \code{next\_release\_ms} 单调前进，不因时间溢出立刻失控。
+\item 串口发送缓冲区满时，提交失败或施加背压，而不是覆盖旧数据。
+\item 非阻塞状态机在硬件未 ready 时不改变发送进度。
+\item 任一任务超时应被计数或记录，不能静默拖慢全系统。
+\end{itemize}
+
+这一章的验收结论是：操作系统不是凭空出现的。只要裸机程序里出现多个活动、共享资源、等待硬件、错误恢复和时间预算，就已经需要 OS 式的状态管理。
+
+\section{源码级补充：真实 MCU 启动、UART 与链接脚本}
+
+\subsection{向量表、\_start 与 reset handler}
+
+单片机启动的第一份“内核源码”通常不是 C 函数，而是向量表和 reset handler。以 Cortex-M 风格启动为例，地址 0 处通常放初始栈指针，下一项放 reset handler 入口，后面是 NMI、HardFault、外设中断入口。RISC-V 微控制器常通过 \code{mtvec} 指向 trap vector，通过 linker script 和启动汇编建立栈与全局变量。
+
+\begin{lstlisting}
+vector_table:
+  word __stack_top
+  word reset_handler
+  word nmi_handler
+  word hardfault_handler
+  word timer_handler
+  word uart_handler
+
+reset_handler:
+  set sp, __stack_top
+  copy .data from flash LMA to sram VMA
+  zero .bss
+  call clock_init
+  call uart_init
+  call kernel_main
+  loop forever
+\end{lstlisting}
+
+这里已经出现了 OS 启动的三个根概念：入口地址、内存布局和异常表。后面 x86 的 IDT、内核入口和多核启动更复杂，但本质仍是“硬件按固定规则跳到一段受信任代码，代码建立可运行环境”。
+
+\subsection{VMA 与 LMA：为什么 data 要复制}
+
+链接脚本里常见 VMA 和 LMA。VMA 是代码运行时使用的地址，LMA 是镜像中加载的位置。已初始化全局变量的初值保存在 Flash 中，但运行时变量要位于 SRAM，所以启动代码要从 LMA 复制到 VMA。
+
+\begin{lstlisting}
+MEMORY {
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+  SRAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+SECTIONS {
+  .text : { *(.text*) *(.rodata*) } > FLASH
+  .data : AT(ADDR(.text) + SIZEOF(.text)) {
+    __data_start = .;
+    *(.data*)
+    __data_end = .;
+  } > SRAM
+  __data_load = LOADADDR(.data);
+  .bss : {
+    __bss_start = .;
+    *(.bss*) *(COMMON)
+    __bss_end = .;
+  } > SRAM
+}
+\end{lstlisting}
+
+若 data 未复制，带初值的全局对象会从错误内容开始；若 BSS 未清零，锁、队列和指针的初始值不可预测。这个失败和大型 OS 的早期页表、per-CPU 区域未初始化一样，通常不会在第一条错误处崩溃，而是在后续随机位置表现出来。
+
+\subsection{GPIO 和 UART 寄存器}
+
+裸机驱动的核心是 MMIO。GPIO 通常有模式寄存器、输出数据寄存器、输入数据寄存器；UART 通常有状态寄存器、数据寄存器、波特率 divisor、控制寄存器。真实芯片位名不同，但结构类似。
+
+\begin{lstlisting}
+#define UART_SR   (UART_BASE + 0x00)
+#define UART_DR   (UART_BASE + 0x04)
+#define UART_BRR  (UART_BASE + 0x08)
+#define UART_CR   (UART_BASE + 0x0c)
+#define UART_TXE  (1u << 7)
+#define UART_RXNE (1u << 5)
+
+void uart_putc(char c) {
+  uint32_t deadline = ticks + 10;
+  while (!(read32(UART_SR) & UART_TXE)) {
+    if (time_after(ticks, deadline)) {
+      uart_errors.timeout++;
+      return;
+    }
+  }
+  write32(UART_DR, c);
+}
+\end{lstlisting}
+
+这里的超时是工程边界。没有超时的驱动把硬件故障扩大成系统停顿。大型内核中的块设备超时、网络设备 reset、watchdog 都是同一思想：设备是异步状态机，不是可靠函数。
+
+\subsection{轮询、中断和 CPU 占用率}
+
+假设 UART 每秒收到 100 个字节，CPU 频率 100MHz。若主循环每 10 微秒轮询一次状态寄存器，一秒轮询 100000 次，其中只有 100 次有用；若每次轮询花 30 个周期，纯轮询检查就耗掉 300 万周期，约 3\% CPU。若轮询间隔变大，CPU 占用下降，但输入延迟和溢出风险上升。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+模式 & 优点 & 失败边界 \\
+\midrule
+忙轮询 & 实现最简单，延迟可控 & 浪费 CPU，慢操作会漏事件 \\
+周期轮询 & 降低 CPU 消耗 & 延迟取决于周期，burst 易溢出 \\
+中断驱动 & 空闲时不耗 CPU，事件到达即处理 & ISR 竞态、队列满、中断风暴 \\
+DMA + 中断 & 大吞吐低 CPU & buffer 生命周期、cache、一致性复杂 \\
+\bottomrule
+\end{longtable}
+
+这张表也适用于大 OS：epoll 减少无效轮询，NAPI 在高负载下把中断转为轮询，io\_uring 用共享队列减少系统调用往返。机制不同，目标都是在 CPU 占用、延迟和复杂度之间折中。
+
+\subsection{真实代码阅读入口}
+
+读真实 MCU 代码时，建议按下面顺序找：
+
+\begin{enumerate}
+\tightlist
+\item 启动汇编或 startup 文件：向量表、reset handler、栈顶符号。
+\item 链接脚本：Flash/SRAM 区域、\code{.text/.data/.bss}、堆栈布局。
+\item HAL 或裸驱动：UART/GPIO/TIMER 寄存器定义和初始化序列。
+\item 中断文件：IRQ handler 如何清中断、入队、唤醒主循环。
+\item 示例 main：是否有阻塞等待、是否有超时、是否有错误计数。
+\end{enumerate}
+
+STM32F4 常见文件名包括 \filepath{startup\_stm32f4xx.s}、\filepath{system\_stm32f4xx.c} 和 \filepath{stm32f4xx\_hal\_uart.c}；RISC-V MCU 工程常见 \filepath{start.S}、\filepath{linker.ld}、\filepath{trap.c}。不要先读完整 HAL 文档，先把上电到第一个字符输出的路径追通。

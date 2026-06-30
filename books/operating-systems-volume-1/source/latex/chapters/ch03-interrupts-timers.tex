@@ -1,0 +1,281 @@
+\chapter{中断、定时器与内核入口}
+
+\section{原理}
+
+轮询模型的问题是 CPU 必须不断主动检查外设。中断把方向反过来：外设在事件发生时打断 CPU，CPU 保存当前执行现场，跳到中断向量表中登记的处理函数，处理最少必要工作，然后恢复被打断的代码。中断是操作系统从“一个主循环”走向“多个异步事件”的关键。
+
+中断处理函数必须短。原因很具体：中断期间可能屏蔽同级或低级中断；处理太久会增加其他事件延迟；处理函数如果访问复杂共享状态，会和主循环或其他中断产生竞态。因此常见设计是 top half 只读取硬件状态、清中断、把事件放入队列；bottom half 或普通任务稍后完成复杂处理。
+
+\begin{lstlisting}
+interrupt uart_rx_isr() {
+  byte b = UART_DATA;
+  ring_push(&rx_queue, b);
+  UART_CLEAR_INTERRUPT();
+}
+
+void uart_task_step() {
+  while (ring_pop(&rx_queue, &b)) {
+    parse_byte(b);
+  }
+}
+\end{lstlisting}
+
+中断引入了共享状态竞争。主循环和中断处理函数可能同时访问 \code{rx\_queue}。在单核单片机上，最简单的临界区是短暂关中断，修改队列指针，再开中断。这个方法有效，但必须短；如果关中断期间做慢操作，就会丢事件或增加控制延迟。
+
+\begin{lstlisting}
+disable_interrupts();
+bool ok = ring_push(&queue, value);
+enable_interrupts();
+\end{lstlisting}
+
+这个临界区就是锁的祖先。以后在多核机器上，关本核中断不能阻止另一个核心同时访问同一数据结构，于是需要自旋锁、互斥锁和原子操作。但基本问题没有变：某段代码需要在状态不变量被临时打破时不被并发打断。
+
+\subsection{定时器和时间片}
+
+定时器中断是操作系统调度的起点。没有定时器，只有任务主动让出 CPU 时，系统才能切换任务；一旦任务死循环，整个系统就失控。定时器按固定频率打断 CPU，内核在中断中增加 tick、检查超时、唤醒等待任务，并在必要时设置“需要调度”的标志。
+
+\begin{lstlisting}
+interrupt timer_isr() {
+  ticks++;
+  for each timer in timer_wheel[current_slot]:
+    if (timer.expired(ticks)) {
+      make_task_runnable(timer.task);
+    }
+  if (current_task.time_slice_used++ >= current_task.time_slice) {
+    need_reschedule = true;
+  }
+}
+\end{lstlisting}
+
+直接扫描所有定时器的复杂度是 \code{O(n)}。如果系统只有几个任务，这很简单；如果有几十万个超时请求，每个 tick 都扫描全表就不可接受。常见算法包括最小堆、时间轮和分层时间轮。最小堆插入和删除是 \code{O(log n)}，查看最近超时是 \code{O(1)}；时间轮把时间划分成槽，插入通常接近 \code{O(1)}，但精度和最大超时范围受槽设计影响。
+
+\subsection{异常和系统调用}
+
+中断来自外设，异常来自当前指令执行，例如除零、非法指令、缺页、权限错误。系统调用也是一种受控入口：用户程序主动执行特定指令，请求进入内核。三者共同构成内核入口。
+
+\begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\toprule
+入口 & 来源 & 典型处理 \\
+\midrule
+中断 & 外设或定时器 & 读取设备状态，唤醒任务，记录 tick \\
+异常 & 当前指令失败 & 发送信号、修复缺页、终止进程 \\
+系统调用 & 用户主动请求 & 检查参数和权限，操作内核对象 \\
+\bottomrule
+\end{longtable}
+
+从这里开始，OS 的边界清楚了：用户代码不能直接操作所有资源，而是通过受控入口进入内核；内核根据当前上下文、权限和对象状态决定是否允许请求。
+
+\subsection{上下文保存}
+
+中断、异常和调度都需要保存上下文。最小上下文包括程序计数器、状态寄存器、通用寄存器和栈指针。若要切换任务，还要保存当前任务的内核栈、地址空间标识和调度账本。
+
+\begin{lstlisting}
+struct Context {
+  uint64_t pc;
+  uint64_t sp;
+  uint64_t flags;
+  uint64_t regs[16];
+};
+
+void switch_to(Task* prev, Task* next) {
+  save_context(&prev->ctx);
+  current = next;
+  restore_context(&next->ctx);
+}
+\end{lstlisting}
+
+这段伪代码隐藏了真实汇编细节，但说明了不变量：一个任务被切走时，它的下一条指令位置和栈必须能恢复；一个任务被恢复时，寄存器必须像它从未离开 CPU 一样。上下文保存不正确，任何高级调度策略都没有意义。
+
+\section{算法与实现分析}
+
+\subsection{中断入口的最小状态机}
+
+中断入口要做的第一件事不是调用 C 函数，而是保存足够现场，让被打断代码将来能继续。可以把入口写成四段：硬件自动保存、汇编入口补充保存、C 层分发、返回路径恢复。
+
+\begin{lstlisting}
+interrupt_entry(vector):
+  frame = hardware_saved_frame()
+  save_scratch_registers(frame)
+  switch_to_kernel_stack_if_needed(frame)
+  dispatch_interrupt(vector, frame)
+  maybe_preempt_on_return(frame)
+  restore_registers(frame)
+  iret(frame)
+\end{lstlisting}
+
+这个状态机维护两个不变量。第一，任何会被中断处理函数破坏的寄存器，要么已经保存，要么按 ABI 规定不需要保存。第二，返回用户态之前，内核必须处理挂起信号、抢占标志和可能的调度请求。若在中断中直接切换任务，必须保证旧任务的内核栈仍保存完整 trap frame。
+
+\subsection{中断控制器与优先级}
+
+真实硬件通常通过中断控制器管理多路中断。控制器至少要完成屏蔽、优先级、确认和结束通知。教学模型可以抽象成 pending bitmap：
+
+\begin{lstlisting}
+interrupt_controller_tick():
+  pending = pending_bits & enabled_bits
+  if pending == 0:
+    return
+  vector = highest_priority(pending)
+  pending_bits.clear(vector)
+  cpu_raise_interrupt(vector)
+
+end_of_interrupt(vector):
+  controller.eoi(vector)
+\end{lstlisting}
+
+若忘记 EOI，控制器可能不再投递后续同类中断；若过早 EOI，同一个设备可能在 handler 尚未处理完共享状态时再次打断。驱动通常先读取设备状态并清设备侧中断源，再向控制器确认完成。顺序错误会导致中断风暴或丢事件。
+
+\subsection{top half 与 bottom half 的分工}
+
+中断上半部只做必须立即完成的工作：读取硬件状态、清中断源、把事件入队、唤醒下半部。下半部可以在软中断、工作队列或普通内核线程中运行。
+
+\begin{lstlisting}
+irq_top_half(dev):
+  status = mmio_read(dev.status)
+  mmio_write(dev.ack, status)
+  push_event(dev.event_queue, status)
+  schedule_bottom_half(dev)
+
+bottom_half(dev):
+  while pop_event(dev.event_queue, &event):
+    process_event(event)
+    wake_waiters(dev.waitq)
+\end{lstlisting}
+
+分工的理由是延迟控制。上半部越长，其他中断越晚被处理；下半部越慢，队列越容易积压。因此测试不只看功能，还要看最大关中断时间、队列峰值和事件丢失计数。
+
+\subsection{定时器数据结构选择}
+
+若每个 tick 扫描所有定时器，复杂度是 \code{O(n)}。最小堆适合定时器数量中等、过期时间分散的系统；时间轮适合大量短超时；分层时间轮适合同时覆盖短超时和长超时。
+
+\begin{longtable}{p{0.18\linewidth}p{0.24\linewidth}p{0.24\linewidth}p{0.22\linewidth}}
+\toprule
+结构 & 插入 & 取最近超时 & 适用场景 \\
+\midrule
+线性表 & \code{O(1)} & \code{O(n)} & 少量定时器，教学 baseline \\
+最小堆 & \code{O(log n)} & \code{O(1)} & 通用超时，精度清楚 \\
+单级时间轮 & 接近 \code{O(1)} & 接近 \code{O(1)} & 大量短超时，槽宽可接受 \\
+分层时间轮 & 接近 \code{O(1)} & 接近 \code{O(1)} & 长短超时混合 \\
+\bottomrule
+\end{longtable}
+
+选择定时器结构时要写清精度、最大超时、插入成本和 tick 成本。一个只在 10 个定时器上正确的实现，不能直接推广到 100000 个 socket 超时。
+
+\section{实践}
+
+本章实践建议写一个事件日志。每次进入中断、退出中断、唤醒任务、设置 need\_reschedule，都记录 tick、事件类型和当前任务。然后用日志回答：哪个事件打断了谁，哪个任务被唤醒，什么时候真正运行。
+
+\begin{lstlisting}
+tick=100 enter timer_isr current=control
+tick=100 wake task=telemetry reason=period
+tick=100 set need_reschedule
+tick=100 exit timer_isr current=control
+tick=100 switch control -> telemetry
+\end{lstlisting}
+
+同时实现两个定时器队列版本：全表扫描和最小堆。比较 n 从 10 到 100000 时，每个 tick 的处理成本。这个实验能说明为什么 OS 算法不能只看功能正确，还要看事件规模。
+
+\section{测试}
+
+最低测试清单如下：
+
+\begin{itemize}
+\tightlist
+\item 中断处理函数只做短路径工作，不调用可能阻塞的函数。
+\item 环形队列在主循环和 ISR 同时访问时不破坏 head/tail/size。
+\item 定时器 tick 单调增加，超时任务只被唤醒一次。
+\item 时间片用尽后设置 reschedule 标志，不能在任意位置破坏当前上下文。
+\item 上下文切换后，任务能从被切走的位置继续执行。
+\item 异常路径能区分可修复缺页、权限错误和不可恢复错误。
+\end{itemize}
+
+这一章的验收结论是：中断和定时器让系统获得外部事件和抢占能力，但也迫使我们认真处理共享状态、上下文保存和入口权限。
+
+\section{源码级补充：x86 IDT、APIC 与 Linux 中断路径}
+
+\subsection{x86 异常入口保存了什么}
+
+x86-64 的中断和异常入口由 IDT 描述。CPU 根据 vector 找到 gate，切换特权级时切到内核栈，硬件压入返回所需状态。某些异常还会压入 error code。汇编入口随后保存通用寄存器，形成内核能理解的寄存器帧。
+
+\begin{lstlisting}
+struct TrapFrame {
+  // software-saved general registers
+  u64 r15, r14, r13, r12, r11, r10, r9, r8;
+  u64 rdi, rsi, rbp, rbx, rdx, rcx, rax;
+
+  // hardware-saved frame
+  u64 vector;
+  u64 error_code;
+  u64 rip;
+  u64 cs;
+  u64 rflags;
+  u64 rsp;
+  u64 ss;
+};
+\end{lstlisting}
+
+真实布局会因入口类型和内核版本变化，但读源码时要抓住语义：\code{rip/cs/rflags/rsp/ss} 决定如何返回；error code 帮助 page fault 和保护异常分类；通用寄存器保存系统调用参数和被打断计算状态。
+
+\subsection{IDT、APIC、IOAPIC 和 MSI}
+
+IDT 是 CPU 本地表；APIC/IOAPIC/MSI 解决“设备事件如何送到哪个 CPU 的哪个 vector”。传统外设中断可经 IOAPIC 重定向到本地 APIC；PCIe 设备常用 MSI/MSI-X，通过一次内存写消息触发中断。多核重调度和 TLB shootdown 使用 IPI，由一个 CPU 通过本地 APIC 向另一个 CPU 投递。
+
+\begin{lstlisting}
+device event
+  -> IOAPIC redirection entry or MSI message
+  -> local APIC on target CPU
+  -> CPU vector
+  -> IDT gate
+  -> low-level entry
+  -> generic IRQ dispatch
+  -> device handler
+  -> EOI
+\end{lstlisting}
+
+中断亲和性影响性能。网卡 RX 队列中断若全部打到 CPU0，CPU0 会成为瓶颈；把队列中断分散到处理对应网络栈的 CPU，可以减少跨核 cache line 迁移。但过度分散也会让连接状态在 CPU 间跳动。真实系统因此有 irq affinity、RSS/RPS/XPS 等策略。
+
+\subsection{Linux 中断路径阅读点}
+
+读 Linux 中断路径可以从这些位置开始：
+
+\begin{itemize}
+\tightlist
+\item \filepath{arch/x86/kernel/idt.c}：IDT gate 初始化。
+\item \filepath{arch/x86/entry/entry\_64.S}：低级入口、寄存器保存、返回路径。
+\item \filepath{kernel/irq/handle.c}：通用 IRQ 分发。
+\item \filepath{kernel/irq/manage.c}：\code{request\_irq}、\code{request\_threaded\_irq}。
+\item \filepath{kernel/time/timer.c}、\filepath{kernel/time/hrtimer.c}：低精度 timer wheel 与 hrtimer。
+\end{itemize}
+
+阅读时不要只看 handler 函数。要同时看谁注册 handler、handler 运行在哪种上下文、是否允许睡眠、谁发送 EOI、错误返回如何统计、设备移除时如何注销并等待 in-flight handler 完成。
+
+\subsection{四种下半部机制}
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+机制 & 特点 & 适用场景 \\
+\midrule
+softirq & 固定类型，常用于网络和块层，高并发 & 极热路径，要求不能随意睡眠 \\
+tasklet & 基于 softirq 的延后执行，同一 tasklet 串行 & 旧驱动常见，新代码逐步少用 \\
+workqueue & 在内核线程中执行，可睡眠 & 需要分配内存、拿 mutex、访问慢设备 \\
+threaded IRQ & 把 IRQ handler 线程化 & 降低硬中断时间，适合较复杂设备处理 \\
+\bottomrule
+\end{longtable}
+
+选择机制的核心问题是上下文：是否需要睡眠，是否要高吞吐，是否允许同一事件并行，是否要限制 CPU 占用。把会睡眠的代码放进 hard IRQ 或 softirq，是典型内核 bug。
+
+\subsection{hrtimer、timer wheel 与 tickless}
+
+低精度超时适合 timer wheel，例如 TCP 重传、普通超时、周期任务；高精度计时适合 hrtimer，例如纳秒级睡眠、音视频定时、精确 profiler。tickless 则在 CPU 空闲或单任务运行时减少周期 tick，降低功耗和噪声。
+
+\begin{lstlisting}
+timer wheel:
+  cheap insertion, coarse granularity, many ordinary timeouts
+
+hrtimer:
+  ordered by expiry in high-resolution time, higher overhead, precise wakeup
+
+tickless:
+  program next hardware timer to nearest event instead of fixed periodic tick
+\end{lstlisting}
+
+tickless 不表示没有时间。它表示内核不再无条件固定频率打断 CPU，而是计算下一个必要事件并设置硬件定时器。调度统计、RCU、负载均衡和超时都要适配这种模式。

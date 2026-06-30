@@ -1,0 +1,171 @@
+\chapter{安全、隔离与最小权限}
+
+\section{原理}
+
+操作系统的隔离不是一个单独功能，而是贯穿 CPU、内存、文件、进程、设备和网络的约束集合。没有隔离，一个进程可以读写任意内存、伪造设备请求、修改别人的文件、消耗全部 CPU 和内存。安全机制的目标不是让程序“不会出错”，而是让错误和恶意行为被限制在授权边界内。
+
+最基础隔离来自 CPU 特权级和页表权限。用户态不能执行特权指令，不能访问内核页，不能修改页表。系统调用是受控入口，内核在入口处检查参数和权限。文件权限、用户 ID、组 ID、capability、namespace、cgroup、seccomp 和 LSM 则在更高层限制对象访问和资源消耗。
+
+\section{实践}
+
+安全分析先写主体、对象、操作、权限：
+
+\begin{longtable}{p{0.18\linewidth}p{0.22\linewidth}p{0.24\linewidth}p{0.24\linewidth}}
+\toprule
+主体 & 对象 & 操作 & 检查 \\
+\midrule
+进程 & 虚拟页 & read/write/exec & 页表权限、VMA \\
+进程 & 文件 & open/read/write & mode、owner、capability、mount \\
+进程 & 系统调用 & exec/fork/ioctl & seccomp、LSM、资源限制 \\
+容器 & CPU/内存 & 消耗资源 & cgroup quota/limit \\
+\bottomrule
+\end{longtable}
+
+然后写威胁模型：攻击者控制什么输入，目标对象是什么，期望阻止什么。没有威胁模型的“安全”讨论会变成口号。
+
+\section{算法与实现分析}
+
+\subsection{访问控制检查}
+
+访问控制算法接收主体、对象和操作，返回允许或拒绝。Unix mode 位是最小模型：如果主体是 owner，看 owner bits；否则如果主体属于 group，看 group bits；否则看 other bits。
+
+\begin{lstlisting}
+may_access(subject, inode, op):
+  if subject.uid == inode.uid:
+    bits = inode.mode.owner
+  else if subject.groups contains inode.gid:
+    bits = inode.mode.group
+  else:
+    bits = inode.mode.other
+  return bits.allow(op)
+\end{lstlisting}
+
+capability 是对 root 权限的拆分。与其让 uid 0 拥有全部能力，不如把网络配置、挂载、修改时间、加载模块等能力拆开。这样服务可以只拿最小需要的能力。
+
+\subsection{namespace 和 cgroup}
+
+namespace 改变“看见什么”，cgroup 限制“能用多少”。PID namespace 让进程看到自己的进程树；mount namespace 改变文件系统视图；network namespace 隔离网卡、路由和端口。cgroup 限制 CPU、内存、I/O 和进程数量。
+
+\begin{lstlisting}
+container_start():
+  create_namespaces(pid, mount, net, ipc, uts)
+  configure_cgroup(cpu_quota, memory_limit, pids_max)
+  drop_capabilities()
+  apply_seccomp_filter()
+  exec_init_process()
+\end{lstlisting}
+
+容器不是虚拟机。它共享宿主内核，所以内核漏洞仍可能突破容器边界。容器安全依赖 namespace、cgroup、capability、seccomp、LSM 和镜像文件系统共同工作。
+
+\subsection{seccomp 过滤}
+
+\code{seccomp} 允许进程限制自己未来能调用哪些系统调用。典型服务启动后，只保留 \code{read}、\code{write}、\code{epoll}、\code{futex}、\code{clock} 等必要调用，拒绝 \code{mount}、\code{ptrace}、模块加载等危险入口。
+
+\begin{lstlisting}
+seccomp_check(syscall_nr, args):
+  action = bpf_program.evaluate(syscall_nr, args)
+  if action == ALLOW: continue_syscall()
+  if action == ERRNO: return -EPERM
+  if action == KILL: terminate_process()
+\end{lstlisting}
+
+seccomp 的价值是缩小攻击面。即使攻击者控制了进程内存，也很难调用被过滤的内核入口。但过滤规则写错也会让程序在正常路径崩溃，所以必须用测试覆盖。
+
+\section{测试}
+
+\begin{itemize}
+\tightlist
+\item 用户态访问内核地址必须失败。
+\item 只读映射写入必须触发权限错误。
+\item 文件权限拒绝时，不创建、不截断、不写入目标文件。
+\item drop capability 后，相关特权操作必须失败。
+\item namespace 中不可见的对象不能通过旧路径访问。
+\item cgroup 内存限制触发时，系统有明确 OOM 或失败策略。
+\item seccomp 规则允许正常路径，拒绝非必要危险系统调用。
+\end{itemize}
+
+\section{源码级补充：DAC、MAC、capability、namespace、Landlock 与硬化}
+
+\subsection{访问控制模型}
+
+DAC 由对象拥有者决定访问，典型是 UNIX mode、uid、gid；MAC 由系统策略决定，典型是 SELinux 和 AppArmor；RBAC 按角色授权；ABAC 按属性决策。Linux 实际路径通常叠加 DAC、capability、LSM、mount flags 和 namespace。读 \filepath{fs/namei.c}、\filepath{security/security.c}、\filepath{security/selinux/} 时，要追踪同一个对象从路径解析到权限 hook 的全过程。
+
+\begin{lstlisting}
+open(path, O_WRONLY):
+  resolve path to inode and mount
+  check mount is writable
+  check DAC mode or CAP_DAC_OVERRIDE
+  call security_inode_permission()
+  check file type and open flags
+  create struct file
+\end{lstlisting}
+
+安全检查必须绑定实际对象。只检查字符串路径，再使用路径，是 TOCTOU 风险；解析后持有 inode、dentry 或 file 引用，再检查权限，才有稳定对象。权限失败时还要保证没有副作用：不能先 truncate 再发现权限不足。
+
+\subsection{capability 集合}
+
+进程有 permitted、effective、inheritable、bounding、ambient 等 capability 集合。bounding set 给进程树设置上界；ambient set 影响 exec 后保留的能力。容器安全经常要求清空不必要 capability，尤其避免 \code{CAP\_SYS\_ADMIN}、\code{CAP\_SYS\_PTRACE}、\code{CAP\_NET\_RAW}。
+
+\begin{lstlisting}
+drop_privileges():
+  clear_ambient_capabilities()
+  drop_bounding_set_except(required_caps)
+  set_no_new_privs()
+  install_seccomp_filter()
+\end{lstlisting}
+
+能力检查要放在对象所属 user namespace 下解释。\code{ns\_capable(user\_ns, CAP\_NET\_ADMIN)} 和全局 \code{capable} 不是同一个边界。容器内 root 若只在容器 user namespace 有能力，不应自动获得宿主网络或宿主挂载的管理权。
+
+\subsection{namespace 与 cgroup v2}
+
+\begin{longtable}{p{0.18\linewidth}p{0.56\linewidth}}
+\toprule
+namespace & 隔离内容 \\
+\midrule
+PID & 进程编号和父子视图 \\
+Mount & 挂载树和路径视图 \\
+Network & 网络设备、路由、端口空间 \\
+IPC & System V/POSIX IPC 对象 \\
+UTS & hostname/domainname \\
+User & uid/gid 映射和 namespace 内 capability \\
+CGroup/Time & cgroup 视图、部分时间视图 \\
+\bottomrule
+\end{longtable}
+
+cgroup v2 用 \filepath{cgroup.controllers} 声明可用 controller，用 \filepath{cgroup.subtree\_control} 向子树下发 controller，用 memory、cpu、io、pids 等文件表达限制。资源限制也是安全边界：没有 pids 限制，fork bomb 会扩大到宿主；没有 memory 限制，单服务可触发全局回收和 OOM；没有 io 限制，后台写入会拖慢其他租户。
+
+\subsection{Landlock、seccomp user notification 和 BPF LSM}
+
+Landlock 允许非特权进程给自己加文件访问规则，是基于 LSM 的沙箱。seccomp user notification 可把某些系统调用交给监督进程决策。BPF LSM 允许加载受验证的 BPF 程序到安全 hook。这些机制的共同边界是：它们可以进一步限制自己或被管理进程，但不能凭空授予原本没有的权限。
+
+\begin{lstlisting}
+sandbox_process:
+  create Landlock ruleset
+  add allowed read-only paths
+  restrict_self()
+  install seccomp allowlist
+  exec workload
+\end{lstlisting}
+
+这类沙箱必须有负面测试：禁止路径打开失败、禁止 syscall 被拒绝、规则安装后不能再获得新权限。只验证正常路径能运行，不足以证明沙箱有效。
+
+\subsection{TPM、measured boot 和 sealed storage}
+
+TPM 可记录启动链测量值，remote attestation 让远端验证机器启动了预期固件、bootloader、内核和策略；sealed storage 让密钥只在特定测量状态下解封。它解决的是“这台机器是不是以预期状态启动”，不是运行时所有访问控制。内核被测量启动后，仍然要依赖权限、LSM、seccomp 和更新机制维护运行时边界。
+
+\subsection{ASLR、stack canary、CFI 与 KASLR}
+
+ASLR 随机化栈、堆、mmap 和 PIE 基址；stack canary 检测栈溢出覆盖返回地址；CFI 限制间接控制流；KASLR 随机化内核基址。它们是缓解措施，不是权限模型替代品。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+机制 & 防什么 & 不能防什么 \\
+\midrule
+ASLR/KASLR & 降低地址可预测性 & 信息泄漏后效果下降 \\
+stack canary & 简单栈返回地址覆盖 & 任意写、逻辑漏洞 \\
+CFI & 非法间接跳转 & 合法路径上的权限绕过 \\
+W\^X/NX & 数据页执行 & JIT 配置错误、ROP \\
+\bottomrule
+\end{longtable}
+
+安全测试要同时证明正常路径可用、禁止路径失败、失败有日志、敏感数据不泄露。只打开硬化选项但没有负面测试，不能说明边界有效。

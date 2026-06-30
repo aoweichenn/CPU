@@ -1,0 +1,408 @@
+\section{调度与并发深讲：从“能跑”到“可解释地推进”}
+
+调度器和同步原语经常被分开讲，但真实系统中二者紧密绑定。线程等待锁会离开 CPU；I/O completion 会唤醒线程；定时器会打断当前线程；优先级和锁持有时间会相互影响；关闭路径要唤醒所有等待者。若只学调度算法，不学等待语义，就无法解释“线程为什么不运行”。
+
+\subsection{线程不运行的六种原因}
+
+用户看到“程序卡住”，内核可能处在完全不同的状态。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+原因 & 内核状态 & 诊断方向 \\
+\midrule
+等 CPU & RUNNABLE 但不在 CPU 上 & runnable wait、runqueue 长度、优先级 \\
+等锁 & SLEEPING 在 mutex/futex 等待队列 & 持锁者、锁顺序、临界区长度 \\
+等 I/O & SLEEPING 在 completion 等待队列 & 块层队列、设备延迟、writeback \\
+等页面 & page fault 或内存回收 & major fault、swap、page cache miss \\
+等事件 & poll/epoll/timer/condition variable & 等待谓词、关闭路径、超时 \\
+已退出 & ZOMBIE 或 TERMINATED & 父进程是否 wait、资源是否释放 \\
+\bottomrule
+\end{longtable}
+
+这张表比“调度器选择下一个任务”更重要。调度器只能从 runnable 集合里选任务；一个 sleeping 任务不运行，通常不是调度策略问题，而是等待条件没有满足或唤醒丢失。
+
+\subsection{完整的阻塞读路径}
+
+以 pipe 的阻塞读为例。读者发现缓冲区为空，不能忙等，否则浪费 CPU。它必须把自己放入等待队列，改变状态为 sleeping，然后调度走。写者写入数据后，改变条件并唤醒读者。
+
+\begin{lstlisting}
+pipe_read(pipe, buf, len):
+  lock(pipe.lock)
+  while pipe.empty and not pipe.write_closed:
+    current.state = SLEEPING
+    enqueue(pipe.read_waitq, current)
+    schedule_unlocking(pipe.lock)
+    lock(pipe.lock)
+  if pipe.empty and pipe.write_closed:
+    unlock(pipe.lock)
+    return 0
+  n = copy_from_pipe(pipe, buf, len)
+  wake_waiters(pipe.write_waitq)
+  unlock(pipe.lock)
+  return n
+
+pipe_write(pipe, buf, len):
+  lock(pipe.lock)
+  while pipe.full and not pipe.read_closed:
+    sleep_on(pipe.write_waitq, pipe.lock)
+  if pipe.read_closed:
+    unlock(pipe.lock)
+    return -EPIPE
+  n = copy_to_pipe(pipe, buf, len)
+  wake_waiters(pipe.read_waitq)
+  unlock(pipe.lock)
+  return n
+\end{lstlisting}
+
+这里有多个边界：读端关闭要唤醒写者，写端关闭要唤醒读者；读者被信号打断时要返回 \code{EINTR} 或部分结果；非阻塞 fd 应返回 \code{EAGAIN} 而不是睡眠。一个合格 OS 模型必须把这些边界都写出来。
+
+\subsection{优先级反转}
+
+优先级反转是并发与调度相互影响的典型问题。低优先级线程 L 持有锁，高优先级线程 H 等这个锁，中优先级线程 M 持续运行，导致 L 得不到 CPU 释放锁，H 虽然优先级高却无法推进。
+
+\begin{lstlisting}
+L: lock(A), do work slowly
+H: tries lock(A), blocks
+M: CPU-bound, runnable
+
+without inheritance:
+  scheduler runs M before L
+  H waits for L indirectly
+
+with priority inheritance:
+  L temporarily inherits H priority
+  scheduler runs L so it can release A
+\end{lstlisting}
+
+priority inheritance 不是让锁更快，而是让等待关系反馈给调度器。实现要维护“谁在等谁”的依赖图，释放锁时撤销继承。若多把锁嵌套，继承链可能跨多个线程，测试必须覆盖链式等待。
+
+\subsection{死锁调试的步骤}
+
+死锁不是“程序没输出”。它是等待图出现环。调试时先列出每个线程持有的资源和等待的资源。
+
+\begin{lstlisting}
+Thread A: holds inode.lock, waits page.lock
+Thread B: holds page.lock, waits inode.lock
+
+wait-for graph:
+  A -> page.lock -> B
+  B -> inode.lock -> A
+\end{lstlisting}
+
+解决死锁的常用手段是全局锁顺序、trylock 回退、缩短临界区、拆分锁或使用 RCU。不要用“加更多锁”解决死锁，更多锁通常只会增加等待图边数。正确方法是减少共享状态、明确所有权和规定顺序。
+
+\subsection{调度和同步练习}
+
+\begin{enumerate}
+\tightlist
+\item 给三个任务 A/B/C，分别是 CPU 密集、周期 I/O、交互输入，手算 FCFS、RR、MLFQ 的等待时间。
+\item 构造一个 lost wakeup 的时序，并说明哪一把锁应同时保护等待谓词和等待队列。
+\item 画出 priority inversion 的等待图，写出 priority inheritance 后每个线程的临时优先级。
+\item 为一个有界队列写关闭协议：生产者关闭、消费者关闭、双端同时关闭分别怎样唤醒。
+\item 设计一个测试，证明 blocked 线程永远不会被调度器选中。
+\end{enumerate}
+
+\subsection{调度算法对比：同一负载下的不同结论}
+
+考虑三个任务：A 是长 CPU 任务，需要 30 个 tick；B 是交互任务，每运行 1 tick 就等待 I/O 5 tick；C 是短任务，只需要 3 tick。不同调度策略会给出完全不同的用户体验。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+策略 & 表现 & 问题 \\
+\midrule
+FCFS & 若 A 先到，C 和 B 长时间等待 & convoy effect，交互体验差 \\
+RR & A 不能长期霸占 CPU，B/C 能穿插运行 & 时间片过小会增加切换成本 \\
+优先级 & B 可以更快响应输入 & 低优先级任务可能饥饿 \\
+MLFQ & 通过行为反馈照顾交互任务 & 参数复杂，可能被任务行为利用 \\
+公平调度 & 长期 CPU 份额接近权重 & 响应延迟需要额外 wakeup/preempt 规则 \\
+EDF & deadline 最近者先运行 & 需要准入控制，过载时仍会 miss \\
+\bottomrule
+\end{longtable}
+
+这说明没有“唯一正确”的调度算法。调度器服务于目标：批处理吞吐、桌面交互、实时 deadline、容器公平、能耗控制或尾延迟。教材中算法比较的目的，不是背哪个更先进，而是理解每个算法优化了什么、牺牲了什么。
+
+\subsection{关闭路径是并发程序的必修课}
+
+很多同步教材只讲生产者消费者的正常路径，却不讲关闭。真实 OS 对象一定会关闭：pipe 端点关闭、socket 断开、进程退出、设备拔出、文件释放。关闭路径的核心规则是：改变关闭状态后，必须唤醒所有可能等待这个状态的线程。
+
+\begin{lstlisting}
+queue_close(q):
+  lock(q.lock)
+  q.closed = true
+  wake_all(q.not_empty)
+  wake_all(q.not_full)
+  unlock(q.lock)
+
+queue_pop(q):
+  lock(q.lock)
+  while q.empty and not q.closed:
+    sleep(q.not_empty, q.lock)
+  if q.empty and q.closed:
+    unlock(q.lock)
+    return CLOSED
+  item = pop(q)
+  wake_one(q.not_full)
+  unlock(q.lock)
+  return item
+\end{lstlisting}
+
+若关闭只唤醒消费者，不唤醒生产者，正在等待空间的生产者可能永远睡眠。若关闭状态不受同一把锁保护，等待者可能错过关闭通知。关闭路径是检验并发模型是否完整的最好办法。
+
+\subsection{常见误区}
+
+\begin{warningbox}
+\begin{itemize}
+\tightlist
+\item “线程没运行就是调度器不公平”：它可能根本不在 runnable 集合里。
+\item “加锁就安全”：锁必须保护正确对象，并且所有路径都遵守同一锁规则。
+\item “notify 等于发送消息”：notify 只唤醒等待者，条件仍要重新检查。
+\item “自旋锁比 mutex 快”：临界区短且不能睡眠时自旋才合适，长等待会浪费 CPU。
+\item “测试跑过一次没有死锁”：死锁是时序问题，需要锁顺序和等待图分析。
+\end{itemize}
+\end{warningbox}
+
+\subsection{从时间片轮转到反馈队列}
+
+Round Robin 的优点是简单：每个 runnable 任务轮流运行一个时间片。它解决了 FCFS 中长任务霸占 CPU 的问题，但它无法区分交互任务和批处理任务。交互任务经常运行很短时间就阻塞等待 I/O，如果它每次被唤醒后还要排在长 CPU 任务后面，用户会感觉系统迟钝。
+
+多级反馈队列（MLFQ）的核心是用任务行为估计任务类型：刚创建或刚被唤醒的任务放在较高优先级；任务用完整个时间片，说明偏 CPU 密集，降低优先级；任务很快阻塞，说明偏交互或 I/O 密集，保持或提升优先级；周期性提升所有任务，防止饥饿。
+
+\begin{lstlisting}
+on_tick(current):
+  current.slice_used += 1
+  if current.slice_used == quantum[current.level]:
+    demote(current)
+    enqueue(current)
+    schedule()
+
+on_sleep(current):
+  current.sleep_start = now
+
+on_wakeup(task):
+  if now - task.sleep_start >= interactive_threshold:
+    promote(task)
+  enqueue(task)
+\end{lstlisting}
+
+MLFQ 的难点不是队列，而是参数。时间片太短，上下文切换成本高；时间片太长，交互延迟差；提升太频繁，CPU 任务占便宜；提升太少，低优先级任务饥饿。工业调度器通常不会直接照搬教科书 MLFQ，而是把类似思想融入更复杂的权重、虚拟运行时间和唤醒抢占规则。
+
+\subsection{公平调度的虚拟运行时间}
+
+公平调度不承诺每次都平均，而承诺长期 CPU 份额接近权重。一个常见思路是维护每个任务的虚拟运行时间 \code{vruntime}。任务实际运行越久，\code{vruntime} 越大；权重越高，\code{vruntime} 增长越慢。调度器选择 \code{vruntime} 最小的任务，让落后的任务追上来。
+
+\begin{lstlisting}
+account_runtime(task, delta_exec):
+  task.vruntime += delta_exec * NICE_0_WEIGHT / task.weight
+
+pick_next(rq):
+  return leftmost_task_by_vruntime(rq.tree)
+\end{lstlisting}
+
+若用平衡树保存 runnable 任务，选择最小 \code{vruntime} 是 \code{O(log n)} 插入删除加 \code{O(1)} 或 \code{O(log n)} 取最小，具体取决于实现是否缓存最左节点。这个算法牺牲了极简实现，换来权重公平和较平滑的延迟。它仍然需要补充唤醒抢占、最小时间粒度、CPU affinity 和负载均衡，否则单靠 \code{vruntime} 无法覆盖完整系统需求。
+
+\subsection{实时调度：可调度性比算法名字重要}
+
+实时系统关注 deadline。固定优先级调度中，Rate Monotonic 把周期短的任务设为更高优先级；动态优先级调度中，EDF 选择绝对 deadline 最近的任务。它们都不能解决过载：如果任务最坏执行时间总和超过 CPU 能力，deadline miss 只是时间问题。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+算法 & 需要的输入 & 失败模式 \\
+\midrule
+RM & 周期、最坏执行时间、固定优先级 & 高优先级任务过多时低优先级 miss \\
+EDF & 绝对 deadline、剩余执行时间 & 过载时大量任务连续 miss \\
+CBS/预算调度 & runtime budget、period、deadline & 预算耗尽后任务被限速 \\
+\bottomrule
+\end{longtable}
+
+实时任务必须接受准入控制。准入控制回答“把这个任务加入后，已有保证是否还能成立”。没有准入控制，所谓实时优先级只是让某些任务更早失败。测试也必须记录 deadline miss、最大响应时间和抢占延迟，而不是只证明任务最终运行过。
+
+\subsection{futex：用户态快路径和内核等待队列}
+
+互斥锁若每次加锁解锁都进入内核，成本很高。futex 的思想是：无竞争时完全在用户态用原子操作完成；只有竞争时才进入内核，把线程挂到与某个用户地址关联的等待队列上。
+
+\begin{lstlisting}
+mutex_lock(m):
+  if atomic_compare_exchange(m.state, 0, 1):
+    return
+  while true:
+    old = atomic_exchange(m.state, 2)
+    if old == 0:
+      return
+    futex_wait(&m.state, expected=2)
+
+mutex_unlock(m):
+  old = atomic_exchange(m.state, 0)
+  if old == 2:
+    futex_wake(&m.state, 1)
+\end{lstlisting}
+
+关键是 \code{futex\_wait} 必须原子地检查用户地址仍等于 expected，再入队睡眠。否则 unlock 可能在检查和入队之间发生，造成 lost wakeup。futex 展示了一个重要原则：OS 不需要接管所有同步操作，它只需要在用户态快路径失败时提供可靠睡眠和唤醒。
+
+\subsection{信号、取消和可中断睡眠}
+
+阻塞调用不能只考虑“等到事件发生”。进程可能收到信号，线程可能被取消，文件描述符可能被关闭，设备可能拔出。内核等待点要定义是否可中断，以及中断后返回什么。
+
+\begin{lstlisting}
+wait_event_interruptible(q, condition):
+  lock(q.lock)
+  while !condition:
+    if signal_pending(current):
+      unlock(q.lock)
+      return -EINTR
+    sleep(q, q.lock)
+  unlock(q.lock)
+  return 0
+\end{lstlisting}
+
+可中断等待提高响应性，但让调用者必须处理部分完成。例如 \code{read} 已复制 100 字节后收到信号，通常应返回 100，而不是丢弃已完成工作；若 0 字节完成才被信号打断，才返回 \code{EINTR}。这种细节决定系统调用是否可组合。
+
+\subsection{并发对象的状态机写法}
+
+讲同步不能只写“加锁”。每个共享对象都应该有状态机。以有限队列为例，状态包括 open、closing、closed；计数包括 item 数和等待者；事件包括 push、pop、close producer、close consumer、timeout、signal。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+当前状态 & 事件 & 动作 \\
+\midrule
+open, empty & pop blocking & 消费者入 not\_empty 等待队列 \\
+open, full & push blocking & 生产者入 not\_full 等待队列 \\
+open & close producer & 标记 no\_more\_push，唤醒消费者 \\
+open & close consumer & 标记 no\_more\_pop，唤醒生产者 \\
+closed, empty & pop & 返回 EOF/CLOSED \\
+closed/full & push & 返回 EPIPE/CLOSED \\
+\bottomrule
+\end{longtable}
+
+状态机有两个好处。第一，它迫使设计者写出关闭路径和错误路径。第二，它直接变成测试矩阵：每个状态和事件组合至少有一个测试或证明。
+
+\subsection{同步算法复杂度和适用边界}
+
+不同同步原语服务不同场景。自旋锁避免睡眠切换，适合极短临界区和中断上下文；mutex 允许睡眠，适合可能等待较久的临界区；读写锁适合读多写少，但写者饥饿要处理；RCU 让读者几乎无锁，代价是更新路径复杂且对象释放要等 grace period。
+
+\begin{longtable}{p{0.2\linewidth}p{0.28\linewidth}p{0.4\linewidth}}
+\toprule
+原语 & 适合 & 不适合 \\
+\midrule
+spinlock & 短临界区、不能睡眠上下文 & I/O、缺页、可能阻塞路径 \\
+mutex & 普通内核对象互斥 & 中断上下文、自旋锁内层 \\
+rwlock & 读多写少且临界区短 & 写频繁或读者长期持有 \\
+semaphore & 资源计数与限流 & 表达复杂对象不变量 \\
+RCU & 读多、遍历多、更新少 & 需要立即释放或强一致更新 \\
+\bottomrule
+\end{longtable}
+
+原语选择错误会直接变成性能或正确性问题。把长 I/O 放在自旋锁内，会浪费 CPU 甚至死锁；用读写锁保护写多对象，会让写者互相等待且读者无收益；用 RCU 保护需要立即撤销权限的对象，可能留下过期访问窗口。
+
+\subsection{并发测试：从随机到可复现}
+
+并发测试不能只靠压力跑。压力测试能暴露问题，但失败时如果没有事件日志和可控调度，很难复现。更可靠的方法是把关键同步点做成可插桩事件，枚举或随机探索不同交错。
+
+\begin{lstlisting}
+test_lost_wakeup():
+  pause_after(reader, "checked_empty")
+  writer.write(byte)
+  writer.wake()
+  resume(reader)
+  assert(reader.eventually_returns(byte))
+\end{lstlisting}
+
+高质量并发测试至少记录：线程 id、对象 id、锁 acquire/release、状态改变、入队/出队、睡眠/唤醒、错误返回和超时。测试失败时要能画出等待图或事件序列。否则“偶现卡住”会变成无法定位的黑盒。
+
+\subsection{源码级补充：task\_struct 与 Linux 调度类}
+
+Linux 的调度对象不是一个抽象“线程”词条，而是 \code{task\_struct} 加上调度类私有实体。读 \filepath{include/linux/sched.h}、\filepath{kernel/sched/core.c}、\filepath{kernel/sched/fair.c} 时，先找这些字段：pid/tgid、state、flags、mm、active\_mm、files、signal、sighand、ptrace、cgroups、cpus\_mask、se、rt、dl。
+
+\begin{longtable}{p{0.22\linewidth}p{0.5\linewidth}}
+\toprule
+字段或对象 & 作用 \\
+\midrule
+\code{task\_struct.state} & runnable、interruptible sleep、uninterruptible sleep 等状态 \\
+\code{mm/active\_mm} & 用户地址空间和内核线程借用地址空间 \\
+\code{files} & fd table，fork/clone 时按标志共享或复制 \\
+\code{signal/sighand} & 进程级信号状态和 handler 表 \\
+\code{sched\_entity se} & CFS 的 vruntime、权重、红黑树节点 \\
+\code{cpus\_mask} & CPU affinity，限制可运行 CPU 集合 \\
+\code{cgroups} & CPU、memory、io 等资源控制归属 \\
+\bottomrule
+\end{longtable}
+
+进程创建读 \filepath{kernel/fork.c} 的 \code{copy\_process}：它根据 \code{CLONE\_*} 标志决定共享还是复制 mm、files、sighand、thread group。进程退出读 \filepath{kernel/exit.c} 的 \code{do\_exit}、\code{exit\_notify} 和 wait 路径：退出不是立即删除 task，而是留下 zombie 供父进程读取退出状态。
+
+\subsection{fork、clone、vfork 和线程}
+
+\code{fork} 复制进程抽象，地址空间用 COW；\code{clone} 用标志精确控制共享哪些对象；\code{vfork} 暂时共享地址空间并挂起父进程直到子进程 exec/exit；NPTL 线程通常是共享 mm、files、sighand 的 clone 任务。TLS、\code{set\_tid\_address}、robust futex list 都和线程退出清理有关。
+
+\begin{lstlisting}
+clone flags for pthread-like thread:
+  CLONE_VM        share address space
+  CLONE_FS        share fs context
+  CLONE_FILES     share fd table
+  CLONE_SIGHAND   share signal handlers
+  CLONE_THREAD    same thread group
+  CLONE_SETTLS    set thread-local storage base
+\end{lstlisting}
+
+这解释了为什么“进程”和“线程”在内核里不是两种完全不同对象，而是同一种 task 在资源共享标志上的不同组合。
+
+\subsection{上下文切换：switch\_mm、FPU 和 TLB}
+
+\code{\_\_schedule} 选择 next 后，底层切换要保存/恢复 CPU 上下文、切换内核栈、切换地址空间、处理 lazy FPU 状态。若 prev 和 next 属于同一 mm，可能避免完整地址空间切换；若不同 mm，需要更新页表基址并处理 TLB/PCID。
+
+\begin{lstlisting}
+context_switch(prev, next):
+  prepare_task_switch(prev, next)
+  if prev.mm != next.mm:
+    switch_mm(prev.mm, next.mm)
+  switch_to(prev, next)  // registers and stack
+  finish_task_switch(prev)
+\end{lstlisting}
+
+上下文切换成本不只是保存寄存器。cache/TLB 热状态丢失、跨 CPU 迁移、FPU/向量寄存器保存和安全缓解措施都会影响成本。因此调度器要在公平、延迟和局部性之间折中。
+
+\subsection{调度类顺序}
+
+Linux 调度类有优先顺序：stop、deadline、realtime、fair、idle。核心调度路径从高到低询问各类是否有可运行任务。
+
+\begin{lstlisting}
+pick_next_task(rq):
+  for class in [stop, dl, rt, fair, idle]:
+    p = class.pick_next_task(rq)
+    if p != null:
+      return p
+\end{lstlisting}
+
+stop class 用于极高优先级的 CPU 控制任务；deadline 处理 \code{SCHED\_DEADLINE}；rt 处理 \code{SCHED\_FIFO/RR}；fair 处理普通任务；idle 在无事可做时运行。若实时任务配置错误，普通 CFS 任务会长期得不到 CPU，所以实时调度必须配合权限和 runtime 限制。
+
+\subsection{CFS、红黑树和唤醒抢占}
+
+CFS 用 \code{vruntime} 表示任务已获得的加权 CPU 服务，runqueue 用红黑树按 \code{vruntime} 排序，选择最左任务。关键参数包括 \code{sched\_latency}、\code{min\_granularity}、wakeup preempt 规则和 task weight。
+
+\begin{lstlisting}
+enqueue_task_fair(rq, p):
+  update_curr(rq)
+  place_entity(p.se)
+  rb_insert_by_vruntime(rq.cfs_tasks, p.se)
+
+pick_next_task_fair(rq):
+  return rb_leftmost(rq.cfs_tasks)
+\end{lstlisting}
+
+唤醒抢占不是简单“新任务来了就抢”。它比较新任务的 \code{vruntime}、交互延迟、当前任务运行时间和最小粒度。过度抢占会提高响应但增加上下文切换；抢占太少会让交互任务尾延迟变差。
+
+\subsection{cgroup、NUMA balancing 与能源调度}
+
+cgroup CPU controller 用权重、配额和周期限制任务组 CPU 时间。NUMA balancing 通过采样页访问和迁移任务/页面改善内存局部性。能源感知调度 EAS 和 schedutil 把任务放置、CPU capacity、频率调节和能耗模型联系起来。
+
+\begin{longtable}{p{0.22\linewidth}p{0.5\linewidth}}
+\toprule
+机制 & 调度影响 \\
+\midrule
+CPU quota & 组用完周期预算后 throttled，即使有 runnable 任务也不能运行 \\
+CPU weight & 多组竞争时按权重分配长期份额 \\
+CPU affinity & 限制任务可运行 CPU，可能改善局部性也可能造成热点 \\
+NUMA balancing & 在任务迁移和页面迁移之间寻找更低远端访问成本 \\
+EAS/schedutil & 结合 CPU capacity 和频率，平衡性能与能耗 \\
+\bottomrule
+\end{longtable}
+
+诊断“调度不公平”时必须看 cgroup throttling、affinity、rt/deadline 任务、NUMA 迁移和 CPU 频率。只看 runqueue 长度会漏掉资源控制和硬件拓扑。

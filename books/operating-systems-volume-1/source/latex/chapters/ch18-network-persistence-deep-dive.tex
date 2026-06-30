@@ -1,0 +1,316 @@
+\section{网络与持久化深讲：流、事件和提交}
+
+网络和持久化看起来相距很远，一个处理远端通信，一个处理本地存储。但它们共享几个 OS 问题：缓冲区所有权、阻塞与唤醒、错误传播、部分完成、重试与幂等。网络 send 可能短写，磁盘 write 可能只进 page cache；TCP 连接可能 reset，块设备写入可能返回 \code{EIO}；应用都必须写出可恢复状态机。
+
+\subsection{TCP 字节流为什么没有消息边界}
+
+TCP 提供可靠有序字节流，不提供应用消息边界。一次 \code{send} 的 100 字节，接收方可能分两次 \code{recv} 到 40 和 60 字节，也可能和下一次 send 合并读到。应用协议必须自己定义长度、分隔符或帧格式。
+
+\begin{lstlisting}
+read_frame(sock):
+  while buffer.len < HEADER_SIZE:
+    recv_more(sock, buffer)
+  len = parse_length(buffer.header)
+  while buffer.len < HEADER_SIZE + len:
+    recv_more(sock, buffer)
+  return extract_frame(buffer)
+\end{lstlisting}
+
+这解释了为什么 readiness 不是消息。epoll 告诉你 socket 可能可读，不告诉你完整帧已经到达。若把一次可读事件当成完整请求，协议解析会在高负载或网络分片时失败。
+
+\subsection{网络背压}
+
+发送缓冲区、接收缓冲区、协议队列和用户态队列都必须有限。若应用生产速度超过网络发送速度，队列会增长。正确系统要让生产者感受到背压，而不是无限缓存。
+
+\begin{lstlisting}
+send_with_backpressure(sock, data):
+  while data not empty:
+    n = send(sock, data)
+    if n > 0:
+      data = data[n:]
+    else if errno == EAGAIN:
+      wait_for_writable(sock)
+    else:
+      fail_connection(errno)
+\end{lstlisting}
+
+背压也适用于持久化。后台写盘跟不上，dirty page 不能无限增长；内核会限制脏页比例，让写入者参与 writeback 或阻塞。这样牺牲局部延迟，换取系统整体不被内存耗尽。
+
+\subsection{提交协议和幂等恢复}
+
+网络服务通常要处理“请求已经执行但响应丢失”的情况。持久化系统要处理“数据已经写一部分但 commit 记录没写”的情况。二者都需要幂等标识。
+
+\begin{lstlisting}
+request:
+  client_id
+  request_id
+  operation
+  payload
+
+server:
+  if request_id already committed:
+    return previous_result
+  prepare operation
+  commit durable record
+  return result
+\end{lstlisting}
+
+幂等不是“重复执行也没事”这么简单，而是系统能识别重复请求，并返回同一个已提交结果。没有 request id，网络重试可能造成重复扣款、重复写文件或重复发布版本。
+
+\subsection{断电恢复和网络重试的共同思维}
+
+两者都要求你列出中间状态。
+
+\begin{longtable}{p{0.24\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+领域 & 中间状态 & 恢复规则 \\
+\midrule
+网络请求 & received、processing、committed、replied & committed 后重复请求返回旧结果 \\
+文件输出 & temp、synced、renamed、manifest & manifest 后才被读取者信任 \\
+日志事务 & intent、data written、commit & commit 存在则 redo，不存在则忽略 \\
+\bottomrule
+\end{longtable}
+
+学习 OS 时要养成这种状态枚举习惯。它比背诵某个 API 更接近工程正确性。
+
+\subsection{网络与持久化练习}
+
+\begin{enumerate}
+\tightlist
+\item 为什么 TCP 服务端不能假设一次 \code{recv} 得到一个完整请求？
+\item 设计一个带 request id 的幂等接口，说明响应丢失后客户端如何重试。
+\item 比较 socket send buffer 背压和 dirty page 背压的共同点。
+\item 写出 manifest 提交前后崩溃的恢复规则。
+\item 为什么 commit record 需要 checksum 和 fsync？
+\end{enumerate}
+
+\subsection{网络错误和文件错误的相似性}
+
+网络错误常被误解成“连接断了”，文件错误常被误解成“磁盘坏了”。实际上二者都需要精细分类。
+
+\begin{longtable}{p{0.2\linewidth}p{0.32\linewidth}p{0.36\linewidth}}
+\toprule
+领域 & 错误 & 处理 \\
+\midrule
+socket & \code{EAGAIN} & 等可写/可读事件后继续 \\
+socket & connection reset & 丢弃连接状态，决定请求是否可重试 \\
+socket & short write & 保存剩余 buffer，下次继续发送 \\
+文件 & short write & 循环写或上报部分完成 \\
+文件 & \code{fsync} failure & 业务提交失败，不能发布 manifest \\
+日志 & checksum mismatch & 停止恢复到最后完整记录 \\
+\bottomrule
+\end{longtable}
+
+共同原则是：先判断是否部分完成，再判断是否可重试，再判断重试是否幂等。没有这个顺序，网络服务和持久化系统都会在故障时产生重复、丢失或半提交。
+
+\subsection{案例：上传文件服务}
+
+上传文件服务同时涉及网络和持久化。服务端从 socket 接收字节，写入临时文件，计算 checksum，fsync，rename，更新 manifest，再返回成功。任何一步失败都要有恢复规则。
+
+\begin{lstlisting}
+upload(request_id, socket):
+  tmp = create_temp(request_id)
+  while not end_of_body:
+    bytes = recv(socket)
+    if bytes.error: abort_tmp(tmp)
+    write_all(tmp, bytes)
+    update_checksum(bytes)
+  fsync(tmp)
+  rename(tmp, final_name(request_id))
+  fsync(parent_dir)
+  commit_manifest(request_id, final_name, checksum)
+  send_success(socket)
+\end{lstlisting}
+
+若成功响应丢失，客户端可能重试同一个 request id。服务端必须识别 manifest 中已有提交，返回同一结果，而不是再创建第二个文件。这就是网络幂等和持久化提交的交叉点。
+
+\subsection{本章小结}
+
+\begin{itemize}
+\tightlist
+\item TCP 是字节流，应用协议必须自己定义消息边界。
+\item 网络和存储都可能部分完成，调用者必须保存状态继续推进。
+\item 背压是系统稳定性的机制，不是性能失败。
+\item 幂等 request id 能把网络重试和持久化提交连接起来。
+\item 日志、manifest 和 checksum 让崩溃恢复有可判定事实。
+\end{itemize}
+
+\subsection{网络栈分层：从网卡帧到 socket}
+
+网卡收到的是链路层帧，用户程序读到的是 socket 字节或数据报。中间要经过驱动、软中断或 polling、链路层解析、IP 层路由和分片处理、传输层状态机、socket 缓冲区和唤醒机制。
+
+\begin{lstlisting}
+NIC DMA frame
+  -> driver RX ring
+  -> network poll budget
+  -> Ethernet header parse
+  -> IP validation and routing
+  -> TCP/UDP demux by ports
+  -> socket receive queue
+  -> wake epoll/read waiter
+\end{lstlisting}
+
+每层都有丢弃理由。网卡 ring 满会丢包；校验和错会丢包；IP TTL 为 0 会丢包；没有匹配 socket 会发 RST 或 ICMP；socket receive buffer 满会产生背压或丢弃。网络栈不是“把数据送给进程”，而是一系列有限队列和状态机。
+
+\subsection{UDP 和 TCP 的不同契约}
+
+UDP 保留报文边界，但不保证可靠、有序、去重和拥塞控制；TCP 保证可靠有序字节流，但不保留消息边界。应用选择协议时，实际上是在选择哪些语义由内核提供，哪些语义由应用自己实现。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+协议 & 提供 & 不提供 \\
+\midrule
+UDP & 数据报边界、端口复用、校验和 & 重传、排序、拥塞控制、连接状态 \\
+TCP & 可靠有序字节流、流量控制、拥塞控制 & 应用消息边界、请求幂等、业务提交 \\
+QUIC 类协议 & 用户态连接、流、多路复用、加密集成 & 仍需应用定义业务语义和提交规则 \\
+\bottomrule
+\end{longtable}
+
+UDP 适合应用能容忍丢包或自己实现重传的场景，例如实时音视频、查询协议或自定义传输。TCP 适合需要可靠字节流的场景，但应用仍要处理半关闭、reset、短读短写和重复请求。
+
+\subsection{TCP 状态机和关闭语义}
+
+TCP 连接有状态：LISTEN、SYN-SENT、ESTABLISHED、FIN-WAIT、CLOSE-WAIT、TIME-WAIT 等。关闭不是单个动作，而是双向字节流各自结束。收到 FIN 表示对方不再发送数据，但本端仍可发送；reset 表示连接异常终止，未读或未确认数据可能丢失。
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
+\toprule
+事件 & socket 读写表现 & 应用含义 \\
+\midrule
+peer FIN & \code{recv} 返回 0 & 对方正常关闭发送方向 \\
+local shutdown write & 本端发送 FIN & 告诉对方本端不再发送 \\
+RST & \code{ECONNRESET} 等错误 & 连接状态丢弃，业务是否完成未知 \\
+TIME\_WAIT & 连接四元组暂时保留 & 吸收迟到报文，避免旧连接污染新连接 \\
+\bottomrule
+\end{longtable}
+
+服务端常见 bug 是把 \code{recv} 返回 0 当成错误，或把 \code{send} 成功当成对方业务已经处理。TCP 只能说明字节进入本机协议栈或被对端确认到传输层，不能说明远端应用已经提交业务。
+
+\subsection{流量控制和拥塞控制}
+
+流量控制保护接收方：接收窗口告诉发送方还能接收多少字节。拥塞控制保护网络：发送方根据丢包、延迟或 ACK 估计网络可承受速率。二者都能让 \code{send} 变慢或返回 \code{EAGAIN}，但原因不同。
+
+\begin{lstlisting}
+tcp_send_loop:
+  while app_has_data:
+    if send_buffer_full:
+      wait_app_backpressure()
+    if receiver_window_zero:
+      wait_window_update()
+    if congestion_window_limited:
+      wait_ack_or_timer()
+    transmit_allowed_segments()
+\end{lstlisting}
+
+这解释了为什么“网络慢”不能只看带宽。可能是接收方应用不读导致窗口关闭；可能是中间网络拥塞导致拥塞窗口缩小；可能是本机 socket buffer 太小；可能是 Nagle、delayed ACK 或小包策略影响延迟。诊断要看队列、窗口、重传、RTT 和应用读写速率。
+
+\subsection{epoll/readiness：事件不是工作完成}
+
+readiness API 告诉应用“某 fd 可能不会阻塞”，而不是“完整请求已经准备好”。边缘触发模式下，应用必须一直读到 \code{EAGAIN}，否则可能错过后续事件；水平触发模式下，只要条件仍成立，事件会重复出现。
+
+\begin{lstlisting}
+on_readable(fd):
+  while true:
+    n = recv(fd, buf)
+    if n > 0:
+      parser.feed(buf[0:n])
+      while parser.has_frame():
+        handle_frame(parser.next_frame())
+    else if n == 0:
+      close_connection(fd)
+      break
+    else if errno == EAGAIN:
+      break
+    else:
+      fail_connection(fd, errno)
+      break
+\end{lstlisting}
+
+事件循环必须把连接状态保存在对象里：已读但未解析的字节、待发送但未写完的响应、超时时间、是否半关闭、request id 和持久化提交状态。没有这些状态，短读短写一出现，程序就会丢帧或重复发送。
+
+\subsection{accept 队列、listen backlog 和过载}
+
+服务器调用 \code{listen(backlog)} 后，内核维护连接建立相关队列。过载时，SYN 队列、accept 队列、应用线程池、socket buffer 或业务队列都可能成为瓶颈。只调大一个 backlog 不一定解决问题。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+队列 & 堵塞表现 & 对策 \\
+\midrule
+SYN 队列 & 新连接握手失败或重传 & SYN cookie、限流、扩容 \\
+accept 队列 & 连接已建立但应用未 accept & 更快 accept、多进程、backlog 调整 \\
+worker 队列 & 已接收请求等待处理 & 背压、负载均衡、降级 \\
+send buffer & 响应写不出去 & 非阻塞写、限速慢客户端 \\
+持久化队列 & fsync 或日志提交积压 & 批量提交、限流、隔离磁盘 \\
+\bottomrule
+\end{longtable}
+
+一个健壮服务会在每层设置上限，并在上限触发时明确拒绝或降级。无限 accept、无限读 body、无限缓存响应，都会把远端慢客户端或恶意客户端变成本机内存问题。
+
+\subsection{持久化日志：redo、undo 和幂等}
+
+崩溃恢复常见两类思路。redo 日志记录“提交后应当产生的结果”，恢复时重做已提交事务；undo 日志记录“修改前的旧值”，未提交事务崩溃后回滚。实际数据库可能使用更复杂的 WAL，但核心仍是先写可恢复证据，再改变主数据。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+日志类型 & 写入顺序 & 恢复规则 \\
+\midrule
+redo & 日志 intent/data 先持久，commit 后主数据可稍后写 & 有 commit 则 redo，无 commit 忽略 \\
+undo & 旧值日志先持久，再覆盖主数据 & 无 commit 则 undo，有 commit 保留 \\
+manifest & 内容文件先完整持久，再发布版本记录 & 只采用 manifest 中可校验版本 \\
+\bottomrule
+\end{longtable}
+
+幂等 request id 与日志结合后，服务才能处理响应丢失。commit record 中记录 request id 和结果摘要；客户端重试时，服务查到已提交记录，直接返回同一结果。没有这层记录，重试只能变成“再执行一次”，这对扣款、发货、发布版本等操作通常是错误的。
+
+\subsection{批量提交和延迟权衡}
+
+每个请求都单独 \code{fsync}，语义清楚但吞吐受 flush 延迟限制。批量提交把多个请求放进同一次 journal commit 或 group commit，摊薄 flush 成本，但会增加单个请求等待批次的延迟。
+
+\begin{lstlisting}
+group_commit_loop:
+  wait_until(batch_not_empty or timeout)
+  batch = collect_pending_requests(max_batch)
+  append_records(batch)
+  fsync(log)
+  for req in batch:
+    mark_committed(req)
+    wake_waiter(req)
+\end{lstlisting}
+
+批量提交的正确性条件是：只有 fsync 成功后才能向这些请求返回 committed；fsync 失败时，整个批次都必须失败或进入恢复状态；批次中的每条记录要有长度、checksum 和 request id，恢复时能跳过不完整尾部。
+
+\subsection{网络服务的端到端状态机}
+
+把网络和持久化合起来，一个请求至少经过这些状态：RECEIVING、PARSED、VALIDATED、EXECUTING、LOGGED、COMMITTED、REPLYING、DONE。错误和重试必须能从每个状态解释。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+状态 & 持有资源 & 失败处理 \\
+\midrule
+RECEIVING & socket buffer、解析缓冲区 & 连接断开则丢弃未完整请求 \\
+VALIDATED & 请求对象、权限结果 & 拒绝时不改变持久状态 \\
+EXECUTING & 内存中业务变更或临时文件 & 失败则回滚临时资源 \\
+LOGGED & WAL/manifest 候选记录 & 未 commit 崩溃后忽略或 undo \\
+COMMITTED & 持久 commit record & 重试返回同一结果 \\
+REPLYING & 待发送响应 buffer & 发送失败不撤销已提交业务 \\
+\bottomrule
+\end{longtable}
+
+最后一行尤其重要。业务已经 committed 后，响应发送失败不能回滚业务，因为客户端可能稍后重试并期望得到同一结果。应用协议必须把“业务提交”和“响应送达”分开。
+
+\subsection{网络与持久化测试矩阵}
+
+\begin{longtable}{p{0.28\linewidth}p{0.36\linewidth}p{0.24\linewidth}}
+\toprule
+测试 & 注入故障 & 期望 \\
+\midrule
+TCP 分片 & 每次只发送 1 字节 & parser 仍能组帧 \\
+短写 & send 只接受部分响应 & 状态机保存剩余字节 \\
+连接 reset & commit 前/后分别 reset & 前者不提交，后者可幂等查询 \\
+重复 request id & 响应丢失后重试 & 返回同一 committed 结果 \\
+fsync 失败 & 日志提交阶段返回 EIO & 请求失败，不能发布 commit \\
+崩溃恢复 & commit 前/后断电 & 前者忽略，后者 redo/可查询 \\
+背压 & 慢客户端和慢磁盘同时出现 & 队列有上限，系统不 OOM \\
+\bottomrule
+\end{longtable}
+
+这些测试能证明服务不是只在理想网络和理想磁盘下正确，而是在短读短写、重复、断线、断电和过载下仍然有清晰语义。

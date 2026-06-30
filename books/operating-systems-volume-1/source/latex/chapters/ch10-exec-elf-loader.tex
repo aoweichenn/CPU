@@ -1,0 +1,276 @@
+\chapter{exec、ELF 装载与用户栈}
+
+\section{原理}
+
+\code{fork} 复制了一个进程的执行环境，而 \code{exec} 把当前进程的用户态程序替换成另一个程序。这个替换不是“创建新进程”，因为 pid、父子关系、部分资源限制和很多内核对象仍然属于同一个进程；它也不是普通文件读取，因为内核必须验证可执行文件格式、建立新的地址空间、设置入口点、构造用户栈、处理解释器、重置部分信号语义并关闭带 \code{close-on-exec} 标志的 fd。
+
+ELF 装载器是系统调用边界、文件系统、虚拟内存和权限模型的交汇点。用户给内核一个路径和参数数组，内核必须在不信任用户内存的前提下读取这些字符串；路径解析得到 inode 后，还要检查执行权限、文件类型、挂载选项和安全策略；读取 ELF 头后，装载器根据 program header 而不是 section header 建立映射。section 是链接和调试视角，program segment 才是运行时装载视角。
+
+\begin{keyidea}
+\code{exec} 的核心契约是原子替换用户态映像：成功后旧程序不能继续执行；失败时旧程序必须仍然可运行，除非失败发生在明确不可恢复的提交点之后。
+\end{keyidea}
+
+真实系统还要处理动态链接。若 ELF 带 \code{PT\_INTERP}，内核并不直接跳到主程序入口，而是同时映射解释器，把控制权交给动态链接器。动态链接器再加载共享库、重定位符号，最后跳到用户程序的入口。内核只负责把 aux vector、入口、program header 信息和随机数等必要元数据放到用户栈。
+
+\section{实践}
+
+一个教学内核中的 \code{execve(path, argv, envp)} 可以拆成九个阶段：
+
+\begin{enumerate}
+\tightlist
+\item 从用户内存复制 path、argv、envp，设置长度上限。
+\item 路径解析并打开可执行 inode。
+\item 检查文件类型、执行权限、noexec 挂载选项和安全策略。
+\item 读取并验证 ELF header。
+\item 扫描 program header，计算新地址空间布局。
+\item 创建临时地址空间，映射 \code{PT\_LOAD} 段和用户栈。
+\item 若存在 \code{PT\_INTERP}，装载解释器并设置实际入口。
+\item 构造用户栈：argc、argv 指针、envp 指针、auxv、字符串和对齐填充。
+\item 提交：切换进程 mm、寄存器入口和栈指针，关闭 \code{CLOEXEC} fd。
+\end{enumerate}
+
+这里最容易讲错的是失败回滚。前七步应尽量在临时对象中完成：临时 mm、临时 VMA、临时页、临时 fd 引用。只有全部验证成功后，才进入提交阶段并销毁旧地址空间。否则一个坏 ELF 就可能把调用者进程破坏到无法返回错误码。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+对象 & 成功后状态 & 失败回滚 \\
+\midrule
+旧 mm & 被新 mm 替换并释放引用 & 保持可运行 \\
+新 mm & 成为 current 的地址空间 & 释放所有 VMA 和页 \\
+文件引用 & 可执行文件可关闭或保留映射引用 & put inode/file 引用 \\
+fd table & 关闭 \code{FD\_CLOEXEC} 条目 & 不应改变 \\
+信号处理 & 捕获处理器重置，忽略语义按规则保留 & 不应改变 \\
+寄存器 & rip/pc 指向入口，sp 指向新用户栈 & 不应改变 \\
+\bottomrule
+\end{longtable}
+
+\section{算法与实现分析}
+
+\subsection{ELF header 验证}
+
+ELF 验证要防止把任意文件当代码执行。最小检查包括 magic、class、endianness、machine、type、program header 范围和整数溢出。
+
+\begin{lstlisting}
+validate_elf(file):
+  eh = read_at(file, 0, sizeof(Elf64_Ehdr))
+  require eh.magic == 0x7f 'E' 'L' 'F'
+  require eh.class == ELFCLASS64
+  require eh.machine == EM_X86_64
+  require eh.phentsize == sizeof(Elf64_Phdr)
+  require eh.phnum <= MAX_PHDRS
+  require checked_mul(eh.phnum, eh.phentsize, &ph_size)
+  require checked_add(eh.phoff, ph_size, &ph_end)
+  require ph_end <= file.size or file supports sparse read policy
+\end{lstlisting}
+
+复杂度是 \code{O(phnum)}。真正关键的是边界检查：\code{p\_offset + p\_filesz}、\code{p\_vaddr + p\_memsz}、页对齐和权限组合都可能溢出。装载器不能相信编译器或链接器一定生成合法文件，因为攻击者可以手工构造 ELF。
+
+\subsection{段映射}
+
+\code{PT\_LOAD} 段描述文件区间到虚拟地址区间的映射。文件大小 \code{p\_filesz} 是需要从文件读出的内容，内存大小 \code{p\_memsz} 包括 BSS 零填充。
+
+\begin{lstlisting}
+map_load_segment(mm, file, ph):
+  require ph.memsz >= ph.filesz
+  require same_page_offset(ph.vaddr, ph.offset)
+  start = page_down(ph.vaddr)
+  end   = page_up(ph.vaddr + ph.memsz)
+  file_start = page_down(ph.offset)
+  prot = prot_from_flags(ph.flags)
+  map_file(mm, start, end, file, file_start, prot)
+  zero_range(mm, ph.vaddr + ph.filesz, ph.vaddr + ph.memsz)
+\end{lstlisting}
+
+若采用 demand paging，\code{map\_file} 不必立即读入所有页面，只需建立 VMA，等 page fault 时按文件偏移填充页面。这样 \code{exec} 延迟低，内存占用也低。若采用 eager loading，实现简单但启动大程序会有明显 I/O 峰值。
+
+\subsection{用户栈构造}
+
+用户栈是 ABI 契约的一部分。教学系统可以简化 auxv，但不能把 argv 字符串和 argv 指针混为一谈。
+
+\begin{lstlisting}
+build_user_stack(argv, envp, auxv):
+  sp = USER_STACK_TOP
+  for s in reverse(strings(argv, envp)):
+    sp -= len(s) + 1
+    copy_to_new_user(sp, s)
+    remember_pointer(s, sp)
+  sp = align_down(sp, 16)
+  push_null()
+  push_auxv(auxv)
+  push_null()
+  push_pointers(envp)
+  push_null()
+  push_pointers(argv)
+  push(argc)
+  return sp
+\end{lstlisting}
+
+栈构造要设置总大小上限，防止用户传入巨量参数耗尽内核内存。所有用户字符串必须先复制到内核或临时页中，因为在 \code{exec} 期间旧地址空间即将被替换；若边复制边销毁旧 mm，就可能读到无效地址。
+
+\subsection{提交点}
+
+提交阶段要尽量短，并且顺序清晰：
+
+\begin{lstlisting}
+commit_exec(new_image):
+  old_mm = current.mm
+  current.mm = new_image.mm
+  current.regs.ip = new_image.entry
+  current.regs.sp = new_image.stack_pointer
+  reset_caught_signal_handlers(current)
+  close_cloexec_fds(current.files)
+  activate_mm(new_image.mm)
+  drop_mm(old_mm)
+  return_to_user()
+\end{lstlisting}
+
+提交点之后不应再执行可能失败且需要返回旧程序的操作。比如关闭 \code{CLOEXEC} fd 一般可以在提交逻辑中完成，因为关闭失败不应阻止 exec 成功；但读取解释器、分配栈页和权限检查必须放在提交点之前。
+
+\section{测试}
+
+\begin{enumerate}
+\tightlist
+\item 正常 ELF：静态程序能打印 argc/argv/envp，入口地址和栈对齐正确。
+\item 坏 magic：返回 \code{ENOEXEC}，旧程序继续运行。
+\item 无执行权限：返回 \code{EACCES}，fd table 不变化。
+\item 段溢出：构造 \code{p\_vaddr + p\_memsz} 溢出的 ELF，装载器必须拒绝。
+\item BSS 清零：全局未初始化数组初值必须为零。
+\item \code{FD\_CLOEXEC}：带标志 fd 在新程序中不可见，普通 fd 仍可用。
+\item 大 argv：超过限制返回 \code{E2BIG}，不破坏旧地址空间。
+\item 动态链接入口：带 \code{PT\_INTERP} 时入口应进入解释器而不是主程序 \code{e\_entry}。
+\end{enumerate}
+
+\begin{rubricbox}
+本章合格标准：能区分 fork 和 exec；能解释 ELF program header 的运行时意义；能画出用户栈布局；能指出 exec 的失败回滚边界和提交点。
+\end{rubricbox}
+
+\section{源码级补充：load\_elf\_binary、auxv 与 binfmt}
+
+\subsection{ELF 结构字段}
+
+读 ELF 装载源码时要区分三类头：\code{Elf64\_Ehdr} 描述整个文件，\code{Elf64\_Phdr} 描述运行时段，\code{Elf64\_Shdr} 描述链接/调试节。内核运行装载主要看 program header；section header 即使被 stripped，也不影响程序运行。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+字段或类型 & 含义 & 装载用途 \\
+\midrule
+\code{PT\_LOAD} & 可映射段 & 建立 VMA，设置 R/W/X 权限 \\
+\code{PT\_INTERP} & 动态解释器路径 & 装载 \code{ld-linux.so} 并把入口交给它 \\
+\code{PT\_PHDR} & program header 自身位置 & 传给用户态动态链接器 \\
+\code{PT\_GNU\_STACK} & 栈权限提示 & 决定用户栈是否可执行 \\
+\code{e\_entry} & ELF 入口虚拟地址 & 静态程序入口或解释器最终跳转参考 \\
+\bottomrule
+\end{longtable}
+
+Linux 源码入口是 \filepath{fs/binfmt\_elf.c} 的 \code{load\_elf\_binary}。读时抓住阶段：读取 header，读取 program header，检查 interpreter，建立新 mm，映射 load segments，设置 brk，构造栈和 auxv，设置寄存器。
+
+\subsection{aux vector 布局}
+
+auxv 是内核放到用户栈上的键值数组，给动态链接器和 libc 传递信息。常见项包括 \code{AT\_PHDR}、\code{AT\_PHENT}、\code{AT\_PHNUM}、\code{AT\_ENTRY}、\code{AT\_BASE}、\code{AT\_PAGESZ}、\code{AT\_RANDOM}、\code{AT\_EXECFN}、\code{AT\_NULL}。
+
+\begin{lstlisting}
+user stack top:
+  strings for argv/envp
+  random bytes
+  auxv: AT_PHDR, value
+        AT_PHENT, value
+        AT_PHNUM, value
+        AT_ENTRY, value
+        AT_RANDOM, pointer
+        AT_NULL, 0
+  envp pointers, NULL
+  argv pointers, NULL
+  argc
+\end{lstlisting}
+
+\code{AT\_RANDOM} 为 stack canary 和 ASLR 提供随机种子；\code{AT\_BASE} 指向动态链接器基址；\code{AT\_PHDR} 让动态链接器找到主程序段表。若 auxv 构造错误，程序可能在 \code{main} 前就崩溃。
+
+\subsection{解释器脚本和 binfmt}
+
+\code{\#! /bin/sh} 脚本不是 ELF。内核识别 shebang 后，把解释器路径和脚本路径重写成新的 argv，再递归执行解释器。Linux 用 binfmt 框架支持多种二进制格式：ELF、脚本、misc 注册格式等。
+
+\begin{lstlisting}
+execve("script.sh", ["script.sh", "a"]):
+  read first line "#!/bin/sh"
+  new argv = ["/bin/sh", "script.sh", "a"]
+  execve("/bin/sh", new argv)
+\end{lstlisting}
+
+这里要限制递归深度，否则脚本解释器互相指向会无限递归。binfmt\_misc 允许用户注册自定义格式，例如通过魔数把某类文件交给解释器。安全检查必须覆盖最终解释器和原脚本，不能只检查第一层路径。
+
+\subsection{vfork + exec 为什么高效但危险}
+
+\code{vfork} 让子进程在 exec 或 exit 前与父进程共享地址空间，父进程通常被挂起。它避免了复制页表和 COW 设置，适合立刻 exec 的路径；但子进程若在 exec 前修改内存或调用复杂函数，会破坏父进程状态。
+
+\begin{lstlisting}
+child = vfork()
+if child == 0:
+  // only async-signal-safe, minimal setup
+  dup2(fd, STDOUT_FILENO)
+  execve(path, argv, envp)
+  _exit(127)
+\end{lstlisting}
+
+现代系统常用 \code{posix\_spawn} 在库和内核之间选择更安全高效的实现。理解 \code{vfork} 的意义，不是鼓励随便使用，而是理解 exec 前后地址空间提交点的重要性。
+
+\subsection{setuid、凭据变化与 no\_new\_privs}
+
+exec 不只是换代码。执行 setuid/setgid 文件时，进程凭据可能变化；capability 也会根据文件能力、bounding set、ambient set 和 no\_new\_privs 重新计算。动态链接器和环境变量处理必须考虑提权执行，避免用户用 \code{LD\_PRELOAD} 一类环境影响高权限程序。
+
+\begin{lstlisting}
+exec_security_transition(file):
+  read inode mode, owner, file capabilities
+  if no_new_privs:
+    suppress privilege gain
+  compute new effective/permitted/inheritable caps
+  clear dangerous personality and env effects
+  install new credentials at commit
+\end{lstlisting}
+
+这解释了为什么 exec 路径会调用 LSM hook 和凭据提交逻辑。安全检查不能只看 ELF 格式合法，还要看执行后主体身份是否改变、哪些 fd 继承、dumpable 标志如何更新、ptrace 是否允许继续。
+
+\subsection{ASLR、PIE 与栈保护输入}
+
+exec 建立新地址空间时，会选择随机化的 mmap base、stack base、brk 和 VDSO 位置。PIE 主程序也可随机基址加载。内核还向 auxv 提供 \code{AT\_RANDOM}，供 libc 初始化 stack canary。
+
+\begin{longtable}{p{0.24\linewidth}p{0.48\linewidth}}
+\toprule
+机制 & exec 阶段输入 \\
+\midrule
+ASLR & 随机选择 mmap、stack、brk、VDSO、PIE 基址 \\
+stack canary & \code{AT\_RANDOM} 提供随机字节 \\
+NX stack & \code{PT\_GNU\_STACK} 和默认策略决定栈可执行性 \\
+RELRO/动态链接 & program header 和 dynamic section 给链接器信息 \\
+\bottomrule
+\end{longtable}
+
+这些保护不是 exec 独立完成的，但 exec 负责把初始地址布局和 auxv 种子交给用户态运行时。若地址布局固定或随机数可预测，后续保护会明显削弱。
+
+\subsection{exec 与多线程}
+
+多线程进程调用 exec 时，成功后只留下调用 exec 的线程，其他线程被清理。因为新程序映像不可能继承旧程序的线程栈、锁状态和用户态同步对象。内核必须停止同一线程组中的其他线程，并让共享资源进入一致状态。
+
+\begin{lstlisting}
+de_thread_for_exec(current):
+  signal other threads to exit
+  wait until thread group is single-threaded
+  take over thread group leader identity if needed
+  proceed to install new mm
+\end{lstlisting}
+
+这也是为什么 exec 提交点必须非常谨慎：旧线程可能持有用户态锁，但 exec 后这些锁没有意义；内核对象如 fd table、credentials、signal struct 还要按规则继承或重置。
+
+\subsection{binfmt\_misc 与解释器安全边界}
+
+binfmt 框架允许注册自定义格式，把某些 magic 或扩展名交给解释器。它方便运行脚本、模拟器格式或语言运行时，但也扩大了 exec 策略面。解释器路径、参数重写、递归深度、权限继承和 mount noexec 都必须纳入检查。
+
+\begin{lstlisting}
+registered format:
+  magic = "\xCA\xFE"
+  interpreter = "/usr/bin/custom-runner"
+exec file:
+  kernel rewrites argv:
+    custom-runner original-file original-args...
+\end{lstlisting}
+
+安全模型必须说明权限检查作用于原文件、解释器，还是二者都检查。只检查脚本可执行而不检查解释器，或绕过 noexec 挂载，都会形成边界漏洞。

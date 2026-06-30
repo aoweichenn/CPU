@@ -1,0 +1,167 @@
+\chapter{进程、线程与调度}
+
+\section{原理}
+
+操作系统的第一个核心职责是分配 CPU 时间。硬件只有有限核心，用户却希望多个程序同时推进。进程提供资源边界，线程提供执行边界，调度器在可运行实体之间选择下一个执行者。这里的关键不是“轮流执行”四个字，而是每个执行实体必须处在可解释的状态里。
+
+进程不是一个正在运行的函数。它至少包含地址空间、文件描述符表、信号处理状态、凭据、资源限制、子进程关系和一个或多个线程。线程是内核可调度实体，拥有寄存器上下文、栈、调度状态和等待原因；同一进程内的线程共享地址空间和许多进程资源，所以它们能高效共享数据，也更容易互相破坏。
+
+进程生命周期可以简化为 created、runnable、running、blocked、zombie、reaped。线程状态可以简化为 runnable、running、sleeping、stopped、terminated。真实内核状态更多，但第一版必须先守住这些边界：blocked 线程不能被调度执行，terminated 线程不能重新运行，zombie 进程已经退出但仍等待父进程回收退出状态。
+
+调度策略必须回答：谁处于 runnable，谁在 blocked，时间片用完后怎么办，优先级是否影响选择，任务退出后资源如何回收，唤醒是否会造成饥饿。一个可解释的调度器必须把这些状态外化，而不是只返回一个线程编号。
+
+上下文切换是调度的成本边界。切换时内核要保存当前线程的寄存器、栈指针和调度账本，选择下一个线程，恢复它的上下文，并可能改变地址空间和 TLB 状态。线程切换不一定改变地址空间，进程切换通常会带来更重的内存管理成本。高并发程序如果制造过多 runnable 线程，就会把时间花在 runqueue 等待、抢占和上下文切换上。
+
+等待是调度的另一半。一个线程不运行，可能是被抢占，也可能是主动睡眠，可能等锁、等 I/O、等 page fault、等子进程、等信号、等定时器。分析性能和死锁时，必须区分 on-CPU 时间和 off-CPU 时间。只看 CPU 使用率会误导：CPU 低可能是线程都阻塞了，CPU 高可能是大量线程在抢锁或忙等。
+
+\section{实践}
+
+纸上实践先画三张表。第一张是进程表，列出 PID、父 PID、状态、退出码、地址空间和 fd 表引用。第二张是线程表，列出 TID、所属 PID、状态、等待原因、优先级、最近运行 CPU 和已消耗 tick。第三张是 runqueue，列出当前可运行线程的顺序和调度账本。
+
+\begin{longtable}{@{}p{0.08\linewidth}p{0.17\linewidth}p{0.2\linewidth}p{0.14\linewidth}p{0.25\linewidth}@{}}
+\toprule
+tick & 事件 & runqueue & 运行线程 & 状态变化 \\
+\midrule
+0 & 创建 A/B & A,B & A & A running \\
+1 & 时间片结束 & B,A & B & A runnable, B running \\
+2 & B 发起 I/O & A & A & B blocked(io) \\
+3 & I/O 完成 & A,B & A & B runnable \\
+4 & A exit & B & B & A zombie \\
+\bottomrule
+\end{longtable}
+
+这张表比一句“轮转调度”更有价值，因为它同时呈现了状态、队列和事件。后续任何复杂策略都可以在这张表上增加字段，例如虚拟运行时间、deadline、优先级、CPU affinity、NUMA node 或 cgroup quota。
+
+实践报告必须区分三个时间：wall time、runnable wait 和 on-CPU time。wall time 是请求从开始到结束的总时间；runnable wait 是线程已经可运行但还没拿到 CPU 的时间；on-CPU time 是真正执行指令的时间。把三者混在一起，会把调度问题误判成算法问题。
+
+\section{算法与实现分析}
+
+\subsection{FCFS：最简单也最容易产生长等待}
+
+先来最简单的调度算法：first-come, first-served。任务按进入 runnable 队列的顺序执行，一个任务运行到阻塞、退出或主动让出 CPU 后，才轮到下一个任务。
+
+\begin{lstlisting}
+while true:
+  task = runqueue.pop_front()
+  run_until_block_or_exit(task)
+  if task.state == RUNNABLE:
+    runqueue.push_back(task)
+\end{lstlisting}
+
+FCFS 的实现成本很低：入队 \code{O(1)}，出队 \code{O(1)}。它的问题是 convoy effect。一个长 CPU 任务排在前面，后面的短交互任务会长时间等待。若系统只跑批处理，FCFS 可以作为 reference；若系统需要交互响应，它通常不合格。
+
+\subsection{Round-robin：用时间片限制独占}
+
+Round-robin 在 FCFS 上增加时间片。每个 runnable 任务最多运行一个 quantum，时间片到期后被放回队尾。它解决了“一个任务长期霸占 CPU”的问题，但引入了时间片选择：时间片太大，交互延迟高；时间片太小，上下文切换成本高。
+
+\begin{lstlisting}
+on timer_tick:
+  current.used_ticks += 1
+  if current.used_ticks == current.quantum:
+    current.used_ticks = 0
+    current.state = RUNNABLE
+    runqueue.push_back(current)
+    current = runqueue.pop_front()
+\end{lstlisting}
+
+假设上下文切换成本是 S，时间片是 Q，CPU 时间被切换消耗的比例大约是 \code{S / (S + Q)}。Q 越小，响应越好，但浪费越多。这个公式不是精确模型，却能解释为什么时间片不能无限小。
+
+\subsection{优先级调度和饥饿}
+
+优先级调度把 runqueue 拆成多个队列，总是选择最高优先级的 runnable 任务。它适合表达“控制任务比日志任务重要”，但如果高优先级任务持续可运行，低优先级任务可能永远得不到 CPU。
+
+\begin{lstlisting}
+for priority from HIGH to LOW:
+  if !queue[priority].empty():
+    return queue[priority].pop_front()
+return idle_task
+\end{lstlisting}
+
+解决饥饿的常见方法是 aging：等待越久，优先级逐步提高。aging 的实现要小心，不能每个 tick 扫描所有任务，否则任务多时成本过高。可以在任务入队时记录等待起点，在选择或周期性维护时计算有效优先级。
+
+\subsection{MLFQ：用反馈区分交互和批处理}
+
+Multilevel feedback queue 使用多个优先级队列，新任务先进入高优先级；如果任务用完整个时间片，说明它偏 CPU 密集，下次降级；如果任务很快阻塞或让出 CPU，说明它可能是交互任务，保留较高优先级。MLFQ 不需要提前知道任务类型，而是从行为反馈中调整。
+
+\begin{lstlisting}
+on_task_created(task):
+  task.level = 0
+  queues[0].push_back(task)
+
+on_quantum_expired(task):
+  task.level = min(task.level + 1, MAX_LEVEL)
+  queues[task.level].push_back(task)
+
+on_task_blocked_before_quantum(task):
+  queues[task.level].push_back_when_woken(task)
+\end{lstlisting}
+
+MLFQ 的关键参数包括层数、每层时间片、降级规则、周期性 boost。boost 用来防止低层任务永久饥饿：每隔一段时间，把所有 runnable 任务提升回高层。实现上要记录任务当前层级、已用时间、最近 boost epoch。
+
+\subsection{公平调度：虚拟运行时间}
+
+公平调度不只问“谁先来”，而是问每个 runnable 任务已经得到多少 CPU 服务。可以给每个任务维护虚拟运行时间 \code{vruntime}：任务实际运行越久，\code{vruntime} 越大；权重越高，虚拟时间增长越慢。每次选择 \code{vruntime} 最小的任务。
+
+\begin{lstlisting}
+on_task_run(task, delta_exec):
+  task.vruntime += delta_exec * NICE_0_WEIGHT / task.weight
+
+pick_fair(rbtree):
+  return leftmost_node_by_vruntime(rbtree)
+\end{lstlisting}
+
+若用红黑树保存 runnable 任务，插入、删除和选择下一个任务大约是 \code{O(log n)}，取最左节点可缓存到接近 \code{O(1)}。这个模型解释了为什么 nice 值不是简单固定优先级：它影响获得 CPU 的比例，而不是让低优先级任务永远不运行。
+
+\subsection{deadline 调度与准入控制}
+
+实时或准实时任务还会声明运行时间和截止时间。例如任务说“每 20ms 需要 3ms CPU”。调度器若盲目接受所有请求，总利用率超过 100 后必然 miss deadline。因此 deadline 调度需要准入控制。
+
+\begin{lstlisting}
+admit(task):
+  new_util = total_runtime_over_period + task.runtime / task.period
+  if new_util > CPU_CAPACITY:
+    return -EBUSY
+  add_to_deadline_class(task)
+  return OK
+
+pick_deadline():
+  return task with earliest absolute_deadline
+\end{lstlisting}
+
+EDF 在单 CPU 理想模型中有很强性质，但真实系统还有抢占成本、临界区、缓存失效、中断关闭和共享资源阻塞。理论可调度不等于工程一定按时，测试必须记录 deadline miss、最大关抢占时间和锁等待。
+
+\subsection{调度指标}
+
+调度器优化必须有指标。常用指标包括平均响应时间、p95/p99 延迟、吞吐、上下文切换次数、公平误差、迁移次数、cache miss、deadline miss 和能耗。只报告“更快”没有意义。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+指标 & 说明 & 常见误判 \\
+\midrule
+on-CPU time & 真正执行指令的时间 & 把等待 I/O 误认为算法慢 \\
+runnable wait & 可运行但没拿到 CPU 的时间 & 把调度拥塞误认为锁死 \\
+context switches & 切换次数和成本 & 只看次数，不看每次成本 \\
+migration count & 跨 CPU 迁移 & 均衡改善但缓存局部性变差 \\
+fairness error & 实得 CPU 与权重目标差距 & 平均公平掩盖尾延迟 \\
+\bottomrule
+\end{longtable}
+
+\subsection{真实系统为什么更复杂}
+
+真实通用 OS 还要处理多核、NUMA、CPU affinity、实时任务、cgroup 配额、负载均衡和能耗。多核调度不是简单地把一个队列给所有 CPU，因为全局队列会产生锁竞争；每 CPU runqueue 能降低竞争，但需要负载均衡。迁移任务可以平衡负载，却会丢失 cache/TLB 热状态。调度器必须在公平、吞吐、延迟、局部性和能耗之间折中。
+
+\section{测试}
+
+调度测试至少覆盖三类情况：多个 runnable 进程应轮转推进；blocked 进程不应获得 tick；terminated 进程不应重新出现。还要检查没有 runnable 进程时，调度器返回 idle，而不是访问空队列。
+
+\begin{itemize}
+\tightlist
+\item fork 后父子进程关系可解释，父进程能回收子进程退出状态。
+\item exec 后地址空间替换，但 PID、部分 fd 和进程身份按规则保留。
+\item 线程阻塞后从 runqueue 消失，唤醒后回到 runnable 集合。
+\item 时间片结束只改变调度状态，不应破坏进程资源。
+\item 没有 runnable 线程时进入 idle，而不是忙等消耗 CPU。
+\item 优先级或 aging 不得让低优先级任务永久饥饿，除非策略明确允许。
+\end{itemize}
+
+后续可以加入优先级、deadline、affinity、负载均衡和 cgroup 配额，但必须保留基础回归。任何复杂策略都不能让 blocked 或 terminated 任务被错误调度。

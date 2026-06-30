@@ -1,0 +1,280 @@
+\chapter{虚拟内存与地址空间}
+
+\section{原理}
+
+虚拟内存把每个进程看到的地址空间和物理内存分开。进程使用虚拟页，页表把虚拟页映射到物理页，并附带 readable、writable、executable、present 等权限。一次访问是否合法，不只取决于地址是否存在，还取决于访问类型和权限位。
+
+隔离来自默认不可见。一个进程不能随便读写另一个进程的页；没有映射的地址会触发缺页；只读页不能写；不可执行页不能取指。操作系统通过这些规则同时提供保护、共享和按需分配。
+
+虚拟地址空间不仅是页表。内核还维护 VMA 或等价区域结构，用来描述一段虚拟地址的来源和权限：匿名内存、栈、堆、共享库、文件映射、设备映射。页表项是某一页当前是否能翻译，VMA 是这一段地址理论上是否合法、缺页时应该怎样处理。没有页表项不一定是错误，可能只是尚未按需分配。
+
+一次访问的大致路径是：CPU 发出虚拟地址；TLB 命中则直接得到物理地址和权限；TLB 未命中则硬件或内核进行页表遍历；页表项不存在或权限不符时触发异常；内核根据 VMA 判断是合法缺页、权限错误还是非法访问；合法缺页可能分配物理页、从文件读页、建立 COW 私有页或映射零页。
+
+copy-on-write 是虚拟内存最有代表性的协议。\code{fork} 时，父子进程可以先共享物理页，并把页表标记为只读和 COW。任何一方写入时触发保护异常，内核复制物理页，更新写入方页表，再继续执行。这样 fork 不需要立刻复制整个地址空间，但必须正确维护引用计数和权限。
+
+\section{实践}
+
+实验的 \code{PageTable} 支持按页映射。读访问要求 present 和 readable；写访问要求 writable；执行访问要求 executable。地址翻译保留页内 offset，帮助读者理解“页号转换，页内偏移不变”。
+
+\begin{longtable}{p{0.25\linewidth}p{0.55\linewidth}}
+\toprule
+输入 & 计算 \\
+\midrule
+page size & 4096 \\
+virtual address & \code{0x401234} \\
+virtual page number & \code{0x401} \\
+offset & \code{0x234} \\
+physical page number & 查页表得到 \\
+physical address & \code{physical\_page * 4096 + offset} \\
+\bottomrule
+\end{longtable}
+
+权限矩阵要单独写：
+
+\begin{longtable}{p{0.16\linewidth}p{0.16\linewidth}p{0.18\linewidth}p{0.18\linewidth}p{0.18\linewidth}}
+\toprule
+访问 & present & readable & writable & 结果 \\
+\midrule
+load & yes & yes & no & 成功 \\
+store & yes & yes & no & 权限错误 \\
+fetch & yes & yes & no & NX 错误 \\
+load & no & - & - & 缺页或非法 \\
+\bottomrule
+\end{longtable}
+
+观察真实系统时，要区分虚拟大小、RSS、page cache、minor fault 和 major fault。虚拟地址空间很大，不代表物理内存已经占用；RSS 增加，可能是匿名页，也可能是文件页；minor fault 可能只是建立映射，major fault 更可能等待存储设备。
+
+\section{算法与实现分析}
+
+\subsection{物理页分配：free list、bitmap 和 buddy}
+
+最简单的物理页分配器是 free list。每个空闲页框放进链表，分配时弹出一个，释放时放回去。它的分配和释放都是 \code{O(1)}，适合固定大小页框；缺点是难以快速找到连续页，也难以检测重复释放和碎片分布。
+
+\begin{lstlisting}
+page_alloc():
+  if free_list.empty(): return null
+  page = free_list.pop()
+  page.refcount = 1
+  return page
+
+page_free(page):
+  assert(page.refcount == 0)
+  free_list.push(page)
+\end{lstlisting}
+
+bitmap 分配器用一个 bit 表示一个页框是否空闲。它节省元数据，容易扫描连续区域，但朴素扫描是 \code{O(n)}。可以通过分层 bitmap 或缓存上次搜索位置降低平均成本。
+
+buddy allocator 用 2 的幂大小管理连续页块。分配 8 页时，寻找 order=3 的块；如果只有更大的块，就不断拆分；释放时，如果相邻 buddy 也空闲，就合并成更大块。buddy 的分配和释放大约是 \code{O(log N)}，能较好处理连续页需求，但仍会产生内部碎片。
+
+\subsection{虚拟地址查找：VMA 和页表}
+
+页表回答“这一页当前映射到哪里”，VMA 回答“这一段地址理论上是否合法”。缺页时，内核先查 VMA：若地址不属于任何 VMA，就是非法访问；若属于可按需分配的匿名 VMA，就分配零页；若属于文件映射 VMA，就从 page cache 找页或发起 I/O。
+
+VMA 可以用有序区间结构保存。查找地址属于哪个区间，朴素线性扫描是 \code{O(n)}；平衡树查找是 \code{O(log n)}；现代内核还会使用更适合区间查询和缓存局部性的结构。教学模型可以先用有序数组，因为它能把语义讲清楚。
+
+\begin{lstlisting}
+handle_page_fault(addr, access):
+  vma = find_vma(addr)
+  if vma == null: signal(SIGSEGV)
+  if !vma.allows(access): signal(SIGSEGV)
+  page = materialize_page(vma, addr)
+  install_pte(addr, page, vma.permissions)
+\end{lstlisting}
+
+\subsection{COW 的引用计数}
+
+COW 的不变量是：共享页必须只读，物理页有引用计数；写入共享页时，写入方得到新副本。若 refcount 为 1，可以直接把页改成可写；若 refcount 大于 1，必须复制。
+
+\begin{lstlisting}
+handle_write_fault(vaddr):
+  pte = lookup_pte(vaddr)
+  page = pte.page
+  if !pte.cow: signal(SIGSEGV)
+  if page.refcount == 1:
+    pte.writable = true
+    pte.cow = false
+  else:
+    new_page = alloc_page()
+    copy_page(new_page, page)
+    page.refcount -= 1
+    install_pte(vaddr, new_page, writable=true, cow=false)
+\end{lstlisting}
+
+这段算法最容易错在引用计数和权限更新顺序。若忘记把共享页设为只读，写入不会触发 fault，父子进程会互相污染；若复制后忘记减少旧页引用计数，会泄漏；若 TLB 中仍缓存旧权限，必须刷新或失效对应条目。
+
+\subsection{页面置换}
+
+当物理内存不足时，内核要回收页面。理想算法 OPT 总是淘汰未来最晚再访问的页面，但它需要知道未来，不能实现。LRU 淘汰最近最久未使用的页，更接近实际局部性，但精确 LRU 维护成本高。Clock 算法用访问位近似 LRU：扫描环形列表，访问位为 1 就清零并跳过，访问位为 0 就淘汰。
+
+\begin{lstlisting}
+clock_evict():
+  while true:
+    page = clock_hand.page
+    if page.referenced:
+      page.referenced = false
+      advance(clock_hand)
+    else if page.dirty:
+      schedule_writeback(page)
+      advance(clock_hand)
+    else:
+      remove_and_return(page)
+\end{lstlisting}
+
+置换策略必须和文件系统、匿名页、swap、dirty writeback 结合。干净文件页可以直接丢弃，未来再从文件读；脏文件页要先写回；匿名页若要回收，需要 swap 或压缩；被锁定或正在 I/O 的页不能随便回收。
+
+\subsection{多级页表}
+
+64 位地址空间太大，不能为每个虚拟页都预留一个线性页表。多级页表把虚拟页号拆成多段索引，只为实际使用的区域分配中间页表页。以四级页表为例，虚拟地址被拆成 L4、L3、L2、L1 和页内 offset。
+
+\begin{lstlisting}
+walk_page_table(root, vaddr, create):
+  table = root
+  for level in [L4, L3, L2]:
+    index = index_for(level, vaddr)
+    if table[index] not present:
+      if not create:
+        return null
+      table[index] = allocate_page_table()
+    table = table[index].next_table
+  return &table[index_for(L1, vaddr)]
+\end{lstlisting}
+
+查找复杂度按层数是常数，但每层都可能带来内存访问。TLB 的价值就在于缓存最近翻译，避免每次访问都走多级页表。页表设计还影响内核内存占用：稀疏地址空间只分配用到的页表页，密集映射则消耗更多元数据。
+
+\subsection{TLB shootdown}
+
+改变页表后，CPU TLB 中可能仍缓存旧翻译。单核系统可以本地失效；多核系统中，同一地址空间可能正在其他 CPU 运行，需要发送 shootdown IPI 让它们失效对应条目。
+
+\begin{lstlisting}
+unmap_page(mm, vaddr):
+  pte = walk_page_table(mm.root, vaddr, false)
+  old = clear_pte(pte)
+  cpus = mm.active_cpus
+  for cpu in cpus except current_cpu:
+    send_tlb_shootdown(cpu, mm, vaddr)
+  local_invlpg(vaddr)
+  wait_for_shootdown_ack(cpus)
+  put_page(old.page)
+\end{lstlisting}
+
+顺序很重要。若在其他 CPU 失效 TLB 前就释放物理页，该页可能被重新分配给别的对象，而旧 CPU 仍通过过期 TLB 写入它，形成严重内存破坏。TLB shootdown 是虚拟内存和多核同步的交叉点。
+
+\subsection{overcommit 与 OOM}
+
+虚拟内存允许系统承诺比物理内存更多的虚拟地址。例如 \code{mmap} 或 \code{malloc} 成功不代表物理页已经分配，首次写入才可能触发分配。overcommit 提高灵活性，但内存真正不足时必须选择失败策略。
+
+\begin{lstlisting}
+handle_anon_fault(vma, addr):
+  page = alloc_page()
+  if page == null:
+    victim = oom_select_process()
+    if victim == null:
+      return SIGBUS_OR_ENOMEM
+    kill(victim)
+    retry allocation
+  zero_page(page)
+  install_pte(addr, page, WRITE | USER)
+\end{lstlisting}
+
+OOM killer 不是随意杀进程。它通常综合内存占用、权限、oom score、是否关键服务、cgroup 限制和可回收性。容器场景下，cgroup 内 OOM 应优先限制在该 cgroup 内，而不是扩大到整个宿主。
+
+\section{测试}
+
+测试要覆盖成功翻译、写只读页失败、访问未映射页失败、unmap 后访问失败、页内 offset 保留。错误结果必须携带可读诊断，不能只返回一个空值。
+
+\begin{itemize}
+\tightlist
+\item \code{fork} 后父子共享只读 COW 页，任一方写入后得到私有副本。
+\item \code{mmap} 文件页首次访问触发填页，第二次访问走热路径。
+\item 栈增长必须受上限约束，不能无限扩张。
+\item \code{mprotect} 改变权限后，旧访问策略失效。
+\item \code{munmap} 后再次访问必须失败。
+\item 用户态指针传入系统调用时，内核必须检查可读/可写范围。
+\end{itemize}
+
+权限测试尤其重要。没有权限测试的虚拟内存模型，会把地址转换误写成普通哈希表查找，丢掉操作系统最重要的保护语义。
+
+\section{源码级补充：PTE 标志、THP、swap、mlock 与 PSI}
+
+\subsection{页表项标志}
+
+x86-64 PTE 典型标志包括 present、writable、user、accessed、dirty、global、NX 等。操作系统把 VMA 权限、文件打开模式、COW 状态和硬件标志合成 PTE。注意 COW 不是单纯硬件位，通常由软件在只读 PTE 和附加元数据中表达。
+
+\begin{longtable}{p{0.22\linewidth}p{0.48\linewidth}}
+\toprule
+标志 & 语义 \\
+\midrule
+present & PTE 可用于地址翻译，否则触发缺页 \\
+writable & store 是否允许 \\
+user & ring 3 是否可访问 \\
+accessed & CPU 访问后置位，用于回收近似 LRU \\
+dirty & CPU 写入后置位，用于写回和 COW 判断 \\
+NX & 禁止取指执行 \\
+\bottomrule
+\end{longtable}
+
+权限收缩必须刷新 TLB。例如把页从可写改成只读，如果旧 TLB 仍保留可写权限，写入可能绕过新的 COW 或 mprotect 规则。
+
+\subsection{mprotect、munmap 和 VMA 切分}
+
+\code{mprotect} 改变区间权限，\code{munmap} 删除映射。二者都可能把一个 VMA 切成三段：前半保持原权限，中间修改或删除，后半保持原权限。
+
+\begin{lstlisting}
+before:
+  [0x1000, 0x9000) RW
+mprotect [0x3000, 0x5000) R
+after:
+  [0x1000, 0x3000) RW
+  [0x3000, 0x5000) R
+  [0x5000, 0x9000) RW
+\end{lstlisting}
+
+VMA 切分后，要更新页表权限、失效 TLB、处理锁定页和文件映射引用。教学实现若只改一个 flags 字段，会在部分区间修改时出错。
+
+\subsection{Transparent Huge Page}
+
+普通页常为 4KiB，大页可为 2MiB 或更大。THP 尝试把连续匿名页合并成 PMD 级大页，减少 TLB miss。代价是分配连续内存更难，拆分和 COW 成本更高，延迟可能出现尖峰。
+
+\begin{lstlisting}
+khugepaged:
+  scan VMAs marked hugepage-friendly
+  find 512 contiguous 4KiB pages
+  allocate 2MiB huge page
+  copy or remap contents
+  replace PTE table with PMD huge mapping
+\end{lstlisting}
+
+THP 是性能优化，不应改变用户语义。发生 mprotect、munmap、COW 或内存压力时，大页可能被拆回普通页。性能报告要说明 THP 是否开启，否则 TLB 和内存延迟数据难以比较。
+
+\subsection{swap cache 和 swappiness}
+
+匿名页回收需要把内容写到 swap。swap slot 是匿名页在交换区的位置；swap cache 避免同一 swap 页被重复读写。swappiness 影响内核在文件页和匿名页之间的回收倾向。
+
+\begin{lstlisting}
+swap_out(page):
+  slot = allocate_swap_slot()
+  write_page_to_swap(slot, page)
+  replace_pte_with_swap_entry(vaddr, slot)
+  free_physical_page(page)
+
+swap_in(fault):
+  slot = fault.swap_entry
+  page = swap_cache_lookup_or_read(slot)
+  install_pte(fault.addr, page)
+\end{lstlisting}
+
+swap 让系统在内存压力下继续运行，但延迟可能变得非常高。服务端系统常用 PSI、cgroup memory.high 和限流来避免进入严重 swap 抖动。
+
+\subsection{mlock 和不可回收页}
+
+\code{mlock} 把页锁在内存中，常用于实时路径、密码材料或避免 page fault 的场景。锁定页不能被普通回收换出，因此必须受权限和 rlimit 限制。
+
+\begin{lstlisting}
+mlock(addr, len):
+  check RLIMIT_MEMLOCK
+  for each VMA page in range:
+    fault page in if needed
+    mark unevictable
+\end{lstlisting}
+
+滥用 mlock 会减少可回收内存，影响整机。教学 OS 要把“不可回收”作为页面状态加入回收测试，证明回收器不会错误丢弃 locked page。

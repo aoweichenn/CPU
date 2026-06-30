@@ -1,0 +1,144 @@
+\section{硬件基本信息：操作系统依赖的机器事实}
+
+操作系统不是在抽象空间里运行的。它依赖一组非常具体的硬件事实：CPU 怎样取指和切换特权级，内存怎样寻址和缓存，设备怎样通过寄存器、中断和 DMA 与 CPU 通信，定时器怎样提供时间基准，启动固件怎样把第一段代码交给内核。若这些事实不清楚，后面的进程、虚拟内存、驱动、文件系统和安全机制都会变成悬空概念。
+
+\begin{keyidea}
+硬件给 OS 的不是“进程、文件、socket”，而是指令、寄存器、地址、中断、页表、缓存、总线和设备寄存器。OS 的工作是把这些硬件事实组织成可验证的契约。
+\end{keyidea}
+
+\subsection{CPU 执行模型}
+
+CPU 的基本循环是取指、译码、执行、提交结果。程序计数器指向下一条指令；通用寄存器保存整数、地址和临时值；状态寄存器保存中断使能、条件码、当前特权级等控制位；栈指针指向当前调用栈。操作系统进行上下文切换时，最少要保存足以恢复执行的这组状态。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+硬件状态 & 作用 & OS 关心点 \\
+\midrule
+程序计数器 & 指向下一条指令 & 中断、异常、调度后从哪里继续 \\
+栈指针 & 指向当前栈顶 & 用户栈和内核栈必须分开管理 \\
+通用寄存器 & 保存参数和临时值 & 系统调用参数、返回值、上下文保存 \\
+状态寄存器 & 保存特权级、中断位、标志位 & 返回用户态前必须恢复正确权限 \\
+控制寄存器 & 指向页表、控制 MMU 和中断 & 只有内核能修改关键控制状态 \\
+\bottomrule
+\end{longtable}
+
+现代 CPU 还会乱序执行、预测分支、合并内存访问。多数时候程序看见的是架构保证的顺序，但内核和驱动不能忽略内存屏障。比如驱动必须先写完 DMA 描述符，再敲 doorbell 通知设备；锁实现必须用 acquire/release 语义，否则另一个 CPU 可能看到锁已释放却看不到临界区内的数据更新。
+
+\subsection{特权级、异常和系统调用}
+
+用户程序不能直接修改页表、关中断或访问任意设备寄存器。CPU 用特权级区分普通代码和内核代码。用户态执行特权指令会触发异常；系统调用是用户态主动进入内核态的受控入口；中断是设备或定时器异步打断 CPU 的入口；异常是当前指令执行失败产生的入口。
+
+\begin{lstlisting}
+user mode:
+  execute normal instructions
+  syscall -> controlled entry to kernel
+  page fault -> exception entry to kernel
+  timer interrupt -> asynchronous entry to kernel
+
+kernel mode:
+  validate context
+  inspect object and permission
+  update kernel state
+  return to user or schedule another task
+\end{lstlisting}
+
+特权级解释了为什么系统调用不是普通函数调用。普通函数调用仍然在同一信任边界里；系统调用跨越用户/内核边界，必须切换栈、保存 trap frame、检查用户指针、处理信号和抢占，再安全返回。
+
+\subsection{内存、地址总线与页表}
+
+CPU 发出的地址通常先是虚拟地址。MMU 根据页表把虚拟页翻译成物理页，并检查 R/W/X、用户/内核、present 等权限。页表基址保存在控制寄存器中；TLB 缓存最近翻译，减少页表遍历成本。操作系统通过切换页表和设置权限，让每个进程看到自己的地址空间。
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
+\toprule
+概念 & 含义 & 常见错误理解 \\
+\midrule
+虚拟地址 & 程序使用的地址 & 误以为一定已经占用物理内存 \\
+物理地址 & 内存控制器看到的地址 & 误以为用户程序能直接使用 \\
+页表项 & 虚拟页到物理页和权限的记录 & 只当作普通 map，忽略权限 \\
+TLB & 地址翻译缓存 & 修改页表后忘记失效旧翻译 \\
+VMA & 合法虚拟区间的内核记录 & 误以为没有 PTE 就一定非法 \\
+\bottomrule
+\end{longtable}
+
+页表是隔离的硬件根。没有页表权限，进程可以互相读写；没有用户/内核页区分，用户程序可以访问内核数据；没有 NX，数据页可能被当作代码执行。OS 的内存管理不是“分配内存”这么简单，而是在性能、隔离、共享、懒加载和回收之间维护一组不变量。
+
+\subsection{缓存层次与一致性}
+
+CPU 访问寄存器最快，其次是 L1/L2/L3 cache，再往后是内存和存储设备。cache 以 cache line 为单位搬运数据。多核系统中，同一个物理地址可能被多个 CPU cache 缓存，硬件一致性协议负责让普通内存读写最终保持一致。但设备 DMA、MMIO 和某些弱内存模型仍要求内核显式使用屏障和 cache 维护操作。
+
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+层次 & 特点 & OS 影响 \\
+\midrule
+寄存器 & 每个 CPU 私有，最快 & 上下文切换必须保存可见寄存器 \\
+L1/L2/L3 cache & 以 cache line 缓存内存 & 锁竞争、伪共享、迁移成本来自这里 \\
+主内存 & 所有 CPU 共享 & 页分配、NUMA、DMA buffer 来自这里 \\
+存储设备 & 持久但慢 & page cache、writeback、fsync 用来隐藏和约束它 \\
+\bottomrule
+\end{longtable}
+
+缓存解释了许多 OS 设计选择。每 CPU runqueue 减少共享 cache line 抖动；per-CPU slab cache 减少全局锁；任务迁移会损失 cache/TLB 热状态；DMA 写入内存后，CPU 可能需要 invalidate cache 才能看到设备写入的新数据。
+
+\subsection{总线、MMIO 和设备寄存器}
+
+设备通过总线连接到 CPU 和内存。很多设备把控制寄存器映射到物理地址空间，CPU 通过 MMIO 读写它们。MMIO 不是普通内存：读取可能有副作用，写入顺序可能被设备解释为命令序列，编译器和 CPU 不能随意优化这些访问。
+
+\begin{lstlisting}
+driver_init(dev):
+  writel(dev.mmio + RESET, 1)
+  wait_until(readl(dev.mmio + STATUS) & READY)
+  writel(dev.mmio + IRQ_ENABLE, RX_DONE | TX_DONE)
+\end{lstlisting}
+
+驱动必须给轮询加超时，因为设备可能坏掉。驱动也必须理解寄存器语义：有些状态位写 1 清除，有些寄存器读一次就弹出队列，有些寄存器要求先写高位再写低位。OS 不能把设备当作可靠函数调用，它面对的是异步硬件状态机。
+
+\subsection{中断、定时器和时钟源}
+
+中断让设备主动通知 CPU。定时器中断给 OS 提供抢占和超时能力；高精度时钟源提供时间戳；watchdog 检测系统是否长时间没有前进。没有定时器，任务死循环时系统无法抢回 CPU；没有中断，驱动只能轮询设备，浪费 CPU 并增加延迟。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+硬件机制 & OS 用途 & 失败表现 \\
+\midrule
+外设中断 & I/O completion、网络包、设备错误 & 中断风暴、丢中断、延迟尖峰 \\
+定时器中断 & 时间片、超时、周期任务 & 任务霸占 CPU，超时不触发 \\
+时钟源 & 时间戳、性能统计、调度账本 & 时间倒退或漂移导致判断错误 \\
+watchdog & 检测软锁死和硬锁死 & 无响应时缺少故障证据 \\
+\bottomrule
+\end{longtable}
+
+中断处理要短，因为它打断了当前执行流。复杂工作通常放到下半部、工作队列或内核线程。这个原则不是风格问题，而是延迟和可抢占性的硬边界。
+
+\subsection{DMA 与 IOMMU}
+
+PIO 由 CPU 搬运数据，简单但慢。DMA 让设备直接读写内存，CPU 只准备描述符、buffer 和地址映射。DMA 的难点是：设备访问的是 DMA 地址，不一定等同于 CPU 物理地址；buffer 在设备完成前不能释放；cache 可能需要 clean/invalidate；IOMMU 需要建立和拆除设备页表映射。
+
+\begin{lstlisting}
+submit_dma(req):
+  req.page = pin_user_or_kernel_page(req.buffer)
+  req.dma = dma_map(dev, req.page, req.len, TO_DEVICE)
+  fill_descriptor(req.dma, req.len)
+  memory_barrier()
+  ring_doorbell(dev)
+\end{lstlisting}
+
+DMA 是高性能 I/O 的基础，也是内核 bug 的高风险区域。一个错误的 DMA 地址可能让设备覆盖内核对象；一个过早释放的 buffer 可能被设备迟到写入；一个缺失的 cache invalidate 可能让 CPU 读到旧数据。
+
+\subsection{启动固件和第一条内核指令}
+
+机器上电后，CPU 不会直接运行 C 语言内核。固件先初始化基本硬件，bootloader 把内核镜像和启动参数放入内存，然后跳到内核入口。内核早期代码要设置栈、清 BSS、复制 data、建立早期页表、解析内存地图、初始化 console 和分配器。
+
+\begin{lstlisting}
+PowerOn
+  -> Firmware
+  -> Bootloader
+  -> KernelEntry
+  -> StackReady
+  -> BssCleared
+  -> EarlyConsole
+  -> PageTablesReady
+  -> SchedulerReady
+  -> FirstUserProcess
+\end{lstlisting}
+
+启动阶段的约束最严格：还没有完整内存分配器，不能随意分配；还没有调度器，不能睡眠；还没有完整日志，错误证据有限；还没有完整设备模型，很多硬件不能访问。理解这些限制，后面读内核初始化代码才不会把“为什么这么麻烦”误解成历史包袱。

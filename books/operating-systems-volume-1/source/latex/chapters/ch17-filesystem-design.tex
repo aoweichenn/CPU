@@ -1,0 +1,321 @@
+\chapter{文件系统设计：目录、inode、缓存与一致性}
+
+\section{原理}
+
+文件系统把块设备上的字节数组组织成命名对象。用户看到路径、目录、普通文件、链接和权限；内核维护 superblock、inode、目录项、数据块、空闲空间、页缓存和日志。文件系统不是“把文件内容写到磁盘”这么简单，它要解决命名、分配、缓存、权限、并发和崩溃一致性。
+
+最小文件系统可以从四类对象开始。superblock 描述整个文件系统，例如块大小、inode 表位置、空闲块位图位置。inode 描述一个文件的元数据和数据块地址。directory 是从名字到 inode 号的映射。free space manager 记录哪些块和 inode 可用。
+
+\section{实践}
+
+画出一个小文件系统布局：
+
+\begin{lstlisting}
+block 0: boot or reserved
+block 1: superblock
+block 2: inode bitmap
+block 3: block bitmap
+block 4..15: inode table
+block 16..end: data blocks
+\end{lstlisting}
+
+再画路径解析：\code{/home/a.txt} 先从根 inode 读取目录数据，查找 \code{home}，得到 home inode，再读取 home 目录，查找 \code{a.txt}，得到文件 inode，最后根据 inode 的 block 指针读取数据。
+
+\section{算法与实现分析}
+
+\subsection{inode 和块映射}
+
+inode 需要把文件 offset 映射到磁盘块。小文件可以用 direct block 指针；大文件需要 indirect、double indirect 或 extent。extent 用起始块和长度描述连续范围，适合大连续文件。
+
+\begin{lstlisting}
+block_for_offset(inode, offset):
+  logical = offset / BLOCK_SIZE
+  if logical < NDIRECT:
+    return inode.direct[logical]
+  logical -= NDIRECT
+  indirect_block = read_block(inode.indirect)
+  return indirect_block[logical]
+\end{lstlisting}
+
+direct/indirect 结构简单，但大文件查找可能多一次或多次 I/O。extent 查找需要在 extent 列表或树中搜索，复杂度可能是 \code{O(log n)}，但连续文件元数据更少。
+
+\subsection{目录查找}
+
+最简单目录是线性表：每个目录项保存 name 和 inode number。查找是 \code{O(n)}。目录小的时候足够；目录很大时，需要 hash 或 B-tree。
+
+\begin{lstlisting}
+dir_lookup(dir_inode, name):
+  for each entry in read_directory(dir_inode):
+    if entry.name == name:
+      return entry.inode_number
+  return -ENOENT
+\end{lstlisting}
+
+目录缓存 dentry 可以把常见路径查找变快。缓存必须处理失效：rename、unlink、mount namespace、权限变化都可能影响路径结果。
+
+\subsection{空闲空间管理}
+
+bitmap 是最直观的空闲块管理。每个 bit 表示一个块是否空闲。分配时扫描 0 bit，置 1；释放时清 0。连续分配可以扫描连续 0 bit。
+
+\begin{lstlisting}
+alloc_block():
+  for i in 0..num_blocks:
+    if bitmap[i] == 0:
+      bitmap[i] = 1
+      mark_bitmap_dirty()
+      return i
+  return -ENOSPC
+\end{lstlisting}
+
+bitmap 简单但扫描可能慢。实际文件系统会按块组、预分配、extent 和局部性策略减少碎片。分配策略要尽量让同一文件的数据块连续，让同一目录下文件局部性更好。
+
+\subsection{VFS 层}
+
+VFS 给不同文件系统提供统一接口。上层调用 open/read/write，VFS 根据 inode 或 file operations 分发到 ext、tmpfs、procfs、设备文件等具体实现。这个抽象让“一切皆文件”可行，但每种对象语义仍不同。
+
+\begin{lstlisting}
+vfs_read(file, user_buf, len):
+  if !file.can_read: return -EBADF
+  return file.ops.read(file, user_buf, len)
+\end{lstlisting}
+
+VFS 的价值是统一生命周期和权限边界：fd 引用 file，file 引用 inode 或设备对象，inode 引用具体文件系统对象。关闭 fd 不等于 inode 消失，unlink 路径名也不等于已打开文件立刻不可用。
+
+\subsection{创建文件的回滚路径}
+
+文件系统修改通常跨多个对象：分配 inode、分配目录项、更新父目录、可能分配数据块、更新 bitmap。任意一步失败都要回滚，否则会留下孤儿 inode 或错误 bitmap。
+
+\begin{lstlisting}
+create_file(parent, name):
+  inode = alloc_inode()
+  if inode.error:
+    return inode.error
+  ret = init_inode(inode)
+  if ret: goto out_inode
+  ret = dir_add_entry(parent, name, inode.number)
+  if ret: goto out_inode
+  mark_inode_dirty(inode)
+  mark_inode_dirty(parent)
+  return inode
+
+out_inode:
+  free_inode(inode)
+  return ret
+\end{lstlisting}
+
+这只是内存中状态的回滚。若某些修改已经写到磁盘，崩溃恢复还需要日志或 fsck。文件系统代码的难点是同时维护运行时一致性和崩溃后可恢复性。
+
+\subsection{unlink 与打开文件}
+
+Unix 语义中，\code{unlink} 删除目录项，不一定立即删除文件内容。若文件仍被 fd 打开，inode 引用计数仍大于零，数据块要等最后一个引用释放后才能回收。
+
+\begin{lstlisting}
+unlink(parent, name):
+  inode = dir_lookup(parent, name)
+  remove_dir_entry(parent, name)
+  inode.link_count -= 1
+  if inode.link_count == 0 and inode.open_count == 0:
+    free_inode_and_blocks(inode)
+
+close(file):
+  inode = file.inode
+  inode.open_count -= 1
+  if inode.link_count == 0 and inode.open_count == 0:
+    free_inode_and_blocks(inode)
+\end{lstlisting}
+
+这个协议解释了为什么删除正在写的日志文件后，磁盘空间可能不立刻释放；也解释了为什么路径名和已打开 fd 是两个不同层次的对象身份。
+
+\subsection{fsck 的基本思想}
+
+没有日志或日志也损坏时，检查工具需要从磁盘结构重建一致性。最小 fsck 会扫描 inode 表、目录树和 bitmap，比较“被引用块集合”和“bitmap 标记集合”。
+
+\begin{lstlisting}
+fsck():
+  referenced_blocks = empty_set()
+  reachable_inodes = walk_from_root_directory()
+  for inode in reachable_inodes:
+    for block in inode.blocks:
+      if block already in referenced_blocks:
+        report_duplicate_block(block)
+      add(referenced_blocks, block)
+  compare_with_block_bitmap(referenced_blocks)
+  repair_or_report()
+\end{lstlisting}
+
+fsck 的复杂度通常与文件系统大小相关，可能很慢。日志文件系统的目标之一就是把崩溃恢复从全盘扫描缩小到重放最近事务。
+
+\section{测试}
+
+\begin{itemize}
+\tightlist
+\item 创建文件会分配 inode 和目录项，失败时不能泄漏块。
+\item unlink 已打开文件后，fd 仍可读写，最后引用释放后再回收 inode。
+\item rename 后路径解析结果原子切换，不能出现两个半状态。
+\item 大目录查找有明确复杂度和缓存策略。
+\item 空闲块 bitmap 崩溃后能通过日志或检查工具恢复一致。
+\item page cache 中脏页写回后，inode size 和数据块状态一致。
+\end{itemize}
+
+\section{源码级补充：VFS、ext4、jbd2、xattr、quota、FUSE 与 fsck}
+
+\subsection{VFS 操作表}
+
+VFS 的核心不是一个对象，而是一组对象和操作表：\code{super\_block} 描述挂载实例，\code{inode} 描述文件身份，\code{dentry} 缓存名字关系，\code{file} 描述一次打开。操作表包括 \code{file\_operations}、\code{inode\_operations}、\code{super\_operations}。
+
+\begin{longtable}{p{0.22\linewidth}p{0.5\linewidth}}
+\toprule
+操作表 & 典型职责 \\
+\midrule
+\code{file\_operations} & \code{read/write/mmap/fsync/poll/ioctl}，面向打开文件 \\
+\code{inode\_operations} & \code{lookup/create/unlink/rename/getattr/setattr}，面向名字和元数据 \\
+\code{super\_operations} & 挂载级同步、inode 分配释放、统计信息 \\
+\bottomrule
+\end{longtable}
+
+读 \filepath{fs/namei.c} 和 \filepath{fs/open.c} 时，要把路径名解析、权限检查、dentry 缓存和最终 \code{file} 创建分开看。路径字符串只是输入，dentry/inode/file 才是稳定对象。
+
+\subsection{ext4 extent 与 mballoc}
+
+ext4 用 extent 描述连续块范围。小文件 extent 可直接放在 inode 内；大文件使用 extent tree。空间分配由 mballoc 按块组、局部性、预分配和碎片情况选择块。
+
+\begin{lstlisting}
+logical file block
+  -> ext4 extent tree lookup
+  -> physical block range
+  -> build bio for page cache writeback
+\end{lstlisting}
+
+读 \filepath{fs/ext4/extents.c}、\filepath{fs/ext4/mballoc.c}。关注 \code{ext4\_map\_blocks} 如何把逻辑块映射到物理块，分配失败如何返回 \code{ENOSPC}，以及预分配如何减少碎片但增加回滚复杂度。
+
+\subsection{jbd2 事务、commit 与 checkpoint}
+
+jbd2 把元数据修改组织成事务。handle 表示一个修改上下文，transaction 收集多个 handle，commit 线程把描述符、元数据和 commit record 写入 journal，checkpoint 再把已提交修改传播回主文件系统位置。
+
+\begin{lstlisting}
+ext4_journal_start()
+  modify metadata buffers
+  ext4_handle_dirty_metadata()
+  ext4_journal_stop()
+
+jbd2 commit thread:
+  write descriptor blocks
+  write metadata blocks
+  write commit block with checksum
+  checkpoint later
+\end{lstlisting}
+
+读 \filepath{fs/jbd2/commit.c}。重点不是记函数名，而是理解 commit record 是恢复判断边界：commit 完整则 redo，commit 缺失或 checksum 坏则忽略该事务。
+
+\subsection{xattr、ACL、quota 与 FUSE}
+
+扩展属性让文件挂载额外元数据，例如 \code{security.selinux}、\code{system.posix\_acl\_access}、用户自定义 xattr。安全标签不只是字符串；LSM 在访问时读取标签并按策略决策。备份或复制若丢失 xattr，恢复后的系统可能权限完全不同。
+
+quota 给用户、组或项目限制块和 inode 使用。它需要在分配路径同步更新计数，失败时返回 \code{EDQUOT}。FUSE 则把文件系统实现放到用户态，内核 VFS 通过 \code{fuse\_req} 把 lookup/read/write 等请求交给用户态 daemon。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+机制 & 优点 & 风险 \\
+\midrule
+xattr/ACL & 表达安全标签和细粒度权限 & 复制备份时容易遗漏 \\
+quota & 防止单用户耗尽文件系统 & 计数一致性、恢复和性能开销 \\
+FUSE & 用户态开发文件系统，安全边界更清晰 & 上下文切换、daemon 死亡、缓存一致性 \\
+\bottomrule
+\end{longtable}
+
+\subsection{fsck 五步检查}
+
+以 e2fsck 思路看，恢复工具会检查 superblock、inode、目录、连接关系和 bitmap。每一步都在验证“被引用集合”和“元数据记录集合”是否一致。
+
+\begin{enumerate}
+\tightlist
+\item superblock 和块组描述符是否合理。
+\item inode 表中每个 inode 的类型、大小、块指针是否合理。
+\item 目录项是否指向合法 inode，目录结构是否可达。
+\item link count 与目录引用数是否一致。
+\item block/inode bitmap 与实际引用集合是否一致。
+\end{enumerate}
+
+fsck 能修一些结构错误，但不能恢复应用层语义。例如两个业务文件必须同版本，这件事只能由应用 manifest 或数据库日志表达。
+
+\subsection{mount、namespace 与传播}
+
+挂载不是简单把一个磁盘目录接到路径上。内核维护 mount 对象和 mount namespace，不同进程可以看到不同路径树。容器常用独立 mount namespace、bind mount、只读挂载和 pivot\_root/chroot 构造自己的文件系统视图。
+
+\begin{lstlisting}
+mount namespace:
+  /
+    /proc        procfs
+    /sys         sysfs read-only
+    /app         bind mount application root
+    /data        writable volume
+\end{lstlisting}
+
+mount propagation 决定一个 namespace 中的挂载变化是否传播到其他 namespace。若容器中的挂载意外传播回宿主，可能形成安全漏洞；若宿主挂载没有传播到需要的 namespace，服务可能看不到设备或数据卷。文件系统学习必须把“磁盘布局”和“命名空间视图”分开。
+
+\subsection{特殊文件系统：tmpfs、procfs、sysfs、overlayfs}
+
+并非所有文件系统都对应磁盘。tmpfs 把文件内容放在内存和 swap 中；procfs 暴露进程和内核状态；sysfs 暴露设备模型和 kobject；overlayfs 把 lower 和 upper 层合成一个视图。VFS 的统一接口让这些对象都能被 open/read/write，但语义完全不同。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+文件系统 & 主要用途 & 语义注意点 \\
+\midrule
+tmpfs & 临时文件、共享内存 & 受内存和 swap 限制，断电不保留 \\
+procfs & 进程和内核状态 & 内容动态生成，不是普通磁盘文件 \\
+sysfs & 设备和驱动属性 & 一文件一属性，写入可能触发设备操作 \\
+overlayfs & 容器镜像层叠 & copy-up、whiteout、rename 语义复杂 \\
+\bottomrule
+\end{longtable}
+
+这些文件系统说明“文件”是内核对象接口，不等于“磁盘上的一段字节”。读 \filepath{/proc/meminfo} 是内核现场生成文本；写 \filepath{/sys/.../online} 可能触发 CPU 或设备上线下线；overlay 中修改 lower 文件会先 copy-up 到 upper。
+
+\subsection{dcache、负 dentry 与路径缓存}
+
+路径解析很频繁，不能每次都读目录块。dcache 缓存 dentry，包括存在的名字和不存在的名字。负 dentry 表示某目录下某名字不存在，可以加速反复失败查找。
+
+\begin{lstlisting}
+lookup(parent, name):
+  dentry = dcache_lookup(parent, name)
+  if dentry exists and valid:
+    return dentry.inode or ENOENT for negative
+  inode = filesystem_lookup(parent.inode, name)
+  dcache_insert(parent, name, inode or negative)
+  return inode
+\end{lstlisting}
+
+缓存失效是难点。rename、unlink、mount、远端文件系统变化和权限变化都可能影响缓存结果。VFS 需要引用计数、序列号、RCU path walk 和慢路径重试，才能在高并发路径查找中兼顾性能和一致性。
+
+\subsection{rename、hard link 与 link count}
+
+hard link 让多个目录项指向同一个 inode。link count 记录目录项引用数，open file 引用则是另一套运行时引用。rename 可以把一个目录项原子移到另一个位置，甚至替换已有目标。
+
+\begin{lstlisting}
+rename(old_parent, old_name, new_parent, new_name):
+  lock directories in stable order
+  old_inode = lookup(old_parent, old_name)
+  target = lookup(new_parent, new_name)
+  journal intent
+  remove old dir entry
+  install new dir entry
+  adjust link counts if replacing
+  commit
+\end{lstlisting}
+
+rename 的复杂性来自跨目录锁顺序、目标存在时的替换、目录不能移动到自己的子树、崩溃恢复和 dcache 失效。教学文件系统可以先限制为同目录普通文件 rename，再逐步加入跨目录和替换语义。
+
+\subsection{应用层一致性不能外包给文件系统}
+
+文件系统保证自己的元数据一致，不保证应用多个文件之间的业务关系。比如配置更新涉及 \code{config.json} 和 \code{index.json} 两个文件，文件系统无法知道它们必须同版本。应用要用 manifest、版本号、checksum 和原子切换表达业务提交。
+
+\begin{lstlisting}
+publish_version(v):
+  write_all("objects/v/data", data)
+  fsync("objects/v/data")
+  write_all("manifests/v", checksum_and_metadata)
+  fsync("manifests/v")
+  rename("manifests/v", "CURRENT")
+  fsync("manifests")
+\end{lstlisting}
+
+这也是数据库使用 WAL 的原因。文件系统日志保护文件系统结构；数据库日志保护数据库事务；应用 manifest 保护应用版本。层次不同，日志语义不同。

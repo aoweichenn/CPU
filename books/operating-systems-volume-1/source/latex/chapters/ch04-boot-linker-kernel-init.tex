@@ -1,0 +1,270 @@
+\chapter{启动、链接脚本与内核初始化}
+
+\section{原理}
+
+从裸机程序走向内核，第一道门是启动。机器上电后不会自动理解 C 语言，也不会自动准备堆、栈、全局变量和设备。CPU 只知道从复位向量或固件指定入口取指。操作系统必须把“二进制文件如何进入内存、第一条指令在哪里、栈在哪里、全局变量如何初始化、设备何时可用”这些问题全部讲清。
+
+在单片机上，启动路径通常是 reset handler：设置栈指针，把 \code{.data} 从 Flash 复制到 SRAM，把 \code{.bss} 清零，初始化时钟和最小串口，然后调用 \code{main} 或 \code{kernel\_main}。在 PC 或服务器上，路径更长：固件初始化硬件，bootloader 加载内核镜像和启动参数，切换 CPU 模式，建立最小页表，最后跳到内核入口。
+
+启动阶段的特点是“没有服务可用”。还没有调度器，不能睡眠；还没有内存分配器，不能随便 \code{malloc}；还没有完整中断，不能依赖异步事件；还没有文件系统，不能读普通文件；还没有日志系统，调试输出只能靠串口、早期 console 或内存缓冲区。这些约束解释了为什么内核初始化代码通常按严格阶段组织。
+
+\subsection{链接脚本决定内存布局}
+
+链接脚本把代码段、只读数据、已初始化数据、未初始化数据和栈安排到具体地址。没有链接脚本，编译器和链接器不知道内核应该放在物理地址哪里，也不知道哪些符号表示段边界。
+
+\begin{lstlisting}
+SECTIONS {
+  . = 0x80200000;
+  __kernel_start = .;
+  .text : { *(.text*) }
+  .rodata : { *(.rodata*) }
+  .data : { *(.data*) }
+  __bss_start = .;
+  .bss : { *(.bss*) *(COMMON) }
+  __bss_end = .;
+  __kernel_end = .;
+}
+\end{lstlisting}
+
+这些符号不是装饰。启动代码需要 \code{\_\_bss\_start} 和 \code{\_\_bss\_end} 来清零 BSS；早期物理页分配器需要 \code{\_\_kernel\_end} 知道哪些内存已经被内核占用；页表初始化要知道哪些区域可执行、只读或可写。
+
+\subsection{启动阶段的状态机}
+
+内核启动可以写成状态机：
+
+\begin{lstlisting}
+Reset
+  -> MinimalStack
+  -> DataCopied
+  -> BssCleared
+  -> EarlyConsole
+  -> BootMemoryDiscovered
+  -> PageTablesReady
+  -> InterruptsReady
+  -> SchedulerReady
+  -> InitProcessStarted
+\end{lstlisting}
+
+每个阶段只能使用之前已经建立的能力。比如 EarlyConsole 之前不能输出复杂日志；BootMemoryDiscovered 之前不能建立通用页分配；SchedulerReady 之前不能阻塞等待；InterruptsReady 之前不能依赖设备中断。
+
+\section{实践}
+
+实践时先写一个启动依赖表：
+
+\begin{longtable}{p{0.24\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 可用能力 & 禁止事项 \\
+\midrule
+Reset & 寄存器、固定入口 & 使用全局变量假设已初始化 \\
+MinimalStack & 栈、少量汇编 & 调用复杂 C 运行库 \\
+BssCleared & 零初始化全局变量 & 动态分配内存 \\
+EarlyConsole & 最小输出 & 格式化复杂日志、大缓冲 \\
+BootMemory & 物理内存范围 & 使用完整虚拟内存假设 \\
+PageTables & 基础地址翻译 & 访问未映射设备 \\
+Scheduler & 任务切换 & 在早期 init 中遗留永久锁 \\
+\bottomrule
+\end{longtable}
+
+然后画出内核镜像布局：text、rodata、data、bss、boot stack、page tables、free memory。只要能解释“内核自己占了哪些页，哪些页可以交给分配器”，后续物理页管理才有根。
+
+\section{算法与实现分析}
+
+\subsection{BSS 清零和 data 复制}
+
+\begin{lstlisting}
+boot_zero_bss():
+  p = __bss_start
+  while p < __bss_end:
+    *p = 0
+    p += word_size
+
+boot_copy_data():
+  src = __data_load_start
+  dst = __data_start
+  while dst < __data_end:
+    *dst++ = *src++
+\end{lstlisting}
+
+这两个循环是 \code{O(n)}，n 是段大小。它们必须在使用对应全局变量之前完成。若 BSS 没清零，全局队列、锁和指针会从随机值开始，后续 bug 很难定位。
+
+\subsection{早期 bump allocator}
+
+完整页分配器建立前，内核常用 bump allocator 分配早期对象。它只维护一个 next 指针，每次按对齐向上推进，不支持释放。
+
+\begin{lstlisting}
+early_alloc(size, align):
+  next = align_up(early_next, align)
+  end = next + size
+  if end > early_limit: panic()
+  early_next = end
+  return next
+\end{lstlisting}
+
+分配是 \code{O(1)}，实现极简单。代价是不能释放，且必须在切换到正式分配器后停止使用。它适合页表、启动参数副本、早期设备表等生命周期贯穿启动阶段的对象。
+
+\subsection{初始化依赖图}
+
+内核初始化不能只靠函数排列顺序。一个模块可能依赖 console，一个模块依赖内存分配器，一个模块依赖中断，一个模块必须在调度器启动前完成。把这些关系写成依赖图，才能解释为什么初始化常被分成 early、core、subsys、device、late 等阶段。
+
+\begin{lstlisting}
+init_node {
+  name: "page_allocator"
+  requires: ["boot_memory_map", "early_console"]
+  provides: ["alloc_pages"]
+}
+
+run_init_graph(nodes):
+  ready = nodes with all requirements satisfied
+  while ready not empty:
+    n = pop(ready)
+    run(n.init)
+    mark_provided(n.provides)
+    add newly unblocked nodes to ready
+  if unfinished nodes remain:
+    panic("init dependency cycle or missing provider")
+\end{lstlisting}
+
+这个算法是拓扑排序，复杂度是 \code{O(V + E)}。它的工程价值是把“某函数必须先跑”变成可检查约束。若出现环，例如文件系统初始化依赖块设备，而块设备初始化又要从文件系统读取配置，就必须拆出更早的配置来源。
+
+\subsection{启动参数与可信边界}
+
+bootloader 会把内存地图、命令行、initrd、设备树或 ACPI 表交给内核。内核不能盲信这些数据，因为它们可能来自固件 bug、配置错误或攻击面。早期解析必须检查地址范围、长度、对齐和重叠。
+
+\begin{lstlisting}
+validate_memory_region(region):
+  require region.start aligned to PAGE_SIZE
+  require region.length > 0
+  require checked_add(region.start, region.length, &end)
+  require end <= physical_address_limit
+  require not overlaps(kernel_image)
+  require not overlaps(previous_accepted_regions)
+\end{lstlisting}
+
+若把内核镜像所在物理页误标为空闲，后续页分配器会把正在运行的内核代码分配给别人。启动阶段的错误通常不是立刻崩溃，而是在很久以后变成随机损坏，因此必须在早期就把内存地图打印和校验做好。
+
+\subsection{从单核启动到多核启动}
+
+多核系统通常只有 bootstrap processor 先运行内核入口，其他 CPU 处于等待状态。主 CPU 建立全局页表、per-CPU 区域和调度数据后，再唤醒 application processors。每个 CPU 都需要自己的内核栈、当前任务指针、runqueue 和中断状态。
+
+\begin{lstlisting}
+boot_cpu_main():
+  setup_global_memory()
+  setup_percpu_area(boot_cpu)
+  for cpu in secondary_cpus:
+    allocate_cpu_stack(cpu)
+    send_startup_ipi(cpu, secondary_entry)
+  wait_until_all_online()
+  start_scheduler()
+
+secondary_entry(cpu):
+  load_kernel_page_table()
+  set_percpu_base(cpu)
+  init_local_interrupts()
+  mark_cpu_online(cpu)
+  idle_loop()
+\end{lstlisting}
+
+这里的不变量是：CPU online 之前不能被调度器选作迁移目标；per-CPU 数据初始化之前不能接收普通设备中断；所有 CPU 使用的内核文本映射必须一致。多核启动把“初始化顺序”从单线流程变成了并发协议。
+
+\section{测试}
+
+\begin{itemize}
+\tightlist
+\item 链接脚本导出的段边界单调递增且按页对齐。
+\item BSS 清零后，全局计数器、指针和队列初值可预测。
+\item 早期分配器返回地址满足对齐，且不会覆盖内核镜像。
+\item 未初始化 console 前，日志路径不会访问空设备。
+\item 调度器 ready 前，任何初始化函数都不能睡眠。
+\item 页表 ready 后，text 只读可执行，data/bss 可写不可执行。
+\end{itemize}
+
+启动章节的验收标准是：能从第一条指令解释到第一个用户任务启动，中间每一阶段可用能力和禁止事项都清楚。
+
+\section{源码级补充：x86-64、UEFI 与 start\_kernel}
+
+\subsection{RESET 到长模式}
+
+x86 CPU 复位后不是直接处于 64 位长模式。传统路径会经历实模式、保护模式和长模式切换；现代 UEFI 固件和 bootloader 会替内核完成大量工作，但内核仍必须理解启动时 CPU 模式、页表、内存地图和调用约定。
+
+\begin{lstlisting}
+RESET
+  -> firmware initializes platform
+  -> bootloader loads kernel image and initrd
+  -> build boot parameters and memory map
+  -> enter protected/long mode as required by protocol
+  -> jump to decompressor or kernel entry
+  -> early page tables
+  -> start_kernel()
+\end{lstlisting}
+
+实模式只能直接访问有限地址空间，保护模式引入段和保护，长模式引入 64 位寄存器和分页模型。操作系统教材不需要把每条切换指令都背下来，但必须知道：64 位内核能运行，是因为早期代码已经设置好 GDT、控制寄存器、EFER.LME、页表和跳转序列。
+
+\subsection{BIOS 与 UEFI 的差异}
+
+BIOS 风格启动常从磁盘引导扇区开始，bootloader 逐步加载更多代码。UEFI 则提供标准化的 Boot Services、Runtime Services、内存地图和 PE/COFF 应用加载环境。UEFI 下 bootloader 或 EFI stub 能以更结构化方式获得 GOP framebuffer、ACPI 表、initrd 和命令行。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+项目 & BIOS 风格 & UEFI 风格 \\
+\midrule
+入口形态 & 引导扇区和 bootloader 阶段 & EFI 应用或 EFI stub \\
+固件服务 & 中断调用，模式受限 & Boot Services/Runtime Services \\
+内存地图 & e820 等接口 & \code{GetMemoryMap} \\
+图形输出 & VGA/vesa 等路径 & GOP framebuffer \\
+退出固件 & bootloader 控制移交 & \code{ExitBootServices} 后服务受限 \\
+\bottomrule
+\end{longtable}
+
+\code{ExitBootServices} 是重要边界。退出前可以调用 UEFI Boot Services 分配内存、打开协议、读取设备；退出后内核必须依靠自己的驱动和内存管理。若退出前后内存地图不同步，内核可能误用固件保留页。
+
+\subsection{Linux start\_kernel 调用序列}
+
+Linux 的 \code{start\_kernel} 是阅读大型内核初始化的主干。它不是所有细节的开始，但它把架构初始化、内存、调度、RCU、中断、定时器、VFS、proc、driver model、init 进程串起来。
+
+\begin{lstlisting}
+start_kernel()
+  setup_arch()
+  setup_command_line()
+  mm_init()
+  sched_init()
+  radix_tree_init()
+  trap_init()
+  init_IRQ()
+  tick_init()
+  rcu_init()
+  vfs_caches_init()
+  rest_init()
+\end{lstlisting}
+
+不同版本顺序会变化，读源码时应抓依赖：\code{setup\_arch} 解析固件和内存；\code{mm\_init} 建立内存分配基础；\code{sched\_init} 建立 runqueue；\code{trap\_init/init\_IRQ} 建立入口和中断；\code{rest\_init} 创建 kernel thread 和第一个用户态 init 的路径。
+
+\subsection{initcall 机制}
+
+驱动和子系统不能全都手写进一个巨大初始化函数。Linux 用 initcall 等级把初始化函数放入特殊段，启动时按等级依次调用。常见等级包括 early、core、postcore、arch、subsys、fs、device、late。
+
+\begin{lstlisting}
+early_initcall(foo_early);
+core_initcall(mm_subsystem);
+subsys_initcall(bus_subsystem);
+fs_initcall(vfs_feature);
+device_initcall(driver_init);
+late_initcall(debug_late);
+\end{lstlisting}
+
+initcall 的实质是链接脚本和函数指针数组。它让模块能声明“我属于哪个初始化阶段”，但不能自动解决所有依赖。若一个 device initcall 假设某总线已注册，而总线初始化等级写错，启动会出现只在特定配置下复现的失败。
+
+\subsection{多核启动和 CPU hotplug}
+
+bootstrap processor 先运行全局初始化，然后通过 IPI 或固件接口唤醒 application processors。每个 CPU 上线前要设置 per-CPU base、内核栈、本地 APIC、idle task 和 runqueue。CPU hotplug 则要求运行中 CPU 可下线和上线，所以初始化/清理路径必须可重复、可回滚。
+
+\begin{lstlisting}
+bringup_cpu(cpu):
+  allocate_idle_task(cpu)
+  allocate_percpu_area(cpu)
+  send_startup_ipi(cpu)
+  wait cpu reports online
+  add cpu to scheduler domains
+  enable interrupts on cpu
+\end{lstlisting}
+
+失败案例：CPU 已经标记 online 但本地 timer 未初始化，调度器可能把任务迁过去后无法抢占；CPU 下线时未迁走 timer 或 workqueue，后续事件投递到离线 CPU。多核启动不是“让其他核心开始跑”，而是把每个 CPU 纳入调度、中断和时间子系统的一致状态。

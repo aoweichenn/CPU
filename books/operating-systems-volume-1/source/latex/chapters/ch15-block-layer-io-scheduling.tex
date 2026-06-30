@@ -1,0 +1,294 @@
+\chapter{块设备层、I/O 调度与提交顺序}
+
+\section{原理}
+
+文件系统最终要把逻辑块读写交给块设备。若每个上层请求都直接变成一次磁盘操作，系统会遭遇两个问题：机械磁盘上寻道开销巨大，随机请求顺序会让吞吐崩溃；即使在 SSD/NVMe 上，请求大小、队列深度、合并策略和 flush 顺序也直接影响延迟和持久化语义。因此操作系统在文件系统和驱动之间放置块层，负责把 bio 合并、拆分、排序、限流、派发和完成。
+
+块层的目标不是“越重排越好”。对普通读写，重排可以提高吞吐；对日志提交、数据库事务和文件系统 barrier，错误重排会破坏崩溃一致性。I/O 调度器必须同时理解性能和顺序约束：哪些请求可合并，哪些可越过，哪些必须在 flush 后才能报告完成。
+
+\begin{keyidea}
+块层把“文件系统想读写哪些块”转化为“设备能高效且按约束完成的请求序列”。它是性能优化层，也是持久化契约层。
+\end{keyidea}
+
+从设备演进看，机械磁盘偏好按扇区顺序扫描；SATA SSD 降低了寻道成本但仍受擦写块和队列深度影响；NVMe 提供多队列并行，单一全局电梯队列反而会成为瓶颈。教材不能只讲一个 SCAN 算法就结束，而要说明为什么算法随硬件变化。
+
+\section{实践}
+
+块层常用对象如下：
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+对象 & 含义 & 关键字段 \\
+\midrule
+bio & 上层的一段块 I/O 意图 & sector、len、page list、op、flags、endio \\
+request & 设备队列中的可派发请求 & 合并后的 bio 链、方向、优先级、deadline \\
+request queue & 块设备的软件队列 & pending、inflight、depth、scheduler \\
+hardware queue & 多队列设备的硬件提交队列 & doorbell、completion、CPU 亲和 \\
+flush request & 缓存刷新或持久化屏障 & preflush、FUA、barrier dependency \\
+\bottomrule
+\end{longtable}
+
+一次写入的路径可以写成：
+
+\begin{lstlisting}
+filesystem_writeback(page):
+  bio = build_bio(page.block, page.data, WRITE)
+  submit_bio(bio)
+
+submit_bio(bio):
+  q = bio.device.queue
+  if can_merge(q.last_request, bio):
+    merge(q.last_request, bio)
+  else:
+    req = make_request(bio)
+    scheduler_insert(q, req)
+  dispatch_if_possible(q)
+\end{lstlisting}
+
+这里的关键是 bio 的生命周期。bio 完成并不等于调用者数据结构一定可释放，除非 endio 回调已经把 page 状态、错误码和等待者唤醒都处理完。对写请求而言，“设备报告完成”也不必然等于掉电后数据存在，除非请求带有 FUA 或之前执行了正确 flush。
+
+\section{算法与实现分析}
+
+\subsection{合并与拆分}
+
+合并减少请求数量，提高吞吐。前向合并是新 bio 紧接已有请求后方；后向合并是新 bio 紧接已有请求前方。
+
+\begin{lstlisting}
+try_merge(req, bio):
+  if req.op != bio.op or req.device != bio.device:
+    return false
+  if req.end_sector == bio.start_sector:
+    append(req, bio)
+    return true
+  if bio.end_sector == req.start_sector:
+    prepend(req, bio)
+    return true
+  return false
+\end{lstlisting}
+
+合并复杂度取决于查找结构。只看队尾是 \code{O(1)}，但合并机会少；用按 sector 排序的树查找相邻请求是 \code{O(\log n)}，合并率更高。拆分发生在请求跨越设备最大段数、最大字节数、DMA 边界或 zone 限制时。教学模型可以只实现连续扇区合并，但要保留“设备约束可能要求拆分”的接口。
+
+\subsection{SCAN 和 deadline}
+
+SCAN 电梯算法按当前磁头方向服务请求，到尽头后反向。它适合解释机械磁盘为什么怕随机寻道。
+
+\begin{lstlisting}
+pick_scan(queue, head, direction):
+  candidates = requests_in_direction(queue, head, direction)
+  if empty(candidates):
+    direction = reverse(direction)
+    candidates = requests_in_direction(queue, head, direction)
+  return nearest_by_sector(candidates, head, direction)
+\end{lstlisting}
+
+SCAN 的吞吐较好，但远处请求可能等待很久。deadline 调度器给读写请求设置截止时间，选择时优先处理过期请求，否则继续按 sector 顺序提升吞吐。
+
+\begin{lstlisting}
+pick_deadline(queue):
+  if has_expired(queue.read_deadline):
+    return pop_oldest(queue.read_fifo)
+  if has_expired(queue.write_deadline):
+    return pop_oldest(queue.write_fifo)
+  return pop_by_sector_order(queue)
+\end{lstlisting}
+
+deadline 的本质是用最大等待时间约束吞吐优化。它不保证实时性，但能避免单纯电梯算法在混合负载下让读请求被大量写请求拖垮。
+
+\subsection{CFQ/BFQ 与公平性}
+
+桌面和多租户环境还需要进程间公平。按进程或控制组建立 I/O 队列，可以避免一个大顺序写任务压制交互读。BFQ 这类预算公平队列给每个实体分配服务预算，用“服务了多少字节”和“等待了多久”共同决定下一个队列。
+
+\begin{lstlisting}
+pick_fair(queue_set):
+  entity = min_virtual_finish_time(queue_set.active)
+  req = entity.pop_next_request()
+  entity.service += req.bytes
+  entity.vfinish = entity.vstart + entity.service / entity.weight
+  if entity.has_more():
+    reinsert(entity)
+  return req
+\end{lstlisting}
+
+公平调度会牺牲部分全局顺序性，尤其在机械磁盘上可能增加寻道。工程选择取决于目标：批处理吞吐、桌面响应、数据库尾延迟还是云主机隔离。
+
+\subsection{flush、FUA 与 barrier}
+
+现代存储有缓存。普通写完成可能只表示数据到达设备缓存，不表示掉电持久。flush 请求要求设备把缓存写入介质；FUA 要求当前写绕过或强制落到持久介质；barrier 规定顺序，防止前后的写被重排穿越。
+
+\begin{lstlisting}
+submit_ordered_write(data_req):
+  if data_req.requires_preflush:
+    submit(FLUSH)
+    wait_flush_done()
+  submit(data_req with FUA if requested)
+  wait_data_done()
+  if data_req.requires_postflush:
+    submit(FLUSH)
+    wait_flush_done()
+  complete_to_filesystem()
+\end{lstlisting}
+
+这段逻辑解释了为什么 \code{fsync} 慢：它不只是把 page cache 交给设备，还可能要求等待队列中相关写完成，并发出 flush 来建立掉电后的顺序证据。
+
+\subsection{多队列 NVMe}
+
+NVMe 设备支持多个 submission/completion queue。块层会把请求映射到 CPU 本地硬件队列，减少全局锁竞争。
+
+\begin{lstlisting}
+submit_nvme(req):
+  hctx = map_cpu_to_hw_queue(current.cpu)
+  tag = allocate_tag(hctx)
+  cmd = build_nvme_command(req, tag)
+  sq = hctx.submission_queue
+  sq.entries[sq.tail] = cmd
+  sq.tail = next(sq.tail)
+  ring_doorbell(hctx)
+\end{lstlisting}
+
+多队列提高并行度，但也削弱了全局排序。需要顺序语义的请求必须带明确依赖，不能假设“提交顺序就是完成顺序”。
+
+\section{测试}
+
+\begin{enumerate}
+\tightlist
+\item 合并测试：连续写 bio 应合并成较少 request，非连续不得错误合并。
+\item 拆分测试：超过最大请求大小时必须拆分，完成回调仍只向上层报告一次整体结果或清晰的部分错误。
+\item SCAN 测试：给定 head 和方向，选择顺序可手算。
+\item deadline 测试：过期读请求应越过大量未过期写请求。
+\item flush 顺序测试：日志数据、flush、commit block 的完成顺序不能被重排破坏。
+\item 多队列测试：同一队列 tag 唯一，completion 能找到原请求。
+\item 错误注入：设备返回 I/O error 时，page、bio、request、等待者状态都能收敛。
+\end{enumerate}
+
+\begin{rubricbox}
+本章合格标准：能说明 bio、request、queue 的区别；能分析 SCAN、deadline、公平调度的取舍；能解释 flush/FUA/barrier 为什么属于正确性而不仅是性能。
+\end{rubricbox}
+
+\section{源码级补充：blk-mq、IO 统计、优先级与 io\_uring}
+
+\subsection{blk-mq 对象关系}
+
+blk-mq 把软件提交队列映射到硬件队列，减少单锁瓶颈。核心对象包括 \code{request\_queue}、\code{blk\_mq\_tag\_set}、hardware context、software context 和 tag。tag 是请求在硬件队列中的身份，用 completion 找回 request。
+
+\begin{lstlisting}
+submit_bio
+  -> blk_mq_submit_bio
+  -> get request tag
+  -> map current CPU to hctx
+  -> driver queue_rq
+  -> device completion interrupt
+  -> blk_mq_complete_request
+  -> bio end_io
+\end{lstlisting}
+
+读源码看 \filepath{block/blk-mq.c}、\filepath{block/bio.c} 和具体驱动的 \code{queue\_rq}。关注 request 从 free tag 到 in-flight，再到 completion 释放 tag 的生命周期。
+
+\subsection{IO 统计从哪里来}
+
+\filepath{/proc/diskstats}、\filepath{/proc/[pid]/io}、iostat 看到的数字来自块层和任务 I/O 统计。它们能说明请求数、扇区数、队列时间、服务时间，但不能直接告诉你应用层哪个业务请求慢。需要把应用 trace、系统调用和块层事件串起来。
+
+\begin{longtable}{p{0.22\linewidth}p{0.52\linewidth}}
+\toprule
+指标 & 解释注意点 \\
+\midrule
+read/write IOPS & 请求次数，受合并影响，不等于应用调用次数 \\
+sectors & 数据量，可和吞吐换算 \\
+await/latency & 队列等待加服务时间，受队列深度影响 \\
+util & 设备忙碌时间比例，多队列设备上不等同饱和度 \\
+\bottomrule
+\end{longtable}
+
+错误诊断不要只看 util。NVMe util 高不一定坏，机械盘 util 高更可能意味着排队；await 上升要结合队列深度、flush、写回和 cgroup 限流。
+
+\subsection{IO 优先级和 cgroup}
+
+\code{ionice}、IO priority class 和 blk-cgroup 可影响不同任务的 I/O 服务顺序。云主机和容器环境常通过 cgroup v2 的 io controller 控制权重或限速。公平性会改变尾延迟：低权重任务可能明显变慢，高权重任务不应被后台写回完全淹没。
+
+\subsection{io\_uring 与块 I/O}
+
+io\_uring 用共享提交队列 SQ 和完成队列 CQ 减少系统调用往返，支持固定 buffer、固定文件、poll、timeout、链式请求和异步取消。它不是“绕过内核”，而是把提交和完成批量化，让内核在更少入口中处理更多请求。
+
+\begin{lstlisting}
+userspace:
+  sqe = get_sqe()
+  sqe.op = READV
+  sqe.fd = fixed_file
+  sqe.buf = fixed_buffer
+  submit_sq_tail()
+  io_uring_enter()
+
+kernel:
+  consume SQEs
+  issue async work or direct submit
+  post CQEs with result
+\end{lstlisting}
+
+io\_uring 的正确性问题和普通异步 I/O 一样：buffer 在 completion 前不能释放，取消可能和完成竞态，部分完成必须按 CQE 结果处理。fixed buffer/file 提高性能，但也把生命周期责任推给应用。
+
+\subsection{writeback、dirty throttling 与块层的关系}
+
+应用 \code{write} 把页标脏后，脏页并不会无限积累。内核用 dirty ratio、dirty bytes、writeback 线程和 per-bdi 状态控制写回。当脏页过多时，写入者可能被迫参与平衡，表现为一次普通 \code{write} 变慢。
+
+\begin{lstlisting}
+balance_dirty_pages(task, mapping):
+  dirty = global_dirty_pages()
+  if dirty < dirty_background:
+    return
+  wake_writeback_threads()
+  if dirty > dirty_limit:
+    sleep_or_writeback_until_below_limit(task)
+\end{lstlisting}
+
+这个机制把存储压力反馈给应用。没有 throttling，快 CPU 可以瞬间制造大量脏页，把内存挤爆；有 throttling，局部写入延迟会上升，但系统保持可控。诊断写慢时要区分：是用户态复制慢，page cache 分配慢，dirty throttling，块层排队，还是设备 flush。
+
+\subsection{zone 设备和顺序写约束}
+
+某些设备把空间划成 zone，并要求一个 zone 内按顺序写入。文件系统和块层必须知道 zone write pointer，不能随意把随机写重排进去。这个例子说明块层不只是性能优化，还承载设备语义。
+
+\begin{lstlisting}
+submit_zone_write(req):
+  zone = lookup_zone(req.sector)
+  if req.sector != zone.write_pointer:
+    return -EIO
+  dispatch(req)
+  zone.write_pointer += req.length
+\end{lstlisting}
+
+对普通块设备，逻辑块可随机覆盖；对 zone 设备，文件系统可能要采用 log-structured 布局或显式 reset zone。硬件约束改变，上层算法就必须改变。
+
+\subsection{请求取消、超时与错误完成}
+
+块请求提交后可能超时、被设备 reset、被上层取消或完成失败。取消不是“把请求从队列里删除”这么简单，因为请求可能已经在设备硬件队列中，甚至设备正在 DMA。
+
+\begin{lstlisting}
+timeout_request(req):
+  mark req timed_out
+  ask driver eh_timed_out(req)
+  if driver says reset:
+    freeze_queue()
+    reset_device()
+    complete_lost_requests(EIO)
+    unfreeze_queue()
+  else if request completed meanwhile:
+    ignore timeout
+\end{lstlisting}
+
+这里存在竞态：timeout 线程准备处理请求时，中断也可能完成请求。request 状态机必须保证 completion 只发生一次，tag 只释放一次，bio endio 只调用一次。块层测试要专门构造 timeout 和 completion 交错。
+
+\subsection{从 fio 数字到 OS 解释}
+
+I/O benchmark 不能只报 MB/s 和 IOPS。高质量报告要写明 direct/buffered、sync/async、iodepth、block size、read/write mix、文件系统、是否预热、是否清缓存、是否包含 fsync。
+
+\begin{longtable}{p{0.24\linewidth}p{0.48\linewidth}p{0.18\linewidth}}
+\toprule
+参数 & 含义 & 影响 \\
+\midrule
+\code{bs} & 每次 I/O 大小 & 合并、吞吐和延迟 \\
+\code{iodepth} & in-flight 请求数量 & 设备并行度和排队 \\
+\code{direct} & 是否绕过 page cache & 缓存干扰和对齐要求 \\
+\code{fsync} & 是否等待持久化 & flush 延迟和事务成本 \\
+\code{rw} & 顺序/随机、读/写混合 & 调度器和介质特性 \\
+\bottomrule
+\end{longtable}
+
+如果不说明这些参数，“磁盘很快”或“磁盘很慢”没有工程意义。OS 学习里的性能测试必须可复现，也必须能解释观测值背后的路径。

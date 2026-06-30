@@ -1,0 +1,128 @@
+\chapter{操作系统地图与契约}
+
+\section{原理}
+
+操作系统的第一性问题不是“提供哪些 API”，而是“怎样让多个不可信、会失败、会竞争的程序共享同一台机器”。硬件只提供有限的 CPU 核、物理内存、设备、中断和特权级。应用希望看到的是进程、线程、虚拟地址、文件、socket、权限、时间和错误码。操作系统处在中间，把硬件事实翻译成可编程契约。
+
+一个契约至少包含四层含义。第一，状态由谁持有，例如进程表、页表、文件描述符表、inode、设备队列。第二，谁可以修改状态，例如系统调用、异常处理、中断处理、内核线程或回收器。第三，失败怎样表达，例如返回错误码、发送信号、杀死进程、回滚事务或留下可恢复日志。第四，外部观察者能看到什么，例如命令输出、trace、统计计数、日志和测试结果。
+
+操作系统同时解决五类问题。抽象让程序不必直接操作物理设备；隔离让一个程序不能随便破坏另一个程序；并发让多个任务共享 CPU 和 I/O；持久化让数据在进程退出或机器崩溃后仍有解释；可观测性让系统在出错时有证据，而不是只留下“偶现问题”。
+
+这五类问题不能分开学习。进程调度要理解线程睡眠和唤醒，睡眠和唤醒又依赖同步原语；虚拟内存隔离要理解页表权限，权限错误又通过异常进入内核；文件写入要理解 page cache，page cache 又属于内存管理；可靠提交要理解 \code{fsync}、目录项和崩溃恢复。
+
+本册把操作系统看成一组状态机的组合。进程有生命周期，线程有运行状态，页表有映射状态，fd 有引用状态，文件页有 clean、dirty、writeback 状态，设备请求有 submitted、completed 状态，持久化输出有 prepared、committed 状态。能画出状态机，就能开始解释 OS；只会背 API 名字，无法判断边界。
+
+\begin{keyidea}
+本册所有机制都用同一个问题模板分析：谁拥有状态，谁能改变状态，改变时如何同步，失败时如何回滚，外部如何证明它真的发生。
+\end{keyidea}
+
+从工程角度看，操作系统的每个功能都同时有“用户可见语义”和“内核维护成本”。例如进程给用户一个独立执行环境，但内核要维护地址空间、fd 表、信号、父子关系和退出状态；虚拟内存给用户一个连续地址幻觉，但内核要维护 VMA、页表、TLB 失效和回收策略；文件给用户一个字节流或目录树，但内核要维护 inode、page cache、块分配、权限和崩溃恢复。只讲语义会太抽象，只讲实现会迷失在细节里，二者必须一起讲。
+
+\section{实践}
+
+阅读任何 OS 现象时，先写一张“状态和边界表”。
+
+\begin{longtable}{p{0.18\linewidth}p{0.74\linewidth}}
+\toprule
+问题 & 要填写的内容 \\
+\midrule
+状态对象 & 进程、线程、页、fd、inode、socket、设备请求、日志记录 \\
+所有者 & 用户态对象、内核对象、硬件寄存器、设备控制器 \\
+入口 & 系统调用、异常、中断、内核线程、后台回收 \\
+权限 & 特权级、页表权限、文件权限、capability、namespace、引用计数 \\
+等待 & runqueue、futex、page fault、I/O completion、锁、条件变量 \\
+提交 & 状态更新、引用释放、写入 page cache、落盘、manifest 生效 \\
+证据 & 返回值、errno、trace、计数器、日志、测试断言 \\
+\bottomrule
+\end{longtable}
+
+例如一次 \code{write(fd, buf, len)} 可以这样拆：用户态只有一个整数 fd 和一段用户 buffer；内核要先从进程 fd 表找到 open file description，再检查写权限，再复制用户 buffer，再把页标记为 dirty，最后返回写入字节数或错误。这个返回值通常不等于数据已经安全落盘。要证明持久化，还需要 \code{fsync}、目录同步或更高层 manifest。
+
+再看一次 page fault。用户态执行 load/store，硬件发现页表项不存在或权限不符，CPU 进入异常入口，内核根据 VMA 判断这是合法缺页、权限错误还是非法地址。合法缺页可能分配物理页或读取文件页；权限错误可能发送信号；非法访问可能终止进程。这里的核心不是“缺页很慢”，而是虚拟地址访问被拆成硬件检查和内核决策。
+
+\section{契约维度}
+
+一个 OS 机制要讲完整，至少要覆盖五个维度。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+维度 & 追问 & 例子 \\
+\midrule
+身份 & 对象如何被引用 & pid、tid、fd、inode number、socket 四元组、DMA tag \\
+权限 & 谁能做什么 & 页表 R/W/X、fd flags、capability、seccomp、namespace \\
+生命周期 & 何时创建和释放 & fork/exit/wait、open/dup/close、page refcount、request completion \\
+等待 & 无法立即推进时停在哪里 & runqueue、wait queue、page fault、I/O queue、timer \\
+提交 & 何时对外可见或持久 & 系统调用返回、PTE 安装、DMA 完成、fsync、manifest \\
+\bottomrule
+\end{longtable}
+
+这五个维度能帮助读者判断一个解释是否完整。比如“socket 可读”只覆盖了等待维度，还要问：哪个 fd 引用它，谁有权限读，缓冲区里数据生命周期如何，读取后 offset 或队列怎样变化，关闭时如何唤醒等待者。
+
+\section{层次与反向依赖}
+
+操作系统经常呈现层次结构：硬件在底层，内核抽象在中间，用户 API 在上层。但真实问题会反向穿透层次。一个 \code{write} 系统调用看似属于文件 API，却可能等待内存回收、块层队列、驱动中断、设备 flush 和调度器唤醒。一个 page fault 看似属于内存管理，却可能读取文件页，触发块设备 I/O。一个安全拒绝看似属于权限系统，却依赖路径解析、namespace、凭据和 LSM。
+
+\begin{lstlisting}
+user write()
+  -> fd table
+  -> file object
+  -> page cache
+  -> writeback
+  -> block layer
+  -> driver DMA
+  -> interrupt completion
+  -> wakeup
+\end{lstlisting}
+
+因此阅读本册时，不要把章节理解成互不相干的模块。章节只是学习顺序，真实系统是交叉依赖的状态机网络。
+
+\section{演进路线}
+
+本册后续章节按一条明确路线展开。
+
+\begin{enumerate}
+\tightlist
+\item 单片机裸机程序：一个主循环直接拥有整台机器。
+\item 事件和状态机：阻塞函数被拆成可返回的 step。
+\item 中断：外设主动打断 CPU，事件不再只靠轮询。
+\item 定时器：系统获得时间基准和抢占入口。
+\item 任务上下文：程序计数器、寄存器和栈成为可保存对象。
+\item 调度器：多个 runnable 任务按策略共享 CPU。
+\item 同步：共享状态需要互斥、等待谓词和唤醒协议。
+\item 内存保护：地址空间、页表和权限阻止任务互相破坏。
+\item 系统调用：用户程序通过受控入口请求内核操作资源。
+\item 文件和 I/O：设备被包装成对象、句柄、队列和 completion。
+\item 持久化：数据从“写过”推进到“崩溃后仍可解释”。
+\end{enumerate}
+
+这条路线的意义是把 OS 特性从原因中长出来。不是先背“进程、线程、虚拟内存、文件系统”，而是从每个阶段遇到的失败推出下一层机制。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+失败 & 需要的机制 & 新增代价 \\
+\midrule
+轮询浪费 CPU & 中断 & 异步共享状态 \\
+任务死循环霸占 CPU & 定时器抢占 & 上下文保存和调度开销 \\
+任务互相覆盖内存 & 地址空间和权限 & 页表、缺页、TLB 成本 \\
+用户能随便改设备 & 系统调用和特权级 & 入口检查和复制成本 \\
+I/O 等待拖住计算 & 阻塞队列、异步和 completion & 请求身份和 buffer 生命周期 \\
+写一半崩溃 & 日志、fsync、manifest & 写放大和恢复复杂度 \\
+\bottomrule
+\end{longtable}
+
+\section{测试}
+
+OS 理论卷的测试不是只跑程序，而是验证契约。一个合格测试要覆盖正常路径、错误路径和边界路径，并且能指出是哪条不变量断了。
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能把一次系统调用拆成用户态入口、内核对象、权限检查、状态更新和返回值。
+\item 能区分“函数返回成功”“内核接受请求”“设备完成”“业务提交生效”。
+\item 能解释至少一个等待现象：等 CPU、等锁、等页面、等 I/O、等子进程。
+\item 能说明至少一个隔离边界：进程地址空间、文件权限、用户/内核态、namespace。
+\item 能为任意章节机制写出状态、入口、失败和证据四列。
+\end{itemize}
+\end{rubricbox}
+
+反例同样重要。若读者把 fd 当成文件本体，把 \code{write} 成功当成落盘，把线程 ready 当成 running，把 \code{malloc} 成功当成物理页已分配，把 \code{notify\_one} 当成消息投递，就说明 OS 契约还没有建立。

@@ -1,0 +1,279 @@
+\chapter{mmap、page cache 与文件映射}
+
+\section{原理}
+
+\code{read} 和 \code{write} 把文件内容显式复制到用户缓冲区，而 \code{mmap} 把文件区间映射到进程地址空间，让普通 load/store 触发文件页面的调入和回写。它看起来像内存功能，实际是虚拟内存、文件系统和 page cache 的共同契约：VMA 记录虚拟地址区间；page cache 记录文件偏移到物理页的缓存；缺页处理把两者连接起来；写回系统决定脏页何时落盘。
+
+为什么需要 \code{mmap}？第一，它减少系统调用和复制，适合随机访问大文件。第二，它让多个进程共享同一份文件页，天然支持共享库和共享内存。第三，它把文件 I/O 纳入页表权限和缺页机制，统一了“按需加载”。但它也带来更复杂的一致性：一个进程通过 \code{write} 修改文件，另一个进程通过 \code{mmap} 读同一区间，看到的应是同一份 page cache 语义，而不是两个互相独立的缓存。
+
+\begin{keyidea}
+\code{mmap} 不是把文件一次性读进内存，而是建立“虚拟地址 -> 文件偏移 -> page cache 页面”的延迟绑定。
+\end{keyidea}
+
+\code{MAP\_SHARED} 和 \code{MAP\_PRIVATE} 是理解文件映射的分水岭。共享映射的写入会把 page cache 页面标脏，之后由 \code{msync}、\code{fsync} 或后台写回落盘；私有映射初始可共享文件页，但第一次写入触发 COW，产生匿名页，文件本身不被修改。共享库代码段通常是只读文件映射；进程堆和栈通常是匿名映射；数据库会谨慎选择 \code{mmap} 或 direct I/O，因为错误的写回假设会破坏延迟和持久化边界。
+
+\section{实践}
+
+一个教学 \code{mmap} 需要以下对象：
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+对象 & 保存什么 & 不变量 \\
+\midrule
+VMA & 虚拟区间、权限、flags、file、offset & VMA 不重叠，权限不超过文件打开模式 \\
+page table entry & 虚拟页到物理页、权限、dirty/accessed & PTE 权限不能超过 VMA 权限 \\
+page cache page & inode、文件页索引、物理页、dirty、refcount & 同一 inode+index 对应一个缓存页 \\
+anon page & 私有 COW 后的页面 & 不再回写到文件 \\
+writeback item & 脏页、目标块、提交状态 & 写回完成前页面不能被当成干净页回收 \\
+\bottomrule
+\end{longtable}
+
+文件映射缺页路径如下：
+
+\begin{lstlisting}
+handle_page_fault(addr, access):
+  vma = find_vma(current.mm, addr)
+  if vma == null or access not allowed by vma:
+    send_sigsegv()
+  page_index = vma.file_offset_pages + ((addr - vma.start) / PAGE_SIZE)
+  page = page_cache_get_or_load(vma.file, page_index)
+  if access == WRITE and vma.private:
+    page = copy_page(page)
+    mark_anon(page)
+  install_pte(addr, page, pte_prot(vma, access))
+\end{lstlisting}
+
+\code{mmap} 实现中最重要的错误路径是长度、偏移和权限检查。映射长度为零、地址未对齐、偏移未按页对齐、写共享映射但 fd 没有写权限、文件系统不支持映射、区间越过用户地址空间，都必须明确返回错误。不要把所有失败都压成一个 \code{EINVAL}，否则测试和调试会失去边界信息。
+
+\section{算法与实现分析}
+
+\subsection{VMA 查找}
+
+最简单的 VMA 管理可以用按起始地址排序的数组或链表，查找复杂度为 \code{O(n)}。这对教学模型足够，但进程有大量映射时会拖慢 page fault。真实内核会使用树结构，Linux 近年使用 maple tree 管理 VMA，以降低查找、插入和遍历成本。
+
+\begin{lstlisting}
+find_vma(mm, addr):
+  for vma in mm.vmas_by_start:
+    if vma.start <= addr and addr < vma.end:
+      return vma
+    if addr < vma.start:
+      return null
+  return null
+\end{lstlisting}
+
+插入 VMA 时必须检查相邻区间是否可合并。若权限、flags、file 和连续 offset 一致，就可以合并，减少 VMA 数量。若频繁切分和合并出错，会导致 \code{munmap} 后仍然能访问、或合法区间被错误 SIGSEGV。
+
+\subsection{page cache 索引}
+
+page cache 的键通常是 \code{(inode, page\_index)}。这个键保证 \code{read/write} 与 \code{mmap} 共享同一页：
+
+\begin{lstlisting}
+page_cache_get_or_load(file, index):
+  key = (file.inode, index)
+  lock(page_cache.lock)
+  page = radix_tree_lookup(page_cache, key)
+  if page != null:
+    page.refcount++
+    unlock(page_cache.lock)
+    return page
+  page = allocate_page_locked()
+  radix_tree_insert(page_cache, key, page)
+  unlock(page_cache.lock)
+  read_file_page(file, index, page)
+  unlock_page(page)
+  return page
+\end{lstlisting}
+
+这里先插入 locked page，再执行 I/O，是为了阻止多个线程同时读取同一文件页。后来的缺页者发现页面存在但 locked，就等待页面解锁。否则并发 page fault 会造成重复 I/O，甚至最后一个完成者覆盖前一个完成者的状态。
+
+\subsection{shared 与 private 写故障}
+
+写故障要区分三种情况：VMA 不允许写，私有映射需要 COW，共享映射需要让 PTE 可写并跟踪脏页。
+
+\begin{lstlisting}
+handle_write_fault(vma, addr, old_page):
+  if not vma.writable:
+    send_sigsegv()
+  if vma.private:
+    new_page = allocate_page()
+    copy(new_page, old_page)
+    install_pte(addr, new_page, WRITE | USER)
+    put_page(old_page)
+    return
+  mark_page_dirty(old_page)
+  install_pte(addr, old_page, WRITE | USER | SHARED)
+\end{lstlisting}
+
+COW 的复杂度是一次页面复制 \code{O(PAGE\_SIZE)}。它用写时成本换取 fork/exec 和私有映射的低启动成本。共享映射的复杂性则在持久化：PTE dirty、page dirty、文件系统 journal dirty 和块设备队列不是同一件事。用户调用 \code{msync(MS\_SYNC)} 期望脏页写回并等待完成，但这仍不必然等价于包含目录项的业务提交，后者需要文件系统和上层协议共同保证。
+
+\subsection{回收与写回}
+
+内存压力下，干净文件页可以直接回收，因为它们能从文件重新读入；脏文件页必须先写回；匿名页若没有 swap，就不能随意丢弃。
+
+\begin{lstlisting}
+reclaim_page(page):
+  if page.refcount != 0 or page.locked:
+    return BUSY
+  if page.file_backed and not page.dirty:
+    remove_from_page_cache(page)
+    free(page)
+    return OK
+  if page.file_backed and page.dirty:
+    enqueue_writeback(page)
+    return RETRY_LATER
+  if page.anon and swap_available:
+    write_to_swap(page)
+    free(page)
+    return OK
+  return BUSY
+\end{lstlisting}
+
+这个算法说明 page cache 不只是性能缓存，也是内存回收策略的一部分。错误地回收 dirty page 会丢数据；错误地保留所有文件页会让匿名内存被挤爆。
+
+\section{测试}
+
+\begin{enumerate}
+\tightlist
+\item 基本映射：映射文件第一页，读取字节应等于文件内容。
+\item 懒加载：\code{mmap} 后不访问不应触发磁盘读，第一次访问才缺页。
+\item 权限：只读 fd 不能建立可写 \code{MAP\_SHARED}。
+\item 私有写：\code{MAP\_PRIVATE} 写入后文件内容不变。
+\item 共享写：\code{MAP\_SHARED} 写入后 \code{read} 同区间能看到 page cache 更新。
+\item \code{munmap}：解除映射后访问同地址触发 SIGSEGV 或等价错误。
+\item 截断：文件被 truncate 后访问越界映射要触发 SIGBUS 或教学系统定义的文件映射错误。
+\item 回写：脏页经过 \code{msync} 后，模拟块设备能观察到写请求。
+\end{enumerate}
+
+\begin{rubricbox}
+本章合格标准：能画出 VMA、PTE、page cache、inode 的关系；能解释 private/shared 映射的写故障差异；能说明 \code{msync}、\code{fsync} 和业务提交不是同一个边界。
+\end{rubricbox}
+
+\section{源码级补充：do\_mmap、XArray、writeback、O\_DIRECT 与 DAX}
+
+\subsection{do\_mmap 到 mmap\_region}
+
+Linux 的 \code{mmap} 路径会从系统调用参数进入 \code{do\_mmap}，经过权限、地址选择、长度和 flags 校验后，调用 \code{mmap\_region} 建立或合并 VMA。文件映射还会调用 \code{file->f\_op->mmap}，让具体文件系统或设备设置 \code{vm\_ops}。
+
+\begin{lstlisting}
+sys_mmap
+  -> ksys_mmap_pgoff
+  -> vm_mmap_pgoff
+  -> do_mmap
+  -> get_unmapped_area
+  -> mmap_region
+  -> file->f_op->mmap
+\end{lstlisting}
+
+读源码时看 \filepath{mm/mmap.c}、\filepath{mm/filemap.c}。重点关注 \code{vm\_flags}：\code{VM\_READ/WRITE/EXEC/SHARED/MAYWRITE/LOCKED/HUGEPAGE} 等标志共同决定 fault、mprotect、mlock、回收和写回行为。
+
+\subsection{address\_space 与 XArray}
+
+page cache 不挂在 fd 上，而挂在文件的 address\_space 上。一个 inode 的 \code{i\_mapping} 用 XArray 以页索引为 key 保存缓存页或 folio。这样不同进程、不同 fd、read/write/mmap 都能找到同一份文件页。
+
+\begin{lstlisting}
+filemap_fault(vmf):
+  mapping = vmf.vma.file.f_mapping
+  index = offset_to_page_index(vmf.address)
+  folio = xa_load(mapping.i_pages, index)
+  if folio missing:
+    folio = page_cache_sync_readahead(...)
+    read_folio_from_filesystem(...)
+  install_pte(vmf.address, folio)
+\end{lstlisting}
+
+XArray 替代老的 radix tree，支持稀疏索引、并发查找和特殊 entry。读源码时不必先精通 XArray 实现，但要知道 page cache 的 key 是文件偏移，不是虚拟地址。
+
+\subsection{readahead 与访问模式}
+
+顺序读时，内核会预读后续页；随机读时，过度预读会浪费 I/O 和内存。应用可用 \code{madvise} 给出提示：\code{MADV\_SEQUENTIAL}、\code{MADV\_RANDOM}、\code{MADV\_DONTNEED}、\code{MADV\_HUGEPAGE}。
+
+\begin{lstlisting}
+on_page_cache_miss(file, index):
+  if sequential_pattern_detected(file):
+    submit_readahead(index + 1, window)
+  else:
+    read_single_page(index)
+\end{lstlisting}
+
+预读失败案例：数据库随机读大文件，错误地被当成顺序流，page cache 被无用页污染；或者媒体顺序读取未触发预读，设备队列深度上不去。性能报告要注明访问模式和缓存状态。
+
+\subsection{writeback 与错误范围}
+
+脏页写回由 flusher 线程、内存压力、\code{fsync/msync} 等触发。Linux 用 \code{writeback\_control} 描述写回目标，用 address\_space 记录写回错误。一个 \code{write} 成功后发生的异步写回错误，可能在之后的 \code{fsync} 才报告。
+
+\begin{lstlisting}
+fsync(file):
+  filemap_fdatawrite(mapping)
+  filemap_fdatawait(mapping)
+  err = file_check_and_advance_wb_err(file)
+  if err:
+    return err
+  return filesystem_fsync_metadata(file)
+\end{lstlisting}
+
+错误范围跟踪很重要。否则一个进程造成的写回错误可能被另一个不相关进程消费，或者永远没人知道。可靠程序必须检查 \code{fsync} 返回值。
+
+\subsection{O\_DIRECT 和 DAX}
+
+\code{O\_DIRECT} 尝试绕过 page cache，把用户页直接用于块 I/O。它通常要求地址、长度和文件偏移对齐设备或文件系统要求。绕过 page cache 不等于绕过一致性：若同一文件同时被 buffered I/O 和 direct I/O 访问，内核必须同步或失效相关缓存页。
+
+DAX 面向持久内存，允许文件直接映射到持久介质地址，跳过 page cache。这样 load/store 可直接访问持久介质，但持久化顺序、cache flush 和失败原子性更需要应用和文件系统谨慎处理。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+模式 & 优点 & 风险 \\
+\midrule
+buffered I/O & page cache、预读、合并、易用 & 双重缓存、fsync 边界易误解 \\
+\code{O\_DIRECT} & 减少缓存污染，数据库可控 & 对齐、短 I/O、混用一致性复杂 \\
+DAX & 跳过 page cache，低延迟持久内存 & cache flush、持久顺序、硬件依赖强 \\
+\bottomrule
+\end{longtable}
+
+\subsection{截断、SIGBUS 与映射失效}
+
+文件映射后，文件可能被另一个进程 truncate。若映射区间超过新的文件大小，访问超出部分通常触发 \code{SIGBUS}，因为虚拟地址属于 VMA，但背后的文件页不再存在。这和访问完全未映射地址的 \code{SIGSEGV} 不同。
+
+\begin{lstlisting}
+file_truncate(inode, new_size):
+  invalidate page cache pages beyond new_size
+  unmap mappings beyond new_size or mark invalid
+  wake waiters
+
+fault_mapped_file(addr):
+  if page_index beyond inode.size:
+    signal(SIGBUS)
+\end{lstlisting}
+
+这个边界常被忽略。mmap 程序不能假设映射后文件大小永远不变，尤其是共享文件、日志文件和被管理进程替换的文件。
+
+\subsection{msync、fsync 和 fdatasync}
+
+\code{msync} 面向映射区间，把 dirty mapped pages 写回；\code{fsync} 面向文件，等待文件数据和必要元数据持久；\code{fdatasync} 通常只保证读取文件数据所需的元数据。它们重叠但不等价。
+
+\begin{longtable}{p{0.2\linewidth}p{0.52\linewidth}}
+\toprule
+接口 & 语义重点 \\
+\midrule
+\code{msync} & 映射页写回，可按地址范围控制 \\
+\code{fsync} & 文件数据和必要元数据持久化 \\
+\code{fdatasync} & 文件数据和读取必需元数据，不一定同步所有时间戳 \\
+\code{syncfs} & 某挂载文件系统的脏数据同步 \\
+\bottomrule
+\end{longtable}
+
+数据库和存储服务必须明确使用哪个边界。只调用 \code{msync} 某段映射，不一定同步目录项或业务 manifest；只调用 \code{fsync} 文件，不一定说明应用的多文件事务已提交。
+
+\subsection{userfaultfd 和用户态缺页处理}
+
+userfaultfd 允许用户态接管某些缺页事件，用于虚拟机迁移、按需加载和用户态分页。内核把 fault 事件交给用户态管理进程，后者填充页面并唤醒 faulting 线程。
+
+\begin{lstlisting}
+fault on registered range:
+  kernel queues userfault event
+  faulting thread sleeps
+  pager reads event
+  pager copies page data into address
+  pager wakes faulting thread
+\end{lstlisting}
+
+这个机制说明 page fault 不只属于内核内部，也可以成为用户态系统软件的接口。但它要求严格权限和资源控制，否则恶意 pager 可以让线程永久睡眠或制造内存压力。

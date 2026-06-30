@@ -1,0 +1,277 @@
+\chapter{socket、网络入口与内核边界}
+
+\section{原理}
+
+网络系统会在第三册展开，本章只讲操作系统必须提供的网络入口：socket 为什么是 fd，连接和监听如何变成内核对象，阻塞和非阻塞 I/O 如何与调度器协作，\code{poll/epoll} 为什么不是“循环 read”的语法糖。把 socket 放在文件描述符模型里，是 Unix 设计的强大统一：进程用 fd 表引用网络端点，权限、关闭、继承、阻塞、异步通知和事件等待都能复用已有 OS 机制。
+
+socket 与普通文件的差异在于它不是稳定字节数组，而是协议状态机和队列集合。TCP socket 至少包含发送缓冲、接收缓冲、连接状态、重传计时器、拥塞控制状态和等待队列。UDP socket 没有连接字节流，但有端口绑定、报文边界和接收队列。应用看到的是 \code{send/recv}，内核维护的是协议栈状态、网卡队列和计时器。
+
+\begin{keyidea}
+socket 是 fd 表中的一个内核对象，但它的可读可写由协议状态、缓冲区、水位线和错误队列共同决定。
+\end{keyidea}
+
+网络入口必须先把 OS 契约讲清楚，再进入协议细节。阻塞 \code{recv} 在没有数据时会让线程睡在 socket 等待队列；非阻塞 \code{recv} 返回 \code{EAGAIN}；\code{poll} 把“是否可读可写”注册为等待条件；\code{epoll} 用就绪队列降低大量 fd 的重复扫描成本。这些都是调度、等待队列和 fd 生命周期的延伸。
+
+\section{实践}
+
+最小 socket 子系统可以包含：
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+对象 & 作用 & 不变量 \\
+\midrule
+socket fd & 进程引用网络端点的句柄 & fd 引用有效时 socket refcount 大于零 \\
+socket object & 保存协议族、类型、状态、ops & 状态决定允许的系统调用 \\
+bind table & 本地地址端口到 socket 的映射 & 同一四元组不能被非法重复绑定 \\
+listen queue & 半连接和已完成连接队列 & backlog 限制必须生效 \\
+send buffer & 用户写入但未发送或未确认的数据 & 字节数受 SO\_SNDBUF 限制 \\
+receive buffer & 已到达但未被用户读取的数据 & 可读事件与缓冲水位一致 \\
+\bottomrule
+\end{longtable}
+
+典型 TCP 服务端路径：
+
+\begin{lstlisting}
+s = socket(AF_INET, SOCK_STREAM)
+bind(s, 0.0.0.0:8080)
+listen(s, backlog=128)
+while true:
+  c = accept(s)
+  handle_client(c)
+\end{lstlisting}
+
+内核对应状态是：\code{socket} 创建未绑定对象；\code{bind} 加入端口表；\code{listen} 把对象转成监听状态并初始化队列；三次握手完成后，新连接进入 accept queue；\code{accept} 取出一个已完成连接，创建新的 fd 指向新的 connected socket。监听 socket 和连接 socket 不是同一个对象。
+
+\section{算法与实现分析}
+
+\subsection{bind 冲突检查}
+
+端口绑定要考虑地址、端口、协议、reuse 标志和 namespace。教学模型可以先实现严格唯一：
+
+\begin{lstlisting}
+bind(sock, local_addr):
+  lock(bind_table.lock)
+  if bind_table.contains(sock.netns, sock.proto, local_addr):
+    unlock(bind_table.lock)
+    return EADDRINUSE
+  sock.local = local_addr
+  sock.state = BOUND
+  bind_table.insert(sock)
+  unlock(bind_table.lock)
+  return OK
+\end{lstlisting}
+
+真实系统的 \code{SO\_REUSEADDR} 和 \code{SO\_REUSEPORT} 会放宽规则，但不能简化成“允许重复”。复用规则还要区分监听 socket、已连接四元组、TIME\_WAIT 和负载均衡策略。先掌握严格唯一模型，再扩展复用规则，能避免把安全边界讲错。
+
+\subsection{listen 与 accept 队列}
+
+监听 socket 有两个不同队列：握手未完成的半连接队列，以及握手完成等待用户 accept 的队列。简化模型可以只保留完成队列：
+
+\begin{lstlisting}
+tcp_connection_established(listener, child):
+  lock(listener.lock)
+  if listener.acceptq.len == listener.backlog:
+    drop_or_reset(child)
+  else:
+    enqueue(listener.acceptq, child)
+    wake_waiters(listener.read_waitq)
+  unlock(listener.lock)
+
+accept(listener):
+  lock(listener.lock)
+  while empty(listener.acceptq):
+    if listener.nonblock:
+      unlock(listener.lock)
+      return EAGAIN
+    sleep_on(listener.read_waitq, listener.lock)
+  child = dequeue(listener.acceptq)
+  fd = install_fd(child)
+  unlock(listener.lock)
+  return fd
+\end{lstlisting}
+
+不变量是：accept queue 中的 child socket 已经是 connected 状态；队列非空时监听 socket 对 \code{poll} 表现为可读；关闭监听 socket 必须唤醒等待 \code{accept} 的线程并让它们返回错误。
+
+\subsection{send/recv 与背压}
+
+发送路径不是把用户数据直接交给网卡。数据先进入 socket send buffer，再由协议栈分段、排队、重传和确认。
+
+\begin{lstlisting}
+send(sock, user_buf, len):
+  copied = 0
+  lock(sock.lock)
+  while copied < len:
+    space = sock.sndbuf_limit - sock.sndbuf_used
+    if space == 0:
+      if sock.nonblock:
+        break_or_EAGAIN(copied)
+      sleep_on(sock.write_waitq, sock.lock)
+      continue
+    n = min(space, len - copied)
+    copy_from_user_into_skb(sock, user_buf + copied, n)
+    copied += n
+    tcp_push_pending(sock)
+  unlock(sock.lock)
+  return copied
+\end{lstlisting}
+
+这段伪代码解释短写：阻塞 socket 通常尽量等待空间，非阻塞 socket 在缓冲区满时可能只写入部分数据或返回 \code{EAGAIN}。接收路径类似：接收缓冲为空时阻塞或返回 \code{EAGAIN}；对 TCP 返回字节流，对 UDP 每次读取保留报文边界语义。
+
+\subsection{poll 与 epoll}
+
+朴素 \code{poll} 每次扫描 fd 数组，复杂度 \code{O(n)}：
+
+\begin{lstlisting}
+poll(fds, timeout):
+  ready = []
+  for fd in fds:
+    mask = fd.file.ops.poll(fd.file)
+    if mask != 0:
+      ready.append((fd, mask))
+  if ready not empty:
+    return ready
+  register_waiters(fds, current)
+  schedule_timeout(timeout)
+  retry scan
+\end{lstlisting}
+
+\code{epoll} 把关注集合保存在内核中。当 socket 状态变化时，回调把对应 epitem 放入 ready list，用户调用 \code{epoll\_wait} 主要消费 ready list。这样大量空闲连接不会每次都被全量扫描。
+
+\begin{lstlisting}
+socket_state_change(sock):
+  for epitem in sock.poll_subscribers:
+    if sock.poll_mask & epitem.interest:
+      enqueue_once(epitem.epoll.ready_list, epitem)
+      wake_waiters(epitem.epoll.waitq)
+\end{lstlisting}
+
+边沿触发和水平触发的区别也来自 ready 条件。水平触发下，只要缓冲区仍有数据，下一次等待还会报告；边沿触发只在状态从不可读变可读时报告，用户必须一直读到 \code{EAGAIN}，否则可能再也收不到事件。
+
+\subsection{TCP 状态边界}
+
+操作系统教材不必在本册完整推导 TCP，但要能解释 socket 系统调用面对的状态：
+
+\begin{longtable}{p{0.2\linewidth}p{0.32\linewidth}p{0.34\linewidth}}
+\toprule
+状态 & 用户可见行为 & 内核重点 \\
+\midrule
+LISTEN & 可 accept，不能普通 recv 数据 & accept queue、backlog、SYN 处理 \\
+SYN-SENT & connect 进行中 & 超时、错误返回、非阻塞完成事件 \\
+ESTABLISHED & 可 send/recv & 缓冲、重传、拥塞控制、窗口 \\
+FIN-WAIT/CLOSE-WAIT & 半关闭 & EOF、shutdown、剩余数据读取 \\
+TIME-WAIT & fd 通常已关但四元组保留 & 防旧包污染新连接 \\
+\bottomrule
+\end{longtable}
+
+\section{测试}
+
+\begin{enumerate}
+\tightlist
+\item fd 生命周期：dup socket 后关闭一个 fd，连接对象不能提前释放。
+\item bind 冲突：同一地址端口重复绑定应失败，释放后可再次绑定。
+\item listen backlog：超过 backlog 的完成连接必须被拒绝或延迟，不能无限增长。
+\item accept 阻塞：无连接时阻塞，有连接到达后唤醒；非阻塞返回 \code{EAGAIN}。
+\item send 背压：发送缓冲满时阻塞或短写，空间释放后唤醒写等待者。
+\item recv EOF：对端关闭后，已缓冲数据读完再返回 EOF。
+\item poll 水平触发：缓冲仍有数据时重复报告可读。
+\item epoll 边沿触发：未读尽数据时不会凭空产生新边沿事件。
+\end{enumerate}
+
+\begin{rubricbox}
+本章合格标准：能说明 socket 为什么是 fd；能画出 bind/listen/accept/connect/send/recv 的对象变化；能解释阻塞、非阻塞、poll、epoll 的等待语义。
+\end{rubricbox}
+
+\section{源码级补充：sk\_buff、协议栈入口、NAPI 与 Netfilter}
+
+\subsection{sk\_buff 是网络栈的“页”和“bio”}
+
+Linux 网络栈中，\code{sk\_buff} 是数据包在内核中的主要载体。它不仅保存字节，还保存协议头指针、校验和状态、路由信息、引用计数、分片信息和共享数据区。理解 skb，才能把驱动、协议栈和 socket 接起来。
+
+\begin{lstlisting}
+sk_buff:
+  head, data, tail, end
+  len, data_len
+  mac_header, network_header, transport_header
+  dev, sk
+  checksum state
+  shared_info: fragments, gso, refcount
+\end{lstlisting}
+
+\code{skb\_clone} 共享数据但复制元数据，\code{skb\_copy} 复制数据，\code{kfree\_skb} 释放引用。性能问题常来自不必要 copy；正确性问题常来自共享 skb 被误写、引用计数错误或线性区和 fragment 区理解错误。
+
+\subsection{接收路径：从 NAPI 到 socket 队列}
+
+高吞吐网络接收通常走 NAPI。中断只负责调度 poll，poll 在 budget 内批量取包，把 skb 送入协议栈。
+
+\begin{lstlisting}
+nic_interrupt:
+  disable_rx_interrupt()
+  napi_schedule()
+
+napi_poll(budget):
+  while work < budget and rx_desc_ready:
+    skb = build_skb_from_rx_desc()
+    napi_gro_receive(skb)
+  if no_more_work:
+    napi_complete()
+    enable_rx_interrupt()
+
+ip_rcv -> tcp_v4_rcv -> tcp_v4_do_rcv
+  -> append to socket receive queue
+  -> wake waiters
+\end{lstlisting}
+
+GRO 可以把多个小包合并成较大 skb，降低协议栈成本；但它也改变了观测粒度。抓包、trace 和应用 recv 的边界不一定一一对应。测试网络栈时要区分 wire packet、skb、TCP segment 和应用读出的字节。
+
+\subsection{发送路径：tcp\_sendmsg 到驱动队列}
+
+发送路径从用户 buffer 复制或引用到 skb，进入 TCP 发送队列，按拥塞窗口、接收窗口和 MSS 分段，最后到 qdisc 和驱动。
+
+\begin{lstlisting}
+sendmsg
+  -> inet_sendmsg
+  -> tcp_sendmsg
+  -> copy into skb or attach pages
+  -> tcp_push_pending_frames
+  -> ip_queue_xmit
+  -> qdisc enqueue/dequeue
+  -> dev_queue_xmit
+  -> driver ndo_start_xmit
+\end{lstlisting}
+
+这个路径解释了 send 成功的边界：数据进入本机 TCP 发送状态，不等于对端应用收到，更不等于业务提交。若连接稍后 reset，应用必须根据协议状态判断请求是否需要重试。
+
+\subsection{Netfilter hook 点}
+
+Netfilter 在 IP 路径上提供 hook：PRE\_ROUTING、LOCAL\_IN、FORWARD、LOCAL\_OUT、POST\_ROUTING。防火墙、NAT、容器端口映射和连接跟踪都依赖这些点。
+
+\begin{longtable}{p{0.24\linewidth}p{0.5\linewidth}}
+\toprule
+hook & 典型用途 \\
+\midrule
+\code{NF\_INET\_PRE\_ROUTING} & 入站后、路由前，DNAT、早期过滤 \\
+\code{NF\_INET\_LOCAL\_IN} & 目的地是本机，进入 socket 前过滤 \\
+\code{NF\_INET\_FORWARD} & 转发路径过滤 \\
+\code{NF\_INET\_LOCAL\_OUT} & 本机发出包，路由后处理 \\
+\code{NF\_INET\_POST\_ROUTING} & 出站前，SNAT、最后修改 \\
+\bottomrule
+\end{longtable}
+
+Netfilter 让网络语义不仅由 socket 代码决定，还受规则表、namespace、连接跟踪和 NAT 影响。诊断“包为什么没到应用”时，要检查驱动、IP、路由、Netfilter、socket 绑定和应用读取，而不是只看一个层次。
+
+\subsection{socket option 与内核策略}
+
+socket option 是应用调整内核协议策略的入口。例如 \code{SO\_RCVBUF} 和 \code{SO\_SNDBUF} 控制缓冲区，\code{TCP\_NODELAY} 影响 Nagle，\code{SO\_REUSEPORT} 允许多个监听 socket 分担连接，\code{SO\_KEEPALIVE} 打开保活探测。
+
+\begin{longtable}{p{0.24\linewidth}p{0.46\linewidth}p{0.18\linewidth}}
+\toprule
+选项 & 影响 & 风险 \\
+\midrule
+\code{TCP\_NODELAY} & 小包立即发送 & 更多包，可能降低吞吐 \\
+\code{SO\_REUSEPORT} & 多 socket 绑定同端口 & 负载分配和安全检查更复杂 \\
+\code{SO\_RCVBUF} & 接收缓冲上限 & 太小丢吞吐，太大耗内存 \\
+\code{SO\_LINGER} & close 时处理未发送数据 & 可能阻塞或丢弃 \\
+\bottomrule
+\end{longtable}
+
+选项不是调优魔法。每个选项都改变状态机和资源边界，必须通过负载测试和故障测试验证。

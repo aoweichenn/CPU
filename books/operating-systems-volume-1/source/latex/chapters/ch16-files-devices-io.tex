@@ -1,0 +1,145 @@
+\chapter{文件、设备与 I/O}
+
+\section{原理}
+
+文件描述符是用户态访问内核对象的句柄。它可以指向普通文件、管道、socket、设备或匿名内核对象。进程拿到的是一个小整数，但内核维护的是对象、offset、权限、引用计数和关闭状态。
+
+文件 I/O 的第一层对象关系是：路径字符串经过路径解析找到目录项和 inode；\code{open} 产生 open file description；进程 fd 表保存一个小整数到 open file description 的引用。\code{dup} 产生新的 fd，但通常仍指向同一个 open file description，因此共享 offset 和状态。再次 \code{open} 同一路径通常产生新的 open file description，因此 offset 分离。
+
+普通文件读写经常经过 page cache。读命中 page cache 时不碰设备；读未命中时可能提交块设备请求并等待完成。写通常先把用户字节复制进 page cache，把页标记为 dirty，再由后台 writeback 或 \code{fsync} 推进到设备。\code{write} 返回不等于数据安全落盘，这一点必须反复强调。
+
+设备可以看作有特殊行为的文件对象。终端、磁盘、网卡、timerfd、eventfd、epoll、pipe、socket 都可以放进 fd/event 模型，但它们的 read/write 语义不同：有的返回字节流，有的返回结构化事件，有的可能阻塞，有的可能短读短写，有的只表示 readiness。
+
+阻塞、非阻塞和异步是三种控制流模型。阻塞 I/O 让当前线程睡眠直到有结果；非阻塞 I/O 在不能推进时返回 \code{EAGAIN}，调用者等待 readiness 后重试；异步 I/O 提交请求，completion 稍后返回结果。三者没有绝对高低，关键是请求身份、buffer 生命周期、短读短写、错误传播和背压。
+
+背压是 I/O 系统的安全阀。无界队列能让短 benchmark 看起来很快，因为生产者从不等待；一旦设备变慢，内存会持续增长，尾延迟扩大，最终进程可能被杀。可靠系统要同时限制 item 数、字节数和 in-flight 请求数，并在关闭时 drain 或 cancel。
+
+\section{实践}
+
+纸上实践一：画 fd 引用图。
+
+\begin{lstlisting}
+process fd table:
+  fd 3 -> open file description A -> inode X
+  fd 4 -> open file description A -> inode X   # dup
+  fd 5 -> open file description B -> inode X   # open same path again
+\end{lstlisting}
+
+这张图能解释 offset 行为：fd 3 和 fd 4 共享 offset，fd 5 有独立 offset。并行文件读取如果使用 fd 3 和 fd 4，就可能因为共享 offset 得到不可预期的分片；使用 \code{pread} 或独立 open file description 更清楚。
+
+纸上实践二：写出短写循环。任何 \code{write} 都可能只写入一部分字节，尤其是 pipe、socket、非阻塞 fd 或被信号打断时。正确代码必须记录已完成字节数，继续写剩余部分，遇到 \code{EINTR} 重试，遇到 \code{EAGAIN} 进入等待，而不是把短写当成完整成功。
+
+纸上实践三：区分 readiness 和 message。\code{epoll} 告诉你 fd 可能可读或可写，不告诉你协议帧已经完整。网络程序必须有用户态 receive buffer、解析状态机和背压策略。把 fd readiness 当成完整请求，是事件驱动程序常见错误。
+
+\begin{lstlisting}
+PreparedBuffer
+  -> Submitted
+  -> InFlight
+  -> Completed(bytes, error)
+  -> ConsumedByProtocol
+  -> BufferReleased
+\end{lstlisting}
+
+异步 I/O 中，buffer 在 completion 前不能被上游复用；completion 失败不能被提交路径吞掉；cancel 后也可能收到迟到 completion，所以请求身份必须稳定。
+
+\section{算法与实现分析}
+
+\subsection{fd 分配表}
+
+进程的 fd table 可以先看作数组：下标是 fd，元素是指向 open file description 的引用。open 要找最小空闲 fd；close 清空槽位并减少引用计数；dup 找新槽位并增加引用计数。
+
+\begin{lstlisting}
+alloc_fd(file):
+  for i in 0..max_fd:
+    if table[i] == null:
+      table[i] = file
+      file.refcount += 1
+      return i
+  return -EMFILE
+
+close(fd):
+  file = table[fd]
+  if file == null: return -EBADF
+  table[fd] = null
+  file.refcount -= 1
+  if file.refcount == 0:
+    file.ops.release(file)
+\end{lstlisting}
+
+线性扫描是 \code{O(n)}，但简单。真实系统会用 bitmap 或 hint 记录下一个可能空闲位置，把常见分配降到接近 \code{O(1)}。无论怎么优化，不变量都是：fd 只是进程局部索引，open file description 才保存 offset、flags 和对象引用。
+
+\subsection{路径解析}
+
+路径解析把字符串变成目录项和 inode。绝对路径从根目录开始，相对路径从当前工作目录开始；每个路径分量都要查目录；遇到符号链接可能要跳转；权限和 mount namespace 会改变可见结果。
+
+\begin{lstlisting}
+resolve(path):
+  node = path.starts_with("/") ? root : current.cwd
+  for component in split(path, "/"):
+    if component == "." continue
+    if component == "..": node = node.parent
+    else:
+      node = lookup_child(node, component)
+      if node is symlink:
+        node = resolve_symlink(node)
+  return node
+\end{lstlisting}
+
+路径解析的复杂度大致和路径分量数相关，每个目录查找又取决于文件系统目录结构。缓存 dentry 可以避免每次都从磁盘读目录。安全实现还要限制符号链接递归深度，避免循环。
+
+\subsection{page cache 读写}
+
+普通文件读路径先查 page cache。若缓存命中，从内核页复制到用户 buffer；若未命中，分配 page cache 页，提交块 I/O，等待完成，再复制。写路径通常复制用户数据到 page cache，标记 dirty，并在之后由 writeback 或 fsync 推进设备写。
+
+\begin{lstlisting}
+buffered_read(file, offset, len):
+  while len > 0:
+    page_index = offset / PAGE_SIZE
+    page = page_cache_lookup(file, page_index)
+    if page == null:
+      page = read_page_from_storage(file, page_index)
+    n = copy_page_to_user(page, offset % PAGE_SIZE, len)
+    offset += n
+    len -= n
+\end{lstlisting}
+
+这个算法解释了冷读和热读差异。热读可能完全不碰设备；冷读可能等待存储。benchmark 若不说明缓存状态，就无法比较。
+
+\subsection{设备队列和完成}
+
+块设备、网卡和异步 I/O 都可以抽象成提交队列和完成队列。提交时生成 request，放入设备或驱动队列；完成时中断或轮询拿到结果，唤醒等待任务或投递 completion。
+
+\begin{lstlisting}
+submit(req):
+  req.id = next_id()
+  req.state = IN_FLIGHT
+  device_queue.push(req)
+  kick_device()
+
+complete(req_id, status, bytes):
+  req = lookup(req_id)
+  req.status = status
+  req.bytes = bytes
+  req.state = COMPLETED
+  wake(req.waiter)
+\end{lstlisting}
+
+请求身份非常重要。异步完成可能乱序返回；取消后的请求也可能迟到完成；buffer 所有权必须跟着请求身份走。没有 request id，就无法把 completion 正确对应到提交者。
+
+\section{测试}
+
+测试覆盖 open/write/read、dup 后共享内容、close 一个 fd 后另一个 fd 仍有效、关闭所有引用后访问失败、未知 fd 返回诊断。还要测试 fd 分配单调或复用策略是否有明确规则。
+
+\begin{itemize}
+\tightlist
+\item \code{dup} 后 offset 共享，独立 \code{open} 后 offset 分离。
+\item \code{pread} 不改变 current offset。
+\item pipe 空读阻塞或非阻塞返回 \code{EAGAIN}，写端关闭后读端得到 EOF。
+\item 读端关闭后写 pipe 失败，不应静默丢数据。
+\item socket 或 pipe 短写后，调用者继续写剩余字节。
+\item readiness 事件只触发解析尝试，不被当成完整消息。
+\item 异步请求完成前，buffer 所有权不能释放。
+\item 队列达到字节上限时，生产者受到背压。
+\end{itemize}
+
+第一版必须先保证句柄生命周期可解释。持久化和崩溃恢复放到下一章单独讨论。

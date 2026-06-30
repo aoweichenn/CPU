@@ -1,0 +1,318 @@
+\section{安全与观测深讲：没有证据就没有边界}
+
+安全和可观测性必须一起讲。权限检查失败时，要能证明没有改变目标对象；进程被 seccomp 拒绝时，要能看到拒绝的系统调用；cgroup 限制触发时，要能解释是内存、CPU 还是进程数限制；panic 发生时，要保留足够证据。没有观测能力，安全边界只能靠想象。
+
+\subsection{威胁模型写法}
+
+安全分析应先写威胁模型，而不是先列工具名。
+
+\begin{lstlisting}
+Threat model:
+  attacker controls:
+    HTTP request body and headers
+    uploaded file content
+  attacker does not control:
+    service binary
+    kernel code
+    host root credentials
+  assets:
+    user database
+    service token
+    host filesystem
+  required boundaries:
+    process cannot read host secrets
+    process cannot mount or ptrace
+    process cannot consume unlimited memory
+\end{lstlisting}
+
+这样才能判断 namespace、cgroup、capability、seccomp 和文件权限各自解决哪一部分问题。否则“用了容器”不等于安全，“用了 seccomp”也不等于安全。
+
+\subsection{最小权限的阶段化}
+
+服务启动阶段和运行阶段需要的权限不同。启动可能需要读取配置、绑定端口、打开日志；运行时只需要处理已有 fd 和少量系统调用。权限应随阶段下降。
+
+\begin{lstlisting}
+startup:
+  read config
+  bind port 80
+  open log file
+
+drop:
+  chroot or mount namespace
+  drop capabilities
+  set no_new_privs
+  install seccomp allowlist
+  enter cgroup limits
+
+serve:
+  accept, read, write, epoll, futex, clock
+\end{lstlisting}
+
+权限下降要可测试。测试不应只证明正常请求成功，还要证明 \code{mount}、\code{ptrace}、打开宿主敏感路径、超额 fork 和超额内存分配都会失败。
+
+\subsection{错误路径的证据}
+
+错误路径也要写日志和计数器，但不能泄露敏感信息。比如权限拒绝应记录主体、对象类型、操作和拒绝原因，但不应把密钥内容写入日志。panic 记录寄存器、栈、锁和任务状态，但不能依赖复杂文件系统路径。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+事件 & 必要证据 & 避免 \\
+\midrule
+权限拒绝 & uid、capability、对象类型、操作 & 打印敏感文件内容 \\
+OOM & cgroup、进程、内存统计、victim & 只写 killed without reason \\
+seccomp 拒绝 & syscall number、action、pid & 静默杀进程无诊断 \\
+panic & 原因、CPU、寄存器、栈、锁 & panic 路径做复杂阻塞 I/O \\
+\bottomrule
+\end{longtable}
+
+\subsection{从现象到证据链}
+
+一个好的 OS 调试结论要形成证据链。
+
+\begin{lstlisting}
+Symptom:
+  p99 latency increased from 50ms to 2s
+
+Evidence chain:
+  application trace: requests stuck in write phase
+  syscall trace: fsync takes 1.8s
+  kernel metrics: dirty pages high
+  block trace: queue depth high, flush waits long
+  conclusion: tail latency dominated by storage flush
+\end{lstlisting}
+
+这种报告比“怀疑磁盘慢”有用，因为它说明了每一层的证据和排除方向。若没有 syscall trace，也可能是应用锁；若没有 block trace，也可能是文件系统 journal；证据链让下一步实验明确。
+
+\subsection{安全与观测练习}
+
+\begin{enumerate}
+\tightlist
+\item 写一个网络服务的威胁模型，列出攻击者能控制和不能控制的对象。
+\item 设计 seccomp allowlist，并说明正常路径需要哪些系统调用。
+\item 构造权限拒绝测试，证明失败时目标文件没有被创建或截断。
+\item 写一份 OOM 诊断报告，包含 cgroup、进程和内存统计。
+\item 给一次 panic 设计最小 crash dump 字段。
+\end{enumerate}
+
+\subsection{安全边界的测试矩阵}
+
+安全机制必须能被测试。下面是一组最小矩阵：
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+边界 & 测试 & 期望 \\
+\midrule
+页表隔离 & 用户态读内核地址 & page fault 或进程终止 \\
+文件权限 & 无权限 open/write & 返回拒绝且目标不变 \\
+capability & drop 后执行特权操作 & 返回 \code{EPERM} \\
+namespace & 访问不可见路径或进程 & 不可见或返回不存在 \\
+cgroup & 超过内存或进程限制 & OOM/失败限制在 cgroup 内 \\
+seccomp & 调用禁止 syscall & 按策略返回 errno 或杀进程 \\
+观测 & 触发拒绝和 OOM & 日志/计数器能解释原因 \\
+\bottomrule
+\end{longtable}
+
+测试安全时要检查“没有发生什么”。权限拒绝后文件不能被截断；seccomp 拒绝后进程不能完成危险操作；cgroup OOM 不能扩大成宿主全局 OOM。负面保证是安全测试的核心。
+
+\subsection{可观测性常见误区}
+
+\begin{warningbox}
+\begin{itemize}
+\tightlist
+\item CPU 低不代表系统没压力，可能都在 off-CPU 等 I/O 或锁。
+\item RSS 增长不一定是泄漏，可能是 page cache、arena 或 mmap。
+\item p99 变差不一定是平均路径慢，可能是少数 fsync、reclaim 或锁等待。
+\item 日志多不等于可观测，结构化字段和请求身份更重要。
+\item 没有反证的结论只是猜测。
+\end{itemize}
+\end{warningbox}
+
+\subsection{本章小结}
+
+\begin{itemize}
+\tightlist
+\item 安全需要威胁模型，不能只列机制名。
+\item 最小权限要随阶段下降，并用测试证明危险操作失败。
+\item 错误路径必须留下足够证据，但不能泄露敏感数据。
+\item 调试报告要形成现象、证据、反证、结论和边界的链条。
+\item 安全和可观测性互相支撑：看不见的边界很难被信任。
+\end{itemize}
+
+\subsection{访问控制：主体、客体、操作和上下文}
+
+权限判断可以抽象成四元组：主体是谁，客体是什么，操作是什么，上下文是什么。主体可能是 uid、gid、capability、进程安全标签或容器身份；客体可能是 inode、socket、进程、设备或命名空间对象；操作是 read、write、execute、mount、ptrace 等；上下文包括路径、挂载选项、是否 setuid、是否处于用户命名空间等。
+
+\begin{lstlisting}
+may_access(subject, object, operation, context):
+  if object.type == inode:
+    if dac_denies(subject.uid, object.mode, operation):
+      if !has_capability(subject, override_cap(operation)):
+        return DENY
+  if lsm_policy_denies(subject.label, object.label, operation):
+    return DENY
+  if mount_flags_deny(context.mount, operation):
+    return DENY
+  return ALLOW
+\end{lstlisting}
+
+真实系统通常叠加多层策略：传统 UNIX DAC、capability、ACL、LSM、namespace 边界和挂载选项。安全 bug 常来自只检查其中一层，或在路径解析和最终对象使用之间发生 TOCTOU。正确做法是尽量在持有对象引用后检查权限，并让检查结果绑定到实际对象而不是字符串路径。
+
+\subsection{capability：把 root 权限拆小}
+
+传统 root 权限过大。capability 把特权拆成多个位，例如绑定低端口、修改网络配置、加载模块、改变文件所有者、绕过 DAC 等。服务启动时可能短暂需要某些 capability，运行时应丢弃。
+
+\begin{longtable}{p{0.28\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+能力类型 & 能做什么 & 风险 \\
+\midrule
+\code{CAP\_NET\_BIND\_SERVICE} & 绑定低端口 & 可在启动后丢弃 \\
+\code{CAP\_SYS\_ADMIN} & 大量系统管理操作 & 过大，接近半个 root \\
+\code{CAP\_SYS\_PTRACE} & 调试或观察其他进程 & 可读敏感内存 \\
+\code{CAP\_DAC\_OVERRIDE} & 绕过文件权限检查 & 可读写本不该访问的文件 \\
+\code{CAP\_NET\_ADMIN} & 改网络接口和路由 & 可影响宿主网络 \\
+\bottomrule
+\end{longtable}
+
+最小权限不是“非 root 运行”一句话。一个非 root 进程若仍有危险 capability，仍可能扩大影响面。反过来，一个 root 启动的进程若完成初始化后清空 capability、设置 \code{no\_new\_privs} 并进入受限 namespace，风险会显著降低。
+
+\subsection{namespace：隔离名字，不隔离内核}
+
+namespace 改变进程看到的名字空间：mount namespace 改变路径树，pid namespace 改变进程编号视图，net namespace 改变网络设备和路由视图，uts namespace 改变 hostname，ipc namespace 改变 System V/POSIX IPC 视图，user namespace 改变 uid/gid 映射。
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
+\toprule
+namespace & 隔离内容 & 仍然共享 \\
+\midrule
+mount & 文件系统挂载视图 & 同一内核 VFS 和底层设备风险 \\
+pid & 进程编号和父子视图 & 调度器、内核内存、系统调用实现 \\
+net & 网卡、路由、端口空间 & 协议栈代码和内核漏洞面 \\
+user & uid/gid 映射和部分能力 & 内核仍必须正确限制能力转换 \\
+ipc & IPC 对象名字空间 & 内核 IPC 实现 \\
+\bottomrule
+\end{longtable}
+
+容器不是虚拟机，因为容器共享宿主内核。namespace 隔离的是名字和视图，不是内核代码本身。若内核某系统调用存在提权漏洞，容器内进程可能利用同一个内核漏洞逃逸。因此容器安全通常要叠加 seccomp、capability、只读挂载、cgroup 和及时更新内核。
+
+\subsection{cgroup：资源边界也是安全边界}
+
+没有资源限制，攻击者可以通过 fork bomb、内存耗尽、磁盘写满或 CPU 忙等影响整机。cgroup 给进程集合设置资源边界，例如 CPU 权重/配额、内存上限、进程数、I/O 权重和设备访问。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+资源 & 没有限制的风险 & 期望证据 \\
+\midrule
+CPU & 忙等拖慢其他服务 & throttled time、quota hit 计数 \\
+memory & OOM 扩散到宿主 & cgroup OOM 事件、victim、统计 \\
+pids & fork bomb 填满进程表 & pids.current/max、fork 失败 \\
+I/O & 大量写回拖慢共享磁盘 & io latency、队列深度、权重 \\
+devices & 访问宿主敏感设备 & 设备拒绝日志和 errno \\
+\bottomrule
+\end{longtable}
+
+资源限制要和观测一起配置。只设置 memory.max 但不记录 OOM 事件，故障时只能看到进程消失；只设置 CPU quota 但不看 throttled time，容易误判成应用锁或网络慢。
+
+\subsection{seccomp：收缩系统调用面}
+
+seccomp 允许进程限制自己可调用的系统调用。最小化系统调用面能减少内核攻击入口。网络服务正常处理请求可能只需要 \code{read/write/recv/send/epoll/futex/clock/mmap/brk/close} 等有限集合，不应该在运行阶段调用 \code{mount}、\code{ptrace}、\code{init\_module}。
+
+\begin{lstlisting}
+seccomp_policy:
+  allow read, write, close
+  allow epoll_wait, epoll_ctl
+  allow recvfrom, sendto, accept4
+  allow futex, clock_gettime
+  allow mmap, munmap, brk
+  deny mount, ptrace, bpf, init_module
+\end{lstlisting}
+
+allowlist 要从实际 trace 推导，而不是凭感觉写。测试时先在日志模式收集正常路径系统调用，再切到拒绝模式；同时要测试危险调用确实失败。seccomp 失败动作也要明确：返回 errno、kill 线程、kill 进程或记录审计。
+
+\subsection{安全日志：可审计但不泄密}
+
+安全事件日志需要足够结构化，便于按主体、对象、操作和原因查询。日志字段应包含 request id、pid、uid、容器/cgroup、操作、对象标识、策略名称和结果。敏感数据如 token、密码、密钥、完整请求体不应写入普通日志。
+
+\begin{lstlisting}
+security_event:
+  request_id=...
+  pid=...
+  uid=...
+  cgroup=...
+  operation=open_write
+  object=/data/report
+  policy=readonly_mount
+  result=denied
+  errno=EROFS
+\end{lstlisting}
+
+日志也要有完整性和留存策略。攻击者若能删除或篡改日志，事后审计会失效；日志若无限增长，又会变成磁盘耗尽风险。高安全系统通常把安全事件发送到独立收集端，并给本地日志设置限额和轮转。
+
+\subsection{性能观测：USE 与 RED 方法}
+
+系统性能观测可以用两套简单框架。USE 关注资源：Utilization、Saturation、Errors，即资源使用率、排队饱和度和错误。RED 关注服务请求：Rate、Errors、Duration，即请求速率、错误率和耗时分布。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+框架 & 适用对象 & 指标例子 \\
+\midrule
+USE & CPU、内存、磁盘、网卡、锁、队列 & CPU busy、runqueue、EIO、drop、reclaim \\
+RED & HTTP/RPC/数据库请求 & QPS、5xx、p50/p99、超时 \\
+\bottomrule
+\end{longtable}
+
+这两套方法要结合。用户看到的是 RED：请求慢或失败；工程师定位要落到 USE：哪个资源饱和或错误。比如 p99 上升可能来自 CPU runnable wait、锁等待、page fault、dirty writeback、网络重传或 cgroup throttling。
+
+\subsection{tracepoint、采样和事件日志}
+
+观测手段有不同成本。计数器成本低，但细节少；事件 trace 细节多，但可能扰动系统；采样 profiler 能看到热点，但对短暂事件和 off-CPU 等待不敏感；分布式 trace 能串请求路径，但需要上下文传播。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+手段 & 适合回答 & 局限 \\
+\midrule
+计数器 & 是否发生、发生多少次 & 难以解释单个请求 \\
+直方图 & 延迟分布和尾部 & 需要合理 bucket \\
+事件 trace & 谁在何时做了什么 & 数据量大，需过滤 \\
+CPU sampling & on-CPU 热点在哪里 & 看不到 sleeping 时间 \\
+off-CPU trace & 线程等待在哪里 & 栈采集和符号成本 \\
+\bottomrule
+\end{longtable}
+
+一个成熟诊断通常先看低成本指标定位方向，再打开更细粒度 trace 验证假设。直接全量抓所有事件，往往会制造过多噪声和额外开销。
+
+\subsection{panic、oops 和可恢复错误}
+
+内核错误并非都要 panic。用户传坏指针应返回 \code{EFAULT}；设备 I/O 失败应向上返回 \code{EIO}；某个驱动检测到可重置设备错误，可以隔离设备并恢复。panic 适用于内核不变量被破坏且继续运行可能造成更大损坏的情况，例如内核栈破坏、关键锁结构损坏、无法恢复的内存一致性错误。
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
+\toprule
+错误类型 & 处理 & 证据 \\
+\midrule
+用户错误 & 返回 errno 或发信号 & syscall、pid、地址、errno \\
+设备错误 & 重试、reset、上报 EIO & 设备状态、请求 id、超时 \\
+资源不足 & ENOMEM/OOM/限流 & cgroup、分配大小、victim \\
+内核 bug & oops 或 panic & 寄存器、栈、锁、CPU、taint \\
+\bottomrule
+\end{longtable}
+
+panic 路径要少依赖。此时文件系统、调度器或锁可能已经不可信，所以 crash dump 和 console 输出应尽量使用简单、预留或早期初始化的路径。复杂日志系统在 panic 中可能再次阻塞或破坏证据。
+
+\subsection{故障注入：证明错误路径真的可用}
+
+错误路径如果不测试，基本等于没实现。故障注入让内核或应用在可控点返回错误：分配失败、copy 用户失败、磁盘第 N 次写失败、网络短写、时钟跳变、锁超时、设备 completion 丢失。
+
+\begin{lstlisting}
+fault_injection_plan:
+  fail allocation at callsite X once
+  force copy_from_user to fail after 128 bytes
+  return EIO on block write number N
+  drop network response after commit
+  delay wakeup by 500ms
+\end{lstlisting}
+
+每个注入点都要有预期：资源是否释放，引用计数是否回到原值，目标对象是否保持不变，错误是否传给调用者，日志是否足够诊断。故障注入把“理论上能处理错误”变成可验证事实。
+
+\subsection{安全与观测的最终验收}
+
+\begin{rubricbox}
+一个边界合格的系统必须同时满足三件事：正常路径能完成；越权路径明确失败且没有副作用；失败路径留下足够证据，能说明主体、客体、操作、原因和影响范围。
+\end{rubricbox}

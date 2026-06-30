@@ -1,0 +1,282 @@
+\section{硬件细节深讲：从一条指令到一次设备完成}
+
+很多操作系统书厚，不是因为它们列了更多名词，而是因为它们会反复把同一个机制放到不同层次里解释。本节从硬件层展开，说明 OS 为什么必须关心指令执行、内存层次、设备协议和启动约束。
+
+\subsection{一条 load 指令背后发生了什么}
+
+用户程序写下一句 \code{x = *p}，看起来只是读取内存。硬件实际要经过多个检查和缓存层次。CPU 先得到虚拟地址，TLB 查询是否有缓存的翻译；若 TLB 未命中，硬件页表遍历器读取多级页表；页表项必须 present，并允许当前特权级读取；然后物理地址进入 cache 层次，L1 未命中查 L2，L2 未命中查 L3，最后才可能访问内存控制器。
+
+\begin{lstlisting}
+load virtual_address:
+  translation = tlb_lookup(virtual_address)
+  if translation.miss:
+    pte = page_table_walk(current.cr3, virtual_address)
+    if not pte.present or not pte.readable:
+      raise_page_fault()
+    tlb_insert(virtual_address, pte)
+  physical = pte.physical_page + page_offset(virtual_address)
+  line = cache_lookup(physical)
+  if line.miss:
+    line = memory_read(cache_line_address(physical))
+  return extract_word(line, physical)
+\end{lstlisting}
+
+这条路径解释了几个 OS 事实。第一，页表权限是硬件执行的，不是内核每次手工检查。第二，TLB 让地址翻译变快，但也让页表修改必须配合失效。第三，cache line 让相邻数据访问更快，也让伪共享和锁竞争变得昂贵。第四，缺页异常不是函数调用，而是 CPU 在执行普通指令时发现无法继续，转入内核处理。
+
+\subsection{一次 store 为什么需要内存屏障}
+
+普通程序通常假设代码顺序就是别人看到的顺序。多核和设备环境中，这个假设不总成立。CPU 可以把 store 暂存在 store buffer，编译器可以重排不相关内存访问，设备可能通过总线异步观察内存。内核因此使用 memory barrier 表达顺序约束。
+
+\begin{lstlisting}
+publish_object(obj):
+  obj.field1 = value1
+  obj.field2 = value2
+  store_release(global_ptr, obj)
+
+read_object():
+  obj = load_acquire(global_ptr)
+  if obj != null:
+    use(obj.field1, obj.field2)
+\end{lstlisting}
+
+release/acquire 的意思是：发布者在指针可见前完成对象初始化；读取者看到指针后，也能看到发布者之前写入的字段。锁、RCU、无锁队列和驱动描述符都依赖类似规则。没有屏障，bug 可能只在特定 CPU、特定优化级别、特定负载下出现。
+
+\subsection{NUMA：内存不是均匀的}
+
+多路服务器上，CPU 插槽和内存控制器形成 NUMA node。本地内存访问比远端内存低延迟、高带宽。调度器、页分配器和内存回收因此不能只把所有 CPU 和内存看成一个平面池。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 原因 & OS 对策 \\
+\midrule
+线程迁移后变慢 & cache 和 TLB 热状态丢失 & CPU affinity、迁移成本估计 \\
+访问远端内存慢 & 内存挂在另一个 NUMA node & first-touch、NUMA-aware allocation \\
+局部内存耗尽 & 某 node 压力更高 & 本地回收、跨 node fallback \\
+锁竞争放大 & cache line 在插槽间移动 & per-CPU 数据、分片锁、RCU \\
+\bottomrule
+\end{longtable}
+
+这也是为什么“线程数等于核心数”不是万能规则。若线程频繁共享同一批 cache line，即使核心很多，也可能被 cache coherence 拖慢。
+
+\subsection{MMIO、PIO 和 DMA 的差别}
+
+设备 I/O 有三种典型方式。PIO 由 CPU 直接搬运数据，适合简单设备或早期启动。MMIO 让 CPU 通过地址读写设备寄存器，适合控制设备状态。DMA 让设备直接访问内存，适合大吞吐数据传输。
+
+\begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\toprule
+方式 & 数据路径 & OS 难点 \\
+\midrule
+PIO & CPU 读写数据端口或寄存器 & CPU 被搬运占用，吞吐低 \\
+MMIO & CPU 读写设备寄存器 & 访问顺序、副作用、超时、错误状态 \\
+DMA & 设备直接读写内存 & buffer pin、IOMMU、cache 一致性、completion \\
+\bottomrule
+\end{longtable}
+
+一个块设备写请求可能同时使用三者：驱动用 MMIO 配置队列，用 DMA 传输数据，用中断报告 completion。OS 教材如果只讲“设备读写”，就会漏掉驱动里最容易出错的生命周期和顺序问题。
+
+\subsection{启动时为什么不能使用完整内核能力}
+
+启动早期没有堆、没有调度、没有完整页表、没有普通文件系统，也不一定有中断。很多初学者会问：为什么不一开始就调用统一日志、统一分配器、统一驱动框架？原因是这些框架本身依赖更基础的能力。
+
+\begin{lstlisting}
+early code can use:
+  fixed stack
+  linker symbols
+  bootloader memory map
+  early console
+  bump allocator
+
+early code cannot assume:
+  scheduler exists
+  page allocator is ready
+  interrupts are enabled
+  file system is mounted
+  all CPUs are online
+\end{lstlisting}
+
+启动代码的复杂性不是历史负担，而是依赖关系决定的。一个成熟内核会把初始化分层：先建立能输出错误的 console，再建立能描述内存的 boot memory，再建立页表和分配器，最后建立调度器、设备和用户态。
+
+\subsection{硬件基础检查题}
+
+\begin{enumerate}
+\tightlist
+\item 为什么修改页表后还要处理 TLB，而不是只改内存中的页表项？
+\item 为什么驱动写完描述符后要有 memory barrier 再通知设备？
+\item 为什么中断处理函数不能随意睡眠？
+\item 为什么 DMA buffer 在 completion 前不能释放？
+\item 为什么多核调度不能只用一个全局 runqueue？
+\item 为什么启动早期不能调用普通 \code{malloc} 或普通文件 I/O？
+\end{enumerate}
+
+能回答这些问题，后面的虚拟内存、调度、驱动和文件系统才有硬件根基。
+
+\subsection{时间尺度：为什么 OS 总在权衡}
+
+操作系统的大量设计都是在不同时间尺度之间权衡。寄存器访问可以看作 1 个 CPU 周期量级，L1 cache 是几个周期，内存可能是上百周期，NVMe I/O 可能是微秒到毫秒，网络和机械磁盘可能更慢。调度器一次上下文切换、一次 TLB shootdown、一次 fsync 都不是“抽象操作”，它们背后有硬件成本。
+
+\begin{longtable}{p{0.22\linewidth}p{0.28\linewidth}p{0.38\linewidth}}
+\toprule
+操作 & 典型尺度 & OS 设计影响 \\
+\midrule
+寄存器访问 & CPU 周期 & 上下文切换要保存恢复寄存器 \\
+L1/L2 cache 命中 & 几到几十周期 & 数据局部性、per-CPU 数据结构重要 \\
+主内存访问 & 上百周期量级 & page fault 和 cache miss 成本明显 \\
+TLB shootdown & 跨 CPU 中断和等待 & 频繁改页表会拖慢多核程序 \\
+NVMe I/O & 微秒到毫秒 & 需要队列、异步、批量和 completion \\
+fsync/flush & 可能毫秒级或更高 & 可靠提交不能放在热路径随意调用 \\
+\bottomrule
+\end{longtable}
+
+这些数字不是让读者背精确值，而是建立数量级直觉。一个算法少一次内存访问可能值得优化；一个功能如果每个请求都 fsync，就可能把吞吐限制在存储设备 flush 延迟上；一个锁如果让 cache line 在 CPU 间来回迁移，会比临界区本身更贵。
+
+\subsection{一个完整硬件路径：网卡收到一个包}
+
+以网卡接收数据包为例，可以把硬件和 OS 串起来。
+
+\begin{lstlisting}
+1. driver allocates RX buffers
+2. driver maps buffers for DMA
+3. driver fills RX descriptor ring
+4. NIC receives packet from wire
+5. NIC DMA-writes packet into memory
+6. NIC writes completion/status
+7. NIC raises interrupt or waits for interrupt moderation
+8. interrupt handler schedules poll
+9. poll reads descriptors, invalidates cache if needed
+10. network stack consumes packet
+11. socket receive queue wakes user process
+\end{lstlisting}
+
+这条路径里任何一步都可能出错：buffer 太少会丢包；DMA 映射错误会写坏内存；中断合并过大增加延迟；poll budget 太大影响调度；用户进程不读 socket 会导致接收队列积压并产生背压。教材要讲厚，就必须把这样的路径完整展开，而不是只说“网卡通过中断通知内核”。
+
+\subsection{从单片机循环到通用操作系统}
+
+理解操作系统最好不要从“Linux 有哪些子系统”开始，而要从最小机器开始。一个简单单片机程序通常只有一个主循环和若干中断处理函数。它没有用户态和内核态之分，没有页表，没有进程，也没有文件系统。程序直接读写外设寄存器，所有代码处在同一信任边界内。
+
+\begin{lstlisting}
+bare_metal_main():
+  init_clock()
+  init_gpio()
+  init_uart()
+  while true:
+    poll_button()
+    update_led()
+    handle_uart_bytes()
+\end{lstlisting}
+
+这种模型能工作，是因为问题规模小：任务数量少，开发者知道所有代码，内存布局固定，失败影响有限。一旦系统要同时运行多个互不信任程序，或要让一个程序卡住时不拖死全部功能，就需要更强的机制。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 新需求 & 产生的 OS 机制 \\
+\midrule
+单循环裸机 & 周期性处理少量设备 & 主循环、轮询、少量中断 \\
+中断驱动裸机 & 外设事件不能丢 & 中断向量、临界区、环形缓冲区 \\
+协作式多任务 & 多个任务共享 CPU & 任务控制块、显式 yield、简单栈切换 \\
+抢占式内核 & 任务不能长期霸占 CPU & 定时器中断、调度器、保存恢复上下文 \\
+多程序系统 & 程序互不信任 & 特权级、系统调用、页表、权限检查 \\
+通用系统 & 设备和文件很多 & 驱动模型、VFS、块层、网络栈、日志恢复 \\
+\bottomrule
+\end{longtable}
+
+这条演进线解释了为什么 OS 特性不是凭空增加的。调度器来自“不能信任任务主动让出 CPU”；系统调用来自“用户程序不能直接改内核状态”；虚拟内存来自“程序不能互相读写”；文件系统来自“存储设备不能只暴露原始扇区”；网络栈来自“设备字节流必须变成可复用通信接口”。
+
+\subsection{协作式任务为什么不够}
+
+协作式任务把每个任务写成能主动让出的函数。它比单循环清晰，但它依赖每个任务都守规矩。一个任务忘记调用 \code{yield}，或者在循环中等待硬件状态，就会让系统停止响应。
+
+\begin{lstlisting}
+task_a():
+  while true:
+    do_a_small_step()
+    yield()
+
+task_b_bug():
+  while device_not_ready():
+    ;   // forgot to yield, all other tasks starve
+\end{lstlisting}
+
+抢占式调度用定时器中断打破这个假设。即使当前任务不合作，硬件也会在时间片到达时进入内核。内核保存当前寄存器，选择另一个 runnable 任务，再恢复其寄存器。这就是“硬件定时器 + trap frame + scheduler”共同形成的控制权回收机制。
+
+\subsection{trap frame：异常入口的最小证据}
+
+CPU 进入内核时，必须留下足够信息，让内核知道从哪里来、为什么来、如何返回。这个保存下来的状态通常称为 trap frame 或 interrupt frame。不同架构字段不同，但语义类似。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+字段 & 含义 & 用途 \\
+\midrule
+PC/IP & 被打断或出错的指令位置 & 返回、信号、调试栈 \\
+SP & 进入异常前的栈指针 & 恢复用户栈或诊断坏栈 \\
+FLAGS/STATUS & 中断位、条件码、特权级信息 & 判断返回权限和中断状态 \\
+通用寄存器 & 参数和临时值 & 系统调用参数、恢复用户执行 \\
+错误码 & page fault、保护异常等附加原因 & 区分缺页、权限和非法访问 \\
+\bottomrule
+\end{longtable}
+
+trap frame 解释了系统调用和异常为何能返回到原程序。它也解释了为什么内核 panic 时要打印寄存器和指令地址：这些字段是定位错误路径的最低成本证据。
+
+\begin{lstlisting}
+trap_entry(vector, hardware_frame):
+  switch_to_kernel_stack_if_from_user()
+  save_general_registers()
+  tf = current.trap_frame
+  dispatch_trap(vector, tf)
+  restore_general_registers()
+  return_from_trap(tf)
+\end{lstlisting}
+
+入口代码必须非常保守。它运行在栈切换、页表边界和中断状态都敏感的位置，不能调用可能睡眠的复杂函数。很多内核把低级入口代码写成汇编或极薄的 C 包装，就是为了精确控制保存顺序和 ABI。
+
+\subsection{中断控制器、优先级和 IPI}
+
+设备不是直接“喊 CPU”。多数机器有中断控制器负责接收设备中断、屏蔽中断、设置优先级并把中断送到某个 CPU。多核系统还需要 CPU 之间互相发送 IPI，用于重调度、TLB shootdown、停止其他 CPU 或调试。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+机制 & 用途 & OS 风险 \\
+\midrule
+interrupt mask & 临时屏蔽某类中断 & 屏蔽过久造成延迟或丢事件 \\
+interrupt priority & 高优先级事件先处理 & 优先级反转或低优先级饥饿 \\
+interrupt affinity & 把设备中断送到指定 CPU & 热点 CPU 过载或缓存局部性变差 \\
+MSI/MSI-X & 设备用内存写触发中断消息 & 向量分配、隔离和设备错误处理 \\
+IPI & CPU 间发送控制事件 & 频繁 IPI 会破坏多核伸缩性 \\
+\bottomrule
+\end{longtable}
+
+TLB shootdown 是 IPI 的典型用途。一个 CPU 修改了某进程页表，其他正在运行该进程的 CPU 可能仍有旧 TLB 项。修改方必须通知这些 CPU 失效旧翻译，并等待确认后才能释放旧物理页。这个过程昂贵，所以现代内核会尽量批量处理 unmap 和权限变化。
+
+\subsection{内存模型：编译器顺序、CPU 顺序和设备顺序}
+
+很多并发错误来自把三种顺序混在一起。源代码顺序是程序员写下的顺序；编译器可能在不改变单线程语义的前提下重排；CPU 可能因为 store buffer、乱序执行和缓存协议让其他 CPU 以不同时间观察到写入；设备通过 DMA 和 MMIO 观察到的顺序还要额外受总线和设备协议影响。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+顺序层次 & 例子 & 常用约束 \\
+\midrule
+编译器顺序 & 普通变量访问被优化或重排 & volatile 语义、编译器屏障、原子操作 \\
+CPU 顺序 & store 先进入缓冲区，稍后对其他核可见 & acquire/release、full fence \\
+设备顺序 & 描述符写入和 doorbell MMIO 顺序 & DMA barrier、MMIO write barrier \\
+\bottomrule
+\end{longtable}
+
+驱动发布 DMA 描述符时，必须先让内存中的描述符对设备可见，再写 MMIO doorbell。锁释放时，必须先让临界区写入对其他 CPU 可见，再让锁状态变成未持有。RCU 发布指针时，必须先初始化对象，再发布地址。这些看似不同的场景，本质都是“先写数据，再发布可见性”的顺序要求。
+
+\subsection{硬件抽象的边界}
+
+OS 会抽象硬件，但不能把硬件成本抹掉。页表让每个进程看到独立地址空间，但 TLB shootdown 仍然昂贵；block layer 把设备包装成请求队列，但 flush 仍然慢；socket 把网卡包装成字节流，但拥塞和丢包仍然存在；调度器把 CPU 时间切片给线程，但 cache/TLB 热状态仍然影响性能。
+
+\begin{rubricbox}
+学习硬件基础的验收标准：看到一个 OS 机制时，能回答它依赖哪个硬件入口、改变哪些硬件状态、失败时硬件给出什么证据、性能瓶颈来自哪个硬件层次。
+\end{rubricbox}
+
+\subsection{本章小结}
+
+\begin{itemize}
+\tightlist
+\item CPU 特权级和页表权限是 OS 隔离的硬件根。
+\item cache、TLB、NUMA 和内存屏障解释了内核为何重视局部性和顺序。
+\item MMIO、DMA、中断和 IOMMU 构成设备驱动的基本硬件接口。
+\item 启动阶段受依赖限制，不能使用尚未初始化的内核服务。
+\item 所有高级 OS 机制都能追溯到硬件状态、硬件事件和硬件成本。
+\end{itemize}

@@ -1,0 +1,311 @@
+\chapter{panic、错误路径与恢复策略}
+
+\section{原理}
+
+操作系统必须区分普通错误、进程错误、内核 bug 和硬件不可恢复错误。普通错误应返回 \code{errno}，例如文件不存在、权限不足、非阻塞 I/O 暂时不可用；进程错误应向进程发送信号，例如非法地址访问；内核 bug 可能触发 WARN、oops 或 panic；硬件错误可能要求隔离设备、下线页面或重启系统。若把所有错误都 panic，系统不可用；若把所有错误都吞掉，数据会被悄悄破坏。
+
+panic 的含义是内核认为继续运行比停止更危险。典型原因包括核心不变量破坏、调度器状态自相矛盾、文件系统元数据检测到不可恢复损坏、内核栈溢出、无法处理的机器检查。panic 不是调试打印的高级版本，而是系统级 fail-stop 策略：停止服务，尽量保留证据，避免进一步破坏状态。
+
+\begin{keyidea}
+高质量 OS 实现不只写正常路径，还要把每个失败点的责任写清楚：返回错误、终止进程、重试、降级、隔离，还是 panic。
+\end{keyidea}
+
+错误路径的工程难点在资源回收。系统调用可能已经分配页、获取锁、增加引用、插入表项、发起 I/O，然后第七步失败。正确实现必须让失败路径按照相反顺序撤销已完成步骤，并且不能撤销还没完成的步骤。C 语言内核常用 \code{goto out\_...} 标签表达这种线性回滚；C++ 内核或教学模拟器可以用 RAII 表达资源所有权，但必须注意中断上下文、panic 路径和 no-throw 约束。
+
+\section{实践}
+
+错误分类可以写成下表：
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+类别 & 处理方式 & 示例 \\
+\midrule
+可预期用户错误 & 返回 \code{errno} & \code{ENOENT}、\code{EACCES}、\code{EAGAIN} \\
+用户进程违规 & 信号或终止该进程 & page fault 权限错误、非法指令 \\
+资源暂时不足 & 返回错误、等待或回收 & \code{ENOMEM}、队列满、端口耗尽 \\
+设备局部故障 & 重置设备、隔离队列、上报 I/O error & 磁盘超时、网卡 reset \\
+内核不变量破坏 & WARN/oops/panic & 双重释放、runqueue 计数错误 \\
+持久化一致性风险 & remount read-only、replay journal、panic & 元数据校验失败 \\
+\bottomrule
+\end{longtable}
+
+一个系统调用实现应在设计阶段列出失败点：
+
+\begin{lstlisting}
+open(path, flags):
+  copied_path = copy_path_from_user(path)        may fail EFAULT/ENAMETOOLONG
+  parent = resolve_parent(copied_path)           may fail ENOENT/EACCES
+  inode = lookup_or_create(parent, name, flags)  may fail ENOENT/EEXIST/EROFS
+  file = alloc_file(inode, flags)                may fail ENOMEM
+  fd = alloc_fd(current.files)                   may fail EMFILE
+  install_fd(fd, file)                           commit point
+  return fd
+\end{lstlisting}
+
+提交点之前失败，要释放已拿到的引用；提交点之后失败，通常不能再返回“没有打开”，而要让 fd 表保持一致或执行明确关闭。把提交点写出来，可以避免半初始化 fd 留在表里。
+
+\section{算法与实现分析}
+
+\subsection{errno 返回与用户可见契约}
+
+\code{errno} 不是随便选的数字。调用者会根据错误码决定重试、降级、提示用户还是终止。
+
+\begin{lstlisting}
+copy_from_user_checked(dst, user_ptr, len):
+  if not user_range_valid(user_ptr, len, READ):
+    return EFAULT
+  if len > MAX_COPY:
+    return EINVAL
+  fault = copy_may_fault(dst, user_ptr, len)
+  if fault:
+    return EFAULT
+  return OK
+\end{lstlisting}
+
+把非法用户地址返回 \code{EFAULT}，而不是 panic，是因为这是用户进程可触发的预期错误。内核必须把“不可信输入”当正常情况处理。只有当内核自己的页表、锁状态或对象引用被破坏时，才进入更严重路径。
+
+\subsection{goto 回滚模板}
+
+C 风格内核常见模式：
+
+\begin{lstlisting}
+sys_create(path):
+  name = null
+  inode = null
+  file = null
+
+  name = copy_name(path)
+  if name == null:
+    ret = ENOMEM
+    goto out
+
+  inode = create_inode(name)
+  if is_error(inode):
+    ret = error(inode)
+    goto out_name
+
+  file = alloc_file(inode)
+  if file == null:
+    ret = ENOMEM
+    goto out_inode
+
+  ret = install_fd(file)
+  if ret < 0:
+    goto out_file
+  return ret
+
+out_file:
+  put_file(file)
+out_inode:
+  put_inode(inode)
+out_name:
+  free(name)
+out:
+  return ret
+\end{lstlisting}
+
+这个结构的优点是回滚顺序与获取顺序相反，且每个标签只释放已经成功获取的资源。缺点是标签命名和跳转边界容易腐烂，需要测试每个失败注入点。C++ RAII 可以减少样板，但内核中不是所有路径都适合异常；析构函数也不能在持有自旋锁或 panic 路径中做复杂阻塞操作。
+
+\subsection{WARN、BUG、oops 与 panic}
+
+可以把严重程度分成四级：
+
+\begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.36\linewidth}}
+\toprule
+机制 & 含义 & 处理 \\
+\midrule
+WARN & 发现异常但可能继续 & 打印栈、计数、继续或降级 \\
+BUG/oops & 当前内核路径不可继续 & 杀死当前进程或停止当前 CPU，视上下文而定 \\
+panic & 整个系统不可安全继续 & 停机、重启或进入 crash dump \\
+watchdog & 系统长时间无响应 & 触发诊断、中断栈采样或 panic \\
+\bottomrule
+\end{longtable}
+
+教学系统可以实现 \code{assert\_kernel\_invariant}：调试构建 panic，发布构建记录错误并尽量隔离。但对文件系统元数据损坏这类风险，继续写入可能扩大破坏，remount read-only 或 panic 是合理选择。
+
+\subsection{看门狗与故障转储}
+
+watchdog 检测“没有前进”。硬锁死可能表现为中断不再发生；软锁死可能表现为某 CPU 长时间不调度；RCU stall 表示读侧临界区过久导致回收无法完成。
+
+\begin{lstlisting}
+watchdog_tick(cpu):
+  now = time()
+  if now - cpu.last_schedule_time > SOFTLOCKUP_LIMIT:
+    dump_cpu_stack(cpu)
+    warn("soft lockup")
+  if now - cpu.last_interrupt_time > HARDLOCKUP_LIMIT:
+    panic("hard lockup")
+\end{lstlisting}
+
+panic 后的目标不是恢复服务，而是保留证据：panic 原因、CPU 寄存器、栈、当前任务、锁持有、最近日志、脏页状态和设备错误。crash dump 的价值在于让下一次启动后能分析，而不是在 panic 路径中做复杂修复。
+
+\subsection{重试与幂等}
+
+不是所有失败都应该立即返回。临时内存不足可以触发回收后重试；设备超时可以 reset 后重试；网络发送可以等待窗口。但重试必须有边界，并且操作要么幂等，要么有明确的提交记录。
+
+\begin{lstlisting}
+retry_io(req):
+  while req.retries < MAX_RETRIES:
+    submit(req)
+    status = wait_completion(req, timeout)
+    if status == OK:
+      return OK
+    if not is_transient(status):
+      return status
+    reset_path_if_needed(req.device)
+    req.retries++
+  return EIO
+\end{lstlisting}
+
+对写请求，若设备状态不明，简单重试可能造成重复写。对普通块覆盖写通常可接受；对“追加一条记录”这类上层操作，必须有序列号、校验或日志来识别重复提交。
+
+\section{测试}
+
+\begin{enumerate}
+\tightlist
+\item errno 矩阵：非法指针、权限不足、资源耗尽返回不同错误码。
+\item 失败注入：在系统调用每个分配点失败，引用计数和锁计数最终归零。
+\item 提交点测试：提交前失败无用户可见副作用，提交后状态自洽。
+\item WARN 测试：非致命不变量异常记录证据但不破坏后续测试。
+\item panic 测试：核心不变量破坏后停止调度，输出原因和栈。
+\item watchdog 测试：构造关中断死循环或不调度循环，能触发诊断。
+\item 设备重试：临时错误可重试，永久错误返回 \code{EIO} 且唤醒等待者。
+\item crash dump：panic 后保存当前任务、寄存器、锁和最近日志。
+\end{enumerate}
+
+\begin{rubricbox}
+本章合格标准：能区分 errno、信号、oops、panic；能为系统调用写出失败回滚路径；能解释提交点、幂等重试和故障证据的关系。
+\end{rubricbox}
+
+\section{源码级补充：oops、KASAN、KCSAN、KFENCE、fault injection 与 kdump}
+
+\subsection{BUG、WARN、oops 和 panic 的代码路径}
+
+Linux 中 \code{WARN\_ON} 打印栈但通常继续；\code{BUG\_ON} 表示当前路径不可继续；oops 是内核异常报告，可能杀死当前进程或导致 panic；\code{panic} 停止系统或按配置重启。读 \filepath{kernel/panic.c} 和架构异常处理代码时，看报告如何收集寄存器、栈、taint、loaded modules 和当前任务。
+
+\begin{lstlisting}
+bad_kernel_access:
+  fault in kernel mode
+  -> do_error_trap or page fault path
+  -> oops_begin()
+  -> show registers, stack, code bytes
+  -> decide die, panic, or kill current task
+\end{lstlisting}
+
+错误严重程度取决于上下文。用户进程传坏指针应返回 \code{EFAULT}；内核在持有自旋锁时 page fault，可能说明严重 bug；文件系统检测到元数据不一致继续写入可能扩大损坏，因此 remount read-only 或 panic 都是合理策略。
+
+\subsection{KASAN、KCSAN 和 KFENCE}
+
+\begin{longtable}{p{0.18\linewidth}p{0.44\linewidth}p{0.26\linewidth}}
+\toprule
+工具 & 发现问题 & 取舍 \\
+\midrule
+KASAN & 越界、use-after-free、部分栈/全局错误 & 高开销，高覆盖 \\
+KCSAN & 数据竞争，非原子并发访问 & 采样式，可能需多跑 \\
+KFENCE & 堆越界和 UAF & 低开销，覆盖有限 \\
+\bottomrule
+\end{longtable}
+
+这些工具不会替代锁设计。它们帮助你发现违反不变量的具体证据，例如哪个对象释放后被哪个路径继续访问，哪个字段被两个 CPU 无同步写入。测试报告应保留工具输出中的对象地址、分配栈、释放栈和访问栈。
+
+\subsection{fault injection}
+
+Linux 提供多种故障注入，例如 fail\_page\_alloc、failslab、fail\_make\_request。目标是在可控位置让分配、slab、块 I/O 失败，验证错误路径。
+
+\begin{lstlisting}
+test plan:
+  fail next kmalloc in sys_open
+  expect no fd installed, inode ref dropped
+
+  fail block request number N during fsync
+  expect fsync returns EIO and writeback error recorded
+\end{lstlisting}
+
+没有故障注入，错误回滚代码很可能从未执行过。高质量 OS 代码要让每个 \code{goto out\_*} 标签都能被测试触发。故障注入测试必须检查“没有发生什么”：没有泄漏引用、没有遗留锁、没有半初始化对象进入全局表。
+
+\subsection{kdump 与 /proc/vmcore}
+
+kdump 预留一段 crashkernel 内存。panic 后通过 kexec 启动捕获内核，导出 \filepath{/proc/vmcore}，再用 crash 工具结合 vmlinux 符号分析。panic 路径越少依赖损坏系统，dump 成功率越高。
+
+\begin{lstlisting}
+panic
+  -> stop other CPUs
+  -> save registers and notes
+  -> kexec crash kernel
+  -> expose /proc/vmcore
+  -> analyze task, locks, stacks, memory
+\end{lstlisting}
+
+生产环境中，panic 策略要结合服务目标：有的系统宁可快速重启，有的系统必须保留 dump，有的存储系统检测到元数据损坏要停止写入避免扩大破坏。
+
+\subsection{错误恢复的状态机写法}
+
+恢复不是“再试一次”。每个可恢复对象都应有明确状态：正常、降级、恢复中、不可用、已隔离。状态转换要有进入条件、退出条件和超时策略。
+
+\begin{lstlisting}
+device state:
+  ONLINE
+    on timeout -> RECOVERING
+  RECOVERING
+    stop queues
+    reset hardware
+    replay configuration
+    complete lost requests
+    if success -> ONLINE
+    if fail count exceeded -> FAILED
+  FAILED
+    reject new requests with EIO
+    keep diagnostic evidence
+\end{lstlisting}
+
+没有状态机，恢复路径容易和正常 I/O 并发踩踏：reset 时仍提交新请求，失败请求没有唤醒等待者，或恢复成功后旧 completion 又回来释放同一资源。
+
+\subsection{错误预算和降级}
+
+并非所有错误都要立即 panic 或无限重试。系统可以设置错误预算：短时间少量校验失败触发重试，连续失败触发隔离，核心元数据错误触发只读或 panic。错误预算让系统避免因为瞬时故障过度反应，也避免因为反复失败无限拖延。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 初始处理 & 超过预算后 \\
+\midrule
+块 I/O 超时 & 重试、reset 队列 & 下线设备或返回 \code{EIO} \\
+内存分配失败 & 回收、压缩、等待 & OOM kill 或返回 \code{ENOMEM} \\
+网络重传增多 & 降低发送速率 & 熔断连接或限流 \\
+文件系统校验失败 & 停止相关写入 & remount read-only 或 panic \\
+\bottomrule
+\end{longtable}
+
+错误预算必须可观测：重试次数、最后错误、进入降级时间、当前状态和影响对象都要暴露。否则系统处在降级状态时，用户只会看到“偶尔很慢”。
+
+\subsection{cleanup attribute 与 RAII 的边界}
+
+用户态 C 可以用 \code{__attribute__((cleanup))} 模拟作用域清理，C++ 可以用 RAII。内核 C 常用 \code{goto out}，是因为错误路径需要精确控制上下文、锁和释放顺序。三种方法没有绝对高低，关键是所有权必须清楚。
+
+\begin{lstlisting}
+// conceptual RAII style
+FileRef file = open_checked(path)
+PageRef page = allocate_page()
+LockGuard guard(inode.lock)
+commit_update(file, page)
+\end{lstlisting}
+
+RAII 适合普通进程上下文中的资源组合；但析构函数不应隐藏可能睡眠的复杂 I/O，也不应在 panic 路径中试图获取新锁。教学 OS 可以使用 C++20 RAII 管理引用和锁，但要为中断上下文、noexcept 和显式提交点写清规则。
+
+\subsection{panic 报告模板}
+
+panic 输出要稳定、短而有证据。最低字段如下：
+
+\begin{lstlisting}
+panic report:
+  reason
+  cpu id and current task
+  instruction pointer and stack pointer
+  trap vector or syscall number
+  held locks
+  taint or loaded modules
+  last N kernel log records
+  affected device or inode if any
+  reboot/dump policy
+\end{lstlisting}
+
+报告不是越长越好。panic 时系统可能已经损坏，输出过多可能再次阻塞。核心原则是保留能定位第一现场的事实，而不是在崩溃路径中做复杂分析。

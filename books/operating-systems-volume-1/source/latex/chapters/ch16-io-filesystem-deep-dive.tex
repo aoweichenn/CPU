@@ -1,0 +1,325 @@
+\section{I/O 与文件系统深讲：从 fd 到磁盘块}
+
+文件系统和 I/O 是许多教材最难讲清的部分，因为它们跨越对象模型、缓存、设备、并发和持久化。用户看到的是 \code{read}、\code{write}、\code{open}、\code{close}，内核看到的是 fd 表、file、inode、page cache、bio、request、DMA 和 completion。
+
+\subsection{一次 buffered read 的完整路径}
+
+\begin{lstlisting}
+read(fd, user_buf, len)
+  -> fd table lookup
+  -> file object permission check
+  -> inode and page cache lookup
+  -> if cache miss: submit block I/O
+  -> sleep waiting for completion
+  -> driver interrupt completes request
+  -> wake reader
+  -> copy page cache bytes to user buffer
+  -> update file offset
+  -> return bytes read
+\end{lstlisting}
+
+这个路径里有三个不同的“成功”。块设备成功读取页面，不代表用户 buffer 已经复制；用户复制成功，不代表文件 offset 更新一定已经对其他共享 fd 可见；\code{read} 返回字节数，也不代表下一次读不会因为 EOF、信号或错误返回不同结果。OS 教材必须不断区分这些边界。
+
+\subsection{一次 buffered write 的完整路径}
+
+\code{write} 更容易误解。普通 buffered write 通常只是把数据复制到 page cache，并把页标脏。数据什么时候写到设备，由后台 writeback、内存压力、\code{fsync} 或文件系统策略决定。
+
+\begin{lstlisting}
+write(fd, user_buf, len)
+  -> fd table lookup
+  -> check write permission
+  -> copy user bytes into page cache
+  -> mark page dirty
+  -> update inode size if needed
+  -> return bytes written
+
+later:
+  writeback dirty page
+  -> build bio
+  -> block scheduler
+  -> driver DMA
+  -> completion
+  -> mark page clean
+\end{lstlisting}
+
+因此 \code{write} 返回和持久化不是一回事。可靠程序需要 \code{fsync} 文件，必要时还要 \code{fsync} 父目录，并用 manifest 表达业务提交。
+
+\subsection{fd、file、inode 的引用关系}
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+对象 & 保存内容 & 生命周期 \\
+\midrule
+fd slot & 进程局部整数到 file 的引用 & \code{open/dup/close} 改变 \\
+file object & offset、flags、ops、inode 引用 & 引用计数为 0 时释放 \\
+inode & 文件元数据、数据块索引、权限 & link count 和 open count 共同决定回收 \\
+dentry & 名字到 inode 的缓存映射 & rename/unlink/mount 会影响有效性 \\
+\bottomrule
+\end{longtable}
+
+\code{dup} 后两个 fd 指向同一个 file object，所以共享 offset；独立 \code{open} 同一路径得到不同 file object，所以 offset 分离；\code{unlink} 删除目录项，但已打开 file 仍引用 inode，所以文件内容可能继续存在到最后一个 fd 关闭。
+
+\subsection{块层为什么存在}
+
+文件系统关心逻辑块，设备关心队列、扇区、对齐、最大请求、flush 和 completion。块层在中间做合并、拆分、排序和顺序约束。
+
+\begin{lstlisting}
+file system:
+  write inode block 100
+  write data blocks 200..240
+  flush journal commit
+
+block layer:
+  merge adjacent writes
+  split too-large requests
+  enforce flush/FUA order
+  dispatch to hardware queue
+\end{lstlisting}
+
+没有块层，文件系统要直接理解每种设备队列；没有顺序约束，文件系统日志可能被设备重排破坏；没有合并，吞吐会被小请求拖垮。
+
+\subsection{文件系统练习}
+
+\begin{enumerate}
+\tightlist
+\item 画出 \code{dup}、\code{open}、\code{fork} 后 fd、file、inode 的引用图。
+\item 为什么 \code{unlink} 一个打开文件后，磁盘空间可能不立刻释放？
+\item 为什么 \code{write} 成功后立刻断电，重启不一定看到新数据？
+\item 为什么 direct I/O 和 mmap 同时访问同一文件会有一致性风险？
+\item 设计一个测试，证明 page cache 热读没有访问块设备。
+\end{enumerate}
+
+\subsection{持久化故障矩阵：从 write 到 fsync}
+
+可靠文件输出要把每个阶段的崩溃结果写清楚。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 崩溃后可能看到 & 正确恢复态度 \\
+\midrule
+\code{write} 返回后 & 数据只在 page cache，磁盘可能无变化 & 不能宣布业务提交 \\
+\code{fsync(file)} 后 & 文件内容和部分元数据持久 & 若路径是新建文件，还要考虑目录 \\
+\code{rename(tmp, final)} 后 & 名字可能切换，目录项未必持久 & 需要 \code{fsync(parent dir)} \\
+manifest 写入前 & 数据文件可能存在但未被承认 & 读取者忽略孤儿文件 \\
+manifest fsync 后 & 版本记录可校验 & 读取者按 manifest 校验并采用 \\
+\bottomrule
+\end{longtable}
+
+这个矩阵解释了为什么可靠系统常用临时文件、rename、目录 fsync 和 manifest。不是每个程序都需要这么重，但如果程序声称“崩溃后不产生半成品”，就必须定义这些阶段。
+
+\subsection{文件系统常见误区}
+
+\begin{warningbox}
+\begin{itemize}
+\tightlist
+\item \code{write} 成功不等于数据落盘。
+\item \code{close} 不是可靠提交协议，错误可能来自之前的 writeback。
+\item \code{rename} 原子可见不等于目录项已经持久。
+\item 删除路径名不等于已打开文件对象立即消失。
+\item page cache 不是“可有可无的缓存”，它参与 mmap、回收和写回。
+\item direct I/O 绕过 page cache 不等于绕过所有一致性问题。
+\end{itemize}
+\end{warningbox}
+
+\subsection{本章小结}
+
+\begin{itemize}
+\tightlist
+\item fd 是进程局部句柄，file object 保存 offset 和 flags，inode 保存文件身份。
+\item buffered I/O 通过 page cache，冷/热缓存性能差异巨大。
+\item 块层负责合并、拆分、排序和 flush 顺序。
+\item 文件系统必须同时维护运行时一致性和崩溃后可恢复性。
+\item 可靠写出需要明确业务提交点，通常不能只依赖 \code{write}。
+\end{itemize}
+
+\subsection{VFS：为什么需要统一文件对象模型}
+
+不同文件系统的磁盘布局差异很大，设备文件、管道、socket 和普通文件也不是同一种存储对象。用户态却希望都能通过 \code{open/read/write/close} 操作。VFS 的作用是提供统一对象模型：路径解析得到 dentry 和 inode；打开后得到 file object；具体操作通过 file operations 或 inode operations 分发给底层实现。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+VFS 对象 & 语义 & 例子 \\
+\midrule
+superblock & 一个挂载文件系统实例 & ext4、tmpfs、procfs 的挂载点 \\
+inode & 文件身份和元数据 & 普通文件、目录、设备节点 \\
+dentry & 名字到 inode 的缓存关系 & \code{/usr/bin/sh} 的路径组件 \\
+file & 一次打开实例 & offset、flags、权限和 ops \\
+mount & 命名空间中的挂载关系 & bind mount、overlay、chroot 边界 \\
+\bottomrule
+\end{longtable}
+
+VFS 解释了“一切皆文件”的边界。普通文件的 \code{read} 走 page cache；管道的 \code{read} 走内存环形缓冲区；socket 的 \code{read} 走网络接收队列；设备节点的 \code{read} 进入驱动。统一 API 不等于统一实现，调用者仍要根据对象类型处理短读、阻塞、错误和 readiness。
+
+\subsection{路径解析：名字查找不是字符串拼接}
+
+路径解析要逐级查找目录项，处理 \code{.}、\code{..}、符号链接、挂载点、权限、并发 rename 和命名空间边界。它不能简单把字符串 split 后查哈希表，因为每一级都可能跨文件系统或触发权限检查。
+
+\begin{lstlisting}
+path_lookup(start, path):
+  current = start
+  for component in split(path):
+    if component == ".":
+      continue
+    if component == "..":
+      current = parent_respecting_mount_namespace(current)
+      continue
+    dentry = lookup_dentry(current, component)
+    if dentry.is_symlink:
+      path = expand_symlink(dentry, remaining_path)
+      restart_with_symlink_limit()
+    if crosses_mount(dentry):
+      current = mounted_root(dentry)
+    else:
+      current = dentry.inode
+  return current
+\end{lstlisting}
+
+路径查找的失败也要分类。组件不存在返回 \code{ENOENT}；中间组件不是目录返回 \code{ENOTDIR}；权限不足返回 \code{EACCES}；符号链接层数太多返回 \code{ELOOP}；路径过长返回 \code{ENAMETOOLONG}。这些错误让调用者知道是创建父目录、修正路径还是请求权限。
+
+\subsection{目录、rename 和原子可见性}
+
+目录是名字到 inode 的映射。它本身也是文件，只是内容由文件系统解释。rename 的关键价值是原子可见：观察者要么看到旧名字，要么看到新名字，不应看到半个名字。这个性质让临时文件发布成为可能。
+
+\begin{lstlisting}
+atomic_replace(path, data):
+  tmp = create(path + ".tmp")
+  write_all(tmp, data)
+  fsync(tmp)
+  rename(tmp, path)
+  fsync(parent_directory(path))
+\end{lstlisting}
+
+这里的原子可见和持久化仍然不同。rename 完成后，其他进程查路径应看到新文件；但断电后目录项是否仍在，要看父目录是否持久化。很多可靠更新协议必须同时关心“运行时读者看到什么”和“崩溃后恢复看到什么”。
+
+\subsection{page cache 一致性：read、write、mmap}
+
+普通 buffered I/O 和文件 \code{mmap} 通常共享 page cache。进程 \code{write} 修改 page cache 页后，另一个进程通过 \code{mmap} 读同一页，应该看到一致内容；反过来，\code{mmap} 写共享映射后，\code{read} 也应看到页缓存中的新数据。这个共享减少了重复缓存，但增加了一致性规则。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+访问方式 & 数据所在位置 & 一致性关注点 \\
+\midrule
+buffered read & page cache 到用户 buffer & 热页不访问设备，冷页触发 I/O \\
+buffered write & 用户 buffer 到 page cache & 返回不等于落盘，页变 dirty \\
+MAP\_SHARED mmap & PTE 映射 page cache 页 & 写入变 dirty，回写时机独立 \\
+MAP\_PRIVATE mmap & COW 匿名页 & 写入不改变文件内容 \\
+direct I/O & 用户页到设备 DMA & 与 page cache 的失效/同步边界 \\
+\bottomrule
+\end{longtable}
+
+direct I/O 试图绕过 page cache，常用于数据库。它减少双重缓存，但要求处理对齐、短 I/O、设备错误和与 buffered/mmap 混用的一致性。若同一文件同时被 direct write 和 buffered read 访问，内核必须失效或同步相关 page cache 页，否则读者可能看到旧数据。
+
+\subsection{inode 元数据和数据块分配}
+
+文件系统不只保存文件内容，还要保存大小、权限、时间戳、link count、extent 或 block map。写入一个新文件块可能同时改变多个结构：分配位图、inode size、extent tree、目录项和 journal。
+
+\begin{lstlisting}
+append_block(file, data):
+  block = allocate_free_block()
+  update_allocation_bitmap(block)
+  write_data(block, data)
+  update_inode_extent(file.inode, block)
+  update_inode_size(file.inode)
+  mark_metadata_dirty(file.inode)
+\end{lstlisting}
+
+崩溃一致性的难点就在这里。如果位图显示块已分配，但 inode 没有引用它，出现空间泄漏；如果 inode 引用块，但位图仍显示空闲，未来可能把同一块分给另一个文件；如果目录项指向未初始化 inode，路径查找会读到坏对象。日志和写序约束用于避免这些不一致状态在重启后被当成合法事实。
+
+\subsection{日志文件系统的三种常见模式}
+
+日志文件系统把元数据或数据更新先写入 journal，再提交。恢复时根据 commit record redo 完整事务，忽略不完整事务。不同模式在性能和数据保证之间取舍。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+模式 & 写入内容 & 崩溃后保证 \\
+\midrule
+metadata journal & journal 只记录元数据 & 文件系统结构一致，文件新数据可能旧或空洞 \\
+ordered mode & 数据先写，再提交元数据 journal & 新元数据不会指向未写入垃圾数据 \\
+data journal & 数据和元数据都写 journal & 语义更强，写放大更高 \\
+\bottomrule
+\end{longtable}
+
+日志不是万能。设备可能重排写入，所以 commit 前后需要 flush/FUA 等顺序保证；journal 空间有限，所以要 checkpoint；checksum 用于发现 torn write；事务太大影响延迟，太小影响吞吐。文件系统设计的核心是把这些成本变成可解释的提交协议。
+
+\subsection{块调度算法：从磁头到 NVMe}
+
+传统磁盘有寻道成本，因此电梯算法会按扇区顺序合并和排序请求，减少磁头来回移动。SSD 和 NVMe 没有机械磁头，但仍有队列深度、并行通道、写放大、flush 成本和公平性问题。块调度从“减少寻道”演进到“控制延迟、合并请求、按 cgroup 分配带宽”。
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
+\toprule
+策略 & 优点 & 问题 \\
+\midrule
+FCFS & 简单，保持提交顺序 & 随机 I/O 性能差，尾延迟不可控 \\
+SSTF & 优先近距离请求，减少寻道 & 远处请求可能饥饿 \\
+SCAN/elevator & 有方向地扫过磁盘 & 参数依赖介质，交互延迟仍需控制 \\
+deadline & 给请求设置过期时间 & 吞吐和延迟需要权衡 \\
+BFQ/权重公平 & 按进程或 cgroup 分配带宽 & 实现复杂，需识别同步/异步流 \\
+mq 调度 & 多硬件队列并行提交 & CPU 亲和性、锁和合并难度增加 \\
+\bottomrule
+\end{longtable}
+
+现代块层还要处理 flush 和 FUA。普通写请求完成，可能只是设备缓存接收；flush 要求设备把缓存内容推到持久介质；FUA 要求特定写绕过或强制落到稳定介质。文件系统的 \code{fsync} 正确性依赖这些语义。
+
+\subsection{驱动生命周期：probe、open、submit、remove}
+
+设备驱动不是只有 read/write。驱动要在设备发现时 probe，分配队列和 DMA 资源；打开设备时建立引用；提交请求时保证 buffer 生命周期；中断或 polling 完成请求；设备移除时拒绝新请求并等待旧请求完成。
+
+\begin{lstlisting}
+driver_probe(dev):
+  map_mmio(dev)
+  allocate_queues(dev)
+  register_interrupt(dev)
+  register_device_node(dev)
+
+driver_remove(dev):
+  mark_dying(dev)
+  wake_all_waiters(dev)
+  stop_queues(dev)
+  wait_inflight_requests(dev)
+  unregister_interrupt(dev)
+  unmap_mmio(dev)
+\end{lstlisting}
+
+热插拔和错误恢复把生命周期变复杂。用户线程可能正在阻塞读设备时设备被拔出；中断可能在 remove 期间到达；DMA 可能尚未完成。驱动必须有 dying 状态、引用计数、in-flight 计数和唤醒所有等待者的关闭路径。
+
+\subsection{I/O 错误传播}
+
+写回错误可能晚于 \code{write} 出现。用户调用 \code{write} 时数据进入 page cache，后台 writeback 才发现设备 \code{EIO}。内核必须把错误记录在 inode 或 file 的错误状态里，让后续 \code{fsync}、\code{close} 或再次写入时能报告。
+
+\begin{lstlisting}
+writeback_complete(page, status):
+  if status == EIO:
+    mapping.error = EIO
+    mark_page_error(page)
+  end_writeback(page)
+
+fsync(file):
+  writeback_dirty_pages(file.mapping)
+  err = file.mapping.consume_error_since(file.open_time)
+  if err:
+    return -err
+  flush_device()
+  return 0
+\end{lstlisting}
+
+这也是为什么可靠程序不能忽略 \code{fsync} 和 \code{close} 错误。错误可能代表先前看似成功的 buffered write 实际没有持久化。高质量 API 文档应明确错误是在当前调用中发生，还是报告此前异步写回失败。
+
+\subsection{文件系统测试：不仅测功能，还测崩溃}
+
+文件系统测试要覆盖运行时一致性、权限、并发和崩溃恢复。只测试“创建文件后能读回”远远不够。
+
+\begin{longtable}{p{0.28\linewidth}p{0.36\linewidth}p{0.24\linewidth}}
+\toprule
+测试类型 & 方法 & 期望 \\
+\midrule
+路径错误 & 构造 \code{ENOENT/ENOTDIR/ELOOP/EACCES} & 错误码准确，目标不被破坏 \\
+引用生命周期 & open 后 unlink、dup、fork、close & inode/file 引用计数正确 \\
+page cache & buffered read/write/mmap 混用 & 内容一致，dirty 状态正确 \\
+direct I/O & 非对齐和混用 buffered I/O & 返回明确错误或同步缓存 \\
+写回错误 & 注入设备 EIO & fsync/close 可观察到错误 \\
+崩溃恢复 & 在事务各阶段断电重放 & fsck/journal 恢复到合法状态 \\
+并发 rename & 多线程查找和替换路径 & 观察到旧或新，不能看到坏中间态 \\
+\bottomrule
+\end{longtable}
+
+崩溃测试通常需要 fault injection 或模拟块设备：在第 N 次写、flush 或 journal commit 后强制崩溃，然后重挂载检查不变量。没有这类测试，文件系统只能证明正常路径可用，不能证明持久化语义可信。

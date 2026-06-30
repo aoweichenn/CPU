@@ -1,0 +1,290 @@
+\chapter{设备驱动、中断下半部与 DMA}
+
+\section{原理}
+
+设备驱动把硬件寄存器、中断、DMA 和内核对象连接起来。应用看到的是 fd、socket、块设备或帧缓冲；驱动看到的是 MMIO 寄存器、描述符环、设备状态位、中断线、DMA 地址和错误码。驱动的难点在于硬件和 CPU 并发运行：CPU 写描述符，设备异步读取；设备写内存，CPU 稍后读取；中断可能在任意时刻到来。
+
+最简单设备可以用 programmed I/O：CPU 直接读写设备寄存器或数据端口。PIO 易懂，但吞吐低，CPU 被数据搬运占住。DMA 让设备直接读写内存，CPU 只准备描述符和缓冲区。DMA 提高吞吐，也引入缓存一致性、地址映射、内存屏障和 buffer 生命周期问题。
+
+驱动通常分成上半部和下半部。中断上半部快速确认设备、读取状态、屏蔽或清除中断，把复杂工作推迟到底半部、工作队列、软中断或普通内核线程。这样可以减少中断关闭时间，避免在硬中断上下文执行可能睡眠的操作。
+
+\section{实践}
+
+先画一个网卡或磁盘的描述符环：
+
+\begin{lstlisting}
+descriptor ring:
+  head: device consumes descriptors
+  tail: driver produces descriptors
+  desc[i]:
+    dma_address
+    length
+    flags
+    status
+\end{lstlisting}
+
+驱动发送路径通常是：从内核分配 buffer，映射成设备可见 DMA 地址，填描述符，执行内存屏障，更新 tail，通知设备。完成路径通常是：设备 DMA 完成并写 status，触发中断，驱动回收描述符，解除 DMA 映射，释放 buffer，唤醒等待者或上报 completion。
+
+\section{算法与实现分析}
+
+\subsection{MMIO 寄存器访问}
+
+MMIO 把设备寄存器映射到物理地址。访问 MMIO 不能当成普通内存优化：编译器不能随便重排，CPU 也要遵守设备要求的顺序。驱动通常使用专用 readl/writel 一类接口。
+
+\begin{lstlisting}
+device_start(dev):
+  writel(dev->mmio + CTRL, CTRL_RESET)
+  wait_until(readl(dev->mmio + STATUS) & READY)
+  writel(dev->mmio + IRQ_MASK, RX_IRQ | TX_IRQ)
+\end{lstlisting}
+
+轮询 wait 要有超时。设备可能坏掉，寄存器可能永远不变。驱动若在内核里无限等待，会拖死系统。
+
+\subsection{描述符环}
+
+描述符环是设备驱动的核心队列。生产者和消费者可以是 CPU 和设备，也可以反过来。环满时不能继续提交，环空时不能继续回收。
+
+\begin{lstlisting}
+submit_tx(desc_ring, packet):
+  next = (tail + 1) % ring_size
+  if next == head:
+    return -EAGAIN
+  desc[tail].addr = dma_map(packet.data)
+  desc[tail].len = packet.len
+  desc[tail].flags = OWNED_BY_DEVICE
+  memory_barrier()
+  tail = next
+  writel(DOORBELL, tail)
+\end{lstlisting}
+
+这里的屏障非常关键。CPU 必须先把描述符内容写完，再更新 tail 或 doorbell 通知设备；否则设备可能看到半初始化描述符。
+
+\subsection{DMA 和缓存一致性}
+
+若 CPU cache 和设备 DMA 不自动一致，驱动必须在设备读内存前清理 cache，在设备写内存后失效 cache。即使硬件支持 IOMMU，也要建立设备可访问地址映射。
+
+\begin{lstlisting}
+prepare_dma_to_device(buf):
+  cache_clean(buf)
+  dma_addr = iommu_map(buf.phys)
+  return dma_addr
+
+finish_dma_from_device(buf):
+  cache_invalidate(buf)
+  parse_received_data(buf)
+\end{lstlisting}
+
+DMA buffer 的生命周期必须覆盖设备访问全过程。提交后不能释放或复用 buffer，直到 completion 表明设备不再访问它。这个规则和异步 I/O 的 buffer 所有权完全一致。
+
+\subsection{中断合并和轮询}
+
+高吞吐设备如果每个包都中断一次，CPU 会被中断淹没。中断合并让设备积累多个完成再中断；NAPI 一类机制在高负载下从中断转为轮询，批量处理包，降低中断成本。代价是单个包延迟可能增加。
+
+\begin{lstlisting}
+rx_interrupt():
+  disable_rx_irq()
+  schedule_poll()
+
+poll(budget):
+  processed = 0
+  while processed < budget and rx_desc_ready():
+    handle_packet()
+    processed += 1
+  if no_more_packets():
+    enable_rx_irq()
+\end{lstlisting}
+
+这里的 budget 是背压工具。一次 poll 不能无限处理，否则其他任务得不到 CPU。
+
+\section{测试}
+
+\begin{itemize}
+\tightlist
+\item MMIO 等待必须有超时，设备无响应时返回错误。
+\item 描述符环满时返回背压，不覆盖未完成描述符。
+\item 提交描述符前执行必要内存屏障。
+\item DMA buffer 在 completion 前不能释放或复用。
+\item 中断处理上半部不执行可能睡眠操作。
+\item 批量 poll 遵守 budget，不能垄断 CPU。
+\item 设备 reset 后，驱动能清理 in-flight 请求并通知上层失败。
+\end{itemize}
+
+\section{源码级补充：Linux 设备模型、PCI、NVMe、virtio 与 IOMMU}
+
+\subsection{设备模型：bus、driver、device、class}
+
+Linux 设备模型把发现、匹配、生命周期和 sysfs 统一起来。总线负责枚举和匹配，driver 提供 probe/remove，device 表示具体硬件或虚拟设备，class 给用户空间暴露类别视图，kobject/kset 负责引用计数和 sysfs 层次。
+
+\begin{lstlisting}
+struct bus_type      -> match(device, driver)
+struct device_driver -> probe(device), remove(device)
+struct device        -> parent, bus, driver, kobject
+struct class         -> /sys/class view
+\end{lstlisting}
+
+probe 成功后驱动必须拥有明确资源集合：MMIO 映射、IRQ、DMA mask、队列、字符/块/网络注册对象。remove 路径按相反顺序撤销，并拒绝新请求、等待 in-flight 请求完成。
+
+\subsection{PCI 驱动骨架}
+
+\begin{lstlisting}
+static const struct pci_device_id ids[] = {
+  { PCI_DEVICE(VENDOR, DEVICE) },
+  { 0 }
+};
+
+probe(pdev, id):
+  pci_enable_device(pdev)
+  pci_request_regions(pdev)
+  mmio = pci_iomap(pdev, bar)
+  dma_set_mask_and_coherent(pdev, DMA_BIT_MASK(64))
+  request_irq(pdev->irq, handler, IRQF_SHARED, name, dev)
+  init_queues(dev)
+
+remove(pdev):
+  stop_queues(dev)
+  free_irq(pdev->irq, dev)
+  pci_iounmap(pdev, mmio)
+  pci_release_regions(pdev)
+  pci_disable_device(pdev)
+\end{lstlisting}
+
+错误路径要能从任一步失败回滚。例如 \code{request\_irq} 失败时，要释放 MMIO 和 PCI region；队列初始化失败时，要释放 IRQ。真实源码中这类 \code{goto err\_*} 标签比正常路径更能体现驱动质量。
+
+\subsection{字符、块、网络三类设备}
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+类别 & 核心对象 & 典型回调 \\
+\midrule
+字符设备 & \code{cdev}、\code{file\_operations} & \code{open/read/write/ioctl/poll} \\
+块设备 & \code{gendisk}、\code{request\_queue}、blk-mq & \code{submit\_bio}、queue\_rq、completion \\
+网络设备 & \code{net\_device}、\code{net\_device\_ops}、NAPI & \code{ndo\_start\_xmit}、poll、set\_rx\_mode \\
+\bottomrule
+\end{longtable}
+
+同一个硬件可能暴露多个接口。比如 NVMe 是块设备，网卡是网络设备，串口是字符设备。VFS 统一 fd 入口，但驱动对象和 completion 路径完全不同。
+
+\subsection{streaming DMA 与 coherent DMA}
+
+\code{dma\_alloc\_coherent} 返回 CPU 和设备一致可见的内存，适合描述符环；\code{dma\_map\_single/sg} 把已有 buffer 临时映射给设备，适合数据包或块 I/O。streaming DMA 要在方向、同步和 unmap 上严格配对。
+
+\begin{lstlisting}
+tx_submit(buf):
+  dma = dma_map_single(dev, buf.data, buf.len, DMA_TO_DEVICE)
+  if dma_mapping_error(dev, dma): return -EIO
+  fill_desc(dma, buf.len)
+  dma_wmb()
+  ring_doorbell()
+
+tx_complete(desc):
+  dma_unmap_single(dev, desc.dma, desc.len, DMA_TO_DEVICE)
+  free_buf(desc.buf)
+\end{lstlisting}
+
+IOMMU 为设备建立地址空间，限制设备只能 DMA 到授权页。没有 IOMMU 或映射错误时，设备 bug 可能覆盖任意内存；有 IOMMU 时，错误 DMA 会变成 IOMMU fault，至少能阻止破坏扩大。
+
+\subsection{NAPI、NVMe 与 virtio 阅读入口}
+
+网络驱动可读 \filepath{drivers/net/ethernet/intel/e1000e/} 或 virtio-net；NVMe 可读 \filepath{drivers/nvme/host/}；virtio 核心可读 \filepath{drivers/virtio/}。阅读时按同一模板：
+
+\begin{enumerate}
+\tightlist
+\item probe 如何发现设备、分配队列、注册上层对象。
+\item submit 路径如何填描述符、DMA map、通知设备。
+\item completion 路径如何从中断/NAPI/poll 回收资源。
+\item reset/remove 路径如何停止新请求并清理 in-flight。
+\item 错误统计在哪里暴露给 ethtool、sysfs、dmesg 或 block stats。
+\end{enumerate}
+
+\subsection{platform 设备与 device tree}
+
+并非所有设备都能像 PCI 一样自描述。很多 SoC 外设通过 device tree 或 ACPI 表描述寄存器地址、中断号、时钟、复位线、DMA 通道和兼容字符串。platform driver 的匹配不依赖 vendor/device id，而依赖 \code{compatible} 或 ACPI id。
+
+\begin{lstlisting}
+uart0: serial@40004000 {
+  compatible = "vendor,soc-uart";
+  reg = <0x40004000 0x1000>;
+  interrupts = <5>;
+  clocks = <&apb_clk>;
+  dmas = <&dma0 3>, <&dma0 4>;
+};
+\end{lstlisting}
+
+probe 阶段要把描述转换成内核资源：\code{platform\_get\_resource} 取得 MMIO 区间，\code{devm\_ioremap\_resource} 建立映射，\code{platform\_get\_irq} 取得中断，clock/reset API 管理时钟和复位。教学系统可以把 device tree 简化成静态设备表，但仍要保留“描述硬件”和“驱动绑定”两个阶段。
+
+\subsection{托管资源和错误回滚}
+
+Linux 驱动大量使用 devm 托管资源。资源绑定到 device 生命周期，remove 或 probe 失败时自动释放。托管资源不是为了偷懒，而是为了减少 probe 多阶段失败路径中的泄漏。
+
+\begin{lstlisting}
+probe(dev):
+  state = devm_kzalloc(dev, sizeof(*state))
+  mmio = devm_ioremap_resource(dev, res)
+  irq = platform_get_irq(dev, 0)
+  ret = devm_request_threaded_irq(dev, irq, top, thread, flags, name, state)
+  if ret:
+    return ret
+  ret = register_upper_object(state)
+  if ret:
+    return ret
+  return 0
+\end{lstlisting}
+
+但 devm 不能替代所有生命周期管理。已经暴露给上层的字符设备、网络设备或块设备必须先停止新请求、撤销注册、等待 in-flight 完成，再让托管资源释放。否则用户态仍可能通过旧 fd 进入已经释放的 MMIO 或队列。
+
+\subsection{ioctl、sysfs 与用户态控制面}
+
+驱动给用户态暴露控制面时，常见三种方式：ioctl、sysfs 属性和 netlink。ioctl 适合和 fd 绑定的设备私有命令；sysfs 适合稳定、简单、可文本化的设备属性；netlink 适合网络和复杂事件通知。控制面设计必须有版本、长度、权限和兼容性边界。
+
+\begin{lstlisting}
+ioctl(file, cmd, user_arg):
+  switch cmd:
+    case GET_STATUS:
+      status = snapshot_device_status()
+      return copy_to_user(user_arg, status)
+    case RESET_DEVICE:
+      if !capable(CAP_SYS_ADMIN):
+        return -EPERM
+      return reset_device_safely()
+    default:
+      return -ENOTTY
+\end{lstlisting}
+
+ioctl 的常见漏洞来自信任用户结构体长度、未检查 padding、把内核指针泄露给用户、或在 reset 中没有和 I/O 路径同步。控制命令不是旁路，它和 read/write/interrupt 一样会并发访问设备状态。
+
+\subsection{runtime PM、suspend 与 resume}
+
+现代设备需要省电。runtime power management 允许设备空闲时关闭时钟或电源域；系统 suspend/resume 要在整机睡眠和唤醒时保存恢复设备状态。驱动必须区分“设备逻辑对象仍存在”和“硬件暂时不可访问”。
+
+\begin{lstlisting}
+runtime_suspend(dev):
+  stop_new_io(dev)
+  wait_inflight(dev)
+  save_registers(dev)
+  disable_irq(dev)
+  disable_clock(dev)
+
+runtime_resume(dev):
+  enable_clock(dev)
+  restore_registers(dev)
+  enable_irq(dev)
+  restart_queues(dev)
+\end{lstlisting}
+
+如果 resume 后忘记恢复 DMA mask、队列基址或中断 mask，设备可能表现为偶发超时。电源管理 bug 常常只在压力、热插拔、suspend 循环或低功耗平台上出现，因此测试必须覆盖这些状态转换。
+
+\subsection{驱动并发不变量}
+
+驱动至少要维护下面不变量：
+
+\begin{itemize}
+\tightlist
+\item 提交给设备的描述符在 completion 前不能释放。
+\item 设备可 DMA 的 buffer 必须有有效映射，方向必须匹配。
+\item remove/reset 开始后，不再接受新请求。
+\item 中断处理看到 dying 状态时只确认和丢弃，不再提交新工作。
+\item 用户 fd 持有期间，驱动私有对象引用不能降到零。
+\item 上半部只做不可睡眠操作，复杂恢复进入线程化 IRQ 或 workqueue。
+\end{itemize}
+
+把这些不变量写进测试，才能发现“正常收发能跑”之外的问题。驱动不是能读写设备就合格，而是要在错误、中断风暴、热拔、reset 和并发 close 下仍然收敛。

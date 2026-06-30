@@ -1,0 +1,228 @@
+\chapter{并发、同步、IPC 与信号}
+
+\section{原理}
+
+多线程程序的核心风险不是“同时执行”这个事实，而是共享状态缺少清晰的不变量。两个线程同时修改一个队列，硬件只能执行 load、store、CAS、fence 等局部操作；它不知道 head、tail、size、closed 之间应该满足什么关系。操作系统和运行库提供 mutex、condition variable、semaphore、futex、pipe、signal 等机制，帮助程序把共享状态、等待和唤醒写成可检查的协议。
+
+互斥锁保护的不是某个变量，而是一组字段之间的不变量。条件变量也不是消息队列，它表达的是“某个谓词暂时不满足，线程可以睡眠，等状态可能改变后再重新检查”。正确等待必须同时包含谓词、锁和退出路径。只写 \code{wait()} 而不写完整谓词，会遇到虚假唤醒、丢失唤醒和关闭卡死。
+
+一个有界队列足以说明同步原理。队列状态包括 buffer、capacity、head、tail、size、closed。生产者等待 \code{size < capacity || closed}，消费者等待 \code{size > 0 || closed}。\code{push} 改变 buffer、tail、size；\code{pop} 改变 buffer、head、size；\code{close} 改变 closed 并唤醒所有等待者。任何一个字段在锁外修改，都会破坏状态机。
+
+IPC 是跨进程同步和数据交换。pipe 把字节流连接到 fd，socket 把通信扩展到本机或网络，shared memory 共享页但不自动提供同步，message queue 提供消息边界，eventfd 把计数型事件暴露成 fd readiness。IPC 的关键不是哪个接口高级，而是数据在哪里、所有权如何转移、背压如何发生、关闭如何传播。
+
+信号是异步控制流。它可以通知进程发生了外部事件，例如终端中断、子进程退出、非法内存访问、定时器到期。信号难学，是因为它打断正常执行路径，而且信号处理函数只能安全调用很少一部分函数。工程上常把信号转成更普通的事件，例如写 pipe、设置原子标志或使用 signalfd，再交给主循环处理。
+
+\section{实践}
+
+同步实践先写不变量表。
+
+\begin{longtable}{p{0.18\linewidth}p{0.48\linewidth}p{0.22\linewidth}}
+\toprule
+字段 & 含义 & 受谁保护 \\
+\midrule
+capacity & 最大槽数，固定大于 0 & 构造后只读 \\
+head & 下一个可读槽 & mutex \\
+tail & 下一个可写槽 & mutex \\
+size & 当前元素数量 & mutex \\
+closed & 是否拒绝新写入 & mutex \\
+\bottomrule
+\end{longtable}
+
+然后写等待谓词：
+
+\begin{itemize}
+\tightlist
+\item 生产者等待：\code{size < capacity || closed}
+\item 消费者等待：\code{size > 0 || closed}
+\item 关闭等待：\code{running\_workers == 0} 或 \code{queue\_empty \&\& all\_workers\_stopped}
+\end{itemize}
+
+IPC 实践也按同样方式写。pipe 的状态包括读端引用数、写端引用数、内核缓冲区、读写阻塞队列。写端关闭后，读端读空返回 EOF；读端关闭后，写端写入会失败或收到信号；缓冲区满时写阻塞或返回 EAGAIN；缓冲区空时读阻塞或返回 EAGAIN。
+
+信号实践要避免在 handler 里做复杂逻辑。推荐的纸上模型是：handler 只记录最小事实，例如设置原子标志；主循环在安全位置检查标志并执行真正清理。若系统使用 signalfd，则信号也进入 fd/event loop 模型，和其他 I/O 事件统一处理。
+
+\section{算法与实现分析}
+
+\subsection{环形缓冲区}
+
+环形缓冲区是设备驱动、pipe、socket buffer 和日志队列的基础结构。它用固定数组保存数据，用 head 指向下一个可读位置，用 tail 指向下一个可写位置。若额外维护 size，判断空满很直接；若不维护 size，则常留一个空槽，用 \code{head == tail} 表示空，用 \code{next(tail) == head} 表示满。
+
+\begin{lstlisting}
+bool push(Ring* r, byte b) {
+  if (r->size == r->capacity) return false;
+  r->buf[r->tail] = b;
+  r->tail = (r->tail + 1) % r->capacity;
+  r->size += 1;
+  return true;
+}
+
+bool pop(Ring* r, byte* out) {
+  if (r->size == 0) return false;
+  *out = r->buf[r->head];
+  r->head = (r->head + 1) % r->capacity;
+  r->size -= 1;
+  return true;
+}
+\end{lstlisting}
+
+push/pop 都是 \code{O(1)}。难点不在算法复杂度，而在并发所有权。单生产者单消费者可以用两个原子索引实现无锁队列；多生产者多消费者通常先用 mutex 保护不变量，等有证据证明锁是瓶颈，再考虑更复杂结构。
+
+\subsection{信号量}
+
+信号量表达可用资源数量。P/acquire 操作在计数大于 0 时减一，否则等待；V/release 操作加一并唤醒等待者。它适合连接池许可、队列空槽、I/O in-flight 限额，不适合保护多字段复杂不变量。
+
+\begin{lstlisting}
+acquire(sem):
+  lock(sem.lock)
+  while sem.count == 0:
+    wait(sem.cv, sem.lock)
+  sem.count -= 1
+  unlock(sem.lock)
+
+release(sem):
+  lock(sem.lock)
+  sem.count += 1
+  notify_one(sem.cv)
+  unlock(sem.lock)
+\end{lstlisting}
+
+信号量的常见 bug 是许可泄漏：acquire 成功后，错误路径忘记 release。工程上要用作用域对象或 finally 路径保证释放。另一个 bug 是把信号量当成关闭广播；关闭是额外状态，必须单独表达。
+
+\subsection{条件变量}
+
+条件变量的算法核心是“检查谓词、睡眠、醒来后重新检查”。虚假唤醒不是异常，而是接口允许的行为；因此 wait 必须写在 while 循环中。
+
+\begin{lstlisting}
+lock(m)
+while !predicate():
+  wait(cv, m)
+// predicate is true while holding m
+do_state_transition()
+unlock(m)
+\end{lstlisting}
+
+notify 的语义也要讲清：通知不是把数据交给等待者，只是说明谓词可能变真。若生产者先通知再修改状态，消费者醒来仍看不到新状态；若修改状态后忘记通知，等待者可能永远睡眠；若关闭时只通知一个等待队列，其他等待者可能卡住。
+
+\subsection{IPC 的背压算法}
+
+pipe 和 socket 都需要背压。缓冲区满时，写入者要么阻塞，要么在非阻塞模式返回 \code{EAGAIN}。背压算法的本质是有界队列：
+
+\begin{lstlisting}
+write(pipe, bytes):
+  while bytes not empty:
+    if pipe.buffer_full():
+      if nonblocking: return bytes_written_or_EAGAIN
+      sleep_until_not_full_or_closed()
+    copy_some_bytes_into_buffer()
+    wake_readers()
+\end{lstlisting}
+
+这里的 \code{copy\_some\_bytes} 说明短写是正常路径。只要缓冲区剩余空间小于请求长度，写入就可能部分完成。调用者必须把“已完成多少字节”作为状态保存，而不是假设一次 write 完成整个消息。
+
+\section{测试}
+
+并发测试要覆盖正常路径、等待路径和关闭路径。只测单线程 push/pop 没有意义，因为它没有触发同步问题。
+
+\begin{itemize}
+\tightlist
+\item 多生产者多消费者下，元素不丢、不重、不乱破坏队列不变量。
+\item 队列空时消费者等待，生产者 push 后消费者能醒来。
+\item 队列满时生产者等待，消费者 pop 后生产者能醒来。
+\item close 能唤醒所有生产者和消费者，不留下永久睡眠线程。
+\item timeout 或 cancel 路径不会破坏 size/head/tail。
+\item pipe 读写能处理 EOF、EPIPE、EAGAIN 和短读短写。
+\item 信号只改变允许改变的最小状态，不在 handler 中执行不安全操作。
+\end{itemize}
+
+测试报告必须写出等待谓词和唤醒来源。若测试只说“不会死锁”，但没有说明哪个线程等什么、谁负责唤醒、关闭时怎样退出，这个测试不可维护。
+
+\section{源码级补充：Linux IPC、信号与事件 fd}
+
+\subsection{pipefs 与 pipe\_buffer}
+
+Linux 管道不是用户态数组，而是内核 pipe inode 和一组 \code{pipe\_buffer}。每个 buffer 可以引用匿名页、page cache 页或 splice 传递的页片段。管道容量有默认值和上限，常见默认容量是 65536 字节量级，但会受内核版本和配置影响。
+
+\begin{lstlisting}
+pipe_write(file, iov):
+  pipe = file.private_data
+  lock(pipe.mutex)
+  while pipe_full(pipe):
+    if nonblocking: return -EAGAIN
+    wait(pipe.wr_wait, pipe.mutex)
+  copy_or_splice_pages_into_pipe_buffers()
+  wake_readers(pipe.rd_wait)
+  unlock(pipe.mutex)
+\end{lstlisting}
+
+读源码时看 \filepath{fs/pipe.c}：\code{pipe\_write}、\code{pipe\_read}、\code{pipe\_wait}、\code{pipe\_buffer}。关注点不是函数名，而是关闭语义：写端全关且缓冲为空时读返回 EOF；读端全关时写失败并可能触发 \code{SIGPIPE}；非阻塞模式返回 \code{EAGAIN}。
+
+\subsection{System V 与 POSIX IPC}
+
+System V IPC 提供 semaphore、message queue、shared memory，典型接口是 \code{semget/semop}、\code{msgget/msgsnd/msgrcv}、\code{shmget/shmat}。POSIX IPC 提供命名 semaphore、POSIX message queue 和共享内存对象，接口如 \code{sem\_open}、\code{mq\_open}、\code{shm\_open}。
+
+\begin{longtable}{p{0.24\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+机制 & 特点 & 适用边界 \\
+\midrule
+System V semaphore & 内核维护计数和 undo 语义 & 传统系统和跨进程资源计数 \\
+POSIX semaphore & named/unnamed 两类 & 进程间或线程间许可控制 \\
+System V msgqueue & 类型化消息，内核队列 & 需要消息边界但吞吐不极致 \\
+POSIX mq & 描述符化，可通知 & 与 fd/event loop 集成更方便 \\
+shared memory & 共享页，不自带同步 & 大数据交换，需 futex/锁配合 \\
+\bottomrule
+\end{longtable}
+
+共享内存常和 futex 一起使用：数据放在共享页，锁字也放在共享页；无竞争时用户态原子操作完成，有竞争时 futex 让内核按这个用户地址建立等待队列。这样数据路径不必每次进入内核。
+
+\subsection{eventfd、timerfd、signalfd 和 memfd}
+
+Linux 把很多事件转成 fd，是为了让 epoll 能统一等待。
+
+\begin{longtable}{p{0.18\linewidth}p{0.4\linewidth}p{0.3\linewidth}}
+\toprule
+接口 & 内核语义 & 常见用途 \\
+\midrule
+\code{eventfd} & 64 位计数器，read 消费，write 增加 & 线程/进程通知、io\_uring、KVM kick \\
+\code{timerfd} & 定时器到期次数可读 & event loop 中处理超时 \\
+\code{signalfd} & 把被 mask 的信号作为 fd 读取 & 避免复杂 async signal handler \\
+\code{memfd} & 匿名内存文件，可 seal & 共享内存、沙箱传递只读 blob \\
+\bottomrule
+\end{longtable}
+
+\code{eventfd} 的 \code{EFD\_SEMAPHORE} 模式每次 read 只消耗 1，否则 read 返回当前计数并清零。这个小差异决定它表达的是“累计事件”还是“许可”。\code{memfd} sealing 可以禁止继续写、增长或收缩，让发送方把一段内存变成稳定对象再交给接收方。
+
+\subsection{信号投递路径}
+
+信号不是立即调用用户函数。内核先把信号加入 pending 集合；线程返回用户态前检查 pending signal；若未被屏蔽且有 handler，内核在用户栈上构造 signal frame，把返回地址改成 handler；handler 执行后通过 sigreturn 恢复原上下文。
+
+\begin{lstlisting}
+send_signal(task, sig, info):
+  add_to_pending(task.signal_pending, sig, info)
+  if task sleeping interruptibly:
+    wake_up(task)
+
+return_to_user(task):
+  if has_unblocked_pending_signal(task):
+    build_signal_frame_on_user_stack()
+    task.regs.ip = handler_address
+    task.regs.sp = signal_frame_sp
+\end{lstlisting}
+
+这解释了为什么 handler 可用函数受限：它运行在异步插入的用户控制流里，可能打断 malloc、printf、锁持有路径。signalfd 的工程价值在于把异步信号改造成普通 fd 事件，降低重入风险。
+
+\subsection{IPC 性能决策树}
+
+\begin{longtable}{p{0.28\linewidth}p{0.52\linewidth}}
+\toprule
+需求 & 推荐思路 \\
+\midrule
+少量控制事件 & \code{eventfd}、pipe、socketpair \\
+需要消息边界 & Unix datagram socket、POSIX mq、自定义帧协议 \\
+大块数据同机传输 & shared memory + futex/eventfd 通知 \\
+要跨机器扩展 & TCP/QUIC/RPC，明确超时、重试和幂等 \\
+要把文件数据转发给 socket & \code{sendfile}、\code{splice}、zero-copy 路径 \\
+要统一事件循环 & fd 化接口：epoll + eventfd/timerfd/signalfd \\
+\bottomrule
+\end{longtable}
+
+性能不是只看平均延迟。管道有内核拷贝和容量上限；共享内存吞吐高但同步复杂；socket 语义完整但协议开销高；message queue 保留边界但容量和优先级策略会影响尾延迟。选择 IPC 时要写出数据大小、频率、是否需要消息边界、是否跨主机、背压和关闭语义。

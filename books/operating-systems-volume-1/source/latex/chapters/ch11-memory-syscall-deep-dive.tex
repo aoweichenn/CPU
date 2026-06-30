@@ -1,0 +1,316 @@
+\section{系统调用与内存深讲：一次请求如何安全穿过边界}
+
+系统调用和内存管理是 OS 隔离能力的核心。系统调用控制“用户能请求什么”，页表控制“用户能访问什么”。二者常常一起出现：用户把指针传给系统调用，内核必须检查这段用户内存；缺页可能在系统调用复制参数时发生；\code{exec} 会替换地址空间并重建用户栈。
+
+\subsection{为什么用户指针不能直接解引用}
+
+用户传入的地址可能不存在、只读、跨页、被另一个线程并发修改，甚至在检查后被 \code{munmap}。内核若直接解引用，轻则崩溃，重则形成安全漏洞。因此内核要用专门的 copy 接口，并准备处理 copy 期间的 page fault。
+
+\begin{lstlisting}
+sys_write(fd, user_buf, len):
+  file = lookup_fd(fd)
+  if file == null:
+    return -EBADF
+  if not file.can_write:
+    return -EBADF
+  kbuf = allocate_temp(min(len, MAX_RW_COUNT))
+  ret = copy_from_user(kbuf, user_buf, len)
+  if ret < 0:
+    return -EFAULT
+  return vfs_write(file, kbuf, len)
+\end{lstlisting}
+
+注意顺序：先查 fd 和写权限，再复制用户数据；复制失败不能留下半提交文件状态。对很大的写入，真实系统不会一次复制全部，而是分段处理；每段成功后返回值可能是短写，调用者必须循环。
+
+\subsection{page fault 的三种结论}
+
+同样是 page fault，内核结论可能完全不同。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+结论 & 条件 & 处理 \\
+\midrule
+合法缺页 & 地址属于 VMA，权限允许，只是 PTE 不存在 & 分配页、读文件页或建立 COW 页 \\
+权限错误 & 地址属于 VMA，但访问类型不允许 & 发送 SIGSEGV 或返回 \code{EFAULT} \\
+非法地址 & 不属于任何 VMA & 发送 SIGSEGV 或返回 \code{EFAULT} \\
+\bottomrule
+\end{longtable}
+
+区别取决于上下文。用户态普通 load/store 错误通常给进程发信号；内核在 \code{copy\_from\_user} 中遇到用户地址错误，通常让系统调用返回 \code{EFAULT}。内核访问自己错误地址则是内核 bug，不能当普通用户错误处理。
+
+\subsection{fork、COW 与 exec 的组合}
+
+shell 启动程序常见流程是 fork 后在子进程中设置 fd，再 exec。若 fork 立刻复制整个地址空间，启动大进程会很慢。COW 让父子先共享只读页，只有写入时才复制。exec 成功后，子进程旧地址空间被替换，很多 COW 页根本不用复制。
+
+\begin{lstlisting}
+parent shell:
+  pid = fork()
+
+child after fork:
+  dup2(file, STDOUT)
+  execve(program)
+
+kernel optimization:
+  fork shares pages as read-only COW
+  exec discards old user mappings
+  only pages written before exec are copied
+\end{lstlisting}
+
+这说明机制之间是组合出来的。fork 的语义简单，COW 让它便宜，exec 让它变成启动新程序，fd 继承让 shell 能做重定向。很多 OS 设计的美感来自小机制组合，而不是一个巨大的 \code{spawn} 黑盒。
+
+\subsection{内存回收为什么会影响系统调用延迟}
+
+系统调用可能看起来只是写 socket 或打开文件，却在中途分配内存。若内存不足，分配器可能触发回收；回收可能写回脏页；写回可能等待块设备；块设备完成再唤醒当前线程。于是一个普通请求的尾延迟可能来自内存和 I/O，而不是业务代码。
+
+\begin{lstlisting}
+sys_send()
+  -> allocate socket buffer
+  -> memory pressure
+  -> reclaim pages
+  -> dirty page writeback
+  -> block I/O wait
+  -> scheduler wakeup
+  -> return to send path
+\end{lstlisting}
+
+这也是为什么真实性能分析要看 off-CPU 时间、page fault、writeback 和 block I/O。只看 CPU profiler 会漏掉大部分等待。
+
+\subsection{系统调用与内存练习}
+
+\begin{enumerate}
+\tightlist
+\item 为什么 \code{copy\_from\_user} 失败应该返回 \code{EFAULT}，而不是让内核 panic？
+\item \code{fork} 后父子进程共享 COW 页，父进程写入一页后，页表和物理页引用计数怎样变化？
+\item 为什么 \code{exec} 失败前应尽量保留旧地址空间可运行？
+\item \code{mmap(MAP\_PRIVATE)} 写入文件映射页后，文件内容为什么不变？
+\item 为什么内存压力会让看似无关的系统调用变慢？
+\end{enumerate}
+
+\subsection{系统调用错误矩阵}
+
+高质量系统调用实现要能区分不同失败原因。把所有失败都返回一个通用错误，会让调用者无法恢复。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+错误 & 典型原因 & 调用者策略 \\
+\midrule
+\code{EBADF} & fd 不存在或模式不允许 & 程序 bug 或句柄生命周期错误 \\
+\code{EFAULT} & 用户指针不可访问 & 程序 bug，不能重试同一指针 \\
+\code{EINTR} & 阻塞调用被信号打断 & 根据已完成字节数决定是否重试 \\
+\code{EAGAIN} & 非阻塞对象暂时不能推进 & 等 readiness 后重试 \\
+\code{ENOMEM} & 内存不足或限制触发 & 降级、释放资源或失败返回 \\
+\code{EIO} & 设备或底层 I/O 错误 & 上报、切换副本、进入恢复流程 \\
+\code{EACCES} & 权限不足 & 请求授权或拒绝操作 \\
+\bottomrule
+\end{longtable}
+
+错误码本身就是 API 的一部分。比如 \code{EAGAIN} 表示状态可能稍后改变，\code{EFAULT} 表示调用者传了坏地址，二者的恢复策略完全不同。
+
+\subsection{页表权限和文件权限的区别}
+
+初学者容易混淆“我能打开文件”和“我能访问内存”。文件权限是文件系统对象上的访问控制；页表权限是 CPU 执行每次内存访问时检查的硬件权限。二者可以关联，但不是同一个东西。
+
+\begin{lstlisting}
+open file read-only:
+  file.can_write = false
+
+mmap file private writable:
+  VMA may allow write
+  first write creates anonymous COW page
+  file content is not modified
+
+mmap file shared writable:
+  fd must allow write
+  dirty page belongs to file mapping
+  msync/fsync affects persistence
+\end{lstlisting}
+
+这就是为什么 \code{MAP\_PRIVATE} 可以让只读文件映射在进程内“可写”：写入的是私有匿名副本，不是文件本体。反过来，\code{MAP\_SHARED} 可写映射必须受文件打开模式和文件系统权限限制。
+
+\subsection{本章小结}
+
+\begin{itemize}
+\tightlist
+\item 系统调用跨越信任边界，必须检查 fd、权限、用户指针和对象状态。
+\item page fault 不是单一错误；它可能是合法懒加载、权限错误或非法地址。
+\item fork、COW、exec、fd 继承共同组成高效进程启动模型。
+\item 内存压力可能把普通系统调用拖入回收和 I/O 等待。
+\item 错误码要表达恢复策略，而不是只表达“失败了”。
+\end{itemize}
+
+\subsection{系统调用入口的生命周期}
+
+系统调用入口不是简单跳到一个 C 函数。CPU 从用户态进入内核后，内核要切换到受信任内核栈，保存用户寄存器，建立当前线程的系统调用上下文，验证系统调用号和参数，再调用具体实现。返回前还要处理信号、抢占、审计、ptrace/seccomp 等边界。
+
+\begin{lstlisting}
+syscall_entry:
+  switch_to_kernel_stack()
+  save_user_registers()
+  nr = user_registers.syscall_number
+  if seccomp_denies(nr):
+    return_error_or_kill()
+  ret = syscall_table[nr](arg0, arg1, ...)
+  if signal_pending(current):
+    prepare_signal_frame_or_restart()
+  if need_reschedule:
+    schedule()
+  restore_user_registers(ret)
+  return_to_user()
+\end{lstlisting}
+
+这条路径解释了几个现象。系统调用可能被信号打断，也可能在返回用户态前被抢占；同一个系统调用在 tracing 或 seccomp 下成本不同；错误返回不是异常抛出，而是 ABI 规定的返回值和错误码。系统调用接口必须稳定，因为它是用户程序和内核之间的长期二进制契约。
+
+\subsection{用户指针的 TOCTOU 问题}
+
+即使内核先检查用户地址范围，再复制数据，也不能假设这段内存在检查后不变。另一个线程可能修改 buffer、调用 \code{munmap}，或改变内存内容。正确模型是：检查只能证明“此刻看起来可访问”，真正复制必须能处理 fault；若需要稳定数据，内核要复制到内核缓冲区后再验证和使用。
+
+\begin{lstlisting}
+bad_path(user_header):
+  if validate_user_header(user_header):
+    // user thread may change fields here
+    use_header_fields_directly(user_header)
+
+better_path(user_header):
+  hdr = copy_from_user(user_header, sizeof(Header))
+  if !validate_header(hdr):
+    return -EINVAL
+  use_private_copy(hdr)
+\end{lstlisting}
+
+不是所有用户数据都必须一次复制完。大 I/O 通常分段复制或使用 pinned pages、iov iterator、zero-copy 机制。但无论哪种方式，所有权和生命周期都要写清楚：谁能修改这段内存，设备或内核何时完成访问，失败时如何解除 pin 或引用。
+
+\subsection{VMA、PTE 和 page cache 的三层关系}
+
+很多虚拟内存错误来自混淆三层对象。VMA 是虚拟地址区间的策略；PTE 是某个虚拟页当前的硬件映射；page cache 是文件内容在内存中的缓存页。文件 \code{mmap} 首次访问时，VMA 说明这段地址来自哪个文件和偏移；page cache 提供或创建对应页；PTE 把该页映射进进程地址空间。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+对象 & 回答的问题 & 典型变化 \\
+\midrule
+VMA & 这段地址是否合法，权限和来源是什么 & \code{mmap/munmap/mprotect} 改变 \\
+PTE & 这一页现在是否可由硬件访问 & 缺页、换出、COW、unmap 改变 \\
+page cache page & 文件某偏移的内容是否在内存 & read、mmap fault、writeback、reclaim 改变 \\
+\bottomrule
+\end{longtable}
+
+因此，没有 PTE 不一定是错误；可能是合法 VMA 的懒加载。没有 VMA 通常才是非法地址。page cache 中有页，也不代表某进程已经有 PTE；多个进程可以通过不同 PTE 映射同一个 page cache 页。
+
+\subsection{缺页处理的完整分支}
+
+缺页处理要先分类，再处理。分类至少包括：地址是否在用户范围，是否属于 VMA，访问权限是否允许，PTE 是否存在但权限不符，是否 COW，是否文件页，是否栈增长，是否内核 copy 用户数据时发生。
+
+\begin{lstlisting}
+handle_fault(mm, addr, access, context):
+  if !is_user_range(addr):
+    return fault_result(context, BAD_ADDRESS)
+  vma = find_vma(mm, addr)
+  if vma == null:
+    return fault_result(context, NO_VMA)
+  if is_stack_growth(vma, addr):
+    expand_stack_or_fail(vma, addr)
+  if !vma.allows(access):
+    return fault_result(context, PERMISSION)
+  pte = walk_pte(mm, addr, create=true)
+  if pte.present and access.write and pte.cow:
+    return handle_cow_fault(pte)
+  if !pte.present:
+    return materialize_page(vma, addr, access)
+  return fault_result(context, PERMISSION)
+\end{lstlisting}
+
+\code{fault\_result} 取决于上下文。用户态访问失败通常发信号；系统调用复制用户内存失败通常返回 \code{EFAULT}；内核访问内核坏地址通常 panic。把这些路径混成一个错误码，会掩盖边界。
+
+\subsection{页面回收的实际顺序}
+
+内存回收不是随机找页释放。回收器通常先尝试容易回收的页：干净文件页可以直接丢；脏文件页要写回；匿名页需要 swap 或压缩；被 mlock、DMA pin、正在 I/O 或引用计数异常的页不能回收。
+
+\begin{lstlisting}
+reclaim_scan():
+  for page in inactive_list:
+    if page.pinned or page.under_writeback:
+      skip(page)
+    else if page.clean and page.file_backed:
+      remove_from_page_cache(page)
+      free(page)
+    else if page.dirty and page.file_backed:
+      start_writeback(page)
+    else if page.anonymous and swap_available:
+      write_to_swap(page)
+    else:
+      keep_or_escalate_pressure()
+\end{lstlisting}
+
+这个顺序解释了为什么内存压力会传导到存储 I/O。系统缺内存时，回收器可能把脏页写回设备；设备慢时，回收也慢；回收慢又会让分配路径阻塞，最终表现为系统调用尾延迟升高。
+
+\subsection{TLB、ASID 和 shootdown 成本}
+
+TLB 缓存虚拟地址翻译。切换地址空间时，若没有 ASID/PCID 之类标签，CPU 需要清空大量 TLB 项；有标签时，可以保留不同地址空间的翻译，但页表修改仍要失效相关条目。多核下，其他 CPU 可能正在用同一地址空间运行，必须通过 IPI 通知它们失效。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+操作 & 必要性 & 成本来源 \\
+\midrule
+local invalidate & 当前 CPU 旧翻译不能继续用 & pipeline/TLB 扰动 \\
+remote shootdown & 其他 CPU 旧翻译不能继续用 & IPI、等待 ack、跨核同步 \\
+batch unmap & 合并多个失效请求 & 延迟释放与复杂生命周期 \\
+ASID/PCID & 减少切换地址空间的全局 flush & 标识管理和一致性规则 \\
+\bottomrule
+\end{longtable}
+
+这也是为什么高频 \code{mmap/munmap/mprotect} 可能拖慢多线程程序。它们不是只改一张表，还可能引发跨 CPU 协议。优化思路通常是批量映射、复用区域、减少权限翻转和避免在热路径频繁改变页表。
+
+\subsection{分配器层次：页、slab 和用户堆}
+
+内核内存分配有层次。页分配器管理物理页框；slab/slub 等对象分配器管理固定大小内核对象；用户态 \code{malloc} 在进程地址空间内管理堆，并通过 \code{brk/mmap} 向内核申请更大区域。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+分配层 & 管理对象 & 典型问题 \\
+\midrule
+page allocator & 物理页和连续页块 & 外部碎片、NUMA、本地性 \\
+slab allocator & inode、task、dentry 等固定对象 & 对象复用、构造析构、缓存热度 \\
+vm allocator & 内核虚拟连续区域 & 页表开销、TLB、地址空间碎片 \\
+user malloc & 用户堆小对象 & arena、碎片、RSS 与虚拟大小差异 \\
+\bottomrule
+\end{longtable}
+
+理解层次能避免错误诊断。用户进程 RSS 增长不一定是内核泄漏；slab 增长可能来自 dentry/inode cache；虚拟地址空间变大不一定占用物理页；页分配失败可能是连续块碎片而不是总内存为零。
+
+\subsection{exec 的失败原子性}
+
+\code{execve} 成功后旧程序消失；失败时通常应让调用进程还能继续运行并看到错误码。这要求内核在替换地址空间时谨慎排序。若过早销毁旧地址空间，然后发现 ELF 无效或无法分配栈，就可能让进程处于不可恢复半状态。
+
+\begin{lstlisting}
+execve(path, argv, envp):
+  file = open_executable(path)
+  image = validate_elf(file)
+  new_mm = build_new_address_space(image, argv, envp)
+  if any_step_failed:
+    destroy_partial_new_mm()
+    return -errno
+  old_mm = current.mm
+  current.mm = new_mm
+  switch_page_table(new_mm)
+  destroy_old_mm(old_mm)
+  start_at_entry(image.entry)
+\end{lstlisting}
+
+真实实现还要处理解释器脚本、动态链接器、setuid、安全标签、fd 的 \code{CLOEXEC}、信号处理器重置和多线程 exec 语义。核心原则仍然是：新镜像完全准备好之前，不要破坏失败后必须保留的旧执行环境。
+
+\subsection{内存与系统调用测试矩阵}
+
+\begin{longtable}{p{0.28\linewidth}p{0.34\linewidth}p{0.26\linewidth}}
+\toprule
+测试 & 触发方式 & 期望 \\
+\midrule
+坏用户读指针 & \code{write(fd, bad, len)} & 返回 \code{EFAULT}，内核不崩溃 \\
+坏用户写指针 & \code{read(fd, bad, len)} & 返回 \code{EFAULT} 或短读语义清楚 \\
+COW 写入 & fork 后父子分别写同页 & 内容分离，引用计数正确 \\
+权限缺页 & 写只读映射或执行 NX 页 & 信号或错误，不能绕过权限 \\
+munmap 竞态 & 复制期间另线程 unmap & 返回错误或短完成，不 use-after-free \\
+TLB 失效 & mprotect 后旧权限访问 & 旧权限不能继续生效 \\
+内存压力 & 限制内存后触发分配 & 有 OOM/ENOMEM 证据和恢复路径 \\
+\bottomrule
+\end{longtable}
+
+这些测试共同证明：边界错误不会变成内核错误，权限变化能真正影响硬件访问，资源不足有可解释失败，部分完成语义被调用者看见。

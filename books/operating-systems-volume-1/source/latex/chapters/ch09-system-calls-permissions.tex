@@ -1,0 +1,304 @@
+\chapter{系统调用、权限与内核边界}
+
+\section{原理}
+
+系统调用是用户态请求内核代为操作受保护资源的入口。用户程序不能直接修改页表、调度队列、磁盘控制器或其他进程的状态；它只能把请求和参数交给内核。CPU 通过特权级、异常入口和约定寄存器完成控制权转移，内核再检查参数、权限和对象状态。
+
+系统调用不是普通函数调用。普通函数调用仍在同一特权级、同一地址空间和同一信任边界里执行；系统调用会从用户态进入内核态，切换到受控入口，使用内核栈或内核上下文，检查用户指针，并在返回前恢复用户态。这个边界使得内核可以拒绝非法请求，也使系统调用有固定开销。
+
+参数复制是系统调用安全性的核心。用户态传入的指针不能被内核直接相信，因为它可能无效、不可读、不可写、跨页、在检查后被另一个线程改掉，或指向内核不应访问的区域。内核必须使用 copy\_from\_user/copy\_to\_user 一类机制，把用户内存当作不可信输入处理。
+
+权限不只有文件 mode 位。一个请求是否允许，可能取决于用户 ID、组 ID、capability、namespace、cgroup、seccomp、LSM、安全标签、mount 选项、fd 打开模式、对象引用和当前进程状态。OS 学习中的常见错误，是把“我是这个进程”误以为“我拥有所有资源”。
+
+错误码也是契约。\code{EACCES} 表示权限不足，\code{ENOENT} 表示对象不存在，\code{EBADF} 表示 fd 无效，\code{EFAULT} 表示用户指针不可访问，\code{EINTR} 表示系统调用被信号打断，\code{EAGAIN} 表示非阻塞对象暂时不能推进。高质量 OS 程序必须按错误码分支，而不是把所有失败都写成 fatal。
+
+\section{实践}
+
+分析一个系统调用时，按下面顺序写报告：
+
+\begin{enumerate}
+\tightlist
+\item 用户态传入什么：整数、fd、地址、长度、flags、路径字符串。
+\item 内核查找什么对象：进程表、fd 表、路径、inode、socket、VMA。
+\item 检查哪些权限：对象存在、打开模式、读写执行、用户指针、资源限制。
+\item 改变哪些状态：offset、buffer、引用计数、队列、页表、信号状态。
+\item 返回什么：字节数、对象句柄、0/-1、errno、部分完成数量。
+\item 哪些错误可重试，哪些错误必须失败，哪些错误表示调用者 bug。
+\end{enumerate}
+
+以 \code{read(fd, buf, len)} 为例。内核先用 fd 查进程 fd 表，确认对象可读；再检查用户 buffer 是否可写；然后根据对象类型走普通文件、pipe、socket 或设备路径。普通文件可能从 page cache 复制，pipe 可能等待缓冲区，socket 可能返回当前已有字节。返回值为正时表示读取字节数，返回 0 可能是 EOF，返回 -1 时 errno 才解释失败原因。
+
+以 \code{execve(path, argv, envp)} 为例。它不是创建新进程，而是在当前进程中替换用户态程序映像。PID 通常保持不变，地址空间被替换，用户栈重新构造，信号处理和 fd 状态按规则继承或关闭。若把 exec 理解成“启动新进程”，就无法解释 shell 中 fork+exec 的组合。
+
+\section{算法与实现分析}
+
+\subsection{系统调用分发}
+
+系统调用入口通常把系统调用号和参数放在约定寄存器中。内核入口保存用户上下文，检查系统调用号范围，从系统调用表中找到处理函数，再把参数交给对应实现。返回时把结果或错误码放回约定位置。
+
+\begin{lstlisting}
+syscall_entry(trap_frame):
+  nr = trap_frame.regs[SYSCALL_NR]
+  if nr >= syscall_table_size:
+    return -ENOSYS
+  current.user_context = trap_frame
+  result = syscall_table[nr](trap_frame.args)
+  trap_frame.return_value = result
+  return_to_user(trap_frame)
+\end{lstlisting}
+
+这段算法的关键不是函数指针表，而是入口边界。内核必须确认当前线程确实来自用户态，不能让用户随便伪造内核上下文；必须处理信号、抢占、审计、seccomp 和 tracing；必须保证错误路径也能恢复到一致状态。
+
+\subsection{用户指针复制}
+
+用户指针复制要处理跨页、部分可访问和竞态。简单版本可以逐字节或逐页检查；高性能版本会利用硬件异常处理快速路径。教学模型先写清语义：复制失败时，系统调用返回 \code{EFAULT}，内核对象不能处在半提交状态。
+
+\begin{lstlisting}
+copy_from_user(dst, user_ptr, len):
+  copied = 0
+  while copied < len:
+    page = translate_user_page(user_ptr + copied, READ)
+    if page == fault:
+      return -EFAULT
+    n = min(bytes_until_page_end(user_ptr + copied), len - copied)
+    memcpy(dst + copied, kernel_map(page), n)
+    copied += n
+  return copied
+\end{lstlisting}
+
+真实内核还要处理 TOCTOU：检查之后用户线程可能修改内存。因此安全策略是把用户数据复制到内核缓冲区后再解析，不在解析过程中反复信任用户地址。路径字符串、数组参数和结构体参数都应遵守这个原则。
+
+\subsection{权限检查的顺序}
+
+权限检查要先定位对象，再检查主体是否有权操作对象，最后检查操作是否符合对象当前状态。以 \code{write(fd)} 为例：fd 必须存在；open file description 必须允许写；文件系统不能只读；用户 buffer 必须可读；长度不能超过限制；对象当前不能处于不允许写入的状态。
+
+\begin{lstlisting}
+sys_write(fd, user_buf, len):
+  file = fd_table_lookup(current, fd)
+  if file == null: return -EBADF
+  if !file.flags.can_write: return -EBADF
+  if len > MAX_RW_COUNT: len = MAX_RW_COUNT
+  kbuf = copy_from_user(user_buf, len)
+  if kbuf.error: return -EFAULT
+  return file.ops.write(file, kbuf, len)
+\end{lstlisting}
+
+不同错误码表达不同层次。fd 不存在和 fd 不可写都可能返回 \code{EBADF}；路径权限不足可能是 \code{EACCES}；文件系统只读可能是 \code{EROFS}；用户指针错误是 \code{EFAULT}。错误码越准确，调用者越能做正确恢复。
+
+\subsection{fork、exec、wait 的组合}
+
+Unix 风格进程创建不是一个巨大 \code{spawn}，而是 fork、exec、wait 的组合。fork 复制当前进程抽象；exec 替换当前进程映像；wait 回收子进程退出状态。这个设计让 shell 能在 fork 后、exec 前修改子进程 fd，例如重定向 stdin/stdout。
+
+\begin{lstlisting}
+pid = fork()
+if pid == 0:
+  dup2(output_fd, STDOUT_FILENO)
+  execve(program, argv, envp)
+  _exit(127)
+else:
+  status = waitpid(pid)
+\end{lstlisting}
+
+算法不变量是：父进程和子进程在 fork 后分离推进；exec 成功后不会返回原用户程序；子进程退出后先变成 zombie，直到父进程 wait 取走退出状态。若没有 zombie 状态，父进程可能永远无法知道子进程怎样退出；若没有 reaped，进程表项会泄漏。
+
+\subsection{系统调用重启与信号}
+
+阻塞系统调用可能被信号打断。内核要决定返回 \code{EINTR}，还是在信号处理结束后自动重启系统调用。这个规则影响用户程序正确性：某些调用可安全重启，某些调用已经部分完成，不能假装从未发生。
+
+\begin{lstlisting}
+blocking_read(fd, buf, len):
+  while no_data_available(fd):
+    ret = sleep_interruptible(fd.waitq)
+    if ret == INTERRUPTED:
+      if bytes_copied > 0:
+        return bytes_copied
+      if syscall_restartable(current):
+        return -ERESTARTSYS
+      return -EINTR
+  return copy_available_data()
+\end{lstlisting}
+
+不变量是：已经对用户可见的部分完成不能被自动撤销。若 \code{read} 已经复制了 10 个字节，再收到信号，返回 10 比返回 \code{EINTR} 更能表达真实状态。调用者必须循环处理短读短写。
+
+\subsection{TOCTOU 与路径权限}
+
+time-of-check to time-of-use 是系统调用常见漏洞。比如先检查路径 \code{/tmp/a} 权限，再打开这个路径；中间攻击者把路径替换成符号链接，最终操作对象已经不是被检查对象。正确做法是把权限检查绑定到已经解析并持有引用的对象。
+
+\begin{lstlisting}
+unsafe_open(path):
+  if may_access_path(path):
+    return open_path(path)
+
+safe_open(path):
+  inode = resolve_and_get_inode(path)
+  if inode == null:
+    return -ENOENT
+  if !may_access_inode(current, inode):
+    put_inode(inode)
+    return -EACCES
+  return make_file_from_inode(inode)
+\end{lstlisting}
+
+路径名是查找输入，不是稳定对象。fd、inode 引用和 file 引用才是内核能持有的对象身份。安全系统调用设计要尽量让检查和使用落在同一个对象引用上。
+
+\section{测试}
+
+系统调用测试要验证边界，而不只是验证 happy path。
+
+\begin{itemize}
+\tightlist
+\item 非法 fd 返回 \code{EBADF}，不应修改其他状态。
+\item 只读 fd 写入失败，错误应表达权限问题。
+\item 用户 buffer 不可访问时返回指针错误，不应让内核崩溃。
+\item 短读短写被调用者正确循环处理。
+\item \code{EINTR} 和 \code{EAGAIN} 被区分处理。
+\item fork 后父子进程共享 open file description 的 offset，独立 open 则 offset 分离。
+\item exec 后用户地址空间替换，但按规则保留或关闭 fd。
+\item seccomp、资源限制或 capability 缺失时，请求被拒绝且有可解释错误。
+\end{itemize}
+
+测试结论要写清“内核没有做什么”。例如权限失败时没有写入数据，非法指针没有部分污染内核对象，系统调用被信号打断后调用者能判断是否需要重试。负面保证是 OS 边界的核心。
+
+\section{源码级补充：entry\_SYSCALL\_64、capability、LSM 与 vDSO}
+
+\subsection{x86-64 syscall 入口}
+
+x86-64 快速系统调用通常使用 \code{syscall/sysret}，入口地址和相关段选择子由 MSR 配置。进入内核后，低级入口要处理 \code{swapgs}、保存用户栈、切到内核栈、保存寄存器、检查 tracing/seccomp，再进入 C 层分发。
+
+\begin{lstlisting}
+entry_SYSCALL_64:
+  swapgs
+  save user rsp into per-cpu area
+  load kernel rsp
+  push pt_regs
+  call do_syscall_64
+  check signals, reschedule, tracing
+  restore regs
+  sysretq or iretq
+\end{lstlisting}
+
+读 Linux 时看 \filepath{arch/x86/entry/entry\_64.S}、\filepath{arch/x86/entry/common.c} 和 \filepath{arch/x86/entry/syscalls/syscall\_64.tbl}。系统调用号表把 ABI 固定下来；\code{SYSCALL\_DEFINE3(write,...)} 这类宏把 C 实现接入表项。不要把系统调用入口理解成普通函数指针调用，它先是特权级和寄存器协议。
+
+\subsection{access\_ok 与 copy 用户}
+
+\code{access\_ok} 只做范围和用户地址边界的快速判断，不保证后续复制一定成功。真正复制仍可能 fault，所以 \code{copy\_from\_user} 必须有异常修复表或等价机制。真实内核会为用户访问指令建立 fixup：访问失败时跳到错误处理地址，而不是让内核普通 page fault 变成 panic。
+
+\begin{lstlisting}
+copy_from_user(dst, src, len):
+  if !access_ok(src, len):
+    return bytes_not_copied
+  instrument_usercopy_before()
+  n = raw_copy_from_user(dst, src, len)
+  instrument_usercopy_after()
+  return n
+\end{lstlisting}
+
+这里返回值语义也很重要：很多内核 helper 返回“未复制字节数”，上层再转换成 \code{EFAULT} 或短完成。写教学代码时可以返回错误码，但必须明确是否允许部分复制。
+
+\subsection{capable、ns\_capable 和 user namespace}
+
+capability 判断不再只是“uid 0”。\code{capable(CAP\_NET\_ADMIN)} 检查当前主体是否有网络管理能力；\code{ns\_capable(user\_ns, cap)} 把能力放进某个 user namespace 里解释。容器依赖 user namespace 把容器内 root 映射成宿主上非特权身份。
+
+\begin{lstlisting}
+if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
+  return -EPERM;
+\end{lstlisting}
+
+安全边界的常见错误是检查了全局 capability，却忘了对象所属 namespace；或者在 user namespace 中给了过宽能力，导致容器内操作影响宿主对象。读源码时要跟着对象走：这个 network namespace、mount namespace、inode 或 cgroup 属于哪个 user namespace。
+
+\subsection{LSM hook 和 seccomp}
+
+LSM 在 VFS、进程、socket、BPF 等路径插入 \code{security\_*} hook。SELinux、AppArmor、BPF LSM 都可在这些点拒绝操作。seccomp 则在系统调用入口附近按 BPF filter 检查系统调用号和参数，返回 allow、errno、trap、trace、kill、user notify 等动作。
+
+\begin{lstlisting}
+sys_openat:
+  file = path_openat(...)
+  ret = security_file_open(file)
+  if ret:
+    fput(file)
+    return ret
+  install_fd(file)
+\end{lstlisting}
+
+安全检查要放在对象已解析且引用稳定之后，否则路径 TOCTOU 仍可能存在。seccomp 适合收缩系统调用面，但它看不到所有内核对象语义；LSM 能看对象语义，但策略复杂。二者互补，不是替代关系。
+
+\subsection{vDSO 为什么能加速时间调用}
+
+有些“系统调用”只是读取内核维护的只读数据，例如当前时间。频繁进入内核会有上下文切换开销。vDSO 把一小段内核提供的用户态代码和只读数据映射到进程地址空间，使 \code{clock\_gettime} 等调用能在用户态完成快路径。
+
+\begin{lstlisting}
+clock_gettime():
+  if vDSO available and clock mode stable:
+    read seqlock-protected time data in user mapping
+    return computed time
+  else:
+    syscall clock_gettime
+\end{lstlisting}
+
+vDSO 依赖 seqlock 一类协议：内核更新时改变序列号，用户态读取若发现并发更新就重试。它展示了一个重要设计：不是所有内核服务都必须每次陷入内核，稳定只读数据可通过受控共享映射给用户态。
+
+\subsection{系统调用表、ABI 和兼容层}
+
+系统调用 ABI 一旦发布，就很难改变。系统调用号、参数寄存器、返回值约定、错误码范围和结构体布局都属于用户态契约。Linux x86-64 的系统调用表在 \filepath{arch/x86/entry/syscalls/syscall\_64.tbl} 一类文件中维护；32 位兼容进程还可能走 compat syscall，把 32 位结构体转换为内核内部格式。
+
+\begin{lstlisting}
+syscall ABI:
+  rax = syscall number
+  rdi, rsi, rdx, r10, r8, r9 = arguments
+  rax = return value or negative errno
+\end{lstlisting}
+
+这解释了为什么内核常新增系统调用而不是随意改变旧系统调用语义。用户态程序、libc、容器 seccomp profile、审计工具和 trace 工具都依赖 ABI 稳定。教学 OS 也应把 syscall 编号集中管理，并写兼容性测试。
+
+\subsection{审计、ptrace 和 restart block}
+
+系统调用入口不只分发表项。它还可能经过 audit、ptrace、seccomp、ftrace 和 signal 检查。调试器通过 ptrace 可在 syscall enter/exit 停住进程，修改寄存器或观察参数；安全审计记录主体、对象和结果；信号可能让阻塞系统调用返回 \code{EINTR} 或进入 restart。
+
+\begin{lstlisting}
+do_syscall_64(regs):
+  nr = regs.orig_ax
+  if ptrace_or_seccomp_active:
+    nr = syscall_trace_enter(regs, nr)
+  ret = dispatch_syscall(nr, regs)
+  regs.ax = ret
+  syscall_exit_work(regs)
+\end{lstlisting}
+
+restart block 用于保存重启系统调用所需状态。比如带 timeout 的阻塞调用被信号打断后，剩余 timeout 需要重新计算，而不能简单从头开始等待。系统调用重启是用户可见语义和内核内部状态的交叉点。
+
+\subsection{资源限制：rlimit 与 errno}
+
+权限检查之外，系统调用还要检查资源限制。进程可打开 fd 数、文件大小、地址空间、栈、锁定内存、进程数都可能受 rlimit 或 cgroup 限制。错误码要表达限制来源。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+限制 & 触发路径 & 常见错误 \\
+\midrule
+open files & \code{open/dup/socket/accept} & \code{EMFILE/ENFILE} \\
+file size & \code{write/truncate} & \code{EFBIG} 或信号 \\
+address space & \code{mmap/brk} & \code{ENOMEM} \\
+locked memory & \code{mlock} & \code{ENOMEM/EPERM} \\
+process count & \code{fork/clone} & \code{EAGAIN} \\
+\bottomrule
+\end{longtable}
+
+这类错误通常不是权限不足，而是资源边界。高质量程序应把 \code{EMFILE}、\code{ENOMEM}、\code{EAGAIN} 分开处理：释放资源、限流、等待或明确失败。
+
+\subsection{用户内存数组和二次复制}
+
+\code{execve}、\code{sendmsg}、\code{ioctl} 这类系统调用会传入指针数组或嵌套结构。内核不能只复制外层结构后继续信任内层用户指针。正确做法是逐层验证长度上限，把需要长期使用的数据复制到内核内存或 pin 住用户页。
+
+\begin{lstlisting}
+copy_iovec(user_iov, count):
+  if count > UIO_MAXIOV:
+    return -EINVAL
+  k_iov = copy_array_from_user(user_iov, count)
+  for each entry in k_iov:
+    if entry.len overflows total:
+      return -EINVAL
+    if !access_ok(entry.base, entry.len):
+      return -EFAULT
+  return k_iov
+\end{lstlisting}
+
+二次复制和整数溢出是系统调用漏洞高发区。长度相加要检查溢出，数组个数要有上限，结构体 padding 不能泄露内核栈数据，输出结构体应先清零再填字段。

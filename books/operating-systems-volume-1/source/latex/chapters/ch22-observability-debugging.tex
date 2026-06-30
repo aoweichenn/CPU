@@ -1,0 +1,300 @@
+\chapter{可观测性、调试与性能边界}
+
+\section{原理}
+
+操作系统问题很少只靠读代码解决。线程为什么不运行，可能是调度等待、锁等待、I/O 阻塞、page fault、信号、cgroup 限流或下游服务；内存为什么上涨，可能是真实泄漏、allocator 缓存、page cache、mmap、线程栈或内核 buffer；写文件为什么慢，可能是 page cache 脏页、设备队列、fsync、目录同步或日志提交。没有观测证据，结论只是猜测。
+
+可观测性要把 OS 状态映射到证据。进程和线程状态可以从 \filepath{/proc}、ps、top、调度 trace 观察；系统调用可以用 strace 观察；CPU 热点可以用采样 profiler；page fault、context switch、I/O 等待和网络状态可以用系统计数器和 tracing 工具；应用层必须补充业务 trace，记录请求身份、队列等待、状态机阶段和错误码。
+
+调试时要区分 on-CPU 和 off-CPU。on-CPU 说明线程正在执行指令；off-CPU 说明线程没有运行，可能在等待。CPU profiler 只能解释运行时消耗在哪里，解释不了大部分时间都在睡眠的请求。尾延迟问题常常要从 off-CPU 等待开始看。
+
+内存调试要区分 virtual size、resident set、anonymous memory、file-backed page、page cache、allocator arena 和 kernel memory。\code{malloc} 后不触页，可能只增加虚拟地址；首次写入才分配物理页；释放内存后 RSS 不马上下降，也可能是 allocator 保留 arena。把所有 RSS 增长都叫泄漏，是不合格诊断。
+
+I/O 调试要区分 buffered I/O、direct I/O、mmap、page cache hit/miss、dirty writeback、fsync 和设备吞吐。一次写很快，可能只是进入 page cache；一次读很快，可能只是热缓存；一次 fsync 很慢，可能是在偿还之前累计的脏页。实验必须控制冷缓存和热缓存，否则数字不可比较。
+
+\section{实践}
+
+本章的实践模板是“现象、假设、证据、反证、结论”。
+
+\begin{longtable}{p{0.18\linewidth}p{0.72\linewidth}}
+\toprule
+字段 & 请求延迟升高示例 \\
+\midrule
+现象 & p95 从 20ms 升到 500ms \\
+假设 & worker 等锁或等 I/O \\
+证据 & trace 中 queue\_wait 低，blocked\_io 高，线程睡在 writeback \\
+反证 & on-CPU profiler 没有热函数占用 500ms \\
+结论 & 延迟主要来自 I/O 完成等待，不是 CPU 算法变慢 \\
+\bottomrule
+\end{longtable}
+
+程序卡死时，先列线程状态：哪个线程持有锁，哪个线程等待条件变量，哪个线程在 join，关闭标志是否设置，是否有线程仍可能唤醒等待者。若所有消费者都睡在 not\_empty，而关闭路径只通知 not\_full，就能定位到等待谓词和通知对象不匹配。
+
+实践中要保留原始证据：命令、时间、输入规模、机器信息、内核版本、容器限制、采样频率、日志片段和无法观察的字段。没有这些，报告不可复现。
+
+\section{算法与实现分析}
+
+\subsection{事件日志}
+
+最简单的可观测性算法是事件日志。每个关键状态转换追加一条结构化记录：时间、线程、请求 ID、事件类型、对象 ID、旧状态、新状态和错误码。日志不能只写自然语言，否则无法聚合和验证。
+
+\begin{lstlisting}
+record_event(req_id, object, old_state, new_state, reason):
+  entry.ts = monotonic_time()
+  entry.cpu = current_cpu()
+  entry.thread = current_thread()
+  entry.req_id = req_id
+  entry.object = object
+  entry.old_state = old_state
+  entry.new_state = new_state
+  entry.reason = reason
+  ring_append(trace_buffer, entry)
+\end{lstlisting}
+
+事件日志本身也要有背压。无限日志会把故障变成磁盘或内存问题。常见做法是固定大小环形缓冲区、按级别采样、按请求 ID 打开详细追踪，或者把关键错误同步写入可靠日志。
+
+\subsection{延迟分解}
+
+请求延迟不能只记录总耗时。一个可行动的分解至少包括 queue wait、runnable wait、on CPU、blocked on lock、blocked on I/O、downstream wait 和 cleanup。实现上可以在状态转换处打点，然后按请求 ID 聚合。
+
+\begin{lstlisting}
+transition(req, new_state):
+  now = clock()
+  req.time_in_state[req.state] += now - req.last_ts
+  req.state = new_state
+  req.last_ts = now
+\end{lstlisting}
+
+这个算法的复杂度是每次状态转换 \code{O(1)}，但要求状态枚举稳定。若所有等待都记成 blocked，后续无法判断是锁、I/O 还是 page fault。
+
+\subsection{资源对账}
+
+资源泄漏调试需要对账算法。每次 open 增加 fd 计数，每次 close 减少；每次分配对象记录 owner，每次释放删除记录；系统退出或测试结束时检查剩余对象。
+
+\begin{lstlisting}
+track_alloc(id, type, owner):
+  live[id] = {type, owner, stack}
+
+track_free(id):
+  live.erase(id)
+
+assert_no_leak():
+  for each object in live:
+    report(object)
+\end{lstlisting}
+
+真实系统不能给所有对象都保存完整 stack，因为成本太高；可以采样、按类型开启、只在测试构建开启。但思想不变：资源必须能被计数，生命周期必须能闭合。
+
+\subsection{off-CPU 分析}
+
+很多性能问题不在 CPU 火焰图里，因为线程大部分时间不在 CPU 上。off-CPU 分析记录线程从运行态切到睡眠态的原因，以及被谁唤醒。
+
+\begin{lstlisting}
+on_schedule_out(task, reason, wait_object):
+  task.offcpu_start = clock()
+  task.wait_reason = reason
+  task.wait_object = wait_object
+
+on_wakeup(task, waker):
+  delta = clock() - task.offcpu_start
+  offcpu_histogram[task.wait_reason].add(delta)
+  record_wakeup_edge(waker, task, task.wait_object)
+\end{lstlisting}
+
+这个数据能区分等锁、等 I/O、等页、等网络、等定时器和等子进程。若 p99 延迟主要来自 off-CPU 的 writeback 等待，优化业务 CPU 代码不会解决问题。
+
+\subsection{最小可复现报告}
+
+高质量调试报告要让别人能复现判断。最小格式如下：
+
+\begin{lstlisting}
+Problem:
+  现象、影响范围、首次出现时间
+
+Environment:
+  内核版本、硬件/容器限制、文件系统、负载规模
+
+Timeline:
+  关键事件按时间排序
+
+Evidence:
+  系统调用、trace、线程状态、资源计数、日志、指标
+
+Rejected hypotheses:
+  已经排除的解释和证据
+
+Conclusion:
+  当前最能解释现象的机制
+
+Boundary:
+  仍未验证的假设和下一步实验
+\end{lstlisting}
+
+报告的价值不在于一次猜中，而在于缩小不确定性。写出反证能防止团队反复讨论已经排除的方向。
+
+\section{测试}
+
+可观测性也需要测试。一个系统若只能在成功时输出日志，失败时没有状态，就不可维护。
+
+\begin{itemize}
+\tightlist
+\item 每个长时间等待点都能输出等待原因或 trace 事件。
+\item 每个请求都有稳定身份，能串起进入队列、开始执行、阻塞、完成和失败。
+\item 错误码保留原始原因，不被统一改写成 unknown error。
+\item 资源计数可对账：打开 fd 数、活跃线程数、队列长度、in-flight I/O、分配对象数。
+\item 性能测试区分冷启动、热缓存、预热、输入规模和测量次数。
+\item 故障注入能触发日志和恢复路径，而不是只测试成功路径。
+\end{itemize}
+
+调试报告的验收标准是别人能复现你的判断。若报告只写“怀疑是系统问题”，没有线程状态、系统调用、等待点、资源计数或反证，它不是 OS 分析。
+
+\section{源码级补充：printk、ftrace、perf、eBPF、strace、/proc、/sys 与 PSI}
+
+\subsection{printk 和 dmesg}
+
+\code{printk} 有 loglevel、rate limiting、console 输出和 ring buffer。panic 前后的日志可能是唯一证据，但过量 printk 会扰动时序，甚至拖慢系统。驱动错误路径应记录设备、请求 id、状态寄存器、errno，而不是只写 “failed”。
+
+\subsection{ftrace 和 tracepoint}
+
+ftrace 可以追踪函数入口、函数图和静态 tracepoint。tracepoint 的价值是稳定字段：调度切换、irq、block、net、syscalls 都有可解析事件。
+
+\begin{lstlisting}
+trace-cmd record -e sched:sched_switch -e block:block_rq_issue
+trace-cmd report
+\end{lstlisting}
+
+阅读 \filepath{kernel/trace/} 时，看 trace event 如何定义字段、如何写入 per-CPU ring buffer、如何被用户态读取。tracepoint 是把证据落成可采集事件。
+
+\subsection{perf 与 PMU}
+
+\code{perf stat} 看计数，\code{perf record/report} 看采样调用栈，\code{perf top} 看实时热点。PMU 事件能观察 cycles、instructions、cache misses、branch misses、TLB misses。IPC 低可能来自 cache miss、分支错误、前端供给不足或后端等待，不能只说“CPU 慢”。
+
+\begin{lstlisting}
+perf stat -e cycles,instructions,cache-misses,branches,branch-misses ./workload
+perf record -g ./workload
+perf report
+\end{lstlisting}
+
+\subsection{eBPF 和 bpftrace}
+
+eBPF 程序可挂到 kprobe、uprobe、tracepoint、profile、LSM、cgroup、网络路径。BPF map 保存状态，helper 提供受控内核访问。bpftrace 适合快速一行观测。
+
+\begin{lstlisting}
+bpftrace -e 'tracepoint:syscalls:sys_enter_write { @[comm] = count(); }'
+bpftrace -e 'kprobe:vfs_read { @[kstack] = count(); }'
+\end{lstlisting}
+
+eBPF 的边界是 verifier、安全权限和观测开销。生产系统应限制采样频率和输出量，避免观测本身制造故障。
+
+\subsection{strace、ltrace 和 gdb}
+
+strace 基于 ptrace 观察系统调用 enter/exit，能回答“程序在请求内核做什么”；ltrace 观察动态库调用，能回答“用户态库在做什么”；gdb/kgdb 用符号和断点观察状态。strace 看不到内核内部等待原因，perf/ftrace/eBPF 可以补上。
+
+\subsection{/proc、/sys、sysctl 和 systemd journal}
+
+\filepath{/proc/meminfo}、\filepath{/proc/interrupts}、\filepath{/proc/slabinfo}、\filepath{/proc/[pid]/status}、\filepath{/proc/[pid]/stack} 是运行状态窗口；\filepath{/sys} 暴露 kobject、设备、cgroup、block queue 参数；\filepath{/proc/sys} 是 sysctl 控制面；journald 给系统日志结构化字段。
+
+\subsection{PSI：Pressure Stall Information}
+
+PSI 记录 CPU、memory、IO stall 时间，回答“任务因为资源压力停顿了多久”。它比单纯利用率更接近用户感受到的延迟。内存 PSI 高说明任务因回收或内存不足停顿；I/O PSI 高说明任务等待 I/O；CPU PSI 高说明 runnable 但等不到 CPU。
+
+\begin{lstlisting}
+cat /proc/pressure/cpu
+cat /proc/pressure/memory
+cat /proc/pressure/io
+\end{lstlisting}
+
+PSI 适合做过载保护信号。服务可以在 memory/io pressure 高时限流，避免把队列堆到超时。
+
+\subsection{工具选择决策表}
+
+可观测性工具很多，选择时先问问题类型。
+
+\begin{longtable}{p{0.26\linewidth}p{0.42\linewidth}p{0.2\linewidth}}
+\toprule
+问题 & 优先工具 & 证据 \\
+\midrule
+程序卡在哪个系统调用 & \code{strace -tt -T} & syscall、耗时、errno \\
+CPU 时间花在哪里 & \code{perf record -g} & on-CPU 调用栈 \\
+线程为什么不运行 & off-CPU trace、sched trace & 睡眠原因、唤醒者 \\
+磁盘请求慢在哪里 & block trace、iostat、perf sched & 队列和 completion \\
+内存压力是否存在 & PSI、\filepath{/proc/meminfo}、vmstat & stall、reclaim、swap \\
+内核路径偶发错误 & tracepoint、kprobe、bpftrace & 事件字段和栈 \\
+容器被限制 & cgroup v2 文件、journal & throttled、OOM、pids limit \\
+\bottomrule
+\end{longtable}
+
+不要一上来抓所有数据。先用低成本指标定位层次，再用高精度 trace 验证假设。观测也会扰动系统，尤其是高频 kprobe、过量 printk 和全量系统调用 trace。
+
+\subsection{一次延迟诊断的完整演示}
+
+假设 HTTP 服务 p99 从 80ms 升到 2s。诊断不应直接改代码，而应建立证据链。
+
+\begin{lstlisting}
+step 1: application trace
+  parse: 1ms, business: 5ms, persist: 1900ms
+
+step 2: strace
+  fsync(fd) = 0 <1.87s>
+
+step 3: /proc/pressure/io
+  some avg10 increased
+
+step 4: block trace
+  many flush requests wait behind writeback
+
+step 5: conclusion
+  tail latency dominated by storage flush and dirty writeback
+\end{lstlisting}
+
+反证也要写：CPU profiler 没有 2s on-CPU 热点；网络 recv/send 没有长时间阻塞；锁等待直方图没有对应峰值。这样结论才不是“看起来像磁盘”。
+
+\subsection{指标设计：counter、gauge、histogram、event}
+
+系统指标至少分四类。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+类型 & 含义 & OS 示例 \\
+\midrule
+counter & 单调增加事件数 & syscall 次数、错误次数、重试次数 \\
+gauge & 当前状态值 & 队列长度、活跃线程、脏页数量 \\
+histogram & 分布 & 请求延迟、锁等待、I/O 完成时间 \\
+event & 结构化状态转换 & 任务睡眠、唤醒、请求提交、panic \\
+\bottomrule
+\end{longtable}
+
+错误率只用 counter 不够，还要有错误码和对象维度；延迟只报平均值不够，要有 p50/p95/p99 和最大值；队列只报当前值不够，最好有高水位和丢弃次数。
+
+\subsection{低开销 instrumentation 原则}
+
+观测点应贴近状态转换，而不是在循环里无节制打印。推荐做法：
+
+\begin{itemize}
+\tightlist
+\item 热路径用 per-CPU counter，避免全局锁。
+\item 高频事件采样或按条件开启。
+\item 错误路径记录结构化字段和稳定 id。
+\item 日志消息带 request id、task id、object id。
+\item trace buffer 有固定容量和丢弃计数。
+\item 观测代码本身不能持有业务关键锁太久。
+\end{itemize}
+
+可观测性也是代码，必须有性能预算。一个 tracing patch 若把锁竞争扩大，就可能把被观察系统变成另一个系统。
+
+\subsection{验收：可复现诊断包}
+
+本卷要求最终报告能够打包复现。最小诊断包包括：
+
+\begin{lstlisting}
+diagnostic bundle:
+  exact command and workload
+  kernel version and hardware/container limits
+  application logs with request ids
+  relevant /proc and /sys snapshots
+  trace or perf data
+  benchmark raw results
+  analysis notes with rejected hypotheses
+\end{lstlisting}
+
+报告不是把命令输出堆在一起，而是把证据组织成因果链：现象是什么，在哪层出现，哪些解释被排除，当前结论的边界在哪里。能做到这一点，才算真正掌握 OS 调试。

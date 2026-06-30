@@ -1,0 +1,274 @@
+\chapter{内核内存分配器}
+
+\section{原理}
+
+虚拟内存章节讲页表和地址空间，本章看内核自己怎样管理内存。内核需要分配页表页、进程结构、文件对象、socket buffer、目录项缓存、驱动 DMA buffer、日志记录和临时缓冲区。这些对象大小不同、生命周期不同、对齐要求不同，有些可以睡眠等待内存，有些在中断上下文不能睡眠。
+
+内核分配器通常分层。最底层管理物理页框，例如 buddy allocator；上层把页切成固定大小对象，例如 slab/slub；再上层可能有专用缓存，例如 task struct cache、inode cache、dentry cache。分层的原因是单一分配器无法同时高效处理连续页、大量小对象、构造析构、缓存局部性和调试需求。
+
+\section{实践}
+
+实践先写对象分类表：
+
+\begin{longtable}{p{0.22\linewidth}p{0.28\linewidth}p{0.36\linewidth}}
+\toprule
+对象 & 分配来源 & 约束 \\
+\midrule
+页表页 & buddy order-0 页 & 页对齐，通常不可移动 \\
+DMA buffer & 连续物理页或 IOMMU 映射 & 设备可访问，对齐和边界限制 \\
+task 结构 & slab cache & 高频分配释放，需要初始化 \\
+socket buffer & slab + page fragment & 网络吞吐和生命周期复杂 \\
+日志缓冲 & kmalloc 或专用池 & 失败路径也要可用 \\
+\bottomrule
+\end{longtable}
+
+然后为每类对象写：是否可睡眠、是否可回收、是否可移动、是否需要清零、是否可能从中断上下文分配。
+
+\section{算法与实现分析}
+
+\subsection{buddy allocator}
+
+buddy allocator 把空闲内存按 order 管理，order=k 表示 \code{2^k} 个连续页。分配时找最小足够 order；没有就拆更大的块。释放时尝试和 buddy 合并。
+
+\begin{lstlisting}
+alloc(order):
+  for k in order..MAX_ORDER:
+    if free[k] not empty:
+      block = free[k].pop()
+      while k > order:
+        k -= 1
+        buddy = split(block, k)
+        free[k].push(buddy)
+      return block
+  return null
+
+free(block, order):
+  while order < MAX_ORDER:
+    buddy = find_buddy(block, order)
+    if buddy not free: break
+    remove buddy from free[order]
+    block = merge(block, buddy)
+    order += 1
+  free[order].push(block)
+\end{lstlisting}
+
+buddy 的优势是能管理连续页，释放时能合并。问题是内部碎片：请求 9 页必须分配 16 页。长期运行后，高 order 连续块也可能稀缺。
+
+\subsection{slab cache}
+
+slab 分配器为固定大小对象建立缓存。一个 slab 通常由一页或多页组成，切成多个对象槽。分配就是从 freelist 取一个槽；释放就是放回 freelist。对象构造可以在 slab 创建时完成，减少重复初始化成本。
+
+\begin{lstlisting}
+slab_alloc(cache):
+  if cache.partial not empty:
+    obj = pop_free_object(cache.partial.first)
+    return obj
+  slab = allocate_new_slab(cache)
+  cache.partial.push(slab)
+  return pop_free_object(slab)
+\end{lstlisting}
+
+slab 的分配释放接近 \code{O(1)}。它适合大量同类型对象，例如 inode、dentry、task。实现要处理 per-CPU cache，以减少多核锁竞争；还要处理调试模式下的红区、poison、double free 检测。
+
+\subsection{kmalloc 和大小类别}
+
+通用 \code{kmalloc} 通常把请求大小映射到一组 size class，例如 32、64、128、256 字节。每个 size class 背后是一个 slab cache。这样可以用固定对象缓存服务变长请求。
+
+\begin{lstlisting}
+kmalloc(size):
+  class = size_to_class(size)
+  return slab_alloc(kmalloc_cache[class])
+\end{lstlisting}
+
+size class 的代价是内部碎片。请求 129 字节可能分到 256 字节槽。分配器设计要在碎片、速度和缓存局部性之间折中。
+
+\subsection{GFP 标志和上下文}
+
+内核分配 API 通常带标志，说明是否允许睡眠、是否允许 I/O 回收、是否要求 DMA 区域等。中断上下文不能睡眠，所以只能使用不会阻塞的分配；普通进程上下文可以等待回收。
+
+\begin{lstlisting}
+if in_interrupt():
+  page = alloc_page(GFP_ATOMIC)
+else:
+  page = alloc_page(GFP_KERNEL)
+\end{lstlisting}
+
+这解释了为什么内核代码不能随便分配内存。分配失败不是理论问题，尤其在中断、持锁、内存压力和回收路径中。高质量代码必须定义失败策略：返回错误、丢包、使用预留池、降级还是 panic。
+
+\subsection{per-CPU 缓存}
+
+多核系统中，所有小对象分配都争同一把 slab 锁会很慢。per-CPU cache 让每个 CPU 维护少量本地空闲对象，常见分配释放不需要全局锁。
+
+\begin{lstlisting}
+kmem_cache_alloc(cache):
+  cpu_cache = cache.percpu[current_cpu()]
+  if cpu_cache.freelist not empty:
+    return cpu_cache.freelist.pop()
+  refill_from_global(cache, cpu_cache)
+  return cpu_cache.freelist.pop()
+
+kmem_cache_free(cache, obj):
+  cpu_cache = cache.percpu[current_cpu()]
+  cpu_cache.freelist.push(obj)
+  if cpu_cache.count > HIGH_WATERMARK:
+    drain_to_global(cache, cpu_cache)
+\end{lstlisting}
+
+per-CPU 缓存降低锁竞争，但会增加内存滞留：每个 CPU 都可能囤积一批对象。高质量实现要有高低水位、CPU 下线 drain、内存压力回收和统计对账。
+
+\subsection{内存调试与防御}
+
+分配器是许多内核漏洞的放大器。越界写、use-after-free、double free 和未初始化读取都可能破坏任意内核对象。调试构建应加入红区、poison、隔离队列和调用栈记录。
+
+\begin{lstlisting}
+debug_free(obj):
+  if obj.magic != LIVE_MAGIC:
+    panic("double free or corrupted object")
+  fill(obj.memory, POISON_FREE)
+  obj.magic = FREE_MAGIC
+  quarantine_push(obj)
+
+debug_alloc(cache):
+  obj = real_alloc(cache)
+  fill(obj.memory, POISON_ALLOC)
+  obj.magic = LIVE_MAGIC
+  return obj
+\end{lstlisting}
+
+隔离队列会延迟复用刚释放对象，使 use-after-free 更容易在测试中暴露。代价是内存占用和性能下降，所以通常只在调试或安全强化配置中开启。
+
+\section{测试}
+
+\begin{itemize}
+\tightlist
+\item buddy 分配释放后，空闲页总数守恒。
+\item 分裂和合并后，不存在重叠空闲块。
+\item slab 分配对象满足对齐，释放后能复用。
+\item double free、越界写和 use-after-free 在调试模式能被检测。
+\item GFP\_ATOMIC 路径不能睡眠，失败时有明确降级策略。
+\item 内存压力下，分配器统计能解释碎片和失败原因。
+\end{itemize}
+
+\section{源码级补充：buddy、SLUB、GFP、vmalloc 与 kmemleak}
+
+\subsection{buddy 的 free\_area 和迁移类型}
+
+Linux buddy 不只是按 order 分链表，还按迁移类型分组，例如 movable、unmovable、reclaimable、CMA 等。这样做是为了降低长期碎片：可移动页尽量放在一起，未来需要高 order 连续页时更容易通过 compaction 得到。
+
+\begin{lstlisting}
+struct free_area {
+  list_head free_list[MIGRATE_TYPES];
+  unsigned long nr_free;
+};
+\end{lstlisting}
+
+读 \filepath{mm/page\_alloc.c} 时重点看 \code{\_\_rmqueue}、\code{\_\_free\_pages\_ok}、watermark、zone 和 migratetype。一次 order-9 分配失败，不一定表示系统没有 512 页空闲，可能是没有连续的 512 页。
+
+\subsection{SLAB、SLUB、SLOB 的取舍}
+
+SLAB 强调对象缓存和复杂队列；SLUB 简化元数据，成为常见默认；SLOB 面向极小系统，结构简单但伸缩性弱。现代主线常见是 SLUB。读 \filepath{mm/slub.c} 时看 \code{kmem\_cache}、per-CPU freelist、partial slab、debug red zone 和 poison。
+
+\begin{lstlisting}
+kmem_cache_alloc(cache):
+  if current_cpu.freelist:
+    return pop(current_cpu.freelist)
+  if cache.node.partial:
+    slab = take_partial(cache.node)
+    load_cpu_freelist(slab)
+    return pop(current_cpu.freelist)
+  slab = new_slab_from_buddy()
+  return first_object(slab)
+\end{lstlisting}
+
+SLUB 的快路径很短，但 debug 选项会显著增加检查成本。教材中讲“分配是 O(1)”时，要同时说明这是平均快路径；慢路径可能进入 buddy、回收、compaction 或 OOM。
+
+\subsection{kmalloc size class 与内部碎片}
+
+\code{kmalloc(130)} 可能进入 192 或 256 字节 size class，取决于架构和配置。向上取整带来内部碎片，但换来固定大小缓存的速度和对齐。对象若频繁分配，最好建立专用 \code{kmem\_cache}，可以提供构造函数、调试名和更好统计。
+
+\subsection{GFP\_NOIO、GFP\_NOFS 和回收递归}
+
+\code{GFP\_KERNEL} 允许睡眠和回收；\code{GFP\_ATOMIC} 用于中断或持自旋锁路径；\code{GFP\_NOIO} 禁止通过 I/O 回收；\code{GFP\_NOFS} 禁止进入文件系统回收路径。后两者用于避免递归死锁。
+
+\begin{lstlisting}
+filesystem_write_path():
+  lock(inode)
+  buf = kmalloc(size, GFP_NOFS)
+  // avoid reclaim entering filesystem and taking inode locks again
+\end{lstlisting}
+
+若文件系统持有 inode 锁时用 \code{GFP\_KERNEL} 分配，内存压力下回收可能进入同一文件系统并等待 inode 锁，形成递归死锁。GFP flag 是锁和回收的边界，不是性能装饰。
+
+\subsection{vmalloc 与物理不连续}
+
+\code{kmalloc} 通常返回物理连续内存，适合 DMA 或小对象；\code{vmalloc} 返回虚拟连续但物理页可不连续的内存，适合大缓冲或模块映射。代价是需要建立页表，TLB 局部性更差，不能直接给不支持 scatter-gather 的设备 DMA。
+
+\begin{lstlisting}
+vmalloc(size):
+  area = allocate_virtual_area(size)
+  pages = alloc_individual_pages(npages)
+  map_pages(area, pages)
+  return area.addr
+\end{lstlisting}
+
+\subsection{kmemleak、KASAN 和 KFENCE}
+
+内存泄漏和 use-after-free 很难靠肉眼找。kmemleak 通过扫描可达指针寻找未释放对象；KASAN 使用 shadow memory 检测越界和释放后访问；KFENCE 用低频保护页检测堆错误，开销比 KASAN 低但覆盖率也低。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+工具 & 能发现 & 代价 \\
+\midrule
+kmemleak & 长期未释放对象 & 扫描和误报，需要调试配置 \\
+KASAN & 越界、use-after-free & 内存和性能开销高 \\
+KFENCE & 采样式堆越界和 UAF & 开销低，非确定覆盖 \\
+\bottomrule
+\end{longtable}
+
+\subsection{内存碎片、compaction 和 CMA}
+
+内存碎片分为内部碎片和外部碎片。内部碎片来自 size class 向上取整；外部碎片来自空闲页分散，无法满足高 order 连续页。compaction 通过迁移可移动页，把空闲页聚合成连续块。CMA 预留可迁移区域，给需要连续物理内存的设备使用。
+
+\begin{lstlisting}
+compact_zone(zone):
+  free_scanner = end_of_zone
+  migrate_scanner = start_of_zone
+  while scanners_not_met:
+    page = find_movable_page(migrate_scanner)
+    free = find_free_page(free_scanner)
+    migrate(page, free)
+\end{lstlisting}
+
+并非所有页都能迁移。页表页、驱动 pin 住的 DMA 页、mlock 页和某些内核对象不可移动。高 order 分配失败时，诊断要看总空闲页、最大连续块、不可移动页比例和 compaction 失败原因。
+
+\subsection{内存控制组和分配归属}
+
+cgroup v2 可以限制一组进程的内存。分配器需要把许多用户可归因的内存记到 memcg，例如 page cache、匿名页、部分 slab 对象。这样容器内泄漏不会无限吃掉宿主内存。
+
+\begin{lstlisting}
+charge_memcg(page, current.memcg):
+  if memcg.current + page.size > memcg.max:
+    reclaim_memcg(memcg)
+    if still over limit:
+      trigger_memcg_oom(memcg)
+  memcg.current += page.size
+\end{lstlisting}
+
+memcg OOM 和全局 OOM 要区分。前者应限制在 cgroup 内，后者说明整机资源不足。测试容器内存限制时，要观察 \filepath{memory.current}、\filepath{memory.events} 和 OOM victim。
+
+\subsection{对象生命周期对账}
+
+内核内存质量不只看分配成功，还要能证明对象生命周期闭合。每类对象应有 alloc/free 计数、当前活跃数、高水位和失败次数。对复杂对象，还应记录 owner 和引用来源。
+
+\begin{lstlisting}
+object_accounting:
+  alloc_count++
+  active_count++
+  high_watermark = max(high_watermark, active_count)
+
+free:
+  active_count--
+  free_count++
+\end{lstlisting}
+
+测试结束时 active count 不为零，就是泄漏线索；free count 大于 alloc count，说明 double free 或计数损坏；高水位异常说明负载下对象滞留。生产系统不一定记录所有栈，但调试构建应支持按对象类型打开详细追踪。
