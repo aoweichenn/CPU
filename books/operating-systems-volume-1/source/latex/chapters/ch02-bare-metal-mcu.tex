@@ -8,6 +8,62 @@
 
 最小裸机程序通常是轮询模型。代码不断检查输入设备是否有数据、检查定时器是否到点、更新输出设备。轮询的本质是 CPU 主动问外设“你准备好了吗”。如果事件很频繁，轮询很直接；如果事件很稀疏，CPU 大量时间都浪费在重复检查；如果轮询顺序写错，高优先级事件可能被低优先级慢操作延迟。
 
+\subsection{一个 MCU 芯片里面通常有什么}
+
+单片机不是“缩小的 PC”，而是一颗芯片上集成了 CPU 核、Flash、SRAM、时钟、复位控制器、GPIO、UART、SPI/I2C、定时器、ADC、DMA 控制器和中断控制器。很多外设不是通过复杂总线枚举出来，而是在芯片手册里固定了基地址和寄存器布局。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+部件 & 作用 & 与 OS 的关系 \\
+\midrule
+CPU core & 执行指令和异常入口 & 上下文、特权模式、中断响应 \\
+Flash & 保存程序镜像和只读数据 & 类似启动介质和只读代码段 \\
+SRAM & 保存栈、堆、全局变量 & 物理内存管理的最小形态 \\
+中断控制器 & 管理外设中断 & IRQ 分发和优先级的原型 \\
+SysTick/Timer & 周期时间基准 & tick、超时和抢占的原型 \\
+GPIO/UART/SPI/I2C & 连接外部设备 & 字符设备和总线驱动的原型 \\
+DMA controller & 在外设和内存间搬运数据 & DMA 生命周期和 completion 的原型 \\
+\bottomrule
+\end{longtable}
+
+这些部件通常共享同一个地址空间。CPU 访问 0x20000000 可能是 SRAM，访问 0x40000000 可能是 UART 寄存器。区别不在指令，而在地址译码后连到哪个硬件。这个事实会一路延伸到大型 OS：驱动通过 MMIO 地址访问 PCIe 设备寄存器，本质仍是 load/store 触发硬件状态机。
+
+\subsection{芯片设计者怎样选择寄存器接口}
+
+外设寄存器是硬件和软件的协议。设计一个 UART 外设时，芯片设计者通常会暴露控制寄存器、状态寄存器、数据寄存器、波特率寄存器和中断使能寄存器。软件写控制寄存器启用发送接收；读状态寄存器判断 TX ready 或 RX available；读写数据寄存器收发字节。
+
+\begin{lstlisting}
+UART register model:
+  CTRL     bit0 enable_rx, bit1 enable_tx
+  STATUS   bit0 rx_ready, bit1 tx_empty, bit2 overrun
+  DATA     read pops received byte, write submits transmit byte
+  BAUD     divisor for baud rate generator
+  IRQ_EN   enable rx/tx/error interrupt
+\end{lstlisting}
+
+注意 \code{DATA} 寄存器不是普通内存。读它可能弹出接收 FIFO 的一个字节，写它可能启动发送状态机。状态位也可能有特殊清除规则，例如“写 1 清除”。驱动必须严格按手册顺序访问这些寄存器，否则问题不是编译错误，而是硬件进入不可预期状态。
+
+\subsection{从外设状态机看驱动}
+
+一个 UART 发送器可以看成硬件状态机：空闲时等待软件写 DATA；收到字节后按波特率移位输出；完成后设置 tx\_empty；若开启中断，则向中断控制器发请求。软件驱动的任务不是“调用发送函数”，而是和这个状态机同步。
+
+\begin{lstlisting}
+UART_TX_IDLE:
+  if software writes DATA:
+    shift_reg = DATA
+    state = UART_TX_BUSY
+
+UART_TX_BUSY:
+  shift one bit per baud tick
+  if all bits sent:
+    STATUS.tx_empty = 1
+    if IRQ_EN.tx_empty:
+      raise_irq()
+    state = UART_TX_IDLE
+\end{lstlisting}
+
+这就是为什么驱动要处理 ready 位、超时、FIFO 满、错误位和中断确认。硬件不会执行 C 函数返回值协议，它只会按寄存器位和状态机推进。操作系统把这种硬件状态机包装成 \code{read/write/poll/ioctl}，但底层仍然必须尊重硬件协议。
+
 \begin{lstlisting}
 init_clock();
 init_gpio();
@@ -64,6 +120,23 @@ while (true) {
 
 合作式调度器已经比手写超级循环好，因为任务的释放条件变成数据。但它仍然无法处理一个任务超时的问题。如果 \code{task\_send\_telemetry} 等串口缓冲区空等了 50ms，那么 1ms 周期的控制任务就会迟到。于是我们需要区分“能立刻做的计算”和“需要等待的 I/O”，这会把系统推向事件队列和中断。
 
+\subsection{最小调度算法的复杂度和失败边界}
+
+周期任务表的扫描算法很容易写，但它把每轮成本变成 \code{O(n)}。如果任务数量很少，成本可忽略；如果任务很多或周期很短，调度器本身会吃掉可观 CPU 时间。更重要的是，它没有强制时间预算，只能在任务返回后继续扫描。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+策略 & 算法成本 & 失败边界 \\
+\midrule
+固定顺序超级循环 & 每轮 \code{O(n)} & 任务顺序即隐式优先级，慢任务拖累后续任务 \\
+周期任务表 & 每轮扫描 \code{O(n)} & 任务不返回则全局停顿，deadline 只能事后发现 \\
+优先级就绪队列 & 取最高优先级可为 \code{O(1)} 或 \code{O(log n)} & 低优先级可能饥饿，需要抢占和时间统计 \\
+时间片轮转 & 每次切换接近 \code{O(1)} & 交互延迟和吞吐受时间片影响 \\
+\bottomrule
+\end{longtable}
+
+这里已经能看见调度器设计的核心：策略不是口号，必须落到数据结构和复杂度。任务少时，简单扫描最可靠；任务多、优先级复杂、需要抢占时，就要引入 runqueue、时间统计和上下文切换。
+
 \subsection{状态机替代阻塞函数}
 
 裸机程序最常见的灾难是阻塞等待：
@@ -116,6 +189,24 @@ bool uart_read(UartDevice* dev, byte* out);
 
 从这里可以看到后续 fd、socket、设备文件的影子。用户不应该直接改设备寄存器，而应该持有一个句柄，请求拥有者执行操作。差别只是大型 OS 里这个拥有者运行在内核态，并且有硬件权限保护。
 
+\subsection{从裸机模块边界到用户/内核边界}
+
+裸机程序里也可以规定“只有 UART 模块能写 UART 寄存器”，但这只是团队约定。任何 C 文件只要拿到寄存器地址，仍然能直接写硬件。通用 OS 不能依赖所有程序守规矩，它必须让硬件禁止用户程序访问设备寄存器。
+
+\begin{lstlisting}
+bare-metal convention:
+  app calls uart_submit()
+  but app could still write UART_BASE directly
+
+protected OS:
+  user VA does not map UART MMIO
+  user write to UART physical address triggers fault
+  app must call write(fd, ...)
+  kernel driver performs MMIO after permission checks
+\end{lstlisting}
+
+这就是模块化和隔离的区别。模块化让代码更清楚，但不能阻止恶意或错误代码；隔离由 CPU 特权级、页表权限和异常入口强制执行。OS 的很多复杂性，就是把裸机里的“请大家遵守约定”升级成“硬件保证不能绕过”。
+
 \section{实践}
 
 本章实践不需要复杂环境。拿任意一个单片机或模拟器，写三版程序：
@@ -158,30 +249,25 @@ bool uart_read(UartDevice* dev, byte* out);
 
 \section{源码级补充：真实 MCU 启动、UART 与链接脚本}
 
-\subsection{向量表、\_start 与 reset handler}
+\subsection{x86-64 早期入口、\_start 与最小启动代码}
 
-单片机启动的第一份“内核源码”通常不是 C 函数，而是向量表和 reset handler。以 Cortex-M 风格启动为例，地址 0 处通常放初始栈指针，下一项放 reset handler 入口，后面是 NMI、HardFault、外设中断入口。RISC-V 微控制器常通过 \code{mtvec} 指向 trap vector，通过 linker script 和启动汇编建立栈与全局变量。
+早期启动的第一份“内核源码”通常不是 C 函数，而是入口汇编和链接脚本。x86-64 上，UEFI/bootloader 或 EFI stub 把内核镜像放入内存，传入启动参数和内存地图；早期入口建立最小栈、清 BSS、准备早期页表和 IDT，然后才调用 \code{kernel\_main} 一类 C 入口。
 
 \begin{lstlisting}
-vector_table:
-  word __stack_top
-  word reset_handler
-  word nmi_handler
-  word hardfault_handler
-  word timer_handler
-  word uart_handler
-
-reset_handler:
-  set sp, __stack_top
+early_x86_64_entry:
+  lea rsp, [rip + boot_stack_top]
   copy .data from flash LMA to sram VMA
   zero .bss
-  call clock_init
-  call uart_init
+  build early page tables
+  load provisional IDT
+  call early_console_init
   call kernel_main
-  loop forever
+halt_loop:
+  hlt
+  jmp halt_loop
 \end{lstlisting}
 
-这里已经出现了 OS 启动的三个根概念：入口地址、内存布局和异常表。后面 x86 的 IDT、内核入口和多核启动更复杂，但本质仍是“硬件按固定规则跳到一段受信任代码，代码建立可运行环境”。
+这里已经出现了 OS 启动的三个根概念：入口地址、内存布局和异常表。后面 IDT、内核入口和多核启动更复杂，但本质仍是“硬件和 bootloader 按固定规则跳到一段受信任代码，代码建立可运行环境”。
 
 \subsection{VMA 与 LMA：为什么 data 要复制}
 
@@ -254,6 +340,27 @@ DMA + 中断 & 大吞吐低 CPU & buffer 生命周期、cache、一致性复杂 
 
 这张表也适用于大 OS：epoll 减少无效轮询，NAPI 在高负载下把中断转为轮询，io\_uring 用共享队列减少系统调用往返。机制不同，目标都是在 CPU 占用、延迟和复杂度之间折中。
 
+\subsection{MCU 上的 DMA：从串口接收到环形缓冲区}
+
+即使在单片机上，DMA 也不是高级服务器才有的东西。典型场景是 UART 持续接收数据，CPU 不想每个字节都进中断。驱动可以准备一个环形缓冲区，让 DMA 控制器把 UART 接收数据直接写入 SRAM，半满或满时再中断 CPU。
+
+\begin{lstlisting}
+uart_rx_dma_setup():
+  dma.src = UART_DATA_REGISTER
+  dma.dst = rx_ring_buffer
+  dma.len = RING_SIZE
+  dma.mode = circular
+  dma.enable_half_full_irq = true
+  dma.enable_full_irq = true
+  start_dma()
+
+dma_irq():
+  produced = compute_dma_write_position()
+  publish_new_bytes_to_parser(produced)
+\end{lstlisting}
+
+这个例子把 DMA 的三条规则讲清楚。第一，buffer 在 DMA 运行期间不能随意改用途。第二，CPU 读取 DMA 写入的数据前，必须理解缓存一致性和写入位置。第三，completion 不一定表示全部 I/O 结束，也可能只是半缓冲区可消费。大型 OS 的网卡 RX ring 和块设备 completion，本质上是这个模型的扩展。
+
 \subsection{真实代码阅读入口}
 
 读真实 MCU 代码时，建议按下面顺序找：
@@ -267,4 +374,4 @@ DMA + 中断 & 大吞吐低 CPU & buffer 生命周期、cache、一致性复杂 
 \item 示例 main：是否有阻塞等待、是否有超时、是否有错误计数。
 \end{enumerate}
 
-STM32F4 常见文件名包括 \filepath{startup\_stm32f4xx.s}、\filepath{system\_stm32f4xx.c} 和 \filepath{stm32f4xx\_hal\_uart.c}；RISC-V MCU 工程常见 \filepath{start.S}、\filepath{linker.ld}、\filepath{trap.c}。不要先读完整 HAL 文档，先把上电到第一个字符输出的路径追通。
+x86-64 教学内核常见文件可以包括 \filepath{boot/entry\_64.S}、\filepath{kernel/head64.c}、\filepath{linker.ld}、\filepath{drivers/early\_uart.c}。不要先读完整驱动框架，先把 UEFI/bootloader 交接到第一个字符输出的路径追通。

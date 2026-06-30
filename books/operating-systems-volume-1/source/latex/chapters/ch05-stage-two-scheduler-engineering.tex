@@ -1,0 +1,175 @@
+\section{第二阶段深讲：调度器工程化，从算法到多核策略}
+
+调度算法课常用 FCFS、RR、优先级、MLFQ、CFS、EDF 做比较，但内核调度器不是算法博物馆。真实调度器要在中断、锁、cache、NUMA、cgroup、实时任务、能耗和安全边界之间做决策。本节关注算法落地后的工程问题：运行队列怎么组织，唤醒如何抢占，负载如何迁移，配额如何限流，证据如何解释。
+
+\subsection{调度器只从 runnable 集合里选}
+
+很多性能分析误把“线程没运行”归因于调度器。调度器只负责选择 runnable 任务；如果任务 sleeping，它等待的是锁、I/O、page fault、timer、信号或条件变量。正确诊断必须先问任务在哪个集合中。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+任务位置 & 含义 & 调度器能否直接运行 \\
+\midrule
+CPU current & 正在运行或在内核入口中 & 已经在运行 \\
+runqueue & runnable，等待 CPU & 可以被选择 \\
+wait queue & 条件不满足，睡眠中 & 不能，必须被唤醒 \\
+completion/request & 等设备或异步结果 & 不能，completion 路径唤醒 \\
+zombie list & 已退出，等父进程 wait & 不能 \\
+\bottomrule
+\end{longtable}
+
+这个区分决定了工具选择。runnable wait 高，查 runqueue 和 CPU 配额；sleep wait 高，查锁、I/O 或等待对象；zombie 多，查父进程是否 wait。没有这个分类，调度分析会变成猜测。
+
+\subsection{每 CPU runqueue 为什么必要}
+
+单一全局 runqueue 实现简单，但多核上所有 CPU 都要竞争一把锁，且每次调度都会移动同一组 cache line。每 CPU runqueue 把局部调度变成局部锁，降低争用；代价是负载不均时需要跨 CPU 迁移。
+
+\begin{lstlisting}
+per-cpu scheduling:
+  local timer tick updates current CPU's rq
+  local wakeup usually enqueues on target CPU rq
+  idle CPU tries to pull tasks from busy CPU
+  periodic balance compares load across domains
+\end{lstlisting}
+
+这就产生了调度域：SMT sibling、同一 LLC、同一 NUMA node、跨 node。近距离迁移成本低，远距离迁移成本高。调度器不能只看任务数量，还要看任务负载、cache 热度、内存位置和 CPU 能力。
+
+\subsection{唤醒路径比定时器路径更影响交互延迟}
+
+交互任务多数时间在睡眠，事件到来后被唤醒。如果唤醒后还要等很久才运行，用户会感到卡顿。因此调度器不仅要在时间片耗尽时选择任务，还要在 wakeup 时判断是否应抢占当前任务。
+
+\begin{lstlisting}
+wakeup(task):
+  task.state = RUNNABLE
+  place task on target runqueue
+  if task should preempt current:
+    set reschedule flag
+    if remote CPU:
+      send reschedule IPI
+\end{lstlisting}
+
+这里有两个难点。第一，唤醒任务放到哪个 CPU：放回上次 CPU 有 cache 局部性，放到空闲 CPU 有低延迟，放到数据所在 NUMA node 有内存局部性。第二，是否抢占当前任务：过度抢占会增加切换成本，抢占不足会增加交互延迟。
+
+\subsection{CFS 的 \code{min\_vruntime} 是队列坐标系}
+
+只讲 \code{vruntime} 还不够。每个 CFS runqueue 还维护 \code{min\_vruntime}，表示队列已经推进到的公平时间基准。新任务和唤醒任务不能简单设为 0，否则它们会在树最左边占便宜；也不能放得太靠后，否则唤醒延迟差。
+
+\begin{lstlisting}
+enqueue_fair(task, rq):
+  if task is new:
+    task.vruntime = rq.min_vruntime
+  if task wakes from sleep:
+    task.vruntime = max(task.vruntime, rq.min_vruntime - wakeup_granularity)
+  insert task into rb_tree ordered by vruntime
+\end{lstlisting}
+
+\code{min\_vruntime} 让每个 runqueue 有自己的坐标系。迁移任务时，需要把任务的 \code{vruntime} 从源 runqueue 坐标转换到目标 runqueue 坐标，否则任务可能因为跨 CPU 迁移得到不公平优势或惩罚。
+
+\subsection{EEVDF 思路：从公平份额到最早合格截止}
+
+现代公平调度进一步引入虚拟 deadline 思路。直观地说，任务不仅有“已经用了多少 CPU”的账本，还可以有“按权重和 slice 计算出的虚拟截止时间”。调度器倾向选择已经 eligible 且虚拟 deadline 最早的实体，以改善延迟和公平之间的折中。
+
+\begin{lstlisting}
+entity fields:
+  vruntime
+  weight
+  slice
+  virtual_deadline = vruntime + slice / weight_scaled
+
+pick:
+  among eligible entities
+  choose earliest virtual_deadline
+\end{lstlisting}
+
+这里不需要把工业实现细节全部搬进原理卷，但要说明动机：单纯最小 \code{vruntime} 关注长期公平，交互延迟还要通过 slice、wakeup 和 eligibility 调节。调度器演进的方向，是把“公平”和“延迟目标”放进同一个可维护账本。
+
+\subsection{实时调度和普通调度的边界}
+
+实时任务不能和普通 CFS 任务只靠 nice 值竞争。实时调度类通常优先于普通调度类，FIFO/RR 实时任务能长时间压制普通任务。deadline 调度还要处理 runtime、period、deadline 和准入控制。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+调度类 & 目标 & 风险 \\
+\midrule
+stop/deadline & CPU 停止、deadline 保证 & 最高优先级路径错误会冻结系统 \\
+real-time FIFO/RR & 固定优先级实时响应 & 饥饿普通任务，需要限额 \\
+fair & 权重公平与通用吞吐 & 不能保证硬实时 \\
+idle & 没有其他任务时运行 & 不应影响正常调度 \\
+\bottomrule
+\end{longtable}
+
+实时任务需要限额和监控，否则一个死循环实时线程可以让系统失去响应。工业内核通常提供 RT throttling，防止实时任务占满全部 CPU 时间。
+
+\subsection{cgroup 配额造成的周期性延迟}
+
+容器或服务组常被配置 CPU quota。假设周期 100ms，配额 20ms。组内任务在本周期累计运行 20ms 后会被 throttle，即使机器还有空闲 CPU，也要等下个周期补充预算。
+
+\begin{lstlisting}
+cgroup runtime:
+  on task execution:
+    group.runtime_remaining -= delta
+  if group.runtime_remaining <= 0:
+    throttle all runnable tasks in group
+  at period timer:
+    refill group.runtime_remaining
+    unthrottle group
+\end{lstlisting}
+
+这种机制会形成很典型的尾延迟：请求前 20ms 很快，预算耗尽后突然等待到周期刷新。排查容器内延迟时，必须看 throttled time、throttled periods 和 quota 配置，而不是只看宿主 CPU 利用率。
+
+\subsection{优先级反转是调度器和锁的交叉问题}
+
+低优先级任务持锁，高优先级任务等锁，中优先级任务占 CPU，会导致高优先级任务间接被中优先级任务阻塞。调度器单独看 runnable 集合时看不出问题，因为真正持有资源的是低优先级任务。
+
+\begin{lstlisting}
+priority inheritance:
+  H waits on lock owned by L
+  boost L effective priority to at least H
+  if L waits on another owner X:
+    propagate boost to X
+  when lock released:
+    recompute effective priority
+\end{lstlisting}
+
+实现上要维护 owner、waiters、effective priority 和继承链。释放锁时不能简单恢复原优先级，因为任务可能还持有另一个被高优先级任务等待的锁。这个例子说明同步原语不能和调度器完全隔离。
+
+\subsection{调度器证据：如何解释一次延迟}
+
+一次请求慢，要按时间分段：
+
+\begin{lstlisting}
+request latency =
+  runnable wait
+  + on-cpu execution
+  + sleeping on I/O or lock
+  + page fault/reclaim
+  + scheduler and interrupt overhead
+\end{lstlisting}
+
+常用证据包括 \code{perf sched}、\code{/proc/<pid>/sched}、tracepoint、off-CPU profile、\code{/proc/schedstat}、cgroup CPU 统计、\code{pidstat -w}。不同证据回答不同问题。
+
+\begin{longtable}{p{0.24\linewidth}p{0.46\linewidth}p{0.18\linewidth}}
+\toprule
+证据 & 回答的问题 & 层次 \\
+\midrule
+\code{/proc/<pid>/sched} & 任务运行、等待、迁移等统计 & 单任务 \\
+\code{perf sched} & 调度事件时间线 & 系统级 \\
+cgroup cpu.stat & 是否被 quota throttle & 服务组 \\
+tracepoint sched\_* & wakeup、switch、migrate 事件 & 内核事件 \\
+off-CPU profile & 睡眠等待在哪里发生 & 锁/I/O \\
+\bottomrule
+\end{longtable}
+
+调度器优化要先定位是哪一段时间异常。若大部分时间在 off-CPU 等锁，改 CFS 参数不会解决；若大部分时间 runnable wait，才应看 CPU 配额、优先级、runqueue 和负载均衡。
+
+\subsection{调度器工程验收}
+
+\begin{itemize}
+\tightlist
+\item 能解释 task 为什么不在 CPU：runnable、sleeping、zombie、throttled 要分清。
+\item 能说明每 CPU runqueue 与负载均衡的取舍。
+\item 能推导唤醒抢占对交互延迟和上下文切换成本的影响。
+\item 能解释 \code{vruntime}、\code{min\_vruntime} 和迁移坐标转换的关系。
+\item 能说明 cgroup quota 为什么会制造周期性尾延迟。
+\item 能用调度事件证据区分 on-CPU 慢和 off-CPU 等待。
+\end{itemize}

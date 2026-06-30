@@ -6,7 +6,197 @@
 
 系统调用不是普通函数调用。普通函数调用仍在同一特权级、同一地址空间和同一信任边界里执行；系统调用会从用户态进入内核态，切换到受控入口，使用内核栈或内核上下文，检查用户指针，并在返回前恢复用户态。这个边界使得内核可以拒绝非法请求，也使系统调用有固定开销。
 
+\subsection{特权到底保护了什么}
+
+特权级保护的不是一个抽象名分，而是一组具体硬件状态。用户态不能改页表根，不能关中断，不能改中断向量，不能写任意控制寄存器，不能访问只映射给内核的 MMIO，不能把自己的代码标成内核入口。CPU 在执行敏感指令、地址翻译和异常返回时都会检查当前模式。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+受保护对象 & 为什么危险 & 合法路径 \\
+\midrule
+页表根/地址空间控制 & 可映射任意物理页，读取内核或其他进程 & 内核内存管理代码 \\
+中断使能和向量表 & 可阻止调度或劫持异常入口 & 内核入口和中断子系统 \\
+设备 MMIO 寄存器 & 可重置设备、窃取数据、破坏存储 & 驱动通过 fd/ioctl/sysfs 等受控接口 \\
+特权返回状态 & 可伪造内核态返回或跳转地址 & 低级 entry/return 代码检查 \\
+I/O 权限和端口 & 可直接访问平台设备 & 内核 I/O 权限管理或驱动 \\
+\bottomrule
+\end{longtable}
+
+x86-64 用 Ring 0 和 Ring 3 表达常见用户/内核边界。Ring 3 运行普通用户程序，Ring 0 运行内核；CPU 在执行敏感指令、访问 supervisor-only 页、装载控制寄存器、返回低特权级时检查 CPL 和相关权限位。
+
+\begin{longtable}{p{0.18\linewidth}p{0.3\linewidth}p{0.4\linewidth}}
+\toprule
+层级 & 角色 & 系统调用入口 \\
+\midrule
+Ring 3 & 用户程序 & 执行 \code{syscall} 请求进入内核 \\
+Ring 0 & 内核 & 由 IA32\_LSTAR MSR 指向的入口接管 \\
+VMX root & hypervisor & 可选择拦截 guest 的敏感事件 \\
+\bottomrule
+\end{longtable}
+
+特权边界的验收问题是：用户程序是否能绕过内核直接改变受保护状态？若答案是能，系统调用实现得再漂亮也没有隔离。
+
+\subsection{为什么进入内核要换栈}
+
+用户栈由用户程序控制。它可能没有映射，可能只读，可能指向恶意构造的数据，也可能在系统调用前被故意放到临界边界。内核不能在用户栈上保存自己的返回地址、锁状态和局部变量，否则用户就能破坏内核控制流。因此跨特权级入口必须切到可信内核栈或受控异常栈。
+
+\begin{lstlisting}
+on syscall from user:
+  hardware saves minimal return state
+  entry code switches from user rsp to current.kernel_stack
+  entry code saves registers into pt_regs
+  C syscall code runs on kernel stack
+\end{lstlisting}
+
+每个线程通常有自己的内核栈。线程在用户态运行时使用用户栈；进入内核后使用内核栈；若阻塞在系统调用中，内核栈保存它在内核里的等待位置。调度器切换线程时，既要能恢复用户态 trap frame，也要能恢复睡眠中的内核调用链。
+
+\subsection{函数调用、库调用和系统调用的三层区别}
+
+很多初学者把 \code{printf}、\code{write}、系统调用混在一起。实际上它们处在三层边界上。普通函数调用只改变当前进程内部的 RIP 和栈；库调用仍在用户态，只是封装了更复杂逻辑；系统调用才跨越 CPU 特权边界进入内核。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+调用类型 & 发生在哪里 & 边界含义 \\
+\midrule
+普通函数调用 & 同一进程、同一特权级 & 调用者和被调者互相信任同一地址空间 \\
+libc/API 调用 & 用户态库代码 & 可做缓冲、格式化、兼容处理，但不能直接改内核对象 \\
+系统调用 & 用户态陷入内核态 & CPU 切换特权，内核检查权限和对象状态 \\
+\bottomrule
+\end{longtable}
+
+\code{printf("x")} 通常先把格式化结果写到用户态 stdio buffer；buffer 满、遇到换行或显式 flush 时，libc 可能调用 \code{write}；\code{write} wrapper 把系统调用号和参数放进寄存器，执行 \code{syscall}。内核并不知道 \code{printf} 的格式化细节，它只看见 fd、用户 buffer 和长度。
+
+\begin{lstlisting}
+printf("hello\n")
+  -> libc formats into FILE buffer
+  -> libc write wrapper
+  -> CPU syscall instruction
+  -> kernel sys_write
+  -> fd table, file object, device/file path
+\end{lstlisting}
+
+这层区分能解释许多现象：程序崩溃时 stdio buffer 可能没写出；\code{write} 返回成功不等于数据落盘；系统调用开销来自特权切换、参数检查和内核路径，不是 C 函数调用本身。
+
+\subsection{系统调用入口的硬件动作逐步展开}
+
+以 x86-64 的 \code{syscall} 为例，用户态执行指令后，CPU 不会查 C 函数表。它读取预先由内核配置的 MSR，切换到内核入口地址，保存返回地址和标志的一部分，改变特权相关状态。随后汇编入口完成 \code{swapgs}、切换内核栈、构造 \code{pt\_regs}。
+
+\begin{lstlisting}
+user mode before syscall:
+  rax = syscall number
+  rdi, rsi, rdx, r10, r8, r9 = args
+  rip = address after syscall
+  rsp = user stack
+
+hardware/syscall entry:
+  save return rip into rcx
+  save flags into r11
+  load kernel entry rip from MSR
+  enter privileged execution path
+
+low-level kernel entry:
+  swapgs to kernel per-cpu base
+  load current thread kernel stack
+  save user registers into pt_regs
+  call C syscall dispatcher
+\end{lstlisting}
+
+不同架构寄存器名和指令不同，但结构类似：约定参数位置，触发陷入，保存返回状态，切换到可信上下文，分发表项，返回前处理信号/抢占/审计。把这条路径记清，后面看 entry 汇编就不会把它当成神秘代码。
+
+\subsection{返回用户态比进入内核更危险}
+
+进入内核时，内核获得控制权；返回用户态时，内核要把控制权交还给不可信程序。返回前必须保证：目标 RIP 是用户地址，返回 CPL 是 Ring 3，用户栈指针不会让内核继续使用，挂起信号和抢占已处理，调试/审计状态一致，寄存器中不能泄露内核敏感数据。
+
+\begin{lstlisting}
+return_to_user(regs):
+  if need_resched: schedule()
+  if signal_pending: deliver_signal(regs)
+  if tracing_or_audit: syscall_exit_work(regs)
+  sanitize_user_return_state(regs)
+  restore_user_registers(regs)
+  sysretq or iretq
+\end{lstlisting}
+
+许多安全漏洞发生在返回路径：错误使用快速返回指令、没有正确验证用户返回地址、泄露内核寄存器内容、返回前忘记处理单步/信号状态。系统调用不是“进入内核执行函数再回来”这么简单，入口和出口都是安全边界。
+
 参数复制是系统调用安全性的核心。用户态传入的指针不能被内核直接相信，因为它可能无效、不可读、不可写、跨页、在检查后被另一个线程改掉，或指向内核不应访问的区域。内核必须使用 copy\_from\_user/copy\_to\_user 一类机制，把用户内存当作不可信输入处理。
+
+\subsection{用户指针为什么不能直接解引用}
+
+用户指针看起来只是一个地址，但它属于用户地址空间的契约，不属于内核可信内存。直接解引用会产生四类问题。第一，地址可能无效，内核访问会 fault。第二，地址可能指向用户不可读/不可写区域。第三，地址所在页可能跨页，前半可读后半不可读。第四，另一个线程可能在检查之后修改数据，造成 TOCTOU。
+
+\begin{lstlisting}
+bad:
+  // directly trusts user pointer
+  header = *(struct Header*)user_ptr
+  use(header.length)
+
+better:
+  header = copy_struct_from_user(user_ptr)
+  validate(header.length)
+  data = copy_bytes_from_user(user_ptr + sizeof(header), header.length)
+\end{lstlisting}
+
+copy 不是低效保守，而是把不可信输入转成内核拥有的稳定快照。对于大 I/O，内核可以 pin 用户页或使用零拷贝，但那会引入页生命周期、DMA 映射和 completion 责任，不能简单理解成“直接用用户指针”。
+
+\subsection{EFAULT 是如何产生的}
+
+当内核复制用户数据时，用户页可能不存在或权限不允许。若普通内核代码访问坏地址直接 fault，通常是内核 bug；但 \code{copy\_from\_user} 的 fault 是预期错误路径。内核通过异常表或等价机制告诉 page fault handler：如果 fault 发生在这段用户复制指令上，不要 panic，而是跳到 fixup 路径返回失败。
+
+\begin{lstlisting}
+copy loop instruction at address A:
+  load byte from user pointer
+  store byte to kernel buffer
+
+exception table:
+  faulting instruction A -> fixup address F
+
+page fault handler:
+  if fault_pc found in exception table:
+    regs.rip = fixup_address
+    return
+  else:
+    handle normal kernel/user fault
+\end{lstlisting}
+
+这解释了为什么用户指针复制需要专用 API。它不仅做范围检查，还和低级异常处理配合，把硬件 fault 转换成系统调用错误码。教学 OS 也应该明确区分“内核自己访问坏地址”和“内核按用户请求复制时遇到坏用户页”。
+
+\subsection{权限检查不是一个 if}
+
+一次系统调用经常要穿过多层权限。以 \code{openat} 为例，路径解析要检查每级目录搜索权限；mount namespace 决定看到哪棵树；符号链接可能改变目标；LSM 可在路径或 inode 层拒绝；文件 mode、ACL、capability 决定读写执行；打开 flags 决定是否创建、截断、追加；资源限制决定还能否分配 fd。
+
+\begin{lstlisting}
+openat(dirfd, path, flags):
+  resolve dirfd in current fd table
+  walk path under mount namespace
+  check execute/search permission on directories
+  handle symlink policy and flags
+  get stable inode/dentry reference
+  check DAC/ACL/capability
+  call LSM hooks
+  create file object with open flags
+  allocate fd in current process fd table
+\end{lstlisting}
+
+这也是为什么错误码能提供信息。\code{ENOENT}、\code{ENOTDIR}、\code{EACCES}、\code{EPERM}、\code{ELOOP}、\code{EMFILE} 分别表示不同层次失败。把所有失败都写成“权限不够”会掩盖状态机。
+
+\subsection{root、capability 和 namespace 的演进}
+
+早期 Unix 常把 uid 0 作为全能 root。现代系统把 root 权限拆成 capability，例如 \code{CAP\_NET\_ADMIN}、\code{CAP\_SYS\_ADMIN}、\code{CAP\_DAC\_OVERRIDE}。namespace 又让“这个 capability 对哪个对象集合有效”成为问题。容器内 root 不应自动拥有宿主全部权限。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+机制 & 解决的问题 & 新复杂性 \\
+\midrule
+uid/gid/mode & 简单主体和文件权限 & 粒度粗，root 过大 \\
+capability & 把 root 权限拆小 & 哪个路径检查哪个 capability 要准确 \\
+namespace & 隔离进程看到的资源视图 & capability 必须相对 user namespace 解释 \\
+LSM & 策略化强制访问控制 & hook 覆盖面和策略复杂度 \\
+seccomp & 收缩系统调用面 & 只看 syscall/参数，难懂对象语义 \\
+\bottomrule
+\end{longtable}
+
+权限系统的本质是最小授权。内核应让调用者只获得完成任务所需能力；任何跳过对象所属 namespace 的 capability 检查，都可能把容器内权限放大成宿主权限。
 
 权限不只有文件 mode 位。一个请求是否允许，可能取决于用户 ID、组 ID、capability、namespace、cgroup、seccomp、LSM、安全标签、mount 选项、fd 打开模式、对象引用和当前进程状态。OS 学习中的常见错误，是把“我是这个进程”误以为“我拥有所有资源”。
 

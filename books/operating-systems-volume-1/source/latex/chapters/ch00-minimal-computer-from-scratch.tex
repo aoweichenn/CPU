@@ -1,0 +1,422 @@
+\section{从零搭一个 x86-64 教学子集：先能手算，再谈 OS}
+
+前面讲了从电路到 OS 的大方向，但真正理解硬件，不能只读概念。我们在这一节搭一个极小但完整的 x86-64 教学子集。它不追求真实 x86-64 的全部复杂度，而是保留所有关键骨架：bit、字节、机器字、内存地址、RIP、RSP、通用寄存器、Intel 语法指令、取指译码执行、栈、中断、Ring 0/3 和地址保护。只要这台小机器能讲清，后面再看 Linux x86-64，就只是把同一组机制放大。
+
+\begin{keyidea}
+先不要问“Linux 怎么做”。先问：如果只有一块内存、几个寄存器和一组指令，程序如何运行？程序如何等待设备？程序出错如何停住？多个程序如何互不破坏？这些问题推出来的答案，就是 OS 的硬件根。
+\end{keyidea}
+
+\subsection{第一步：bit、byte、word 到底是什么}
+
+硬件里最小的稳定信息单位是 bit，它只有两个状态：0 或 1。8 个 bit 组成 byte。CPU 通常一次更喜欢处理固定宽度的一组 bit，例如 16 位、32 位或 64 位，这组 bit 叫 word。word 不是数学概念，而是机器一次自然处理的数据宽度。
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.44\linewidth}}
+\toprule
+单位 & 例子 & 含义 \\
+\midrule
+bit & \code{0} 或 \code{1} & 一个开关状态、一个标志位、权限位 \\
+byte & \code{01000001} & 最小寻址单位常是 1 byte，可表示字符或二进制片段 \\
+word & 16/32/64 bit & CPU 算术、地址和寄存器常用宽度 \\
+cache line & 常见 64 byte 量级 & cache 一次搬运的数据块 \\
+page & 常见 4KiB 起 & MMU 和 OS 管理内存的基本单位 \\
+\bottomrule
+\end{longtable}
+
+同一串 bit 可以被解释成不同含义。比如 \code{01000001} 可以是无符号整数 65，也可以是 ASCII 字符 \code{A}，也可以是某条指令的一部分。机器只保存 bit；含义来自解释规则。OS 做 ELF 装载、页权限、系统调用参数检查，本质上都在维护这些 bit 的合法解释方式。
+
+\subsection{第二步：数值表示为什么需要补码}
+
+无符号整数最简单：n 个 bit 表示 \code{0} 到 \code{2^n-1}。8 位无符号数 \code{11111111} 是 255。问题是负数怎么表示。现代 CPU 通常用二进制补码：最高位有负权重。8 位补码中，\code{11111111} 表示 -1，\code{10000000} 表示 -128，\code{01111111} 表示 127。
+
+\begin{lstlisting}
+8-bit unsigned:
+  00000000 = 0
+  00000001 = 1
+  11111111 = 255
+
+8-bit two's complement:
+  00000000 = 0
+  00000001 = 1
+  01111111 = 127
+  10000000 = -128
+  11111111 = -1
+\end{lstlisting}
+
+补码的好处是加法电路统一。硬件不需要为有符号加法重做一套加法器。比如 \code{1 + (-1)}：
+
+\begin{lstlisting}
+  00000001
++ 11111111
+=1 00000000   // 舍弃第 9 位进位，结果是 0
+\end{lstlisting}
+
+OS 为什么关心整数表示？因为长度、地址、偏移、权限位和计数器都可能溢出。系统调用里 \code{offset + length} 若不检查溢出，就可能绕过边界检查；页号移位若用错有符号类型，就会产生错误地址。底层表示不是数学细节，而是安全边界。
+
+\subsection{第三步：内存是一张按地址编号的字节表}
+
+先把内存想成一个数组：
+
+\begin{lstlisting}
+memory[0] = byte
+memory[1] = byte
+memory[2] = byte
+...
+\end{lstlisting}
+
+地址就是数组下标。若机器有 16 位地址，则最多能直接编号 \code{2^16 = 65536} 个 byte，也就是 64KiB。真实 64 位机器虚拟地址空间远大得多，但第一层理解就是“地址选中某个 byte”。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+问题 & 朴素答案 & 后续复杂化 \\
+\midrule
+地址是什么 & 内存数组下标 & 虚拟地址、物理地址、DMA 地址会分开 \\
+读一个 word 怎么办 & 读连续多个 byte 组合 & 端序、对齐、cache line、缺页 \\
+写内存是什么 & 把 byte 放到地址位置 & 权限、dirty bit、写回 cache、DMA 一致性 \\
+非法地址怎么办 & 简单机器可能乱读乱写 & MMU 触发异常，OS 决定修复或杀进程 \\
+\bottomrule
+\end{longtable}
+
+多字节数值还涉及端序。小端机器把低有效字节放在低地址，大端机器相反。比如 32 位值 \code{0x12345678} 在小端内存中是：
+
+\begin{lstlisting}
+address A+0: 0x78
+address A+1: 0x56
+address A+2: 0x34
+address A+3: 0x12
+\end{lstlisting}
+
+端序影响二进制文件、网络协议、设备寄存器和调试内存转储。OS 读 ELF header、网络栈解析报文、驱动读设备描述符时，都必须知道字段的字节顺序。
+
+\subsection{第四步：先定义一个 x86-64 教学 CPU}
+
+我们定义一个 x86-64 教学子集，名字叫 X64S。为了方便手算，它只开放少量指令和 64KiB 教学内存，但寄存器命名、栈语义、系统调用入口和中断返回都沿用 x86-64 主线。它有通用寄存器 \code{rax/rbx/rcx/rdx/rsi/rdi/rbp/rsp}，一个指令指针 \code{rip}，一个状态寄存器 \code{rflags}，一个当前特权级 \code{cpl}。
+
+\begin{longtable}{p{0.16\linewidth}p{0.28\linewidth}p{0.44\linewidth}}
+\toprule
+状态 & 初始解释 & OS 关联 \\
+\midrule
+\code{rip} & 下一条指令地址 & 中断、异常和上下文切换必须保存它 \\
+\code{rsp} & 当前栈顶地址 & 函数调用、系统调用、内核栈切换依赖它 \\
+\code{rax/rdi/rsi/...} & 通用计算寄存器 & 返回值、系统调用号、参数、临时状态 \\
+\code{rflags} & zero、carry、interrupt enable & 分支、算术结果、中断开关 \\
+\code{cpl} & Ring 3 或 Ring 0 & 特权级的最小模型 \\
+\bottomrule
+\end{longtable}
+
+这台机器是教学简化版，但它足够解释 OS。真实 x86-64 有更多寄存器、更复杂的 RFLAGS、控制寄存器、MSR、段/TSS/IST 和虚拟化状态；核心问题不变：机器状态必须能被保存、恢复、检查和保护。
+
+\subsection{第五步：定义几条指令}
+
+X64S 使用 x86-64 Intel 语法展示指令，但只选少量常用语义。真实 x86-64 编码有前缀、opcode、ModRM/SIB、位移和立即数；教学时先看语义。
+
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+指令 & 语义 & 用途 \\
+\midrule
+\code{mov reg, imm} & \code{reg = imm} & 把常量放进寄存器 \\
+\code{mov reg, [base]} & \code{reg = memory[base]} & 从内存读数据 \\
+\code{mov [base], reg} & \code{memory[base] = reg} & 向内存写数据 \\
+\code{add dst, src} & \code{dst = dst + src} & 算术计算 \\
+\code{sub dst, src} & \code{dst = dst - src} & 比较和减法 \\
+\code{cmp a, b} & 设置 zero/carry 等标志 & 条件分支前比较 \\
+\code{jmp label} & \code{rip = label} & 无条件跳转 \\
+\code{jz label} & zero 为 1 时跳转 & 条件分支 \\
+\code{syscall} & 进入 Ring 0 系统调用入口 & 用户请求内核服务 \\
+\code{iretq/sysretq} & 返回较低特权级或快速返回 & 受控返回用户态 \\
+\bottomrule
+\end{longtable}
+
+真实机器会把 I/O 设计成端口 I/O 或 MMIO。本书主线使用 MMIO。教学重点是：指令不是魔法，它只是固定格式的 bit，译码器按 opcode 和寻址模式选择数据通路动作。
+
+\subsection{第六步：取指、译码、执行的完整循环}
+
+现在 X64S 能跑程序了。CPU 每次从 \code{rip} 指向的内存取指令字节，解码出指令长度和操作数，默认让 \code{rip} 前进到下一条指令；分支、异常和返回指令可以覆盖这个默认下一地址。
+
+\begin{lstlisting}
+cpu_step():
+  inst = decode(memory, rip)
+  next_rip = rip + inst.length
+  switch opcode:
+    MOV_REG_IMM: regs[dst] = imm
+    MOV_LOAD:    regs[dst] = read64(memory, regs[base] + disp)
+    MOV_STORE:   write64(memory, regs[base] + disp, regs[src])
+    ADD:         regs[dst] = regs[dst] + regs[src]
+    CMP:         rflags.zero = (regs[a] == regs[b])
+    JZ:          if rflags.zero: next_rip = target
+  rip = next_rip
+\end{lstlisting}
+
+真实 CPU 可能因为流水线和预测更复杂，但架构语义仍要保证程序按正确顺序推进。中断和异常会保存 \code{rip}，所以 fault 保存当前指令还是 interrupt 保存下一条指令，是架构必须定义清楚的契约。
+
+\subsection{第七步：手跑一个程序}
+
+我们写一个程序，把内存 \code{0x2000} 和 \code{0x2008} 的两个 64 位数相加，结果写到 \code{0x2010}。
+
+\begin{lstlisting}
+mov rbx, 0x2000
+mov rax, qword ptr [rbx]       ; rax = memory[0x2000]
+mov rbx, 0x2008
+mov rcx, qword ptr [rbx]       ; rcx = memory[0x2008]
+add rax, rcx
+mov rbx, 0x2010
+mov qword ptr [rbx], rax
+hlt
+\end{lstlisting}
+
+假设初始内存：
+
+\begin{lstlisting}
+memory[0x2000] = 7
+memory[0x2008] = 5
+\end{lstlisting}
+
+执行结束后，\code{memory[0x2010] = 12}。这就是所有程序运行的根：指令改变寄存器，寄存器形成地址，内存保存数据，\code{rip} 决定下一步。OS 再复杂，也不能违反这个根模型。
+
+\subsection{第八步：为什么需要栈}
+
+没有栈，也能写直线程序；一旦需要函数调用、局部变量和返回地址，就需要一个按后进先出管理的区域。我们把 \code{rsp} 作为栈指针，约定栈向低地址增长。
+
+\begin{lstlisting}
+push rax:
+  rsp = rsp - 8
+  memory[rsp] = rax
+
+pop rax:
+  rax = memory[rsp]
+  rsp = rsp + 8
+
+call addr:
+  push next_rip
+  rip = addr
+
+ret:
+  pop rip
+\end{lstlisting}
+
+栈解释了很多 OS 现象。每个线程为什么要有自己的栈？因为函数调用链、返回地址和局部变量不能混在一起。系统调用为什么要从用户栈切到内核栈？因为用户栈不可信，内核不能把自己的返回地址和局部状态放在用户可改的内存里。
+
+\subsection{第九步：内存布局从哪里来}
+
+程序不能随便把代码、数据和栈混在同一块区域。我们给 X64S 一个简单内存布局：
+
+\begin{lstlisting}
+0x0000 - 0x0fff  kernel code
+0x1000 - 0x1fff  user program code
+0x2000 - 0x2fff  user data
+0x3000 - 0x3fff  user stack
+0xf000 - 0xffff  device registers
+\end{lstlisting}
+
+这张表一开始只是约定。若所有代码同权，用户程序仍然可以写 \code{0x0000} 覆盖 kernel code，也可以写 \code{0xf000} 操作设备。要把“约定”变成“保证”，需要硬件保护。OS 的复杂性就是从这里开始的。
+
+\subsection{第十步：轮询设备为什么会浪费 CPU}
+
+假设 X64S 有一个键盘设备，MMIO 状态寄存器在 \code{0xf000}，数据寄存器在 \code{0xf008}。状态 bit0 表示是否有字符。
+
+\begin{lstlisting}
+keyboard_poll:
+  mov rbx, 0xf000
+loop:
+  mov rax, qword ptr [rbx]        ; read status
+  and rax, 1
+  cmp rax, 0
+  jz loop
+  mov rbx, 0xf008
+  mov rcx, qword ptr [rbx]        ; read character
+\end{lstlisting}
+
+这个程序功能上正确，但 CPU 在没有按键时一直空转。若系统只有一个任务，可以接受；若还要同时控制电机、刷新显示、处理网络，就不能让 CPU 卡在一个设备等待上。于是需要中断：设备有事件时打断 CPU，而不是 CPU 一直问设备。
+
+\subsection{第十一步：中断如何进入 CPU}
+
+给 X64S 增加中断机制。设备可以通过 APIC/MSI-X 路径设置 pending vector。CPU 在指令边界，如果 \code{rflags.IF = 1} 且有可投递中断，就保存当前返回状态，关闭同级中断，跳到 IDT 中登记的中断入口。
+
+\begin{lstlisting}
+after each instruction:
+  if rflags.IF and pending_interrupt:
+    kernel_stack.push(rflags)
+    kernel_stack.push(cs)
+    kernel_stack.push(rip)
+    rflags.IF = 0
+    cpl = 0
+    rip = idt[vector].handler
+\end{lstlisting}
+
+中断处理函数读取设备数据，清 pending，恢复 \code{rip/rflags}，返回被打断的程序。
+
+\begin{lstlisting}
+irq_return:
+  iretq restores rip, cs, rflags, rsp, ss when returning to Ring 3
+\end{lstlisting}
+
+这就是 trap frame 的雏形。真实 CPU 保存更多寄存器，也有更复杂的栈切换和优先级，但本质是一样的：硬件必须留下足够状态，让内核处理事件后能回到被打断的位置。
+
+\subsection{第十二步：定时器为什么能让 OS 抢回 CPU}
+
+中断不只来自键盘，也可以来自定时器。给 X64S 加一个每 1000 个周期触发一次的 local APIC timer IRQ。即使用户程序写了死循环，定时器仍会周期性把 CPU 带回内核。
+
+\begin{lstlisting}
+user_bad_program:
+  jmp user_bad_program
+
+timer_irq:
+  save current registers into current_task.context
+  choose next runnable task
+  restore next_task.context
+  iretq
+\end{lstlisting}
+
+这就是抢占式调度的硬件根。没有定时器，OS 只能相信程序主动 \code{yield}；有了定时器，OS 可以在程序不合作时收回 CPU。调度器不是凭空切换线程，它依赖定时器中断、上下文保存和恢复。
+
+\subsection{第十三步：为什么需要用户态和内核态}
+
+现在 X64S 有中断了，但用户程序仍然可以写设备寄存器、改中断向量、覆盖内核代码。我们加入 \code{cpl}：Ring 3 表示用户态，Ring 0 表示内核态。再规定：
+
+\begin{itemize}
+\tightlist
+\item 只有 Ring 0 能访问 \code{0x0000-0x0fff} 的内核代码数据。
+\item 只有 Ring 0 能访问 \code{0xf000-0xffff} 的设备 MMIO。
+\item 只有 Ring 0 能修改 IDT、CR3、MSR 和保护配置。
+\item Ring 3 执行特权指令会触发异常。
+\end{itemize}
+
+\begin{lstlisting}
+memory_access(addr, type):
+  if cpl == 3 and addr in kernel_or_device_range:
+    raise protection_fault
+  else:
+    perform access
+\end{lstlisting}
+
+这一步把“不要乱写”变成“写不了”。操作系统最基本的安全性，不是靠应用自觉，而是靠 CPU 在每次敏感访问时强制检查。
+
+\subsection{第十四步：系统调用是受控入口}
+
+有了用户态/内核态，用户程序不能直接写设备，那它如何输出字符？答案是系统调用。X64S 使用 x86-64 的 \code{syscall} 指令。用户程序把系统调用号放进 \code{rax}，把参数放进 \code{rdi/rsi/rdx/r10/r8/r9}，执行 \code{syscall}；CPU 切到 Ring 0 入口；内核检查系统调用号和参数，再代表用户操作设备。
+
+\begin{lstlisting}
+user:
+  mov rax, 1        ; syscall number: write_char
+  mov rdi, 'A'      ; argument
+  syscall
+
+hardware:
+  save user rip/rflags into rcx/r11
+  cpl = 0
+  rip = syscall_entry_msr
+
+kernel:
+  if rax == write_char:
+    check permission
+    write device register
+  return to user
+\end{lstlisting}
+
+现在可以看清：系统调用不是函数调用。函数调用不改变 \code{cpl}，不能绕过用户权限；系统调用由硬件提供受控入口，只有入口处的内核代码能获得特权。
+
+\subsection{第十五步：base/limit 是最小内存保护}
+
+先不引入复杂页表，给 X64S 教学模型每个用户程序两个界限寄存器：\code{BASE} 和 \code{LIMIT}。用户态访存时，硬件检查地址是否落在范围内。真实 x86-64 不用这种简单 base/limit 管普通用户地址空间，而是依赖页表和 U/S 权限位；这里先用它说明“硬件必须参与隔离”。
+
+\begin{lstlisting}
+user_translate(addr):
+  if addr >= LIMIT:
+    raise protection_fault
+  physical = BASE + addr
+  return physical
+\end{lstlisting}
+
+这让每个程序以为自己从地址 0 开始，硬件把它平移到不同物理区域。程序 A 的 \code{addr=0x0100} 和程序 B 的 \code{addr=0x0100} 可以落到不同物理位置。它已经能实现基本隔离，但有明显局限：每个程序需要连续物理内存，不适合共享库，也不适合按需分配。
+
+\subsection{第十六步：分页如何解决连续内存问题}
+
+分页把虚拟地址切成页号和页内偏移。假设页大小 256 byte，虚拟地址高 8 位是虚拟页号，低 8 位是偏移。页表记录每个虚拟页映射到哪个物理页，以及权限。
+
+\begin{lstlisting}
+translate(va, access):
+  vpn = va >> 8
+  off = va & 0xff
+  pte = page_table[vpn]
+  if !pte.present:
+    raise page_fault
+  if access not allowed:
+    raise protection_fault
+  return (pte.ppn << 8) | off
+\end{lstlisting}
+
+分页解决了三件事。第一，虚拟连续不要求物理连续。第二，每页可以有独立权限。第三，不存在的页可以等访问时再分配或从文件读取。现代虚拟内存、COW、\code{mmap}、按需装载都从这里长出来。
+
+\subsection{第十七步：page fault 不是一定错误}
+
+如果用户访问一个 \code{present=0} 的页，硬件触发 page fault。内核查看这个地址是否属于合法 VMA。如果合法，例如栈增长或文件映射尚未读入，内核可以分配页、更新 PTE、返回用户态重试原指令。如果不合法，内核发送错误信号或杀死进程。
+
+\begin{lstlisting}
+page_fault(va, access):
+  vma = find_vma(current, va)
+  if vma == none:
+    kill_process(SIGSEGV)
+  else if access not allowed by vma:
+    kill_process(SIGSEGV)
+  else:
+    page = allocate_or_load_page(vma, va)
+    install_pte(va, page, permissions)
+    return_to_faulting_instruction()
+\end{lstlisting}
+
+这一步非常重要。缺页不是“内存坏了”，而是硬件把某次无法完成的访问交给 OS 决策。虚拟内存的弹性来自这个机制。
+
+\subsection{第十八步：把所有状态放进 task}
+
+如果要运行多个程序，OS 必须能暂停一个程序，恢复另一个程序。一个 task 至少保存这些状态：
+
+\begin{lstlisting}
+struct Task {
+  gpr[16]
+  rip
+  rsp
+  rflags
+  cpl
+  page_table
+  kernel_stack
+  state: Runnable | Running | Blocked | Zombie
+}
+\end{lstlisting}
+
+上下文切换就是保存当前 task 的 CPU 状态，选择下一个 runnable task，把它的状态装回 CPU。真实 OS 还要保存浮点/SIMD、调度统计、信号、fd 表、凭据、namespace 等，但最小根就是这些。
+
+\subsection{第十九步：从 X64S 教学子集映射到真实 x86-64}
+
+现在可以把 X64S 的概念映射到真实机器。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+X64S 概念 & 真实 x86-64 对应 & OS 意义 \\
+\midrule
+\code{rip} & RIP & 异常返回和调试定位 \\
+\code{rsp} & RSP、TSS/IST 栈切换 & 用户栈、内核栈、调度切换 \\
+\code{cpl} & Ring 3/Ring 0 & 特权级和系统调用边界 \\
+syscall entry & IA32\_LSTAR MSR、IDT gate & 受控进入内核 \\
+page table & x86-64 四/五级页表、CR3、PCID & 地址空间和权限 \\
+timer IRQ & local APIC timer、TSC deadline & 抢占和超时 \\
+device range & PCIe BAR、ACPI resource & 驱动访问设备寄存器 \\
+task context & \code{task\_struct/thread\_info/pt\_regs} 等 & 调度器保存恢复执行 \\
+\bottomrule
+\end{longtable}
+
+真实机器复杂，但不是另一套逻辑。x86-64 的页表层级更多，权限位更多，系统调用入口更讲究，设备通过 PCIe 和 MSI-X，DMA 经过 IOMMU；但每一项都能在 X64S 的最小模型里找到原型。
+
+\subsection{本节验收：能不能从头讲一遍机器运行}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能解释 bit、byte、word、地址、内存数组之间的关系。
+\item 能手跑一个 \code{mov/add/mov} 小程序，说明每步 \code{rip} 和寄存器如何变化。
+\item 能解释为什么需要栈，以及 \code{call/ret} 如何使用栈保存返回地址。
+\item 能解释轮询设备为什么浪费 CPU，中断如何保存 \code{rip/rflags} 并跳到处理函数。
+\item 能解释定时器为什么让 OS 可以抢占死循环程序。
+\item 能解释用户态为什么不能直接写设备寄存器，系统调用如何成为受控入口。
+\item 能解释 base/limit 和分页分别解决什么问题，page fault 什么时候是可修复事件。
+\item 能把 X64S 的 \code{rip/rsp/cpl/page table/timer IRQ} 映射到真实 x86-64 概念。
+\end{itemize}
+\end{rubricbox}

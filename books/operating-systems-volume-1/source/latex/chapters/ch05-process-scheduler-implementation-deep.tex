@@ -1,0 +1,286 @@
+\section{进程与调度实现深讲：从 task 到 switch}
+
+前面的章节已经讲了调度算法。本节把进程和调度器按内核实现拆开：进程对象有哪些字段，fork 如何复制资源，exec 如何替换地址空间，wait 如何回收子进程，调度器如何维护 runqueue，睡眠唤醒如何避免丢事件，上下文切换到底切了什么。
+
+\subsection{进程不是一个结构体，而是一组引用}
+
+Linux 中常用 \code{task\_struct} 表示可调度实体。它不把所有资源都内嵌进去，而是引用地址空间、文件表、信号处理、凭据、命名空间、cgroup、调度实体等对象。这样线程可以共享一部分资源，fork 可以复制或共享不同对象，exec 可以替换地址空间但保留 PID 和部分文件描述符。
+
+\begin{longtable}{p{0.22\linewidth}p{0.38\linewidth}p{0.28\linewidth}}
+\toprule
+对象 & 回答的问题 & 生命周期事件 \\
+\midrule
+\code{task\_struct} & 这个可调度实体是谁、处于什么状态 & fork 创建、exit 释放 \\
+\code{mm\_struct} & 用户地址空间是什么 & fork COW、exec 替换、exit 释放 \\
+\code{files\_struct} & fd 表指向哪些打开文件 & fork 共享或复制、exec close-on-exec \\
+\code{fs\_struct} & cwd、root、umask 等进程文件系统上下文 & chdir/chroot/fork \\
+\code{sighand} & 信号处理函数和 mask & fork/exec/signal \\
+\code{cred} & uid、gid、capability、安全标签 & setuid、exec、LSM 检查 \\
+\code{sched\_entity} & 调度账本 & enqueue、dequeue、account runtime \\
+\bottomrule
+\end{longtable}
+
+源码入口可以从 \filepath{include/linux/sched.h}、\filepath{kernel/fork.c}、\filepath{kernel/exit.c}、\filepath{fs/exec.c} 看。阅读时要抓引用计数和共享边界：线程共享 \code{mm} 和 \code{files} 时，一个线程关闭 fd 会影响同进程其他线程。
+
+\subsection{fork 的实现顺序}
+
+fork 不是复制一整个进程镜像。内核先分配新的 task，复制或共享资源，建立父子关系，把子任务放入 runnable 集合，最后返回父子两个不同返回值。若中间失败，必须按已经成功的步骤逆序回滚。
+
+\begin{lstlisting}
+fork sketch:
+  allocate task_struct and kernel stack
+  copy scheduler attributes
+  copy or share mm_struct with COW PTEs
+  copy or share files_struct
+  copy signal and credential state
+  assign pid
+  link into parent children list
+  make child runnable
+  return child pid to parent, 0 to child
+\end{lstlisting}
+
+最容易错的是“什么时候可见”。子任务在所有必要状态初始化完成前不能进入 runqueue，否则另一个 CPU 可能立刻调度它，看到半初始化对象。父子关系也要在锁保护下建立，否则 wait 路径可能漏掉子进程。
+
+\subsection{fork 的 COW 页表细节}
+
+fork 复制页表时，匿名可写页通常不复制物理页，而是父子 PTE 都改成只读并标记 COW。物理页引用计数增加。任一方写入时，触发写保护缺页，内核复制新页，再把写入方 PTE 改为可写。
+
+\begin{lstlisting}
+fork COW:
+  for each writable anonymous PTE:
+    clear write bit in parent PTE
+    install read-only PTE in child
+    mark both as COW
+    increment page refcount
+  flush parent TLB entries if permissions were tightened
+
+write fault:
+  if page refcount == 1:
+    make PTE writable
+  else:
+    allocate new page
+    copy old page contents
+    decrement old page refcount
+    map new page writable
+\end{lstlisting}
+
+注意父进程 PTE 也要收紧权限，否则父进程写入不会 fault，就会直接修改共享页，破坏 fork 语义。权限收紧后还要处理 TLB，否则 CPU 可能继续使用旧的 writable 翻译。
+
+\subsection{exec 的关键承诺}
+
+exec 成功后，当前进程身份大体保留，但用户地址空间被新程序替换。PID 不变，部分 fd 保留，设置了 close-on-exec 的 fd 关闭，信号处理按规则重置，凭据可能因 setuid 或文件 capability 改变。
+
+\begin{lstlisting}
+execve sketch:
+  copy argv/envp from user memory
+  open executable and check permissions
+  identify binary format
+  create new mm_struct
+  map program segments
+  map interpreter if dynamically linked
+  create user stack with argc/argv/envp/auxv
+  apply credential transitions
+  commit new mm atomically
+  start at entry point
+\end{lstlisting}
+
+exec 失败要小心。理想情况下，在 commit 新地址空间前失败，旧程序仍能收到错误返回并继续运行；一旦已经不可逆地销毁旧地址空间，就只能终止进程。成熟内核会尽量把可能失败的检查和分配放在 commit 之前。
+
+\subsection{用户栈的构造}
+
+新程序启动时不是 C 的 \code{main} 被内核直接调用。内核把初始用户栈构造成 ABI 规定的布局，包括 \code{argc}、\code{argv} 指针数组、\code{envp} 指针数组、auxiliary vector 和字符串数据。入口点通常是动态链接器或 \code{\_start}。
+
+\begin{lstlisting}
+initial user stack high to low:
+  strings for argv and envp
+  alignment padding
+  auxiliary vector entries
+  NULL
+  envp pointers
+  NULL
+  argv pointers
+  argc
+\end{lstlisting}
+
+auxv 给用户态传递页大小、随机数地址、程序头信息、vDSO 入口等。动态链接器用这些信息装载共享库、处理重定位和准备 libc。OS 的 exec 不是“把文件读到内存跳过去”这么简单，它要建立完整 ABI 环境。
+
+\subsection{wait 和 zombie 的意义}
+
+子进程退出后不能立刻完全消失，因为父进程还可能调用 wait 获取退出状态和资源使用信息。于是退出进程进入 zombie 状态，保留 PID、退出码和少量统计；父进程 wait 后，内核释放最后对象。
+
+\begin{lstlisting}
+exit:
+  close files
+  release mm
+  record exit_code
+  notify parent
+  become ZOMBIE
+  schedule away forever
+
+wait:
+  find child in ZOMBIE state
+  copy exit status to parent
+  unlink child from parent list
+  free final task reference
+\end{lstlisting}
+
+若父进程不 wait，zombie 会留下。若父进程先退出，子进程会被 reparent 给 init 或 subreaper。这里的设计保证退出状态不丢，同时避免已退出任务再次运行。
+
+\subsection{runqueue 的最小不变量}
+
+每 CPU runqueue 至少要维护当前任务、runnable 任务集合、锁、调度时钟和统计。一个任务在同一时刻只能处于一个位置：某个 CPU 的 current，某个 runqueue，某个等待队列，或者退出路径。
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item RUNNING 任务必须等于某个 CPU 的 current。
+\item RUNNABLE 任务必须在且只在一个 runqueue 中。
+\item SLEEPING 任务不能留在 runqueue 中。
+\item ZOMBIE 任务不能被调度器选中。
+\item 迁移任务时，源 runqueue 和目标 runqueue 的锁顺序必须固定。
+\item 改变任务状态和队列位置必须在同一临界区内完成。
+\end{itemize}
+\end{rubricbox}
+
+调度 bug 常常不是 pick 算法错，而是不变量破坏：任务重复入队，睡眠任务未出队，唤醒时状态已经变化，迁移时两个 CPU 同时看到同一任务。
+
+\subsection{CFS 的核心数据结构}
+
+公平调度类用 \code{sched\_entity} 记录虚拟运行时间、权重、统计和树节点。runqueue 中的 CFS 队列按 \code{vruntime} 排序，最左边是当前最“亏”的任务，优先运行。
+
+\begin{lstlisting}
+CFS account:
+  delta_exec = now - curr.exec_start
+  weighted = delta_exec * NICE_0_LOAD / curr.weight
+  curr.vruntime += weighted
+  update rq.min_vruntime
+
+CFS pick:
+  next = leftmost entity in rb_tree
+  return task_of(next)
+\end{lstlisting}
+
+\code{min\_vruntime} 是队列的基准。新唤醒任务不能简单设置为 0，否则会长期占便宜；也不能设置得太大，否则交互响应差。实际实现会把新实体放在相对 \code{min\_vruntime} 合理的位置，并配合唤醒抢占规则。
+
+\subsection{红黑树为什么合适}
+
+公平调度需要频繁插入、删除和取最小 \code{vruntime}。普通链表插入简单但查找最小慢；堆取最小快，但删除任意 sleeping 任务不方便；红黑树能在 \code{O(log n)} 完成插入、删除和按 key 排序。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+结构 & 优点 & 缺点 \\
+\midrule
+FIFO 队列 & O(1)，简单 & 不能表达公平权重和 vruntime 排序 \\
+优先级数组 & 固定优先级快 & 动态公平排序不自然 \\
+堆 & 取最小快 & 删除任意实体复杂 \\
+红黑树 & 排序、插入、删除平衡 & 常数成本高于队列 \\
+\bottomrule
+\end{longtable}
+
+算法选择来自操作需求。调度器不是为了展示数据结构，而是因为任务会频繁睡眠、唤醒、迁移、改变权重，必须支持这些操作。
+
+\subsection{睡眠唤醒的无丢失顺序}
+
+等待队列正确性的核心是同一把锁保护“条件检查”和“入队睡眠”。否则唤醒可能发生在检查之后、入队之前，等待者永远睡下去。
+
+\begin{lstlisting}
+correct wait:
+  lock(obj.lock)
+  while !condition:
+    prepare_to_wait(waitq, current, SLEEPING)
+    unlock(obj.lock)
+    schedule()
+    lock(obj.lock)
+  finish_wait(waitq, current)
+  unlock(obj.lock)
+
+waker:
+  lock(obj.lock)
+  change condition
+  wake_up(waitq)
+  unlock(obj.lock)
+\end{lstlisting}
+
+很多真实内核代码会用更复杂的 helper，但它们都在维护这个原则。条件变量、pipe、socket、futex、completion、wait event 都逃不开同一条规则。
+
+\subsection{上下文切换切的是什么}
+
+上下文切换分成调度器层和架构层。调度器选择 next，更新 current、统计、状态；架构层保存 callee-saved 寄存器、栈指针和必要控制状态，切到 next 的内核栈，再返回到 next 之前停下的位置。
+
+\begin{lstlisting}
+schedule:
+  prev = current
+  next = pick_next_task(rq)
+  if prev != next:
+    rq.current = next
+    context_switch(prev, next)
+
+context_switch:
+  switch address space if needed
+  switch kernel stack
+  save prev callee-saved registers
+  restore next callee-saved registers
+  return as next task
+\end{lstlisting}
+
+这里有一个反直觉点：\code{context\_switch} 返回时，执行流已经变成 next 任务。prev 将来被调度回来时，会从它当初离开的地方继续返回。这就是线程切换能伪装成普通函数返回的原因。
+
+\subsection{地址空间切换和 lazy TLB}
+
+若两个线程共享同一个 \code{mm\_struct}，切换时不需要换页表根。若切到不同进程，通常要切换页表根或地址空间标识。切换页表会影响 TLB；带 PCID/ASID 的架构可以减少全量刷新。
+
+\begin{lstlisting}
+switch_mm(prev_mm, next_mm):
+  if prev_mm == next_mm:
+    keep current page table root
+  else:
+    load next page table root with ASID/PCID if available
+    ensure stale translations cannot be used
+\end{lstlisting}
+
+内核线程可能没有自己的用户地址空间，常借用上一个进程的 \code{mm} 或使用特殊内核地址空间。lazy TLB 这类优化的目标，是减少无意义的页表切换和 TLB 刷新。
+
+\subsection{负载均衡和调度域}
+
+多核系统不是一个平面。SMT sibling、同一核心、同一 LLC、同一 NUMA node、跨 socket 的迁移成本不同。调度器通常建立调度域，从近到远做负载均衡。
+
+\begin{lstlisting}
+load balance levels:
+  SMT siblings
+  cores sharing LLC
+  CPUs in same NUMA node
+  CPUs across NUMA nodes
+\end{lstlisting}
+
+迁移一个任务可能减少 runnable wait，却损失 cache 热状态并增加远端内存访问。x86-64 服务器和工作站上，调度器要估计 SMT sibling、共享 LLC、NUMA node、跨 socket 迁移、turbo 预算和功耗封顶。任务放错位置会让锁竞争、cache miss、远端内存访问和尾延迟一起变差。
+
+\subsection{cgroup CPU 配额}
+
+容器和服务隔离需要限制一组任务的 CPU 使用。cgroup CPU controller 可以按周期给 group 分配 runtime budget。预算耗尽后，该组任务被 throttled，直到下个周期补充预算。
+
+\begin{lstlisting}
+cgroup quota:
+  period = 100ms
+  quota = 20ms
+  tasks in group may run total 20ms per period
+  after budget exhausted:
+    throttle group
+  at next period:
+    refill runtime and unthrottle
+\end{lstlisting}
+
+这会产生典型现象：容器内 CPU 使用看似没满，但请求出现周期性延迟尖峰，因为 group 被配额限流。性能分析必须看 cgroup throttling 统计，而不是只看宿主机总体 CPU。
+
+\subsection{调度实现测试}
+
+\begin{itemize}
+\tightlist
+\item fork 后子任务不能在初始化完成前进入 runqueue。
+\item COW fork 后父子任一方写入都不能修改另一方可见内容。
+\item exec 失败路径不得破坏旧程序继续运行的必要状态。
+\item wait 必须能回收 zombie，并且不能回收非子进程。
+\item 睡眠和唤醒并发时不能 lost wakeup。
+\item 迁移任务时不能同时出现在两个 CPU 的 runqueue。
+\item cgroup quota 耗尽时 group 被 throttle，周期补充后能恢复。
+\item 上下文切换后 callee-saved 寄存器、栈和地址空间必须正确。
+\end{itemize}

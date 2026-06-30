@@ -1,0 +1,233 @@
+\section{整机硬件图谱：一台计算机不只有 CPU}
+
+只讲 CPU、DMA、MMU 仍然不够。真实计算机是一组硬件子系统的组合：CPU、内存、固件、主板互联、存储、网络、显示、USB、音频、传感器、电源、散热、安全芯片、管理控制器。操作系统要把这些异构硬件纳入统一生命周期：发现、初始化、命名、授权、驱动、错误处理、休眠唤醒、热插拔和观测。
+
+\subsection{整机从哪里开始：x86-64 主板和平台}
+
+本书主线采用 x86-64 桌面和服务器平台。常见主板形态包括：CPU 插槽、内存槽、PCIe 插槽、芯片组、固件 Flash、网卡、存储接口、USB 控制器、风扇、电源管理、TPM 和 BMC。OS 首先要把这些部件从固件表和总线配置空间中识别出来，再建立内核对象和驱动生命周期。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+平台形态 & 典型硬件组织 & OS 重点 \\
+\midrule
+PC/服务器 & CPU + DRAM + PCIe + 芯片组 + UEFI/ACPI & 枚举、NUMA、PCIe、热插拔、电源状态 \\
+x86-64 虚拟机 & 虚拟 CPU、虚拟设备、virtio、emulated firmware & hypervisor 边界、虚拟中断、虚拟 IOMMU \\
+服务器管理面 & BMC、IPMI/Redfish、传感器、风扇 & 带外管理、故障日志、电源控制 \\
+\bottomrule
+\end{longtable}
+
+OS 首先要回答“这台机器到底有什么”。x86-64 平台主要从 ACPI、PCI 配置空间和 UEFI 内存地图获得信息；虚拟机从虚拟固件、虚拟 PCI/virtio 总线和 hypervisor 暴露的 paravirtual 接口获得信息。
+
+\subsection{固件和启动芯片}
+
+固件存放在 Flash 或 ROM 中，负责上电后的最早期初始化。x86-64 PC/服务器上常见 UEFI；服务器还可能有 BMC；安全启动、TPM 测量和 UEFI 变量共同构成启动可信链的一部分。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+固件部件 & 作用 & OS 关系 \\
+\midrule
+UEFI/BIOS & 平台初始化和启动服务 & 提供内存地图、ACPI、启动协议 \\
+BMC & 服务器带外管理控制器 & 远程电源、传感器、风扇、故障日志 \\
+TPM/安全芯片 & 测量启动、密钥保护 & secure boot、磁盘解锁、远程证明 \\
+\bottomrule
+\end{longtable}
+
+固件不是 OS 的替代品。固件把机器带到可启动状态，OS 接管后要建立自己的内存管理、调度、驱动和安全策略。固件表也可能有 bug，所以内核必须校验地址、长度、重叠和设备描述。
+
+\subsection{DRAM、ECC 和内存控制器}
+
+DRAM 保存运行时数据，内存控制器负责把 CPU 的内存请求转换成 DRAM 命令。服务器常使用 ECC 内存，可以检测并纠正单 bit 错误，报告不可纠正错误。NUMA 系统中，每个 CPU socket 可能有本地内存控制器。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+机制 & 解决的问题 & OS 可见现象 \\
+\midrule
+ECC & 检测/纠正内存位翻转 & EDAC/MCE 日志、页下线 \\
+NUMA & 多控制器和远近不同 & 节点、CPU affinity、内存策略 \\
+memory hotplug & 运行时增减内存 & online/offline page blocks \\
+row hammer 缓解 & DRAM 行干扰风险 & 刷新策略、隔离、错误报告 \\
+\bottomrule
+\end{longtable}
+
+内存不是“永远正确的数组”。硬件错误会发生，OS 要记录、隔离和尽量恢复。服务器内核可能把频繁出错的物理页下线，避免再次分配。
+
+\subsection{PCIe：现代高速外设的主干}
+
+PCIe 连接 NVMe SSD、网卡、GPU、采集卡、USB 控制器等设备。它是点对点高速互联，有 root complex、switch、endpoint。设备通过配置空间被枚举，通过 BAR 暴露 MMIO，通过 MSI/MSI-X 投递中断，通过 DMA 访问内存。
+
+\begin{lstlisting}
+PCIe device lifecycle:
+  enumerate config space
+  allocate BAR address ranges
+  enable bus mastering
+  configure DMA mask and IOMMU domain
+  allocate MSI-X vectors
+  bind driver and run probe
+\end{lstlisting}
+
+PCIe 错误也要处理。链路可能降速，设备可能 surprise removal，AER 会报告可纠正/不可纠正错误。驱动不能假设设备永远在线。
+
+\subsection{存储设备：HDD、SATA SSD、NVMe、eMMC/UFS}
+
+存储设备差异很大。机械硬盘有寻道和旋转延迟；SATA SSD 使用 AHCI/SATA 协议；NVMe 面向 PCIe，多队列、低延迟、高并行；手机常见 eMMC/UFS。OS 不直接暴露这些差异给普通应用，而是通过块层、文件系统和 page cache 抽象。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+设备 & 特点 & OS 设计点 \\
+\midrule
+HDD & 寻道慢，顺序吞吐好 & I/O 调度、合并、预读 \\
+SATA SSD & 无机械寻道，队列较有限 & TRIM、flush、写放大 \\
+NVMe & PCIe、多队列、MSI-X & blk-mq、CPU/queue 亲和、低延迟 \\
+eMMC/UFS & 移动设备常见 & 电源管理、寿命、队列深度 \\
+\bottomrule
+\end{longtable}
+
+\code{write} 成功、设备 completion、设备缓存 flush、数据到稳定介质是不同阶段。文件系统的日志和 \code{fsync} 就是为了约束这些阶段的顺序。
+
+\subsection{网络设备和 PHY}
+
+网卡不是只把字节交给 CPU。它包含 MAC、PHY、DMA 队列、checksum offload、TSO/GSO、RSS、多队列、中断合并和硬件过滤。PHY 负责物理层信号，MAC 处理链路层帧，驱动管理 RX/TX ring。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+网卡能力 & 作用 & OS 影响 \\
+\midrule
+RX/TX ring & 批量收发描述符 & NAPI、队列背压、DMA 生命周期 \\
+RSS & 按流分散到多个队列 & 多核并行和缓存局部性 \\
+checksum offload & 硬件算校验和 & skb 标志和协议栈路径 \\
+TSO/GSO & 大包分段卸载 & 降低 CPU 开销，影响抓包理解 \\
+interrupt moderation & 合并中断 & 吞吐和延迟折中 \\
+\bottomrule
+\end{longtable}
+
+网络性能问题常常不是 TCP 算法一个因素，还涉及 IRQ 亲和性、队列数量、NUMA、驱动 NAPI budget、socket buffer 和用户进程调度。
+
+\subsection{GPU、显示控制器和 framebuffer}
+
+显示输出不是 printf。最简单模型是 framebuffer：内存里一块区域表示屏幕像素，显示控制器按刷新率读取这块内存并输出到屏幕。现代 GPU 复杂得多，有命令队列、显存、shader、DMA、显示管线、同步对象和电源管理。
+
+\begin{lstlisting}
+simple framebuffer:
+  pixel_address = fb_base + (y * stride + x) * bytes_per_pixel
+  write color to pixel_address
+  display controller scans out framebuffer
+\end{lstlisting}
+
+OS 图形栈要管理显存、buffer sharing、page flip、vblank、GPU 命令提交、进程隔离和 hang recovery。即使本书不展开完整图形系统，也必须知道显示设备同样是“内存 + 队列 + 中断 + DMA + 权限”的组合。
+
+\subsection{USB、输入设备和 HID}
+
+USB 是主机控制的总线。键盘、鼠标、摄像头、存储设备、声卡都可能挂在 USB 上。USB 设备有描述符，说明设备类型、接口、端点和传输类型。HID 键盘通过 interrupt endpoint 周期性报告按键状态。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+USB 概念 & 含义 & OS 关系 \\
+\midrule
+descriptor & 设备自描述信息 & 枚举和驱动绑定 \\
+endpoint & 设备通信端点 & 控制/批量/中断/等时传输 \\
+URB & USB request block & 异步提交和 completion \\
+HID report & 输入设备状态包 & 键盘鼠标事件解析 \\
+\bottomrule
+\end{longtable}
+
+USB 热插拔意味着驱动必须随时处理 remove。用户还拿着旧 fd 时，设备可能已经拔掉；内核要让后续 read/write 返回错误，而不是访问已释放硬件状态。
+
+\subsection{音频、摄像头和实时流}
+
+音频和摄像头强调连续流。音频设备需要固定采样率、环形 buffer、低延迟和 underrun/overrun 处理。摄像头涉及传感器、ISP、DMA buffer、像素格式和帧同步。
+
+\begin{lstlisting}
+audio playback:
+  user fills ring buffer
+  device DMA reads samples
+  period interrupt fires
+  kernel wakes audio server
+  user fills next period
+\end{lstlisting}
+
+这类设备说明“吞吐够”不等于“体验好”。实时流关心抖动、周期、buffer 深度、调度延迟和电源状态切换。
+
+\subsection{电源、散热和频率}
+
+现代计算机不断调整频率、电压和电源状态。CPU 有 P-state/C-state，设备有 runtime PM，整机有 suspend/resume，服务器有风扇和温度传感器，手机有热限制。OS 要在性能、功耗、温度和响应延迟之间权衡。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+机制 & 含义 & 影响 \\
+\midrule
+P-state/DVFS & 调整频率电压 & 性能、功耗、温度 \\
+C-state & CPU 空闲深度 & 唤醒延迟、节能 \\
+runtime PM & 单设备空闲省电 & 设备访问前需 resume \\
+suspend/resume & 整机睡眠唤醒 & 驱动状态保存恢复 \\
+thermal throttling & 温度过高降频 & 延迟尖峰、吞吐下降 \\
+\bottomrule
+\end{longtable}
+
+性能测试必须记录频率和温度，否则同一程序两次结果可能只是因为第一次冷机、第二次热降频。
+
+\subsection{安全硬件：TPM、IOMMU、内存加密和安全启动}
+
+安全不是纯软件。TPM 可保存密钥和测量启动链；Secure Boot 验证启动组件；IOMMU 限制设备 DMA；内存加密保护 DRAM 内容；CPU 提供 NX、SMEP/SMAP、PAC、MTE 等硬件防护。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+硬件安全机制 & 防什么 & OS 使用方式 \\
+\midrule
+TPM & 密钥被直接导出、启动链篡改 & measured boot、磁盘解锁 \\
+Secure Boot & 未签名启动组件 & 固件验证 bootloader/kernel \\
+IOMMU & 设备任意 DMA & DMA 隔离、虚拟机直通 \\
+NX & 数据页执行代码 & \code{W\textasciicircum X}、栈不可执行 \\
+SMEP/SMAP/PAN & 内核误执行/访问用户页 & 内核漏洞利用缓解 \\
+\bottomrule
+\end{longtable}
+
+硬件安全机制都有边界。TPM 不能修复运行中内核漏洞；Secure Boot 不能保证用户空间没漏洞；IOMMU 不能防 CPU 自己写错内存。OS 必须把它们组合成分层防御。
+
+\subsection{虚拟化硬件}
+
+虚拟机让 guest OS 以为自己有 CPU、内存和设备。硬件虚拟化提供 VM entry/exit、二级页表、虚拟中断和设备直通支持。没有硬件辅助，很多特权指令和页表操作只能慢速模拟。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+机制 & 作用 & OS/Hypervisor 关系 \\
+\midrule
+VMX/SVM & 运行 guest 并拦截敏感事件 & hypervisor 控制 guest \\
+EPT/NPT & guest physical 到 host physical 翻译 & 内存隔离和 overcommit \\
+virtio & 半虚拟化设备接口 & 高效虚拟 I/O \\
+SR-IOV & 设备虚拟功能 & 直通性能和隔离 \\
+\bottomrule
+\end{longtable}
+
+虚拟化再次说明硬件和 OS 是契约关系。guest 的“物理地址”可能只是 hypervisor 管理的第二层虚拟地址。
+
+\subsection{硬件观测入口}
+
+真实系统里可以通过多种入口观察硬件：
+
+\begin{lstlisting}
+lscpu
+lsmem
+lspci -nn
+lsusb
+cat /proc/cpuinfo
+cat /proc/iomem
+cat /proc/interrupts
+find /sys/devices -maxdepth 3 -type d
+dmesg | grep -i -E 'acpi|pci|nvme|usb|iommu|tpm|thermal'
+\end{lstlisting}
+
+学习硬件不能只看框图。要能把命令输出映射到本节硬件：CPU 拓扑、NUMA node、PCIe 设备、USB 设备、中断 vector、MMIO 区间、驱动名称、电源状态和错误日志。
+
+\subsection{本节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能画出一台 x86-64 PC/服务器的主要硬件块和互联关系。
+\item 能说明 UEFI、ACPI、PCIe 枚举分别提供什么信息。
+\item 能区分 DRAM/ECC/NUMA、NVMe/网络/GPU/USB/音频等设备的 OS 关注点。
+\item 能解释电源、散热和频率为什么影响性能测试。
+\item 能说明 TPM、Secure Boot、IOMMU、NX 等安全硬件分别解决哪类问题。
+\item 能用系统命令找到设备、驱动、中断、MMIO 和 IOMMU 相关证据。
+\end{itemize}
+\end{rubricbox}

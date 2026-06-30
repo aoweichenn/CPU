@@ -16,7 +16,7 @@ pdf: check
 
 epub: check
 	@BOOK_TITLE="操作系统第一册" \
-	BOOK_SUBTITLE="硬件演进、内核对象、并发控制、内存、I/O、网络入口与恢复" \
+	BOOK_SUBTITLE="从计算机组成原理到内核对象、并发控制、内存、I/O、网络入口与恢复" \
 	BOOK_AUTHOR="CPU Books" \
 	python3 $(EPUB_BUILDER) --book-dir $(LATEX_SOURCE_DIR) --output $(LATEX_SOURCE_DIR)/main.epub
 

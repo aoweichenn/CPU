@@ -1,0 +1,174 @@
+\section{第一阶段深讲：CPU 对操作系统暴露的契约}
+
+CPU 不是操作系统可以随意想象的执行器。它给软件暴露的是一组精确契约：指令如何改变寄存器，异常在什么边界发生，特权模式如何切换，页表根在哪里，系统调用从哪里进入，返回用户态前哪些状态必须恢复。理解这些契约，比背一张 CPU 结构图更重要。
+
+\subsection{寄存器不是临时变量，而是架构状态}
+
+软件能直接观察和依赖的 CPU 状态称为架构状态。通用寄存器、程序计数器、栈指针、状态寄存器、控制寄存器、浮点和向量寄存器，都属于这个范围。微架构内部的乱序窗口、重命名寄存器、分支预测表通常不可直接观察，但它们会影响性能和安全。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+状态 & 对普通程序的意义 & 对 OS 的意义 \\
+\midrule
+RIP & 下一条或当前指令位置 & 异常返回、信号、调试、上下文切换 \\
+RSP & 当前栈顶 & 用户栈、内核栈、ABI 对齐、栈溢出 \\
+通用寄存器 & 参数、返回值、临时计算 & syscall ABI、trap frame、调度保存恢复 \\
+RFLAGS & 条件码、中断使能、模式位 & 中断开关、返回用户态、单步调试 \\
+页表根寄存器 & 当前地址空间 & 进程切换、内核映射、TLB 语义 \\
+向量寄存器 & SIMD/浮点计算 & 信号帧、延迟保存、上下文切换成本 \\
+\bottomrule
+\end{longtable}
+
+一条用户指令被中断打断后，程序将来还要像没发生过中断一样继续运行。为此，内核不能只保存 RIP，还要保存足够恢复用户可见状态的寄存器。x86-64 ABI 和入口代码共同定义保存集合；凡是用户态能依赖的状态，内核要么保存恢复，要么在 ABI 中明确它会被破坏。
+
+\subsection{指令执行不是一句“取指执行”}
+
+最小模型可以写成取指、译码、执行、访存、写回。真实 CPU 可能乱序、预测和并行，但最终必须提交出与 ISA 一致的结果。OS 关心的是每条指令在异常和中断面前的边界。
+
+\begin{lstlisting}
+instruction retirement view:
+  fetch bytes from instruction address
+  decode according to ISA
+  read architectural operands
+  execute operation or memory access
+  if fault, report precise exception
+  otherwise commit architectural result
+\end{lstlisting}
+
+“提交”这个概念很关键。乱序 CPU 可以提前执行后面的指令，但不能让用户态看到不符合顺序语义的架构状态。若一条 load 触发 page fault，内核必须知道 faulting instruction 是哪一条，之前的指令已经生效，之后的指令不能对架构状态产生不可回滚影响。否则 page fault handler 无法修复状态并重试。
+
+\subsection{精确异常是虚拟内存的地基}
+
+精确异常的意思是，异常发生时 CPU 能给出一个像顺序执行一样的状态点：异常指令之前的指令已经完成，异常指令和之后的指令没有提交最终架构效果。缺页、除零、非法指令、断点、系统调用，都依赖这个性质。
+
+\begin{lstlisting}
+if instruction at RIP faults:
+  saved_rip = RIP of faulting instruction
+  saved_error = reason and access type
+  architectural state corresponds to before this instruction commits
+  kernel may fix the cause and return to saved_rip
+\end{lstlisting}
+
+没有精确异常，COW 就很难实现。写 COW 页的 store 必须在真正写入共享物理页之前停下来，让内核复制新页并更新 PTE，再回到同一条 store。若 store 已经部分写入旧页，父子隔离就被破坏。硬件异常语义直接决定 OS 能实现哪些内存抽象。
+
+\subsection{fault、trap、interrupt 的差别}
+
+中文里常把异常、中断、陷入混着说，但写内核时必须分清事件来源和返回语义。
+
+\begin{longtable}{p{0.16\linewidth}p{0.28\linewidth}p{0.28\linewidth}p{0.18\linewidth}}
+\toprule
+类型 & 来源 & 典型例子 & 返回位置 \\
+\midrule
+fault & 当前指令无法完成 & page fault、保护错误 & 常返回同一条指令重试 \\
+trap & 当前指令主动进入内核或调试 & syscall、breakpoint & 常返回下一条指令 \\
+interrupt & 外部异步事件 & timer、device IRQ、IPI & 返回被打断位置 \\
+abort & 严重硬件或不可恢复错误 & machine check、总线错误 & 可能无法安全返回 \\
+\bottomrule
+\end{longtable}
+
+这个分类影响内核入口保存什么状态。fault 要保留足够信息让指令重试；syscall 要按 ABI 把返回值写回指定寄存器；interrupt 要避免破坏被打断上下文；严重硬件错误可能只能记录日志、隔离页或 panic。
+
+\subsection{用户栈和内核栈为什么要分开}
+
+用户栈由用户程序控制，可能被破坏、未映射、接近栈底，甚至故意指向恶意地址。内核进入特权态后不能继续信任用户栈，否则中断帧、返回地址和内核局部变量都会落在不可信内存里。因此系统调用、中断和异常入口通常切换到内核栈。
+
+\begin{lstlisting}
+on privilege transition:
+  CPU or entry code chooses kernel stack for current task
+  save user RIP, RSP, RFLAGS and selected registers
+  run kernel handler on trusted stack
+  restore or validate state before returning to user mode
+\end{lstlisting}
+
+每个线程需要自己的内核栈，因为线程可能在系统调用中阻塞。若所有线程共享一个内核栈，线程 A 阻塞在内核里后，线程 B 进入内核就会覆盖 A 的调用链。内核栈大小有限，所以内核代码不能随意放巨大局部数组，也不能无限递归。
+
+\subsection{系统调用入口是一段极谨慎的汇编}
+
+系统调用入口处，C 运行环境还不完整。入口代码要处理用户寄存器、切换栈、建立内核可用的调用约定、屏蔽或允许中断、检查系统调用号、进入 C 函数分发。返回路径同样危险：返回用户态前要处理信号、调度、审计、单步调试和可能的抢占。
+
+\begin{lstlisting}
+syscall entry outline:
+  save user register frame
+  switch to trusted kernel stack if needed
+  sanitize user-provided state
+  dispatch syscall table entry
+  store return value in ABI register
+  check pending signal or reschedule flag
+  restore user state
+  return to user mode
+\end{lstlisting}
+
+这里不能有“差不多”。若入口漏保存一个用户可见寄存器，程序会随机坏；若没有清理某些特权状态，用户态可能继承内核状态；若返回路径错误恢复 RFLAGS，用户程序可能以错误中断状态或错误单步状态运行。
+
+\subsection{上下文切换不是只保存寄存器}
+
+最浅的说法是“上下文切换保存现场”。更准确地说，它要切换当前 CPU 正在代表哪个任务执行。这个切换至少涉及调度实体、内核栈、寄存器保存区、地址空间、抢占计数、FPU 状态和 CPU 本地 current 指针。
+
+\begin{lstlisting}
+switch from prev to next:
+  prev.thread.rsp = current RSP
+  save callee-saved registers into prev thread context
+  current = next
+  load next address-space root if mm changes
+  switch RSP to next.thread.rsp
+  restore next registers
+  return as if next's old schedule call just finished
+\end{lstlisting}
+
+注意最后一句：上下文切换不是“跳到 next 的 main 函数”。next 之前可能正在系统调用中睡眠，也可能刚被定时器抢占。恢复后，它从自己上次离开 CPU 的内核位置继续运行，最终回到用户态或继续内核逻辑。
+
+\subsection{FPU 和 SIMD 为什么让切换变贵}
+
+现代向量寄存器很大。若每次切换都保存所有向量状态，成本高；若延迟保存，又要处理任务第一次使用 FPU/SIMD 时的异常、跨任务泄漏和安全补丁。许多系统在性能和安全之间选择 eager 策略，即每次切换都明确保存恢复用户可见向量状态。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+策略 & 好处 & 风险或成本 \\
+\midrule
+lazy save & 不使用 FPU 的任务不付成本 & 状态管理复杂，历史上暴露过安全问题 \\
+eager save & 语义清晰，隔离更直接 & 每次切换固定成本增加 \\
+按需扩展状态 & 只为使用的扩展保存空间 & 需要精确追踪任务使用的 CPU 特性 \\
+\bottomrule
+\end{longtable}
+
+这解释了为什么 CPU 新增向量扩展不只是编译器问题。OS 要知道如何启用、保存、恢复、暴露给用户、在信号帧中表示，并在不支持时给出正确非法指令异常。
+
+\subsection{控制寄存器把硬件策略交给内核}
+
+页表根、向量表基址、系统调用入口、定时器配置、中断屏蔽、cache 策略、性能计数器控制，这些状态通常只能在内核或更高特权层修改。它们让 OS 能建立策略，也让错误配置变得危险。
+
+\begin{lstlisting}
+privileged configuration examples:
+  set page table root for current address space
+  install exception vector table
+  configure syscall entry point
+  program local timer deadline
+  enable or disable selected interrupts
+  configure performance monitoring counters
+\end{lstlisting}
+
+普通用户程序不能直接改这些寄存器。若能改页表根，它可以访问任意内存；若能改异常向量，它可以劫持系统调用；若能关闭定时器中断，它可以阻止抢占。特权级的价值，就体现在这些寄存器的写权限被硬件强制限制。
+
+\subsection{x86-64 名字与共同原则}
+
+本册不再把多个 ISA 混在一起讲。x86-64 的名字就是本书后续源码和汇编的默认语言：RIP/RSP/RFLAGS 表示执行现场，CR3 表示当前页表根，IDT 表示中断和异常入口，\code{syscall} 表示用户进入内核，Ring 3/Ring 0 表示用户态和内核态。重要的是把这些名字背后的角色讲清：有用户态和特权态，有异常入口，有地址翻译，有中断，有返回用户态的受控路径，有保存恢复上下文的要求。
+
+\begin{longtable}{p{0.24\linewidth}p{0.28\linewidth}p{0.36\linewidth}}
+\toprule
+问题 & x86-64 名字 & OS 角色 \\
+\midrule
+用户进入内核 & \code{syscall} & 受控系统调用入口 \\
+特权层级 & Ring 3/Ring 0 & 用户态和内核态隔离 \\
+页表根 & CR3 & 当前地址空间翻译根 \\
+异常入口 & IDT & 中断、异常和 trap 的分发入口 \\
+返回用户态 & \code{sysretq}/\code{iretq} & 恢复用户 RIP/RSP/RFLAGS 和 CPL \\
+\bottomrule
+\end{longtable}
+
+学习 OS 时要把“名字”和“角色”分开。CR3 不是普通变量，它是地址空间切换的硬件根；IDT 不是函数表，它是异常和中断的受控入口；\code{syscall} 不是函数调用，它是跨特权级入口。
+
+\subsection{CPU 契约的最低验收}
+
+读完本节，应该能回答以下问题：为什么 page fault 可以返回同一条指令重试；为什么系统调用不能使用用户栈保存内核状态；为什么上下文切换要考虑地址空间和向量寄存器；为什么不同架构的系统调用指令不同但 OS 模型相似；为什么特权寄存器必须由硬件限制写入。
+
+如果这些问题能回答清楚，进程、线程、系统调用和虚拟内存就不再是孤立概念，而是 CPU 契约自然推出的软件结构。

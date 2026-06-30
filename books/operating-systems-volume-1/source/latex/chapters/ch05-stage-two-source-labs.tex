@@ -1,0 +1,279 @@
+\section{第二阶段源码与实验：把任务、调度、同步落到可验证对象}
+
+前面的章节已经把进程生命周期、调度策略和同步状态机讲成了模型。模型还不够。读者必须能把模型落到三类材料上：真实内核源码里的对象和函数、可运行的小实验、出错时能区分原因的观测命令。本节不追求把 Linux 源码逐行翻译，而是给出一条能读通的路线：先找对象，再找状态转移，再找失败路径，最后用实验验证自己的理解。
+
+\subsection{源码阅读地图：先读结构，再读路径}
+
+操作系统源码很大，直接从入口函数一路跳会很快迷路。更可靠的读法是先确定“哪些结构保存状态”，再读“哪些函数改变状态”。以 Linux 为参照，第二阶段最相关的路径如下。
+
+\begin{longtable}{p{0.26\linewidth}p{0.34\linewidth}p{0.28\linewidth}}
+\toprule
+主题 & 典型源码位置 & 读的时候要抓住什么 \\
+\midrule
+任务结构 & \code{include/linux/sched.h} & \code{task\_struct} 的状态、调度实体、父子关系、引用对象 \\
+fork 路径 & \code{kernel/fork.c} & \code{kernel\_clone}、\code{copy\_process}、\code{copy\_mm}、\code{copy\_files}、\code{copy\_thread} \\
+exec 路径 & \code{fs/exec.c} & 二进制格式检查、参数复制、新 \code{mm} 提交点、凭据转换 \\
+exit/wait & \code{kernel/exit.c} & \code{do\_exit}、zombie、reparent、wait 扫描和最终释放 \\
+核心调度 & \code{kernel/sched/core.c} & enqueue/dequeue、wakeup、schedule、context switch 调用边界 \\
+公平调度 & \code{kernel/sched/fair.c} & \code{vruntime}、\code{min\_vruntime}、唤醒放置、负载均衡 \\
+实时调度 & \code{kernel/sched/rt.c}、\code{kernel/sched/deadline.c} & 固定优先级、预算、deadline 和准入控制 \\
+futex & \code{kernel/futex/core.c} & 用户态原子值和内核等待队列如何连接 \\
+mutex/rtmutex & \code{kernel/locking/mutex.c}、\code{kernel/locking/rtmutex.c} & owner、waiter、优先级继承、慢路径 \\
+pipe 等待 & \code{fs/pipe.c} & 条件谓词、等待队列、关闭唤醒、非阻塞语义 \\
+RCU & \code{kernel/rcu/tree.c} & 读侧临界区、宽限期、延迟释放 \\
+\bottomrule
+\end{longtable}
+
+读源码时不要先追所有宏。先写出每个对象的字段表：哪些字段是身份，哪些字段是状态，哪些字段是链接关系，哪些字段是引用计数，哪些字段只在持锁时可改。然后再读改变这些字段的路径。这样能避免把源码读成函数调用列表。
+
+\subsection{fork 的源码读法：每一步都问可见性}
+
+\code{fork} 或 \code{clone} 的阅读重点不是“它创建了进程”，而是每一步创建出的对象什么时候对其他 CPU 可见。一个半初始化任务若提前进入 PID 表、父子列表或 runqueue，后续调度、信号、wait 都可能观察到破碎状态。
+
+\begin{lstlisting}
+source reading checklist for fork:
+  1. task object and kernel stack allocated?
+  2. scheduler fields initialized but not runnable?
+  3. credentials, files, fs, signal, mm copied or shared?
+  4. child register frame prepared?
+  5. pid allocated and published?
+  6. parent-child relation linked?
+  7. task finally made runnable?
+  8. every failure label releases exactly the acquired references?
+\end{lstlisting}
+
+这条路线能解释源码里的错误标签。若 \code{copy\_files} 成功、\code{copy\_mm} 失败，错误路径必须释放文件表引用；若 PID 已经发布，回滚就要同时撤销 PID 映射；若任务已经 runnable，很多失败不能再用简单 free，而要走退出路径。源码中的阶段边界，就是原理章节里的生命周期边界。
+
+\subsection{上下文切换：保存的不是“整个进程”}
+
+上下文切换常被抽象成“保存 A，恢复 B”。这句话容易误导。内核并不会每次复制整个进程资源；它保存的是继续执行所需的 CPU 上下文，并切换当前 CPU 指向的任务、栈、地址空间和调度状态。地址空间、文件表、凭据这些对象通过引用挂在 task 上，不会在每次切换时复制。
+
+\begin{longtable}{p{0.2\linewidth}p{0.4\linewidth}p{0.28\linewidth}}
+\toprule
+项目 & 切换时发生什么 & 为什么重要 \\
+\midrule
+内核栈 & 从 prev 的内核栈切到 next 的内核栈 & 每个线程有自己的内核执行上下文 \\
+通用寄存器 & 保存调用约定要求保存的部分，并恢复 next 的部分 & 保证内核函数返回后能继续执行 \\
+PC/返回地址 & 由切换汇编和栈帧间接恢复 & next 像是从上次 \code{schedule} 后继续 \\
+页表根 & 进程地址空间不同才需要切换或标记切换 & 影响 TLB、ASID/PCID 和内存隔离 \\
+FPU/SIMD 状态 & 通常惰性或按需保存恢复 & AVX 状态很大，不能无脑复制 \\
+TLS/段寄存器 & 用户线程切换时要保持线程局部状态正确 & 影响 \code{thread\_local} 和 libc 线程数据 \\
+调度统计 & 记录运行时间、等待时间和切换事件 & 后续诊断依赖这些统计 \\
+\bottomrule
+\end{longtable}
+
+在 x86-64 Linux 中，可以沿着 \code{schedule()}、\code{context\_switch()}、\code{switch\_to} 和架构相关切换汇编去读。读的时候重点看三件事：prev 的栈指针保存在哪里，next 的栈指针从哪里恢复，地址空间切换在哪个条件下发生。明白这三点，才算真正理解“线程切换比进程切换轻”的具体含义。
+
+\subsection{一个可检查的调度器数据结构}
+
+为了把调度算法写得可测，先不要急着实现所有策略。可以先写一个最小模型：任务状态、runqueue、等待原因和调度统计必须显式存在。
+
+\begin{lstlisting}[language=C++]
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <stdexcept>
+#include <vector>
+
+using TaskId = std::size_t;
+using ProcessId = std::uint32_t;
+
+constexpr TaskId SCHED_IDLE_TASK = std::numeric_limits<TaskId>::max();
+constexpr ProcessId SCHED_INVALID_PID = 0;
+
+enum class TaskState {
+  Runnable,
+  Running,
+  Sleeping,
+  Zombie,
+};
+
+enum class WaitReason {
+  None,
+  Mutex,
+  Io,
+  Timer,
+  ChildExit,
+  PageFault,
+};
+
+struct Task {
+  TaskId tid = SCHED_IDLE_TASK;
+  ProcessId pid = SCHED_INVALID_PID;
+  int priority = 0;
+  TaskState state = TaskState::Runnable;
+  WaitReason wait_reason = WaitReason::None;
+  std::uint64_t vruntime = 0;
+  std::uint64_t runnable_since = 0;
+  std::uint64_t total_runtime = 0;
+  std::uint64_t total_wait = 0;
+};
+
+struct RunQueue {
+  std::deque<TaskId> rr;
+  std::uint64_t clock = 0;
+};
+\end{lstlisting}
+
+这段结构虽然小，却已经能写出硬断言：只有 \code{Runnable} 能入队；调度选中的任务必须从 \code{Runnable} 变成 \code{Running}；进入 \code{Sleeping} 时必须记录 \code{wait\_reason}；进入 \code{Zombie} 后不能再回到 runqueue；每次 tick 要更新当前任务的 runtime，而不是误把 sleeping 时间算成运行时间。
+
+\begin{lstlisting}[language=C++]
+void enqueue(RunQueue& rq, std::vector<Task>& tasks, TaskId tid) {
+  auto& task = tasks.at(tid);
+  if (task.state != TaskState::Runnable) {
+    throw std::logic_error("only runnable task may enter runqueue");
+  }
+  task.runnable_since = rq.clock;
+  rq.rr.push_back(tid);
+}
+
+TaskId pick_next(RunQueue& rq, std::vector<Task>& tasks) {
+  while (!rq.rr.empty()) {
+    const TaskId tid = rq.rr.front();
+    rq.rr.pop_front();
+    auto& task = tasks.at(tid);
+    if (task.state == TaskState::Runnable) {
+      task.total_wait += rq.clock - task.runnable_since;
+      task.state = TaskState::Running;
+      return tid;
+    }
+  }
+  return SCHED_IDLE_TASK;
+}
+\end{lstlisting}
+
+很多教学代码的调度器 bug 来自“队列里只有 tid，没有状态断言”。任务睡眠后忘记出队、退出后仍被选中、唤醒时重复入队，都会在压力测试下变成随机错误。把状态检查写进数据结构入口，能让错误尽早暴露。
+
+\subsection{futex 实验：用户态快路径为什么还需要内核}
+
+futex 的实验目标不是背 \code{futex(2)} 参数，而是观察“无竞争不进内核，有竞争才睡眠”。可以写一个用户态 mutex：先用 CAS 从 0 改到 1；失败后把状态改成 2，再调用 futex wait；解锁时把状态置 0，若旧状态是 2，则 futex wake。
+
+\begin{lstlisting}
+observe futex:
+  strace -f -e futex ./futex_mutex_demo uncontended
+  strace -f -e futex ./futex_mutex_demo contended
+  perf stat -e context-switches,cpu-migrations ./futex_mutex_demo contended
+\end{lstlisting}
+
+无竞争版本中，绝大多数 lock/unlock 不应产生 futex 系统调用；竞争版本中，应该能看到 wait/wake。若每次加锁都进内核，说明 fast path 失败；若竞争版本 CPU 占满但 futex 调用很少，可能在忙等；若 wait 后没人 wake，要检查 unlock 是否根据旧状态唤醒。
+
+\subsection{lost wakeup 的可复现实验}
+
+lost wakeup 最难的地方是它看起来像偶发卡住。要让它稳定复现，可以故意写一个错误版本：等待者先检查谓词，释放锁，然后再把自己加入等待队列。唤醒者在这个窗口里改变条件并 notify，等待者随后入队睡眠，就会错过唯一一次唤醒。
+
+\begin{lstlisting}
+wrong wait sequence:
+  lock(m)
+  if (!ready) {
+    unlock(m)              // window begins
+    enqueue(waiters, self)
+    sleep()
+  }
+
+waker:
+  lock(m)
+  ready = true
+  notify_one()
+  unlock(m)
+\end{lstlisting}
+
+正确实验要用 barrier 固定时序：让等待线程停在“释放锁之后、入队之前”，再让唤醒线程完成 notify，最后放行等待线程。期望结果是错误实现永久睡眠，正确实现不会睡眠或会立即重新检查谓词。这个测试比随机跑一万次更有价值，因为它直接覆盖了危险窗口。
+
+\subsection{condition variable 的三个负面案例}
+
+条件变量的常见错误可以拆成三个小实验，每个实验都应该有明确期望。
+
+\begin{longtable}{p{0.25\linewidth}p{0.38\linewidth}p{0.25\linewidth}}
+\toprule
+错误 & 构造方法 & 期望现象 \\
+\midrule
+\code{if} 代替 \code{while} & 两个消费者等待一个 item，notify all 后同时醒来 & 一个消费者拿到 item，另一个必须重新睡眠；错误实现会读空队列 \\
+修改状态前 notify & producer 先 notify，再 push item & consumer 醒来看到旧状态，可能继续睡或错误返回 \\
+关闭不广播 & 多个 producer/consumer 睡在不同队列，close 只唤醒一边 & 另一边永久等待 \\
+\bottomrule
+\end{longtable}
+
+这三个案例对应三条规则：等待必须循环检查谓词；状态改变和 notify 的顺序必须让等待者能看到新状态；关闭是一种状态变化，必须唤醒所有可能等待这个状态的线程。
+
+\subsection{same-pool future deadlock}
+
+线程池和 future 是现代 C++ 程序里很常见的同步组合。一个典型死锁是：线程池只有 N 个 worker，N 个任务都在等待同一个线程池中尚未运行的子任务。所有 worker 都被等待占住，子任务无人执行。
+
+\begin{lstlisting}
+bad pattern:
+  worker task A:
+    future = pool.submit(B)
+    return future.get()   // blocks a worker
+
+if all workers do this:
+  no worker remains to run B
+\end{lstlisting}
+
+修复方向有三种。第一，把等待改成 continuation：B 完成后触发 A 的后续逻辑，不占住 worker。第二，允许 worker 在等待时帮助执行队列中的其他任务，但要小心重入和优先级。第三，把阻塞等待放到专门的 blocking pool，计算 pool 不做无限期等待。这个例子说明同步问题不只在内核；用户态运行时也必须有调度意识。
+
+\subsection{调度观测命令：每个命令回答一个问题}
+
+观测命令不是越多越好。关键是每个命令要回答一个具体问题。长命令不要塞进表格；实验报告里应把命令、问题和结论分开写。
+
+\begin{lstlisting}
+cat /proc/<pid>/sched
+\end{lstlisting}
+
+它回答单个任务运行了多久、等待了多久、迁移了几次。若 runnable wait 高，说明任务已经可运行但长期拿不到 CPU。
+
+\begin{lstlisting}
+perf stat -e context-switches,cpu-migrations,page-faults ./workload
+\end{lstlisting}
+
+它回答切换、迁移和缺页是否异常。上下文切换暴涨常见于线程过多、锁竞争或频繁阻塞；迁移过多可能破坏 cache 和 NUMA 局部性；缺页多时要进一步区分 minor fault、major fault 和回收。
+
+\begin{lstlisting}
+perf sched record ./workload
+perf sched latency
+\end{lstlisting}
+
+这组命令回答“任务被唤醒后等了多久才真正运行”。若唤醒延迟集中在某些线程或某些 CPU 上，要继续检查 runqueue、CPU affinity、优先级和 cgroup quota。
+
+\begin{lstlisting}
+pidstat -w -p <pid> 1
+\end{lstlisting}
+
+它区分自愿上下文切换和非自愿上下文切换。自愿切换多，通常说明线程主动阻塞在 I/O、锁或等待事件；非自愿切换多，通常说明被抢占或 CPU 竞争强。
+
+\begin{lstlisting}
+cat /sys/fs/cgroup/<group>/cpu.stat
+\end{lstlisting}
+
+它回答服务组是否被 CPU 配额限流。若 throttled time 和 throttled periods 增长，p99 延迟很可能来自配额周期，而不是业务函数突然变慢。
+
+\begin{lstlisting}
+strace -f -e futex,clone,execve,wait4 ./workload
+\end{lstlisting}
+
+它回答线程、进程和 futex 系统调用行为。若大量线程停在 futex wait，就要寻找锁 owner、等待谓词和唤醒路径；若 wait4 长期不返回，要检查子进程是否退出以及父子关系是否正确。
+
+\begin{lstlisting}
+perf top
+perf record ./workload
+\end{lstlisting}
+
+它们回答 CPU 真正在执行哪里。若热点在自旋、内存拷贝、哈希查找或内核软中断，优化方向完全不同。
+
+做报告时不要只贴命令输出。要写清楚：实验负载是什么，预期瓶颈是什么，命令观察到的现象是否支持预期，若不支持下一步查什么。例如 p99 延迟高，同时 \code{cpu.stat} 显示大量 throttled time，说明要先看 CPU quota；若 \code{perf sched latency} 显示唤醒后等待长，但 cgroup 没限流，要看 runqueue、优先级和 CPU affinity。
+
+\subsection{从源码到实验的闭环}
+
+第二阶段的最低闭环可以按下面顺序完成。
+
+\begin{enumerate}
+\tightlist
+\item 读 \code{copy\_process}，画出 fork 的阶段图和失败回滚表。
+\item 写一个 fork/exec/wait 小程序，用 \code{strace -f} 验证父子返回值、exec 成功路径和 wait 回收。
+\item 读 \code{schedule} 到架构切换路径，说明一次线程切换保存哪些状态。
+\item 写一个 Round Robin 或公平调度模型，断言 sleeping/zombie 任务不能入队。
+\item 写一个错误 condition variable 示例，用 barrier 稳定制造 lost wakeup。
+\item 写一个 futex mutex 或阅读 pthread mutex 的 futex 行为，用 \code{strace -e futex} 区分快路径和慢路径。
+\item 用 \code{perf sched} 或 \code{/proc/<pid>/sched} 分析一次人为制造的 runnable wait。
+\end{enumerate}
+
+完成这些实验后，读者不再只是知道概念名称，而是能把一个现象定位到对象、状态、源码路径和观测证据。到这一步，任务、调度与同步这一章才真正具备工程教材的质量。

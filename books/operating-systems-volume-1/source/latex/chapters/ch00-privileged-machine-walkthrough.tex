@@ -1,0 +1,197 @@
+\section{特权机器完整走读：从用户指令到内核返回}
+
+现在把前面的硬件拼起来，走读一台带 OS 的机器如何处理用户程序。目标不是背 x86-64 细节，而是建立完整路径：用户指令、异常、中断、系统调用、页表、设备、调度如何互相连接。
+
+\subsection{机器启动后的两类代码}
+
+系统启动后，内核代码运行在特权模式，用户程序运行在非特权模式。它们不是简单“谁更重要”，而是 CPU 对它们执行不同规则。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+能力 & 用户态 & 内核态 \\
+\midrule
+普通算术和分支 & 可以 & 可以 \\
+访问用户页 & 可以，受页表限制 & 可以，但必须小心用户指针 \\
+访问内核页 & 不可以 & 可以 \\
+修改页表根 & 不可以 & 可以 \\
+开关中断 & 不可以 & 可以 \\
+访问设备 MMIO & 通常不可以 & 驱动可以 \\
+返回任意模式 & 不可以 & 通过受控返回路径 \\
+\bottomrule
+\end{longtable}
+
+用户态的限制不是库函数实现的，而是 CPU 和页表强制的。用户程序绕过 libc 直接写设备地址，也会 fault。
+
+\subsection{路径一：普通用户指令}
+
+用户程序执行普通加法：
+
+\begin{lstlisting}
+add rax, rbx
+\end{lstlisting}
+
+硬件动作是取指、译码、读寄存器、ALU 加法、写回。没有进入内核。OS 不参与每一条普通指令，否则程序会慢到不可用。OS 只通过页表、特权级、调度器和中断在边界处介入。
+
+\subsection{路径二：用户 load 命中}
+
+用户程序读取已映射内存：
+
+\begin{lstlisting}
+mov rax, qword ptr [rbx]
+\end{lstlisting}
+
+硬件查询 TLB，确认页表权限允许用户读，cache 命中后返回数据。整个过程不进内核。虚拟内存能高效运行，是因为权限检查由硬件快速完成，而不是内核逐条检查。
+
+\subsection{路径三：用户 load 缺页}
+
+若 TLB/page table 发现 PTE 不 present，CPU 进入 page fault。
+
+\begin{lstlisting}
+hardware:
+  save faulting RIP
+  save fault address and error code
+  switch to kernel entry
+
+kernel:
+  find VMA
+  if legal:
+    allocate/load page
+    install PTE
+    return to same instruction
+  else:
+    deliver SIGSEGV or kill process
+\end{lstlisting}
+
+这条路径说明 page fault 是硬件和 OS 的合作。硬件只知道访问无法完成；OS 判断这是合法懒分配、文件映射、COW，还是非法地址。
+
+\subsection{路径四：用户写只读 COW 页}
+
+\code{fork} 后，父子进程可共享同一物理页，但 PTE 标为只读。任何一方写入时触发保护异常。
+
+\begin{lstlisting}
+write to COW page:
+  hardware sees PTE writable = 0
+  page fault with write error
+  kernel sees VMA allows write and page is COW
+  allocate new page
+  copy old content
+  update PTE writable to new page
+  return and retry store
+\end{lstlisting}
+
+没有页表权限位和精确异常，COW 就无法透明实现。用户程序以为自己只是普通写内存，OS 在异常路径完成复制。
+
+\subsection{路径五：系统调用}
+
+用户程序要写文件：
+
+\begin{lstlisting}
+write(fd, buf, len)
+\end{lstlisting}
+
+libc wrapper 把系统调用号和参数放进寄存器，执行 syscall 指令。CPU 切换到内核入口。内核保存寄存器，检查 fd、用户 buffer、权限和对象状态，然后执行文件路径。
+
+\begin{lstlisting}
+sys_write:
+  file = current.fd_table[fd]
+  check file is writable
+  copy bytes from user buffer
+  write into page cache or device path
+  return bytes_written or -errno
+\end{lstlisting}
+
+这里有两个边界。系统调用返回成功表示内核接受并完成了该调用语义，不一定表示数据持久化。用户 buffer 复制成功表示当时那段用户地址可读，不表示用户以后不会修改原 buffer。
+
+\subsection{路径六：定时器中断打断用户程序}
+
+用户程序正在运行，定时器到了。
+
+\begin{lstlisting}
+hardware:
+  finish current instruction boundary
+  save user RIP/RFLAGS
+  enter timer vector
+
+kernel timer handler:
+  account time to current task
+  run expired timers
+  if time slice exhausted:
+    set need_resched
+
+return path:
+  if need_resched:
+    schedule()
+  return to chosen task
+\end{lstlisting}
+
+若调度器选择另一个任务，返回用户态时就不回到原任务，而是恢复新任务的 RIP/RSP/寄存器/页表。用户程序感受到的是“自己某段时间没运行”，不是显式函数调用。
+
+\subsection{路径七：设备完成中断}
+
+磁盘或网卡完成 DMA 后发中断。
+
+\begin{lstlisting}
+device:
+  writes data/status to memory
+  raises MSI-X interrupt
+
+kernel:
+  enter IRQ handler
+  acknowledge interrupt
+  read completion queue
+  unmap DMA buffer
+  mark request done
+  wake waiting task
+\end{lstlisting}
+
+这条路径说明设备和 CPU 是并发的。CPU 提交请求后可能去运行别的任务；设备完成时异步打断某个 CPU；内核把 completion 转换成等待队列唤醒或上层回调。
+
+\subsection{路径八：返回用户态前的检查}
+
+内核不能处理完就随便返回。返回用户态前，要检查信号、抢占、调试、审计、单步、恢复寄存器和返回模式。
+
+\begin{lstlisting}
+prepare_return_to_user:
+  if signal_pending:
+    build signal frame on user stack
+  if need_resched:
+    schedule
+  run syscall exit tracing/audit
+  restore user registers
+  return with user mode bit
+\end{lstlisting}
+
+返回路径是安全边界。若返回模式错、栈错、寄存器泄露、信号帧构造错，都可能造成崩溃或漏洞。很多内核 entry 代码复杂，是因为它同时处理性能快路径和安全慢路径。
+
+\subsection{一张总图：OS 介入点}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+事件 & 谁先发现 & 内核做什么 \\
+\midrule
+普通加法 & 不进入内核 & 不介入 \\
+合法内存命中 & MMU/TLB/cache & 不介入 \\
+缺页 & MMU & 分配/装载页面或报错 \\
+权限错误 & MMU & COW、信号或杀进程 \\
+系统调用 & 用户执行陷入指令 & 检查对象和权限，执行请求 \\
+定时器 & timer hardware & 统计时间、调度、超时 \\
+设备完成 & device/interrupt controller & completion、唤醒、错误处理 \\
+非法指令 & decoder/privilege check & 信号、模拟或杀进程 \\
+\bottomrule
+\end{longtable}
+
+这张表是后续全书的入口图。OS 不控制每个周期，但它控制关键边界；硬件不懂进程和文件，但它能在边界处把控制权交给内核。
+
+\subsection{本节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能说明普通指令为什么不进入内核，系统仍然能被 OS 管理。
+\item 能画出合法 load、缺页 load、COW store 三条路径的差异。
+\item 能从 \code{write(fd, buf, len)} 说到寄存器 ABI、系统调用入口、fd 表、用户复制、page cache。
+\item 能解释定时器中断如何让当前任务被换出。
+\item 能解释设备 completion 如何唤醒等待 I/O 的任务。
+\item 能说明返回用户态前为什么要处理信号、抢占和 tracing。
+\end{itemize}
+\end{rubricbox}

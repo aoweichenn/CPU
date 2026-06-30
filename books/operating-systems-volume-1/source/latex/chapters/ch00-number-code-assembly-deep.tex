@@ -1,0 +1,213 @@
+\section{数值、编码与汇编：从一串 bit 到一条程序}
+
+很多组成原理教材讲到 bit 后，很快跳到 CPU。中间少掉的一层是：同一串 bit 如何被解释成整数、地址、字符、指令、权限位和文件格式。操作系统每天都在处理这些解释规则。ELF header 是字节解释规则，系统调用 ABI 是寄存器解释规则，页表项是 bit 字段解释规则，网络协议是字节序解释规则。若这一层不清楚，后面读内核结构体和二进制文件会很吃力。
+
+\subsection{同一串 bit 可以有多种含义}
+
+假设内存某个 byte 是 \code{0x41}，也就是二进制 \code{01000001}。它可以表示无符号整数 65，可以表示 ASCII 字符 \code{A}，可以表示机器指令的一部分，也可以表示一个权限位集合。硬件并不知道“它真正是什么”，解释权来自使用它的路径。
+
+\begin{longtable}{p{0.2\linewidth}p{0.28\linewidth}p{0.4\linewidth}}
+\toprule
+解释方式 & \code{0x41} 的含义 & 谁规定 \\
+\midrule
+无符号整数 & 65 & 算术指令和程序类型 \\
+有符号补码 & 65 & 算术指令和类型解释 \\
+字符编码 & \code{A} & ASCII/UTF-8 等编码规则 \\
+指令字节 & 某条指令的一部分 & ISA 编码规则 \\
+权限位 & bit0 和 bit6 为 1 & OS 数据结构定义 \\
+\bottomrule
+\end{longtable}
+
+这解释了为什么 C/C++ 里的类型很重要，也解释了为什么内核解析用户输入必须严格检查长度、对齐和字段含义。字节本身没有安全性，安全来自解释规则是否完整。
+
+\subsection{二进制、十六进制和位字段}
+
+二进制适合硬件，十六进制适合人读。1 个十六进制数字对应 4 个 bit。比如 \code{0x5a}：
+
+\begin{lstlisting}
+0x5a = 0101 1010
+        ^^^^ ^^^^
+        0x5 0xa
+\end{lstlisting}
+
+OS 大量使用位字段。例如一个页表项低几位可能是权限和状态，高位是物理页号。
+
+\begin{lstlisting}
+PTE:
+  bit 0       present
+  bit 1       writable
+  bit 2       user_accessible
+  bit 3       write_through
+  bit 4       cache_disable
+  bit 5       accessed
+  bit 6       dirty
+  bit 63      no_execute
+  bits 12..51 physical_page_number
+\end{lstlisting}
+
+设置、清除和测试位字段通常用 AND/OR/NOT/SHIFT。
+
+\begin{lstlisting}
+set writable:
+  pte = pte | PTE_WRITABLE
+
+clear writable:
+  pte = pte & ~PTE_WRITABLE
+
+test present:
+  if (pte & PTE_PRESENT) != 0
+\end{lstlisting}
+
+这不是“位运算技巧”，而是硬件契约的直接表达。CPU 做地址翻译时会读取这些 bit；OS 修改这些 bit 就是在修改硬件后续如何处理内存访问。
+
+\subsection{有符号溢出和地址溢出}
+
+8 位无符号数最大是 255。再加 1 会变成 0，这是模 \code{2^8} 的结果。硬件加法器自然产生这种环绕。软件必须决定这是正常行为还是错误。
+
+\begin{lstlisting}
+uint8:
+  255 + 1 = 0
+
+16-bit address:
+  0xffff + 1 = 0x0000
+\end{lstlisting}
+
+系统调用里，地址和长度经常成对出现。若用户传入 \code{ptr=0xfff0, len=0x40}，简单计算 \code{end = ptr + len} 在 16 位地址里会变成 \code{0x0030}。如果内核只检查 \code{end < limit}，就可能被骗过。
+
+\begin{lstlisting}
+bad_check(ptr, len):
+  end = ptr + len
+  if end <= user_limit:
+    allow
+
+good_check(ptr, len):
+  if len > user_limit:
+    reject
+  if ptr > user_limit - len:
+    reject
+  allow
+\end{lstlisting}
+
+这就是为什么整数溢出是内核漏洞高发点。组成原理里的补码和模运算，直接影响 OS 安全。
+
+\subsection{字符编码和文本不是一回事}
+
+文件里保存的是字节，不是“文字”。ASCII 用一个 byte 表示英文字符；UTF-8 用 1 到 4 个 byte 表示 Unicode 码点。中文字符通常占多个 byte。路径名、环境变量、命令行参数、终端输入，最终都是字节序列加解释规则。
+
+\begin{lstlisting}
+ASCII:
+  'A' -> 0x41
+
+UTF-8:
+  '中' -> e4 b8 ad
+\end{lstlisting}
+
+OS 内核通常不理解所有文本语义，它更关心字节串长度、是否包含 \code{NUL}、路径分隔符、编码是否由用户空间约定。系统调用如 \code{execve(path, argv, envp)} 必须逐个复制以 \code{NUL} 结尾的用户字符串，并限制总长度，避免用户传入无限长或跨坏页的参数。
+
+\subsection{指令也是字节：反汇编做了什么}
+
+机器码是字节，反汇编器按 ISA 规则把字节解释成汇编文本。比如在某个 ISA 中，前 4 bit 是 opcode，后面是寄存器编号和立即数；在 x86-64 中，编码更复杂，有前缀、opcode、ModRM、SIB、位移和立即数。
+
+\begin{lstlisting}
+bytes:
+  b8 2a 00 00 00
+
+x86-64 interpretation:
+  mov eax, 42
+\end{lstlisting}
+
+CPU 不看汇编文本，汇编文本只是人类可读形式。汇编器把文本转成机器码；反汇编器把机器码尽量转回文本。调试内核 oops 时看到的 \code{RIP} 和机器码，就是在定位“CPU 当时执行到哪串字节”。
+
+\subsection{x86-64 Intel 汇编到机器动作}
+
+考虑这段 Intel 语法汇编：
+
+\begin{lstlisting}
+mov rbx, 0x2000
+mov rax, qword ptr [rbx]
+add rax, 1
+mov qword ptr [rbx], rax
+\end{lstlisting}
+
+逐步解释：
+
+\begin{enumerate}
+\tightlist
+\item \code{mov rbx, 0x2000} 把地址常量放进寄存器 \code{rbx}。
+\item \code{mov rax, qword ptr [rbx]} 把 \code{rbx} 当地址，从内存读 8 字节到 \code{rax}。
+\item \code{add rax, 1} 使用 ALU，让 \code{rax} 加 1。
+\item \code{mov qword ptr [rbx], rax} 把 \code{rax} 写回 \code{rbx} 指向的内存。
+\end{enumerate}
+
+这四条指令已经覆盖了程序的大部分本质：常量、地址、读内存、算术、写内存。C 语言里的 \code{x = x + 1}，编译后也会落到类似动作，只是寄存器分配和寻址模式更复杂。
+
+\subsection{地址和指针：类型给地址加意义}
+
+指针本质上是一个地址值。但 \code{int*}、\code{char*}、\code{struct Task*} 对同一地址的解释不同。编译器根据类型决定一次读写多少字节、按什么对齐、字段偏移是多少。
+
+\begin{lstlisting}
+struct Pair {
+  uint32_t a;
+  uint32_t b;
+};
+
+p->b
+  address = p + offset_of(b)
+  load 4 bytes from address
+\end{lstlisting}
+
+内核大量使用结构体指针。若把用户传入的整数当内核指针使用，就是严重漏洞。用户地址和内核地址必须区分；用户地址要通过 \code{copy\_from\_user}，内核指针才可直接解引用。
+
+\subsection{对齐为什么会影响正确性和性能}
+
+很多 CPU 更喜欢在自然边界上访问数据：2 字节值地址是 2 的倍数，4 字节值地址是 4 的倍数，8 字节值地址是 8 的倍数。有些架构允许非对齐访问但慢，有些架构会触发异常。设备 DMA 描述符也常要求对齐。
+
+\begin{longtable}{p{0.2\linewidth}p{0.32\linewidth}p{0.36\linewidth}}
+\toprule
+对象 & 常见对齐 & 原因 \\
+\midrule
+16 位整数 & 2 字节 & 一次总线访问或避免跨边界 \\
+32 位整数 & 4 字节 & ALU/内存接口自然宽度 \\
+64 位整数 & 8 字节 & 原子访问和性能 \\
+cache line 数据 & 64 字节量级 & 避免伪共享、满足 DMA/cache 要求 \\
+页 & 4KiB 或更大 & 页表和 MMU 管理单位 \\
+\bottomrule
+\end{longtable}
+
+OS 里对齐随处可见：页表页必须按页对齐，内核栈按 ABI 对齐，DMA buffer 按设备要求对齐，结构体字段为了性能可能填充 padding。理解 padding 后，读二进制结构和系统调用 ABI 才不会误解字段位置。
+
+\subsection{从 C 到汇编再到 OS 证据}
+
+一个简单 C 函数：
+
+\begin{lstlisting}
+int add_one(int x) {
+  return x + 1;
+}
+\end{lstlisting}
+
+可能变成类似汇编：
+
+\begin{lstlisting}
+add_one:
+  mov eax, edi
+  add eax, 1
+  ret
+\end{lstlisting}
+
+这里 \code{edi} 是参数寄存器，\code{eax} 是返回值寄存器。这是 ABI 规定的，不是编译器随意选择。系统调用也有 ABI：系统调用号在哪个寄存器，参数在哪些寄存器，返回值和 errno 如何表达。OS 不是运行“C 源码”，它运行机器码，并通过 ABI 和用户程序达成二进制契约。
+
+\subsection{本节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能把一个 byte 同时解释成整数、字符、指令字节和权限位，并说明解释规则来自哪里。
+\item 能用位运算说明如何设置、清除和测试页表权限位。
+\item 能解释整数溢出如何破坏地址范围检查。
+\item 能说明端序如何影响内存中的多字节值。
+\item 能把一段简单 C 语句拆成 load、ALU、store 动作。
+\item 能解释指针为什么只是地址加类型解释，为什么用户指针不能当内核指针直接用。
+\item 能说明对齐、padding、ABI 和系统调用参数寄存器之间的关系。
+\end{itemize}
+\end{rubricbox}

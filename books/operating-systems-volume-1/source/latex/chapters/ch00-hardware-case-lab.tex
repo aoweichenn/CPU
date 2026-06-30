@@ -1,0 +1,607 @@
+\section{硬件案例深拆：从事件、对象到证据}
+
+本节把硬件知识压到具体路径里。每个案例都回答五个问题：事件从哪里来，经过哪些硬件，内核维护哪些对象，用户看见什么，失败时从哪里取证。这样写的目的不是多堆页数，而是把“计算机相关硬件”变成能解释、能调试、能测试的系统知识。
+
+\subsection{案例零：一条 C 语句如何落到硬件}
+
+先看最普通的一句代码：
+
+\begin{lstlisting}
+array[i] = array[i] + 1;
+\end{lstlisting}
+
+编译器可能把它变成地址计算、load、加法、store。CPU 执行时并不是直接“改数组”，而是一步步经过寄存器、地址生成、TLB、页表权限、cache、store buffer 和一致性协议。
+
+\begin{lstlisting}
+1. compute virtual address: base + i * element_size
+2. look up TLB for virtual page
+3. if TLB misses, walk page table
+4. check user/supervisor and write permission
+5. load cache line into L1 if absent
+6. read old value from cache line
+7. add one in ALU
+8. place store into store buffer
+9. make modified cache line visible by coherence rules
+\end{lstlisting}
+
+这条路径解释了几个常见现象。若虚拟地址没有合法 VMA，内核给进程发送 \code{SIGSEGV}；若 VMA 合法但 PTE 不 present，内核可能分配页、读取文件页或执行 COW；若两个 CPU 更新同一 cache line 上的不同计数器，性能会因为伪共享下降；若 store 还在 store buffer 中，另一个 CPU 看到的顺序可能需要原子操作和内存屏障来约束。
+
+\begin{longtable}{p{0.2\linewidth}p{0.35\linewidth}p{0.33\linewidth}}
+\toprule
+硬件步骤 & 出错或变慢的原因 & OS 证据 \\
+\midrule
+地址计算 & 指针越界、整数溢出 & sanitizer、异常地址、core dump \\
+TLB/page walk & 页表不存在、权限不够 & page fault 统计、\code{perf stat} TLB miss \\
+cache 访问 & cache miss、伪共享 & \code{perf stat} cache miss、LLC miss \\
+store 可见性 & 数据竞争、缺少屏障 & KCSAN、TSAN、lockdep、代码审查 \\
+\bottomrule
+\end{longtable}
+
+所以“内存访问”不是一个单点动作。操作系统中的缺页、COW、mmap、锁、原子变量、NUMA 和性能分析，都在为这条路径服务。
+
+\subsection{案例一：复位到第一个用户进程}
+
+从按下电源到第一个用户进程运行，机器经历了多级控制权转移。每一级都只拥有下一步所需的最小能力。
+
+\begin{lstlisting}
+power good
+  -> reset vector
+  -> immutable BootROM or firmware entry
+  -> DRAM training and platform init
+  -> bootloader or EFI stub
+  -> kernel decompression and early entry
+  -> early page tables and console
+  -> memory allocator and scheduler
+  -> driver probing and root filesystem
+  -> exec first user process
+\end{lstlisting}
+
+这条链路里，硬件和软件界限不断变化。UEFI 固件初始化 DRAM、PCIe、ACPI 和基础平台状态；bootloader 或 EFI stub 把内核镜像、initrd、命令行、UEFI 内存地图传给内核；内核接管页表、中断、调度和驱动；最后 \code{execve} 把第一个用户态程序装入地址空间。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 最关键的硬件事实 & 失败证据 \\
+\midrule
+复位向量 & CPU 从固定地址取指 & 无串口输出、BMC 事件、逻辑分析仪 \\
+DRAM 初始化 & 内存控制器和内存条必须稳定 & 内存训练失败码、固件日志 \\
+固件表 & 内存地图、设备、中断、NUMA 信息 & ACPI 错误、\code{dmesg} 启动日志 \\
+内核早期 & 栈、BSS、页表、early console & early panic、异常寄存器 \\
+驱动 probe & 资源、IRQ、DMA、clock、reset & probe fail 日志、sysfs 设备和 ACPI 节点 \\
+用户态启动 & rootfs、init、ELF、动态链接器 & kernel panic、\code{No init found} \\
+\bottomrule
+\end{longtable}
+
+Linux 源码阅读可以从 \filepath{arch/x86/boot/}、\filepath{arch/x86/kernel/head64.c}、\filepath{init/main.c}、\filepath{drivers/firmware/efi/}、\filepath{drivers/acpi/}、\filepath{drivers/pci/} 开始。读的时候不要只看函数名，要问：这一行代码依赖哪些硬件已经可用，哪些还不可用。
+
+\subsection{案例二：一次定时器抢占}
+
+抢占式调度不是调度器单独完成的。它依赖硬件定时器在未来某个时间点打断 CPU。假设用户程序正在死循环，定时器中断到来后，CPU 切入内核入口，内核记录当前任务运行时间，设置重新调度标志，在返回路径切换到另一个任务。
+
+\begin{lstlisting}
+user loop running
+  -> local APIC timer or architecture timer fires
+  -> CPU enters interrupt vector
+  -> kernel saves interrupt frame
+  -> tick handler updates scheduler clock
+  -> current task exhausts slice
+  -> return path calls scheduler
+  -> switch registers and stack to next task
+  -> return to user mode of next task
+\end{lstlisting}
+
+这里至少有四种硬件状态参与：定时器、当前 RIP 和寄存器、内核栈、页表或地址空间标识。若中断被长期关闭，抢占会延迟；若时钟源不可靠，调度统计会错；若保存寄存器不完整，任务恢复后会计算错误。
+
+\begin{longtable}{p{0.2\linewidth}p{0.35\linewidth}p{0.33\linewidth}}
+\toprule
+内核对象 & 对应硬件状态 & 典型源码入口 \\
+\midrule
+\code{task\_struct} & 任务身份、调度状态、地址空间 & \filepath{include/linux/sched.h} \\
+内核栈 & 中断和系统调用时的可信栈 & \filepath{arch/x86/entry/entry\_64.S} \\
+调度类 & runnable 任务的选择策略 & \filepath{kernel/sched/} \\
+clockevent & 产生下一次定时事件 & \filepath{kernel/time/} \\
+上下文切换代码 & 保存恢复寄存器和栈 & \filepath{arch/x86/kernel/process\_64.c} \\
+\bottomrule
+\end{longtable}
+
+可观测证据包括 \code{cat /proc/interrupts} 中 timer 相关计数、\code{perf sched}、\code{trace-cmd record -e sched:*}、\code{/proc/schedstat}。若系统卡顿，要区分是没有定时器中断、调度器没选到任务、任务不可运行，还是 CPU 被更高优先级中断或关中断区域占用。
+
+\subsection{案例三：TLB shootdown 为什么会拖慢多核}
+
+进程取消映射一段内存时，内核修改页表。但其他 CPU 可能仍然缓存旧 TLB 项。若内核立即释放物理页，另一个 CPU 可能继续用旧翻译访问已释放页，破坏隔离。因此内核必须让所有相关 CPU 失效旧翻译。
+
+\begin{lstlisting}
+unmap virtual page:
+  take mm locks
+  remove or modify PTE
+  collect CPUs that may run this address space
+  send IPI to those CPUs
+  each CPU invalidates TLB entry or range
+  wait for acknowledgement
+  free physical page after old translations are gone
+\end{lstlisting}
+
+这就是为什么频繁 \code{munmap}、频繁改变页权限、频繁释放大量映射，在多核系统上可能很贵。成本不只是改内存里的页表项，还包括跨 CPU IPI、等待远端 CPU 响应、打断远端工作流和刷新 TLB 热状态。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+设计选择 & 好处 & 代价 \\
+\midrule
+立即 shootdown & 隔离清晰，回收及时 & IPI 和等待成本高 \\
+批量 unmap & 分摊 shootdown 成本 & 回收延迟、实现复杂 \\
+PCID/ASID & 降低地址空间切换刷新 & 标签管理和一致性仍复杂 \\
+大页 & 减少 TLB 项数量 & 拆分和权限粒度成本 \\
+\bottomrule
+\end{longtable}
+
+Linux 相关路径可读 \filepath{mm/mmu\_gather.c}、\filepath{arch/x86/mm/tlb.c}、\filepath{include/linux/mmu\_gather.h}。观察可以用 \code{perf stat -e tlb:tlb\_flush} 或架构支持的 TLB 事件，再配合 \code{perf record} 看是否大量时间落在 TLB flush 和 IPI 路径。
+
+\subsection{案例四：一次 \code{malloc} 到物理页}
+
+\code{malloc} 通常先在用户态分配器里找空闲块。若分配器没有合适空间，它可能通过 \code{brk} 扩展堆，或通过 \code{mmap} 建立新映射。即使系统调用成功，物理页也不一定立刻分配。第一次写入时触发缺页，内核才分配零页或物理页。
+
+\begin{lstlisting}
+malloc large object:
+  userspace allocator decides mmap
+  kernel creates VMA
+  syscall returns virtual address
+  user first writes address
+  CPU raises page fault because PTE absent
+  kernel checks VMA permissions
+  allocator takes physical page from buddy/slab path
+  kernel zero-fills page
+  kernel installs writable PTE
+  faulting instruction retries
+\end{lstlisting}
+
+这个案例把用户分配器、VMA、缺页、物理页分配、cache 和安全连接起来。零填充不是浪费，而是隔离要求：新进程不能读到旧进程释放页里的数据。NUMA first-touch 也在这里生效：哪个 CPU 第一次写页，内核通常倾向从本地 NUMA node 分配页。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 硬件/内核原因 & 证据 \\
+\midrule
+\code{malloc} 快，首次访问慢 & 懒分配和缺页 & \code{perf stat} page-faults \\
+跨 NUMA 变慢 & 页在远端 node & \code{numastat}、\code{numactl} \\
+RSS 小于虚拟内存 & VMA 已建但页未实际分配 & \code{/proc/<pid>/smaps} \\
+释放后内存不立刻回系统 & 分配器缓存和 VMA 策略 & \code{mallinfo}、\code{pmap} \\
+\bottomrule
+\end{longtable}
+
+源码入口包括 \filepath{mm/mmap.c}、\filepath{mm/memory.c}、\filepath{mm/page\_alloc.c}、\filepath{mm/huge\_memory.c}。学习时要把“虚拟地址可用”和“物理页已经分配”分开。
+
+\subsection{案例五：一次 DMA 描述符顺序错误}
+
+假设驱动要让设备读取一段 buffer。正确顺序是：准备 buffer，映射 DMA，填写描述符，执行 DMA 写屏障，再写 doorbell。若屏障缺失，设备可能先看到 doorbell，再读到旧描述符或半初始化描述符。
+
+\begin{lstlisting}
+correct submit:
+  desc.addr = dma_addr
+  desc.len = len
+  desc.flags = READ
+  dma_wmb()
+  writel(new_tail, DOORBELL)
+
+buggy submit:
+  desc.addr = dma_addr
+  desc.len = len
+  writel(new_tail, DOORBELL)
+  desc.flags = READ
+\end{lstlisting}
+
+这个 bug 难复现，因为它依赖 CPU store buffer、cache、互联排序和设备读取时机。低负载、单核或某种 CPU 上可能一直正常；换平台、换优化级别、换设备后就出现随机超时或 DMA 错误。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+错误 & 后果 & 证据 \\
+\midrule
+doorbell 早于描述符可见 & 设备读到旧命令 & command timeout、设备错误状态 \\
+completion 前释放 buffer & 迟到 DMA 写坏内存 & KASAN、IOMMU fault、随机崩溃 \\
+方向标错 & cache clean/invalidate 错 & 数据旧、数据损坏 \\
+unmap 漏掉 & IOVA 泄漏或权限残留 & DMA debug、IOMMU 统计 \\
+\bottomrule
+\end{longtable}
+
+Linux 提供 DMA API 和 DMA debug 是为了让驱动不要直接拼物理地址。相关入口包括 \filepath{Documentation/core-api/dma-api.rst}、\filepath{kernel/dma/}、\filepath{lib/dma-debug.c}、\filepath{drivers/iommu/}。驱动评审时必须追踪 buffer 所有权：CPU 写、设备读、设备写、CPU 读，每次转换都要有对应屏障和 map/unmap。
+
+\subsection{案例六：冷缓存文件读取}
+
+用户调用 \code{read(fd, buf, len)}。若 page cache 没有对应页，路径会从 VFS 进入文件系统，再到块层、I/O 调度、NVMe 或其他存储驱动，最后设备 DMA 把数据放进页缓存。
+
+\begin{lstlisting}
+cold read:
+  user read()
+  fd -> file -> inode
+  page cache lookup misses
+  filesystem maps file offset to disk blocks
+  block layer builds bio/request
+  driver submits command to device queue
+  device DMA fills page cache page
+  completion interrupt wakes waiting task
+  kernel copies data to user buffer
+\end{lstlisting}
+
+关键是区分三种“完成”。设备 completion 表示硬件完成了 DMA；page cache uptodate 表示内核页里有了数据；\code{read} 返回表示数据已经复制到用户 buffer。这三个时间点不同。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+层次 & 对象 & 源码入口 \\
+\midrule
+系统调用 & fd、file、iov iterator & \filepath{fs/read\_write.c} \\
+页缓存 & page/folio、xarray & \filepath{mm/filemap.c} \\
+文件系统 & inode、extent、block mapping & \filepath{fs/ext4/}、\filepath{fs/xfs/} \\
+块层 & bio、request、blk-mq queue & \filepath{block/} \\
+设备驱动 & submission/completion queue & \filepath{drivers/nvme/host/} \\
+\bottomrule
+\end{longtable}
+
+证据可以用 \code{strace} 看系统调用，用 \code{vmtouch} 或 \code{mincore} 判断缓存，用 \code{blktrace} 或 \code{bpftrace} 观察块 I/O，用 \code{iostat -x} 看设备队列。若第二次读取明显更快，通常是 page cache 命中，不是硬盘突然变快。
+
+\subsection{案例七：写文件、掉电和 \code{fsync}}
+
+写文件最容易误解。应用调用 \code{write} 成功，只表示内核接收了数据，通常还在 page cache 中。后台 writeback 会稍后把 dirty page 写到设备。若应用需要崩溃后数据存在，必须使用 \code{fsync} 或文件系统提供的事务语义。
+
+\begin{lstlisting}
+safe replace pattern:
+  write new contents to temp file
+  fsync(temp file)
+  rename temp file to target name
+  fsync(parent directory)
+\end{lstlisting}
+
+这段模式看起来繁琐，是因为硬件和文件系统有多个持久化对象：文件数据、inode 元数据、目录项、日志提交、设备 volatile cache。只同步文件不一定同步目录项；设备返回写完成不一定意味着掉电后仍存在，除非 flush/FUA 语义把数据推到稳定介质。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 崩溃后风险 & 约束方式 \\
+\midrule
+\code{write} 返回 & 数据可能只在内存 & \code{fsync}、同步写策略 \\
+writeback 完成 & 设备缓存可能易失 & flush、FUA、掉电保护 \\
+日志提交 & 元数据恢复有序 & journaling、barrier \\
+rename 完成 & 目录项可能未持久化 & fsync parent directory \\
+\bottomrule
+\end{longtable}
+
+源码入口包括 \filepath{mm/page-writeback.c}、\filepath{fs/sync.c}、\filepath{fs/ext4/fsync.c}、\filepath{block/blk-flush.c}。测试应使用故障注入或虚拟块设备模拟掉电，而不是只在正常关机后看文件是否存在。
+
+\subsection{案例八：USB 键盘按键到 shell}
+
+USB 键盘不是把字符直接交给 shell。设备周期性上报 HID report，host controller 用 DMA 把报告放入内存，USB core 完成 URB，HID 驱动解析按键，input 子系统产生事件，tty line discipline 把按键转成终端输入，shell 的 \code{read} 被唤醒。
+
+\begin{lstlisting}
+key press:
+  key matrix changes
+  keyboard firmware builds HID report
+  USB host polls interrupt endpoint
+  DMA writes report to memory
+  HID driver parses usage code
+  input subsystem emits key event
+  tty handles canonical mode and echo
+  shell read() returns after line discipline policy
+\end{lstlisting}
+
+同一个按键可能因为键盘布局、修饰键、终端模式、输入法、tty 设置而得到不同字符。硬件只报告按键状态，字符语义在更高层解释。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+失败点 & 表现 & 证据 \\
+\midrule
+USB 枚举失败 & 设备不存在 & \code{lsusb}、\code{dmesg} \\
+HID report 异常 & 按键错乱或无响应 & \code{hid-recorder}、内核日志 \\
+input 层未创建设备 & 桌面无输入 & \code{/proc/bus/input/devices} \\
+tty canonical 模式 & 输入到回车才返回 & \code{stty -a} \\
+shell 被信号打断 & \code{read} 返回错误或重启 & \code{strace} \\
+\bottomrule
+\end{longtable}
+
+相关源码入口有 \filepath{drivers/usb/core/}、\filepath{drivers/hid/}、\filepath{drivers/input/}、\filepath{drivers/tty/}。这个案例说明“输入”跨越硬件、固件、总线、驱动、内核子系统和用户态协议。
+
+\subsection{案例九：网卡收包到 \code{recv}}
+
+网卡收包路径是硬件队列和协议栈协作的经典例子。驱动预先把 RX buffer 映射给设备，设备收到包后 DMA 写入 buffer，写 completion，触发中断。内核通常用 NAPI 关闭一段时间中断并轮询多个包，减少中断风暴。
+
+\begin{lstlisting}
+packet receive:
+  NIC receives bits from PHY
+  MAC validates frame and writes DMA buffer
+  NIC writes descriptor status
+  MSI-X interrupt targets selected CPU
+  NAPI poll harvests packets
+  driver builds skb
+  IP/TCP stack processes headers
+  socket receive queue gets data
+  epoll or recv wakes user task
+\end{lstlisting}
+
+网络路径里的硬件细节会直接影响上层延迟。RSS 决定流分到哪个队列；IRQ affinity 决定中断在哪个 CPU；NUMA 决定 DMA buffer 离 CPU 远近；interrupt moderation 决定中断合并延迟；GRO 决定包在协议栈里的聚合粒度。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+调优项 & 改变什么 & 风险 \\
+\midrule
+RX ring size & 可暂存包数量 & 太小丢包，太大延迟和内存占用 \\
+interrupt moderation & 中断频率 & 吞吐和延迟折中 \\
+RSS indirection & 流到队列映射 & 负载不均或破坏局部性 \\
+IRQ affinity & completion 运行 CPU & 热点 CPU 或跨 NUMA \\
+GRO/TSO offload & 包处理粒度 & 抓包和延迟理解更复杂 \\
+\bottomrule
+\end{longtable}
+
+源码入口包括 \filepath{net/core/dev.c}、\filepath{net/ipv4/tcp\_input.c}、\filepath{drivers/net/ethernet/}。证据命令包括 \code{ethtool -S}、\code{ethtool -l}、\code{cat /proc/interrupts}、\code{nstat}、\code{ss -tin}、\code{dropwatch}。
+
+\subsection{案例十：Wi-Fi 连接突然不稳定}
+
+Wi-Fi 不稳定时，应用只能看到请求慢或断线。底层可能是射频信号差、漫游、信道拥塞、省电策略、固件崩溃、监管域限制或驱动队列堵塞。Wi-Fi 设备通常有固件，很多 MAC 层策略在固件中执行，OS 通过命令和事件与它协作。
+
+\begin{lstlisting}
+Wi-Fi path:
+  supplicant requests connection
+  driver sends commands to firmware
+  firmware scans and authenticates
+  radio transmits frames over selected channel
+  firmware reports events and received frames
+  kernel network stack exposes normal netdev
+\end{lstlisting}
+
+有线网络里 PHY/MAC 已经复杂，无线还多了信道、速率控制、重传、加密、漫游和省电。故障排查要看 \code{iw dev wlan0 link}、\code{iw dev wlan0 station dump}、\code{dmesg} 固件日志、\code{wpa\_supplicant} 日志、信号强度、重传计数和省电状态。
+
+\subsection{案例十一：GPU 渲染一帧到屏幕}
+
+用户界面的一帧通常由应用渲染、合成器合成、GPU 执行命令、显示控制器扫描输出。应用可能使用 OpenGL、Vulkan 或软件渲染；合成器把多个窗口合成到目标 buffer；KMS 在 vblank 边界 page flip。
+
+\begin{lstlisting}
+frame lifecycle:
+  application renders into buffer
+  compositor receives buffer and fence
+  GPU executes composition commands
+  fence signals render completion
+  KMS schedules page flip at vblank
+  display controller scans buffer
+  monitor shows pixels
+\end{lstlisting}
+
+显示路径里有两个异步边界：GPU 命令完成和显示扫描完成。若 buffer 在 GPU 完成前被显示，会出现未完成内容；若 buffer 在显示扫描时被修改，会撕裂；若 page flip 错过 vblank，会多等一个刷新周期。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+对象 & 作用 & Linux 入口 \\
+\midrule
+buffer object & 显存或共享内存对象 & \filepath{drivers/gpu/drm/} \\
+fence & 异步完成同步 & \filepath{drivers/dma-buf/} \\
+plane/CRTC & 显示合成和扫描输出 & DRM/KMS helper \\
+connector & HDMI、DP、eDP、DSI & EDID、hotplug、modeset \\
+\bottomrule
+\end{longtable}
+
+黑屏或卡顿不能只怪应用。证据包括 \code{dmesg} GPU hang、\code{/sys/class/drm/} 连接器状态、compositor 日志、\code{modetest}、\code{intel\_gpu\_top} 或对应厂商工具。
+
+\subsection{案例十二：音频爆音}
+
+音频设备以固定采样率消耗数据。假设采样率 48kHz，period 只有几毫秒。用户态音频服务必须在设备读完当前 period 前填好后续数据。任何调度延迟、锁竞争、CPU 深睡眠、中断延迟都可能造成 underrun。
+
+\begin{lstlisting}
+audio underrun:
+  device DMA consumes playback ring
+  period interrupt should wake audio thread
+  audio thread wakes too late
+  next period contains no valid samples
+  hardware outputs silence or repeats stale data
+  user hears pop or gap
+\end{lstlisting}
+
+这个案例说明实时不是“CPU 总体很空”就够。即使平均 CPU 使用率只有 20\%，一次几十毫秒的调度停顿也能毁掉音频。证据包括 ALSA underrun 日志、音频服务日志、\code{cyclictest}、调度 trace、CPU C-state 和频率状态。
+
+\subsection{案例十三：摄像头采集一帧}
+
+摄像头路径从光开始。x86-64 PC 上常见的 USB UVC 摄像头会在设备内部完成传感器读出和图像处理，再通过 USB 主机控制器把帧数据传到内存；PCIe 采集卡则通过 BAR、MSI-X 和 DMA 队列交付帧。V4L2 或 media framework 把 buffer 交给用户态。每一帧都有时间戳和 buffer 生命周期。
+
+\begin{lstlisting}
+camera frame:
+  sensor exposure
+  USB xHCI or PCIe capture card transfers pixels
+  host controller or device DMA writes output buffer
+  MSI-X or completion event marks buffer done
+  V4L2 dequeues buffer to userspace
+  application encodes or displays frame
+\end{lstlisting}
+
+摄像头比普通字符设备复杂，因为它是 pipeline。sensor、CSI receiver、ISP、scaler、codec 都可能是不同子设备。格式、分辨率、帧率、lane 数、时钟和电源顺序必须一致。证据包括 \code{media-ctl -p}、\code{v4l2-ctl --all}、帧 drop 计数、CSI error 和 ISP 日志。
+
+\subsection{案例十四：温度传感器触发降频}
+
+CPU 或 GPU 高负载运行后温度升高。传感器超过 trip point，thermal framework 调用 cooling device，可能降低 CPU 频率、限制 GPU、提高风扇转速或最终关机。用户看到的是吞吐下降或延迟升高。
+
+\begin{lstlisting}
+thermal throttling:
+  workload raises power
+  temperature sensor crosses trip point
+  thermal governor selects cooling state
+  cpufreq or devfreq reduces frequency
+  scheduler capacity model changes
+  application observes lower throughput
+\end{lstlisting}
+
+硬件热状态是性能报告必须包含的上下文。证据包括 \code{/sys/class/thermal/thermal\_zone*/temp}、\code{cpupower frequency-info}、\code{turbostat}、\code{perf stat}、风扇转速和环境温度。若不记录这些，两个 benchmark 结果没有可比性。
+
+\subsection{案例十五：Secure Boot 到磁盘解锁}
+
+安全启动和磁盘加密常组合使用。固件验证 bootloader，bootloader 验证内核或测量内核，TPM PCR 记录启动链状态。磁盘密钥可以封存到特定 PCR 状态，只有启动链未被篡改时才自动解锁。
+
+\begin{lstlisting}
+measured boot:
+  firmware measures bootloader into PCR
+  bootloader measures kernel and initrd
+  kernel or initramfs asks TPM to unseal key
+  TPM checks PCR values
+  if values match policy, releases secret
+  disk mapper decrypts root filesystem
+\end{lstlisting}
+
+这条路径解决的是“离线篡改启动组件后窃取磁盘数据”的一部分风险。它不解决运行中 root 权限滥用，不解决内核漏洞，不解决用户已解锁后的数据泄露。安全硬件必须放在威胁模型中解释。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+机制 & 防护对象 & 边界 \\
+\midrule
+Secure Boot & 未授权启动组件 & 运行中漏洞仍可能攻破系统 \\
+TPM sealing & 密钥只在匹配测量状态释放 & 授权状态下恶意软件仍可请求使用 \\
+IOMMU & 设备 DMA 越权 & CPU 内核漏洞不由 IOMMU 防住 \\
+内存加密 & 物理 DRAM 窃听或冷启动部分风险 & 运行中软件访问仍受权限控制 \\
+\bottomrule
+\end{longtable}
+
+源码和工具入口包括 \filepath{drivers/char/tpm/}、\filepath{security/integrity/ima/}、\code{mokutil}、\code{tpm2\_pcrread}、\code{systemd-cryptenroll}。学习安全硬件时不要只问“开没开”，要问它保护哪条路径、失败时如何恢复。
+
+\subsection{案例十六：虚拟机直通一块网卡}
+
+设备直通把真实 PCIe 设备交给虚拟机使用。hypervisor 要从 host driver 手中解绑设备，绑定到 VFIO，建立 IOMMU domain，把设备 DMA 限制在 guest 内存范围内，并把中断重定向给 guest。
+
+\begin{lstlisting}
+device passthrough:
+  host checks IOMMU group isolation
+  host binds device to vfio-pci
+  VM maps guest memory into IOMMU domain
+  device DMA is translated by IOMMU
+  MSI/MSI-X interrupts are remapped to guest
+  guest driver thinks it owns a real PCIe device
+\end{lstlisting}
+
+直通性能好，但隔离依赖 IOMMU group、ACS、interrupt remapping 和设备本身可信度。若同一 group 中有多个不可隔离设备，把其中一个交给 guest 可能让 guest 影响 host 或其他设备。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+风险 & 原因 & 证据或约束 \\
+\midrule
+DMA 越界 & IOMMU 配置错误或关闭 & \code{dmesg} IOMMU、VFIO 日志 \\
+中断注入错误 & interrupt remapping 问题 & VM 日志、host IRQ 统计 \\
+group 不隔离 & PCIe 拓扑共享请求者 ID & \code{/sys/kernel/iommu\_groups} \\
+设备 reset 不完整 & 设备状态泄漏到下个 owner & FLR 支持、驱动 reset 路径 \\
+\bottomrule
+\end{longtable}
+
+相关入口包括 \filepath{drivers/vfio/}、\filepath{drivers/iommu/}、\filepath{drivers/pci/quirks.c}。这个案例把 PCIe、IOMMU、中断、安全和虚拟化连接在一起。
+
+\subsection{案例十七：BMC 远程重启一台服务器}
+
+服务器 BMC 可以在主机 OS 崩溃时仍然工作。管理员通过管理网络登录 BMC，查看传感器、日志和远程控制台，执行 power cycle。主 CPU 被断电重启，但 BMC 的固件和网络连接可能一直在线。
+
+\begin{lstlisting}
+BMC recovery path:
+  administrator connects over management network
+  BMC reads platform event log
+  BMC controls power rails through board logic
+  host CPU resets and firmware starts again
+  OS later reads hardware error records
+\end{lstlisting}
+
+BMC 是运维救命工具，也是安全风险。它有独立凭据、独立网络栈、固件更新路径和高权限硬件控制能力。生产环境应隔离管理网，审计 BMC 账户，更新固件，记录远程操作。
+
+\subsection{案例十八：JTAG、串口和早期调试}
+
+当内核还没启动到日志系统，普通调试器和文件系统都不可用。x86-64 硬件调试依赖更低层入口：串口 early console、Intel DCI/JTAG、逻辑分析仪、BMC SOL、panic blink code、firmware debug port。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+调试入口 & 适用阶段 & 价值 \\
+\midrule
+UART early console & bootloader 和内核早期 & 最简单稳定的文本证据 \\
+Intel DCI/JTAG & 裸机、固件和早期内核 & 停 CPU、看寄存器和内存 \\
+BMC SOL & 服务器远程串口 & 无需现场接线 \\
+logic analyzer & 信号级时序问题 & 查 I2C/SPI/GPIO/复位线 \\
+crash dump & 内核运行后崩溃 & 保存内存和寄存器证据 \\
+\bottomrule
+\end{longtable}
+
+这解释了为什么底层工程重视串口。屏幕和网络依赖太多驱动，串口依赖少，最适合定位启动早期、panic 和设备 probe 问题。
+
+\subsection{硬件相关 Linux 源码阅读路线}
+
+为了避免“工业对标只是概述”，这里给出一个实际阅读顺序。每个路径都建议先读数据结构，再读 probe，再读失败回滚，再读中断或 completion。
+
+\begin{longtable}{p{0.25\linewidth}p{0.37\linewidth}p{0.26\linewidth}}
+\toprule
+主题 & 源码路径 & 先抓的对象 \\
+\midrule
+启动主线 & \filepath{init/main.c}、\filepath{arch/x86/kernel/head64.c} & early init、initcall \\
+ACPI & \filepath{drivers/acpi/} & device 描述、电源状态和资源 \\
+PCIe & \filepath{drivers/pci/} & \code{pci\_dev}、BAR、MSI \\
+USB & \filepath{drivers/usb/core/} & \code{urb}、endpoint、hub event \\
+DMA/IOMMU & \filepath{kernel/dma/}、\filepath{drivers/iommu/} & mapping、domain、fault \\
+块层 & \filepath{block/} & \code{bio}、\code{request}、blk-mq \\
+NVMe & \filepath{drivers/nvme/host/} & queue、command、completion \\
+网络 & \filepath{net/core/dev.c}、\filepath{drivers/net/} & \code{sk\_buff}、NAPI、netdev \\
+DRM/KMS & \filepath{drivers/gpu/drm/} & GEM、plane、CRTC、fence \\
+音频 & \filepath{sound/core/}、\filepath{sound/pci/hda/} & PCM ring、codec、stream \\
+摄像头 & \filepath{drivers/media/} & media graph、V4L2 buffer \\
+热管理 & \filepath{drivers/thermal/} & thermal zone、cooling device \\
+电源管理 & \filepath{drivers/base/power/} & runtime PM、system sleep \\
+安全芯片 & \filepath{drivers/char/tpm/} & command、PCR、session \\
+\bottomrule
+\end{longtable}
+
+读源码要带着硬件问题读。例如读 \code{pci\_driver.probe} 时，问：资源哪里来，MMIO 如何映射，IRQ 如何分配，DMA mask 如何设置，失败时如何释放。读 NAPI 时，问：为什么中断处理不直接把所有包处理完，poll budget 如何平衡延迟和吞吐。
+
+\subsection{硬件测试报告模板}
+
+下面这个模板适合本章学习后的最小测试。它不要求写代码，但要求把硬件结论落到证据。
+
+\begin{lstlisting}
+Hardware report:
+  Machine:
+    CPU model, core/thread count, cache levels, NUMA nodes
+    memory size, memory type if visible, ECC status if visible
+  Firmware:
+    BIOS/UEFI version, ACPI evidence, Secure Boot status
+  PCIe:
+    list NVMe/GPU/NIC path, BAR, driver, IRQ/MSI-X, IOMMU group
+  Storage:
+    device model, queue count, scheduler, flush support, SMART summary
+  Network:
+    link speed, queues, offload, IRQ affinity, error counters
+  USB/Input:
+    topology, HID devices, hotplug evidence
+  Display/Audio:
+    connectors, modes, audio devices, underrun or error counters
+  Power/Thermal:
+    temperature sensors, frequency governor, cooling devices
+  Security:
+    TPM, Secure Boot, IOMMU, kernel lockdown if enabled
+  Failure case:
+    choose one failure and trace hardware -> kernel -> user symptom
+\end{lstlisting}
+
+报告的判断标准：每个结论都要有命令输出或日志证据；每个设备都要能说出驱动对象；每个性能结论都要说明硬件瓶颈可能在哪里；每个安全结论都要说明防护边界。
+
+\subsection{常见误区集中纠正}
+
+\begin{warningbox}
+\begin{itemize}
+\tightlist
+\item “CPU 访问内存就是读数组”：实际还经过虚拟地址、TLB、页表权限、cache 和异常路径。
+\item “\code{write} 成功就是落盘”：通常只是内核接收，持久化还需要 writeback、flush 和文件系统顺序。
+\item “中断越多越实时”：过多中断会造成 CPU 浪费和抖动，很多高性能路径会合并中断或轮询。
+\item “DMA 就是更快复制”：DMA 是设备直接访问内存，关键是所有权、映射、cache 和完成回收。
+\item “设备插上驱动就该工作”：还需要供电、时钟、复位、总线枚举、固件描述、IRQ、DMA 和权限。
+\item “虚拟机里的物理地址是真的物理地址”：guest physical 还要经过二级页表到 host physical。
+\item “安全硬件打开就安全”：安全硬件只保护特定边界，不能替代内核和用户态安全。
+\item “性能只看算法”：cache、TLB、NUMA、频率、温度、I/O 队列和中断亲和性都可能主导结果。
+\end{itemize}
+\end{warningbox}
+
+\subsection{本节能力验收}
+
+读完本节后，不要求记住所有芯片型号，但要能做到以下事情：
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能从一条 C 内存访问讲到 TLB、页表、cache、store buffer 和缺页。
+\item 能从电源复位讲到固件、bootloader、内核 early init 和第一个用户进程。
+\item 能解释定时器中断如何让内核抢回 CPU。
+\item 能解释 TLB shootdown 为什么是多核虚拟内存的昂贵操作。
+\item 能解释 \code{malloc} 成功和物理页真正分配之间的差别。
+\item 能给 DMA 提交流程写出正确的所有权和屏障顺序。
+\item 能完整讲出冷缓存文件读取、可靠文件写入、USB 键盘、网卡收包、GPU 显示、音频播放、摄像头采集的路径。
+\item 能把 Wi-Fi 不稳、NVMe 超时、黑屏、音频爆音、热降频、设备不可见拆成硬件层、驱动层、内核对象层和用户可见层。
+\item 能根据 Linux 源码路径找到至少一个硬件子系统的 probe、资源申请、completion 和错误恢复代码。
+\item 能写出一份本机硬件测试报告，并给每个结论附上命令或日志证据。
+\end{itemize}
+\end{rubricbox}

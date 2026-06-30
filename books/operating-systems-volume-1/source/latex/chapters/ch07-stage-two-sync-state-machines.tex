@@ -1,0 +1,172 @@
+\section{第二阶段深讲：同步原语要写成状态机}
+
+同步章节若只讲 mutex、condition variable、semaphore 的 API，很容易产生错觉：只要调用了锁，就安全。真实系统的同步安全来自对象状态机。每个共享对象都应该明确：有哪些字段，字段之间的不变量是什么，哪些事件改变状态，等待者等的谓词是什么，关闭和取消怎样唤醒所有路径。
+
+\subsection{有界队列：最小但完整的同步对象}
+
+一个有界队列包含 buffer、capacity、head、tail、size、closed、读等待队列和写等待队列。它的核心不变量是：
+
+\begin{lstlisting}
+0 <= size <= capacity
+head and tail are always in [0, capacity)
+size == number of occupied slots
+closed implies no new successful push begins
+waiters sleep only while their predicate is false
+\end{lstlisting}
+
+生产者等待 \code{size < capacity || closed}，消费者等待 \code{size > 0 || closed}。注意关闭状态必须写进谓词，否则关闭后空队列上的消费者可能永远睡眠，满队列上的生产者也可能永远睡眠。
+
+\subsection{正确 wait 的四步}
+
+正确等待不是一个 \code{wait()} 调用，而是四个动作的组合：持锁检查谓词，把自己加入等待集合，释放锁并睡眠，醒来后重新持锁检查谓词。
+
+\begin{lstlisting}
+wait_until(q, predicate):
+  lock(q.lock)
+  while !predicate():
+    enqueue(q.waiters, current)
+    current.state = SLEEPING
+    schedule_unlocking(q.lock)
+    lock(q.lock)
+  unlock(q.lock)
+\end{lstlisting}
+
+这段伪代码中的 \code{schedule\_unlocking} 表达一个关键原子性：任务状态变成 sleeping、等待节点进入队列、锁释放、调度走，必须对唤醒方形成一致顺序。若先释放锁再入队，唤醒可能发生在空窗口里，造成 lost wakeup。
+
+\subsection{notify 不是消息}
+
+条件变量和等待队列的 \code{notify} 或 \code{wake} 只是告诉等待者“相关状态可能变了”。它不携带数据，也不保证谓词已经为真，更不保证只有一个等待者会醒。醒来后必须重新检查谓词。
+
+\begin{lstlisting}
+consumer:
+  lock(m)
+  while queue.empty() and not queue.closed:
+    wait(cv, m)
+  if queue.empty() and queue.closed:
+    return EOF
+  item = queue.pop()
+  unlock(m)
+
+producer:
+  lock(m)
+  queue.push(item)
+  notify_one(cv)
+  unlock(m)
+\end{lstlisting}
+
+若消费者用 \code{if} 而不是 \code{while}，虚假唤醒或多个消费者竞争同一个 item 都可能破坏逻辑。若 producer 在修改状态前 notify，消费者醒来仍可能看到旧状态。若关闭时忘记 notify all，等待者可能永久挂起。
+
+\subsection{信号量和条件变量的边界}
+
+信号量表达“许可数量”，条件变量表达“对象状态变化”。它们能互相模拟一部分场景，但语义侧重点不同。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+问题 & 适合的原语 & 原因 \\
+\midrule
+连接池最多 N 个并发连接 & semaphore & 许可数量就是核心状态 \\
+队列不空/不满 & condition variable & 谓词依赖多个字段 \\
+等待某个请求完成一次 & completion/future & 一次性状态转移 \\
+等待多个 fd readiness & epoll/wait queue & 等待集合是 fd 对象 \\
+读多写少配置表 & RCU/seqlock & 读路径要极轻 \\
+\bottomrule
+\end{longtable}
+
+把 semaphore 用来表达复杂队列状态，会让关闭、取消和错误路径变得隐晦；把 condition variable 用来表达简单许可，也会多出不必要的 mutex 和谓词。选择原语前先写状态机。
+
+\subsection{futex 的状态机}
+
+用户态 mutex 常用一个整数表示状态：0 表示 unlocked，1 表示 locked 无已知等待者，2 表示 locked 且可能有等待者。futex 只在竞争路径进入内核。
+
+\begin{lstlisting}
+lock state:
+  0 unlocked
+  1 locked, no known waiter
+  2 locked, contended
+
+lock:
+  CAS 0 -> 1 succeeds: acquired
+  otherwise set/observe 2 and futex_wait(state, 2)
+
+unlock:
+  exchange state -> 0
+  if old == 2: futex_wake(state, 1)
+\end{lstlisting}
+
+内核 futex wait 的关键动作是检查用户地址仍等于 expected。若用户态状态已经变了，内核不能睡眠，而要返回让用户态重试。这个比较把用户态原子状态和内核等待队列连接起来。
+
+\subsection{读多写少：seqlock 和 RCU}
+
+读多写少对象不一定适合普通 mutex。seqlock 让读者无锁复制数据，若写者更新期间序列号变化，读者重试。它适合时间戳、统计快照这类可重试读取，不适合包含指针且对象可能被释放的复杂结构。
+
+\begin{lstlisting}
+read seqlock:
+  do:
+    seq = read_begin()
+    local = copy(shared)
+  while read_retry(seq)
+
+write seqlock:
+  write_lock()
+  update shared
+  write_unlock()
+\end{lstlisting}
+
+RCU 则适合指针发布：读者拿到旧对象也没关系，只要旧对象在读侧临界区结束前不释放。写者创建新对象、原子发布指针、等待 grace period 后释放旧对象。RCU 的难点不是读，而是更新和回收。
+
+\subsection{关闭、取消和超时}
+
+完整同步对象必须处理关闭、取消和超时。否则测试只覆盖正常路径，系统一退出就卡死。
+
+\begin{lstlisting}
+pop_with_timeout(q, deadline):
+  lock(q.lock)
+  while q.empty and not q.closed:
+    remaining = deadline - now
+    if remaining <= 0:
+      unlock(q.lock)
+      return TIMEOUT
+    timed_wait(q.not_empty, q.lock, remaining)
+  if q.empty and q.closed:
+    unlock(q.lock)
+    return CLOSED
+  item = pop(q)
+  notify_one(q.not_full)
+  unlock(q.lock)
+  return item
+\end{lstlisting}
+
+timeout 路径要把等待节点从队列移除，不能留下悬挂指针。取消路径也一样。关闭路径要唤醒所有等待者，让它们重新检查 \code{closed}。这些路径是同步代码最容易漏测的部分。
+
+\subsection{状态机测试矩阵}
+
+有界队列的测试不应只验证 push/pop。应按状态和事件组合设计：
+
+\begin{longtable}{p{0.24\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+状态 & 事件 & 期望 \\
+\midrule
+empty open & blocking pop & 消费者睡眠 \\
+empty open & producer push & 消费者被唤醒并取得 item \\
+full open & blocking push & 生产者睡眠 \\
+full open & consumer pop & 生产者被唤醒并写入 \\
+empty closed & pop & 返回 CLOSED/EOF \\
+full closed & push & 返回 CLOSED/EPIPE \\
+waiting & timeout & 等待节点移除，返回 TIMEOUT \\
+waiting & cancel & 等待节点移除，不破坏队列 \\
+\bottomrule
+\end{longtable}
+
+这类测试能暴露三种经典 bug：lost wakeup、关闭不唤醒、timeout 后等待节点悬挂。压力测试只能偶然撞到这些问题，状态机测试能稳定覆盖。
+
+\subsection{同步状态机验收}
+
+\begin{itemize}
+\tightlist
+\item 每个共享对象都有字段表和不变量。
+\item 每个等待都有明确谓词，且谓词包含关闭或取消条件。
+\item 每个状态改变都说明唤醒哪个等待队列。
+\item 每个 timeout/cancel 路径都移除等待节点。
+\item 每个关闭路径都唤醒所有可能等待者。
+\item 每个测试都能说明覆盖了哪个状态和事件。
+\end{itemize}

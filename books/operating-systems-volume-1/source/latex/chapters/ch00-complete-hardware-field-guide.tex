@@ -1,0 +1,809 @@
+\section{整机硬件详解：从芯片、板卡到操作系统对象}
+
+前面的章节已经解释了位、寄存器、指令、页表、cache、TLB、总线、MMIO、DMA 和中断。本节继续把范围扩大到一台真实计算机的全部重要硬件。目标不是把硬件工程每个公式都讲完，而是让读者知道：每个硬件部件为什么出现，给 OS 暴露了什么接口，失败时能留下什么证据，内核为什么必须为它建立对象、策略和测试。
+
+\begin{keyidea}
+学习硬件不能停在“CPU、内存、磁盘、网卡”四个名词。真实机器还包括供电、时钟、复位、固件、芯片组、互联、存储介质、控制器、传感器、安全芯片、管理控制器、显示链路、音频链路、无线模块和调试设施。OS 的职责是把这些不同速度、不同可靠性、不同权限边界的硬件收敛为统一的软件契约。
+\end{keyidea}
+
+\subsection{先画整机，而不是先背术语}
+
+一台通用计算机可以先按“能源、时钟、计算、存储、互联、外设、管理、安全、观测”九类画图。这样做的好处是：一个新名词出现时，可以先判断它属于哪一类，再问它和 OS 的关系。
+
+\begin{longtable}{p{0.18\linewidth}p{0.35\linewidth}p{0.35\linewidth}}
+\toprule
+类别 & 典型硬件 & OS 关系 \\
+\midrule
+能源 & PSU、VRM、PMIC、电池、充电芯片 & 电源状态、功耗限制、掉电恢复 \\
+时钟复位 & 晶振、PLL、clock controller、reset controller & 时间源、定时器、设备初始化顺序 \\
+计算 & CPU、GPU、NPU、DSP、协处理器 & 调度、驱动、内存共享、队列提交 \\
+存储 & SRAM、DRAM、Flash、NAND、磁盘、NVRAM & 页分配、块层、文件系统、持久化语义 \\
+互联 & 片上总线、内存总线、PCIe、USB、CXL、I2C、SPI & 枚举、带宽、延迟、热插拔、错误处理 \\
+外设 & 网卡、显示、音频、摄像头、键鼠、传感器 & 驱动、输入输出对象、权限和命名 \\
+管理 & UEFI、BMC、EC、ACPI & 启动、硬件描述、电源热管理 \\
+安全 & TPM、Secure Boot、IOMMU、CPU 内存保护 & 启动测量、密钥保护、DMA 隔离 \\
+观测 & PMU、JTAG、串口、trace buffer、错误寄存器 & 性能分析、故障定位、测试验收 \\
+\bottomrule
+\end{longtable}
+
+这张表还可以帮助区分“硬件能力”和“OS 抽象”。例如 NVMe 是存储控制器和协议，OS 把它变成块设备和文件；TPM 是安全芯片，OS 把它用于测量启动和密钥封存；GPU 是计算与显示硬件，OS 把它包装成显存对象、命令队列、fence 和显示平面。
+
+\subsection{供电：没有稳定电源就没有正确执行}
+
+CPU 执行指令之前，系统必须先有稳定供电。台式机和服务器从 PSU 获得多路电压，主板上的 VRM 把电压转换成 CPU、内存、芯片组和外设需要的电压。手机和嵌入式设备常用 PMIC 管理电池、充电、升降压、低功耗状态和电源域。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+硬件 & 作用 & OS 可见影响 \\
+\midrule
+PSU & 提供整机电源 & 掉电、功率不足、服务器冗余电源事件 \\
+VRM & 给 CPU/GPU/内存提供稳定电压 & 频率电压调节、功耗墙、热限制 \\
+PMIC & 管理移动设备电源轨和电池 & runtime PM、充电状态、低电量策略 \\
+power domain & 允许局部断电 & 驱动 resume 前必须重新打开电源域 \\
+brown-out detector & 检测电压过低 & 嵌入式复位、错误日志、数据保护 \\
+\bottomrule
+\end{longtable}
+
+电源不稳定会造成随机重启、设备掉线、存储写入失败、PCIe 链路错误和内存错误。OS 不能假设所有失败都是软件 bug。可靠系统会把电源事件纳入日志，例如服务器 BMC 记录电源冗余状态，移动系统记录电池温度和充电限制，嵌入式系统在掉电前触发保存或保护动作。
+
+\subsection{电源域和驱动生命周期}
+
+x86-64 PC 和服务器也会把 GPU、网卡、NVMe 控制器、USB 控制器、音频、BMC、风扇和传感器放入不同电源域或电源管理层级。设备空闲时关闭电源可以省电，但关闭电源也意味着寄存器状态、队列状态和时钟状态可能丢失。驱动的 \code{suspend/resume}、\code{runtime\_suspend/runtime\_resume} 本质上就是在管理这个硬件状态机。
+
+\begin{lstlisting}
+runtime resume of a device:
+  enable parent power domain
+  enable regulator
+  enable clocks
+  deassert reset
+  restore registers
+  rebuild DMA rings if needed
+  allow new I/O
+
+runtime suspend:
+  stop accepting new I/O
+  wait or cancel in-flight requests
+  save device state
+  assert reset if required
+  disable clocks
+  disable regulator
+  mark device suspended
+\end{lstlisting}
+
+如果驱动在设备断电后仍访问 MMIO，轻则读到无效值，重则总线错误。若 resume 后忘记恢复中断使能，设备完成了 I/O 也没人通知 CPU。若关闭电源域时还有 DMA 进行，设备可能写到已回收的内存。电源管理不是附加功能，而是设备生命周期的一部分。
+
+\subsection{时钟、PLL 和复位：硬件动作为什么要按顺序}
+
+芯片内部不是所有部件都用同一个频率。晶振提供基础时钟，PLL 产生 CPU、总线、内存、显示、音频、USB 等不同频率。reset controller 控制各模块复位线。许多设备初始化必须按顺序执行：先供电，再开时钟，再解除复位，再配置寄存器。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+部件 & 作用 & 常见失败 \\
+\midrule
+crystal & 稳定基础频率 & 时间漂移、外设协议频率不准 \\
+PLL & 倍频和分频 & lock 失败、切频瞬间不稳定 \\
+clock gate & 关闭空闲模块时钟 & 驱动访问无时钟设备导致超时 \\
+reset line & 把模块拉回初始状态 & reset 顺序错，设备状态不可预测 \\
+watchdog clock & 独立计时 & 主时钟挂死后仍能复位系统 \\
+\bottomrule
+\end{longtable}
+
+音频设备尤其依赖准确时钟。采样率偏差会导致声音速度和同步问题；USB 和 PCIe 也要求稳定链路时钟；CPU 调频需要内核知道频率变化，否则调度统计和性能计数会失真。OS 的 clock framework、reset framework 和 regulator framework 就是为了把这些硬件依赖显式化。
+
+\subsection{复位向量和第一段代码}
+
+上电或复位后，CPU 从架构规定的位置取第一条指令，这个位置叫复位向量。第一段代码通常在 ROM 或固件 Flash 中。它不能假设 DRAM 已经可用，因为 DRAM 训练和控制器初始化还没做；也不能假设栈、堆、中断、cache 都可用。启动链必须一步一步把硬件带到可运行状态。
+
+\begin{lstlisting}
+reset vector:
+  run immutable ROM code
+  choose boot source
+  initialize minimal SRAM stack
+  verify and load next firmware stage
+  initialize DRAM controller
+  load bootloader or kernel image
+  pass hardware description to kernel
+\end{lstlisting}
+
+从这里可以看出，启动安全和启动可靠性天然交织。若 BootROM 验证失败，应停止启动或进入恢复模式；若 DRAM 初始化失败，内核根本没有稳定内存可用；若 bootloader 给错内存地图，内核页分配器可能覆盖固件保留区或内核镜像本身。
+
+\subsection{主板、封装和插槽：硬件拓扑不是软件想象}
+
+PC 主板把 CPU、内存、PCIe 插槽、芯片组、固件 Flash、USB、音频、网卡、电源管理和风扇连接起来。服务器主板还会有多个 CPU socket、多组内存通道、多条 PCIe switch、BMC、存储背板、传感器和远程管理网口。拓扑决定中断路由、NUMA 距离、DMA 可达性、热插拔路径和故障隔离边界。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+拓扑事实 & 为什么重要 & OS 影响 \\
+\midrule
+内存通道数量 & 决定内存带宽上限 & NUMA、带宽测试、页放置 \\
+PCIe 插槽连接位置 & 决定设备离哪个 CPU 更近 & IRQ affinity、DMA locality \\
+PCIe switch & 多设备共享上游链路 & 带宽竞争、错误隔离 \\
+BMC 独立管理网口 & OS 之外还有管理平面 & 安全边界、运维日志 \\
+天线和射频前端 & 无线质量受物理设计影响 & 驱动只能看到链路质量结果 \\
+\bottomrule
+\end{longtable}
+
+同样一块 NVMe SSD 插在不同插槽，性能可能不同；同一个网卡绑定到不同 CPU 的中断亲和性，延迟也可能不同。OS 性能分析不能只看进程代码，也要看硬件拓扑。
+
+\subsection{CPU 核内部：不只是 ALU}
+
+CPU 核通常包含取指前端、分支预测器、译码器、寄存器重命名、调度队列、整数执行单元、浮点和 SIMD 单元、load/store 单元、提交逻辑、L1 cache、TLB 和异常控制。ISA 只定义软件可见结果，微架构决定这些结果如何高效实现。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+内部部件 & 作用 & OS 相关性 \\
+\midrule
+branch predictor & 猜测下一条执行路径 & 侧信道、上下文污染、性能抖动 \\
+rename/ROB & 支持乱序执行和精确提交 & 精确异常、投机执行边界 \\
+load/store unit & 处理内存访问 & page fault、memory ordering、MMIO 限制 \\
+FPU/SIMD & 浮点和向量计算 & 上下文保存、信号帧、内核禁用或受限使用 \\
+PMU & 统计周期、cache miss、分支等事件 & perf、性能诊断、回归测试 \\
+\bottomrule
+\end{longtable}
+
+OS 不需要在每次调度时管理分支预测器细节，但安全补丁可能需要清理某些预测状态；OS 不需要理解每条 SIMD 指令的数学意义，但必须保存用户可见的向量寄存器；OS 不需要直接安排乱序执行，但必须使用屏障建立跨 CPU 和设备的可见顺序。
+
+\subsection{微码、MSR 和控制寄存器}
+
+许多 CPU 有微码，用更低层的内部操作实现复杂指令或修补硬件问题。x86 还提供大量 MSR，用于控制系统调用入口、性能计数、时间戳、缓存策略、调试和安全缓解。控制寄存器则管理页表、保护模式、cache、特权状态等核心能力。
+
+\begin{lstlisting}
+examples of privileged CPU state:
+  page table root register
+  interrupt descriptor table pointer
+  syscall entry address
+  control bits for paging and protection
+  model specific registers for timer and PMU
+\end{lstlisting}
+
+这些寄存器只能由内核或更高特权层修改。普通进程若能修改系统调用入口，就可以劫持整个内核入口；若能修改页表根，就可以读取任意物理内存；若能禁用中断，就可以阻止调度。特权保护不是抽象原则，而是硬件寄存器权限的直接结果。
+
+\subsection{异构计算：GPU、NPU、DSP 和加速器}
+
+现代计算机的“计算”不只在 CPU 上。GPU 擅长大规模并行图形和通用计算；NPU 擅长神经网络算子；DSP 常用于音频、基带和信号处理；压缩、加密、视频编解码也常有专用加速器。OS 必须管理这些设备的内存、队列、权限和错误恢复。
+
+\begin{longtable}{p{0.18\linewidth}p{0.35\linewidth}p{0.35\linewidth}}
+\toprule
+加速器 & 硬件特点 & OS/驱动任务 \\
+\midrule
+GPU & 命令队列、显存、shader、display engine & 显存分配、命令提交、fence、hang recovery \\
+NPU & 固定算子或矩阵加速 & 模型 buffer、DMA、调度、功耗控制 \\
+DSP & 实时信号处理 & firmware 加载、共享内存、低延迟消息 \\
+crypto engine & AES、SHA、公钥或随机数 & 密钥边界、异步请求、熵质量 \\
+video codec & 编解码帧流 & buffer 队列、格式协商、同步 \\
+\bottomrule
+\end{longtable}
+
+加速器驱动的核心不是“调用硬件算一下”，而是管理异步命令。应用提交命令后，设备稍后完成；期间 buffer 不能释放，权限不能越界，错误要能回报，进程退出要能回收。GPU hang recovery 和块设备 reset 在结构上很像：停止新请求、处理旧请求、重建硬件状态、把结果传播给等待者。
+
+\subsection{DRAM 细节：bank、row、refresh 和 ECC}
+
+DRAM 不是一个简单数组。它由 channel、rank、bank、row、column 组织。访问前可能要激活某一行，读写后需要保持和预充电；电荷会泄漏，所以必须刷新。内存控制器负责把 CPU 请求调度到 DRAM 命令序列，并尽量利用行命中和并行 bank。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+DRAM 概念 & 含义 & OS/系统影响 \\
+\midrule
+channel & 独立内存通路 & 多通道提升带宽，插条位置影响性能 \\
+bank & 可并行访问的内部区域 & 访问模式影响延迟和带宽 \\
+row buffer & 已激活行的缓存 & 顺序和局部访问更快 \\
+refresh & 周期性恢复电荷 & 极端实时系统要考虑刷新抖动 \\
+ECC & 检测或纠正位错误 & 错误日志、页下线、可靠性报告 \\
+\bottomrule
+\end{longtable}
+
+ECC 错误是硬件可靠性进入 OS 的典型入口。可纠正错误不一定立即造成程序失败，但频繁出现在同一页或同一 DIMM 上就可能预示硬件退化。内核可以记录物理地址、页、DIMM 和错误类型，并在必要时 soft offline 某页。
+
+\subsection{内存类型：SRAM、DRAM、NAND、NOR、NVRAM、HBM}
+
+不同存储硬件的速度、寿命、随机访问能力和持久性完全不同。OS 之所以有页缓存、块层、文件系统、wear leveling、DAX、swap 和日志，是因为硬件不是一个统一的“保存字节”的盒子。
+
+\begin{longtable}{p{0.18\linewidth}p{0.35\linewidth}p{0.35\linewidth}}
+\toprule
+存储类型 & 特点 & OS 设计点 \\
+\midrule
+SRAM & 快、贵、容量小 & cache、片上 SRAM、启动早期栈 \\
+DRAM & 易失、容量大、随机访问 & 物理页、NUMA、page cache、DMA buffer \\
+NOR Flash & 可随机读取、擦写慢 & 固件存储、嵌入式启动镜像 \\
+NAND Flash & 块擦除、页写入、有限寿命 & FTL、TRIM、写放大、坏块管理 \\
+NVRAM/PMem & 持久且接近内存访问模型 & DAX、cache flush、持久化顺序 \\
+HBM & 高带宽、封装近计算单元 & GPU/AI 加速器、带宽敏感任务 \\
+\bottomrule
+\end{longtable}
+
+持久内存最能说明“内存”和“存储”边界会变化。CPU 可能像访问内存一样访问持久介质，但 CPU cache 仍然是易失的。程序要保证崩溃后一致，仍然需要 flush cache line、写持久化屏障和设计日志协议。
+
+\subsection{CXL 和内存扩展}
+
+CXL 让 CPU 和设备之间可以进行更紧密的缓存一致性和内存语义互联。它可以用于内存扩展、内存池化和加速器共享内存。对 OS 来说，问题不是“多了一根更快的线”，而是出现了新的内存层级、距离、可靠性和热插拔模型。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+CXL 场景 & 带来的能力 & OS 问题 \\
+\midrule
+内存扩展 & 增加容量 & NUMA 距离、页分配策略、回收优先级 \\
+内存池化 & 多主机共享资源池 & 隔离、热插拔、故障域 \\
+加速器一致内存 & CPU 和设备共享数据结构 & cache 一致性、权限、同步模型 \\
+\bottomrule
+\end{longtable}
+
+当内存速度和可靠性不再统一时，OS 需要把“哪类页放在哪类内存”变成策略：热页放近处，冷页放远处；内核关键对象放可靠内存；大缓存可放扩展内存；故障设备上的页要迁移或下线。
+
+\subsection{系统互联和外设总线}
+
+x86-64 PC 和服务器常见 PCIe、USB、SATA、SMBus、LPC、CXL 等互联。不同总线的差别在于速度、主从关系、枚举能力、热插拔能力、事务模型和错误报告。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+互联 & 常见用途 & OS 关注点 \\
+\midrule
+PCIe & GPU、NVMe、网卡、加速器 & 枚举、BAR、MSI-X、AER、IOMMU \\
+USB & 外接设备、HID、存储、音频 & 热插拔、描述符、URB、权限 \\
+SMBus/I2C/SPI & 传感器、PMIC、触摸、Flash & ACPI 描述、低速事务、同步访问 \\
+UART & 串口控制台、调试、嵌入式通信 & early console、日志、恢复入口 \\
+GPIO/PWM/ADC & 板级控制、LED、风扇、按键、采样 & pinctrl、sysfs 或字符设备、权限 \\
+\bottomrule
+\end{longtable}
+
+总线决定驱动模型。PCIe 设备通常能自描述并可枚举；I2C/SMBus 设备常不能完整自描述，在 x86-64 平台上通常由 ACPI 告诉内核地址、硬件 ID 和中断资源；USB 设备热插拔频繁，驱动必须随时处理断开；UART 简单可靠，所以常作为最早日志通道。
+
+\subsection{PCIe 深讲：配置空间、BAR、MSI-X 和 AER}
+
+PCIe 设备被发现时，内核读取配置空间，识别 vendor ID、device ID、class code 和 capability。BAR 告诉内核设备需要的 MMIO 或 I/O 地址窗口。MSI/MSI-X 让设备通过内存写消息触发中断。AER 报告链路和事务错误。
+
+\begin{lstlisting}
+PCIe probe evidence:
+  config space says what device is
+  BAR says where registers live
+  DMA mask says what addresses device can reach
+  MSI-X table says how many interrupt vectors it can use
+  AER status says whether link or transaction errors occurred
+\end{lstlisting}
+
+NVMe 和高端网卡会使用多个 MSI-X vector，让不同队列绑定不同 CPU，减少锁竞争并提高缓存局部性。若所有中断都落到一个 CPU，吞吐可能上不去；若 IRQ affinity 和 NUMA 不匹配，数据会跨节点移动。硬件队列、CPU 拓扑和调度策略必须一起看。
+
+\subsection{USB 深讲：描述符、端点和传输类型}
+
+USB 是主机控制的层级总线。设备插入后，主机读取设备描述符、配置描述符、接口描述符和端点描述符，然后选择配置并绑定驱动。端点支持控制、批量、中断和等时传输。键盘鼠标常用 HID interrupt endpoint，U 盘使用 bulk，摄像头和音频会用等时或批量流。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+传输类型 & 特点 & 典型设备 \\
+\midrule
+control & 用于枚举和控制命令 & 所有 USB 设备 \\
+bulk & 保证可靠性，延迟不固定 & 存储、打印、部分网卡 \\
+interrupt & 周期轮询，小数据、低延迟 & 键盘、鼠标、手柄 \\
+isochronous & 保证带宽，不重传 & 音频、视频采集 \\
+\bottomrule
+\end{longtable}
+
+USB 的关键是异步和热插拔。一个 URB 提交后，设备可能完成、失败、超时，也可能被拔掉。驱动必须处理用户还持有文件描述符但设备已经消失的情况。正确行为不是崩溃，而是让后续操作返回明确错误，并释放内核资源。
+
+\subsection{低速板级总线：I2C、SPI、GPIO、PWM、ADC}
+
+很多“计算机硬件”不是高速设备，而是低速控制和传感器。I2C 连接温度传感器、PMIC、触摸控制器、摄像头配置芯片；SPI 连接 Flash、显示屏、传感器；GPIO 读取按键、控制 LED、复位设备；PWM 控制风扇、背光和电机；ADC 采样电压和传感器信号。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+硬件 & 常见用途 & OS 抽象 \\
+\midrule
+I2C & 低速寄存器访问，多从设备共享两根线 & adapter、client、regmap \\
+SPI & 全双工同步串行，常用于 Flash 和屏幕 & controller、device、transfer \\
+GPIO & 单个数字输入输出引脚 & pinctrl、gpiod、interrupt line \\
+PWM & 占空比控制 & 背光、风扇、电机、蜂鸣器 \\
+ADC/DAC & 模拟和数字转换 & 传感器、电池电压、音频或工业控制 \\
+\bottomrule
+\end{longtable}
+
+这些硬件让 OS 必须理解“板级设计”。同一类 x86-64 主板也可能接不同触摸芯片、传感器、EC、风扇控制器或背光控制器。内核镜像相同，但 ACPI 描述不同。驱动不能假设某个 GPIO 或 IRQ 一定存在，必须从固件描述中获取资源。
+
+\subsection{存储硬件一：机械硬盘}
+
+机械硬盘由盘片、磁头、主轴、电机、缓存和控制器组成。随机 I/O 慢，因为磁头要寻道，盘片要旋转到目标扇区；顺序 I/O 快，因为磁头移动少、预读有效。OS 早期的 I/O 调度大量考虑合并和排序，就是为了减少寻道。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+HDD 事实 & 软件含义 & OS 对策 \\
+\midrule
+寻道和旋转延迟高 & 随机小 I/O 代价大 & 合并、排序、预读 \\
+顺序吞吐较好 & 连续文件和大块读写有优势 & extent、readahead、writeback \\
+设备缓存易失 & 写完成不等于落盘 & flush、FUA、fsync \\
+坏扇区可能出现 & 读写错误需要上报和重试 & SMART、错误日志、文件系统校验 \\
+\bottomrule
+\end{longtable}
+
+理解 HDD 后才能理解为什么传统文件系统强调布局、块组、预分配和顺序写。即使 SSD 普及，这些概念仍有价值，因为“把很多小随机操作变成批量顺序操作”也是现代存储和网络系统的通用优化。
+
+\subsection{存储硬件二：SSD、NAND 和 FTL}
+
+SSD 内部是 NAND Flash、控制器、DRAM 缓存、固件和 FTL。NAND 不能像 DRAM 一样随意覆盖单个字节，通常按页写、按块擦除。FTL 把主机看到的逻辑块地址映射到内部物理页，并处理垃圾回收、磨损均衡和坏块。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+NAND/SSD 事实 & 影响 & OS 接口 \\
+\midrule
+页写块擦 & 覆盖写会变成内部搬迁 & 写放大、TRIM/discard \\
+擦写寿命有限 & 热点写会磨损介质 & wear leveling、SMART 寿命指标 \\
+内部并行通道 & 队列深度影响吞吐 & blk-mq、多队列、异步 I/O \\
+掉电保护差异 & 缓存中的数据可能丢失 & flush、FUA、文件系统日志 \\
+\bottomrule
+\end{longtable}
+
+所以 \code{fsync} 的成本不是内核故意慢，而是它要求存储控制器把易失缓存和内部映射状态推进到崩溃后可恢复点。不同 SSD 的掉电保护能力不同，数据库和文件系统必须把硬件承诺纳入设计。
+
+\subsection{NVMe：队列化存储协议}
+
+NVMe 面向 PCIe 和多核系统设计。它使用 submission queue 和 completion queue，每个队列可以绑定一个或一组 CPU。驱动把命令写入提交队列，敲 doorbell；设备完成后写完成队列并触发 MSI-X。
+
+\begin{lstlisting}
+NVMe read path:
+  filesystem maps file offset to block
+  block layer builds request
+  nvme driver fills command in submission queue
+  driver rings doorbell MMIO
+  controller DMA reads/writes data
+  controller writes completion entry
+  MSI-X interrupt wakes completion path
+\end{lstlisting}
+
+NVMe 让存储从“一个设备一把大锁”变成“多队列、多 CPU、批量 completion”。OS 的块层因此发展出 blk-mq。性能测试时要看队列深度、CPU 亲和性、NUMA、IOMMU、文件系统、page cache 和设备固件，而不能只看应用发了多少 \code{read}。
+
+\subsection{移动存储：eMMC、UFS、SD 卡}
+
+手机、平板和嵌入式设备常用 eMMC、UFS 或 SD 卡。它们有不同的命令集、队列能力、电源状态和可靠性。UFS 支持更高并行和性能，eMMC 更简单，SD 卡质量差异极大。移动系统还必须考虑功耗、热限制和突然断电。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+设备 & 特点 & OS 关注点 \\
+\midrule
+eMMC & 集成控制器和 NAND，移动常见 & boot partition、RPMB、寿命、flush \\
+UFS & 高性能移动存储，多队列能力更强 & command queue、电源模式、热管理 \\
+SD 卡 & 可插拔、质量差异大 & 热插拔、写保护、错误恢复、超时 \\
+\bottomrule
+\end{longtable}
+
+嵌入式产品的文件系统选择必须考虑存储特性。日志策略、写放大、断电保护、只读分区、A/B 更新、校验和坏块管理都不是纯软件偏好，而是对 Flash 介质和用户拔电行为的响应。
+
+\subsection{网络硬件：PHY、MAC、队列和 offload}
+
+有线网卡通常分为 PHY 和 MAC。PHY 处理物理信号，MAC 处理以太帧。现代 NIC 有 RX/TX ring、多队列、RSS、checksum offload、TSO/GSO、GRO、VLAN、时间戳和过滤规则。无线网卡还要处理射频、信道、加密、漫游、省电和固件。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+网卡能力 & 目的 & OS 影响 \\
+\midrule
+RSS & 把不同流分到不同 RX 队列 & 多核并行、IRQ affinity \\
+interrupt moderation & 合并中断 & 吞吐提升但延迟增加 \\
+checksum offload & 硬件计算校验和 & 抓包显示和 skb 标志要理解 \\
+TSO/GSO & 大段交给硬件分片 & 减少 CPU 开销，改变包可见粒度 \\
+hardware timestamp & 精确打时间戳 & PTP、金融交易、工业控制 \\
+\bottomrule
+\end{longtable}
+
+网络性能诊断必须同时看协议栈和硬件。TCP 拥塞控制、socket buffer、NAPI budget、队列深度、IRQ affinity、NUMA、本机防火墙、网卡 offload 和交换机链路都可能是瓶颈。
+
+\subsection{无线硬件：Wi-Fi、蓝牙、基带和射频}
+
+无线设备不是“没有线的网卡”这么简单。Wi-Fi 驱动常与设备固件协作，固件负责扫描、连接、加密、速率控制或省电的一部分。蓝牙涉及控制器、HCI、配对、低功耗和音频 profile。手机基带通常是独立处理器，和应用处理器通过共享内存、PCIe、USB 或专用链路通信。
+
+\begin{longtable}{p{0.2\linewidth}p{0.35\linewidth}p{0.33\linewidth}}
+\toprule
+无线部件 & 特点 & OS/安全关注 \\
+\midrule
+Wi-Fi firmware & 处理射频和协议细节 & 固件加载、崩溃恢复、监管域 \\
+Bluetooth controller & HCI 命令和事件 & 配对权限、音频延迟、共存 \\
+cellular modem & 独立基带系统 & 隔离、共享内存、SIM、紧急呼叫 \\
+RF front-end & 功放、滤波、天线切换 & 信号质量、功耗、SAR 限制 \\
+\bottomrule
+\end{longtable}
+
+无线问题经常无法只靠应用日志解释。链路质量、射频干扰、固件状态、省电模式、监管域限制、天线设计和驱动队列都可能参与。OS 要提供足够的统计和错误事件，让问题能从“网慢”拆成可验证路径。
+
+\subsection{显示硬件：从 framebuffer 到现代 DRM/KMS}
+
+最简单的显示模型是 framebuffer：内存中一块像素数组被显示控制器按刷新率扫描输出。现代图形系统把渲染和显示分开：GPU 渲染到 buffer，display engine 负责 scanout，compositor 协调窗口合成，KMS 设置模式、plane、CRTC、connector 和 page flip。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+显示概念 & 含义 & OS 关系 \\
+\midrule
+framebuffer & 像素所在内存区域 & early console、简单显示 \\
+plane & 可叠加的显示层 & cursor、overlay、视频平面 \\
+CRTC & 扫描输出时序单元 & 分辨率、刷新率、vblank \\
+connector & HDMI、DP、eDP、DSI 等输出 & 热插拔、EDID、链路训练 \\
+fence & buffer 使用完成同步点 & 防止显示未完成 buffer 被复用 \\
+\bottomrule
+\end{longtable}
+
+显示错误可以来自像素格式、stride、cache flush、EDID 错误、vblank 时序、GPU 命令超时、显示链路训练失败或电源域没恢复。OS 图形栈看似复杂，是因为它要同时管理内存、异步命令、用户权限、实时刷新和热插拔。
+
+\subsection{GPU 内存和命令提交}
+
+GPU 驱动要管理显存或共享内存、页表、命令 buffer、同步对象和错误恢复。用户进程不能把任意命令直接丢给硬件，驱动必须校验命令、限制访问范围、管理地址空间，并在 GPU 挂起时回收或重置。
+
+\begin{lstlisting}
+GPU command lifecycle:
+  userspace allocates buffer object
+  userspace records command buffer
+  driver validates referenced buffers
+  driver maps buffers into GPU virtual address space
+  driver submits command to hardware queue
+  GPU executes asynchronously
+  fence signals completion
+  buffer can be reused or displayed
+\end{lstlisting}
+
+这条路径和 NVMe、网卡类似：都是队列、DMA、completion、权限和 reset。区别是 GPU 命令更复杂，可能引用大量 buffer，且错误可能来自用户提交的 shader 或命令序列。因此 GPU 驱动既是设备驱动，也是用户态图形 API 与硬件之间的安全边界。
+
+\subsection{音频硬件：codec、DMA ring 和低延迟}
+
+音频链路包括应用、音频服务、内核音频框架、DMA buffer、音频控制器、codec、DAC/ADC、功放和扬声器或麦克风。播放时设备周期性从 ring buffer 取 PCM 样本；录音时设备周期性写入 ring buffer。每个 period 完成时触发中断或通知。
+
+\begin{lstlisting}
+audio playback timing:
+  user fills period N
+  DMA engine reads period N
+  hardware plays samples
+  period interrupt wakes refill
+  user must fill period N+K before underrun
+\end{lstlisting}
+
+音频的核心指标不是最大吞吐，而是稳定低延迟。buffer 太小容易 underrun，产生爆音；buffer 太大延迟高，影响实时通话和乐器输入。调度延迟、CPU 省电状态、锁竞争、中断屏蔽和驱动 period 设置都会影响音频体验。
+
+\subsection{摄像头和图像链路}
+
+x86-64 PC 上的摄像头路径通常是 USB UVC 摄像头或 PCIe 采集卡。USB 摄像头把传感器读出、压缩或格式转换封装在设备内部，通过 xHCI endpoint 把帧传给主机；PCIe 采集卡通过 BAR、MSI-X 和 DMA ring 交付帧。内核侧的核心问题仍然是 buffer 生命周期、像素格式、时间戳、同步和权限。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+摄像头部件 & 作用 & OS/驱动问题 \\
+\midrule
+USB UVC device & 采集、编码或格式转换 & endpoint、带宽、帧率、断连恢复 \\
+PCIe capture card & 高带宽图像输入 & BAR、MSI-X、DMA ring、IOMMU \\
+xHCI host controller & USB 传输调度 & completion、带宽预算、错误恢复 \\
+V4L2 buffer & 内核和用户共享帧 & mmap、DMA-BUF、同步和权限 \\
+\bottomrule
+\end{longtable}
+
+摄像头说明外设常常不是单个设备，而是一条流水线。任何一个环节的时钟、复位、电源、buffer 或格式不匹配都会导致无图、花屏、丢帧或延迟。驱动模型必须能表达 pipeline 中多个子设备之间的依赖。
+
+\subsection{输入设备：键盘、鼠标、触摸屏和传感器}
+
+输入设备把物理世界事件转换成内核事件。键盘可能走 USB HID 或矩阵扫描；触摸屏可能通过 I2C 报告多点坐标；加速度计、陀螺仪、光线传感器、温度传感器通过 I2C/SPI/ADC 周期采样。OS 要把这些不同硬件统一成输入事件、传感器数据和权限控制。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+设备 & 硬件事件 & OS 抽象 \\
+\midrule
+键盘 & key matrix 或 HID report & key code、tty、快捷键 \\
+鼠标 & 相对位移、按键、滚轮 & pointer event、桌面输入 \\
+触摸屏 & 多点坐标、压力、手势原始数据 & multi-touch slot、输入子系统 \\
+IMU & 加速度、角速度 & sensor hub、时间戳、校准 \\
+温度传感器 & 芯片或环境温度 & thermal zone、风扇和降频策略 \\
+\bottomrule
+\end{longtable}
+
+输入是安全边界。键盘事件可能包含密码；传感器数据可能泄露用户行为；触摸注入可能影响授权操作。桌面和移动 OS 会对输入设备、后台读取和辅助功能接口施加权限，不只是因为用户体验，而是因为输入数据本身敏感。
+
+\subsection{EC、BMC 和管理平面}
+
+很多机器有 OS 之外的控制器。笔记本有 EC，管理键盘热键、电池、风扇和电源状态。服务器有 BMC，可在主 CPU 关机时远程开关机、读传感器、控制风扇、记录硬件错误、提供远程控制台。它们有自己的固件、网络接口和权限边界。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+控制器 & 能做什么 & OS 关注点 \\
+\midrule
+EC & 电池、键盘热键、风扇、盖合状态 & ACPI 事件、热管理、休眠唤醒 \\
+BMC & 带外管理、电源、传感器、KVM & 安全隔离、硬件日志、远程恢复 \\
+sensor hub & 聚合低功耗传感器 & 时间戳、批量上报、省电 \\
+secure controller & 密钥、指纹、安全启动辅助 & 权限、固件更新、攻击面 \\
+\bottomrule
+\end{longtable}
+
+BMC 尤其值得警惕。它常有独立网络栈和高权限硬件访问能力，即使主 OS 很安全，BMC 漏洞也可能影响整机。生产系统的安全审计不能只看 Linux 用户态和内核，也要看固件、BMC、管理网和供应链更新。
+
+\subsection{安全硬件：TPM、TEE、熔丝和随机数}
+
+安全硬件的目标是提供软件难以伪造或窃取的根。TPM 可以保存密钥、记录启动测量并做远程证明；TEE 提供隔离执行环境；芯片熔丝保存不可逆配置；硬件随机数发生器提供熵；IOMMU 限制设备 DMA；CPU 权限位限制代码执行和内存访问。
+
+\begin{longtable}{p{0.2\linewidth}p{0.35\linewidth}p{0.33\linewidth}}
+\toprule
+安全硬件 & 提供的根 & OS 使用方式 \\
+\midrule
+TPM & 密钥和测量寄存器 & measured boot、磁盘解锁、证明 \\
+Secure Boot & 启动组件签名验证 & 防止未授权内核或 bootloader \\
+TEE & 隔离执行环境 & DRM、支付、密钥操作、远程证明 \\
+fuse/OTP & 不可变配置或唯一 ID & 防回滚、设备身份、启动策略 \\
+TRNG & 硬件熵源 & 内核随机池、密钥生成 \\
+\bottomrule
+\end{longtable}
+
+安全硬件不是万能。Secure Boot 只能约束启动链，不保证运行中的内核无漏洞；TPM 能保护密钥不直接导出，但不能阻止已经授权的恶意软件请求解密；TEE 可能被侧信道或固件漏洞影响。OS 要把安全硬件放进整体威胁模型，而不是把它当作开关。
+
+\subsection{虚拟化硬件和嵌套地址翻译}
+
+虚拟化硬件让 hypervisor 能运行 guest OS，同时拦截敏感操作。CPU 提供 VM entry/exit、虚拟中断、二级页表和设备直通支持。二级页表把 guest physical address 再翻译到 host physical address；IOMMU 把直通设备限制在 guest 拥有的内存范围。
+
+\begin{lstlisting}
+guest load:
+  guest virtual -> guest physical by guest page table
+  guest physical -> host physical by second-stage page table
+  cache/TLB may cache combined translation
+  violation causes VM exit or injected page fault
+\end{lstlisting}
+
+虚拟化让“物理地址”这个词变得分层。guest 看到的物理地址并不一定是机器真实物理地址。性能问题也分层：guest page fault、EPT violation、host reclaim、vCPU 调度、虚拟中断和设备后端都可能参与。
+
+\subsection{时间硬件：TSC、HPET、RTC 和 PTP}
+
+OS 需要多种时间。RTC 保存墙上时间，断电后靠电池维持；TSC 提供高频单调计数；HPET、local APIC timer 和 TSC deadline timer 提供定时事件；网卡硬件时间戳支持 PTP 精确同步。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+时间硬件 & 用途 & 风险 \\
+\midrule
+RTC & 启动时读取日期时间 & 电池耗尽、时间错误 \\
+TSC/counter & 高速单调时间源 & 频率不稳、跨 CPU 不同步的旧系统 \\
+timer interrupt & 调度 tick、hrtimer、超时 & 中断延迟、tickless 复杂性 \\
+PTP clock & 网络硬件时间戳 & 驱动和交换机配置错误 \\
+watchdog & 检测无进展 & 误触发或未覆盖死锁路径 \\
+\bottomrule
+\end{longtable}
+
+时间错误会破坏很多系统：证书验证、日志排序、数据库事务、分布式锁、TCP 重传、调度统计和性能分析。OS 要区分 wall time 与 monotonic time，避免时间被 NTP 调整后让超时计算倒退。
+
+\subsection{热管理：传感器、风扇、降频和关机}
+
+芯片功耗变成热。温度过高会造成错误、老化甚至损坏。硬件提供温度传感器、功耗计数器、风扇控制、频率电压调节和紧急关机。OS 的 thermal framework 把传感器、冷却设备和策略连接起来。
+
+\begin{lstlisting}
+thermal control loop:
+  read temperature sensor
+  compare with trip points
+  choose cooling action
+  reduce CPU/GPU frequency or increase fan
+  if critical threshold reached, shutdown
+\end{lstlisting}
+
+热管理会直接改变性能。基准测试若不记录温度、频率和功耗限制，结果不可解释。移动设备上，持续 GPU/NPU 负载可能让 CPU 被迫降频；服务器上，风道堵塞可能让所有任务变慢。OS 性能诊断必须把热状态作为一等证据。
+
+\subsection{硬件错误：从静默错误到可恢复错误}
+
+硬件会失败。内存可能 bit flip，PCIe 可能链路错误，NVMe 可能超时，网卡可能 firmware crash，GPU 可能 hang，风扇可能停转，电池可能过热。OS 的目标不是假装硬件完美，而是尽量把错误变成可记录、可隔离、可恢复或可明确失败的状态。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+错误类型 & 硬件证据 & OS 行为 \\
+\midrule
+ECC correctable & syndrome、物理地址、DIMM & 记录、计数、页下线候选 \\
+PCIe AER & requester、status、severity & reset 设备、降级或上报 \\
+NVMe timeout & command id、queue id、status & abort、reset controller、失败请求 \\
+GPU hang & fence timeout、engine state & reset engine、杀死 guilty context \\
+thermal critical & sensor trip & 降频、关机、记录事件 \\
+\bottomrule
+\end{longtable}
+
+可恢复错误也要严肃对待。一次 ECC 可纠正错误可能只是偶发，重复错误可能是内存条损坏；一次 PCIe correctable error 可能无害，持续出现可能是线缆、插槽或信号完整性问题。OS 要提供统计和时间序列，而不仅是打印一句日志。
+
+\subsection{硬件观测：从命令输出反推机器结构}
+
+学习硬件要能落到证据。在 Linux 上，下面命令能把硬件描述、驱动绑定、中断、内存、块设备、网络和电源热状态暴露出来。
+
+\begin{lstlisting}
+lscpu
+lsmem
+numactl --hardware
+lspci -nn
+lspci -vv -s 0000:xx:yy.z
+lsusb -t
+cat /proc/iomem
+cat /proc/interrupts
+cat /proc/timer_list
+find /sys/bus/pci/devices -maxdepth 2 -type l
+find /sys/class/thermal -maxdepth 2 -type f
+find /sys/class/power_supply -maxdepth 2 -type f
+dmesg | grep -i -E 'acpi|efi|pci|aer|nvme|iommu|tpm|thermal|edac'
+\end{lstlisting}
+
+观察报告不要只贴输出，要回答问题：CPU 有几个 NUMA node；内存是否有可见错误报告；NVMe 挂在哪个 PCIe 路径；网卡用了几个 MSI-X；IOMMU 是否启用；USB 设备挂在哪个 root hub；温度传感器如何命名；启动日志里固件给了哪些表。
+
+\subsection{案例：一次开机失败怎么分层排查}
+
+假设机器按下电源后无法进入系统。不要直接说“系统坏了”。按硬件启动链分层：
+
+\begin{enumerate}
+\tightlist
+\item 无任何灯和风扇：先查电源、主板供电、PMIC、保险丝或电池。
+\item 有电但无画面：查复位、DRAM 初始化、固件、显示链路或串口日志。
+\item 固件界面可见但无启动项：查存储枚举、UEFI NVRAM、启动顺序。
+\item bootloader 可见但内核不启动：查内核镜像、initrd、命令行、内存地图。
+\item 内核启动后 panic：查 early console、异常寄存器、页表、驱动 probe。
+\item 进入用户态失败：查 rootfs、init、动态链接器、权限和挂载。
+\end{enumerate}
+
+这就是“从硬件到 OS”的排查路径。每一层都要找证据：电源灯、串口、BMC 事件、固件日志、内核 early printk、\code{dmesg}、设备枚举和文件系统检查。
+
+\subsection{案例：设备明明插上了，为什么 OS 看不到}
+
+设备不可见也要分层。PCIe 设备看不到，可能是插槽没供电、reset 没释放、链路训练失败、BIOS/UEFI 禁用、资源分配失败、热插拔事件丢失或设备损坏。USB 设备看不到，可能是线缆、供电、hub、枚举描述符错误或驱动拒绝。I2C/SMBus 设备看不到，可能是 ACPI 没描述、地址错、上拉电阻问题或设备还在复位。
+
+\begin{lstlisting}
+device invisible checklist:
+  is power enabled?
+  is clock enabled?
+  is reset deasserted?
+  does bus enumerate it?
+  does firmware describe it?
+  did driver probe run?
+  did probe fail and unwind?
+  are permissions hiding it from user space?
+\end{lstlisting}
+
+这个清单比“重装驱动”更可靠，因为它沿着硬件事实走。驱动只是链条最后几环之一。若设备没有供电或总线根本枚举不到，再好的驱动也不会被调用。
+
+\subsection{案例：一次 NVMe 超时}
+
+NVMe 超时通常表现为请求长时间没有 completion。排查时要同时看块层、驱动、PCIe、IOMMU、电源管理和设备固件。
+
+\begin{lstlisting}
+NVMe timeout path:
+  block request issued
+  command placed in submission queue
+  doorbell written
+  no completion arrives before timeout
+  driver tries abort
+  if abort fails, reset controller
+  failed requests complete with error
+  filesystem or application observes EIO or delay
+\end{lstlisting}
+
+可能原因包括：设备固件挂起，PCIe 链路错误，APST 省电状态恢复失败，IOMMU fault，MSI-X 中断丢失，队列内存损坏，电源不足或温度过高。一次超时不是单纯“磁盘慢”，而是一条异步硬件队列没有收敛。
+
+\subsection{案例：网络延迟突然升高}
+
+网络延迟升高可能来自应用、协议栈、网卡、PCIe、CPU 调度、电源和交换机。硬件方向的典型检查包括：网卡是否降速；是否发生 RX/TX error；IRQ 是否集中在一个 CPU；NAPI poll 是否积压；CPU 是否降频；网卡 interrupt moderation 是否过大；是否跨 NUMA 访问。
+
+\begin{lstlisting}
+network latency evidence:
+  ethtool <dev>
+  ethtool -S <dev>
+  cat /proc/interrupts
+  mpstat -P ALL 1
+  perf top or perf record
+  tc -s qdisc show
+  ss -tin
+\end{lstlisting}
+
+如果只看应用日志，可能只看到“请求慢”。把硬件路径展开后，才能判断是 TCP 重传、队列积压、中断亲和性、CPU 频率、网卡固件还是交换机链路造成的。
+
+\subsection{案例：屏幕花屏或黑屏}
+
+显示故障可以来自 GPU 渲染、buffer 格式、显示控制器、连接器、线缆、显示器、背光或电源域。黑屏不等于系统死机，系统可能仍在运行，只是 scanout 失败。串口、SSH、键盘灯和日志能帮助区分。
+
+\begin{lstlisting}
+display failure path:
+  is GPU driver loaded?
+  did modeset succeed?
+  is connector detected?
+  did EDID parse?
+  is framebuffer allocated?
+  did page flip complete?
+  is backlight enabled?
+  did GPU hang or reset?
+\end{lstlisting}
+
+花屏常见于像素格式、stride、cache 同步或显存损坏；黑屏可能是 EDID、链路训练、背光、电源域或 GPU hang。图形系统复杂，是因为它跨 CPU、GPU、显示控制器、内存、同步和用户态合成器。
+
+\subsection{案例：音频爆音和摄像头丢帧}
+
+音频爆音通常来自 buffer underrun：设备按固定速率取样本，但用户态或内核没有及时填充。原因可能是调度延迟、CPU 深睡眠、period 太小、锁竞争、中断屏蔽或音频服务负载过高。摄像头丢帧类似：传感器按帧率输出，ISP 和 DMA 必须及时提供 buffer。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 硬件本质 & 排查证据 \\
+\midrule
+音频爆音 & DMA ring 没及时补数据 & underrun 计数、调度延迟、period 设置 \\
+摄像头丢帧 & frame buffer 不足或 pipeline 堵塞 & V4L2 drop、CSI error、ISP 日志 \\
+视频撕裂 & page flip 不在 vblank 边界 & compositor 日志、vblank 计数 \\
+输入延迟 & 中断、调度或合成延迟 & evtest 时间戳、trace、CPU 频率 \\
+\bottomrule
+\end{longtable}
+
+这些设备说明实时系统的难点不是平均吞吐，而是 deadline。只要偶尔超过周期，就会产生用户可见问题。OS 必须用调度、优先级、buffer 深度和电源策略共同控制抖动。
+
+\subsection{案例：温度上升后的性能坍塌}
+
+程序开始运行很快，几分钟后变慢，常见原因是热限制。CPU 或 GPU 温度达到阈值后，thermal governor 要求降低频率，PMIC 或固件也可能施加功耗上限。风扇策略、散热条件和环境温度都会改变结果。
+
+\begin{lstlisting}
+thermal performance chain:
+  workload increases switching activity
+  power rises
+  temperature sensor crosses trip point
+  governor reduces frequency or voltage
+  scheduler sees lower capacity
+  application throughput drops
+\end{lstlisting}
+
+因此性能报告必须记录温度、频率、governor、功耗限制和持续时间。只跑一次短 benchmark 得到的峰值，不能代表长期稳定性能。操作系统要把硬件热状态纳入调度和能耗模型，尤其在移动设备和异构核心系统中。
+
+\subsection{源码级入口：从 Linux 看硬件对象}
+
+下面列出读 Linux 内核时常见的硬件对象入口。这里不要求一次读完，而是给读者建立“概念到源码路径”的索引。
+
+\begin{longtable}{p{0.28\linewidth}p{0.3\linewidth}p{0.3\linewidth}}
+\toprule
+硬件/机制 & 典型源码路径 & 先看什么 \\
+\midrule
+PCI core & \filepath{drivers/pci/} & 枚举、BAR、MSI、AER \\
+USB core & \filepath{drivers/usb/core/} & 描述符、URB、hub、热插拔 \\
+DMA API & \filepath{kernel/dma/} & map/unmap、coherent、IOMMU \\
+IOMMU & \filepath{drivers/iommu/} & domain、IOVA、fault \\
+clock framework & \filepath{drivers/clk/} & prepare、enable、rate \\
+regulator & \filepath{drivers/regulator/} & 电源轨、约束、enable \\
+thermal & \filepath{drivers/thermal/} & thermal zone、cooling device \\
+DRM/KMS & \filepath{drivers/gpu/drm/} & plane、CRTC、connector、fence \\
+ALSA HD-audio & \filepath{sound/pci/hda/} & codec、stream、DMA buffer \\
+V4L2/media & \filepath{drivers/media/} & subdev、pipeline、buffer queue \\
+EDAC/MCE & \filepath{drivers/edac/}、\filepath{arch/x86/kernel/cpu/mce/} & 内存错误和机器检查 \\
+BMC/IPMI & \filepath{drivers/char/ipmi/} & 带外管理接口 \\
+\bottomrule
+\end{longtable}
+
+阅读源码时要抓四件事：设备对象在哪里创建，资源在哪里申请，失败路径如何回滚，异步 completion 如何回到上层。只看 happy path 会低估驱动复杂度。
+
+\subsection{最小实验：把本机硬件做成报告}
+
+读者可以用一台 Linux 机器做硬件报告。报告不追求设备越贵越好，而追求证据完整。
+
+\begin{enumerate}
+\tightlist
+\item 画出 CPU、内存、PCIe、USB、存储、网络、显示、电源热管理的整机图。
+\item 用 \code{lscpu} 和 \code{numactl} 说明 CPU 拓扑、cache 层级和 NUMA。
+\item 用 \code{lspci -vv} 找一个 NVMe 或网卡，标出 BAR、MSI-X、driver、IOMMU group。
+\item 用 \code{cat /proc/interrupts} 找到该设备中断落在哪些 CPU。
+\item 用 \code{lsusb -t} 找到 USB 拓扑和速率。
+\item 用 \code{find /sys/class/thermal} 找到温度传感器和 cooling device。
+\item 用 \code{dmesg} 找启动中的 ACPI/EFI/PCI/IOMMU/TPM/NVMe 证据。
+\item 任选一个故障假设，写出从硬件到 OS 的排查路径。
+\end{enumerate}
+
+这个实验的评分重点不是命令数量，而是能否把命令输出解释成硬件结构。例如看到 MSI-X vector，不只写“有中断”，还要说明多队列设备如何用这些 vector 分散 completion；看到 IOMMU group，不只写“启用了 IOMMU”，还要说明设备隔离边界。
+
+\subsection{硬件概念的学习顺序}
+
+如果读者觉得硬件太多，可以按下面顺序学习。每一步都要能画图、能解释 OS 用途、能说出一个失败案例。
+
+\begin{enumerate}
+\tightlist
+\item 位、门电路、寄存器、时钟、状态机。
+\item CPU 取指执行、寄存器、栈、异常和特权级。
+\item 物理地址、虚拟地址、页表、TLB、cache。
+\item MMIO、总线、中断、DMA、IOMMU。
+\item 固件、启动链、UEFI 内存地图、ACPI。
+\item PCIe、USB、I2C/SPI/GPIO 等设备发现方式。
+\item 存储、网络、显示、音频、摄像头等端到端 I/O。
+\item 电源、时钟、热管理、休眠唤醒。
+\item 安全硬件、管理控制器、虚拟化硬件。
+\item 硬件错误、观测工具和故障恢复。
+\end{enumerate}
+
+这个顺序从“机器如何一步一步执行”走到“整机如何长期可靠运行”。操作系统的抽象就在这条路上逐层长出来：线程来自寄存器和栈，进程来自页表和特权级，文件来自存储控制器和块层，socket 来自网卡和协议栈，权限来自硬件边界和内核对象。
+
+\subsection{本节硬验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能画出一台 x86-64 PC 或服务器的供电、时钟、CPU、内存、互联、外设、固件和安全硬件图。
+\item 能解释 power domain、clock、reset 的顺序为什么会影响驱动 probe 和 resume。
+\item 能区分 PCIe、USB、I2C、SPI、UART、GPIO 这几类互联的发现方式和驱动模型。
+\item 能说明 HDD、SSD、NVMe、eMMC/UFS 的介质差异如何影响块层和文件系统。
+\item 能从 PHY/MAC/RX ring/MSI-X/NAPI/socket queue 讲出网卡收包路径。
+\item 能从 framebuffer/GPU command/fence/CRTC/connector 讲出显示路径。
+\item 能说明音频、摄像头和传感器为什么更关心周期、buffer 和抖动。
+\item 能说明 EC、BMC、TPM、TEE、IOMMU 这些“CPU 之外的控制面”分别带来什么边界。
+\item 能用 \code{lspci}、\code{lsusb}、\code{dmesg}、\code{/proc/interrupts}、\code{/sys} 为硬件结论找证据。
+\item 能把一次设备不可见、NVMe 超时、网络延迟、黑屏、音频爆音或热降频拆成硬件到 OS 的分层路径。
+\end{itemize}
+\end{rubricbox}

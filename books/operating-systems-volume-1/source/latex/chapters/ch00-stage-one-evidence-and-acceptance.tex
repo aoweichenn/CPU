@@ -1,0 +1,155 @@
+\section{第一阶段证据与验收：用可观察现象校准理解}
+
+第一阶段的目标是让硬件名词落到可观察现象，而不是让读者背出更长清单。真正理解 CPU、MMU、DMA、中断、cache 和设备队列，应该能在系统上找到证据：日志、计数器、地址映射、页错误、块 I/O、网络队列、调度事件和错误报告。
+
+\subsection{观察启动链：哪些硬件事实被交给内核}
+
+启动日志是硬件到 OS 的第一份证据。它会显示内存地图、CPU 特性、NUMA 拓扑、时钟源、中断控制器、PCIe 设备、IOMMU、存储设备和根文件系统。读启动日志时，不要只找错误，要把它当成硬件契约清单。
+
+\begin{lstlisting}
+evidence to collect on a Linux system:
+  dmesg
+  cat /proc/cpuinfo
+  cat /proc/iomem
+  cat /proc/interrupts
+  lspci -vv
+  lsblk
+  numactl --hardware
+\end{lstlisting}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+证据 & 说明什么 & 关联章节 \\
+\midrule
+\code{/proc/iomem} & RAM、保留区、MMIO 窗口 & 物理内存地图、设备地址 \\
+\code{/proc/interrupts} & IRQ 分配和计数 & 中断控制器、设备完成 \\
+\code{lspci -vv} & BAR、MSI-X、AER、IOMMU group & PCIe、驱动资源 \\
+\code{dmesg} & probe、错误、时钟、IOMMU、NUMA & 启动链、设备模型 \\
+\code{numactl --hardware} & CPU 与内存 node 距离 & NUMA、页放置 \\
+\bottomrule
+\end{longtable}
+
+这些命令是原理卷的校准工具，不替代实践卷实验。书里说“MMIO 是地址空间的一部分”，\code{/proc/iomem} 应该能看到设备窗口；书里说“中断有亲和性和计数”，\code{/proc/interrupts} 应该能看到每个 CPU 上的计数分布。
+
+\subsection{观察系统调用和特权边界}
+
+\code{strace} 能看到用户态请求了哪些系统调用，但看不到内核内部所有路径。它适合验证“库函数不是系统调用本身”和“系统调用有返回值与错误码”。例如一个 \code{read} 可能返回短读，一个 \code{open} 可能因权限失败，一个 \code{mmap} 可能成功但物理页尚未分配。
+
+\begin{lstlisting}
+questions while reading strace:
+  Which calls cross the user/kernel boundary?
+  Which file descriptors are created, duplicated, or closed?
+  Which calls return EAGAIN, EINTR, EFAULT, or EPERM?
+  Does mmap only create virtual ranges, or also force page allocation?
+\end{lstlisting}
+
+特权边界的负面证据同样重要。用户态传入坏指针时，内核应返回 \code{EFAULT} 或终止进程，而不是崩溃；无权限打开文件应失败且不产生副作用；被 seccomp 拒绝的系统调用不应进入危险路径。
+
+\subsection{观察虚拟内存：VMA、RSS 和 page fault}
+
+进程的虚拟地址空间可以从 \code{/proc/<pid>/maps} 和 \code{/proc/<pid>/smaps} 观察。maps 显示 VMA，smaps 显示更细的 RSS、dirty、shared/private 等统计。page fault 可以用 \code{perf stat} 或进程资源统计观察。
+
+\begin{lstlisting}
+memory evidence:
+  cat /proc/<pid>/maps
+  cat /proc/<pid>/smaps
+  perf stat -e page-faults,minor-faults,major-faults <command>
+  pmap -x <pid>
+\end{lstlisting}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 可能原因 & 需要区分 \\
+\midrule
+VIRT 很大 RSS 很小 & VMA 已建，页未实际分配 & 懒分配、文件映射、保留地址空间 \\
+minor fault 多 & 分配零页或建立 PTE & 不一定访问磁盘 \\
+major fault 多 & 需要存储 I/O & 文件页或 swap 读入 \\
+shared 增加 & 共享库或共享映射 & 不等于进程独占内存增加 \\
+dirty 增加 & 写过但未回写 & page cache 或匿名页 \\
+\bottomrule
+\end{longtable}
+
+这组证据对应的核心理解是：虚拟地址、VMA、PTE、物理页、RSS 不是同一层概念。一个地址可见，不代表物理页已分配；一个页在 RSS 中，不代表它独占；一个 page fault 发生，不代表程序错误。
+
+\subsection{观察调度：on-CPU 与 off-CPU 分开}
+
+调度问题最容易被误判。请求慢可能是 CPU 算得慢，也可能是 runnable 但排队，也可能是 sleeping 等 I/O 或锁。证据上要分 on-CPU、runnable wait 和 blocked wait。
+
+\begin{lstlisting}
+scheduler evidence:
+  perf sched record/report
+  trace-cmd record -e sched:*
+  cat /proc/<pid>/sched
+  cat /proc/schedstat
+  pidstat -w
+\end{lstlisting}
+
+若上下文切换次数非常高，可能是线程过多、锁竞争、I/O 小请求过多或时间片太短。若 runnable wait 高，说明任务想运行但拿不到 CPU。若 CPU 使用率低但延迟高，可能大量时间在 I/O、锁或内存回收中睡眠。
+
+\subsection{观察设备和 I/O：队列、completion、错误}
+
+块设备和网络设备都有队列。吞吐不只由设备峰值决定，还由队列深度、请求大小、合并、完成延迟、中断亲和性和 CPU 处理能力共同决定。
+
+\begin{lstlisting}
+I/O evidence:
+  iostat -x
+  lsblk -o NAME,MODEL,ROTA,SIZE
+  cat /sys/block/<dev>/queue/*
+  ethtool -S <iface>
+  cat /proc/interrupts
+  dmesg | grep -i -E "nvme|pcie|iommu|dma|reset|timeout"
+\end{lstlisting}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+现象 & 可能原因 & 硬件/OS 联系 \\
+\midrule
+设备利用率高且 await 高 & 队列拥塞或设备慢 & 块层请求和设备服务时间 \\
+中断集中在一个 CPU & IRQ affinity 不均 & 多队列和 CPU 拓扑 \\
+IOMMU fault & DMA 地址或权限错误 & DMA mapping 生命周期 \\
+reset/timeout 日志 & 设备或驱动失去响应 & in-flight 请求恢复 \\
+网络 drop 增加 & ring 满或协议栈处理慢 & NAPI、socket backlog、应用读取 \\
+\bottomrule
+\end{longtable}
+
+这些现象应该能回到前文的状态机：请求是否已经提交，设备是否拥有 buffer，completion 是否回来，等待者是否被唤醒，错误是否传播到用户态。
+
+\subsection{第一阶段负面测试思维}
+
+高质量理解必须包含负面路径。只验证正常读写成功，无法证明边界正确。第一阶段可以用纸上或小实验设计下面这些测试：
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+机制 & 应注入的失败 & 期望结果 \\
+\midrule
+用户指针检查 & 传入无效用户地址 & 返回错误或信号，内核不崩溃 \\
+page fault & 访问无 VMA 地址 & 进程失败，不影响其他进程 \\
+COW & fork 后父子分别写同一地址 & 内容分离，互不污染 \\
+DMA 生命周期 & completion 前释放 buffer 的模拟 & 测试应能发现所有权错误 \\
+中断处理 & completion 丢失或迟到 & 超时路径唤醒等待者并报告错误 \\
+设备复位 & in-flight 请求未完成时 reset & 请求被 retry 或 fail，不永久睡眠 \\
+持久化 & write 后崩溃模拟 & 无 fsync 不承诺持久，有 fsync 按语义恢复 \\
+\bottomrule
+\end{longtable}
+
+负面测试的价值是逼迫我们说清楚“不变量”。例如“completion 前不能释放 buffer”来自设备仍可能 DMA 的事实；“PTE 改权限后要失效 TLB”关系到隔离条件；“write 不等于持久”来自 page cache、设备 cache 和崩溃恢复共同决定的语义。
+
+\subsection{第一阶段最终验收清单}
+
+下面的清单可以作为第一阶段完成标准。每一项都要求能讲出硬件来源、内核对象、正常路径、失败路径和可观察证据。
+
+\begin{itemize}
+\tightlist
+\item 能从复位向量讲到内核初始化：固件、内存地图、页表、异常入口、驱动 probe。
+\item 能从系统调用讲到特权边界：寄存器 ABI、内核栈、用户指针、返回路径。
+\item 能从一次 load/store 讲到 MMU：VMA、PTE、TLB、fault、COW、权限。
+\item 能从定时器中断讲到调度：tick、runtime accounting、runqueue、context switch。
+\item 能从 DMA 提交讲到 completion：描述符、屏障、IOMMU、中断、等待队列。
+\item 能从 file read 讲到硬件设备：fd、page cache、filesystem、block layer、NVMe。
+\item 能从网络包讲到 socket：RX ring、NAPI、skb、TCP receive queue、epoll。
+\item 能从 write 讲到崩溃恢复：dirty folio、writeback、journal、flush、fsync。
+\item 能解释多核带来的成本：cache line、锁竞争、IPI、TLB shootdown、NUMA。
+\item 能用至少一种系统证据验证自己的解释，而不是只停留在定义。
+\end{itemize}
+
+这份清单完成后，第一阶段才算过关。后续进入进程、内存、文件系统和网络时，读者已经有一条硬件到 OS 的主线，不会把每章当成孤立概念。

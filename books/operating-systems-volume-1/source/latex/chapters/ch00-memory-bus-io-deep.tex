@@ -1,0 +1,285 @@
+\section{内存、总线、设备和 DMA：从芯片连线到 OS I/O}
+
+CPU 再强，也必须和内存、设备、时钟、中断控制器一起工作。操作系统里最难的 bug，常常出在这些边界：地址翻译和 TLB 不一致，MMIO 顺序错，DMA buffer 生命周期错，中断确认顺序错，IOMMU 映射漏撤销。本节把这些路径拆开讲。
+
+\subsection{内存芯片的最小读写协议}
+
+最朴素的 SRAM 可以抽象为地址输入、数据输入、数据输出、读写控制和片选信号。CPU 或内存控制器给出地址，选择读或写，等待信号稳定。DRAM 更复杂，需要行列地址、刷新、bank、burst，但对 OS 的第一层抽象仍是：某个物理地址可以读写某些字节。
+
+\begin{lstlisting}
+SRAM read:
+  chip_select = 1
+  write_enable = 0
+  address = A
+  wait access_time
+  data = data_out
+
+SRAM write:
+  chip_select = 1
+  write_enable = 1
+  address = A
+  data_in = V
+  wait write_time
+\end{lstlisting}
+
+物理地址不是自然存在的数字，而是系统设计给内存控制器和设备译码的编号。哪些地址连到 DRAM，哪些地址连到固件 ROM，哪些地址连到 PCIe MMIO 或 APIC 寄存器，由芯片组、PCIe root complex、固件表和硬件设计共同决定。OS 通过内存地图知道哪些物理页可用，哪些必须保留。
+
+\subsection{地址空间地图：同一个 load 可以读内存也可以读设备}
+
+CPU 执行 load/store 时只发出地址和访问类型。地址译码决定这个请求去 DRAM、ROM、PCIe MMIO 窗口，还是本地 APIC 寄存器。于是同一条 store 指令，写 DRAM 是保存数据，写设备寄存器可能是启动 DMA，写中断控制器可能是发送 IPI。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+地址区域 & 背后硬件 & 软件语义 \\
+\midrule
+RAM & 内存控制器和 DRAM & 普通可缓存内存、页分配来源 \\
+ROM/Flash & 固件或只读存储 & 启动代码、固件表、只读镜像 \\
+MMIO window & 设备寄存器或队列门铃 & 驱动控制设备状态 \\
+interrupt controller & local APIC、IOAPIC、MSI/MSI-X & mask、priority、EOI、IPI \\
+framebuffer & 显存或显示控制器窗口 & 图形输出或 DMA buffer \\
+\bottomrule
+\end{longtable}
+
+这就是为什么内核页表要给不同区域设置不同属性。普通 RAM 可以 cache；MMIO 通常要设为 device/uncacheable/strongly ordered 类属性；framebuffer 可能使用 write-combining。属性错了，轻则性能差，重则设备协议被 CPU 合并或重排破坏。
+
+\subsection{DRAM 为什么慢，cache 为什么必要}
+
+CPU 周期很短，DRAM 访问要经过内存控制器、行激活、列访问、总线传输和排队。若每条 load 都等 DRAM，CPU 大部分时间会空转。cache 利用局部性：刚访问过的数据很可能很快再访问，相邻数据也可能很快访问。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+局部性 & 例子 & cache 如何利用 \\
+\midrule
+时间局部性 & 循环反复访问同一变量 & 保留最近 cache line \\
+空间局部性 & 顺序遍历数组 & 一次搬入整条 cache line \\
+指令局部性 & 顺序执行函数体 & I-cache 预取连续指令 \\
+共享局部性 & 多线程读同一只读表 & 多核 cache 可共享只读 line \\
+\bottomrule
+\end{longtable}
+
+cache line 是最小搬运单位。一个 8 字节变量被修改，硬件可能搬运和独占整个 64 字节 line。OS 数据结构若把多个 CPU 频繁写的变量放在同一 line，就会产生伪共享。许多内核结构会显式对齐到 cache line，就是为了避免这种硬件级共享。
+
+\subsection{cache 写策略和脏数据}
+
+写穿透 cache 每次写都同步写到下层，简单但慢。写回 cache 先只改 cache line，把 line 标为 dirty，稍后再写回下层。现代 CPU 多用写回策略。于是“CPU 执行了 store”不等于“DRAM 立刻有新值”，更不等于“设备通过 DMA 已经能看到新值”。
+
+\begin{lstlisting}
+CPU store to cached memory:
+  line = load line into cache if absent
+  modify bytes in cache line
+  mark line dirty
+  write back later on eviction or flush
+\end{lstlisting}
+
+对普通内存，硬件一致性协议让其他 CPU 最终能看到正确结果。对非一致 DMA 设备，驱动必须在设备读内存前 clean cache，把 dirty 数据推到设备可见层；在设备写内存后 invalidate cache，避免 CPU 继续读旧 line。是否需要这些操作取决于平台 DMA 一致性模型，但驱动必须按 DMA API 写，不能凭感觉。
+
+\subsection{TLB：页表太慢后的缓存}
+
+多级页表翻译一次虚拟地址可能要读多次内存。如果每条 load/store 都完整 page walk，开销巨大。TLB 缓存虚拟页到物理页和权限。命中时，地址翻译接近几个周期；未命中时，硬件 page walker 或内核参与填充。
+
+\begin{lstlisting}
+translate(va):
+  vpn = va >> PAGE_SHIFT
+  entry = tlb.lookup(vpn, asid)
+  if entry.hit and entry.permissions allow access:
+    return entry.ppn | page_offset(va)
+  else:
+    pte = page_table_walk(vpn)
+    if invalid: raise page_fault
+    tlb.insert(vpn, pte)
+\end{lstlisting}
+
+TLB 让虚拟内存可用，也让页表修改变复杂。修改 PTE 后，旧翻译可能仍在本 CPU 或其他 CPU 的 TLB 中。内核必须在释放物理页、收紧权限或取消映射前完成必要失效。多核下这通常需要 IPI，也就是 TLB shootdown。
+
+\subsection{页大小和大页：为什么不是越大越好}
+
+常见基础页大小是 4KiB，也有 2MiB、1GiB 这类大页。大页减少页表层级和 TLB 压力，适合大连续内存区域；小页减少内部碎片，权限粒度更细，适合普通进程堆栈和文件映射。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+页大小 & 优点 & 代价 \\
+\midrule
+小页 & 细粒度权限、少内部碎片、回收灵活 & 页表多、TLB 覆盖范围小 \\
+大页 & TLB 覆盖范围大、page walk 少 & 内部碎片、拆分成本、权限粗 \\
+透明大页 & 用户无感提高部分负载性能 & 折叠/拆分带来延迟尖峰 \\
+\bottomrule
+\end{longtable}
+
+OS 内存管理的很多复杂性来自这些折中。数据库、虚拟机和大模型推理可能受益于大页；延迟敏感系统可能不希望后台折叠大页造成抖动。页不是抽象单位而已，它直接影响 TLB、cache、回收和 I/O。
+
+\subsection{总线事务：读、写、posted write 和错误}
+
+总线或互联把请求从发起者送到目标。读事务通常需要请求和响应；写事务可能是 posted write，即发起者把写请求发出后不等待设备真正处理完成。posted write 提高吞吐，但让“写了寄存器”与“设备已经执行命令”之间产生距离。
+
+\begin{lstlisting}
+MMIO posted write:
+  CPU writes DOORBELL
+  interconnect queues write
+  CPU continues
+  device receives write later
+
+MMIO read after write:
+  CPU writes DOORBELL
+  CPU reads STATUS
+  read often forces prior posted writes to reach device ordering point
+\end{lstlisting}
+
+驱动有时会在关键 MMIO 写后读回某个寄存器，以确保写到达设备或满足排序要求。具体规则依平台和 API 而定，但核心思想是：设备不是 CPU 内部函数，MMIO 访问经过互联、缓冲和设备状态机。
+
+\subsection{PCIe 设备是怎样被发现的}
+
+PCIe 设备有配置空间，里面包含 vendor ID、device ID、class code、BAR、MSI/MSI-X capability 等信息。固件或内核枚举总线，给 BAR 分配地址窗口，给设备分配 bus/device/function 编号。驱动通过 ID 表匹配设备。
+
+\begin{lstlisting}
+pci enumeration:
+  for each bus/device/function:
+    read vendor_id
+    if present:
+      read class/device ids
+      size BARs and allocate MMIO ranges
+      discover MSI/MSI-X capability
+      create pci_dev object
+      bind matching driver
+\end{lstlisting}
+
+BAR 是 Base Address Register。设备通过 BAR 告诉系统“我需要一段 MMIO 地址空间”。内核分配物理地址范围后，驱动再 ioremap 到内核虚拟地址。用户进程不能直接访问这个 MMIO，除非内核通过受控接口映射并检查权限。
+
+\subsection{描述符环：CPU 和设备共享队列}
+
+高性能设备不希望 CPU 每个请求都写一堆寄存器。更常见的做法是：内存在 RAM 中建立 descriptor ring，CPU 作为生产者填写描述符，设备作为消费者读取描述符；完成后设备写回 status 或 completion ring，再中断或让 CPU 轮询。
+
+\begin{lstlisting}
+TX ring:
+  desc[0] -> buffer A, len, flags
+  desc[1] -> buffer B, len, flags
+  ...
+  driver_tail: next slot driver may fill
+  device_head: next slot device may consume
+
+submit:
+  fill desc[tail]
+  dma_wmb()
+  tail = tail + 1
+  writel(tail, DOORBELL)
+\end{lstlisting}
+
+环形队列有几个不变量：不能覆盖设备尚未消费的描述符；不能回收设备尚未完成的 buffer；发布 tail 前描述符必须完整可见；处理 completion 后必须 unmap DMA 并释放上层资源。网络、NVMe、virtio、io\_uring 都可以用这个模型理解。
+
+\subsection{DMA 地址不等于用户虚拟地址}
+
+用户程序传给 \code{read/write} 的是用户虚拟地址。CPU 访问它要通过当前进程页表。设备不能直接理解这个地址。驱动要么复制数据到内核 buffer，要么 pin 用户页，拿到物理页，再通过 DMA API 得到设备可用的 DMA 地址。若有 IOMMU，DMA 地址通常是设备虚拟地址 IOVA。
+
+\begin{lstlisting}
+user pointer
+  -> validate VMA and permissions
+  -> pin user pages or copy into kernel pages
+  -> physical pages
+  -> dma_map creates DMA address / IOVA
+  -> descriptor contains DMA address
+  -> device DMA reads/writes memory
+\end{lstlisting}
+
+这条路径很容易出 bug。用户 buffer 长度可能溢出；页可能跨多个物理页，需要 scatter-gather list；设备 DMA mask 可能只能访问低 32 位地址；IOMMU 映射可能失败；用户取消请求时，in-flight DMA 不能简单释放。
+
+\subsection{scatter-gather：物理内存不连续怎么办}
+
+用户看到的虚拟 buffer 可以连续，但背后的物理页通常不连续。大 I/O 不应该强迫内核分配一大段连续物理内存。scatter-gather 描述符让一个请求由多个片段组成，每个片段有 DMA 地址和长度。
+
+\begin{lstlisting}
+sglist for 10KB user buffer:
+  segment0: dma=0x1000a000 len=4096
+  segment1: dma=0x20345000 len=4096
+  segment2: dma=0x0ff12000 len=2048
+\end{lstlisting}
+
+块层 bio、网络 skb fragment、DMA engine 都会遇到类似结构。算法上要处理片段合并、最大段数、对齐、设备边界和 IOMMU 映射成本。所谓“零拷贝”不是没有成本，而是把复制成本换成页 pin、映射、片段管理和完成回收成本。
+
+\subsection{IOMMU 和设备隔离}
+
+IOMMU 给设备访问内存也加了一层翻译。设备发出 DMA 地址，IOMMU 查设备所属 domain 的页表，得到物理地址并检查权限。这样内核可以只把某个 buffer 映射给设备，completion 后撤销映射。
+
+\begin{lstlisting}
+device DMA:
+  device emits IOVA
+  IOMMU checks device domain
+  if mapping exists and permission ok:
+    physical = translate_iova(IOVA)
+    perform memory access
+  else:
+    report IOMMU fault
+\end{lstlisting}
+
+IOMMU 还支撑虚拟化设备直通。把一个 PCIe 设备交给虚拟机时，hypervisor 不能让它 DMA 到宿主任意内存；IOMMU domain 必须限制在该虚拟机拥有的页。IOMMU 不是性能功能，而是设备侧隔离的硬件根。
+
+\subsection{中断和 DMA completion 的完整路径}
+
+现在串起一次 NVMe 读取或网卡接收的典型路径：
+
+\begin{lstlisting}
+1. kernel allocates/pins pages for data
+2. kernel maps pages for DMA and builds sglist
+3. driver fills descriptors in submission ring
+4. dma_wmb publishes descriptors to device
+5. driver writes doorbell MMIO
+6. device reads descriptors via DMA
+7. device transfers data to/from memory
+8. device writes completion entry
+9. device raises MSI-X interrupt
+10. interrupt handler schedules poll or completion work
+11. driver reads completion ring
+12. driver unmaps DMA and releases/publishes buffer
+13. waiting task or upper stack is woken
+\end{lstlisting}
+
+每一步都有状态和失败。DMA map 可能失败；设备可能超时；中断可能被合并；completion 可能表示错误；用户进程可能已经取消；reset 可能正在进行。驱动代码之所以长，是因为它必须覆盖这些状态，而不是因为工程师喜欢复杂。
+
+\subsection{设备 reset：异步系统的故障收敛}
+
+设备可能挂起、固件崩溃、PCIe 链路错误、DMA fault 或长期无 completion。驱动 reset 不是简单写一个 reset bit，它要停止新请求，冻结队列，等待或取消 in-flight，通知上层失败，重建硬件状态，再恢复服务。
+
+\begin{lstlisting}
+reset_device(dev):
+  mark dev as resetting
+  stop accepting new submissions
+  quiesce queues
+  abort or wait in-flight requests
+  mask interrupts
+  issue hardware reset
+  reinitialize registers and rings
+  re-enable interrupts
+  fail or retry old requests by policy
+  mark dev as running
+\end{lstlisting}
+
+如果 reset 时还有旧 DMA 写入已释放 buffer，就会造成内存破坏；如果 reset 后忘记重建 IOMMU 映射，设备会 DMA fault；如果上层不知道请求失败，用户程序会永久等待。I/O 子系统的可靠性，核心就是让异步失败最终收敛到可解释状态。
+
+\subsection{实践观察：用命令把硬件路径看见}
+
+在真实 Linux 系统上，可以用下面命令观察硬件和 OS 的连接点。这里不是要求背命令，而是把“硬件描述、驱动绑定、中断、IOMMU、内存属性”变成可验证对象。
+
+\begin{lstlisting}
+lspci -nn
+lspci -vv -s <device>
+cat /proc/interrupts
+find /sys/bus/pci/devices -maxdepth 2 -type l
+dmesg | grep -i -E 'iommu|dma|msi|nvme|eth'
+cat /proc/iomem
+cat /proc/meminfo
+\end{lstlisting}
+
+观察报告至少要回答：设备如何被发现，BAR 映射在哪里，使用哪个 IRQ/MSI-X vector，驱动名称是什么，是否启用 IOMMU，DMA mask 是多少，错误统计在哪里看。没有这些证据，谈驱动和 DMA 只是概念。
+
+\subsection{本节测试：画出数据所有权}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能区分用户虚拟地址、内核虚拟地址、物理地址、DMA 地址和 IOVA。
+\item 能说明为什么 MMIO 访问需要专用 API 和顺序约束。
+\item 能画出 descriptor ring 的 head/tail、owned by CPU/device、completion 状态。
+\item 能说明 DMA buffer 在提交、设备访问、completion、unmap 各阶段归谁所有。
+\item 能解释 IOMMU 如何限制设备 DMA 范围，以及映射失败或 fault 如何处理。
+\item 能解释中断合并、poll budget 和 completion queue 如何影响延迟与吞吐。
+\item 能为设备 reset 写出停止新请求、处理 in-flight、重建硬件状态的顺序。
+\end{itemize}
+\end{rubricbox}

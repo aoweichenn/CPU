@@ -1,0 +1,329 @@
+\section{硬件微观机制深讲：状态机、缓存一致性和 I/O 事务}
+
+上一节把整机硬件铺开，本节继续往下钻。学习操作系统最容易卡住的地方，是知道“有 cache、有中断、有 DMA”，但不知道这些机制内部怎样改变状态，为什么内核要按某种顺序写代码。本节按实现粒度讲：CPU 如何提交指令，cache line 如何在核心之间转移，TLB 如何失效，PCIe/NVMe 如何完成一次事务，IOMMU 如何把设备也放进地址空间。
+
+\subsection{同步时序：为什么硬件要靠时钟推进}
+
+组合逻辑只把输入变成输出，不能记住过去。寄存器在时钟边沿采样输入，构成下一周期的状态。CPU、内存控制器、DMA 引擎、NVMe 控制器、网卡队列，本质上都是许多状态机协同推进。
+
+\begin{lstlisting}
+state machine template:
+  current_state is stored in registers
+  combinational logic computes next_state from inputs
+  on clock edge:
+    if reset:
+      current_state = RESET_STATE
+    else:
+      current_state = next_state
+\end{lstlisting}
+
+OS 里的“状态不可跳跃”来自这里。设备 reset 后必须等 ready bit，是因为设备内部状态机还没从 RESET 走到 READY；写 doorbell 后要等 completion，是因为设备只记录了“有新请求”，数据搬运、错误检查和完成写回还要经历多个状态；中断处理必须给 EOI，是因为中断控制器也有 pending、in-service、masked 等状态。
+
+\subsection{流水线不是五个名词，而是一组提交规则}
+
+教科书常把流水线写成取指、译码、执行、访存、写回。真实 CPU 可能有更复杂的前端、重命名、发射、执行、回写、提交，但对 OS 最关键的是提交规则：架构状态必须按程序顺序提交，异常必须精确。
+
+\begin{lstlisting}
+out-of-order core sketch:
+  fetch instruction bytes
+  decode into micro-ops
+  rename architectural registers to physical registers
+  dispatch micro-ops into queues
+  execute ready micro-ops out of order
+  write results to physical registers
+  retire completed instructions in program order
+\end{lstlisting}
+
+“乱序执行”不意味着用户程序看见乱序结果。CPU 可以内部先执行后面的 load 或 ALU 操作，但提交到架构寄存器、异常点和内存可见语义时必须遵守 ISA 规定。缺页异常能返回原指令重试，依赖的就是精确异常：出错指令之前的指令已经提交，之后的指令没有提交。
+
+\subsection{精确异常的例子：load 缺页}
+
+假设指令流中第三条 load 缺页，第四条加法可能已经在乱序引擎里算过，但不能对 OS 可见。
+
+\begin{lstlisting}
+inst1: add r1, r2, r3       committed
+inst2: store [x], r1        committed or ordered by memory rules
+inst3: load r4, [bad_va]    raises page fault
+inst4: add r5, r6, r7       may have executed speculatively
+
+architectural view at exception:
+  saved RIP points to inst3
+  inst1 and inst2 are visible as completed
+  inst3 has not produced final architectural result
+  inst4 is not architecturally visible
+\end{lstlisting}
+
+内核处理缺页时才能做出可靠判断：若是合法懒分配，就建立 PTE 后返回 inst3 重试；若是非法访问，就向进程发送信号。没有这个契约，page fault 不能成为虚拟内存的基础。
+
+\subsection{寄存器重命名和上下文切换}
+
+CPU 内部可能有比 ISA 更多的物理寄存器。寄存器重命名把软件可见寄存器映射到物理寄存器，消除很多假依赖。上下文切换时，OS 不需要保存所有物理寄存器，只需要保存 ISA 规定的软件可见状态。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+状态 & 谁管理 & 上下文切换关系 \\
+\midrule
+架构通用寄存器 & OS 必须保存恢复 & 用户程序可见，必须准确 \\
+浮点/SIMD 状态 & OS 按 ABI 和策略保存 & 状态大，可能惰性或按需保存 \\
+物理寄存器池 & CPU 微架构管理 & OS 不直接保存 \\
+分支预测器状态 & CPU 微架构管理 & 性能和侧信道相关 \\
+cache/TLB & CPU 和 OS 协作维护 & 不保存，但切换影响命中率 \\
+\bottomrule
+\end{longtable}
+
+这解释了为什么上下文切换不仅是保存几十个寄存器。它还会改变 cache/TLB 热状态、分支预测历史、内存局部性和 NUMA 访问路径。调度器选择任务时，实际在权衡“马上公平”和“保留热状态”。
+
+\subsection{cache line 状态：以 MESI 思想理解一致性}
+
+多核系统中，每个 CPU 有自己的 cache。同一个物理 cache line 可能同时存在于多个核心。硬件一致性协议维护每条 line 的状态。不同 CPU 具体协议不同，但用 MESI 思想足以理解 OS 成本。
+
+\begin{longtable}{p{0.16\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+\toprule
+状态 & 含义 & 典型转移 \\
+\midrule
+Modified & 本核有最新数据，内存可能旧 & 其他核读时必须提供或写回 \\
+Exclusive & 本核独占且干净 & 本核写入后变 Modified \\
+Shared & 多个核可读共享 & 某核写入前要让其他副本失效 \\
+Invalid & 本核没有有效副本 & 读写时要重新获取 line \\
+\bottomrule
+\end{longtable}
+
+两个 CPU 写同一 cache line 上的不同变量时，line 会在两个核心间来回转移。程序逻辑上写的是两个变量，硬件上争的是同一 line 的独占权。这就是伪共享。内核的 per-CPU 数据、cacheline 对齐、分片计数器，本质都是减少 line 状态来回迁移。
+
+\subsection{锁的真实成本：cache line 所有权迁移}
+
+自旋锁通常是一个小整数。获取锁时，CPU 执行原子读改写，必须拿到锁变量所在 cache line 的独占权。很多 CPU 同时争锁时，这条 line 在核心之间移动，互联流量和延迟迅速上升。
+
+\begin{lstlisting}
+test_and_set_lock(lock):
+  while atomic_exchange(lock, 1) == 1:
+    cpu_relax()
+
+unlock(lock):
+  store_release(lock, 0)
+\end{lstlisting}
+
+这个简单锁在低竞争时很好，高竞争时很差。排队自旋锁把“所有 CPU 抢同一变量”变成“每个 CPU 等自己的节点”，减少缓存抖动。
+
+\begin{lstlisting}
+queued_spin_lock:
+  node = per_cpu_node()
+  pred = atomic_xchg(lock.tail, node)
+  if pred != null:
+    node.locked = true
+    pred.next = node
+    while node.locked:
+      cpu_relax()
+  // enter critical section
+\end{lstlisting}
+
+Linux 的 queued spinlock 和 MCS 思想相关。这里的重点不是记算法名，而是理解：高竞争锁慢的主要原因常常不是临界区代码，而是 cache line 所有权在 CPU 间转移。
+
+\subsection{内存顺序：store buffer 为什么会改变可见顺序}
+
+CPU 为了性能会把 store 先放进 store buffer，稍后再对其他核心可见。单线程看不出问题，因为本 CPU 之后的 load 可以从 store buffer 转发；多核就可能看到不同顺序。
+
+\begin{lstlisting}
+CPU0:
+  data = 42
+  flag = 1
+
+CPU1:
+  if flag == 1:
+    assert(data == 42)
+\end{lstlisting}
+
+在弱顺序模型或编译器重排下，CPU1 看到 \code{flag == 1} 时不一定能看到 \code{data == 42}，除非使用 release/acquire 或锁。正确发布对象要写成：
+
+\begin{lstlisting}
+CPU0:
+  data = 42
+  store_release(flag, 1)
+
+CPU1:
+  if load_acquire(flag) == 1:
+    assert(data == 42)
+\end{lstlisting}
+
+OS 内核里同样适用。唤醒等待者前要先改变等待条件；发布文件对象前要先初始化字段；设备 doorbell 前要先让描述符对设备可见。屏障的含义永远要和“谁观察什么”一起写。
+
+\subsection{TLB 和 page walk cache}
+
+TLB 缓存虚拟页到物理页的翻译。现代 CPU 还可能有 page walk cache，缓存页表中间层结果。修改页表后，内存里的 PTE 变了，不代表 CPU 立即不用旧翻译。OS 必须按架构要求失效相关 TLB。
+
+\begin{lstlisting}
+page walk for a 4-level page table:
+  read top-level entry from page table root
+  read next-level entry
+  read next-level entry
+  read final PTE
+  check present and permissions
+  insert translation into TLB
+\end{lstlisting}
+
+大页减少页表层级和 TLB 项数量，但权限粒度变粗。一个 2MiB 大页内只要有 4KiB 要改权限，就可能拆成 512 个小页。拆页会造成页表分配、TLB flush 和锁竞争，所以透明大页可能提升吞吐，也可能造成延迟尖峰。
+
+\subsection{TLB shootdown 的正确性边界}
+
+释放物理页前必须保证没有 CPU 还能通过旧 TLB 访问它。否则这页可能已经分配给别的进程或内核对象，旧翻译会变成越权访问。
+
+\begin{lstlisting}
+safe unmap:
+  remove PTE or clear permission
+  flush local TLB entry
+  send shootdown IPI to CPUs that may use mm
+  remote CPUs invalidate entry and acknowledge
+  wait for acknowledgements
+  now old physical page may be freed or reused
+\end{lstlisting}
+
+这里的“may use mm”不是随便猜。内核要跟踪哪些 CPU 正在或最近运行某个地址空间，避免给所有 CPU 发 IPI。过度 shootdown 会让大机器扩展性下降；少发一个 shootdown 则是安全 bug。
+
+\subsection{中断控制器状态：pending、masked、in-service}
+
+设备触发中断后，中断控制器通常不是直接丢给 CPU 就结束。它会记录 pending，检查 mask 和优先级，把 vector 送到目标 CPU。CPU 进入 handler 后，中断可能处于 in-service 状态；handler 结束时需要 EOI 或等价操作。
+
+\begin{lstlisting}
+interrupt controller:
+  if device asserts interrupt:
+    mark vector pending
+  if not masked and priority allows:
+    deliver vector to target CPU
+    mark vector in_service
+  after handler sends EOI:
+    clear in_service
+    deliver next pending interrupt if any
+\end{lstlisting}
+
+若驱动没有清设备状态就 EOI，中断可能立刻再次触发，形成中断风暴。若 handler 清了设备状态但忘了 EOI，后续同类中断可能被阻塞。若 mask 过久，completion 延迟会飙升。中断处理顺序必须同时满足设备状态机和中断控制器状态机。
+
+\subsection{MSI-X：中断也是一次内存写消息}
+
+传统线中断像一根线被拉高。MSI/MSI-X 更像设备向特定地址写入一条消息，中断控制器把这条消息解释成某个 vector。这样设备可以有多个 vector，适合多队列网卡和 NVMe。
+
+\begin{lstlisting}
+MSI-X setup:
+  kernel allocates interrupt vectors
+  kernel programs device MSI-X table
+  each queue gets vector and CPU affinity
+  device writes MSI-X message when queue completes
+  target CPU enters corresponding handler
+\end{lstlisting}
+
+多队列设备性能依赖这个映射。若 64 个 RX/TX 队列都映射到一个 CPU，硬件有多队列也发挥不出来；若队列、CPU 和 NUMA 不匹配，DMA 数据会跨节点移动。驱动初始化时的 vector 分配不是细枝末节，而是性能结构。
+
+\subsection{PCIe 事务：BAR、doorbell 和 completion}
+
+PCIe 设备通过 BAR 暴露 MMIO 寄存器。CPU 写 doorbell 时，写请求会经过 root complex、switch、链路，到设备。写可能是 posted，CPU 不等待设备真正处理完成。设备完成 DMA 后，再通过 completion queue 和 MSI-X 通知 CPU。
+
+\begin{lstlisting}
+CPU submit to PCIe device:
+  CPU writes descriptors in RAM
+  dma_wmb()
+  CPU MMIO-writes doorbell BAR
+  posted write travels through PCIe fabric
+  device receives doorbell
+  device DMA-reads descriptors
+  device performs work
+  device DMA-writes completion
+  device sends MSI-X message
+\end{lstlisting}
+
+这个路径解释了为什么驱动不能把 MMIO 写当函数调用。doorbell 返回不代表设备完成；甚至不一定代表设备已经处理。若驱动需要确认某个 posted write 到达，常见做法是在平台规则允许时读回一个寄存器形成排序点。
+
+\subsection{NVMe 队列内部：phase tag 和 head/tail}
+
+NVMe submission queue 由主机写、设备读；completion queue 由设备写、主机读。completion queue 常用 phase tag 区分“这一格是新一轮写入还是上一轮旧值”。队列满、队列空、环绕时都要靠 head/tail 和 phase 正确判断。
+
+\begin{lstlisting}
+completion poll:
+  cqe = cq[head]
+  if cqe.phase != expected_phase:
+    return no_new_completion
+  process cqe
+  head = head + 1
+  if head == queue_size:
+    head = 0
+    expected_phase = !expected_phase
+  write new head doorbell
+\end{lstlisting}
+
+如果没有 phase tag，环形队列回绕后，软件无法可靠区分旧 completion 和新 completion。这个细节体现了硬件队列的共同问题：数组槽位会复用，所以必须有 generation、phase、sequence 或所有权位。
+
+\subsection{IOMMU 页表和 IOTLB}
+
+IOMMU 给设备也建立翻译缓存。设备发出 IOVA，IOMMU 查页表得到物理地址，并检查读写权限。为了速度，IOMMU 也会有 IOTLB。撤销 DMA 映射后，必要时也要失效 IOTLB，否则设备可能继续用旧映射。
+
+\begin{lstlisting}
+dma_unmap:
+  remove IOVA -> physical mapping from IOMMU page table
+  invalidate IOTLB for this device/domain/range
+  only after invalidation may page be returned to allocator
+\end{lstlisting}
+
+这和 CPU TLB shootdown 是同一类正确性问题，只是访问者从 CPU 变成设备。设备侧隔离必须考虑 IOMMU group：若多个设备在硬件上不能区分请求者 ID，就不能把它们当成完全隔离的安全主体。
+
+\subsection{非一致 DMA 平台上的 cache 维护}
+
+有些平台上，设备 DMA 与 CPU cache 不自动一致。CPU 写给设备读的 buffer 前，需要 clean cache，把 dirty line 推到设备可见层；设备写给 CPU 读的 buffer 后，需要 invalidate cache，避免 CPU 读旧 line。
+
+\begin{lstlisting}
+TO_DEVICE:
+  CPU writes buffer
+  clean cache lines for buffer
+  device DMA reads memory
+
+FROM_DEVICE:
+  device DMA writes memory
+  invalidate CPU cache lines for buffer
+  CPU reads fresh data
+\end{lstlisting}
+
+这就是为什么驱动必须使用 DMA API，而不是直接把物理地址写进描述符。即使本书主线是 x86-64，DMA API 仍然负责表达方向、生命周期、IOMMU 映射和必要屏障。直接绕开 API 的驱动，可能在一个测试机上偶然工作，却在启用 IOMMU、不同 cache 属性或不同设备 DMA mask 时随机损坏数据。
+
+\subsection{存储介质内部状态：FTL 的写放大}
+
+SSD 对外暴露逻辑块，对内管理 NAND 页和擦除块。覆盖写不能直接改旧页，通常写到新物理页，再把旧页标为无效。垃圾回收把仍有效的页搬到新块，然后擦除旧块。主机随机写越多，内部搬迁越多，写放大越大。
+
+\begin{lstlisting}
+FTL overwrite logical block L:
+  old_phys = map[L]
+  new_phys = allocate_free_flash_page()
+  program new_phys with data
+  map[L] = new_phys
+  mark old_phys invalid
+  later garbage_collect blocks with many invalid pages
+\end{lstlisting}
+
+TRIM/discard 告诉 SSD 某些逻辑块不再包含有效文件数据，FTL 可以把对应物理页当作无效页，降低后续垃圾回收成本。文件系统、块层和设备固件因此共同决定长期写入性能。
+
+\subsection{可靠提交：cache flush、FUA 和日志顺序}
+
+存储设备可能有易失缓存。块层写完成不一定表示掉电后存在。可靠提交要约束顺序：先写日志或数据，再 flush 或使用 FUA，最后提交元数据。设备必须向上层报告它支持哪些 flush 语义。
+
+\begin{lstlisting}
+journal transaction:
+  write descriptor block
+  write data or metadata blocks
+  issue flush if device cache is volatile
+  write commit block with FUA or followed by flush
+  transaction is durable after commit reaches stable media
+\end{lstlisting}
+
+若 flush 被设备虚假完成，文件系统再正确也无法保证崩溃恢复。若文件系统漏掉目录 fsync，应用的原子替换协议也会有洞。可靠性是应用、文件系统、块层和设备共同实现的契约。
+
+\subsection{硬件算法小结}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能解释精确异常为什么让缺页可恢复。
+\item 能用 MESI 思想解释伪共享和锁竞争。
+\item 能说明 release/acquire 约束的是跨 CPU 可见顺序。
+\item 能写出 TLB shootdown 和 IOMMU unmap 的安全顺序。
+\item 能解释 MSI-X、多队列和 IRQ affinity 为什么影响 NVMe/网卡性能。
+\item 能说明 NVMe completion queue 为什么需要 phase tag。
+\item 能解释非一致 DMA 平台为什么必须 clean/invalidate cache。
+\item 能把 SSD FTL、TRIM、flush 和文件系统日志顺序联系起来。
+\end{itemize}
+\end{rubricbox}

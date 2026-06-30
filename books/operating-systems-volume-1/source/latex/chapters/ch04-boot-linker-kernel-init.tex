@@ -8,6 +8,24 @@
 
 启动阶段的特点是“没有服务可用”。还没有调度器，不能睡眠；还没有内存分配器，不能随便 \code{malloc}；还没有完整中断，不能依赖异步事件；还没有文件系统，不能读普通文件；还没有日志系统，调试输出只能靠串口、早期 console 或内存缓冲区。这些约束解释了为什么内核初始化代码通常按严格阶段组织。
 
+\subsection{上电后 CPU 为什么不能直接运行内核 C 函数}
+
+C 函数依赖一组运行环境：栈指针有效，全局变量已初始化，BSS 为零，代码和数据位于链接器预期地址，调用约定可用，必要的地址映射存在。上电瞬间这些条件都不自动成立。CPU 只处在架构定义的复位状态，从固定入口取指；剩下的环境必须由启动代码一步步建立。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+C 代码假设 & 谁建立 & 若缺失会怎样 \\
+\midrule
+栈可用 & reset handler 或 bootloader & 函数调用和局部变量破坏未知内存 \\
+全局变量已初始化 & 启动代码复制 \code{.data}、清 \code{.bss} & 锁、队列、指针从随机值开始 \\
+代码地址正确 & 链接脚本和装载器 & 跳转、全局地址、异常表错误 \\
+内存可访问 & 页表或物理映射 & 取指或访存 fault \\
+最小输出可用 & early console 初始化 & 出错时没有证据 \\
+\bottomrule
+\end{longtable}
+
+所以内核入口往往先是汇编或极小 C 代码。它不是为了炫技，而是因为在运行时环境建立前，普通 C 抽象还没有可靠落脚点。
+
 \subsection{链接脚本决定内存布局}
 
 链接脚本把代码段、只读数据、已初始化数据、未初始化数据和栈安排到具体地址。没有链接脚本，编译器和链接器不知道内核应该放在物理地址哪里，也不知道哪些符号表示段边界。
@@ -28,6 +46,20 @@ SECTIONS {
 
 这些符号不是装饰。启动代码需要 \code{\_\_bss\_start} 和 \code{\_\_bss\_end} 来清零 BSS；早期物理页分配器需要 \code{\_\_kernel\_end} 知道哪些内存已经被内核占用；页表初始化要知道哪些区域可执行、只读或可写。
 
+\subsection{链接地址、加载地址和重定位}
+
+链接地址是代码认为自己运行的位置，加载地址是 bootloader 把镜像放到内存的位置。二者可以相同，也可以不同。若不同，早期代码要么以位置无关方式运行，要么完成重定位，要么建立页表把链接虚拟地址映射到实际物理地址。
+
+\begin{lstlisting}
+kernel linked at virtual address: 0xffffffff81000000
+kernel loaded at physical address: 0x00100000
+
+early page table maps:
+  0xffffffff81000000 -> 0x00100000
+\end{lstlisting}
+
+这解释了为什么 64 位内核常有“高半区内核”概念。用户进程使用低地址范围，内核映射在高虚拟地址范围；每个进程切换页表时仍保留内核映射，系统调用和中断进入内核后能访问同一套内核代码和数据。这个设计依赖页表，而不是物理内存真的在高地址。
+
 \subsection{启动阶段的状态机}
 
 内核启动可以写成状态机：
@@ -46,6 +78,41 @@ Reset
 \end{lstlisting}
 
 每个阶段只能使用之前已经建立的能力。比如 EarlyConsole 之前不能输出复杂日志；BootMemoryDiscovered 之前不能建立通用页分配；SchedulerReady 之前不能阻塞等待；InterruptsReady 之前不能依赖设备中断。
+
+\subsection{x86-64 模式演进：实模式、保护模式、长模式}
+
+x86-64 的历史包袱让启动路径比很多 RISC 架构复杂。复位后 CPU 从兼容模式开始，早期代码或固件/bootloader 需要逐步建立 GDT、打开保护机制、准备页表、启用 PAE 和长模式，最后跳到 64 位代码。现代 UEFI 和 bootloader 会屏蔽许多细节，但内核仍要理解当前进入时的模式和页表状态。
+
+\begin{lstlisting}
+legacy shape:
+  reset vector
+  real mode firmware/bootloader
+  load kernel setup code
+  build provisional GDT
+  enter protected mode
+  build early page tables
+  enable long mode
+  jump to 64-bit kernel entry
+\end{lstlisting}
+
+GDT 在长模式下不再像 32 位分段那样用于普通地址计算，但仍参与代码段、数据段、TSS、特权切换和系统调用入口设置。TSS 也不只是历史名词，x86-64 可用 IST 为 NMI、double fault 等关键异常提供专用栈，避免在当前栈损坏时继续崩溃。
+
+\subsection{BIOS、UEFI 和 bootloader 的职责边界}
+
+BIOS 风格启动和 UEFI 风格启动不同，但目标相同：把内核镜像和硬件描述交给内核。bootloader 不应替内核做所有工作，它只建立足够条件让内核接管。内核接管后，必须停止依赖大部分固件 Boot Services，改用自己的内存管理、驱动和中断。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+阶段 & 可依赖对象 & 退出后的边界 \\
+\midrule
+固件早期 & DRAM 初始化、平台基础设置 & 内核通常看不到细节，只接收结果 \\
+bootloader & 读取磁盘/网络、加载镜像、构造参数 & 不再参与普通运行时服务 \\
+UEFI Boot Services & 分配内存、访问协议、获取内存地图 & \code{ExitBootServices} 后不可再调用 \\
+内核 early boot & 启动参数、内存地图、早期 console & 必须校验并建立自己的对象 \\
+\bottomrule
+\end{longtable}
+
+\code{ExitBootServices} 是一个硬边界。退出前，固件仍可能拥有内存和设备；退出后，内核承担管理责任。若内核拿到内存地图后，固件又分配了内存，而内核没有重新获取地图，就可能把固件仍使用的页当成空闲页。
 
 \section{实践}
 
@@ -142,6 +209,22 @@ validate_memory_region(region):
 
 若把内核镜像所在物理页误标为空闲，后续页分配器会把正在运行的内核代码分配给别人。启动阶段的错误通常不是立刻崩溃，而是在很久以后变成随机损坏，因此必须在早期就把内存地图打印和校验做好。
 
+\subsection{ACPI 和 PCI 配置空间：硬件不是凭空出现的}
+
+内核要知道“有哪些 CPU、哪些内存、哪些设备、设备寄存器在哪、用哪个 IRQ、挂在哪个 NUMA node、有哪些电源关系”。在本书的 x86-64 主线里，这部分信息主要来自 UEFI/ACPI、PCI/PCIe 配置空间和固件内存地图。它们都不是设备驱动本身，而是硬件描述入口。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+描述来源 & x86-64 常见用途 & 描述内容 \\
+\midrule
+ACPI & PC、服务器 & CPU 拓扑、NUMA、PCI routing、电源、热管理、平台设备资源 \\
+PCI config & 可枚举 PCIe 设备 & vendor/device、BAR、MSI、能力链 \\
+UEFI memory map & 启动阶段内存交接 & RAM、保留区、runtime services、ACPI reclaim 区域 \\
+\bottomrule
+\end{longtable}
+
+驱动 probe 的输入很多来自这些描述。若 ACPI resource 或 PCI BAR 错，MMIO 映射到错误地址；若 IRQ routing 或 MSI-X 配置错，设备完成不会唤醒驱动；若 DMA mask 或 IOMMU domain 配置错，设备可能访问不到高地址内存。硬件描述错误会表现成软件 bug，所以启动阶段要尽早暴露和校验资源表。
+
 \subsection{从单核启动到多核启动}
 
 多核系统通常只有 bootstrap processor 先运行内核入口，其他 CPU 处于等待状态。主 CPU 建立全局页表、per-CPU 区域和调度数据后，再唤醒 application processors。每个 CPU 都需要自己的内核栈、当前任务指针、runqueue 和中断状态。
@@ -165,6 +248,22 @@ secondary_entry(cpu):
 \end{lstlisting}
 
 这里的不变量是：CPU online 之前不能被调度器选作迁移目标；per-CPU 数据初始化之前不能接收普通设备中断；所有 CPU 使用的内核文本映射必须一致。多核启动把“初始化顺序”从单线流程变成了并发协议。
+
+\subsection{per-CPU 数据为什么必须很早准备}
+
+多核 OS 不能让所有 CPU 频繁写同一批全局变量。每个 CPU 需要自己的当前任务指针、内核栈、runqueue、计数器、本地 timer 状态、抢占计数和中断统计。这些对象通常放在 per-CPU 区域，通过特殊基址寄存器或固定偏移快速访问。
+
+\begin{lstlisting}
+per_cpu_area[cpu]:
+  current_task
+  kernel_stack_top
+  runqueue
+  irq_count
+  preempt_count
+  local_timer_state
+\end{lstlisting}
+
+secondary CPU 进入内核后，必须先设置自己的 per-CPU base，才能安全访问 \code{current} 这类隐式变量。否则 CPU1 可能误用 CPU0 的当前任务或 runqueue，造成调度和中断统计混乱。per-CPU 是多核性能优化，也是正确性边界。
 
 \section{测试}
 

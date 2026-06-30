@@ -1,0 +1,213 @@
+\section{第一阶段深讲：内存系统怎样塑造虚拟内存}
+
+操作系统的内存管理不是“把内存分给程序”这么简单。硬件内存系统由 DRAM、cache、TLB、MMU、内存控制器、NUMA 拓扑和 DMA 可见性共同组成。OS 的地址空间、页表、VMA、COW、page cache、伙伴分配器和回收算法，都是在这些硬件条件下形成的。
+
+\subsection{物理内存首先是一张不连续地图}
+
+初学者容易把物理内存想成从 0 到 N 的连续数组。真实机器启动时，固件会告诉内核哪些范围可用，哪些被固件、设备 MMIO、ACPI 表、内核镜像、initrd、显存窗口或保留区域占用。内核不能把保留区当普通页分配。
+
+\begin{lstlisting}
+memory map examples:
+  usable RAM
+  reserved firmware region
+  kernel image and initrd
+  MMIO aperture for PCIe devices
+  ACPI tables and UEFI memory map
+  crash kernel reserved area
+\end{lstlisting}
+
+因此页分配器的第一步是解析内存地图，建立可用页框集合，而不是假设所有地址都能清零后使用。每个物理页还要记录状态：是否可分配，属于哪个 NUMA node，是否被保留，是否在 LRU，是否 dirty，是否被 DMA pin，是否有硬件错误。
+
+\subsection{页是硬件和 OS 的折中粒度}
+
+页太小，页表和 TLB 压力大；页太大，内部碎片和权限粒度变差。4 KiB 页是许多系统的基础粒度，但大页和巨大页用于降低 TLB miss。OS 在页粒度上做权限、映射、换入换出、COW 和 page cache，是因为硬件 MMU 也按页翻译。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+粒度 & 优点 & 代价 \\
+\midrule
+小页 & 权限细，碎片小，按需分配灵活 & 页表项多，TLB 覆盖范围小 \\
+大页 & TLB 覆盖范围大，page walk 少 & 分配连续内存难，拆分成本高 \\
+cache line & 硬件缓存和一致性粒度 & 伪共享、写放大、对齐敏感 \\
+块设备扇区/块 & 持久存储 I/O 粒度 & 与页大小不总是一致 \\
+\bottomrule
+\end{longtable}
+
+这张表说明一个重要原则：OS 很少只有一个粒度。CPU cache 按 cache line 传输，MMU 按页翻译，文件系统按块管理，设备按队列请求传输。性能问题常出现在粒度转换处。
+
+\subsection{虚拟地址先落到 VMA，再落到 PTE}
+
+VMA 描述一段虚拟地址区间的高层语义：权限、是否匿名、是否文件映射、是否共享、增长方向、文件偏移。PTE 描述某一页当前的硬件翻译：是否 present、物理页号、读写执行权限、dirty/accessed 位等。二者不是同一个东西。
+
+\begin{lstlisting}
+virtual access:
+  find VMA by fault address
+  if no VMA: invalid access
+  if VMA permissions reject access: protection fault
+  inspect or create PTE
+  if needed allocate page or read file page
+  install PTE and return
+\end{lstlisting}
+
+VMA 是“这段地址应该有什么语义”，PTE 是“这页现在如何被硬件翻译”。一个合法 VMA 可以暂时没有 PTE，因为懒分配或文件页尚未读入。一个 PTE 也必须受 VMA 约束，不能凭空给出 VMA 不允许的写或执行权限。
+
+\subsection{页表层级来自地址位数和稀疏性}
+
+若为整个虚拟地址空间建立一个线性页表，会巨大且浪费。多级页表把虚拟地址拆成若干索引，只为实际使用的区域分配中间页表页。地址空间越稀疏，多级页表越有意义。
+
+\begin{lstlisting}
+virtual address split:
+  top-level index
+  middle-level index
+  lower-level index
+  page-table index
+  page offset
+\end{lstlisting}
+
+page walk 的成本来自多次内存访问。TLB 缓存最终翻译，是为了避免每次 load/store 都走多级页表。大页减少层级和 TLB 项数量，但要求地址和物理内存按大页对齐，并牺牲一部分细粒度权限。
+
+\subsection{PTE 位是硬件和内核共同维护的协议}
+
+一个 PTE 通常不仅有物理页号，还包含权限和状态位。不同架构位名不同，但角色相似：present 决定是否有当前翻译，writable 决定写入是否允许，user/supervisor 决定用户态能否访问，execute disable 决定能否取指，accessed/dirty 帮助内核判断冷热和写回。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+PTE 信息 & 硬件用法 & 内核用法 \\
+\midrule
+present & 缺失时触发 page fault & 懒分配、swap、文件缺页 \\
+writable & 写保护检查 & COW、只读映射、mprotect \\
+user/supervisor & 用户态访问检查 & 内核页隔离、用户地址空间 \\
+execute permission & 取指检查 & W\^X、代码页保护 \\
+accessed/dirty & 访问和写入记录 & 回收、写回、冷热判断 \\
+physical frame & 最终物理页 & 反向映射、引用计数、迁移 \\
+\bottomrule
+\end{longtable}
+
+PTE 是典型的软硬件共享数据结构。硬件会读取甚至更新某些位，内核会修改权限、清理位、替换物理页。凡是共享，就有一致性问题：修改 PTE 后，TLB 中的旧翻译是否还有效？其他 CPU 是否也缓存了旧结果？这些问题推导出 TLB flush 和 shootdown。
+
+\subsection{缺页处理是一棵决策树}
+
+page fault handler 不能只看“地址不存在”。它要区分访问类型、VMA 类型、PTE 状态、进程状态和内存压力。
+
+\begin{lstlisting}
+handle_page_fault(address, access):
+  vma = find_vma(address)
+  if vma missing: signal segmentation fault
+  if access violates vma permissions: signal protection fault
+  if anonymous and pte missing: allocate zero page
+  if file-backed and pte missing: read page cache or storage
+  if write to COW page: copy or reuse page
+  if swapped out: read swap entry
+  if allocation fails: invoke reclaim or OOM policy
+\end{lstlisting}
+
+同样是 fault，结果可能是成功分配、读文件、复制 COW 页、阻塞等待 I/O、触发回收、杀进程或向用户发送信号。把所有 fault 都理解为“程序错了”，会误解虚拟内存。
+
+\subsection{COW 的关键是同时保护父子和旧 TLB}
+
+fork 之后，父子共享物理页。为了让任何一方第一次写入都被内核截获，父子 PTE 都必须改成只读，并标记 COW。若只改子进程，父进程可以继续写共享页。若改了 PTE 但没有处理 TLB，CPU 可能继续使用旧 writable 翻译。
+
+\begin{lstlisting}
+fork COW:
+  for each writable private page:
+    clear writable in parent PTE
+    install read-only child PTE
+    mark both COW
+    increment physical page refcount
+    invalidate stale writable TLB translations
+\end{lstlisting}
+
+COW 写 fault 的快慢取决于页是否仍共享。如果引用计数为 1，说明只剩当前进程，直接恢复 writable 即可。否则分配新页、复制内容、更新 PTE、减少旧页引用。这里的引用计数必须和页表更新同步，否则可能释放仍被映射的物理页。
+
+\subsection{TLB shootdown 是多核虚拟内存的税}
+
+一个进程可能在多个 CPU 上运行过，或者同一地址空间的多个线程正在不同 CPU 上执行。内核修改某个地址的 PTE 后，要确保所有可能使用旧翻译的 CPU 都失效对应 TLB 项。
+
+\begin{lstlisting}
+shootdown timeline:
+  CPU0 modifies PTE
+  CPU0 records target CPUs using this mm
+  CPU0 sends IPI to CPU1 and CPU2
+  remote CPUs run interrupt handler and invalidate TLB entry
+  remote CPUs acknowledge
+  CPU0 may now free or reuse the old page
+\end{lstlisting}
+
+这就是为什么大量小范围 \code{mprotect}、\code{munmap} 或频繁映射变化可能在多核机器上很贵。成本包括 IPI、远端中断处理、等待确认和丢失 TLB 热状态。批量 unmap 和延迟释放的很多设计，都是为了减少这笔税。
+
+\subsection{cache 一致性不等于程序没有数据竞争}
+
+硬件 cache coherence 通常保证同一个物理地址的 cache line 在多个 CPU 间遵守一致性协议。但这不等于普通读写自动形成程序想要的同步。两个 CPU 同时更新共享变量，仍可能丢失更新；一个 CPU 写数据再写 flag，另一个 CPU 先看到 flag 后看到旧数据，也可能在弱内存模型上发生。
+
+\begin{lstlisting}
+producer:
+  data = 42
+  release_store(ready, true)
+
+consumer:
+  if acquire_load(ready):
+    use(data)
+\end{lstlisting}
+
+锁、原子操作和内存屏障的目标是建立跨 CPU 可见顺序，不是简单地“让 cache 生效”。OS 内部的 runqueue、引用计数、页状态、设备队列，都需要这种顺序保证。
+
+\subsection{NUMA 让“内存速度”不再单一}
+
+多 socket x86-64 机器中，CPU 访问本地内存和远端内存延迟不同、带宽不同。OS 要知道 CPU 和内存 node 的拓扑，尽量让任务运行在靠近其内存的位置，或者把页迁移到任务常运行的 node。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+策略 & 目的 & 代价 \\
+\midrule
+first touch & 谁先写页就从谁本地 node 分配 & 初始化线程位置会影响后续性能 \\
+CPU affinity & 让任务少迁移，保持缓存和内存局部性 & 负载不均时可能浪费 CPU \\
+page migration & 把热页迁到更近 node & 迁移本身消耗带宽和 CPU \\
+interleave & 在多个 node 间分散页 & 降低热点但增加部分远端访问 \\
+\bottomrule
+\end{longtable}
+
+NUMA 问题常被误判为算法慢。同一程序、同一输入，线程绑核和页放置不同，性能可能差很多。OS 调度器和内存管理必须共同考虑这种硬件拓扑。
+
+\subsection{page cache 把内存和存储连接起来}
+
+文件数据读入内存后，不应每次 read 都访问设备。page cache 用内存缓存文件页，普通 read 从缓存复制，普通 write 先写缓存再标 dirty。这样存储 I/O 被合并、重排和批量化，代价是持久化语义变复杂。
+
+\begin{lstlisting}
+file read miss:
+  allocate folio in page cache
+  map file offset to disk block
+  submit block I/O
+  wait for completion
+  mark folio uptodate
+  copy to user
+
+file write:
+  copy from user to folio
+  mark dirty
+  writeback later or on fsync
+\end{lstlisting}
+
+page cache 也参与内存回收。clean 文件页可以直接丢弃，将来再从文件读；dirty 文件页要先写回；匿名页不能从文件重读，只能保留、换出到 swap 或丢弃进程。内存管理和文件系统因此不是两套独立机制。
+
+\subsection{回收和 OOM 是内存承诺失败后的策略}
+
+当空闲页不足，内核先尝试回收：丢 clean page cache，写回 dirty 页，换出匿名页，收缩 slab 缓存。如果仍无法满足分配，就进入 OOM 策略，选择牺牲某个进程或让分配失败。
+
+\begin{lstlisting}
+allocation slow path:
+  try per-cpu page lists
+  try buddy free lists
+  reclaim clean file pages
+  write back dirty pages if allowed
+  swap anonymous pages if configured
+  compact memory for high-order allocation
+  invoke OOM policy if still failing
+\end{lstlisting}
+
+不同分配上下文允许的动作不同。中断上下文不能睡眠等待磁盘 I/O；持锁路径不能随意进入会回调同一锁的回收；高阶分配可能因为碎片失败，即使总空闲内存不少。内存管理的难点在这些上下文约束。
+
+\subsection{内存系统的最低验收}
+
+第一阶段读者应该能解释：为什么 VMA 合法但 PTE 可以不存在；为什么 COW 要写保护父子双方；为什么改 PTE 后要处理 TLB；为什么 cache 一致性不等于数据竞争安全；为什么 page cache 同时属于文件系统和内存管理；为什么 OOM 不一定表示机器真的没有任何空闲字节。
+
+这些问题回答清楚，后面的虚拟内存、文件系统和性能分析才有根基。

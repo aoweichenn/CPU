@@ -1,0 +1,407 @@
+\section{第三阶段 C++20 模型：从 VMA 到 PTE 的可测内存管理器}
+
+虚拟内存不能只靠文字理解。读者至少要实现一个小模型，能把 VMA、PTE、物理页、COW 和缺页处理连起来。这个模型不追求模拟所有硬件细节，而是追求状态可检查：非法地址不能访问，权限收缩必须生效，COW 写入必须复制，引用计数必须闭合。
+
+\subsection{模型边界}
+
+教学模型保留四类对象。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+对象 & 责任 & 不做什么 \\
+\midrule
+\code{PhysicalMemory} & 分配页框、维护引用计数、复制页 & 不模拟 NUMA、cache、DMA \\
+\code{AddressSpace} & 管理 VMA 和页表 & 不模拟多级页表的每级页表页 \\
+\code{PageTableEntry} & 保存页框、权限、COW 标志 & 不模拟 accessed/dirty 的硬件置位细节 \\
+\code{FaultHandler} & 按 VMA/PTE/访问类型处理缺页 & 不模拟真实信号栈和架构异常帧 \\
+\bottomrule
+\end{longtable}
+
+先省略一部分硬件细节，是为了让核心不变量清晰。等这些不变量稳定后，再加入 accessed/dirty、swap、file mapping、TLB shootdown 和 memcg，才不会把系统写成一团不可测代码。
+
+\subsection{类型和常量}
+
+先用强类型别名和命名常量写清地址单位。所有有语义的数字都要命名。
+
+\begin{lstlisting}[language=C++]
+#include <algorithm>
+#include <cstdint>
+#include <deque>
+#include <limits>
+#include <stdexcept>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+using VirtualAddress = std::uint64_t;
+using PageNumber = std::uint64_t;
+using FrameNumber = std::uint64_t;
+
+constexpr std::uint64_t VM_PAGE_SIZE = 4096;
+constexpr VirtualAddress VM_USER_TOP = 0x0000800000000000ULL;
+constexpr FrameNumber VM_INVALID_FRAME =
+    std::numeric_limits<FrameNumber>::max();
+
+enum class AccessKind {
+  Read,
+  Write,
+  Execute,
+};
+\end{lstlisting}
+
+地址计算要集中放在小函数里，避免到处手写除法和取模。
+
+\begin{lstlisting}[language=C++]
+constexpr PageNumber page_number(VirtualAddress address) {
+  return address / VM_PAGE_SIZE;
+}
+
+constexpr std::uint64_t page_offset(VirtualAddress address) {
+  return address % VM_PAGE_SIZE;
+}
+
+constexpr VirtualAddress page_down(VirtualAddress address) {
+  return address - page_offset(address);
+}
+
+constexpr VirtualAddress page_up(VirtualAddress address) {
+  const auto offset = page_offset(address);
+  if (offset == 0) {
+    return address;
+  }
+  return address + (VM_PAGE_SIZE - offset);
+}
+\end{lstlisting}
+
+\subsection{权限和 VMA}
+
+VMA 是区间策略，不是当前硬件映射。它说明地址是否属于进程、理论上允许什么访问、缺页时应该怎样补页。
+
+\begin{lstlisting}[language=C++]
+struct VmPermissions {
+  bool readable = false;
+  bool writable = false;
+  bool executable = false;
+};
+
+bool allows(const VmPermissions& permissions, AccessKind access) {
+  switch (access) {
+    case AccessKind::Read:
+      return permissions.readable;
+    case AccessKind::Write:
+      return permissions.writable;
+    case AccessKind::Execute:
+      return permissions.executable;
+  }
+  throw std::logic_error("unknown access kind");
+}
+
+enum class VmaKind {
+  Anonymous,
+  FilePrivate,
+  FileShared,
+};
+
+struct Vma {
+  VirtualAddress start = 0;
+  VirtualAddress end = 0;
+  VmPermissions permissions;
+  VmaKind kind = VmaKind::Anonymous;
+  std::uint64_t file_offset = 0;
+};
+\end{lstlisting}
+
+VMA 插入时必须检查页对齐、非空区间、用户地址范围和不重叠。教学模型可用有序 vector；查找是线性扫描，语义最直观。
+
+\begin{lstlisting}[language=C++]
+class VmaTable {
+ public:
+  void insert(Vma vma) {
+    this->validate_new_vma(vma);
+    auto position = std::ranges::lower_bound(
+        this->vmas_, vma.start, {}, &Vma::start);
+    this->vmas_.insert(position, std::move(vma));
+  }
+
+  [[nodiscard]] const Vma* find(VirtualAddress address) const {
+    for (const auto& vma : this->vmas_) {
+      if (address < vma.start) {
+        return nullptr;
+      }
+      if (vma.start <= address && address < vma.end) {
+        return &vma;
+      }
+    }
+    return nullptr;
+  }
+
+ private:
+  void validate_new_vma(const Vma& vma) const {
+    if (vma.start >= vma.end) {
+      throw std::invalid_argument("empty VMA");
+    }
+    if (page_offset(vma.start) != 0 || page_offset(vma.end) != 0) {
+      throw std::invalid_argument("VMA must be page aligned");
+    }
+    if (vma.end > VM_USER_TOP) {
+      throw std::invalid_argument("VMA outside user range");
+    }
+    for (const auto& existing : this->vmas_) {
+      const bool disjoint = vma.end <= existing.start || existing.end <= vma.start;
+      if (!disjoint) {
+        throw std::invalid_argument("overlapping VMA");
+      }
+    }
+  }
+
+  std::vector<Vma> vmas_;
+};
+\end{lstlisting}
+
+这段代码故意没有实现自动合并。教学阶段先让每次插入的边界完全显式；等测试覆盖充分后，再把相邻 VMA 合并作为优化加入。
+
+\subsection{物理页和引用计数}
+
+物理内存模型用 frame number 标识页框，页内容用固定大小数组表示。为了节省书中篇幅，可以把内容简化为 byte vector；真实实现中应避免在热路径频繁分配。
+
+\begin{lstlisting}[language=C++]
+struct PhysicalPage {
+  std::vector<std::uint8_t> bytes = std::vector<std::uint8_t>(VM_PAGE_SIZE);
+  std::uint32_t refcount = 0;
+};
+
+class PhysicalMemory {
+ public:
+  FrameNumber allocate_zeroed() {
+    FrameNumber frame = VM_INVALID_FRAME;
+    if (!this->free_list_.empty()) {
+      frame = this->free_list_.front();
+      this->free_list_.pop_front();
+      auto& page = this->pages_.at(frame);
+      std::ranges::fill(page.bytes, 0);
+      page.refcount = 1;
+      return frame;
+    }
+
+    frame = static_cast<FrameNumber>(this->pages_.size());
+    PhysicalPage page;
+    page.refcount = 1;
+    this->pages_.push_back(std::move(page));
+    return frame;
+  }
+
+  FrameNumber clone(FrameNumber source) {
+    const FrameNumber target = this->allocate_zeroed();
+    this->pages_.at(target).bytes = this->pages_.at(source).bytes;
+    return target;
+  }
+
+  void retain(FrameNumber frame) {
+    this->pages_.at(frame).refcount += 1;
+  }
+
+  void release(FrameNumber frame) {
+    auto& page = this->pages_.at(frame);
+    if (page.refcount == 0) {
+      throw std::logic_error("double release of physical page");
+    }
+    page.refcount -= 1;
+    if (page.refcount == 0) {
+      this->free_list_.push_back(frame);
+    }
+  }
+
+  [[nodiscard]] std::uint32_t refcount(FrameNumber frame) const {
+    return this->pages_.at(frame).refcount;
+  }
+
+ private:
+  std::vector<PhysicalPage> pages_;
+  std::deque<FrameNumber> free_list_;
+};
+\end{lstlisting}
+
+引用计数是 COW 的核心证据。每个测试结束时，物理页活跃数、引用计数和页表映射数要能对上，否则模型可能泄漏或重复释放。
+
+\subsection{PTE 和地址空间}
+
+PTE 保存当前硬件可见映射。VMA 允许写不等于 PTE 当前可写；COW 页的 VMA 允许写，但 PTE 要暂时只读，让第一次写触发 fault。
+
+\begin{lstlisting}[language=C++]
+struct PageTableEntry {
+  FrameNumber frame = VM_INVALID_FRAME;
+  VmPermissions permissions;
+  bool present = false;
+  bool cow = false;
+};
+
+class AddressSpace {
+ public:
+  void map_vma(Vma vma) {
+    this->vmas_.insert(vma);
+  }
+
+  [[nodiscard]] const Vma* find_vma(VirtualAddress address) const {
+    return this->vmas_.find(address);
+  }
+
+  [[nodiscard]] PageTableEntry* find_pte(VirtualAddress address) {
+    const auto iterator = this->page_table_.find(page_number(address));
+    if (iterator == this->page_table_.end()) {
+      return nullptr;
+    }
+    return &iterator->second;
+  }
+
+  void install_pte(VirtualAddress address, PageTableEntry pte) {
+    this->page_table_[page_number(address)] = pte;
+  }
+
+ private:
+  VmaTable vmas_;
+  std::unordered_map<PageNumber, PageTableEntry> page_table_;
+};
+\end{lstlisting}
+
+这个页表是哈希表，不是多级页表。它足以表达“某个虚拟页当前是否 present、权限是什么、是否 COW”。后续实践卷再把它替换成四级页表或模拟 TLB。
+
+\subsection{缺页处理}
+
+缺页处理先查 VMA，再查权限，再决定是新分配、COW 还是权限错误。返回结果要区分用户可见错误。
+
+\begin{lstlisting}[language=C++]
+enum class FaultResult {
+  Resolved,
+  SegmentationFault,
+  ProtectionFault,
+};
+
+class FaultHandler {
+ public:
+  explicit FaultHandler(PhysicalMemory& memory) : memory_(memory) {}
+
+  FaultResult handle(AddressSpace& space, VirtualAddress address, AccessKind access) {
+    const Vma* vma = space.find_vma(address);
+    if (vma == nullptr) {
+      return FaultResult::SegmentationFault;
+    }
+    if (!allows(vma->permissions, access)) {
+      return FaultResult::ProtectionFault;
+    }
+
+    PageTableEntry* pte = space.find_pte(address);
+    if (pte != nullptr && pte->present) {
+      return this->handle_present_pte(*pte, access);
+    }
+
+    PageTableEntry new_pte;
+    new_pte.frame = this->memory_.allocate_zeroed();
+    new_pte.present = true;
+    new_pte.permissions = vma->permissions;
+    space.install_pte(address, new_pte);
+    return FaultResult::Resolved;
+  }
+
+ private:
+  FaultResult handle_present_pte(PageTableEntry& pte, AccessKind access) {
+    if (allows(pte.permissions, access)) {
+      return FaultResult::Resolved;
+    }
+    if (access == AccessKind::Write && pte.cow) {
+      return this->resolve_cow(pte);
+    }
+    return FaultResult::ProtectionFault;
+  }
+
+  FaultResult resolve_cow(PageTableEntry& pte) {
+    if (this->memory_.refcount(pte.frame) == 1) {
+      pte.permissions.writable = true;
+      pte.cow = false;
+      return FaultResult::Resolved;
+    }
+
+    const FrameNumber old_frame = pte.frame;
+    const FrameNumber new_frame = this->memory_.clone(old_frame);
+    this->memory_.release(old_frame);
+    pte.frame = new_frame;
+    pte.permissions.writable = true;
+    pte.cow = false;
+    return FaultResult::Resolved;
+  }
+
+  PhysicalMemory& memory_;
+};
+\end{lstlisting}
+
+这段实现有一个清晰的不变量：COW 处理前，PTE 不可写；处理后，当前地址空间获得可写私有页；旧 frame 引用计数减少。若 refcount 为 1，不复制，只把权限改回可写。
+
+\subsection{fork 的 COW 准备}
+
+fork 时复制页表，但共享物理页，把双方 PTE 改为只读 COW。VMA 不需要复制物理页，只要复制区间策略。
+
+\begin{lstlisting}
+fork address space:
+  copy VMA table
+  for each present writable anonymous PTE:
+    clear writable in parent PTE
+    set cow in parent PTE
+    create child PTE pointing to same frame
+    clear writable in child PTE
+    set cow in child PTE
+    retain physical frame
+\end{lstlisting}
+
+教学代码实现 fork 时要特别注意父进程 PTE 也要改成只读。如果只改子进程，父进程写入不会 fault，会直接污染共享页。真实系统还要 flush 父进程对应 TLB，否则父 CPU 可能继续使用旧 writable 权限。
+
+\subsection{mprotect 的模型}
+
+\code{mprotect} 至少要改 VMA 权限和已有 PTE 权限。教学模型可以先拒绝跨 VMA 的复杂修改，只允许整段 VMA 修改；实践卷再实现切分。
+
+\begin{lstlisting}
+mprotect simplified:
+  find exact VMA [start, end)
+  verify new permissions do not exceed may permissions
+  update VMA permissions
+  for each PTE in range:
+    pte.permissions = intersect(pte.permissions, new_permissions)
+    if new permissions remove write:
+      record need_tlb_flush
+\end{lstlisting}
+
+注意“扩大权限”不能只改 PTE，还要检查原始 \code{may} 权限；“缩小权限”不能只改 VMA，还要改已经 present 的 PTE。否则已有映射会继续按旧权限访问。
+
+\subsection{测试用例}
+
+这个模型至少要有以下测试。
+
+\begin{longtable}{p{0.24\linewidth}p{0.36\linewidth}p{0.28\linewidth}}
+\toprule
+测试 & 步骤 & 期望 \\
+\midrule
+未映射地址 & 不建 VMA，访问地址 & 返回段错误结果 \\
+懒分配 & 建匿名 VMA，首次读 & 分配零页并 resolved \\
+写只读 VMA & VMA 只读，执行写 fault & 返回权限错误结果 \\
+COW refcount>1 & 父子共享页，子写 & 子获得新 frame，旧 frame refcount 减一 \\
+COW refcount=1 & 单独持有 COW 页后写 & 不复制，只恢复 writable \\
+mprotect 收缩 & RW 改 R 后写 & 写失败，旧权限不能生效 \\
+double release & 对同一 frame release 两次 & 抛出逻辑错误或测试失败 \\
+\bottomrule
+\end{longtable}
+
+测试要断言内部状态，而不是只断言返回值。例如 COW 测试必须检查父子 frame 是否不同、内容是否正确、旧 frame 引用计数是否符合预期。只有这样才能发现“看似成功但泄漏引用”的错误。
+
+\subsection{从教学模型到真实内核}
+
+这个模型和真实内核差距很大，但差距是有方向的。
+
+\begin{itemize}
+\tightlist
+\item 把哈希页表替换为多级页表，可学习页表页分配和页表遍历。
+\item 给 PTE 加 accessed/dirty，可学习回收和写回。
+\item 给 VMA 加文件对象和 offset，可学习 mmap 与 page cache。
+\item 给地址空间加 active CPU 集合，可学习 TLB shootdown。
+\item 给物理页加 memcg、zone、order 和 migratetype，可学习 buddy、NUMA、compaction。
+\item 给 fault handler 加可睡眠点和 retry，可学习真实缺页路径的并发。
+\end{itemize}
+
+不要一开始就实现所有功能。先让最小模型通过严格测试，再逐步加入复杂字段。操作系统工程的质量来自可维护的不变量，而不是一次性写出大量不可验证的机制。

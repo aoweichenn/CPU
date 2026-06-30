@@ -1,0 +1,134 @@
+\section{第二阶段证据与验收：把卡顿、死锁和饥饿拆开}
+
+第二阶段的目标不是背更多调度算法和同步原语，而是能解释一个系统为什么没有推进。用户说“卡住了”，内核可能在等 CPU、等锁、等 I/O、等内存回收、等定时器、等信号，也可能已经退出但没人回收。本节把证据、问题类型和验收方法放在一起。
+
+\subsection{先分类：没有推进的六种状态}
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+现象 & 内核解释 & 主要证据 \\
+\midrule
+CPU 忙但请求慢 & runnable 竞争、锁自旋、软中断占用 & \code{perf top}、\code{perf sched}、runqueue \\
+CPU 不忙但请求慢 & 线程 sleeping 等事件 & off-CPU profile、等待队列、I/O 统计 \\
+周期性尖峰 & cgroup throttle、定时批处理、GC/回收 & cgroup \code{cpu.stat}、tracepoint \\
+永久等待 & lost wakeup、死锁、关闭未唤醒 & 等待图、锁依赖、线程栈 \\
+低优先级饿死 & 高优先级或实时任务长期占用 & 调度类、优先级、runtime 统计 \\
+zombie 增多 & 父进程未 wait 或 reaper 异常 & \code{ps}、进程树、wait 路径 \\
+\bottomrule
+\end{longtable}
+
+分类的价值是避免乱调参数。若线程在 I/O wait，修改时间片无效；若被 cgroup 限流，优化业务代码可能只降低配额内 CPU 时间，仍有周期性等待；若是 lost wakeup，增加 CPU 只会让 bug 更随机。
+
+\subsection{线程栈是等待原因的第一证据}
+
+卡住时，先看线程栈。用户态栈能显示线程停在哪个库调用；内核栈能显示它睡在 futex、poll、read、writeback、page fault、mutex、waitpid 还是其他路径。
+
+\begin{lstlisting}
+questions for a blocked thread:
+  Is it in futex_wait?
+  Is it in epoll_wait or poll?
+  Is it in read/write/fsync?
+  Is it in page fault or reclaim?
+  Is it waiting for child exit?
+  Is it runnable but not scheduled?
+\end{lstlisting}
+
+只有 runnable 但没被调度，才优先看调度器。若栈显示在 \code{futex\_wait}，要找持锁者；若在 \code{epoll\_wait}，要找 fd readiness 和关闭路径；若在 \code{waitpid}，要找子进程状态。
+
+\subsection{等待图：死锁和优先级反转的共同语言}
+
+等待图把“谁等谁”显式化。线程等待锁，锁由另一个线程持有；线程等待 I/O，请求由设备 completion 完成；线程等待子进程，子进程由调度器和 exit 路径推进。死锁是等待图成环，优先级反转是等待图上的 owner 得不到 CPU。
+
+\begin{lstlisting}
+wait graph example:
+  T1 waits lock A, owned by T2
+  T2 waits lock B, owned by T3
+  T3 waits lock C, owned by T1
+  => cycle, deadlock
+
+priority inversion:
+  High waits lock A, owned by Low
+  Medium runnable and preempts Low
+  => no cycle, but scheduler must boost Low
+\end{lstlisting}
+
+这个区分很重要。死锁需要打破环；优先级反转需要让持锁者运行；lost wakeup 则可能没有 owner，因为等待者睡在一个再也不会被通知的队列上。
+
+\subsection{调度证据的最小集合}
+
+一次调度问题至少收集：
+
+\begin{lstlisting}
+minimum scheduling evidence:
+  number of runnable tasks
+  context switch rate
+  per-task runtime and wait time
+  migrations
+  cgroup throttled time
+  interrupt and softirq distribution
+\end{lstlisting}
+
+\begin{longtable}{p{0.24\linewidth}p{0.46\linewidth}p{0.18\linewidth}}
+\toprule
+指标 & 解释 & 风险 \\
+\midrule
+nr\_running & 可运行任务数量 & 高表示 CPU 竞争 \\
+voluntary cs & 主动阻塞切换 & I/O/锁/等待事件多 \\
+involuntary cs & 被抢占切换 & 时间片、优先级、竞争 \\
+migrations & CPU 迁移次数 & 可能损失 cache/NUMA 局部性 \\
+throttled time & cgroup 配额等待 & 容器周期性延迟 \\
+softirq time & 网络/块等延后处理 & 可能抢占业务线程 \\
+\bottomrule
+\end{longtable}
+
+这些指标要放到同一条时间线上看。平均值很容易掩盖尾延迟：一个 100ms 周期里前 20ms 很快，后 80ms 被 throttle，平均 CPU 使用并不能解释 p99。
+
+\subsection{同步证据的最小集合}
+
+同步问题至少收集对象状态、等待谓词、持有者、等待者和关闭状态。
+
+\begin{lstlisting}
+minimum synchronization evidence:
+  object id and state fields
+  lock owner
+  waiter list
+  wait predicate
+  last state transition
+  close/cancel/timeout flag
+\end{lstlisting}
+
+如果一个队列卡住，要能回答：队列是空还是满，closed 是否为真，谁应该唤醒 not\_empty，谁应该唤醒 not\_full，等待者的 timeout 是否已经过期。没有这些字段，日志再多也只是噪声。
+
+\subsection{第二阶段负面测试}
+
+\begin{longtable}{p{0.25\linewidth}p{0.42\linewidth}p{0.22\linewidth}}
+\toprule
+注入点 & 目的 & 期望 \\
+\midrule
+fork 第 N 步失败 & 验证资源回滚 & 无泄漏、无半成品可见 \\
+exec commit 前失败 & 验证旧程序保留 & 返回错误，旧地址空间仍可用 \\
+wait 与 exit 并发 & 验证 zombie 回收 & 只回收一次 \\
+唤醒发生在入队前 & 验证无 lost wakeup & 等待者不永久睡眠 \\
+锁顺序反转 & 验证 deadlock 检测 & 报告等待环 \\
+高优先级等低优先级锁 & 验证优先级继承 & 持锁者被提升并释放锁 \\
+cgroup budget 耗尽 & 验证 throttle/unthrottle & 周期刷新后恢复运行 \\
+关闭有等待者的队列 & 验证广播唤醒 & 所有等待者退出 \\
+\bottomrule
+\end{longtable}
+
+这些测试比“创建几个线程跑一跑”更接近内核质量要求。它们检查的是状态机边界，而不是碰巧跑通的正常路径。
+
+\subsection{第二阶段完成标准}
+
+\begin{itemize}
+\tightlist
+\item 能从 fork 的每个阶段说出可见性、失败点和回滚对象。
+\item 能解释 exec 的提交点，以及 commit 前后失败语义为什么不同。
+\item 能区分 runnable wait、on-CPU、off-CPU sleep 和 zombie。
+\item 能说明每 CPU runqueue、唤醒抢占、负载均衡和 cgroup 配额的关系。
+\item 能为一个同步对象写出字段、不变量、等待谓词和关闭路径。
+\item 能画出死锁等待图、优先级反转等待图和 lost wakeup 时序。
+\item 能用证据判断一个卡顿属于调度问题、锁问题、I/O 问题还是退出回收问题。
+\end{itemize}
+
+到这个标准，进程、调度和同步才不再是 API 名称，而是可证明推进的状态机。

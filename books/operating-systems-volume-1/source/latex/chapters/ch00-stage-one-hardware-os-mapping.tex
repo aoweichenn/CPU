@@ -1,0 +1,109 @@
+\section{第一阶段映射表：硬件对象怎样变成内核对象}
+
+学硬件最容易卡在“知道名词但不知道用在哪里”。本节把第一阶段核心硬件逐项映射到 OS 对象、源码入口、观测证据和失败案例。读者以后遇到任何新硬件，都应该按这张表追问：它暴露什么寄存器或协议，内核为它建什么对象，失败时谁等待，谁唤醒，谁回收资源。
+
+\subsection{CPU 状态到任务上下文}
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.26\linewidth}p{0.18\linewidth}}
+\toprule
+硬件事实 & OS 对象 & 源码阅读入口 & 证据 \\
+\midrule
+RIP/通用寄存器 & trap frame、thread context & \code{arch/x86/entry/}、\code{switch\_to} & \code{perf sched}、内核栈 \\
+状态寄存器 & 中断位、模式位、返回状态 & 异常返回路径 & 信号、ptrace、崩溃现场 \\
+内核栈 & 每线程内核执行上下文 & task/thread struct & \code{/proc/<pid>/stack} \\
+FPU/SIMD 寄存器 & 扩展上下文保存区 & FPU lazy/eager save 代码 & 信号帧、上下文切换成本 \\
+\bottomrule
+\end{longtable}
+
+失败案例：上下文切换漏保存寄存器，用户程序会随机算错；返回用户态前模式位错误，可能把用户代码带回高特权；中断栈损坏，异常嵌套会让系统无法可靠 panic。
+
+\subsection{MMU 到地址空间}
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.26\linewidth}p{0.18\linewidth}}
+\toprule
+硬件事实 & OS 对象 & 源码阅读入口 & 证据 \\
+\midrule
+页表根 & \code{mm\_struct}/地址空间 & \code{mm/}、架构页表代码 & \code{/proc/<pid>/maps} \\
+PTE 权限 & VMA、PTE、fault handler & \code{mm/memory.c} & SIGSEGV、page fault 计数 \\
+TLB & shootdown、ASID/PCID & \code{mm/tlb.c} & IPI、TLB miss、mprotect 成本 \\
+COW 只读页 & 页引用计数和写 fault & fork 和 fault 路径 & fork 后 RSS、minor fault \\
+\bottomrule
+\end{longtable}
+
+失败案例：修改 PTE 后不失效 TLB，旧权限继续生效；COW 页忘记设只读，父子进程互相污染；释放页表页早于远端 CPU shootdown，旧翻译可能写坏新对象。
+
+\subsection{中断控制器到事件分发}
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.26\linewidth}p{0.18\linewidth}}
+\toprule
+硬件事实 & OS 对象 & 源码阅读入口 & 证据 \\
+\midrule
+IRQ line/vector & irq descriptor、handler & \code{kernel/irq/} & \code{/proc/interrupts} \\
+MSI/MSI-X & 每队列中断向量 & PCI/MSI 子系统 & \code{lspci -vv} \\
+IPI & CPU 间控制消息 & smp call、resched、TLB shootdown & perf/trace 中 IPI \\
+定时器事件 & clockevent、hrtimer、tick & \code{kernel/time/} & \code{/proc/timer\_list} \\
+\bottomrule
+\end{longtable}
+
+失败案例：中断未确认会形成中断风暴；中断亲和性不合理会让 CPU0 成瓶颈；定时器未初始化就把 CPU 标记 online，任务迁移过去后无法抢占。
+
+\subsection{总线和 MMIO 到驱动资源}
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.26\linewidth}p{0.18\linewidth}}
+\toprule
+硬件事实 & OS 对象 & 源码阅读入口 & 证据 \\
+\midrule
+PCI BAR & resource、ioremap 区间 & PCI core、driver probe & \code{lspci -vv}、\code{/proc/iomem} \\
+ACPI resource & platform/PCI resource & ACPI parser、PCI core & dmesg probe 日志 \\
+MMIO 寄存器 & \code{readl/writel} 协议 & 各设备驱动 & 超时、状态寄存器 \\
+posted write & 需要读回或屏障确认 & arch I/O barrier & 随机设备状态错误 \\
+\bottomrule
+\end{longtable}
+
+失败案例：把 MMIO 当普通内存缓存，读写会被重排或省略；驱动 probe 失败不逆序释放资源，后续驱动无法绑定；BAR 解析错误会访问不属于该设备的地址窗口。
+
+\subsection{DMA 和 IOMMU 到 buffer 生命周期}
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.26\linewidth}p{0.18\linewidth}}
+\toprule
+硬件事实 & OS 对象 & 源码阅读入口 & 证据 \\
+\midrule
+DMA descriptor & 请求队列、ring、SQE & NVMe/NIC/GPU 驱动 & 队列深度、completion \\
+DMA 地址/IOVA & DMA mapping、IOMMU PTE & DMA API、IOMMU 子系统 & IOMMU fault 日志 \\
+cache 一致性 & clean/invalidate、方向标志 & arch DMA ops & 旧数据、数据损坏 \\
+completion & 中断、轮询、fence & 驱动 completion 路径 & timeout/reset 日志 \\
+\bottomrule
+\end{longtable}
+
+失败案例：completion 前释放 buffer，会出现迟到 DMA 写；方向标错会导致设备看到旧数据或 CPU 看到旧数据；IOMMU unmap 后设备继续 DMA，应触发 fault，而不是写到任意内存。
+
+\subsection{存储硬件到文件系统语义}
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.26\linewidth}p{0.18\linewidth}}
+\toprule
+硬件事实 & OS 对象 & 源码阅读入口 & 证据 \\
+\midrule
+块设备队列 & request queue、tag set & block layer、NVMe/SCSI & \code{iostat -x}、blk trace \\
+设备 cache & flush/FUA 请求 & filesystem fsync 路径 & fsync 延迟、flush 计数 \\
+NAND/FTL & discard/TRIM、写放大 & block discard、FS 策略 & SMART、设备日志 \\
+介质错误 & bad block、I/O error & error handler、retry & dmesg、EIO \\
+\bottomrule
+\end{longtable}
+
+失败案例：\code{write} 返回成功后断电，数据可能只在 page cache 或设备 cache 中；没有 flush/FUA，日志提交顺序可能不满足崩溃恢复；设备 reset 时 in-flight 请求不处理，会让等待者永久睡眠。
+
+\subsection{第一阶段读源码的最低路线}
+
+不需要一开始读完整 Linux。第一阶段源码阅读只抓硬件边界：
+
+\begin{enumerate}
+\tightlist
+\item \code{arch/x86/entry/}：系统调用、中断和异常如何保存状态。
+\item \code{arch/x86/mm/} 与 \code{mm/memory.c}：页表、fault、TLB 失效。
+\item \code{kernel/irq/} 与 \code{kernel/time/}：IRQ 和定时器如何变成内核事件。
+\item \code{drivers/pci/}、\code{drivers/base/}：设备如何被发现和绑定驱动。
+\item \code{kernel/dma/}、\code{drivers/iommu/}：DMA 地址空间如何建立和回收。
+\item 一个具体驱动，例如 NVMe 或 e1000/e1000e：队列、doorbell、DMA、completion 如何闭环。
+\end{enumerate}
+
+读每个入口都只问四个问题：谁拥有对象，什么时候发布给硬件，失败时怎样回滚，完成时怎样通知等待者。第一阶段能用这四问读通一个驱动的提交和完成路径，才算真正过关。

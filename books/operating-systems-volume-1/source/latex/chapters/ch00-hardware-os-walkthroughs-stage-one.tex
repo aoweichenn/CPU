@@ -1,0 +1,277 @@
+\section{第一阶段全链路案例：从硬件事件走到内核对象}
+
+上一节说明硬件机制如何逼出操作系统对象。本节继续用长案例把这些对象串起来。每个案例都尽量避免只给结论，而是按事件推进：硬件先发生什么，CPU 看到什么，内核保存什么状态，用户态最后观察到什么。这样写比背诵名词慢，但更接近真实调试。
+
+\subsection{案例一：一条系统调用从用户态走到设备}
+
+考虑用户程序执行：
+
+\begin{lstlisting}
+read(fd, buffer, 4096)
+\end{lstlisting}
+
+若 \code{fd} 指向一个冷缓存普通文件，这一行会跨过几乎所有 OS 层次。用户态先把系统调用号、fd、buffer 地址、长度放进约定寄存器，执行 syscall 指令。CPU 切到内核态，进入系统调用入口，内核保存用户寄存器形成 trap frame。
+
+\begin{lstlisting}
+user registers:
+  syscall number = read
+  arg0 = fd
+  arg1 = user buffer pointer
+  arg2 = length
+
+CPU transition:
+  switch privilege to kernel
+  jump to syscall entry
+  use kernel stack
+  save user register frame
+\end{lstlisting}
+
+内核不能相信任何参数。fd 可能无效；buffer 可能指向未映射地址；长度可能过大；文件可能不可读；调用可能被信号打断。检查通过后，fd 表把小整数映射到 \code{struct file}，\code{struct file} 再指向 inode、文件偏移和操作函数。若 page cache 命中，内核只需从缓存页复制到用户 buffer。冷缓存时，路径继续下行。
+
+\begin{lstlisting}
+fd table -> struct file
+struct file -> inode and file operations
+page cache lookup(file, index)
+if miss:
+  filesystem maps logical file block to disk block
+  block layer creates request
+  driver submits DMA command to device
+\end{lstlisting}
+
+设备请求提交后，当前线程没有数据可返回。同步 \code{read} 的表现是“阻塞”，但内核内部已经变成异步：request 在设备队列里，task 在等待队列里，buffer 或 page cache folio 等待 DMA 完成。CPU 可以调度别的任务运行。
+
+\begin{lstlisting}
+current task:
+  state = sleeping
+  wait_reason = I/O
+  wait_queue = folio waiters or request waiters
+
+device:
+  command descriptor visible through DMA
+  completion will arrive by interrupt or polling
+\end{lstlisting}
+
+设备完成 DMA 后，写 completion queue 或状态寄存器，触发 MSI-X 中断。CPU 进入中断入口，驱动读取 completion，解除 DMA 映射，标记 folio uptodate，唤醒等待任务。任务重新变成 runnable，调度器稍后选中它，系统调用继续执行，把页缓存中的字节复制到用户 buffer，更新文件 offset，返回读取字节数。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+层次 & 关键对象 & 失败或延迟来源 \\
+\midrule
+用户态 ABI & syscall number、参数寄存器 & 参数错误、信号打断 \\
+fd 层 & fd table、struct file & EBADF、权限不匹配 \\
+VFS/page cache & inode、folio、xarray & cache miss、folio lock 等待 \\
+文件系统 & extent、block mapping & 元数据 I/O、碎片 \\
+块层 & bio、request、queue & 队列拥塞、调度延迟 \\
+驱动/设备 & DMA descriptor、completion & 超时、IRQ 丢失、设备错误 \\
+返回用户态 & copy\_to\_user、offset & 用户页缺页、短读 \\
+\bottomrule
+\end{longtable}
+
+这个案例最重要的结论是：一次 \code{read} 不是“内核读磁盘”。它是用户态 ABI、权限、页缓存、文件系统映射、块层队列、DMA、中断、调度和用户内存复制的组合。定位慢读时也必须逐层排查：是系统调用太多，page cache miss，文件系统碎片，块队列拥塞，设备慢，还是用户 buffer 缺页。
+
+\subsection{案例二：一次写入为什么不能保证掉电后存在}
+
+再看：
+
+\begin{lstlisting}
+write(fd, data, len)
+\end{lstlisting}
+
+普通 buffered write 往往只把用户数据复制进 page cache，把 folio 标记为 dirty，然后返回。它没有承诺设备已经写入，更没有承诺掉电后还能读到。这个语义来自硬件速度差异和批量 I/O：如果每次小写都同步落盘，吞吐会极低，存储寿命也会受影响。
+
+\begin{lstlisting}
+buffered write:
+  validate fd and user buffer
+  find or allocate page cache folio
+  copy bytes from user to folio
+  mark folio dirty
+  update inode size if needed
+  return len
+\end{lstlisting}
+
+dirty folio 稍后由后台 writeback 或显式 \code{fsync} 推进到块层。若文件系统有日志，还要先记录元数据意图，再写 home location。若设备有 volatile cache，还要 flush 或使用 FUA。若目录项也改变，例如安全替换文件时使用 \code{rename}，父目录也要 \code{fsync}。
+
+\begin{lstlisting}
+durable replace:
+  write temp file data
+  fsync temp file
+  rename temp to target
+  fsync parent directory
+\end{lstlisting}
+
+这个模式看似重复，实际保护的是不同对象。第一个 \code{fsync} 保护文件数据和 inode 必要元数据；\code{rename} 改变目录项；第二个 \code{fsync} 保护目录项持久化。若省略父目录同步，崩溃后可能出现文件数据已经在盘上，但目录项没有指向它。
+
+硬件层也有顺序问题。存储设备可能为了性能重排写入；文件系统日志必须用 barrier/flush 保证“日志提交记录”不会早于日志内容持久化。否则恢复时看见 commit，却读不到完整日志，崩溃一致性就被破坏。
+
+\subsection{案例三：一次 page fault 如何从错误变成分配}
+
+用户程序访问一个刚 \code{mmap} 出来的匿名页：
+
+\begin{lstlisting}
+char* p = mmap(..., PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, ...);
+p[0] = 1;
+\end{lstlisting}
+
+\code{mmap} 成功时，内核通常只建立 VMA，未必立刻分配物理页。第一次写入时，CPU 查 TLB 失败，走页表发现 PTE 不 present，于是产生 page fault。硬件把 fault address、访问类型、当前 RIP 和错误码交给内核入口。
+
+\begin{lstlisting}
+page fault handler:
+  read fault address and error code
+  find VMA covering address
+  verify write permission
+  allocate zeroed physical page
+  install writable PTE
+  flush or update TLB as needed
+  return to faulting instruction
+\end{lstlisting}
+
+这不是“程序崩溃”。只要 VMA 合法且权限允许，内核可以修复页表，然后让同一条指令重试。重试时 TLB 能找到新 PTE，store 成功。懒分配让大虚拟地址空间变得便宜，也让实际物理内存按需使用。
+
+COW fault 类似但更微妙。fork 后父子共享同一物理页，PTE 都是 read-only + COW。任一方写入时，page fault handler 发现这是 COW 写 fault：若页仍共享，就分配新页复制内容，再把写入方 PTE 改成 writable；若页已经独占，可以直接恢复 writable。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+fault 类型 & 内核动作 & 用户态结果 \\
+\midrule
+匿名懒分配 & 分配零页并安装 PTE & 指令重试成功 \\
+COW 写入 & 复制共享页或恢复写权限 & 父子内容分离 \\
+文件映射缺页 & 从 page cache 或存储读入 & 访问到文件内容 \\
+权限错误 & 生成信号或异常 & \code{SIGSEGV} 等失败 \\
+内核地址访问 & 拒绝用户访问 & 进程被终止或返回错误 \\
+\bottomrule
+\end{longtable}
+
+理解 page fault 后，许多现象会变得自然：虚拟内存大于物理内存不奇怪，\code{malloc} 后首次访问慢不奇怪，fork 很快也不奇怪。真正需要警惕的是 fault 路径持锁、I/O、OOM 和 TLB shootdown 造成的长尾延迟。
+
+\subsection{案例四：一次网络包如何变成 socket 可读}
+
+网卡收到以太网帧时，通常通过 DMA 把数据写入预先准备好的 receive ring buffer。设备更新 completion 或 descriptor 状态，触发中断或等待 NAPI 轮询。驱动把 buffer 包装成 \code{skb}，交给网络协议栈。
+
+\begin{lstlisting}
+NIC receive:
+  packet arrives on wire
+  NIC chooses RX descriptor
+  DMA writes packet into memory
+  NIC reports completion
+  driver builds skb
+  protocol stack parses Ethernet/IP/TCP
+  TCP queues payload to socket receive queue
+  wake tasks or epoll waiters
+\end{lstlisting}
+
+这条路径有两个队列层次。硬件有 RX ring，决定设备把包放到哪里；内核有 socket receive queue，决定应用何时能读到数据。中间还有 GRO、校验和卸载、路由、Netfilter、TCP 重排、流控和拥塞控制。应用调用 \code{recv} 看到的是字节流，但内核背后处理的是包、段、序列号和状态机。
+
+为什么高性能网络程序常用 epoll？因为 readiness 和阻塞状态要被集中管理。若 socket receive queue 为空，\code{recv} 在阻塞模式下会睡眠，在非阻塞模式下返回 \code{EAGAIN}。epoll 把“哪些 fd 可能可读”组织成事件集合，避免一个线程为大量连接逐个阻塞。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+阶段 & 关键状态 & 常见故障 \\
+\midrule
+RX ring & descriptor、DMA address、buffer ownership & ring 满、buffer 泄漏、DMA 错误 \\
+中断/NAPI & budget、poll 状态、IRQ affinity & 中断风暴、软中断延迟 \\
+协议栈 & skb、路由、TCP 状态 & 丢包、乱序、重传 \\
+socket & receive queue、wait queue & backlog 满、应用读取慢 \\
+用户态 & epoll interest、非阻塞循环 & 忙等、短读、背压缺失 \\
+\bottomrule
+\end{longtable}
+
+这个案例说明网络不是独立于 OS 的应用层话题。它和 DMA、cache、NUMA、中断亲和性、调度延迟、内存分配都有关系。一个网络服务 p99 延迟升高，可能是 TCP 重传，也可能是 softirq 被抢占，也可能是 RX buffer 分配慢，还可能是用户态没有及时 drain socket。
+
+\subsection{案例五：一次进程切换到底切了哪些硬件状态}
+
+调度器选择下一个任务只是开始。真正的上下文切换要处理寄存器、栈、地址空间、FPU/SIMD 状态、调试寄存器、性能计数、CPU 本地状态和调度统计。不同架构细节不同，但核心问题相同：哪些状态是任务私有的，哪些状态是 CPU 私有的，哪些状态可以延迟保存。
+
+\begin{lstlisting}
+context switch:
+  save callee-saved registers of prev
+  save prev kernel stack pointer
+  choose next kernel stack
+  switch address space if mm differs
+  handle lazy or eager FPU state
+  update current task pointer
+  restore next registers
+  return into next task's previous kernel path
+\end{lstlisting}
+
+地址空间切换可能影响 TLB。若硬件支持 ASID/PCID，旧地址空间的 TLB 项可以带标签保留；若没有标签或必须失效，切换成本更高。FPU/SIMD 状态很大，早期系统常用 lazy save，但安全问题和实现复杂性让许多系统转向 eager 策略。调度器的“公平”算法只是上层，底层切换成本会反过来影响线程数量和时间片选择。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+状态 & 为什么要处理 & 优化或风险 \\
+\midrule
+通用寄存器 & 任务恢复后继续计算 & 保存集合由 ABI 和入口路径决定 \\
+内核栈 & 每个任务有自己的内核执行现场 & 栈溢出会破坏内核对象 \\
+页表根/ASID & 不同进程地址空间不同 & PCID/ASID 降低 TLB 刷新 \\
+FPU/SIMD & 用户可见寄存器很多 & lazy 策略复杂，eager 成本固定 \\
+分支/cache 状态 & 微架构状态影响性能和安全 & 侧信道缓解可能增加成本 \\
+\bottomrule
+\end{longtable}
+
+因此“线程很轻量”只在相对进程创建、地址空间复制而言成立。大量 runnable 线程仍会带来调度排队、cache 污染、TLB 压力和栈内存占用。OS 教材必须把调度算法和硬件切换成本一起讲，否则容易误导读者以为线程只是一个软件列表节点。
+
+\subsection{案例六：一次设备复位为什么会影响所有等待者}
+
+设备可能超时、固件崩溃、PCIe 链路错误或队列失去响应。驱动不能只打印错误然后继续提交请求。可靠复位要把设备状态机和内核请求状态机一起处理。
+
+\begin{lstlisting}
+device reset:
+  stop accepting new requests
+  mark queues frozen
+  collect in-flight requests
+  disable interrupts or mask vectors
+  reset hardware
+  rebuild rings and registers
+  decide old requests: retry, fail, or complete
+  unfreeze queues
+  wake all affected waiters
+\end{lstlisting}
+
+这个过程解释了为什么驱动需要 request id、引用计数、超时计时器、错误码和 completion 路径。若复位时漏掉某个 in-flight 请求，等待它的进程会永久睡眠；若复位后旧 completion 迟到，可能错误完成新请求；若直接释放 DMA buffer，设备可能在复位前后继续写内存。
+
+设备复位也是“硬件不可靠”进入 OS 设计的例子。操作系统不能假设设备总按协议完成。它必须有超时、取消、错误传播和恢复策略。高质量驱动的难点往往不在正常提交，而在这些异常路径。
+
+\subsection{案例七：一次安全边界检查跨越了哪些硬件}
+
+用户程序打开文件，看起来是路径权限问题，但硬件也参与了安全边界。用户态无法直接读磁盘，是因为没有设备 MMIO 权限；无法修改内核文件缓存，是因为页表隔离；无法伪造系统调用结果，是因为返回路径由内核控制；无法直接访问别的进程地址，是因为 MMU 和特权级共同限制。
+
+\begin{lstlisting}
+open(path, flags):
+  syscall enters privileged mode
+  kernel copies path from user memory safely
+  VFS resolves path under namespace and mount rules
+  DAC/capability/LSM checks decide permission
+  file object is installed into fd table
+  user receives only an integer handle
+\end{lstlisting}
+
+fd 是安全能力的一种形式：用户态不能直接拿 inode 指针，只能拿内核发放的整数句柄。后续 \code{read/write/ioctl} 都要通过这个句柄回到内核检查对象和操作。若 fd 泄漏到子进程，权限也随之泄漏，所以 close-on-exec 是安全边界的一部分。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+边界 & 硬件基础 & OS 策略 \\
+\midrule
+用户/内核 & 特权级、页表 U/S 位 & syscall、copy\_from\_user、KASLR \\
+进程/进程 & 地址空间、ASID/TLB & VMA、PTE、COW、信号权限 \\
+进程/文件 & 不能直接访问设备和缓存 & fd、inode 权限、LSM \\
+设备/内存 & IOMMU、DMA 权限 & dma\_map/unmap、隔离域 \\
+容器/宿主 & namespace 仍共享内核 & capability、seccomp、cgroup、LSM \\
+\bottomrule
+\end{longtable}
+
+这说明安全不是一个章节里的附加功能，而是硬件和内核对象从一开始就共同维护的边界。后续学习 namespace、seccomp、LSM 时，应把它们看成在基础硬件边界上继续收紧权限；它们不能凭空创造隔离。
+
+\subsection{第一阶段验收：能沿路径说清楚，而不是背定义}
+
+完成第一阶段后，读者应该能把下面几条路径讲完整：
+
+\begin{itemize}
+\tightlist
+\item 从复位向量到内核第一个 C 函数：哪些硬件已可用，哪些还不可用。
+\item 从系统调用入口到返回用户态：寄存器、栈、特权级和用户指针如何处理。
+\item 从虚拟地址访问到物理页：VMA、PTE、TLB、page fault 如何合作。
+\item 从设备 DMA 到用户 read 返回：描述符、completion、中断、等待队列如何合作。
+\item 从定时器中断到任务切换：调度账本、runqueue、上下文和地址空间如何合作。
+\item 从 write 返回到 fsync 持久：page cache、writeback、日志、flush 如何合作。
+\end{itemize}
+
+如果只能背出 CPU、DMA、TLB 的定义，却不能沿这些路径说明状态变化，那还是浅层理解。第一阶段的目标就是把定义变成可追踪的状态机。

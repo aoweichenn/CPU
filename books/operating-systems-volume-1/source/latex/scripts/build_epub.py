@@ -238,7 +238,7 @@ def render_table(lines: list[str]) -> str:
     return "\n".join(rendered)
 
 
-def convert_latex(source: str, heading_shift: int = 0) -> str:
+def convert_latex(source: str, heading_shift: int = 0, book_dir: Path | None = None) -> str:
     lines = [strip_comment(line) for line in source.splitlines()]
     out: list[str] = []
     paragraph: list[str] = []
@@ -314,6 +314,16 @@ def convert_latex(source: str, heading_shift: int = 0) -> str:
             out.append(f"<li>{inline(content)}</li>")
             index += 1
             continue
+        if line.startswith(r"\lstinputlisting"):
+            flush_paragraph()
+            path_start = line.find("{")
+            if path_start != -1 and book_dir is not None:
+                path_name, _ = read_group(line, path_start)
+                listing_path = book_dir / path_name
+                code = listing_path.read_text(encoding="utf-8")
+                out.append(f"<pre><code>{html.escape(code)}</code></pre>")
+            index += 1
+            continue
         if line.startswith("\\") and line in {
             r"\frontmatter",
             r"\mainmatter",
@@ -374,14 +384,14 @@ def build_pages(book_dir: Path) -> list[Page]:
         if line.startswith(r"\inputtopic{"):
             name = first_arg(line, "inputtopic")
             path = book_dir / f"{name}.tex"
-            current_body.append(convert_latex(path.read_text(encoding="utf-8"), heading_shift=1))
+            current_body.append(convert_latex(path.read_text(encoding="utf-8"), heading_shift=1, book_dir=book_dir))
             continue
         if line.startswith(r"\input{"):
             name = first_arg(line, "input")
             if name == "frontmatter/title":
                 continue
             path = book_dir / f"{name}.tex"
-            current_body.append(convert_latex(path.read_text(encoding="utf-8"), heading_shift=0))
+            current_body.append(convert_latex(path.read_text(encoding="utf-8"), heading_shift=0, book_dir=book_dir))
             continue
         if line in {r"\frontmatter", r"\mainmatter", r"\backmatter"}:
             continue

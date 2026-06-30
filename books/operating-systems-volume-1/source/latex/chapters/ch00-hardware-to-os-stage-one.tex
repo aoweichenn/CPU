@@ -1,0 +1,225 @@
+\section{第一阶段深讲：硬件机制怎样逼出操作系统}
+
+前面已经介绍了许多硬件部件。本节不再按“CPU、内存、总线、设备”逐项罗列，而是换一个角度：每增加一种硬件能力，系统会遇到什么新问题，操作系统为什么必须出现相应的对象、策略和算法。这样读者不会把组成原理看成操作系统前面的附录，而能看到二者是一条连续的工程演进线。
+
+\begin{keyidea}
+操作系统的大部分核心对象，都可以从硬件限制中推出来：寄存器和 RIP 推出线程上下文，特权级推出系统调用和内核入口，MMU 推出地址空间，定时器推出抢占调度，DMA 和中断推出驱动队列，cache 和多核推出锁、屏障和 per-CPU 数据。
+\end{keyidea}
+
+\subsection{第一步：只有一段固件时，还没有操作系统}
+
+从最小机器开始想象：一颗微控制器，一段烧在 Flash 里的固件，一小片 SRAM，几个 MMIO 寄存器控制 GPIO、串口和定时器。复位后 CPU 从固定地址取指，固件设置栈指针，初始化外设，然后进入主循环。这个系统没有进程、没有文件、没有用户态，也没有“内核”这个边界。
+
+\begin{lstlisting}
+reset:
+  set stack pointer
+  initialize clock and UART
+  initialize timer
+  while true:
+    poll input
+    update state
+    write output
+\end{lstlisting}
+
+这种系统能工作，是因为它的信任模型极简单：所有代码由同一个固件作者写入，所有代码拥有同样权限，系统只运行一个应用。若固件写错地址，整机崩溃；若循环太久，外设响应变慢；若中断处理函数和主循环同时改同一个变量，就可能出现竞态。但这些问题还没有被抽象成“操作系统问题”，因为没有多个互不信任程序需要隔离。
+
+此时最重要的硬件概念是复位、时钟、栈、MMIO 和中断。它们已经预告了后来的 OS 机制：复位和启动链会演进成 bootloader 与内核初始化；栈会演进成每线程内核栈；MMIO 会演进成驱动资源；中断会演进成异常入口、调度时钟和设备完成路径。
+
+\subsection{第二步：中断让控制流不再只有一条}
+
+轮询主循环的问题是响应时间受循环长度限制。若主循环正在处理一段耗时计算，串口输入可能溢出，定时事件可能延迟。中断的出现解决了这个问题：硬件事件可以打断当前执行，把 CPU 引到预先登记的入口函数。
+
+\begin{lstlisting}
+main loop running:
+  instruction N
+  timer interrupt becomes pending
+  CPU saves minimal interrupted state
+  CPU jumps to interrupt vector
+  handler runs
+  CPU restores state and returns
+\end{lstlisting}
+
+这里已经出现了“上下文”的雏形。中断入口必须保存被打断代码需要继续执行的状态，例如 RIP、RFLAGS 和通用寄存器。保存不完整，主程序返回后就会计算错误。保存太多，延迟增加。内核后来的上下文切换，本质上是把这种“保存和恢复执行现场”从中断扩展到多个线程之间。
+
+中断还引入了并发的第一个版本。即使只有一个 CPU，主循环和中断处理函数也会交错访问共享变量。若主循环正在更新一个多字节计数器，中断在中间读取，就可能看到半更新状态。最早的临界区可以简单到关中断：
+
+\begin{lstlisting}
+disable_interrupts()
+shared_counter = shared_counter + 1
+enable_interrupts()
+\end{lstlisting}
+
+但这个方法只能保护单核上的中断交错。进入多核以后，另一个 CPU 不受本核关中断影响，必须使用锁和原子操作。理解这一点，才能明白为什么“关中断”和“自旋锁”是不同层次的互斥手段。
+
+\subsection{第三步：定时器把协作式程序推向抢占式系统}
+
+如果所有代码都愿意主动让出 CPU，系统可以用协作式调度：任务运行一会儿，调用 \code{yield}，再让别人运行。这在早期小系统或事件循环里可行，但一旦某个任务死循环，整个系统就失去响应。硬件定时器把 OS 从“相信任务会合作”推进到“内核可以强制收回 CPU”。
+
+\begin{lstlisting}
+timer interrupt:
+  save current register frame
+  account current runtime
+  if current consumed its time slice:
+    mark current runnable
+    choose next runnable task
+    switch stack and registers
+  return to selected task
+\end{lstlisting}
+
+这段路径逼出了三个对象。第一是 task：内核必须有地方保存每个执行流的寄存器、栈、状态和调度账本。第二是 runqueue：内核必须知道哪些 task 现在可运行。第三是 scheduler：当定时器或阻塞事件改变状态时，内核必须选择下一个 task。
+
+定时器同时也定义了时间的可信来源。没有稳定时钟，睡眠超时、网络重传、调度统计、文件时间戳和性能测量都会失真。硬件定时器不是小外设，它是多任务 OS 的节拍器。
+
+\subsection{第四步：特权级把“库函数”变成“内核入口”}
+
+若所有程序都同权，任何程序都可以关中断、改页表、访问磁盘控制器、读写别人的内存。为了运行多个互不信任程序，CPU 必须提供至少两种执行模式：受限的用户态和完全控制硬件的内核态。用户态代码遇到需要特权的操作时，不能直接做，只能通过受控入口请求内核代做。
+
+\begin{lstlisting}
+user process wants to read file:
+  place syscall number and arguments in registers
+  execute syscall/trap instruction
+  CPU switches to privileged mode
+  CPU jumps to kernel entry
+  kernel validates fd, buffer and permission
+  kernel performs operation
+  CPU returns to user mode with result
+\end{lstlisting}
+
+系统调用的本质是特权边界切换，不是普通函数调用。普通函数调用信任调用者传来的指针，系统调用不能信任。用户给内核一个地址，内核必须确认它属于用户地址空间、权限合适、长度不会溢出，并且复制过程中要能处理缺页。若内核直接解引用恶意用户指针，用户程序就可能诱导内核读写任意地址。
+
+这一步还解释了为什么 ABI 很重要。系统调用入口要约定号码放在哪个寄存器，参数放在哪些寄存器，返回值和错误码如何表达，哪些寄存器会被破坏。特权边界不是只靠“进入内核”四个字，它是一套硬件状态、寄存器约定、栈切换、权限检查和返回路径共同组成的协议。
+
+\subsection{第五步：MMU 把地址从数字变成权限对象}
+
+没有 MMU 时，地址就是物理地址。程序写地址 0x1000，就真的写那块物理存储。多个程序共享机器时，这显然不够：一个程序的指针错误可以覆盖另一个程序或内核。MMU 引入虚拟地址到物理地址的翻译，并在翻译时检查权限。
+
+\begin{lstlisting}
+CPU executes load/store:
+  virtual_address = base + offset
+  lookup TLB
+  if miss, walk page table
+  check present, user/supervisor, read/write/execute
+  produce physical address or raise page fault
+\end{lstlisting}
+
+这一步把地址空间推出来了。进程不再只是“正在运行的代码”，而拥有一张自己的地址翻译表。相同虚拟地址在不同进程里可以指向不同物理页；内核页可以映射为 supervisor only；代码页可以 executable but not writable；栈页可以 writable but not executable。
+
+MMU 也把异常变成正常控制流。访问不存在的页不一定是错误，可能是懒分配；写只读 COW 页不一定是非法，可能是 fork 后第一次写；访问文件映射缺页可能需要从磁盘读入。page fault handler 是 OS 和硬件合作的典型路径：硬件发现指令无法按当前翻译完成，内核检查 VMA 和 PTE，修复状态后让同一条指令重试。
+
+\subsection{第六步：cache 和 TLB 让“正确顺序”变得昂贵}
+
+cache 和 TLB 是为了速度出现的。没有 cache，CPU 大量时间等待内存；没有 TLB，每次访存都要走多级页表。它们的副作用是状态被复制到了多个地方：内存里有页表，TLB 里有翻译缓存；DRAM 里有数据，多个 CPU cache 里也可能有同一 cache line。
+
+当内核修改页表权限时，只改内存中的 PTE 不够，旧 TLB 项可能还在 CPU 里。当驱动准备 DMA 描述符时，只把字段写到 cache line 不够，设备必须在 doorbell 后能看到正确内容。当两个 CPU 修改同一共享变量时，只看源代码顺序不够，硬件可能通过 store buffer、失效队列和乱序执行改变可见时间。
+
+\begin{lstlisting}
+page permission downgrade:
+  update PTE in memory
+  flush local TLB entry
+  send shootdown IPI to other CPUs using this address space
+  wait until remote CPUs acknowledge
+  only then free or reuse the physical page
+\end{lstlisting}
+
+这一步逼出了 TLB shootdown、内存屏障、cache flush、DMA 同步、原子操作和锁。很多 OS 难点并不在“怎样表达一个状态”，而在“怎样让所有硬件观察者在正确时刻看到同一个状态”。
+
+\subsection{第七步：总线和设备把内核推向驱动模型}
+
+只要 CPU、内存和一个串口，系统还能写死设备地址。但真实机器有许多设备，设备可以热插拔，地址窗口由固件或总线枚举分配，中断可以有多个 vector，DMA 地址受设备能力和 IOMMU 限制。内核必须把硬件资源抽象成驱动模型：发现设备、匹配驱动、申请资源、初始化设备、处理中断、提交请求、回收资源。
+
+\begin{lstlisting}
+driver probe:
+  identify device
+  map MMIO BAR or register range
+  allocate IRQ/MSI-X vectors
+  set DMA mask and create DMA mappings
+  initialize submission and completion queues
+  register block/net/input/char device object
+\end{lstlisting}
+
+驱动模型的关键是生命周期管理，远不止“会写寄存器”。probe 成功后，设备对象对上层可见；remove 时必须阻止新请求、等待或取消旧请求、释放 IRQ、unmap DMA、销毁队列、关闭电源和时钟。若错误路径少释放一步，就泄漏资源；多释放一步，就可能 use-after-free。
+
+\subsection{第八步：DMA 和 completion 把同步调用变成异步协议}
+
+PIO 时代，CPU 可以在一个函数里读完设备数据。DMA 时代，CPU 只提交描述符，设备稍后完成。于是一次 I/O 被拆成两个时间点：提交和完成。中间这段时间里，请求对象、buffer、DMA 映射和等待者都必须保持有效。
+
+\begin{lstlisting}
+submit read request:
+  pin or allocate buffer pages
+  map pages for DMA_FROM_DEVICE
+  fill device descriptor
+  ring doorbell
+  put task to sleep or return EAGAIN
+
+completion interrupt:
+  read completion queue
+  unmap DMA
+  mark buffer uptodate
+  wake task or post event
+\end{lstlisting}
+
+这个异步协议解释了为什么内核里到处都有 request、bio、skb、urb、kiocb、fence、completion、wait queue。它们都是在保存“已经提交但还没完成”的状态。同步系统调用只是表面：\code{read} 可以在内部提交异步 I/O，然后让当前线程睡眠；设备完成时，中断路径唤醒它，系统调用才返回。
+
+\subsection{第九步：多核把一个内核变成分布式状态机}
+
+单核内核可以用“当前 CPU 正在做什么”理解很多事情。多核内核不行。多个 CPU 同时进入内核，同时修改不同对象，甚至同时修改同一对象。每 CPU runqueue、per-CPU 计数器、本地中断、远程 IPI、RCU grace period、跨 CPU TLB shootdown，都是多核带来的结构。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+多核问题 & 简单做法为什么不够 & OS 机制 \\
+\midrule
+全局 runqueue 锁竞争 & 所有 CPU 抢同一把锁 & 每 CPU runqueue + 负载均衡 \\
+全局引用计数抖动 & cache line 在 CPU 间来回迁移 & per-CPU 计数、批量汇总 \\
+读多写少数据 & 普通锁让读者互相阻塞 & RCU、seqlock、读写锁 \\
+页表失效传播 & 远端 CPU 仍有旧 TLB & IPI shootdown、ASID/PCID \\
+NUMA 远端访问 & 内存延迟不均匀 & CPU affinity、页迁移、first touch \\
+\bottomrule
+\end{longtable}
+
+多核系统里，性能 bug 常常是共享状态设计错误。一个看似无害的全局计数器，在 128 核机器上可能变成所有 CPU 争用的 cache line。一个在单核上正确的“关中断保护”，在多核上不能保护另一个 CPU。OS 设计必须从一开始就问：这个状态属于全局、每 CPU、每进程、每设备，还是每请求？
+
+\subsection{第十步：文件和 socket 是硬件差异的收敛结果}
+
+从硬件看，磁盘、网卡、管道、终端和定时器完全不同。从用户态看，它们可以都变成 fd。这个统一来自 OS 在中间建立的对象层，而不是硬件本身相似：fd 表、open file description、inode/socket/device file、ops 函数表、等待队列和 readiness 事件共同支撑了统一接口。
+
+\begin{lstlisting}
+user read(fd):
+  fd table maps integer to struct file
+  struct file points to object and operations
+  operation may hit page cache, pipe buffer, socket receive queue, or device
+  if data unavailable:
+    task sleeps on object's wait queue
+  completion path wakes waiters
+\end{lstlisting}
+
+统一接口有巨大价值：shell 重定向、管道、epoll、权限检查、引用计数、close-on-exec 都可以围绕 fd 建立。但统一接口不能抹掉语义差异。普通文件 read 返回 EOF，socket read 受协议影响，pipe 受容量和对端关闭影响，timerfd 返回计数，eventfd 返回计数器。教材若只说“文件是一切”，就会掩盖这些关键差异。
+
+\subsection{从硬件机制到 OS 对象的映射}
+
+下面这张表是第一阶段的压缩地图。后续章节每讲一个 OS 机制，都应能回到这里找到硬件来源。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+硬件机制 & 直接问题 & OS 对象或算法 \\
+\midrule
+RIP、寄存器、栈 & 执行现场如何保存恢复 & thread context、kernel stack、context switch \\
+中断向量 & 异步事件如何进入可信代码 & IDT/vector table、IRQ handler、softirq \\
+定时器 & 不合作任务如何被抢占 & scheduler tick、hrtimer、time accounting \\
+特权级 & 不可信程序如何请求特权操作 & syscall、trap frame、copy\_from\_user \\
+MMU/PTE & 地址如何隔离和授权 & address space、VMA、page fault、COW \\
+TLB & 翻译缓存如何保持一致 & shootdown、ASID/PCID、lazy TLB \\
+cache/coherence & 多核共享数据如何可见 & locks、atomics、barriers、RCU \\
+MMIO & CPU 如何控制设备 & ioremap、readl/writel、regmap \\
+DMA & 设备如何直接访问内存 & DMA mapping、IOMMU、buffer lifetime \\
+MSI/MSI-X & 设备如何报告完成 & IRQ affinity、completion queue、NAPI \\
+PCIe/USB/I2C & 设备如何被发现和匹配 & bus model、driver probe、resources \\
+DRAM/NUMA & 内存距离和可靠性不同 & page allocator、NUMA policy、memory error handling \\
+持久存储 & 写入何时算持久 & page cache、writeback、journal、fsync \\
+\bottomrule
+\end{longtable}
+
+\subsection{第一阶段读者应该形成的判断力}
+
+到这里，不要求读者已经能写完整内核，但应该能做出一组判断。看到系统调用，要想到特权级、寄存器 ABI、用户指针检查和返回路径。看到 page fault，要想到 MMU、VMA、PTE、TLB、COW 和缺页重试。看到设备驱动，要想到 MMIO、DMA、IRQ、队列、屏障和错误路径。看到多核性能问题，要想到 cache line、锁粒度、per-CPU、IPI 和 NUMA。
+
+这就是第一阶段的目标：不把硬件当背景，不把 OS 当概念，而是把二者合成一条可追踪的执行链。

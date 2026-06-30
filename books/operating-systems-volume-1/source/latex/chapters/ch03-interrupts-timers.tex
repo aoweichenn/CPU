@@ -30,6 +30,43 @@ enable_interrupts();
 
 这个临界区就是锁的祖先。以后在多核机器上，关本核中断不能阻止另一个核心同时访问同一数据结构，于是需要自旋锁、互斥锁和原子操作。但基本问题没有变：某段代码需要在状态不变量被临时打破时不被并发打断。
 
+\subsection{中断控制器为什么不是可选部件}
+
+若只有一个外设和一个 CPU，外设可以直接把中断线连到 CPU。真实系统有多个外设、多个中断源、多个优先级，甚至多个 CPU。中断控制器负责把混乱的硬件事件整理成 CPU 能处理的 vector：记录 pending 位，应用 mask，比较优先级，选择目标 CPU，并在处理完成后接收 EOI。
+
+\begin{lstlisting}
+interrupt_controller:
+  pending[source] = device_irq_line
+  enabled[source] = software_mask
+  priority[source] = configured_priority
+  target[source] = cpu_id
+
+deliver():
+  candidates = pending & enabled
+  source = highest_priority(candidates)
+  cpu = target[source]
+  cpu.raise_interrupt(vector[source])
+\end{lstlisting}
+
+没有中断控制器，OS 就不能可靠地屏蔽某类中断，不能区分中断来源，不能把高吞吐设备分散到多个 CPU，也不能在多核系统中发送 IPI。中断控制器是“外设事件”和“CPU 异常入口”之间的路由层。
+
+\subsection{x86-64 中断控制器：local APIC、IOAPIC、MSI/MSI-X}
+
+x86-64 主线里，中断控制器不是一个单独芯片名，而是一组协作机制。local APIC 属于每个 CPU，用于本地 timer、IPI 和接收 vector；IOAPIC 把传统外部 IRQ 重定向到目标 CPU 和 vector；MSI/MSI-X 让 PCIe 设备通过内存写消息投递中断；x2APIC 扩展了 APIC 编址和访问方式，适合大规模多核系统。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+机制 & 主要用途 & OS 关心点 \\
+\midrule
+local APIC & 每 CPU 中断、本地 timer、IPI & 多核调度、TLB shootdown、timer tick \\
+IOAPIC & 把外部 IRQ 重定向到 CPU/vector & IRQ 路由、触发方式、亲和性 \\
+MSI/MSI-X & PCIe 设备通过内存写投递中断 & 多队列设备、vector 分配、隔离 \\
+x2APIC & 扩展 APIC 编址和访问方式 & 大规模 CPU、虚拟化、IPI 成本 \\
+\bottomrule
+\end{longtable}
+
+MSI/MSI-X 值得单独强调。传统中断像一根线；MSI 是设备向一个特殊地址写入消息来触发中断。这样 PCIe 设备可以为多个队列分配多个 vector，让网卡 RX queue 0 中断送到 CPU0，RX queue 1 中断送到 CPU1。多队列网络和 NVMe 的伸缩性很大程度依赖这种硬件能力。
+
 \subsection{定时器和时间片}
 
 定时器中断是操作系统调度的起点。没有定时器，只有任务主动让出 CPU 时，系统才能切换任务；一旦任务死循环，整个系统就失控。定时器按固定频率打断 CPU，内核在中断中增加 tick、检查超时、唤醒等待任务，并在必要时设置“需要调度”的标志。
@@ -49,6 +86,24 @@ interrupt timer_isr() {
 
 直接扫描所有定时器的复杂度是 \code{O(n)}。如果系统只有几个任务，这很简单；如果有几十万个超时请求，每个 tick 都扫描全表就不可接受。常见算法包括最小堆、时间轮和分层时间轮。最小堆插入和删除是 \code{O(log n)}，查看最近超时是 \code{O(1)}；时间轮把时间划分成槽，插入通常接近 \code{O(1)}，但精度和最大超时范围受槽设计影响。
 
+\subsection{定时器从硬件计数器到 OS 超时}
+
+硬件定时器最小形态是一个递增或递减计数器，加一个比较寄存器。计数器来自固定频率时钟；当计数器达到比较值时，硬件产生中断。OS 在中断里更新软件时间，并设置下一次比较值。
+
+\begin{lstlisting}
+program_next_timer(deadline):
+  timer.compare = deadline
+  timer.enable_interrupt = true
+
+timer_interrupt():
+  now = timer.counter
+  run_expired_timers(now)
+  next = earliest_deadline()
+  program_next_timer(next)
+\end{lstlisting}
+
+周期 tick 的做法是每隔固定时间中断一次，例如 1ms 或 10ms。高精度和 tickless 的做法是按最近事件编程下一次中断。前者实现简单，后者减少无意义中断，但要求内核精确维护最近 deadline。无论哪种方式，抢占和超时都依赖硬件在未来把控制权交回内核。
+
 \subsection{异常和系统调用}
 
 中断来自外设，异常来自当前指令执行，例如除零、非法指令、缺页、权限错误。系统调用也是一种受控入口：用户程序主动执行特定指令，请求进入内核。三者共同构成内核入口。
@@ -65,15 +120,33 @@ interrupt timer_isr() {
 
 从这里开始，OS 的边界清楚了：用户代码不能直接操作所有资源，而是通过受控入口进入内核；内核根据当前上下文、权限和对象状态决定是否允许请求。
 
+\subsection{异常入口保存的是诊断证据}
+
+异常不是“出错就跳到内核”这么简单。硬件必须保存足够证据，让内核判断能否修复。以 page fault 为例，内核需要知道 faulting address、访问类型、当前特权级、出错指令地址和错误码。以非法指令为例，内核需要知道是哪条指令，以便发送信号或模拟指令。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+证据 & 用途 & 缺失后果 \\
+\midrule
+fault RIP & 返回或报告出错指令 & 无法重试或定位错误 \\
+fault address & 判断哪个虚拟地址出错 & 无法处理缺页或 SIGSEGV \\
+access type & 读、写、执行、用户/内核 & 无法区分 COW、NX、权限错误 \\
+RFLAGS/CPL & 中断状态、特权级、条件位 & 返回路径不安全 \\
+error code/cause & 架构提供的分类原因 & 只能粗暴终止，无法精细恢复 \\
+\bottomrule
+\end{longtable}
+
+这也是内核崩溃日志要打印寄存器、RIP、栈和 fault address 的原因。它们不是噪声，而是硬件给出的最低层证据。没有这些证据，调试只能猜。
+
 \subsection{上下文保存}
 
-中断、异常和调度都需要保存上下文。最小上下文包括程序计数器、状态寄存器、通用寄存器和栈指针。若要切换任务，还要保存当前任务的内核栈、地址空间标识和调度账本。
+中断、异常和调度都需要保存上下文。x86-64 的最小上下文包括 RIP、RFLAGS、通用寄存器和 RSP。若要切换任务，还要保存当前任务的内核栈、地址空间标识和调度账本。
 
 \begin{lstlisting}
 struct Context {
-  uint64_t pc;
-  uint64_t sp;
-  uint64_t flags;
+  uint64_t rip;
+  uint64_t rsp;
+  uint64_t rflags;
   uint64_t regs[16];
 };
 
@@ -85,6 +158,23 @@ void switch_to(Task* prev, Task* next) {
 \end{lstlisting}
 
 这段伪代码隐藏了真实汇编细节，但说明了不变量：一个任务被切走时，它的下一条指令位置和栈必须能恢复；一个任务被恢复时，寄存器必须像它从未离开 CPU 一样。上下文保存不正确，任何高级调度策略都没有意义。
+
+\subsection{上下文分两类：异常上下文和调度上下文}
+
+异常上下文由硬件入口和低级入口共同保存，描述“被打断的执行现场”。调度上下文描述“线程被切走后下次如何继续”。二者有关但不完全相同。系统调用和中断进入内核时，需要 trap frame；线程主动睡眠或被调度出去时，需要保存 callee-saved 寄存器、内核栈位置和调度状态。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+上下文 & 保存内容 & 典型时机 \\
+\midrule
+trap frame & 用户 RIP、RSP、RFLAGS、系统调用参数、错误码 & 中断、异常、系统调用入口 \\
+switch context & 内核栈指针、callee-saved 寄存器、返回地址 & scheduler 切换内核线程 \\
+地址空间上下文 & 页表根、ASID/PCID、TLB 状态 & 切换进程地址空间 \\
+浮点/SIMD 上下文 & FPU、向量寄存器、控制字 & 用户使用浮点/SIMD 或信号处理 \\
+\bottomrule
+\end{longtable}
+
+把这几类上下文混在一起会导致很多误解。例如中断打断用户程序时，内核需要 trap frame 才能返回用户态；调度器在两个都已进入内核的线程之间切换时，通常只需要保存内核执行所需的最小寄存器集合。地址空间切换还要改页表根和处理 TLB。
 
 \section{算法与实现分析}
 
@@ -105,6 +195,24 @@ interrupt_entry(vector):
 
 这个状态机维护两个不变量。第一，任何会被中断处理函数破坏的寄存器，要么已经保存，要么按 ABI 规定不需要保存。第二，返回用户态之前，内核必须处理挂起信号、抢占标志和可能的调度请求。若在中断中直接切换任务，必须保证旧任务的内核栈仍保存完整 trap frame。
 
+\subsection{精确中断和延迟中断}
+
+外部中断通常在指令边界被接收，CPU 完成当前指令的架构效果后进入中断入口。这样内核返回时可以从下一条指令继续。异常则和当前指令绑定：缺页异常通常要返回到同一条指令重试，除零或非法指令可能发送信号。精确性让 OS 能用同一套保存/恢复机制处理多种入口。
+
+\begin{lstlisting}
+external interrupt:
+  instruction N committed
+  interrupt taken before N+1
+  saved RIP = address of N+1
+
+page fault:
+  instruction N cannot complete
+  saved RIP = address of N
+  kernel may fix page and retry N
+\end{lstlisting}
+
+中断延迟来自多个来源：CPU 临时关中断、硬件优先级屏蔽、长时间持有自旋锁、中断控制器路由、cache miss、下半部积压。实时系统关心最大延迟；通用系统也要避免长时间关中断，因为它会让定时器、网络、块 I/O 和 RCU 都延后。
+
 \subsection{中断控制器与优先级}
 
 真实硬件通常通过中断控制器管理多路中断。控制器至少要完成屏蔽、优先级、确认和结束通知。教学模型可以抽象成 pending bitmap：
@@ -123,6 +231,22 @@ end_of_interrupt(vector):
 \end{lstlisting}
 
 若忘记 EOI，控制器可能不再投递后续同类中断；若过早 EOI，同一个设备可能在 handler 尚未处理完共享状态时再次打断。驱动通常先读取设备状态并清设备侧中断源，再向控制器确认完成。顺序错误会导致中断风暴或丢事件。
+
+\subsection{电平触发、边沿触发和 MSI}
+
+中断触发方式影响 handler 的确认顺序。边沿触发在信号变化瞬间产生事件；若软件没及时处理，可能错过后续边沿。电平触发只要设备中断线保持有效，控制器就认为中断仍 pending；若 handler 没清设备状态，EOI 后会立刻再次进入。MSI/MSI-X 则是设备写一个中断消息，通常不依赖共享物理线。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+触发方式 & 特点 & handler 重点 \\
+\midrule
+边沿触发 & 变化瞬间产生一次事件 & 不能丢边沿，事件队列要足够 \\
+电平触发 & 条件保持则持续 pending & 必须清设备侧原因再 EOI \\
+MSI/MSI-X & 设备写消息触发 vector & vector 分配、队列亲和性、屏蔽同步 \\
+\bottomrule
+\end{longtable}
+
+很多“中断风暴”来自清除顺序错误或设备状态未消费。OS 不能只从 CPU 侧看中断，还要看设备侧 pending 条件是否被真正清掉。
 
 \subsection{top half 与 bottom half 的分工}
 

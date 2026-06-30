@@ -1,0 +1,168 @@
+\section{第二阶段深讲：进程生命周期不是 fork/exec/wait 三个词}
+
+进程章节容易被讲成系统调用列表：\code{fork} 创建，\code{exec} 装载，\code{wait} 回收，\code{exit} 退出。这样的讲法太薄。真实内核维护的是一组互相引用的对象：任务、地址空间、文件表、信号状态、凭据、命名空间、调度实体、父子关系和资源统计。生命周期问题的核心是：什么时候对象对其他 CPU 可见，什么时候能失败，失败后怎样回滚，最后一个引用在哪里释放。
+
+\subsection{从硬件执行流到 task}
+
+硬件只知道当前 CPU 正在执行一组寄存器、PC、栈和页表根。操作系统把这组状态包装成 task。task 不等于进程的全部资源；它是可调度实体，指向更大的资源集合。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+资源 & 为什么不直接内嵌进 task & 生命周期问题 \\
+\midrule
+地址空间 & 线程可共享，exec 可替换 & 引用计数、COW、TLB shootdown \\
+文件表 & fork 可共享，dup 共享 open file & close-on-exec、并发 close/read \\
+信号处理 & 进程级和线程级状态交织 & handler、mask、pending queue \\
+凭据 & 安全检查频繁读取，变更较少 & RCU 发布、setuid/exec 转换 \\
+命名空间 & 容器内多个进程共享视图 & 引用计数、权限边界 \\
+调度实体 & 每个线程都要被调度 & runqueue、vruntime、CPU affinity \\
+\bottomrule
+\end{longtable}
+
+这种“task 指向对象”的结构让共享和替换成为可能。同一进程内多个线程共享 \code{mm} 和 \code{files}；\code{exec} 替换 \code{mm}，但保留 PID 和部分 fd；\code{fork} 复制 task，同时复制或共享不同对象。若把所有资源平铺在一个大结构里，这些语义会变得混乱。
+
+\subsection{创建进程的真正顺序}
+
+创建进程不能先把半成品放进 runqueue。只要任务进入 runnable 集合，另一个 CPU 就可能立刻运行它。因此 fork 的顺序必须从“不可见半成品”逐步推进到“对调度器可见”。
+
+\begin{lstlisting}
+copy_process outline:
+  allocate task and kernel stack
+  initialize minimal scheduler state
+  copy credentials or install new references
+  copy/share files, fs, signal state
+  copy mm with COW page tables if needed
+  allocate pid
+  link child into parent relationships
+  publish task to pid tables
+  make task runnable only after invariants hold
+\end{lstlisting}
+
+每一步都有失败可能：内存不足、pid 不足、文件表复制失败、页表复制失败、权限检查失败。错误路径必须按逆序释放已经拿到的引用。这里的质量不在正常路径跑通，而在第 5 步失败时前 4 步是否完整回滚。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 成功后新增什么 & 失败时必须回滚什么 \\
+\midrule
+分配 task & task 内存和内核栈 & 释放栈和 task 对象 \\
+复制 files & fd 表引用增加 & put 每个 open file 引用 \\
+复制 mm & 页表页、PTE 引用、COW 标记 & 释放页表页、撤销引用 \\
+分配 pid & pid 映射占用 & 释放 pid，不能留下僵尸映射 \\
+链接父子 & 父进程 child list 可见 & 从列表摘除，避免 wait 看到半成品 \\
+入队运行 & 调度器可选择任务 & 之后失败通常不能简单回滚，要走退出路径 \\
+\bottomrule
+\end{longtable}
+
+这张表解释了为什么内核代码里有大量 \code{goto bad\_*}。这些标签表达的是阶段化回滚：从哪个阶段失败，就只回滚已经成功取得的资源。高质量内核代码宁愿显式写出阶段，也不能让半初始化对象泄漏到全局结构。
+
+\subsection{fork 后父子为什么返回不同值}
+
+fork 的一个经典语义是父进程返回子 PID，子进程返回 0。硬件没有“两个返回值”的指令，内核通过修改子任务保存的寄存器帧实现这个效果。父进程系统调用正常返回时，返回值寄存器写入 child pid；子任务第一次被调度时，从复制出的内核返回路径继续，返回值寄存器已经被设置为 0。
+
+\begin{lstlisting}
+parent path:
+  ret = child.pid
+  return_to_user(parent_regs with ret)
+
+child prepared frame:
+  child_regs = copy(parent_regs)
+  child_regs.return_value = 0
+  when scheduled, return_to_user(child_regs)
+\end{lstlisting}
+
+这个细节能帮助读者理解上下文切换：子进程不是从 \code{main} 开头重新执行，也不是内核调用了两次用户函数。它从和父进程相同的用户 PC 返回，只是寄存器状态略有不同。
+
+\subsection{exec 是不可逆提交点}
+
+\code{execve} 成功后，旧程序映像消失，新程序从入口点运行。难点在于失败语义：在提交点之前失败，应返回错误给旧程序；提交点之后失败，旧程序已经没有完整地址空间可恢复，只能终止任务。
+
+\begin{lstlisting}
+exec phases:
+  copy argv/envp from old user memory
+  open executable and check permissions
+  parse binary format
+  allocate new mm
+  map text/data/interpreter/stack
+  prepare credentials and auxv
+  commit new mm and credentials
+  jump to new entry
+\end{lstlisting}
+
+因此 exec 要尽量把可能失败的分配、权限检查和格式解析放在 commit 前。commit 动作要原子地切换 \code{mm}、设置新用户栈和入口、处理 close-on-exec fd、重置信号处理规则、应用 setuid/capability 变化。这个点之后，内核不能再假装旧程序还在。
+
+\subsection{线程创建和资源共享边界}
+
+线程和进程的差别不是“更轻量”四个字。线程共享地址空间、文件表和许多进程级状态，但拥有独立的可调度上下文、用户栈、内核栈、TLS、信号 mask 和调度状态。共享使通信便宜，也让错误传播更广。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+资源 & 进程间 fork 后 & 同进程线程间 \\
+\midrule
+地址空间 & 初始 COW，之后可分离 & 共享同一 \code{mm} \\
+fd 表 & 可复制或共享，取决于语义 & 通常共享，close 影响其他线程 \\
+用户栈 & 子进程有复制视图 & 每线程独立栈 \\
+信号 mask & 每线程独立 mask & 进程 pending 与线程 pending 并存 \\
+PID/TID & 父子不同 PID & 同 TGID，不同 TID \\
+\bottomrule
+\end{longtable}
+
+线程库还要处理 TLS 和启动 trampoline。内核创建新线程时准备一个初始寄存器状态，使它第一次返回用户态时进入用户态线程入口，参数指向线程函数和参数对象。线程退出时要清理用户栈、TLS、robust futex、join 状态和内核 task 引用。
+
+\subsection{exit 不是立刻消失}
+
+任务调用 \code{exit} 后，不能简单释放自己。它可能还在别的表里有引用，父进程还要读取退出码，ptrace 或 wait 还可能观察它。于是退出分成多个阶段：停止用户执行、释放大资源、记录退出状态、通知父进程、进入 zombie，最后由 wait 或 reaper 释放 task。
+
+\begin{lstlisting}
+do_exit:
+  mark task exiting
+  close files and release mm
+  release futexes and timers
+  record exit_code and resource usage
+  notify parent and reparent children
+  become zombie
+  schedule away forever
+
+wait:
+  find zombie child
+  copy status to parent
+  unlink child
+  put final task reference
+\end{lstlisting}
+
+zombie 是一个必要状态：它保留父进程需要读取的结果，同时保证已退出任务不会再被调度。如果父进程不 wait，系统要通过 init 或 subreaper 接管，防止 zombie 永久积累。
+
+\subsection{父子关系和 reparent}
+
+进程树不是装饰。父进程负责 wait 子进程；信号传播、作业控制、会话、进程组都依赖关系结构。若父进程先退出，子进程不能失去回收者，内核会把它们 reparent 给 init 或最近的 subreaper。
+
+\begin{lstlisting}
+parent exits:
+  for each child:
+    choose new_parent = nearest subreaper or init
+    move child to new_parent.children
+    if child is zombie:
+      notify new_parent
+\end{lstlisting}
+
+这里的并发点是父子列表、退出状态和 wait 扫描必须在锁保护下保持一致。否则 wait 可能漏掉刚退出的子进程，或者子进程被两个父对象同时看到。
+
+\subsection{进程生命周期的测试矩阵}
+
+进程生命周期测试应该覆盖正常路径、失败路径和并发路径。
+
+\begin{longtable}{p{0.24\linewidth}p{0.42\linewidth}p{0.22\linewidth}}
+\toprule
+测试 & 关键断言 & 风险 \\
+\midrule
+fork 基本路径 & 父返回 child pid，子返回 0 & 寄存器帧设置错误 \\
+fork 失败注入 & 每个阶段失败后引用数归零 & 资源泄漏或半成品可见 \\
+fork COW & 父子写入互不污染 & PTE/TLB 权限错误 \\
+exec 成功 & PID 保留，地址空间替换 & fd/signal/cred 规则错误 \\
+exec 失败 & commit 前失败旧程序继续 & 旧 mm 被提前破坏 \\
+exit/wait & zombie 被 wait 回收一次 & 重复回收或泄漏 \\
+多线程 close/read & 共享 fd 表语义一致 & use-after-close 或引用泄漏 \\
+reparent & 父退出后子由 reaper 回收 & zombie 泄漏 \\
+\bottomrule
+\end{longtable}
+
+如果一本书只讲 fork/exec/wait 的定义，不讲这些断言，读者就无法写出可靠内核，也无法读懂真实源码里的复杂错误路径。

@@ -1,0 +1,85 @@
+\section{第一阶段可运行模型：把 CPU、MMIO、中断和 DMA 变成状态机}
+
+前面几节把硬件事实映射到内核对象，本节再补最后一块：用一个可编译的 \cpp20 小模型，把“用户态不能访问内核页”“用户态不能访问 MMIO”“设备通过中断通知 CPU”“DMA 映射有生命周期”这些说法变成能失败、能断言、能复现的状态机。
+
+这个模型不是为了模拟 x86-64 的全部细节。第一阶段需要的是最小硬件契约：只要这几个契约讲不清，后面的系统调用、调度、文件系统和网络 I/O 都会变成背概念。
+
+\begin{keyidea}
+一个适合原理卷的硬件模型不追求外设数量，而追求边界清楚：CPU 以某个模式发起访问，总线按地址把访问分发到 RAM 或 MMIO，内存权限决定访问是否成立，设备完成后投递中断，DMA engine 只能在映射有效期内写入被授权的 buffer。
+\end{keyidea}
+
+\subsection{模型覆盖的硬件契约}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+模块 & 模型里的结构 & 对应 OS 原理 \\
+\midrule
+CPU 特权级 & \code{PrivilegeLevel::Ring3} 与 \code{PrivilegeLevel::Ring0} & x86-64 CPL、系统调用入口、中断返回 \\
+页权限 & \code{PagePermission} 与 \code{PhysicalMemory::check\_access} & 用户页、内核页、PTE 权限、保护异常 \\
+总线解码 & \code{Bus::load8/store8} 按地址选择 RAM 或 MMIO & 物理地址空间、设备寄存器窗口、\code{ioremap} \\
+MMIO 设备 & \code{SimpleDevice} 的 status/data/doorbell & 驱动寄存器协议、doorbell、副作用写 \\
+中断控制器 & \code{InterruptController::raise/take\_next} & IRQ descriptor、pending 事件、handler 分发 \\
+trap frame & \code{Cpu::handle\_one\_interrupt} 保存 RIP/RFLAGS/CPL & 内核入口、异常帧、返回用户态所需状态 \\
+DMA 映射 & \code{DmaEngine::map/unmap/device\_write} & DMA API、IOMMU 授权、buffer 所有权 \\
+\bottomrule
+\end{longtable}
+
+这张表里的每一行都刻意对应一个 OS 对象。CPU 模式对应“谁有资格执行特权操作”；页权限对应“用户指针为什么要检查”；MMIO 对应“设备为什么不能被当作普通变量”；中断对应“设备完成为什么能唤醒等待者”；DMA 对应“completion 前为什么不能释放 buffer”。
+
+\subsection{状态机比名词更重要}
+
+第一阶段最容易写成硬件名词表。名词表的问题是没有失败边界：读者知道 DMA、IOMMU、MMIO，却不知道什么时候该拒绝访问，什么时候该保存现场，什么时候资源已经不能再被设备使用。这个模型用几个状态转移强制表达边界。
+
+\begin{enumerate}
+\tightlist
+\item 用户态写普通用户页：总线走 RAM 路径，页权限允许，写入成功。
+\item 用户态写内核页：地址仍是 RAM，但页权限拒绝，抛出保护 fault。
+\item 用户态写 MMIO doorbell：总线发现地址属于设备窗口，但模式不是 kernel，抛出保护 fault。
+\item 内核写 MMIO doorbell：设备接收命令，更新内部状态，并向中断控制器投递 device interrupt。
+\item CPU 处理 pending interrupt：保存 trap frame，切换到 Ring 0，把 RIP 改成设备中断入口。
+\item 内核为 buffer 建立 DMA mapping：设备拿到 handle 后才能写入对应 RAM。
+\item DMA unmap 后设备继续写：mapping 已失效，模型必须拒绝这次迟到写。
+\end{enumerate}
+
+这些状态转移对应真实内核里的不变量：权限检查必须发生在访问之前；中断入口必须保存足够恢复用户态的状态；设备拥有 buffer 的时间必须被内核精确管理；unmap 不是注释，而是权限撤销。
+
+\subsection{编译和运行}
+
+在书根目录运行下面两条命令，可以独立编译并执行本节模型。
+
+\begin{lstlisting}
+g++ -std=c++20 -Wall -Wextra -Wpedantic -Werror \
+  source/latex/listings/stage_one_hardware_model.cpp \
+  -o /tmp/stage_one_hardware_model
+/tmp/stage_one_hardware_model
+\end{lstlisting}
+
+期望输出如下：
+
+\begin{lstlisting}
+stage one hardware model checks passed
+\end{lstlisting}
+
+如果读者把模型里的任一条边界删掉，例如允许用户态写 MMIO、允许用户态写内核页、或者允许 unmap 后继续 DMA 写，程序都应该失败。这个失败比“书上说不可以”更有教学价值，因为它把抽象规则变成了可观察的断言。
+
+\subsection{测试断言和失败含义}
+
+\begin{longtable}{p{0.3\linewidth}p{0.34\linewidth}p{0.24\linewidth}}
+\toprule
+断言 & 失败说明 & 对应真实系统风险 \\
+\midrule
+用户页读写成功 & 基础 RAM 路径或页权限初始化错误 & 用户程序无法正常执行 \\
+用户态写内核页失败 & 缺少特权隔离 & 用户进程可破坏内核对象 \\
+用户态写 MMIO 失败 & 设备寄存器暴露给用户态 & 用户程序可直接控制硬件 \\
+内核写 doorbell 后产生中断 & 设备完成路径没有闭环 & 等待者可能永久睡眠 \\
+中断保存 trap frame & 返回路径缺少现场 & 用户态恢复后状态错乱 \\
+DMA 写入映射 buffer 成功 & buffer 授权或地址翻译错误 & I/O 数据无法进入内存 \\
+unmap 后 DMA 写失败 & 生命周期撤销无效 & 迟到 DMA 可能写坏新对象 \\
+\bottomrule
+\end{longtable}
+
+这组断言不是完整 OS 测试，但它覆盖第一阶段必须过关的最小边界。后面讲系统调用时，可以把“用户指针检查”接回页权限；讲调度时，可以把“中断入口保存现场”接回 trap frame；讲文件系统和网络时，可以把“请求完成”接回中断与 DMA 生命周期。
+
+\subsection{完整 \cpp20 模型源码}
+
+\lstinputlisting[language=C++,basicstyle=\ttfamily\tiny]{listings/stage_one_hardware_model.cpp}

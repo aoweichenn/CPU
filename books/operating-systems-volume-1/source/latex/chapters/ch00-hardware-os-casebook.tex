@@ -1,0 +1,209 @@
+\section{端到端案例：把硬件和 OS 串成一条路径}
+
+硬件最难学的地方，是每个部件单独看都能理解，合起来就乱。本节用几个端到端案例串起来。每个案例都按同一模板：事件从哪里来，经过哪些硬件，内核维护哪些对象，用户程序看到什么，哪里可能失败。
+
+\subsection{案例一：按下键盘到终端显示字符}
+
+按键不是直接变成 shell 输入。以 USB 键盘为例，键盘把按键状态放进 HID report，USB host controller 按轮询周期取回 report，通过 DMA 写入内存，触发中断或 completion。内核 USB/HID 驱动解析 report，输入子系统产生 key event，终端行规程处理字符，等待 \code{read} 的 shell 被唤醒。
+
+\begin{lstlisting}
+key press
+  -> USB HID report
+  -> host controller DMA
+  -> USB interrupt/completion
+  -> HID driver
+  -> input subsystem
+  -> tty line discipline
+  -> wake shell blocked in read()
+\end{lstlisting}
+
+可能失败的地方很多：USB 设备拔出，HID report 格式异常，键盘布局映射不同，tty canonical 模式等待回车，shell 被信号打断，终端缓冲区满。一个简单按键，跨了设备、DMA、中断、驱动、输入子系统、tty 和进程调度。
+
+\subsection{案例二：读取 NVMe 上的一个文件}
+
+用户程序调用 \code{read(fd, buf, len)}。如果数据在 page cache 中，内核直接复制到用户 buffer；如果不在，文件系统把文件 offset 转成逻辑块，块层构造 bio/request，NVMe 驱动填 submission queue，设备 DMA 读取数据，completion queue 写回结果并中断，内核把页放入 page cache，再复制给用户。
+
+\begin{lstlisting}
+read()
+  -> fd table
+  -> file/inode
+  -> page cache miss
+  -> filesystem block mapping
+  -> bio/request
+  -> NVMe submission queue
+  -> PCIe DMA
+  -> completion interrupt
+  -> page cache filled
+  -> copy_to_user
+\end{lstlisting}
+
+关键误区：\code{read} 返回不是设备每次都读盘；page cache 命中时不会访问 NVMe。另一个误区：NVMe completion 表示设备完成了这次读请求，不等于后续用户处理一定完成。
+
+\subsection{案例三：写文件并保证崩溃后存在}
+
+用户调用 \code{write}，数据通常先进 page cache，页被标记 dirty。后台 writeback 或 \code{fsync} 把数据提交给块层。文件系统可能先写日志，再写数据和元数据。设备内部可能有 volatile cache，所以还需要 flush 或 FUA 约束持久化。
+
+\begin{lstlisting}
+write()
+  -> copy_from_user
+  -> page cache dirty
+  -> filesystem transaction
+  -> block layer request
+  -> device cache
+  -> flush/FUA
+  -> stable media
+  -> fsync returns
+\end{lstlisting}
+
+若程序只调用 \code{write} 后崩溃，数据可能还在内存。若调用 \code{fsync(file)} 但目录项没同步，rename/create 的目录更新可能不持久。可靠写入要区分数据、元数据、目录项和 manifest。
+
+\subsection{案例四：网卡收到一个 TCP 包}
+
+网卡 RX ring 中预先放了 DMA buffer。包从网线进入 PHY/MAC，网卡把数据 DMA 到 buffer，写 completion/status，通过 MSI-X 中断通知 CPU。驱动 NAPI poll 取包，构造 skb，经过协议栈 IP/TCP，放入 socket receive queue，唤醒阻塞在 \code{recv} 或 \code{epoll} 的进程。
+
+\begin{lstlisting}
+packet on wire
+  -> PHY/MAC
+  -> NIC RX DMA into buffer
+  -> MSI-X interrupt
+  -> NAPI poll
+  -> skb
+  -> IP/TCP stack
+  -> socket receive queue
+  -> wake user process
+\end{lstlisting}
+
+性能问题可能出在 IRQ 全打到一个 CPU、NAPI budget 太小、socket buffer 太小、用户进程调度不及时、NUMA 跨节点、GRO/TSO 配置、包过滤规则。网络不是单纯“协议栈算法”，它强依赖硬件队列和 CPU 拓扑。
+
+\subsection{案例五：在屏幕上显示一个像素}
+
+最简单 framebuffer 模型中，用户或 compositor 写入一块图像 buffer。显示控制器按刷新率 scanout 这块 buffer。为了避免撕裂，系统使用 double buffering 或 page flip，在 vblank 边界切换显示 buffer。现代 GPU 路径还包括渲染命令队列、显存分配、同步 fence 和合成器。
+
+\begin{lstlisting}
+draw pixel
+  -> write into render buffer
+  -> GPU or CPU rendering completes
+  -> compositor submits page flip
+  -> display controller switches buffer at vblank
+  -> monitor receives scanout
+\end{lstlisting}
+
+显示问题可能不是“画图代码错”，而是 buffer stride、像素格式、cache flush、GPU fence 未完成、vblank 同步、显示模式或电源状态。OS 图形栈是硬件队列和用户态协议的组合。
+
+\subsection{案例六：播放一段声音}
+
+音频程序把 PCM 数据写入 ring buffer。x86-64 PC 上的 HD-audio 控制器或 USB audio 设备通过 DMA 或主机控制器传输周期性读取 buffer，把样本送到 codec 和 DAC。每播放一个 period，设备产生中断或 completion，内核唤醒音频服务继续填充。若用户进程调度太晚，buffer underrun，就会爆音。
+
+\begin{lstlisting}
+audio app
+  -> userspace audio server
+  -> kernel ALSA buffer
+  -> DMA to audio controller
+  -> DAC
+  -> speaker
+  -> period interrupt wakes refill
+\end{lstlisting}
+
+音频强调延迟和稳定周期。更大的 buffer 抗抖动但延迟高；更小 buffer 延迟低但更容易 underrun。调度器、电源管理和中断延迟都会影响音频体验。
+
+\subsection{案例七：系统睡眠再唤醒}
+
+suspend 不是简单暂停 CPU。内核要冻结用户进程，停止设备新 I/O，等待或取消 in-flight 请求，保存设备寄存器，关闭中断源，进入低功耗状态。唤醒时，固件或硬件事件恢复 CPU，内核重新初始化时钟、中断和设备，恢复队列，再解冻进程。
+
+\begin{lstlisting}
+suspend:
+  freeze userspace
+  suspend filesystems/devices
+  disable non-wakeup IRQs
+  save device state
+  enter low power state
+
+resume:
+  restore clocks and interrupts
+  resume devices
+  restart queues
+  thaw userspace
+\end{lstlisting}
+
+常见 bug：设备 resume 后寄存器没恢复，DMA 队列丢失，中断未重新打开，时钟源跳变，网络连接超时，USB 设备重新枚举。电源管理是整机状态机，不是单个设备函数。
+
+\subsection{案例八：CPU 过热导致性能下降}
+
+程序运行一段时间后变慢，可能不是算法变了，而是温度升高触发降频。温度传感器报告超过阈值，thermal framework 要求 cpufreq 降低频率，甚至限制 GPU/NPU。风扇、散热片、功耗限制都会影响结果。
+
+\begin{lstlisting}
+high workload
+  -> CPU power rises
+  -> temperature sensor crosses threshold
+  -> thermal governor requests lower frequency
+  -> cpufreq changes P-state
+  -> benchmark throughput drops
+\end{lstlisting}
+
+性能报告必须记录频率、温度、功耗状态和 governor。否则“优化后变慢”可能只是热状态不同。操作系统性能分析离不开硬件传感器。
+
+\subsection{案例九：虚拟机里一次磁盘读}
+
+guest 里调用 \code{read}，guest 文件系统走到虚拟块设备。若使用 virtio-blk，guest driver 把请求放入 virtqueue，触发 VM exit 或通知 host。host vhost/virtio 后端把请求转成宿主文件或块设备 I/O。completion 再反向通知 guest。
+
+\begin{lstlisting}
+guest read()
+  -> guest page cache/block layer
+  -> virtio queue
+  -> VM exit or ioeventfd
+  -> host backend
+  -> host storage stack
+  -> completion
+  -> virtual interrupt to guest
+\end{lstlisting}
+
+这里有两层 OS、两层 page cache、两层调度和可能的二级页表翻译。虚拟化性能问题常来自 VM exit、队列深度、host page cache、NUMA 放置和虚拟中断延迟。
+
+\subsection{案例十：一次内存错误被 OS 处理}
+
+服务器 ECC 检测到可纠正错误，硬件通过机器检查或 EDAC 报告给 OS。内核记录 DIMM、地址、错误计数。若某页错误频繁，内核可能把页下线，迁移数据，避免继续使用。
+
+\begin{lstlisting}
+DRAM bit flip
+  -> ECC corrects
+  -> memory controller logs syndrome
+  -> machine check/EDAC reports
+  -> kernel logs physical address
+  -> page may be soft-offlined
+\end{lstlisting}
+
+这说明硬件错误不是玄学。高可靠系统要能定位 DIMM、页、进程影响范围，并给运维留下证据。
+
+\subsection{案例方法：每条路径都写五列}
+
+以后分析任何硬件到 OS 的路径，都写五列：
+
+\begin{longtable}{p{0.18\linewidth}p{0.74\linewidth}}
+\toprule
+列 & 要写什么 \\
+\midrule
+事件源 & 用户调用、设备事件、定时器、故障、温度、电源状态 \\
+硬件路径 & CPU、总线、DMA、中断、cache、IOMMU、设备队列 \\
+内核对象 & fd、inode、page、skb、request、task、timer、workqueue \\
+用户可见结果 & 返回值、errno、唤醒、信号、性能变化、日志 \\
+失败证据 & 计数器、trace、dmesg、sysfs、perf、错误码 \\
+\bottomrule
+\end{longtable}
+
+这样写，硬件概念就不再散。每个设备、每个中断、每个 DMA 都能落到用户可见行为和内核对象上。
+
+\subsection{本节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能完整讲出按键到 shell 读到字符的路径。
+\item 能区分文件读的 page cache 命中和 NVMe 真实 I/O。
+\item 能说明 \code{write}、writeback、flush、\code{fsync} 的阶段差异。
+\item 能讲出网卡 RX ring 到 socket receive queue 的路径。
+\item 能讲出 framebuffer/GPU page flip 到屏幕显示的路径。
+\item 能解释 suspend/resume 为什么是整机状态机。
+\item 能把虚拟机 I/O 拆成 guest、hypervisor、host 三层。
+\item 能用“五列表”分析一个新硬件案例。
+\end{itemize}
+\end{rubricbox}

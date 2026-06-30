@@ -1,0 +1,222 @@
+\section{第三阶段深讲：特权边界、装载和内存提交点}
+
+系统调用、exec 和缺页处理都在改变“谁能访问什么”。这类代码最怕半提交：权限已经放开但对象还没准备好，地址空间已经切换但旧程序还要返回错误，页表已经失效但物理页提前释放。学习这一章时，应把每条路径拆成准备、验证、提交、回滚四个阶段，而不是只记住 API 名字。
+
+\subsection{边界代码的共同结构}
+
+边界代码有三个共同问题。第一，输入来自不可信主体：系统调用参数来自用户寄存器和用户内存，ELF 文件可能被攻击者构造，page fault 地址可能来自错误或恶意访问。第二，执行路径会改变全局可见状态：fd 表、地址空间、页表、文件页、凭据和调度状态。第三，失败必须可解释：有些失败返回错误码，有些发送信号，有些说明内核自身已经损坏。
+
+\begin{lstlisting}
+boundary operation:
+  snapshot untrusted input
+  validate object identity and permissions
+  allocate temporary resources
+  build new state off to the side
+  commit with a short ordered sequence
+  publish visibility only after invariants hold
+  roll back temporary resources on every pre-commit failure
+\end{lstlisting}
+
+这个结构适用于 \code{openat}、\code{execve}、\code{mmap}、\code{mprotect}、COW fault 和文件写回。源码阅读时，只要找到“提交点”在哪里，前后语义就会清楚很多：提交点之前失败要回到旧状态，提交点之后失败只能按新状态处理或终止任务。
+
+\subsection{系统调用返回值也是 ABI}
+
+系统调用的结果不只是一个整数。ABI 规定返回值寄存器、错误码编码、哪些寄存器被破坏、哪些状态在返回前必须处理。libc wrapper 再把内核返回值转换成 \code{-1} 和 \code{errno}。如果教学 OS 忽略这些细节，用户程序就只能靠猜。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+返回类型 & 例子 & 调用者应该怎样理解 \\
+\midrule
+非负数量 & \code{read/write} 返回字节数 & 可能短读/短写，不等于请求全部完成 \\
+新句柄 & \code{open/socket/dup} 返回 fd & fd 是进程表索引，不是对象永久身份 \\
+0 表示成功 & \code{close/mprotect/munmap} & 只说明接口语义完成，不说明持久化 \\
+\code{-errno} & 内核内部常见约定 & wrapper 转成 \code{errno} 或直接传递 \\
+信号 & 用户访存错误、非法指令 & 错误发生在用户执行流，不一定有 syscall 返回 \\
+\bottomrule
+\end{longtable}
+
+\code{close} 的错误尤其容易被误解。fd 表项可能已经释放并可被复用，即使底层写回错误在 close 期间才报告。用户态不能在 \code{close} 返回错误后再重试同一个 fd，因为这个整数可能已经指向别的文件。正确设计要把持久化错误尽量通过 \code{fsync} 这类明确边界暴露。
+
+\subsection{restartable syscall 和 EINTR}
+
+阻塞系统调用可能在等待期间收到信号。内核有时返回 \code{EINTR}，有时把系统调用改写成可重启状态，让信号处理返回后重新执行。重启不是简单“再调一次函数”，因为部分 I/O、超时参数和用户可见副作用必须精确处理。
+
+\begin{lstlisting}
+blocking read:
+  copy no bytes yet
+  sleep waiting for data
+  signal arrives
+  if handler installed:
+    either return -EINTR
+    or arrange restart after signal frame
+
+partial read:
+  copied some bytes
+  signal arrives
+  return copied bytes, not -EINTR
+\end{lstlisting}
+
+这个规则解释了为什么系统调用实现要记录“是否已经产生用户可见进展”。已经复制给用户的字节、已经消耗的 socket 数据、已经创建的 fd，不能因为信号到来就假装从未发生。测试时应同时覆盖“阻塞前被打断”和“部分完成后被打断”。
+
+\subsection{copy\_from\_user 的分段提交}
+
+大 \code{read/write} 不应一次性申请巨大内核缓冲。常见实现会分段处理用户 iovec 或页片段。分段处理带来短完成语义：前几段成功，后面遇到坏页或信号，返回值可能是已经完成的字节数。
+
+\begin{lstlisting}
+write_iter(file, iov):
+  done = 0
+  for each segment in iov:
+    while segment has bytes:
+      chunk = copy_chunk_from_user(segment)
+      if chunk fault:
+        return done > 0 ? done : -EFAULT
+      ret = file_write_chunk(file, chunk)
+      if ret < 0:
+        return done > 0 ? done : ret
+      done += ret
+  return done
+\end{lstlisting}
+
+这里的提交粒度是 chunk。若 chunk 已写入 pipe 或 socket queue，就不能在后续 fault 时撤销。文件系统写入还要区分 page cache dirty、journal commit 和设备持久化。一本教材若只说“复制用户 buffer 再写文件”，读者会漏掉短写、EFAULT 和持久化边界。
+
+\subsection{exec 的三道权限门}
+
+\code{execve} 至少经过三道权限门。第一道是路径和文件权限：调用者是否能走到该文件，文件是否可执行，挂载是否 \code{noexec}。第二道是二进制格式和装载权限：ELF 段权限是否合理，解释器是否允许执行，栈是否可执行。第三道是凭据转换：setuid、file capability、LSM、no\_new\_privs 和 ptrace 规则共同决定新程序的身份。
+
+\begin{lstlisting}
+exec permission gates:
+  path permission and executable inode
+  binary format and memory layout policy
+  credential transition and security hooks
+\end{lstlisting}
+
+这三道门的错误码和失败时机不同。路径不存在是 \code{ENOENT}；不是可执行格式可能是 \code{ENOEXEC}；参数过大是 \code{E2BIG}；权限不足是 \code{EACCES} 或 \code{EPERM}；解释器不存在也会让整个 exec 失败，但旧程序必须还能拿到错误。把这些都归为“启动失败”，无法写出 shell、容器运行时或服务管理器。
+
+\subsection{ELF 段权限不是 section 权限}
+
+运行时装载看 program header，链接和调试看 section header。很多 ELF 被 strip 后没有完整 section 信息，仍然能运行。教学装载器如果读取 \code{.text/.data/.bss} 名字来建立映射，就是把链接器视角误当成内核视角。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+视角 & 使用对象 & 典型消费者 \\
+\midrule
+运行时装载 & \code{PT\_LOAD/PT\_INTERP/PT\_PHDR} & 内核 exec、动态链接器 \\
+链接和重定位 & section、symbol、relocation & 链接器、objdump、调试器 \\
+调试展开 & DWARF、CFI、eh\_frame & gdb、异常展开、profiler \\
+\bottomrule
+\end{longtable}
+
+段映射还要处理文件尾页。若 \code{p\_filesz} 结束在页中间，而 \code{p\_memsz} 更大，同一页中从文件末尾到页末的部分必须清零；后续整页 BSS 也要清零或懒分配零页。这个细节若错，未初始化全局变量会读到旧文件内容或未清理内存。
+
+\subsection{地址空间切换的提交顺序}
+
+exec 提交时，最危险的是先激活新页表再访问旧地址空间数据，或先释放旧 mm 再需要从旧用户栈取参数。安全做法是：提交前把 path、argv、envp、解释器路径和 auxv 所需数据复制到内核或新栈页；新 mm 完整可用后再短序列切换。
+
+\begin{lstlisting}
+safe exec commit:
+  prepare new_mm, new_stack, new_regs
+  copy all old user data before old_mm is dropped
+  stop sibling threads if multithreaded
+  install credentials that belong to new image
+  install current.mm = new_mm
+  switch hardware page table
+  make old_mm unreachable from current
+  drop old_mm references
+  return to new user entry
+\end{lstlisting}
+
+顺序里有两个可见性点：\code{current.mm} 对内核其他路径可见，硬件页表根对 CPU 访存可见。多核系统还要考虑同一地址空间是否仍在其他 CPU 活跃。若旧 mm 的页表页在远端 CPU TLB 失效前被释放，后果和普通 \code{munmap} 的 shootdown 错误一样严重。
+
+\subsection{mprotect 的权限收缩和扩大}
+
+\code{mprotect} 改权限时，扩大权限和收缩权限的风险不同。扩大权限要检查 VMA 的 \code{may} 权限和文件打开模式；收缩权限要立刻让硬件旧权限失效。比如把 RW 改成 R，如果不 flush TLB，CPU 可能继续使用缓存的 writable 翻译。
+
+\begin{lstlisting}
+mprotect(range, new_prot):
+  split vmas at range boundaries
+  for each vma in range:
+    if new_prot exceeds vma.may_prot:
+      rollback splits if needed
+      return -EACCES
+  update vma.prot
+  update present PTE permission bits
+  flush TLB for affected range
+\end{lstlisting}
+
+VMA 切分是另一个回滚点。若先切分出三个 VMA，后续某段权限检查失败，需要合并回原状态或保证中间状态不会被观察到。真实内核会通过锁保护 mm 结构，让其他线程不能在半修改区间中处理 fault。
+
+\subsection{munmap 和延迟释放}
+
+\code{munmap} 删除映射后，用户不能再访问这段虚拟地址。但对应物理页不一定立刻释放：其他进程可能映射同一文件页，I/O 可能持有页引用，RCU 或 TLB gather 可能延迟释放页表页。语义上的不可访问和资源上的最终释放是两件事。
+
+\begin{lstlisting}
+munmap(range):
+  remove or split VMAs
+  clear PTEs in range
+  collect old PTE pages and mapped pages into batch
+  flush TLB for range on all active CPUs
+  drop page references after stale translations are gone
+  free page table pages when no walker can see them
+\end{lstlisting}
+
+这能解释为什么内存统计不是瞬时下降，也解释为什么页表释放要和 TLB shootdown、页表遍历锁、RCU 等机制配合。教学 OS 可简化，但必须保留顺序原则：先撤销可达性，再失效旧翻译，最后释放底层资源。
+
+\subsection{page fault 的锁顺序}
+
+缺页路径会碰到 mm 锁、VMA 锁、页表锁、page cache 锁、folio 锁、文件系统锁和 I/O 等待。锁顺序错了会出现非常隐蔽的死锁。一个基本原则是：先稳定地址空间和 VMA，再稳定页表项，再稳定物理页或文件页；等待 I/O 时尽量不持有会阻塞其他 fault 的大锁。
+
+\begin{lstlisting}
+file page fault:
+  take mmap read lock or VMA lock
+  find and validate VMA
+  locate page cache folio
+  if folio locked or needs I/O:
+    drop/reduce locks that block unrelated faults
+    wait for folio
+    retry validation
+  take page table lock
+  install PTE if still valid
+  drop locks
+\end{lstlisting}
+
+这里的 retry 很重要。等待 I/O 期间，另一个线程可能 \code{munmap} 或 \code{mprotect} 了同一区间。醒来后不能直接安装 PTE，必须重新验证 VMA 和权限。许多内存管理 bug 都来自“睡眠前检查过，醒来后不再检查”。
+
+\subsection{源码阅读路线}
+
+这一阶段读 Linux 源码可以按路径而不是文件顺序推进。
+
+\begin{longtable}{p{0.27\linewidth}p{0.38\linewidth}p{0.23\linewidth}}
+\toprule
+路径 & 关键文件或函数 & 读法 \\
+\midrule
+系统调用入口 & \code{arch/x86/entry/}、\code{kernel/seccomp.c} & 参数、seccomp、返回工作 \\
+用户复制 & \code{arch/x86/lib/usercopy*}、\code{lib/iov\_iter.c} & fault fixup、短拷贝、iov \\
+exec/ELF & \code{fs/exec.c}、\code{fs/binfmt\_elf.c} & 准备新镜像和提交点 \\
+VMA 管理 & \code{mm/mmap.c}、\code{include/linux/mm\_types.h} & maple tree、切分、合并 \\
+缺页 & \code{mm/memory.c}、\code{mm/filemap.c} & anon/file/COW fault 分支 \\
+页表失效 & \code{mm/tlb.c}、架构 TLB 代码 & batch、shootdown、延迟释放 \\
+回收/OOM & \code{mm/vmscan.c}、\code{mm/oom\_kill.c} & reclaim 顺序和 victim 选择 \\
+\bottomrule
+\end{longtable}
+
+每条路径都按同一张表做笔记：输入对象、持有锁、可睡眠点、提交点、回滚对象、用户可见结果。这样能把几万行源码压成可理解的状态机。
+
+\subsection{边界反例集}
+
+高质量测试要故意打破边界。
+
+\begin{longtable}{p{0.27\linewidth}p{0.38\linewidth}p{0.23\linewidth}}
+\toprule
+反例 & 构造方法 & 必须观察到 \\
+\midrule
+用户指针半页坏 & iovec 前半有效后半 unmapped & 短完成或 \code{EFAULT}，内核不崩 \\
+exec 坏解释器 & ELF 的 \code{PT\_INTERP} 指向不存在路径 & exec 失败，旧程序继续 \\
+ELF 溢出段 & \code{p\_vaddr + p\_memsz} 整数溢出 & 拒绝装载 \\
+\code{mprotect} 后旧权限 & RW 改 R 后立即写 & 必须 fault，不能被 TLB 旧权限放行 \\
+fault 等 I/O 时 munmap & 线程 A fault 等页，线程 B unmap & A 醒来后重新验证并失败 \\
+close 与 read 并发 & 一个线程 read 已 fget，另一个 close 并复用 fd & read 用旧 file 引用，fd 数字可复用 \\
+memcg OOM & cgroup 内触发限制 & 只在 cgroup 内选择 victim \\
+\bottomrule
+\end{longtable}
+
+这些反例比正常路径更能检验实现质量。正常路径只证明代码能跑，反例才能证明边界没有漏。

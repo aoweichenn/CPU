@@ -1,0 +1,278 @@
+\section{系统调用、缺页和文件 I/O 实现深讲}
+
+本节把系统调用、虚拟内存、fd、VFS 和 page cache 连成一条实现路径。用户看到的是 \code{open/read/write/mmap/fork/exec}，内核看到的是 fd 表、file、inode、VMA、PTE、folio、bio、request 和设备 completion。深入理解 OS，必须能把这些对象按生命周期串起来。
+
+\subsection{系统调用入口的最小状态}
+
+CPU 进入系统调用入口后，内核必须拿到系统调用号、参数寄存器、用户返回地址、用户栈、状态寄存器和当前线程。入口代码先建立可信执行环境，再调用 C 层分发。
+
+\begin{lstlisting}
+syscall entry state:
+  user RIP and RFLAGS
+  user stack pointer
+  syscall number
+  argument registers
+  current task pointer
+  kernel stack pointer
+  page table context
+\end{lstlisting}
+
+入口路径不能直接相信用户栈。用户栈可能不可访问、被另一个线程修改，甚至故意指向内核地址。参数寄存器只是整数，指针参数要在具体系统调用里通过 \code{copy\_from\_user} 或 iov 机制处理。
+
+\subsection{fd 表、file 和 inode}
+
+文件描述符不是文件本身。fd 是进程 fd 表中的整数索引；索引指向 open file description，也就是内核的 \code{struct file}；\code{file} 再指向 inode 或 socket 等具体对象。多个 fd 可以指向同一个 \code{file}，共享文件 offset；多个 \code{file} 可以指向同一个 inode，各自有不同 offset 和 flags。
+
+\begin{lstlisting}
+process files_struct:
+  fd 0 -> file A -> inode terminal
+  fd 1 -> file B -> inode output.txt
+  fd 2 -> file B -> inode output.txt
+
+dup(1):
+  new fd points to same file B
+  file offset is shared
+
+open same path again:
+  new file C points to same inode
+  file offset is independent
+\end{lstlisting}
+
+这解释了 shell 重定向、dup2、fork 后 fd 共享、close-on-exec 的行为。若父子进程 fork 后共享同一个 \code{file}，它们写同一 fd 时共享 offset；若各自重新 open，同一 inode 也有不同 offset。
+
+\subsection{open 的路径解析}
+
+\code{open("/a/b/c")} 不是一次查表。内核从当前 root 或 cwd 出发，逐级解析 dentry，处理挂载点、符号链接、权限、缓存命中和可能的文件系统 I/O。路径解析必须防止 race 和越权。
+
+\begin{lstlisting}
+open path:
+  choose starting point: root or cwd
+  split path components
+  for each component:
+    lookup dentry in dcache
+    if miss, ask filesystem lookup
+    follow mount point if needed
+    handle symlink subject to flags and limits
+    check execute/search permission on directory
+  check final file permissions and flags
+  allocate struct file
+  install into fd table
+\end{lstlisting}
+
+路径解析有大量安全边界。攻击者可能在检查后替换路径组件；符号链接可能指向意外位置；目录权限和文件权限不同；\code{O\_NOFOLLOW}、\code{O\_CLOEXEC}、\code{openat}、\code{openat2} 都是在修复具体 race 或权限边界。
+
+\subsection{read 的三条路径：缓存命中、缓存未命中、直接 I/O}
+
+普通文件 \code{read} 首先查 page cache。若命中，内核把缓存页复制到用户 buffer；若未命中，文件系统和块层发起 I/O，设备完成后再复制；若使用 \code{O\_DIRECT}，则尽量绕过 page cache，把用户页或内核 bounce buffer 直接交给块层。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+路径 & 数据流 & 代价 \\
+\midrule
+page cache hit & cache page 到用户 buffer & copy 成本，低延迟 \\
+page cache miss & storage 到 page cache，再 copy & I/O 等待，后续可复用 \\
+direct I/O & 用户页和块设备之间 DMA 或接近 DMA & 对齐、pin 页、生命周期复杂 \\
+\bottomrule
+\end{longtable}
+
+直接 I/O 不是“一定更快”。它减少 page cache 污染和复制，但增加对齐、页 pin、设备队列和应用缓存管理成本。数据库常用它，是因为数据库自己管理缓存和写入顺序；普通应用通常受益于 page cache。
+
+\subsection{page cache 的 xarray 思想}
+
+文件的 page cache 需要按文件 offset 快速找到页。Linux 使用 address space 和 xarray 一类结构管理文件页。概念上可以理解为：
+
+\begin{lstlisting}
+file address_space:
+  key = page index within file
+  value = folio containing file data
+
+read page:
+  index = file_offset / PAGE_SIZE
+  folio = xarray_lookup(mapping, index)
+  if folio exists and uptodate:
+    copy from folio
+  else:
+    allocate folio and start read I/O
+\end{lstlisting}
+
+folio/page 的状态位很重要：uptodate 表示内容有效，dirty 表示需要写回，writeback 表示正在写，locked 表示某个路径正在操作。缺少这些状态，多个线程会重复读同一页或同时写回同一页。
+
+\subsection{write 的脏页路径}
+
+普通 buffered write 通常先把用户数据复制到 page cache，把页标记 dirty，然后返回。后台 writeback 或 fsync 再把 dirty 页写到存储设备。
+
+\begin{lstlisting}
+buffered write:
+  lookup or create page cache folio
+  copy_from_user into folio
+  mark folio dirty
+  update file size if extending
+  return bytes copied
+
+later writeback:
+  pick dirty folios
+  filesystem maps file blocks
+  submit bios to block layer
+  on completion clear writeback
+\end{lstlisting}
+
+这解释了为什么 \code{write} 可能很快而 \code{fsync} 很慢。前者只把数据推进到内核内存和文件系统状态，后者要等设备和日志顺序满足持久化要求。
+
+\subsection{mmap 读文件：不经过 read 也用 page cache}
+
+\code{mmap} 文件后，用户第一次访问对应地址会触发缺页。内核通过 VMA 找到文件和 offset，再从 page cache 找或读对应页，安装 PTE。之后用户态 load/store 直接访问映射页。
+
+\begin{lstlisting}
+file mmap fault:
+  CPU raises page fault at virtual address
+  kernel finds VMA
+  offset = vma.file_offset + (addr - vma.start)
+  folio = page_cache_get_or_read(file.mapping, offset)
+  install PTE mapping folio
+  return to faulting instruction
+\end{lstlisting}
+
+所以 \code{read} 和 \code{mmap} 不是两套完全分离的缓存。它们常共享 page cache。一个进程 \code{read} 过的文件页，另一个进程 \code{mmap} 访问可能命中；反过来也成立。区别在于数据进入用户态的方式：read 复制，mmap 建 PTE。
+
+\subsection{COW fault 的实现分支}
+
+\code{MAP\_PRIVATE} 文件映射或 fork 后匿名页共享，都可能使用 COW。写入时，硬件发现 PTE 不可写，触发保护异常。内核检查 VMA 允许写且 PTE 是 COW，然后复制页。
+
+\begin{lstlisting}
+COW write fault:
+  locate VMA and PTE
+  verify write is allowed by VMA
+  if PTE is COW:
+    old = pte.page
+    new = allocate_page()
+    copy_page(new, old)
+    install writable PTE to new page
+    decrement old refcount
+    flush TLB for address
+  else:
+    signal permission fault
+\end{lstlisting}
+
+COW 的难点在并发。两个线程可能同时 fault 同一页；fork、unmap、reclaim 也可能并发修改页表。内核必须用页表锁、页引用计数和重试逻辑保证不会复制错误页或泄漏引用。
+
+\subsection{缺页错误如何变成信号或 EFAULT}
+
+同一个坏地址，在不同上下文下结果不同。用户态直接访问坏地址，内核通常发送 \code{SIGSEGV}。系统调用 \code{copy\_from\_user} 过程中访问坏地址，系统调用应返回 \code{EFAULT}。内核自己访问坏内核地址，则是内核 bug，可能 oops 或 panic。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.3\linewidth}}
+\toprule
+上下文 & fault 结果 & 原因 \\
+\midrule
+用户指令 load/store & signal & 用户程序违反地址空间规则 \\
+内核 copy user & \code{-EFAULT} & 系统调用参数错误，可返回给调用者 \\
+内核普通指针 & oops/panic & 内核自身错误或硬件故障 \\
+缺页可修复 & 返回重试指令 & 懒分配、COW、文件页读入 \\
+\bottomrule
+\end{longtable}
+
+这就是 exception table 的价值：内核某些 copy 用户路径可以声明“若这里 fault，跳到修复位置返回错误”，而不是让内核崩溃。
+
+\subsection{epoll 的 readiness 不是 completion}
+
+文件和 socket 的 readiness 只表示“现在尝试某类操作可能不阻塞”，不是保证一定读到固定字节，也不是 I/O completion。多线程或边缘触发下，readiness 状态可能在应用处理前就变化。
+
+\begin{lstlisting}
+epoll wait:
+  if socket receive queue not empty:
+    report readable
+  user thread wakes
+  another thread may consume data first
+  read may still return EAGAIN on nonblocking fd
+\end{lstlisting}
+
+所以非阻塞 I/O 必须在循环中处理 \code{EAGAIN}。epoll 降低“等待很多 fd”的成本，但不取消对象状态变化和并发竞争。readiness API 和 io\_uring completion API 的语义不同，不能混用理解。
+
+\subsection{io\_uring 的提交和完成环}
+
+io\_uring 用共享 ring 减少系统调用次数。用户态写 submission queue entry，内核消费 SQE 并执行请求，完成后写 completion queue entry。关键仍是所有权、顺序和生命周期。
+
+\begin{lstlisting}
+io_uring lifecycle:
+  userspace fills SQE
+  userspace advances SQ tail with store-release
+  kernel observes SQ tail with load-acquire
+  kernel validates fd, buffer, opcode
+  request is issued to file/socket/block layer
+  completion CQE is written
+  userspace reads CQE and recycles resources
+\end{lstlisting}
+
+若 buffer 在 completion 前释放，异步路径可能使用悬空内存；若 fd 在请求执行前关闭，内核必须通过引用计数保证对象要么仍有效，要么请求明确失败；若应用不消费 CQE，完成队列会背压。
+
+\subsection{fd 生命周期和引用计数}
+
+并发 close 和 I/O 是系统调用实现的经典难点。用户关闭 fd 后，fd 表项删除，新的 open 可能复用同一整数。但已经拿到 \code{struct file} 引用的内核 I/O 可以继续完成。
+
+\begin{lstlisting}
+sys_read(fd):
+  file = fget(fd)       // increments file refcount if fd valid
+  if file == null:
+    return -EBADF
+  ret = vfs_read(file)
+  fput(file)            // may release after last ref
+  return ret
+
+sys_close(fd):
+  file = remove fd table entry
+  fput(file)
+\end{lstlisting}
+
+这解释了为什么 fd 整数不能长期当对象身份。close 后同一个数字可能马上指向另一个文件。内核内部必须使用对象引用，用户态高层库也要小心 fd reuse 带来的取消和多线程 race。
+
+\subsection{文件系统日志和 page cache 的关系}
+
+page cache 保存文件数据，文件系统日志通常保护元数据或特定模式下的数据顺序。dirty page 写回和日志提交是相关但不同的状态机。fsync 必须把两者推进到一致点。
+
+\begin{lstlisting}
+fsync(file):
+  write dirty file data pages
+  wait data writeback completion
+  commit filesystem metadata transaction
+  issue flush/FUA as needed
+  return only after required durability point
+\end{lstlisting}
+
+不同文件系统和挂载选项会改变数据与元数据顺序。例如 ordered 模式要求相关数据块在提交元数据前写出；writeback 模式可能只保证元数据一致；journal data 模式连数据也进日志。应用不能凭感觉推断崩溃语义，必须理解目标文件系统契约。
+
+\subsection{把一次请求完整编号}
+
+分析复杂 I/O 时，给每一层对象编号能避免混乱。
+
+\begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\toprule
+编号 & 对象 & 状态问题 \\
+\midrule
+1 & 用户 fd 整数 & 是否仍指向预期 file \\
+2 & \code{struct file} & 引用计数、offset、flags \\
+3 & inode/address space & 文件大小、page cache、权限 \\
+4 & folio/page & uptodate、dirty、locked、writeback \\
+5 & bio/request & 块映射、队列、超时 \\
+6 & DMA buffer/descriptor & map/unmap、所有权、completion \\
+7 & device command & status、错误码、reset 影响 \\
+\bottomrule
+\end{longtable}
+
+任何一层状态没写清楚，都会产生 bug。例如 fd 已 close 但 file 引用还在，page dirty 但 writeback 未完成，request 已超时但设备稍后仍 completion，reset 后旧 DMA 仍可能写内存。
+
+\subsection{实现级测试矩阵}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item \code{dup} 后两个 fd 共享 offset；重新 \code{open} 的 fd 不共享 offset。
+\item \code{O\_CLOEXEC} fd 在 exec 后关闭，普通 fd 按规则保留。
+\item 坏用户指针在 \code{read/write} 中返回 \code{EFAULT}，不导致内核崩溃。
+\item \code{MAP\_PRIVATE} 写入后文件内容不变，\code{MAP\_SHARED} 按规则变 dirty。
+\item fork 后 COW 写入不影响父子另一方。
+\item close 与并发 read/write 不造成 use-after-free，fd reuse 不混淆对象。
+\item page cache 命中路径不发块 I/O，冷缓存路径能观察到块 I/O。
+\item fsync 后再模拟崩溃，文件数据和目录项语义符合预期。
+\item 非阻塞 fd 在未 ready 时返回 \code{EAGAIN}，epoll 事件后仍能处理竞态。
+\item io\_uring 请求在 completion 前不能释放 buffer 或丢失对象引用。
+\end{itemize}
+\end{rubricbox}

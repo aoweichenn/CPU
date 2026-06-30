@@ -1,0 +1,175 @@
+\section{函数调用、栈和 ABI：程序如何变成可恢复的控制流}
+
+操作系统的进程、线程、系统调用和异常处理，都依赖一个更基础的事实：程序运行不是一团代码随便跳，而是有调用约定、栈帧、返回地址、寄存器保存规则和二进制接口。先把普通函数调用讲清楚，再看系统调用和上下文切换，会少很多误解。
+
+\subsection{为什么需要调用约定}
+
+函数调用要解决几个问题：参数放在哪里，返回值放在哪里，被调用函数能改哪些寄存器，返回地址如何保存，栈如何对齐，谁负责清理参数。调用者和被调用者必须遵守同一套规则，否则分别编译的代码无法互相调用。这套规则叫 calling convention，是 ABI 的一部分。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+问题 & 调用约定回答 & 错误后果 \\
+\midrule
+参数传递 & 前几个参数在寄存器，更多参数在栈 & 函数读错输入 \\
+返回值 & 使用指定寄存器或内存返回区 & 调用者拿错结果 \\
+寄存器保存 & caller-saved / callee-saved & 返回后变量被破坏 \\
+栈对齐 & 调用前满足固定对齐 & SIMD/函数序言/ABI 失败 \\
+可变参数 & 额外寄存器和栈布局规则 & \code{printf} 一类函数解析错误 \\
+\bottomrule
+\end{longtable}
+
+系统调用 ABI 和函数调用 ABI 相似但边界更硬。函数调用跨的是代码组织边界；系统调用跨的是用户/内核特权边界。
+
+\subsection{一个函数调用的机器级过程}
+
+假设调用 \code{f(1, 2)}。伪汇编可能是：
+
+\begin{lstlisting}
+mov edi, 1      ; arg0, System V x86-64 integer arg 1
+mov esi, 2      ; arg1, System V x86-64 integer arg 2
+call f
+; return value in eax
+\end{lstlisting}
+
+\code{call f} 至少做两件事：把返回地址压入当前 \code{rsp} 指向的栈，把 \code{rip} 改成 \code{f} 的入口。返回时 \code{ret} 从栈顶取回返回地址放回 \code{rip}。
+
+\begin{lstlisting}
+call target:
+  push next_rip
+  rip = target
+
+ret:
+  pop rip
+\end{lstlisting}
+
+这解释了为什么栈损坏会导致程序跳飞。返回地址只是栈上的数据；若越界写覆盖返回地址，\code{ret} 就会把错误值装入 \code{rip}。现代系统用栈 canary、ASLR、NX、CFI 等机制降低这类攻击风险。
+
+\subsection{栈帧里有什么}
+
+一个典型栈帧可能包含返回地址、旧帧指针、保存的 callee-saved 寄存器、局部变量、临时 spill 槽和对齐填充。
+
+\begin{lstlisting}
+high address
+  caller frame
+  argument spill area
+  return address
+  old frame pointer
+  saved registers
+  local variables
+  temporary spill slots
+low address
+\end{lstlisting}
+
+优化编译器可能省略帧指针，把局部变量放寄存器，甚至内联函数让栈帧消失。但异常展开、调试器栈回溯、perf 采样和崩溃报告都需要某种方式恢复调用链。DWARF CFI 和 frame pointer 就是为了解决“如何从当前寄存器和栈恢复上一帧”。
+
+\subsection{caller-saved 和 callee-saved}
+
+寄存器保存规则是一种成本分摊。caller-saved 表示调用者若还需要该寄存器，就在调用前自己保存；callee-saved 表示被调用者若要使用，就必须在返回前恢复。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+类别 & 谁保存 & 适合用途 \\
+\midrule
+caller-saved & 调用者 & 短生命周期临时值、参数寄存器 \\
+callee-saved & 被调用者 & 跨函数调用仍要保留的局部状态 \\
+special registers & ABI 或硬件固定 & RSP、RIP、RFLAGS、线程指针等 \\
+\bottomrule
+\end{longtable}
+
+上下文切换和函数调用不同。函数调用只遵守 ABI 保存一部分寄存器；中断或线程切换必须保存足以恢复执行的架构状态。系统调用入口还要保存用户传参寄存器，因为它们是系统调用语义的一部分。
+
+\subsection{栈增长、栈溢出和 guard page}
+
+很多系统的用户栈向低地址增长。函数调用越深，\code{rsp} 越小。若递归过深或局部数组太大，栈会撞到未映射区域。OS 通常在栈边界放 guard page：访问它时触发 page fault，内核判断是可增长栈还是栈溢出。
+
+\begin{lstlisting}
+stack layout:
+  mapped stack pages
+  guard page  // not present
+  other mappings
+\end{lstlisting}
+
+内核栈更危险。用户栈溢出通常杀进程；内核栈溢出可能破坏内核对象，导致安全漏洞或 panic。因此内核栈较小、禁止大局部数组、使用专门栈处理 NMI/double fault 等关键异常。
+
+\subsection{线程为什么需要自己的栈}
+
+线程的“执行到哪里”不只在 \code{rip}，还在栈里。若两个线程共用同一个栈，它们的函数调用、返回地址和局部变量会互相覆盖。每个线程必须有独立用户栈；进入内核后，也需要对应的内核栈或受控异常栈保存内核路径。
+
+\begin{lstlisting}
+Thread A:
+  user stack A
+  kernel stack A
+
+Thread B:
+  user stack B
+  kernel stack B
+\end{lstlisting}
+
+协程和用户态线程可以共享 OS 线程，但它们仍需要各自保存栈或保存状态机 continuation。无论实现方式如何，“下一步在哪里”和“局部状态在哪里”必须有地方保存。
+
+\subsection{系统调用栈切换与函数调用的差别}
+
+普通函数调用继续使用同一栈和同一特权级。系统调用从用户态进入内核态，不能继续信任用户栈。内核入口要切换到当前线程的内核栈，把用户寄存器保存成 \code{pt\_regs}，再调用 C 层系统调用处理函数。
+
+\begin{lstlisting}
+user:
+  rax = syscall_number
+  rdi = arg0
+  syscall
+
+entry:
+  switch rsp from user_rsp to kernel_rsp
+  push user register state into pt_regs
+  call syscall_dispatch
+\end{lstlisting}
+
+这说明系统调用开销来自多层：CPU 特权切换、栈切换、寄存器保存、权限检查、对象查找、可能的调度和返回路径工作。它不是普通函数调用慢一点而已。
+
+\subsection{异常展开和 C++ 异常为什么依赖 ABI}
+
+C++ 异常抛出时，运行时要沿调用栈查找 handler，并在经过每个栈帧时执行析构。它必须知道每个函数的栈布局、返回地址、保存寄存器和清理代码位置。这些信息由 ABI、DWARF unwind table 和编译器共同维护。
+
+\begin{lstlisting}
+throw:
+  capture exception object
+  inspect current frame unwind info
+  find landing pad or caller frame
+  run destructors while unwinding
+  transfer control to catch handler
+\end{lstlisting}
+
+内核通常不使用 C++ 异常，但它有类似需求：oops/panic 打印栈，perf 采样回溯调用链，用户态 signal handler 返回要恢复上下文，调试器要 unwind。所有这些都要求机器状态和栈布局可解释。
+
+\subsection{exec 如何构造第一帧用户栈}
+
+\code{execve} 装载新程序后，用户程序还没有调用任何函数，但它需要一个初始栈，里面放 \code{argc}、\code{argv}、\code{envp}、auxv 和字符串数据。动态链接器和 libc 启动代码从这个栈读取参数，再调用 \code{main}。
+
+\begin{lstlisting}
+initial user stack:
+  argc
+  argv[0] pointer
+  argv[1] pointer
+  ...
+  NULL
+  envp[0] pointer
+  ...
+  NULL
+  auxv entries
+  strings for argv/envp
+\end{lstlisting}
+
+这说明进程启动也依赖 ABI。内核不能随便把参数放某个内核对象里；用户态启动代码按 ABI 从栈读取。若栈对齐或 auxv 错，程序可能在进入 \code{main} 前就崩溃。
+
+\subsection{本节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能解释调用约定为什么必须规定参数、返回值、寄存器保存和栈对齐。
+\item 能画出 \code{CALL/RET} 如何用栈保存返回地址。
+\item 能说明栈帧中返回地址、旧帧指针、保存寄存器、局部变量的位置和作用。
+\item 能区分函数调用保存寄存器、系统调用保存 trap frame、线程切换保存 context。
+\item 能解释为什么系统调用必须切到内核栈。
+\item 能解释 \code{execve} 为什么要构造初始用户栈。
+\end{itemize}
+\end{rubricbox}

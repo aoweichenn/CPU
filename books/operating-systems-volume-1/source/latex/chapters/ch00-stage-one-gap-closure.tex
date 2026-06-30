@@ -1,0 +1,96 @@
+\section{第一阶段补课：为什么还不能算完成}
+
+前面的第一章已经放进了大量硬件知识，但“知识多”不等于“第一阶段完成”。第一阶段的完成标准不是能背出 CPU、DMA、IOMMU、TLB、PCIe、APIC 这些词，而是能把一个硬件事实推导成一个 OS 设计，再把这个设计落到源码对象、可运行模型、失败案例和观测证据上。若读者看完仍然不知道“为什么必须有这个机制”，第一阶段就没有完成。
+
+\subsection{第一阶段真正要回答的六个问题}
+
+\begin{longtable}{p{0.25\linewidth}p{0.36\linewidth}p{0.27\linewidth}}
+\toprule
+问题 & 必须能解释到什么程度 & 不合格表现 \\
+\midrule
+程序为什么会跑 & RIP、取指、译码、寄存器、内存读写、异常 & 只说 CPU 执行指令 \\
+OS 为什么能抢回 CPU & 定时器中断、trap frame、内核栈、调度入口 & 只说调度器切换进程 \\
+用户程序为什么不能乱改机器 & 特权级、控制寄存器、页权限、MMIO 保护 & 只说内核权限更高 \\
+地址为什么会 fault & VMA/PTE/TLB、权限、present、COW、缺页上下文 & 只说内存不够或空指针 \\
+设备为什么不是普通变量 & MMIO 副作用、DMA 所有权、中断 completion、屏障 & 只说读写设备寄存器 \\
+启动为什么有严格顺序 & 复位向量、固件、DRAM、页表、异常入口、驱动 probe & 只说 bootloader 加载内核 \\
+\bottomrule
+\end{longtable}
+
+这六个问题是第一阶段的硬标准。后面的进程、文件系统、网络、安全，都要回到这些硬件事实。如果这里没有过关，后面章节会变成一堆互不相连的规则。
+
+\subsection{从单片机到通用 OS 的因果链}
+
+很多教材直接从“进程、线程、虚拟内存”开始，读者就会觉得 OS 是人为规定出来的。更好的方式是从最小单片机一步一步推到通用 OS。
+
+\begin{longtable}{p{0.2\linewidth}p{0.28\linewidth}p{0.38\linewidth}}
+\toprule
+阶段 & 当前能力 & 下一个机制为什么出现 \\
+\midrule
+裸循环 & 一个 \code{while(1)} 控制所有设备 & 等待设备会浪费 CPU，需要中断 \\
+中断驱动裸机 & 设备能异步通知 CPU & 多个任务仍要合作让出 CPU，需要定时器抢占 \\
+抢占式内核 & 定时器可打断死循环 & 任务互不信任，需要特权级和内存保护 \\
+多程序系统 & 用户态不能直接控制硬件 & 程序要请求资源，需要系统调用 ABI \\
+虚拟内存系统 & 地址空间隔离和懒分配 & 频繁拷贝太贵，需要 COW、mmap、page cache \\
+多核系统 & 多任务真正并行 & 共享状态会竞争，需要锁、原子、IPI、per-CPU \\
+高速 I/O 系统 & 设备通过 DMA 批量搬运数据 & 生命周期复杂，需要队列、completion、IOMMU \\
+\bottomrule
+\end{longtable}
+
+注意这个链条里每一步都来自失败场景：轮询浪费 CPU，协作任务可能不让出 CPU，单一地址空间会互相破坏，直接设备访问会越权，PIO 搬数据太慢，多核共享变量会乱序和竞争。OS 不是先验地复杂，而是每个硬件失败场景都迫使它增加一层结构。
+
+\subsection{一条完整路径：键盘字符到用户进程}
+
+用一个小事件把第一阶段串起来：用户按下键盘，终端程序读到一个字符。
+
+\begin{enumerate}
+\tightlist
+\item 键盘控制器或 USB 主机控制器收到物理事件。
+\item 设备把事件放入自己的 FIFO、端点或 DMA buffer。
+\item 设备通过中断控制器投递 IRQ 或 MSI。
+\item CPU 在指令边界响应中断，硬件保存返回状态，进入内核入口。
+\item 内核中断处理读取设备状态，确认事件，必要时把重活交给线程化中断或 workqueue。
+\item 驱动把 scancode 或 HID report 转成输入事件，写入内核缓冲区。
+\item 等待在 \code{read}、\code{poll} 或 \code{epoll} 上的进程被唤醒。
+\item 调度器在某次调度点选择该进程运行。
+\item 系统调用返回用户态，用户 buffer 中出现字符或事件结构。
+\end{enumerate}
+
+这条路径至少涉及中断、内核栈、设备寄存器、等待队列、调度器、用户指针复制和系统调用返回。若读者只能说“键盘产生中断，程序读到字符”，说明第一阶段仍然没有过关。
+
+\subsection{另一条完整路径：一次文件读到 NVMe}
+
+再看 \code{read(fd, buf, len)} 最终落到 NVMe 的路径。
+
+\begin{lstlisting}
+user read(fd, buf, len)
+  syscall entry saves user state and checks fd
+  VFS resolves file and offset
+  page cache lookup misses
+  filesystem maps file offset to block
+  block layer builds request
+  NVMe driver fills submission queue entry
+  dma_map user or kernel buffer pages
+  driver rings doorbell MMIO register
+  device DMA-reads/writes memory
+  device posts completion and raises MSI-X
+  interrupt handler completes request
+  sleeping task wakes and copies data to user buffer
+\end{lstlisting}
+
+第一阶段需要读者能指出每个硬件点：doorbell 是 MMIO，数据移动靠 DMA，completion 靠中断或轮询，DMA 地址可能经过 IOMMU，用户 buffer 不能被设备无限期持有，缺页和 page cache 会改变路径。这样进入文件系统章节时，读者看到 page cache、bio、request、completion 才不会断线。
+
+\subsection{为什么必须加可运行模型}
+
+文字解释容易让人以为自己懂了。第一阶段必须至少有一个可运行模型，把下面这些断言跑出来：
+
+\begin{itemize}
+\tightlist
+\item 用户态不能访问内核页。
+\item 用户态不能访问 MMIO。
+\item 内核可以通过 MMIO 通知设备。
+\item 设备事件会产生中断，CPU 保存 trap frame 并进入内核模式。
+\item DMA 映射完成前后有明确所有权，unmap 后设备不能继续写。
+\end{itemize}
+
+这些不是实践卷才需要的内容。原理卷也需要最小代码，因为它证明书里的概念能落成状态机。下一节给出一个 C++20 模型，覆盖第一阶段最小硬件契约。

@@ -1,0 +1,290 @@
+\section{从数字电路到 CPU：把每一层设计掰开}
+
+上一节给出了组成原理主线，本节把最容易被教材压缩的部分展开：为什么要有逻辑门，为什么寄存器必须跟时钟绑定，为什么 CPU 不是一个巨大函数，为什么指令要编码，为什么流水线会带来异常和安全问题。读完本节，后面讲“保存上下文”“系统调用入口”“页表异常”时，读者应能把它们落回硬件状态，而不是只记术语。
+
+\subsection{布尔逻辑：从判断到电路}
+
+软件里写 \code{if (a \&\& b)}，硬件里对应的是逻辑门。AND 门只有两个输入都为 1 时输出 1；OR 门只要有一个输入为 1 就输出 1；NOT 门把 0 变 1、1 变 0；XOR 门表示两个输入不同。所有复杂控制条件最终都能分解为这些布尔函数的组合。
+
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+门 & 输出规则 & 在 CPU 中的用途 \\
+\midrule
+AND & 两个条件都成立 & 权限位同时满足、mask 检查、enable 信号 \\
+OR & 任一条件成立 & 多个异常源合并、多个 pending 位汇总 \\
+NOT & 条件取反 & valid/invalid、zero/non-zero 控制 \\
+XOR & 输入不同 & 加法器、比较器、奇偶校验 \\
+MUX & 按选择信号选一路输入 & 选择 ALU 输入、写回来源、下一 RIP \\
+\bottomrule
+\end{longtable}
+
+多路选择器 MUX 非常关键。CPU 中到处都是“根据控制信号选一个值”：下一条 RIP 是顺序地址、分支目标、异常入口还是返回地址；写回寄存器的数据来自 ALU、内存、立即数或内部控制状态；load/store 的地址来自基址寄存器加偏移。MUX 把控制信号和数据通路连接起来。
+
+\begin{lstlisting}
+next_pc = mux(
+  normal: next_sequential_rip,
+  branch_taken: branch_target,
+  trap: trap_vector,
+  return_from_trap: saved_pc
+)
+\end{lstlisting}
+
+这个模型会在 OS 中反复出现。系统调用入口就是一种“下一 RIP 被硬件选择到 trap vector”的情况；异常返回就是“下一 RIP 被选择回 saved RIP”的情况。区别只是硬件选择受严格权限规则约束。
+
+\subsection{半加器、全加器和 ALU}
+
+整数加法器是理解 CPU 数据通路的好入口。一位半加器接收两个 bit，输出 sum 和 carry；全加器再接收低位进位。把 64 个全加器串起来，就能做 64 位加法。真实 CPU 会用更快的进位预测结构，但语义仍是逐位加法。
+
+\begin{lstlisting}
+half_adder(a, b):
+  sum = a XOR b
+  carry = a AND b
+
+full_adder(a, b, carry_in):
+  sum = a XOR b XOR carry_in
+  carry_out = (a AND b) OR (carry_in AND (a XOR b))
+\end{lstlisting}
+
+ALU 不只做加法。它通常支持加、减、与、或、异或、移位、比较。控制单元根据指令 opcode 选择 ALU 操作。比如 \code{sub} 可以用加法器加上补码实现，比较可以看减法结果和符号/零标志。
+
+\begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\toprule
+ALU 操作 & 硬件动作 & 软件语义 \\
+\midrule
+ADD & 二进制加法 & 指针偏移、整数运算、栈指针调整 \\
+SUB & 加上补码 & 比较、循环计数、地址差 \\
+AND/OR/XOR & 按位逻辑 & 位图、权限位、mask、标志位 \\
+SHIFT & 左右移位 & 乘除 2 的幂、页号/页内偏移分解 \\
+COMPARE & 产生 zero/sign/carry 等标志 & 分支条件和排序判断 \\
+\bottomrule
+\end{longtable}
+
+OS 为什么关心 ALU？因为许多 OS 数据结构依赖位运算：页表权限位、CPU mask、IRQ pending 位、bitmap 分配器、slab freelist 标记、atomic bit operation。位运算不是低级技巧，而是硬件支持下的高密度状态表达。
+
+\subsection{组合逻辑的延迟和为什么需要时钟}
+
+组合逻辑不是瞬间完成。信号通过每个门都需要传播时间；电路越深，输出稳定越晚。若下一层在输出还没稳定时采样，就会得到错误值。时钟把系统切成离散周期：一个周期内，组合逻辑从寄存器输出开始传播；到下一个时钟边沿，目标寄存器采样稳定结果。
+
+\begin{lstlisting}
+cycle begins:
+  source registers output old values
+  combinational logic computes new values
+  signals settle before clock edge
+clock edge:
+  destination registers capture new values
+\end{lstlisting}
+
+时钟频率不能无限提高。周期必须长到足够覆盖最长组合路径、寄存器建立时间、时钟偏斜和安全余量。提高频率通常需要缩短每级逻辑，于是出现流水线。流水线不是为了让单条指令的延迟变短，而是为了让每个周期能推进不同指令的不同阶段，提高吞吐。
+
+\subsection{触发器和寄存器：状态的物理形态}
+
+触发器保存一个 bit，寄存器保存一组 bit。程序计数器是寄存器，通用寄存器文件是寄存器阵列，状态寄存器也是寄存器。内核里说“保存 CPU 状态”，最终就是把这些寄存器的软件可见值写到内存里的 trap frame 或 context 结构。
+
+\begin{lstlisting}
+register64 rip
+register64 gpr[16]  // rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8..r15
+register status {
+  privilege_mode
+  interrupt_enable
+  condition_flags
+}
+\end{lstlisting}
+
+寄存器有两个重要性质。第一，它们只在特定时刻更新，所以硬件状态可以被分阶段分析。第二，它们数量有限，所以编译器和 ABI 必须决定哪些值放寄存器，哪些溢出到栈。上下文切换时，寄存器越多越宽，保存恢复成本越高。
+
+\subsection{寄存器文件为什么有读端口和写端口}
+
+一条典型整数指令可能同时读两个源寄存器，写一个目的寄存器。因此寄存器文件通常要有多个读端口和至少一个写端口。端口越多，硬件面积和时序越困难。复杂乱序 x86-64 CPU 会通过寄存器重命名、调度队列和旁路网络提高并行度，但软件可见的架构寄存器集合仍由 ISA 固定。
+
+\begin{lstlisting}
+execute add rax, rbx:
+  a = regfile.read_port0(rax)
+  b = regfile.read_port1(rbx)
+  y = alu.add(a, b)
+  regfile.write_port0(rax, y)
+\end{lstlisting}
+
+这也解释了 ABI 为什么规定参数寄存器和返回值寄存器。系统调用入口不想从用户栈里慢慢解析所有参数，而是让用户态按 ABI 把系统调用号和前几个参数放进约定寄存器。内核保存 trap frame 后，就能从寄存器槽读取参数。
+
+\subsection{指令编码：为什么机器码要有格式}
+
+CPU 取到的是一串 bit。译码器必须知道哪些 bit 表示 opcode，哪些 bit 表示寄存器编号，哪些 bit 表示立即数，哪些 bit 表示访存模式。RISC ISA 通常指令长度和格式更规则，译码简单；x86-64 指令长度可变、编码历史包袱重，译码更复杂，但兼容性强。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+编码字段 & 作用 & OS 相关例子 \\
+\midrule
+opcode & 指令做什么 & \code{syscall} 触发陷入 \\
+register id & 读写哪些寄存器 & ABI 参数和返回值位置 \\
+immediate & 常量或偏移 & 栈调整、页内偏移、跳转距离 \\
+memory mode & 如何计算地址 & load/store、栈访问、结构体字段 \\
+privileged bit/encoding & 是否敏感指令 & 用户态执行会触发异常 \\
+\bottomrule
+\end{longtable}
+
+非法指令异常就是译码或权限检查发现当前 bit 串不能在当前模式下执行。内核可以把它变成信号，也可以在某些情况下模拟指令。虚拟化也依赖类似机制：guest 执行敏感操作时陷入 hypervisor，由 hypervisor 模拟或转发。
+
+\subsection{单周期 CPU 为什么不够}
+
+教学里常从单周期 CPU 开始：一条指令在一个长周期内完成取指、译码、执行、访存和写回。它容易理解，但周期必须长到覆盖最慢指令，例如 load 要经过指令内存、寄存器读、ALU 地址计算、数据内存、写回。于是简单加法也要等同样长的周期，浪费硬件。
+
+\begin{lstlisting}
+single_cycle:
+  period >= max(delay(fetch), decode, execute, memory, writeback)
+  every instruction consumes one long cycle
+\end{lstlisting}
+
+多周期 CPU 把一条指令拆成多个步骤，简单指令可少走某些阶段。流水线进一步让不同指令重叠执行。每一步都是为了更好利用硬件，但每一步也增加控制复杂度：要保存中间状态，要处理 hazard，要保证异常精确。
+
+\subsection{流水线细讲：五级只是起点}
+
+经典五级流水线是 IF、ID、EX、MEM、WB。IF 取指；ID 译码和读寄存器；EX 执行 ALU 或计算地址；MEM 访问数据 cache；WB 写回寄存器。真实 CPU 可能更多级，前端和后端也更复杂，但五级模型足够解释 OS 关心的入口。
+
+\begin{longtable}{p{0.12\linewidth}p{0.32\linewidth}p{0.44\linewidth}}
+\toprule
+阶段 & 做什么 & 可能产生的 OS 相关事件 \\
+\midrule
+IF & 用 RIP 取指令 & 指令页缺页、执行权限错误、I-cache miss \\
+ID & 译码和读寄存器 & 非法指令、特权指令检查 \\
+EX & ALU、分支、地址计算 & 除零、溢出陷阱、分支目标计算 \\
+MEM & load/store 访问内存 & 数据页缺页、写权限错误、对齐异常 \\
+WB & 写回寄存器 & 架构状态提交边界 \\
+\bottomrule
+\end{longtable}
+
+如果一条 load 在 MEM 阶段发现页不存在，CPU 必须让内核看到“前面指令已提交，这条 load 未完成，后面指令不应可见”的状态。这就是精确异常。没有精确异常，内核无法修复页表后重试同一条指令。
+
+\subsection{数据 hazard：为什么需要转发和停顿}
+
+考虑两条相邻指令：
+
+\begin{lstlisting}
+add rax, rbx
+sub rcx, rax
+\end{lstlisting}
+
+第二条需要第一条产生的 \code{rax}。但第一条可能要到 WB 阶段才写回寄存器，第二条在 ID 阶段就读寄存器，会读到旧值。硬件可用转发把 EX 结果直接送给下一条 EX；若是 load-use，数据要到 MEM 后才可用，可能必须插入 bubble。
+
+\begin{lstlisting}
+if id.rs1 == ex.rd and ex.will_write:
+  operand1 = forward(ex.result)
+else if id.rs1 == mem.rd and mem.will_write:
+  operand1 = forward(mem.result)
+else:
+  operand1 = regfile.read(id.rs1)
+\end{lstlisting}
+
+OS 不直接管理这些 hazard，但它受影响。上下文切换和异常入口要求流水线在可定义边界停住；性能分析里的 pipeline stall、IPC 下降、cache miss 和 branch miss，都来自这些微架构细节。
+
+\subsection{控制 hazard：分支预测和异常边界}
+
+分支指令决定下一条 RIP。若等分支结果完全计算出来再取下一条，流水线会空等。分支预测猜测方向和目标，先取预测路径。猜对提高吞吐，猜错要冲刷流水线并从正确 RIP 重新开始。
+
+\begin{lstlisting}
+if branch_predictor.predict(rip) == taken:
+  next_pc = predicted_target
+else:
+  next_rip = rip + instruction_length
+
+later:
+  if actual != predicted:
+    flush younger instructions
+    restart at correct_pc
+\end{lstlisting}
+
+预测路径上的指令即使最终被冲刷，也可能触碰 cache 和预测器，留下微架构痕迹。Spectre 一类漏洞正是利用这种“架构上没发生、微架构上留下痕迹”的差异。OS 的隔离设计不能只看 ISA 可见状态，还要考虑某些微架构共享结构。
+
+\subsection{乱序执行和提交：为什么要 reorder buffer}
+
+乱序 CPU 为了隐藏延迟，会让不相互依赖的指令先执行。例如一条 cache miss 的 load 等内存时，后面的独立加法可以先算。为了保持程序员看到的顺序，CPU 通常在提交阶段按程序顺序更新架构状态。reorder buffer 记录每条在途指令的结果、异常和完成状态。
+
+\begin{lstlisting}
+dispatch instructions into ROB
+execute ready operations out of order
+write temporary results into ROB entries
+commit from ROB head in program order
+if head has exception:
+  stop commit younger entries
+  raise precise exception
+\end{lstlisting}
+
+这个设计对 OS 至关重要。异常要精确，必须在提交点报告；中断要可恢复，必须在架构状态一致的位置接收；上下文切换保存的是架构寄存器，不是 CPU 内部临时物理寄存器。OS 不需要知道 ROB 每个细节，但必须依赖“架构状态可定义”这个契约。
+
+\subsection{原子指令：多核共享状态的硬件支点}
+
+多核下，两个 CPU 同时执行 \code{counter = counter + 1} 会丢更新，因为它实际是 load、add、store 三步。原子读改写指令把这三步包装成硬件不可分割操作，或者通过 load-linked/store-conditional 协议保证并发检测。
+
+\begin{lstlisting}
+atomic_fetch_add(addr, 1):
+  lock cache line or acquire exclusive ownership
+  old = memory[addr]
+  memory[addr] = old + 1
+  release ownership
+  return old
+\end{lstlisting}
+
+自旋锁、引用计数、futex 快路径、无锁队列都依赖原子操作。没有原子操作，多核 OS 很难正确维护共享内核对象。原子操作本身也有成本：它会让 cache line 获得独占状态，并可能在 CPU 间迁移。
+
+\subsection{内存序：为什么“已经写了”不等于“别人已经看见”}
+
+单核顺序执行下，写 A 再写 B 通常很直观。多核里，写入可能先进入 store buffer，其他 CPU 看到的时间不一定等同于源代码顺序。设备通过 DMA 或 MMIO 观察内存时，还会再多一层总线顺序问题。
+
+\begin{lstlisting}
+producer:
+  data = 42
+  ready = true
+
+consumer:
+  if ready:
+    assert(data == 42)  // without ordering, not guaranteed on all machines
+\end{lstlisting}
+
+release/acquire 修复这个发布模式：
+
+\begin{lstlisting}
+producer:
+  data = 42
+  store_release(ready, true)
+
+consumer:
+  if load_acquire(ready):
+    assert(data == 42)
+\end{lstlisting}
+
+OS 中这类模式无处不在：发布新 task、把 page 放入 LRU、提交 DMA 描述符、唤醒等待队列、释放锁。理解内存序不是为了写花哨无锁代码，而是为了知道哪些顺序必须由硬件和编译器共同保证。
+
+\subsection{从 CPU 到 OS 的第一条完整路径}
+
+现在把一条用户态 load 指令串起来：
+
+\begin{lstlisting}
+1. IF reads instruction bytes using RIP
+2. I-TLB translates instruction address
+3. decoder recognizes load instruction
+4. register file reads base register
+5. ALU computes virtual address
+6. D-TLB translates data address
+7. PTE permission check fails because page not present
+8. pipeline records precise exception
+9. CPU saves fault RIP/RFLAGS and enters kernel trap vector
+10. kernel inspects fault address and VMA
+11. kernel allocates or reads page, installs PTE
+12. return from exception retries the same load
+\end{lstlisting}
+
+这条路径把组成原理和 OS 连接起来了。没有 RIP 和译码，就没有“哪条指令 fault”；没有 MMU 和 PTE，就没有权限检查；没有精确异常，就不能修复后重试；没有内核 trap 入口，就不能把硬件事件变成 OS 决策。后面的虚拟内存章节只是在这条路径上继续加细节。
+
+\subsection{本节测试：不用背名词，要能解释路径}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 给出一条 \code{add} 指令，能说明寄存器文件、ALU、控制信号和写回如何配合。
+\item 给出一条 \code{load} 指令，能说明虚拟地址、TLB、页表、cache 和异常如何参与。
+\item 给出两条有依赖的指令，能说明为什么需要转发或停顿。
+\item 给出一个分支，能说明预测、冲刷和微架构痕迹的区别。
+\item 给出一个 page fault，能说明 CPU 为什么能精确回到 faulting instruction。
+\item 给出一个多核计数器，能说明普通 load/add/store 为什么不够，原子操作解决什么。
+\item 给出一个发布对象例子，能说明 release/acquire 保护的是哪条可见性顺序。
+\end{itemize}
+\end{rubricbox}

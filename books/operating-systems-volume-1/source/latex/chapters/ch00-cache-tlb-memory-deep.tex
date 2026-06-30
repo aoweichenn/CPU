@@ -1,0 +1,171 @@
+\section{cache、TLB 与内存层次：为什么“访问内存”不是一步}
+
+很多 OS 机制都卡在内存层次上：上下文切换为什么贵，任务迁移为什么掉性能，页表修改为什么要 TLB shootdown，锁为什么在多核下慢，DMA 为什么要 cache 维护。若把内存当成一个均匀数组，这些问题都解释不清。
+
+\subsection{内存层次的基本矛盾}
+
+CPU 很快，DRAM 慢，存储设备更慢。为了让程序大多数时间不等最慢层，系统做了多层缓存：寄存器、L1/L2/L3 cache、TLB、内存、page cache、设备缓存。每一层都在用小容量换低延迟。
+
+\begin{longtable}{p{0.2\linewidth}p{0.28\linewidth}p{0.4\linewidth}}
+\toprule
+层次 & 保存什么 & OS 关心点 \\
+\midrule
+寄存器 & 当前计算状态 & 上下文切换、ABI、系统调用参数 \\
+L1/L2/L3 cache & 最近访问的内存 cache line & 局部性、伪共享、锁竞争 \\
+TLB & 最近虚拟页翻译 & 地址空间切换、页表修改、shootdown \\
+DRAM & 物理页 & 页分配、NUMA、回收 \\
+page cache & 文件页副本 & 文件 I/O、writeback、mmap \\
+设备缓存 & 磁盘/SSD/网卡内部状态 & flush、FUA、completion 语义 \\
+\bottomrule
+\end{longtable}
+
+OS 的工作经常是维护这些层次之间的一致解释：页表说这个虚拟页映射到哪个物理页，TLB 不能有旧答案；文件系统说数据已提交，设备缓存和稳定介质之间不能混淆；DMA 说设备已写内存，CPU cache 不能继续读旧数据。
+
+\subsection{cache line 和局部性}
+
+cache 不按字节搬运，而按 cache line 搬运。假设 cache line 是 64 byte，程序读取 \code{array[i]} 时，硬件可能把 \code{array[i]} 附近 64 byte 都搬进 cache。顺序遍历数组很快，因为空间局部性好；链表随机跳转慢，因为每个节点可能在不同 cache line。
+
+\begin{lstlisting}
+good locality:
+  for i in 0..n:
+    sum += array[i]
+
+poor locality:
+  node = head
+  while node:
+    sum += node.value
+    node = node.next
+\end{lstlisting}
+
+内核热路径偏爱数组、per-CPU 数据、紧凑结构和批量处理，不是代码风格偏好，而是 cache 行为决定的。调度器、网络栈、块层都要避免把热点状态分散到随机内存。
+
+\subsection{写回 cache 和 dirty line}
+
+CPU 写一个变量时，通常先写 cache line，把它标为 dirty。dirty line 何时写回内存由硬件决定。对其他 CPU，cache coherence 协议会维护普通内存一致性；对设备 DMA，则要看平台是否 DMA coherent。
+
+\begin{lstlisting}
+CPU writes buffer:
+  cache line becomes dirty
+  DRAM may still have old bytes
+
+device DMA reads buffer:
+  if platform not coherent and driver forgot cache clean:
+    device may read old bytes
+\end{lstlisting}
+
+所以驱动使用 DMA API，而不是手写物理地址。API 的一部分工作就是按平台需要做 cache clean/invalidate 和 IOMMU 映射。
+
+\subsection{伪共享：没有共享变量也会共享 cache line}
+
+两个 CPU 写不同变量，但变量落在同一 cache line，也会互相抢 line 所有权。
+
+\begin{lstlisting}
+struct Counters {
+  atomic<uint64_t> a; // CPU0 writes
+  atomic<uint64_t> b; // CPU1 writes, same cache line
+}
+\end{lstlisting}
+
+从程序语义看，\code{a} 和 \code{b} 独立；从硬件看，它们在同一 cache line。两个 CPU 都要写，line 在 CPU0 和 CPU1 之间来回迁移。解决方法是 padding 或 per-CPU 分片。
+
+\begin{lstlisting}
+struct Counters {
+  alignas(64) atomic<uint64_t> a;
+  alignas(64) atomic<uint64_t> b;
+}
+\end{lstlisting}
+
+OS 设计 runqueue、统计计数器、slab cache 时经常这么做。性能问题不是“算法复杂度”一个维度，cache line 也是复杂度的一部分。
+
+\subsection{TLB 为什么存在}
+
+虚拟地址翻译需要查页表。多级页表可能访问多次内存。TLB 缓存最近翻译，让常见内存访问不必每次 page walk。
+
+\begin{lstlisting}
+load [va]:
+  if TLB has va page:
+    pa = cached translation
+  else:
+    pa = page_table_walk(va)
+    insert into TLB
+  load cache line at pa
+\end{lstlisting}
+
+TLB 命中时，虚拟内存开销很低；TLB miss 时，硬件要走页表，可能触发更多 cache miss。程序工作集太大、随机访问太多、页太小，都可能让 TLB miss 增加。
+
+\subsection{TLB shootdown 为什么昂贵}
+
+当一个 CPU 修改某进程页表，例如取消映射某页，其他 CPU 可能还在 TLB 里缓存旧翻译。如果旧物理页被释放并重用，其他 CPU 用旧翻译访问就会破坏隔离。因此内核必须让相关 CPU 失效旧 TLB 项。
+
+\begin{lstlisting}
+unmap page:
+  remove PTE
+  find CPUs that may run this address space
+  send IPI to those CPUs
+  each CPU invalidates TLB entry
+  wait for acknowledgement
+  now physical page can be freed
+\end{lstlisting}
+
+这涉及跨 CPU 中断和等待，所以昂贵。现代内核会批量 unmap、延迟释放、使用 ASID/PCID 减少全局刷新。页表不是普通 map，TLB 让它变成多核协议。
+
+\subsection{ASID/PCID：避免每次切换都清空 TLB}
+
+若 TLB 只缓存虚拟页到物理页，不区分进程，那么切换地址空间时必须清空，否则进程 B 的虚拟地址可能命中进程 A 的翻译。ASID/PCID 给 TLB 项加地址空间标签，让不同进程的同一虚拟地址可共存。
+
+\begin{lstlisting}
+TLB entry:
+  virtual_page
+  address_space_id
+  physical_page
+  permissions
+\end{lstlisting}
+
+这降低上下文切换成本，但没有消除页表修改成本。若某个地址空间自己的 PTE 改了，对应 ASID/PCID 的旧项仍要失效。
+
+\subsection{NUMA：物理内存也有远近}
+
+多插槽机器上，每个 CPU 到本地内存控制器更近，到远端内存更远。统一的“物理内存池”只是抽象，硬件上访问延迟和带宽不同。OS 调度和页分配要尽量让线程运行在靠近其内存的 CPU 上。
+
+\begin{lstlisting}
+first touch policy:
+  thread on node 0 first writes page
+  kernel allocates physical page from node 0
+
+bad migration:
+  thread moves to node 1
+  still accesses node 0 memory
+  remote latency increases
+\end{lstlisting}
+
+这解释了 CPU affinity、NUMA balancing、内存绑定策略。并不是核心越多越快，线程和内存分布不匹配会让远端访问拖慢程序。
+
+\subsection{page cache：文件 I/O 的内存层}
+
+读文件时，内核通常先把磁盘块读到 page cache，再从 page cache 拷贝给用户。再次读取同一页时，不需要访问设备。写文件时，数据可能先进入 page cache 并标记 dirty，稍后 writeback 到设备。
+
+\begin{lstlisting}
+read(file, buf):
+  page = page_cache_lookup(file, offset)
+  if page missing:
+    page = read_from_disk(file, offset)
+    insert into page cache
+  copy page bytes to user buffer
+\end{lstlisting}
+
+这解释了为什么 \code{write} 返回成功不等于落盘。它可能只是写入 page cache。可靠持久化需要 \code{fsync}、日志、flush/FUA 等机制把数据推进到稳定介质。
+
+\subsection{本节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能说明 cache line 为什么会让顺序数组快、随机链表慢。
+\item 能解释伪共享为什么会让两个独立计数器互相拖慢。
+\item 能画出虚拟地址访问经过 TLB、页表、cache、内存的路径。
+\item 能说明修改页表后为什么要 TLB shootdown。
+\item 能解释 ASID/PCID 解决什么，不解决什么。
+\item 能解释 NUMA 为什么让线程迁移和页分配有关。
+\item 能区分 page cache 写入、设备 completion、稳定落盘。
+\end{itemize}
+\end{rubricbox}

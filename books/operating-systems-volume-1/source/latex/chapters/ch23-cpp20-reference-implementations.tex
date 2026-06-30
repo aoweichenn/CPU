@@ -1,0 +1,295 @@
+\section{\cpp{}20 参考实现：把原理落实成可运行数据结构}
+
+本节把前文反复出现的数据结构和算法放进一份可编译的 \cpp{}20 参考实现。它不是要替代真实 Linux 内核，也不是实践卷的完整 OS，而是服务原理卷：每个机制都用尽量小的模型保留关键不变量，让读者能看到“为什么必须这样维护状态”。浅层教材常把操作系统讲成一组名词：进程、线程、页表、文件、网络。真正的理解要再往下走一层：这些名词在内核里都要变成可更新的数据结构，每一次更新都要满足状态不变量，每一个不变量破坏后都会出现可复现的错误。
+
+\begin{keyidea}
+操作系统原理的落点不是“知道某个机制存在”，而是能回答四个问题：为什么需要这个机制，内核用什么数据结构保存它，哪些状态转换必须原子完成，测试怎样证明错误路径也被覆盖。本节的参考实现按这个标准组织。
+\end{keyidea}
+
+这份代码覆盖十四组对象：
+
+\begin{itemize}
+\tightlist
+\item CFS 风格 runqueue：用 \code{std::set} 表达红黑树按 \code{vruntime} 选择最亏任务。
+\item 等待队列：展示 sleeping/runnable 状态转换和 wakeup 的所有权。
+\item futex 字：展示用户态值比较与内核等待队列之间如何避免 lost wakeup。
+\item wait-for graph：用非递归拓扑剥离检测死锁环。
+\item 伙伴分配器：展示按阶拆分、按 buddy 地址合并的物理页框分配。
+\item 页表、TLB 和 COW：展示 fork 后父子页表如何收紧权限，写入时如何复制页。
+\item LRU page cache：展示冷热页、dirty 页、回收和写回之间的关系。
+\item extent map：展示文件逻辑块到物理块的区间映射。
+\item deadline block scheduler：展示寻道优化不能饿死过期请求。
+\item IOMMU：展示设备 IOVA 到页的映射、方向权限和 unmap 后 IOTLB 失效。
+\item NVMe completion queue：展示 phase tag 如何区分环形队列的新旧 completion。
+\item fd/file/inode：展示 fd 整数、open file description、inode 的三层关系。
+\item journaling block device：展示先写日志、崩溃后重放、再清空日志的恢复语义。
+\item TCP connection state：展示 SYN、ESTABLISHED、重传定时器、FIN 和 TIME-WAIT 的最小状态机。
+\end{itemize}
+
+\subsection{为什么参考实现不能只写 happy path}
+
+操作系统最常见的错误不在正常路径，而在“刚好被打断”的地方：任务刚要睡眠时事件已经发生，fork 刚收紧 PTE 但 TLB 还保留 writable 翻译，块设备写了日志但还没写 home block 就掉电，TCP 发出数据后 ACK 丢失，page cache 回收 dirty 页时漏掉写回。为了把这些边界说清楚，参考实现每个模块都配了测试。测试不是为了展示一串绿灯，而是把不变量写成可执行断言。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+模块 & 关键不变量 & 测试覆盖的反例 \\
+\midrule
+runqueue & runnable 任务只能在一个可运行集合中，running 任务不能同时留在树里 & 阻塞任务先出调度路径，再进入 wait queue \\
+futex & 用户态值仍等于期望值时才允许睡眠 & 值已变化时 \code{wait} 立即失败，不能丢 wakeup \\
+deadlock & wait-for graph 有环才是死锁 & 链式等待不报错，加入回边后报错 \\
+buddy & 每个空闲页框只属于一个阶的一个块 & 释放相邻页后必须合并回高阶块 \\
+COW & fork 后父子可写页都先变只读，写入方独占复制 & 子写不影响父，父再写不影响子 \\
+LRU & clean 回收不写盘，dirty 回收必须写回 & 淘汰 clean 页不增加写回计数，淘汰 dirty 页增加 \\
+journal & 已提交日志崩溃后必须可重放，未落 home block 前不能假装完成 & crash point 后 home block 为空，recover 后内容出现 \\
+TCP & 只要还有未确认数据就要有重传定时器 & RTO 到期触发重传，ACK 后取消定时器 \\
+\bottomrule
+\end{longtable}
+
+\subsection{调度：公平不是轮流，而是维护欠账}
+
+最简单的调度器可以把任务放进 FIFO 队列：谁先来谁先跑。这个模型在单片机前后台循环中还能凑合，一旦任务权重不同、任务会睡眠、I/O 密集任务需要低延迟唤醒，FIFO 就不够了。CFS 的核心不是“每个任务跑同样时间”，而是“按权重维护虚拟运行时间”。权重高的任务同样运行 1ms，\code{vruntime} 增长更慢，因此它在红黑树里更容易保持靠左，得到更多 CPU。
+
+参考实现中 \code{CfsRunQueue} 用 \code{std::set} 模拟红黑树。排序键是 \code{vruntime}，若相等再用 task id 打破平局。这个设计体现两个内核事实。第一，pick next 只需要取最左实体，因此是有序集合的最小元素。第二，任务运行后 \code{vruntime} 会变化，必须先从树里取出、更新账本、再按新 key 插回去；如果直接修改树中元素的 key，平衡树顺序就被破坏。
+
+\begin{lstlisting}
+weighted_delta = delta_exec * NICE_0_WEIGHT / task.weight
+task.vruntime += weighted_delta
+runqueue.insert(task)
+\end{lstlisting}
+
+复杂度来自操作需求：插入、删除、取最小都是 \code{O(log n)} 或更好。链表可以做到入队 \code{O(1)}，但每次寻找最小 \code{vruntime} 都要扫描；堆取最小很快，却不适合任意任务睡眠时从中间删除。调度器的算法选择不是抽象偏好，而是睡眠、唤醒、迁移、调权这些操作共同逼出来的。
+
+\subsection{睡眠唤醒：lost wakeup 是状态顺序错误}
+
+等待队列看起来像一个普通队列：任务睡眠时入队，事件发生时唤醒。但真正的问题是条件检查和入队必须连在一起。若线程先检查“条件不满足”，准备睡眠；就在它还没入队时，另一个 CPU 改变条件并执行 wake；随后第一个线程才入队睡下去，就再也没人叫醒它。这就是 lost wakeup。
+
+参考实现把 \code{WaitQueue} 和 \code{FutexWord} 分开，是为了说明两层语义：普通等待队列只保存睡眠任务，futex 还要比较用户态字的当前值。真实 futex 的快路径完全在用户态完成，只有比较失败或需要阻塞时才进入内核；慢路径进入内核后，必须重新验证用户态值仍等于期望值，才能把任务挂到等待队列。
+
+\begin{lstlisting}
+if futex_word != expected:
+  return EAGAIN
+enqueue current into futex wait queue
+schedule()
+\end{lstlisting}
+
+这里的 \code{EAGAIN} 不是小细节，而是避免 lost wakeup 的关键返回值。它告诉用户态锁：值已经变了，你不应该睡眠，应当重新尝试获取锁。参考测试先构造一个值不相等的 futex wait，要求任务仍保持 running；再构造值相等路径，要求任务进入 sleeping，随后 \code{wake\_one} 把它恢复为 runnable。
+
+\subsection{死锁检测：不是“卡住”就叫死锁}
+
+死锁的严格定义是等待关系中存在环。任务 A 等 B，B 等 C，这只是阻塞链；只有 C 又等 A，才形成任何一个任务都无法推进的闭环。内核中很多锁不会默认做全局死锁检测，因为维护全局 wait-for graph 成本高，且锁路径极热。但教学实现可以把这个图显式建出来，让“死锁”从感觉变成算法。
+
+参考实现的 \code{DeadlockDetector} 维护边 \code{waiter -> owner}，检测时不用递归 DFS，而用 Kahn 拓扑剥离：先找入度为 0 的节点，把它们和出边不断删掉；如果最后还有节点没被剥掉，剩下部分必然在环里。这个算法复杂度是 \code{O(V + E)}，也适合内核风格的显式队列实现。
+
+\begin{lstlisting}
+ready = all nodes with indegree 0
+while ready not empty:
+  node = pop_front(ready)
+  for successor in graph[node]:
+    indegree[successor]--
+    if indegree[successor] == 0:
+      push_back(successor)
+cycle exists if visited != node_count
+\end{lstlisting}
+
+这个实现还展示了清理边的重要性。任务退出、锁释放、超时取消后，等待边必须删除；否则检测器会看到已经不存在的等待关系，误报死锁。测试中先建立 \code{1 -> 2 -> 3}，不应报死锁；加入 \code{3 -> 1} 后必须报；清理任务 2 后环断开。
+
+\subsection{伙伴分配：为什么物理页框不是随便找一页}
+
+页分配器若只维护一个空闲页链表，分配单页很简单，但分配连续页会越来越困难。DMA、巨大页、页表页、某些设备缓冲区都可能需要连续物理页。伙伴系统把内存按 $2^k$ 页为一块管理：大块可以拆成两个同阶 buddy，小块释放后若 buddy 也空闲就合并回大块。
+
+参考实现的 \code{BuddyAllocator} 保留三个核心状态：每个 order 的 free list、已分配块的起始页、已分配块的 order。分配时先把请求页数向上取整到 $2^k$，再找不小于该 order 的最小空闲块，逐级拆分。释放时用 \code{start_page ^ (1 << order)} 找 buddy；只要 buddy 在同阶 free list 中，就移除 buddy 并合并到更高阶。
+
+\begin{lstlisting}
+buddy = start_page XOR (1 << order)
+if buddy is free at same order:
+  remove buddy
+  start_page = min(start_page, buddy)
+  order++
+else:
+  insert current block into free_list[order]
+\end{lstlisting}
+
+这个 XOR 公式依赖块按 $2^k$ 对齐。它说明了为什么伙伴分配器要用阶管理，而不是任意长度区间：只有对齐块才有唯一 buddy。测试分配第 0 页和第 1 页，再依次释放，最后必须合并回最高阶的一个完整空闲块。若释放路径忘记合并，短期测试也许能过，长时间运行后连续页会耗尽。
+
+\subsection{页表、TLB 与 COW：权限收紧必须让 CPU 看见}
+
+COW 的表面目标是 fork 快：父子先共享物理页，等写入时再复制。它真正困难的地方是权限传播。fork 时，父进程原来 writable 的 PTE 必须被改成 read-only，子进程也安装 read-only PTE，并标记 COW。若只改子页表，父进程写共享页不会 fault，会直接破坏子进程视图。
+
+还有一个硬件层问题：CPU 可能已经把旧的 writable PTE 缓存在 TLB 里。页表改成只读后，如果不失效对应 TLB 项，CPU 仍可能用旧翻译完成写入。参考实现的 \code{fork\_cow} 在收紧父 PTE 后调用 \code{parent\_tlb.invalidate\_page}，这正是把软件页表变化同步给硬件翻译缓存的动作。
+
+\begin{lstlisting}
+parent.pte.writable = false
+parent.pte.cow = true
+child.pte = parent.pte
+invalidate parent TLB entry
+\end{lstlisting}
+
+写 fault 时还要分两种情况。若物理页只剩当前地址空间引用，内核可以直接把 PTE 改回 writable；若仍被父子共享，就必须分配新页并复制内容。参考实现用 \code{shared\_ptr::unique()} 表达引用计数判断，虽然真实内核用 \code{struct page} 的 refcount，但不变量相同：共享页不能原地写。
+
+\subsection{LRU page cache：缓存不是越多越好}
+
+page cache 把文件内容缓存在内存中，读文件先查缓存，写文件通常先改缓存页并标 dirty，再由回写路径落盘。缓存的核心矛盾是内存有限：保留热页能加速访问，但冷页必须被回收；回收 clean 页只需丢弃，回收 dirty 页必须先写回，否则数据丢失。
+
+参考实现的 \code{LruPageCache} 用 \code{std::list} 维护从热到冷的页，用哈希表从 page id 找到 list iterator。访问命中时把节点 splice 到表头，复杂度 \code{O(1)}；未命中且容量满时淘汰表尾。dirty 位决定淘汰是否增加 writeback 计数。
+
+\begin{lstlisting}
+on access(page):
+  if cached:
+    move page to LRU head
+  else:
+    if full:
+      evict tail, write back if dirty
+    insert new page at head
+\end{lstlisting}
+
+真实内核的回收比这复杂得多：有 active/inactive list，有匿名页和文件页，有 cgroup、NUMA、dirty throttle、writeback congestion，还有 direct reclaim 和 kswapd。但最小模型已经展示了关键语义：冷热判断决定谁被牺牲，dirty 决定牺牲前是否需要 I/O。测试刻意先淘汰 clean 页，再淘汰 dirty 页，证明两条路径不同。
+
+\subsection{extent 与块调度：文件系统和设备之间还有一层翻译}
+
+文件系统不一定为每个逻辑块保存一个物理块号。连续区域可以用 extent 表示：逻辑起点、物理起点、长度。这样一个大文件的连续数据只需少量记录。参考实现的 \code{ExtentMap} 拒绝重叠 extent，并能把逻辑块 10 翻译成对应物理块 202。这说明文件读写不是直接把 offset 扔给磁盘，而是先经过文件系统布局翻译。
+
+\begin{lstlisting}
+logical block 8..11 -> physical block 200..203
+lookup(10) = 200 + (10 - 8) = 202
+\end{lstlisting}
+
+翻译完成后，请求进入块层。块调度器面对两个目标：减少寻道或队列跳转成本，同时不能让旧请求饿死。参考实现的 \code{DeadlineBlockScheduler} 给读写请求不同 deadline：读请求 deadline 短，写请求 deadline 长。dispatch 时若有过期请求，先发过期请求；否则选择离当前磁头位置更近的请求。SSD 上“寻道”概念弱化，但队列深度、合并、优先级、超时仍然存在。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+策略 & 解决的问题 & 可能的代价 \\
+\midrule
+按 sector 接近度调度 & 降低机械盘寻道或设备队列跳转成本 & 远处请求可能等待太久 \\
+deadline & 给请求最长等待时间 & 可能牺牲局部最优顺序 \\
+读优先 & 改善交互延迟 & 写回堆积时需要限流 \\
+请求合并 & 减少设备命令数量 & 合并等待可能增加单个请求延迟 \\
+\bottomrule
+\end{longtable}
+
+\subsection{IOMMU 与 NVMe：设备也有地址翻译和队列协议}
+
+没有 IOMMU 时，设备 DMA 可以直接访问物理地址，一旦驱动或设备出错，可能覆盖任意内存。IOMMU 给设备建立 IOVA 到物理页的映射，并附带方向权限：ToDevice 表示设备读内存，FromDevice 表示设备写内存。参考实现的 \code{IommuDomain} 在 \code{unmap} 时同时移除 IOTLB，强调设备侧翻译缓存也要失效。
+
+NVMe completion queue 展示另一个硬件协议细节：环形队列槽位会被反复使用，主机怎么知道这个槽里的 completion 是新一轮还是上一轮留下的旧值？答案是 phase tag。队列绕回时，设备 phase 翻转；主机期望 phase 也在读完一圈后翻转。参考实现初始化时把所有槽 phase 设成非期望值，避免空队列被误读成已有 completion。
+
+\begin{lstlisting}
+if slot.phase != expected_phase:
+  queue is empty from host view
+else:
+  consume completion
+  advance head
+  if head wrapped:
+    expected_phase = !expected_phase
+\end{lstlisting}
+
+这个例子说明，驱动并不是“读写寄存器”这么浅。驱动要维护共享内存队列、缓存一致性、DMA 映射生命周期、中断或轮询、错误状态和设备协议。任何一个 bit 的初始值错了，都可能让主机读到不存在的完成事件。
+
+\subsection{fd、open file 与 inode：一个整数背后三层对象}
+
+用户态看到的 fd 是整数，但内核不是把文件内容直接挂在整数上。fd 表项指向 open file description，open file description 保存当前 offset、flags 等打开实例状态，再指向 inode 或 vnode，inode 表示文件身份和持久数据。这样 \code{dup} 后两个 fd 共享 offset，而两次独立 \code{open} 通常有不同 offset。
+
+参考实现的 \code{FileDescriptorTable::dup} 返回另一个 fd，但两个 fd 指向同一个 \code{OpenFile}。测试先写入 \code{hello}，dup 后检查两个 fd 的 offset 相同；再把一个 fd seek 到开头，从另一个 fd 读，也能观察到共享 offset 的效果。这比“fd 是文件编号”的说法更接近真实语义。
+
+page cache 和 fsync 又把文件语义往下推进一层。写入先改 \code{Folio} 并标 dirty，此时稳定存储仍为空；只有 \code{fsync} 才把 dirty folio 拷到 storage。真实系统里还要处理元数据日志、磁盘缓存 flush、写屏障和错误上报，但最小模型已经把“write 返回”和“数据持久”区分开。
+
+\subsection{日志恢复：崩溃一致性不是靠祈祷}
+
+文件系统更新常常不是单块写。例如创建文件可能要改目录项、inode 位图、inode 本身和数据块映射。如果系统在中间掉电，磁盘可能处于“目录项指向一个还没初始化的 inode”这类不一致状态。日志的基本思想是先把意图写到 journal，提交后再把更新应用到 home location；崩溃恢复时，已提交日志可以重放，未提交日志丢弃。
+
+参考实现的 \code{JournaledBlockDevice} 有一个显式 crash point：\code{AfterJournalAppend}。事务提交时先把记录追加到 journal，若此时崩溃，home block 还没变化；恢复时 \code{recover} 重放 journal，把 block 7 更新为 \code{metadata-v2}，再清空 journal。这展示了 write-ahead logging 的核心承诺：只要日志中有已提交意图，恢复后 home location 必须达到同样结果。
+
+\begin{lstlisting}
+commit:
+  append records to journal
+  if crash: stop here
+  replay journal to home blocks
+  clear journal
+
+recover:
+  replay committed journal records
+  clear journal
+\end{lstlisting}
+
+真实文件系统还会区分 descriptor block、commit block、checkpoint、revoke record、barrier 和 checksum。教学模型没有展开这些格式，是为了突出最根本的顺序：先有可恢复的意图，再改最终位置。若顺序反过来，崩溃后就无法判断哪些更新完整、哪些更新只写了一半。
+
+\subsection{TCP 状态机：网络不是 send/recv 两个函数}
+
+socket API 把网络隐藏成 \code{send} 和 \code{recv}，但内核协议栈内部是状态机、计时器、重传队列和拥塞控制共同工作。参考实现的 \code{TcpConnection} 只保留最小路径：主动打开进入 SYN-SENT，收到 SYN-ACK 后进入 ESTABLISHED；发送数据后记录 unacked bytes 并启动 RTO；RTO 到期触发重传；ACK 到达后取消定时器；close 进入 FIN-WAIT-1，收到 FIN ACK 后进入 TIME-WAIT。
+
+\begin{lstlisting}
+CLOSED -> SYN-SENT -> ESTABLISHED -> FIN-WAIT-1 -> TIME-WAIT
+\end{lstlisting}
+
+这个模型刻意保留 RTO，而不是只写状态跳转。因为网络系统的本质是不可靠事件流：包可能丢、ACK 可能丢、定时器可能先于 ACK 触发。没有重传计时器，TCP 就无法从丢包中恢复；没有 unacked 账本，内核就不知道重传什么；没有 TIME-WAIT，旧连接的迟到报文可能污染新连接。
+
+\subsection{复杂度与工程取舍汇总}
+
+下面这张表把参考实现里的主要数据结构和复杂度放在一起。读操作系统源码时，先找这张表对应的结构，再看锁和生命周期，会比直接陷入函数细节更稳。
+
+\begin{longtable}{p{0.18\linewidth}p{0.26\linewidth}p{0.22\linewidth}p{0.24\linewidth}}
+\toprule
+机制 & 数据结构 & 主要复杂度 & 取舍 \\
+\midrule
+CFS runqueue & 有序树 & 插入/删除 \code{O(log n)}，取最小 \code{O(1)} 或 \code{O(log n)} & 公平排序强，常数成本高于 FIFO \\
+futex wait & 哈希桶 + wait queue & wait/wake 近似 \code{O(1)} 加队列成本 & 快路径在用户态，慢路径复杂 \\
+deadlock graph & map + set & 检测 \code{O(V + E)} & 适合诊断，不适合每次锁操作都跑 \\
+buddy allocator & 分阶 free list & 拆分/合并 \code{O(max\_order)} & 连续页友好，内部碎片来自 $2^k$ 取整 \\
+TLB cache & 哈希表 & lookup 近似 \code{O(1)} & 快但必须维护失效协议 \\
+LRU cache & list + hash & 命中移动 \code{O(1)} & 简洁，但真实冷热判断更复杂 \\
+extent map & 有序区间表 & lookup \code{O(e)} 教学版；真实实现常用树 & 连续文件紧凑，碎片多时记录增加 \\
+deadline scheduler & pending vector 教学版 & dispatch \code{O(n)} & 易读，真实内核会用更合适的队列结构 \\
+journal & 顺序记录 & commit/replay \code{O(records)} & 恢复简单，写放大增加 \\
+TCP state & 有限状态机 + timer & tick \code{O(1)} 教学版 & 状态清晰，真实协议栈还要拥塞和乱序队列 \\
+\bottomrule
+\end{longtable}
+
+\subsection{从教学代码到真实内核源码}
+
+这份实现有意保持单文件、单线程、确定性测试，因此没有加入真实内核必须面对的 SMP 锁、RCU、内存屏障、中断上下文、NUMA、设备错误恢复和安全检查。读者不应把它当成 Linux 的缩小版，而应把它当成源码阅读前的骨架图。带着骨架图去看真实源码时，可以按下面路径对照：
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+机制 & Linux 阅读入口 & 对照问题 \\
+\midrule
+任务与调度 & \filepath{kernel/sched/fair.c}、\filepath{include/linux/sched.h} & \code{vruntime} 何时更新，实体何时入树出树 \\
+等待队列/futex & \filepath{kernel/futex/}、\filepath{include/linux/wait.h} & 条件检查和入队如何避免 lost wakeup \\
+页表/COW & \filepath{mm/memory.c}、\filepath{kernel/fork.c} & fork 如何 write-protect，fault 如何复制页 \\
+伙伴分配 & \filepath{mm/page_alloc.c} & order、zone、迁移类型如何影响分配 \\
+page cache & \filepath{mm/filemap.c}、\filepath{mm/vmscan.c} & folio 如何进入缓存，回收如何处理 dirty \\
+块层 & \filepath{block/} & 请求如何合并、排序、超时、完成 \\
+日志文件系统 & \filepath{fs/ext4/}、\filepath{fs/jbd2/} & commit block 和 checkpoint 如何保证恢复 \\
+网络 TCP & \filepath{net/ipv4/tcp*.c} & 状态机、RTO、拥塞窗口和重传队列如何协作 \\
+NVMe/IOMMU & \filepath{drivers/nvme/host/}、\filepath{drivers/iommu/} & 队列 phase、DMA map/unmap、IOTLB 失效在哪里发生 \\
+\bottomrule
+\end{longtable}
+
+\subsection{编译与运行}
+
+源码放在本原理卷目录：
+
+\begin{lstlisting}
+source/latex/listings/os_reference_implementation.cpp
+\end{lstlisting}
+
+可用下面命令单独编译运行：
+
+\begin{lstlisting}
+g++ -std=c++20 -Wall -Wextra -Wpedantic \
+  source/latex/listings/os_reference_implementation.cpp \
+  -o /tmp/os_reference_implementation
+/tmp/os_reference_implementation
+\end{lstlisting}
+
+期望输出：
+
+\begin{lstlisting}
+os_reference_implementation: all tests passed
+\end{lstlisting}
+
+\begin{rubricbox}
+读完本节后，最低验收不是背出这些类名，而是能独立解释：为什么 futex 要比较用户态值后才睡眠；为什么 COW fork 要同时收紧父子 PTE 并失效 TLB；为什么 dirty page 被回收前必须写回；为什么 journal 要先记录意图再改 home block；为什么 TCP 的正确性离不开定时器和未确认队列。
+\end{rubricbox}
+
+\subsection{完整源码}
+
+\lstinputlisting[language=C++,basicstyle=\ttfamily\scriptsize]{listings/os_reference_implementation.cpp}
