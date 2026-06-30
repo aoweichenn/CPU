@@ -24,3 +24,12 @@ Key result:
 Interpretation:
 
 This is a correctness and integration baseline, not a claim that LCQI has llama.cpp-level performance. LCQI now owns the full GGUF loading and LLaMA-style decode path for this small model, but it currently expands quantized weights to f32 and then uses generic f32 matvec. llama.cpp remains much faster because it keeps quantized blocks in the hot path and uses mature packed kernels, threading, prefetching, scheduling, and serving/runtime machinery.
+
+Follow-up same-input comparison:
+
+- Raw artifact: `books/cpu-volume-3/reports/lcqi-smollm2-same-input-compare-caw.txt`.
+- Same model, same expanded SmolLM2 chat prompt, same `max-new=2`.
+- LCQI prompt ids and llama.cpp `llama-tokenize` ids matched exactly: `31` tokens.
+- caw median prefill: LCQI `1278.47 ms` vs llama.cpp `22.92 ms`, LCQI `55.78x` slower.
+- caw median decode step: LCQI `44.64 ms` vs llama.cpp `2.84 ms`, LCQI `15.72x` slower.
+- Root cause remains engine architecture: LCQI is still `f32_dequantized_reference`, one-token-at-a-time prefill; llama.cpp uses quantized block execution, prompt batching, ggml graph scheduling, compact KV cache, and tuned CPU kernels.

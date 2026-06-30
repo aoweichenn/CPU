@@ -591,7 +591,36 @@ benchmark_f32_weight_bytes 538060032
 benchmark_tensors_loaded 272
 \end{lstlisting}
 
-这组数解释了 LCQI 与 llama.cpp 的真实差距。LCQI 已经能跑同一个模型文件，但当前把 103.7 MB 量化权重一次性解成约 538 MB f32 权重，decode 阶段仍用通用 f32 matvec；llama.cpp 则保留 GGML 量化 block，在线程池、packed kernel、prefetch、KV cache、sampler 和调度中直接执行低比特路径。因此 LCQI 的 reference decode 约 \code{22 tok/s}，而同机 llama.cpp 端到端 \code{tg4} 参考约 \code{216.82 tok/s}。差距不是“少一个 AVX2 指令”这么简单，而是权重表示、矩阵内核、线程调度、内存带宽和整图执行方式都还没有达到成熟引擎水平。
+这组数只能说明 LCQI 自研路径已经能端到端生成，不能单独回答“和 llama.cpp 差多少”。严格对比必须先消除 prompt、chat template、tokenizer 和生成长度差异。因此本章又在 caw 上补了一次同输入测量，原始 artifact 写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-same-input-compare-caw.txt}，分析摘要写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-same-input-compare-analysis.md}。这次固定同一个模型文件、同一个用户 prompt \code{Hello}、同一个展开后的 SmolLM2 chat prompt、同样 \code{max-new=2}，并用 llama.cpp 的 \cmd{llama-tokenize} 证明 31 个 token id 完全一致：
+
+\begin{lstlisting}[numbers=none,caption={caw 同输入 LCQI 与 llama.cpp 对比证据}]
+host=caw
+nproc=20
+model_file=SmolLM2-135M-Instruct-Q4_K_M.gguf
+model_actual_sha256=2e8040ceae7815abe0dcb3540b9995eaa1fa0d2ca9e797d0a635ae4433c68c2d
+llama_cpp_commit=b3fed31b99f9bd37725833674252bccb429bb183
+user_prompt=Hello
+max_new_tokens=2
+prompt_tokens_lcqi_median=31.0
+prompt_tokens_llama_tokenize=31.0
+same_input_prompt_token_count_match=true
+same_input_prompt_token_ids_match=true
+lcqi_prefill_ms_median=1278.470
+lcqi_prefill_tps_median=24.2477
+lcqi_decode_step_ms_median=44.6356
+lcqi_decode_tps_median=22.4037
+llama_simple_prompt_eval_ms_median=22.920
+llama_simple_prompt_eval_tps_median=1352.47
+llama_simple_eval_step_ms_median=2.840
+llama_simple_eval_tps_median=351.62
+prefill_ms_ratio_lcqi_over_llama_simple=55.779668
+decode_step_ms_ratio_lcqi_over_llama_simple=15.716761
+lcqi_f32_dequantized_weight_inflation_ratio=5.190199
+llama_bench_same_token_count_prefill_tps=1463.87
+llama_bench_same_token_count_decode_tps=508.91
+\end{lstlisting}
+
+这次同输入数据把差距拆清楚了。第一，prefill 慢约 \code{55.78x}，主要因为 LCQI 在 \code{llama\_gguf\_generate\_greedy} 中把 31 个 prompt token 逐个当 decode step 跑，没有像 llama.cpp 那样把 prompt 批量送进 graph/backend。第二，decode step 慢约 \code{15.72x}，主要因为 LCQI 的 GGUF 路径仍是 \code{f32\_dequantized\_reference}：加载时把 103.7 MB 量化权重解成约 538 MB f32 权重，decoder block 里的 Q/K/V、attention output、SwiGLU gate/up/down 和 tied lm head 仍走通用 f32 matvec。第三，llama.cpp 保留 GGUF 量化 block 热路径，使用 ggml graph 调度、成熟 CPU kernel、线程协调、prompt batching 和更紧凑的 KV cache。差距不是输入不一致，也不是“少一个 AVX2 指令”，而是权重表示、prompt 批处理、矩阵内核、线程调度、KV 表示和整图执行方式都还没有进入成熟引擎状态。
 
 \subsection{微内核进入默认路径的验收}
 

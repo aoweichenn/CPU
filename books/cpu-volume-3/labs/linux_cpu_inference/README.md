@@ -241,3 +241,21 @@ benchmark_tensors_loaded 272
 ```
 
 这条路径证明 LCQI 自研代码已经能读取同一个 SmolLM2 GGUF、解析 tokenizer arrays、解码混合量化权重并端到端生成文本。它仍然不是生产级高性能引擎：当前把 103.7 MB 量化权重解成约 538 MB f32 权重，再用通用 f32 matvec 执行；与 llama.cpp 的差距主要来自低比特权重直算、packed kernel、线程调度、prefetch、KV cache 和整图执行。
+
+LCQI 与 llama.cpp 同输入对比：
+
+```bash
+python3 books/cpu-volume-3/tools/run_smollm2_same_input_compare.py \
+  --cache-dir ~/.cache/lcqi-smollm2-same-input-compare \
+  --model-path ~/.cache/lcqi-smollm2-small-smoke/models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
+  --build-dir books/cpu-volume-3/build/lcqi-release \
+  --rounds 5 --max-new 2
+```
+
+这个脚本会构建固定 commit 的 llama.cpp，运行 `llama-tokenize`、`llama-simple` 和 `llama-bench`，并确认 LCQI 和 llama.cpp 看到的 prompt token ids 完全一致。caw 上的同输入报告保存在：
+
+```text
+books/cpu-volume-3/reports/lcqi-smollm2-same-input-compare-caw.txt
+```
+
+关键结论：同一个模型、同一个展开 chat prompt、同样 31 个 token id、同样 `max-new=2` 下，LCQI prefill 中位数 `1278.47 ms`，llama.cpp `22.92 ms`，LCQI 慢 `55.78x`；LCQI decode step 中位数 `44.64 ms`，llama.cpp `2.84 ms`，LCQI 慢 `15.72x`。所以差距不是 prompt mismatch，而是 LCQI 仍处在 `f32_dequantized_reference`、逐 token prefill、通用 f32 matvec 阶段；llama.cpp 已经走量化 block、prompt batching、ggml graph 调度、紧凑 KV cache 和成熟 CPU kernel。
