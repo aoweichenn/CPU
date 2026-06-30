@@ -13,6 +13,7 @@ namespace {
 
 constexpr std::size_t LCQI_F32_AVX2_LANE_COUNT = 8;
 constexpr std::size_t LCQI_F32_AVX2_UNROLL_COUNT = 4;
+constexpr std::size_t LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT = 8;
 constexpr std::size_t LCQI_F32_AVX2_UNROLLED_FLOATS =
     LCQI_F32_AVX2_LANE_COUNT * LCQI_F32_AVX2_UNROLL_COUNT;
 
@@ -61,6 +62,57 @@ void compute_four_row_dot(const float* row0,
         sums[1] += row1[index] * input_value;
         sums[2] += row2[index] * input_value;
         sums[3] += row3[index] * input_value;
+    }
+}
+
+void compute_eight_row_dot(const float* const* rows,
+                           const float* input,
+                           std::size_t input_size,
+                           float* sums) noexcept {
+    std::size_t index = 0;
+    __m256 accumulator0 = _mm256_setzero_ps();
+    __m256 accumulator1 = _mm256_setzero_ps();
+    __m256 accumulator2 = _mm256_setzero_ps();
+    __m256 accumulator3 = _mm256_setzero_ps();
+    __m256 accumulator4 = _mm256_setzero_ps();
+    __m256 accumulator5 = _mm256_setzero_ps();
+    __m256 accumulator6 = _mm256_setzero_ps();
+    __m256 accumulator7 = _mm256_setzero_ps();
+
+    for (; index + LCQI_F32_AVX2_LANE_COUNT <= input_size;
+         index += LCQI_F32_AVX2_LANE_COUNT) {
+        const __m256 input_values = _mm256_loadu_ps(input + index);
+        accumulator0 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[0] + index), input_values, accumulator0);
+        accumulator1 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[1] + index), input_values, accumulator1);
+        accumulator2 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[2] + index), input_values, accumulator2);
+        accumulator3 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[3] + index), input_values, accumulator3);
+        accumulator4 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[4] + index), input_values, accumulator4);
+        accumulator5 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[5] + index), input_values, accumulator5);
+        accumulator6 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[6] + index), input_values, accumulator6);
+        accumulator7 =
+            _mm256_fmadd_ps(_mm256_loadu_ps(rows[7] + index), input_values, accumulator7);
+    }
+
+    sums[0] = horizontal_sum(accumulator0);
+    sums[1] = horizontal_sum(accumulator1);
+    sums[2] = horizontal_sum(accumulator2);
+    sums[3] = horizontal_sum(accumulator3);
+    sums[4] = horizontal_sum(accumulator4);
+    sums[5] = horizontal_sum(accumulator5);
+    sums[6] = horizontal_sum(accumulator6);
+    sums[7] = horizontal_sum(accumulator7);
+    for (; index < input_size; ++index) {
+        const float input_value = input[index];
+        for (std::size_t row = 0; row < LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT; ++row) {
+            sums[row] += rows[row][index] * input_value;
+        }
     }
 }
 
@@ -126,6 +178,20 @@ void linear_f32_rows_avx2_unchecked(const float* weights,
                                     std::size_t row_end,
                                     float* output) noexcept {
     std::size_t row = row_begin;
+    for (; row + LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT <= row_end;
+         row += LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT) {
+        std::array<const float*, LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT> rows{};
+        rows[0] = weights + row * input_size;
+        for (std::size_t offset = 1; offset < rows.size(); ++offset) {
+            rows[offset] = rows[offset - 1] + input_size;
+        }
+        std::array<float, LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT> sums{};
+        compute_eight_row_dot(rows.data(), input, input_size, sums.data());
+        for (std::size_t offset = 0; offset < LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT; ++offset) {
+            output[row + offset] =
+                sums[offset] + (bias == nullptr ? 0.0F : bias[row + offset]);
+        }
+    }
     for (; row + LCQI_F32_AVX2_UNROLL_COUNT <= row_end;
          row += LCQI_F32_AVX2_UNROLL_COUNT) {
         const float* row0 = weights + row * input_size;
@@ -155,6 +221,22 @@ F32RowMax max_dot_f32_rows_avx2_unchecked(const float* weights,
     best.row = row_begin;
     best.value = -std::numeric_limits<float>::infinity();
     std::size_t row = row_begin;
+    for (; row + LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT <= row_end;
+         row += LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT) {
+        std::array<const float*, LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT> rows{};
+        rows[0] = weights + row * input_size;
+        for (std::size_t offset = 1; offset < rows.size(); ++offset) {
+            rows[offset] = rows[offset - 1] + input_size;
+        }
+        std::array<float, LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT> sums{};
+        compute_eight_row_dot(rows.data(), input, input_size, sums.data());
+        for (std::size_t offset = 0; offset < LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT; ++offset) {
+            if (row + offset == row_begin || sums[offset] > best.value) {
+                best.row = row + offset;
+                best.value = sums[offset];
+            }
+        }
+    }
     for (; row + LCQI_F32_AVX2_UNROLL_COUNT <= row_end;
          row += LCQI_F32_AVX2_UNROLL_COUNT) {
         const float* row0 = weights + row * input_size;

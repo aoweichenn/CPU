@@ -869,14 +869,18 @@ def add_ratio_summary(
         lines.append(f"llama_bench_same_token_count_decode_tps={bench_tg_tps:.6f}")
     lines.append(
         "root_cause=LCQI keeps shape-compatible Q4_K matrices in the default direct "
-        "quantized path. The experimental Q5_0/Q6_K/Q8_0 direct path now uses the "
-        "same row worker pool and is much faster than the first scalar whole-matrix "
-        "experiment, but it is still slower than the default Q4_K plus f32 fallback "
-        "mix because the GGML block layout, Q6_K scalar unpacking, and per-block "
-        "scale handling are not yet packed into tuned multi-row SIMD kernels. "
-        "--threads 1 keeps the serial reference. llama.cpp still batches prompt "
-        "evaluation, uses ggml graph scheduling, tuned low-bit CPU kernels, "
-        "prefetch/thread scheduling, and more compact KV/cache execution."
+        "quantized path and uses an 8-row AVX2 F32 fallback fast path for the "
+        "remaining materialized tensors. The 8-row path reduces the dominant "
+        "F32 fallback hotspot, but the default path still spends most time in "
+        "per-token row-major GEMV. The experimental Q5_0/Q6_K/Q8_0 direct path "
+        "uses the same row worker pool and is much faster than the first scalar "
+        "whole-matrix experiment, but it is still slower than the default Q4_K "
+        "plus F32 fallback mix because the GGML block layout, Q6_K scalar "
+        "unpacking, and per-block scale handling are not yet packed into tuned "
+        "multi-row SIMD kernels. --threads 1 keeps the serial reference. "
+        "llama.cpp still batches prompt evaluation, uses ggml graph scheduling, "
+        "tuned low-bit CPU kernels, prefetch/thread scheduling, and more compact "
+        "KV/cache execution."
     )
 
 

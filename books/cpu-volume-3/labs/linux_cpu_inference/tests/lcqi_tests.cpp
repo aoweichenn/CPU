@@ -2015,6 +2015,32 @@ void test_f32_row_kernels_match_scalar() {
                     "AVX2 F32 linear row kernel output differs from scalar");
         }
 
+        std::vector<float> scalar_subrange(LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+        std::vector<float> avx2_subrange(LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+        constexpr std::size_t LCQI_F32_ROW_TEST_SUBRANGE_BEGIN = 1;
+        constexpr std::size_t LCQI_F32_ROW_TEST_SUBRANGE_END = 7;
+        lcqi::linear_f32_rows_scalar_unchecked(weights.data(),
+                                               input.data(),
+                                               bias.data(),
+                                               input.size(),
+                                               LCQI_F32_ROW_TEST_SUBRANGE_BEGIN,
+                                               LCQI_F32_ROW_TEST_SUBRANGE_END,
+                                               scalar_subrange.data());
+        lcqi::linear_f32_rows_avx2_unchecked(weights.data(),
+                                             input.data(),
+                                             bias.data(),
+                                             input.size(),
+                                             LCQI_F32_ROW_TEST_SUBRANGE_BEGIN,
+                                             LCQI_F32_ROW_TEST_SUBRANGE_END,
+                                             avx2_subrange.data());
+        for (std::size_t index = LCQI_F32_ROW_TEST_SUBRANGE_BEGIN;
+             index < LCQI_F32_ROW_TEST_SUBRANGE_END;
+             ++index) {
+            require(std::fabs(scalar_subrange[index] - avx2_subrange[index]) <=
+                        LCQI_F32_KERNEL_MAX_DIFF,
+                    "AVX2 F32 subrange row kernel output differs from scalar");
+        }
+
         const lcqi::F32RowMax avx2_max =
             lcqi::max_dot_f32_rows_avx2_unchecked(weights.data(),
                                                   input.data(),
