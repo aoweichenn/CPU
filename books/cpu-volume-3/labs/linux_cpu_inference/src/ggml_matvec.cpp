@@ -312,6 +312,15 @@ void matvec_ggml_quantized_q8_0_avx2_unchecked(GgmlType type,
                                                std::int64_t column_count,
                                                std::span<const Q8_0InputBlock> input,
                                                std::span<float> output);
+
+void matvec_ggml_quantized_q8_0_avx2_rows_unchecked(GgmlType type,
+                                                    std::span<const std::uint8_t> rows,
+                                                    std::int64_t row_count,
+                                                    std::int64_t column_count,
+                                                    std::span<const Q8_0InputBlock> input,
+                                                    std::span<float> output,
+                                                    std::int64_t row_begin,
+                                                    std::int64_t row_end);
 #else
 bool ggml_q8_0_avx2_available() noexcept {
     return false;
@@ -323,6 +332,15 @@ void matvec_ggml_quantized_q8_0_avx2_unchecked(GgmlType,
                                                std::int64_t,
                                                std::span<const Q8_0InputBlock>,
                                                std::span<float>) {}
+
+void matvec_ggml_quantized_q8_0_avx2_rows_unchecked(GgmlType,
+                                                    std::span<const std::uint8_t>,
+                                                    std::int64_t,
+                                                    std::int64_t,
+                                                    std::span<const Q8_0InputBlock>,
+                                                    std::span<float>,
+                                                    std::int64_t,
+                                                    std::int64_t) {}
 #endif
 
 std::vector<Q8_0InputBlock> quantize_q8_0_input(std::span<const float> input) {
@@ -446,35 +464,58 @@ void matvec_ggml_quantized_q8_0(GgmlType type,
     if (rows.size() != checked_size(row_bytes * row_count, "GGML Q8_0 matvec matrix bytes")) {
         throw std::runtime_error("GGML Q8_0 matvec matrix byte size mismatch");
     }
+
+    matvec_ggml_quantized_q8_0_rows_unchecked(type,
+                                              rows,
+                                              row_count,
+                                              column_count,
+                                              input,
+                                              output,
+                                              0,
+                                              row_count);
+}
+
+void matvec_ggml_quantized_q8_0_rows_unchecked(GgmlType type,
+                                               std::span<const std::uint8_t> rows,
+                                               std::int64_t row_count,
+                                               std::int64_t column_count,
+                                               std::span<const Q8_0InputBlock> input,
+                                               std::span<float> output,
+                                               std::int64_t row_begin,
+                                               std::int64_t row_end) {
+    const GgmlTypeLayout layout = ggml_type_layout(type);
 #if defined(LCQI_ENABLE_AVX2)
     if ((type == GgmlType::q8_0 || type == GgmlType::q5_0) && ggml_q8_0_avx2_available()) {
-        matvec_ggml_quantized_q8_0_avx2_unchecked(type,
-                                                  rows,
-                                                  row_count,
-                                                  column_count,
-                                                  input,
-                                                  output);
+        matvec_ggml_quantized_q8_0_avx2_rows_unchecked(type,
+                                                       rows,
+                                                       row_count,
+                                                       column_count,
+                                                       input,
+                                                       output,
+                                                       row_begin,
+                                                       row_end);
         return;
     }
 #endif
+    (void)row_count;
     const std::int64_t input_blocks_per_weight_block =
         layout.block_size / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t row_bytes =
+        (column_count / layout.block_size) * static_cast<std::int64_t>(layout.type_size);
 
-    for (std::int64_t row = 0; row < row_count; ++row) {
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
         const std::uint8_t* row_bytes_begin =
-            rows.data() + checked_size(row * row_bytes, "GGML Q8_0 matvec row offset");
+            rows.data() + static_cast<std::size_t>(row * row_bytes);
         float sum = 0.0F;
         for (std::int64_t block = 0; block < column_count / layout.block_size; ++block) {
             sum += dot_quantized_block_q8_0(
                 type,
                 row_bytes_begin +
-                    checked_size(block * static_cast<std::int64_t>(layout.type_size),
-                                 "GGML Q8_0 matvec block offset"),
+                    static_cast<std::size_t>(block * static_cast<std::int64_t>(layout.type_size)),
                 input.data() +
-                    checked_size(block * input_blocks_per_weight_block,
-                                 "GGML Q8_0 matvec input block offset"));
+                    static_cast<std::size_t>(block * input_blocks_per_weight_block));
         }
-        output[checked_size(row, "GGML Q8_0 matvec row")] = sum;
+        output[static_cast<std::size_t>(row)] = sum;
     }
 }
 

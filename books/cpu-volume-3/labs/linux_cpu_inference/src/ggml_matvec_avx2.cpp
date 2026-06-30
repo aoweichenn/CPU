@@ -100,10 +100,13 @@ void matvec_q8_0_q8_0_avx2_unchecked(std::span<const std::uint8_t> rows,
                                      std::int64_t row_count,
                                      std::int64_t column_count,
                                      std::span<const Q8_0InputBlock> input,
-                                     std::span<float> output) {
+                                     std::span<float> output,
+                                     std::int64_t row_begin,
+                                     std::int64_t row_end) {
+    (void)row_count;
     const std::int64_t row_blocks = column_count / LCQI_Q8_0_INPUT_BLOCK_VALUES;
     const std::int64_t row_bytes = row_blocks * LCQI_GGML_AVX2_Q8_0_BLOCK_BYTES;
-    for (std::int64_t row = 0; row < row_count; ++row) {
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
         float sum = 0.0F;
         const std::uint8_t* row_data = rows.data() + row * row_bytes;
         for (std::int64_t block = 0; block < row_blocks; ++block) {
@@ -119,10 +122,13 @@ void matvec_q5_0_q8_0_avx2_unchecked(std::span<const std::uint8_t> rows,
                                      std::int64_t row_count,
                                      std::int64_t column_count,
                                      std::span<const Q8_0InputBlock> input,
-                                     std::span<float> output) {
+                                     std::span<float> output,
+                                     std::int64_t row_begin,
+                                     std::int64_t row_end) {
+    (void)row_count;
     const std::int64_t row_blocks = column_count / LCQI_Q8_0_INPUT_BLOCK_VALUES;
     const std::int64_t row_bytes = row_blocks * LCQI_GGML_AVX2_Q5_0_BLOCK_BYTES;
-    for (std::int64_t row = 0; row < row_count; ++row) {
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
         float sum = 0.0F;
         const std::uint8_t* row_data = rows.data() + row * row_bytes;
         for (std::int64_t block = 0; block < row_blocks; ++block) {
@@ -145,18 +151,57 @@ bool ggml_q8_0_avx2_available() noexcept {
 #endif
 }
 
+void matvec_ggml_quantized_q8_0_avx2_rows_unchecked(GgmlType type,
+                                                    std::span<const std::uint8_t> rows,
+                                                    std::int64_t row_count,
+                                                    std::int64_t column_count,
+                                                    std::span<const Q8_0InputBlock> input,
+                                                    std::span<float> output,
+                                                    std::int64_t row_begin,
+                                                    std::int64_t row_end);
+
 void matvec_ggml_quantized_q8_0_avx2_unchecked(GgmlType type,
                                                std::span<const std::uint8_t> rows,
                                                std::int64_t row_count,
                                                std::int64_t column_count,
                                                std::span<const Q8_0InputBlock> input,
                                                std::span<float> output) {
+    matvec_ggml_quantized_q8_0_avx2_rows_unchecked(type,
+                                                   rows,
+                                                   row_count,
+                                                   column_count,
+                                                   input,
+                                                   output,
+                                                   0,
+                                                   row_count);
+}
+
+void matvec_ggml_quantized_q8_0_avx2_rows_unchecked(GgmlType type,
+                                                    std::span<const std::uint8_t> rows,
+                                                    std::int64_t row_count,
+                                                    std::int64_t column_count,
+                                                    std::span<const Q8_0InputBlock> input,
+                                                    std::span<float> output,
+                                                    std::int64_t row_begin,
+                                                    std::int64_t row_end) {
     if (type == GgmlType::q8_0) {
-        matvec_q8_0_q8_0_avx2_unchecked(rows, row_count, column_count, input, output);
+        matvec_q8_0_q8_0_avx2_unchecked(rows,
+                                        row_count,
+                                        column_count,
+                                        input,
+                                        output,
+                                        row_begin,
+                                        row_end);
         return;
     }
     if (type == GgmlType::q5_0) {
-        matvec_q5_0_q8_0_avx2_unchecked(rows, row_count, column_count, input, output);
+        matvec_q5_0_q8_0_avx2_unchecked(rows,
+                                        row_count,
+                                        column_count,
+                                        input,
+                                        output,
+                                        row_begin,
+                                        row_end);
     }
 }
 

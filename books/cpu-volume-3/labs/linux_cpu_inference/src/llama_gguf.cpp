@@ -760,6 +760,42 @@ void linear_ggml_quantized_direct(const LlamaGgufLinearWeights& layer,
                                output);
 }
 
+void linear_ggml_quantized_direct_parallel(const LlamaGgufLinearWeights& layer,
+                                           std::span<const Q8_0InputBlock> q8_0_input,
+                                           std::span<float> output,
+                                           const LlamaGgufExecutionOptions& options,
+                                           LlamaParallelWorkerPool* worker_pool) {
+    if (q8_0_input.size() != checked_size(layer.input_size / LCQI_Q8_0_INPUT_BLOCK_VALUES,
+                                          "Q8_0 input block count")) {
+        throw std::runtime_error("LLaMA GGUF Q8_0 scratch block count mismatch");
+    }
+    const std::size_t input_size = checked_size(layer.input_size, "linear input size");
+    const std::size_t output_size = checked_size(layer.output_size, "linear output size");
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        linear_ggml_quantized_direct(layer, q8_0_input, output);
+        return;
+    }
+
+    const auto rows_fn = [&layer, q8_0_input, output](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        (void)worker_index;
+        matvec_ggml_quantized_q8_0_rows_unchecked(layer.source_type,
+                                                  layer.quantized_bytes,
+                                                  layer.output_size,
+                                                  layer.input_size,
+                                                  q8_0_input,
+                                                  output,
+                                                  static_cast<std::int64_t>(begin),
+                                                  static_cast<std::int64_t>(end));
+    };
+    worker_pool->parallel_for_rows(0,
+                                   output_size,
+                                   parallel_row_grain(output_size, *worker_pool),
+                                   rows_fn);
+}
+
 void linear_gguf(const LlamaGgufLinearWeights& layer,
                  std::span<const float> input,
                  std::span<const Q8KBlock> q8_input,
@@ -781,7 +817,11 @@ void linear_gguf(const LlamaGgufLinearWeights& layer,
             break;
         case LlamaGgufLinearStorage::ggml_quantized:
             elapsed = measure_ms([&]() {
-                linear_ggml_quantized_direct(layer, q8_0_input, output);
+                linear_ggml_quantized_direct_parallel(layer,
+                                                      q8_0_input,
+                                                      output,
+                                                      options,
+                                                      worker_pool);
             });
             hotspots.ggml_direct_ms += elapsed;
             ++hotspots.ggml_direct_calls;

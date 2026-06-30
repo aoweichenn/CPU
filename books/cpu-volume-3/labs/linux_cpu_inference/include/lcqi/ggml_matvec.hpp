@@ -40,4 +40,13 @@ void matvec_ggml_quantized_q8_0(GgmlType type,
                                 std::span<const Q8_0InputBlock> input,
                                 std::span<float> output);
 
+void matvec_ggml_quantized_q8_0_rows_unchecked(GgmlType type,
+                                               std::span<const std::uint8_t> rows,
+                                               std::int64_t row_count,
+                                               std::int64_t column_count,
+                                               std::span<const Q8_0InputBlock> input,
+                                               std::span<float> output,
+                                               std::int64_t row_begin,
+                                               std::int64_t row_end);
+
 }  // namespace lcqi

@@ -447,17 +447,18 @@ def ensure_llama_targets(
     skip_build: bool,
     timeout_seconds: int,
 ) -> tuple[Path, Path, Path]:
-    run_smollm2_small_smoke.ensure_llama_simple_chat(
-        cache_dir,
-        jobs=jobs,
-        skip_build=skip_build,
-    )
     build_dir = cache_dir / "llama.cpp" / "build"
     binaries = {
         LLAMA_SIMPLE_TARGET: build_dir / "bin" / LLAMA_SIMPLE_TARGET,
         LLAMA_BENCH_TARGET: build_dir / "bin" / LLAMA_BENCH_TARGET,
         LLAMA_TOKENIZE_TARGET: build_dir / "bin" / LLAMA_TOKENIZE_TARGET,
     }
+    if not skip_build:
+        run_smollm2_small_smoke.ensure_llama_simple_chat(
+            cache_dir,
+            jobs=jobs,
+            skip_build=False,
+        )
     for target, binary in binaries.items():
         if binary.exists() and os.access(binary, os.X_OK):
             continue
@@ -653,6 +654,19 @@ def command_output(args: list[str]) -> str:
     return completed.stdout.strip()
 
 
+def llama_source_commit(cache_dir: Path) -> str:
+    source_dir = cache_dir / "llama.cpp"
+    if not (source_dir / ".git").exists():
+        return "unavailable"
+    result = subprocess.run(
+        ["git", "-C", str(source_dir), "rev-parse", "HEAD"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else "unknown"
+
+
 def write_report(
     report_path: Path,
     *,
@@ -668,11 +682,14 @@ def write_report(
     llama_tokenize: CommandResult,
     llama_simple_runs: list[CommandResult],
     llama_bench: CommandResult,
+    skip_llama_build: bool,
 ) -> None:
     report_path.parent.mkdir(parents=True, exist_ok=True)
     model_matches, actual_sha256, actual_bytes = run_smollm2_small_smoke.verify_model_file(
         model_path
     )
+    actual_llama_commit = llama_source_commit(cache_dir)
+    expected_llama_commit = run_smollm2_small_smoke.LLAMA_CPP_COMMIT
     lines = [
         "LCQI vs llama.cpp SmolLM2 Same Input Compare",
         "",
@@ -693,7 +710,11 @@ def write_report(
         f"model_expected_sha256={run_smollm2_small_smoke.MODEL_EXPECTED_SHA256}",
         f"model_actual_sha256={actual_sha256}",
         f"model_identity_match={str(model_matches).lower()}",
-        f"llama_cpp_commit={run_smollm2_small_smoke.LLAMA_CPP_COMMIT}",
+        f"llama_cpp_expected_commit={expected_llama_commit}",
+        f"llama_cpp_source_git_commit={actual_llama_commit}",
+        "llama_cpp_source_commit_verified="
+        f"{str(actual_llama_commit == expected_llama_commit).lower()}",
+        f"llama_cpp_skip_build={str(skip_llama_build).lower()}",
         "",
         f"user_prompt={escape_newlines(user_prompt)}",
         f"max_new_tokens={max_new_tokens}",
@@ -848,13 +869,14 @@ def add_ratio_summary(
         lines.append(f"llama_bench_same_token_count_decode_tps={bench_tg_tps:.6f}")
     lines.append(
         "root_cause=LCQI keeps shape-compatible Q4_K matrices in the default direct "
-        "quantized path. The experimental Q5_0/Q6_K/Q8_0 direct path increases "
-        "quantized-byte coverage, but its current scalar block kernels are slower "
-        "than the dequantized f32 AVX2 fallback, so it is not enabled by default. "
-        "The default LCQI run now uses a persistent row worker pool for large f32 "
-        "fallback matrices; --threads 1 keeps the serial reference. llama.cpp "
-        "still batches prompt evaluation, uses ggml graph scheduling, tuned low-bit "
-        "CPU kernels, prefetch/thread scheduling, and more compact KV/cache execution."
+        "quantized path. The experimental Q5_0/Q6_K/Q8_0 direct path now uses the "
+        "same row worker pool and is much faster than the first scalar whole-matrix "
+        "experiment, but it is still slower than the default Q4_K plus f32 fallback "
+        "mix because the GGML block layout, Q6_K scalar unpacking, and per-block "
+        "scale handling are not yet packed into tuned multi-row SIMD kernels. "
+        "--threads 1 keeps the serial reference. llama.cpp still batches prompt "
+        "evaluation, uses ggml graph scheduling, tuned low-bit CPU kernels, "
+        "prefetch/thread scheduling, and more compact KV/cache execution."
     )
 
 
@@ -1118,6 +1140,7 @@ def main() -> int:
             llama_tokenize=llama_tokenize,
             llama_simple_runs=llama_simple_runs,
             llama_bench=llama_bench,
+            skip_llama_build=args.skip_llama_build,
         )
     except Exception as error:
         print(f"[lcqi-same-input] ERROR: {error}", file=sys.stderr)

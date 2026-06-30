@@ -1367,6 +1367,23 @@ void test_ggml_quantized_f32_matvec_paths() {
                                              columns,
                                              q8_0_input,
                                              q8_0_direct);
+            std::vector<float> q8_0_row_range_direct(2, 0.0F);
+            lcqi::matvec_ggml_quantized_q8_0_rows_unchecked(type,
+                                                            matrix,
+                                                            2,
+                                                            columns,
+                                                            q8_0_input,
+                                                            q8_0_row_range_direct,
+                                                            0,
+                                                            1);
+            lcqi::matvec_ggml_quantized_q8_0_rows_unchecked(type,
+                                                            matrix,
+                                                            2,
+                                                            columns,
+                                                            q8_0_input,
+                                                            q8_0_row_range_direct,
+                                                            1,
+                                                            2);
             const std::vector<float> weights =
                 lcqi::dequantize_ggml_tensor(type, matrix, columns * 2);
             std::array<float, 2> reference{0.0F, 0.0F};
@@ -1379,6 +1396,10 @@ void test_ggml_quantized_f32_matvec_paths() {
                     throw std::runtime_error(message);
                 }
                 if (std::fabs(reference[row] - q8_0_direct[row]) >
+                    LCQI_GGML_Q8_MATVEC_MAX_DIFF) {
+                    throw std::runtime_error(message);
+                }
+                if (std::fabs(q8_0_direct[row] - q8_0_row_range_direct[row]) >
                     LCQI_GGML_Q8_MATVEC_MAX_DIFF) {
                     throw std::runtime_error(message);
                 }

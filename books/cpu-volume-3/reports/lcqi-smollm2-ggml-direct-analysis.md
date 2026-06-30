@@ -4,6 +4,7 @@ Date: 2026-06-30
 Host: caw
 Raw report: `books/cpu-volume-3/reports/lcqi-smollm2-ggml-direct-compare-caw.txt`
 Follow-up report: `books/cpu-volume-3/reports/lcqi-smollm2-threaded-q4-compare-caw.txt`
+GGML row-range follow-up report: `books/cpu-volume-3/reports/lcqi-smollm2-ggml-threaded-compare-caw.txt`
 
 ## Question
 
@@ -101,6 +102,35 @@ Follow-up caw evidence, same model and same 31-token prompt:
 - LCQI threaded default over llama.cpp same-input: prefill `7.381619x` slower, decode step `2.471694x` slower
 
 The first threaded attempt exposed an important interaction: after f32 fallback became row-parallel, the single-thread Q4_K direct path could lose to the parallel f32 fallback in some decode measurements. The fix was not to disable Q4_K direct, but to make Q4_K direct obey the same output-row partitioning. This is why the final report must be `lcqi-smollm2-threaded-q4-compare-caw.txt`, not the intermediate `lcqi-smollm2-threaded-compare-caw.txt`.
+
+## GGML Direct Row-Range Follow-Up
+
+The next change applied the same row partitioning idea to the opt-in GGML direct path. `matvec_ggml_quantized_q8_0_rows_unchecked` computes only `[row_begin,row_end)` after the caller has already validated the tensor shape and byte span. `linear_ggml_quantized_direct_parallel` then sends those row ranges through `LlamaParallelWorkerPool`.
+
+Final caw evidence, same model and same 31-token prompt:
+
+- serial default Q4_K direct prefill median: `364.282 ms`
+- serial default Q4_K direct decode step median: `14.9794 ms`
+- threaded default worker count median: `8`
+- threaded default Q4_K direct prefill median: `162.492 ms`
+- threaded default Q4_K direct decode step median: `6.41487 ms`
+- threaded f32 fallback hotspot median: `148.132 ms`, down from serial `338.779 ms`
+- threaded Q4_K direct hotspot median: `5.39028 ms`, down from serial `19.6660 ms`
+- threaded speedup over serial: prefill `2.241846x`, decode step `2.335106x`, f32 hotspot `2.287008x`
+- Q4_K direct, compared with Q4 direct off in the same threaded binary: prefill `1.073148x`, decode step `1.057014x`, `w_down` `1.642115x`
+- LCQI threaded default over llama.cpp same-input: prefill `7.089529x` slower, decode step `2.250832x` slower
+- experimental GGML direct row-range prefill median: `242.149 ms`
+- experimental GGML direct row-range decode step median: `8.98937 ms`
+- experimental GGML direct hotspot median: `228.300 ms`
+- experimental GGML direct tensors: `194`
+- experimental GGML direct calls: `6208`
+- experimental direct quantized weight byte share: `0.708479`
+
+This is a real improvement over the first opt-in GGML direct experiment: prefill dropped from `1211.710 ms` to `242.149 ms`, and decode step dropped from `42.4420 ms` to `8.98937 ms`. The improvement confirms that the first failure was not just "low-bit direct is bad"; one major bottleneck was that the direct path did not participate in row-level parallel scheduling.
+
+It is still not the default path. The default Q4_K plus f32 fallback mix is `162.492 ms` prefill and `6.41487 ms` decode step. The remaining GGML direct hotspot is `228.300 ms`, with slower `wk`, `wv`, and `w_down` regions than the default mix. That points to the next real work: packed multi-row layout, full SIMD coverage for the dominant formats including `Q6_K`, less per-block scale overhead, and prefetch. Simply increasing direct-format coverage is no longer the bottleneck statement.
+
+The final report also records `llama_cpp_source_git_commit=unavailable`, `llama_cpp_source_commit_verified=false`, and `llama_cpp_skip_build=true` because caw reused an existing offline llama.cpp binary cache without `.git`. The model identity was still verified by bytes and SHA-256, but the binary provenance is explicitly weaker than a fresh source checkout.
 
 The remaining evidence points to two higher-leverage directions:
 

@@ -250,7 +250,7 @@ benchmark_hotspot_f32_fallback_calls 6208
 
 这条路径证明 LCQI 自研代码已经能读取同一个 SmolLM2 GGUF、解析 tokenizer arrays、处理混合量化权重并端到端生成文本。默认执行路径不再只是“加载时全部解成 f32”：shape 兼容的 `Q4_K` linear tensor 会保留 GGUF block bytes，并在真实 decoder 里通过 `matvec_q4_k_q8` 直接执行；`Q5_0/Q6_K/Q8_0/F32` tensor 仍然 materialize 成 f32 fallback。当前只有约 `7.68%` 的加载权重字节进入默认 direct Q4_K 路径，prefill 仍逐 token 执行；与 llama.cpp 的差距主要来自更完整的低比特权重覆盖、prompt batching、packed kernel、线程调度、prefetch、KV cache 和整图执行。
 
-实验路径 `LCQI_LLAMA_GGML_DIRECT=1` 会尝试让 shape 兼容的 `Q5_0/Q6_K/Q8_0` linear tensor 也保留 GGUF block bytes，并通过 `matvec_ggml_quantized_q8_0` 执行。caw 同输入报告显示它把 direct 量化字节覆盖率从 `0.076809` 提高到 `0.708479`，但 prefill 中位数从默认 `370.847 ms` 退化到 `1211.710 ms`，decode step 从 `15.4182 ms` 退化到 `42.4420 ms`。原因是这些 GGML direct kernel 仍按 block/row 标量组织，热点 `benchmark_hotspot_ggml_direct_ms` 达到 `1207.13 ms`，慢于当前 f32 AVX2 fallback。因此它保留为实验路径，不默认启用。
+实验路径 `LCQI_LLAMA_GGML_DIRECT=1` 会尝试让 shape 兼容的 `Q5_0/Q6_K/Q8_0` linear tensor 也保留 GGUF block bytes，并通过 `matvec_ggml_quantized_q8_0` 执行。第一版单线程/整矩阵实验曾把 direct 量化字节覆盖率从 `0.076809` 提高到 `0.708479`，但 prefill 从默认 `370.847 ms` 退化到 `1211.710 ms`，热点 `benchmark_hotspot_ggml_direct_ms` 达到 `1207.13 ms`。当前版本已经给 GGML direct 补上 row-range unchecked 入口，并接入同一个 `LlamaParallelWorkerPool`：caw 同输入 5 轮中位数显示，实验路径降到 prefill `242.149 ms`、decode step `8.98937 ms`、`benchmark_hotspot_ggml_direct_ms=228.300`。这说明 row-range 解决了“所有行串行扫”的一大块问题，但它仍慢于默认 Q4_K+f32 fallback 的 `162.492 ms`、`6.41487 ms`，所以继续保留为 opt-in，不默认启用。
 
 LCQI 与 llama.cpp 同输入对比：
 
@@ -265,7 +265,7 @@ python3 books/cpu-volume-3/tools/run_smollm2_same_input_compare.py \
 这个脚本会构建固定 commit 的 llama.cpp，运行 `llama-tokenize`、`llama-simple` 和 `llama-bench`，并确认 LCQI 和 llama.cpp 看到的 prompt token ids 完全一致。caw 上的同输入报告保存在：
 
 ```text
-books/cpu-volume-3/reports/lcqi-smollm2-threaded-q4-compare-caw.txt
+books/cpu-volume-3/reports/lcqi-smollm2-ggml-threaded-compare-caw.txt
 ```
 
-关键结论：同一个模型、同一个展开 chat prompt、同样 31 个 token id、同样 `max-new=2` 下，当前默认 LCQI 使用 `8` 个 worker，对大行数 f32 fallback 和 Q4_K direct row-range 都做输出行切分。默认 Q4_K direct prefill 中位数从串行 `363.759 ms` 降到 `161.436 ms`，decode step 从串行 `15.1652 ms` 降到 `7.26678 ms`；f32 fallback hotspot 从 `338.173 ms` 降到 `146.731 ms`。相对同输入 llama.cpp，LCQI prefill 仍慢 `7.381619x`，decode step 仍慢 `2.471694x`。同一二进制里关闭 `LCQI_LLAMA_Q4_DIRECT=0` 后，LCQI prefill 为 `175.634 ms`，decode step 为 `7.23524 ms`，`w_down` 热点为 `36.7329 ms`；默认 Q4_K direct 后分别为 `161.436 ms`、`7.26678 ms`、`22.3253 ms`。所以这轮默认优化的 A/B 证据是：线程池带来 prefill `2.253271x`、decode step `2.086922x`、f32 hotspot `2.304714x`；Q4_K direct 在并行后带来 prefill `1.087948x`、`w_down` `1.645349x`，decode 中位数 `0.995660x` 基本持平，并减少 `56,623,104` 字节 f32 materialized 权重。实验 GGML direct 仍只保留为 opt-in：之前的 caw 负结果已经证明，单纯提高 `Q5_0/Q6_K/Q8_0` 覆盖率而没有 packed multi-row/SIMD/threaded kernel，会让端到端倒退。
+关键结论：同一个模型、同一个展开 chat prompt、同样 31 个 token id、同样 `max-new=2` 下，当前默认 LCQI 使用 `8` 个 worker，对大行数 f32 fallback、Q4_K direct row-range 和实验 GGML direct row-range 都能做输出行切分。默认 Q4_K direct prefill 中位数从串行 `364.282 ms` 降到 `162.492 ms`，decode step 从串行 `14.9794 ms` 降到 `6.41487 ms`；f32 fallback hotspot 从 `338.779 ms` 降到 `148.132 ms`。相对同输入 llama.cpp，LCQI prefill 仍慢 `7.089529x`，decode step 仍慢 `2.250832x`。同一二进制里关闭 `LCQI_LLAMA_Q4_DIRECT=0` 后，LCQI prefill 为 `174.378 ms`，decode step 为 `6.78061 ms`，`w_down` 热点为 `36.4924 ms`；默认 Q4_K direct 后分别为 `162.492 ms`、`6.41487 ms`、`22.2228 ms`。所以这轮默认优化的 A/B 证据是：线程池带来 prefill `2.241846x`、decode step `2.335106x`、f32 hotspot `2.287008x`；Q4_K direct 在并行后带来 prefill `1.073148x`、decode step `1.057014x`、`w_down` `1.642115x`，并减少 `56,623,104` 字节 f32 materialized 权重。实验 GGML direct row-range 相比最初 `1211.710 ms` 已明显改善到 `242.149 ms`，但仍慢于默认路径，下一步需要 packed multi-row layout、更完整 SIMD 覆盖和 prefetch，而不是只扩大格式覆盖。
