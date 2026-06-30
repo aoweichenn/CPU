@@ -180,105 +180,66 @@ RAG/Agent   只保留和推理服务相关的接口契约，不要喧宾夺主
 
 最终标准很简单：每个重要原理都必须有源码、实验、证据、反例、工业对照。没有这五个之一，就不要写成”大师级”。
 
-七、操作系统第一册必须补的内容
+七、操作系统第一册评价与待办（2026-06-30 更新）
 
-（零）当前进度（2026-06-30 更新）
+（零）总体评价
 
-commit fb7114e 已新增 9409 行 LaTeX，OS 原理卷从 5947 行增长到 8360 行。
-多数章节已从 <150 行扩充到 270-320 行，并补充了 Linux 源码路径。
+commit fb7114e 新增 9409 行，OS 原理卷从 5947 → 11,798 行。
+从"骨架阶段"一步跨入"准出版级"。最大变化不是字数，而是结构重组和密度提升。
 
-已完成（commit fb7114e）：
-- ch02 裸机 MCU 157→270 行：补充了链接脚本、启动汇编、设备树基础
-- ch03 中断定时器 191→281 行：补充了 IDT、trap frame、Linux do_IRQ 路径
-- ch04 boot/linker/init 181→270 行：补充了 UEFI、initcall、多核启动
-- ch07 并发 IPC 信号 137→228 行：补充了 eventfd/timerfd/memfd
-- ch08 内核锁 186→290 行：补充了 lockdep、MCS queued spinlock
-- ch09 系统调用 160→304 行：补充了 LSM hook、seccomp BPF、vdso
-- ch10 exec ELF 145→276 行：补充了 binfmt 机制、auxv、动态链接
-- ch11 虚拟内存 195→280 行：补充了 KASAN、PSI、THP
-- ch12 mmap 149→279 行：补充了 DAX、O_DIRECT、madvise
-- ch13 内核内存 150→274 行：补充了 kmemleak、percpu
-- ch14 设备驱动 110→290 行：补充了 device tree、platform driver、devm、ioctl、runtime PM、驱动并发不变量
-- ch15 块层 IO 165→294 行：补充了 blk-mq、io_uring
-- ch17 文件系统 158→321 行：补充了 ext4 extent、jbd2、FUSE
-- ch18 网络 182→277 行：补充了 Netfilter、skb 管理
-- ch19 持久化 142→219 行：补充了 RAID、LVM
-- ch20 安全隔离 85→171 行：补充了 DAC/MAC/capability 集合/Landlock/TPM/ASLR/CFI
-- ch21 panic 恢复 178→311 行：补充了 KASAN/KCSAN/KFENCE/kdump
-- ch22 可观测性 149→300 行：补充了 ftrace、eBPF、bpftrace、PSI
-- ch23 案例 402→601 行：补充了 8 个端到端案例
-- 新增 frontmatter：abbreviations.tex、how-to-read.tex、preface.tex、title.tex
-- 新增 backmatter：source-reading-index.tex
-- 新增脚本：build_epub.py(485行)、check_inputs.py(63行)
+当前体量对比：
+- OS 原理卷：11,798 行 / 53 文件 / 7 个大章
+- cpu-volume-2（成熟）：24,670 行 / 675 页
+- OS 在"教学理念"和"结构创新"上已超越成熟书，但体量还差约 50%
 
-未跟踪文件（需提交）：
-- CMakeLists.txt、labs/、materials/、reports/、source/markdown/ — 这些文件在磁盘上但未 git add
+核心优点：
+1. 结构重组为 7 个大章故事线，从硬件到系统演进，不再是平铺章节
+2. T16 教学计算机（423 行，19 步从零搭 CPU）—— 全书最大亮点，所有中文 OS 教材未见
+3. 组成原理主线（430 行）—— 从晶体管到 OS，每个硬件机制指向"修复的 OS 失败"
+4. 统一分析框架：失败场景 → 原理 → 不变量 → 实践 → 测试
+5. 源码阅读索引（33 个主题 → Linux 路径）+ 能力清单（24 条）
+6. 写作质量高：每章有 keyidea/longtable/lstlisting/rubricbox，信息密度均匀
 
-仍存在的问题：
-- 7 对 deep-dive 章节仍未合并
-- 7 个章节仍 <200 行
-- 实践卷仍 39 行
-- 未进入 books-export 流程
+（一）仍 <200 行的薄章节 📌待扩充
 
+章节    当前行数    缺什么
+ch00-hardware-foundations  144  与 primer/deep-dive 重叠，应合并
+ch01-os-map-and-contracts  128  内容好但篇幅短，缺 POSIX/Windows 对照
+ch05-process-thread-scheduling  167  缺 task_struct 字段、fork/exec/wait 完整路径
+ch06-scheduler-deep-dive  157  与 ch05-deep-dive(408) 重叠，应合并
+ch16-files-devices-io  145  缺 fd 管理、open/read/write 完整路径
+ch20-security-isolation  171  缺 Landlock 实践、BPF LSM 细节
+ch23-practice-and-acceptance  118  评分矩阵和验收标准未展开
 
-（二）ch00-ch01 导言 📌待做
-当前 144+128=272 行 → 目标 400+ 行
-- ch00-hardware-foundations 仍 144 行：缺 x86-64 启动序列、UEFI/BIOS 差异、PLIC/APIC
-- ch01-os-map 仍 128 行：缺 POSIX/Windows API 对照、演进路线、全书状态机模板展开
+（二）deep-dive 章节合并 📌待做
+7 对"基础章(薄)+deep-dive章(厚)"仍分离，基础章平均 150 行，deep-dive 平均 340 行。
+建议合并为一章（350-450 行），deep-dive 内容作为 \section{深入} 插入：
+ch00: foundations(144) + deep-dive(282) + primer(430) → 合并为 1 章
+ch05: scheduling(167) + ch06(157) + deep-dive(408) → 合并为 1 章
+ch11: vm(280) + deep-dive(316) → 合并
+ch16: io(145) + deep-dive(325) → 合并
+ch18: net(277) + deep-dive(316) → 合并
+ch20: security(171) + deep-dive(318) → 合并
+ch23: acceptance(118) + casebook(601) → 合并
 
-（三）ch02-ch13 章节 ✅已完成（commit fb7114e）
-以下章节已扩充到 270-320 行并补充 Linux 源码路径：
-ch02(270) ch03(281) ch04(270) ch07(228) ch08(290) ch09(304) ch10(276)
-ch11-vm(280) ch12(279) ch13(274) ch15(294) ch17(321) ch18-net(277)
-ch19(219) ch21(311) ch22(300) ch23-casebook(601)
+（三）ch00 三章节重叠 📌待合并
+ch00 有 11 个子节共 3289 行，其中：
+- computer-organization-primer(430) ← 最完整
+- minimal-computer-from-scratch(423) ← 最独特（T16）
+- hardware-foundations(144) + hardware-deep-dive(282) ← 与 primer 重叠
+建议：foundations 和 deep-dive 合并到 primer 中，保留 T16 独立
 
-（四）ch14 设备驱动 ✅已完成 + 📌待合并
-当前 290 行，已补充 device tree、platform driver、devm、ioctl、runtime PM、并发不变量。
-但 ch14 仍与 ch00-hardware-deep-dive(282行) 有内容重叠，需确认边界。
+（四）frontmatter/backmatter 📌部分完成
+✅ abbreviations.tex、how-to-read.tex、preface.tex、title.tex、source-reading-index.tex
+📌 glossary.tex（术语表，OS 缩写多，必须有）
+📌 全书总结/回顾章节
 
-（五）仍 <200 行的薄章节 📌待扩充
-
-章节    当前行数    目标    缺什么
-ch00-hardware-foundations  144  250+   启动序列、APIC、NUMA 拓扑
-ch01-os-map-and-contracts  128  250+   POSIX/Windows 对照、演进路线
-ch05-process-thread-scheduling  167  250+   task_struct 字段、fork/exec/wait 路径
-ch06-scheduler-deep-dive  157  250+   CFS 红黑树、cgroup 调度、EAS
-ch16-files-devices-io  145  250+   fd 管理、open/read/write 路径
-ch20-security-isolation  171  250+   Landlock 实践、BPF LSM
-ch23-practice-and-acceptance  118  250+   评分矩阵、项目验收标准
-
-（六）deep-dive 章节合并 📌待做
-7 对章节仍为基础章(薄)+deep-dive章(厚)的拆分结构：
-ch00: foundations(144) + deep-dive(282)
-ch05: scheduling(167) + deep-dive(408) ← 还与 ch06(157) 重叠
-ch11: vm(280) + deep-dive(316)
-ch16: io(145) + deep-dive(325)
-ch18: net(277) + deep-dive(316)
-ch20: security(171) + deep-dive(318)
-ch23: acceptance(118) + casebook(601)
-建议：合并为一章，deep-dive 内容作为 \section{深入} 插入
-
-（七）实践卷 📌待做
-当前：39 行正文 / 3 章 / Lab 337 行（仅 write/exit）
-目标：
-- 正文每章 200+ 行，覆盖原理、实现、测试、边界
-- Lab 扩展到：fork/调度/终止、页表/COW/缺页、文件系统/VFS、管道/信号、ELF 加载
-- 新增验收报告模板
-
-（八）未跟踪文件 📌需 git add
-以下文件在磁盘上但未提交：
-- books/operating-systems-volume-1/CMakeLists.txt
-- books/operating-systems-volume-1/labs/ (527 LOC)
-- books/operating-systems-volume-1/materials/reading-map.md
-- books/operating-systems-volume-1/reports/acceptance-template.md
-- books/operating-systems-volume-1/source/markdown/ (539 行, 9 章)
-
-（九）导出流程 📌待做
-- 接入 Makefile 的 os-check / os-test 目标
-- 生成 EPUB
+（五）导出流程 📌待做
+- Makefile 加 os-check / os-test 目标
+- 生成 EPUB（build_epub.py 已写但未接入）
 - 接入 books-export 和 phone-books-export
-- 当前 PDF 仍在 build/ 下而非 source/latex/ 下
+- PDF 从 build/ 移到 source/latex/
 
-（十）frontmatter/backmatter 📌部分完成
-✅ 已完成：abbreviations.tex、how-to-read.tex、preface.tex、title.tex、source-reading-index.tex
-📌 待做：glossary.tex（术语表）、全书总结/大师级能力清单
+（六）未跟踪文件 📌需 git add
+- CMakeLists.txt、labs/(527 LOC)、materials/reading-map.md
+- reports/acceptance-template.md、source/markdown/(539 行, 9 章)
