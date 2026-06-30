@@ -2,10 +2,12 @@ find_package(Threads REQUIRED)
 
 add_library(lcqi STATIC
     src/f32_kernels.cpp
+    src/gguf.cpp
     src/gpt2_reference.cpp
     src/inference.cpp
     src/int8_kernels.cpp
     src/model.cpp
+    src/q4_k.cpp
     src/reference_decoder.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
@@ -55,6 +57,16 @@ target_link_libraries(lcqi_bench PRIVATE lcqi)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi_bench PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(lcqi_gguf_q4_bench
+    src/gguf_q4_bench.cpp
+)
+
+target_link_libraries(lcqi_gguf_q4_bench PRIVATE lcqi)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lcqi_gguf_q4_bench PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 add_executable(lcqi_trace

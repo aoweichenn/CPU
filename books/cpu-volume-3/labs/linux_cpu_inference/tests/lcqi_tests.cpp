@@ -1,8 +1,10 @@
 #include <lcqi/gpt2_reference.hpp>
 #include <lcqi/f32_kernels.hpp>
+#include <lcqi/gguf.hpp>
 #include <lcqi/inference.hpp>
 #include <lcqi/int8_kernels.hpp>
 #include <lcqi/model.hpp>
+#include <lcqi/q4_k.hpp>
 #include <lcqi/reference_decoder.hpp>
 #include <lcqi/safetensors.hpp>
 #include <lcqi/tokenizer.hpp>
@@ -80,6 +82,17 @@ constexpr std::uint16_t LCQI_TEST_F16_ONE = 0x3C00U;
 constexpr std::uint16_t LCQI_TEST_F16_NEGATIVE_TWO = 0xC000U;
 constexpr std::uint16_t LCQI_TEST_BF16_ONE_POINT_FIVE = 0x3FC0U;
 constexpr std::uint16_t LCQI_TEST_BF16_NEGATIVE_HALF = 0xBF00U;
+constexpr std::uint32_t LCQI_GGUF_TEST_VERSION = 3;
+constexpr std::uint32_t LCQI_GGUF_TEST_ALIGNMENT = 32;
+constexpr std::int64_t LCQI_GGUF_TEST_TENSOR_COUNT = 1;
+constexpr std::int64_t LCQI_GGUF_TEST_METADATA_COUNT = 2;
+constexpr std::int32_t LCQI_GGUF_TYPE_UINT32 = 4;
+constexpr std::int32_t LCQI_GGUF_TYPE_STRING = 8;
+constexpr std::int32_t LCQI_GGUF_TENSOR_TYPE_Q4_K = 12;
+constexpr std::uint64_t LCQI_GGUF_TEST_TENSOR_OFFSET = 0;
+constexpr float LCQI_Q4K_TEST_BLOCK_SCALE = 0.5F;
+constexpr float LCQI_Q4K_TEST_BLOCK_MIN = 0.25F;
+constexpr float LCQI_Q4K_Q8_DIFF_LIMIT = 0.08F;
 
 struct KernelShapeCase {
     std::int32_t input_size = 0;
@@ -144,6 +157,37 @@ void write_le_u64(std::ofstream& output, std::uint64_t value) {
 void append_le_u16(std::vector<std::uint8_t>& output, std::uint16_t value) {
     output.push_back(static_cast<std::uint8_t>(value & LCQI_BYTE_MASK));
     output.push_back(static_cast<std::uint8_t>((value >> LCQI_TEST_BYTE_BITS) & LCQI_BYTE_MASK));
+}
+
+void append_le_u32(std::vector<std::uint8_t>& output, std::uint32_t value) {
+    for (std::int32_t i = 0; i < 4; ++i) {
+        output.push_back(static_cast<std::uint8_t>(
+            (value >> (LCQI_TEST_BYTE_BITS * i)) & LCQI_BYTE_MASK));
+    }
+}
+
+void append_le_i32(std::vector<std::uint8_t>& output, std::int32_t value) {
+    std::uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_le_u32(output, bits);
+}
+
+void append_le_u64(std::vector<std::uint8_t>& output, std::uint64_t value) {
+    for (std::int32_t i = 0; i < 8; ++i) {
+        output.push_back(static_cast<std::uint8_t>(
+            (value >> (LCQI_TEST_BYTE_BITS * i)) & LCQI_BYTE_MASK));
+    }
+}
+
+void append_le_i64(std::vector<std::uint8_t>& output, std::int64_t value) {
+    std::uint64_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    append_le_u64(output, bits);
+}
+
+void append_gguf_string(std::vector<std::uint8_t>& output, const std::string& text) {
+    append_le_u64(output, static_cast<std::uint64_t>(text.size()));
+    output.insert(output.end(), text.begin(), text.end());
 }
 
 void append_le_f32(std::vector<std::uint8_t>& output, float value) {
@@ -255,6 +299,108 @@ void write_text_file(const std::filesystem::path& path, const std::string& text)
         throw std::runtime_error("cannot create text fixture");
     }
     output << text;
+}
+
+std::vector<std::uint8_t> make_q4_k_test_block() {
+    std::vector<std::uint8_t> block(
+        static_cast<std::size_t>(lcqi::LCQI_Q4_K_BLOCK_BYTES),
+        0);
+    block[0] = 0x00U;
+    block[1] = 0x38U;
+    block[2] = 0x00U;
+    block[3] = 0x34U;
+
+    std::array<std::uint8_t, static_cast<std::size_t>(lcqi::LCQI_Q4_K_SUBBLOCKS)> scales{
+        1, 2, 3, 4, 5, 6, 7, 8,
+    };
+    std::array<std::uint8_t, static_cast<std::size_t>(lcqi::LCQI_Q4_K_SUBBLOCKS)> mins{
+        1, 1, 2, 2, 3, 3, 4, 4,
+    };
+    for (std::size_t index = 0; index < 4; ++index) {
+        block[4 + index] = static_cast<std::uint8_t>(
+            (scales[index] & 0x3FU) | ((scales[index + 4] >> 4U) << 6U));
+        block[8 + index] = static_cast<std::uint8_t>(
+            (mins[index] & 0x3FU) | ((mins[index + 4] >> 4U) << 6U));
+        block[12 + index] = static_cast<std::uint8_t>(
+            (scales[index + 4] & 0x0FU) | ((mins[index + 4] & 0x0FU) << 4U));
+    }
+
+    for (std::int32_t pair = 0; pair < 4; ++pair) {
+        const std::int32_t low_subblock = pair * 2;
+        const std::int32_t high_subblock = low_subblock + 1;
+        for (std::int32_t index = 0; index < lcqi::LCQI_Q4_K_SUBBLOCK_VALUES; ++index) {
+            const std::uint8_t low = static_cast<std::uint8_t>(
+                (low_subblock + index) & 0x0F);
+            const std::uint8_t high = static_cast<std::uint8_t>(
+                (high_subblock + index + 1) & 0x0F);
+            block[static_cast<std::size_t>(16 + pair * 32 + index)] =
+                static_cast<std::uint8_t>(low | (high << 4U));
+        }
+    }
+    return block;
+}
+
+std::vector<float> expected_q4_k_test_values() {
+    const std::array<float, static_cast<std::size_t>(lcqi::LCQI_Q4_K_SUBBLOCKS)> scales{
+        1, 2, 3, 4, 5, 6, 7, 8,
+    };
+    const std::array<float, static_cast<std::size_t>(lcqi::LCQI_Q4_K_SUBBLOCKS)> mins{
+        1, 1, 2, 2, 3, 3, 4, 4,
+    };
+    std::vector<float> values(
+        static_cast<std::size_t>(lcqi::LCQI_QK_K_BLOCK_VALUES),
+        0.0F);
+    for (std::int32_t subblock = 0; subblock < lcqi::LCQI_Q4_K_SUBBLOCKS; ++subblock) {
+        for (std::int32_t index = 0; index < lcqi::LCQI_Q4_K_SUBBLOCK_VALUES; ++index) {
+            const std::int32_t quantized =
+                (subblock % 2 == 0)
+                    ? ((subblock + index) & 0x0F)
+                    : ((subblock + index + 1) & 0x0F);
+            values[static_cast<std::size_t>(
+                subblock * lcqi::LCQI_Q4_K_SUBBLOCK_VALUES + index)] =
+                LCQI_Q4K_TEST_BLOCK_SCALE * scales[static_cast<std::size_t>(subblock)] *
+                    static_cast<float>(quantized) -
+                LCQI_Q4K_TEST_BLOCK_MIN * mins[static_cast<std::size_t>(subblock)];
+        }
+    }
+    return values;
+}
+
+void write_gguf_q4_k_fixture(const std::filesystem::path& path) {
+    std::vector<std::uint8_t> bytes;
+    bytes.push_back('G');
+    bytes.push_back('G');
+    bytes.push_back('U');
+    bytes.push_back('F');
+    append_le_u32(bytes, LCQI_GGUF_TEST_VERSION);
+    append_le_i64(bytes, LCQI_GGUF_TEST_TENSOR_COUNT);
+    append_le_i64(bytes, LCQI_GGUF_TEST_METADATA_COUNT);
+
+    append_gguf_string(bytes, "general.alignment");
+    append_le_i32(bytes, LCQI_GGUF_TYPE_UINT32);
+    append_le_u32(bytes, LCQI_GGUF_TEST_ALIGNMENT);
+    append_gguf_string(bytes, "general.architecture");
+    append_le_i32(bytes, LCQI_GGUF_TYPE_STRING);
+    append_gguf_string(bytes, "lcqi-test");
+
+    append_gguf_string(bytes, "blk.0.ffn_up.weight");
+    append_le_u32(bytes, 2);
+    append_le_i64(bytes, lcqi::LCQI_QK_K_BLOCK_VALUES);
+    append_le_i64(bytes, 1);
+    append_le_i32(bytes, LCQI_GGUF_TENSOR_TYPE_Q4_K);
+    append_le_u64(bytes, LCQI_GGUF_TEST_TENSOR_OFFSET);
+    while (bytes.size() % LCQI_GGUF_TEST_ALIGNMENT != 0) {
+        bytes.push_back(0);
+    }
+    const std::vector<std::uint8_t> block = make_q4_k_test_block();
+    bytes.insert(bytes.end(), block.begin(), block.end());
+
+    std::ofstream output(path, std::ios::binary);
+    if (!output) {
+        throw std::runtime_error("cannot create GGUF fixture");
+    }
+    output.write(reinterpret_cast<const char*>(bytes.data()),
+                 static_cast<std::streamsize>(bytes.size()));
 }
 
 void write_tiny_gpt2_safetensors(const std::filesystem::path& path,
@@ -483,6 +629,65 @@ void test_safetensors_reads_float_tensors() {
     require_close(f16[1], -2.0F, "safetensors F16 value 1 mismatch");
     require_close(bf16[0], 1.5F, "safetensors BF16 value 0 mismatch");
     require_close(bf16[1], -0.5F, "safetensors BF16 value 1 mismatch");
+}
+
+void test_gguf_manifest_reads_q4_k_tensor() {
+    const std::filesystem::path path = temp_file_path("lcqi_q4_k_fixture.gguf");
+    write_gguf_q4_k_fixture(path);
+
+    const lcqi::GgufManifest manifest = lcqi::load_gguf_manifest(path);
+    const lcqi::GgufTensorInfo* tensor =
+        manifest.find_tensor("blk.0.ffn_up.weight");
+    require(tensor != nullptr, "GGUF Q4_K tensor missing");
+    const std::vector<std::uint8_t> bytes =
+        lcqi::read_gguf_tensor_bytes(path, *tensor);
+    std::filesystem::remove(path);
+
+    require(manifest.version == LCQI_GGUF_TEST_VERSION, "GGUF version mismatch");
+    require(manifest.alignment == LCQI_GGUF_TEST_ALIGNMENT, "GGUF alignment mismatch");
+    require(manifest.metadata.size() == LCQI_GGUF_TEST_METADATA_COUNT,
+            "GGUF metadata count mismatch");
+    require(manifest.tensors.size() == LCQI_GGUF_TEST_TENSOR_COUNT,
+            "GGUF tensor count mismatch");
+    require(tensor->type == lcqi::GgmlType::q4_k, "GGUF tensor type mismatch");
+    require(tensor->shape == std::vector<std::int64_t>({lcqi::LCQI_QK_K_BLOCK_VALUES, 1}),
+            "GGUF tensor shape mismatch");
+    require(tensor->byte_size == lcqi::LCQI_Q4_K_BLOCK_BYTES,
+            "GGUF tensor byte size mismatch");
+    require(bytes == make_q4_k_test_block(), "GGUF tensor payload mismatch");
+}
+
+void test_q4_k_dequant_and_dot_paths() {
+    const std::vector<std::uint8_t> block = make_q4_k_test_block();
+    const std::vector<float> expected = expected_q4_k_test_values();
+    const std::vector<float> decoded =
+        lcqi::dequantize_q4_k(block, lcqi::LCQI_QK_K_BLOCK_VALUES);
+
+    require(decoded.size() == expected.size(), "Q4_K decoded size mismatch");
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        require_close(decoded[index], expected[index], "Q4_K decoded value mismatch");
+    }
+
+    std::vector<float> input(expected.size(), 0.0F);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] = static_cast<float>(static_cast<std::int32_t>(index % 11U) - 5) *
+                       0.125F;
+    }
+    float expected_dot = 0.0F;
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        expected_dot += expected[index] * input[index];
+    }
+    const float q4_f32_dot = lcqi::dot_q4_k_f32(block, input);
+    require_close(q4_f32_dot, expected_dot, "Q4_K F32 dot mismatch");
+
+    const std::vector<lcqi::Q8KBlock> q8_input = lcqi::quantize_q8_k_input(input);
+    const float q4_q8_dot = lcqi::dot_q4_k_q8(block, q8_input);
+    require(std::fabs(q4_q8_dot - q4_f32_dot) <= LCQI_Q4K_Q8_DIFF_LIMIT,
+            "Q4_K Q8 dot drift is too large");
+
+    std::vector<float> matvec_output(1, 0.0F);
+    lcqi::matvec_q4_k_q8(block, 1, lcqi::LCQI_QK_K_BLOCK_VALUES, q8_input, matvec_output);
+    require_close(matvec_output[0], q4_q8_dot, "Q4_K Q8 matvec mismatch");
 }
 
 void test_gpt2_tiny_forward_and_generation() {
@@ -955,6 +1160,8 @@ int main() {
         test_safetensors_rejects_bad_offsets();
         test_safetensors_rejects_bad_dtype_shape_size();
         test_safetensors_reads_float_tensors();
+        test_gguf_manifest_reads_q4_k_tensor();
+        test_q4_k_dequant_and_dot_paths();
         test_gpt2_tiny_forward_and_generation();
         test_gpt2_byte_bpe_tokenizer();
         test_gpt2_loads_hf_style_tiny_checkpoint();
