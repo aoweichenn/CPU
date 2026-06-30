@@ -25,7 +25,9 @@ LLAMA_SIMPLE_TARGET = "llama-simple"
 LLAMA_BENCH_TARGET = "llama-bench"
 LLAMA_TOKENIZE_TARGET = "llama-tokenize"
 LCQI_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT"
+LCQI_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT"
 LCQI_Q4_DIRECT_OFF = "0"
+LCQI_GGML_DIRECT_ON = "1"
 LCQI_SUMMARY_KEYS = [
     "benchmark_load_ms",
     "benchmark_prefill_ms",
@@ -48,9 +50,14 @@ LCQI_SUMMARY_KEYS = [
     "benchmark_hotspot_w_down_ms",
     "benchmark_hotspot_lm_head_ms",
     "benchmark_hotspot_q4_k_direct_ms",
+    "benchmark_hotspot_ggml_direct_ms",
     "benchmark_hotspot_f32_fallback_ms",
     "benchmark_hotspot_q4_k_direct_calls",
+    "benchmark_hotspot_ggml_direct_calls",
     "benchmark_hotspot_f32_fallback_calls",
+    "benchmark_q4_k_direct_tensors",
+    "benchmark_ggml_direct_tensors",
+    "benchmark_f32_fallback_tensors",
 ]
 
 
@@ -197,6 +204,7 @@ def parse_lcqi_metrics(stdout: str) -> dict[str, str]:
             "benchmark_fallback_dequantized_weight_bytes",
             "benchmark_tensors_loaded",
             "benchmark_q4_k_direct_tensors",
+            "benchmark_ggml_direct_tensors",
             "benchmark_f32_fallback_tensors",
             "benchmark_hotspot_rms_norm_ms",
             "benchmark_hotspot_attention_ms",
@@ -210,8 +218,10 @@ def parse_lcqi_metrics(stdout: str) -> dict[str, str]:
             "benchmark_hotspot_w_down_ms",
             "benchmark_hotspot_lm_head_ms",
             "benchmark_hotspot_q4_k_direct_ms",
+            "benchmark_hotspot_ggml_direct_ms",
             "benchmark_hotspot_f32_fallback_ms",
             "benchmark_hotspot_q4_k_direct_calls",
+            "benchmark_hotspot_ggml_direct_calls",
             "benchmark_hotspot_f32_fallback_calls",
         }:
             metrics[key] = value.strip()
@@ -648,6 +658,7 @@ def write_report(
     max_new_tokens: int,
     lcqi_runs: list[CommandResult],
     lcqi_q4_direct_off_runs: list[CommandResult],
+    lcqi_ggml_direct_runs: list[CommandResult],
     llama_tokenize: CommandResult,
     llama_simple_runs: list[CommandResult],
     llama_bench: CommandResult,
@@ -704,6 +715,13 @@ def write_report(
         LCQI_SUMMARY_KEYS,
     ))
     lines.append("")
+    if lcqi_ggml_direct_runs:
+        lines.extend(format_summary(
+            "lcqi_ggml_direct_experimental_same_input",
+            lcqi_ggml_direct_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
     lines.extend(format_summary(
         "llama_simple_same_input",
         llama_simple_runs,
@@ -727,9 +745,17 @@ def write_report(
         llama_simple_runs,
         llama_bench,
         lcqi_q4_direct_off_runs,
+        lcqi_ggml_direct_runs,
     )
 
-    for run in lcqi_q4_direct_off_runs + lcqi_runs + [llama_tokenize] + llama_simple_runs + [llama_bench]:
+    for run in (
+        lcqi_q4_direct_off_runs +
+        lcqi_runs +
+        lcqi_ggml_direct_runs +
+        [llama_tokenize] +
+        llama_simple_runs +
+        [llama_bench]
+    ):
         lines.extend(
             [
                 "",
@@ -761,6 +787,7 @@ def add_ratio_summary(
     llama_simple_runs: list[CommandResult],
     llama_bench: CommandResult,
     lcqi_q4_direct_off_runs: list[CommandResult],
+    lcqi_ggml_direct_runs: list[CommandResult],
 ) -> None:
     lcqi_prompt_tokens = median_metric(lcqi_runs, "benchmark_prompt_tokens")
     lcqi_prompt_ids = lcqi_runs[0].metrics.get("prompt_ids") if lcqi_runs else None
@@ -796,17 +823,19 @@ def add_ratio_summary(
     if lcqi_direct_share is not None:
         lines.append(f"lcqi_direct_quantized_weight_byte_share={lcqi_direct_share:.6f}")
     add_lcqi_ab_ratios(lines, lcqi_q4_direct_off_runs, lcqi_runs)
+    add_lcqi_ggml_experimental_ratios(lines, lcqi_runs, lcqi_ggml_direct_runs)
     if bench_pp_tps is not None:
         lines.append(f"llama_bench_same_token_count_prefill_tps={bench_pp_tps:.6f}")
     if bench_tg_tps is not None:
         lines.append(f"llama_bench_same_token_count_decode_tps={bench_tg_tps:.6f}")
     lines.append(
-        "root_cause=LCQI now keeps the shape-compatible Q4_K matrices in a direct "
-        "quantized matvec path, but most SmolLM2 matrices still fall back to "
-        "dequantized f32 and prefill still runs one token at a time. llama.cpp "
-        "keeps more quantized block weights in the execution path, batches prompt "
-        "evaluation, uses ggml graph scheduling and tuned CPU kernels, and stores "
-        "KV cache more compactly."
+        "root_cause=LCQI keeps shape-compatible Q4_K matrices in the default direct "
+        "quantized path. The experimental Q5_0/Q6_K/Q8_0 direct path increases "
+        "quantized-byte coverage, but its current scalar block kernels are slower "
+        "than the dequantized f32 AVX2 fallback, so it is not enabled by default. "
+        "llama.cpp batches prompt evaluation, uses ggml graph scheduling, tuned "
+        "low-bit CPU kernels, prefetch/thread scheduling, and more compact "
+        "KV/cache execution."
     )
 
 
@@ -835,6 +864,39 @@ def add_lcqi_ab_ratios(
         lines.append(f"lcqi_q4_direct_f32_weight_bytes_saved={off_f32_bytes - on_f32_bytes:.0f}")
 
 
+def add_lcqi_ggml_experimental_ratios(
+    lines: list[str],
+    lcqi_runs: list[CommandResult],
+    lcqi_ggml_direct_runs: list[CommandResult],
+) -> None:
+    if not lcqi_ggml_direct_runs:
+        return
+    default_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    ggml_prefill = median_metric(lcqi_ggml_direct_runs, "benchmark_prefill_ms")
+    default_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    ggml_decode = median_metric(lcqi_ggml_direct_runs, "derived_decode_ms_per_step")
+    default_direct_share = median_metric(lcqi_runs, "derived_direct_quantized_weight_byte_share")
+    ggml_direct_share = median_metric(lcqi_ggml_direct_runs, "derived_direct_quantized_weight_byte_share")
+    ggml_hotspot = median_metric(lcqi_ggml_direct_runs, "benchmark_hotspot_ggml_direct_ms")
+    if default_prefill is not None and ggml_prefill is not None and ggml_prefill > 0.0:
+        lines.append(
+            "lcqi_ggml_experimental_prefill_speedup_default_over_experimental="
+            f"{default_prefill / ggml_prefill:.6f}"
+        )
+    if default_decode is not None and ggml_decode is not None and ggml_decode > 0.0:
+        lines.append(
+            "lcqi_ggml_experimental_decode_step_speedup_default_over_experimental="
+            f"{default_decode / ggml_decode:.6f}"
+        )
+    if default_direct_share is not None and ggml_direct_share is not None:
+        lines.append(
+            "lcqi_ggml_experimental_direct_share_delta="
+            f"{ggml_direct_share - default_direct_share:.6f}"
+        )
+    if ggml_hotspot is not None:
+        lines.append(f"lcqi_ggml_experimental_hotspot_ms={ggml_hotspot:.6f}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Run same-input SmolLM2 comparison between LCQI and llama.cpp."
@@ -852,6 +914,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--skip-llama-build", action="store_true")
     parser.add_argument("--include-lcqi-q4-direct-off", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-lcqi-ggml-direct", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -890,6 +953,7 @@ def main() -> int:
 
         lcqi_q4_direct_off_runs: list[CommandResult] = []
         lcqi_runs: list[CommandResult] = []
+        lcqi_ggml_direct_runs: list[CommandResult] = []
         llama_simple_runs: list[CommandResult] = []
         for round_index in range(1, args.rounds + 1):
             if args.include_lcqi_q4_direct_off:
@@ -922,6 +986,24 @@ def main() -> int:
                 )
             )
             ensure_success(lcqi_runs[-1], "run LCQI same-input round")
+            if args.include_lcqi_ggml_direct:
+                print(f"[lcqi-same-input] LCQI GGML direct experimental round {round_index}/{args.rounds}")
+                lcqi_ggml_direct_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_ggml_direct_experimental_round",
+                        env={LCQI_GGML_DIRECT_ENV: LCQI_GGML_DIRECT_ON},
+                    )
+                )
+                ensure_success(
+                    lcqi_ggml_direct_runs[-1],
+                    "run LCQI GGML direct experimental same-input round",
+                )
             print(f"[lcqi-same-input] llama-simple round {round_index}/{args.rounds}")
             llama_simple_runs.append(
                 run_llama_simple_round(
@@ -964,6 +1046,7 @@ def main() -> int:
             max_new_tokens=args.max_new,
             lcqi_runs=lcqi_runs,
             lcqi_q4_direct_off_runs=lcqi_q4_direct_off_runs,
+            lcqi_ggml_direct_runs=lcqi_ggml_direct_runs,
             llama_tokenize=llama_tokenize,
             llama_simple_runs=llama_simple_runs,
             llama_bench=llama_bench,

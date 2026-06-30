@@ -1,5 +1,6 @@
 #include <lcqi/gpt2_reference.hpp>
 #include <lcqi/f32_kernels.hpp>
+#include <lcqi/ggml_matvec.hpp>
 #include <lcqi/ggml_tensors.hpp>
 #include <lcqi/gguf.hpp>
 #include <lcqi/inference.hpp>
@@ -98,6 +99,8 @@ constexpr std::uint64_t LCQI_GGUF_TEST_TENSOR_OFFSET = 0;
 constexpr float LCQI_Q4K_TEST_BLOCK_SCALE = 0.5F;
 constexpr float LCQI_Q4K_TEST_BLOCK_MIN = 0.25F;
 constexpr float LCQI_Q4K_Q8_DIFF_LIMIT = 0.08F;
+constexpr float LCQI_GGML_MATVEC_MAX_DIFF = 1.0e-4F;
+constexpr float LCQI_GGML_Q8_MATVEC_MAX_DIFF = 0.2F;
 constexpr std::int32_t LCQI_GGML_TEST_Q5_HALF_VALUES = 16;
 constexpr std::int32_t LCQI_GGML_TEST_Q5_ZERO_POINT = 16;
 constexpr std::int32_t LCQI_GGML_TEST_Q6_LANE = 5;
@@ -120,6 +123,8 @@ constexpr std::int32_t LCQI_LLAMA_Q4_TEST_INTERMEDIATE = 256;
 constexpr std::int32_t LCQI_LLAMA_Q4_TEST_VOCAB = 2;
 constexpr std::int32_t LCQI_LLAMA_Q4_TEST_CONTEXT = 4;
 constexpr std::int32_t LCQI_LLAMA_Q4_TEST_LAYER_COUNT = 1;
+constexpr const char* LCQI_TEST_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
+constexpr const char* LCQI_TEST_TRUE_ENV = "1";
 
 struct KernelShapeCase {
     std::int32_t input_size = 0;
@@ -146,6 +151,34 @@ struct GgufTensorFixture {
     lcqi::GgmlType type = lcqi::GgmlType::f32;
     std::vector<std::uint8_t> bytes;
     std::uint64_t relative_offset = 0;
+};
+
+struct ScopedEnvVar {
+    std::string name;
+    std::string old_value;
+    bool had_old_value = false;
+
+    ScopedEnvVar(const char* env_name, const char* value) : name(env_name) {
+        const char* old = std::getenv(env_name);
+        if (old != nullptr) {
+            this->old_value = old;
+            this->had_old_value = true;
+        }
+        if (setenv(env_name, value, 1) != 0) {
+            throw std::runtime_error("failed to set test environment variable");
+        }
+    }
+
+    ScopedEnvVar(const ScopedEnvVar&) = delete;
+    ScopedEnvVar& operator=(const ScopedEnvVar&) = delete;
+
+    ~ScopedEnvVar() {
+        if (this->had_old_value) {
+            static_cast<void>(setenv(this->name.c_str(), this->old_value.c_str(), 1));
+        } else {
+            static_cast<void>(unsetenv(this->name.c_str()));
+        }
+    }
 };
 
 constexpr std::array<KernelShapeCase, 4> LCQI_KERNEL_SHAPE_CASES{{
@@ -659,6 +692,34 @@ void add_gguf_q4_k_tensor(std::vector<GgufTensorFixture>& tensors,
     });
 }
 
+void add_gguf_quantized_tensor(std::vector<GgufTensorFixture>& tensors,
+                               std::string name,
+                               std::vector<std::int64_t> shape,
+                               lcqi::GgmlType type,
+                               const std::vector<std::uint8_t>& bytes) {
+    tensors.push_back(GgufTensorFixture{
+        std::move(name),
+        std::move(shape),
+        type,
+        bytes,
+        0,
+    });
+}
+
+std::vector<std::uint8_t> repeated_ggml_block(const std::vector<std::uint8_t>& block,
+                                              std::int32_t input_size,
+                                              std::int32_t output_size,
+                                              std::int64_t block_values) {
+    const std::size_t block_count =
+        static_cast<std::size_t>((input_size / block_values) * output_size);
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(block.size() * block_count);
+    for (std::size_t index = 0; index < block_count; ++index) {
+        bytes.insert(bytes.end(), block.begin(), block.end());
+    }
+    return bytes;
+}
+
 void write_tiny_llama_gguf_fixture(const std::filesystem::path& path) {
     std::vector<std::uint8_t> metadata;
     append_gguf_uint32_metadata(metadata, "general.alignment", LCQI_GGUF_TEST_ALIGNMENT);
@@ -743,6 +804,106 @@ void write_tiny_llama_gguf_fixture(const std::filesystem::path& path) {
                         "blk.0.ffn_down.weight",
                         {LCQI_LLAMA_TEST_INTERMEDIATE, LCQI_LLAMA_TEST_HIDDEN},
                         intermediate_to_hidden);
+    write_gguf_fixture(path, tensors, metadata);
+}
+
+void write_tiny_llama_ggml_direct_gguf_fixture(const std::filesystem::path& path) {
+    std::vector<std::uint8_t> metadata;
+    append_gguf_uint32_metadata(metadata, "general.alignment", LCQI_GGUF_TEST_ALIGNMENT);
+    append_gguf_string_metadata(metadata, "general.architecture", "llama");
+    append_gguf_string_metadata(metadata, "general.name", "lcqi ggml direct tiny llama");
+    append_gguf_uint32_metadata(metadata, "llama.embedding_length", LCQI_LLAMA_Q4_TEST_HIDDEN);
+    append_gguf_uint32_metadata(metadata, "llama.block_count", LCQI_LLAMA_Q4_TEST_LAYER_COUNT);
+    append_gguf_uint32_metadata(metadata,
+                                "llama.feed_forward_length",
+                                LCQI_LLAMA_Q4_TEST_INTERMEDIATE);
+    append_gguf_uint32_metadata(metadata, "llama.attention.head_count", LCQI_LLAMA_Q4_TEST_HEADS);
+    append_gguf_uint32_metadata(metadata,
+                                "llama.attention.head_count_kv",
+                                LCQI_LLAMA_Q4_TEST_KV_HEADS);
+    append_gguf_uint32_metadata(metadata,
+                                "llama.rope.dimension_count",
+                                LCQI_LLAMA_Q4_TEST_HEAD_DIM);
+    append_gguf_float32_metadata(metadata, "llama.rope.freq_base", 10000.0F);
+    append_gguf_uint32_metadata(metadata, "llama.context_length", LCQI_LLAMA_Q4_TEST_CONTEXT);
+    append_gguf_uint32_metadata(metadata, "llama.vocab_size", LCQI_LLAMA_Q4_TEST_VOCAB);
+    append_gguf_float32_metadata(metadata, "llama.attention.layer_norm_rms_epsilon", 1.0e-5F);
+    append_gguf_uint32_metadata(metadata, "tokenizer.ggml.eos_token_id", 1);
+
+    std::vector<GgufTensorFixture> tensors;
+    std::vector<float> embedding(
+        static_cast<std::size_t>(LCQI_LLAMA_Q4_TEST_HIDDEN * LCQI_LLAMA_Q4_TEST_VOCAB),
+        0.0F);
+    embedding[0] = 1.0F;
+    embedding[static_cast<std::size_t>(LCQI_LLAMA_Q4_TEST_HIDDEN)] = 0.5F;
+    add_gguf_f32_tensor(tensors,
+                        "token_embd.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_VOCAB},
+                        embedding);
+    add_gguf_f32_tensor(tensors,
+                        "output_norm.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN},
+                        std::vector<float>(LCQI_LLAMA_Q4_TEST_HIDDEN, 1.0F));
+    add_gguf_f32_tensor(tensors,
+                        "blk.0.attn_norm.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN},
+                        std::vector<float>(LCQI_LLAMA_Q4_TEST_HIDDEN, 1.0F));
+    add_gguf_f32_tensor(tensors,
+                        "blk.0.ffn_norm.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN},
+                        std::vector<float>(LCQI_LLAMA_Q4_TEST_HIDDEN, 1.0F));
+
+    const std::vector<std::uint8_t> q5_matrix = repeated_ggml_block(
+        std::vector<std::uint8_t>(static_cast<std::size_t>(lcqi::LCQI_Q5_0_BLOCK_BYTES), 0),
+        LCQI_LLAMA_Q4_TEST_HIDDEN,
+        LCQI_LLAMA_Q4_TEST_HIDDEN,
+        lcqi::LCQI_Q5_0_BLOCK_VALUES);
+    const std::vector<std::uint8_t> q8_matrix = repeated_ggml_block(
+        std::vector<std::uint8_t>(static_cast<std::size_t>(lcqi::LCQI_Q8_0_BLOCK_BYTES), 0),
+        LCQI_LLAMA_Q4_TEST_HIDDEN,
+        LCQI_LLAMA_Q4_TEST_HIDDEN,
+        lcqi::LCQI_Q8_0_BLOCK_VALUES);
+    const std::vector<std::uint8_t> q6_matrix = repeated_ggml_block(
+        std::vector<std::uint8_t>(static_cast<std::size_t>(lcqi::LCQI_Q6_K_BLOCK_BYTES), 0),
+        LCQI_LLAMA_Q4_TEST_INTERMEDIATE,
+        LCQI_LLAMA_Q4_TEST_HIDDEN,
+        lcqi::LCQI_Q6_K_BLOCK_VALUES);
+
+    add_gguf_quantized_tensor(tensors,
+                              "blk.0.attn_q.weight",
+                              {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HIDDEN},
+                              lcqi::GgmlType::q5_0,
+                              q5_matrix);
+    add_gguf_quantized_tensor(tensors,
+                              "blk.0.attn_k.weight",
+                              {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HEAD_DIM},
+                              lcqi::GgmlType::q5_0,
+                              q5_matrix);
+    add_gguf_quantized_tensor(tensors,
+                              "blk.0.attn_v.weight",
+                              {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HEAD_DIM},
+                              lcqi::GgmlType::q8_0,
+                              q8_matrix);
+    add_gguf_quantized_tensor(tensors,
+                              "blk.0.attn_output.weight",
+                              {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HIDDEN},
+                              lcqi::GgmlType::q5_0,
+                              q5_matrix);
+    add_gguf_quantized_tensor(tensors,
+                              "blk.0.ffn_gate.weight",
+                              {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_INTERMEDIATE},
+                              lcqi::GgmlType::q5_0,
+                              q5_matrix);
+    add_gguf_quantized_tensor(tensors,
+                              "blk.0.ffn_up.weight",
+                              {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_INTERMEDIATE},
+                              lcqi::GgmlType::q8_0,
+                              q8_matrix);
+    add_gguf_quantized_tensor(tensors,
+                              "blk.0.ffn_down.weight",
+                              {LCQI_LLAMA_Q4_TEST_INTERMEDIATE, LCQI_LLAMA_Q4_TEST_HIDDEN},
+                              lcqi::GgmlType::q6_k,
+                              q6_matrix);
     write_gguf_fixture(path, tensors, metadata);
 }
 
@@ -1164,6 +1325,97 @@ void test_ggml_mixed_dequantizers() {
     require(rejected_bad_size, "GGML dequantizer accepted a truncated Q8_0 block");
 }
 
+void test_ggml_quantized_f32_matvec_paths() {
+    const std::vector<float> input32 = [] {
+        std::vector<float> values(static_cast<std::size_t>(lcqi::LCQI_Q8_0_BLOCK_VALUES), 0.0F);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] =
+                static_cast<float>(static_cast<std::int32_t>(index % 9U) - 4) * 0.125F;
+        }
+        return values;
+    }();
+    const std::vector<float> input256 = [] {
+        std::vector<float> values(static_cast<std::size_t>(lcqi::LCQI_Q6_K_BLOCK_VALUES), 0.0F);
+        for (std::size_t index = 0; index < values.size(); ++index) {
+            values[index] =
+                static_cast<float>(static_cast<std::int32_t>(index % 13U) - 6) * 0.0625F;
+        }
+        return values;
+    }();
+
+    const auto assert_matvec_matches_dequantized =
+        [](lcqi::GgmlType type,
+           const std::vector<std::uint8_t>& block,
+           std::span<const float> input,
+           const char* message) {
+            const std::int64_t columns = static_cast<std::int64_t>(input.size());
+            const std::vector<std::uint8_t> matrix = [&] {
+                std::vector<std::uint8_t> bytes;
+                bytes.reserve(block.size() * 2U);
+                bytes.insert(bytes.end(), block.begin(), block.end());
+                bytes.insert(bytes.end(), block.begin(), block.end());
+                return bytes;
+            }();
+            std::vector<float> direct(2, 0.0F);
+            lcqi::matvec_ggml_quantized_f32(type, matrix, 2, columns, input, direct);
+            const std::vector<lcqi::Q8_0InputBlock> q8_0_input =
+                lcqi::quantize_q8_0_input(input);
+            std::vector<float> q8_0_direct(2, 0.0F);
+            lcqi::matvec_ggml_quantized_q8_0(type,
+                                             matrix,
+                                             2,
+                                             columns,
+                                             q8_0_input,
+                                             q8_0_direct);
+            const std::vector<float> weights =
+                lcqi::dequantize_ggml_tensor(type, matrix, columns * 2);
+            std::array<float, 2> reference{0.0F, 0.0F};
+            for (std::size_t row = 0; row < reference.size(); ++row) {
+                for (std::size_t column = 0; column < input.size(); ++column) {
+                    reference[row] +=
+                        weights[row * input.size() + column] * input[column];
+                }
+                if (std::fabs(reference[row] - direct[row]) > LCQI_GGML_MATVEC_MAX_DIFF) {
+                    throw std::runtime_error(message);
+                }
+                if (std::fabs(reference[row] - q8_0_direct[row]) >
+                    LCQI_GGML_Q8_MATVEC_MAX_DIFF) {
+                    throw std::runtime_error(message);
+                }
+            }
+        };
+
+    require(lcqi::ggml_type_has_f32_direct_matvec(lcqi::GgmlType::q5_0),
+            "Q5_0 direct matvec support flag mismatch");
+    require(lcqi::ggml_type_has_f32_direct_matvec(lcqi::GgmlType::q6_k),
+            "Q6_K direct matvec support flag mismatch");
+    require(lcqi::ggml_type_has_f32_direct_matvec(lcqi::GgmlType::q8_0),
+            "Q8_0 direct matvec support flag mismatch");
+    require(!lcqi::ggml_type_has_f32_direct_matvec(lcqi::GgmlType::f32),
+            "F32 should not be reported as quantized direct matvec");
+    require(lcqi::ggml_type_has_q8_0_direct_matvec(lcqi::GgmlType::q5_0),
+            "Q5_0 Q8_0 direct matvec support flag mismatch");
+    require(lcqi::ggml_type_has_q8_0_direct_matvec(lcqi::GgmlType::q6_k),
+            "Q6_K Q8_0 direct matvec support flag mismatch");
+    require(lcqi::ggml_type_has_q8_0_direct_matvec(lcqi::GgmlType::q8_0),
+            "Q8_0 Q8_0 direct matvec support flag mismatch");
+    require(!lcqi::ggml_type_has_q8_0_direct_matvec(lcqi::GgmlType::f32),
+            "F32 should not be reported as Q8_0 quantized direct matvec");
+
+    assert_matvec_matches_dequantized(lcqi::GgmlType::q8_0,
+                                      make_q8_0_test_block(),
+                                      input32,
+                                      "Q8_0 direct matvec mismatch");
+    assert_matvec_matches_dequantized(lcqi::GgmlType::q5_0,
+                                      make_q5_0_test_block(),
+                                      input32,
+                                      "Q5_0 direct matvec mismatch");
+    assert_matvec_matches_dequantized(lcqi::GgmlType::q6_k,
+                                      make_q6_k_test_block(),
+                                      input256,
+                                      "Q6_K direct matvec mismatch");
+}
+
 void test_llama_gguf_loader_and_generation() {
     const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_fixture.gguf");
     write_tiny_llama_gguf_fixture(path);
@@ -1191,10 +1443,14 @@ void test_llama_gguf_loader_and_generation() {
             "LLaMA GGUF F32 fixture byte accounting mismatch");
     require(loaded.report.q4_k_direct_tensors == 0,
             "LLaMA GGUF F32 fixture should not use direct Q4_K tensors");
+    require(loaded.report.ggml_direct_tensors == 0,
+            "LLaMA GGUF F32 fixture should not use direct GGML tensors");
     require(result.hotspots.f32_fallback_calls == 7,
             "LLaMA GGUF F32 fixture linear fallback call count mismatch");
     require(result.hotspots.q4_k_direct_calls == 0,
             "LLaMA GGUF F32 fixture should not call Q4_K direct matvec");
+    require(result.hotspots.ggml_direct_calls == 0,
+            "LLaMA GGUF F32 fixture should not call GGML direct matvec");
 }
 
 void test_llama_gguf_q4_direct_generation() {
@@ -1213,6 +1469,8 @@ void test_llama_gguf_q4_direct_generation() {
     require(loaded.report.tensors_loaded == 11, "LLaMA Q4_K fixture tensor load count mismatch");
     require(loaded.report.q4_k_direct_tensors == 7,
             "LLaMA Q4_K fixture direct tensor count mismatch");
+    require(loaded.report.ggml_direct_tensors == 0,
+            "LLaMA Q4_K fixture should not use GGML direct tensors");
     require(loaded.report.f32_fallback_tensors == 4,
             "LLaMA Q4_K fixture fallback tensor count mismatch");
     require(loaded.report.direct_quantized_weight_bytes >
@@ -1220,10 +1478,44 @@ void test_llama_gguf_q4_direct_generation() {
             "LLaMA Q4_K fixture should keep direct quantized matrix bytes");
     require(result.hotspots.q4_k_direct_calls == 7,
             "LLaMA Q4_K fixture direct matvec call count mismatch");
+    require(result.hotspots.ggml_direct_calls == 0,
+            "LLaMA Q4_K fixture should not call GGML direct matvec");
     require(result.hotspots.f32_fallback_calls == 0,
             "LLaMA Q4_K fixture should not call fallback linear matvec");
     require(result.generated_ids == std::vector<std::int32_t>({0, 0}),
             "LLaMA Q4_K fixture generated ids mismatch");
+}
+
+void test_llama_gguf_ggml_direct_generation() {
+    const ScopedEnvVar enable_ggml_direct(LCQI_TEST_LLAMA_GGML_DIRECT_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_ggml_direct.gguf");
+    write_tiny_llama_ggml_direct_gguf_fixture(path);
+
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{0};
+    const lcqi::LlamaGgufGenerationResult result =
+        lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+    std::filesystem::remove(path);
+
+    require(loaded.model.decoder.config.hidden_size == LCQI_LLAMA_Q4_TEST_HIDDEN,
+            "LLaMA GGML fixture hidden size mismatch");
+    require(loaded.report.tensors_loaded == 11, "LLaMA GGML fixture tensor load count mismatch");
+    require(loaded.report.q4_k_direct_tensors == 0,
+            "LLaMA GGML fixture should not use Q4_K direct tensors");
+    require(loaded.report.ggml_direct_tensors == 7,
+            "LLaMA GGML fixture direct tensor count mismatch");
+    require(loaded.report.f32_fallback_tensors == 4,
+            "LLaMA GGML fixture fallback tensor count mismatch");
+    require(result.hotspots.ggml_direct_calls == 7,
+            "LLaMA GGML fixture direct matvec call count mismatch");
+    require(result.hotspots.q4_k_direct_calls == 0,
+            "LLaMA GGML fixture should not call Q4_K direct matvec");
+    require(result.hotspots.f32_fallback_calls == 0,
+            "LLaMA GGML fixture should not call fallback linear matvec");
+    require(result.generated_ids == std::vector<std::int32_t>({0, 0}),
+            "LLaMA GGML fixture generated ids mismatch");
 }
 
 void test_gpt2_tiny_forward_and_generation() {
@@ -1699,8 +1991,10 @@ int main() {
         test_gguf_manifest_reads_q4_k_tensor();
         test_q4_k_dequant_and_dot_paths();
         test_ggml_mixed_dequantizers();
+        test_ggml_quantized_f32_matvec_paths();
         test_llama_gguf_loader_and_generation();
         test_llama_gguf_q4_direct_generation();
+        test_llama_gguf_ggml_direct_generation();
         test_gpt2_tiny_forward_and_generation();
         test_gpt2_byte_bpe_tokenizer();
         test_gpt2_loads_hf_style_tiny_checkpoint();

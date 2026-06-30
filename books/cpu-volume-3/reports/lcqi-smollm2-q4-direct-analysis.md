@@ -1,5 +1,7 @@
 # LCQI SmolLM2 Q4_K Direct Decoder Integration
 
+Status: superseded for latest numbers by `books/cpu-volume-3/reports/lcqi-smollm2-ggml-direct-analysis.md`. This file remains the historical Q4_K-direct integration note.
+
 Date: 2026-06-30
 
 Host: `caw`, Linux WSL2 x86-64, `nproc=20`.

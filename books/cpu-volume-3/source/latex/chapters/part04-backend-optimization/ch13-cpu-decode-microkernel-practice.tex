@@ -519,7 +519,7 @@ decoder block & RMSNorm、QKV、RoPE、KV、MLP、lm head & 只比较一个 line
 \end{tabular}
 \end{center}
 
-本章当前有两层真实 GGUF 证据。第一层是单算子：LCQI 可以读取 llama.cpp smoke 使用的同一个 \code{SmolLM2-135M-Instruct-Q4\_K\_M.gguf}，解析 GGUF tensor 表，选取真实 \code{Q4\_K} 矩阵，运行 \code{Q4\_K} 权重加 \code{Q8\_K} 激活的 matvec。第二层是端到端 reference path：LCQI 现在能读取同一个 GGUF 里的 tokenizer tokens/merges、\code{F32}、\code{Q8\_0}、\code{Q5\_0}、\code{Q6\_K} 和 \code{Q4\_K} 混合权重，加载 30 层 SmolLM2，执行 RMSNorm、normal RoPE、GQA KV cache、SwiGLU 和 tied lm head，并从文本 prompt 生成 token。第二层当前是 \code{f32\_dequantized\_reference}，不是高性能量化直算引擎：它的作用是给后续优化提供可复查正确性基线。
+本章当前有两层真实 GGUF 证据。第一层是单算子：LCQI 可以读取 llama.cpp smoke 使用的同一个 \code{SmolLM2-135M-Instruct-Q4\_K\_M.gguf}，解析 GGUF tensor 表，选取真实 \code{Q4\_K} 矩阵，运行 \code{Q4\_K} 权重加 \code{Q8\_K} 激活的 matvec。第二层是端到端 decoder path：LCQI 现在能读取同一个 GGUF 里的 tokenizer tokens/merges、\code{F32}、\code{Q8\_0}、\code{Q5\_0}、\code{Q6\_K} 和 \code{Q4\_K} 混合权重，加载 30 层 SmolLM2，执行 RMSNorm、normal RoPE、GQA KV cache、SwiGLU 和 tied lm head，并从文本 prompt 生成 token。默认执行路径已经把 shape 兼容的 \code{Q4\_K} linear tensor 留在 GGUF block bytes 中直接执行；\code{Q5\_0/Q6\_K/Q8\_0} direct 作为实验路径保留，用来证明“覆盖更多量化格式”本身还不等于端到端加速。
 
 caw 上的 artifact 写入第三册 results 目录中的 \filepath{lcqi-smollm2-q4-k-benchmark.txt}。这次不是换一个方便的模型单独测，而是复用 llama.cpp smoke 同一个 GGUF 文件；模型身份、文件 hash 和 pinned llama.cpp commit 必须一起进入报告，避免“文件名相同、内容不同”的假对照。
 
@@ -563,7 +563,7 @@ caw 上的完整 reference decode artifact 写入 \filepath{books/cpu-volume-3/r
 
 \begin{lstlisting}[numbers=none,caption={LCQI 自研 SmolLM2/GGUF reference decode 证据}]
 mode llama_gguf_reference
-weight_execution f32_dequantized_reference
+weight_execution gguf_mixed_q4_k_direct
 architecture llama
 model_name Smollm2 135M 8k Lc100K Mix1 Ep2
 layers 30
@@ -583,15 +583,21 @@ benchmark_prompt_tokens 31
 benchmark_generated_tokens 2
 benchmark_prefill_steps 31
 benchmark_decode_steps 1
-benchmark_first_token_tokens_per_second 0.78061
-benchmark_decode_tokens_per_second 22.1886
+benchmark_decode_tokens_per_second 64.8586
 benchmark_kv_cache_bytes 1520640
 benchmark_quantized_weight_bytes 103668480
-benchmark_f32_weight_bytes 538060032
+benchmark_f32_weight_bytes 481436928
+benchmark_direct_quantized_weight_bytes 7962624
+benchmark_q4_k_direct_tensors 16
+benchmark_ggml_direct_tensors 0
+benchmark_f32_fallback_tensors 256
+benchmark_hotspot_q4_k_direct_calls 512
+benchmark_hotspot_ggml_direct_calls 0
+benchmark_hotspot_f32_fallback_calls 6208
 benchmark_tensors_loaded 272
 \end{lstlisting}
 
-这组数只能说明 LCQI 自研路径已经能端到端生成，不能单独回答“和 llama.cpp 差多少”。严格对比必须先消除 prompt、chat template、tokenizer 和生成长度差异。因此本章又在 caw 上补了一次同输入测量，原始 artifact 写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-same-input-compare-caw.txt}，分析摘要写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-same-input-compare-analysis.md}。这次固定同一个模型文件、同一个用户 prompt \code{Hello}、同一个展开后的 SmolLM2 chat prompt、同样 \code{max-new=2}，并用 llama.cpp 的 \cmd{llama-tokenize} 证明 31 个 token id 完全一致：
+这组数只能说明 LCQI 自研路径已经能端到端生成，不能单独回答“和 llama.cpp 差多少”。严格对比必须先消除 prompt、chat template、tokenizer 和生成长度差异。因此本章在 caw 上跑同输入测量，原始 artifact 写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-ggml-direct-compare-caw.txt}。这次固定同一个模型文件、同一个用户 prompt \code{Hello}、同一个展开后的 SmolLM2 chat prompt、同样 \code{max-new=2}，并用 llama.cpp 的 \cmd{llama-tokenize} 证明 31 个 token id 完全一致：
 
 \begin{lstlisting}[numbers=none,caption={caw 同输入 LCQI 与 llama.cpp 对比证据}]
 host=caw
@@ -605,45 +611,40 @@ prompt_tokens_lcqi_median=31.0
 prompt_tokens_llama_tokenize=31.0
 same_input_prompt_token_count_match=true
 same_input_prompt_token_ids_match=true
-lcqi_prefill_ms_median=1278.470
-lcqi_prefill_tps_median=24.2477
-lcqi_decode_step_ms_median=44.6356
-lcqi_decode_tps_median=22.4037
-llama_simple_prompt_eval_ms_median=22.920
-llama_simple_prompt_eval_tps_median=1352.47
-llama_simple_eval_step_ms_median=2.840
-llama_simple_eval_tps_median=351.62
-prefill_ms_ratio_lcqi_over_llama_simple=55.779668
-decode_step_ms_ratio_lcqi_over_llama_simple=15.716761
-lcqi_f32_dequantized_weight_inflation_ratio=5.190199
-llama_bench_same_token_count_prefill_tps=1463.87
-llama_bench_same_token_count_decode_tps=508.91
-\end{lstlisting}
-
-这次同输入数据把上一轮差距拆清楚了。第一，prefill 慢约 \code{55.78x}，主要因为 LCQI 在 \code{llama\_gguf\_generate\_greedy} 中把 31 个 prompt token 逐个当 decode step 跑，没有像 llama.cpp 那样把 prompt 批量送进 graph/backend。第二，decode step 慢约 \code{15.72x}，主要因为当时 LCQI 的 GGUF 路径仍是 \code{f32\_dequantized\_reference}：加载时把 103.7 MB 量化权重解成约 538 MB f32 权重，decoder block 里的 Q/K/V、attention output、SwiGLU gate/up/down 和 tied lm head 仍走通用 f32 matvec。第三，llama.cpp 保留 GGUF 量化 block 热路径，使用 ggml graph 调度、成熟 CPU kernel、线程协调、prompt batching 和更紧凑的 KV cache。差距不是输入不一致，也不是“少一个 AVX2 指令”，而是权重表示、prompt 批处理、矩阵内核、线程调度、KV 表示和整图执行方式都还没有进入成熟引擎状态。
-
-下一步不能只停在 \code{lcqi\_gguf\_q4\_bench} 这种单算子 benchmark。因此 LCQI 把 shape 兼容的 \code{Q4\_K} linear tensor 接入了真实 \code{llama\_gguf.cpp} decoder：loader 不再把这部分权重展开成 f32，而是保存 GGUF 原始 block bytes；前向时把对应输入量化成 \code{Q8\_K} scratch，再调用 \code{matvec\_q4\_k\_q8}。不兼容的 \code{Q4\_K}、\code{Q6\_K}、\code{Q5\_0}、\code{Q8\_0} 和 \code{F32} tensor 继续走 f32 fallback。caw 上新的同输入 A/B artifact 写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-q4-direct-compare-caw.txt}，分析摘要写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-q4-direct-analysis.md}。
-
-\begin{lstlisting}[numbers=none,caption={Q4\_K direct 接入真实 decoder 后的 caw A/B 证据}]
-same_input_prompt_token_ids_match=true
-lcqi_q4_direct_off_prefill_ms_median=423.556
-lcqi_q4_direct_on_prefill_ms_median=396.926
-lcqi_q4_direct_off_decode_step_ms_median=17.2102
-lcqi_q4_direct_on_decode_step_ms_median=16.4401
-lcqi_q4_direct_off_w_down_ms_median=98.1026
-lcqi_q4_direct_on_w_down_ms_median=67.5007
-lcqi_q4_direct_prefill_speedup_off_over_on=1.067091
-lcqi_q4_direct_decode_step_speedup_off_over_on=1.046843
-lcqi_q4_direct_w_down_speedup_off_over_on=1.453357
-lcqi_q4_direct_f32_weight_bytes_saved=56623104
+lcqi_default_q4_direct_prefill_ms_median=370.847
+lcqi_default_q4_direct_decode_step_ms_median=15.4182
+llama_simple_prompt_eval_ms_median=22.840
+llama_simple_eval_step_ms_median=2.880
+prefill_ms_ratio_lcqi_over_llama_simple=16.236734
+decode_step_ms_ratio_lcqi_over_llama_simple=5.353542
 lcqi_direct_quantized_weight_byte_share=0.076809
-benchmark_hotspot_q4_k_direct_calls_median=512
-benchmark_hotspot_f32_fallback_calls_median=6208
-current_prefill_ms_ratio_lcqi_over_llama_simple=16.234192
-current_decode_step_ms_ratio_lcqi_over_llama_simple=5.252428
+lcqi_q4_direct_prefill_speedup_off_over_on=1.062411
+lcqi_q4_direct_decode_step_speedup_off_over_on=1.029835
+lcqi_q4_direct_w_down_speedup_off_over_on=1.442955
+lcqi_q4_direct_f32_weight_bytes_saved=56623104
+llama_bench_same_token_count_prefill_tps=1012.21
+llama_bench_same_token_count_decode_tps=182.94
 \end{lstlisting}
 
-这组数要保守读。和上一轮报告相比，当前 LCQI prefill 中位数从 \code{1278.47 ms} 到 \code{396.93 ms}，decode step 从 \code{44.64 ms} 到 \code{16.44 ms}；但严格归因到本次 \code{Q4\_K} direct 的同二进制 A/B，保守提升是 prefill \code{1.067x}、decode step \code{1.047x}、\code{w\_down} 热点 \code{1.453x}。原因也在报告里：这次只有 \code{7.68\%} 的加载权重字节进入 direct \code{Q4\_K} 路径，实际 direct call 是 \code{512} 次，而 f32 fallback call 仍有 \code{6208} 次。最大剩余热点仍是 f32 fallback 的 \code{w\_gate}、\code{w\_up}、attention projection 和 tied embedding \code{lm\_head}。所以这轮优化的意义不是“已经追平 llama.cpp”，而是第一次把量化 block matvec 从孤立 benchmark 接进真实 decoder，并用 caw A/B 证明它确实减少了 \code{w\_down} 和 materialized f32 权重。下一阶段如果要继续缩小 \code{16.23x}/\code{5.25x} 的差距，应优先扩大 GGUF 量化 tensor 覆盖，或做 batched prefill；继续只磨单个 \code{Q4\_K} 子块 SIMD，收益会被 fallback 路径稀释。
+这次同输入数据把差距拆清楚了。第一，prefill 仍慢约 \code{16.24x}，主要因为 LCQI 在 \code{llama\_gguf\_generate\_greedy} 中把 31 个 prompt token 逐个当 decode step 跑，没有像 llama.cpp 那样把 prompt 批量送进 graph/backend。第二，decode step 慢约 \code{5.35x}，主要因为默认路径只让 \code{16} 个 shape 兼容的 \code{Q4\_K} tensor 进入 direct 路径，实际 direct call 是 \code{512} 次，而 f32 fallback call 仍有 \code{6208} 次。第三，llama.cpp 保留更多 GGUF 量化 block 热路径，使用 ggml graph 调度、成熟 CPU kernel、线程协调、prompt batching 和更紧凑的 KV cache。差距不是输入不一致，也不是“少一个 AVX2 指令”，而是权重表示、prompt 批处理、矩阵内核、线程调度、KV 表示和整图执行方式都还没有进入成熟引擎状态。
+
+本轮还做了一个重要的负结果实验：把 shape 兼容的 \code{Q5\_0/Q6\_K/Q8\_0} tensor 也接入 direct path。loader 会把它们保存为 GGUF 原始 block bytes，前向时把输入量化成 \code{Q8\_0} scratch，再调用 \code{matvec\_ggml\_quantized\_q8\_0}。这个路径必须用 \code{LCQI\_LLAMA\_GGML\_DIRECT=1} 显式打开，因为 caw A/B 证明它当前不是优化：
+
+\begin{lstlisting}[numbers=none,caption={Q5/Q6/Q8 direct 实验路径的 caw 负结果}]
+default_q4_direct_prefill_ms_median=370.847
+default_q4_direct_decode_step_ms_median=15.4182
+experimental_ggml_direct_prefill_ms_median=1211.710
+experimental_ggml_direct_decode_step_ms_median=42.4420
+default_direct_quantized_weight_byte_share=0.076809
+experimental_direct_quantized_weight_byte_share=0.708479
+experimental_ggml_direct_tensors_median=194
+experimental_ggml_direct_calls_median=6208
+experimental_ggml_hotspot_ms_median=1207.130
+lcqi_ggml_experimental_prefill_speedup_default_over_experimental=0.306053
+lcqi_ggml_experimental_decode_step_speedup_default_over_experimental=0.363277
+\end{lstlisting}
+
+这组负结果比“又快了一点”更有教学价值。它说明低比特权重格式不等于天然更快：如果 \code{Q5\_0/Q8\_0} 每个 32 元素 block 都现场解包、每行独立循环、没有多行 packed layout、没有更宽 SIMD 覆盖 \code{Q6\_K}、没有线程分片和 prefetch，那么省下的 f32 权重带宽会被整数解包和标量控制流吃掉。默认路径因此只启用经过同二进制 A/B 证明收益的 \code{Q4\_K} direct；\code{Q5\_0/Q6\_K/Q8\_0} direct 保留为实验代码和报告对象。下一阶段如果要继续缩小 \code{16.24x}/\code{5.35x} 的差距，应优先做 batched prefill，或把 GGML 低比特 direct 重新设计成 packed multi-row/SIMD/threaded kernel，而不是简单扩大格式覆盖。
 
 \subsection{微内核进入默认路径的验收}
 

@@ -18,7 +18,9 @@ constexpr std::string_view LCQI_LLAMA_IDS_PREFIX = "--ids=";
 constexpr std::string_view LCQI_LLAMA_PROMPT_PREFIX = "--prompt=";
 constexpr std::string_view LCQI_LLAMA_MAX_NEW_PREFIX = "--max-new=";
 constexpr const char* LCQI_LLAMA_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT";
+constexpr const char* LCQI_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
 constexpr std::string_view LCQI_LLAMA_FALSE_ENV = "0";
+constexpr std::string_view LCQI_LLAMA_TRUE_ENV = "1";
 
 using Clock = std::chrono::steady_clock;
 
@@ -182,6 +184,8 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
     std::cout << "benchmark_tensors_loaded " << loaded.report.tensors_loaded << "\n";
     std::cout << "benchmark_q4_k_direct_tensors "
               << loaded.report.q4_k_direct_tensors << "\n";
+    std::cout << "benchmark_ggml_direct_tensors "
+              << loaded.report.ggml_direct_tensors << "\n";
     std::cout << "benchmark_f32_fallback_tensors "
               << loaded.report.f32_fallback_tensors << "\n";
     std::cout << "benchmark_hotspot_rms_norm_ms " << result.hotspots.rms_norm_ms << "\n";
@@ -197,10 +201,14 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
     std::cout << "benchmark_hotspot_lm_head_ms " << result.hotspots.lm_head_ms << "\n";
     std::cout << "benchmark_hotspot_q4_k_direct_ms "
               << result.hotspots.q4_k_direct_ms << "\n";
+    std::cout << "benchmark_hotspot_ggml_direct_ms "
+              << result.hotspots.ggml_direct_ms << "\n";
     std::cout << "benchmark_hotspot_f32_fallback_ms "
               << result.hotspots.f32_fallback_ms << "\n";
     std::cout << "benchmark_hotspot_q4_k_direct_calls "
               << result.hotspots.q4_k_direct_calls << "\n";
+    std::cout << "benchmark_hotspot_ggml_direct_calls "
+              << result.hotspots.ggml_direct_calls << "\n";
     std::cout << "benchmark_hotspot_f32_fallback_calls "
               << result.hotspots.f32_fallback_calls << "\n";
 }
@@ -208,6 +216,21 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
 [[nodiscard]] bool q4_direct_enabled() noexcept {
     const char* enabled = std::getenv(LCQI_LLAMA_Q4_DIRECT_ENV);
     return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
+[[nodiscard]] bool ggml_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_GGML_DIRECT_ENV);
+    return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
+}
+
+[[nodiscard]] const char* weight_execution_mode() noexcept {
+    if (ggml_direct_enabled()) {
+        return "gguf_mixed_quantized_direct_experimental";
+    }
+    if (!q4_direct_enabled()) {
+        return "f32_dequantized_reference";
+    }
+    return "gguf_mixed_q4_k_direct";
 }
 
 }  // namespace
@@ -235,10 +258,7 @@ int main(int argc, char** argv) {
         result.total_ms = elapsed_ms(total_begin, Clock::now());
 
         std::cout << "mode llama_gguf_reference\n";
-        std::cout << "weight_execution "
-                  << (q4_direct_enabled() ? "gguf_mixed_q4_k_direct"
-                                           : "f32_dequantized_reference")
-                  << "\n";
+        std::cout << "weight_execution " << weight_execution_mode() << "\n";
         std::cout << "model_path " << options.gguf_path.string() << "\n";
         std::cout << "architecture " << loaded.model.architecture << "\n";
         std::cout << "model_name " << loaded.model.name << "\n";

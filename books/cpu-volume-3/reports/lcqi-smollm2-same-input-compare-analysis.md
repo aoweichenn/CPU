@@ -1,5 +1,7 @@
 # LCQI SmolLM2 Same-Input Gap Analysis
 
+Status: pre-Q4-direct historical baseline. The latest same-input default/experimental direct-path evidence is in `books/cpu-volume-3/reports/lcqi-smollm2-ggml-direct-analysis.md`.
+
 Date: 2026-06-30
 
 Host: `caw`, Linux WSL2 x86-64, `nproc=20`.

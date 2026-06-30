@@ -15,6 +15,7 @@ namespace lcqi {
 enum class LlamaGgufLinearStorage : std::uint8_t {
     f32,
     q4_k,
+    ggml_quantized,
 };
 
 struct LlamaGgufLinearWeights {
@@ -23,7 +24,7 @@ struct LlamaGgufLinearWeights {
     GgmlType source_type = GgmlType::f32;
     LlamaGgufLinearStorage storage = LlamaGgufLinearStorage::f32;
     std::vector<float> f32_weights;
-    std::vector<std::uint8_t> q4_k_bytes;
+    std::vector<std::uint8_t> quantized_bytes;
 };
 
 struct LlamaGgufDecoderLayerWeights {
@@ -65,6 +66,7 @@ struct LlamaGgufLoadReport {
     std::uint64_t fallback_dequantized_weight_bytes = 0;
     std::int64_t tensors_loaded = 0;
     std::int64_t q4_k_direct_tensors = 0;
+    std::int64_t ggml_direct_tensors = 0;
     std::int64_t f32_fallback_tensors = 0;
 };
 
@@ -86,8 +88,10 @@ struct LlamaGgufHotspotReport {
     double w_down_ms = 0.0;
     double lm_head_ms = 0.0;
     double q4_k_direct_ms = 0.0;
+    double ggml_direct_ms = 0.0;
     double f32_fallback_ms = 0.0;
     std::uint64_t q4_k_direct_calls = 0;
+    std::uint64_t ggml_direct_calls = 0;
     std::uint64_t f32_fallback_calls = 0;
 };
 

@@ -1,5 +1,7 @@
 # LCQI SmolLM2 GGUF Reference Decode Summary
 
+Status: historical baseline. The latest same-input default/experimental direct-path evidence is in `books/cpu-volume-3/reports/lcqi-smollm2-ggml-direct-analysis.md`.
+
 Artifact: `books/cpu-volume-3/results/lcqi-smollm2-gguf-reference-decode-caw.txt`
 
 Remote validation: `caw`

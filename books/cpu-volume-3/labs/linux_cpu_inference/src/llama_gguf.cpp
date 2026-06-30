@@ -1,6 +1,7 @@
 #include <lcqi/llama_gguf.hpp>
 
 #include <lcqi/f32_kernels.hpp>
+#include <lcqi/ggml_matvec.hpp>
 #include <lcqi/ggml_tensors.hpp>
 #include <lcqi/gguf.hpp>
 #include <lcqi/q4_k.hpp>
@@ -42,7 +43,9 @@ constexpr const char* LCQI_LLAMA_BOS_TOKEN_KEY = "tokenizer.ggml.bos_token_id";
 constexpr const char* LCQI_LLAMA_EOS_TOKEN_KEY = "tokenizer.ggml.eos_token_id";
 constexpr const char* LCQI_LLAMA_UNKNOWN_TOKEN_KEY = "tokenizer.ggml.unknown_token_id";
 constexpr const char* LCQI_LLAMA_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT";
+constexpr const char* LCQI_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
 constexpr const char* LCQI_LLAMA_FALSE_ENV = "0";
+constexpr const char* LCQI_LLAMA_TRUE_ENV = "1";
 
 using Clock = std::chrono::steady_clock;
 
@@ -135,9 +138,24 @@ void validate_shape(const GgufTensorInfo& tensor,
            tensor.shape[0] % LCQI_QK_K_BLOCK_VALUES == 0;
 }
 
+[[nodiscard]] bool can_use_ggml_direct(const GgufTensorInfo& tensor) {
+    if (tensor.shape.size() != 2 || tensor.shape[0] <= 0 || tensor.shape[1] <= 0 ||
+        !ggml_type_has_q8_0_direct_matvec(tensor.type)) {
+        return false;
+    }
+    const GgmlTypeLayout layout = ggml_type_layout(tensor.type);
+    return tensor.shape[0] % layout.block_size == 0 &&
+           tensor.shape[0] % LCQI_Q8_0_INPUT_BLOCK_VALUES == 0;
+}
+
 [[nodiscard]] bool q4_k_direct_enabled() noexcept {
     const char* enabled = std::getenv(LCQI_LLAMA_Q4_DIRECT_ENV);
     return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
+[[nodiscard]] bool ggml_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_GGML_DIRECT_ENV);
+    return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
 }
 
 void account_f32_tensor_load(const GgufTensorInfo& tensor,
@@ -171,12 +189,16 @@ void account_f32_tensor_load(const GgufTensorInfo& tensor,
     return values;
 }
 
-void account_q4_k_direct_tensor_load(const GgufTensorInfo& tensor,
-                                     LlamaGgufLoadReport& report) {
+void account_quantized_direct_tensor_load(const GgufTensorInfo& tensor,
+                                          LlamaGgufLoadReport& report) {
     report.quantized_weight_bytes += tensor.byte_size;
     report.direct_quantized_weight_bytes += tensor.byte_size;
     ++report.tensors_loaded;
-    ++report.q4_k_direct_tensors;
+    if (tensor.type == GgmlType::q4_k) {
+        ++report.q4_k_direct_tensors;
+    } else {
+        ++report.ggml_direct_tensors;
+    }
 }
 
 [[nodiscard]] LlamaGgufLinearWeights make_linear_from_gguf(
@@ -200,8 +222,14 @@ void account_q4_k_direct_tensor_load(const GgufTensorInfo& tensor,
     const std::vector<std::uint8_t> bytes = read_gguf_tensor_bytes(gguf_path, *tensor);
     if (q4_k_direct_enabled() && can_use_q4_k_direct(*tensor)) {
         linear.storage = LlamaGgufLinearStorage::q4_k;
-        linear.q4_k_bytes = bytes;
-        account_q4_k_direct_tensor_load(*tensor, report);
+        linear.quantized_bytes = bytes;
+        account_quantized_direct_tensor_load(*tensor, report);
+        return linear;
+    }
+    if (ggml_direct_enabled() && can_use_ggml_direct(*tensor)) {
+        linear.storage = LlamaGgufLinearStorage::ggml_quantized;
+        linear.quantized_bytes = bytes;
+        account_quantized_direct_tensor_load(*tensor, report);
         return linear;
     }
 
@@ -321,16 +349,32 @@ void linear_q4_k_direct(const LlamaGgufLinearWeights& layer,
         checked_size(layer.input_size / LCQI_QK_K_BLOCK_VALUES, "Q8_K input block count")) {
         throw std::runtime_error("LLaMA GGUF Q4_K scratch block count mismatch");
     }
-    matvec_q4_k_q8(layer.q4_k_bytes,
+    matvec_q4_k_q8(layer.quantized_bytes,
                    layer.output_size,
                    layer.input_size,
                    q8_input,
                    output);
 }
 
+void linear_ggml_quantized_direct(const LlamaGgufLinearWeights& layer,
+                                  std::span<const Q8_0InputBlock> q8_0_input,
+                                  std::span<float> output) {
+    if (q8_0_input.size() != checked_size(layer.input_size / LCQI_Q8_0_INPUT_BLOCK_VALUES,
+                                          "Q8_0 input block count")) {
+        throw std::runtime_error("LLaMA GGUF Q8_0 scratch block count mismatch");
+    }
+    matvec_ggml_quantized_q8_0(layer.source_type,
+                               layer.quantized_bytes,
+                               layer.output_size,
+                               layer.input_size,
+                               q8_0_input,
+                               output);
+}
+
 void linear_gguf(const LlamaGgufLinearWeights& layer,
                  std::span<const float> input,
                  std::span<const Q8KBlock> q8_input,
+                 std::span<const Q8_0InputBlock> q8_0_input,
                  std::span<float> output,
                  LlamaGgufLinearOp operation,
                  LlamaGgufHotspotReport& hotspots) {
@@ -341,6 +385,13 @@ void linear_gguf(const LlamaGgufLinearWeights& layer,
             elapsed = measure_ms([&]() { linear_q4_k_direct(layer, q8_input, output); });
             hotspots.q4_k_direct_ms += elapsed;
             ++hotspots.q4_k_direct_calls;
+            break;
+        case LlamaGgufLinearStorage::ggml_quantized:
+            elapsed = measure_ms([&]() {
+                linear_ggml_quantized_direct(layer, q8_0_input, output);
+            });
+            hotspots.ggml_direct_ms += elapsed;
+            ++hotspots.ggml_direct_calls;
             break;
         case LlamaGgufLinearStorage::f32:
             elapsed = measure_ms([&]() { linear_f32_fallback(layer, input, output); });
@@ -353,6 +404,10 @@ void linear_gguf(const LlamaGgufLinearWeights& layer,
 
 [[nodiscard]] bool uses_q4_k_direct(const LlamaGgufLinearWeights& layer) noexcept {
     return layer.storage == LlamaGgufLinearStorage::q4_k;
+}
+
+[[nodiscard]] bool uses_ggml_direct(const LlamaGgufLinearWeights& layer) noexcept {
+    return layer.storage == LlamaGgufLinearStorage::ggml_quantized;
 }
 
 [[nodiscard]] std::size_t q8_scratch_blocks(std::int32_t input_size) {
@@ -371,6 +426,22 @@ void prepare_q8_if_needed(std::span<const float> input,
     quantize_q8_k_input_to(input, scratch);
 }
 
+[[nodiscard]] std::size_t q8_0_scratch_blocks(std::int32_t input_size) {
+    if (input_size <= 0 || input_size % LCQI_Q8_0_INPUT_BLOCK_VALUES != 0) {
+        return 0;
+    }
+    return checked_size(input_size / LCQI_Q8_0_INPUT_BLOCK_VALUES, "Q8_0 scratch blocks");
+}
+
+void prepare_q8_0_if_needed(std::span<const float> input,
+                            std::span<Q8_0InputBlock> scratch,
+                            bool needed) {
+    if (!needed) {
+        return;
+    }
+    quantize_q8_0_input_to(input, scratch);
+}
+
 struct LlamaWorkspace {
     std::vector<float> hidden;
     std::vector<float> normed;
@@ -387,6 +458,9 @@ struct LlamaWorkspace {
     std::vector<Q8KBlock> normed_q8;
     std::vector<Q8KBlock> attention_q8;
     std::vector<Q8KBlock> mlp_hidden_q8;
+    std::vector<Q8_0InputBlock> normed_q8_0;
+    std::vector<Q8_0InputBlock> attention_q8_0;
+    std::vector<Q8_0InputBlock> mlp_hidden_q8_0;
 
     explicit LlamaWorkspace(const DecoderConfig& config)
         : hidden(checked_size(config.hidden_size, "hidden_size"), 0.0F),
@@ -403,7 +477,10 @@ struct LlamaWorkspace {
           final_norm(hidden.size(), 0.0F),
           normed_q8(q8_scratch_blocks(config.hidden_size)),
           attention_q8(normed_q8.size()),
-          mlp_hidden_q8(q8_scratch_blocks(config.intermediate_size)) {}
+          mlp_hidden_q8(q8_scratch_blocks(config.intermediate_size)),
+          normed_q8_0(q8_0_scratch_blocks(config.hidden_size)),
+          attention_q8_0(normed_q8_0.size()),
+          mlp_hidden_q8_0(q8_0_scratch_blocks(config.intermediate_size)) {}
 };
 
 void forward_llama_layer(const DecoderConfig& config,
@@ -423,21 +500,28 @@ void forward_llama_layer(const DecoderConfig& config,
                          workspace.normed_q8,
                          uses_q4_k_direct(layer.wq) || uses_q4_k_direct(layer.wk) ||
                              uses_q4_k_direct(layer.wv));
+    prepare_q8_0_if_needed(workspace.normed,
+                           workspace.normed_q8_0,
+                           uses_ggml_direct(layer.wq) || uses_ggml_direct(layer.wk) ||
+                               uses_ggml_direct(layer.wv));
     linear_gguf(layer.wq,
                 workspace.normed,
                 workspace.normed_q8,
+                workspace.normed_q8_0,
                 workspace.query,
                 LlamaGgufLinearOp::wq,
                 hotspots);
     linear_gguf(layer.wk,
                 workspace.normed,
                 workspace.normed_q8,
+                workspace.normed_q8_0,
                 workspace.key,
                 LlamaGgufLinearOp::wk,
                 hotspots);
     linear_gguf(layer.wv,
                 workspace.normed,
                 workspace.normed_q8,
+                workspace.normed_q8_0,
                 workspace.value,
                 LlamaGgufLinearOp::wv,
                 hotspots);
@@ -465,9 +549,13 @@ void forward_llama_layer(const DecoderConfig& config,
     prepare_q8_if_needed(workspace.attention,
                          workspace.attention_q8,
                          uses_q4_k_direct(layer.wo));
+    prepare_q8_0_if_needed(workspace.attention,
+                           workspace.attention_q8_0,
+                           uses_ggml_direct(layer.wo));
     linear_gguf(layer.wo,
                 workspace.attention,
                 workspace.attention_q8,
+                workspace.attention_q8_0,
                 workspace.projected,
                 LlamaGgufLinearOp::wo,
                 hotspots);
@@ -479,15 +567,20 @@ void forward_llama_layer(const DecoderConfig& config,
     prepare_q8_if_needed(workspace.normed,
                          workspace.normed_q8,
                          uses_q4_k_direct(layer.w_gate) || uses_q4_k_direct(layer.w_up));
+    prepare_q8_0_if_needed(workspace.normed,
+                           workspace.normed_q8_0,
+                           uses_ggml_direct(layer.w_gate) || uses_ggml_direct(layer.w_up));
     linear_gguf(layer.w_gate,
                 workspace.normed,
                 workspace.normed_q8,
+                workspace.normed_q8_0,
                 workspace.gate,
                 LlamaGgufLinearOp::w_gate,
                 hotspots);
     linear_gguf(layer.w_up,
                 workspace.normed,
                 workspace.normed_q8,
+                workspace.normed_q8_0,
                 workspace.up,
                 LlamaGgufLinearOp::w_up,
                 hotspots);
@@ -497,9 +590,13 @@ void forward_llama_layer(const DecoderConfig& config,
     prepare_q8_if_needed(workspace.mlp_hidden,
                          workspace.mlp_hidden_q8,
                          uses_q4_k_direct(layer.w_down));
+    prepare_q8_0_if_needed(workspace.mlp_hidden,
+                           workspace.mlp_hidden_q8_0,
+                           uses_ggml_direct(layer.w_down));
     linear_gguf(layer.w_down,
                 workspace.mlp_hidden,
                 workspace.mlp_hidden_q8,
+                workspace.mlp_hidden_q8_0,
                 workspace.mlp_out,
                 LlamaGgufLinearOp::w_down,
                 hotspots);
@@ -528,9 +625,14 @@ void forward_llama_layer(const DecoderConfig& config,
         uses_q4_k_direct(model.decoder.lm_head)
             ? quantize_q8_k_input(final_hidden)
             : std::vector<Q8KBlock>{};
+    const std::vector<Q8_0InputBlock> final_hidden_q8_0 =
+        uses_ggml_direct(model.decoder.lm_head)
+            ? quantize_q8_0_input(final_hidden)
+            : std::vector<Q8_0InputBlock>{};
     linear_gguf(model.decoder.lm_head,
                 final_hidden,
                 final_hidden_q8,
+                final_hidden_q8_0,
                 logits,
                 LlamaGgufLinearOp::lm_head,
                 hotspots);
