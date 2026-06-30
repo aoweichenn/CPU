@@ -1,0 +1,119 @@
+\section{第一阶段 x86-64 契约模型：把架构名字落到断言}
+
+上一节的小模型故意很小，用来证明“模式、权限、MMIO、中断、DMA 生命周期”这些边界必须存在。但它还没有把 x86-64 的关键名字直接放进状态机：canonical address、四级页表索引、PTE 权限、TLB/PCID、CPL、IDT、RFLAGS、APIC pending、MSI-X 风格中断、IOMMU 映射和 \code{iretq} 返回。第一阶段若要真正服务后面的 OS 章节，就必须再前进一步：不是完整模拟器，而是把 x86-64 最小契约做成可运行断言。
+
+\begin{keyidea}
+原理卷里的 x86-64 模型不追求跑真实机器码，而追求把“硬件为什么强迫 OS 这样设计”固定下来。只要 PTE 权限、TLB 失效、CPL、IDT、trap frame、APIC、IOMMU 和 DMA 生命周期能被测试击穿，读者就能把后续的系统调用、缺页、调度和驱动路径接回硬件事实。
+\end{keyidea}
+
+\subsection{这个模型比上一节多了什么}
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.30\linewidth}}
+\toprule
+机制 & 模型里的对象 & 要证明的不变量 \\
+\midrule
+canonical address & \code{is\_canonical} 与 \code{split\_virtual\_address} & 非 canonical 虚拟地址不能继续页表遍历 \\
+四级页表索引 & PML4/PDPT/PD/PT/offset 拆分 & 虚拟地址不是一个平面整数，而是页表路径加页内偏移 \\
+PTE 权限 & \code{PageTableEntry} 的 present/writable/user/executable & 用户态、写、执行分别有独立权限位 \\
+TLB/PCID & \code{TlbKey\{pcid,vpn\}} & 改 PTE 后旧 TLB 仍可能保存旧权限，必须失效 \\
+CPL & \code{PrivilegeLevel::Ring3/Ring0} & Ring 3 不能访问 supervisor 页和 MMIO \\
+trap frame & RIP/RSP/RFLAGS/CPL/vector/error code & 异常和中断返回必须有足够证据 \\
+IDT/APIC & \code{InterruptDescriptorTable} 与 \code{LocalApic} & 设备完成不是函数调用，而是 pending vector 分发 \\
+IOMMU/DMA & \code{IommuDomain} 与 \code{DmaEngine} & 设备只能写被映射、方向允许、生命周期有效的 buffer \\
+\bottomrule
+\end{longtable}
+
+注意这里的“x86-64”不是把所有 Intel 手册字段搬进书里，而是保留后续 OS 必须依赖的最小集合。比如模型没有实现真实机器码译码，但它明确保存 RIP；没有实现完整 CR3 位布局，但用 PCID 区分 TLB 项；没有实现真实 MSI-X table，但用 APIC pending vector 表达设备完成的异步交付。
+
+\subsection{测试一：地址不是任意 64 位数}
+
+x86-64 的虚拟地址虽然放在 64 位寄存器里，但常见实现只使用低 48 位或更宽的 canonical 形式。高位必须是符号扩展。模型里的第一组测试要求：
+
+\begin{lstlisting}
+low canonical user address is accepted
+high canonical kernel address is accepted
+non-canonical address is rejected before page walk
+virtual address splits into PML4/PDPT/PD/PT/offset
+\end{lstlisting}
+
+这个测试对应真实 OS 的两个边界。第一，坏地址可能在页表查询前就被硬件拒绝；第二，页表不是“map 里查一个地址”这么简单，而是由虚拟地址位段逐级索引。后面讲 page fault 时，读者要区分“地址形式非法”“页表项不存在”“页表项存在但权限不允许”。
+
+\subsection{测试二：PTE 权限必须产生可诊断 fault}
+
+模型把用户页、只读页、不可执行页、内核页和 MMIO 页分别映射出来。Ring 3 访问普通用户页应该成功；Ring 3 访问 supervisor 页、写只读页、执行 NX 页都必须触发 page fault，并在 trap frame 里保存 vector、fault address 和 error code。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+访问 & 期望结果 & OS 解释 \\
+\midrule
+Ring 3 读写用户页 & 成功 & 普通用户内存 \\
+Ring 3 读 supervisor 页 & page fault，user bit 置位 & 用户越权访问内核映射 \\
+Ring 3 写只读页 & page fault，write bit 置位 & COW 或权限错误入口 \\
+Ring 3 执行 NX 页 & page fault，instruction bit 置位 & W\^X、栈不可执行和代码页保护 \\
+\bottomrule
+\end{longtable}
+
+这些断言让“缺页不是一种错误”变得具体。内核必须看 fault address、error code、当前 CPL 和 VMA/PTE，才能判断是合法懒分配、COW、非法地址还是安全违规。
+
+\subsection{测试三：改 PTE 不等于旧 TLB 自动消失}
+
+模型故意做了一个危险过程：先让写访问填充 TLB，再把 PTE 改成只读，但不做 TLB invalidate。此时第二次写仍然通过，因为 TLB 里保存着旧 writable 权限。只有执行 \code{invalidate\_page(pcid,vpn)} 后，下一次写才按新 PTE 触发 page fault。
+
+\begin{lstlisting}
+write user page -> TLB caches writable PTE
+kernel clears writable bit in page table
+write still succeeds while stale TLB exists
+invalidate PCID+VPN
+write now faults
+\end{lstlisting}
+
+这就是 TLB shootdown 的根。多核机器上，别的 CPU 可能还缓存着旧翻译。OS 修改页表后，不仅要改内存里的 PTE，还要让相关 CPU 失效旧 TLB；否则权限收紧、unmap、COW 分离都可能被旧缓存绕过。
+
+\subsection{测试四：系统调用和中断都要保存返回证据}
+
+模型把 \code{syscall} 简化为：从 Ring 3 保存 trap frame，进入 Ring 0，把 RIP 改为 \code{X86\_SYSCALL\_HANDLER}，并清掉 RFLAGS.IF。返回用 \code{iretq} 恢复 RIP/RSP/RFLAGS/CPL。设备完成路径则是内核写 MMIO doorbell，设备向 local APIC 投递 pending vector，CPU 从 IDT 查 handler。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+入口 & 共同点 & 差别 \\
+\midrule
+系统调用 & 保存用户现场，进入 Ring 0 & 入口由约定 MSR/ABI 决定，来自同步指令 \\
+设备中断 & 保存被打断现场，进入 Ring 0 & 入口由 APIC pending vector 和 IDT 决定，来自异步设备事件 \\
+page fault & 保存 fault 现场，进入 Ring 0 & 还要保存 fault address 和 error code \\
+\bottomrule
+\end{longtable}
+
+这说明“进入内核”不是一句话。不同入口的来源、错误码、返回规则、可重启性不同。后面讲系统调用、定时器抢占、设备 completion、信号和调度时，都要回到这张表。
+
+\subsection{测试五：DMA 受 IOMMU 和生命周期约束}
+
+模型的 IOMMU domain 给设备发 IOVA。设备写入时，必须满足三件事：IOVA 存在，方向允许设备写，offset 在映射长度内。unmap 后再写必须失败。
+
+\begin{lstlisting}
+iova = iommu.map(user_page, len, FromDevice)
+device_write(iova, offset, value) succeeds
+iommu.unmap(iova)
+device_write(iova, offset, value) faults
+\end{lstlisting}
+
+这条测试对应真实驱动里最容易出问题的生命周期：completion 前释放 buffer、方向标错、unmap 太早或太晚、设备 reset 后迟到 DMA。IOMMU 不是性能装饰，它把设备访问也变成可授权、可撤销、可诊断的地址空间。
+
+\subsection{编译和运行}
+
+在书根目录运行：
+
+\begin{lstlisting}
+make test
+\end{lstlisting}
+
+期望看到三个 listing 都被编译并运行，其中 x86-64 契约模型输出：
+
+\begin{lstlisting}
+x86-64 stage one contract model checks passed
+\end{lstlisting}
+
+\code{make check} 现在也会依赖这些 C++ listing 测试。以后若书稿里的模型和解释脱节，或者 C++ 代码被改坏，构建会直接失败。这比把代码贴在书里但不执行更可靠。
+
+\subsection{完整 \cpp20 模型源码}
+
+\lstinputlisting[language=C++,basicstyle=\ttfamily\tiny]{listings/x86_64_stage_one_model.cpp}

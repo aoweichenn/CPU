@@ -1,0 +1,227 @@
+\section{第一阶段源码走读：x86-64 \#PF 到 VMA、PTE 与 COW}
+
+前面已经讲过虚拟地址、VMA、PTE、TLB 和 COW，但只讲概念还不够。真正读懂操作系统，必须能把一次用户态 load/store 失败拆成硬件异常、入口现场、VMA 判定、PTE 状态、缺页修复、TLB 失效和返回重试。x86-64 上这条路径的核心异常是 \#PF，Linux 里它从 \filepath{arch/x86/mm/fault.c} 进入，再落到 \filepath{mm/memory.c} 的通用内存管理逻辑。
+
+\begin{keyidea}
+\#PF 不是“程序访问错了内存”的同义词。它只是 CPU 告诉内核：“这次地址翻译或权限检查没有按当前页表完成。”内核必须结合 CR2、error code、当前上下文、VMA 和 PTE，才能决定是分配零页、读文件页、执行 COW、返回 \code{-EFAULT}，还是给进程发送信号。
+\end{keyidea}
+
+\subsection{硬件交给内核的最小证据}
+
+x86-64 上发生 page fault 时，CPU 至少提供三类证据：faulting virtual address、错误码和被打断现场。faulting address 由 CR2 保存；错误码说明这是不是 present 页上的保护错误、是不是写访问、是不是用户态访问、是不是取指访问等；入口保存的寄存器现场说明 fault 发生在什么 RIP、什么 RSP、什么 CPL。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+证据 & 典型来源 & OS 需要回答的问题 \\
+\midrule
+fault address & CR2 & 这个地址属于哪个 VMA，是否 canonical \\
+error code.P & page fault error code & 是 PTE 不存在，还是 present 页权限拒绝 \\
+error code.W/R & page fault error code & 是读、写还是取指触发 \\
+error code.U/S & page fault error code & 是 Ring 3 访问，还是内核路径访问 \\
+trap frame & 异常入口保存 & 返回后重试哪条指令，还是转成信号/错误 \\
+\bottomrule
+\end{longtable}
+
+这张表解释了为什么“缺页处理”不能只写成 \code{if page missing then allocate}。同样是 \#PF，缺少 PTE 可能是匿名懒分配，present 页写保护可能是 COW，用户态访问无 VMA 是 \code{SIGSEGV}，内核 \code{copy\_from\_user} 访问坏地址应该返回 \code{-EFAULT}，内核普通指针 fault 则可能是 oops。
+
+\subsection{源码地图：从 x86-64 异常到通用 mm}
+
+阅读 Linux 时，先不要在整个源码树里搜索“page fault”到处跳。应该按层次看：
+
+\begin{longtable}{p{0.28\linewidth}p{0.30\linewidth}p{0.30\linewidth}}
+\toprule
+路径 & 角色 & 阅读重点 \\
+\midrule
+\filepath{arch/x86/mm/fault.c} & x86-64 page fault 入口 & 读取 CR2、解释 error code、区分用户/内核上下文 \\
+\filepath{arch/x86/entry/entry\_64.S} & 异常入口汇编 & trap frame、寄存器保存、进入 C 函数前的状态 \\
+\filepath{include/linux/mm\_types.h} & mm 核心结构 & \code{mm\_struct}、\code{vm\_area\_struct}、页表相关对象 \\
+\filepath{mm/mmap.c} & VMA 创建与查找 & \code{mmap}、\code{mprotect}、VMA 合并拆分 \\
+\filepath{mm/memory.c} & 通用 fault 主干 & \code{handle\_mm\_fault}、匿名 fault、文件 fault、COW \\
+\filepath{mm/rmap.c} & 反向映射 & 页被哪些映射引用，回收和 COW 需要的关系 \\
+\filepath{mm/filemap.c} & 文件页 fault & page cache、文件映射、读入文件页 \\
+\filepath{arch/x86/mm/tlb.c} & TLB 失效 & 本地 flush、远端 shootdown、PCID 相关路径 \\
+\bottomrule
+\end{longtable}
+
+这条地图的分层很重要：\filepath{arch/x86/mm/fault.c} 负责架构相关入口，\filepath{mm/memory.c} 负责大部分架构无关语义。不要把二者混成一个函数理解。x86-64 入口知道 CR2 和 error code；通用 mm 知道 VMA、folio、匿名页、文件页、COW、回收和锁。
+
+\subsection{第一步：地址形式和 VMA 查找不是同一件事}
+
+用户态传来的值先要满足 x86-64 canonical address 规则。非 canonical 地址不是“找不到 VMA”那么简单，它在页表遍历前就可以被硬件拒绝。通过这一关后，内核才用 fault address 查找当前进程的 VMA。
+
+\begin{lstlisting}
+page fault classification:
+  address is not canonical:
+    reject before treating it as a normal VMA miss
+  no VMA covers address:
+    user instruction -> SIGSEGV
+    kernel usercopy -> -EFAULT
+  VMA covers address but permissions reject access:
+    protection failure, not demand allocation
+  VMA covers address and permissions allow access:
+    inspect PTE and repair if possible
+\end{lstlisting}
+
+VMA 是虚拟地址区间的语义说明。它回答“这段地址是否应该存在，允许读写执行吗，来自匿名内存还是文件，私有还是共享”。PTE 是当前硬件翻译状态。一个合法 VMA 允许暂时没有 PTE；一个没有 VMA 的地址不能靠分配页修复。
+
+\subsection{第二步：error code 决定走缺失路径还是保护路径}
+
+page fault error code 的 present/protection 位把路径分成两类。若不是 present 页，常见情况是懒分配、文件页未读入或 swap 页未换入。若是 present 页上的保护 fault，常见情况是 COW、写只读映射、用户态访问 supervisor 页或取指违反 NX。
+
+\begin{longtable}{p{0.20\linewidth}p{0.35\linewidth}p{0.33\linewidth}}
+\toprule
+硬件现象 & 内核可能动作 & 不能误判成什么 \\
+\midrule
+not-present 读匿名页 & 分配零页，安装 PTE，重试指令 & 程序错误 \\
+not-present 读文件页 & 查 page cache，必要时发起 I/O & 简单 malloc \\
+present 写只读 PTE & 若 VMA 允许写且 PTE 是 COW，则复制或提升 & 普通权限失败 \\
+present 写只读 VMA & 发送信号或返回错误 & COW \\
+present 取指 NX 页 & 发送信号或安全违规处理 & 数据页缺失 \\
+\bottomrule
+\end{longtable}
+
+这里的关键是同时看 VMA 和 PTE。VMA 允许写、PTE 不可写，可能是 COW；VMA 本身不允许写，PTE 不可写就是权限拒绝。只看 PTE 会把只读文件映射误当成 COW；只看 VMA 会看不见硬件当前状态。
+
+\subsection{匿名懒分配：合法地址为什么第一次访问才有物理页}
+
+\code{mmap} 或堆增长可以先建立 VMA，不立刻分配物理页。第一次读写触发 not-present \#PF，内核分配一个清零页，安装 PTE，返回用户态重试 faulting instruction。用户程序感觉这条 load/store 成功了，但中间发生过一次异常和内核修复。
+
+\begin{lstlisting}
+anonymous demand fault:
+  find VMA covering fault address
+  verify VMA permits the access
+  allocate zero-filled physical page
+  install user PTE with VMA-derived permissions
+  return to the same user RIP
+  CPU retries the faulting load/store
+\end{lstlisting}
+
+这就是为什么 VIRT 可以很大而 RSS 很小。VMA 代表承诺，RSS 代表当前真的驻留的物理页。OS 用这个策略避免提前为大量可能永远不会访问的地址分配内存。
+
+\subsection{文件映射缺页：read 和 mmap 在 page cache 汇合}
+
+文件 \code{mmap} 后，用户第一次读某个页面也会触发 not-present \#PF。内核根据 VMA 找到文件和偏移，再到 page cache 查对应页。若 page cache 命中，这是 minor fault；若需要从存储设备读入，这是 major fault。读入后安装 PTE，用户指令重试。
+
+\begin{lstlisting}
+file-backed fault:
+  fault address -> VMA
+  VMA file + page offset -> page-cache index
+  if page cache hit:
+    map cached folio and return
+  else:
+    submit storage read, wait for completion
+    mark folio uptodate
+    map folio and return
+\end{lstlisting}
+
+因此 \code{read} 和 \code{mmap} 共享的不只是“文件内容”，而是内核里的 page cache 对象。前者通常把 page cache 内容复制到用户 buffer；后者把 page cache 页映射进用户地址空间。理解这一点，后面讲 page cache 回收、dirty、writeback 和文件系统日志才不会断开。
+
+\subsection{COW 的完整条件：VMA 允许写，PTE 暂时禁止写}
+
+fork 后父子共享匿名物理页。为了发现第一次写，父子 PTE 都要清掉 writable，并标记 COW。用户写入时，CPU 看到 present PTE 但不可写，于是产生保护型 \#PF。内核确认 VMA 允许写、PTE 是 COW，再决定复制还是提升。
+
+\begin{lstlisting}
+COW write fault:
+  write to present but read-only PTE
+  VMA says private mapping is writable
+  PTE carries COW state
+  if physical page refcount > 1:
+    allocate new page and copy old content
+    decrement old page refcount
+    install writable PTE to new page
+  else:
+    only restore writable bit
+  invalidate stale TLB translation
+  return and retry the store
+\end{lstlisting}
+
+复制和提升的差别体现了 COW 的性能设计。若物理页仍被父子或其他映射共享，必须复制；若只剩当前映射，直接把 PTE 改回 writable 即可。无论哪种，都要处理 TLB，因为 CPU 可能还缓存着旧的只读或旧的可写翻译。
+
+\subsection{为什么 fork 时父进程也必须写保护}
+
+常见误解是“fork 只要把子进程页表设成只读”。这是错的。父进程如果保留 writable PTE，它可以继续写共享物理页，子进程会直接看到父进程的新内容，COW 就失效了。正确做法是父子双方都写保护，并清理父进程可能已有的 writable TLB 项。
+
+\begin{lstlisting}
+fork private pages:
+  for each writable private PTE:
+    increment physical page refcount
+    clear parent writable bit
+    mark parent PTE as COW
+    install child read-only COW PTE
+    invalidate parent stale writable TLB entry
+\end{lstlisting}
+
+这一步把“fork 很快”变成可理解的状态机：fork 不复制所有页，只复制页表项和引用计数；第一次写才复制物理页。代价是 fork 时要批量改 PTE 权限，并承担 TLB 失效成本。
+
+\subsection{TLB shootdown：COW 的隐藏正确性条件}
+
+如果父进程在 fork 前刚写过某页，CPU TLB 可能缓存了 writable 翻译。fork 清掉父 PTE writable 后，若没有失效旧 TLB，父进程下一次写可能不触发 \#PF，而是直接修改共享物理页。这不是性能问题，而是隔离正确性问题。
+
+\begin{lstlisting}
+stale TLB failure:
+  parent writes page, TLB caches writable PTE
+  fork clears parent PTE writable but forgets TLB invalidate
+  parent writes again through stale TLB
+  child observes modified shared frame
+  COW handler never runs
+\end{lstlisting}
+
+多核时问题更明显：同一个地址空间的线程可能在多个 CPU 上运行，远端 CPU 也可能缓存旧翻译。内核需要本地 TLB invalidate，也可能需要 IPI 触发远端 CPU 执行 shootdown。后面看到 \code{mprotect}、\code{munmap}、COW、页迁移性能问题时，要把这笔成本算进去。
+
+\subsection{用户指针 fault：为什么有时是 \code{-EFAULT} 而不是信号}
+
+同一个坏地址，在用户指令里访问和在系统调用参数复制时访问，结果不同。用户程序自己执行 \code{mov rax, qword ptr [rdi]} 访问坏地址，通常应得到信号。若用户把坏指针传给 \code{read} 或 \code{write}，内核在 \code{copy\_to\_user} 或 \code{copy\_from\_user} 中 fault，则系统调用应返回 \code{-EFAULT}。
+
+\begin{lstlisting}
+; Intel syntax, user instruction fault example
+mov rax, qword ptr [rdi]
+
+; syscall usercopy fault example, conceptual
+copy_from_user(kernel_buffer, user_pointer, length)
+if page fault is not repairable:
+  return -EFAULT
+\end{lstlisting}
+
+Linux 用异常表一类机制标记某些内核访问用户内存的指令：这里 fault 不代表内核坏了，而是用户参数不可访问，应跳到修复位置返回错误。没有这个区分，坏用户指针就会把内核打崩。
+
+\subsection{可观察证据：不要只看 maps}
+
+调试缺页路径时，\code{/proc/<pid>/maps} 只能告诉你 VMA，不告诉你每页是否已经有 PTE、是否驻留、是否 dirty。需要把多个证据合起来看：
+
+\begin{longtable}{p{0.30\linewidth}p{0.30\linewidth}p{0.28\linewidth}}
+\toprule
+命令或文件 & 能看到什么 & 不能单独推出什么 \\
+\midrule
+\code{/proc/<pid>/maps} & VMA 区间、权限、文件映射 & 物理页是否已分配 \\
+\code{/proc/<pid>/smaps} & RSS、dirty、shared/private 统计 & 每一次 fault 的源码分支 \\
+\code{perf stat -e page-faults} & page fault 总量 & major/minor 和 fault 原因细节 \\
+\code{perf stat -e minor-faults,}\\
+\code{major-faults} & 缺页是否涉及 I/O & COW 与匿名零页的区别 \\
+\code{strace} & 系统调用返回 \code{EFAULT} 等错误 & 用户指令自己的 page fault \\
+\bottomrule
+\end{longtable}
+
+真正的分析要能把现象落回路径。例如 VMA 存在但 RSS 没涨，说明还没实际触页；minor fault 增加但 major fault 不增，通常没有存储 I/O；fork 后父子写同一页 RSS 增加，可能是 COW 分裂；系统调用返回 \code{EFAULT}，说明坏用户指针被 usercopy 路径捕获。
+
+\subsection{配套 \cpp20 模型覆盖哪些失败}
+
+下面的模型不是完整 Linux，也不模拟真实指令译码。它只把第一阶段最容易讲空的断言变成测试：
+
+\begin{itemize}
+\tightlist
+\item 合法匿名 VMA 第一次访问会 minor fault，分配零页后重试成功。
+\item 只读 VMA 的写入不能被当成 COW，必须失败且不能偷偷分配页。
+\item fork 后父子共享页，第一次写触发 COW，父子内容分离。
+\item 如果 fork 时忘记失效父进程 writable TLB，父进程会绕过 COW 污染子进程。
+\item 文件映射第一次 fault 通过 page cache 建立映射，并记录 major fault。
+\item syscall usercopy 遇到坏用户指针返回失败，而不是模拟成内核崩溃。
+\item 非 canonical 地址不能被误讲成普通 VMA miss。
+\end{itemize}
+
+\begin{rubricbox}
+第一阶段关于虚拟内存的最低验收：能解释一条用户态写指令为什么可能正常完成、minor fault 后完成、major fault 后完成、COW 后完成、返回 \code{-EFAULT}，或变成信号；并能指出每种结果依赖哪个 VMA/PTE/TLB 条件。
+\end{rubricbox}
+
+\subsection{完整 \cpp20 模型源码}
+
+\lstinputlisting[language=C++,basicstyle=\ttfamily\tiny]{listings/x86_64_page_fault_cow_model.cpp}

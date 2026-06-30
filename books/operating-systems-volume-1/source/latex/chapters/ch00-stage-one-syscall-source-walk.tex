@@ -1,0 +1,203 @@
+\section{第一阶段源码走读：x86-64 系统调用入口}
+
+第一阶段不能只说“系统调用进入内核”。真正要过关，必须能把一条 \code{syscall} 指令映射到 x86-64 寄存器约定、低级入口汇编、\code{pt\_regs}、C 层分发、用户指针复制、错误码和返回路径。这样后面讲 \code{open}、\code{read}、\code{mmap}、\code{exec}、信号和 seccomp 时，读者知道每个对象为什么能被内核检查，而不是把系统调用当成神秘函数表。
+
+\begin{keyidea}
+x86-64 syscall 入口是 OS 最核心的安全边界之一。它不是“跳到一个 C 函数”，而是先由 CPU 和入口汇编建立可信执行环境，再由 C 层根据系统调用号、寄存器参数、当前任务、seccomp、tracing、权限和用户指针决定能否推进。
+\end{keyidea}
+
+\subsection{先固定源码入口和读法}
+
+读 Linux 时先看这些路径。不同内核版本函数名会有细微变化，但对象和边界基本稳定。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+源码路径 & 先看什么 & 读法 \\
+\midrule
+\filepath{arch/x86/entry/entry\_64.S} & \code{entry\_SYSCALL\_64}、返回用户态路径 & 看寄存器怎样保存、栈怎样切换、何时走慢路径 \\
+\filepath{arch/x86/entry/common.c} & \code{do\_syscall\_64}、exit work & 看系统调用号、seccomp、tracing、信号、调度检查 \\
+\filepath{arch/x86/entry/syscalls/syscall\_64.tbl} & 系统调用号表 & 看 ABI 如何把数字绑定到实现名 \\
+\filepath{include/linux/syscalls.h} & \code{SYSCALL\_DEFINE*} 声明 & 看 C 实现怎样接入统一表项 \\
+\filepath{arch/x86/include/asm/ptrace.h} & \code{struct pt\_regs} & 看 trap frame 在 C 层怎样表示 \\
+\filepath{lib/usercopy.c}、\filepath{arch/x86/lib/usercopy\_64.c} & usercopy & 看用户指针复制怎样和异常修复配合 \\
+\bottomrule
+\end{longtable}
+
+读入口代码时不要从第一行汇编硬啃。先带着四个问题读：用户态把什么放进寄存器，CPU 自动改了什么，入口汇编补保存了什么，C 层分发前还有哪些安全工作。
+
+\subsection{用户态 ABI：参数不是压到栈上}
+
+x86-64 Linux 系统调用 ABI 把系统调用号放在 \code{rax}，最多六个参数放在 \code{rdi/rsi/rdx/r10/r8/r9}。注意第四个参数用 \code{r10}，不是 C 函数调用 ABI 的 \code{rcx}。原因是 \code{syscall} 指令会用 \code{rcx} 保存用户返回 RIP，用 \code{r11} 保存用户 RFLAGS。
+
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+寄存器 & syscall ABI 含义 & 为什么重要 \\
+\midrule
+\code{rax} & 系统调用号，返回时放返回值 & 调度到哪个 \code{sys\_*} 实现 \\
+\code{rdi} & 第 1 参数 & 例如 \code{write(fd,...)} 的 fd \\
+\code{rsi} & 第 2 参数 & 例如用户 buffer 指针 \\
+\code{rdx} & 第 3 参数 & 例如长度 \\
+\code{r10} & 第 4 参数 & \code{rcx} 被硬件占用，不能放参数 \\
+\code{r8/r9} & 第 5/6 参数 & 六参数系统调用使用 \\
+\code{rcx} & 用户返回 RIP & \code{sysretq} 快速返回需要 \\
+\code{r11} & 用户 RFLAGS & 返回时恢复用户可见标志 \\
+\bottomrule
+\end{longtable}
+
+这张表解释了为什么系统调用 wrapper 不是普通 C 调用。libc 或内联汇编必须把参数移动到这些寄存器，再执行 \code{syscall}。如果你在调试器里看系统调用入口，先看寄存器，而不是看用户栈。
+
+\subsection{CPU 做了什么，入口汇编又补了什么}
+
+\code{syscall} 指令本身只做一部分特权转移：保存返回 RIP 到 \code{rcx}，保存 RFLAGS 到 \code{r11}，把 RIP 改成内核配置的入口地址，按 MSR 配置更新特权相关状态。它不会自动保存所有通用寄存器，也不会替你验证用户参数。
+
+\begin{lstlisting}
+before syscall:
+  rax = syscall number
+  rdi/rsi/rdx/r10/r8/r9 = arguments
+  rip = address of syscall instruction
+  rsp = user stack
+
+after CPU syscall transition:
+  rcx = user return rip
+  r11 = user rflags
+  rip = IA32_LSTAR entry address
+  execution enters ring 0 entry path
+\end{lstlisting}
+
+随后 \filepath{entry\_64.S} 的入口代码补齐内核需要的上下文：处理 \code{swapgs}，找到当前 CPU 的内核数据，切换到当前线程的内核栈，按约定把寄存器保存成 \code{pt\_regs} 形状，再调用 C 层分发函数。
+
+\begin{lstlisting}
+entry_SYSCALL_64 outline:
+  swapgs or equivalent per-cpu base transition
+  save user rsp
+  load current task kernel stack
+  push user ss, user rsp, rflags, user cs, user rip style frame
+  save general-purpose registers into pt_regs
+  call do_syscall_64(regs, nr)
+\end{lstlisting}
+
+这里的关键不是背汇编每一行，而是理解入口汇编在构造一个 C 层可读的事实包：这个任务从哪里来，用户 RIP/RSP/RFLAGS 是什么，参数寄存器是什么，返回时要恢复到哪里。
+
+\subsection{\code{pt\_regs}：低级入口交给 C 代码的证据包}
+
+\code{pt\_regs} 可以理解为“这次陷入的证据包”。系统调用、page fault、中断和调试异常都会需要类似对象，只是字段含义和错误码不同。系统调用路径尤其关心参数寄存器、系统调用号、用户返回 RIP、用户栈和返回值位置。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+\code{pt\_regs} 类字段 & 来源 & 用途 \\
+\midrule
+通用寄存器 & 用户态执行 \code{syscall} 前的寄存器 & 提取参数、保存用户可见状态 \\
+\code{orig\_ax} & 原始系统调用号 & tracing/seccomp/restart syscall 需要原号 \\
+\code{ip} & 用户返回 RIP & 信号、ptrace、返回路径验证 \\
+\code{sp} & 用户 RSP & 信号帧构造和调试输出 \\
+\code{flags} & 用户 RFLAGS & 单步、方向标志、中断相关状态 \\
+\code{ax} & 返回值位置 & C 层结果写回给用户态 \\
+\bottomrule
+\end{longtable}
+
+入口代码漏保存字段，后面不是“少打印一个值”，而是可能破坏调试、信号、系统调用重启、seccomp、ptrace 和返回用户态。第一阶段读源码时要形成这个判断：低级结构体字段是安全边界的一部分。
+
+\subsection{C 层分发：不只是查表调用}
+
+C 层分发通常可以抽象成下面的流程，但真实路径还要处理 tracing、audit、seccomp、ptrace、系统调用重启、信号和返回用户态前的 work。
+
+\begin{lstlisting}
+do_syscall_64(regs, nr):
+  if nr is outside syscall table:
+    regs.ax = -ENOSYS
+    return
+  if syscall_enter_work is pending:
+    run tracing/audit/seccomp hooks
+    nr may be changed or rejected
+  result = syscall_table[nr](regs arguments)
+  regs.ax = result
+  if syscall_exit_work is pending:
+    run tracing/audit/signal/resched checks
+\end{lstlisting}
+
+这说明系统调用号表只是中间一步。比如 seccomp 可能在真正执行前拒绝某个系统调用；ptrace 可能观察或改写参数；audit 可能记录事件；信号可能导致阻塞系统调用返回 \code{-EINTR} 或被重启。把系统调用理解成“数组下标调函数”会漏掉安全和可观测性。
+
+\subsection{以 \code{write(fd, buf, len)} 追一条完整路径}
+
+用户态调用 \code{write(1, buf, len)} 时，硬件入口只知道三个整数：fd、用户地址、长度。它不知道这是终端、文件、pipe 还是 socket。内核必须逐层把整数还原成受保护对象。
+
+\begin{lstlisting}
+write(fd, user_buf, len):
+  fd table lookup -> struct file
+  check file was opened for writing
+  copy or pin user buffer under user access rules
+  dispatch file->f_op->write_iter
+  update file offset or stream queue
+  return bytes written or negative errno
+\end{lstlisting}
+
+如果 fd 无效，返回 \code{-EBADF}。如果用户 buffer 不可读，返回 \code{-EFAULT}。如果对象暂时不能写且是非阻塞 fd，返回 \code{-EAGAIN}。如果信号打断等待，可能返回 \code{-EINTR}。这些错误不是装饰，它们分别来自 fd 表、用户地址空间、对象等待语义和信号状态。
+
+\subsection{用户指针复制：fault 可以是正常错误路径}
+
+用户指针的特殊性在于：它来自不可信地址空间，但内核必须按请求访问它。直接解引用用户指针会把用户错误变成内核错误。正确路径是 usercopy：访问前后有范围、权限、异常修复和对象生命周期约束。
+
+\begin{lstlisting}
+copy_from_user kernel idea:
+  while bytes remain:
+    try load from user address
+    if page fault happens at a usercopy instruction:
+      jump to exception-table fixup
+      return bytes not copied or -EFAULT
+    store into kernel-owned buffer
+\end{lstlisting}
+
+异常表的价值在这里体现出来：同样是 page fault，如果 faulting RIP 在 usercopy 的异常表范围内，它是用户输入错误；如果发生在普通内核指针解引用上，它更可能是内核 bug。第一阶段讲 fault 时必须把这两类区分开。
+
+\subsection{返回路径：快返回和慢返回}
+
+系统调用返回不是简单 \code{return result}。内核要决定能否走快速 \code{sysretq} 风格路径，还是必须走更通用的 \code{iretq} 风格路径。若用户返回 RIP/RFLAGS、tracing、信号、单步调试、抢占或兼容状态需要特殊处理，就可能走慢路径。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+返回条件 & 快路径倾向 & 慢路径原因 \\
+\midrule
+普通系统调用，无 pending work & 可快速恢复寄存器并返回 & 无 \\
+有信号待投递 & 不适合直接快返 & 需要构造用户信号帧 \\
+需要调度 & 不适合直接快返 & 返回前要切换任务 \\
+ptrace/seccomp/audit exit work & 不适合直接快返 & 需要通知观察者或改写结果 \\
+返回状态不满足快速指令限制 & 走通用返回 & \code{iretq} 能表达更完整状态恢复 \\
+\bottomrule
+\end{longtable}
+
+这也是为什么返回路径经常比入口更容易出安全问题。入口时内核取得控制权；返回时内核把控制权交回给不可信程序，必须保证所有用户可见状态都被正确恢复，内核私密状态没有泄漏。
+
+\subsection{观察证据：用真实系统校准理解}
+
+原理卷不要求读者修改内核，但要求能把系统调用入口的解释和系统证据对上。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+命令或文件 & 能观察什么 & 如何判读 \\
+\midrule
+\code{strace -e trace=write ./a.out} & 用户态发起的系统调用和 errno & 只能看到边界结果，看不到内核内部等待 \\
+\code{perf trace -e syscalls:sys\_enter\_*} & syscall enter/exit tracepoint & 能看到系统调用号、参数和返回时序 \\
+\code{grep syscall /proc/kallsyms} & 内核符号是否可见 & 受权限和 kallsyms 设置影响 \\
+\code{cat /proc/<pid>/syscall} & 线程当前 syscall 和参数 & 只在任务正在系统调用中时有意义 \\
+\code{bpftrace tracepoint:syscalls:*} & syscall tracepoint 采样 & 可按 pid、comm、errno 过滤 \\
+\bottomrule
+\end{longtable}
+
+用这些证据时要保持边界感。\code{strace} 看到 \code{write(1,...)=5}，只能证明用户/内核边界返回了 5；它不能证明数据已经落盘，也不能说明底层是否发生 page fault、锁等待、设备 I/O 或信号处理。要解释更深路径，需要结合 perf、ftrace、eBPF、\code{/proc/<pid>/stack} 和具体子系统日志。
+
+\subsection{第一阶段验收题}
+
+读完本节，应能不看书回答这些问题。
+
+\begin{enumerate}
+\tightlist
+\item 为什么 x86-64 Linux 第四个系统调用参数放在 \code{r10} 而不是 \code{rcx}？
+\item \code{rcx} 和 \code{r11} 在 \code{syscall} 入口中分别保存什么？
+\item 为什么入口汇编要构造 \code{pt\_regs}，而不是直接调用 C 函数？
+\item \code{do\_syscall\_64} 查表前后为什么还有 seccomp、tracing、audit 和 signal work？
+\item \code{copy\_from\_user} 遇到 page fault 为什么通常返回 \code{EFAULT} 而不是让内核崩溃？
+\item \code{sysretq} 和 \code{iretq} 都能回用户态，为什么还要区分快路径和慢路径？
+\item \code{strace} 能证明什么，不能证明什么？
+\end{enumerate}
+
+这些问题能答清，系统调用就不再是“用户调用内核函数”，而是一条从 x86-64 硬件入口、低级汇编、C 层分发、对象权限、用户内存和返回路径共同组成的受控边界。
