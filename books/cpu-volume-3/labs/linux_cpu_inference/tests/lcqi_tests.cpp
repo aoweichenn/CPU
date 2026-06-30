@@ -1453,6 +1453,36 @@ void test_llama_gguf_loader_and_generation() {
             "LLaMA GGUF F32 fixture should not call GGML direct matvec");
 }
 
+void test_llama_gguf_parallel_generation_matches_serial() {
+    const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_parallel.gguf");
+    write_tiny_llama_gguf_fixture(path);
+
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{1};
+    const lcqi::LlamaGgufGenerationResult serial =
+        lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+    lcqi::LlamaGgufExecutionOptions parallel_options;
+    parallel_options.worker_count = 2;
+    parallel_options.parallel_min_rows = 1;
+    const lcqi::LlamaGgufGenerationResult parallel =
+        lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1, parallel_options);
+    std::filesystem::remove(path);
+
+    require(parallel.worker_count == parallel_options.worker_count,
+            "parallel LLaMA worker count mismatch");
+    require(parallel.generated_ids == serial.generated_ids,
+            "parallel LLaMA generated ids mismatch");
+    require(parallel.predicted_first_token == serial.predicted_first_token,
+            "parallel LLaMA predicted token mismatch");
+    require(parallel.hotspots.f32_fallback_calls == serial.hotspots.f32_fallback_calls,
+            "parallel LLaMA fallback call count mismatch");
+    require(parallel.hotspots.q4_k_direct_calls == serial.hotspots.q4_k_direct_calls,
+            "parallel LLaMA Q4 direct call count mismatch");
+    require(parallel.hotspots.ggml_direct_calls == serial.hotspots.ggml_direct_calls,
+            "parallel LLaMA GGML direct call count mismatch");
+}
+
 void test_llama_gguf_q4_direct_generation() {
     const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_q4_direct.gguf");
     write_tiny_llama_q4_direct_gguf_fixture(path);
@@ -1993,6 +2023,7 @@ int main() {
         test_ggml_mixed_dequantizers();
         test_ggml_quantized_f32_matvec_paths();
         test_llama_gguf_loader_and_generation();
+        test_llama_gguf_parallel_generation_matches_serial();
         test_llama_gguf_q4_direct_generation();
         test_llama_gguf_ggml_direct_generation();
         test_gpt2_tiny_forward_and_generation();

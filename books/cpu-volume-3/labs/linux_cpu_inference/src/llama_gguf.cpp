@@ -8,13 +8,16 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <utility>
 
@@ -46,6 +49,12 @@ constexpr const char* LCQI_LLAMA_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT";
 constexpr const char* LCQI_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
 constexpr const char* LCQI_LLAMA_FALSE_ENV = "0";
 constexpr const char* LCQI_LLAMA_TRUE_ENV = "1";
+constexpr std::int32_t LCQI_LLAMA_MAX_AUTO_WORKERS = 8;
+constexpr std::int32_t LCQI_LLAMA_DEFAULT_PARALLEL_MIN_ROWS = 512;
+constexpr std::int32_t LCQI_LLAMA_PARALLEL_MIN_COLUMNS = 512;
+constexpr std::int64_t LCQI_LLAMA_PARALLEL_MIN_OPS = 1'000'000;
+constexpr std::size_t LCQI_LLAMA_PARALLEL_ROW_BLOCK_MULTIPLIER = 4;
+constexpr std::size_t LCQI_LLAMA_WORKER_SPIN_PAUSES_BEFORE_YIELD = 4096;
 
 using Clock = std::chrono::steady_clock;
 
@@ -58,6 +67,192 @@ enum class LlamaGgufLinearOp : std::uint8_t {
     w_up,
     w_down,
     lm_head,
+};
+
+void pause_worker_spin(std::size_t& pause_count) noexcept {
+#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+    __builtin_ia32_pause();
+#endif
+    ++pause_count;
+    if (pause_count >= LCQI_LLAMA_WORKER_SPIN_PAUSES_BEFORE_YIELD) {
+        pause_count = 0;
+        std::this_thread::yield();
+    }
+}
+
+class LlamaParallelWorkerPool {
+public:
+    explicit LlamaParallelWorkerPool(std::int32_t requested_workers)
+        : worker_count_(LlamaParallelWorkerPool::normalize_worker_count(requested_workers)) {
+        if (this->worker_count_ <= 1) {
+            return;
+        }
+        const std::size_t background_count =
+            static_cast<std::size_t>(this->worker_count_ - 1);
+        this->threads_.reserve(background_count);
+        for (std::size_t index = 0; index < background_count; ++index) {
+            this->threads_.emplace_back([this, index]() { this->worker_loop(index); });
+        }
+    }
+
+    ~LlamaParallelWorkerPool() {
+        this->stopping_.store(true, std::memory_order_release);
+        this->generation_.fetch_add(1, std::memory_order_release);
+        for (std::thread& thread : this->threads_) {
+            if (thread.joinable()) {
+                thread.join();
+            }
+        }
+    }
+
+    LlamaParallelWorkerPool(const LlamaParallelWorkerPool&) = delete;
+    LlamaParallelWorkerPool& operator=(const LlamaParallelWorkerPool&) = delete;
+
+    [[nodiscard]] std::int32_t worker_count() const noexcept {
+        return this->worker_count_;
+    }
+
+    template <typename Function>
+    void parallel_for_rows(std::size_t begin,
+                           std::size_t end,
+                           std::size_t grain,
+                           Function&& function) {
+        if (end <= begin) {
+            return;
+        }
+        const std::size_t row_count = end - begin;
+        if (this->worker_count_ <= 1 || row_count <= grain) {
+            function(begin, end, 0);
+            return;
+        }
+
+        const std::size_t task_count =
+            std::min<std::size_t>(static_cast<std::size_t>(this->worker_count_),
+                                  (row_count + grain - 1) / grain);
+        if (task_count <= 1) {
+            function(begin, end, 0);
+            return;
+        }
+
+        auto task_context = ParallelTaskContext<Function>{function};
+        this->task_begin_.store(begin, std::memory_order_release);
+        this->task_end_.store(end, std::memory_order_release);
+        this->task_count_.store(task_count, std::memory_order_release);
+        this->task_context_.store(&task_context, std::memory_order_release);
+        this->task_invoke_.store(&ParallelTaskContext<Function>::invoke,
+                                 std::memory_order_release);
+        this->active_workers_.store(task_count - 1, std::memory_order_release);
+        this->generation_.fetch_add(1, std::memory_order_release);
+
+        const std::size_t main_worker = task_count - 1;
+        const auto [main_begin, main_end] =
+            this->chunk_bounds(begin, end, task_count, main_worker);
+        function(main_begin, main_end, main_worker);
+
+        std::size_t pause_count = 0;
+        while (this->active_workers_.load(std::memory_order_acquire) != 0) {
+            pause_worker_spin(pause_count);
+        }
+        this->task_context_.store(nullptr, std::memory_order_release);
+        this->task_invoke_.store(nullptr, std::memory_order_release);
+    }
+
+private:
+    template <typename Function>
+    struct ParallelTaskContext {
+        Function& function;
+
+        static void invoke(void* context,
+                           std::size_t begin,
+                           std::size_t end,
+                           std::size_t worker_index) {
+            auto* typed_context = static_cast<ParallelTaskContext*>(context);
+            typed_context->function(begin, end, worker_index);
+        }
+    };
+
+    std::int32_t worker_count_ = 1;
+    std::vector<std::thread> threads_;
+    std::atomic<bool> stopping_ = false;
+    std::atomic<std::uint64_t> generation_ = 0;
+    std::atomic<std::size_t> task_begin_ = 0;
+    std::atomic<std::size_t> task_end_ = 0;
+    std::atomic<std::size_t> task_count_ = 0;
+    std::atomic<std::size_t> active_workers_ = 0;
+    std::atomic<void*> task_context_ = nullptr;
+    std::atomic<void (*)(void*, std::size_t, std::size_t, std::size_t)> task_invoke_ = nullptr;
+
+    [[nodiscard]] static std::int32_t normalize_worker_count(std::int32_t requested_workers) {
+        if (requested_workers > 0) {
+            return requested_workers;
+        }
+        const unsigned int hardware_workers = std::thread::hardware_concurrency();
+        if (hardware_workers == 0) {
+            return 1;
+        }
+        const std::int32_t capped =
+            std::min<std::int32_t>(static_cast<std::int32_t>(hardware_workers),
+                                   LCQI_LLAMA_MAX_AUTO_WORKERS);
+        return std::max(capped, 1);
+    }
+
+    [[nodiscard]] std::pair<std::size_t, std::size_t> chunk_bounds(
+        std::size_t begin,
+        std::size_t end,
+        std::size_t task_count,
+        std::size_t worker_index) const noexcept {
+        const std::size_t row_count = end - begin;
+        const std::size_t chunk_begin = begin + row_count * worker_index / task_count;
+        const std::size_t chunk_end = begin + row_count * (worker_index + 1) / task_count;
+        return {chunk_begin, chunk_end};
+    }
+
+    void worker_loop(std::size_t worker_index) {
+        std::uint64_t observed_generation = 0;
+        std::size_t pause_count = 0;
+        while (true) {
+            const std::uint64_t current_generation =
+                this->generation_.load(std::memory_order_acquire);
+            if (current_generation == observed_generation) {
+                if (this->stopping_.load(std::memory_order_acquire)) {
+                    return;
+                }
+                pause_worker_spin(pause_count);
+                continue;
+            }
+
+            observed_generation = current_generation;
+            pause_count = 0;
+            if (this->stopping_.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            const std::size_t task_count = this->task_count_.load(std::memory_order_acquire);
+            if (this->generation_.load(std::memory_order_acquire) != current_generation ||
+                task_count == 0) {
+                continue;
+            }
+            const std::size_t background_task_count = task_count - 1;
+            if (worker_index >= background_task_count) {
+                continue;
+            }
+            void* task_context = this->task_context_.load(std::memory_order_acquire);
+            void (*task_invoke)(void*, std::size_t, std::size_t, std::size_t) =
+                this->task_invoke_.load(std::memory_order_acquire);
+            if (task_context == nullptr || task_invoke == nullptr) {
+                continue;
+            }
+            const std::size_t task_begin = this->task_begin_.load(std::memory_order_acquire);
+            const std::size_t task_end = this->task_end_.load(std::memory_order_acquire);
+            if (this->generation_.load(std::memory_order_acquire) != current_generation) {
+                continue;
+            }
+            const auto [begin, end] =
+                this->chunk_bounds(task_begin, task_end, task_count, worker_index);
+            task_invoke(task_context, begin, end, worker_index);
+            this->active_workers_.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
 };
 
 [[nodiscard]] double elapsed_ms(Clock::time_point begin, Clock::time_point end) {
@@ -342,6 +537,165 @@ void linear_f32_fallback(const LlamaGgufLinearWeights& layer,
                               output.data());
 }
 
+[[nodiscard]] bool should_parallelize_rows(const LlamaGgufExecutionOptions& options,
+                                           std::size_t rows,
+                                           std::size_t columns,
+                                           const LlamaParallelWorkerPool* worker_pool) {
+    if (worker_pool == nullptr || worker_pool->worker_count() <= 1) {
+        return false;
+    }
+    const std::int32_t min_rows =
+        options.parallel_min_rows > 0 ? options.parallel_min_rows
+                                      : LCQI_LLAMA_DEFAULT_PARALLEL_MIN_ROWS;
+    if (rows < checked_size(min_rows, "parallel_min_rows")) {
+        return false;
+    }
+    if (options.worker_count > 1) {
+        return true;
+    }
+    return columns >= checked_size(LCQI_LLAMA_PARALLEL_MIN_COLUMNS, "parallel_min_columns") ||
+           rows * columns >= static_cast<std::size_t>(LCQI_LLAMA_PARALLEL_MIN_OPS);
+}
+
+[[nodiscard]] std::size_t parallel_row_grain(std::size_t rows,
+                                             const LlamaParallelWorkerPool& worker_pool) {
+    const std::size_t workers = checked_size(worker_pool.worker_count(), "worker_count");
+    const std::size_t target_tasks = workers * LCQI_LLAMA_PARALLEL_ROW_BLOCK_MULTIPLIER;
+    return std::max<std::size_t>(1, (rows + target_tasks - 1) / target_tasks);
+}
+
+[[nodiscard]] bool model_has_parallel_work(const LlamaGgufModel& model,
+                                           const LlamaGgufExecutionOptions& options) {
+    if (options.worker_count == 1) {
+        return false;
+    }
+    const DecoderConfig& config = model.decoder.config;
+    const std::size_t hidden_size = checked_size(config.hidden_size, "hidden_size");
+    const std::size_t kv_width = checked_size(config.kv_heads * config.head_dim, "kv_width");
+    const std::size_t intermediate_size =
+        checked_size(config.intermediate_size, "intermediate_size");
+    const std::size_t vocab_size = checked_size(config.vocab_size, "vocab_size");
+    const std::int32_t min_rows =
+        options.parallel_min_rows > 0 ? options.parallel_min_rows
+                                      : LCQI_LLAMA_DEFAULT_PARALLEL_MIN_ROWS;
+    const auto large_enough = [min_rows](std::size_t rows, std::size_t columns) {
+        if (rows < checked_size(min_rows, "parallel_min_rows")) {
+            return false;
+        }
+        return columns >= checked_size(LCQI_LLAMA_PARALLEL_MIN_COLUMNS,
+                                       "parallel_min_columns") ||
+               rows * columns >= static_cast<std::size_t>(LCQI_LLAMA_PARALLEL_MIN_OPS);
+    };
+    if (options.worker_count > 1) {
+        return vocab_size >= checked_size(min_rows, "parallel_min_rows") ||
+               hidden_size >= checked_size(min_rows, "parallel_min_rows") ||
+               kv_width >= checked_size(min_rows, "parallel_min_rows") ||
+               intermediate_size >= checked_size(min_rows, "parallel_min_rows");
+    }
+    return large_enough(vocab_size, hidden_size) ||
+           large_enough(hidden_size, hidden_size) ||
+           large_enough(kv_width, hidden_size) ||
+           large_enough(intermediate_size, hidden_size) ||
+           large_enough(hidden_size, intermediate_size);
+}
+
+[[nodiscard]] std::unique_ptr<LlamaParallelWorkerPool> make_worker_pool(
+    const LlamaGgufModel& model,
+    const LlamaGgufExecutionOptions& options) {
+    if (!model_has_parallel_work(model, options)) {
+        return nullptr;
+    }
+    return std::make_unique<LlamaParallelWorkerPool>(options.worker_count);
+}
+
+void linear_f32_fallback_parallel(const LlamaGgufLinearWeights& layer,
+                                  std::span<const float> input,
+                                  std::span<float> output,
+                                  const LlamaGgufExecutionOptions& options,
+                                  LlamaParallelWorkerPool* worker_pool) {
+    if (layer.f32_weights.size() !=
+        checked_size(layer.input_size, "linear input size") *
+            checked_size(layer.output_size, "linear output size")) {
+        throw std::runtime_error("LLaMA GGUF F32 linear weight size mismatch");
+    }
+    const std::size_t input_size = checked_size(layer.input_size, "linear input size");
+    const std::size_t output_size = checked_size(layer.output_size, "linear output size");
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        linear_f32_fallback(layer, input, output);
+        return;
+    }
+
+    const float* weights = layer.f32_weights.data();
+    const float* input_data = input.data();
+    float* output_data = output.data();
+    const auto rows_fn = [weights, input_data, input_size, output_data](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        (void)worker_index;
+        linear_f32_rows_unchecked(weights,
+                                  input_data,
+                                  nullptr,
+                                  input_size,
+                                  begin,
+                                  end,
+                                  output_data);
+    };
+    worker_pool->parallel_for_rows(0,
+                                   output_size,
+                                   parallel_row_grain(output_size, *worker_pool),
+                                   rows_fn);
+}
+
+[[nodiscard]] F32RowMax max_dot_f32_rows_parallel(const float* weights,
+                                                  const float* input,
+                                                  std::size_t input_size,
+                                                  std::size_t row_count,
+                                                  const LlamaGgufExecutionOptions& options,
+                                                  LlamaParallelWorkerPool* worker_pool) {
+    if (!should_parallelize_rows(options, row_count, input_size, worker_pool)) {
+        return max_dot_f32_rows_unchecked(weights, input, input_size, 0, row_count);
+    }
+
+    const std::size_t worker_count = checked_size(worker_pool->worker_count(), "worker_count");
+    std::vector<F32RowMax> local_best(worker_count);
+    std::vector<std::uint8_t> has_result(worker_count, 0U);
+    const auto rows_fn = [weights, input, input_size, &local_best, &has_result](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        if (begin >= end) {
+            return;
+        }
+        local_best[worker_index] =
+            max_dot_f32_rows_unchecked(weights, input, input_size, begin, end);
+        has_result[worker_index] = 1U;
+    };
+    worker_pool->parallel_for_rows(0,
+                                   row_count,
+                                   parallel_row_grain(row_count, *worker_pool),
+                                   rows_fn);
+
+    F32RowMax best;
+    best.row = 0;
+    best.value = -std::numeric_limits<float>::infinity();
+    bool found = false;
+    for (std::size_t index = 0; index < local_best.size(); ++index) {
+        if (has_result[index] == 0U) {
+            continue;
+        }
+        const F32RowMax& candidate = local_best[index];
+        if (!found || candidate.value > best.value) {
+            best = candidate;
+            found = true;
+        }
+    }
+    if (!found) {
+        return max_dot_f32_rows_unchecked(weights, input, input_size, 0, row_count);
+    }
+    return best;
+}
+
 void linear_q4_k_direct(const LlamaGgufLinearWeights& layer,
                         std::span<const Q8KBlock> q8_input,
                         std::span<float> output) {
@@ -354,6 +708,41 @@ void linear_q4_k_direct(const LlamaGgufLinearWeights& layer,
                    layer.input_size,
                    q8_input,
                    output);
+}
+
+void linear_q4_k_direct_parallel(const LlamaGgufLinearWeights& layer,
+                                 std::span<const Q8KBlock> q8_input,
+                                 std::span<float> output,
+                                 const LlamaGgufExecutionOptions& options,
+                                 LlamaParallelWorkerPool* worker_pool) {
+    if (q8_input.size() !=
+        checked_size(layer.input_size / LCQI_QK_K_BLOCK_VALUES, "Q8_K input block count")) {
+        throw std::runtime_error("LLaMA GGUF Q4_K scratch block count mismatch");
+    }
+    const std::size_t input_size = checked_size(layer.input_size, "linear input size");
+    const std::size_t output_size = checked_size(layer.output_size, "linear output size");
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        linear_q4_k_direct(layer, q8_input, output);
+        return;
+    }
+
+    const auto rows_fn = [&layer, q8_input, output](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        (void)worker_index;
+        matvec_q4_k_q8_rows_unchecked(layer.quantized_bytes,
+                                      layer.output_size,
+                                      layer.input_size,
+                                      q8_input,
+                                      output,
+                                      static_cast<std::int64_t>(begin),
+                                      static_cast<std::int64_t>(end));
+    };
+    worker_pool->parallel_for_rows(0,
+                                   output_size,
+                                   parallel_row_grain(output_size, *worker_pool),
+                                   rows_fn);
 }
 
 void linear_ggml_quantized_direct(const LlamaGgufLinearWeights& layer,
@@ -377,12 +766,16 @@ void linear_gguf(const LlamaGgufLinearWeights& layer,
                  std::span<const Q8_0InputBlock> q8_0_input,
                  std::span<float> output,
                  LlamaGgufLinearOp operation,
-                 LlamaGgufHotspotReport& hotspots) {
+                 LlamaGgufHotspotReport& hotspots,
+                 const LlamaGgufExecutionOptions& options,
+                 LlamaParallelWorkerPool* worker_pool) {
     validate_linear_shape(layer, input, output);
     double elapsed = 0.0;
     switch (layer.storage) {
         case LlamaGgufLinearStorage::q4_k:
-            elapsed = measure_ms([&]() { linear_q4_k_direct(layer, q8_input, output); });
+            elapsed = measure_ms([&]() {
+                linear_q4_k_direct_parallel(layer, q8_input, output, options, worker_pool);
+            });
             hotspots.q4_k_direct_ms += elapsed;
             ++hotspots.q4_k_direct_calls;
             break;
@@ -394,7 +787,9 @@ void linear_gguf(const LlamaGgufLinearWeights& layer,
             ++hotspots.ggml_direct_calls;
             break;
         case LlamaGgufLinearStorage::f32:
-            elapsed = measure_ms([&]() { linear_f32_fallback(layer, input, output); });
+            elapsed = measure_ms([&]() {
+                linear_f32_fallback_parallel(layer, input, output, options, worker_pool);
+            });
             hotspots.f32_fallback_ms += elapsed;
             ++hotspots.f32_fallback_calls;
             break;
@@ -489,7 +884,9 @@ void forward_llama_layer(const DecoderConfig& config,
                          std::int32_t model_position,
                          ReferenceKVCache& cache,
                          LlamaWorkspace& workspace,
-                         LlamaGgufHotspotReport& hotspots) {
+                         LlamaGgufHotspotReport& hotspots,
+                         const LlamaGgufExecutionOptions& options,
+                         LlamaParallelWorkerPool* worker_pool) {
     hotspots.rms_norm_ms += measure_ms([&]() {
         rms_norm(workspace.hidden,
                  layer.rms_attention_weight,
@@ -510,21 +907,27 @@ void forward_llama_layer(const DecoderConfig& config,
                 workspace.normed_q8_0,
                 workspace.query,
                 LlamaGgufLinearOp::wq,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     linear_gguf(layer.wk,
                 workspace.normed,
                 workspace.normed_q8,
                 workspace.normed_q8_0,
                 workspace.key,
                 LlamaGgufLinearOp::wk,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     linear_gguf(layer.wv,
                 workspace.normed,
                 workspace.normed_q8,
                 workspace.normed_q8_0,
                 workspace.value,
                 LlamaGgufLinearOp::wv,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     hotspots.rope_ms += measure_ms([&]() {
         apply_rope(workspace.query,
                    config.query_heads,
@@ -558,7 +961,9 @@ void forward_llama_layer(const DecoderConfig& config,
                 workspace.attention_q8_0,
                 workspace.projected,
                 LlamaGgufLinearOp::wo,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     add_inplace(workspace.hidden, workspace.projected);
 
     hotspots.rms_norm_ms += measure_ms([&]() {
@@ -576,14 +981,18 @@ void forward_llama_layer(const DecoderConfig& config,
                 workspace.normed_q8_0,
                 workspace.gate,
                 LlamaGgufLinearOp::w_gate,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     linear_gguf(layer.w_up,
                 workspace.normed,
                 workspace.normed_q8,
                 workspace.normed_q8_0,
                 workspace.up,
                 LlamaGgufLinearOp::w_up,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     for (std::size_t index = 0; index < workspace.mlp_hidden.size(); ++index) {
         workspace.mlp_hidden[index] = silu(workspace.gate[index]) * workspace.up[index];
     }
@@ -599,23 +1008,30 @@ void forward_llama_layer(const DecoderConfig& config,
                 workspace.mlp_hidden_q8_0,
                 workspace.mlp_out,
                 LlamaGgufLinearOp::w_down,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     add_inplace(workspace.hidden, workspace.mlp_out);
 }
 
 [[nodiscard]] std::int32_t predict_next_token(const LlamaGgufModel& model,
                                               std::span<const float> final_hidden,
-                                              LlamaGgufHotspotReport& hotspots) {
+                                              LlamaGgufHotspotReport& hotspots,
+                                              const LlamaGgufExecutionOptions& options,
+                                              LlamaParallelWorkerPool* worker_pool) {
     const DecoderConfig& config = model.decoder.config;
     F32RowMax best;
     if (model.lm_head_tied_to_embedding) {
         const std::span<const float> weights = model.decoder.token_embedding;
+        const std::size_t hidden_size = checked_size(config.hidden_size, "hidden_size");
+        const std::size_t vocab_size = checked_size(config.vocab_size, "vocab_size");
         hotspots.lm_head_ms += measure_ms([&]() {
-            best = max_dot_f32_rows_unchecked(weights.data(),
-                                              final_hidden.data(),
-                                              checked_size(config.hidden_size, "hidden_size"),
-                                              0,
-                                              checked_size(config.vocab_size, "vocab_size"));
+            best = max_dot_f32_rows_parallel(weights.data(),
+                                             final_hidden.data(),
+                                             hidden_size,
+                                             vocab_size,
+                                             options,
+                                             worker_pool);
         });
         return static_cast<std::int32_t>(best.row);
     }
@@ -635,7 +1051,9 @@ void forward_llama_layer(const DecoderConfig& config,
                 final_hidden_q8_0,
                 logits,
                 LlamaGgufLinearOp::lm_head,
-                hotspots);
+                hotspots,
+                options,
+                worker_pool);
     best.row = 0;
     best.value = logits.front();
     for (std::size_t row = 1; row < logits.size(); ++row) {
@@ -653,7 +1071,9 @@ void forward_llama_layer(const DecoderConfig& config,
                                               LlamaWorkspace& workspace,
                                               std::int32_t token_id,
                                               bool predict,
-                                              LlamaGgufHotspotReport& hotspots) {
+                                              LlamaGgufHotspotReport& hotspots,
+                                              const LlamaGgufExecutionOptions& options,
+                                              LlamaParallelWorkerPool* worker_pool) {
     const DecoderConfig& original_config = model.decoder.config;
     if (token_id < 0 || token_id >= original_config.vocab_size) {
         throw std::runtime_error("LLaMA token id out of vocabulary");
@@ -675,7 +1095,9 @@ void forward_llama_layer(const DecoderConfig& config,
                             model_position,
                             cache,
                             workspace,
-                            hotspots);
+                            hotspots,
+                            options,
+                            worker_pool);
     }
     if (!predict) {
         return -1;
@@ -686,7 +1108,7 @@ void forward_llama_layer(const DecoderConfig& config,
                  active_config.rms_epsilon,
                  workspace.final_norm);
     });
-    return predict_next_token(model, workspace.final_norm, hotspots);
+    return predict_next_token(model, workspace.final_norm, hotspots, options, worker_pool);
 }
 
 [[nodiscard]] std::size_t kv_cache_bytes(const DecoderConfig& config, std::int32_t layer_count) {
@@ -945,6 +1367,17 @@ std::vector<std::int32_t> llama_gguf_chat_prompt_ids(const Gpt2Tokenizer& tokeni
 LlamaGgufGenerationResult llama_gguf_generate_greedy(const LlamaGgufModel& model,
                                                      std::span<const std::int32_t> prompt_ids,
                                                      std::int32_t max_new_tokens) {
+    return llama_gguf_generate_greedy(model,
+                                      prompt_ids,
+                                      max_new_tokens,
+                                      LlamaGgufExecutionOptions{});
+}
+
+LlamaGgufGenerationResult llama_gguf_generate_greedy(
+    const LlamaGgufModel& model,
+    std::span<const std::int32_t> prompt_ids,
+    std::int32_t max_new_tokens,
+    const LlamaGgufExecutionOptions& options) {
     if (prompt_ids.empty()) {
         throw std::runtime_error("LLaMA generation requires at least one prompt token");
     }
@@ -963,11 +1396,13 @@ LlamaGgufGenerationResult llama_gguf_generate_greedy(const LlamaGgufModel& model
     active_config.max_context = active_context;
     ReferenceKVCache cache(active_config, layer_count);
     LlamaWorkspace workspace(active_config);
+    std::unique_ptr<LlamaParallelWorkerPool> worker_pool = make_worker_pool(model, options);
 
     LlamaGgufGenerationResult result;
     result.prompt_ids.assign(prompt_ids.begin(), prompt_ids.end());
     result.generated_ids.assign(prompt_ids.begin(), prompt_ids.end());
     result.kv_cache_bytes = kv_cache_bytes(active_config, layer_count);
+    result.worker_count = worker_pool ? worker_pool->worker_count() : 1;
     if (max_new_tokens == 0) {
         return result;
     }
@@ -980,7 +1415,9 @@ LlamaGgufGenerationResult llama_gguf_generate_greedy(const LlamaGgufModel& model
                                              workspace,
                                              prompt_ids[index],
                                              false,
-                                             result.hotspots));
+                                             result.hotspots,
+                                             options,
+                                             worker_pool.get()));
     }
     std::int32_t predicted = step_llama_decoder(model,
                                                 active_config,
@@ -988,7 +1425,9 @@ LlamaGgufGenerationResult llama_gguf_generate_greedy(const LlamaGgufModel& model
                                                 workspace,
                                                 prompt_ids.back(),
                                                 true,
-                                                result.hotspots);
+                                                result.hotspots,
+                                                options,
+                                                worker_pool.get());
     result.predicted_first_token = predicted;
     result.prefill_steps = prompt_ids.size();
     result.prefill_ms = elapsed_ms(prefill_begin, Clock::now());
@@ -1006,7 +1445,9 @@ LlamaGgufGenerationResult llama_gguf_generate_greedy(const LlamaGgufModel& model
                                            workspace,
                                            predicted,
                                            true,
-                                           result.hotspots);
+                                           result.hotspots,
+                                           options,
+                                           worker_pool.get());
             ++result.decode_steps;
         }
     }

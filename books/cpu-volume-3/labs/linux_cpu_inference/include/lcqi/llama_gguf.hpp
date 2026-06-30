@@ -4,6 +4,7 @@
 #include <lcqi/gguf.hpp>
 #include <lcqi/reference_decoder.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <span>
@@ -95,6 +96,11 @@ struct LlamaGgufHotspotReport {
     std::uint64_t f32_fallback_calls = 0;
 };
 
+struct LlamaGgufExecutionOptions {
+    std::int32_t worker_count = 0;
+    std::int32_t parallel_min_rows = 512;
+};
+
 struct LlamaGgufGenerationResult {
     std::vector<std::int32_t> prompt_ids;
     std::vector<std::int32_t> generated_ids;
@@ -106,6 +112,7 @@ struct LlamaGgufGenerationResult {
     std::size_t kv_cache_bytes = 0;
     std::size_t prefill_steps = 0;
     std::size_t decode_steps = 0;
+    std::int32_t worker_count = 1;
     std::int32_t predicted_first_token = -1;
 };
 
@@ -124,5 +131,11 @@ struct LlamaGgufGenerationResult {
     const LlamaGgufModel& model,
     std::span<const std::int32_t> prompt_ids,
     std::int32_t max_new_tokens);
+
+[[nodiscard]] LlamaGgufGenerationResult llama_gguf_generate_greedy(
+    const LlamaGgufModel& model,
+    std::span<const std::int32_t> prompt_ids,
+    std::int32_t max_new_tokens,
+    const LlamaGgufExecutionOptions& options);
 
 }  // namespace lcqi

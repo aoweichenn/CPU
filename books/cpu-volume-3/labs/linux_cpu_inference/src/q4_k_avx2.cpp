@@ -188,14 +188,39 @@ const char* q4_k_q8_active_backend() noexcept {
     return q4_k_q8_avx2_available() ? "avx2_maddubs" : "scalar";
 }
 
+void matvec_q4_k_q8_avx2_rows_unchecked(std::span<const std::uint8_t> q4_rows,
+                                        std::int64_t row_count,
+                                        std::int64_t column_count,
+                                        std::span<const Q8KBlock> input,
+                                        std::span<float> output,
+                                        std::int64_t row_begin,
+                                        std::int64_t row_end) noexcept;
+
 void matvec_q4_k_q8_avx2_unchecked(std::span<const std::uint8_t> q4_rows,
                                    std::int64_t row_count,
                                    std::int64_t column_count,
                                    std::span<const Q8KBlock> input,
                                    std::span<float> output) {
+    matvec_q4_k_q8_avx2_rows_unchecked(q4_rows,
+                                       row_count,
+                                       column_count,
+                                       input,
+                                       output,
+                                       0,
+                                       row_count);
+}
+
+void matvec_q4_k_q8_avx2_rows_unchecked(std::span<const std::uint8_t> q4_rows,
+                                        std::int64_t row_count,
+                                        std::int64_t column_count,
+                                        std::span<const Q8KBlock> input,
+                                        std::span<float> output,
+                                        std::int64_t row_begin,
+                                        std::int64_t row_end) noexcept {
+    (void)row_count;
     const std::int64_t row_blocks = column_count / LCQI_QK_K_BLOCK_VALUES;
     const std::int64_t row_bytes = row_blocks * LCQI_Q4_K_BLOCK_BYTES;
-    for (std::int64_t row = 0; row < row_count; ++row) {
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
         float sum = 0.0F;
         const std::uint8_t* row_data = q4_rows.data() + row * row_bytes;
         for (std::int64_t block = 0; block < row_blocks; ++block) {

@@ -17,6 +17,7 @@ constexpr std::int32_t LCQI_LLAMA_DEFAULT_MAX_NEW_TOKENS = 1;
 constexpr std::string_view LCQI_LLAMA_IDS_PREFIX = "--ids=";
 constexpr std::string_view LCQI_LLAMA_PROMPT_PREFIX = "--prompt=";
 constexpr std::string_view LCQI_LLAMA_MAX_NEW_PREFIX = "--max-new=";
+constexpr std::string_view LCQI_LLAMA_THREADS_PREFIX = "--threads=";
 constexpr const char* LCQI_LLAMA_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT";
 constexpr const char* LCQI_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
 constexpr std::string_view LCQI_LLAMA_FALSE_ENV = "0";
@@ -29,6 +30,7 @@ struct LlamaCliOptions {
     std::string prompt;
     std::vector<std::int32_t> ids;
     std::int32_t max_new_tokens = LCQI_LLAMA_DEFAULT_MAX_NEW_TOKENS;
+    std::int32_t threads = 0;
     bool use_ids = false;
     bool benchmark = false;
     bool decode_text = false;
@@ -91,7 +93,7 @@ void print_ids(std::string_view label, const std::vector<std::int32_t>& ids) {
     if (argc < 2) {
         throw std::runtime_error(
             "usage: lcqi_llama_gguf model.gguf [--prompt TEXT|--ids 1,2,3] "
-            "[--max-new N] [--benchmark] [--decode-text]");
+            "[--max-new N] [--threads N] [--benchmark] [--decode-text]");
     }
     LlamaCliOptions options;
     options.gguf_path = argv[1];
@@ -131,6 +133,14 @@ void print_ids(std::string_view label, const std::vector<std::int32_t>& ids) {
         } else if (consume_prefix(arg, LCQI_LLAMA_MAX_NEW_PREFIX, value)) {
             options.max_new_tokens =
                 parse_non_negative_i32(std::string(value), "--max-new");
+        } else if (arg == "--threads") {
+            if (index + 1 >= argc) {
+                throw std::runtime_error("--threads requires a value");
+            }
+            ++index;
+            options.threads = parse_non_negative_i32(argv[index], "--threads");
+        } else if (consume_prefix(arg, LCQI_LLAMA_THREADS_PREFIX, value)) {
+            options.threads = parse_non_negative_i32(std::string(value), "--threads");
         } else {
             throw std::runtime_error("unknown option: " + arg);
         }
@@ -170,6 +180,7 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
     std::cout << "benchmark_generated_tokens " << generated_new_tokens << "\n";
     std::cout << "benchmark_prefill_steps " << result.prefill_steps << "\n";
     std::cout << "benchmark_decode_steps " << result.decode_steps << "\n";
+    std::cout << "benchmark_worker_count " << result.worker_count << "\n";
     std::cout << "benchmark_first_token_tokens_per_second "
               << first_token_tokens_per_second << "\n";
     std::cout << "benchmark_decode_tokens_per_second " << decode_tokens_per_second << "\n";
@@ -250,10 +261,13 @@ int main(int argc, char** argv) {
         }
         const std::vector<std::int32_t> prompt_ids =
             make_prompt_ids(options, &tokenizer, loaded.model.bos_token_id);
+        lcqi::LlamaGgufExecutionOptions execution_options;
+        execution_options.worker_count = options.threads;
         lcqi::LlamaGgufGenerationResult result =
             lcqi::llama_gguf_generate_greedy(loaded.model,
                                              prompt_ids,
-                                             options.max_new_tokens);
+                                             options.max_new_tokens,
+                                             execution_options);
         result.load_ms = load_ms;
         result.total_ms = elapsed_ms(total_begin, Clock::now());
 

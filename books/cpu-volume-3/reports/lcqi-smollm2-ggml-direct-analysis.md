@@ -3,6 +3,7 @@
 Date: 2026-06-30
 Host: caw
 Raw report: `books/cpu-volume-3/reports/lcqi-smollm2-ggml-direct-compare-caw.txt`
+Follow-up report: `books/cpu-volume-3/reports/lcqi-smollm2-threaded-q4-compare-caw.txt`
 
 ## Question
 
@@ -84,7 +85,24 @@ The negative result is useful because it separates three facts that are easy to 
 
 ## Next Optimization Target
 
-The best next work is not to simply add more scalar quantized formats. The evidence points to two higher-leverage directions:
+The best next work was not to simply add more scalar quantized formats. The next change connected the existing f32 fallback and default Q4_K direct path to a persistent row worker pool, then added a Q4_K row-range unchecked entry so the default direct path was not left single-threaded after f32 fallback became parallel.
+
+Follow-up caw evidence, same model and same 31-token prompt:
+
+- serial default Q4_K direct prefill median: `363.759 ms`
+- serial default Q4_K direct decode step median: `15.1652 ms`
+- threaded default worker count median: `8`
+- threaded default Q4_K direct prefill median: `161.436 ms`
+- threaded default Q4_K direct decode step median: `7.26678 ms`
+- threaded f32 fallback hotspot median: `146.731 ms`, down from serial `338.173 ms`
+- threaded Q4_K direct hotspot median: `4.98589 ms`, down from serial `19.6195 ms`
+- threaded speedup over serial: prefill `2.253271x`, decode step `2.086922x`, f32 hotspot `2.304714x`
+- Q4_K direct, compared with Q4 direct off in the same threaded binary: prefill `1.087948x`, decode step `0.995660x`, `w_down` `1.645349x`
+- LCQI threaded default over llama.cpp same-input: prefill `7.381619x` slower, decode step `2.471694x` slower
+
+The first threaded attempt exposed an important interaction: after f32 fallback became row-parallel, the single-thread Q4_K direct path could lose to the parallel f32 fallback in some decode measurements. The fix was not to disable Q4_K direct, but to make Q4_K direct obey the same output-row partitioning. This is why the final report must be `lcqi-smollm2-threaded-q4-compare-caw.txt`, not the intermediate `lcqi-smollm2-threaded-compare-caw.txt`.
+
+The remaining evidence points to two higher-leverage directions:
 
 1. Batched prefill: LCQI currently processes prompt tokens as repeated decode steps, while llama.cpp evaluates the prompt through batched graph execution.
 2. Packed multi-row low-bit kernels: redesign GGML direct execution around multi-row layout, SIMD coverage for the dominant formats, prefetch, and thread partitioning before trying to make it a default path.

@@ -53,4 +53,12 @@ void matvec_q4_k_q8(std::span<const std::uint8_t> q4_rows,
                     std::span<const Q8KBlock> input,
                     std::span<float> output);
 
+void matvec_q4_k_q8_rows_unchecked(std::span<const std::uint8_t> q4_rows,
+                                   std::int64_t row_count,
+                                   std::int64_t column_count,
+                                   std::span<const Q8KBlock> input,
+                                   std::span<float> output,
+                                   std::int64_t row_begin,
+                                   std::int64_t row_end) noexcept;
+
 }  // namespace lcqi

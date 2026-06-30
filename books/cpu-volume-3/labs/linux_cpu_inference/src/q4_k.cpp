@@ -235,6 +235,14 @@ void matvec_q4_k_q8_avx2_unchecked(std::span<const std::uint8_t>,
                                    std::span<const Q8KBlock>,
                                    std::span<float>);
 
+void matvec_q4_k_q8_avx2_rows_unchecked(std::span<const std::uint8_t>,
+                                        std::int64_t,
+                                        std::int64_t,
+                                        std::span<const Q8KBlock>,
+                                        std::span<float>,
+                                        std::int64_t,
+                                        std::int64_t) noexcept;
+
 std::vector<float> dequantize_q4_k(std::span<const std::uint8_t> bytes,
                                    std::int64_t element_count) {
     validate_q4_k_bytes(bytes, element_count);
@@ -388,10 +396,36 @@ void matvec_q4_k_q8(std::span<const std::uint8_t> q4_rows,
         return;
     }
 #endif
-    for (std::int64_t row = 0; row < row_count; ++row) {
-        output[checked_size(row, "Q4_K row")] =
-            dot_q4_k_q8(q4_rows.subspan(checked_size(row * row_bytes, "Q4_K row offset"),
-                                        checked_size(row_bytes, "Q4_K row bytes")),
+    matvec_q4_k_q8_rows_unchecked(q4_rows, row_count, column_count, input, output, 0, row_count);
+}
+
+void matvec_q4_k_q8_rows_unchecked(std::span<const std::uint8_t> q4_rows,
+                                   std::int64_t row_count,
+                                   std::int64_t column_count,
+                                   std::span<const Q8KBlock> input,
+                                   std::span<float> output,
+                                   std::int64_t row_begin,
+                                   std::int64_t row_end) noexcept {
+    const std::int64_t row_bytes =
+        (column_count / LCQI_QK_K_BLOCK_VALUES) * LCQI_Q4_K_BLOCK_BYTES;
+#if defined(LCQI_ENABLE_AVX2)
+    if (q4_k_q8_avx2_available()) {
+        matvec_q4_k_q8_avx2_rows_unchecked(q4_rows,
+                                           row_count,
+                                           column_count,
+                                           input,
+                                           output,
+                                           row_begin,
+                                           row_end);
+        return;
+    }
+#else
+    (void)row_count;
+#endif
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
+        output[static_cast<std::size_t>(row)] =
+            dot_q4_k_q8(q4_rows.subspan(static_cast<std::size_t>(row * row_bytes),
+                                        static_cast<std::size_t>(row_bytes)),
                         input);
     }
 }

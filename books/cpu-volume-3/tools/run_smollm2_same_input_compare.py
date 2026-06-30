@@ -36,6 +36,7 @@ LCQI_SUMMARY_KEYS = [
     "benchmark_decode_ms",
     "derived_decode_ms_per_step",
     "benchmark_decode_tokens_per_second",
+    "benchmark_worker_count",
     "derived_f32_weight_inflation_ratio",
     "derived_direct_quantized_weight_byte_share",
     "benchmark_hotspot_rms_norm_ms",
@@ -195,6 +196,7 @@ def parse_lcqi_metrics(stdout: str) -> dict[str, str]:
             "benchmark_generated_tokens",
             "benchmark_prefill_steps",
             "benchmark_decode_steps",
+            "benchmark_worker_count",
             "benchmark_first_token_tokens_per_second",
             "benchmark_decode_tokens_per_second",
             "benchmark_kv_cache_bytes",
@@ -486,6 +488,7 @@ def run_lcqi_round(
     timeout_seconds: int,
     name_prefix: str = "lcqi_round",
     env: dict[str, str] | None = None,
+    threads: int | None = None,
 ) -> CommandResult:
     command = [
         str(binary),
@@ -497,6 +500,8 @@ def run_lcqi_round(
         "--benchmark",
         "--decode-text",
     ]
+    if threads is not None:
+        command.extend(["--threads", str(threads)])
     result = run_command(
         f"{name_prefix}_{round_index}",
         command,
@@ -657,6 +662,7 @@ def write_report(
     full_prompt: str,
     max_new_tokens: int,
     lcqi_runs: list[CommandResult],
+    lcqi_serial_runs: list[CommandResult],
     lcqi_q4_direct_off_runs: list[CommandResult],
     lcqi_ggml_direct_runs: list[CommandResult],
     llama_tokenize: CommandResult,
@@ -709,6 +715,14 @@ def write_report(
         ))
         lines.append("")
 
+    if lcqi_serial_runs:
+        lines.extend(format_summary(
+            "lcqi_serial_same_input",
+            lcqi_serial_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
+
     lines.extend(format_summary(
         "lcqi_same_input",
         lcqi_runs,
@@ -744,12 +758,14 @@ def write_report(
         llama_tokenize,
         llama_simple_runs,
         llama_bench,
+        lcqi_serial_runs,
         lcqi_q4_direct_off_runs,
         lcqi_ggml_direct_runs,
     )
 
     for run in (
         lcqi_q4_direct_off_runs +
+        lcqi_serial_runs +
         lcqi_runs +
         lcqi_ggml_direct_runs +
         [llama_tokenize] +
@@ -786,6 +802,7 @@ def add_ratio_summary(
     llama_tokenize: CommandResult,
     llama_simple_runs: list[CommandResult],
     llama_bench: CommandResult,
+    lcqi_serial_runs: list[CommandResult],
     lcqi_q4_direct_off_runs: list[CommandResult],
     lcqi_ggml_direct_runs: list[CommandResult],
 ) -> None:
@@ -822,6 +839,7 @@ def add_ratio_summary(
         lines.append(f"lcqi_f32_dequantized_weight_inflation_ratio={lcqi_weight_ratio:.6f}")
     if lcqi_direct_share is not None:
         lines.append(f"lcqi_direct_quantized_weight_byte_share={lcqi_direct_share:.6f}")
+    add_lcqi_threaded_ratios(lines, lcqi_serial_runs, lcqi_runs)
     add_lcqi_ab_ratios(lines, lcqi_q4_direct_off_runs, lcqi_runs)
     add_lcqi_ggml_experimental_ratios(lines, lcqi_runs, lcqi_ggml_direct_runs)
     if bench_pp_tps is not None:
@@ -833,10 +851,44 @@ def add_ratio_summary(
         "quantized path. The experimental Q5_0/Q6_K/Q8_0 direct path increases "
         "quantized-byte coverage, but its current scalar block kernels are slower "
         "than the dequantized f32 AVX2 fallback, so it is not enabled by default. "
-        "llama.cpp batches prompt evaluation, uses ggml graph scheduling, tuned "
-        "low-bit CPU kernels, prefetch/thread scheduling, and more compact "
-        "KV/cache execution."
+        "The default LCQI run now uses a persistent row worker pool for large f32 "
+        "fallback matrices; --threads 1 keeps the serial reference. llama.cpp "
+        "still batches prompt evaluation, uses ggml graph scheduling, tuned low-bit "
+        "CPU kernels, prefetch/thread scheduling, and more compact KV/cache execution."
     )
+
+
+def add_lcqi_threaded_ratios(
+    lines: list[str],
+    lcqi_serial_runs: list[CommandResult],
+    lcqi_runs: list[CommandResult],
+) -> None:
+    if not lcqi_serial_runs:
+        return
+    serial_prefill = median_metric(lcqi_serial_runs, "benchmark_prefill_ms")
+    threaded_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    serial_decode = median_metric(lcqi_serial_runs, "derived_decode_ms_per_step")
+    threaded_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    serial_f32 = median_metric(lcqi_serial_runs, "benchmark_hotspot_f32_fallback_ms")
+    threaded_f32 = median_metric(lcqi_runs, "benchmark_hotspot_f32_fallback_ms")
+    worker_count = median_metric(lcqi_runs, "benchmark_worker_count")
+    if worker_count is not None:
+        lines.append(f"lcqi_threaded_worker_count_median={worker_count:.0f}")
+    if serial_prefill is not None and threaded_prefill is not None and threaded_prefill > 0.0:
+        lines.append(
+            "lcqi_threaded_prefill_speedup_serial_over_threaded="
+            f"{serial_prefill / threaded_prefill:.6f}"
+        )
+    if serial_decode is not None and threaded_decode is not None and threaded_decode > 0.0:
+        lines.append(
+            "lcqi_threaded_decode_step_speedup_serial_over_threaded="
+            f"{serial_decode / threaded_decode:.6f}"
+        )
+    if serial_f32 is not None and threaded_f32 is not None and threaded_f32 > 0.0:
+        lines.append(
+            "lcqi_threaded_f32_hotspot_speedup_serial_over_threaded="
+            f"{serial_f32 / threaded_f32:.6f}"
+        )
 
 
 def add_lcqi_ab_ratios(
@@ -952,6 +1004,7 @@ def main() -> int:
         )
 
         lcqi_q4_direct_off_runs: list[CommandResult] = []
+        lcqi_serial_runs: list[CommandResult] = []
         lcqi_runs: list[CommandResult] = []
         lcqi_ggml_direct_runs: list[CommandResult] = []
         llama_simple_runs: list[CommandResult] = []
@@ -974,6 +1027,20 @@ def main() -> int:
                     lcqi_q4_direct_off_runs[-1],
                     "run LCQI Q4 direct off same-input round",
                 )
+            print(f"[lcqi-same-input] LCQI serial round {round_index}/{args.rounds}")
+            lcqi_serial_runs.append(
+                run_lcqi_round(
+                    lcqi_binary,
+                    model_path,
+                    user_prompt=args.prompt,
+                    max_new_tokens=args.max_new,
+                    round_index=round_index,
+                    timeout_seconds=args.timeout_seconds,
+                    name_prefix="lcqi_serial_round",
+                    threads=1,
+                )
+            )
+            ensure_success(lcqi_serial_runs[-1], "run LCQI serial same-input round")
             print(f"[lcqi-same-input] LCQI round {round_index}/{args.rounds}")
             lcqi_runs.append(
                 run_lcqi_round(
@@ -1045,6 +1112,7 @@ def main() -> int:
             full_prompt=full_prompt,
             max_new_tokens=args.max_new,
             lcqi_runs=lcqi_runs,
+            lcqi_serial_runs=lcqi_serial_runs,
             lcqi_q4_direct_off_runs=lcqi_q4_direct_off_runs,
             lcqi_ggml_direct_runs=lcqi_ggml_direct_runs,
             llama_tokenize=llama_tokenize,

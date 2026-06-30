@@ -265,7 +265,7 @@ python3 books/cpu-volume-3/tools/run_smollm2_same_input_compare.py \
 这个脚本会构建固定 commit 的 llama.cpp，运行 `llama-tokenize`、`llama-simple` 和 `llama-bench`，并确认 LCQI 和 llama.cpp 看到的 prompt token ids 完全一致。caw 上的同输入报告保存在：
 
 ```text
-books/cpu-volume-3/reports/lcqi-smollm2-ggml-direct-compare-caw.txt
+books/cpu-volume-3/reports/lcqi-smollm2-threaded-q4-compare-caw.txt
 ```
 
-关键结论：同一个模型、同一个展开 chat prompt、同样 31 个 token id、同样 `max-new=2` 下，当前默认 LCQI Q4_K direct prefill 中位数 `370.847 ms`，llama.cpp `22.840 ms`，LCQI 慢 `16.24x`；LCQI decode step 中位数 `15.4182 ms`，llama.cpp `2.880 ms`，LCQI 慢 `5.35x`。同一二进制里关闭 `LCQI_LLAMA_Q4_DIRECT=0` 后，LCQI prefill 为 `393.992 ms`，decode step 为 `15.8782 ms`，`w_down` 热点为 `91.6812 ms`；默认 Q4_K direct 后分别为 `370.847 ms`、`15.4182 ms`、`63.5371 ms`。所以这轮默认优化的保守 A/B 证据是：prefill `1.062x`、decode step `1.030x`、`w_down` `1.443x`，并减少 `56,623,104` 字节 f32 materialized 权重。实验 GGML direct 证明“覆盖更多量化格式”本身不是优化结论：没有 packed multi-row/SIMD/threaded kernel 时，端到端会倒退。
+关键结论：同一个模型、同一个展开 chat prompt、同样 31 个 token id、同样 `max-new=2` 下，当前默认 LCQI 使用 `8` 个 worker，对大行数 f32 fallback 和 Q4_K direct row-range 都做输出行切分。默认 Q4_K direct prefill 中位数从串行 `363.759 ms` 降到 `161.436 ms`，decode step 从串行 `15.1652 ms` 降到 `7.26678 ms`；f32 fallback hotspot 从 `338.173 ms` 降到 `146.731 ms`。相对同输入 llama.cpp，LCQI prefill 仍慢 `7.381619x`，decode step 仍慢 `2.471694x`。同一二进制里关闭 `LCQI_LLAMA_Q4_DIRECT=0` 后，LCQI prefill 为 `175.634 ms`，decode step 为 `7.23524 ms`，`w_down` 热点为 `36.7329 ms`；默认 Q4_K direct 后分别为 `161.436 ms`、`7.26678 ms`、`22.3253 ms`。所以这轮默认优化的 A/B 证据是：线程池带来 prefill `2.253271x`、decode step `2.086922x`、f32 hotspot `2.304714x`；Q4_K direct 在并行后带来 prefill `1.087948x`、`w_down` `1.645349x`，decode 中位数 `0.995660x` 基本持平，并减少 `56,623,104` 字节 f32 materialized 权重。实验 GGML direct 仍只保留为 opt-in：之前的 caw 负结果已经证明，单纯提高 `Q5_0/Q6_K/Q8_0` 覆盖率而没有 packed multi-row/SIMD/threaded kernel，会让端到端倒退。
