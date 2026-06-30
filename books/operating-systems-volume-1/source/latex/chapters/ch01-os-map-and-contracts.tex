@@ -18,6 +18,161 @@
 
 从工程角度看，操作系统的每个功能都同时有“用户可见语义”和“内核维护成本”。例如进程给用户一个独立执行环境，但内核要维护地址空间、fd 表、信号、父子关系和退出状态；虚拟内存给用户一个连续地址幻觉，但内核要维护 VMA、页表、TLB 失效和回收策略；文件给用户一个字节流或目录树，但内核要维护 inode、page cache、块分配、权限和崩溃恢复。只讲语义会太抽象，只讲实现会迷失在细节里，二者必须一起讲。
 
+\section{OS 对象不是名词，而是硬件状态的管理账}
+
+进程、线程、地址空间、文件描述符、inode、socket、设备请求这些词容易被背成名词。更准确地说，它们是内核为了管理硬件状态而建立的账本。CPU 只能执行当前寄存器里的上下文，OS 于是建立 task；MMU 只能按当前页表翻译地址，OS 于是建立 mm 和 VMA；设备只认识描述符和 doorbell，OS 于是建立 request、bio、skb、completion queue；存储设备只完成块写，OS 于是建立 inode、journal 和 fsync 语义。
+
+\begin{longtable}{p{0.2\linewidth}p{0.32\linewidth}p{0.36\linewidth}}
+\toprule
+OS 对象 & 管理的硬件事实 & 为什么不能只交给应用 \\
+\midrule
+task/thread & RIP、RSP、寄存器、内核栈、调度状态 & 应用不能自己抢占死循环，也不能保存别人的上下文 \\
+address space & CR3、PTE、TLB、VMA 意图 & 应用不能自己修改页表来隔离自己和别人 \\
+fd table & 进程内整数句柄到内核对象引用 & 应用需要受控引用资源，而不是直接拿内核指针 \\
+file/inode & page cache、块映射、权限、引用计数 & 应用不能直接维护全局目录树和崩溃恢复 \\
+socket & NIC 队列、协议状态、收发缓冲区 & 应用不能直接管理网卡 DMA 和 TCP 状态机 \\
+request/bio/skb & DMA buffer、队列位置、completion & 设备异步完成，需要内核追踪所有权和失败 \\
+\bottomrule
+\end{longtable}
+
+这张表背后的规则是：只要某个硬件状态会被多个程序共享，或者失败后需要恢复，就不能让应用直接操作原始硬件。内核必须建立一个对象，给它身份、权限、生命周期、等待队列和可观测证据。对象不是为了“面向对象”而存在，而是为了让硬件状态可命名、可授权、可回收、可诊断。
+
+\section{四条完整路径：从硬件事件到内核决策}
+
+下面用四条路径把本章的地图落到具体步骤。它们不是后续章节的替代品，而是读完整本书时不断回看的骨架。
+
+\subsection{路径一：\code{write(fd, buf, len)} 为什么不是一次普通函数调用}
+
+应用看见的是一个 C 库函数，硬件看见的是一次受控特权级转换，内核看见的是多个对象状态更新。
+
+\begin{lstlisting}
+user:
+  rax = SYS_write
+  rdi = fd
+  rsi = user_buf
+  rdx = len
+  syscall
+
+kernel entry:
+  save user RIP/RSP/RFLAGS and registers
+  switch to trusted kernel stack
+  locate current task and fd table
+  validate fd refers to writable file/socket/pipe
+  validate user buffer range and copy or pin pages
+  update target object state
+  return byte count or -errno in rax
+\end{lstlisting}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 关键检查 & 失败表达 \\
+\midrule
+系统调用入口 & syscall number 是否存在，当前上下文是否允许 & \code{-ENOSYS}、审计拒绝、seccomp 信号 \\
+fd 查找 & fd 是否打开，是否有写权限 & \code{-EBADF}、\code{-EPERM} \\
+用户 buffer & 地址是否 canonical、VMA 是否允许读、复制中是否 fault & \code{-EFAULT} 或部分写入 \\
+目标对象 & pipe/socket/file 是否可写、是否阻塞 & \code{-EAGAIN}、睡眠、信号中断 \\
+提交语义 & 数据进入哪里：page cache、socket buffer、设备队列 & 返回值不一定表示落盘或发出网络包 \\
+\bottomrule
+\end{longtable}
+
+这条路径说明了 OS 契约的层次。系统调用返回成功，只说明内核接受并完成了该接口定义下的一部分工作。写普通文件可能只是写入 page cache；写 socket 可能只是进入发送缓冲；写终端可能经过驱动队列和中断。若业务需要“崩溃后仍存在”，还要继续追 \code{fsync} 和存储 flush；若业务需要“对端已收到”，还要追协议确认。
+
+\subsection{路径二：一次 page fault 如何在硬件和内核之间分工}
+
+用户态一条 \asmcode{mov rax, qword ptr [rdi]} 可能触发 page fault。硬件做的是检查和转交，内核做的是解释和修复。
+
+\begin{lstlisting}
+CPU:
+  compute effective address from rdi
+  check canonical form
+  lookup TLB or walk page table
+  if missing or permission denied:
+    save fault RIP and error code
+    record fault address
+    enter page fault handler
+
+kernel:
+  find VMA covering fault address
+  compare access type with VMA permissions
+  inspect PTE state
+  allocate zero page, read file page, perform COW, or reject
+  install PTE and invalidate stale TLB when needed
+  return to faulting RIP or deliver signal
+\end{lstlisting}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+硬件看到 & 内核进一步区分 & 结果 \\
+\midrule
+present=0 & 地址属于匿名 VMA & 分配零页，minor fault \\
+present=0 & 地址属于文件映射 & page cache 命中或发起磁盘 I/O \\
+write denied & PTE 标记 COW & 复制页并恢复写权限 \\
+execute denied & NX 或 VMA 不可执行 & 发送信号，安全拒绝 \\
+user bit denied & 用户访问 supervisor 页 & 发送信号或记录攻击/bug \\
+\bottomrule
+\end{longtable}
+
+缺页机制的关键不是“慢”，而是“可恢复边界”。如果 CPU 不能保存 faulting RIP，COW store 就无法重试；如果内核不能判断 VMA 意图，present=0 就无法区分合法懒分配和非法访问；如果 TLB 失效不正确，PTE 更新后旧权限仍可能生效。
+
+\subsection{路径三：定时器中断如何变成抢占}
+
+用户程序可能永远不主动让出 CPU。定时器中断给内核一个周期性入口，让它能统计时间、处理超时并决定是否切换任务。
+
+\begin{lstlisting}
+local APIC timer fires:
+  CPU takes interrupt at instruction boundary
+  entry saves interrupted RIP/RFLAGS/RSP
+  timer handler increments scheduler clock
+  expired timers wake sleeping tasks
+  current task runtime is charged
+  if time slice or policy says preempt:
+    set need_resched
+  return path calls scheduler before going back to user
+  scheduler saves current kernel context and restores next
+\end{lstlisting}
+
+这里有两个容易混淆的点。第一，中断 handler 通常不在任意深处直接把用户栈改成另一个任务；它设置调度标志，在安全返回点进入调度。第二，切换任务不是只改一个 current 指针，还可能涉及内核栈、callee-saved 寄存器、地址空间、FPU/SIMD 状态、CPU 本地数据和 TLB 语义。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+动作 & 需要保存什么 & 保存错误的现象 \\
+\midrule
+中断进入 & 用户 RIP/RSP/RFLAGS 和 scratch 状态 & 返回后用户程序寄存器随机坏 \\
+调度统计 & 当前任务运行时间、vruntime、状态 & CPU 时间不公平或饥饿 \\
+切换内核上下文 & 内核栈指针、callee-saved 寄存器 & 任务从错误调用链恢复 \\
+切换地址空间 & CR3/PCID、必要 TLB 处理 & 任务访问到别人的内存 \\
+\bottomrule
+\end{longtable}
+
+\subsection{路径四：设备完成如何唤醒一个睡眠任务}
+
+设备 I/O 是异步的。提交请求后，任务可能睡眠；设备通过 DMA 和中断报告完成；内核再把 completion 变成任务可见结果。
+
+\begin{lstlisting}
+submit I/O:
+  allocate request object
+  map buffer for DMA
+  fill descriptor ring
+  publish descriptor with barrier
+  write MMIO doorbell
+  if synchronous API:
+    put task on wait queue and schedule away
+
+device:
+  reads descriptor by DMA
+  transfers data
+  writes completion entry
+  raises MSI-X interrupt
+
+interrupt/bottom half:
+  read completion queue
+  unmap DMA and mark request done
+  store status and byte count
+  wake tasks waiting on request
+\end{lstlisting}
+
+这条路径解释了为什么 I/O 子系统一定有 request identity。中断到来时，CPU 不知道“哪个用户函数在等它”，只看到某个设备队列有 completion。内核必须通过队列位置、tag、request 指针或 completion entry 找回原请求，撤销 DMA 授权，更新上层对象，再唤醒等待者。没有这层身份映射，异步 I/O 无法可靠对应到发起者。
+
 \section{从组成原理到 OS 抽象}
 
 组成原理解释机器能做什么，操作系统解释这些能力如何被组织成可共享、可隔离、可恢复的服务。把二者分开学时，读者很容易知道“CPU 有特权级”，却不知道系统调用为什么必须切栈；知道“页表做地址翻译”，却不知道 \code{fork} 为什么能 COW；知道“DMA 很快”，却不知道驱动为什么要维护 descriptor ring 和 completion。

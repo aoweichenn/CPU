@@ -20,6 +20,34 @@
 
 系统调用 ABI 和函数调用 ABI 相似但边界更硬。函数调用跨的是代码组织边界；系统调用跨的是用户/内核特权边界。
 
+\subsection{System V x86-64 参数分类：不只是前六个整数寄存器}
+
+常见说法是“前六个整数参数放寄存器”，这只覆盖最简单情况。System V x86-64 ABI 会按参数类别把值放进整数寄存器、SSE 寄存器或内存。整数和指针走 GPR，浮点数常走 XMM，过大或复杂聚合类型可能通过内存传递。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+参数类型 & 常见位置 & 注意点 \\
+\midrule
+整数/指针 & \code{rdi,rsi,rdx,rcx,r8,r9} & 更小整数会扩展或只使用低位寄存器 \\
+浮点/double & \code{xmm0-xmm7} & 和整数寄存器计数分开 \\
+小结构体 & 可能拆到 GPR/XMM & 取决于字段分类和大小 \\
+大结构体参数 & 内存或指针传递 & 调用者要准备对象地址 \\
+大结构体返回 & structure-return 隐藏指针 & 调用者传入返回缓冲区地址 \\
+\bottomrule
+\end{longtable}
+
+这解释了为什么同一个 C 函数签名稍微变一下，汇编会完全不同。OS 读用户态寄存器时也要区分 ABI：普通函数 ABI 使用 \code{rcx} 作为第 4 个整数参数，而 Linux x86-64 syscall ABI 使用 \code{r10} 传第 4 个参数，因为 \code{syscall} 硬件会使用 \code{rcx} 保存返回 RIP。
+
+\begin{lstlisting}
+System V function call integer args:
+  arg0 rdi, arg1 rsi, arg2 rdx, arg3 rcx, arg4 r8, arg5 r9
+
+Linux x86-64 syscall args:
+  nr rax, arg0 rdi, arg1 rsi, arg2 rdx, arg3 r10, arg4 r8, arg5 r9
+\end{lstlisting}
+
+如果把这两套 ABI 混用，系统调用会读错参数。用户态 syscall wrapper 的价值之一，就是把 C 函数调用 ABI 翻译成 syscall ABI。
+
 \subsection{一个函数调用的机器级过程}
 
 假设调用 \code{f(1, 2)}。伪汇编可能是：
@@ -125,6 +153,38 @@ entry:
 
 这说明系统调用开销来自多层：CPU 特权切换、栈切换、寄存器保存、权限检查、对象查找、可能的调度和返回路径工作。它不是普通函数调用慢一点而已。
 
+\subsection{red zone、栈对齐和内核代码为什么要小心}
+
+System V x86-64 用户态 ABI 定义了 red zone：\code{rsp} 以下 128 字节在异步信号处理前不会被破坏，叶子函数可以临时使用而不调整 \code{rsp}。这对用户态优化有用，但内核或中断上下文不能盲目依赖用户态 red zone。内核入口会切换到内核栈，内核自身通常禁用或避免 red zone，因为中断可能在同一栈上保存状态。
+
+\begin{lstlisting}
+leaf function may use red zone in user ABI:
+  temporary data at [rsp - 8], [rsp - 16], ...
+  no sub rsp needed
+
+kernel entry:
+  do not trust user stack
+  switch to kernel stack
+  save pt_regs in controlled memory
+\end{lstlisting}
+
+栈对齐同样不是格式要求。许多 SIMD 指令、函数序言和 ABI 约定假设调用边界满足 16 字节对齐。若手写汇编破坏对齐，程序可能在看似无关的库函数里崩溃。内核构造初始用户栈、信号栈和 exec 栈时，必须满足用户态 ABI，否则新程序还没进入 \code{main} 就可能出错。
+
+\subsection{varargs 为什么需要 ABI 细则}
+
+\code{printf} 这类可变参数函数不知道调用者传了多少个参数、每个参数是什么类型，只能依赖格式串和 ABI 布局去取。System V x86-64 中，可变参数函数需要知道哪些寄存器参数被使用，必要时把寄存器保存到 register save area，\code{va\_list} 再按规则取出下一个参数。
+
+\begin{lstlisting}
+va_arg conceptual path:
+  if next argument class still has register slot:
+    read from saved register area
+  else:
+    read from overflow area on stack
+  advance offset according to type and alignment
+\end{lstlisting}
+
+这说明 ABI 不是“编译器内部细节”。动态库、JIT、FFI、系统调用封装、eBPF helper、内核用户态边界都依赖调用约定。如果边界两侧对参数分类理解不同，错误不会表现为类型检查失败，而是直接读错寄存器或栈槽。
+
 \subsection{异常展开和 C++ 异常为什么依赖 ABI}
 
 C++ 异常抛出时，运行时要沿调用栈查找 handler，并在经过每个栈帧时执行析构。它必须知道每个函数的栈布局、返回地址、保存寄存器和清理代码位置。这些信息由 ABI、DWARF unwind table 和编译器共同维护。
@@ -139,6 +199,25 @@ throw:
 \end{lstlisting}
 
 内核通常不使用 C++ 异常，但它有类似需求：oops/panic 打印栈，perf 采样回溯调用链，用户态 signal handler 返回要恢复上下文，调试器要 unwind。所有这些都要求机器状态和栈布局可解释。
+
+\subsection{signal frame：内核怎样临时改写用户控制流}
+
+信号不是在用户程序旁边开一条神秘线程。内核要让当前线程在返回用户态时先执行 signal handler，于是会在用户栈或 alternate signal stack 上构造一个 signal frame，保存原来的用户上下文，并把返回路径安排到 signal trampoline。handler 结束后，\code{sigreturn} 系统调用让内核从 signal frame 恢复原上下文。
+
+\begin{lstlisting}
+deliver_signal:
+  choose user stack or altstack
+  write signal frame with saved registers and mask
+  set user RIP = handler
+  set user RSP = signal_frame
+  arrange return path to sigreturn trampoline
+
+sigreturn:
+  validate frame
+  restore saved user registers, RIP, RSP, RFLAGS, signal mask
+\end{lstlisting}
+
+这条路径把 ABI、栈、系统调用和安全检查连在一起。用户栈坏了，信号投递可能失败；signal frame 校验不严，用户就可能伪造上下文获得非法状态；异步信号打断普通代码，也解释了为什么可重入和 async-signal-safe 函数很重要。
 
 \subsection{exec 如何构造第一帧用户栈}
 

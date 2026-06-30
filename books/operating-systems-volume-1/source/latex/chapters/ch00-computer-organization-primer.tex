@@ -37,6 +37,186 @@ on each clock edge:
 
 这段伪代码看起来像软件，实际对应硬件状态机。操作系统学习中反复出现的“状态机”不是写作技巧，而是硬件和内核共同的基本形态：硬件在时钟和事件下推进，内核对象在系统调用、中断和锁保护下推进。
 
+\subsection{电平、采样和复位：为什么状态不是自然可靠的}
+
+把高电平叫 1、低电平叫 0，只是第一层抽象。真实电路里信号有上升沿、下降沿、传播延迟、噪声和亚稳态。数字系统要可靠工作，必须规定什么时候采样、采样前信号必须稳定多久、采样后信号要保持多久。于是出现时钟、建立时间、保持时间和复位。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+概念 & 硬件含义 & OS 为什么要知道 \\
+\midrule
+时钟边沿 & 寄存器在固定时刻采样输入 & CPU 状态按离散步骤推进，异常能落在边界上 \\
+复位 & 把寄存器送到已知初值 & 上电后从固定 reset vector 或固件入口开始 \\
+ready/valid & 双方确认数据是否有效 & 总线、DMA 队列、设备 completion 都用类似握手 \\
+超时 & 预期事件长期不来 & 驱动不能无限等设备，必须 reset 或报错 \\
+亚稳态 & 异步信号采样不稳定 & 中断、外设输入要同步，硬件和驱动都要容忍边界情况 \\
+\bottomrule
+\end{longtable}
+
+这解释了为什么“启动”不是直接运行内核 main。CPU、DRAM、时钟、PCIe、APIC、IOMMU 和设备都需要从未知电气状态进入可编程状态。固件和早期内核初始化做的很多事，本质是让硬件寄存器有可解释的初值，让中断、DMA 和内存访问不再处于随机状态。
+
+\begin{lstlisting}
+reset path sketch:
+  hardware reset asserts known register defaults
+  CPU starts from reset vector
+  firmware trains DRAM and discovers platform
+  boot code enters protected long mode
+  kernel sets IDT, page tables, stacks, APIC, timers
+  only then can normal traps, syscalls and scheduling work
+\end{lstlisting}
+
+如果没有复位和初始化边界，OS 无法判断某个设备寄存器里的 bit 是旧状态、随机噪声还是有效完成事件。驱动里的 probe、reset、quiesce、timeout、resume 不是附加流程，而是把硬件状态重新拉回可推理状态的工程手段。
+
+\subsection{控制信号：指令不是被“解释”，而是打开一组开关}
+
+CPU 取到指令后，译码器不会在芯片里运行一段高级语言解释器。更准确的说法是：opcode 和寻址模式被译码成一组控制信号，控制 MUX 选哪路输入、寄存器文件读写哪些端口、ALU 做什么、是否访问内存、是否更新 RIP、是否进入异常路径。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+控制信号 & 作用 & 例子 \\
+\midrule
+reg\_read & 选择源寄存器编号 & \asmcode{add rax, rbx} 读 \code{rax/rbx} \\
+alu\_op & 选择 ALU 操作 & add、sub、and、compare、address generation \\
+mem\_read/write & 是否访问数据内存或 MMIO & load/store、栈 push/pop \\
+writeback\_src & 写回来自 ALU、内存还是立即数 & \asmcode{mov rax, qword ptr [rbx]} 来自内存 \\
+next\_rip\_src & 下一 RIP 来自顺序、分支、异常或返回 & branch、syscall、iretq \\
+privilege\_check & 当前 CPL 是否允许该动作 & 用户态执行特权指令触发异常 \\
+\bottomrule
+\end{longtable}
+
+一条 load 指令可以拆成更小的微操作。下面不是 x86-64 的真实微码，只是帮助读者把“指令语义”落到硬件动作：
+
+\begin{lstlisting}
+micro-ops for mov rax, qword ptr [rbx + 16]:
+  uop0: base = read_register(rbx)
+  uop1: va = base + 16
+  uop2: pa = translate_and_check(va, READ, cpl)
+  uop3: data = load64(pa)
+  uop4: write_register(rax, data)
+\end{lstlisting}
+
+这条拆解直接通向 OS。若 uop2 失败，进入 page fault；若 uop3 命中 MMIO 地址，读操作可能有设备副作用；若 uop4 还没提交时发生异常，CPU 必须保证软件可见状态仍能恢复。指令不是一句文本，而是一组受权限、地址翻译和提交规则约束的硬件动作。
+
+\subsection{信号到状态：一条指令为什么能被中断}
+
+初学时常把 CPU 看成“正在执行某条指令”。硬件上更准确的说法是：CPU 在每个周期推进一组寄存器和流水线状态，指令只是这些状态转移的编码来源。只要状态转移能在某个边界停住，硬件就能在这个边界接收异常或中断。
+
+\begin{lstlisting}
+architectural boundary:
+  before boundary:
+    previous instructions have committed
+  at boundary:
+    RIP/RSP/RFLAGS/general registers have defined values
+  after boundary:
+    CPU may either fetch next instruction or enter an event vector
+\end{lstlisting}
+
+这解释了三个看似不同的 OS 机制。第一，定时器中断要等到可恢复边界交付，否则内核无法保存一个一致现场。第二，page fault 要把 faulting RIP 和错误码交给内核，否则内核不知道修复哪个访问。第三，上下文切换保存的是架构状态，不是流水线里每个临时信号。CPU 内部可以有复杂乱序执行，但对 OS 暴露出来的必须是可定义、可保存、可恢复的状态点。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+硬件边界 & 保存或检查什么 & OS 依赖它做什么 \\
+\midrule
+指令提交 & 目标寄存器、RFLAGS、内存写入是否生效 & 精确异常、调试、信号恢复 \\
+异常入口 & RIP、错误码、访问类型、当前 CPL & page fault、非法指令、保护错误处理 \\
+中断入口 & 被打断 RIP/RFLAGS 和必要寄存器 & 抢占调度、设备 completion、IPI \\
+系统调用入口 & 用户返回地址、参数寄存器、RFLAGS mask & 受控进入内核并返回用户态 \\
+\bottomrule
+\end{longtable}
+
+因此，“CPU 支持中断”不是多了一根线那么简单。它要求 CPU 能把异步事件推迟到安全边界，能阻止更低特权级伪造入口，能在进入内核时留下足够证据，能在返回时恢复用户态可见状态。后面讲调度器时，说“时钟中断触发调度”，背后就是这套边界。
+
+\subsection{地址译码不是数组下标：从芯片选择到总线事务}
+
+内存数组模型能帮助入门，但硬件里的地址首先进入译码逻辑。译码器会根据高位地址和平台配置决定本次访问命中哪类目标：DRAM、ROM、local APIC、PCIe MMIO window、显存窗口，或者根本没有设备响应。这个过程决定了同一条 \asmcode{mov rax, qword ptr [rbx]} 是普通读内存，还是读一个有副作用的设备寄存器。
+
+\begin{lstlisting}
+physical_access(pa, kind):
+  if pa in DRAM ranges:
+    send transaction to memory controller
+  else if pa in local APIC range:
+    access interrupt controller register
+  else if pa in PCIe BAR range:
+    send MMIO transaction to device
+  else:
+    report machine or bus error by platform rules
+\end{lstlisting}
+
+OS 必须在启动时拿到这张物理地址地图，并把它变成自己的资源管理结构。可用 DRAM 进入页分配器；固件保留区不能分配；PCIe BAR 只能映射给驱动；APIC 寄存器只能在内核里访问。若把 MMIO 当作普通 RAM 分给用户进程，用户态就能控制设备；若把固件保留区当作普通页，内核可能覆盖 ACPI 表或设备保留内存。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+地址译码结果 & 硬件动作 & 内核必须建立的规则 \\
+\midrule
+DRAM & 可缓存普通内存事务 & 页分配、页表映射、NUMA 归属 \\
+ROM/固件保留 & 只读或保留区域 & 不进入普通页分配器 \\
+APIC/MMIO & 设备寄存器事务 & 只给驱动映射，禁止用户态直接访问 \\
+PCIe BAR & 发给 PCIe endpoint & probe 后由匹配驱动管理生命周期 \\
+不存在地址 & 平台错误或返回特殊值 & 不把未知范围当作可用资源 \\
+\bottomrule
+\end{longtable}
+
+这也是为什么“物理地址”仍然需要权限和类型。页表不仅决定虚拟地址映射到哪里，还要设置 cacheability、可执行性、用户可访问性等属性。普通 DRAM 用 write-back cache；设备寄存器通常要用不可缓存或设备类型；framebuffer 可能用 write-combining。属性错了，CPU 可能把设备寄存器访问合并、缓存或重排，设备协议就会被破坏。
+
+\subsection{从轮询到中断再到 DMA：I/O 不是一个函数调用}
+
+最简单的设备访问是轮询：CPU 一直读状态寄存器，直到设备 ready，再读写数据寄存器。这种模型容易理解，但浪费 CPU，并且每个字节都经过 CPU。中断把“什么时候 ready”交给设备通知，DMA 把“大块数据搬运”交给设备或 DMA engine，CPU 只负责授权、发布描述符和处理 completion。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+阶段 & CPU 做什么 & OS 新增责任 \\
+\midrule
+轮询 PIO & 循环读状态和数据寄存器 & 防止长时间忙等，处理超时 \\
+中断 I/O & 提交命令后睡眠或运行别的任务 & 保存中断现场、确认设备、唤醒等待者 \\
+DMA I/O & 建立 buffer 映射，设备直接读写内存 & pin/unmap、IOMMU、cache 一致性、生命周期 \\
+队列化 I/O & 批量描述符和 completion ring & 背压、队列深度、重试、取消、reset \\
+\bottomrule
+\end{longtable}
+
+这条演进线直接解释文件系统和网络为什么复杂。应用看见的是 \code{read(fd, buf, len)}，内核实际要验证用户 buffer，决定复制还是 pin 页，建立 DMA 映射，填设备描述符，执行写屏障，敲 MMIO doorbell，然后在中断或轮询 completion 后撤销映射、更新状态、唤醒任务。任何一步失败，都要把硬件状态和内核对象收敛到可解释状态。
+
+\begin{lstlisting}
+read request as hardware state machine:
+  validate fd and user buffer
+  allocate or pin kernel-visible pages
+  map pages into device DMA address space
+  fill descriptor ring entries
+  publish descriptors with dma_wmb
+  write MMIO doorbell
+  wait for interrupt or poll completion
+  unmap DMA and release ownership
+  copy or expose bytes to user
+\end{lstlisting}
+
+注意这里没有一步叫“设备函数返回”。设备和 CPU 是并发状态机：CPU 发布请求后继续运行，设备稍后通过 DMA 写内存和中断报告完成。驱动的核心任务是维护这两个状态机之间的所有权协议。
+
+\subsection{特权、地址和设备的统一模型}
+
+前面分别讲了特权级、页表、MMIO 和 DMA，真正写 OS 时要把它们合起来看。一次访问能否成立，不只取决于“地址有没有映射”，还取决于谁发起访问、访问类型是什么、目标内存类型是什么、设备是否被授权。
+
+\begin{lstlisting}
+access decision:
+  actor = CPU ring 3 | CPU ring 0 | PCIe device
+  target = user page | supervisor page | MMIO | DMA buffer
+  kind = read | write | execute | device DMA
+  decision = address translation + permission + memory type + lifecycle
+\end{lstlisting}
+
+\begin{longtable}{p{0.16\linewidth}p{0.22\linewidth}p{0.24\linewidth}p{0.26\linewidth}}
+\toprule
+发起者 & 目标 & 应有结果 & 缺少检查的后果 \\
+\midrule
+Ring 3 CPU & 用户可读页 & 允许 load & 普通程序无法运行 \\
+Ring 3 CPU & supervisor 页 & page fault & 用户能读写内核对象 \\
+Ring 3 CPU & MMIO & fault 或禁止映射 & 用户直接控制设备 \\
+Ring 0 CPU & MMIO & 按设备协议访问 & 驱动无法配置设备 \\
+PCIe 设备 & 已映射 DMA buffer & IOMMU 允许 & 高性能 I/O 完成 \\
+PCIe 设备 & 未授权内存 & IOMMU fault & 设备可破坏任意内存 \\
+\bottomrule
+\end{longtable}
+
+这张表是本册前半部分最重要的统一视角。进程隔离依赖 Ring 3 访问 supervisor 页失败；系统调用依赖 Ring 3 只能从受控入口请求 Ring 0；驱动安全依赖 MMIO 不暴露给普通进程；DMA 安全依赖设备也受地址空间约束。OS 不是单独实现“权限系统”，而是在所有入口上把硬件权限、内核对象权限和生命周期规则合成一个可测试契约。
+
 \subsection{从固定电路到存储程序}
 
 早期最简单的计算电路可以为某个特定任务连线，比如把两个输入相加，或者按固定流程控制设备。但一台通用计算机不能每换一个程序就重新接线。存储程序思想把“要做什么”也编码成内存里的数据：指令存放在内存中，CPU 取出指令、解释指令、执行指令，再取下一条。
@@ -195,7 +375,7 @@ PIO 模型里，CPU 亲自从设备寄存器读字节再写到内存，或者反
 \begin{lstlisting}
 pio_read_block():
   for i in 0..block_size-1:
-    memory[buf+i] = read_device_data_register()
+    memory[buf + i] = read_device_data_register()
 
 dma_read_block():
   desc.addr = dma_map(buf)

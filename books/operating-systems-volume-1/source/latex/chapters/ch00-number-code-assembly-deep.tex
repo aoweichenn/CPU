@@ -118,6 +118,112 @@ x86-64 interpretation:
 
 CPU 不看汇编文本，汇编文本只是人类可读形式。汇编器把文本转成机器码；反汇编器把机器码尽量转回文本。调试内核 oops 时看到的 \code{RIP} 和机器码，就是在定位“CPU 当时执行到哪串字节”。
 
+\subsection{x86-64 指令编码为什么看起来复杂}
+
+x86-64 为了兼容历史，指令长度可变。一条指令可以有前缀、REX 前缀、opcode、ModRM、SIB、位移和立即数。初学时不需要背完整编码表，但必须知道“汇编文本”和“机器字节”之间有明确规则，否则看 \code{objdump}、内核 oops、kprobe、ftrace 和热补丁时会断层。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+字段 & 作用 & 例子 \\
+\midrule
+prefix & 改变操作数大小、重复、锁语义等 & \code{lock}、operand-size override \\
+REX & x86-64 扩展寄存器和 64 位操作数 & 使用 \code{r8-r15} 或 64 位 GPR \\
+opcode & 指令种类 & mov、add、call、jmp 的主编码 \\
+ModRM & 寄存器和寻址模式 & 选择寄存器直接寻址或内存寻址 \\
+SIB & scale/index/base 地址形式 & \code{[base + index*scale + disp]} \\
+disp & 内存地址位移 & 结构体字段偏移、栈槽偏移 \\
+imm & 指令内立即数 & \asmcode{mov eax, 42} 中的 42 \\
+\bottomrule
+\end{longtable}
+
+例如 \asmcode{mov eax, 42} 常见机器码是：
+
+\begin{lstlisting}
+b8 2a 00 00 00
+|  |-----------|
+|      imm32 = 42, little endian
+opcode: mov r32, imm32 with destination eax
+\end{lstlisting}
+
+这里的 \code{2a 00 00 00} 再次体现小端：十六进制 \code{0x0000002a} 在内存里低字节在前。CPU 按 ISA 规则读这些字节，不会看到字符串 \code{mov}。
+
+\subsection{ModRM 和 SIB：内存操作数如何编码}
+
+Intel 语法中的 \code{qword ptr [rbx + 16]} 是给人的寻址表达式。机器码里，它会被拆成“基址寄存器是 rbx、位移是 16、访问宽度是 8 字节”等字段。简化看，地址生成单元执行：
+
+\begin{lstlisting}
+effective_address = base + index * scale + displacement
+\end{lstlisting}
+
+常见寻址形式如下：
+
+\begin{longtable}{p{0.24\linewidth}p{0.30\linewidth}p{0.34\linewidth}}
+\toprule
+Intel 语法 & 地址生成 & 常见来源 \\
+\midrule
+\code{[rbx]} & \code{rbx} & 指针解引用 \\
+\code{[rbx + 16]} & \code{rbx + 16} & 结构体字段或栈槽 \\
+\code{[rbx + rcx*8]} & \code{rbx + rcx * 8} & 数组元素 \\
+\code{[rbp - 32]} & \code{rbp - 32} & 栈帧局部变量 \\
+\code{[rip + disp]} & \code{next\_rip + disp} & 位置无关代码访问全局数据 \\
+\bottomrule
+\end{longtable}
+
+\code{rip}-relative 寻址是理解共享库和内核映像的重要入口。位置无关代码不把全局变量地址写死在指令里，而是用当前 \code{rip} 加位移找到数据。这样同一段代码可以加载到不同虚拟地址，动态链接器或内核重定位的工作量更小。
+
+\subsection{相对跳转和调用：控制流也是编码出来的}
+
+\code{call} 和 \code{jmp} 不一定把绝对地址放进机器码。很多 x86-64 直接调用使用相对位移：目标地址等于下一条指令地址加 signed displacement。
+
+\begin{lstlisting}
+call target:
+  pushed_return = next_rip
+  rip = next_rip + sign_extend(rel32)
+\end{lstlisting}
+
+这解释了为什么反汇编常显示某个地址而机器码里只有一个小端位移。链接器处理 relocation 时，也经常是在填这些位移或 GOT/PLT 入口。OS 读 oops 和栈回溯时，看到的返回地址是 \code{call} 的下一条指令地址；调试器再根据符号表把它映射回函数名和源码行。
+
+\subsection{从 objdump 读证据}
+
+写作和调试时，不要只说“编译器会生成汇编”。要能拿出命令和输出。下面是典型证据路径：
+
+\begin{lstlisting}
+g++ -O2 -c demo.cpp -o demo.o
+objdump -dr -Mintel demo.o
+readelf -Ws demo.o
+readelf -r demo.o
+\end{lstlisting}
+
+\code{objdump -d} 给反汇编，\code{-r} 同时显示 relocation，\code{-Mintel} 使用 Intel 语法。若某条指令访问外部符号，目标地址在 .o 里可能还没确定，反汇编会看到 relocation 项。这个细节连接到后面的 ELF、动态链接、内核模块装载和 eBPF/JIT：机器码中的地址不是总能在编译时写死，链接和装载会继续修改或解释它。
+
+\subsection{最小实验：从 C 到对象文件的四个观察点}
+
+下面这个实验不依赖内核源码，适合作为读者的第一条证据链。写一个小文件：
+
+\begin{lstlisting}
+// demo.cpp
+extern int g;
+
+int add_g(int x) {
+  return x + g + 1;
+}
+\end{lstlisting}
+
+编译但不链接：
+
+\begin{lstlisting}
+g++ -O2 -c demo.cpp -o demo.o
+objdump -dr -Mintel demo.o
+readelf -Ws demo.o
+readelf -r demo.o
+\end{lstlisting}
+
+应该观察四件事。第一，函数参数 \code{x} 进入整数参数寄存器，返回值在 \code{eax/rax}。第二，对外部变量 \code{g} 的访问不会在 \code{demo.o} 里得到最终地址，而是留下 relocation。第三，反汇编中的 \code{rip}-relative 访存说明代码不是把绝对地址写死。第四，优化级改变后，指令数量、寄存器选择和内存访问可能变化，但 ABI 边界不能变。
+
+\begin{rubricbox}
+这不是为了背命令，而是训练一个习惯：凡是书里说“编译器生成”“链接器修正”“CPU 执行”，都应能用 \code{objdump/readelf/gdb/perf} 之类工具找到证据。没有证据的解释，容易停留在概念层。
+\end{rubricbox}
+
 \subsection{x86-64 Intel 汇编到机器动作}
 
 考虑这段 Intel 语法汇编：
