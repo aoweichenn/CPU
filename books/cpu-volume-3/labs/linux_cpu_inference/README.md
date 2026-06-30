@@ -24,13 +24,14 @@
 - 自研 GPT-2 benchmark 对比：同一个 GPT-2 F32 safetensors 模型分别跑 full-prefix 和 cached-KV，并在可用时附带 llama.cpp/SmolLM2 Q4_K_M 作为成熟引擎参考
 - 自研 GPT-2 优化 A/B：从指定 baseline commit 建临时 worktree，当前实现和 baseline 都通过 `books/cpu-volume-3-practice` 的 Release CMake 入口构建，再用同一个 GPT-2 F32 模型多轮测量 full-prefix 与 cached-KV
 - 真实 small 开源模型冒烟：通过 llama.cpp 加载 SmolLM2-135M-Instruct 的 GGUF 量化文件，在本地 CPU 上生成一段 assistant 文本，并把模型 hash、命令、输出和性能行写入报告
+- 自研 SmolLM2/GGUF reference decode：读取同一个 GGUF 内的 tokenizer tokens/merges 和 `F32/Q8_0/Q5_0/Q6_K/Q4_K` 混合权重，加载 30 层 SmolLM2，执行 RMSNorm、normal RoPE、GQA KV cache、SwiGLU 和 tied lm head；当前权重执行方式是加载时解到 f32，用作后续量化直算优化的 correctness baseline
 - CLI 推理和简单 benchmark
 - CTest 正确性测试
 
 后续扩展方向：
 
 - 真实 7B 级模型 metadata、tokenizer 和量化权重导入
-- SentencePiece tokenizer、GGUF 权重导入、safetensors 分片加载和更多模型方言 name mapping
+- SentencePiece tokenizer、safetensors 分片加载和更多模型方言 name mapping
 - GPT-2 reference path 的 Transformers/PyTorch golden logits 对齐报告
 - KV cache 分页、内存规划和可选量化
 - CPU packed weight、SIMD、NUMA 和线程亲和优化
@@ -209,4 +210,34 @@ make cpu3-smollm2-smoke
 books/cpu-volume-3/results/lcqi-smollm2-small-model-smoke.txt
 ```
 
-这份报告只能证明真实 GGUF small 模型已经完成加载、tokenizer/chat template、prefill、decode 和文本输出。它不能证明 LCQI 自研 C++ 引擎已经支持完整 GGUF、不能证明回答质量正确，也不能替代 tiny fixture 的逐层 golden trace。tiny fixture 继续负责可手算语义和回归定位；SmolLM2 smoke 负责把“真实开源模型能在本机跑起来”变成可复查证据。
+这份报告只能证明 llama.cpp 成熟外部引擎上的真实 GGUF small 模型已经完成加载、tokenizer/chat template、prefill、decode 和文本输出。它不能证明 LCQI 自研 C++ 引擎已经达到 llama.cpp 的性能，也不能替代 tiny fixture 的逐层 golden trace。
+
+LCQI 自研 SmolLM2/GGUF reference decode：
+
+```bash
+books/cpu-volume-3/build/lcqi-release/labs/linux_cpu_inference/lcqi_llama_gguf \
+  ~/.cache/lcqi-smollm2-small-smoke/models/SmolLM2-135M-Instruct-Q4_K_M.gguf \
+  --prompt "Hello" --max-new 2 --benchmark --decode-text
+```
+
+caw 上的最新报告写到：
+
+```text
+books/cpu-volume-3/results/lcqi-smollm2-gguf-reference-decode-caw.txt
+```
+
+关键行是：
+
+```text
+weight_execution f32_dequantized_reference
+generated_text ... <|im_start|>assistant
+Hello!
+benchmark_prompt_tokens 31
+benchmark_generated_tokens 2
+benchmark_decode_tokens_per_second 22.1886
+benchmark_quantized_weight_bytes 103668480
+benchmark_f32_weight_bytes 538060032
+benchmark_tensors_loaded 272
+```
+
+这条路径证明 LCQI 自研代码已经能读取同一个 SmolLM2 GGUF、解析 tokenizer arrays、解码混合量化权重并端到端生成文本。它仍然不是生产级高性能引擎：当前把 103.7 MB 量化权重解成约 538 MB f32 权重，再用通用 f32 matvec 执行；与 llama.cpp 的差距主要来自低比特权重直算、packed kernel、线程调度、prefetch、KV cache 和整图执行。

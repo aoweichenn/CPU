@@ -519,7 +519,7 @@ decoder block & RMSNorm、QKV、RoPE、KV、MLP、lm head & 只比较一个 line
 \end{tabular}
 \end{center}
 
-本章当前已经把第一层推进到真实 GGUF 量化切片：LCQI 可以读取 llama.cpp smoke 使用的同一个 \code{SmolLM2-135M-Instruct-Q4\_K\_M.gguf}，解析 GGUF tensor 表，选取真实 \code{Q4\_K} 矩阵，运行 \code{Q4\_K} 权重加 \code{Q8\_K} 激活的单算子 matvec。它仍不是完整 SmolLM2 推理；完整路径还需要 tokenizer、RMSNorm、RoPE、SwiGLU、attention、KV cache、sampler 和调度闭环。
+本章当前有两层真实 GGUF 证据。第一层是单算子：LCQI 可以读取 llama.cpp smoke 使用的同一个 \code{SmolLM2-135M-Instruct-Q4\_K\_M.gguf}，解析 GGUF tensor 表，选取真实 \code{Q4\_K} 矩阵，运行 \code{Q4\_K} 权重加 \code{Q8\_K} 激活的 matvec。第二层是端到端 reference path：LCQI 现在能读取同一个 GGUF 里的 tokenizer tokens/merges、\code{F32}、\code{Q8\_0}、\code{Q5\_0}、\code{Q6\_K} 和 \code{Q4\_K} 混合权重，加载 30 层 SmolLM2，执行 RMSNorm、normal RoPE、GQA KV cache、SwiGLU 和 tied lm head，并从文本 prompt 生成 token。第二层当前是 \code{f32\_dequantized\_reference}，不是高性能量化直算引擎：它的作用是给后续优化提供可复查正确性基线。
 
 caw 上的 artifact 写入第三册 results 目录中的 \filepath{lcqi-smollm2-q4-k-benchmark.txt}。这次不是换一个方便的模型单独测，而是复用 llama.cpp smoke 同一个 GGUF 文件；模型身份、文件 hash 和 pinned llama.cpp commit 必须一起进入报告，避免“文件名相同、内容不同”的假对照。
 
@@ -558,6 +558,40 @@ llama_cpp_tg4_tps=216.82
 读这组数时要分层。LCQI 的 \code{40.604 us} 是单个真实 \code{Q4\_K} tensor matvec 加一次 \code{Q8\_K} input 量化的总耗时，证明量化权重加 \code{Q8\_K} 激活路径已经比“先解成 f32 权重再算”的基线快 \code{7.999x}；llama.cpp 的 \code{pp5=1450.48 tok/s} 和 \code{tg4=216.82 tok/s} 是完整引擎端到端参考，包含模型图、tokenizer、KV cache、线程池、调度和 sampler。二者不能直接相除，但它们共同给出下一步目标：LCQI 还要把这个单算子能力扩展到完整 decoder block，再进入端到端 tokens/s 验收。没有 correctness 对照的 tokens/s，只是吞吐数字，不是 AI Infra 证据。
 
 这轮 AVX2 优化必须诚实看：\code{avx2\_maddubs} 把 \code{Q4\_K x Q8\_K} 单 matvec 从 \code{43.030 us} 降到 \code{37.205 us}，只有 \code{1.157x}；把输入量化也算进去，总耗时从 \code{46.133 us} 到 \code{40.604 us}，只有 \code{1.136x}。原因是当前优化只替换了 32 元素子块里的 nibble 乘加，外层仍然是逐 row、逐 block 扫描；每个 block 仍要解 scale/min、做浮点缩放、写一个 row 的输出，也没有像 llama.cpp 那样把多行、多 block、线程调度、prefetch 和更宽 ISA 合并起来。因此这次证据的结论不是“已经接近 llama.cpp”，而是“第一个可复查的 Q4\_K AVX2 内核已进入默认路径，下一步瓶颈转移到多行调度、scale/min 解包和完整 decoder block 集成”。
+
+caw 上的完整 reference decode artifact 写入 \filepath{books/cpu-volume-3/results/lcqi-smollm2-gguf-reference-decode-caw.txt}。这条命令不是调用 llama.cpp，而是调用 LCQI 新增的 \cmd{lcqi\_llama\_gguf}：
+
+\begin{lstlisting}[numbers=none,caption={LCQI 自研 SmolLM2/GGUF reference decode 证据}]
+mode llama_gguf_reference
+weight_execution f32_dequantized_reference
+architecture llama
+model_name Smollm2 135M 8k Lc100K Mix1 Ep2
+layers 30
+hidden_size 576
+query_heads 9
+kv_heads 3
+head_dim 64
+vocab_size 49152
+tie_lm_head_to_embedding 1
+generated_text <|im_start|>system
+You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+Hello!
+benchmark_prompt_tokens 31
+benchmark_generated_tokens 2
+benchmark_prefill_steps 31
+benchmark_decode_steps 1
+benchmark_first_token_tokens_per_second 0.78061
+benchmark_decode_tokens_per_second 22.1886
+benchmark_kv_cache_bytes 1520640
+benchmark_quantized_weight_bytes 103668480
+benchmark_f32_weight_bytes 538060032
+benchmark_tensors_loaded 272
+\end{lstlisting}
+
+这组数解释了 LCQI 与 llama.cpp 的真实差距。LCQI 已经能跑同一个模型文件，但当前把 103.7 MB 量化权重一次性解成约 538 MB f32 权重，decode 阶段仍用通用 f32 matvec；llama.cpp 则保留 GGML 量化 block，在线程池、packed kernel、prefetch、KV cache、sampler 和调度中直接执行低比特路径。因此 LCQI 的 reference decode 约 \code{22 tok/s}，而同机 llama.cpp 端到端 \code{tg4} 参考约 \code{216.82 tok/s}。差距不是“少一个 AVX2 指令”这么简单，而是权重表示、矩阵内核、线程调度、内存带宽和整图执行方式都还没有达到成熟引擎水平。
 
 \subsection{微内核进入默认路径的验收}
 

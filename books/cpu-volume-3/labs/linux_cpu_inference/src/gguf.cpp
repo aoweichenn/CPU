@@ -99,6 +99,13 @@ public:
         return value;
     }
 
+    [[nodiscard]] float read_f32() {
+        const std::uint32_t value = this->read_u32();
+        float result = 0.0F;
+        std::memcpy(&result, &value, sizeof(result));
+        return result;
+    }
+
     [[nodiscard]] std::int32_t read_i32() {
         const std::uint32_t value = this->read_u32();
         std::int32_t result = 0;
@@ -272,8 +279,7 @@ std::string read_scalar_preview(BinaryReader& reader,
         case LCQI_GGUF_TYPE_STRING:
             return reader.read_string();
         case LCQI_GGUF_TYPE_FLOAT32:
-            reader.skip(LCQI_GGUF_TYPE_U32_BYTES);
-            return "<float32>";
+            return std::to_string(reader.read_f32());
         case LCQI_GGUF_TYPE_FLOAT64:
             reader.skip(LCQI_GGUF_TYPE_U64_BYTES);
             return "<float64>";
@@ -284,10 +290,27 @@ std::string read_scalar_preview(BinaryReader& reader,
     }
 }
 
-void skip_array_values(BinaryReader& reader, std::int32_t element_type, std::uint64_t count) {
+std::vector<std::string> read_string_array(BinaryReader& reader, std::uint64_t count) {
+    std::vector<std::string> values;
+    if (count > static_cast<std::uint64_t>(std::numeric_limits<std::size_t>::max())) {
+        throw std::runtime_error("GGUF string array is too large");
+    }
+    values.reserve(static_cast<std::size_t>(count));
+    for (std::uint64_t index = 0; index < count; ++index) {
+        values.push_back(reader.read_string());
+    }
+    return values;
+}
+
+void read_or_skip_array_values(BinaryReader& reader,
+                               std::int32_t element_type,
+                               std::uint64_t count,
+                               GgufMetadataEntry& entry) {
     if (element_type == LCQI_GGUF_TYPE_STRING) {
-        for (std::uint64_t index = 0; index < count; ++index) {
-            static_cast<void>(reader.read_string());
+        entry.string_values = read_string_array(reader, count);
+        if (!entry.string_values.empty()) {
+            entry.value_preview =
+                "count=" + std::to_string(count) + " first=" + entry.string_values.front();
         }
         return;
     }
@@ -306,7 +329,7 @@ void read_metadata(BinaryReader& reader, GgufManifest& manifest) {
             const std::uint64_t count = reader.read_u64();
             entry.type = "ARRAY[" + gguf_value_type_name(element_type) + "]";
             entry.value_preview = "count=" + std::to_string(count);
-            skip_array_values(reader, element_type, count);
+            read_or_skip_array_values(reader, element_type, count, entry);
         } else {
             entry.value_preview = read_scalar_preview(reader, type, entry.key, manifest);
         }
@@ -391,6 +414,19 @@ const GgufTensorInfo* GgufManifest::find_tensor(std::string_view name) const {
             return tensor.name == name;
         });
     if (found == this->tensors.end()) {
+        return nullptr;
+    }
+    return &(*found);
+}
+
+const GgufMetadataEntry* GgufManifest::find_metadata(std::string_view key) const {
+    const auto found = std::find_if(
+        this->metadata.begin(),
+        this->metadata.end(),
+        [key](const GgufMetadataEntry& entry) {
+            return entry.key == key;
+        });
+    if (found == this->metadata.end()) {
         return nullptr;
     }
     return &(*found);

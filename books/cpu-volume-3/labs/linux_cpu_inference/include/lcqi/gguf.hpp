@@ -44,6 +44,7 @@ struct GgufMetadataEntry {
     std::string key;
     std::string type;
     std::string value_preview;
+    std::vector<std::string> string_values;
 };
 
 struct GgufTensorInfo {
@@ -67,6 +68,7 @@ struct GgufManifest {
     std::vector<GgufTensorInfo> tensors;
 
     [[nodiscard]] const GgufTensorInfo* find_tensor(std::string_view name) const;
+    [[nodiscard]] const GgufMetadataEntry* find_metadata(std::string_view key) const;
 };
 
 [[nodiscard]] GgmlTypeLayout ggml_type_layout(GgmlType type);

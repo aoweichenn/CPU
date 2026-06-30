@@ -2,10 +2,12 @@ find_package(Threads REQUIRED)
 
 add_library(lcqi STATIC
     src/f32_kernels.cpp
+    src/ggml_tensors.cpp
     src/gguf.cpp
     src/gpt2_reference.cpp
     src/inference.cpp
     src/int8_kernels.cpp
+    src/llama_gguf.cpp
     src/model.cpp
     src/q4_k.cpp
     src/reference_decoder.cpp
@@ -89,6 +91,16 @@ target_link_libraries(lcqi_gpt2 PRIVATE lcqi)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(lcqi_gpt2 PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(lcqi_llama_gguf
+    src/llama_cli.cpp
+)
+
+target_link_libraries(lcqi_llama_gguf PRIVATE lcqi)
+
+if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
+    target_compile_options(lcqi_llama_gguf PRIVATE -Wall -Wextra -Wpedantic)
 endif()
 
 add_executable(lcqi_ledger
