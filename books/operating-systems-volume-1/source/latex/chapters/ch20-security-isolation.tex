@@ -169,3 +169,102 @@ W\^X/NX & 数据页执行 & JIT 配置错误、ROP \\
 \end{longtable}
 
 安全测试要同时证明正常路径可用、禁止路径失败、失败有日志、敏感数据不泄露。只打开硬化选项但没有负面测试，不能说明边界有效。
+
+\subsection{open 权限检查不能只看路径字符串}
+
+路径是输入，inode 和 file 才是稳定对象。安全代码若先检查字符串路径，再在另一步打开文件，中间目录项可能被替换，形成 TOCTOU。更可靠的做法是让内核路径解析在同一次操作里完成权限、mount、LSM 和 open flag 检查，或者使用目录 fd、\code{openat2} 约束和已经打开的 fd 作为稳定能力。
+
+\begin{lstlisting}
+unsafe pattern:
+  if path starts with "/safe":
+    open(path)
+
+safer pattern:
+  dirfd = open("/safe", O_PATH | O_DIRECTORY)
+  openat2(dirfd, relative_path,
+          RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS)
+\end{lstlisting}
+
+这里的关键不是某个 API 名字，而是对象绑定：检查和使用必须落在同一个解析结果上。符号链接、bind mount、rename、并发 unlink、mount namespace 都会改变“同一个字符串”指向的对象。
+
+\subsection{exec 时 capability 和 no\_new\_privs 改变边界}
+
+权限不是进程启动后固定不变。exec 会重新计算凭据、环境、dumpable 状态、secureexec、文件 capability 和 setuid 影响。若进程设置 \code{no\_new\_privs}，后续 exec 不能获得比当前更多的权限；seccomp 过滤器通常要求先设置这个标志，防止低权限进程安装过滤器后再通过 exec 提权。
+
+\begin{lstlisting}
+exec credential sketch:
+  read current cred
+  inspect executable mode and file capabilities
+  if no_new_privs:
+    suppress privilege gain
+  compute new permitted/effective/ambient sets
+  apply secureexec rules if privilege boundary changed
+  commit new cred at exec commit point
+\end{lstlisting}
+
+ambient capability 容易被误用。它能跨 exec 传递给非特权可执行文件，所以启动服务前应清理不需要的 ambient set，并收紧 bounding set。否则子进程可能在没预期的路径上保留网络、ptrace 或管理能力。
+
+\subsection{seccomp 规则要按参数和返回动作设计}
+
+只按 syscall 号 allow/deny 往往太粗。例如 \code{ioctl}、\code{prctl}、\code{clone}、\code{socket} 的危险性高度依赖参数。高质量 seccomp profile 至少要区分常用参数组合，并为拒绝路径选择明确动作：返回 errno、kill 进程、记录日志或交给 user notification。
+
+\begin{lstlisting}
+seccomp policy sketch:
+  allow read/write/close/futex/clock_gettime
+  allow mmap only without PROT_EXEC|PROT_WRITE together
+  allow socket only AF_UNIX if service does not need network
+  reject mount/ptrace/bpf/module loading
+  return EPERM for expected probes
+  kill process for impossible dangerous calls
+\end{lstlisting}
+
+规则还要随库和运行时变化测试。动态链接器、线程库、DNS、日志库都可能调用你没想到的系统调用。部署前应在真实启动路径、热路径、错误路径和 reload 路径下跑 profile，而不是只跑主函数。
+
+\subsection{Landlock 的边界：只能收紧，不能授权}
+
+Landlock 适合让普通进程给自己加文件系统沙箱。它的 ruleset 声明要处理哪些访问类型，再把路径 fd 加入 allow list，最后 \code{restrict\_self}。一旦限制生效，进程不能用 Landlock 获得原来没有的权限，只能在原权限基础上进一步收紧。
+
+\begin{lstlisting}
+landlock flow:
+  ruleset = create_ruleset(handled_access_fs)
+  dirfd = open(allowed_dir, O_PATH | O_DIRECTORY)
+  add_path_beneath_rule(ruleset, dirfd, allowed_access)
+  prctl(PR_SET_NO_NEW_PRIVS, 1)
+  landlock_restrict_self(ruleset)
+  exec or run workload
+\end{lstlisting}
+
+测试要覆盖允许目录、禁止目录、符号链接、rename、临时文件和继承。若只测试“程序还能启动”，无法说明沙箱真的挡住了写入、删除、执行或路径逃逸。
+
+\subsection{BPF LSM 和传统 LSM 的关系}
+
+LSM hook 把安全检查插入到 inode、file、task、socket、bpf 等对象操作中。传统 LSM 如 SELinux、AppArmor 使用预先加载的策略；BPF LSM 允许受验证的 BPF 程序挂到安全 hook 上，适合做可观测、渐进式或环境相关的策略。
+
+\begin{lstlisting}
+security_inode_permission(inode, mask):
+  for each registered LSM:
+    ret = lsm->inode_permission(inode, mask)
+    if ret != 0:
+      return ret
+  return 0
+\end{lstlisting}
+
+BPF LSM 仍受 verifier、权限和 hook 上下文限制。程序不能任意睡眠，不能随便访问内核内存，返回值语义也要遵守 hook 约定。它是内核安全框架的一部分，不是绕过 DAC/capability 的后门。
+
+\subsection{容器逃逸常见入口}
+
+容器共享宿主内核，所以边界经常坏在“多给了一个能力或设备”。常见风险包括挂载宿主敏感路径、保留 \code{CAP\_SYS\_ADMIN}、开放容器引擎 socket、允许特权设备、未限制 \code{/proc} 和 \code{/sys}、seccomp profile 过宽、cgroup pids/memory 未限。
+
+\begin{longtable}{p{0.25\linewidth}p{0.36\linewidth}p{0.27\linewidth}}
+\toprule
+风险 & 为什么危险 & 收紧方向 \\
+\midrule
+\code{CAP\_SYS\_ADMIN} & 覆盖大量管理操作 & 默认删除，只按具体需要添加 \\
+宿主容器引擎 socket & 等价于控制宿主容器引擎 & 不挂载，改用受限代理 \\
+特权设备节点 & 可能直接访问内核或硬件接口 & devices cgroup 和最小设备集 \\
+宽松 \code{/proc} & 泄露进程、内核和 namespace 信息 & hidepid、只读挂载、裁剪视图 \\
+无 pids/memory 限制 & fork bomb 或内存压力拖垮宿主 & cgroup v2 限额 \\
+\bottomrule
+\end{longtable}
+
+安全隔离要按“最小必要对象”配置，而不是按“程序跑起来需要什么就全开”。每放开一个 capability、设备、挂载或 syscall，都要写清楚它对应的业务需求和负面测试。

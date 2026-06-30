@@ -150,6 +150,106 @@ fairness error & 实得 CPU 与权重目标差距 & 平均公平掩盖尾延迟 
 
 真实通用 OS 还要处理多核、NUMA、CPU affinity、实时任务、cgroup 配额、负载均衡和能耗。多核调度不是简单地把一个队列给所有 CPU，因为全局队列会产生锁竞争；每 CPU runqueue 能降低竞争，但需要负载均衡。迁移任务可以平衡负载，却会丢失 cache/TLB 热状态。调度器必须在公平、吞吐、延迟、局部性和能耗之间折中。
 
+\subsection{task 不是一个正在运行的函数}
+
+硬件正在执行的是寄存器、RIP、RSP、RFLAGS 和页表上下文。内核把这组执行状态包装成 task，再让 task 指向地址空间、文件表、信号状态、凭据、namespace 和 cgroup。task 是可调度实体，不是进程所有资源的简单大盒子。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+字段类别 & 保存什么 & 为什么重要 \\
+\midrule
+执行现场 & 内核栈、保存寄存器、返回路径 & 被切走后还能从同一点继续 \\
+调度状态 & state、policy、prio、vruntime、on\_rq & 判断能否运行、怎样排序、是否已入队 \\
+地址空间 & \code{mm}、\code{active\_mm} & 进程切换可能要切页表和 TLB \\
+资源指针 & files、fs、signal、sighand & fork、exec、exit 要复制、共享或释放 \\
+安全身份 & cred、namespace、cgroup & 权限、限额和可见性都依赖它 \\
+亲和性 & allowed CPUs、last CPU、NUMA 统计 & 负载均衡不能只看队列长度 \\
+\bottomrule
+\end{longtable}
+
+\code{state} 和 \code{on\_rq} 要分开理解。\code{state} 说明任务是 runnable、sleeping、stopped 还是 exiting；\code{on\_rq} 说明它是否已经挂到某个 runqueue。一个 runnable 任务没有入队，会永远等不到 CPU；一个 sleeping 任务留在 runqueue，会被错误调度。调度器的大量锁和状态检查，就是为了让这两本账一致。
+
+\subsection{阻塞系统调用怎样离开 CPU}
+
+阻塞不是“函数停住”。内核要把当前任务从可运行集合移走，把它挂到等待队列，并保证事件到达时能找回它。以等待 pipe 或 socket 可读为例：
+
+\begin{lstlisting}
+blocking_read(obj):
+  lock(obj.lock)
+  while !data_available(obj):
+    prepare_to_wait(obj.read_waitq, current)
+    current.state = TASK_INTERRUPTIBLE
+    unlock(obj.lock)
+    schedule()
+    lock(obj.lock)
+    finish_wait(obj.read_waitq, current)
+    if signal_pending(current):
+      unlock(obj.lock)
+      return -EINTR
+  copy_data_to_user()
+  unlock(obj.lock)
+  return bytes
+\end{lstlisting}
+
+检查谓词和入等待队列必须受同一把锁保护。若先检查发现没有数据，还没入队时生产者写入并唤醒，唤醒会丢失；随后当前任务睡下，就形成 lost wakeup。谓词循环也不是模板写法：任务可能被信号唤醒，可能被虚假唤醒，也可能多个等待者竞争同一份数据。
+
+\subsection{唤醒怎样进入 runqueue}
+
+唤醒不等于立即运行。唤醒方通常只把等待任务改回 runnable，放到目标 CPU 的 runqueue；是否抢占当前任务，要看调度类、优先级、抢占状态和 CPU 位置。
+
+\begin{lstlisting}
+wake_up(waitq):
+  lock(waitq.lock)
+  for task in waitq:
+    if task.wait_condition_is_satisfied:
+      remove_from_waitq(task)
+      task.state = TASK_RUNNING
+      enqueue_task(select_runqueue(task), task)
+      if task_should_preempt_current(task):
+        set_need_resched(target_cpu)
+  unlock(waitq.lock)
+\end{lstlisting}
+
+若目标 CPU 正在用户态运行，\code{need\_resched} 常在返回用户态、定时器中断返回或显式调度点处理。若目标 CPU 是另一个核心，内核可能发 IPI 让它尽快重新调度。这样看，wakeup 的成本包括等待队列锁、runqueue 锁、跨 CPU 通知和 cache line 迁移。
+
+\subsection{抢占点和不可抢占区}
+
+定时器中断可以打断用户态程序，但内核不能在任意位置无条件切走当前任务。持有自旋锁、关闭中断、正在修改 runqueue、正在操作每 CPU 数据时，随意抢占会破坏不变量。内核用 \code{preempt\_count}、中断状态和锁规则标记这些区域。
+
+\begin{lstlisting}
+timer_interrupt:
+  account_runtime(current)
+  if current.timeslice_expired:
+    set_need_resched(current)
+  if returning_to_user and need_resched:
+    schedule()
+  else if kernel_preemptible and preempt_count == 0:
+    schedule()
+\end{lstlisting}
+
+实时系统关心的不是平均时间片，而是最长不可抢占区、最长关中断区和最高优先级任务被低优先级持锁路径阻塞的时间。一个系统平均响应很好，也可能因为某条持锁路径过长而出现不可接受的尾延迟。
+
+\subsection{fork、exec、wait 和调度器的连接}
+
+\code{fork} 创建的新任务不能在半初始化状态进入 runqueue。内核必须先准备内核栈、保存的用户寄存器、调度实体、地址空间引用、文件表引用、信号状态和 PID，再让调度器看到它。子进程第一次运行时不是从程序开头执行，而是从系统调用返回路径回到用户态，只是返回值寄存器被设置为 0。
+
+\begin{lstlisting}
+fork scheduling boundary:
+  allocate child task
+  prepare child saved registers
+  copy or share mm/files/signal/cred
+  allocate pid and link parent-child relation
+  enqueue child as runnable
+  parent returns child pid
+  child later returns 0 from copied frame
+\end{lstlisting}
+
+\code{exec} 成功后仍是同一个 task 被调度，但地址空间、用户栈、入口 RIP、部分信号处理和 close-on-exec fd 改变。\code{wait} 要求已退出子进程保留 zombie 壳，直到父进程读取退出码。调度器只负责不再运行 zombie；进程管理还要保证退出状态只被回收一次，最后一个引用释放 task。
+
+\subsection{源码阅读入口}
+
+进程创建看 \filepath{kernel/fork.c} 的 \code{copy\_process}；退出和回收看 \filepath{kernel/exit.c} 的 \code{do\_exit}、\code{release\_task}；调度主干看 \filepath{kernel/sched/core.c} 的 \code{\_\_schedule}、\code{try\_to\_wake\_up}；公平类看 \filepath{kernel/sched/fair.c} 的 enqueue/dequeue、vruntime 和负载均衡。阅读时把每一步标成四类动作：改 task 状态、改 runqueue、改资源引用、通知等待者。
+
 \section{测试}
 
 调度测试至少覆盖三类情况：多个 runnable 进程应轮转推进；blocked 进程不应获得 tick；terminated 进程不应重新出现。还要检查没有 runnable 进程时，调度器返回 idle，而不是访问空队列。

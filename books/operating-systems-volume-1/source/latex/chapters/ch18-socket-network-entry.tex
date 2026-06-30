@@ -275,3 +275,98 @@ socket option 是应用调整内核协议策略的入口。例如 \code{SO\_RCVB
 \end{longtable}
 
 选项不是调优魔法。每个选项都改变状态机和资源边界，必须通过负载测试和故障测试验证。
+
+\subsection{connect 的阻塞、非阻塞和错误取回}
+
+\code{connect} 不是简单地“连上或失败”。阻塞 TCP connect 会发起握手并睡眠等待结果；非阻塞 connect 通常返回 \code{EINPROGRESS}，之后用户用 \code{poll/epoll} 等待可写，再用 \code{getsockopt(SO\_ERROR)} 取真正结果。可写事件只表示连接状态有变化，不表示一定成功。
+
+\begin{lstlisting}
+nonblocking_connect(sock, addr):
+  ret = connect(sock, addr)
+  if ret == 0:
+    connected
+  else if errno == EINPROGRESS:
+    wait EPOLLOUT
+    err = getsockopt(sock, SOL_SOCKET, SO_ERROR)
+    if err == 0:
+      connected
+    else:
+      connect failed with err
+  else:
+    immediate failure
+\end{lstlisting}
+
+程序只看到 \code{EPOLLOUT} 就开始发送，是常见错误。连接拒绝、超时、路由不可达都可能通过 socket 错误状态返回。内核把异步错误挂在 socket 上，应用必须取走并处理。
+
+\subsection{recv 返回值的含义}
+
+TCP 是字节流，\code{recv} 的返回值表达当前 socket 状态，不表达业务协议状态。
+
+\begin{longtable}{p{0.18\linewidth}p{0.40\linewidth}p{0.30\linewidth}}
+\toprule
+结果 & 内核含义 & 应用动作 \\
+\midrule
+\code{n > 0} & 从接收队列取出 n 字节 & 放入协议解析缓冲，继续解析消息边界 \\
+\code{0} & 对端有序关闭，且本端已读完缓冲数据 & 处理 EOF，不能再期待新字节 \\
+\code{-EAGAIN} & 非阻塞 socket 暂无数据 & 等待下一次可读事件 \\
+\code{-EINTR} & 被信号打断 & 根据业务决定重试或退出 \\
+\code{-ECONNRESET} & 连接被复位 & 丢弃未完成请求，按协议决定是否重试 \\
+\bottomrule
+\end{longtable}
+
+EOF 不等于错误，reset 也不等于普通 EOF。若对端发送 FIN，已经在接收缓冲里的数据仍可读；读完后才返回 0。若收到 RST，未完成的字节流不再可信，很多协议必须把当前请求标成结果未知。
+
+\subsection{TCP 不是消息队列}
+
+应用写入两次，接收端可能一次读到合并后的字节；应用写入一次，接收端可能分多次读到。TCP 保证有序字节流，不保留 \code{write} 调用边界。业务协议必须显式 framing。
+
+\begin{lstlisting}
+length_prefixed_protocol:
+  read bytes into buffer
+  while buffer has at least 4 bytes:
+    len = parse_u32(buffer[0:4])
+    if buffer has less than 4 + len:
+      break
+    message = buffer[4:4+len]
+    dispatch(message)
+    remove consumed bytes
+\end{lstlisting}
+
+这个状态机必须处理半包、粘包、超长长度、恶意长度、连接关闭和超时。把一次 \code{recv} 当成一条完整消息，是 TCP 服务端最常见的教学级错误。
+
+\subsection{Nagle、delayed ACK 和小包延迟}
+
+\code{TCP\_NODELAY} 关闭 Nagle 后，小写入更快发出，但包数增加；Nagle 打开时，小包可能等待未确认数据；接收端 delayed ACK 又可能延迟确认。两者组合会让“写了几个字节为什么几十毫秒后才到”变成真实问题。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+机制 & 目的 & 可能副作用 \\
+\midrule
+Nagle & 合并小包，减少网络开销 & 请求/响应小消息延迟上升 \\
+Delayed ACK & 减少纯 ACK 包 & 与 Nagle 组合造成等待 \\
+\code{TCP\_NODELAY} & 降低小消息等待 & 包数和 CPU 开销上升 \\
+\code{TCP\_CORK} & 手动聚合发送 & 忘记 uncork 会拖延发送 \\
+\bottomrule
+\end{longtable}
+
+调优不能只背“低延迟就开 TCP\_NODELAY”。如果协议能批量发送，保留聚合可能更好；如果是交互 RPC，小消息阻塞会直接进入尾延迟。
+
+\subsection{超时、重试和幂等不由 socket 自动解决}
+
+socket 超时只能告诉应用某个等待没有在期限内完成，不能告诉远端是否处理了请求。发送超时、接收超时、连接 reset、进程崩溃都可能让请求处在“可能提交、可能未提交”的灰区。应用协议要用请求 ID、幂等键、事务日志或去重表解决语义。
+
+\begin{lstlisting}
+rpc_with_idempotency:
+  id = allocate_request_id()
+  send(id, operation, payload)
+  if timeout:
+    reconnect_or_retry(id)
+  server:
+    if id already committed:
+      return old result
+    execute operation
+    record result by id
+    return result
+\end{lstlisting}
+
+OS 负责提供字节流、错误码、关闭语义和等待机制；“这笔业务是否执行过”是应用协议层的责任。网络章节若不讲这个边界，读者会把 TCP 可靠传输误解成业务可靠提交。

@@ -145,7 +145,7 @@ def inline(text: str) -> str:
             continue
         name = match.group(1)
         index += len(match.group(0))
-        if name in {"code", "filepath", "texttt", "nolinkurl"} and index < len(text) and text[index] == "{":
+        if name in {"asmcode", "code", "filepath", "texttt", "nolinkurl"} and index < len(text) and text[index] == "{":
             raw, index = read_group(text, index)
             out.append(f"<code>{html.escape(latex_plain(raw))}</code>")
             continue

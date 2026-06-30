@@ -126,6 +126,129 @@ complete(req_id, status, bytes):
 
 请求身份非常重要。异步完成可能乱序返回；取消后的请求也可能迟到完成；buffer 所有权必须跟着请求身份走。没有 request id，就无法把 completion 正确对应到提交者。
 
+\subsection{fd、file 和 inode 的并发引用}
+
+fd 是进程 fd 表下标，不是对象身份。内核执行 \code{read(fd)} 时，先把 fd 转成 \code{struct file} 引用；只要引用拿到，即使另一个线程随后 \code{close(fd)}，当前 I/O 也能在 file 对象上完成。close 删除的是 fd 表槽位，并减少 file 引用；它不能把正在执行的 I/O 用到的 file 直接释放。
+
+\begin{lstlisting}
+sys_read(fd, buf, len):
+  file = fget(fd)
+  if file == null:
+    return -EBADF
+  ret = vfs_read(file, buf, len)
+  fput(file)
+  return ret
+
+sys_close(fd):
+  file = files_table_remove(fd)
+  if file == null:
+    return -EBADF
+  fput(file)
+  return 0
+\end{lstlisting}
+
+这个规则解释 fd reuse 风险：线程 A 保存整数 fd=5，线程 B close(5)，线程 C open 得到新的 fd=5。A 再用整数 5 时，访问的可能已经是另一个对象。内核靠 file 引用保护内部生命周期，用户态也要避免把裸 fd 长期跨线程传递而没有所有权约定。
+
+\subsection{open flags 的作用域}
+
+flag 不是都绑定在同一层。fd flag 绑定 fd 表项；file status flag 绑定 open file description。dup 后两个 fd 指向同一个 open file description，所以共享 file status flag 和 offset；但 close-on-exec 是 fd flag，每个 fd 可以不同。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+标志 & 作用范围 & 边界 \\
+\midrule
+\code{O\_CLOEXEC} & fd 表项 & exec 提交时关闭该 fd，不影响其他 fd 的标志 \\
+\code{O\_NONBLOCK} & open file description & dup 后共享，影响 read/write/accept/connect 等等待行为 \\
+\code{O\_APPEND} & open file description & 每次写前在内核内原子移动到文件尾 \\
+\code{O\_DIRECT} & file I/O 路径 & 对齐、页 pin、缓存一致性和短 I/O 更复杂 \\
+\code{O\_SYNC/O\_DSYNC} & 写入持久化语义 & 返回前要推进数据或元数据到更强边界 \\
+\bottomrule
+\end{longtable}
+
+\code{O\_APPEND} 不是用户态先 \code{lseek} 到末尾再 \code{write}。后者在并发下会竞争：两个线程都看到同一个旧文件尾，然后互相覆盖。append 语义要求内核在持有文件系统相关锁的状态下决定写入位置。
+
+\subsection{短读短写不是异常}
+
+普通文件顺序读常尽量返回请求长度，但很多 fd 都允许短读短写。pipe 可能只剩一部分数据；socket 是字节流，接收缓冲里有什么就先给什么；非阻塞 fd 无法继续推进时返回 \code{EAGAIN}；信号可能让系统调用返回 \code{EINTR}；存储错误可能让已经完成的部分和错误同时出现。
+
+\begin{lstlisting}
+write_all(fd, buf, len):
+  done = 0
+  while done < len:
+    n = write(fd, buf + done, len - done)
+    if n > 0:
+      done += n
+      continue
+    if errno == EINTR:
+      continue
+    if errno == EAGAIN:
+      wait_writable(fd)
+      continue
+    return error
+  return done
+\end{lstlisting}
+
+读路径也需要协议层状态机。对 TCP，\code{recv} 返回 20 字节不表示一个业务消息完整；对 UDP，一次 \code{recvmsg} 对应一个 datagram，buffer 太小会截断；对终端，行规程可能改变返回时机。OS 提供 fd 语义，应用协议必须自己定义消息边界。
+
+\subsection{buffered I/O 和 direct I/O 的不同风险}
+
+buffered I/O 经过 page cache，适合普通应用和共享缓存；direct I/O 尽量绕过 page cache，适合数据库一类自己管理缓存和写入顺序的程序。direct I/O 不是“更高级的 read/write”，它把对齐、页 pin、设备队列、缓存一致性和错误处理暴露得更多。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+路径 & 优点 & 代价 \\
+\midrule
+buffered read & 命中 page cache 很快，可共享缓存 & 多一次复制，缓存污染可能影响其他任务 \\
+buffered write & 快速标脏，后台批量写回 & write 返回不代表持久化 \\
+direct read/write & 减少 page cache 干扰，适合自管缓存 & 对齐、pin 页、短 I/O 和并发一致性复杂 \\
+mmap & load/store 直接访问映射页 & 缺页、SIGBUS、dirty/writeback 语义更隐蔽 \\
+\bottomrule
+\end{longtable}
+
+direct I/O 和 buffered I/O 混用尤其危险。一个路径绕过 page cache，另一个路径读写 page cache，若文件系统没有正确失效或同步缓存，应用可能看到旧数据。真实系统会在文件系统层处理这类一致性，但应用设计仍应尽量避免无计划混用。
+
+\subsection{epoll item 绑定的是 file}
+
+\code{epoll\_ctl} 把一个 fd 对应的 file 和 interest mask 加进 epoll 实例。之后整数 fd 关闭并复用，不代表旧 epoll item 自动变成新文件的监听项。事件返回里带着用户当初登记的 fd 数字，但内核里的等待关系绑定的是旧 file。
+
+\begin{lstlisting}
+epoll_ctl(epfd, ADD, fd):
+  file = fget(fd)
+  epitem.file = file
+  epitem.fd_number_for_user = fd
+  attach_poll_callback(file, epitem)
+
+event delivery:
+  file state changes
+  callback enqueues epitem
+  epoll_wait returns stored fd_number and event mask
+\end{lstlisting}
+
+事件循环通常要给每个连接对象加 generation 或指针身份，而不是只根据 fd 整数找状态。close、dup、fork、exec、线程并发都可能让 fd 数字的直觉失效。
+
+\subsection{io\_uring 的提交、完成和取消}
+
+io\_uring 把“提交请求”和“收完成结果”拆成两个环。SQE 中的 \code{user\_data} 是应用识别 completion 的关键；CQE 中的 \code{res} 是最终字节数或负 errno。提交成功只表示内核接收了请求，不表示 I/O 完成。
+
+\begin{lstlisting}
+submit:
+  fill SQE with opcode, fd, buffer, length, user_data
+  publish SQ tail
+  enter kernel or rely on SQPOLL
+
+complete:
+  read CQE
+  id = cqe.user_data
+  result = cqe.res
+  release or reuse buffer only now
+\end{lstlisting}
+
+取消请求要按竞态理解：取消到达时，请求可能还在队列里，可能已经派发给设备，可能刚刚完成。应用必须能接受“取消成功”“取消失败因为已经完成”“先收到完成后收到取消结果”等情况。只要 completion 可能到来，buffer 和请求对象就不能提前复用。
+
+\subsection{源码阅读入口}
+
+fd 表和引用看 \filepath{fs/file.c}、\filepath{include/linux/fdtable.h}；open 和路径解析看 \filepath{fs/open.c}、\filepath{fs/namei.c}；read/write 主干看 \filepath{fs/read\_write.c}；page cache 看 \filepath{mm/filemap.c}；epoll 看 \filepath{fs/eventpoll.c}；io\_uring 看 \filepath{io\_uring/}。阅读时跟住一个 fd：它从整数变成 file，如何增加引用，如何进入具体 file operations，错误码在哪里返回，最后一个引用在哪里释放。
+
 \section{测试}
 
 测试覆盖 open/write/read、dup 后共享内容、close 一个 fd 后另一个 fd 仍有效、关闭所有引用后访问失败、未知 fd 返回诊断。还要测试 fd 分配单调或复用策略是否有明确规则。
