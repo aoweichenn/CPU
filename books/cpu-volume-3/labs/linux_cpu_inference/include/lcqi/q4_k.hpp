@@ -28,6 +28,10 @@ void dequantize_q4_k_to(std::span<const std::uint8_t> bytes,
 
 [[nodiscard]] std::vector<Q8KBlock> quantize_q8_k_input(std::span<const float> input);
 
+[[nodiscard]] bool q4_k_q8_avx2_available() noexcept;
+
+[[nodiscard]] const char* q4_k_q8_active_backend() noexcept;
+
 float dot_q4_k_f32(std::span<const std::uint8_t> q4_blocks,
                    std::span<const float> input);
 

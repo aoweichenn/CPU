@@ -56,11 +56,16 @@ def run_command(
     *,
     timeout_seconds: int,
     cwd: Path | None = None,
+    env: dict[str, str] | None = None,
 ) -> CommandResult:
+    command_env = os.environ.copy()
+    if env:
+        command_env.update(env)
     try:
         completed = subprocess.run(
             args,
             cwd=str(cwd) if cwd else str(repo_dir()),
+            env=command_env,
             text=True,
             capture_output=True,
             timeout=timeout_seconds,
@@ -174,14 +179,17 @@ def run_lcqi_benchmark(
     binary: Path,
     model: Path,
     *,
+    name: str,
     tensor: str,
     repeat: int,
     timeout_seconds: int,
+    env: dict[str, str] | None = None,
 ) -> CommandResult:
     return run_command(
-        "lcqi_smollm2_q4_k",
+        name,
         [str(binary), str(model), tensor, str(repeat)],
         timeout_seconds=timeout_seconds,
+        env=env,
     )
 
 
@@ -282,9 +290,32 @@ def write_report(path: Path, runs: list[CommandResult], *, model: Path) -> None:
                 "",
             ]
         )
+    scalar = next((run for run in runs if run.name == "lcqi_smollm2_q4_k_scalar"), None)
+    auto = next((run for run in runs if run.name == "lcqi_smollm2_q4_k_auto"), None)
+    if scalar is not None and auto is not None:
+        scalar_matvec = metric_as_float(scalar.metrics, "q4_q8_matvec_average_us")
+        auto_matvec = metric_as_float(auto.metrics, "q4_q8_matvec_average_us")
+        scalar_total = metric_as_float(scalar.metrics, "q4_q8_total_average_us")
+        auto_total = metric_as_float(auto.metrics, "q4_q8_total_average_us")
+        if scalar_matvec is not None and auto_matvec is not None and auto_matvec > 0.0:
+            lines.append("[lcqi_auto_vs_scalar]")
+            lines.append(f"q4_q8_matvec_speedup_auto_vs_scalar={scalar_matvec / auto_matvec:.3f}")
+            if scalar_total is not None and auto_total is not None and auto_total > 0.0:
+                lines.append(f"q4_q8_total_speedup_auto_vs_scalar={scalar_total / auto_total:.3f}")
+            lines.append("")
     while lines and lines[-1] == "":
         lines.pop()
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def metric_as_float(metrics: dict[str, str], key: str) -> float | None:
+    value = metrics.get(key)
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -321,6 +352,16 @@ def main() -> int:
             run_lcqi_benchmark(
                 binary,
                 model,
+                name="lcqi_smollm2_q4_k_scalar",
+                tensor=args.tensor,
+                repeat=args.repeat,
+                timeout_seconds=args.timeout_seconds,
+                env={"LCQI_Q4K_BACKEND": "scalar"},
+            ),
+            run_lcqi_benchmark(
+                binary,
+                model,
+                name="lcqi_smollm2_q4_k_auto",
                 tensor=args.tensor,
                 repeat=args.repeat,
                 timeout_seconds=args.timeout_seconds,

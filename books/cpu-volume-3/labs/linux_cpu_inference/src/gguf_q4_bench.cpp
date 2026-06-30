@@ -238,6 +238,7 @@ int main(int argc, char** argv) {
         std::cout << "f32_matvec_average_us=" << f32_us << '\n';
         std::cout << "q4_f32_input_average_us=" << q4_f32_us << '\n';
         std::cout << "q8_quantize_input_average_us=" << q8_quantize_us << '\n';
+        std::cout << "q4_q8_backend=" << lcqi::q4_k_q8_active_backend() << '\n';
         std::cout << "q4_q8_matvec_average_us=" << q4_q8_us << '\n';
         std::cout << "q4_q8_total_average_us=" << q4_q8_total_us << '\n';
         std::cout << "speedup_q4_q8_total_vs_f32="

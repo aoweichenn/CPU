@@ -219,6 +219,22 @@ float dot_block_q4_k_q8(const std::uint8_t* block, const Q8KBlock& input) {
 
 }  // namespace
 
+#if !defined(LCQI_ENABLE_AVX2)
+bool q4_k_q8_avx2_available() noexcept {
+    return false;
+}
+
+const char* q4_k_q8_active_backend() noexcept {
+    return "scalar";
+}
+#endif
+
+void matvec_q4_k_q8_avx2_unchecked(std::span<const std::uint8_t>,
+                                   std::int64_t,
+                                   std::int64_t,
+                                   std::span<const Q8KBlock>,
+                                   std::span<float>);
+
 std::vector<float> dequantize_q4_k(std::span<const std::uint8_t> bytes,
                                    std::int64_t element_count) {
     validate_q4_k_bytes(bytes, element_count);
@@ -357,6 +373,12 @@ void matvec_q4_k_q8(std::span<const std::uint8_t> q4_rows,
     if (q4_rows.size() != checked_size(row_bytes * row_count, "Q4_K matrix bytes")) {
         throw std::runtime_error("Q4_K matvec matrix byte size mismatch");
     }
+#if defined(LCQI_ENABLE_AVX2)
+    if (q4_k_q8_avx2_available()) {
+        matvec_q4_k_q8_avx2_unchecked(q4_rows, row_count, column_count, input, output);
+        return;
+    }
+#endif
     for (std::int64_t row = 0; row < row_count; ++row) {
         output[checked_size(row, "Q4_K row")] =
             dot_q4_k_q8(q4_rows.subspan(checked_size(row * row_bytes, "Q4_K row offset"),
