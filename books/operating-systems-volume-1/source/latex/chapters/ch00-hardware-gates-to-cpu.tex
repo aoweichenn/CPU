@@ -1,0 +1,608 @@
+\section{为什么要单独讲硬件}
+
+操作系统教材常把硬件压缩成几张框图：CPU、内存、总线、磁盘、网卡。这样会让后面的概念失去来源。系统调用为什么必须切栈，缺页为什么可以重试，同步为什么要原子指令，DMA 为什么要屏障，调度为什么关心 cache 和 TLB，这些问题都要回到硬件怎样由电路一步一步组成。
+
+本章只沿 x86-64 主线解释通用计算机。目标不是把芯片设计课完整搬进来，而是把 OS 必须依赖的硬件机制讲到可推理、可画路径、可分析时延、可解释失败。每个硬件模块都按六个问题拆：
+
+\begin{longtable}{p{0.18\linewidth}p{0.74\linewidth}}
+\toprule
+问题 & 需要回答什么 \\
+\midrule
+输入 & 这个模块从哪里拿 bit、地址、控制信号或时钟 \\
+输出 & 它把什么结果交给下一级，结果什么时候有效 \\
+组合路径 & 输出是否只由当前输入决定，最长逻辑路径是什么 \\
+状态 & 它是否保存历史，状态在什么时钟边沿更新 \\
+时延 & 它的关键路径如何限制频率、吞吐或响应延迟 \\
+OS 关系 & 它如何影响异常、特权、调度、内存、I/O 或安全 \\
+\bottomrule
+\end{longtable}
+
+有了这张拆解表，硬件就不再是一堆名词。加法器不是“能加数”的盒子，而是一串产生 sum/carry 的门；寄存器不是变量，而是时钟边沿采样的状态；ALU 不是魔法函数，而是多个组合电路加一个选择器；CPU 不是一个大循环，而是寄存器、组合逻辑、控制信号、时钟和异常入口共同组成的状态机。
+
+\section{晶体管到逻辑门：先得到可靠的 0 和 1}
+
+数字电路的第一层抽象是把连续电压分成两个稳定区域：低电平表示 0，高电平表示 1。晶体管可以看成受输入控制的开关。很多开关组合起来，就能实现逻辑门。真实芯片要考虑噪声容限、功耗、扇出、电容负载和工艺波动；教材模型先抓住一件事：输入稳定后，输出经过传播延迟也会稳定。
+
+\begin{longtable}{p{0.16\linewidth}p{0.30\linewidth}p{0.42\linewidth}}
+\toprule
+门 & 布尔函数 & 为什么重要 \\
+\midrule
+NOT & 输出输入的反值 & 构造反相、使能取反、条件翻转 \\
+NAND & 不是两个输入都为 1 & 功能完备，可构造任意组合逻辑 \\
+NOR & 不是任一输入为 1 & 功能完备，适合某些控制逻辑 \\
+AND & 两个条件都为 1 & 权限位、valid 位、enable 位同时满足 \\
+OR & 至少一个条件为 1 & 多个异常源、多个 pending 位汇总 \\
+XOR & 两个输入不同 & 加法器 sum、奇偶校验、比较辅助 \\
+\bottomrule
+\end{longtable}
+
+“功能完备”的意思是，只用 NAND 或只用 NOR 也能搭出所有布尔函数。例如 NOT 可以用 NAND 的两个输入接同一个信号得到；AND 可以先 NAND 再 NOT；OR 可以用德摩根律得到。芯片设计不会真的每处都只手写 NAND，但理解 NAND/NOR 能说明复杂硬件最终还是由可组合的简单门构成。
+
+\begin{lstlisting}
+not_a = nand(a, a)
+a_and_b = not(nand(a, b))
+a_or_b = nand(not(a), not(b))
+\end{lstlisting}
+
+门有传播延迟。若一个 NAND 延迟记为 \code{t\_nand}，三个门串联的路径至少要等三个门都稳定。组合逻辑的输出不能在输入改变后立即采样，必须给信号传播时间。这个事实会一路推导出时钟周期、关键路径、流水线和 CPU 频率上限。
+
+\section{组合逻辑：没有记忆的计算网络}
+
+组合逻辑只由当前输入决定输出，不保存历史。加法器、比较器、译码器、选择器、优先级编码器都属于组合逻辑。组合逻辑适合表达“现在这些 bit 应该产生什么结果”，但不能表达“上一周期执行到哪里”。
+
+\subsection{译码器和编码器}
+
+译码器把一个二进制编号变成多根 one-hot 信号。例如 3 位输入可以选择 8 个输出中的一个。寄存器文件要根据寄存器编号选择某个寄存器，指令译码器要根据 opcode 选择控制路径，中断控制器要根据 vector 找入口。
+
+\begin{lstlisting}
+decode3(x):
+  out[0] = (x == 0)
+  out[1] = (x == 1)
+  ...
+  out[7] = (x == 7)
+\end{lstlisting}
+
+编码器反过来，把多根输入压成编号。优先级编码器还要规定多个输入同时为 1 时选谁。例如多个中断 pending 时，中断控制器要根据优先级选择一个 vector 投递给 CPU。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+模块 & 输入输出 & OS 相关影子 \\
+\midrule
+寄存器编号译码 & register id 到读写选择线 & syscall ABI 规定参数在哪些寄存器 \\
+opcode 译码 & 指令字节到控制信号 & \code{syscall}、特权指令和非法指令检查 \\
+vector 选择 & pending 中断到 vector & timer、IPI、device IRQ 分发 \\
+页表索引拆分 & 虚拟地址位段到 PML4/PDPT/PD/PT index & page fault handler 能定位 PTE \\
+\bottomrule
+\end{longtable}
+
+\subsection{多路选择器 MUX}
+
+MUX 根据选择信号从多个输入中选一个输出。CPU 里到处都是 MUX：ALU 的第二个操作数来自寄存器还是立即数，写回值来自 ALU 还是 load 数据，下一 RIP 来自顺序地址、分支目标、异常入口还是返回地址。
+
+\begin{lstlisting}
+writeback_value = mux(
+  from_alu: alu_result,
+  from_memory: load_data,
+  from_immediate: sign_extended_imm,
+  from_status: flags_value
+)
+\end{lstlisting}
+
+MUX 的代价是选择路径也有延迟。输入很多时，MUX 会变深或变宽，时序更难。x86-64 的复杂寻址模式、复杂写回来源和丰富控制状态，都会增加前端译码和后端选择网络的复杂度。OS 不直接控制 MUX，但系统调用、异常、返回用户态都依赖“下一 RIP 只能由受控硬件路径选择”。
+
+\section{加法器：从一位到 64 位}
+
+\subsection{半加器和全加器}
+
+一位加法先从真值表开始。两个输入 \code{a/b} 相加，sum 表示本位结果，carry 表示进位。半加器没有低位进位：
+
+\begin{lstlisting}
+sum   = a XOR b
+carry = a AND b
+\end{lstlisting}
+
+全加器增加 \code{carry\_in}：
+
+\begin{lstlisting}
+sum       = a XOR b XOR carry_in
+carry_out = (a AND b) OR (carry_in AND (a XOR b))
+\end{lstlisting}
+
+把 64 个全加器串起来，就是 64 位 ripple-carry adder。第 0 位产生的进位传给第 1 位，第 1 位再传给第 2 位，一直传到第 63 位。
+
+\begin{lstlisting}
+carry[0] = carry_in
+for i in 0..63:
+  sum[i], carry[i + 1] = full_adder(a[i], b[i], carry[i])
+\end{lstlisting}
+
+这个设计直观，但关键路径很长。最高位结果必须等低位进位一路传播。若每一级全加器进位延迟是 \code{t\_fa}，64 位串行进位路径近似是 \code{64 * t\_fa}。频率高的 CPU 不能只靠这种最朴素结构。
+
+\subsection{进位生成、传播和更快加法}
+
+把每一位拆成 generate 和 propagate，可以更清楚地分析进位：
+
+\begin{lstlisting}
+g[i] = a[i] AND b[i]      // this bit generates carry
+p[i] = a[i] XOR b[i]      // this bit propagates carry_in
+carry[i + 1] = g[i] OR (p[i] AND carry[i])
+\end{lstlisting}
+
+若某一位 \code{g[i] = 1}，不管低位进位是什么，本位都会产生进位。若 \code{p[i] = 1}，本位会把低位进位传上去。carry-lookahead、carry-select、prefix adder 等结构的目标，都是减少“进位逐位等”的深度，用更多门面积换更短关键路径。
+
+\begin{longtable}{p{0.22\linewidth}p{0.30\linewidth}p{0.36\linewidth}}
+\toprule
+加法器 & 关键路径特点 & 取舍 \\
+\midrule
+ripple-carry & 进位逐位传播，深度随位宽线性增长 & 面积小，慢 \\
+carry-lookahead & 分组提前计算进位 & 面积更大，速度更快 \\
+prefix adder & 树形合并 generate/propagate & 适合高性能宽位加法，布线复杂 \\
+\bottomrule
+\end{longtable}
+
+OS 为什么要知道这些？不是为了手画加法器版图，而是理解“硬件速度来自结构取舍”。同样的思想会出现在页表遍历、cache 查找、队列调度里：线性等待简单但慢，提前计算和并行结构更快但更复杂。
+
+\subsection{减法、比较和 RFLAGS}
+
+减法可以用补码加法实现：
+
+\begin{lstlisting}
+a - b = a + bitwise_not(b) + 1
+\end{lstlisting}
+
+比较也常复用减法路径。执行 \asmcode{cmp rax, rbx} 时，硬件计算类似 \code{rax - rbx} 的结果，但不写回目的寄存器，只更新标志位。x86-64 常见条件分支会读取这些标志，例如 zero flag、sign flag、carry flag、overflow flag。
+
+\begin{longtable}{p{0.16\linewidth}p{0.34\linewidth}p{0.38\linewidth}}
+\toprule
+标志 & 来源 & 软件影响 \\
+\midrule
+ZF & 结果是否为 0 & \asmcode{je}、循环结束、比较相等 \\
+SF & 结果最高位 & 有符号比较辅助 \\
+CF & 无符号进位或借位 & 无符号比较、宽整数运算 \\
+OF & 有符号溢出 & 有符号比较和溢出检测 \\
+\bottomrule
+\end{longtable}
+
+RFLAGS 是 CPU 架构状态的一部分。中断、异常和系统调用返回时，如果错误恢复了标志位，用户程序的后续条件分支可能走错路径。这样看，RFLAGS 不是“汇编课小细节”，而是上下文保存必须精确处理的硬件状态。
+
+\section{ALU：把多个组合电路收束成执行单元}
+
+ALU 可以看成一组组合电路加一个结果选择器。加法、减法、按位逻辑、移位、比较都并行或分组计算，控制信号选择最终结果和标志位。
+
+\begin{lstlisting}
+alu(a, b, op):
+  add_result = a + b
+  sub_result = a + (~b) + 1
+  and_result = a AND b
+  or_result  = a OR b
+  xor_result = a XOR b
+  shl_result = barrel_shift_left(a, b[0..5])
+
+  result = mux(op,
+    ADD: add_result,
+    SUB: sub_result,
+    AND: and_result,
+    OR:  or_result,
+    XOR: xor_result,
+    SHL: shl_result)
+  flags = compute_flags(result, op)
+\end{lstlisting}
+
+\subsection{移位器和桶形移位}
+
+移位可以一位一位移，也可以用桶形移位器一次完成多位选择。64 位桶形移位器通常按 1、2、4、8、16、32 这些层级组织，每一层根据移位量的一位决定是否移动。它本质上是多层 MUX。
+
+\begin{lstlisting}
+stage0 = mux(shift[0], value << 1, value)
+stage1 = mux(shift[1], stage0 << 2, stage0)
+stage2 = mux(shift[2], stage1 << 4, stage1)
+...
+\end{lstlisting}
+
+这说明高性能硬件经常用“多层选择网络”换速度。代价是面积、功耗和布线。软件里一条 \asmcode{shl rax, cl} 看起来简单，硬件里可能是一组宽 MUX 网络。
+
+\subsection{乘法和除法为什么常有更长延迟}
+
+加法是 ALU 的基础路径。乘法可以理解为部分积生成和求和，除法常需要迭代或复杂预测。高性能 CPU 会给乘法器专门硬件，但乘法延迟通常仍比简单整数加法长；除法更慢。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+操作 & 硬件特点 & 性能含义 \\
+\midrule
+ADD/SUB & 宽加法器，常见热路径 & 延迟低，吞吐高 \\
+SHIFT & 多层选择网络 & 延迟中等，依赖移位器设计 \\
+MUL & 部分积生成和压缩树 & 延迟更长，执行端口更少 \\
+DIV & 迭代或复杂算法 & 延迟长，吞吐低 \\
+\bottomrule
+\end{longtable}
+
+OS 热路径大量使用加减、位运算和比较，而谨慎使用除法。调度器、内存分配器、网络路径常把除法换成移位、乘法近似或预计算，不是写法偏好，而是硬件执行成本不同。
+
+\section{触发器和寄存器：让机器拥有状态}
+
+组合逻辑没有记忆。要让机器知道“当前 RIP 是多少”“当前任务是谁”“上一周期请求是否已经发出”，必须有时序逻辑。D 触发器在时钟边沿采样输入 \code{D}，把它保存为输出 \code{Q}。多个 D 触发器并排就是寄存器。
+
+\begin{lstlisting}
+on rising_clock_edge:
+  if reset:
+    q = 0
+  else if enable:
+    q = d
+\end{lstlisting}
+
+寄存器引入三个重要时序参数：
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+参数 & 含义 & 违反后果 \\
+\midrule
+clock-to-Q & 时钟边沿后输出稳定所需时间 & 后级组合逻辑起点变晚 \\
+setup time & 时钟边沿前输入必须稳定多久 & 采样错误或亚稳态 \\
+hold time & 时钟边沿后输入还要保持多久 & 采样到错误变化 \\
+\bottomrule
+\end{longtable}
+
+时钟周期必须满足：
+
+\[
+T_{clk} \ge T_{clk\_to\_q} + T_{comb\_max} + T_{setup} + T_{skew} + T_{margin}
+\]
+
+这就是“关键路径”概念。若一个阶段中寄存器文件读取、ALU、cache tag 比较、数据选择和写回全塞在一个周期里，\code{T\_comb\_max} 会很长，频率就上不去。流水线的本质，是在长组合路径中间插入寄存器，把一个长周期拆成多个短周期。
+
+\section{寄存器文件：CPU 的小而快状态库}
+
+通用寄存器不是内存数组的简单缩小版。寄存器文件需要同时支持多个读端口和写端口。例如一条整数二操作数指令常读两个源、写一个目的。系统调用 ABI 又规定 \code{rax/rdi/rsi/rdx/r10/r8/r9} 等寄存器承担系统调用号和参数。
+
+\begin{lstlisting}
+read_port0 selects source register A
+read_port1 selects source register B
+write_port selects destination register
+write_enable controls whether result is committed
+\end{lstlisting}
+
+端口越多，寄存器文件越难做快。每个读端口都要能从所有寄存器中选择一个值，每个写端口都要把数据写到指定寄存器。乱序 CPU 还会加入寄存器重命名，把 x86-64 架构寄存器映射到更多物理寄存器，减少假依赖。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+层次 & 作用 & OS 看到什么 \\
+\midrule
+架构寄存器 & ISA 规定的软件可见寄存器 & trap frame、上下文切换、ABI \\
+物理寄存器 & 微架构内部重命名资源 & OS 通常看不到，不逐个保存 \\
+保存区 & 内存中的寄存器快照 & signal frame、switch context、pt\_regs \\
+\bottomrule
+\end{longtable}
+
+上下文切换保存的是架构可见状态，而不是所有物理寄存器。中断入口保存通用寄存器，是为了让被打断代码返回后仍看到相同架构状态。理解这一点，就能区分“CPU 内部有很多临时状态”和“OS 必须保存哪些状态”。
+
+\section{存储阵列：从寄存器到 cache 和 DRAM}
+
+寄存器很快但面积贵，不能拿来做主内存。SRAM 用更多晶体管保存一个 bit，速度快，适合 cache、TLB 和小型片上队列。DRAM 用电容保存 bit，密度高但需要刷新，适合主内存。NAND Flash、NVMe SSD 等则提供持久存储，但访问模型完全不同。
+
+\begin{longtable}{p{0.16\linewidth}p{0.32\linewidth}p{0.40\linewidth}}
+\toprule
+存储 & 硬件特点 & OS 影响 \\
+\midrule
+寄存器 & 最快，数量少，CPU 私有 & 上下文切换必须保存可见部分 \\
+SRAM & 快，面积大，片上使用 & cache、TLB、队列、预测器 \\
+DRAM & 容量大，易失，要刷新 & 物理页、NUMA、page cache、DMA buffer \\
+NAND/SSD & 持久，块擦写，控制器复杂 & 文件系统、flush、FUA、磨损和错误恢复 \\
+\bottomrule
+\end{longtable}
+
+\subsection{cache 作为 SRAM 结构}
+
+cache 通常由 tag、valid、dirty、data 组成。CPU 用地址的一部分选择 set，再比较 tag，命中后读出 cache line。cache line 常见为 64 字节量级。cache 不是逐字节取一个小值，而是以 line 为单位搬运。
+
+\begin{lstlisting}
+cache_lookup(address):
+  offset = address bits selecting byte in line
+  index  = address bits selecting set
+  tag    = remaining high bits
+  for way in set[index]:
+    if way.valid and way.tag == tag:
+      return way.data[offset]
+  miss
+\end{lstlisting}
+
+OS 设计里反复出现 cache line：自旋锁竞争会让同一 line 在 CPU 间迁移，伪共享会让不同变量互相拖慢，每 CPU 数据结构减少共享写，DMA buffer 需要考虑 CPU cache 和设备可见性。cache 是硬件，但它塑造了内核数据结构。
+
+\subsection{TLB 作为翻译缓存}
+
+TLB 缓存虚拟页到物理页和权限。它不是普通 data cache，因为它的内容来自页表遍历，并且带有权限、PCID、global 等语义。x86-64 地址翻译热路径大致是：
+
+\begin{lstlisting}
+virtual address
+  -> canonical check
+  -> TLB lookup by virtual page and PCID
+  -> if miss, page walk from CR3
+  -> PTE permission check
+  -> physical address
+\end{lstlisting}
+
+页表项改了，内存中的 PTE 变了，但 TLB 里的旧翻译不会自动消失。于是 OS 必须执行 invalidate 和 shootdown。硬件为了快复制了状态，OS 就要负责让这些副本在关键时刻一致。
+
+\section{数据通路：把寄存器、ALU、内存接口连起来}
+
+有了寄存器文件、ALU、MUX、内存接口和 RIP，就可以画一个最小数据通路。以 \asmcode{add rax, rbx} 为例：
+
+\begin{lstlisting}
+1. instruction decoder selects rax as dst/src0 and rbx as src1
+2. register file reads rax and rbx
+3. ALU op is set to ADD
+4. ALU computes sum
+5. writeback MUX selects ALU result
+6. register file writes rax on clock edge
+7. next RIP selects sequential address
+\end{lstlisting}
+
+以 \asmcode{mov rax, qword ptr [rbx + 16]} 为例：
+
+\begin{lstlisting}
+1. decoder recognizes load with base rbx and displacement 16
+2. register file reads rbx
+3. address generation unit computes rbx + 16
+4. D-TLB translates virtual address
+5. cache or memory returns 8 bytes
+6. writeback MUX selects load data
+7. register file writes rax
+\end{lstlisting}
+
+这两条指令共享很多硬件：寄存器文件、ALU 或地址生成器、写回 MUX、RIP 更新路径。load 额外使用 TLB、cache、内存顺序和异常路径。OS 后面讲 page fault，就是第 4 步无法完成时，硬件把控制权交给内核。
+
+\section{控制器：谁来产生控制信号}
+
+数据通路回答“数据从哪里流到哪里”，控制器回答“这一拍打开哪些开关”。控制信号包括读哪个寄存器、ALU 做什么、是否访存、是否写回、下一 RIP 选哪路、当前指令是否允许在 Ring 3 执行。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+控制信号 & 控制对象 & 错误后果 \\
+\midrule
+reg\_read\_sel & 寄存器文件读端口 & 读错参数或地址 \\
+alu\_op & ALU 功能选择 & 算错结果或标志位 \\
+mem\_read/write & cache/MMU 访问 & 错读、错写或破坏内存 \\
+writeback\_enable & 寄存器写回 & 状态未更新或误更新 \\
+next\_rip\_select & RIP 来源 MUX & 跳错路径或无法进入异常入口 \\
+privilege\_check & 特权和权限检查 & 用户态执行敏感操作 \\
+\bottomrule
+\end{longtable}
+
+\subsection{硬布线控制和微码}
+
+简单指令集可以用硬布线控制器：opcode 经过译码器直接产生控制信号。x86-64 为了长期兼容和丰富指令，会把复杂指令译成内部微操作，某些复杂或少见路径由微码协助。无论内部实现如何，软件看到的 ISA 契约必须稳定。
+
+\begin{lstlisting}
+x86-64 front-end sketch:
+  fetch instruction bytes
+  find instruction boundaries
+  decode prefixes, opcode, ModR/M, SIB, displacement, immediate
+  produce one or more micro-operations
+  send uops to scheduler and execution units
+\end{lstlisting}
+
+这解释了为什么 x86-64 解码比教学固定长度指令难：一条指令可能 1 字节，也可能十几字节；操作数可能在寄存器、内存、立即数中；寻址模式可能包含 base、index、scale、displacement。OS 不写解码器，但调试、反汇编、异常 RIP、kprobes、ftrace 都依赖“指令边界可确定”。
+
+\section{单周期 CPU：最容易理解，也最浪费}
+
+单周期 CPU 让每条指令在一个长周期内完成所有工作。对 \asmcode{add rax, rbx}，周期要覆盖取指、译码、读寄存器、ALU、写回。对 load，周期还要覆盖地址生成、TLB/cache 访问和写回。为了让最慢指令也能完成，所有指令都被迫使用同样长的周期。
+
+\begin{lstlisting}
+T_single >= fetch + decode + reg_read + alu + tlb + cache + writeback + setup
+\end{lstlisting}
+
+假设粗略延迟如下：
+
+\begin{longtable}{p{0.28\linewidth}p{0.24\linewidth}p{0.36\linewidth}}
+\toprule
+模块 & 示例延迟 & 说明 \\
+\midrule
+取指 I-cache & 1.0 ns & 命中时仍要 tag/data 路径 \\
+译码 & 0.8 ns & x86-64 前端更复杂 \\
+寄存器读 & 0.4 ns & 多端口增加负担 \\
+ALU/地址生成 & 0.5 ns & 加法或地址计算 \\
+D-TLB/cache & 1.2 ns & load/store 热路径 \\
+写回和 setup & 0.3 ns & 写回寄存器前稳定 \\
+\bottomrule
+\end{longtable}
+
+单周期 load 可能需要 4 ns 以上，于是频率上限不到 250 MHz；而简单 add 其实不需要等完整 load 路径。数字只是示意，结论重要：最长路径决定所有指令周期，硬件利用率差。
+
+\section{多周期 CPU：把一条指令拆成状态机}
+
+多周期 CPU 把一条指令拆成多个阶段，每个阶段用较短周期完成一部分工作。不同指令可以走不同数量的状态。例如 ALU 指令不需要 MEM 阶段，store 不需要 WB 阶段。
+
+\begin{lstlisting}
+FETCH:
+  IR = memory[RIP]
+  RIP = RIP + instruction_length
+
+DECODE:
+  decode IR
+  read source registers
+
+EXECUTE:
+  ALU computes result or address
+
+MEMORY:
+  load or store if needed
+
+WRITEBACK:
+  update destination register if needed
+\end{lstlisting}
+
+这里第一次出现“控制器是状态机”的完整形态。控制器保存当前状态，下一状态由当前状态、opcode、异常和 ready 信号决定。内核中的驱动状态机、调度状态机、文件系统恢复状态机，形式上都和这个硬件控制器相似：状态不能跳跃，失败要有收敛路径。
+
+\section{流水线 CPU：用寄存器切开关键路径}
+
+流水线在阶段之间插入流水线寄存器，让 IF、ID、EX、MEM、WB 同时处理不同指令。它提高吞吐，不一定降低单条指令从开始到完成的延迟。
+
+\begin{lstlisting}
+cycle 1: inst1 IF
+cycle 2: inst1 ID   inst2 IF
+cycle 3: inst1 EX   inst2 ID   inst3 IF
+cycle 4: inst1 MEM  inst2 EX   inst3 ID   inst4 IF
+cycle 5: inst1 WB   inst2 MEM  inst3 EX   inst4 ID   inst5 IF
+\end{lstlisting}
+
+流水线周期由最慢阶段决定：
+
+\[
+T_{pipe} \ge \max(T_{IF}, T_{ID}, T_{EX}, T_{MEM}, T_{WB}) + T_{pipe\_reg}
+\]
+
+流水线寄存器也有成本。切得太浅，频率上不去；切得太深，分支错误和异常冲刷成本增加，流水线寄存器本身耗电也增加。现代 x86-64 CPU 的前端、乱序后端、load/store、提交都比五级模型复杂，但关键思想不变：用状态边界把长组合路径拆短。
+
+\subsection{数据 hazard}
+
+相邻指令有依赖时，流水线会遇到数据 hazard：
+
+\begin{lstlisting}
+add rax, rbx
+sub rcx, rax
+\end{lstlisting}
+
+第二条需要第一条的新 \code{rax}。如果等第一条写回再读，流水线要停。硬件可用 forwarding 把执行结果直接送到后续执行单元，减少等待。load-use 更难，因为 load 数据要到 cache 返回后才知道。
+
+\begin{lstlisting}
+if EX/MEM.rd == ID/EX.rs and EX/MEM.writes_register:
+  operand = EX/MEM.forwarded_result
+else if MEM/WB.rd == ID/EX.rs and MEM/WB.writes_register:
+  operand = MEM/WB.forwarded_result
+else:
+  operand = register_file_value
+\end{lstlisting}
+
+\subsection{控制 hazard 和分支预测}
+
+分支决定下一 RIP。如果等分支完全解析再取指，前端会空等。分支预测器猜方向和目标，先把预测路径送进流水线。猜错时，硬件丢弃年轻指令，从正确 RIP 重新取指。
+
+\begin{lstlisting}
+if prediction_wrong:
+  squash younger pipeline entries
+  restore front-end RIP to correct target
+  restart fetch
+\end{lstlisting}
+
+分支预测是性能优化，也带来安全问题。被冲刷的预测路径不会提交架构结果，但可能改变 cache 和预测器状态。OS 的隔离和安全补丁要考虑这种微架构痕迹。
+
+\subsection{结构 hazard}
+
+结构 hazard 是两个阶段争同一个硬件资源。例如取指和数据访问若共用同一个单端口内存，会冲突；多个执行单元不足时，后端会排队。硬件通过分离 I-cache/D-cache、多端口结构、队列和调度器缓解。
+
+这对 OS 性能分析很重要。程序慢不一定是算法指令数多，也可能是前端取指不足、load/store 单元堵塞、执行端口竞争、cache miss 或 TLB miss。perf 看到 IPC 低时，要能把它落到这些硬件资源上。
+
+\section{乱序执行：保持 ISA 顺序，内部尽量并行}
+
+乱序执行把“何时执行”和“何时提交”分开。指令进入 reorder buffer，源操作数准备好就可以发射到执行单元；结果先写到临时位置；最终按程序顺序提交到架构状态。
+
+\begin{lstlisting}
+front-end decodes instructions into uops
+rename maps architectural registers to physical registers
+scheduler wakes uops whose operands are ready
+execution units run ready uops out of order
+ROB commits completed uops in program order
+\end{lstlisting}
+
+这样可以在 cache miss 等慢事件发生时继续执行无关工作。但 OS 依赖的是提交边界：异常必须精确，系统调用必须在受控边界进入，调试单步必须看到可解释 RIP，上下文切换保存的是已经提交或可恢复的架构状态。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+内部结构 & 作用 & OS 依赖的外部契约 \\
+\midrule
+rename table & 消除假依赖，提高并行度 & 架构寄存器语义不变 \\
+scheduler & 选择可执行 uop & 指令结果最终按 ISA 呈现 \\
+ROB & 记录顺序和异常 & precise exception、可重试 fault \\
+store buffer & 缓冲写入 & 需要内存屏障控制可见顺序 \\
+\bottomrule
+\end{longtable}
+
+\section{异常和中断硬件：CPU 怎样受控交还给 OS}
+
+异常和中断不是在 CPU 外面“调用内核函数”。硬件必须在可恢复边界停止当前流，保存返回所需状态，查 IDT，必要时切换到 TSS 指定的内核栈，然后跳到 handler。
+
+\begin{lstlisting}
+event_entry(vector):
+  finish or roll back to precise boundary
+  determine whether privilege changes
+  if Ring 3 -> Ring 0:
+    switch RSP to TSS.RSP0 or IST stack
+  push return RIP, CS, RFLAGS, RSP, SS as required
+  push error code for selected exceptions
+  RIP = IDT[vector].handler
+\end{lstlisting}
+
+这条路径依赖前面所有硬件：RIP 是寄存器，IDT 查找是表项读取和权限检查，TSS 提供栈，RFLAGS 记录状态，流水线和 ROB 提供精确边界。OS 的 trap frame 不是软件随便造的结构，而是硬件入口事实和汇编保存约定合成的证据。
+
+\section{MMU 和页表硬件：地址也要通过电路决策}
+
+虚拟地址不是直接送到 DRAM。x86-64 CPU 要先检查 canonical 形式，再查 TLB，miss 时从 CR3 指向的顶级页表开始 page walk。每级页表项都要检查 present、权限、地址位和页大小等字段。
+
+\begin{lstlisting}
+translate(va, access, cpl):
+  require canonical(va)
+  if TLB has (pcid, virtual_page):
+    check cached permissions
+    return physical_page + offset
+
+  pml4e = read_phys(CR3.base + pml4_index(va) * 8)
+  pdpte = read_phys(pml4e.base + pdpt_index(va) * 8)
+  pde   = read_phys(pdpte.base + pd_index(va) * 8)
+  pte   = read_phys(pde.base + pt_index(va) * 8)
+  check permission bits
+  fill TLB
+  return pte.page + offset
+\end{lstlisting}
+
+page walk 本身也是内存访问，可能命中 cache，也可能很慢。因此 TLB 是性能关键。修改页表后必须失效旧 TLB 项，是因为硬件为了快保存了翻译副本。COW、\code{mprotect}、\code{munmap}、进程退出都要处理这个副本生命周期。
+
+\section{总线和 ready/valid：模块之间怎样说话}
+
+CPU 内部和外部模块不能只靠“函数返回”。硬件常用 ready/valid 协议表达一次传输：发送方在数据有效时拉高 valid，接收方能接受时拉高 ready，二者同时为 1 的周期完成一次握手。
+
+\begin{lstlisting}
+transfer happens when valid && ready
+sender must keep data stable while valid && !ready
+receiver may apply backpressure by lowering ready
+\end{lstlisting}
+
+这个小协议解释了很多 OS 现象。设备队列满时就是硬件或驱动层 backpressure；block layer 要限制 queue depth；网络栈要处理发送队列和接收 ring；io\_uring 要区分 submission queue 和 completion queue。硬件接口天然就是异步状态机，不是同步函数调用。
+
+\section{从硬件模块到 OS 抽象}
+
+把本章的硬件模块映射回 OS，可以看到每个抽象都有电路根。
+
+\begin{longtable}{p{0.24\linewidth}p{0.34\linewidth}p{0.30\linewidth}}
+\toprule
+硬件层 & 直接能力 & OS 抽象或约束 \\
+\midrule
+逻辑门和 MUX & 条件选择、控制信号 & 特权入口只能走受控路径 \\
+加法器和 ALU & 地址计算、比较、标志位 & 指针、页内偏移、RFLAGS、条件分支 \\
+触发器和寄存器 & 保存当前状态 & trap frame、context switch、signal frame \\
+寄存器文件 & 快速操作数和 ABI 位置 & syscall 参数、返回值、调用约定 \\
+cache/TLB SRAM & 缓存数据和地址翻译 & 局部性、TLB shootdown、cache line 竞争 \\
+流水线和 ROB & 高吞吐和精确提交 & precise fault、可重试 page fault \\
+MMU/page walker & 地址翻译和权限检查 & 地址空间、COW、mmap、隔离 \\
+IDT/TSS/APIC & 异常、中断、栈切换 & syscall、timer、IRQ、IPI、调度 \\
+ready/valid/队列 & 异步通信和背压 & DMA ring、completion、等待队列 \\
+\bottomrule
+\end{longtable}
+
+因此，后面讲 OS 时要持续追问：这个抽象最后落在哪个硬件状态上？谁能改它？什么时候采样？旧副本在哪里？失败时哪个入口拿到证据？能回答这些问题，才算把硬件和 OS 真正合起来学。
+
+\section{硬件章节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能从 NAND/NOR 说明为什么逻辑门能组合成任意布尔函数。
+\item 能画出半加器、全加器，并解释 64 位 ripple-carry 的关键路径。
+\item 能说明 carry-lookahead 为什么用更多硬件换更短时延。
+\item 能把 \asmcode{cmp rax, rbx} 解释为减法路径和 RFLAGS 更新。
+\item 能说明寄存器的 setup/hold/clock-to-Q 如何限制时钟周期。
+\item 能把寄存器文件、ALU、MUX、RIP 更新连成一条 \asmcode{add rax, rbx} 数据通路。
+\item 能解释单周期、多周期、流水线 CPU 的时延取舍。
+\item 能说明 forwarding、stall、flush、ROB 和 precise exception 分别解决什么问题。
+\item 能解释 TLB 为什么不是页表本体，以及页表修改后为什么要 invalidate。
+\item 能把 ready/valid、队列和 backpressure 映射到 DMA ring、completion 和等待队列。
+\end{itemize}
+\end{rubricbox}
