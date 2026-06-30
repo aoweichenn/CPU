@@ -259,7 +259,18 @@ std::vector<Q8KBlock> quantize_q8_k_input(std::span<const float> input) {
     const std::int64_t block_count =
         static_cast<std::int64_t>(input.size()) / LCQI_QK_K_BLOCK_VALUES;
     std::vector<Q8KBlock> output(checked_size(block_count, "Q8_K block count"));
+    quantize_q8_k_input_to(input, output);
+    return output;
+}
 
+void quantize_q8_k_input_to(std::span<const float> input,
+                            std::span<Q8KBlock> output) {
+    validate_input_size(input);
+    const std::int64_t block_count =
+        static_cast<std::int64_t>(input.size()) / LCQI_QK_K_BLOCK_VALUES;
+    if (output.size() != checked_size(block_count, "Q8_K block count")) {
+        throw std::runtime_error("Q8_K output block count mismatch");
+    }
     for (std::int64_t block_index = 0; block_index < block_count; ++block_index) {
         Q8KBlock& block = output[checked_size(block_index, "Q8_K block index")];
         const float* values =
@@ -297,8 +308,6 @@ std::vector<Q8KBlock> quantize_q8_k_input(std::span<const float> input) {
         }
         block.d = 1.0F / inverse_scale;
     }
-
-    return output;
 }
 
 float dot_q4_k_f32(std::span<const std::uint8_t> q4_blocks,

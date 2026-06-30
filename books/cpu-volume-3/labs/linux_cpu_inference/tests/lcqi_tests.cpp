@@ -112,6 +112,14 @@ constexpr std::int32_t LCQI_LLAMA_TEST_LAYER_COUNT = 1;
 constexpr std::int32_t LCQI_LLAMA_TEST_EXPECTED_TOKEN = 2;
 constexpr float LCQI_LLAMA_TEST_SMALL_ATTENTION_VALUE = 0.1F;
 constexpr float LCQI_LLAMA_TEST_SMALL_OUTPUT_SCALE = 0.1F;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_HIDDEN = 256;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_HEADS = 1;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_KV_HEADS = 1;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_HEAD_DIM = 256;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_INTERMEDIATE = 256;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_VOCAB = 2;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_CONTEXT = 4;
+constexpr std::int32_t LCQI_LLAMA_Q4_TEST_LAYER_COUNT = 1;
 
 struct KernelShapeCase {
     std::int32_t input_size = 0;
@@ -638,6 +646,19 @@ void add_gguf_f32_tensor(std::vector<GgufTensorFixture>& tensors,
     });
 }
 
+void add_gguf_q4_k_tensor(std::vector<GgufTensorFixture>& tensors,
+                          std::string name,
+                          std::vector<std::int64_t> shape,
+                          const std::vector<std::uint8_t>& bytes) {
+    tensors.push_back(GgufTensorFixture{
+        std::move(name),
+        std::move(shape),
+        lcqi::GgmlType::q4_k,
+        bytes,
+        0,
+    });
+}
+
 void write_tiny_llama_gguf_fixture(const std::filesystem::path& path) {
     std::vector<std::uint8_t> metadata;
     append_gguf_uint32_metadata(metadata, "general.alignment", LCQI_GGUF_TEST_ALIGNMENT);
@@ -722,6 +743,81 @@ void write_tiny_llama_gguf_fixture(const std::filesystem::path& path) {
                         "blk.0.ffn_down.weight",
                         {LCQI_LLAMA_TEST_INTERMEDIATE, LCQI_LLAMA_TEST_HIDDEN},
                         intermediate_to_hidden);
+    write_gguf_fixture(path, tensors, metadata);
+}
+
+void write_tiny_llama_q4_direct_gguf_fixture(const std::filesystem::path& path) {
+    std::vector<std::uint8_t> metadata;
+    append_gguf_uint32_metadata(metadata, "general.alignment", LCQI_GGUF_TEST_ALIGNMENT);
+    append_gguf_string_metadata(metadata, "general.architecture", "llama");
+    append_gguf_string_metadata(metadata, "general.name", "lcqi q4 direct tiny llama");
+    append_gguf_uint32_metadata(metadata, "llama.embedding_length", LCQI_LLAMA_Q4_TEST_HIDDEN);
+    append_gguf_uint32_metadata(metadata, "llama.block_count", LCQI_LLAMA_Q4_TEST_LAYER_COUNT);
+    append_gguf_uint32_metadata(metadata, "llama.feed_forward_length", LCQI_LLAMA_Q4_TEST_INTERMEDIATE);
+    append_gguf_uint32_metadata(metadata, "llama.attention.head_count", LCQI_LLAMA_Q4_TEST_HEADS);
+    append_gguf_uint32_metadata(metadata, "llama.attention.head_count_kv", LCQI_LLAMA_Q4_TEST_KV_HEADS);
+    append_gguf_uint32_metadata(metadata, "llama.rope.dimension_count", LCQI_LLAMA_Q4_TEST_HEAD_DIM);
+    append_gguf_float32_metadata(metadata, "llama.rope.freq_base", 10000.0F);
+    append_gguf_uint32_metadata(metadata, "llama.context_length", LCQI_LLAMA_Q4_TEST_CONTEXT);
+    append_gguf_uint32_metadata(metadata, "llama.vocab_size", LCQI_LLAMA_Q4_TEST_VOCAB);
+    append_gguf_float32_metadata(metadata, "llama.attention.layer_norm_rms_epsilon", 1.0e-5F);
+    append_gguf_uint32_metadata(metadata, "tokenizer.ggml.eos_token_id", 1);
+
+    std::vector<GgufTensorFixture> tensors;
+    std::vector<float> embedding(
+        static_cast<std::size_t>(LCQI_LLAMA_Q4_TEST_HIDDEN * LCQI_LLAMA_Q4_TEST_VOCAB),
+        0.0F);
+    embedding[0] = 1.0F;
+    embedding[static_cast<std::size_t>(LCQI_LLAMA_Q4_TEST_HIDDEN)] = 0.5F;
+    add_gguf_f32_tensor(tensors,
+                        "token_embd.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_VOCAB},
+                        embedding);
+    add_gguf_f32_tensor(tensors,
+                        "output_norm.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN},
+                        std::vector<float>(LCQI_LLAMA_Q4_TEST_HIDDEN, 1.0F));
+    add_gguf_f32_tensor(tensors,
+                        "blk.0.attn_norm.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN},
+                        std::vector<float>(LCQI_LLAMA_Q4_TEST_HIDDEN, 1.0F));
+    add_gguf_f32_tensor(tensors,
+                        "blk.0.ffn_norm.weight",
+                        {LCQI_LLAMA_Q4_TEST_HIDDEN},
+                        std::vector<float>(LCQI_LLAMA_Q4_TEST_HIDDEN, 1.0F));
+
+    const std::vector<std::uint8_t> zero_q4_matrix(
+        static_cast<std::size_t>(LCQI_LLAMA_Q4_TEST_HIDDEN) *
+            static_cast<std::size_t>(lcqi::LCQI_Q4_K_BLOCK_BYTES),
+        0);
+    add_gguf_q4_k_tensor(tensors,
+                         "blk.0.attn_q.weight",
+                         {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HIDDEN},
+                         zero_q4_matrix);
+    add_gguf_q4_k_tensor(tensors,
+                         "blk.0.attn_k.weight",
+                         {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HEAD_DIM},
+                         zero_q4_matrix);
+    add_gguf_q4_k_tensor(tensors,
+                         "blk.0.attn_v.weight",
+                         {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HEAD_DIM},
+                         zero_q4_matrix);
+    add_gguf_q4_k_tensor(tensors,
+                         "blk.0.attn_output.weight",
+                         {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_HIDDEN},
+                         zero_q4_matrix);
+    add_gguf_q4_k_tensor(tensors,
+                         "blk.0.ffn_gate.weight",
+                         {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_INTERMEDIATE},
+                         zero_q4_matrix);
+    add_gguf_q4_k_tensor(tensors,
+                         "blk.0.ffn_up.weight",
+                         {LCQI_LLAMA_Q4_TEST_HIDDEN, LCQI_LLAMA_Q4_TEST_INTERMEDIATE},
+                         zero_q4_matrix);
+    add_gguf_q4_k_tensor(tensors,
+                         "blk.0.ffn_down.weight",
+                         {LCQI_LLAMA_Q4_TEST_INTERMEDIATE, LCQI_LLAMA_Q4_TEST_HIDDEN},
+                         zero_q4_matrix);
     write_gguf_fixture(path, tensors, metadata);
 }
 
@@ -1093,6 +1189,41 @@ void test_llama_gguf_loader_and_generation() {
     require(loaded.report.tensors_loaded == 11, "LLaMA GGUF tensor load count mismatch");
     require(loaded.report.f32_weight_bytes == loaded.report.quantized_weight_bytes,
             "LLaMA GGUF F32 fixture byte accounting mismatch");
+    require(loaded.report.q4_k_direct_tensors == 0,
+            "LLaMA GGUF F32 fixture should not use direct Q4_K tensors");
+    require(result.hotspots.f32_fallback_calls == 7,
+            "LLaMA GGUF F32 fixture linear fallback call count mismatch");
+    require(result.hotspots.q4_k_direct_calls == 0,
+            "LLaMA GGUF F32 fixture should not call Q4_K direct matvec");
+}
+
+void test_llama_gguf_q4_direct_generation() {
+    const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_q4_direct.gguf");
+    write_tiny_llama_q4_direct_gguf_fixture(path);
+
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{0};
+    const lcqi::LlamaGgufGenerationResult result =
+        lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+    std::filesystem::remove(path);
+
+    require(loaded.model.decoder.config.hidden_size == LCQI_LLAMA_Q4_TEST_HIDDEN,
+            "LLaMA Q4_K fixture hidden size mismatch");
+    require(loaded.report.tensors_loaded == 11, "LLaMA Q4_K fixture tensor load count mismatch");
+    require(loaded.report.q4_k_direct_tensors == 7,
+            "LLaMA Q4_K fixture direct tensor count mismatch");
+    require(loaded.report.f32_fallback_tensors == 4,
+            "LLaMA Q4_K fixture fallback tensor count mismatch");
+    require(loaded.report.direct_quantized_weight_bytes >
+                loaded.report.fallback_dequantized_weight_bytes,
+            "LLaMA Q4_K fixture should keep direct quantized matrix bytes");
+    require(result.hotspots.q4_k_direct_calls == 7,
+            "LLaMA Q4_K fixture direct matvec call count mismatch");
+    require(result.hotspots.f32_fallback_calls == 0,
+            "LLaMA Q4_K fixture should not call fallback linear matvec");
+    require(result.generated_ids == std::vector<std::int32_t>({0, 0}),
+            "LLaMA Q4_K fixture generated ids mismatch");
 }
 
 void test_gpt2_tiny_forward_and_generation() {
@@ -1569,6 +1700,7 @@ int main() {
         test_q4_k_dequant_and_dot_paths();
         test_ggml_mixed_dequantizers();
         test_llama_gguf_loader_and_generation();
+        test_llama_gguf_q4_direct_generation();
         test_gpt2_tiny_forward_and_generation();
         test_gpt2_byte_bpe_tokenizer();
         test_gpt2_loads_hf_style_tiny_checkpoint();

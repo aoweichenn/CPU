@@ -229,18 +229,24 @@ books/cpu-volume-3/results/lcqi-smollm2-gguf-reference-decode-caw.txt
 关键行是：
 
 ```text
-weight_execution f32_dequantized_reference
+weight_execution gguf_mixed_q4_k_direct
 generated_text ... <|im_start|>assistant
 Hello!
 benchmark_prompt_tokens 31
 benchmark_generated_tokens 2
-benchmark_decode_tokens_per_second 22.1886
+benchmark_decode_tokens_per_second 60.827
 benchmark_quantized_weight_bytes 103668480
-benchmark_f32_weight_bytes 538060032
-benchmark_tensors_loaded 272
+benchmark_f32_weight_bytes 481436928
+benchmark_direct_quantized_weight_bytes 7962624
+benchmark_fallback_dequantized_weight_bytes 481436928
+benchmark_q4_k_direct_tensors 16
+benchmark_f32_fallback_tensors 256
+benchmark_hotspot_w_down_ms 67.5007
+benchmark_hotspot_q4_k_direct_calls 512
+benchmark_hotspot_f32_fallback_calls 6208
 ```
 
-这条路径证明 LCQI 自研代码已经能读取同一个 SmolLM2 GGUF、解析 tokenizer arrays、解码混合量化权重并端到端生成文本。它仍然不是生产级高性能引擎：当前把 103.7 MB 量化权重解成约 538 MB f32 权重，再用通用 f32 matvec 执行；与 llama.cpp 的差距主要来自低比特权重直算、packed kernel、线程调度、prefetch、KV cache 和整图执行。
+这条路径证明 LCQI 自研代码已经能读取同一个 SmolLM2 GGUF、解析 tokenizer arrays、处理混合量化权重并端到端生成文本。它现在不再只是“加载时全部解成 f32”的 reference path：shape 兼容的 `Q4_K` linear tensor 会保留 GGUF block bytes，并在真实 decoder 里通过 `matvec_q4_k_q8` 直接执行；不兼容的 `Q4_K`、`Q6_K`、`Q5_0`、`Q8_0` 和 `F32` tensor 仍然 materialize 成 f32 fallback。它仍然不是生产级高性能引擎：当前只有约 `7.68%` 的加载权重字节进入 direct Q4_K 路径，prefill 仍逐 token 执行；与 llama.cpp 的差距主要来自更完整的低比特权重覆盖、prompt batching、packed kernel、线程调度、prefetch、KV cache 和整图执行。
 
 LCQI 与 llama.cpp 同输入对比：
 
@@ -255,7 +261,7 @@ python3 books/cpu-volume-3/tools/run_smollm2_same_input_compare.py \
 这个脚本会构建固定 commit 的 llama.cpp，运行 `llama-tokenize`、`llama-simple` 和 `llama-bench`，并确认 LCQI 和 llama.cpp 看到的 prompt token ids 完全一致。caw 上的同输入报告保存在：
 
 ```text
-books/cpu-volume-3/reports/lcqi-smollm2-same-input-compare-caw.txt
+books/cpu-volume-3/reports/lcqi-smollm2-q4-direct-compare-caw.txt
 ```
 
-关键结论：同一个模型、同一个展开 chat prompt、同样 31 个 token id、同样 `max-new=2` 下，LCQI prefill 中位数 `1278.47 ms`，llama.cpp `22.92 ms`，LCQI 慢 `55.78x`；LCQI decode step 中位数 `44.64 ms`，llama.cpp `2.84 ms`，LCQI 慢 `15.72x`。所以差距不是 prompt mismatch，而是 LCQI 仍处在 `f32_dequantized_reference`、逐 token prefill、通用 f32 matvec 阶段；llama.cpp 已经走量化 block、prompt batching、ggml graph 调度、紧凑 KV cache 和成熟 CPU kernel。
+关键结论：同一个模型、同一个展开 chat prompt、同样 31 个 token id、同样 `max-new=2` 下，当前 LCQI prefill 中位数 `396.93 ms`，llama.cpp `24.45 ms`，LCQI 慢 `16.23x`；LCQI decode step 中位数 `16.44 ms`，llama.cpp `3.13 ms`，LCQI 慢 `5.25x`。同一二进制里关闭 `LCQI_LLAMA_Q4_DIRECT=0` 后，LCQI prefill 为 `423.56 ms`，decode step 为 `17.21 ms`，`w_down` 热点为 `98.10 ms`；打开 Q4_K direct 后分别为 `396.93 ms`、`16.44 ms`、`67.50 ms`。所以这轮优化的保守 A/B 证据是：prefill `1.067x`、decode step `1.047x`、`w_down` `1.453x`，并减少 `56,623,104` 字节 f32 materialized 权重。剩余差距不是 prompt mismatch，而是 LCQI 仍有大量 f32 fallback、逐 token prefill、缺少 ggml graph 调度和成熟 CPU kernel。

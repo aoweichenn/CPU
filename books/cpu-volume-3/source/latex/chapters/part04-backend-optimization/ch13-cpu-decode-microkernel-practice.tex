@@ -620,7 +620,30 @@ llama_bench_same_token_count_prefill_tps=1463.87
 llama_bench_same_token_count_decode_tps=508.91
 \end{lstlisting}
 
-这次同输入数据把差距拆清楚了。第一，prefill 慢约 \code{55.78x}，主要因为 LCQI 在 \code{llama\_gguf\_generate\_greedy} 中把 31 个 prompt token 逐个当 decode step 跑，没有像 llama.cpp 那样把 prompt 批量送进 graph/backend。第二，decode step 慢约 \code{15.72x}，主要因为 LCQI 的 GGUF 路径仍是 \code{f32\_dequantized\_reference}：加载时把 103.7 MB 量化权重解成约 538 MB f32 权重，decoder block 里的 Q/K/V、attention output、SwiGLU gate/up/down 和 tied lm head 仍走通用 f32 matvec。第三，llama.cpp 保留 GGUF 量化 block 热路径，使用 ggml graph 调度、成熟 CPU kernel、线程协调、prompt batching 和更紧凑的 KV cache。差距不是输入不一致，也不是“少一个 AVX2 指令”，而是权重表示、prompt 批处理、矩阵内核、线程调度、KV 表示和整图执行方式都还没有进入成熟引擎状态。
+这次同输入数据把上一轮差距拆清楚了。第一，prefill 慢约 \code{55.78x}，主要因为 LCQI 在 \code{llama\_gguf\_generate\_greedy} 中把 31 个 prompt token 逐个当 decode step 跑，没有像 llama.cpp 那样把 prompt 批量送进 graph/backend。第二，decode step 慢约 \code{15.72x}，主要因为当时 LCQI 的 GGUF 路径仍是 \code{f32\_dequantized\_reference}：加载时把 103.7 MB 量化权重解成约 538 MB f32 权重，decoder block 里的 Q/K/V、attention output、SwiGLU gate/up/down 和 tied lm head 仍走通用 f32 matvec。第三，llama.cpp 保留 GGUF 量化 block 热路径，使用 ggml graph 调度、成熟 CPU kernel、线程协调、prompt batching 和更紧凑的 KV cache。差距不是输入不一致，也不是“少一个 AVX2 指令”，而是权重表示、prompt 批处理、矩阵内核、线程调度、KV 表示和整图执行方式都还没有进入成熟引擎状态。
+
+下一步不能只停在 \code{lcqi\_gguf\_q4\_bench} 这种单算子 benchmark。因此 LCQI 把 shape 兼容的 \code{Q4\_K} linear tensor 接入了真实 \code{llama\_gguf.cpp} decoder：loader 不再把这部分权重展开成 f32，而是保存 GGUF 原始 block bytes；前向时把对应输入量化成 \code{Q8\_K} scratch，再调用 \code{matvec\_q4\_k\_q8}。不兼容的 \code{Q4\_K}、\code{Q6\_K}、\code{Q5\_0}、\code{Q8\_0} 和 \code{F32} tensor 继续走 f32 fallback。caw 上新的同输入 A/B artifact 写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-q4-direct-compare-caw.txt}，分析摘要写入 \filepath{books/cpu-volume-3/reports/lcqi-smollm2-q4-direct-analysis.md}。
+
+\begin{lstlisting}[numbers=none,caption={Q4\_K direct 接入真实 decoder 后的 caw A/B 证据}]
+same_input_prompt_token_ids_match=true
+lcqi_q4_direct_off_prefill_ms_median=423.556
+lcqi_q4_direct_on_prefill_ms_median=396.926
+lcqi_q4_direct_off_decode_step_ms_median=17.2102
+lcqi_q4_direct_on_decode_step_ms_median=16.4401
+lcqi_q4_direct_off_w_down_ms_median=98.1026
+lcqi_q4_direct_on_w_down_ms_median=67.5007
+lcqi_q4_direct_prefill_speedup_off_over_on=1.067091
+lcqi_q4_direct_decode_step_speedup_off_over_on=1.046843
+lcqi_q4_direct_w_down_speedup_off_over_on=1.453357
+lcqi_q4_direct_f32_weight_bytes_saved=56623104
+lcqi_direct_quantized_weight_byte_share=0.076809
+benchmark_hotspot_q4_k_direct_calls_median=512
+benchmark_hotspot_f32_fallback_calls_median=6208
+current_prefill_ms_ratio_lcqi_over_llama_simple=16.234192
+current_decode_step_ms_ratio_lcqi_over_llama_simple=5.252428
+\end{lstlisting}
+
+这组数要保守读。和上一轮报告相比，当前 LCQI prefill 中位数从 \code{1278.47 ms} 到 \code{396.93 ms}，decode step 从 \code{44.64 ms} 到 \code{16.44 ms}；但严格归因到本次 \code{Q4\_K} direct 的同二进制 A/B，保守提升是 prefill \code{1.067x}、decode step \code{1.047x}、\code{w\_down} 热点 \code{1.453x}。原因也在报告里：这次只有 \code{7.68\%} 的加载权重字节进入 direct \code{Q4\_K} 路径，实际 direct call 是 \code{512} 次，而 f32 fallback call 仍有 \code{6208} 次。最大剩余热点仍是 f32 fallback 的 \code{w\_gate}、\code{w\_up}、attention projection 和 tied embedding \code{lm\_head}。所以这轮优化的意义不是“已经追平 llama.cpp”，而是第一次把量化 block matvec 从孤立 benchmark 接进真实 decoder，并用 caw A/B 证明它确实减少了 \code{w\_down} 和 materialized f32 权重。下一阶段如果要继续缩小 \code{16.23x}/\code{5.25x} 的差距，应优先扩大 GGUF 量化 tensor 覆盖，或做 batched prefill；继续只磨单个 \code{Q4\_K} 子块 SIMD，收益会被 fallback 路径稀释。
 
 \subsection{微内核进入默认路径的验收}
 

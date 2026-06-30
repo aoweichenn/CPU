@@ -58,8 +58,12 @@ The important split is prefill versus decode. Decode is already much closer than
 
 ## Next Optimization Priority
 
-1. Integrate quantized GGUF block matvec into the full decoder path instead of only the isolated `lcqi_gguf_q4_bench` microbenchmark.
+This report is the pre-Q4-direct baseline. The next step was implemented in `books/cpu-volume-3/reports/lcqi-smollm2-q4-direct-compare-caw.txt`: shape-compatible `Q4_K` matrices now enter the real decoder instead of only the isolated `lcqi_gguf_q4_bench` microbenchmark.
+
+Updated priority after that integration:
+
+1. Expand real-decoder quantized coverage beyond the shape-compatible `Q4_K` subset, especially the formats and shapes used by `w_gate` and `w_up`.
 2. Add batched prompt prefill for the same decoder block so 31 prompt tokens do not execute as 31 independent decode steps.
-3. Add a row-parallel or tile-parallel execution policy for the LLaMA linear projections, separate from the GPT-2-only parallel path.
+3. Add a row-parallel or tile-parallel execution policy for the LLaMA fallback f32 projections, separate from the GPT-2-only parallel path.
 4. Store KV cache in f16 or quantized-compatible compact form and remove per-step attention temporary allocation.
-5. Add a benchmark mode that reports per-layer projection timing for SmolLM2, so the next optimization is chosen from measured hotspots rather than broad engine-level ratios.
+5. Keep the per-op hotspot report in every SmolLM2 comparison so the next optimization is chosen from measured hotspots rather than broad engine-level ratios.

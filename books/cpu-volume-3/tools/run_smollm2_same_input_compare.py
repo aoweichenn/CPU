@@ -24,6 +24,34 @@ LCQI_TARGET = "lcqi_llama_gguf"
 LLAMA_SIMPLE_TARGET = "llama-simple"
 LLAMA_BENCH_TARGET = "llama-bench"
 LLAMA_TOKENIZE_TARGET = "llama-tokenize"
+LCQI_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT"
+LCQI_Q4_DIRECT_OFF = "0"
+LCQI_SUMMARY_KEYS = [
+    "benchmark_load_ms",
+    "benchmark_prefill_ms",
+    "derived_prefill_ms_per_prompt_token",
+    "derived_prefill_prompt_tokens_per_second",
+    "benchmark_decode_ms",
+    "derived_decode_ms_per_step",
+    "benchmark_decode_tokens_per_second",
+    "derived_f32_weight_inflation_ratio",
+    "derived_direct_quantized_weight_byte_share",
+    "benchmark_hotspot_rms_norm_ms",
+    "benchmark_hotspot_attention_ms",
+    "benchmark_hotspot_rope_ms",
+    "benchmark_hotspot_wq_ms",
+    "benchmark_hotspot_wk_ms",
+    "benchmark_hotspot_wv_ms",
+    "benchmark_hotspot_wo_ms",
+    "benchmark_hotspot_w_gate_ms",
+    "benchmark_hotspot_w_up_ms",
+    "benchmark_hotspot_w_down_ms",
+    "benchmark_hotspot_lm_head_ms",
+    "benchmark_hotspot_q4_k_direct_ms",
+    "benchmark_hotspot_f32_fallback_ms",
+    "benchmark_hotspot_q4_k_direct_calls",
+    "benchmark_hotspot_f32_fallback_calls",
+]
 
 
 @dataclass(frozen=True)
@@ -165,7 +193,26 @@ def parse_lcqi_metrics(stdout: str) -> dict[str, str]:
             "benchmark_kv_cache_bytes",
             "benchmark_quantized_weight_bytes",
             "benchmark_f32_weight_bytes",
+            "benchmark_direct_quantized_weight_bytes",
+            "benchmark_fallback_dequantized_weight_bytes",
             "benchmark_tensors_loaded",
+            "benchmark_q4_k_direct_tensors",
+            "benchmark_f32_fallback_tensors",
+            "benchmark_hotspot_rms_norm_ms",
+            "benchmark_hotspot_attention_ms",
+            "benchmark_hotspot_rope_ms",
+            "benchmark_hotspot_wq_ms",
+            "benchmark_hotspot_wk_ms",
+            "benchmark_hotspot_wv_ms",
+            "benchmark_hotspot_wo_ms",
+            "benchmark_hotspot_w_gate_ms",
+            "benchmark_hotspot_w_up_ms",
+            "benchmark_hotspot_w_down_ms",
+            "benchmark_hotspot_lm_head_ms",
+            "benchmark_hotspot_q4_k_direct_ms",
+            "benchmark_hotspot_f32_fallback_ms",
+            "benchmark_hotspot_q4_k_direct_calls",
+            "benchmark_hotspot_f32_fallback_calls",
         }:
             metrics[key] = value.strip()
         elif key == "prompt_ids":
@@ -190,6 +237,7 @@ def add_lcqi_derived_metrics(metrics: dict[str, str]) -> None:
     decode_steps = metric_as_float(metrics, "benchmark_decode_steps")
     quantized_bytes = metric_as_float(metrics, "benchmark_quantized_weight_bytes")
     f32_bytes = metric_as_float(metrics, "benchmark_f32_weight_bytes")
+    direct_bytes = metric_as_float(metrics, "benchmark_direct_quantized_weight_bytes")
     if prefill_ms is not None and prefill_ms > 0.0 and prompt_tokens is not None:
         metrics["derived_prefill_prompt_tokens_per_second"] = (
             f"{prompt_tokens * 1000.0 / prefill_ms:.6f}"
@@ -202,6 +250,10 @@ def add_lcqi_derived_metrics(metrics: dict[str, str]) -> None:
         metrics["derived_decode_ms_per_step"] = f"{decode_ms / max(decode_steps, 1.0):.6f}"
     if quantized_bytes is not None and quantized_bytes > 0.0 and f32_bytes is not None:
         metrics["derived_f32_weight_inflation_ratio"] = f"{f32_bytes / quantized_bytes:.6f}"
+    if quantized_bytes is not None and quantized_bytes > 0.0 and direct_bytes is not None:
+        metrics["derived_direct_quantized_weight_byte_share"] = (
+            f"{direct_bytes / quantized_bytes:.6f}"
+        )
 
 
 def parse_llama_simple_metrics(stderr: str, stdout: str, full_prompt: str) -> dict[str, str]:
@@ -422,6 +474,8 @@ def run_lcqi_round(
     max_new_tokens: int,
     round_index: int,
     timeout_seconds: int,
+    name_prefix: str = "lcqi_round",
+    env: dict[str, str] | None = None,
 ) -> CommandResult:
     command = [
         str(binary),
@@ -434,9 +488,10 @@ def run_lcqi_round(
         "--decode-text",
     ]
     result = run_command(
-        f"lcqi_round_{round_index}",
+        f"{name_prefix}_{round_index}",
         command,
         timeout_seconds=timeout_seconds,
+        env=env,
     )
     return CommandResult(
         result.name,
@@ -592,6 +647,7 @@ def write_report(
     full_prompt: str,
     max_new_tokens: int,
     lcqi_runs: list[CommandResult],
+    lcqi_q4_direct_off_runs: list[CommandResult],
     llama_tokenize: CommandResult,
     llama_simple_runs: list[CommandResult],
     llama_bench: CommandResult,
@@ -634,19 +690,18 @@ def write_report(
         "",
     ]
 
+    if lcqi_q4_direct_off_runs:
+        lines.extend(format_summary(
+            "lcqi_q4_direct_off_same_input",
+            lcqi_q4_direct_off_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
+
     lines.extend(format_summary(
         "lcqi_same_input",
         lcqi_runs,
-        [
-            "benchmark_load_ms",
-            "benchmark_prefill_ms",
-            "derived_prefill_ms_per_prompt_token",
-            "derived_prefill_prompt_tokens_per_second",
-            "benchmark_decode_ms",
-            "derived_decode_ms_per_step",
-            "benchmark_decode_tokens_per_second",
-            "derived_f32_weight_inflation_ratio",
-        ],
+        LCQI_SUMMARY_KEYS,
     ))
     lines.append("")
     lines.extend(format_summary(
@@ -665,9 +720,16 @@ def write_report(
     ))
     lines.append("")
 
-    add_ratio_summary(lines, lcqi_runs, llama_tokenize, llama_simple_runs, llama_bench)
+    add_ratio_summary(
+        lines,
+        lcqi_runs,
+        llama_tokenize,
+        llama_simple_runs,
+        llama_bench,
+        lcqi_q4_direct_off_runs,
+    )
 
-    for run in lcqi_runs + [llama_tokenize] + llama_simple_runs + [llama_bench]:
+    for run in lcqi_q4_direct_off_runs + lcqi_runs + [llama_tokenize] + llama_simple_runs + [llama_bench]:
         lines.extend(
             [
                 "",
@@ -698,6 +760,7 @@ def add_ratio_summary(
     llama_tokenize: CommandResult,
     llama_simple_runs: list[CommandResult],
     llama_bench: CommandResult,
+    lcqi_q4_direct_off_runs: list[CommandResult],
 ) -> None:
     lcqi_prompt_tokens = median_metric(lcqi_runs, "benchmark_prompt_tokens")
     lcqi_prompt_ids = lcqi_runs[0].metrics.get("prompt_ids") if lcqi_runs else None
@@ -709,6 +772,7 @@ def add_ratio_summary(
     lcqi_decode_step = median_metric(lcqi_runs, "derived_decode_ms_per_step")
     llama_eval_step = median_metric(llama_simple_runs, "llama_eval_ms_per_run")
     lcqi_weight_ratio = median_metric(lcqi_runs, "derived_f32_weight_inflation_ratio")
+    lcqi_direct_share = median_metric(lcqi_runs, "derived_direct_quantized_weight_byte_share")
     bench_pp_tps = metric_as_float(llama_bench.metrics, "llama_bench_prefill_tokens_per_second")
     bench_tg_tps = metric_as_float(llama_bench.metrics, "llama_bench_decode_tokens_per_second")
 
@@ -729,16 +793,46 @@ def add_ratio_summary(
         lines.append(f"decode_step_ms_ratio_lcqi_over_llama_simple={lcqi_decode_step / llama_eval_step:.6f}")
     if lcqi_weight_ratio is not None:
         lines.append(f"lcqi_f32_dequantized_weight_inflation_ratio={lcqi_weight_ratio:.6f}")
+    if lcqi_direct_share is not None:
+        lines.append(f"lcqi_direct_quantized_weight_byte_share={lcqi_direct_share:.6f}")
+    add_lcqi_ab_ratios(lines, lcqi_q4_direct_off_runs, lcqi_runs)
     if bench_pp_tps is not None:
         lines.append(f"llama_bench_same_token_count_prefill_tps={bench_pp_tps:.6f}")
     if bench_tg_tps is not None:
         lines.append(f"llama_bench_same_token_count_decode_tps={bench_tg_tps:.6f}")
     lines.append(
-        "root_cause=LCQI currently dequantizes GGUF weights into f32 and runs a "
-        "reference decoder one token at a time; llama.cpp keeps quantized block "
-        "weights in the execution path, batches prompt evaluation, uses ggml graph "
-        "scheduling and tuned CPU kernels, and stores KV cache more compactly."
+        "root_cause=LCQI now keeps the shape-compatible Q4_K matrices in a direct "
+        "quantized matvec path, but most SmolLM2 matrices still fall back to "
+        "dequantized f32 and prefill still runs one token at a time. llama.cpp "
+        "keeps more quantized block weights in the execution path, batches prompt "
+        "evaluation, uses ggml graph scheduling and tuned CPU kernels, and stores "
+        "KV cache more compactly."
     )
+
+
+def add_lcqi_ab_ratios(
+    lines: list[str],
+    lcqi_q4_direct_off_runs: list[CommandResult],
+    lcqi_runs: list[CommandResult],
+) -> None:
+    if not lcqi_q4_direct_off_runs:
+        return
+    off_prefill = median_metric(lcqi_q4_direct_off_runs, "benchmark_prefill_ms")
+    on_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    off_decode = median_metric(lcqi_q4_direct_off_runs, "derived_decode_ms_per_step")
+    on_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    off_down = median_metric(lcqi_q4_direct_off_runs, "benchmark_hotspot_w_down_ms")
+    on_down = median_metric(lcqi_runs, "benchmark_hotspot_w_down_ms")
+    off_f32_bytes = median_metric(lcqi_q4_direct_off_runs, "benchmark_f32_weight_bytes")
+    on_f32_bytes = median_metric(lcqi_runs, "benchmark_f32_weight_bytes")
+    if off_prefill is not None and on_prefill is not None and on_prefill > 0.0:
+        lines.append(f"lcqi_q4_direct_prefill_speedup_off_over_on={off_prefill / on_prefill:.6f}")
+    if off_decode is not None and on_decode is not None and on_decode > 0.0:
+        lines.append(f"lcqi_q4_direct_decode_step_speedup_off_over_on={off_decode / on_decode:.6f}")
+    if off_down is not None and on_down is not None and on_down > 0.0:
+        lines.append(f"lcqi_q4_direct_w_down_speedup_off_over_on={off_down / on_down:.6f}")
+    if off_f32_bytes is not None and on_f32_bytes is not None:
+        lines.append(f"lcqi_q4_direct_f32_weight_bytes_saved={off_f32_bytes - on_f32_bytes:.0f}")
 
 
 def parse_args() -> argparse.Namespace:
@@ -757,6 +851,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--force-download", action="store_true")
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--skip-llama-build", action="store_true")
+    parser.add_argument("--include-lcqi-q4-direct-off", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
 
@@ -793,9 +888,28 @@ def main() -> int:
             timeout_seconds=args.timeout_seconds,
         )
 
+        lcqi_q4_direct_off_runs: list[CommandResult] = []
         lcqi_runs: list[CommandResult] = []
         llama_simple_runs: list[CommandResult] = []
         for round_index in range(1, args.rounds + 1):
+            if args.include_lcqi_q4_direct_off:
+                print(f"[lcqi-same-input] LCQI Q4 direct off round {round_index}/{args.rounds}")
+                lcqi_q4_direct_off_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_q4_direct_off_round",
+                        env={LCQI_Q4_DIRECT_ENV: LCQI_Q4_DIRECT_OFF},
+                    )
+                )
+                ensure_success(
+                    lcqi_q4_direct_off_runs[-1],
+                    "run LCQI Q4 direct off same-input round",
+                )
             print(f"[lcqi-same-input] LCQI round {round_index}/{args.rounds}")
             lcqi_runs.append(
                 run_lcqi_round(
@@ -849,6 +963,7 @@ def main() -> int:
             full_prompt=full_prompt,
             max_new_tokens=args.max_new,
             lcqi_runs=lcqi_runs,
+            lcqi_q4_direct_off_runs=lcqi_q4_direct_off_runs,
             llama_tokenize=llama_tokenize,
             llama_simple_runs=llama_simple_runs,
             llama_bench=llama_bench,
