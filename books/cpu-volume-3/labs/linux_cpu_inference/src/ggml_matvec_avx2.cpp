@@ -8,6 +8,7 @@
 
 #include <array>
 #include <cstdint>
+#include <limits>
 #include <span>
 
 namespace lcqi {
@@ -118,6 +119,34 @@ void matvec_q8_0_q8_0_avx2_unchecked(std::span<const std::uint8_t> rows,
     }
 }
 
+void matvec_q8_0_q8_0_avx2_batch_unchecked(std::span<const std::uint8_t> rows,
+                                           std::int64_t row_count,
+                                           std::int64_t column_count,
+                                           std::span<const Q8_0InputBlock> input,
+                                           std::int64_t batch_size,
+                                           std::span<float> output,
+                                           std::int64_t output_stride,
+                                           std::int64_t row_begin,
+                                           std::int64_t row_end) {
+    (void)row_count;
+    const std::int64_t row_blocks = column_count / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t row_bytes = row_blocks * LCQI_GGML_AVX2_Q8_0_BLOCK_BYTES;
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
+        const std::uint8_t* row_data = rows.data() + row * row_bytes;
+        for (std::int64_t batch = 0; batch < batch_size; ++batch) {
+            const Q8_0InputBlock* batch_input =
+                input.data() + static_cast<std::size_t>(batch * row_blocks);
+            float sum = 0.0F;
+            for (std::int64_t block = 0; block < row_blocks; ++block) {
+                sum += dot_q8_0_block_q8_0_avx2(
+                    row_data + block * LCQI_GGML_AVX2_Q8_0_BLOCK_BYTES,
+                    batch_input[static_cast<std::size_t>(block)]);
+            }
+            output[static_cast<std::size_t>(batch * output_stride + row)] = sum;
+        }
+    }
+}
+
 void matvec_q5_0_q8_0_avx2_unchecked(std::span<const std::uint8_t> rows,
                                      std::int64_t row_count,
                                      std::int64_t column_count,
@@ -138,6 +167,90 @@ void matvec_q5_0_q8_0_avx2_unchecked(std::span<const std::uint8_t> rows,
         }
         output[static_cast<std::size_t>(row)] = sum;
     }
+}
+
+void matvec_q5_0_q8_0_avx2_batch_unchecked(std::span<const std::uint8_t> rows,
+                                           std::int64_t row_count,
+                                           std::int64_t column_count,
+                                           std::span<const Q8_0InputBlock> input,
+                                           std::int64_t batch_size,
+                                           std::span<float> output,
+                                           std::int64_t output_stride,
+                                           std::int64_t row_begin,
+                                           std::int64_t row_end) {
+    (void)row_count;
+    const std::int64_t row_blocks = column_count / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t row_bytes = row_blocks * LCQI_GGML_AVX2_Q5_0_BLOCK_BYTES;
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
+        const std::uint8_t* row_data = rows.data() + row * row_bytes;
+        for (std::int64_t batch = 0; batch < batch_size; ++batch) {
+            const Q8_0InputBlock* batch_input =
+                input.data() + static_cast<std::size_t>(batch * row_blocks);
+            float sum = 0.0F;
+            for (std::int64_t block = 0; block < row_blocks; ++block) {
+                sum += dot_q5_0_block_q8_0_avx2(
+                    row_data + block * LCQI_GGML_AVX2_Q5_0_BLOCK_BYTES,
+                    batch_input[static_cast<std::size_t>(block)]);
+            }
+            output[static_cast<std::size_t>(batch * output_stride + row)] = sum;
+        }
+    }
+}
+
+F32RowMax max_dot_q8_0_q8_0_avx2_rows_unchecked(std::span<const std::uint8_t> rows,
+                                                std::int64_t row_count,
+                                                std::int64_t column_count,
+                                                std::span<const Q8_0InputBlock> input,
+                                                std::int64_t row_begin,
+                                                std::int64_t row_end) {
+    (void)row_count;
+    const std::int64_t row_blocks = column_count / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t row_bytes = row_blocks * LCQI_GGML_AVX2_Q8_0_BLOCK_BYTES;
+    F32RowMax best;
+    best.row = static_cast<std::size_t>(row_begin);
+    best.value = -std::numeric_limits<float>::infinity();
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
+        const std::uint8_t* row_data = rows.data() + row * row_bytes;
+        float sum = 0.0F;
+        for (std::int64_t block = 0; block < row_blocks; ++block) {
+            sum += dot_q8_0_block_q8_0_avx2(
+                row_data + block * LCQI_GGML_AVX2_Q8_0_BLOCK_BYTES,
+                input[static_cast<std::size_t>(block)]);
+        }
+        if (row == row_begin || sum > best.value) {
+            best.row = static_cast<std::size_t>(row);
+            best.value = sum;
+        }
+    }
+    return best;
+}
+
+F32RowMax max_dot_q5_0_q8_0_avx2_rows_unchecked(std::span<const std::uint8_t> rows,
+                                                std::int64_t row_count,
+                                                std::int64_t column_count,
+                                                std::span<const Q8_0InputBlock> input,
+                                                std::int64_t row_begin,
+                                                std::int64_t row_end) {
+    (void)row_count;
+    const std::int64_t row_blocks = column_count / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t row_bytes = row_blocks * LCQI_GGML_AVX2_Q5_0_BLOCK_BYTES;
+    F32RowMax best;
+    best.row = static_cast<std::size_t>(row_begin);
+    best.value = -std::numeric_limits<float>::infinity();
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
+        const std::uint8_t* row_data = rows.data() + row * row_bytes;
+        float sum = 0.0F;
+        for (std::int64_t block = 0; block < row_blocks; ++block) {
+            sum += dot_q5_0_block_q8_0_avx2(
+                row_data + block * LCQI_GGML_AVX2_Q5_0_BLOCK_BYTES,
+                input[static_cast<std::size_t>(block)]);
+        }
+        if (row == row_begin || sum > best.value) {
+            best.row = static_cast<std::size_t>(row);
+            best.value = sum;
+        }
+    }
+    return best;
 }
 
 }  // namespace
@@ -203,6 +316,72 @@ void matvec_ggml_quantized_q8_0_avx2_rows_unchecked(GgmlType type,
                                         row_begin,
                                         row_end);
     }
+}
+
+void matvec_ggml_quantized_q8_0_avx2_batch_rows_unchecked(
+    GgmlType type,
+    std::span<const std::uint8_t> rows,
+    std::int64_t row_count,
+    std::int64_t column_count,
+    std::span<const Q8_0InputBlock> input,
+    std::int64_t batch_size,
+    std::span<float> output,
+    std::int64_t output_stride,
+    std::int64_t row_begin,
+    std::int64_t row_end) {
+    if (type == GgmlType::q8_0) {
+        matvec_q8_0_q8_0_avx2_batch_unchecked(rows,
+                                              row_count,
+                                              column_count,
+                                              input,
+                                              batch_size,
+                                              output,
+                                              output_stride,
+                                              row_begin,
+                                              row_end);
+        return;
+    }
+    if (type == GgmlType::q5_0) {
+        matvec_q5_0_q8_0_avx2_batch_unchecked(rows,
+                                              row_count,
+                                              column_count,
+                                              input,
+                                              batch_size,
+                                              output,
+                                              output_stride,
+                                              row_begin,
+                                              row_end);
+    }
+}
+
+F32RowMax max_dot_ggml_quantized_q8_0_avx2_rows_unchecked(
+    GgmlType type,
+    std::span<const std::uint8_t> rows,
+    std::int64_t row_count,
+    std::int64_t column_count,
+    std::span<const Q8_0InputBlock> input,
+    std::int64_t row_begin,
+    std::int64_t row_end) {
+    if (type == GgmlType::q8_0) {
+        return max_dot_q8_0_q8_0_avx2_rows_unchecked(rows,
+                                                     row_count,
+                                                     column_count,
+                                                     input,
+                                                     row_begin,
+                                                     row_end);
+    }
+    if (type == GgmlType::q5_0) {
+        return max_dot_q5_0_q8_0_avx2_rows_unchecked(rows,
+                                                     row_count,
+                                                     column_count,
+                                                     input,
+                                                     row_begin,
+                                                     row_end);
+    }
+    F32RowMax best;
+    best.row = static_cast<std::size_t>(row_begin);
+    best.value = -std::numeric_limits<float>::infinity();
+    return best;
 }
 
 }  // namespace lcqi

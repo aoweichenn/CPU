@@ -5,6 +5,7 @@
 #include <lcqi/ggml_tensors.hpp>
 #include <lcqi/gguf.hpp>
 #include <lcqi/q4_k.hpp>
+#include <lcqi/q5_0_packed.hpp>
 
 #include <algorithm>
 #include <array>
@@ -46,7 +47,15 @@ constexpr const char* LCQI_LLAMA_BOS_TOKEN_KEY = "tokenizer.ggml.bos_token_id";
 constexpr const char* LCQI_LLAMA_EOS_TOKEN_KEY = "tokenizer.ggml.eos_token_id";
 constexpr const char* LCQI_LLAMA_UNKNOWN_TOKEN_KEY = "tokenizer.ggml.unknown_token_id";
 constexpr const char* LCQI_LLAMA_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT";
+constexpr const char* LCQI_LLAMA_Q5_0_PACKED_ENV = "LCQI_LLAMA_Q5_0_PACKED";
+constexpr const char* LCQI_LLAMA_Q6_K_DIRECT_ENV = "LCQI_LLAMA_Q6_K_DIRECT";
+constexpr const char* LCQI_LLAMA_Q8_0_DIRECT_ENV = "LCQI_LLAMA_Q8_0_DIRECT";
+constexpr const char* LCQI_LLAMA_Q8_0_TIED_LM_HEAD_ENV =
+    "LCQI_LLAMA_Q8_0_TIED_LM_HEAD";
 constexpr const char* LCQI_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
+constexpr const char* LCQI_LLAMA_GGML_SELECTIVE_DIRECT_ENV =
+    "LCQI_LLAMA_GGML_SELECTIVE_DIRECT";
+constexpr const char* LCQI_LLAMA_BATCH_PREFILL_ENV = "LCQI_LLAMA_BATCH_PREFILL";
 constexpr const char* LCQI_LLAMA_FALSE_ENV = "0";
 constexpr const char* LCQI_LLAMA_TRUE_ENV = "1";
 constexpr std::int32_t LCQI_LLAMA_MAX_AUTO_WORKERS = 8;
@@ -343,14 +352,49 @@ void validate_shape(const GgufTensorInfo& tensor,
            tensor.shape[0] % LCQI_Q8_0_INPUT_BLOCK_VALUES == 0;
 }
 
+[[nodiscard]] bool can_use_selective_ggml_direct(const GgufTensorInfo& tensor) {
+    return (tensor.type == GgmlType::q5_0 || tensor.type == GgmlType::q8_0) &&
+           can_use_ggml_direct(tensor);
+}
+
 [[nodiscard]] bool q4_k_direct_enabled() noexcept {
     const char* enabled = std::getenv(LCQI_LLAMA_Q4_DIRECT_ENV);
+    return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
+[[nodiscard]] bool q5_0_packed_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q5_0_PACKED_ENV);
+    return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
+[[nodiscard]] bool q6_k_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q6_K_DIRECT_ENV);
+    return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
+}
+
+[[nodiscard]] bool q8_0_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q8_0_DIRECT_ENV);
+    return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
+[[nodiscard]] bool q8_0_tied_lm_head_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q8_0_TIED_LM_HEAD_ENV);
     return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
 }
 
 [[nodiscard]] bool ggml_direct_enabled() noexcept {
     const char* enabled = std::getenv(LCQI_LLAMA_GGML_DIRECT_ENV);
     return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
+}
+
+[[nodiscard]] bool ggml_selective_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_GGML_SELECTIVE_DIRECT_ENV);
+    return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
+}
+
+[[nodiscard]] bool batch_prefill_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_BATCH_PREFILL_ENV);
+    return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
 }
 
 void account_f32_tensor_load(const GgufTensorInfo& tensor,
@@ -396,6 +440,45 @@ void account_quantized_direct_tensor_load(const GgufTensorInfo& tensor,
     }
 }
 
+void account_q5_0_packed_tensor_load(const GgufTensorInfo& tensor,
+                                     const LlamaGgufLinearWeights& linear,
+                                     LlamaGgufLoadReport& report) {
+    report.quantized_weight_bytes += tensor.byte_size;
+    report.direct_quantized_weight_bytes += tensor.byte_size;
+    report.q5_0_packed_weight_bytes +=
+        linear.q5_0_packed_blocks.size() * sizeof(Q5_0PackedBlock);
+    const std::uint64_t batch_f32_bytes =
+        static_cast<std::uint64_t>(linear.f32_weights.size()) *
+        static_cast<std::uint64_t>(sizeof(float));
+    report.f32_weight_bytes += batch_f32_bytes;
+    report.q5_0_batch_f32_weight_bytes += batch_f32_bytes;
+    ++report.tensors_loaded;
+    ++report.q5_0_packed_tensors;
+}
+
+void account_q6_k_direct_tensor_load(const GgufTensorInfo& tensor,
+                                     LlamaGgufLoadReport& report) {
+    report.quantized_weight_bytes += tensor.byte_size;
+    report.direct_quantized_weight_bytes += tensor.byte_size;
+    report.q6_k_direct_weight_bytes += tensor.byte_size;
+    ++report.tensors_loaded;
+    ++report.q6_k_direct_tensors;
+}
+
+void account_q8_0_direct_tensor_load(const GgufTensorInfo& tensor,
+                                     LlamaGgufLoadReport& report) {
+    report.direct_quantized_weight_bytes += tensor.byte_size;
+    report.q8_0_direct_weight_bytes += tensor.byte_size;
+    ++report.q8_0_direct_tensors;
+}
+
+void account_q8_0_linear_tensor_load(const GgufTensorInfo& tensor,
+                                     LlamaGgufLoadReport& report) {
+    report.quantized_weight_bytes += tensor.byte_size;
+    account_q8_0_direct_tensor_load(tensor, report);
+    ++report.tensors_loaded;
+}
+
 [[nodiscard]] LlamaGgufLinearWeights make_linear_from_gguf(
     const std::filesystem::path& gguf_path,
     const GgufManifest& manifest,
@@ -421,7 +504,43 @@ void account_quantized_direct_tensor_load(const GgufTensorInfo& tensor,
         account_quantized_direct_tensor_load(*tensor, report);
         return linear;
     }
+    if (q5_0_packed_enabled() && !ggml_direct_enabled() &&
+        !ggml_selective_direct_enabled() && tensor->type == GgmlType::q5_0 &&
+        can_use_ggml_direct(*tensor)) {
+        linear.storage = LlamaGgufLinearStorage::q5_0_packed;
+        linear.q5_0_packed_blocks = pack_q5_0_blocks(
+            bytes,
+            static_cast<std::int64_t>(tensor->element_count()));
+        linear.f32_weights =
+            dequantize_ggml_tensor(tensor->type,
+                                   bytes,
+                                   static_cast<std::int64_t>(tensor->element_count()));
+        account_q5_0_packed_tensor_load(*tensor, linear, report);
+        return linear;
+    }
+    if (q6_k_direct_enabled() && !ggml_direct_enabled() &&
+        !ggml_selective_direct_enabled() && tensor->type == GgmlType::q6_k &&
+        can_use_ggml_direct(*tensor)) {
+        linear.storage = LlamaGgufLinearStorage::q6_k_direct;
+        linear.quantized_bytes = bytes;
+        account_q6_k_direct_tensor_load(*tensor, report);
+        return linear;
+    }
+    if (q8_0_direct_enabled() && !ggml_direct_enabled() &&
+        !ggml_selective_direct_enabled() && tensor->type == GgmlType::q8_0 &&
+        can_use_ggml_direct(*tensor)) {
+        linear.storage = LlamaGgufLinearStorage::q8_0_direct;
+        linear.quantized_bytes = bytes;
+        account_q8_0_linear_tensor_load(*tensor, report);
+        return linear;
+    }
     if (ggml_direct_enabled() && can_use_ggml_direct(*tensor)) {
+        linear.storage = LlamaGgufLinearStorage::ggml_quantized;
+        linear.quantized_bytes = bytes;
+        account_quantized_direct_tensor_load(*tensor, report);
+        return linear;
+    }
+    if (ggml_selective_direct_enabled() && can_use_selective_ggml_direct(*tensor)) {
         linear.storage = LlamaGgufLinearStorage::ggml_quantized;
         linear.quantized_bytes = bytes;
         account_quantized_direct_tensor_load(*tensor, report);
@@ -434,6 +553,28 @@ void account_quantized_direct_tensor_load(const GgufTensorInfo& tensor,
                                bytes,
                                static_cast<std::int64_t>(tensor->element_count()));
     account_f32_tensor_load(*tensor, linear.f32_weights, report);
+    return linear;
+}
+
+[[nodiscard]] LlamaGgufLinearWeights make_tied_lm_head_from_embedding(
+    const std::filesystem::path& gguf_path,
+    const GgufManifest& manifest,
+    std::int32_t hidden_size,
+    std::int32_t vocab_size,
+    LlamaGgufLoadReport& report) {
+    LlamaGgufLinearWeights linear;
+    linear.input_size = hidden_size;
+    linear.output_size = vocab_size;
+    const GgufTensorInfo* tensor = manifest.find_tensor("token_embd.weight");
+    if (tensor == nullptr || tensor->type != GgmlType::q8_0 ||
+        !q8_0_tied_lm_head_enabled() || !can_use_ggml_direct(*tensor)) {
+        return linear;
+    }
+    validate_shape(*tensor, std::array<std::int64_t, 2>{hidden_size, vocab_size});
+    linear.source_type = tensor->type;
+    linear.storage = LlamaGgufLinearStorage::q8_0_direct;
+    linear.quantized_bytes = read_gguf_tensor_bytes(gguf_path, *tensor);
+    account_q8_0_direct_tensor_load(*tensor, report);
     return linear;
 }
 
@@ -466,6 +607,12 @@ void validate_llama_config(const DecoderConfig& config, std::int32_t layer_count
                                               std::int32_t row_width) {
     return values.subspan(checked_size(row, "row") * checked_size(row_width, "row_width"),
                           checked_size(row_width, "row_width"));
+}
+
+[[nodiscard]] std::span<float> mutable_row_span(std::span<float> values,
+                                                std::size_t row,
+                                                std::size_t row_width) {
+    return values.subspan(row * row_width, row_width);
 }
 
 void add_inplace(std::span<float> target, std::span<const float> source) {
@@ -647,6 +794,73 @@ void linear_f32_fallback_parallel(const LlamaGgufLinearWeights& layer,
                                    rows_fn);
 }
 
+void linear_f32_batch_parallel(std::span<const float> weights,
+                               std::size_t input_size,
+                               std::size_t output_size,
+                               std::span<const float> input,
+                               std::size_t batch_size,
+                               std::span<float> output,
+                               const LlamaGgufExecutionOptions& options,
+                               LlamaParallelWorkerPool* worker_pool) {
+    if (weights.size() != input_size * output_size) {
+        throw std::runtime_error("LLaMA GGUF F32 linear weight size mismatch");
+    }
+    if (input.size() != batch_size * input_size || output.size() != batch_size * output_size) {
+        throw std::runtime_error("LLaMA GGUF F32 batch linear shape mismatch");
+    }
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        linear_f32_batch_rows_unchecked(weights.data(),
+                                        input.data(),
+                                        nullptr,
+                                        input_size,
+                                        batch_size,
+                                        0,
+                                        output_size,
+                                        output_size,
+                                        output.data());
+        return;
+    }
+
+    const float* weights_data = weights.data();
+    const float* input_data = input.data();
+    float* output_data = output.data();
+    const auto rows_fn = [weights_data, input_data, input_size, batch_size, output_size, output_data](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        (void)worker_index;
+        linear_f32_batch_rows_unchecked(weights_data,
+                                        input_data,
+                                        nullptr,
+                                        input_size,
+                                        batch_size,
+                                        begin,
+                                        end,
+                                        output_size,
+                                        output_data);
+    };
+    worker_pool->parallel_for_rows(0,
+                                   output_size,
+                                   parallel_row_grain(output_size, *worker_pool),
+                                   rows_fn);
+}
+
+void linear_f32_fallback_batch_parallel(const LlamaGgufLinearWeights& layer,
+                                        std::span<const float> input,
+                                        std::size_t batch_size,
+                                        std::span<float> output,
+                                        const LlamaGgufExecutionOptions& options,
+                                        LlamaParallelWorkerPool* worker_pool) {
+    linear_f32_batch_parallel(layer.f32_weights,
+                              checked_size(layer.input_size, "linear input size"),
+                              checked_size(layer.output_size, "linear output size"),
+                              input,
+                              batch_size,
+                              output,
+                              options,
+                              worker_pool);
+}
+
 [[nodiscard]] F32RowMax max_dot_f32_rows_parallel(const float* weights,
                                                   const float* input,
                                                   std::size_t input_size,
@@ -692,6 +906,74 @@ void linear_f32_fallback_parallel(const LlamaGgufLinearWeights& layer,
     }
     if (!found) {
         return max_dot_f32_rows_unchecked(weights, input, input_size, 0, row_count);
+    }
+    return best;
+}
+
+[[nodiscard]] F32RowMax max_dot_ggml_quantized_q8_0_parallel(
+    const LlamaGgufLinearWeights& layer,
+    std::span<const Q8_0InputBlock> q8_0_input,
+    const LlamaGgufExecutionOptions& options,
+    LlamaParallelWorkerPool* worker_pool) {
+    if (q8_0_input.size() != checked_size(layer.input_size / LCQI_Q8_0_INPUT_BLOCK_VALUES,
+                                          "Q8_0 max-dot input block count")) {
+        throw std::runtime_error("LLaMA GGUF Q8_0 max-dot scratch block count mismatch");
+    }
+    const std::size_t input_size = checked_size(layer.input_size, "linear input size");
+    const std::size_t output_size = checked_size(layer.output_size, "linear output size");
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        return max_dot_ggml_quantized_q8_0(layer.source_type,
+                                           layer.quantized_bytes,
+                                           layer.output_size,
+                                           layer.input_size,
+                                           q8_0_input);
+    }
+
+    const std::size_t worker_count = checked_size(worker_pool->worker_count(), "worker_count");
+    std::vector<F32RowMax> local_best(worker_count);
+    std::vector<std::uint8_t> has_result(worker_count, 0U);
+    const auto rows_fn = [&layer, q8_0_input, &local_best, &has_result](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        if (begin >= end) {
+            return;
+        }
+        local_best[worker_index] =
+            max_dot_ggml_quantized_q8_0_rows_unchecked(layer.source_type,
+                                                       layer.quantized_bytes,
+                                                       layer.output_size,
+                                                       layer.input_size,
+                                                       q8_0_input,
+                                                       static_cast<std::int64_t>(begin),
+                                                       static_cast<std::int64_t>(end));
+        has_result[worker_index] = 1U;
+    };
+    worker_pool->parallel_for_rows(0,
+                                   output_size,
+                                   parallel_row_grain(output_size, *worker_pool),
+                                   rows_fn);
+
+    F32RowMax best;
+    best.row = 0;
+    best.value = -std::numeric_limits<float>::infinity();
+    bool found = false;
+    for (std::size_t index = 0; index < local_best.size(); ++index) {
+        if (has_result[index] == 0U) {
+            continue;
+        }
+        const F32RowMax& candidate = local_best[index];
+        if (!found || candidate.value > best.value) {
+            best = candidate;
+            found = true;
+        }
+    }
+    if (!found) {
+        return max_dot_ggml_quantized_q8_0(layer.source_type,
+                                           layer.quantized_bytes,
+                                           layer.output_size,
+                                           layer.input_size,
+                                           q8_0_input);
     }
     return best;
 }
@@ -745,6 +1027,72 @@ void linear_q4_k_direct_parallel(const LlamaGgufLinearWeights& layer,
                                    rows_fn);
 }
 
+void linear_q5_0_packed_direct(const LlamaGgufLinearWeights& layer,
+                               std::span<const Q8_0InputBlock> q8_0_input,
+                               std::span<float> output) {
+    if (q8_0_input.size() != checked_size(layer.input_size / LCQI_Q8_0_INPUT_BLOCK_VALUES,
+                                          "Q8_0 input block count")) {
+        throw std::runtime_error("LLaMA GGUF Q5_0 packed scratch block count mismatch");
+    }
+    matvec_q5_0_packed_q8_0(layer.q5_0_packed_blocks,
+                            layer.output_size,
+                            layer.input_size,
+                            q8_0_input,
+                            output);
+}
+
+void linear_q5_0_packed_direct_parallel(const LlamaGgufLinearWeights& layer,
+                                        std::span<const Q8_0InputBlock> q8_0_input,
+                                        std::span<float> output,
+                                        const LlamaGgufExecutionOptions& options,
+                                        LlamaParallelWorkerPool* worker_pool) {
+    if (q8_0_input.size() != checked_size(layer.input_size / LCQI_Q8_0_INPUT_BLOCK_VALUES,
+                                          "Q8_0 input block count")) {
+        throw std::runtime_error("LLaMA GGUF Q5_0 packed scratch block count mismatch");
+    }
+    const std::size_t input_size = checked_size(layer.input_size, "linear input size");
+    const std::size_t output_size = checked_size(layer.output_size, "linear output size");
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        linear_q5_0_packed_direct(layer, q8_0_input, output);
+        return;
+    }
+
+    const auto rows_fn = [&layer, q8_0_input, output](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        (void)worker_index;
+        matvec_q5_0_packed_q8_0_rows_unchecked(layer.q5_0_packed_blocks,
+                                               layer.output_size,
+                                               layer.input_size,
+                                               q8_0_input,
+                                               output,
+                                               static_cast<std::int64_t>(begin),
+                                               static_cast<std::int64_t>(end));
+    };
+    worker_pool->parallel_for_rows(0,
+                                   output_size,
+                                   parallel_row_grain(output_size, *worker_pool),
+                                   rows_fn);
+}
+
+void quantize_q8_0_batch_to(std::span<const float> input,
+                            std::size_t input_size,
+                            std::size_t batch_size,
+                            std::span<Q8_0InputBlock> output) {
+    const std::size_t blocks_per_input =
+        checked_size(static_cast<std::int64_t>(input_size) / LCQI_Q8_0_INPUT_BLOCK_VALUES,
+                     "Q8_0 input block count");
+    if (input.size() != batch_size * input_size ||
+        output.size() != batch_size * blocks_per_input) {
+        throw std::runtime_error("LLaMA GGUF Q8_0 batch quantization shape mismatch");
+    }
+    for (std::size_t batch = 0; batch < batch_size; ++batch) {
+        quantize_q8_0_input_to(input.subspan(batch * input_size, input_size),
+                               output.subspan(batch * blocks_per_input, blocks_per_input));
+    }
+}
+
 void linear_ggml_quantized_direct(const LlamaGgufLinearWeights& layer,
                                   std::span<const Q8_0InputBlock> q8_0_input,
                                   std::span<float> output) {
@@ -796,6 +1144,64 @@ void linear_ggml_quantized_direct_parallel(const LlamaGgufLinearWeights& layer,
                                    rows_fn);
 }
 
+void linear_ggml_quantized_direct_batch_parallel(const LlamaGgufLinearWeights& layer,
+                                                 std::span<const float> input,
+                                                 std::size_t batch_size,
+                                                 std::vector<Q8_0InputBlock>& q8_0_scratch,
+                                                 std::span<float> output,
+                                                 const LlamaGgufExecutionOptions& options,
+                                                 LlamaParallelWorkerPool* worker_pool) {
+    const std::size_t input_size = checked_size(layer.input_size, "linear input size");
+    const std::size_t output_size = checked_size(layer.output_size, "linear output size");
+    if (input.size() != batch_size * input_size || output.size() != batch_size * output_size) {
+        throw std::runtime_error("LLaMA GGUF quantized batch linear shape mismatch");
+    }
+    if (layer.input_size <= 0 || layer.input_size % LCQI_Q8_0_INPUT_BLOCK_VALUES != 0) {
+        throw std::runtime_error("LLaMA GGUF quantized batch input is not Q8_0 compatible");
+    }
+    const std::size_t blocks_per_input =
+        checked_size(layer.input_size / LCQI_Q8_0_INPUT_BLOCK_VALUES,
+                     "Q8_0 input block count");
+    q8_0_scratch.resize(batch_size * blocks_per_input);
+    quantize_q8_0_batch_to(input, input_size, batch_size, q8_0_scratch);
+
+    if (!should_parallelize_rows(options, output_size, input_size, worker_pool)) {
+        matvec_ggml_quantized_q8_0_batch_rows_unchecked(layer.source_type,
+                                                        layer.quantized_bytes,
+                                                        layer.output_size,
+                                                        layer.input_size,
+                                                        q8_0_scratch,
+                                                        static_cast<std::int64_t>(batch_size),
+                                                        output,
+                                                        layer.output_size,
+                                                        0,
+                                                        layer.output_size);
+        return;
+    }
+
+    const auto rows_fn = [&layer, &q8_0_scratch, batch_size, output](
+                             std::size_t begin,
+                             std::size_t end,
+                             std::size_t worker_index) {
+        (void)worker_index;
+        matvec_ggml_quantized_q8_0_batch_rows_unchecked(
+            layer.source_type,
+            layer.quantized_bytes,
+            layer.output_size,
+            layer.input_size,
+            q8_0_scratch,
+            static_cast<std::int64_t>(batch_size),
+            output,
+            layer.output_size,
+            static_cast<std::int64_t>(begin),
+            static_cast<std::int64_t>(end));
+    };
+    worker_pool->parallel_for_rows(0,
+                                   output_size,
+                                   parallel_row_grain(output_size, *worker_pool),
+                                   rows_fn);
+}
+
 void linear_gguf(const LlamaGgufLinearWeights& layer,
                  std::span<const float> input,
                  std::span<const Q8KBlock> q8_input,
@@ -814,6 +1220,39 @@ void linear_gguf(const LlamaGgufLinearWeights& layer,
             });
             hotspots.q4_k_direct_ms += elapsed;
             ++hotspots.q4_k_direct_calls;
+            break;
+        case LlamaGgufLinearStorage::q5_0_packed:
+            elapsed = measure_ms([&]() {
+                linear_q5_0_packed_direct_parallel(layer,
+                                                   q8_0_input,
+                                                   output,
+                                                   options,
+                                                   worker_pool);
+            });
+            hotspots.q5_0_packed_ms += elapsed;
+            ++hotspots.q5_0_packed_calls;
+            break;
+        case LlamaGgufLinearStorage::q6_k_direct:
+            elapsed = measure_ms([&]() {
+                linear_ggml_quantized_direct_parallel(layer,
+                                                      q8_0_input,
+                                                      output,
+                                                      options,
+                                                      worker_pool);
+            });
+            hotspots.q6_k_direct_ms += elapsed;
+            ++hotspots.q6_k_direct_calls;
+            break;
+        case LlamaGgufLinearStorage::q8_0_direct:
+            elapsed = measure_ms([&]() {
+                linear_ggml_quantized_direct_parallel(layer,
+                                                      q8_0_input,
+                                                      output,
+                                                      options,
+                                                      worker_pool);
+            });
+            hotspots.q8_0_direct_ms += elapsed;
+            ++hotspots.q8_0_direct_calls;
             break;
         case LlamaGgufLinearStorage::ggml_quantized:
             elapsed = measure_ms([&]() {
@@ -837,12 +1276,131 @@ void linear_gguf(const LlamaGgufLinearWeights& layer,
     linear_hotspot_field(hotspots, operation) += elapsed;
 }
 
+[[nodiscard]] bool uses_q4_k_direct(const LlamaGgufLinearWeights& layer) noexcept;
+[[nodiscard]] bool uses_q5_0_packed_direct(const LlamaGgufLinearWeights& layer) noexcept;
+[[nodiscard]] bool uses_ggml_direct(const LlamaGgufLinearWeights& layer) noexcept;
+[[nodiscard]] bool uses_q8_0_activation_direct(const LlamaGgufLinearWeights& layer) noexcept;
+[[nodiscard]] std::size_t q8_scratch_blocks(std::int32_t input_size);
+void prepare_q8_if_needed(std::span<const float> input,
+                          std::span<Q8KBlock> scratch,
+                          bool needed);
+[[nodiscard]] std::size_t q8_0_scratch_blocks(std::int32_t input_size);
+void prepare_q8_0_if_needed(std::span<const float> input,
+                            std::span<Q8_0InputBlock> scratch,
+                            bool needed);
+
+void linear_gguf_batch(const LlamaGgufLinearWeights& layer,
+                       std::span<const float> input,
+                       std::size_t batch_size,
+                       std::vector<Q8KBlock>& q8_scratch,
+                       std::vector<Q8_0InputBlock>& q8_0_scratch,
+                       std::span<float> output,
+                       LlamaGgufLinearOp operation,
+                       LlamaGgufHotspotReport& hotspots,
+                       const LlamaGgufExecutionOptions& options,
+                       LlamaParallelWorkerPool* worker_pool) {
+    const std::size_t input_size = checked_size(layer.input_size, "linear input size");
+    const std::size_t output_size = checked_size(layer.output_size, "linear output size");
+    if (input.size() != batch_size * input_size || output.size() != batch_size * output_size) {
+        throw std::runtime_error("LLaMA GGUF batch linear input/output size mismatch");
+    }
+
+    if (layer.storage == LlamaGgufLinearStorage::f32) {
+        const double elapsed = measure_ms([&]() {
+            linear_f32_fallback_batch_parallel(layer,
+                                               input,
+                                               batch_size,
+                                               output,
+                                               options,
+                                               worker_pool);
+        });
+        hotspots.f32_fallback_ms += elapsed;
+        ++hotspots.f32_fallback_calls;
+        linear_hotspot_field(hotspots, operation) += elapsed;
+        return;
+    }
+
+    if (layer.storage == LlamaGgufLinearStorage::q5_0_packed) {
+        const double elapsed = measure_ms([&]() {
+            linear_f32_fallback_batch_parallel(layer,
+                                               input,
+                                               batch_size,
+                                               output,
+                                               options,
+                                               worker_pool);
+        });
+        hotspots.q5_0_batch_f32_ms += elapsed;
+        ++hotspots.q5_0_batch_f32_calls;
+        linear_hotspot_field(hotspots, operation) += elapsed;
+        return;
+    }
+
+    if (layer.storage == LlamaGgufLinearStorage::q6_k_direct ||
+        layer.storage == LlamaGgufLinearStorage::q8_0_direct ||
+        layer.storage == LlamaGgufLinearStorage::ggml_quantized) {
+        const double elapsed = measure_ms([&]() {
+            linear_ggml_quantized_direct_batch_parallel(layer,
+                                                       input,
+                                                       batch_size,
+                                                       q8_0_scratch,
+                                                       output,
+                                                       options,
+                                                       worker_pool);
+        });
+        if (layer.storage == LlamaGgufLinearStorage::q6_k_direct) {
+            hotspots.q6_k_direct_ms += elapsed;
+            ++hotspots.q6_k_direct_calls;
+        } else if (layer.storage == LlamaGgufLinearStorage::q8_0_direct) {
+            hotspots.q8_0_direct_ms += elapsed;
+            ++hotspots.q8_0_direct_calls;
+        } else {
+            hotspots.ggml_direct_ms += elapsed;
+            ++hotspots.ggml_direct_calls;
+        }
+        linear_hotspot_field(hotspots, operation) += elapsed;
+        return;
+    }
+
+    q8_scratch.resize(q8_scratch_blocks(layer.input_size));
+    q8_0_scratch.resize(q8_0_scratch_blocks(layer.input_size));
+    for (std::size_t batch = 0; batch < batch_size; ++batch) {
+        const std::span<const float> token_input =
+            input.subspan(batch * input_size, input_size);
+        std::span<float> token_output =
+            output.subspan(batch * output_size, output_size);
+        prepare_q8_if_needed(token_input, q8_scratch, uses_q4_k_direct(layer));
+        prepare_q8_0_if_needed(token_input,
+                               q8_0_scratch,
+                               uses_q8_0_activation_direct(layer));
+        linear_gguf(layer,
+                    token_input,
+                    q8_scratch,
+                    q8_0_scratch,
+                    token_output,
+                    operation,
+                    hotspots,
+                    options,
+                    worker_pool);
+    }
+}
+
 [[nodiscard]] bool uses_q4_k_direct(const LlamaGgufLinearWeights& layer) noexcept {
     return layer.storage == LlamaGgufLinearStorage::q4_k;
 }
 
+[[nodiscard]] bool uses_q5_0_packed_direct(const LlamaGgufLinearWeights& layer) noexcept {
+    return layer.storage == LlamaGgufLinearStorage::q5_0_packed;
+}
+
 [[nodiscard]] bool uses_ggml_direct(const LlamaGgufLinearWeights& layer) noexcept {
     return layer.storage == LlamaGgufLinearStorage::ggml_quantized;
+}
+
+[[nodiscard]] bool uses_q8_0_activation_direct(const LlamaGgufLinearWeights& layer) noexcept {
+    return uses_q5_0_packed_direct(layer) ||
+           layer.storage == LlamaGgufLinearStorage::q6_k_direct ||
+           layer.storage == LlamaGgufLinearStorage::q8_0_direct ||
+           uses_ggml_direct(layer);
 }
 
 [[nodiscard]] std::size_t q8_scratch_blocks(std::int32_t input_size) {
@@ -918,6 +1476,39 @@ struct LlamaWorkspace {
           mlp_hidden_q8_0(q8_0_scratch_blocks(config.intermediate_size)) {}
 };
 
+struct LlamaBatchWorkspace {
+    std::size_t batch_size = 0;
+    std::vector<float> hidden;
+    std::vector<float> normed;
+    std::vector<float> query;
+    std::vector<float> key;
+    std::vector<float> value;
+    std::vector<float> attention;
+    std::vector<float> projected;
+    std::vector<float> gate;
+    std::vector<float> up;
+    std::vector<float> mlp_hidden;
+    std::vector<float> mlp_out;
+    std::vector<float> final_norm;
+    std::vector<Q8KBlock> q8_scratch;
+    std::vector<Q8_0InputBlock> q8_0_scratch;
+
+    LlamaBatchWorkspace(const DecoderConfig& config, std::size_t requested_batch_size)
+        : batch_size(requested_batch_size),
+          hidden(batch_size * checked_size(config.hidden_size, "hidden_size"), 0.0F),
+          normed(hidden.size(), 0.0F),
+          query(hidden.size(), 0.0F),
+          key(batch_size * checked_size(config.kv_heads * config.head_dim, "kv_width"), 0.0F),
+          value(key.size(), 0.0F),
+          attention(hidden.size(), 0.0F),
+          projected(hidden.size(), 0.0F),
+          gate(batch_size * checked_size(config.intermediate_size, "intermediate_size"), 0.0F),
+          up(gate.size(), 0.0F),
+          mlp_hidden(gate.size(), 0.0F),
+          mlp_out(hidden.size(), 0.0F),
+          final_norm(checked_size(config.hidden_size, "hidden_size"), 0.0F) {}
+};
+
 void forward_llama_layer(const DecoderConfig& config,
                          const LlamaGgufDecoderLayerWeights& layer,
                          std::int32_t layer_id,
@@ -939,8 +1530,9 @@ void forward_llama_layer(const DecoderConfig& config,
                              uses_q4_k_direct(layer.wv));
     prepare_q8_0_if_needed(workspace.normed,
                            workspace.normed_q8_0,
-                           uses_ggml_direct(layer.wq) || uses_ggml_direct(layer.wk) ||
-                               uses_ggml_direct(layer.wv));
+                           uses_q8_0_activation_direct(layer.wq) ||
+                               uses_q8_0_activation_direct(layer.wk) ||
+                               uses_q8_0_activation_direct(layer.wv));
     linear_gguf(layer.wq,
                 workspace.normed,
                 workspace.normed_q8,
@@ -994,7 +1586,7 @@ void forward_llama_layer(const DecoderConfig& config,
                          uses_q4_k_direct(layer.wo));
     prepare_q8_0_if_needed(workspace.attention,
                            workspace.attention_q8_0,
-                           uses_ggml_direct(layer.wo));
+                           uses_q8_0_activation_direct(layer.wo));
     linear_gguf(layer.wo,
                 workspace.attention,
                 workspace.attention_q8,
@@ -1014,7 +1606,8 @@ void forward_llama_layer(const DecoderConfig& config,
                          uses_q4_k_direct(layer.w_gate) || uses_q4_k_direct(layer.w_up));
     prepare_q8_0_if_needed(workspace.normed,
                            workspace.normed_q8_0,
-                           uses_ggml_direct(layer.w_gate) || uses_ggml_direct(layer.w_up));
+                           uses_q8_0_activation_direct(layer.w_gate) ||
+                               uses_q8_0_activation_direct(layer.w_up));
     linear_gguf(layer.w_gate,
                 workspace.normed,
                 workspace.normed_q8,
@@ -1041,7 +1634,7 @@ void forward_llama_layer(const DecoderConfig& config,
                          uses_q4_k_direct(layer.w_down));
     prepare_q8_0_if_needed(workspace.mlp_hidden,
                            workspace.mlp_hidden_q8_0,
-                           uses_ggml_direct(layer.w_down));
+                           uses_q8_0_activation_direct(layer.w_down));
     linear_gguf(layer.w_down,
                 workspace.mlp_hidden,
                 workspace.mlp_hidden_q8,
@@ -1054,6 +1647,162 @@ void forward_llama_layer(const DecoderConfig& config,
     add_inplace(workspace.hidden, workspace.mlp_out);
 }
 
+void forward_llama_layer_prefill_batch(const DecoderConfig& config,
+                                       const LlamaGgufDecoderLayerWeights& layer,
+                                       std::int32_t layer_id,
+                                       std::int32_t position_begin,
+                                       ReferenceKVCache& cache,
+                                       LlamaBatchWorkspace& workspace,
+                                       LlamaGgufHotspotReport& hotspots,
+                                       const LlamaGgufExecutionOptions& options,
+                                       LlamaParallelWorkerPool* worker_pool) {
+    const std::size_t hidden_size = checked_size(config.hidden_size, "hidden_size");
+    const std::size_t kv_width = checked_size(config.kv_heads * config.head_dim, "kv_width");
+    const std::size_t intermediate_size =
+        checked_size(config.intermediate_size, "intermediate_size");
+
+    hotspots.rms_norm_ms += measure_ms([&]() {
+        for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+            rms_norm(mutable_row_span(workspace.hidden, batch, hidden_size),
+                     layer.rms_attention_weight,
+                     config.rms_epsilon,
+                     mutable_row_span(workspace.normed, batch, hidden_size));
+        }
+    });
+    linear_gguf_batch(layer.wq,
+                      workspace.normed,
+                      workspace.batch_size,
+                      workspace.q8_scratch,
+                      workspace.q8_0_scratch,
+                      workspace.query,
+                      LlamaGgufLinearOp::wq,
+                      hotspots,
+                      options,
+                      worker_pool);
+    linear_gguf_batch(layer.wk,
+                      workspace.normed,
+                      workspace.batch_size,
+                      workspace.q8_scratch,
+                      workspace.q8_0_scratch,
+                      workspace.key,
+                      LlamaGgufLinearOp::wk,
+                      hotspots,
+                      options,
+                      worker_pool);
+    linear_gguf_batch(layer.wv,
+                      workspace.normed,
+                      workspace.batch_size,
+                      workspace.q8_scratch,
+                      workspace.q8_0_scratch,
+                      workspace.value,
+                      LlamaGgufLinearOp::wv,
+                      hotspots,
+                      options,
+                      worker_pool);
+    hotspots.rope_ms += measure_ms([&]() {
+        for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+            const std::int32_t model_position =
+                position_begin + static_cast<std::int32_t>(batch);
+            apply_rope(mutable_row_span(workspace.query, batch, hidden_size),
+                       config.query_heads,
+                       config.head_dim,
+                       model_position,
+                       config.rope_base);
+            apply_rope(mutable_row_span(workspace.key, batch, kv_width),
+                       config.kv_heads,
+                       config.head_dim,
+                       model_position,
+                       config.rope_base);
+        }
+    });
+    for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+        const std::int32_t model_position = position_begin + static_cast<std::int32_t>(batch);
+        cache.append(layer_id,
+                     model_position,
+                     mutable_row_span(workspace.key, batch, kv_width),
+                     mutable_row_span(workspace.value, batch, kv_width));
+    }
+    hotspots.attention_ms += measure_ms([&]() {
+        for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+            const std::int32_t model_position =
+                position_begin + static_cast<std::int32_t>(batch);
+            attention_decode(config,
+                             cache,
+                             layer_id,
+                             model_position,
+                             mutable_row_span(workspace.query, batch, hidden_size),
+                             mutable_row_span(workspace.attention, batch, hidden_size));
+        }
+    });
+    linear_gguf_batch(layer.wo,
+                      workspace.attention,
+                      workspace.batch_size,
+                      workspace.q8_scratch,
+                      workspace.q8_0_scratch,
+                      workspace.projected,
+                      LlamaGgufLinearOp::wo,
+                      hotspots,
+                      options,
+                      worker_pool);
+    for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+        add_inplace(mutable_row_span(workspace.hidden, batch, hidden_size),
+                    mutable_row_span(workspace.projected, batch, hidden_size));
+    }
+
+    hotspots.rms_norm_ms += measure_ms([&]() {
+        for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+            rms_norm(mutable_row_span(workspace.hidden, batch, hidden_size),
+                     layer.rms_mlp_weight,
+                     config.rms_epsilon,
+                     mutable_row_span(workspace.normed, batch, hidden_size));
+        }
+    });
+    linear_gguf_batch(layer.w_gate,
+                      workspace.normed,
+                      workspace.batch_size,
+                      workspace.q8_scratch,
+                      workspace.q8_0_scratch,
+                      workspace.gate,
+                      LlamaGgufLinearOp::w_gate,
+                      hotspots,
+                      options,
+                      worker_pool);
+    linear_gguf_batch(layer.w_up,
+                      workspace.normed,
+                      workspace.batch_size,
+                      workspace.q8_scratch,
+                      workspace.q8_0_scratch,
+                      workspace.up,
+                      LlamaGgufLinearOp::w_up,
+                      hotspots,
+                      options,
+                      worker_pool);
+    for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+        std::span<float> mlp_hidden = mutable_row_span(workspace.mlp_hidden,
+                                                       batch,
+                                                       intermediate_size);
+        std::span<float> gate = mutable_row_span(workspace.gate, batch, intermediate_size);
+        std::span<float> up = mutable_row_span(workspace.up, batch, intermediate_size);
+        for (std::size_t index = 0; index < intermediate_size; ++index) {
+            mlp_hidden[index] = silu(gate[index]) * up[index];
+        }
+    }
+    linear_gguf_batch(layer.w_down,
+                      workspace.mlp_hidden,
+                      workspace.batch_size,
+                      workspace.q8_scratch,
+                      workspace.q8_0_scratch,
+                      workspace.mlp_out,
+                      LlamaGgufLinearOp::w_down,
+                      hotspots,
+                      options,
+                      worker_pool);
+    for (std::size_t batch = 0; batch < workspace.batch_size; ++batch) {
+        add_inplace(mutable_row_span(workspace.hidden, batch, hidden_size),
+                    mutable_row_span(workspace.mlp_out, batch, hidden_size));
+    }
+}
+
 [[nodiscard]] std::int32_t predict_next_token(const LlamaGgufModel& model,
                                               std::span<const float> final_hidden,
                                               LlamaGgufHotspotReport& hotspots,
@@ -1062,6 +1811,20 @@ void forward_llama_layer(const DecoderConfig& config,
     const DecoderConfig& config = model.decoder.config;
     F32RowMax best;
     if (model.lm_head_tied_to_embedding) {
+        if (model.decoder.tied_lm_head.storage == LlamaGgufLinearStorage::q8_0_direct) {
+            const std::vector<Q8_0InputBlock> final_hidden_q8_0 =
+                quantize_q8_0_input(final_hidden);
+            const double elapsed = measure_ms([&]() {
+                best = max_dot_ggml_quantized_q8_0_parallel(model.decoder.tied_lm_head,
+                                                            final_hidden_q8_0,
+                                                            options,
+                                                            worker_pool);
+            });
+            hotspots.q8_0_direct_ms += elapsed;
+            ++hotspots.q8_0_direct_calls;
+            hotspots.lm_head_ms += elapsed;
+            return static_cast<std::int32_t>(best.row);
+        }
         const std::span<const float> weights = model.decoder.token_embedding;
         const std::size_t hidden_size = checked_size(config.hidden_size, "hidden_size");
         const std::size_t vocab_size = checked_size(config.vocab_size, "vocab_size");
@@ -1082,7 +1845,7 @@ void forward_llama_layer(const DecoderConfig& config,
             ? quantize_q8_k_input(final_hidden)
             : std::vector<Q8KBlock>{};
     const std::vector<Q8_0InputBlock> final_hidden_q8_0 =
-        uses_ggml_direct(model.decoder.lm_head)
+        uses_q8_0_activation_direct(model.decoder.lm_head)
             ? quantize_q8_0_input(final_hidden)
             : std::vector<Q8_0InputBlock>{};
     linear_gguf(model.decoder.lm_head,
@@ -1144,6 +1907,56 @@ void forward_llama_layer(const DecoderConfig& config,
     }
     hotspots.rms_norm_ms += measure_ms([&]() {
         rms_norm(workspace.hidden,
+                 model.decoder.final_norm_weight,
+                 active_config.rms_epsilon,
+                 workspace.final_norm);
+    });
+    return predict_next_token(model, workspace.final_norm, hotspots, options, worker_pool);
+}
+
+[[nodiscard]] std::int32_t prefill_llama_decoder_batch(const LlamaGgufModel& model,
+                                                       const DecoderConfig& active_config,
+                                                       ReferenceKVCache& cache,
+                                                       std::span<const std::int32_t> prompt_ids,
+                                                       LlamaGgufHotspotReport& hotspots,
+                                                       const LlamaGgufExecutionOptions& options,
+                                                       LlamaParallelWorkerPool* worker_pool) {
+    const DecoderConfig& original_config = model.decoder.config;
+    const std::size_t batch_size = prompt_ids.size();
+    const std::size_t hidden_size = checked_size(original_config.hidden_size, "hidden_size");
+    LlamaBatchWorkspace workspace(active_config, batch_size);
+    for (std::size_t batch = 0; batch < batch_size; ++batch) {
+        const std::int32_t token_id = prompt_ids[batch];
+        if (token_id < 0 || token_id >= original_config.vocab_size) {
+            throw std::runtime_error("LLaMA token id out of vocabulary");
+        }
+        const std::span<const float> embedding =
+            row_span(model.decoder.token_embedding, token_id, original_config.hidden_size);
+        std::copy(embedding.begin(),
+                  embedding.end(),
+                  workspace.hidden.begin() + static_cast<std::ptrdiff_t>(batch * hidden_size));
+    }
+
+    const std::int32_t position_begin = cache.filled_tokens();
+    if (position_begin + static_cast<std::int32_t>(batch_size) > active_config.max_context) {
+        throw std::runtime_error("LLaMA generation exceeded active context");
+    }
+    for (std::int32_t layer_id = 0;
+         layer_id < static_cast<std::int32_t>(model.decoder.layers.size());
+         ++layer_id) {
+        forward_llama_layer_prefill_batch(active_config,
+                                          model.decoder.layers[checked_size(layer_id,
+                                                                            "layer_id")],
+                                          layer_id,
+                                          position_begin,
+                                          cache,
+                                          workspace,
+                                          hotspots,
+                                          options,
+                                          worker_pool);
+    }
+    hotspots.rms_norm_ms += measure_ms([&]() {
+        rms_norm(mutable_row_span(workspace.hidden, batch_size - 1U, hidden_size),
                  model.decoder.final_norm_weight,
                  active_config.rms_epsilon,
                  workspace.final_norm);
@@ -1361,6 +2174,12 @@ LlamaGgufLoadedModel load_llama_gguf_reference_model(const std::filesystem::path
         loaded.model.lm_head_tied_to_embedding = true;
         loaded.model.decoder.lm_head.input_size = config.hidden_size;
         loaded.model.decoder.lm_head.output_size = config.vocab_size;
+        loaded.model.decoder.tied_lm_head =
+            make_tied_lm_head_from_embedding(gguf_path,
+                                             manifest,
+                                             config.hidden_size,
+                                             config.vocab_size,
+                                             loaded.report);
     }
     loaded.report.weights_ms = elapsed_ms(weights_begin, Clock::now());
     return loaded;
@@ -1448,26 +2267,37 @@ LlamaGgufGenerationResult llama_gguf_generate_greedy(
     }
 
     const Clock::time_point prefill_begin = Clock::now();
-    for (std::size_t index = 0; index + 1 < prompt_ids.size(); ++index) {
-        static_cast<void>(step_llama_decoder(model,
-                                             active_config,
-                                             cache,
-                                             workspace,
-                                             prompt_ids[index],
-                                             false,
-                                             result.hotspots,
-                                             options,
-                                             worker_pool.get()));
-    }
-    std::int32_t predicted = step_llama_decoder(model,
+    std::int32_t predicted = -1;
+    if (batch_prefill_enabled() && prompt_ids.size() > 1U) {
+        predicted = prefill_llama_decoder_batch(model,
                                                 active_config,
                                                 cache,
-                                                workspace,
-                                                prompt_ids.back(),
-                                                true,
+                                                prompt_ids,
                                                 result.hotspots,
                                                 options,
                                                 worker_pool.get());
+    } else {
+        for (std::size_t index = 0; index + 1 < prompt_ids.size(); ++index) {
+            static_cast<void>(step_llama_decoder(model,
+                                                 active_config,
+                                                 cache,
+                                                 workspace,
+                                                 prompt_ids[index],
+                                                 false,
+                                                 result.hotspots,
+                                                 options,
+                                                 worker_pool.get()));
+        }
+        predicted = step_llama_decoder(model,
+                                       active_config,
+                                       cache,
+                                       workspace,
+                                       prompt_ids.back(),
+                                       true,
+                                       result.hotspots,
+                                       options,
+                                       worker_pool.get());
+    }
     result.predicted_first_token = predicted;
     result.prefill_steps = prompt_ids.size();
     result.prefill_ms = elapsed_ms(prefill_begin, Clock::now());

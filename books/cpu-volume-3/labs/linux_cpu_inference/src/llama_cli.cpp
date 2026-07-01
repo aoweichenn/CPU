@@ -19,7 +19,14 @@ constexpr std::string_view LCQI_LLAMA_PROMPT_PREFIX = "--prompt=";
 constexpr std::string_view LCQI_LLAMA_MAX_NEW_PREFIX = "--max-new=";
 constexpr std::string_view LCQI_LLAMA_THREADS_PREFIX = "--threads=";
 constexpr const char* LCQI_LLAMA_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT";
+constexpr const char* LCQI_LLAMA_Q5_0_PACKED_ENV = "LCQI_LLAMA_Q5_0_PACKED";
+constexpr const char* LCQI_LLAMA_Q6_K_DIRECT_ENV = "LCQI_LLAMA_Q6_K_DIRECT";
+constexpr const char* LCQI_LLAMA_Q8_0_DIRECT_ENV = "LCQI_LLAMA_Q8_0_DIRECT";
+constexpr const char* LCQI_LLAMA_Q8_0_TIED_LM_HEAD_ENV =
+    "LCQI_LLAMA_Q8_0_TIED_LM_HEAD";
 constexpr const char* LCQI_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
+constexpr const char* LCQI_LLAMA_GGML_SELECTIVE_DIRECT_ENV =
+    "LCQI_LLAMA_GGML_SELECTIVE_DIRECT";
 constexpr std::string_view LCQI_LLAMA_FALSE_ENV = "0";
 constexpr std::string_view LCQI_LLAMA_TRUE_ENV = "1";
 
@@ -192,9 +199,23 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
               << loaded.report.direct_quantized_weight_bytes << "\n";
     std::cout << "benchmark_fallback_dequantized_weight_bytes "
               << loaded.report.fallback_dequantized_weight_bytes << "\n";
+    std::cout << "benchmark_q5_0_packed_weight_bytes "
+              << loaded.report.q5_0_packed_weight_bytes << "\n";
+    std::cout << "benchmark_q5_0_batch_f32_weight_bytes "
+              << loaded.report.q5_0_batch_f32_weight_bytes << "\n";
+    std::cout << "benchmark_q6_k_direct_weight_bytes "
+              << loaded.report.q6_k_direct_weight_bytes << "\n";
+    std::cout << "benchmark_q8_0_direct_weight_bytes "
+              << loaded.report.q8_0_direct_weight_bytes << "\n";
     std::cout << "benchmark_tensors_loaded " << loaded.report.tensors_loaded << "\n";
     std::cout << "benchmark_q4_k_direct_tensors "
               << loaded.report.q4_k_direct_tensors << "\n";
+    std::cout << "benchmark_q5_0_packed_tensors "
+              << loaded.report.q5_0_packed_tensors << "\n";
+    std::cout << "benchmark_q6_k_direct_tensors "
+              << loaded.report.q6_k_direct_tensors << "\n";
+    std::cout << "benchmark_q8_0_direct_tensors "
+              << loaded.report.q8_0_direct_tensors << "\n";
     std::cout << "benchmark_ggml_direct_tensors "
               << loaded.report.ggml_direct_tensors << "\n";
     std::cout << "benchmark_f32_fallback_tensors "
@@ -212,12 +233,28 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
     std::cout << "benchmark_hotspot_lm_head_ms " << result.hotspots.lm_head_ms << "\n";
     std::cout << "benchmark_hotspot_q4_k_direct_ms "
               << result.hotspots.q4_k_direct_ms << "\n";
+    std::cout << "benchmark_hotspot_q5_0_packed_ms "
+              << result.hotspots.q5_0_packed_ms << "\n";
+    std::cout << "benchmark_hotspot_q5_0_batch_f32_ms "
+              << result.hotspots.q5_0_batch_f32_ms << "\n";
+    std::cout << "benchmark_hotspot_q6_k_direct_ms "
+              << result.hotspots.q6_k_direct_ms << "\n";
+    std::cout << "benchmark_hotspot_q8_0_direct_ms "
+              << result.hotspots.q8_0_direct_ms << "\n";
     std::cout << "benchmark_hotspot_ggml_direct_ms "
               << result.hotspots.ggml_direct_ms << "\n";
     std::cout << "benchmark_hotspot_f32_fallback_ms "
               << result.hotspots.f32_fallback_ms << "\n";
     std::cout << "benchmark_hotspot_q4_k_direct_calls "
               << result.hotspots.q4_k_direct_calls << "\n";
+    std::cout << "benchmark_hotspot_q5_0_packed_calls "
+              << result.hotspots.q5_0_packed_calls << "\n";
+    std::cout << "benchmark_hotspot_q5_0_batch_f32_calls "
+              << result.hotspots.q5_0_batch_f32_calls << "\n";
+    std::cout << "benchmark_hotspot_q6_k_direct_calls "
+              << result.hotspots.q6_k_direct_calls << "\n";
+    std::cout << "benchmark_hotspot_q8_0_direct_calls "
+              << result.hotspots.q8_0_direct_calls << "\n";
     std::cout << "benchmark_hotspot_ggml_direct_calls "
               << result.hotspots.ggml_direct_calls << "\n";
     std::cout << "benchmark_hotspot_f32_fallback_calls "
@@ -229,8 +266,33 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
     return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
 }
 
+[[nodiscard]] bool q5_0_packed_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q5_0_PACKED_ENV);
+    return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
+[[nodiscard]] bool q6_k_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q6_K_DIRECT_ENV);
+    return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
+}
+
+[[nodiscard]] bool q8_0_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q8_0_DIRECT_ENV);
+    return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
+[[nodiscard]] bool q8_0_tied_lm_head_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_Q8_0_TIED_LM_HEAD_ENV);
+    return enabled == nullptr || std::string_view(enabled) != LCQI_LLAMA_FALSE_ENV;
+}
+
 [[nodiscard]] bool ggml_direct_enabled() noexcept {
     const char* enabled = std::getenv(LCQI_LLAMA_GGML_DIRECT_ENV);
+    return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
+}
+
+[[nodiscard]] bool ggml_selective_direct_enabled() noexcept {
+    const char* enabled = std::getenv(LCQI_LLAMA_GGML_SELECTIVE_DIRECT_ENV);
     return enabled != nullptr && std::string_view(enabled) == LCQI_LLAMA_TRUE_ENV;
 }
 
@@ -238,8 +300,28 @@ void print_benchmark(const lcqi::LlamaGgufLoadedModel& loaded,
     if (ggml_direct_enabled()) {
         return "gguf_mixed_quantized_direct_experimental";
     }
-    if (!q4_direct_enabled()) {
+    if (ggml_selective_direct_enabled()) {
+        return "gguf_mixed_selective_ggml_direct";
+    }
+    if (q6_k_direct_enabled()) {
+        return "gguf_mixed_q4_k_q5_0_packed_q6_k_q8_0_direct_experimental";
+    }
+    if (!q4_direct_enabled() && !q5_0_packed_enabled() && !q8_0_direct_enabled() &&
+        !q8_0_tied_lm_head_enabled()) {
         return "f32_dequantized_reference";
+    }
+    if (q4_direct_enabled() && q5_0_packed_enabled() && q8_0_direct_enabled() &&
+        q8_0_tied_lm_head_enabled()) {
+        return "gguf_mixed_q4_k_q5_0_packed_q8_0_direct";
+    }
+    if (!q4_direct_enabled() && q5_0_packed_enabled()) {
+        return "gguf_mixed_q5_0_packed_direct";
+    }
+    if (q4_direct_enabled() && q5_0_packed_enabled() && q8_0_tied_lm_head_enabled()) {
+        return "gguf_mixed_q4_k_q5_0_packed_q8_0_lm_head_direct";
+    }
+    if (q4_direct_enabled() && q5_0_packed_enabled()) {
+        return "gguf_mixed_q4_k_q5_0_packed_direct";
     }
     return "gguf_mixed_q4_k_direct";
 }

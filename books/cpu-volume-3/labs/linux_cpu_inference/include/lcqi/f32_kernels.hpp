@@ -50,6 +50,36 @@ void linear_f32_rows_avx2_unchecked(const float* weights,
                                     std::size_t row_end,
                                     float* output) noexcept;
 
+void linear_f32_batch_rows_scalar_unchecked(const float* weights,
+                                            const float* input,
+                                            const float* bias,
+                                            std::size_t input_size,
+                                            std::size_t batch_size,
+                                            std::size_t row_begin,
+                                            std::size_t row_end,
+                                            std::size_t output_stride,
+                                            float* output) noexcept;
+
+void linear_f32_batch_rows_unchecked(const float* weights,
+                                     const float* input,
+                                     const float* bias,
+                                     std::size_t input_size,
+                                     std::size_t batch_size,
+                                     std::size_t row_begin,
+                                     std::size_t row_end,
+                                     std::size_t output_stride,
+                                     float* output) noexcept;
+
+void linear_f32_batch_rows_avx2_unchecked(const float* weights,
+                                          const float* input,
+                                          const float* bias,
+                                          std::size_t input_size,
+                                          std::size_t batch_size,
+                                          std::size_t row_begin,
+                                          std::size_t row_end,
+                                          std::size_t output_stride,
+                                          float* output) noexcept;
+
 [[nodiscard]] F32RowMax max_dot_f32_rows_scalar_unchecked(const float* weights,
                                                           const float* input,
                                                           std::size_t input_size,

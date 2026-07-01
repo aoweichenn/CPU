@@ -8,6 +8,7 @@ namespace {
 
 constexpr std::size_t LCQI_F32_AVX2_MIN_DOT_SIZE = 32;
 constexpr std::size_t LCQI_F32_AVX2_MIN_ROW_COUNT = 4;
+constexpr std::size_t LCQI_F32_AVX2_MIN_BATCH_SIZE = 2;
 
 }  // namespace
 
@@ -72,6 +73,60 @@ void linear_f32_rows_unchecked(const float* weights,
         return;
     }
     linear_f32_rows_scalar_unchecked(weights, input, bias, input_size, row_begin, row_end, output);
+}
+
+void linear_f32_batch_rows_scalar_unchecked(const float* weights,
+                                            const float* input,
+                                            const float* bias,
+                                            std::size_t input_size,
+                                            std::size_t batch_size,
+                                            std::size_t row_begin,
+                                            std::size_t row_end,
+                                            std::size_t output_stride,
+                                            float* output) noexcept {
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const float* weight_row = weights + row * input_size;
+        for (std::size_t batch = 0; batch < batch_size; ++batch) {
+            output[batch * output_stride + row] =
+                dot_f32_scalar_unchecked(weight_row, input + batch * input_size, input_size) +
+                (bias == nullptr ? 0.0F : bias[row]);
+        }
+    }
+}
+
+void linear_f32_batch_rows_unchecked(const float* weights,
+                                     const float* input,
+                                     const float* bias,
+                                     std::size_t input_size,
+                                     std::size_t batch_size,
+                                     std::size_t row_begin,
+                                     std::size_t row_end,
+                                     std::size_t output_stride,
+                                     float* output) noexcept {
+    static const bool AVX2_AVAILABLE = dot_f32_avx2_available();
+    if (AVX2_AVAILABLE && input_size >= LCQI_F32_AVX2_MIN_DOT_SIZE &&
+        batch_size >= LCQI_F32_AVX2_MIN_BATCH_SIZE &&
+        row_end - row_begin >= LCQI_F32_AVX2_MIN_ROW_COUNT) {
+        linear_f32_batch_rows_avx2_unchecked(weights,
+                                             input,
+                                             bias,
+                                             input_size,
+                                             batch_size,
+                                             row_begin,
+                                             row_end,
+                                             output_stride,
+                                             output);
+        return;
+    }
+    linear_f32_batch_rows_scalar_unchecked(weights,
+                                           input,
+                                           bias,
+                                           input_size,
+                                           batch_size,
+                                           row_begin,
+                                           row_end,
+                                           output_stride,
+                                           output);
 }
 
 F32RowMax max_dot_f32_rows_scalar_unchecked(const float* weights,
@@ -147,6 +202,26 @@ F32RowMax max_dot_f32_rows_avx2_unchecked(const float* weights,
                                           std::size_t row_begin,
                                           std::size_t row_end) noexcept {
     return max_dot_f32_rows_scalar_unchecked(weights, input, input_size, row_begin, row_end);
+}
+
+void linear_f32_batch_rows_avx2_unchecked(const float* weights,
+                                          const float* input,
+                                          const float* bias,
+                                          std::size_t input_size,
+                                          std::size_t batch_size,
+                                          std::size_t row_begin,
+                                          std::size_t row_end,
+                                          std::size_t output_stride,
+                                          float* output) noexcept {
+    linear_f32_batch_rows_scalar_unchecked(weights,
+                                           input,
+                                           bias,
+                                           input_size,
+                                           batch_size,
+                                           row_begin,
+                                           row_end,
+                                           output_stride,
+                                           output);
 }
 
 }  // namespace lcqi

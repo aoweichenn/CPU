@@ -11,6 +11,7 @@ add_library(lcqi STATIC
     src/llama_gguf.cpp
     src/model.cpp
     src/q4_k.cpp
+    src/q5_0_packed.cpp
     src/reference_decoder.cpp
     src/safetensors.cpp
     src/tokenizer.cpp
@@ -22,10 +23,12 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64|i[3-6]86")
         target_sources(lcqi PRIVATE src/ggml_matvec_avx2.cpp)
         target_sources(lcqi PRIVATE src/int8_kernels_avx2.cpp)
         target_sources(lcqi PRIVATE src/q4_k_avx2.cpp)
+        target_sources(lcqi PRIVATE src/q5_0_packed_avx2.cpp)
         set_source_files_properties(src/f32_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
         set_source_files_properties(src/ggml_matvec_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
         set_source_files_properties(src/int8_kernels_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
         set_source_files_properties(src/q4_k_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
+        set_source_files_properties(src/q5_0_packed_avx2.cpp PROPERTIES COMPILE_OPTIONS "-mavx2")
         target_compile_definitions(lcqi PRIVATE LCQI_ENABLE_AVX2=1)
     endif()
 endif()
