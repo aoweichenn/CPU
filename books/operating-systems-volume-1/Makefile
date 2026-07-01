@@ -2,7 +2,6 @@ BUILD_DIR ?= build
 LATEX_SOURCE_DIR := source/latex
 PHONE_EXPORT_ROOT ?= /mnt/sdcard/STU/BOOKS
 PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/操作系统第一册
-EPUB_BUILDER ?= $(LATEX_SOURCE_DIR)/scripts/build_epub.py
 CXX ?= g++
 CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -Werror
 LISTING_SOURCES := \
@@ -11,7 +10,7 @@ LISTING_SOURCES := \
 	$(LATEX_SOURCE_DIR)/listings/x86_64_page_fault_cow_model.cpp \
 	$(LATEX_SOURCE_DIR)/listings/os_reference_implementation.cpp
 
-.PHONY: check test pdf epub phone-export clean
+.PHONY: check test pdf phone-export clean
 
 check: test
 	python3 $(LATEX_SOURCE_DIR)/scripts/check_inputs.py
@@ -31,16 +30,9 @@ test:
 pdf: check
 	cd $(LATEX_SOURCE_DIR) && latexmk -xelatex -interaction=nonstopmode -halt-on-error main.tex
 
-epub: check
-	@BOOK_TITLE="操作系统第一册" \
-	BOOK_SUBTITLE="从计算机组成原理到内核对象、并发控制、内存、I/O、网络入口与恢复" \
-	BOOK_AUTHOR="CPU Books" \
-	python3 $(EPUB_BUILDER) --book-dir $(LATEX_SOURCE_DIR) --output $(LATEX_SOURCE_DIR)/main.epub
-
-phone-export: pdf epub
-	python3 ../../tools/export_book.py --source $(LATEX_SOURCE_DIR) --dest "$(PHONE_EXPORT_DIR)" --pdf-name "操作系统第一册" --epub-name "操作系统第一册"
+phone-export: pdf
+	python3 ../../tools/export_book.py --source $(LATEX_SOURCE_DIR) --dest "$(PHONE_EXPORT_DIR)" --pdf-name "操作系统第一册"
 
 clean:
 	rm -rf $(BUILD_DIR)
 	cd $(LATEX_SOURCE_DIR) && latexmk -C
-	rm -f $(LATEX_SOURCE_DIR)/main.epub

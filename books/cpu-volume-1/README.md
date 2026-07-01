@@ -5,7 +5,7 @@
 ## 目录结构
 
 ```text
-source/latex/      # 正式 LaTeX 书稿，生成 main.pdf 和 main.epub
+source/latex/      # 正式 LaTeX 书稿，生成 main.pdf
 materials/drafts/  # Markdown 草稿和旧章节素材
 materials/         # 16 周计划、长期路线和参考材料
 labs/              # C++ 实验
@@ -19,16 +19,14 @@ tools/             # 本书脚本
 ```bash
 make check
 make pdf
-make epub
 make text-target
 ```
 
 生成文件位置：
 
 - `source/latex/main.pdf`
-- `source/latex/main.epub`
 
-正式排版规则、字体、目录策略、EPUB 生成方式见 `source/latex/README.md`。
+正式排版规则、字体和目录策略见 `source/latex/README.md`。
 
 ## 运行实验
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export one book as one title-named PDF and one title-named EPUB."""
+"""Export one book as one title-named PDF."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ import shutil
 from pathlib import Path
 
 
-SOURCE_FILES = ("main.pdf", "main.epub")
+SOURCE_FILE = "main.pdf"
 ALLOWED_EXPORT_ROOTS = (
     Path("book-exports"),
     Path("/mnt/sdcard/STU/BOOKS"),
@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--dest", required=True, type=Path)
     parser.add_argument("--pdf-name", required=True)
-    parser.add_argument("--epub-name", required=True)
+    parser.add_argument("--epub-name", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -56,31 +56,26 @@ def clean_dest(dest: Path) -> None:
             child.unlink()
 
 
-def export_book(source: Path, dest: Path, pdf_name: str, epub_name: str) -> None:
+def export_book(source: Path, dest: Path, pdf_name: str) -> None:
     validate_export_name(pdf_name, "PDF")
-    validate_export_name(epub_name, "EPUB")
-    missing = [source_file for source_file in SOURCE_FILES if not (source / source_file).is_file()]
-    if missing:
-        raise SystemExit(f"missing build artifacts in {source}: {', '.join(missing)}")
+    if not (source / SOURCE_FILE).is_file():
+        raise SystemExit(f"missing build artifact in {source}: {SOURCE_FILE}")
 
     clean_dest(dest)
-    output_files = (f"{pdf_name}.pdf", f"{epub_name}.epub")
-    copy_pairs = zip(SOURCE_FILES, output_files, strict=True)
-    for source_file, output_file in copy_pairs:
-        shutil.copy2(source / source_file, dest / output_file)
+    output_file = f"{pdf_name}.pdf"
+    shutil.copy2(source / SOURCE_FILE, dest / output_file)
 
     exported = sorted(path.name for path in dest.iterdir() if path.is_file())
-    expected = sorted(output_files)
+    expected = [output_file]
     if exported != expected:
         raise SystemExit(f"unexpected export contents in {dest}: {exported}")
 
-    for output_file in output_files:
-        print(dest / output_file)
+    print(dest / output_file)
 
 
 def main() -> int:
     args = parse_args()
-    export_book(args.source, args.dest, args.pdf_name, args.epub_name)
+    export_book(args.source, args.dest, args.pdf_name)
     return 0
 
 

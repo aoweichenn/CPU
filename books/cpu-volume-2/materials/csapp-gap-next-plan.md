@@ -279,7 +279,7 @@ C++ semantics -> assembly/machine shape -> hardware/runtime/distributed structur
 -> evidence/experiment -> engineering boundary
 ```
 
-- Keep generated PDF/EPUB valid after every meaningful expansion.
+- Keep generated PDF valid after every meaningful expansion.
 - Export final artifacts to:
 
 ```text

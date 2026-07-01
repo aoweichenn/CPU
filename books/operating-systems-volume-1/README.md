@@ -11,6 +11,5 @@
 ```bash
 make check
 make pdf
-make epub
 make phone-export
 ```

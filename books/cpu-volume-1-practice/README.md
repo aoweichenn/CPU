@@ -26,7 +26,6 @@ ctest --test-dir books/cpu-volume-1-practice/build/executable-evidence-debug \
 
 ```bash
 make -C books/cpu-volume-1-practice pdf
-make -C books/cpu-volume-1-practice epub
 ```
 
 ## 运行 CLI

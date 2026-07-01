@@ -236,7 +236,7 @@ ch00 有 11 个子节共 3289 行，其中：
 
 （五）导出流程 📌待做
 - Makefile 加 os-check / os-test 目标
-- 生成 EPUB（build_epub.py 已写但未接入）
+- 只生成 PDF，旧 EPUB 构建入口已移除
 - 接入 books-export 和 phone-books-export
 - PDF 从 build/ 移到 source/latex/
 

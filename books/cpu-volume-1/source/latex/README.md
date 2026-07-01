@@ -30,7 +30,6 @@ latexmk -xelatex -interaction=nonstopmode main.tex
 cd books/cpu-volume-1/source/latex
 make check
 make pdf
-make epub
 ```
 
 清理：
@@ -62,7 +61,7 @@ source/latex/
 - 提示、误区、深入理解等块使用黑灰教材风格，不使用彩色网页卡片。
 - 实验和习题块使用白底左线式材料块，避免大面积灰底和框套框。
 - 代码清单使用 Maple Mono NL NF CN，保持等宽缩进、细线分隔和长行换行标记。
-- EPUB 由 `scripts/build_epub.py` 从正式 LaTeX 源生成，导航只保留前置内容、部、章、附录和术语表，适合移动端阅读；默认使用微信读书兼容模式，不嵌入本地字体文件。
+- 正式交付只生成 PDF；手机阅读和归档导出均使用同一份 PDF。
 
 ## 写作规则
 

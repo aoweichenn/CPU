@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Organize phone book exports without duplicating PDF/EPUB files."""
+"""Organize phone book exports without duplicating PDF files."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 
 
 PHONE_EXPORT_ROOT = Path("/mnt/sdcard/STU/BOOKS")
-PDF_EPUB_SUFFIXES = {".pdf", ".epub"}
-PHONE_STALE_TEXT_SUFFIXES = {".md", ".txt"}
+PDF_SUFFIXES = {".pdf"}
+PHONE_STALE_FILE_SUFFIXES = {".epub", ".md", ".txt"}
 HYPHEN_LIKE_CHARS = ("-", "‐", "‑", "‒", "–", "—", "―", "－", "−")
 
 
@@ -82,7 +82,7 @@ def ensure_safe_title(title: str) -> None:
 
 
 def ensure_expected_book_files(book_dir: Path, title: str) -> None:
-    expected_names = {f"{title}.pdf", f"{title}.epub"}
+    expected_names = {f"{title}.pdf"}
     existing_files = [path for path in book_dir.iterdir() if path.is_file()]
     existing_names = {path.name for path in existing_files}
     missing = sorted(expected_names - existing_names)
@@ -104,7 +104,7 @@ def ensure_expected_book_files(book_dir: Path, title: str) -> None:
 
 
 def compare_book_dirs(left: Path, right: Path, title: str) -> bool:
-    for suffix in (".pdf", ".epub"):
+    for suffix in (".pdf",):
         left_file = left / f"{title}{suffix}"
         right_file = right / f"{title}{suffix}"
         if not left_file.is_file() or not right_file.is_file():
@@ -143,7 +143,7 @@ def clean_index_trees(root: Path) -> None:
         if path.exists():
             shutil.rmtree(path)
     for path in root.rglob("*"):
-        if path.is_file() and path.suffix.lower() in PHONE_STALE_TEXT_SUFFIXES:
+        if path.is_file() and path.suffix.lower() in PHONE_STALE_FILE_SUFFIXES:
             path.unlink()
 
 
@@ -168,11 +168,11 @@ def ensure_no_duplicate_exports(root: Path) -> None:
             raise SystemExit(f"legacy top-level book directory still exists: {legacy_dir}")
 
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in PDF_EPUB_SUFFIXES:
+        if not path.is_file() or path.suffix.lower() not in PDF_SUFFIXES:
             continue
         parent = path.parent.resolve()
         if parent not in allowed_book_dirs:
-            raise SystemExit(f"unexpected PDF/EPUB outside canonical book dirs: {path}")
+            raise SystemExit(f"unexpected PDF outside canonical book dirs: {path}")
 
 
 def main() -> int:

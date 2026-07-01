@@ -7,7 +7,6 @@
 ```bash
 make check
 make pdf
-make epub
 ```
 
 正式 LaTeX 工程位于 `source/latex`。导出到手机时使用 `Cpp从零到高级` 作为目录和文件名，避免 `+`、短横线和空格影响微信读书识别。

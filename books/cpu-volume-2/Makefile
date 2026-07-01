@@ -1,17 +1,14 @@
 LATEX_DIR := source/latex
 
-.PHONY: all check pdf epub text-count text-count-chapters text-target clean
+.PHONY: all check pdf text-count text-count-chapters text-target clean
 
-all: pdf epub
+all: pdf
 
 check:
 	$(MAKE) -C $(LATEX_DIR) check
 
 pdf:
 	$(MAKE) -C $(LATEX_DIR) pdf
-
-epub:
-	$(MAKE) -C $(LATEX_DIR) epub
 
 text-count:
 	$(MAKE) -C $(LATEX_DIR) text-count
