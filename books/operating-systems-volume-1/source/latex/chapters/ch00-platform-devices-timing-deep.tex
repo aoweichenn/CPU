@@ -1,0 +1,442 @@
+\section{硬件平台机制深讲：不止 cache}
+
+前面已经讲了 cache、TLB、DMA、MMIO 和 descriptor ring，但一台机器不只靠这些对象运行。很多操作系统 bug 来自更外围的硬件事实：寄存器位有清除语义，中断有 mask 和 in-service 状态，定时器有 deadline 和漂移，USB 有主机控制器调度，网卡有 RX refill，SSD 有 FTL 和 volatile write cache，显示有 scanout deadline，音频有周期中断，固件表决定资源边界，TPM/IOMMU/BMC 决定安全边界。
+
+本节把这些机制按“硬件状态机 \(\rightarrow\) OS 对象 \(\rightarrow\) 不变量 \(\rightarrow\) 故障证据”补齐。读者遇到任何新硬件，都应该先问四件事：
+
+\[
+\begin{aligned}
+state &= \{registers,\ queues,\ buffers,\ clocks,\ power,\ errors\},\\
+event &= interrupt \lor poll \lor timeout \lor fault,\\
+ownership &= CPU \lor device \lor firmware \lor user,\\
+commit &= visible\ to\ caller \land recoverable\ after\ failure.
+\end{aligned}
+\]
+
+\subsection{硬件接口的三种形态}
+
+OS 看到硬件，通常不是直接看到电路，而是看到三类接口：寄存器、共享内存队列和异步事件。寄存器用于控制和状态；共享内存队列用于批量提交工作；异步事件用于告诉 CPU “某个状态变了”。三者组合起来，才是一台现代设备的完整接口。
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
+\toprule
+接口 & 硬件含义 & OS 必须维护的事实 \\
+\midrule
+control reg & 配置模式、启动/停止、mask、reset & 写入顺序、位语义、访问宽度和电源状态 \\
+status reg & busy、ready、error、cause、pending & 读取是否有副作用，清除是否需要特定写法 \\
+shared ring & CPU 和设备共享 descriptor/completion & head/tail、所有权、屏障、DMA 映射生命周期 \\
+IRQ/event & 设备、定时器或 CPU 间消息 & mask、ack、EOI、亲和性、丢失和合并 \\
+firmware & 描述硬件拓扑和资源 & 内存地图、IRQ、NUMA、ACPI 方法、保留区 \\
+\bottomrule
+\end{longtable}
+
+许多错误来自把一种接口当成另一种接口。MMIO status 不是普通变量，因为读它可能清除 pending 位；descriptor 不是寄存器，因为设备通过 DMA 异步读取它；中断不是函数调用，因为它可以被 mask、合并、重定向，也可能在状态尚未处理完时再次到来。
+
+\subsection{寄存器位语义：读写不是普通赋值}
+
+设备寄存器的每一位都可能有专门语义。普通内存里 \code{x = 1} 表示写入值 1；MMIO 寄存器里写 1 可能表示置位、清除、触发、门铃、解锁或无效。读寄存器也可能改变设备状态。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+位语义 & 例子 & 驱动错误 \\
+\midrule
+RW & 普通可读写配置位 & read-modify-write 未加锁，覆盖别的位 \\
+W1C & write one to clear 错误/中断原因 & 写回整寄存器时误清其他 pending 位 \\
+RO sticky & 错误发生后保持到 reset 或清除 & 只看瞬时状态，漏掉历史故障 \\
+RC & read to clear & 调试打印读一次就把事件清掉 \\
+WO trigger & 写入触发动作，如 doorbell/reset & 重复写导致重复提交或误 reset \\
+self clearing & 写 1 后硬件完成时自动清 0 & 轮询必须有超时，不能无限等 \\
+\bottomrule
+\end{longtable}
+
+正确驱动不会用“把结构体映射到寄存器地址然后随便赋值”的方式控制设备。它要知道每个寄存器的访问宽度、对齐、端序、副作用和顺序要求。尤其是 W1C 位，常见错误是：
+
+\begin{lstlisting}
+wrong:
+  v = readl(STATUS)
+  v &= ~ERROR_BIT
+  writel(v, STATUS)      // may clear unrelated W1C bits
+
+right:
+  writel(ERROR_BIT, STATUS_W1C)
+\end{lstlisting}
+
+寄存器访问的不变量可以写成：
+
+\[
+\begin{aligned}
+valid\_mmio\_write
+&\Leftarrow device=powered \land clock=enabled\\
+&\land reset=deasserted \land width=specified\\
+&\land side\_effect=understood.
+\end{aligned}
+\]
+
+这条式子解释了为什么驱动 probe、resume、reset path 都要重复配置寄存器。设备断电或 reset 后，寄存器不是“仍然保存上次值”的 C++ 对象，而是回到硬件定义的初始状态。
+
+\subsection{中断路径：从设备 cause 到内核 handler}
+
+中断不是“设备调用内核函数”。更准确地说，设备先把内部 cause 位置位；若没有被 mask，就通过引脚、MSI 或 MSI-X 把事件投递到中断控制器；APIC 记录 pending；CPU 在可中断边界接受 vector；硬件切到内核入口；内核保存现场、查 IDT、运行 handler；最后确认设备状态和 APIC in-service 状态。
+
+\begin{pdfdiagram}[x=0.92cm,y=1cm]
+  \node[os state, minimum width=1.55cm] (cause) at (0,0) {device\\cause};
+  \node[os control, minimum width=1.35cm] (mask) at (1.9,0) {mask};
+  \node[os block, minimum width=1.6cm] (msix) at (3.8,0) {MSI-X\\message};
+  \node[os control, minimum width=1.55cm] (apic) at (5.9,0) {local APIC\\IRR/ISR};
+  \node[os compute, minimum width=1.55cm] (cpu) at (8.0,0) {CPU\\trap entry};
+  \node[os control, minimum width=1.55cm] (idt) at (10.05,0) {IDT\\vector};
+  \node[os state, minimum width=1.75cm] (handler) at (12.2,0) {handler\\thread/poll};
+
+  \draw[os strong bus] (cause) -- (mask);
+  \draw[os strong bus] (mask) -- (msix);
+  \draw[os strong bus] (msix) -- (apic);
+  \draw[os strong bus] (apic) -- (cpu);
+  \draw[os strong bus] (cpu) -- (idt);
+  \draw[os strong bus] (idt) -- (handler);
+  \draw[os feedback] (handler.south) .. controls +(0,-1.05) and +(0,-1.05) .. node[os label, below] {clear cause + EOI} (cause.south);
+\end{pdfdiagram}
+\diagramnote{中断的完整路径。设备 cause、MSI-X、APIC IRR/ISR、IDT 和 handler 各有独立状态，不能只用“中断来了”概括。}
+
+中断确认顺序必须和设备协议匹配。若设备采用 level-triggered 或“状态未清就会再次触发”的模型，handler 需要先处理或清除设备 cause，再向 APIC 发送 EOI：
+
+\[
+clear(device\_cause)\ \prec\ EOI(APIC)
+\]
+
+如果先 EOI，APIC 可能立即接受同一个仍然 pending 的事件，造成中断风暴；如果只 EOI 不清设备 cause，CPU 会反复进入 handler；如果只清设备 cause 不读 completion ring，可能丢掉真实完成。正确 handler 一般是状态驱动的：
+
+\begin{lstlisting}
+irq_handler(vector):
+  reason = read_device_status()
+  if reason has completions:
+    disable_or_mask_device_irq_if_polling()
+    schedule_poll()
+  if reason has errors:
+    record error and start recovery
+  clear_device_interrupt_cause(reason)
+  send_EOI_to_local_APIC()
+\end{lstlisting}
+
+\subsection{APIC、IPI 和多核控制}
+
+x86-64 多核系统里，每个 CPU 有 local APIC。设备中断可以通过 IOAPIC 或 MSI/MSI-X 路由到某个 CPU；CPU 也可以向其他 CPU 发送 IPI。IPI 不是普通消息队列，它会打断目标 CPU 的执行，用于 TLB shootdown、reschedule、stop-machine、多核启动等强控制路径。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+APIC 相关状态 & 作用 & OS 后果 \\
+\midrule
+IRR & 已到达但尚未服务的 vector & 中断可能排队，不是实时函数调用 \\
+ISR & 正在服务的 vector & EOI 过早或过晚都会影响再次投递 \\
+TPR/priority & 屏蔽低优先级中断 & 过度屏蔽会增加延迟 \\
+MSI-X affinity & 队列 vector 绑定到 CPU & 网络/块设备队列和 NUMA 局部性 \\
+IPI target & 目标 CPU 集合 & TLB shootdown 和 reschedule 成本随 CPU 数增加 \\
+\bottomrule
+\end{longtable}
+
+TLB shootdown 可以写成 IPI 协议：
+
+\[
+\begin{aligned}
+sender &: clear\ PTE,\ build\ cpu\_mask,\ send\ IPI,\\
+receiver &: enter\ vector,\ invalidate\ TLB,\ ack,\\
+sender &: wait(\forall cpu\in mask: ack),\ then\ free\ page.
+\end{aligned}
+\]
+
+这说明 shootdown 的成本不是一条 \code{invlpg}，而是跨 CPU 中断、远端停顿、确认等待和 TLB 热状态损失。进程越大、CPU 越多、页表修改越频繁，这条路径越容易成为瓶颈。
+
+\subsection{定时器：调度不是靠 while 循环抢时间}
+
+抢占式 OS 必须有硬件定时器。定时器的本质是比较“当前计数”和“目标 deadline”，到期后产生中断。x86-64 上常见时间相关硬件包括 TSC、local APIC timer、HPET、PIT、RTC 和设备自己的硬件 timestamp。OS 通常把它们分成两类：clocksource 提供“现在几点”，clockevent 提供“到点叫醒我”。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[os memory, minimum width=1.7cm] (tsc) at (0,0.6) {TSC\\clocksource};
+  \node[os compute, minimum width=1.7cm] (tk) at (2.3,0.6) {timekeeper\\ns};
+  \node[os state, minimum width=1.7cm] (hr) at (4.6,0.6) {hrtimer\\rb-tree};
+  \node[os control, minimum width=1.8cm] (lapic) at (6.95,0.6) {APIC timer\\deadline};
+  \node[os control, minimum width=1.7cm] (irq) at (9.25,0.6) {timer IRQ};
+  \node[os state, minimum width=1.7cm] (sched) at (11.45,0.6) {scheduler\\tick};
+
+  \draw[os strong bus] (tsc) -- (tk);
+  \draw[os bus] (tk) -- (hr);
+  \draw[os strong bus] (hr) -- (lapic);
+  \draw[os strong bus] (lapic) -- (irq);
+  \draw[os strong bus] (irq) -- (sched);
+  \node[os label] at (5.7,-0.55) {$deadline = now + \Delta t,\quad fired \Leftrightarrow counter \ge deadline$};
+\end{pdfdiagram}
+\diagramnote{时间系统分成“读当前时间”和“安排下一次中断”。调度 tick、超时、睡眠、网络重传和 I/O timeout 都依赖这条链。}
+
+系统里至少有三种时间语义：
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+时间 & 语义 & 常见用途 \\
+\midrule
+monotonic time & 单调递增，不受手动改时影响 & 超时、调度、性能测量 \\
+realtime wall clock & 人类日期时间，可被校准或修改 & 文件时间戳、日志、证书有效期 \\
+cycle counter & CPU 或平台计数器 & 精细性能测量、clocksource 原料 \\
+\bottomrule
+\end{longtable}
+
+定时器 bug 常表现为“任务睡不醒、超时过早、时钟跳变、CPU 空转、延迟尖峰”。调试时要分清：是 clocksource 不稳定，clockevent 没设置成功，定时器中断被屏蔽，还是 handler 运行太久。调度器的时间片不是抽象数字，它最终要落到硬件 deadline：
+
+\[
+preempt(current) \Leftarrow runtime(current) \ge slice(current)
+\land timer\_irq\ delivered.
+\]
+
+\subsection{轮询、中断合并和背压}
+
+高频 I/O 不能每个包或每个 completion 都触发一次中断。网卡、NVMe 和高速 USB 控制器会使用中断合并、批量 completion 和轮询。中断降低空闲延迟，轮询降低高负载开销，背压防止上层无限制提交。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+机制 & 解决什么 & 代价 \\
+\midrule
+每事件中断 & 空闲时低延迟 & 高负载下中断风暴 \\
+interrupt moderation & 合并多个完成再中断 & 增加单个请求尾延迟 \\
+poll budget & 一次 poll 处理有限数量事件 & 防止长期占用 CPU，但可能留下积压 \\
+queue depth & 限制 in-flight 请求数 & 过小浪费设备并行，过大增加排队延迟 \\
+backpressure & 告诉上层暂缓提交 & 需要把拥塞传播到 socket、bio 或应用 \\
+\bottomrule
+\end{longtable}
+
+用公式看更清楚：
+
+\[
+latency = queueing + service + interrupt\_delay + software\_dispatch.
+\]
+
+吞吐优化经常增加 \(queueing\) 或 \(interrupt\_delay\)，低延迟优化经常降低队列深度和合并窗口。OS 不是追求单一指标，而是根据负载选择中断、轮询、批处理和背压的平衡点。
+
+\subsection{USB：设备不是直接把字符交给进程}
+
+USB 是主机控制模型。键盘、鼠标、摄像头、U 盘和声卡都不是主动“调用进程”；主机控制器按调度读取或传输 endpoint，DMA 到内存，完成 URB，再由类驱动转换成 input、block、audio 或 video 对象。
+
+\begin{lstlisting}
+USB keyboard input:
+  xHCI schedules interrupt endpoint transfer
+  device returns HID report
+  host controller DMA writes transfer buffer
+  xHCI writes transfer event
+  MSI-X interrupt wakes USB core
+  HID driver parses key code
+  input subsystem publishes key event
+  tty or compositor consumes event
+\end{lstlisting}
+
+USB 插拔还引入枚举状态机：
+
+\[
+attached \rightarrow powered \rightarrow reset \rightarrow addressed
+\rightarrow configured \rightarrow driver\ bound.
+\]
+
+如果设备在 configured 后突然断开，所有 in-flight URB 都要失败并回收；如果用户进程还持有设备 fd，后续 read/write 要得到明确错误；如果断开时 DMA buffer 未撤销，驱动会留下内存生命周期 bug。热插拔能力越强，驱动状态机越不能只写初始化路径。
+
+\subsection{网卡收包：硬件队列、NAPI 和协议栈}
+
+网卡收包路径把多个硬件细节连接在一起：PHY/MAC 接收比特流，硬件校验帧，选择 RSS 队列，DMA 写入 RX buffer，写 completion，触发 MSI-X；内核用 NAPI poll 批量处理 packet，构造 skb，进入协议栈，最后唤醒 socket。
+
+\begin{pdfdiagram}[x=0.92cm,y=1cm]
+  \node[os block, minimum width=1.55cm] (wire) at (0,0) {wire\\frame};
+  \node[os block, minimum width=1.55cm] (mac) at (1.85,0) {PHY/MAC};
+  \node[os compute, minimum width=1.55cm] (rss) at (3.7,0) {RSS\\queue};
+  \node[os memory, minimum width=1.65cm] (rx) at (5.6,0) {RX buffer\\DMA};
+  \node[os state, minimum width=1.55cm] (cq) at (7.55,0) {CQE};
+  \node[os control, minimum width=1.55cm] (napi) at (9.4,0) {NAPI\\poll};
+  \node[os state, minimum width=1.55cm] (skb) at (11.3,0) {skb};
+  \node[os state, minimum width=1.55cm] (sock) at (13.2,0) {socket};
+
+  \draw[os strong bus] (wire) -- (mac);
+  \draw[os strong bus] (mac) -- (rss);
+  \draw[os strong bus] (rss) -- (rx);
+  \draw[os strong bus] (rx) -- (cq);
+  \draw[os strong bus] (cq) -- (napi);
+  \draw[os strong bus] (napi) -- (skb);
+  \draw[os strong bus] (skb) -- (sock);
+\end{pdfdiagram}
+\diagramnote{网卡收包不是“中断后 copy 到 socket”。它先是 DMA 和 completion，再由 NAPI、skb 和协议栈逐层提升语义。}
+
+这条路径里有几个关键不变量：
+
+\[
+\begin{aligned}
+RX\ buffer\ reusable &\Leftarrow packet\ consumed \land DMA\ unmapped\ or\ resynced,\\
+queue\ progress &\Leftarrow refill\ buffers \land update\ tail,\\
+socket\ delivery &\Leftarrow protocol\ accepts\ packet \land receive\ queue\ has\ space.
+\end{aligned}
+\]
+
+若 RX buffer refill 不及时，网卡会丢包；若 IRQ affinity 和应用 CPU 不匹配，cache line 在 CPU 间迁移；若 GRO 合并太激进，吞吐提高但尾延迟可能增加；若 socket receive queue 满了，背压或丢包会向上暴露。网络性能不是协议栈单独决定的，也由 DMA buffer、队列、亲和性和 cache line ownership 决定。
+
+\subsection{NVMe 和 SSD：completion 不等于持久化}
+
+NVMe 控制器用 submission queue 和 completion queue 工作。SSD 内部还有 NAND page、erase block、FTL 映射表、垃圾回收、磨损均衡、DRAM/SRAM 缓存和掉电保护。块 I/O completion 表示控制器处理了命令；文件系统的持久化还要看 flush、FUA、日志提交和设备是否真的把 volatile cache 推到稳定介质。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[os state, minimum width=1.55cm] (write) at (0,0) {write()};
+  \node[os memory, minimum width=1.75cm] (pc) at (2.0,0) {page cache\\dirty};
+  \node[os state, minimum width=1.55cm] (bio) at (4.1,0) {bio/request};
+  \node[os memory, minimum width=1.75cm] (nvme) at (6.25,0) {NVMe SQ\\DMA};
+  \node[os block, minimum width=1.75cm] (ssd) at (8.45,0) {SSD FTL\\cache};
+  \node[os block, minimum width=1.75cm] (nand) at (10.65,0) {NAND\\stable};
+  \node[os control, minimum width=1.55cm] (fsync) at (5.15,-1.35) {fsync\\flush/FUA};
+
+  \draw[os strong bus] (write) -- (pc);
+  \draw[os strong bus] (pc) -- (bio);
+  \draw[os strong bus] (bio) -- (nvme);
+  \draw[os strong bus] (nvme) -- (ssd);
+  \draw[os bus] (ssd) -- (nand);
+  \draw[os feedback] (fsync) -- (ssd);
+  \node[os label] at (5.6,0.78) {$write\ return \ne media\ persistent$};
+\end{pdfdiagram}
+\diagramnote{文件写入经历 page cache、块层、NVMe 队列、SSD 控制器和 NAND。只有具备 flush/FUA 与文件系统提交语义时，才能向应用承诺崩溃后存在。}
+
+持久化顺序可以写成：
+
+\[
+data\ blocks \prec journal\ commit \prec directory\ entry\ durable
+\]
+
+实际应用常用模式是：
+
+\begin{lstlisting}
+write temp file data
+fsync(temp file)
+rename temp file to final name
+fsync(parent directory)
+\end{lstlisting}
+
+这不是“保守写法”，而是在多层缓存和文件系统元数据之间建立 crash-consistency。SSD 有写缓存、FTL 重映射和垃圾回收；文件系统有 page cache、日志和目录项；应用如果只相信 \code{write} 返回，就把内存可见性误当成掉电持久性。
+
+\subsection{显示和 GPU：像素也有 deadline}
+
+显示系统不是把 framebuffer 写完就结束。显示控制器按刷新率持续 scanout，逐行从 framebuffer 或显存读像素，经 plane、scaler、composer、encoder 输出到 HDMI/DP/eDP 面板。GPU 渲染和显示 scanout 是两个异步时间线，需要 fence 和 vblank 同步。
+
+\begin{lstlisting}
+frame presentation:
+  application renders commands
+  GPU writes render target
+  fence signals rendering complete
+  compositor chooses buffers
+  atomic modeset updates plane at vblank
+  display engine scans out next frame
+\end{lstlisting}
+
+显示不变量：
+
+\[
+scanout(buffer)\Rightarrow render\_fence(buffer)=signaled
+\land buffer\ not\ freed\ until\ scanout\ done.
+\]
+
+如果违反它，用户看到的不是内核崩溃，而是撕裂、花屏、上一帧残影或随机闪烁。GPU hang recovery 也和块设备 reset 类似：停止提交，判断哪些 fence 永远不会 signal，重置硬件，把错误传播给进程或图形栈。
+
+\subsection{音频：环形缓冲区和实时约束}
+
+音频设备通常用 DMA 环形缓冲区。CPU 周期性填充播放 buffer，设备按采样率消耗；录音方向相反，设备写 buffer，CPU 消耗。这里的核心是 deadline：播放方向如果 CPU 填得太慢，就 underflow；录音方向如果 CPU 读得太慢，就 overflow。
+
+\[
+available\_playback\_time
+= \frac{frames\_queued}{sample\_rate}.
+\]
+
+如果队列里只剩 240 帧，采样率 48kHz，那么只剩 5ms。调度延迟、关中断时间、page fault、I/O 抖动都可能导致爆音。音频系统因此关心 pinned buffer、period interrupt、实时调度、功耗状态退出延迟和时钟同步。它不是“普通文件写入声卡”。
+
+\subsection{固件表：内核不是凭空知道硬件}
+
+x86-64 内核启动后，需要从 UEFI、ACPI、SMBIOS、MP table、PCIe 配置空间等来源获得硬件信息。固件告诉内核：哪些物理内存可用，哪些保留；CPU 和 APIC 如何编号；NUMA 距离如何；PCIe root complex 在哪里；设备中断和电源方法是什么。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+固件/表 & 提供什么 & 错误后果 \\
+\midrule
+UEFI memory map & RAM、保留区、ACPI、MMIO & 页分配器覆盖保留区或漏用内存 \\
+ACPI MADT & APIC、CPU、中断控制器 & CPU 启动失败、中断路由错 \\
+ACPI SRAT/SLIT & NUMA node 和距离 & 页放置、调度亲和性错误 \\
+ACPI DSDT/SSDT & 设备资源和电源方法 & 设备 probe、suspend/resume 失败 \\
+SMBIOS & 主板、DIMM、固件版本 & 运维诊断、ECC 错误定位 \\
+\bottomrule
+\end{longtable}
+
+固件是 OS 的输入，不是绝对真理。内核要处理固件 bug、保留区重叠、资源冲突、错误 ACPI 方法和设备 quirks。很多“驱动为什么有一堆特殊判断”的答案，是某些机器固件给出的硬件描述不完全符合规范。
+
+\subsection{TPM、Secure Boot、IOMMU 和 BMC：安全边界也是硬件}
+
+安全不是只靠内核权限检查。Secure Boot 让固件验证下一级启动组件；TPM 用 PCR 记录测量值并可封存密钥；IOMMU 限制设备 DMA；CPU 提供页表、NX、SMEP/SMAP、用户/内核特权；服务器 BMC 则是 OS 之外的独立管理计算机。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+硬件机制 & 保护对象 & 不能解决什么 \\
+\midrule
+Secure Boot & 启动链组件完整性 & 已启动内核里的逻辑漏洞 \\
+TPM PCR/sealing & 测量启动状态、保护密钥释放条件 & 不判断软件是否无 bug \\
+IOMMU & 设备 DMA 地址范围 & CPU 内核代码越权访问 \\
+SMEP/SMAP/NX & CPU 执行和访问权限 & 数据泄露侧信道和逻辑授权错误 \\
+BMC & 远程管理、传感器、复位控制 & 本身也是高权限攻击面 \\
+\bottomrule
+\end{longtable}
+
+一条安全不变量可以写成：
+
+\[
+secret\ release
+\Leftarrow
+PCRs=expected \land boot\ chain\ verified
+\land runtime\ policy\ allows.
+\]
+
+这解释了为什么磁盘加密、远程证明、内核 lockdown、设备直通和云主机隔离都要看硬件根。没有 IOMMU，恶意或失控设备可能 DMA 到任意内存；没有启动测量，密钥可能在未知内核上被释放；BMC 若被攻破，攻击者可能在 OS 之外重启、刷固件或读传感器。
+
+\subsection{硬件错误：超时、AER、MCE、NMI 和 watchdog}
+
+硬件失败不只是一句“设备坏了”。OS 要把不同错误归类为可重试、可隔离、可降级或必须 panic。PCIe AER 报告链路和事务错误；MCE 报告 CPU/内存机器检查；NMI 可用于不可屏蔽诊断；watchdog 负责发现系统长期不响应；thermal/throttling 表示硬件为了保护自己降低频率或关机。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+错误源 & 典型证据 & OS 策略 \\
+\midrule
+MMIO timeout & 轮询 ready 超时、读回无效 & reset 设备、下线驱动、返回 I/O error \\
+PCIe AER & corrected/non-fatal/fatal 计数和日志 & 记录、链路恢复、函数级 reset \\
+IOMMU fault & requester id、IOVA、权限错误 & 停止设备、定位坏 descriptor 或越权 DMA \\
+MCE/ECC & 物理地址、bank、syndrome & page offline、杀进程、panic \\
+watchdog & CPU 长时间不调度或不响应 IPI & dump stacks、panic、重启 \\
+thermal throttle & 频率下降、温度事件 & 降频、迁移负载、风扇策略 \\
+\bottomrule
+\end{longtable}
+
+错误处理也有提交边界。比如块设备写失败时，文件系统必须知道哪些 bio 失败，哪些 page 仍 dirty，哪些事务不能提交；网卡 reset 时，协议栈必须知道哪些 skb 已经发送、哪些要重试或丢弃；内存不可纠正错误如果落在匿名页，可杀进程，若落在内核关键结构，可能只能 panic。
+
+\subsection{把硬件讲清楚的检查表}
+
+以后书中出现任何硬件概念，都可以用这张表自检。如果某一行答不上来，说明概念还没讲清楚。
+
+\begin{longtable}{p{0.18\linewidth}p{0.74\linewidth}}
+\toprule
+问题 & 必须能回答 \\
+\midrule
+状态在哪里 & 寄存器、队列、buffer、PTE、TLB、APIC、firmware table 还是设备内部 SRAM \\
+谁拥有它 & CPU、设备、固件、用户进程、内核子系统还是远端 CPU \\
+怎么推进 & 时钟边沿、MMIO 写、DMA、doorbell、中断、轮询、timeout 还是 reset \\
+如何观察 & status register、completion、tracepoint、perf、dmesg、AER/MCE/IOMMU 日志 \\
+如何同步 & lock、屏障、DMA map/unmap、EOI、flush、fence、fsync、IPI \\
+失败怎么办 & 重试、回滚、杀进程、下线页、reset 设备、降级、panic 或报告给用户 \\
+\bottomrule
+\end{longtable}
+
+这张表比背术语重要。cache 只是其中一类状态；硬件平台还有时钟、复位、电源、固件、中断、设备队列、存储介质、安全根和错误通道。OS 之所以复杂，是因为它必须把所有这些异步状态机收敛成用户能理解的文件、进程、socket、时间、权限和错误码。
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能解释寄存器 W1C、read-to-clear、doorbell 和 status sticky 位的区别。
+\item 能画出 device cause、MSI-X、APIC、IDT、handler、EOI 的中断路径。
+\item 能区分 clocksource 与 clockevent，并说明 timer tick 怎样导致抢占。
+\item 能说明轮询、中断合并、队列深度和背压如何共同影响延迟与吞吐。
+\item 能把 USB 键盘输入、网卡收包、NVMe 写入、显示 scanout、音频 DMA 各自画成硬件到 OS 对象的路径。
+\item 能解释为什么 \code{write} 返回、块设备 completion、\code{fsync} 和掉电持久化不是同一个承诺。
+\item 能说明 UEFI/ACPI/SMBIOS 给内核提供哪些硬件事实，以及固件错误会造成什么后果。
+\item 能说明 TPM、Secure Boot、IOMMU、SMEP/SMAP/NX 和 BMC 各自保护或暴露的边界。
+\item 能根据 AER、IOMMU fault、MCE、watchdog 和 thermal 证据判断错误大致来自哪层硬件。
+\end{itemize}
+\end{rubricbox}

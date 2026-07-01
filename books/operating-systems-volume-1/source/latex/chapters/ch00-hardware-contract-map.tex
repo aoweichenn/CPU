@@ -1,0 +1,129 @@
+\section{硬件对象的统一读法：结构、时序、接口和 OS 后果}
+
+本书后面会反复出现 CPU、cache、TLB、DRAM、MMIO、DMA、IOMMU、APIC、NVMe、网卡、GPU、TPM、BMC 等硬件名词。只把它们列出来没有用。读硬件必须按一条固定路径拆：
+
+\[
+\text{下层物理结构}
+\rightarrow
+\text{内部状态机}
+\rightarrow
+\text{对上接口}
+\rightarrow
+\text{OS 契约}
+\rightarrow
+\text{失败证据}
+\]
+
+下层物理结构回答“它由什么构成”。内部状态机回答“它什么时候改变状态”。对上接口回答“CPU、设备或内核怎样和它说话”。OS 契约回答“内核可以依赖什么、不可以假设什么”。失败证据回答“出错时硬件留下哪个寄存器、状态位、中断、错误码或日志”。
+
+\begin{keyidea}
+不要问“cache 是什么”“DMA 是什么”这种孤立问题。要问：cache 的下层是 SRAM 和一致性互联，上层是 load/store 和内核数据结构；DMA 的下层是设备总线事务和内存控制器，上层是驱动描述符、IOMMU 映射和 completion。每个硬件对象都要这样贯通上下层。
+\end{keyidea}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[os control, minimum width=2.2cm] (isa) at (0,1.2) {ISA/ABI\\指令、寄存器、调用约定};
+  \node[os state, minimum width=2.2cm] (core) at (3.0,1.2) {CPU core\\流水线、ROB、执行单元};
+  \node[os memory, minimum width=2.2cm] (cache) at (6.0,1.2) {cache/TLB\\line、tag、PTE 副本};
+  \node[os memory, minimum width=2.2cm] (dram) at (9.0,1.2) {DRAM/NUMA\\channel、bank、page};
+  \node[os control, minimum width=2.2cm] (os) at (0,-0.65) {OS kernel\\调度、页表、驱动};
+  \node[os block, minimum width=2.2cm] (bus) at (3.0,-0.65) {互联/总线\\PCIe、APIC、CXL};
+  \node[os block, minimum width=2.2cm] (dev) at (6.0,-0.65) {设备\\NVMe、NIC、GPU};
+  \node[os memory, minimum width=2.2cm] (iommu) at (9.0,-0.65) {IOMMU/DMA\\IOVA、domain、ring};
+
+  \draw[os strong bus] (isa) -- node[os label, above] {提交状态} (core);
+  \draw[os strong bus] (core) -- node[os label, above] {load/store} (cache);
+  \draw[os strong bus] (cache) -- node[os label, above] {miss/fill} (dram);
+  \draw[os strong bus] (os) -- node[os label, above] {配置寄存器} (core);
+  \draw[os strong bus] (os) -- node[os label, above] {MMIO/IRQ} (bus);
+  \draw[os strong bus] (bus) -- node[os label, above] {事务} (dev);
+  \draw[os strong bus] (dev) -- node[os label, above] {DMA} (iommu);
+  \draw[os strong bus] (iommu) -- node[os label, right] {内存访问} (dram);
+  \draw[os feedback] (cache) -- node[os label, right] {\#PF/TLB miss} (os);
+  \draw[os feedback] (dev) -- node[os label, right] {MSI-X/completion} (os);
+\end{pdfdiagram}
+\diagramnote{整机硬件不是平铺盒子，而是多条契约链。CPU load/store、页表、cache/TLB、DRAM、设备 DMA 和中断最终都要在 OS 中收敛成可验证状态。}
+
+\subsection{每个硬件对象都要回答四组问题}
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+问题 & 必须讲清楚的内容 & 没讲清会造成什么误解 \\
+\midrule
+结构 & 由哪些寄存器、阵列、队列、表项、线和状态位组成 & 把硬件当成黑盒函数，无法解释边界 \\
+时序 & 哪些路径是组合逻辑，哪些状态在时钟或事件后改变 & 误以为写了变量就等于全系统立刻看见 \\
+接口 & 上层通过指令、控制寄存器、MMIO、DMA、IRQ 还是固件表访问 & 混淆用户地址、物理地址、MMIO、IOVA 和内核对象 \\
+后果 & 正常路径、慢路径、错误路径分别怎样暴露给 OS & 不知道为什么需要 shootdown、barrier、reset、fsync \\
+\bottomrule
+\end{longtable}
+
+例如 cache 要按这四组问题讲。结构上，它有 tag array、data array、valid/dirty/coherence state、replacement state；时序上，它要先查 index，再比较 tag，再选择 way，miss 后向下层发请求；接口上，上层看到的是 load/store 延迟和一致性，下层看到的是 line fill、writeback、invalidate；OS 后果是伪共享、锁竞争、DMA 同步、页属性和性能计数。
+
+DMA 也一样。结构上，它有设备队列、描述符、DMA engine、IOMMU domain 和 completion ring；时序上，CPU 填 descriptor、屏障、doorbell，设备稍后 DMA 和写 completion；接口上，驱动通过 DMA API、MMIO 和 IRQ 管理它；OS 后果是 buffer 所有权、unmap 顺序、取消、超时、reset 和隔离。
+
+\subsection{硬件层次和 OS 对象的对照表}
+
+\begin{longtable}{p{0.18\linewidth}p{0.29\linewidth}p{0.41\linewidth}}
+\toprule
+硬件对象 & 内部结构关键词 & OS 必须建立的对象或规则 \\
+\midrule
+逻辑门/寄存器 & 门延迟、setup/hold、时钟边沿 & 精确状态、上下文保存、入口不可半提交 \\
+ALU/AGU & 加法器、MUX、RFLAGS、地址生成 & 指针计算、条件分支、faulting address 证据 \\
+流水线/ROB & 重命名、调度队列、按序提交 & precise exception、可重试 page fault、信号语义 \\
+L1/L2/L3 cache & tag、set、way、line、MESI 状态 & 局部性、伪共享、锁设计、DMA cache 维护 \\
+TLB/page walker & VPN、PCID、PTE 权限、CR3 & 地址空间切换、TLB shootdown、COW、mprotect \\
+DRAM/NUMA & channel、bank、row、ECC、node & 页分配、迁移、回收、内存错误隔离 \\
+MMIO/PCIe BAR & 地址窗口、posted write、状态寄存器 & \code{ioremap}、访问顺序、驱动 probe/remove \\
+DMA/IOMMU & descriptor、IOVA、domain、completion & pin/map/unmap、buffer 所有权、设备隔离 \\
+APIC/MSI-X & vector、priority、EOI、IPI、affinity & 定时器、设备中断、跨核唤醒、shootdown \\
+存储控制器 & submission/completion queue、flush、FUA & 块层、page cache、fsync、崩溃恢复 \\
+\bottomrule
+\end{longtable}
+
+这张表也是后面阅读源码的索引。看到 \code{switch\_mm}，要想到 CR3、PCID 和 TLB；看到 \code{dma\_map\_*}，要想到 IOVA、cache 维护和 IOMMU domain；看到 \code{spin\_lock}，要想到 cache line ownership 和原子指令；看到 \code{fsync}，要想到 page cache、块层、设备缓存和稳定介质。
+
+\subsection{用公式减少口头描述}
+
+硬件结构适合用公式和不变量表达。后文会反复使用这些基础式子：
+
+\[
+\text{cache line address} = \left\lfloor \frac{PA}{L} \right\rfloor,\qquad
+\text{set} = \left(\left\lfloor \frac{PA}{L} \right\rfloor \bmod S\right)
+\]
+
+\[
+\text{TLB reach} = N_{entry} \times \text{page size}
+\]
+
+\[
+AMAT = T_{hit} + R_{miss} \times P_{miss}
+\]
+
+\[
+T_{clk} \ge T_{clk\_to\_q}+T_{logic}+T_{setup}+T_{skew}+T_{margin}
+\]
+
+\[
+\text{DMA safe free} \Rightarrow
+\text{completion observed} \land \text{dma\_unmap done} \land \text{no device ownership}
+\]
+
+这些式子不是为了显得数学化，而是为了去掉含混句子。比如“cache 很快但 miss 很慢”不如写成 AMAT；“TLB 覆盖范围不够”不如写成 TLB reach；“不能提前释放 DMA buffer”不如写出安全释放不变量。
+
+\subsection{读硬件路径时先找边界}
+
+每条路径都要先找边界。边界是硬件和软件交接的地方，最容易出错，也最能解释 OS 设计。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+边界 & 硬件交给 OS 的证据 & OS 要做的事 \\
+\midrule
+缺页边界 & faulting RIP、CR2、error code & 查 VMA/PTE，分配页或发信号 \\
+系统调用边界 & syscall number、ABI 参数寄存器 & 验证参数、复制用户数据、返回 errno/value \\
+中断边界 & vector、APIC 状态、设备 completion & ack/EOI、消费完成队列、唤醒等待者 \\
+DMA 边界 & descriptor ownership、completion tag、IOMMU fault & map/unmap、回收 buffer、reset 或报错 \\
+持久化边界 & block completion、flush completion、journal commit & 决定 \code{fsync} 是否可返回成功 \\
+热插拔边界 & bus remove event、设备错误状态 & 停止新请求、处理 in-flight、释放对象 \\
+\bottomrule
+\end{longtable}
+
+后面的章节如果只给出名词，而没有说明边界、证据和不变量，就不算讲清楚。本章后续内容按这个标准展开。

@@ -144,6 +144,42 @@ MMIO read after write:
 
 驱动有时会在关键 MMIO 写后读回某个寄存器，以确保写到达设备或满足排序要求。具体规则依平台和 API 而定，但核心思想是：设备不是 CPU 内部函数，MMIO 访问经过互联、缓冲和设备状态机。
 
+\subsection{MMIO 访问的完整路径}
+
+一次 \code{writel(tail, doorbell)} 从内核代码到设备，至少跨过页表属性、CPU store 路径、uncacheable/write-combining 规则、root complex、PCIe transaction layer、设备 BAR 译码和设备内部寄存器。它不是普通内存写。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[os control, minimum width=1.55cm] (drv) at (0,0) {driver\\writel};
+  \node[os memory, minimum width=1.55cm] (pte) at (2.0,0) {PTE\\MMIO attr};
+  \node[os compute, minimum width=1.55cm] (cpu) at (4.0,0) {CPU\\store path};
+  \node[os block, minimum width=1.75cm] (rc) at (6.15,0) {root complex\\PCIe TLP};
+  \node[os block, minimum width=1.55cm] (bar) at (8.25,0) {BAR\\decode};
+  \node[os state, minimum width=1.55cm] (reg) at (10.15,0) {device\\register};
+  \draw[os strong bus] (drv) -- (pte);
+  \draw[os strong bus] (pte) -- (cpu);
+  \draw[os strong bus] (cpu) -- (rc);
+  \draw[os strong bus] (rc) -- (bar);
+  \draw[os strong bus] (bar) -- (reg);
+  \node[os label] at (5.1,-1.0) {$MMIO\ store \ne RAM\ store,\quad posted \ne completed$};
+\end{pdfdiagram}
+\diagramnote{MMIO 写从内核 API 到设备寄存器的路径。页属性和访问 API 共同约束排序、合并、宽度和可见性。}
+
+可写成两个顺序不变量：
+
+\[
+\text{normal memory descriptor writes}
+\prec_{dma}
+\text{MMIO doorbell}
+\]
+
+\[
+\text{MMIO command write}
+\prec_{device}
+\text{status/completion observed}
+\]
+
+第一条由 \code{dma\_wmb} 和正确的 doorbell 写建立；第二条通常要靠设备协议、读回、completion 或中断确认建立。若只看到 CPU 执行完一条 store，就宣布设备完成，是把 CPU 本地顺序误当成设备全局顺序。
+
 \subsection{PCIe 设备是怎样被发现的}
 
 PCIe 设备有配置空间，里面包含 vendor ID、device ID、class code、BAR、MSI/MSI-X capability 等信息。固件或内核枚举总线，给 BAR 分配地址窗口，给设备分配 bus/device/function 编号。驱动通过 ID 表匹配设备。
@@ -161,6 +197,36 @@ pci enumeration:
 \end{lstlisting}
 
 BAR 是 Base Address Register。设备通过 BAR 告诉系统“我需要一段 MMIO 地址空间”。内核分配物理地址范围后，驱动再 ioremap 到内核虚拟地址。用户进程不能直接访问这个 MMIO，除非内核通过受控接口映射并检查权限。
+
+\subsection{PCIe 的上下层契约}
+
+PCIe 往下是链路、lane、TLP、重试和错误报告；往上是内核看到的 \code{pci\_dev}、BAR 资源、MSI-X vector、DMA mask 和 AER 状态。驱动不直接管理电信号，但必须尊重这些上层对象。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+PCIe 层面 & 硬件事实 & OS 对象或策略 \\
+\midrule
+link/lane & 速率、宽度、训练、降速 & 性能上限、链路错误、热插拔恢复 \\
+configuration space & vendor/device/class/capability & 设备发现、驱动匹配、能力启用 \\
+BAR & 设备 MMIO 窗口需求 & resource 分配、\code{ioremap}、权限控制 \\
+MSI-X table & 多个中断 vector & 队列到 CPU 亲和性、NAPI/blk-mq 并行 \\
+bus mastering & 设备能发起 DMA & 启用前必须准备 DMA mask/IOMMU/domain \\
+AER & 可纠正/不可纠正错误 & 错误日志、reset、设备下线 \\
+\bottomrule
+\end{longtable}
+
+因此驱动 probe 的真实顺序不是“发现设备就开始收发”。它要先确认资源、启用设备、配置 DMA、分配中断、初始化队列，最后才允许上层提交请求：
+
+\begin{lstlisting}
+pci_driver_probe(dev):
+  enable PCI device and MMIO resources
+  set DMA mask and attach IOMMU domain
+  ioremap BAR registers
+  allocate submission/completion rings
+  request MSI-X vectors and set affinity
+  initialize hardware registers
+  publish block/net/char device to upper layer
+\end{lstlisting}
 
 \subsection{BAR、寄存器、doorbell 和 descriptor 不是一回事}
 
@@ -201,6 +267,32 @@ submit:
 \end{lstlisting}
 
 环形队列有几个不变量：不能覆盖设备尚未消费的描述符；不能回收设备尚未完成的 buffer；发布 tail 前描述符必须完整可见；处理 completion 后必须 unmap DMA 并释放上层资源。网络、NVMe、virtio、io\_uring 都可以用这个模型理解。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[os state, minimum width=1.7cm] (cpu) at (0,0.8) {CPU/driver};
+  \node[os memory, minimum width=2.2cm] (sq) at (3.0,0.8) {submission ring\\descriptor[N]};
+  \node[os state, minimum width=1.7cm] (dev) at (6.0,0.8) {device\\DMA engine};
+  \node[os memory, minimum width=2.2cm] (cq) at (3.0,-1.0) {completion ring\\status/tag};
+  \node[os control, minimum width=1.7cm] (irq) at (6.0,-1.0) {MSI-X\\vector};
+  \node[os memory, minimum width=1.7cm] (buf) at (0,-1.0) {DMA buffer};
+  \draw[os strong bus] (cpu) -- node[os label, above] {fill desc} (sq);
+  \draw[os bus] (buf) -- node[os label, left] {IOVA} (sq);
+  \draw[os strong bus] (sq) -- node[os label, above] {DMA read} (dev);
+  \draw[os strong bus] (dev) -- node[os label, right] {DMA write} (cq);
+  \draw[os bus] (dev) -- (irq);
+  \draw[os feedback] (irq) -- node[os label, below] {handler/poll} (cpu);
+  \draw[os feedback] (cq) -- node[os label, below] {consume status} (cpu);
+\end{pdfdiagram}
+\diagramnote{队列型设备的通用结构：descriptor 在普通 RAM，doorbell 在 MMIO，数据通过 DMA，完成通过 completion ring 和 MSI-X 返回。}
+
+安全释放不变量可以直接写成：
+
+\[
+free(buffer) \Leftarrow
+completion(tag)\land dma\_unmap(buffer)\land owner(buffer)=CPU
+\]
+
+取消请求也必须维护这个不变量。用户关闭 fd 或超时返回，不代表设备已经不再 DMA。只有驱动确认 request 不会再完成，或者已经把迟到 completion 收敛掉，buffer 才能释放。
 
 \subsection{descriptor ring 的所有权状态机}
 
@@ -338,6 +430,43 @@ device DMA:
 
 IOMMU 还支撑虚拟化设备直通。把一个 PCIe 设备交给虚拟机时，hypervisor 不能让它 DMA 到宿主任意内存；IOMMU domain 必须限制在该虚拟机拥有的页。IOMMU 不是性能功能，而是设备侧隔离的硬件根。
 
+\subsection{IOMMU 的上下游：设备看 IOVA，内存控制器看 PA}
+
+IOMMU 位于设备 DMA 请求和内存系统之间。设备 descriptor 里放的是 DMA address/IOVA；IOMMU 根据 requester id 找到 domain，再查 IOMMU 页表，把 IOVA 翻译成物理地址。内存控制器最后只看到物理地址请求。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[os block, minimum width=1.65cm] (dev) at (0,0) {PCIe device\\requester ID};
+  \node[os bit, minimum width=1.35cm] (iova) at (2.0,0) {IOVA};
+  \node[os memory, minimum width=1.9cm] (iommu) at (4.1,0) {IOMMU\\domain table};
+  \node[os bit, minimum width=1.35cm] (pa) at (6.3,0) {PA};
+  \node[os memory, minimum width=1.7cm] (dram) at (8.3,0) {DRAM\\page};
+  \node[os control, minimum width=1.8cm] (fault) at (4.1,-1.4) {IOMMU fault};
+  \draw[os strong bus] (dev) -- (iova);
+  \draw[os strong bus] (iova) -- (iommu);
+  \draw[os strong bus] (iommu) -- (pa);
+  \draw[os strong bus] (pa) -- (dram);
+  \draw[os feedback] (iommu) -- (fault);
+\end{pdfdiagram}
+\diagramnote{IOMMU 把设备发出的 IOVA 翻译成物理地址，并按设备 domain 检查权限。没有映射或方向错误会形成 IOMMU fault。}
+
+映射生命周期可以写成：
+
+\begin{lstlisting}
+dma_map(page, direction):
+  pin or otherwise own page for I/O lifetime
+  create IOVA -> PA mapping in device domain
+  perform cache maintenance if platform requires it
+  return IOVA
+
+dma_unmap(IOVA, direction):
+  ensure device no longer owns the buffer
+  synchronize cache if platform requires it
+  remove IOVA mapping
+  allow page ownership to return upward
+\end{lstlisting}
+
+方向也有语义。DMA\_TO\_DEVICE 表示设备读内存，CPU 写入 buffer 后要让设备看到新数据；DMA\_FROM\_DEVICE 表示设备写内存，CPU 读取前要避免旧 cache line；DMA\_BIDIRECTIONAL 成本更高，不能为了省心乱用。
+
 \subsection{中断和 DMA completion 的完整路径}
 
 现在串起一次 NVMe 读取或网卡接收的典型路径：
@@ -396,6 +525,26 @@ cat /proc/meminfo
 
 观察报告至少要回答：设备如何被发现，BAR 映射在哪里，使用哪个 IRQ/MSI-X vector，驱动名称是什么，是否启用 IOMMU，DMA mask 是多少，错误统计在哪里看。没有这些证据，谈驱动和 DMA 只是概念。
 
+\subsection{从上层系统调用到底层硬件的 I/O 契约}
+
+把一次 \code{read} 或 \code{send} 贯穿到底，完整链条不是“应用调用内核，内核调用设备”。更准确的是：
+
+\[
+\begin{aligned}
+&\text{syscall}
+\rightarrow \text{VFS/socket/block/net object}
+\rightarrow \text{request/skb/bio}\\
+&\rightarrow \text{DMA mapping}
+\rightarrow \text{descriptor}
+\rightarrow \text{doorbell}\\
+&\rightarrow \text{device state machine}
+\rightarrow \text{completion}
+\rightarrow \text{wake up}
+\end{aligned}
+\]
+
+每一层只向上承诺自己能承诺的事实。系统调用返回值承诺用户可见语义；块层 completion 承诺块请求完成；设备 completion 承诺硬件处理了 descriptor；DMA unmap 承诺设备访问授权撤销；文件系统 \code{fsync} 才承诺持久化语义。把这些承诺混在一起，就会写出“completion 到了就可以向用户承诺落盘”的 bug。
+
 \subsection{本节测试：画出数据所有权}
 
 \begin{rubricbox}
@@ -406,6 +555,8 @@ cat /proc/meminfo
 \item 能画出 descriptor ring 的 head/tail、owned by CPU/device、completion 状态。
 \item 能说明 DMA buffer 在提交、设备访问、completion、unmap 各阶段归谁所有。
 \item 能解释 IOMMU 如何限制设备 DMA 范围，以及映射失败或 fault 如何处理。
+\item 能写出 \(descriptor\ writes \prec doorbell\) 和 \(completion \land dma\_unmap \Rightarrow buffer\ 可释放\) 这两个不变量。
+\item 能说明 PCIe BAR、MSI-X、DMA mask、AER 分别在驱动 probe 中解决什么问题。
 \item 能解释中断合并、poll budget 和 completion queue 如何影响延迟与吞吐。
 \item 能为设备 reset 写出停止新请求、处理 in-flight、重建硬件状态的顺序。
 \end{itemize}
