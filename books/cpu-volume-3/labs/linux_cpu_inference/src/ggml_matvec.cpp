@@ -321,6 +321,27 @@ void matvec_ggml_quantized_q8_0_avx2_rows_unchecked(GgmlType type,
                                                     std::span<float> output,
                                                     std::int64_t row_begin,
                                                     std::int64_t row_end);
+
+void matvec_ggml_quantized_q8_0_avx2_batch_rows_unchecked(
+    GgmlType type,
+    std::span<const std::uint8_t> rows,
+    std::int64_t row_count,
+    std::int64_t column_count,
+    std::span<const Q8_0InputBlock> input,
+    std::int64_t batch_size,
+    std::span<float> output,
+    std::int64_t output_stride,
+    std::int64_t row_begin,
+    std::int64_t row_end);
+
+F32RowMax max_dot_ggml_quantized_q8_0_avx2_rows_unchecked(
+    GgmlType type,
+    std::span<const std::uint8_t> rows,
+    std::int64_t row_count,
+    std::int64_t column_count,
+    std::span<const Q8_0InputBlock> input,
+    std::int64_t row_begin,
+    std::int64_t row_end);
 #else
 bool ggml_q8_0_avx2_available() noexcept {
     return false;
@@ -341,6 +362,31 @@ void matvec_ggml_quantized_q8_0_avx2_rows_unchecked(GgmlType,
                                                     std::span<float>,
                                                     std::int64_t,
                                                     std::int64_t) {}
+
+void matvec_ggml_quantized_q8_0_avx2_batch_rows_unchecked(
+    GgmlType,
+    std::span<const std::uint8_t>,
+    std::int64_t,
+    std::int64_t,
+    std::span<const Q8_0InputBlock>,
+    std::int64_t,
+    std::span<float>,
+    std::int64_t,
+    std::int64_t,
+    std::int64_t) {}
+
+F32RowMax max_dot_ggml_quantized_q8_0_avx2_rows_unchecked(
+    GgmlType,
+    std::span<const std::uint8_t>,
+    std::int64_t,
+    std::int64_t,
+    std::span<const Q8_0InputBlock>,
+    std::int64_t,
+    std::int64_t) {
+    F32RowMax best;
+    best.value = -std::numeric_limits<float>::infinity();
+    return best;
+}
 #endif
 
 std::vector<Q8_0InputBlock> quantize_q8_0_input(std::span<const float> input) {
@@ -517,6 +563,138 @@ void matvec_ggml_quantized_q8_0_rows_unchecked(GgmlType type,
         }
         output[static_cast<std::size_t>(row)] = sum;
     }
+}
+
+void matvec_ggml_quantized_q8_0_batch_rows_unchecked(
+    GgmlType type,
+    std::span<const std::uint8_t> rows,
+    std::int64_t row_count,
+    std::int64_t column_count,
+    std::span<const Q8_0InputBlock> input,
+    std::int64_t batch_size,
+    std::span<float> output,
+    std::int64_t output_stride,
+    std::int64_t row_begin,
+    std::int64_t row_end) {
+    const GgmlTypeLayout layout = ggml_type_layout(type);
+#if defined(LCQI_ENABLE_AVX2)
+    if ((type == GgmlType::q8_0 || type == GgmlType::q5_0) && ggml_q8_0_avx2_available()) {
+        matvec_ggml_quantized_q8_0_avx2_batch_rows_unchecked(type,
+                                                             rows,
+                                                             row_count,
+                                                             column_count,
+                                                             input,
+                                                             batch_size,
+                                                             output,
+                                                             output_stride,
+                                                             row_begin,
+                                                             row_end);
+        return;
+    }
+#endif
+    (void)row_count;
+    const std::int64_t input_blocks_per_weight_block =
+        layout.block_size / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t input_blocks_per_batch =
+        column_count / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t row_bytes =
+        (column_count / layout.block_size) * static_cast<std::int64_t>(layout.type_size);
+
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
+        const std::uint8_t* row_bytes_begin =
+            rows.data() + static_cast<std::size_t>(row * row_bytes);
+        for (std::int64_t batch = 0; batch < batch_size; ++batch) {
+            const Q8_0InputBlock* batch_input =
+                input.data() + static_cast<std::size_t>(batch * input_blocks_per_batch);
+            float sum = 0.0F;
+            for (std::int64_t block = 0; block < column_count / layout.block_size; ++block) {
+                sum += dot_quantized_block_q8_0(
+                    type,
+                    row_bytes_begin +
+                        static_cast<std::size_t>(
+                            block * static_cast<std::int64_t>(layout.type_size)),
+                    batch_input +
+                        static_cast<std::size_t>(block * input_blocks_per_weight_block));
+            }
+            output[static_cast<std::size_t>(batch * output_stride + row)] = sum;
+        }
+    }
+}
+
+F32RowMax max_dot_ggml_quantized_q8_0(
+    GgmlType type,
+    std::span<const std::uint8_t> rows,
+    std::int64_t row_count,
+    std::int64_t column_count,
+    std::span<const Q8_0InputBlock> input) {
+    require_positive(row_count, "GGML Q8_0 max-dot row count");
+    const GgmlTypeLayout layout = ggml_type_layout(type);
+    if (!ggml_type_has_q8_0_direct_matvec(type)) {
+        throw std::runtime_error(std::string("LCQI has no direct Q8_0 max-dot for ") +
+                                 ggml_type_name(type));
+    }
+    require_multiple(column_count, layout.block_size, "GGML Q8_0 max-dot column count");
+    validate_q8_0_blocks(input, column_count);
+    const std::int64_t row_bytes =
+        (column_count / layout.block_size) * static_cast<std::int64_t>(layout.type_size);
+    if (rows.size() != checked_size(row_bytes * row_count, "GGML Q8_0 max-dot matrix bytes")) {
+        throw std::runtime_error("GGML Q8_0 max-dot matrix byte size mismatch");
+    }
+    return max_dot_ggml_quantized_q8_0_rows_unchecked(type,
+                                                      rows,
+                                                      row_count,
+                                                      column_count,
+                                                      input,
+                                                      0,
+                                                      row_count);
+}
+
+F32RowMax max_dot_ggml_quantized_q8_0_rows_unchecked(
+    GgmlType type,
+    std::span<const std::uint8_t> rows,
+    std::int64_t row_count,
+    std::int64_t column_count,
+    std::span<const Q8_0InputBlock> input,
+    std::int64_t row_begin,
+    std::int64_t row_end) {
+    const GgmlTypeLayout layout = ggml_type_layout(type);
+#if defined(LCQI_ENABLE_AVX2)
+    if ((type == GgmlType::q8_0 || type == GgmlType::q5_0) && ggml_q8_0_avx2_available()) {
+        return max_dot_ggml_quantized_q8_0_avx2_rows_unchecked(type,
+                                                               rows,
+                                                               row_count,
+                                                               column_count,
+                                                               input,
+                                                               row_begin,
+                                                               row_end);
+    }
+#endif
+    (void)row_count;
+    const std::int64_t input_blocks_per_weight_block =
+        layout.block_size / LCQI_Q8_0_INPUT_BLOCK_VALUES;
+    const std::int64_t row_bytes =
+        (column_count / layout.block_size) * static_cast<std::int64_t>(layout.type_size);
+    F32RowMax best;
+    best.row = checked_size(row_begin, "GGML Q8_0 max-dot row_begin");
+    best.value = -std::numeric_limits<float>::infinity();
+    for (std::int64_t row = row_begin; row < row_end; ++row) {
+        const std::uint8_t* row_bytes_begin =
+            rows.data() + static_cast<std::size_t>(row * row_bytes);
+        float sum = 0.0F;
+        for (std::int64_t block = 0; block < column_count / layout.block_size; ++block) {
+            sum += dot_quantized_block_q8_0(
+                type,
+                row_bytes_begin +
+                    static_cast<std::size_t>(block * static_cast<std::int64_t>(layout.type_size)),
+                input.data() +
+                    static_cast<std::size_t>(block * input_blocks_per_weight_block));
+        }
+        if (row == row_begin || sum > best.value) {
+            best.row = static_cast<std::size_t>(row);
+            best.value = sum;
+        }
+    }
+    return best;
 }
 
 }  // namespace lcqi

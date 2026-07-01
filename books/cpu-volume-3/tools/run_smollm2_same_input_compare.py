@@ -25,9 +25,21 @@ LLAMA_SIMPLE_TARGET = "llama-simple"
 LLAMA_BENCH_TARGET = "llama-bench"
 LLAMA_TOKENIZE_TARGET = "llama-tokenize"
 LCQI_Q4_DIRECT_ENV = "LCQI_LLAMA_Q4_DIRECT"
+LCQI_Q5_0_PACKED_ENV = "LCQI_LLAMA_Q5_0_PACKED"
+LCQI_Q6_K_DIRECT_ENV = "LCQI_LLAMA_Q6_K_DIRECT"
+LCQI_Q8_0_DIRECT_ENV = "LCQI_LLAMA_Q8_0_DIRECT"
+LCQI_Q8_0_TIED_LM_HEAD_ENV = "LCQI_LLAMA_Q8_0_TIED_LM_HEAD"
 LCQI_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT"
+LCQI_GGML_SELECTIVE_DIRECT_ENV = "LCQI_LLAMA_GGML_SELECTIVE_DIRECT"
+LCQI_BATCH_PREFILL_ENV = "LCQI_LLAMA_BATCH_PREFILL"
 LCQI_Q4_DIRECT_OFF = "0"
+LCQI_Q5_0_PACKED_OFF = "0"
+LCQI_Q6_K_DIRECT_ON = "1"
+LCQI_Q8_0_DIRECT_OFF = "0"
+LCQI_Q8_0_TIED_LM_HEAD_OFF = "0"
 LCQI_GGML_DIRECT_ON = "1"
+LCQI_GGML_SELECTIVE_DIRECT_ON = "1"
+LCQI_BATCH_PREFILL_OFF = "0"
 LCQI_SUMMARY_KEYS = [
     "benchmark_load_ms",
     "benchmark_prefill_ms",
@@ -39,6 +51,10 @@ LCQI_SUMMARY_KEYS = [
     "benchmark_worker_count",
     "derived_f32_weight_inflation_ratio",
     "derived_direct_quantized_weight_byte_share",
+    "benchmark_q5_0_packed_weight_bytes",
+    "benchmark_q5_0_batch_f32_weight_bytes",
+    "benchmark_q6_k_direct_weight_bytes",
+    "benchmark_q8_0_direct_weight_bytes",
     "benchmark_hotspot_rms_norm_ms",
     "benchmark_hotspot_attention_ms",
     "benchmark_hotspot_rope_ms",
@@ -51,12 +67,23 @@ LCQI_SUMMARY_KEYS = [
     "benchmark_hotspot_w_down_ms",
     "benchmark_hotspot_lm_head_ms",
     "benchmark_hotspot_q4_k_direct_ms",
+    "benchmark_hotspot_q5_0_packed_ms",
+    "benchmark_hotspot_q5_0_batch_f32_ms",
+    "benchmark_hotspot_q6_k_direct_ms",
+    "benchmark_hotspot_q8_0_direct_ms",
     "benchmark_hotspot_ggml_direct_ms",
     "benchmark_hotspot_f32_fallback_ms",
     "benchmark_hotspot_q4_k_direct_calls",
+    "benchmark_hotspot_q5_0_packed_calls",
+    "benchmark_hotspot_q5_0_batch_f32_calls",
+    "benchmark_hotspot_q6_k_direct_calls",
+    "benchmark_hotspot_q8_0_direct_calls",
     "benchmark_hotspot_ggml_direct_calls",
     "benchmark_hotspot_f32_fallback_calls",
     "benchmark_q4_k_direct_tensors",
+    "benchmark_q5_0_packed_tensors",
+    "benchmark_q6_k_direct_tensors",
+    "benchmark_q8_0_direct_tensors",
     "benchmark_ggml_direct_tensors",
     "benchmark_f32_fallback_tensors",
 ]
@@ -204,8 +231,15 @@ def parse_lcqi_metrics(stdout: str) -> dict[str, str]:
             "benchmark_f32_weight_bytes",
             "benchmark_direct_quantized_weight_bytes",
             "benchmark_fallback_dequantized_weight_bytes",
+            "benchmark_q5_0_packed_weight_bytes",
+            "benchmark_q5_0_batch_f32_weight_bytes",
+            "benchmark_q6_k_direct_weight_bytes",
+            "benchmark_q8_0_direct_weight_bytes",
             "benchmark_tensors_loaded",
             "benchmark_q4_k_direct_tensors",
+            "benchmark_q5_0_packed_tensors",
+            "benchmark_q6_k_direct_tensors",
+            "benchmark_q8_0_direct_tensors",
             "benchmark_ggml_direct_tensors",
             "benchmark_f32_fallback_tensors",
             "benchmark_hotspot_rms_norm_ms",
@@ -220,9 +254,17 @@ def parse_lcqi_metrics(stdout: str) -> dict[str, str]:
             "benchmark_hotspot_w_down_ms",
             "benchmark_hotspot_lm_head_ms",
             "benchmark_hotspot_q4_k_direct_ms",
+            "benchmark_hotspot_q5_0_packed_ms",
+            "benchmark_hotspot_q5_0_batch_f32_ms",
+            "benchmark_hotspot_q6_k_direct_ms",
+            "benchmark_hotspot_q8_0_direct_ms",
             "benchmark_hotspot_ggml_direct_ms",
             "benchmark_hotspot_f32_fallback_ms",
             "benchmark_hotspot_q4_k_direct_calls",
+            "benchmark_hotspot_q5_0_packed_calls",
+            "benchmark_hotspot_q5_0_batch_f32_calls",
+            "benchmark_hotspot_q6_k_direct_calls",
+            "benchmark_hotspot_q8_0_direct_calls",
             "benchmark_hotspot_ggml_direct_calls",
             "benchmark_hotspot_f32_fallback_calls",
         }:
@@ -676,8 +718,14 @@ def write_report(
     full_prompt: str,
     max_new_tokens: int,
     lcqi_runs: list[CommandResult],
+    lcqi_batch_prefill_off_runs: list[CommandResult],
     lcqi_serial_runs: list[CommandResult],
     lcqi_q4_direct_off_runs: list[CommandResult],
+    lcqi_q5_0_packed_off_runs: list[CommandResult],
+    lcqi_q6_k_direct_runs: list[CommandResult],
+    lcqi_q8_0_direct_off_runs: list[CommandResult],
+    lcqi_q8_0_lm_head_off_runs: list[CommandResult],
+    lcqi_ggml_selective_direct_runs: list[CommandResult],
     lcqi_ggml_direct_runs: list[CommandResult],
     llama_tokenize: CommandResult,
     llama_simple_runs: list[CommandResult],
@@ -736,6 +784,46 @@ def write_report(
         ))
         lines.append("")
 
+    if lcqi_batch_prefill_off_runs:
+        lines.extend(format_summary(
+            "lcqi_batch_prefill_off_same_input",
+            lcqi_batch_prefill_off_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
+
+    if lcqi_q5_0_packed_off_runs:
+        lines.extend(format_summary(
+            "lcqi_q5_0_packed_off_same_input",
+            lcqi_q5_0_packed_off_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
+
+    if lcqi_q6_k_direct_runs:
+        lines.extend(format_summary(
+            "lcqi_q6_k_direct_experimental_same_input",
+            lcqi_q6_k_direct_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
+
+    if lcqi_q8_0_lm_head_off_runs:
+        lines.extend(format_summary(
+            "lcqi_q8_0_lm_head_off_same_input",
+            lcqi_q8_0_lm_head_off_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
+
+    if lcqi_q8_0_direct_off_runs:
+        lines.extend(format_summary(
+            "lcqi_q8_0_direct_off_same_input",
+            lcqi_q8_0_direct_off_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
+
     if lcqi_serial_runs:
         lines.extend(format_summary(
             "lcqi_serial_same_input",
@@ -750,6 +838,13 @@ def write_report(
         LCQI_SUMMARY_KEYS,
     ))
     lines.append("")
+    if lcqi_ggml_selective_direct_runs:
+        lines.extend(format_summary(
+            "lcqi_ggml_selective_direct_same_input",
+            lcqi_ggml_selective_direct_runs,
+            LCQI_SUMMARY_KEYS,
+        ))
+        lines.append("")
     if lcqi_ggml_direct_runs:
         lines.extend(format_summary(
             "lcqi_ggml_direct_experimental_same_input",
@@ -781,13 +876,25 @@ def write_report(
         llama_bench,
         lcqi_serial_runs,
         lcqi_q4_direct_off_runs,
+        lcqi_q5_0_packed_off_runs,
+        lcqi_q6_k_direct_runs,
+        lcqi_q8_0_direct_off_runs,
+        lcqi_q8_0_lm_head_off_runs,
+        lcqi_batch_prefill_off_runs,
+        lcqi_ggml_selective_direct_runs,
         lcqi_ggml_direct_runs,
     )
 
     for run in (
         lcqi_q4_direct_off_runs +
+        lcqi_q5_0_packed_off_runs +
+        lcqi_q6_k_direct_runs +
+        lcqi_q8_0_direct_off_runs +
+        lcqi_q8_0_lm_head_off_runs +
+        lcqi_batch_prefill_off_runs +
         lcqi_serial_runs +
         lcqi_runs +
+        lcqi_ggml_selective_direct_runs +
         lcqi_ggml_direct_runs +
         [llama_tokenize] +
         llama_simple_runs +
@@ -825,6 +932,12 @@ def add_ratio_summary(
     llama_bench: CommandResult,
     lcqi_serial_runs: list[CommandResult],
     lcqi_q4_direct_off_runs: list[CommandResult],
+    lcqi_q5_0_packed_off_runs: list[CommandResult],
+    lcqi_q6_k_direct_runs: list[CommandResult],
+    lcqi_q8_0_direct_off_runs: list[CommandResult],
+    lcqi_q8_0_lm_head_off_runs: list[CommandResult],
+    lcqi_batch_prefill_off_runs: list[CommandResult],
+    lcqi_ggml_selective_direct_runs: list[CommandResult],
     lcqi_ggml_direct_runs: list[CommandResult],
 ) -> None:
     lcqi_prompt_tokens = median_metric(lcqi_runs, "benchmark_prompt_tokens")
@@ -862,6 +975,12 @@ def add_ratio_summary(
         lines.append(f"lcqi_direct_quantized_weight_byte_share={lcqi_direct_share:.6f}")
     add_lcqi_threaded_ratios(lines, lcqi_serial_runs, lcqi_runs)
     add_lcqi_ab_ratios(lines, lcqi_q4_direct_off_runs, lcqi_runs)
+    add_lcqi_q5_0_packed_ratios(lines, lcqi_q5_0_packed_off_runs, lcqi_runs)
+    add_lcqi_q6_k_direct_ratios(lines, lcqi_runs, lcqi_q6_k_direct_runs)
+    add_lcqi_q8_0_direct_ratios(lines, lcqi_q8_0_direct_off_runs, lcqi_runs)
+    add_lcqi_q8_0_lm_head_ratios(lines, lcqi_q8_0_lm_head_off_runs, lcqi_runs)
+    add_lcqi_batch_prefill_ratios(lines, lcqi_batch_prefill_off_runs, lcqi_runs)
+    add_lcqi_ggml_selective_ratios(lines, lcqi_runs, lcqi_ggml_selective_direct_runs)
     add_lcqi_ggml_experimental_ratios(lines, lcqi_runs, lcqi_ggml_direct_runs)
     if bench_pp_tps is not None:
         lines.append(f"llama_bench_same_token_count_prefill_tps={bench_pp_tps:.6f}")
@@ -869,10 +988,17 @@ def add_ratio_summary(
         lines.append(f"llama_bench_same_token_count_decode_tps={bench_tg_tps:.6f}")
     lines.append(
         "root_cause=LCQI keeps shape-compatible Q4_K matrices in the default direct "
-        "quantized path and uses an 8-row AVX2 F32 fallback fast path for the "
-        "remaining materialized tensors. The 8-row path reduces the dominant "
-        "F32 fallback hotspot, but the default path still spends most time in "
-        "per-token row-major GEMV. The experimental Q5_0/Q6_K/Q8_0 direct path "
+        "quantized path, packs shape-compatible Q5_0 matrices into a load-time "
+        "AVX2-friendly direct layout for decode while keeping an F32 sidecar for "
+        "batched prompt prefill, evaluates the tied Q8_0 embedding/lm_head "
+        "without scanning the dequantized F32 embedding, uses an 8-row AVX2 F32 "
+        "fallback fast path, and batches prompt prefill F32 fallback projections across prompt tokens. Batched "
+        "prefill reduces repeated row-major weight scans and worker dispatches "
+        "for prompt evaluation, but decode is still single-token GEMV. The "
+        "selective GGML direct path is reported separately: it only tries Q5_0 "
+        "and Q8_0 weights that already have AVX2 Q8_0 input kernels, while "
+        "leaving Q6_K in the F32 fallback. The full experimental "
+        "Q5_0/Q6_K/Q8_0 direct path "
         "uses the same row worker pool and is much faster than the first scalar "
         "whole-matrix experiment, but it is still slower than the default Q4_K "
         "plus F32 fallback mix because the GGML block layout, Q6_K scalar "
@@ -942,6 +1068,276 @@ def add_lcqi_ab_ratios(
         lines.append(f"lcqi_q4_direct_f32_weight_bytes_saved={off_f32_bytes - on_f32_bytes:.0f}")
 
 
+def add_lcqi_q5_0_packed_ratios(
+    lines: list[str],
+    lcqi_q5_0_packed_off_runs: list[CommandResult],
+    lcqi_runs: list[CommandResult],
+) -> None:
+    if not lcqi_q5_0_packed_off_runs:
+        return
+    off_prefill = median_metric(lcqi_q5_0_packed_off_runs, "benchmark_prefill_ms")
+    on_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    off_decode = median_metric(lcqi_q5_0_packed_off_runs, "derived_decode_ms_per_step")
+    on_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    off_f32 = median_metric(lcqi_q5_0_packed_off_runs, "benchmark_hotspot_f32_fallback_ms")
+    on_f32 = median_metric(lcqi_runs, "benchmark_hotspot_f32_fallback_ms")
+    on_packed = median_metric(lcqi_runs, "benchmark_hotspot_q5_0_packed_ms")
+    on_batch_f32 = median_metric(lcqi_runs, "benchmark_hotspot_q5_0_batch_f32_ms")
+    on_batch_f32_calls = median_metric(lcqi_runs, "benchmark_hotspot_q5_0_batch_f32_calls")
+    off_f32_bytes = median_metric(lcqi_q5_0_packed_off_runs, "benchmark_f32_weight_bytes")
+    on_f32_bytes = median_metric(lcqi_runs, "benchmark_f32_weight_bytes")
+    on_packed_bytes = median_metric(lcqi_runs, "benchmark_q5_0_packed_weight_bytes")
+    on_batch_f32_bytes = median_metric(lcqi_runs, "benchmark_q5_0_batch_f32_weight_bytes")
+    on_packed_tensors = median_metric(lcqi_runs, "benchmark_q5_0_packed_tensors")
+    if off_prefill is not None and on_prefill is not None and on_prefill > 0.0:
+        lines.append(
+            "lcqi_q5_0_packed_prefill_speedup_off_over_on="
+            f"{off_prefill / on_prefill:.6f}"
+        )
+    if off_decode is not None and on_decode is not None and on_decode > 0.0:
+        lines.append(
+            "lcqi_q5_0_packed_decode_step_speedup_off_over_on="
+            f"{off_decode / on_decode:.6f}"
+        )
+    if off_f32 is not None and on_f32 is not None and on_f32 > 0.0:
+        lines.append(
+            "lcqi_q5_0_packed_f32_hotspot_speedup_off_over_on="
+            f"{off_f32 / on_f32:.6f}"
+        )
+    if on_packed is not None:
+        lines.append(f"lcqi_q5_0_packed_hotspot_ms={on_packed:.6f}")
+    if on_batch_f32 is not None:
+        lines.append(f"lcqi_q5_0_batch_f32_hotspot_ms={on_batch_f32:.6f}")
+    if on_batch_f32_calls is not None:
+        lines.append(f"lcqi_q5_0_batch_f32_calls={on_batch_f32_calls:.0f}")
+    if off_f32_bytes is not None and on_f32_bytes is not None:
+        lines.append(
+            "lcqi_q5_0_packed_f32_weight_bytes_saved="
+            f"{off_f32_bytes - on_f32_bytes:.0f}"
+        )
+    if on_packed_bytes is not None:
+        lines.append(f"lcqi_q5_0_packed_weight_bytes={on_packed_bytes:.0f}")
+    if on_batch_f32_bytes is not None:
+        lines.append(f"lcqi_q5_0_batch_f32_weight_bytes={on_batch_f32_bytes:.0f}")
+    if on_packed_tensors is not None:
+        lines.append(f"lcqi_q5_0_packed_tensors={on_packed_tensors:.0f}")
+
+
+def add_lcqi_q6_k_direct_ratios(
+    lines: list[str],
+    lcqi_runs: list[CommandResult],
+    lcqi_q6_k_direct_runs: list[CommandResult],
+) -> None:
+    if not lcqi_q6_k_direct_runs:
+        return
+    default_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    q6_prefill = median_metric(lcqi_q6_k_direct_runs, "benchmark_prefill_ms")
+    default_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    q6_decode = median_metric(lcqi_q6_k_direct_runs, "derived_decode_ms_per_step")
+    default_f32 = median_metric(lcqi_runs, "benchmark_hotspot_f32_fallback_ms")
+    q6_f32 = median_metric(lcqi_q6_k_direct_runs, "benchmark_hotspot_f32_fallback_ms")
+    default_f32_bytes = median_metric(lcqi_runs, "benchmark_f32_weight_bytes")
+    q6_f32_bytes = median_metric(lcqi_q6_k_direct_runs, "benchmark_f32_weight_bytes")
+    q6_direct_bytes = median_metric(
+        lcqi_q6_k_direct_runs,
+        "benchmark_q6_k_direct_weight_bytes",
+    )
+    q6_direct_hotspot = median_metric(
+        lcqi_q6_k_direct_runs,
+        "benchmark_hotspot_q6_k_direct_ms",
+    )
+    q6_direct_calls = median_metric(
+        lcqi_q6_k_direct_runs,
+        "benchmark_hotspot_q6_k_direct_calls",
+    )
+    q6_direct_tensors = median_metric(
+        lcqi_q6_k_direct_runs,
+        "benchmark_q6_k_direct_tensors",
+    )
+    if default_prefill is not None and q6_prefill is not None and q6_prefill > 0.0:
+        lines.append(
+            "lcqi_q6_k_direct_prefill_speedup_default_over_experimental="
+            f"{default_prefill / q6_prefill:.6f}"
+        )
+    if default_decode is not None and q6_decode is not None and q6_decode > 0.0:
+        lines.append(
+            "lcqi_q6_k_direct_decode_step_speedup_default_over_experimental="
+            f"{default_decode / q6_decode:.6f}"
+        )
+    if default_f32 is not None and q6_f32 is not None:
+        lines.append(
+            "lcqi_q6_k_direct_f32_hotspot_ms_delta_experimental_minus_default="
+            f"{q6_f32 - default_f32:.6f}"
+        )
+    if default_f32_bytes is not None and q6_f32_bytes is not None:
+        lines.append(
+            "lcqi_q6_k_direct_f32_weight_bytes_saved="
+            f"{default_f32_bytes - q6_f32_bytes:.0f}"
+        )
+    if q6_direct_bytes is not None:
+        lines.append(f"lcqi_q6_k_direct_weight_bytes={q6_direct_bytes:.0f}")
+    if q6_direct_hotspot is not None:
+        lines.append(f"lcqi_q6_k_direct_hotspot_ms={q6_direct_hotspot:.6f}")
+    if q6_direct_calls is not None:
+        lines.append(f"lcqi_q6_k_direct_calls={q6_direct_calls:.0f}")
+    if q6_direct_tensors is not None:
+        lines.append(f"lcqi_q6_k_direct_tensors={q6_direct_tensors:.0f}")
+
+
+def add_lcqi_q8_0_lm_head_ratios(
+    lines: list[str],
+    lcqi_q8_0_lm_head_off_runs: list[CommandResult],
+    lcqi_runs: list[CommandResult],
+) -> None:
+    if not lcqi_q8_0_lm_head_off_runs:
+        return
+    off_decode = median_metric(lcqi_q8_0_lm_head_off_runs, "derived_decode_ms_per_step")
+    on_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    off_lm_head = median_metric(lcqi_q8_0_lm_head_off_runs, "benchmark_hotspot_lm_head_ms")
+    on_lm_head = median_metric(lcqi_runs, "benchmark_hotspot_lm_head_ms")
+    on_q8 = median_metric(lcqi_runs, "benchmark_hotspot_q8_0_direct_ms")
+    on_q8_bytes = median_metric(lcqi_runs, "benchmark_q8_0_direct_weight_bytes")
+    on_q8_tensors = median_metric(lcqi_runs, "benchmark_q8_0_direct_tensors")
+    if off_decode is not None and on_decode is not None and on_decode > 0.0:
+        lines.append(
+            "lcqi_q8_0_lm_head_decode_step_speedup_off_over_on="
+            f"{off_decode / on_decode:.6f}"
+        )
+    if off_lm_head is not None and on_lm_head is not None and on_lm_head > 0.0:
+        lines.append(
+            "lcqi_q8_0_lm_head_hotspot_speedup_off_over_on="
+            f"{off_lm_head / on_lm_head:.6f}"
+        )
+    if on_q8 is not None:
+        lines.append(f"lcqi_q8_0_direct_hotspot_ms={on_q8:.6f}")
+    if on_q8_bytes is not None:
+        lines.append(f"lcqi_q8_0_direct_weight_bytes={on_q8_bytes:.0f}")
+    if on_q8_tensors is not None:
+        lines.append(f"lcqi_q8_0_direct_tensors={on_q8_tensors:.0f}")
+
+
+def add_lcqi_q8_0_direct_ratios(
+    lines: list[str],
+    lcqi_q8_0_direct_off_runs: list[CommandResult],
+    lcqi_runs: list[CommandResult],
+) -> None:
+    if not lcqi_q8_0_direct_off_runs:
+        return
+    off_prefill = median_metric(lcqi_q8_0_direct_off_runs, "benchmark_prefill_ms")
+    on_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    off_decode = median_metric(lcqi_q8_0_direct_off_runs, "derived_decode_ms_per_step")
+    on_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    off_f32 = median_metric(lcqi_q8_0_direct_off_runs, "benchmark_hotspot_f32_fallback_ms")
+    on_f32 = median_metric(lcqi_runs, "benchmark_hotspot_f32_fallback_ms")
+    off_calls = median_metric(lcqi_q8_0_direct_off_runs, "benchmark_hotspot_f32_fallback_calls")
+    on_calls = median_metric(lcqi_runs, "benchmark_hotspot_f32_fallback_calls")
+    on_q8 = median_metric(lcqi_runs, "benchmark_hotspot_q8_0_direct_ms")
+    on_q8_calls = median_metric(lcqi_runs, "benchmark_hotspot_q8_0_direct_calls")
+    on_q8_tensors = median_metric(lcqi_runs, "benchmark_q8_0_direct_tensors")
+    if off_prefill is not None and on_prefill is not None and on_prefill > 0.0:
+        lines.append(
+            "lcqi_q8_0_direct_prefill_speedup_off_over_on="
+            f"{off_prefill / on_prefill:.6f}"
+        )
+    if off_decode is not None and on_decode is not None and on_decode > 0.0:
+        lines.append(
+            "lcqi_q8_0_direct_decode_step_speedup_off_over_on="
+            f"{off_decode / on_decode:.6f}"
+        )
+    if off_f32 is not None and on_f32 is not None and on_f32 > 0.0:
+        lines.append(
+            "lcqi_q8_0_direct_f32_hotspot_speedup_off_over_on="
+            f"{off_f32 / on_f32:.6f}"
+        )
+    if off_calls is not None and on_calls is not None:
+        lines.append(
+            "lcqi_q8_0_direct_f32_fallback_calls_saved="
+            f"{off_calls - on_calls:.0f}"
+        )
+    if on_q8 is not None:
+        lines.append(f"lcqi_q8_0_direct_all_hotspot_ms={on_q8:.6f}")
+    if on_q8_calls is not None:
+        lines.append(f"lcqi_q8_0_direct_all_calls={on_q8_calls:.0f}")
+    if on_q8_tensors is not None:
+        lines.append(f"lcqi_q8_0_direct_all_tensors={on_q8_tensors:.0f}")
+
+
+def add_lcqi_batch_prefill_ratios(
+    lines: list[str],
+    lcqi_batch_prefill_off_runs: list[CommandResult],
+    lcqi_runs: list[CommandResult],
+) -> None:
+    if not lcqi_batch_prefill_off_runs:
+        return
+    off_prefill = median_metric(lcqi_batch_prefill_off_runs, "benchmark_prefill_ms")
+    on_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    off_f32 = median_metric(lcqi_batch_prefill_off_runs, "benchmark_hotspot_f32_fallback_ms")
+    on_f32 = median_metric(lcqi_runs, "benchmark_hotspot_f32_fallback_ms")
+    off_calls = median_metric(lcqi_batch_prefill_off_runs, "benchmark_hotspot_f32_fallback_calls")
+    on_calls = median_metric(lcqi_runs, "benchmark_hotspot_f32_fallback_calls")
+    if off_prefill is not None and on_prefill is not None and on_prefill > 0.0:
+        lines.append(
+            "lcqi_batch_prefill_speedup_off_over_on="
+            f"{off_prefill / on_prefill:.6f}"
+        )
+    if off_f32 is not None and on_f32 is not None and on_f32 > 0.0:
+        lines.append(
+            "lcqi_batch_prefill_f32_hotspot_speedup_off_over_on="
+            f"{off_f32 / on_f32:.6f}"
+        )
+    if off_calls is not None and on_calls is not None and on_calls > 0.0:
+        lines.append(
+            "lcqi_batch_prefill_f32_call_reduction_off_over_on="
+            f"{off_calls / on_calls:.6f}"
+        )
+
+
+def add_lcqi_ggml_selective_ratios(
+    lines: list[str],
+    lcqi_runs: list[CommandResult],
+    lcqi_ggml_selective_direct_runs: list[CommandResult],
+) -> None:
+    if not lcqi_ggml_selective_direct_runs:
+        return
+    default_prefill = median_metric(lcqi_runs, "benchmark_prefill_ms")
+    selective_prefill = median_metric(lcqi_ggml_selective_direct_runs, "benchmark_prefill_ms")
+    default_decode = median_metric(lcqi_runs, "derived_decode_ms_per_step")
+    selective_decode = median_metric(lcqi_ggml_selective_direct_runs, "derived_decode_ms_per_step")
+    default_direct_share = median_metric(lcqi_runs, "derived_direct_quantized_weight_byte_share")
+    selective_direct_share = median_metric(
+        lcqi_ggml_selective_direct_runs,
+        "derived_direct_quantized_weight_byte_share",
+    )
+    default_f32_bytes = median_metric(lcqi_runs, "benchmark_f32_weight_bytes")
+    selective_f32_bytes = median_metric(lcqi_ggml_selective_direct_runs, "benchmark_f32_weight_bytes")
+    selective_hotspot = median_metric(
+        lcqi_ggml_selective_direct_runs,
+        "benchmark_hotspot_ggml_direct_ms",
+    )
+    if default_prefill is not None and selective_prefill is not None and selective_prefill > 0.0:
+        lines.append(
+            "lcqi_ggml_selective_prefill_speedup_default_over_selective="
+            f"{default_prefill / selective_prefill:.6f}"
+        )
+    if default_decode is not None and selective_decode is not None and selective_decode > 0.0:
+        lines.append(
+            "lcqi_ggml_selective_decode_step_speedup_default_over_selective="
+            f"{default_decode / selective_decode:.6f}"
+        )
+    if default_direct_share is not None and selective_direct_share is not None:
+        lines.append(
+            "lcqi_ggml_selective_direct_share_delta="
+            f"{selective_direct_share - default_direct_share:.6f}"
+        )
+    if default_f32_bytes is not None and selective_f32_bytes is not None:
+        lines.append(
+            "lcqi_ggml_selective_f32_weight_bytes_saved="
+            f"{default_f32_bytes - selective_f32_bytes:.0f}"
+        )
+    if selective_hotspot is not None:
+        lines.append(f"lcqi_ggml_selective_hotspot_ms={selective_hotspot:.6f}")
+
+
 def add_lcqi_ggml_experimental_ratios(
     lines: list[str],
     lcqi_runs: list[CommandResult],
@@ -992,6 +1388,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--no-download", action="store_true")
     parser.add_argument("--skip-llama-build", action="store_true")
     parser.add_argument("--include-lcqi-q4-direct-off", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-lcqi-q5-0-packed-off", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-lcqi-q6-k-direct", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-lcqi-q8-0-direct-off", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-lcqi-q8-0-lm-head-off", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-lcqi-batch-prefill-off", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--include-lcqi-ggml-selective-direct", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--include-lcqi-ggml-direct", action=argparse.BooleanOptionalAction, default=True)
     return parser.parse_args()
 
@@ -1030,8 +1432,14 @@ def main() -> int:
         )
 
         lcqi_q4_direct_off_runs: list[CommandResult] = []
+        lcqi_q5_0_packed_off_runs: list[CommandResult] = []
+        lcqi_q6_k_direct_runs: list[CommandResult] = []
+        lcqi_q8_0_direct_off_runs: list[CommandResult] = []
+        lcqi_q8_0_lm_head_off_runs: list[CommandResult] = []
+        lcqi_batch_prefill_off_runs: list[CommandResult] = []
         lcqi_serial_runs: list[CommandResult] = []
         lcqi_runs: list[CommandResult] = []
+        lcqi_ggml_selective_direct_runs: list[CommandResult] = []
         lcqi_ggml_direct_runs: list[CommandResult] = []
         llama_simple_runs: list[CommandResult] = []
         for round_index in range(1, args.rounds + 1):
@@ -1052,6 +1460,99 @@ def main() -> int:
                 ensure_success(
                     lcqi_q4_direct_off_runs[-1],
                     "run LCQI Q4 direct off same-input round",
+                )
+            if args.include_lcqi_q5_0_packed_off:
+                print(f"[lcqi-same-input] LCQI Q5_0 packed off round {round_index}/{args.rounds}")
+                lcqi_q5_0_packed_off_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_q5_0_packed_off_round",
+                        env={LCQI_Q5_0_PACKED_ENV: LCQI_Q5_0_PACKED_OFF},
+                    )
+                )
+                ensure_success(
+                    lcqi_q5_0_packed_off_runs[-1],
+                    "run LCQI Q5_0 packed off same-input round",
+                )
+            if args.include_lcqi_q8_0_lm_head_off:
+                print(f"[lcqi-same-input] LCQI Q8_0 lm head off round {round_index}/{args.rounds}")
+                lcqi_q8_0_lm_head_off_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_q8_0_lm_head_off_round",
+                        env={LCQI_Q8_0_TIED_LM_HEAD_ENV: LCQI_Q8_0_TIED_LM_HEAD_OFF},
+                    )
+                )
+                ensure_success(
+                    lcqi_q8_0_lm_head_off_runs[-1],
+                    "run LCQI Q8_0 lm head off same-input round",
+                )
+            if args.include_lcqi_q6_k_direct:
+                print(
+                    "[lcqi-same-input] LCQI Q6_K direct experimental round "
+                    f"{round_index}/{args.rounds}"
+                )
+                lcqi_q6_k_direct_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_q6_k_direct_experimental_round",
+                        env={LCQI_Q6_K_DIRECT_ENV: LCQI_Q6_K_DIRECT_ON},
+                    )
+                )
+                ensure_success(
+                    lcqi_q6_k_direct_runs[-1],
+                    "run LCQI Q6_K direct experimental same-input round",
+                )
+            if args.include_lcqi_q8_0_direct_off:
+                print(f"[lcqi-same-input] LCQI Q8_0 direct off round {round_index}/{args.rounds}")
+                lcqi_q8_0_direct_off_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_q8_0_direct_off_round",
+                        env={LCQI_Q8_0_DIRECT_ENV: LCQI_Q8_0_DIRECT_OFF},
+                    )
+                )
+                ensure_success(
+                    lcqi_q8_0_direct_off_runs[-1],
+                    "run LCQI Q8_0 direct off same-input round",
+                )
+            if args.include_lcqi_batch_prefill_off:
+                print(f"[lcqi-same-input] LCQI batch prefill off round {round_index}/{args.rounds}")
+                lcqi_batch_prefill_off_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_batch_prefill_off_round",
+                        env={LCQI_BATCH_PREFILL_ENV: LCQI_BATCH_PREFILL_OFF},
+                    )
+                )
+                ensure_success(
+                    lcqi_batch_prefill_off_runs[-1],
+                    "run LCQI batch prefill off same-input round",
                 )
             print(f"[lcqi-same-input] LCQI serial round {round_index}/{args.rounds}")
             lcqi_serial_runs.append(
@@ -1079,6 +1580,29 @@ def main() -> int:
                 )
             )
             ensure_success(lcqi_runs[-1], "run LCQI same-input round")
+            if args.include_lcqi_ggml_selective_direct:
+                print(
+                    "[lcqi-same-input] LCQI GGML selective direct round "
+                    f"{round_index}/{args.rounds}"
+                )
+                lcqi_ggml_selective_direct_runs.append(
+                    run_lcqi_round(
+                        lcqi_binary,
+                        model_path,
+                        user_prompt=args.prompt,
+                        max_new_tokens=args.max_new,
+                        round_index=round_index,
+                        timeout_seconds=args.timeout_seconds,
+                        name_prefix="lcqi_ggml_selective_direct_round",
+                        env={
+                            LCQI_GGML_SELECTIVE_DIRECT_ENV: LCQI_GGML_SELECTIVE_DIRECT_ON,
+                        },
+                    )
+                )
+                ensure_success(
+                    lcqi_ggml_selective_direct_runs[-1],
+                    "run LCQI GGML selective direct same-input round",
+                )
             if args.include_lcqi_ggml_direct:
                 print(f"[lcqi-same-input] LCQI GGML direct experimental round {round_index}/{args.rounds}")
                 lcqi_ggml_direct_runs.append(
@@ -1138,8 +1662,14 @@ def main() -> int:
             full_prompt=full_prompt,
             max_new_tokens=args.max_new,
             lcqi_runs=lcqi_runs,
+            lcqi_batch_prefill_off_runs=lcqi_batch_prefill_off_runs,
             lcqi_serial_runs=lcqi_serial_runs,
             lcqi_q4_direct_off_runs=lcqi_q4_direct_off_runs,
+            lcqi_q5_0_packed_off_runs=lcqi_q5_0_packed_off_runs,
+            lcqi_q6_k_direct_runs=lcqi_q6_k_direct_runs,
+            lcqi_q8_0_direct_off_runs=lcqi_q8_0_direct_off_runs,
+            lcqi_q8_0_lm_head_off_runs=lcqi_q8_0_lm_head_off_runs,
+            lcqi_ggml_selective_direct_runs=lcqi_ggml_selective_direct_runs,
             lcqi_ggml_direct_runs=lcqi_ggml_direct_runs,
             llama_tokenize=llama_tokenize,
             llama_simple_runs=llama_simple_runs,

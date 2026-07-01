@@ -14,6 +14,8 @@ namespace {
 constexpr std::size_t LCQI_F32_AVX2_LANE_COUNT = 8;
 constexpr std::size_t LCQI_F32_AVX2_UNROLL_COUNT = 4;
 constexpr std::size_t LCQI_F32_AVX2_WIDE_ROW_UNROLL_COUNT = 8;
+constexpr std::size_t LCQI_F32_AVX2_BATCH_UNROLL_COUNT = 4;
+constexpr std::size_t LCQI_F32_AVX2_WIDE_BATCH_UNROLL_COUNT = 8;
 constexpr std::size_t LCQI_F32_AVX2_UNROLLED_FLOATS =
     LCQI_F32_AVX2_LANE_COUNT * LCQI_F32_AVX2_UNROLL_COUNT;
 
@@ -116,6 +118,41 @@ void compute_eight_row_dot(const float* const* rows,
     }
 }
 
+template <std::size_t BATCH_SIZE>
+void compute_batch_dot(const float* weights,
+                       const float* input,
+                       std::size_t input_size,
+                       float* sums) noexcept {
+    std::size_t index = 0;
+    __m256 accumulators[BATCH_SIZE];
+    std::array<const float*, BATCH_SIZE> inputs{};
+    for (std::size_t batch = 0; batch < BATCH_SIZE; ++batch) {
+        accumulators[batch] = _mm256_setzero_ps();
+        inputs[batch] = input + batch * input_size;
+    }
+
+    for (; index + LCQI_F32_AVX2_LANE_COUNT <= input_size;
+         index += LCQI_F32_AVX2_LANE_COUNT) {
+        const __m256 weight_values = _mm256_loadu_ps(weights + index);
+        for (std::size_t batch = 0; batch < BATCH_SIZE; ++batch) {
+            accumulators[batch] =
+                _mm256_fmadd_ps(weight_values,
+                                _mm256_loadu_ps(inputs[batch] + index),
+                                accumulators[batch]);
+        }
+    }
+
+    for (std::size_t batch = 0; batch < BATCH_SIZE; ++batch) {
+        sums[batch] = horizontal_sum(accumulators[batch]);
+    }
+    for (; index < input_size; ++index) {
+        const float weight_value = weights[index];
+        for (std::size_t batch = 0; batch < BATCH_SIZE; ++batch) {
+            sums[batch] += weight_value * inputs[batch][index];
+        }
+    }
+}
+
 }  // namespace
 
 bool dot_f32_avx2_available() noexcept {
@@ -209,6 +246,80 @@ void linear_f32_rows_avx2_unchecked(const float* weights,
         const float* weight_row = weights + row * input_size;
         output[row] = dot_f32_avx2_unchecked(weight_row, input, input_size) +
                       (bias == nullptr ? 0.0F : bias[row]);
+    }
+}
+
+void linear_f32_batch_rows_avx2_unchecked(const float* weights,
+                                          const float* input,
+                                          const float* bias,
+                                          std::size_t input_size,
+                                          std::size_t batch_size,
+                                          std::size_t row_begin,
+                                          std::size_t row_end,
+                                          std::size_t output_stride,
+                                          float* output) noexcept {
+    for (std::size_t row = row_begin; row < row_end; ++row) {
+        const float* weight_row = weights + row * input_size;
+        std::size_t batch = 0;
+        for (; batch + LCQI_F32_AVX2_WIDE_BATCH_UNROLL_COUNT <= batch_size;
+             batch += LCQI_F32_AVX2_WIDE_BATCH_UNROLL_COUNT) {
+            std::array<float, LCQI_F32_AVX2_WIDE_BATCH_UNROLL_COUNT> sums{};
+            compute_batch_dot<LCQI_F32_AVX2_WIDE_BATCH_UNROLL_COUNT>(
+                weight_row,
+                input + batch * input_size,
+                input_size,
+                sums.data());
+            for (std::size_t offset = 0;
+                 offset < LCQI_F32_AVX2_WIDE_BATCH_UNROLL_COUNT;
+                 ++offset) {
+                output[(batch + offset) * output_stride + row] =
+                    sums[offset] + (bias == nullptr ? 0.0F : bias[row]);
+            }
+        }
+        for (; batch + LCQI_F32_AVX2_BATCH_UNROLL_COUNT <= batch_size;
+             batch += LCQI_F32_AVX2_BATCH_UNROLL_COUNT) {
+            std::array<float, LCQI_F32_AVX2_BATCH_UNROLL_COUNT> sums{};
+            compute_batch_dot<LCQI_F32_AVX2_BATCH_UNROLL_COUNT>(weight_row,
+                                                                input + batch * input_size,
+                                                                input_size,
+                                                                sums.data());
+            for (std::size_t offset = 0; offset < LCQI_F32_AVX2_BATCH_UNROLL_COUNT; ++offset) {
+                output[(batch + offset) * output_stride + row] =
+                    sums[offset] + (bias == nullptr ? 0.0F : bias[row]);
+            }
+        }
+        for (; batch < batch_size; ++batch) {
+            const std::size_t remaining = batch_size - batch;
+            if (remaining == 3U) {
+                std::array<float, 3> sums{};
+                compute_batch_dot<3>(weight_row,
+                                     input + batch * input_size,
+                                     input_size,
+                                     sums.data());
+                for (std::size_t offset = 0; offset < sums.size(); ++offset) {
+                    output[(batch + offset) * output_stride + row] =
+                        sums[offset] + (bias == nullptr ? 0.0F : bias[row]);
+                }
+                break;
+            }
+            if (remaining == 2U) {
+                std::array<float, 2> sums{};
+                compute_batch_dot<2>(weight_row,
+                                     input + batch * input_size,
+                                     input_size,
+                                     sums.data());
+                for (std::size_t offset = 0; offset < sums.size(); ++offset) {
+                    output[(batch + offset) * output_stride + row] =
+                        sums[offset] + (bias == nullptr ? 0.0F : bias[row]);
+                }
+                break;
+            }
+            output[batch * output_stride + row] =
+                dot_f32_avx2_unchecked(weight_row,
+                                       input + batch * input_size,
+                                       input_size) +
+                (bias == nullptr ? 0.0F : bias[row]);
+        }
     }
 }
 

@@ -2,6 +2,7 @@
 
 #include <lcqi/gpt2_reference.hpp>
 #include <lcqi/gguf.hpp>
+#include <lcqi/q5_0_packed.hpp>
 #include <lcqi/reference_decoder.hpp>
 
 #include <cstddef>
@@ -16,6 +17,9 @@ namespace lcqi {
 enum class LlamaGgufLinearStorage : std::uint8_t {
     f32,
     q4_k,
+    q5_0_packed,
+    q6_k_direct,
+    q8_0_direct,
     ggml_quantized,
 };
 
@@ -26,6 +30,7 @@ struct LlamaGgufLinearWeights {
     LlamaGgufLinearStorage storage = LlamaGgufLinearStorage::f32;
     std::vector<float> f32_weights;
     std::vector<std::uint8_t> quantized_bytes;
+    std::vector<Q5_0PackedBlock> q5_0_packed_blocks;
 };
 
 struct LlamaGgufDecoderLayerWeights {
@@ -43,6 +48,7 @@ struct LlamaGgufDecoderLayerWeights {
 struct LlamaGgufDecoderModel {
     DecoderConfig config;
     std::vector<float> token_embedding;
+    LlamaGgufLinearWeights tied_lm_head;
     std::vector<LlamaGgufDecoderLayerWeights> layers;
     std::vector<float> final_norm_weight;
     LlamaGgufLinearWeights lm_head;
@@ -65,8 +71,15 @@ struct LlamaGgufLoadReport {
     std::uint64_t f32_weight_bytes = 0;
     std::uint64_t direct_quantized_weight_bytes = 0;
     std::uint64_t fallback_dequantized_weight_bytes = 0;
+    std::uint64_t q5_0_packed_weight_bytes = 0;
+    std::uint64_t q5_0_batch_f32_weight_bytes = 0;
+    std::uint64_t q6_k_direct_weight_bytes = 0;
+    std::uint64_t q8_0_direct_weight_bytes = 0;
     std::int64_t tensors_loaded = 0;
     std::int64_t q4_k_direct_tensors = 0;
+    std::int64_t q5_0_packed_tensors = 0;
+    std::int64_t q6_k_direct_tensors = 0;
+    std::int64_t q8_0_direct_tensors = 0;
     std::int64_t ggml_direct_tensors = 0;
     std::int64_t f32_fallback_tensors = 0;
 };
@@ -89,9 +102,17 @@ struct LlamaGgufHotspotReport {
     double w_down_ms = 0.0;
     double lm_head_ms = 0.0;
     double q4_k_direct_ms = 0.0;
+    double q5_0_packed_ms = 0.0;
+    double q5_0_batch_f32_ms = 0.0;
+    double q6_k_direct_ms = 0.0;
+    double q8_0_direct_ms = 0.0;
     double ggml_direct_ms = 0.0;
     double f32_fallback_ms = 0.0;
     std::uint64_t q4_k_direct_calls = 0;
+    std::uint64_t q5_0_packed_calls = 0;
+    std::uint64_t q5_0_batch_f32_calls = 0;
+    std::uint64_t q6_k_direct_calls = 0;
+    std::uint64_t q8_0_direct_calls = 0;
     std::uint64_t ggml_direct_calls = 0;
     std::uint64_t f32_fallback_calls = 0;
 };

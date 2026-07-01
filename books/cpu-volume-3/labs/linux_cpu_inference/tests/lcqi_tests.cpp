@@ -8,6 +8,7 @@
 #include <lcqi/llama_gguf.hpp>
 #include <lcqi/model.hpp>
 #include <lcqi/q4_k.hpp>
+#include <lcqi/q5_0_packed.hpp>
 #include <lcqi/reference_decoder.hpp>
 #include <lcqi/safetensors.hpp>
 #include <lcqi/tokenizer.hpp>
@@ -48,6 +49,7 @@ constexpr std::int32_t LCQI_SIMD_TEST_BLOCK = 8;
 constexpr std::size_t LCQI_F32_DOT_TEST_SIZE = 257;
 constexpr std::size_t LCQI_F32_ROW_TEST_INPUT_SIZE = 65;
 constexpr std::size_t LCQI_F32_ROW_TEST_OUTPUT_SIZE = 17;
+constexpr std::size_t LCQI_F32_BATCH_TEST_SIZE = 5;
 constexpr std::int32_t LCQI_REFERENCE_DECODER_PREDICTED_TOKEN = 0;
 constexpr std::size_t LCQI_REFERENCE_DECODER_VOCAB_SIZE = 5;
 constexpr std::array<float, LCQI_REFERENCE_DECODER_VOCAB_SIZE> LCQI_REFERENCE_DECODER_LOGITS{
@@ -123,7 +125,14 @@ constexpr std::int32_t LCQI_LLAMA_Q4_TEST_INTERMEDIATE = 256;
 constexpr std::int32_t LCQI_LLAMA_Q4_TEST_VOCAB = 2;
 constexpr std::int32_t LCQI_LLAMA_Q4_TEST_CONTEXT = 4;
 constexpr std::int32_t LCQI_LLAMA_Q4_TEST_LAYER_COUNT = 1;
+constexpr const char* LCQI_TEST_LLAMA_BATCH_PREFILL_ENV = "LCQI_LLAMA_BATCH_PREFILL";
 constexpr const char* LCQI_TEST_LLAMA_GGML_DIRECT_ENV = "LCQI_LLAMA_GGML_DIRECT";
+constexpr const char* LCQI_TEST_LLAMA_GGML_SELECTIVE_DIRECT_ENV =
+    "LCQI_LLAMA_GGML_SELECTIVE_DIRECT";
+constexpr const char* LCQI_TEST_LLAMA_Q5_0_PACKED_ENV = "LCQI_LLAMA_Q5_0_PACKED";
+constexpr const char* LCQI_TEST_LLAMA_Q6_K_DIRECT_ENV = "LCQI_LLAMA_Q6_K_DIRECT";
+constexpr const char* LCQI_TEST_LLAMA_Q8_0_DIRECT_ENV = "LCQI_LLAMA_Q8_0_DIRECT";
+constexpr const char* LCQI_TEST_FALSE_ENV = "0";
 constexpr const char* LCQI_TEST_TRUE_ENV = "1";
 
 struct KernelShapeCase {
@@ -1384,6 +1393,57 @@ void test_ggml_quantized_f32_matvec_paths() {
                                                             q8_0_row_range_direct,
                                                             1,
                                                             2);
+            constexpr std::size_t LCQI_GGML_DIRECT_BATCH_SIZE = 3;
+            std::vector<lcqi::Q8_0InputBlock> batch_q8_0_input(
+                LCQI_GGML_DIRECT_BATCH_SIZE * q8_0_input.size());
+            std::vector<float> expected_batch(LCQI_GGML_DIRECT_BATCH_SIZE * 2U, 0.0F);
+            std::vector<float> direct_batch(expected_batch.size(), 0.0F);
+            for (std::size_t batch = 0; batch < LCQI_GGML_DIRECT_BATCH_SIZE; ++batch) {
+                std::vector<float> batch_input(input.begin(), input.end());
+                for (std::size_t index = 0; index < batch_input.size(); ++index) {
+                    batch_input[index] +=
+                        static_cast<float>(static_cast<std::int32_t>(batch) - 1) *
+                        0.015625F;
+                }
+                const std::vector<lcqi::Q8_0InputBlock> batch_quantized =
+                    lcqi::quantize_q8_0_input(batch_input);
+                std::copy(batch_quantized.begin(),
+                          batch_quantized.end(),
+                          batch_q8_0_input.begin() +
+                              static_cast<std::ptrdiff_t>(batch * batch_quantized.size()));
+                lcqi::matvec_ggml_quantized_q8_0(
+                    type,
+                    matrix,
+                    2,
+                    columns,
+                    batch_quantized,
+                    std::span<float>(expected_batch).subspan(batch * 2U, 2U));
+            }
+            lcqi::matvec_ggml_quantized_q8_0_batch_rows_unchecked(
+                type,
+                matrix,
+                2,
+                columns,
+                batch_q8_0_input,
+                static_cast<std::int64_t>(LCQI_GGML_DIRECT_BATCH_SIZE),
+                direct_batch,
+                2,
+                0,
+                2);
+            const lcqi::F32RowMax q8_0_max =
+                lcqi::max_dot_ggml_quantized_q8_0(type,
+                                                  matrix,
+                                                  2,
+                                                  columns,
+                                                  q8_0_input);
+            const lcqi::F32RowMax q8_0_subrange_max =
+                lcqi::max_dot_ggml_quantized_q8_0_rows_unchecked(type,
+                                                                 matrix,
+                                                                 2,
+                                                                 columns,
+                                                                 q8_0_input,
+                                                                 1,
+                                                                 2);
             const std::vector<float> weights =
                 lcqi::dequantize_ggml_tensor(type, matrix, columns * 2);
             std::array<float, 2> reference{0.0F, 0.0F};
@@ -1400,6 +1460,21 @@ void test_ggml_quantized_f32_matvec_paths() {
                     throw std::runtime_error(message);
                 }
                 if (std::fabs(q8_0_direct[row] - q8_0_row_range_direct[row]) >
+                    LCQI_GGML_Q8_MATVEC_MAX_DIFF) {
+                    throw std::runtime_error(message);
+                }
+            }
+            require(q8_0_max.row == 0U, "GGML Q8_0 max-dot selected the wrong row");
+            require(std::fabs(q8_0_max.value - q8_0_direct[0]) <=
+                        LCQI_GGML_Q8_MATVEC_MAX_DIFF,
+                    "GGML Q8_0 max-dot value differs from matvec output");
+            require(q8_0_subrange_max.row == 1U,
+                    "GGML Q8_0 row-range max-dot selected the wrong row");
+            require(std::fabs(q8_0_subrange_max.value - q8_0_direct[1]) <=
+                        LCQI_GGML_Q8_MATVEC_MAX_DIFF,
+                    "GGML Q8_0 row-range max-dot value differs from matvec output");
+            for (std::size_t index = 0; index < direct_batch.size(); ++index) {
+                if (std::fabs(expected_batch[index] - direct_batch[index]) >
                     LCQI_GGML_Q8_MATVEC_MAX_DIFF) {
                     throw std::runtime_error(message);
                 }
@@ -1437,6 +1512,104 @@ void test_ggml_quantized_f32_matvec_paths() {
                                       "Q6_K direct matvec mismatch");
 }
 
+void test_q5_0_packed_matvec_matches_ggml_q8_0_path() {
+    std::vector<float> input(static_cast<std::size_t>(lcqi::LCQI_Q5_0_BLOCK_VALUES), 0.0F);
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] =
+            static_cast<float>(static_cast<std::int32_t>(index % 11U) - 5) * 0.0625F;
+    }
+    const std::vector<std::uint8_t> block = make_q5_0_test_block();
+    std::vector<std::uint8_t> matrix;
+    matrix.reserve(block.size() * 2U);
+    matrix.insert(matrix.end(), block.begin(), block.end());
+    matrix.insert(matrix.end(), block.begin(), block.end());
+
+    const std::vector<lcqi::Q8_0InputBlock> q8_0_input = lcqi::quantize_q8_0_input(input);
+    std::vector<float> ggml_direct(2, 0.0F);
+    lcqi::matvec_ggml_quantized_q8_0(lcqi::GgmlType::q5_0,
+                                     matrix,
+                                     2,
+                                     lcqi::LCQI_Q5_0_BLOCK_VALUES,
+                                     q8_0_input,
+                                     ggml_direct);
+    const std::vector<lcqi::Q5_0PackedBlock> packed =
+        lcqi::pack_q5_0_blocks(matrix, lcqi::LCQI_Q5_0_BLOCK_VALUES * 2);
+    std::vector<float> packed_direct(2, 0.0F);
+    lcqi::matvec_q5_0_packed_q8_0(packed,
+                                  2,
+                                  lcqi::LCQI_Q5_0_BLOCK_VALUES,
+                                  q8_0_input,
+                                  packed_direct);
+    std::vector<float> row_range_direct(2, 0.0F);
+    lcqi::matvec_q5_0_packed_q8_0_rows_unchecked(packed,
+                                                 2,
+                                                 lcqi::LCQI_Q5_0_BLOCK_VALUES,
+                                                 q8_0_input,
+                                                 row_range_direct,
+                                                 0,
+                                                 1);
+    lcqi::matvec_q5_0_packed_q8_0_rows_unchecked(packed,
+                                                 2,
+                                                 lcqi::LCQI_Q5_0_BLOCK_VALUES,
+                                                 q8_0_input,
+                                                 row_range_direct,
+                                                 1,
+                                                 2);
+    const auto assert_packed_batch_matches_per_token =
+        [&](std::size_t batch_size, const char* message) {
+            std::vector<lcqi::Q8_0InputBlock> batch_q8_0_input(
+                batch_size * q8_0_input.size());
+            std::vector<float> expected_batch(batch_size * ggml_direct.size(), 0.0F);
+            std::vector<float> packed_batch(expected_batch.size(), 0.0F);
+            for (std::size_t batch = 0; batch < batch_size; ++batch) {
+                std::vector<float> batch_input = input;
+                for (std::size_t index = 0; index < batch_input.size(); ++index) {
+                    batch_input[index] +=
+                        static_cast<float>(static_cast<std::int32_t>(batch) - 1) * 0.03125F;
+                }
+                const std::vector<lcqi::Q8_0InputBlock> batch_quantized =
+                    lcqi::quantize_q8_0_input(batch_input);
+                std::copy(batch_quantized.begin(),
+                          batch_quantized.end(),
+                          batch_q8_0_input.begin() +
+                              static_cast<std::ptrdiff_t>(batch * batch_quantized.size()));
+                lcqi::matvec_q5_0_packed_q8_0(
+                    packed,
+                    2,
+                    lcqi::LCQI_Q5_0_BLOCK_VALUES,
+                    batch_quantized,
+                    std::span<float>(expected_batch)
+                        .subspan(batch * ggml_direct.size(), ggml_direct.size()));
+            }
+            lcqi::matvec_q5_0_packed_q8_0_batch_rows_unchecked(
+                packed,
+                2,
+                lcqi::LCQI_Q5_0_BLOCK_VALUES,
+                batch_q8_0_input,
+                static_cast<std::int64_t>(batch_size),
+                packed_batch,
+                static_cast<std::int64_t>(ggml_direct.size()),
+                0,
+                2);
+            for (std::size_t index = 0; index < packed_batch.size(); ++index) {
+                require(std::fabs(expected_batch[index] - packed_batch[index]) <=
+                            LCQI_GGML_Q8_MATVEC_MAX_DIFF,
+                        message);
+            }
+        };
+    assert_packed_batch_matches_per_token(3, "Q5_0 packed batch tail-3 output mismatch");
+    assert_packed_batch_matches_per_token(5, "Q5_0 packed batch 4+1 output mismatch");
+    assert_packed_batch_matches_per_token(11, "Q5_0 packed batch 8+3 output mismatch");
+    for (std::size_t row = 0; row < ggml_direct.size(); ++row) {
+        require(std::fabs(ggml_direct[row] - packed_direct[row]) <=
+                    LCQI_GGML_Q8_MATVEC_MAX_DIFF,
+                "Q5_0 packed output differs from GGML Q8_0 direct path");
+        require(std::fabs(packed_direct[row] - row_range_direct[row]) <=
+                    LCQI_GGML_Q8_MATVEC_MAX_DIFF,
+                "Q5_0 packed row range output differs from full path");
+    }
+}
+
 void test_llama_gguf_loader_and_generation() {
     const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_fixture.gguf");
     write_tiny_llama_gguf_fixture(path);
@@ -1472,6 +1645,86 @@ void test_llama_gguf_loader_and_generation() {
             "LLaMA GGUF F32 fixture should not call Q4_K direct matvec");
     require(result.hotspots.ggml_direct_calls == 0,
             "LLaMA GGUF F32 fixture should not call GGML direct matvec");
+}
+
+void test_llama_gguf_default_packs_q5_0_tensors() {
+    const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_q5_0_packed.gguf");
+    write_tiny_llama_ggml_direct_gguf_fixture(path);
+
+    const ScopedEnvVar disable_ggml_direct(LCQI_TEST_LLAMA_GGML_DIRECT_ENV,
+                                           LCQI_TEST_FALSE_ENV);
+    const ScopedEnvVar disable_selective_ggml_direct(LCQI_TEST_LLAMA_GGML_SELECTIVE_DIRECT_ENV,
+                                                     LCQI_TEST_FALSE_ENV);
+    const ScopedEnvVar enable_q5_0_packed(LCQI_TEST_LLAMA_Q5_0_PACKED_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const ScopedEnvVar enable_q8_0_direct(LCQI_TEST_LLAMA_Q8_0_DIRECT_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{0};
+    const lcqi::LlamaGgufGenerationResult result =
+        lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+    std::filesystem::remove(path);
+
+    require(loaded.report.q5_0_packed_tensors == 4,
+            "default LLaMA GGUF path should pack Q5_0 tensors");
+    require(loaded.report.ggml_direct_tensors == 0,
+            "default LLaMA GGUF path should not use experimental GGML direct tensors");
+    require(loaded.report.q8_0_direct_tensors == 2,
+            "default LLaMA GGUF path should keep Q8_0 tensors direct");
+    require(loaded.report.f32_fallback_tensors == 5,
+            "default LLaMA GGUF path should leave F32 and Q6_K tensors in fallback");
+    require(result.hotspots.q5_0_packed_calls == 4,
+            "default LLaMA GGUF path Q5_0 packed call count mismatch");
+    require(result.hotspots.q8_0_direct_calls == 2,
+            "default LLaMA GGUF path Q8_0 direct call count mismatch");
+    require(result.hotspots.f32_fallback_calls == 1,
+            "default LLaMA GGUF path fallback call count mismatch");
+    require(result.hotspots.ggml_direct_calls == 0,
+            "default LLaMA GGUF path should not call experimental GGML direct");
+    require(result.generated_ids == std::vector<std::int32_t>({0, 0}),
+            "default LLaMA GGUF Q5_0 packed generated ids mismatch");
+}
+
+void test_llama_gguf_batch_prefill_uses_q5_0_f32_sidecar_path() {
+    const std::filesystem::path path =
+        temp_file_path("lcqi_tiny_llama_q5_0_batch_prefill.gguf");
+    write_tiny_llama_ggml_direct_gguf_fixture(path);
+
+    const ScopedEnvVar disable_ggml_direct(LCQI_TEST_LLAMA_GGML_DIRECT_ENV,
+                                           LCQI_TEST_FALSE_ENV);
+    const ScopedEnvVar disable_selective_ggml_direct(LCQI_TEST_LLAMA_GGML_SELECTIVE_DIRECT_ENV,
+                                                     LCQI_TEST_FALSE_ENV);
+    const ScopedEnvVar enable_q5_0_packed(LCQI_TEST_LLAMA_Q5_0_PACKED_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const ScopedEnvVar enable_q8_0_direct(LCQI_TEST_LLAMA_Q8_0_DIRECT_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{0, 0, 0};
+    {
+        const ScopedEnvVar disable_batch_prefill(LCQI_TEST_LLAMA_BATCH_PREFILL_ENV,
+                                                 LCQI_TEST_FALSE_ENV);
+        const lcqi::LlamaGgufGenerationResult token_path =
+            lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+        const ScopedEnvVar enable_batch_prefill(LCQI_TEST_LLAMA_BATCH_PREFILL_ENV,
+                                                LCQI_TEST_TRUE_ENV);
+        const lcqi::LlamaGgufGenerationResult batch_path =
+            lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+        require(batch_path.generated_ids == token_path.generated_ids,
+                "Q5_0 packed batch prefill generated ids differ from token path");
+        require(batch_path.predicted_first_token == token_path.predicted_first_token,
+                "Q5_0 packed batch prefill predicted token differs from token path");
+        require(batch_path.hotspots.q5_0_packed_calls == 0,
+                "Q5_0 batch prefill should not use packed decode kernels");
+        require(batch_path.hotspots.q5_0_batch_f32_calls ==
+                    static_cast<std::uint64_t>(loaded.report.q5_0_packed_tensors),
+                "Q5_0 batch prefill should call each F32 sidecar tensor once");
+        require(token_path.hotspots.q5_0_packed_calls >
+                    batch_path.hotspots.q5_0_packed_calls,
+                "Q5_0 batch prefill should leave packed matvecs to token/decode path");
+    }
+    std::filesystem::remove(path);
 }
 
 void test_llama_gguf_parallel_generation_matches_serial() {
@@ -1567,6 +1820,74 @@ void test_llama_gguf_ggml_direct_generation() {
             "LLaMA GGML fixture should not call fallback linear matvec");
     require(result.generated_ids == std::vector<std::int32_t>({0, 0}),
             "LLaMA GGML fixture generated ids mismatch");
+}
+
+void test_llama_gguf_selective_ggml_direct_keeps_q6_fallback() {
+    const ScopedEnvVar enable_selective_ggml_direct(
+        LCQI_TEST_LLAMA_GGML_SELECTIVE_DIRECT_ENV,
+        LCQI_TEST_TRUE_ENV);
+    const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_selective_ggml.gguf");
+    write_tiny_llama_ggml_direct_gguf_fixture(path);
+
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{0};
+    const lcqi::LlamaGgufGenerationResult result =
+        lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+    std::filesystem::remove(path);
+
+    require(loaded.report.q4_k_direct_tensors == 0,
+            "selective GGML fixture should not use Q4_K direct tensors");
+    require(loaded.report.ggml_direct_tensors == 6,
+            "selective GGML fixture should only keep Q5_0/Q8_0 tensors direct");
+    require(loaded.report.f32_fallback_tensors == 5,
+            "selective GGML fixture should dequantize Q6_K through the F32 fallback");
+    require(result.hotspots.ggml_direct_calls == 6,
+            "selective GGML fixture direct call count mismatch");
+    require(result.hotspots.f32_fallback_calls == 1,
+            "selective GGML fixture Q6_K fallback call count mismatch");
+    require(result.hotspots.q4_k_direct_calls == 0,
+            "selective GGML fixture should not call Q4_K direct matvec");
+    require(result.generated_ids == std::vector<std::int32_t>({0, 0}),
+            "selective GGML fixture generated ids mismatch");
+}
+
+void test_llama_gguf_q6_k_direct_experimental_path() {
+    const ScopedEnvVar disable_ggml_direct(LCQI_TEST_LLAMA_GGML_DIRECT_ENV,
+                                           LCQI_TEST_FALSE_ENV);
+    const ScopedEnvVar disable_selective_ggml_direct(LCQI_TEST_LLAMA_GGML_SELECTIVE_DIRECT_ENV,
+                                                     LCQI_TEST_FALSE_ENV);
+    const ScopedEnvVar enable_q5_0_packed(LCQI_TEST_LLAMA_Q5_0_PACKED_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const ScopedEnvVar enable_q8_0_direct(LCQI_TEST_LLAMA_Q8_0_DIRECT_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const ScopedEnvVar enable_q6_k_direct(LCQI_TEST_LLAMA_Q6_K_DIRECT_ENV,
+                                          LCQI_TEST_TRUE_ENV);
+    const std::filesystem::path path =
+        temp_file_path("lcqi_tiny_llama_q6_k_direct.gguf");
+    write_tiny_llama_ggml_direct_gguf_fixture(path);
+
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{0};
+    const lcqi::LlamaGgufGenerationResult result =
+        lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+    std::filesystem::remove(path);
+
+    require(loaded.report.q5_0_packed_tensors == 4,
+            "Q6_K direct fixture should still pack Q5_0 tensors");
+    require(loaded.report.q6_k_direct_tensors == 1,
+            "Q6_K direct fixture should keep the Q6_K tensor direct");
+    require(loaded.report.q8_0_direct_tensors == 2,
+            "Q6_K direct fixture should still keep Q8_0 tensors direct");
+    require(loaded.report.f32_fallback_tensors == 4,
+            "Q6_K direct fixture should remove Q6_K from the F32 fallback set");
+    require(result.hotspots.q6_k_direct_calls == 1,
+            "Q6_K direct fixture should call the Q6_K direct path once");
+    require(result.hotspots.f32_fallback_calls == 0,
+            "Q6_K direct fixture should not call fallback linear matvec");
+    require(result.generated_ids == std::vector<std::int32_t>({0, 0}),
+            "Q6_K direct fixture generated ids mismatch");
 }
 
 void test_gpt2_tiny_forward_and_generation() {
@@ -2054,6 +2375,85 @@ void test_f32_row_kernels_match_scalar() {
     }
 }
 
+void test_f32_batch_row_kernels_match_scalar() {
+    std::vector<float> weights(LCQI_F32_ROW_TEST_INPUT_SIZE *
+                                   LCQI_F32_ROW_TEST_OUTPUT_SIZE,
+                               0.0F);
+    std::vector<float> input(LCQI_F32_BATCH_TEST_SIZE * LCQI_F32_ROW_TEST_INPUT_SIZE, 0.0F);
+    std::vector<float> bias(LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+    for (std::size_t index = 0; index < weights.size(); ++index) {
+        weights[index] =
+            static_cast<float>(static_cast<std::int32_t>(index % 19U) - 9) * 0.03125F;
+    }
+    for (std::size_t index = 0; index < input.size(); ++index) {
+        input[index] =
+            static_cast<float>(static_cast<std::int32_t>(index % 23U) - 11) * 0.046875F;
+    }
+    for (std::size_t index = 0; index < bias.size(); ++index) {
+        bias[index] =
+            static_cast<float>(static_cast<std::int32_t>(index % 5U) - 2) * 0.125F;
+    }
+
+    constexpr std::size_t LCQI_F32_BATCH_ROW_BEGIN = 1;
+    constexpr std::size_t LCQI_F32_BATCH_ROW_END = 16;
+    std::vector<float> scalar(LCQI_F32_BATCH_TEST_SIZE * LCQI_F32_ROW_TEST_OUTPUT_SIZE, 0.0F);
+    std::vector<float> dispatched(scalar.size(), 0.0F);
+    for (std::size_t batch = 0; batch < LCQI_F32_BATCH_TEST_SIZE; ++batch) {
+        lcqi::linear_f32_rows_scalar_unchecked(
+            weights.data(),
+            input.data() + batch * LCQI_F32_ROW_TEST_INPUT_SIZE,
+            bias.data(),
+            LCQI_F32_ROW_TEST_INPUT_SIZE,
+            LCQI_F32_BATCH_ROW_BEGIN,
+            LCQI_F32_BATCH_ROW_END,
+            scalar.data() + batch * LCQI_F32_ROW_TEST_OUTPUT_SIZE);
+    }
+    lcqi::linear_f32_batch_rows_unchecked(weights.data(),
+                                          input.data(),
+                                          bias.data(),
+                                          LCQI_F32_ROW_TEST_INPUT_SIZE,
+                                          LCQI_F32_BATCH_TEST_SIZE,
+                                          LCQI_F32_BATCH_ROW_BEGIN,
+                                          LCQI_F32_BATCH_ROW_END,
+                                          LCQI_F32_ROW_TEST_OUTPUT_SIZE,
+                                          dispatched.data());
+    for (std::size_t batch = 0; batch < LCQI_F32_BATCH_TEST_SIZE; ++batch) {
+        for (std::size_t row = LCQI_F32_BATCH_ROW_BEGIN; row < LCQI_F32_BATCH_ROW_END; ++row) {
+            const std::size_t index = batch * LCQI_F32_ROW_TEST_OUTPUT_SIZE + row;
+            require(std::fabs(scalar[index] - dispatched[index]) <= LCQI_F32_KERNEL_MAX_DIFF,
+                    "F32 batch row kernel output differs from scalar");
+        }
+    }
+}
+
+void test_llama_gguf_batch_prefill_matches_token_path() {
+    const std::filesystem::path path = temp_file_path("lcqi_tiny_llama_batch_prefill.gguf");
+    write_tiny_llama_gguf_fixture(path);
+
+    const lcqi::LlamaGgufLoadedModel loaded =
+        lcqi::load_llama_gguf_reference_model(path);
+    const std::vector<std::int32_t> prompt{1, 2, 3};
+    {
+        const ScopedEnvVar disable_batch_prefill(LCQI_TEST_LLAMA_BATCH_PREFILL_ENV,
+                                                 LCQI_TEST_FALSE_ENV);
+        const lcqi::LlamaGgufGenerationResult token_path =
+            lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+        const ScopedEnvVar enable_batch_prefill(LCQI_TEST_LLAMA_BATCH_PREFILL_ENV,
+                                                LCQI_TEST_TRUE_ENV);
+        const lcqi::LlamaGgufGenerationResult batch_path =
+            lcqi::llama_gguf_generate_greedy(loaded.model, prompt, 1);
+        require(batch_path.generated_ids == token_path.generated_ids,
+                "batch prefill generated ids differ from token path");
+        require(batch_path.predicted_first_token == token_path.predicted_first_token,
+                "batch prefill predicted token differs from token path");
+        require(batch_path.prefill_steps == token_path.prefill_steps,
+                "batch prefill step count differs from token path");
+        require(batch_path.hotspots.f32_fallback_calls < token_path.hotspots.f32_fallback_calls,
+                "batch prefill should reduce fallback linear call count");
+    }
+    std::filesystem::remove(path);
+}
+
 }  // namespace
 
 int main() {
@@ -2069,10 +2469,15 @@ int main() {
         test_q4_k_dequant_and_dot_paths();
         test_ggml_mixed_dequantizers();
         test_ggml_quantized_f32_matvec_paths();
+        test_q5_0_packed_matvec_matches_ggml_q8_0_path();
         test_llama_gguf_loader_and_generation();
+        test_llama_gguf_default_packs_q5_0_tensors();
+        test_llama_gguf_batch_prefill_uses_q5_0_f32_sidecar_path();
         test_llama_gguf_parallel_generation_matches_serial();
         test_llama_gguf_q4_direct_generation();
         test_llama_gguf_ggml_direct_generation();
+        test_llama_gguf_selective_ggml_direct_keeps_q6_fallback();
+        test_llama_gguf_q6_k_direct_experimental_path();
         test_gpt2_tiny_forward_and_generation();
         test_gpt2_byte_bpe_tokenizer();
         test_gpt2_loads_hf_style_tiny_checkpoint();
@@ -2085,6 +2490,8 @@ int main() {
         test_packed_i8_kernel_matches_scalar();
         test_f32_dot_kernel_matches_scalar();
         test_f32_row_kernels_match_scalar();
+        test_f32_batch_row_kernels_match_scalar();
+        test_llama_gguf_batch_prefill_matches_token_path();
 
         std::cout << "lcqi tests passed\n";
         return EXIT_SUCCESS;
