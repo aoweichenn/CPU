@@ -11,6 +11,7 @@
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
 - `books/cpu-volume-3-practice/`：第三册配套实践与代码卷，主题是 Linux 本地量化推理引擎、完整源码、KV Cache、reference trace、7B 账本、服务 SLO、CPU/GPU 后端边界和验收门禁。
 - `books/cpu-volume-3-source/`：第三册源码卷历史素材目录；默认导出已合并到第三册实践与代码卷。
+- `books/hardware-zero-to-machine/`：硬件从零到整机原理卷，主题是从二极管、逻辑门、组合逻辑、时序逻辑、ALU 和最小 CPU 推导到内存、I/O 与整机。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 - `books/cpp-zero-to-advanced/`：Cpp 从零到高级教材，主题是执行模型、值和类型、RAII、标准库、泛型、构建测试、性能、并发、大型代码组织和综合项目。
 

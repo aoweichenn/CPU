@@ -1,0 +1,115 @@
+\chapter{控制器}
+
+数据通路提供了很多可能路径，但同一周期不能所有路径都随意打开。控制器的任务是根据当前状态和外部条件，产生一组控制信号，让数据通路执行一个明确动作。控制器不是写在纸上的命令列表，而是一块输出控制电线的硬件。
+
+\section{一、控制信号就是电线值}
+
+控制信号通常是一组 0/1 或多 bit 选择值：
+
+\begin{lstlisting}
+alu_op
+a_sel
+b_sel
+wb_sel
+reg_write
+mem_read
+mem_write
+next_state_sel
+\end{lstlisting}
+
+这些信号直接接到 ALU、mux、寄存器阵列和存储器接口。控制信号给错，数据通路就会走错。例如 reg\_write 本应为 0 却变成 1，某个寄存器会在时钟沿被意外覆盖；wb\_sel 本应选择 ALU，却选了外部输入，写回值就会错。
+
+因此控制器要解决的不是“告诉硬件一句话”，而是“在每个周期给出一组一致的电线值”。一致意味着：来源只开一路，目的地只写该写的，ALU 操作和输入选择匹配，下一状态也和当前动作匹配。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state,minimum width=1.55cm] (state) at (0.9,1.65) {状态寄存器};
+  \node[hw control,minimum width=1.4cm] (code) at (0.9,0.45) {动作编码};
+  \node[hw compute,minimum width=2.25cm] (decode) at (3.8,1.05) {译码/下一状态逻辑};
+  \node[hw control,minimum width=1.25cm] (sig1) at (6.75,2.25) {alu\_op};
+  \node[hw control,minimum width=1.25cm] (sig2) at (6.75,1.45) {mux 选择};
+  \node[hw control,minimum width=1.25cm] (sig3) at (6.75,0.65) {写使能};
+  \node[hw control,minimum width=1.25cm] (sig4) at (6.75,-0.15) {下一状态};
+  \draw[hw bus] (state.east) -- (decode.west);
+  \draw[hw bus] (code.east) -- (decode.west);
+  \draw[hw bus] (decode.east) -- (sig1.west);
+  \draw[hw bus] (decode.east) -- (sig2.west);
+  \draw[hw bus] (decode.east) -- (sig3.west);
+  \draw[hw bus] (decode.east) -- (sig4.west);
+  \draw[BookTeal,line width=0.55pt,-{Latex[length=2mm,width=1.5mm]}] (sig4.south) .. controls (4.2,-1.05) and (1.2,-0.8) .. (state.south);
+  \node[hw label,align=center] at (3.9,-1.35) {控制器输出的是一组同时有效的电线值，不是一句顺序命令};
+\end{pdfdiagram}
+\diagramnote{控制器把当前状态和动作编码译成一致的控制信号组，并准备下一状态。}
+
+\section{二、硬连线控制适合简单规则}
+
+若动作规则简单，可以用组合逻辑直接从输入生成控制信号。例如输入 mode 为 0 时做加法，为 1 时做按位 AND：
+
+\begin{lstlisting}
+mode = 0 -> alu_op = ADD
+mode = 1 -> alu_op = AND
+\end{lstlisting}
+
+硬件实现仍然是译码和门电路，不是顺序执行。mode 进入译码逻辑，译码逻辑输出 ALU 的选择位。若还要控制写回，则同一块译码逻辑同时产生 wb\_sel 和 reg\_write。
+
+硬连线控制速度快，结构也直接。缺点是规则复杂后，组合逻辑会变大，修改一个动作可能影响多条控制线。即便如此，很多简单数据通路仍然适合硬连线控制，因为它没有额外状态，输入一稳定，控制信号就稳定。
+
+\section{三、状态机控制多周期动作}
+
+如果一个动作无法在一个周期内完成，就需要状态机。状态机保存“当前走到哪一步”，每个状态输出一组控制信号，并决定下一状态。
+
+\begin{longtable}{p{0.18\linewidth}p{0.48\linewidth}p{0.24\linewidth}}
+\toprule
+状态 & 控制动作 & 下一状态 \\
+\midrule
+S0 & 选择源寄存器，锁存操作数 & S1 \\
+S1 & ALU 计算，结果进入临时寄存器 & S2 \\
+S2 & 选择临时结果，写回目标寄存器 & S0 \\
+\bottomrule
+\end{longtable}
+
+这里每一行都对应真实硬件动作。S0 打开读路径和临时寄存器写使能；S1 设置 ALU 输入和 op，并保存 ALU 结果；S2 打开写回路径和目标寄存器写使能。状态机让复杂动作分成多个清楚边界，而不是把所有组合逻辑塞进一个超长周期。
+
+\section{四、微操作把动作拆成控制信号组}
+
+复杂动作可以拆成微操作：读、选择、计算、保存、更新状态。这里的微操作不是另一个抽象层的口号，而是一个周期内同时打开的一组硬件控制信号。用一个具体动作看得最清楚：把 R1 和 R2 相加，结果写入 R3。
+
+先假设数据通路里有这些部件：寄存器阵列有两个读地址输入和一个写地址输入；读出的两个值可以进入 A、B 两个操作数锁存器；ALU 的输出可以进入结果锁存器；写回 mux 可以在不同来源中选择一个值送回寄存器阵列。控制器要做的事，就是在每个状态给这些部件分配正确的选择值和写使能。下面先给出三个周期的控制信号 trace，再逐步解释每一组信号对应的硬件动作：
+
+\begin{lstlisting}
+S0: read_sel_a=R1, read_sel_b=R2
+    A_write=1, B_write=1
+    reg_write=0, ALU_out_write=0
+
+S1: a_sel=A, b_sel=B, alu_op=ADD
+    ALU_out_write=1
+    reg_write=0, A_write=0, B_write=0
+
+S2: wb_sel=ALU_out, write_sel=R3
+    reg_write=1
+    A_write=0, B_write=0, ALU_out_write=0
+\end{lstlisting}
+
+第一步 S0 不是“把 R1 和 R2 读出来”这么一句话。read\_sel\_a 选中 R1 后，寄存器阵列的第一个读端口会把 R1 当前保存的 bit 组合驱动到读数据线上；read\_sel\_b 选中 R2 后，第二个读端口同理输出 R2。等这些组合路径稳定后，时钟沿到来，A\_write 和 B\_write 让 A、B 锁存器保存这两个值。这个周期里 reg\_write 必须为 0，因为此时写回 mux 上的值并不代表最终结果，提前写寄存器只会制造错误状态。
+
+第二步 S1 才让 ALU 工作。A、B 锁存器的输出作为 ALU 输入，alu\_op=ADD 让 ALU 内部选择加法路径。加法电路不是瞬间得到稳定结果，低位进位会影响高位，输出线上可能经历一小段变化过程。控制器在这个周期打开 ALU\_out\_write，让时钟沿把已经稳定的 ALU 输出锁存下来；同时 reg\_write 仍然保持 0，避免把尚未明确提交边界的值写进 R3。
+
+第三步 S2 才写回。wb\_sel 选择 ALU\_out 锁存器，write\_sel 选择 R3，reg\_write 在这个周期置 1。到时钟沿时，寄存器阵列把写数据端口上的值保存到 R3。至此，R1 和 R2 没有被改动，R3 得到 R1+R2 的结果，控制器回到空闲或取下一动作的状态。
+
+这个例子也说明控制错误为什么危险。若 S2 的 wb\_sel 错选成 B 锁存器，R3 写入的就是 R2，而不是相加结果；若 S1 提前打开 reg\_write，R3 可能在 ALU 输出尚未稳定时被覆盖；若 S0 忘记关闭 ALU\_out\_write，旧的计算边界会被无关读数污染。微操作的价值就在这里：每一步都能检查“哪些线打开、哪些线关闭、哪个状态元件会在时钟沿改变”。
+
+\section{五、控制器走向最小 CPU}
+
+到这里，控制器已经具备两种能力：根据编码生成控制信号，根据状态推进多周期动作。下一章把“动作编码”固定存放在一个可读取的位置，把“当前读取到哪一条编码”保存在一个计数寄存器里，再让控制器反复取出编码、译码、驱动数据通路。这样，一个最小 CPU 就会自然出现。
+
+\begin{classicnote}
+控制器的标注对象不是单个输出，而是一组控制信号的时间表。每个周期哪些写使能为 1，哪些 mux 选择哪一路，ALU 做什么，都要能列成 trace。
+
+\begin{itemize}
+\item 纸上实验：为多周期 \code{ADD R3,R1,R2} 写 S0/S1/S2 三行控制表，检查每行是否只提交应该提交的状态。
+\item 机器证据：控制信号也是电线值；错误控制线会打开错误路径，比 ALU 算错更隐蔽。
+\item 状态证据：硬连线控制适合简单组合译码；多周期控制需要状态寄存器保存当前阶段。
+\item 检查题：若 S1 周期提前打开 \code{reg\_write}，为什么 R3 可能写入不稳定值？这个错误属于数据通路，还是控制器时序？
+\end{itemize}
+
+经典教材会把控制器和数据通路并排讲：数据通路说明“能走哪些路”，控制器说明“本周期允许哪条路”。两者合起来，才是可执行动作。
+\end{classicnote}

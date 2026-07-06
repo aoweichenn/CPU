@@ -16,6 +16,8 @@ CPP_BOOK_DIR := books/cpp-zero-to-advanced
 CPP_LATEX_DIR := $(CPP_BOOK_DIR)/source/latex
 CSE_BOOK_DIR := books/compute-systems-engine-code
 CSE_LATEX_DIR := $(CSE_BOOK_DIR)/source/latex
+HW_BOOK_DIR := books/hardware-zero-to-machine
+HW_LATEX_DIR := $(HW_BOOK_DIR)/source/latex
 EXPORT_ROOT := book-exports
 PHONE_EXPORT_ROOT := /mnt/sdcard/STU/BOOKS
 CPU_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到计算系统第一册
@@ -27,6 +29,7 @@ CPU3S_EXPORT_DIR := $(EXPORT_ROOT)/从Cpp到AI计算第三册源码卷
 ALGO_EXPORT_DIR := $(EXPORT_ROOT)/算法刷题与Cpp面试教材
 CPP_EXPORT_DIR := $(EXPORT_ROOT)/Cpp从零到高级
 CSE_EXPORT_DIR := $(EXPORT_ROOT)/计算系统引擎代码实践卷
+HW_EXPORT_DIR := $(EXPORT_ROOT)/硬件从零到整机
 CPU_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/从Cpp到计算系统第一册
 CPU1P_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践与代码卷/从Cpp到计算系统第一册实践卷
 CPU2_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/从Cpp到计算系统第二册
@@ -35,6 +38,7 @@ CPU3P_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践与代码卷/�
 ALGO_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/算法刷题与Cpp面试教材
 CPP_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/Cpp从零到高级
 CSE_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/实践与代码卷/计算系统引擎代码实践卷
+HW_PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/硬件从零到整机
 CPU_EXPORT_NAME := 从Cpp到计算系统第一册
 CPU1P_EXPORT_NAME := 从Cpp到计算系统第一册实践卷
 CPU2_EXPORT_NAME := 从Cpp到计算系统第二册
@@ -44,7 +48,8 @@ CPU3S_EXPORT_NAME := 从Cpp到AI计算第三册源码卷
 ALGO_EXPORT_NAME := 算法刷题与Cpp面试教材
 CPP_EXPORT_NAME := Cpp从零到高级
 CSE_EXPORT_NAME := 计算系统引擎代码实践卷
-.PHONY: all cpu-check cpu-pdf cpu-export cpu-phone-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-export cpu1p-phone-export cpu1p-test cpu2-check cpu2-pdf cpu2-export cpu2-phone-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-export cpu3-phone-export cpu3-smollm2-smoke cpu3-smollm2-q4-benchmark cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-gpt2-hotspot-profile cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-export cpu3p-phone-export cpu3p-test cpu3s-check cpu3s-pdf cpu3s-export cpu3s-phone-export cpu3s-test books-export phone-books-export phone-export-organize phone-export-organize-allow-missing algo-check algo-pdf algo-export algo-phone-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-export cpp-phone-export cpp-text-count cpp-text-target cse-check cse-pdf cse-export cse-phone-export clean
+HW_EXPORT_NAME := 硬件从零到整机
+.PHONY: all cpu-check cpu-pdf cpu-export cpu-phone-export cpu-text-count cpu-text-target cpu-lab00 cpu-coverage cpu1p-check cpu1p-pdf cpu1p-export cpu1p-phone-export cpu1p-test cpu2-check cpu2-pdf cpu2-export cpu2-phone-export cpu2-text-count cpu2-text-count-chapters cpu2-text-target cpu3-check cpu3-pdf cpu3-export cpu3-phone-export cpu3-smollm2-smoke cpu3-smollm2-q4-benchmark cpu3-gpt2-smoke cpu3-gpt2-benchmark-compare cpu3-gpt2-hotspot-profile cpu3-text-count cpu3-text-count-chapters cpu3-text-target cpu3p-check cpu3p-pdf cpu3p-export cpu3p-phone-export cpu3p-test cpu3s-check cpu3s-pdf cpu3s-export cpu3s-phone-export cpu3s-test books-export phone-books-export phone-export-organize phone-export-organize-allow-missing algo-check algo-pdf algo-export algo-phone-export algo-text-count algo-text-target algo-test cpp-check cpp-pdf cpp-export cpp-phone-export cpp-text-count cpp-text-target cse-check cse-pdf cse-export cse-phone-export hw-check hw-pdf hw-export hw-phone-export clean
 
 all: cpu-pdf
 
@@ -179,7 +184,7 @@ cpu3-text-count-chapters:
 cpu3-text-target:
 	$(MAKE) -C $(CPU3_LATEX_DIR) text-target
 
-books-export: cpu-export cpu1p-export cpu2-export cpu3-export cpu3p-export algo-export cpp-export cse-export
+books-export: cpu-export cpu1p-export cpu2-export cpu3-export cpu3p-export algo-export cpp-export cse-export hw-export
 
 phone-books-export:
 	$(MAKE) cpu-phone-export
@@ -190,6 +195,7 @@ phone-books-export:
 	$(MAKE) algo-phone-export
 	$(MAKE) cpp-phone-export
 	$(MAKE) cse-phone-export
+	$(MAKE) hw-phone-export
 	$(MAKE) phone-export-organize
 
 phone-export-organize:
@@ -252,12 +258,26 @@ cse-phone-export: cse-pdf
 	python3 tools/export_book.py --source $(CSE_LATEX_DIR) --dest "$(CSE_PHONE_EXPORT_DIR)" --pdf-name "$(CSE_EXPORT_NAME)"
 	$(MAKE) phone-export-organize-allow-missing
 
+hw-check:
+	$(MAKE) -C $(HW_BOOK_DIR) check
+
+hw-pdf:
+	$(MAKE) -C $(HW_BOOK_DIR) pdf
+
+hw-export: hw-pdf
+	python3 tools/export_book.py --source $(HW_LATEX_DIR) --dest "$(HW_EXPORT_DIR)" --pdf-name "$(HW_EXPORT_NAME)"
+
+hw-phone-export: hw-pdf
+	python3 tools/export_book.py --source $(HW_LATEX_DIR) --dest "$(HW_PHONE_EXPORT_DIR)" --pdf-name "$(HW_EXPORT_NAME)"
+	$(MAKE) phone-export-organize-allow-missing
+
 clean:
 	$(MAKE) -C $(CPU_LATEX_DIR) clean
 	$(MAKE) -C $(CPU1P_LATEX_DIR) clean
 	$(MAKE) -C $(CPU2_LATEX_DIR) clean
 	$(MAKE) -C $(CPU3_LATEX_DIR) clean
 	$(MAKE) -C $(CPU3P_LATEX_DIR) clean
+	$(MAKE) -C $(HW_BOOK_DIR) clean
 	$(MAKE) -C $(CPU3S_LATEX_DIR) clean
 	$(MAKE) -C $(ALGO_BOOK_DIR) clean
 	$(MAKE) -C $(CPP_BOOK_DIR) clean

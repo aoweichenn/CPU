@@ -13,6 +13,7 @@
 | `cpu-volume-3` | planning | CPU 与 AI 计算教材第三册：AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。 |
 | `cpu-volume-3-practice` | active | 第三册配套实践卷：Linux 本地量化推理引擎、KV Cache、reference trace、7B 账本、服务 SLO 和验收门禁。 |
 | `cpu-volume-3-source` | active | 第三册源码卷：LCQI 本地 CPU 推理工程完整源码、测试、benchmark、工具脚本和阅读路径。 |
+| `hardware-zero-to-machine` | active | 硬件从零到整机：从二极管、逻辑门、组合逻辑、时序逻辑、ALU 和最小 CPU 推导到内存、I/O 与整机。 |
 | `algorithm-interview` | active | 算法刷题与 C++ 面试教材：LaTeX 正式书稿，覆盖数据结构、算法原理、暴力到优化、C++ 容器、力扣题单、训练路线和面试表达。 |
 | `cpp-zero-to-advanced` | active | Cpp 从零到高级教材：执行模型、类型、RAII、标准库、泛型、构建测试、性能、并发和综合项目。 |
 
