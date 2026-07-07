@@ -6,7 +6,7 @@ CPU 可以视为一组同步硬件闭环：PC 指出下一条编码，取指路�
 
 第一章提前出现的 6502、Z80、8051、8086、80386、80486 和 Pentium，在本章不再只是名称。它们可以被排列成一条硬件问题线索：先看早期微处理器如何通过外部总线和控制信号组成整机，再看单片机如何把 I/O 和定时器收进片内，随后看 x86 如何从 16-bit 总线接口走向 32-bit 地址转换和片上 cache、流水线、预测。这样的顺序比单纯背年份更有用，因为每一步都对应一个新的硬件边界。
 
-\begin{longtable}{p{0.19\linewidth}p{0.29\linewidth}p{0.42\linewidth}}
+\begin{longtable}{L{0.19\linewidth}L{0.29\linewidth}L{0.42\linewidth}}
 \toprule
 芯片 & 本章观察重点 & 对整机理解的贡献 \\
 \midrule
@@ -30,7 +30,7 @@ opcode | dst | src_a | src_b
 
 若有一组动作编码连续放在存储结构中，硬件还需要知道当前取哪一条。这个位置由 PC 保存。PC 本质上也是寄存器，只是它保存的是“下一条动作编码的地址”。
 
-\begin{longtable}{p{0.24\linewidth}p{0.52\linewidth}}
+\begin{longtable}{L{0.24\linewidth}L{0.52\linewidth}}
 \toprule
 部件 & 作用 \\
 \midrule
@@ -53,7 +53,7 @@ pc_next = pc_current + instruction_size
 
 最小单周期模型可以这样走：
 
-\begin{longtable}{p{0.18\linewidth}p{0.52\linewidth}p{0.18\linewidth}}
+\begin{longtable}{L{0.18\linewidth}L{0.52\linewidth}L{0.18\linewidth}}
 \toprule
 阶段 & 硬件动作 & 边界 \\
 \midrule
@@ -83,6 +83,73 @@ next_pc = mux(branch_taken, pc_sequential, branch_target)
 
 分支的硬件本质是改变 PC 这个寄存器的下一值。下一周期取到哪条编码，完全由这个新 PC 决定。
 
+\topic{把指令周期写成可验收账本}经典教材讲 CPU 时，常把一条指令拆成取指、译码、执行、访存、写回和下一 PC 更新。这个拆分不是为了背阶段名称，而是为了把每个阶段对应到真实硬件路径。最小单周期 CPU 可以在一个长周期内完成所有路径；多周期 CPU 可以把这些路径分到多个时钟；流水线 CPU 可以让多条指令在不同阶段重叠推进。三者的共同点是：每个阶段都要说明源状态、组合路径、目标状态和异常边界。
+
+\begin{longtable}{L{0.14\linewidth}L{0.34\linewidth}L{0.28\linewidth}L{0.14\linewidth}}
+\toprule
+阶段 & 主要硬件动作 & 关键控制信号 & 提交边界 \\
+\midrule
+IF 取指 & PC 送到指令存储器或 I-cache，取回指令 bit & \code{pc_out}、\code{imem_read}、\code{ir_write} & IR 或取指缓冲 \\
+ID 译码 & opcode、寄存器号、立即数字段被解释成控制线 & \code{decode}、\code{imm_kind}、\code{read_addr} & 可组合，也可锁存 \\
+EX 执行 & ALU 做加减、逻辑、比较或地址形成 & \code{alu_op}、\code{a_sel}、\code{b_sel} & 输出和标志 \\
+MEM 访存 & 对数据存储器、cache 或 MMIO 发起读写事务 & \code{mem_read}、\code{mem_write}、\code{byte_en} & MDR 或外部响应 \\
+WB 写回 & ALU 结果或读回数据写入寄存器堆 & \code{wb_sel}、\code{reg_write} & 目标寄存器 \\
+PC 更新 & 选择顺序 PC、分支目标、跳转目标或异常入口 & \code{pc_sel}、\code{pc_write} & PC \\
+\bottomrule
+\end{longtable}
+
+这张表可以直接变成验收清单。若某条 LOAD 指令读到了错误数据，不应只问“内存为什么错”，而要逐项检查：PC 是否取到正确编码，译码是否识别为 LOAD，ALU 是否形成正确地址，MEM 阶段是否访问正确目标，读回数据是否进入 MDR，WB 阶段是否选择了 MDR 而不是 ALUOut。这样的排查方式比凭感觉改控制器可靠得多。
+
+\topic{五类基本指令覆盖了 CPU 的主要通路}最小 CPU 不必一开始支持复杂指令，但至少要能解释五类动作：寄存器到寄存器运算、加载、存储、条件分支和无条件跳转。它们共同覆盖寄存器堆、ALU、数据存储器、PC 选择器和标志位。
+
+\begin{longtable}{L{0.14\linewidth}L{0.34\linewidth}L{0.32\linewidth}L{0.1\linewidth}}
+\toprule
+指令类 & 典型路径 & 必须打开的控制 & 写回对象 \\
+\midrule
+ADD/SUB & 寄存器读出，经 ALU，结果写回寄存器 & \code{alu_op}、\code{wb_sel=ALU}、\code{reg_write} & 寄存器、Flags \\
+LOAD & 基址寄存器加立即数形成地址，存储器读回数据 & \code{alu_op=ADD}、\code{mem_read}、\code{wb_sel=MEM} & 寄存器 \\
+STORE & 基址寄存器加立即数形成地址，源寄存器写入存储器 & \code{alu_op=ADD}、\code{mem_write}、\code{store_data_sel} & 存储器或 MMIO \\
+BRANCH & 比较源操作数或标志位，条件成立则选择分支目标 & \code{alu_op=CMP}、\code{pc_sel}、\code{pc_write} & PC \\
+JUMP & 立即数、寄存器或链接地址决定下一 PC & \code{target_sel}、\code{pc_sel}、可选 \code{reg_write} & PC，可选链接寄存器 \\
+\bottomrule
+\end{longtable}
+
+以 LOAD 为例，\code{R3 = MEM[R1 + 8]} 不是单纯“读内存”。硬件要先读出 R1，把立即数 8 符号扩展或零扩展到 ALU 输入宽度，ALU 做地址加法，地址进入数据存储路径，读响应回来后经过写回 mux，最后在时钟沿写入 R3。若目标地址落入普通 RAM，读回的是存储阵列内容；若目标地址落入 MMIO 区，读回的是设备寄存器当前状态。地址相同形式，语义由地址译码决定。
+
+\begin{lstlisting}
+LOAD R3, [R1 + 8]
+  EX:  addr = R1 + sign_extend(8)
+  MEM: read target selected by addr
+  WB:  R3 = read_data
+\end{lstlisting}
+
+STORE 的风险更高，因为它有副作用。 \code{MEM[R1 + 8] = R3} 若落到 RAM，表示保存数据；若落到设备命令寄存器，可能启动设备、清除中断或改变输出引脚。因此 STORE 必须明确字节使能、写数据来源、地址空间属性和完成条件。普通内存写响应表示写事务被接受；设备命令写响应通常不表示设备动作完成。
+
+\begin{lstlisting}
+STORE [R1 + 8], R3
+  EX:  addr = R1 + sign_extend(8)
+  MEM: write_data = R3, byte_en = access_size
+       target receives write command
+  WB:  no register writeback
+\end{lstlisting}
+
+BRANCH 和 JUMP 则说明 PC 是数据通路的一部分。条件分支一般要先得到比较证据，例如 Zero、Sign、Carry 或 Overflow，再由控制器决定 \code{pc_sel}。无条件跳转可以直接选择目标地址；带链接跳转还会把返回地址写入寄存器。此时同一条指令可能同时写 PC 和一个通用寄存器，控制器必须明确两个写边界是否在同一时钟沿提交。
+
+\topic{最小整机实验要先有可观察边界}若把本节落到一块低速实验板，不必立即追求完整 ISA。可以先定义四条动作：\code{ADD}、\code{LOAD}、\code{STORE}、\code{JZ}。指令 ROM 提供编码，4 个寄存器保存通用值，74HC283/74HC86 构成加减核心，SRAM 或寄存器阵列模拟数据存储器，若干 LED 和拨码开关映射成 MMIO。验收重点是每一步都可观察：PC LED 显示当前取指地址，IR LED 或逻辑分析仪显示当前指令，控制线可单步观察，写回和 PC 更新只在时钟沿发生。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+实验对象 & 可用器件或实现 & 验收证据 \\
+\midrule
+指令 ROM & EEPROM、Flash 或预置拨码/仿真 ROM & 复位后固定地址输出第一条编码 \\
+PC/IR & 74HC161、74HC574 或触发器组 & PC 每步按控制更新，IR 保存本周期指令 \\
+数据 RAM & SRAM、寄存器阵列或仿真存储器 & LOAD/STORE 地址、数据、写使能可观察 \\
+地址译码 & 74HC138、比较器或门阵列 & RAM、LED、按键寄存器不会同时响应 \\
+MMIO LED & 锁存器驱动 LED & 写指定地址后 LED 状态在边界改变 \\
+MMIO 按键 & 上拉/下拉、施密特、同步器 & 读指定地址返回已同步状态，不直接用生按键 \\
+\bottomrule
+\end{longtable}
+
 在 6502 和 Z80 这类 8-bit 处理器上，最小 CPU 模型会更接近外部总线机器：PC 给出地址，外部存储器返回操作码，控制逻辑再用若干机器周期访问操作数、执行 ALU 操作或读写 I/O。由于数据通路和外部总线较窄，许多动作天然被分解为多个周期。这个观察可以帮助读者理解：多周期控制不是落后写法，而是在晶体管、引脚、存储器速度和系统成本之间作出的硬件取舍。
 
 \begin{chipcase}
@@ -93,7 +160,7 @@ next_pc = mux(branch_taken, pc_sequential, branch_target)
 
 Z80 则适合观察更丰富的总线控制。它不仅访问存储器，也有清楚的 I/O 周期、刷新和中断相关信号。站在本书视角，Z80 说明同一条外部引脚边界可以承载多种事务类型：取指、读内存、写内存、读 I/O、写 I/O、中断响应。不同事务使用相近的地址、数据和控制线组合，但语义完全不同。理解这一点后，后面讨论 MMIO、DMA 和中断时，就不会把所有地址访问都误认为普通内存读写。
 
-\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
 \toprule
 早期微机对象 & 硬件问题 & 本章后续对应 \\
 \midrule
@@ -119,7 +186,7 @@ physical_address = segment * 16 + offset
 
 8086 的外部总线也值得注意。地址线和数据线存在复用，某些引脚在总线周期的不同阶段承担不同含义。硬件需要地址锁存器在地址有效阶段保存地址，随后这些引脚可以用于数据传输。一次总线访问不是“读内存”三个字，而是分阶段发生的事务：输出地址、锁存地址、给出读写控制、等待存储器或 I/O 响应、传输数据、结束总线周期。
 
-\begin{longtable}{p{0.24\linewidth}p{0.58\linewidth}}
+\begin{longtable}{L{0.24\linewidth}L{0.58\linewidth}}
 \toprule
 8086 观察点 & 硬件含义 \\
 \midrule
@@ -130,6 +197,33 @@ physical_address = segment * 16 + offset
 BIU/EU 分工 & 取指队列和执行部件可部分重叠工作 \\
 \bottomrule
 \end{longtable}
+
+8086 的典型板级连接还需要外部支持器件。地址/数据复用引脚在 T1 阶段输出地址，在后续阶段承载数据，因此常用地址锁存器保存低位地址；时钟、复位和 ready 同步可由时钟发生器组织；最大模式下，总线控制信号还可由总线控制器从状态信号译出。读数据手册时，不应只看“8086 是 16-bit CPU”，还要看它把哪些系统责任交给了板级芯片。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+信号或器件 & 硬件作用 & 验收问题 \\
+\midrule
+ALE & 地址锁存允许，提示外部锁存低位地址 & 锁存器是否在地址有效窗口保存地址 \\
+AD0--AD15 & 复用地址/数据线 & 哪个阶段由 CPU 驱动，哪个阶段由存储器或 I/O 驱动 \\
+A16--A19/S3--S6 & 高位地址与状态复用 & 地址是否在访问开始阶段被正确保存 \\
+\code{RD}/\code{WR} & 读写控制 & 目标芯片输出使能和写使能是否互斥 \\
+M/IO & 区分存储器周期和 I/O 周期 & 地址译码是否把事务送到正确目标 \\
+READY & 外部目标请求插入等待状态 & 慢存储器是否能可靠延长总线周期 \\
+INTR/NMI & 可屏蔽和不可屏蔽中断入口 & 请求是否同步，响应和清除顺序是否明确 \\
+8284/8288 & 时钟/复位/ready 或总线控制辅助 & 外部控制信号是否满足时序和极性要求 \\
+\bottomrule
+\end{longtable}
+
+一个 8086 存储器读周期可以按 T 状态走读。T1 中，CPU 把地址放到复用总线并拉出 ALE，外部锁存器保存地址；T2 中，CPU 改变总线方向并给出读控制；T3/Tw 中，存储器或 I/O 设备把数据放到数据线上，若 READY 不满足，CPU 插入等待状态；T4 中，CPU 采样数据并结束周期。这个过程把第一章的三态总线、第二章的时钟边界和第三章的控制 trace 合到一起：总线上的每一段时间都必须有唯一驱动者和明确采样者。
+
+\begin{lstlisting}
+8086 memory read sketch:
+  T1: address valid, ALE latches address
+  T2: RD active, bus turns around for target data
+  T3: target drives data, READY may insert wait states
+  T4: CPU samples data, control deasserts
+\end{lstlisting}
 
 8086 内部常被划分为总线接口单元和执行单元。总线接口单元负责取指、形成物理地址、访问外部总线，并维护预取队列；执行单元负责译码和执行指令。这个分工说明，即使没有现代深流水，CPU 内部也已经在尝试把“取指访问外部世界”和“执行内部运算”分开，以减少外部存储访问延迟对执行的影响。
 
@@ -152,7 +246,7 @@ linear address    -> paging       -> physical address
 
 保护模式把“谁能访问什么”变成硬件可检查的合同。段描述符、特权级、页表权限等机制，使得不同程序或系统组件不能随意访问全部内存或执行全部指令。这些机制后来成为现代操作系统隔离、虚拟内存和系统调用的硬件基础。对本书来说，重点不是展开操作系统，而是看见硬件层面的扩展：CPU 不只执行 ALU 运算，还参与地址翻译、权限判断和异常入口选择。
 
-\begin{longtable}{p{0.24\linewidth}p{0.58\linewidth}}
+\begin{longtable}{L{0.24\linewidth}L{0.58\linewidth}}
 \toprule
 80386 观察点 & 硬件含义 \\
 \midrule
@@ -164,11 +258,39 @@ linear address    -> paging       -> physical address
 \bottomrule
 \end{longtable}
 
+80386 的外部接口同样要按事务理解。32-bit 数据路径并不意味着每次访问都天然是完整 32-bit 字。处理器需要用地址低位和字节使能说明本次访问哪些字节有效；外部总线、存储器阵列和 cache 控制器必须据此选择正确字节、处理未对齐访问或拆分周期。若只把 80386 理解成“寄存器变成 32 位”，就会漏掉字节使能、总线周期、异常和地址转换这些整机边界。
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+80386 对象 & 硬件含义 & 常见验收点 \\
+\midrule
+地址线与数据线 & 指出事务目标并传输 32-bit 数据片段 & 地址对齐、字节选择和目标译码是否一致 \\
+字节使能 & 表明本周期哪些字节有效 & 字节/半字/字访问不会破坏相邻字节 \\
+总线状态 & 区分读、写、取指、确认等周期语义 & 外部控制器是否按状态产生正确控制线 \\
+分页部件 & 查页目录和页表，形成物理地址 & 缺页、权限和存在位错误是否触发异常 \\
+TLB 思想 & 缓存近期地址转换结果 & 命中降低转换时延，失效和权限改变要刷新 \\
+\bottomrule
+\end{longtable}
+
+分页可以用一次 LOAD 来观察。指令先形成有效地址，分段得到线性地址；分页开启时，线性地址被拆成页目录索引、页表索引和页内偏移。若转换结果已在 TLB 中，地址转换可以很快完成；若未命中，就要访问内存中的页表结构。页表项还带有存在位、读写权限、用户/内核权限、访问位和脏位等硬件证据。任何一步失败，LOAD 不应返回任意数据，而应进入异常处理路径。
+
+\begin{lstlisting}
+80386-style address walk:
+  effective address
+    -> segmentation checks
+    -> linear address
+    -> TLB lookup or page-table walk
+    -> permission checks
+    -> physical address or exception
+\end{lstlisting}
+
+从时延角度看，80386 到 80486/Pentium 的演进可以读成“把常用慢路径搬近”。TLB 避免每次访存都走页表；片上 cache 避免每次命中数据都走外部总线；流水线把长执行路径切成多个边界；分支预测减少控制流改变带来的等待。硬件并没有消灭延迟，而是用缓存、预测、并行和更细边界，让常见情况少走远路，让少见情况通过异常、回填或冲刷流水线处理。
+
 从 8086 到 80386，可以看到 CPU 和整机边界的变化。8086 主要展示了早期微处理器如何通过外部总线接入存储器和 I/O；80386 则展示了处理器如何把内存管理和保护机制纳入芯片内部。后来的处理器继续把 cache、TLB、流水线、分支预测、乱序执行、多核互连等机制纳入芯片，但基本问题没有改变：地址从哪里来，权限如何检查，数据经哪条路径返回，状态在哪个边界提交。
 
 80486 和 Pentium 可以作为 80386 之后的两个观察窗口。80486 把片上 cache、流水线和浮点方向的集成推到更显著的位置，使常用指令和数据更容易走近路径；Pentium 进一步展示双流水线、分支预测和更复杂控制对吞吐率的影响。它们并没有改变“寄存器到组合逻辑到寄存器”的基本模型，而是复制、切分和调度这些路径，让常见工作更少等待远处存储器和长控制路径。
 
-\begin{longtable}{p{0.2\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\begin{longtable}{L{0.2\linewidth}L{0.32\linewidth}L{0.38\linewidth}}
 \toprule
 阶段 & 新增硬件重点 & 与前文概念的连接 \\
 \midrule
@@ -183,7 +305,7 @@ Pentium & 双流水线、预测和更复杂发射控制 & 多条候选执行路�
 
 寄存器阵列很快，但容量有限。主存提供大容量状态空间，用地址选择位置，用数据线传递内容，用控制信号说明读还是写。
 
-\begin{longtable}{p{0.2\linewidth}p{0.5\linewidth}}
+\begin{longtable}{L{0.2\linewidth}L{0.5\linewidth}}
 \toprule
 信号 & 作用 \\
 \midrule
@@ -197,9 +319,48 @@ ready/valid & 指明请求或响应是否有效 \\
 
 一次读访问可以这样理解：CPU 给出地址和读控制，主存经过内部译码、阵列访问和输出驱动后，把数据放到读数据线上，并用响应信号表示结果有效。一次写访问则是 CPU 同时给出地址、写数据和写控制，主存在合适边界把数据保存到对应位置。
 
+\topic{存储芯片接线从地址、片选和输出使能开始}主存不是一个抽象数组，而是一组芯片和控制信号。ROM、Flash、SRAM 和 DRAM 都用地址选择位置，但物理行为不同。ROM/Flash 适合保存启动代码或固件，断电后内容仍在；SRAM 速度快、接口直观，常用于 cache、片上 RAM 或简单实验板；DRAM 密度高但需要刷新、行列地址和控制器，适合作为大容量主存。不同存储器的“读一个地址”在硬件上不是同一种动作。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+存储类型 & 典型用途 & 硬件验收重点 \\
+\midrule
+ROM/Flash & 启动代码、固件、常量表 & 复位地址是否映射到有效内容，读时序是否满足 \\
+SRAM & cache、小容量 RAM、实验板数据存储 & 地址、片选、输出使能、写使能和字节使能是否互斥正确 \\
+DRAM & 大容量主存 & 控制器、刷新、行列访问、训练和等待状态是否正确 \\
+寄存器文件 & CPU 内部近距离状态 & 多读端口、写端口和旁路规则是否明确 \\
+\bottomrule
+\end{longtable}
+
+以一片简单异步 SRAM 为例，CPU 或总线控制器给出地址；地址译码器根据高位地址产生 \code{CS} 片选；读周期打开 \code{OE} 输出使能并关闭 \code{WE} 写使能，SRAM 在访问时间后驱动数据线；写周期打开 \code{WE}，数据线由 CPU 或总线主设备驱动，SRAM 在写入窗口保存数据。若 \code{OE} 和另一个设备的输出同时打开，就会形成总线争用；若 \code{WE} 在地址或数据尚未稳定时打开，就可能写错位置或写错内容。
+
+\begin{longtable}{L{0.16\linewidth}L{0.34\linewidth}L{0.4\linewidth}}
+\toprule
+信号 & 读周期 & 写周期 \\
+\midrule
+地址线 & 稳定指向目标单元 & 写入窗口前必须稳定 \\
+\code{CS} & 选中目标存储芯片 & 只允许目标芯片响应 \\
+\code{OE} & 打开 SRAM 输出驱动 & 关闭，避免与 CPU 写数据冲突 \\
+\code{WE} & 关闭，避免误写 & 在地址和数据稳定后有效 \\
+字节使能 & 选择返回字节或半字 & 只允许目标字节被修改 \\
+\bottomrule
+\end{longtable}
+
+地址译码决定“这个地址落到哪里”。一个教学整机可以规定：低地址区域映射 ROM，中间区域映射 RAM，高地址小窗口映射 LED、按键、串口或定时器。译码器可以由比较器、门阵列、74HC138 或可编程逻辑实现。无论实现方式如何，验收目标相同：任意一个地址只应选中一个响应目标；未映射区域要有明确行为，例如返回总线错误、固定值或保持无响应并让控制器超时。
+
+\begin{lstlisting}
+example memory map:
+  0x0000_0000 - 0x0000_7FFF  boot ROM
+  0x0000_8000 - 0x0000_FFFF  SRAM
+  0x1000_0000 - 0x1000_000F  GPIO MMIO
+  0x1000_0100 - 0x1000_010F  timer MMIO
+\end{lstlisting}
+
+对齐和字节使能也必须提前规定。若 CPU 做 32-bit 访问，地址最低两位通常决定目标字节位置；若访问没有按自然边界对齐，硬件可以支持一次拆成多个总线周期，也可以直接触发异常。早期简单处理器、微控制器和高性能 CPU 的选择不同，但都必须有规则。没有规则时，同一条 STORE 可能在不同板级实现上修改不同字节。
+
 CPU 内部一个周期可以很短，而主存访问可能慢得多。若每次取指、读数据、写数据都等主存完成，ALU、寄存器阵列和控制器会长时间空转。层级存储的动机，是把最近、最常用的一小部分内容放到更近、更快的位置。cache 可以先理解成靠近 CPU 的小型硬件存储，它通过 tag、data、valid、dirty 等字段完成命中判断、数据返回、替换和写回。
 
-\begin{longtable}{p{0.2\linewidth}p{0.56\linewidth}}
+\begin{longtable}{L{0.2\linewidth}L{0.56\linewidth}}
 \toprule
 cache 字段 & 作用 \\
 \midrule
@@ -212,7 +373,7 @@ dirty & 表示这一项是否被改过、尚未写回下层 \\
 
 一次 cache 命中读可以写成短事务。CPU 形成地址，地址的一部分用于索引 cache 组，tag 与保存的 tag 比较；若 valid 为 1 且 tag 相等，cache 从 data 字段中选出目标字节或字，送回执行流水线。此时访问没有走到 DRAM，低时延来自“数据已经在近处”。一次 cache 未命中读则完全不同：cache 控制器要向下一级 cache 或主存发起请求，可能需要选择牺牲项；若牺牲项 dirty，还要先写回；随后等待下层返回一整块数据，填入 cache，再把本次请求需要的字返回给 CPU。这个过程可能跨越许多周期，并可能与其他请求、预取、写回和一致性事务交织。
 
-\begin{longtable}{p{0.18\linewidth}p{0.48\linewidth}p{0.24\linewidth}}
+\begin{longtable}{L{0.18\linewidth}L{0.48\linewidth}L{0.24\linewidth}}
 \toprule
 访问类型 & 事务过程 & 延迟来源 \\
 \midrule
@@ -229,7 +390,32 @@ cache 未命中读 & 向下层请求、可能写回 dirty 行、等待回填、�
 
 MMIO 与普通内存的关键差别在于\hwrisk{副作用}。写普通内存通常表示保存数据；写设备命令寄存器可能启动传输、清除中断、改变引脚、复位设备或触发状态机。读普通内存通常返回保存的值；读设备状态寄存器可能返回瞬时状态，有些位还可能因为读而清除。因此 MMIO 区域通常不能被普通缓存策略随意缓存，也不能被处理器或编译器当作无副作用内存自由重排。硬件和系统软件必须共同规定访问顺序、可见性和完成条件。
 
-\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\topic{从 GPIO、定时器和 UART 看设备寄存器}设备寄存器最好用具体布局理解。一个 GPIO 控制器可以有输出寄存器、输入寄存器、方向寄存器和中断状态寄存器；定时器可以有计数值、比较值、控制位和中断清除位；UART 可以有发送数据、接收数据、状态和波特率配置寄存器。CPU 访问这些寄存器时走的是地址事务，但设备内部看到的是控制状态机输入。
+
+\begin{longtable}{L{0.18\linewidth}L{0.24\linewidth}L{0.26\linewidth}L{0.22\linewidth}}
+\toprule
+设备 & 寄存器示例 & 写入含义 & 读取含义 \\
+\midrule
+GPIO & \code{DIR/OUT/IN/IRQ} & 配置方向、改变输出、清中断 & 读取引脚状态或中断原因 \\
+定时器 & \code{COUNT/CMP/CTRL/STAT} & 设置比较值、启动、清除 done & 读取计数和到期状态 \\
+UART & \code{TX/RX/STAT/BAUD} & 发送字节、配置速率 & 读取接收字节和满/空状态 \\
+中断控制器 & \code{MASK/PENDING/ACK} & 屏蔽、确认、清除请求 & 读取待处理请求和优先级 \\
+\bottomrule
+\end{longtable}
+
+以 LED 和按键 MMIO 为例，地址 \code{GPIO_OUT} 可以连接到一个输出锁存器，CPU 写入的低 8 位在时钟边界保存并驱动 LED；地址 \code{GPIO_IN} 可以返回已经同步过的按键状态。这里不能把外部按键直接接到 CPU 数据总线。按键要先有上拉或下拉、消抖、施密特整形和同步器，之后才适合作为设备寄存器的输入位。这样读 \code{GPIO_IN} 得到的是本时钟域内的稳定状态，而不是一个正在抖动的外部电压。
+
+\begin{lstlisting}
+GPIO example:
+  0x1000_0000 GPIO_DIR   // 1 output, 0 input
+  0x1000_0004 GPIO_OUT   // write changes output latch
+  0x1000_0008 GPIO_IN    // read synchronized pins
+  0x1000_000C GPIO_IRQ   // read/clear edge events
+\end{lstlisting}
+
+定时器展示了“状态位”和“完成事件”的差别。CPU 写比较值和控制位后，定时器开始计数；计数达到比较值时，硬件置位 \code{done} 或 \code{irq_pending}。CPU 读到状态后，还要按规定方式清除该位。有些设备采用写 1 清除，有些采用读后清除，有些要求先读状态再写确认。清除顺序不清楚时，可能丢掉同时到来的新事件。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
 \toprule
 寄存器类型 & 典型含义 & 验收问题 \\
 \midrule
@@ -249,7 +435,7 @@ MMIO 与普通内存的关键差别在于\hwrisk{副作用}。写普通内存通
 
 中断不是普通函数调用。设备先把请求送到中断控制器；中断控制器根据屏蔽位、优先级和当前 CPU 状态决定是否投递；CPU 在可接受的边界保存必要状态，转入中断或异常入口；处理程序读取设备状态、确认事件、清除或重新使能中断。若设备状态尚未清除就重新打开中断，可能立即再次进入；若先清中断控制器而不读设备状态，可能丢失真实事件。因此中断验收必须同时检查设备侧、控制器侧和 CPU 入口侧。
 
-\begin{longtable}{p{0.2\linewidth}p{0.42\linewidth}p{0.28\linewidth}}
+\begin{longtable}{L{0.2\linewidth}L{0.42\linewidth}L{0.28\linewidth}}
 \toprule
 完成信号 & 表示什么 & 不表示什么 \\
 \midrule
@@ -263,15 +449,63 @@ DMA completion & DMA 描述的搬运完成或失败 & cache 中旧副本自动�
 
 8051 把这一套设备视角缩小到单片机内部。I/O 口、定时器、中断控制和片内存储器与 CPU 共处一片硅片，许多原本需要板级总线连接的对象变成片内寄存器或特殊功能寄存器。CPU 写某个 I/O 寄存器，可能改变引脚输出；定时器溢出，可能置位中断请求；中断控制器再按优先级让 CPU 进入服务入口。这个例子说明 MMIO、设备状态、中断和控制寄存器不是大型计算机才有的概念，小型单片机同样需要这些硬件合同，只是规模和速度不同。
 
+\topic{系统级低时延来自近处、并行和卸载}第三章已经从 ALU、定点、浮点和进位路径解释了执行单元时延。本章要补上整机层面的低时延。现代芯片让常见访问更快，首先靠片上 cache 和 TLB 把近期数据与地址转换结果放近；其次靠预取和分支预测提前准备可能需要的指令和数据；再次靠流水线、乱序调度和旁路网络减少可并行工作之间的等待；最后靠 DMA、设备队列和中断聚合把大量搬运工作从 CPU 指令流中卸载出去。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+低时延手段 & 加速的对象 & 代价或失败路径 \\
+\midrule
+L1/L2 cache & 常见取指和数据访问 & 未命中会走下层和互连 \\
+TLB & 虚拟到物理地址转换 & TLB 未命中可能触发页表 walk \\
+预取 & 顺序或可预测访问 & 错误预取浪费带宽和能量 \\
+分支预测 & 控制流等待 & 预测错误需要冲刷和恢复 \\
+旁路/转发 & 相邻指令的数据依赖 & 复杂连线和时序压力 \\
+DMA/队列 & 大块 I/O 搬运 & 一致性、完成通知和错误处理更复杂 \\
+\bottomrule
+\end{longtable}
+
 \section{五、整机启动与经典芯片后的演进}
 
 通电或复位后，CPU、主存控制器、互连和设备控制器都必须进入规定初始状态。PC 通常被置到固定启动地址，那里连接 ROM、片上存储或其他启动介质。启动路径的第一件事，是让硬件从可预测位置开始取编码。
 
 整机启动不仅是 CPU 复位。时钟源要稳定，复位树要按顺序释放，主存控制器要完成训练或初始化，互连要进入可转发请求的状态，必要设备要处于安全默认值。若这些硬件条件没有满足，即使 CPU 本身能取指，也可能在第一次访问主存或设备时无法继续推进。
 
+\topic{从复位向量走到第一条有效指令}启动可以写成一条硬件 trace。上电后，电源管理电路等待电压进入允许范围；时钟源或晶振稳定后，复位电路保持 CPU 和关键外设在安全状态；复位释放时，PC 或取指地址逻辑装入固定复位向量；地址译码把这个地址指向 ROM、Flash 或片上启动存储；取指路径读回第一条编码；控制器译码并开始执行初始化序列。任何一步没有定义，整机都会表现为“CPU 不启动”，但根因可能不在 CPU。
+
+\begin{longtable}{L{0.16\linewidth}L{0.42\linewidth}L{0.32\linewidth}}
+\toprule
+启动阶段 & 硬件动作 & 验收证据 \\
+\midrule
+电源爬升 & 电压达到允许范围，去耦提供瞬态电流 & 欠压复位未提前释放 \\
+时钟稳定 & 晶振、PLL 或外部时钟进入稳定范围 & 时钟频率和占空比满足规格 \\
+复位保持 & CPU、控制器、设备进入安全默认状态 & 危险输出关闭，写使能无效 \\
+复位释放 & PC 装入复位向量或启动地址 & 第一拍地址可预测 \\
+取启动码 & ROM/Flash/片上存储响应该地址 & 数据总线返回有效编码 \\
+初始化 & 配置栈、RAM、时钟、设备和中断 & 每项配置有完成或错误状态 \\
+\bottomrule
+\end{longtable}
+
+在 8086 类系统中，复位后从规定的高地址入口开始取指，外部 ROM 必须映射到这个入口；在许多微控制器中，复位向量可能位于片内 Flash 的固定地址，前几个字保存初始栈指针和入口地址；在现代 SoC 中，片上 Boot ROM 可能先验证启动介质、配置内存控制器，再把控制权交给后续固件。形式不同，问题相同：复位向量指向哪里，谁在该地址响应，第一批指令执行前哪些硬件已经可靠。
+
+\topic{整机实验可以从 ROM、RAM 和两个 MMIO 寄存器开始}一个可搭建的最小整机不需要复杂操作系统。可先规定 8-bit 或 16-bit 地址空间：低地址接 ROM，中间接 RAM，高地址映射 LED 输出寄存器和按键输入寄存器。CPU 或教学控制器复位后从 ROM 取指，执行一段程序：读取按键状态，若按下则把 LED 寄存器置 1，否则置 0。这个系统已经包含整机硬件的核心对象：取指、数据访存、地址译码、MMIO、副作用、外部输入同步和可观察输出。
+
+\begin{lstlisting}
+minimal whole-machine program:
+  loop:
+    r1 = MMIO[GPIO_IN]
+    if r1 == 0 goto off
+    MMIO[GPIO_OUT] = 1
+    goto loop
+  off:
+    MMIO[GPIO_OUT] = 0
+    goto loop
+\end{lstlisting}
+
+这段程序的硬件验收不应只看 LED 是否跟随按钮。应同时确认 ROM 地址、RAM 地址和 MMIO 地址不会被同时片选；按钮已经同步后才被读；写 \code{GPIO_OUT} 只改变输出锁存器，不误写 RAM；分支改变的是 PC 下一值；循环运行时没有总线争用。若以后把 LED 换成电机、继电器或功率负载，还必须增加驱动级、续流保护和安全停机链路，不能把 MMIO 输出锁存器直接当成功率开关。
+
 经典微处理器的发展可以用若干硬件剖面概括。下表不是处理器史年表，而是说明每一代芯片把哪些硬件问题推到读者面前。
 
-\begin{longtable}{p{0.18\linewidth}p{0.2\linewidth}p{0.5\linewidth}}
+\begin{longtable}{L{0.18\linewidth}L{0.2\linewidth}L{0.5\linewidth}}
 \toprule
 芯片或系列 & 典型特征 & 对硬件学习的意义 \\
 \midrule
@@ -294,7 +528,7 @@ Pentium 的意义在于展示更强的并行执行方向。双流水线、分支
 
 从 8086、80386 向后看，处理器继续沿几条方向扩展。第一，内部执行路径更深，流水线把取指、译码、执行、访存、写回切成多个阶段。第二，存储层级更复杂，片上 cache 和 TLB 成为地址访问性能的关键。第三，控制逻辑更复杂，分支预测、乱序执行和异常恢复要求硬件保存更多内部状态。第四，多核和片上互连让“总线事务”扩展成核间一致性和缓存一致性协议。第五，外设从简单寄存器发展到 PCI、PCIe、USB、SATA 等分层协议，但本质仍然是地址、数据、控制、握手、完成和错误状态。
 
-\begin{longtable}{p{0.24\linewidth}p{0.58\linewidth}}
+\begin{longtable}{L{0.24\linewidth}L{0.58\linewidth}}
 \toprule
 演进方向 & 保持不变的硬件问题 \\
 \midrule
@@ -312,40 +546,66 @@ DMA 与设备 & 谁发起事务，谁完成事务，完成如何通知 CPU \\
 
 本节练习要求把 CPU 内部动作和整机外部事务连起来。答案不能停留在“读内存”“写设备”“发生中断”这类短语，必须列出发起者、地址、目标、控制信号、响应、完成条件和错误边界。
 
-\begin{longtable}{p{0.18\linewidth}p{0.46\linewidth}p{0.26\linewidth}}
+\begin{longtable}{L{0.18\linewidth}L{0.46\linewidth}L{0.26\linewidth}}
 \toprule
 任务 & 要完成的产物 & 验收标准 \\
 \midrule
 ADD 指令 & 走读 PC、取指、译码、寄存器读、ALU、写回和下一 PC & 能指出状态在哪个时钟沿提交 \\
+LOAD 指令 & 走读基址加立即数、数据存储器读、MDR 和寄存器写回 & 能区分地址形成、访存响应和写回来源 \\
+STORE 指令 & 走读地址形成、写数据来源、字节使能和存储器/MMIO 写入 & 能说明写响应不等于副作用完成 \\
 条件分支 & 说明比较结果如何改变下一 PC 选择 & 能区分顺序 PC 和分支目标 \\
+无条件跳转 & 说明跳转目标如何进入 PC，带链接跳转如何保存返回地址 & 能说明 PC 和链接寄存器的提交边界 \\
+最小整机 & 设计 ROM、RAM、GPIO LED、GPIO 按键的地址映射和译码规则 & 任意地址只允许一个目标响应 \\
 8086 地址 & 用段寄存器和偏移计算一个 20-bit 物理地址 & 能说明段:偏移是地址形成硬件规则 \\
+8086 总线周期 & 走读一次读周期中的 ALE、地址锁存、RD、READY 和数据采样 & 能说明复用总线每个阶段的唯一驱动者 \\
 80386 地址 & 走读有效地址、分段、线性地址、分页和物理地址 & 能说明权限或页错误如何变成异常 \\
+80386 字节使能 & 说明 32-bit 总线上字节/半字访问如何选择有效字节 & 能避免误改相邻字节 \\
+SRAM 接线 & 为一片 SRAM 写出地址、CS、OE、WE、字节使能和数据线的读写规则 & 能防止总线争用和误写 \\
+地址译码 & 给出 ROM、RAM、GPIO、定时器的内存映射表 & 未映射区域和重叠区域有明确处理 \\
 cache 命中读 & 写出 tag 比较、valid 检查、data 选择和返回路径 & 能说明低时延来自近处命中 \\
 cache 未命中读 & 写出下层请求、dirty 写回、回填和返回过程 & 能说明慢路径来自下层和互连等待 \\
+TLB 未命中 & 说明地址转换结果不在 TLB 时为何要访问页表 & 能区分 cache 未命中和 TLB 未命中 \\
 MMIO 写命令 & 说明写命令寄存器、设备执行、状态位和完成通知的关系 & 不把写响应当作设备完成 \\
+GPIO 寄存器 & 设计 \code{DIR/OUT/IN/IRQ} 四个寄存器的读写语义 & 外部按键必须先调理和同步 \\
+定时器寄存器 & 设计 \code{COUNT/CMP/CTRL/STAT}，说明到期事件和清除顺序 & 不丢同时到来的新事件 \\
 DMA 传输 & 写出 CPU 配置、cache 处理、设备搬运、completion 和 CPU 读取结果 & 能说明 cache 一致性或显式清理失效 \\
 中断入口 & 说明设备、中断控制器、CPU 入口和设备确认的顺序 & 能避免丢事件或重复进入 \\
 启动路径 & 写出复位、时钟、启动地址、ROM/启动介质、主存初始化和设备默认状态 & 能说明整机启动不只是 PC 赋值 \\
+启动 ROM 实验 & 写出复位后从 ROM 取第一条指令、访问 RAM、写 GPIO LED 的 trace & 能证明 ROM/RAM/MMIO 译码和 PC 更新正确 \\
+系统低时延 & 比较 cache、TLB、预取、分支预测、DMA 对延迟和吞吐的作用 & 能说明低时延不是单纯晶体管更快 \\
 经典芯片 & 分别说明 6502/Z80、8051、8086、80386、80486/Pentium 的硬件观察点 & 每个案例要绑定一个真实整机问题 \\
 \bottomrule
 \end{longtable}
 
 \section*{参考解答与验收要点}
 
-\begin{longtable}{p{0.18\linewidth}p{0.46\linewidth}p{0.26\linewidth}}
+\begin{longtable}{L{0.18\linewidth}L{0.46\linewidth}L{0.26\linewidth}}
 \toprule
 任务 & 参考解答 & 必须保留的验收点 \\
 \midrule
 ADD 指令 & PC 输出地址，指令存储器返回编码，控制器译码出读地址和 \code{alu_op=ADD}，寄存器阵列输出源操作数，ALU 产生结果，写回 mux 选择 ALU，时钟沿写入目标寄存器并更新 PC。 & 取指/译码/执行是组合传播，写回和 PC 更新是状态提交。 \\
+LOAD 指令 & 基址寄存器和扩展后的立即数进入 ALU 形成地址；数据存储路径按地址访问 RAM、cache 或 MMIO；读响应进入 MDR 或写回 mux；时钟沿把读回数据写入目标寄存器。 & 地址形成、读事务和寄存器写回是不同边界。 \\
+STORE 指令 & ALU 形成地址，源寄存器提供写数据，字节使能说明写入哪些字节；若地址落到 RAM 就保存数据，若落到 MMIO 可能启动设备或改变外设状态。 & STORE 有副作用，必须说明目标和完成条件。 \\
 条件分支 & ALU 或比较器生成条件证据，控制器形成 \code{branch_taken}，下一 PC mux 在顺序地址和分支目标之间选择。 & 分支本质是 PC 下一值选择。 \\
+无条件跳转 & 跳转目标可来自立即数、寄存器或表项，\code{pc_sel} 选择该目标写入 PC；若是带链接跳转，还要把顺序 PC 写入链接寄存器。 & PC 写入和链接寄存器写入都要有明确时钟边界。 \\
+最小整机 & 示例映射：\code{0x0000-0x7FFF} 为 ROM，\code{0x8000-0xEFFF} 为 RAM，\code{0xF000} 为 \code{GPIO_OUT}，\code{0xF004} 为 \code{GPIO_IN}。地址译码可用高位比较或 74HC138 生成片选，任何周期只允许一个目标响应。 & ROM、RAM 和 MMIO 不能重叠驱动总线。 \\
 8086 地址 & 物理地址可写作 \code{segment * 16 + offset}，例如 \code{1234h:0050h} 形成 \code{12390h}。 & 20-bit 地址来自段基址左移和偏移相加。 \\
+8086 总线周期 & T1 输出地址并用 ALE 让外部锁存器保存低位地址；T2 激活读控制并让总线转向；T3/Tw 由目标驱动数据且 READY 可插入等待；T4 CPU 采样数据并撤销控制。 & 复用总线必须分阶段说明谁驱动、谁采样。 \\
 80386 地址 & 有效地址经分段得到线性地址；启用分页后线性地址经页表得到物理地址；权限、存在位或界限错误触发异常入口。 & 地址转换同时包含数值形成和权限检查。 \\
+80386 字节使能 & 32-bit 总线上的字节或半字访问要用地址低位和字节使能选择有效字节；未被选中的字节不能被写改。未对齐访问可由硬件拆分，也可触发异常，取决于体系规则。 & 位宽扩大后仍要精确控制字节粒度。 \\
+SRAM 接线 & 读周期：地址和 \code{CS} 稳定，\code{OE} 有效，\code{WE} 无效，由 SRAM 驱动数据线。写周期：地址、写数据、字节使能稳定，\code{CS} 和 \code{WE} 有效，\code{OE} 关闭。 & \code{OE} 与其他驱动源不能同时打开，\code{WE} 不能早于地址和数据稳定。 \\
+地址译码 & 先列地址区间，再为每个区间生成片选；ROM、RAM、GPIO、定时器各有独立响应，未映射地址可返回错误、固定空值或超时，但必须写入规格。 & 地址译码是整机语义边界。 \\
 cache 命中读 & 地址索引 cache，tag 比较相等且 valid 为 1，data 字段选出目标数据并返回执行路径。 & 没有访问 DRAM，是近处结构命中。 \\
 cache 未命中读 & cache 向下层请求数据；若牺牲行 dirty，先写回；下层返回 cache line 后填入本级，再把目标字返回 CPU。 & 未命中包括互连、下层访问、可能写回和回填。 \\
+TLB 未命中 & TLB 保存近期虚拟页到物理页的转换。若未命中，硬件或系统软件必须访问页表取得转换，并检查存在位和权限；成功后可填入 TLB，失败则进入异常。 & TLB 解决地址转换时延，cache 解决数据位置时延。 \\
 MMIO 写命令 & CPU 写命令寄存器只表示命令到达设备接口；设备随后执行并更新 busy/done/error，CPU 应轮询状态、等待中断或读取 completion。 & MMIO 写响应不等于设备完成。 \\
+GPIO 寄存器 & \code{DIR} 决定引脚方向，\code{OUT} 写输出锁存器，\code{IN} 返回同步后的引脚状态，\code{IRQ} 保存边沿事件并按规则清除。按键输入必须经过默认电平、消抖、施密特和同步器。 & 外部电压不能直接当作 CPU 内部状态。 \\
+定时器寄存器 & \code{COUNT} 为当前计数，\code{CMP} 为比较目标，\code{CTRL} 控制启动、模式和中断使能，\code{STAT} 报告 done 或 error。清除状态位要按设备规则，常见做法是写 1 清除。 & 状态清除顺序要避免丢新事件。 \\
 DMA 传输 & CPU 准备缓冲区和描述符，按一致性规则清理 cache，写设备寄存器启动 DMA；设备作为互连发起者搬运数据；完成后置位 done、写 completion 或发中断；CPU 再按规则失效旧 cache 并读取结果。 & CPU 与 DMA 共享主存时必须处理可见性。 \\
 中断入口 & 设备置请求，中断控制器按屏蔽和优先级投递，CPU 在可接受边界保存状态并进入入口；处理程序读取设备状态，确认或清除事件，再恢复执行。 & 设备侧和控制器侧都要确认，顺序错误会丢事件或重复进入。 \\
 启动路径 & 复位让 PC 到固定启动地址，时钟和复位树稳定，启动 ROM 或片上存储提供第一段编码，主存控制器和必要设备初始化，危险输出保持安全默认值。 & 整机启动包含 CPU、时钟、复位、存储、互连和设备。 \\
+启动 ROM 实验 & 复位后 PC 指向 ROM 入口；取指读 ROM；程序可先写 RAM 测试字，再读 \code{GPIO_IN}，根据按键状态写 \code{GPIO_OUT}。验收时观察 PC、ROM 片选、RAM 片选、GPIO 片选、写使能和 LED 锁存。 & 第一条指令可预测，地址译码和副作用可观察。 \\
+系统低时延 & cache 缩短数据访问，TLB 缩短地址转换，预取提前取可能使用的数据，分支预测减少控制流等待，DMA 把大块搬运从 CPU 指令流卸载。失败路径包括 cache/TLB 未命中、预测错误、DMA 一致性处理和互连排队。 & 要区分单次延迟、吞吐率和失败路径成本。 \\
 经典芯片 & 6502/Z80 观察外部总线和多周期控制；8051 观察片上 I/O 和中断；8086 观察段地址、复用总线和预取；80386 观察 32-bit、保护和分页；80486/Pentium 观察 cache、流水线和预测。 & 每个案例都对应一个硬件边界，不只是年代名称。 \\
 \bottomrule
 \end{longtable}
