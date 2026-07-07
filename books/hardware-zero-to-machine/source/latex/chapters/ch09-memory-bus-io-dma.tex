@@ -1,0 +1,254 @@
+\chapter{主存、总线、I/O 与 DMA}
+
+前面三章已经解释了 bit 如何稳定、组合逻辑如何计算、状态元件如何保存历史、ALU 和控制器如何让数据通路在每个时钟边界提交新状态。若停在这里，读者只能得到一台“会在片内寄存器之间搬数”的小机器。真正的整机还需要大容量主存、可寻址设备、外部事件、等待和错误路径。本章专门补上这条桥：CPU 怎样把一个地址变成一次存储器或设备事务，设备怎样把完成事件通知 CPU，DMA 又怎样在不让 CPU 逐字搬运的情况下读写主存。
+
+本章的目标不是背总线协议名字。无论是 8086 板级总线、微控制器片内总线、PCIe 设备，还是现代 SoC 互连，工程问题都相同：谁发起请求，谁响应地址，数据由谁驱动，什么时候采样，目标慢了怎样等待，目标不存在怎样失败，设备完成后怎样通知。把这些问题写清楚，才能从最小 CPU 走到可启动、可调试、可扩展的整机。
+
+\begin{keyidea}
+整机硬件不是“CPU 加一块内存”的粗线图，而是一组可验收事务。每次访问都必须说明地址、方向、字节选择、目标片选、握手、完成、错误和副作用。只有这些边界明确，CPU 才能可靠地取指、访存、访问设备和处理中断。
+\end{keyidea}
+
+\section{一、主存不是抽象数组}
+
+软件把内存看成按地址编号的字节序列，硬件却必须用地址线、译码器、存储阵列、数据线和控制信号实现这件事。一次读访问至少包含四个事实：发起者给出地址，译码逻辑选中目标，目标经过内部访问后驱动数据，发起者在规定边界采样。一次写访问则要求地址、写数据、字节使能和写控制在目标采样窗口内稳定。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+对象 & 硬件含义 & 验收问题 \\
+\midrule
+地址 & 指出本次事务目标位置 & 高位译码是否只选中一个目标 \\
+数据 & 读时由目标返回，写时由发起者提供 & 同一时刻是否只有一个驱动者 \\
+读写控制 & 区分本次事务方向和类型 & 输出使能和写使能是否互斥 \\
+字节使能 & 指明哪些 8-bit 车道有效 & 字节写不会破坏相邻数据 \\
+ready/valid & 指明请求或响应是否真正完成 & 慢目标能否插入等待而不丢地址和数据 \\
+\bottomrule
+\end{longtable}
+
+\topic{ROM、SRAM 和 DRAM 的读写不是同一种动作}
+ROM 或 Flash 适合保存启动代码，掉电后内容仍在；SRAM 接口直观，地址稳定后在访问时间内返回数据，适合教学板、cache 和小容量片上 RAM；DRAM 密度高，但单元需要刷新，访问还要经过 bank、行、列、预充电和控制器调度。把这些对象都叫“内存”没有错，但在硬件验收时必须区分它们的时序和控制边界。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+存储类型 & 典型用途 & 关键边界 \\
+\midrule
+ROM/Flash & 复位入口、固件、常量表 & 复位地址必须映射到有效内容，读时序满足取指 \\
+SRAM & cache、实验板 RAM、小容量片上存储 & \code{CS}/\code{OE}/\code{WE} 互斥，地址和数据满足建立时间 \\
+DRAM & 大容量主存 & 控制器负责 activate、read/write、precharge、refresh \\
+寄存器文件 & CPU 内部近距离状态 & 多读端口、写端口、旁路和同周期读写规则明确 \\
+\bottomrule
+\end{longtable}
+
+\topic{异步 SRAM 是最好的第一块主存}
+教学整机可以先使用低速异步 SRAM。读周期中，地址和片选稳定后，打开输出使能，SRAM 在访问时间后驱动数据线；写周期中，输出使能关闭，发起者驱动数据线，在写使能有效窗口内把数据写入目标字节。这个模型足够简单，也足以暴露硬件最常见错误：片选重叠、输出争用、写使能过早、字节使能错误。
+
+\begin{lstlisting}
+SRAM read:
+  address stable
+  CS active, OE active, WE inactive
+  wait access time
+  sample data
+
+SRAM write:
+  address and write_data stable
+  CS active, OE inactive, WE active for write window
+  selected byte lanes store data
+\end{lstlisting}
+
+\topic{DRAM 需要控制器而不是直接接地址线}
+DRAM 的容量来自更密集的存储单元，代价是接口复杂。控制器要先打开某个 bank 的某一行，再读写列；换行前需要预充电；即使没有普通访问，也要周期性刷新；高速 DRAM 还需要训练采样窗口。CPU 看到的是“主存读写”，但实际路径经过控制器、队列、bank 调度、行命中或行冲突。这也是为什么现代 CPU 必须靠 cache 把常用数据放近。
+
+\section{二、地址译码定义整机地图}
+
+CPU 输出的是地址数值，整机必须规定这个数值由哪个目标响应。这个规定叫地址映射。一个简单教学板可以把低地址映射到 ROM，中间映射到 RAM，高地址小窗口映射到 GPIO、定时器和串口等设备寄存器。地址译码器把高位地址和访问类型变成片选信号。
+
+\begin{lstlisting}
+example 16-bit address map:
+  0x0000-0x7FFF  boot ROM
+  0x8000-0xEFFF  SRAM
+  0xF000         GPIO_OUT
+  0xF004         GPIO_IN
+  0xF010         TIMER_COUNT
+  0xF014         TIMER_CTRL
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+映射对象 & 响应规则 & 典型错误 \\
+\midrule
+ROM & 复位入口和只读代码地址命中 & 复位后 CPU 取不到第一条指令 \\
+RAM & 普通数据读写地址命中 & 写使能误打到 ROM 或设备窗口 \\
+GPIO & 设备寄存器地址命中并产生副作用 & 地址译码过宽，普通内存写误触发外设 \\
+未映射区 & 返回错误、超时或固定空值 & 访问悬空，CPU 永久等待或读到随机总线值 \\
+\bottomrule
+\end{longtable}
+
+\topic{片选表达式就是硬件合同}
+若地址空间为 64 KiB，可以用高位地址产生粗粒度片选。例如 \code{A15=0} 选 ROM，\code{A15=1,A14=0} 选 RAM，\code{A15=1,A14=1,A13=1,A12=1} 选 I/O 窗口。无论用门电路、译码器、CPLD 还是 FPGA 实现，都必须证明任意合法周期最多只有一个目标片选有效。
+
+\begin{lstlisting}
+rom_cs = !A15
+ram_cs = A15 && !A14
+io_cs  = A15 && A14 && A13 && A12
+\end{lstlisting}
+
+这三个表达式看起来像逻辑练习，实际上就是整机安全边界。若 ROM 和 RAM 可同时片选，读周期可能出现两个芯片同时驱动数据线；若 RAM 和 GPIO 片选重叠，普通 STORE 可能既改内存又改外设输出；若未映射地址没有超时或错误返回，CPU 可能等待一个永远不会响应的目标。
+
+\topic{时序预算决定是否需要等待状态}
+地址译码需要时间，存储器访问需要时间，数据到达 CPU 输入端后还要满足建立时间。若这些时间总和超过时钟周期，就必须降低频率、换更快器件，或插入等待状态。等待状态不是软件延时，而是硬件事务延长：地址、片选、读写方向和数据驱动关系必须在等待期间保持可解释。
+
+\begin{lstlisting}
+read_budget =
+  cpu_address_output_delay
+  + address_decode_delay
+  + memory_access_time
+  + input_setup_time
+  + board_margin
+\end{lstlisting}
+
+若 \code{read_budget} 大于一个周期，控制器就不能在下一拍采样数据。慢 ROM、慢外设和长板级走线都可能需要 READY/WAIT 机制。正式规格还应说明最大等待长度和超时行为，避免坏设备把整机永久挂住。
+
+\section{三、MMIO 把设备寄存器放进地址空间}
+
+设备寄存器可以像内存地址一样被 CPU 读写，但它们不是普通 RAM。读状态寄存器可能清除某些位，写命令寄存器可能启动外设动作，写数据寄存器可能进入 FIFO，读数据寄存器可能弹出一个元素。这类地址称为内存映射 I/O，简称 MMIO。MMIO 的关键不是地址长得像内存，而是每个寄存器都有副作用和顺序规则。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+设备寄存器 & 读写语义 & 验收问题 \\
+\midrule
+\code{DIR} & 设置 GPIO 引脚方向 & 输出引脚和输入引脚不会混用 \\
+\code{OUT} & 写输出锁存器 & 写入只改变目标输出位 \\
+\code{IN} & 读取同步后的外部输入 & 按键抖动和亚稳态不能直接进入 CPU \\
+\code{STAT} & 返回 ready、busy、error、irq 等状态 & 清除规则不会丢掉同时到来的新事件 \\
+\code{DATA} & 数据收发寄存器或 FIFO 端口 & 空读、满写和溢出有明确定义 \\
+\bottomrule
+\end{longtable}
+
+\topic{MMIO 写响应不等于设备已经完成}
+CPU 写一个命令寄存器，通常只表示设备已经接收命令。设备真正完成可能要等若干周期、若干微秒，甚至更久。完成可以通过状态位、轮询、DMA completion 或中断通知。若把 MMIO 写返回当作“设备动作完成”，软件会在设备尚未写完缓冲区、尚未刷新状态或尚未清除错误时继续执行，形成难复现的硬件错误。
+
+\begin{lstlisting}
+device command sequence:
+  CPU writes COMMAND register
+  bus write response returns
+  device starts internal work
+  device sets DONE or ERROR
+  interrupt or polling tells CPU to inspect result
+\end{lstlisting}
+
+\topic{外部输入必须先调理和同步}
+按键、传感器、串口线和外部中断引脚都不按 CPU 时钟整齐变化。按键还会抖动，异步输入还可能让触发器进入亚稳态。教学板上的 GPIO 输入至少应经过电平保护、上拉/下拉、去抖策略和同步触发器，再进入设备寄存器。否则 CPU 读到的不是稳定硬件事实，而是未定义的边界行为。
+
+\begin{warningbox}
+不要把设备寄存器当作普通变量。普通 RAM 的读写目标是保存数据；MMIO 的读写目标是驱动硬件状态机。编译器、cache、写缓冲和乱序执行都可能改变普通内存访问的时机，但设备访问通常需要不可缓存属性、顺序约束和明确的完成检查。
+\end{warningbox}
+
+\section{四、中断和 DMA 把外部事件接回 CPU}
+
+轮询可以让 CPU 一直读状态寄存器，直到设备 ready。但若设备很慢，CPU 会浪费大量周期。中断提供另一种路径：设备在状态变化后请求中断，中断控制器汇总、屏蔽和排序请求，CPU 在可接受边界保存当前执行上下文，跳到中断入口，服务程序读取设备状态并清除事件。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+对象 & 硬件职责 & 验收问题 \\
+\midrule
+设备 & 产生完成、错误或数据到达事件 & 状态位和中断请求是否同步一致 \\
+中断控制器 & 汇总、屏蔽、优先级和投递 & 屏蔽位、优先级、EOI 顺序是否正确 \\
+CPU 入口 & 保存边界状态并跳到入口 & PC、标志和特权边界是否可恢复 \\
+服务程序 & 读状态、搬数据、清除事件 & 不丢新事件，不重复进入同一旧事件 \\
+\bottomrule
+\end{longtable}
+
+\topic{中断清除顺序是硬件合同}
+若服务程序先清设备状态，再清中断控制器，或先通知中断控制器再清设备，效果可能不同。某些设备要求先读状态后读数据，某些要求写 1 清位，某些要求读数据寄存器自动清除 ready。教材级规格必须写清楚事件锁存、状态读取、清除、EOI 和重新开放中断的顺序。否则系统在低速测试中正常，在高频事件下丢中断或重复中断。
+
+DMA 解决的是另一类浪费。若磁盘、网卡、显示控制器或音频设备需要搬运大量数据，CPU 不应逐字从设备读出再逐字写入内存。DMA 让设备或 DMA 控制器成为总线发起者，按描述符或寄存器配置直接读写主存。CPU 负责准备缓冲区和描述符，设备负责搬运，完成后用状态位或中断通知 CPU。
+
+\begin{lstlisting}
+DMA receive sketch:
+  CPU allocates buffer
+  CPU writes descriptor address and length
+  CPU ensures descriptor is visible to device
+  device reads descriptor and writes buffer
+  device posts completion
+  CPU handles interrupt and inspects buffer
+\end{lstlisting}
+
+\topic{DMA 最容易错在可见性和所有权}
+DMA 让 CPU 和设备共享主存，也引入 cache 一致性、顺序和缓冲区所有权问题。CPU 写好的描述符必须先对设备可见；设备写入的缓冲区必须在 CPU 读取前变得可见；CPU 不能在设备仍拥有缓冲区时重用它；设备不能越过分配的地址范围。现代系统还会用 IOMMU 限制 DMA 能访问哪些物理页，避免坏设备或错误驱动破坏任意内存。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+边界 & 必须说明 & 失败后果 \\
+\midrule
+描述符可见 & CPU 写描述符后如何让设备看到 & 设备读到旧地址、旧长度或旧标志 \\
+数据可见 & 设备写缓冲区后 CPU 如何看到新数据 & CPU 读到 cache 中的旧内容 \\
+所有权 & 缓冲区何时归 CPU，何时归设备 & 重用正在 DMA 的缓冲区，数据被覆盖 \\
+地址权限 & 设备能访问哪些物理页或 I/O 虚拟地址 & DMA 写坏无关内存或触发 IOMMU fault \\
+完成顺序 & completion 到达是否代表所有数据已可见 & 收到中断后仍读到未完成数据 \\
+\bottomrule
+\end{longtable}
+
+\section{五、从教学总线到现代互连}
+
+早期微机的并行总线比较直观：地址线、数据线、读写控制、片选和等待信号都能在逻辑分析仪上看到。现代芯片内部和 PCIe 这类外部互连更复杂，可能使用分层 packet、请求队列、completion、错误报告和流控。但抽象问题没有改变：事务由发起者提出，经互连路由到目标，目标返回数据或完成状态，错误路径必须被记录和上报。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+互连对象 & 旧总线中的类比 & 现代形式 \\
+\midrule
+地址阶段 & 地址线和片选 & 请求 packet、BAR、路由 ID、地址译码 \\
+数据阶段 & 数据线和字节使能 & payload、byte enable、burst 或 cache line \\
+等待 & READY/WAIT & credit、ready/valid、队列背压 \\
+完成 & 采样数据或写周期结束 & completion packet、状态位、中断或 MSI \\
+错误 & 总线错误或超时 & poison、fault、AER、IOMMU fault、设备 error \\
+\bottomrule
+\end{longtable}
+
+\topic{valid/ready 是理解现代片上互连的最小模型}
+许多片上接口都可以抽象成 valid/ready 握手。发送方在 valid 为 1 时保持请求或响应稳定，接收方在 ready 为 1 时表示可以接收，只有二者同周期为 1，事务片段才真正完成。请求通道和响应通道可以分开，读请求和读数据也可以隔很多周期。这个模型比“总线一拍完成”更接近现代硬件。
+
+\begin{lstlisting}
+handshake rule:
+  transfer happens only when valid == 1 and ready == 1
+  while valid == 1 and ready == 0:
+    sender keeps payload stable
+  receiver may apply backpressure by deasserting ready
+\end{lstlisting}
+
+\topic{低时延来自近处、缓存、并行和卸载}
+现代整机降低时延，不是让所有路径都变成零等待。L1/L2 cache 让常见数据走近处 SRAM；TLB 让近期地址转换不必每次查页表；预取和分支预测提前准备可能需要的路径；流水线、旁路和乱序调度让独立工作重叠；DMA、队列和中断聚合把批量 I/O 从 CPU 指令流中卸载。失败路径仍然存在：cache miss、TLB miss、DRAM 排队、设备背压、DMA fault 和错误中断都会把访问拉回慢路径。
+
+\begin{classicnote}
+读任何硬件平台，都可以用同一张事务表约束理解：发起者、目标、地址、方向、数据宽度、握手、完成、错误、副作用和可观察证据。早期 8086 总线、微控制器片内外设、PCIe 设备和现代 SoC 互连的规模不同，但这十项问题不变。
+\end{classicnote}
+
+\section*{章末练习与验收任务}
+
+\begin{longtable}{L{0.22\linewidth}L{0.5\linewidth}L{0.18\linewidth}}
+\toprule
+任务 & 要求 & 验收标准 \\
+\midrule
+SRAM 读写周期 & 画出地址、CS、OE、WE、数据线和采样窗口 & 能指出谁驱动数据线，谁采样 \\
+地址映射 & 设计 64 KiB ROM/RAM/GPIO/定时器映射 & 任意地址最多一个片选有效 \\
+等待状态 & 为慢 ROM 和慢 I/O 设计 READY/WAIT 规则 & 等待期间地址和方向稳定，有超时策略 \\
+MMIO 寄存器 & 设计 GPIO 的 \code{DIR/OUT/IN/STAT} 语义 & 外部输入经过同步，状态清除规则明确 \\
+中断顺序 & 写出设备 ready 到 CPU 服务程序返回的 trace & 不丢事件，不重复清旧事件 \\
+DMA 顺序 & 写出描述符、缓冲区、completion 和 cache 可见性边界 & CPU 和设备所有权不重叠 \\
+现代互连 & 用 valid/ready 描述一次读请求和读响应 & 能说明背压和 completion 的作用 \\
+\bottomrule
+\end{longtable}
+
+\section*{参考解答与验收要点}
+
+\begin{longtable}{L{0.18\linewidth}L{0.48\linewidth}L{0.24\linewidth}}
+\toprule
+任务 & 参考解答 & 必须保留的验收点 \\
+\midrule
+SRAM 周期 & 读时地址和片选稳定，OE 有效、WE 无效，由 SRAM 驱动数据；写时 OE 无效，由发起者驱动数据，WE 在地址和数据稳定后有效。 & 输出使能互斥，写窗口满足建立/保持时间。 \\
+地址映射 & 例如低半区 ROM，高半区中一块 RAM，最高 4 KiB 为 I/O；用高位地址产生互斥片选，未映射区返回错误或超时。 & 片选互斥和未映射行为必须写入规格。 \\
+等待状态 & 慢目标在 ready 之前保持事务未完成，控制器保持地址、片选和方向；超过最大等待则返回错误。 & 等待状态是硬件事务延长。 \\
+MMIO & GPIO 输出写入锁存器，输入来自同步后的外部引脚，状态位说明 ready/error/irq，清除规则避免新旧事件混淆。 & MMIO 有副作用，不是普通变量。 \\
+中断 & 设备锁存事件并请求中断，中断控制器投递，CPU 进入入口，服务程序读状态、处理数据、按设备规则清事件，再发送 EOI 或恢复中断。 & 清除顺序决定是否丢事件。 \\
+DMA & CPU 准备描述符和缓冲区并保证对设备可见，设备搬运数据并投递 completion，CPU 在 completion 后按一致性规则读取缓冲区。 & 描述符可见、数据可见和缓冲区所有权必须分开。 \\
+valid/ready & 只有 valid 和 ready 同时为 1 才传输；ready 为 0 时发送方保持 payload；读请求和读响应可隔多个周期。 & 背压不等于错误，completion 才是完成证据。 \\
+\bottomrule
+\end{longtable}
