@@ -697,6 +697,120 @@ response code & OKAY、SLVERR、DECERR、超时等 & 区分目标报错和无人
 
 这也是为什么后续平台 bring-up 日志要把总线层证据记录下来。单看 C 代码中的一行 \code{*ptr} 无法知道失败来自页表、cache、IOMMU、互连还是设备时钟未开；完整错误记录能把问题缩小到可测量的硬件边界。
 
+\topic{专题：内存层次要同时看容量、时延、带宽和所有权}
+计算机硬件不是只有 CPU。CPU 的每一次有用工作，几乎都要和某一级存储或 I/O 交换信息。寄存器最快但数量极少；L1/L2/L3 cache 容量逐级增大、时延逐级上升；DRAM 容量大但需要控制器、队列和刷新；SSD/硬盘容量更大，却只能通过控制器、队列、DMA 和中断间接参与执行。把这些对象都称为“存储”会掩盖关键差异：有些层按字节随机访问，有些层按 cache line 交换，有些层按页或块传输，有些层只能通过命令队列返回 completion。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=1.55cm] (reg) at (0,0) {寄存器};
+  \node[hw compute, minimum width=1.55cm] (l1) at (1.8,0) {L1};
+  \node[hw compute, minimum width=1.55cm] (l2) at (3.6,0) {L2/L3};
+  \node[hw memory, minimum width=1.75cm] (dram) at (5.65,0) {DRAM};
+  \node[hw control, minimum width=1.75cm] (ssd) at (7.9,0) {SSD/硬盘};
+  \node[hw lane, minimum width=8.8cm, text width=8.4cm] at (3.95,-1.35) {越靠左，访问粒度越小、时延越低、容量越小；越靠右，容量越大，但访问要经过控制器、队列、DMA、错误码和完成通知。};
+  \draw[hw bus] (reg) -- node[above,hw label]{操作数} (l1);
+  \draw[hw bus] (l1) -- node[above,hw label]{cache line} (l2);
+  \draw[hw bus] (l2) -- node[above,hw label]{回填/写回} (dram);
+  \draw[hw bus] (dram) -- node[above,hw label]{DMA 缓冲区} (ssd);
+\end{pdfdiagram}
+\diagramnote{内存层次不是一条“更大的数组”，而是一组访问粒度和完成语义不同的层。}
+
+\begin{longtable}{L{0.16\linewidth}L{0.22\linewidth}L{0.28\linewidth}L{0.24\linewidth}}
+\toprule
+层次 & 常见粒度 & 谁直接访问 & 主要硬件问题 \\
+\midrule
+寄存器 & word 或向量 lane & 执行单元 & 端口数、旁路、写回冲突 \\
+L1 cache & cache line & 当前核心 load/store 单元 & 命中时延、虚实地址、别名和写策略 \\
+L2/L3 cache & cache line & 一个核心或多个核心 & 容量、共享、替换、一致性 \\
+DRAM & burst/cache line & 内存控制器 & bank、行命中、刷新、ECC、调度 \\
+SSD/硬盘 & 块、页或扇区 & 设备控制器和 DMA & 命令队列、坏块、磨损、错误恢复 \\
+网络/显卡等设备 & 描述符、包、帧、buffer & DMA 引擎和设备内部队列 & 所有权、completion、IOMMU、cache 可见性 \\
+\bottomrule
+\end{longtable}
+
+从程序角度看，\code{load x} 只是取一个变量；从硬件角度看，它可能命中寄存器旁路、命中 L1、命中 L2、命中共享 L3、访问 DRAM、触发页表遍历、发生缺页，甚至等待块设备把页面读回主存。CSAPP 强调的 locality 就是让常见访问停留在左侧短路径。硬件书不能只说“内存很快/很慢”，而要说明每一级的访问粒度、所有者、完成证据和失败路径。
+
+\topic{专题：cache 与 TLB 是两套不同的近路}
+cache 缓存数据或指令内容，TLB 缓存虚拟页到物理页的地址转换。二者经常同时出现在一次 LOAD 路径上，但回答的问题不同：TLB 问“这个虚拟地址能否翻译成哪个物理地址”；cache 问“这个物理位置的内容是否已经在近处”。把二者混在一起，会导致读者无法理解为什么 TLB miss 不等于 cache miss，页错误也不等于总线错误。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.85cm] (va) at (0,0) {虚拟地址};
+  \node[hw compute, minimum width=1.85cm] (tlb) at (2.45,0) {TLB};
+  \node[hw state, minimum width=1.85cm] (pa) at (4.9,0) {物理地址};
+  \node[hw compute, minimum width=1.85cm] (cache) at (7.35,0) {cache};
+  \node[hw memory, minimum width=1.65cm] (data) at (9.65,0) {数据};
+  \node[hw control, minimum width=2.0cm] (ptw) at (2.45,-1.35) {页表遍历};
+  \node[hw memory, minimum width=2.0cm] (mem) at (7.35,-1.35) {DRAM 回填};
+  \draw[hw bus] (va) -- (tlb);
+  \draw[hw bus] (tlb) -- node[above,hw label]{命中} (pa);
+  \draw[hw bus] (pa) -- (cache);
+  \draw[hw bus] (cache) -- node[above,hw label]{命中} (data);
+  \draw[hw danger] (tlb) -- node[right,hw label]{miss} (ptw);
+  \draw[hw danger] (cache) -- node[right,hw label]{miss} (mem);
+\end{pdfdiagram}
+\diagramnote{TLB miss 需要地址转换证据；cache miss 需要数据回填证据。二者都可能让 LOAD 变慢，但失败位置不同。}
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+事件 & 真实含义 & 后续动作 \\
+\midrule
+TLB hit + cache hit & 地址转换和数据都在近处 & LOAD 快速返回 \\
+TLB miss + 页表命中 & 转换不在 TLB，但页表有效 & 硬件或软件页表遍历后填 TLB \\
+页不存在 & 页表没有有效映射 & 进入页错误异常，可能由 OS 分配或从磁盘读页 \\
+cache miss & 地址有效，但数据不在当前 cache & 从下一级 cache 或 DRAM 回填 cache line \\
+权限错误 & 转换存在但访问类型不允许 & 报保护异常，不能提交数据 \\
+\bottomrule
+\end{longtable}
+
+\topic{专题：SSD 和硬盘不是慢内存，而是块设备}
+硬盘和 SSD 都不能像 SRAM 那样把地址线接上就读一个字节。CPU 要通过控制器提交命令：读哪个逻辑块、读多长、放到哪个主存缓冲区、完成后写哪个 completion。硬盘的内部约束来自机械寻道和旋转；SSD 的内部约束来自 NAND flash 页读写、块擦除、FTL 映射、磨损均衡、垃圾回收和掉电保护。它们对 CPU 暴露的共同形态，是队列化块设备。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+对象 & 内部结构重点 & 对系统可见的边界 \\
+\midrule
+机械硬盘 & 盘片、磁头、磁道、扇区、缓存 & 随机访问受寻道和旋转影响，顺序访问更友好 \\
+SATA SSD & NAND flash、FTL、通道、擦除块 & 写放大、垃圾回收、坏块管理、掉电保护 \\
+NVMe SSD & PCIe、多队列、doorbell、completion queue & 并发队列深度高，CPU 通过 MMIO 和 DMA 协作 \\
+SD/eMMC & 控制器隐藏 flash 细节，命令集较简单 & 嵌入式启动和存储，延迟波动明显 \\
+\bottomrule
+\end{longtable}
+
+理解 SSD 时要避免两个误解。第一，SSD 没有机械寻道，不等于每次访问都一样快；内部垃圾回收、擦除、映射表缓存和热控都会让尾延迟上升。第二，逻辑块地址连续，不等于物理 NAND 页连续；FTL 会把逻辑写重映射到新位置，再在后台回收旧块。因此块设备的正确抽象不是“巨大数组”，而是“命令队列 + DMA 缓冲区 + completion + 错误恢复”。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.55cm] (cpu) at (0,0) {CPU};
+  \node[hw control, minimum width=2.05cm] (sq) at (2.55,0.72) {提交队列};
+  \node[hw control, minimum width=1.65cm] (bell) at (2.55,-0.72) {门铃};
+  \node[hw control, minimum width=2.0cm] (ctrl) at (5.25,0) {NVMe 控制器};
+  \node[hw memory, minimum width=1.85cm] (nand) at (7.8,0.72) {NAND/FTL};
+  \node[hw state, minimum width=2.05cm] (cq) at (7.8,-0.72) {完成队列};
+  \node[hw label] at (1.25,1.15) {1 写命令};
+  \node[hw label] at (1.25,-1.12) {2 敲门铃};
+  \node[hw label] at (6.55,-1.18) {3 投递完成};
+  \draw[hw bus] (cpu) -- (sq);
+  \draw[hw bus] (cpu) -- (bell);
+  \draw[hw bus] (sq) -- (ctrl);
+  \draw[hw bus] (bell) -- (ctrl);
+  \draw[hw bus] (ctrl) -- (nand);
+  \draw[hw return] (ctrl) -- (cq);
+  \draw[hw return] (cq.west) |- (cpu.south);
+\end{pdfdiagram}
+\diagramnote{NVMe 的基本形态：CPU 写队列和门铃，设备 DMA 读写主存，completion 才说明请求完成。}
+
+\topic{专题：读硬件结构时要区分数据路径和控制路径}
+CPU、cache、DRAM、SSD、网卡和显卡都可以用同一个提问框架阅读：数据从哪里到哪里，控制由谁发起，完成由谁报告，错误由谁保存。低质量描述常把这些混成“设备把数据给 CPU”。更好的描述应写出两条路径：数据可能经 DMA 在设备和主存之间移动；控制通常由 CPU 写 MMIO、设备写 completion、CPU 读状态或处理中断。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+路径 & 典型方向 & 必须说明 \\
+\midrule
+控制路径 & CPU 到 MMIO/doorbell，设备到状态/中断 & 命令何时被接收，完成如何通知 \\
+数据路径 & 设备 DMA 与主存缓冲区之间 & 缓冲区地址、长度、cache 可见性、权限 \\
+错误路径 & 设备或互连到错误码/异常 & 超时、校验、越界、权限和重试策略 \\
+恢复路径 & 驱动或固件到 reset/retry/rebuild & 哪些状态保留，哪些队列丢弃或重放 \\
+\bottomrule
+\end{longtable}
+
 \section*{章末练习与验收任务}
 
 \begin{longtable}{L{0.22\linewidth}L{0.5\linewidth}L{0.18\linewidth}}
@@ -713,6 +827,9 @@ valid/ready & 用 valid/ready 描述一次读请求和读响应 & 能说明背�
 cache 行 & 用 tag/index/offset 解释一次 cache 命中和一次 miss & 能说明 cache line、valid、dirty 和替换边界 \\
 MMIO 属性 & 说明为什么设备寄存器通常不能按普通 cacheable 内存处理 & 能指出副作用、顺序和可见性要求 \\
 未映射访问 & 规定未映射地址的超时、错误或固定返回值 & CPU 不会永久等待未知目标 \\
+存储层次图 & 画出寄存器、L1/L2/L3、DRAM、SSD/硬盘的数据粒度和完成语义 & 能区分 cache line、页、块和 completion \\
+TLB/cache 区分 & 写出一次 LOAD 中 TLB hit/miss、页错误、cache miss 的不同路径 & 不把地址转换错误和数据回填混为一谈 \\
+块设备队列 & 为 NVMe 或简化 SSD 写出 submission、doorbell、DMA、completion 顺序 & 能说明 CPU 写门铃不等于 I/O 完成 \\
 \bottomrule
 \end{longtable}
 

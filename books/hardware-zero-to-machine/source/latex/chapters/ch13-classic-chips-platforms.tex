@@ -1024,6 +1024,126 @@ cache/MMU & 页表摘要、属性、TLB flush 记录 & 地址转换和一致性�
 
 这样安排后，经典芯片不是怀旧材料，而是复杂系统的分层样本。每前进一步都在回答同一件事：更多性能、更多外设、更多安全约束进入系统后，哪些状态必须被显式保存，哪些事务必须被确认完成，哪些错误必须变成可诊断证据。
 
+\topic{专题：主板不是插槽集合，而是平台合同}
+主板把 CPU、内存、固件、电源、时钟、PCIe 设备、USB/SATA/NVMe、显卡、网卡和低速管理控制器连成一个可启动平台。它的核心职责不是“提供很多接口”，而是保证复位后每个设备处于可枚举、可供电、可配置、可报告错误的状态。CPU 能跑程序只是平台的一部分；内存训练、PCIe 枚举、电源时序、时钟分配、固件配置和热管理同样决定整机是否可靠。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.55cm] (cpu) at (0,0.8) {CPU};
+  \node[hw memory, minimum width=1.75cm] (dram) at (2.6,1.65) {DDR 内存};
+  \node[hw compute, minimum width=1.9cm] (pch) at (2.6,-0.35) {芯片组/PCH};
+  \node[hw control, minimum width=1.7cm] (fw) at (0,-1.35) {UEFI/Flash};
+  \node[hw control, minimum width=1.65cm] (pcie) at (5.2,0.8) {PCIe Root};
+  \node[hw state, minimum width=1.55cm] (gpu) at (7.5,1.55) {显卡};
+  \node[hw control, minimum width=1.55cm] (nvme) at (7.5,0.15) {NVMe};
+  \node[hw control, minimum width=1.55cm] (usb) at (5.2,-1.35) {USB/SATA/网卡};
+  \draw[hw bus] (cpu) -- node[above,hw label]{内存控制器} (dram);
+  \draw[hw bus] (cpu) -- node[left,hw label]{DMI/片上互连} (pch);
+  \draw[hw bus] (fw) -- node[left,hw label]{启动固件} (pch);
+  \draw[hw bus] (cpu) -- (pcie);
+  \draw[hw bus] (pcie) -- (gpu);
+  \draw[hw bus] (pcie) -- (nvme);
+  \draw[hw bus] (pch) -- (usb);
+\end{pdfdiagram}
+\diagramnote{PC 主板的关键不是“很多线”，而是启动、枚举、供电、时钟和错误报告共同构成平台合同。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+主板对象 & 负责的问题 & 典型失败表现 \\
+\midrule
+供电 VRM & 把电源转换成 CPU/GPU/内存所需电压，并按时序上电 & 复位不释放、负载变化时掉压、机器重启 \\
+时钟源 & 给 CPU、内存、PCIe、USB 等提供参考时钟 & 链路训练失败、设备枚举不稳定 \\
+固件 Flash & 保存 UEFI/BIOS、微码、平台配置 & 无法取第一阶段代码或配置错误 \\
+DDR 通道 & 连接内存颗粒或 DIMM，完成训练和 ECC & 内存训练失败、随机数据错误 \\
+PCIe Root & 枚举显卡、NVMe、网卡和扩展设备 & 设备消失、降速、AER 错误 \\
+低速管理 & Super I/O、EC、传感器、风扇、RTC & 键盘、风扇、温度或睡眠唤醒异常 \\
+\bottomrule
+\end{longtable}
+
+\topic{专题：PCIe 是分组互连，不是并行总线升级版}
+早期外部总线常暴露地址线、数据线、读写控制和 READY；PCIe 则把事务封装成包，在点对点串行链路上传输。CPU 或芯片组通过 root complex 发起配置、内存读写和消息事务；设备通过 BAR 暴露 MMIO 窗口，通过 MSI/MSI-X 发送中断，通过 DMA 访问主存。PCIe 的关键边界包括链路训练、配置空间、BAR 映射、事务层包、完成包和错误报告。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+PCIe 概念 & 含义 & 本书对应概念 \\
+\midrule
+配置空间 & 枚举设备、读取 ID、配置 BAR 和能力 & 地址地图和平台发现 \\
+BAR & 把设备寄存器映射到 CPU 地址空间 & MMIO 副作用和访问属性 \\
+Memory Read/Write TLP & 设备或 root 发起的内存事务包 & 总线事务和 completion \\
+MSI/MSI-X & 设备通过写内存样式消息触发中断 & 中断不一定是独立引脚 \\
+AER & 高级错误报告 & 错误路径可诊断 \\
+\bottomrule
+\end{longtable}
+
+把 PCIe 讲清楚后，显卡、NVMe、网卡都可以归入同一模型：先由平台枚举设备并分配地址窗口；驱动把命令写入队列或 MMIO；设备通过 DMA 读写主存；完成后写 completion 或发 MSI；错误通过状态寄存器、completion 状态或 AER 上报。这样读者不会把“插在主板上的设备”理解成 CPU 的附属品，而会把它看成能主动访问内存的总线主设备。
+
+\topic{专题：显卡的核心不是显示器接口，而是并行处理器加显存系统}
+显卡既是显示设备，也是大规模并行计算设备。GPU 内部有许多执行单元、调度器、寄存器文件、L1/L2 cache、纹理/采样单元、光栅化和显示引擎；外部或封装上有高带宽显存，例如 GDDR 或 HBM。CPU 不会逐像素把画面写到显示器，而是准备命令缓冲区、资源描述、纹理和顶点数据，GPU 读取这些对象并在显存中生成帧缓冲，显示引擎再按扫描时序把帧送到显示接口。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.6cm] (cpu) at (0,0) {CPU};
+  \node[hw memory, minimum width=2.0cm] (sysmem) at (2.4,0.8) {系统内存};
+  \node[hw control, minimum width=2.0cm] (cmd) at (2.4,-0.8) {命令缓冲};
+  \node[hw control, minimum width=1.85cm] (pcie) at (4.9,0) {PCIe};
+  \node[hw compute, minimum width=2.0cm] (gpu) at (7.35,0.8) {GPU 执行};
+  \node[hw memory, minimum width=1.75cm] (vram) at (9.7,0.8) {VRAM};
+  \node[hw state, minimum width=1.75cm] (scan) at (7.35,-0.8) {显示引擎};
+  \node[hw state, minimum width=1.55cm] (disp) at (9.7,-0.8) {显示器};
+  \draw[hw bus] (cpu) -- (sysmem);
+  \draw[hw bus] (cpu) -- (cmd);
+  \draw[hw bus] (cmd) -- (pcie);
+  \draw[hw bus] (pcie) -- (gpu);
+  \draw[hw bus] (gpu) -- (vram);
+  \draw[hw return] (vram) -- (scan);
+  \draw[hw bus] (scan) -- (disp);
+\end{pdfdiagram}
+\diagramnote{GPU 数据路径：CPU 提交命令，GPU 经 PCIe/内存读取资源，在显存中生成帧，显示引擎独立扫描输出。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+显卡对象 & 硬件含义 & 常见误解 \\
+\midrule
+命令缓冲 & CPU 写入、GPU 异步消费的工作队列 & 不是 CPU 直接调用 GPU 函数 \\
+VRAM & GPU 近处的大带宽存储系统 & 不是普通 DRAM 的别名，带宽和访问模式不同 \\
+着色/计算单元 & 大量相似线程并行执行 & 不是少数超快 CPU 核心 \\
+纹理/cache 单元 & 优化二维或三维局部访问和采样 & 不等于通用 cache 的简单复制 \\
+显示引擎 & 按固定时序读取帧缓冲并输出信号 & 渲染完成和显示扫描是两个边界 \\
+\bottomrule
+\end{longtable}
+
+GPU 的性能问题也不同于 CPU。CPU 常追求低时延和强单线程控制流；GPU 常追求吞吐，用大量并行线程隐藏显存等待。分支发散、访存不合并、显存带宽不足、CPU/GPU 同步过多，都会让 GPU 性能掉下来。理解显卡时应问：命令何时提交，资源何时对 GPU 可见，GPU 何时完成，帧缓冲何时可显示，CPU 是否过早读回结果。
+
+\topic{专题：整机案例：从打开程序到读取文件和显示图像}
+一个真实用户动作会穿过多种硬件。用户打开程序，操作系统可能从 SSD 读取可执行文件和页面；CPU 触发块设备队列；NVMe 控制器 DMA 数据到主存；页表和 cache 让 CPU 取指执行；程序提交图形命令；GPU 读取资源、渲染到 VRAM；显示引擎扫描帧缓冲。这里没有哪个部件可以单独解释全程，必须把 CPU、内存、SSD、PCIe、GPU、显示和中断连成 trace。
+
+\begin{longtable}{L{0.16\linewidth}L{0.44\linewidth}L{0.3\linewidth}}
+\toprule
+阶段 & 硬件动作 & 完成证据 \\
+\midrule
+缺页/读文件 & OS 提交 NVMe 读请求，设备 DMA 到主存 & 块 I/O completion 和页状态有效 \\
+执行代码 & CPU 取指、TLB/cache 查找、分支和写回 & 指令提交，异常路径为空 \\
+准备图形资源 & CPU 写命令缓冲和资源描述符 & 命令队列对 GPU 可见 \\
+GPU 渲染 & GPU 读取资源，执行 shader，写 VRAM & fence 或 completion 表示渲染完成 \\
+显示扫描 & 显示引擎按刷新时序读取帧缓冲 & vblank、翻页或显示控制器状态 \\
+\bottomrule
+\end{longtable}
+
+这个案例可以作为读完整本书后的纸面项目。要求不是实现操作系统和驱动，而是把每一步写成机器证据：谁拥有缓冲区，谁发起 DMA，哪个地址空间有效，cache/TLB 在哪里参与，哪个 completion 才说明完成，哪个错误会阻止下一阶段。
+
+\topic{专题：纸面项目应替代不可执行的大实验}
+如果没有硬件平台，仍然可以做高质量项目。项目形式应从“搭出来能跑”改成“规格写得可检查”。例如给出一台简化 PC：一个 CPU、两级 cache、DDR 控制器、PCIe root、NVMe、GPU、USB 控制器和固件 ROM。读者要写地址地图、启动顺序、设备枚举、一次文件读取、一次 GPU 命令提交、一次中断处理和一个错误路径。这样的纸面项目比空泛地说“了解主板”更有效。
+
+\begin{longtable}{L{0.2\linewidth}L{0.46\linewidth}L{0.24\linewidth}}
+\toprule
+纸面项目 & 必须交付 & 合格标准 \\
+\midrule
+简化 PC 地址地图 & DRAM、固件、MMIO、PCIe BAR、未映射区 & 任意地址有明确目标或错误 \\
+NVMe 读路径 & submission、doorbell、DMA buffer、completion、中断 & CPU 不把门铃返回当成 I/O 完成 \\
+GPU 命令路径 & 命令缓冲、资源可见性、VRAM、fence、显示扫描 & 渲染完成和显示完成分开 \\
+主板启动路径 & 电源、时钟、复位、固件、内存训练、PCIe 枚举 & 每一步有失败后可诊断状态 \\
+错误注入 & TLB miss、cache miss、PCIe 错误、SSD 超时、GPU hang & 错误归属到具体层，不混成“程序卡住” \\
+\bottomrule
+\end{longtable}
+
 
 
 \section*{章末练习与验收任务}
@@ -1040,6 +1160,9 @@ cache/MMU & 页表摘要、属性、TLB flush 记录 & 地址转换和一致性�
 复位向量 & 比较 6502、Z80/8051、8086、80386 后续 x86 的复位入口 & 能说明第一条指令必须由非易失存储响应 \\
 平台分层 & 说明 CPU 本地总线、内存/cache 控制、高速扩展、低速 I/O 和固件层职责 & 能说明等待来自整个平台 \\
 SoC 演进 & 说明把内存控制器、I/O 和安全启动搬进片内的收益与代价 & 能指出片上互连和调试复杂度 \\
+主板结构 & 画出 CPU、DDR、PCH、UEFI Flash、PCIe、NVMe、GPU 的连接关系 & 能说明供电、时钟、复位和枚举不是 CPU 内部问题 \\
+PCIe 设备 & 说明配置空间、BAR、TLP、MSI 和 AER 各自解决什么问题 & 能把显卡/NVMe/网卡统一成总线主设备 \\
+显卡路径 & 写出 CPU 提交命令、GPU 读资源、VRAM 写帧、显示扫描的 trace & 能区分渲染完成、DMA 完成和显示完成 \\
 \bottomrule
 \end{longtable}
 
