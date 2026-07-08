@@ -13,6 +13,7 @@ MAIN = ROOT / "main.tex"
 EXPECTED_INPUTS = [
     "frontmatter/title",
     "frontmatter/preface",
+    "frontmatter/expanded-outline",
     "chapters/ch01-electricity-diode-switch",
     "chapters/ch04-feedback-latches-flipflops",
     "chapters/ch07-number-arithmetic-circuits",
