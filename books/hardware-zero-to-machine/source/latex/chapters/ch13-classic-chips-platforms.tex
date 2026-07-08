@@ -618,6 +618,339 @@ DMA 与设备 & 谁发起事务，谁完成事务，完成如何通知 CPU \\
 
 到这里，本书的硬件链路闭合：电和器件形成可控开关，开关形成门，门形成组合逻辑，反馈和时钟形成状态，寄存器和 ALU 形成数据通路，控制器组织动作，CPU 执行编码，主存、cache、互连、设备和启动路径把它扩展成整机。8086 和 80386 的意义在于提供了两个清晰历史剖面：一个展示早期微处理器如何连接总线和地址空间，一个展示处理器如何承担更复杂的地址转换、保护和异常机制。
 
+\section{四、从目标文件、固件到可启动机器}
+
+前面几章已经解释了 CPU 如何执行编码，主存和设备如何响应地址，经典芯片如何定义平台边界。还差一条常被硬件教材略过、却对系统理解非常关键的链路：程序怎样从目标文件进入内存，符号地址怎样变成机器地址，启动固件怎样把硬件带到可执行状态，异常表和页表怎样让失败路径可恢复。参考经典系统教材的读法，这一节不展开编译器细节，而是把链接、装载和启动都还原成硬件地址合同。
+
+\topic{目标文件里的符号最终要落成地址}
+汇编器或编译器产生的目标文件通常还不知道所有最终地址。函数名、全局变量名、外部符号和跳转目标先以符号或重定位项表示。链接器把多个目标文件和库合并，决定代码段、只读数据段、数据段、BSS 段等放到什么地址，并把需要修补的位置改成最终地址或相对偏移。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+对象 & 系统含义 & 硬件落点 \\
+\midrule
+代码段 & 机器指令编码 & 取指路径从这些地址读取 opcode \\
+只读数据 & 常量、跳转表、字符串 & 普通 LOAD 读取，权限通常禁止写 \\
+数据段 & 已初始化全局变量 & 启动时从镜像复制到 RAM \\
+BSS & 零初始化全局变量 & 启动时清零，镜像中不必保存全量零字节 \\
+重定位项 & 需要链接器或装载器修补的地址位置 & 改写指令立即数字段、地址表或指针字 \\
+\bottomrule
+\end{longtable}
+
+这说明“函数地址”不是抽象标签。取指硬件需要 PC 中的数值地址；CALL 需要目标地址或相对偏移；全局变量 LOAD 需要数据地址；中断向量需要入口地址。链接器和装载器的工作，就是把这些名字和段布局变成 CPU 能取指、LOAD、STORE 和跳转的地址。
+
+\begin{lstlisting}
+source idea:
+  call uart_putc
+  load global_counter
+
+after link/load:
+  CALL 0x00102480
+  LOAD R1, [0x00203010]
+\end{lstlisting}
+
+\topic{装载器建立的是第一张可执行地址地图}
+在有操作系统的机器上，装载器把可执行文件映射进进程地址空间，建立代码、数据、堆、栈和共享库区域；在裸机或固件场景中，启动代码负责把镜像从 ROM/Flash 复制或映射到合适位置，清 BSS，设置栈指针，初始化全局数据，然后跳到入口函数。两者规模不同，但硬件问题一致：哪些地址可取指，哪些地址可读写，栈在哪里，异常入口在哪里，设备寄存器在哪里。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+启动/装载动作 & 硬件意义 & 失败表现 \\
+\midrule
+设置栈指针 & CALL/RET、局部变量和异常入口有可用内存 & 第一次函数调用或中断即破坏内存 \\
+复制数据段 & RAM 中全局变量得到初始值 & 程序读到未初始化数据 \\
+清 BSS & 零初始化对象符合语言和固件约定 & 状态机、计数器、指针初值随机 \\
+建立向量表 & 中断和异常有入口地址 & 外部事件或错误无法处理 \\
+初始化时钟/总线 & 后续 RAM、设备、cache 路径满足时序 & 访问慢器件超时或读写失败 \\
+跳入口 & PC 改到主程序第一条指令 & 程序真正进入可维护代码路径 \\
+\bottomrule
+\end{longtable}
+
+裸机启动常见伪代码如下。它表面像软件初始化，实质上每一步都在建立后续硬件事务的前提。
+
+\begin{lstlisting}
+reset_handler:
+  set SP to top_of_stack
+  copy .data from flash image to SRAM
+  zero .bss in SRAM
+  initialize clocks and memory controller
+  install vector table base
+  initialize essential MMIO devices
+  jump main
+\end{lstlisting}
+
+\topic{异常向量表是硬件失败路径的地址表}
+只要系统会处理中断、页错误、非法指令或设备事件，就需要某种入口表。早期处理器可能用固定地址或固定向量；保护模式处理器使用更复杂的描述符表；微控制器常在启动区域放置向量表。表的形式不同，但作用相同：当硬件事件发生时，CPU 能把事件编号转成处理程序入口，并保存足够状态以便恢复或诊断。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+向量项 & 保存内容 & 硬件使用场景 \\
+\midrule
+复位向量 & 第一条启动代码地址或跳转指令 & 上电或复位后装入 PC \\
+非法指令向量 & 无法译码或不允许执行时的入口 & opcode 不合法或特权不允许 \\
+页错误/总线错误向量 & 地址转换或外部事务失败入口 & LOAD/STORE/取指不能完成 \\
+外设中断向量 & 设备完成、错误或数据到达入口 & 中断控制器投递事件 \\
+系统调用入口 & 用户代码请求特权服务入口 & 权限切换和受控进入内核或监控程序 \\
+\bottomrule
+\end{longtable}
+
+向量表本身也必须位于可访问地址。若页表或地址译码没有覆盖异常入口，CPU 在处理第一个错误时会遇到第二个错误；若栈没有准备好，保存 PC/Flags 或错误码时会破坏未知内存；若中断处理程序所在代码被错误标成不可执行，事件到达后系统会在入口处再次失败。启动顺序必须先保证最小异常路径可靠，再打开复杂设备和中断。
+
+\topic{页表把装载结果提升为可保护的运行时地图}
+链接器决定镜像中的相对布局，装载器把段放进内存，页表则把运行时地址空间变成可检查合同。代码页可以标为只读和可执行，数据页可读写但不可执行，内核页禁止用户访问，设备 MMIO 页设置为不可缓存或强顺序。这样，同一条 LOAD/STORE/取指路径在真正访问 cache 或总线前，会先经过地址转换和权限检查。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+区域 & 典型页属性 & 硬件效果 \\
+\midrule
+代码 & 只读、可执行 & STORE 到代码页触发保护异常 \\
+只读数据 & 只读、不可执行或按平台规定 & 防止常量被误写或执行数据 \\
+普通数据/堆/栈 & 可读写、通常不可执行 & 数据写入允许，取指可被阻止 \\
+内核映射 & 特权访问，用户禁止 & 用户态越权访问触发异常 \\
+MMIO 窗口 & 不可缓存、设备顺序属性 & 读写按设备事务执行，不被普通 cache 吞掉 \\
+\bottomrule
+\end{longtable}
+
+这张表把前几章内容合并起来：第三章的 bit 和地址解释，第四章的 PC/LOAD/STORE， 第五章的 cache/MMIO 属性，第六章的 80386 分页和异常，在页表属性中汇合。现代系统的许多安全和可靠性机制，本质上就是让硬件在每次取指和访存前检查这些合同。
+
+\topic{从固件到操作系统是平台所有权转移}
+固件启动阶段拥有硬件控制权：它配置时钟、内存控制器、基本 I/O、启动介质和必要安全检查。操作系统接管后，会重新建立页表、中断控制、设备驱动和调度机制。这个交接不是一句“加载内核”，而是一段平台所有权转移：谁拥有中断表，谁拥有页表，谁管理内存，谁接管设备，谁定义错误处理策略。
+
+\begin{longtable}{L{0.18\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
+\toprule
+阶段 & 固件职责 & 交给后续系统的合同 \\
+\midrule
+早期启动 & 电源、时钟、复位、最小取指路径 & CPU 能从可信入口执行 \\
+内存初始化 & DRAM 控制器、cache/TLB 初始策略 & 可用内存范围和保留区域 \\
+设备发现 & 基本总线枚举、启动介质选择 & 设备地址窗口、中断和 DMA 能力 \\
+镜像验证/加载 & 读取、校验、解压或复制内核/程序 & 入口地址、参数和内存布局 \\
+控制权转移 & 设置寄存器、栈、页表或模式后跳转 & 后续系统接管异常、中断和设备 \\
+\bottomrule
+\end{longtable}
+
+在微控制器上，固件和“应用”可能就是同一个镜像；在 PC 或服务器上，固件、引导加载器、内核和用户程序分层明显；在 SoC 上，还可能有 Boot ROM、一级引导、可信固件、安全监控和普通操作系统。层数不同，但每一层都要把可执行地址、栈、异常入口、内存属性和设备所有权交代清楚。
+
+\topic{安全启动把第一条指令也纳入信任链}
+现代 SoC 常把 Boot ROM 固化在芯片内部，复位后先执行不可修改的 ROM 代码。Boot ROM 读取下一阶段固件，验证签名、版本和配置，再决定是否跳转。这样做不是密码学装饰，而是硬件启动合同的一部分：如果第一段可变固件不可信，后续页表、设备配置、密钥和操作系统都可能被篡改。
+
+\begin{longtable}{L{0.18\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
+\toprule
+安全启动对象 & 硬件/固件动作 & 失败处理 \\
+\midrule
+Boot ROM & 从固定复位入口执行，不可现场改写 & 提供根信任和最小验证代码 \\
+公钥/哈希 & 存在熔丝、ROM 或安全存储中 & 用于验证下一阶段镜像 \\
+镜像签名 & 覆盖代码、配置和版本信息 & 验证失败则停止、降级或进入恢复模式 \\
+回滚保护 & 记录允许的最小版本 & 防止加载旧漏洞固件 \\
+调试锁定 & 限制 JTAG、串口下载或内存读出 & 防止启动后被外部接口改写控制流 \\
+\bottomrule
+\end{longtable}
+
+这也解释了为什么“硬件从零到整机”不能只讲电路能跑。整机一旦能取指、访存和访问设备，就必须回答谁能改代码、谁能访问内存、谁能发起 DMA、谁能接收中断、启动镜像是否可信、错误路径是否可恢复。经典芯片提供了这些问题的历史剖面，现代平台则把它们推向更复杂的安全和系统集成边界。
+
+\topic{案例：一个裸机镜像从链接地址跑到 main}
+假设一块教学板把 Flash 映射到 \code{0x00000000}，SRAM 映射到 \code{0x20000000}，GPIO 映射到 \code{0x40000000}。链接脚本规定向量表和代码放在 Flash，已初始化数据运行在 SRAM，但初始内容存放在 Flash 镜像中，BSS 在 SRAM 中清零，栈顶放在 SRAM 高地址。这个布局看起来是软件文件，实际上直接决定复位后每一次取指、LOAD 和 STORE 的地址。
+
+\begin{lstlisting}
+memory map:
+  0x00000000-0x0003FFFF  Flash: vectors, code, const, data image
+  0x20000000-0x20007FFF  SRAM: data, bss, stack
+  0x40000000-0x40000FFF  GPIO MMIO
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+镜像区域 & 链接/装载含义 & 硬件事务 \\
+\midrule
+向量表 & 复位入口和异常入口地址 & 复位时取入口，异常时取向量 \\
+\code{.text} & 指令编码放在 Flash & PC 取指访问 Flash 或映射后的代码区 \\
+\code{.rodata} & 常量和只读表 & LOAD 读取，通常禁止写 \\
+\code{.data} 镜像 & 初始值存放在 Flash & 启动代码复制到 SRAM 运行地址 \\
+\code{.bss} & 运行时应为 0 的对象 & 启动代码对 SRAM 发起 STORE 清零 \\
+栈 & 函数调用和异常保存上下文 & SP 指向 SRAM 可写区域 \\
+\bottomrule
+\end{longtable}
+
+复位后第一段代码不应依赖尚未初始化的全局变量，也不应调用需要完整栈和运行时的复杂函数。它要先建立最小可运行边界。
+
+\begin{lstlisting}
+reset trace:
+  PC = vector_table.reset_handler
+  SP = _stack_top
+  copy bytes from _sidata in Flash to _sdata in SRAM
+  zero bytes from _sbss to _ebss
+  configure clocks and essential wait states
+  set vector table base if architecture supports it
+  call main
+\end{lstlisting}
+
+\begin{longtable}{L{0.16\linewidth}L{0.42\linewidth}L{0.32\linewidth}}
+\toprule
+启动动作 & 不能省略的原因 & 常见错误 \\
+\midrule
+设置 SP & 后续 CALL、PUSH、异常保存需要栈 & SP 指到 Flash 或未映射区 \\
+复制 \code{.data} & 全局初值要出现在 RAM 运行地址 & 变量初值全错或仍为 Flash 内容 \\
+清 \code{.bss} & 语言和固件约定零初始化 & 状态机初值随机，指针非零 \\
+配置等待状态 & Flash、SRAM 或外设满足时序 & 高频下取指或访问偶发失败 \\
+设置向量表 & 中断和异常能进入正确入口 & 第一场中断跳到错误地址 \\
+跳 \code{main} & 进入应用主逻辑 & 入口地址或模式错误导致跑飞 \\
+\bottomrule
+\end{longtable}
+
+\topic{案例：保护模式最小启动清单}
+以 80386 风格机器为例，若要从实模式进入带分页的保护环境，必须先建立一组硬件可读的表和寄存器状态。这个过程常被写成启动代码技巧，但本质是把 CPU 的地址解释合同从旧模式切换到新模式。
+
+\begin{longtable}{L{0.16\linewidth}L{0.42\linewidth}L{0.32\linewidth}}
+\toprule
+步骤 & 硬件目的 & 验收证据 \\
+\midrule
+建立 GDT & 给代码段、数据段、栈段描述符 & 描述符 base/limit/type/present 正确 \\
+建立 IDT & 给异常和中断入口描述符 & 页错误、非法指令等入口可达 \\
+加载 GDTR/IDTR & CPU 知道描述符表位置 & 表所在内存可读，界限正确 \\
+打开保护模式位 & 改变段选择子解释方式 & 远跳转后 CS 使用新描述符 \\
+重装段寄存器 & DS/SS/ES 等进入新合同 & 数据和栈访问按新描述符解释 \\
+建立页目录/页表 & 线性地址可转换到物理地址 & 取指、栈、异常代码均被映射 \\
+加载 CR3 并开启分页 & CPU 开始查页表和 TLB & 缺失映射会触发页错误而非随机访问 \\
+\bottomrule
+\end{longtable}
+
+最小保护模式 bring-up 应先保守映射。把当前代码、栈、页表、GDT、IDT 和 VGA/串口调试 MMIO 映射好，再打开分页；确认能打印或点亮调试输出后，再逐步收紧权限。若一开始就建立复杂高半区映射、多个页大小、用户/内核分离和设备属性，任何一个地址错误都可能导致连续异常，难以定位。
+
+\begin{lstlisting}
+protected-mode checklist:
+  GDT covers code/data/stack selectors
+  IDT covers at least fault handlers
+  stack is writable after mode switch
+  current instruction stream is mapped
+  page tables themselves are mapped
+  debug output MMIO is mapped uncached
+  fault handlers do not fault recursively
+\end{lstlisting}
+
+\topic{案例：从异常号定位启动失败}
+启动阶段最可怕的现象是“黑屏”或“无输出”。更好的教材写法是把失败分层。若能进入非法指令异常，说明取指至少到了某条不合法编码；若能进入页错误，说明保护模式和 IDT 至少部分工作；若连续进入双重错误或复位，说明异常处理路径本身可能失败；若完全没有总线活动，可能是复位、时钟或复位向量映射问题。
+
+\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.3\linewidth}}
+\toprule
+现象 & 可能边界 & 优先证据 \\
+\midrule
+无取指总线活动 & 复位、时钟、复位向量、ROM 片选 & 示波器看时钟/复位/地址线 \\
+取指后立即异常 & 编码、模式、段描述符或权限错误 & IR/PC、异常号、错误码 \\
+页错误循环 & 页表缺映射、权限错误、异常入口未映射 & 故障地址、PDE/PTE、CR3 \\
+中断后死机 & 栈、IDT、EOI 或清中断顺序错误 & SP、向量号、中断控制器状态 \\
+DMA 后数据错 & cache 可见性、IOMMU、缓冲区所有权 & 描述符、completion、cache 维护记录 \\
+\bottomrule
+\end{longtable}
+
+这张表把整本书的排查方法统一起来：不要先猜“CPU 坏了”，先问硬件证据停在哪个边界。电源和时钟是第一章的边界，触发器和状态是第二章的边界，ALU 和控制线是第三章的边界，PC/IR/寄存器是第四章的边界，主存/总线/MMIO/DMA 是第五章的边界，描述符、页表、固件和平台是第六章的边界。
+
+\topic{案例：把教学板扩展成一台小系统}
+最后给一个可以落地的整机扩展路线。第一阶段只跑 ROM 中的 LED 循环；第二阶段加入 SRAM 和栈，能调用函数；第三阶段加入定时器中断，能周期性切换状态；第四阶段加入简化 DMA，把一段内存复制到另一段；第五阶段加入保护或至少地址错误检测，让未映射访问进入错误入口。每一阶段都对应书中一个硬件层次。
+
+\begin{longtable}{L{0.16\linewidth}L{0.42\linewidth}L{0.32\linewidth}}
+\toprule
+阶段 & 新增硬件/固件 & 验收标准 \\
+\midrule
+ROM LED & 复位向量、ROM、GPIO MMIO & 上电后固定节奏改写 LED 寄存器 \\
+SRAM 栈 & SRAM 译码、SP 初始化、CALL/RET & 函数调用和局部变量不破坏全局数据 \\
+定时器中断 & 定时器、向量表、中断清除 & 周期事件不丢失，主循环可继续运行 \\
+简化 DMA & 描述符、源/目标地址、completion & DMA 完成后 CPU 读到正确内存内容 \\
+错误入口 & 未映射检测、总线超时或简化异常 & 错误地址进入可观察处理程序 \\
+\bottomrule
+\end{longtable}
+
+这条路线比“一步到位跑操作系统”更适合硬件书。读者每完成一层，都能指出新增了哪些地址、哪些控制线、哪些状态边界、哪些错误路径。等这些边界稳定后，再看 8086、80386 或现代 SoC，就不是背芯片史，而是在识别同一组问题如何被真实平台放大和工程化。
+
+\topic{综合项目：写一份最小整机规格}
+本章最后可以把全书内容收束成一份最小整机规格。规格不需要一开始很复杂，但必须让别人能按它搭出同一台机器，并能判断每个访问是成功、等待还是错误。下面给出一个建议模板，读者可以用分立逻辑、FPGA、微控制器外设模拟或软件仿真来实现。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+规格项目 & 必须写清楚 & 验收证据 \\
+\midrule
+地址空间 & ROM、RAM、MMIO、未映射区范围 & 任意地址最多一个目标响应 \\
+复位行为 & PC 初值、SP 初值、控制线安全值 & 上电第一条取指可重复观察 \\
+指令集 & 编码、寄存器字段、立即数扩展和标志规则 & 每条指令能写成控制 trace \\
+内存访问 & 字节序、对齐、字节使能、等待和错误 & LOAD/STORE 不破坏相邻字节 \\
+设备寄存器 & 每个位的读写、副作用和清除规则 & GPIO/定时器/UART 状态可验证 \\
+中断/异常 & 向量入口、保存状态、清除和返回规则 & 外部事件和错误能进入可诊断路径 \\
+DMA/队列 & 描述符格式、所有权、completion 和 cache 规则 & CPU 与设备不同时拥有缓冲区 \\
+\bottomrule
+\end{longtable}
+
+规格写完后，建议按下面的顺序实现，而不是同时接上所有模块。
+
+\begin{longtable}{L{0.14\linewidth}L{0.42\linewidth}L{0.34\linewidth}}
+\toprule
+里程碑 & 要实现的最小能力 & 通过标准 \\
+\midrule
+M1 & 复位后从 ROM 取指，PC 顺序前进 & 逻辑分析仪能看到连续取指地址 \\
+M2 & ADD/ADDI/SUB/JNZ 跑通计数循环 & 寄存器值和分支方向符合 trace \\
+M3 & SRAM LOAD/STORE 和栈可用 & 函数调用能返回，局部变量不乱 \\
+M4 & GPIO MMIO 可读写 & LED/按键通过地址事务控制 \\
+M5 & 定时器中断可进入和返回 & 中断不破坏主循环寄存器和栈 \\
+M6 & 简化 DMA 或块复制控制器可搬数据 & completion 后内存内容正确 \\
+M7 & 未映射访问进入错误入口 & 错误地址和原因可观察 \\
+\bottomrule
+\end{longtable}
+
+每个里程碑都应保留一个最小测试程序。不要只保留最终大程序，因为最终程序一旦失败，无法判断是取指、译码、ALU、存储器、MMIO、中断还是 DMA 出错。小测试程序就是硬件书里的单元测试。
+
+\begin{lstlisting}
+M2 counter loop:
+  LDI  R1, 0
+  LDI  R2, 10
+loop:
+  ADDI R1, R1, 1
+  SUBI R2, R2, 1
+  JNZ  R2, loop
+  STORE R1, [GPIO_OUT]
+\end{lstlisting}
+
+\begin{longtable}{L{0.2\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
+\toprule
+测试失败现象 & 优先怀疑 & 观察信号 \\
+\midrule
+PC 不变 & 复位、时钟、PC 写使能或取指等待 & \code{PC}、\code{reset}、\code{clock}、\code{ready} \\
+循环次数错 & 立即数扩展、SUBI、Zero 标志或 JNZ & \code{R2}、\code{Zero}、\code{pc_sel}、\code{branch_target} \\
+GPIO 不变 & 地址译码、MMIO 写使能、字节使能 & \code{address}、\code{io_cs}、\code{mem_write}、\code{write_data} \\
+函数返回错 & SP、CALL/RET 返回地址、栈 RAM & \code{SP}、栈内容、\code{PC}、\code{writeback} \\
+中断后错乱 & 保存/恢复寄存器、EOI、清状态顺序 & \code{vector}、\code{SP}、saved PC、irq status \\
+DMA 数据错 & 描述符、地址权限、cache 可见性、completion & \code{desc}、\code{buffer}、\code{owner}、\code{done} \\
+\bottomrule
+\end{longtable}
+
+这个综合项目的目的，是让读者把书中的概念变成可执行机器：第一章的电平和输出驱动，第二章的状态边界，第三章的 ALU 和控制字，第四章的 CPU trace，第五章的地址事务和 DMA，第六章的启动、异常和平台合同。能写出并验证这份规格，才算真正把“硬件从零到整机”连起来。
+
+\topic{综合项目的验收报告模板}
+为了避免实验结果只停留在“好像能跑”，每个里程碑都应留下验收报告。报告不需要长篇叙事，但必须保存足够证据，让另一个人能复现同样结论。建议每个实验至少记录以下字段：
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+报告字段 & 要记录的内容 & 为什么重要 \\
+\midrule
+硬件版本 & 原理图版本、器件型号、时钟频率、电源电压 & 不同器件和频率会改变时序结论 \\
+固件版本 & ROM 镜像、链接地址、入口地址、编译选项 & 同一硬件跑不同镜像可能表现不同 \\
+地址地图 & ROM/RAM/MMIO/未映射区域范围 & 后续访问错误可直接对照 \\
+测试程序 & 最小汇编或机器码列表 & 能定位具体指令和控制 trace \\
+观察信号 & PC、IR、控制字、地址、数据、ready、写使能 & 证明结果来自正确硬件路径 \\
+通过标准 & 预期寄存器、内存、设备和异常状态 & 避免把偶然现象当成通过 \\
+失败记录 & 失败现象、假设、修改和复测结果 & 保留调试证据链 \\
+\bottomrule
+\end{longtable}
+
+例如 M3“SRAM 栈可用”的验收报告应包含：复位后 SP 的值，CALL 前后的 PC，栈上保存的返回地址，函数内部局部变量地址，RET 后 PC 是否回到调用点，R0 或指定返回值寄存器是否正确。若只写“函数调用成功”，后续出现异常时无法判断是栈、返回地址、寄存器保存还是取指路径出了问题。
+
+\begin{lstlisting}
+M3 evidence example:
+  reset PC = 0x00000000
+  initial SP = 0x20008000
+  CALL writes return address 0x00000124 to [SP-4]
+  callee uses [SP-8] for local variable
+  RET loads PC = 0x00000124
+  R0 = expected return value
+\end{lstlisting}
+
+这类报告会把学习从“看懂章节”推进到“能维护机器”。硬件工程的核心不是一次点亮 LED，而是每次改动后仍能解释：哪个状态边界改变了，哪个事务完成了，哪个错误路径被覆盖了，哪些证据足以支持结论。
+
 
 
 \section*{章末练习与验收任务}

@@ -414,6 +414,216 @@ TLB miss & 地址转换缓存缺失，要查页表或进异常 & 页表 walker�
 \topic{低时延来自近处、缓存、并行和卸载}
 现代整机降低时延，不是让所有路径都变成零等待。L1/L2 cache 让常见数据走近处 SRAM；TLB 让近期地址转换不必每次查页表；预取和分支预测提前准备可能需要的路径；流水线、旁路和乱序调度让独立工作重叠；DMA、队列和中断聚合把批量 I/O 从 CPU 指令流中卸载。失败路径仍然存在：cache miss、TLB miss、DRAM 排队、设备背压、DMA fault 和错误中断都会把访问拉回慢路径。
 
+\topic{六、存储层次、地址转换和设备驱动 trace}
+
+前面已经讲了单次总线事务、MMIO、中断、DMA 和 cache。真正的系统程序运行时，这些对象不会孤立出现。一次普通 LOAD 可能先经过 TLB 查找，再查 L1 cache，未命中后查 L2/L3，最后进入内存控制器；一次设备接收数据可能由驱动准备描述符，设备 DMA 写缓冲区，cache 一致性或维护操作让 CPU 看见新数据，中断再把完成事件带回来。若教材只讲“内存比寄存器慢”，就漏掉了真正的硬件路径。
+
+\begin{longtable}{L{0.18\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
+\toprule
+访问层次 & 常见命中路径 & 失败或慢路径 \\
+\midrule
+寄存器 & 直接从寄存器堆读写 & 端口冲突、旁路失败或流水线停顿 \\
+L1 cache & 近处 SRAM 命中，几个周期内返回 & L1 miss，向 L2 请求整条 cache line \\
+L2/L3 cache & 片上较大 cache 命中 & 最后级 miss，访问内存控制器和 DRAM \\
+TLB & 地址转换缓存命中 & page walk、页错误或权限异常 \\
+DRAM & 控制器调度行命中和突发传输 & 行冲突、刷新、排队、ECC 错误 \\
+设备/MMIO & 设备寄存器响应读写 & 背压、超时、错误状态或中断完成 \\
+\bottomrule
+\end{longtable}
+
+\topic{TLB 把地址转换也纳入近处缓存}
+虚拟地址或线性地址到物理地址的转换若每次都查页表，访存会变得很慢。TLB 可以理解为“地址转换的 cache”：它保存近期虚拟页到物理页框的映射及权限位。LOAD/STORE 形成虚拟地址后，先用虚拟页号查 TLB；命中时得到物理页框和权限证据，再与页内偏移组合成物理地址；未命中时，硬件 page walker 或软件异常处理会去内存里的页表结构查找。
+
+\begin{lstlisting}
+virtual address = [ virtual_page_number | page_offset ]
+TLB hit:
+  physical_address = TLB[virtual_page_number].frame | page_offset
+TLB miss:
+  walk page tables or enter miss handler
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+TLB 字段 & 作用 & 验收问题 \\
+\midrule
+虚拟页号 tag & 判断当前地址是否命中某个转换项 & 进程切换、地址空间标识和刷新规则是否清楚 \\
+物理页框 & 与页内偏移组合成物理地址 & 页大小、对齐和物理地址宽度是否一致 \\
+权限位 & 读写、执行、用户/特权等访问属性 & 访问失败是权限异常，不是普通 cache miss \\
+valid/global & 表示转换是否有效、是否跨进程保留 & 页表修改后如何让旧 TLB 项失效 \\
+\bottomrule
+\end{longtable}
+
+TLB miss 和 cache miss 都是“近处没有”，但语义不同。cache miss 只是数据不在近处，通常可以向下级取回；TLB miss 可能只是转换缓存缺失，也可能说明页不存在或权限不允许。若页表项不存在，硬件不能继续访问内存数据；若权限不允许，访问必须转入异常。这个差别解释了为什么地址转换、保护和异常在系统硬件中是同一条路径的不同分支。
+
+\topic{多核和 DMA 让 cache 一致性成为硬件合同}
+单核教学机里，cache 可以先理解为 CPU 与主存之间的近处副本。多核或 DMA 加入后，问题变成“多个观察者如何看见同一地址的值”。一个核心的 cache 中可能有某条 line 的旧副本，另一个核心或设备刚刚写入了新值；如果没有一致性协议、cache 维护或不可缓存映射，CPU 读到的就可能不是系统真实最新值。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+场景 & 风险 & 常见硬件/软件边界 \\
+\midrule
+核心 A 写，核心 B 读 & B 的 cache 中可能有旧行 & cache coherence、失效消息、共享/独占状态 \\
+CPU 写描述符，设备读 & 描述符可能还在 CPU cache 或写缓冲中 & coherent DMA、flush、写屏障 \\
+设备写缓冲区，CPU 读 & CPU cache 中可能有旧数据 & invalidate、coherent 互连、不可缓存映射 \\
+MMIO 状态寄存器 & cache 命中会隐藏设备新状态 & 设备内存属性、禁止普通缓存 \\
+\bottomrule
+\end{longtable}
+
+一致性协议细节可以很深，但教学阶段先抓住三件事。第一，同一地址可能在多个近处缓存中有副本。第二，写入必须让其他观察者的旧副本失效或更新。第三，设备并不总是自动参与 CPU cache 一致性；若平台不支持 coherent DMA，驱动必须在交出缓冲区前后做 cache 维护。否则 DMA 完成中断到达后，CPU 仍可能读到旧 cache line。
+
+\topic{store buffer 和屏障把“执行完成”与“可见”分开}
+STORE 对流水线来说可以很早“执行完成”：地址和数据已经形成，写事务进入 store buffer，后续独立指令可以继续执行。但这个 STORE 什么时候对其他核心、DMA 或设备可见，要看 store buffer 排队、cache 状态、内存类型和屏障规则。普通 RAM 写可以合并和延迟；MMIO 写通常要求更强顺序；DMA 描述符写在通知设备前必须已经对设备可见。
+
+\begin{lstlisting}
+prepare DMA descriptor:
+  descriptor.addr = buffer
+  descriptor.len  = length
+  memory_barrier()
+  MMIO[DEVICE_DOORBELL] = descriptor_index
+\end{lstlisting}
+
+这里的屏障不是“让 CPU 慢一点”的软件仪式，而是要求硬件在门铃 MMIO 写对设备可见之前，先让描述符内容按平台规则可见。若顺序反了，设备可能看到门铃，却读到旧描述符或半写入描述符。许多难复现的设备错误，本质上就是这个可见性边界没有写清楚。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+对象 & 可见性要求 & 失败表现 \\
+\midrule
+普通数据 & 由语言、编译器和内存模型共同约束 & 多核读到旧值或乱序观察 \\
+锁变量 & 获取/释放顺序必须约束临界区数据 & 进入临界区后仍看见旧数据 \\
+DMA 描述符 & 通知设备前必须对设备可见 & 设备搬错地址或长度 \\
+MMIO 门铃 & 前面的配置写必须先到设备接口 & 设备按旧配置启动 \\
+中断完成 & completion 到达后数据必须已可读取或可同步 & 中断处理读到旧缓冲区 \\
+\bottomrule
+\end{longtable}
+
+\topic{描述符环把 DMA 变成持续事务流}
+高速设备通常不会每次只处理一个缓冲区。网卡、磁盘控制器、USB 控制器常使用描述符环或队列：CPU 准备一批描述符，设备按头尾指针消费，完成后写回状态或 completion 队列，并用中断或轮询通知 CPU。这样可以减少 MMIO 次数，让 CPU 和设备并行工作。
+
+\begin{lstlisting}
+receive ring:
+  CPU owns descriptor N
+  CPU fills buffer address and length
+  CPU marks descriptor ready for device
+  CPU updates tail pointer or rings doorbell
+  device writes packet into buffer
+  device writes completion status
+  CPU regains ownership and processes buffer
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+环队列字段 & 硬件含义 & 验收问题 \\
+\midrule
+描述符地址 & 设备要读写的主存位置 & 地址是否经过 IOMMU 或物理地址转换 \\
+长度 & 本次 DMA 允许访问的字节数 & 设备不能越界写出缓冲区 \\
+所有权位 & 当前由 CPU 还是设备拥有 & 所有权不重叠，状态切换有屏障 \\
+头尾指针 & CPU 和设备约定的生产/消费位置 & 指针更新顺序和环绕规则清楚 \\
+completion & 设备报告完成、长度、错误码 & 中断到达不等于所有 cache 可见性自动正确 \\
+\bottomrule
+\end{longtable}
+
+这个模型也说明驱动程序为什么必须理解硬件。驱动不是“调用设备 API”的普通软件，它要写 MMIO 寄存器、分配对齐缓冲区、建立 DMA 映射、维护 cache 可见性、处理中断、回收描述符和处理错误。每一步都对应本章的硬件对象：地址、权限、字节数、所有权、完成和错误。
+
+\topic{驱动 bring-up 应按硬件证据分层}
+调试设备时，最差的方法是直接运行完整驱动并等待它“能不能用”。更可靠的顺序是先验证配置空间或设备 ID，再验证 MMIO 映射，再验证单个寄存器读写，再验证中断，再验证一个最小 DMA 描述符，最后才跑持续队列。每一层都要有可观察证据。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+bring-up 阶段 & 操作 & 通过标准 \\
+\midrule
+枚举/识别 & 读取设备 ID、版本或能力寄存器 & 地址映射正确，读值稳定可复现 \\
+复位 & 写复位位并轮询 ready/busy & 状态位按规格变化，不永久 busy \\
+MMIO 回读 & 写可回读配置寄存器再读回 & 字节序、位域和写掩码正确 \\
+中断 & 人工触发或配置定时事件 & 中断线/MSI 到达，清除顺序正确 \\
+单次 DMA & 一个描述符、一个缓冲区、一个 completion & 地址、长度、cache 可见性和错误码正确 \\
+持续队列 & 多描述符环和批量 completion & 所有权、环绕、背压和中断聚合正确 \\
+\bottomrule
+\end{longtable}
+
+这张表也适用于教学板。即使没有 PCIe，只用一个 GPIO、定时器或简化 DMA 控制器，也应该按同样顺序验证：先确认地址译码，再确认寄存器语义，再确认事件通知，再确认数据搬运。这样本书的硬件 trace 就能从最小 CPU 直接延伸到现代设备驱动。
+
+\topic{案例：一个接收包怎样进入内存}
+以网卡接收一个数据包为例。CPU 先分配若干缓冲区，把每个缓冲区的地址和长度写入接收描述符环；随后保证描述符对设备可见，再写 MMIO 门铃或尾指针告诉设备可以接收。设备收到外部数据后，作为 DMA 发起者把数据写入某个缓冲区，再写 completion 或描述符状态，最后触发中断。CPU 处理中断，确认 completion，按一致性规则让缓冲区数据对 CPU 可见，然后把缓冲区交给上层软件。
+
+\begin{longtable}{L{0.14\linewidth}L{0.42\linewidth}L{0.34\linewidth}}
+\toprule
+阶段 & 硬件事务 & 关键证据 \\
+\midrule
+准备缓冲区 & CPU 在 RAM 中分配对齐缓冲区 & 物理地址或 I/O 虚拟地址有效，长度足够 \\
+写描述符 & CPU STORE 地址、长度、所有权位 & 描述符 cache line 已按平台规则可见 \\
+通知设备 & CPU 写 MMIO tail/doorbell & MMIO 不被普通 cache 合并或延迟越界 \\
+设备 DMA 写 & 设备发起内存写事务 & IOMMU 权限、字节数、completion 顺序正确 \\
+投递完成 & 设备写状态并触发中断 & completion 可读，中断不会早于数据可见 \\
+CPU 回收 & 中断处理读取状态和缓冲区 & cache invalidate 或 coherent 规则完成 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+receive path:
+  CPU: fill rx_desc[N] with buffer address and length
+  CPU: barrier, then MMIO[RX_TAIL] = N
+  DEV: reads rx_desc[N]
+  DEV: writes packet bytes into buffer
+  DEV: writes completion status
+  DEV: raises interrupt
+  CPU: acknowledges interrupt and reads completion
+  CPU: synchronizes buffer visibility
+  CPU: consumes packet
+\end{lstlisting}
+
+这条路径里至少有三次“完成”。第一，CPU 写 MMIO 门铃完成，只表示设备接口看到了通知；第二，设备 DMA 写缓冲区完成，表示数据已经到达内存系统的某个可见点；第三，中断处理完成，表示 CPU 已经确认状态并回收所有权。把这三者混在一起，是驱动和硬件协同时最常见的错误来源。
+
+\topic{案例：发送路径为什么要区分数据和描述符}
+发送数据包时方向相反。CPU 先把待发送数据写入缓冲区，再写发送描述符，最后通知设备。设备读描述符，再 DMA 读缓冲区，把数据发出。这里最关键的可见性顺序是：缓冲区内容必须先对设备可见，描述符必须描述正确地址和长度，门铃必须最后到达。否则设备可能发出旧数据、半写数据或错误长度的数据。
+
+\begin{longtable}{L{0.18\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
+\toprule
+发送对象 & 可见性要求 & 失败表现 \\
+\midrule
+数据缓冲区 & CPU 写入的数据先对设备可见 & 设备发送旧包或未初始化字节 \\
+描述符 & 地址、长度、标志位完整可见 & 设备读错缓冲区或长度 \\
+门铃寄存器 & 在数据和描述符之后对设备可见 & 设备提前启动，读到旧状态 \\
+completion & 设备确认已不再读取缓冲区 & CPU 过早重用缓冲区导致数据损坏 \\
+\bottomrule
+\end{longtable}
+
+发送 completion 到达前，CPU 不应重用缓冲区。即使 MMIO 写门铃已经返回，设备可能还没有读描述符；即使设备已经读描述符，可能还没有读完数据；即使数据已经发出，completion 可能还在队列里等待 CPU 处理。因此所有权位和 completion 队列不是形式主义，而是让 CPU 和设备不同时修改同一块内存的硬件合同。
+
+\topic{案例：块设备读请求的队列化}
+磁盘、NVMe、SD 控制器或简化块设备也可以用同一模型理解。CPU 准备命令描述符：逻辑块地址、目标缓冲区、长度、读写方向；设备读取命令后，在内部介质或控制器中完成实际读写，再通过 DMA 把数据写到主存，最后投递 completion。区别只在于设备内部工作可能更慢、队列更深、错误码更复杂。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+块请求字段 & 含义 & 硬件问题 \\
+\midrule
+LBA 或块号 & 设备内部介质位置 & 越界、坏块、介质错误如何报告 \\
+缓冲区地址 & DMA 写入或读取的主存位置 & 对齐、IOMMU、cache 可见性 \\
+长度 & 传输字节数或块数 & 不能越过缓冲区和描述符许可范围 \\
+方向 & 读设备到内存，或写内存到设备 & DMA 方向决定 cache 维护方式 \\
+命令 ID & completion 对应哪个请求 & 队列乱序完成时仍能匹配请求 \\
+状态码 & 成功、超时、校验错误、权限错误 & 驱动恢复或上报错误 \\
+\bottomrule
+\end{longtable}
+
+这个案例能把“设备很慢”讲得更具体。CPU 发出块读请求后，并不会逐字等待数据从设备口读出。它可以切换去做别的工作；设备和 DMA 在后台推进；中断或轮询 completion 时，CPU 再取回结果。硬件性能来自异步队列和批量搬运，而不是让单条 LOAD 直接等磁盘或网络。
+
+\topic{案例：一个未映射访问如何成为可诊断错误}
+再看失败路径。CPU 执行 \code{LOAD R1,[0xDEAD0000]}，地址译码没有任何目标响应。没有错误合同时，CPU 可能读到悬空总线值，或永久等待 ready。可靠平台应规定超时、总线错误或异常入口。若有 MMU，还可能在页表阶段就发现该地址未映射，不会走到外部总线。
+
+\begin{longtable}{L{0.2\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
+\toprule
+失败位置 & 可观察现象 & 正确处理 \\
+\midrule
+页表不存在 & 地址转换阶段触发页错误 & 保存故障地址和错误码，进入页错误入口 \\
+权限不允许 & 转换存在但读写/特权不满足 & 触发保护异常，不发起外部访问 \\
+地址译码无目标 & 总线事务无人响应 & 超时或 bus error，而不是无限等待 \\
+目标返回错误 & 设备或内存控制器报告失败 & 错误状态进入异常或驱动恢复路径 \\
+ECC 校验失败 & 数据返回但校验错误 & 更正、重读、上报或机器检查 \\
+\bottomrule
+\end{longtable}
+
+这张表对硬件调试尤其有用。现象“程序卡住”可能来自页表、总线译码、设备 ready、时钟、复位或错误入口任何一层。把失败位置写成层级，就能决定先看页表项、地址线、片选、ready、错误状态，还是异常向量。
+
 \begin{classicnote}
 读任何硬件平台，都可以用同一张事务表约束理解：发起者、目标、地址、方向、数据宽度、握手、完成、错误、副作用和可观察证据。早期 8086 总线、微控制器片内外设、PCIe 设备和现代 SoC 互连的规模不同，但这十项问题不变。
 \end{classicnote}

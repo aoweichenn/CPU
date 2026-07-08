@@ -928,6 +928,199 @@ ALU & 输入两个操作数，输出结果和标志 & \code{a_sel}、\code{b_sel
 
 本章也给出了调试整机硬件的基本方法。不要先问“CPU 为什么不工作”，而要按 trace 缩小范围：PC 是否在时钟沿更新，指令寄存器是否保存了正确 bit，译码是否输出了预期控制字，ALU 输入是否来自正确源，ALU 输出和标志是否正确，写回 mux 是否选对，写使能是否只在目标周期打开。这个方法从 4-bit 面包板实验到 8086、80386 这样的经典处理器分析，再到现代核心的流水线调试，层次不同，思路一致。
 
+\topic{八、从机器级表达式读回硬件动作}
+到这一章末尾，读者已经能看见一条机器级表达式背后的硬件路径。高级语言里的 \code{x+y}、\code{a[i]}、\code{p->field}、\code{x \& mask} 看起来属于软件语法，但落到硬件上，它们都要变成寄存器读、立即数扩展、移位、加法、逻辑运算、LOAD/STORE、标志位和写回。若教材只讲 ALU 真值表，不讲这些表达式如何落到地址和控制线，读者会知道“加法器能加”，却不知道程序为什么会变成一串硬件事务。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+表达式形态 & 机器级分解 & 硬件证据 \\
+\midrule
+\code{x+y} & 读两个寄存器，ALU 加法，结果写回 & \code{alu_op=ADD}、Carry、Overflow、Zero \\
+\code{x-y} & B 取反加一，复用加法器 & \code{sub} 同时控制 XOR 和最低位进位 \\
+\code{x<<k} & 移位器按移位量选择各位来源 & 逻辑移位、算术移位和溢出规则要分开 \\
+\code{x \& mask} & ALU 逻辑路径保留部分 bit & 掩码常用于字段提取、权限位和状态位 \\
+\code{a[i]} & 基址加缩放下标形成地址，再 LOAD/STORE & 移位器或乘法路径、地址加法、字节使能 \\
+\code{p->field} & 指针基址加固定字段偏移 & 结构体布局、对齐和访问宽度 \\
+\bottomrule
+\end{longtable}
+
+以 \code{a[i] = a[i] + 1} 为例，若 \code{a} 是 32-bit 整数数组，机器动作至少包含四步：下标缩放、地址形成、读旧值、加一并写回。每一步都能追到本章已有部件。
+
+\begin{lstlisting}
+addr = base(a) + i * 4
+old  = MEM[addr]
+new  = old + 1
+MEM[addr] = new
+\end{lstlisting}
+
+\begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}}
+\toprule
+阶段 & 数据通路动作 & 验收问题 \\
+\midrule
+下标缩放 & \code{i<<2} 或地址生成单元计算 \code{i*4} & 元素大小是否由类型布局决定 \\
+地址形成 & 基址与缩放下标相加 & 加法是否按地址宽度截断或异常 \\
+读取旧值 & 发起 32-bit LOAD & 字节序、对齐、cache/MMIO 属性是否清楚 \\
+加一 & ALU 执行 \code{old+1} & 是否需要更新条件码，溢出如何解释 \\
+写回内存 & 发起 32-bit STORE & 字节使能正确，不能破坏相邻元素 \\
+\bottomrule
+\end{longtable}
+
+如果把 \code{a[i]} 错看成“数组对象知道自己的长度”，就会误解越界访问。硬件只看到基址、下标、缩放和加法。除非后续保护机制或编译器插入检查，否则 \code{i} 超出范围仍然会形成一个地址，并继续发起 LOAD 或 STORE。这个地址可能落在同一栈帧的另一个变量、堆对象的元数据、返回地址、MMIO 区域，或未映射页。后面讨论异常和分页时，正是把“地址是否允许访问”提升为硬件可检查的合同。
+
+\topic{结构体布局把字段名变成偏移}
+结构体字段名不是硬件对象。编译后，字段访问会变成“对象起始地址加字段偏移”。字段偏移由字段顺序、字段宽度和对齐规则决定。对齐不是排版习惯，而是为了让硬件访问落在更自然的字节边界上，减少拆分传输、简化字节使能和提高 cache 行利用率。
+
+\begin{lstlisting}
+struct Packet {
+  uint8_t  type;
+  uint8_t  flags;
+  uint16_t length;
+  uint32_t address;
+};
+
+p->address  ->  LOAD32 [base(p) + 4]
+\end{lstlisting}
+
+\begin{longtable}{L{0.16\linewidth}L{0.2\linewidth}L{0.24\linewidth}L{0.3\linewidth}}
+\toprule
+字段 & 宽度 & 可能偏移 & 硬件访问 \\
+\midrule
+\code{type} & 1 字节 & 0 & 字节 LOAD，通常零扩展 \\
+\code{flags} & 1 字节 & 1 & 字节 LOAD，可与掩码配合 \\
+\code{length} & 2 字节 & 2 & 半字 LOAD，受字节序影响 \\
+\code{address} & 4 字节 & 4 & 字 LOAD，要求字节使能覆盖四个车道 \\
+\bottomrule
+\end{longtable}
+
+若为了节省空间强行取消对齐，某些字段可能跨越自然边界。硬件仍可通过多个字节车道或多个总线周期完成访问，但代价会增加；某些架构会直接规定未对齐访问异常，要求软件拆成多个字节访问。教学阶段要把这件事写清楚：类型布局不是只影响内存大小，它会进入地址形成、字节选择、cache line 命中和总线传输。
+
+\topic{位掩码是最小的机器级抽象工具}
+许多硬件状态寄存器不是把每个状态放进独立地址，而是把多个 1-bit 字段压在同一个字中。程序读出一个状态寄存器后，常用掩码提取某些位；写控制寄存器时，也常用掩码只改指定字段。掩码操作本质上是 ALU 的 AND、OR、XOR 和移位路径。
+
+\begin{lstlisting}
+status = MMIO[UART_STAT]
+ready  = (status & 0x01) != 0
+error  = (status & 0x0E) >> 1
+
+ctrl = ctrl | 0x04      // set bit 2
+ctrl = ctrl & ~0x04     // clear bit 2
+ctrl = ctrl ^ 0x04      // toggle bit 2
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+位操作 & 硬件路径 & 典型用途 \\
+\midrule
+AND mask & 保留掩码为 1 的位，清除其他位 & 提取状态位、对齐地址、清除字段 \\
+OR mask & 把掩码为 1 的位置 1 & 设置控制位、构造权限字段 \\
+XOR mask & 翻转掩码为 1 的位 & 切换状态、构造补码取反路径 \\
+SHIFT & 改变字段位置或完成缩放 & 字段对齐、数组下标乘元素宽度 \\
+\bottomrule
+\end{longtable}
+
+位掩码也能解释为什么设备寄存器规格必须写清楚读写语义。有些位是只读状态位，有些位写 1 清除，有些位写 0 无效，有些位一写就启动设备动作。若用普通“读-改-写”序列处理一个带副作用寄存器，可能在读时清掉事件，或在写回时误改其他字段。硬件书在这里要提醒读者：同样是 bit，普通 RAM 字节和设备寄存器字段的合同完全不同。
+
+\topic{整数溢出要同时给出数学结果和机器结果}
+固定宽度整数运算的结果总是某个位宽内的 bit 模式。数学上的结果可能超出范围，此时硬件仍然给出低位截断结果和若干标志证据。若程序把 \code{INT_MAX+1} 当作普通正数继续使用，后续比较、数组下标和地址形成都会被污染。硬件不会自动替程序选择“报错、饱和、回绕、陷入”哪一种语义，必须由 ISA、编译器、语言规则或显式指令规定。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+语义 & 机器动作 & 适合场景 \\
+\midrule
+回绕 & 只保留低 N 位，标志记录证据 & 地址计数器、哈希、无符号模运算 \\
+陷入 & 溢出时进入异常或错误路径 & 安全语言运行时、调试检查 \\
+饱和 & 超范围钳到最大或最小值 & DSP、音频、图像和控制系统 \\
+扩大位宽 & 用更宽临时结果保存数学值 & 乘法、累加、编译器优化中间值 \\
+\bottomrule
+\end{longtable}
+
+这个表能把第三章和后面 CPU 章节连接起来。若 ISA 提供普通 ADD、带陷入 ADD、饱和 ADD 或宽乘法指令，控制器和 ALU 就必须输出不同的控制线和标志处理路径。若 ISA 只提供普通 ADD，软件就需要用比较和条件分支组合出额外检查。所谓“语言整数语义”，最后仍要落在硬件结果、标志位、异常入口和控制流上。
+
+\topic{案例：解析一个二进制包头}
+系统程序经常要解析来自网络、磁盘或外设 FIFO 的二进制包头。这个任务看起来属于软件格式处理，实际上集中使用了第三章的全部机器级工具：字节序、字段偏移、位掩码、整数扩展、对齐访问和溢出检查。假设某设备返回如下 8 字节包头：
+
+\begin{lstlisting}
+offset  size  field
+0       1     type
+1       1     flags
+2       2     length   // little-endian
+4       4     address  // little-endian
+\end{lstlisting}
+
+解析过程可以写成：
+
+\begin{lstlisting}
+type   = LOAD8 [base + 0]
+flags  = LOAD8 [base + 1]
+len_lo = LOAD8 [base + 2]
+len_hi = LOAD8 [base + 3]
+length = len_lo | (len_hi << 8)
+addr   = LOAD32 [base + 4]
+ready  = (flags & 0x01) != 0
+error  = (flags & 0x0E) >> 1
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+解析动作 & 硬件路径 & 验收问题 \\
+\midrule
+读取 \code{type} & 字节 LOAD 后零扩展 & 目标寄存器高位是否清零 \\
+读取 \code{length} & 两个字节按小端拼接 & 字节序是否和设备规格一致 \\
+读取 \code{address} & 32-bit LOAD 或四次字节 LOAD 组合 & 对齐、字节使能和异常规则是否清楚 \\
+提取 \code{ready} & AND 掩码后比较零 & 状态位是否被读操作清除 \\
+提取 \code{error} & AND 后右移 & 字段位置和移位方向是否正确 \\
+检查长度 & 与缓冲区容量比较 & 无符号比较和溢出检查不能混用 \\
+\bottomrule
+\end{longtable}
+
+若 \code{length} 来自外部设备，不能直接用它做 \code{base + length}。地址加法可能回绕，长度可能超过缓冲区，字段可能被设备错误写入。可靠代码需要先做范围检查，再执行后续 LOAD/STORE。硬件层面，这些检查仍然是比较器、标志位和分支。
+
+\begin{lstlisting}
+if length > buffer_capacity:
+  reject packet
+if base + length < base:
+  reject packet      // unsigned wraparound check
+payload_end = base + length
+\end{lstlisting}
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+检查项 & 机器级证据 & 漏掉后的后果 \\
+\midrule
+长度上限 & 无符号比较 \code{length <= capacity} & 后续 STORE 越过缓冲区 \\
+地址回绕 & \code{base+length < base} 说明无符号回绕 & 访问低地址或错误对象 \\
+字段合法性 & 掩码后剩余位应为 0 或规定值 & 未定义设备状态被当成合法状态 \\
+对齐要求 & \code{address \& (align-1)==0} & 未对齐异常或拆分传输代价 \\
+权限属性 & 地址不能落入 MMIO 或只读区域 & 普通数据访问变成设备副作用或保护异常 \\
+\bottomrule
+\end{longtable}
+
+这个案例是 CSAPP 式机器级思维和本书硬件 trace 的交汇点。读者不只要会写 C 代码，还要能指出每一步需要哪些 LOAD、移位、掩码、比较、标志和分支；更要能说明这些动作失败时，会落到第五章的总线错误、DMA 可见性或第六章的页错误和保护异常。
+
+\topic{案例：多字长整数为什么要保存 Carry}
+很多低成本 CPU 或教学 CPU 的 ALU 宽度较小，但程序需要处理更宽整数。例如用 16-bit ALU 实现 32-bit 加法，必须先加低 16 位，再把低位加法产生的 Carry 加入高 16 位。这里 Carry 不是附属显示灯，而是下一步运算的真实输入。
+
+\begin{lstlisting}
+// 32-bit A+B on a 16-bit ALU
+lo = A_lo + B_lo
+carry = carry_out(lo)
+hi = A_hi + B_hi + carry
+result = [hi:lo]
+\end{lstlisting}
+
+\begin{longtable}{L{0.16\linewidth}L{0.4\linewidth}L{0.34\linewidth}}
+\toprule
+步骤 & 控制线 & 验收证据 \\
+\midrule
+低位加法 & \code{alu_op=ADD}，\code{carry_in=0} & 低位结果和 CarryOut 正确 \\
+保存 Carry & \code{flags_write=1} & 标志寄存器在下一周期仍可读 \\
+高位带进位加法 & \code{carry_in=Carry} & 高位结果包含低位进位 \\
+写回组合结果 & 写回低位和高位目标寄存器 & 两个半字都在正确边界提交 \\
+\bottomrule
+\end{longtable}
+
+减法、多精度计数器、地址加法和校验和也会用到类似链路。若控制器在低位加法后错误关闭 \code{flags_write}，或在高位加法前让另一条指令覆盖 Carry，多字长结果就会错。这个例子帮助读者理解为什么真实 ISA 会提供 ADC、SBB 这类“带进位加/减”指令，也解释了为什么标志位是程序员可见状态的一部分。
+
 \section*{章末练习与验收任务}
 
 本节练习要求把 bit 解释、硬件路径和控制信号放在同一张账本中。答案不应仅写算术结果，还要说明该结果来自哪条组合路径，在哪个时钟边界被保存，哪些控制线必须同时成立。
