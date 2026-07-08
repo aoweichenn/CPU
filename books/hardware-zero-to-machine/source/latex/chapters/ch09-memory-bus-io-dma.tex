@@ -355,6 +355,62 @@ handshake rule:
 \topic{总线错误和超时必须成为规格的一部分}
 未映射地址不能只写成“不要访问”。真实系统必须规定访问未映射区域时会发生什么：返回固定值、保持等待直到超时、产生总线错误，或进入异常入口。设备无响应、DRAM 控制器报错、ECC 检测失败、外设权限不允许，也都应该形成可观察错误状态。没有错误合同的整机，调试时会把硬件故障误判为程序死循环。
 
+\topic{cache 行和局部性把常见访问留在近处}
+主存容量大但离 CPU 远，寄存器离 CPU 近但容量小，cache 处在二者之间。cache 不是“更快的内存副本”这么简单，而是按 cache line 搬运的一组近处 SRAM。CPU 读取某个地址时，cache 会用地址中的 tag 判断目标行是否已经在近处；若命中，数据直接从 cache 返回；若未命中，cache 控制器向下一级 cache 或 DRAM 请求整行，再把需要的字节送回 CPU。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+对象 & 硬件含义 & 验收问题 \\
+\midrule
+cache line & 一次填充和替换的最小数据块 & 行大小、字节偏移和未对齐访问是否清楚 \\
+tag & 判断某个 cache 槽保存的是哪段地址 & 命中比较是否覆盖高位地址和有效位 \\
+index & 选择 cache 中的候选槽或集合 & 映射冲突是否可能造成反复 miss \\
+valid/dirty & 表示行是否有效、是否被修改过 & 替换时是否需要写回下一级 \\
+miss & 近处没有所需行，需要向下一级请求 & miss 期间 CPU 停顿、继续执行或乱序等待的边界 \\
+\bottomrule
+\end{longtable}
+
+局部性解释了 cache 为什么有效。时间局部性表示刚访问过的数据很可能再次访问，例如循环变量和栈顶对象；空间局部性表示访问某个地址后，很可能访问相邻地址，例如顺序扫描数组。cache line 正是利用空间局部性：一次 miss 不只取一个字节，而是取一整段相邻字节。代价也随之出现：若程序跨很大步长访问数组，或者两个热数据反复映射到同一 cache 集合，硬件仍会不停搬行，表面上只是 LOAD 很慢，实质上是事务层反复 miss 和替换。
+
+\begin{lstlisting}
+32-byte cache line example:
+  address bits = [ tag | index | byte_offset ]
+  byte_offset selects one byte within the line
+  index selects a cache set
+  tag comparison decides hit or miss
+\end{lstlisting}
+
+\topic{写策略决定 STORE 什么时候真正离开 CPU}
+读 miss 的动作比较直观：向下级取回数据。写入更复杂，因为 CPU 可以先改 cache，再决定什么时候把修改传播到下一级。写穿策略每次写命中都继续写下一级，行为直接但带宽压力大；写回策略只在 cache 中标脏位，替换时再写回下一级，常见情况下更快，但可见性和错误恢复更复杂。无论哪种策略，字节写都必须尊重 byte enable，不能把同一 cache line 中无关字节改坏。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+写策略 & 优点 & 风险和边界 \\
+\midrule
+写穿 & 下一级更快看见新值，调试直观 & 带宽压力大，常配合写缓冲隐藏延迟 \\
+写回 & 多次写同一行可合并，减少外部事务 & dirty 行替换、掉电和 DMA 可见性更难处理 \\
+写分配 & 写 miss 时先把整行取入 cache 再修改 & 小写入可能触发整行读取 \\
+非写分配 & 写 miss 直接向下级写，不装入 cache & 后续读同地址可能仍 miss \\
+\bottomrule
+\end{longtable}
+
+这也是 MMIO 不能随意缓存的根本原因。写 LED 寄存器、清中断状态或启动 DMA 命令时，程序需要的是一次外设可见动作，而不是某条 cache line 中的普通字节更新。若 MMIO 被写回 cache 吞掉，设备可能永远看不到命令；若读状态寄存器被 cache 命中，CPU 可能一直看到旧状态。因此地址属性必须区分普通可缓存内存、不可缓存设备内存、写合并 framebuffer、DMA coherent 区域等不同事务合同。
+
+\topic{cache miss 是事务暂停，不是抽象的慢}
+当 LOAD miss 时，流水线不能凭空得到数据。简单 CPU 会停在访存阶段，保持地址和控制状态，直到下级返回数据；高性能 CPU 可能让独立指令继续执行，把这条 LOAD 放在未完成队列中，等数据回来再唤醒依赖指令。二者复杂度不同，但都必须维护同一个可见合同：依赖这次 LOAD 的指令不能使用错误旧值，异常和中断也不能让程序看见半提交状态。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+miss 类型 & 事务路径 & 典型处理 \\
+\midrule
+L1 miss/L2 hit & L1 请求 L2 返回 cache line & 几到十几周期，流水线可能短暂停顿 \\
+最后级 cache miss & 请求内存控制器和 DRAM & 上百周期级别，常需乱序、预取或多线程隐藏 \\
+TLB miss & 地址转换缓存缺失，要查页表或进异常 & 页表 walker、权限检查和可能的页错误 \\
+写回替换 & 脏行被换出，需先写下一级 & 替换队列、写缓冲和错误报告 \\
+设备/DMA 冲突 & cache 中旧副本与设备写入不一致 & coherent 互连、cache 维护或不可缓存映射 \\
+\bottomrule
+\end{longtable}
+
 \topic{低时延来自近处、缓存、并行和卸载}
 现代整机降低时延，不是让所有路径都变成零等待。L1/L2 cache 让常见数据走近处 SRAM；TLB 让近期地址转换不必每次查页表；预取和分支预测提前准备可能需要的路径；流水线、旁路和乱序调度让独立工作重叠；DMA、队列和中断聚合把批量 I/O 从 CPU 指令流中卸载。失败路径仍然存在：cache miss、TLB miss、DRAM 排队、设备背压、DMA fault 和错误中断都会把访问拉回慢路径。
 
@@ -375,6 +431,8 @@ MMIO 寄存器 & 设计 GPIO 的 \code{DIR/OUT/IN/STAT} 语义 & 外部输入经
 中断顺序 & 写出设备 ready 到 CPU 服务程序返回的 trace & 不丢事件，不重复清旧事件 \\
 DMA 顺序 & 写出描述符、缓冲区、completion 和 cache 可见性边界 & CPU 和设备所有权不重叠 \\
 valid/ready & 用 valid/ready 描述一次读请求和读响应 & 能说明背压和 completion 的作用 \\
+cache 行 & 用 tag/index/offset 解释一次 cache 命中和一次 miss & 能说明 cache line、valid、dirty 和替换边界 \\
+MMIO 属性 & 说明为什么设备寄存器通常不能按普通 cacheable 内存处理 & 能指出副作用、顺序和可见性要求 \\
 未映射访问 & 规定未映射地址的超时、错误或固定返回值 & CPU 不会永久等待未知目标 \\
 \bottomrule
 \end{longtable}

@@ -214,6 +214,75 @@ off:
   JMP   loop
 \end{lstlisting}
 
+\topic{程序员可见状态不是全部硬件状态}
+机器级程序通常只直接看见一小组状态：PC、通用寄存器、条件码或标志、可寻址内存，有些 ISA 还显式暴露栈指针、链接寄存器或状态寄存器。CPU 内部还会有 IR、MDR、ALUOut、流水线寄存器、旁路网络和微程序计数器，但这些通常不是普通程序可以直接读写的对象。区分这两类状态很重要：ISA 规定的是程序必须可依赖的边界，微结构内部状态则服务于实现速度、面积和功耗。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+状态 & 程序员视角 & 硬件实现视角 \\
+\midrule
+PC & 下一条或当前执行位置 & 取指地址、分支选择、异常入口和返回路径 \\
+通用寄存器 & 保存整数、地址、临时值和返回值 & 寄存器堆端口、旁路、写回优先级 \\
+条件码 & 最近运算留下的比较证据 & ALU 标志生成、\code{flags_write} 和分支条件译码 \\
+内存 & 按地址访问的字节对象 & cache、TLB、总线、MMIO 和权限检查 \\
+栈指针 & 当前栈顶位置 & 普通寄存器加受约束的加减和 LOAD/STORE 序列 \\
+\bottomrule
+\end{longtable}
+
+这种划分能解释为什么同一套 ISA 可以有不同实现。一个简单教学 CPU 可以用多周期状态机执行 LOAD；一个高性能 CPU 可以把它拆进流水线、cache 和乱序队列。只要最终提交到程序员可见状态的结果相同，内部路径可以不同。反过来，若内部优化改变了 PC、寄存器、内存或条件码的可见顺序，就不再只是实现细节，而是破坏了 ISA 合同。
+
+\topic{条件码把 ALU 证据变成控制流}
+条件分支不是“看高级语言的 if”，而是看硬件已经保存的证据。ALU 做加法、减法或比较时，可以同时产生 Zero、Sign、Carry、Overflow 等标志。控制器把这些标志与指令中的条件字段组合，决定下一 PC 选择顺序地址还是分支目标。比较指令常常等价于一次不写回结果的减法：结果本身丢弃，但标志被保留下来供后续分支使用。
+
+\begin{longtable}{L{0.16\linewidth}L{0.34\linewidth}L{0.4\linewidth}}
+\toprule
+条件 & 常见硬件证据 & 容易犯错的解释 \\
+\midrule
+相等 & \code{A-B} 的 Zero 为 1 & 只适合判断 bit 模式相等，不说明大小 \\
+无符号小于 & 减法借位或 Carry 约定 & 不能直接用结果最高位判断 \\
+有符号小于 & Sign 与 Overflow 的组合 & 最高位受溢出影响，必须修正 \\
+结果为负 & Sign 标志为 1 & 只在补码解释下表示负数 \\
+有符号溢出 & 同号相加得到异号，或减法符号规则触发 & 与无符号进位不是同一件事 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+CMP R1, R2       // flags = R1 - R2, result is not written
+JE  equal_path   // branch if Zero == 1
+JL  less_path    // signed branch uses Sign xor Overflow
+JB  below_path   // unsigned branch uses borrow/carry convention
+\end{lstlisting}
+
+这个例子说明，分支条件必须绑定解释规则。同一对寄存器 \code{R1} 和 \code{R2} 的 bit 模式，按无符号数、有符号补码数或地址偏移解释，可能得到不同的“小于”。硬件不会自动知道程序员想要哪一种比较，必须由 opcode 或条件字段告诉控制器使用哪组标志逻辑。
+
+\topic{调用、返回和栈帧是受约束的地址事务}
+函数调用可以从软件语法降到三件硬件事：保存返回地址，跳到被调用函数入口，为局部对象和保存寄存器预留内存。返回时再恢复必要状态，把 PC 改回返回地址。很多 ISA 用专门的 CALL/RET 指令完成其中一部分；精简教学 CPU 也可以用普通 STORE、LOAD、加减栈指针和 JUMP 组合出来。
+
+\begin{lstlisting}
+CALL target, stack grows downward:
+  SP = SP - word_size
+  MEM[SP] = PC + instruction_size   // push return address
+  PC = target
+
+RET:
+  PC = MEM[SP]                       // pop return address
+  SP = SP + word_size
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+栈帧对象 & 机器级表示 & 硬件动作 \\
+\midrule
+返回地址 & 一个位宽等于 PC 的地址值 & STORE 到栈，RET 时 LOAD 到 PC \\
+保存寄存器 & 调用约定规定要保留的寄存器内容 & 进入时 STORE，返回前 LOAD \\
+局部变量 & SP 或帧指针加固定偏移 & 地址形成后普通 LOAD/STORE \\
+实参溢出区 & 寄存器放不下的参数位置 & 调用方或被调用方按约定访问 \\
+对齐空洞 & 为总线宽度、ABI 或向量访问保留的字节 & 调整 SP，避免未对齐访问代价或异常 \\
+\bottomrule
+\end{longtable}
+
+把调用栈看成地址事务后，许多系统错误会变得具体。栈越界写不是抽象的“内存不安全”，而是一次 STORE 形成了错误地址，可能覆盖相邻局部变量、保存寄存器、返回地址或未映射页。若返回地址被覆盖，RET 只是按合同把栈顶字节装进 PC；CPU 并不知道这个地址原本是否可信。后续章节讨论保护模式、页表、异常和执行权限时，就是在给这些地址事务加上硬件可检查的边界。
+
 \topic{从一条语句贯通到硬件事务}为了避免本章变成若干概念并列，可以用一条简单语句贯通整机：\code{if (MMIO[GPIO_IN] != 0) MMIO[GPIO_OUT] = 1;}。在软件层面它像一次条件判断；在硬件层面，它至少包含取指、译码、地址形成、MMIO 读、条件分支、MMIO 写和 PC 更新。每一步都可以写成可验收事务。
 
 \begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}}
@@ -332,6 +401,8 @@ ADD trace & 为 \code{R3=R1+R2} 列出读地址、ALU 操作、写回选择和�
 LOAD trace & 把 LOAD 拆成地址形成、存储读、MDR 保存、寄存器写回 & 能处理存储器未 ready \\
 STORE trace & 说明地址、写数据、字节使能、写控制和无寄存器写回 & 能区分 RAM 写和 MMIO 副作用 \\
 JZ trace & 说明 Zero 标志如何影响下一 PC & 分支目标和顺序 PC 选择明确 \\
+条件码比较 & 分别解释有符号小于和无符号小于使用哪些 ALU 证据 & 不把 Carry、Sign 和 Overflow 混用 \\
+CALL/RET trace & 把调用和返回拆成保存返回地址、更新 SP、改写 PC 和恢复 PC & 能指出栈访问本质上是 LOAD/STORE \\
 控制字 & 设计一个包含 \code{alu_op/wb_sel/reg_write/mem_read/mem_write/pc_sel} 的控制字 & 每一位能追到实际电路 \\
 微程序 & 为 LOAD 写出 5 个微步骤和等待状态处理 & 慢存储器只拖住访存阶段 \\
 流水线冒险 & 说明结构、数据、控制三类冒险各破坏什么边界 & 能提出停顿、转发或冲刷策略 \\
