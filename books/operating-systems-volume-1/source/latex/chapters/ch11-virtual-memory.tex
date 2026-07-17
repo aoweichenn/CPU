@@ -4,13 +4,56 @@
 
 虚拟内存把每个进程看到的地址空间和物理内存分开。进程使用虚拟页，页表把虚拟页映射到物理页，并附带 readable、writable、executable、present 等权限。一次访问是否合法，不只取决于地址是否存在，还取决于访问类型和权限位。
 
+先看一个最容易误判的程序：
+
+\begin{lstlisting}
+char* p = malloc(1 << 30);   // request 1 GiB virtual range
+p[0] = 1;                    // touch first page
+p[4096] = 2;                 // touch second page
+\end{lstlisting}
+
+很多人会把 \code{malloc} 成功理解成“系统已经给了 1 GiB 物理内存”。这通常不对。用户程序拿到的是一段虚拟地址范围；真正的物理页可能在第一次写入某个页时才分配。也就是说，虚拟内存首先是一套承诺和检查机制：地址范围是否被允许，访问类型是否被允许，物理页是否已经准备好，没准备好时能不能补上。
+
+把这条路径拆开，会看到三个层次：
+
+\begin{enumerate}
+\tightlist
+\item 用户代码只拿到虚拟地址，例如 \code{p + 4096}。
+\item 内核用 VMA 记录“这段地址理论上属于堆，允许读写，可以按需分配”。
+\item CPU/MMU 用页表项记录“这一页当前是否有物理页，权限是什么”。
+\end{enumerate}
+
+因此“没有 PTE”和“非法地址”不是同一件事。一个地址如果不在任何 VMA 中，访问就是非法；一个地址在 VMA 中但还没有 PTE，可能只是第一次访问，需要缺页处理分配或调入页面。理解这层区别，后面的 \code{mmap}、COW、swap、page cache 才不会混在一起。
+
 隔离来自默认不可见。一个进程不能随便读写另一个进程的页；没有映射的地址会触发缺页；只读页不能写；不可执行页不能取指。操作系统通过这些规则同时提供保护、共享和按需分配。
 
 虚拟地址空间不仅是页表。内核还维护 VMA 或等价区域结构，用来描述一段虚拟地址的来源和权限：匿名内存、栈、堆、共享库、文件映射、设备映射。页表项是某一页当前是否能翻译，VMA 是这一段地址理论上是否合法、缺页时应该怎样处理。没有页表项不一定是错误，可能只是尚未按需分配。
 
 一次访问的大致路径是：CPU 发出虚拟地址；TLB 命中则直接得到物理地址和权限；TLB 未命中则硬件或内核进行页表遍历；页表项不存在或权限不符时触发异常；内核根据 VMA 判断是合法缺页、权限错误还是非法访问；合法缺页可能分配物理页、从文件读页、建立 COW 私有页或映射零页。
 
+这条路径可以用一个具体地址走一遍。假设页大小是 4096，进程访问 \code{0x401234}：
+
+\begin{lstlisting}
+virtual address = 0x401234
+virtual page    = 0x401
+offset in page  = 0x234
+
+find VMA containing 0x401234
+  yes: [0x400000, 0x500000) readable executable file mapping
+
+look up PTE for virtual page 0x401
+  present: physical page 0x83000, readable executable
+
+physical address = 0x83000 * 4096 + 0x234
+\end{lstlisting}
+
+若 PTE 不存在，内核不会立刻把程序杀掉，而是先问 VMA：这是不是文件映射的合法页？是不是栈增长？是不是匿名页按需分配？若 VMA 也找不到，才是典型的非法访问。若 VMA 找到了但访问类型不允许，例如往只读代码页写，就是权限错误。缺页异常只是入口，真正结论由 VMA、PTE、访问类型和错误码共同决定。
+
 copy-on-write 是虚拟内存最有代表性的协议。\code{fork} 时，父子进程可以先共享物理页，并把页表标记为只读和 COW。任何一方写入时触发保护异常，内核复制物理页，更新写入方页表，再继续执行。这样 fork 不需要立刻复制整个地址空间，但必须正确维护引用计数和权限。
+
+\begin{keyidea}
+虚拟内存不是“把地址翻译成另一个地址”这么简单。它同时维护三件事：哪些虚拟区间被承诺，当前哪些页已经物化成物理页，每次读写执行是否被授权。
+\end{keyidea}
 
 \section{实践}
 
@@ -102,6 +145,24 @@ handle_write_fault(vaddr):
 
 这段算法最容易错在引用计数和权限更新顺序。若忘记把共享页设为只读，写入不会触发 fault，父子进程会互相污染；若复制后忘记减少旧页引用计数，会泄漏；若 TLB 中仍缓存旧权限，必须刷新或失效对应条目。
 
+用一个父子进程的实际页来走一遍。父进程有一页虚拟地址 \code{0x7000}，物理页是 \code{P42}，内容是字符串 \code{"abc"}。\code{fork} 前，父进程 PTE 指向 \code{P42}，权限可读可写，\code{P42.refcount = 1}。\code{fork} 时，内核不复制 \code{P42} 的 4096 字节，而是让父子页表都指向同一个 \code{P42}，同时把两个 PTE 都改成只读，并在软件元数据里标记 COW，\code{P42.refcount = 2}。
+
+\begin{longtable}{p{0.16\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+时刻 & 父进程 PTE & 子进程 PTE \\
+\midrule
+fork 前 & \code{0x7000 -> P42, writable} & 不存在 \\
+fork 后 & \code{0x7000 -> P42, read-only, COW} & \code{0x7000 -> P42, read-only, COW} \\
+子进程写入前 & \code{P42.refcount = 2} & store 触发写保护 fault \\
+子进程 fault 后 & 仍指向 \code{P42, read-only, COW} & 指向新页 \code{P99, writable} \\
+后续父进程写入 & 若 \code{P42.refcount = 1} 可直接恢复 writable & 已经和父进程分离 \\
+\bottomrule
+\end{longtable}
+
+关键点是“写入必须在 store 提交前被拦住”。CPU 执行子进程的 \code{*p = 'x'} 时，地址翻译发现 PTE present 但不可写，于是保存 faulting address、错误码和 RIP 进入内核。因为 store 还没有修改 \code{P42}，内核才能安全复制旧页到 \code{P99}，把子进程 PTE 改为 \code{P99, writable}，再返回原指令重试。重试后写入落在 \code{P99}，父进程继续看到旧的 \code{"abc"}。
+
+失败路径也要讲清楚。若 fault 地址不在允许写的 VMA 内，不能执行 COW，而应给进程发段错误。若分配 \code{P99} 失败，可能触发回收或 OOM。若更新 PTE 后没有失效旧 TLB，CPU 可能继续使用旧只读翻译，导致重复 fault；更危险的是撤销可写权限时没有失效旧可写翻译，会让某个 CPU 绕过新的只读保护继续写共享页。COW 的正确性不是“复制一页”这么简单，而是 VMA 权限、PTE 权限、物理页引用计数、TLB 失效和 fault 可重试性共同成立。
+
 \subsection{页面置换}
 
 当物理内存不足时，内核要回收页面。理想算法 OPT 总是淘汰未来最晚再访问的页面，但它需要知道未来，不能实现。LRU 淘汰最近最久未使用的页，更接近实际局部性，但精确 LRU 维护成本高。Clock 算法用访问位近似 LRU：扫描环形列表，访问位为 1 就清零并跳过，访问位为 0 就淘汰。
@@ -159,6 +220,24 @@ unmap_page(mm, vaddr):
 
 顺序很重要。若在其他 CPU 失效 TLB 前就释放物理页，该页可能被重新分配给别的对象，而旧 CPU 仍通过过期 TLB 写入它，形成严重内存破坏。TLB shootdown 是虚拟内存和多核同步的交叉点。
 
+再把这个危险展开成具体事故。进程 X 有虚拟页 \code{0x9000 -> P10}，它的两个线程分别在 CPU0 和 CPU1 上运行。CPU1 的 TLB 里已经缓存了这条翻译。CPU0 执行 \code{munmap(0x9000)}，把页表项清掉，然后若立刻把 \code{P10} 释放给物理页分配器，分配器可能马上把 \code{P10} 交给内核网络栈当作 packet buffer。此时 CPU1 如果还没收到 shootdown，仍可用旧 TLB 把用户态 \code{0x9000} 翻译到 \code{P10}，一次普通 store 就会写坏网络 buffer。这个 bug 表面可能表现成网络包校验失败、随机内核崩溃或安全越权，根因却是页表撤销和 TLB 旧副本之间的生命周期错误。
+
+因此 shootdown 的完成点必须在“物理页可重用”之前。教学模型可以记成三步：先让新页表状态不可再产生新翻译；再让所有可能持有旧翻译的 CPU 丢掉旧 TLB；最后释放旧物理页或改变其用途。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 必须完成的事 & 如果提前进入下一步 \\
+\midrule
+清 PTE & 后续 page walk 不能再得到旧映射 & 新 TLB 项仍可能被硬件装入 \\
+本地失效 & 当前 CPU 不再使用旧翻译 & 当前线程可能继续访问已撤销页 \\
+远端 IPI & 其他 active CPU 执行 \code{invlpg} 或等价操作 & 远端 CPU 可能写入已释放物理页 \\
+等待 ack & 确认旧翻译不可再被使用 & 释放页会造成 use-after-free 到物理内存 \\
+释放旧页 & 页框回到分配器或引用计数下降 & 到这一步才安全改变页用途 \\
+\bottomrule
+\end{longtable}
+
+这也是为什么 \code{mprotect}、\code{munmap}、COW 和进程退出在多核上不是“改一张表”就结束。内核还要知道哪些 CPU 可能正在运行这个地址空间，哪些映射范围需要 flush，能否批量合并 shootdown，是否允许延迟释放。优化可以减少 IPI 次数，但不能破坏上面的安全边界。
+
 \subsection{overcommit 与 OOM}
 
 虚拟内存允许系统承诺比物理内存更多的虚拟地址。例如 \code{mmap} 或 \code{malloc} 成功不代表物理页已经分配，首次写入才可能触发分配。overcommit 提高灵活性，但内存真正不足时必须选择失败策略。
@@ -178,6 +257,29 @@ handle_anon_fault(vma, addr):
 
 OOM killer 不是随意杀进程。它通常综合内存占用、权限、oom score、是否关键服务、cgroup 限制和可回收性。容器场景下，cgroup 内 OOM 应优先限制在该 cgroup 内，而不是扩大到整个宿主。
 
+把 overcommit 放进一个常见服务事故。机器有 8GiB 内存，服务 A 启动时 \code{malloc(6GiB)} 做缓存索引，服务 B 也 \code{malloc(6GiB)} 准备批处理。两个 \code{malloc} 都可能成功，因为内核只是给它们各自建立虚拟区间和 VMA，并没有立即分配 12GiB 物理页。监控里 VSZ 很大，但 RSS 还不高。事故发生在两者开始真正写入页面时：
+
+\begin{lstlisting}
+for each 4096-byte page in allocated range:
+  p[i] = 0;
+\end{lstlisting}
+
+每写一个尚未物化的匿名页，CPU 都会触发缺页；内核确认 VMA 允许写，分配物理页，清零，安装 PTE，然后重试 store。刚开始这很顺利；随着空闲页减少，内核先回收干净文件页，再尝试写回脏页，再考虑 swap 或压缩；若仍不能满足分配，就进入 OOM 决策。此时失败点不是 \code{malloc}，而是某一次普通 store 的缺页处理。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 内核状态 & 应用看到什么 \\
+\midrule
+\code{malloc} 成功 & VMA/堆区扩展，物理页可能未分配 & 返回非空指针 \\
+首次写前几页 & 匿名页缺页，分配物理页并清零 & store 正常完成，只是可能变慢 \\
+内存压力上升 & 回收 page cache、写回脏页、触发 swap & 延迟抖动，RSS 上升 \\
+无法回收 & OOM 在进程或 cgroup 内选择受害者 & 某进程被杀，或 fault 返回失败语义 \\
+cgroup 限制命中 & 只在该资源组内回收和 OOM & 宿主其他服务不应被拖下水 \\
+\bottomrule
+\end{longtable}
+
+这解释了为什么服务不能只用“malloc 成功”作为容量保证。真正可靠的设计要设置 cgroup memory.max、应用层缓存上限、分批预热、失败回退和监控 RSS/PSI。overcommit 的价值是让稀疏使用的大地址空间可行；代价是失败可能延迟到第一次触碰具体页面时才出现。
+
 \section{测试}
 
 测试要覆盖成功翻译、写只读页失败、访问未映射页失败、unmap 后访问失败、页内 offset 保留。错误结果必须携带可读诊断，不能只返回一个空值。
@@ -193,6 +295,41 @@ OOM killer 不是随意杀进程。它通常综合内存占用、权限、oom sc
 \end{itemize}
 
 权限测试尤其重要。没有权限测试的虚拟内存模型，会把地址转换误写成普通哈希表查找，丢掉操作系统最重要的保护语义。
+
+\subsection{本章压缩进来的内存工程账本}
+
+虚拟内存的细节很多：page fault、VMA 切分、PTE 标志、TLB shootdown、COW、swap、THP、mlock、PSI、OOM 和 cgroup。主线里先把它们压成一张“缺页账本”。每次 CPU 访问地址失败，内核都要回答：地址属于哪个 VMA，访问类型是否被允许，页面内容从哪里来，PTE 怎样安装，旧 TLB 是否要失效，失败时返回信号还是 errno，线程是否需要睡眠等待 I/O 或回收。
+
+\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+场景 & 内核主要动作 & 关键风险 \\
+\midrule
+匿名首次写 & 分配物理页、清零、安装 writable PTE & overcommit 后在首次触碰时 OOM \\
+COW 写 fault & 检查引用、复制页面、替换 PTE、flush TLB & 父子进程互相污染或复制后权限错误 \\
+文件映射 fault & 查 page cache、必要时发起读 I/O、安装映射 & 把 I/O 等待误判成 CPU 慢 \\
+\code{mprotect} & VMA 切分、改权限、更新页表、失效 TLB & 旧 TLB 保留过宽权限 \\
+内存回收 & 扫 LRU、写回脏页、swap out、唤醒等待者 & 回收不可回收页或引发严重抖动 \\
+\bottomrule
+\end{longtable}
+
+读源码时可以按对象追踪：\code{mm\_struct} 是进程地址空间账本，VMA 是区间权限和来源账本，PTE 是硬件当前可执行的翻译账本，\code{struct page/folio} 是物理页生命周期账本，rmap 把物理页反查到映射它的地址空间。任何优化都不能跳过这些账本的一致性。THP 减少 TLB 压力，但拆分时仍要恢复普通页语义；swap 降低内存压力，但 fault 延迟会进入请求尾部；mlock 保护实时路径或密钥页，但会减少可回收集合；PSI 不解决内存压力，只告诉你线程正在因为内存等待而失去前进能力。
+
+内核自己的内存分配也属于这张账本。页分配器负责按页框分配和回收，buddy 系统处理连续页块；slab/SLUB 把页切成固定大小对象，服务 \code{task\_struct}、inode、dentry、socket 等高频对象；\code{vmalloc} 提供虚拟连续但物理不连续的内核映射。教学实现可以先只有 page allocator 和几个对象池，但必须保留三个边界：中断上下文不能随意睡眠等待内存，DMA buffer 可能要求物理连续或满足设备地址限制，对象缓存释放后不能仍被 RCU 读者或异步 completion 引用。
+
+\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+分配器 & 适合的对象 & 验收问题 \\
+\midrule
+页分配器 & 页表页、大块缓冲、匿名页和 page cache 页 & 压力下是否能回收、写回或明确失败 \\
+SLUB/slab & 大量同类型小对象 & 析构、引用计数、越界和 use-after-free 是否可检测 \\
+\code{vmalloc} & 大型内核虚拟连续缓冲 & 不能交给要求物理连续 DMA 的设备 \\
+per-CPU allocator & 每 CPU 统计、队列和热路径缓存 & CPU 热插拔和迁移时账本是否一致 \\
+\bottomrule
+\end{longtable}
+
+\begin{rubricbox}
+本章验收问题：给一个虚拟地址和一次读/写/取指访问，能否说明它命中哪个 VMA、PTE 应有哪组权限、缺页后页面从哪里来、是否可能睡眠、失败给用户什么信号或错误、哪些观测指标能证明判断。能回答这些，才算把虚拟内存读成 OS 机制，而不是地址转换表。
+\end{rubricbox}
 
 \section{源码级补充：PTE 标志、THP、swap、mlock 与 PSI}
 

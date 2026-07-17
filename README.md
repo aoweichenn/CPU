@@ -11,6 +11,7 @@
 - `books/cpu-volume-3/`：CPU 与 AI 计算教材第三册规划目录，主题是 AI 模型、张量、算子开发、量化和本地 CPU 推理引擎。
 - `books/cpu-volume-3-practice/`：第三册配套实践与代码卷，主题是 Linux 本地量化推理引擎、完整源码、KV Cache、reference trace、7B 账本、服务 SLO、CPU/GPU 后端边界和验收门禁。
 - `books/cpu-volume-3-source/`：第三册源码卷历史素材目录；默认导出已合并到第三册实践与代码卷。
+- `books/hardware-zero-to-machine/`：硬件从零到整机原理卷，主题是从二极管、逻辑门、组合逻辑、时序逻辑、ALU 和最小 CPU 推导到内存、I/O 与整机。
 - `books/algorithm-interview/`：算法刷题与 C++ 面试教材，主题是数据结构、算法原理、暴力到优化、C++ 容器、力扣题单和面试表达；训练周期只作为可调节节奏，不作为内容边界。
 - `books/cpp-zero-to-advanced/`：Cpp 从零到高级教材，主题是执行模型、值和类型、RAII、标准库、泛型、构建测试、性能、并发、大型代码组织和综合项目。
 
@@ -28,20 +29,20 @@ books/
   by_type/             # 按原理卷、实践与代码卷整理入口
   by_topic/            # 按 C++、算法、计算系统、AI、组成原理、OS、网络整理入口
   cpu-volume-1/
-    source/latex/      # 正式 LaTeX 书稿，生成 PDF/EPUB
+    source/latex/      # 正式 LaTeX 书稿，生成 PDF
     materials/         # 草稿、课程计划、素材、参考资料
     labs/              # 与本书绑定的代码实验
     reports/           # 报告模板和学习报告
     results/           # 实验输出，默认只跟踪 .gitkeep
     tools/             # 本书专用脚本
   cpu-volume-1-practice/
-    source/latex/      # 第一册实践卷正式 LaTeX 书稿，生成 PDF/EPUB
+    source/latex/      # 第一册实践卷正式 LaTeX 书稿，生成 PDF
     labs/              # Executable Evidence Kit C++20 工程
     reports/           # 研究报告输出
     results/           # 实验输出
     tools/             # 本书专用脚本
   cpu-volume-2/
-    source/latex/      # 第二册原理卷正式 LaTeX 书稿，生成 PDF/EPUB
+    source/latex/      # 第二册原理卷正式 LaTeX 书稿，生成 PDF
     materials/         # 草稿、课程计划、素材、参考资料
     labs/              # 早期实验和配套实践素材
     reports/           # 报告模板和学习报告
@@ -75,7 +76,7 @@ books/
     results/           # 实验输出
     tools/             # 本书检查脚本
   cpp-zero-to-advanced/
-    source/latex/      # Cpp 从零到高级正式 LaTeX 主稿，生成 PDF/EPUB
+    source/latex/      # Cpp 从零到高级正式 LaTeX 主稿，生成 PDF
 CMakeLists.txt         # 仓库级 C++ 实验入口
 Makefile               # 仓库级常用命令入口
 ```
@@ -103,11 +104,10 @@ Makefile               # 仓库级常用命令入口
 
 ## 常用命令
 
-生成当前第一册 PDF 和 EPUB：
+生成当前第一册 PDF：
 
 ```bash
 make cpu-pdf
-make cpu-epub
 ```
 
 检查第一册 LaTeX 输入和正文规模：
@@ -134,16 +134,14 @@ make cpu-coverage
 ```bash
 make cpu1p-check
 make cpu1p-pdf
-make cpu1p-epub
 make cpu1p-test
 ```
 
-生成第二册 PDF 和 EPUB：
+生成第二册 PDF：
 
 ```bash
 make cpu2-check
 make cpu2-pdf
-make cpu2-epub
 make cpu2-text-count
 ```
 
@@ -153,7 +151,7 @@ make cpu2-text-count
 make books-export
 ```
 
-该命令会重新构建各本书的 PDF/EPUB，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF 和 EPUB。EPUB 不再使用 `cpu-volume-1.epub` 这类带短横线的机器名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
+该命令会重新构建各本书的 PDF，并把 `book-exports/` 下每本书的导出目录清理成一份不含短横线、不含加号的 PDF。导出文件不使用 `main.pdf` 这类通用名，也不在导入文件名里使用 `C++`，避免微信读书导入链路误处理特殊字符。
 
 整理手机导出目录：
 
@@ -161,7 +159,7 @@ make books-export
 make phone-export-organize
 ```
 
-手机目录使用 `/mnt/sdcard/STU/BOOKS/按卷类型/{原理卷,实践与代码卷}/书名/` 保存真实 PDF/EPUB；`按内容领域/` 只保存 Markdown 索引说明，不复制书文件，也不生成 `.txt` 索引，避免微信读书把同一本书或目录说明扫描成多份。
+手机目录使用 `/mnt/sdcard/STU/BOOKS/按卷类型/{原理卷,实践与代码卷}/书名/` 保存真实 PDF；`按内容领域/` 只保存 Markdown 索引说明，不复制书文件，也不生成 `.txt` 索引，避免微信读书把同一本书或目录说明扫描成多份。
 
 直接导出到手机：
 
@@ -176,7 +174,6 @@ make phone-books-export
 ```bash
 make cpu3p-check
 make cpu3p-pdf
-make cpu3p-epub
 make cpu3p-test
 ```
 
@@ -195,7 +192,6 @@ make algo-test
 ```bash
 cd books/cpu-volume-1
 make pdf
-make epub
 make lab00
 ```
 
@@ -214,7 +210,6 @@ Cpp 从零到高级也可以进入单本书目录执行：
 cd books/cpp-zero-to-advanced
 make check
 make pdf
-make epub
 ```
 
 第二册也可以进入单本书目录执行：
@@ -223,7 +218,6 @@ make epub
 cd books/cpu-volume-2
 make check
 make pdf
-make epub
 ```
 
 ## CMake 构建

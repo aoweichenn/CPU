@@ -1,0 +1,1365 @@
+\chapter{状态、时钟与同步边界}
+
+第一章讲的是组合逻辑：输入稳定后，输出由当前输入唯一决定。它能计算，却不能保存过去。真正的机器必须能把某个结果留下来，等下一个步骤继续使用；也必须能规定“什么时候更新状态”，否则反馈路径会让硬件在一个周期内连续变化，机器无法分步骤推进。
+
+本章将反馈、锁存器、触发器、时钟、复位、寄存器、计数器和状态机合并讨论。读完后，应当能把“状态”理解成真实硬件边界：一些 bit 在时钟边界被提交，边界之间由组合逻辑准备下一值。后续 CPU 的 PC、指令寄存器、控制状态、流水线寄存器和中断入口，都将反复使用这一本章模型。
+
+\begin{keyidea}
+组合逻辑负责准备下一值，状态元件负责在边界保存下一值。同步硬件就是把这两件事反复组织起来。
+\end{keyidea}
+
+第一章已经把建立时间、保持时间、时钟到输出和时钟偏斜作为词汇预告。本章从这里正式接上：组合逻辑的输出并不是“最终正确即可”，它必须在目标触发器的采样窗口之前稳定；状态元件也不是理想变量，它采样后需要时间把新值送到 Q 端。同步设计的基本任务，就是把这些时间合同写成可检查的账本。
+
+\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.3\linewidth}}
+\toprule
+第一章词汇 & 本章正式含义 & 典型失败 \\
+\midrule
+时钟到输出 & 触发器被时钟触发后，Q 端多久开始并完成变化 & 下一段组合逻辑起点被估计得过早 \\
+组合最大延迟 & Q 端变化经过门和连线到达 D 端的最晚时间 & 下一个时钟沿到来时结果未稳定 \\
+建立时间 & D 端在采样沿之前必须提前稳定的时间 & 目标触发器采到过渡值 \\
+保持时间 & D 端在采样沿之后必须继续稳定的时间 & 新值过早冲进采样窗口 \\
+时钟偏斜 & 源触发器和目标触发器看到时钟沿的时间差 & 有效周期被压缩或保持窗口被破坏 \\
+\bottomrule
+\end{longtable}
+
+本章的版面组织遵循同一顺序：先说明反馈为什么能保存一个 bit，再说明锁存器和触发器如何定义写入边界，随后把多个触发器扩展成寄存器、计数器、移位寄存器和状态机，最后把复位、跨边界输入、实验板接线和数据手册验收合成完整工程闭环。读者不应把这些小节看成独立名词表，而应把它们看成“状态如何被创建、提交、传播和验证”的连续链条。
+
+\section{一、反馈、锁存器与保存一个 bit}
+
+保存一个 bit 的起点是反馈。两个反相器首尾相接，会形成两个稳定状态。若左边节点为 0，右边经过反相后为 1；右边的 1 再反相回来，正好维持左边为 0。反过来，左边为 1、右边为 0 也能稳定。只要没有外部强制改变，这个状态会保持。
+
+该结构说明，“保存一个 bit”对应电路中某些节点在反馈作用下停留于稳定物理状态。一个稳定状态解释为 0，另一个稳定状态解释为 1。状态的本质，是电路有能力在输入不再变化时仍然维持某个内部结果。
+
+从电路角度看，反馈不是抽象箭头，而是输出重新影响输入。两个反相器互相连接时，每一侧都在“支持”另一侧的当前电平。若某个扰动让左侧电压略有上升，右侧反相器会把右侧电压压低，右侧的低电平又通过另一个反相器继续支持左侧高电平。这个正反馈过程让电路迅速落入两个稳定点之一。数字电路把这两个稳定点命名为 0 和 1，但底层仍然是晶体管、电容、电阻和电源共同决定的物理平衡。
+
+真实锁存结构通常不会直接暴露为两个反相器，而是用交叉耦合的 NAND 门或 NOR 门构成 SR 锁存器。SR 的含义是 set 与 reset：set 请求把状态置为 1，reset 请求把状态置为 0。它已经能表达“外部命令改变内部状态”，但也引入一个重要约束：不能同时给出相互冲突的命令。若 set 和 reset 同时有效，输出可能进入不符合设计语义的状态；当冲突解除时，最后落到 0 还是 1 取决于门延迟和释放顺序。这就是第一类状态设计合同：不仅要说明哪个状态合法，还要说明哪些输入组合禁止出现。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+结构 & 能解决的问题 & 必须说明的风险 \\
+\midrule
+双反相器反馈 & 两个稳定点保存 1 bit & 没有独立写入控制 \\
+SR 锁存器 & set/reset 命令改变状态 & set 与 reset 不能给出冲突请求 \\
+D 锁存器 & 用一个数据输入和 enable 表达写入 & enable 有效期间输入可穿透到输出 \\
+D 触发器 & 在时钟边沿采样并保存 & 需要满足建立时间、保持时间和复位要求 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{circuit}[x=1cm,y=1cm]
+  \node[not gate US, draw=BookAccent, line width=0.55pt, scale=1.35] (inv1) at (1.6,0) {};
+  \node[not gate US, draw=BookAccent, line width=0.55pt, scale=1.35] (inv2) at (6.4,0) {};
+  \node[hw label, above=0.3cm of inv1] {反相器 A};
+  \node[hw label, above=0.3cm of inv2] {反相器 B};
+  \coordinate (tap1) at ($(inv1.output)+(0.75,0)$);
+  \coordinate (tap2) at ($(inv2.output)+(0.75,0)$);
+  \draw[hw bus] (inv1.output) -- (tap1) -- (inv2.input);
+  \draw[hw return] (inv2.output) -- (tap2) |- (4.0,-1.15) -| ($(inv1.input)+(-0.65,0)$) -- (inv1.input);
+  \node[BookTeal,font=\small\bfseries] at (3.95,0.45) {X};
+  \node[BookTeal,font=\small\bfseries] at (7.7,0.35) {Y};
+  \node[hw label, text width=8.5cm] at (4.0,-1.85) {两个反相器首尾相接后，任意一个稳定输出都会成为另一侧的输入；反馈线绕到下方，避免穿过门符号和标签。};
+\end{circuit}
+\diagramnote{两个反相器首尾相接形成双稳态：X=0, Y=1 稳定；X=1, Y=0 也稳定。}
+\vspace{0.8em plus 0.25em}
+
+单纯反馈还不足以形成可用存储单元。若无法可靠地把它从 0 改成 1，或从 1 改成 0，它只是一个稳定反馈环。因此需要写入控制。锁存器可以理解为带写使能的 1-bit 存储单元：写使能有效时，输入 D 可以影响输出 Q；写使能无效时，反馈通路维持原来的 Q。
+
+\begin{longtable}{L{0.22\linewidth}L{0.24\linewidth}L{0.42\linewidth}}
+\toprule
+写使能 & 数据输入 & 输出行为 \\
+\midrule
+有效 & 0 或 1 & 输出跟随输入变化 \\
+无效 & 任意 & 输出保持原值 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=2.0cm,y=1.6cm]
+  \node[draw, rectangle, minimum width=2.4cm, minimum height=2.0cm, fill=BookCodeBg, rounded corners=3pt] (sym) at (0,0) {};
+  \node[above=0.12cm of sym, font=\small\color{BookNavy}] {D-Latch};
+  \node[left] at ($(sym.west)+(-0.12,0.5)$) {D};
+  \node[left] at ($(sym.west)+(-0.12,-0.5)$) {LE};
+  \node[right] at ($(sym.east)+(0.12,0.5)$) {Q};
+  \node[right] at ($(sym.east)+(0.12,-0.5)$) {Q'};
+  \node[below=0.3cm of sym, font=\footnotesize, BookAccent] {LE=1: 透明};
+  \node[below=0.6cm of sym, font=\footnotesize, BookTeal] {LE=0: 保持};
+\end{block}
+\diagramnote{D 锁存器方框符号：LE=1 时 Q 跟随 D（透明），LE=0 时反馈保持原值。}
+\vspace{0.8em plus 0.25em}
+
+例如一个“按住才能设置”的电路中，enable 为 1 时，D=1 会把锁存器写成 1；enable 回到 0 后，即使 D 变回 0，Q 仍保持 1。这样，过去某一刻的输入就被硬件保存下来了。
+
+把 SR 锁存器变成 D 锁存器的意义，在于把两个可能冲突的命令合并为一个数据输入 D 和一个写使能 enable。enable 有效且 D=1 时，相当于请求 set；enable 有效且 D=0 时，相当于请求 reset；enable 无效时，set 和 reset 都不被触发，反馈保持旧值。这样，外部控制逻辑不再同时生成 set/reset 两条危险命令，而是生成“是否写入”和“写入什么值”两个更清晰的问题。
+
+真实器件中的锁存器还会暴露输出使能、低有效清零、三态输出等控制脚。以 74HC373/74HC573 这类透明锁存器为例，锁存使能决定内部是否继续跟随输入，输出使能只决定引脚是否驱动外部总线；二者不能混淆。关闭输出并不等于内部状态消失，打开输出也不等于重新采样输入。后面讨论总线、寄存器堆和 I/O 芯片时，这个区分会反复出现：内部状态、外部驱动、写入边界是三件不同的事。
+
+8086 是理解锁存器用途的经典案例。8086 的部分地址线与数据线复用，地址阶段先在总线上给出地址，随后同一组引脚又可能转为数据传输。外部存储器不能在数据阶段继续把这些引脚当作地址，因此系统板需要由 ALE 这类地址锁存允许信号驱动外部锁存器，把地址阶段的值保存下来。8086 时代常见的板级器件包括 8282/8283 或 74LS373；今天做低速教学实验时也常用 74HC373/74HC573 复现同一思想。这里的锁存器不是“多余缓冲器”，而是把一个总线相位中的地址变成后续相位仍然可用的状态。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+总线阶段 & 锁存器动作 & 设计含义 \\
+\midrule
+地址有效 & 锁存窗口打开，地址进入锁存器 & 允许复用总线先表达地址 \\
+窗口关闭 & 内部反馈保持地址 & 外部存储器继续看到稳定地址 \\
+数据传输 & 总线引脚改作数据或状态用途 & 地址不会随复用引脚变化而丢失 \\
+输出使能控制 & 决定是否驱动外部总线或后级 & 不改变锁存器内部保存的值 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{circuit}[x=1cm,y=1cm]
+  \node[nand gate US, draw=BookAccent, line width=0.55pt, logic gate inputs=nn, scale=1.28] (n1) at (3.0,1.25) {};
+  \node[nand gate US, draw=BookAccent, line width=0.55pt, logic gate inputs=nn, scale=1.28] (n2) at (3.0,-1.25) {};
+  \draw[hw bus] (0.4,1.45) node[left] {$\overline{S}$} -- (n1.input 1);
+  \draw[hw bus] (0.4,-1.45) node[left] {$\overline{R}$} -- (n2.input 2);
+  \coordinate (q) at (5.25,1.25);
+  \coordinate (qn) at (5.25,-1.25);
+  \draw[hw bus] (n1.output) -- (q) node[right,BookTeal,font=\small\bfseries] {Q};
+  \draw[hw bus] (n2.output) -- (qn) node[right,BookTeal,font=\small\bfseries] {$\overline{Q}$};
+  \draw[hw return] (q) -- ++(0.62,0) |- (0.78,-0.98) -- (n2.input 1);
+  \draw[hw return] (qn) -- ++(0.62,0) |- (0.78,0.98) -- (n1.input 2);
+  \node[hw label, text width=6.9cm] at (3.0,-2.35) {交叉反馈只连接到另一只 NAND 的第二输入，输入线、输出线和反馈线各走独立通道。};
+\end{circuit}
+\diagramnote{由两个交叉耦合的 NAND 门构成的 SR 锁存器。$\overline{S}$ 与 $\overline{R}$ 低有效；当两者都为高时，反馈维持原状态。}
+
+从这个案例可以看出，锁存器适合用在协议已经提供清晰电平窗口的地方，例如地址锁存、外部总线相位分离、显示输出暂存等。若协议没有给出可靠窗口，或者多个状态级之间存在组合反馈，透明锁存器反而会让调试变难。教材后面讲最小 CPU 时，PC、指令寄存器和控制状态一般优先使用边沿触发器；讲总线和 I/O 时，再把锁存器作为相位保持和输出隔离工具使用。
+
+锁存器的问题在于透明窗口。只要 enable 有效，输入变化就可能一路穿透到输出。若多个锁存器共用同一个 enable，并且它们之间还接着组合逻辑，状态可能在一个打开窗口内穿过多级，边界变得模糊。对小电路来说，锁存器易于分析；对大规模同步机器来说，更清晰的做法是把写入压到离散时钟边界。
+
+透明窗口不是“锁存器不能用”的理由，而是要求设计者明确时间边界。两相锁存器、流水线透明锁存、片内时钟门控单元都可能利用锁存器，但它们依赖严格的相位、非重叠时钟和时序分析。初学同步机器时，先使用边沿触发器更稳妥，因为每一级状态只在时钟沿提交，调试时可以把每个周期看成一页账本：上一页 Q 经过组合逻辑形成本页 D，本页边界再把 D 提交为下一页 Q。
+
+\begin{waveform}[x=2pt,y=6ex]
+  \draw[BookRule!20,step=20pt] (0,-12ex) grid (260pt,30ex);
+  % CLK — ++(32pt,0) 保持电平, ++(0,±6ex) 跳变
+  \draw[BookAccent,line width=3pt]
+    (0,26ex) -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(20pt,0);
+  \node[BookAccent,left] at (0,23ex) {CLK};
+  % D — 高 13ex, 低 5ex, 每周期 CLK↑前 12pt 建立
+  \draw[BookAmber,line width=3pt]
+    (0,5ex) -- ++(20pt,0) -- ++(0,8ex) -- ++(52pt,0) -- ++(0,-8ex) -- ++(56pt,0)
+            -- ++(0,8ex) -- ++(48pt,0) -- ++(0,-8ex) -- ++(48pt,0)
+            -- ++(0,8ex) -- ++(36pt,0);
+  \node[BookAmber,left] at (0,9ex) {D};
+  % Q — 高 -2ex, 低 -9ex, CLK↑后 tCQ=12pt 延迟
+  \draw[BookTeal,line width=3pt]
+    (0,-9ex) -- ++(32pt,0) -- ++(0,7ex) -- ++(64pt,0) -- ++(0,-7ex) -- ++(64pt,0)
+             -- ++(0,7ex) -- ++(64pt,0) -- ++(0,-7ex) -- ++(36pt,0);
+  \node[BookTeal,left] at (0,-5.5ex) {Q};
+  % Setup/hold 窗口 — 填充矩形标注
+  \foreach \x in {20,76,132,188} {\fill[BookRed!25]  (\x pt, 19.5ex) rectangle (\x+12 pt, 26.5ex);}
+  \foreach \x in {32,96,160,224} {\fill[BookAmber!25] (\x pt, 19.5ex) rectangle (\x+12 pt, 26.5ex);}
+  \node[BookRed,right,font=\small]   at (32pt,28ex) {\code{t_{su}}};
+  \node[BookAmber,right,font=\small] at (44pt,28ex) {\code{t_h}};
+\end{waveform}
+\diagramnote{建立/保持时间窗口。D 必须在时钟沿前后保持稳定。}
+
+
+\section{二、触发器、时钟周期与采样窗口}
+
+触发器解决的是“什么时候写入”的问题。它不像锁存器那样在一段时间内透明，而是在时钟沿附近采样输入，把采样值保存到输出。
+
+\begin{lstlisting}
+on clock edge:
+  Q = D
+between clock edges:
+  Q holds
+\end{lstlisting}
+
+这让大电路有了清楚节奏。一个时钟沿之后，上一批触发器输出新状态；这些状态经过组合逻辑传播，形成下一批输入；到下一个时钟沿，目标触发器再统一采样。于是“计算”和“保存”被分开了。
+
+以 74HC74 这类双 D 触发器为例，D 是待采样数据，CP 或 CLK 是采样边界，Q 是保存后的输出，异步置位和异步清零用于把状态强制带到已知值。它的引脚命名迫使设计者区分三件事：数据是否已经准备好，时钟边沿是否合格，异步控制脚是否处于安全状态。若 D 在边沿附近变化，触发器不保证采样结果；若清零脚悬空，触发器可能在电源噪声中被误复位；若时钟来自未消抖按钮，单次按压可能被解释成多个边沿。
+
+\begin{chipcase}
+把 74HC74 接成最小实验电路时，应把异步置位和异步清零接到确定无效电平或受控复位，D 端由开关、组合逻辑或前级触发器驱动，CP 端只能接经过整形的时钟。若用按钮作为单步时钟，按钮必须先经过上拉/下拉、消抖和施密特整形；否则一次机械按压可能产生多个有效边沿，使 Q 连续翻转或连续采样。这个案例说明，\hwtiming{时钟边沿质量}与逻辑功能同等重要。
+\end{chipcase}
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+触发器对象 & 正确理解 & 常见误解 \\
+\midrule
+D 输入 & 下一个边界要保存的候选值 & 只要最终正确，何时稳定都无所谓 \\
+CLK/CP & 状态提交的边界 & 任意跳变都可以当时钟 \\
+Q 输出 & 已提交的当前状态 & 和 D 必须随时相等 \\
+异步复位/置位 & 不等时钟即可强制状态 & 可悬空或随意接按钮 \\
+数据手册时序 & 建立、保持、脉宽、传播延迟合同 & 只在高频设计才需要阅读 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=2.0cm,y=1.6cm]
+  \node[draw, rectangle, minimum width=2.2cm, minimum height=1.8cm, fill=BookCodeBg, rounded corners=3pt] (ff) at (0,0) {};
+  \node[above=0.12cm of ff, font=\small\color{BookNavy}] {D-FF};
+  \node[left] at ($(ff.west)+(-0.12,0.5)$) {D};
+  \node[left] at ($(ff.west)+(-0.12,-0.5)$) {CLK};
+  \node[right] at ($(ff.east)+(0.12,0.5)$) {Q};
+  \node[right] at ($(ff.east)+(0.12,-0.5)$) {Q'};
+  \draw[BookAccent, very thick] ($(ff.west)+(-0.06,-0.5)$) -- ++(0.22,0) -- ++(0,0.22);
+  \node[below=0.3cm of ff, font=\footnotesize, BookAccent] {上升沿采样};
+\end{block}
+\diagramnote{D 触发器方框符号：只在时钟上升沿采样 D 并保存到 Q。}
+\vspace{0.8em plus 0.25em}
+
+最常见的同步路径可以写成：
+
+\begin{lstlisting}
+source register -> combinational logic -> destination register
+\end{lstlisting}
+\vspace{1.0em plus 0.35em}
+
+时钟沿到来后，源寄存器输出旧状态对应的新值。这个值进入组合逻辑，经过门延迟和布线延迟，最终到达目标寄存器输入。下一个时钟沿到来时，目标寄存器采样这个结果。因此频率不是越高越好。频率提高意味着周期缩短，留给组合逻辑稳定的时间变少。若周期短到最慢路径来不及稳定，目标寄存器就可能采到旧值、过渡值或错误值。
+
+同步设计的关键，是区分\hwkey{当前状态}和\hwkey{下一状态}。当前状态存在于源寄存器 Q 端，下一状态存在于目标寄存器 D 端。组合逻辑可以在整个周期内反复变化，直到输入稳定、路径传播完成、D 端满足建立时间；但只有时钟沿到来，D 才会成为新的 Q。用软件赋值类比硬件时，最容易犯的错误是把 D 端的临时变化当成已经写入。硬件没有“变量立即更新”的全局瞬间，只有被状态元件定义出来的提交边界。
+
+阅读触发器数据手册时，至少要把四类时间参数分开。第一，时钟到输出延迟说明源状态何时对后级可见。第二，建立时间和保持时间说明目标触发器允许 D 端怎样靠近采样沿。第三，时钟高电平、低电平和脉冲宽度说明怎样的波形才算合格时钟。第四，异步复位或置位的脉宽、恢复时间和释放时间说明复位不能随意撤销。即使低速面包板实验看起来“肉眼很慢”，按钮抖动、慢边沿和悬空输入仍然可能违反这些合同。
+
+\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.3\linewidth}}
+\toprule
+数据手册项目 & 应回答的问题 & 板上故障表现 \\
+\midrule
+时钟到输出延迟 & Q 何时能作为后级输入使用 & 后级过早采样旧值或过渡值 \\
+建立/保持时间 & D 在边沿前后要稳定多久 & 偶发采错、亚稳态或重复触发 \\
+最小时钟脉宽 & CP 高低电平是否足够长 & 窄脉冲被忽略或产生异常采样 \\
+复位恢复时间 & 复位释放离时钟沿是否过近 & 复位后状态机随机进入非入口状态 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+
+触发器采样也不是数学瞬间。输入 D 必须在时钟沿到来前稳定一小段时间，这称为建立时间；时钟沿之后还要继续稳定一小段时间，这称为保持时间。
+
+\begin{longtable}{L{0.22\linewidth}L{0.42\linewidth}L{0.26\linewidth}}
+\toprule
+约束 & 含义 & 违反后果 \\
+\midrule
+建立时间 & 采样前输入要提前稳定 & 采到错误值或不稳定值 \\
+保持时间 & 采样后输入要继续稳定 & 新旧值混入采样窗口 \\
+传播延迟 & 上一级输出和组合逻辑需要时间 & 周期太短会来不及 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=1.6cm,y=1.6cm]
+  \node[hw compute, minimum width=2.0cm] (tcq) {tCQ};
+  \node[hw compute, right=0.45cm of tcq, minimum width=3.0cm] (tcomb) {组合逻辑};
+  \node[hw compute, right=0.45cm of tcomb, minimum width=1.8cm] (twire) {连线};
+  \node[hw compute, right=0.45cm of twire, minimum width=1.6cm] (tsu) {tSU};
+  \node[hw compute, right=0.45cm of tsu, minimum width=1.6cm] (tskew) {偏斜+余量};
+  \node[hw label, below=0.3cm of tcq] {0.8ns};
+  \node[hw label, below=0.3cm of tcomb] {3.6ns};
+  \node[hw label, below=0.3cm of twire] {0.7ns};
+  \node[hw label, below=0.3cm of tsu] {0.4ns};
+  \node[hw label, below=0.3cm of tskew] {0.5ns};
+  \draw[hw bus] (tcq.west) -- ++(-0.6,0) node[left,hw label]{CLK};
+  \draw[hw bus] (tskew.east) -- ++(0.6,0) node[right,hw label]{CLK};
+  \draw[BookMuted, decorate, decoration={brace,amplitude=5pt,raise=2pt}] (tcq.north west) -- (tskew.north east) node[midway,above=12pt,BookAccent,font=\small] {Tclk $\geq$ 6.0ns};
+\end{block}
+\diagramnote{时钟周期预算：各段时间之和决定最小周期。}
+\vspace{0.8em plus 0.25em}
+
+一条路径的周期账本可以写成：
+
+\begin{lstlisting}
+clock period >= source clock-to-Q
+              + combinational delay
+              + wire delay
+              + destination setup time
+\end{lstlisting}
+
+更严谨地写，还要把时钟偏斜和余量纳入公式。若目标触发器的时钟沿比源触发器更早到达，有效可用时间会变少；若目标时钟更晚到达，建立时间压力可能减轻，但保持时间压力可能增加。为了保持第一轮理解清晰，可以先把建立约束写成：
+
+\begin{lstlisting}
+Tclk >= tCQ_max + tcomb_max + twire_max + tsetup + tskew + margin
+\end{lstlisting}
+
+其中 \code{tCQ_max} 是源触发器时钟到输出的最大时间，\code{tcomb_max} 是组合逻辑最大延迟，\code{twire_max} 是布线最大延迟，\code{tsetup} 是目标触发器建立时间，\code{tskew} 表示不利时钟偏斜，\code{margin} 是留给电压、温度、工艺、建模误差和老化的余量。建立约束回答“最慢结果能否赶上下一个采样沿”。
+
+\begin{longtable}{L{0.2\linewidth}L{0.2\linewidth}L{0.5\linewidth}}
+\toprule
+项目 & 示例数值 & 读法 \\
+\midrule
+\code{tCQ_max} & 1.2ns & 源寄存器输出最晚 1.2ns 后有效 \\
+\code{tcomb_max} & 5.8ns & 组合逻辑最坏传播时间 \\
+\code{twire_max} & 0.9ns & 远距离连线和负载引入延迟 \\
+\code{tsetup} & 0.6ns & 目标寄存器采样前要求 \\
+\code{tskew+margin} & 0.5ns & 偏斜和工程余量 \\
+合计 & 9.0ns & 时钟周期必须不小于 9.0ns \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=2.0cm,y=1.6cm]
+  \node[draw, dashed, rounded corners, inner sep=8pt, label={[hw label]above:异步输入}] (rst_in) {外部复位};
+  \node[hw state, right=1.2cm of rst_in, label={[hw label]above:第一级}] (ff1) {FF$_1$};
+  \node[hw state, right=1.2cm of ff1, label={[hw label]above:第二级}] (ff2) {FF$_2$};
+  \node[hw control, right=1.2cm of ff2, label={[hw label]above:同步输出}] (ctrl) {同步复位};
+  \draw[hw bus] (rst_in) -- (ff1) node[below,hw label,pos=0.5]{异步拉入};
+  \draw[hw bus] (ff1) -- (ff2) node[below,hw label,pos=0.5]{同步释放};
+  \draw[hw bus] (ff2) -- (ctrl) node[below,hw label,pos=0.5]{边界对齐};
+  \node[below=0.3cm of ff1, hw label] {D=1};
+  \node[below=0.3cm of ff2, hw label] {D=Q$_1$};
+\end{block}
+\diagramnote{异步拉入、同步释放的复位电路。}
+\vspace{0.8em plus 0.25em}
+
+若目标频率要求周期为 8ns，上表路径就不合格。修复方式不是在公式里删除余量，而是缩短组合逻辑、增加寄存器边界、改善布局布线、换用更快单元、降低频率，或重新安排微操作。同步设计的严肃性在于：功能真值表通过，仅能说明最终会算对；时序账本通过，才说明能在规定边界前算对。
+
+保持时间看起来更小，却同样危险。若源寄存器输出太快、路径太短，目标寄存器可能在同一个时钟沿之后立刻看到新值，从而破坏它本应采旧值的窗口。长路径会限制最高频率，短路径也可能破坏保持约束。
+
+保持约束可以按最小延迟理解：
+
+\begin{lstlisting}
+tCQ_min + tcomb_min + twire_min >= thold + unfavorable_skew
+\end{lstlisting}
+
+这条式子回答“新值是否来得太早”。例如源触发器最快 0.1ns 就改变 Q，路径中几乎没有组合逻辑，布线也很短，而目标触发器要求保持 0.3ns；若时钟偏斜又让目标采样沿相对更晚，那么新值可能在目标仍需要旧值稳定时抵达。修复保持问题的常见手段是插入小延迟、调整布线、改变时钟树或重新放置寄存器。它和建立问题方向相反：建立嫌路径太慢，保持嫌路径太快。
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+约束类型 & 失败方向 & 常见修复 \\
+\midrule
+建立约束 & 最慢路径太慢，赶不上采样沿 & 缩短组合逻辑、流水线化、降频、优化布局 \\
+保持约束 & 最快路径太快，冲入采样窗口 & 增加最小延迟、调整时钟偏斜、改变布线 \\
+复位释放 & 状态元件退出复位不一致 & 异步拉入、同步释放、限定复位域 \\
+跨时钟输入 & 采样沿附近输入不受控 & 两级同步、握手、异步 FIFO 或协议化采样 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+
+\begin{waveform}[x=2pt,y=6ex]
+  \draw[BookRule!20,step=20pt] (0,-12ex) grid (260pt,30ex);
+  % CLK — ++(32pt,0) 保持电平, ++(0,±6ex) 跳变
+  \draw[BookAccent,line width=3pt]
+    (0,26ex) -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(20pt,0);
+  \node[BookAccent,left] at (0,23ex) {CLK};
+  % D — 高 13ex, 低 5ex, CLK↑前 12pt 建立
+  \draw[BookAmber,line width=3pt]
+    (0,5ex) -- ++(20pt,0) -- ++(0,8ex) -- ++(52pt,0) -- ++(0,-8ex) -- ++(188pt,0);
+  \node[BookAmber,left] at (0,9ex) {D};
+  % Q — 高 -2ex, 低 -9ex, CLK↑后 tCQ=12pt 才变化
+  \draw[BookTeal,line width=3pt]
+    (0,-9ex) -- ++(44pt,0) -- ++(0,7ex) -- ++(64pt,0) -- ++(0,-7ex) -- ++(152pt,0);
+  \node[BookTeal,left] at (0,-5.5ex) {Q};
+  % 测量标注
+  \draw[BookRed,line width=1.2pt,<->]
+    (32pt,17ex) -- node[above=1pt,font=\scriptsize\bfseries,BookRed]{\code{tCQ}} (44pt,17ex);
+  \draw[BookAmber,line width=1.2pt,<->]
+    (44pt,17ex) -- node[above=1pt,font=\scriptsize\bfseries,BookAmber]{组合逻辑延迟} (96pt,17ex);
+  \draw[BookTeal,line width=1.2pt,<->]
+    (96pt,17ex) -- node[above=1pt,font=\scriptsize\bfseries,BookTeal]{\code{tSU}} (108pt,17ex);
+\end{waveform}
+\diagramnote{\code{tCQ} + 组合逻辑延迟 + \code{tSU} = 最小时钟周期。}
+
+
+
+\section{三、关键路径、复位与跨边界输入}
+
+一块同步电路里会有很多寄存器到寄存器路径。最长、最慢、最限制周期的那条叫关键路径。它可能是一串加法器，也可能是多级选择器，也可能是远距离布线加上复杂译码。
+
+例如一个 32-bit 串行进位加法器接在两个寄存器之间。最低位进位要一位一位传到最高位，最高位结果最后才稳定。如果把这个加法器放在一个周期里完成，那么周期至少要等最坏进位链走完。若把运算拆成更短的几段，中间插入寄存器，单个周期可以变短，但完成一次完整运算需要更多周期。
+
+关键路径不只来自“算术看起来复杂”的地方。一个很宽的 mux、远距离控制线、解码后再进入选择器的路径、寄存器堆读口到 ALU 再到写回选择器的路径，都可能成为限制频率的对象。真实 CPU 中，很多优化不是改变逻辑功能，而是重新安排边界：把一次长动作拆成取指、译码、执行、访存、写回；把全局信号改成本地译码；把长总线切成更短的局部通路。时序账本让这些选择可以比较，而不是靠直觉判断“这条线应该很快”。
+
+在整机视角下，8086、80386 和现代处理器都在反复处理同一个问题：哪些动作放在一个边界之间完成，哪些动作必须切成多个边界。8086 的外部总线周期把地址、控制和数据分成若干相位；80386 的 32-bit 数据通路、分页地址转换和总线接口让路径更宽、更复杂，因此必须更严格地区分内部状态、外部总线状态和等待状态；现代 CPU 则进一步把取指、译码、重命名、执行、访存和提交拆成流水阶段。它们规模不同，但工程判断相同：若一条路径太长，就要缩短组合逻辑、增加状态边界或改变协议等待方式。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+案例 & 可能形成长路径的位置 & 常用处理 \\
+\midrule
+8-bit/16-bit 板级 CPU & 外部总线、地址锁存、存储器访问 & 用总线相位和等待状态分步完成 \\
+80386 类 32-bit 处理器 & 宽数据通路、地址转换、总线控制 & 增加内部阶段和更明确的控制状态 \\
+现代乱序 CPU & 预测、调度、执行、cache 访问、提交 & 流水线、局部化、cache 层次和旁路网络 \\
+FPGA/ASIC 数据通路 & 宽 mux、长连线、加法器链、译码扇出 & 插入寄存器、重定时、局部译码和布局优化 \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{L{0.24\linewidth}L{0.34\linewidth}L{0.32\linewidth}}
+\toprule
+结构选择 & 好处 & 代价 \\
+\midrule
+一周期完成长运算 & 控制简单，单条动作周期数少 & 关键路径长，频率低 \\
+拆段插入寄存器 & 单周期路径短，频率可能高 & 完成一次动作需要更多边界 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=2.0cm,y=1.6cm]
+  \node[draw, dashed, rounded corners, inner sep=8pt, minimum width=1.6cm, label={[hw label]above:异步输入域}] (async) {外部事件};
+  \node[hw state, right=1.6cm of async, label={[hw label]above:第一级同步}] (ff1) {FF$_1$};
+  \node[hw state, right=1.4cm of ff1, label={[hw label]above:第二级同步}] (ff2) {FF$_2$};
+  \node[draw, dashed, rounded corners, inner sep=8pt, right=1.6cm of ff2, minimum width=1.8cm, label={[hw label]above:目标时钟域}] (sync) {同步后信号};
+  \draw[hw bus] (async) -- (ff1) node[below,hw label,pos=0.5]{可能亚稳态};
+  \draw[hw bus] (ff1) -- (ff2) node[below,hw label,pos=0.5]{恢复时间};
+  \draw[hw bus] (ff2) -- (sync) node[below,hw label,pos=0.5]{稳定输出};
+  \node[below=0.3cm of ff1, BookRed, font=\small] {meta};
+  \node[below=0.3cm of ff2, BookTeal, font=\small] {sync};
+\end{block}
+\diagramnote{两级触发器同步器结构。}
+\vspace{0.8em plus 0.25em}
+
+触发器通电后的值不一定符合设计预期。若一组状态寄存器随机落在不同值，后面的组合逻辑可能立刻进入非法状态。复位信号的作用，是把关键状态单元带到已知点，例如计数器清零、状态机回到 idle、控制寄存器进入安全默认值。
+
+并不是所有触发器都必须复位。控制状态、外部使能、写存储器信号、片选、错误标志和协议状态通常需要复位，因为它们会决定机器是否对外产生动作；纯数据缓冲如果有可靠写使能保护，未必需要每一位都在复位时清零。过度复位会增加布线、负载和时序压力，尤其在大规模芯片中会让复位网络本身变成困难对象。因此，复位设计不是“全清零”，而是列出哪些状态必须已知、哪些输出必须安全、哪些数据可以等第一次有效写入后再使用。
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+状态对象 & 通常是否复位 & 判断依据 \\
+\midrule
+控制状态机 & 是 & 必须有唯一入口和安全输出 \\
+外部写使能/片选 & 是 & 上电和复位期间不能误写外设或存储器 \\
+计数器/超时器 & 通常是 & 初始计数影响协议等待和超时判断 \\
+流水数据寄存器 & 视情况而定 & 若有 valid 位保护，数据位可等首次有效写入 \\
+同步器与 pending 位 & 是 & 复位释放不能制造伪事件 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=1.8cm,y=1.5cm]
+  \node[hw compute, minimum width=2.2cm] (mux) {MUX};
+  \node[hw state, right=1.0cm of mux, minimum width=2.0cm] (ff) {D-FF};
+  \draw[hw bus] (ff.east) -- ++(0.8,0) node[right] (q_out) {Q};
+  \draw[hw bus] (q_out) |- ++(0,1.2) -| (mux.south) node[pos=0.7, above right, hw label, BookTeal] {反馈};
+  \draw[hw bus] (mux) -- (ff) node[above, hw label, pos=0.5]{D};
+  \draw[hw bus] (mux.west) -- ++(-0.8,0) node[left]{D$_{in}$};
+  \node[hw control, below=0.8cm of mux, minimum width=1.4cm] (we) {WE};
+  \draw[hw bus] (we.north) -- ($(we.north)+(0,0.34)$) -| (mux.south) node[pos=0.78, above right, hw label]{选择};
+  \node[below=0.3cm of we, hw label] {0=保持, 1=写入};
+\end{block}
+\diagramnote{写使能寄存器：数据路径决定写入或保持。}
+\vspace{0.8em plus 0.25em}
+
+复位本身也要讲边界。
+
+若复位释放时，有的触发器先退出复位，有的后退出复位，状态机可能看到一半新状态、一半旧状态。常见处理是异步拉入复位以便快速进入安全状态，再同步释放，让所有相关触发器在清楚的时钟边界恢复工作。复位不能简化为“清零所有东西”。哪些状态需要复位，哪些数据寄存器可以不复位，哪些输出在复位期间必须安全，都要由硬件需求决定。
+
+跨时钟或来自外部世界的输入还会带来亚稳态。若输入 D 正好在时钟沿附近变化，触发器内部节点可能短时间落在不稳定区域，既不像明确 0，也不像明确 1。多数情况下，它会在一小段时间后落回 0 或 1，但落回哪边、需要多久，不能按普通组合逻辑精确保证。因此来自另一个时钟节奏或外部世界的信号，不能直接拿来控制大面积电路，通常要先经过同步结构，降低亚稳态扩散概率。
+
+最常见的单 bit 同步结构是两级触发器串联。第一级直接采样异步输入，可能进入亚稳态；第二级在下一个时钟沿再采样第一级输出，给第一级更多时间恢复到明确 0 或 1。两级同步不能从数学上消灭亚稳态，但能显著降低亚稳态传播到后级控制逻辑的概率。多 bit 数据不能简单地每一位各接两级同步后直接使用，因为各位可能在不同周期被采到，形成混合值；多 bit 跨边界通常要使用握手、有效位、灰码计数器或异步 FIFO。
+
+工程上常用 \term{平均无故障时间}{MTBF, Mean Time Between Failures} 描述亚稳态风险是否可接受。它不是功能真值表，而是可靠性口径：异步输入变化越频繁、目标时钟越快，触发器遇到采样窗口的机会越多；留给第一级同步器恢复的时间越长，亚稳态传播到第二级之后的概率越低。因此，提高同步级数、降低异步事件频率、给同步器留出完整周期、避免在同步器后面接复杂组合逻辑，都能改善可靠性。严肃设计不会声称“两级同步一定安全”，而是说明在目标频率、输入事件频率和器件参数下，失效率是否满足系统要求。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+MTBF 影响因素 & 对可靠性的影响 & 设计含义 \\
+\midrule
+目标时钟频率 & 采样次数越多，遇到危险窗口机会越多 & 高频域更需要规范同步结构 \\
+异步事件频率 & 输入变化越频繁，触发亚稳态机会越多 & 高频事件应使用握手或 FIFO \\
+恢复时间 & 两级触发器之间时间越充足，传播概率越低 & 同步器后不应接长组合路径再采样 \\
+器件特性 & 触发器恢复参数决定概率下降速度 & 应使用目标工艺或芯片数据手册口径 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=1.8cm,y=1.5cm]
+  \node[hw compute, minimum width=2.4cm] (add) {+1};
+  \node[hw state, right=1.0cm of add, minimum width=2.2cm] (ff) {4-bit 寄存器};
+  \draw[hw bus] (add) -- (ff) node[above, hw label, pos=0.5]{next};
+  \draw[hw bus] (ff.east) -- ++(0.6,0) node[right] (q) {Q[3:0]};
+  \draw[hw bus] (q) |- ++(0,1.2) -| (add.north) node[pos=0.7, above right, hw label, BookTeal] {当前值};
+  \node[hw control, below=0.8cm of add, minimum width=1.4cm] (en) {EN};
+  \draw[hw bus] (en.north) -- ($(en.north)+(0,0.34)$) -| (add.south) node[pos=0.78, below right, hw label]{使能};
+  \node[below=0.3cm of en, hw label] {0=保持, 1=加一};
+\end{block}
+\diagramnote{4-bit 同步计数器。}
+\vspace{0.8em plus 0.25em}
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+跨边界对象 & 推荐处理 & 不当处理的风险 \\
+\midrule
+单 bit 按钮/中断 & 两级同步后再进入状态机 & 亚稳态扩散或一次事件被识别多次 \\
+多 bit 数据总线 & 使用握手、valid/ready 或 FIFO & 各 bit 来自不同采样时刻，形成错误编码 \\
+复位释放 & 异步拉入、同步释放 & 状态机部分触发器先运行 \\
+脉冲信号 & 转换为电平握手或拉宽后同步 & 窄脉冲被漏采或重复采样 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=2.0cm,y=1.6cm]
+  \node[hw state, minimum width=3.2cm, minimum height=1.0cm, label={[hw label]above:8-bit 移位寄存器}] (shift) {};
+  \node[hw memory, right=1.0cm of shift, minimum width=3.2cm, minimum height=1.0cm, label={[hw label]above:8-bit 输出锁存}] (latch) {};
+  \node[right=0.5cm of latch] (q) {Q$_0$..Q$_7$};
+  \draw[hw bus] (shift) -- (latch) node[above, hw label, pos=0.5]{8-bit};
+  \draw[hw bus] (latch) -- (q);
+  \draw[hw bus] (shift.west) -- ++(-0.6,0) node[left]{DS};
+  \node[below=0.35cm of shift, hw label] {SHCP 移位};
+  \node[below=0.35cm of latch, hw label] {STCP 锁存};
+\end{block}
+\diagramnote{74HC595：移位寄存器与输出锁存器分开。}
+\vspace{0.8em plus 0.25em}
+
+安全启动控制板中的 \code{start_request} 可以作为例子。按钮原始触点先经过默认电平、保护和消抖，得到板内稳定请求；若后级控制器是同步状态机，这个请求还要在控制器时钟域内同步，状态机只能使用同步后的 \code{start_request_sync}。这样第一章的“可靠 bit”与本章的“可靠采样边界”才真正接上：前者解决电平和路径，后者解决保存时刻。
+
+\begin{chipcase}
+用 74HC14 和 74HC74 可以搭出一个完整的单 bit 跨边界入口。
+
+74HC14 负责把按钮或慢边沿信号整形成确定翻转的逻辑电平，74HC74 的两级触发器负责把该电平带入目标时钟域。若后级是计数器或状态机，只允许使用第二级 Q；第一级 Q 是给亚稳态恢复留时间的内部边界，不应直接参与控制。这个小电路比“按钮直接接计数器 CP”更接近真实机器的输入入口。
+\end{chipcase}
+
+\topic{专题：从外部事件到同步状态机}
+
+许多同步电路的故障并不发生在核心状态机内部，而是发生在外部事件进入状态机之前。按钮、传感器、限位开关、中断线、另一片芯片的 ready 信号，都可能在本时钟域的任意时刻变化。若把这些信号直接接到状态机输入，设计等于默认外部世界服从本时钟的建立时间和保持时间；这个默认在真实硬件中通常不成立。
+
+可以把外部事件进入同步状态机的链路写成六段：
+
+\begin{lstlisting}
+raw pin
+  -> electrical default and protection
+  -> filtering or debounce
+  -> level normalization
+  -> clock-domain synchronization
+  -> event detection or handshake
+  -> FSM consumption
+\end{lstlisting}
+
+第一段处理电气边界。原始引脚不能悬空，不能让过压、静电或长线干扰直接进入芯片内部；上拉、下拉、限流、钳位、RC 滤波和施密特输入都属于这一层。第二段处理物理抖动或噪声。按钮按下不是一个理想阶跃，可能在数毫秒内多次跳变；传感器线缆也可能受到干扰。第三段把电平极性转成内部语义，例如把低有效的 \code{start_n} 转成高有效的 \code{start_pressed}。
+
+第四段才进入本章的核心：同步。一个单 bit 电平在消抖后仍然是异步输入，因为它的变化时刻不由目标时钟决定。两级同步器给第一级触发器留下恢复时间，降低亚稳态传播概率。同步后的信号仍然只是“本时钟域看到的电平”，若状态机需要的是一次事件，还必须再做边沿检测、事件保持或握手确认。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+链路阶段 & 解决的问题 & 不能替代的内容 \\
+\midrule
+默认电平与保护 & 悬空、过压、静电和异常电流 & 不能保证采样时刻安全 \\
+滤波与消抖 & 机械抖动、窄噪声、线缆干扰 & 不能消除跨时钟亚稳态 \\
+语义归一化 & 低有效、高有效和断线默认含义 & 不能证明事件只发生一次 \\
+两级同步 & 单 bit 异步电平进入目标时钟域 & 不能直接处理多 bit 一致性 \\
+边沿检测 & 把同步电平转换成单周期事件 & 不能保证目标状态机一定接受 \\
+握手或事件保持 & 事件持续到被消费并确认 & 不能替代前面的电气保护 \\
+\bottomrule
+\end{longtable}
+
+以安全启动按钮为例，较完整的命名应当区分每一层信号：
+
+\begin{lstlisting}
+start_button_raw       // 引脚上的原始电平
+start_button_filtered  // 经过默认电平、保护和消抖
+start_pressed          // 归一化后的语义电平
+start_pressed_meta     // 第一级同步器输出
+start_pressed_sync     // 第二级同步器输出
+start_event            // 本时钟域检测到的一次请求
+start_pending          // 等待状态机消费的保持事件
+\end{lstlisting}
+
+这些名字不是形式主义，而是调试边界。若示波器看到 \code{start_button_raw} 抖动，问题属于电气或消抖；若 \code{start_pressed_sync} 偶发异常，重点检查同步器、时钟域和亚稳态扩散；若 \code{start_event} 出现两次，重点检查边沿检测和消抖窗口；若 \code{start_event} 只有一次但状态机没有启动，重点检查 \code{start_pending}、状态转移条件和消费确认。
+
+事件保持尤其重要。假设同步后的 \code{start_event} 只有一个时钟周期，而状态机当前处在 \code{RESET_WAIT} 或 \code{FAULT}，这个事件可能被漏掉。更稳妥的做法是让事件进入 \code{start_pending} 寄存器，直到状态机在允许启动的状态下消费它，再由 \code{start_ack} 清除。
+
+\begin{lstlisting}
+on clock edge:
+  if reset:
+    start_pending = 0
+  else if start_event:
+    start_pending = 1
+  else if start_ack:
+    start_pending = 0
+\end{lstlisting}
+
+这段逻辑说明，外部事件不是直接驱动危险输出，而是先转化为本时钟域内的状态。状态机可以在 \code{IDLE} 中消费 \code{start_pending}，在 \code{FAULT} 中忽略或保留它，在复位期间清除它。这样，事件、状态和安全策略都落在时钟边界上，而不是落在一根不受控的外部线上。
+
+\begin{warningbox}
+两级同步器只适合单 bit 控制电平或事件标志。若外部输入是 8-bit 数据、地址、计数值或编码状态，逐位接两级同步器不能保证各位来自同一个源时刻。多 bit 跨域必须使用握手、有效信号加稳定保持、格雷码计数器或异步 FIFO 等协议。
+\end{warningbox}
+
+对一个外部事件链路进行验收，可以要求留下四类证据。第一，电气证据：默认电平、保护、电压范围和抖动处理。第二，同步证据：进入哪个时钟域、几级同步、复位后同步器处于什么默认状态。第三，事件证据：电平如何变成一次事件，事件是否保持到被消费。第四，状态机证据：哪些状态接受事件，哪些状态拒绝事件，拒绝时事件清除还是保留。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+验收证据 & 应写入设计说明的内容 & 典型失败模式 \\
+\midrule
+电气证据 & 上拉/下拉、保护、消抖时间、有效电平范围 & 悬空、抖动、多次触发 \\
+同步证据 & 目标时钟域、同步级数、复位默认值 & 亚稳态扩散、复位后伪事件 \\
+事件证据 & 边沿检测、事件保持、确认清除 & 窄脉冲漏采或重复消费 \\
+状态机证据 & 接受状态、拒绝状态、安全输出和错误处理 & 故障状态误启动或请求丢失 \\
+\bottomrule
+\end{longtable}
+
+这个专题把第一章的电气可靠性、本章的同步边界和后续控制器的状态消费连接在一起。对硬件工程而言，“外部输入已经变成 0/1”不是终点；只有当它被目标时钟域可靠采样、被事件协议保持、被状态机按安全条件消费之后，它才成为可用于控制机器动作的内部事实。
+
+\begin{waveform}[x=2pt,y=6ex]
+  \draw[BookRule!20,step=20pt] (0,-18ex) grid (260pt,34ex);
+  % CLK
+  \draw[BookAccent,line width=3pt]
+    (0,28ex) -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(32pt,0) -- ++(0,-6ex) -- ++(32pt,0) -- ++(0,6ex)
+             -- ++(20pt,0);
+  \node[BookAccent,left] at (0,25ex) {CLK};
+  % Async input
+  \draw[BookAmber,line width=3pt]
+    (0,11ex) -- ++(80pt,0) -- ++(0,6ex) -- ++(120pt,0) -- ++(0,-6ex) -- ++(60pt,0);
+  \node[BookAmber,left] at (0,14ex) {async input};
+  % FF1 — 有亚稳态振荡
+  \draw[BookRed,line width=3pt]
+    (0,-2ex) -- ++(32pt,0) -- ++(0,8ex) -- ++(48pt,0);
+  \draw[BookRed,dashed,line width=3pt]
+    (80pt,6ex) .. controls (92pt,10ex) and (108pt,0ex) .. (120pt,4ex);
+  \draw[BookRed,line width=3pt]
+    (120pt,4ex) -- ++(40pt,0) -- ++(0,-6ex) -- ++(40pt,0);
+  \draw[BookRed,dashed,line width=3pt]
+    (200pt,-2ex) .. controls (212pt,3ex) and (228pt,10ex) .. (240pt,4ex);
+  \draw[BookRed,line width=3pt] (240pt,4ex) -- ++(20pt,0);
+  \node[BookRed,left] at (0,2ex) {FF$_1$ (meta)};
+  % FF2 — 稳定同步输出
+  \draw[BookTeal,line width=3pt]
+    (0,-14ex) -- ++(120pt,0) -- ++(0,6ex) -- ++(120pt,0) -- ++(0,-6ex) -- ++(20pt,0);
+  \node[BookTeal,left] at (0,-11ex) {FF$_2$ (sync)};
+  % Annotations
+  \node[BookRed,font=\small]   at (100pt,32ex)  {亚稳态};
+  \node[BookTeal,font=\small\bfseries] at (160pt,-17ex) {稳定输出};
+\end{waveform}
+\diagramnote{两级同步器波形：第一级可能亚稳态，第二级输出稳定。}
+
+
+\section{四、寄存器、计数器与移位结构}
+
+一个触发器保存 1 bit。把多个触发器并排，并让它们共享同一个时钟边界，就得到多 bit 寄存器。寄存器可以理解为一组共享时钟和写使能的触发器。若写使能有效，在时钟沿采样输入；若写使能无效，保持原值。
+
+\begin{lstlisting}
+on clock edge:
+  if write_enable:
+    Q = D
+  else:
+    Q holds
+\end{lstlisting}
+
+
+
+寄存器的意义不只是“能存数”。它把连续传播的组合逻辑切成离散步骤。上一个周期的结果在寄存器输出端稳定存在，成为本周期组合逻辑的输入；本周期算出的结果，要到下一个时钟沿才成为新的状态。共享同一提交边界是关键：寄存器保存的是同一个边界上的一组 bit，不是一位一位随意变化。
+
+多 bit 寄存器还承担“原子提交”的角色。若一个 8-bit 状态表示 \code{01111111} 到 \code{10000000} 的变化，多个 bit 会同时改变；后级逻辑应在同一个时钟边界之后看到新状态，而不是看到一部分旧 bit、一部分新 bit。若这些 bit 来自同一组触发器，时钟边界和传播延迟可以被统一分析；若它们来自不同异步来源，后级就可能看到不存在于设计语义中的混合值。因此，寄存器不只是若干触发器的并排复制，而是一个“这些 bit 同属一个提交时刻”的合同。
+
+写使能寄存器通常有两种实现方式。第一种是在触发器前放数据选择器：使能为 1 时选择新数据，使能为 0 时选择旧 Q 反馈；第二种是使用器件或标准单元内部提供的 enable 触发器。两者的目标都是让时钟边界仍然存在，只是决定这个边界保存新值还是旧值。把 enable 直接拿去切时钟看起来也能保持状态，但会把 enable 的毛刺和传播延迟带进时钟树，风险远高于在数据路径上做选择。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+寄存器动作 & 下一值表达 & 硬件含义 \\
+\midrule
+保持 & \code{next = current} & 写回旧 Q 或关闭写使能 \\
+装载 & \code{next = input} & 在边界保存外部或组合结果 \\
+清零 & \code{next = 0} & 同步清零或受控复位路径 \\
+置位 & \code{next = all\_ones} & 标志位、掩码或诊断状态写入 \\
+条件更新 & \code{next = cond ? input : current} & 由控制线决定是否提交 \\
+\bottomrule
+\end{longtable}
+
+计数器的下一值来自当前值加一：
+
+\begin{lstlisting}
+next = current + 1
+on clock edge:
+  current = next
+\end{lstlisting}
+
+
+
+该结构里有反馈，但反馈不是直接绕回去，而是经过加法器，并且被时钟边界切开。若 current 为 3，本周期组合逻辑算出 next 为 4；只有下一个时钟沿到来，寄存器才保存 4。随后组合逻辑再从 4 算出 5。如果没有寄存器边界，\code{current+1} 的结果会立刻回到输入，再加一，再回到输入，电路无法表达“每个周期只增加一次”。
+
+74HC161/74HC163 这类 4-bit 计数器把这种结构做成了可直接使用的芯片。它们通常有时钟、计数使能、并行装载、清零、进位输出和 4 个 Q 输出。计数使能决定是否执行 \code{current+1}，并行装载允许在边界写入外部给定值，进位输出用于把多个计数器级联成更宽的计数器。读这类芯片的数据手册时，不能只看“它会加一”，还要查清楚清零是同步还是异步、装载优先级如何、使能脚无效时是否保持、进位输出何时有效。
+
+\begin{longtable}{L{0.2\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
+\toprule
+计数器引脚/功能 & 对应的状态问题 & 典型用途 \\
+\midrule
+CP/CLK & 哪个边界提交新计数值 & 单步时钟、系统时钟、分频后时钟 \\
+ENP/ENT 等使能 & 本周期是否执行加一 & PC 加一、循环计数、定时等待 \\
+并行装载 & 是否用外部值覆盖加一结果 & 跳转地址、预置计数、状态恢复 \\
+清零/复位 & 初始状态如何确定 & 上电入口、错误恢复、实验复位 \\
+进位输出 & 更宽计数器何时进位 & 级联 8-bit、16-bit 或更宽计数器 \\
+\bottomrule
+\end{longtable}
+
+把两个 4-bit 计数器级联成 8-bit 计数器时，低 4 位的进位不能被理解为普通数据输出。它是高 4 位是否在同一边界加一的控制条件，必须满足高位计数器的使能时序。若把低位 Q 经过随意组合逻辑再驱动高位时钟，就把同步计数器退化成脉动计数器，时序边界会变得难以验收。同步级联的要点是：所有位共享同一个时钟，进位只作为下一状态选择条件。
+
+移位寄存器把一组 bit 向左或向右移动。它可以用于串行输入、串行输出、简单延迟线和位级变换。
+
+\begin{lstlisting}
+next[3] = current[2]
+next[2] = current[1]
+next[1] = current[0]
+next[0] = serial_in
+\end{lstlisting}
+
+
+
+假设 current 为 \code{1010}，\code{serial\_in} 为 1。下一个时钟沿后，寄存器变成 \code{0101}。注意，四个位不是按顺序一个一个搬。组合逻辑同时准备好四个 next 输入，时钟沿到来时一起写入。该例说明状态更新不一定是加法，也可以是重新排列、选择、清零、保持或装载外部输入。
+
+移位结构在整机里非常常见。串行外设把一个引脚上的 bit 流变成内部并行字节，显示驱动把内部字节逐位送到外部，流水线把阶段之间的状态向前推进，调试链把片内状态一位一位移出。74HC595 的移位寄存器与输出锁存器分开，正好说明两级状态边界：移位时钟改变内部移位状态，锁存时钟才改变外部可见输出。这个结构避免了外部 LED 或后级芯片在移位过程中看到中间状态乱跳。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+74HC595 边界 & 发生的状态动作 & 读者应观察到的现象 \\
+\midrule
+\code{SHCP} 边沿 & 串行 bit 进入内部移位寄存器 & 外部输出可保持不变 \\
+连续 8 次移位 & 内部移位状态逐步形成一个字节 & 中间状态不应直接驱动负载语义 \\
+\code{STCP} 边沿 & 内部字节提交到输出锁存器 & Q0 到 Q7 一起更新 \\
+\code{OE_n}/\code{MR_n} & 控制输出驱动和清零默认状态 & 低有效脚必须处于确定电平 \\
+\bottomrule
+\end{longtable}
+
+这一类器件提前引出后续流水线寄存器的思想。流水线寄存器保存的不是单个数，而是一组需要一起前进的状态：数据、控制位、valid 位、异常标志和目的寄存器编号。若只有数据向前移动而控制位没有同步移动，后级就会把一个周期的数据解释成另一个周期的操作。移位寄存器是最简单的“状态随边界推进”模型；CPU 流水线是同一思想在更宽状态集合上的应用。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+结构 & 典型用途 & 验收问题 \\
+\midrule
+普通寄存器 & 保存 ALU 结果、地址、控制字 & 写使能是否只在目标周期打开 \\
+计数器 & PC 加一、循环计数、超时计数 & 使能、清零、装载优先级是否明确 \\
+移位寄存器 & 串并转换、延迟线、输出扩展 & 移位边界和输出锁存边界是否分开 \\
+标志寄存器 & 保存 zero/carry/error 等条件 & 哪些指令或事件会覆盖标志 \\
+\bottomrule
+\end{longtable}
+
+\section{五、状态机把硬件动作切成阶段}
+
+有限状态机由三部分组成：当前状态、输入条件、下一状态逻辑。当前状态保存在寄存器里，组合逻辑根据当前状态和输入条件决定下一状态。
+
+
+设计状态机时，第一步不是写状态名字，而是列出机器必须区分的阶段。若一个控制器要等待请求、装载数据、运行运算、等待外设完成、提交结果，那么这些阶段是否能合并，取决于它们是否需要不同的控制输出和不同的等待条件。第二步才是给阶段编码，并写出每个状态在每种关键输入下的下一状态。第三步是列出输出：哪些输出只由状态决定，哪些输出还依赖输入，哪些输出必须寄存后再送往外部。
+
+一个完整状态机说明至少包含五张账。第一张是状态含义表，说明每个状态代表哪个硬件阶段。第二张是转移表，说明当前状态遇到关键输入后进入哪里。第三张是输出表，说明每个状态打开哪些控制线。第四张是复位和非法状态表，说明上电、复位释放和异常编码如何处理。第五张是波形验收表，说明哪些信号必须在同一周期出现。缺少任何一张，状态机都容易退化成“名字看起来对，但边界不清楚”的草率描述。
+
+\begin{longtable}{L{0.2\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
+\toprule
+状态机账本 & 主要内容 & 缺失后的风险 \\
+\midrule
+状态含义表 & 每个状态对应的硬件阶段 & 状态命名漂亮但动作不明确 \\
+转移表 & 输入条件和下一状态 & 等待、错误和默认分支遗漏 \\
+输出表 & 写使能、片选、ALU 选择、驱动使能 & 控制线在错误周期打开 \\
+复位/非法表 & 入口状态、默认安全输出、恢复路径 & 上电或扰动后进入危险动作 \\
+波形验收表 & 时钟边界上应同时观察的信号 & 最终结果正确但中间周期错误 \\
+\bottomrule
+\end{longtable}
+
+以一个三阶段硬件控制器为例：
+
+\begin{longtable}{L{0.2\linewidth}L{0.32\linewidth}L{0.34\linewidth}}
+\toprule
+当前状态 & 条件 & 下一状态 \\
+\midrule
+IDLE & start=1 & LOAD \\
+LOAD & ready=1 & RUN \\
+RUN & count\_done=1 & DONE \\
+DONE & clear=1 & IDLE \\
+\bottomrule
+\end{longtable}
+
+若当前状态是 IDLE 且 start=0，状态保持 IDLE；若 start=1，下一状态逻辑准备 LOAD，等时钟沿到来后状态寄存器才真正变成 LOAD。状态机因此不会在一个周期里连续越过 IDLE、LOAD、RUN、DONE，它每次只跨过一个明确边界。
+
+上表还不够完整，因为它只写了“去哪里”，没有写“做什么”。若 LOAD 状态要把外部数据装入寄存器，就必须说明 \code{load_reg_we} 在哪个周期为 1；若 RUN 状态要让计数器递减，就必须说明计数使能、ALU 选择和完成条件；若 DONE 状态要向外部报告结果，就必须说明输出是否寄存、ready 信号保持多久、clear 到来前是否允许覆盖结果。状态机设计的核心不是列出状态名称，而是让状态名称、控制输出和被控制的状态元件逐周期对应。
+
+\begin{longtable}{L{0.16\linewidth}L{0.24\linewidth}L{0.26\linewidth}L{0.24\linewidth}}
+\toprule
+状态 & 本周期动作 & 关键输出 & 离开条件 \\
+\midrule
+IDLE & 等待同步后的启动请求 & 关闭写使能与外部驱动 & \code{start_pending=1} \\
+LOAD & 装载输入寄存器或初始计数 & \code{load_we=1} & 输入 ready 或装载完成 \\
+RUN & 执行运算、计数或移位 & \code{run_en=1} & \code{count_done=1} \\
+DONE & 保持结果并等待清除 & \code{done=1}，输出稳定 & \code{clear=1} \\
+\bottomrule
+\end{longtable}
+
+状态机输出可以只由当前状态决定，也可以同时依赖输入。前者输出更稳定，后者反应更快但更容易受输入毛刺影响。基本原则是：状态机不是若干状态名称的集合，而是“状态寄存器 + 下一状态组合逻辑 + 输出组合逻辑”的硬件结构。
+
+Moore 型输出只由当前状态决定，常用于写使能、片选、锁存时钟、功率使能等需要稳定边界的控制线。Mealy 型输出同时依赖状态和输入，响应可能少等一个周期，但输入毛刺也可能被带到控制线。工程上并不是简单规定只能用哪一种，而是按后果分类：危险输出、外部驱动和写存储器信号倾向于寄存或由稳定状态产生；纯内部、已同步且后级还会采样的条件信号，可以在明确时序账本后使用组合依赖。
+
+一个状态表必须覆盖默认情况。若状态是 \code{IDLE}、\code{LOAD}、\code{RUN}、\code{DONE}，而编码使用两个 bit，则四个编码刚好用完；若状态更多或编码留有空洞，未使用编码不能留给综合器或门延迟“自己决定”。安全写法是给下一状态逻辑设置默认恢复路径，例如进入 \code{FAULT}、\code{RESET_WAIT} 或 \code{IDLE}，同时让写使能、外部驱动、片选和功率使能默认为关闭。这样，即使上电扰动、复位释放问题或外部干扰让状态寄存器进入非法编码，电路也不会在非法状态下驱动危险动作。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+状态机对象 & 正文设计问题 & 验收证据 \\
+\midrule
+状态集合 & 机器必须区分哪些阶段 & 状态表覆盖所有阶段和等待条件 \\
+状态编码 & 二进制、one-hot 或显式安全编码 & 未使用编码有恢复路径 \\
+下一状态逻辑 & 每个状态遇到关键输入后去哪里 & 缺省分支不产生危险动作 \\
+输出逻辑 & 哪些控制线在哪些周期有效 & 波形中写使能、片选、驱动使能位置正确 \\
+复位入口 & 上电后从哪个状态开始运行 & 复位期间输出安全，释放后边界清晰 \\
+\bottomrule
+\end{longtable}
+
+把状态机连接到后续 CPU 时，可以把每条控制线都问成一个状态问题：PC 什么时候写入，指令寄存器什么时候装载，寄存器堆写使能在哪个周期打开，ALU 选择哪种运算，存储器读写请求何时有效，外设未 ready 时机器停在哪个状态。若这些问题只用“连线会变成正确值”回答，就没有真正形成控制器；只有把它们落到状态、条件、下一状态和输出时序上，CPU 才能按周期推进。
+
+以最小多周期 CPU 为例，状态机通常至少要区分取指、译码、执行、访存和写回。取指状态打开存储器读请求，并在合适边界装载指令寄存器；译码状态读取寄存器堆并准备立即数；执行状态选择 ALU 运算或计算地址；访存状态等待数据存储器 ready；写回状态打开寄存器堆写使能。若存储器没有 ready，状态机不能假设数据已经存在，而应保持在等待状态并关闭不该打开的写使能。这样，CPU 的每个周期都能落回本章模型：当前状态和寄存器输出经过组合控制，形成下一状态和下一批写入。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+CPU 状态 & 主要控制输出 & 必须保护的边界 \\
+\midrule
+取指 & \code{mem_read}、\code{pc_to_addr}、\code{ir_we} & 指令只在存储器 ready 后装载 \\
+译码 & 寄存器堆读选择、立即数扩展 & 不应写回任何目的寄存器 \\
+执行 & \code{alu_op}、操作数选择、条件判断 & 分支条件和 ALU 结果在采样前稳定 \\
+访存 & \code{mem_read/write}、地址保持 & 外设未 ready 时保持状态和控制线 \\
+写回 & \code{rf_we}、写回数据选择 & 只在目标指令的目标寄存器上打开写使能 \\
+\bottomrule
+\end{longtable}
+
+这种写法也能解释为什么现代芯片会引入更复杂的控制状态和流水阶段。它们不是为了把教材概念复杂化，而是为了缩短关键路径、隐藏等待、保持高吞吐，并让异常、中断、cache miss、分支错误等事件有可恢复边界。无论是 8086 的总线等待状态、80386 的系统控制状态，还是现代 CPU 的提交队列和异常入口，本质上都要回答同一个问题：某个动作在哪个状态被允许，结果在哪个边界对外可见，失败时回到哪个安全状态。
+
+现在硬件已经能够保存一组 bit、按周期加一、按周期移动、按条件切换阶段。下一步要把这些能力用于更大的动作组织：哪些寄存器在这个周期写入，ALU 做哪种运算，哪一路数据被选择，下一阶段去哪里。这就是控制器的基础。
+
+\topic{专题：时钟、复位、状态编码与验证闭环}
+
+前面已经把同步边界讲成寄存器到寄存器的路径，但真实工程中还必须处理四个经常被低估的问题：时钟如何送达，复位如何跨越边界，状态编码如何影响安全性，验证如何证明边界确实成立。这四件事不改变“组合逻辑准备下一值、状态元件保存下一值”的基本模型，却决定一个设计能否从纸面状态表进入可靠机器。
+
+首先区分\hwkey{写使能}和\hwrisk{门控时钟}。写使能的做法是让时钟继续到达触发器，但在时钟沿到来时决定是否接收新 D 值；若写使能为 0，寄存器保持原值。门控时钟则是让某段时钟停止翻转，以降低功耗或隔离无用活动。两者在功能描述上都可能表现为“保持不变”，但硬件风险完全不同。普通数据通路优先使用写使能；真正需要门控时钟时，应使用专用 clock gating 单元，并保证 enable 在安全窗口内被锁存。不能随意用一个 AND 门把 \code{clk} 和 \code{enable} 相与后送给触发器，因为 enable 的毛刺或变化时刻可能制造短脉冲、窄时钟或额外时钟沿。
+
+\begin{longtable}{L{0.2\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
+\toprule
+做法 & 硬件含义 & 验收重点 \\
+\midrule
+写使能 & 时钟照常到达，触发器按使能选择写入或保持 & 使能信号必须满足目标触发器时序 \\
+数据 mux 保持 & \code{D=mux(we,new,Q)}，写入旧值实现保持 & mux 延迟进入数据关键路径 \\
+专用时钟门控 & 使用门控单元生成局部时钟 & enable 锁存、无毛刺、时钟树约束 \\
+组合门控时钟 & 普通门电路直接切时钟 & 容易产生短脉冲和不可控偏斜，通常禁止 \\
+\bottomrule
+\end{longtable}
+
+其次，复位也有“域”。
+
+一个时钟域内部可以规定复位异步拉入、同步释放；两个时钟域之间则不能假设复位释放同时发生。若控制状态机已经退出复位，而它依赖的外设状态机、同步器或计数器仍在复位中，就可能读到无效状态。复位域验收应回答三个问题：哪些状态元件属于同一复位域，哪些跨域信号在复位期间必须保持安全，复位释放后第一个有效事件如何产生。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+复位问题 & 正确写法 & 典型失败 \\
+\midrule
+控制状态复位 & 状态机进入 \code{RESET_WAIT} 或 \code{IDLE} & 上电落入未定义状态 \\
+数据寄存器复位 & 仅复位影响控制或外部可见安全的寄存器 & 大面积无意义复位增加布线和时序压力 \\
+跨域复位释放 & 每个时钟域内部同步释放，并等待依赖域 ready & 一个域先运行，另一个域仍无效 \\
+复位后事件 & 同步器和 pending 位进入不会伪触发的默认值 & 复位释放产生假启动或假中断 \\
+\bottomrule
+\end{longtable}
+
+第三，状态机编码不是纯粹的排版选择。二进制编码使用较少触发器，但下一状态译码可能较复杂；one-hot 编码为每个状态使用一个触发器，译码直接、常适合较高速度或 FPGA 结构，但触发器数量更多；格雷编码让相邻状态尽量只改变一位，常用于跨域计数指针或减少多位同时变化带来的采样风险。无论使用哪种编码，都要定义未使用编码的下一状态和输出默认值。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+编码方式 & 适合场景 & 风险与验收 \\
+\midrule
+二进制编码 & 状态数较多、触发器资源敏感 & 译码复杂，未使用编码必须安全恢复 \\
+one-hot 编码 & 状态数适中、希望译码简单快速 & 触发器多，多个 bit 同时为 1 时要进入安全处理 \\
+格雷编码 & 计数指针、跨域观察、相邻状态变化 & 只适合有相邻关系的状态序列，不能随意套用 \\
+显式安全编码 & 安全相关控制器、故障诊断状态机 & 需要定义非法编码、错误记录和恢复路径 \\
+\bottomrule
+\end{longtable}
+
+第四，验证必须看波形上的边界。只看最终寄存器值，可能错过“某个周期写使能提前打开”“复位释放产生伪事件”“同步器第一级短暂不稳定”“pending 位被错误清除”等问题。一个同步小系统的波形检查至少要同时观察 \code{clk}、\code{reset}、源寄存器 Q、目标寄存器 D、目标写使能、状态编码、同步器两级输出、事件 pending 位和 ack 信号。
+
+\begin{longtable}{L{0.2\linewidth}L{0.4\linewidth}L{0.3\linewidth}}
+\toprule
+波形对象 & 应检查的问题 & 失败迹象 \\
+\midrule
+\code{reset} & 释放是否在本时钟域边界生效 & 状态机半周期启动或产生伪事件 \\
+\code{Q -> D} 路径 & D 是否在采样沿前稳定 & 目标寄存器采到过渡值 \\
+\code{write_enable} & 是否只在允许写入的周期有效 & 寄存器被提前覆盖或漏写 \\
+同步器两级输出 & 第二级是否作为唯一后级输入 & 后级直接使用异步 raw 或 meta 信号 \\
+\code{pending/ack} & 事件是否保持到被消费 & 窄事件丢失、重复消费或错误清除 \\
+状态编码 & 非法编码是否关闭危险输出并恢复 & 未使用状态驱动写使能或外部输出 \\
+\bottomrule
+\end{longtable}
+
+这些检查会直接连接到后续 CPU 章节。PC 是寄存器，指令寄存器是状态，流水线寄存器是阶段边界，控制器是状态机，异常和中断入口依赖同步事件，写回使能必须在正确周期打开。若第二章的边界概念不清楚，后面的数据通路和最小 CPU 就会退化成“线连起来就能跑”的误解。真正的 CPU 不是一张组合逻辑图，而是一组由时钟、复位、状态编码、控制使能和验证证据共同约束的同步系统。
+
+\topic{六、从时序账本到验收方法}
+
+同步设计不能仅以“这个状态机功能正确”作为结论。功能正确说明下一状态逻辑在稳定输入下给出正确答案；时序正确说明这些答案能在规定边界前到达，并且不会过早冲入保持窗口。二者缺一不可。一个严肃的验收记录应当把每条关键路径写成四个对象：源状态元件、数据路径、目标状态元件、时钟关系。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+验收对象 & 必须说明 & 常见遗漏 \\
+\midrule
+源状态元件 & 哪个触发器在发射沿后改变 Q & 只写信号名，不写状态边界 \\
+数据路径 & 经过哪些门、mux、加法器、译码和连线 & 只看逻辑级数，忽略布线和负载 \\
+目标状态元件 & 哪个触发器在捕获沿采样 D & 没有说明采样窗口 \\
+时钟关系 & 周期、偏斜、抖动和工程余量 & 用理想同相时钟代替真实时钟树 \\
+\bottomrule
+\end{longtable}
+
+建立约束和保持约束检查的是同一条路径的两个方向。\hwkey{建立约束}关心最慢数据是否赶得上下一个采样沿；\hwtiming{保持约束}关心最快数据是否过早进入同一个采样沿后的保持窗口。工程上常见的错误，是只盯着最高频率而忽略保持时间。事实上，降低频率可以缓解建立问题，却不一定修复保持问题；保持问题往往需要改变最小延迟、时钟偏斜或布局。
+
+可以用一个寄存器到寄存器路径作为验收模板。若源寄存器 \code{Rsrc} 的 \code{tCQ_max}=0.8ns，组合逻辑最大延迟为 3.6ns，连线最大延迟为 0.7ns，目标寄存器建立时间为 0.4ns，不利偏斜和余量合计 0.5ns，则周期至少为 6.0ns。若系统要求 200MHz，即周期 5.0ns，该路径就不能通过验收。正确处理方式是把组合逻辑拆段、优化 mux 和加法路径、调整布局或降低频率，而不是把余量从账本中删除。
+
+\begin{lstlisting}
+required period = 0.8ns + 3.6ns + 0.7ns + 0.4ns + 0.5ns
+                = 6.0ns
+target period   = 5.0ns
+result          = setup violation
+\end{lstlisting}
+
+保持检查则使用最小延迟。若 \code{tCQ_min}=0.08ns，组合逻辑最小延迟为 0.02ns，连线最小延迟为 0.03ns，目标保持时间为 0.20ns，再叠加不利偏斜 0.08ns，则数据最早 0.13ns 到达，而目标要求至少 0.28ns 后才允许变化。这条路径存在保持违例。修复方法通常是在数据路径上增加受控延迟、调整寄存器相对位置、修改时钟树或让工具插入保持缓冲。它不是“频率太高”的问题。
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+现象 & 优先检查 & 不应直接假设 \\
+\midrule
+高频下偶发错误 & 建立约束、关键路径、温度和电压角落 & 逻辑表达式一定写错 \\
+任何频率都偶发错误 & 保持约束、异步输入、复位释放、亚稳态 & 降低频率一定有效 \\
+复位后偶发跑飞 & 复位释放同步、非法状态恢复、安全默认输出 & 只要复位电平正确就足够 \\
+外部按钮偶发多次触发 & 消抖、同步、脉冲宽度、状态机边界 & 按钮已经是数字信号 \\
+\bottomrule
+\end{longtable}
+
+复位验收也要写成合同。首先列出哪些寄存器必须复位：控制状态、计数器、使能输出、错误状态、协议状态通常需要复位；纯数据缓冲如果写使能受控，未必每一位都需要复位。其次说明复位期间输出是否安全，例如电机使能、写存储器使能、片选信号和外部驱动必须进入禁止态。最后说明复位如何释放：异步拉入可以快速进入安全状态，同步释放可以避免同一状态机内不同触发器在不同边界开始运行。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+复位对象 & 合理默认 & 验收问题 \\
+\midrule
+控制状态机 & \code{IDLE} 或 \code{RESET_WAIT} & 是否只有一个合法入口状态 \\
+写使能 & 0 & 复位期间是否可能写寄存器或存储器 \\
+外部驱动 & 禁止输出或高阻安全态 & 是否会误启动执行机构 \\
+错误状态 & 清除或进入诊断态 & 是否能区分复位清除和真实故障 \\
+跨域同步器 & 进入不会触发事件的状态 & 释放后是否产生伪脉冲 \\
+\bottomrule
+\end{longtable}
+
+跨时钟边界要按对象分类。单 bit 电平可以使用两级同步；窄脉冲应先转换为持续足够长的电平事件，或使用握手协议；多 bit 数据不能逐位同步后直接合并，因为各位可能来自不同采样边界；计数器跨域常用格雷码，异步 FIFO 则用读写指针、同步后的指针和空满判断来建立合同。这里的关键不是背某一种结构，而是承认两个时钟域之间没有共同的“同时”概念，必须让协议定义何时有效、何时可采样、何时完成。
+
+\begin{chipcase}
+74HC74 这类双 D 触发器可以作为本章的门槛案例：它把 D、CLK、Q、复位和置位引脚明确暴露出来，迫使读者区分数据输入、采样边界和异步控制。74HC161 这类同步计数器则展示“当前状态经加法路径反馈到下一状态”的标准结构。74HC164、74HC595 等移位寄存器进一步说明，多 bit 状态可以按固定连线和时钟边界逐步移动。使用这些芯片时，必须检查电源去耦、输入默认电平、时钟边沿质量、复位极性和输出负载；否则纸面上的状态表无法保证板上行为。
+\end{chipcase}
+
+\topic{专题：把本章改写成纸面设计审查}
+
+本章概念可以用常见 74HC/74HCT 逻辑芯片搭成低速实验板，但本书不要求读者实际搭建。更适合本书目标的训练，是把这些器件当作可审查的真实案例：根据数据手册写出电源、输入默认值、复位极性、时钟边界、输出负载和故障表现。若读者没有面包板和仪器，也可以完成同样的纸面设计审查；若读者选择实际搭建，则必须限制在低压直流逻辑范围内，例如 3.3V 或 5V 数字电路，不得把这些小信号电路直接接到市电、电机、继电器线圈或其他大功率负载。LED 必须串联限流电阻，CMOS 输入不能悬空，每片芯片的 VCC 与 GND 之间应靠近芯片放置约 0.1uF 去耦电容，实验板和信号源必须共地。
+
+数据手册是搭电路时的合同。正文用信号名说明连接关系，而不依赖某一种封装的脚号；实际搭建时必须以手中芯片和封装的数据手册为准。低有效输入常写作 \code{reset_n}、\code{MR_n}、\code{OE_n} 或 \code{RD_n}，含义是拉低有效、拉高无效。若把低有效复位误当成高有效复位，电路会长期处于复位或完全失去复位保护。
+
+\begin{longtable}{L{0.24\linewidth}L{0.3\linewidth}L{0.36\linewidth}}
+\toprule
+器件 & 本章对应概念 & 搭建时的重点 \\
+\midrule
+74HC14 & 施密特输入、慢边沿整形、按钮消抖前后边界 & 输出反相；若内部语义需要同相，可串联两级反相器 \\
+74HC74 & 正沿 D 触发器、两级同步器、事件保持位 & 异步置位/复位脚必须接到确定无效电平或受控复位 \\
+74HC161/74HC163 & 4-bit 同步计数器、当前状态加一、进位级联 & 区分异步复位和同步复位，计数使能与并行装载不能悬空 \\
+74HC157 & 数据选择器、写使能保持、\code{D=mux(we,new,Q)} & 让时钟连续运行，用数据路径决定写入或保持 \\
+74HC595 & 串入并出移位寄存器、输出锁存、三态输出 & 区分移位时钟和锁存时钟，输出负载要受限 \\
+NE555 或晶振模块 & 低速实验时钟 & 时钟边沿应再经过施密特整形，按钮时钟必须消抖 \\
+\bottomrule
+\end{longtable}
+
+如果只做纸面训练，不需要准备物料；需要准备的是三张表：器件功能表、引脚电平表和故障定位表。器件功能表说明每颗芯片在本章概念中扮演什么角色；引脚电平表说明每个输入脚在复位、空闲和动作时处于什么电平；故障定位表说明某个现象优先怀疑哪条边界。下面保留实际搭建所需物料，是为了让这些纸面表格有真实约束来源，而不是暗示读者必须做实物实验。
+
+具体到本章实验，常用芯片包括 \code{74HC14}、\code{74HC74}、\code{74HC161} 或 \code{74HC163}、\code{74HC157}、\code{74HC595}；常用阻容范围包括 330R 到 1k 的 LED 限流电阻、4.7k 到 10k 的上拉或下拉电阻、100nF 去耦电容，以及 100nF 到 1uF 的按钮滤波电容。逻辑分析仪或示波器不是第一步必需品，但一旦要判断“按一次为什么计了两次”“复位释放为什么产生假事件”“锁存时钟为什么没有更新输出”，它们就比肉眼观察 LED 更可靠。
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+物料 & 用途 & 验收口径 \\
+\midrule
+稳定直流电源 & 给所有逻辑芯片提供同一电源域 & 电压在芯片允许范围内，实验板各处共地 \\
+0.1uF 去耦电容 & 抑制芯片开关瞬间的局部电源扰动 & 每片芯片靠近 VCC/GND 放置一颗 \\
+上拉/下拉电阻 & 给按钮、复位和未驱动输入确定默认值 & 松开按钮或开关断开时节点不悬空 \\
+LED 与限流电阻 & 低速观察 Q、同步级和计数输出 & LED 电流不超过芯片输出能力 \\
+按钮与 RC 滤波 & 产生人工事件和复位请求 & 按钮边沿进入 74HC14 前已有默认电平 \\
+逻辑分析仪或示波器 & 观察边沿、抖动、短脉冲和时序关系 & 能同时看到 \code{raw/pressed/sync/clk/reset_n} \\
+\bottomrule
+\end{longtable}
+
+上电前应先按连接检查表逐项确认。许多低速实验失败不是因为状态机概念错误，而是因为 VCC/GND 接反、低有效输入悬空、输出直接短接、不同电压域硬连或 LED 没有限流。对 CMOS 逻辑而言，“未使用输入不接”不是中性状态，而是让输入节点暴露给噪声和漏电流；它可能让芯片耗电增大、输出随机变化，甚至把后级状态机带入错误状态。
+
+\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.3\linewidth}}
+\toprule
+检查项 & 必须确认 & 常见后果 \\
+\midrule
+电源脚 & 每片芯片的 VCC、GND 与数据手册一致 & 芯片发热、无输出或永久损坏 \\
+去耦 & 每片芯片电源脚旁有 0.1uF 电容 & 时钟沿或输出翻转时产生偶发错误 \\
+低有效脚 & \code{reset_n/MR_n/OE_n} 等处于确定有效或无效电平 & 电路长期复位、输出高阻或随机启动 \\
+未用输入 & 接到确定 0 或 1，不能悬空 & LED 随机闪烁，计数器误跳变 \\
+输出负载 & LED 串电阻，不能多个推挽输出硬短接 & 输出电流过大或总线冲突 \\
+电压域 & 3.3V 与 5V 芯片互连满足输入阈值和绝对最大额定值 & 高电平不被识别，或 5V 损伤 3.3V 输入 \\
+\bottomrule
+\end{longtable}
+
+搭建顺序也应分层进行。第一步只接电源、去耦、一个 LED 和限流电阻，确认电源轨、极性和 LED 方向。第二步只接 74HC14 与按钮，验证按钮松开和按下时输出有确定变化。第三步接 74HC74 两级同步器，用低速时钟观察 \code{button_meta} 和 \code{button_sync} 的周期差。第四步再接 74HC161/74HC163 或 74HC595。若一次把所有芯片都插上，故障会混在一起，读者很难判断问题属于电源、按钮、时钟、复位还是状态逻辑。
+
+第一个可搭电路是“按钮进入同步状态机”的前半段。按钮一端接 GND，另一端通过约 10k 电阻上拉到 VCC，形成低有效原始输入 \code{button_raw_n}。在按钮节点到 GND 之间可并联 100nF 左右电容作为低速消抖起点；随后进入 74HC14。由于 74HC14 是反相施密特触发器，经过一级后得到边沿更陡但极性反转的信号，经过第二级后可得到与内部语义一致的 \code{button_pressed}。这个电路对应外部事件链路中的“默认电平、滤波、语义归一化”。
+
+然后用 74HC74 搭两级同步器。第一触发器的 D 接 \code{button_pressed}，CP 接系统时钟，异步置位保持无效，异步复位接受控的 \code{reset_n}；第一触发器的 Q 记为 \code{button_meta}。第二触发器的 D 接 \code{button_meta}，CP 接同一个系统时钟，Q 记为 \code{button_sync}。状态机、计数器或后级逻辑只能使用 \code{button_sync}，不能直接使用 \code{button_raw_n} 或 \code{button_meta}。若要观察现象，可把 \code{button_pressed}、\code{button_meta}、\code{button_sync} 分别通过较大限流电阻接到 LED；在 1Hz 到 5Hz 的慢时钟下，读者能看到同步输出只在时钟边界变化。
+
+\begin{lstlisting}
+button_raw_n -> 74HC14 -> 74HC14 -> button_pressed
+
+74HC74 stage 1:
+  D  = button_pressed
+  CP = clk
+  Q  = button_meta
+
+74HC74 stage 2:
+  D  = button_meta
+  CP = clk
+  Q  = button_sync
+\end{lstlisting}
+
+该实验的验收不是“按键能点亮 LED”这么简单，而是要记录四个事实。第一，按钮松开时原始节点有确定默认电平。第二，施密特输入之后的边沿不再长时间停留在中间电压。第三，\code{button_meta} 可能比 \code{button_sync} 早一个周期变化，后级不得使用它。第四，复位拉低后两个触发器进入不会伪触发的默认值，复位释放后输出只能在时钟沿重新进入有效状态。
+
+第二个可搭电路是 74HC161 或 74HC163 计数器。把 CP 接低速时钟，计数使能接有效电平，并行装载保持无效，复位接到受控 \code{reset_n}，Q0 到 Q3 分别通过限流电阻接 LED。此时四个 LED 显示的是同一个时钟边界保存的 4-bit 状态，而不是四个彼此独立的灯。每来一个有效时钟沿，内部寄存器一起更新，组合加一逻辑准备下一个值。若使用 74HC161，应特别注意其复位口是异步复位；若教材实验要强调“同步释放”，可以让外部复位先进入本时钟域同步器，再驱动后级控制逻辑，或选用同步复位口径更清楚的计数器。
+
+这个计数器实验可以验证三件事。第一，把时钟停住后，Q0 到 Q3 保持不变，说明状态由触发器保存。第二，把计数使能关掉后，时钟仍然可以继续进入芯片，但状态保持，说明写使能和门控时钟不是一回事。第三，若把并行装载打开并在 D0 到 D3 上给出固定值，计数器会在规定边界装载该值，说明状态元件可以执行“保持、加一、装载、清零”等不同下一状态选择。
+
+第三个可搭电路是 74HC595 输出链路。它内部有移位寄存器和输出锁存器，通常使用 \code{DS} 作为串行数据，\code{SHCP} 作为移位时钟，\code{STCP} 作为输出锁存时钟，\code{MR_n} 作为低有效清零，\code{OE_n} 作为低有效输出使能。每给 \code{SHCP} 一个有效边沿，串行 bit 进入移位寄存器；连续移入 8 bit 后，再给 \code{STCP} 一个边沿，八个输出 Q0 到 Q7 才一起更新。这个器件非常适合说明“内部状态移动”和“外部可见输出提交”是两个边界。
+
+\begin{lstlisting}
+for each bit:
+  set DS stable
+  pulse SHCP
+
+after 8 bits:
+  pulse STCP
+  Q0..Q7 update together
+\end{lstlisting}
+
+若用按钮手动提供 \code{DS}、\code{SHCP} 或 \code{STCP}，这些按钮信号仍然要先经过上拉/下拉、消抖和施密特整形。未经消抖的手动时钟可能一次按压产生多个边沿，使移位寄存器多移几位。若用微控制器驱动 74HC595，要保证电压域兼容；5V 逻辑输出不能随意接到只允许 3.3V 的输入。Q0 到 Q7 可以驱动小电流 LED 作为观察负载，若要控制继电器、电机或更大负载，必须增加合适的驱动器件、续流保护和隔离策略，不能把 74HC595 输出脚当作功率开关。
+
+第四个可搭电路用 74HC157 和 74HC74 说明写使能。把 74HC74 的 Q 反馈到 74HC157 的一个输入，把新数据 \code{new_bit} 接到另一个输入，用 \code{write_enable} 选择哪一路送到 74HC74 的 D。时钟始终送到 74HC74；当 \code{write_enable=0} 时，D 得到旧 Q，下一个边界写回旧值，表现为保持；当 \code{write_enable=1} 时，D 得到 \code{new_bit}，下一个边界写入新值。这个实验应当与“用 74HC08 把时钟和 enable 相与”明确区分。后者即使在低速实验中似乎能工作，也会把 enable 的毛刺、传播延迟和不对称边沿带进时钟路径；它适合用逻辑分析仪作为反例观察，不适合作为后级状态机的正常时钟。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+实验 & 观察信号 & 合格现象 \\
+\midrule
+按钮同步器 & \code{raw/pressed/meta/sync/reset_n/clk} & 后级只在时钟边界看到同步后的事件 \\
+4-bit 计数器 & \code{clk/reset_n/enable/Q0..Q3} & 关使能时状态保持，开使能时每周期加一 \\
+74HC595 输出链路 & \code{DS/SHCP/STCP/MR_n/OE_n/Q0..Q7} & 移位期间输出不乱跳，锁存边界后一起更新 \\
+写使能寄存器 & \code{new_bit/write_enable/D/Q/clk} & 时钟连续存在，是否更新由数据路径决定 \\
+\bottomrule
+\end{longtable}
+
+故障定位应从可观察事实开始，而不是先猜逻辑表达式。若计数器按一次按钮跳多格，优先检查按钮抖动、手动时钟是否经过 74HC14、是否把按钮直接当 CP 使用。若 LED 随机闪烁，优先检查 CMOS 输入是否悬空、复位或输出使能是否处于确定电平、面包板电源轨是否断开。若 74HC595 的 Q0 到 Q7 始终不变，应检查 \code{OE_n} 是否允许输出、\code{MR_n} 是否保持无效、\code{STCP} 是否真的收到锁存边沿，而不是只检查 \code{SHCP}。若复位后出现一次假启动，应检查同步器和 pending 位的复位默认值，以及复位释放是否在本时钟域边界发生。
+
+\begin{longtable}{L{0.23\linewidth}L{0.34\linewidth}L{0.33\linewidth}}
+\toprule
+失败现象 & 优先检查 & 修复方向 \\
+\midrule
+按一次计多次 & 按钮抖动、手动时钟、74HC14 整形 & 增加 RC 消抖，整形后再进时钟域 \\
+LED 随机闪烁 & 悬空输入、复位脚、输出使能脚、电源轨 & 给所有输入确定默认电平并检查共地 \\
+复位后假事件 & 同步器复位值、pending 位默认值、释放边界 & 异步拉入、同步释放，事件位复位为 0 \\
+74HC595 输出不变 & \code{OE_n/MR_n/STCP/SHCP} 与数据稳定时间 & 区分移位时钟和锁存时钟，固定控制脚电平 \\
+写使能保持失败 & mux 选择脚、Q 反馈路径、D 采样边界 & 观察 \code{write_enable/D/Q/clk} 的周期关系 \\
+芯片明显发热 & 电源极性、输出短路、总线冲突、负载电流 & 立即断电，按数据手册逐脚复查 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.25cm, minimum height=0.9cm] (state) at (0,0.7) {状态寄存器};
+  \node[hw compute, minimum width=2.75cm, minimum height=0.9cm] (next) at (3.5,0.7) {下一状态逻辑};
+  \node[hw control, minimum width=2.25cm, minimum height=0.9cm] (out) at (7.0,0.7) {输出逻辑};
+  \node[hw lane, minimum width=2.0cm] (inputs) at (3.5,-1.15) {输入};
+  \node[hw lane, minimum width=1.55cm] (clk) at (-2.2,0.7) {CLK};
+  \node[hw lane, minimum width=1.8cm] (outputs) at (9.6,0.7) {控制输出};
+  \draw[hw bus] (clk) -- (state);
+  \draw[hw bus] (state) -- (next);
+  \node[hw label] at (1.75,1.08) {当前状态};
+  \draw[hw return] (next.north) |- (1.75,1.55) -| (state.north);
+  \node[hw label] at (1.75,1.78) {next state};
+  \draw[hw bus] (state.south) |- (1.15,-0.42) -- (5.95,-0.42) -| (out.south);
+  \node[hw label] at (5.45,-0.62) {当前状态};
+  \draw[hw bus] (inputs.north) -- (next.south);
+  \draw[hw bus] (inputs.east) -| (out.south);
+  \draw[hw bus] (out) -- (outputs);
+  \node[hw label, text width=9.4cm] at (3.8,-2.0) {状态寄存器只在时钟边界提交；下一状态逻辑和输出逻辑是组合网络。图中把反馈放在上方直线，避免弯箭头穿过节点。};
+\end{block}
+\diagramnote{有限状态机结构：状态寄存器 + 下一状态逻辑 + 输出逻辑。}
+\vspace{0.8em plus 0.25em}
+
+\topic{专题：从数据手册到可靠接线}
+
+真实芯片不能只按逻辑符号连接，还要按数据手册给出的电气边界连接。数据手册通常有两类容易混淆的表。\term{绝对最大额定值}{absolute maximum ratings} 是器件不应超过的损伤边界，不是推荐工作点；长期按这个边界运行并不可靠。\term{推荐工作条件}{recommended operating conditions} 才是设计应采用的电源、电压、温度、输入上升下降时间和时钟条件范围。实验报告应记录使用的是哪一种条件，而不能把“没有立刻烧毁”当成合格。
+
+\begin{longtable}{L{0.23\linewidth}L{0.36\linewidth}L{0.31\linewidth}}
+\toprule
+数据手册项目 & 读法 & 设计用途 \\
+\midrule
+绝对最大额定值 & 超过可能损伤器件 & 用来划红线，不用来定正常工作点 \\
+推荐工作条件 & 厂商承诺正常工作的范围 & 决定 VCC、电压域、温度和输入边沿要求 \\
+\code{VIH/VIL} & 输入被承认为 1 或 0 的电压门限 & 判断 3.3V 输出能否驱动 5V 输入 \\
+\code{VOH/VOL} & 在给定输出电流下仍能保证的输出电平 & 判断下一级是否能可靠识别高低电平 \\
+输出电流 & 单脚和整片芯片的源/灌电流限制 & 决定 LED 电阻、负载数量和是否需要驱动器 \\
+传播延迟 & 输入变化到输出有效的最坏时间 & 进入时序账本，不能只看典型值 \\
+最小时钟脉宽 & CP、SHCP、STCP 等高/低电平至少持续多久 & 判断按钮、NE555 或逻辑脉冲是否太窄 \\
+最高工作频率 & 在规定电压、负载和温度下的频率上限 & 面包板实验应留出明显余量 \\
+\bottomrule
+\end{longtable}
+
+电压兼容要用最坏条件判断。若一个 3.3V 微控制器输出接到 5V 供电的 74HC 输入，不能只看示波器上有 3.3V 高电平，还要查 5V 条件下该输入要求的 \code{VIH_min}。如果 \code{VIH_min} 高于 3.3V 输出在负载下能保证的 \code{VOH_min}，这个连接就没有静态高电平余量，即使短时间看似能工作，也可能随温度、电源和芯片批次变化而失败。74HCT 系列常用于 5V 系统接收 TTL 口径输入，是因为它的输入门限更适合较低高电平；但 74HCT 输出仍由自身 VCC 决定，不能把 5V 输出直接送入不耐 5V 的 3.3V 输入。
+
+\begin{lstlisting}
+static high-level margin:
+  driver VOH_min >= receiver VIH_min + margin
+
+static low-level margin:
+  driver VOL_max <= receiver VIL_max - margin
+\end{lstlisting}
+
+扇出与负载也要按电流和电平一起看。\term{扇出}{fan-out} 指一个输出能可靠驱动多少个输入。CMOS 输入静态电流很小，所以低速实验中一个 74HC 输出常能驱动多个 CMOS 输入；但这不等于它能随意驱动多个 LED、长线或电容负载。LED 会消耗直流输出电流，电流过大时 \code{VOH} 会下降或 \code{VOL} 会升高，后级输入余量随之变小。长杜邦线和多个输入会增加电容负载，使边沿变慢；边沿太慢又可能让普通 CMOS 输入在门限附近停留过久，造成多次翻转或额外功耗。因此，观察 LED 应使用较大限流电阻，真实负载应使用专门驱动器或晶体管/MOSFET 级。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+负载类型 & 风险 & 正确处理 \\
+\midrule
+多个 CMOS 输入 & 电容变大，边沿变慢 & 降低频率、缩短连线，必要时加缓冲器 \\
+LED 观察负载 & 输出电流过大拉低高电平或抬高低电平 & 串较大限流电阻，优先低电流观察 \\
+长杜邦线 & 串扰、反射、接触不良和地线回路 & 低速实验、短线、共地、必要时示波器确认 \\
+继电器或电机 & 电流和反灌电压远超逻辑芯片能力 & 使用驱动管、续流二极管、独立供电和隔离策略 \\
+多个推挽输出相连 & 一个拉高、一个拉低会形成短路 & 只用三态总线或开漏/开集加上拉结构 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=1cm,y=1cm]
+  \node[hw state, minimum width=1.6cm, minimum height=0.9cm] (idle) at (0,0) {IDLE};
+  \node[hw state, minimum width=1.6cm, minimum height=0.9cm] (load) at (2.8,0) {LOAD};
+  \node[hw state, minimum width=1.6cm, minimum height=0.9cm] (run) at (5.6,0) {RUN};
+  \node[hw state, minimum width=1.6cm, minimum height=0.9cm] (done) at (8.4,0) {DONE};
+  \draw[hw bus] (idle) -- node[above, hw label, pos=0.58]{start=1} (load);
+  \draw[hw bus] (load) -- node[above, hw label]{ready=1} (run);
+  \draw[hw bus] (run) -- node[above, hw label]{count\_done=1} (done);
+  \draw[hw return] (done.south) |- (4.2,-1.45) -| (idle.south) node[pos=0.23, below, hw label]{clear=1};
+  \draw[BookMuted,line width=0.55pt,-{Stealth[length=2mm,width=1.4mm]}] (idle.north) .. controls +(0,0.72) and +(0.72,0.72) .. node[above,hw label]{start=0} (idle.east);
+  \draw[BookMuted,line width=0.55pt,-{Stealth[length=2mm,width=1.4mm]}] (done.north) .. controls +(0,0.72) and +(0.72,0.72) .. node[above,hw label]{clear=0} (done.east);
+  \node[hw label, text width=8.8cm] at (4.2,-2.15) {主路径水平推进，返回路径独占下方通道，自环标签放在节点上方，避免和返回线相交。};
+\end{block}
+\diagramnote{四状态硬件控制器状态图：IDLE 到 LOAD 到 RUN 到 DONE 再回到 IDLE。}
+\vspace{0.8em plus 0.25em}
+
+时钟质量决定状态边界是否真实存在。一个合法时钟不仅要有频率，还要满足最小高电平时间、最小低电平时间、上升/下降时间和边沿单调性。NE555 可以产生低速时钟，但输出边沿、占空比和电源扰动仍需检查；按钮可以产生人工事件，但未经消抖不应直接作为计数器 CP；晶振模块边沿质量较好，但频率可能高到面包板布线、LED 观察和手工调试都跟不上。手工实验建议先用 1Hz 到 5Hz 的可观察时钟验证状态，再逐步提高频率，并在提高频率前去掉重负载 LED 或改用缓冲观察点。
+
+\begin{longtable}{L{0.22\linewidth}L{0.36\linewidth}L{0.32\linewidth}}
+\toprule
+时钟来源 & 适合用途 & 额外检查 \\
+\midrule
+按钮单步 & 教学观察、单周期推进 & 必须消抖并经施密特整形，不直接驱动 CP \\
+NE555 & 低速自动运行 & 检查占空比、电源去耦、边沿和最小脉宽 \\
+晶振模块 & 稳定周期时钟 & 频率、电压域、输出负载和面包板布线余量 \\
+微控制器 GPIO & 可编程时钟或测试脉冲 & 电压兼容、脉宽、地线和软件抖动 \\
+\bottomrule
+\end{longtable}
+
+面包板适合低速验证概念，不等同于可量产硬件。面包板触点有接触电阻和寄生电容，长杜邦线会带来额外电感和串扰，电源轨可能在中间断开，地线回路会让几个芯片看到不同的瞬时参考电位。这些问题在 1Hz LED 实验里可能不明显，在更快边沿和更多芯片同时翻转时就会变成偶发故障。将来进入 CPU 数据通路、总线和存储器章节时，读者应记住：面包板证明“逻辑关系能被观察”，不能证明“任意频率和任意规模都可靠”。
+
+安全边界也要明确。本章实验只验证低压逻辑信号，不验证功率驱动。若要让逻辑电路控制继电器、电机、灯带或其它外部负载，必须增加驱动晶体管或 MOSFET、栅极/基极电阻、续流二极管或 TVS、独立电源退耦、共地或隔离策略，并重新验收电流、热、反灌电压和失效状态。把 74HC595、74HC74 或 74HC161 的输出脚直接当作功率开关，是把逻辑输出误用为能量输出。
+
+下面是一份完整故障报告样例。现象：用按钮给 74HC161 提供单步时钟，按一次按钮时计数器从 3 跳到 5。定位步骤一，逻辑分析仪同时观察按钮原始节点 \code{button_raw_n}、74HC14 输出 \code{button_pressed} 和计数器 \code{CP}；发现一次按压期间 \code{CP} 出现两个上升沿。定位步骤二，断开计数器，只观察按钮链路；发现 RC 时间常数过小且按钮释放也产生窄脉冲。修复动作：增大消抖电容，保证按钮先进入 74HC14，再由整形后的信号产生单步请求；若该请求进入状态机，则继续经过 74HC74 同步。复测结果：一次按压期间 \code{CP} 只有一个有效边沿，计数器从 3 变为 4。结论：故障不是 74HC161 的加一逻辑错误，而是手动时钟没有形成唯一边界。
+
+实验报告应像小型工程验收记录，而不是只写“现象正确”。每个实验至少记录芯片型号和系列、电源电压、时钟来源、复位极性、每个低有效控制脚的默认电平、异步输入如何进入同步器、观察到的信号、失败现象和修复动作。若使用 74HCT 与 74HC 混合，还要记录电平兼容依据。一般而言，5V 输出不应直接接入只允许 3.3V 的输入；3.3V 输出能否可靠驱动 5V 供电的 74HC 输入，也不能凭“看起来能亮”判断，而应查数据手册中的输入高电平阈值。74HCT 的输入阈值更接近 TTL 口径，常用于 5V 系统中接收较低高电平，但输出仍受自身供电影响。
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+报告项 & 应记录的内容 & 合格标准 \\
+\midrule
+物料与版本 & 芯片完整型号、逻辑系列、电源电压 & 可回到数据手册复查电气条件 \\
+连接合同 & VCC/GND、复位、置位、输出使能、未用输入 & 没有悬空控制脚和危险负载 \\
+时钟与复位 & 时钟来源、频率范围、复位拉入和释放方式 & 状态只在边界变化，复位后无伪事件 \\
+异步输入 & 原始引脚、消抖、施密特整形、同步级数 & 后级只使用同步后的信号 \\
+观测证据 & LED、逻辑分析仪或示波器看到的关键节点 & 现象能解释到具体边界和信号名 \\
+故障处理 & 失败现象、定位步骤、修复前后对比 & 修复不是偶然重插线，而有明确原因 \\
+\bottomrule
+\end{longtable}
+
+这些实验把“状态、时钟与同步边界”落到真实芯片上。完成实验后，读者应能为每个小电路写出一页验收记录：使用了哪些芯片，电源和默认电平如何保证，哪些输入是异步的，进入了几级同步器，复位默认状态是什么，哪些输出只是观察 LED，哪些信号绝不能直接驱动危险负载。这样的记录比单纯画出逻辑关系更接近真实工程。
+
+因此，本章的最终目标不是让读者背出触发器、寄存器、计数器和状态机的定义，而是能为一个同步小系统留下\hwevidence{可复查证据}：状态表、复位表、时序账本、跨边界处理方式和异常恢复策略。后续 CPU 的 PC、寄存器堆、控制器、异常入口和设备中断，都将重复使用这套证据格式。
+
+\topic{专题：setup/hold 不是公式，而是采样窗口}
+触发器的 setup 和 hold 约束经常被背成两个时间参数，但它们本质上是在说明采样窗口。时钟沿到来前，D 输入要提前稳定一段时间；时钟沿之后，D 输入还要继续保持一小段时间。若输入在窗口内变化，触发器内部再生过程可能无法快速决定 0 或 1，输出延迟变长，甚至进入亚稳态。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+时序参数 & 原理含义 & 违反后果 \\
+\midrule
+\code{t_setup} & 时钟沿前 D 必须稳定的最短时间 & 采样值可能错误或输出延迟异常 \\
+\code{t_hold} & 时钟沿后 D 必须保持的最短时间 & 新数据可能穿透到本周期采样 \\
+\code{t_clkq} & 时钟沿后 Q 输出稳定所需时间 & 后级组合逻辑可用时间减少 \\
+\code{t_pd} & 组合逻辑最坏传播延迟 & 决定下一级 setup 是否满足 \\
+\code{skew} & 不同触发器实际看到时钟沿的差异 & 可能同时影响 setup 和 hold 裕量 \\
+\bottomrule
+\end{longtable}
+
+单周期路径的基本账本可以写成：
+
+\begin{lstlisting}
+clk_period >= t_clkq_max + t_logic_max + t_setup + skew + margin
+hold_margin = t_clkq_min + t_logic_min - skew - t_hold
+\end{lstlisting}
+
+第一条约束决定频率上限，第二条约束决定短路径是否太快。很多初学者只关心“逻辑太慢”，却忽略“逻辑太快”也可能破坏 hold。若同一时钟沿从前级触发器出来的数据太快到达后级，而后级仍处在 hold 窗口内，就可能把本该下一拍才采样的数据提前采进去。解决 hold 的方法通常不是降低频率，而是调整时钟树、增加最小延迟或改变寄存器布局。
+
+\topic{亚稳态只能降低概率，不能被完全消灭}
+异步输入、跨时钟信号和机械按键都可能在触发器采样窗口内变化。触发器内部的再生电路可能暂时停在中间电平，随后随机解析为 0 或 1，这就是亚稳态。同步器不能保证“永不亚稳”，只能让亚稳态有更多时间衰减，使错误传播到后级的概率低到工程可接受。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+设计选择 & 作用 & 仍需注意 \\
+\midrule
+两级同步器 & 给第一级亚稳态多一个周期衰减 & 只能同步单 bit 电平，不能同步多 bit 总线值 \\
+握手协议 & 用 valid/ready 或请求/应答跨边界 & 吞吐降低，但语义清楚 \\
+异步 FIFO & 用双端口存储和格雷码指针跨时钟 & 指针同步和空满判断必须严格验证 \\
+脉冲拉宽 & 让短事件至少覆盖目标时钟周期 & 过窄脉冲可能完全漏采 \\
+\bottomrule
+\end{longtable}
+
+多 bit 总线不能简单给每一位各接两级同步器后直接使用，因为各位解析时间可能不同，接收端会看到不存在的混合值。正确做法通常是先在源时钟域保持数据稳定，再用握手同步“数据可用”事件；或者使用异步 FIFO 让写指针和读指针通过受控编码跨域。
+
+\topic{复位要区分上电初始化、错误恢复和运行控制}
+复位不只是“把所有寄存器清零”。有些寄存器必须复位到安全值，有些数据寄存器可以不复位，有些外设需要按电源和时钟顺序释放，有些跨时钟域需要各自同步释放。把复位当成普通控制信号乱用，会造成时钟域之间状态不一致、异步释放毛刺或组合路径被复位扇出拖慢。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+复位对象 & 建议策略 & 验收问题 \\
+\midrule
+控制状态机 & 复位到明确安全状态 & 复位释放后第一拍输出是否安全 \\
+PC/入口状态 & 装入复位向量或启动状态 & 第一条取指地址是否确定 \\
+数据寄存器 & 可按需要不复位，由控制路径保证无效时不使用 & 是否有 valid 位防止读旧值 \\
+外设接口 & 先复位设备内部，再开放总线响应 & 复位期间是否会误写 MMIO \\
+跨域复位 & 异步断言、同步释放或每域独立处理 & 释放边界是否满足目标时钟域时序 \\
+\bottomrule
+\end{longtable}
+
+良好的复位规格应写清楚：复位信号有效电平、最短保持时间、时钟是否必须运行、复位释放后第一个可接受输入的时间、输出是否需要保持安全值。没有这些边界，系统 bring-up 时会把电源、时钟、复位、状态机和总线问题混成一团。
+
+\topic{状态机验证要覆盖非法状态和输出时序}
+状态机图只画正常转移是不够的。真实触发器可能因复位不完整、毛刺、单粒子翻转或设计错误进入未列出的编码。若非法状态没有恢复路径，控制器可能卡死或输出危险控制线。状态机输出还要区分 Moore 型和 Mealy 型：前者只依赖当前状态，后者还依赖输入，可能更快但更容易受输入毛刺影响。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+验证项 & 要检查什么 & 失败风险 \\
+\midrule
+复位覆盖 & 所有关键状态寄存器进入已知状态 & 上电随机进入危险路径 \\
+非法状态恢复 & 未使用编码能回到安全状态或错误入口 & 状态机锁死或误写设备 \\
+输出默认值 & 每个状态未显式赋值的控制线有安全默认 & 锁存器推断或保持旧控制线 \\
+输入同步 & Mealy 输入是否来自同步边界 & 毛刺直接影响输出控制线 \\
+进度性 & 等待状态是否有超时或退出条件 & 外设无响应时永久等待 \\
+\bottomrule
+\end{longtable}
+
+这套检查表会在 CPU 控制器、内存等待、DMA 描述符、总线仲裁和中断控制器中反复出现。第二章的状态机不是孤立数字逻辑练习，而是后面所有“硬件会按阶段推进”的基础。
+
+\topic{去抖和边沿检测要分成两件事}
+机械按键输入常常同时暴露三个问题：异步、抖动和事件检测。异步意味着它不按本机时钟变化，需要同步；抖动意味着一次按下会产生多个跳变，需要滤除；事件检测意味着电平稳定后还要决定什么时候产生一个周期宽的“按下事件”。把三者混在一起，常会导致一次按键被计数多次，或按住不放时不断触发。
+
+\begin{lstlisting}
+button pipeline:
+  raw_pin -> synchronizer -> debounce counter -> stable_level
+  stable_level + previous_level -> one_cycle_press_event
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+阶段 & 原理 & 验收证据 \\
+\midrule
+同步 & 两级触发器降低亚稳态传播概率 & raw 改变时内部不会产生多 bit 混合状态 \\
+去抖 & 输入持续稳定 N 个周期才接受新电平 & 抖动期间 \code{stable_level} 不变化 \\
+边沿检测 & 当前稳定电平与上一稳定电平比较 & 一次按下只产生一个事件脉冲 \\
+事件消费 & 状态机或计数器只看事件脉冲 & 长按不会重复触发，除非规格要求连发 \\
+\bottomrule
+\end{longtable}
+
+这个小例子把第二章与第一章连接起来：第一章能用示波器看到按键抖动，第二章用同步状态机把抖动变成稳定事件，后面整机章再把该事件映射成 GPIO 状态位或中断请求。
+
+\section*{章末练习与验收任务}
+
+本节练习要求把状态边界写清楚。答案必须说明哪个值在组合路径上传播，哪个值在时钟沿保存；若涉及外部输入、复位或跨时钟边界，还必须说明同步和默认安全状态。
+
+\begin{longtable}{L{0.18\linewidth}L{0.46\linewidth}L{0.26\linewidth}}
+\toprule
+任务 & 要完成的产物 & 验收标准 \\
+\midrule
+触发器路径账本 & 为一条寄存器到寄存器路径列出 \code{tCQ}、组合延迟、连线延迟、建立时间、偏斜和余量 & 能判断目标周期是否通过建立约束 \\
+保持违例 & 构造一条最小延迟过短的路径，并写出修复方法 & 能区分建立问题和保持问题 \\
+锁存器透明窗口 & 说明两个锁存器共用 enable 时可能出现的穿透风险 & 能解释为什么大系统更偏好清晰时钟边界 \\
+复位释放 & 为一个三状态控制器写复位表和释放策略 & 复位期间危险输出关闭，释放在同步边界发生 \\
+两级同步 & 说明外部按钮或中断线进入时钟域的处理流程 & 原始异步信号不能直接驱动状态机 \\
+MTBF 口径 & 说明为什么同步器只能降低亚稳态风险，并列出影响 MTBF 的因素 & 能把时钟频率、事件频率、恢复时间和器件特性联系起来 \\
+外部事件链路 & 为一个按钮或传感器写出从原始引脚到状态机消费的完整信号链 & 能区分电气处理、同步、边沿检测和事件保持 \\
+事件保持 & 设计 \code{pending/ack} 结构，说明何时置位、何时清除 & 窄事件不能因状态机暂时不可接收而丢失 \\
+多 bit 跨域 & 说明为什么 8-bit 总线不能逐位两级同步后直接使用 & 给出握手、FIFO 或格雷码方案 \\
+脉冲同步 & 设计一个不会漏采窄脉冲的跨域事件方案 & 能说明事件保持到被确认 \\
+时钟门控 & 比较写使能、数据 mux 保持、专用时钟门控和普通门控时钟 & 能说明为什么普通门电路不应直接切时钟 \\
+复位域 & 为两个相关时钟域写复位释放和 ready 等待策略 & 能说明复位跨域也需要同步和安全默认值 \\
+状态编码 & 比较二进制、one-hot 和格雷编码的用途与风险 & 能为未使用编码写安全恢复规则 \\
+波形验证 & 列出验证一个同步小系统必须观察的信号 & 能从波形判断写使能、复位、pending/ack 是否正确 \\
+CPU 连接 & 说明 PC、流水线寄存器、控制器和中断入口分别对应本章哪个概念 & 能把第二章边界模型映射到后续 CPU \\
+按钮同步器实作 & 用 74HC14 和 74HC74 写出按钮到同步电平的连接方案 & 能区分原始引脚、消抖整形、第一级同步和第二级同步 \\
+计数器实作 & 用 74HC161 或 74HC163 设计 4-bit LED 计数器 & 能说明时钟、复位、计数使能、并行装载和输出负载 \\
+移位输出实作 & 用 74HC595 说明串行输入、移位时钟、锁存时钟和输出使能 & 能解释为什么八个输出在锁存边界一起更新 \\
+写使能实作 & 用 74HC157 和 74HC74 搭一个可保持的 1-bit 寄存器 & 能说明为什么数据 mux 保持优于普通门控时钟 \\
+实验板物料 & 为本章低速逻辑实验列出最小 BOM 和用途 & 能覆盖电源、去耦、默认电平、观察负载和测量工具 \\
+接线检查 & 写出上电前检查表，覆盖低有效脚、未用输入、电压域和输出负载 & 能防止悬空、误复位、输出短路和电平不兼容 \\
+故障定位报告 & 针对一个失败现象写出定位步骤和修复证据 & 能从现象追到具体信号边界，而不是只重插线 \\
+数据手册读取 & 给出 74HC 实验前必须查的参数表和用途 & 能区分绝对最大额定值、推荐工作条件、输入输出电平和时序参数 \\
+电压与扇出 & 判断一个输出能否可靠驱动后级输入、LED 或多路负载 & 能用 \code{VOH/VOL/VIH/VIL} 和输出电流说明余量 \\
+时钟与面包板限制 & 说明按钮、NE555、晶振模块和面包板布线的边界 & 能解释最小脉宽、边沿质量、寄生效应和低速验证范围 \\
+非法状态恢复 & 为状态机未使用编码指定下一状态和输出 & 非法状态不产生危险使能 \\
+状态机输出 & 比较只依赖状态的输出和依赖输入的输出 & 能说明稳定性与响应速度的取舍 \\
+芯片案例 & 用 74HC74、74HC161 或移位寄存器说明一个本章概念 & 绑定到真实引脚、复位、时钟和输出负载 \\
+\bottomrule
+\end{longtable}
+\vspace{1.0em plus 0.35em}
+\begin{block}[x=1cm,y=1cm]
+  \node[hw lane, minimum width=4.6cm, minimum height=3.0cm, label={[hw label]above:推荐：数据端使能}] (leftbox) at (1.9,0) {};
+  \node[hw compute, minimum width=1.2cm] (mux) at (0.6,0.35) {MUX};
+  \node[hw state, minimum width=1.35cm] (ff) at (2.7,0.35) {D-FF};
+  \node[hw control, minimum width=1.0cm] (we) at (0.6,-0.9) {WE};
+  \draw[hw bus] (-1.25,0.35) node[left]{D} -- (mux);
+  \draw[hw bus] (mux) -- (ff);
+  \draw[hw return] (ff.east) -- ++(0.45,0) |- (1.65,1.05) -| (mux.north);
+  \draw[hw bus] (we) -- (mux);
+  \node[hw label] at (2.7,-0.9) {CLK 不被门控};
+
+  \node[hw lane, minimum width=4.6cm, minimum height=3.0cm, label={[hw label]above:危险：门控时钟}] (rightbox) at (7.1,0) {};
+  \node[hw control, minimum width=1.1cm] (andg) at (5.85,0.35) {AND};
+  \node[hw state, minimum width=1.35cm] (ff2) at (7.9,0.35) {D-FF};
+  \node[hw control, minimum width=1.0cm] (en) at (5.85,-0.9) {EN};
+  \draw[hw danger] (4.55,0.35) node[left]{CLK} -- (andg);
+  \draw[hw danger] (andg) -- node[above,hw label]{毛刺会变成边沿} (ff2);
+  \draw[hw bus] (ff2.east) -- ++(0.45,0) node[right]{Q};
+  \draw[hw danger] (en) -- (andg);
+  \node[hw label, text width=9.4cm] at (4.5,-2.1) {左边只改变 D 端选择，时钟树保持干净；右边把 EN 放进时钟路径，EN 的毛刺可能被触发器当作真实时钟沿。};
+\end{block}
+\diagramnote{写使能 vs 门控时钟：写使能在数据路径上选择；门控时钟可能把 EN 的毛刺变成额外时钟沿。}
+\vspace{0.8em plus 0.25em}
+
+\section*{参考解答与验收要点}
+
+\begin{longtable}{L{0.18\linewidth}L{0.46\linewidth}L{0.26\linewidth}}
+\toprule
+任务 & 参考解答 & 必须保留的验收点 \\
+\midrule
+触发器路径账本 & 示例：\code{Tclk >= 0.8ns + 3.6ns + 0.7ns + 0.4ns + 0.5ns = 6.0ns}。若目标周期为 5.0ns，则建立约束失败。 & 使用最大延迟和不利偏斜，不得只用典型门延迟。 \\
+保持违例 & 示例：最快路径 0.13ns 到达，而目标保持窗口要求 0.28ns 后才允许变化，存在保持违例。修复可插入保持缓冲、调整布局或修正时钟树。 & 降频不能可靠修复保持违例。 \\
+锁存器透明窗口 & enable 有效期间，前一级输入变化可能穿过第一级锁存器、组合逻辑和第二级锁存器，使一次更新跨越多个预期阶段。 & 必须指出透明期间没有清晰提交边界。 \\
+复位释放 & 控制状态复位到 \code{IDLE} 或 \code{RESET_WAIT}，写使能和危险输出为 0；复位可异步拉入，但在本时钟域用触发器同步释放。 & 复位值、安全输出、释放边界三者都要写明。 \\
+两级同步 & 外部按钮先经过电气默认值和消抖，再进入两级触发器，状态机只使用 \code{button_sync}。 & 两级同步降低亚稳态扩散概率，但不替代消抖。 \\
+MTBF 口径 & MTBF 表示亚稳态导致可见失败的平均时间尺度。目标时钟越快、异步事件越频繁，风险越高；第一级到第二级之间恢复时间越长，风险越低；器件恢复参数也会影响结果。 & 同步器是可靠性设计，不是绝对功能保证。 \\
+外部事件链路 & 示例链路：\code{raw -> filtered -> pressed -> meta -> sync -> event -> pending -> FSM}。其中 raw/filtered 属于电气与消抖，meta/sync 属于时钟域同步，event/pending 属于目标时钟域事件协议。 & 每一层信号名应对应一个可测或可验收边界。 \\
+事件保持 & \code{start_event} 置位 \code{start_pending}，状态机在 \code{IDLE} 且安全条件满足时产生 \code{start_ack} 清除 pending；复位或故障可按安全策略清除或拒绝事件。 & 单周期事件不应直接作为危险动作使能。 \\
+多 bit 跨域 & 8-bit 总线逐位同步会采到混合时刻的 bit。若是数据传输，应使用 valid/ready 握手或异步 FIFO；若是计数指针，可用格雷码减少一次变化的 bit 数。 & 多 bit 数据必须有整体有效性合同。 \\
+脉冲同步 & 可把源域窄脉冲转换为保持电平或翻转事件位，目标域同步后检测变化，再用确认信号让源域清除事件。 & 事件必须持续到目标域可见，不应仅依赖单周期脉冲宽度。 \\
+时钟门控 & 写使能让时钟继续到达触发器，只控制是否保存新值；专用时钟门控用于功耗控制并要求 enable 无毛刺和安全锁存；普通 AND 门切时钟会产生短脉冲、额外边沿和不可控偏斜。 & 普通数据通路优先用写使能，不应随意组合门控时钟。 \\
+复位域 & 每个时钟域内部同步释放复位；跨域依赖通过 ready、同步器或状态握手确认。同步器、pending 位和危险输出在复位期间应进入不会伪触发的默认值。 & 复位释放顺序属于设计合同，不能假设所有域同时恢复。 \\
+状态编码 & 二进制编码节省触发器但译码较复杂；one-hot 译码直接但触发器多；格雷编码适合相邻状态或跨域指针。无论哪种编码，未使用编码都应导向安全状态并关闭危险输出。 & 状态编码选择要绑定资源、速度、跨域和安全要求。 \\
+波形验证 & 至少观察 \code{clk/reset/source_q/dest_d/write_enable/state/sync1/sync2/pending/ack}，检查 D 是否在采样沿前稳定、写使能是否只在目标周期有效、复位释放是否产生伪事件。 & 只看最终寄存器值不足以证明同步边界正确。 \\
+CPU 连接 & PC 是寄存器，流水线寄存器是阶段边界，控制器是状态机，写回使能是状态控制线，中断入口来自同步后的外部或内部事件。 & 后续 CPU 仍遵守“组合准备、边界提交”的模型。 \\
+按钮同步器实作 & 按钮节点用上拉或下拉给出默认电平，经过 RC 和 74HC14 得到整形后的 \code{button_pressed}；再接入 74HC74 两级触发器，后级只使用第二级 Q。复位脚进入不会伪触发的默认状态。 & 必须写清楚每一级信号名，不能把 raw 引脚直接送入状态机。 \\
+计数器实作 & 74HC161/74HC163 的 CP 接低速时钟，计数使能接受控有效电平，并行装载保持无效或由实验开关控制，Q0 到 Q3 通过限流电阻接 LED。复位极性按数据手册连接。 & 计数器体现同一时钟边界上的 4-bit 状态更新。 \\
+移位输出实作 & 74HC595 的 \code{DS} 在 \code{SHCP} 边沿前稳定，8 次移位后再给 \code{STCP} 边沿，Q0 到 Q7 一起更新；\code{MR_n} 和 \code{OE_n} 保持在确定电平。 & 必须区分移位寄存器内部状态和输出锁存边界。 \\
+写使能实作 & 74HC157 在旧 Q 和 \code{new_bit} 之间选择，输出送入 74HC74 的 D；时钟持续送入触发器，\code{write_enable=0} 时写回旧 Q，\code{write_enable=1} 时写入新值。 & 不应使用普通与门直接门控时钟作为正式方案。 \\
+实验板物料 & 最小 BOM 应包含稳定 3.3V 或 5V 电源、面包板、目标 74HC/74HCT 芯片、0.1uF 去耦电容、上拉/下拉电阻、LED 与限流电阻、按钮、RC 滤波电容、杜邦线和万用表；逻辑分析仪或示波器用于观察边沿和短脉冲。 & 物料清单必须对应实验中的电源、输入、状态输出和测量证据。 \\
+接线检查 & 上电前检查 VCC/GND、低有效复位和输出使能、未用输入默认值、LED 限流、输出是否短接、电压域是否兼容。发现芯片发热或输出异常时应立即断电复查。 & 检查表应能解释常见硬件失败，而不是只列器件名称。 \\
+故障定位报告 & 示例：按一次计数器跳多格时，先观察按钮 raw，再看 74HC14 输出，最后看计数器 CP；若 raw 抖动而整形后仍有多个边沿，应增加消抖或避免按钮直接作为时钟。报告要写出修复前后观测差异。 & 失败分析必须绑定可观察信号和修复证据。 \\
+数据手册读取 & 必须先查推荐工作条件确认 VCC、电压和输入边沿，再查 \code{VIH/VIL/VOH/VOL} 判断电平兼容，查输出电流判断 LED 和负载，查传播延迟、最高频率与最小脉宽判断时钟是否合格；绝对最大额定值只用于损伤边界。 & 不得把绝对最大额定值当作正常工作条件。 \\
+电压与扇出 & 若驱动器 \code{VOH_min} 小于接收器 \code{VIH_min} 加余量，高电平不可靠；若 LED 电流过大，输出电平会被拉坏；一个输出驱动多个 CMOS 输入时还要考虑电容负载和边沿变慢。 & 判断必须同时看电压余量、电流限制和负载电容。 \\
+时钟与面包板限制 & 按钮单步必须消抖和施密特整形，NE555 要检查占空比和脉宽，晶振模块要检查频率和电压域；面包板只适合低速概念验证，不能证明高频 CPU 级可靠性。 & 状态边界必须来自合格边沿，不来自慢爬升或多次抖动。 \\
+非法状态恢复 & 未使用编码的下一状态导向 \code{IDLE}、\code{FAULT} 或复位等待态，输出逻辑默认关闭写使能、驱动使能和片选。 & 非法状态的输出也要安全，不应只写下一状态。 \\
+状态机输出 & Moore 输出只依赖状态，通常更稳定；Mealy 输出还依赖输入，响应更快但可能把输入毛刺传到控制线。危险输出宜寄存或只由稳定状态产生。 & 取舍必须结合后级是否采样或驱动危险对象。 \\
+芯片案例 & 以 74HC74 为例，D 是待保存数据，CLK 是采样边界，Q 是保存结果，异步复位/置位必须按数据手册极性连接；未用输入不能悬空。 & 真实芯片要检查引脚、电源、复位极性、时钟边沿和负载。 \\
+\bottomrule
+\end{longtable}
+
+\begin{classicnote}
+本章的标注对象是“边界”和“状态转移表”。仅说明某个值会变化并不充分，必须说明哪个时钟边界提交，提交前后的组合路径是什么。
+
+\begin{itemize}
+\item 纸上实验：画出一个 D 触发器前后各接一段组合逻辑，标出当前周期的旧 Q、组合路径上的 D、下一个时钟沿后的新 Q。
+\item 时序证据：为一条路径写出 \code{Tclk >= tCQ + tcomb + tsetup + tskew}，再解释每一项对应哪个硬件现象。
+\item 复位证据：复位要让控制状态进入已知安全点，但释放复位也要有同步边界，不能让状态机半边先跑。
+\item 状态证据：寄存器是一组并排触发器；计数器是寄存器输出经过加法器反馈到输入；移位寄存器是固定连线选择了相邻 bit。
+\item 控制证据：状态机输出可以只依赖状态，也可以依赖状态和输入；后者反应快，但更容易把输入毛刺传给控制线。
+\item 检查题：若状态编码里出现未使用编码，电路上电或受干扰进入它时，下一状态逻辑应该怎样让机器回到安全状态？参考答案：未使用编码不应保持未定义，也不应产生危险输出；下一状态逻辑应把它导向复位、IDLE、FAULT 或其他安全诊断状态，同时关闭写使能、功率使能等危险控制线。若安全要求更高，还应记录错误或触发复位流程。
+\end{itemize}
+
+经典系统教材通常会把组合逻辑和状态逻辑分开建模：组合逻辑计算下一值，状态元件在边界保存下一值。后面 CPU 的 PC、寄存器、状态机和控制器都遵守这个模型。
+\end{classicnote}

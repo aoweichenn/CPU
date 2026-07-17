@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Organize phone book PDF exports without stale duplicate files."""
+"""Organize phone book exports without duplicating PDF files."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from pathlib import Path
 
 
 PHONE_EXPORT_ROOT = Path("/mnt/sdcard/STU/BOOKS")
-PHONE_EXPORT_SUFFIXES = {".pdf"}
-PHONE_STALE_SUFFIXES = {".epub", ".md", ".txt"}
+PDF_SUFFIXES = {".pdf"}
+PHONE_STALE_FILE_SUFFIXES = {".epub", ".md", ".txt"}
 HYPHEN_LIKE_CHARS = ("-", "‐", "‑", "‒", "–", "—", "―", "－", "−")
 
 
@@ -23,7 +23,7 @@ class Book:
     topics: tuple[str, ...]
 
 
-REQUIRED_BOOKS = (
+BOOKS = (
     Book("Cpp从零到高级", "原理卷", ("Cpp语言与工程",)),
     Book("算法刷题与Cpp面试教材", "原理卷", ("算法与面试",)),
     Book("从Cpp到计算系统第一册", "原理卷", ("计算系统",)),
@@ -32,9 +32,7 @@ REQUIRED_BOOKS = (
     Book("从Cpp到计算系统第一册实践卷", "实践与代码卷", ("计算系统",)),
     Book("从Cpp到AI计算第三册实践与代码卷", "实践与代码卷", ("AI计算",)),
     Book("计算系统引擎代码实践卷", "实践与代码卷", ("计算系统",)),
-)
-
-OPTIONAL_PLANNED_BOOKS = (
+    Book("硬件从零到整机", "原理卷", ("计算机组成原理",)),
     Book("计算机组成原理第一册", "原理卷", ("计算机组成原理",)),
     Book("计算机组成原理实践卷", "实践与代码卷", ("计算机组成原理",)),
     Book("操作系统第一册", "原理卷", ("操作系统",)),
@@ -42,8 +40,6 @@ OPTIONAL_PLANNED_BOOKS = (
     Book("计算机网络第一册", "原理卷", ("计算机网络",)),
     Book("计算机网络实践卷", "实践与代码卷", ("计算机网络",)),
 )
-
-ALL_BOOKS = REQUIRED_BOOKS
 
 RETIRED_BOOK_TITLES = (
     "从Cpp到AI计算第三册实践卷",
@@ -108,20 +104,15 @@ def ensure_expected_book_files(book_dir: Path, title: str) -> None:
         raise SystemExit(f"unexpected export contents in {book_dir}: {final_files}")
 
 
-def has_expected_book_files(book_dir: Path, title: str) -> bool:
-    expected_names = {f"{title}.pdf"}
-    existing_names = {path.name for path in book_dir.iterdir() if path.is_file()}
-    return expected_names.issubset(existing_names)
-
-
 def compare_book_dirs(left: Path, right: Path, title: str) -> bool:
-    left_file = left / f"{title}.pdf"
-    right_file = right / f"{title}.pdf"
-    return (
-        left_file.is_file()
-        and right_file.is_file()
-        and filecmp.cmp(left_file, right_file, shallow=False)
-    )
+    for suffix in (".pdf",):
+        left_file = left / f"{title}{suffix}"
+        right_file = right / f"{title}{suffix}"
+        if not left_file.is_file() or not right_file.is_file():
+            return False
+        if not filecmp.cmp(left_file, right_file, shallow=False):
+            return False
+    return True
 
 
 def move_or_merge_book(root: Path, book: Book, *, allow_missing: bool) -> Path | None:
@@ -143,19 +134,8 @@ def move_or_merge_book(root: Path, book: Book, *, allow_missing: bool) -> Path |
         if allow_missing:
             return None
         raise SystemExit(f"missing phone export directory for {book.title}: {dest}")
-    if allow_missing and not has_expected_book_files(dest, book.title):
-        return None
     ensure_expected_book_files(dest, book.title)
     return dest
-
-
-def remove_optional_planned_book(root: Path, book: Book) -> None:
-    ensure_safe_title(book.title)
-    for path in (root / book.title, canonical_book_dir(root, book)):
-        if path.is_dir():
-            shutil.rmtree(path)
-        elif path.exists():
-            path.unlink()
 
 
 def clean_index_trees(root: Path) -> None:
@@ -164,7 +144,7 @@ def clean_index_trees(root: Path) -> None:
         if path.exists():
             shutil.rmtree(path)
     for path in root.rglob("*"):
-        if path.is_file() and path.suffix.lower() in PHONE_STALE_SUFFIXES:
+        if path.is_file() and path.suffix.lower() in PHONE_STALE_FILE_SUFFIXES:
             path.unlink()
 
 
@@ -182,14 +162,14 @@ def remove_retired_book_dirs(root: Path) -> None:
 
 
 def ensure_no_duplicate_exports(root: Path) -> None:
-    allowed_book_dirs = {canonical_book_dir(root, book).resolve() for book in ALL_BOOKS}
-    for book in ALL_BOOKS:
+    allowed_book_dirs = {canonical_book_dir(root, book).resolve() for book in BOOKS}
+    for book in BOOKS:
         legacy_dir = root / book.title
         if legacy_dir.exists():
             raise SystemExit(f"legacy top-level book directory still exists: {legacy_dir}")
 
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in PHONE_EXPORT_SUFFIXES:
+        if not path.is_file() or path.suffix.lower() not in PDF_SUFFIXES:
             continue
         parent = path.parent.resolve()
         if parent not in allowed_book_dirs:
@@ -207,11 +187,9 @@ def main() -> int:
     remove_retired_book_dirs(root)
 
     exported_books: list[Book] = []
-    for book in REQUIRED_BOOKS:
+    for book in BOOKS:
         if move_or_merge_book(root, book, allow_missing=args.allow_missing) is not None:
             exported_books.append(book)
-    for book in OPTIONAL_PLANNED_BOOKS:
-        remove_optional_planned_book(root, book)
 
     clean_index_trees(root)
     ensure_no_duplicate_exports(root)

@@ -7,6 +7,7 @@
 - `cpu_volume_1` -> `../../cpu-volume-1`
 - `cpu_volume_2` -> `../../cpu-volume-2`
 - `cpu_volume_3` -> `../../cpu-volume-3`
+- `hardware_zero_to_machine` -> `../../hardware-zero-to-machine`
 - `cpp_zero_to_advanced` -> `../../cpp-zero-to-advanced`
 - `algorithm_interview` -> `../../algorithm-interview`
 

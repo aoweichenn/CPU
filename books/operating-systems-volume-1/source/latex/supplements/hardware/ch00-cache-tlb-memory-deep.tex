@@ -1,0 +1,539 @@
+\section{cache、TLB 与内存层次：为什么“访问内存”不是一步}
+
+上一节走完了用户指令、缺页、系统调用和中断的入口。现在把其中最容易误解的一段单独拆开：CPU 发出一次访存后，中间经过 TLB、页表、cache、DRAM、page cache 和设备缓存，绝不是“数组下标取值”这么简单。
+
+很多 OS 机制都卡在内存层次上：上下文切换为什么贵，任务迁移为什么掉性能，页表修改为什么要 TLB shootdown，锁为什么在多核下慢，DMA 为什么要 cache 维护。若把内存当成一个均匀数组，这些问题都解释不清。
+
+\subsection{内存层次的基本矛盾}
+
+CPU 很快，DRAM 慢，存储设备更慢。为了让程序大多数时间不等最慢层，系统做了多层缓存：寄存器、L1/L2/L3 cache、TLB、内存、page cache、设备缓存。每一层都在用小容量换低延迟。
+
+\begin{longtable}{p{0.2\linewidth}p{0.28\linewidth}p{0.4\linewidth}}
+\toprule
+层次 & 保存什么 & OS 关心点 \\
+\midrule
+寄存器 & 当前计算状态 & 上下文切换、ABI、系统调用参数 \\
+L1/L2/L3 cache & 最近访问的内存 cache line & 局部性、伪共享、锁竞争 \\
+TLB & 最近虚拟页翻译 & 地址空间切换、页表修改、shootdown \\
+DRAM & 物理页 & 页分配、NUMA、回收 \\
+page cache & 文件页副本 & 文件 I/O、writeback、mmap \\
+设备缓存 & 磁盘/SSD/网卡内部状态 & flush、FUA、completion 语义 \\
+\bottomrule
+\end{longtable}
+
+OS 的工作经常是维护这些层次之间的一致解释：页表说这个虚拟页映射到哪个物理页，TLB 不能有旧答案；文件系统说数据已提交，设备缓存和稳定介质之间不能混淆；DMA 说设备已写内存，CPU cache 不能继续读旧数据。
+
+\subsection{cache line 和局部性}
+
+cache 不按字节搬运，而按 cache line 搬运。假设 cache line 是 64 byte，程序读取 \code{array[i]} 时，硬件可能把 \code{array[i]} 附近 64 byte 都搬进 cache。顺序遍历数组很快，因为空间局部性好；链表随机跳转慢，因为每个节点可能在不同 cache line。
+
+\begin{lstlisting}
+good locality:
+  for i in 0..n:
+    sum += array[i]
+
+poor locality:
+  node = head
+  while node:
+    sum += node.value
+    node = node.next
+\end{lstlisting}
+
+内核热路径偏爱数组、per-CPU 数据、紧凑结构和批量处理，不是代码风格偏好，而是 cache 行为决定的。调度器、网络栈、块层都要避免把热点状态分散到随机内存。
+
+\subsection{cache 的内部结构：tag、set、way、line}
+
+cache 不是“一个更快的内存数组”。它至少包含 data array、tag array、valid bit、dirty bit、一致性状态和替换状态。地址进入 cache 后，硬件按 index 选择 set，并行比较多个 way 的 tag。命中条件可写成：
+
+\[
+hit = \exists way:\ valid[set,way]\land tag[set,way]=tag(PA)
+\]
+
+若 line 大小为 \(L\)，set 数为 \(S\)，物理地址 \(PA\) 的基本拆分是：
+
+\[
+line = \left\lfloor \frac{PA}{L} \right\rfloor,\quad
+set = line \bmod S,\quad
+offset = PA \bmod L,\quad
+tag = \left\lfloor \frac{line}{S} \right\rfloor
+\]
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[os bit, minimum width=1.35cm] (pa) at (0,0) {PA};
+  \node[os compute, minimum width=1.65cm] (split) at (1.9,0) {tag/index/offset};
+  \node[os memory, minimum width=1.55cm] (tags) at (4.0,0.75) {tag array};
+  \node[os memory, minimum width=1.55cm] (data) at (4.0,-0.45) {data array};
+  \node[os compute, minimum width=1.65cm] (cmp) at (6.15,0.75) {$tag==$\\valid};
+  \node[os compute, minimum width=1.65cm] (waymux) at (6.15,-0.45) {way MUX};
+  \node[os compute, minimum width=1.55cm] (bytemux) at (8.15,-0.45) {byte MUX};
+  \node[os bit, minimum width=1.25cm] (value) at (9.95,-0.45) {value};
+  \node[os control, minimum width=1.45cm] (miss) at (8.15,0.75) {miss/fill};
+
+  \draw[os strong bus] (pa) -- (split);
+  \draw[os bus] (split) -- node[os label, above] {index} (tags);
+  \draw[os bus] (split) -- node[os label, below] {index} (data);
+  \draw[os bus] (tags) -- (cmp);
+  \draw[os bus] (data) -- (waymux);
+  \draw[os bus] (cmp) -- node[os label, right] {hit way} (waymux);
+  \draw[os bus] (split) |- node[os label, right] {offset} (bytemux);
+  \draw[os bus] (waymux) -- (bytemux);
+  \draw[os strong bus] (bytemux) -- (value);
+  \draw[os feedback] (cmp) -- (miss);
+\end{pdfdiagram}
+\diagramnote{cache hit 的硬件路径：index 选 set，tag 并行比较，way MUX 选中 line，offset 选出字节或字。}
+
+容量变大，tag/data array 更大，访问延迟可能增加；相联度变高，tag 比较和 way MUX 更复杂，也可能增加延迟。于是 L1 通常小而快，L2/L3 更大但更慢。它们不是“越大越好”的同一种 cache，而是在延迟、容量、功耗、面积之间取不同点。
+
+\[
+AMAT = T_{L1} + MR_{L1}\times(T_{L2}+MR_{L2}\times(T_{L3}+MR_{L3}\times T_{mem}))
+\]
+
+这条式子比“cache miss 很慢”更准确。优化内核热路径时，要么降低命中时间 \(T\)，要么降低 miss rate \(MR\)，要么降低 miss penalty。顺序预取、批处理、per-CPU 数据、减少指针追踪，本质上都在影响这三个量。
+
+\subsection{上层怎样接 cache：load/store、原子操作和页属性}
+
+CPU 上层给 cache 的请求来自取指、load、store、原子读改写和硬件 page walk。普通 load 只需要读 line；store 需要取得 line 的可写所有权；原子操作还要把读、修改、写做成对其他 CPU 可见的不可分割序列。
+
+\begin{lstlisting}
+load PA:
+  require line in Shared or Exclusive/Modified state
+  return selected bytes
+
+store PA:
+  obtain line ownership
+  modify selected bytes
+  mark line dirty
+
+locked atomic PA:
+  obtain exclusive ownership
+  block competing ownership changes for this operation
+  read old value, compute new value, write new value
+\end{lstlisting}
+
+OS 通过页表属性影响 cache 行为。普通 RAM 映射为 write-back；MMIO 通常映射为 uncacheable 或 device 类属性；framebuffer 可能用 write-combining；持久内存还要考虑 cache line flush 和持久化屏障。页表项不是只管权限，也影响访问到达下层硬件的方式。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+映射属性 & 适用对象 & 错配后果 \\
+\midrule
+write-back & 普通 DRAM & 性能最好，靠一致性协议维护 CPU 间可见性 \\
+不可缓存或设备 & MMIO 寄存器 & 若误设可缓存，设备寄存器读写可能被合并或读旧值 \\
+写合并 & framebuffer、顺序写窗口 & 适合批量写，不适合需要严格读回的寄存器 \\
+write-through & 少见特殊场景 & 写延迟高，但下层更快得到更新 \\
+\bottomrule
+\end{longtable}
+
+这就是为什么驱动不能把 MMIO 当普通指针。访问普通内存的 \code{*ptr = value} 可以被编译器和 CPU 优化；访问设备寄存器要用 \code{readl/writel} 一类 API，API 同时表达 volatile 语义、宽度、字节序和必要排序。
+
+\subsection{下层怎样接 cache：fill、evict、writeback}
+
+cache miss 不是直接“去内存拿一个变量”。L1 miss 会向 L2 发 line fill；L2 miss 向 L3；L3 miss 向内存控制器或互联。若要替换的旧 line 是 dirty，还要先 writeback 到下层。
+
+\begin{lstlisting}
+cache_miss(PA):
+  victim = choose_way(set(PA))
+  if victim.valid and victim.dirty:
+    send writeback(victim.line_address, victim.data)
+  send read_for_ownership_or_shared(PA.line_address)
+  wait for lower level response
+  install returned line with tag, data, state
+  replay waiting load/store
+\end{lstlisting}
+
+这条路径解释了为什么同一个 load 有时很快，有时慢几个数量级。若 L1 命中，路径短；若一路 miss 到 DRAM，要经过互联、内存控制器、DRAM bank/row；若还遇到 dirty victim writeback 或其他 core 的所有权竞争，延迟更高。
+
+\[
+T_{miss} = T_{lookup\_lower}+T_{queue}+T_{transfer}+T_{install}+T_{replay}
+\]
+
+\subsection{写回 cache 和 dirty line}
+
+CPU 写一个变量时，通常先写 cache line，把它标为 dirty。dirty line 何时写回内存由硬件决定。对其他 CPU，cache coherence 协议会维护普通内存一致性；对设备 DMA，则要看平台是否 DMA coherent。
+
+\begin{lstlisting}
+CPU writes buffer:
+  cache line becomes dirty
+  DRAM may still have old bytes
+
+device DMA reads buffer:
+  if platform not coherent and driver forgot cache clean:
+    device may read old bytes
+\end{lstlisting}
+
+所以驱动使用 DMA API，而不是手写物理地址。API 的一部分工作就是按平台需要做 cache clean/invalidate 和 IOMMU 映射。
+
+\subsection{伪共享：没有共享变量也会共享 cache line}
+
+两个 CPU 写不同变量，但变量落在同一 cache line，也会互相抢 line 所有权。
+
+\begin{lstlisting}
+struct Counters {
+  atomic<uint64_t> a; // CPU0 writes
+  atomic<uint64_t> b; // CPU1 writes, same cache line
+}
+\end{lstlisting}
+
+从程序语义看，\code{a} 和 \code{b} 独立；从硬件看，它们在同一 cache line。两个 CPU 都要写，line 在 CPU0 和 CPU1 之间来回迁移。解决方法是 padding 或 per-CPU 分片。
+
+\begin{lstlisting}
+struct Counters {
+  alignas(64) atomic<uint64_t> a;
+  alignas(64) atomic<uint64_t> b;
+}
+\end{lstlisting}
+
+OS 设计 runqueue、统计计数器、slab cache 时经常这么做。性能问题不是“算法复杂度”一个维度，cache line 也是复杂度的一部分。
+
+\subsection{多核一致性：写共享变量为什么会拖慢}
+
+多核 CPU 必须让普通内存看起来有一致解释。常见教学模型用 MESI 类状态描述一条 cache line 的所有权：Modified、Exclusive、Shared、Invalid。真正实现可能更复杂，但核心事实是：写某条 line 需要独占所有权，其他 CPU 的同一 line 副本要失效或降级。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+状态 & 含义 & 对 OS 的影响 \\
+\midrule
+M & 本 CPU 拥有脏副本，下层可能旧 & 迁移或回收前要理解 dirty writeback 不是同步点 \\
+E & 本 CPU 独占干净副本 & 第一次写可本地升级，成本低 \\
+S & 多个 CPU 可读共享副本 & 读共享便宜，写需要失效别人 \\
+I & 本 CPU 没有有效副本 & 访问要重新获取 line \\
+\bottomrule
+\end{longtable}
+
+自旋锁慢，不只是“很多线程等一个变量”。锁变量所在 cache line 会在多个 CPU 间反复转移所有权：
+
+\[
+CPU_0\ write(lock) \Rightarrow line@CPU_0=M,\qquad
+CPU_1\ atomic(lock) \Rightarrow line\ moves\ to\ CPU_1
+\]
+
+如果同一 line 还放了其他热字段，那些字段也会被拖着迁移。per-CPU 计数器、cacheline padding、队列分片、RSS 多队列，本质上都是减少 cache line ownership 在 CPU 间来回跑。
+
+\subsection{内存屏障：cache 一致性不等于执行顺序}
+
+cache 一致性解决“同一地址最终按某种一致规则被看见”，不自动解决“不同地址按程序写的顺序被别人看见”。CPU store buffer、load buffer、乱序执行和编译器优化都会改变可见顺序。锁、原子变量、设备 doorbell、DMA descriptor 都需要明确顺序。
+
+\begin{lstlisting}
+wrong DMA publish:
+  desc.addr = dma_addr
+  desc.len = len
+  doorbell = tail        // device may see doorbell before descriptor fields
+
+right DMA publish:
+  desc.addr = dma_addr
+  desc.len = len
+  dma_wmb()
+  writel(tail, DOORBELL)
+\end{lstlisting}
+
+这里的屏障不是为了“让 CPU 慢一点”，而是为了建立跨主体可见顺序：
+
+\[
+\text{descriptor writes visible to device}
+\prec
+\text{doorbell visible to device}
+\]
+
+普通锁也一样。unlock 前的临界区写入必须先于别的 CPU acquire lock 后读取；否则锁只保护了代码形状，没有保护内存可见性。C++20 的 acquire/release、Linux 的 \code{smp\_load\_acquire}/\code{smp\_store\_release} 都是在表达这个关系。
+
+\subsection{TLB 为什么存在}
+
+虚拟地址翻译需要查页表。多级页表可能访问多次内存。TLB 缓存最近翻译，让常见内存访问不必每次 page walk。
+
+\begin{lstlisting}
+load [va]:
+  if TLB has va page:
+    pa = cached translation
+  else:
+    pa = page_table_walk(va)
+    insert into TLB
+  load cache line at pa
+\end{lstlisting}
+
+TLB 命中时，虚拟内存开销很低；TLB miss 时，硬件要走页表，可能触发更多 cache miss。程序工作集太大、随机访问太多、页太小，都可能让 TLB miss 增加。
+
+\subsection{TLB 和 cache 的先后关系}
+
+教学时可以说“先翻译 VA 到 PA，再查 cache”，但真实 CPU 为了快会并行化部分步骤。例如 VIPT L1 cache 可以用页内 offset 里的 index 位先选 set，同时 TLB 查 tag 所需的物理页号。无论微架构怎样优化，架构契约必须满足：
+
+\[
+VA \xrightarrow{TLB/page\ walk} PA,\qquad
+permission(PTE, access, CPL)=allow
+\Rightarrow load/store\ may\ commit
+\]
+
+若权限失败，访问不能提交。若只是 data cache miss，访问可以等待下层填充后提交。二者性质完全不同：
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+事件 & 硬件性质 & OS 是否介入 \\
+\midrule
+L1/L2/L3 cache miss & 性能事件，硬件向下层取 line & 通常不介入，只能通过性能计数观察 \\
+TLB miss 且 page walk 成功 & 性能事件，硬件填 TLB & 通常不介入 \\
+PTE not present & 架构异常 \#PF & OS 查 VMA，分配页、读文件或发信号 \\
+权限不允许 & 架构异常 \#PF/\#GP & OS 判断 COW、mprotect 或非法访问 \\
+非 canonical 地址 & 架构异常 & OS 通常向用户报告错误或处理内核 bug \\
+\bottomrule
+\end{longtable}
+
+这张表是理解虚拟内存的关键。cache miss 是“硬件还没拿到数据”；page fault 是“硬件不能合法完成这次访问”。二者都可能让程序慢，但只有后者是 OS 语义路径。
+
+\subsection{页表项是 OS 和硬件共享的数据结构}
+
+x86-64 PTE 不是普通整数。硬件 page walker 读取它，OS 修改它，TLB 缓存它的结果。PTE 里既有物理页框号，也有 present、writable、user、accessed、dirty、global、NX 等权限和状态位。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+PTE 字段 & 硬件怎样用 & OS 怎样用 \\
+\midrule
+present & 不为 1 时访问触发 \#PF & 懒分配、换入、文件页加载 \\
+RW & 写访问权限 & COW、mprotect、只读代码页 \\
+US & 用户态是否可访问 & 用户/内核隔离，SMAP 配合 \\
+XD/NX & 是否禁止取指 & W\textasciicircum X、栈不可执行 \\
+accessed & 硬件可置位 & 页面回收估计热度 \\
+dirty & 写入后硬件可置位 & 回写、COW、文件脏页判断 \\
+global & CR3 切换时可保留 & 内核全局映射减少 TLB 损失 \\
+\bottomrule
+\end{longtable}
+
+因此页表锁不是形式主义。OS 修改 PTE 时，要同时考虑硬件可能正在 page walk，其他 CPU 可能缓存旧翻译，回收线程可能看 accessed/dirty，文件系统可能等脏页回写。页表是硬件和内核并发访问的共享结构。
+
+\subsection{TLB shootdown 为什么昂贵}
+
+当一个 CPU 修改某进程页表，例如取消映射某页，其他 CPU 可能还在 TLB 里缓存旧翻译。如果旧物理页被释放并重用，其他 CPU 用旧翻译访问就会破坏隔离。因此内核必须让相关 CPU 失效旧 TLB 项。
+
+\begin{lstlisting}
+unmap page:
+  remove PTE
+  find CPUs that may run this address space
+  send IPI to those CPUs
+  each CPU invalidates TLB entry
+  wait for acknowledgement
+  now physical page can be freed
+\end{lstlisting}
+
+这涉及跨 CPU 中断和等待，所以昂贵。x86-64 内核会批量 unmap、延迟释放、使用 PCID 减少全局刷新。页表不是普通 map，TLB 让它变成多核协议。
+
+\subsection{PCID：避免每次切换都清空 TLB}
+
+若 TLB 只缓存虚拟页到物理页，不区分进程，那么切换地址空间时必须清空，否则进程 B 的虚拟地址可能命中进程 A 的翻译。x86-64 的 PCID 给 TLB 项加地址空间标签，让不同进程的同一虚拟地址可共存。PCID 不是进程 ID，也不是 pid；它是处理器用于区分 TLB 项归属的短标签，由内核分配、复用和失效。
+
+\begin{lstlisting}
+TLB entry:
+  virtual_page
+  pcid
+  physical_page
+  permissions
+\end{lstlisting}
+
+这降低上下文切换成本，但没有消除页表修改成本。若某个地址空间自己的 PTE 改了，对应 PCID 的旧项仍要失效。PCID 解决的是“不同地址空间的旧翻译不要互相污染”，不解决“同一地址空间的 PTE 更新后旧翻译仍然存在”。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+问题 & PCID 能否解决 & 还需要什么 \\
+\midrule
+进程切换后保留部分 TLB 热度 & 能 & 正确设置 CR3/PCID 和保留策略 \\
+进程 A 的虚拟页误命中进程 B 的翻译 & 能 & TLB key 必须包含 PCID \\
+\code{mprotect} 把页从可写改为只读 & 不能自动解决 & invalidate 当前 PCID 的目标页 \\
+\code{munmap} 后释放物理页 & 不能自动解决 & shootdown 所有可能持有旧翻译的 CPU \\
+PCID 被复用给另一个地址空间 & 不能自动解决 & 复用前清理旧 PCID 相关 TLB 项 \\
+\bottomrule
+\end{longtable}
+
+\subsection{NUMA：物理内存也有远近}
+
+多插槽机器上，每个 CPU 到本地内存控制器更近，到远端内存更远。统一的“物理内存池”只是抽象，硬件上访问延迟和带宽不同。OS 调度和页分配要尽量让线程运行在靠近其内存的 CPU 上。
+
+\begin{lstlisting}
+first touch policy:
+  thread on node 0 first writes page
+  kernel allocates physical page from node 0
+
+bad migration:
+  thread moves to node 1
+  still accesses node 0 memory
+  remote latency increases
+\end{lstlisting}
+
+这解释了 CPU affinity、NUMA balancing、内存绑定策略。并不是核心越多越快，线程和内存分布不匹配会让远端访问拖慢程序。
+
+\subsection{page cache：文件 I/O 的内存层}
+
+读文件时，内核通常先把磁盘块读到 page cache，再从 page cache 拷贝给用户。再次读取同一页时，不需要访问设备。写文件时，数据可能先进入 page cache 并标记 dirty，稍后 writeback 到设备。
+
+\begin{lstlisting}
+read(file, buf):
+  page = page_cache_lookup(file, offset)
+  if page missing:
+    page = read_from_disk(file, offset)
+    insert into page cache
+  copy page bytes to user buffer
+\end{lstlisting}
+
+这解释了为什么 \code{write} 返回成功不等于落盘。它可能只是写入 page cache。可靠持久化需要 \code{fsync}、日志、flush/FUA 等机制把数据推进到稳定介质。
+
+\subsection{四种 cache 不要混在一起}
+
+很多读者看到 cache 就只想到“快一点的内存”。在 OS 里至少要区分四种名字相似但语义完全不同的缓存。
+
+\begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
+\toprule
+缓存 & 缓存的是什么 & 谁负责一致性 \\
+\midrule
+CPU data cache & 物理内存中的 cache line & 硬件一致性协议，DMA 时还要驱动/API 配合 \\
+I-cache & 指令字节 & 硬件和内核在代码修改、JIT、模块加载时配合 \\
+TLB & 虚拟页到物理页和权限 & MMU 填充，内核在改 PTE 后失效旧项 \\
+page cache & 文件内容的内存副本 & 内核文件系统、回写线程、fsync 和设备 flush \\
+设备缓存 & SSD/NIC/磁盘控制器内部队列或缓存 & 驱动命令、flush/FUA、设备完成语义 \\
+\bottomrule
+\end{longtable}
+
+这几种缓存的错误后果不同。CPU data cache 错了，CPU 可能读到旧字节；TLB 错了，权限或物理页可能错；page cache 错了，文件语义和落盘语义错；设备缓存错了，崩溃恢复可能错。调试时必须先问“哪一层缓存给了旧答案”，不能把所有现象都叫 cache miss。
+
+\subsection{一条 load 的完整时间线}
+
+把 \asmcode{mov rax, qword ptr [rdi]} 拆成时间线，可以看清 cache、TLB、页表和异常的先后关系。
+
+\begin{lstlisting}
+1. decode instruction and read rdi
+2. compute virtual address
+3. check canonical form
+4. lookup D-TLB by virtual page and PCID
+5. if TLB miss, walk x86-64 page tables from CR3
+6. check PTE present, user/supervisor, writable, NX as needed
+7. combine physical frame with page offset
+8. access L1 data cache by physical line
+9. on cache miss, fetch line from lower cache or DRAM
+10. only if all checks pass, write loaded value into rax
+\end{lstlisting}
+
+异常可能发生在多个位置：非 canonical 地址在 page walk 前失败；PTE 不存在或权限不符时 page fault；物理地址命中 MMIO 时变成设备访问；普通 DRAM cache miss 只是性能事件，不是异常。OS 处理 page fault 时，面对的是第 5/6 步失败，不是第 8/9 步变慢。
+
+\subsection{三条页表修改路径：COW、mprotect 和 munmap}
+
+页表修改不能只说“改 PTE”。不同路径要维护的所有权不同，因此 TLB 和物理页生命周期也不同。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+路径 & 页表动作 & 必须同步的事实 \\
+\midrule
+COW 写 fault & 分配新物理页，把当前进程 PTE 改到新页并设 writable & 旧共享页引用计数减少；当前 CPU 旧只读翻译要失效或被覆盖 \\
+\code{mprotect} 收紧权限 & 原 PTE 保留同一物理页，但清 writable 或 executable & 所有 CPU 的旧权限翻译必须失效 \\
+\code{munmap} & 删除 PTE，并可能释放物理页 & 释放前必须等远端 TLB 不再能访问旧页 \\
+进程退出 & 批量拆整棵地址空间 & 可以批量 shootdown，但页释放仍要等旧翻译安全消失 \\
+\bottomrule
+\end{longtable}
+
+用状态机写会更清楚：
+
+\begin{lstlisting}
+unmap_and_free(mm, va):
+  lock page table
+  pte = clear_pte(mm, va)
+  page = pte.physical_page
+  record tlb_flush(mm.pcid, va)
+  unlock page table
+
+  send shootdown to CPUs that may run mm
+  wait for acknowledgements
+
+  drop page reference
+  if page.refcount == 0:
+    free physical page
+\end{lstlisting}
+
+这段顺序中，最不能提前的是释放物理页。如果先把页交给分配器，远端 CPU 又用旧 TLB 写了一次，就会把新对象写坏。很多内存安全问题并不是“页表 map 写错了”，而是页表、TLB、引用计数和跨 CPU 确认之间少了一步。
+
+\subsection{PCID 的复用为什么也要有生命周期}
+
+PCID 数量有限，不可能永远给每个历史进程一个新标签。内核复用 PCID 时，要保证旧地址空间留下的 TLB 项不会被新地址空间误用。简单模型如下：
+
+\begin{lstlisting}
+assign_pcid(mm):
+  if mm has active pcid on this CPU:
+    return mm.pcid
+
+  pcid = choose reusable pcid
+  if pcid belonged to another mm:
+    invalidate all non-global TLB entries for pcid
+  bind pcid to mm on this CPU
+  return pcid
+\end{lstlisting}
+
+PCID 的局部性也很重要。同一个进程在 CPU 0 上的 PCID 状态，不能直接等价于 CPU 7 上的状态；每个 CPU 有自己的 TLB 和 PCID 使用历史。于是 shootdown 既要知道地址空间，也要知道哪些 CPU 可能缓存过这个地址空间。调度器、地址空间切换和 TLB 子系统因此耦合在一起。
+
+\subsection{从 page cache 到 CPU cache：文件页的两层身份}
+
+文件内容进入内存后，首先成为 page cache 中的页；CPU 读取这页时，又会把其中的 cache line 放进 CPU data cache。page cache 是内核管理的“文件页对象”，CPU cache 是硬件管理的“物理 line 副本”。它们名字都叫 cache，但层级和所有权完全不同。
+
+\[
+\text{file offset} \rightarrow \text{page cache page}
+\rightarrow \text{physical page}
+\rightarrow \text{CPU cache line}
+\]
+
+一次 \code{read} 和一次 \code{mmap} 读同一个文件页，可能最终访问同一个 page cache page；区别是 \code{read} 把字节拷到用户 buffer，\code{mmap} 让用户虚拟地址直接映射到这个页。无论哪条路径，CPU 执行 load 时仍会经过 TLB 和 data cache。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+层次 & 管理者 & 一致性问题 \\
+\midrule
+page cache & 内核 VFS/文件系统/mm & 文件偏移、脏页、writeback、truncate、mmap 一致性 \\
+CPU cache & 硬件一致性协议和页属性 & line 命中、dirty line、跨 CPU 所有权、DMA 同步 \\
+设备缓存 & 设备控制器和驱动协议 & flush/FUA、completion、掉电恢复 \\
+\bottomrule
+\end{longtable}
+
+\code{write} 返回成功通常只说明数据进入内核管理的内存状态，不说明设备稳定保存。若 page cache 页变 dirty，writeback 线程稍后把它交给块层；块设备 completion 说明设备处理了请求；\code{fsync} 还要保证文件系统日志和设备 flush 语义满足崩溃恢复要求。
+
+\subsection{DRAM 到 OS 页分配：不是一块均匀大数组}
+
+固件把物理内存地图交给内核。内核要排除固件保留区、MMIO hole、内核镜像、initrd、ACPI 表、崩溃内核保留区，再把可用 RAM 切成 page frame。NUMA 系统还要把页按 node 管理。
+
+\begin{lstlisting}
+boot memory setup:
+  read firmware memory map
+  remove reserved and MMIO ranges
+  mark usable DRAM ranges
+  split ranges into page frames
+  assign frames to NUMA nodes and zones
+  initialize buddy allocator and per-cpu page lists
+\end{lstlisting}
+
+页分配器不是只维护一个 free list。它要处理 DMA zone、normal zone、high memory 历史约束、NUMA node、水位线、迁移类型、巨页、CMA、内存热插拔和内存错误下线。硬件给的是不连续、带属性、带距离和可靠性信息的物理地址空间；OS 把它整理成可分配页。
+
+\subsection{内存错误：ECC、MCE 和 page offline}
+
+DRAM 位错误可能被 ECC 纠正，也可能不可纠正。CPU 或内存控制器通过 machine check、EDAC 日志或平台错误接口报告。OS 要把硬件错误映射到物理页、进程和恢复策略。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+错误类型 & 硬件现象 & OS 策略 \\
+\midrule
+corrected error & ECC 修复，程序未必失败 & 记录地址，统计趋势，必要时预防性下线页 \\
+uncorrected recoverable & 某次访问无法修复但系统可定位 & 杀死受影响进程或下线页 \\
+fatal machine check & CPU 无法保证继续执行安全 & panic 或平台复位 \\
+\bottomrule
+\end{longtable}
+
+这说明“物理页”也有生命周期和可靠性。内核可以把某页标记为不再分配；文件页可重新从磁盘读，匿名页可能导致进程失败；内核关键页出错更严重。硬件错误处理把 DRAM 物理事实带进了 OS 策略。
+
+\subsection{本节验收}
+
+\begin{rubricbox}
+\begin{itemize}
+\tightlist
+\item 能说明 cache line 为什么会让顺序数组快、随机链表慢。
+\item 能画出 tag/set/way/offset 的 cache lookup，并写出 set/index 公式。
+\item 能用 AMAT 解释 L1/L2/L3/DRAM 延迟怎样叠加。
+\item 能解释伪共享为什么会让两个独立计数器互相拖慢。
+\item 能说明 MESI 类状态为什么让写共享变量产生 line ownership 迁移。
+\item 能区分 cache miss、TLB miss、page fault 和权限 fault。
+\item 能画出虚拟地址访问经过 TLB、页表、cache、内存的路径。
+\item 能解释 PTE 字段如何同时服务硬件 page walk 和 OS 内存策略。
+\item 能说明修改页表后为什么要 TLB shootdown。
+\item 能解释 PCID 解决什么，不解决什么。
+\item 能解释 NUMA 为什么让线程迁移和页分配有关。
+\item 能区分 CPU cache、TLB、page cache、设备缓存和稳定介质。
+\item 能解释 DRAM/ECC 错误如何映射到 page offline 或进程失败。
+\end{itemize}
+\end{rubricbox}

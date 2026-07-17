@@ -7,13 +7,11 @@
 ```bash
 make check
 make pdf
-make epub
 ```
 
 生成文件：
 
 - `main.pdf`
-- `main.epub`
 
 写作约束：
 
@@ -21,4 +19,4 @@ make epub
 - 每个概念先说明它解决的底层问题，再给术语。
 - 正文以原理、伪代码、关键 C++ 片段、汇编形态和测量边界为主。
 - 当前 `books/cpu-volume-3/labs/linux_cpu_inference/` 是最小 MLP/int8 权重切片；完整工程路线会继续扩展到 7B 级 decoder-only 模型加载、tokenizer、Transformer 层、KV cache、CPU/GPU 后端和 benchmark harness。
-- EPUB 不包含图片文件或本地字体文件，保持微信读书兼容导出。
+- 正式交付只生成 PDF，导出目录也只保留 PDF。

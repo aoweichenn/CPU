@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export one book with title-safe output filenames."""
+"""Export one book as one title-named PDF."""
 
 from __future__ import annotations
 
@@ -8,8 +8,7 @@ import shutil
 from pathlib import Path
 
 
-SOURCE_PDF = "main.pdf"
-SOURCE_EPUB = "main.epub"
+SOURCE_FILE = "main.pdf"
 ALLOWED_EXPORT_ROOTS = (
     Path("book-exports"),
     Path("/mnt/sdcard/STU/BOOKS"),
@@ -21,12 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source", required=True, type=Path)
     parser.add_argument("--dest", required=True, type=Path)
     parser.add_argument("--pdf-name", required=True)
-    parser.add_argument("--epub-name")
-    parser.add_argument(
-        "--pdf-only",
-        action="store_true",
-        help="export only the title-named PDF and remove stale files in the destination",
-    )
+    parser.add_argument("--epub-name", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
@@ -62,51 +56,26 @@ def clean_dest(dest: Path) -> None:
             child.unlink()
 
 
-def export_book(
-    source: Path,
-    dest: Path,
-    pdf_name: str,
-    epub_name: str | None,
-    *,
-    pdf_only: bool,
-) -> None:
+def export_book(source: Path, dest: Path, pdf_name: str) -> None:
     validate_export_name(pdf_name, "PDF")
-    source_files = [SOURCE_PDF]
-    output_files = [f"{pdf_name}.pdf"]
-    if not pdf_only:
-        if epub_name is None:
-            raise SystemExit("--epub-name is required unless --pdf-only is used")
-        validate_export_name(epub_name, "EPUB")
-        source_files.append(SOURCE_EPUB)
-        output_files.append(f"{epub_name}.epub")
-
-    missing = [source_file for source_file in source_files if not (source / source_file).is_file()]
-    if missing:
-        raise SystemExit(f"missing build artifacts in {source}: {', '.join(missing)}")
+    if not (source / SOURCE_FILE).is_file():
+        raise SystemExit(f"missing build artifact in {source}: {SOURCE_FILE}")
 
     clean_dest(dest)
-    copy_pairs = zip(source_files, output_files, strict=True)
-    for source_file, output_file in copy_pairs:
-        shutil.copy2(source / source_file, dest / output_file)
+    output_file = f"{pdf_name}.pdf"
+    shutil.copy2(source / SOURCE_FILE, dest / output_file)
 
     exported = sorted(path.name for path in dest.iterdir() if path.is_file())
-    expected = sorted(output_files)
+    expected = [output_file]
     if exported != expected:
         raise SystemExit(f"unexpected export contents in {dest}: {exported}")
 
-    for output_file in output_files:
-        print(dest / output_file)
+    print(dest / output_file)
 
 
 def main() -> int:
     args = parse_args()
-    export_book(
-        args.source,
-        args.dest,
-        args.pdf_name,
-        args.epub_name,
-        pdf_only=args.pdf_only,
-    )
+    export_book(args.source, args.dest, args.pdf_name)
     return 0
 
 

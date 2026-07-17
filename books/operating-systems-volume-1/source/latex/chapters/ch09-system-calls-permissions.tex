@@ -258,6 +258,20 @@ copy_from_user(dst, user_ptr, len):
 
 真实内核还要处理 TOCTOU：检查之后用户线程可能修改内存。因此安全策略是把用户数据复制到内核缓冲区后再解析，不在解析过程中反复信任用户地址。路径字符串、数组参数和结构体参数都应遵守这个原则。
 
+用 \code{write(fd, user_buf, 8192)} 看一次跨页复制。假设 \code{user\_buf} 从页 A 的最后 100 字节开始，后面 8092 字节落在页 B 和页 C。页 A 可读，页 B 暂时没有 PTE 但 VMA 允许按需调入，页 C 不在任何 VMA 中。内核不能只检查起始地址，也不能在持有文件锁并已经修改文件状态后才发现页 C 不合法。稳妥路径通常是先把用户数据复制或 pin 到内核可控制的状态，再提交给文件或设备层。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+片段 & 复制时发生什么 & 结果 \\
+\midrule
+页 A 尾部 100 字节 & 页表权限允许读，直接复制 & \code{copied = 100} \\
+页 B & PTE 不 present，缺页处理按 VMA 调入或分配页 & 成功后继续复制 \\
+页 C & 找不到 VMA 或权限不允许读 & \code{copy\_from\_user} 返回 \code{-EFAULT} \\
+\bottomrule
+\end{longtable}
+
+错误处理取决于提交点。如果系统调用还没有把任何字节交给文件对象，返回 \code{-EFAULT} 比较干净；如果某些接口允许部分完成，必须返回已经完成的字节数，并让调用者继续处理。关键是不能让内核对象处在“文件 offset 已经推进、page cache 半更新、但调用者只看到 EFAULT”的混乱状态。用户指针复制看似是内存问题，本质上是在保护系统调用的提交边界。
+
 \subsection{权限检查的顺序}
 
 权限检查要先定位对象，再检查主体是否有权操作对象，最后检查操作是否符合对象当前状态。以 \code{write(fd)} 为例：fd 必须存在；open file description 必须允许写；文件系统不能只读；用户 buffer 必须可读；长度不能超过限制；对象当前不能处于不允许写入的状态。
@@ -331,6 +345,21 @@ safe_open(path):
 
 路径名是查找输入，不是稳定对象。fd、inode 引用和 file 引用才是内核能持有的对象身份。安全系统调用设计要尽量让检查和使用落在同一个对象引用上。
 
+再看一个真实感更强的攻击时序。受害程序想安全打开用户指定目录下的 \code{data.txt}，先调用 \code{stat(path)} 检查它不是符号链接、权限也允许，然后再调用 \code{open(path)}。攻击者在两次调用之间把 \code{data.txt} 替换成指向 \code{/etc/shadow} 的符号链接。若内核或程序把“刚才检查过的路径字符串”当作对象身份，第二次打开的就可能是另一个对象。
+
+\begin{longtable}{p{0.16\linewidth}p{0.42\linewidth}p{0.3\linewidth}}
+\toprule
+时刻 & 动作 & 对象身份 \\
+\midrule
+1 & 受害者 \code{stat("/tmp/x/data.txt")} & 检查的是旧 dentry/inode \\
+2 & 攻击者 \code{rename} 替换路径分量 & 路径字符串不变，指向对象已变 \\
+3 & 受害者 \code{open("/tmp/x/data.txt")} & 解析得到新 dentry/inode \\
+4 & 程序继续写入 & 权限检查和使用对象不一致 \\
+\bottomrule
+\end{longtable}
+
+更可靠的接口会缩短或消除这个窗口。例如先打开目录 fd，再用 \code{openat} 相对目录解析；使用 \code{O\_NOFOLLOW} 拒绝末尾符号链接；在打开后对拿到的 fd 做 \code{fstat}，因为 fd 绑定的是已经打开的 file 对象；需要创建时用 \code{O\_CREAT|O\_EXCL} 把“检查不存在”和“创建”合成一个原子操作。原则不变：路径是名字，fd/inode/file 引用才是稳定对象。
+
 \section{测试}
 
 系统调用测试要验证边界，而不只是验证 happy path。
@@ -348,6 +377,24 @@ safe_open(path):
 \end{itemize}
 
 测试结论要写清“内核没有做什么”。例如权限失败时没有写入数据，非法指针没有部分污染内核对象，系统调用被信号打断后调用者能判断是否需要重试。负面保证是 OS 边界的核心。
+
+\subsection{本章压缩进来的边界账本}
+
+系统调用深讲材料可以展开很多低级细节：entry 汇编、异常修复表、capability、LSM、seccomp、vDSO、审计、ptrace、restart block 和资源限制。主线阅读时先把它们压成一张账本。任一系统调用都要能说清：入口寄存器保存在哪里，用户指针何时复制成内核快照，权限在哪个稳定对象上检查，失败是否已经改变状态，返回前是否处理信号、审计和抢占。
+
+\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+边界 & 必须回答的问题 & 错误后果 \\
+\midrule
+entry/return & 用户 RIP/RSP/flags 和参数寄存器怎样保存与恢复 & 返回到错误特权级、泄露寄存器或跳过信号处理 \\
+用户内存 & 外层结构、内层指针和长度何时复制、何时 pin 页 & \code{EFAULT} 变 panic，TOCTOU，整数溢出 \\
+对象解析 & fd、path、inode、socket、namespace 是否已变成稳定引用 & 检查和使用不是同一对象 \\
+权限策略 & DAC、capability、LSM、seccomp、rlimit 谁先失败 & 错误码混乱或绕过最小权限 \\
+提交点 & 哪一行之后状态对用户可见，失败如何回滚 & fd 泄漏、引用计数泄漏、半初始化对象可见 \\
+\bottomrule
+\end{longtable}
+
+这张账本能把看似分散的实现放回同一条路径。例如 \code{openat} 的提交点不是解析路径，也不是创建 file 对象，而是 fd 安装到进程 fd 表；在这之前失败必须释放 file、dentry、inode 和路径引用。在 \code{write} 中，返回正数可能表示部分完成；调用者不能把它和完整业务提交等同。在 \code{ioctl} 中，命令结构体版本、长度和 padding 都属于 ABI，不能因为“这是私有命令”就直接信任用户传入的内存布局。
 
 \section{源码级补充：entry\_SYSCALL\_64、capability、LSM 与 vDSO}
 

@@ -15,14 +15,12 @@ source/latex/
 ```bash
 make -C source/latex check
 make -C source/latex pdf
-make -C source/latex epub
 ```
 
 生成文件：
 
 ```text
 source/latex/main.pdf
-source/latex/main.epub
 ```
 
 当前保留的第一阶段切片：

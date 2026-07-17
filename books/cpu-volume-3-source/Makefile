@@ -1,17 +1,14 @@
 LATEX_DIR := source/latex
 
-.PHONY: all check pdf epub test clean
+.PHONY: all check pdf test clean
 
-all: pdf epub
+all: pdf
 
 check:
 	$(MAKE) -C $(LATEX_DIR) check
 
 pdf:
 	$(MAKE) -C $(LATEX_DIR) pdf
-
-epub:
-	$(MAKE) -C $(LATEX_DIR) epub
 
 test:
 	cmake -S ../cpu-volume-3 -B ../cpu-volume-3/build/lcqi-debug -DCMAKE_BUILD_TYPE=Debug

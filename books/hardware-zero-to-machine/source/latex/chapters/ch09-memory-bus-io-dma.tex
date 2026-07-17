@@ -1,0 +1,851 @@
+
+\chapter{主存、总线、I/O 与 DMA}
+
+前面已经解释了最小 CPU 如何在内部取指、译码、执行和提交状态。若停在这里，读者只能得到一台“会在寄存器之间搬数”的小机器。真正的整机还需要大容量主存、可寻址设备、外部事件、等待、错误和批量数据搬运。本章专门补上这条桥：CPU 怎样把一个地址变成一次存储器或设备事务，设备怎样把完成事件通知 CPU，DMA 又怎样在不让 CPU 逐字搬运的情况下读写主存。
+
+本章的目标不是背总线协议名字。无论是 8086 板级总线、微控制器片内总线、PCIe 设备，还是现代 SoC 互连，工程问题都相同：谁发起请求，谁响应地址，数据由谁驱动，什么时候采样，目标慢了怎样等待，目标不存在怎样失败，设备完成后怎样通知。把这些问题写清楚，才能从最小 CPU 走到可启动、可调试、可扩展的整机。
+
+\begin{keyidea}
+整机硬件不是“CPU 加一块内存”的粗线图，而是一组可验收事务。每次访问都必须说明地址、方向、字节选择、目标片选、握手、完成、错误和副作用。只有这些边界明确，CPU 才能可靠地取指、访存、访问设备和处理中断。
+\end{keyidea}
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.55cm] (cpu) at (0,0) {CPU};
+  \node[hw compute, minimum width=1.95cm] (dec) at (2.35,0) {地址译码};
+  \node[hw state, minimum width=1.65cm] (rom) at (5.0,1.0) {ROM};
+  \node[hw state, minimum width=1.65cm] (ram) at (5.0,0) {SRAM};
+  \node[hw control, minimum width=1.65cm] (io) at (5.0,-1.0) {MMIO};
+  \node[hw control, minimum width=1.75cm] (irq) at (7.45,-1.0) {中断/DMA};
+  \draw[hw bus] (cpu) -- node[above,hw label]{地址/控制} (dec);
+  \draw[hw bus] (dec.east) |- (rom.west) node[pos=0.25,above,hw label]{片选};
+  \draw[hw bus] (dec) -- (ram);
+  \draw[hw bus] (dec.east) |- (io.west);
+  \draw[hw return] (io) -- (irq);
+  \draw[hw return] (irq.north) |- (cpu.south) node[pos=0.2,below,hw label]{完成/事件};
+  \node[hw label, text width=8.8cm] at (3.75,-2.0) {整机事务从 CPU 发起，但完成、等待和错误由目标与互连共同决定；设备还可通过中断或 DMA 把事件带回 CPU。};
+\end{pdfdiagram}
+\diagramnote{从最小 CPU 到整机事务。地址译码决定目标，握手和事件决定本次访问何时真正完成。}
+
+\section{一、主存不是抽象数组}
+
+软件把内存看成按地址编号的字节序列，硬件却必须用地址线、译码器、存储阵列、数据线和控制信号实现这件事。一次读访问至少包含四个事实：发起者给出地址，译码逻辑选中目标，目标经过内部访问后驱动数据，发起者在规定边界采样。一次写访问则要求地址、写数据、字节使能和写控制在目标采样窗口内稳定。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+对象 & 硬件含义 & 验收问题 \\
+\midrule
+地址 & 指出本次事务目标位置 & 高位译码是否只选中一个目标 \\
+数据 & 读时由目标返回，写时由发起者提供 & 同一时刻是否只有一个驱动者 \\
+读写控制 & 区分本次事务方向和类型 & 输出使能和写使能是否互斥 \\
+字节使能 & 指明哪些 8-bit 车道有效 & 字节写不会破坏相邻数据 \\
+ready/valid & 指明请求或响应是否真正完成 & 慢目标能否插入等待而不丢地址和数据 \\
+\bottomrule
+\end{longtable}
+
+\topic{ROM、SRAM 和 DRAM 的读写不是同一种动作}
+ROM 或 Flash 适合保存启动代码，掉电后内容仍在；SRAM 接口直观，地址稳定后在访问时间内返回数据，适合教学板、cache 和小容量片上 RAM；DRAM 密度高，但单元需要刷新，访问还要经过 bank、行、列、预充电和控制器调度。把这些对象都叫“内存”没有错，但在硬件验收时必须区分它们的时序和控制边界。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+存储类型 & 典型用途 & 关键边界 \\
+\midrule
+ROM/Flash & 复位入口、固件、常量表 & 复位地址必须映射到有效内容，读时序满足取指 \\
+SRAM & cache、实验板 RAM、小容量片上存储 & \code{CS}/\code{OE}/\code{WE} 互斥，地址和数据满足建立时间 \\
+DRAM & 大容量主存 & 控制器负责 activate、read/write、precharge、refresh \\
+寄存器文件 & CPU 内部近距离状态 & 多读端口、写端口、旁路和同周期读写规则明确 \\
+\bottomrule
+\end{longtable}
+
+\topic{异步 SRAM 是最好的第一块主存}
+教学整机可以先使用低速异步 SRAM。读周期中，地址和片选稳定后，打开输出使能，SRAM 在访问时间后驱动数据线；写周期中，输出使能关闭，发起者驱动数据线，在写使能有效窗口内把数据写入目标字节。这个模型足够简单，也足以暴露硬件最常见错误：片选重叠、输出争用、写使能过早、字节使能错误。
+
+\begin{lstlisting}
+SRAM read:
+  address stable
+  CS active, OE active, WE inactive
+  wait access time
+  sample data
+
+SRAM write:
+  address and write_data stable
+  CS active, OE inactive, WE active for write window
+  selected byte lanes store data
+\end{lstlisting}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \draw[BookRule,line width=0.45pt] (0,1.4) -- (9.6,1.4);
+  \draw[BookRule,line width=0.45pt] (0,0.65) -- (9.6,0.65);
+  \draw[BookRule,line width=0.45pt] (0,-0.1) -- (9.6,-0.1);
+  \node[left,hw label] at (0,1.4) {ADDR};
+  \node[left,hw label] at (0,0.65) {CS/OE};
+  \node[left,hw label] at (0,-0.1) {DATA};
+  \draw[BookTeal,line width=0.85pt] (0.8,1.4) -- (8.8,1.4);
+  \draw[BookAccent,line width=0.85pt] (1.4,0.65) -- (7.9,0.65);
+  \draw[BookMuted,line width=0.65pt,dashed] (0.8,-0.1) -- (4.35,-0.1);
+  \draw[BookTeal,line width=0.85pt] (4.35,-0.1) -- (8.2,-0.1);
+  \draw[BookRule,line width=0.45pt] (0.8,1.75) -- (0.8,-0.45);
+  \draw[BookRule,line width=0.45pt] (4.35,1.75) -- (4.35,-0.45);
+  \draw[BookRule,line width=0.45pt] (8.2,1.75) -- (8.2,-0.45);
+  \node[hw label] at (0.8,1.98) {地址稳定};
+  \node[hw label] at (4.35,1.98) {数据有效};
+  \node[hw label] at (8.2,1.98) {CPU 采样};
+  \node[hw label, text width=8.6cm] at (4.8,-0.9) {等待状态的目的，是把采样点推迟到数据有效之后，同时保持地址、片选和方向不变。};
+\end{pdfdiagram}
+\diagramnote{异步 SRAM 读周期的最小账本。数据有效之前不能被 CPU 采样。}
+
+\topic{DRAM 需要控制器而不是直接接地址线}
+DRAM 的容量来自更密集的存储单元，代价是接口复杂。控制器要先打开某个 bank 的某一行，再读写列；换行前需要预充电；即使没有普通访问，也要周期性刷新；高速 DRAM 还需要训练采样窗口。CPU 看到的是“主存读写”，但实际路径经过控制器、队列、bank 调度、行命中或行冲突。这也是为什么现代 CPU 必须靠 cache 把常用数据放近。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+DRAM 动作 & 硬件含义 & 时延来源 \\
+\midrule
+Activate & 打开某个 bank 中的一行 & 行译码和感放建立 \\
+Read/Write & 在已打开行内选择列传输数据 & 列访问、突发传输和总线排队 \\
+Precharge & 关闭当前行，准备访问另一行 & 位线恢复到可再次访问状态 \\
+Refresh & 周期性恢复存储单元电荷 & 控制器必须暂停或调度普通访问 \\
+\bottomrule
+\end{longtable}
+
+\section{二、地址译码定义整机地图}
+
+CPU 输出的是地址数值，整机必须规定这个数值由哪个目标响应。这个规定叫地址映射。一个简单教学板可以把低地址映射到 ROM，中间映射到 RAM，高地址小窗口映射到 GPIO、定时器和串口等设备寄存器。地址译码器把高位地址和访问类型变成片选信号。
+
+\begin{lstlisting}
+example 16-bit address map:
+  0x0000-0x7FFF  boot ROM
+  0x8000-0xEFFF  SRAM
+  0xF000         GPIO_OUT
+  0xF004         GPIO_IN
+  0xF010         TIMER_COUNT
+  0xF014         TIMER_CTRL
+\end{lstlisting}
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=2.0cm] (addr) at (0,0) {地址 A[15:0]};
+  \node[hw compute, minimum width=2.15cm] (dec) at (3.0,0) {高位译码};
+  \node[hw state, minimum width=1.6cm] (rom) at (6.0,1.05) {ROM CS};
+  \node[hw state, minimum width=1.6cm] (ram) at (6.0,0) {RAM CS};
+  \node[hw control, minimum width=1.6cm] (io) at (6.0,-1.05) {IO CS};
+  \draw[hw bus] (addr) -- (dec);
+  \draw[hw bus] (dec.east) |- (rom.west) node[pos=0.3,above,hw label]{A15=0};
+  \draw[hw bus] (dec) -- (ram) node[pos=0.55,above,hw label]{10xx};
+  \draw[hw bus] (dec.east) |- (io.west) node[pos=0.3,below,hw label]{1111};
+  \node[hw label, text width=7.8cm] at (3.4,-1.95) {验收目标：任意一个地址最多选中一个目标；未映射区域也要有错误、固定值或超时规则。};
+\end{pdfdiagram}
+\diagramnote{地址译码不是软件表格，而是片选电路。片选重叠会造成总线争用或误写设备。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+映射对象 & 响应规则 & 典型错误 \\
+\midrule
+ROM & 复位入口和只读代码地址命中 & 复位后 CPU 取不到第一条指令 \\
+RAM & 普通数据读写地址命中 & 写使能误打到 ROM 或设备窗口 \\
+GPIO & 设备寄存器地址命中并产生副作用 & 地址译码过宽，普通内存写误触发外设 \\
+未映射区 & 返回错误、超时或固定空值 & 访问悬空，CPU 永久等待或读到随机总线值 \\
+\bottomrule
+\end{longtable}
+
+\topic{片选表达式就是硬件合同}
+若地址空间为 64 KiB，可以用高位地址产生粗粒度片选。例如 \code{A15=0} 选 ROM，\code{A15=1,A14=0} 选 RAM，\code{A15=1,A14=1,A13=1,A12=1} 选 I/O 窗口。无论用门电路、译码器、CPLD 还是 FPGA 实现，都必须证明任意合法周期最多只有一个目标片选有效。
+
+\begin{lstlisting}
+rom_cs = !A15
+ram_cs = A15 && !A14
+io_cs  = A15 && A14 && A13 && A12
+\end{lstlisting}
+
+这三个表达式看起来像逻辑练习，实际上就是整机安全边界。若 ROM 和 RAM 可同时片选，读周期可能出现两个芯片同时驱动数据线；若 RAM 和 GPIO 片选重叠，普通 STORE 可能既改内存又改外设输出；若未映射地址没有超时或错误返回，CPU 可能等待一个永远不会响应的目标。
+
+\topic{时序预算决定是否需要等待状态}
+地址译码需要时间，存储器访问需要时间，数据到达 CPU 输入端后还要满足建立时间。若这些时间总和超过时钟周期，就必须降低频率、换更快器件，或插入等待状态。等待状态不是软件延时，而是硬件事务延长：地址、片选、读写方向和数据驱动关系必须在等待期间保持可解释。
+
+\begin{lstlisting}
+read_budget =
+  cpu_address_output_delay
+  + address_decode_delay
+  + memory_access_time
+  + input_setup_time
+  + board_margin
+\end{lstlisting}
+
+若 \code{read_budget} 大于一个周期，控制器就不能在下一拍采样数据。慢 ROM、慢外设和长板级走线都可能需要 READY/WAIT 机制。正式规格还应说明最大等待长度和超时行为，避免坏设备把整机永久挂住。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+处理方式 & 适合场景 & 代价 \\
+\midrule
+降低时钟 & 全系统都慢，教学板容易观察 & 所有操作都变慢 \\
+更快器件 & SRAM 或译码器成为瓶颈 & 成本、功耗或电平兼容性变化 \\
+插入等待 & 只有部分目标较慢 & 控制器必须保持事务状态 \\
+超时返回错误 & 目标可能不存在或失效 & 需要错误状态和恢复入口 \\
+\bottomrule
+\end{longtable}
+
+\section{三、MMIO 把设备寄存器放进地址空间}
+
+设备寄存器可以像内存地址一样被 CPU 读写，但它们不是普通 RAM。读状态寄存器可能清除某些位，写命令寄存器可能启动外设动作，写数据寄存器可能进入 FIFO，读数据寄存器可能弹出一个元素。这类地址称为内存映射 I/O，简称 MMIO。MMIO 的关键不是地址长得像内存，而是每个寄存器都有副作用和顺序规则。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+设备寄存器 & 读写语义 & 验收问题 \\
+\midrule
+\code{DIR} & 设置 GPIO 引脚方向 & 输出引脚和输入引脚不会混用 \\
+\code{OUT} & 写输出锁存器 & 写入只改变目标输出位 \\
+\code{IN} & 读取同步后的外部输入 & 按键抖动和亚稳态不能直接进入 CPU \\
+\code{STAT} & 返回 ready、busy、error、irq 等状态 & 清除规则不会丢掉同时到来的新事件 \\
+\code{DATA} & 数据收发寄存器或 FIFO 端口 & 空读、满写和溢出有明确定义 \\
+\bottomrule
+\end{longtable}
+
+\topic{MMIO 写响应不等于设备已经完成}
+CPU 写一个命令寄存器，通常只表示设备已经接收命令。设备真正完成可能要等若干周期、若干微秒，甚至更久。完成可以通过状态位、轮询、DMA completion 或中断通知。若把 MMIO 写返回当作“设备动作完成”，软件会在设备尚未写完缓冲区、尚未刷新状态或尚未清除错误时继续执行，形成难复现的硬件错误。
+
+\begin{lstlisting}
+device command sequence:
+  CPU writes COMMAND register
+  bus write response returns
+  device starts internal work
+  device sets DONE or ERROR
+  interrupt or polling tells CPU to inspect result
+\end{lstlisting}
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.55cm] (cpu) at (0,0) {CPU};
+  \node[hw compute, minimum width=1.75cm] (bus) at (2.3,0) {总线响应};
+  \node[hw control, minimum width=1.95cm] (cmd) at (4.85,0) {命令寄存器};
+  \node[hw control, minimum width=1.95cm] (dev) at (7.45,0) {设备状态机};
+  \node[hw state, minimum width=1.5cm] (done) at (9.75,0) {DONE};
+  \draw[hw bus] (cpu) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{写命令} (bus);
+  \draw[hw bus] (bus) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{写已接受} (cmd);
+  \draw[hw bus] (cmd) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{开始工作} (dev);
+  \draw[hw return] (dev) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{完成/错误} (done);
+  \node[hw label, text width=9.0cm] at (4.7,-1.0) {总线写响应只证明命令到达设备接口；真正完成必须看状态位、中断或 DMA completion。};
+\end{pdfdiagram}
+\diagramnote{MMIO 写命令的两层完成边界。总线完成不等于设备动作完成。}
+
+\topic{端口 I/O 与 MMIO 是两种地址合同}
+8086 家族保留了独立 I/O 地址空间，\code{IN} 和 \code{OUT} 指令访问端口；许多 RISC 和单片机系统则把设备寄存器映射进普通地址空间，用 LOAD/STORE 访问。两者都能控制设备，但硬件合同不同。端口 I/O 需要 I/O 周期和端口地址译码；MMIO 需要内存地址译码和内存属性规则，例如不可缓存、不可合并或必须保持顺序。
+
+\topic{外部输入必须先调理和同步}
+按键、传感器、串口线和外部中断引脚都不按 CPU 时钟整齐变化。按键还会抖动，异步输入还可能让触发器进入亚稳态。教学板上的 GPIO 输入至少应经过电平保护、上拉/下拉、去抖策略和同步触发器，再进入设备寄存器。否则 CPU 读到的不是稳定硬件事实，而是未定义的边界行为。
+
+\begin{warningbox}
+不要把设备寄存器当作普通变量。普通 RAM 的读写目标是保存数据；MMIO 的读写目标是驱动硬件状态机。编译器、cache、写缓冲和乱序执行都可能改变普通内存访问的时机，但设备访问通常需要不可缓存属性、顺序约束和明确的完成检查。
+\end{warningbox}
+
+\topic{从 GPIO、定时器和 UART 看设备寄存器}
+设备寄存器最好用具体布局理解。一个 GPIO 控制器可以有输出寄存器、输入寄存器、方向寄存器和中断状态寄存器；定时器可以有计数值、比较值、控制位和中断清除位；UART 可以有发送数据、接收数据、状态和波特率配置寄存器。CPU 访问这些寄存器时走的是地址事务，但设备内部看到的是控制状态机输入。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+设备 & 寄存器边界 & 常见验收问题 \\
+\midrule
+GPIO & \code{DIR/OUT/IN/IRQ_STAT} & 输入是否同步，输出是否只改目标位 \\
+定时器 & \code{COUNT/CMP/CTRL/IRQ_CLEAR} & 到期事件是否锁存，清除是否丢新事件 \\
+UART & \code{TX/RX/STAT/BAUD} & 空读、满写、错误位和中断顺序是否清楚 \\
+\bottomrule
+\end{longtable}
+
+\section{四、中断和 DMA 把外部事件接回 CPU}
+
+轮询可以让 CPU 一直读状态寄存器，直到设备 ready。但若设备很慢，CPU 会浪费大量周期。中断提供另一种路径：设备在状态变化后请求中断，中断控制器汇总、屏蔽和排序请求，CPU 在可接受边界保存当前执行上下文，跳到中断入口，服务程序读取设备状态并清除事件。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+对象 & 硬件职责 & 验收问题 \\
+\midrule
+设备 & 产生完成、错误或数据到达事件 & 状态位和中断请求是否同步一致 \\
+中断控制器 & 汇总、屏蔽、优先级和投递 & 屏蔽位、优先级、EOI 顺序是否正确 \\
+CPU 入口 & 保存边界状态并跳到入口 & PC、标志和特权边界是否可恢复 \\
+服务程序 & 读状态、搬数据、清除事件 & 不丢新事件，不重复进入同一旧事件 \\
+\bottomrule
+\end{longtable}
+
+\topic{中断清除顺序是硬件合同}
+若服务程序先清设备状态，再清中断控制器，或先通知中断控制器再清设备，效果可能不同。某些设备要求先读状态后读数据，某些要求写 1 清位，某些要求读数据寄存器自动清除 ready。教材级规格必须写清楚事件锁存、状态读取、清除、EOI 和重新开放中断的顺序。否则系统在低速测试中正常，在高频事件下丢中断或重复中断。
+
+DMA 解决的是另一类浪费。若磁盘、网卡、显示控制器或音频设备需要搬运大量数据，CPU 不应逐字从设备读出再逐字写入内存。DMA 让设备或 DMA 控制器成为总线发起者，按描述符或寄存器配置直接读写主存。CPU 负责准备缓冲区和描述符，设备负责搬运，完成后用状态位或中断通知 CPU。
+
+\begin{lstlisting}
+DMA receive sketch:
+  CPU allocates buffer
+  CPU writes descriptor address and length
+  CPU ensures descriptor is visible to device
+  device reads descriptor and writes buffer
+  device posts completion
+  CPU handles interrupt and inspects buffer
+\end{lstlisting}
+
+\topic{DMA 最容易错在可见性和所有权}
+DMA 让 CPU 和设备共享主存，也引入 cache 一致性、顺序和缓冲区所有权问题。CPU 写好的描述符必须先对设备可见；设备写入的缓冲区必须在 CPU 读取前变得可见；CPU 不能在设备仍拥有缓冲区时重用它；设备不能越过分配的地址范围。现代系统还会用 IOMMU 限制 DMA 能访问哪些物理页，避免坏设备或错误驱动破坏任意内存。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.85cm] (cpu) at (0,0) {CPU owns};
+  \node[hw compute, minimum width=2.1cm] (desc) at (2.65,0) {描述符可见};
+  \node[hw control, minimum width=1.95cm] (dev) at (5.35,0) {Device owns};
+  \node[hw compute, minimum width=2.0cm] (comp) at (7.95,0) {completion};
+  \node[hw state, minimum width=1.85cm] (cpu2) at (10.45,0) {CPU owns};
+  \draw[hw bus] (cpu) -- node[above,hw label]{提交描述符} (desc);
+  \draw[hw bus] (desc) -- node[above,hw label]{设备搬运} (dev);
+  \draw[hw bus] (dev) -- node[above,hw label]{写状态/中断} (comp);
+  \draw[hw return] (comp) -- node[above,hw label]{同步 cache 后读取} (cpu2);
+  \node[hw label, text width=10.0cm] at (5.25,-1.0) {所有权不能重叠：CPU 交出缓冲区后不得改写；设备 completion 到达且数据可见后，CPU 才能重新使用。};
+\end{pdfdiagram}
+\diagramnote{DMA 缓冲区所有权。完成通知、cache 可见性和所有权回收必须按顺序发生。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+边界 & 必须说明 & 失败后果 \\
+\midrule
+描述符可见 & CPU 写描述符后如何让设备看到 & 设备读到旧地址、旧长度或旧标志 \\
+数据可见 & 设备写缓冲区后 CPU 如何看到新数据 & CPU 读到 cache 中的旧内容 \\
+所有权 & 缓冲区何时归 CPU，何时归设备 & 重用正在 DMA 的缓冲区，数据被覆盖 \\
+地址权限 & 设备能访问哪些物理页或 I/O 虚拟地址 & DMA 写坏无关内存或触发 IOMMU fault \\
+完成顺序 & completion 到达是否代表所有数据已可见 & 收到中断后仍读到未完成数据 \\
+\bottomrule
+\end{longtable}
+
+\section{五、从教学总线到现代互连}
+
+早期微机的并行总线比较直观：地址线、数据线、读写控制、片选和等待信号都能在逻辑分析仪上看到。现代芯片内部和 PCIe 这类外部互连更复杂，可能使用分层 packet、请求队列、completion、错误报告和流控。但抽象问题没有改变：事务由发起者提出，经互连路由到目标，目标返回数据或完成状态，错误路径必须被记录和上报。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+互连对象 & 旧总线中的类比 & 现代形式 \\
+\midrule
+地址阶段 & 地址线和片选 & 请求 packet、BAR、路由 ID、地址译码 \\
+数据阶段 & 数据线和字节使能 & payload、byte enable、burst 或 cache line \\
+等待 & READY/WAIT & credit、ready/valid、队列背压 \\
+完成 & 采样数据或写周期结束 & completion packet、状态位、中断或 MSI \\
+错误 & 总线错误或超时 & poison、fault、AER、IOMMU fault、设备 error \\
+\bottomrule
+\end{longtable}
+
+\topic{valid/ready 是理解现代片上互连的最小模型}
+许多片上接口都可以抽象成 valid/ready 握手。发送方在 valid 为 1 时保持请求或响应稳定，接收方在 ready 为 1 时表示可以接收，只有二者同周期为 1，事务片段才真正完成。请求通道和响应通道可以分开，读请求和读数据也可以隔很多周期。这个模型比“总线一拍完成”更接近现代硬件。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \draw[BookRule,line width=0.45pt] (0,1.2) -- (9.4,1.2);
+  \draw[BookRule,line width=0.45pt] (0,0.45) -- (9.4,0.45);
+  \draw[BookRule,line width=0.45pt] (0,-0.3) -- (9.4,-0.3);
+  \node[left,hw label] at (0,1.2) {valid};
+  \node[left,hw label] at (0,0.45) {ready};
+  \node[left,hw label] at (0,-0.3) {payload};
+  \draw[BookTeal,line width=0.85pt] (1.0,1.2) -- (7.6,1.2);
+  \draw[BookAccent,line width=0.85pt] (4.0,0.45) -- (8.3,0.45);
+  \draw[BookMuted,line width=0.65pt] (1.0,-0.3) -- (8.3,-0.3);
+  \draw[BookRule,line width=0.45pt] (4.0,1.55) -- (4.0,-0.65);
+  \node[hw label] at (4.0,1.8) {transfer};
+  \node[hw label, text width=8.4cm] at (4.7,-1.05) {valid=1 且 ready=0 时，发送方必须保持 payload；二者同时为 1 的周期才完成一次传输。};
+\end{pdfdiagram}
+\diagramnote{valid/ready 握手。背压不是错误，而是接收方暂时不能接受。}
+
+\begin{lstlisting}
+handshake rule:
+  transfer happens only when valid == 1 and ready == 1
+  while valid == 1 and ready == 0:
+    sender keeps payload stable
+  receiver may apply backpressure by deasserting ready
+\end{lstlisting}
+
+\topic{写缓冲和内存顺序解释了现代芯片为什么看起来更快}
+写入比读取更容易被隐藏。CPU 可以先把写事务放进写缓冲，让执行流水线继续推进；写缓冲再把相邻写合并、排队发送到 cache 或互连。这样常见 STORE 的表面延迟很低，但代价是可见性变复杂：其他核心、DMA 或设备什么时候看到这次写，取决于 cache 一致性、内存类型和屏障规则。普通 RAM、MMIO 和 DMA 描述符不能使用同一套可见性假设。
+
+\topic{总线错误和超时必须成为规格的一部分}
+未映射地址不能只写成“不要访问”。真实系统必须规定访问未映射区域时会发生什么：返回固定值、保持等待直到超时、产生总线错误，或进入异常入口。设备无响应、DRAM 控制器报错、ECC 检测失败、外设权限不允许，也都应该形成可观察错误状态。没有错误合同的整机，调试时会把硬件故障误判为程序死循环。
+
+\topic{cache 行和局部性把常见访问留在近处}
+主存容量大但离 CPU 远，寄存器离 CPU 近但容量小，cache 处在二者之间。cache 不是“更快的内存副本”这么简单，而是按 cache line 搬运的一组近处 SRAM。CPU 读取某个地址时，cache 会用地址中的 tag 判断目标行是否已经在近处；若命中，数据直接从 cache 返回；若未命中，cache 控制器向下一级 cache 或 DRAM 请求整行，再把需要的字节送回 CPU。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+对象 & 硬件含义 & 验收问题 \\
+\midrule
+cache line & 一次填充和替换的最小数据块 & 行大小、字节偏移和未对齐访问是否清楚 \\
+tag & 判断某个 cache 槽保存的是哪段地址 & 命中比较是否覆盖高位地址和有效位 \\
+index & 选择 cache 中的候选槽或集合 & 映射冲突是否可能造成反复 miss \\
+valid/dirty & 表示行是否有效、是否被修改过 & 替换时是否需要写回下一级 \\
+miss & 近处没有所需行，需要向下一级请求 & miss 期间 CPU 停顿、继续执行或乱序等待的边界 \\
+\bottomrule
+\end{longtable}
+
+局部性解释了 cache 为什么有效。时间局部性表示刚访问过的数据很可能再次访问，例如循环变量和栈顶对象；空间局部性表示访问某个地址后，很可能访问相邻地址，例如顺序扫描数组。cache line 正是利用空间局部性：一次 miss 不只取一个字节，而是取一整段相邻字节。代价也随之出现：若程序跨很大步长访问数组，或者两个热数据反复映射到同一 cache 集合，硬件仍会不停搬行，表面上只是 LOAD 很慢，实质上是事务层反复 miss 和替换。
+
+\begin{lstlisting}
+32-byte cache line example:
+  address bits = [ tag | index | byte_offset ]
+  byte_offset selects one byte within the line
+  index selects a cache set
+  tag comparison decides hit or miss
+\end{lstlisting}
+
+\topic{写策略决定 STORE 什么时候真正离开 CPU}
+读 miss 的动作比较直观：向下级取回数据。写入更复杂，因为 CPU 可以先改 cache，再决定什么时候把修改传播到下一级。写穿策略每次写命中都继续写下一级，行为直接但带宽压力大；写回策略只在 cache 中标脏位，替换时再写回下一级，常见情况下更快，但可见性和错误恢复更复杂。无论哪种策略，字节写都必须尊重 byte enable，不能把同一 cache line 中无关字节改坏。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+写策略 & 优点 & 风险和边界 \\
+\midrule
+写穿 & 下一级更快看见新值，调试直观 & 带宽压力大，常配合写缓冲隐藏延迟 \\
+写回 & 多次写同一行可合并，减少外部事务 & dirty 行替换、掉电和 DMA 可见性更难处理 \\
+写分配 & 写 miss 时先把整行取入 cache 再修改 & 小写入可能触发整行读取 \\
+非写分配 & 写 miss 直接向下级写，不装入 cache & 后续读同地址可能仍 miss \\
+\bottomrule
+\end{longtable}
+
+这也是 MMIO 不能随意缓存的根本原因。写 LED 寄存器、清中断状态或启动 DMA 命令时，程序需要的是一次外设可见动作，而不是某条 cache line 中的普通字节更新。若 MMIO 被写回 cache 吞掉，设备可能永远看不到命令；若读状态寄存器被 cache 命中，CPU 可能一直看到旧状态。因此地址属性必须区分普通可缓存内存、不可缓存设备内存、写合并 framebuffer、DMA coherent 区域等不同事务合同。
+
+\topic{cache miss 是事务暂停，不是抽象的慢}
+当 LOAD miss 时，流水线不能凭空得到数据。简单 CPU 会停在访存阶段，保持地址和控制状态，直到下级返回数据；高性能 CPU 可能让独立指令继续执行，把这条 LOAD 放在未完成队列中，等数据回来再唤醒依赖指令。二者复杂度不同，但都必须维护同一个可见合同：依赖这次 LOAD 的指令不能使用错误旧值，异常和中断也不能让程序看见半提交状态。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+miss 类型 & 事务路径 & 典型处理 \\
+\midrule
+L1 miss/L2 hit & L1 请求 L2 返回 cache line & 几到十几周期，流水线可能短暂停顿 \\
+最后级 cache miss & 请求内存控制器和 DRAM & 上百周期级别，常需乱序、预取或多线程隐藏 \\
+TLB miss & 地址转换缓存缺失，要查页表或进异常 & 页表 walker、权限检查和可能的页错误 \\
+写回替换 & 脏行被换出，需先写下一级 & 替换队列、写缓冲和错误报告 \\
+设备/DMA 冲突 & cache 中旧副本与设备写入不一致 & coherent 互连、cache 维护或不可缓存映射 \\
+\bottomrule
+\end{longtable}
+
+\topic{低时延来自近处、缓存、并行和卸载}
+现代整机降低时延，不是让所有路径都变成零等待。L1/L2 cache 让常见数据走近处 SRAM；TLB 让近期地址转换不必每次查页表；预取和分支预测提前准备可能需要的路径；流水线、旁路和乱序调度让独立工作重叠；DMA、队列和中断聚合把批量 I/O 从 CPU 指令流中卸载。失败路径仍然存在：cache miss、TLB miss、DRAM 排队、设备背压、DMA fault 和错误中断都会把访问拉回慢路径。
+
+\topic{六、存储层次、地址转换和设备驱动 trace}
+
+前面已经讲了单次总线事务、MMIO、中断、DMA 和 cache。真正的系统程序运行时，这些对象不会孤立出现。一次普通 LOAD 可能先经过 TLB 查找，再查 L1 cache，未命中后查 L2/L3，最后进入内存控制器；一次设备接收数据可能由驱动准备描述符，设备 DMA 写缓冲区，cache 一致性或维护操作让 CPU 看见新数据，中断再把完成事件带回来。若教材只讲“内存比寄存器慢”，就漏掉了真正的硬件路径。
+
+\begin{longtable}{L{0.18\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
+\toprule
+访问层次 & 常见命中路径 & 失败或慢路径 \\
+\midrule
+寄存器 & 直接从寄存器堆读写 & 端口冲突、旁路失败或流水线停顿 \\
+L1 cache & 近处 SRAM 命中，几个周期内返回 & L1 miss，向 L2 请求整条 cache line \\
+L2/L3 cache & 片上较大 cache 命中 & 最后级 miss，访问内存控制器和 DRAM \\
+TLB & 地址转换缓存命中 & page walk、页错误或权限异常 \\
+DRAM & 控制器调度行命中和突发传输 & 行冲突、刷新、排队、ECC 错误 \\
+设备/MMIO & 设备寄存器响应读写 & 背压、超时、错误状态或中断完成 \\
+\bottomrule
+\end{longtable}
+
+\topic{TLB 把地址转换也纳入近处缓存}
+虚拟地址或线性地址到物理地址的转换若每次都查页表，访存会变得很慢。TLB 可以理解为“地址转换的 cache”：它保存近期虚拟页到物理页框的映射及权限位。LOAD/STORE 形成虚拟地址后，先用虚拟页号查 TLB；命中时得到物理页框和权限证据，再与页内偏移组合成物理地址；未命中时，硬件 page walker 或软件异常处理会去内存里的页表结构查找。
+
+\begin{lstlisting}
+virtual address = [ virtual_page_number | page_offset ]
+TLB hit:
+  physical_address = TLB[virtual_page_number].frame | page_offset
+TLB miss:
+  walk page tables or enter miss handler
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+TLB 字段 & 作用 & 验收问题 \\
+\midrule
+虚拟页号 tag & 判断当前地址是否命中某个转换项 & 进程切换、地址空间标识和刷新规则是否清楚 \\
+物理页框 & 与页内偏移组合成物理地址 & 页大小、对齐和物理地址宽度是否一致 \\
+权限位 & 读写、执行、用户/特权等访问属性 & 访问失败是权限异常，不是普通 cache miss \\
+valid/global & 表示转换是否有效、是否跨进程保留 & 页表修改后如何让旧 TLB 项失效 \\
+\bottomrule
+\end{longtable}
+
+TLB miss 和 cache miss 都是“近处没有”，但语义不同。cache miss 只是数据不在近处，通常可以向下级取回；TLB miss 可能只是转换缓存缺失，也可能说明页不存在或权限不允许。若页表项不存在，硬件不能继续访问内存数据；若权限不允许，访问必须转入异常。这个差别解释了为什么地址转换、保护和异常在系统硬件中是同一条路径的不同分支。
+
+\topic{多核和 DMA 让 cache 一致性成为硬件合同}
+单核教学机里，cache 可以先理解为 CPU 与主存之间的近处副本。多核或 DMA 加入后，问题变成“多个观察者如何看见同一地址的值”。一个核心的 cache 中可能有某条 line 的旧副本，另一个核心或设备刚刚写入了新值；如果没有一致性协议、cache 维护或不可缓存映射，CPU 读到的就可能不是系统真实最新值。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+场景 & 风险 & 常见硬件/软件边界 \\
+\midrule
+核心 A 写，核心 B 读 & B 的 cache 中可能有旧行 & cache coherence、失效消息、共享/独占状态 \\
+CPU 写描述符，设备读 & 描述符可能还在 CPU cache 或写缓冲中 & coherent DMA、flush、写屏障 \\
+设备写缓冲区，CPU 读 & CPU cache 中可能有旧数据 & invalidate、coherent 互连、不可缓存映射 \\
+MMIO 状态寄存器 & cache 命中会隐藏设备新状态 & 设备内存属性、禁止普通缓存 \\
+\bottomrule
+\end{longtable}
+
+一致性协议细节可以很深，但教学阶段先抓住三件事。第一，同一地址可能在多个近处缓存中有副本。第二，写入必须让其他观察者的旧副本失效或更新。第三，设备并不总是自动参与 CPU cache 一致性；若平台不支持 coherent DMA，驱动必须在交出缓冲区前后做 cache 维护。否则 DMA 完成中断到达后，CPU 仍可能读到旧 cache line。
+
+\topic{store buffer 和屏障把“执行完成”与“可见”分开}
+STORE 对流水线来说可以很早“执行完成”：地址和数据已经形成，写事务进入 store buffer，后续独立指令可以继续执行。但这个 STORE 什么时候对其他核心、DMA 或设备可见，要看 store buffer 排队、cache 状态、内存类型和屏障规则。普通 RAM 写可以合并和延迟；MMIO 写通常要求更强顺序；DMA 描述符写在通知设备前必须已经对设备可见。
+
+\begin{lstlisting}
+prepare DMA descriptor:
+  descriptor.addr = buffer
+  descriptor.len  = length
+  memory_barrier()
+  MMIO[DEVICE_DOORBELL] = descriptor_index
+\end{lstlisting}
+
+这里的屏障不是“让 CPU 慢一点”的软件仪式，而是要求硬件在门铃 MMIO 写对设备可见之前，先让描述符内容按平台规则可见。若顺序反了，设备可能看到门铃，却读到旧描述符或半写入描述符。许多难复现的设备错误，本质上就是这个可见性边界没有写清楚。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+对象 & 可见性要求 & 失败表现 \\
+\midrule
+普通数据 & 由语言、编译器和内存模型共同约束 & 多核读到旧值或乱序观察 \\
+锁变量 & 获取/释放顺序必须约束临界区数据 & 进入临界区后仍看见旧数据 \\
+DMA 描述符 & 通知设备前必须对设备可见 & 设备搬错地址或长度 \\
+MMIO 门铃 & 前面的配置写必须先到设备接口 & 设备按旧配置启动 \\
+中断完成 & completion 到达后数据必须已可读取或可同步 & 中断处理读到旧缓冲区 \\
+\bottomrule
+\end{longtable}
+
+\topic{描述符环把 DMA 变成持续事务流}
+高速设备通常不会每次只处理一个缓冲区。网卡、磁盘控制器、USB 控制器常使用描述符环或队列：CPU 准备一批描述符，设备按头尾指针消费，完成后写回状态或 completion 队列，并用中断或轮询通知 CPU。这样可以减少 MMIO 次数，让 CPU 和设备并行工作。
+
+\begin{lstlisting}
+receive ring:
+  CPU owns descriptor N
+  CPU fills buffer address and length
+  CPU marks descriptor ready for device
+  CPU updates tail pointer or rings doorbell
+  device writes packet into buffer
+  device writes completion status
+  CPU regains ownership and processes buffer
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+环队列字段 & 硬件含义 & 验收问题 \\
+\midrule
+描述符地址 & 设备要读写的主存位置 & 地址是否经过 IOMMU 或物理地址转换 \\
+长度 & 本次 DMA 允许访问的字节数 & 设备不能越界写出缓冲区 \\
+所有权位 & 当前由 CPU 还是设备拥有 & 所有权不重叠，状态切换有屏障 \\
+头尾指针 & CPU 和设备约定的生产/消费位置 & 指针更新顺序和环绕规则清楚 \\
+completion & 设备报告完成、长度、错误码 & 中断到达不等于所有 cache 可见性自动正确 \\
+\bottomrule
+\end{longtable}
+
+这个模型也说明驱动程序为什么必须理解硬件。驱动不是“调用设备 API”的普通软件，它要写 MMIO 寄存器、分配对齐缓冲区、建立 DMA 映射、维护 cache 可见性、处理中断、回收描述符和处理错误。每一步都对应本章的硬件对象：地址、权限、字节数、所有权、完成和错误。
+
+\topic{驱动 bring-up 应按硬件证据分层}
+调试设备时，最差的方法是直接运行完整驱动并等待它“能不能用”。更可靠的顺序是先验证配置空间或设备 ID，再验证 MMIO 映射，再验证单个寄存器读写，再验证中断，再验证一个最小 DMA 描述符，最后才跑持续队列。每一层都要有可观察证据。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+bring-up 阶段 & 操作 & 通过标准 \\
+\midrule
+枚举/识别 & 读取设备 ID、版本或能力寄存器 & 地址映射正确，读值稳定可复现 \\
+复位 & 写复位位并轮询 ready/busy & 状态位按规格变化，不永久 busy \\
+MMIO 回读 & 写可回读配置寄存器再读回 & 字节序、位域和写掩码正确 \\
+中断 & 人工触发或配置定时事件 & 中断线/MSI 到达，清除顺序正确 \\
+单次 DMA & 一个描述符、一个缓冲区、一个 completion & 地址、长度、cache 可见性和错误码正确 \\
+持续队列 & 多描述符环和批量 completion & 所有权、环绕、背压和中断聚合正确 \\
+\bottomrule
+\end{longtable}
+
+这张表也适用于教学板。即使没有 PCIe，只用一个 GPIO、定时器或简化 DMA 控制器，也应该按同样顺序验证：先确认地址译码，再确认寄存器语义，再确认事件通知，再确认数据搬运。这样本书的硬件 trace 就能从最小 CPU 直接延伸到现代设备驱动。
+
+\topic{案例：一个接收包怎样进入内存}
+以网卡接收一个数据包为例。CPU 先分配若干缓冲区，把每个缓冲区的地址和长度写入接收描述符环；随后保证描述符对设备可见，再写 MMIO 门铃或尾指针告诉设备可以接收。设备收到外部数据后，作为 DMA 发起者把数据写入某个缓冲区，再写 completion 或描述符状态，最后触发中断。CPU 处理中断，确认 completion，按一致性规则让缓冲区数据对 CPU 可见，然后把缓冲区交给上层软件。
+
+\begin{longtable}{L{0.14\linewidth}L{0.42\linewidth}L{0.34\linewidth}}
+\toprule
+阶段 & 硬件事务 & 关键证据 \\
+\midrule
+准备缓冲区 & CPU 在 RAM 中分配对齐缓冲区 & 物理地址或 I/O 虚拟地址有效，长度足够 \\
+写描述符 & CPU STORE 地址、长度、所有权位 & 描述符 cache line 已按平台规则可见 \\
+通知设备 & CPU 写 MMIO tail/doorbell & MMIO 不被普通 cache 合并或延迟越界 \\
+设备 DMA 写 & 设备发起内存写事务 & IOMMU 权限、字节数、completion 顺序正确 \\
+投递完成 & 设备写状态并触发中断 & completion 可读，中断不会早于数据可见 \\
+CPU 回收 & 中断处理读取状态和缓冲区 & cache invalidate 或 coherent 规则完成 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+receive path:
+  CPU: fill rx_desc[N] with buffer address and length
+  CPU: barrier, then MMIO[RX_TAIL] = N
+  DEV: reads rx_desc[N]
+  DEV: writes packet bytes into buffer
+  DEV: writes completion status
+  DEV: raises interrupt
+  CPU: acknowledges interrupt and reads completion
+  CPU: synchronizes buffer visibility
+  CPU: consumes packet
+\end{lstlisting}
+
+这条路径里至少有三次“完成”。第一，CPU 写 MMIO 门铃完成，只表示设备接口看到了通知；第二，设备 DMA 写缓冲区完成，表示数据已经到达内存系统的某个可见点；第三，中断处理完成，表示 CPU 已经确认状态并回收所有权。把这三者混在一起，是驱动和硬件协同时最常见的错误来源。
+
+\topic{案例：发送路径为什么要区分数据和描述符}
+发送数据包时方向相反。CPU 先把待发送数据写入缓冲区，再写发送描述符，最后通知设备。设备读描述符，再 DMA 读缓冲区，把数据发出。这里最关键的可见性顺序是：缓冲区内容必须先对设备可见，描述符必须描述正确地址和长度，门铃必须最后到达。否则设备可能发出旧数据、半写数据或错误长度的数据。
+
+\begin{longtable}{L{0.18\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
+\toprule
+发送对象 & 可见性要求 & 失败表现 \\
+\midrule
+数据缓冲区 & CPU 写入的数据先对设备可见 & 设备发送旧包或未初始化字节 \\
+描述符 & 地址、长度、标志位完整可见 & 设备读错缓冲区或长度 \\
+门铃寄存器 & 在数据和描述符之后对设备可见 & 设备提前启动，读到旧状态 \\
+completion & 设备确认已不再读取缓冲区 & CPU 过早重用缓冲区导致数据损坏 \\
+\bottomrule
+\end{longtable}
+
+发送 completion 到达前，CPU 不应重用缓冲区。即使 MMIO 写门铃已经返回，设备可能还没有读描述符；即使设备已经读描述符，可能还没有读完数据；即使数据已经发出，completion 可能还在队列里等待 CPU 处理。因此所有权位和 completion 队列不是形式主义，而是让 CPU 和设备不同时修改同一块内存的硬件合同。
+
+\topic{案例：块设备读请求的队列化}
+磁盘、NVMe、SD 控制器或简化块设备也可以用同一模型理解。CPU 准备命令描述符：逻辑块地址、目标缓冲区、长度、读写方向；设备读取命令后，在内部介质或控制器中完成实际读写，再通过 DMA 把数据写到主存，最后投递 completion。区别只在于设备内部工作可能更慢、队列更深、错误码更复杂。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+块请求字段 & 含义 & 硬件问题 \\
+\midrule
+LBA 或块号 & 设备内部介质位置 & 越界、坏块、介质错误如何报告 \\
+缓冲区地址 & DMA 写入或读取的主存位置 & 对齐、IOMMU、cache 可见性 \\
+长度 & 传输字节数或块数 & 不能越过缓冲区和描述符许可范围 \\
+方向 & 读设备到内存，或写内存到设备 & DMA 方向决定 cache 维护方式 \\
+命令 ID & completion 对应哪个请求 & 队列乱序完成时仍能匹配请求 \\
+状态码 & 成功、超时、校验错误、权限错误 & 驱动恢复或上报错误 \\
+\bottomrule
+\end{longtable}
+
+这个案例能把“设备很慢”讲得更具体。CPU 发出块读请求后，并不会逐字等待数据从设备口读出。它可以切换去做别的工作；设备和 DMA 在后台推进；中断或轮询 completion 时，CPU 再取回结果。硬件性能来自异步队列和批量搬运，而不是让单条 LOAD 直接等磁盘或网络。
+
+\topic{案例：一个未映射访问如何成为可诊断错误}
+再看失败路径。CPU 执行 \code{LOAD R1,[0xDEAD0000]}，地址译码没有任何目标响应。没有错误合同时，CPU 可能读到悬空总线值，或永久等待 ready。可靠平台应规定超时、总线错误或异常入口。若有 MMU，还可能在页表阶段就发现该地址未映射，不会走到外部总线。
+
+\begin{longtable}{L{0.2\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
+\toprule
+失败位置 & 可观察现象 & 正确处理 \\
+\midrule
+页表不存在 & 地址转换阶段触发页错误 & 保存故障地址和错误码，进入页错误入口 \\
+权限不允许 & 转换存在但读写/特权不满足 & 触发保护异常，不发起外部访问 \\
+地址译码无目标 & 总线事务无人响应 & 超时或 bus error，而不是无限等待 \\
+目标返回错误 & 设备或内存控制器报告失败 & 错误状态进入异常或驱动恢复路径 \\
+ECC 校验失败 & 数据返回但校验错误 & 更正、重读、上报或机器检查 \\
+\bottomrule
+\end{longtable}
+
+这张表对硬件调试尤其有用。现象“程序卡住”可能来自页表、总线译码、设备 ready、时钟、复位或错误入口任何一层。把失败位置写成层级，就能决定先看页表项、地址线、片选、ready、错误状态，还是异常向量。
+
+\begin{classicnote}
+读任何硬件平台，都可以用同一张事务表约束理解：发起者、目标、地址、方向、数据宽度、握手、完成、错误、副作用和可观察证据。早期 8086 总线、微控制器片内外设、PCIe 设备和现代 SoC 互连的规模不同，但这十项问题不变。
+\end{classicnote}
+
+\topic{专题：DRAM 控制器为什么要排队和调度}
+SRAM 可以近似看成“地址稳定后读出数据”的存储器，DRAM 则必须先打开行、读写列、预充电、刷新。主存控制器面对的不是单个 LOAD，而是一串来自 CPU、DMA、显示控制器和其他主设备的请求。它要在正确性约束内排序请求，尽量利用行命中和 bank 并行，同时保证刷新不丢失数据。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+DRAM 概念 & 含义 & 对系统的影响 \\
+\midrule
+row activate & 把某一行搬到行缓冲中 & 同一行后续列访问较快 \\
+row conflict & 下一个请求落到不同的行 & 需要预充电再打开新行，延迟增加 \\
+bank & 多组可相对独立工作的阵列 & 交错访问可隐藏部分等待 \\
+refresh & 周期性恢复电容电荷 & 刷新窗口内部分请求会被延后 \\
+ECC & 用冗余位检测或纠正错误 & 增加位宽和延迟，但提高可靠性 \\
+\bottomrule
+\end{longtable}
+
+因此，主存延迟不是一个固定常数。一次 cache miss 到达内存控制器后，可能遇到行命中、行冲突、刷新、写队列排空或高优先级 DMA。系统软件看到的是“同样的 LOAD 有时快有时慢”，硬件工程师看到的是请求队列、调度策略和时序参数。教学时不必展开 DDR 全部命令，但必须让读者知道：主存不是无限宽、无限快、无排队的数组。
+
+\topic{专题：cache 设计参数怎样改变命中率和时延}
+cache 的基本问题是把大而慢的主存切成较小的行，并保存最近使用的数据。地址会被拆成 tag、index、offset：offset 选择 cache 行内字节，index 选择组，tag 判断这一组里哪一路是目标行。不同组织改变冲突概率、比较器数量、替换策略和命中时延。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+组织 & 优点 & 代价或风险 \\
+\midrule
+直接映射 & 查找简单、速度快、面积小 & 两个常用地址若映到同一行会反复冲突 \\
+组相联 & 多路候选降低冲突 miss & 多个 tag 比较器和路选择 mux 增加延迟 \\
+全相联 & 任意行可放任意位置，冲突最少 & 硬件代价高，通常用于 TLB 或小 cache \\
+写直达 & 内存总是较新，恢复简单 & 写流量大，常需写缓冲 \\
+写回 & 多次写合并到 cache 行，带宽效率高 & dirty 行替换时必须写回，失电/一致性更复杂 \\
+\bottomrule
+\end{longtable}
+
+cache 验收不能只看“第二次访问变快”。还要看替换、脏行写回、字节写使能、未对齐访问、MMIO 不可 cache、DMA 可见性和异常路径。例如设备把数据 DMA 到主存后，CPU 若继续读旧 cache 行，就会看到过期数据；CPU 写好发送缓冲区后，若脏行没有写回，设备也可能读到旧内容。这就是为什么驱动要有 cache clean/invalidate 或一致性互连。
+
+\topic{专题：MMIO 寄存器位语义要像数据手册一样写}
+MMIO 寄存器不是普通变量。每一位都可能有副作用：读清、写 1 清、只读、保留位必须写 0、写后自动启动、硬件置位软件清除。若教材只写“把某地址当寄存器读写”，读者会在真实芯片上犯危险错误。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+位语义 & 例子 & 软件访问要求 \\
+\midrule
+RO & 输入电平、设备 ID & 写入无效或保留，不应读改写破坏其他位 \\
+WO & FIFO 写口、启动命令 & 读值可能无意义，不能依赖回读 \\
+RW & 配置模式、使能位 & 修改前要明确复位默认值 \\
+W1C & 中断状态位 & 写 1 清除对应事件，写 0 保持 \\
+RC & 读状态自动清除 & 调试打印也可能改变设备状态 \\
+reserved & 未来扩展或工厂测试位 & 按手册写固定值，通常为 0 \\
+\bottomrule
+\end{longtable}
+
+一个严谨的 GPIO 寄存器描述至少要写清：方向寄存器决定引脚驱动还是输入；输出寄存器只影响输出模式；输入寄存器来自同步后的外部电平；中断状态由边沿检测置位；清除中断采用 W1C；保留位读值未定义且写 0。这样驱动代码才能避免“读状态时把事件清掉”“读改写时误清中断”“把保留位写成 1 后芯片行为改变”等问题。
+
+\topic{专题：总线错误要能定位到层级}
+当一次访问失败时，工程上最重要的问题不是“错了”，而是错在地址转换、权限、互连、目标设备还是数据校验。若每层都只把错误折叠成一个笼统异常，调试会非常困难。更好的设计是保留故障地址、访问方向、主设备 ID、错误来源和目标返回码。
+
+\begin{longtable}{L{0.2\linewidth}L{0.42\linewidth}L{0.28\linewidth}}
+\toprule
+记录字段 & 作用 & 调试价值 \\
+\midrule
+fault address & 失败访问的地址 & 区分空指针、越界和 MMIO 映射错误 \\
+access type & 读、写、取指、原子操作 & 判断权限和副作用风险 \\
+master ID & CPU、DMA、GPU 或调试器 & 找到真正发起者 \\
+decode result & 命中哪个目标或未命中 & 定位地址地图错误 \\
+response code & OKAY、SLVERR、DECERR、超时等 & 区分目标报错和无人响应 \\
+\bottomrule
+\end{longtable}
+
+这也是为什么后续平台 bring-up 日志要把总线层证据记录下来。单看 C 代码中的一行 \code{*ptr} 无法知道失败来自页表、cache、IOMMU、互连还是设备时钟未开；完整错误记录能把问题缩小到可测量的硬件边界。
+
+\topic{专题：内存层次要同时看容量、时延、带宽和所有权}
+计算机硬件不是只有 CPU。CPU 的每一次有用工作，几乎都要和某一级存储或 I/O 交换信息。寄存器最快但数量极少；L1/L2/L3 cache 容量逐级增大、时延逐级上升；DRAM 容量大但需要控制器、队列和刷新；SSD/硬盘容量更大，却只能通过控制器、队列、DMA 和中断间接参与执行。把这些对象都称为“存储”会掩盖关键差异：有些层按字节随机访问，有些层按 cache line 交换，有些层按页或块传输，有些层只能通过命令队列返回 completion。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=1.55cm] (reg) at (0,0) {寄存器};
+  \node[hw compute, minimum width=1.55cm] (l1) at (1.8,0) {L1};
+  \node[hw compute, minimum width=1.55cm] (l2) at (3.6,0) {L2/L3};
+  \node[hw memory, minimum width=1.75cm] (dram) at (5.65,0) {DRAM};
+  \node[hw control, minimum width=1.75cm] (ssd) at (7.9,0) {SSD/硬盘};
+  \node[hw lane, minimum width=8.8cm, text width=8.4cm] at (3.95,-1.35) {越靠左，访问粒度越小、时延越低、容量越小；越靠右，容量越大，但访问要经过控制器、队列、DMA、错误码和完成通知。};
+  \draw[hw bus] (reg) -- node[above,hw label]{操作数} (l1);
+  \draw[hw bus] (l1) -- node[above,hw label]{cache line} (l2);
+  \draw[hw bus] (l2) -- node[above,hw label]{回填/写回} (dram);
+  \draw[hw bus] (dram) -- node[above,hw label]{DMA 缓冲区} (ssd);
+\end{pdfdiagram}
+\diagramnote{内存层次不是一条“更大的数组”，而是一组访问粒度和完成语义不同的层。}
+
+\begin{longtable}{L{0.16\linewidth}L{0.22\linewidth}L{0.28\linewidth}L{0.24\linewidth}}
+\toprule
+层次 & 常见粒度 & 谁直接访问 & 主要硬件问题 \\
+\midrule
+寄存器 & word 或向量 lane & 执行单元 & 端口数、旁路、写回冲突 \\
+L1 cache & cache line & 当前核心 load/store 单元 & 命中时延、虚实地址、别名和写策略 \\
+L2/L3 cache & cache line & 一个核心或多个核心 & 容量、共享、替换、一致性 \\
+DRAM & burst/cache line & 内存控制器 & bank、行命中、刷新、ECC、调度 \\
+SSD/硬盘 & 块、页或扇区 & 设备控制器和 DMA & 命令队列、坏块、磨损、错误恢复 \\
+网络/显卡等设备 & 描述符、包、帧、buffer & DMA 引擎和设备内部队列 & 所有权、completion、IOMMU、cache 可见性 \\
+\bottomrule
+\end{longtable}
+
+从程序角度看，\code{load x} 只是取一个变量；从硬件角度看，它可能命中寄存器旁路、命中 L1、命中 L2、命中共享 L3、访问 DRAM、触发页表遍历、发生缺页，甚至等待块设备把页面读回主存。CSAPP 强调的 locality 就是让常见访问停留在左侧短路径。硬件书不能只说“内存很快/很慢”，而要说明每一级的访问粒度、所有者、完成证据和失败路径。
+
+\topic{专题：cache 与 TLB 是两套不同的近路}
+cache 缓存数据或指令内容，TLB 缓存虚拟页到物理页的地址转换。二者经常同时出现在一次 LOAD 路径上，但回答的问题不同：TLB 问“这个虚拟地址能否翻译成哪个物理地址”；cache 问“这个物理位置的内容是否已经在近处”。把二者混在一起，会导致读者无法理解为什么 TLB miss 不等于 cache miss，页错误也不等于总线错误。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.85cm] (va) at (0,0) {虚拟地址};
+  \node[hw compute, minimum width=1.85cm] (tlb) at (2.45,0) {TLB};
+  \node[hw state, minimum width=1.85cm] (pa) at (4.9,0) {物理地址};
+  \node[hw compute, minimum width=1.85cm] (cache) at (7.35,0) {cache};
+  \node[hw memory, minimum width=1.65cm] (data) at (9.65,0) {数据};
+  \node[hw control, minimum width=2.0cm] (ptw) at (2.45,-1.35) {页表遍历};
+  \node[hw memory, minimum width=2.0cm] (mem) at (7.35,-1.35) {DRAM 回填};
+  \draw[hw bus] (va) -- (tlb);
+  \draw[hw bus] (tlb) -- node[above,hw label]{命中} (pa);
+  \draw[hw bus] (pa) -- (cache);
+  \draw[hw bus] (cache) -- node[above,hw label]{命中} (data);
+  \draw[hw danger] (tlb) -- node[right,hw label]{miss} (ptw);
+  \draw[hw danger] (cache) -- node[right,hw label]{miss} (mem);
+\end{pdfdiagram}
+\diagramnote{TLB miss 需要地址转换证据；cache miss 需要数据回填证据。二者都可能让 LOAD 变慢，但失败位置不同。}
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+事件 & 真实含义 & 后续动作 \\
+\midrule
+TLB hit + cache hit & 地址转换和数据都在近处 & LOAD 快速返回 \\
+TLB miss + 页表命中 & 转换不在 TLB，但页表有效 & 硬件或软件页表遍历后填 TLB \\
+页不存在 & 页表没有有效映射 & 进入页错误异常，可能由 OS 分配或从磁盘读页 \\
+cache miss & 地址有效，但数据不在当前 cache & 从下一级 cache 或 DRAM 回填 cache line \\
+权限错误 & 转换存在但访问类型不允许 & 报保护异常，不能提交数据 \\
+\bottomrule
+\end{longtable}
+
+\topic{专题：SSD 和硬盘不是慢内存，而是块设备}
+硬盘和 SSD 都不能像 SRAM 那样把地址线接上就读一个字节。CPU 要通过控制器提交命令：读哪个逻辑块、读多长、放到哪个主存缓冲区、完成后写哪个 completion。硬盘的内部约束来自机械寻道和旋转；SSD 的内部约束来自 NAND flash 页读写、块擦除、FTL 映射、磨损均衡、垃圾回收和掉电保护。它们对 CPU 暴露的共同形态，是队列化块设备。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+对象 & 内部结构重点 & 对系统可见的边界 \\
+\midrule
+机械硬盘 & 盘片、磁头、磁道、扇区、缓存 & 随机访问受寻道和旋转影响，顺序访问更友好 \\
+SATA SSD & NAND flash、FTL、通道、擦除块 & 写放大、垃圾回收、坏块管理、掉电保护 \\
+NVMe SSD & PCIe、多队列、doorbell、completion queue & 并发队列深度高，CPU 通过 MMIO 和 DMA 协作 \\
+SD/eMMC & 控制器隐藏 flash 细节，命令集较简单 & 嵌入式启动和存储，延迟波动明显 \\
+\bottomrule
+\end{longtable}
+
+理解 SSD 时要避免两个误解。第一，SSD 没有机械寻道，不等于每次访问都一样快；内部垃圾回收、擦除、映射表缓存和热控都会让尾延迟上升。第二，逻辑块地址连续，不等于物理 NAND 页连续；FTL 会把逻辑写重映射到新位置，再在后台回收旧块。因此块设备的正确抽象不是“巨大数组”，而是“命令队列 + DMA 缓冲区 + completion + 错误恢复”。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.55cm] (cpu) at (0,0) {CPU};
+  \node[hw control, minimum width=2.05cm] (sq) at (2.55,0.72) {提交队列};
+  \node[hw control, minimum width=1.65cm] (bell) at (2.55,-0.72) {门铃};
+  \node[hw control, minimum width=2.0cm] (ctrl) at (5.25,0) {NVMe 控制器};
+  \node[hw memory, minimum width=1.85cm] (nand) at (7.8,0.72) {NAND/FTL};
+  \node[hw state, minimum width=2.05cm] (cq) at (7.8,-0.72) {完成队列};
+  \node[hw label] at (1.25,1.15) {1 写命令};
+  \node[hw label] at (1.25,-1.12) {2 敲门铃};
+  \node[hw label] at (6.55,-1.18) {3 投递完成};
+  \draw[hw bus] (cpu) -- (sq);
+  \draw[hw bus] (cpu) -- (bell);
+  \draw[hw bus] (sq) -- (ctrl);
+  \draw[hw bus] (bell) -- (ctrl);
+  \draw[hw bus] (ctrl) -- (nand);
+  \draw[hw return] (ctrl) -- (cq);
+  \draw[hw return] (cq.west) |- (cpu.south);
+\end{pdfdiagram}
+\diagramnote{NVMe 的基本形态：CPU 写队列和门铃，设备 DMA 读写主存，completion 才说明请求完成。}
+
+\topic{专题：读硬件结构时要区分数据路径和控制路径}
+CPU、cache、DRAM、SSD、网卡和显卡都可以用同一个提问框架阅读：数据从哪里到哪里，控制由谁发起，完成由谁报告，错误由谁保存。低质量描述常把这些混成“设备把数据给 CPU”。更好的描述应写出两条路径：数据可能经 DMA 在设备和主存之间移动；控制通常由 CPU 写 MMIO、设备写 completion、CPU 读状态或处理中断。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+路径 & 典型方向 & 必须说明 \\
+\midrule
+控制路径 & CPU 到 MMIO/doorbell，设备到状态/中断 & 命令何时被接收，完成如何通知 \\
+数据路径 & 设备 DMA 与主存缓冲区之间 & 缓冲区地址、长度、cache 可见性、权限 \\
+错误路径 & 设备或互连到错误码/异常 & 超时、校验、越界、权限和重试策略 \\
+恢复路径 & 驱动或固件到 reset/retry/rebuild & 哪些状态保留，哪些队列丢弃或重放 \\
+\bottomrule
+\end{longtable}
+
+\section*{章末练习与验收任务}
+
+\begin{longtable}{L{0.22\linewidth}L{0.5\linewidth}L{0.18\linewidth}}
+\toprule
+任务 & 要求 & 验收标准 \\
+\midrule
+SRAM 读写周期 & 画出地址、CS、OE、WE、数据线和采样窗口 & 能指出谁驱动数据线，谁采样 \\
+地址映射 & 设计 64 KiB ROM/RAM/GPIO/定时器映射 & 任意地址最多一个片选有效 \\
+等待状态 & 为慢 ROM 和慢 I/O 设计 READY/WAIT 规则 & 等待期间地址和方向稳定，有超时策略 \\
+MMIO 寄存器 & 设计 GPIO 的 \code{DIR/OUT/IN/STAT} 语义 & 外部输入经过同步，状态清除规则明确 \\
+中断顺序 & 写出设备 ready 到 CPU 服务程序返回的 trace & 不丢事件，不重复清旧事件 \\
+DMA 顺序 & 写出描述符、缓冲区、completion 和 cache 可见性边界 & CPU 和设备所有权不重叠 \\
+valid/ready & 用 valid/ready 描述一次读请求和读响应 & 能说明背压和 completion 的作用 \\
+cache 行 & 用 tag/index/offset 解释一次 cache 命中和一次 miss & 能说明 cache line、valid、dirty 和替换边界 \\
+MMIO 属性 & 说明为什么设备寄存器通常不能按普通 cacheable 内存处理 & 能指出副作用、顺序和可见性要求 \\
+未映射访问 & 规定未映射地址的超时、错误或固定返回值 & CPU 不会永久等待未知目标 \\
+存储层次图 & 画出寄存器、L1/L2/L3、DRAM、SSD/硬盘的数据粒度和完成语义 & 能区分 cache line、页、块和 completion \\
+TLB/cache 区分 & 写出一次 LOAD 中 TLB hit/miss、页错误、cache miss 的不同路径 & 不把地址转换错误和数据回填混为一谈 \\
+块设备队列 & 为 NVMe 或简化 SSD 写出 submission、doorbell、DMA、completion 顺序 & 能说明 CPU 写门铃不等于 I/O 完成 \\
+\bottomrule
+\end{longtable}
+
+\section*{参考解答与验收要点}
+
+\begin{longtable}{L{0.18\linewidth}L{0.48\linewidth}L{0.24\linewidth}}
+\toprule
+任务 & 参考解答 & 必须保留的验收点 \\
+\midrule
+SRAM 周期 & 读时地址和片选稳定，OE 有效、WE 无效，由 SRAM 驱动数据；写时 OE 无效，由发起者驱动数据，WE 在地址和数据稳定后有效。 & 输出使能互斥，写窗口满足建立/保持时间。 \\
+地址映射 & 例如低半区 ROM，高半区中一块 RAM，最高 4 KiB 为 I/O；用高位地址产生互斥片选，未映射区返回错误或超时。 & 片选互斥和未映射行为必须写入规格。 \\
+等待状态 & 慢目标在 ready 之前保持事务未完成，控制器保持地址、片选和方向；超过最大等待则返回错误。 & 等待状态是硬件事务延长。 \\
+MMIO & GPIO 输出写入锁存器，输入来自同步后的外部引脚，状态位说明 ready/error/irq，清除规则避免新旧事件混淆。 & MMIO 有副作用，不是普通变量。 \\
+中断 & 设备锁存事件并请求中断，中断控制器投递，CPU 进入入口，服务程序读状态、处理数据、按设备规则清事件，再发送 EOI 或恢复中断。 & 清除顺序决定是否丢事件。 \\
+DMA & CPU 准备描述符和缓冲区并保证对设备可见，设备搬运数据并投递 completion，CPU 在 completion 后按一致性规则读取缓冲区。 & 描述符可见、数据可见和缓冲区所有权必须分开。 \\
+valid/ready & 只有 valid 和 ready 同时为 1 才传输；ready 为 0 时发送方保持 payload；读请求和读响应可隔多个周期。 & 背压不等于错误，completion 才是完成证据。 \\
+未映射访问 & 未映射区域可以返回固定值、产生错误或等待到超时，但规则必须固定且可观察；不能让总线悬空成为随机值。 & 错误路径也是硬件规格。 \\
+\bottomrule
+\end{longtable}

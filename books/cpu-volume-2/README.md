@@ -13,7 +13,7 @@ AI 模型、算子开发和本地量化推理引擎放入第三册。
 ## 目录结构
 
 ```text
-source/latex/      # 正式 LaTeX 书稿，生成 main.pdf 和 main.epub
+source/latex/      # 正式 LaTeX 书稿，生成 main.pdf
 materials/         # 草稿、素材、参考资料和扩写计划
 labs/              # 早期代码实验和本书配套实践素材
 reports/           # 实验报告模板
@@ -36,20 +36,18 @@ materials/csapp-gap-next-plan.md
 ```bash
 make check
 make pdf
-make epub
 make text-count
 ```
 
 生成文件位置：
 
 - `source/latex/main.pdf`
-- `source/latex/main.epub`
 
 ## 本书维护规则
 
 - 正式成书以 `source/latex/` 为准。
 - 本书只维护一个正式版本，不再并行维护 Markdown 版本。
-- 排版、字体、代码样式、目录层级和 EPUB 约束沿用第一册。
+- 排版、字体、代码样式和目录层级沿用第一册。
 - 章节写作顺序保持“原理先行、模型约束、代码证据、测量验证、源码入口”。
 - C++ 示例统一使用位宽明确的整数类型，例如 `std::int32_t`、`std::int64_t` 和 `std::uint64_t`。
 - 所有性能结论必须说明输入规模、数据布局、缓存行为、指令约束和测量边界。
