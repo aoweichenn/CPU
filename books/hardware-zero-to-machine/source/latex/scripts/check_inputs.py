@@ -15,11 +15,11 @@ EXPECTED_INPUTS = [
     "frontmatter/preface",
     "frontmatter/expanded-outline",
     "chapters/ch01-electricity-diode-switch",
-    "chapters/ch04-feedback-latches-flipflops",
-    "chapters/ch07-number-arithmetic-circuits",
-    "chapters/ch11-minimal-cpu",
-    "chapters/ch09-memory-bus-io-dma",
-    "chapters/ch13-classic-chips-platforms",
+    "chapters/ch02-feedback-latches-flipflops",
+    "chapters/ch03-number-arithmetic-circuits",
+    "chapters/ch04-minimal-cpu",
+    "chapters/ch05-memory-bus-io-dma",
+    "chapters/ch06-classic-chips-platforms",
     "backmatter/checklist",
 ]
 
