@@ -117,6 +117,24 @@ send(sock, user_buf, len):
 
 这段伪代码解释短写：阻塞 socket 通常尽量等待空间，非阻塞 socket 在缓冲区满时可能只写入部分数据或返回 \code{EAGAIN}。接收路径类似：接收缓冲为空时阻塞或返回 \code{EAGAIN}；对 TCP 返回字节流，对 UDP 每次读取保留报文边界语义。
 
+背压要从两端同时看。发送方应用调用 \code{send(sock, buf, 1MiB)}，内核不可能把 1MiB 立即塞进网卡。它先受本机 socket send buffer 限制；再受 TCP 拥塞窗口和接收方通告窗口限制；再受 qdisc、驱动队列和网卡 DMA ring 限制。任一层满了，\code{send} 都可能停住、短写或返回 \code{EAGAIN}。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+队列或窗口 & 它限制什么 & 满了以后会怎样 \\
+\midrule
+socket sndbuf & 应用已交给内核但尚未确认释放的字节 & 阻塞 \code{send}、短写或 \code{EAGAIN} \\
+TCP send queue & 已分段、待发送、待重传的数据 & 受拥塞控制和对端窗口约束 \\
+qdisc 队列 & 本机网络调度层待发送 packet & 排队延迟增加，可能丢包或限速 \\
+驱动 TX ring & 网卡可消费的 DMA 描述符槽位 & 停止网络队列，等 completion 回收槽位 \\
+对端 receive window & 接收方还能缓存多少未读数据 & 发送方必须减速，甚至进入零窗口等待 \\
+\bottomrule
+\end{longtable}
+
+一个常见现象是：程序以为 \code{send} 返回成功就表示对方收到了消息。实际并不是。返回成功通常只说明数据已经被本机内核接收进入发送路径，后续还可能因为连接 reset、重传失败、超时或本机崩溃而没有到达对端应用。若业务需要“对方已经处理”，必须在应用协议里设计确认，而不是把 socket 写入成功当业务提交点。
+
+接收方向也一样。网卡收到包后，驱动把 skb 交给协议栈，TCP 按序重组后放进 socket receive queue。应用不读，receive queue 会涨满；涨满后接收窗口变小，发送方会被迫降速。若应用只看“网络带宽不够”，就会误诊。真正问题可能是本进程处理慢、单线程事件循环被阻塞、receive buffer 太小，或者应用协议把消息边界处理错。
+
 \subsection{poll 与 epoll}
 
 朴素 \code{poll} 每次扫描 fd 数组，复杂度 \code{O(n)}：
@@ -147,6 +165,30 @@ socket_state_change(sock):
 
 边沿触发和水平触发的区别也来自 ready 条件。水平触发下，只要缓冲区仍有数据，下一次等待还会报告；边沿触发只在状态从不可读变可读时报告，用户必须一直读到 \code{EAGAIN}，否则可能再也收不到事件。
 
+用一个具体 bug 看边沿触发为什么容易错。socket S 原来不可读，随后内核收到 100 字节，状态从不可读变为可读，epoll edge-triggered 把 S 放入 ready list。应用从 \code{epoll\_wait} 取到事件，只调用一次 \code{recv(S, buf, 20)}，读走 20 字节后就回到等待。此时 socket 里还剩 80 字节，但状态没有从“不可读”再次变成“可读”，所以边沿触发可能不会再报告。应用就把 80 字节卡在内核 receive queue 里。
+
+正确写法是：收到边沿事件后，对非阻塞 fd 循环读取，直到 \code{recv} 返回 \code{EAGAIN}。这个 \code{EAGAIN} 不是错误，而是证明“当前 ready 条件已经被消费干净”。写方向也类似，收到可写事件后应尽量写到 \code{EAGAIN} 或应用输出队列为空。
+
+\begin{lstlisting}
+on_epollin_edge(fd):
+  while true:
+    n = recv(fd, buf, sizeof(buf), NONBLOCK)
+    if n > 0:
+      append_to_protocol_parser(buf, n)
+      continue
+    if n == 0:
+      close_connection(fd)
+      break
+    if errno == EAGAIN:
+      break
+    if errno == EINTR:
+      continue
+    handle_error(fd, errno)
+    break
+\end{lstlisting}
+
+epoll 还要求应用区分“事件身份”和“fd 数字”。线程 A 把 fd=7 加入 epoll，线程 B 关闭 fd=7，线程 C 立即打开新连接又得到 fd=7。旧 epoll item 在内核里绑定的是旧 file，不是新连接；但事件返回给用户时可能仍带着当初保存的数字 7。健壮事件循环通常把 \code{data.ptr} 指向连接对象，并给对象加 generation 或关闭标记，避免用裸 fd 数字误操作新连接。
+
 \subsection{TCP 状态边界}
 
 操作系统教材不必在本册完整推导 TCP，但要能解释 socket 系统调用面对的状态：
@@ -158,7 +200,7 @@ socket_state_change(sock):
 LISTEN & 可 accept，不能普通 recv 数据 & accept queue、backlog、SYN 处理 \\
 SYN-SENT & connect 进行中 & 超时、错误返回、非阻塞完成事件 \\
 ESTABLISHED & 可 send/recv & 缓冲、重传、拥塞控制、窗口 \\
-FIN-WAIT/CLOSE-WAIT & 半关闭 & EOF、shutdown、剩余数据读取 \\
+半关闭 & FIN-WAIT 或 CLOSE-WAIT & EOF、shutdown、剩余数据读取 \\
 TIME-WAIT & fd 通常已关但四元组保留 & 防旧包污染新连接 \\
 \bottomrule
 \end{longtable}
@@ -180,6 +222,36 @@ TIME-WAIT & fd 通常已关但四元组保留 & 防旧包污染新连接 \\
 \begin{rubricbox}
 本章合格标准：能说明 socket 为什么是 fd；能画出 bind/listen/accept/connect/send/recv 的对象变化；能解释阻塞、非阻塞、poll、epoll 的等待语义。
 \end{rubricbox}
+
+\subsection{本章压缩进来的网络可靠性边界}
+
+网络补充材料可以继续展开路由、Netfilter、NAPI、skb、拥塞控制和持久化服务协议。主线里先守住一个边界：TCP 的可靠字节流不等于业务请求可靠提交。操作系统能告诉你连接状态、字节是否进入本机内核、对端是否关闭、socket 错误是什么；它不能替应用判断“远端服务是否已经执行这笔订单、写入这条记录或只执行了一半”。
+
+\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+现象 & OS/协议层含义 & 应用层仍要处理什么 \\
+\midrule
+\code{send} 返回正数 & 字节被本机发送路径接收 & 对端应用未必收到或处理 \\
+\code{recv} 返回 0 & 对端有序关闭且缓冲已读完 & 未完成请求可能成功也可能失败 \\
+\code{ECONNRESET} & 连接被复位，流状态不再可信 & 当前业务操作结果未知 \\
+超时 & 等待期限内未得到事件 & 远端可能稍后处理或已处理但响应丢失 \\
+重连成功 & 新 TCP 流建立 & 旧流上的请求语义不能自动继承 \\
+\bottomrule
+\end{longtable}
+
+可靠服务要在 TCP 之上建立自己的提交证据。常见方法包括请求 ID、幂等键、服务端去重表、事务日志、单调版本、应用级 ACK 和恢复查询。客户端超时后重试同一个请求 ID，服务端若发现已经提交，就返回旧结果；若未提交，才执行并记录。这样网络断开、进程崩溃、重复发送和响应丢失都能收敛到同一条业务语义，而不是把 socket 错误码当作业务真相。
+
+\begin{lstlisting}
+server_handle(req):
+  if committed_log.contains(req.id):
+    return committed_log.result(req.id)
+  result = execute_transaction(req.payload)
+  committed_log.append(req.id, result)
+  fsync(committed_log)
+  return result
+\end{lstlisting}
+
+这个模型也解释了为什么网络服务常和文件系统持久化绑在一起。若服务端先回 ACK 再写日志，崩溃后客户端以为成功而服务端忘记结果；若先写日志再回 ACK，客户端即使没收到响应，也能用同一个请求 ID 查询或重试。OS 网络栈负责传字节和报告连接状态，业务一致性由应用协议和存储提交共同证明。
 
 \section{源码级补充：sk\_buff、协议栈入口、NAPI 与 Netfilter}
 

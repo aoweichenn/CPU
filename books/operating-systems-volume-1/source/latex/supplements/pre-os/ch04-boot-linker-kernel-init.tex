@@ -2,15 +2,48 @@
 
 \section{原理}
 
-从裸机程序走向内核，第一道门是启动。机器上电后不会自动理解 C 语言，也不会自动准备堆、栈、全局变量和设备。CPU 只知道从复位向量或固件指定入口取指。操作系统必须把“二进制文件如何进入内存、第一条指令在哪里、栈在哪里、全局变量如何初始化、设备何时可用”这些问题全部讲清。
+从裸机程序走向内核，第一道门是启动。先看一个最容易误判的写法：
 
-在单片机上，启动路径通常是 reset handler：设置栈指针，把 \code{.data} 从 Flash 复制到 SRAM，把 \code{.bss} 清零，初始化时钟和最小串口，然后调用 \code{main} 或 \code{kernel\_main}。在 PC 或服务器上，路径更长：固件初始化硬件，bootloader 加载内核镜像和启动参数，切换 CPU 模式，建立最小页表，最后跳到内核入口。
+\begin{lstlisting}
+power_on:
+  call kernel_main
+\end{lstlisting}
+
+这段伪代码看起来干净，但在真实机器上通常不能成立。C 函数不是孤立存在的，它默认栈已经可用，全局变量已经初始化，代码和数据在链接器预期的位置，必要地址能访问，最小输出设备已经准备好。上电瞬间，这些条件都不是天然存在的。
+
+机器上电后，CPU 只知道从复位向量或固件指定入口取第一条指令。复位向量就是架构规定或固件约定的起始地址。CPU 不会自动理解“这是内核主函数”，也不会自动准备堆、栈、全局变量和设备。操作系统必须把“二进制文件如何进入内存、第一条指令在哪里、栈在哪里、全局变量如何初始化、设备何时可用”这些问题全部讲清。
+
+在单片机上，启动路径通常是 reset handler：设置栈指针，把 \code{.data} 从 Flash 复制到 SRAM，把 \code{.bss} 清零，初始化时钟和最小串口，然后调用 \code{main} 或 \code{kernel\_main}。\code{.data} 是带初值的全局数据段，例如 \code{int x = 7}；\code{.bss} 是未显式初始化的全局数据段，C 语言要求它运行时从 0 开始。在 PC 或服务器上，路径更长：固件初始化硬件，bootloader 加载内核镜像和启动参数，切换 CPU 模式，建立最小页表，最后跳到内核入口。
 
 启动阶段的特点是“没有服务可用”。还没有调度器，不能睡眠；还没有内存分配器，不能随便 \code{malloc}；还没有完整中断，不能依赖异步事件；还没有文件系统，不能读普通文件；还没有日志系统，调试输出只能靠串口、早期 console 或内存缓冲区。这些约束解释了为什么内核初始化代码通常按严格阶段组织。
 
 \subsection{上电后 CPU 为什么不能直接运行内核 C 函数}
 
 C 函数依赖一组运行环境：栈指针有效，全局变量已初始化，BSS 为零，代码和数据位于链接器预期地址，调用约定可用，必要的地址映射存在。上电瞬间这些条件都不自动成立。CPU 只处在架构定义的复位状态，从固定入口取指；剩下的环境必须由启动代码一步步建立。
+
+可以按下面这条线理解从“不能调用 C”到“可以调用 \code{kernel\_main}”的过渡：
+
+\begin{lstlisting}
+Reset:
+  CPU only has architectural reset state
+
+MinimalStack:
+  set stack pointer, now simple calls can return
+
+DataCopied:
+  copy initialized globals to runtime memory
+
+BssCleared:
+  zero uninitialized globals
+
+EarlyConsole:
+  prepare minimal output for failure evidence
+
+KernelMain:
+  now ordinary early C code has a reliable base
+\end{lstlisting}
+
+每一步都只解决一个问题。先有栈，函数调用才不会把返回地址写到未知位置；再有 \code{.data/.bss}，全局锁、队列和指针才有可预测初值；再有 early console，后面的失败才有证据。
 
 \begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
 \toprule
@@ -28,7 +61,7 @@ C 代码假设 & 谁建立 & 若缺失会怎样 \\
 
 \subsection{链接脚本决定内存布局}
 
-链接脚本把代码段、只读数据、已初始化数据、未初始化数据和栈安排到具体地址。没有链接脚本，编译器和链接器不知道内核应该放在物理地址哪里，也不知道哪些符号表示段边界。
+链接脚本把代码段、只读数据、已初始化数据、未初始化数据和栈安排到具体地址。代码段通常叫 \code{.text}，只读数据段通常叫 \code{.rodata}，已初始化全局数据是 \code{.data}，未初始化全局数据是 \code{.bss}。没有链接脚本，编译器和链接器不知道内核应该放在物理地址哪里，也不知道哪些符号表示段边界。
 
 \begin{lstlisting}
 SECTIONS {
@@ -48,7 +81,7 @@ SECTIONS {
 
 \subsection{链接地址、加载地址和重定位}
 
-链接地址是代码认为自己运行的位置，加载地址是 bootloader 把镜像放到内存的位置。二者可以相同，也可以不同。若不同，早期代码要么以位置无关方式运行，要么完成重定位，要么建立页表把链接虚拟地址映射到实际物理地址。
+链接地址是代码认为自己运行的位置，加载地址是 bootloader 把镜像放到内存的位置。二者可以相同，也可以不同。若不同，早期代码要么以位置无关方式运行，要么完成重定位，要么建立页表把链接虚拟地址映射到实际物理地址。重定位就是把“代码里原本按某个地址计算的引用”修正到实际运行地址。
 
 \begin{lstlisting}
 kernel linked at virtual address: 0xffffffff81000000
@@ -62,7 +95,7 @@ early page table maps:
 
 \subsection{启动阶段的状态机}
 
-内核启动可以写成状态机：
+前面的步骤可以收束成启动状态机：
 
 \begin{lstlisting}
 Reset
@@ -78,6 +111,8 @@ Reset
 \end{lstlisting}
 
 每个阶段只能使用之前已经建立的能力。比如 EarlyConsole 之前不能输出复杂日志；BootMemoryDiscovered 之前不能建立通用页分配；SchedulerReady 之前不能阻塞等待；InterruptsReady 之前不能依赖设备中断。
+
+这条限制很硬。若某个 early init 函数偷偷调用需要内存分配器的路径，它可能在小配置上“刚好能跑”，在大配置上随机损坏；若某个初始化函数在调度器 ready 前等待事件，它没有任何任务切换机制能把自己唤醒。
 
 \subsection{x86-64 模式演进：实模式、保护模式、长模式}
 

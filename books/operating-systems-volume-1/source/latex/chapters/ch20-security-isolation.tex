@@ -4,7 +4,72 @@
 
 操作系统的隔离不是一个单独功能，而是贯穿 CPU、内存、文件、进程、设备和网络的约束集合。没有隔离，一个进程可以读写任意内存、伪造设备请求、修改别人的文件、消耗全部 CPU 和内存。安全机制的目标不是让程序“不会出错”，而是让错误和恶意行为被限制在授权边界内。
 
+先从一个具体事故模型进入：一个图片处理服务接收用户上传文件，解析库里有漏洞，攻击者能让它执行任意代码。此时问题已经不是“程序会不会出 bug”，而是“这个被接管的进程还能碰到什么”。如果它能读所有文件、调用所有系统调用、无限 fork、访问宿主设备、修改网络配置，那么一个进程漏洞就会变成整机失陷。OS 安全机制要做的是把损害限制在最小授权范围里。
+
+错误设计通常长这样：
+
+\begin{lstlisting}
+run_service():
+  start as root
+  mount host filesystem
+  allow all syscalls
+  no memory or process limit
+  parse untrusted image
+\end{lstlisting}
+
+这个设计把“程序正常运行需要的能力”和“程序被攻破后拥有的能力”混成了一件事。正确思路要反过来：先列主体、对象和操作，再逐层收紧。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+层次 & 限制什么 & 失败时挡住什么 \\
+\midrule
+CPU 特权级和页表 & 用户代码不能执行特权指令或访问内核页 & 任意代码直接改内核内存 \\
+权限模型层 & 哪个主体能访问哪个文件、socket、设备 & 越权读写对象 \\
+namespace & 进程能看见哪些名字和对象集合 & 通过全局路径或 PID 找到宿主资源 \\
+cgroup/rlimit & 能消耗多少 CPU、内存、进程和 I/O & fork bomb、内存耗尽、I/O 拖垮整机 \\
+沙箱收紧层 & 未来还能调用哪些入口、访问哪些路径 & 漏洞后扩大攻击面 \\
+\bottomrule
+\end{longtable}
+
 最基础隔离来自 CPU 特权级和页表权限。用户态不能执行特权指令，不能访问内核页，不能修改页表。系统调用是受控入口，内核在入口处检查参数和权限。文件权限、用户 ID、组 ID、capability、namespace、cgroup、seccomp 和 LSM 则在更高层限制对象访问和资源消耗。
+
+这些机制不是互相替代。页表保护内核地址，但不决定某个用户能不能写 \code{/etc/passwd}；文件权限能拒绝写文件，但不能限制进程创建十万个子进程；namespace 改变进程看到的文件树和 PID 视图，但共享宿主内核；seccomp 能减少系统调用入口，但不能把原本没有的文件权限授予进程。安全设计要叠加多层边界，每层解决不同失败模式。
+
+本章第一次使用“主体”和“对象”两个词。主体是发起动作的一方，例如进程、线程、用户身份、容器或服务账号。对象是被访问的一方，例如虚拟页、inode、socket、设备、namespace、cgroup 文件。权限检查不是抽象口号，它必须落到“主体 S 对对象 O 做操作 A 是否允许”这个三元关系上。
+
+继续展开图片处理服务的事故。攻击者上传一张畸形图片，触发解析库越界写，拿到了服务进程内的任意代码执行。此时 CPU 和页表已经无法阻止它在本进程地址空间里做事，因为它就是这个进程本身；OS 隔离要从“它接下来想越界访问别的对象”开始拦截。
+
+\begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\toprule
+攻击动作 & 若没有边界 & 哪层机制应当挡住 \\
+\midrule
+读取 \code{/etc/shadow} & 泄露宿主口令哈希 & DAC、capability、mount namespace、只读根文件系统 \\
+打开容器引擎 socket & 创建特权容器控制宿主 & mount namespace 不暴露 socket，文件权限和 LSM 拒绝 \\
+调用 \code{ptrace} 注入同机服务 & 横向控制其他进程 & uid 边界、Yama/LSM、缺少 \code{CAP\_SYS\_PTRACE}、seccomp \\
+无限 \code{fork} & 占满 pid 和调度资源 & pids cgroup、rlimit \\
+分配大量内存 & 触发宿主回收和 OOM & memory cgroup、oom 策略 \\
+创建设备节点或挂载文件系统 & 访问宿主设备或改写视图 & 缺少 \code{CAP\_SYS\_ADMIN}，seccomp/LSM 拒绝 \\
+\bottomrule
+\end{longtable}
+
+按这张表看，安全配置不是“开一个沙箱”就结束。假如服务以普通 uid 运行，但把宿主 Docker socket 挂进容器，攻击者不需要 root 也可能通过 socket 请求宿主创建新容器；假如没有 pids 限制，攻击者即使读不了敏感文件，也能 fork bomb 拖垮机器；假如 seccomp 允许 \code{mount}、\code{bpf}、\code{ptrace}、危险 \code{ioctl}，一次普通解析漏洞就有机会变成内核攻击面。每一层都只负责一类失败，叠加起来才叫最小权限。
+
+把收紧后的设计写成状态变化，而不是口号：
+
+\begin{lstlisting}
+before accepting untrusted images:
+  create service uid without shell login
+  mount only /app and /tmp/work, /app read-only
+  map container uid 0 to unprivileged host uid if using user namespace
+  drop all capabilities except the exact required set
+  set pids.max, memory.max, cpu.max, io.max
+  set no_new_privs
+  install seccomp profile for the real hot path
+  apply LSM/Landlock rules for file access
+  exec worker
+\end{lstlisting}
+
+这个顺序也有意义。先准备 namespace 和 cgroup，是为了让后续进程在受限视图和资源账本里出生；drop capability 和 \code{no\_new\_privs} 要发生在执行不可信工作前；seccomp 一旦安装，未来系统调用入口被缩小；最后通过 exec 进入 worker，可以顺便清理地址空间、环境变量和不该继承的 fd。若顺序反了，例如先开始解析图片再安装 seccomp，漏洞就可能发生在边界生效之前。
 
 \section{实践}
 
@@ -83,6 +148,43 @@ seccomp 的价值是缩小攻击面。即使攻击者控制了进程内存，也
 \item cgroup 内存限制触发时，系统有明确 OOM 或失败策略。
 \item seccomp 规则允许正常路径，拒绝非必要危险系统调用。
 \end{itemize}
+
+\subsection{本章压缩进来的故障、观测与验收}
+
+安全隔离不是最后一章唯一主题。一个真实系统还必须回答：错误怎样返回，panic 后哪些状态不可信，恢复依据是什么，观测证据从哪里来。把 panic、错误路径和可观测性放在安全章收束，是因为它们都在检查同一件事：边界被突破或状态不一致时，系统能不能停止扩散、留下证据、支持恢复。
+
+\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+场景 & 系统应做什么 & 验收证据 \\
+\midrule
+普通错误 & 返回明确 errno，回滚未提交对象 & 负面测试证明没有副作用和泄漏 \\
+可恢复资源压力 & 限流、回收、失败或局部 OOM & cgroup 事件、PSI、日志和请求错误率 \\
+内核不变量破坏 & oops/panic，停止继续写不可信状态 & panic 日志、kdump、最后 trace 事件 \\
+设备或 I/O 错误 & 停新请求、完成 in-flight、上报 delayed error & dmesg、block stats、fsync 错误、驱动计数器 \\
+安全拒绝 & 拒绝入口并记录主体、对象、操作 & audit、LSM 日志、seccomp 统计和负面测试 \\
+\bottomrule
+\end{longtable}
+
+观测工具也要按问题选择。tracepoint 和 ftrace 适合看内核路径是否经过；perf 适合看 CPU 时间、cache miss 和热点；eBPF 适合在线聚合延迟、队列长度和错误码；日志适合记录低频状态转换；crash dump 适合 panic 后离线检查。观测不是越多越好，证据必须能回答具体假设：线程是在等 CPU、等锁、等 I/O、等内存回收，还是被安全策略拒绝。
+
+\begin{lstlisting}
+incident_report:
+  symptom: request p99 rises from 20ms to 2s
+  hypothesis: blocked on page cache writeback
+  evidence:
+    off-cpu stack shows balance_dirty_pages
+    PSI io full rises during incident
+    block queue latency p99 rises
+    application CPU remains low
+  conclusion:
+    not an algorithm CPU hotspot; storage backpressure
+\end{lstlisting}
+
+整册的最终验收可以压成七项。任一机制都要写出状态对象、入口、权限、等待、提交、失败路径和证据。调度有 task/runqueue/wait queue；内存有 mm/VMA/PTE/page；文件有 fd/file/inode/page cache/request；网络有 socket/skb/队列/错误状态；安全有主体/对象/策略/审计。若某个解释只剩术语，没有这七项，就还不能指导实现和排障。
+
+\begin{rubricbox}
+本册收束标准：拿到一次系统调用、缺页、I/O、网络请求或安全拒绝，能说清它改变了哪些对象，在哪个点可能睡眠，哪个点对用户可见，哪个点对持久化或远端可见，失败如何回滚，哪条观测证据能证明判断。做到这一点，章节压缩后内容仍然是厚的。
+\end{rubricbox}
 
 \section{源码级补充：DAC、MAC、capability、namespace、Landlock 与硬化}
 

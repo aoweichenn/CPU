@@ -4,6 +4,63 @@
 
 \code{read} 和 \code{write} 把文件内容显式复制到用户缓冲区，而 \code{mmap} 把文件区间映射到进程地址空间，让普通 load/store 触发文件页面的调入和回写。它看起来像内存功能，实际是虚拟内存、文件系统和 page cache 的共同契约：VMA 记录虚拟地址区间；page cache 记录文件偏移到物理页的缓存；缺页处理把两者连接起来；写回系统决定脏页何时落盘。
 
+先写一个常见误解：
+
+\begin{lstlisting}
+addr = mmap(file, length)
+# wrong mental model:
+# kernel reads the whole file into memory now
+# addr points to that private copy
+\end{lstlisting}
+
+这个模型会立刻解释不了三个现象。第一，映射一个很大的文件可以很快返回，因为内核通常只建立 VMA，不会立刻把所有页面读入内存。第二，多个进程映射同一个文件区间，读到的可能是同一份 page cache 页，而不是每个进程一份私有拷贝。第三，另一个进程把文件 truncate 后，当前进程访问原来映射的越界部分可能得到 \code{SIGBUS}，因为虚拟地址仍在 VMA 里，但背后的文件页已经不存在。
+
+正确过渡是：
+
+\begin{lstlisting}
+mmap:
+  create VMA [addr, addr + length)
+  remember file and file offset
+  do not install every PTE yet
+
+first load from addr + x:
+  page fault
+  find VMA
+  compute file page index
+  find or load page cache page
+  install PTE
+resume user instruction
+\end{lstlisting}
+
+所以 \code{mmap} 的核心不是“少一次拷贝”这一句话，而是把文件偏移延迟绑定到虚拟地址访问上。这个延迟绑定带来性能，也带来错误边界：缺页可能等待 I/O，写入可能变成 COW 或 dirty page，持久化要靠 \code{msync/fsync} 推进，文件大小变化可能让合法 VMA 里的访问失败。
+
+用一个小文件把状态走完整。文件 \code{data.bin} 有 9000 字节，页大小 4096。进程执行：
+
+\begin{lstlisting}
+fd = open("data.bin", O_RDWR);
+p = mmap(NULL, 8192, PROT_READ | PROT_WRITE,
+         MAP_SHARED, fd, 0);
+x = p[5000];
+\end{lstlisting}
+
+\code{mmap} 返回时，常见状态并不是“两个页都已经在内存里”。更准确的账本是：
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+对象 & 刚 mmap 后 & 第一次读 \code{p[5000]} 后 \\
+\midrule
+VMA & 记录虚拟区间、文件、offset 0、共享可写 & 不变 \\
+PTE & 两个虚拟页通常都还没有 present 映射 & 第二个虚拟页 present，指向 page cache 页 \\
+page cache & 可能没有对应页，也可能已有别的进程留下的页 & \code{(inode, index=1)} 有缓存页 \\
+文件系统 I/O & 通常没有立即读 8192 字节 & 若 cache miss，提交读第 1 个文件页 \\
+用户指令 & 还没执行 load & fault 返回后重新执行 load，读到字节 \\
+\bottomrule
+\end{longtable}
+
+这里的 \code{p[5000]} 落在映射的第二个虚拟页，因为 \code{5000 / 4096 = 1}。缺页处理先用 fault 地址找到 VMA，再把 \code{addr - vma.start} 换算成文件页索引 1，然后到 inode 的 page cache 中查 \code{index=1}。若缓存命中，内核直接安装 PTE；若缓存未命中，内核分配一个 locked page，把它先放入 page cache，再发起磁盘读。读完成前 faulting 线程睡眠；完成后解锁页面，安装 PTE，回到用户态重新执行那条 load。注意是重新执行 faulting 指令，不是从下一行继续，因为第一次 load 还没有真正完成。
+
+再看边界。映射长度是 8192，只覆盖文件前两个页；文件实际有 9000 字节，所以这两个页都在文件范围内。若改成映射 16384 字节，再访问第三页的一部分，VMA 可能仍然覆盖该地址，但文件没有对应内容，内核不能凭空制造稳定文件页，应该按系统语义触发 \code{SIGBUS} 或等价错误。这也是 \code{SIGSEGV} 和 \code{SIGBUS} 的区别：前者常表示地址不属于合法映射或权限不对；后者常表示地址形式上属于映射，但背后的文件对象不能提供该页。
+
 为什么需要 \code{mmap}？第一，它减少系统调用和复制，适合随机访问大文件。第二，它让多个进程共享同一份文件页，天然支持共享库和共享内存。第三，它把文件 I/O 纳入页表权限和缺页机制，统一了“按需加载”。但它也带来更复杂的一致性：一个进程通过 \code{write} 修改文件，另一个进程通过 \code{mmap} 读同一区间，看到的应是同一份 page cache 语义，而不是两个互相独立的缓存。
 
 \begin{keyidea}
@@ -106,6 +163,30 @@ handle_write_fault(vma, addr, old_page):
 
 COW 的复杂度是一次页面复制 \code{O(PAGE\_SIZE)}。它用写时成本换取 fork/exec 和私有映射的低启动成本。共享映射的复杂性则在持久化：PTE dirty、page dirty、文件系统 journal dirty 和块设备队列不是同一件事。用户调用 \code{msync(MS\_SYNC)} 期望脏页写回并等待完成，但这仍不必然等价于包含目录项的业务提交，后者需要文件系统和上层协议共同保证。
 
+继续用 \code{data.bin}。两个进程 A 和 B 都用 \code{MAP\_SHARED} 映射文件第一页。A 执行：
+
+\begin{lstlisting}
+p[10] = 'X';
+\end{lstlisting}
+
+如果 A 的 PTE 当前是只读但 VMA 允许写，CPU 会产生写权限 fault。内核确认这是共享可写映射后，可以把同一份 page cache 页装成可写 PTE，并在合适的时机把页面标脏。此后 B 通过 \code{read(fd, buf, ...)} 或自己的共享映射读同一文件页，看到的可能就是 page cache 中已修改的内容。此时状态应分层看：
+
+\begin{longtable}{p{0.22\linewidth}p{0.58\linewidth}}
+\toprule
+层次 & \code{p[10]='X'} 之后发生了什么 \\
+\midrule
+CPU/PTE & A 的页表项允许写；硬件 dirty 位可能被置位 \\
+page cache & \code{(inode,0)} 对应页内容已变，页面需要写回 \\
+文件系统 & 还未必分配或提交所有元数据事务 \\
+块层/设备 & 还未必收到写请求，更未必完成持久化 \\
+应用语义 & 写了内存，不等于业务事务已经提交 \\
+\bottomrule
+\end{longtable}
+
+这就是很多 mmap 程序出错的地方：它们看到另一个进程能读到新字节，就以为数据已经“保存到磁盘”。实际上那只是 page cache 可见性，不是掉电后的持久性。若随后机器掉电，而 dirty page 还没写回，磁盘上的文件可能仍是旧内容。若应用需要“写完记录后断电也能恢复”，至少要推进到 \code{msync(MS\_SYNC)} 或 \code{fsync}，并且还要考虑文件长度、目录项、日志或 manifest 的提交顺序。
+
+\code{MAP\_PRIVATE} 的同一行代码完全不同。A 第一次写时，内核复制一页，把 A 的 PTE 指向匿名页；page cache 仍保存文件原始内容，B 也仍看到原始内容。此时“写入成功”只对 A 的进程地址空间成立，不对文件成立。私有映射不是“共享映射但晚点落盘”，而是写入后脱离文件页的匿名内存。
+
 \subsection{回收与写回}
 
 内存压力下，干净文件页可以直接回收，因为它们能从文件重新读入；脏文件页必须先写回；匿名页若没有 swap，就不能随意丢弃。
@@ -147,6 +228,24 @@ reclaim_page(page):
 \begin{rubricbox}
 本章合格标准：能画出 VMA、PTE、page cache、inode 的关系；能解释 private/shared 映射的写故障差异；能说明 \code{msync}、\code{fsync} 和业务提交不是同一个边界。
 \end{rubricbox}
+
+\subsection{本章压缩进来的持久化与恢复}
+
+文件映射、page cache 和写回最终都要服务恢复语义。普通应用常把“别的进程现在能读到新字节”误认为“断电后仍能读到新字节”；存储系统则必须把每一步写成可恢复协议。主线里先抓住四层提交：内存可见、page cache 变脏、块设备完成、文件系统和目录项持久。业务提交通常还要在这些层之上，再写 manifest、日志或版本号。
+
+\begin{longtable}{p{0.18\linewidth}p{0.42\linewidth}p{0.28\linewidth}}
+\toprule
+边界 & 已经保证什么 & 仍未保证什么 \\
+\midrule
+\code{memcpy} 到映射区 & 当前进程地址空间已改变 & 文件页未必写回，私有映射不改文件 \\
+其他进程读到新字节 & 共享 page cache 可见 & 掉电后未必存在 \\
+\code{msync(MS\_SYNC)} & 指定映射脏页写回并等待结果 & 目录项、rename、其他文件未必提交 \\
+\code{fsync(file)} & 文件数据和必要元数据推进到持久层 & 多文件事务顺序未必正确 \\
+\code{rename + fsync(dir)} & 目录项切换可恢复 & 应用协议仍要能识别旧版/新版 \\
+\bottomrule
+\end{longtable}
+
+可靠更新通常需要单调证据。先写新数据并同步，再写临时 manifest 并同步，随后 \code{rename} 替换正式 manifest，最后同步目录。崩溃恢复时，程序只相信通过校验和、长度、版本号或事务记录证明完整的版本。若先更新 manifest 再同步数据，恢复程序可能看到“版本 42 已提交”，但数据页还停在旧内容。持久化错误最危险的地方是正常测试很难暴露，只有把崩溃点插在每个提交边界之后，才能证明恢复算法不会相信半成品。
 
 \section{源码级补充：do\_mmap、XArray、writeback、O\_DIRECT 与 DAX}
 
@@ -262,6 +361,31 @@ fault_mapped_file(addr):
 \end{longtable}
 
 数据库和存储服务必须明确使用哪个边界。只调用 \code{msync} 某段映射，不一定同步目录项或业务 manifest；只调用 \code{fsync} 文件，不一定说明应用的多文件事务已提交。
+
+用一个索引文件更新看清楚持久化边界。程序维护两个文件：\code{data.dat} 保存记录，\code{manifest} 保存“当前有效数据文件和版本”。它用 mmap 修改 \code{data.dat} 的某一页，然后更新 manifest 指向新版本：
+
+\begin{lstlisting}
+memcpy(mapped_data + off, record, len);
+msync(mapped_data + page_start, PAGE_SIZE, MS_SYNC);
+write(manifest_fd, "version=42\n", 11);
+fsync(manifest_fd);
+\end{lstlisting}
+
+这段看起来已经很谨慎，但还要继续问：manifest 文件是覆盖写还是 rename 新文件？目录项是否 fsync？data 文件长度是否已经扩展并持久？如果 \code{record} 跨两页，只 msync 了一页会怎样？如果 \code{msync} 成功但 \code{fsync(manifest)} 失败，恢复时应该相信哪个版本？持久化不是“调用一个同步函数”就完了，而是要把恢复算法需要的证据按顺序写到介质上。
+
+\begin{longtable}{p{0.2\linewidth}p{0.46\linewidth}p{0.22\linewidth}}
+\toprule
+动作 & 它推进了哪层状态 & 仍未保证什么 \\
+\midrule
+写 mmap 内存 & 改了 page cache 或私有匿名页 & 未必到块设备 \\
+\code{msync(MS\_SYNC)} 数据页 & 等待指定映射脏页写回 & 未必同步目录项或其他文件 \\
+\code{fsync(data\_fd)} & 推进 data 文件数据和必要元数据 & 不代表 manifest 已提交 \\
+\code{rename(tmp, manifest)} & 原子切换目录项视图 & 目录项持久化仍要看目录 fsync \\
+\code{fsync(dirfd)} & 推进目录项更新 & 不修复上层协议顺序错误 \\
+\bottomrule
+\end{longtable}
+
+可靠更新通常要让恢复路径有单调证据。例如先把新数据页写入并同步，再写临时 manifest，\code{fsync} 临时文件，\code{rename} 替换正式 manifest，最后 \code{fsync} 目录。崩溃后要么看到旧 manifest 指向旧数据，要么看到新 manifest 指向已经同步过的新数据。若顺序反过来，先提交 manifest 再写 data，恢复时可能读到“版本 42 已提交”但数据页仍是旧内容。这里的核心不是某个固定配方，而是每一步都要说明：崩溃发生在这一行之后，恢复程序会看到哪些对象状态。
 
 \subsection{userfaultfd 和用户态缺页处理}
 

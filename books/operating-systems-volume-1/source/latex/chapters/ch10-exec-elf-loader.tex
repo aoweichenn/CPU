@@ -44,6 +44,59 @@ fd table & 关闭 \code{FD\_CLOEXEC} 条目 & 不应改变 \\
 \bottomrule
 \end{longtable}
 
+把这条路径放进一个具体命令会更清楚。假设 shell 进程 pid 为 3182，执行：
+
+\begin{lstlisting}
+execve("/usr/bin/grep",
+       ["grep", "-n", "main", "a.txt"],
+       envp);
+\end{lstlisting}
+
+进入内核时，\code{path}、\code{argv} 和 \code{envp} 都还在旧地址空间里。这里的旧地址空间不是“快要没用的垃圾”，而是内核目前唯一能读到这些字符串的地方。内核不能先释放旧 mm 再慢慢读参数；一旦旧页表被拆掉，\code{argv[2]} 指向的 \code{"main"} 可能就再也翻译不出来。因此第一轮工作是复制输入：先复制路径字符串，再按指针数组逐个复制 argv/envp 字符串，并统计总字节数。若 \code{argv[3]} 恰好跨到一个不可读页，正确结果是 \code{-EFAULT}，旧 shell 继续运行，fd table、signal handler 和旧地址空间都不能被改坏。
+
+\begin{longtable}{p{0.16\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+\toprule
+阶段 & 内核手里的稳定证据 & 此时失败应怎样收场 \\
+\midrule
+复制用户参数 & 内核缓冲区里的 path、argv、envp 副本 & 返回 \code{EFAULT/E2BIG}，旧程序继续 \\
+路径解析 & 指向 \code{/usr/bin/grep} 的 inode/file 引用 & 返回 \code{ENOENT/EACCES}，释放引用 \\
+ELF 验证 & ELF header 和 program header 副本 & 返回 \code{ENOEXEC}，旧 mm 不变 \\
+临时装载 & 新 mm、VMA、栈页、解释器信息 & 释放临时 mm，旧程序继续 \\
+提交 & 新入口、新栈、新凭据、CLOEXEC 关闭集合 & 成功后不再回到旧用户代码 \\
+\bottomrule
+\end{longtable}
+
+接着内核解析路径，得到稳定的 inode 和 file 引用。权限检查必须绑定这个对象，而不是只检查字符串 \code{"/usr/bin/grep"}。检查通过后，内核读取 ELF header。若这是动态链接的程序，program header 里通常有 \code{PT\_INTERP}，例如指向 \code{/lib64/ld-linux-x86-64.so.2}。这意味着“用户写的是执行 grep”，但第一条用户态指令很可能属于动态链接器；动态链接器根据 auxv 找到主程序的 program header，完成共享库装载和重定位，最后再跳到 grep 的入口。这个过程解释了为什么 exec 栈上要有 \code{AT\_PHDR}、\code{AT\_PHNUM}、\code{AT\_ENTRY}、\code{AT\_BASE} 和 \code{AT\_RANDOM}，它们不是装饰字段，而是用户态运行时启动所需的证据。
+
+再看文件描述符。shell 可能提前打开了管道：
+
+\begin{lstlisting}
+grep -n main a.txt | less
+\end{lstlisting}
+
+这时 grep 进程继承的 \code{STDOUT\_FILENO} 可能不是终端，而是管道写端。exec 成功后，普通 fd 继续指向同一个 open file description；带 \code{FD\_CLOEXEC} 的 fd 则在提交时关闭。这个规则必须在提交点附近执行：太早关闭会导致 exec 失败后旧程序少了 fd；太晚关闭会让新程序短暂看到本不该继承的能力。于是 \code{FD\_CLOEXEC} 不是“关闭一些数字”这么简单，它是在程序映像替换边界上裁剪继承能力。
+
+最后把新用户栈具体展开。假设栈顶从高地址向低地址增长，内核通常先把字符串放到栈下方，再压入指针表和 auxv。进入动态链接器或程序入口时，用户态看到的是：
+
+\begin{lstlisting}
+low address
+  argc = 4
+  argv[0] -> "grep"
+  argv[1] -> "-n"
+  argv[2] -> "main"
+  argv[3] -> "a.txt"
+  argv[4] = NULL
+  envp[0] -> ...
+  ...
+  NULL
+  auxv entries: AT_PHDR, AT_PHNUM, AT_ENTRY, AT_RANDOM, ...
+  padding for alignment
+  strings: "grep\0-n\0main\0a.txt\0..."
+high address
+\end{lstlisting}
+
+如果这里指针顺序错了，\code{main(int argc, char** argv)} 看到的参数就会错；如果 16 字节对齐错了，某些 ABI 约定和运行时启动代码会在很早的位置崩溃；如果 \code{AT\_RANDOM} 指向了旧地址空间或未映射地址，libc 初始化 canary 时会 fault。用户栈构造不是格式化输出，而是内核和用户态启动代码之间的二进制契约。
+
 \section{算法与实现分析}
 
 \subsection{ELF header 验证}
@@ -82,6 +135,23 @@ map_load_segment(mm, file, ph):
 \end{lstlisting}
 
 若采用 demand paging，\code{map\_file} 不必立即读入所有页面，只需建立 VMA，等 page fault 时按文件偏移填充页面。这样 \code{exec} 延迟低，内存占用也低。若采用 eager loading，实现简单但启动大程序会有明显 I/O 峰值。
+
+用 \code{/usr/bin/grep} 的第一条指令看 demand paging。exec 提交完成后，寄存器 RIP 已经指向解释器或主程序入口，RSP 指向新用户栈；但入口所在的代码页可能还没有真正读入物理内存。CPU 返回用户态后开始取指，MMU 查入口虚拟地址的 PTE，发现 present=0，于是触发 instruction page fault。内核重新进入缺页处理，先用 fault 地址找到对应 VMA，再发现它来自可执行文件的 \code{PT\_LOAD} 段，权限是 read+exec，文件偏移由 \code{vaddr - segment.vaddr + segment.offset} 算出。若 page cache 里没有这一页，内核提交文件读；读完后安装只读可执行 PTE，返回用户态重试同一条取指。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+时刻 & 状态 & 关键边界 \\
+\midrule
+exec 提交 & 新 mm 已安装，代码段只有 VMA 或部分 PTE & 旧程序不能继续运行 \\
+第一次取指 & 入口页 PTE 不 present，CPU 产生缺页异常 & faulting 指令还没执行 \\
+缺页处理 & 根据 VMA 找到 ELF 文件和页偏移 & 必须检查 VMA 可执行权限 \\
+读入页面 & page cache miss 时等待存储 I/O & 当前 task 可睡眠，调度器运行别人 \\
+安装 PTE & PTE 标成 user、present、read、exec、not writable & 权限不能超过 ELF 段权限 \\
+重试取指 & 同一 RIP 再次执行，这次翻译成功 & demand paging 对用户程序透明 \\
+\bottomrule
+\end{longtable}
+
+这条路径解释了两个现象。第一，大程序 exec 可以很快返回到用户态，因为只物化了马上需要的页；后面真正访问到的代码和数据才陆续缺页。第二，exec 已经成功不代表后续每次取指和读数据都不会失败：底层文件系统 I/O 错误、映射被异常截断、权限标志错误，都可能在第一次访问某页时暴露。教材若只说“exec 装载 ELF”，读者会误以为装载一定是一次性读完整个文件；真实边界是“建立地址空间契约”和“按需把页物化”两步。
 
 \subsection{用户栈构造}
 
@@ -142,6 +212,44 @@ commit_exec(new_image):
 
 \begin{rubricbox}
 本章合格标准：能区分 fork 和 exec；能解释 ELF program header 的运行时意义；能画出用户栈布局；能指出 exec 的失败回滚边界和提交点。
+\end{rubricbox}
+
+\subsection{本章压缩进来的装载与身份账本}
+
+\code{exec} 很容易被误讲成“把一个 ELF 读进内存”。真正的主线更宽：它同时替换地址空间、重建用户栈、改变入口寄存器、裁剪 fd 继承、可能改变凭据、处理多线程、交给解释器或动态链接器，并把旧程序的错误恢复边界切断。把这些细节压成一张账本，读源码时才不会只盯着 \code{load\_elf\_binary} 里某几次 \code{mmap}。
+
+\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+账本 & exec 要修改什么 & 不能出错的边界 \\
+\midrule
+地址空间 & 新 \code{mm}、VMA、栈、brk、mmap base、VDSO & 提交前失败必须保留旧 \code{mm}，提交后不能再回旧代码 \\
+文件与路径 & 可执行文件、解释器、脚本原文件、mount flags & 权限检查必须绑定稳定 inode/file，而不是路径字符串 \\
+fd 继承 & 普通 fd 继承，\code{FD\_CLOEXEC} fd 关闭 & 不能在 exec 失败时提前关闭旧程序 fd \\
+凭据与安全 & setuid、file capability、LSM、no\_new\_privs、dumpable & 提权 exec 要清理危险环境和调试关系 \\
+线程组 & 成功后只保留调用 exec 的线程 & 旧用户态锁和其他线程栈不能进入新映像 \\
+用户态启动 & \code{argc/argv/envp/auxv}、入口 RIP、栈对齐 & 动态链接器和 libc 在 \code{main} 前就依赖这些字段 \\
+\bottomrule
+\end{longtable}
+
+这张账本能解释很多看似零散的规则。脚本 \code{\#!/bin/sh} 需要重新构造 argv，是因为真正执行的是解释器；动态 ELF 入口先到 \code{ld-linux}，是因为重定位和共享库加载属于用户态运行时；\code{no\_new\_privs} 会压制提权，是因为 seccomp 和沙箱不能允许“先收紧入口、再 exec 一个 setuid 程序拿回更大权限”；多线程 exec 要清掉其他线程，是因为旧程序里的用户态 mutex、TLS、栈和信号现场对新程序没有可解释语义。
+
+再用一个带提权和动态链接的例子收束。进程执行一个 setuid root 的动态链接程序时，内核不能只检查 ELF magic。它要先解析可执行 inode，计算新凭据，判断 \code{no\_new\_privs}、文件 capability 和 LSM 策略；若发生权限边界变化，运行时还要进入 secure mode，忽略或清理会影响动态链接器的环境变量，例如 \code{LD\_PRELOAD}。否则攻击者可以让高权限程序在启动前加载自己控制的共享库。
+
+\begin{lstlisting}
+privileged_exec_boundary(file):
+  old_cred = current.cred
+  new_cred = compute_exec_cred(file, old_cred)
+  if privilege_will_change(old_cred, new_cred):
+    enable_secureexec()
+    suppress_unsafe_loader_environment()
+    restrict_dump_and_ptrace()
+  install_new_image_and_cred_at_commit()
+\end{lstlisting}
+
+这里的提交点必须把“新程序身份”和“新程序映像”作为一组状态安装。若凭据已经提升但地址空间仍是旧程序，旧代码就拿到了不该有的身份；若地址空间已经换成新程序但 fd 和环境还没裁剪，新程序又可能短暂看到不该继承的能力。好的教学实现即使简化 setuid 和动态链接，也要保留这条不变量：exec 成功后看到的是一组自洽的新运行身份，exec 失败后旧程序仍保持原身份和原资源。
+
+\begin{rubricbox}
+读 \code{exec} 源码时，至少标出四个点：仍可回滚到旧程序的点、开始销毁旧用户映像的点、新凭据和新地址空间一起生效的点、返回用户态且永不返回旧代码的点。缺少这四个点，就很难判断错误路径是否安全。
 \end{rubricbox}
 
 \section{源码级补充：load\_elf\_binary、auxv 与 binfmt}

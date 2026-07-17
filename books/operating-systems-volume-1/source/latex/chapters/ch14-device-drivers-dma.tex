@@ -4,9 +4,50 @@
 
 设备驱动把硬件寄存器、中断、DMA 和内核对象连接起来。应用看到的是 fd、socket、块设备或帧缓冲；驱动看到的是 MMIO 寄存器、描述符环、设备状态位、中断线、DMA 地址和错误码。驱动的难点在于硬件和 CPU 并发运行：CPU 写描述符，设备异步读取；设备写内存，CPU 稍后读取；中断可能在任意时刻到来。
 
+先从一个错误直觉开始：
+
+\begin{lstlisting}
+disk_write(buf, len):
+  return disk.write(buf, len)
+\end{lstlisting}
+
+这像普通函数调用，但真实设备不会沿着你的调用栈返回。CPU 能做的是写设备寄存器、填一段内存中的描述符、敲 doorbell 通知设备；设备随后按自己的时钟和状态机工作。它可能成功，可能失败，可能很久以后才完成，也可能在 reset 中丢掉请求。驱动的工作就是把这种异步硬件行为包装成内核可管理的请求。
+
+把最小路径写清楚：
+
+\begin{lstlisting}
+submit_write(buf):
+  req = allocate_request()
+  req.buffer = buf
+  req.state = PREPARED
+  dma = map_buffer_for_device(buf)
+  fill_descriptor(req.id, dma, len)
+  publish_descriptor_with_barrier()
+  ring_doorbell()
+  req.state = IN_FLIGHT
+  sleep_until_completion(req)
+\end{lstlisting}
+
+这段伪代码第一次引出几个概念。descriptor 是给设备看的请求摘要，通常包含 DMA 地址、长度、标志和请求身份。doorbell 是通知设备“我放了新活”的寄存器写入。completion 是设备稍后交回的完成结果。request 是内核自己的对象，用来把用户请求、buffer、描述符、等待任务和最终错误码连在一起。
+
 最简单设备可以用 programmed I/O：CPU 直接读写设备寄存器或数据端口。PIO 易懂，但吞吐低，CPU 被数据搬运占住。DMA 让设备直接读写内存，CPU 只准备描述符和缓冲区。DMA 提高吞吐，也引入缓存一致性、地址映射、内存屏障和 buffer 生命周期问题。
 
+PIO 和 DMA 的区别不是“老技术”和“新技术”的区别，而是 CPU 参与程度不同：
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+方式 & CPU 做什么 & 风险边界 \\
+\midrule
+PIO & 每次读写设备寄存器搬运数据 & CPU 忙等、吞吐低、长时间占用核心 \\
+DMA & 准备 buffer 和描述符，让设备直接搬运内存 & buffer 生命周期、cache 一致性、IOMMU 映射 \\
+中断 & 设备完成后通知 CPU & 中断风暴、上半部不能睡眠、completion 要能找回请求 \\
+轮询 & CPU 定期检查完成队列 & 延迟/吞吐折中、budget 背压 \\
+\bottomrule
+\end{longtable}
+
 驱动通常分成上半部和下半部。中断上半部快速确认设备、读取状态、屏蔽或清除中断，把复杂工作推迟到底半部、工作队列、软中断或普通内核线程。这样可以减少中断关闭时间，避免在硬中断上下文执行可能睡眠的操作。
+
+驱动和前面章节的连接也要明确：提交请求时可能让当前 task 睡眠，completion 到来后要唤醒 wait queue；DMA buffer 来自页分配器和虚拟内存系统；设备错误最终要通过 fd、socket、块层或文件系统返回给用户；权限和 namespace 决定用户能否打开这个设备。驱动不是孤立章节，而是硬件异步事件进入 OS 对象系统的入口。
 
 \section{实践}
 
@@ -59,6 +100,26 @@ submit_tx(desc_ring, packet):
 
 这里的屏障非常关键。CPU 必须先把描述符内容写完，再更新 tail 或 doorbell 通知设备；否则设备可能看到半初始化描述符。
 
+把一次网卡发送请求走细一点。用户态 \code{send} 最终让内核拿到一段要发送的数据，网络栈构造 packet buffer，驱动要把这个 buffer 交给网卡。网卡不认识 \code{struct sk\_buff}，也不能读用户虚拟地址；它通常只读一段描述符内存，描述符里写着 DMA 地址、长度、校验和 offload 标志、结束位和 request tag。CPU 是生产者，设备是消费者。
+
+\begin{longtable}{p{0.16\linewidth}p{0.42\linewidth}p{0.3\linewidth}}
+\toprule
+步骤 & 驱动和硬件动作 & 不能错的边界 \\
+\midrule
+保留槽位 & 驱动读取 \code{head/tail}，确认环未满，选择 \code{tail} 槽位 & 满环必须返回或停止上层队列，不能覆盖设备未消费的描述符 \\
+映射 buffer & DMA API 把 packet buffer 映射成设备可见 DMA 地址 & 设备不能拿用户指针或内核虚拟地址 \\
+填写描述符 & 写入地址、长度、flags、tag，最后设置 owned/valid 位 & valid 位不能早于其他字段对设备可见 \\
+发布顺序 & 执行 DMA 写屏障，保证描述符内容先于 doorbell & 少屏障会让设备读到旧字段或半初始化字段 \\
+敲门铃 & 写 MMIO doorbell 或更新 tail，通知设备取新描述符 & doorbell 只是通知，不代表发送完成 \\
+设备 DMA & 网卡读取描述符和数据，经 IOMMU 访问内存，发送到链路 & buffer 在 completion 前不能释放或复用 \\
+完成回收 & 设备写回 completion 或更新 head，驱动 unmap 并释放 buffer & 回收必须以设备完成证据为准 \\
+\bottomrule
+\end{longtable}
+
+这里有两个常见误解。第一，\code{tail = next} 只是软件变量变化，设备未必看见；真正通知设备的通常是 MMIO doorbell 或共享队列尾指针的可见更新。第二，completion 不等于用户业务语义完成。网卡发送 completion 通常说明设备已经不再需要这个 DMA buffer，未必说明对端应用已经收到数据；块设备 completion 说明设备处理了请求，是否持久还要看 flush/FUA 和文件系统语义。驱动层必须先把“buffer 能否释放”这件事讲清楚，再谈上层协议。
+
+迟到 completion 是取消路径最容易出错的地方。假设上层超时，驱动 reset 队列并把 request 对象释放；如果设备或旧中断稍后又报告同一个 tag 完成，而 tag 已经被新请求复用，驱动可能唤醒错任务或释放错 buffer。可靠实现通常给 request tag、队列 generation、in-flight bitmap 和 reset 状态建立明确规则：reset 开始后停止新提交，标记旧请求失败，等待或屏蔽旧 completion，确认设备不再 DMA 后再复用 tag 和 buffer。
+
 \subsection{DMA 和缓存一致性}
 
 若 CPU cache 和设备 DMA 不自动一致，驱动必须在设备读内存前清理 cache，在设备写内存后失效 cache。即使硬件支持 IOMMU，也要建立设备可访问地址映射。
@@ -75,6 +136,23 @@ finish_dma_from_device(buf):
 \end{lstlisting}
 
 DMA buffer 的生命周期必须覆盖设备访问全过程。提交后不能释放或复用 buffer，直到 completion 表明设备不再访问它。这个规则和异步 I/O 的 buffer 所有权完全一致。
+
+缓存一致性要分方向看。设备从内存读数据，叫 TO\_DEVICE：CPU 先把数据写进 buffer，但这些写入可能还停在 cache 中，设备从内存读会看到旧内容；所以提交前要 clean 或通过 coherent 映射保证设备可见。设备向内存写数据，叫 FROM\_DEVICE：设备已经把新数据写进内存，但 CPU cache 里可能还有旧 cache line；所以 completion 后 CPU 读取前要 invalidate 或同步。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+方向 & 提交前/完成后要做什么 & 忘记后的现象 \\
+\midrule
+TO\_DEVICE & CPU 写 buffer 后，clean cache，再让设备 DMA 读 & 设备发送旧包、旧磁盘数据或半初始化描述符 \\
+FROM\_DEVICE & 设备 completion 后，invalidate cache，再让 CPU 解析 & CPU 读到旧包内容，协议栈校验失败或数据错乱 \\
+BIDIRECTIONAL & 两个方向都要同步，并严格定义所有权切换 & CPU 和设备同时修改，结果半新半旧 \\
+coherent DMA & 平台保证 CPU/设备可见性，但仍需要顺序屏障 & 数据可见不等于 doorbell 顺序自动正确 \\
+\bottomrule
+\end{longtable}
+
+再看一个接收包场景。驱动预先分配 RX buffer，把它 DMA map 成 FROM\_DEVICE，挂到 RX ring。挂上去之后，buffer 暂时归设备所有，CPU 不应把它当普通内存写。网卡收到包后 DMA 写入 buffer，并在描述符里写入长度、校验状态和完成位。驱动 poll 到完成位后，先执行 DMA 同步或 invalidate，再读取包头和长度，构造 skb 交给协议栈。若顺序反了，CPU 可能先读旧 cache line，看到旧长度或旧以太网头；这类 bug 往往不是每次复现，因为它取决于 cache 状态、CPU 迁移和包到达时机。
+
+IOMMU 还提供了另一个边界：设备只能访问被映射的 IOVA 范围。驱动 unmap 后，设备若继续 DMA，正确结果应是 IOMMU fault 或设备错误，而不是静默覆盖任意物理内存。可这要求驱动先确认设备不再持有该 descriptor，再 unmap 并释放页。IOMMU 是安全网，不是生命周期管理的替代品。
 
 \subsection{中断合并和轮询}
 
@@ -108,6 +186,24 @@ poll(budget):
 \item 批量 poll 遵守 budget，不能垄断 CPU。
 \item 设备 reset 后，驱动能清理 in-flight 请求并通知上层失败。
 \end{itemize}
+
+\subsection{本章压缩进来的块层与提交顺序}
+
+块层原本可以单独讲很久，但放在设备章里看更清楚：它是把文件系统的逻辑读写转换成设备队列 request 的中间层。文件系统提交的是 bio，描述“文件系统需要这些扇区读写”；blk-mq 把 bio 合并、排序、分派给硬件队列；驱动把 request 变成设备描述符；completion 再把错误和字节数一路传回等待者。
+
+\begin{longtable}{p{0.18\linewidth}p{0.40\linewidth}p{0.30\linewidth}}
+\toprule
+层次 & 保存什么账本 & 不能混淆的边界 \\
+\midrule
+bio & 一组页、扇区范围、读写方向和完成回调 & bio 完成不一定等于文件系统事务提交 \\
+request & 合并后的设备队列项、tag、超时和状态 & request tag 复用必须等旧 completion 收敛 \\
+hardware queue & CPU/NUMA 亲和的提交队列 & 多队列提高吞吐，也引入负载和顺序问题 \\
+flush/FUA & 写缓存顺序和持久化约束 & 普通写完成不等于掉电安全 \\
+I/O scheduler & 合并、排序、公平和延迟控制 & 吞吐优化不能破坏屏障语义 \\
+\bottomrule
+\end{longtable}
+
+存储顺序比普通异步完成更严格。日志文件系统、数据库和键值存储经常要求“先写数据，再提交元数据或 manifest”。如果设备或调度器为了吞吐随意重排，就可能在崩溃后看到新 manifest 指向旧数据。块层用 flush、FUA、barrier 或等价机制表达这些顺序约束；文件系统还要把自己的 journal commit、checkpoint 和目录项更新放在正确位置。设备章至少要记住一句话：DMA completion 说明设备不再需要某个 buffer，持久化 completion 才说明恢复路径能相信某个状态。
 
 \section{源码级补充：Linux 设备模型、PCI、NVMe、virtio 与 IOMMU}
 

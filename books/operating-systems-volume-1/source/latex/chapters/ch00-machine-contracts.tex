@@ -1,0 +1,769 @@
+\chapter{硬件事实怎样逼出内核对象}
+
+上一章已经把硬件链路单独讲清楚：CPU 只能从当前寄存器和程序计数器继续执行；地址要经过页表、TLB、cache 和内存属性；设备通过 MMIO、队列、DMA、中断和 completion 与 CPU 协作。现在往上走一层：这些硬件事实怎样逼出内核对象。
+
+task、地址空间、VMA、fd、request、wait queue 这些名字不是先验规定出来的。它们解决的都是同一个问题：硬件只给瞬时状态和低层事件，OS 必须把它们组织成可恢复、可检查、可等待、可取消、可释放的长期状态。只要这条线不清楚，后面讲调度、虚拟内存、文件系统和驱动时，就会像在背结构体字段。
+
+先从一个非常普通的动作开始。一个进程往日志文件追加一行：
+
+\begin{lstlisting}
+int fd = open("app.log", O_APPEND | O_WRONLY);
+write(fd, user_buf, len);
+\end{lstlisting}
+
+直觉上，这像是“把 \code{user\_buf} 里的字节交给磁盘”。但硬件并不认识“进程”“文件”“字符串”“追加写”这些概念。硬件只认识当前指令、寄存器里的数、虚拟地址、页表权限、cache line、设备寄存器、DMA 地址、中断向量和 completion 队列。于是内核必须把这次写日志拆成一串可验证的状态转换：当前程序怎样停下来，用户地址怎样验证，fd 怎样变成文件对象，文件偏移怎样确定，数据怎样进入 page cache 或块请求，设备完成怎样回来，失败后哪些状态已经提交，哪些状态必须回滚。
+
+\begin{keyidea}
+内核对象的第一原则是：把硬件给出的低层状态，变成可恢复、可检查、可等待、可释放的状态。进程不是“正在运行的代码”四个字，而是 CPU 现场、地址空间、文件表、信号、等待原因和调度状态的组合；I/O 请求也不是“调用设备函数”，而是 buffer、设备地址、request id、completion 和等待者的组合。
+\end{keyidea}
+
+把这条路径先压成一张总表：
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+硬件事实 & 如果只写成普通函数会怎样 & 被逼出的内核对象 \\
+\midrule
+CPU 只能从当前现场继续执行 & 进入内核后覆盖寄存器，返回用户态时找不到原位置 & trap frame、task、内核栈 \\
+用户地址只是虚拟地址 & 用户传坏指针会让内核读错页、越权读，或跨页时只检查了一半 & address space、VMA、PTE、用户拷贝边界 \\
+\code{fd} 只是一个小整数 & 另一个线程 close 后对象可能被释放，权限和文件偏移也无处保存 & fd table、open file description、引用计数 \\
+设备只暴露寄存器和队列 & 把设备当函数调用会忙等、丢完成、无法取消和超时 & driver、request、descriptor ring \\
+完成事件异步回来 & 中断只说“有事件”，不能说明哪个请求完成、结果是什么 & completion、request id、wait queue \\
+DMA 会让设备直接访问内存 & CPU 和设备同时改 buffer，或设备写到已经释放的页 & buffer ownership、DMA mapping、IOMMU 约束 \\
+\bottomrule
+\end{longtable}
+
+这张表也是后面章节的阅读索引。调度章讲 task 为什么能被切走再回来；内存章讲 address space、VMA、PTE 为什么分层；系统调用章讲用户指针为什么不能直接用；设备章讲 request、descriptor 和 completion 怎样接到硬件；文件章讲 fd 怎样引用文件对象；安全章讲谁有权触碰这些对象。读到任何 OS 名词时，都应该问一句：它是在补哪条硬件事实缺失的语义？
+
+\section{一、从一次写日志看硬件边界}
+
+先写一个错误但很自然的版本：
+
+\begin{lstlisting}
+write(fd, user_buf, len):
+  disk.write(user_buf, len)
+  return len
+\end{lstlisting}
+
+这个版本的问题不是“代码太短”，而是它把五个硬件边界都抹掉了。
+
+第一，CPU 正在执行用户程序，不会凭空同时运行内核代码。用户态进入内核时，硬件只提供一个受控入口。入口必须保存返回地址、栈指针、状态寄存器和参数寄存器。否则内核处理完以后，不知道回到哪条用户指令，也不知道用户原来传了什么参数。
+
+第二，\code{user\_buf} 不是物理内存地址，也不是可信内核指针。它只是当前进程地址空间里的一个虚拟地址。它可能跨页，可能后半段不可读，可能指向尚未调入的 \code{mmap} 文件页，也可能在另一个线程里被并发 \code{munmap}。内核不能因为起始地址看起来正常，就把 \code{len} 字节当成一整段可靠内存。
+
+第三，\code{fd} 不是文件本身。它只是当前进程文件表里的一个小整数索引。内核要用它找到 open file description，也就是“这个打开实例”的状态：访问权限、当前文件偏移、append 标志、引用计数、底层 inode 或设备对象。没有这个对象，两个线程同时写同一个 fd 时，谁更新偏移、谁持有引用、close 以后对象何时释放，都说不清。
+
+第四，磁盘不是函数。高速存储设备通常靠队列工作：CPU 在内存里放描述符，写 MMIO doorbell 通知设备；设备经 DMA 读写内存；完成后写 completion 并触发中断或等待轮询。设备返回不是沿 C 调用栈返回，而是稍后通过硬件事件回来。
+
+第五，失败不是一种。用户地址错误、文件不可写、磁盘超时、设备 reset、只写入一部分、数据只到 page cache、数据到设备缓存但未持久化，这些都不同。内核对象必须记录“推进到哪一步、哪些字节已经进入哪个层次、哪个请求还在飞、谁在等它、失败证据在哪里”。
+
+现在把例子走细一点。假设用户执行：
+
+\begin{lstlisting}
+write(fd, user_buf, 6000);
+\end{lstlisting}
+
+\code{user\_buf} 从用户页 A 的偏移 3000 开始，长度 6000 字节，因此会跨过页 A、页 B，并进入页 C。页 A 已经映射且可读；页 B 当前 PTE 不 present，但 VMA 说明它是合法的文件映射，可以缺页调入；页 C 不在任何 VMA 内。fd 指向一个普通日志文件，打开时带 \code{O\_APPEND}。
+
+朴素版本会说：“检查起点合法，然后拷 6000 字节。”这会错。正确路径必须按边界推进：
+
+\begin{longtable}{p{0.14\linewidth}p{0.42\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 内核和硬件发生什么 & 为什么要形成对象 \\
+\midrule
+入口 & syscall 保存用户 RIP/RSP、状态位和参数寄存器，切到内核入口和内核栈 & trap frame 让内核能返回、重启或把错误发给正确任务 \\
+fd 查找 & 当前 task 的 fd table 把小整数 \code{fd} 解析成 open file description，并临时增加引用 & 防止并发 close 释放对象，也保存写权限和 append 语义 \\
+权限和偏移 & 检查文件是否可写、是否 append、是否受 mount 或安全策略限制；append 写要在提交点取文件尾 & 文件对象保存“这次打开”的权限和偏移状态 \\
+用户拷贝页 A & CPU 按用户页表读取页 A 尾部，复制到内核 buffer 或 page cache 页 & 用户地址访问仍可能 fault，不能当普通内核 memcpy \\
+用户拷贝页 B & PTE 不 present，CPU 进入 page fault；内核查 VMA 后把页调入，再重试拷贝 & VMA 是“这个 fault 是否合法”的软件策略，PTE 是硬件证据 \\
+遇到页 C & 地址不在任何 VMA 内，内核不能继续读取 & 请求对象要记录已经接收多少字节，返回短写或错误语义 \\
+进入文件层 & 已接收的字节进入 page cache，或构造成块层请求；相关页标 dirty & page cache 把用户 API 返回和设备持久化分开 \\
+提交设备 & 若需要回写，块层分配 request，驱动填 descriptor、DMA mapping、request id，写 doorbell & 设备只认队列、DMA 地址、长度和控制位 \\
+睡眠等待 & 当前 task 从 running 变成 blocked，挂到 request 的 wait queue & CPU 不应忙等慢设备；等待原因必须可恢复 \\
+完成返回 & 设备写 completion，驱动按 tag 找回 request，记录结果并唤醒等待 task & 中断只是入口，request 才说明哪次请求完成 \\
+\bottomrule
+\end{longtable}
+
+这条路径里，每个对象都有必要性。trap frame 解决“回哪里”；task 解决“谁正在请求，谁要睡眠”；address space 和 VMA 解决“用户地址是否合法”；file object 解决“fd 对应哪个打开实例”；page cache 解决“文件内容在内存里的版本”；request 解决“异步设备请求的身份”；wait queue 解决“谁在等这个条件”；completion 解决“设备完成事实怎样回到具体请求”。
+
+再看页 C。内核已经成功接收页 A 尾部和页 B 的一部分之后，发现页 C 无效。此时不能简单说“整个 write 失败”，也不能简单说“6000 字节都成功”。普通文件、管道、socket、直接 I/O 对短写和错误的语义不同，但共同要求是：内核必须知道哪些字节已经进入了哪个内核对象，哪些还没有越过边界。这就是为什么后面文件章会反复讲 short write，为什么系统调用章会讲 \code{copy\_from\_user} 不是普通 \code{memcpy}。
+
+再看 append。没有 \code{O\_APPEND} 时，写入使用 open file description 里的当前文件偏移；写完后偏移前进。带 \code{O\_APPEND} 时，写入位置应当在提交时取文件尾。若两个线程同时写同一个日志文件，内核必须把“取文件尾、写入、更新大小或偏移”放在文件系统定义的同步边界里，否则两条日志可能互相覆盖。硬件只会执行 load/store，OS 对象必须补出“这是一个打开实例，这是一次追加写，这是已经提交的文件大小变化”。
+
+同一次 \code{write} 放到不同路径里，硬件边界还会继续分叉。很多初学者把“写文件”直接想成“CPU 把字节送到磁盘”，这会把 page cache、直接 I/O、设备 DMA 和崩溃一致性混成一件事。先看四种常见路径：
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+路径 & 表面看起来 & 真正跨过的硬件边界 \\
+\midrule
+page cache 命中 & 字节很快被复制到内核页，\code{write} 返回 & CPU 从用户页读，写入 page cache 页；设备请求可能稍后才出现 \\
+page cache 未命中或部分块写 & 先准备文件页，再把用户字节合进去 & 可能需要从设备读旧块，填补用户没有覆盖的部分，再标 dirty \\
+直接 I/O & 绕过 page cache，让设备直接读用户数据 & 用户页要 pin，建立 DMA/IOMMU 映射，completion 前不能释放或改作他用 \\
+append 与崩溃边界 & 多个线程都说“追加一行” & 文件大小、目录项、日志事务、设备缓存 flush 的提交点必须分清 \\
+\bottomrule
+\end{longtable}
+
+第一条路径是 page cache 命中。文件对应的缓存页已经在内存中，内核把用户字节复制到这些页，给页打上 dirty 标记，然后 \code{write} 可以较快返回。这里的完成只说明“内核已经接收这些字节，并把文件的内存版本改了”。它不说明磁盘已经持久化。硬件层面实际发生的是 CPU load 用户页、CPU store 内核页、cache line 被改脏；块设备可能还没有看到任何 request。于是 page cache 页必须保存 dirty 状态、文件偏移、页索引和引用计数，否则后台回写线程将来不知道哪些页要写到哪个文件位置。
+
+第二条路径是 page cache 未命中，尤其是部分块写。假设文件系统块大小是 4096 字节，用户只覆盖某个块中间 100 字节。如果这个块原内容不在 page cache，内核不能凭空把一个新页的 100 字节写出去，因为同一块其余 3996 字节仍然要保留旧内容。常见做法是先把旧块读进 page cache，或通过文件系统规则确认其余部分可以视为零，再把用户字节合进去。这里一个 \code{write} 可能先产生读 request，再产生未来的写 request。对象模型必须能表达“这页正在读入”“这页已经 uptodate”“这页被用户写脏”“这页等待回写”。如果只写成 \code{disk.write(user\_buf, len)}，就无法解释为什么一次写有时会先读磁盘。
+
+第三条路径是直接 I/O。用户用 \code{O\_DIRECT} 或数据库用自己的缓存时，内核可能让设备 DMA 直接从用户页读数据。此时用户地址检查还不够，内核还要 pin 住参与 I/O 的物理页，防止它们在设备访问期间被换出、释放或重新映射给别人。然后驱动通过 DMA API 把这些页变成设备可见的 DMA 地址，必要时写入 IOMMU 页表。completion 到达前，request 保存的不是一份普通指针，而是一组仍被设备引用的页、一组 DMA 映射和一个方向标记：这是设备读内存还是写内存。若进程在直接 I/O 期间退出，内核也不能立即释放这些页，必须等 request 完成或被设备确认取消。
+
+第四条路径是 append、并发和崩溃。两个线程同时执行：
+
+\begin{lstlisting}
+write(fd, "A\n", 2);
+write(fd, "B\n", 2);
+\end{lstlisting}
+
+如果二者都先读到同一个文件尾，再各自写入，就可能互相覆盖。文件对象和文件系统锁必须把“取尾部位置并分配写入范围”做成一个受控动作。再往下，系统突然断电时，用户看到 \code{write} 返回并不等价于数据已经越过设备缓存落到介质上；\code{fsync} 返回也依赖文件系统日志、块层 flush、设备对 flush/FUA 的实现。这里逼出的对象不仅是 open file 和 page cache，还有 journal transaction、dirty inode、writeback request 和错误回报位置。后面文件系统章会继续展开，但此处先记住一点：硬件只提供写 cache line、发 request、收到 completion 这些事实，OS 必须把它们组合成“追加”“可见”“持久化”这些接口语义。
+
+把四条路径放在一起，就能看出本章的主线：同一个 API 名字下面有多层完成边界。page cache 命中路径主要考验用户拷贝、页状态和延迟回写；部分块写路径暴露读改写；直接 I/O 路径暴露 DMA 和 IOMMU；append 路径暴露并发提交和崩溃恢复。内核对象不是为了把代码写复杂，而是为了让这些不同硬件事实不会互相冒充。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+如果没有这个对象 & 直接后果 & 对应的真实问题 \\
+\midrule
+没有 trap frame & 系统调用或中断后无法恢复用户指令流 & 任务不能被安全暂停和恢复 \\
+没有 task & 寄存器现场、地址空间、文件表和等待状态无法归属 & 调度器不知道切谁、唤醒谁 \\
+没有 VMA & PTE 不 present 时不知道是懒分配还是非法地址 & 缺页处理只能盲目失败或盲目放行 \\
+没有 open file description & fd 无法保存权限、偏移和引用关系 & 并发 write/close 语义崩掉 \\
+没有 request & 设备完成回来时找不到原始 buffer 和等待者 & 中断只能说明“有事”，不能完成 API \\
+没有 wait queue & 线程要么忙等，要么睡了以后没人知道它等什么 & 慢设备会浪费 CPU 或丢唤醒 \\
+\bottomrule
+\end{longtable}
+
+所以本章不是给结构体起名，而是把一次普通写入拆成对象形成过程。对象不是为了“面向对象设计”，而是为了保存跨越硬件边界的事实：谁拥有、谁等待、谁能访问、谁已经提交、谁还可能失败。
+
+\section{二、CPU 入口为什么逼出 task 和 trap frame}
+
+先只看 CPU，不看文件和设备。用户程序执行到这里：
+
+\begin{lstlisting}
+write(fd, user_buf, len);
+next_line();
+\end{lstlisting}
+
+进入内核前，CPU 的软件可见状态大致包括：
+
+\begin{lstlisting}
+RIP    = address of syscall instruction or next return point
+RSP    = top of user stack
+RAX    = syscall number
+RDI    = fd
+RSI    = user_buf
+RDX    = len
+RFLAGS = condition flags, interrupt-related state, mode bits
+\end{lstlisting}
+
+这些名字不用一次背完。关键是：CPU 当前只知道一组寄存器和下一条指令地址。用户程序执行 \code{syscall} 后，硬件会进入内核配置好的入口，并保存返回用户态所需的一部分状态。内核入口代码随后把更多通用寄存器保存成一份结构化现场。这份现场通常叫 trap frame。
+
+trap frame 第一次出现时，可以把它理解成“进入内核那一刻的证据包”。它至少回答四个问题：
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+问题 & trap frame 里的证据 & 后续用途 \\
+\midrule
+从哪里来 & 用户 RIP、用户代码段或特权级状态 & 返回用户态、信号处理、调试、错误报告 \\
+怎么回去 & 用户 RSP、返回状态位、中断相关状态 & 恢复用户栈和受控状态 \\
+带了什么参数 & 系统调用号和参数寄存器 & 派发到具体系统调用并验证参数 \\
+失败在哪里 & faulting RIP、fault address、error code & 缺页、非法指令、权限错误和重启逻辑 \\
+\bottomrule
+\end{longtable}
+
+如果不保存现场，内核很快会把用户寄存器覆盖掉：
+
+\begin{lstlisting}
+bad_syscall_entry:
+  use rdi, rsi, rdx for kernel work
+  call filesystem_write
+  return_to_user   // old fd, user_buf, len, and return point are gone
+\end{lstlisting}
+
+这不是抽象风险。内核自己的 C 函数也需要寄存器传参，也会使用栈，也会调用其他函数。若入口不先保存用户现场，内核一旦开始工作，原来的用户状态就会被正常的内核执行覆盖。trap frame 把“用户现场”从 CPU 瞬时状态变成内存里的对象，后面的检查、调度、信号和返回才有基础。
+
+但 trap frame 还不够。系统调用期间可能发生定时器中断，当前线程可能睡眠，调度器可能选择另一个线程运行。此时需要一个更大的归属对象：task。task 可以先理解成“一个可被调度和恢复的执行流”。它不是单独的寄存器集合，而是把一组长期状态绑在一起：
+
+\begin{lstlisting}
+Task:
+  saved CPU context
+  kernel stack
+  state: running, runnable, blocked, stopped
+  address space
+  file table
+  signal state
+  wait reason and wait queue link
+  accounting and scheduling metadata
+\end{lstlisting}
+
+用一次系统调用睡眠来走完整路径。用户线程调用 \code{write}，进入内核，内核发现设备请求需要等待，于是把当前 task 标成 blocked，并挂到 request 的 wait queue 上。调度器选择另一个 runnable task，保存旧 task 的内核执行上下文，恢复新 task 的上下文。等设备完成后，中断处理函数把旧 task 从 wait queue 移回 runqueue。未来某个时间片里，调度器恢复这个 task，它继续从系统调用内部的睡眠点之后执行，最终返回用户态。
+
+\begin{longtable}{p{0.15\linewidth}p{0.43\linewidth}p{0.3\linewidth}}
+\toprule
+时刻 & 状态变化 & 为什么需要 task \\
+\midrule
+用户执行 & CPU 当前寄存器属于用户线程 & 这些状态要归属到某个可调度实体 \\
+系统调用入口 & trap frame 记录用户现场，内核栈开始工作 & 进入内核后仍要知道将来回哪个用户线程 \\
+提交 I/O & request 记录 buffer、长度、tag 和等待者 & 等待关系要能从 request 回到 task \\
+睡眠 & task 状态从 running 变成 blocked，离开 CPU & CPU 可以运行其他 task，原 task 不丢失 \\
+中断完成 & completion 找到 request，再找到等待 task & 硬件事件变成对具体 task 的唤醒 \\
+再次调度 & task 被放回 runnable 并恢复内核上下文 & 系统调用从睡眠点继续，而不是从头再来 \\
+返回用户态 & trap frame 恢复用户寄存器和返回位置 & 用户程序看到一个普通 \code{write} 返回值 \\
+\bottomrule
+\end{longtable}
+
+这张表解释了为什么“进程/线程”不能只说成“一个程序”。程序是代码和数据；task 是当前执行流的可恢复状态。两个线程可以运行同一份代码、共享同一个地址空间和文件表，但有不同的寄存器现场、栈、等待原因和调度状态。OS 需要的是后者，因为 CPU 只能在具体现场之间切换。
+
+再加入异步中断。假设用户线程正在循环计算，没有调用系统调用：
+
+\begin{lstlisting}
+while (true) {
+  work();
+}
+\end{lstlisting}
+
+若没有定时器中断，这个线程可以一直占着 CPU。定时器到期后，硬件在指令边界进入内核入口。入口保存被打断现场，调度器给当前 task 记账，必要时把它放回 runqueue，再选择另一个 task。这里没有用户主动配合，task 仍然成立，因为硬件中断入口和 trap frame 让内核能把“当前 CPU 正在执行的现场”抓成对象。
+
+\begin{keyidea}
+task 是 CPU 硬件事实的内核化：CPU 只能执行一个当前现场，OS 就把每个可恢复现场做成 task；CPU 入口只能给一次瞬时 trap，OS 就把入口证据保存成 trap frame；CPU 会被中断打断，OS 就把等待原因和调度状态也放进 task。
+\end{keyidea}
+
+再把入口类型分清。进入内核并不只有系统调用一种。系统调用是用户程序主动请求服务；page fault 是 CPU 在执行 load/store/fetch 时发现地址翻译或权限不满足；timer interrupt 是时钟设备要求内核获得控制权；device interrupt 是外设报告队列或状态有变化。它们都进入内核，但原因、保存的证据和后续动作不同。
+
+\begin{longtable}{p{0.18\linewidth}p{0.35\linewidth}p{0.35\linewidth}}
+\toprule
+入口 & 触发原因 & trap frame 之外还要找什么对象 \\
+\midrule
+system call & 用户代码执行受控入口指令，请求内核服务 & 当前 task、fd table、address space、系统调用参数 \\
+page fault & MMU 无法完成某次取指、读或写 & fault address、error code、VMA、PTE、可能的物理页 \\
+timer interrupt & 定时器到期，CPU 被异步打断 & 当前 task 的运行时间、runqueue、调度策略 \\
+device interrupt & 设备报告队列、completion 或错误状态 & driver、device queue、request tag、wait queue \\
+\bottomrule
+\end{longtable}
+
+系统调用入口的特点是“主动而同步”。用户代码知道自己正在调用 \code{write}，参数按 ABI 放在寄存器里，返回值会回到同一条执行流。内核主要做两件事：把不可信参数变成内核对象，例如 fd 变成 open file；把可能阻塞的动作变成 task 的等待状态，例如等待 I/O completion。
+
+page fault 的特点是“当前指令没有完成”。例如内核在 \code{copy\_from\_user} 中读 \code{user\_buf}，CPU 发现页 B 的 PTE 不 present，于是进入 page fault。trap frame 记录的是被 fault 打断的位置，硬件还提供 fault address 和错误码。内核查 VMA 后若能补页，就安装 PTE 并返回到原指令附近重试；若不能补救，就把错误转成系统调用失败，或给用户进程发信号。这里 trap frame 不只是返回用的，它还让内核知道“这次 fault 属于哪个 task、发生在用户态还是内核态、能不能恢复”。
+
+timer interrupt 的特点是“用户或内核代码没有主动请求”。CPU 正在执行某个 task，定时器突然让控制权转入内核。内核保存现场后，可以决定当前 task 的时间片已经用完，把它从 running 放回 runnable，再从 runqueue 里挑另一个 task。若没有 trap frame，异步打断会破坏被打断代码；若没有 task，调度器只知道“CPU 上有寄存器”，不知道这些寄存器属于谁、已经运行多久、该放回哪个队列。
+
+device interrupt 的特点是“完成事实在设备侧”。设备中断到来时，当前 CPU 上运行的 task 未必是当初提交 I/O 的 task。甚至提交 I/O 的 task 可能在另一个 CPU 上睡眠。中断处理函数不能靠当前 task 来猜结果，必须读取设备 completion，按 tag 找 request，再通过 request 找等待者或回调。这一层关系非常重要：中断入口保存的是“被打断的当前现场”，completion 保存的是“设备完成了哪次请求”。二者不是同一个对象。
+
+还要解释内核栈。用户态有用户栈，为什么进入内核后不能继续用用户栈？因为用户栈位于用户地址空间，权限和映射都由用户进程影响。用户可以把栈指针设到非法地址，也可以让栈页在进入内核后触发缺页，还可以把栈内容设计成让内核覆盖关键数据。如果内核直接在用户栈上保存返回地址、局部变量和锁状态，就等于把内核控制流交给了不可信内存。所以每个 task 需要受内核保护的内核栈。系统调用、中断、缺页处理进入内核后，内核代码在这块栈上运行；task 睡眠时，这条内核调用链也随 task 一起保存。
+
+\begin{longtable}{p{0.2\linewidth}p{0.35\linewidth}p{0.33\linewidth}}
+\toprule
+如果继续用用户栈 & 可能发生什么 & 内核栈解决什么 \\
+\midrule
+用户 RSP 指向非法页 & 入口保存现场时再次 fault，甚至无法可靠报告错误 & 入口有可信保存位置 \\
+用户 RSP 指向共享映射 & 另一个线程或进程可修改内核临时数据 & 内核调用链不受用户写入影响 \\
+用户栈空间不足 & 深层文件系统或驱动调用覆盖用户数据或触发嵌套错误 & 每个 task 有受控大小和保护页 \\
+系统调用中睡眠 & 用户可能修改栈上“内核状态” & 睡眠中的内核帧保存在内核地址空间 \\
+\bottomrule
+\end{longtable}
+
+CPU 入口还会发生在内核态。内核正在执行文件系统代码时，设备中断可能到来；内核正在做用户拷贝时，page fault 可能到来；内核拿着某个锁时，定时器中断可能到来。于是 trap frame 还要记录被打断时的特权级和状态。若中断来自用户态，返回路径可能经过调度、信号投递和用户态恢复；若中断来自内核态，返回路径通常要回到被打断的内核代码，并且必须遵守“哪些锁已持有、哪些栈帧仍有效、哪些操作不可重入”。这就是为什么 OS 入口代码往往比普通函数调用复杂：它不仅要进来，还要能在各种嵌套和异步条件下正确出去。
+
+\section{三、地址翻译为什么逼出 address space、VMA 和 PTE}
+
+现在看 \code{user\_buf}。用户传给内核的是一个虚拟地址。虚拟地址是进程自己看到的地址编号，例如 \code{0x7fff00001234}。它不直接说明真实内存条上的位置，也不说明当前是否允许读写。硬件里的 MMU 查页表，把虚拟页翻译成物理页，并检查权限。页表项叫 PTE，也就是 page table entry。
+
+可以先把 PTE 看成硬件能读懂的一条记录：
+
+\begin{lstlisting}
+PTE:
+  present: is this virtual page currently mapped?
+  physical page number
+  readable / writable / executable
+  user-accessible or kernel-only
+  dirty / accessed and other status bits
+\end{lstlisting}
+
+但是 PTE 只回答“当前硬件能不能直接完成这次访问”。它不回答“如果不能完成，内核该不该补救”。这个补救策略来自 VMA。VMA 可以理解成 address space 里的一个合法区间说明：这段虚拟地址从哪里来，允许读写执行吗，背后是匿名内存、文件映射、栈，还是设备映射。
+
+\begin{longtable}{p{0.18\linewidth}p{0.4\linewidth}p{0.3\linewidth}}
+\toprule
+层次 & 它保存什么 & 谁使用它 \\
+\midrule
+address space & 一个进程看到的虚拟地址世界，包含页表根和 VMA 集合 & task 切换、缺页处理、用户地址检查 \\
+VMA & 一段虚拟区间的策略：范围、权限、来源、增长规则 & 内核缺页处理和 \code{mmap}/\code{munmap} \\
+PTE & 硬件当前可执行的映射：present、物理页、权限位 & MMU page walk 和 TLB 填充 \\
+TLB & 最近 PTE 翻译结果的硬件缓存 & CPU 快速完成 load/store \\
+\bottomrule
+\end{longtable}
+
+用前面的跨页 \code{user\_buf} 走一遍：
+
+\begin{lstlisting}
+page A: PTE present, user readable
+page B: PTE not present, VMA says file mapping and readable
+page C: no VMA covers this address
+\end{lstlisting}
+
+拷贝页 A 时，硬件翻译通过，CPU 从用户页读出字节。拷贝页 B 时，硬件发现 PTE 不 present，于是进入 page fault。注意，PTE 不 present 不等于一定非法。内核要查 VMA：若 VMA 说明这是一段合法文件映射，内核可以分配物理页、从文件读入数据、安装 PTE，然后重试原来的用户读取。拷贝页 C 时，没有任何 VMA 覆盖这个地址，内核就不能补页，因为这不是“暂时没准备好”，而是“这段地址不属于进程”。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+访问结果 & 硬件看到什么 & 内核怎样解释 \\
+\midrule
+页 A 成功 & PTE present 且用户可读，TLB 或 page walk 给出物理页 & 直接复制这一页内剩余字节 \\
+页 B 缺页 & PTE not present，CPU 记录 fault address 和错误码 & 查 VMA，合法则补页后重试 \\
+页 C 非法 & 没有 VMA，或者 VMA 不允许读 & 停止拷贝，返回错误或短写语义 \\
+只读页写入 & PTE present 但 writable 位不允许 & 可能是 COW，也可能是非法写 \\
+NX 执行失败 & PTE 不允许执行 & 安全隔离，不应改成可执行后放行 \\
+\bottomrule
+\end{longtable}
+
+这就是 address space、VMA、PTE 三层同时存在的原因。只有 PTE，不知道 not-present 是懒分配、文件页、换出页，还是非法地址。只有 VMA，硬件无法每条 load/store 都进内核询问策略。只有 TLB，修改页表后旧翻译还可能继续被 CPU 使用。OS 必须维护这三层的一致关系。
+
+把几种 fault 分开看，会更清楚。初学者常把 page fault 理解成“程序访问了非法内存”。这只对一部分 fault 成立。page fault 更准确的说法是：CPU 按当前页表和权限位无法完成这次内存访问，于是把证据交给内核。内核再根据 VMA 和对象状态判断，这是正常的按需工作，还是应该终止进程。
+
+\begin{longtable}{p{0.19\linewidth}p{0.36\linewidth}p{0.33\linewidth}}
+\toprule
+情况 & 硬件报告 & 内核解释 \\
+\midrule
+匿名内存第一次写 & PTE not present，地址落在可写匿名 VMA 内 & 分配一页清零物理页，安装 PTE，然后重试 \\
+文件映射第一次读 & PTE not present，地址落在可读 file-backed VMA 内 & 从文件对应位置读页，填入 page cache 或映射页，再重试 \\
+换出页被访问 & PTE not present，但软件记录说明页在 swap 中 & 从 swap 读回，恢复 PTE，再重试 \\
+COW 写入 & PTE present 但不可写，VMA 允许写且页被共享 & 复制物理页，给当前进程安装私有可写 PTE \\
+真正越权写 & PTE 或 VMA 不允许写 & 返回 \code{EFAULT} 或向用户进程发送信号 \\
+NX 取指 & PTE 不允许执行，CPU 正在取指 & 阻止把数据页当代码执行，通常发送信号 \\
+\bottomrule
+\end{longtable}
+
+匿名内存第一次写是最温和的 fault。用户调用 \code{malloc} 后，库可能只向内核申请一段虚拟地址范围，真实物理页直到第一次写入才分配。CPU 写这个地址时发现 PTE not present，进入内核。内核查到地址属于可写匿名 VMA，就分配一页物理内存、清零、安装 PTE。返回后，原来的写指令重新执行，用户程序完全可以感觉不到这次 fault。这里 VMA 保存的是“这段地址应该存在，只是物理页还没准备”；PTE 保存的是“现在硬件还不能直接访问”。
+
+文件映射第一次读类似，但来源不同。用户用 \code{mmap} 把文件映射到地址空间，读取某个尚未在内存中的页时，内核要根据 VMA 找到底层文件、页偏移和权限，把文件内容读入页，再建立映射。若此时文件被截短，访问落在新文件大小之外，VMA 仍然可能覆盖这段虚拟地址，但底层文件对象已经没有对应内容。很多系统会把这种错误报告成类似 \code{SIGBUS} 的总线错误。这个例子说明：VMA 合法不代表底层对象永远能提供数据；VMA 还必须和文件大小、页缓存状态、文件系统错误一起解释。
+
+COW，也就是 copy-on-write，能说明 PTE 权限位不只是安全检查，也是一种延迟复制机制。父进程 \code{fork} 后，父子进程先共享同一批物理页，PTE 都标成只读。某一方写入时，CPU 因为 writable 位不允许而 fault。内核查 VMA 后发现这不是非法写，而是 COW 写，于是分配新页、复制旧内容、给当前进程安装可写 PTE。另一个进程仍然指向旧页。若只看硬件错误码，会以为这是“写只读页”；只有结合 VMA 和页引用计数，内核才知道这是“该复制了”。
+
+NX fault 则是安全边界。NX 可以理解成 PTE 上的“不可执行”权限。栈、堆、普通数据页通常不应当被当作代码取指。CPU 从这些页取指时进入 fault，内核不能因为“页存在、可读”就放行执行。这里 PTE 把读写执行拆成不同权限，VMA 记录这段区域的预期用途，安全策略再决定是否允许把某段内存改成可执行。后面讲进程安全时，这条边界会直接连接到 W\^{}X、JIT、动态链接器和代码注入防护。
+
+TLB 会让问题再多一层。CPU 为了不每次访存都走完整页表，会把最近的虚拟页到物理页翻译缓存到 TLB。内核修改 PTE 后，如果旧翻译还留在某个 CPU 的 TLB 中，那个 CPU 可能继续按旧权限访问旧物理页。例如内核把某页从可写改成只读，用来启动 COW；如果没有让相关 CPU 刷掉旧 TLB 项，另一个 CPU 可能继续写共享页，COW 就被绕过。再比如内核撤销某段用户映射后，旧 TLB 项若继续有效，用户代码可能访问已经释放并被重新分配的物理页。于是 address space 对象不只保存页表根，还要知道哪些 CPU 可能缓存了这个地址空间的翻译，什么时候需要本地或远程 TLB shootdown。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+PTE 变化 & 如果 TLB 没同步 & 后果 \\
+\midrule
+present 变 not present & CPU 继续用旧翻译访问物理页 & 访问已释放页，破坏新对象 \\
+writable 变只读 & CPU 继续写旧可写映射 & COW 或写保护失效 \\
+user 变 kernel-only & 用户态继续访问旧用户映射 & 权限隔离失效 \\
+物理页号改变 & CPU 继续访问旧物理页 & 读写错对象，数据难以追踪 \\
+\bottomrule
+\end{longtable}
+
+用户拷贝和普通用户访存还有一个差别：fault 发生在内核代码执行期间。内核执行 \code{copy\_from\_user} 时，当前特权级在内核态，但被访问地址属于用户地址空间。若这个访问 fault，不能简单按“内核 bug”崩掉，也不能像用户态 fault 那样随便重启任意指令。内核必须知道这段代码是一个允许 fault 的用户拷贝窗口，fault 可恢复时继续，不可恢复时把错误返回给系统调用。很多内核会给这类拷贝点配套异常表：某条内核指令访问用户地址失败时，跳到预先登记的修复位置。对象层面看，这仍然是 trap frame、address space、VMA 和系统调用返回路径一起工作。
+
+再看一个具体反例。假设内核为了省事，在系统调用入口只检查 \code{user\_buf} 起点：
+
+\begin{lstlisting}
+bad_copy_from_user(user_buf, len):
+  if address_is_valid(user_buf):
+    memcpy(kernel_buf, user_buf, len)
+\end{lstlisting}
+
+这段代码在跨页时会错。起点所在页合法，不代表后续每一页合法。更严重的是，页表可能在拷贝过程中发生变化：另一个线程可以 \code{munmap} 某段地址，文件映射页可能第一次访问才调入，栈页可能按需增长。可靠的用户拷贝必须以“可能 fault、可能部分成功、必须能恢复”为前提设计。
+
+\begin{lstlisting}
+copy_from_user_like(dst, user_addr, len):
+  copied = 0
+  while copied < len:
+    check current user page
+    if page fault can be resolved:
+      resolve and retry
+    if access is illegal:
+      stop and report copied/error
+    copy bytes until page boundary
+    copied += bytes_this_page
+\end{lstlisting}
+
+这里的循环不是实现细节，而是语义边界。它告诉后面的系统调用章节：用户指针永远不能先验可信；告诉内存章节：缺页是硬件事件和 VMA 策略的交汇；告诉文件章节：短写和错误返回来自“请求推进到一半时遇到不可继续边界”。
+
+地址空间还解释了为什么 task 切换不只是换寄存器。若调度器从进程 A 切到进程 B，只恢复寄存器还不够；同一个虚拟地址在两个进程里可以指向不同物理页。内核还要切换页表根，或者切换带地址空间标识的翻译上下文。否则进程 B 的 \code{user\_buf} 可能被按进程 A 的页表解释。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+切换内容 & 少做会怎样 & 对象来源 \\
+\midrule
+通用寄存器和 PC & 新 task 从错误位置继续，参数和局部值损坏 & CPU 现场 \\
+内核栈 & 两个 task 的内核调用链互相覆盖 & task 私有内核执行状态 \\
+页表根或地址空间标识 & 用户虚拟地址按错误进程解释 & address space \\
+TLB 相关状态 & CPU 继续使用旧地址空间的翻译 & PTE/TLB 缓存一致性 \\
+文件表引用 & fd 指向的对象归属混乱或被提前释放 & task 或进程资源表 \\
+\bottomrule
+\end{longtable}
+
+地址空间还会和 DMA 发生关系。设备 DMA 使用的是设备可见地址，不一定等于 CPU 物理地址，更不等于用户虚拟地址。直接 I/O 中，用户传入的 \code{user\_buf} 必须先被分解成一批用户虚拟页；内核检查 VMA 和 PTE，确保这些页允许这次方向的 I/O；再把对应物理页 pin 住；最后通过 IOMMU 建立设备可见映射。IOMMU 可以理解成“给设备用的地址翻译和权限检查”。没有它，设备一旦拿到错误 DMA 地址，可能读写任意物理内存；有了它，驱动仍然要正确建立、同步和撤销映射。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+地址名字 & 谁使用 & 不能混淆的原因 \\
+\midrule
+用户虚拟地址 & 用户程序和内核用户拷贝代码 & 只在某个 address space 中有意义 \\
+内核虚拟地址 & 内核代码 & 可能映射同一物理页，也可能没有直接映射用户页 \\
+物理页号 & CPU 页表和内核页管理器 & 设备未必直接用这个编号访问 \\
+DMA 地址 & 设备和 IOMMU & 生命周期受 DMA mapping 控制 \\
+\bottomrule
+\end{longtable}
+
+如果一个进程提交直接 I/O 后马上 \code{munmap(user\_buf)}，用户虚拟地址可以从 address space 中消失，但被 pin 的物理页不能立刻释放，因为设备 request 仍然引用它们。等 completion 到达、驱动同步 DMA、撤销 IOMMU 映射并放掉页引用后，这些页才真正回到普通内存管理。这个例子把第三节和第四节连起来：地址空间解决 CPU 访问的合法性，request 和 DMA mapping 解决设备访问期间的所有权。
+
+从硬件角度看，地址空间是页表和权限检查；从内核角度看，地址空间是一个进程能触碰哪些虚拟地址、这些地址来自哪里、出现 fault 时怎样补救的对象。二者必须同时成立。
+
+\section{四、设备请求为什么逼出 request、wait queue 和 completion}
+
+假设内核已经把用户数据安全地接收到内核对象里，下一步要让设备写出去。错误版本会写成：
+
+\begin{lstlisting}
+device.write(kernel_buf, len);
+\end{lstlisting}
+
+真实设备通常暴露三类东西：MMIO 寄存器、内存中的队列、完成事件。MMIO 寄存器是 CPU 通过特殊内存属性访问的设备状态槽；队列是 CPU 和设备都能读写的一段内存；完成事件可能是 completion queue 中的一项，也可能伴随中断。
+
+先看最小串口模型：
+
+\begin{lstlisting}
+STATUS bit0: tx_ready
+DATA:        write one byte to start sending
+CTRL bit0:   enable transmitter
+\end{lstlisting}
+
+朴素轮询版是：
+
+\begin{lstlisting}
+while ((read_mmio(STATUS) & tx_ready) == 0) {
+  // keep spinning
+}
+write_mmio(DATA, byte);
+\end{lstlisting}
+
+这个模型能说明 MMIO，但不适合通用 OS 的慢设备路径。若设备 10 ms 后才 ready，CPU 这 10 ms 都在原地读状态寄存器，不能运行别的 task。于是内核需要把“现在不能继续，但将来条件满足后要回来”表示成等待关系。等待关系不能只存在栈上，因为当前 task 会离开 CPU；它必须挂到内核对象上。
+
+wait queue 第一次出现时，可以把它理解成“等同一个条件的 task 链表”。等待串口 ready 的 task 可以挂在串口对象的 wait queue 上；等待块请求完成的 task 可以挂在 request 的 wait queue 上；等待锁的 task 可以挂在锁或 futex 对应的队列上。睡眠不是消失，而是 task 状态从 running 变成 blocked，并记录它等的条件。
+
+高吞吐设备会进一步使用 request。request 是一次异步设备工作的内核身份牌。它至少保存：
+
+\begin{lstlisting}
+Request:
+  id or tag
+  target device queue
+  operation: read or write
+  buffer list and length
+  DMA mapping
+  current state: new, submitted, completed, failed, canceled
+  error code
+  waiter or completion callback
+\end{lstlisting}
+
+用 NVMe 写请求走一遍：
+
+\begin{longtable}{p{0.15\linewidth}p{0.43\linewidth}p{0.3\linewidth}}
+\toprule
+阶段 & 发生什么 & request 保存什么 \\
+\midrule
+创建 & 文件系统或块层把脏页转成块 I/O 请求 & 目标 LBA、长度、方向、关联页 \\
+映射 & 驱动通过 DMA API 建立设备可见地址 & DMA 地址、方向、长度和待撤销映射 \\
+填描述符 & CPU 在 submission queue 写 opcode、DMA 地址、tag & tag 把设备完成对回 request \\
+敲门铃 & CPU 写 MMIO doorbell，通知设备队列 tail 前进 & request 状态变成 submitted \\
+睡眠或异步返回 & 同步调用把 task 挂到 wait queue；异步路径记录回调或完成对象 & 谁在等、完成后通知谁 \\
+设备 DMA & 设备读取描述符并搬运数据 & buffer 不能释放或复用 \\
+写 completion & 设备把 tag、status、phase 写到 completion queue & request 结果等待驱动收割 \\
+中断处理 & 驱动读取 completion，按 tag 找到 request & 状态变成 completed 或 failed \\
+唤醒与回收 & 唤醒等待 task，撤销 DMA mapping，释放引用 & 生命周期结束条件清楚 \\
+\bottomrule
+\end{longtable}
+
+这里最容易混的是中断和 completion。中断只是 CPU 入口，意思是“有设备事件需要处理”。completion 才是设备写下的结果，告诉驱动哪个 tag 完成、状态码是什么。若只根据中断返回用户态，内核不知道完成的是哪次 request；若只看 completion 不处理等待者，任务会永远睡着。
+
+再看 DMA。DMA 不是“更快的 memcpy”，而是设备获得了直接访问内存的能力。于是 buffer 所有权必须明确：
+
+\begin{longtable}{p{0.18\linewidth}p{0.4\linewidth}p{0.3\linewidth}}
+\toprule
+阶段 & 谁拥有 buffer & 规则 \\
+\midrule
+提交前 & CPU/内核拥有 & 可以填数据、建描述符、建立 IOMMU 映射 \\
+提交后完成前 & 设备拥有或共享拥有 & CPU 不能释放、复用或无序改写；必须遵守 cache/DMA 同步规则 \\
+completion 后 & 结果回到驱动，但还没完全释放 & 先读取状态、同步 cache、撤销 DMA mapping \\
+回收后 & CPU/内核重新拥有 & 页或 buffer 才能回到分配器或上层对象 \\
+\bottomrule
+\end{longtable}
+
+如果驱动在 completion 前释放 buffer，设备迟到 DMA 可能写坏新对象。如果驱动没有建立正确 IOMMU 映射，设备可能无法访问 buffer，或者越界访问不该碰的页。如果驱动没有在 descriptor 写完后再敲 doorbell，设备可能读到旧描述符。request 对象把这些边界放到一处：提交前准备，提交后禁止释放，完成后按顺序回收。
+
+失败路径更能说明 request 的必要性。设备可能超时。超时不代表设备一定没做；它只代表“在规定时间内没有观察到 completion”。此时内核不能马上释放 buffer，因为设备可能稍后还会 DMA。可靠恢复通常要停止队列、屏蔽中断或 quiesce 设备、尝试 abort request、必要时 reset 控制器、确认没有 in-flight DMA 后再撤销映射。没有 request 列表，内核不知道哪些请求还在飞；没有 request state，内核不知道哪些能重试、哪些已经失败、哪些不能再释放。
+
+为了避免把设备统一想成“磁盘”，再看三个设备路径。它们的规模不同，但都在逼出同一组 OS 对象。
+
+\begin{longtable}{p{0.16\linewidth}p{0.39\linewidth}p{0.33\linewidth}}
+\toprule
+设备路径 & 典型动作 & 逼出的对象 \\
+\midrule
+PIO 串口发送一个字节 & CPU 读状态寄存器，ready 后写 DATA 寄存器 & wait queue、设备锁、寄存器访问顺序 \\
+网卡接收一个包 & 设备 DMA 到预先给出的 buffer，写 completion 或更新 ring & buffer pool、descriptor ring、packet object、NAPI/poll 状态 \\
+NVMe 写多个块 & CPU 填 submission queue，设备 DMA 用户或 page cache 页，写 completion queue & request tag、DMA mapping、queue depth、timeout/reset 状态 \\
+\bottomrule
+\end{longtable}
+
+PIO，也就是 programmed I/O，是 CPU 自己一字节或一字地读写设备寄存器。它简单，但暴露了等待问题。串口发送缓冲满时，CPU 可以忙等，也可以让当前 task 睡到“发送缓冲有空位”这个条件上。若使用中断，设备在变 ready 时触发中断，驱动唤醒 wait queue。这里没有复杂 DMA，仍然需要 wait queue，因为硬件 ready 信号和用户 \code{write} 的返回不是同一时刻发生的。
+
+网卡接收路径能说明“设备先写内存，CPU 后处理”。驱动会提前准备一批接收 buffer，把它们的 DMA 地址放进 receive ring。网卡收到包后，把包内容 DMA 到某个 buffer，再在 completion 或 descriptor 状态位里写明长度、校验状态和 buffer 编号。中断到来后，驱动并不是从设备寄存器里读出整个包，而是沿着 ring 找到哪些 descriptor 已完成，把 buffer 变成内核网络包对象，再补充新的空 buffer 给设备。若 buffer pool 没有对象，网卡可能丢包；若驱动过早复用 buffer，上层协议可能读到被新包覆盖的数据。
+
+NVMe 这类块设备则把队列深度推高。一个队列里可以同时有几十、几百甚至更多 request 在飞。CPU 不能用“我刚提交的就是下一个完成的”这种假设，因为设备可能重排、合并或不同请求耗时不同。request tag 的作用就在这里：提交时把 tag 写入 descriptor，completion 回来时带回 tag，驱动据此找到原 request。没有 tag 或等价身份，异步高并发设备就无法正确匹配结果。
+
+再看“走 cache”和“不走 cache”的差别。这里的 cache 不只指 CPU cache，也包括 page cache 和设备内部缓存。普通 buffered write 先进入 page cache，后续由回写线程合并、排序并提交块请求；直接 I/O 绕过 page cache，但仍然经过 CPU cache 一致性、IOMMU 和设备队列；设备内部可能还有易失缓存，completion 只说明设备接受或完成了命令，不一定说明掉电后仍可恢复。不同缓存层解决的问题不同：
+
+\begin{longtable}{p{0.19\linewidth}p{0.36\linewidth}p{0.33\linewidth}}
+\toprule
+缓存层 & 它让什么变快 & OS 必须额外记录什么 \\
+\midrule
+CPU cache & CPU 读写内存更快 & DMA 前后的可见性、内存屏障、cache 同步 \\
+page cache & 文件读写复用内存页，合并小 I/O & dirty、uptodate、writeback、文件偏移到页索引的关系 \\
+块层队列缓存/合并 & 多个请求排序、合并、限流 & request 状态、队列深度、公平性和超时 \\
+设备内部缓存 & 设备接收写入后更快返回 & flush/FUA、持久化错误回报、断电边界 \\
+\bottomrule
+\end{longtable}
+
+假设日志写入走 buffered path：用户字节先复制到 page cache，\code{write} 返回；几秒后回写线程把脏页变成 block request；设备 completion 回来后，页的 writeback 状态清掉。这个路径下用户态很快继续执行，但崩溃时最近数据可能还在内存或设备缓存中。若应用调用 \code{fsync}，内核要把相关脏页、元数据和日志事务推到设备承诺的持久化边界，并处理设备可能晚报的写错误。
+
+假设同一日志写入走 direct I/O：用户页被 pin，request 保存 scatter-gather 列表，设备 DMA 直接读取这些页。这里 page cache 不承担数据缓存，但 CPU cache 仍然存在。如果平台是 cache coherent DMA，硬件能保证 CPU cache 和设备 DMA 看到的一致性；如果平台是 non-coherent DMA，驱动必须在设备读内存前把 CPU 写过的数据清到内存，在设备写内存后让 CPU cache 失效或同步。否则设备可能读到旧数据，CPU 也可能读不到设备刚写的新数据。
+
+内存屏障也来自这个边界。CPU 和编译器可能为了性能重排普通内存写；设备则按它观察到的内存和 MMIO 顺序行动。驱动填 descriptor 时，必须保证 descriptor 内容对设备可见之后，才写 doorbell。否则设备看到 doorbell 后去读 descriptor，可能读到半旧半新的内容。抽象成代码就是：
+
+\begin{lstlisting}
+fill descriptor fields
+make descriptor writes visible to device
+write MMIO doorbell
+\end{lstlisting}
+
+中间那句在不同架构上可能是内存屏障、DMA 同步或有序 MMIO 规则。它不是“玄学优化”，而是在告诉硬件：先看到队列内容，再看到通知。没有这层顺序，request 对象里保存的状态和设备实际执行的命令可能对不上。
+
+再看丢中断。设备 completion 已经写到内存，但中断因为屏蔽、合并或硬件问题没有及时送到 CPU。若驱动只依赖“中断来了才检查 completion”，request 可能一直挂起。许多高性能驱动会把中断和轮询结合：中断负责提示“可能有活”，poll 循环负责批量收割 completion；超时定时器负责在长时间没有完成时检查 in-flight request。这样即使单个中断丢失，completion ring 中的结果仍可能被后续轮询发现。这里 wait queue 等的是 request 状态，而不是“某一次中断一定发生”。
+
+设备 reset 是最复杂的失败路径之一。reset 不是把结构体清零这么简单。reset 前可能已有 request submitted，设备可能已经 DMA 了一半，completion 可能在 reset 过程中丢失，队列内存可能还留着旧 phase 位。可靠恢复至少要回答：
+
+\begin{longtable}{p{0.25\linewidth}p{0.55\linewidth}}
+\toprule
+问题 & 必须有的状态 \\
+\midrule
+哪些请求已经提交给设备 & in-flight request list 和 queue generation \\
+哪些 buffer 仍可能被设备访问 & DMA mapping、pinned pages、设备 quiesce 结果 \\
+哪些请求可以重试 & request 操作类型、幂等性、文件系统上层语义 \\
+哪些请求必须失败上报 & error code、等待 task、回调对象 \\
+旧 completion 怎样区分 & tag、phase、queue generation 或 reset epoch \\
+\bottomrule
+\end{longtable}
+
+这张表说明“复杂硬件”不是因为名词多，而是因为异步边界多。CPU 可以继续运行，设备可以稍后 DMA，中断可能合并，completion 可能乱序，reset 可能跨过半完成状态。OS 要把这些边界收束成对象生命周期，否则用户看到的 \code{read}/\code{write}/\code{fsync} 就没有可靠语义。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+事件 & 不能怎么处理 & 正确依赖的对象 \\
+\midrule
+completion 正常到达 & 不能只说“中断来了”就返回成功 & completion tag、request status、wait queue \\
+设备超时 & 不能立刻释放 DMA buffer & in-flight request list、timeout state、reset protocol \\
+用户取消 I/O & 不能假设设备已经停止访问内存 & request cancel state、设备 abort 或完成确认 \\
+进程退出 & 不能释放仍被设备持有的用户页 & pinned page list、request refcount、DMA mapping \\
+设备 reset & 不能沿用 reset 前的队列状态 & queue generation、request recovery、completion cleanup \\
+\bottomrule
+\end{longtable}
+
+这就是设备章和文件章会反复出现 request、completion、wait queue、refcount、timeout 的原因。它们不是工程噪声，而是异步硬件进入 OS 语义后的最低对象集合。
+
+\section{五、第一阶段映射：从硬件事实到内核对象模型}
+
+现在把前四节收束成一个最小内核模型。这个模型不是 Linux 完整结构体图，而是后文所有章节反复使用的检查框架：每个内核对象都必须回答“保存什么事实、谁能引用它、谁在等待它、它何时提交、它何时释放”。
+
+\begin{lstlisting}
+Machine
+  CPUs[]:
+    current task
+    trap/interrupt entry state
+    current address-space root
+
+  PhysicalPages[]:
+    refcount
+    dirty / locked / uptodate
+    dma_pinned
+
+  Devices[]:
+    MMIO registers
+    DMA queues
+    interrupt vectors
+    reset and error state
+
+Kernel
+  Task:
+    saved context
+    kernel stack
+    state and wait reason
+    address space
+    file table
+
+  AddressSpace:
+    VMA list
+    page table root
+    active CPUs that may hold TLB entries
+
+  OpenFile:
+    permissions
+    file offset or append mode
+    reference count
+    backing inode, pipe, socket, or device
+
+  Request:
+    id/tag
+    buffer ownership
+    DMA mapping
+    status and error code
+    wait queue or callback
+\end{lstlisting}
+
+用这套模型重新走一次 \code{write(fd, user\_buf, len)}，每一步都能落到对象上：
+
+\begin{longtable}{p{0.15\linewidth}p{0.43\linewidth}p{0.3\linewidth}}
+\toprule
+动作 & 参与对象 & 不变量 \\
+\midrule
+进入内核 & CPU、trap frame、task、内核栈 & 用户现场已保存，内核可安全使用自己的栈和寄存器 \\
+解析 fd & task、fd table、open file & file 引用有效，权限和偏移语义明确 \\
+验证地址 & task、address space、VMA、PTE & 用户范围逐页检查，fault 可修复才继续 \\
+接收数据 & page cache 或内核 buffer、physical page & 已接收字节和未接收字节边界明确 \\
+提交 I/O & request、device queue、DMA mapping & descriptor、buffer、doorbell 顺序正确 \\
+睡眠等待 & task、wait queue、request & task 等的是具体条件，不占 CPU 忙等 \\
+完成事件 & device completion、interrupt entry、request & completion 能匹配 request，并记录成功或错误 \\
+返回用户态 & task、trap frame、open file、request result & 返回值只反映已经提交到相应语义边界的事实 \\
+\bottomrule
+\end{longtable}
+
+再把这条路径按时间展开。下面不是新增概念，而是把前面分散讲过的 CPU、MMU、cache、设备和 completion 放到同一条线里：
+
+\begin{longtable}{p{0.12\linewidth}p{0.32\linewidth}p{0.24\linewidth}p{0.2\linewidth}}
+\toprule
+时间 & 硬件动作 & 内核对象变化 & 读者要抓住什么 \\
+\midrule
+T0 & 用户态 CPU 执行 \code{syscall} 指令 & trap frame 开始形成，task 仍是当前 task & 入口先保存现场，不先信参数 \\
+T1 & CPU 切到内核入口和内核栈 & task 的内核栈承载系统调用路径 & 内核不用用户栈保存状态 \\
+T2 & 内核按 fd table 查 open file & file 引用增加，权限和 append 状态被检查 & 小整数变成有生命周期的对象 \\
+T3 & CPU 读取用户虚拟地址 & MMU 查 TLB/PTE，可能触发 page fault & 用户指针逐页变成可信字节 \\
+T4 & 缺页处理读取 VMA，安装或拒绝 PTE & address space、VMA、page refcount 更新 & not-present 要靠 VMA 解释 \\
+T5 & CPU 把字节写入 page cache 或内核 buffer & page 变 dirty、locked 或 uptodate & \code{write} 可能只到内存层 \\
+T6 & 回写或 direct I/O 构造设备请求 & request 分配 tag，buffer 建 DMA mapping & 设备工作必须有身份牌 \\
+T7 & CPU 写 descriptor，再写 MMIO doorbell & request 进入 submitted 状态 & 顺序必须保证设备先看到描述符 \\
+T8 & task 若需等待，离开 CPU & task 挂到 wait queue，调度器运行别人 & 等待不是忙等，也不是丢失调用栈 \\
+T9 & 设备按 DMA 地址访问内存并执行命令 & buffer 仍被 request 和 DMA mapping 持有 & completion 前不能释放 buffer \\
+T10 & 设备写 completion，触发中断或等待轮询 & driver 按 tag 找 request，记录 status & 中断不是结果，completion 才是结果证据 \\
+T11 & 内核唤醒 task，撤销 DMA mapping，释放引用 & task 回到 runnable，request 走向 release & 完成要伴随回收和错误传播 \\
+T12 & CPU 恢复 trap frame 返回用户态 & 返回值放入用户可见寄存器 & 用户看到的是接口语义，不是全部硬件细节 \\
+\bottomrule
+\end{longtable}
+
+这条时间线也能解释为什么 OS 教材里同一个词会在不同章节反复出现。调度看到的是 T8 到 T12：task 为什么能睡下去又醒来。虚拟内存看到的是 T3 到 T4：地址为什么要按页检查。文件系统看到的是 T5 和持久化边界：写入何时对文件可见、何时对崩溃恢复可见。驱动看到的是 T6 到 T11：request 怎样提交，completion 怎样匹配，DMA 怎样收尾。把这些阶段分开后，“硬件重要”就不再是一句口号，而是每个 OS 对象的来源。
+
+再把“提交边界”单独拎出来。OS 里很多 bug 都来自把不同层的完成混成一层：
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+完成说法 & 真实含义 & 不能误解成 \\
+\midrule
+系统调用入口完成 & CPU 已进入内核并保存现场 & 参数已经可信 \\
+用户拷贝完成 & 字节已经进入内核 buffer 或 page cache & 数据已经写到设备 \\
+request submitted & 描述符和 doorbell 已提交给设备路径 & 设备已经完成 I/O \\
+completion 到达 & 设备报告某个 tag 有结果 & 文件系统元数据已经持久 \\
+\code{write} 返回 & 对应接口语义下已接收或已提交一定字节 & \code{fsync} 语义已经满足 \\
+\code{fsync} 返回 & 文件系统和设备承诺的持久化边界已完成或返回错误 & 所有未来硬件故障都不可能丢数据 \\
+\bottomrule
+\end{longtable}
+
+所有这些对象还有一个共同生命周期。它们通常不是“创建后用一下就丢”，而是沿着 create、reference、use、wait、complete、release 往前走：
+
+\begin{longtable}{p{0.16\linewidth}p{0.42\linewidth}p{0.3\linewidth}}
+\toprule
+阶段 & 含义 & 例子 \\
+\midrule
+create & 把一次硬件事实或 API 请求变成对象 & 建 task、建 VMA、分配 request \\
+reference & 防止对象在使用期间被释放 & fd lookup 增加 file 引用，I/O pin 用户页 \\
+use & 按对象保存的权限和状态推进工作 & 拷贝用户页、填 descriptor、修改 page cache \\
+wait & 条件暂时不满足时让 task 离开 CPU & 等页读入、等锁、等 completion \\
+complete & 外部事实回来后记录结果并唤醒等待者 & page fault resolved、DMA done、journal committed \\
+release & 最后一个引用消失后撤销映射和释放资源 & put file、unpin page、free request \\
+\bottomrule
+\end{longtable}
+
+这个生命周期能防住很多直觉错误。fd 查找之后要给 file 增加引用，是因为另一个线程可能马上 \code{close(fd)}；直接 I/O 要 pin page，是因为用户可能马上 \code{munmap} 或退出；request 完成后不能只唤醒 task，还要撤销 DMA mapping，是因为设备地址空间也曾经持有访问权；VMA 删除后要处理 TLB，是因为 CPU 可能还握着旧翻译。OS 对象的引用计数、锁、等待队列和状态位，都是在给这些生命周期边界补证据。
+
+用一个排障案例把全章连起来。用户报告：
+
+\begin{lstlisting}
+write(fd, buf, len) sometimes hangs
+\end{lstlisting}
+
+不能只盯着 \code{write} 这一行。按本章模型，要顺着对象链往下查：
+
+\begin{longtable}{p{0.18\linewidth}p{0.39\linewidth}p{0.31\linewidth}}
+\toprule
+检查点 & 可能发现 & 指向的章节 \\
+\midrule
+task 状态 & task 是 running、runnable，还是 blocked & 调度与等待 \\
+等待原因 & task 挂在哪个 wait queue 上 & 锁、I/O、内存回收或页 fault \\
+用户拷贝 & 是否卡在 page fault、缺页读入或内存压力 & 虚拟内存 \\
+file 对象 & fd 是否指向慢设备、管道、socket 或普通文件 & 文件与 VFS \\
+page cache & 页是否 locked、writeback、dirty 堆积 & 文件缓存与回写 \\
+request & 块请求是否 submitted、timeout 或等待队列深 & 块层和驱动 \\
+completion & 设备是否写了 completion，中断是否送达或被轮询收割 & 中断与设备 \\
+DMA mapping & buffer 是否还被设备持有，IOMMU 是否报错 & DMA 与硬件隔离 \\
+\bottomrule
+\end{longtable}
+
+假设排查发现 task 睡在某个 request 的 wait queue 上。下一步不是说“磁盘慢”就结束，而是继续看 request state。如果 request 还没 submitted，问题可能在块层限流、队列冻结或内存分配；如果已经 submitted 但没有 completion，问题可能在设备队列、doorbell、DMA 地址、设备固件或中断；如果 completion 已到但 task 没醒，问题可能在驱动收割、request tag 匹配或 wait queue 唤醒；如果 task 醒了但 \code{write} 仍不返回，问题可能在文件系统日志提交或错误回报。每一步都对应一个对象，不靠猜。
+
+再换一个现象：
+
+\begin{lstlisting}
+write(fd, bad_user_ptr, 4096) returns EFAULT
+\end{lstlisting}
+
+这里设备路径可能完全没有发生。CPU 在用户拷贝阶段访问 \code{bad\_user\_ptr}，page fault 入口记录 fault address，内核查当前 task 的 address space，发现没有 VMA 或权限不对，于是系统调用返回 \code{EFAULT}。如果程序传的地址第一半合法、第二半非法，可能已经复制一部分；不同对象类型对“部分成功后遇到错误”有不同语义。这条路径让人看到：同样叫 \code{write}，有些失败发生在 CPU/MMU 边界，甚至还没碰到文件系统和设备。
+
+再看性能案例：
+
+\begin{lstlisting}
+small writes are fast, fsync is slow
+\end{lstlisting}
+
+这通常不是矛盾。小 \code{write} 可能只把字节放入 page cache 并标 dirty，返回时没有等待设备持久化；\code{fsync} 要把此前积累的脏页、inode 元数据和日志事务推进到持久化边界，还可能等待设备 flush。若设备有易失缓存，completion 和持久化之间还隔着 flush/FUA 语义。这里 page cache、writeback request、journal transaction 和 device completion 都是不同对象，不能用一个“写完了”概括。
+
+这张表会贯穿后文。调度要区分“task 可运行”和“task 正在 CPU 上运行”；内存要区分“VMA 合法”和“PTE 已 present”；文件要区分“page cache dirty”和“设备持久化”；网络要区分“包进入网卡 DMA buffer”和“用户 \code{recv} 已拿到字节”；安全要区分“对象存在”和“当前主体有权使用它”。
+
+把第三章压成后文索引，可以得到下面这张映射表：
+
+\begin{longtable}{p{0.2\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+硬件事实 & 内核对象 & 后文会展开的问题 \\
+\midrule
+CPU 被同步或异步入口打断 & trap frame、task、kernel stack & 系统调用、异常、中断、调度 \\
+虚拟地址要翻译和检查权限 & address space、VMA、PTE、TLB state & 缺页、COW、mmap、用户拷贝 \\
+物理页会被共享、锁住、写脏或 DMA 引用 & page、page cache、pin/refcount & 内存分配、回收、回写、直接 I/O \\
+fd 只是进程表里的索引 & fd table、open file、inode/socket/pipe & VFS、权限、偏移、并发 close \\
+设备通过队列和寄存器协作 & driver、queue、descriptor、doorbell & 块层、网络、字符设备、驱动模型 \\
+完成异步到达且可能失败 & request、completion、wait queue、timeout & 睡眠唤醒、超时、取消、reset \\
+持久化不是普通内存写 & dirty page、journal transaction、flush request & 文件系统一致性、fsync、崩溃恢复 \\
+\bottomrule
+\end{longtable}
+
+最后给一份阅读 OS 机制的检查表。以后遇到任何机制，都按这六问拆：
+
+\begin{longtable}{p{0.18\linewidth}p{0.42\linewidth}p{0.28\linewidth}}
+\toprule
+问题 & 要找的证据 & 例子 \\
+\midrule
+状态在哪里 & 哪个对象保存长期事实，不在 CPU 瞬时寄存器里 & task、VMA、request、inode \\
+入口在哪里 & 硬件或 API 从哪个受控点进入内核 & syscall、page fault、IRQ、timer \\
+权限在哪里检查 & 谁把不可信参数变成可用对象 & fd lookup、VMA check、LSM、IOMMU \\
+等待在哪里表达 & task 睡在哪个条件上，谁负责唤醒 & wait queue、completion、futex queue \\
+提交点在哪里 & 哪一步之后对上层语义可见 & PTE install、file size update、doorbell、journal commit \\
+失败怎样收敛 & 哪些对象回滚、释放、保留错误码或重试 & errno、request error、page refcount、reset recovery \\
+\bottomrule
+\end{longtable}
+
+\begin{keyidea}
+硬件不给应用直接共享整台机器的安全办法。CPU、MMU、cache、设备和持久化介质只暴露低层状态；内核必须把这些状态组织成 task、address space、open file、request、wait queue、completion 和恢复证据。后面每一章都在细化这套转换。
+\end{keyidea}

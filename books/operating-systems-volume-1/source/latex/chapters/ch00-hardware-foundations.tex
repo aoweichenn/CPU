@@ -1,32 +1,1092 @@
-\section{硬件基本信息：操作系统依赖的机器事实}
+\chapter{硬件基础：从需求到机器结构}
 
-操作系统不是在抽象空间里运行的。它依赖一组非常具体的硬件事实：CPU 怎样取指和切换特权级，内存怎样寻址和缓存，设备怎样通过寄存器、中断和 DMA 与 CPU 通信，定时器怎样提供时间基准，启动固件怎样把第一段代码交给内核。若这些事实不清楚，后面的进程、虚拟内存、驱动、文件系统和安全机制都会变成悬空概念。
+先从一个很小的动作开始：把字节 \code{'A'} 交给一个输出设备。
+
+\begin{lstlisting}
+output_one_byte('A'):
+  wait until the output device can accept one byte
+  place 'A' into the device's input slot
+\end{lstlisting}
+
+这两行看起来像普通函数调用，其实已经把整台机器压进去了。执行端要知道设备现在能不能接收；设备要记住自己是空闲还是忙；输出动作要有一个边界，不能一半算发生、一半算没发生；如果设备很慢，当前执行流不能永远原地空转；如果输出从 1 字节变成 4096 字节，执行端也不能一直逐字节搬运。
+
+先构造一个最天真的硬件版本：
+
+\begin{lstlisting}
+naive_output_A:
+  DATA_LINE = 0x41
+  VALID_LINE = 1
+\end{lstlisting}
+
+它只是把一个电平组合摆到线上。若外部刚好能接收，也许能看到 \code{'A'}；但它没有回答任何关键问题：设备忙时怎么办，什么时候算已经接收，下一次输出 \code{'B'} 时谁改变数据，失败时谁留下错误，复位后这些线应该回到什么状态。它甚至不能区分“这次输出还没开始”和“上一次输出已经结束但线还保持旧值”。
+
+于是第一处缺口出现了：机器不能只有瞬时信号，必须有能保存事实的状态。设备至少要保存 \code{READY}、\code{BUSY}、\code{ERR} 这类状态位；执行端也要保存“现在走到哪一步、手里有哪些值、下一步要做什么”。没有状态，输出不是一个可解释的动作，只是一组随输入变化的电平。
+
+再把硬件想得稍微强一点：
+
+\begin{lstlisting}
+polling_output_A:
+  while READY == 0:
+    keep checking
+  DATA = 0x41
+\end{lstlisting}
+
+这已经比第一版强，因为它承认设备会忙。但它又暴露出下一批问题。\code{READY} 必须存在于某个可读的状态槽里；\code{DATA} 必须存在于某个可写的数据槽里；\code{while} 需要比较和条件选择；\code{DATA = 0x41} 需要一个明确提交点，不能在设备还没有接收时就让上层相信完成；一直检查 \code{READY} 还会浪费执行资源。也就是说，状态之后马上需要计算、比较、选择下一步和等待事件。
+
+硬件结构就从这些缺口里长出来。先解决“事实会消失”，才有能在时钟边界保存值的单元；再解决“要不要继续、往哪里继续”，才有比较、选择器和下一步位置；再解决“不能永远只输出固定的 \code{'A'}”，才有可被程序控制的取指、译码和写回；再解决“大量数据放不下”和“多个程序不能互相踩”，才有地址、内存和权限；再解决“慢设备和大块数据不能拖住执行端”，才有事件通知和设备侧搬运。
 
 \begin{keyidea}
-硬件给 OS 的不是“进程、文件、socket”，而是指令、寄存器、地址、中断、页表、缓存、总线和设备寄存器。OS 的工作是把这些硬件事实组织成可验证的契约。
+硬件结构不是零件清单，而是需求被一层层逼出来的结果。每个硬件名词都要能回答三个问题：它保存了什么事实，允许哪条数据路径发生，失败或完成时给 OS 留下什么证据。
 \end{keyidea}
 
-\subsection{CPU 执行模型}
+把 \code{output\_one\_byte('A')} 拆成一份需求账本，就能看到硬件能力出现的顺序：
 
-CPU 的基本循环是取指、译码、执行、提交结果。程序计数器指向下一条指令；通用寄存器保存整数、地址和临时值；状态寄存器保存中断使能、条件码、当前特权级等控制位；栈指针指向当前调用栈。操作系统进行上下文切换时，最少要保存足以恢复执行的这组状态。
-
-\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\begin{longtable}{p{0.18\linewidth}p{0.35\linewidth}p{0.35\linewidth}}
 \toprule
-硬件状态 & 作用 & OS 关心点 \\
+卡住的地方 & 必须增加的机器能力 & OS 关注原因 \\
 \midrule
-程序计数器 & 指向下一条指令 & 中断、异常、调度后从哪里继续 \\
-栈指针 & 指向当前栈顶 & 用户栈和内核栈必须分开管理 \\
-通用寄存器 & 保存参数和临时值 & 系统调用参数、返回值、上下文保存 \\
-状态寄存器 & 保存特权级、中断位、标志位 & 返回用户态前必须恢复正确权限 \\
-控制寄存器 & 指向页表、控制 MMU 和中断 & 只有内核能修改关键控制状态 \\
+线上的值会消失 & 状态单元在时钟边界保存上一刻事实 & 启动、异常返回、设备 reset 都要有可恢复状态 \\
+不知道设备能不能收 & 设备状态寄存器保存 ready/busy/error & 驱动不能假设设备永远 ready，也不能无限等 \\
+不知道下一步选哪条路 & 比较、分支和下一位置选择 & 等待、错误分支、系统调用返回都依赖可恢复控制流 \\
+不能执行不同动作 & 指令、取指、译码、寄存器和写回边界 & task 切换和异常处理必须保存软件可见现场 \\
+数据放不下 & 能按地址访问一大片存储 & 用户 buffer、栈、堆和文件缓存都不是少量寄存器能装下的 \\
+多个程序会互相破坏 & 访问时自动检查地址归属和权限 & 进程隔离、缺页、COW 和用户指针检查必须有硬件根 \\
+慢访问拖住执行 & 常用翻译和常用数据保存在更近处，同时保留精确失败边界 & 性能优化不能破坏精确异常和权限边界 \\
+设备不是函数 & 外部状态机通过地址窗口、事件和状态位接入机器 & 驱动面对的是异步硬件状态，不是可靠函数返回 \\
+大块 I/O 太重 & 用请求记录描述一批数据，让设备侧完成搬运并留下完成证据 & buffer 所有权和设备访问范围必须可验证 \\
 \bottomrule
 \end{longtable}
 
-现代 CPU 还会乱序执行、预测分支、合并内存访问。多数时候程序看见的是架构保证的顺序，但内核和驱动不能忽略内存屏障。比如驱动必须先写完 DMA 描述符，再敲 doorbell 通知设备；锁实现必须用 acquire/release 语义，否则另一个 CPU 可能看到锁已释放却看不到临界区内的数据更新。
+若把这条路径简化成“调用一个输出函数”，执行现场、地址、设备状态和异步完成都会失去来源。机器先满足保存、计算、执行、寻址、隔离、加速、通信、通知和恢复这些需求；具体硬件名称只是这些需求被实现后的形状。
 
-\subsection{CPU 设计为什么会分成取指、译码和执行}
+每引入一个硬件名词，都按同一套结构读法展开。先看状态保存在哪里；再看数据从哪里进入，经过哪些组合逻辑、队列、互联或内存层次，最后写回哪里；然后看控制信号或权限位怎样选择路径；最后看失败、超时、权限拒绝或完成事件怎样被记录。只有把这四层合在一起，OS 才能判断一个动作是否可重试、能否被抢占、能否被隔离、资源能否释放。
 
-取指、译码和执行不是教材为了好记而拆出的词，而是硬件实现上的自然分工。取指单元只关心 RIP、指令 cache 和下一条地址；译码单元把二进制指令解释成内部控制信号；执行单元使用 ALU、分支单元、load/store 单元或浮点/SIMD 单元完成动作。把这些职责分开，CPU 才能流水化、预测和并行发射。
+\section{一、从需求增长到现代整机}
+
+组合逻辑只能给出当前输入对应的输出，不能保存“上一刻”。状态寄存器让机器有上一拍和下一拍。寄存器能保存值，但不能决定写入哪个候选结果，于是出现选择器和写使能。能保存和选择后，机器还只能做固定动作；要让不同程序控制不同动作，就需要指令、取指位置、译码和写回。能执行指令后，寄存器容量不够，于是需要内存。内存一出现，多个程序互相破坏的问题就出现，于是需要地址翻译和权限。访问内存太慢，机器把常用翻译和常用数据放到更近处，但仍必须保留可恢复的失败边界。设备一加入，普通内存路径又不够，外部状态机、事件通知和批量搬运路径也必须接进来。
+
+这条链路的重点不在硬件名称增多，而在每增加一项能力，就增加一个 OS 必须管理的边界。能执行指令，就要能保存和恢复现场；能访问地址，就要区分访问权限；能把常用数据留在更近处，就要处理旧副本；能让设备自己搬数据，就要限制设备能访问的内存范围。OS 的复杂性正是这些能力和风险叠加后的结果。
+
+判断任何硬件结构，都要抓住四件事：旧写法卡在哪里，新增结构保存什么状态，数据走哪条路，控制信号怎样选择，失败时留下什么证据。进程、虚拟内存、文件系统和驱动这些 OS 机制，最终都会回到这四件事上。
+
+第一个缺口是稳定状态。纯计算电路只负责把输入组合成输出。若输入稳定，它经过门延迟后给出结果；若输入变化，输出也会跟着变化。这样的组合逻辑没有“上一刻”和“下一刻”的概念。要让机器按步骤运行，必须先有能保存状态的单元在时钟边沿记住结果。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=26mm] (old) at (0,0) {状态寄存器\\old state};
+  \node[os compute, minimum width=31mm] (logic) at (38mm,0) {组合逻辑\\计算 next state};
+  \node[os state, minimum width=26mm] (new) at (82mm,0) {状态寄存器\\new state};
+  \node[os control, minimum width=21mm] (clk) at (38mm,-17mm) {时钟边沿};
+  \node[os control, minimum width=21mm] (rst) at (82mm,-17mm) {复位};
+  \draw[os strong bus] (old) -- node[os label, above]{当前值} (logic);
+  \draw[os strong bus] (logic) -- node[os label, above]{候选下一状态} (new);
+  \draw[os bus] (clk) -- node[os label, right]{采样} (logic.south);
+  \draw[os feedback] (rst) -- node[os label, right]{拉回已知初值} (new.south);
+\end{pdfdiagram}
+\diagramnote{机器能按步骤运行，靠的是“状态寄存器保存上一拍，组合逻辑计算下一拍，时钟边沿统一提交”。}
+
+\begin{lstlisting}
+one hardware step:
+  old_state is held in registers
+  combinational logic computes next_state
+  on clock edge:
+    registers capture next_state
+\end{lstlisting}
+
+把它放回开头的输出设备例子，会更容易看清楚。设备的 \code{READY} 不是一句软件判断，而是设备状态寄存器里的一个 bit。假设设备刚复位完成，\code{READY=1}，表示数据寄存器空闲。主控端读取状态地址时，总线把这个已保存的 bit 返回给主控端；主控端写入 \code{'A'} 时，写事务到达设备的数据寄存器。设备在自己的时钟边界接收这个字节，通常会把 \code{READY} 清成 0，表示暂时不能再收下一个字节；等外部发送完成后，设备控制逻辑再把 \code{READY} 置回 1。
+
+\begin{longtable}{p{0.16\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+\toprule
+时刻 & 硬件状态变化 & OS 能观察到什么 \\
+\midrule
+复位后 & 状态寄存器进入 ready、无错误的初值 & 驱动 probe 后能确认设备可用 \\
+主控端读状态 & 地址译码选中设备状态寄存器，返回保存的 bit & 轮询代码看到 ready 或 busy \\
+主控端写数据 & \code{'A'} 被写入设备数据寄存器 & 写入不是函数返回，而是提交了一个设备命令 \\
+设备接收 & 设备状态机清 \code{READY}，开始外部发送 & 下一次轮询可能看到 busy \\
+发送完成 & 设备置 \code{READY=1}，必要时产生完成事件 & 等待者可以继续提交下一个字节 \\
+发送失败 & 设备置 \code{ERR=1} 或记录错误码 & 驱动必须停止、清错或 reset \\
+\bottomrule
+\end{longtable}
+
+这张小表说明“状态”不是抽象名词。OS 所谓等待、超时、唤醒、错误恢复，都是围绕这些硬件保存位建立的：读到 \code{READY=0} 不能假装已经完成，读到 \code{ERR=1} 不能继续写数据槽，reset 后不能沿用 reset 前的请求状态。
+
+复位则把一组关键状态放回已知初值。机器上电后从固定入口或固件指定入口开始；设备 reset 后状态位、队列指针和错误位回到手册规定的状态。没有复位边界，OS 无法判断一个保存单元里的值是旧请求、随机上电值，还是有效完成记录。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+硬件时序概念 & 含义 & OS 直接后果 \\
+\midrule
+时钟边沿 & 保存单元在离散时刻采样输入 & 执行状态可以在指令边界保存和恢复 \\
+复位 & 把状态机拉回已知初始状态 & 启动、驱动 probe、设备 reset 都要重建状态 \\
+ready/valid & 一方声明数据有效，另一方声明可接收 & 总线、设备队列、completion 都是握手协议 \\
+超时 & 预期状态长期不变化 & 驱动不能无限等 ready，必须报错或 reset \\
+错误位 & 状态机报告无法继续 & 内核要记录证据、停止新请求、回收 in-flight 状态 \\
+\bottomrule
+\end{longtable}
+
+因此，硬件基础不能直接从“机器执行程序”开始。先有时钟和复位，才有可解释的状态；先有状态，寄存器和程序计数器才有意义；先有程序计数器，才有连续取指；先有异常和中断入口，OS 才能在硬件出错或设备完成时接管。换句话说，OS 保存的“现场”，本质上就是硬件在这些状态单元里已经离散化、可命名、可恢复的值。
+
+有了“能保存上一拍”的状态单元之后，机器还不能自动变成处理器。一个保存单元只能记住 0 或 1；把很多保存单元并排放在一起，才能形成 8 位、32 位或 64 位寄存器。寄存器只解决“值放在哪里”，没有解决“下一拍写入什么”。下一拍可能保持原值，可能写入加法结果，可能写入从外部读回的数据，也可能在复位时写入固定初值。要在这些候选值之间选择，就需要选择器，常写作 MUX。
+
+\begin{lstlisting}
+one controlled register update:
+  candidates = {old_value, alu_result, load_data, reset_value}
+  selected   = mux(candidates, control_signal)
+  on clock edge if write_enable:
+    register = selected
+\end{lstlisting}
+
+这段伪代码对应的不是软件分支，而是硬件连线：多个候选输入同时接到选择器，控制信号只决定哪一路能到达寄存器输入端。若 \code{write\_enable} 没有打开，时钟到来时寄存器继续保持旧值。由此形成最小数据通路：状态寄存器提供旧值，组合逻辑产生候选结果，选择器决定写回内容，时钟边沿把结果提交成新状态。
+
+举一个具体的寄存器更新例子。假设寄存器 \code{R0} 当前保存 5，另一个寄存器 \code{R1} 保存 3。本周期控制器希望执行 \code{R0 = R0 + R1}。在时钟边沿到来之前，\code{R0} 和 \code{R1} 的输出已经稳定；ALU 的加法通路计算出候选结果 8；MUX 选择 ALU 结果；\code{write\_enable} 打开。真正把 8 写进 \code{R0} 的动作发生在提交边界，而不是 ALU 刚算出 8 的瞬间。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 硬件里发生什么 & 为什么重要 \\
+\midrule
+旧状态保持 & \code{R0=5, R1=3} 在寄存器输出端稳定 & 组合逻辑有确定输入 \\
+候选结果产生 & ALU 看到两个输入，输出 \code{8} & 此时只是候选值，还没改变 \code{R0} \\
+控制信号选择 & MUX 选择 ALU 输出，写使能打开 & 决定本周期是否真的更新状态 \\
+时钟边沿提交 & \code{R0} 采样输入端，变成 \code{8} & 从这里开始，软件可见状态改变 \\
+未提交分支 & 若写使能关闭，\code{R0} 仍是 \code{5} & 异常、停顿、取消都依赖这个边界 \\
+\bottomrule
+\end{longtable}
+
+所以“提交”是理解 OS 的核心词。上下文切换保存的是已经提交的软件可见寄存器；page fault 要求 faulting 指令还没有提交错误结果；设备 reset 要求旧队列状态不能被误当作新提交。没有这条边界，OS 就无法区分“硬件正在尝试”与“动作已经发生”。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=25mm] (ra) at (0,10mm) {寄存器 A\\当前值};
+  \node[os state, minimum width=25mm] (rb) at (0,-10mm) {寄存器 B\\当前值};
+  \node[os control, minimum width=25mm] (mux) at (40mm,0) {选择器 MUX\\选输入};
+  \node[os compute, minimum width=30mm] (logic) at (82mm,0) {组合逻辑\\加/比/传递};
+  \node[os state, minimum width=27mm] (dst) at (126mm,0) {目标寄存器\\下一拍保存};
+  \node[os control, minimum width=33mm] (ctrl) at (82mm,-25mm) {控制状态\\op + write enable};
+  \draw[os strong bus] (ra.east) -- node[os label, above]{候选值} (mux.west);
+  \draw[os strong bus] (rb.east) -- node[os label, below]{候选值} (mux.west);
+  \draw[os strong bus] (mux) -- (logic);
+  \draw[os strong bus] (logic) -- node[os label, above]{候选结果} (dst);
+  \draw[os bus] (ctrl.north) -- node[os label, right]{选择和写使能} (logic.south);
+\end{pdfdiagram}
+\diagramnote{硬件动作不是“一个函数返回值”，而是状态寄存器、选择器、组合逻辑和写使能共同完成的一次提交。OS 后来依赖的可恢复现场，必须落在这些已经提交的状态上。}
+
+这条数据通路还没有程序，也没有 CPU。它只是说明硬件怎样从“保存一个值”进化到“按控制信号更新一个值”。即使换成 ALU、寄存器文件、程序计数器、地址翻译和设备寄存器，结构也没有变：旧状态经过数据通路形成候选新状态，再由控制信号决定是否提交。不同硬件名词之间真正相连的，是这条状态更新规则。
+
+在最小数据通路里，组合逻辑如果只能“原样传递”，机器最多保存和搬运值；它还不能计算地址偏移，不能判断状态位是否为零，也不能比较两个数。下一项需求就是：给定两个寄存器值，能不能算出结果，能不能比较大小或是否为零。这个需求推出算术逻辑单元，英文常写作 ALU。ALU 接收两个输入和一个操作选择，输出计算结果，并可能更新 zero、carry、sign、overflow 等标志位。\code{add}、\code{sub}、\code{and}、\code{or}、\code{xor}、\code{compare} 等操作，都可以落到 ALU 或相关执行单元上。
+
+理解 ALU 时，不应只把它看成“会算数的黑盒”。它首先是一组执行 bit 运算的门电路。以一位全加器为例，输入是两个 bit 和一个进位，输出是本位结果和下一位进位。
+
+\begin{lstlisting}
+full_adder(a, b, carry_in):
+  sum_bit = a xor b xor carry_in
+  carry_out = (a & b) | (a & carry_in) | (b & carry_in)
+  return sum_bit, carry_out
+\end{lstlisting}
+
+一位加法器只能算一位。把很多个一位加法器连起来，低位的 \code{carry\_out} 进入高位的 \code{carry\_in}，就能做 32 位或 64 位加法。真实执行单元会用更快的进位预测或并行前缀结构减少等待，但 OS 视角要抓住的是：加法会产生结果，也会产生标志位。减法通常可以转成“加上补码”；比较通常可以转成“做一次减法但不写回结果，只更新标志位”。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=23mm] (ra) at (0,8mm) {寄存器 A\\操作数};
+  \node[os state, minimum width=23mm] (rb) at (0,-8mm) {寄存器 B\\操作数};
+  \node[os control, minimum width=22mm] (op) at (34mm,23mm) {op 选择\\ADD/SUB/CMP};
+  \node[os compute, minimum width=31mm] (alu) at (43mm,0) {ALU\\加法/逻辑/比较};
+  \node[os state, minimum width=25mm] (rd) at (86mm,8mm) {目标寄存器\\result};
+  \node[os state, minimum width=25mm] (flags) at (86mm,-11mm) {状态寄存器\\flags};
+  \draw[os strong bus] (ra.east) -- (alu.west);
+  \draw[os strong bus] (rb.east) -- (alu.west);
+  \draw[os bus] (op.south) -- node[os label, right]{选择运算} (alu.north);
+  \draw[os strong bus] (alu.east) -- node[os label, above]{结果} (rd.west);
+  \draw[os bus] (alu.east) -- ++(8mm,0) |- node[os label, below right]{标志位} (flags.west);
+\end{pdfdiagram}
+\diagramnote{ALU 不单独构成“程序执行”，它只是数据通路中的计算节点；寄存器提供输入并接收结果，状态寄存器保存可被分支和异常路径使用的证据。}
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+标志位 & 来源 & 对 OS 和程序的影响 \\
+\midrule
+zero & 结果所有 bit 都为 0 & 条件分支、循环结束、错误码判断 \\
+sign & 结果最高位为 1 & 有符号比较、边界检查 \\
+carry & 无符号加法进位或减法借位 & 地址计算、无符号溢出判断、多精度整数 \\
+overflow & 有符号结果超出可表示范围 & 调试、运行时检查、语言语义实现 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+alu(a, b, op):
+  if op == ADD: result = a + b
+  if op == SUB: result = a - b
+  if op == AND: result = a & b
+  if op == CMP: flags = compare(a, b)
+\end{lstlisting}
+
+但能计算还不等于能运行程序。ALU 不知道 \code{a} 和 \code{b} 从哪里来，不知道结果写回哪里，也不知道下一步做什么。它只是在“寄存器 -> 组合逻辑 -> 寄存器”这条通路中提供一种候选结果。要让 ALU 成为可编程机器的一部分，随之出现的需求是：有一组可命名寄存器保存参数和临时值，有选择器把正确寄存器接到 ALU 输入，有写回端口保存结果，有一个状态保存“下一步取哪条指令”。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+部件 & 最小作用 & OS 相关后果 \\
+\midrule
+ALU & 整数运算、比较、位操作 & 页表权限位、bitmap、核心掩码、条件分支 \\
+寄存器文件 & 保存参数、地址和临时值 & 系统调用参数、trap frame、上下文切换 \\
+程序计数器 & 指向下一条指令 & 异常返回、信号、调试、调度恢复 \\
+状态寄存器 & 保存条件码、模式位、中断位 & 特权切换、关中断、返回用户态 \\
+控制器 & 把指令变成控制信号 & 非法指令、特权指令、系统调用入口 \\
+\bottomrule
+\end{longtable}
+
+所谓“保存执行上下文”，保存的不是一个抽象对象，而是这组软件可见状态：通用寄存器、栈指针、程序计数器、状态寄存器，以及必要的浮点/SIMD 状态。ALU 本身无须保存，它下一周期可以继续计算；必须保存的是用户程序能够观察到的架构状态。
+
+当机器不再只做固定加法，而是要按程序选择动作时，控制信号就不能靠手工拨开关产生。机器需要把一串指令字节解释成“读哪些寄存器、选择哪种 ALU 操作、结果写回哪里、下一条指令在哪里”。这就引出指令、译码、寄存器文件、数据通路和控制信号。以 \code{add rax, rbx} 为例，硬件不是直接“知道加法语义”，而是在一个数据通路里打开一组控制信号。
+
+\begin{lstlisting}
+execute add rax, rbx:
+  left  = regfile.read(rax)
+  right = regfile.read(rbx)
+  out   = alu(left, right, ADD)
+  regfile.write(rax, out)
+  update_flags(out)
+\end{lstlisting}
+
+这已经构成执行指令的基本骨架：寄存器文件提供输入，ALU 计算，写回端口保存结果，状态寄存器记录标志位。再加上取指和译码，就能执行不同指令；再加上 load/store 单元，就能访问更多数据；再加上异常入口，就能在执行失败时交给内核。在这个阶段，可以把这套取指、译码、执行和提交状态的硬件整体称为 CPU。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=22mm] (pc) at (0,18mm) {PC/RIP\\下一条指令};
+  \node[os memory, minimum width=25mm] (imem) at (35mm,18mm) {指令存储\\取字节};
+  \node[os control, minimum width=27mm] (dec) at (72mm,18mm) {译码/控制\\控制信号};
+  \node[os control, minimum width=28mm] (nextpc) at (112mm,18mm) {下一 PC\\顺序/分支/异常};
+  \node[os state, minimum width=27mm] (regs) at (0,-12mm) {寄存器文件\\读/写端口};
+  \node[os compute, minimum width=28mm] (exe) at (37mm,-12mm) {执行单元\\ALU/分支/地址};
+  \node[os memory, minimum width=27mm] (lsu) at (75mm,-12mm) {load/store\\数据访问};
+  \node[os state, minimum width=25mm] (wb) at (112mm,-12mm) {写回\\寄存器/flags};
+  \draw[os strong bus] (pc) -- node[os label, above]{取指} (imem);
+  \draw[os strong bus] (imem) -- node[os label, above]{字节} (dec);
+  \draw[os bus] (dec) -- node[os label, above]{控制} (nextpc);
+  \draw[os bus] (dec.south) -- ++(0,-9mm) -| (regs.north);
+  \draw[os strong bus] (regs) -- node[os label, above]{操作数} (exe);
+  \draw[os strong bus] (exe) -- node[os label, above]{结果/地址} (lsu);
+  \draw[os strong bus] (lsu) -- node[os label, above]{数据/异常} (wb);
+  \draw[os bus] (wb.north) -- ++(0,9mm) -| node[os label, near end, right]{提交} (nextpc.south);
+  \draw[os feedback] (nextpc.north) -- ++(0,7mm) -| node[os label, near end, left]{更新} (pc.north);
+\end{pdfdiagram}
+\diagramnote{CPU 不是一个单块黑盒，而是取指、译码、读寄存器、执行、访存、写回和下一 PC 选择共同组成的状态机。OS 能恢复执行，依赖的是这些结构在提交边界留下的架构状态。}
+
+\begin{lstlisting}
+control signals for add rax, rbx:
+  reg_src0 = rax
+  reg_src1 = rbx
+  alu_op = ADD
+  writeback_dst = rax
+  writeback_src = ALU_RESULT
+  update_flags = true
+  next_rip = rip + instruction_length
+\end{lstlisting}
+
+控制信号把“指令语义”落实成硬件动作。MUX 负责按控制信号选择输入：ALU 左输入来自哪个寄存器，右输入来自寄存器还是立即数，写回数据来自 ALU 还是内存，下一 RIP 来自顺序地址、分支目标、异常入口还是中断返回。写回端口和下一 PC 选择是这张图里最重要的提交点：只要结果还没有写回、下一 PC 还没有提交，硬件就能把这条指令当作未完成；一旦写回完成，OS 就必须把它当作已经发生的架构事实。
+
+把 \code{add rax, rbx} 走细一点。假设进入这条指令前，\code{RIP=0x400100}，\code{rax=5}，\code{rbx=3}。取指单元用 \code{RIP} 访问指令字节；译码器识别出这是一条把 \code{rbx} 加到 \code{rax} 的整数指令；寄存器文件打开 \code{rax} 和 \code{rbx} 的读端口；ALU 输出 8；写回端口把 8 写回 \code{rax}；下一 PC 选择器把 \code{RIP} 更新到下一条指令地址。每一步都接在前面的状态上。
+
+\begin{longtable}{p{0.16\linewidth}p{0.36\linewidth}p{0.36\linewidth}}
+\toprule
+阶段 & 具体硬件动作 & 提交后的可见事实 \\
+\midrule
+取指 & \code{RIP=0x400100} 送到指令存储或 I-cache & 还没有改变通用寄存器 \\
+译码 & 指令字节被解释成读 \code{rax/rbx}、ALU 加法、写 \code{rax} & 控制信号已确定，结果还未出现 \\
+读寄存器 & 寄存器文件输出 \code{5} 和 \code{3} & 仍只是读取旧状态 \\
+执行 & ALU 计算 \code{5+3=8}，同时更新候选标志位 & 8 还只是候选结果 \\
+写回 & 写端口在提交边界把 8 写入 \code{rax} & \code{rax=8} 成为软件可见事实 \\
+更新 PC & 下一 PC 选择顺序地址 & 返回用户态或继续执行时从下一条开始 \\
+\bottomrule
+\end{longtable}
+
+这也是为什么 OS 保存现场时不保存“ALU 里面正在算什么”。若 \code{add} 已提交，现场里看到的是 \code{rax=8} 和下一条 \code{RIP}；若它没有提交，现场里应该仍能回到 \code{rax=5} 和这条指令。硬件内部可以流水化、乱序化，但对 OS 暴露的提交事实必须保持这种清晰边界。
+
+\code{load} 和 \code{store} 比 \code{add} 多一层问题：它们不只使用寄存器和 ALU，还要先算出一个地址，再按这个地址读写外部存储。最小模型中，地址直接指向某个存储位置，暂不考虑隔离和加速。只要读写失败，CPU 就不能把这条指令标记为已经完成。
+
+\begin{lstlisting}
+execute load rax, [rbx + 8]:
+  effective_addr = regfile.read(rbx) + 8
+  if memory_cannot_read(effective_addr):
+    raise_load_fault(effective_addr)
+  data = memory_read(effective_addr)
+  regfile.write(rax, data)
+\end{lstlisting}
+
+最后一步的顺序是关键约束：只有地址检查和读数据都成功后，\code{rax} 才能被写回。若先写回一半再报错，内核就无法把这条指令当作“没有发生过”来重试。异常可恢复，依赖硬件在写回前守住提交边界。即使加入地址隔离和缓存，这个提交边界仍然不能被破坏。
+
+仍用一个具体值走一遍。假设 \code{rbx=0x1000}，指令是 \code{load rax, [rbx + 8]}，那么地址生成单元先得到 \code{0x1008}。如果这个地址可读，内存系统返回 8 个字节，写回端口把它们写进 \code{rax}，然后 \code{RIP} 前进。若地址不可读，硬件不能先把随机数据写进 \code{rax}，再告诉内核“出错了”；它必须保存 fault address、错误原因和 faulting RIP，进入异常入口，让内核决定分配页、发信号、杀进程或 panic。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+路径 & 硬件动作 & OS 后续解释 \\
+\midrule
+load 成功 & 地址生成成功，权限通过，数据返回，\code{rax} 写回 & 指令已经发生，异常处理不应再重试它 \\
+地址不存在 & 页表或最小内存模型报告无法读 & 内核可建立映射后重试同一条指令 \\
+权限不允许 & 读/写/执行权限检查失败 & 可能是 COW、非法访问或安全违规 \\
+设备或物理错误 & 下层返回不可恢复错误或机器检查 & 进入错误处理、隔离或 panic 路径 \\
+\bottomrule
+\end{longtable}
+
+这张表给出一条通用判断。缺页、COW、用户指针校验、信号恢复、断点调试，本质上都要求硬件能把“失败发生在提交前”说清楚。否则内核不知道应该重试原指令、跳过原指令，还是把进程结束掉。
+
+\begin{longtable}{p{0.18\linewidth}p{0.4\linewidth}p{0.3\linewidth}}
+\toprule
+已有能力 & 仍然缺少什么 & 后果 \\
+\midrule
+只有 ALU & 没有寄存器和 PC & 不能保存程序状态，无法连续执行 \\
+只有寄存器和 ALU & 没有指令译码 & 不能由程序选择操作，只能固定连线 \\
+有译码和 PC & 没有特权检查 & 用户程序可执行敏感动作 \\
+有 load/store & 没有访问边界 & 所有程序共享同一片地址，彼此可以破坏 \\
+有异常入口 & 没有精确现场 & 内核无法修复 fault 后重试 \\
+\bottomrule
+\end{longtable}
+
+从“能计算”过渡到 OS，需要补上三条硬件事实：程序能连续执行，因此必须有可恢复现场；程序可能失败，因此必须有异常证据；多个程序需要共存，因此必须有权限和地址隔离。
+
+能按步骤执行之后，下一项需求是提高吞吐。最小的 CPU 模型可以是一条指令在一个较长周期内完成取指、译码、执行、访存和写回。该模型的问题在于周期必须按最慢指令设计，简单加法也要等待 load/store 的最长路径。流水线把一条指令拆成多个阶段，让不同指令重叠运行。
+
+先看不流水化时的低效。假设一条 \code{add} 只需要取指、译码、ALU 和写回，另一条 \code{load} 还需要等待数据 cache。若硬件要求“每条指令从头到尾独占整条路径”，那么 \code{add} 也要按 \code{load} 的最坏延迟留足时间。结果是：取指部件在执行阶段闲着，ALU 在访存阶段闲着，写回端口在取指阶段闲着。机器不是没有硬件，而是同一时刻只允许一条指令使用这些硬件。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+模型 & 一条指令怎样占用硬件 & 问题在哪里 \\
+\midrule
+单周期模型 & 取指、译码、执行、访存、写回必须在一个长周期内完成 & 周期被最慢路径决定，简单指令也被拖慢 \\
+多周期模型 & 一条指令分多拍走完，但仍独占主要路径 & 部件分时复用，吞吐仍低 \\
+流水线模型 & 每拍推进一个阶段，多条指令占据不同阶段 & 吞吐提高，但需要处理相关、预测和异常边界 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+classic pipeline:
+  IF   fetch instruction at RIP
+  ID   decode and read registers
+  EX   run ALU or compute address
+  MEM  access memory
+  WB   write result back
+\end{lstlisting}
+
+流水线不是把一条指令切成五个软件函数，而是在硬件阶段之间加入保存中间结果的流水线寄存器。IF/ID 寄存器保存取到的指令字节和下一 PC；ID/EX 寄存器保存译码后的控制信号、源寄存器编号和立即数；EX/MEM 寄存器保存 ALU 结果或有效地址；MEM/WB 寄存器保存准备写回的数据和目标寄存器号。每个时钟边沿，这些阶段寄存器一起向前推进。这样第 1 条指令在 EX 阶段计算时，第 2 条指令可以同时在 ID 阶段读寄存器，第 3 条指令可以同时在 IF 阶段取指。
+
+\begin{longtable}{p{0.15\linewidth}p{0.22\linewidth}p{0.22\linewidth}p{0.25\linewidth}}
+\toprule
+周期 & 指令 1 & 指令 2 & 关键硬件事实 \\
+\midrule
+第 1 拍 & IF 取指 & -- & PC 和 I-cache 工作 \\
+第 2 拍 & ID 译码/读寄存器 & IF 取指 & IF/ID 寄存器隔开两个阶段 \\
+第 3 拍 & EX 执行 & ID 译码/读寄存器 & ALU 和取指前端可并行工作 \\
+第 4 拍 & MEM 访存或跳过 & EX 执行 & load/store 才会使用数据 cache \\
+第 5 拍 & WB 写回 & MEM 访存或跳过 & 架构状态在写回处提交 \\
+\bottomrule
+\end{longtable}
+
+这张表解释了为什么流水线一出现，硬件就必须能“停住某些阶段、冲掉某些阶段、转发某些结果”。如果第 2 条指令马上使用第 1 条指令的结果，而第 1 条还没写回，ID 阶段读到的可能是旧寄存器值。硬件可以把 EX 或 MEM 阶段的新结果直接转发给后面的 EX 阶段；如果数据还没回来，就只能插入停顿。流水线提高的是正常路径吞吐，不是取消了依赖关系。
+
+流水线提高吞吐，也制造新问题。这里的 hazard 指“下一步不能按理想节奏继续推进的情况”，不是软件异常。后一条指令可能依赖前一条结果，分支可能猜错，load 可能访问失败，执行单元也可能被前面的长延迟操作占住。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+流水线问题 & 具体例子 & 硬件或 OS 后果 \\
+\midrule
+数据相关 & \code{add rax, rbx} 后立刻使用 \code{rax} & 转发、停顿或乱序调度 \\
+控制相关 & 分支目标还没确定就要取下一条指令 & 分支预测，猜错后冲刷流水线 \\
+结构相关 & 多条指令同时需要同一个执行资源 & 排队、发射限制、吞吐下降 \\
+异常边界 & load 访问失败时后面指令可能已猜测执行 & 必须丢弃年轻指令并保留精确现场 \\
+\bottomrule
+\end{longtable}
+
+现代乱序核心进一步把指令拆成微操作，允许先执行不依赖的操作，但最终仍要按程序顺序提交架构状态。这个“按序提交”是 OS 能处理异常的根。
+
+乱序执行解决的是另一个浪费：流水线虽然能重叠阶段，但遇到 cache miss 或长延迟乘除法时，后面那些完全不依赖它的指令也可能被堵住。乱序核心会把已译码的操作放入队列，源操作数准备好、执行单元空闲时就先执行。为了不破坏程序语义，它还要维护一张提交队列，常称为 reorder buffer。每个条目至少记录：这条操作在程序顺序中的位置、目标架构寄存器、计算出的候选结果、是否完成、是否有异常。内部可以先完成年轻指令，但只有队首的老指令满足条件时，才能把结果提交成软件可见状态。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+结构 & 保存什么 & 为什么 OS 依赖它 \\
+\midrule
+保留站/调度队列 & 已译码但等待操作数或执行单元的微操作 & 允许独立操作绕过慢操作先执行 \\
+物理寄存器 & 临时保存未提交或重命名后的结果 & 消除假依赖，但不直接作为 OS 保存对象 \\
+提交队列 & 程序顺序、目标寄存器、完成位、异常位 & 保证异常点之前已经提交，异常点之后都可丢弃 \\
+store buffer & 已产生但尚未对外可见的写入 & 锁、屏障、MMIO 顺序必须约束它 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+precise fault boundary:
+  older instructions have committed
+  faulting instruction has not committed its result
+  younger instructions are discarded
+  saved RIP points to the faulting instruction
+  fault address and error code are recorded
+\end{lstlisting}
+
+这个边界决定异常是否可恢复。以 \code{load rax, [p]} 访问失败为例，CPU 不能让后面已经猜测执行的写入对用户程序可见；也不能把 RIP 保存到下一条指令，否则内核处理完原因后无法重试原来的 load。虚拟内存中的懒分配、文件映射和 COW 都依赖这种精确、可重试的异常现场。
+
+用一个小程序看清楚这件事：
+
+\begin{lstlisting}
+1: add rbx, 1
+2: load rax, [p]       // p may fault
+3: store [q], rax
+\end{lstlisting}
+
+若第 2 条 \code{load} 缺页，第 1 条 \code{add} 可以已经提交，因为它在程序顺序上更老；第 2 条不能把错误数据写入 \code{rax}；第 3 条即使在内部已经猜测执行，也必须被丢弃，不能真的写入 \code{q}。内核拿到的现场应该是：\code{rbx} 已经加一，\code{RIP} 指向第 2 条，fault address 是 \code{p}，错误码说明是 not-present 或权限问题。缺页处理修复页表后返回，CPU 从第 2 条重新执行。这个例子把流水线、乱序和 OS 缺页处理接在了一起。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+机制 & 它带来的性能能力 & OS 依赖或承担的后果 \\
+\midrule
+流水线 & 多条指令重叠执行 & 异常必须落在可恢复边界 \\
+分支预测 & 减少等待分支结果的空泡 & 预测器可能形成侧信道 \\
+乱序执行 & 慢访问或长运算期间执行其他独立操作 & 需要精确异常和按序提交 \\
+寄存器重命名 & 消除假依赖，提高并行度 & OS 保存架构寄存器，不保存内部物理寄存器 \\
+store buffer & 写入先排队，提高吞吐 & 锁、屏障和设备顺序必须显式表达 \\
+\bottomrule
+\end{longtable}
+
+现代 CPU 对 OS 暴露两层事实：ISA 层承诺寄存器、异常、地址访问和特权规则；微架构层影响性能和安全，包括流水线停顿、分支预测、store buffer、慢访问等待和侧信道。OS 不能忽略微架构影响，否则锁、调度、内存屏障和安全隔离都无法完整解释。
+
+能执行指令之后，程序会遇到容量问题：寄存器数量有限，所有数据不可能都放在执行单元旁边。数组、栈、堆、文件缓存、网络包都需要一大片可寻址存储，这就是内存。最小内存模型可以表示为“地址到字节的表”：
+
+\begin{lstlisting}
+memory[address] -> byte
+load  rax, [address]  reads bytes from memory
+store [address], rax  writes bytes to memory
+\end{lstlisting}
+
+这个表面模型背后对应的是一条物理路径。执行单元先算出地址，地址线或片上互联把这个数送到内存子系统；内存控制器根据地址选择通道、bank 和行列；DRAM 返回一整段数据，通常再被切成 CPU 需要的字节或字。对 OS 来说，最初要抓住两件事：地址不是变量名，而是选择某个存储位置的编号；内存读写不是 ALU 内部动作，而是一次可能等待、失败、被缓存或被权限拦住的外部访问。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+从寄存器到内存 & 结构上增加了什么 & 新问题 \\
+\midrule
+寄存器读写 & 编号很少，位置在 CPU 内部 & 容量不够，不能放大量对象 \\
+直接物理内存 & 地址选择 DRAM 中的字节或 cache line & 多程序互相覆盖，装载位置僵硬 \\
+带权限的地址翻译 & 虚拟地址先经页表变成物理地址 & 需要维护页表、处理 fault 和旧翻译 \\
+带缓存的访问 & 常用物理 cache line 放在核心附近 & 需要处理一致性、伪共享和 DMA 同步 \\
+\bottomrule
+\end{longtable}
+
+有了内存，程序才能把大对象放到寄存器之外；随之出现的是隔离问题：如果所有程序都直接使用同一片物理地址，一个程序写错地址就能覆盖另一个程序或内核。为了让多个程序共存，机器必须把“程序看到的地址”和“真实内存位置”分开，并在访问时检查权限。这个硬件叫 MMU，memory management unit。它按页表把虚拟地址翻译成物理地址，并检查读、写、执行、用户/内核等权限。
+
+先用最小反例说明为什么直接物理地址不够。假设程序 A 的数组在物理地址 \code{0x2000}，程序 B 的栈也恰好被错误写到 \code{0x2000} 附近。没有翻译和权限时，硬件只看地址数字，不知道“这是 A 的数组”还是“这是 B 的栈”。一次越界 store 会直接改坏另一个程序。OS 当然可以在软件里检查某些系统调用参数，但用户程序普通 load/store 每秒可以执行大量次，不能每条都陷入内核检查。权限必须放到硬件访存路径上，随每一次 load/store 自动执行。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+访问方式 & 硬件看到什么 & 隔离结果 \\
+\midrule
+直接物理地址 & 指令给出 \code{0x2000}，内存系统直接访问物理位置 & 任意错误地址都可能改坏别的程序或内核 \\
+基址/界限 & 地址先加基址，并检查是否在连续范围内 & 能保护单段程序，但不适合稀疏堆栈和共享库 \\
+分页虚拟地址 & 虚拟页号查页表，得到物理页号和权限 & 每页可独立映射、共享、撤销、懒分配和保护 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+load from *p:
+  virtual address comes from register
+  MMU reads page table entry
+  MMU checks present, R/W/X, user/supervisor
+  memory system reads physical address
+  CPU returns data or raises exception
+\end{lstlisting}
+
+页表项不是单纯的 \code{virtual -> physical} 映射。它还告诉硬件：这一页当前是否存在，用户态能不能访问，能不能写，能不能执行。硬件每次访问都按这些位检查；检查失败时，CPU 进入异常入口，把 fault address 和原因交给内核。
+
+把一个 64 位虚拟地址拆开看，会更具体。页大小若是 4KiB，低 12 bit 是页内偏移，高位是虚拟页号。页表翻译只替换页号部分：虚拟页号查到物理页框号，低 12 bit 原样保留。于是 \code{0x7f00_1234} 这样的虚拟地址可以映射到任意物理页框的偏移 \code{0x234} 处。OS 分配和回收的基本单位通常是页，因为硬件权限和翻译也是按页生效。
+
+\begin{lstlisting}
+virtual address:
+  VPN = high bits of address
+  offset = low 12 bits for a 4KiB page
+
+translation:
+  PTE[VPN] -> PPN + permission bits
+  physical address = PPN || offset
+\end{lstlisting}
+
+这也解释了为什么同一个物理页可以出现在多个进程的虚拟地址里。共享库代码页可以被多个进程映射为只读可执行；\code{fork} 后的匿名页可以先让父子进程共同映射为只读，等某一方写入时触发 COW；内核也可以把同一块设备 buffer 映射到不同地址，用不同权限约束访问。虚拟地址提供的是命名空间，物理页提供的是实际存储，页表把二者在某个时刻绑定起来。
+
+一次 \code{load rax, [p]} 实际上有三条常见路径。第一条是快路径：TLB 里已经有 \code{p} 所在虚拟页的翻译和权限，权限允许，cache 命中，数据很快返回。第二条是中间路径：TLB 没有翻译，但页表项存在且权限允许，硬件 page walker 读取页表，填入 TLB，再继续访问 cache。第三条是异常路径：页表项不存在或权限不允许，硬件无法直接完成这条指令，必须保存 fault 证据并进入内核。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+路径 & 硬件怎么走 & OS 是否接管 \\
+\midrule
+TLB 命中 & 虚拟页直接得到物理页号和权限，继续访问 cache & 不接管，程序感觉只是一次普通读取 \\
+TLB miss 但 PTE 有效 & page walker 读页表，检查权限，填 TLB & 通常不接管，只是变慢 \\
+PTE 不存在 & page walker 发现无有效映射 & 接管，内核查 VMA 后决定是否补页 \\
+权限失败 & PTE 存在但写/执行/用户权限不允许 & 接管，可能 COW、发信号或杀进程 \\
+cache miss & 翻译和权限都通过，但数据不在近端 cache & 不接管，继续向下级 cache 或 DRAM 请求 \\
+\bottomrule
+\end{longtable}
+
+这里最容易混的是 TLB miss 和 page fault。TLB miss 只是硬件缓存没有命中；page fault 是硬件查到“这次访问不能按当前页表直接完成”。前者通常不进入内核，后者一定要给内核一个可解释现场。OS 修改页表、做 COW、撤销映射、切换地址空间时，真正要维护的就是这条证据链。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=23mm] (reg) at (0,12mm) {寄存器\\虚拟地址};
+  \node[os compute, minimum width=25mm] (agu) at (34mm,12mm) {地址生成\\base+index+off};
+  \node[os memory, minimum width=26mm] (tlb) at (70mm,12mm) {TLB\\最近翻译};
+  \node[os memory, minimum width=29mm] (ptw) at (70mm,-12mm) {page walker\\读取页表};
+  \node[os control, minimum width=27mm] (perm) at (106mm,12mm) {权限检查\\R/W/X U/S};
+  \node[os memory, minimum width=29mm] (cache) at (143mm,12mm) {cache\\物理 line};
+  \node[os memory, minimum width=29mm] (dram) at (143mm,-12mm) {内存控制器\\DRAM};
+  \node[os control, minimum width=25mm] (fault) at (106mm,-12mm) {异常证据\\addr+reason};
+  \draw[os strong bus] (reg) -- (agu);
+  \draw[os strong bus] (agu) -- node[os label, above]{虚拟页号} (tlb);
+  \draw[os bus] (tlb.south) -- node[os label, right]{miss} (ptw.north);
+  \draw[os strong bus] (ptw.east) -| node[os label, below right]{PTE} (perm.south);
+  \draw[os strong bus] (tlb.east) -- node[os label, above]{PPN+权限} (perm.west);
+  \draw[os strong bus] (perm) -- node[os label, above]{物理地址} (cache);
+  \draw[os bus] (cache.south) -- node[os label, right]{miss} (dram.north);
+  \draw[os feedback] (perm.south) -- node[os label, right]{失败} (fault.north);
+\end{pdfdiagram}
+\diagramnote{一次 load/store 不是“CPU 直接读内存”，而是地址生成、TLB/page walk、权限检查、cache 和内存控制器串起来的结构路径；page fault 来自权限或映射检查，不是普通 cache miss。}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+事件 & 硬件含义 & OS 是否立刻参与 \\
+\midrule
+PTE not present & 页表项当前无有效物理页 & 进入内核缺页处理 \\
+权限不允许 & 写只读页、用户访问内核页、执行 NX 页 & 进入内核，可能 COW、发信号或杀进程 \\
+机器检查 & 硬件发现不可忽略的物理错误 & 内核记录、隔离、降级或 panic \\
+\bottomrule
+\end{longtable}
+
+由此可见，OS 内存管理远不止“分配内存”四个字。页表权限给进程隔离提供硬件根；缺页异常让懒分配、文件映射和 COW 成立；权限异常让内核能拦住非法访问。先有这条隔离路径，之后才能讨论“怎样让它更快”。
+
+页表检查解决了安全问题，但每次访问都完整读页表会太慢。于是硬件增加翻译缓存，常叫 TLB，translation lookaside buffer。TLB 保存最近的虚拟页到物理页翻译结果。TLB miss 只是“翻译缓存里没有”，硬件可以自己走页表；page fault 是“页表或权限告诉硬件这次访问不能直接完成”，CPU 必须进入内核。两者不能混同。
+
+把缺页处理接到前面的提交边界上，就能理解懒分配为什么成立。用户程序第一次读 \code{p[0]}，硬件发现 PTE 不 present，保存 faulting RIP 和 fault address，进入内核。内核查到 \code{p} 落在合法 VMA 内，于是分配物理页、填 PTE、刷新必要的旧翻译，然后返回原指令。CPU 重新执行同一条 load，这次翻译成功，数据返回。用户程序看到的只是第一次访问慢一些；它没有看到中间的内核路径。
+
+\begin{lstlisting}
+lazy page allocation:
+  user load p[0]
+  hardware finds PTE not present
+  kernel checks VMA and allocates a page
+  kernel installs PTE and returns
+  CPU retries the original load
+\end{lstlisting}
+
+如果 fault 之前 \code{rax} 已经被写回，重试就会破坏程序语义；如果 faulting RIP 保存错了，内核也不知道该回到哪条指令。虚拟内存能把“没有物理页”伪装成“第一次访问时再准备”，依赖的正是硬件把访存失败停在提交前。
+
+数据访问本身也需要加速。主内存比执行单元慢得多，若每次 load/store 都等完整内存延迟，流水线会经常停住。于是硬件在核心附近放更小、更快的副本，叫 cache。cache 以 cache line 为单位保存最近访问过的物理内存内容。
+
+cache 不是为了改变内存语义，而是为了利用局部性。若程序刚读过地址 \code{0x1008}，它很可能很快再读附近地址 \code{0x1010}；硬件一次从下级内存搬来一整条 cache line，例如 64 字节，后续相邻访问就能在 L1 cache 中完成。若程序反复遍历数组，cache 能显著减少访问 DRAM 的次数；若程序随机跳跃访问很大的内存区域，cache 命中率下降，执行单元就会更多等待。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+访问现象 & 硬件解释 & OS 或程序后果 \\
+\midrule
+顺序扫描数组快 & 相邻元素落在同一条或相邻 cache line & 预读、批量处理和局部性友好 \\
+链表随机跳慢 & 每个节点可能在不同 cache line，甚至不同页 & 指针追逐造成 cache/TLB miss \\
+任务迁移后变慢 & 新 CPU 的 L1/L2 和 TLB 没有旧任务热状态 & 调度器要考虑亲和性 \\
+共享锁很慢 & 锁所在 cache line 在多个 CPU 间转移所有权 & per-CPU、分片和队列锁减少抖动 \\
+\bottomrule
+\end{longtable}
+
+TLB 和 cache 常被一起提到，但它们缓存的东西不同。TLB 缓存“虚拟页到物理页以及权限”的翻译结果；cache 缓存“某个物理 cache line 的数据内容”。一次 load 通常先需要翻译，再按物理地址访问数据 cache。TLB miss 不等于数据 cache miss；数据 cache miss 也不等于 page fault。把这三者区分开，阅读内核日志和性能计数时才不会混乱。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+内存子系统部件 & 它实际做什么 & OS 关心点 \\
+\midrule
+L1/L2/L3 cache & 缓存物理 cache line，减少访存延迟 & 伪共享、锁竞争、cache 热度、DMA 同步 \\
+TLB/page walker & 缓存或读取页表翻译结果 & shootdown、PCID、大页、COW 权限变化 \\
+内存控制器 & 把物理地址事务送到 DRAM channel/rank/bank & NUMA、带宽、ECC 错误、内存热插拔 \\
+NUMA 互联 & 连接多个 socket 或内存节点 & 线程亲和性、first-touch、页迁移 \\
+内存类型机制 & 标记可缓存、不可缓存、write-combining 等属性 & MMIO 不能按普通 RAM 缓存，framebuffer 需要特殊属性 \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+事件 & 硬件含义 & OS 是否立刻参与 \\
+\midrule
+L1 cache miss & 数据不在最近的 cache 中 & 通常不参与，只是变慢 \\
+TLB miss & 翻译不在 TLB 中 & 通常不参与，page walker 读页表 \\
+page fault & 页表或权限不允许这次访问直接完成 & 进入内核，修复或报错 \\
+\bottomrule
+\end{longtable}
+
+DRAM 也不是一个平面数组。内存控制器要在 channel、rank、bank、row 之间调度请求；远端 NUMA 节点要经过互联；ECC 可能报告可纠正或不可纠正错误。OS 的页分配器、NUMA 策略和错误处理因此不是“性能优化附录”，而是现代内存系统的必要配套。
+
+将一次 cache miss 继续展开，可以看到更多硬件状态：
+
+\begin{lstlisting}
+cache miss to DRAM:
+  pick memory controller by physical address
+  choose channel/rank/bank
+  if target row is not open:
+    precharge old row
+    activate target row
+  read cache line
+  check or correct ECC
+  return line to last-level cache
+\end{lstlisting}
+
+这对应两个常见现象。第一，连续访问相邻地址通常更快，因为它们可能落在相同或相近的 DRAM 行和 cache line 上。第二，NUMA 机器上“同样是内存”也有远近，线程在 CPU0 上运行却频繁访问 CPU1 所属节点的内存，会让延迟和互联流量上升。OS 的 first-touch、页迁移、任务亲和性，都是在处理这类硬件距离。
+
+当一个执行流不够用时，系统会增加多个执行核心。单核机器上，同一时刻只有一个执行流真正运行；多核机器上，多个 CPU 同时读写共享内存，核心问题转为：谁先看到谁的写入？同一条 cache line 在多个核心里如何保持一致？两个 CPU 同时改一个计数器会不会丢更新？
+
+先看最小失败例子。内存里的 \code{counter} 初值是 0，CPU0 和 CPU1 同时执行 \code{counter++}。这条语句至少包含三步：load 旧值、ALU 加一、store 新值。若两个 CPU 都先读到 0，再各自写回 1，最后结果就是 1，而不是 2。问题不在 C 语句写得短，而在硬件动作不是不可分割的一步。
+
+\begin{longtable}{p{0.16\linewidth}p{0.32\linewidth}p{0.32\linewidth}p{0.12\linewidth}}
+\toprule
+时刻 & CPU0 & CPU1 & 内存结果 \\
+\midrule
+开始 & 准备读 \code{counter} & 准备读 \code{counter} & 0 \\
+读旧值 & 读到 0 & 读到 0 & 0 \\
+本地计算 & ALU 得到 1 & ALU 得到 1 & 0 \\
+写回 & 写 1 & 写 1 & 1 \\
+\bottomrule
+\end{longtable}
+
+多核硬件必须先解决两个层面的问题。第一层是“一致性”：同一个物理地址的 cache line 不能让多个核心随意写出互相矛盾的版本，写入所有权要在核心之间转移。第二层是“顺序”：一个 CPU 先写数据再写标志，另一个 CPU 看到标志时，是否一定能看到数据。这两个问题分别对应 cache 一致性协议、原子指令和内存屏障。OS 的锁、引用计数、等待队列和 RCU 都建立在这些硬件能力上。
+
+\begin{pdfdiagram}
+  \node[os compute, minimum width=24mm] (c0) at (0,14mm) {Core 0\\执行流 A};
+  \node[os memory, minimum width=24mm] (l10) at (34mm,14mm) {L1 cache\\line X};
+  \node[os compute, minimum width=24mm] (c1) at (0,-14mm) {Core 1\\执行流 B};
+  \node[os memory, minimum width=24mm] (l11) at (34mm,-14mm) {L1 cache\\line X};
+  \node[os memory, minimum width=32mm] (llc) at (82mm,0) {共享 cache/互联\\一致性目录};
+  \node[os memory, minimum width=30mm] (mem) at (128mm,0) {内存控制器\\DRAM};
+  \draw[os strong bus] (c0) -- node[os label, above]{load/store} (l10);
+  \draw[os strong bus] (c1) -- node[os label, below]{load/store} (l11);
+  \draw[os bus] (l10.east) -- node[os label, above]{共享/独占状态} (llc.west);
+  \draw[os bus] (l11.east) -- node[os label, below]{失效/转移所有权} (llc.west);
+  \draw[os strong bus] (llc) -- node[os label, above]{cache line} (mem);
+\end{pdfdiagram}
+\diagramnote{多核共享内存不是多个 CPU 同时改一个平面数组，而是每个核心先操作自己的 cache line 副本，再由一致性协议转移共享或独占所有权。}
+
+\begin{lstlisting}
+counter++ is not one hardware action:
+  load counter
+  add 1 in ALU
+  store counter
+\end{lstlisting}
+
+为解决这种并发更新问题，多核硬件提供原子读改写和 cache 一致性协议，OS 在其上建立锁、引用计数、RCU、per-CPU 数据和调度队列。原子操作的关键不在语法，而在硬件确保某个 cache line 的所有权和更新不可被其他 CPU 插入。
+
+\begin{lstlisting}
+atomic_fetch_add(counter, 1):
+  get exclusive ownership of counter cache line
+  read old value
+  write old value + 1
+  keep other cores from interleaving another write
+\end{lstlisting}
+
+原子操作的成本来自硬件所有权转移。若很多 CPU 同时修改同一个变量，这条 cache line 会在核心之间来回迁移；每个 CPU 都要等待自己取得独占所有权。屏障则规定“发布对象字段”和“发布对象指针”的可见顺序。
+
+把锁放进这个结构看，会更清楚。获取锁通常意味着对锁变量执行原子读改写，硬件要让当前 CPU 取得锁所在 cache line 的独占所有权。释放锁通常是一次带 release 语义的 store，要求临界区里对共享数据的写入先对其他 CPU 可见，再让锁看起来已经释放。另一个 CPU 获取锁时使用 acquire 语义，要求它看到锁已获取后，也能看到前一个持有者发布的数据。锁保护的不是源码括号，而是硬件可见顺序。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+同步动作 & 硬件必须保证什么 & 缺失后果 \\
+\midrule
+原子加 & 读旧值和写新值之间不能插入另一个写者 & 计数丢失、引用计数提前归零 \\
+获取锁 & 获取者之后的读写不能跑到获取之前 & 进入临界区却看不到受保护数据 \\
+释放锁 & 临界区写入不能跑到释放锁之后 & 别的 CPU 看到锁空闲却读到旧数据 \\
+唤醒等待者 & 状态更新先可见，再通知远端 CPU 或线程 & 被唤醒者看不到唤醒原因 \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+多核硬件事实 & 直接问题 & OS 应对方式 \\
+\midrule
+每核私有 cache & 同一数据可能有多个副本 & 一致性协议、cacheline 对齐、per-CPU 数据 \\
+原子读改写要独占 line & 热锁会让 line 在 CPU 间迁移 & queued spinlock、分片计数、减少全局锁 \\
+store buffer 延迟可见 & 源码顺序不等于其他 CPU 观察顺序 & acquire/release、内存屏障、锁语义 \\
+跨核通知靠 IPI & 远端 CPU 需要被打断配合 & TLB shootdown、reschedule IPI、call function \\
+NUMA 访问不等价 & 远端内存更慢，远端设备 DMA 更绕 & 调度亲和性、页迁移、IRQ affinity \\
+\bottomrule
+\end{longtable}
+
+因此，内核经常把“同一件事”拆成每 CPU 状态。全局计数器最直观，但每次更新都要抢同一条 cache line；每 CPU 计数器读起来复杂一些，却能让热写路径留在本地。硬件迫使 OS 在“读时汇总”和“写时争抢”之间做取舍。
+
+只会计算和访问内存的机器仍然是封闭的。真正的计算机还要接入磁盘、网卡、键盘、显示、USB、GPU、传感器和安全芯片。设备通信的最小需求，是把一个字节交给外部设备。
+
+设备不是函数，而是另一个按自己时钟前进的状态机。最小输出设备至少需要两个可观察位置：一个状态位告诉内核“现在能不能收字节”，一个数据槽接收要输出的字节。
+
+可以先把设备想成一台小机器，而不是一个 C 对象。它有自己的状态寄存器、数据寄存器、控制逻辑和外部引脚。CPU 不能直接进入设备内部调用“发送函数”，只能通过总线读写设备暴露出来的寄存器窗口。CPU 写入数据寄存器，只是把一个命令放到设备边界上；设备什么时候真正把 bit 送到线缆、屏幕或控制器外部，由设备自己的状态机决定。
+
+\begin{lstlisting}
+minimal output device:
+  status slot:
+    READY = 1 means device can accept one byte
+  data slot:
+    writing a byte starts device-side output work
+\end{lstlisting}
+
+从结构上看，这个设备内部至少也有保存状态的寄存器。状态寄存器保存 \code{READY}、\code{BUSY}、\code{ERR}；数据寄存器保存 CPU 写进来的字节；设备自己的控制逻辑在另一套时钟下把数据送到外部世界；完成后再把 \code{READY} 置回 1，或在失败时置 \code{ERR}。CPU 看见的不是设备内部所有细节，而是 MMIO 暴露出来的这些状态窗口。
+
+\begin{pdfdiagram}[scale=0.84]
+  \node[os compute, minimum width=25mm] (cpu) at (0,8mm) {CPU\\load/store};
+  \node[os control, minimum width=27mm] (mmio) at (38mm,8mm) {MMIO 地址窗口\\状态/数据槽};
+  \node[os state, minimum width=27mm] (status) at (80mm,20mm) {状态寄存器\\READY/ERR};
+  \node[os state, minimum width=27mm] (data) at (80mm,-3mm) {数据寄存器\\byte};
+  \node[os compute, minimum width=28mm] (logic) at (118mm,8mm) {设备控制逻辑\\发送/完成/失败};
+  \node[os control, minimum width=24mm] (event) at (154mm,8mm) {事件输出\\状态或 IRQ};
+  \draw[os strong bus] (cpu) -- node[os label, above]{物理地址事务} (mmio);
+  \draw[os bus] (mmio.east) |- node[os label, above left]{读} (status.west);
+  \draw[os strong bus] (mmio.east) |- node[os label, below left]{写} (data.west);
+  \draw[os strong bus] (data.east) -- (logic.west);
+  \draw[os feedback] (logic.north) -- node[os label, above]{更新 ready/err} (status.east);
+  \draw[os feedback] (logic.east) -- node[os label, above]{完成/失败} (event.west);
+\end{pdfdiagram}
+\diagramnote{设备寄存器不是普通变量，而是 CPU 和设备状态机之间的边界。CPU 写数据寄存器只是启动设备侧动作，完成和失败要靠设备后来更新状态或发出事件。}
+
+\code{output\_one\_byte('A')} 因此可以具体化为：
+
+\begin{lstlisting}
+output_one_byte('A'):
+  while load(DEVICE_STATUS).READY == 0:
+    keep waiting or check timeout
+  store(DEVICE_DATA, 'A')
+\end{lstlisting}
+
+这里的 \code{load} 和 \code{store} 形式上像访问内存，但目标不是普通 RAM，而是设备暴露出来的状态槽。CPU 的地址生成、权限检查和总线事务仍然存在；只是物理地址译码发现目标落在设备 BAR，而不是落在 DRAM。把设备状态槽放进地址空间，让 CPU 用普通 load/store 指令访问，这种方式叫 memory-mapped I/O，简称 MMIO。MMIO 的关键在于访问规则不同：读状态可能有副作用，写数据可能启动设备动作，访问顺序也不能随意缓存和重排。
+
+这一步把前面的内存路径改了一点：虚拟地址仍先经页表翻译成物理地址，但物理地址不一定通往 DRAM。平台地址译码会判断这段物理地址属于普通内存、固件保留区，还是某个设备 BAR。若落在设备 BAR，请求会经过片上互联或 PCIe root complex 到设备，而不是进入内存控制器。于是同样是 \code{store} 指令，写普通内存的含义是“更新某个 cache line”，写 MMIO 的含义是“向设备寄存器发出一个有顺序的事务”。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+访问目标 & 结构路径 & 语义差异 \\
+\midrule
+普通 RAM & CPU store -> cache -> 内存控制器 -> DRAM & 可缓存、可合并、可稍后写回 \\
+设备 BAR & CPU store -> 不可普通缓存映射 -> root complex/总线 -> 设备寄存器 & 可能启动动作，顺序和宽度由设备手册规定 \\
+设备状态读 & CPU load -> 总线读请求 -> 设备返回状态寄存器 & 读到的是设备当前状态，可能有副作用 \\
+\bottomrule
+\end{longtable}
+
+这段代码可以按硬件时序展开。假设 \code{DEVICE_STATUS} 和 \code{DEVICE_DATA} 都落在同一个设备 BAR 内，且这段地址被内核映射成不可普通缓存的 MMIO 区间。CPU 每次执行 \code{load(DEVICE_STATUS)}，都会形成一次到设备的读事务；设备返回当前状态寄存器的值。若 \code{READY=0}，CPU 继续循环或检查超时计数。若 \code{READY=1}，CPU 执行 \code{store(DEVICE_DATA, 'A')}，这次写事务到达设备数据寄存器，设备控制逻辑把它解释成“开始输出这个字节”。
+
+\begin{longtable}{p{0.16\linewidth}p{0.42\linewidth}p{0.3\linewidth}}
+\toprule
+步骤 & 硬件路径 & 驱动必须记住什么 \\
+\midrule
+读状态地址 & CPU 发起 MMIO read，地址译码到设备 BAR & 读到的是设备当前状态，不是普通变量副本 \\
+看到 busy & \code{READY=0}，设备状态机还没准备好 & 不能无限空转，要有超时或让出 CPU \\
+看到 ready & \code{READY=1}，数据寄存器可接收 & 下一步写数据才有意义 \\
+写数据地址 & CPU 发起 MMIO write，字节进入设备数据寄存器 & 写入顺序就是设备命令顺序 \\
+设备开始工作 & 设备清 \code{READY}，按自己时钟输出字节 & CPU 不再控制每一个外部 bit \\
+完成或失败 & 设备置 \code{READY} 或 \code{ERR}，也可能发 IRQ & 驱动必须重新读状态确认结果 \\
+\bottomrule
+\end{longtable}
+
+这也解释了为什么驱动代码里常见 \code{readl}、\code{writel} 这类专门接口，而不是随便拿普通指针读写。普通内存读写可以被编译器和 CPU 缓存、合并或重排；MMIO 读写是和外部状态机对话。把 \code{DEVICE_STATUS} 缓存在普通变量里，循环就可能永远看不到设备后来置回的 \code{READY}；把两个 MMIO 写重排，设备可能先收到“启动”，后收到“描述符地址”，请求就会乱掉。
+
+\begin{pdfdiagram}
+  \node[os compute, minimum width=25mm] (cpu) at (0,12mm) {CPU\\load/store};
+  \node[os control, minimum width=28mm] (decode) at (37mm,12mm) {地址译码\\RAM 或 MMIO};
+  \node[os memory, minimum width=27mm] (ram) at (78mm,23mm) {普通内存\\可缓存};
+  \node[os control, minimum width=27mm] (bar) at (78mm,0mm) {设备 BAR\\不可普通缓存};
+  \node[os state, minimum width=26mm] (status) at (118mm,10mm) {状态寄存器\\READY/ERR};
+  \node[os state, minimum width=26mm] (data) at (118mm,-12mm) {数据寄存器\\写入启动动作};
+  \draw[os strong bus] (cpu) -- (decode);
+  \draw[os bus] (decode) -- node[os label, above]{物理地址落在 RAM} (ram);
+  \draw[os strong bus] (decode) -- node[os label, above]{物理地址落在 BAR} (bar);
+  \draw[os bus] (bar.east) -- (status.west);
+  \draw[os strong bus] (bar.east) |- (data.west);
+\end{pdfdiagram}
+\diagramnote{MMIO 是把设备寄存器放进地址空间，但它不是普通 RAM；同样的 load/store 到了设备 BAR 后，语义变成读取状态或向设备状态机下命令。}
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+需求增长 & 推出的机制 & OS 立刻遇到的问题 \\
+\midrule
+读设备是否 ready & 设备状态寄存器 & 轮询不能无限等，必须有超时和错误证据 \\
+交给设备一个字节 & 设备数据寄存器 & 写入顺序就是命令顺序，不能按普通内存优化 \\
+设备太慢 & 中断或可睡眠等待 & 线程不能一直空转，要能睡眠和被唤醒 \\
+设备有很多请求 & 队列和 completion & 完成事件必须能找回原请求 \\
+数据太大 & 描述符和设备侧搬运 & buffer 归属和生命周期必须明确 \\
+\bottomrule
+\end{longtable}
+
+如果设备很快，轮询状态位的成本尚可接受；如果设备很慢，CPU 一直转圈等待会浪费执行资源。随之产生的需求是“设备完成时能通知内核”。硬件可以让设备或中断控制器发出 interrupt request，简称 IRQ；CPU 在指令边界进入中断入口，内核再读取设备状态，确认到底哪个请求完成或失败。中断不是设备调用内核函数，它只是让 CPU 进入一个受控入口，真正的解释仍由驱动完成。
+
+从轮询到中断，本质上是把“谁负责反复查看状态”换了一种方式。轮询时，CPU 主动一遍遍读状态寄存器；中断时，驱动先提交请求并让当前线程睡眠，设备完成后制造一个硬件事件，CPU 进入中断入口，驱动再读状态寄存器或 completion 队列，最后唤醒等待者。完成事实仍然来自设备状态或 completion，不来自“中断已经发生”这件事本身。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+等待方式 & 硬件动作 & 适用边界 \\
+\midrule
+忙轮询 & CPU 不断发 MMIO read，看状态位变化 & 延迟低，但占用 CPU \\
+带超时轮询 & CPU 周期性读取状态，同时检查时间边界 & 防止坏设备让内核永远等 \\
+中断等待 & 设备完成后投递 IRQ，CPU 进入中断入口 & 省 CPU，但需要处理中断顺序和丢失事件 \\
+队列 completion & 设备写 completion 项，驱动按 tag 找回请求 & 适合并发请求和批量 I/O \\
+\bottomrule
+\end{longtable}
+
+如果一次只输出一个字节，CPU 自己写数据槽尚可接受；如果要读写磁盘块、网络包或显存区域，逐字节搬运会大量占用执行资源。随之产生的需求是“让设备按一批描述符自己搬大块数据”。这种直接内存访问叫 DMA，direct memory access。DMA 的风险也随之出现：设备不再只是被 CPU 读写状态槽，它也能主动读写内存。因此内核必须建立映射、限制设备能访问哪些 buffer，并在完成后撤销映射。约束设备访问范围的硬件叫 IOMMU。
+
+从单字节设备过渡到队列设备，是因为“状态位 + 数据槽”一次只能表达一个很小的动作。磁盘读一个 4KiB 块、网卡接收一个包、NVMe 同时处理上千个请求，都需要把“要访问哪里、长度多少、方向是什么、完成后找谁”写成结构化记录。这个记录就是 descriptor。多个 descriptor 排成 submission queue；设备处理完后把结果写到 completion queue。doorbell 寄存器的作用不是传数据，而是告诉设备队列尾指针已经推进，可以去普通内存里读 descriptor 了。
+
+\begin{longtable}{p{0.15\linewidth}p{0.43\linewidth}p{0.3\linewidth}}
+\toprule
+单字节模型 & 队列模型中的对应物 & 为什么需要升级 \\
+\midrule
+ready 状态位 & submission/completion queue 的 head、tail 和 phase & 多个请求不能只靠一个 ready bit 表达 \\
+数据槽 & 内存中的 descriptor 和 buffer & 大块数据不能逐字节写 MMIO \\
+写入启动 & 写 doorbell 通知设备读队列 & 命令和数据分离，减少 MMIO 次数 \\
+完成状态 & completion 项或 MSI-X 中断 & 完成必须带 tag，才能找回具体请求 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+modern queued device path:
+  CPU maps device registers as MMIO
+  driver allocates queue and DMA buffers
+  CPU writes descriptors in RAM
+  CPU writes MMIO doorbell
+  device DMA-reads descriptors
+  device DMA-writes data or completion
+  device sends MSI-X interrupt
+  kernel handler finds the completed request
+\end{lstlisting}
+
+由此形成驱动模型。驱动要发现设备、保留资源、映射 MMIO、分配 IRQ、设置 DMA mask、加入 IOMMU domain、管理队列、处理 reset 和热插拔。若没有 IOMMU，设备 DMA 错地址可能覆盖任意内存；若 completion 前释放 buffer，迟到 DMA 会写坏新对象；若中断处理顺序错，可能丢中断或中断风暴。
+
+把一条现代队列请求走完整，会看到更多必须保持的顺序。驱动先在普通内存里准备 descriptor，里面放 DMA 地址、长度、方向和 request tag；再确保 descriptor 和 buffer 内容已经对设备可见；然后写 MMIO doorbell。doorbell 不是数据本身，它只是告诉设备“队列尾部推进了，请来读”。设备随后 DMA 读取 descriptor，经 IOMMU 把 IOVA 翻译成物理地址，再读写 buffer。完成后，设备写 completion 项，通常还会发 MSI-X 中断。内核中断处理函数不能只看 vector 就认为请求完成，它还要读 completion，按 tag 找回原请求，再做 cache 同步、unmap 和唤醒。
+
+\begin{longtable}{p{0.14\linewidth}p{0.43\linewidth}p{0.31\linewidth}}
+\toprule
+阶段 & 结构路径 & 乱序或遗漏的后果 \\
+\midrule
+准备缓冲区 & CPU 写普通内存，必要时 pin 页或分配 DMA buffer & buffer 无效会导致 DMA 越界或写坏对象 \\
+建立映射 & DMA API/IOMMU 建立 \code{IOVA -> PA} 和方向权限 & 设备可能访问不到页，或访问不该访问的页 \\
+写描述符 & CPU 在提交队列写地址、长度、tag、flags & 设备读到旧 descriptor 会执行旧请求 \\
+敲门铃 & CPU 对 MMIO BAR 写队列尾指针或命令 & posted write 可能稍后才到设备 \\
+设备 DMA & 设备经 IOMMU 读 descriptor、读写 buffer & 映射或方向错会触发 IOMMU fault 或数据损坏 \\
+写完成项 & 设备把结果、tag、状态写回 completion ring & tag 复用过早会唤醒错请求 \\
+发现完成 & CPU 进入 IRQ 或轮询到新 completion & 必须再查 completion，不能只信 vector \\
+回收请求 & 驱动同步 cache、unmap、释放页并唤醒等待者 & 过早释放会遇到迟到 DMA \\
+\bottomrule
+\end{longtable}
+
+这一整条链路里，普通内存、MMIO、IOMMU 页表、设备内部队列和中断控制器都参与了同一个请求。驱动 bug 往往不是“少写一行寄存器”，而是某个结构边界的所有权或顺序没有讲清楚：descriptor 还没对设备可见就敲 doorbell，completion 没确认就释放 buffer，unmap 后设备还拿着旧 IOTLB 翻译继续 DMA。
+
+\begin{pdfdiagram}
+  \node[os compute, minimum width=25mm] (cpu) at (0,18mm) {CPU/驱动\\填描述符};
+  \node[os memory, minimum width=30mm] (sq) at (42mm,18mm) {内存队列\\descriptor};
+  \node[os control, minimum width=27mm] (door) at (42mm,-7mm) {MMIO doorbell\\通知设备};
+  \node[os compute, minimum width=27mm] (dev) at (86mm,6mm) {设备控制器\\队列状态机};
+  \node[os memory, minimum width=28mm] (iommu) at (128mm,18mm) {IOMMU\\IOVA->PA};
+  \node[os memory, minimum width=28mm] (buf) at (128mm,-7mm) {DMA buffer\\数据页};
+  \node[os control, minimum width=26mm] (irq) at (0,-22mm) {MSI-X/IRQ\\完成事件};
+  \draw[os strong bus] (cpu) -- node[os label, above]{普通内存写} (sq);
+  \draw[os bus] (cpu.south east) -- node[os label, below left]{MMIO 写} (door.west);
+  \draw[os strong bus] (door.east) -- node[os label, above]{启动} (dev.west);
+  \draw[os strong bus] (dev.north east) -- node[os label, above]{DMA 读描述符} (iommu.west);
+  \draw[os strong bus] (iommu.south) -- node[os label, right]{检查并翻译} (buf.north);
+  \draw[os bus] (dev.south) -- ++(0,-18mm) -| node[os label, near end, above]{完成事件} (irq.east);
+  \draw[os feedback] (irq.north) -- node[os label, left]{进入内核入口} (cpu.south);
+\end{pdfdiagram}
+\diagramnote{现代设备请求跨过普通内存、MMIO、设备队列、IOMMU、DMA buffer 和中断入口；驱动管理的是这条结构路径上的所有权和顺序，而不是单独写一个寄存器。}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+设备事务细节 & 它意味着什么 & 驱动必须怎么处理 \\
+\midrule
+MMIO read 有副作用 & 读状态可能清位或弹出队列 & 用专门访问函数，按手册读写 \\
+MMIO posted write & 写 doorbell 返回不等于设备已处理 & 需要屏障或读回形成排序点 \\
+MSI-X 是消息写入 & 设备可把中断投递到不同 vector/CPU & 配置队列亲和性和中断亲和性 \\
+completion ring 复用槽位 & 同一个数组格会多轮使用 & phase、generation 或 ownership 位防止误读旧完成 \\
+设备 reset 不取消物理事实 & 迟到 DMA 或旧中断仍可能出现 & quiesce、mask IRQ、等待 in-flight、撤销映射 \\
+\bottomrule
+\end{longtable}
+
+PCIe 设备还涉及一个基本事实：CPU 对设备 BAR 的写入通常会变成 PCIe posted write，也就是写事务发出去后 CPU 可以继续执行；而 MMIO read 通常要等设备或 root complex 返回 completion。这个差异会直接影响驱动里的排序。
+
+\begin{lstlisting}
+MMIO write doorbell:
+  CPU store to uncached BAR mapping
+  root complex emits PCIe posted write
+  device receives command later
+
+MMIO read status:
+  CPU load from BAR mapping
+  root complex emits PCIe read request
+  CPU waits for completion data
+\end{lstlisting}
+
+驱动并不只是“写几个寄存器”。它管理的是 CPU、设备、IOMMU、中断控制器和内存之间的并发协议。一次请求只有在 descriptor 可见、doorbell 有序、DMA 映射有效、completion 被确认、unmap 完成之后，才真正回到内核可释放状态。
+
+当计算、内存、隔离、多核、设备和 DMA 都出现后，机器就不再是几个孤立部件，而是一整个平台。现代硬件通常包含多核 CPU、私有和共享 cache、TLB、内存控制器、NUMA 节点、PCIe root complex、IOMMU、中断控制器、NVMe、网卡、GPU、USB 控制器、TPM、固件和电源管理单元。它们每个都有寄存器、队列、权限和错误状态。
+
+\begin{pdfdiagram}[scale=0.84]
+  \node[os compute, minimum width=28mm] (core0) at (0,18mm) {CPU core 0\\寄存器/TLB/L1};
+  \node[os compute, minimum width=28mm] (core1) at (0,-8mm) {CPU core 1\\寄存器/TLB/L1};
+  \node[os memory, minimum width=30mm] (llc) at (42mm,5mm) {共享 cache\\一致性互联};
+  \node[os memory, minimum width=31mm] (mc) at (84mm,18mm) {内存控制器\\DRAM/ECC};
+  \node[os control, minimum width=31mm] (rc) at (84mm,-8mm) {PCIe root complex\\地址路由};
+  \node[os memory, minimum width=29mm] (iommu) at (128mm,5mm) {IOMMU\\设备页表};
+  \node[os compute, minimum width=26mm] (dev1) at (156mm,20mm) {NVMe/网卡\\DMA 队列};
+  \node[os control, minimum width=26mm] (intc) at (156mm,-7mm) {中断控制器\\vector/EOI};
+  \node[os control, minimum width=27mm] (fw) at (128mm,-28mm) {固件/ACPI\\发现与电源};
+  \draw[os strong bus] (core0.east) -- (llc.west);
+  \draw[os strong bus] (core1.east) -- (llc.west);
+  \draw[os strong bus] (llc.east) -- (mc.west);
+  \draw[os bus] (llc.east) -- (rc.west);
+  \draw[os strong bus] (rc.east) -- (iommu.west);
+  \draw[os strong bus] (iommu.east) -- (dev1.west);
+  \draw[os feedback] (dev1.south) -- node[os label, right]{MSI-X} (intc.north);
+  \draw[os feedback] (intc.west) -- node[os label, below]{投递到 CPU} (core1.south east);
+  \draw[os bus] (fw.north) -- node[os label, right]{描述资源} (rc.south);
+\end{pdfdiagram}
+\diagramnote{现代平台是一张互联结构图。OS 管理 task、地址空间、驱动和恢复路径时，实际是在维护 CPU 状态、内存翻译、设备 DMA、中断投递和固件描述之间的契约。}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+现代硬件块 & 主要接口 & OS 要维护的契约 \\
+\midrule
+CPU core & ISA、异常、中断、控制寄存器 & task、trap frame、系统调用、调度 \\
+cache/TLB/MMU & load/store、PTE、TLB entry & 地址空间、COW、shootdown、cache 属性 \\
+互联/NUMA & cache line、内存节点、远端访问 & 亲和性、页分配、负载均衡 \\
+PCIe 设备 & BAR、MSI-X、DMA queue & probe、driver、IRQ、request lifecycle \\
+IOMMU & IOVA、domain、IOTLB & DMA 隔离、VFIO、unmap 安全 \\
+存储设备 & submission/completion queue、flush/FUA & page cache、块层、fsync、崩溃恢复 \\
+安全硬件 & NX、SMEP/SMAP、TPM、Secure Boot & 隔离、启动信任链、最小权限 \\
+\bottomrule
+\end{longtable}
+
+这条链路至此形成闭环：计算需求对应 ALU；保存和选择下一步对应寄存器、程序计数器和 CPU；多程序共存对应特权、异常、MMU 和页表；访问加速对应 TLB、cache 和内存层次；多个执行流并行对应一致性、原子指令和跨核通知；设备通信对应 MMIO、中断、队列和 DMA；设备隔离和启动可信性则对应 IOMMU 和安全硬件。OS 要管理的，正是这些状态、权限、等待和失败边界。
+
+真实硬件会失败：DRAM 有 ECC 错误，PCIe 有 AER 错误，NVMe 请求会超时，网卡可能 reset，CPU 可能收到机器检查异常，电源管理会让设备暂时不可访问。OS 必须覆盖这些非正常路径，才能在长期运行中保持可解释状态。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+硬件错误来源 & 硬件留下的证据 & OS 恢复方向 \\
+\midrule
+CPU machine check & 错误 bank、地址、严重级别 & 隔离页、杀进程、panic 或降级 \\
+DRAM ECC & 可纠正/不可纠正错误地址 & page offline、内存巡检、故障统计 \\
+PCIe AER & 设备、链路、事务错误码 & reset 设备、重建队列、上报驱动 \\
+NVMe timeout & request tag、队列状态、控制器状态 & abort、reset controller、失败请求 \\
+中断丢失或风暴 & pending/in-service/mask 状态异常 & mask、轮询、清设备状态、EOI 顺序修正 \\
+电源状态切换 & suspend/resume、reset、clock 状态 & 保存/恢复寄存器，停止和恢复 DMA \\
+\bottomrule
+\end{longtable}
+
+恢复路径的核心是不变量：停止新请求，找出 in-flight 请求，阻止设备继续 DMA，撤销或重建映射，清理 completion，恢复寄存器和队列，再决定重试还是向上层报错。文件系统、网络和块层保存 request tag、引用计数和超时状态，目的就是在硬件偏离正常路径时把系统拉回可解释状态。
+
+把这些硬件块放回一个小程序里，主线会更清楚。考虑下面这段代码：
+
+\begin{lstlisting}
+long sum_and_output(int *a, long n, int fd) {
+  long s = 0;
+
+  for (long i = 0; i < n; ++i) {
+    s += a[i];
+  }
+
+  unsigned char out = (unsigned char)s;
+  write(fd, &out, 1);
+  return s;
+}
+\end{lstlisting}
+
+源码只有一个循环和一次输出，但硬件不会看到“遍历数组”和“写文件描述符”这两个高层动作。硬件先看到的是函数入口处的一组寄存器参数：\code{a} 是一个虚拟地址，\code{n} 是循环上界，\code{fd} 是一个整数。循环变量 \code{i} 和累加器 \code{s} 可能放在通用寄存器里；每轮循环用地址生成单元算出 \code{a + i * 4}；load 指令把这个虚拟地址交给 MMU；ALU 把读回的整数加到 \code{s}；分支单元比较 \code{i} 和 \code{n}，决定下一 PC 回到循环开头还是继续向下执行。
+
+\begin{longtable}{p{0.16\linewidth}p{0.43\linewidth}p{0.29\linewidth}}
+\toprule
+程序片段 & 硬件结构路径 & 关键边界 \\
+\midrule
+函数入口 & 调用约定把 \code{a}、\code{n}、\code{fd} 放进寄存器或栈，PC 指向函数第一条指令 & OS 切换任务时必须保存这些软件可见状态 \\
+循环地址计算 & 寄存器文件给出 \code{a} 和 \code{i}，ALU/地址生成单元计算元素地址 & 地址仍是虚拟地址，还没有证明可读 \\
+读取 \code{a[i]} & TLB 查翻译，必要时 page walk；权限通过后访问 cache、下级 cache 或 DRAM & TLB miss 只是慢；PTE 不存在或权限失败才进入内核 \\
+累加 \code{s} & ALU 计算新和，寄存器写回在提交边界发生 & 异常或中断不能把半提交结果暴露给程序 \\
+循环分支 & 比较单元设置条件，下一 PC 选择循环开头或退出路径 & 分支预测可提前取指，但猜错必须丢弃错误路径 \\
+形成 \code{out} & 低 8 bit 被写到栈上或寄存器中的临时位置 & \code{\&out} 是用户虚拟地址，不是设备地址 \\
+调用 \code{write} & 系统调用入口切到内核，内核检查 \code{fd} 和用户地址 & 用户参数不可信，必须转成内核对象和已验证地址 \\
+设备输出 & 可能复制到内核 buffer，再走 MMIO 状态/数据寄存器，或走队列、DMA 和 completion & 返回值、设备完成和持久化边界不是同一个概念 \\
+\bottomrule
+\end{longtable}
+
+现在把同一个循环放到几种硬件路径下对比。若数组刚被顺序访问过，\code{a[i]} 所在页的翻译可能在 TLB 中，目标 cache line 也可能在 L1 data cache 中。此时每轮循环主要消耗取指、译码、地址生成、L1 load、整数加法和分支预测。OS 不接管，用户程序只觉得循环很快。
+
+若数组很大并且第一次扫描，路径会变长。第一次碰到某个虚拟页时，TLB 可能 miss；page walker 按当前页表基址读取多级页表，填入 TLB；目标数据不在 cache 时，内存请求继续走 L2、L3、内存控制器，可能还要跨 NUMA 互联到远端内存节点。硬件仍然不需要内核参与，因为页表允许访问；只是执行单元会等待更久，性能计数里会看到 TLB miss、cache miss 或远端内存访问。
+
+若 \code{a[i]} 落在 \code{mmap} 后尚未装入的文件页上，事情才进入 OS。page walker 发现 PTE 不 present，CPU 保存 fault address、错误码和 faulting RIP，进入缺页异常入口。内核查 VMA，确认这个地址属于合法文件映射，于是分配物理页、向文件系统或块层读入内容、安装 PTE，并返回原来的 load 指令重新执行。用户代码仍然只是写了一次 \code{s += a[i]}，但第一次访问某页时，硬件和 OS 共同把“还没有物理页”补成了“现在可以读取”。
+
+\begin{longtable}{p{0.18\linewidth}p{0.41\linewidth}p{0.29\linewidth}}
+\toprule
+同一轮循环的情况 & 实际路径 & 读者应该抓住什么 \\
+\midrule
+TLB 和 L1 都命中 & 地址翻译和数据都在核心附近，load 很快返回 & cache/TLB 是性能路径，OS 通常不出现 \\
+TLB miss、PTE 有效 & 硬件 page walk 读取页表，填 TLB 后继续执行 & TLB miss 不等于 page fault \\
+cache miss、权限通过 & 数据请求走下级 cache、DRAM 或远端 NUMA 节点 & 这是慢访问，不是权限失败 \\
+PTE 不 present & CPU 进入缺页异常，内核根据 VMA 补页后重试 & 懒分配和文件映射依赖精确异常 \\
+PTE 不允许写或执行 & CPU 在提交前进入保护异常 & COW、安全隔离和 NX 都靠权限位拦截 \\
+定时器中断插入 & CPU 在指令边界保存现场进入内核，调度器可能换任务 & 循环没有主动让出 CPU，硬件定时器提供抢占边界 \\
+\bottomrule
+\end{longtable}
+
+这个例子还说明“性能”和“语义”要分开读。分支预测、cache 命中、预取和乱序执行影响循环快慢；页表权限、异常现场、提交边界和系统调用入口决定程序是否合法、能否恢复、能否隔离。OS 可以利用性能结构，例如调度器尽量保持 cache 热度，页分配器考虑 NUMA；但 OS 的正确性不能建立在“这次应该会命中 cache”上。正确性必须建立在页表权限、特权级、精确异常、设备 completion 和可恢复现场这些硬边界上。
+
+最后看 \code{write(fd, \&out, 1)}。这里的 \code{\&out} 不是设备数据寄存器地址，而是当前用户栈上的一个虚拟地址。系统调用入口只把这个地址作为不可信参数带入内核；内核必须先用文件表把 \code{fd} 转成 file 对象，再安全地从用户地址复制 1 个字节。如果这个 \code{fd} 指向普通文件，字节可能先进 page cache；如果它指向终端或串口，驱动可能轮询 MMIO 状态寄存器并写数据寄存器；如果它指向高速设备，内核可能把请求排到队列里，等待 DMA completion。一个统一的 \code{write} 接口背后，硬件路径取决于文件对象、内存属性、设备队列和完成语义。
+
+从单字节输出推到现代平台之后，还要把几个关键路径压实。没有可恢复的执行现场，地址翻译、设备中断和 DMA 都无法接入 OS 主线；没有权限和事件证据，内核也无法判断一个动作是可重试、应报错，还是必须停止设备。
+
+\section{二、CPU 执行、寄存器和特权入口}
+
+上一节把固定数据通路推到了“能按指令选择动作”的机器。到了这一步，OS 最关心的不是 ALU 能算多快，而是两个更硬的事实：当前执行流能不能被暂停后恢复，用户代码能不能只从受控入口进入内核。进程切换、系统调用、缺页异常、中断和信号，全部压在这两个事实上。
+
+先看一行普通 C 代码：
+
+\begin{lstlisting}
+x = a[i] + 1;
+\end{lstlisting}
+
+从源码看，它像一个整体动作；从硬件看，它早已被拆成若干条指令：取出 \code{a} 和 \code{i}，计算地址，读取 \code{a[i]}，加一，再把结果写回 \code{x}。如果读取 \code{a[i]} 时缺页，失败点不是“这一行 C 代码中间某处”，而是某条 load 指令。硬件必须告诉内核：哪条指令失败，访问哪个地址，失败原因是什么，哪些更早的结果已经提交，哪些更晚的猜测结果必须丢弃。
+
+\begin{lstlisting}
+possible instruction-level shape:
+  addr = a + i * sizeof(a[0])
+  tmp  = load [addr]       // may fault here
+  tmp  = tmp + 1
+  store [x], tmp           // may fault here too
+\end{lstlisting}
+
+把这件事再具体一点。假设有一个函数：
+
+\begin{lstlisting}
+int bump(int *a, long i, int *x) {
+  int t = a[i] + 1;
+  *x = t;
+  return t;
+}
+\end{lstlisting}
+
+按照常见 64 位调用约定，进入函数时可能是：\code{rdi} 保存 \code{a}，\code{rsi} 保存 \code{i}，\code{rdx} 保存 \code{x}。若 \code{a = 0x600000}，\code{i = 3}，\code{x = 0x700000}，并且 \code{int} 占 4 字节，那么 \code{a[i]} 的虚拟地址就是 \code{0x600000 + 3 * 4 = 0x60000c}。CPU 不知道这是数组第 3 个元素，它只看到一次地址生成、一次 load、一次整数加法和一次 store。
+
+\begin{longtable}{p{0.16\linewidth}p{0.38\linewidth}p{0.34\linewidth}}
+\toprule
+机器动作 & 具体状态变化 & 失败边界 \\
+\midrule
+读参数寄存器 & \code{rdi=0x600000}，\code{rsi=3}，\code{rdx=0x700000} & 参数值本身来自调用者，硬件不懂 C 类型 \\
+地址生成 & 地址生成单元计算 \code{0x60000c} & 这一步通常只是得到一个 bit 模式，还没检查页表 \\
+读取数组元素 & MMU 检查 \code{0x60000c}，cache 或内存返回 4 字节 & 若页不存在或不可读，异常发生在写回结果之前 \\
+整数加一 & ALU 把读出的值加 1，并产生候选结果 & ALU 结果还没有改变 \code{x} 指向的内存 \\
+写回 \code{*x} & MMU 检查 \code{0x700000}，store 把结果写入目标地址 & 若目标页不可写，异常发生在 store 提交前 \\
+返回值 & 返回寄存器保存同一个结果，下一 PC 回到调用者 & 调用者只看见已提交的寄存器和内存状态 \\
+\bottomrule
+\end{longtable}
+
+这张表的重点是“同一行 C 代码”在机器里有多个可观察边界。若数组读取缺页，\code{*x} 还不能被修改；若写 \code{*x} 时触发 COW，数组读取和加法可以已经完成，但目标 store 还不能提交；若定时器中断正好打在加法和 store 之间，内核保存的现场必须足以让 CPU 将来回到 store 之前继续执行。读机器级程序时，要把源码动作不断压到寄存器、地址、cache、页表和提交边界上，而不是停在“执行这一行”。
+
+这个例子先排除一个常见误解：CPU 不在执行 C 语句，而是在执行指令流。程序计数器指向下一条指令；通用寄存器保存整数、地址和临时值；状态寄存器保存条件码、中断使能、当前特权级等控制位；栈指针指向当前调用栈。OS 所谓“保存现场”，保存的就是这组软件可见状态。若少保存一个用户程序还会使用的寄存器，恢复后程序就会在看似随机的位置算错。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+硬件状态 & 在执行中的作用 & OS 关心点 \\
+\midrule
+程序计数器 & 指向下一条或当前异常指令 & 中断、异常、调度后从哪里继续 \\
+栈指针 & 指向当前栈顶 & 用户栈和内核栈必须分开管理 \\
+通用寄存器 & 保存参数、地址和临时值 & 系统调用参数、返回值、上下文保存 \\
+状态寄存器 & 保存特权级、中断位、标志位 & 返回用户态前必须恢复正确权限 \\
+控制寄存器 & 指向页表、控制地址翻译和中断 & 只有内核能修改关键控制状态 \\
+浮点/向量寄存器 & 保存浮点和 SIMD 计算状态 & 状态很大，切换、信号和惰性保存要谨慎处理 \\
+\bottomrule
+\end{longtable}
+
+从结构上看，CPU 同时维护两类状态。第一类是软件可见的架构状态：通用寄存器、RIP、RFLAGS、栈指针、页表基址和特权级。第二类是软件不可直接命名的内部状态：流水线寄存器、重排序缓冲、store buffer、分支预测器、cache 和 TLB。OS 切换任务时保存第一类状态；第二类状态通常由硬件自然清空、保留或按控制指令失效。这个区分解释了为什么“上下文切换”不是把 CPU 内部所有东西都倒出来保存。
+
+取指、译码和执行不是记忆用的分类，而是硬件实现上的自然分工。取指单元只关心 RIP、指令 cache 和下一条地址；译码单元把二进制指令解释成内部控制信号；执行单元使用 ALU、分支单元、load/store 单元或浮点/SIMD 单元完成动作。把这些职责分开，CPU 才能流水化、预测和并行发射。
 
 \begin{lstlisting}
 front end:
@@ -43,26 +1103,21 @@ back end:
 
 OS 关心这种划分有三个原因。第一，异常通常在执行或访存阶段才发现，但必须回报给架构层一个精确 RIP。第二，指令 cache、数据 cache 和 TLB 的冷热会影响系统调用、上下文切换和缺页性能。第三，分支预测和乱序执行虽然不改变正常架构语义，却会影响安全隔离和侧信道防护。
 
-\subsection{寄存器为什么不只是变量}
-
-寄存器是 CPU 中软件可见的最快状态。普通变量可以在内存里，也可以被编译器临时放进寄存器；但寄存器本身属于架构状态，上下文切换、中断返回、系统调用 ABI 都要明确处理。若内核切换线程时漏保存一个被用户程序依赖的寄存器，用户程序会在看似随机的位置计算错误。
-
-\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
-\toprule
-寄存器类别 & 例子 & OS 影响 \\
-\midrule
-通用寄存器 & 参数、返回值、临时整数 & trap frame、系统调用参数、上下文切换 \\
-栈指针 & 用户栈和内核栈位置 & 特权切换必须换到可信内核栈 \\
-程序计数器 & 下一条或异常指令地址 & 信号、调试、异常恢复 \\
-状态寄存器 & 中断位、条件码、模式位 & 返回用户态前必须恢复受控状态 \\
-控制寄存器 & 页表基址、MMU 开关、系统控制 & 只能由内核或更高特权层修改 \\
-向量/浮点寄存器 & SIMD、浮点状态 & 惰性保存、信号帧、ABI 兼容 \\
-\bottomrule
-\end{longtable}
-
-浮点和 SIMD 寄存器尤其说明“保存上下文”并不免费。它们数量多、宽度大，频繁保存会拖慢切换；惰性保存又要处理异常、信号和内核使用 SIMD 的边界。现代内核通常谨慎限制内核态浮点/SIMD 使用，原因不是风格，而是上下文状态太大。
-
-\subsection{特权级、异常和系统调用}
+\begin{pdfdiagram}
+  \node[os control, minimum width=30mm] (fe) at (0,12mm) {前端\\取指/预测/译码};
+  \node[os state, minimum width=29mm] (sched) at (42mm,12mm) {调度/重命名\\微操作队列};
+  \node[os compute, minimum width=31mm] (be) at (84mm,12mm) {后端执行\\ALU/branch/load/store};
+  \node[os memory, minimum width=29mm] (mem) at (84mm,-12mm) {cache/TLB\\数据和翻译};
+  \node[os state, minimum width=29mm] (rob) at (128mm,12mm) {提交队列\\按序提交};
+  \node[os control, minimum width=29mm] (trap) at (128mm,-12mm) {异常入口\\精确现场};
+  \draw[os strong bus] (fe) -- node[os label, above]{微操作} (sched);
+  \draw[os strong bus] (sched) -- node[os label, above]{可执行操作} (be);
+  \draw[os strong bus] (be.south) -- node[os label, right]{load/store} (mem.north);
+  \draw[os strong bus] (be.east) -- node[os label, above]{完成结果} (rob.west);
+  \draw[os feedback] (mem.east) -- node[os label, below]{fault 信息} (trap.west);
+  \draw[os feedback] (rob.south) -- node[os label, right]{未提交时可丢弃} (trap.north);
+\end{pdfdiagram}
+\diagramnote{乱序执行可以改变内部完成顺序，但对 OS 暴露的异常必须发生在按序提交边界；否则缺页、信号和调试都无法可靠恢复。}
 
 用户程序不能直接修改页表、关中断或访问任意设备寄存器。CPU 用特权级区分普通代码和内核代码。用户态执行特权指令会触发异常；系统调用是用户态主动进入内核态的受控入口；中断是设备或定时器异步打断 CPU 的入口；异常是当前指令执行失败产生的入口。
 
@@ -80,9 +1135,71 @@ kernel mode:
   return to user or schedule another task
 \end{lstlisting}
 
-特权级解释了为什么系统调用不是普通函数调用。普通函数调用仍然在同一信任边界里；系统调用跨越用户/内核边界，必须切换栈、保存 trap frame、检查用户指针、处理信号和抢占，再安全返回。
+特权级解释了为什么系统调用不是普通函数调用。普通函数调用仍然在同一信任边界里；系统调用跨越用户/内核边界，必须切换栈、保存 trap frame、检查用户指针、处理信号和抢占，然后安全返回。
 
-\subsection{特权机器的最小硬件清单}
+先把两者放在一起对比。用户态普通函数调用只是在同一个地址空间、同一个特权级、同一套用户栈上移动控制流：
+
+\begin{lstlisting}
+ordinary call:
+  put arguments in registers or on user stack
+  push or record return address
+  jump to callee code in the same privilege level
+  callee returns to caller
+\end{lstlisting}
+
+如果这个 callee 有 bug，它仍然只是用户进程的一部分；它不能因为被叫作“库函数”就修改页表或访问设备 BAR。系统调用不同。系统调用指令是 ISA 规定的入口，CPU 只允许跳到内核预先配置的入口地址，并把返回用户态所需的 RIP、状态位和参数现场保存到内核能解释的位置。用户不能选择跳进内核任意一行代码，也不能带着用户栈让内核随便使用。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+动作 & 普通函数调用 & 系统调用 \\
+\midrule
+特权级 & 不变，仍在用户态 & 从用户态进入内核态 \\
+入口地址 & 由程序中的 call 目标决定 & 由 CPU 控制寄存器或向量表限定 \\
+栈 & 使用用户栈 & 入口要切到内核栈或受控入口栈 \\
+参数可信度 & 同一进程内部约定 & 全部来自不可信用户寄存器和用户地址 \\
+返回条件 & callee 按 ABI 返回 & 内核恢复受控现场，执行返回用户态指令 \\
+失败含义 & 进程内部 bug 或异常 & 可能是权限拒绝、地址错误、对象错误或设备错误 \\
+\bottomrule
+\end{longtable}
+
+以 \code{write(fd, buf, len)} 为例，用户态库函数最多只是把参数放到 ABI 规定的寄存器里，再执行系统调用指令。真正的边界发生在硬件入口处。
+
+\begin{lstlisting}
+user:
+  rax = SYS_write
+  rdi = fd
+  rsi = buf
+  rdx = len
+  syscall
+
+hardware:
+  save return RIP and status
+  switch to kernel privilege
+  jump to syscall entry
+
+kernel:
+  build trap frame
+  validate fd and user buffer
+  copy or pin data according to path
+  return value or -errno
+\end{lstlisting}
+
+常见误解是：“内核已经拿到了 \code{buf} 指针，因此可以直接使用。”实际上，\code{buf} 只是用户虚拟地址。内核必须按用户地址空间检查它，拷贝时还可能跨页，途中也可能缺页。系统调用边界的本质不是函数名，而是：不可信寄存器参数进入可信内核入口，内核要把它们逐个变成经过验证的内核对象。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=26mm] (ureg) at (0,18mm) {用户寄存器\\fd, buf, len};
+  \node[os control, minimum width=28mm] (entry) at (42mm,18mm) {syscall 指令\\切特权级};
+  \node[os state, minimum width=29mm] (kstack) at (84mm,18mm) {内核栈\\trap frame};
+  \node[os control, minimum width=29mm] (check) at (126mm,18mm) {内核检查\\fd 和权限};
+  \node[os memory, minimum width=29mm] (copy) at (126mm,-8mm) {用户地址访问\\copy/pin};
+  \node[os memory, minimum width=29mm] (pt) at (84mm,-8mm) {当前页表\\用户映射};
+  \draw[os strong bus] (ureg) -- node[os label, above]{不可信参数} (entry);
+  \draw[os strong bus] (entry) -- node[os label, above]{保存返回点/状态} (kstack);
+  \draw[os strong bus] (kstack) -- node[os label, above]{构造内核上下文} (check);
+  \draw[os strong bus] (check.south) -- node[os label, right]{访问 buf} (copy.north);
+  \draw[os bus] (copy.west) -- node[os label, below]{仍受页表约束} (pt.east);
+\end{pdfdiagram}
+\diagramnote{系统调用入口只把 CPU 带到内核特权级，并不会把用户指针变成可信内核对象；参数还必须通过页表和内核对象表验证。}
 
 要让特权级真正有用，CPU 不能只提供一个“当前模式”标志。它至少要提供五类硬件支持：受保护的控制寄存器、受控的陷入入口、返回用户态的指令、异常原因记录、以及对内存访问的权限检查。
 
@@ -98,9 +1215,7 @@ kernel mode:
 \bottomrule
 \end{longtable}
 
-这也解释了为什么“把库函数写得安全一点”不能代替内核边界。库函数仍然运行在用户态，用户可以绕过库直接发指令。只有 CPU 在每条敏感路径上强制检查，OS 才能把不可信程序约束在用户态。
-
-\subsection{异常、陷入和中断的共同结构}
+“把库函数写得安全一点”不能代替内核边界。库函数仍然运行在用户态，用户可以绕过库直接发指令。只有 CPU 在每条敏感路径上强制检查，OS 才能把不可信程序约束在用户态。
 
 异常、陷入和中断来源不同，但入口结构相似：CPU 停下当前控制流，保存返回所需状态，切换到受信任入口，把原因交给内核，内核处理后决定返回、杀死任务、切换任务或 panic。
 
@@ -121,9 +1236,35 @@ kernel_entry:
 
 入口路径必须极小心，因为它在系统最脆弱的位置运行。页表可能刚刚出错，用户指针不可信，中断状态敏感，栈也可能需要切换。许多架构把入口的一部分固定在汇编里，就是为了精确控制寄存器保存和返回协议。
 
-\subsection{内存、地址总线与页表}
+CPU 如何停下当前程序并进入内核，已经有了硬件基础。进入内核后，几乎所有请求都会碰到地址：系统调用参数是地址，缺页异常是地址，设备寄存器也是地址。执行现场必须接上地址翻译和缓存，OS 才能继续判断“这个地址能不能碰、碰到的是 RAM 还是设备”。
 
-CPU 发出的地址通常先是虚拟地址。MMU 根据页表把虚拟页翻译成物理页，并检查 R/W/X、用户/内核、present 等权限。页表基址保存在控制寄存器中；TLB 缓存最近翻译，减少页表遍历成本。操作系统通过切换页表和设置权限，让每个进程看到自己的地址空间。
+\section{三、内存、设备和平台事务}
+
+第二节解释了执行现场和特权入口，现在把一条具体地址继续往外走。用户程序里写下的地址，不会直接变成内存芯片上的位置；内核驱动里写下的设备地址，也不一定通向普通 RAM。同样是 load/store，硬件会先解释地址，再决定它落到普通内存、设备窗口、不可访问区域，还是一个必须交给内核处理的异常。
+
+先从用户态的一次读取开始：
+
+\begin{lstlisting}
+char *p = mmap(file, length, PROT_READ);
+char c = p[0];
+\end{lstlisting}
+
+\code{p} 是用户虚拟地址。CPU 发出的地址通常先交给 MMU。MMU 根据页表把虚拟页翻译成物理页，并检查 R/W/X、用户/内核、present 等权限。页表基址保存在控制寄存器中；TLB 缓存最近翻译，减少页表遍历成本。操作系统通过切换页表和设置权限，让每个进程看到自己的地址空间。
+
+地址翻译的结构要分成三层看。第一层是 CPU 指令实际发出的虚拟地址，它来自寄存器、立即数和地址生成单元。第二层是硬件可读取的页表结构，它把虚拟页号连接到物理页框并附带权限。第三层是内核维护的 VMA 等软件结构，它说明某段虚拟区间是否合法、来自文件还是匿名内存、允许哪些访问。page fault 发生后，内核不是凭空分配页，而是在 VMA 允许的前提下修改页表，让硬件下一次访问能直接完成。
+
+把一条 \code{mov rax, [rdi]} 放进这三层里看。寄存器 \code{rdi} 保存的是虚拟地址，例如 \code{0x7f00_0010}。地址生成单元把它作为本次 load 的虚拟地址交给 MMU。MMU 先用虚拟页号查 TLB；若命中，就拿到物理页号和权限；若未命中，就从当前页表基址开始做 page walk。page walk 读到的 PTE 如果 present 且允许用户读，硬件把物理页号和页内偏移拼成物理地址，再交给 cache。若 PTE 不存在或权限不允许，cache 根本不应该被当作成功路径继续访问，CPU 要记录 fault address 和错误码进入内核。
+
+\begin{longtable}{p{0.17\linewidth}p{0.39\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 硬件正在确认什么 & 失败时留下什么 \\
+\midrule
+地址生成 & \code{base + index * scale + offset} 得到虚拟地址 & 算术溢出通常不是地址 fault，本质仍是得到一个 bit 模式 \\
+TLB 查询 & 最近是否已有该虚拟页翻译和权限 & TLB miss 只是慢，不等于异常 \\
+page walk & 页表项是否存在，权限是否允许 & page fault address、访问类型、用户/内核、present 位状态 \\
+cache/内存访问 & 物理 cache line 是否在近端，DRAM 是否返回 & cache miss 只是慢，机器检查才是硬错误 \\
+\bottomrule
+\end{longtable}
 
 \begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
 \toprule
@@ -137,11 +1278,9 @@ VMA & 合法虚拟区间的内核记录 & 误以为没有 PTE 就一定非法 \\
 \bottomrule
 \end{longtable}
 
-页表是隔离的硬件根。没有页表权限，进程可以互相读写；没有用户/内核页区分，用户程序可以访问内核数据；没有 NX，数据页可能被当作代码执行。OS 的内存管理不是“分配内存”这么简单，而是在性能、隔离、共享、懒加载和回收之间维护一组不变量。
+页表是隔离的硬件根。没有页表权限，进程可以互相读写；没有用户/内核页区分，用户程序可以访问内核数据；没有 NX，数据页可能被当作代码执行。OS 的内存管理不是简单的“分配内存”，而是在性能、隔离、共享、懒加载和回收之间维护一组不变量。
 
-\subsection{从物理地址到虚拟地址的演进}
-
-最早的简单机器可以让程序直接使用物理地址。这样最容易理解：地址 0x1000 就是某个内存芯片上的位置。但多程序系统里，直接物理地址有三个硬伤。第一，程序彼此知道并可能覆盖对方地址。第二，程序必须按实际物理位置链接和装载。第三，内存碎片会让大程序难以找到连续空间。
+为什么不让程序直接使用物理地址？早期简单机器可以这样做：地址 0x1000 对应某个内存芯片上的位置。但在多程序系统中，直接物理地址有三个根本缺陷。第一，程序彼此知道并可能覆盖对方地址。第二，程序必须按实际物理位置链接和装载。第三，内存碎片会让大程序难以找到连续空间。
 
 虚拟地址把程序看到的地址和内存条上的物理地址分开。每个进程都可以以为自己从固定地址开始，有连续的栈、堆和映射区；内核用页表决定这些虚拟页实际落到哪些物理页，或者暂时不落到任何物理页。
 
@@ -159,18 +1298,16 @@ VMA & 合法虚拟区间的内核记录 & 误以为没有 PTE 就一定非法 \\
 
 分页之所以成为现代通用 OS 的核心，是因为它把“地址连续幻觉”和“物理页离散管理”解耦。进程堆可以在虚拟地址上连续增长，物理页却可以来自任意空闲页框；共享库可以映射到多个进程；\code{fork} 可以先共享物理页，等写入时再 COW。
 
-\subsection{页表项为什么要有这么多位}
-
-初学者容易把页表项看成 \code{vpn -> ppn} 的字典项。真实页表项还包含权限、状态和性能位，因为硬件必须在每次地址翻译时直接做决定。
+页表项如果只保存 \code{vpn -> ppn}，只能回答“去哪里”，回答不了“能不能去”。真实页表项还包含权限、状态和性能位，因为硬件必须在每次地址翻译时直接做决定。
 
 \begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
 \toprule
 位或字段 & 含义 & OS 用法 \\
 \midrule
 present/valid & 翻译是否有效 & 缺页、懒分配、换出 \\
-physical page number & 指向物理页框 & 页分配和共享的实际对象 \\
-read/write/execute & 允许哪些访问 & 代码保护、COW、NX 防护 \\
-user/supervisor & 用户态是否可访问 & 内核页和用户页隔离 \\
+PPN & 指向物理页框 & 页分配和共享的实际对象 \\
+R/W/X & 读、写、执行权限 & 代码保护、COW、NX 防护 \\
+U/S & 用户态是否可访问 & 内核页和用户页隔离 \\
 accessed & 最近是否访问 & 页面回收近似 LRU \\
 dirty & 是否写过 & 文件页 writeback、匿名页换出 \\
 global/PCID & TLB 保留或地址空间标识 & 降低切换刷新成本 \\
@@ -179,9 +1316,47 @@ global/PCID & TLB 保留或地址空间标识 & 降低切换刷新成本 \\
 
 这些位让 OS 能把策略推迟到事件发生时。例如 \code{mmap} 文件时可以只建 VMA，不立刻读文件；第一次访问触发缺页，内核再读取对应页并安装 PTE。COW 也靠权限位实现：父子进程先共享只读页，写入触发保护异常，内核复制物理页并恢复可写权限。
 
-\subsection{缓存层次与一致性}
+把这件事落到 \code{mmap} 上，就能看到 OS 为什么要把策略推迟到第一次访问。把内存管理理解成“申请一块内存”过于粗略。实际路径是：建立虚拟区间，等待第一次访问，再由硬件把问题交给内核。
 
-CPU 访问寄存器最快，其次是 L1/L2/L3 cache，再往后是内存和存储设备。cache 以 cache line 为单位搬运数据。多核系统中，同一个物理地址可能被多个 CPU cache 缓存，硬件一致性协议负责让普通内存读写最终保持一致。但设备 DMA、MMIO 和某些弱内存模型仍要求内核显式使用屏障和 cache 维护操作。
+\begin{lstlisting}
+char *p = mmap(file, length, PROT_READ);
+char c = p[0];
+\end{lstlisting}
+
+\code{mmap} 返回后，\code{p} 这段地址通常有 VMA，不一定立刻有 PTE，也不一定已经读入物理页。VMA 是内核记录的“这段虚拟地址是否合法、权限是什么、背后对应哪个文件或匿名内存”；PTE 是硬件 page walk 能读取的“某个虚拟页当前是否映射到某个物理页，以及权限是什么”；TLB 是 CPU 对 PTE 结果的缓存。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=29mm] (vma) at (0,10mm) {VMA\\合法区间和策略};
+  \node[os memory, minimum width=29mm] (pte) at (44mm,10mm) {PTE\\硬件可读映射};
+  \node[os memory, minimum width=29mm] (tlb) at (88mm,10mm) {TLB\\翻译缓存};
+  \node[os compute, minimum width=29mm] (load) at (132mm,10mm) {load 指令\\重试后完成};
+  \node[os control, minimum width=29mm] (fault) at (44mm,-15mm) {page fault\\addr+error};
+  \node[os memory, minimum width=29mm] (page) at (88mm,-15mm) {物理页\\文件页/匿名页};
+  \draw[os feedback] (load.south) -- node[os label, right]{PTE 不 present} (fault.east);
+  \draw[os strong bus] (fault.west) -- node[os label, above]{查合法性} (vma.east);
+  \draw[os strong bus] (vma) -- node[os label, above]{允许后安装} (pte);
+  \draw[os strong bus] (page.north) -- node[os label, right]{PPN} (pte.south);
+  \draw[os bus] (pte) -- node[os label, above]{缓存翻译} (tlb);
+  \draw[os strong bus] (tlb) -- node[os label, above]{下次命中} (load);
+\end{pdfdiagram}
+\diagramnote{VMA、PTE、TLB 不是并列术语。VMA 是内核策略，PTE 是硬件证据，TLB 是硬件缓存；缺页处理就是把合法的软件策略转成硬件可执行的页表项。}
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+步骤 & 发生了什么 & OS 的判断 \\
+\midrule
+\code{mmap} 返回 & 内核建立 VMA，可能不安装 PTE & 这段地址合法，但不等于已有物理页 \\
+CPU 执行 load & MMU 查 TLB，未命中后 page walk & 硬件先尝试自己翻译地址 \\
+PTE 不 present & CPU 触发 page fault，记录 faulting address 和错误码 & 内核进入缺页处理，不是用户函数主动调用 \\
+内核查 VMA & 地址落在合法 VMA 内且权限允许读 & 可以分配页或读取文件页 \\
+安装 PTE & 页表项指向物理页，权限设为可读用户页 & 后续访问可由硬件直接完成 \\
+返回原指令 & CPU 重新执行那条 load & 用户代码像是普通读取，只是第一次慢 \\
+\bottomrule
+\end{longtable}
+
+若地址不在任何 VMA 内，内核通常给进程发 \code{SIGSEGV}；若 VMA 允许读但不允许写，写入会变成保护异常；若 PTE 改了但旧 TLB 还在，CPU 可能继续使用旧翻译，因此多核内核还要做 TLB shootdown。VMA、PTE 和 TLB 不是三个并列名词，而是一条访问路径上的三层证据。
+
+地址和权限检查解决的是“能不能访问”，没有解决“访问快不快”。CPU 访问寄存器最快，其次是 L1/L2/L3 cache，再往后是内存和存储设备。cache 以 cache line 为单位搬运数据。多核系统中，同一个物理地址可能被多个 CPU cache 缓存，硬件一致性协议负责让普通内存读写最终保持一致。但设备 DMA、MMIO 和某些弱内存模型仍要求内核显式使用屏障和 cache 维护操作。
 
 \begin{longtable}{p{0.18\linewidth}p{0.28\linewidth}p{0.42\linewidth}}
 \toprule
@@ -196,9 +1371,58 @@ L1/L2/L3 cache & 以 cache line 缓存内存 & 锁竞争、伪共享、迁移成
 
 缓存解释了许多 OS 设计选择。每 CPU runqueue 减少共享 cache line 抖动；per-CPU slab cache 减少全局锁；任务迁移会损失 cache/TLB 热状态；DMA 写入内存后，CPU 可能需要 invalidate cache 才能看到设备写入的新数据。
 
-\subsection{cache line、伪共享和锁为什么会慢}
+用两个很小的循环可以把 cache 和 TLB 的差异看得更清楚：
 
-cache 不是按单个字节搬运，而是按 cache line 搬运，常见大小是 64 字节量级。若两个 CPU 反复写同一 cache line 上的不同变量，硬件仍必须在两个 CPU 之间转移这条 line 的独占所有权。这叫伪共享：程序逻辑上没有共享同一个变量，硬件上却共享了同一个 cache line。
+\begin{lstlisting}
+long sum_array(int *a, long n) {
+  long s = 0;
+  for (long i = 0; i < n; ++i) {
+    s += a[i];
+  }
+  return s;
+}
+
+long sum_stride(int *a, long n) {
+  long s = 0;
+  for (long i = 0; i < n; i += 1024) {
+    s += a[i];
+  }
+  return s;
+}
+\end{lstlisting}
+
+第一段顺序扫描数组。假设 cache line 是 64 字节，一个 \code{int} 是 4 字节，那么一条 cache line 能装 16 个连续元素。第一次访问 \code{a[0]} 可能 miss，硬件从下级 cache 或 DRAM 搬来包含 \code{a[0]} 到 \code{a[15]} 的整条 line；接下来访问 \code{a[1]}、\code{a[2]} 时通常命中同一条 line。地址翻译也有类似局部性：4KiB 页能装 1024 个 \code{int}，一次 TLB 翻译可以覆盖这一页内的连续元素。于是顺序扫描常见路径是“少量 cache/TLB miss 后，大量命中”。
+
+第二段每次跳过 1024 个 \code{int}，步长正好是 4096 字节。每次访问都可能落到新页，也通常落到新 cache line。即使每次只读 4 字节，硬件仍会搬来一整条 cache line；但剩下 60 字节很可能用不上。若数组很大，TLB 也会频繁替换，因为每次访问都换一个虚拟页。程序源码只是把 \code{i += 1} 改成 \code{i += 1024}，硬件路径却从“line 内连续命中”变成“cache line 和 TLB 都不断换工作集”。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+访问模式 & 硬件看到什么 & OS 或程序后果 \\
+\midrule
+连续数组扫描 & 同一页内连续虚拟地址，同一 cache line 内连续物理字节 & cache line 利用率高，预取器容易工作，TLB 压力低 \\
+大步长访问 & 每次跳到新 cache line，甚至新页 & 搬来的 line 大部分浪费，TLB 可能频繁 miss \\
+链表追逐 & 下一个地址要等当前节点 load 返回后才知道 & 硬件难预取，乱序执行也难绕过依赖 \\
+二维数组按行访问 & 内存布局和访问顺序一致，地址连续增长 & cache/TLB 局部性好 \\
+二维数组按列访问 & 每次跨过一整行，步长可能很大 & cache line 利用率低，可能触发更多 TLB miss \\
+\bottomrule
+\end{longtable}
+
+链表再差一步，因为它不仅可能跳到新 cache line，还存在真实数据依赖：
+
+\begin{lstlisting}
+long sum_list(Node *p) {
+  long s = 0;
+  while (p != nullptr) {
+    s += p->value;
+    p = p->next;
+  }
+  return s;
+}
+\end{lstlisting}
+
+数组扫描时，下一次访问地址可以由循环变量提前算出；链表遍历时，下一次地址藏在当前节点的 \code{next} 字段里。当前节点没有从 cache 或 DRAM 返回之前，CPU 甚至不知道下一个节点在哪里。乱序核心可以先执行一些无关指令，却无法提前访问未知地址。OS 中许多数据结构会避免在热路径上做长链表追逐，或者把对象按 slab、per-CPU cache、批量数组和队列组织起来，原因就在这里。
+
+cache line 还会把“看起来没有共享”的变量绑到同一条硬件路径上。cache 不是按单个字节搬运，而是按 cache line 搬运，常见大小是 64 字节量级。若两个 CPU 反复写同一 cache line 上的不同变量，硬件仍必须在两个 CPU 之间转移这条 line 的独占所有权。这叫伪共享：程序逻辑上没有共享同一个变量，硬件上却共享了同一个 cache line。
 
 \begin{lstlisting}
 struct BadCounter {
@@ -214,26 +1438,43 @@ struct BetterCounter {
 
 OS 大量使用 per-CPU 数据，就是为了避免所有 CPU 争同一条 cache line。调度器每 CPU runqueue、网络每队列统计、slab 每 CPU 缓存，本质上都是把热写路径分散到局部状态，必要时再汇总。锁慢也常不是临界区代码慢，而是锁变量所在 cache line 在 CPU 间高速迁移。
 
-\subsection{内存屏障到底在约束谁}
+以一次自旋锁交接为例。CPU0 修改受保护数据后释放锁，CPU1 随后获取同一把锁。锁变量所在 cache line 必须从 CPU0 的 cache 转到 CPU1，受保护数据所在的热 cache line 也可能要迁移。若所有 CPU 都抢同一把全局锁，性能下降不是因为“加锁语句多写了几行”，而是硬件互联在搬运 cache line 所有权。OS 把 runqueue、统计计数和内存分配缓存拆成 per-CPU 形式，就是为了让热写路径留在本地 CPU。
 
-内存屏障约束的不是“C 语言语句顺序”这么简单。它同时约束编译器优化、CPU store buffer、cache 一致性可见顺序以及设备观察顺序。普通用户程序通常用高级原子语义间接表达；内核和驱动经常必须直接选择 acquire、release、full barrier、DMA barrier 或 MMIO barrier。
+当多个核心和设备都能观察内存时，只写出源码顺序不够。内存屏障约束的不只是“C 语言语句顺序”。它同时约束编译器优化、CPU store buffer、cache 一致性可见顺序以及设备观察顺序。普通用户程序通常用高级原子语义间接表达；内核和驱动经常必须直接选择 acquire、release、full barrier、DMA barrier 或 MMIO barrier。
 
 \begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
 \toprule
 场景 & 需要的顺序 & 典型工具 \\
 \midrule
-发布对象指针 & 对象字段先可见，指针后可见 & store-release/load-acquire \\
+发布对象指针 & 对象字段先可见，指针后可见 & release/acquire \\
 释放锁 & 临界区写入先可见，锁状态后释放 & unlock release 语义 \\
 提交 DMA 描述符 & 描述符内存先对设备可见，再 doorbell & dma\_wmb/MMIO write barrier \\
 读取设备完成 & 先看到 completion，再读取设备写入数据 & dma\_rmb/cache invalidate \\
 \bottomrule
 \end{longtable}
 
-屏障不是越多越好。多余屏障会拖慢热路径；缺失屏障会造成难复现的并发错误。正确做法是先写出“谁发布什么，谁观察什么，观察到标志后必须看到哪些数据”，再选择最弱但足够的顺序约束。
+屏障不是越多越好。多余屏障会拖慢热路径；缺失屏障会造成难复现的并发错误。正确做法是先写出“谁发布什么，谁观察什么，观察到标志后必须看到哪些数据”，再选择足够但不过度的顺序约束。
 
-\subsection{总线、MMIO 和设备寄存器}
+CPU 和内存这条线解释了指令如何访问字节。真实 OS 还要和外部世界交换数据。外设不在 C 函数调用栈里，它们通过地址窗口、寄存器、队列和中断进入机器。普通内存访问因此必须继续延伸到设备访问。
 
 设备通过总线连接到 CPU 和内存。很多设备把控制寄存器映射到物理地址空间，CPU 通过 MMIO 读写它们。MMIO 不是普通内存：读取可能有副作用，写入顺序可能被设备解释为命令序列，编译器和 CPU 不能随意优化这些访问。
+
+总线描述的是读写事务的参与者和地址路由方式。CPU 访问普通内存时，请求通常走向内存控制器；CPU 访问某个 PCIe BAR 对应的物理地址时，请求走向 root complex，再被路由到具体设备；设备发起 DMA 时，请求反过来从设备进入 root complex，经 IOMMU 检查后到内存。
+
+\begin{lstlisting}
+CPU load/store:
+  virtual address -> physical address
+  physical address decoded by platform
+  RAM range  -> memory controller
+  MMIO range -> PCIe root complex -> device BAR
+
+device DMA:
+  device issues DMA address
+  IOMMU translates and checks permission
+  memory controller reads or writes DRAM
+\end{lstlisting}
+
+同样写成 \code{*addr = value}，普通内存和 MMIO 的语义并不相同。普通内存写入可以被 cache 合并、延迟、重排；MMIO 写入是在给设备状态机下命令，访问函数、内存属性和屏障都必须按设备手册来。
 
 \begin{lstlisting}
 driver_init(dev):
@@ -244,9 +1485,54 @@ driver_init(dev):
 
 驱动必须给轮询加超时，因为设备可能坏掉。驱动也必须理解寄存器语义：有些状态位写 1 清除，有些寄存器读一次就弹出队列，有些寄存器要求先写高位再写低位。OS 不能把设备当作可靠函数调用，它面对的是异步硬件状态机。
 
-\subsection{芯片如何被 OS 发现}
+最小 UART 驱动还能轮询一个状态位；高速设备通常不能这样工作。NVMe、网卡、virtio 这类设备更像一个队列状态机：CPU 在内存里填描述符，写 MMIO doorbell 通知设备；设备稍后 DMA 读取描述符、搬运数据、写 completion，再用中断或轮询告诉驱动。
 
-单片机工程里，外设地址通常写在芯片手册和头文件中；通用 OS 不能为每块主板硬编码所有设备。在本书的 x86-64 主线里，它需要从 UEFI/ACPI 和总线协议中发现硬件：ACPI 描述板级设备和电源关系，PCI/PCIe 配置空间描述可枚举设备，设备的 BAR 告诉内核 MMIO 区间，中断属性告诉内核如何接收事件，DMA mask 告诉内核设备能访问多少位地址。
+\begin{lstlisting}
+queue_device_submit(req):
+  desc = reserve_submission_slot()
+  desc.buffer = dma_address(req.buffer)
+  desc.length = req.length
+  desc.tag = req.tag
+  dma_wmb()              // descriptor before doorbell
+  writel(queue.tail, dev.doorbell)
+
+queue_device_complete():
+  cqe = read_completion_slot()
+  req = find_request(cqe.tag)
+  dma_unmap(req.buffer)
+  wake_waiter(req)
+\end{lstlisting}
+
+在这段代码中，\code{desc} 位于普通内存，\code{doorbell} 位于 MMIO 区间，\code{buffer} 由设备通过 DMA 访问，\code{tag} 用于把异步 completion 找回原请求。若没有 \code{dma_wmb}，设备可能先看见 doorbell，再读到旧描述符；若 completion 前释放 buffer，设备迟到写入会破坏别的内核对象；若 tag 复用过早，完成事件可能唤醒错请求。
+
+设备寄存器不是天然出现在内核变量里的。PCIe 设备刚被枚举时，OS 不能直接知道它的寄存器在哪里、需要几个中断、能做多少位 DMA。设备把一部分信息放在配置空间里。OS 读取 vendor id、device id、class code 判断它是什么设备；读取 BAR 判断设备希望暴露多大的 MMIO 区间；分配地址后再把这个区间映射进系统物理地址空间。
+
+枚举过程可以理解成“把一块会响应总线事务的硬件，转成内核资源对象”。设备上电后并不会自动拥有一个内核虚拟地址；BAR 里描述的是它需要多大的地址窗口，系统固件或内核给这个窗口分配一段不和 RAM 冲突的物理地址范围。随后驱动用内核映射接口把这段物理 MMIO 区间映射到内核虚拟地址，访问属性设置成设备内存。到这一步，驱动手里的 \code{dev->mmio} 才是可以传给 \code{readl/writel} 的地址。
+
+\begin{lstlisting}
+PCIe BAR path:
+  device exposes BAR size in config space
+  OS allocates a physical MMIO range
+  platform routes that range to the PCIe device
+  driver maps the range as device memory
+  readl/writel generate MMIO transactions to the BAR
+\end{lstlisting}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+PCIe 信息 & 它说明什么 & OS 用它做什么 \\
+\midrule
+vendor/device id & 厂商和设备型号 & 匹配驱动或通用 class 驱动 \\
+class code & 存储、网络、显示等设备类型 & 没有专用驱动时选择通用路径 \\
+BAR & 设备寄存器或内存窗口大小 & 分配 MMIO 资源并建立内核映射 \\
+capability list & MSI-X、PCIe、AER、电源管理等能力 & 配置中断、错误恢复和电源状态 \\
+DMA mask & 设备能产生的地址位宽 & 决定 buffer 分配范围和 IOMMU 策略 \\
+\bottomrule
+\end{longtable}
+
+这里的“资源”是硬边界，不是配置备注。两个设备不能占用同一段 MMIO；驱动不能访问未保留的 BAR；32 位 DMA 设备不能任意使用 4GiB 以上的物理页。设备枚举把硬件自描述信息转换成内核可管理的地址、中断和 DMA 约束。
+
+在小型裸机程序里，外设地址通常写在芯片手册和头文件中；通用 OS 不能为每块主板硬编码所有设备。在本书的 x86-64 主线里，它需要从 UEFI/ACPI 和总线协议中发现硬件：ACPI 描述板级设备和电源关系，PCI/PCIe 配置空间描述可枚举设备，设备的 BAR 告诉内核 MMIO 区间，中断属性告诉内核如何接收事件，DMA mask 告诉内核设备能访问多少位地址。
 
 \begin{lstlisting}
 discover device:
@@ -261,7 +1547,21 @@ discover device:
 
 这条路径解释了驱动 probe 为什么复杂。驱动不是拿到一个“设备对象”就能工作，它要把硬件描述转换成受内核管理的资源，并在任一步失败时回滚。MMIO、IRQ、DMA、clock、reset、power domain 和上层注册对象都属于生命周期的一部分。
 
-\subsection{中断、定时器和时钟源}
+probe 的顺序由资源依赖决定。内核必须先确认设备身份和资源边界，再映射寄存器，再建立中断和 DMA 约束，最后才允许设备开始工作。
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
+\toprule
+阶段 & 先做什么 & 过早或遗漏会怎样 \\
+\midrule
+发现设备 & 读取 ACPI/PCIe 信息，确认 vendor、class、BAR & 驱动可能绑定错设备或访问错地址 \\
+保留资源 & 占用 MMIO 区间和 IRQ vector & 两个驱动可能同时操作同一硬件 \\
+映射 MMIO & 用内核专门接口建立不可乱缓存的映射 & 普通指针访问会破坏设备顺序语义 \\
+建立 DMA 边界 & 设置 DMA mask，加入 IOMMU domain & 设备可能访问不到 buffer，或越界访问内存 \\
+启用中断/队列 & 初始化 ring、清状态、打开中断 & 设备可能在驱动未准备好时产生 completion \\
+\bottomrule
+\end{longtable}
+
+设备完成发现、映射和初始化后，还需要把完成事件传回内核。设备不能直接调用内核函数返回，只能改变状态、写 completion，或者发出中断。事件从硬件回到 CPU 之后，定时器还给 OS 提供抢占和超时所需的时间边界。
 
 中断让设备主动通知 CPU。定时器中断给 OS 提供抢占和超时能力；高精度时钟源提供时间戳；watchdog 检测系统是否长时间没有前进。没有定时器，任务死循环时系统无法抢回 CPU；没有中断，驱动只能轮询设备，浪费 CPU 并增加延迟。
 
@@ -278,9 +1578,49 @@ watchdog & 检测软锁死和硬锁死 & 无响应时缺少故障证据 \\
 
 中断处理要短，因为它打断了当前执行流。复杂工作通常放到下半部、工作队列或内核线程。这个原则不是风格问题，而是延迟和可抢占性的硬边界。
 
-\subsection{定时器为什么是抢占的硬件根}
+旧式外设可能通过电平或边沿信号连到中断控制器。现代 PCIe 设备更常见的是 MSI 或 MSI-X：设备不是拉一根物理中断线，而是向一个特殊地址写一条消息。中断控制器接收消息，把它变成某个 vector，投递给某个 CPU。
 
-协作式系统依赖任务主动让出 CPU。只要当前任务不调用 \code{yield}，系统就无法切换。定时器打破了这个假设：硬件在未来某个时间点强制产生中断，CPU 无论当前运行哪个用户程序，都必须进入内核入口。内核因此获得重新选择任务的机会。
+注意这里的顺序：设备通常先把 completion 写入内存，再投递 MSI-X。MSI-X 本身也是设备发起的一次写消息，但目标不是普通数据 buffer，而是平台定义的中断投递地址。CPU 收到 vector 后，只知道“某个中断入口被触发”，还不知道哪个请求成功、哪个请求失败。驱动必须读取设备状态或 completion ring，根据 tag 找回请求对象。中断是门铃，不是结果本身。
+
+\begin{lstlisting}
+MSI-X interrupt delivery:
+  device DMA-writes completion entry
+  device writes MSI-X message
+  interrupt controller receives vector
+  target CPU takes interrupt at instruction boundary
+  kernel handler reads device completion state
+  kernel sends EOI when interrupt is handled
+\end{lstlisting}
+
+这条路径里有两个顺序不能混。第一，completion 数据必须先于中断可见，否则 CPU 进了中断处理函数却读不到完成项。第二，内核要先清设备侧原因，再对中断控制器 EOI；顺序反了可能立刻再次进入同一个中断，形成风暴。
+
+\begin{longtable}{p{0.17\linewidth}p{0.39\linewidth}p{0.32\linewidth}}
+\toprule
+动作 & 结构含义 & 如果理解错了 \\
+\midrule
+设备写 completion & 结果被放到内存中的完成队列槽位 & 只看 IRQ 不看 completion 会丢失具体请求信息 \\
+设备发 MSI-X & 设备向中断控制器投递消息 & MSI-X 不携带完整 I/O 结果 \\
+CPU 进 vector & 硬件保存当前现场，跳到内核入口 & vector 可能共享或复用，不能当作唯一设备状态 \\
+驱动读取完成队列 & 按 tag 匹配原请求并读取状态码 & tag 复用错误会唤醒错线程或释放错 buffer \\
+EOI/重新打开中断 & 告诉中断控制器这次处理结束 & 过早 EOI 可能导致重入，过晚可能增加延迟 \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+中断概念 & 真实含义 & OS 风险 \\
+\midrule
+vector & CPU 入口编号，不等于设备对象 & 共享或复用时必须再查设备状态 \\
+mask & 暂时禁止某路中断投递 & mask 后仍可能有 pending 事件 \\
+pending & 事件已经到达但尚未处理 & 处理顺序错会丢事件或重复处理 \\
+EOI & 告诉中断控制器本次处理完成 & 过早 EOI 可能造成重入或风暴 \\
+affinity & 选择投递到哪个 CPU & 影响 cache 局部性、队列亲和性和负载 \\
+\bottomrule
+\end{longtable}
+
+中断不是“设备调用内核函数”。设备最多只能制造一个硬件事件；内核还要从 vector 找到设备，从设备寄存器或 completion ring 找到具体请求，再把等待这个请求的线程唤醒。
+
+定时器是抢占的硬件根。协作式系统依赖任务主动让出 CPU。只要当前任务不调用 \code{yield}，系统就无法切换。定时器打破了这个假设：硬件在未来某个时间点强制产生中断，CPU 无论当前运行哪个用户程序，都必须进入内核入口。内核因此获得重新选择任务的机会。
 
 \begin{lstlisting}
 timer interrupt:
@@ -294,7 +1634,29 @@ timer interrupt:
 
 定时器也支撑超时语义。睡眠、socket 超时、锁等待超时、TCP 重传、块设备请求超时、watchdog 都需要“未来某时刻再回来检查”。没有可靠时间源，OS 只能处理已经发生的事件，无法给等待设置边界。
 
-\subsection{时钟源和时钟事件设备}
+用死循环看最清楚。用户程序可以写出永不主动让出 CPU 的代码：
+
+\begin{lstlisting}
+while (true) {
+  // no syscall, no yield
+}
+\end{lstlisting}
+
+若只有普通函数调用，内核永远拿不回控制权。定时器中断改变了这件事：内核在调度用户程序前设置下一次 clock event；时间到后，硬件强制进入中断入口；入口保存当前 RIP、状态寄存器和通用寄存器；内核给当前任务记账，发现时间片用尽，就把它放回可运行队列，选择另一个任务返回。即使用户程序没有主动配合，CPU 也能被抢回。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+时刻 & 硬件或内核动作 & 形成的 OS 概念 \\
+\midrule
+返回用户态前 & 内核设置下一次定时器事件 & 时间片有硬件边界 \\
+用户死循环 & CPU 连续执行普通指令 & 任务当前占用 CPU \\
+定时器到期 & CPU 异步进入中断向量 & 抢占入口出现 \\
+入口保存现场 & trap frame 保存可恢复状态 & 任务可以被暂停 \\
+调度器选择 & 当前任务未消失，只是回到 runqueue & 多任务共享 CPU \\
+\bottomrule
+\end{longtable}
+
+“调度器能切任务”不是单靠算法实现的。算法只决定选谁，定时器和中断入口才提供“什么时候能强制重新选择”的硬件根。
 
 OS 通常区分 clock source 和 clock event device。clock source 用来读取当前时间或单调计数；clock event device 用来安排下一次中断。前者回答“现在是多少”，后者回答“什么时候叫醒我”。
 
@@ -310,9 +1672,33 @@ watchdog & 检测长期无进展 & 死锁或关中断过久无证据 \\
 
 tickless 内核不是没有定时器，而是不再固定频率无条件打断 CPU。内核计算最近的必要事件，把硬件定时器设置到那个时间点。这能降低空闲功耗和噪声，但要求调度、RCU、负载统计和 hrtimer 更精确地维护时间状态。
 
-\subsection{DMA 与 IOMMU}
+中断解决的是“设备或时间怎样通知 CPU”。但如果大块数据仍由 CPU 一字节一字节搬运，I/O 吞吐会受 CPU 搬运能力限制。PIO 由 CPU 搬运数据，简单但慢。DMA 让设备直接读写内存，CPU 只准备描述符、buffer 和地址映射。DMA 的难点是：设备访问的是 DMA 地址，不一定等同于 CPU 物理地址；buffer 在设备完成前不能释放；cache 可能需要 clean/invalidate；IOMMU 需要建立和拆除设备页表映射。
 
-PIO 由 CPU 搬运数据，简单但慢。DMA 让设备直接读写内存，CPU 只准备描述符、buffer 和地址映射。DMA 的难点是：设备访问的是 DMA 地址，不一定等同于 CPU 物理地址；buffer 在设备完成前不能释放；cache 可能需要 clean/invalidate；IOMMU 需要建立和拆除设备页表映射。
+DMA 路径必须区分三种地址。用户进程拿到的是用户虚拟地址；内核管理页框时看到 CPU 物理地址；设备描述符里通常放 DMA 地址，也叫 IOVA 或总线地址。它们可能数值相同，也可能完全不同。驱动不能把用户指针直接塞给设备。
+
+以 \code{write(fd, user_buf, 4096)} 走 DMA 为例，用户传进来的是用户虚拟地址。内核首先要把这段用户地址解析成一组物理页，并保证 I/O 期间这些页不能被释放或换出；然后通过 DMA API 为设备建立 IOVA 映射；最后把 IOVA 和长度写进 descriptor。设备看到的只有 descriptor 里的 DMA 地址，它不会理解用户进程的 \code{user_buf}，也不会自动遵守进程页表权限。这个转换链条是 DMA 安全性的核心。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+转换阶段 & 谁负责 & 不能跳过的原因 \\
+\midrule
+用户虚拟地址到页 & 内核按当前进程页表和 VMA 检查、pin 或复制 & 用户地址可能无效、跨页、权限不足或被并发撤销 \\
+页到 DMA 映射 & DMA API/IOMMU 建立设备可见地址和方向权限 & 设备不能直接信任 CPU 物理地址，更不能拿用户指针 \\
+DMA 地址到 descriptor & 驱动写入队列，并发布给设备 & 设备只读 descriptor，不读内核请求对象 \\
+completion 到请求对象 & 驱动用 tag 反查原请求、同步 cache、unmap & 完成事件必须回收到正确 buffer 和等待者 \\
+\bottomrule
+\end{longtable}
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+地址类型 & 谁使用它 & 为什么不能混用 \\
+\midrule
+用户虚拟地址 & 用户程序和系统调用参数 & 设备不理解进程页表，也不能信任用户权限 \\
+内核虚拟地址 & 内核代码访问 buffer & 只对 CPU 有意义，设备看不到这个映射 \\
+CPU 物理地址 & MMU 翻译后的内存地址 & 有 IOMMU 时未必等于设备可用地址 \\
+DMA 地址/IOVA & 设备描述符中的地址 & 必须由 DMA API 建立和撤销映射 \\
+\bottomrule
+\end{longtable}
 
 \begin{lstlisting}
 submit_dma(req):
@@ -323,11 +1709,23 @@ submit_dma(req):
   ring_doorbell(dev)
 \end{lstlisting}
 
-DMA 是高性能 I/O 的基础，也是内核 bug 的高风险区域。一个错误的 DMA 地址可能让设备覆盖内核对象；一个过早释放的 buffer 可能被设备迟到写入；一个缺失的 cache invalidate 可能让 CPU 读到旧数据。
+DMA 是高性能 I/O 的基础，也是内核缺陷的高风险区域。一个错误的 DMA 地址可能让设备覆盖内核对象；一个过早释放的 buffer 可能被设备迟到写入；一个缺失的 cache invalidate 可能让 CPU 读到旧数据。
 
-\subsection{IOMMU：给设备也加上页表}
+DMA 的正确读法是“所有权转移”，不是“更快的 memcpy”。提交前 buffer 属于 CPU，CPU 可以写内容、填描述符、建 IOMMU 映射；提交后 buffer 属于设备，CPU 不能随意改、不能释放、不能复用；completion 到达并完成 unmap 后，buffer 才重新归 CPU。
 
-MMU 约束 CPU 访问内存，IOMMU 约束设备访问内存。没有 IOMMU 时，设备拿到的总线地址可能直接对应物理内存，驱动错误或恶意设备可以 DMA 到任意位置。有 IOMMU 后，内核为每个设备或设备组建立 DMA 地址空间，只映射允许访问的 buffer。
+\begin{longtable}{p{0.19\linewidth}p{0.39\linewidth}p{0.3\linewidth}}
+\toprule
+阶段 & 必须成立的不变量 & 破坏后的典型表现 \\
+\midrule
+map 前 & buffer 是有效页，方向和长度正确 & 设备读错数据或越界 \\
+doorbell 前 & 描述符和 buffer 内容已经对设备可见 & 随机超时、设备读到旧命令 \\
+DMA 期间 & CPU 不释放、不复用、不并发改写设备拥有的区域 & 迟到 DMA 写坏内存 \\
+completion 后 & 先确认完成，再做 cache 同步和 unmap & CPU 读到旧数据或 IOVA 泄漏 \\
+释放前 & 没有设备还持有该 buffer 的所有权 & use-after-free、IOMMU fault、随机崩溃 \\
+\bottomrule
+\end{longtable}
+
+设备也需要访问边界。MMU 约束 CPU 访问内存，IOMMU 约束设备访问内存。没有 IOMMU 时，设备拿到的总线地址可能直接对应物理内存，驱动错误或恶意设备可以 DMA 到任意位置。有 IOMMU 后，内核为每个设备或设备组建立 DMA 地址空间，只映射允许访问的 buffer。
 
 \begin{lstlisting}
 dma_map(dev, page, len, direction):
@@ -340,11 +1738,20 @@ dma_unmap(dev, iova, len):
   free_device_virtual_address(iova)
 \end{lstlisting}
 
+设备也有翻译缓存，通常称为 IOTLB 或类似结构。内核撤销 IOMMU 映射后，还要保证设备不会继续用旧翻译访问内存。这个要求和 CPU 修改页表后做 TLB shootdown 很像，只是参与者从 CPU 变成了设备。
+
+\begin{lstlisting}
+safe_dma_unmap(req):
+  stop device from issuing new DMA for req
+  observe completion or abort result
+  iommu_unmap(req.iova)
+  invalidate device/IOMMU translation cache if required
+  release pages and request object
+\end{lstlisting}
+
 IOMMU 的代价是映射维护和 IOTLB 成本。高性能驱动会批量映射、复用 DMA buffer 或使用页池，减少每包 map/unmap。虚拟化场景中，IOMMU 还用于设备直通隔离：把设备 DMA 限制在某个虚拟机拥有的内存范围内。
 
-\subsection{DMA 和用户页：pin 不是复制}
-
-当用户态提交异步 I/O 时，内核可以复制用户数据到内核 buffer，也可以 pin 用户页让设备直接 DMA。pin 的意思是这些物理页在 I/O 完成前不能被回收、迁移或换出。它避免复制，但把用户内存生命周期和设备生命周期绑在一起。
+用户页参与 DMA 时，还要区分 pin 和复制。当用户态提交异步 I/O 时，内核可以复制用户数据到内核 buffer，也可以 pin 用户页让设备直接 DMA。pin 的意思是这些物理页在 I/O 完成前不能被回收、迁移或换出。它避免复制，但把用户内存生命周期和设备生命周期绑在一起。
 
 \begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
 \toprule
@@ -356,9 +1763,11 @@ pin 用户页 DMA & 少复制，适合大 I/O & 页不能迁移/回收，complet
 \bottomrule
 \end{longtable}
 
-这解释了为什么高性能 I/O 接口往往要显式注册 buffer、固定队列大小、区分 submit 和 completion。性能不是免费来的，它把简单的同步复制变成了异步所有权协议。
+高性能 I/O 接口往往要显式注册 buffer、固定队列大小、区分 submit 和 completion。性能提升的代价，是把简单的同步复制转换成异步所有权协议。
 
-\subsection{启动固件和第一条内核指令}
+用户页参与 DMA 时还要处理取消和进程退出。用户进程可以关闭 fd、收到信号、被终止，甚至把原来的虚拟地址 \code{munmap} 掉；但只要设备还可能写这个物理页，内核就不能把页还给普通分配器。可靠实现通常把请求对象、pinned page 列表、DMA 映射和 completion 绑定在一起，取消路径只是阻止新提交或标记请求，不等于立刻释放所有 buffer。
+
+前面的讨论默认内核已经在运行，已经有页表、栈、日志和驱动框架。真实机器上这些条件不是天然存在的。最后一条硬件链路回到上电瞬间：第一条内核指令之前，谁初始化最低限度的 CPU、内存和设备状态。
 
 机器上电后，CPU 不会直接运行 C 语言内核。固件先初始化基本硬件，bootloader 把内核镜像和启动参数放入内存，然后跳到内核入口。内核早期代码要设置栈、清 BSS、复制 data、建立早期页表、解析内存地图、初始化 console 和分配器。
 
@@ -375,4 +1784,474 @@ PowerOn
   -> FirstUserProcess
 \end{lstlisting}
 
-启动阶段的约束最严格：还没有完整内存分配器，不能随意分配；还没有调度器，不能睡眠；还没有完整日志，错误证据有限；还没有完整设备模型，很多硬件不能访问。理解这些限制，后面读内核初始化代码才不会把“为什么这么麻烦”误解成历史包袱。
+启动阶段的约束最严格：还没有完整内存分配器，不能随意分配；还没有调度器，不能睡眠；还没有完整日志，错误证据有限；还没有完整设备模型，很多硬件不能访问。这些限制解释了内核初始化代码为何显得繁琐：早期代码不是在完整运行时环境中执行，而是在逐步制造这个环境。
+
+早期内核不像普通 C 程序。普通 C 程序默认已经有栈、全局变量初始化、库函数、文件描述符、线程、堆和操作系统服务。内核入口处这些条件大多还不存在，内核必须自己逐步建立运行环境。
+
+\begin{longtable}{p{0.22\linewidth}p{0.36\linewidth}p{0.3\linewidth}}
+\toprule
+早期阶段 & 能做什么 & 不能假设什么 \\
+\midrule
+刚进内核 & 少量汇编设置临时栈，确认启动参数 & 不能调用依赖完整栈和全局状态的复杂 C 代码 \\
+清 BSS/定位镜像 & 建立全局变量的初始状态 & 不能假设静态对象已经自动可用 \\
+早期页表 & 让内核虚拟地址能访问代码、数据和必要设备 & 不能随意访问未映射物理地址 \\
+内存地图解析 & 找出可用 RAM、保留区、设备区和固件区 & 不能把所有物理地址都当可分配页 \\
+早期 console & 尽早输出 panic 和调试证据 & 不能依赖完整驱动栈和文件系统日志 \\
+分配器/调度器就绪 & 开始创建长期内核对象和任务 & 此前不能睡眠，也不能用普通锁等待别人唤醒 \\
+\bottomrule
+\end{longtable}
+
+启动链把硬件概念收束到第一条内核指令：CPU 入口给出最初现场，页表决定哪些地址能用，内存地图决定哪些物理页能分配，MMIO console 提供早期证据，定时器和中断就绪后调度才有根，DMA 和完整设备模型要等内存、IOMMU 和驱动框架准备好之后才能安全启用。
+
+\section{四、几个完整硬件路径大案例}
+
+状态、ALU、CPU、页表、TLB、cache、MMIO、DMA、IOMMU、中断和多核一致性不能分开背。真正有用的读法，是把一次真实动作走穿：状态在哪里，数据走哪条通路，控制信号或权限怎样选择路径，失败或完成怎样留下证据。
+
+\medskip
+\noindent\textbf{第一条完整路径：同一条 \code{load rax, [p]} 为什么会有多条结果。}
+
+假设用户态正在执行：
+
+\begin{lstlisting}
+rax = *p;
+\end{lstlisting}
+
+进入这条指令前，\code{p = 0x7f00_1234}。硬件先取指、译码，寄存器文件读出保存 \code{p} 的寄存器，地址生成单元得到虚拟地址 \code{0x7f00_1234}。从这一刻开始，路径会分叉。分叉点不是“是否走 cache”一个问题，而是依次经过地址合法性、翻译缓存、页表权限、数据缓存、内存控制器和错误报告。
+
+\begin{longtable}{p{0.17\linewidth}p{0.43\linewidth}p{0.28\linewidth}}
+\toprule
+路径 & 硬件实际动作 & OS 看到什么 \\
+\midrule
+TLB 命中且 L1 命中 & TLB 给出物理页号和权限；物理地址命中 L1 data cache；数据返回执行单元；\code{rax} 在提交边界写回 & OS 不接管，用户程序只看到一次普通读取 \\
+TLB miss 但 PTE 有效 & TLB 没有翻译；page walker 按页表基址读取多级页表；权限通过后填 TLB；再访问 cache & OS 通常不接管，只是这条 load 变慢 \\
+cache miss & 翻译和权限都通过；L1/L2/LLC 没有目标 cache line；请求进入内存控制器或远端 NUMA 节点；返回整条 cache line & OS 通常不接管；性能计数会显示 cache/DRAM/NUMA 成本 \\
+PTE 不存在 & page walker 发现页表项 not present；CPU 保存 fault address、error code 和 faulting RIP & OS 进入缺页处理，查 VMA 后补页、读文件页、分配匿名页或发信号 \\
+权限失败 & PTE 存在但权限不允许，例如用户访问内核页、写只读页、执行 NX 页 & OS 接管，可能 COW、\code{SIGSEGV}、杀进程或 panic \\
+机器检查 & 翻译和权限可能通过，但内存系统报告不可纠正 ECC 或总线错误 & OS 记录硬件错误，隔离页、杀进程、降级或 panic \\
+\bottomrule
+\end{longtable}
+
+逐步看第一条快路径。TLB 命中说明硬件已经缓存了“虚拟页号到物理页号以及权限”的结果；L1 命中说明目标物理 cache line 已经在当前核心附近。此时 load 很快完成，\code{rax} 被写回，下一 PC 前进。OS 不应该介入，因为没有权限错误、没有缺页、没有设备事件。
+
+第二条路径只是不在 TLB 中。硬件会自己走页表，这叫 page walk。page walk 读取的是内存里的页表项，所以它本身也可能访问 cache；若页表项在 cache 里，TLB miss 可能只是中等成本；若页表项也要去 DRAM，成本更高。但只要 PTE 有效且权限允许，这仍不是 page fault。把 TLB miss 当成缺页，是读 OS 时常见的概念错误。
+
+第三条路径才是通常说的“不走 cache”或“cache miss”。准确说，它不是完全不经过 cache，而是先查近端 cache 未命中，然后向下级 cache、内存控制器、DRAM 或远端 NUMA 节点请求。返回的通常是一整条 cache line，而不是只返回 \code{rax} 需要的 8 字节。若 ECC 发现可纠正错误，硬件可能纠正后继续；若错误不可纠正，才会变成 OS 可见的硬件错误路径。
+
+第四、第五条路径进入内核，是因为硬件无法把这条 load 当作当前页表下的合法动作完成。not-present 可能是懒分配、文件映射第一次访问、换出页或栈增长；权限失败可能是 COW 写保护、用户越界、执行不可执行页。内核能修复后重试，依赖前文讲过的提交边界：faulting 指令还没有把错误结果写入 \code{rax}，RIP 仍指向原 load。
+
+\medskip
+\noindent\textbf{第二条完整路径：同一条 \code{store [p], rax} 为什么不只是“写内存”。}
+
+再看写入：
+
+\begin{lstlisting}
+*p = rax;
+\end{lstlisting}
+
+store 比 load 多一个容易忽略的事实：CPU 可以先把写入放进 store buffer，稍后再让它对其他 CPU、cache 层级或设备可见。对普通内存，这能提高吞吐；对锁和设备，这就必须用原子操作、release/acquire 或 MMIO 屏障表达顺序。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+写入场景 & 硬件路径 & OS 或并发后果 \\
+\midrule
+普通私有页写入 & 地址翻译通过；cache line 取得可写状态；store 先进入 store buffer，再更新本地 cache line，之后可能变成 dirty line & 用户程序正常前进；脏页以后可能被回写或换出 \\
+写只读 COW 页 & PTE present 但不可写；CPU 在提交前触发保护异常 & 内核复制物理页，更新 PTE 后重试原 store \\
+写共享 cache line & 当前 CPU 必须通过一致性协议取得该 line 的独占所有权；其他 CPU 的副本失效或降级 & 热锁、共享计数器和伪共享会让 line 在 CPU 间迁移 \\
+原子读改写 & CPU 取得独占所有权，读旧值、算新值、写回期间不允许其他写者插入 & 引用计数、锁、队列指针才不会丢更新 \\
+发布对象指针 & 数据字段写入和指针写入都可能经过 store buffer；release 屏障要求字段先可见，指针后可见 & 没有顺序约束时，其他 CPU 可能看到指针却看不到完整对象 \\
+写 MMIO doorbell & 地址属性是设备内存；写事务进入总线或 PCIe posted write；返回不等于设备已经处理 & 驱动要用 \code{writel}、DMA 屏障或读回形成排序点 \\
+\bottomrule
+\end{longtable}
+
+一个具体失败例子是发布队列节点：
+
+\begin{lstlisting}
+node->value = 42;
+queue->tail = node;
+\end{lstlisting}
+
+源码顺序看起来是先写字段，再发布指针。但在硬件层面，两个 store 可能先进入 store buffer；另一个 CPU 若先看见 \code{queue->tail = node}，却还没看见 \code{node->value = 42}，就会读到未初始化内容。正确同步不是“相信 C 代码顺序”，而是用 release store 发布指针，用 acquire load 读取指针。release/acquire 约束的是其他 CPU 能观察到的硬件可见顺序。
+
+写共享变量时还要考虑 cache line 所有权。假设两个 CPU 分别更新两个不同变量，但它们刚好落在同一条 64 字节 cache line。程序逻辑上没有共享变量，硬件却必须在两个 CPU 之间转移同一条 line 的独占所有权，这就是伪共享。OS 的 per-CPU 计数器、cacheline 对齐和分片锁，都是为了减少这类所有权迁移。
+
+\medskip
+\noindent\textbf{第三条完整路径：同样是地址访问，普通 RAM、MMIO 和 framebuffer 路径不同。}
+
+CPU 指令形式上都可能是 \code{load/store}，但物理地址属性会改变语义。假设三个地址：
+
+\begin{lstlisting}
+normal_ptr      -> ordinary RAM
+dev->status     -> MMIO status register
+framebuffer_ptr -> write-combining device memory
+\end{lstlisting}
+
+这三个地址都要经过页表翻译，但 PTE 或平台内存类型会告诉硬件后续访问规则不同。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+目标 & 硬件访问规则 & 错用后的问题 \\
+\midrule
+普通 RAM & 可进入 cache，可预取，可合并写入，可延迟回写；一致性协议维护 CPU 间普通内存一致性 & 若拿它当设备寄存器，读写可能被缓存或重排，设备看不到真实命令顺序 \\
+MMIO 状态寄存器 & 通常不可普通缓存；load 会变成总线读事务；读可能清状态位或弹出队列项 & 若缓存状态值，驱动可能永远看不到 ready 或错误位变化 \\
+MMIO doorbell & store 变成设备命令；PCIe 上可能是 posted write，CPU 返回时设备未必已处理 & descriptor 未对设备可见就敲门铃，会让设备读到旧请求 \\
+framebuffer/WC 区 & 写入可合并成更大的总线事务，提高顺序写带宽；读通常很慢或语义特殊 & 若按普通 RAM 随机读改写，性能和顺序都可能出问题 \\
+DMA coherent buffer & CPU 和设备共享的内存区域，平台保证或由 API 维护可见性 & 忘记同步会导致 CPU 读旧数据或设备读旧描述符 \\
+\bottomrule
+\end{longtable}
+
+这个案例说明，\code{cache} 只是问题的一部分。真正决定路径的是“地址翻译结果 + 内存类型 + 访问主体”。普通 RAM 的优化目标是让 CPU 快；MMIO 的目标是让设备按手册看到命令；framebuffer 的目标可能是顺序写吞吐；DMA buffer 的目标是让 CPU 和设备在明确的所有权边界上共享数据。OS 映射地址时必须把这些属性设对，否则同一条 \code{store} 指令会被硬件按错误规则执行。
+
+\medskip
+\noindent\textbf{第四条完整路径：一次 NVMe 读请求从系统调用走到 DMA 完成。}
+
+再看一个大 I/O。用户执行：
+
+\begin{lstlisting}
+read(fd, user_buf, 4096);
+\end{lstlisting}
+
+\code{read} 不一定每次都碰设备。page cache 是内核用普通内存保存文件页内容的一层缓存。若目标文件页已经在 page cache 里，内核可以把这 4096 字节从内核页复制到用户 buffer；若不在，内核才需要向块设备提交 I/O，把数据读进 page cache 或目标页，再完成用户可见的读取。两条路径都叫 \code{read}，但硬件路径差别很大。
+
+\begin{longtable}{p{0.18\linewidth}p{0.4\linewidth}p{0.3\linewidth}}
+\toprule
+路径 & 机器和内核动作 & 用户看到什么 \\
+\midrule
+page cache 命中 & 系统调用进入内核；内核找到已缓存文件页；CPU 通过普通 load/store 和 cache 把数据复制到 \code{user\_buf}；复制时仍要检查用户页权限，可能触发用户页缺页 & 没有设备 I/O，返回较快，但仍有系统调用和内存复制成本 \\
+page cache 未命中 & 内核分配或选择页，提交块层请求；设备 DMA 把数据读入内存；completion 后等待者被唤醒；内核再把数据交给用户 buffer 或让映射页可用 & 当前线程可能睡眠，返回时间取决于设备、队列和调度 \\
+用户 buffer 不可写 & 即使文件页命中，复制到用户地址时页表权限失败或地址非法 & 返回 \code{-EFAULT} 或产生相应错误，不应把设备路径误当根因 \\
+设备错误 & cache 未命中后设备返回介质错误、超时或控制器错误 & 内核按块层和文件系统语义返回 I/O 错误 \\
+\bottomrule
+\end{longtable}
+
+先看命中路径。CPU 从当前进程寄存器里拿到 \code{user\_buf}，系统调用入口把它带进内核；内核通过文件对象和页缓存索引找到目标文件页。接下来不是设备在搬数据，而是 CPU 在复制：读 page cache 页的 cache line，写用户地址对应的 cache line。写用户地址前，MMU 仍要按用户页表检查 \code{user\_buf} 是否可写；若用户 buffer 跨两个页，其中第二页不可写，复制可能在中途失败。内核必须保证返回值能表达“实际复制了多少”或返回错误，而不是假设一次 4096 字节复制必然整体成功。
+
+未命中路径才会走到 NVMe。若数据不在 page cache，块层可能向 NVMe 设备提交读请求。这个路径同时经过系统调用入口、用户地址检查、页分配或 pin、DMA 映射、普通内存 descriptor、MMIO doorbell、IOMMU、设备 DMA、completion、MSI-X 中断和等待队列。
+
+\begin{longtable}{p{0.15\linewidth}p{0.43\linewidth}p{0.3\linewidth}}
+\toprule
+阶段 & 硬件或内核动作 & 关键不变量 \\
+\midrule
+系统调用入口 & CPU 从用户态进入内核，保存返回 RIP、状态和寄存器参数 & \code{user_buf} 只是用户虚拟地址，不是设备可用地址 \\
+检查用户 buffer & 内核按 VMA 和页表检查范围，必要时 fault-in 或 pin 页 & I/O 完成前相关页不能被释放、换出或迁移到不可访问状态 \\
+建立 DMA 映射 & DMA API/IOMMU 建立 \code{IOVA -> PA}，附带读写方向权限 & 设备只能访问被授权的页和方向 \\
+填写 submission entry & CPU 在普通内存队列写 opcode、LBA、长度、DMA 地址、request tag & descriptor 必须先对设备可见 \\
+敲 doorbell & 驱动写 MMIO doorbell，通知设备队列 tail 前进 & doorbell 是设备命令，不是数据本身；posted write 需要排序意识 \\
+设备取请求 & NVMe 控制器 DMA 读 submission entry，经 IOMMU 翻译 IOVA & IOMMU 或 IOTLB 错误会变成 DMA fault 或设备错误 \\
+设备写数据 & 设备把磁盘数据 DMA 写入 buffer & CPU 不能提前释放或复用 buffer；非一致平台还要 cache invalidate \\
+设备写 completion & 设备把 status、tag、phase 写入 completion queue，并投递 MSI-X & 中断只是通知，真正结果在 completion 项里 \\
+内核完成请求 & IRQ handler 或轮询读取 completion，按 tag 找回请求，unmap，唤醒等待线程 & completion 前释放对象会导致迟到 DMA 或唤醒错请求 \\
+\bottomrule
+\end{longtable}
+
+这条路径说明，“走不走 cache”无法单独解释 I/O。descriptor 在普通内存里，CPU 写它时会受 cache 和 store buffer 影响；doorbell 在 MMIO 区间，不能按普通内存缓存；设备 DMA 访问 buffer，要经过 IOMMU；completion 写回内存后，中断控制器把 MSI-X 投递给 CPU；CPU 再进入中断入口。任何一段顺序错了，表现可能是超时、数据损坏、中断风暴、IOMMU fault 或 use-after-free。
+
+把这条读请求按硬件块拆开，能看出每个机制解决的不是同一个问题：
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+硬件块 & 在这次 NVMe 读里负责什么 & 不能混淆的边界 \\
+\midrule
+TLB/MMU & 内核访问用户地址、队列和 MMIO 映射时，都要先把虚拟地址翻译成可访问的物理或设备地址范围 & TLB miss 只是翻译缓存未命中；用户 buffer 不合法才会走 fault 或错误返回 \\
+CPU cache & CPU 写 submission entry、读 completion、复制用户数据时，会缓存普通内存里的 cache line & cache 命中只说明 CPU 访问普通内存快，不说明设备已经看到 descriptor \\
+store buffer/屏障 & CPU 可能把普通内存写暂存在本地；屏障约束 descriptor 先于 doorbell 对设备可见 & 源码先写 descriptor 再写 doorbell，不自动等于设备观察顺序正确 \\
+MMIO/BAR & doorbell 是设备寄存器，CPU 写它是在通知控制器读队列 & MMIO 不是普通 RAM，不能被普通缓存和随意合并替代 \\
+DMA 引擎 & 设备按 descriptor 中的 DMA 地址读写 buffer 和 completion queue & DMA 不是 CPU memcpy，设备会在 CPU 之外主动访问内存 \\
+IOMMU/IOTLB & 把设备看到的 IOVA 翻译成被授权的物理页，并限制方向和范围 & 它保护的是设备访问内存的边界，不是用户进程 load/store 的边界 \\
+中断控制器/MSI-X & completion 写好后，把“有完成需要处理”的事件投递给某个 CPU & 中断只是提示，不携带完整请求结果；驱动仍要读 completion ring \\
+request tag & 把异步 completion 对回原始内核请求对象和等待者 & tag 复用过早会把完成事件交给错误请求 \\
+\bottomrule
+\end{longtable}
+
+因此，cache 只是路径中的一层。一次 I/O 还同时经过地址翻译、普通内存可见性、设备寄存器顺序、设备侧 DMA、IOMMU 权限、中断投递和请求匹配。优化或排错时只盯着 cache，容易把权限错误、顺序错误、设备超时和 completion 匹配错误都看成同一种慢访问。
+
+\medskip
+\noindent\textbf{第五条完整路径：一次 \code{write} 到 \code{fsync} 为什么才牵出持久化硬件。}
+
+普通文件写入最容易被误解成“用户 buffer 里的字节马上写到磁盘”。实际情况通常不是这样。用户执行：
+
+\begin{lstlisting}
+write(fd, user_buf, 4096);
+fsync(fd);
+\end{lstlisting}
+
+若 \code{fd} 是普通文件，\code{write} 的常见快路径是把用户数据复制到 page cache 中的文件页，并把这页标记为 dirty。dirty 的意思是“内存里的文件页比设备上的持久副本更新”。\code{write} 返回时，数据可能还只在 DRAM 里；后台 writeback 或之后的 \code{fsync} 才会把 dirty 页提交给块设备。于是 \code{write} 解决的是“内核已经接收这批字节”，\code{fsync} 才试图解决“这批字节和必要元数据已经进入设备承诺的持久化边界”。
+
+\begin{longtable}{p{0.17\linewidth}p{0.43\linewidth}p{0.28\linewidth}}
+\toprule
+阶段 & 硬件和内核动作 & 关键边界 \\
+\midrule
+系统调用入口 & CPU 保存用户返回点和寄存器参数，进入内核 & \code{user\_buf} 仍是不可信用户虚拟地址 \\
+复制用户数据 & 内核按用户页表读取 \code{user\_buf}，通过 CPU cache/load/store 复制到 page cache 页 & 用户页可能缺页或不可读，错误属于用户地址边界 \\
+标记 dirty & 文件页在内存中变成新版本，并记录需要回写 & \code{write} 返回不等于设备已经持久化 \\
+writeback 提交 & 内核把 dirty 页转成 bio/request，块层可能合并、排序或限流 & 文件页所有权从“只在内存中更新”转向“等待设备写入” \\
+DMA 到设备 & 驱动建立 DMA 映射，填描述符，写 doorbell；设备读取内存中的数据并写入介质或控制器缓存 & buffer、descriptor、IOMMU 和 completion 顺序必须正确 \\
+设备 completion & 设备报告写命令完成 & completion 可能只说明设备已接收或写入其缓存，是否断电不丢取决于设备缓存策略 \\
+\code{fsync} & 内核等待相关 dirty 数据、日志或元数据提交，并在需要时发送 flush 或 FUA & 返回前必须满足文件系统和设备共同定义的持久化承诺 \\
+\bottomrule
+\end{longtable}
+
+这里有两个不同层面的缓存。CPU cache 缓存的是普通内存里的 cache line，例如 page cache 页、描述符和 completion ring。存储设备也可能有自己的写缓存，可能在控制器 DRAM、SSD FTL 缓冲区或带断电保护的缓存中。CPU cache miss、page cache dirty、设备写缓存，这三个概念不能混在一起。CPU cache 是处理器近端副本；page cache 是内核用 DRAM 保存文件内容；设备写缓存是存储控制器为了吞吐暂存请求的内部状态。
+
+\begin{longtable}{p{0.18\linewidth}p{0.4\linewidth}p{0.3\linewidth}}
+\toprule
+缓存层次 & 保存什么 & 断电或错误时的含义 \\
+\midrule
+CPU cache & 普通内存 cache line 的近端副本 & 硬件一致性通常保证最终写回 DRAM，但它不是文件持久化边界 \\
+page cache & 文件页在内核 DRAM 中的副本 & \code{write} 后可能只有这里是新数据，断电会丢 \\
+块层队列 & 等待提交、合并或调度的 I/O 请求 & 请求还没到设备，不能承诺持久化 \\
+设备写缓存 & 控制器内部暂存的写入 & 若没有断电保护，completion 后仍可能在突然断电时丢失 \\
+非易失介质或保护域 & NAND、磁盘介质，或有电容保护的控制器缓存 & \code{fsync} 想达到的通常是这个边界 \\
+\bottomrule
+\end{longtable}
+
+持久化难点在于“写入顺序”也必须被保存。假设文件系统先写元数据说“文件长度已经增长”，但数据页还没真正落到持久介质，断电后就可能出现文件长度变大而内容是旧数据或空洞。文件系统因此会使用日志、写屏障、flush、FUA 或有序 writeback。FUA 可以理解成“这次写不要只停在易失写缓存里，完成前要到达设备承诺的持久边界”；flush 则是要求设备把之前已经接收的写缓存刷到持久边界。
+
+\begin{lstlisting}
+fsync_persistence_path:
+  copy user bytes into page cache
+  mark file page dirty
+  submit data writeback
+  wait for data write completion
+  submit or commit filesystem metadata/journal
+  issue flush or FUA if device write cache needs draining
+  return success only after required completions
+\end{lstlisting}
+
+这个伪代码里的每一行都对应不同硬件证据。数据 write completion 说明那批数据请求有结果；journal completion 说明文件系统元数据的事务有结果；flush completion 说明设备承认之前的易失写缓存已经被推进到承诺边界。若设备谎报 flush，或者没有正确实现断电保护，OS 再严格也无法凭空制造持久性。OS 的职责是把请求顺序和设备命令发对，并在设备报告错误时向上层返回失败。
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+断点 & 可能发生什么 & 恢复后看到的结果 \\
+\midrule
+\code{write} 返回后、writeback 前断电 & 新数据只在 DRAM page cache 里 & 文件可能仍是旧内容，除非另有同步保障 \\
+设备写命令已完成、flush 前断电 & 数据可能在设备易失写缓存中 & 取决于设备是否有断电保护或是否要求 flush/FUA \\
+数据持久化、元数据未持久化 & 数据块可能存在，但文件系统还没把它连接到文件名、长度或块映射 & 日志恢复可能丢弃这次变化，避免结构损坏 \\
+元数据先持久化、数据未持久化 & 文件系统结构看似指向新数据，但内容可能旧或未定义 & 这是文件系统必须通过顺序和日志避免的危险路径 \\
+\code{fsync} 成功返回后断电 & 设备和文件系统已经给出持久化完成证据 & 正常情况下应能恢复到包含这次同步写入的状态 \\
+\bottomrule
+\end{longtable}
+
+这条路径把硬件链路再扩了一层：CPU 负责复制和提交请求，MMU 负责验证用户地址，page cache 负责吸收普通文件读写，块层负责排队和合并，NVMe 或其他控制器负责 DMA 和 completion，存储介质或设备保护域负责最终持久性。若把 \code{write} 理解成“直接写盘”，就无法解释为什么系统需要 dirty page、writeback、journal、flush、FUA、I/O scheduler 和错误上报。
+
+\medskip
+\noindent\textbf{第六条完整路径：改页表权限后，为什么还要让其他 CPU 配合。}
+
+最后看一个纯内存管理的大案例。内核把某个虚拟页从可写改成只读，常见于 COW、\code{mprotect} 或撤销映射。
+
+\begin{lstlisting}
+make page read-only:
+  update PTE writable bit from 1 to 0
+  flush stale TLB entry on CPUs that may use it
+  return after old writable translations cannot be used
+\end{lstlisting}
+
+修改内存里的 PTE 只是第一步。其他 CPU 的 TLB 里可能还缓存着旧的“可写”翻译；当前 CPU 的 store buffer 里也可能有更早的写入；另一个 CPU 可能正在用户态运行同一个进程。若不处理旧翻译，硬件仍可能按旧权限完成写入。
+
+\begin{longtable}{p{0.18\linewidth}p{0.4\linewidth}p{0.3\linewidth}}
+\toprule
+阶段 & 硬件事实 & OS 为什么要处理 \\
+\midrule
+更新 PTE & 页表内存里的 writable 位被清掉 & 只改变了内存中的权威记录，没清掉 TLB 副本 \\
+本地 TLB flush & 当前 CPU 丢弃该虚拟页旧翻译 & 防止当前 CPU 继续用旧权限写入 \\
+远端 shootdown & 向可能运行该地址空间的 CPU 发 IPI，让它们失效旧 TLB entry & 防止其他 CPU 用旧 writable 翻译越过新权限 \\
+等待确认 & 远端 CPU 完成失效后返回确认 & 内核才能认为旧权限已经不可再用 \\
+后续写入 & 用户再次写该页时触发保护异常 & COW 或 \code{SIGSEGV} 才有可靠硬件证据 \\
+\bottomrule
+\end{longtable}
+
+这个案例同时涉及页表、TLB、中断、跨核通知和调度。TLB shootdown 不是“刷新缓存”四个字那么简单：它要求 OS 知道哪些 CPU 可能持有这个地址空间，给它们发 IPI，远端 CPU 在安全点执行失效，再返回确认。若某个 CPU 正在关中断或长时间不可响应，权限切换的完成时间就会变长。COW、\code{mprotect}、进程迁移和安全隔离都压在这条硬件链路上。
+
+\medskip
+\noindent\textbf{第七条完整路径：一次 \code{write(fd, buf, 1)} 怎样从用户态走到设备。}
+
+现在把开头的输出一个字节放进真实 OS 路径。用户态执行：
+
+\begin{lstlisting}
+write(fd, buf, 1);
+\end{lstlisting}
+
+若 \code{fd} 对应的是一个简单串口或早期 console，这个请求最后可能落到 MMIO 状态寄存器和数据寄存器上。注意这不是“用户调用驱动函数”。用户程序只能把参数放进寄存器，然后用系统调用指令进入内核；内核再把不可信参数转换成经过验证的内核对象和地址。
+
+\begin{longtable}{p{0.15\linewidth}p{0.44\linewidth}p{0.29\linewidth}}
+\toprule
+阶段 & 硬件路径 & OS 必须确认什么 \\
+\midrule
+用户发起 & ABI 把 \code{fd}、\code{buf}、\code{len} 放进寄存器；系统调用指令触发受控入口 & 寄存器参数来自用户，不可信 \\
+进入内核 & CPU 切换特权级，保存返回 RIP、状态寄存器和必要寄存器，改用内核栈 & trap frame 足够让内核将来返回用户态 \\
+查 \code{fd} & 内核用当前 task 的文件表把小整数 \code{fd} 转成 file 对象 & \code{fd} 可能无效，或对象不支持写 \\
+取用户字节 & \code{buf} 是用户虚拟地址；\code{copy\_from\_user} 会走用户页表、TLB 和 cache，也可能缺页 & 不能把用户指针直接当内核指针，更不能直接交给设备 \\
+进入驱动 & 驱动拿到已经复制到内核侧的字节，获取设备锁，检查设备状态 & 多个写者不能同时打乱设备寄存器顺序 \\
+读状态寄存器 & CPU 对 MMIO 状态地址发起 read，经地址译码、root complex 或片上总线到设备 & 读到的是设备当前状态，不是 cache 里的普通变量 \\
+写数据寄存器 & CPU 对 MMIO 数据地址发起 write，设备状态机接收字节并清 busy/ready 状态 & 写入可能启动外部动作，不能按普通 RAM 重排 \\
+返回用户态 & 内核设置返回值，系统调用返回路径恢复用户寄存器和特权级 & 返回成功只说明字节已提交给对应语义，不一定代表外设物理动作已经完全结束 \\
+\bottomrule
+\end{longtable}
+
+这里同时有两条访存路径。读取 \code{buf[0]} 是普通用户内存访问：它要通过用户页表和 cache，可能命中 L1，也可能 TLB miss、缺页或权限失败。写设备数据寄存器是 MMIO 访问：它也从一条 store 指令开始，但地址属性把它送到设备寄存器，而不是送到普通 cache line。若把二者混成“读一个地址、写一个地址”，就会漏掉系统调用入口、用户地址验证、文件对象、驱动锁、MMIO 顺序和设备状态机。
+
+失败路径也要按硬件边界拆开。系统调用入口失败，表现为非法入口或错误的寄存器状态；\code{fd} 失败，是内核对象表查不到；\code{buf} 失败，可能是页表权限或缺页处理不能完成；设备失败，可能是 MMIO 状态长期 busy、错误位被置起，或写后设备不再产生预期完成事件。每一类失败对应的证据不同，所以 OS 不能只返回一个模糊的“写失败”，它要尽量把错误定位到参数、地址、权限、设备状态或超时。
+
+\medskip
+\noindent\textbf{第八条完整路径：一次定时器中断怎样变成线程切换。}
+
+再看没有用户主动调用的路径。当前 CPU 正在用户态执行普通代码，硬件定时器到期后投递中断。这个事件可能导致内核抢占当前线程，切换到另一个线程运行。
+
+\begin{lstlisting}
+timer expires:
+  interrupt controller delivers vector
+  CPU enters kernel interrupt path
+  scheduler may choose another task
+  return to selected task
+\end{lstlisting}
+
+这条路径重点不是 cache，而是“异步事件怎样在安全边界接入当前执行流”。定时器不是修改用户变量，也不是调用用户函数；它通过中断控制器让 CPU 在指令边界进入内核入口。内核随后把当前执行现场变成可保存对象，再决定是否继续运行原线程。
+
+\begin{longtable}{p{0.15\linewidth}p{0.44\linewidth}p{0.29\linewidth}}
+\toprule
+阶段 & 硬件路径 & OS 决策点 \\
+\midrule
+定时器到期 & local APIC timer、HPET 或平台定时器达到比较值，产生中断请求 & 当前 CPU 是否允许接收中断，是否处在不可抢占区 \\
+中断投递 & 中断控制器把 vector 投递给目标 CPU & vector 只说明入口类型，不说明调度结果 \\
+入口保存 & CPU 保存返回位置、状态和部分现场，切换到内核入口和内核栈 & trap frame 必须足够恢复被打断代码 \\
+内核计时 & handler 更新 tick、hrtimer、运行时间统计和超时队列 & 哪些等待者到期，当前线程时间片是否耗尽 \\
+调度判断 & 若允许抢占，scheduler 比较 runqueue，选择下一个 task & 不能在持锁、关中断或不可抢占区域随意切换 \\
+地址空间切换 & 若换到另一个进程，切换页表根或地址空间标识，处理必要的 TLB 状态 & 旧进程的用户虚拟地址不能被新进程继续解释 \\
+执行现场切换 & 保存旧线程 callee-saved 寄存器、栈指针等，恢复新线程现场 & 漏保存一个寄存器就会破坏用户程序语义 \\
+返回执行 & 中断返回指令恢复目标 task 的 RIP、状态和特权级 & 返回点可能是原线程，也可能是另一个线程上次停下的位置 \\
+\bottomrule
+\end{longtable}
+
+这一案例把 CPU、定时器、中断控制器、内核栈、调度器、页表、TLB 和 cache 热状态放到同一条线上。切换页表会影响 TLB 命中；切到另一个 CPU 或另一个工作集，会影响 cache 命中；但这些只是成本的一部分。更根本的不变量是：被打断线程的现场必须完整保存，新线程的地址空间必须正确生效，中断控制器必须收到合适的确认，内核不能在不允许抢占的硬件和软件边界上强行切换。
+
+若定时器路径出错，症状也各不相同。定时器未重新编程，超时和抢占不发生；中断被屏蔽，CPU 长时间不进入调度；EOI 顺序错误，可能出现中断风暴或后续中断被卡住；现场保存错误，会变成随机寄存器损坏；页表切换错误，则会让一个进程用另一个进程的地址解释 load/store。把这些都归结为“调度有 bug”，无法定位真正硬件边界。
+
+\medskip
+\noindent\textbf{第九条完整路径：\code{fork} 后第一次写 COW 页为什么能被精确拦住。}
+
+\code{fork} 后，父子进程常常先共享同一批物理页。为了避免立刻复制所有内存，内核把这些页同时映射到父子进程，但清掉 writable 位。等某一方第一次写入时，硬件保护异常把这个动作拦住，内核再复制页面。这就是 copy-on-write，简称 COW。
+
+\begin{lstlisting}
+after fork:
+  parent PTE: PA=X, read-only, COW
+  child  PTE: PA=X, read-only, COW
+
+child writes *p:
+  hardware sees write to read-only PTE
+  page fault enters kernel before store commits
+\end{lstlisting}
+
+\begin{longtable}{p{0.16\linewidth}p{0.43\linewidth}p{0.29\linewidth}}
+\toprule
+阶段 & 硬件和内核动作 & 为什么不能省略 \\
+\midrule
+建立共享 & 父子页表都指向同一物理页，PTE 清 writable，并记录 COW 语义 & 只读保护是让硬件拦住第一次写的关键 \\
+清旧翻译 & 对已运行过的地址空间失效旧 writable TLB entry & 否则 CPU 可能继续用旧可写权限 \\
+用户写入 & store 指令地址翻译时发现 PTE 不允许写 & 错误 store 还未提交，原指令可重试 \\
+进入缺页 & CPU 保存 fault address、error code、RIP，进入内核缺页入口 & 内核能知道是哪一个地址、哪一种权限失败 \\
+分配新页 & 内核分配物理页，把旧页内容复制过去，更新引用计数 & 父子后续写入不能互相污染 \\
+更新 PTE & 当前进程 PTE 改成新物理页并恢复 writable，必要时 flush TLB & 新翻译必须替换旧只读翻译 \\
+重试 store & 缺页处理返回后，CPU 重新执行原 store，这次写入新页 & 用户态看见的是一次普通写入，没有看到中间复制 \\
+\bottomrule
+\end{longtable}
+
+这个案例容易被讲成“页表 + 缺页”两个词，但完整链路更长。写指令先经过地址生成和权限检查，TLB 可能命中旧只读翻译，也可能 page walk 读到只读 PTE；无论哪条路径，只要权限拒绝，CPU 都要在提交前进入异常。内核进入后还要确认 VMA 是否允许写、PTE 是否真是 COW、物理页引用计数是否大于一。若不是 COW，而是用户写只读代码页，就不能复制后放行，而要给进程发段错误。
+
+COW 也说明 cache 不是唯一变量。复制旧页时，CPU 会把旧页 cache line 读入并写新页；更新 PTE 后，要处理 TLB 旧翻译；多核下，其他 CPU 可能也运行同一地址空间，需要 shootdown；内存分配器要保证新物理页不含别的进程残留数据；异常返回要保证原 store 可重试。少看任何一个硬件块，这个“懒复制”就解释不完整。
+
+\medskip
+\noindent\textbf{第十条完整路径：网卡收到一个包怎样走到 \code{recv}。}
+
+最后看外部输入路径。网卡收到一个以太网帧，用户进程稍后调用：
+
+\begin{lstlisting}
+recv(sock, buf, len);
+\end{lstlisting}
+
+这个路径和 NVMe 读类似，都有 DMA、IOMMU、completion 和中断；但它还多了网络协议栈、socket 接收队列和从内核 buffer 到用户 buffer 的复制。它能说明“设备主动把数据带进系统”时，硬件和 OS 怎样共同维护所有权。
+
+\begin{longtable}{p{0.15\linewidth}p{0.44\linewidth}p{0.29\linewidth}}
+\toprule
+阶段 & 硬件或内核动作 & 关键边界 \\
+\midrule
+预先布置 RX ring & 驱动分配 packet buffer，建立 DMA 映射，把 IOVA 写进接收描述符 & 设备只能 DMA 到这些已授权 buffer \\
+包到达网卡 & 网卡 PHY/MAC 接收帧，控制器选择一个可用 RX descriptor & 没有空 descriptor 时可能丢包或触发流控 \\
+DMA 写入内存 & 网卡经 PCIe/root complex/IOMMU 把包数据写入 buffer，并更新 descriptor 状态 & IOMMU 限制设备不能写到任意内存 \\
+投递中断或轮询 & 网卡发 MSI-X，或 NAPI 轮询稍后批量收包 & 中断只是提示有工作，结果仍要读 ring 状态 \\
+驱动收割 completion & CPU 读取 RX ring，做必要的 cache 同步，构造 skb 或等价包对象 & buffer 所有权从设备转回内核 \\
+协议栈处理 & 内核解析二层、IP、TCP/UDP，把数据挂到 socket 接收队列 & 包可能被丢弃、重组、校验失败或排队等待 \\
+用户 \code{recv} & 系统调用进入内核，检查用户 \code{buf}，把 socket 数据复制到用户页 & 用户地址可能缺页或权限失败 \\
+补充 buffer & 驱动给 RX ring 重新挂上空 buffer，并写 doorbell 或更新 tail & 不补 buffer，设备后续没有位置接收新包 \\
+\bottomrule
+\end{longtable}
+
+这条路径同时存在三类“内存”。第一类是普通内核对象，例如 socket 队列、skb 元数据和协议栈状态，它们由 CPU 读写并受 cache 一致性影响。第二类是 DMA buffer，提交给设备后由设备写入，completion 前 CPU 不能把它当普通可释放内存。第三类是用户 \code{buf}，它属于用户地址空间，只有系统调用检查和复制阶段才被内核安全接触。把这三类地址混在一起，就会出现把用户指针塞给设备、completion 前释放 DMA buffer、或协议栈读到未同步数据这类严重错误。
+
+网卡路径也能说明为什么高性能 I/O 经常选择轮询和批量。每个包都发一次中断，CPU 会在中断入口、cache 扰动和协议栈调度上付出高成本；NAPI 这类机制会在中断提示后暂时转为轮询，一次收割多个 completion。优化并没有取消硬件边界：RX ring 仍要有所有权位，IOMMU 映射仍要有效，MSI-X 或轮询仍要保证内核最终发现 completion，用户 \code{recv} 仍要通过页表和权限检查。
+
+\section{五、回到输出一个字节}
+
+回到开头那两行：
+
+\begin{lstlisting}
+output_one_byte('A'):
+  wait until the output device can accept one byte
+  place 'A' into the device's input slot
+\end{lstlisting}
+
+经过前面的推导，这个需求可以对应到完整硬件路径：
+
+\begin{longtable}{p{0.2\linewidth}p{0.38\linewidth}p{0.3\linewidth}}
+\toprule
+需求片段 & 硬件含义 & 对后续 OS 章节的连接 \\
+\midrule
+当前执行到哪一步 & CPU 从程序计数器指向的指令继续执行，参数和临时值在寄存器或栈里 & task、trap frame、上下文切换 \\
+设备是否可接收 & CPU 对设备状态地址发起 load，设备状态机返回 ready/busy & 驱动轮询、超时、错误证据 \\
+根据状态选择动作 & 条件分支依赖 ALU 标志位和程序计数器更新 & 条件分支、异常边界、可恢复现场 \\
+把字节交给设备 & CPU 对设备寄存器对应地址发起 store，写入顺序就是命令顺序 & MMIO 顺序、屏障、posted write \\
+设备自己完成输出 & 设备按自己的时钟发送字节，CPU 不参与每个 bit & 异步设备、等待队列、调度让出 CPU \\
+完成或失败怎样回来 & 设备更新状态位，复杂设备还会写 completion 或发中断 & IRQ、completion、request 生命周期 \\
+输出一大块数据 & CPU 准备描述符和 DMA buffer，让设备批量搬运 & DMA mapping、IOMMU、buffer ownership \\
+\bottomrule
+\end{longtable}
+
+最后把它按一次真实执行走完。假设内核已经把设备 BAR 映射到内核虚拟地址 \code{dev->mmio}，其中 \code{STATUS} 偏移为 \code{0x00}，\code{DATA} 偏移为 \code{0x04}。当前 CPU 的 \code{RIP} 指向驱动里的轮询代码，某个寄存器保存 \code{dev->mmio}，另一个寄存器保存待写字节 \code{'A'}。硬件不会看到“输出一个字符”这个高级意图，它只会执行一串 load、test、branch 和 store。
+
+\begin{longtable}{p{0.15\linewidth}p{0.42\linewidth}p{0.31\linewidth}}
+\toprule
+步骤 & 硬件结构路径 & 这一刻的关键边界 \\
+\midrule
+取指 & PC/RIP 进入取指前端，指令 cache 返回驱动代码字节 & CPU 知道下一条机器指令，不知道 C 函数语义 \\
+算状态地址 & 寄存器文件读出 \code{dev->mmio}，ALU/地址生成单元加上 \code{STATUS} 偏移 & 地址只是候选，还要经过翻译和属性检查 \\
+翻译地址 & MMU/TLB 把内核虚拟地址翻译成设备 BAR 的物理地址，并确认内核可访问 & 页表权限和内存类型决定这是设备访问，不是普通 RAM \\
+读状态 & 总线把 MMIO read 路由到设备，设备状态寄存器返回 \code{READY/ERR} 位 & 读到的是设备保存的当前状态，不能用普通变量缓存替代 \\
+条件分支 & ALU/test 逻辑检查 \code{READY}，下一 PC 选择循环或写数据路径 & 分支依赖状态位，错误时必须能保留可恢复现场 \\
+算数据地址 & 地址生成单元计算 \code{dev->mmio + DATA} & 仍是 MMIO 地址，写入会变成设备命令 \\
+写数据 & CPU 发出 MMIO write，设备数据寄存器接收 \code{'A'}，设备清 \code{READY} 开始工作 & store 提交后，命令已经越过 CPU/设备边界 \\
+设备推进 & 设备按自己的状态机发送字节，完成后置 \code{READY} 或 \code{ERR}，复杂设备还会 IRQ & CPU 不控制每个外部 bit，只能观察状态或事件 \\
+\bottomrule
+\end{longtable}
+
+这条路径里任何一步都可能改变 OS 的处理方式。取指或执行阶段若遇到异常，内核得到的是 CPU 异常现场；地址翻译失败，说明驱动映射或权限有问题；MMIO read 长期看不到 ready，驱动要按超时处理；MMIO write 后设备报错，驱动要清状态、reset 或向上层返回失败；如果改成大块输出，单个 \code{DATA} 寄存器就不够，必须升级到 descriptor、DMA、completion 和 IOMMU。也就是说，OS 不是把一个“输出函数”塞给硬件，而是在每一个硬件边界上维护状态、权限、顺序和失败证据。
+
+结论可以概括为一条检查法：分析任意 OS 机制时，都要说明它来自哪一个机器需求，又落在哪个硬件事实上。进程能被暂停，是因为执行现场能保存；虚拟内存能懒分配，是因为缺页异常可重试；驱动要处理 timeout，是因为设备是状态机；DMA 需要严格约束，是因为设备能越过 CPU 直接访问内存；启动阶段特殊，是因为这些契约还没完全建立。
+
+硬件链路可以收束成一张回查地图。遇到任意 OS 机制时，都可以把它放回这些机器事实：它依赖哪种状态，哪条数据通路，哪种权限检查，哪类异步事件，哪种完成证据。
+
+\begin{longtable}{p{0.16\linewidth}p{0.38\linewidth}p{0.34\linewidth}}
+\toprule
+硬件事实 & 解决的问题 & 后续衔接位置 \\
+\midrule
+时钟/复位 & 状态寄存器让机器有可解释的上一刻和下一刻 & 启动、异常返回、设备 reset 和错误恢复 \\
+提交边界 & ALU、MUX 和寄存器让指令结果从候选值变成软件可见状态 & trap frame、上下文切换、精确异常和调试证据 \\
+入口现场 & 程序计数器、栈和 ABI 保存普通调用和异常入口的返回路径 & 系统调用、信号、线程切换和 \code{exec} 用户栈 \\
+地址翻译 & 页表、TLB、cache 和内存属性让地址访问能被翻译、缓存、拒绝或重试 & 虚拟内存、page fault、COW、TLB shootdown 和锁性能 \\
+设备寄存器 & MMIO、总线、设备状态位和中断让外部设备进入 CPU 世界 & 驱动、定时器、等待队列、超时和中断下半部 \\
+DMA 完成 & descriptor、DMA、IOMMU 和 completion 让设备批量搬运数据，并把完成事件对应回请求 & 块层、网卡、page cache、buffer 生命周期和错误返回 \\
+多核同步 & 一致性协议和原子操作让多个执行流共享内存但仍能维护不变量 & 调度、锁、futex、RCU、伪共享和内存屏障 \\
+平台资源 & 固件、ACPI/PCIe、NVMe/FTL 和安全硬件让内核发现资源并处理故障证据 & 设备枚举、持久化、崩溃恢复、权限隔离和观测 \\
+\bottomrule
+\end{longtable}
+
+遇到一个 OS 名词，不应只背定义，还要追问它压在哪个硬件事实上。进程压在可保存执行现场上；虚拟内存压在页表、TLB 和 fault 上；文件 I/O 压在 page cache、descriptor、DMA 和 completion 上；安全隔离压在特权级、页表权限、对象引用和审计证据上。这样硬件基础不会变成前置名词表，而会持续参与每一个机制解释。
+
+第二章到这里结束。后面不再继续堆硬件名词，而是换一个视角：既然硬件只提供现场、地址、权限、队列、事件和完成证据，内核为什么必须把它们包装成 task、地址空间、文件对象、request、wait queue 和 completion。下一章就从一次写日志请求开始，把这些硬件事实收束成内核对象。
