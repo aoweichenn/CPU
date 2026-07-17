@@ -84,6 +84,23 @@ ADD dst=R3, src_a=R1, src_b=R2
 
 这些控制信号稳定后，寄存器阵列的两个读端口输出 R1 和 R2 当前的值。它们经过 ALU 输入选择器进入 ALU，加法路径产生结果。结果再经过写回选择器，到达寄存器阵列的写数据端口。另一边，PC 加法器准备下一条指令地址，PC 选择器把它送到 PC 的下一值输入。只有到时钟沿，两个状态变化才同时提交：R3 保存 ALU 结果，PC 保存下一条地址。
 
+把这次走读填上具体数值，"路径"就变成"账目"。设 \code{R1=5}、\code{R2=7}、指令长 2 字节：
+
+\begin{longtable}{L{0.16\linewidth}L{0.34\linewidth}L{0.42\linewidth}}
+\toprule
+时刻 & 路径上的值 & 账目核对 \\
+\midrule
+周期开始 & \code{PC=100} & 取指地址稳定 \\
+取指后 & \code{IR = ADD R3,R1,R2} & 编码来自 \code{MEM[100]} \\
+译码后 & \code{alu\_op=ADD}，读地址 R1/R2，写地址 R3，\code{wb\_sel=ALU}，\code{reg\_write=1} & 控制线与 opcode 一致 \\
+读寄存器 & \code{read\_a=5}，\code{read\_b=7} & 寄存器堆当前值 \\
+执行后 & \code{ALU\_out=12}，写回 mux 输出 12 & 加法路径和写回选择正确 \\
+时钟沿 & \code{R3 <- 12}，\code{PC <- 102} & 两个状态同时提交，R1/R2 不变 \\
+\bottomrule
+\end{longtable}
+
+任何一格对不上，故障范围就锁死了：\code{read\_a} 不是 5，查寄存器堆读地址；\code{ALU\_out} 不是 12，查 \code{alu\_op} 和进位链；12 没到写数据口，查 \code{wb\_sel}；R3 没变或 PC 没变，查 \code{reg\_write}、\code{pc\_write} 和时钟沿本身。这就是 trace 比"检查一下"可靠的地方。
+
 分支也可以归结为下一 PC 选择。顺序情况下，下一 PC 是 PC 加指令长度；条件分支则由 ALU 比较结果和选择器决定下一 PC 来源：
 
 \begin{lstlisting}
@@ -108,7 +125,7 @@ PC 更新 & 选择顺序 PC、分支目标、跳转目标或异常入口 & \code
 \bottomrule
 \end{longtable}
 
-这张表可以直接变成验收清单。若某条 LOAD 指令读到了错误数据，不应只问“内存为什么错”，而要逐项检查：PC 是否取到正确编码，译码是否识别为 LOAD，ALU 是否形成正确地址，MEM 阶段是否访问正确目标，读回数据是否进入 MDR，WB 阶段是否选择了 MDR 而不是 ALUOut。这样的排查方式比凭感觉改控制器可靠得多。
+这张表可以直接变成验收清单。若某条 LOAD 指令读到了错误数据，不应只问“内存为什么错”，而要逐项检查：PC 是否取到正确编码，译码是否识别为 LOAD，ALU 是否形成正确地址，MEM 阶段是否访问正确目标，读回数据是否进入 MDR（memory data register，存储器数据寄存器——访存返回数据在进入写回路径之前的暂存，写回 mux 的“存储器数据”候选就是从它引出），WB 阶段是否选择了 MDR 而不是 ALUOut。这样的排查方式比凭感觉改控制器可靠得多。
 
 \topic{控制字把“会执行指令”落到可接线信号}教学 CPU 最容易写成口号：取指、译码、执行、写回。真正能搭出来的版本必须有控制字。控制字不是高级软件结构，而是一组在某个周期稳定的控制线集合。它决定寄存器是否写入、ALU 选哪个操作、存储器是否读写、PC 从哪里取下一值。若控制字没有定义清楚，CPU 即使图上连通，也无法稳定执行程序。
 
@@ -139,6 +156,35 @@ control word fields:
   byte_en     // selected byte lanes
   flags_write // update Zero/Carry/Overflow/Sign
 \end{lstlisting}
+
+把控制字压到这台具体 ISA 上，每条指令一行，全部 7 条覆盖：
+
+{\setlength{\tabcolsep}{2pt}
+\begin{longtable}{L{0.09\linewidth}L{0.1\linewidth}L{0.11\linewidth}L{0.11\linewidth}L{0.11\linewidth}L{0.07\linewidth}L{0.09\linewidth}L{0.09\linewidth}L{0.09\linewidth}}
+\toprule
+指令 & \code{alu\_op} & \code{a\_sel} & \code{b\_sel} & \code{wb\_sel} & \code{reg\_w} & \code{mem\_r} & \code{mem\_w} & \code{pc\_sel} \\
+\midrule
+\code{ADD} & ADD & 寄存器 & 寄存器 & ALU & 1 & 0 & 0 & 顺序 \\
+\code{LDI} & 直送 & 立即数 & — & ALU & 1 & 0 & 0 & 顺序 \\
+\code{LOAD} & ADD & 寄存器 & off4 扩展 & 存储器 & 1 & 1 & 0 & 顺序 \\
+\code{STORE} & ADD & 寄存器 & off4 扩展 & — & 0 & 0 & 1 & 顺序 \\
+\code{JZ} & 判零 & 寄存器 & — & — & 0 & 0 & 0 & Z?目标：顺序 \\
+\code{JMP} & — & — & — & — & 0 & 0 & 0 & 目标 \\
+\code{SLI} & 左移 & 寄存器 & imm4 & ALU & 1 & 0 & 0 & 顺序 \\
+\bottomrule
+\end{longtable}
+}
+
+这张表还能再压成布尔式。以 \code{reg\_write} 为例，它只在四条指令下为 1：
+
+\begin{lstlisting}
+reg_write = (op == ADD) OR (op == LDI) OR (op == LOAD) OR (op == SLI)
+mem_read  = (op == LOAD)
+mem_write = (op == STORE)
+pc_sel    = (op == JMP) OR ((op == JZ) AND Zero) ? target : sequential
+\end{lstlisting}
+
+译码器到此就没有黑箱了：输入 opcode 的 4 个 bit，输出这张表里的每一格，且每一格都能在这张真值表和数据通路图之间互相指认。若某条指令行为异常，先在这张表上查控制字哪一格错了，再回数据通路图查那条线——排查顺序永远是先控制字、后路径。
 
 \topic{硬连线控制与微程序控制是两种组织控制字的方法}控制器可以直接由 opcode、状态位和当前周期译码出控制线，这称为硬连线控制。它速度快，结构适合简单指令集和高频流水线，但修改指令行为需要改组合逻辑。另一种方法是把控制字存在控制存储器中，由微程序计数器逐条取出微指令；每条机器指令对应一段微操作序列。这种方法更像“硬件内部的小程序”，适合组织复杂指令、多周期总线访问和异常入口，但控制存储器和微序列会增加延迟。
 
@@ -182,37 +228,120 @@ T4 & \code{R[rd] = MDR, PC = PC+4} & 写回 mux 和 PC 加法器 & 寄存器、P
 
 这个 trace 说明，多周期设计不是“慢版单周期”，而是把过长的硬件路径切成可计时、可观察、可插入等待的边界。若数据存储器慢，可以只让 T3 等待；若分支比较已经在 T2 得到结果，可以在 T2 或 T3 改写 PC；若发生异常，可以把 PC 选择器改到异常入口，而不是继续提交错误写回。
 
-\topic{先规定一个极小 ISA，程序才能进入 ROM}为了让整机实验真正运行，需要把“指令”压成固定 bit。下面是一种 16-bit 教学编码：高 4 bit 是 opcode，中间字段选择寄存器，低位可解释为寄存器号、立即数或分支偏移。它不是任何真实 ISA 的复制品，但足以把编码、译码、控制字和 ROM 内容连接起来。
+\topic{先规定一个极小 ISA，程序才能进入 ROM}为了让整机实验真正运行，需要把“指令”压成固定 bit。下面是一种 16-bit 教学编码：高 4 bit 是 opcode，中间字段选择寄存器，低位可解释为寄存器号、立即数或分支偏移。寄存器字段 3 bit，即 R0–R7，其中 R0 固定为 0。它不是任何真实 ISA 的复制品，但足以把编码、译码、控制字和 ROM 内容连接起来。
 
-\begin{longtable}{L{0.16\linewidth}L{0.22\linewidth}L{0.24\linewidth}L{0.28\linewidth}}
+\begin{longtable}{L{0.13\linewidth}L{0.24\linewidth}L{0.3\linewidth}L{0.25\linewidth}}
 \toprule
 指令 & 编码格式 & 语义 & 需要的硬件路径 \\
 \midrule
-\code{ADD} & \code{0001 d a b ----} & \code{R[d]=R[a]+R[b]} & 双读端口、ALU、写回 \\
-\code{LDI} & \code{0010 d imm8} & \code{R[d]=zero_extend(imm8)} & 立即数扩展、写回 \\
-\code{LOAD} & \code{0011 d a off4} & \code{R[d]=MEM[R[a]+off]} & 地址形成、读存储、写回 \\
-\code{STORE} & \code{0100 s a off4} & \code{MEM[R[a]+off]=R[s]} & 地址形成、写数据、字节使能 \\
-\code{JZ} & \code{0101 r off8} & 若 \code{R[r]==0} 则 PC 加偏移 & 比较、符号扩展、PC 选择 \\
-\code{JMP} & \code{0110 off12} & PC 加偏移 & 目标形成、PC 写入 \\
+\code{ADD} & \code{0001 d a b ---} & \code{R[d]=R[a]+R[b]} & 双读端口、ALU、写回 \\
+\code{LDI} & \code{0010 d x imm8} & \code{R[d]=zero_extend(imm8)} & 立即数扩展、写回 \\
+\code{LOAD} & \code{0011 d a off4 --} & \code{R[d]=MEM[R[a]+off4]} & 地址形成、读存储、写回 \\
+\code{STORE} & \code{0100 s a off4 --} & \code{MEM[R[a]+off4]=R[s]} & 地址形成、写数据、字节使能 \\
+\code{JZ} & \code{0101 r x off8} & 若 \code{R[r]==0}，\code{PC=PC+1+sign\_extend(off8)} & 比较、符号扩展、PC 选择 \\
+\code{JMP} & \code{0110 off12} & \code{PC=PC+1+sign\_extend(off12)} & 目标形成、PC 写入 \\
+\code{SLI} & \code{0111 d a imm4 --} & \code{R[d]=R[a]<<imm4}，低位补 0 & 移位器、写回 \\
 \bottomrule
 \end{longtable}
 
-这个编码能直接写入 ROM。若 \code{GPIO_IN=0xF004}、\code{GPIO_OUT=0xF000}，程序可以先用 \code{LDI} 装入高地址基址，再循环读取按键、条件跳转、写 LED。教学实现中可把 \code{R0} 固定为 0，也可用一个寄存器保存 I/O 基址。关键不是汇编语法，而是 ROM 中每个 16-bit 字都能被译码成控制信号。
+两个语义细节必须先定死，后面的程序才跑得上。第一，跳转偏移都相对\hwkey{下一条指令的地址}计算：跳转目标 = 本条地址 + 1 + 偏移，偏移按补码解释，可正可负。第二，\code{LDI} 只能装 8 位立即数，高地址必须靠移位拼出来：\code{LDI R1, 0xF0} 得到 \code{R1=0x00F0}，再 \code{SLI R1, R1, 8} 左移 8 位得到 \code{R1=0xF000}。\code{SLI} 的字段布局与 \code{ADD} 相同（d、a、低 4 位立即数），所以译码路径几乎免费。
 
-\begin{lstlisting}
-tiny ROM program sketch:
-  LDI   R1, 0xF0       // R1 holds high part of MMIO base
-loop:
-  LOAD  R2, [R1 + 4]   // read GPIO_IN
-  JZ    R2, off
-  LDI   R3, 1
-  STORE R3, [R1 + 0]   // write GPIO_OUT = 1
-  JMP   loop
-off:
-  LDI   R3, 0
-  STORE R3, [R1 + 0]   // write GPIO_OUT = 0
-  JMP   loop
-\end{lstlisting}
+这个编码能直接写入 ROM。若 \code{GPIO_IN=0xF004}、\code{GPIO_OUT=0xF000}，程序先用 \code{LDI}+\code{SLI} 拼出 MMIO 基址 \code{0xF000}，再循环读取按键、条件跳转、写 LED。下面左栏是 ROM 中的真实 16-bit 字，右栏是对应汇编和语义：
+
+\begin{longtable}{L{0.1\linewidth}L{0.13\linewidth}L{0.24\linewidth}L{0.45\linewidth}}
+\toprule
+地址 & 内容 & 汇编 & 语义 \\
+\midrule
+0 & \code{0x22F0} & \code{LDI R1, 0xF0} & \code{R1 = 0x00F0} \\
+1 & \code{0x7260} & \code{SLI R1, R1, 8} & \code{R1 = 0xF000}（MMIO 基址） \\
+2 & \code{0x3450} & \code{LOAD R2, [R1+4]} & \code{R2 = MEM[0xF004]}，读 GPIO\_IN \\
+3 & \code{0x5403} & \code{JZ R2, +3} & \code{R2==0} 时跳到地址 7（$3+1+3$） \\
+4 & \code{0x2601} & \code{LDI R3, 1} & \code{R3 = 1} \\
+5 & \code{0x4640} & \code{STORE R3, [R1+0]} & \code{MEM[0xF000] = 1}，点亮 LED \\
+6 & \code{0x6FFB} & \code{JMP -5} & 跳回地址 2（$6+1-5$） \\
+7 & \code{0x2600} & \code{LDI R3, 0} & \code{R3 = 0} \\
+8 & \code{0x4640} & \code{STORE R3, [R1+0]} & \code{MEM[0xF000] = 0}，熄灭 LED \\
+9 & \code{0x6FF8} & \code{JMP -8} & 跳回地址 2（$9+1-8$） \\
+\bottomrule
+\end{longtable}
+
+注意三个可验证事实。第一，偏移账是平的：地址 3 的 \code{JZ +3} 落到地址 7，地址 6 的 \code{JMP -5} 和地址 9 的 \code{JMP -8} 都落回地址 2。第二，\code{0xF004} 这条地址在 ISA 里是\textbf{可以形成}的——不是注释里的愿望，而是 \code{0x00F0 << 8 + 4} 的真实计算。第三，ROM 里每个 16-bit 字都能被译码器逐字段读出：拿 \code{0x7260} 验证，高 4 位 \code{0111} 是 \code{SLI}，d=\code{001}、a=\code{001}、imm4=\code{1000}=8。
+
+\topic{把这台 ISA 画成可接线的数据通路}有了确定指令集，数据通路就不能再停在“ALU 加寄存器”的粗框上。下面这张图把取指、执行、写回和 PC 更新全部画成可检查的路径，每条指令都可以在上面走一遍：
+
+\begin{pdfdiagram}
+  % PC 更新列（左侧）
+  \node[hw state, minimum width=1.5cm] (pc) at (0.8,4.2) {PC};
+  \node[hw compute, minimum width=1.7cm] (add1) at (0.8,2.8) {+1 加法器};
+  \node[hw compute, minimum width=2.0cm] (addoff) at (0.8,1.4) {+off 加法器};
+  \node[hw compute, minimum width=1.5cm] (pmux) at (0.8,0.0) {pc mux};
+  \draw[hw bus] (pc.south) -- (add1.north);
+  \draw[hw bus] (pc.south) -- ++(0,-0.28) -- ++(0.85,0) coordinate (pctap);
+  \draw[hw bus] (pctap) -- (addoff.north east);
+  \draw[hw bus] (add1.south) -- (pmux.north);
+  \draw[hw bus] (addoff.south) -- (addoff.south |- pmux.north);
+  \draw[hw bus] (pmux.west) -- ++(-0.5,0) -- ++(0,3.92) node[right, hw label, pos=0.5]{下一 PC} -- (pc.west);
+  % 取排行
+  \node[hw compute, minimum width=2.2cm] (imem) at (3.6,4.2) {指令存储};
+  \node[hw state, minimum width=1.5cm] (ir) at (6.6,4.2) {IR};
+  \node[hw control, minimum width=2.0cm] (ctrl) at (10.2,4.2) {控制器};
+  \draw[hw bus] (pc) -- node[hw label, above]{取指地址} (imem);
+  \draw[hw bus] (imem) -- node[hw label, above]{16-bit 编码} (ir);
+  \draw[hw bus] (ir) -- node[hw label, above]{opcode} (ctrl);
+  \draw[hw bus] (ir.south) -- node[hw label, right, pos=0.4]{off8/off12} (addoff.east |- ir.south) -- (addoff.east);
+  % 执行行
+  \node[hw state, minimum width=1.8cm] (rf) at (2.6,-2.6) {寄存器堆};
+  \node[hw compute, minimum width=2.2cm] (ext) at (5.2,-0.9) {立即数扩展\\imm8 零扩 / off4 符号扩};
+  \node[hw compute, minimum width=1.6cm] (muxa) at (5.0,-2.2) {mux A};
+  \node[hw compute, minimum width=1.6cm] (muxb) at (5.0,-3.4) {mux B};
+  \node[hw compute, minimum width=2.0cm] (alu) at (7.8,-2.8) {ALU/移位器};
+  \node[hw compute, minimum width=1.8cm] (wb) at (10.7,-2.6) {写回 mux};
+  \node[hw memory, minimum width=2.0cm] (dmem) at (10.7,-4.2) {数据存储/MMIO};
+  \draw[hw bus] (ir.south) -- (6.6,2.6) -- (2.6,2.6) node[hw label, above, pos=0.35]{寄存器字段 r/s} -- (rf.north);
+  \draw[hw bus] (ir.south) -- node[hw label, right]{imm8/off4} (ext.north);
+  \draw[hw bus] (rf.east) -- ++(0.7,0) |- (muxa.west);
+  \draw[hw bus] (rf.east) -- ++(0.7,0) |- (muxb.west);
+  \draw[hw bus] (ext.south) -- (muxa.north);
+  \draw[hw bus] (ext.south) -- (ext.south |- muxb.north) -- (muxb.north);
+  \draw[hw bus] (muxa.east) -- (alu.west |- muxa.east) -- (alu.west);
+  \draw[hw bus] (muxb.east) -- (alu.south west);
+  \draw[hw bus] (alu.east) -- (wb.west);
+  \draw[hw bus] (alu.east) -- ++(0.45,0) |- (dmem.west);
+  \draw[hw bus] (dmem.east) -- ++(0.4,0) |- (wb.south);
+  \draw[hw bus] (wb.east) -- ++(0.45,0) -- ++(0,-1.0) -- (2.6,-3.95) node[hw label, below, pos=0.5]{写回数据+写地址 d} -- (rf.south);
+  % Z 标志到 pc mux
+  \draw[hw bus] (alu.south) -- (7.8,-4.7) -- (1.9,-4.7) node[hw label, below, pos=0.55]{Zero 标志} -- (pmux.south |- 1.9,-4.7) -- (pmux.south);
+  % 控制线（虚线）
+  \draw[hw return] (ctrl.south) -- (10.2,2.6) node[hw label, above, pos=0.5]{控制线} -- (10.7,2.6) -- (wb.north);
+  \draw[hw return] (ctrl.south) -- (9.4,3.4) -- (7.8,3.4) -- (alu.north);
+  \draw[hw return] (ctrl.south) -- (9.4,3.0) -- (5.0,3.0) -- (muxa.north east);
+\end{pdfdiagram}
+\diagramnote{这台最小 ISA 的完整数据通路。实线是数据路径，虚线是控制线。左侧一列是 PC 更新：顺序值和分支目标都先算好，由 \code{pc mux} 按 Zero 标志选择；中间是执行路径；右侧写回 mux 在 ALU 结果和存储器数据之间选择。任何一条指令的 trace，都应能在这张图上逐段指出来。}
+
+用三条指令验证这张图确实能跑通全部指令类型：\code{ADD} 走“寄存器堆双读 → ALU → 写回 mux 选 ALU 结果”；\code{LDI} 走“imm8 零扩展 → mux A → ALU 直送 → 写回”；\code{LOAD} 走“基址寄存器加 off4 符号扩展 → ALU 形成地址 → 数据存储 → 写回 mux 选存储器数据”；\code{STORE} 复用 LOAD 的地址路径，但数据从寄存器堆流向数据存储；\code{JZ} 的 Zero 决定 \code{pc mux} 选 +1 加法器还是 +off 加法器；\code{SLI} 走“mux A → ALU 内置移位路径 → 写回”。没有一条指令需要图外的部件——这是数据通路完整性的最低验收。
+
+最后把 ROM 程序放进这台机器跑一整圈。设初态 \code{PC=0}、按键未按下（GPIO\_IN 读 0），第 8 个时钟沿前按键被按下（GPIO\_IN 读 1）：
+
+\begin{longtable}{L{0.12\linewidth}L{0.12\linewidth}L{0.15\linewidth}L{0.53\linewidth}}
+\toprule
+时钟沿 & PC & IR & 本沿提交的状态 \\
+\midrule
+1 & 0 & \code{0x22F0} & \code{R1=0x00F0} \\
+2 & 1 & \code{0x7260} & \code{R1=0xF000} \\
+3 & 2 & \code{0x3450} & \code{R2=0}（读 GPIO\_IN） \\
+4 & 3 & \code{0x5403} & 无（Zero=1，\code{pc\_sel} 选目标：$3+1+3=7$） \\
+5 & 7 & \code{0x2600} & \code{R3=0} \\
+6 & 8 & \code{0x4640} & \code{MEM[0xF000]=0}，灯灭 \\
+7 & 9 & \code{0x6FF8} & 无（跳回 2） \\
+8 & 2 & \code{0x3450} & \code{R2=1}（按键已按下） \\
+9 & 3 & \code{0x5403} & 无（Zero=0，顺序执行） \\
+10 & 4 & \code{0x2601} & \code{R3=1} \\
+11 & 5 & \code{0x4640} & \code{MEM[0xF000]=1}，灯亮 \\
+12 & 6 & \code{0x6FFB} & 无（跳回 2） \\
+\bottomrule
+\end{longtable}
+
+这一圈账值得逐行核对：偏移算术（沿 4 的 $3+1+3$、沿 7 和 12 的回跳）、MMIO 地址形成（沿 3 和 8 的 \code{0xF000+4}）、条件跳转两次走向相反（沿 4 跳、沿 9 不跳）、以及程序效果本身——LED 跟随按键状态循环亮灭。能写出这张表，才说明编码、译码、数据通路、控制字和 PC 更新在同一条账上；任何一格对不上，回到控制真值表和数据通路图逐格反查即可。
 
 \topic{程序员可见状态不是全部硬件状态}
 机器级程序通常只直接看见一小组状态：PC、通用寄存器、条件码或标志、可寻址内存，有些 ISA 还显式暴露栈指针、链接寄存器或状态寄存器。CPU 内部还会有 IR、MDR、ALUOut、流水线寄存器、旁路网络和微程序计数器，但这些通常不是普通程序可以直接读写的对象。区分这两类状态很重要：ISA 规定的是程序必须可依赖的边界，微结构内部状态则服务于实现速度、面积和功耗。
@@ -492,6 +621,8 @@ STORE & 执行写 RAM 或写 LED 寄存器 & 只有目标片选有效，非目�
 \topic{案例：从一个计数循环走到逐周期 trace}
 为了把本章从概念推进到可验收工程，可以完整走读一个小程序。假设内存中从 \code{BASE} 开始有若干 32-bit 数，R1 保存当前地址，R4 保存剩余元素个数，R3 保存累加和。程序每轮加载一个元素，加入累加和，地址加 4，计数减 1，若计数不为 0 就回到循环入口。
 
+先说明口径：这个案例使用 32-bit 宽数据和 \code{ADDI/SUBI/JNZ} 等示意助记符，比前面的 16-bit 极小 ISA 宽一档，目的是让数值关系更醒目；两者的 trace 方法完全相同——读旧状态、经组合路径、在时钟沿提交。
+
 \begin{lstlisting}
 loop:
   LOAD R2, [R1 + 0]
@@ -713,10 +844,12 @@ CALL/RET trace & 把调用和返回拆成保存返回地址、更新 SP、改写
 任务 & 参考解答 & 必须保留的验收点 \\
 \midrule
 PC 取指 & PC 输出取指地址，指令存储器返回编码，\code{ir_write} 在取指边界保存编码；下一 PC 可由 \code{pc+size}、分支目标或异常入口选择。 & PC 和 IR 都是状态元件。 \\
-ADD trace & 读端口选择 R1/R2，ALU 选择 ADD，写回 mux 选择 ALUOut，写地址为 R3，\code{reg_write=1} 只在写回边界有效。 & 算对不等于写对。 \\
+ADD trace & 读端口选择 R1/R2，ALU 选择 ADD，写回 mux 选择 ALUOut，写地址为 R3，\code{reg_write=1} 只在写回边界有效。示例账：\code{R1=5,R2=7} 时 \code{read\_a=5}、\code{read\_b=7}、\code{ALU\_out=12}，时钟沿 \code{R3<-12}、\code{PC=100->102}。 & 算对不等于写对。 \\
 LOAD trace & EX 阶段形成地址，MEM 阶段发起读，目标未 ready 时保持地址和控制，响应后保存 MDR，WB 阶段写回目标寄存器。 & 等待不能污染其他状态。 \\
 STORE trace & STORE 使用 ALU 形成地址，源寄存器提供写数据，打开字节使能和写控制，不打开寄存器写回。若地址命中 MMIO，副作用由设备规格决定。 & STORE 是有副作用的事务。 \\
-JZ trace & 比较或 ALU 结果产生 Zero，控制器根据 Zero 选择顺序 PC 或分支目标；PC 只在提交边界更新。 & 条件输入必须在采样前稳定。 \\
+JZ trace & 比较或 ALU 结果产生 Zero，控制器根据 Zero 选择顺序 PC 或分支目标；PC 只在提交边界更新。示例账（本章 ROM 程序）：地址 3 的 \code{JZ +3} 在 \code{R2=0} 时 \code{PC=3+1+3=7}；同一指令在 \code{R2=1} 时顺序取地址 4。 & 条件输入必须在采样前稳定。 \\
+条件码比较 & 无符号小于看减法后的借位/Carry 约定（结果可能为正仍算小于）；有符号小于看 \code{Sign XOR Overflow}（如 \code{0x80-1}：结果为负但无溢出，有符号小于成立）。相等判断只看 Zero。 & 标志必须绑定解释规则。 \\
+CALL/RET trace & CALL：返回地址先经栈保存（\code{SP 减后 STORE}），再 \code{PC=目标}；RET：从栈读回返回地址（\code{LOAD}），恢复 SP，\code{PC=返回地址}。栈访问本质就是 LOAD/STORE 事务，SP 是普通寄存器加约定。 & 调用链是事务序列，不是语法。 \\
 控制字 & 控制字字段应覆盖 PC、IR、寄存器堆、ALU、存储器和下一状态逻辑；任何字段没有连接对象都不是硬件控制。 & 控制字是电线集合，不是注释。 \\
 微程序 & LOAD 可写为取指、读寄存器、地址形成、访存等待、写回；访存未完成时微地址保持在等待状态，错误时跳异常入口。 & 微步骤提供可观察边界。 \\
 流水线冒险 & 结构冒险来自资源争用，数据冒险来自结果未写回，控制冒险来自下一 PC 尚未确定。停顿保护边界，转发减少等待，冲刷丢弃错误路径。 & 提高吞吐不能破坏提交顺序。 \\
