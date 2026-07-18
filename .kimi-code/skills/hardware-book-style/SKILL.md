@@ -45,6 +45,8 @@ description: 《硬件从零到整机》写作规范——经典教材口吻（�
 
 ## 三、改完必做
 
+插图绘制与修改另见 `hardware-book-diagrams` 技能（箭头收尾、标签防压、走线通道、渲染目检硬要求）。
+
 1. 根目录 `make hw-pdf`：零 `^! ` 错误、零 Overfull。
 2. 改动涉及图或版式时 `mutool draw` 渲染目检。
 3. `make hw-phone-export` 导出手机（见 book-export-workflow 技能）。
