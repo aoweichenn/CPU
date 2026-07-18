@@ -21,6 +21,7 @@ EXPECTED_INPUTS = [
     "chapters/ch05-memory-bus-io-dma",
     "chapters/ch06-classic-chips-platforms",
     "chapters/ch07-breadboard-computer",
+    "chapters/ch08-power-clock-signal-integrity",
     "backmatter/checklist",
 ]
 
@@ -33,8 +34,8 @@ def main() -> int:
         raise SystemExit(f"missing expected inputs: {missing}")
 
     chapter_files = sorted((ROOT / "chapters").glob("*.tex"))
-    if len(chapter_files) != 7:
-        raise SystemExit(f"expected 7 chapter files, found {len(chapter_files)}")
+    if len(chapter_files) != 8:
+        raise SystemExit(f"expected 8 chapter files, found {len(chapter_files)}")
 
     for chapter in chapter_files:
         chapter_text = chapter.read_text(encoding="utf-8")
