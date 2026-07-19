@@ -433,6 +433,35 @@ translation layer，闪存翻译层）填平。FTL 是跑在盘内控制
 的廉价盘把映射挤在小块 SRAM 和闪存里，或借主机内存
 （NVMe 的 HMB 机制）暂存，随机访问映射本身成了新的瓶颈。
 
+把介质的页块格局与 FTL 的翻译过程画在一起，"改写"在盘内
+的真实形态就清楚了：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=2.0cm] (host) at (1.05,0.35) {主机：改写逻辑页 L};
+  \node[hw compute, minimum width=3.4cm] (ftl) at (5.3,0.35) {FTL 映射表\\逻辑页 $\to$ 物理页};
+  \draw[hw bus] (host.east) -- (ftl.west);
+  \node[hw label, anchor=south] at (3.3,0.9) {改写请求};
+  % 块 A：原页所在块，内含若干页
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (0.5,-3.2) rectangle (4.1,-1.6);
+  \node[hw label] at (2.6,-1.85) {原页所在块};
+  \node[hw memory, minimum width=1.0cm, minimum height=0.66cm, fill=BookRed!10] (oldpage) at (1.15,-2.55) {旧页 L};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (2.35,-2.55) {页};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (3.45,-2.55) {页$\cdots$};
+  % 块 B：当前可写块，只许追加
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (6.1,-3.2) rectangle (9.7,-1.6);
+  \node[hw label] at (8.05,-1.85) {当前可写块};
+  \node[hw memory, minimum width=1.0cm, minimum height=0.66cm, fill=BookTeal!15] (newpage) at (6.85,-2.55) {新页 L};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (8.05,-2.55) {空页};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (9.15,-2.55) {空页$\cdots$};
+  % FTL 的两条动作线：共享竖直干线，按 y 分层各自折出
+  \draw[hw bus] (ftl.south) -- (5.3,-1.1) -- (6.85,-1.1) -- (newpage.north);
+  \node[hw label, above] at (6.9,-1.1) {① 写新页、映射改指};
+  \draw[hw return] (ftl.south) -- (5.3,-0.72) -- (1.15,-0.72) -- (oldpage.north);
+  \node[hw label, above] at (3.2,-0.72) {② 旧页标脏};
+  \node[hw label, text width=9.4cm] at (5.2,-3.85) {块（256 KiB--4 MiB）内含数百页（4--16 KiB）；无效页攒满一整块后，垃圾回收搬走仍有效的页、整块擦除、收回空块。};
+\end{pdfdiagram}
+\diagramnote{NAND 闪存的页写块擦与 FTL 地址映射。主机以为自己原地改写了逻辑页 L；盘内实际是两步：FTL 把数据写进当前可写块的下一个空页、映射改指新页，旧页标脏等待回收。无效页攒满一整块后，垃圾回收搬走仍有效的页、整块擦除、收回空块——追加写加周期性回收，就是 SSD 在只许追加的介质上提供原地改写接口的全部机制。}
+
 第二件是空页供给：追加写需要源源不断的已擦空块，FTL 平
 时预留若干，写完再补。第三件因此必然登场——垃圾回收
 （garbage collection，GC）：无效页攒多了，挑一个无效页
@@ -718,6 +747,40 @@ latency），等目标扇区转到磁头下方；传输，数据经读通道、�
 存、接口由 DMA 搬进内存——最后这段走的就是第五章描述符与 DMA
 的通道，微秒级。前两段是机械运动，毫秒级。随机小请求的总耗时几
 乎全在前两段，这是本节的中心事实。
+
+把三段耗时按真实比例画在一条时间条上，与盘片的结构对照
+着看：
+
+\begin{pdfdiagram}
+  % 左：盘片俯视——磁道、扇区、磁臂
+  \draw[BookMuted, line width=0.55pt] (1.8,0.6) circle (1.5);
+  \draw[BookMuted, line width=0.45pt] (1.8,0.6) circle (1.05);
+  \draw[BookMuted, line width=0.45pt] (1.8,0.6) circle (0.6);
+  \fill[BookTeal!20] ([shift={(1.8,0.6)}]205:0.6) arc[start angle=205, end angle=235, radius=0.6] -- ([shift={(1.8,0.6)}]235:1.5) arc[start angle=235, end angle=205, radius=1.5] -- cycle;
+  \draw[BookMuted, line width=0.5pt] (0.7,-0.5) -- (0.7,-1.05);
+  \node[hw label] at (0.7,-1.28) {扇区（512 B / 4 KB）};
+  \draw[BookMuted, line width=0.5pt] (1.8,2.1) -- (1.8,2.4);
+  \node[hw label, anchor=south] at (1.8,2.42) {磁道（每面数十万条同心环）};
+  \draw[BookMuted, line width=2.0pt] (4.6,-0.1) -- (3.05,-0.1);
+  \fill[BookMuted] (4.6,-0.1) circle (0.12);
+  \node[hw state, minimum width=0.3cm, minimum height=0.3cm, inner sep=1pt] at (2.95,-0.1) {};
+  \draw[BookMuted, line width=0.5pt] (4.6,-0.24) -- (4.6,-0.5);
+  \node[hw label, anchor=north] at (4.6,-0.55) {磁臂与磁头（音圈电机驱动）};
+  \node[hw label] at (1.8,-1.8) {盘片恒速旋转（如 7200 rpm），磁头等目标扇区转到位};
+  % 右：一次随机 4 KB 读的时间条
+  \node[hw label, anchor=west] at (5.3,2.85) {随机 4 KB 读一次，合计 $\approx$9.2 ms};
+  \filldraw[fill=BookAccent!18, draw=BookAccent, line width=0.5pt] (5.3,1.0) rectangle (7.9,1.7);
+  \node[hw label, text=BookInk] at (6.6,1.35) {寻道 $\approx$5 ms};
+  \filldraw[fill=BookAmber!20, draw=BookAmber, line width=0.5pt] (7.9,1.0) rectangle (10.3,1.7);
+  \node[hw label, text=BookInk] at (9.1,1.35) {旋转等待 $\approx$4.17 ms};
+  \filldraw[fill=BookTeal!30, draw=BookTeal, line width=0.5pt] (10.3,1.0) rectangle (10.44,1.7);
+  \draw[BookMuted, line width=0.5pt] (10.37,1.7) -- (10.37,2.2);
+  \node[hw label, anchor=south] at (10.37,2.22) {传输 $\approx$0.02 ms};
+  \draw[BookMuted, line width=0.6pt, <->] (5.3,0.78) -- (10.3,0.78);
+  \node[hw label] at (7.8,0.5) {机械运动，毫秒级，占约 99.8\%};
+  \node[hw label, anchor=west] at (5.3,0.05) {IOPS $\approx$ 1000/9.2 $\approx$ 109（"约 100 IOPS"的由来）};
+\end{pdfdiagram}
+\diagramnote{机械盘的结构与一次随机 4 KB 读的时间构成。左图俯视盘片：同心圆环是磁道，圆周上的一小段是扇区，磁臂把磁头送到目标半径后，等目标扇区转到磁头下方。右图把三段耗时按真实比例排开：寻道约 5 ms、旋转等待约 4.17 ms 都是毫秒级的机械运动，传输约 0.02 ms 是微秒级的电过程——随机小请求的时间几乎全部花在前两段，"一块机械盘约 100 IOPS"由此而来。}
 
 寻道本身还可再拆：磁臂加速、巡航、减速、在目标磁道上安定到可读
 写的精度。短寻道花不完加速段，长寻道大部分时间在巡航，所以"平
@@ -1114,6 +1177,36 @@ $4.7\times10^{4}\times3\mu s\approx0.14$ 颗核——从中断风暴的 4.5
 占用，换确定的几微秒时延。两个方向都对，区别只在业务把哪一头算
 作成本。
 
+把两种策略各画一条时序，这笔交换的形状如下：
+
+\begin{waveform}[x=0.8cm,y=0.9cm]
+  % 参考虚线：第 32 帧到达触发 / 等满 T 超时触发
+  \draw[BookRule, line width=0.45pt, dashed] (8.75,1.35) -- (8.75,3.9);
+  \draw[BookRule, line width=0.45pt, dashed] (12.0,1.35) -- (12.0,3.9);
+  % 帧到达（线速，不聚合场景）
+  \foreach \x in {1.0,1.25,...,8.9} \draw[BookTeal, line width=0.9pt] (\x,7.0) -- (\x,7.55);
+  \node[hw label, anchor=east] at (0.8,7.28) {帧到达（线速）};
+  % 中断·不聚合：每帧一次
+  \draw[BookAccent, line width=0.9pt] (1.0,5.4) -- (9.0,5.4);
+  \foreach \x in {1.0,1.25,...,8.9} \draw[BookAccent, line width=0.9pt] (\x,5.4) -- (\x,6.0) -- ({\x+0.13},6.0) -- ({\x+0.13},5.4);
+  \node[hw label, anchor=east] at (0.8,5.7) {中断·不聚合};
+  \node[hw label] at (6.4,4.9) {不聚合：每帧一次，$\approx$149 万次/秒，CPU $\approx$4.5 核};
+  % 帧到达（聚合场景：线速 32 帧 + 低负载单帧）
+  \foreach \x in {1.0,1.25,...,8.9} \draw[BookTeal, line width=0.9pt] (\x,3.2) -- (\x,3.75);
+  \draw[BookTeal, line width=0.9pt] (10.2,3.2) -- (10.2,3.75);
+  \node[hw label, anchor=east] at (0.8,3.48) {帧到达};
+  \draw[BookMuted, line width=0.6pt, <->] (1.0,4.05) -- (8.75,4.05);
+  \node[hw label] at (4.9,4.34) {攒满 32 帧 $\approx$21.5 $\mu$s（先于超时）};
+  \draw[BookMuted, line width=0.6pt, <->] (10.2,4.05) -- (12.0,4.05);
+  \node[hw label] at (11.1,4.34) {等满 $T$=40 $\mu$s};
+  \node[hw label] at (10.4,2.92) {低负载：单帧到达};
+  % 中断·聚合：攒满一批或超时，才发一次
+  \draw[BookAccent, line width=0.9pt] (1.0,1.6) -- (8.75,1.6) -- (8.75,2.2) -- (9.05,2.2) -- (9.05,1.6) -- (12.0,1.6) -- (12.0,2.2) -- (12.3,2.2) -- (12.3,1.6) -- (12.6,1.6);
+  \node[hw label, anchor=east] at (0.8,1.9) {中断·聚合};
+  \node[hw label] at (6.3,0.95) {聚合 $N$=32 / $T$=40 $\mu$s：$\approx$4.7 万次/秒，CPU $\approx$0.14 核};
+\end{waveform}
+\diagramnote{中断聚合的时序对比。上方不聚合：每帧一次中断，1.49 Mpps 折合每秒约 149 万次中断进出，约 4.5 颗核的算力全花在保存与恢复现场上。下方聚合：攒满 32 帧（线速下约 21.5 $\mu$s，先于超时）或等满 T=40 $\mu$s——先到为准——才发一次中断，中断率降到约 4.7 万次/秒，CPU 开销约 0.14 核；代价是一帧平均多等约半个聚合窗口。}
+
 \begin{longtable}{L{0.16\linewidth}L{0.32\linewidth}L{0.20\linewidth}L{0.20\linewidth}}
 \toprule
 参数 & 机制 & 偏向吞吐 & 偏向时延 \\
@@ -1292,6 +1385,46 @@ flush）、起始 LBA、块数，以及 PRP 数据指针列表，逐页给出数
 "描述符先可见、再通知"和"完成以写回状态为准"这两条规则，在这里原
 样成立，只是被写进了设备规范，由硬件而不是驱动员的细心来保证。
 
+把这条链路画成图，主机内存、doorbell 寄存器与设备之间的
+分工如下：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.9cm] (cpu) at (0.9,0.55) {CPU\\（本核驱动）};
+  % 主机内存：SQ 环与 CQ 环
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (2.6,-1.3) rectangle (7.2,1.35);
+  \node[hw label, anchor=west] at (2.75,1.08) {SQ：64 B 命令项环};
+  \node[hw label, anchor=east] at (7.1,0.12) {主机内存（DRAM）};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] (sq1) at (3.35,0.55) {命令};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (4.35,0.55) {命令};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (5.35,0.55) {命令};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] (sq4) at (6.35,0.55) {$\cdots$};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (3.35,-0.55) {完成};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (4.35,-0.55) {完成};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (5.35,-0.55) {完成};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] (cq4) at (6.35,-0.55) {$\cdots$};
+  \node[hw label, anchor=west] at (2.75,-1.05) {CQ：16 B 完成项环};
+  \node[hw control, minimum width=1.6cm] (db) at (8.3,0.45) {doorbell\\寄存器};
+  \node[hw compute, minimum width=1.9cm] (dev) at (10.45,0.45) {NVMe 控制器\\FTL + DMA};
+  % ① 驱动把命令项写进本核 SQ 尾槽
+  \draw[hw bus] (cpu.east) -- (sq1.west);
+  \node[hw label, anchor=west] at (2.75,0.12) {① 写命令项};
+  % ② 屏障后写 SQ 尾 doorbell（MMIO，控制）
+  \draw[hw return] (cpu.south) -- (0.9,-2.0) -- (8.3,-2.0) -- (db.south);
+  \node[hw label, above] at (4.5,-2.0) {② 写 SQ 尾 doorbell（MMIO）};
+  % ③ 设备按指针差 DMA 取走命令
+  \draw[hw bus] (sq4.north) -- (6.35,1.85) -- (10.45,1.85) -- (dev.north);
+  \node[hw label, above] at (8.3,1.85) {③ DMA 取命令};
+  % doorbell 通知设备（只携带新尾指针）
+  \draw[hw return] (db.east) -- (dev.west);
+  % ④ 设备写完成项进 CQ（device.south 竖直干线共享）
+  \draw[hw bus] (dev.south) -- (10.45,-1.5) -- (6.35,-1.5) -- (cq4.south);
+  \node[hw label, below] at (7.3,-1.5) {④ 写完成项};
+  % ⑤ MSI 中断回本核
+  \draw[hw return] (dev.south) -- (10.45,-2.6) -- (0.3,-2.6) -- (0.3,0.07);
+  \node[hw label, below] at (5.0,-2.6) {⑤ MSI 中断回本核};
+\end{pdfdiagram}
+\diagramnote{NVMe 的提交—完成链路。驱动把 64 B 命令项写进本核 SQ 尾槽（①），屏障之后写 SQ 尾 doorbell（②）——doorbell 只携带新尾指针；设备按指针差 DMA 取走命令（③），执行后把 16 B 完成项写进 CQ（④），此时数据已按 PRP 地址 DMA 进入内存，最后以 MSI-X 中断通知本核（⑤）。SQ 与 CQ 各自独立、每核一对，提交路径上没有需要上锁的共享状态。}
+
 第二处改动是多队列。规范允许最多 65535 对 I/O 队列，每对深度上限
 65535；真实盘实现的对数远小于此（几十到几千），但已足够给每个 CPU
 核配一对。每核一对的用意是免锁：各核写自己的 SQ、收自己的 CQ，尾指
@@ -1414,6 +1547,45 @@ P99 & 1 ms & 10 倍 & 每 100 个里约 1 个这么慢 \\
 P999 & 10 ms & 100 倍 & 每 1000 个里约 1 个这么慢 \\
 \bottomrule
 \end{longtable}
+
+把这张分布画成直方图，长尾的形状比数字更直接：
+
+\begin{pdfdiagram}
+  % 坐标轴
+  \draw[BookMuted, line width=0.6pt, ->] (0.5,0) -- (11.0,0);
+  \draw[BookMuted, line width=0.6pt, ->] (0.5,0) -- (0.5,4.0);
+  \node[hw label, anchor=south] at (0.5,4.05) {请求数};
+  \node[hw label] at (6.9,-0.3) {时延（横轴按对数间距）};
+  % 直方图：主峰在 100 µs 附近，长尾拖向 1 ms、10 ms
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (0.8,0) rectangle (1.3,0.7);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (1.35,0) rectangle (1.85,3.2);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (1.95,0) rectangle (2.45,1.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (2.55,0) rectangle (3.05,0.8);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (3.25,0) rectangle (3.75,0.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (4.05,0) rectangle (4.55,0.35);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (5.05,0) rectangle (5.55,0.25);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (6.25,0) rectangle (6.75,0.18);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (7.65,0) rectangle (8.15,0.13);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (9.15,0) rectangle (9.65,0.1);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (10.15,0) rectangle (10.65,0.07);
+  % 百分位参考线与平均值
+  \draw[BookMuted, line width=0.5pt, dashed] (1.6,0) -- (1.6,3.75);
+  \node[hw label, anchor=west] at (1.72,3.9) {P50 = 100 $\mu$s};
+  \draw[BookRed, line width=0.5pt, dashed] (2.5,0) -- (2.5,3.35);
+  \node[hw label, anchor=west, text=BookRed] at (2.62,3.5) {平均值 $\approx$199 $\mu$s};
+  \draw[BookRed, line width=0.6pt, ->] (1.72,2.9) -- (2.4,2.9);
+  \node[hw label, anchor=west] at (2.62,2.9) {被长尾拉偏};
+  \draw[BookMuted, line width=0.5pt, dashed] (9.4,0) -- (9.4,1.5);
+  \node[hw label, anchor=south] at (9.4,1.55) {P99 = 1 ms};
+  \draw[BookMuted, line width=0.5pt, dashed] (10.4,0) -- (10.4,1.1);
+  \node[hw label, anchor=south] at (10.4,1.15) {P999 = 10 ms};
+  % 横轴刻度与长尾来源
+  \node[hw label, anchor=north] at (1.6,-0.12) {100 $\mu$s};
+  \node[hw label, anchor=north] at (9.4,-0.12) {1 ms};
+  \node[hw label, anchor=north] at (10.4,-0.12) {10 ms};
+  \node[hw label] at (6.2,0.85) {长尾：GC 擦除、队列拥塞、SMR 重写、读重试};
+\end{pdfdiagram}
+\diagramnote{消费级 NVMe SSD 4 KB 随机读的时延分布（横轴按对数间距）。主峰在 P50 = 100 $\mu$s；GC 擦除、队列拥塞、SMR 重写、读重试这类不常发生、一发生就是十倍百倍慢的事件，把分布拖出长尾：P99 = 1 ms，P999 = 10 ms。平均值被长尾向右拉偏，离中位数越来越远——所以外设时延必须带百分位一起报。}
 
 平均时延把这些全藏了起来。算一遍第十章的同款例子：100 个请求里 99
 个花 100 $\mu$s、1 个花 10 ms，平均值是
