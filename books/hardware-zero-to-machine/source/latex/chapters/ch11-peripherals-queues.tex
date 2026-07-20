@@ -299,6 +299,29 @@ fsync 时间构成（无掉电保护的 SATA SSD，量级）
   合计                             毫秒级，上限约 10^3 次/秒
 \end{lstlisting}
 
+把这条层级链与 fsync 的走法画在一起，普通写与同步写
+的分岔点一目了然：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=4.6cm] (app) at (2.6,0) {应用：\code{write} / \code{fsync}};
+  \node[hw memory, minimum width=4.6cm] (pc) at (2.6,-1.5) {页缓存：主存 GiB 级，读命中约 100 ns};
+  \node[hw memory, minimum width=4.6cm] (dc) at (2.6,-3.0) {设备缓存：盘内 DRAM，数十 $\mu$s};
+  \node[hw memory, minimum width=4.6cm] (med) at (2.6,-4.5) {介质：闪存或盘片，$10^{2}$ $\mu$s--$10$ ms};
+  \draw[hw bus] (app.south) -- (pc.north);
+  \draw[hw bus] (pc.south) -- (dc.north);
+  \draw[hw bus] (dc.south) -- (med.north);
+  \node[hw label, anchor=east] at (2.35,-0.75) {\code{write} 拷进即返回};
+  \node[hw label, anchor=east] at (2.35,-2.25) {回写线程：几十秒级 DMA};
+  \node[hw label, anchor=east] at (2.35,-3.75) {FLUSH 后写入介质};
+  % fsync 穿透路径：右侧虚线一路向下直到介质
+  \draw[hw return] (app.east) -- (6.6,0) -- (6.6,-4.5) -- (med.east);
+  \node[hw label, anchor=west] at (6.8,-0.75) {① 脏页排进块层队列等写完};
+  \node[hw label, anchor=west] at (6.8,-2.25) {② FLUSH 清设备缓存};
+  \node[hw label, anchor=west] at (6.8,-3.75) {③ 设备确认后才返回};
+  \node[hw label] at (3.3,-5.35) {普通写停在页缓存即算完成；\code{fsync} 一路穿透到介质——停在易失 RAM 的"完成"只是承诺};
+\end{pdfdiagram}
+\diagramnote{块设备访问的三层结构与 fsync 的穿透路径。写系统调用把数据拷进页缓存即返回，回写线程按几十秒级的节奏异步写盘，盘内还有一层设备缓存代收；fsync 则把每一层都走完：脏页排进块层队列等写完、发 FLUSH 命令清设备缓存、等设备确认才返回。数据到达非易失的去处才算数——停在任何一层易失 RAM 上的"完成"，都只是承诺。}
+
 数据库对 fsync 延迟敏感，原因全在这笔明细里。事务日志
 （WAL）的正确性规则是"日志先到介质、数据后到介质"，每
 条提交记录都要过 fsync 这一关，提交时延里 fsync 常占九
@@ -518,6 +541,36 @@ $v$ 每涨一点，代价不是线性涨，是倒数式地涨：
 0.9 & 10 & 接近写满的盘做随机写 \\
 \bottomrule
 \end{longtable}
+
+把 $v=0.5$ 那一行画成过程图，"搬一页换一页"的运费
+就看得见了：
+
+\begin{pdfdiagram}
+  % 待回收块
+  \node[hw label, anchor=south] at (2.1,0.08) {待回收块：256 页};
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (0.4,-0.2) rectangle (3.8,-2.0);
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm, fill=BookTeal!15] (va) at (1.3,-1.3) {有效\\128 页};
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm, fill=BookRed!10] (ia) at (3.0,-1.3) {无效\\128 页};
+  % 新块
+  \node[hw label, anchor=south] at (8.9,0.08) {新块};
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (7.2,-0.2) rectangle (10.6,-2.0);
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm, fill=BookTeal!15] (vb) at (8.1,-1.3) {搬入\\128 页};
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm] (hb) at (9.8,-1.3) {主机新写\\128 页};
+  % ① 搬运：左侧出框、顶部通道，再竖直落入新块
+  \draw[hw bus] (va.west) -- (0.22,-1.3) -- (0.22,0.72) -- (8.1,0.72) -- (vb.north);
+  \node[hw label, anchor=south] at (4.7,0.78) {① 有效页读出、写入新块：闪存写 128 页};
+  % ② 主机写满余下空页
+  \draw[hw bus] (9.8,-2.75) -- (hb.south);
+  \node[hw label, anchor=north] at (9.8,-2.85) {② 主机写入 128 页};
+  % ③ 整块擦除
+  \draw[hw bus] (2.1,-2.0) -- (2.1,-3.05);
+  \node[hw label, anchor=west] at (2.3,-2.55) {③ 整块擦除};
+  \draw[BookRule, line width=0.42pt, dashed, rounded corners=2pt] (0.6,-3.15) rectangle (3.6,-3.95);
+  \node[hw label] at (2.1,-3.55) {空块：256 页全部可写};
+  % 盘点
+  \node[hw label] at (5.5,-4.6) {主机写入 128 页，闪存实际写入 $128+128=256$ 页 $\Rightarrow$ WA $=256/128=2$};
+\end{pdfdiagram}
+\diagramnote{一次 GC 的完整过程（块含 256 页、一半有效）。回收：128 个有效页读出并写入新块，这是主机没有要求的闪存写入；旧块整块擦除，换回 256 个空页，其中 128 页被搬来的数据占用，剩 128 页供主机写新数据。等主机写满盘点：主机写 128 页，介质写 256 页，WA 恰为 2——有效页占一半，写一倍送一倍。}
 
 随机写为什么放大更严重，看 $v$ 的下场就知道。顺序写把失
 效集中到少数块上：文件被顺序覆盖，整块一起变脏，$v$ 趋
@@ -987,6 +1040,40 @@ $ cat /sys/block/sda/queue/nr_requests
 准备，本章第五节展开。对机械盘，32 个在途请求提供的重排空间已
 把大部分收益吃掉。
 
+重排做的事用六个请求示意便清楚（实际队列里是 32 个）：
+
+\begin{pdfdiagram}
+  % 上：到达顺序，相位乱跳
+  \node[hw label, anchor=east] at (0.55,0) {到达顺序};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a1) at (1.6,0) {相位 5};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a2) at (3.15,0) {相位 1};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a3) at (4.7,0) {相位 6};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a4) at (6.25,0) {相位 2};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a5) at (7.8,0) {相位 4};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a6) at (9.35,0) {相位 3};
+  \draw[hw bus] (a1.east) -- (a2.west);
+  \draw[hw bus] (a2.east) -- (a3.west);
+  \draw[hw bus] (a3.east) -- (a4.west);
+  \draw[hw bus] (a4.east) -- (a5.west);
+  \draw[hw bus] (a5.east) -- (a6.west);
+  \node[hw label] at (5.5,-0.82) {按到达先后服务：寻道加平均半圈等待，每条约 10 ms $\Rightarrow$ 约 100 IOPS};
+  % 下：按旋转相位重排
+  \node[hw label, anchor=east] at (0.55,-1.9) {NCQ 重排后};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b1) at (1.6,-1.9) {相位 1};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b2) at (3.15,-1.9) {相位 2};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b3) at (4.7,-1.9) {相位 3};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b4) at (6.25,-1.9) {相位 4};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b5) at (7.8,-1.9) {相位 5};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b6) at (9.35,-1.9) {相位 6};
+  \draw[hw bus] (b1.east) -- (b2.west);
+  \draw[hw bus] (b2.east) -- (b3.west);
+  \draw[hw bus] (b3.east) -- (b4.west);
+  \draw[hw bus] (b4.east) -- (b5.west);
+  \draw[hw bus] (b5.east) -- (b6.west);
+  \node[hw label] at (5.5,-2.72) {按转到磁头下的先后执行：每条摊定位约 2.5--4 ms $\Rightarrow$ 约 250--400 IOPS};
+\end{pdfdiagram}
+\diagramnote{同一批随机请求的两种服务顺序（示意六个，实际是 32 个在途）。按到达先后服务，相邻请求相位乱跳，每条都要付一次寻道加平均半圈的旋转等待；盘内固件知道磁头位置与盘片角度，按"当前柱面加旋转相位"重排后，同一柱面的请求按转到磁头下的先后执行，旋转等待被摊薄，每条定位约 2.5--4 ms。时延没变，在途数变了——IOPS 从约 100 提到约 250--400。}
+
 SMR（叠瓦式磁记录）从另一头榨容量。写入磁道天生比读取所需宽度
 宽，叠瓦布局让后一条磁道盖住前一条的边缘，像屋顶瓦片一样部分重
 叠，磁道密度因此提高，单盘容量便宜约两成。代价全在写的方向：写
@@ -995,6 +1082,41 @@ SMR（叠瓦式磁记录）从另一头榨容量。写入磁道天生比读取�
 扇区，必须把它之后的内容读出、合并、整条带重写。极端情况下一次
 4KB 随机写牵连 256MB 的重写，写放大约六万五千倍；盘内固件当然不
 会每次真这么做，它用下一段的缓存机制把账延后，但账不会消失。
+
+叠瓦的结构与改写的牵连画在一起看，"便宜两成"的代价
+就具体了：
+
+\begin{pdfdiagram}
+  % 五条叠瓦磁道：后一条盖住前一条的边缘
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,0) rectangle (6.7,0.55);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-0.35) rectangle (6.7,0.2);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-0.7) rectangle (6.7,-0.15);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-1.05) rectangle (6.7,-0.5);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-1.4) rectangle (6.7,-0.85);
+  % 重叠区（被后一道盖住的边缘）
+  \fill[BookAmber!25] (0.7,0) rectangle (6.7,0.2);
+  \fill[BookAmber!25] (0.7,-0.35) rectangle (6.7,-0.15);
+  \fill[BookAmber!25] (0.7,-0.7) rectangle (6.7,-0.5);
+  \fill[BookAmber!25] (0.7,-1.05) rectangle (6.7,-0.85);
+  \node[hw label] at (1.55,0.375) {道 N};
+  \node[hw label] at (1.55,0.025) {道 N+1};
+  \node[hw label] at (1.55,-0.325) {道 N+2};
+  \node[hw label] at (1.55,-0.675) {道 N+3};
+  \node[hw label] at (1.55,-1.025) {道 N+4};
+  % 改写点：写第 N+2 道会顺带覆盖第 N+3 道的重叠区
+  \draw[BookRed, line width=0.5pt, fill=BookRed!30] (3.6,-0.5) rectangle (4.4,-0.15);
+  \node[hw label, anchor=west, text=BookRed] at (4.5,-0.325) {改写点};
+  % 读/写宽度对照
+  \draw[BookMuted, line width=0.6pt, <->] (7.15,0.2) -- (7.15,0.55);
+  \node[hw label, anchor=west] at (7.3,0.375) {读所需宽度};
+  \draw[BookMuted, line width=0.6pt, <->] (8.85,-0.35) -- (8.85,0.2);
+  \node[hw label, anchor=west] at (9.0,-0.075) {写入磁道宽度};
+  % 带
+  \draw[BookAmber, line width=0.6pt] (0.5,-1.4) -- (0.5,0.55);
+  \node[hw label] at (3.7,-2.1) {一条带（band，典型 256 MB）：带内只能从带首顺序追加};
+  \node[hw label, text=BookRed] at (3.7,-2.75) {改写带中一个扇区：其后各道读出、合并，整条带重写——极端时 4 KB 写牵连 256 MB};
+\end{pdfdiagram}
+\diagramnote{SMR 叠瓦磁道的结构（深色条带是被后一道盖住的重叠区）。写入磁道天生比读取所需的宽度宽，叠瓦布局让后一道盖住前一道的边缘，磁道密度提高，单盘容量便宜约两成。代价在写的方向：写第 N 道会顺带覆盖第 N+1 道的重叠区，于是一组磁道构成一条带，带内只能从带首顺序追加；要改写带中间一个扇区，必须把它之后的内容读出、合并、整条带重写——极端情况一次 4 KB 随机写牵连 256 MB 重写，写放大约六万五千倍。}
 
 盘管式 SMR（DM-SMR）用一小片 CMR 缓存区先收下随机写，空闲时再
 整理回叠瓦区：轻负载看不出差别，持续随机写打穿缓存之后，稳态写
@@ -1318,6 +1440,37 @@ MSI-X 中断向量、绑一颗核。接收侧的分流由硬件完成：RSS 对�
 送侧对称：软件按流或按 CPU 选发送队列，各核各挂各的环，提交路
 径无锁。
 
+分流的全过程画成一张图，就是哈希定向加按核绑环：
+
+\begin{pdfdiagram}
+  \node[hw label, anchor=south] at (5.5,0.68) {同一条流哈希相同，永远进同一队列——天然保序};
+  \node[hw state, minimum width=2.4cm] (nic) at (1.5,-1.28) {网卡收包\\10GbE 小帧\\14.88 Mpps};
+  \node[hw compute, minimum width=2.8cm] (hash) at (4.35,-1.28) {RSS：五元组\\Toeplitz 哈希\\低位查间接表};
+  \draw[hw bus] (nic.east) -- (hash.west);
+  % 队列（示意 4 行，常见 16--128 对）
+  \node[hw memory, minimum width=1.6cm, minimum height=0.55cm, inner sep=1pt] (q0) at (7.05,0) {RX 环 0};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.55cm, inner sep=1pt] (q1) at (7.05,-0.85) {RX 环 1};
+  \node[hw label] at (7.05,-1.7) {$\vdots$};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.55cm, inner sep=1pt] (q15) at (7.05,-2.55) {RX 环 15};
+  % 核
+  \node[hw compute, minimum width=1.3cm, minimum height=0.55cm, inner sep=1pt] (c0) at (9.6,0) {核 0};
+  \node[hw compute, minimum width=1.3cm, minimum height=0.55cm, inner sep=1pt] (c1) at (9.6,-0.85) {核 1};
+  \node[hw label] at (9.6,-1.7) {$\vdots$};
+  \node[hw compute, minimum width=1.3cm, minimum height=0.55cm, inner sep=1pt] (c15) at (9.6,-2.55) {核 15};
+  % 哈希到队列：共享竖直干线，分层折出
+  \draw[hw bus] (hash.east) -- (6.05,-1.28);
+  \draw[BookMuted, line width=0.62pt] (6.05,0) -- (6.05,-2.55);
+  \draw[hw bus] (6.05,0) -- (q0.west);
+  \draw[hw bus] (6.05,-0.85) -- (q1.west);
+  \draw[hw bus] (6.05,-2.55) -- (q15.west);
+  % 队列到核：一对一
+  \draw[hw bus] (q0.east) -- (c0.west);
+  \draw[hw bus] (q1.east) -- (c1.west);
+  \draw[hw bus] (q15.east) -- (c15.west);
+  \node[hw label] at (5.5,-3.4) {每对环绑一个 MSI-X 向量、绑一颗核；单核约 1.5 Mpps，16 颗核并行才接得住 14.88 Mpps};
+\end{pdfdiagram}
+\diagramnote{RSS 接收分流：网卡对每帧的五元组算 Toeplitz 哈希，取低位查间接表，把帧定向到对应 RX 环；每对环绑一个 MSI-X 中断向量、绑一颗核，各核独立处理自己环上的帧，提交路径无锁。同一条流哈希相同、永远进同一队列，保序由哈希天然保证；并行度由队列对数决定——10GbE 小帧 14.88 Mpps 对单核约 1.5 Mpps，16 队列绑 16 核才接得住。}
+
 配置按一遍数：10GbE 小帧 14.88 Mpps，单核约 1.5 Mpps，需要约 10
 颗核起步，留余量配 16 队列、16 个 MSI-X 向量、绑 16 颗核。三个
 配置必须一起看：队列数、间接表、中断亲和——队列开了 32 条而中
@@ -1378,6 +1531,34 @@ ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
 /* kernel path: page cache pages -> socket buffer -> NIC gather DMA;
    file contents never pass through a CPU register */
 \end{lstlisting}
+
+两条路径并排画出来，零拷贝省掉的是哪一段就一目了然：
+
+\begin{pdfdiagram}
+  % 传统路径：两次 CPU 拷贝
+  \node[hw label, anchor=west] at (0.4,0.98) {传统：页缓存 $\to$ 应用缓冲 $\to$ socket 缓冲，两次 CPU 拷贝};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (pc1) at (1.4,0) {页缓存};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (ub) at (4.2,0) {应用缓冲};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (sb1) at (7.0,0) {socket 缓冲};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (nic1) at (9.8,0) {网卡};
+  \draw[hw bus] (pc1.east) -- (ub.west);
+  \draw[hw bus] (ub.east) -- (sb1.west);
+  \draw[hw bus] (sb1.east) -- (nic1.west);
+  \node[hw label, anchor=south] at (2.8,0.62) {① CPU 拷贝};
+  \node[hw label, anchor=south] at (5.6,0.62) {② CPU 拷贝};
+  \node[hw label, anchor=south] at (8.4,0.62) {③ DMA};
+  % 零拷贝路径
+  \node[hw label, anchor=west] at (0.4,-0.98) {零拷贝 sendfile：流转的是缓冲区归属，CPU 不搬数据};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (pc2) at (1.4,-1.95) {页缓存};
+  \node[hw memory, minimum width=2.6cm, minimum height=0.8cm] (sb2) at (5.6,-1.95) {socket 缓冲\\只记指针};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (nic2) at (9.8,-1.95) {网卡};
+  \draw[hw return] (pc2.east) -- (sb2.west);
+  \draw[hw bus] (sb2.east) -- (nic2.west);
+  \node[hw label, anchor=south] at (2.85,-1.33) {只改归属};
+  \node[hw label, anchor=south] at (8.35,-1.33) {gather DMA};
+  \node[hw label] at (5.5,-2.9) {10 Gb/s 下两次 CPU 拷贝产生 5 GB/s 内存流量，约占一条 DDR4-3200 通道（25.6 GB/s）的两成};
+\end{pdfdiagram}
+\diagramnote{发送一个文件的两种路径。传统路径上数据两次经过 CPU：页缓存拷进应用缓冲、应用缓冲再拷进 socket 缓冲，每次都是读一遍写一遍，10 Gb/s 的流量就此产生 5 GB/s 的内存流量。sendfile 让页缓存直接对接 socket，缓冲区只改归属、内容原地不动，网卡用 gather DMA 把协议头与数据拼接发出，CPU 一个字节不搬——省的是内核与用户态之间那次复制，设备 DMA 那一步本来就有。}
 
 \begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
 \toprule
