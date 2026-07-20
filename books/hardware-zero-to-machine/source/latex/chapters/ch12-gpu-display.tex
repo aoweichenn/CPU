@@ -520,6 +520,30 @@ warp 槽位，三者取最紧的那个。寄存器堆的账最直
   占用率 8/64 = 12.5%，400 拍的访存藏不干净
 \end{lstlisting}
 
+把这条计算链画成流程，编译器报告的寄存器数怎样一路决定占用率，
+就一目了然：
+
+\begin{pdfdiagram}
+  % 例一：每线程 40 个寄存器
+  \node[hw state, minimum width=2.7cm] (a1) at (1.6,0) {每线程 40 个寄存器\\每 warp 占 $32\times40=1{,}280$ 个};
+  \node[hw compute, minimum width=2.5cm] (a2) at (4.75,0) {$65{,}536\div1{,}280=51$\\可驻留 51 组 warp};
+  \node[hw compute, minimum width=2.2cm] (a3) at (7.5,0) {占用率\\$51/64\approx80\%$};
+  \node[hw state, minimum width=1.9cm] (a4) at (10.0,0) {藏得住\\400 拍};
+  \draw[hw bus] (a1.east) -- (a2.west);
+  \draw[hw bus] (a2.east) -- (a3.west);
+  \draw[hw bus] (a3.east) -- (a4.west);
+  % 例二：每线程 255 个寄存器
+  \node[hw state, minimum width=2.7cm] (b1) at (1.6,-1.7) {每线程 255 个寄存器\\每 warp 占 $8{,}160$ 个};
+  \node[hw compute, minimum width=2.5cm] (b2) at (4.75,-1.7) {$65{,}536\div8{,}160\approx8$\\只能驻留 8 组};
+  \node[hw compute, minimum width=2.2cm] (b3) at (7.5,-1.7) {占用率\\$8/64=12.5\%$};
+  \node[hw control, minimum width=1.9cm] (b4) at (10.0,-1.7) {400 拍\\藏不住};
+  \draw[hw bus] (b1.east) -- (b2.west);
+  \draw[hw bus] (b2.east) -- (b3.west);
+  \draw[hw bus] (b3.east) -- (b4.west);
+  \node[hw label] at (5.5,-2.85) {分母固定：每 SM 65,536 个寄存器（256 KiB）；内核少用寄存器，是在给时延隐藏能力腾地方};
+\end{pdfdiagram}
+\diagramnote{寄存器预算到占用率的计算链（分母固定为每 SM 65,536 个 32 位寄存器，共 256 KiB）。每线程 40 个寄存器时一个 warp 占 1,280 个，可驻留 51 组，占用率约 80\%，400 拍的访存时延藏得住；每线程 255 个时一个 warp 占 8,160 个，只能驻留 8 组，占用率 12.5\%，发射槽开始空转。编译器报告每线程寄存器数，报的其实是占用率的上限。}
+
 工程含义有两层。其一，内核少用寄存器不是洁癖，
 是在给时延隐藏能力腾地方：编译器报告每线程寄存
 器数时，报的其实是占用率的上限；为省寄存器把变
@@ -1309,6 +1333,34 @@ GPU 每工作一份就空等十份。环把握手摊薄：驱动攒够一批再
 章"描述符预先建好、传输时只改指针"是同一招：把构造的
 成本与提交的成本分开，贵的只做一次。
 
+把两级结构画出来，复用单位与搬运通道各归各位：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.8cm] (drv) at (1.0,-0.1) {CPU：驱动\\（应用录制）};
+  \node[hw memory, minimum width=3.1cm] (bufA) at (4.15,1.15) {命令缓冲 A\\一帧不变的绘制序列};
+  \node[hw memory, minimum width=3.1cm] (bufB) at (4.15,-1.35) {命令缓冲 B\\另一组可复用序列};
+  \node[hw memory, minimum width=3.2cm, minimum height=1.5cm] (ring) at (7.9,-0.1) {主存命令环\\（搬运通道）\\命令包 命令包 $\cdots$};
+  \node[hw compute, minimum width=1.7cm] (gpu) at (10.6,-0.1) {GPU\\前端};
+  % 录一次
+  \draw[hw bus] (drv.east) -- (2.35,-0.1);
+  \draw[BookMuted, line width=0.62pt] (2.35,1.15) -- (2.35,-1.35);
+  \draw[hw bus] (2.35,1.15) -- (bufA.west);
+  \draw[hw bus] (2.35,-1.35) -- (bufB.west);
+  \node[hw label, anchor=west] at (2.55,0.5) {录一次};
+  % 提交＝整块挂接到环
+  \draw[hw bus] (bufA.east) -- (6.5,1.15) -- (6.5,0.65);
+  \draw[hw bus] (bufB.east) -- (6.5,-1.35) -- (6.5,-0.85);
+  \node[hw label, anchor=west] at (6.65,1.15) {提交＝整块挂接};
+  \node[hw label, anchor=west] at (6.65,-1.35) {可提交多次};
+  % GPU 前端取命令
+  \draw[hw bus] (ring.east) -- (gpu.west);
+  \node[hw label, anchor=south] at (9.55,0.72) {DMA 取命令};
+  % doorbell：只带新尾指针
+  \draw[hw return] (drv.south) -- (1.0,-2.5) -- (10.6,-2.5) -- (gpu.south);
+  \node[hw label, anchor=north] at (5.8,-2.6) {doorbell：只带新尾指针};
+\end{pdfdiagram}
+\diagramnote{命令缓冲与命令环的二级结构。应用先把命令录进命令缓冲这种可整块复用的对象（录一次），提交时再把整块挂到主存命令环上——一帧里不变的绘制序列录一次、提交多次，驱动省掉重新编码的开销。环只是搬运通道：doorbell 照样只带新尾指针，GPU 前端经 DMA 取命令。构造的成本与提交的成本分开，贵的只做一次，与第五章"描述符预先建好、传输时只改指针"是同一招。}
+
 doorbell 还有两个容易忽略的性质，都来自"内容只是指针"
 这一件事。其一，它可以合并：驱动连续提交三批、写三次门
 ，GPU 看到的只是尾指针停在最后的位置，一次取走全部三批
@@ -1461,6 +1513,62 @@ ms 以上的差距已有明确体感，这是竞技游戏把深度压到一的
 空隙，一帧几十个边界就把帧预算啃掉一块。深度的选择于是
 是一个明确的工程旋钮：以毫秒为单位买帧间隔的平滑，买不
 买、买几毫秒，看应用对输入时延的容忍度。
+
+把三种提交深度画成时间轴，时延与吞吐各在哪一头就清楚了：
+
+\begin{waveform}[x=0.8cm,y=0.85cm]
+  % 深度 1
+  \node[hw label, anchor=east] at (0.75,7.1) {深度 1 · CPU};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (1,6.85) rectangle (4,7.35);
+  \node at (2.5,7.1) {录 $N$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (4,6.85) rectangle (7,7.35);
+  \node at (5.5,7.1) {录 $N{+}1$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (7,6.85) rectangle (10,7.35);
+  \node at (8.5,7.1) {录 $N{+}2$};
+  \node[hw label, anchor=east] at (0.75,6.0) {深度 1 · GPU};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (4,5.75) rectangle (7,6.25);
+  \node at (5.5,6.0) {执行 $N$};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (7,5.75) rectangle (10,6.25);
+  \node at (8.5,6.0) {执行 $N{+}1$};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (10,5.75) rectangle (13,6.25);
+  \node at (11.5,6.0) {执行 $N{+}2$};
+  \draw[BookMuted, line width=0.6pt, <->] (1,5.35) -- (7,5.35);
+  \node[hw label, anchor=north] at (4,5.28) {输入到显示 $+1$ 帧 $\approx16.7$ ms};
+  % 深度 2
+  \node[hw label, anchor=east] at (0.75,4.5) {深度 2 · CPU};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (1,4.25) rectangle (4,4.75);
+  \node at (2.5,4.5) {录 $N$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (4,4.25) rectangle (7,4.75);
+  \node at (5.5,4.5) {录 $N{+}1$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (7,4.25) rectangle (10,4.75);
+  \node at (8.5,4.5) {录 $N{+}2$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (10,4.25) rectangle (13,4.75);
+  \node at (11.5,4.5) {录 $N{+}3$};
+  \node[hw label, anchor=east] at (0.75,3.4) {深度 2 · GPU};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (7,3.15) rectangle (10,3.65);
+  \node at (8.5,3.4) {执行 $N$};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (10,3.15) rectangle (13,3.65);
+  \node at (11.5,3.4) {执行 $N{+}1$};
+  \draw[BookMuted, line width=0.6pt, <->] (1,2.75) -- (10,2.75);
+  \node[hw label, anchor=north] at (5.5,2.68) {$+2$ 帧 $\approx33$ ms};
+  % 深度 3
+  \node[hw label, anchor=east] at (0.75,1.9) {深度 3 · CPU};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (1,1.65) rectangle (4,2.15);
+  \node at (2.5,1.9) {录 $N$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (4,1.65) rectangle (7,2.15);
+  \node at (5.5,1.9) {录 $N{+}1$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (7,1.65) rectangle (10,2.15);
+  \node at (8.5,1.9) {录 $N{+}2$};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (10,1.65) rectangle (13,2.15);
+  \node at (11.5,1.9) {录 $N{+}3$};
+  \node[hw label, anchor=east] at (0.75,0.8) {深度 3 · GPU};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (10,0.55) rectangle (13,1.05);
+  \node at (11.5,0.8) {执行 $N$};
+  \draw[BookMuted, line width=0.6pt, <->] (1,0.15) -- (13,0.15);
+  \node[hw label, anchor=north] at (7,0.08) {$+3$ 帧 $\approx50$ ms};
+  \node[hw label] at (7,-0.7) {深度每加一级：掉帧更平滑，输入时延多一帧——竞技游戏锁深度一，主机游戏常选两到三};
+\end{waveform}
+\diagramnote{提交深度 1/2/3 的时延—吞吐权衡（60 Hz，横轴每格一帧）。深度 1：CPU 与 GPU 错开一整帧并行，输入到显示约多一帧；深度 2、3：GPU 永远有活干，偶发的慢帧被队列吸收、掉帧更平滑，输入时延相应多两到三帧。深度用内存与时延换吞吐——手快的玩家对 30 ms 以上的差距已有明确体感，这是竞技游戏把深度压到一的全部理由。}
 
 这正引出本节的工程结论：最好的同步，是设计上不需要同步
 。帧缓冲、描述表、常量缓冲按帧轮换双份或三份，生产者和
@@ -1646,6 +1754,46 @@ Hz）以下时，驱动要靠低帧率补偿把每帧显示两三遍，把名义
 刷新率抬回面板能接受的范围。选择依旧回到那句：帧率、时
 延、画质，三选二。
 
+把固定刷新与可变刷新画成两条帧时序，阶梯与抹平各是什么
+形状就清楚了：
+
+\begin{waveform}[x=0.8cm,y=0.85cm]
+  % 组一：固定刷新
+  \node[hw label, anchor=west] at (1,7.75) {固定刷新（60 Hz，每格 16.7 ms）};
+  \node[hw label, anchor=east] at (0.75,7.0) {vsync 节拍};
+  \foreach \x in {1,5,9,13} \draw[BookAccent, line width=0.9pt] (\x,6.75) -- (\x,7.25);
+  \node[hw label, anchor=east] at (0.75,5.85) {渲染};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (1,5.6) rectangle (5.1,6.1);
+  \node at (3.05,5.85) {渲染 X：17 ms};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (9,5.6) rectangle (13.1,6.1);
+  \node at (11.05,5.85) {渲染 Y：17 ms};
+  \node[hw label, anchor=east] at (0.75,4.7) {上屏};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (9,4.45) rectangle (13,4.95);
+  \node at (11,4.7) {显示 X（等一拍）};
+  % 完成迟 0.3 ms：错过当拍窗口，对齐到下一拍
+  \draw[BookRed, line width=0.45pt, dashed] (5.1,6.2) -- (5.1,5.5);
+  \draw[hw danger] (5.1,5.45) -- (5.1,5.08) -- (8.9,5.08) -- (8.9,5.0);
+  \node[hw label, anchor=south, text=BookRed] at (7.5,5.14) {错过窗口：等下一拍（60 掉 30）};
+  % 组二：可变刷新
+  \node[hw label, anchor=west] at (1,3.8) {可变刷新 VRR：刷新跟着渲染走};
+  \node[hw label, anchor=east] at (0.75,3.1) {渲染};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (1,2.85) rectangle (5.1,3.35);
+  \node at (3.05,3.1) {渲染 X：17 ms};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (5.1,2.85) rectangle (9.2,3.35);
+  \node at (7.15,3.1) {渲染 Y：17 ms};
+  \draw[BookTeal, fill=BookCodeBg, line width=0.8pt] (9.2,2.85) rectangle (13.3,3.35);
+  \node[hw label] at (11.25,3.1) {渲染 Z $\cdots$};
+  \node[hw label, anchor=east] at (0.75,1.95) {刷新};
+  \foreach \x in {5.1,9.2,13.3} \draw[BookAccent, line width=0.9pt] (\x,1.7) -- (\x,2.2);
+  \node[hw label, anchor=east] at (0.75,0.8) {上屏};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (5.1,0.55) rectangle (9.2,1.05);
+  \node at (7.15,0.8) {显示 X};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (9.2,0.55) rectangle (13.3,1.05);
+  \node[hw label] at (11.25,0.8) {显示 Y $\cdots$};
+  \node[hw label] at (7,-0.35) {固定刷新：上屏只能取节拍约数（60/30/20）；VRR：帧率连续，代价是帧间隔不匀};
+\end{waveform}
+\diagramnote{固定刷新与可变刷新的帧时序对照（横轴每格约 16.7 ms）。上方固定刷新：交换只能发生在 vsync 窗口，渲染耗时 17 ms、比预算多 0.3 ms，完成时刻错过当拍窗口，只能对齐到下一拍——帧率从 60 直接掉到 30，中间没有任何档。下方 VRR：显示器不再按固定节拍催帧，等 GPU 宣布帧就绪才扫下一帧，17 ms 的帧按约 59 Hz 显示，帧率第一次可以连续变化；代价是帧间隔忽长忽短，低到面板下限以下时靠倍帧补偿。}
+
 \section{五、从图形管线到通用计算}
 
 本节把前四节装回两种真实负载。先沿图形管线走一遍：一个三角形怎
@@ -1731,6 +1879,30 @@ $1.5\times10^{11}$ 次操作，还没算顶点与光栅化；CPU 单核每秒能
 是图形管线必须并行、且把并行做成流式的理由：片元数量比顶点大一
 到两个数量级，面积自然跟着数据量走——可编程的片元级占去芯片大
 部分，固定级做窄而深。
+
+把片元着色里最重的一次访存——纹理采样——单独画出来，纹
+理为什么配专用 cache 与二维布局就有了形状：
+
+\begin{pdfdiagram}
+  \node[hw memory, minimum width=2.2cm] (vram) at (1.1,0) {VRAM 纹理区\\二维分块布局};
+  \node[hw memory, minimum width=1.7cm] (tc) at (3.9,0) {纹理\\cache};
+  \node[hw compute, minimum width=2.1cm] (tu) at (6.6,0) {纹理单元\\寻址＋插值过滤};
+  \node[hw compute, minimum width=2.3cm] (fs) at (9.45,0) {片元着色器\\（SM，SIMT）};
+  \draw[hw bus] (vram.east) -- (tc.west);
+  \draw[hw bus] (tc.east) -- (tu.west);
+  \draw[hw bus] (tu.east) -- (fs.west);
+  \draw[hw bus] (fs.east) -- (11.35,0);
+  \node[hw label, anchor=south west] at (10.75,0.12) {颜色};
+  % 未命中：按二维邻近取回整行
+  \draw[hw return] (tc.north) -- (3.9,1.0) -- (1.1,1.0) -- (vram.north);
+  \node[hw label, anchor=south] at (2.5,1.05) {未命中：按二维邻近取回整行};
+  \node[hw label, anchor=north] at (2.6,-0.5) {命中：纹素};
+  \node[hw label, anchor=north] at (5.15,-0.5) {双线性过滤};
+  \node[hw label, anchor=north] at (8.0,-0.5) {纹素＋光照};
+  \node[hw label] at (5.5,-1.6) {同一小片纹理一帧内被成千上万个像素反复采样，命中频次以亿计——读多写少};
+  \node[hw label] at (5.5,-2.2) {相邻像素采相邻纹素：取回的整行下一拍还能用（二维局部性）};
+\end{pdfdiagram}
+\diagramnote{一次纹理采样的路径。片元着色器发起采样，纹理单元算地址、做插值过滤；命中纹理 cache 直接得纹素，未命中才按二维邻近性从 VRAM 取回整行——纹理在显存里按二维分块布局存放，相邻像素采相邻纹素，取回的整行下一拍还能用。同一小片纹理一帧内被成千上万个像素反复采样，命中频次以亿计：读多写少加二维局部性，是纹理配专用 cache 的全部理由。}
 
 更妙的是这条管线不需要调度者。每级只盯着自己的输入队列：顶点处
 理完一个顶点就交给装配，光栅化每产出一个片元就喂给片元着色器；
@@ -1865,6 +2037,23 @@ GB/s 计，输入 a、b 共 8 MiB，输出 c 共 4 MiB。
 次操作。其二，真要用 GPU 就得批：数据常驻显存，一次搬运喂一串
 内核，把 PCIe 这笔固定开销摊到足够多的计算上——分块流水、异步
 重叠，都是在跟这九成半作战。
+
+把总时长按真实比例画成一条时间条，钱花在哪一头一眼见底：
+
+\begin{pdfdiagram}
+  % 三段按真实比例：530 + 31 + 266 ≈ 830 µs
+  \filldraw[fill=BookAccent!18, draw=BookAccent, line width=0.5pt] (0.4,0) rectangle (7.05,0.7);
+  \node[hw label, text=BookInk] at (3.7,0.35) {拷入 8 MiB $\approx$530 $\mu$s};
+  \filldraw[fill=BookTeal!30, draw=BookTeal, line width=0.5pt] (7.05,0) rectangle (7.44,0.7);
+  \draw[BookMuted, line width=0.5pt] (7.25,0.7) -- (7.25,1.25);
+  \node[hw label, anchor=south] at (7.25,1.3) {内核 31 $\mu$s（约 4\%）};
+  \filldraw[fill=BookAmber!20, draw=BookAmber, line width=0.5pt] (7.44,0) rectangle (10.79,0.7);
+  \node[hw label, text=BookInk] at (9.1,0.35) {拷回 4 MiB $\approx$266 $\mu$s};
+  \draw[BookMuted, line width=0.6pt, <->] (0.4,-0.3) -- (10.79,-0.3);
+  \node[hw label, anchor=north] at (5.6,-0.4) {总时长 $\approx$830 $\mu$s};
+  \node[hw label] at (5.6,-1.15) {PCIe 搬运两段合计 $\approx$796 $\mu$s，占九成半——优化指向批量化与数据常驻，不在内核本身};
+\end{pdfdiagram}
+\diagramnote{一次内核启动的耗时构成（$N=2^{20}$ 向量加，PCIe 3.0 x16，按比例）：拷入 8 MiB 约 530 $\mu$s，内核执行约 31 $\mu$s，拷回 4 MiB 约 266 $\mu$s，总时长约 830 $\mu$s。两次 PCIe 搬运占九成半，内核只占约 4\%——算术强度约 0.08 FLOP/B 的负载，时间几乎全花在搬运上；工程上要么批量化、让数据常驻显存把这笔固定开销摊薄，要么干脆留在 CPU 上。}
 
 把这次 trace 与第十一章的 NVMe 读并排摆开，是同一个骨架穿了两
 套衣服：
