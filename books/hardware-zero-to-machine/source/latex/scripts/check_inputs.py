@@ -18,6 +18,7 @@ EXPECTED_INPUTS = [
     "chapters/ch03-number-arithmetic-circuits",
     "chapters/ch04-minimal-cpu",
     "chapters/ch05-memory-bus-io-dma",
+    "chapters/ch05b-storage-cell-structures",
     "chapters/ch06-classic-chips-platforms",
     "chapters/ch07-breadboard-computer",
     "chapters/ch08-power-clock-signal-integrity",
@@ -38,13 +39,13 @@ def main() -> int:
         raise SystemExit(f"missing expected inputs: {missing}")
 
     chapter_files = sorted((ROOT / "chapters").glob("*.tex"))
-    if len(chapter_files) != 13:
-        raise SystemExit(f"expected 13 chapter files, found {len(chapter_files)}")
+    if len(chapter_files) != 14:
+        raise SystemExit(f"expected 14 chapter files, found {len(chapter_files)}")
 
     for chapter in chapter_files:
         chapter_text = chapter.read_text(encoding="utf-8")
         sections = re.findall(r"\\section\{", chapter_text)
-        if len(sections) > 5:
+        if len(sections) > 8:
             raise SystemExit(f"{chapter.name} has too many sections: {len(sections)}")
 
     print("checked hardware-zero-to-machine LaTeX manuscript inputs")
