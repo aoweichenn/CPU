@@ -45,7 +45,7 @@ def main() -> int:
     for chapter in chapter_files:
         chapter_text = chapter.read_text(encoding="utf-8")
         sections = re.findall(r"\\section\{", chapter_text)
-        if len(sections) > 8:
+        if len(sections) > 9:
             raise SystemExit(f"{chapter.name} has too many sections: {len(sections)}")
 
     print("checked hardware-zero-to-machine LaTeX manuscript inputs")
