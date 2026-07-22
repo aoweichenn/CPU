@@ -63,6 +63,14 @@ EXTRAS = {
     18: ("ch18-pcie-transactions.tex",),
     23: ("ch23-usb-human-interface.tex",),
 }
+DIAGRAM_OVERRIDES = {
+    6: (("这台最小 ISA 的完整数据通路", "ch06-minimal-isa-datapath.tex"),),
+    13: (("内存控制器内部流水线", "ch13-memory-controller-pipeline.tex"),),
+    14: (("NVMe 命令处理流程", "ch14-nvme-command-flow.tex"),),
+    16: (("从 read() 到寄存器的完整路径", "ch16-read-end-to-end.tex"),),
+    21: (("台式机主板布局与三大分配网络", "ch21-motherboard-distribution.tex"),),
+    26: (("J 的条件选通逻辑", "ch26-conditional-jump-select.tex"),),
+}
 LEGACY_CHAPTER_REFERENCES = (
     ("第十三章", "存储与外设队列案例"),
     ("第十二章", "“冒险、异常与性能”一章"),
@@ -264,11 +272,36 @@ def rewrite_legacy_chapter_references(text: str, chapter_number: int) -> str:
     return text
 
 
+def apply_diagram_overrides(text: str, chapter_number: int, overrides_dir: Path) -> str:
+    """Replace selected legacy figures while preserving their prose and captions."""
+    for caption_start, override_name in DIAGRAM_OVERRIDES.get(chapter_number, ()):
+        marker = text.find(r"\diagramnote{" + caption_start)
+        if marker < 0:
+            raise ValueError(
+                f"diagram override marker not found in chapter {chapter_number}: {caption_start}"
+            )
+        begin = text.rfind(r"\begin{pdfdiagram", 0, marker)
+        end_token = r"\end{pdfdiagram}"
+        end = text.find(end_token, begin, marker)
+        if begin < 0 or end < 0:
+            raise ValueError(
+                f"diagram environment not found for chapter {chapter_number}: {caption_start}"
+            )
+        end += len(end_token)
+        replacement_path = overrides_dir / override_name
+        if not replacement_path.is_file():
+            raise FileNotFoundError(f"missing diagram override: {replacement_path}")
+        replacement = replacement_path.read_text(encoding="utf-8").strip()
+        text = text[:begin] + replacement + text[end:]
+    return text
+
+
 def main() -> int:
     root = find_root(Path.cwd().resolve())
     source_dir = root / "books/hardware-zero-to-machine/source/latex/chapters"
     output_dir = root / "books/hardware-zero-to-machine/source/latex/chapters26"
     additions_dir = output_dir / "additions"
+    overrides_dir = output_dir / "diagram-overrides"
     output_dir.mkdir(parents=True, exist_ok=True)
 
     source_names = sorted({name for chapter in CHAPTERS for name, _ in chapter.units})
@@ -304,6 +337,7 @@ def main() -> int:
         body = rewrite_legacy_chapter_references(
             "".join(body_parts).lstrip("\n"), chapter.number
         )
+        body = apply_diagram_overrides(body, chapter.number, overrides_dir)
         body = renumber_sections(body)
         output = output_dir / f"ch{chapter.number:02d}-{chapter.slug}.tex"
         expected_outputs.add(output)
