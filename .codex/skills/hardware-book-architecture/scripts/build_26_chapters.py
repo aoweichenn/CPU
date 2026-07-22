@@ -51,6 +51,7 @@ CHAPTERS = (
 SECTION_RE = re.compile(r"(?m)^\\section\{")
 NUMBERED_SECTION_RE = re.compile(r"^(\\section\{)(?:〇|[一二三四五六七八九十]+)、")
 CHINESE_NUMERALS = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
+CHINESE_TO_ARABIC = {number: str(index) for index, number in enumerate(CHINESE_NUMERALS, start=1)}
 EXTRAS = {
     8: ("ch08-pipeline-core.tex",),
     9: ("ch09-pipeline-hazards.tex",),
@@ -63,24 +64,37 @@ EXTRAS = {
     23: ("ch23-usb-human-interface.tex",),
 }
 LEGACY_CHAPTER_REFERENCES = (
-    ("第十三章", "NVMe 与存储 I/O 两章"),
+    ("第十三章", "存储与外设队列案例"),
     ("第十二章", "“冒险、异常与性能”一章"),
     ("第九章", "“电源、时钟与信号完整性”一章"),
-    ("第八章", "最后的教学计算机项目"),
+    ("第八章", "本书末章的教学计算机项目"),
     ("第七章", "经典芯片与平台案例"),
-    ("第五章", "存储与设备事务部分"),
-    ("第四章", "处理器核心部分"),
-    ("第三章", "数值与数据通路部分"),
+    ("第五章", "存储与设备事务相关章节"),
+    ("第四章", "处理器核心相关章节"),
+    ("第三章", "算术与数据通路相关章节"),
     ("第二章", "“状态、时钟与时序逻辑”一章"),
-    ("第一章", "数字硬件基础部分"),
+    ("第一章", "“数字硬件基础”部分"),
+)
+LEGACY_TOPIC_REFERENCES = (
+    ("经典芯片与平台演进章", "经典芯片与平台演进案例"),
+    ("经典芯片与平台章", "经典芯片与平台案例"),
+    ("存储器件结构章", "存储器件相关章节"),
+    ("主存与总线章", "存储与互连相关章节"),
+    ("外设队列章", "“外设、网络与人机接口”一章"),
+    ("电源时钟章", "“电源、时钟与信号完整性”一章"),
 )
 REFERENCE_CLEANUPS = (
+    ("现象上一节", "该现象前文"),
     ("经典芯片与平台案例经典芯片", "经典芯片与平台案例"),
-    ("最后的教学计算机项目面包板教学机", "教学计算机项目中的面包板机"),
-    ("最后的教学计算机项目教学机", "教学计算机项目"),
-    ("最后的教学计算机项目的面包板计算机", "教学计算机项目中的面包板计算机"),
-    ("最后的教学计算机项目的教学机", "教学计算机项目中的教学机"),
-    ("最后的教学计算机项目这台机器", "教学计算机项目中的这台机器"),
+    ("存储与外设队列案例的 NVMe", "存储与外设队列案例中的 NVMe"),
+    ("存储与外设队列案例 NVMe", "存储与外设队列案例中的 NVMe"),
+    ("列mux", "列 mux"),
+    ("R高", "R 高"),
+    ("本书末章的教学计算机项目面包板教学机", "教学计算机项目中的面包板机"),
+    ("本书末章的教学计算机项目教学机", "教学计算机项目"),
+    ("本书末章的教学计算机项目的面包板计算机", "教学计算机项目中的面包板计算机"),
+    ("本书末章的教学计算机项目的教学机", "教学计算机项目中的教学机"),
+    ("本书末章的教学计算机项目这台机器", "教学计算机项目中的这台机器"),
 )
 TARGET_REPLACEMENTS = {
     2: (("独占整章", "独占一个完整部分"),),
@@ -111,6 +125,118 @@ def split_units(path: Path) -> list[str]:
     return [body[: starts[0]], *[body[start:end] for start, end in zip(starts, starts[1:] + [len(body)])]]
 
 
+def section_topics(path: Path) -> tuple[dict[str, str], tuple[str | None, ...]]:
+    """Return old section-number topics and the topic owned by each split unit."""
+    text = path.read_text(encoding="utf-8")
+    headings = re.findall(r"(?m)^\\section\{([^}]+)\}", text)
+    by_number: dict[str, str] = {}
+    ordered: list[str | None] = [None]
+    for heading in headings:
+        match = re.match(r"(〇|[一二三四五六七八九十]+)、(.+)", heading)
+        if not match:
+            raise ValueError(f"section heading lacks a Chinese number: {path}: {heading}")
+        number, topic = match.groups()
+        by_number[number] = topic
+        ordered.append(topic)
+    return by_number, tuple(ordered)
+
+
+def named_section_reference(topic: str) -> str:
+    return f"“{topic}”一节"
+
+
+def rewrite_legacy_section_references(
+    text: str,
+    source_name: str,
+    unit_index: int,
+    topics_by_number: dict[str, dict[str, str]],
+    topics_by_unit: dict[str, tuple[str | None, ...]],
+) -> str:
+    """Turn pre-migration numeric and relative references into stable topic names."""
+    number_map = topics_by_number[source_name]
+    alternatives = "|".join(sorted(map(re.escape, number_map), key=len, reverse=True))
+
+    def replace_section_symbol(match: re.Match[str]) -> str:
+        return named_section_reference(number_map[match.group(1)])
+
+    text = re.sub(rf"[ \t]*§[ \t]*({alternatives})", replace_section_symbol, text)
+    text = re.sub(
+        rf"本章第[ \t]*({alternatives})[ \t]*节",
+        replace_section_symbol,
+        text,
+    )
+
+    arabic = {
+        CHINESE_TO_ARABIC[number]: number
+        for number in number_map
+        if number in CHINESE_TO_ARABIC
+    }
+
+    def replace_arabic_section(match: re.Match[str]) -> str:
+        number = arabic.get(match.group(1))
+        return named_section_reference(number_map[number]) if number else match.group(0)
+
+    text = re.sub(
+        r"本章第[ \t]*([0-9]+)[ \t]*节", replace_arabic_section, text
+    )
+
+    ordered = topics_by_unit[source_name]
+    if unit_index > 0 and ordered[unit_index - 1]:
+        text = text.replace("上一节", named_section_reference(ordered[unit_index - 1]))
+    if unit_index + 1 < len(ordered) and ordered[unit_index + 1]:
+        text = text.replace("下一节", named_section_reference(ordered[unit_index + 1]))
+    text = re.sub(
+        r"一节[ \t]+(?=[\u4e00-\u9fff，。；：、！？）])", "一节", text
+    )
+    return text
+
+
+INLINE_LITERAL_RE = re.compile(
+    r"(\\(?:code|texttt|url|path)\{[^{}]*\})"
+)
+PROSE_QUOTE_RE = re.compile(r'"([^"]*)"')
+
+
+def polish_prose_chunk(text: str) -> str:
+    literals: list[str] = []
+
+    def protect_literal(match: re.Match[str]) -> str:
+        literals.append(match.group(0))
+        return f"\ue000{len(literals) - 1}\ue001"
+
+    text = INLINE_LITERAL_RE.sub(protect_literal, text)
+    text = PROSE_QUOTE_RE.sub(r"“\1”", text)
+    text = re.sub(r"(?<=[\u4e00-\u9fff])(?=[A-Za-z0-9])", " ", text)
+    text = re.sub(r"(?<=[A-Za-z0-9])(?=[\u4e00-\u9fff])", " ", text)
+    for index, literal in enumerate(literals):
+        text = text.replace(f"\ue000{index}\ue001", literal)
+    return text
+
+
+def polish_reader_text(text: str) -> str:
+    """Apply typography fixes to prose while leaving literal code blocks intact."""
+    output: list[str] = []
+    prose_buffer: list[str] = []
+    literal_depth = 0
+    for line in text.splitlines(keepends=True):
+        if re.search(r"\\begin\{(?:lstlisting|verbatim)\}", line):
+            output.append(polish_prose_chunk("".join(prose_buffer)))
+            prose_buffer.clear()
+            literal_depth += 1
+            output.append(line)
+            continue
+        if literal_depth:
+            output.append(line)
+            if re.search(r"\\end\{(?:lstlisting|verbatim)\}", line):
+                literal_depth -= 1
+            continue
+        prose_buffer.append(line)
+    if literal_depth:
+        raise ValueError("unterminated literal environment")
+    output.append(polish_prose_chunk("".join(prose_buffer)))
+    return "".join(output)
+
+
 def renumber_sections(text: str) -> str:
     index = 0
     output: list[str] = []
@@ -129,6 +255,8 @@ def renumber_sections(text: str) -> str:
 def rewrite_legacy_chapter_references(text: str, chapter_number: int) -> str:
     for old, new in LEGACY_CHAPTER_REFERENCES:
         text = text.replace(old, new)
+    for old, new in LEGACY_TOPIC_REFERENCES:
+        text = text.replace(old, new)
     for old, new in REFERENCE_CLEANUPS:
         text = text.replace(old, new)
     for old, new in TARGET_REPLACEMENTS.get(chapter_number, ()):
@@ -145,6 +273,9 @@ def main() -> int:
 
     source_names = sorted({name for chapter in CHAPTERS for name, _ in chapter.units})
     units = {name: split_units(source_dir / name) for name in source_names}
+    topic_data = {name: section_topics(source_dir / name) for name in source_names}
+    topics_by_number = {name: data[0] for name, data in topic_data.items()}
+    topics_by_unit = {name: data[1] for name, data in topic_data.items()}
     expected = {(name, index) for name, blocks in units.items() for index in range(len(blocks))}
     assigned: list[tuple[str, int]] = []
 
@@ -156,7 +287,15 @@ def main() -> int:
                 if index >= len(units[name]):
                     raise IndexError(f"invalid unit {name}:{index}")
                 assigned.append((name, index))
-                body_parts.append(units[name][index])
+                body_parts.append(
+                    rewrite_legacy_section_references(
+                        units[name][index],
+                        name,
+                        index,
+                        topics_by_number,
+                        topics_by_unit,
+                    )
+                )
         for extra_name in EXTRAS.get(chapter.number, ()):
             extra = additions_dir / extra_name
             if not extra.is_file():
@@ -175,6 +314,7 @@ def main() -> int:
             "\\end{keyidea}\n\n"
             f"{body}"
         )
+        text = polish_reader_text(text)
         text = text.rstrip() + "\n"
         output.write_text(text, encoding="utf-8")
 

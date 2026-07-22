@@ -13,6 +13,7 @@ Read these references completely before planning or editing:
 
 1. `references/architecture-26-chapters.md`
 2. `references/migration-ledger.md`
+3. For prose editing, rewriting, expansion, or polishing, also read `references/editorial-style.md`.
 
 Treat an explicit user instruction as higher priority than these references. Do not change the 26-chapter target merely to make migration easier.
 
@@ -56,3 +57,9 @@ When the user asks to finish the book restructuring, perform this closeout unles
 For each chapter, make the hardware path explicit: input/state, data path, control path, timing or commit boundary, interface contract, and error/recovery path. Include at least one concrete mechanism or historical case and end with concept, trace, boundary-condition, and fault-localization exercises with machine-level answers.
 
 Do not claim completion from line counts alone. Report the ledger status, build results, and any content units still awaiting verification.
+
+## Polish prose without losing content
+
+When improving wording, keep the intact legacy files as the content baseline and make repeatable editorial transformations in `scripts/build_26_chapters.py` or reader-facing additions. Do not hand-edit generated `chapters26/ch*.tex` without updating its source of truth.
+
+After regeneration, run `python3 .codex/skills/hardware-book-architecture/scripts/audit_prose.py`. Treat old numeric chapter references, `§` references, stale legacy chapter names, and vague relative section references as migration defects. Resolve them to stable topic or section names before publishing.
