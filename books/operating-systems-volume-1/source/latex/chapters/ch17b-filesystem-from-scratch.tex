@@ -50,7 +50,9 @@ DMA）传输数据。下面是队列式设备的简化路径；具体设备可�
 \item CPU 的中断处理程序被调用，确认 I/O 完成。
 \end{enumerate}
 
-关键洞察：在 DMA 传输期间，发起 I/O 的线程通常不必占用 CPU 等待；CPU 可以执行其他线程，也可以按设备与负载选择中断或轮询完成队列。DMA 解决的是数据搬运方式，轮询与中断解决的是完成通知方式，两者不是互斥的替代关系。
+在 DMA 传输期间，发起 I/O 的线程通常不必占用 CPU 等待；CPU 可以执行其他线程，
+完成队列则可按设备与负载采用中断或轮询。DMA 规定数据怎样搬运，中断与轮询规定
+完成怎样通知，两者处于不同层次。
 
 \begin{lstlisting}
   CPU               Memory                Disk Controller        Disk
@@ -119,12 +121,9 @@ read(fd, my_data, 8192);
 这里不把“原子写”列成文件系统自动提供的通用属性：不同系统调用、不同文件系统、
 不同挂载模式所承诺的可见性与持久性边界并不相同，后文会逐项拆开。
 
-\begin{keyidea}
-文件系统的本质是\textbf{变换}：它把一个无名的、块号的线性数组变换为
-有名的、层级组织的、崩溃可恢复的、并发可访问的存储对象集合。这个变换
-需要四类磁盘上的数据结构（超级块、inode、目录项、空闲空间位图）和一组
-管理它们的算法（分配、查找、回收、缓存、日志）。
-\end{keyidea}
+文件系统把这些职责分配给不同结构和协议：超级块提供布局入口，inode 保存文件
+属性和块映射，目录项保存名字关系，位图管理空间；分配、查找、缓存和恢复算法再
+维持它们之间的一致性。后面的设备路径将说明这些磁盘结构最终怎样转化为 I/O 请求。
 
 %%% ================================================================
 %%% Section 2: 块设备接口：从 CPU 到磁盘字节
@@ -240,14 +239,12 @@ Linux 的页缓存（page cache）是文件数据的内存缓存。每个文件�
   \code{read()} 系统调用被唤醒，从页缓存复制数据到用户缓冲区。
 \end{enumerate}
 
-\begin{keyidea}
-页缓存是 Linux \emph{buffered I/O} 的核心设计：普通 \code{read()} 先查缓存，
+Linux 的 \emph{buffered I/O} 以页缓存为默认数据路径：普通 \code{read()} 先查缓存，
 miss 时才走设备 I/O；普通 \code{write()} 先修改缓存 folio 并标脏，再由
 writeback 机制异步回写。\code{O\_DIRECT} 和 DAX 等路径可以绕过传统页缓存，
 所以不能把“buffered I/O 的默认路径”写成“所有文件读写的唯一通路”。
 \code{write()} 返回也不等于掉电持久；可靠程序还必须检查 \code{fsync()} 的
 返回值，并确认底层设备履行 flush/FUA 等持久化承诺。
-\end{keyidea}
 
 \subsection{块 I/O 层：bio 结构}
 
@@ -351,13 +348,9 @@ NVMe 没有机械寻道，因此按扇区排序的收益通常远小于 HDD，�
   \code{bio} 为完成状态，调用 \code{bi_end_io} 回调。
 \end{enumerate}
 
-\begin{keyidea}
-DMA 的本质是\textbf{让磁盘控制器成为总线主控}（bus master）。
-控制器不再依赖 CPU 逐字节搬运数据，而是自行访问内存。CPU 的角色从
-"搬运工"变为"调度员"：设置描述符、发门铃、等中断。在 NVMe 协议中，
-每个 I/O 队列有多达 65536 个条目，控制器可以一口气处理大量请求
-而不需要 CPU 逐个干预。
-\end{keyidea}
+DMA 允许控制器以总线主控（bus master）身份访问已经映射的内存，不再依赖 CPU
+逐字节搬运。CPU 准备描述符并通知设备，控制器执行传输，完成事件再由中断或轮询
+路径收取。队列由此可以容纳多个在途请求，CPU 无须为每个数据字节参与传输。
 
 \subsection{完整追踪：read(fd, buf, 4096) 在偏移 8192 处}
 
@@ -614,10 +607,10 @@ struct mdfs_inode {
 \end{itemize}
 
 \begin{warningbox}
-\code{i_blocks} 的语义极其反直觉：它不是文件使用的块数，而是文件
-使用的\textbf{512 字节扇区数}，包括元数据块（如间接指针块、扩展属性块）。
+\code{i_blocks} 采用\textbf{512 字节扇区数}作为单位，并可能计入间接指针块、
+扩展属性块等元数据；它不等于当前文件系统块的数量。
 一个 1 字节文件在 4K 块系统上 \code{i_blocks} = 8（1 块 $\times$ 8 扇区），
-而不是 1。这个设计源于 ext2 时代，为了兼容只有 512 字节扇区的设备。
+而不是 1。读取该字段时应先确认单位，再换算实际占用量。
 \end{warningbox}
 
 \subsection{目录项：文件名的存放}
@@ -1154,12 +1147,10 @@ read(fd, buf, 4096);                // 返回全零页, 不产生磁盘 I/O!
 // 内核发现 i_block[] 指针 = 0, 直接返回 zero-filled page
 \end{lstlisting}
 
-\begin{keyidea}
-稀疏文件的核心机制是：\code{i_block[]} 中的 0 指针不是"无效"，而是
-"该逻辑块未分配，内容全为零"。读取 hole 不产生任何磁盘 I/O——内核
-直接返回一个预制的零页（zero page）。这使得创建巨大的稀疏文件
-（如虚拟机磁盘镜像、数据库预分配空间）几乎不占用磁盘空间。
-\end{keyidea}
+在经典间接指针表示中，\code{i_block[]} 的 0 指针表示相应逻辑块尚未分配，
+读取结果按零填充。这个区间称为 hole。读取 hole 无须读取数据块；写入其中某一段时，
+文件系统才为相应范围分配物理空间。虚拟机镜像和数据库文件常利用这一性质表示
+逻辑容量很大、实际写入范围较小的文件。
 
 \subsection{inode 表的布局}
 
@@ -1711,11 +1702,9 @@ ext4 的 \code{mballoc}（multi-block allocator）在块组之上叠加多层策
 
 \subsection{延迟分配（delalloc）}
 
-\begin{keyidea}
-延迟分配的核心思想：\code{write()} 只把数据写入页缓存，
-\emph{不分配物理块}。等到 \code{writeback} 时，
-分配器看到完整的脏页范围，一次性分配连续块。
-\end{keyidea}
+延迟分配在 buffered \code{write()} 阶段先记录脏缓存和逻辑范围，暂缓决定物理块。
+到 writeback 阶段，分配器能够观察更完整的脏范围，并尝试一次分配连续 extent。
+这改善了布局机会，但也意味着空间不足等错误可能延迟到写回或 \code{fsync} 才出现。
 
 对比两种场景（写 3 个 4~KiB 页）：
 
@@ -2132,12 +2121,10 @@ ssize_t vfs_read(struct file *file, char __user *buf, size_t len, loff_t *pos) {
 //   nfs:  nfs_file_read_iter   -> 网络 RPC
 \end{lstlisting}
 
-\begin{keyidea}
-VFS 分发的本质是\emph{延迟绑定}：\code{open()} 时
-\code{file->f\_op = inode->i\_fop}（由具体文件系统在 \code{alloc\_inode} 时设置），
+VFS 通过\emph{延迟绑定}完成分发：打开文件时，
+\code{file->f\_op = inode->i\_fop}；具体文件系统在实例化相应 inode 时设置操作表。
 此后每次 \code{read}/\code{write}/\code{fsync} 都通过这张函数指针表
 分发到正确的实现。应用代码、VFS 通用代码、文件系统特定代码三者解耦。
-\end{keyidea}
 
 \subsection{open() 完整路径追踪}
 
@@ -2262,9 +2249,9 @@ Docker 镜像层叠正是基于 overlayfs。
 随后由后台写回或同步调用送往设备。Direct I/O 和 DAX 是后文单独讨论的旁路，不能
 把这段默认路径扩大成所有文件 I/O 的唯一实现。
 
-\begin{keyidea}
-page cache 的本质是把磁盘内容映射到内存页帧。每个缓存页由 \code{(inode, offset)} 唯一标识。读路径优先在缓存中查找；写路径只修改缓存中的页，标记为脏页后立即返回。磁盘 I/O 被推迟到 writeback 线程异步执行。
-\end{keyidea}
+页缓存按文件映射与页索引组织 folio，使同一文件区间能够被 read、write 和 mmap
+共享。buffered read 优先查找缓存；buffered write 通常修改缓存并标脏，随后由后台
+写回或同步调用提交 I/O。这里描述的是默认 buffered 路径，不包括 Direct I/O 与 DAX。
 
 \subsection{address\_space：从 (inode, offset) 到 folio}
 
@@ -2559,13 +2546,14 @@ put_page(page);
 \toprule
 时刻 & 数据位置 & 断电后 \\
 \midrule
-\code{write()} 返回 & page cache（内存） & 丢失 \\
+普通 buffered \code{write()} 返回 & page cache（内存） & 掉电时通常丢失 \\
 writeback 完成 & 磁盘写缓存 & 可能丢失（易失缓存） \\
 \code{fsync()} 成功返回 & 文件系统与设备已完成其持久化协议 & 设备兑现 flush/FUA 等承诺且硬件无故障时保留 \\
 \bottomrule
 \end{longtable}
 
-这就是为什么 \code{write()} 返回成功不代表数据已持久化——它只代表数据到达了内存。
+对这里讨论的普通 buffered write，\code{write()} 成功返回只说明内核已经接收数据；
+持久化仍取决于后续写回、文件系统提交和设备协议。
 
 \subsection{脏页追踪}
 
@@ -3136,7 +3124,10 @@ e2fsck(dev):
       bitmap[block] = USED  // 可能是泄漏
 \end{lstlisting}
 
-\code{fsck} 的复杂度是 $O(\text{total\_blocks})$——必须扫描每个块和每个 inode。一个 1 TiB 的文件系统，4 KiB 块，共 $2^{38}/2^{12} = 2^{26} \approx 6700$ 万个块。即使每秒检查 100000 块，也需要 $\sim$11 分钟。更大的文件系统（10 TiB+）可能需要数小时。
+全盘检查的工作量随 inode 与块数增长。一个 1 TiB 文件系统若采用 4 KiB 块，共有
+$2^{40}/2^{12}=2^{28}\approx2.68$ 亿个块；即使以每秒 100000 块的理想速度线性扫描，
+仅块扫描也约需 45 分钟。真实耗时还受 inode 数量、元数据局部性、设备并行度和修复
+工作影响，因此大容量文件系统的完整检查可能持续更久。
 
 \begin{warningbox}
 \code{fsck} 在大型文件系统上恢复时间长达数十分钟到数小时。服务器重启窗口要求几秒到几分钟，\code{fsck} 的恢复时间是不可接受的。这正是日志文件系统被发明的直接动机：把恢复时间从 $O(\text{文件系统大小})$ 降到 $O(\text{日志大小})$。
@@ -3144,7 +3135,9 @@ e2fsck(dev):
 
 \subsection{日志：write-ahead logging}
 
-日志的核心思想是\emph{写前记录}（write-ahead logging, WAL）：在修改文件系统的实际数据结构之前，先把修改的内容记录到一块专门的日志区域。日志中的记录描述"我要把块 X 的内容改成 Y"。修改提交后，再把实际数据写到文件系统的对应位置。
+日志采用\emph{写前记录}（write-ahead logging, WAL）：相关主位置更新获得持久性之前，
+先将事务所需的元数据版本和提交信息写入日志区域。事务提交后，主文件系统位置可以在
+checkpoint 阶段更新，已完成 checkpoint 的日志空间随后回收。
 
 \begin{lstlisting}
 // 带日志的文件创建
@@ -3187,7 +3180,9 @@ checkpoint 之后 & 日志已回收 & 无需恢复（修改已在主位置） \\
 \end{longtable}
 
 \begin{keyidea}
-日志的关键规则是\emph{日志先行}（write-ahead）：描述修改的日志记录\emph{必须}在主文件系统上的实际修改之前持久化到磁盘。否则崩溃后无法判断磁盘上的半成品是否应该保留。commit 块是事务的原子边界——有 commit 块就重放，没有就丢弃。
+日志先行约束要求恢复所需的日志记录先于受保护的主位置更新持久化。恢复程序还要验证
+事务序号、描述块、校验和与 commit 块；只有满足格式规定的完整事务才可重放。commit
+块提供提交证据，但不能脱离写序和完整性检查单独解释。
 \end{keyidea}
 
 \subsection{jbd2 日志格式}
@@ -3676,12 +3671,11 @@ snapshot 创建后，两个 subvolume 共享未修改的数据块；只有后续
 相关元数据路径才会分叉。因此创建通常远快于复制整棵文件树，但不能据此许诺与
 任意系统状态无关的严格常数时间。
 
-\begin{keyidea}
-Btrfs snapshot 是 COW 的直接收益：旧树根仍然有效，新树根通过 COW 路径逐渐分叉。
+旧树根在 COW 更新期间仍然有效，新快照通过共享引用保留既有数据，后续写入才使相关
+路径逐渐分叉。
 共享的数据块通过 extent tree 的引用记录管理，最后一个引用消失后才具备回收条件。
-创建时不复制全部文件数据，这是应当记住的复杂度优势；真实完成时间还受事务提交、
+创建时不复制全部文件数据；真实完成时间还受事务提交、
 元数据更新和系统负载影响。
-\end{keyidea}
 
 \subsection{ZFS：事务对象存储}
 
@@ -3865,9 +3859,10 @@ snapshot & 需 LVM 等上层机制 & 原生、创建元数据开销较小 & 原�
 \bottomrule
 \end{longtable}
 
-\begin{keyidea}
-COW 文件系统用写放大换取了崩溃一致性和 snapshot 能力。原地覆盖写文件系统用日志换取同样的崩溃一致性，但写放大更低。两者不是"谁更好"的问题，而是不同的优先级：COW 优先一致性和功能，原地覆盖优先吞吐和低延迟。
-\end{keyidea}
+COW 设计通过写新版本与提交协议提供恢复点和原生 snapshot，但会引入元数据更新、
+引用追踪和碎片等成本。允许原地更新的文件系统通常以日志保护特定元数据，并获得
+不同的写放大与延迟特征。两类设计对用户数据原子性、校验和和恢复范围的承诺仍取决于
+具体实现与配置，不能只按“COW”或“日志”标签推断。
 
 \begin{pdfdiagram}
   % COW update: old tree and new tree
@@ -4580,11 +4575,9 @@ Btrfs 提供了类似但更慷慨的内嵌支持。Btrfs 的 \emph{inline extent
 \filepath{/etc} 的全量扫描，I/O 从 $\sim$ 3000 次数据块读取降至 0 次——
 所有数据已在 inode 块中。
 
-\begin{keyidea}
-inline data 的本质是将 \emph{元数据存储} 与 \emph{数据存储} 合并到同一个
-物理块。当文件大小 $\le$ inode 内嵌容量时，数据访问退化为元数据访问——
-只需一次 I/O 即可同时获取元数据和数据。
-\end{keyidea}
+inline data 利用 inode 内的可用空间保存小文件内容，省去独立数据块和一次间接寻址。
+当内容超过内联容量时，文件系统需要把它迁移到普通块映射；实际读取是否产生 I/O
+还取决于 inode 所在元数据块是否已经缓存。
 
 % ------------------------------------------------------------------
 \subsection{元数据校验和}
@@ -4844,10 +4837,10 @@ int ddt_lookup(zfs_sb_t *zsb, ddt_entry_t *dde, void *data)
 新块才真正写入磁盘并添加到去重表。}
 
 \begin{warningbox}
-去重表的内存在规模化后变得不可接受。对于 10 TiB 存储，DDT 需要 $\sim$ 256 GiB
-RAM。如果 DDT 不在内存中，每次写入的哈希查找都需要磁盘 I/O，性能急剧下降。
-这就是为什么 ZFS 文档反复强调：``dedup is always a bad idea unless you know
-exactly what you are doing''。
+去重表的成本取决于唯一块数量、记录格式、缓存命中率和实现。容量相同的数据集，块越小、
+唯一块越多，索引记录就越多；索引不能在内存中保持有效工作集时，写入路径会增加持久
+索引访问。部署前应以目标数据集测量重复率、内存占用、写入放大和恢复时间，不按总容量
+套用一个固定内存比例。
 \end{warningbox}
 
 \emph{最佳用例}：VM 镜像（多台虚拟机安装相同操作系统，90\%+ 块重复）、
