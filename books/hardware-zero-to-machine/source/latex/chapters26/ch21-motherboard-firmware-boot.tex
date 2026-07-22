@@ -1,0 +1,646 @@
+\chapter{主板、芯片组、固件与启动}
+
+\begin{keyidea}
+按下电源后，供电、时钟、复位、训练、枚举和固件必须按依赖顺序推进。本章沿启动时间线解释主板与平台分工。
+\end{keyidea}
+
+\section{一、整机启动与经典芯片后的演进}
+
+通电或复位后，CPU、主存控制器、互连和设备控制器都必须进入规定初始状态。PC 通常被置到固定启动地址，那里连接 ROM、片上存储或其他启动介质。启动路径的第一件事，是让硬件从可预测位置开始取编码。
+
+整机启动不仅是 CPU 复位。时钟源要稳定，复位树要按顺序释放，主存控制器要完成训练或初始化，互连要进入可转发请求的状态，必要设备要处于安全默认值。若这些硬件条件没有满足，即使 CPU 本身能取指，也可能在第一次访问主存或设备时无法继续推进。
+
+\topic{从复位向量走到第一条有效指令}启动可以写成一条硬件 trace。上电后，电源管理电路等待电压进入允许范围；时钟源或晶振稳定后，复位电路保持 CPU 和关键外设在安全状态；复位释放时，PC 或取指地址逻辑装入固定复位向量；地址译码把这个地址指向 ROM、Flash 或片上启动存储；取指路径读回第一条编码；控制器译码并开始执行初始化序列。任何一步没有定义，整机都会表现为“CPU 不启动”，但根因可能不在 CPU。
+
+\begin{longtable}{L{0.16\linewidth}L{0.42\linewidth}L{0.32\linewidth}}
+\toprule
+启动阶段 & 硬件动作 & 预期行为 \\
+\midrule
+电源爬升 & 电压达到允许范围，去耦提供瞬态电流 & 欠压复位未提前释放 \\
+时钟稳定 & 晶振、PLL 或外部时钟进入稳定范围 & 时钟频率和占空比满足规格 \\
+复位保持 & CPU、控制器、设备进入安全默认状态 & 危险输出关闭，写使能无效 \\
+复位释放 & PC 装入复位向量或启动地址 & 第一拍地址可预测 \\
+取启动码 & ROM/Flash/片上存储响应该地址 & 数据总线返回有效编码 \\
+初始化 & 配置栈、RAM、时钟、设备和中断 & 每项配置有完成或错误状态 \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.45cm] (pwr) at (0,0) {电源};
+  \node[hw compute, minimum width=1.55cm] (clk) at (1.95,0) {时钟};
+  \node[hw control, minimum width=1.65cm] (rst) at (4.0,0) {复位树};
+  \node[hw state, minimum width=1.7cm] (vec) at (6.15,0) {复位向量};
+  \node[hw compute, minimum width=1.75cm] (rom) at (8.35,0) {Boot ROM};
+  \node[hw state, minimum width=1.55cm] (fw) at (10.45,0) {固件};
+  \draw[hw bus] (pwr) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{稳定} (clk);
+  \draw[hw bus] (clk) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{可用} (rst);
+  \draw[hw bus] (rst) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{释放} (vec);
+  \draw[hw bus] (vec) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{取指地址} (rom);
+  \draw[hw bus] (rom) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{第一条编码} (fw);
+  \node[hw label, text width=9.5cm] at (5.2,-1.05) {启动不是“CPU 开始跑”一句话，而是一条逐级成立的链路：电源和时钟先可靠，复位再释放，复位向量必须命中非易失启动代码。};
+\end{pdfdiagram}
+\diagramnote{整机启动链路。第一条有效指令依赖电源、时钟、复位、地址映射和启动存储共同成立。}
+
+\topic{主板电源时序决定了复位何时可以释放}上图链路的前两级——电源和时钟——值得再放慢看一遍。按下电源键后，ATX 电源的各电压轨（+3.3 V、+5 V、+12 V 以及主板上的二级稳压输出）并不是瞬间到位：输出电容要充电，稳压反馈环路要收敛，不同轨的爬升斜率也不相同。在电压进入允许误差范围之前，逻辑门的输出没有定义，此时若释放复位，CPU 和控制器可能在半稳定状态下取指、写寄存器，结果不可预测。因此电源内部设有 PWR\_OK（power good）信号：它在各主要电压轨稳定达标之后再保持一小段时间才有效（ATX 规范给出的典型窗口是 100--500 ms），电压跌落时则提前失效，给整机留出收尾的余量。主板复位电路把 PWR\_OK 当作释放条件之一：PWR\_OK 无效就保持全板复位，有效之后再按时钟节拍有序释放复位树。这就解释了为什么“插电能亮”不等于“电压稳定”：待机指示灯只要 5 VSB 待机轨工作就能点亮，它在上电瞬间即可工作，而主电压轨爬升和 PWR\_OK 确认是几十到几百毫秒量级的过程，两者相差多个数量级。
+
+冷启动与热启动的差别也在这里。冷启动从完全断电开始，必须走完整个电压爬升、时钟稳定和 PWR\_OK 等待，DRAM 内容不可靠，内存自检和初始化不能省略；热启动（复位键或软件复位）时各电压轨早已稳定，时钟不需要重新等待，复位电路只产生一个短复位脉冲，固件可以通过约定标志跳过耗时的内存测试。对调试而言，区分两者很有用：只在冷启动出现的问题，多半与电源爬升、时钟起振或复位释放顺序有关；冷热启动都出现的问题，才更可能在逻辑本身。
+
+\begin{longtable}{L{0.16\linewidth}L{0.40\linewidth}L{0.32\linewidth}}
+\toprule
+时序阶段 & 硬件事实 & 关键问题 \\
+\midrule
+待机 & 5 VSB 待机轨供电，点亮指示灯、等待开机事件 & 指示灯亮只说明待机轨在工作 \\
+电压爬升 & 各电压轨按各自斜率上升，输出电容充电 & 未达标前逻辑输出没有定义 \\
+PWR\_OK 确认 & 电压达标后再保持约 100--500 ms 才有效 & 提前释放复位会让 CPU 在半稳定状态取指 \\
+复位释放 & 复位电路以 PWR\_OK 为条件，按时钟释放复位树 & 复位向量处必须已有可靠时钟和存储响应 \\
+热启动 & 电压轨保持稳定，仅产生短复位脉冲 & 可跳过内存测试，但复位时序仍要完整 \\
+\bottomrule
+\end{longtable}
+
+\begin{waveform}[x=0.72cm,y=0.85cm]
+  % 事件参考虚线：1 上电、6 电压达标、10 PWR_OK 有效、11.5 复位释放
+  \draw[BookRule, line width=0.45pt, dashed] (1,0.4) -- (1,7.6);
+  \draw[BookRule, line width=0.45pt, dashed] (6,0.4) -- (6,7.6);
+  \draw[BookRule, line width=0.45pt, dashed] (10,0.4) -- (10,7.6);
+  \draw[BookRule, line width=0.45pt, dashed] (11.5,0.4) -- (11.5,7.6);
+  % 5 VSB 待机轨：上电即工作
+  \draw[BookAccent, line width=0.9pt] (0,6.4) -- (1,6.4) -- (1,7.1) -- (14,7.1);
+  \node[hw label, anchor=east] at (-0.2,6.75) {5 VSB};
+  \node[hw label, anchor=south, fill=white, inner sep=1pt] at (4,7.18) {待机轨上电即工作，指示灯亮};
+  % 主电压轨：按各自斜率爬升，t=6 全部达标
+  \draw[BookAccent, line width=0.9pt] (1,4.6) -- (6,5.3) -- (14,5.3);
+  \node[hw label, anchor=east] at (-0.2,4.95) {主电压轨};
+  \node[hw label, anchor=north] at (3.4,4.5) {各轨按各自斜率爬升};
+  \node[hw label, anchor=south west] at (6.15,5.35) {全部达标};
+  % PWR_OK：达标后再保持 100--500 ms 才有效
+  \draw[BookAccent, line width=0.9pt] (0,2.8) -- (10,2.8) -- (10,3.5) -- (14,3.5);
+  \node[hw label, anchor=east] at (-0.2,3.15) {PWR\_OK};
+  \draw[BookMuted, line width=0.6pt, <->] (6,2.42) -- node[hw label, below=1pt, fill=white, inner sep=1pt]{达标后再保持 100--500 ms} (10,2.42);
+  % 复位：PWR_OK 有效后按时钟节拍释放
+  \draw[BookAccent, line width=0.9pt] (0,1.7) -- (11.5,1.7) -- (11.5,1.0) -- (14,1.0);
+  \node[hw label, anchor=east] at (-0.2,1.35) {全板复位};
+  \node[hw label, anchor=north, fill=white, inner sep=1pt] at (12.9,0.88) {复位释放，从复位向量取指};
+\end{waveform}
+\diagramnote{主板电源时序：待机轨 5 VSB 上电即工作，主电压轨按各自斜率爬升，全部达标之后 PWR\_OK 再保持 100--500 ms 才有效，复位电路以 PWR\_OK 为释放条件、按时钟节拍释放复位树。指示灯亮只说明待机轨在工作，它与主电压轨稳定相差几十到几百毫秒——这就是“插电能亮”不等于“电压稳定”的时序根源。}
+
+\topic{复位入口体现地址空间顶端和底端的不同设计}不同处理器的复位入口不相同，但背后的硬件问题一致：复位后 CPU 必须从非易失存储中的确定位置取得第一条可执行编码。6502 从固定向量中取入口地址，Z80/8051 常从 0 地址开始执行，8086 从 1 MiB 空间顶端附近开始取指，80386 及后续 x86 则把初始取指放到更高物理地址附近，以便系统固件映射在地址空间顶端。
+
+\begin{longtable}{L{0.2\linewidth}L{0.28\linewidth}L{0.42\linewidth}}
+\toprule
+处理器 & 典型复位入口 & 硬件含义 \\
+\midrule
+6502 & 从 \code{0xFFFC/0xFFFD} 取 16-bit 入口 & 顶端向量表必须由 ROM 响应 \\
+Z80/8051 & 从 \code{0x0000} 开始执行 & 低地址必须映射启动代码 \\
+8086 & 物理地址 \code{0xFFFF0} 附近 & 1 MiB 顶端 ROM 保存跳转或启动片段 \\
+80386 及后续 x86 & 高物理地址顶端附近 & 固件映射到高地址，早期代码再跳转到初始化区域 \\
+现代 SoC & 片上 Boot ROM 或可配置启动介质 & 先验证/选择介质，再初始化 DRAM 和外设 \\
+\bottomrule
+\end{longtable}
+
+在 8086 类系统中，复位后从规定的高地址入口开始取指，外部 ROM 必须映射到这个入口；在许多微控制器中，复位向量可能位于片内 Flash 的固定地址，前几个字保存初始栈指针和入口地址；在现代 SoC 中，片上 Boot ROM 可能先验证启动介质、配置内存控制器，再把控制权交给后续固件。形式不同，问题相同：复位向量指向哪里，谁在该地址响应，第一批指令执行前哪些硬件已经可靠。
+
+\begin{pdfdiagram}
+  % 地址增大方向
+  \draw[BookMuted, line width=0.6pt, ->] (-1.3,0.1) -- (-1.3,4.5);
+  \node[hw label, rotate=90] at (-1.62,2.3) {地址增大};
+  % 6502：顶端向量
+  \node[hw label] at (0,5.3) {6502};
+  \node[hw label] at (0,4.94) {0xFFFF};
+  \node[hw label] at (0,-0.3) {0x0000};
+  \draw[BookRule, line width=0.5pt] (-0.75,0) rectangle (0.75,4.6);
+  \draw[BookTeal, line width=0.9pt] (-0.75,3.9) rectangle (0.75,4.35);
+  \node[hw label] at (0,4.12) {0xFFFC};
+  \node[hw label, align=center, text width=2.6cm] at (0,-1.1) {顶端向量 0xFFFC/0xFFFD 给出 16 位入口};
+  % Z80/8051：底端直接执行
+  \node[hw label] at (2.9,5.3) {Z80/8051};
+  \node[hw label] at (2.9,4.94) {0xFFFF};
+  \node[hw label] at (2.9,-0.3) {0x0000};
+  \draw[BookRule, line width=0.5pt] (2.15,0) rectangle (3.65,4.6);
+  \draw[BookTeal, line width=0.9pt] (2.15,0) rectangle (3.65,0.45);
+  \node[hw label] at (2.9,0.22) {0x0000};
+  \node[hw label, align=center, text width=2.6cm] at (2.9,-1.1) {从 0 地址开始执行};
+  % 8086：1 MiB 顶端附近
+  \node[hw label] at (5.8,5.3) {8086};
+  \node[hw label] at (5.8,4.94) {0xFFFFF};
+  \node[hw label] at (5.8,-0.3) {0x00000};
+  \draw[BookRule, line width=0.5pt] (5.05,0) rectangle (6.55,4.6);
+  \draw[BookTeal, line width=0.9pt] (5.05,3.9) rectangle (6.55,4.35);
+  \node[hw label] at (5.8,4.12) {0xFFFF0};
+  \node[hw label, align=center, text width=2.6cm] at (5.8,-1.1) {顶端附近 0xFFFF0 取指，ROM 必须映射到此};
+  % 80386 及后续 x86：更高物理地址顶端附近
+  \node[hw label] at (8.7,5.3) {80386 及后续 x86};
+  \node[hw label] at (8.7,4.94) {0xFFFFFFFF};
+  \node[hw label] at (8.7,-0.3) {0x0};
+  \draw[BookRule, line width=0.5pt] (7.95,0) rectangle (9.45,4.6);
+  \draw[BookTeal, line width=0.9pt] (7.95,3.9) rectangle (9.45,4.35);
+  \node[hw label, align=center, text width=2.6cm] at (8.7,-1.1) {初始取指在高物理地址顶端附近，固件映射在顶端};
+  % 底部共同问题
+  \node[hw label, text width=10.4cm] at (4.35,-2.3) {四种入口的共同问题一致：入口地址必须由非易失存储响应——谁在入口处响应，决定复位后第一条指令是什么。};
+\end{pdfdiagram}
+\diagramnote{四种处理器的复位入口对照。6502 从顶端向量 \code{0xFFFC/0xFFFD} 取 16 位入口地址，Z80/8051 从 \code{0x0000} 直接开始执行；8086 从 1 MiB 空间顶端附近的 \code{0xFFFF0} 取指，80386 及后续 x86 把初始取指放到更高物理地址顶端附近，系统固件映射在地址空间顶端。位置不同，约束相同：入口必须由 ROM 等非易失存储响应。}
+
+\topic{BIOS 把固件启动分成自检、初始化、选设备和移交四步}复位向量把 CPU 送进 BIOS 之后，固件按四个阶段把整机带到可交接状态。第一阶段是 POST（power-on self-test，加电自检）：BIOS 先检查 CPU、ROM 校验和与芯片组基本寄存器，再初始化并测试内存——早期 PC 对 DRAM 做逐段读写测试，容量越大耗时越长，这正是热启动要跳过它的原因；测试失败时用蜂鸣码或诊断口代码报告，因为此时连显示都未必可用。第二阶段是设备初始化：先点亮显示（视频 BIOS 常以 option ROM 形式挂在 \code{0xC0000} 附近），再初始化键盘控制器、磁盘控制器等；BIOS 会扫描规定的地址区间，找到带签名头的 option ROM 就把它的初始化入口执行一遍。第三阶段是启动设备选择：按约定的启动顺序（软盘、硬盘、光盘等）逐个尝试，\code{int 19h} 把候选设备的第一个扇区（512 字节）读到固定地址 \code{0x0000:0x7C00}（物理地址 \code{0x7C00}）。第四阶段是移交：扇区已在内存，检查其末尾的 \code{0x55AA} 签名，签名有效则跳转到 \code{0x7C00}，控制权自此属于启动扇区代码；签名无效则换下一个候选设备。
+
+在移交之前，BIOS 还扮演“早期操作环境”的角色：它以中断向量的形式提供服务，\code{int 10h} 操作文本显示，\code{int 13h} 读写磁盘扇区，\code{int 16h} 读键盘。启动扇区和早期引导代码没有任何驱动可用，正是靠这些实模式中断服务完成显示和读盘；进入保护模式后实模式中断向量表失效，操作系统才必须换成自己的驱动。这套约定后来被 UEFI 整体重写：分区表从 MBR 换成带 GUID 的 GPT，不再依赖 \code{0x7C00} 装载约定和 \code{0x55AA} 签名；固件功能组织成可扩展的驱动与应用模型，启动装载程序是固件直接装载执行的 \code{.efi} 文件；设置界面从字符画面换成图形界面，启动项保存在 NVRAM 变量中由启动管理器选择。载体全换了，四阶段的骨架仍在：自检并初始化硬件、准备服务环境、按顺序选择启动源、把控制权交给下一阶段。
+
+\begin{longtable}{L{0.14\linewidth}L{0.44\linewidth}L{0.30\linewidth}}
+\toprule
+阶段 & 硬件动作 & 预期结果 \\
+\midrule
+POST 自检 & 检查 CPU/ROM/芯片组，初始化并测试内存 & 失败有蜂鸣码或诊断码，不进入下一阶段 \\
+设备初始化 & 执行视频等 option ROM，初始化键盘、磁盘控制器 & 显示可用，设备寄存器进入约定默认态 \\
+选择启动设备 & 按启动顺序逐个把第一扇区读到 \code{0x7C00}，检查 \code{0x55AA} 签名 & 第一个签名有效的设备被选中 \\
+移交控制权 & 签名有效则跳转到 \code{0x7C00} & CPU 从启动扇区第一条编码开始执行 \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=5.6cm] (start) at (0,0) {复位向量 → BIOS 入口};
+  \node[hw compute, minimum width=5.6cm] (s1) at (0,-1.6) {① POST 自检\\检查 CPU/ROM/芯片组，测试内存};
+  \node[hw control, minimum width=2.6cm] (fail) at (6.3,-1.6) {自检失败\\蜂鸣码/诊断码};
+  \node[hw compute, minimum width=5.6cm] (s2) at (0,-3.2) {② 设备初始化\\执行 option ROM，初始化键盘、磁盘控制器};
+  \node[hw compute, minimum width=5.6cm] (s3) at (0,-4.8) {③ 选择启动设备\\int 19h 把第一扇区读入 \code{0x7C00}};
+  \node[hw control, minimum width=5.6cm] (s4) at (0,-6.4) {④ 扇区末尾 \code{0x55AA} 签名有效吗？};
+  \node[hw state, minimum width=5.6cm] (hand) at (0,-8.0) {移交：跳转到 \code{0x7C00}\\控制权交给启动扇区代码};
+  \draw[hw bus] (start.south) -- (s1.north);
+  \draw[hw bus] (s1.south) -- (s2.north);
+  \draw[hw bus] (s2.south) -- (s3.north);
+  \draw[hw bus] (s3.south) -- (s4.north);
+  \draw[hw bus] (s4.south) -- node[right,hw label,fill=white,inner sep=1pt]{签名有效} (hand.north);
+  \draw[hw return] (s1.east) -- node[above=1pt,hw label,fill=white,inner sep=1pt]{测试失败} (fail.west);
+  \draw[hw return] (s4.east) -- (4.7,-6.4) -- (4.7,-4.8) -- node[pos=0.5,right,hw label,fill=white,inner sep=1pt]{签名无效：换下一个候选设备} (s3.east);
+\end{pdfdiagram}
+\diagramnote{BIOS 启动的四阶段流程：POST 失败时以蜂鸣码或诊断口代码报告，不进入后续阶段；选设备阶段按约定的启动顺序逐个尝试，签名无效就回退到下一个候选设备；只有签名有效的扇区才能得到 CPU 控制权。}
+
+\topic{整机实验可以从 ROM、RAM 和两个 MMIO 寄存器开始}一个可搭建的最小整机不需要复杂操作系统。可先规定 8-bit 或 16-bit 地址空间：低地址接 ROM，中间接 RAM，高地址映射 LED 输出寄存器和按键输入寄存器。CPU 或教学控制器复位后从 ROM 取指，执行一段程序：读取按键状态，若按下则把 LED 寄存器置 1，否则置 0。这个系统已经包含整机硬件的核心对象：取指、数据访存、地址译码、MMIO、副作用、外部输入同步和可观察输出。
+
+\begin{lstlisting}
+minimal whole-machine program:
+  loop:
+    r1 = MMIO[GPIO_IN]
+    if r1 == 0 goto off
+    MMIO[GPIO_OUT] = 1
+    goto loop
+  off:
+    MMIO[GPIO_OUT] = 0
+    goto loop
+\end{lstlisting}
+
+这段程序的硬件检查不应只看 LED 是否跟随按钮。应同时确认 ROM 地址、RAM 地址和 MMIO 地址不会被同时片选；按钮已经同步后才被读；写 \code{GPIO_OUT} 只改变输出锁存器，不误写 RAM；分支改变的是 PC 下一值；循环运行时没有总线争用。若以后把 LED 换成电机、继电器或功率负载，还必须增加驱动级、续流保护和安全停机链路，不能把 MMIO 输出锁存器直接当成功率开关。
+
+\topic{最小整机的检查应分成三层}第一层检查硬件静态条件：电源、复位、时钟、片选互斥和三态方向。第二层检查单条指令：ADD、MOV、JZ 等每条指令都能在单步下看到正确的控制线和提交边界。第三层检查小程序：ROM 中循环程序能够读按键、分支、写 LED，并能在异常输入下保持安全状态。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+层次 & 具体检查 & 失败时优先排查 \\
+\midrule
+静态硬件 & 电源纹波、复位释放、时钟边沿、片选互斥 & 供电、复位树、译码极性 \\
+单指令 & PC、IR、控制字、ALUOut、MDR、写回寄存器 & 控制器、寄存器堆、ALU、存储器时序 \\
+小程序 & 按键输入同步、条件分支、LED 输出锁存 & MMIO 地址、分支目标、外设副作用 \\
+错误路径 & 未映射地址、慢设备等待、外设 error 位 & 超时、错误响应、异常入口 \\
+\bottomrule
+\end{longtable}
+
+在实验报告中，应记录每个检查点的“预期值、实测值、观察工具和结论”。例如 PC 第 0 拍应为 \code{0x0000}，ROM 片选应有效，IR 应锁存第一条 \code{MOV}；执行写 \code{GPIO_OUT} 的指令时，RAM 片选应无效，LED 锁存器写使能应只出现一个有效窗口。这样的记录比“程序运行成功”更接近工程实践。
+
+\topic{可采购器件清单要匹配教学目标}若目标是搭一台低速可观察整机，器件选择应服务于可测性，而不是追求最高频率。可以使用 74HC/74HCT 系列计数器、锁存器、三态缓冲器、加法器、比较器、EEPROM、SRAM 和 LED/按键模块；也可以用 CPLD/FPGA 把控制器和数据通路放进可编程逻辑，再把 ROM/RAM/MMIO 作为独立模块观察。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+对象 & 可选器件 & 选择理由 \\
+\midrule
+PC/计数 & 74HC161/163 或 FPGA 寄存器 & 可清零、可装载、可单步观察 \\
+IR/锁存 & 74HC574/273 & 时钟沿保存指令或中间状态 \\
+ALU 原型 & 74HC283、异或门、比较器或 FPGA 逻辑 & 可先实现加法、零检测和简单逻辑 \\
+总线隔离 & 74HC245/244 & 控制数据方向，避免多源驱动 \\
+ROM & AT28C 系列 EEPROM 或片内 ROM & 保存启动程序和指令编码 \\
+RAM & 低速异步 SRAM 或 FPGA block RAM & 接口直观，便于单步读写 \\
+I/O & LED 锁存器、按键同步器、UART 模块 & 形成可观察输入输出和串口调试 \\
+\bottomrule
+\end{longtable}
+
+搭建顺序应从电源、时钟、复位、单个寄存器和单条总线开始。只有确认三态控制不会冲突、复位后所有写使能无效、时钟边沿干净，才应接入 ROM、RAM 和 I/O。若直接把所有模块连接后调试，任何错误都可能表现为“程序不跑”，排查成本会急剧上升。
+
+\topic{整机 bring-up 要记录症状、信号和假设}真实硬件第一次上电时，常见问题集中在复位、时钟、片选、总线方向、等待状态或启动 ROM 映射。把症状、相关信号和当前假设逐项记录下来，才能形成一条可逐步核对的排查链条，而不是笼统地说“检查硬件”。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+症状 & 优先观察信号 & 可能原因 \\
+\midrule
+PC 不变化 & 复位、时钟、PC 写使能 & 复位未释放、时钟不稳定、控制器未进入取指 \\
+ROM 无输出 & 地址线、ROM 片选、输出使能 & 复位向量未映射到 ROM，译码极性错误 \\
+数据总线异常发热 & CPU/存储器输出使能、方向控制 & 两个器件同时驱动总线 \\
+加载读错值 & 地址、字节使能、读响应、MDR & 地址形成错误或存储器时序不满足 \\
+LED 乱闪 & MMIO 片选、写使能、外设锁存时钟 & 地址译码过宽或写周期毛刺 \\
+中断重复进入 & 设备状态、中断控制器 ACK、CPU 入口 & 清除顺序错误或事件源未确认 \\
+\bottomrule
+\end{longtable}
+
+经典微处理器的发展可以用若干硬件剖面概括。
+
+\begin{longtable}{L{0.18\linewidth}L{0.2\linewidth}L{0.5\linewidth}}
+\toprule
+芯片或系列 & 典型特征 & 对硬件学习的意义 \\
+\midrule
+4004 & 4-bit 微处理器 & 微处理器把控制器、寄存器和算术部件集成到单芯片形态 \\
+6502/Z80 & 经典 8-bit 微处理器 & 外部总线、存储器、I/O 和多周期控制构成早期微机基本形态 \\
+8051 & 经典单片机 & CPU、片内存储、I/O、定时器和中断控制展示片上整机控制 \\
+8080/8085 & 8-bit 微处理器 & 外部总线、地址空间、存储器和 I/O 开始形成通用微机结构 \\
+8086/8088 & 16-bit x86 起点 & 段:偏移地址、指令预取、复用总线和外部锁存器体现早期整机取舍 \\
+80286 & 保护模式前驱 & 分段保护和特权机制开始成为处理器硬件的一部分 \\
+80386 & 32-bit x86 & 32-bit 寄存器、线性地址、分页和异常机制把 CPU 推向系统级硬件 \\
+80486/Pentium & 片上 cache 与更深执行结构 & 流水线、cache、浮点单元和更复杂控制逻辑成为性能核心 \\
+\bottomrule
+\end{longtable}
+
+8051 的意义在于把“小整机”收进一颗芯片。CPU 旁边可以直接布置片内 RAM、ROM、I/O 口、定时器、串口和中断控制。外部引脚不再只是地址/数据总线，也可能直接是可编程 I/O。整机边界可以移动：同样是“写设备寄存器改变输出”，在早期微机上可能通过板级地址译码访问外设，在单片机上则可能是写特殊功能寄存器改变某个引脚锁存器。
+
+80486 把片上 cache 和流水化执行引入主流 x86。片上 cache 缩短了高频取指和数据访问路径，使常见访问不必每次走外部总线；流水线把取指、译码、执行等工作分段，使不同指令可以重叠推进。性能不是单靠提高门速度，\hwevidence{把常见数据放近}和\hwtiming{把长路径切段}同样关键。
+
+Pentium 的意义在于展示更强的并行执行方向。双流水线、分支预测和更复杂的发射控制，使处理器尝试在同一时间推进多条合适的指令。此时硬件问题不再只是“一个 ALU 算得多快”，还包括指令之间是否有依赖、分支方向是否预测正确、两条流水线是否争用资源、错误路径如何清除、异常如何保持精确边界。这些机制为现代乱序执行、寄存器重命名和提交队列铺路。
+
+\topic{80486 把 cache、FPU 和流水线收进芯片}80386 时代，cache 是主板上的独立芯片加标签存储器，浮点运算是另一颗 80387 协处理器，两者都通过板级总线与 CPU 通信。80486 把三样东西收进片内：8 KiB 统一 cache（指令和数据共用，采用写穿策略）、浮点单元和一条 5 级流水线。配套的还有总线接口的改变：486 引入突发总线周期，一次 cache 行填充用 4 拍连续传完 16 B，只有第一拍需要给出地址，后面三拍不再重复。收益很直接：cache 命中时取指和读数不再走板级总线，常见指令的吞吐接近每拍一条；代价同样明确：片内 cache 要处理一致性，写穿策略持续占用外部总线带宽，流水线的段间控制、数据相关和分支处理也比多周期实现复杂得多。
+
+\topic{Pentium 用双发射和分支预测重组执行结构}Pentium 的性能提升不再主要来自时钟频率，而是来自执行结构的重组。它有 U、V 两条整数流水线，满足配对规则的简单指令可以在同一拍内双发射；分支目标缓冲（BTB）预测分支方向，猜错才冲刷流水线；指令 cache 和数据 cache 分开，各 8 KiB，取指和读数不再争同一个端口；外部数据总线扩到 64 bit，一次总线事务搬运的数据翻倍。Pentium Pro 又往前走了一步：x86 指令先被译成微操作，由乱序执行核心按数据就绪顺序执行，寄存器重命名消除假依赖，最后按程序顺序提交，从而在乱序执行下保持精确异常。执行可以和提交分离，是这一代留下的主线：处理器核心部分讲的执行/提交区分，在这里成为真实芯片的基本组织方式。
+
+\topic{386/486 主板把 CPU、内存和外设分成平台层次}80386、80486 之后，整机越来越依赖主板芯片组。CPU 不再直接以简单板级总线面对所有外设，而是通过内存控制器、cache 控制器、总线桥和 I/O 控制器访问不同速度、不同协议的目标。早期 PC 主板可以粗略理解为：CPU 与高速本地总线连接，芯片组负责 DRAM、cache、ISA/EISA/VLB/PCI 等扩展路径，低速外设再挂到更慢的 I/O 控制器。后来的“北桥/南桥”说法，就是把高速内存/图形路径和低速 I/O 路径分开组织。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+平台层次 & 负责对象 & 与本章概念的关系 \\
+\midrule
+CPU 本地总线 & 取指、数据访问、cache miss、写回 & 地址、数据、字节使能、等待和总线错误 \\
+内存/cache 控制 & DRAM 行列访问、二级 cache、写缓冲 & 命中/未命中、回填、写回和时序预算 \\
+高速扩展路径 & 图形、磁盘控制、网络或总线桥 & DMA、总线主设备、仲裁和中断 \\
+低速 I/O 控制 & 串口、并口、键盘、软驱、RTC 等 & 端口 I/O、状态寄存器、完成事件 \\
+固件层 & BIOS/option ROM、设备初始化和启动选择 & 复位向量、枚举、内存检测和启动介质 \\
+\bottomrule
+\end{longtable}
+
+这个分层解释了为什么整机性能不能只看 CPU 主频。若 cache 未命中要走慢 DRAM，若 PCI 设备 DMA 被总线仲裁阻塞，若中断控制器或桥片配置错误，CPU 再快也会等待。另一方面，把 cache、内存控制器、图形控制、PCIe 根复合体等功能逐步移近 CPU，也正是现代平台降低时延的方向：常用路径减少芯片间往返，慢速外设通过桥接和队列异步处理。
+
+\topic{芯片组演进是把慢路径一段段搬进更快的边界}上表的平台分层不是一开始就存在的。最早的 PC 主板上，这些职责是各自独立的分立器件：8237 负责 DMA，8259 负责中断，8253/8254 负责定时，8042 负责键盘，再算上时钟发生器和总线缓冲，一颗 CPU 旁边要围一圈“配角芯片”。第一次整合是南北桥结构：北桥接管内存控制器、cache 控制和图形接口（后来的 AGP），直接坐在 CPU 前端总线上；南桥接管中断、DMA、定时器和 IDE、USB、ISA/LPC 等低速 I/O，两桥之间用专用链路相连。第二次迁移是内存控制器进 CPU：从 AMD K8（2003）和 Intel Nehalem（2008）开始，CPU 直连 DRAM，北桥名存实亡，剩余部分改叫 PCH（平台控制中心），通过 DMI 与 CPU 相连。第三次是 SoC：图形、显示、PCIe 根复合体乃至 PCH 的功能继续收进同一颗芯片或同一封装。
+
+每一次迁移，移动的都是某条具体路径的时延。分立器件时代，CPU 读一次内存要穿过主板走线和总线缓冲；南北桥时代，访存路径变成“CPU 经前端总线到北桥再到 DRAM”，多一次芯片间往返，引脚和板级走线的时延直接加在每次 cache miss 上；内存控制器进 CPU 后，这一段跨芯片往返消失，cache miss 到 DRAM 的路径不再离开芯片——这是收益最大的一次迁移，因为取指和读数是整机里最频繁的路径。中断和 DMA 则一直留在南侧：它们本来就慢，继续经南桥或 PCH 转发，换来的是 CPU 引脚和主板面积的节省。判断一代平台时，只要问“这次被搬近的是哪条路径”，就能看出它为什么变快、又付出了什么代价。
+
+\begin{longtable}{L{0.16\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+平台形态 & 集成对象 & 被缩短的路径 \\
+\midrule
+分立器件 & 8237/8259/8253 等各管一摊 & 无片内捷径，全部走板级总线 \\
+北桥+南桥 & 北桥管内存/图形，南桥管低速 I/O & 内存路径集中到北桥，I/O 路径集中到南桥 \\
+PCH & 内存控制器进 CPU，南桥余部改称 PCH & cache miss 到 DRAM 不再跨芯片，I/O 经 DMI 转发 \\
+SoC & 图形、PCIe 根复合体、外设全部片内 & 常见路径不出芯片，只剩电源和低速引脚外连 \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}
+  \node[hw compute, minimum width=7cm] (n1) at (0,0) {分立器件\\8237 DMA、8259 中断、8253/8254 定时、8042 键盘围在 CPU 旁};
+  \node[hw compute, minimum width=7cm] (n2) at (0,-2.1) {北桥 + 南桥\\北桥管内存、cache、图形；南桥管中断、DMA、低速 I/O};
+  \node[hw state, minimum width=7cm] (n3) at (0,-4.2) {CPU + PCH\\CPU 直连 DRAM，北桥余部改称 PCH，经 DMI 与 CPU 相连};
+  \node[hw state, minimum width=7cm] (n4) at (0,-6.3) {SoC\\图形、显示、PCIe 根复合体与 PCH 功能收进同一芯片或封装};
+  \draw[hw bus] (n1.south) -- node[right=3pt,hw label,align=left,fill=white,inner sep=1pt]{第一次整合：配角芯片归入两桥\\被搬近的路径：内存/图形集中到北桥，I/O 集中到南桥} (n2.north);
+  \draw[hw bus] (n2.south) -- node[right=3pt,hw label,align=left,fill=white,inner sep=1pt]{第二次迁移：内存控制器进 CPU（K8 2003、Nehalem 2008）\\被搬近的路径：cache miss 到 DRAM 不再跨芯片} (n3.north);
+  \draw[hw bus] (n3.south) -- node[right=3pt,hw label,align=left,fill=white,inner sep=1pt]{第三次：图形与 I/O 继续收进片内\\被搬近的路径：常见路径不出芯片，只剩电源和低速引脚外连} (n4.north);
+\end{pdfdiagram}
+\diagramnote{芯片组演进链：每一次迁移搬近的都是某条具体路径——先是配角芯片归入南北两桥，再是内存控制器进 CPU、让 cache miss 到 DRAM 不再跨芯片（收益最大的一次，因为取指和读数是整机里最频繁的路径），最后图形、PCIe 根复合体和 PCH 功能收进 SoC。中断和 DMA 这类本来就慢的路径一直留在南侧。}
+
+\topic{从 PCI 到 PCIe，设备仍然是事务发起者和响应者}设备可以暴露配置空间、MMIO BAR、DMA 能力和中断机制；CPU 或固件先枚举设备，分配地址窗口和中断资源；驱动程序再通过 MMIO 配置设备，通过 DMA 描述符让设备读写内存，并通过 MSI/MSI-X 或传统中断接收完成事件。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+PCI/PCIe 对象 & 硬件含义 & 关键问题 \\
+\midrule
+配置空间 & 设备身份、能力、BAR 和控制位 & 枚举是否能读到设备，BAR 是否分配到不冲突地址 \\
+BAR/MMIO & 设备寄存器窗口映射到物理地址 & 访问属性是否不可缓存或按设备规则排序 \\
+DMA & 设备作为总线发起者读写主存 & 地址权限、IOMMU、cache 一致性和 completion 顺序 \\
+MSI/MSI-X & 设备通过内存写形式投递中断消息 & 消息地址/数据配置是否正确，是否会丢事件 \\
+错误报告 & 链路、权限、超时或设备内部错误 & 错误能否被记录、上报和恢复 \\
+\bottomrule
+\end{longtable}
+
+PCIe 不再是多块板卡共享一排并行地址线的简单总线，但它仍然要解决同样的问题。请求从哪里来，目标地址是谁，数据何时有效，完成如何返回，错误如何上报，中断如何投递，DMA 写入何时对 CPU 可见。
+
+\topic{SoC 把北桥、南桥和许多外设继续收进芯片}现代 SoC 的趋势是把 CPU 核、cache、内存控制器、GPU/NPU、视频编解码、PCIe/USB/SATA、网卡、显示控制、GPIO、定时器和安全启动逻辑放进一颗或少数几颗芯片。这样做的直接收益是缩短常见路径、降低引脚数量、减少板级功耗和提高集成度；代价是片上互连、一致性、时钟/电源域、调试和安全启动变得更复杂。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+SoC 结构 & 低时延来源 & 新增边界 \\
+\midrule
+片上 L2/L3 cache & 多个核心共享近处数据 & 一致性状态、替换、QoS 和带宽竞争 \\
+集成内存控制器 & CPU 到 DRAM 控制路径更短 & DRAM 训练、刷新、ECC 和功耗状态 \\
+片上互连 & 核、DMA、GPU、外设通过网络通信 & 仲裁、优先级、背压和死锁避免 \\
+集成外设 & GPIO、UART、SPI、I2C、USB 等近距离访问 & MMIO 属性、中断路由和复位/时钟门控 \\
+安全启动 & Boot ROM 验证后续固件 & 密钥、签名、回滚保护和调试锁定 \\
+\bottomrule
+\end{longtable}
+
+从 8086、80386 向后看，处理器继续沿几条方向扩展。第一，内部执行路径更深，流水线把取指、译码、执行、访存、写回切成多个阶段。第二，存储层级更复杂，片上 cache 和 TLB 成为地址访问性能的关键。第三，控制逻辑更复杂，分支预测、乱序执行和异常恢复要求硬件保存更多内部状态。第四，多核和片上互连让“总线事务”扩展成核间一致性和缓存一致性协议。第五，外设从简单寄存器发展到 PCI、PCIe、USB、SATA 等分层协议，但本质仍然是地址、数据、控制、握手、完成和错误状态。
+
+\begin{longtable}{L{0.24\linewidth}L{0.58\linewidth}}
+\toprule
+演进方向 & 保持不变的硬件问题 \\
+\midrule
+流水线 & 状态边界如何切分，错误路径如何清除 \\
+cache/TLB & 地址如何命中、缺失、替换和回填 \\
+保护与异常 & 何时拒绝访问，如何进入规定处理入口 \\
+DMA 与设备 & 谁发起事务，谁完成事务，完成如何通知 CPU \\
+多核一致性 & 多个观察者如何看到受控顺序的内存结果 \\
+\bottomrule
+\end{longtable}
+
+\section{二、主板：供电、时钟与固件}
+
+前面三节讨论了 CPU 如何通过控制器驾驭内存与外设：命令如何调度、链路如何训练、数据如何在总线上可靠移动。这些芯片不会悬浮在空中工作——它们焊在同一张印制电路板上，由这张板供给能量、供给时钟、供给彼此相连的走线。本节把视角从芯片移到板级：主板这张多层 PCB 究竟提供什么，CPU 核心那约 1V、上百安培的供电由谁稳出来，全机的时钟从哪一颗晶体出发，以及按下电源键之后、操作系统出现之前那段由固件主导的时间。
+
+\topic{4.1\quad 主板是什么：一张板承载三种分配网络}
+
+\term{主板}{motherboard}是一块多层印制电路板（PCB），上面焊接 CPU 插槽、内存插槽、芯片组与各种连接器。从功能上看，主板是三种分配网络的载体。第一种是\hwkey{电源分配网络}（Power Delivery Network，PDN）：24-pin 与 8-pin 电源接口把电源供应器（PSU）的 12V、5V、3.3V 引入板内，VRM 模组（电压调节模组，4.2 节详解）把 12V 降到 CPU 核心需要的约 1V，整面的电源平面与地平面再把电流低阻地送到每个芯片。第二种是\hwkey{时钟分配网络}：一颗 25MHz 晶振驱动时钟发生器芯片，倍频、缓冲、扇出，把参考时钟送到 CPU、内存与每条总线。第三种是\hwkey{信号分配网络}：成千上万的走线按阻抗受控的方式连接各芯片，高速信号贴着完整的参考平面走，长度按组匹配。
+
+三种网络各有自己的约束语言。电源网络的约束是阻抗：负载电流怎么跳变，电压都不能超出允许窗口，这个问题在电源时钟章第一节已用目标阻抗的形式化方法讲过。时钟网络的约束是对齐与纯净：各接收端的沿要齐、沿的位置不能抖动，见该章第二节的时钟树与抖动分析。信号网络的约束是完整：反射、串扰、回流都要受控，见该章第三、四节。主板设计在很大程度上就是这三套约束在同一块层叠结构上的联合求解。
+
+\begin{keyidea}
+主板不是被动的连线板。它是三个物理分配网络的交叉点：电流在其中流动，时钟沿在其中传播，信号波在其中往返。CPU 的性能与稳定性，最终受限于这张板把能量、时间和信息送得有多准。
+\end{keyidea}
+
+\topic{层叠结构：每一层都有分工}
+
+多层板把铜箔与绝缘介质（FR-4 玻纤环氧，介电常数约 4.2）交替叠合、层压为一整块。层数不是越多越好，而是由信号密度与参考平面需求决定。典型叠层安排如下：
+
+\begin{longtable}{L{0.10\linewidth}L{0.44\linewidth}L{0.20\linewidth}L{0.17\linewidth}}
+\toprule
+方案 & 各层分工（顶到底） & 适用 & 代价 \\
+\midrule
+4 层 & 信号/元件、地平面、电源平面、信号 & 低速板、微控制器板 & 只有两层可走线，高速信号密度受限 \\
+6 层 & 信号、地、信号、信号、电源/地、信号 & 主流台式机主板 & 中间两层信号共享参考平面，需避免长距离平行走线 \\
+8 层 & 信号、地、信号、地、电源、信号、地、信号 & 多通道 DDR、多插槽平台 & 每个高速信号层都有紧邻的完整参考平面，成本显著上升 \\
+\bottomrule
+\end{longtable}
+
+叠层的核心原则只有一条：高速信号层必须紧邻完整的参考平面（通常是地）。原因在电源时钟章第四节讲过——信号电流沿走线前进，回流沿正下方的平面返回，平面完整则环路面积最小、阻抗连续；平面被割裂，回流被迫绕路，串扰与辐射随之恶化。内存条插槽附近的区域走线最密，DDR 主板因此普遍采用 6 层或 8 层。
+
+\topic{长度匹配：蛇形线是买时间的走线}
+
+同一个数据组内的信号必须同时到达。DDR 的一个字节组里，8 根 DQ 与 1 对 DQS 的走线长度差要控制在零点几毫米以内——FR-4 中信号传播速度约 15cm/ns，即 1ps 对应约 0.15mm，0.3mm 的长度差约折合 2ps 的到达时间差。存储器件结构章第三节讲过，训练可以把每根 DQ 的采样延迟独立调节到数据眼中央，但训练的调节范围有限，板级等长先把粗偏差消掉，训练再做精调，两级分工。走线长度不够时，布线工具把它绕成波浪形的\hwkey{蛇形线}（serpentine）补足长度；蛇形的弯折会局部破坏与邻线的间距，弯折幅度和间距同样有规则约束。差分对（PCIe、USB、SATA）则要求两根线自始至终等长并行，对内失配直接损耗共模抑制能力。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % ---- 电源入口与 VRM（左上） ----
+  \node[hw block, minimum width=1.3cm, minimum height=0.8cm, align=center] (p8) at (0.7,8.2) {8-pin\\CPU 供电};
+  \node[hw compute, minimum width=2.2cm, minimum height=1.0cm, align=center] (vrm) at (3.1,8.2) {VRM 模组\\多相 buck};
+  \node[hw state, minimum width=3.0cm, minimum height=1.7cm, align=center] (cpu) at (6.3,7.7) {CPU 插槽};
+  \draw[hw danger] (p8.east) -- (vrm.west);
+  \node[hw label] at (1.67,8.48) {12 V};
+  \draw[hw danger] (vrm.east) |- (cpu.west);
+  \node[hw label] at (4.5,7.88) {VCC};
+
+  % ---- DIMM 插槽（右上） ----
+  \node[hw memory, minimum width=0.7cm, minimum height=2.4cm] (dimm1) at (9.3,8.0) {\rotatebox{90}{DIMM}};
+  \node[hw memory, minimum width=0.7cm, minimum height=2.4cm] (dimm2) at (10.4,8.0) {\rotatebox{90}{DIMM}};
+  \node[hw label] at (9.85,9.5) {DIMM 插槽 $\times$2};
+  \draw[hw bus] (cpu.east |- 7.8,7.3) -- (dimm1.west |- 7.8,7.3);
+  \draw[hw bus] (dimm1.east |- 7.8,7.3) -- (dimm2.west |- 7.8,7.3);
+  \node[hw label, align=center] at (8.37,7.72) {内存\\通道};
+
+  % ---- 24-pin 主供电（右缘） ----
+  \node[hw block, minimum width=1.2cm, minimum height=1.2cm, align=center] (p24) at (11.2,6.2) {24-pin\\主供电};
+  \draw[BookRed, line width=0.62pt] (p24.west) -- (9.7,6.2);
+  \node[hw label, font=\tiny] at (10.1,5.82) {12 V/5 V/3.3 V 入板};
+
+  % ---- PCIe 插槽（左中、左下） ----
+  \node[hw block, minimum width=4.8cm, minimum height=0.7cm] (pcie16) at (3.0,5.4) {PCIe $\times$16 插槽};
+  \node[hw block, minimum width=3.6cm, minimum height=0.6cm] (pcie1) at (2.4,3.7) {PCIe $\times$1 插槽};
+  \draw[hw bus] (5.0,6.85) -- (5.0,5.75);
+
+  % ---- PCH 与低速芯片 ----
+  \node[hw control, minimum width=2.2cm, minimum height=1.1cm] (pch) at (6.6,4.6) {PCH};
+  \draw[hw bus] (6.9,6.85) -- (6.9,5.15);
+  \node[hw label, anchor=east, fill=white, inner sep=1pt] at (6.75,5.95) {DMI};
+  \draw[hw bus] (pch.west |- 5.5,4.4) -- (4.8,4.4) |- (4.8,3.7) -- (4.2,3.7);
+  \node[hw label, anchor=east] at (4.7,4.2) {PCIe $\times$1};
+  \node[hw memory, minimum width=1.7cm, minimum height=0.8cm, align=center] (spi) at (7.4,3.0) {SPI flash\\固件};
+  \node[hw compute, minimum width=2.0cm, minimum height=0.8cm] (sio) at (9.9,3.0) {Super I/O};
+  \draw[hw bus] (6.2,4.05) |- (6.2,3.0) -- (spi.west);
+  \draw[hw bus] (spi.east) -- (sio.west);
+  \node[hw label, anchor=east, fill=white, inner sep=1pt] at (6.05,3.55) {SPI / eSPI};
+
+  % ---- 时钟发生器与扇出 ----
+  \node[hw control, minimum width=2.0cm, minimum height=0.9cm, align=center] (clk) at (9.4,4.8) {时钟\\发生器};
+  \draw[hw return] (clk.north) -- (9.4,6.8);
+  \draw[hw return] (9.4,6.5) -- (7.4,6.5) -- (7.4,6.85);
+  \draw[hw return] (9.4,6.05) -- (2.4,6.05) -- (2.4,5.75);
+  \draw[hw return] (9.4,5.6) -- (8.2,5.6) -- (8.2,4.6) -- (7.7,4.6);
+  \node[hw label, anchor=south] at (4.0,6.14) {100 MHz};
+
+  % ---- 图例 ----
+  \draw[hw bus] (0.6,0.75) -- (1.7,0.75);
+  \node[hw label, anchor=west] at (1.9,0.75) {信号走线（数据/地址/控制）};
+  \draw[hw danger] (0.6,0.3) -- (1.7,0.3);
+  \node[hw label, anchor=west] at (1.9,0.3) {电源分配（12 V 输入、VRM 输出）};
+  \draw[hw return] (6.2,0.75) -- (7.3,0.75);
+  \node[hw label, anchor=west] at (7.5,0.75) {时钟分配（100 MHz 参考）};
+\end{pdfdiagram}
+\diagramnote{台式机主板布局与三大分配网络。实线为信号路径：CPU 直连内存与 PCIe $\times$16，其余设备经 DMI 汇聚到 PCH。红色线为电源路径：8-pin 专供 CPU，经 VRM 降为约 1V；24-pin 把 12V/5V/3.3V 引入全板。虚线为时钟路径：时钟发生器向 CPU、PCH、PCIe 扇出 100MHz 参考。SPI flash 保存固件，Super I/O 承接键盘、串口、风扇监控等低速功能。}
+
+读这张图时值得注意谁在 CPU 上、谁在 PCH 上：时延最敏感的内存与显卡直连 CPU，其余一切低速路径汇聚到 PCH，再经一条 DMI 链路上行——这正是经典芯片与平台章讲过的南北桥职责划分的现代形态。主板上还能看到一颗 Super I/O 芯片（职能见 3.6 节），它经 LPC 或 eSPI（Enhanced Serial Peripheral Interface，增强型串行外设接口）挂在 PCH 上，承接比 PCH 更慢、更杂的功能。
+
+\topic{4.2\quad VRM：一个模拟反馈环给 CPU 供电}
+
+CPU 核心是主板上最苛刻的负载：电压只有约 1V，电流却可达上百安培，而且电流随负载在纳秒到微秒尺度上剧烈变化。给它供电的电路称为\term{电压调节模组}{Voltage Regulator Module，VRM}，其主体是多相并联的 buck 降压变换器。电源时钟章第一节比较过线性稳压与开关稳压的取舍：压差大、电流大时必须用开关方案。12V 降到 1V、输出上百安培，正是开关方案的主场；本节把这个方案拆开，看它的功率级、反馈环与瞬态行为。
+
+\topic{buck 单相：占空比决定电压}
+
+\term{buck 变换器}{buck converter}的功率级只有四个角色：高边 MOSFET、低边 MOSFET、电感、输出电容。两只 MOSFET 组成半桥，中点称为开关节点 SW。高边导通时 SW 接到 12V，电感电流线性上升，电感储能；高边关断、低边导通时 SW 接地，电感电流经低边续流，线性下降，把储存的能量释放给输出。控制电路以固定频率（每相典型 300kHz--1MHz）交替驱动两只管子，高边导通时间占周期的比例称为占空比 $D$。稳态下电感电压平均值为零，输出电压就是 SW 波形的平均值：
+
+$$V_{out} = D \cdot V_{in}$$
+
+12V 转 1V 意味着 $D \approx 0.083$：每个周期里高边只导通约 8\% 的时间。两只管子绝不允许同时导通——那会把 12V 直接短路到地——驱动器在两次导通之间插入几十纳秒的死区时间。电感电流的三角起伏称为纹波电流，由输出电容滤平，输出电压上只残留很小的锯齿。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % ---- 功率级（上方，实线） ----
+  \node[hw block, minimum width=1.3cm, minimum height=0.9cm, align=center] (vin) at (0.75,4.8) {12 V\\输入};
+  \node[hw compute, minimum width=2.0cm, minimum height=1.8cm, align=center] (bridge) at (3.0,4.8) {半桥\\高边+低边\\MOSFET};
+  \node[hw compute, minimum width=1.4cm, minimum height=0.9cm] (ind) at (5.6,4.8) {电感 L};
+  \node[hw state, minimum width=1.8cm, minimum height=1.0cm, align=center] (load) at (8.6,4.8) {负载\\CPU 核心};
+  \draw[hw bus] (vin.east) -- (bridge.west);
+  \draw[hw bus] (bridge.east) -- (ind.west);
+  \node[hw label] at (4.45,5.02) {SW};
+  \draw[hw bus] (ind.east) -- (load.west);
+  \node[hw label] at (7.0,5.1) {$V_{out}\approx 1$ V};
+  \node[hw compute, minimum width=1.5cm, minimum height=0.8cm] (cap) at (6.6,3.6) {输出电容 C};
+  \draw[line width=0.62pt, draw=BookMuted] (6.6,4.8) -- (cap.north);
+
+  % ---- 反馈环路（下方，虚线） ----
+  \node[hw compute, minimum width=2.2cm, minimum height=0.9cm, align=center] (div) at (5.6,1.5) {分压采样 R1/R2};
+  \node[hw compute, minimum width=1.8cm, minimum height=1.0cm, align=center] (ea) at (2.9,1.5) {误差\\放大器};
+  \node[hw memory, minimum width=1.3cm, minimum height=0.6cm] (vref) at (2.9,0.3) {$V_{ref}$};
+  \node[hw control, minimum width=1.8cm, minimum height=1.0cm, align=center] (pwm) at (2.9,2.9) {PWM\\比较器};
+  \node[hw block, minimum width=1.3cm, minimum height=0.8cm] (saw) at (0.85,2.9) {锯齿波};
+  \draw[hw return] (load.south) -- (8.6,1.5) -- (div.east);
+  \draw[hw return] (div.west) -- (ea.east);
+  \draw[hw bus] (vref.north) -- (2.9,1.0);
+  \draw[hw return] (ea.north) -- (2.9,2.4);
+  \draw[hw bus] (saw.east) -- (pwm.west);
+  \draw[hw bus] (pwm.north) -- (2.9,3.9);
+  \node[hw label, anchor=west] at (3.05,3.65) {栅极驱动};
+\end{pdfdiagram}
+\diagramnote{buck 单相功率级与反馈环。实线为功率路径：半桥把 12V 斩成方波，电感与输出电容滤成直流。虚线为反馈路径：输出电压经分压采样送入误差放大器，与参考电压比较，误差信号再与锯齿波比较产生 PWM，决定下一个周期高边的导通时间。输出偏低则占空比加大，输出偏高则占空比减小——一个自动回到设定值的负反馈环。}
+
+\topic{反馈环是一个模拟 PID}
+
+图的下半部分是这个变换器的控制核心，也是本章主题在电源领域的化身。输出电压经电阻分压采样后送入误差放大器的反相端，同相端接精确的参考电压（带隙基准）；误差放大器输出两者之差经补偿网络放大后的信号。这个误差信号送到 PWM 比较器，与固定频率的锯齿波比较：误差大，交点右移，占空比加大；误差小，占空比减小。输出电压任何偏离设定值的趋势都会被环路反向纠正——结构与负反馈放大器完全同构——本章第五节将给出它的统一词汇，只是这里的反馈量不是数字状态而是模拟电压。
+
+误差放大器周围的补偿网络决定环路的动态性格：纯比例增益响应快但留静差，积分环节消除静差，微分环节抑制振荡。补偿元件（几只电阻电容）取值合起来就是一个模拟 PI/PID 控制器，其设计目标是把环路带宽推到开关频率的约十分之一（典型几十到一百多 kHz），同时保留足够的相位裕度。带宽就是这个电源“反应速度”的定量刻画，它直接决定下一段要讲的负载瞬态表现。
+
+现代 VRM 的参考电压不是固定的。CPU 通过一条三线串行总线（Intel 平台称 SVID，即 Serial VID；AMD 平台对应 SVI2/SVI3）向 VRM 控制器发送 \hwkey{VID}（Voltage Identification，电压识别码），以 5--10mV 的步进指定目标电压：轻载时请求降压省电，重载冲刺前请求升压。操作系统层面的频率调节（P-state 切换），对应到硬件上就是一次 VID 改写加一次倍频改写——软件看见的“变频”，有一半是这个模拟环路在换设定值。
+
+\topic{多相并联：错相 360/N 度}
+
+单相 buck 的电流能力受 MOSFET 与电感限制，每相持续输出典型 20--40A。CPU 核心需要上百安培时，唯一的出路是多相并联：$N$ 个相同的半桥加电感共用同一组输出电容，由同一个控制器驱动。台式机主板常见 4--16 相，相数印在主板规格表上，是其供电能力的直接指标。
+
+多相的价值不止于电流相加。控制器让各相的 PWM 依次错开 $360/N$ 度：6 相错 60 度，任一时刻只有一相的高边刚导通。各相电感电流的三角纹波相位错开，在输出电容处汇合时峰谷互抵，合成纹波的频率变为单相的 $N$ 倍、幅度显著减小——同样的滤波电容得到更平的输出。输入侧同样受益：12V 输入电流被摊成 $N$ 份错相抽取，输入电容与 PSU 看到的脉冲电流随之减小。瞬态时多相可以同时转向，等效电感为单相的 $L/N$，电流爬升速度也是单相的 $N$ 倍。
+
+\topic{负载瞬态：下陷与过冲}
+
+buck 环路再快也有带宽上限，而 CPU 的电流阶跃几乎没有上升时间：一批核心从空闲同时进入睿频，电流边沿的 di/dt 可达几十 A/ns，一次完整的负载阶跃（如 10A 跳到 100A）在几十纳秒到微秒量级内完成。电感电流不能突变，环路察觉到电压下跌、调大占空比也需要若干微秒。这段响应延迟里的电流缺口只能由输出电容垫付，电压因此下跌，称为\hwkey{下陷}（droop/undershoot）；反过来，满载突然撤去时电感里已建立的电流无处释放，灌进输出电容造成\hwkey{过冲}（overshoot）。
+
+下陷幅度可以估算。缺口电流由电容提供，$\Delta V \approx \Delta I \cdot \Delta t / C$，再叠上电容等效串联电阻造成的 $\Delta I \cdot \mathrm{ESR}$ 一项。代入典型量级：$\Delta I = 90$A，环路响应延迟 $\Delta t \approx 2\,\mu$s，输出电容总量 $1.5$mF，得到 $\Delta V \approx 90 \times 2\,\mu\mathrm{s} / 1.5\,\mathrm{mF} = 120$mV——对 1V 供电已是 12\% 的扰动，而 CPU 要求的供电窗口通常只有正负几个百分点。这就是主板上 CPU 插槽周围密密麻麻排布电容的原因：聚合物电容管低频段的大电荷量，成片的 MLCC 陶瓷电容管高频段的快速响应，分工方式与电源时钟章第一节的去耦分层完全相同。
+
+\begin{longtable}{L{0.30\linewidth}L{0.24\linewidth}L{0.38\linewidth}}
+\toprule
+量 & 典型量级 & 由什么决定 \\
+\midrule
+负载电流阶跃 $\Delta I$ & 数十到上百 A & 核心数、睿频策略、负载类型 \\
+电流变化率 di/dt & 边沿可达几十 A/ns & CPU 内部时钟门控的速度，主板无法控制 \\
+环路响应延迟 & 数 $\mu$s & 环路带宽（开关频率的约 1/10）与补偿设计 \\
+下陷/过冲幅度 & 数十到一百多 mV & $\Delta I$、响应延迟、输出电容总量与 ESR \\
+供电允许窗口 & 约 $\pm$3\%--5\% & CPU 数据手册的 VRM 规范 \\
+\bottomrule
+\end{longtable}
+
+\topic{负载线：故意不完美的稳压}
+
+直觉上稳压器的目标是输出电压恒定，VRM 却故意做不到：它让输出电压随负载电流线性下降，满载时比空载低几十到一百多 mV。这条人为的伏安斜线称为\term{负载线}{load line}，其斜率（等效电阻）典型为 1m$\Omega$ 量级，即每 100A 负载压降约 100mV。
+
+故意降压的理由是双向余量。没有负载线时，空载 1.00V、加载下陷 120mV，电压触及 0.88V，越出下限；有了负载线，满载稳态值预先设在 0.90V 附近，同样的下陷从更低处开始、谷底不变，而撤载过冲从 0.90V 起跳，顶点远低于从 1.00V 起跳的情形——同一份电压窗口，瞬态扰动在上下两个方向都获得了空间。附带的收益是省电：满载时电压低 10\%，同样的电流下功耗也低约 10\%（理想化估算——实际负载电流会随电压略变）。负载线的斜率由 VRM 控制器按 CPU 厂商规范实现，超频工具里的 LLC（Load-Line Calibration）档位调的就是这条线的斜率——把线拉平，满载电压更好看，代价是撤载过冲顶到上限。
+
+\begin{warningbox}
+“供电相数越多电压越稳”只说对了一半。相数决定电流能力与纹波抵消，瞬态表现却由环路带宽、输出电容与负载线共同决定；两相供电配优秀的补偿与充足的电容，瞬态响应可以好过堆相数但补偿平庸的设计。看一份 VRM 方案，相数、每相电流等级、控制器带宽、输出电容总量要放在一起读。
+\end{warningbox}
+
+\topic{4.3\quad 时钟分配：一颗晶体驱动全机}
+
+主板上的时钟起点是一颗 25MHz 石英晶体（或晶体振荡器），它本身只产生一个频率。晶体旁边是\term{时钟发生器}{clock generator}芯片：内部 PLL 把 25MHz 倍频到 100MHz，再经一组扇出缓冲器复制成多路，分别送往 CPU（作为基础时钟 BCLK）、PCH、PCIe 插槽与 SATA 等接口。PLL 的倍频与滤波原理、晶振起振需要毫秒级时间的事实，电源时钟章第二节都已讲过，此处不再重复；本节关心的是分配的结构。
+
+各域拿到的是同一份 100MHz 参考，各自的内部 PLL 再做二次倍频：CPU 核心把 BCLK 乘上倍频系数（如 $\times 45$ 得 4.5GHz），内存控制器把参考倍频到内存实际时钟（DDR4-3200 对应 1600MHz），PCIe 与 SATA 则直接用 100MHz 参考恢复出各自的链路速率。同源设计的好处是各域时钟的漂移方向一致，跨域接口看到的频率关系是稳定的。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block, minimum width=1.4cm, minimum height=0.8cm, align=center] (xtal) at (0.9,3.0) {25 MHz\\晶振};
+  \node[hw control, minimum width=2.6cm, minimum height=1.2cm, align=center] (gen) at (4.0,3.0) {时钟发生器\\PLL + 扇出缓冲};
+  \node[hw state, minimum width=2.6cm, minimum height=0.9cm, align=center] (cpu) at (9.3,5.0) {CPU 核心\\$\times$倍频系数};
+  \node[hw compute, minimum width=2.6cm, minimum height=0.9cm, align=center] (mem) at (9.3,3.6) {内存控制器\\$\times$16 等};
+  \node[hw compute, minimum width=2.6cm, minimum height=0.9cm, align=center] (io) at (9.3,2.2) {PCIe / SATA\\直接用参考};
+  \draw[hw bus] (xtal.east) -- (gen.west);
+  \draw[hw bus] (gen.east) -- (6.3,3.0);
+  \draw[hw bus] (6.3,3.0) -- (6.3,5.0) -- (cpu.west);
+  \draw[hw bus] (6.3,3.0) -- (6.3,3.6) -- (mem.west);
+  \draw[hw bus] (6.3,3.0) -- (6.3,2.2) -- (io.west);
+  \fill[BookMuted] (6.3,3.6) circle (0.045);
+  \fill[BookMuted] (6.3,2.2) circle (0.045);
+  \node[hw label] at (7.15,5.26) {100 MHz 参考};
+  \node[hw label, align=center] at (4.0,1.7) {扩频（SSC）：约 33 kHz 三角波，频率在\\标称值与其 $-0.5\%$ 之间扫动（下扩频）};
+\end{pdfdiagram}
+\diagramnote{主板时钟分配。25MHz 晶振驱动时钟发生器，PLL 倍频出 100MHz 参考并扇出到各时钟域；各域内部 PLL 二次倍频。SSC 调制在时钟发生器内完成，全机时钟同步漂移。}
+
+\topic{扩频时钟：把能量摊开来过认证}
+
+恒频时钟的频谱是一根尖锐的谱线：100MHz 及其各次谐波上的能量高度集中，主板上长走线充当天线时，这些频点的辐射容易超出电磁兼容限值。\term{扩频时钟}{Spread Spectrum Clocking，SSC}的做法是让时钟频率不再恒定，而是以约 33 kHz 的三角波缓慢调制，使频率在标称值与标称值的 $-0.5\%$ 之间来回扫动（下扩频）。总能量不变，但原本集中在一个频点的能量被摊进约 0.5\% 带宽内，峰值功率谱密度随之下降数 dB 到十 dB 量级，恰好够把认证测试中的辐射峰值降到限值以下。代价是时钟沿位置引入了有界的低频摆动：平均频率比标称值低 0.25\%，瞬时频率在标称值与其 $-0.5\%$ 之间变化。同步数字逻辑对此不敏感；高速串行链路则要求收发双方共享同一份带 SSC 的参考——PCIe 允许 SSC 的前提正是主板把同一路 100MHz 参考同时发给 CPU 根复合体与插槽，两者同步漂移，相对关系不变。电磁兼容的完整讨论见电源时钟章第四节。
+
+\topic{4.4\quad 固件与开机：从 PWR\_OK 到 bootloader}
+
+按下电源键到操作系统出现，中间有一段完全由固件主导的时间。经典芯片与平台章已讲过一个版本的故事：复位向量、BIOS 的 POST、设备初始化、选设备与移交四阶段。本节讲现代 UEFI 版本，重点放在这条链路与主板硬件的对应关系——固件放在哪颗芯片里，每一步初始化的是本节与前几节讲过的哪部分硬件。
+
+\topic{上电时序：先电力，再时钟，最后逻辑}
+
+电源键并不直接接通主电源，它只是给 PCH（或嵌入式控制器 EC）一个请求信号。PCH 确认后把电源控制线 PS\_ON\# 拉低（低有效），PSU 才开始输出各电压轨；板上各 VRM 随之启动，把 12V 分配到 CPU、内存与各插槽。电压爬升与稳定需要时间，PSU 在所有输出进入允许范围后才拉高 PWR\_OK 信号，\hwevidence{ATX 规范把这个延迟规定在 100--500ms}。与此同时晶振起振（毫秒级）、时钟发生器内 PLL 锁定（数十到数百 $\mu$s，见电源时钟章第二节）。PCH 等到 PWR\_OK 有效且时钟稳定，才释放全机复位。CPU 退出复位后的第一个动作是从复位向量取指——x86 的初始取指地址在 4GB 空间顶端附近（\code{0xFFFFFFF0}），这个地址由 PCH 译码，映射到主板上的 SPI flash。复位向量在不同架构上的对照，经典芯片与平台章已有专表，此处只需记住结论：入口地址是硬件约定，响应该地址的必须是可靠的非易失存储。
+
+\topic{UEFI 的阶段：SEC、PEI、DXE}
+
+固件保存在主板上那颗 SPI NOR flash 里，典型容量 16--32MB，经 PCH 的 SPI 控制器以几十 MHz 时钟读取，并映射到地址空间顶端供 CPU 直接取指。UEFI 固件把启动过程组织成几个阶段，每个阶段的可用资源不同，能做的事也不同：
+
+\begin{longtable}{L{0.09\linewidth}L{0.24\linewidth}L{0.33\linewidth}L{0.25\linewidth}}
+\toprule
+阶段 & 运行环境 & 主要工作 & 结束时的世界 \\
+\midrule
+SEC & 无内存可用，单核，实模式入口，随即切保护模式 & 把部分 cache 配置为临时 RAM（cache-as-RAM），建立栈与初始数据区，验证并装载 PEI 核心 & CPU 有了可用的临时内存 \\
+PEI & 临时 RAM，SPI flash 可读 & 早期硬件初始化；执行内存参考代码：读 SPD、配置内存控制器、执行训练；内存就绪后装载 DXE 核心 & DRAM 可用 \\
+DXE & 全部内存可用 & 按依赖关系调度驱动：枚举 PCIe 设备、初始化存储与显示控制器、建立 ACPI/SMBIOS 表 & 设备可枚举、表已备好 \\
+BDS & 设备驱动就绪 & 初始化控制台，按启动项顺序选择启动设备，装载 bootloader & 控制权移交 \\
+\bottomrule
+\end{longtable}
+
+SEC 阶段的 cache-as-RAM 值得停留片刻。复位后 DRAM 尚未初始化——它需要先读 SPD、再做训练（本章 2.3 节），而做这些事的代码本身需要内存来运行。解决方法是把 CPU 的部分 cache 临时配置成填充后不再驱逐、也不写回（no-evict）的模式，让它充当几十 KB 到几 MB 量级的 SRAM：C 代码的栈和全局变量就建在这片临时内存上。等到 PEI 阶段末尾 DRAM 训练完成，固件把执行环境整体迁入真正的内存，cache 才恢复本来的职责。PEI 阶段的内存初始化是整机启动中最容易失败的一环：训练失败时，主板诊断灯停在 DRAM 档位，正是这个阶段的输出。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block, minimum width=6.0cm, minimum height=0.85cm] (b1) at (5.5,9.6) {按下电源键：PSU 各电压轨升起};
+  \node[hw control, minimum width=6.0cm, minimum height=0.85cm] (b2) at (5.5,8.4) {PWR\_OK 拉高，复位释放};
+  \node[hw state, minimum width=6.0cm, minimum height=0.85cm] (b3) at (5.5,7.2) {CPU 从复位向量取指（命中 SPI flash）};
+  \node[hw compute, minimum width=6.0cm, minimum height=0.85cm] (b4) at (5.5,6.0) {SEC：cache-as-RAM，建立临时执行环境};
+  \node[hw compute, minimum width=6.0cm, minimum height=0.85cm] (b5) at (5.5,4.8) {PEI：读 SPD，内存初始化与训练};
+  \node[hw compute, minimum width=6.0cm, minimum height=0.85cm] (b6) at (5.5,3.6) {DXE：枚举设备，装载驱动，建立 ACPI 表};
+  \node[hw state, minimum width=6.0cm, minimum height=0.85cm] (b7) at (5.5,2.4) {BDS：选择启动设备，装载 bootloader};
+  \node[hw block, minimum width=6.0cm, minimum height=0.85cm] (b8) at (5.5,1.2) {交棒：bootloader $\to$ OS 内核};
+  \draw[hw bus] (b1.south) -- (b2.north);
+  \draw[hw bus] (b2.south) -- (b3.north);
+  \draw[hw bus] (b3.south) -- (b4.north);
+  \draw[hw bus] (b4.south) -- (b5.north);
+  \draw[hw bus] (b5.south) -- (b6.north);
+  \draw[hw bus] (b6.south) -- (b7.north);
+  \draw[hw bus] (b7.south) -- (b8.north);
+  \node[hw label, anchor=east] at (2.3,8.4) {等电压与时钟稳定};
+  \node[hw label, anchor=east] at (2.3,6.0) {DRAM 尚不可用};
+  \node[hw label, anchor=east] at (2.3,4.8) {SPD 见 4.5 节};
+  \node[hw label, anchor=west, align=left] at (8.7,7.2) {复位向量对照见\\经典芯片与平台演进章};
+  \node[hw label, anchor=west] at (8.7,3.6) {表留给 OS 解析};
+\end{pdfdiagram}
+\diagramnote{UEFI 开机流程。前半段被硬件约束主导：电压与时钟稳定之前不能释放复位，内存训练完成之前只能用 cache 充当内存；后半段被软件结构主导：驱动按依赖调度，表建好后才交棒。任何一步失败，整机表现为“点不亮”，而根因可能远在 CPU 之外。}
+
+\topic{ACPI 表：固件写给操作系统的自我介绍}
+
+bootloader 与操作系统接手后，面对的第一个问题是：这台机器有几个核、中断控制器在哪、有哪些设备？现代平台不允许 OS 靠试探端口来回答——太危险也太慢。答案是 \term{ACPI}{Advanced Configuration and Power Interface，高级配置与电源接口}：固件在 DXE 阶段把一组表写进内存，并在约定位置留下签名指针 \code{RSDP}；OS 由指针找到根表 \code{XSDT}，再按其中的条目索引到各张子表。硬件清单以数据而非探测的方式交付。
+
+\begin{longtable}{L{0.14\linewidth}L{0.40\linewidth}L{0.38\linewidth}}
+\toprule
+表 & 内容 & OS 拿它做什么 \\
+\midrule
+MADT & 每个处理器核的条目、本地 APIC 地址（典型 \code{0xFEE00000}）、I/O APIC 与中断源覆盖 & 决定唤醒几个核、中断控制器在哪、中断号如何路由 \\
+MCFG & PCIe 增强配置空间（ECAM）的基址 & 用 MMIO 读写所有 PCIe 设备的配置空间（见主存与总线章的 MMIO） \\
+DSDT & Differentiated System Description Table（系统描述表）：AML 字节码描述的设备树；设备对象、\code{_HID} 即插即用 ID、\code{_CRS} 资源声明 & OS 的 ACPI 解释器执行 AML，枚举无标准总线的设备（电源键、温度传感器等） \\
+FADT & 电源管理相关的固定寄存器块地址与系统属性 & 睡眠/唤醒、电源按钮语义、复位寄存器位置 \\
+\bottomrule
+\end{longtable}
+
+这套机制把“主板厂商才知道的事”——哪个引脚接了哪个设备、电源键走哪条路径——封装成标准数据结构。同一份 OS 镜像因此能在不同主板上启动：差异被压缩在表的内容里，而不是代码里。BDS 阶段的交棒本身很简短：固件从 EFI 系统分区（ESP）读取启动项指定的 \code{.efi} 文件（bootloader），把它装入内存并跳转；此后固件退居幕后，只保留 ACPI 表与少量运行时服务。从 BIOS 四阶段到 UEFI 的 SEC/PEI/DXE/BDS，载体换了，骨架未变——经典芯片与平台章末尾的四阶段对照依然成立。
+
+\topic{4.5\quad SPD：内存条身上的自我介绍}
+
+PEI 阶段配置内存控制器时，时序参数从哪来？内存条自己带着答案。每根 DIMM 上都有一颗小 EEPROM，即 3.6 节介绍过的 SPD（Serial Presence Detect，串行存在检测），\hwevidence{DDR4 的 SPD 容量为 512 字节（JEDEC EE1004 规范）}；DDR5 把 SPD 换成 1024 字节的 SPD5118 集线器，接口也换成 I3C，角色不变。整颗芯片里固化着这根条的完整身份与能力档案。主板通过 I2C/SMBus 总线（7 位地址 \code{0x50}--\code{0x57}，标准模式 100kHz）在上电早期把它读出来——读满 512 字节只需几十毫秒。
+
+\begin{longtable}{L{0.22\linewidth}L{0.42\linewidth}L{0.28\linewidth}}
+\toprule
+字段 & 内容 & 用途 \\
+\midrule
+制造信息 & 厂商、颗粒型号、序列号、生产日期 & 固件与诊断工具识别条子身份 \\
+组织结构 & 容量、rank 数、位宽、bank 数 & 内存控制器配置地址映射 \\
+标准时序表 & 各档频率对应的最小 \hwtiming{tCK、CL、tRCD、tRP、tRAS}（如 DDR4-3200：\hwtiming{tCK 0.625ns、CL 22}） & 决定目标频率下的命令间隔 \\
+标称电压 & 标准档 1.2V，性能档所需电压 & VRM 设定内存供电 \\
+扩展 profile & Intel XMP / AMD EXPO：厂商验证过的高频时序组合 & 用户在固件设置里一键启用超频档 \\
+\bottomrule
+\end{longtable}
+
+SPD 把本章的两条线索接在了一起。4.4 节讲过，PEI 阶段的内存参考代码负责点亮 DRAM；本章 2.3 节讲过，点亮的关键是训练——把每条链路的采样延迟与判决门限调到数据眼中央。SPD 正是这两者的衔接物：固件先按 SPD 中的保守参数（或标称档）让链路以安全时序跑起来，使基本读写可用；训练再以这个工作点为起点做精调，最终把各档位时序写进控制器寄存器。存储器件结构章第三节描述的训练序列因此有一个隐含的前提：训练开始前，控制器已经通过 SPD 知道了这根条子的组织结构和目标时序。没有 SPD，主板无法区分一根 8GB 单 rank 的 3200 条和一根 32GB 双 rank 的 4800 条，也就无从谈起正确的初始化。
+
+SPD 也是“软件怎么碰到硬件”的一个干净样本：它不产生数据流，不搬指令，只是一份躺在 EEPROM 里的参数表，却决定了训练从哪个工作点开始、内存最终跑在什么频率上。用户在固件设置界面里打开 XMP，效果就是把 SPD 扩展区里那组更激进的时序换成训练的目标值——一次配置选择，穿过固件、控制器与 PHY，最终改变的是纳秒级的信号采样位置。
+
+\begin{classicnote}
+把本节与前几章连起来读：VRM 的反馈环（4.2）是负反馈放大器结构的功率版本；时钟分配（4.3）是时钟树在板级的延伸；SEC 的 cache-as-RAM（4.4）是最小 CPU 章“取指需要可用的存储”这一约束在真实启动中的解法；SPD 与训练（4.5）则完成了从一颗 EEPROM 到纳秒级采样位置的完整链路。整机的启动不是某个部件的动作，而是这些机制按依赖顺序依次成立的过程。
+\end{classicnote}

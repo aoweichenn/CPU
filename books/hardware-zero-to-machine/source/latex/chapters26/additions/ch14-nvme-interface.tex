@@ -1,0 +1,19 @@
+\section{NVMe 队列如何把块请求交给 SSD}
+
+NVMe 控制器通过 PCIe 接入系统。主机先在 DRAM 中建立 submission queue（SQ）与 completion queue（CQ），把它们的物理地址和深度写入控制器寄存器。提交一次读请求时，软件先填好 SQ 项，其中包含 opcode、namespace、逻辑块范围和目标缓冲区描述；随后执行必要的内存屏障，再写 MMIO doorbell 更新队尾。
+
+控制器看到 doorbell 后 DMA 读取命令和数据指针，访问 NAND/FTL，最后把完成项 DMA 写入 CQ，再更新完成相位并选择轮询或 MSI-X 通知。doorbell 写返回只说明寄存器事务完成，不代表数据已经到达内存。
+
+\begin{lstlisting}
+host memory: write SQ entry -> memory barrier -> ring doorbell
+controller:  DMA command -> execute media work -> DMA data
+completion:  write CQ entry -> interrupt/poll -> host consumes CQ
+\end{lstlisting}
+
+PRP 或 SGL 描述数据缓冲区的物理页列表。它们必须在命令有效期内保持固定并允许设备访问；IOMMU 映射、页锁定和完成后的解映射共同划定缓冲区所有权。队列深度提高并行度，但超过介质与控制器能并行处理的程度后，只会增加排队和尾延迟。
+
+\section{错误、复位与持久化边界}
+
+完成项中的状态码、命令标识和 SQ 标识决定主机能否把结果归还给正确请求。超时后不能立刻重用命令缓冲，因为旧控制器事务可能仍在路上；驱动通常先停止新提交、屏蔽通知、确认或复位队列，再按协议处理未完成请求。
+
+普通写完成可能只表示数据进入控制器易失缓存。需要持久化时，文件系统或数据库还要使用 FUA、FLUSH 等语义，并让控制器的断电保护或介质提交边界参与保证。性能数字必须说明测的是提交、完成还是持久化完成。

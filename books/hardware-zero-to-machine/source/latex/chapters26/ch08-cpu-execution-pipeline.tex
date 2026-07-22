@@ -1,0 +1,1231 @@
+\chapter{CPU 执行：单周期、多周期与流水线}
+
+\begin{keyidea}
+单周期、多周期和流水线并不是三套互不相干的机器，而是对硬件复用、关键路径和吞吐的三种组织方式。本章从完整执行 trace 进入处理器实现的演进。
+\end{keyidea}
+
+\section{一、整机实验、调试顺序与案例 trace}
+
+\topic{最小整机实验要先有明确的观察点}若在一块低速实验板上实现本节内容，不必立即追求完整 ISA。可以先定义四条动作：\code{ADD}、\code{MOV}（加载）、\code{MOV}（存储）、\code{JZ}。指令 ROM 提供编码，4 个寄存器保存通用值，74HC283/74HC86 构成加减核心，SRAM 或寄存器堆模拟数据存储器，若干 LED 和拨码开关映射成 MMIO。实现要点是每一步都可观察：PC LED 显示当前取指地址，IR LED 或逻辑分析仪显示当前指令，控制线可单步观察，写回和 PC 更新只在时钟沿发生。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+实验对象 & 可用器件或实现 & 可观察行为 \\
+\midrule
+指令 ROM & EEPROM、Flash 或预置拨码/仿真 ROM & 复位后固定地址输出第一条编码 \\
+PC/IR & 74HC161、74HC574 或触发器组 & PC 每步按控制更新，IR 保存本周期指令 \\
+数据 RAM & SRAM、寄存器堆或仿真存储器 & 加载/存储的地址、数据、写使能可观察 \\
+地址译码 & 74HC138、比较器或门阵列 & RAM、LED、按键寄存器不会同时响应 \\
+MMIO LED & 锁存器驱动 LED & 写指定地址后 LED 状态在边界改变 \\
+MMIO 按键 & 上拉/下拉、施密特、同步器 & 读指定地址返回已同步状态，不直接用未同步的按键信号 \\
+\bottomrule
+\end{longtable}
+
+\topic{最小整机的单步调试顺序}搭建教学 CPU 时，最可靠的调试顺序不是一次性运行程序，而是逐个检查每个状态边界。先让复位把 PC 固定到入口地址，再单步确认 ROM 输出第一条指令；随后确认 IR 能锁存该指令，译码能产生正确控制线；再用一条 ADD 验证寄存器读、ALU 和写回；最后才加入加载、存储、分支和 MMIO。
+
+\begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}}
+\toprule
+调试阶段 & 操作 & 预期行为 \\
+\midrule
+复位 & 拉低/拉高复位并给一个时钟 & PC 固定为入口，写使能均处于安全值 \\
+取指 & 单步一个取指周期 & ROM 片选有效，IR 保存预期编码 \\
+ADD & 预置 R1/R2，执行 \code{ADD R1,R2} & R1 在时钟沿变为正确和，PC 前进 \\
+MOV（加载） & RAM 某地址预置数据，执行加载 & 地址、读使能、写回来源均正确 \\
+MOV（存储） & 执行写 RAM 或写 LED 寄存器 & 只有目标片选有效，非目标不被改写 \\
+分支 & 改变 Zero 条件重复执行 & PC 在顺序地址和分支目标之间正确选择 \\
+\bottomrule
+\end{longtable}
+
+这种逐步观察的方式也适用于 FPGA。逻辑分析仪、仿真波形或片上 ILA 应至少抓取 PC、IR、控制字、ALU 输入输出、内存地址、读写使能、写回数据和寄存器写地址。若只看最终 LED 是否闪烁，错误可能被循环掩盖；若能看到每条指令的提交边界，错误就能定位到具体周期。
+
+\begin{waveform}[x=0.82cm,y=0.95cm]
+  % 周期末上升沿参考线（x=2,6,10）
+  \draw[hw return] (2,1.2) -- (2,10.0);
+  \draw[hw return] (6,1.2) -- (6,10.0);
+  \draw[hw return] (10,1.2) -- (10,10.0);
+  % CLK：周期 4 格，上升沿在 2/6/10
+  \draw[BookAccent, line width=0.9pt] (0,9.0) -- (2,9.0) -- (2,9.8) -- (4,9.8) -- (4,9.0) -- (6,9.0) -- (6,9.8) -- (8,9.8) -- (8,9.0) -- (10,9.0) -- (10,9.8) -- (12,9.8) -- (12,9.0) -- (13,9.0);
+  \node[hw label, anchor=east] at (-0.2,9.4) {CLK};
+  % nRESET：低有效，x=1.5 释放
+  \draw[BookAccent, line width=0.9pt] (0,7.8) -- (1.5,7.8) -- (1.5,8.6) -- (13,8.6);
+  \node[hw label, anchor=east] at (-0.2,8.2) {nRESET};
+  \node[hw label, anchor=west] at (2.2,7.55) {复位释放};
+  % PC 总线
+  \draw[BookTeal, line width=0.9pt] (0,6.2) rectangle (2,7.0);
+  \node at (1,6.6) {0x0000};
+  \draw[BookTeal, line width=0.9pt] (2,6.2) rectangle (6,7.0);
+  \node at (4,6.6) {0x0000};
+  \draw[BookTeal, line width=0.9pt] (6,6.2) rectangle (10,7.0);
+  \node at (8,6.6) {0x0001};
+  \draw[BookTeal, line width=0.9pt] (10,6.2) rectangle (13,7.0);
+  \node at (11.5,6.6) {0x0002};
+  \node[hw label, anchor=east] at (-0.2,6.6) {PC};
+  % IR 总线
+  \draw[BookTeal, line width=0.9pt] (0,4.6) rectangle (2,5.4);
+  \node at (1,5.0) {清零};
+  \draw[BookTeal, line width=0.9pt] (2,4.6) rectangle (6,5.4);
+  \node at (4,5.0) {0x22F0};
+  \draw[BookTeal, line width=0.9pt] (6,4.6) rectangle (10,5.4);
+  \node at (8,5.0) {0x7260};
+  \draw[BookTeal, line width=0.9pt] (10,4.6) rectangle (13,5.4);
+  \node at (11.5,5.0) {0x3450};
+  \node[hw label, anchor=east] at (-0.2,5.0) {IR};
+  % R1 写回提交
+  \draw[BookTeal, line width=0.9pt] (0,3.0) rectangle (6,3.8);
+  \node at (3,3.4) {未知};
+  \draw[BookTeal, line width=0.9pt] (6,3.0) rectangle (10,3.8);
+  \node at (8,3.4) {0x00F0};
+  \draw[BookTeal, line width=0.9pt] (10,3.0) rectangle (13,3.8);
+  \node at (11.5,3.4) {0xF000};
+  \node[hw label, anchor=east] at (-0.2,3.4) {R1};
+  % reg_write
+  \draw[BookAccent, line width=0.9pt] (0,1.6) -- (2,1.6) -- (2,2.4) -- (13,2.4);
+  \node[hw label, anchor=east] at (-0.2,2.0) {reg\_write};
+\end{waveform}
+\diagramnote{复位后前三个周期的时序，对照§二 ROM 程序开头三条编码（\code{0x22F0}=\code{MOV R1,0xF0}、\code{0x7260}=\code{SHL R1,8}、\code{0x3450}=\code{MOV R2,[R1+4]}）。复位把 PC 保持在 \code{0x0000}、写使能保持在安全值；释放后每个周期内组合路径完成取指、译码、执行，周期末上升沿才提交新状态——\code{0x00F0} 在第二个上升沿、\code{0xF000} 在第三个上升沿写进 R1。这张波形图直观展示了“状态只在时钟沿改变”，单步调试时应逐格核对。}
+
+\topic{流水线把吞吐率问题提前暴露出来}一旦把取指、译码、执行、访存和写回拆成流水级，CPU 的平均吞吐率可以提高，但控制复杂度也立刻上升。相邻指令可能争用同一个存储器端口，后一条指令可能读取前一条尚未写回的寄存器，分支可能让已经取到的指令变成错误路径。这些问题统称结构冒险、数据冒险和控制冒险。
+
+先把五级流水的基本结构画出来，再讨论它引来的冒险：
+
+\begin{pdfdiagram}
+  \node[hw compute, minimum width=1.5cm, align=center] (s1) at (0,1.5) {IF\\取指};
+  \node[hw state, minimum width=0.5cm] (p1) at (1.15,1.5) {};
+  \node[hw compute, minimum width=1.5cm, align=center] (s2) at (2.3,1.5) {ID\\译码};
+  \node[hw state, minimum width=0.5cm] (p2) at (3.45,1.5) {};
+  \node[hw compute, minimum width=1.5cm, align=center] (s3) at (4.6,1.5) {EX\\执行};
+  \node[hw state, minimum width=0.5cm] (p3) at (5.75,1.5) {};
+  \node[hw compute, minimum width=1.5cm, align=center] (s4) at (6.9,1.5) {MEM\\访存};
+  \node[hw state, minimum width=0.5cm] (p4) at (8.05,1.5) {};
+  \node[hw compute, minimum width=1.5cm, align=center] (s5) at (9.2,1.5) {WB\\写回};
+  \node[hw label, above] at (1.15,2.0) {IF/ID};
+  \node[hw label, above] at (3.45,2.0) {ID/EX};
+  \node[hw label, above] at (5.75,2.0) {EX/MEM};
+  \node[hw label, above] at (8.05,2.0) {MEM/WB};
+  \draw[hw bus] (s1) -- (p1);
+  \draw[hw bus] (p1) -- (s2);
+  \draw[hw bus] (s2) -- (p2);
+  \draw[hw bus] (p2) -- (s3);
+  \draw[hw bus] (s3) -- (p3);
+  \draw[hw bus] (p3) -- (s4);
+  \draw[hw bus] (s4) -- (p4);
+  \draw[hw bus] (p4) -- (s5);
+  % 旁路转发：级间寄存器里的新结果直接回送 EX 输入
+  \draw[hw return] (p3.south) -- (5.75,0.55) -- (4.9,0.55) -- (4.9,1.0);
+  \draw[hw return] (p4.south) -- (8.05,0.1) -- (4.3,0.1) -- (4.3,1.0);
+  \node[hw label, below] at (5.4,0.55) {EX/MEM 转发};
+  \node[hw label, below] at (6.2,0.1) {MEM/WB 转发};
+\end{pdfdiagram}
+\diagramnote{五级流水的基本结构。IF、ID、EX、MEM、WB 五级之间用级间寄存器隔开，每拍所有级并行推进不同指令，级间寄存器在时钟沿把本级的结果与控制权交给下一级。虚线是旁路转发：EX/MEM、MEM/WB 级间寄存器里的新结果不等写回，直接回送 EX 级的 ALU 输入，大多数寄存器依赖因此不必停顿；load-use 这种数据要到访存拍末才就绪的情形，仍要停一拍。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+冒险类型 & 例子 & 硬件处理 \\
+\midrule
+结构冒险 & 取指和加载同时争用单端口存储器 & 分离指令/数据存储，或插入停顿 \\
+数据冒险 & \code{ADD R1,...} 后立刻 \code{SUB R2,R1,...} & 旁路/转发，或等待写回后再读 \\
+控制冒险 & 条件分支结果未出时已取后续指令 & 预测、延迟槽、停顿或冲刷流水线 \\
+异常冒险 & 较晚指令先完成，较早指令发生异常 & 提交队列或按序提交保证精确状态 \\
+\bottomrule
+\end{longtable}
+
+因此，现代芯片低时延不只是“流水线更深”。流水线必须配套转发网络、停顿控制、冲刷控制和精确异常边界。否则，吞吐率提高会以错误状态提交为代价。学习最小 CPU 时提前看到这些冒险，可以防止把流水线误解成简单地把框图切成几段。
+
+\topic{案例：从一个计数循环走到逐周期 trace}
+假设内存中从 \code{BASE} 开始有若干 32-bit 数，\code{rdi} 保存当前地址，\code{rcx} 保存剩余元素个数，\code{rsi} 保存累加和。程序每轮加载一个元素，加入累加和，地址加 4，计数减 1，若计数不为 0 就回到循环入口。
+
+这个案例改用真实 x86-64 写法（Intel 语法，目的操作数在前）：32-bit 数据经 \code{eax} 中转，地址、计数与累加和使用 64-bit 寄存器，比前面的 16-bit 极小 ISA 宽一档，数值关系更醒目；两者的 trace 方法完全相同——读旧状态、经组合路径、在时钟沿提交。
+
+\begin{lstlisting}
+loop:
+  mov eax, [rdi]
+  add rsi, rax
+  add rdi, 4
+  sub rcx, 1
+  jnz loop
+done:
+  mov [RESULT], esi
+\end{lstlisting}
+
+\begin{longtable}{L{0.14\linewidth}L{0.28\linewidth}L{0.32\linewidth}L{0.16\linewidth}}
+\toprule
+指令 & 主要输入 & 组合路径 & 提交对象 \\
+\midrule
+\code{MOV}（加载） & rdi、偏移 0 & ALU 地址加法，数据存储器读 & eax，PC \\
+\code{ADD} & rsi、rax & ALU 加法，写回 mux & rsi，Flags，PC \\
+\code{ADD} & rdi、立即数 4 & 立即数扩展，ALU 加法 & rdi，Flags，PC \\
+\code{SUB} & rcx、立即数 1 & B 取反加一或减法路径 & rcx，Zero，PC \\
+\code{JNZ} & Zero 标志 & 条件判断，PC mux & PC \\
+\code{MOV}（存储） & rsi、RESULT 地址 & 地址形成，数据存储器写 & 内存或 MMIO，PC \\
+\bottomrule
+\end{longtable}
+
+若采用五级流水线，前两条指令立即暴露 load-use 数据冒险。\code{mov eax, [rdi]} 读回的数据通常到 MEM 阶段末尾才可用，而下一条 \code{add rsi, rax} 在 EX 阶段就需要 rax。没有转发或停顿时，加法指令会读到 rax 的旧值。
+
+把前两条指令的逐拍位置画成时空图，这一拍气泡的来源就看得很清楚：
+
+\begin{pdfdiagram}
+  \node[hw label, anchor=west] at (0,4.1) {F=取指 D=译码 E=执行 M=访存 W=写回};
+  % 行标签
+  \node[hw label, anchor=east] at (-0.2,3.0) {mov eax, [rdi]};
+  \node[hw label, anchor=east] at (-0.2,1.9) {add rsi, rax};
+  \node[hw label, anchor=east] at (-0.2,0.8) {add rdi, 4};
+  % 第 1 行：MOV，第 1--5 拍
+  \draw[BookTeal, line width=0.7pt] (0,2.6) rectangle (1.15,3.4);
+  \node[font=\tiny\sffamily] at (0.575,3.0) {F};
+  \draw[BookTeal, line width=0.7pt] (1.15,2.6) rectangle (2.3,3.4);
+  \node[font=\tiny\sffamily] at (1.725,3.0) {D};
+  \draw[BookTeal, line width=0.7pt] (2.3,2.6) rectangle (3.45,3.4);
+  \node[font=\tiny\sffamily] at (2.875,3.0) {E};
+  \draw[BookTeal, line width=0.7pt] (3.45,2.6) rectangle (4.6,3.4);
+  \node[font=\tiny\sffamily] at (4.025,3.0) {M};
+  \draw[BookTeal, line width=0.7pt] (4.6,2.6) rectangle (5.75,3.4);
+  \node[font=\tiny\sffamily] at (5.175,3.0) {W};
+  % 第 2 行：load-use 相关，EX 前插 1 拍气泡
+  \draw[BookTeal, line width=0.7pt] (1.15,1.5) rectangle (2.3,2.3);
+  \node[font=\tiny\sffamily] at (1.725,1.9) {F};
+  \draw[BookTeal, line width=0.7pt] (2.3,1.5) rectangle (3.45,2.3);
+  \node[font=\tiny\sffamily] at (2.875,1.9) {D};
+  \draw[BookAccent, line width=0.9pt] (3.45,1.5) rectangle (4.6,2.3);
+  \node[font=\tiny\sffamily] at (4.025,1.9) {$\times$};
+  \draw[BookTeal, line width=0.7pt] (4.6,1.5) rectangle (5.75,2.3);
+  \node[font=\tiny\sffamily] at (5.175,1.9) {E};
+  \draw[BookTeal, line width=0.7pt] (5.75,1.5) rectangle (6.9,2.3);
+  \node[font=\tiny\sffamily] at (6.325,1.9) {M};
+  \draw[BookTeal, line width=0.7pt] (6.9,1.5) rectangle (8.05,2.3);
+  \node[font=\tiny\sffamily] at (7.475,1.9) {W};
+  % 第 3 行：随之滞留取指一格（空心格），再正常推进
+  \draw[BookTeal, line width=0.7pt] (2.3,0.4) rectangle (3.45,1.2);
+  \node[font=\tiny\sffamily] at (2.875,0.8) {F};
+  \draw[BookRule, line width=0.5pt] (3.45,0.4) rectangle (4.6,1.2);
+  \draw[BookTeal, line width=0.7pt] (4.6,0.4) rectangle (5.75,1.2);
+  \node[font=\tiny\sffamily] at (5.175,0.8) {D};
+  \draw[BookTeal, line width=0.7pt] (5.75,0.4) rectangle (6.9,1.2);
+  \node[font=\tiny\sffamily] at (6.325,0.8) {E};
+  \draw[BookTeal, line width=0.7pt] (6.9,0.4) rectangle (8.05,1.2);
+  \node[font=\tiny\sffamily] at (7.475,0.8) {M};
+  \draw[BookTeal, line width=0.7pt] (8.05,0.4) rectangle (9.2,1.2);
+  \node[font=\tiny\sffamily] at (8.625,0.8) {W};
+  % MEM 末到 EX 入口的转发
+  \draw[hw return] (4.025,2.6) -- (4.025,2.45) -- (5.175,2.45) -- (5.175,2.3);
+  \node[hw label, anchor=west] at (5.35,2.45) {MEM 末 $\to$ EX 转发};
+  % 数据就绪参考线与周期刻度
+  \draw[hw return] (4.6,0.15) -- (4.6,3.75);
+  \node[hw label, anchor=west] at (4.75,3.68) {加载数据在 MEM 拍末就绪};
+  \node[hw label, below] at (0.575,0.15) {1};
+  \node[hw label, below] at (1.725,0.15) {2};
+  \node[hw label, below] at (2.875,0.15) {3};
+  \node[hw label, below] at (4.025,0.15) {4};
+  \node[hw label, below] at (5.175,0.15) {5};
+  \node[hw label, below] at (6.325,0.15) {6};
+  \node[hw label, below] at (7.475,0.15) {7};
+  \node[hw label, below] at (8.625,0.15) {8};
+  \node[hw label] at (4.6,-0.45) {$\times$ = load-use 气泡（停 1 拍），空心格 = 取指滞留};
+\end{pdfdiagram}
+\diagramnote{load-use 冒险的时空图（F=取指，D=译码，E=执行，M=访存，W=写回）。\code{mov eax, [rdi]} 的数据要到第 4 拍末才就绪，紧跟的 \code{add rsi, rax} 本应在第 4 拍就用 rax 做加法，差的一拍只能用气泡补上：加法滞留译码一拍、执行推迟到第 5 拍，操作数由 MEM 末到 EX 入口的转发（虚线）提供；后一条 \code{add rdi, 4} 随之在取指拍滞留一格。这正是下表第 4 拍“stall 或 EX 等待”一格的几何含义。}
+
+\begin{longtable}{L{0.12\linewidth}L{0.18\linewidth}L{0.18\linewidth}L{0.18\linewidth}L{0.18\linewidth}}
+\toprule
+周期 & \code{mov eax,[rdi]} & \code{add rsi,rax} & \code{add rdi,4} & \code{sub rcx,1} \\
+\midrule
+1 & IF &  &  &  \\
+2 & ID & IF &  &  \\
+3 & EX & ID & IF &  \\
+4 & MEM & stall 或 EX 等待 & IF 滞留 & （未取指） \\
+5 & WB & EX 使用转发值 & ID & IF \\
+\bottomrule
+\end{longtable}
+
+这张表要求回答三个问题：数据什么时候产生，下一条什么时候需要，是否有合法路径把新值送过去。若没有旁路网络，就必须插入停顿；若有从 MEM/WB 到 EX 的转发，控制器必须检测依赖并选择转发输入。否则程序在低速单周期模型中正确，在流水线模型中错误。
+
+\topic{案例：条件分支和预测错误怎样恢复}
+同一个循环的 \code{JNZ} 还能展示控制冒险。取指单元通常希望每周期都取下一条指令，但分支是否成立要等比较结果出来。若等到结果再取指，流水线会空等；若提前猜测，就可能取错路径。教学 CPU 可以先选择“遇到分支就停顿”，再讨论预测。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+策略 & 硬件动作 & 代价 \\
+\midrule
+停顿直到分支结果 & 分支进入 EX 前不继续提交后续路径 & 控制简单，循环每次损失周期 \\
+总是假设不跳 & 继续取顺序 PC，若实际跳转则冲刷 & 适合少跳分支，循环回边常错 \\
+总是假设跳转 & 提前取目标 PC，若实际不跳则冲刷 & 循环体内常较好，退出时错一次 \\
+动态预测 & 根据历史选择方向和目标 & 需要预测表、目标缓存和恢复机制 \\
+\bottomrule
+\end{longtable}
+
+预测错误恢复必须同时处理两类状态。第一，已经取到但不该执行的指令要被冲刷，不能写寄存器、内存或设备。第二，PC 要恢复到正确目标，取指从那里重新开始。若错误路径上有存储或 MMIO 写已经对外可见，就无法简单恢复；因此流水线通常要把真正对外可见的提交推迟到确认顺序正确之后。
+
+\begin{lstlisting}
+branch predicted not taken:
+  fetch sequential instruction
+  branch resolves taken
+  squash wrong-path instruction
+  PC = branch_target
+  restart fetch
+\end{lstlisting}
+
+\topic{案例：函数调用的完整栈帧 trace}
+再用一个更接近系统程序的例子。函数 \code{sum2(a,b)} 返回两个整数之和。调用者把参数放进 \code{edi}/\code{esi}，\code{call} 把返回地址压栈并跳转；被调用者用 \code{push} 保存需要保留的寄存器，计算结果放进 \code{eax}，\code{ret} 恢复 PC。
+
+\begin{lstlisting}
+caller:
+  mov edi, 7
+  mov esi, 5
+  call sum2
+  mov [RESULT], eax
+
+sum2:
+  push rbx
+  mov eax, edi
+  add eax, esi
+  pop rbx
+  ret
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+调用阶段 & 程序员可见状态变化 & 硬件边界 \\
+\midrule
+准备参数 & edi=7，esi=5 & MOV 写回寄存器，PC 顺序前进 \\
+CALL & 返回地址压栈，PC=sum2 入口 & 栈指针减小，返回地址写入栈顶，再写 PC \\
+建立栈帧 & push 保存 RBX，RSP 减小 & 栈指针减小，写数据到栈地址 \\
+计算返回值 & eax=edi+esi & ALU 加法，eax 写回 \\
+销毁栈帧 & pop 恢复 RBX，RSP 加回 & 读栈、栈指针加回、寄存器写回 \\
+RET & PC=返回地址 & 从栈顶读地址，写 PC \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}
+  % 内存条：高地址在上，每格 1.0cm 高
+  \node[hw label, anchor=east] at (-0.5,3.55) {高地址};
+  \node[hw label, anchor=east] at (-0.5,-0.05) {低地址};
+  \draw[hw bus, ->] (-0.2,3.1) -- (-0.2,0.4);
+  \node[hw memory, minimum width=3.8cm, minimum height=1.0cm] (f0) at (1.9,3.25) {调用者的数据区};
+  \node[hw memory, minimum width=3.8cm, minimum height=1.0cm] (f1) at (1.9,2.25) {返回地址（CALL 保存）};
+  \node[hw memory, minimum width=3.8cm, minimum height=1.0cm] (f2) at (1.9,1.25) {保存的 RBX（push 压入）};
+  \node[hw memory, minimum width=3.8cm, minimum height=1.0cm] (f3) at (1.9,0.25) {向下可继续增长};
+  % RSP 位置标注（指向内存条右边界的三条分界线）
+  \draw[hw bus] (4.6,2.75) node[right, hw label]{调用前的 RSP} -- (3.8,2.75);
+  \draw[hw bus] (4.6,1.75) node[right, hw label]{CALL 压入返回地址后} -- (3.8,1.75);
+  \draw[hw bus] (4.6,0.75) node[right, hw label]{push 后的 RSP（帧底）} -- (3.8,0.75);
+\end{pdfdiagram}
+\diagramnote{函数调用案例对应的栈帧内存布局。CALL 先把返回地址压入，RSP 下移一格；\code{sum2} 的序言用 push 把 RBX 保存到新帧里；尾声 pop 按相反顺序恢复，RSP 加回。RET 硬件只认“返回地址”这一格：若某条越界写改写了它，RET 就把被污染的值装进 PC，程序表现为“返回后失控”。}
+
+这个例子把“调用约定”和“硬件状态”联系在一起。若 RSP 初始化错误，第一条 push 就可能写坏数据区；若 CALL 压入返回地址的位置错误，RET 会跳到不可预测地址；若被调用者忘记恢复 RBX，调用者看到的 RBX 就被破坏。所谓 ABI 兼容，最终表现为这些寄存器、栈位置和 PC 更新都按同一约定执行。
+
+\topic{案例：异常插入到调用链中}
+若 \code{sum2} 内部执行加载时发生页错误或总线错误，异常入口必须知道故障发生在哪条指令、如何保存返回上下文、是否能恢复。简单裸机可能直接停机或点亮错误 LED；带操作系统的机器会把故障地址、错误码和当前 PC 保存到异常栈，再进入处理程序。
+
+\begin{longtable}{L{0.18\linewidth}L{0.42\linewidth}L{0.3\linewidth}}
+\toprule
+异常保存对象 & 为什么需要 & 恢复或诊断用途 \\
+\midrule
+故障 PC & 知道哪条指令失败 & 修复后重试，或报告故障位置 \\
+状态/标志 & 保留中断允许、条件码、特权状态 & 返回时恢复执行环境 \\
+通用寄存器 & 处理程序可能使用寄存器 & 避免破坏被打断程序 \\
+错误原因 & 页不存在、权限错误、总线超时等 & 选择缺页、杀进程、复位设备或停机 \\
+栈指针/特权栈 & 异常处理本身需要可靠栈 & 防止在坏用户栈上继续保存状态 \\
+\bottomrule
+\end{longtable}
+
+因此，异常处理是 CPU、栈、向量表、权限和内存映射共同定义的第二套控制流。
+
+\topic{案例：写回来源选错怎样定位到一根控制线}
+接下来两个调试案例都按五拍多周期模型叙述，拍号从 1 起记为 T1–T5，依次对应取指、译码、执行、访存、写回——这是§一 T0–T4 微操作序列的同一拆分，只是改从 1 起编号。
+
+第一个调试案例发生在多周期整机第一次跑通 ROM 程序时。现象是：前两条指令完全正确——\code{0x22F0} 执行后 \code{R1=0x00F0}，\code{0x7260} 执行后 \code{R1=0xF000}；第三条 \code{0x3450}=\code{MOV R2, [R1+4]} 执行后，\code{R2} 应当是 \code{MEM[0xF004]}（GPIO\_IN，按键未按下时读 0），实测却是 \code{0xF004}。随后 \code{JZ R2, +3} 因为 \code{R2} 非零总是顺序执行，表现为按键没有按下灯也亮。先把这个事实本身看清楚：\code{R2} 拿到的值恰好等于本条指令刚形成的访存地址。加载结果一般不会等于自己的地址，这个“巧合”就是第一根线索。
+
+定位沿着写回数据通路反向走。写回 mux 只有两个候选：ALUOut 和 MDR。\code{R2} 拿到 ALUOut，说明 \code{wb\_sel} 选错了来源；但在下结论之前，还要排除“访存本身就错了”的可能。单步重跑这条加载，逐拍观察：
+
+\begin{longtable}{L{0.18\linewidth}L{0.4\linewidth}L{0.3\linewidth}}
+\toprule
+检查步骤 & 观察结果 & 可以排除或锁定的范围 \\
+\midrule
+核对写回值与地址 & \code{R2=0xF004}，与 ALU 形成的地址相同 & 写回数据来自 ALU 通路，不是随机错误 \\
+单步查 MDR & \code{MDR=MEM[0xF004]=0}，读使能、地址均正确 & 访存路径正常，故障在 MDR 之后 \\
+查 \code{wb\_sel}（T4 访存拍） & 期望已切到“存储器”，实测仍为 ALU & 锁定到这一根选择线 \\
+回查控制字来源 & T3 地址形成把 \code{wb\_sel} 置为 ALU，T4 没有切换 & 控制字按拍切换缺失 \\
+\bottomrule
+\end{longtable}
+
+根因是控制字在访存拍没有切换到存储器来源：\code{wb\_sel} 在 T3 被“地址形成”这一拍置成 ALU（对地址加法本身无害，因为 T3 不写回），但控制器没有在 T4 把它改成“存储器”，于是 T5 写回拍沿用旧值，写回 mux 输出 ALUOut 而非 MDR。修复办法是把 \code{wb\_sel} 改为按（状态，opcode）译码：加载指令从 T4 起 \code{wb\_sel=} 存储器，T5 提交时写回 mux 自然输出 MDR。这个案例的方法比结论更重要：症状（寄存器值错）先归到路径（mux 输出错），再归到控制线（\code{wb\_sel}），最后归到控制字（某一拍的某一格）——每一环都可观察、可单步复核。调试控制器时，永远先问“这个错误值是数据通路上哪一个 mux 能产生的”，再问“谁在这一拍驱动它的选择线”。
+
+\topic{案例：PC 更新顺序错怎样让分支被撤销}
+第二个调试案例发生在同一台多周期整机上。先交代这台实现的一处结构差异：它不按指令类型跳过访存拍，每条指令都经过 T4，顺序 PC 也因此固定在 T4 提交。正确设计约定 PC 只在一条指令的最后一个状态（T5）由 \code{pc\_sel} 一次性提交；某次实现中，设计者让 \code{JZ} 在 T3 判零成立时就把目标写进 PC，理由是“早一拍跳转可以省时间”，同时又保留了所有指令在 T4 位置的“顺序 PC 提交”——\code{PC←PC\_seq}，其中 \code{PC\_seq} 在 T1 由 PC 加一锁存。两处改动各自看起来都合理，合在一起就出错了。
+
+现象要对照正确行为看。按键未按下时 \code{R2=0}，地址 3 的 \code{JZ R2, +3} 成立，目标为 $3+1+3=7$，正确机器跳过地址 4、5、6，执行 7、8、9 的灭灯路径；实测地址 4 的 \code{MOV R3, 1} 仍然执行——连续两轮按键采样里它提交了两次，而正确行为下第一轮它根本不该出现，地址 7 的 \code{MOV R3, 0} 则一次也没有出现，灯不随按键熄灭。单步观察 PC，问题立刻显形：
+
+\begin{longtable}{L{0.14\linewidth}L{0.1\linewidth}L{0.14\linewidth}L{0.5\linewidth}}
+\toprule
+时刻 & PC & IR & 说明 \\
+\midrule
+\code{JZ} 的 T1 末 & 3 & \code{0x5403} & 取指；\code{PC\_seq} 锁存为 $3+1=4$ \\
+\code{JZ} 的 T3 末 & 7 & \code{0x5403} & 判零成立，PC 被提前改写为目标 $3+1+3=7$ \\
+\code{JZ} 的 T4 末 & 4 & \code{0x5403} & 顺序提交 \code{PC←PC\_seq=4}，目标被覆盖 \\
+下一拍 T1 末 & 4 & \code{0x2601} & IR 装入地址 4 的 \code{MOV R3, 1}——本应被跳过 \\
+\bottomrule
+\end{longtable}
+
+根因是 PC 写使能的时机与指令提交边界重叠：同一条指令的生存期内 PC 被写了两次，T3 的分支写先发生，T4 的顺序提交后发生，后者覆盖前者，分支于是被静默撤销。这类错误尤其危险，因为它不产生任何异常、不停机、不点错误灯，只是“跳转偶尔不生效”，很容易被当成程序逻辑错误。修复办法是取消 T3 的直接写：分支目标在 T3 只装入 \code{pc\_next} 寄存器，PC 只在一条指令的最后一个状态写入一次，由 \code{pc\_sel} 在提交拍统一选择顺序值或目标。PC 是全机共享的状态，它在每一拍至多有一个写入者——这条纪律一旦破坏，分支、调用返回和异常入口会一起失去保证。
+
+\topic{专题：译码器怎样从指令字段产生控制线}
+指令不是被 CPU “理解”后才执行，而是字段被译码成一组控制选择。操作码决定大类，寄存器字段连接寄存器堆读写地址，立即数字段进入符号扩展或零扩展路径，功能字段进一步选择 ALU 操作。最小 CPU 的译码器可以是组合逻辑，也可以是 ROM/PLA 或微码入口，但它的产物都应体现为可检查的控制线。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+指令字段 & 进入的硬件路径 & 典型错误 \\
+\midrule
+\code{opcode} & 主控制器，决定 \code{mem_read/reg_write/pc_sel} 等 & 未定义 \code{opcode} 被当成合法指令执行 \\
+\code{rs/rt} & 寄存器堆读地址 & 字段位置接反导致读错源寄存器 \\
+\code{rd} & 寄存器堆写地址或写回 mux 的目标选择 & 存储或分支指令错误写寄存器 \\
+\code{imm} & 符号扩展、零扩展、左移、地址加法器 & 立即数扩展规则与 ISA 不一致 \\
+\code{funct} & ALU 控制的二级译码 & ADD/SUB/SLT 等同 \code{opcode} 下混淆 \\
+\bottomrule
+\end{longtable}
+
+译码必须明确非法指令策略。教学机器可以停机并点亮错误码；带异常的机器可以保存 PC 并进入非法指令入口；极简硬件也可以规定未定义 opcode 为 NOP，但这种做法会掩盖程序损坏。无论选择哪种策略，都不能让非法组合悄悄打开 \code{mem_write} 或跳到不可预测 PC。
+
+\topic{专题：多周期控制 FSM 的完整状态表}
+前面把一条指令拆成取指、译码、执行、访存、写回五拍，§一 用 T0–T4 的编号给出过加载指令的微操作序列，调试案例起已改记为 T1–T5（从 1 起编号）。本专题沿用 T1–T5，补齐所有指令的完整状态表。机制上只需记住三件事：控制器里有一个状态寄存器保存当前拍；每一拍输出的控制字由（状态，opcode）共同译出，而不是只随 opcode；每一拍末状态寄存器按“下一状态”规则前进，一条指令走完回到 T1。T4 只被加载、存储两条 \code{MOV} 使用，因为只有它们需要数据存储器事务；PC 只在 T5 提交一次，这正是前面 PC 更新顺序案例的修复原则写进状态表的样子。
+
+\begin{longtable}{L{0.1\linewidth}L{0.36\linewidth}L{0.28\linewidth}L{0.14\linewidth}}
+\toprule
+状态 & 本拍动作 & 控制线 & 下一状态 \\
+\midrule
+T1 取指 & \code{IR←MEM[PC]}；PC 本拍不改变 & \code{pc\_out=1}、\code{imem\_read=1}、\code{ir\_write=1} & T2（所有指令） \\
+T2 译码 & \code{A←R[a]}、\code{B←R[b]}；imm8/off4/off8 按指令扩展；按 opcode 预置后续控制字 & 读地址选择、\code{imm\_kind}；本拍无状态提交 & T3（所有指令） \\
+T3 执行 & \code{ADD}：\code{ALUOut←A+B}；\code{SHL}：\code{ALUOut←A<<imm4}；\code{MOV} 立即数：ALUOut 直送 imm8；加载/存储：\code{ALUOut←A+off4}；\code{JZ}：\code{Zero←(R[r]==0)}；\code{JMP}：备好目标 & \code{alu\_op}、\code{a\_sel}、\code{b\_sel} 按指令；\code{JZ} 时 \code{flags\_write=1} & 加载/存储→T4；其余→T5 \\
+T4 访存 & 加载：\code{MDR←MEM[ALUOut]}；存储：\code{MEM[ALUOut]←R[s]}；\code{ready=0} 时停留本拍 & 加载：\code{mem\_read=1}，\code{wb\_sel} 预选存储器；存储：\code{mem\_write=1}、\code{byte\_en} & T5 \\
+T5 写回 & 寄存器提交（仅 \code{ADD}、\code{MOV} 立即数、加载、\code{SHL}）；\code{PC←pc\_sel} 输出并提交 & \code{reg\_write} 按指令；\code{wb\_sel=} ALU 或存储器；\code{pc\_write=1} & T1（下一条） \\
+\bottomrule
+\end{longtable}
+
+从这张表可以直接读出哪些指令跳过 T4：\code{ADD}、\code{MOV} 立即数、\code{SHL}、\code{JZ}、\code{JMP} 五种非访存指令在 T3 之后由次态逻辑直接送往 T5，每条只占 4 拍；加载和存储占满 5 拍。同理，\code{JZ}、\code{JMP} 和存储在 T5 的 \code{reg\_write=0}，它们只提交 PC。次态逻辑因此有两个输入：当前状态和 opcode——T3 之后去 T4 还是 T5，正是靠 opcode 区分的唯一一处分叉。慢存储器也很好安放：\code{ready=0} 时次态保持 T4 不变，等待只拖住访存拍，不影响其他指令的其他拍。
+
+把这张表画成状态转移图，结构就是一条主链加一处分叉：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.9cm] (t1) at (0,0) {T1\\取指};
+  \node[hw state, minimum width=1.9cm] (t2) at (2.5,0) {T2\\译码};
+  \node[hw state, minimum width=1.9cm] (t3) at (5.0,0) {T3\\执行};
+  \node[hw state, minimum width=1.9cm] (t4) at (7.8,1.3) {T4\\访存};
+  \node[hw state, minimum width=1.9cm] (t5) at (7.8,-1.3) {T5\\写回};
+  % 公共主链
+  \draw[hw bus] (0.95,0) -- (1.55,0);
+  \node[hw label, above] at (1.25,0) {所有指令};
+  \draw[hw bus] (3.45,0) -- (4.05,0);
+  \node[hw label, above] at (3.75,0) {所有指令};
+  % T3 之后按 opcode 分叉
+  \draw[hw bus] (5.95,0) -- (6.4,0) -- (6.4,1.3) -- (6.85,1.3);
+  \node[hw label, rotate=90] at (6.15,0.65) {加载/存储};
+  \draw[hw bus] (5.0,-0.52) -- (5.0,-1.3) -- (6.85,-1.3);
+  \node[hw label, below] at (5.9,-1.3) {其余指令};
+  % T4 的 ready 等待自环
+  \draw[hw bus] (7.45,1.82) -- (7.45,2.45) -- (8.15,2.45) -- (8.15,1.82);
+  \node[hw label] at (7.8,2.7) {\code{ready=0} 停留本拍};
+  % T4 到 T5
+  \draw[hw bus] (7.8,0.78) -- (7.8,-0.78);
+  \node[hw label, anchor=west] at (7.95,0) {访存完成};
+  % T5 回 T1
+  \draw[hw bus] (7.8,-1.82) -- (7.8,-2.5) -- (0,-2.5) -- (0,-0.52);
+  \node[hw label, below] at (3.9,-2.5) {提交 PC，取下一条};
+\end{pdfdiagram}
+\diagramnote{多周期控制 FSM 的状态转移。T1→T2→T3 是所有指令的公共主链；T3 之后按 opcode 分叉是全机唯一一处分流——加载、存储去 T4 访存，其余五种指令直达 T5 写回，各占 4 拍。T4 上方的自环是慢存储器的等待：\code{ready=0} 时次态保持 T4 不变，只拖住访存拍。T5 提交寄存器与 PC 后回到 T1，开始下一条。}
+
+这张状态表同时是硬连线控制与微程序控制的交点。用硬连线实现，它是“状态触发器加次态组合逻辑再加输出译码”；用微程序实现，每一行就是一条微指令，“本拍动作”是微指令的数据通路字段，“下一状态”就是下一微地址字段，T3 之后的分叉对应一条按 opcode 选择微地址的条件微指令。数值与数据通路部分讨论微程序控制器时说过，微序列器每个周期只做一件事：按微地址取微指令、送出控制线、再按条件选下一微地址——本表就是那台微序列器在这台教学 CPU 上的全部表格内容。两种实现的差别只在规则写在哪里，每一拍该出现的控制线一根也不多、一根也不少。
+
+\topic{专题：scoreboard 和冒险检测的最小逻辑（选读）}流水线把多条指令重叠执行后，控制器必须知道“某个结果现在是否已经可用”。最简单的办法不是先设计复杂乱序执行，而是在流水级寄存器里保留目标寄存器号、是否写回、结果来自 ALU 还是存储器等信息，再由冒险检测逻辑比较当前指令的源寄存器。
+
+\begin{longtable}{L{0.18\linewidth}L{0.44\linewidth}L{0.28\linewidth}}
+\toprule
+冒险 & 检测条件 & 处理策略 \\
+\midrule
+ALU-ALU RAW & 前一条会写 \code{rd}，后一条读取同一寄存器 & 转发 EX/MEM 或 MEM/WB 结果 \\
+load-use & 加载的目标寄存器被下一条立即读取 & 停顿一拍，等待数据从存储阶段回来 \\
+存储数据 & 存储指令的写数据来自尚未写回的指令 & 转发到存储数据输入，或停顿 \\
+分支控制 & 分支结果尚未决定但后续指令已取入 & 冲刷流水线中错误路径指令 \\
+结构冲突 & 取指和访存争用同一存储端口 & 停顿，或分离指令/数据存储器 \\
+\bottomrule
+\end{longtable}
+
+最小冒险检测可写成硬件式条件，而不是口头描述。例如：
+\[
+\text{stall} = \text{IDEX.memRead}\land((\text{IDEX.rd}=\text{IFID.rs})\lor(\text{IDEX.rd}=\text{IFID.rt}))
+\]
+这表示当前处于执行级的加载指令还没有数据，而取指/译码级指令马上要读这个目标寄存器。停顿时 PC 和 IF/ID 不更新，ID/EX 注入 bubble，避免错误指令带着旧数据前进。
+
+\topic{专题：目标寄存器 pending 表——scoreboard 检测冒险的最小逻辑（选读）}
+上一专题把冒险检测写成布尔式，工程上更常用的最小结构是一张“目标寄存器 pending 表”：每个可写寄存器配一个触发器，置 1 表示“已有一条在途指令以它为目标、结果尚未提交”。规则只有两条：译码拍末，凡 \code{reg\_write=1} 的指令把自己的目标寄存器置位；写回拍末，对应位清除。译码拍内，把本指令的全部源寄存器号与 pending 表比对，任一为 1 就停顿——PC、IR 保持，指令滞留译码拍，且不做登记。比对时要按本章编码认清谁是源：\code{ADD}、\code{SHL} 是二操作数约定，d 字段既是目标也是源；存储 \code{MOV} 的 s 字段（写数据）是源；\code{JZ} 的 r 字段是源；\code{MOV} 立即数没有源寄存器。\code{R0} 固定为 0、永不作写目标，它的 pending 位恒为 0，比对可以直接省掉。
+
+下面用四条指令把这张表走一遍。约定五级流水（IF/ID/EX/MEM/WB）逐拍推进、无转发、写回在 WB 拍末提交、译码用当拍沿前的 pending 值比对；序列为 \code{MOV R2, [R1+4]}（I1）、\code{ADD R3, R2}（I2）、\code{MOV R4, 1}（I3）、\code{SHL R4, 4}（I4）：
+
+\begin{longtable}{L{0.09\linewidth}L{0.24\linewidth}L{0.24\linewidth}L{0.31\linewidth}}
+\toprule
+拍 & 译码拍内容 & pending 表事件 & 判定与动作 \\
+\midrule
+2 & I1 译码 & 源 R1 未置位 & 放行；拍末置 P2=1 \\
+3--5 & I2 译码 & 源 R2 的 P2=1 & 停顿三拍，滞留译码拍，不登记 \\
+5 末 & I1 写回 R2 & 清 P2=0 & I2 本拍仍见旧值，下一拍再比对 \\
+6 & I2 再次译码 & P2=0 & 放行；拍末置 P3=1 \\
+7 & I3 译码 & 无源寄存器 & 放行；拍末置 P4=1 \\
+8--10 & I4 译码 & 源 R4 的 P4=1 & 停顿三拍，待 I3 写回 \\
+10 末 & I3 写回 R4 & 清 P4=0 & I4 本拍仍见旧值 \\
+11 & I4 再次译码 & P4=0 & 放行；拍末再置 P4=1（\code{SHL} 的目标也是 R4） \\
+\bottomrule
+\end{longtable}
+
+这张表有两条边界约定必须写死。第一，置位与清除都发生在拍末（时钟沿），比对用拍内的当前值，所以写回当拍的目标寄存器仍算 pending——多停一拍是保守但安全的约定。第二，pending 表只回答“能不能走”，不回答“值是多少”：它维护提交顺序，不维护数据本身；想减少停顿，需要上一专题的转发网络把未提交的值直接送往 ALU 输入。意义在于规模：8 个触发器加几组比较器，就把“某个结果现在是否可用”变成可查表的硬件事实；上一专题 \code{IDEX.memRead} 那条布尔式只是这张表“只看最近一条在途指令”的特例。理解了 pending 表，后面再看记分牌调度、寄存器重命名时，认出的都是同一思想的更细版本。
+
+\topic{专题：同一条加载指令在三种 CPU 组织中的对照}
+为了避免“单周期、多周期、流水线”只停留在名词层面，可以用同一条 \code{MOV R1,[R2+4]} 对照三种组织。它们完成的语义相同：读 R2，加立即数形成地址，访问存储器，把数据写回 R1。区别在于资源是否复用、状态保存在哪里、关键路径由谁决定。
+
+\begin{longtable}{L{0.16\linewidth}L{0.42\linewidth}L{0.32\linewidth}}
+\toprule
+组织方式 & 加载指令的执行形态 & 主要代价 \\
+\midrule
+单周期 & 取指、译码、寄存器读、地址加法、存储读、写回全部在一拍完成 & 时钟周期被最慢指令拉长 \\
+多周期 & IF、ID、EX 地址形成、MEM、WB 分拍完成 & 控制状态机复杂，但硬件可复用 \\
+流水线 & 不同加载指令位于不同阶段，阶段间用寄存器隔开 & 需要处理冒险、冲刷和阶段平衡 \\
+\bottomrule
+\end{longtable}
+
+单周期设计最适合教学入门，因为一条指令的 trace 很直观；多周期设计更像早期现实 CPU 的控制方式，因为它允许慢步骤独占多个周期；流水线设计提高吞吐量，但不会让单条加载的物理工作消失。
+
+\topic{专题：控制器检查要同时覆盖正常路径和错误路径}
+CPU 设计是否扎实，不能只跑一段加法程序来判断。控制器必须面对非法 opcode、未对齐访问、慢存储器、分支冲刷、中断屏蔽、异常返回和复位。否则机器在正常程序上看似正确，一旦接入真实总线或设备就会暴露状态边界不清的问题。
+
+\begin{longtable}{L{0.2\linewidth}L{0.42\linewidth}L{0.28\linewidth}}
+\toprule
+场景 & 必须观察的状态 & 合格表现 \\
+\midrule
+非法 opcode & PC、IR、错误码或 halt 状态 & 不写内存，不错误提交寄存器 \\
+慢速加载 & 地址、\code{mem_read}、\code{ready}、MDR & 等待期间请求稳定，只提交一次 \\
+分支命中 & \code{IF/ID}、\code{ID/EX}、PC 选择 & 错误路径指令被冲刷 \\
+异常入口 & 故障 PC、状态寄存器、异常向量 & 可诊断、可恢复或明确停机 \\
+复位 & PC、寄存器堆、控制状态机 & 无旧控制线残留，第一条取指确定 \\
+\bottomrule
+\end{longtable}
+
+这一类检查会迫使实现者回答：哪个周期算提交？哪些控制线在等待时保持？错误路径是否会产生副作用？这些答案比“程序最后算出 42”更接近 CPU 工程。
+
+
+
+\section*{章末练习}
+
+答案必须同时说明控制线、数据路径和提交边界。
+
+\begin{longtable}{L{0.2\linewidth}L{0.48\linewidth}L{0.22\linewidth}}
+\toprule
+任务 & 要完成的产物 & 检查点 \\
+\midrule
+PC 取指 & 写出 PC、指令存储器、IR 和 \code{pc_write/ir_write} 的周期关系 & 能说明哪一拍保存指令 \\
+ADD trace & 为 \code{ADD R1,R2}（即 \code{R1=R1+R2}）列出读地址、ALU 操作、写回选择和写使能 & 写回只在目标时钟沿发生 \\
+加载 trace & 把加载指令拆成地址形成、存储读、MDR 保存、寄存器写回 & 能处理存储器未 ready \\
+存储 trace & 说明地址、写数据、字节使能、写控制和无寄存器写回 & 能区分 RAM 写和 MMIO 副作用 \\
+JZ trace & 说明 Zero 标志如何影响下一 PC & 分支目标和顺序 PC 选择明确 \\
+条件码比较 & 分别解释有符号小于和无符号小于使用哪些 ALU 标志 & 不把 Carry、Sign 和 Overflow 混用 \\
+CALL/RET trace & 把调用和返回拆成保存返回地址、更新栈指针、改写 PC 和恢复 PC & 能指出栈访问本质上是加载/存储事务 \\
+控制字 & 设计一个包含 \code{alu_op/wb_sel/reg_write/mem_read/mem_write/pc_sel} 的控制字 & 每一位能追到实际电路 \\
+微程序 & 为加载指令写出 5 个微步骤和等待状态处理 & 慢存储器只拖住访存阶段 \\
+流水线冒险 & 说明结构、数据、控制三类冒险各破坏什么边界 & 能提出停顿、转发或冲刷策略 \\
+SHL 微操作 & 为 \code{0x7260}=\code{SHL R1, 8} 写出 T1--T5 各拍的微操作、控制线与提交对象 & 不经过 T4，写回只在 T5 提交 \\
+三种组织拍数 & 统计 ROM 前三条（\code{0x22F0}、\code{0x7260}、\code{0x3450}）在单周期、五拍多周期、理想五级流水下各用多少拍 & 拍数与周期长度分开讨论 \\
+新增 SUB & 为 \code{SUB Rd, Rs}（\code{R[d]=R[d]-R[b]}）写控制字行和逐拍流程，说明数据通路是否要加新部件 & 复用既有 ALU 减法路径 \\
+cmp+jcc 配对 & 把 \code{JZ R2, +3} 改写成 x86-64 的 \code{test}/\code{jz} 两条指令，说明标志位在两条指令之间的角色 & 标志是前写后读的约定状态 \\
+CPI 演算 & 某程序动态执行 100 条指令：加载 20、存储 10、其余 70 条为 \code{ADD}/\code{MOV} 立即数/\code{SHL}/\code{JZ}/\code{JMP}；按多周期拍数求总拍数、CPI 与 100 MHz 时钟下的执行时间 & CPI 是动态混合的平均 \\
+pending 表读法 & 对 \code{MOV R2,[R1+4]}、\code{ADD R3,R2}、\code{MOV R4,1}、\code{SHL R4,4} 序列（五级流水、无转发、写回在 WB 拍末提交）写出 pending 表逐拍变化并标出停顿 & 置位在译码拍末、清除在写回拍末 \\
+\bottomrule
+\end{longtable}
+
+\section*{参考解答与要点}
+
+\begin{longtable}{L{0.18\linewidth}L{0.5\linewidth}L{0.22\linewidth}}
+\toprule
+任务 & 参考解答 & 必须保留的要点 \\
+\midrule
+PC 取指 & PC 输出取指地址，指令存储器返回编码，\code{ir_write} 在取指边界保存编码；下一 PC 可由 \code{pc+size}、分支目标或异常入口选择。 & PC 和 IR 都是状态元件。 \\
+ADD trace & 读端口选择 R1/R2，ALU 选择 ADD，写回 mux 选择 ALUOut，写地址为 R1，\code{reg_write=1} 只在写回边界有效。示例：\code{R1=5,R2=7} 时 \code{read\_a=5}、\code{read\_b=7}、\code{ALU\_out=12}，时钟沿 \code{R1<-12}、\code{PC=100->102}。 & 算对不等于写对。 \\
+加载 trace & EX 阶段形成地址，MEM 阶段发起读，目标未 ready 时保持地址和控制，响应后保存 MDR，WB 阶段写回目标寄存器。 & 等待不能污染其他状态。 \\
+存储 trace & 存储指令使用 ALU 形成地址，源寄存器提供写数据，打开字节使能和写控制，不打开寄存器写回。若地址命中 MMIO，副作用由设备规格决定。 & 存储是有副作用的事务。 \\
+JZ trace & 比较或 ALU 结果产生 Zero，控制器根据 Zero 选择顺序 PC 或分支目标；PC 只在提交边界更新。示例（本章 ROM 程序）：地址 3 的 \code{JZ +3} 在 \code{R2=0} 时 \code{PC=3+1+3=7}；同一指令在 \code{R2=1} 时顺序取地址 4。 & 条件输入必须在采样前稳定。 \\
+条件码比较 & 无符号小于看减法后的借位/Carry 约定（结果可能为正仍算小于）；有符号小于看 \code{Sign XOR Overflow}（如 \code{0x80-1}：$-128-1$ 的真值超出范围，结果为正 \code{0x7F} 但溢出位置 1，符号位经溢出修正后仍有符号小于成立）。相等判断只看 Zero。 & 标志必须绑定解释规则。 \\
+CALL/RET trace & CALL：返回地址先压栈保存（栈指针减小后写入栈顶），再 \code{PC=目标}；RET：从栈读回返回地址，恢复栈指针，\code{PC=返回地址}。栈访问本质就是加载/存储事务，栈指针是普通寄存器加约定。 & 调用链是事务序列，不是语法。 \\
+控制字 & 控制字字段应覆盖 PC、IR、寄存器堆、ALU、存储器和下一状态逻辑；任何字段没有连接对象都不是硬件控制。 & 控制字是电线集合，不是注释。 \\
+微程序 & 加载指令可写为取指、读寄存器、地址形成、访存等待、写回；访存未完成时微地址保持在等待状态，错误时跳异常入口。 & 微步骤提供清晰的观察点。 \\
+流水线冒险 & 结构冒险来自资源争用，数据冒险来自结果未写回，控制冒险来自下一 PC 尚未确定。停顿保护边界，转发减少等待，冲刷丢弃错误路径。 & 提高吞吐不能破坏提交顺序。 \\
+SHL 微操作 & T1：\code{IR←MEM[PC]}，取回 \code{0x7260}，\code{imem\_read/ir\_write=1}；T2：\code{A←R1=0x00F0}，imm4 读出 8；T3：\code{alu\_op=} 左移、\code{b\_sel=} imm4，\code{ALUOut←0x00F0<<8=0xF000}；跳过 T4；T5：\code{wb\_sel=} ALU、\code{reg\_write=1}，时钟沿 \code{R1←0xF000}、\code{PC←PC+1}。 & 非访存指令不走 T4。 \\
+三种组织拍数 & 单周期 3 拍：每条一拍，但周期长度按最慢的加载路径定。五拍多周期：\code{MOV} 立即数 4 拍、\code{SHL} 4 拍、\code{MOV} 加载 5 拍，共 $4+4+5=13$ 拍。理想五级流水（无冒险、每拍流入一条）：第 5 拍完成第一条，共 $3+5-1=7$ 拍。 & 比较组织要同时看拍数和周期长度。 \\
+新增 SUB & 控制字与 \code{ADD} 同行，仅 \code{alu\_op=SUB}：\code{a\_sel/b\_sel=} 寄存器、\code{wb\_sel=} ALU、\code{reg\_w=1}、\code{mem\_r/mem\_w=0}、\code{pc\_sel=} 顺序。流程同 \code{ADD}：T1 取指，T2 双读，T3 ALU 做减（B 取反加一），跳过 T4，T5 写回并 \code{PC+1}。数据通路不加新部件，译码真值表加一行即可。 & 新指令优先复用既有路径。 \\
+cmp+jcc 配对 & x86-64 写法：\code{test ecx, ecx}（或 \code{cmp ecx, 0}）按结果置 ZF，再由 \code{jz target} 读 ZF 决定是否跳转。标志寄存器是两条指令之间“前一条写、后一条读”的约定状态；教学 \code{JZ} 把比较与跳转内部化为一条。两者的偏移都相对下一条指令计算。 & 标志位必须绑定解释规则。 \\
+CPI 演算 & 总拍数 $20\times5+10\times5+70\times4=100+50+280=430$ 拍；$\mathrm{CPI}=430/100=4.3$；100 MHz 时钟下执行时间为 $430/10^{8}$ 秒 $=4.3\,\mu\mathrm{s}$。 & CPI 依赖指令混合，不是硬件常数。 \\
+pending 表读法 & 拍 2 I1 译码置 P2；拍 3--5 I2（读 R2）停顿三拍，拍 5 末 I1 写回清 P2，拍 6 I2 放行置 P3；拍 7 I3 译码置 P4；拍 8--10 I4（读 R4）停顿三拍，拍 10 末 I3 写回清 P4，拍 11 I4 放行并再置 P4。共停 6 拍，四条指令 14 拍完成；无冒险理想流水为 8 拍。 & 同拍比对用清除前的值。 \\
+\bottomrule
+\end{longtable}
+
+\begin{classicnote}
+最小 CPU 的经典读法是逐周期 trace。不要只画“PC 连到内存、ALU 连到寄存器”的框图；要写清楚每条指令在哪个周期读旧状态、在哪条组合路径上传播、在哪个时钟沿提交新状态。后续主存、总线、I/O 和经典芯片只是在这个 trace 外面继续增加事务边界。
+\end{classicnote}
+\begin{pdfdiagram}
+  \node[hw lane, minimum width=1.6cm] (a) at (0,0) {\shortstack{8-bit\\外部总线}};
+  \node[hw lane, minimum width=1.65cm] (b) at (2.2,0) {\shortstack{8086\\复用总线}};
+  \node[hw lane, minimum width=1.75cm] (c) at (4.55,0) {\shortstack{80386\\保护/分页}};
+  \node[hw lane, minimum width=1.75cm] (d) at (6.95,0) {\shortstack{486/Pentium\\cache/流水线}};
+  \node[hw lane, minimum width=1.7cm] (e) at (9.25,0) {\shortstack{SoC\\片上平台}};
+  \draw[hw bus] (a) -- (b);
+  \draw[hw bus] (b) -- (c);
+  \draw[hw bus] (c) -- (d);
+  \draw[hw bus] (d) -- (e);
+  \node[hw label, text width=9.4cm] at (4.65,-1.0) {演进主线不是“位宽越来越大”这么简单，而是地址形成、等待隐藏、异常诊断和外设事务逐步进入芯片内部。};
+\end{pdfdiagram}
+\diagramnote{经典芯片观察线索。每一代都把主存与总线章的事务边界移动、扩宽或缓存。}
+
+\section{二、早期微处理器：从 6502、Z80 到 8086}
+
+在 8086 之前，8-bit 微处理器已经把“CPU 加外部总线”这台戏完整演过一遍。6502、Z80 和 8051 各自回答了一个整机问题：寄存器太少怎么办，上下文切换和 DRAM 刷新如何省掉总线事务，整机部件能不能收进同一颗芯片。
+
+\topic{6502 用极少的寄存器和零页换取简单的数据通路}6502 的编程模型只有累加器 A、变址寄存器 X 和 Y、栈指针 SP、程序计数器 PC 和标志寄存器 P，没有一组可自由选用的通用寄存器；整颗芯片约 3500--4500 个晶体管，数据通路围绕累加器组织，没有乘除法指令。寄存器这样少，工作数据就必须经常放在存储器里，6502 的对策是把地址空间最低的第 0 页（\code{0x0000}--\code{0x00FF}）当作“伪寄存器堆”使用：零页寻址的指令只有 2 个字节，3 个时钟拍完成一次读写，比访问任意 16-bit 地址更短更快。栈则被硬件固定在第 1 页（\code{0x0100}--\code{0x01FF}），SP 因此只需保存 8-bit 页内偏移。数组处理依靠 \code{(zp),Y} 间接变址：从零页的一对字节取出 16-bit 基地址，再加上 Y 作为元素偏移，一次读用 5 拍，相加后若跨页再加 1 拍。
+
+\begin{longtable}{L{0.2\linewidth}L{0.12\linewidth}L{0.58\linewidth}}
+\toprule
+指令形式 & 拍数 & 对应的总线动作 \\
+\midrule
+LDA 立即数 & 2 & 取操作码，再把操作数字节直接读入 A \\
+LDA 零页 & 3 & 取操作码，取零页地址，从第 0 页读数据 \\
+LDA 绝对地址 & 4 & 取操作码，取 16-bit 地址的两个字节，再读数据 \\
+LDA \code{(zp),Y} & 5+1 & 取操作码，从零页读基地址两字节，加 Y 后读数据，跨页加 1 拍 \\
+STA \code{(zp),Y} & 6 & 取操作码，从零页读基地址两字节，加 Y 形成地址后写入，写比读多一拍 \\
+JMP 绝对地址 & 3 & 取操作码，取目标地址两个字节并装入 PC \\
+\bottomrule
+\end{longtable}
+
+每条指令的拍数不多而且可数，总线在每个时钟拍上完成一个确定动作，因此 6502 程序可以手工逐拍 trace（执行轨迹）：哪一拍取指、哪一拍读零页、哪一拍形成地址，全能数清楚。6502 的便宜正来自这种简单：没有乘除法，没有多通用寄存器，数据通路只围绕累加器，芯片面积和售价才可能压到最低。
+
+\topic{6502 的总线周期是每拍一次的确定事务}拍数表能手工 trace，前提是一条更硬的硬件事实：6502 的地址总线在每个时钟拍上都有一次确定动作——取操作码、取操作数、读零页、读数据或写数据，连内部运算不需要访问存储器的拍，也会做一次不改变结果的读。总线没有空闲拍，这是 6502 与后来把一条指令拆成若干段、段内还有空闲等待的设计最大的差别。一拍之内再分两相：时钟输入被整形为 $\phi_1$、$\phi_2$ 两相不交叠时钟，$\phi_1$ 期间 CPU 把新地址和读写方向送上总线，$\phi_2$ 期间传输数据——读周期由存储器驱动数据线，CPU 在 $\phi_2$ 结束前采样；写周期由 CPU 驱动数据线，存储器在 $\phi_2$ 窗口内写入。
+
+“存储器只要跟上每拍一事的速度”这句话可以算出来。以 1 MHz 主频为例，一拍 1000 ns，$\phi_2$ 高电平约占一半即 500 ns，再扣除数据建立时间约 100 ns，留给存储器的访问窗口约 400 ns 量级；当年的 2114 SRAM（约 250--450 ns）和 2716 EPROM（约 450 ns）正好在这个量级，不需要任何等待机制。而且访问速率均匀可预期——每拍一次、一拍不多一拍不少——显示电路甚至可以固定借用 $\phi_1$ 半拍读显存而不与 CPU 冲突，Apple II 一类机器正是这样共享存储器的。真正跟不上窗口的慢器件用 RDY 引脚解决：在 $\phi_1$ 期间把 RDY 拉低，CPU 就把当前这一拍延长，地址和读写控制保持不变，直到 RDY 释放。要注意 NMOS 6502 的 RDY 只对读周期有效，写周期照样按时完成；想让写周期也能暂停，得靠后来 65C02 的改进。
+
+以上一张表中的 LDA \code{(zp),Y} 为例，把 5 拍逐拍摊开，就能看到“每拍一事”的确切含义：
+
+\begin{longtable}{L{0.08\linewidth}L{0.2\linewidth}L{0.1\linewidth}L{0.5\linewidth}}
+\toprule
+拍 & 地址总线 & 读/写 & 本拍完成的动作 \\
+\midrule
+1 & PC & 读 & 取操作码 \code{0xB1}，PC 加一 \\
+2 & PC & 读 & 取零页指针 zp，PC 加一 \\
+3 & zp（第 0 页） & 读 & 读出基地址低字节 \\
+4 & zp+1（第 0 页） & 读 & 读出基地址高字节，同时低字节与 Y 相加 \\
+5 & 基址+Y & 读 & 读出数据装入 A；若加 Y 无进位，指令到此结束 \\
+\bottomrule
+\end{longtable}
+
+若低字节加 Y 产生进位，第 5 拍读到的是高字节尚未修正的旧地址数据，是一次无效读；第 6 拍用修正后的高字节重读，共 6 拍——这就是上一张表里“5+1”的来源。把无效读也留在总线上而不是干脆停一拍，正说明 6502 的控制逻辑按“每拍必有总线动作”组织：多一个确定的读，比加一套判断和停顿的控制便宜。
+
+\begin{waveform}[x=0.85cm,y=0.9cm]
+  % 拍边界参考虚线
+  \draw[BookRule, line width=0.45pt, dashed] (1,0.35) -- (1,8.05);
+  \draw[BookRule, line width=0.45pt, dashed] (3,0.35) -- (3,8.05);
+  \draw[BookRule, line width=0.45pt, dashed] (5,0.35) -- (5,8.05);
+  \draw[BookRule, line width=0.45pt, dashed] (7,0.35) -- (7,8.05);
+  \draw[BookRule, line width=0.45pt, dashed] (9,0.35) -- (9,8.05);
+  \draw[BookRule, line width=0.45pt, dashed] (11,0.35) -- (11,8.05);
+  % 拍编号
+  \node[hw label] at (2,8.3) {拍 1};
+  \node[hw label] at (4,8.3) {拍 2};
+  \node[hw label] at (6,8.3) {拍 3};
+  \node[hw label] at (8,8.3) {拍 4};
+  \node[hw label] at (10,8.3) {拍 5};
+  % ADDR — 每拍一个确定地址
+  \draw[BookTeal, line width=0.9pt] (1,7.2) rectangle (3,7.9);
+  \node at (2,7.55) {PC};
+  \draw[BookTeal, line width=0.9pt] (3,7.2) rectangle (5,7.9);
+  \node at (4,7.55) {PC};
+  \draw[BookTeal, line width=0.9pt] (5,7.2) rectangle (7,7.9);
+  \node at (6,7.55) {zp};
+  \draw[BookTeal, line width=0.9pt] (7,7.2) rectangle (9,7.9);
+  \node at (8,7.55) {zp+1};
+  \draw[BookTeal, line width=0.9pt] (9,7.2) rectangle (11,7.9);
+  \node at (10,7.55) {基址+Y};
+  \node[hw label, anchor=east] at (0.8,7.55) {ADDR};
+  % DATA — φ2 窗口内由存储器驱动，五拍全为读
+  \draw[BookTeal, line width=0.9pt] (1,4.6) rectangle (3,5.3);
+  \node at (2,4.95) {0xB1};
+  \draw[BookTeal, line width=0.9pt] (3,4.6) rectangle (5,5.3);
+  \node at (4,4.95) {指针 zp};
+  \draw[BookTeal, line width=0.9pt] (5,4.6) rectangle (7,5.3);
+  \node at (6,4.95) {基址低字节};
+  \draw[BookTeal, line width=0.9pt] (7,4.6) rectangle (9,5.3);
+  \node at (8,4.95) {高字节+Y};
+  \draw[BookTeal, line width=0.9pt] (9,4.6) rectangle (11,5.3);
+  \node at (10,4.95) {数据装入 A};
+  \node[hw label, anchor=east] at (0.8,4.95) {DATA};
+  % φ2 — 每拍后半相传输数据
+  \draw[BookAccent, line width=0.9pt] (1,2.6) -- (2,2.6) -- (2,3.3) -- (3,3.3) -- (3,2.6) -- (4,2.6) -- (4,3.3) -- (5,3.3) -- (5,2.6) -- (6,2.6) -- (6,3.3) -- (7,3.3) -- (7,2.6) -- (8,2.6) -- (8,3.3) -- (9,3.3) -- (9,2.6) -- (10,2.6) -- (10,3.3) -- (11,3.3);
+  \node[hw label, anchor=east] at (0.8,2.95) {$\phi_2$};
+  % RDY — 全程为高：无等待
+  \draw[BookAccent, line width=0.9pt] (1,1.5) -- (11,1.5);
+  \node[hw label, anchor=east] at (0.8,1.5) {RDY};
+  \node[hw label, fill=white, inner sep=1pt] at (6,0.95) {RDY 全程为高：无等待；$\phi_1$ 期间拉低则当前拍延长，地址与读写控制不变};
+\end{waveform}
+\diagramnote{LDA \code{(zp),Y} 的五拍总线时序：五拍全为读周期，每拍地址先送上总线，数据在 $\phi_2$ 窗口内由存储器驱动，CPU 在 $\phi_2$ 结束前采样。第 4 拍读基址高字节的同时，低字节与 Y 相加形成最终地址；RDY 全程为高，故没有任何等待拍。}
+
+\topic{Z80 用双寄存器组和取指刷新换取系统效率}Z80 在软件上与 8080 兼容，并在此之上做了几处扩展。最显眼的是寄存器组：主寄存器组 AF、BC、DE、HL 之外还有整套备用组 AF'、BC'、DE'、HL'，\code{EX AF,AF'} 与 \code{EXX} 各用一条指令即可完成现场交换。中断响应时不必把寄存器逐个压栈再逐个恢复，现场切换不发生任何存储器访问。第二个扩展与 DRAM 刷新有关：R 寄存器保存刷新行地址，在每个 M1 取指周期的后半段——此时指令字节已经读入、地址总线正好空闲——自动把 R 输出到地址总线上完成一次刷新，随后自动加一；刷新被“借”进取指周期，外部不再需要单独的刷新周期。此外，I 寄存器配合中断模式 2 提供向量页地址，IX、IY 变址寄存器扩展了寻址方式。
+
+\begin{longtable}{L{0.22\linewidth}L{0.4\linewidth}L{0.28\linewidth}}
+\toprule
+Z80 机制 & 硬件做法 & 换取的收益 \\
+\midrule
+主/备寄存器组 & AF/BC/DE/HL 与 AF'/BC'/DE'/HL'，\code{EX AF,AF'} 交换 AF 一对，\code{EXX} 交换 BC/DE/HL 三对 & 中断现场切换不访问存储器 \\
+R 寄存器 & M1 取指后半段输出刷新地址，随后自动加一 & DRAM 刷新不占额外总线周期 \\
+I 寄存器与中断模式 2 & I 提供向量页地址，设备提供页内偏移 & 中断入口可以成表组织 \\
+IX/IY 变址寄存器 & 变址基址加偏移形成有效地址 & 数据结构和栈帧访问更直接 \\
+\bottomrule
+\end{longtable}
+
+Z80 的设计有两条主线。第一，寄存器越多，上下文切换越少访问内存：一组备用寄存器换来的是中断响应里整段存储器往返的消失。第二，刷新是“借用已有事务”的设计：DRAM 刷新本来要占用专门的总线时间，Z80 把它塞进每个取指周期里必然出现的空闲半段，系统里就再也看不见它。
+
+\topic{Z80 的指令时序按 M 周期和 T 状态两层计数}6502 用一层计数就够了：一条指令几拍，每拍一次总线动作。Z80 用两层：一条指令先拆成若干机器周期（M 周期），每个 M 周期再含 3--6 个 T 状态。M1 永远是取指周期，固定 4 个 T 状态：T1 把 PC 送上地址总线，T2 用 MREQ、RD 读回操作码，T3、T4 把总线让给 R 寄存器做 DRAM 刷新，CPU 内部同时译码——上一段讲的“借取指周期刷新”，就发生在这两个 T 状态里。存储器读、写周期各 3 个 T 状态；I/O 读写周期固定插入一个等待，共 4 个 T 状态；慢器件还可以用 WAIT 引脚在 T2 与 T3 之间继续插入 Tw。
+
+用 LD A,(HL) 走一遍：它含 2 个 M 周期、共 7 个 T 状态——M1 取指 4T，M2 按 HL 指出的地址读存储器 3T。LD (HL),A 同样是 7T，差别只在 M2 的方向：CPU 从 T1 起驱动数据线，T2 中 WR 有效，存储器在写窗口内采样。按 4 MHz 主频折算，一个 T 状态 250 ns，7T 共 1.75 $\mu$s。
+
+\begin{longtable}{L{0.1\linewidth}L{0.16\linewidth}L{0.6\linewidth}}
+\toprule
+T 状态 & 所属 M 周期 & 总线动作（以 LD A,(HL) 为例） \\
+\midrule
+T1 & M1 & PC 送上地址总线 \\
+T2 & M1 & MREQ、RD 有效，读回操作码 \\
+T3 & M1 & 输出 R 寄存器刷新地址，CPU 内部开始译码 \\
+T4 & M1 & 刷新收尾，总线不传送指令数据 \\
+T5 & M2 & HL 送上地址总线 \\
+T6 & M2 & MREQ、RD 有效，存储器把数据放上线 \\
+T7 & M2 & CPU 采样数据装入 A，指令结束 \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}
+  % M 周期分组括线
+  \draw[BookMuted, line width=0.6pt] (0.03,0.95) -- (0.03,1.12) -- (5.97,1.12) -- (5.97,0.95);
+  \node[hw label] at (3,1.42) {M1 取指（4T）};
+  \draw[BookMuted, line width=0.6pt] (6.03,0.95) -- (6.03,1.12) -- (10.47,1.12) -- (10.47,0.95);
+  \node[hw label] at (8.25,1.42) {M2 存储器读（3T）};
+  % 7 个 T 状态条：T2/T6 是真正传数据的时段
+  \draw[BookTeal, line width=0.9pt] (0,0) rectangle (1.5,0.7);
+  \node at (0.75,0.35) {T1};
+  \draw[BookAccent, line width=0.9pt, fill=BookCodeBg] (1.5,0) rectangle (3,0.7);
+  \node at (2.25,0.35) {T2};
+  \draw[BookTeal, line width=0.9pt] (3,0) rectangle (4.5,0.7);
+  \node at (3.75,0.35) {T3};
+  \draw[BookTeal, line width=0.9pt] (4.5,0) rectangle (6,0.7);
+  \node at (5.25,0.35) {T4};
+  \draw[BookTeal, line width=0.9pt] (6,0) rectangle (7.5,0.7);
+  \node at (6.75,0.35) {T5};
+  \draw[BookAccent, line width=0.9pt, fill=BookCodeBg] (7.5,0) rectangle (9,0.7);
+  \node at (8.25,0.35) {T6};
+  \draw[BookTeal, line width=0.9pt] (9,0) rectangle (10.5,0.7);
+  \node at (9.75,0.35) {T7};
+  % 各 T 状态动作
+  \node[hw label, anchor=north, align=center] at (0.75,-0.08) {PC 送上\\地址总线};
+  \node[hw label, anchor=north, align=center] at (2.25,-0.08) {MREQ、RD\\读回操作码};
+  \node[hw label, anchor=north, align=center] at (3.75,-0.08) {输出刷新\\地址+译码};
+  \node[hw label, anchor=north, align=center] at (5.25,-0.08) {刷新收尾};
+  \node[hw label, anchor=north, align=center] at (6.75,-0.08) {HL 送上\\地址总线};
+  \node[hw label, anchor=north, align=center] at (8.25,-0.08) {MREQ、RD\\存储器驱动};
+  \node[hw label, anchor=north, align=center] at (9.75,-0.08) {采样\\装入 A};
+  \node[hw label] at (5.25,-1.62) {带底纹的 T2、T6 是总线真正传送指令或数据的时段；T3、T4 让给了刷新和内部译码};
+\end{pdfdiagram}
+\diagramnote{\code{LD A,(HL)} 的 M 周期结构：M1 取指固定 4 个 T 状态，其中 T3、T4 把地址总线让给 R 寄存器做 DRAM 刷新，CPU 内部同时译码；M2 存储器读 3 个 T 状态。7 个 T 状态里只有 T2、T6 真正在总线上传送指令或数据；按 4 MHz 折算每 T 250 ns，共 1.75 $\mu$s。}
+
+与 6502 对照时要注意数法不同。Z80 这 7 个 T 状态里，真正在传送指令或数据的只有 T2 和 T6 两段，T3、T4 让给了刷新和内部译码；6502 的 5 拍则每拍都在传数据。两种数法没有对错，但比较芯片时不能拿“7”和“5”直接相减：Z80 把刷新和内部事务显式编进时序，6502 把“每拍必做总线动作”做到底，省掉了这些状态。读 Z80 手册的时序图，要同时带 M 周期和 T 状态两把尺子；读 6502 手册，一把就够。
+
+\topic{8051 把一部分整机收进同一颗芯片}8051 是单片机：CPU、4--8 KiB ROM/EPROM、128--256 B 片内 RAM、4 个 8-bit 端口、2--3 个定时器、UART 和中断控制器全部在同一颗芯片内。片内 RAM 分区使用：最低 32 字节是 4 组工作寄存器 R0--R7，由程序状态字 PSW 的 RS0、RS1 两位选组，一条改选组的指令就完成一次快速上下文切换；\code{0x20}--\code{0x2F} 的 16 字节是位寻址区，其中 128 个 bit 可以单独寻址、置位和清零，标志位不必占用整个字节；其余部分是通用区。片内外设寄存器称为特殊功能寄存器（SFR），占用 \code{0x80}--\code{0xFF} 的直接地址。四个端口采用准双向结构：引脚锁存器先写入 1，该引脚才能作为输入被读取。
+
+把 ROM、RAM、地址译码、MMIO、定时器、串口和中断控制器收进一颗芯片之后，“总线”变成了片内连线，板级事务缩成片内信号，但语义没有改变——写 SFR 仍然是写设备寄存器，读端口仍然是 MMIO 读，定时器溢出仍然是一个中断事件。整机边界在这里第一次明显移动。
+
+8086 是理解早期 x86 体系的重要起点。它是 16-bit 微处理器，拥有 16-bit 通用寄存器和 16-bit 数据通路，同时通过 20-bit 地址能力访问最多 1 MiB 物理地址空间。它的历史意义不只在指令集，还在于展示了 CPU 芯片如何通过外部总线、地址锁存、控制信号和存储器/外设共同构成一台机器。
+
+8086 的寄存器组包括 AX、BX、CX、DX、SP、BP、SI、DI，以及 CS、DS、SS、ES 等段寄存器。段寄存器和偏移地址共同形成物理地址：
+
+\begin{lstlisting}
+physical_address = segment * 16 + offset
+\end{lstlisting}
+
+这个规则反映了一个时代的硬件取舍：内部仍以 16-bit 编程模型为主，但外部需要访问超过 64 KiB 的地址空间，于是通过段基址左移和偏移相加得到 20-bit 地址。分段是地址形成硬件的一部分。
+
+8086 的外部总线采用复用设计。地址线和数据线存在复用，某些引脚在总线周期的不同阶段承担不同含义。硬件需要地址锁存器在地址有效阶段保存地址，随后这些引脚可以用于数据传输。一次总线访问分阶段发生：输出地址、锁存地址、给出读写控制、等待存储器或 I/O 响应、传输数据、结束总线周期。
+
+\begin{longtable}{L{0.24\linewidth}L{0.58\linewidth}}
+\toprule
+8086 观察点 & 硬件含义 \\
+\midrule
+16-bit 寄存器 & 数据运算和编程模型以 16-bit 为核心 \\
+20-bit 地址形成 & 通过段寄存器和偏移访问 1 MiB 物理空间 \\
+地址/数据复用总线 & 芯片引脚有限，外部需要锁存和分阶段传输 \\
+存储器与 I/O 周期 & 访问目标由控制信号和地址空间规则区分 \\
+BIU/EU 分工 & 取指队列和执行部件可部分重叠工作 \\
+\bottomrule
+\end{longtable}
+
+8086 的典型板级连接还需要外部支持器件。地址/数据复用引脚在 T1 阶段输出地址，在后续阶段承载数据，因此常用地址锁存器保存低位地址；时钟、复位和 READY 同步可由时钟发生器组织；最大模式下，总线控制信号还可由总线控制器从状态信号译出。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+信号或器件 & 硬件作用 & 关键问题 \\
+\midrule
+ALE & 地址锁存允许，提示外部锁存低位地址 & 锁存器是否在地址有效窗口保存地址 \\
+AD0--AD15 & 复用地址/数据线 & 哪个阶段由 CPU 驱动，哪个阶段由存储器或 I/O 驱动 \\
+A16--A19/S3--S6 & 高位地址与状态复用 & 地址是否在访问开始阶段被正确保存 \\
+\code{RD}/\code{WR} & 读写控制 & 目标芯片输出使能和写使能是否互斥 \\
+M/IO & 区分存储器周期和 I/O 周期 & 地址译码是否把事务送到正确目标 \\
+READY & 外部目标请求插入等待状态 & 慢存储器是否能可靠延长总线周期 \\
+INTR/NMI & 可屏蔽和不可屏蔽中断入口 & 请求是否同步，响应和清除顺序是否明确 \\
+8284/8288 & 时钟/复位/READY 或总线控制辅助 & 外部控制信号是否满足时序和极性要求 \\
+\bottomrule
+\end{longtable}
+
+\topic{读总线周期要按 T 状态逐段读}上一张信号表说明了每个引脚负责什么，但还不够：同一个总线周期里，同一组引脚在不同时间段做不同的事。8086 把一次总线访问切成 T1、T2、T3、T4 四个状态，必要时在 T3 与 T4 之间插入等待状态 Tw。读手册的正确方式是逐状态确认：这一拍谁在驱动地址/数据引脚，哪个控制信号有效，外部芯片应在哪个边沿锁存或采样。
+
+\begin{longtable}{L{0.1\linewidth}L{0.28\linewidth}L{0.24\linewidth}L{0.28\linewidth}}
+\toprule
+T 状态 & 地址/数据引脚 & 控制信号 & 外部动作 \\
+\midrule
+T1 & CPU 在 AD0--AD15 和 A16--A19/S3--S6 上输出地址 & ALE 拉高 & 地址锁存器在 ALE 下降沿保存地址 \\
+T2 & 地址从复用脚撤出，引脚准备转入数据方向 & \code{RD}（读）或 \code{WR}（写）有效 & 数据收发器按读/写确定传输方向 \\
+T3 & 读周期中由目标芯片驱动数据线 & 控制保持，READY 为低则插入 Tw & 存储器或 I/O 把数据放到总线上，等待状态期间地址和控制保持不变 \\
+T4 & CPU 采样读入的数据，或结束写周期 & 控制信号撤销 & 目标释放数据线，总线周期结束 \\
+\bottomrule
+\end{longtable}
+
+写周期与读周期骨架相同，差别在数据方向：CPU 从 T2 起亲自驱动数据线，并保持到写窗口结束，目标芯片在写控制有效的窗口内采样数据。“读总线周期”读到最后，就是把每个 T 状态里谁驱动什么、谁采样什么写清楚。
+
+\begin{waveform}[x=0.75cm,y=0.9cm]
+  % T 状态带
+  \draw[BookTeal, line width=0.9pt] (0.5,7.9) rectangle (3.5,8.5);
+  \node at (2.0,8.2) {T1};
+  \draw[BookTeal, line width=0.9pt] (3.5,7.9) rectangle (6.5,8.5);
+  \node at (5.0,8.2) {T2};
+  \draw[BookTeal, line width=0.9pt] (6.5,7.9) rectangle (9.5,8.5);
+  \node at (8.0,8.2) {T3};
+  \draw[BookTeal, line width=0.9pt] (9.5,7.9) rectangle (12.5,8.5);
+  \node at (11.0,8.2) {T4};
+  % 参考虚线：2.5 ALE 下降沿，3.5/6.5/9.5 状态边界，10.5 采样点
+  \draw[BookRule, line width=0.45pt, dashed] (2.5,7.9) -- (2.5,1.5);
+  \draw[BookRule, line width=0.45pt, dashed] (3.5,7.9) -- (3.5,1.5);
+  \draw[BookRule, line width=0.45pt, dashed] (6.5,7.9) -- (6.5,1.5);
+  \draw[BookRule, line width=0.45pt, dashed] (9.5,7.9) -- (9.5,1.5);
+  \draw[BookRule, line width=0.45pt, dashed] (10.5,7.9) -- (10.5,1.5);
+  % A19-A16/S6-S3：T1 地址，其后转状态
+  \draw[BookTeal, line width=0.9pt] (0.5,6.6) rectangle (3.0,7.3);
+  \node at (1.75,6.95) {地址 A19--A16};
+  \draw[BookTeal, line width=0.9pt] (3.0,6.6) rectangle (12.5,7.3);
+  \node at (7.75,6.95) {状态 S6--S3};
+  \node[hw label, anchor=east, align=center] at (0.3,6.95) {A19--A16\\S6--S3};
+  % AD15-AD0：地址 → 高阻 → 目标驱动数据 → 高阻
+  \draw[BookTeal, line width=0.9pt] (0.5,5.2) rectangle (3.0,5.9);
+  \node at (1.75,5.55) {地址 A15--A0};
+  \draw[BookMuted, line width=0.65pt, dashed] (3.0,5.55) -- (5.0,5.55);
+  \node[hw label] at (4.0,5.95) {高阻};
+  \draw[BookTeal, line width=0.9pt] (5.0,5.2) rectangle (10.5,5.9);
+  \node at (7.75,5.55) {数据 D15--D0（目标驱动）};
+  \draw[BookMuted, line width=0.65pt, dashed] (10.5,5.55) -- (12.5,5.55);
+  \node[hw label] at (11.5,5.95) {高阻};
+  \node[hw label, anchor=east] at (0.3,5.55) {AD15--AD0};
+  % ALE：T1 内拉高，下降沿锁存地址
+  \draw[BookAccent, line width=0.9pt] (0.5,4.3) -- (2.5,4.3) -- (2.5,3.7) -- (12.5,3.7);
+  \node[hw label, anchor=east] at (0.3,4.0) {ALE};
+  % RD：T2 拉低，T4 采样后撤销
+  \draw[BookAccent, line width=0.9pt] (0.5,2.8) -- (3.5,2.8) -- (3.5,2.2) -- (10.5,2.2) -- (10.5,2.8) -- (12.5,2.8);
+  \node[hw label, anchor=east] at (0.3,2.5) {$\overline{RD}$};
+  % 底部标注（避开参考虚线：虚线止于 y=1.5）
+  \node[hw label] at (2.5,1.05) {ALE 下降沿锁存地址};
+  \node[hw label] at (10.5,1.05) {CPU 采样数据};
+  \node[hw label] at (6.5,0.5) {READY 为低时在 T3 与 T4 之间插入 Tw};
+\end{waveform}
+\diagramnote{8086 存储器读周期波形。T1 输出地址并拉高 ALE，地址锁存器在 ALE 下降沿保存地址；T2 复用脚转入数据方向，$\overline{RD}$ 拉低；T3 由目标芯片驱动数据线，READY 不满足则在 T3 与 T4 之间插入 Tw；T4 CPU 采样数据，控制信号撤销。同一组 AD 引脚在一个周期内先后是地址、高阻、数据——复用总线的每一拍都有唯一驱动者。}
+
+\topic{8086 的存储体选择是理解 16-bit 总线的关键}8086 有 16-bit 数据总线，但外部存储器常按 8-bit 芯片组织成偶地址低字节存储体和奇地址高字节存储体。地址最低位 A0 与高字节使能 $\overline{\mathrm{BHE}}$ 共同决定哪些字节参与本次传输。这样，16-bit 字访问在偶地址上可以一次完成；若字从奇地址开始，通常需要拆成两个总线周期。
+
+\begin{longtable}{L{0.14\linewidth}L{0.18\linewidth}L{0.28\linewidth}L{0.3\linewidth}}
+\toprule
+A0 & $\overline{\mathrm{BHE}}$ & 参与字节 & 典型含义 \\
+\midrule
+0 & 0 & D0--D7 与 D8--D15 & 偶地址 16-bit 字访问 \\
+0 & 1 & D0--D7 & 偶地址低字节访问 \\
+1 & 0 & D8--D15 & 奇地址字节访问 \\
+1 & 1 & 无有效字节 & 正常访问中不应作为有效传输 \\
+\bottomrule
+\end{longtable}
+
+这张表能解释为什么“16-bit CPU”不等于每次总线访问都简单搬 16 bit。存储芯片、地址译码器和数据收发器必须理解字节车道。若把两个 8-bit 存储体简单并在一起而不处理 A0 和 $\overline{\mathrm{BHE}}$，字节写入会破坏相邻数据，奇地址字访问也无法正确完成。两个存储体与 A0、$\overline{\mathrm{BHE}}$ 的连接，以及奇地址字的两个总线周期，如图所示。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.3cm] (cpu) at (0,0) {8086};
+  \node[hw memory, minimum width=2.7cm] (lo) at (6.3,0.85) {偶地址低字节体（A0 选）\\D0--D7};
+  \node[hw memory, minimum width=2.7cm] (hi) at (6.3,-0.85) {奇地址高字节体（$\overline{\mathrm{BHE}}$ 选）\\D8--D15};
+  % 数据车道
+  \draw[hw bus] (0.65,0.22) -- (2.5,0.22) -- (2.5,0.85) -- node[pos=0.7,above=1pt,hw label]{D0--D7} (lo.west);
+  \draw[hw bus] (0.65,-0.22) -- (2.2,-0.22) -- (2.2,-0.85) -- node[pos=0.7,below=1pt,hw label]{D8--D15} (hi.west);
+  % 选择线：A0 选低体（进 lo.north），BHE 选高体（进 hi.south）
+  \draw[BookTeal, line width=0.58pt] (cpu.south) -- (0,-2.35);
+  \draw[hw return] (0,-2.0) -- node[pos=0.5,above=1pt,hw label]{$\overline{\mathrm{BHE}}$ 选高体} (6.3,-2.0) -- (hi.south);
+  \draw[hw return] (0,-2.35) -- node[pos=0.35,below=1pt,hw label]{A0 选低体} (8.45,-2.35) -- (8.45,1.75) -- (6.3,1.75) -- (lo.north);
+  \fill[BookTeal] (0,-2.0) circle (0.05);
+  % 奇地址字访问：两个总线周期
+  \node[hw label] at (6.4,-2.68) {奇地址字访问拆成两个总线周期};
+  \draw[BookTeal, line width=0.9pt] (0,-3.7) rectangle (4.1,-2.9);
+  \node[hw label, align=center] at (2.05,-3.3) {周期 1：A0=1，$\overline{\mathrm{BHE}}$=0\\高体 D8--D15 传低字节};
+  \draw[BookTeal, line width=0.9pt] (4.5,-3.7) rectangle (8.6,-2.9);
+  \node[hw label, align=center] at (6.55,-3.3) {周期 2：A0=0，$\overline{\mathrm{BHE}}$=1\\低体 D0--D7 传高字节};
+  \node[hw label] at (4.3,-4.1) {先访问奇地址（高体），地址加一后再访问偶地址（低体）};
+\end{pdfdiagram}
+\diagramnote{8086 的字节存储体：偶地址字节在低体，接 D0--D7，由 A0=0 选中；奇地址字节在高体，接 D8--D15，由 $\overline{\mathrm{BHE}}$=0 选中。偶地址字访问两体同时选中，一个总线周期完成；奇地址字访问拆成两个周期：先 A0=1、$\overline{\mathrm{BHE}}$=0 经高体传字的低字节，地址加一后 A0=0、$\overline{\mathrm{BHE}}$=1 经低体传字的高字节。}
+
+\topic{最小模式、最大模式和外部控制器}8086 可以在最小模式下直接输出较多总线控制信号，也可以在最大模式下把状态信息交给外部总线控制器生成控制信号。前者适合单处理器小系统，后者便于接入更复杂的总线环境。这个差别说明，CPU 引脚不是固定地“表示某个概念”，它们会随系统模式承担不同职责。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+系统形态 & 典型外部对象 & 学习重点 \\
+\midrule
+最小模式 & 地址锁存器、数据收发器、ROM/RAM、简单 I/O & CPU 直接给出读写、方向、使能等控制 \\
+最大模式 & 8288 总线控制器、总线仲裁、协处理或多主设备 & 状态信号被外部控制器译成总线命令 \\
+8088 小系统 & 8-bit 外部数据总线、较低成本板级存储器 & 编程模型相近，外部总线带宽和周期不同 \\
+\bottomrule
+\end{longtable}
+
+一个 8086 存储器读周期可以按 T 状态走读。T1 中，CPU 把地址放到复用总线并拉出 ALE，外部锁存器保存地址；T2 中，CPU 改变总线方向并给出读控制；T3/Tw 中，存储器或 I/O 设备把数据放到数据线上，若 READY 不满足，CPU 插入等待状态；T4 中，CPU 采样数据并结束周期。总线上的每一段时间都必须有唯一驱动者和明确采样者。
+
+\begin{lstlisting}
+8086 memory read sketch:
+  T1: address valid, ALE latches address
+  T2: RD active, bus turns around for target data
+  T3: target drives data, READY may insert wait states
+  T4: CPU samples data, control deasserts
+\end{lstlisting}
+
+\begin{pdfdiagram}
+  \node[hw lane, minimum width=1.45cm] (t1) at (0,0) {\shortstack{T1\\地址}};
+  \node[hw lane, minimum width=1.55cm] (t2) at (2.1,0) {\shortstack{T2\\转向}};
+  \node[hw lane, minimum width=1.65cm] (tw) at (4.35,0) {\shortstack{T3/Tw\\等待}};
+  \node[hw lane, minimum width=1.45cm] (t4) at (6.65,0) {\shortstack{T4\\采样}};
+  \draw[hw bus] (t1) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{ALE 锁存} (t2);
+  \draw[hw bus] (t2) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{RD 有效} (tw);
+  \draw[hw return] (tw) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{READY} (t4);
+  \node[hw label, text width=2.6cm] at (0,-1.0) {CPU 驱动地址};
+  \node[hw label, text width=2.8cm] at (2.1,-1.0) {总线方向切换};
+  \node[hw label, text width=3.1cm] at (4.35,-1.0) {目标驱动数据};
+  \node[hw label, text width=2.8cm] at (6.65,-1.0) {CPU 采样数据};
+  \node[hw label, text width=9.3cm] at (3.35,-2.0) {复用总线不是一根线同时表示所有含义，而是在同一个读周期内按 T 状态依次承担地址、方向、数据和完成边界。};
+\end{pdfdiagram}
+\diagramnote{8086 存储器读周期。地址锁存、总线转向、等待和采样必须分阶段观察。}
+
+\topic{8086 写周期、中断响应和总线让出也要按事务读}读周期只说明目标驱动数据线；写周期则相反，CPU 在合适阶段驱动数据线，外部存储器或 I/O 设备在写控制有效窗口内采样。若数据收发器方向或写使能时序错误，写入可能丢失，也可能造成 CPU 和外设同时驱动总线。8086 的中断响应周期又是另一类事务：CPU 不访问普通内存数据，而是响应中断控制器，取得中断类型或进入规定入口。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+事务 & 总线动作 & 观察重点 \\
+\midrule
+存储器写 & 地址先被锁存，CPU 驱动数据，\code{WR} 有效，目标采样 & 数据方向、字节存储体和写窗口 \\
+I/O 写 & 地址或端口号选择外设寄存器，CPU 驱动命令或数据 & M/IO 或 I/O 周期控制、端口译码 \\
+中断响应 & CPU 接受 INTR 后执行响应周期，中断控制器给出类型或向量信息 & 请求保持、优先级、响应和屏蔽状态 \\
+DMA 让总线 & DMA 请求总线，CPU 完成当前边界后让出，总线主控权转移 & HOLD/HLDA 类握手、三态释放、仲裁 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+8086 memory write sketch:
+  T1: address valid, ALE latches address
+  T2: CPU drives write data, WR becomes active
+  T3: target samples data, READY may insert wait states
+  T4: WR deasserts, bus returns to idle or next cycle
+\end{lstlisting}
+
+这组事务可以直接指导早期微机板级排错。若读 ROM 正常、写 RAM 失败，应重点查数据收发器方向、\code{WR} 极性、字节存储体选择和 SRAM 写入时间；若外设中断不进入，应同时查外设请求、8259 屏蔽位、CPU 中断允许状态和中断响应周期；若 DMA 后内存内容异常，应查总线让出时 CPU 是否真正三态、DMA 地址计数是否正确、目标存储器是否满足时序。
+
+\topic{一次 INTR 从请求到进入服务程序要走完整条硬件链}前面把中断响应当作“另一类总线事务”提了一句，这里把链条走完。8086 的可屏蔽中断从一根 INTR 引脚开始：外设请求经 8259A 中断控制器判优、查屏蔽后拉高 INTR；CPU 在每条指令结束的边界采样 INTR，FLAGS 中的 IF 位为 0 就继续顺序执行，为 1 才响应。响应先跑两个背靠背的 INTA 总线周期：第一个 INTA 通知 8259A 冻结优先级状态，第二个 INTA 由 8259A 把 8-bit 中断类型号驱动到数据总线低 8 位，CPU 读入。最大模式下，CPU 还会在两个 INTA 之间保持总线锁定，防止仲裁器在响应中途把总线让给别的主设备。
+
+拿到类型号之后的动作全由硬件完成：类型号乘 4 得到中断向量表内偏移——向量表固定在物理地址 \code{0x00000}--\code{0x003FF}，共 256 项、每项 4 字节（偏移 2 字节加段基址 2 字节），恰好 1 KiB。CPU 先把 FLAGS 压栈并清 IF、TF，再依次压栈 CS、IP，然后从表项读出新 IP 和新 CS，转向服务程序第一条指令；IRET 逆序弹出 IP、CS、FLAGS，现场复原。整条链的开销也能数出来：2 个 INTA 总线周期、3 次压栈写、2 次向量表读，共 7 个总线周期，每个至少 4 个 T 状态，合计 28 个 T 状态往上——手册把一次 INTR 的完整响应记为 61 个时钟拍，多出来的部分是 CPU 内部的微码步。
+
+\begin{longtable}{L{0.08\linewidth}L{0.46\linewidth}L{0.34\linewidth}}
+\toprule
+步骤 & 硬件动作 & 关键问题 \\
+\midrule
+1 & 外设拉高请求，8259A 判优、查屏蔽后拉高 INTR & 请求要一直保持到被响应 \\
+2 & CPU 在指令边界采样 INTR，IF 为 0 则不理会 & 采样点只在指令之间，不在指令中间 \\
+3 & 第一个 INTA 总线周期：8259A 冻结优先级状态 & 期间不响应新的同级请求 \\
+4 & 第二个 INTA 总线周期：8259A 送出 8-bit 类型号 & 类型号由控制器给出，不是 CPU 推算的 \\
+5 & FLAGS 压栈，清 IF、TF，CS、IP 依次压栈 & 清 IF 后同级 INTR 被屏蔽，防止嵌套失控 \\
+6 & 类型号乘 4，从 \code{0x00000} 起读新 IP、新 CS & 表项错位 1 字节就会跳到错误入口 \\
+7 & 从新 CS:IP 取指，进入服务程序 & 预取队列作废重填，计入响应代价 \\
+\bottomrule
+\end{longtable}
+
+IF 是 INTR 的总开关：CLI 清 IF，STI 置 IF，且 STI 的效果要推迟一条指令才生效——这样 STI 紧跟 IRET 的收尾序列不会在中途再被打断。NMI 则完全不受 IF 控制，不经过 INTA 周期，类型号由 CPU 内部固定为 2，边沿触发，留给掉电告警、存储器奇偶错这类“不许被软件关掉”的事件。把三者并排看就清楚：INTR 是可商量的外部请求，NMI 是不可拒绝的硬件告警，软件 INT 是程序主动调用同一套向量机制——它们共用同一张向量表和同一套压栈序列，差别只在入口从哪里来。
+
+\begin{waveform}[x=0.65cm,y=0.85cm]
+  % 事务边界参考虚线
+  \draw[BookRule, line width=0.45pt, dashed] (1,1.6) -- (1,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (2.8,1.6) -- (2.8,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (4.6,1.6) -- (4.6,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (6.4,1.6) -- (6.4,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (8.2,1.6) -- (8.2,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (10,1.6) -- (10,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (11.8,1.6) -- (11.8,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (13.6,1.6) -- (13.6,6.4);
+  \draw[BookRule, line width=0.45pt, dashed] (15.4,1.6) -- (15.4,6.4);
+  % 分组标注
+  \node[hw label] at (2.8,6.72) {两个 INTA 周期};
+  \node[hw label] at (7.3,6.72) {FLAGS、CS、IP 依次压栈};
+  \node[hw label] at (11.8,6.72) {类型号乘 4 查向量表};
+  \node[hw label] at (14.5,6.72) {目标取指};
+  % 总线事务条
+  \draw[BookTeal, line width=0.9pt] (1,5.5) rectangle (2.8,6.2);
+  \node at (1.9,5.85) {INTA ①};
+  \draw[BookTeal, line width=0.9pt] (2.8,5.5) rectangle (4.6,6.2);
+  \node at (3.7,5.85) {INTA ②};
+  \draw[BookTeal, line width=0.9pt] (4.6,5.5) rectangle (6.4,6.2);
+  \node at (5.5,5.85) {FLAGS};
+  \draw[BookTeal, line width=0.9pt] (6.4,5.5) rectangle (8.2,6.2);
+  \node at (7.3,5.85) {CS};
+  \draw[BookTeal, line width=0.9pt] (8.2,5.5) rectangle (10,6.2);
+  \node at (9.1,5.85) {IP};
+  \draw[BookTeal, line width=0.9pt] (10,5.5) rectangle (11.8,6.2);
+  \node at (10.9,5.85) {读新 IP};
+  \draw[BookTeal, line width=0.9pt] (11.8,5.5) rectangle (13.6,6.2);
+  \node at (12.7,5.85) {读新 CS};
+  \draw[BookTeal, line width=0.9pt] (13.6,5.5) rectangle (15.4,6.2);
+  \node at (14.5,5.85) {取指};
+  \node[hw label, anchor=east] at (0.8,5.85) {总线事务};
+  % INTA 信号：两个周期内低有效
+  \draw[BookAccent, line width=0.9pt] (1,4.0) -- (4.6,4.0) -- (4.6,4.7) -- (15.4,4.7);
+  \node[hw label, anchor=east] at (0.8,4.35) {$\overline{\mathrm{INTA}}$};
+  \node[hw label, fill=white, inner sep=1pt] at (1.9,3.62) {冻结优先级};
+  \node[hw label, fill=white, inner sep=1pt] at (3.7,3.62) {送出类型号};
+  % D0--D7：仅第二个 INTA 由 8259A 驱动类型号，其余高阻
+  \draw[BookMuted, line width=0.65pt, dashed] (1,2.55) -- (2.8,2.55);
+  \draw[BookMuted, line width=0.65pt, dashed] (4.6,2.55) -- (15.4,2.55);
+  \draw[BookTeal, line width=0.9pt] (2.8,2.2) rectangle (4.6,2.9);
+  \node at (3.7,2.55) {类型号};
+  \node[hw label, anchor=east] at (0.8,2.55) {D0--D7};
+  \node[hw label, fill=white, inner sep=1pt] at (1.9,3.0) {高阻};
+  \node[hw label, fill=white, inner sep=1pt] at (6.4,3.0) {高阻};
+\end{waveform}
+\diagramnote{INTR 响应的总线事务序列：两个背靠背的 INTA 周期——第一个通知 8259A 冻结优先级状态，第二个由 8259A 把 8-bit 类型号驱动到 D0--D7，CPU 读入；随后 FLAGS、CS、IP 依次压栈，再按类型号乘 4 从 \code{0x00000} 起的向量表读出新 IP、新 CS。连同目标取指共 7 个总线周期、28 个 T 状态以上。}
+
+8086 内部常被划分为总线接口单元和执行单元。总线接口单元负责取指、形成物理地址、访问外部总线，并维护预取队列；执行单元负责译码和执行指令。这个分工说明，即使没有现代深流水，CPU 内部也已经在尝试把“取指访问外部世界”和“执行内部运算”分开，以减少外部存储访问时延对执行的影响。
+
+8086 是一个更复杂的同步系统：PC 在 x86 语境中体现为指令指针和代码段组合；地址形成部件把段和偏移送入加法路径；总线接口把地址和控制信号变成外部事务；执行部件译码指令并驱动寄存器、ALU 和标志位。
+
+8086 还说明“低时延”在早期处理器中已经是系统问题。预取队列试图在执行部件工作时提前从外部总线取回后续指令，减少执行部件等待取指的时间。这个机制不等于现代流水线和分支预测，但思想相通：把慢的外部访问与内部执行尽量重叠。若分支改变控制流，预取队列中已经取得的顺序指令可能失效；若外部总线慢于指令消费速度，执行部件仍会等待。
+
+\topic{预取队列把取指和执行第一次重叠起来}8086 内部的总线接口单元（BIU）和执行单元（EU）各管一摊：EU 译码执行，BIU 管段地址加法、外部总线事务，还维护一个 6 字节的指令预取队列。规则很朴素：EU 从队列头取指令字节；只要队列空出至少 2 个字节且总线空闲，BIU 就主动发起一次 16-bit 取指总线周期，把顺序的后续两个字节补进队列尾。顺序执行时，取指被藏进 EU 的执行时间里——EU 执行一条多拍指令（比如乘法或带存储器操作数的指令）期间，BIU 已经把它后面的指令取好，EU 拿下一字节几乎不等待。这就是“执行与取指重叠”，是后来流水线最直接的雏形：没有预测，没有译码并行，只是把“去外面取指令”这件慢事和“在里面算”这件快事在时间轴上错开。
+
+代价集中在控制流改变时。JMP、CALL、RET、中断都会使队列里已预取的顺序字节作废：BIU 清空队列，从目标地址重新预取，EU 在第一个目标字节到手之前只能等待。这笔账可以算：队列 6 字节，一次对齐的 16-bit 取指总线周期补 2 字节、占 4 个 T 状态，把队列补满要 3 个总线周期即 12 个 T 状态；按 PC/XT 的 4.77 MHz 折算约 2.5 $\mu$s，比不少顺序指令本身还长。所以 8086 热路径上紧挨着的跳转有真实的硬件成本，来自队列重填时间。
+
+\begin{longtable}{L{0.16\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+观察点 & 顺序执行 & 跳转之后 \\
+\midrule
+队列内容 & 始终是当前 IP 之后的顺序字节 & 全部作废，从目标地址重填 \\
+BIU 总线动作 & 总线空闲即补 2 字节，队列维持接近满 & 先取目标首字节，再连续预取补满 \\
+EU 等待 & 几乎不等待，取指藏在执行中 & 等到第一个目标字节到手才能继续 \\
+重填代价 & 无 & 6 字节约 3 个总线周期、12 个 T 状态 \\
+\bottomrule
+\end{longtable}
+
+8088 把同一机制缩到 4 字节队列、每次只预取 1 字节，因为它的外部数据总线只有 8 bit；这也意味着 8088 的队列更容易见底，同样主频下更怕跳转。这条 6 字节队列留下的教训一直有效：取指带宽、译码带宽和执行带宽要配平，任何一端长期供不上，另一端就会空等。
+
+\begin{pdfdiagram}[x=0.72cm,y=0.34cm]
+  % 水位刻度参考线
+  \draw[BookRule, line width=0.4pt, dashed] (0,2) -- (13.4,2);
+  \draw[BookRule, line width=0.4pt, dashed] (0,4) -- (13.4,4);
+  \draw[BookRule, line width=0.4pt, dashed] (0,6) -- (13.4,6);
+  \node[hw label, anchor=east] at (-0.15,0) {0};
+  \node[hw label, anchor=east] at (-0.15,2) {2};
+  \node[hw label, anchor=east] at (-0.15,4) {4};
+  \node[hw label, anchor=east] at (-0.15,6) {6};
+  \node[hw label, anchor=east] at (-0.15,7.4) {队列字节数};
+  % 水位线：顺序执行 6→4→6→4→6，JMP 作废归零，再三次补充回满
+  \draw[BookAccent, line width=0.95pt] (0,6) -- (1,6) -- (1,4) -- (3,4) -- (3,6) -- (4,6) -- (4,4) -- (6,4) -- (6,6) -- (6.5,6) -- (6.5,0) -- (8.5,0) -- (8.5,2) -- (10.5,2) -- (10.5,4) -- (12.5,4) -- (12.5,6) -- (13.2,6);
+  % 顺序执行区标注
+  \node[hw label] at (3.25,7.4) {顺序执行：EU 取字节，BIU 见空补 2 字节};
+  \node[hw label, anchor=east, fill=white, inner sep=1pt] at (0.95,5) {EU 取 2 字节};
+  \node[hw label, anchor=west, fill=white, inner sep=1pt] at (3.1,3.4) {BIU 补 2 字节};
+  % 跳转点
+  \draw[BookRed, line width=0.6pt, dashed] (6.5,0) -- (6.5,7.0);
+  \node[hw label, text=BookRed, anchor=west, fill=white, inner sep=1pt] at (6.65,6.7) {JMP：队列作废};
+  % 重填区标注
+  \node[hw label] at (10.85,7.4) {重填：3 个总线周期、12 个 T 状态};
+  % EU 等待区间
+  \draw[BookRed, line width=0.6pt, <->] (6.5,-1.6) -- (8.5,-1.6);
+  \node[hw label, text=BookRed, anchor=north] at (7.5,-1.8) {EU 等待目标首字节};
+  % 时间轴
+  \draw[line width=0.55pt, -{Stealth}] (0,0) -- (13.6,0);
+  \node[hw label, anchor=north] at (13.6,-0.15) {时间};
+\end{pdfdiagram}
+\diagramnote{8086 预取队列的水位变化：顺序执行时 EU 从队头取字节，队列空出至少 2 字节且总线空闲，BIU 就发起一次 16-bit 取指补进 2 字节，水位维持在接近满；跳转到来时已预取的顺序字节全部作废，从目标地址重填 6 字节要 3 个总线周期、12 个 T 状态（4.77 MHz 下约 2.5 $\mu$s），EU 在第一个目标字节到手之前只能等待。}
+
+\begin{chipcase}
+围绕 8086/8088 的经典外围芯片同样值得提前认识。8255 可编程并行接口把若干引脚组织成可配置 I/O 口；8253/8254 定时器提供周期性计数和中断来源；8259 中断控制器把多个外设请求汇总给 CPU；8237 DMA 控制器让设备和内存之间进行批量搬运；8250/16450/16550 UART 把串行线上的位流转换为 CPU 可读写的寄存器和 FIFO。它们共同说明，整机是一组围绕地址、数据、控制和完成事件协作的芯片。
+\end{chipcase}
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+经典芯片 & 解决的问题 & 与本章主题的连接 \\
+\midrule
+8255 PPI & 把并行引脚配置成输入、输出或握手端口 & GPIO 和设备寄存器的早期形态 \\
+8253/8254 PIT & 用计数器产生周期、延时和中断节拍 & 定时器寄存器与完成事件 \\
+8259 PIC & 汇总、屏蔽和优先级排序中断请求 & 中断控制器和 CPU 入口 \\
+8237 DMA & 在设备和内存之间搬运数据 & 总线主设备、仲裁和 cache 可见性 \\
+8250/16550 UART & 串行收发、状态位和 FIFO & 设备状态、数据寄存器和中断通知 \\
+\bottomrule
+\end{longtable}
+
+\topic{8088/8086 最小系统可以按模块逐步实现}若要把 8086 类系统搭成现实电路，不应从“跑 DOS”开始，而应从最小可运行系统开始。8088 常用于教学，因为外部数据总线为 8 bit，存储器接口更容易搭建；8086 则保留 16-bit 外部数据总线，需要同时处理奇偶字节存储体。无论选择哪一种，系统都要包括时钟/复位、地址锁存、数据收发、ROM、RAM、I/O 译码和至少一个可观察外设。
+
+\begin{longtable}{L{0.2\linewidth}L{0.32\linewidth}L{0.38\linewidth}}
+\toprule
+模块 & 典型器件或做法 & 第一轮检查 \\
+\midrule
+时钟/复位 & 8284 或等价时钟复位电路 & 复位保持期间写控制无效，释放后第一拍地址可预测 \\
+地址锁存 & 74LS373/8282 锁存 AD 线上低位地址 & ALE 有效窗口内保存地址，数据阶段地址不丢失 \\
+数据收发 & 74LS245/8286 控制数据方向 & 读周期外设驱动，写周期 CPU 驱动，不发生总线争用 \\
+启动 ROM & EPROM/Flash 映射到复位入口 & 复位入口读出跳转或初始化代码 \\
+SRAM & 静态 RAM 与字节使能/写使能连接 & 写一个地址后再读回同一数据，邻近字节不变 \\
+I/O 译码 & 74LS138、比较器或 PAL/GAL & 8255、8253、8259、UART 等端口互不重叠 \\
+可观察外设 & LED 锁存器、按键、串口或逻辑分析仪探针 & CPU 写端口后能看到确定副作用 \\
+\bottomrule
+\end{longtable}
+
+这样的系统可以分三步 bring-up。第一步只让 CPU 从 ROM 取指，确认复位入口、地址锁存和读周期成立；第二步加入 SRAM，执行一个写后读回的小程序，确认写周期、数据方向和等待状态成立；第三步加入 8255 或简单 LED 锁存器，确认 I/O 周期、端口译码和外设副作用成立。每一步都应记录地址线、ALE、读写控制、数据总线方向和目标片选。若第一步没有通过，后续软件调试没有意义。
+
+\topic{等待状态发生器是慢器件和 CPU 之间的约定}8086/8088 的 READY 信号把固定周期总线变成可延长事务。慢 ROM、慢 SRAM、外设端口或板级译码较深时，目标可以通过 READY 让 CPU 插入等待状态。等待状态是总线周期中的硬件暂停：地址、控制和方向必须保持可解释，目标在满足访问时间后再允许 CPU 采样或结束写周期。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+对象 & READY/等待的作用 & 关键问题 \\
+\midrule
+慢 ROM & 延长取指或读常量周期 & 等待期间地址和片选是否保持稳定 \\
+慢 SRAM & 延长数据读写窗口 & 写周期中数据是否覆盖完整写入窗口 \\
+I/O 外设 & 给外设状态机足够时间返回数据 & 外设未就绪时 CPU 是否错误采样浮空总线 \\
+DMA/仲裁 & 让总线所有权变化落在安全边界 & CPU 是否在让总线前完成当前事务 \\
+\bottomrule
+\end{longtable}
+
+一个简单等待状态发生器可以由地址译码、访问类型和计数器组成：快 SRAM 区域不插等待，慢 ROM 区域插入一个等待，外设区域插入两个等待或等待外设 ACK。正式规格应说明等待的最大长度和超时行为。否则一个坏外设可能永久拉住 CPU，使整机看起来像死机。
+
+\topic{PC/XT 到 PC/AT 是早期整机平台案例}8088、8086、80286 这些处理器进入实际计算机后，通常不会单独出现。以 PC/XT、PC/AT 风格的平台为例，CPU 周围有启动 ROM、DRAM、DMA 控制器、中断控制器、定时器、键盘控制、串口、并口、显示适配器和扩展总线。它们共同定义了“软件看到的机器”。因此，理解这类平台时，不能只问 CPU 支持哪些指令，还要问端口地址怎样分配、中断线怎样汇总、DMA 通道怎样仲裁、启动 ROM 映射在哪里、扩展卡如何把自己的寄存器和 ROM 挂进系统。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.38\linewidth}}
+\toprule
+平台对象 & 硬件职责 & 预期行为 \\
+\midrule
+BIOS ROM & 复位后提供第一段固件，初始化基本设备 & 复位入口命中 ROM，高地址别名或跳转正确 \\
+8259A PIC & 汇总外设中断并向 CPU 投递 & 屏蔽位、优先级、EOI 和中断向量正确 \\
+8253/8254 PIT & 提供周期节拍和计数事件 & 计数输入、模式字、输出和中断请求正确 \\
+8237A DMA & 在设备和内存之间搬运块数据 & 通道、页寄存器、地址计数和终端计数正确 \\
+键盘控制器 & 接收键盘扫描码，也常参与复位/门控控制 & 输入缓冲、输出缓冲和命令应答顺序正确 \\
+UART/并口 & 提供串行或并行外设连接 & 状态位、FIFO 或握手线能解释数据何时可收发 \\
+扩展总线 & 允许插卡响应 I/O、内存窗口或中断线 & 片选互斥、总线方向、中断线和 DMA 请求不冲突 \\
+\bottomrule
+\end{longtable}
+
+BIOS ROM 是启动约定；8259 是中断入口；8254 是定时事件；8237 是 DMA 总线主设备；UART 是状态寄存器与数据寄存器；扩展总线是地址译码、三态和仲裁的板级版本。若一台 PC/AT 风格机器无法启动，应按硬件路径排查：复位后 CPU 是否访问 BIOS 入口，ROM 是否驱动数据总线，时钟和 READY 是否满足，随后才检查键盘、显示、磁盘或操作系统。
+
+\topic{端口地址表是平台规格的一部分}早期 x86 平台大量使用独立 I/O 空间。设备寄存器不一定映射在普通内存地址中，而是通过端口号和 I/O 周期访问。平台必须写清楚哪些端口归哪个设备，哪些中断线归哪个设备，哪些 DMA 通道归哪个设备。否则，即使 CPU 指令正确，两个设备也可能响应同一个端口，或一个中断请求被错误解释成另一个设备事件。
+
+\begin{longtable}{L{0.2\linewidth}L{0.32\linewidth}L{0.38\linewidth}}
+\toprule
+规格项 & 说明内容 & 典型错误 \\
+\midrule
+I/O 端口 & 控制、状态、数据寄存器的端口号和读写语义 & 端口译码过宽，多个设备同时响应 \\
+中断线 & 哪个设备接到哪条 IRQ，是否可屏蔽和共享 & 设备已请求但 PIC 屏蔽，或 EOI 顺序错误 \\
+DMA 通道 & 通道号、方向、地址和长度寄存器 & 8-bit/16-bit 通道混用或页寄存器错误 \\
+内存窗口 & 显存、option ROM、缓冲区或 MMIO 区域 & RAM、ROM 和设备窗口重叠 \\
+启动顺序 & 固件先初始化哪些控制器，再枚举哪些设备 & 设备尚未复位稳定就被访问 \\
+\bottomrule
+\end{longtable}
+
+把端口地址表写成规格，有助于理解“平台兼容性”。处理器可能更换为更快的 80286、80386 或 80486，但许多 I/O 端口、中断和启动约定仍然保留，使旧软件能够找到键盘、定时器、串口和磁盘控制器。硬件的发展在保留平台约定的同时，把部分功能移入更高集成度的芯片组。
+
+\topic{80286 是 8086 与 80386 之间承前启后的过渡}80286 在实模式下就是一颗更快的 8086：同样的段基址左移 4 位加偏移，已有软件原样运行。它的新东西在保护模式里：地址线扩到 24 位，物理空间从 1 MiB 扩到 16 MiB（$2^{24}$ B）；段寄存器不再是段基址，而是“选择子”——高 13 位是描述符表内索引，TI 位选 GDT 还是 LDT，低 2 位是请求特权级。描述符表的每个表项 8 字节，装着 24 位段基址、16 位段限长和访问权字节；CPU 访问存储器时先按选择子查出描述符，再用描述符里的基址加偏移得到物理地址，限长和访问权同时参与检查。GDT、LDT、IDT 三张表的基址和限长分别放在 GDTR、LDTR、IDTR 里，用 LGDT、LIDT 装载——这套“表在内存、指针在 CPU”的约定被 80386 原样继承。
+
+两个边界数字：选择子的索引是 13 位，一张描述符表最多 $2^{13}$ = 8192 项，每项 8 字节，GDT 最大 64 KiB；描述符的限长是 16 位，一个段最大仍是 64 KiB——286 虽然摸得到 16 MiB 物理内存，大对象还是得切成段来管理。
+
+\begin{longtable}{L{0.16\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+286 新机制 & 硬件做法 & 留下的问题 \\
+\midrule
+24 位地址线 & 物理空间 16 MiB & 段内仍是 16 位偏移，大对象要切段 \\
+选择子 & 段寄存器指向描述符，不再直接是基址 & 实模式软件把段寄存器当基址用，两种解释不兼容 \\
+描述符 & 8 字节：24 位基址、16 位限长、访问权 & 限长 16 位，段最大 64 KiB \\
+GDTR、LDTR、IDTR & 各存表基址加限长，LGDT/LIDT 装载 & 约定在此确立，表项格式到 386 还要扩 \\
+保护模式入口 & MSW 的 PE 位置 1 即进入 & LMSW 不能把 PE 清回，退不出 \\
+无分页 & 地址转换只有段这一层 & 按页换出的虚存要等 80386 \\
+\bottomrule
+\end{longtable}
+
+286 保护模式用得少，原因正是表末两行。一是回程困难：286 没有提供把 PE 位清回去的手段，从保护模式回实模式只能靠硬件复位——PC/AT 的取巧做法是让键盘控制器拉复位线，BIOS 按事先约定的关机码恢复现场，慢而且别扭。二是没有分页：保护模式解决了越界检查和特权级，却没解决按页换出，而 DOS 生态的软件全按实模式写死，真正用 286 保护模式的只有 OS/2 1.x、XENIX 等少数系统。但它的历史位置不能跳过：GDTR/IDTR 的装载方式、选择子加描述符这层间接、“段寄存器不再是地址而是句柄”的观念转变，都是 80386 及其后所有 x86 保护模式的直接先例。下一节读 386 时，描述符表原样保留，只是基址扩到 32 位、访问权更细，再叠上分页这一层。
+
+\begin{pdfdiagram}
+  % GDTR 指向 GDT
+  \node[hw state, align=center, minimum width=1.9cm] (gdtr) at (1.3,3.6) {GDTR\\基址 + 限长};
+  \node[hw memory, minimum width=4.0cm, minimum height=2.8cm] (gdt) at (6.6,3.6) {};
+  \node[hw label] at (6.6,5.28) {GDT（在内存中，最多 8192 项）};
+  \node[hw label] at (6.6,4.55) {表项按 8 字节排列：描述符 0、1、…};
+  \node[hw memory, draw=BookAccent, align=center, minimum width=3.0cm, minimum height=1.5cm] (desc) at (6.6,3.05) {描述符 8 字节\\24 位基址 + 16 位限长\\+ 访问权字节};
+  \draw[hw bus] (gdtr.east) -- node[midway, above=1pt, hw label]{表基址} (gdt.west);
+  % 选择子：16 位分成三个字段
+  \draw[BookRule, line width=0.5pt] (0,0) rectangle (4.5,0.8);
+  \draw[BookRule, line width=0.5pt] (2.8,0) -- (2.8,0.8);
+  \draw[BookRule, line width=0.5pt] (3.5,0) -- (3.5,0.8);
+  \node[hw label] at (1.4,0.4) {索引（13 位）};
+  \node[hw label] at (3.15,0.4) {TI};
+  \node[hw label] at (4.0,0.4) {RPL};
+  % 位号
+  \node[hw label, anchor=north west] at (0,-0.05) {15};
+  \node[hw label, anchor=north east] at (2.8,-0.05) {3};
+  \node[hw label, anchor=north] at (3.15,-0.05) {2};
+  \node[hw label, anchor=north west] at (3.5,-0.05) {1};
+  \node[hw label, anchor=north east] at (4.5,-0.05) {0};
+  % 索引查表：正交走线，竖直进入 desc.south
+  \draw[hw bus] (1.4,0.8) -- (1.4,1.7) -- node[pos=0.75, above=1pt, hw label, fill=white, inner sep=1pt]{索引 × 8 = 表内偏移} (6.6,1.7) -- (desc.south);
+  % 说明
+  \node[hw label, align=center, text width=4.6cm] at (2.25,-0.95) {段寄存器 = 选择子：TI=0 查 GDT、TI=1 查 LDT，RPL 是请求特权级};
+  \node[hw label, text width=9.8cm] at (4.5,-1.95) {访问存储器时，CPU 先按选择子查出描述符，再用描述符里的基址加偏移得到物理地址，限长和访问权同时参与检查——段寄存器不再是地址，而是句柄。};
+\end{pdfdiagram}
+\diagramnote{80286 保护模式的选择子与描述符。段寄存器的高 13 位是描述符表内索引，每项 8 字节，索引乘 8 得表内偏移；TI 位选 GDT 还是 LDT；低 2 位是请求特权级。GDTR 保存 GDT 的基址和限长，描述符装着 24 位段基址、16 位限长和访问权字节——查表得到基址再加偏移，才是最终的物理地址。}
+
+\section{三、单周期、多周期与流水线的共同状态边界}
+
+设一条指令要依次完成取指 IF、译码 ID、执行 EX、访存 MEM 和写回 WB。三种组织的差别不是指令语义，而是组合逻辑放在哪些时钟边界之间。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+组织 & 每拍发生什么 & 决定时钟周期的路径 \\
+\midrule
+单周期 & 一拍内走完 IF 到 WB & 最慢指令的整条组合路径 \\
+多周期 & 一条指令分几拍复用 ALU 和存储端口 & 最慢阶段，加上阶段寄存器开销 \\
+流水线 & 多条指令分别占据不同阶段 & 最慢流水阶段，加上流水寄存器开销 \\
+\bottomrule
+\end{longtable}
+
+若五段组合延迟分别为 200、120、180、250、100 ps，流水寄存器的时钟到输出、建立时间和偏斜预算合计 30 ps，则单周期下限约为 $850$ ps，理想五级流水周期下限是 $250+30=280$ ps。流水化缩短的是连续指令的启动间隔，不会把单条指令的五段工作凭空删掉；单条指令还要跨过五个边界，延迟约为 $5\times280=1400$ ps。
+
+\begin{keyidea}
+流水线提高吞吐，不保证降低单条指令时延。每增加一级流水寄存器，都会付出寄存器延迟、时钟功耗、旁路复杂度和冲刷代价。
+\end{keyidea}
+
+\section{四、五级流水线的数据与控制随行}
+
+IF/ID、ID/EX、EX/MEM、MEM/WB 四组流水寄存器不仅保存数据，还必须保存后续阶段需要的控制位。例如译码阶段产生的“是否写寄存器、写回来自 ALU 还是内存、是否读写数据存储器”，要与对应指令的数据一路同行。若控制位错位，机器可能用上一条指令的写使能提交下一条指令的结果。
+
+\begin{lstlisting}
+IF:  PC -> instruction memory -> instruction, PC+4
+ID:  decode -> source values, immediate, destination id, controls
+EX:  ALU/compare -> result, branch decision
+MEM: load/store transaction -> read data or store completion
+WB:  select result -> architectural register write
+\end{lstlisting}
+
+分支决定在 EX 才得到时，IF 和 ID 可能已经装入两条错误路径指令。控制器必须把它们变成不写任何状态的气泡，并把 PC 重定向到正确目标。等待内存时则不同：相关阶段和上游寄存器必须保持，不能一边等待旧事务一边让后续指令覆盖其地址、数据和控制位。
+
+\begin{classicnote}
+流水线图要同时画三类线：数据向前走，旁路结果逆着阶段边界送回 EX，停顿与冲刷控制横向冻结或清空流水寄存器。只画五个方框，无法证明机器正确。
+\end{classicnote}

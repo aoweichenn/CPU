@@ -1,0 +1,700 @@
+\chapter{MMIO、中断、DMA、IOMMU 与设备队列}
+
+\begin{keyidea}
+CPU 和设备通过寄存器、描述符、地址转换和完成通知共享系统。本章明确每次设备事务的所有权、可见性和错误边界。
+\end{keyidea}
+
+\section{一、MMIO 把设备寄存器放进地址空间}
+
+设备寄存器可以像内存地址一样被 CPU 读写，但它们不是普通 RAM。读状态寄存器可能清除某些位，写命令寄存器可能启动外设动作，写数据寄存器可能进入 FIFO，读数据寄存器可能弹出一个元素。这类地址称为内存映射 I/O，简称 MMIO。MMIO 的关键在于每个寄存器都有副作用和顺序规则。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+设备寄存器 & 读写语义 & 关键问题 \\
+\midrule
+\code{DIR} & 设置 GPIO 引脚方向 & 输出引脚和输入引脚不会混用 \\
+\code{OUT} & 写输出锁存器 & 写入只改变目标输出位 \\
+\code{IN} & 读取同步后的外部输入 & 按键抖动和亚稳态不能直接进入 CPU \\
+\code{STAT} & 返回 ready、busy、error、irq 等状态 & 清除规则不会丢掉同时到来的新事件 \\
+\code{DATA} & 数据收发寄存器或 FIFO 端口 & 空读、满写和溢出有明确定义 \\
+\bottomrule
+\end{longtable}
+
+\topic{MMIO 写响应不等于设备已经完成}
+CPU 写一个命令寄存器，通常只表示设备已经接收命令。设备真正完成可能要等若干周期、若干微秒，甚至更久。完成可以通过状态位、轮询、DMA completion 或中断通知。若把 MMIO 写返回当作“设备动作完成”，软件会在设备尚未写完缓冲区、尚未刷新状态或尚未清除错误时继续执行，形成难复现的硬件错误。
+
+\begin{lstlisting}
+device command sequence:
+  CPU writes COMMAND register
+  bus write response returns
+  device starts internal work
+  device sets DONE or ERROR
+  interrupt or polling tells CPU to inspect result
+\end{lstlisting}
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.55cm] (cpu) at (0,0) {CPU};
+  \node[hw compute, minimum width=1.75cm] (bus) at (2.3,0) {总线响应};
+  \node[hw control, minimum width=1.95cm] (cmd) at (4.85,0) {命令寄存器};
+  \node[hw control, minimum width=1.95cm] (dev) at (7.45,0) {设备状态机};
+  \node[hw state, minimum width=1.5cm] (done) at (9.75,0) {DONE};
+  \draw[hw bus] (cpu) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{写命令} (bus);
+  \draw[hw bus] (bus) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{写已接受} (cmd);
+  \draw[hw bus] (cmd) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{开始工作} (dev);
+  \draw[hw return] (dev) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{完成/错误} (done);
+  \node[hw label, text width=9.0cm] at (4.7,-1.0) {总线写响应只证明命令到达设备接口；真正完成必须看状态位、中断或 DMA completion。};
+\end{pdfdiagram}
+\diagramnote{MMIO 写命令的两层完成边界。总线完成不等于设备动作完成。}
+
+\topic{端口 I/O 与 MMIO 是两种地址约定}
+8086 家族保留了独立 I/O 地址空间，\code{IN} 和 \code{OUT} 指令访问端口；许多 RISC 和单片机系统则把设备寄存器映射进普通地址空间，用 LOAD/STORE 访问。两者都能控制设备，但硬件约定不同。端口 I/O 需要 I/O 周期和端口地址译码；MMIO 需要内存地址译码和内存属性规则，例如不可缓存、不可合并或必须保持顺序。
+
+\topic{外部输入必须先调理和同步}
+按键、传感器、串口线和外部中断引脚都不按 CPU 时钟整齐变化。按键还会抖动，异步输入还可能让触发器进入亚稳态。教学板上的 GPIO 输入至少应经过电平保护、上拉/下拉、去抖策略和同步触发器，再进入设备寄存器。否则 CPU 读到的不是稳定硬件事实，而是未定义的边界行为。
+
+\begin{warningbox}
+不要把设备寄存器当作普通变量。普通 RAM 的读写目标是保存数据；MMIO 的读写目标是驱动硬件状态机。编译器、cache、写缓冲和乱序执行都可能改变普通内存访问的时机，但设备访问通常需要不可缓存属性、顺序约束和明确的完成检查。
+\end{warningbox}
+
+\topic{从 GPIO、定时器和 UART 看设备寄存器}
+设备寄存器最好用具体布局理解。一个 GPIO 控制器可以有输出寄存器、输入寄存器、方向寄存器和中断状态寄存器；定时器可以有计数值、比较值、控制位和中断清除位；UART 可以有发送数据、接收数据、状态和波特率配置寄存器。CPU 访问这些寄存器时走的是地址事务，但设备内部看到的是控制状态机输入。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+设备 & 寄存器边界 & 常见问题 \\
+\midrule
+GPIO & \code{DIR/OUT/IN/IRQ_STAT} & 输入是否同步，输出是否只改目标位 \\
+定时器 & \code{COUNT/CMP/CTRL/IRQ_CLEAR} & 到期事件是否锁存，清除是否丢新事件 \\
+UART & \code{TX/RX/STAT/BAUD} & 空读、满写、错误位和中断顺序是否清楚 \\
+\bottomrule
+\end{longtable}
+
+\topic{UART 帧格式与波特率约定}
+UART 没有时钟线，收发双方只靠“每一位持续同样长的时间”这条约定保持对齐。线路空闲时停在高电平；发送方先用一个位时间的低电平打出起始位，再把 8 个数据位按 LSB 在前依次驱动上线，最后用至少一个位时间的高电平作为停止位。接收端用 16 倍于波特率的本地时钟对线路过采样：检测到下降沿后数 8 个采样周期，在起始位中点确认它仍是低电平，随后每隔 16 个采样周期在各位中点读取一次。中点采样让判决位置离前后边沿各半位，这正是异步串行能够容忍时钟误差的来源。
+
+\begin{waveform}[x=0.85cm,y=0.95cm]
+  % 一帧：空闲高 -> 起始位 0 -> D0..D7（0x55，LSB 在前）-> 停止位 1
+  \draw[BookAccent, line width=0.9pt] (0,2.0) -- (1,2.0) -- (1,1.2) -- (2,1.2) -- (2,2.0) -- (3,2.0) -- (3,1.2) -- (4,1.2) -- (4,2.0) -- (5,2.0) -- (5,1.2) -- (6,1.2) -- (6,2.0) -- (7,2.0) -- (7,1.2) -- (8,1.2) -- (8,2.0) -- (9,2.0) -- (9,1.2) -- (10,1.2) -- (10,2.0) -- (11.8,2.0);
+  \node[hw label, anchor=east] at (-0.2,1.6) {RXD};
+  \node[hw label] at (0.5,2.25) {空闲};
+  \node[hw label] at (1.5,2.25) {起始};
+  \node[hw label] at (2.5,2.25) {D0};
+  \node[hw label] at (3.5,2.25) {D1};
+  \node[hw label] at (4.5,2.25) {D2};
+  \node[hw label] at (5.5,2.25) {D3};
+  \node[hw label] at (6.5,2.25) {D4};
+  \node[hw label] at (7.5,2.25) {D5};
+  \node[hw label] at (8.5,2.25) {D6};
+  \node[hw label] at (9.5,2.25) {D7};
+  \node[hw label] at (10.5,2.25) {停止};
+  \draw[hw return] (1.5,0.75) -- (10.5,0.75);
+  \foreach \x in {1.5,2.5,3.5,4.5,5.5,6.5,7.5,8.5,9.5,10.5} \draw[hw return] (\x,0.75) -- (\x,1.12);
+  \node[hw label] at (6.0,0.28) {采样点（$16\times$ 过采样，位中点）};
+\end{waveform}
+\diagramnote{UART 一帧（数据 \code{0x55}，LSB 在前）。空闲为高电平；起始位的下降沿给出帧起点，数据位在中点被逐位采样，停止位把线路带回高电平。}
+
+以 115200 baud 为例，每位宽度 $1/115200\approx 8.68\,\mu\text{s}$。接收端在起始位边沿对齐之后，最后一位（停止位）的采样点距该边沿 9.5 个位时间；若收发时钟的相对误差为 $\varepsilon$，这个采样点会漂移 $9.5\varepsilon$ 位，漂移超过半位即采到相邻位，所以理论上限约为 $0.5/9.5\approx 5\%$。工程上还要从中扣除边沿检测的量化误差（16 倍过采样下最多 $1/16$ 位）与电平翻转时间，留下的常用要求是每一侧波特率误差不超过约 2\%，或者收发双方干脆从同一时钟源分频。误差超限时，出错的往往不是帧首而是帧尾——越早的位漂移越小，最后的停止位最先越界，表现为间歇性的帧错误或数据错位。
+
+\topic{定时器的预分频、计数与比较匹配}
+定时器做的事只有一件：把固定频率的时钟变成软件可编程的周期间隔。它的数据路径很简单——预分频器先把输入时钟除以 $N$，递增计数器 CNT 在每个分频后时钟上加一，比较器持续比较 CNT 与比较寄存器 CMP；当 CNT 数到 CMP，比较器输出 match。match 同时驱动两件事：置起事件状态位（若控制寄存器 CR 中的中断使能有效，同时拉起 IRQ），以及在 auto-reload 模式下把 CNT 清零，让计数立刻开始下一轮。于是中断周期严格等于（预分频 $\times$（CMP+1））个输入时钟——CMP 要加一，因为计数从 0 开始，数到 CMP 共经过 CMP+1 拍。以 1 MHz 输入、预分频 8 为例：分频后的计数时钟是 125 kHz，若 CMP=999，周期为 $8\times(999+1)=8000$ 个输入时钟，即 8 ms（125 Hz）；要得到 1 kHz 中断，应令 CMP=124，此时 $8\times(124+1)=1000$ 个时钟，正好 1 ms。事件状态位由软件按设备规则清除，清除顺序属于§四要讨论的中断约定。
+
+\begin{pdfdiagram}
+  \node[hw control, minimum width=1.6cm] (clk) at (0.3,0) {时钟 CLK};
+  \node[hw compute, minimum width=1.9cm] (pre) at (2.5,0) {预分频器 $\div N$};
+  \node[hw state, minimum width=2.2cm] (cnt) at (5.15,0) {递增计数器 CNT};
+  \node[hw compute, minimum width=1.5cm] (cmp) at (7.5,0) {比较器};
+  \node[hw state, minimum width=1.9cm] (cmpreg) at (7.5,-1.05) {CMP 寄存器};
+  \node[hw state, minimum width=1.7cm] (evt) at (9.9,0) {事件状态位};
+  \node[hw control, minimum width=1.9cm] (irq) at (9.9,-1.05) {中断请求 IRQ};
+  \node[hw control, minimum width=1.9cm] (cr) at (3.4,-1.4) {控制寄存器 CR};
+  \draw[hw bus] (clk) -- (pre);
+  \draw[hw bus] (pre) -- (cnt);
+  \draw[hw bus] (cnt) -- (cmp);
+  \draw[hw bus] (cmpreg.north) -- (cmp.south);
+  \draw[hw bus] (cmp) -- node[above=2pt,hw label,fill=white,inner sep=1pt]{match} (evt);
+  \draw[hw return] (evt.south) -- (irq.north);
+  \draw[hw return] (cmp.north) -- (7.5,0.95) -- (5.15,0.95) node[pos=0.5,above=1pt,hw label,fill=white,inner sep=1pt]{归零重载（auto-reload）} -- (cnt.north);
+  \draw[hw return] (cr.north) -- (3.4,-0.65) -- (2.5,-0.65) -- (pre.south);
+  \draw[hw return] (3.4,-0.65) -- (5.15,-0.65) node[pos=0.5,below=2pt,hw label,fill=white,inner sep=1pt]{使能/重装} -- (5.15,-0.4);
+  \fill[BookTeal] (3.4,-0.65) circle (0.05);
+\end{pdfdiagram}
+\diagramnote{定时器数据路径：时钟经预分频驱动递增计数器，比较器在 CNT 等于 CMP 时产生 match，一路置事件状态位并按 CR 的中断使能拉起 IRQ，一路按 auto-reload 把 CNT 归零，开始下一周期。中断周期 = 预分频 $\times$ (CMP+1) 个输入时钟。}
+
+\topic{I2C 用两根开漏线支撑一条多设备总线}
+I2C 只有两根信号线：串行数据线 SDA 和串行时钟线 SCL。两根线都是开漏输出加上拉电阻——任何设备都只能把线拉低，不能主动驱动为高，线电平相当于所有设备输出的“线与”。空闲时两线靠上拉电阻停在高电平；主设备产生全部时钟，数据位只允许在 SCL 为低时改变，在 SCL 为高时被采样。事务以起始条件开头——SCL 保持高电平时 SDA 从高跳低；以停止条件结尾——SCL 保持高电平时 SDA 从低跳高。每个字节由 8 个数据位加 1 个应答位组成：第 9 个时钟里发送方释放 SDA，接收方把 SDA 拉低表示 ACK，保持高表示 NACK。寻址用 7 位设备地址，与 1 位读写方向合成地址阶段的一个字节。开漏结构正是这条总线能够共享的原因：多主同时发送时，发 0 的一方自然赢过发 1 的一方，竞争不需要额外仲裁线；从设备还可以在字节之间把 SCL 按住不放，强制主设备等待（clock stretching），慢设备因此不会丢数据。
+
+UART 是点对点链路，没有地址概念；I2C 把多个设备挂在同一对线上，用起始条件和地址字节决定本次事务跟谁说话。下表对照二者的边界。
+
+\begin{longtable}{L{0.16\linewidth}L{0.37\linewidth}L{0.37\linewidth}}
+\toprule
+方面 & I2C & UART \\
+\midrule
+拓扑 & 一条共享总线挂多个主从设备 & 点对点，一发一收 \\
+时钟 & 主设备产生 SCL，收发同步于时钟沿 & 无时钟线，靠双方约定的波特率 \\
+寻址 & 起始条件后发送 7 位地址加读写位 & 无地址，线路上只有一个对端 \\
+确认 & 每字节后跟 ACK/NACK，主设备能发现无应答 & 无应答机制，只能靠上层协议 \\
+线数与速度 & 2 线；标准 100 kHz、快速 400 kHz & 2 线收发交叉；常见 115200 baud \\
+\bottomrule
+\end{longtable}
+
+一次典型的“主发地址、寄存器号、再读回数据”事务如下，传感器和 EEPROM 的随机读几乎都是这个形状：
+
+\begin{lstlisting}
+I2C register read transaction:
+  START
+  master sends [7-bit address + W]  -> slave ACK
+  master sends [register number]    -> slave ACK
+  repeated START
+  master sends [7-bit address + R]  -> slave ACK
+  slave sends  [data byte]          -> master NACK
+  STOP
+\end{lstlisting}
+
+中间的重复起始（repeated START）把“先告诉对方读哪个寄存器”和“再开始读”合并成一次不间断事务，避免其他主设备在两段之间插入；读方向下最后一个字节由主设备回 NACK 再发停止条件，通知从设备释放 SDA、结束发送。这次事务的开销可以直接算：一帧 9 位，共 4 帧 36 位，未计起始和停止条件的少量时间；标准模式 100 kHz 下每位 $10\,\mu\text{s}$，合计约 $36\times10=360\,\mu\text{s}$，快速模式 400 kHz 下约 $90\,\mu\text{s}$。也就是说，主设备每 0.36 ms 才能完成一次这样的寄存器读取，这正是 I2C 传感器数据更新率的量级来源；I2C 的意义不在于快，而在于只用两根线就把一整板低速设备纳入同一个地址空间。
+
+\topic{SPI 用片选换速度，用移位环换全双工}
+SPI 是四线同步串行接口：SCLK 时钟、MOSI 主出从入、MISO 主入从出、\code{CS} 片选（低有效）。总线上没有地址阶段——主设备想跟谁通信就把谁的片选拉低，同一时刻只允许被选中的从设备驱动 MISO。数据通路是一对首尾相接的移位寄存器：每来一个时钟沿，主设备从 MOSI 移出一位，同时从 MISO 移入一位，收发在物理上永远同时进行，全双工是这个结构的自然结果而不是协议选项。时钟行为由两个参数规定：CPOL 决定空闲时 SCLK 停在高还是低，CPHA 决定在第几个时钟沿采样数据，组合出四种模式。通信双方必须事先约定同一种模式——这条协商写在芯片手册里，不在总线上进行。
+
+\begin{longtable}{L{0.12\linewidth}L{0.12\linewidth}L{0.12\linewidth}L{0.24\linewidth}L{0.28\linewidth}}
+\toprule
+模式 & CPOL & CPHA & 空闲电平 & 数据采样沿 \\
+\midrule
+0 & 0 & 0 & 低 & 第一个沿（上升沿） \\
+1 & 0 & 1 & 低 & 第二个沿（下降沿） \\
+2 & 1 & 0 & 高 & 第一个沿（下降沿） \\
+3 & 1 & 1 & 高 & 第二个沿（上升沿） \\
+\bottomrule
+\end{longtable}
+
+以最常用的模式 0 读一个字节为例：主设备先拉低 \code{CS}；从设备把数据的最高位驱动到 MISO（发送方在时钟下降沿换位）；主设备发出 8 个时钟，在每个上升沿采样 MISO，依次得到 D7 到 D0；与此同时主设备把 MOSI 上的 8 位移给从设备，纯读时通常发全 0 占位字节；8 拍结束后主设备拉高 \code{CS}，事务结束。
+
+\begin{lstlisting}
+SPI mode-0 byte read (MSB first):
+  CS low
+  for bit = D7 downto D0:
+      slave changes MISO on falling edge of SCLK
+      master samples MISO on rising edge of SCLK
+      master shifts one dummy bit out on MOSI
+  CS high
+\end{lstlisting}
+
+SPI 没有 ACK，也没有起始停止开销，8 个时钟就是 8 位；代价写在引脚数量上，每多一个从设备多一根片选。与 I2C 对照，两者在速度、引脚和协议复杂度上各站一端：
+
+\begin{longtable}{L{0.20\linewidth}L{0.35\linewidth}L{0.35\linewidth}}
+\toprule
+方面 & SPI & I2C \\
+\midrule
+速度 & 常见数 MHz 到数十 MHz & 标准 100 kHz，快速 400 kHz \\
+引脚 & 4 线，且每个从设备一根片选 & 2 线，设备数量不占引脚 \\
+寻址 & 无地址，靠片选 & 7 位地址加读写位 \\
+确认与等待 & 无 ACK，无从设备等待机制 & 每字节 ACK/NACK，从设备可拉住 SCL 等待 \\
+协议复杂度 & 几乎只有移位，模式须事先约定 & 起始、停止、重复起始、应答状态机 \\
+\bottomrule
+\end{longtable}
+
+速度差距可以直接算：SCLK 取 10 MHz 时位时间 $100\,\text{ns}$，读一个字节恰需 8 拍 $=0.8\,\mu\text{s}$；I2C 快速模式 400 kHz 下位时间 $2.5\,\mu\text{s}$，一个字节加应答共 9 位 $=22.5\,\mu\text{s}$，相差约 28 倍。Flash、显示屏、ADC 这类数据量较大的从设备多用 SPI，原因就在这里；而传感器这类低速、多节点、布线路径长的场合，I2C 的两线共享更省板级资源。可见两条总线没有优劣之分，只有“用引脚和约定换什么”的取舍不同。
+
+\topic{USB 用枚举和描述符换来“通用”二字}
+UART、SPI、I2C 的共同前提是主设备事先知道对端是什么；USB 把这个前提取消了。总线严格以主机为中心，设备不能主动发起任何事务。插入检测靠电气约定：设备端在 D+ 或 D- 上接上拉电阻，全速设备拉 D+，低速设备拉 D-，集线器看到哪条线被拉高就知道来了什么速度的设备（高速设备先以全速现身，在复位期间再协商提速），并把端口状态变化上报主机。随后主机执行枚举：先复位该端口，设备以默认地址 0 应答；主机通过默认控制端点 0 读取设备描述符，再发 Set Address 给设备分配 1 到 127 之间的新地址；之后按新地址继续读取配置描述符、接口描述符、端点描述符和字符串描述符。描述符是一套标准格式的自描述数据：厂商 ID、产品 ID、设备类、需要多少端点、每个端点的类型和最大包长，操作系统据此匹配驱动。插拔能自动识别，不是因为总线聪明，而是因为每台设备都能用同一种格式回答“我是谁、我要什么”；“通用”二字，正来自枚举和描述符这套约定。
+
+枚举完成后，数据按端点组织。端点是设备内部的单向通道，端点 0 固定留给控制传输，其余端点在描述符中声明自己的传输类型：
+
+\begin{longtable}{L{0.16\linewidth}L{0.40\linewidth}L{0.34\linewidth}}
+\toprule
+传输类型 & 语义 & 典型设备 \\
+\midrule
+控制 & 有应答、用于配置和命令，端点 0 专用 & 所有设备的枚举阶段 \\
+中断 & 主机按声明周期轮询，小数据量，出错重试 & 键盘、鼠标 \\
+批量 & 利用剩余带宽，无周期保证，出错重传 & U 盘、打印机 \\
+等时 & 每帧预留带宽，不重传，容忍少量错误 & 音频设备、摄像头 \\
+\bottomrule
+\end{longtable}
+
+把四种总线放在一起，复杂度阶梯很清楚：
+
+\begin{longtable}{L{0.12\linewidth}L{0.18\linewidth}L{0.20\linewidth}L{0.16\linewidth}L{0.24\linewidth}}
+\toprule
+总线 & 线数 & 寻址方式 & 设备自描述 & 典型定位 \\
+\midrule
+UART & 2 & 无，点对点 & 无 & 调试口、模块间低速链路 \\
+SPI & 4，每从设备加 1 片选 & 片选 & 无 & 板内高速从设备 \\
+I2C & 2 & 7 位地址 & 无 & 板内多节点低速设备 \\
+USB & 4（含电源和地） & 枚举分配 7 位地址 & 标准格式描述符 & 机箱外可热插拔外设 \\
+\bottomrule
+\end{longtable}
+
+带宽数字能说明“通用”的另一面：高速模式 480 Mb/s 折合每微帧 $125\,\mu\text{s}$ 约 7500 B，批量端点最大包 512 B，一个微帧最多容纳 13 个整包，理论上限约 $13\times512\,\text{B}\div125\,\mu\text{s}\approx53\,\text{MB/s}$。同一条总线既要服务每 $10\,\text{ms}$ 被轮询一次、一次只发几个字节的键盘，又要服务成批搬数据的 U 盘，靠的正是把调度规则写进四种传输类型，而不是为每类设备各做一种接口。
+
+\section{二、中断和 DMA 把外部事件接回 CPU}
+
+轮询可以让 CPU 一直读状态寄存器，直到设备 ready。但若设备很慢，CPU 会浪费大量周期。中断提供另一种路径：设备在状态变化后请求中断，中断控制器汇总、屏蔽和排序请求，CPU 在可接受边界保存当前执行上下文，跳到中断入口，服务程序读取设备状态并清除事件。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+对象 & 硬件职责 & 关键问题 \\
+\midrule
+设备 & 产生完成、错误或数据到达事件 & 状态位和中断请求是否同步一致 \\
+中断控制器 & 汇总、屏蔽、优先级和投递 & 屏蔽位、优先级、EOI（中断结束，end of interrupt）顺序是否正确 \\
+CPU 入口 & 保存边界状态并跳到入口 & PC、标志和特权边界是否可恢复 \\
+服务程序 & 读状态、搬数据、清除事件 & 不丢新事件，不重复进入同一旧事件 \\
+\bottomrule
+\end{longtable}
+
+\topic{中断链路从设备事件一直接到服务程序返回}
+中断把“CPU 主动轮询”反转为“设备主动请求”。完整链路是：事件先在设备内锁存成状态位并拉起 IRQ；中断控制器按屏蔽位和优先级决定是否投递；CPU 只在指令边界采样 INT，接收后保存 PC/Flags，查向量表跳到服务程序；服务程序读状态、处理数据、按设备规则清事件，最后发 EOI 并恢复现场返回。链路上任何一环顺序错误，都会表现为丢中断或同一事件重复进入。
+
+\begin{pdfdiagram}
+  \node[hw memory, minimum width=1.7cm] (dev) at (0,1.7) {设备};
+  \node[hw state, minimum width=2.0cm] (latch) at (2.7,1.7) {事件锁存\\状态位};
+  \node[hw control, minimum width=2.2cm] (pic) at (5.6,1.7) {中断控制器\\屏蔽/优先级};
+  \node[hw state, minimum width=1.6cm] (cpu) at (8.7,1.7) {CPU};
+  \draw[hw bus] (dev) -- node[above,hw label]{事件} (latch);
+  \draw[hw bus] (latch) -- node[above,hw label]{IRQ} (pic);
+  \draw[hw bus] (pic) -- node[above,hw label]{INT} (cpu);
+  \node[hw state, minimum width=2.4cm] (save) at (8.7,0.0) {保存 PC/Flags};
+  \node[hw compute, minimum width=2.2cm] (vec) at (5.6,0.0) {查向量表跳转};
+  \node[hw compute, minimum width=3.2cm] (isr) at (2.4,0.0) {服务程序：读状态、\\处理、清事件、发 EOI};
+  \draw[hw bus] (cpu.south) -- node[right,hw label]{指令边界接收} (save.north);
+  \draw[hw bus] (save) -- (vec);
+  \draw[hw bus] (vec) -- (isr);
+  \draw[hw return] (isr.north) -- (2.4,0.85) -- (5.6,0.85) node[above, hw label, pos=0.5]{EOI} -- (pic.south);
+  \draw[hw return] (isr.south) -- (2.4,-1.05) -- (10.1,-1.05) node[above, hw label, pos=0.5]{恢复现场，返回断点} -- (10.1,1.7) -- (cpu.east);
+\end{pdfdiagram}
+\diagramnote{中断的完整链路。实线是请求与服务路径，虚线是返回路径：EOI 让中断控制器恢复投递，恢复现场让 CPU 回到被打断的位置。服务程序必须按设备规定的顺序清事件——先清设备还是先 EOI，是每种芯片数据手册都会写明的细节。}
+
+\topic{中断清除顺序是硬件约定}
+若服务程序先清设备状态，再清中断控制器，或先通知中断控制器再清设备，效果可能不同。某些设备要求先读状态后读数据，某些要求写 1 清位，某些要求读数据寄存器自动清除 ready。教材级规格必须写清楚事件锁存、状态读取、清除、EOI 和重新开放中断的顺序。否则系统在低速测试中正常，在高频事件下丢中断或重复中断。
+
+\topic{中断控制器用三张寄存器决定谁先被服务}
+设备多起来之后，“谁先被服务”不能靠先到先得。以 8259 可编程中断控制器为例，它用三张 8 位寄存器管理 8 条中断线：IRR（中断请求寄存器）锁存已到但尚未投递的请求；IMR（中断屏蔽寄存器）按位禁止对应线路参与竞争；ISR（在服务寄存器）记录当前正在被服务的请求。优先级裁决器在未屏蔽的 IRR 位中选出最高优先级的一位，与 ISR 中已在服务的最高位比较，只有新请求优先级更高时才向 CPU 拉起 INT。默认是固定优先级——IR0 最高、IR7 最低；控制器也可配置成轮转优先级，刚被服务的线路自动排到队尾，避免某条热线路长期独占。
+
+\begin{longtable}{L{0.14\linewidth}L{0.40\linewidth}L{0.36\linewidth}}
+\toprule
+寄存器 & 记录内容 & 关键问题 \\
+\midrule
+IRR & 已锁存、待投递的请求位 & 请求是否真正被锁存，边沿触发与电平触发是否分清 \\
+IMR & 每条线路的屏蔽位 & 屏蔽期间到来的请求是挂起还是丢失 \\
+ISR & 正在服务的请求位 & EOI 之前同级和低级请求一律等待 \\
+\bottomrule
+\end{longtable}
+
+EOI 是这套机制里最要紧的动作。服务程序发出 EOI，控制器才清除对应的 ISR 位；ISR 位不清，同级和更低优先级的请求即使进了 IRR 也只能等待——优先级秩序正是靠 ISR 位维持的。若希望高级中断能打断正在运行的低级服务程序，即允许嵌套，低级服务程序必须在保存好现场之后重新打开 CPU 的中断允许位。嵌套时保存的内容必须完整，因为返回时要逐层恢复：CPU 接收中断时已把返回地址和标志寄存器压栈，服务程序还要保存自己用到的全部通用寄存器。每一层嵌套占用一帧栈，层数越深栈消耗越大，这是嵌套中断容易忽略的隐性成本。
+
+\begin{lstlisting}
+isr_low:
+    push rax            ; save registers this handler uses
+    push rbx
+    sti                 ; allow higher-priority nesting only now
+    ; ... read device, handle data, clear device event ...
+    cli                 ; block nesting on the return path
+    mov al, 0x20        ; non-specific EOI command
+    out 0x20, al        ; write 8259 command port, clears top ISR bit
+    pop rbx
+    pop rax
+    iretq               ; restore flags and return address
+\end{lstlisting}
+
+优先级机制带来的风险是反转与饿死。反转的典型情形：低级服务程序长时间关中断执行，高级请求虽已进 IRR 却无法投递，实际等待时间反而更长。可以量化：115200 baud 下串口一个字节连起始、停止位共 10 位，到达间隔约 $86.8\,\mu\text{s}$；接收缓冲只有一字节深时，若某个低级服务程序关中断超过这个时间，串口数据就会被下一字节覆盖，表现为溢出错误——优先级更高的串口实际上输给了优先级更低的服务程序。饿死的典型情形则相反：固定优先级下高级中断密集到来时，低级请求在 IRR 里长期得不到服务，轮转优先级正是为这种情况准备的。工程上的通用对策有两条：服务程序尽量短，把重活推迟到中断返回之后；必须关中断的窗口要给出时间上界，而不是随手一关了事。
+
+DMA 解决的是另一类浪费。若磁盘、网卡、显示控制器或音频设备需要搬运大量数据，CPU 不应逐字从设备读出再逐字写入内存。DMA 让设备或 DMA 控制器成为总线发起者，按描述符或寄存器配置直接读写主存。CPU 负责准备缓冲区和描述符，设备负责搬运，完成后用状态位或中断通知 CPU。
+
+\begin{lstlisting}
+DMA receive sketch:
+  CPU allocates buffer
+  CPU writes descriptor address and length
+  CPU ensures descriptor is visible to device
+  device reads descriptor and writes buffer
+  device posts completion
+  CPU handles interrupt and inspects buffer
+\end{lstlisting}
+
+\topic{DMA 控制器按通道组织，每个通道就是地址加计数}
+8237 是理解 DMA 控制器的经典样本。它提供 4 个独立通道，每个通道对应一条设备请求线 DREQ；通道的核心状态只有两类 16 位寄存器——当前地址寄存器指出下一个要访问的内存地址，每传一字节自动加一，当前计数寄存器记录还剩多少字节，每传一字节自动减一。计数写入值比真实字节数少一：写 0 表示传 1 字节，写 \code{0xFFFF} 表示传 65536 字节，计数从 0 再减一回绕时产生终止计数 TC。模式寄存器决定传输方向（设备到内存或内存到设备）和传输方式。由于 16 位地址最多覆盖 64 KiB，PC 还给每个通道配了一个外部页寄存器，锁存物理地址的高 8 位，合成 24 位地址；由此带来一条经典限制：一次传输中低 16 位地址在页内推进，页寄存器保持不变，缓冲区不得跨越 64 KiB 页边界。
+
+\begin{longtable}{L{0.20\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+寄存器组 & 记录内容 & 关键问题 \\
+\midrule
+地址寄存器 & 下一个内存单元的低 16 位地址 & 初值是否指向缓冲区起点，方向是否为递增 \\
+计数寄存器 & 剩余字节数，写入值等于实际字节数减 1 & 忘记减 1 会多传一个字节，覆盖缓冲区之后的内容 \\
+模式/命令 & 传输方向、单字/块/请求方式、通道号 & 方向写反会把设备数据当内存数据搬 \\
+页寄存器 & 物理地址高 8 位（外部锁存） & 缓冲区是否跨 64 KiB 页边界 \\
+屏蔽/请求 & 通道使能与软件请求 & 配置期间通道必须屏蔽，配完再开放 \\
+\bottomrule
+\end{longtable}
+
+传输方式回答“拿到总线后干多久”。单字（single）模式每传一个字节就把总线还给 CPU，等设备下一次 DREQ 再申请；块（block）模式一旦拿到总线就连传到计数结束，其间 CPU 无法使用总线；请求（demand）模式随 DREQ 电平走走停停。慢设备配单字模式时，DMA 只是零星借用本属于 CPU 的总线周期，这称为周期窃取（cycle steal）：CPU 不被告知、不切换状态，只在恰好要用总线的那一拍多等一拍。块模式是另一个极端——它把 CPU 完全关在总线之外，换取最短的总搬运时间。
+
+以软盘控制器常用的通道 2 为例，把 8192 字节从设备搬到物理地址 \code{0x23450} 的完整配置序列如下。页号 \code{0x02}、页内偏移 \code{0x3450}，结束地址 \code{0x2544F}，不跨页边界；计数写 $8192-1=8191=$ \code{0x1FFF}。拼接关系与这个缓冲区在页内的位置如图所示。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=2.6cm] (pg) at (0,0.7) {页寄存器（外部锁存）\\A23--A16 = \code{0x02}};
+  \node[hw state, minimum width=2.6cm] (ad) at (0,-0.7) {通道地址寄存器\\A15--A0 = \code{0x3450}};
+  \node[hw compute, minimum width=1.2cm] (cat) at (3.6,0) {拼接};
+  \node[hw state, minimum width=2.4cm] (pa) at (6.3,0) {物理地址\\\code{0x23450}};
+  \draw[hw bus] (pg.east) -| node[pos=0.25,above=1pt,hw label]{高 8 位} (cat.north);
+  \draw[hw bus] (ad.east) -| node[pos=0.25,below=1pt,hw label]{低 16 位} (cat.south);
+  \draw[hw bus] (cat) -- (pa);
+  % 页内位置：页 0x02 覆盖 0x20000--0x2FFFF
+  \draw[BookRule, line width=0.5pt] (-1.5,-2.6) rectangle (6.8,-1.9);
+  \draw[BookTeal, line width=0.7pt, fill=BookTeal!18] (0.22,-2.6) rectangle (1.23,-1.9);
+  \node[hw label, anchor=west] at (1.45,-2.25) {缓冲区 \code{0x23450}--\code{0x2544F}（8192 B）};
+  \node[hw label, anchor=south west] at (-1.5,-1.88) {页 \code{0x02}（64 KiB）};
+  \node[hw label, anchor=south east] at (6.8,-1.88) {页边界禁跨};
+  \node[hw label, anchor=north] at (-1.5,-2.68) {\code{0x20000}};
+  \node[hw label, anchor=north] at (6.8,-2.68) {\code{0x2FFFF}};
+  \draw[hw return] (pa.south) -- (6.3,-1.5) -- node[pos=0.5,above=1pt,hw label]{起始地址} (0.72,-1.5) -- (0.72,-1.86);
+  \node[hw label] at (2.65,-3.35) {一次传输中页寄存器不变，缓冲区不得跨越 64 KiB 页边界};
+\end{pdfdiagram}
+\diagramnote{8237 的 24 位地址拼接：外部页寄存器锁存 A23--A16，通道地址寄存器提供 A15--A0。示例页号 \code{0x02}、页内偏移 \code{0x3450} 合成物理地址 \code{0x23450}；8192 字节传到 \code{0x2544F} 为止，仍在页 \code{0x02}（\code{0x20000}--\code{0x2FFFF}）之内。一次传输中页寄存器保持不变，跨 64 KiB 页边界的缓冲区必须拆成两次传输。}
+
+\begin{lstlisting}
+; 8237 ch2 block transfer: device -> memory, 8192 B at phys 0x23450
+mov al, 0x06    ; mask ch2 while programming
+out 0x0A, al    ; single-channel mask register
+mov al, 0x86    ; mode: block, write-to-memory, ch2
+out 0x0B, al    ; mode register
+out 0x0C, al    ; clear byte-pointer flip-flop (value ignored)
+mov al, 0x50    ; address low byte  (0x3450)
+out 0x04, al
+mov al, 0x34    ; address high byte
+out 0x04, al
+mov al, 0xFF    ; count low byte    (0x1FFF = 8192-1)
+out 0x05, al
+mov al, 0x1F    ; count high byte
+out 0x05, al
+mov al, 0x02    ; page register -> A16..A23
+out 0x81, al
+mov al, 0x02    ; unmask ch2
+out 0x0A, al
+; device raises DREQ; 8237 requests the bus and moves bytes;
+; TC (count wraps through 0) ends the transfer and raises EOP/IRQ
+\end{lstlisting}
+
+序列里有两处容易出错。其一，16 位寄存器经同一个 8 位端口分两次写入，内部字节指针触发器决定下一次写的是低字节还是高字节，配置前必须先发清除命令，否则高低字节会写反。其二，屏蔽必须在配置之前、开放必须在配置之后，否则设备可能在地址只写了一半时就开始搬运。周期窃取的比例可以估算：软盘数据率约 62.5 KB/s，即每 $16\,\mu\text{s}$ 来一个字节；设总线周期 $250\,\text{ns}$、一次单字搬运占 4 拍共 $1\,\mu\text{s}$，DMA 占用总线的时间比例约 $1/16\approx6\%$，其余 94\% 的总线时间仍归 CPU。上面的配置序列按块模式给出：块模式下 DREQ 只需维持到 8237 以 DACK 应答并取得总线为止，此后控制器不再逐字节等待设备请求，而是以总线速度背靠背连续搬运，直到计数寄存器减完为止——按一次搬运 $1\,\mu\text{s}$ 算，8192 字节约在 $8.2\,\text{ms}$ 内传完，期间总线全部归 DMA。这恰恰说明软盘为什么不能用块模式：软盘每 $16\,\mu\text{s}$ 才供出一个字节，块模式的连续搬运它根本供不上数——读方向上控制器会把尚未到达的字节当作有效数据写进内存，写方向上设备来不及取走总线上的数据，两种情况都是 overrun；而长达数毫秒的总线独占，又让 CPU 在此期间一直取不到指令。正因如此，PC 的软盘 DMA 实际配成单字模式（模式字节 \code{0x46}）：每传一个字节就把总线还给 CPU，等软盘供出下一字节、再次拉起 DREQ 时才传下一字节，这正是前面估算过的周期窃取。块模式适合的是设备端能跟上总线速度的场合，如内存到内存传送或磁盘内部缓冲命中后的连续读出。选哪种模式，本质上是在搬运总时间与 CPU 停顿之间做权衡。
+
+\topic{DMA 最容易错在可见性和所有权}
+DMA 让 CPU 和设备共享主存，也引入 cache 一致性、顺序和缓冲区所有权问题。CPU 写好的描述符必须先对设备可见；设备写入的缓冲区必须在 CPU 读取前变得可见；CPU 不能在设备仍拥有缓冲区时重用它；设备不能越过分配的地址范围。现代系统还会用 IOMMU 限制 DMA 能访问哪些物理页，避免坏设备或错误驱动破坏任意内存。
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.85cm] (cpu) at (0,0) {CPU owns};
+  \node[hw compute, minimum width=2.1cm] (desc) at (2.65,0) {描述符可见};
+  \node[hw control, minimum width=1.95cm] (dev) at (5.35,0) {Device owns};
+  \node[hw compute, minimum width=2.0cm] (comp) at (7.95,0) {completion};
+  \node[hw state, minimum width=1.85cm] (cpu2) at (10.45,0) {CPU owns};
+  \draw[hw bus] (cpu) -- node[above,hw label]{提交描述符} (desc);
+  \draw[hw bus] (desc) -- node[above,hw label]{设备搬运} (dev);
+  \draw[hw bus] (dev) -- node[above,hw label]{写状态/中断} (comp);
+  \draw[hw return] (comp) -- node[above,hw label]{同步 cache 后读取} (cpu2);
+  \node[hw label, text width=10.0cm] at (5.25,-1.0) {所有权不能重叠：CPU 交出缓冲区后不得改写；设备 completion 到达且数据可见后，CPU 才能重新使用。};
+\end{pdfdiagram}
+\diagramnote{DMA 缓冲区所有权。完成通知、cache 可见性和所有权回收必须按顺序发生。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+边界 & 必须说明 & 失败后果 \\
+\midrule
+描述符可见 & CPU 写描述符后如何让设备看到 & 设备读到旧地址、旧长度或旧标志 \\
+数据可见 & 设备写缓冲区后 CPU 如何看到新数据 & CPU 读到 cache 中的旧内容 \\
+所有权 & 缓冲区何时归 CPU，何时归设备 & 重用正在 DMA 的缓冲区，数据被覆盖 \\
+地址权限 & 设备能访问哪些物理页或 I/O 虚拟地址 & DMA 写坏无关内存或触发 IOMMU fault \\
+完成顺序 & completion 到达是否代表所有数据已可见 & 收到中断后仍读到未完成数据 \\
+\bottomrule
+\end{longtable}
+
+\section{三、平台控制器：从芯片组到 IOMMU}
+
+经典芯片与平台章已经把芯片组迁移的轮廓画过一遍：分立的 8237/8259/8254 先被收进北桥与南桥，内存控制器随后搬进 CPU，南桥余部改称 PCH，最终走向 SoC。那一章回答的是“搬了什么”；本节回答“搬完之后它们怎么工作”：设备如何被发现并领到地址窗口，中断如何从一根引脚演化成一次内存写，DMA 地址如何被再翻译一次，操作系统的心跳由哪颗定时器发出，以及主板上那些不起眼却不能缺席的小控制器各管什么。
+
+\begin{keyidea}
+平台控制器的演进有一条统一的主线：\hwkey{能用地址空间表达的，就不用专用引脚}。设备配置空间被映射成一段 MMIO（ECAM），读设备标识就是一次普通 load；中断从 IRQ 引脚变成设备往约定地址的一次写（MSI）；DMA 地址治理借用了与 MMU 相同的页表结构（IOMMU）。整机的控制平面因此从“一堆专用信号线”统一成“地址空间中的读写事务”——这正是主存与总线章里 MMIO 思想在平台尺度上的展开。
+\end{keyidea}
+
+%======================================================================
+\topic{3.1\quad 演进：北桥/南桥、PCH 与 SoC 各管什么}
+%======================================================================
+
+南北桥时代的分工按“离 CPU 多近、要多快”切分。\hwkey{北桥}（northbridge）坐在 CPU 前端总线上，管三条最快的路径：内存控制器（DRAM 命令与调度）、图形接口（AGP，Accelerated Graphics Port，加速图形端口；后来是 PCIe $\times$16）和 cache/前端总线一致性。\hwkey{南桥}（southbridge）管全部低速 I/O：IDE/SATA、USB、PCI、LPC（Low Pin Count，低引脚数总线），并把 8259 中断控制器、8237 DMA、8254 定时器、RTC 这些经典芯片的功能各收一个副本进片内，外加电源管理与 ACPI。两桥之间用一条专用 hub 链路相连，南桥的全部流量都要经过北桥才能到达内存。
+
+把内存控制器从北桥搬进 CPU 是收益最大的一次迁移，原因要分两层看。第一层是延迟：板级走线上信号每走 10 cm 约需 \hwtiming{0.67 ns} 飞行时间（电源、时钟与信号完整性章第三节给出的量级），再算上两端的收发缓冲与仲裁，一次片外往返在纳秒到十几纳秒量级；北桥时代每次 cache miss 都要先走“CPU$\to$北桥”这一程再去 DRAM，比控制器片内方案多出几十纳秒。取指和读数是整机最频繁的路径，这段开销被乘以全部访存次数。第二层是功耗：驱动板级走线要把 50 $\Omega$ 量级的负载在每比特内反复充放，片外 I/O 的能耗典型在 \hwtiming{10--30 pJ/bit}，片内互连则低于 1 pJ/bit——同一份数据少出一次芯片，就省下一次数量级的能量。
+
+迁移分三步走完，每一步搬走的东西都很具体：
+
+\begin{longtable}{L{0.14\linewidth}L{0.40\linewidth}L{0.36\linewidth}}
+\toprule
+阶段 & 结构 & 被搬近的路径 \\
+\midrule
+北桥 + 南桥 & 北桥管内存/图形，南桥管低速 I/O，hub 链路相连 & 内存与图形集中到北桥，I/O 集中到南桥 \\
+PCH & 内存控制器、PCIe 根复合体进 CPU；南桥余部 + 固件接口改称 PCH（Platform Controller Hub），经 DMI（Direct Media Interface，直接媒体接口）连 CPU & cache miss 到 DRAM 不再跨芯片；DMI 本质是一条窄化的 PCIe（$\times$4，量级 4--8 GB/s） \\
+SoC & 图形、显示、外设控制全部收进同一 die 或同一封装 & 常见路径不出芯片，只剩电源、时钟和低速引脚外连 \\
+\bottomrule
+\end{longtable}
+
+既然集成度提高总是更快更省，为什么台式机至今仍是“CPU + PCH”两颗？三个原因都很实际。其一是引脚：低速 I/O 数量大、各占一根引脚，收进 CPU 要占用大量引脚与 die 边缘面积，换来的收益却很小——SATA 盘本来就比 DRAM 慢好几个数量级。其二是工艺：LPC、RTC、模拟监控这类电路工作电压高、对最先进逻辑工艺并不友好，放在成熟工艺的 PCH 上更便宜。其三是产品分档：同一颗 CPU 搭配不同档次的 PCH（通道数、USB 口数不同），不必为每个市场单独流片。理解“什么该集成”与理解“集成了什么”同样重要：集成的是延迟敏感的高频路径，留下的是引脚密集、速度不敏感的长尾。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % === CPU die 容器 ===
+  \draw[draw=BookNavy, fill=BookCodeBg, line width=0.6pt, rounded corners=4pt] (0.5,8.2) rectangle (6.4,10.6);
+  \node[hw label, font=\scriptsize\bfseries, text=BookNavy, anchor=west] at (0.7,10.3) {CPU die};
+  \node[hw compute] (core) at (1.5,9.4) {核心+LLC};
+  \node[hw control] (rc) at (3.45,9.4) {PCIe 根\\复合体};
+  \node[hw compute] (imc) at (5.35,9.4) {内存控制器};
+  % === DIMM ===
+  \node[hw memory] (dimm) at (8.3,9.4) {DDR5 DIMM\\$\times$2};
+  \draw[hw bus] (imc.east) -- (dimm.west);
+  \node[hw label, font=\tiny, anchor=south] at (8.3,10.05) {DDR5-4800 双通道\\$\approx$77 GB/s};
+  % === PCIe 设备 ===
+  \node[hw compute] (gpu) at (1.5,6.2) {GPU\\$\times$16};
+  \node[hw compute] (nvme) at (4.0,6.2) {NVMe SSD\\$\times$4};
+  \draw[BookMuted, line width=0.62pt] (rc.south) -- (3.45,7.7);
+  \draw[BookMuted, line width=0.62pt] (1.5,7.7) -- (4.0,7.7);
+  \draw[hw bus] (1.5,7.7) -- (gpu.north);
+  \draw[hw bus] (4.0,7.7) -- (nvme.north);
+  \node[hw label, font=\tiny, anchor=west] at (1.65,7.15) {$\approx$32 GB/s};
+  \node[hw label, font=\tiny, anchor=west] at (4.15,7.15) {$\approx$8 GB/s};
+  % === DMI 与 PCH ===
+  \draw[hw bus] (5.9,8.2) -- (5.9,5.0);
+  \node[hw label, font=\tiny, anchor=west] at (6.05,6.5) {DMI $\times$4 $\approx$8 GB/s};
+  \draw[draw=BookNavy, fill=white, line width=0.6pt, rounded corners=4pt] (1.0,2.8) rectangle (6.8,5.0);
+  \node[hw label, font=\scriptsize\bfseries, text=BookNavy, anchor=west] at (1.2,4.68) {PCH};
+  \node[hw label, text=BookInk] at (3.9,3.9) {SATA · USB 主控 · 以太网 MAC\\[2pt] LPC/eSPI · SPI · SMBus\\[2pt] RTC · GPIO · 定时器 · 中断};
+  % === PCH 下游设备 ===
+  \draw[BookMuted, line width=0.62pt] (3.9,2.8) -- (3.9,2.2);
+  \draw[BookMuted, line width=0.62pt] (1.05,2.2) -- (8.4,2.2);
+  \node[hw memory] (sata) at (1.05,1.1) {SATA 盘};
+  \node[hw state] (usb) at (2.95,1.1) {USB 设备};
+  \node[hw state] (gbe) at (4.65,1.1) {GbE PHY};
+  \node[hw compute] (ec) at (6.45,1.1) {EC /\\Super I/O};
+  \node[hw memory] (flash) at (8.4,1.1) {BIOS\\flash};
+  \draw[hw bus] (1.05,2.2) -- (sata.north);
+  \draw[hw bus] (2.95,2.2) -- (usb.north);
+  \draw[hw bus] (4.65,2.2) -- (gbe.north);
+  \draw[hw bus] (6.45,2.2) -- (ec.north);
+  \draw[hw bus] (8.4,2.2) -- (flash.north);
+  \node[hw label, font=\tiny, anchor=west, fill=white, inner sep=1pt] at (1.15,1.88) {6 Gb/s};
+  \node[hw label, font=\tiny, anchor=west, fill=white, inner sep=1pt] at (3.05,1.88) {10/20 Gb/s};
+  \node[hw label, font=\tiny, anchor=west, fill=white, inner sep=1pt] at (4.75,1.88) {1 Gb/s};
+  \node[hw label, font=\tiny, anchor=west, fill=white, inner sep=1pt] at (6.55,1.88) {LPC/eSPI};
+  \node[hw label, font=\tiny, anchor=west, fill=white, inner sep=1pt] at (8.5,1.88) {SPI $\approx$50 MB/s};
+\end{pdfdiagram}
+\diagramnote{现代 PC 平台拓扑与带宽量级（单向）。CPU die 内的内存控制器与 PCIe 根复合体接管最快的路径：DRAM 直连内存控制器，GPU 与 NVMe SSD 挂在根复合体上；PCH 经 DMI 汇聚全部低速 I/O。注意图上每一处带宽差距都在 10 倍以上——DRAM 约 77 GB/s，DMI 约 8 GB/s，SATA 约 600 MB/s，LPC 与 SPI 只有数十 MB/s——这个落差正是“快慢分桥”的原因。软件侧的直接对应：\code{lspci -tv} 输出的顶层设备 host bridge 与 ISA bridge，就是 CPU 内根复合体与 PCH 在 PCI 模型中的投影。}
+
+%======================================================================
+\topic{3.2\quad PCIe 根复合体与设备枚举}
+%======================================================================
+
+\term{根复合体}{root complex}是 CPU 与 PCIe 之间的翻译器，工作方向有两个。向下，它把 CPU 对物理地址的读写翻译成 PCIe 事务层包（TLP）发往相应设备——对 BAR 窗口的 MMIO 写变成一个 Memory Write TLP；向上，它把设备发来的 TLP（DMA 读写、MSI 中断消息）翻译成对 CPU 一致性域内存的访问。路由规则分两类：\hwkey{地址路由}用于内存事务，按目标地址落在哪个桥或设备的窗口里逐级转发；\hwkey{ID 路由}用于配置事务与消息，按 BDF 定位。所谓 \term{BDF}{bus:device:function} 是 PCIe 给每个功能的编号：8 位总线号、5 位设备号、3 位功能号，合起来就是 \code{lspci} 输出里 \code{0000:03:00.0} 这样的地址。
+
+设备要被软件使用，先要能被软件找到。每个 PCIe 功能带 4 KiB \hwkey{配置空间}，头部 64 字节是标准布局：偏移 \code{0x00} 处是厂商 ID 与设备 ID，读回全 1（\code{0xFFFFFFFF}）表示该位置没有设备；偏移 \code{0x10} 起是 BAR。配置空间本身又通过 \term{ECAM}{enhanced configuration access mechanism} 映射进物理地址空间：把 256 条总线 $\times$ 32 个设备 $\times$ 8 个功能 $\times$ 4 KiB 共 256 MiB 映射到一段 MMIO，某个寄存器的地址为
+
+\[
+\text{addr} = \text{base} + (\text{bus}\ll 20) \mathbin{|} (\text{dev}\ll 15) \mathbin{|} (\text{fun}\ll 12) + \text{reg}
+\]
+
+基址 base 由固件经 ACPI 的 MCFG 表告诉操作系统。于是“读一块网卡的设备 ID”对内核来说就是一次普通 load——配置这件事不需要任何专用指令，这是本节核心思想的第一处体现。
+
+配置头分两种。类型 0 是端点设备（网卡、SSD、显卡），类型 1 是桥（根端口、switch 下游口），区别在于中段：端点用 BAR 声明自己要多少地址窗口，桥用三个总线号寄存器声明自己下游挂着哪段总线。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw label, font=\scriptsize\bfseries, text=BookNavy] at (3.0,5.35) {类型 0：端点设备};
+  \node[hw label, font=\scriptsize\bfseries, text=BookNavy] at (9.0,5.35) {类型 1：桥};
+  % 左列：类型 0（0x0C 行单独画，便于高亮）
+  \foreach \y/\off/\txt in {
+    4.60/0x00/Device ID（16 位）｜Vendor ID（16 位）,
+    3.88/0x04/Status｜Command,
+    2.44/0x10/BAR0 … BAR5（0x10--0x24，六个窗口）,
+    1.72/0x2C/子系统 Vendor ID｜子系统 Device ID,
+    1.00/0x3C/Int Pin｜Int Line} {
+    \draw[fill=BookCodeBg, draw=BookRule, line width=0.4pt] (0.6,\y-0.3) rectangle (5.4,\y+0.3);
+    \node[hw label, font=\tiny, text=BookInk] at (3.0,\y) {\txt};
+    \node[hw label, font=\tiny, anchor=east] at (0.55,\y) {\off};
+  }
+  \draw[fill=BookAmber!20, draw=BookRule, line width=0.4pt] (0.6,2.86) rectangle (5.4,3.46);
+  \node[hw label, font=\tiny, text=BookInk] at (3.0,3.16) {Header Type = 0x00（端点）};
+  \node[hw label, font=\tiny, anchor=east] at (0.55,3.16) {0x0C};
+  % 右列：类型 1
+  \foreach \y/\off/\txt in {
+    4.60/0x00/Device ID｜Vendor ID,
+    3.88/0x04/Status｜Command,
+    2.44/0x18/Primary｜Secondary｜Subordinate 总线号,
+    1.72/0x20/下游内存窗口 基址/限长} {
+    \draw[fill=BookCodeBg, draw=BookRule, line width=0.4pt] (6.6,\y-0.3) rectangle (11.4,\y+0.3);
+    \node[hw label, font=\tiny, text=BookInk] at (9.0,\y) {\txt};
+    \node[hw label, font=\tiny, anchor=east] at (6.55,\y) {\off};
+  }
+  \draw[fill=BookAmber!20, draw=BookRule, line width=0.4pt] (6.6,2.86) rectangle (11.4,3.46);
+  \node[hw label, font=\tiny, text=BookInk] at (9.0,3.16) {Header Type = 0x01（桥）};
+  \node[hw label, font=\tiny, anchor=east] at (6.55,3.16) {0x0C};
+\end{pdfdiagram}
+\diagramnote{PCIe 配置头对比（每格一行为一个 32 位寄存器，左侧标注偏移）。前 16 字节两种类型相同：Vendor/Device ID 标识身份，Command 寄存器里的 Memory Space Enable 与 Bus Master Enable 两位决定设备是否响应 MMIO、是否允许发起 DMA。高亮行是 Header Type 字段（位于字节 0x0E，图中按所在行首偏移 0x0C 标注），枚举软件靠它分流。类型 0 的六个 BAR 声明地址窗口需求；类型 1 的三个总线号寄存器圈出下游总线范围，上游按它做 ID 路由。}
+
+BAR（Base Address Register，基址寄存器）的分配过程是一段精巧的硬件约定。上电时 BAR 内容未定，固件按三步处理每个 BAR：先写入全 1 再读回——窗口位可写、低位硬连线为 0，读回值的最低置位即窗口大小，例如读回 \code{0xFFFF0000} 表示设备要 64 KiB；然后从空闲物理地址池中分一段满足对齐的窗口写回 BAR；最后置 Command 寄存器的使能位。此后设备内部的地址译码器只响应落在该窗口内的访问。64 位 BAR 占相邻两个槽位；最低位区分内存窗口与 I/O 端口窗口。NVMe 控制器、网卡、显卡的驱动能看到的全部 MMIO 寄存器，都住在这样分出来的窗口里。
+
+枚举（enumeration）把上述过程组织成一次深度优先遍历。固件从根总线 0 开始扫描全部 dev/fun 位置，读到桥就给它分配一个 secondary 总线号并递归扫描下游，回溯时把下游最大总线号写进 subordinate 寄存器；读到端点就探测 BAR 并分配窗口：
+
+\begin{lstlisting}
+scan_bus(bus):
+    for dev in 0..31, fun in 0..7:
+        id = cfg_read(bus, dev, fun, 0x00)
+        if id == 0xFFFFFFFF: continue     # 该位置无设备
+        if header_type == 0x01:           # 桥
+            set secondary = next_bus++
+            scan_bus(secondary)           # 递归下游
+            set subordinate               # 回填下游最大总线号
+        else:                             # 端点
+            probe BARs                    # 写全 1 探测大小
+            分配 MMIO/IO 窗口并写回 BAR
+\end{lstlisting}
+
+遍历结束时，整棵树的每个功能都有了确定的 BDF、确定的地址窗口，桥上的总线号范围支持 ID 路由，整条链路可以开始跑内存事务。这段工作在传统上由 BIOS/UEFI 固件完成，操作系统启动后通常沿用固件分配的结果（Linux 也保留重新分配的能力）；\code{/sys/bus/pci/devices/} 下的目录名就是 BDF，\code{resource} 文件里就是每个 BAR 领到的窗口。
+
+\begin{warningbox}
+BAR 窗口是“一段地址”，不是“一段内存”。这段物理地址背后没有 DRAM，读它得到的是设备寄存器的当前值，写它驱动的是设备的状态机——主存与总线章第三节讲的 MMIO 副作用规则在这里全部适用：窗口必须按不可缓存（UC）属性映射，不能用 \code{memcpy} 式的块拷贝访问 32 位寄存器，也不能指望写返回就代表设备动作完成。另外，窗口之间、窗口与 DRAM 之间不允许重叠；重叠时两个目标同时响应一次访问，结果是总线冲突或数据错乱，且往往表现为与软件无关的随机故障。
+\end{warningbox}
+
+%======================================================================
+\topic{3.3\quad 中断控制器演进：8259、APIC 与 MSI/MSI-X}
+%======================================================================
+
+8259 的内部机制——IRR/IMR/ISR 三张寄存器、EOI（End Of Interrupt，中断结束）纪律、优先级裁决——主存与总线章第四节已经讲过，经典芯片与平台章也走完了一次 INTR 从请求到 INTA 周期的完整链路。这里只补它在整机中的位置与瓶颈。PC/AT 起用两片 8259 级联：从片的 INT 输出接主片的 IR2，共提供 15 条可用中断线，IRQ 号与设备的对应关系被写死成平台约定：
+
+\begin{longtable}{L{0.10\linewidth}L{0.34\linewidth}L{0.49\linewidth}}
+\toprule
+IRQ & 固定对应 & 说明 \\
+\midrule
+0 & PIT 8254 通道 0 & 系统心跳，见 3.5 小节 \\
+1 & 键盘控制器 & 8042，后由 EC 继承 \\
+2 & 级联线 & 从片 INT 接主片 IR2，本身不可用 \\
+3 / 4 & COM2 / COM1 & 串口 \\
+6 & 软盘控制器 & 与 DMA 通道 2 配套 \\
+8 & RTC & 闹钟与周期中断 \\
+12 & PS/2 鼠标 & \\
+14 / 15 & 主/从 IDE 通道 & \\
+\bottomrule
+\end{longtable}
+
+这套结构在单 CPU、十几个设备的时代够用，瓶颈在四个方向同时出现：线数封顶 15，设备多起来只能共享；共享线在边沿触发下不可靠，两个设备恰好同时请求时后一个沿会被吞掉；优先级固定，IRQ 号小的永远压过大的；而且整套机制只认一个 CPU——向量表、EOI、屏蔽全是全局唯一的一份。多核时代需要的恰恰相反：中断线要多、要能定向到指定核、要让高频设备（网卡、SSD）独占向量。
+
+APIC（Advanced Programmable Interrupt Controller，高级可编程中断控制器）把中断控制器拆成两半。\hwkey{Local APIC} 每个 CPU 核一个，MMIO 基址 \code{0xFEE00000}，内部有任务优先级寄存器 TPR（只有高于该阈值的中断才被投递）、按 256 个向量各一位的 IRR/ISR、EOI 寄存器、本地向量表 LVT（本核的定时器、温度传感器、性能计数溢出等本地中断源）以及标识自己身份的 APIC ID。\hwkey{IO APIC} 在 PCH 内，对外收设备的 IRQ 引脚，内部是一张重定向表（典型 24 项），每项指定：这个引脚来的请求译成几号向量、按什么方式投递（固定、最低优先级、SMI 系统管理中断、NMI）、送往哪个或哪些核的 APIC ID、电平还是边沿触发、极性与屏蔽。设备拉起 IRQ 线后，IO APIC 查表生成一条中断消息，经系统互连送到目标核的 Local APIC，后者按 TPR 与 IRR/ISR 判优，在指令边界向 CPU 投递向量号，CPU 查 IDT 进入处理程序。\hwkey{中断亲和性}（affinity）就是写重定向表的目标字段：把网卡队列的中断固定在某个核上，cache 与协议栈状态都留在本地；Linux 的 irqbalance 守护进程做的就是动态调整这些字段。
+
+\term{MSI}{message-signaled interrupt} 更进一步，干脆取消中断引脚：设备要发中断时，往 \code{0xFEExxxxx} 区间做一次 32 位内存写——地址位编码目标核的 APIC ID，数据低 8 位是向量号。这次写经 PCIe 到达根复合体，被解释成一条中断消息转交 Local APIC。预先约定的那对“地址 + 数据”由操作系统在设备初始化时写进设备的 MSI capability 寄存器。MSI 允许每设备最多 32 个向量且必须取 2 的幂连续分配；\term{MSI-X}{MSI extended} 把这个限制放宽到 2048 个向量，每向量有独立的地址、数据与屏蔽位，表格本身放在 BAR 窗口里。MSI-X 的意义不只是数量：网卡、NVMe SSD 可以给每个收发队列配一个独立向量、定向到不同核，中断路径与数据路径按队列一一对应——存储器件结构章第五节讲的 NVMe 每核一对队列，配对的正是一个 MSI-X 向量。
+
+MSI 还有一条容易被忽视的保序性质：它是一次 posted write，遵循 PCIe 的排序规则，不会越过同一设备先发的 DMA 数据写。因此“DMA 写完数据 $\to$ 发 MSI”这个序列到达内存系统的顺序与发出顺序一致，中断处理程序读到的一定是完整数据，不需要额外的人工同步——引脚时代“中断先到、数据还在路上”的竞态在机制上被消除了。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw compute] (legacy) at (1.3,5.8) {传统设备\\（IRQ 引脚）};
+  \node[hw compute] (pciedev) at (1.3,2.8) {PCIe 设备\\（MSI/MSI-X）};
+  \node[hw control] (ioapic) at (5.0,5.8) {IO APIC（PCH 内）\\24 项重定向表};
+  \node[hw control] (lapic) at (9.9,5.8) {Local APIC（每核一个）\\\texttt{0xFEE0\,0000}};
+  \node[hw state] (cpu) at (9.9,7.9) {CPU 核\\IDT $\to$ 处理程序};
+  \draw[hw bus] (legacy.east) -- (ioapic.west);
+  \node[hw label, font=\tiny, anchor=south] at (2.8,5.92) {IRQn};
+  \draw[hw bus] (ioapic.east) -- (lapic.west);
+  \node[hw label, font=\tiny, anchor=south] at (7.45,5.92) {中断消息};
+  \draw[hw bus] (pciedev.east) -- (9.9,2.8) -- (lapic.south);
+  \node[hw label, font=\tiny, anchor=south, fill=white, inner sep=1pt] at (5.9,3.02) {MSI：写 \texttt{0xFEEx\,xxxx}，地址选核、数据含向量};
+  \draw[hw bus] (lapic.north) -- (cpu.south);
+  \node[hw label, font=\tiny, anchor=east] at (9.7,6.85) {按 TPR 判优后投递};
+\end{pdfdiagram}
+\diagramnote{中断从设备到 CPU 的两条投递路径在 Local APIC 汇合。引脚路径：设备拉 IRQ 线，IO APIC 查重定向表得到向量号与目标核，生成中断消息送往该核的 Local APIC。MSI 路径：设备直接对 \code{0xFEE} 开头的地址做一次内存写，地址本身携带目标核，数据携带向量号，不经任何引脚。Local APIC 按 TPR 与 IRR/ISR 判优后在指令边界投递，CPU 查 IDT 进入处理程序。软件侧的观察窗口是 \code{/proc/interrupts}：每一行是一个向量，每一列是一个核的计数——从计数的分布可以直接读出亲和性配置与设备申请到的 MSI-X 向量数。}
+
+\begin{classicnote}
+CSAPP 第 8 章把中断归入“异步异常”，并用定时器与磁盘完成通知作为例子说明控制流如何在任意指令边界被打断。本节给出的是“异步”两个字背后的投递硬件：从 8259 的一根 INTR 引脚，到 IO APIC 的一张重定向表，再到 MSI 的一次内存写——异步性没有变，变的是路由的表达能力。
+\end{classicnote}
+
+%======================================================================
+\topic{3.4\quad DMA 控制器与 IOMMU}
+%======================================================================
+
+8237 作为 DMA 控制器的经典样本，主存与总线章第四节已经讲到通道寄存器、页寄存器与单字/块模式的细节，这里只补它的整机编年：PC/AT 把两片 8237 级联出 7 个通道（通道 4 用于级联本身），软盘固定占通道 2，声卡驱动配置里的“DMA 1、DMA 5”说的就是它；它本质是一台独立的搬运状态机，每传一字节都要向 CPU 借一次总线（单字模式）。1990 年代起它被淘汰的原因很直接——速度。每字节一次握手让它的吞吐停在 MB/s 量级，而 PCI 设备自己发起突发传输能快两个数量级。于是 DMA 引擎改为分散在每个高速设备内部，即 \hwkey{bus-master DMA}：设备自己当总线主，按描述符环批量搬运（描述符环与可见性规则见主存与总线章，NVMe 的队列与 PRP 见存储器件结构章第五节）。“中央 DMA 控制器”这个角色就此消失，8237 只在 LPC 上留一个兼容影子。
+
+但 DMA 引擎分散之后，留下一个集中式时代不突出的问题：\hwkey{地址治理}。设备发起的 DMA 读写不经过 CPU，也不经过 MMU——页表管的是指令发出的虚拟地址，管不到设备发出的地址。一块固件有缺陷的网卡、一个有 bug 的驱动，往描述符里写了错误地址，DMA 就原样写坏任意物理内存，连页错误都不会产生。虚拟化场景更尖锐：把网卡直通给虚拟机后，客户机驱动按它以为的物理地址（guest 物理地址）编程设备，而这些地址在主机上对应着别的内存。
+
+\term{IOMMU}{I/O memory management unit}（Intel 称 VT-d，AMD 称 AMD-Vi）的解法是把 MMU 的页表机制复制一份给设备用。每个 DMA 事务都携带来源标识 source-id，就是发起者的 BDF；IOMMU 先用总线号索引\hwkey{根表}（256 项），再用设备号/功能号索引\hwkey{上下文表}，得到该设备所属域的二级页表基址；随后像 MMU 一样做多级页表 walk，把设备发出的 \term{IOVA}{I/O virtual address} 翻译成真正的物理地址，翻译结果缓存于 IOTLB，高端设备还可以持有 ATS（Address Translation Services，地址翻译服务）缓存把翻译移到设备侧。查不到映射或权限不符，本次 DMA 被拒绝并产生 IOMMU fault 中断，错误被限制在事件级别而不是内存损坏。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw compute] (dev) at (1.0,3.0) {PCIe 设备\\（bus-master）};
+  \node[hw state] (root) at (3.6,3.0) {根表\\按 bus 索引};
+  \node[hw state] (ctx) at (6.2,3.0) {上下文表\\按 dev/fun};
+  \node[hw state] (spt) at (8.6,3.0) {二级页表\\IOVA $\to$ PA};
+  \node[hw memory] (dram) at (10.7,3.0) {DRAM\\物理页};
+  \draw[hw bus] (dev.east) -- (root.west);
+  \draw[hw bus] (root.east) -- (ctx.west);
+  \draw[hw bus] (ctx.east) -- (spt.west);
+  \draw[hw bus] (spt.east) -- (dram.west);
+  \node[BookRed, font=\tiny\bfseries] at (2.3,3.3) {\textcircled{1}};
+  \node[BookRed, font=\tiny\bfseries] at (4.9,3.3) {\textcircled{2}};
+  \node[BookRed, font=\tiny\bfseries] at (7.4,3.3) {\textcircled{3}};
+  \node[BookRed, font=\tiny\bfseries] at (9.8,3.3) {\textcircled{4}};
+  \node[hw label, font=\tiny, text=BookRed] at (6.0,2.1) {任何一级查无映射或权限不符 $\to$ IOMMU fault，本次 DMA 被拒绝};
+  \node[hw label, font=\tiny] at (6.0,1.72) {OS 经 DMA 映射接口为每个缓冲区建立 IOVA $\to$ PA 页表项，根表基址由 OS 写入};
+\end{pdfdiagram}
+\diagramnote{IOMMU 对一次 DMA 的翻译链。\textcircled{1} 设备发起 DMA，事务携带来源标识（BDF）与 IOVA；\textcircled{2} 根表项（按总线号索引，共 256 项）给出上下文表基址；\textcircled{3} 上下文项（按设备号/功能号索引）给出该设备域的二级页表基址与域标识；\textcircled{4} 页表 walk（结果缓存于 IOTLB）得出物理地址，访问发往 DRAM。结构上它与 MMU 完全同构——区别只在触发者是设备而不是指令，页表按“设备域”而不是按“进程”组织。}
+
+IOMMU 的用途按重要性排有三层。第一是保护：操作系统只为缓冲区建立映射，设备越出映射范围即 fault，驱动 bug 与恶意固件的破坏半径被限制在分配给它的页内。第二是虚拟化直通：把物理网卡分给虚拟机，客户机驱动照常工作，IOMMU 把 guest 物理地址再翻译一层到 host 物理地址——虚拟机获得接近原生的 I/O 性能，隔离性却由硬件维持，云主机的网卡直通走的就是这条路。第三是兼容：只能发 32 位地址的老设备，经重映射后可以使用任意位置的缓冲区，不再依赖低 4 GiB 的保留区。代价同样实在：映射的建立与撤销、IOTLB 失效广播都有开销，高频小包场景下 DMA 映射开销可观，工程上的对策是大页、预分配映射池，以及可信环境下用直通模式（Linux 的 \code{iommu=pt}）让 IOVA 恒等映射物理地址、跳过逐缓冲区建表。
+
+\begin{warningbox}
+开启 IOMMU 之后，“DMA 地址等于物理地址”这条假设就失效了。驱动拿到的 \code{dma_addr_t} 是 IOVA，只有通过 DMA 映射接口（\code{dma_map_single} 等）建立映射后得到的地址才能写给设备；把 \code{virt_to_phys} 的结果直接填进描述符，轻则在 IOMMU 开启的机器上触发 fault，重则在映射恰好撞上别的页时写坏无关内存。这也是跨平台驱动代码必须走 DMA API 而不能省的原因。
+\end{warningbox}
+
+%======================================================================
+\topic{3.5\quad 定时器家族：操作系统的心跳从哪来}
+%======================================================================
+
+操作系统对时间有三种需求：周期性的节拍（驱动调度、时间片、超时轮询）、到点即响的单次截止（高精度定时器）、以及可读取的时间戳（测量与日志）。一颗定时器很难同时做好三件事，于是平台上并存着一整族定时器，各管一段。
+
+\hwkey{PIT 8254} 是最老的一员。输入时钟 \hwtiming{1.193182 MHz}（14.31818 MHz 晶振的十二分频，这个奇怪的数字来自 PC 对 NTSC 彩色副载波的复用），片内三个 16 位通道：通道 0 接 IRQ0 产生周期中断，通道 1 曾用于 DRAM 刷新，通道 2 驱动蜂鸣器。除数最大 65536，对应最低频率约 \hwtiming{18.2 Hz}——早期 DOS 的心跳就是它；后来的操作系统把节拍提到 100 Hz、250 Hz、1000 Hz。它的局限在多核时代很突出：全系统只有一颗，重编程要走慢速端口 I/O，分辨率也只有约 0.84 $\mu$s。
+
+\hwkey{HPET} 是替代方案：一个 64 位主计数器以不低于 \hwtiming{10 MHz} 的频率走字（典型值 14.31818 MHz），配至少 3 个比较器，任一比较器匹配即可产生中断，支持单次与周期两种模式。寄存器全部 MMIO 映射，读写比端口 I/O 快，比较器数量也够多个定时源并存。但它仍在 PCH 里，读一次主计数器是一次跨芯片的 MMIO 往返，代价在数十纳秒量级——做中断源合格，做高频时间戳不合格。
+
+\hwkey{Local APIC timer} 把定时器挪回每个核内部：以总线或核心时钟分频后的频率对一个初始计数值做减计数，减到 0 经 LVT 投递中断，有单次、周期、TSC-deadline 三种模式。每核私有意味着中断天然定向本核、不需要任何跨核仲裁，这正是无滴答（tickless）内核给每个核独立编程下一次唤醒点的硬件基础；要注意的是深度睡眠状态可能停走这颗定时器，唤醒源需要另行安排。
+
+\hwkey{TSC}（Time Stamp Counter，时间戳计数器）严格说不是定时器而是计数器：每核一个 64 位寄存器，随核心基准频率走字，现代处理器保证 invariant——变频、休眠都不改变它的速率与连续性。\code{rdtsc} 读它一次约 \hwtiming{20--30 拍}，分辨率在纳秒量级，因此成为时间戳的事实标准：\code{clock_gettime} 的快路径（vDSO，virtual dynamic shared object，内核映射到用户态的共享页）就是读 TSC 再乘一个校准好的换算系数，根本不进内核。TSC-deadline 模式则把 Local APIC timer 与 TSC 接在一起：直接写一个目标 TSC 值作为比较点，省去了“想要 5 $\mu$s 后中断”到“该写多少计数”之间的频率换算。
+
+\begin{longtable}{L{0.13\linewidth}L{0.19\linewidth}L{0.18\linewidth}L{0.17\linewidth}L{0.21\linewidth}}
+\toprule
+器件 & 时钟源 & 分辨率/读代价 & 中断去向 & 典型软件用途 \\
+\midrule
+PIT 8254 & 1.193182 MHz & $\sim$0.84 $\mu$s/端口 I/O & 全局 IRQ0 & 早期 tick，今多为兼容保留 \\
+HPET & $\geq$10 MHz（典型 14.3 MHz） & $\sim$70 ns/跨芯片 MMIO & 可经 IO APIC 定向 & 传统高精度 tick、校准参考 \\
+LAPIC timer & 总线/核心时钟分频 & ns 级/片内寄存器 & 本核 LVT & tickless 内核的 per-cpu 定时 \\
+TSC & invariant 核心基准频率 & ns 级/$\sim$20--30 拍 & 无（仅计数） & 时间戳、vDSO 快路径、性能测量 \\
+RTC（见 3.6） & 32.768 kHz 音叉晶振 & 1 s & IRQ8（闹钟） & 墙钟初值、定时开机 \\
+\bottomrule
+\end{longtable}
+
+把这张表与“操作系统的心跳”对应起来：早期内核的 tick 来自 PIT 或 HPET 的周期中断，每个 tick 到来时调度器统计时间消耗、检查时间片、推进超时队列；现代 tickless 内核把周期中断省掉，空闲核按最近的截止时刻给 LAPIC timer 编程一个单次比较，真正有事才醒。值得分清的是两组“精度”：PIT、HPET、LAPIC timer、TSC 四者的分辨率与访问代价相差三个数量级（PIT 的亚微秒到 TSC 的纳秒），但长期漂移都由晶振决定，全部在 ppm 量级（电源时钟章第二节讨论过晶振与抖动）——也就是说，这些定时器“走得一样准，看得不一样细”，跨天级别的准确度从来不是靠它们中的任何一个，而是靠 NTP 之类的协议持续校准。
+
+%======================================================================
+\topic{3.6\quad 小但不可缺的控制器：RTC、GPIO、SMBus、Super I/O、EC 与 TPM}
+%======================================================================
+
+平台上最后一类控制器速度慢、体积小，却各自守着一项整机缺它不可的职能。逐个看一遍，重点是它们各自在软件世界里留下的入口。
+
+\hwkey{RTC}（Real-Time Clock，实时时钟）由一颗 32.768 kHz 音叉晶振驱动——选这个频率是因为 $32768=2^{15}$，十五级二分频恰好得到 1 Hz。它挂在纽扣电池上，整机关机后照走，寄存器里以 BCD 格式保存年月日时分秒，还能在设定时刻或按周期发闹钟中断（传统 IRQ8），旁带一小片同样由电池保持的 CMOS RAM，早年用来存启动顺序等固件设置。软件碰到它的方式很固定：内核启动早期读 RTC 初始化墙钟，之后系统时间靠 NTP 校准，RTC 只负责“下一次上电时还记得大概是几点”。它的精度在 $\pm$20 ppm 量级，一天能漂出秒级，所以角色是上电初值而不是计时基准——定时开机、从 S3/S5 唤醒闹钟才是它不可替代的部分。
+
+\hwkey{GPIO}（General-Purpose I/O，通用输入输出）是 PCH 上一把可逐位配置的引脚：每位有方向、输出电平、输入状态三类寄存器，有的还带中断与去抖能力。电源键、复位线、LED、风扇转速检测、电平开关，整机上一切“非协议”的单比特信号都挂在 GPIO 上。软件侧，驱动直接读写 PCH 的 GPIO 寄存器块；Linux 的入口从 \code{/sys/class/gpio} 演进到了 libgpiod；慢速的器件协议（如某些传感器）也常靠软件翻转 GPIO 模拟出来。
+
+\hwkey{I2C/SMBus} 的协议本身——两根开漏线、起始/停止条件、地址加读写位——主存与总线章第三节已经讲过；SMBus 是 I2C 在系统管理场景下的子集，速率 100 kHz，命令语义固定（读字节、写字节、块读）。它在整机中有两条著名用途。其一是内存条上的 \term{SPD}{Serial Presence Detect} EEPROM：固定占地址 \code{0x50}--\code{0x57}，里面存着厂商、容量、die 组织和一整套时序参数表，固件上电后第一件事就是沿 SMBus 逐条读出 SPD，据此配置内存控制器的频率与时序——存储器件结构章第二节那些 CL、tRCD、tRP 参数，开机时就是从这几百个字节里来的。其二是主板上的电压/温度传感器，lm-sensors 读到的数据全部来自这条总线。
+
+\hwkey{Super I/O} 是 LPC 总线上的老牌合集芯片：串口 UART、并口、PS/2 键盘鼠标口、风扇控制与硬件监控各收一份，配置走 \code{0x2E}/\code{0x4E} 端口的索引/数据寄存器对。台式机主板上它至今常见，风扇调速曲线、电压监控都由它执行，内核的 hwmon 子系统里有专门的驱动家族。笔记本里这个角色通常并入了下一位。
+
+\hwkey{EC}（Embedded Controller，嵌入式控制器）是笔记本主板上的一颗小单片机——历史上多为 8051 核，现在常见 ARM 或 RISC-V 核——接在常电域上，关机插电时也在运行。它管键盘矩阵扫描、电池充放电管理、风扇、温度采样、电源键与盖子开关，是“按一下电源键机器才会醒”这条链路的起点。与操作系统的接口走 ACPI：有事件时 EC 拉起 SCI（System Control Interrupt，系统控制中断）中断，OS 执行对应的 ACPI 控制方法，再经共享寄存器区读写 EC 状态。理解 EC 就理解了“关机不等于断电”：主板上始终有一台小电脑在值班，等待下一次按键。
+
+\hwkey{TPM}（Trusted Platform Module，可信平台模块）是一颗独立的安全芯片（LPC、SPI 或 I2C 接口；现代 CPU 也提供固件实现 fTPM），内部有非对称与对称加密引擎、单调计数器、受保护的密钥存储，以及一组 \term{PCR}{platform configuration register}。PCR 的特性是只能 extend 不能写：新值 $=$ hash（旧值 $\|$ 度量值）。启动链上每一级固件在把控制权交给下一级之前，先把下一级代码的哈希 extend 进 PCR，于是整条启动路径被记录为一组不可伪造的寄存器值。密钥封存（sealing）利用这一点：全盘加密的卷密钥可以按“仅当 PCR 匹配预期值才释放”的条件封存，启动链任何一环被替换，密钥就取不出来。软件入口是 \code{/dev/tpm0} 与操作系统的安全栈（BitLocker、LUKS+TPM、安全启动）。
+
+\begin{longtable}{L{0.15\linewidth}L{0.24\linewidth}L{0.24\linewidth}L{0.30\linewidth}}
+\toprule
+器件 & 挂接与供电 & 核心职能 & 软件入口 \\
+\midrule
+RTC & 32.768 kHz 晶振 + 纽扣电池 & 墙钟保持、闹钟/唤醒 & 内核读初值，hwclock，NTP 校准 \\
+GPIO & PCH 寄存器块，常电/主电兼有 & 单比特信号进出 & 驱动直接读写，libgpiod \\
+SMBus/I2C & PCH 主控，100 kHz & SPD、传感器 & BIOS 读 SPD；i2c 子系统，lm-sensors \\
+Super I/O & LPC，主电域 & 串并口、风扇、监控 & hwmon 驱动 \\
+EC & LPC/eSPI，常电域 & 电池、风扇、键盘、电源键 & ACPI 方法 + SCI 中断 \\
+TPM & LPC/SPI/I2C 或 fTPM & 密钥存储、启动度量 & \code{/dev/tpm0}，全盘加密封存 \\
+\bottomrule
+\end{longtable}
+
+至此，本节的对象可以收成一句话：整机不是一颗 CPU 加一堆外设，而是一套\hwkey{分层的控制结构}——最快的路径收进 CPU die，慢的长尾留给 PCH 与一众小控制器，层与层之间全部用地址空间中的事务说话。设备枚举决定了每块硬件在地址空间里的位置，中断路由决定了事件如何找到正确的核，IOMMU 决定了设备的 DMA 能碰到哪些内存，定时器决定了操作系统何时醒来；这四件事加上小控制器们的值守，共同构成了 CPU 控制整台机器的控制平面。
+% ch06b part3: 第四节 主板：供电、时钟与固件

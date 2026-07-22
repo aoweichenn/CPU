@@ -1,0 +1,319 @@
+\chapter{PCIe 与高速串行接口}
+
+\begin{keyidea}
+PCIe 把并行总线问题转换为分层数据包、链路训练和配置空间问题。本章沿枚举、BAR、事务和错误上报建立高速扩展接口的理解。
+\end{keyidea}
+
+\section{一、从教学总线到现代互连}
+
+早期微机的并行总线比较直观：地址线、数据线、读写控制、片选和等待信号都能在逻辑分析仪上看到。现代芯片内部和 PCIe 这类外部互连更复杂，可能使用分层 packet、请求队列、completion、错误报告和流控。但抽象问题没有改变：事务由发起者提出，经互连路由到目标，目标返回数据或完成状态，错误路径必须被记录和上报。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+互连对象 & 旧总线中的类比 & 现代形式 \\
+\midrule
+地址阶段 & 地址线和片选 & 请求 packet、BAR（基址寄存器，base address register）、路由 ID、地址译码 \\
+数据阶段 & 数据线和字节使能 & payload、byte enable、burst 或 cache line \\
+等待 & READY/WAIT & credit、ready/valid、队列背压 \\
+完成 & 采样数据或写周期结束 & completion packet、状态位、中断或 MSI（消息信号中断，message signaled interrupt） \\
+错误 & 总线错误或超时 & poison、fault、AER（高级错误报告，advanced error reporting）、IOMMU fault、设备 error \\
+\bottomrule
+\end{longtable}
+
+\topic{总线仲裁：多个主设备谁先用总线}
+共享总线上可以有多个能发起事务的主设备：CPU、DMA 控制器、显示控制器都可能同时要占用地址线和数据线。同一时刻只能有一个主设备驱动总线，因此必须有一种决定“这一轮给谁”的机制，这就是总线仲裁（bus arbitration）。仲裁要同时回答三个问题：裁决花多少时间，谁拥有优先权，低优先级请求会不会永远等不到。经典做法有三种，它们在线数、延迟和公平性之间做出不同取舍。
+
+集中式仲裁器为每个主设备拉一对独立的请求线（request）和授权线（grant），全部连到一个中央仲裁器。所有请求并行到达，仲裁器在一两个周期内按优先级逻辑选出获胜者并抬起对应的 grant。这是最快的做法，优先级还可以做成可编程寄存器；代价是线数随主设备数线性增长，$N$ 个主设备需要 $2N$ 根专用线，仲裁器本身也成为单点。
+
+菊花链（daisy chain）只拉一条授权线，从仲裁器出发依次穿过所有主设备。设备没有请求时把授权信号向下一级传递，有请求时把授权截留下来占用总线。线数与设备数量无关，结构最简单；但优先级由设备在链上的物理位置写死——离仲裁器越近永远越优先，链尾设备可能长期等不到授权，而且授权要逐级传播，链越长延迟越大。
+
+轮询计数（polling）用一小组设备号线代替一对一连线：仲裁器驱动 $\lceil\log_2 N\rceil$ 根线，轮流扫描设备编号，被扫到且有请求的设备抬起 busy 占用总线。线数最少，公平性也最灵活——计数器若每次从零开始，编号小的设备优先；若从上一次授权的设备之后继续扫描，就得到轮转公平。代价是平均要扫过半个编号表才能命中请求者，是三者中最慢的。
+
+\begin{longtable}{L{0.13\linewidth}L{0.15\linewidth}L{0.26\linewidth}L{0.15\linewidth}L{0.21\linewidth}}
+\toprule
+做法 & 专用线数 & 优先级 & 授权速度 & 关键问题 \\
+\midrule
+集中式仲裁器 & $2N$（每设备一对请求/授权） & 由仲裁器逻辑决定，可编程 & 最快，并行比较 & 线多，仲裁器是单点 \\
+菊花链 & 与设备数无关（一条授权链） & 由物理位置固定，链首最高 & 逐级传播，链长则慢 & 链尾可能等不到，优先级不可改 \\
+轮询计数 & $\lceil\log_2 N\rceil$ 根扫描线 & 由计数起点决定，可轮转公平 & 最慢，平均扫半表 & 扫描本身占用总线时间 \\
+\bottomrule
+\end{longtable}
+
+现代片上互连并没有消灭仲裁，而是把它从“整条共享线上的全局问题”拆小，做进了每一个交换节点。NoC 路由器的每个输入端口要仲裁来自不同方向的 flit，crossbar 要为每个输出端口在多个输入之间仲裁，PCIe switch 要在端口和虚通道之间仲裁。共享并行总线退化成点到点链路之后，“谁先用”的问题依然存在于每个交换机内部——只是裁决范围从整块板卡缩小到一个端口。
+
+\topic{valid/ready 是理解现代片上互连的最小模型}
+许多片上接口都可以抽象成 valid/ready 握手。发送方在 valid 为 1 时保持请求或响应稳定，接收方在 ready 为 1 时表示可以接收，只有二者同周期为 1，事务片段才真正完成。请求通道和响应通道可以分开，读请求和读数据也可以隔很多周期。这个模型比“总线一拍完成”更接近现代硬件。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % valid — 先升高并等待
+  \draw[BookTeal,line width=0.85pt] (0.6,0.45) -- (1.0,0.45) -- (1.0,1.2) -- (5.5,1.2) -- (5.5,0.45) -- (9.0,0.45);
+  \node[hw label, anchor=east] at (0.5,1.2) {valid};
+  % ready — 背压阶段为 0, 准备好后才升高
+  \draw[BookAccent,line width=0.85pt] (0.6,0.0) -- (4.0,0.0) -- (4.0,0.75) -- (5.5,0.75) -- (5.5,0.0) -- (9.0,0.0);
+  \node[hw label, anchor=east] at (0.5,0.38) {ready};
+  % payload — valid=1 期间保持稳定的总线
+  \draw[BookMuted,line width=0.65pt,dashed] (0.6,-0.75) -- (1.0,-0.75);
+  \draw[BookMuted,line width=0.65pt,dashed] (5.5,-0.75) -- (9.0,-0.75);
+  \draw[BookTeal,line width=0.85pt] (1.0,-0.45) -- (5.5,-0.45) -- (5.5,-1.05) -- (1.0,-1.05) -- cycle;
+  \node[hw label, anchor=east] at (0.5,-0.75) {payload};
+  \node[hw label] at (3.25,-0.75) {数据保持稳定};
+  \node[hw label] at (7.25,-0.75) {允许变化};
+  % 区间竖线与 transfer
+  \draw[BookRule,line width=0.45pt,dashed] (1.0,1.6) -- (1.0,-1.3);
+  \draw[BookRule,line width=0.45pt,dashed] (4.0,1.6) -- (4.0,-1.3);
+  \draw[BookRule,line width=0.45pt,dashed] (5.5,1.6) -- (5.5,-1.3);
+  \node[hw label] at (2.5,1.85) {背压：valid 等待};
+  \node[hw label] at (4.75,1.85) {transfer};
+  \node[hw label, text width=8.4cm] at (4.7,-1.75) {valid=1 且 ready=0 时，发送方必须保持 payload 稳定；二者同周期为 1 才完成一次传输。};
+\end{pdfdiagram}
+\diagramnote{valid/ready 握手。发送方先抬 valid 并保持数据稳定；接收方在背压期间保持 ready=0；两条线在 transfer 周期同时为 1，事务片段才完成。背压不是错误，而是接收方暂时不能接受。}
+
+\begin{lstlisting}
+handshake rule:
+  transfer happens only when valid == 1 and ready == 1
+  while valid == 1 and ready == 0:
+    sender keeps payload stable
+  receiver may apply backpressure by deasserting ready
+\end{lstlisting}
+
+\topic{三种 valid/ready 时序情形}
+valid/ready 的全部行为可以归纳成一条采样规则和三种常见情形。采样规则是：只在某个采样沿上 valid 和 ready 同时为 1，该通道才完成一次传输。三种常见情形是：双方同拍就绪，当拍完成；接收方拉低 ready 施加背压，发送方必须保持 valid 和 payload 不变；请求通道和响应通道各自独立握手，两次传输之间可以隔任意多个周期。这三种情形都不是异常，而是流控协议的正常组成部分。
+
+\begin{waveform}[x=0.8cm,y=0.8cm]
+  % (a) 同拍传输
+  \node[hw label, anchor=west] at (0,11.3) {(a) 同拍传输};
+  \draw[BookTeal, line width=0.9pt] (0,10.2) -- (4,10.2) -- (4,10.9) -- (8,10.9) -- (8,10.2) -- (12,10.2);
+  \node[hw label, anchor=east] at (-0.1,10.55) {valid};
+  \draw[BookAccent, line width=0.9pt] (0,9.2) -- (4,9.2) -- (4,9.9) -- (8,9.9) -- (8,9.2) -- (12,9.2);
+  \node[hw label, anchor=east] at (-0.1,9.55) {ready};
+  \draw[BookMuted, line width=0.65pt, dashed] (0,8.55) -- (4,8.55);
+  \draw[BookMuted, line width=0.65pt, dashed] (8,8.55) -- (12,8.55);
+  \draw[BookTeal, line width=0.9pt] (4,8.2) rectangle (8,8.9);
+  \node at (6,8.55) {D0};
+  \node[hw label, anchor=east] at (-0.1,8.55) {payload};
+  \draw[BookRule, line width=0.45pt, dashed] (8,11.2) -- (8,8.05);
+  \node[hw label, anchor=south west] at (8.1,11.25) {传输沿};
+  % (b) 背压保持
+  \node[hw label, anchor=west] at (0,7.55) {(b) 背压保持};
+  \draw[BookTeal, line width=0.9pt] (0,6.45) -- (4,6.45) -- (4,7.15) -- (12,7.15) -- (12,6.45);
+  \node[hw label, anchor=east] at (-0.1,6.8) {valid};
+  \draw[BookAccent, line width=0.9pt] (0,5.45) -- (8,5.45) -- (8,6.15) -- (12,6.15) -- (12,5.45);
+  \node[hw label, anchor=east] at (-0.1,5.8) {ready};
+  \draw[BookMuted, line width=0.65pt, dashed] (0,4.8) -- (4,4.8);
+  \draw[BookTeal, line width=0.9pt] (4,4.45) rectangle (12,5.15);
+  \node at (8,4.8) {D1（保持不变）};
+  \node[hw label, anchor=east] at (-0.1,4.8) {payload};
+  \draw[BookRule, line width=0.45pt, dashed] (4,7.45) -- (4,4.3);
+  \node[hw label, anchor=south west] at (4.1,7.5) {valid 抬起};
+  \draw[BookRule, line width=0.45pt, dashed] (12,7.45) -- (12,4.3);
+  \node[hw label, anchor=south east] at (11.9,7.5) {传输沿};
+  % (c) 请求响应分离
+  \node[hw label, anchor=west] at (0,3.75) {(c) 请求响应分离};
+  \draw[BookTeal, line width=0.9pt] (0,3.35) -- (4,3.35) -- (4,2.65) -- (12,2.65);
+  \node[hw label, anchor=east] at (-0.1,3.0) {req valid};
+  \draw[BookTeal, line width=0.9pt] (0,1.65) rectangle (4,2.35);
+  \node at (2,2.0) {请求};
+  \draw[BookMuted, line width=0.65pt, dashed] (4,2.0) -- (12,2.0);
+  \node[hw label, anchor=east] at (-0.1,2.0) {req data};
+  \draw[BookTeal, line width=0.9pt] (0,0.65) -- (8,0.65) -- (8,1.35) -- (12,1.35) -- (12,0.65);
+  \node[hw label, anchor=east] at (-0.1,1.0) {resp valid};
+  \draw[BookAccent, line width=0.9pt] (0,0.35) -- (12,0.35);
+  \node[hw label, anchor=east] at (-0.1,0.0) {resp ready};
+  \draw[BookMuted, line width=0.65pt, dashed] (0,-1.0) -- (8,-1.0);
+  \draw[BookTeal, line width=0.9pt] (8,-1.35) rectangle (12,-0.65);
+  \node at (10,-1.0) {响应};
+  \node[hw label, anchor=east] at (-0.1,-1.0) {resp data};
+  \draw[BookRule, line width=0.45pt, dashed] (4,3.65) -- (4,1.5);
+  \node[hw label, anchor=south west] at (4.1,3.7) {请求传输};
+  \draw[BookRule, line width=0.45pt, dashed] (12,1.65) -- (12,-1.5);
+  \node[hw label, anchor=south east] at (11.9,1.7) {响应传输};
+  \draw[BookMuted, line width=0.6pt, <->] (4.3,2.95) -- (7.7,2.95);
+  \node[hw label, above] at (6,2.95) {隔若干周期};
+\end{waveform}
+\diagramnote{三种情形一条规则：只在 valid 与 ready 同拍为 1 的沿上传输。(a) 双方同拍就绪，当拍完成；(b) ready 为 0 的期间 valid 与 D1 保持不变，这是接收方施加的背压，不是错误；(c) 请求在一个沿完成，响应通道隔若干周期后才完成自己的传输，两个通道互不等待。}
+
+\topic{写缓冲和内存顺序解释了现代芯片为什么看起来更快}
+写入比读取更容易被隐藏。CPU 可以先把写事务放进写缓冲，让执行流水线继续推进；写缓冲再把相邻写合并、排队发送到 cache 或互连。这样常见 STORE 的表面延迟很低，但代价是可见性变复杂：其他核心、DMA 或设备什么时候看到这次写，取决于 cache 一致性、内存类型和屏障规则。普通 RAM、MMIO 和 DMA 描述符不能使用同一套可见性假设。
+
+\topic{总线错误和超时必须成为规格的一部分}
+未映射地址不能只写成“不要访问”。真实系统必须规定访问未映射区域时会发生什么：返回固定值、保持等待直到超时、产生总线错误，或进入异常入口。设备无响应、DRAM 控制器报错、ECC 检测失败、外设权限不允许，也都应该形成可观测错误状态。没有错误约定的整机，调试时会把硬件故障误判为程序死循环。
+
+\topic{cache 行和局部性把常见访问留在近处}
+主存容量大但离 CPU 远，寄存器离 CPU 近但容量小，cache 处在二者之间。cache 是按 cache line 搬运的一组近处 SRAM。CPU 读取某个地址时，cache 会用地址中的 tag 判断目标行是否已经在近处；若命中，数据直接从 cache 返回；若未命中，cache 控制器向下一级 cache 或 DRAM 请求整行，再把需要的字节送回 CPU。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+对象 & 硬件含义 & 关键问题 \\
+\midrule
+cache line & 一次填充和替换的最小数据块 & 行大小、字节偏移和未对齐访问是否清楚 \\
+tag & 判断某个 cache 槽保存的是哪段地址 & 命中比较是否覆盖高位地址和有效位 \\
+index & 选择 cache 中的候选槽或集合 & 映射冲突是否可能造成反复 miss \\
+valid/dirty & 表示行是否有效、是否被修改过 & 替换时是否需要写回下一级 \\
+miss & 近处没有所需行，需要向下一级请求 & miss 期间 CPU 停顿、继续执行或乱序等待的边界 \\
+\bottomrule
+\end{longtable}
+
+局部性解释了 cache 为什么有效。时间局部性表示刚访问过的数据很可能再次访问，例如循环变量和栈顶对象；空间局部性表示访问某个地址后，很可能访问相邻地址，例如顺序扫描数组。cache line 正是利用空间局部性：一次 miss 不只取一个字节，而是取一整段相邻字节。代价也随之出现：若程序跨很大步长访问数组，或者两个热数据反复映射到同一 cache 集合，硬件仍会不停搬行，表面上只是 LOAD 很慢，实质上是事务层反复 miss 和替换。
+
+\begin{lstlisting}
+32-byte cache line example:
+  address bits = [ tag | index | byte_offset ]
+  byte_offset selects one byte within the line
+  index selects a cache set
+  tag comparison decides hit or miss
+\end{lstlisting}
+
+\topic{案例：一次 cache 命中的完整分解}
+cache 的查找可以拆成三个字段各管一件事：offset 选行内字节，index 选槽，tag 判身份。以 32-bit 地址、16 KiB 直接映射、64 B 行为例：offset $=\log_2 64=6$ bit；行数 $=16\ \text{KiB}\div 64\ \text{B}=256$，index $=\log_2 256=8$ bit；tag $=32-8-6=18$ bit。任何地址到来时，硬件先按 index 找到唯一的槽，再用 tag 和 valid 位判断“槽里这行是不是这段地址”。
+
+\begin{pdfdiagram}
+  % 32-bit 地址三段
+  \draw[hw bus] (0,4.0) rectangle (4.0,4.6);
+  \node at (2.0,4.3) {tag（18 bit）};
+  \draw[hw bus] (4.0,4.0) rectangle (6.4,4.6);
+  \node at (5.2,4.3) {index（8 bit）};
+  \draw[hw bus] (6.4,4.0) rectangle (8.6,4.6);
+  \node at (7.5,4.3) {offset（6 bit）};
+  \node[hw label, above] at (4.3,4.6) {32-bit 地址（16 KiB 直接映射、64 B 行）};
+  % tag → 比较器
+  \draw[hw bus] (2.0,4.0) -- (2.0,2.32);
+  \node[hw compute, minimum width=2.4cm] (cmp) at (1.5,2.05) {tag 比较（= ?）};
+  % index → 槽
+  \draw[hw bus] (5.6,4.0) -- node[hw label, right, pos=0.55]{index 译码选槽} (5.6,3.18);
+  \node[hw state, minimum width=4.8cm] (s0) at (5.6,2.9) {槽 168：tag，V，数据};
+  \node[hw state, minimum width=4.8cm] (s1) at (5.6,2.05) {槽 169：tag=0x00010，V=1};
+  \node[hw state, minimum width=4.8cm] (s2) at (5.6,1.2) {槽 170：tag，V，数据};
+  \draw[hw bus] (s1.west) -- (cmp.east);
+  \draw[hw bus] (cmp.south) -- (1.5,0.7) node[hw label, right, pos=1.0, text width=3.6cm]{hit：读槽内数据；miss：向下一级取整行替换};
+  % offset → 字节选择
+  \draw[hw bus] (7.5,4.0) -- (7.5,3.3) node[hw label, right, pos=0.6, text width=3.4cm]{offset 选行内字节（0x15 → 第 21 字节）};
+\end{pdfdiagram}
+\diagramnote{直接映射 cache 的查找。地址拆成 tag/index/offset 三段：index 译码选出唯一的槽，槽内 tag 与地址 tag 比较决定 hit/miss，offset 再从 64 B 行内选出目标字节。}
+
+下表把四次访问的分解和结果走一遍。注意第 3、4 次展示了直接映射最典型的失效模式：
+
+\begin{longtable}{L{0.08\linewidth}L{0.17\linewidth}L{0.28\linewidth}L{0.39\linewidth}}
+\toprule
+次序 & 地址 & tag / index / offset & 结果 \\
+\midrule
+1 & \code{0x00042A40} & \code{0x00010} / \code{0xA9} / \code{0x00} & 槽 169 的 V=0 → miss；从 DRAM 取回 64 B 整行填入，tag 写 \code{0x00010}、V 置 1，返回第 0 字节 \\
+2 & \code{0x00042A40} & \code{0x00010} / \code{0xA9} / \code{0x00} & tag 相等且 V=1 → hit，直接从槽内返回数据 \\
+3 & \code{0x00082A55} & \code{0x00020} / \code{0xA9} / \code{0x15} & 槽 169 的 tag 是 \code{0x00010}，不等 → 冲突 miss；取回新行替换旧行（旧行若 dirty 先写回 DRAM），返回第 21 字节 \\
+4 & \code{0x00042A40} & \code{0x00010} / \code{0xA9} / \code{0x00} & 槽 169 刚被第 3 次访问换掉 → 又 miss \\
+\bottomrule
+\end{longtable}
+
+两个热地址映射到同一个槽时，直接映射会反复 miss——这正是组相联存在的理由：同一个槽放多路，几路 tag 并行比较，任何一路相等都算 hit，常用数据就不必互相驱逐。
+
+\topic{两路组相联让热行各占一路}
+直接映射的冲突来自“一个槽只能放一行”。把同样 16 KiB、64 B 行的 cache 改成 128 组、每组 2 路：offset 仍是 6 bit，index 从 8 bit 变成 7 bit，tag 从 18 bit 变成 19 bit。重走前面的四次访问：\code{0x00042A40} 和 \code{0x00082A55} 的 index 都是 \code{0x29}，tag 分别是 \code{0x00021} 和 \code{0x00041}。第 1 次 miss，填入路 0；第 2 次 tag 相等，hit；第 3 次两路 tag 都不等（路 1 的 V 仍为 0），仍然 miss，但新行填入路 1，不再驱逐路 0；第 4 次再读 \code{0x00042A40}，路 0 的 tag 相等，变成 hit。直接映射下第 3、4 次的互相驱逐，在 2 路组相联下只剩第 3 次那次无法避免的首次 miss。代价是每组多一个 tag 比较器、一个数据选择 mux 和若干替换位。
+
+\begin{pdfdiagram}
+  % 32-bit 地址三段（2 路组相联：tag 19 / index 7 / offset 6）
+  \draw[hw bus] (0,5.6) rectangle (3.2,6.2);
+  \node at (1.6,5.9) {tag（19 bit）};
+  \draw[hw bus] (3.2,5.6) rectangle (5.6,6.2);
+  \node at (4.4,5.9) {index（7 bit）};
+  \draw[hw bus] (5.6,5.6) rectangle (7.8,6.2);
+  \node at (6.7,5.9) {offset（6 bit）};
+  \node[hw label, above] at (3.9,6.2) {32-bit 地址（16 KiB、2 路组相联、64 B 行）};
+  % index 译码：干线加两路下引线
+  \draw[hw bus] (4.4,5.6) -- (4.4,4.9);
+  \draw[hw bus] (2.0,4.9) -- (8.3,4.9);
+  \node[hw label, below] at (5.15,4.9) {index 译码：同一组的两路同时选中};
+  \draw[hw bus] (2.0,4.9) -- (2.0,3.91);
+  \draw[hw bus] (8.3,4.9) -- (8.3,3.91);
+  % offset 选行内字节
+  \node[hw label, below] at (6.7,5.6) {offset 选行内字节};
+  % 组内两路
+  \node[hw state, minimum width=3.4cm] (way0) at (2.0,3.6) {路 0：tag，V，64 B 数据};
+  \node[hw state, minimum width=3.4cm] (way1) at (8.3,3.6) {路 1：tag，V，64 B 数据};
+  % 2 选 1 mux
+  \node[hw compute, minimum width=2.4cm] (mux) at (5.15,3.6) {2 选 1 mux};
+  \draw[hw bus] (way0.east) -- (mux.west);
+  \draw[hw bus] (way1.west) -- (mux.east);
+  \draw[hw bus] (5.55,3.29) -- (5.55,2.85);
+  \node[hw label, anchor=east] at (5.05,3.05) {命中路数据};
+  % 两路 tag 并行比较
+  \node[hw compute, minimum width=2.4cm] (cmp0) at (2.0,2.35) {tag 比较（= ?）};
+  \node[hw compute, minimum width=2.4cm] (cmp1) at (8.3,2.35) {tag 比较（= ?）};
+  \draw[hw bus] (way0.south) -- (cmp0.north);
+  \node[hw label, anchor=west] at (2.05,2.72) {槽内 tag};
+  \draw[hw bus] (way1.south) -- (cmp1.north);
+  \node[hw label, anchor=west] at (8.35,2.72) {槽内 tag};
+  % 地址 tag 总线：并行送两个比较器
+  \draw[hw bus] (1.6,5.6) -- (1.6,5.05) -- (0.3,5.05) -- (0.3,0.9) -- (8.0,0.9) -- (cmp1.south);
+  \node[hw label, above] at (0.95,5.05) {地址 tag};
+  \draw[hw bus] (0.3,2.35) -- (cmp0.west);
+  \node[hw label, below] at (3.2,0.9) {地址 tag 并行送两路比较器};
+  % 任一路相等即 hit，并选择 mux
+  \node[hw compute, minimum width=1.6cm] (orn) at (5.15,2.35) {或（hit）};
+  \draw[hw bus] (cmp0.east) -- (orn.west);
+  \draw[hw bus] (cmp1.west) -- (orn.east);
+  \draw[hw return] (orn.north) -- (mux.south);
+  \node[hw label, anchor=west] at (5.35,2.9) {hit / 选路};
+  % 替换位：miss 时选一路驱逐
+  \node[hw state, minimum width=1.6cm] (rep) at (5.15,1.35) {替换位};
+  \draw[hw return] (rep.north) -- (orn.south);
+  \node[hw label, anchor=west] at (5.25,1.7) {miss 时选一路驱逐};
+\end{pdfdiagram}
+\diagramnote{2 路组相联的查找。index 译码选中整个组，组内两路的 tag 同时与地址 tag 比较；任一路相等，或门即输出 hit，并用比较结果控制 mux 选出命中路的数据。miss 时按组内替换位选一路驱逐、填入新行。}
+
+\topic{写策略决定 STORE 什么时候真正离开 CPU}
+读 miss 的动作比较直观：向下级取回数据。写入更复杂，因为 CPU 可以先改 cache，再决定什么时候把修改传播到下一级。写穿（亦称写直达）策略每次写命中都继续写下一级，行为直接但带宽压力大；写回策略只在 cache 中标脏位，替换时再写回下一级，常见情况下更快，但可见性和错误恢复更复杂。无论哪种策略，字节写都必须尊重 byte enable，不能把同一 cache line 中无关字节改坏。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+写策略 & 优点 & 风险和边界 \\
+\midrule
+写穿 & 下一级更快看见新值，调试直观 & 带宽压力大，常配合写缓冲隐藏延迟 \\
+写回 & 多次写同一行可合并，减少外部事务 & dirty 行替换、掉电和 DMA 可见性更难处理 \\
+写分配 & 写 miss 时先把整行取入 cache 再修改 & 小写入可能触发整行读取 \\
+非写分配 & 写 miss 直接向下级写，不装入 cache & 后续读同地址可能仍 miss \\
+\bottomrule
+\end{longtable}
+
+这也是 MMIO 不能随意缓存的根本原因。写 LED 寄存器、清中断状态或启动 DMA 命令时，程序需要的是一次外设可见动作，而不是某条 cache line 中的普通字节更新。若 MMIO 被写回 cache 吞掉，设备可能永远看不到命令；若读状态寄存器被 cache 命中，CPU 可能一直看到旧状态。因此地址属性必须区分普通可缓存内存、不可缓存设备内存、写合并 framebuffer、DMA coherent 区域等不同事务约定。
+
+\topic{cache miss 是事务暂停，不是抽象的慢}
+当 LOAD miss 时，流水线不能凭空得到数据。简单 CPU 会停在访存阶段，保持地址和控制状态，直到下级返回数据；高性能 CPU 可能让独立指令继续执行，把这条 LOAD 放在未完成队列中，等数据回来再唤醒依赖指令。二者复杂度不同，但都必须维护同一个可见性约定：依赖这次 LOAD 的指令不能使用错误旧值，异常和中断也不能让程序看见半提交状态。
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+miss 类型 & 事务路径 & 典型处理 \\
+\midrule
+L1 miss/L2 hit & L1 请求 L2 返回 cache line & 几到十几周期，流水线可能短暂停顿 \\
+最后级 cache miss & 请求内存控制器和 DRAM & 上百周期级别，常需乱序、预取或多线程隐藏 \\
+TLB miss & 地址转换缓存缺失，要查页表或进异常 & 页表 walker、权限检查和可能的页错误 \\
+写回替换 & 脏行被换出，需先写下一级 & 替换队列、写缓冲和错误报告 \\
+设备/DMA 冲突 & cache 中旧副本与设备写入不一致 & coherent 互连、cache 维护或不可缓存映射 \\
+\bottomrule
+\end{longtable}
+
+\topic{低时延来自近处、缓存、并行和卸载}
+现代整机降低时延，不是让所有路径都变成零等待。L1/L2 cache 让常见数据走近处 SRAM；TLB 让近期地址转换不必每次查页表；预取和分支预测提前准备可能需要的路径；流水线、旁路和乱序调度让独立工作重叠；DMA、队列和中断聚合把批量 I/O 从 CPU 指令流中卸载。失败路径仍然存在：cache miss、TLB miss、DRAM 排队、设备背压、DMA fault 和错误中断都会把访问拉回慢路径。
+
+\section{二、从链路训练到设备枚举}
+
+PCIe 端口先完成物理链路训练，协商 lane 数和速率；链路可用后，固件或操作系统读取配置空间，按总线、设备、功能号发现设备，分配 BAR 地址窗口并设置命令寄存器。驱动看到的 MMIO 地址正是枚举阶段分配后的结果。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+层次 & 主要对象 & 失败表现 \\
+\midrule
+物理层 & lane、均衡、时钟恢复、训练状态 & 链路不上线或降速/降宽 \\
+数据链路层 & 序号、LCRC、重放、流控 credit & 包重试、链路错误计数增长 \\
+事务层 & Memory/Configuration/Completion TLP & 超时、Unsupported Request、完成错误 \\
+软件枚举 & 配置空间、BAR、能力链表 & 设备存在但资源未分配或驱动无法绑定 \\
+\bottomrule
+\end{longtable}
+
+\section{三、TLP、完成包与中断消息}
+
+Memory Write 通常是 posted request：发送后没有逐笔 completion，错误主要靠链路与 AER 报告；Memory Read 是 non-posted request，目标稍后返回带 tag 的 Completion with Data。请求方必须保留 tag 和目标缓冲状态，直到所有分段完成包到齐或超时。
+
+PCIe 的中断不再需要一根设备专用导线。MSI/MSI-X 本质上是设备发出一笔写消息，地址和数据编码中断目标；因此驱动必须先建立中断表和处理程序，再允许设备发消息。AER 则保存可纠正、不可纠正和致命错误信息，排错时应先判断错误位于物理链路、数据链路还是事务语义。
+
+\begin{classicnote}
+PCIe 带宽应按有效负载计算。编码、包头、LCRC、ACK/NAK、流控和小包比例都会让应用带宽低于 lane 速率；队列深度不足还会使链路在等待完成包时空闲。
+\end{classicnote}

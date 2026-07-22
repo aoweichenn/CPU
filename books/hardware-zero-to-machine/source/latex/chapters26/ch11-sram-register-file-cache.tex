@@ -1,0 +1,851 @@
+\chapter{SRAM、寄存器文件与 Cache}
+
+\begin{keyidea}
+离计算核心越近，存储越依赖低延迟、并行端口和局部性。本章从 SRAM 单元与阵列出发，建立寄存器文件和 Cache 的结构基础。
+\end{keyidea}
+
+\section{一、SRAM 单元与阵列}
+
+SRAM（Static Random Access Memory）是 CPU 中速度最快、面积代价最高的存储器件。一个 SRAM bit 由 6 个 MOSFET 构成的双稳态锁存器保存，只要电源不断，数据就永远保持——不需要刷新，不需要时钟。代价是：每个 bit 需要 6 个晶体管，面积是 DRAM 的 6--8 倍。本节从单个 6T 单元的晶体管级结构讲起，经过读/写/保持操作的定量分析，到阵列组织、辅助电路、时序参数、功耗和软错误，最终给出真实芯片中的 SRAM 参数。
+
+\begin{keyidea}
+SRAM 的核心是\hwkey{正反馈锁存}：两个交叉耦合反相器形成双稳态，任何一端的微小扰动都会被反馈放大回稳态。这个正反馈既是 SRAM 保持数据的原因，也是写入时必须克服的障碍。所有设计权衡——读稳定性 vs 写能力、SNM vs 面积、assist 电路 vs 功耗——都源于这一对矛盾。
+\end{keyidea}
+
+%======================================================================
+\topic{1.1\quad 6T 单元结构：六个晶体管的角色}
+%======================================================================
+
+第〇节给出了从单点到系统的递进框架，本小节聚焦第一级：SRAM 的一个 bit 在晶体管级长什么样。\hwkey{6T SRAM 单元}由以下六个 MOSFET 组成：
+
+\begin{longtable}{L{0.10\linewidth}L{0.12\linewidth}L{0.14\linewidth}L{0.54\linewidth}}
+\toprule
+编号 & 类型 & 角色 & 连接关系 \\
+\midrule
+P1 & PMOS & 上拉管（左反相器） & 源接 VDD，漏接 Q，栅接 $\overline{Q}$ \\
+N1 & NMOS & 下拉管（左反相器） & 源接 VSS，漏接 Q，栅接 $\overline{Q}$ \\
+P2 & PMOS & 上拉管（右反相器） & 源接 VDD，漏接 $\overline{Q}$，栅接 Q \\
+N2 & NMOS & 下拉管（右反相器） & 源接 VSS，漏接 $\overline{Q}$，栅接 Q \\
+M5 & NMOS & 访问管（左） & 源/漏接 BL 和 Q，栅接 WL \\
+M6 & NMOS & 访问管（右） & 源/漏接 $\overline{BL}$ 和 $\overline{Q}$，栅接 WL \\
+\bottomrule
+\end{longtable}
+
+P1/N1 构成左反相器（输入 $\overline{Q}$，输出 Q），P2/N2 构成右反相器（输入 Q，输出 $\overline{Q}$）。两者交叉耦合形成\hwkey{双稳态锁存器}：Q=1/$\overline{Q}$=0 和 Q=0/$\overline{Q}$=1 是两个稳定状态。M5/M6 是\term{访问管}{access transistor}——控制锁存器与位线之间通断的开关管，栅极共同连接字线 WL；WL=0 时截止，锁存器与位线隔离，数据自保持；WL=1 时导通，位线与存储节点连通，既可以被读出（sense，把 Q/$\overline{Q}$ 的状态传到位线上），也可以被写驱动器反向驱动（把位线上的新数据强行写入存储节点）。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % VDD rail
+  \draw[BookTeal, line width=0.7pt] (1.0,3.2) -- (7.0,3.2);
+  \node[BookTeal, font=\small\bfseries] at (4.0,3.5) {VDD};
+  % VSS rail
+  \draw[BookTeal, line width=0.7pt] (1.0,-2.2) -- (7.0,-2.2);
+  \node[BookTeal, font=\small\bfseries] at (4.0,-2.5) {VSS};
+  % Left inverter: P1 (top) and N1 (bottom)
+  \node[hw state, minimum width=1.1cm, minimum height=0.65cm] (P1) at (2.5,1.8) {P1 (PMOS)};
+  \node[hw state, minimum width=1.1cm, minimum height=0.65cm] (N1) at (2.5,-0.8) {N1 (NMOS)};
+  % Right inverter: P2 (top) and N2 (bottom)
+  \node[hw state, minimum width=1.1cm, minimum height=0.65cm] (P2) at (5.5,1.8) {P2 (PMOS)};
+  \node[hw state, minimum width=1.1cm, minimum height=0.65cm] (N2) at (5.5,-0.8) {N2 (NMOS)};
+  % Q node (left inverter output)
+  \draw[BookAccent, line width=0.6pt] (P1.south) -- (N1.north);
+  \node[BookAccent, font=\small\bfseries] at (1.8,0.5) {Q};
+  % Qbar node (right inverter output)
+  \draw[BookAccent, line width=0.6pt] (P2.south) -- (N2.north);
+  \node[BookAccent, font=\small\bfseries] at (6.2,0.5) {$\overline{Q}$};
+  % Cross-coupling: Q -> P2/N2 gate
+  \draw[BookRed, line width=0.55pt] (2.5,0.5) -- (2.5,0.5) -| (4.6,1.8);
+  \draw[BookRed, line width=0.55pt] (2.5,0.5) -| (4.6,-0.8);
+  % Cross-coupling: Qbar -> P1/N1 gate
+  \draw[BookRed, line width=0.55pt] (5.5,0.5) -| (3.4,1.8);
+  \draw[BookRed, line width=0.55pt] (5.5,0.5) -| (3.4,-0.8);
+  % P1 to VDD
+  \draw[BookTeal, line width=0.5pt] (P1.north) -- ++(0,0.9);
+  % P2 to VDD
+  \draw[BookTeal, line width=0.5pt] (P2.north) -- ++(0,0.9);
+  % N1 to VSS
+  \draw[BookTeal, line width=0.5pt] (N1.south) -- ++(0,-0.9);
+  % N2 to VSS
+  \draw[BookTeal, line width=0.5pt] (N2.south) -- ++(0,-0.9);
+  % Access transistors M5 and M6
+  \node[hw compute, minimum width=0.9cm, minimum height=0.6cm] (M5) at (0.0,0.5) {M5};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.6cm] (M6) at (8.0,0.5) {M6};
+  % M5 connections: BL -- M5 -- Q
+  \draw[BookAccent, line width=0.6pt] (M5.east) -- (2.5,0.5);
+  \draw[hw bus] (M5.west) -- ++(-1.2,0) node[left, hw label, font=\small\bfseries] {BL};
+  % M6 connections: Qbar -- M6 -- BLbar
+  \draw[BookAccent, line width=0.6pt] (M6.west) -- (5.5,0.5);
+  \draw[hw bus] (M6.east) -- ++(1.2,0) node[right, hw label, font=\small\bfseries] {$\overline{BL}$};
+  % Word line WL：只接 M5/M6 栅极，从顶部通道走线，不穿 P1/P2 框
+  \draw[BookAmber, line width=0.8pt] (M5.north) -- (0.0,3.85);
+  \draw[BookAmber, line width=0.8pt] (M6.north) -- (8.0,3.85);
+  \draw[BookAmber, line width=0.5pt, dashed] (0.0,3.85) -- (8.0,3.85);
+  \node[BookAmber, hw label, font=\small\bfseries] at (4.0,4.15) {WL};
+  % Labels
+  \node[hw label, text width=10cm] at (4.0,-3.4) {6T SRAM 单元完整逻辑图。红色线为交叉耦合反馈路径（Q 驱动 P2/N2 栅极，$\overline{Q}$ 驱动 P1/N1 栅极）。WL 同时控制 M5 和 M6 的栅极。BL/$\overline{BL}$ 是差分位线对。};
+\end{pdfdiagram}
+\diagramnote{6T SRAM 单元。P1/N1 和 P2/N2 交叉耦合形成双稳态锁存；M5/M6 是 NMOS 访问管，栅极共接字线 WL。WL=0 时 M5/M6 截止，锁存器自保持；WL=1 时导通，BL/$\overline{BL}$ 可读出或写入 Q/$\overline{Q}$。}
+
+\hwkey{设计尺寸比}是 SRAM 单元设计的核心参数：
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.40\linewidth}}
+\toprule
+参数 & 定义 & 典型值（28nm） \\
+\midrule
+Cell Ratio (CR) & $W_{N1}/W_{M5}$（下拉管/访问管） & 1.2--1.5 \\
+Pull-up Ratio (PR) & $W_{M5}/W_{P1}$（访问管/上拉管） & 1.0--1.5 \\
+驱动管宽长比 & $W/L$ of N1 & 最小尺寸（如 28nm: $W$=40nm） \\
+访问管宽长比 & $W/L$ of M5 & 略小于 N1 \\
+\bottomrule
+\end{longtable}
+
+两个比值都以访问管 M5 为参照，名字也由此而来。\term{Cell Ratio}{CR}（单元比）衡量下拉管 N1 相对 M5 的强度，决定读操作时 Q=0 的节点能否顶住位线注入的电流而不被抬高；\term{Pull-up Ratio}{PR}（上拉比）衡量 M5 相对上拉管 P1 的强度，决定写操作时 M5 能否从 P1 手中把 Q 拉低。一句话：CR 管读、PR 管写——1.3 和 1.4 两节的定量分析将反复用到这两个比值，之后各节提到 CR/PR 时不再重复定义。
+
+%======================================================================
+\topic{1.2\quad 保持操作：反馈环稳定性与漏电路径}
+%======================================================================
+
+WL=0 时，M5/M6 截止，6T 单元退化为一个\hwkey{交叉耦合锁存器}。假设 Q=1（VDD）、$\overline{Q}$=0（VSS）：
+
+\begin{itemize}
+  \item $\overline{Q}$=0 加在 P1/N1 的栅极上：P1 导通（PMOS 栅极低电平导通）、N1 截止，于是 Q 被 P1 拉在 VDD——与假设一致；
+  \item Q=1 加在 P2/N2 的栅极上：N2 导通（NMOS 栅极高电平导通）、P2 截止，于是 $\overline{Q}$ 被 N2 拉在 VSS——同样与假设一致。
+\end{itemize}
+
+两条推理互为因果、彼此自洽，说明 Q=1/$\overline{Q}$=0 确实是一个稳定状态（由对称性，Q=0/$\overline{Q}$=1 是另一个）。这是一个\hwkey{正反馈环}：任何使 Q 略微下降的扰动，都会使 N2 略微关断、P2 略微导通，把 $\overline{Q}$ 拉高，进而使 N1 略微导通、P1 略微关断，把 Q 进一步拉低——直到翻转。但只要扰动幅度小于\hwkey{静态噪声裕量}（static noise margin, SNM，1.5 节给出定量定义与测量方法），反馈会把工作点推回稳态。
+
+\hwkey{漏电路径}（保持状态下的非理想因素）：
+
+\begin{longtable}{L{0.26\linewidth}L{0.24\linewidth}L{0.40\linewidth}}
+\toprule
+漏电来源 & 典型量级（28nm, 0.9V） & 影响 \\
+\midrule
+亚阈值漏电（N1/N2 截止时） & 1--10 pA/管 & 存储节点缓慢漂移 \\
+栅极隧穿漏电 & 0.1--1 pA/管 & 先进节点（$\leq$7nm）显著 \\
+M5/M6 截止漏电 & 1--5 pA/管 & 通过 BL 路径泄漏 \\
+PN 结反向漏电 & 0.5--2 pA/结 & 源/漏扩散区到衬底 \\
+\bottomrule
+\end{longtable}
+
+四条路径中占主导的是前两条。\term{亚阈值漏电}{subthreshold leakage}指栅压低于阈值后沟道电流并不归零、而是随 $V_{GS}$ 指数减小的残余电流，它是深亚微米工艺保持功耗的主要来源；\term{栅极隧穿漏电}{gate tunneling leakage}指载流子以量子隧穿方式直接穿过栅氧化层的电流，氧化层每薄一分，隧穿概率按指数上升，因此只在先进节点变得显著。
+
+在 28nm 工艺、0.9V 电源下，一个 6T 单元的总保持漏电约 \hwevidence{5--50 pA}。对于 1 Mbit 阵列，总静态漏电约 5--50 $\mu$A。在 7nm 及以下，栅极隧穿漏电占比增大，单元漏电可达 \hwevidence{50--200 pA}。
+
+保持状态下的\hwkey{最小稳定电压}（data retention voltage, DRV）指数据尚不丢失的最低电源电压。它的物理来源是环路增益：VDD 降低后晶体管进入亚阈值区，跨导随电流指数下降，当两个反相器的环路增益不足 1 时，正反馈无力再放大扰动、对抗漏电，双稳态退化为单稳态，数据丢失。典型 DRV 在 28nm 为 \hwevidence{0.4--0.6V}，在 7nm 为 \hwevidence{0.3--0.5V}。DRV 决定了休眠模式下 SRAM 能把电压降到多低而不丢数据，1.11 节的 retention mode 正是利用这一点省电。
+
+%======================================================================
+\topic{1.3\quad 读操作：电荷分享与灵敏放大（定量）}
+%======================================================================
+
+本小节把一次读操作拆成四个阶段，回答两个问题：位线上那几十毫伏的差分信号从哪里来，以及它怎样被放大成干净的 0/1。读之前必须先\term{预充}{precharge}：用预充管把一对位线都充到 VDD，然后关断预充管，使位线处于"高电平但浮空"的待发状态——之后发生的一切电压变化都以这个起点为参照。读操作分四个阶段：
+
+\begin{lstlisting}
+READ OPERATION (step by step):
+  Phase 1 - Precharge:
+    BL = VDD, BLbar = VDD    // 位线对预充到满高
+    WL = 0                    // 字线关闭，单元隔离
+  Phase 2 - Wordline assert:
+    WL = VDD                  // M5, M6 导通
+    // 若 Q=0: BL 通过 M5 -> N1 向 VSS 放电
+    // 若 Q=1: BL 保持 VDD（P1 上拉 vs M5 无放电路径）
+  Phase 3 - Charge sharing / differential develop:
+    // BL 下降 delta_V，BLbar 保持（或微升）
+    // 差分电压 V(BL) - V(BLbar) 逐渐增大
+  Phase 4 - Sense amplifier latch:
+    // 交叉耦合感放检测差分，正反馈放大到全摆幅
+    // 输出 DOUT = 0 (if Q=0) or 1 (if Q=1)
+\end{lstlisting}
+
+\hwkey{定量分析}——电荷分享模型：
+
+设存储节点 Q=0（即 Q 端电压 $\approx$ 0V），BL 预充到 VDD=0.9V。WL 打开后，BL 通过 M5 和 N1 向地放电。但放电不是到 0V——因为 N1 的驱动能力有限，且 BL 电容远大于单元内部电容。实际放电速度由\hwkey{放电通路}决定：读 Q=0 侧时 P1 栅接 $\overline{Q}$=VDD 处于截止，BL 的放电电流只能经 M5、N1 串联流向地，放电极限由 N1 的下拉能力决定。
+
+简化电荷分享模型（读 Q=0 时 P1 截止，暂不考虑其影响）：
+
+$$\Delta V_{BL} = \frac{C_{cell}}{C_{cell} + C_{BL}} \times V_{DD}$$
+
+其中 $C_{cell}$ 是存储节点对地电容（含 M5 漏极、N1 漏极、P1 漏极的扩散电容和连线电容），$C_{BL}$ 是位线总电容。
+
+\begin{longtable}{L{0.30\linewidth}L{0.22\linewidth}L{0.38\linewidth}}
+\toprule
+参数 & 典型值（28nm） & 来源 \\
+\midrule
+$C_{cell}$（存储节点电容） & 1--3 fF & 扩散结电容 + 连线 \\
+$C_{BL}$（位线电容） & 200--400 fF & 128--256 行单元的 M5 漏极 + 金属线 \\
+$C_{cell}/C_{BL}$ & 1:100 -- 1:200 & 比值极小 \\
+$\Delta V_{BL}$（单次电荷分享） & 5--15 mV & 理论初始值 \\
+实际读放电（含电流竞争） & 50--100 mV & 感放触发前累积放电 \\
+\bottomrule
+\end{longtable}
+
+表中最后两行描述的是同一条 BL 电压曲线的两段，不要误读为两个独立过程。\term{电荷分享}{charge sharing}只是 WL 刚打开瞬间的电压阶跃：预充到 VDD 的 BL 与接近 0V 的存储节点突然连通，两边电荷按电容比例重新分配，在皮秒量级内形成 5--15 mV 的初始落差。阶跃之后放电并未停止——N1 持续导通，以近似恒定的电流把 BL 上的电荷泄向地，BL 电压随时间近似线性下降，速率约为 $I_{N1}/C_{BL}$，按 28nm 典型值估算在每纳秒几十到一百多 mV 的量级。表中"实际读放电 50--100 mV"是感放触发时刻（WL 打开后约 0.3--0.5 ns）采样到的累积差分，而不是另一次电荷分享。设计中调节感放触发时刻，就是在"多等一会儿让差分长大"与"尽早读出求快"之间取折中。
+
+为什么不让 BL 自行放电到全摆幅再判断？因为几百 fF 的 BL 电容靠单元里最小尺寸的晶体管放电需要数纳秒，速度无法接受。解决办法是用\term{灵敏放大器}{sense amplifier, SA}：一个由时钟使能的交叉耦合锁存器（核心结构与 6T 单元相同），使能瞬间把毫伏级差分接入正反馈环，在亚纳秒内放大到全摆幅。这样"等电容放完电"就变成了"等电压差长大到可判别"，这是 SRAM 与 DRAM 共用的加速思路。感放并非理想器件：两侧晶体管的阈值失配等效为一个输入\term{失调电压}{offset voltage}，典型小于 20 mV，差分信号必须明显大于失调电压，读出才可靠。
+
+\hwevidence{关键数据}：在 28nm 工艺、VDD=0.9V、256 行阵列中，$C_{BL} \approx$ 300 fF，读放电幅度约 \hwevidence{60--80 mV}，感放触发延迟约 \hwevidence{0.3--0.5 ns}，总读访问时间（WL 有效到 DOUT 稳定）约 \hwevidence{0.8--1.5 ns}。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Time axis
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (11,0) node[right, hw label] {时间 (ns)};
+  % WL waveform
+  \draw[BookAmber, line width=0.7pt] (0.5,3.8) -- (1.5,3.8) -- (1.5,4.4) -- (9.5,4.4) -- (9.5,3.8) -- (10.5,3.8);
+  \node[hw label, anchor=east] at (0.4,4.1) {WL};
+  % BL waveform (discharging)
+  \draw[BookTeal, line width=0.8pt] (0.5,2.8) -- (1.5,2.8) -- (2.0,2.75) -- (3.0,2.6) -- (4.0,2.5) -- (5.0,2.45) -- (5.5,2.4) -- (6.0,1.2) -- (10.5,1.2);
+  \node[hw label, anchor=east] at (0.4,2.8) {BL (Q=0)};
+  % BLbar waveform (stays high)
+  \draw[BookAccent, line width=0.8pt] (0.5,2.2) -- (1.5,2.2) -- (5.5,2.2) -- (6.0,3.2) -- (10.5,3.2);
+  \node[hw label, anchor=east] at (0.4,2.2) {$\overline{BL}$ (Q=1)};
+  % Annotations
+  \draw[BookRule, line width=0.3pt, dashed] (1.5,4.6) -- (1.5,-0.3);
+  \draw[BookRule, line width=0.3pt, dashed] (5.5,4.6) -- (5.5,-0.3);
+  \node[hw label] at (1.0,4.8) {预充};
+  \node[hw label] at (3.5,4.8) {差分发展};
+  \node[hw label] at (8.0,4.8) {感放锁存};
+  % Delta V annotation
+  \draw[BookRed, line width=0.5pt, <->] (5.7,2.45) -- (5.7,2.2);
+  \node[BookRed, font=\tiny\bfseries] at (6.3,2.32) {$\Delta V$=60mV};
+  % Sense amp trigger
+  \node[hw label, font=\tiny] at (5.5,-0.5) {感放触发点};
+  \node[hw label, text width=9cm] at (5.5,-1.2) {读操作时序：WL 打开后 BL 缓慢放电（Q=0 侧），$\overline{BL}$ 保持高（Q=1 侧）。差分电压超过感放的最小可辨阈值（灵敏度下限，约 50--80mV，远大于失调电压）后，正反馈在 0.3ns 内放大到全摆幅。};
+\end{pdfdiagram}
+\diagramnote{SRAM 读操作波形。注意读操作是\hwkey{非破坏性}的——读 Q=0 侧时 P1 栅接 $\overline{Q}$=VDD 处于截止，只要 N1 相对 M5 足够强（CR $>$ 1），Q 就不会被抬过翻转点，读完后单元数据不变。}
+
+\hwkey{读操作的关键约束}：读过程中，预充到 VDD 的 BL 经 M5 向 Q=0 的节点注入电流，Q 被向上抬；同时 N1 把 Q 拉向地——Q 的稳态电压由 M5 与 N1 的分压决定。如果 M5 太强（相对于 N1），Q 可能被抬高到 N2 的阈值电压以上，导致单元意外翻转——这就是\hwkey{读扰动（read disturb）}。因此 N1 必须比 M5 强（即 CR = $W_{N1}/W_{M5}$ $>$ 1），保证读稳定性。
+
+%======================================================================
+\topic{1.4\quad 写操作：驱动能力竞争与 CR/PR}
+%======================================================================
+
+上一节的读操作刻意不去扰动单元，本小节的写操作则相反：目标是\hwkey{强行翻转}锁存器状态。假设当前 Q=1、$\overline{Q}$=0，要写入 0：
+
+\begin{lstlisting}
+WRITE OPERATION (writing 0 to cell with Q=1, Qbar=0):
+  Phase 1 - Drive bitlines:
+    BL = 0 (VSS)             // 写驱动器拉低 BL
+    BLbar = VDD              // 写驱动器拉高 BLbar
+    WL = 0                    // 字线尚未打开
+  Phase 2 - Assert wordline:
+    WL = VDD                  // M5, M6 导通
+    // BL=0 通过 M5 拉低 Q（对抗 P1 上拉）
+    // BLbar=VDD 通过 M6 拉高 Qbar（对抗 N2 下拉）
+  Phase 3 - Cell flip:
+    // Q 被拉低到 N2 阈值以下 -> N2 截止
+    // Qbar 被拉高到 P1 阈值以上 -> P1 截止
+    // 正反馈接管：N1 导通拉 Q->0, P2 截止让 Qbar->VDD
+    // 锁存器翻转到新稳态：Q=0, Qbar=1
+  Phase 4 - Deassert wordline:
+    WL = 0                    // 新数据锁存
+    BL, BLbar 恢复预充
+\end{lstlisting}
+
+\hwkey{写操作的核心矛盾}：写驱动器通过 M5 拉低 Q，但 P1（PMOS 上拉管）同时把 Q 拉向 VDD。写入成功的条件是：
+
+$$I_{M5}(\text{pull-down}) > I_{P1}(\text{pull-up}) \quad \text{at } V_Q = V_{th,N2}$$
+
+即 M5 在 Q 被拉到 N2 阈值电压（约 0.3--0.4V）时提供的下拉电流，必须大于 P1 在此电压下的上拉电流。
+
+注意写入的主攻方向是\hwkey{拉低} Q，而不是抬高 $\overline{Q}$：NMOS 访问管传 0 没有电平损失，传 1 却要损失约一个阈值电压（栅压 VDD 减去 $V_{th}$ 后管子已近截止），靠 M6 把 $\overline{Q}$ 推向 VDD 既慢又不可靠。因此写电路总是由写驱动器把对应一侧的位线拉到 0，让另一侧靠交叉耦合反馈自己跟上。
+
+1.1 节定义的两个尺寸比在这里各就其位。写能力由 PR = $W_{M5}/W_{P1}$ 决定：PR 大意味着 M5 相对 P1 强，写 0 时容易把 Q 拉过翻转点。读稳定性则由 CR = $W_{N1}/W_{M5}$ 决定：读 Q=0 侧时 P1 的栅极接在 $\overline{Q}$=VDD 上处于截止，与 PR 无关，Q 能否稳住只看 N1 是否比 M5 强。一个比值管写、一个管读，这正是读写裕量可以在一定程度上独立调节的结构基础。
+
+典型设计值：CR = 1.2--1.5，PR = 1.0--1.5。在先进节点（7nm/5nm），由于 FinFET 的量化宽度（fin 数为整数），CR 和 PR 的调节粒度变粗，设计空间收窄。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Write operation: current competition
+  \node[hw state, minimum width=1.0cm, minimum height=0.6cm] (P1w) at (2.0,2.0) {P1};
+  \node[hw compute, minimum width=1.0cm, minimum height=0.6cm] (M5w) at (2.0,0.0) {M5};
+  \node[hw state, minimum width=1.0cm, minimum height=0.6cm] (N1w) at (2.0,-1.5) {N1};
+  % Connections
+  \draw[BookTeal, line width=0.6pt] (P1w.north) -- ++(0,0.6) node[above, hw label] {VDD};
+  \draw[BookAccent, line width=0.6pt] (P1w.south) -- (M5w.north);
+  \node[BookAccent, font=\small\bfseries] at (2.8,1.0) {Q};
+  \draw[BookAccent, line width=0.6pt] (M5w.south) -- (0.4,-0.3) node[left, hw label, font=\small\bfseries] {BL=0};
+  \draw[BookTeal, line width=0.5pt] (N1w.south) -- ++(0,-0.5) node[below, hw label] {VSS};
+  % Current arrows
+  \draw[BookRed, line width=0.7pt, ->] (1.2,2.0) -- (1.2,1.0) node[midway, left, font=\tiny, BookRed] {$I_{P1}$};
+  \draw[BookTeal, line width=0.7pt, ->] (1.2,0.0) -- (1.2,-0.8) node[midway, left, font=\tiny, BookTeal] {$I_{M5}$};
+  % Condition
+  \node[hw label, text width=7cm] at (5.5,0.5) {写入条件：$I_{M5} > I_{P1}$ 在 $V_Q = V_{th}$ 时。\\写驱动器（大尺寸 NMOS）通过 BL=0 和 M5 拉低 Q，\\必须克服 P1 的上拉。};
+  % Write driver：正交走线，方向 Write Driver -> BL -> M5
+  \node[hw compute, minimum width=1.4cm, minimum height=0.7cm] (wd) at (0.4,-1.6) {Write Driver};
+  \draw[hw bus] (wd.north) -- (0.4,-0.3);
+  \node[hw label, font=\tiny] at (0.4,-2.35) {大尺寸 NMOS 下拉};
+\end{pdfdiagram}
+\diagramnote{写操作中的电流竞争。P1 试图把 Q 拉回 VDD，M5+写驱动器试图把 Q 拉到 0。写入成功要求 M5 路径的驱动能力超过 P1。}
+
+%======================================================================
+\topic{1.5\quad 静态噪声裕量（SNM）与蝶形图}
+%======================================================================
+
+1.2 节定性地说过"扰动不超过静态噪声裕量就翻不了"，本小节给出这个裕量的严格定义与工程上通用的测量方法。\hwkey{静态噪声裕量（Static Noise Margin, SNM）}是衡量 SRAM 单元在保持状态下抗干扰能力的标准度量。测量方法：
+
+\begin{enumerate}
+  \item 画出左反相器（P1/N1）的电压传输特性（VTC）：$V_{out,Q} = f(V_{in,\overline{Q}})$
+  \item 画出右反相器（P2/N2）的 VTC：$V_{out,\overline{Q}} = g(V_{in,Q})$
+  \item 将第二条 VTC 以 $V_{out}$ 轴为对称轴镜像（即交换横纵坐标）
+  \item 两条曲线叠加形成\hwkey{蝶形图（butterfly curve）}，围成两个"眼"
+  \item 每个眼中能放入的\hwkey{最大内切正方形}的边长即为 SNM（取两个眼中较小者）
+\end{enumerate}
+
+\begin{classicnote}
+为什么取最大内切正方形？把两个反相器首尾相接成环路后，外部干扰可以等效为同时串联在两个输入端的等幅噪声源；两条 VTC 曲线之间能容纳的最大正方形边长，正是环路在保持双稳态的前提下、两个节点可同时承受的最大串联噪声幅度。这个"最大正方形"判据由 Seevinck 等人于 1987 年提出，至今仍是 SRAM 文献的标准度量。
+\end{classicnote}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Axes
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (6.0,0) node[right, hw label] {$V_Q$ (V)};
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (0,6.0) node[above, hw label] {$V_{\overline{Q}}$ (V)};
+  % VDD labels
+  \node[hw label] at (5.5,-0.3) {0.9};
+  \node[hw label] at (-0.3,5.5) {0.9};
+  % VTC curve 1 (inverter 1: input Qbar, output Q) - normal S shape（红）
+  \draw[BookRed, line width=0.9pt] (0.3,5.2) .. controls (1.2,5.2) and (1.8,4.8) .. (2.5,2.8) .. controls (3.2,0.8) and (3.8,0.4) .. (5.2,0.4);
+  % VTC curve 2 (inverter 2 mirrored) - inverted S（蓝）
+  \draw[BookAccent, line width=0.9pt] (5.2,5.2) .. controls (3.8,5.2) and (3.2,4.8) .. (2.5,2.8) .. controls (1.8,0.8) and (1.2,0.4) .. (0.3,0.4);
+  % SNM squares (two eyes)
+  \draw[BookAmber, line width=0.8pt] (0.8,3.2) rectangle (2.2,4.6);
+  \draw[BookAmber, line width=0.8pt] (3.3,1.0) rectangle (4.7,2.4);
+  % SNM label
+  \node[BookAmber, font=\small\bfseries] at (1.5,3.9) {SNM$_1$};
+  \node[BookAmber, font=\small\bfseries] at (4.0,1.7) {SNM$_2$};
+  % Stable points
+  \fill[BookRed] (0.5,5.0) circle (0.08);
+  \fill[BookRed] (5.0,0.5) circle (0.08);
+  \node[BookRed, font=\tiny\bfseries] at (0.9,5.3) {稳态 1};
+  \node[BookRed, font=\tiny\bfseries] at (5.3,0.9) {稳态 2};
+  % Meta-stable point
+  \fill[BookMuted] (2.5,2.8) circle (0.06);
+  \node[hw label, font=\tiny] at (3.0,3.1) {亚稳态};
+  % Caption
+  \node[hw label, text width=9cm] at (3.0,-1.0) {蝶形图：红色曲线为反相器 1 的 VTC，蓝色曲线为反相器 2 的镜像 VTC。两个"眼"中的最大内切正方形边长 = SNM。SNM = min(SNM$_1$, SNM$_2$)。工艺波动使两个眼不对称，较小者决定单元裕量。};
+\end{pdfdiagram}
+\diagramnote{SRAM 蝶形图与 SNM 测量。两个稳态点（红点）位于对角；亚稳态点（灰点）在中心。SNM 越大，单元越不容易被噪声翻转。}
+
+\hwkey{不同工艺节点的 SNM 典型值}：
+
+\begin{longtable}{L{0.12\linewidth}L{0.12\linewidth}L{0.18\linewidth}L{0.18\linewidth}L{0.30\linewidth}}
+\toprule
+工艺节点 & VDD (V) & 标称 SNM (mV) & 3$\sigma$ 最差 SNM & 备注 \\
+\midrule
+65 nm & 1.0 & 250--350 & 180--250 & 平面 MOSFET，裕量充足 \\
+28 nm & 0.9 & 150--250 & 100--160 & 平面 MOSFET 最后节点 \\
+14 nm & 0.8 & 120--180 & 70--120 & FinFET 引入，波动减小 \\
+7 nm & 0.7 & 80--150 & 40--90 & EUV 光刻，fin 数量少 \\
+5 nm & 0.65 & 60--120 & 30--70 & 需要 assist 电路 \\
+3 nm & 0.6 & 50--100 & 20--50 & GAA 纳米片，设计极困难 \\
+\bottomrule
+\end{longtable}
+
+表中"3$\sigma$ 最差 SNM"指计入工艺随机波动后、比标称值差 3 个标准差的单元的 SNM。对百万级单元的阵列而言，起决定作用的是分布尾部的最差单元而不是标称值，因此设计必须按 3$\sigma$（高良率要求时甚至 6$\sigma$）列来校核。
+
+\hwkey{SNM 缩小的原因}：
+\begin{enumerate}
+  \item \hwkey{VDD 降低}：SNM $\propto$ VDD（近似线性），VDD 从 1.0V 降到 0.65V，SNM 直接缩小 35\%
+  \item \hwkey{阈值电压波动}（$V_{th}$ mismatch）：$\sigma_{V_{th}} \propto 1/\sqrt{W \cdot L}$，面积缩小后波动增大
+  \item \hwkey{短沟道效应}：DIBL（漏致势垒降低）使亚阈值斜率退化，反相器增益下降
+  \item \hwkey{FinFET 量化}：fin 数只能取整数（1, 2, 3...），无法精细调节驱动比
+\end{enumerate}
+
+%======================================================================
+\topic{1.6\quad 读稳定性 vs 写能力的权衡}
+%======================================================================
+
+前面三节分别考察了保持、读、写，本小节把它们放在一起：加大同一个晶体管，往往一边受益、一边受损，这是 SRAM 设计中\hwkey{最根本的矛盾}。注意本节的噪声裕量与 1.5 节测的不是同一个：1.5 节的蝶形图对应 WL=0 的\emph{保持}状态，而读操作时 WL=1、位线预充在 VDD，M5 持续向 Q=0 节点注入电流，等效于在随机噪声之上再叠加一个固定方向的扰动，因此读状态的噪声裕量总是显著小于保持状态——读才是单元最容易翻转的时刻。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+设计选择 & 对读稳定性的影响 & 对写能力的影响 \\
+\midrule
+M5 更强（$W_{M5}$ 增大） & 读时 M5 把 BL 电压传到 Q，更容易把 Q 拉高 → \hwrisk{读稳定性下降} & 写时 M5 提供更多下拉电流 → \hwkey{写能力增强} \\
+P1 更强（$W_{P1}$ 增大） & 读时 P1 把 Q 牢牢拉在 VDD → \hwkey{读稳定性增强} & 写时 P1 对抗 M5 更强 → \hwrisk{写能力下降} \\
+N1 更强（$W_{N1}$ 增大） & 读时 N1 提供强放电路径 → 读信号大 & 写时 N1 帮助拉低 Q → 写容易 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{量化权衡}：定义\hwkey{读 SNM}（read SNM, RSNM）为 WL=1、位线预充到 VDD 时测得的 SNM，即读状态下的蝶形图内切正方形边长，它是所有工作状态中最小的噪声裕量。\hwkey{写裕量}（write margin, WM）沿用文献中的常用定义：写 0 时把 BL 从 VDD 开始逐渐下拉，单元恰好翻转那一瞬的 $V_{DD}-V_{BL}$ 即为 WM。WM 越大，说明 BL 不必拉多低单元就已翻转，写入越容易、裕量越大——与 RSNM 一样，数值大才是好事。
+
+\begin{longtable}{L{0.22\linewidth}L{0.26\linewidth}L{0.26\linewidth}L{0.16\linewidth}}
+\toprule
+工艺 & RSNM (mV) & WM (mV) & 设计难点 \\
+\midrule
+65 nm & 200--300 & 400--500 & 裕量充足 \\
+28 nm & 120--200 & 250--350 & 开始紧张 \\
+7 nm & 60--120 & 150--250 & 需要 assist \\
+5 nm & 40--90 & 100--180 & 强依赖 assist \\
+\bottomrule
+\end{longtable}
+
+对照表中趋势：工艺每前进一代，RSNM 与 WM 同步收窄。在 7nm 及以下的最差\hwkey{工艺角}（process corner，即掺杂浓度、器件尺寸、温度、电压波动的最坏组合）下，两者都可能退化到接近于零——同一颗芯片上可能既有读时会翻转的单元，又有写不进去的单元。这就是\hwkey{写辅助电路}（write assist）和\hwkey{读辅助电路}（read assist）存在的根本原因，也是下一小节的主题。
+
+%======================================================================
+\topic{1.7\quad 写辅助电路（Write/Read Assist）}
+%======================================================================
+
+当标称设计无法满足所有工艺角的读写裕量时，引入辅助电路在关键时刻临时改变偏置条件：
+
+\begin{longtable}{L{0.18\linewidth}L{0.32\linewidth}L{0.20\linewidth}L{0.20\linewidth}}
+\toprule
+辅助技术 & 原理 & 裕量改善 & 代价 \\
+\midrule
+\hwkey{负位线}（Negative BL） & 写时把 BL 驱动到 $-$0.1 $\sim$ $-$0.2V（低于 VSS），增大 M5 的 $V_{GS}$ & 写裕量 +80--150 mV & 需要负电压发生器；增加面积 3--5\% \\
+\hwkey{字线下压}（WL underdrive） & 读时 WL 不拉到满 VDD，而是 0.7$\times$VDD，减弱 M5 导通 & 读 SNM +30--60 mV & 读速度变慢 +0.1--0.2 ns \\
+\hwkey{VDD 下压}（VDD collapse） & 写时临时把单元的 VDD 拉到 0.5$\times$VDD，削弱 P1 上拉 & 写裕量 +100--200 mV & 需要 per-bank VDD 开关；恢复时间 \\
+\hwkey{读 VDD 提升}（Read VDD boost） & 读时把单元 VDD 提升到 1.1$\times$VDD，增强 P1 上拉 & 读 SNM +40--80 mV & 需要升压电路；可靠性应力 \\
+\hwkey{体偏置}（Body bias） & 通过衬底偏置调节 $V_{th}$：写时正向体偏（降低 NMOS $V_{th}$） & 读/写均可调 & 需要 triple-well 隔离；面积 +10\% \\
+\bottomrule
+\end{longtable}
+
+把这五种技术放在一起看，原理是统一的：读写困难的根源都是有效 CR/PR 不够大，辅助电路只是在需要的那几十皮秒里临时改变偏置条件——写时让 M5 显得更强或 P1 显得更弱（等效于增大 PR），读时让 M5 显得更弱或 P1 显得更强（等效于增大 CR）。之所以只在操作瞬间施加而不永久改变偏置，是因为这些偏置都偏离正常设计点：负压与过压会加剧器件老化，VDD 下压会侵蚀保持裕量，长期施加得不偿失。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Negative BL diagram
+  \node[hw label, font=\small\bfseries] at (2.0,3.5) {负位线写辅助};
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (5,0) node[right, hw label] {时间};
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (0,3.2) node[above, hw label] {电压};
+  % Normal BL=0
+  \draw[BookTeal, line width=0.7pt] (0.5,0.5) -- (4.5,0.5);
+  \node[hw label, anchor=east] at (0.4,0.5) {0V};
+  % Negative BL
+  \draw[BookRed, line width=0.7pt] (0.5,0.5) -- (1.5,0.5) -- (1.5,-0.3) -- (3.5,-0.3) -- (3.5,0.5) -- (4.5,0.5);
+  \node[BookRed, font=\tiny\bfseries] at (2.5,-0.6) {BL = $-$0.15V};
+  % VDD level
+  \draw[BookAccent, line width=0.5pt, dashed] (0.5,2.8) -- (4.5,2.8);
+  \node[hw label, anchor=east] at (0.4,2.8) {VDD};
+  % VGS annotation
+  \draw[BookAmber, line width=0.5pt, <->] (4.0,2.8) -- (4.0,-0.3);
+  \node[BookAmber, font=\tiny\bfseries, rotate=90] at (4.4,1.2) {$V_{GS}$ 增大};
+  % VDD collapse diagram
+  \node[hw label, font=\small\bfseries] at (8.0,3.5) {VDD 下压写辅助};
+  \draw[BookRule, line width=0.5pt, ->] (6,0) -- (11,0) node[right, hw label] {时间};
+  \draw[BookRule, line width=0.5pt, ->] (6,0) -- (6,3.2) node[above, hw label] {电压};
+  % Normal VDD
+  \draw[BookTeal, line width=0.5pt, dashed] (6.5,2.8) -- (10.5,2.8);
+  \node[hw label, anchor=east] at (6.4,2.8) {VDD};
+  % Collapsed VDD
+  \draw[BookRed, line width=0.7pt] (6.5,2.8) -- (7.5,2.8) -- (7.5,1.4) -- (9.5,1.4) -- (9.5,2.8) -- (10.5,2.8);
+  \node[BookRed, font=\tiny\bfseries] at (8.5,1.1) {VDD$_{cell}$ = 0.5$\times$VDD};
+  % P1 weakened
+  \node[hw label, font=\tiny] at (8.5,0.5) {P1 上拉电流减半 → 写容易};
+\end{pdfdiagram}
+\diagramnote{两种写辅助技术。左：负位线增大 M5 的 $V_{GS}$（从 VDD 变为 VDD+0.15V），增强下拉。右：VDD 下压削弱 P1 上拉，降低写翻转阈值。}
+
+\hwkey{工业实践}：\hwevidence{TSMC 7nm SRAM 宏}使用负位线（$-$100mV）+ WL 下压的组合；\hwevidence{Samsung 5nm} 使用 VDD collapse + 体偏置；\hwevidence{Intel 10nm（Intel 7）}使用读 VDD boost + 负位线。
+
+%======================================================================
+\topic{1.8\quad 从单元到阵列：外围电路}
+%======================================================================
+
+一个实用的 SRAM 宏（macro，即可作为模块例化的成品存储块）由\hwkey{存储阵列}和\hwkey{外围电路}组成。以 28nm 工艺、512 Kbit（64 KiB）SRAM 宏为例，阵列组织为 256 行 $\times$ 2048 列（含纠错码位；纠错码 ECC 在 1.9 与 1.12 节介绍）。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Array block
+  \draw[BookRule, line width=0.6pt, fill=BookCodeBg] (2.0,1.0) rectangle (8.0,5.0);
+  \node[hw label, font=\small\bfseries] at (5.0,3.0) {存储阵列\\256 行 $\times$ 2048 列};
+  % Row decoder (left)
+  \node[hw control, minimum width=1.2cm, minimum height=2.5cm] (rdec) at (0.5,3.0) {行译码器\\(Row Dec)};
+  \draw[hw bus] (rdec.east) -- (2.0,3.0);
+  % Wordlines
+  \foreach \y in {1.5, 2.2, 2.9, 3.6, 4.3} {
+    \draw[BookAmber, line width=0.4pt] (2.0,\y) -- (8.0,\y);
+  }
+  \node[hw label, font=\tiny, align=center] at (1.55,3.38) {WL\\{[255:0]}};
+  % Column mux (bottom)
+  \node[hw compute, minimum width=3.0cm, minimum height=0.7cm] (cmux) at (5.0,0.3) {列多路选择器 (8:1 Mux)};
+  \draw[hw bus] (5.0,1.0) -- (5.0,0.65);
+  % Sense amplifiers
+  \node[hw state, minimum width=2.5cm, minimum height=0.6cm] (sa) at (5.0,-0.6) {灵敏放大器组 (SA)};
+  \draw[hw bus] (cmux.south) -- (sa.north);
+  % Write drivers
+  \node[hw compute, minimum width=2.0cm, minimum height=0.6cm] (wd) at (9.5,0.3) {写驱动器};
+  \draw[hw bus] (wd.west) -- (8.0,0.3) -- (8.0,1.0);
+  % Column decoder
+  \node[hw control, minimum width=1.2cm, minimum height=0.8cm] (cdec) at (9.5,-0.6) {列译码器};
+  % 列译码输出驱动列 mux 的选择端（正交折线从 mux 东侧进入，不进 SA）
+  \draw[hw bus] (cdec.west) -- (7.2,-0.6) -- (7.2,0.3) -- (cmux.east);
+  % Address input
+  \node[hw label, font=\small\bfseries] at (0.5,5.5) {ADDR[15:0]};
+  \draw[hw bus] (0.5,5.3) -- (rdec.north);
+  % 列地址从顶部通道绕到列译码器（不进阵列框）
+  \draw[hw bus] (0.5,5.2) -- (10.9,5.2) -- (10.9,-0.6) -- (cdec.east);
+  % Data I/O
+  \node[hw label, font=\small\bfseries] at (5.0,-1.5) {DIN / DOUT};
+  \draw[hw bus] (sa.south) -- (5.0,-1.3);
+  % Bitlines annotation
+  \foreach \x in {2.5, 3.5, 4.5, 5.5, 6.5, 7.5} {
+    \draw[BookTeal, line width=0.3pt] (\x,1.0) -- (\x,5.0);
+  }
+  \node[hw label, font=\tiny, rotate=90] at (8.3,3.0) {BL pairs};
+  % Caption
+  \node[hw label, text width=9cm] at (5.0,-2.3) {SRAM 宏结构：行译码器选中一条 WL；列译码器通过列 mux 选中一组 BL 对送到灵敏放大器；写驱动器在写操作时驱动 BL 对。};
+\end{pdfdiagram}
+\diagramnote{SRAM 宏内部结构。行地址选择 WL，列地址通过列 mux 选择 BL 组。灵敏放大器位于列 mux 和数据总线之间。}
+
+\hwkey{各外围模块详解}：
+
+\begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}}
+\toprule
+模块 & 功能 & 设计要点 \\
+\midrule
+\hwkey{行译码器} & 将行地址（如 8 bit → 256 条 WL）译码为一条 WL 有效 & 驱动长 WL（横跨整行）；WL 电容 $\propto$ 列数；需要大尺寸驱动管 \\
+\hwkey{字线驱动器} & 提供 WL 的充放电电流 & WL 延迟 = $R_{driver} \times C_{WL}$；横跨 2048 列的 WL 电容约 0.5--1 pF \\
+\hwkey{位线组织} & 每列一对 BL/$\overline{BL}$，贯穿所有行 & BL 电容 = 每行 M5 漏极电容 $\times$ 行数 + 金属线电容；256 行约 200--400 fF \\
+\hwkey{列多路选择器} & 从 N 条 BL 对中选 1 条送到 SA & 4:1 / 8:1 / 16:1；减少 SA 数量（面积）但增加 BL 负载 \\
+\hwkey{灵敏放大器} & 检测 BL 差分电压（50--100 mV）并放大到全摆幅 & 交叉耦合锁存型或电流镜型；offset $<$ 20 mV \\
+\hwkey{写驱动器} & 写时驱动 BL/$\overline{BL}$ 为互补电平 & 驱动能力 $>$ 单元 P1 上拉；通常是大尺寸反相器对 \\
+\hwkey{列译码器} & 将列地址译码为列 mux 的选择信号 & 与行译码器配合确定唯一被访问的单元 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{列 mux 比例的设计权衡}：mux 比例回答的问题是"每个灵敏放大器服务多少对位线"。比例越高，SA 数量越少、面积越省；但 mux 的传输管串在 BL 与 SA 之间，既让每条 BL 多挂一组开关的寄生电容，又给读出路径插入额外电阻，速度随之下降。注意它不改变位线的物理长度——BL 长度由行数决定，mux 比例决定的只是每个 SA 挂接的 BL 对数及其扇出负载。
+
+\begin{longtable}{L{0.12\linewidth}L{0.16\linewidth}L{0.32\linewidth}L{0.30\linewidth}}
+\toprule
+Mux 比例 & SA 数量 & 每个 SA 挂接的 BL 对数与负载 & 适用场景 \\
+\midrule
+1:1 & 最多 & 1 对，直接相连，负载最小、速度最快 & L1 cache（速度优先） \\
+4:1 & 1/4 & 4 对，经一级 mux 选择 & L2 cache \\
+8:1 & 1/8 & 8 对，mux 树加深、插入延迟增大 & L2/L3（面积优先） \\
+16:1 & 1/16 & 16 对，mux 级数与扇出负载最大 & L3/大容量 SRAM \\
+\bottomrule
+\end{longtable}
+
+%======================================================================
+\topic{1.9\quad 阵列组织：Cache 中的 SRAM}
+%======================================================================
+
+CPU 中的 SRAM 阵列根据用途有不同的组织方式：
+
+\begin{longtable}{L{0.14\linewidth}L{0.14\linewidth}L{0.14\linewidth}L{0.14\linewidth}L{0.34\linewidth}}
+\toprule
+参数 & L1D & L1I & L2 & L3 (LLC) \\
+\midrule
+容量 & 32--64 KiB & 32--64 KiB & 256 KiB--2 MiB & 8--128 MiB（共享） \\
+端口数 & 2（读+写） & 1（读为主） & 1 或 2 & 1 \\
+访问延迟 & 3--5 周期 & 3--5 周期 & 8--14 周期 & 25--50 周期 \\
+Bank 数 & 2--4 & 1--2 & 4--8 & 8--32 \\
+行宽 & 64B + ECC & 64B + ECC & 64B + ECC & 64B + ECC \\
+\bottomrule
+\end{longtable}
+
+\hwkey{单端口 vs 双端口}：
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+类型 & 结构 & 应用 \\
+\midrule
+\hwkey{单端口}（1-port） & 1 对 BL/$\overline{BL}$，1 个 WL；同一周期只能读或写 & L1I、L2、L3（读写分时） \\
+\hwkey{双端口}（2-port） & 2 对 BL/$\overline{BL}$，2 个 WL；可同时一读一写 & 寄存器堆（RF）：读端口 $\times$2 + 写端口 $\times$1--2 \\
+\hwkey{多端口}（multi-port） & N 对 BL；面积 $\propto$ 端口数 & 极少用（面积太大）；寄存器堆通常用 2R1W 或 2R2W \\
+\bottomrule
+\end{longtable}
+
+\hwkey{寄存器堆}（Register File, RF）是 SRAM 的特殊应用：CPU 的乱序执行要求同一拍读出多个源操作数并写回结果，因此寄存器堆采用多端口单元，端口配置用"2R1W"（两读一写）这类记法标注，每多一个端口就要多一对位线和一条字线。以 ARM Cortex-A78 为例，其整数物理寄存器堆的项数与端口组织未见官方公开，第三方微结构分析的通行估计为 128 项量级、2R1W 或 2R2W 配置。由于每个端口都需要独立的位线对和字线，2R1W 寄存器堆的单元面积约为单端口 SRAM 的 \hwevidence{2--3 倍}。
+
+\hwkey{冗余与修复}：
+
+制造缺陷（颗粒、光刻缺陷）会导致某些行或列的单元失效。若整颗宏因此报废，良率损失无法接受，所以 SRAM 宏内嵌\hwkey{冗余行}（spare row）和\hwkey{冗余列}（spare column）：出厂测试发现坏行、坏列后，用激光或电流熔断\term{熔丝}{fuse}（或反其道行之，把\term{反熔丝}{antifuse}击穿成永久导通），将坏地址永久重定向到冗余单元。熔丝与反熔丝都是一次性可编程（one-time programmable, OTP）的物理开关，编程后不可恢复。
+
+\begin{longtable}{L{0.24\linewidth}L{0.26\linewidth}L{0.40\linewidth}}
+\toprule
+冗余类型 & 典型数量 & 修复方式 \\
+\midrule
+冗余行（spare row） & 2--4 行 / 阵列 & 熔丝（fuse）或反熔丝（antifuse）将坏行地址重定向到 spare row \\
+冗余列（spare column） & 4--8 列 / 阵列 & 同理；spare column 通常按 byte 或 ECC word 粒度 \\
+ECC 位 & 每 64 数据位 + 8 校验位 & SEC-DED（单错纠正、双错检测）；嵌入阵列中 \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{典型配置}：一个 64 KiB L1 cache 阵列 = 1024 行 $\times$ 512 列数据 + 64 列 ECC + 4 行冗余 + 8 列冗余。
+
+%======================================================================
+\topic{1.10\quad 时序参数}
+%======================================================================
+
+前面各节讨论的都是阵列内部的工作过程，本小节转向对外接口：SRAM 宏作为可集成的模块交付使用时，使用者必须满足哪些时序约定。SRAM 宏的时序参数定义了外部接口（地址、数据、控制信号）的时序约束：
+
+\begin{longtable}{L{0.22\linewidth}L{0.18\linewidth}L{0.50\linewidth}}
+\toprule
+参数 & 典型值（28nm） & 定义 \\
+\midrule
+\hwkey{$t_{AA}$}（地址访问时间） & 0.8--1.5 ns & 地址有效 → 数据输出稳定（读） \\
+\hwkey{$t_{RC}$}（读周期时间） & 1.0--2.0 ns & 两次连续读操作的最小间隔 \\
+\hwkey{$t_{WC}$}（写周期时间） & 1.0--2.0 ns & 写操作的最小周期（地址+数据+WE 有效） \\
+\hwkey{$t_{AS}$}（地址建立时间） & 0.1--0.3 ns & 地址必须在 CLK 上升沿前稳定的最小时间 \\
+\hwkey{$t_{AH}$}（地址保持时间） & 0.05--0.1 ns & CLK 上升沿后地址必须保持的最小时间 \\
+\hwkey{$t_{DS}$}（数据建立时间） & 0.1--0.3 ns & 写数据必须在 CLK 上升沿前稳定 \\
+\hwkey{$t_{DH}$}（数据保持时间） & 0.05--0.1 ns & CLK 上升沿后写数据必须保持 \\
+\hwkey{$t_{WS}$}（WL 建立到 SA 触发） & 0.5--1.0 ns & WL 有效到感放输出的内部延迟 \\
+\bottomrule
+\end{longtable}
+
+建立时间与保持时间不是人为规定，而是内部物理过程的反映。地址变化后，行译码器的多级门和长字线的 RC 延迟都需要时间才能稳定：若地址在时钟沿前不足 $t_{AS}$ 才变化，译码输出尚未就位，被打开的可能是错误的字线；若时钟沿后地址立刻变化（违反 $t_{AH}$），旧字线尚未关断，可能出现两条字线同时导通的争用。$t_{AA}$ 则是整条读路径——地址缓冲、译码、字线驱动、位线放电、感放、输出级——延迟之和，直接决定 SRAM 宏能工作的最高频率。
+
+\hwevidence{实际数据}：TSMC 28nm HPC+ 工艺的 \hwevidence{512Kb SRAM 宏}，typical corner（0.9V, 25°C）下 $t_{AA}$ = \hwevidence{0.82 ns}（即 1.2 GHz 单周期访问）；worst corner（0.81V, 125°C）下 $t_{AA}$ = \hwevidence{1.45 ns}。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Timing diagram for read
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (11,0) node[right, hw label] {时间};
+  % CLK
+  \draw[BookRule, line width=0.6pt] (0.5,4.0) -- (1.5,4.0) -- (1.5,4.6) -- (3.5,4.6) -- (3.5,4.0) -- (5.5,4.0) -- (5.5,4.6) -- (7.5,4.6) -- (7.5,4.0) -- (9.5,4.0) -- (9.5,4.6) -- (10.5,4.6);
+  \node[hw label, anchor=east] at (0.4,4.3) {CLK};
+  % ADDR
+  \draw[BookAccent, line width=0.6pt] (0.5,2.8) -- (1.0,2.8) -- (1.0,3.4) -- (5.0,3.4) -- (5.0,2.8) -- (5.5,2.8) -- (5.5,3.4) -- (9.5,3.4) -- (9.5,2.8) -- (10.5,2.8);
+  \node[hw label, anchor=east] at (0.4,3.1) {ADDR};
+  \node[hw label, font=\tiny] at (3.0,3.6) {A0};
+  \node[hw label, font=\tiny] at (7.5,3.6) {A1};
+  % DOUT
+  \draw[BookTeal, line width=0.6pt] (0.5,1.5) -- (2.5,1.5) -- (2.7,1.5) -- (2.7,2.1) -- (6.5,2.1) -- (6.5,1.5) -- (6.7,1.5) -- (6.7,2.1) -- (10.5,2.1);
+  \node[hw label, anchor=east] at (0.4,1.8) {DOUT};
+  \node[hw label, font=\tiny] at (4.5,2.3) {D(A0)};
+  \node[hw label, font=\tiny] at (8.5,2.3) {D(A1)};
+  % tAA annotation: 地址有效(ADDR 变为 A0 的沿) → DOUT 输出有效(翻转为 D(A0) 的沿)
+  \draw[BookRed, line width=0.5pt] (1.0,0.85) -- (1.0,1.15);
+  \draw[BookRed, line width=0.5pt] (2.7,0.85) -- (2.7,1.15);
+  \draw[BookRed, line width=0.5pt, <->] (1.0,1.0) -- (2.7,1.0);
+  \node[BookRed, font=\tiny\bfseries] at (1.85,0.7) {$t_{AA}$};
+  % tAS annotation
+  \draw[BookAmber, line width=0.5pt, <->] (1.0,4.9) -- (1.5,4.9);
+  \node[BookAmber, font=\tiny\bfseries] at (1.25,5.1) {$t_{AS}$};
+  % Caption
+  \node[hw label, text width=9cm] at (5.5,-0.5) {SRAM 读时序：地址在 CLK 上升沿前 $t_{AS}$ 建立，数据在 CLK 后 $t_{AA}$ 输出。流水线中 $t_{AA}$ 必须小于一个时钟周期。};
+\end{pdfdiagram}
+\diagramnote{SRAM 同步读时序。$t_{AA}$ 是限制最高工作频率的关键参数：$f_{max} = 1/t_{AA}$。}
+
+%======================================================================
+\topic{1.11\quad 功耗：动态与漏电}
+%======================================================================
+
+单元结构与阵列组织确定之后，下一个工程问题是功耗——尤其在大容量 cache 占去芯片一半以上面积的今天。SRAM 功耗分为\hwkey{动态功耗}（读写切换）和\hwkey{静态功耗}（漏电）：
+
+\hwkey{动态功耗}：
+
+$$P_{dynamic} = \alpha \cdot C_{BL} \cdot V_{DD}^2 \cdot f + C_{WL} \cdot V_{DD}^2 \cdot f + C_{internal} \cdot V_{DD}^2 \cdot f$$
+
+其中 $\alpha$ 是活动因子（读操作时约 1/2 的 BL 对放电），$f$ 是访问频率。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.40\linewidth}}
+\toprule
+功耗来源 & 典型值（28nm, 1GHz） & 说明 \\
+\midrule
+BL 充放电（读） & 0.5--2 mW/Mbit & 每次读操作 BL 对放电 $\Delta V \times C_{BL}$ \\
+BL 驱动（写） & 1--4 mW/Mbit & 写时 BL 对全摆幅切换 \\
+WL 充放电 & 0.2--0.5 mW/Mbit & 每次访问一条 WL 充放电 \\
+SA + 逻辑 & 0.3--1 mW/Mbit & 感放、译码、mux 切换 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{静态功耗（漏电）}：
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.40\linewidth}}
+\toprule
+漏电来源 & 典型值（28nm, 0.9V） & 温度依赖 \\
+\midrule
+亚阈值漏电（NMOS 截止） & 1--10 pA/管 & $\propto e^{T}$，每升 10°C 约翻倍 \\
+栅极隧穿漏电 & 0.1--1 pA/管 & 弱温度依赖 \\
+PN 结漏电 & 0.5--2 pA/结 & $\propto e^{T}$ \\
+总单元漏电（6 管） & 5--50 pA/cell & — \\
+1 Mbit 阵列总漏电 & 5--50 $\mu$A & 28nm, 0.9V, 25°C \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{实际数据}：一个 8 MiB L3 cache（64 Mibit，28nm）的静态漏电约 \hwevidence{320 $\mu$A--3.2 mA}（即约 0.3--2.9 mW at 0.9V）。亚阈值漏电本身每升 10°C 约翻倍，但高温下受反型层电荷、体效应等因素影响，总单元漏电从 25°C 到 125°C 典型增大约 \hwevidence{1--2 个数量级}。
+
+\hwkey{功耗管理技术}：
+
+\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.30\linewidth}}
+\toprule
+技术 & 原理 & 效果 \\
+\midrule
+\hwkey{Power gating} & 用 header/footer 开关切断 VDD 或 VSS & 漏电降为 $\sim$0；但数据丢失 \\
+\hwkey{Retention mode} & 降低 VDD 到 DRV 以上（如 0.5V） & 漏电降低 5--10$\times$；数据保持 \\
+\hwkey{DVFS} & 根据负载动态调节 VDD 和频率 & $P \propto V_{DD}^2 \cdot f$；降压 20\% → 功耗降 36\% \\
+\hwkey{Bitline floating} & 不访问时 BL 浮空（不预充） & 减少 BL 漏电；但下次访问需额外预充时间 \\
+\bottomrule
+\end{longtable}
+
+表中的 header/footer 开关指串在电源轨与阵列之间的大尺寸开关管：header 管串在 VDD 一侧，footer 管串在 VSS 一侧，关断后阵列与电源物理隔离，漏电只剩开关管自身的截止电流，代价是数据全部丢失，醒来后要重新加载。Retention mode 利用的正是 1.2 节的 DRV 特性：VDD 只要高于 DRV 数据就不丢，而亚阈值漏电随电压近似指数下降，降压的收益极大。\term{动态电压频率调节}{dynamic voltage and frequency scaling, DVFS}则利用 $P\propto V_{DD}^2 f$：频率需求低时连电压一起降，比单独降频多省一份电压平方的收益。
+
+%======================================================================
+\topic{1.12\quad 软错误：粒子翻转与 ECC}
+%======================================================================
+
+前面所有分析都假定环境是安静的；事实上 SRAM 时刻暴露在辐射环境中。本小节讨论高能粒子撞击引起的数据翻转，以及为什么大容量 SRAM 离不开纠错码。\hwkey{软错误}（Soft Error）是由高能粒子（alpha 粒子、宇宙射线中子）击中 SRAM 单元，在存储节点产生足够多的电子-空穴对，导致存储值翻转。这不是器件损坏（硬错误），而是数据错误——重写即可恢复。
+
+\hwkey{物理机制}：
+\begin{enumerate}
+  \item \hwkey{Alpha 粒子}：即氦原子核，来自封装材料（焊料、引线框架）中的微量 U/Th 衰变，能量 4--9 MeV
+  \item \hwkey{宇宙射线中子}：高能中子（$>$1 MeV）与 Si 原子核发生核反应，产生重离子反冲
+  \item 粒子在 Si 中产生电子-空穴对（每 3.6 eV 产生一对）
+  \item 电荷被存储节点收集；若收集电荷 $>$ \hwkey{临界电荷 $Q_{crit}$}，节点电压被拉过反相器阈值 → 翻转
+\end{enumerate}
+
+\hwkey{临界电荷 $Q_{crit}$}：
+
+$$Q_{crit} = C_{node} \times (V_{DD} - V_{th}) \approx C_{cell} \times \Delta V_{SNM}$$
+
+\begin{longtable}{L{0.16\linewidth}L{0.18\linewidth}L{0.18\linewidth}L{0.38\linewidth}}
+\toprule
+工艺 & $C_{node}$ & $Q_{crit}$ & 软错误率趋势 \\
+\midrule
+130 nm & $\sim$5 fF & $\sim$3--5 fC & 基准 \\
+65 nm & $\sim$2 fF & $\sim$1.5--3 fC & 约 2$\times$ \\
+28 nm & $\sim$1 fF & $\sim$0.8--1.5 fC & 约 4--5$\times$ \\
+7 nm & $\sim$0.5 fF & $\sim$0.3--0.7 fC & 约 8--10$\times$ \\
+\bottomrule
+\end{longtable}
+
+\hwkey{错误率度量}——\hwkey{FIT}（Failure In Time）：1 FIT = 每 $10^9$ 器件小时出现 1 次错误。
+
+\begin{longtable}{L{0.24\linewidth}L{0.26\linewidth}L{0.40\linewidth}}
+\toprule
+条件 & 原始 FIT / Mbit & 说明 \\
+\midrule
+地面（海平面） & 200--1000 FIT/Mbit & 宇宙射线中子为主 \\
+高海拔（3000m） & 1000--5000 FIT/Mbit & 中子通量增大 5--10$\times$ \\
+航空（10km） & 5000--20000 FIT/Mbit & 屏蔽减少，中子通量极大 \\
+封装 alpha 贡献 & 50--200 FIT/Mbit & 低 alpha 封装材料可降低 \\
+\bottomrule
+\end{longtable}
+
+关于海拔的影响需要补充定量背景：大气中子通量随海拔近似指数增长，JEDEC JESD89 与 IEC 62396 系列标准给出的量级是 10--12 km 巡航高度的中子通量约为海平面的 100--300 倍，因此航空电子的软错误问题远比地面严峻。表中 FIT 数值是不同文献来源综合出的量级参考，实际错误率还随工艺、电压、封装材料和纬度显著变化，不宜当作精确指标使用。
+
+\hwevidence{实际影响}：一个 128 MiB L3 cache（1024 Mibit）在海平面的原始软错误率约 \hwevidence{200,000--1,000,000 FIT}（即平均每 \hwevidence{1--7 个月}出现一次未纠正错误）。必须使用 ECC。
+
+\hwkey{ECC 保护}——\hwkey{SEC-DED}（Single Error Correction, Double Error Detection）：
+
+\begin{longtable}{L{0.24\linewidth}L{0.26\linewidth}L{0.40\linewidth}}
+\toprule
+ECC 方案 & 开销 & 能力 \\
+\midrule
+奇偶校验（parity） & +1 bit / 8 data & 仅检测单 bit 错误，不能纠正 \\
+SEC-DED (Hamming) & +8 bit / 64 data & 纠正 1 bit，检测 2 bit \\
+SEC-DED + 符号纠错 & +16 bit / 128 data & 纠正 1 bit + 部分多 bit \\
+Chipkill / SDDC & +16 bit / 128 data & 纠正整颗芯片失效（服务器） \\
+\bottomrule
+\end{longtable}
+
+SEC-DED 的经典实现是 Hamming 码：编码时把每个数据位编入若干奇偶校验组，读出时重算各组奇偶并拼成\term{校正子}{syndrome}。校正子为零表示无错；非零时其数值直接指出出错位的位置，翻转该位即完成纠正。再加一位覆盖全字的全局奇偶校验，就能区分"一位错"（校正子非零且全局校验不符，可纠）与"两位错"（校正子非零但全局校验相符，只能报警），这就是 DED 能力的来源。
+
+\hwkey{ECC 在 SRAM 中的实现}：每 64 数据位附加 8 校验位（共 72 bit），校验位与数据位一起存储在阵列中。读操作时，72 bit 一起读出，ECC 逻辑在感放输出后 1--2 个门延迟内完成校验和纠正。写操作时，ECC 编码器先计算校验位，再一起写入。
+
+\begin{lstlisting}
+ECC SEC-DED for 64-bit data word:
+  // Encode (write path):
+  parity[0] = XOR(data[0], data[1], data[3], data[4], data[6], ...)
+  parity[1] = XOR(data[0], data[2], data[3], data[5], data[6], ...)
+  ...
+  parity[6] = XOR(data[0..63] selected by Hamming matrix)
+  parity[7] = XOR(data[0..63], parity[0..6])  // overall parity for DED
+
+  // Decode (read path):
+  syndrome[6:0] = H_matrix * received_word[71:0]
+  if syndrome == 0: no error
+  if syndrome != 0 and parity[7] mismatch: single-bit error -> flip bit[syndrome]
+  if syndrome != 0 and parity[7] match: double-bit error -> flag uncorrectable
+\end{lstlisting}
+
+%======================================================================
+\topic{1.13\quad 真实芯片中的 SRAM 参数}
+%======================================================================
+
+前面各节的数值多来自教材与工艺文献的典型范围，本小节给出真实产品的参数，与前面的典型范围相互印证。
+
+\hwkey{Intel 处理器 Cache 参数}（公开数据）：
+
+\begin{longtable}{L{0.19\linewidth}L{0.12\linewidth}L{0.12\linewidth}L{0.12\linewidth}L{0.12\linewidth}L{0.22\linewidth}}
+\toprule
+处理器 & L1D & L1I & L2 & L3 & 工艺 \\
+\midrule
+Intel Core i9-13900K & 48 KiB/核 & 32 KiB/核 & 2 MiB/核 & 36 MiB & Intel 7 (10nm) \\
+Intel Core i9-14900K & 48 KiB/核 & 32 KiB/核 & 2 MiB/核 & 36 MiB & Intel 7 \\
+Intel Xeon w9-3495X & 48 KiB/核 & 32 KiB/核 & 2 MiB/核 & 105 MiB & Intel 7 \\
+Intel Core Ultra 200S & 48 KiB/核 & 32 KiB/核 & 3 MiB/核 & 36 MiB & Intel 20A/TSMC N3 \\
+\bottomrule
+\end{longtable}
+
+表中 Core Ultra 200S（Arrow Lake）一栏的工艺标注需要说明：这一代处理器的计算模块（compute tile）实际由台积电 N3B 代工，Intel 20A 用于同期其他产品线；表中"Intel 20A/TSMC N3"反映的是该代产品处于自家工艺与外包工艺并用的过渡期，阅读时按"3nm 级"理解即可。
+
+\hwkey{ARM Cortex 系列寄存器堆与 Cache}：
+
+\begin{longtable}{L{0.22\linewidth}L{0.18\linewidth}L{0.18\linewidth}L{0.32\linewidth}}
+\toprule
+核 & 整数 RF & L1D & 备注 \\
+\midrule
+Cortex-A78 & 128 $\times$ 64 bit (2R1W) & 64 KiB & 13 级流水线 \\
+Cortex-A710 & 128 $\times$ 64 bit (2R1W) & 64 KiB & Armv9 \\
+Cortex-X3 & 192 $\times$ 64 bit (2R2W) & 64 KiB & 大核，更宽发射 \\
+Cortex-X4 & 192+ $\times$ 64 bit & 64 KiB & Armv9.2 \\
+Neoverse V2 & 192 $\times$ 64 bit & 64 KiB & 服务器核 \\
+\bottomrule
+\end{longtable}
+
+需要说明数据来源：ARM 不公开寄存器堆的物理项数与端口组织，表中整数 RF 一栏综合自第三方微结构分析的实测与推断，属于业界通行估计而非官方规格；L1D 容量与流水线级数为公开数据。
+
+\hwkey{SRAM 宏参数（来自工艺设计套件 PDK（process design kit）与 Foundry 公开数据）}：
+
+\begin{longtable}{L{0.18\linewidth}L{0.14\linewidth}L{0.14\linewidth}L{0.14\linewidth}L{0.30\linewidth}}
+\toprule
+参数 & TSMC 28nm & TSMC 7nm & Samsung 5nm & 说明 \\
+\midrule
+最小单元面积 & 0.126 $\mu$m$^2$ & 0.027 $\mu$m$^2$ & 0.021 $\mu$m$^2$ & 6T 单元（含接触） \\
+宏容量范围 & 4Kb--32Mb & 4Kb--256Mb & 4Kb--256Mb & 可配置 \\
+最高频率 (typ) & 1.5--2.0 GHz & 2.5--3.5 GHz & 3.0--4.0 GHz & 取决于容量和配置 \\
+读电流 (active) & 0.5--2 mA/Mb & 0.3--1.5 mA/Mb & 0.2--1.2 mA/Mb & VDD=nominal \\
+漏电 (standby) & 10--50 $\mu$A/Mb & 20--100 $\mu$A/Mb & 30--150 $\mu$A/Mb & 25°C \\
+冗余 & 2--4 spare row/col & 4--8 spare row/col & 4--8 spare row/col & 修复良率 \\
+Assist 电路 & 可选 NBL & NBL + WL underdrive & VDD collapse + BB & 先进节点标配 \\
+\bottomrule
+\end{longtable}
+
+需要说明：表中 5nm 列的单元面积 0.021 $\mu$m$^2$ 是公开发表的 TSMC N5 高密度单元数据（Samsung 5LPE 未见同口径的公开数值，报道量级相近）；该列其余参数取 5nm 级工艺的代表性范围，用于展示代际趋势，不宜当作某一家的精确规格引用。
+
+\hwevidence{TSMC 7nm SRAM 密度}：\hwevidence{0.027 $\mu$m$^2$/bit}，即 1 Mbit 阵列面积约 \hwevidence{27,000 $\mu$m$^2$}（约 0.027 mm$^2$）。一个 64 MiB（512 Mbit）L3 cache 的纯阵列面积约 \hwevidence{13.8 mm$^2$}，加上外围电路（SA、译码器、驱动器）总面积约 \hwevidence{20--25 mm$^2$}。
+
+\hwkey{SRAM 面积不缩放的困境}：
+
+\begin{longtable}{L{0.16\linewidth}L{0.20\linewidth}L{0.20\linewidth}L{0.34\linewidth}}
+\toprule
+节点 & 单元面积 & 缩放比 & 问题 \\
+\midrule
+28 nm & 0.126 $\mu$m$^2$ & 1.0$\times$ & 基准 \\
+14 nm & 0.064 $\mu$m$^2$ & 0.51$\times$ & 接近理想（0.5$\times$） \\
+7 nm & 0.027 $\mu$m$^2$ & 0.42$\times$ & 开始偏离理想 \\
+5 nm & 0.021 $\mu$m$^2$ & 0.78$\times$ & 严重不缩放（fin 数限制） \\
+3 nm & 0.019 $\mu$m$^2$ & 0.90$\times$ & 几乎不缩放 \\
+\bottomrule
+\end{longtable}
+
+从 7nm 到 5nm 到 3nm，SRAM 单元面积缩放比从 0.42$\times$ 退化到 0.90$\times$（几乎不缩小）。这是因为 FinFET 的 fin 数只能取整数（最小 1 fin），而 6T 单元需要至少 6 个 fin（每管 1 fin），加上接触和连线规则，单元宽度无法继续缩小。\hwevidence{这是先进节点 die 面积中 SRAM 占比越来越大的根本原因}——以 Apple M2 为例，第三方 die 照片分析显示其系统级缓存（system-level cache, SLC，公开报道容量约 24 MiB）连同外围电路占去了 die 面积中相当可观的比例（估计在 10\% 以上）。
+
+\begin{warningbox}
+\hwkey{常见误区}：很多人认为"SRAM 就是快一点的 DRAM"。实际上两者的物理机制完全不同：SRAM 靠正反馈锁存（6 管），只要通电就保持；DRAM 靠电容存储（1 管 1 电容），必须每 64 ms 刷新。SRAM 的读是非破坏性的，DRAM 的读是破坏性的。SRAM 的失效模式是 SNM 不足导致软错误，DRAM 的失效模式是电容漏电导致数据丢失。两者不能互换。
+\end{warningbox}
+
+\section{二、Cache 的 tag、index 与 offset}
+
+Cache 用地址低位选择行内字节，用中间位选择集合，用高位 tag 判断当前集合里保存的是哪段主存。以 32 KiB、64 B cache line、8 路组相联、48-bit 物理地址为例：共有 $32\,\text{KiB}/(64\times8)=64$ 个集合，offset 为 6 bit，index 为 6 bit，其余 36 bit 是 tag。
+
+一次读取同时访问所选集合的 8 份 tag 和数据阵列。tag 比较命中且 valid 为 1 时，由路选择器取出对应字节；全部不命中时，Cache 控制器分配 miss 状态项，向下一级请求整条 64 B line。若牺牲行 dirty，还要先写回。
+
+\begin{longtable}{L{0.2\linewidth}L{0.32\linewidth}L{0.38\linewidth}}
+\toprule
+策略 & 硬件动作 & 必须明确的边界 \\
+\midrule
+write-through & 每次写同时送往下一级 & 写缓冲何时满，完成代表哪一级完成 \\
+write-back & 只改本级并置 dirty & 替换、同步或持久化时何时写回 \\
+write-allocate & 写 miss 先取整行再修改 & 额外读流量与所有权获取 \\
+no-write-allocate & 写 miss 直接送下一级 & 部分写合并与字节使能 \\
+\bottomrule
+\end{longtable}
+
+\section{三、多级 Cache、一致性与内存序}
+
+L1 追求每拍访问，容量小且常分成指令与数据两套；L2 容量更大；末级 Cache 还承担核心间共享与外部内存流量过滤。平均访问时间可写成
+
+\[
+T_{avg}=T_{L1}+m_{L1}(T_{L2}+m_{L2}(T_{LLC}+m_{LLC}T_{DRAM})).
+\]
+
+多核中，同一物理 cache line 可能被多个核心保存。写者必须先取得独占所有权，使其他副本失效；读者若命中别处的修改副本，数据要由拥有者或已更新的下一级返回。一致性解决“同一地址最终看到同一写入次序”，内存序还要规定不同地址之间哪些重排对软件可见，二者不能混为一谈。
+
+DMA 设备若不参与硬件一致性，驱动必须在所有权交接处清理或失效 Cache，并使用屏障保证“描述符内容先可见，doorbell 后可见”。这条规则会在设备事务章节再次出现。

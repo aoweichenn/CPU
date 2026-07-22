@@ -1,0 +1,1284 @@
+\chapter{磁记录、硬盘与 SATA}
+
+\begin{keyidea}
+机械硬盘的访问时间由磁记录、寻道、旋转和控制器共同决定。本章把盘片物理、伺服定位、请求调度和块接口放在一起解释。
+\end{keyidea}
+
+\section{一、磁盘界面物理、伺服与磁头定位}
+
+硬盘（HDD）是存储层次中唯一仍依赖精密机电系统的器件：旋转的盘片、飞行的磁头、闭环伺服、模拟读通道——每一个子系统都直接决定容量、带宽和可靠性。本节从整机架构讲到单 bit 物理，再回到系统级性能参数，目标是让读者能画出截面图、算出噪声裕量、读出伺服时序。
+
+\begin{keyidea}
+HDD 的核心矛盾是\hwkey{面密度}（areal density，单位盘面面积上存储的 bit 数，常用单位 bit/in$^2$）与\hwkey{热稳定性}的对立：bit 越小，热扰动越容易翻转磁化（超顺磁极限，见 6.3）；但系统又要求 10 年数据保持。所有记录技术演进（LMR$\to$PMR$\to$SMR$\to$HAMR$\to$MAMR，见 6.4）本质上都是在突破这一物理极限。
+\end{keyidea}
+
+%======================================================================
+\topic{6.1\quad 整机架构与信号通路}
+
+一块 3.5 英寸 HDD 由以下主要子系统构成。下图给出从盘片到主机接口的完整信号通路：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 盘片组
+  \node[hw memory, minimum width=2.2cm, minimum height=2.8cm] (platter) at (0,0) {盘片组\\(Platters)\\$\times$1--9};
+  % 主轴电机
+  \node[hw block, minimum width=1.6cm] (spindle) at (0,-2.2) {主轴电机\\(FDB)};
+  \draw[hw bus] (spindle.north) -- (platter.south);
+  % HSA
+  \node[hw compute, minimum width=2.0cm, minimum height=1.4cm] (hsa) at (3.8,0) {HSA\\磁头堆组件};
+  \draw[hw bus] (platter.east) -- node[above, hw label, font=\tiny] {气隙} (hsa.west);
+  % VCM
+  \node[hw control, minimum width=1.6cm] (vcm) at (3.8,-2.2) {VCM\\音圈电机};
+  \draw[hw bus] (vcm.north) -- (hsa.south);
+  % Preamp
+  \node[hw state, minimum width=1.5cm] (preamp) at (6.5,0.8) {前置放大器\\(Preamp)};
+  \draw[hw bus] (hsa.east) -- ++(0.3,0) |- (preamp.west);
+  % Read Channel
+  \node[hw compute, minimum width=1.8cm] (rchan) at (6.5,-0.6) {读通道\\(Read Ch.)};
+  \draw[hw bus] (preamp.south) -- (rchan.north);
+  % Servo Demod
+  \node[hw control, minimum width=1.8cm] (servo) at (9.2,0.8) {伺服解调\\(Servo Demod)};
+  \draw[hw bus] (preamp.east) -- (servo.west);
+  % Disk Controller
+  \node[hw compute, minimum width=2.4cm, minimum height=1.6cm] (ctrl) at (9.2,-1.2) {磁盘控制器\\(SoC/DSP)};
+  \draw[hw bus] (rchan.east) -- ++(0.4,0) |- (ctrl.west);
+  \draw[hw bus] (servo.south) -- (ctrl.north);
+  % VCM driver
+  \draw[hw danger] (ctrl.south) -- ++(0,-0.6) -| node[below, hw label, font=\tiny] {VCM 驱动} (vcm.east);
+  % Host Interface
+  \node[hw block, minimum width=1.8cm] (host) at (12.2,-1.2) {主机接口\\SATA/SAS};
+  \draw[hw bus] (ctrl.east) -- (host.west);
+  % 标注
+  \node[hw label, text width=11cm] at (6.0,-3.6) {HDD 信号通路：磁头感应磁场$\to$前置放大$\to$读通道（均衡+Viterbi+LDPC）$\to$控制器$\to$SATA/SAS$\to$主机。伺服解调并行提取位置信息，闭环驱动 VCM。};
+\end{pdfdiagram}
+\diagramnote{HDD 整机框图。读路径（左$\to$右）：磁头$\to$Preamp$\to$Read Channel$\to$Controller$\to$Host。伺服路径：Preamp$\to$Servo Demod$\to$Controller$\to$VCM Driver$\to$VCM。写路径反向：Controller$\to$Write Channel$\to$Preamp$\to$磁头。}
+
+各子系统的核心职责：
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+子系统 & 功能 & 关键参数 \\
+\midrule
+盘片组 & 存储磁性介质，承载数据 & 1--10 片，直径 2.5"/3.5" \\
+主轴电机 & 恒速旋转盘片 & 5400--15000 RPM，FDB 轴承 \\
+HSA & 承载所有磁头，径向移动 & 每盘面一个读写头 \\
+VCM & 驱动 HSA 径向寻道 & 力矩常数 $\sim$0.05--0.1 N$\cdot$m/A \\
+Preamp & 放大磁头微弱信号（$\mu$V 级） & 增益 40--60 dB，位于 HSA 上 \\
+Read Channel & 均衡、检测、纠错 & PRML + LDPC，码率 $\sim$0.96 \\
+Servo Demod & 提取位置误差信号 & 采样率 25--40 kHz \\
+Disk Controller & 协议处理、命令队列、ECC & ARM/RISC SoC \\
+Host Interface & 与主机通信 & SATA 6 Gb/s 或 SAS 12/24 Gb/s \\
+\bottomrule
+\end{longtable}
+
+表中几个子系统的名称值得展开。\hwkey{音圈电机}（Voice Coil Motor, VCM）因工作原理与扬声器音圈相同而得名：线圈置于永磁体的气隙磁场中，通过的电流直接产生正比于电流的电磁力，没有齿轮、齿槽和换向延迟，因此能做出快速、平滑、可精密闭环控制的摆动执行器。\hwkey{磁头堆组件}（Head Stack Assembly, HSA）把所有磁头的悬臂固定在同一枢轴上，由 VCM 整体驱动，结构见 6.7。\hwkey{前置放大器}（Preamp）之所以安装在 HSA 上、紧邻磁头，是因为磁头输出信号只有 $\mu$V 级，必须就近放大，否则会在柔性排线的传输途中被噪声淹没。\hwkey{读通道}（Read Channel）是把模拟读回波形恢复成数字比特流的专用电路，内部结构见 6.10。\hwkey{伺服解调}从读信号中提取磁头相对磁道的位置信息，与 VCM 构成闭环控制系统——这套闭环是 6.9 的主题。
+
+%======================================================================
+\topic{6.2\quad 盘片与磁性介质}
+
+盘片（platter）是一个精密的多层薄膜结构。从底到顶依次为：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 基板
+  \draw[fill=gray!20, line width=0.5pt] (0,0) rectangle (10,1.2);
+  \node[hw label] at (5,0.6) {基板（Al 合金 / 玻璃）\quad 厚度 0.63--1.27 mm};
+  % 软磁底层
+  \draw[fill=BookTeal!20, line width=0.4pt] (0,1.2) rectangle (10,1.7);
+  \node[hw label, font=\tiny] at (5,1.45) {软磁底层 (CoZrNb) $\sim$100 nm};
+  % 中间层
+  \draw[fill=BookAmber!20, line width=0.4pt] (0,1.7) rectangle (10,2.1);
+  \node[hw label, font=\tiny] at (5,1.9) {Ru 中间层 $\sim$20 nm（控制晶粒取向）};
+  % 记录层
+  \draw[fill=BookAccent!30, line width=0.5pt] (0,2.1) rectangle (10,2.9);
+  \node[hw label, font=\small\bfseries] at (5,2.5) {磁记录层：CoCrPt 合金颗粒 $\sim$15--25 nm};
+  % 碳保护层
+  \draw[fill=BookNavy!20, line width=0.4pt] (0,2.9) rectangle (10,3.15);
+  % 润滑层
+  \draw[fill=BookRed!15, line width=0.3pt] (0,3.15) rectangle (10,3.35);
+  % 两个薄层标注引线外置（正交折线指向薄层）
+  \node[hw label, font=\tiny, anchor=east] at (-0.4,2.86) {碳保护层 (DLC) $\sim$2--3 nm};
+  \draw[BookMuted, line width=0.3pt] (-0.36,2.86) -- (-0.12,2.86) -- (-0.12,3.02) -- (0,3.02);
+  \node[hw label, font=\tiny, anchor=east] at (-0.4,3.46) {全氟聚醚润滑剂 $\sim$1 nm};
+  \draw[BookMuted, line width=0.3pt] (-0.36,3.46) -- (-0.12,3.46) -- (-0.12,3.25) -- (0,3.25);
+  % 飞行高度标注
+  \draw[BookAmber, line width=0.6pt, <->] (10.5,3.35) -- (10.5,4.0);
+  \node[BookAmber, font=\tiny, rotate=90] at (11.0,3.7) {飞行高度 5--10 nm};
+  % 磁头
+  \draw[fill=BookAccent!50, line width=0.5pt] (9.0,4.0) rectangle (10.5,4.6);
+  \node[hw label, font=\tiny] at (9.75,4.3) {磁头};
+  % 标注
+  \node[hw label, text width=9cm] at (5,-0.7) {盘片截面（非等比例）。记录层由直径 $\sim$8 nm 的 CoCrPt 晶粒组成，每个 bit 包含约 6--10 个晶粒。晶粒间由氧化物（SiO$_2$/TiO$_2$）隔离以降低交换耦合。};
+\end{pdfdiagram}
+\diagramnote{盘片多层薄膜结构。实际各层厚度比图中比例小得多——记录层仅 15--25 nm，碳保护层仅 2--3 nm。基板表面粗糙度 $<$0.3 nm Ra。}
+
+\hwevidence{关键尺寸}：记录层 CoCrPt 晶粒直径 $\sim$8 nm，高度 $\sim$15--25 nm；1\,Tb/in$^2$ 面密度下 bit 面积约 645\,nm$^2$，8\,nm 晶粒含隔离层约占 100\,nm$^2$，即每个 bit 由约 6--10 个晶粒组成；晶粒间氧化物隔离层 $\sim$1--2 nm。碳保护层（类金刚石碳，DLC）厚度 2--3 nm；最外层全氟聚醚（PFPE）润滑剂 $\sim$1 nm。
+
+其中 bit 面积的换算如下：$1\,\mathrm{in}^2 = (2.54\times10^{7}\,\mathrm{nm})^2 \approx 6.45\times10^{14}\,\mathrm{nm}^2$，1 Tb/in$^2$ 的面密度即每 $6.45\times10^{14}$ nm$^2$ 存放 $10^{12}$ bit，因此单个 bit 约占 645 nm$^2$。
+
+\begin{longtable}{L{0.22\linewidth}L{0.28\linewidth}L{0.4\linewidth}}
+\toprule
+层 & 材料 & 作用 \\
+\midrule
+基板 & Al-Mg 合金（3.5"）/ 玻璃（2.5"） & 机械支撑；玻璃更薄更刚，用于多片堆叠 \\
+软磁底层 & CoZrNb / CoTaZr & PMR 的磁通回路（单极头需要） \\
+中间层 & Ru / Cr 合金 & 控制记录层晶粒 c 轴垂直取向 \\
+记录层 & CoCrPt-SiO$_2$ / CoCrPt-B & 存储磁化方向；Cr 降低交换耦合，Pt 提高各向异性 \\
+碳保护层 & 类金刚石碳 (DLC) & 防止磁头接触时磨损记录层 \\
+润滑层 & 全氟聚醚 (PFPE, Z-DOL) & 降低偶发接触的摩擦系数 \\
+\bottomrule
+\end{longtable}
+
+表中记录层一行涉及两个需要展开的物理概念。\hwkey{交换耦合}（exchange coupling）是相邻晶粒磁矩之间的量子力学相互作用：耦合较强时，若干晶粒会作为一个整体一致翻转，等效于一个"大晶粒"，使磁化跳变边界变得不规则、跳变噪声增大。在晶粒之间析出 SiO$_2$/TiO$_2$ 氧化物隔离层，目的正是切断这种耦合，让每个晶粒独立翻转。\hwkey{c 轴垂直取向}指让六方晶系 Co 合金晶粒的易磁化轴（c 轴）统一垂直于盘面——PMR 要求磁化方向垂直盘面（见 6.4），取向越一致，写入后的磁化方向越整齐；Ru 中间层的作用就是在沉积过程中诱导这种取向。
+
+%======================================================================
+\topic{6.3\quad 磁记录物理}
+
+盘片的记录层只是载体，真正完成存取的是磁头与介质之间的磁场交互。本小节回答三个问题：磁化方向如何写入、如何读出、以及写入后的状态为何能稳定保持十年。
+
+\hwkey{写入}：写磁头是一个微型电磁铁。写入电流（$\sim$40--80 mA）流过线圈，在磁极间隙产生 $\sim$1 T 的磁场。该磁场穿透记录层，将晶粒的磁化方向翻转为与场方向一致；为此写场必须超过介质的\hwkey{矫顽力}（coercivity, $H_c$）——使晶粒磁化翻转所需的最小外加磁场，典型记录介质的 $H_c$ 在数千 Oe 量级。一个 bit 所覆盖的若干同向磁化晶粒，在宏观上等效于一个\hwkey{磁畴}（magnetic domain，磁化方向一致的区域）；"写 0"与"写 1"就是把该区域的磁化方向置为两个相反取向之一。对于 PMR，磁化方向垂直于盘面（$+M_r$ 或 $-M_r$）。
+
+\hwkey{读出}：读磁头利用\hwkey{磁阻效应}。GMR（巨磁阻）或 TMR（隧道磁阻）传感器的电阻随外磁场变化：
+
+\begin{lstlisting}
+GMR:  DeltaR/R ~ 5-15%   (spin-valve structure)
+TMR:  DeltaR/R ~ 100-200% (MgO tunnel barrier)
+\end{lstlisting}
+当磁头飞过磁化翻转边界时，传感器感受到的杂散场改变，电阻变化被转换为电压脉冲。
+
+两种传感器的物理机制值得区分。GMR 采用\hwkey{自旋阀}（spin valve）结构：两层铁磁薄膜夹一层非磁金属（Cu），其中一层的磁化方向被相邻反铁磁层钉扎，另一层随外磁场自由转动。电子的散射概率取决于其自旋方向与各层磁化的相对取向——两层磁化平行时电阻小，反平行时电阻大，电阻变化因此反映外磁场方向。TMR 把中间的金属层换成约 1 nm 的 MgO 绝缘势垒，电子以量子隧穿方式穿过，隧穿概率同样取决于两侧磁化的相对取向，但相对变化幅度比 GMR 高一个数量级。信号幅度更大意味着同样的飞行高度下能分辨更小的磁化区域，这是现代磁头一律采用 TMR 的原因。
+
+\hwkey{超顺磁极限}：单个晶粒的磁化方向由磁各向异性能 $E = K_u V$ 维持（$K_u$ 为各向异性常数，$V$ 为晶粒体积）。热扰动能量为 $k_B T$。10 年数据保持要求：
+\[
+\frac{K_u V}{k_B T} > 60
+\]
+若晶粒太小（$V$ 减小）或 $K_u$ 太低，热翻转概率不可忽略。这就是\hwkey{超顺磁极限}——面密度增长的根本物理屏障。
+
+\hwevidence{数值示例}：$K_u = 7 \times 10^7$ erg/cm$^3$（L1$_0$-FePt），$T = 350$ K，要求 $V > 60 k_B T / K_u \approx 4 \times 10^{-20}$ cm$^3$，对应晶粒直径 $\sim$4--5 nm——这正是 FePt 介质著名的最小稳定晶粒尺寸，也是 HAMR 选择 FePt 的物理原因。若使用普通 CoCrPt（$K_u \approx 3 \times 10^6$ erg/cm$^3$），同样计算给出直径 $\sim$12 nm，面密度上限更低。
+
+%======================================================================
+\topic{6.4\quad 记录技术演进：LMR、PMR、SMR、HAMR、MAMR}
+
+面密度的提升不是一次完成的，而是历经五代记录技术的更替。每一代都在上一代撞到的物理瓶颈上向前推进一步，下表给出完整谱系，随后展开其中两条仍活跃的技术路线。
+
+\begin{longtable}{L{0.10\linewidth}L{0.22\linewidth}L{0.16\linewidth}L{0.18\linewidth}L{0.24\linewidth}}
+\toprule
+技术 & 磁化/写入方式 & 面密度 & 磁头--介质交互 & 状态 \\
+\midrule
+LMR & 磁化平行盘面；环形头 & $\sim$100 Gb/in$^2$ & 无特殊 & 已淘汰（2005 前） \\
+PMR & 磁化垂直盘面；单极头+软磁底层 & $\sim$1.0--1.1 Tb/in$^2$ & 无特殊 & 主流（2006--至今） \\
+SMR & 同 PMR，但磁道重叠 $\sim$25\% & $\sim$1.2--1.4 Tb/in$^2$ & 写需重写相邻道 & 量产（归档/冷存储） \\
+HAMR & 激光加热介质至 400--500°C 后写入 & $>$2.0 Tb/in$^2$ & 近场光加热 & 量产（Seagate 2024） \\
+MAMR & 微波场（$\sim$20--40 GHz）辅助翻转 & 1.5--2.0 Tb/in$^2$ & 微波振荡器集成于写极 & 研发/小批量 \\
+\bottomrule
+\end{longtable}
+
+表中有两点需要展开。\hwkey{PMR}（perpendicular magnetic recording，垂直磁记录）让磁化方向垂直于盘面，配合单极写头与软磁底层构成闭合磁通回路：写场被约束在磁极下方极小的区域内，边缘陡峭，bit 因此可以做得更短、更窄，面密度比磁化平行盘面的 LMR（longitudinal magnetic recording，纵向磁记录）提高约一个数量级。\hwkey{SMR}（shingled magnetic recording，叠瓦磁记录）则是让相邻磁道像屋顶瓦片一样部分重叠来提高道密度，代价是写入方式受到结构性限制，详见 6.15。
+
+\hwkey{HAMR 详细机制}：
+
+\begin{enumerate}
+\item 写磁头中集成一个\hwkey{激光二极管}（$\lambda \approx 830$ nm）和\hwkey{近场换能器}（NFT, 等离子体天线），将光聚焦到 $\sim$50 nm 光斑。
+\item 激光在 $\sim$1 ns 内将介质局部加热到 400--500°C。此时 CoCrPt（或 FePt）的矫顽力 $H_c$ 从室温的 $>$15 kOe 骤降至 $<$3 kOe。
+\item 写磁极在此瞬间施加 $\sim$10 kOe 磁场，轻松翻转磁化方向。
+\item 激光关闭后，介质在 $\sim$1 ns 内冷却回室温，矫顽力恢复，磁化方向被\hwkey{冻结}。
+\item 由于加热区极小（$\sim$50 nm），相邻 bit 不受影响。
+\end{enumerate}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 时间轴
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (10,0) node[right, hw label] {时间};
+  % 温度曲线
+  \draw[BookRed, line width=0.8pt] (1,0.3) .. controls (2,0.3) and (2.5,3.5) .. (3.5,3.5) -- (5,3.5) .. controls (6,3.5) and (6.5,0.3) .. (7.5,0.3);
+  \node[BookRed, font=\tiny] at (4.2,3.9) {介质温度 $\sim$450°C};
+  \node[hw label, font=\tiny] at (1.5,0.6) {室温};
+  % 矫顽力曲线
+  \draw[BookAccent, line width=0.8pt, dashed] (1,2.5) .. controls (2,2.5) and (2.5,0.8) .. (3.5,0.8) -- (5,0.8) .. controls (6,0.8) and (6.5,2.5) .. (7.5,2.5);
+  \node[BookAccent, font=\tiny] at (4.2,0.5) {$H_c$ 降至 $\sim$3 kOe};
+  % 写场
+  \draw[BookTeal, line width=0.7pt] (3,1.5) -- (5.5,1.5);
+  \node[BookTeal, font=\tiny] at (4.2,1.8) {写磁场 $\sim$10 kOe};
+  % 标注
+  \node[hw label, font=\tiny] at (3.5,-0.5) {激光开启};
+  \node[hw label, font=\tiny] at (5.5,-0.5) {激光关闭};
+  \draw[BookRule, line width=0.3pt, dashed] (3.5,0) -- (3.5,3.8);
+  \draw[BookRule, line width=0.3pt, dashed] (5.5,0) -- (5.5,3.8);
+  \node[hw label, text width=9cm] at (5,-1.3) {HAMR 时序：激光加热$\to$矫顽力骤降$\to$写场翻转磁化$\to$冷却冻结。加热--冷却全程 $<$5 ns。};
+\end{pdfdiagram}
+\diagramnote{HAMR 写入时序。温度曲线（红）与矫顽力曲线（蓝虚线）互补：温度高时 $H_c$ 低，写场才能翻转；冷却后 $H_c$ 恢复，数据冻结。}
+
+\begin{classicnote}
+磁记录设计面临著名的\hwkey{三难困境}（magnetic recording trilemma）：面密度、热稳定性、可写性三者互相牵制。晶粒做小可以提高面密度，但 $K_u V$ 随之减小，热稳定性变差；改用高 $K_u$ 材料保住稳定性，矫顽力又随之升高，现有写头写不动。HAMR 的思路是写入瞬间用激光临时降低矫顽力，MAMR 则用微波场辅助磁化翻转——两条路线工艺迥异，要解的却是同一个物理矛盾。
+\end{classicnote}
+
+%======================================================================
+\topic{6.5\quad 空气轴承与滑块}
+
+磁头不接触盘片——它\hwkey{飞}在盘片上方。盘片高速旋转时，粘性空气被拖入滑块底面的精密几何结构中，产生压力分布。这套利用气流压力承载滑块的结构称为\hwkey{空气轴承}（air bearing），滑块底面刻有承压几何图案的一面称为 ABS（Air Bearing Surface，空气轴承面）。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 盘片表面
+  \draw[BookRule, line width=0.7pt] (0,0) -- (10,0);
+  \node[hw label, font=\tiny] at (5,-0.35) {盘片表面（旋转方向 $\to$）};
+  % 气流箭头
+  \draw[BookTeal, line width=0.4pt, ->] (0.3,0.15) -- (1.8,0.15);
+  \draw[BookTeal, line width=0.4pt, ->] (0.3,0.35) -- (1.8,0.35);
+  \draw[BookTeal, line width=0.4pt, ->] (0.3,0.55) -- (1.8,0.55);
+  % 滑块轮廓（含导轨）
+  \draw[fill=BookCodeBg, line width=0.6pt]
+    (2.5,0.12) -- (2.5,0.9) -- (7.5,0.9) -- (7.5,0.12)
+    -- (7.0,0.06) -- (6.2,0.10) -- (5.8,0.06)
+    -- (5.0,0.10) -- (4.2,0.06) -- (3.8,0.10) -- (3.0,0.06) -- cycle;
+  \node[hw label, font=\tiny] at (5.0,0.55) {滑块本体};
+  % 正压区
+  \draw[BookAccent, line width=0.5pt, fill=BookAccent!10] (2.8,0.06) rectangle (4.0,0.12);
+  \node[BookAccent, font=\tiny] at (3.4,0.35) {正压区};
+  % 负压区
+  \draw[BookRed, line width=0.5pt, fill=BookRed!10] (5.8,0.06) rectangle (7.2,0.12);
+  \node[BookRed, font=\tiny] at (6.5,0.35) {负压区};
+  % 磁头位置
+  \draw[fill=BookAmber!50, line width=0.4pt] (6.8,0.06) rectangle (7.3,0.25);
+  \node[hw label, font=\tiny] at (7.05,-0.15) {读写元件};
+  % 飞行高度
+  \draw[BookAmber, line width=0.6pt, <->] (8.0,0) -- (8.0,0.10);
+  \node[BookAmber, font=\tiny] at (8.8,0.05) {FH = 5--10 nm};
+  % 力平衡
+  \draw[BookAccent, line width=0.6pt, ->] (4.5,1.0) -- (4.5,1.5);
+  \node[BookAccent, font=\tiny] at (4.5,1.7) {$F_{lift}$};
+  \draw[BookRed, line width=0.6pt, ->] (6.0,1.5) -- (6.0,1.0);
+  \node[BookRed, font=\tiny] at (6.0,1.7) {$F_{suction}$};
+  \node[hw label, text width=9cm] at (5,-1.1) {滑块底面：前缘正压区（导轨台阶）产生升力；后缘深槽产生负压（文丘里效应）防止过度抬起。两力平衡决定飞行高度。};
+\end{pdfdiagram}
+\diagramnote{滑块侧视（非等比例）。实际滑块尺寸 $\sim$1.25 mm $\times$ 1.0 mm，飞行高度 5--10 nm，导轨台阶高度 $\sim$50--200 nm。}
+
+\hwkey{工作原理}：
+\begin{enumerate}
+\item 盘片旋转（线速度 10--55 m/s，随转速与半径变化）通过空气粘性将气流拖入滑块底面。
+\item 前缘\hwkey{正压垫}（pressure pad）：导轨台阶使气流截面突然缩小，压力升高，产生向上升力。
+\item 后缘\hwkey{负压区}（sub-ambient cavity）：深槽中气流膨胀，压力低于环境，产生向下吸力，防止滑块飞得过高。
+\item 升力 = 吸力 + 悬臂加载力时，滑块达到平衡飞行高度。
+\end{enumerate}
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+影响因素 & 效应 & 典型量级 \\
+\midrule
+转速 & 转速$\uparrow$ $\Rightarrow$ 线速度$\uparrow$ $\Rightarrow$ 飞行高度$\uparrow$ & 7200 RPM 外圈线速度 $\sim$33 m/s \\
+海拔 & 气压$\downarrow$ $\Rightarrow$ 空气密度$\downarrow$ $\Rightarrow$ 升力$\downarrow$ $\Rightarrow$ FH$\downarrow$ & 每升高 1000 m，FH 降低 $\sim$0.3 nm \\
+温度 & 温度$\uparrow$ $\Rightarrow$ 粘度$\uparrow$ 但密度$\downarrow$；净效应 FH 略降 & 工作范围 5--55°C \\
+盘片倾斜 & 局部间隙变化 $\Rightarrow$ FH 不均匀 & 锥度 $<$0.1 nm/mm \\
+\bottomrule
+\end{longtable}
+
+%======================================================================
+\topic{6.6\quad 热飞行高度控制（TFC）}
+
+TFC（thermal fly-height control，热飞行高度控制）利用局部热膨胀微调磁头与盘片的间距。\hwkey{为什么需要 TFC}：读信号幅度与飞行高度近似指数衰减——FH 每减小 1 nm，信号幅度增加 $\sim$5--8\%。这一关系由经典的 Wallace 间距损耗公式描述：读回信号幅度 $A \propto e^{-2\pi d/\lambda}$，其中 $d$ 是磁头--介质间距，$\lambda$ 是记录波长（一个 bit 沿磁道方向的物理长度）。面密度越高，$\lambda$ 越短，同样间距下衰减越剧烈——这就是每一代高密度驱动器都必须把飞行高度再压低一点的原因。但 FH 太小会导致磁头与盘片接触（head-disk interaction, HDI），造成磨损甚至磁头碰撞。因此需要\hwkey{动态、可逆}的飞行高度调节。
+
+\hwkey{机制}：在滑块中、紧邻读写元件处集成一个薄膜\hwkey{微加热器}（$\sim$100 $\Omega$）。通电后局部温升 $\sim$50--100°C，热膨胀使滑块底面在磁头处向外凸起 1--2 nm，等效于飞行高度降低。
+
+\begin{lstlisting}
+TFC control loop:
+  target_FH = lookup_table(zone, operation)  // 读/写/空闲不同目标
+  actual_FH = estimate_from_readback_amplitude()
+  error = target_FH - actual_FH
+  heater_power += Kp * error + Ki * integral(error)
+  // heater_power range: 0 ~ 120 mW
+  // FH adjustment range: 0 ~ 2 nm
+\end{lstlisting}
+
+\begin{longtable}{L{0.3\linewidth}L{0.25\linewidth}L{0.35\linewidth}}
+\toprule
+参数 & 典型值 & 说明 \\
+\midrule
+加热器电阻 & 80--120 $\Omega$ & 薄膜 Pt 或 TaN 电阻 \\
+最大加热功率 & 80--120 mW & 对应 FH 降低 $\sim$2 nm \\
+热时间常数 & $\sim$10--50 $\mu$s & 加热到稳态的时间 \\
+控制带宽 & $\sim$1--5 kHz & 受热时间常数限制 \\
+写操作时 FH & $\sim$5--6 nm & 需要最强写场穿透 \\
+读操作时 FH & $\sim$6--8 nm & 稍远以保护磁头 \\
+空闲时 FH & $\sim$10+ nm & 最大功率拉远，减少磨损 \\
+\bottomrule
+\end{longtable}
+
+%======================================================================
+\topic{6.7\quad 磁头堆组件（HSA）}
+
+一块多盘片 HDD 中，每个盘面（上下两面）各有一个读写磁头。所有磁头固定在同一\hwkey{磁头堆组件}（Head Stack Assembly, HSA）上，由 VCM 驱动同步径向移动。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 盘片
+  \foreach \y in {0, 1.2, 2.4, 3.6} {
+    \draw[fill=gray!15, line width=0.4pt] (0,\y) rectangle (3.5,\y+0.15);
+  }
+  \node[hw label, font=\tiny] at (1.75,4.1) {盘片组};
+  % 枢轴
+  \draw[fill=BookNavy!30, line width=0.5pt] (7.5,1.5) circle (0.3);
+  \node[hw label, font=\tiny] at (7.5,0.9) {枢轴};
+  % 悬臂（多层）
+  \foreach \y/\lab in {0.07/A, 1.27/B, 2.47/C, 3.67/D} {
+    \draw[BookAccent, line width=0.5pt] (7.2,\y+1.5) -- (4.0,\y);
+    \draw[fill=BookAmber!40, line width=0.3pt] (4.0,\y-0.05) rectangle (4.3,\y+0.05);
+  }
+  \node[hw label, font=\tiny] at (5.5,4.5) {悬臂 + 磁头};
+  % VCM
+  \draw[fill=BookRed!20, line width=0.5pt] (7.0,0.2) rectangle (9.0,0.8);
+  \node[hw label, font=\tiny] at (8.0,0.5) {VCM 线圈};
+  \draw[BookRule, line width=0.4pt] (7.5,0.8) -- (7.5,1.2);
+  % 标注
+  \node[hw label, text width=9cm] at (4.5,-0.8) {HSA 侧视：所有悬臂固定在公共枢轴上，VCM 驱动整个组件绕枢轴旋转。每个悬臂末端是滑块+磁头，通过柔性铰链（flexure）允许微量俯仰和偏转。};
+\end{pdfdiagram}
+\diagramnote{HSA 侧视图。4 盘片 = 8 个记录面 = 8 个磁头。所有磁头同步移动（同一径向位置），通过电子切换选择当前工作的磁头。}
+
+每个磁头通道的机械结构，从悬臂到磁头依次为：
+\begin{enumerate}
+\item \hwkey{Load beam}（加载梁）：不锈钢弹性片，提供 $\sim$2--3 g 的加载力把滑块压向盘片。
+\item \hwkey{Flexure}（柔性铰链）：$\sim$20 $\mu$m 厚不锈钢或聚合物，允许滑块 $\pm$0.5° 俯仰和偏转，适应盘片表面起伏。
+\item \hwkey{Slider}（滑块）：Al$_2$O$_3$-TiC 陶瓷，底面刻有空气轴承几何。
+\item \hwkey{读写元件}：位于滑块后缘（trailing edge），包含写线圈和 GMR/TMR 读传感器。
+\end{enumerate}
+
+%======================================================================
+\topic{6.8\quad 主轴电机}
+
+现代 HDD 使用\hwkey{流体动压轴承}（Fluid Dynamic Bearing, FDB）：轴与轴套之间充满油膜（$\sim$1--3 $\mu$m），旋转时油膜产生动压支撑转子，无金属接触。
+
+\begin{longtable}{L{0.22\linewidth}L{0.22\linewidth}L{0.22\linewidth}L{0.24\linewidth}}
+\toprule
+转速 & 应用 & 外圈线速度 & 特点 \\
+\midrule
+5400 RPM & 笔记本/归档 & $\sim$25 m/s & 低功耗、低噪声 \\
+7200 RPM & 桌面/企业 & $\sim$33 m/s & 主流性能 \\
+10000 RPM & 企业（已少） & $\sim$46 m/s & 低延迟 \\
+15000 RPM & 企业（已少） & $\sim$55 m/s & 最低旋转延迟，功耗高 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{关键参数}：
+\begin{itemize}
+\item \hwkey{旋转振动}（Rotational Vibration, RV）：盘片质量不平衡和 FDB 油膜扰动引起。未补偿的装配偏心与 RRO 可达 $\mu$m 量级，靠出厂校准的 RRO 前馈补偿表消除（见 6.9.4）；经闭环补偿后的残余跟踪误差在 nm 量级。多盘片驱动器需 RV 传感器（MEMS 陀螺仪）前馈补偿。
+\item \hwkey{反电动势}（Back-EMF）：主轴电机是三相无刷直流电机（BLDC），旋转时线圈感应反电动势 $E = k_e \omega$。驱动器利用反电动势过零点实现无传感器换相。
+\item \hwkey{启动电流}：静止时无反电动势，启动电流可达 2--3 A（12V 供电），是系统上电时的主要浪涌负载。
+\end{itemize}
+
+%======================================================================
+\topic{6.9\quad 伺服系统}
+
+伺服系统是 HDD 最精密的闭环控制子系统，负责把磁头定位到目标磁道中心，精度要求 $<$10\% 磁道间距（$\sim$8--13 nm）。
+
+\topic{6.9.1\quad 伺服扇区格式}
+
+盘片上数据扇区之间嵌入\hwkey{伺服扇区}（servo sector），每转有 200--330 个伺服扇区（对应伺服采样率 25--40 kHz @ 7200 RPM = 120 rps）。每个伺服扇区的格式：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 伺服扇区各段
+  \draw[fill=BookTeal!20, line width=0.4pt] (0,0) rectangle (1.5,0.8);
+  \node[hw label, font=\tiny] at (0.75,0.4) {Preamble};
+  \draw[fill=BookAmber!20, line width=0.4pt] (1.5,0) rectangle (2.8,0.8);
+  \node[hw label, font=\tiny] at (2.15,0.4) {SAM};
+  \draw[fill=BookAccent!20, line width=0.4pt] (2.8,0) rectangle (4.8,0.8);
+  \node[hw label, font=\tiny] at (3.8,0.4) {Gray Code};
+  \draw[fill=BookRed!20, line width=0.4pt] (4.8,0) rectangle (6.3,0.8);
+  \node[hw label, font=\tiny] at (5.55,0.4) {Burst A/B};
+  \draw[fill=BookNavy!20, line width=0.4pt] (6.3,0) rectangle (7.8,0.8);
+  \node[hw label, font=\tiny] at (7.05,0.4) {Burst C/D};
+  \draw[fill=gray!15, line width=0.4pt] (7.8,0) rectangle (9.5,0.8);
+  \node[hw label, font=\tiny] at (8.65,0.4) {Spare/VCO};
+  % 数据区
+  \draw[fill=white, line width=0.3pt, dashed] (9.5,0) rectangle (11,0.8);
+  \node[hw label, font=\tiny] at (10.25,0.4) {Data...};
+  % 标注
+  \node[hw label, text width=10cm] at (5.5,-0.6) {伺服扇区布局：Preamble（AGC+时钟锁定）$\to$ SAM（伺服地址标记）$\to$ Gray Code（磁道号）$\to$ Burst（位置误差）$\to$ 备用。};
+\end{pdfdiagram}
+\diagramnote{伺服扇区格式。Preamble 为固定频率（2T 或 3T）图案，用于 AGC 增益调整和 PLL 时钟恢复。SAM 是唯一的特殊码字，标识伺服扇区起始。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.32\linewidth}L{0.4\linewidth}}
+\toprule
+字段 & 内容 & 功能 \\
+\midrule
+Preamble & 固定频率图案（如 2T = 1010...） & AGC 调整增益；PLL 锁定采样时钟 \\
+SAM & 特殊码字（如 11100010010） & 标识伺服扇区起始；触发后续解码 \\
+Gray Code & 磁道号的格雷码编码（$\sim$16--20 bit） & 粗定位：确定当前磁道号（$\pm$1 道） \\
+Burst A/B & 半磁道偏移的径向条纹 & 精定位：计算 PES（跨道方向） \\
+Burst C/D & 另外半磁道偏移 & 与 A/B 组合消除增益变化影响 \\
+\bottomrule
+\end{longtable}
+
+表中有两个设计细节值得展开。其一，Preamble 的固定频率图案同时服务两个目的：\hwkey{AGC}（automatic gain control，自动增益控制）据此调整放大倍数——读回信号幅度随飞行高度、盘片半径和介质波动变化，不先归一化就无法比较后续 burst 的幅度；\hwkey{PLL}（phase-locked loop，锁相环）则据此锁定采样时钟的相位，保证后续字段在正确的时刻被采样。其二，磁道号采用\hwkey{格雷码}（Gray code）而非自然二进制码，是因为格雷码的相邻码字只差一个 bit：磁头跨在两条磁道之间时读出的磁道号即使模糊，误差也不超过一条磁道。若用自然二进制，某些边界（如 0111 与 1000 之间）所有位同时翻转，跨道读出的值可能错得离谱。
+
+\topic{6.9.2\quad Burst 解调与 PES 计算}
+
+Burst 图案是沿径向（跨道方向）交替排列的磁化条纹。A 和 B 图案各占半条磁道宽度，相位相差半道：
+
+\begin{lstlisting}
+Track center -->
+  |  A pattern  |  B pattern  |  A pattern  |  B pattern  |
+  |<-- 1/2 trk->|<-- 1/2 trk->|
+
+Head at center: reads equal A and B amplitude
+Head off-center: A amplitude != B amplitude
+\end{lstlisting}
+
+\hwkey{位置误差信号}（PES）计算：
+\[
+\text{PES}_{AB} = \frac{A - B}{A + B}
+\]
+其中 $A$、$B$ 是读回 burst A 和 B 的解调幅度。归一化（除以 $A+B$）消除增益波动影响。C/D burst 提供另一半道的信息，组合后得到全磁道范围内的线性 PES：
+
+\[
+\text{PES} = \begin{cases}
+\frac{A-B}{A+B} & \text{磁道前半部分} \\[6pt]
+\frac{C-D}{C+D} & \text{磁道后半部分}
+\end{cases}
+\]
+
+PES = 0 表示磁头在磁道中心；PES = $\pm$1 表示偏移了半条磁道。
+
+\topic{6.9.3\quad 寻道伺服（Seek Servo）}
+
+寻道分三个阶段：\hwkey{加速}、\hwkey{滑行}（coast）、\hwkey{减速}。速度轮廓为梯形（短距离为三角形）：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 坐标轴
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (10,0) node[right, hw label] {时间};
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (0,4) node[above, hw label] {速度};
+  % 梯形速度轮廓
+  \draw[BookAccent, line width=0.8pt] (0.5,0.3) -- (2.5,3.2) -- (6.5,3.2) -- (8.5,0.3);
+  % 阶段标注（加/减速标签放在斜坡外侧空白处，不压线）
+  \node[BookAccent, font=\tiny] at (0.85,2.5) {加速};
+  \node[BookAccent, font=\tiny] at (4.5,3.6) {滑行};
+  \node[BookAccent, font=\tiny] at (8.15,2.5) {减速};
+  % 电流方向
+  \draw[BookTeal, line width=0.5pt, ->] (1.5,0.8) -- (1.5,1.4);
+  \node[BookTeal, font=\tiny] at (1.5,0.5) {$+I$};
+  \draw[BookRed, line width=0.5pt, ->] (7.5,1.4) -- (7.5,0.8);
+  \node[BookRed, font=\tiny] at (7.5,0.5) {$-I$};
+  % 标注
+  \node[hw label, text width=9cm] at (5,-0.8) {寻道速度轮廓（梯形）：VCM 正电流加速$\to$零电流滑行$\to$反电流减速。短距离寻道无滑行段（三角形轮廓）。};
+\end{pdfdiagram}
+\diagramnote{寻道速度轮廓。加速段 VCM 施加最大电流（$\sim$1--2 A），达到目标速度后滑行，接近目标磁道时反向制动。减速结束后切入 track-following 模式。}
+
+为什么是这个形状？寻道要求\hwkey{时间最优}：在 VCM 最大电流（即加速度上限）的约束下，最快的方案是控制理论中的 bang-bang 控制——先以最大加速度加速，再以最大减速度制动；若行程足够长，中间插入一段恒速滑行，此时只需很小的电流克服阻尼。短距离寻道加速尚未结束就要转入减速，轮廓退化为三角形。
+
+\begin{lstlisting}
+seek state machine:
+  ACCELERATE: VCM_current = +I_max until velocity >= v_target
+  COAST:      VCM_current = 0 (or small correction)
+  DECELERATE: VCM_current = -I_max until velocity ~ 0
+  SETTLE:     switch to track-following servo
+              wait for PES to stabilize within +/- 5% track pitch
+\end{lstlisting}
+
+\topic{6.9.4\quad 磁道跟踪伺服（Track Following）}
+
+到达目标磁道后，伺服系统切换到\hwkey{磁道跟踪}模式——以伺服采样率（25--40 kHz）持续读取 PES，通过 PID（proportional--integral--derivative，比例--积分--微分）控制器或更先进的状态空间控制器驱动 VCM，保持磁头在磁道中心：
+
+\begin{lstlisting}
+track-following loop (every servo sample, ~25-40 us):
+  PES = demodulate_burst()          // 位置误差
+  v_est = state_observer(PES)       // 估计速度（观测器）
+  u = Kp*PES + Kd*v_est + Ki*integral(PES)  // 控制量
+  u += RRO_feedforward[sector_index]         // 前馈补偿
+  VCM_current = saturate(u, -I_max, +I_max)
+\end{lstlisting}
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+参数 & 典型值 & 说明 \\
+\midrule
+伺服采样率 & 25--40 kHz & 每转 200--330 个伺服扇区（7200 RPM） \\
+闭环带宽 & 1--3 kHz & 受 VCM 谐振和采样率限制 \\
+定位精度（3$\sigma$） & $<$8--13 nm & $<$10\% 磁道间距 \\
+磁道间距 & 80--130 nm & 200K--300K TPI \\
+VCM 谐振频率 & 5--15 kHz（主谐振） & 限制带宽上限 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{重复性跳动}（Repeatable Runout, RRO）：盘片旋转时，由于伺服图案写入时的偏心或盘片安装偏差，磁道中心并非完美圆形，而是每转重复一次的周期性偏移。控制器在出厂校准时测量每条磁道的 RRO，存储为\hwkey{前馈补偿表}（每伺服扇区一个修正值），在跟踪时叠加到控制输出上，大幅减小跟踪误差。
+
+\hwkey{非重复性跳动}（Non-Repeatable Runout, NRRO）：由气流扰动、外部振动、轴承噪声等随机因素引起，每转不同。只能靠闭环带宽抑制，无法前馈消除。典型 NRRO 3$\sigma$ $<$ 5 nm。多盘片企业级驱动器还配有双轴 MEMS 加速度计，检测外部冲击并前馈补偿。当 off-track 量超过磁道间距的 $\sim$15\% 时，读信号质量急剧下降，控制器触发重试或重新寻道。
+
+\topic{6.9.5\quad 双级执行器（Dual-Stage Actuator）}
+
+随着磁道密度超过 250K TPI，单级 VCM 的带宽（$\sim$2--3 kHz）不足以抑制高频扰动。现代驱动器引入\hwkey{双级执行器}：
+
+\begin{longtable}{L{0.14\linewidth}L{0.28\linewidth}L{0.22\linewidth}L{0.26\linewidth}}
+\toprule
+级 & 执行器 & 行程 & 带宽 \\
+\midrule
+第一级 & VCM（音圈电机） & $\pm$20 mm（全行程） & 1--3 kHz \\
+第二级 & 压电微执行器（PZT） & $\pm$0.5--1.0 $\mu$m & $>$10 kHz \\
+\bottomrule
+\end{longtable}
+
+微执行器集成在悬臂（suspension）上或滑块与悬臂之间，通过压电陶瓷的\hwkey{逆压电效应}——外加电场使压电晶格产生正比于电压的微小形变——产生 $\sim$100 nm 量级的精细位移。控制策略：VCM 负责大行程低频跟踪，PZT 负责小行程高频扰动抑制。两级控制器的带宽不重叠，避免耦合振荡。
+
+%======================================================================
+\topic{6.10\quad 读通道（Read Channel）}
+
+读通道把磁头感应的模拟电压（$\sim$0.1--1 mV）转换为可靠的数字比特流。现代读通道采用\hwkey{PRML}（Partial Response Maximum Likelihood）架构：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 信号链
+  \node[hw state, minimum width=1.3cm] (afe) at (0,0) {AFE\\AGC};
+  \node[hw compute, minimum width=1.3cm] (eq) at (2.5,0) {均衡器\\(FIR)};
+  \node[hw compute, minimum width=1.5cm] (vit) at (5.0,0) {Viterbi\\检测器};
+  \node[hw compute, minimum width=1.3cm] (ldpc) at (7.5,0) {LDPC\\解码};
+  \node[hw block, minimum width=1.3cm] (out) at (10,0) {用户\\数据};
+  \draw[hw bus] (afe) -- (eq);
+  \draw[hw bus] (eq) -- (vit);
+  \draw[hw bus] (vit) -- (ldpc);
+  \draw[hw bus] (ldpc) -- (out);
+  % 标注
+  \node[hw label, font=\tiny] at (1.25,0.5) {模拟};
+  \node[hw label, font=\tiny] at (3.75,0.5) {PR4 目标};
+  \node[hw label, font=\tiny] at (6.25,0.5) {软判决};
+  \node[hw label, font=\tiny] at (8.75,0.5) {纠错};
+  \node[hw label, text width=9cm] at (5,-0.9) {读通道信号链：AFE（可变增益放大+ADC）$\to$ FIR 均衡（整形为 PR4/EPR4 目标响应）$\to$ Viterbi（最大似然序列检测）$\to$ LDPC 解码（纠错）。};
+\end{pdfdiagram}
+\diagramnote{PRML 读通道。均衡器把通道响应整形为 PR4 目标 $h(D)=1-D^2$（或 EPR4 $h(D)=1+D-D^2-D^3$），Viterbi 在 trellis 上找最大似然路径。}
+
+\hwkey{为什么 PRML 取代了峰值检测}：早期低密度驱动器用峰值检测（检测读脉冲的极性和位置）。但面密度提高后，相邻 bit 的脉冲严重重叠——一个 bit 的读回脉冲会拖尾到相邻若干个 bit 的采样时刻，形成\hwkey{码间串扰}（inter-symbol interference, ISI）——单个脉冲不再可分辨。PRML 不试图分离单个脉冲，而是把整段波形作为序列，用 Viterbi 算法在有限状态 trellis 上找最可能的比特序列——本质上是\hwkey{利用 ISI 而非对抗 ISI}。
+
+\begin{longtable}{L{0.22\linewidth}L{0.3\linewidth}L{0.38\linewidth}}
+\toprule
+阶段 & 功能 & 关键参数 \\
+\midrule
+AFE + AGC & 放大 + 自动增益控制 + ADC & 增益范围 40 dB；ADC 6--7 bit, $>$1 GHz 采样 \\
+FIR 均衡器 & 整形通道响应为 PR 目标 & 7--15 抽头自适应 FIR \\
+Viterbi 检测器 & 最大似然序列估计 & 状态数 8--64（取决于 PR 目标） \\
+LDPC 解码器 & 纠错（软判决迭代） & 码率 0.95--0.97；$\sim$100--150 校验字节/扇区 \\
+\bottomrule
+\end{longtable}
+
+信号链中几个环节的分工值得展开。\hwkey{FIR 均衡器}（finite impulse response，有限冲激响应滤波器）把畸变的通道响应强制整形为已知的 PR 目标多项式，使后续检测器只需对付一种固定、可控的 ISI 模式。\hwkey{Viterbi 检测器}做\hwkey{最大似然序列检测}：它不逐 bit 判决，而是在格图（trellis）上比较所有合法 bit 序列对应的期望波形，选出与实际采样波形距离最近的一条——序列级的判决把噪声容限最大化。\hwkey{LDPC}（low-density parity-check，低密度奇偶校验码）用稀疏校验矩阵约束码字，解码时利用 Viterbi 给出的软信息（每个 bit 为 0 或 1 的置信度）迭代修正错误，纠错能力逼近香农限——这就是它仅用约 4\% 的冗余就能把高密度记录的原始误码率压到 $10^{-15}$ 量级的原因。
+
+%======================================================================
+\topic{6.11\quad 写通道（Write Channel）}
+
+写通道把控制器输出的数字比特流转换为驱动写磁头的电流波形：
+
+\begin{longtable}{L{0.24\linewidth}L{0.66\linewidth}}
+\toprule
+技术 & 说明 \\
+\midrule
+写电流 & 典型 $\pm$40--80 mA 差分电流驱动写线圈；电流方向决定磁化极性 \\
+写预补偿 & 内圈线密度高，相邻 bit 的磁场互相干扰（NLTS, Non-Linear Transition Shift）；写通道提前或推迟特定跳变的位置（$\sim$1--5\% bit 周期），补偿写入时的非线性畸变 \\
+过冲（Overshoot） & 写电流在跳变瞬间短暂超过稳态值（$\sim$120--150\%），加速磁极磁场建立，减小跳变宽度 \\
+写预编码 & 对数据做 RLL（Run-Length Limited）编码，保证跳变密度在读写通道能力范围内 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{写预补偿的物理原因}：内圈周长短，同样扇区数意味着更短的 bit 长度。相邻磁化跳变的杂散场叠加，使实际写入的跳变位置偏离理想位置（NLTS）。写预补偿根据前后 bit 图案（data-dependent），把跳变时刻提前或推迟 1--5\% 的 bit 周期，使写入后的跳变落在正确位置。
+
+表中 RLL（run-length limited，游程受限）编码的作用也需要说明：它约束连续同极性 bit 的最大与最小长度。跳变太稀疏，读通道的时钟恢复会失去同步基准；跳变太密集，码间串扰又会超出均衡器的处理能力。编码后的数据流因此始终落在读写通道能可靠处理的变化率范围内。
+
+%======================================================================
+\topic{6.12\quad 区位记录（ZBR）}
+
+外圈周长大于内圈。若所有磁道扇区数相同，外圈线密度远低于内圈，浪费容量。\hwkey{区位记录}（Zone Bit Recording, ZBR）把盘面径向分成若干\hwkey{区}（zone），外区每道扇区数多于内区：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 同心圆（区）
+  \draw[BookRule, line width=0.4pt] (5,0) circle (4.5);
+  \draw[BookRule, line width=0.4pt] (5,0) circle (3.7);
+  \draw[BookRule, line width=0.4pt] (5,0) circle (2.9);
+  \draw[BookRule, line width=0.4pt] (5,0) circle (2.1);
+  \draw[BookRule, line width=0.4pt] (5,0) circle (1.3);
+  % 区标注
+  \node[hw label, font=\tiny] at (5,4.1) {Zone 0（外）};
+  \node[hw label, font=\tiny] at (5,3.3) {Zone 1};
+  \node[hw label, font=\tiny] at (5,2.5) {Zone 2};
+  \node[hw label, font=\tiny] at (5,1.7) {Zone 3};
+  \node[hw label, font=\tiny] at (5,0.9) {Zone 4（内）};
+  % 扇区数标注
+  \node[BookAccent, font=\tiny] at (8.5,3.0) {每道 1200 扇区};
+  \node[BookAccent, font=\tiny] at (8.5,1.5) {每道 700 扇区};
+  \draw[BookAccent, line width=0.3pt, ->] (8.0,3.0) -- (7.4,3.0) -- (7.4,3.5);
+  \draw[BookAccent, line width=0.3pt, ->] (8.0,1.5) -- (6.5,1.5) -- (6.5,1.0);
+  % 标注
+  \node[hw label, text width=8cm] at (5,-1.2) {ZBR：外区每道扇区数多（周长长），内区少。保持全区线密度近似恒定，最大化容量。典型 10--20 个区。};
+\end{pdfdiagram}
+\diagramnote{ZBR 区位布局（俯视）。外区（Zone 0）每道扇区数最多，向内递减。保持线密度恒定意味着外区顺序带宽高于内区。}
+
+\hwevidence{性能影响}：7200 RPM 驱动器，外圈顺序读 $\sim$250--280 MB/s，内圈 $\sim$120--140 MB/s。同一文件若分布在外区和内区，顺序读速度可差 2 倍。
+
+这个 2 倍差距可以直接从几何关系推出：顺序带宽 = 线密度 $\times$ 线速度。ZBR 让各区的线密度近似相等，而线速度正比于半径；外圈半径约为内圈的两倍，外圈带宽自然也约为内圈的两倍。
+
+%======================================================================
+\topic{6.13\quad 扇区格式与容量}
+
+数据并不是以连续 bit 流的形式写在磁道上，而是被切分成一个个扇区，扇区之间留有间隙。本小节给出单个扇区的物理格式，并算一笔格式化开销的明细。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 扇区各段
+  \draw[fill=gray!15, line width=0.3pt] (0,0) rectangle (0.8,0.7);
+  \node[hw label, font=\tiny, rotate=90] at (0.4,0.35) {Gap};
+  \draw[fill=BookTeal!20, line width=0.3pt] (0.8,0) rectangle (1.8,0.7);
+  \node[hw label, font=\tiny] at (1.3,0.35) {Preamble};
+  \draw[fill=BookAmber!20, line width=0.3pt] (1.8,0) rectangle (2.6,0.7);
+  \node[hw label, font=\tiny] at (2.2,0.35) {DAM};
+  \draw[fill=BookAccent!25, line width=0.4pt] (2.6,0) rectangle (6.6,0.7);
+  \node[hw label, font=\small\bfseries] at (4.6,0.35) {Data (512B / 4096B)};
+  \draw[fill=BookNavy!20, line width=0.3pt] (6.6,0) rectangle (8.4,0.7);
+  \node[hw label, font=\tiny] at (7.5,0.35) {ECC (LDPC)};
+  \draw[fill=gray!15, line width=0.3pt] (8.4,0) rectangle (9.2,0.7);
+  \node[hw label, font=\tiny] at (8.8,0.35) {Gap};
+  % 标注
+  \node[hw label, text width=9cm] at (4.6,-0.6) {数据扇区格式：Gap$\to$Preamble（VCO 锁定）$\to$DAM（数据地址标记）$\to$用户数据$\to$ECC 校验$\to$Gap。};
+\end{pdfdiagram}
+\diagramnote{单个数据扇区的物理格式。4Kn 扇区的 ECC 开销约 100--150 字节（LDPC，对应码率 $\sim$0.96--0.97），加上 Preamble/DAM/Gap 开销，格式化容量约为原始容量的 85--90\%。}
+
+各字段的作用与伺服扇区（6.9.1）对称：\hwkey{DAM}（data address mark，数据地址标记）标识用户数据的起点，角色相当于伺服扇区中的 SAM；Preamble 同样用于\hwkey{VCO}（voltage-controlled oscillator，压控振荡器）锁定采样时钟。\hwkey{4Kn}（4K native）指驱动器对主机接口和盘片介质都使用 4096 字节的原生扇区，不再仿真传统的 512 字节扇区；扇区越大，同样数据量所需的 Preamble/DAM/Gap/ECC 开销占比越小，这是 4Kn 格式化效率更高的原因。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+参数 & 典型值 & 说明 \\
+\midrule
+逻辑扇区大小 & 512 B（传统）/ 4096 B（4Kn） & 4Kn 减少 ECC 开销比例 \\
+ECC 开销 & $\sim$100--150 B / 扇区（4Kn） & LDPC 码，对应码率 $\sim$0.96--0.97 \\
+Preamble + DAM & $\sim$20--40 B & VCO 锁定 + 地址标记 \\
+Gap & $\sim$10--20 B & 扇区间保护间隔 \\
+格式化效率 & $\sim$85--90\% & 原始容量 $\times$ 效率 = 标称容量 \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{容量示例}：原始容量 24 TB 的驱动器，格式化后标称 $\sim$22 TB（$\sim$92\% 效率，4Kn 扇区）。512B 扇区时代效率仅 $\sim$85\%。
+
+%======================================================================
+\topic{6.14\quad 命令队列（NCQ / TCQ）}
+
+\hwkey{NCQ}（Native Command Queuing，SATA）允许主机一次下发最多 32 条命令，驱动器内部根据当前磁头位置和盘片旋转角度\hwkey{重新排序}，最小化总寻道+旋转延迟：
+
+\begin{lstlisting}
+NCQ optimization example:
+  Host issues: read LBA_100, read LBA_50000, read LBA_200
+  Drive reorders by track proximity:
+    -> read LBA_100 (current track)
+    -> read LBA_200 (adjacent track, minimal seek)
+    -> read LBA_50000 (far seek, do last)
+  Saves ~8 ms average seek per command
+\end{lstlisting}
+
+\begin{longtable}{L{0.2\linewidth}L{0.2\linewidth}L{0.5\linewidth}}
+\toprule
+特性 & NCQ (SATA) & TCQ (SAS) \\
+\midrule
+队列深度 & 32 & 256 \\
+排序策略 & 驱动器自主 & 驱动器自主 \\
+完成顺序 & 乱序完成 & 乱序完成 \\
+典型增益 & 随机 IOPS +30--50\% & 同左，更深队列适配高并发 \\
+\bottomrule
+\end{longtable}
+
+重排序依据两类信息：磁道邻近度和当前旋转位置。前者减少寻道距离，后者又称旋转位置优化（rotational position optimization, RPO）——驱动器知道每个待处理扇区转到磁头下方还需多久，优先服务"即将转到"的请求，哪怕它的 LBA 并不相邻。只有当队列中积压了足够多的命令时，这种优化才有腾挪空间，这正是 NCQ 的增益随队列深度增加而提高的原因。
+
+%======================================================================
+\topic{6.15\quad SMR 叠瓦磁记录详解}
+
+\hwkey{SMR}（Shingled Magnetic Recording）把相邻磁道像屋顶瓦片一样\hwkey{部分重叠}（重叠量 $\sim$20--25\%），磁道间距缩小到 PMR 的 0.75--0.8 倍，即 $\sim$60--105 nm（对比 PMR 的 $\sim$80--130 nm），面密度提升 20--30\%。
+
+\hwkey{写放大问题}：由于磁道重叠，写入一条磁道会破坏相邻磁道的数据。因此写入必须按\hwkey{区}（zone，$\sim$256 MB）为单位，区内磁道必须顺序写入。若需要修改区内任意位置，必须：
+\begin{enumerate}
+\item 把整个 zone 的有效数据读入缓存；
+\item 合并新写入数据；
+\item 从 zone 起始顺序重写所有磁道。
+\end{enumerate}
+
+这导致\hwkey{写放大}（Write Amplification）：写 4 KB 数据可能需要重写 256 MB。
+
+读者会发现这与 NAND Flash 的处境几乎同构：都是"改写前必须先回收整块区域"，只是粒度从 NAND 的擦除块换成了 SMR 的 zone。因此 SMR 驱动器的固件同样需要一个类似 FTL 的映射与垃圾回收层（见第五节），SMR 与 SSD 在软件视角下面对的是同一类问题。
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+类型 & 机制 & 适用场景 \\
+\midrule
+Drive-Managed SMR (DM-SMR) & 驱动器固件自行管理 zone 映射和 GC；主机看到普通 LBA & 桌面/冷存储；对主机透明但随机写性能不可预测 \\
+Host-Managed SMR (HM-SMR) & 主机必须按 zone 顺序写入；驱动器不做映射 & 数据中心/对象存储；主机可优化写模式，性能可预测 \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{性能数据}：DM-SMR 顺序写 $\sim$200 MB/s（zone 内），随机写 4K 可降至 $<$10 IOPS（GC 期间）。HM-SMR 顺序写保持 $\sim$200 MB/s，但要求应用层保证顺序写。
+
+%======================================================================
+\topic{6.16\quad 可靠性}
+
+机电混合系统的失效规律与纯半导体器件不同：既有随时间缓慢退化的磨损，也有外部冲击引发的突发故障。本小节先用一组量化指标刻画 HDD 的可靠性水平，再列出主要失效模式。
+
+\begin{longtable}{L{0.24\linewidth}L{0.22\linewidth}L{0.44\linewidth}}
+\toprule
+指标 & 典型值 & 说明 \\
+\midrule
+MTBF & 1.0--2.5 M 小时 & 企业级 $\sim$2.5M；桌面级 $\sim$1.0M \\
+AFR（年故障率） & 0.5--2\% & 数据中心实测（Backblaze 数据） \\
+不可恢复读错误率 & 每读 $10^{14}$--$10^{15}$ bit 出现一次 & 企业级每 $10^{15}$ bit 一次 \\
+工作负载 & 550 TB/年（企业） & 超出设计负载加速磨损 \\
+\bottomrule
+\end{longtable}
+
+MTBF 与 AFR 的换算关系为 AFR $\approx 8766\,\mathrm{h} / \mathrm{MTBF}$：MTBF = 2.5M 小时对应 AFR $\approx 0.35\%$。需要说明的是，MTBF（mean time between failures，平均故障间隔时间）是由样本测试统计外推得到的指标，并非单盘的实测寿命——没有任何磁盘真的连续运行过 250 万小时。数据中心大规模实测得到的 AFR 通常高于按 MTBF 换算的值，上表两行数字口径不同正是这个原因。
+
+\hwkey{主要失效模式}：
+\begin{itemize}
+\item \hwkey{磁头碰撞}（Head Crash）：磁头与盘片接触，划伤介质。原因：振动冲击、飞行高度失控、颗粒污染。
+\item \hwkey{静摩擦}（Stiction）：停机时磁头落在盘片上（CSS, Contact Start-Stop），润滑剂固化或湿度导致粘连，启动时无法起飞。现代驱动器使用 ramp load/unload 避免 CSS。
+\item \hwkey{腐蚀}：湿度和污染物侵蚀碳保护层和记录层，导致磁信号衰减。
+\item \hwkey{伺服丢失}：伺服图案退化或电子故障导致磁头无法定位，驱动器进入安全停机。
+\end{itemize}
+
+\hwkey{S.M.A.R.T.}（Self-Monitoring, Analysis and Reporting Technology）属性：
+
+\begin{longtable}{L{0.12\linewidth}L{0.3\linewidth}L{0.48\linewidth}}
+\toprule
+ID & 属性 & 含义 \\
+\midrule
+5 & Reallocated Sectors Count & 已重映射的坏扇区数；增长预示介质退化 \\
+9 & Power-On Hours & 累计通电时间 \\
+194 & Temperature & 盘体温度（°C） \\
+197 & Current Pending Sector Count & 等待重映射的可疑扇区 \\
+198 & Offline Uncorrectable & 离线扫描发现的不可纠正扇区 \\
+199 & CRC Error Count & 接口传输 CRC 错误（线缆/连接器问题） \\
+\bottomrule
+\end{longtable}
+
+%======================================================================
+\topic{6.17\quad 氦气填充驱动器}
+
+\hwkey{原理}：用氦气（He）替代空气填充盘体。氦气密度仅为空气的 1/7（0.164 kg/m$^3$ vs 1.2 kg/m$^3$），粘度与空气相近（$\sim$19.6 vs 18.5 $\mu$Pa$\cdot$s，约 1.06--1.1 倍），密度效应占主导。
+
+\hwkey{收益}：
+\begin{itemize}
+\item \hwkey{降低风阻}：盘片旋转的粘性拖曳力矩 $\propto \rho \omega^2 r^5$，密度降低 7 倍使风阻功耗从 $\sim$3--4 W 降至 $<$1 W。
+\item \hwkey{减少湍流}：低密度气体中湍流强度降低，盘片振动减小，允许更薄的盘片间距。
+\item \hwkey{更多盘片}：3.5" 标准高度（26.1 mm）内可堆叠 7--10 片盘片（空气填充最多 5--6 片），容量提升 40--80\%。
+\item \hwkey{更低功耗}：总功耗从 $\sim$8--10 W 降至 $\sim$5--7 W（企业级大容量型号）。
+\end{itemize}
+
+\hwevidence{产品示例}：Seagate Exos X20（20 TB，10 片盘片，单碟 2 TB，氦气密封）；WD Ultrastar DC HC570（22 TB，10 片，单碟 2.2 TB，ePMR + OptiNAND）。氦气密封寿命设计 $>$5 年（泄漏率 $<$1\%/年）。
+
+%======================================================================
+\topic{6.18\quad 多执行器技术（MACH.2）}
+
+传统 HDD 所有磁头共享一个 VCM，同一时刻只能服务一个 I/O 请求。\hwkey{多执行器}（Multi-Actuator）把 HSA 分成两个独立组，每组有自己的 VCM 和音圈：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 盘片
+  \draw[fill=gray!15, line width=0.4pt] (2,0) rectangle (6,5);
+  \node[hw label, font=\tiny] at (4,5.3) {盘片组};
+  % 执行器 A：悬臂汇到枢轴圆，管上半盘面（线止于盘片右边）
+  \draw[BookAccent, line width=0.7pt] (7.5,3.8) -- (6.0,4.3);
+  \draw[BookAccent, line width=0.7pt] (7.5,3.8) -- (6.0,3.3);
+  \draw[fill=BookAccent!35, draw=BookAccent, line width=0.5pt] (7.5,3.8) circle (0.22);
+  \node[BookAccent, font=\tiny\bfseries, anchor=west] at (8.0,3.8) {Actuator A（上半盘面）};
+  % 执行器 B：悬臂汇到枢轴圆，管下半盘面
+  \draw[BookTeal, line width=0.7pt] (7.5,1.2) -- (6.0,1.7);
+  \draw[BookTeal, line width=0.7pt] (7.5,1.2) -- (6.0,0.7);
+  \draw[fill=BookTeal!35, draw=BookTeal, line width=0.5pt] (7.5,1.2) circle (0.22);
+  \node[BookTeal, font=\tiny\bfseries, anchor=west] at (8.0,1.2) {Actuator B（下半盘面）};
+  % 标注
+  \node[hw label, text width=8cm] at (4,-0.8) {MACH.2 双执行器：两组磁头独立寻道，可同时服务两个 I/O 请求。随机 IOPS 近似翻倍。};
+\end{pdfdiagram}
+\diagramnote{双执行器（MACH.2）概念。Actuator A 控制上半部分盘面的磁头，Actuator B 控制下半部分。两组可独立寻道、独立读写，主机看到两个逻辑驱动器。}
+
+\hwevidence{性能}：Seagate Exos 2X14（14 TB，MACH.2）：随机 4K 读 $\sim$400 IOPS（单执行器 $\sim$200 IOPS）；顺序读 $\sim$500 MB/s（两执行器并行）。代价：成本增加 $\sim$20\%，功耗增加 $\sim$15\%。
+
+%======================================================================
+\topic{6.19\quad 性能参数与延迟分解}
+
+前面各小节分别讨论了盘片、磁头、伺服与通道。本小节把这些子系统参数汇总为系统级性能指标，并把一次随机读的延迟逐项分解——这张分解表是理解 HDD 与 SSD 差异的关键。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+参数 & 典型值（7200 RPM 企业级） & 说明 \\
+\midrule
+顺序读带宽（外圈） & 250--280 MB/s & ZBR 外区线密度最高 \\
+顺序读带宽（内圈） & 120--140 MB/s & 约为外圈的 50\% \\
+随机 4K 读 IOPS & 100--200 & 受寻道+旋转延迟限制 \\
+平均寻道时间 & 4--9 ms & 取决于跨越磁道数 \\
+平均旋转延迟 & 4.17 ms（7200 RPM） & = $\frac{1}{2} \times \frac{60}{7200}$ s \\
+最大旋转延迟 & 8.33 ms & 一整转 \\
+单扇区传输时间 & $\sim$0.016 ms（4K @ 250 MB/s） & 通常可忽略 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{单次随机读延迟分解}：
+\[
+T_{random} = T_{seek} + T_{rotation} + T_{transfer}
+\]
+\[
+\approx (4\text{--}9 \text{ ms}) + (0\text{--}8.33 \text{ ms，平均 4.17}) + (\sim0.016 \text{ ms})
+\]
+\[
+\approx 4\text{--}17 \text{ ms（典型）}
+\]
+
+\begin{lstlisting}
+Latency breakdown (7200 RPM, average random 4K read):
+  Seek time:        ~4.5 ms  (average, ~1/3 stroke)
+  Rotational delay: ~4.17 ms (average, half rotation)
+  Transfer time:    ~0.016 ms (4KB / 250 MB/s)
+  Electronics:      ~0.1 ms  (controller + interface)
+  -----------------------------------------------
+  Total:            ~8.8 ms  => ~113 IOPS theoretical
+  With queuing:     ~5-6 ms  => ~170-200 IOPS (NCQ reorder)
+\end{lstlisting}
+
+\hwevidence{对比 SSD}：SATA SSD 随机 4K 读 $\sim$50--100 $\mu$s（$\sim$10,000--20,000 IOPS）；NVMe SSD $\sim$10--20 $\mu$s（$\sim$50,000--100,000 IOPS）。HDD 的机电延迟（ms 级）比 NAND 电子延迟（$\mu$s 级）慢 2--3 个数量级，这是 HDD 在随机 I/O 场景被 SSD 全面替代的根本原因。
+
+盘片振动与 off-track 容错的伺服机制（闭环带宽、加速度计前馈、RRO/NRRO 补偿）见 6.9.4 小节。
+
+\section{二、机械硬盘与访问调度}
+
+机械盘是主存之外仍在大量服役的机电设备：存储介质是磁，定位机构
+是音圈电机加主轴电机。它的全部性能特征可以归结为一个事实——盘
+片上只有两个运动部件：摆动的磁臂和旋转的盘片，两者的时间常数都
+是毫秒级；而读通道、设备缓存、接口电路这些电的部分都在纳秒到微
+秒级。机械盘几十年的性能工程，本质上是一部"怎样躲开这两件机械
+运动"的历史。
+
+\topic{磁道、柱面与扇区}盘片是铝合金或玻璃基板，两面涂磁性材料，
+每面配一个磁头；所有磁头固定在同一根磁臂上同步摆动，盘片由主轴
+电机带着恒速旋转。磁头停在某个半径上不动、盘片转过一周，磁头在
+盘面上扫出的圆环叫磁道；一张盘面上有几十万条同心磁道。所有盘面
+上同一半径的磁道集合叫柱面——这些圆环在空间里恰好叠成一个圆柱
+面。寻道完成后整组磁头同时就位，所以连续数据按柱面组织：在同一
+柱面内换面读不用再挪磁臂，只需电子开关换一个磁头。磁道沿圆周切
+成小段，每段是一个扇区：传统容量 512 字节，近年的 Advanced
+Format 把物理扇区改为 4096 字节，同时以 512e 模式向旧软件模拟
+512 字节扇区。
+
+先建立结构上的数量级直觉。一块 7200 rpm 的 4 TB 桌面盘通常用三张
+碟片、六个磁头，单碟约 1.3 TB；每张盘面刻下几十万条磁道，道间距
+以十纳米计；磁头的飞行高度只有几纳米，比烟尘颗粒还小几个数量级
+——这就是盘体必须密封、怕震、一粒灰就可能划伤盘面的原因。机械
+盘的全部精密性都花在"让磁头以几纳米高度贴着盘面飞、又永远不许
+碰上去"这一件事上。
+
+磁记录方式本身也换过几代。纵向磁记录（LMR）把磁畴平铺在盘面内，
+面密度很快撞上极限；垂直磁记录（PMR）把磁畴竖起来写，配合更窄的
+读磁头，面密度提高了一个量级，今天的 CMR 盘都是 PMR。再往后，写
+磁头的宽度做不下去了——磁场不能无限聚焦——SMR 干脆利用"写宽
+读窄"的差值让磁道重叠，这是本节后段的主题；HAMR 与 MAMR 则用激
+光或微波辅助写入更小的晶粒，仍在爬坡。磁密度的每一步都同时改写
+容量、速度与"介质的脾气"，这正是本章要一类设备一节分开讲的原
+因。
+
+\begin{longtable}{L{0.14\linewidth}L{0.40\linewidth}L{0.34\linewidth}}
+\toprule
+结构要素 & 物理实质 & 典型数量级 \\
+\midrule
+盘片 platter & 铝合金或玻璃基板，双面涂磁，恒速旋转 & 7200 rpm 桌面盘 1--4 张碟 \\
+磁头 head & 每面一个，固定在磁臂上由音圈电机驱动 & 飞行高度仅数纳米 \\
+磁道 track & 磁头不动、盘转一周扫出的圆环 & 每面几十万条，道间距数十纳米 \\
+柱面 cylinder & 所有盘面同半径磁道的集合 & 柱面内换面不再寻道 \\
+扇区 sector & 磁道沿圆周的最小读写单位 & 512 字节或 4096 字节 \\
+\bottomrule
+\end{longtable}
+
+区域位记录（ZBR）决定了一块盘的容量与速度分布。早期磁盘每条磁
+道的扇区数相同，容量被最内圈锁死：外圈周长是内圈两倍多，却写同
+样多的位，外圈的线密度被白白浪费。区域位记录把盘面按半径分成十
+几个区，区内每条磁道的扇区数固定，越靠外的区每道扇区越多。算一
+笔几何账：数据区外半径约 43mm、内半径约 20mm，周长比约
+$43/20\approx2.15$，恒定线密度下外圈每条磁道能容纳的扇区数约为
+内圈的 2 倍。转速恒定，单位时间从磁头下流过的字节数正比于每道
+扇区数，于是外圈的顺序读速约为内圈两倍：同一块盘，外圈约
+200 MB/s，扫到内圈只剩约 100 MB/s。LBA 编号从外圈排起，"分区越靠
+前越快"这条老经验，物理根源就在 ZBR。
+
+4 KiB 物理扇区带来一条连带约定：分区与文件系统必须按 4 KiB 对齐。若文
+件系统的 4 KiB 块错开一个 512 字节逻辑扇区，每一次块写都会横跨两个
+物理扇区，盘内要先读出两个 4 KiB、合并、再写回——一次写放大成两
+次读加两次写。512e 模式把这件事藏进固件，性能账却藏不住；4Kn 盘
+干脆只暴露 4 KiB 扇区，要求软件直接按物理现实对齐。
+
+扇区的传统地址是三元组（柱面、磁头、扇区）——这三个数曾经是货
+真价实的几何坐标：柱面号指挥磁臂停到哪条半径，磁头号选中哪张盘
+面，扇区号等盘片转到第几段。经典芯片与平台案例 int 13h 的寄存器约定
+\code{CH}、\code{CL}、\code{DH} 就按这三个量命名；BIOS 按位宽能
+表达 1024 柱面、256 磁头、63 扇区，乘 512 字节约 8.4 GB；DOS 兼
+容约定把磁头数限到 255，上限收缩到约 7.8 GiB。这道墙正是几何时
+代的遗产。ZBR 与坏道重映射普及之后，盘内真实布局对外不再
+透明，CHS 退化成一组虚构参数，BIOS 与 ATA 各自做一层"假几何"翻
+译；LBA 随后把寻址拍平成从 0 开始的扇区序号，盘固件收到 LBA 后
+自己换算（区、道、扇区）。磁盘地址从几何坐标变成逻辑序号，是外
+设把物理复杂性藏进固件的典型一例，也是本书反复出现的主题：约定
+一旦立下，硬件在约定后面换了几轮实现，约定本身仍在服役。
+
+\topic{寻道与旋转延迟}一次扇区访问的时间拆成三段：寻道
+（seek），磁臂移到目标磁道并安定下来；旋转等待（rotational
+latency），等目标扇区转到磁头下方；传输，数据经读通道、设备缓
+存、接口由 DMA 搬进内存——最后这段走的就是存储与设备事务部分描述符与 DMA
+的通道，微秒级。前两段是机械运动，毫秒级。随机小请求的总耗时几
+乎全在前两段，这是本节的中心事实。
+
+把三段耗时按真实比例画在一条时间条上，与盘片的结构对照
+着看：
+
+\begin{pdfdiagram}
+  % 左：盘片俯视——磁道、扇区、磁臂
+  \draw[BookMuted, line width=0.55pt] (1.8,0.6) circle (1.5);
+  \draw[BookMuted, line width=0.45pt] (1.8,0.6) circle (1.05);
+  \draw[BookMuted, line width=0.45pt] (1.8,0.6) circle (0.6);
+  \fill[BookTeal!20] ([shift={(1.8,0.6)}]205:0.6) arc[start angle=205, end angle=235, radius=0.6] -- ([shift={(1.8,0.6)}]235:1.5) arc[start angle=235, end angle=205, radius=1.5] -- cycle;
+  \draw[BookMuted, line width=0.5pt] (0.7,-0.5) -- (0.7,-1.05);
+  \node[hw label] at (0.7,-1.28) {扇区（512 B / 4 KB）};
+  \draw[BookMuted, line width=0.5pt] (1.8,2.1) -- (1.8,2.4);
+  \node[hw label, anchor=south] at (1.8,2.42) {磁道（每面数十万条同心环）};
+  \draw[BookMuted, line width=2.0pt] (4.6,-0.1) -- (3.05,-0.1);
+  \fill[BookMuted] (4.6,-0.1) circle (0.12);
+  \node[hw state, minimum width=0.3cm, minimum height=0.3cm, inner sep=1pt] at (2.95,-0.1) {};
+  \draw[BookMuted, line width=0.5pt] (4.6,-0.24) -- (4.6,-0.5);
+  \node[hw label, anchor=north] at (4.6,-0.55) {磁臂与磁头（音圈电机驱动）};
+  \node[hw label] at (1.8,-1.8) {盘片恒速旋转（如 7200 rpm），磁头等目标扇区转到位};
+  % 右：一次随机 4 KB 读的时间条
+  \node[hw label, anchor=west] at (5.3,2.85) {随机 4 KB 读一次，合计 $\approx$9.2 ms};
+  \filldraw[fill=BookAccent!18, draw=BookAccent, line width=0.5pt] (5.3,1.0) rectangle (7.9,1.7);
+  \node[hw label, text=BookInk] at (6.6,1.35) {寻道 $\approx$5 ms};
+  \filldraw[fill=BookAmber!20, draw=BookAmber, line width=0.5pt] (7.9,1.0) rectangle (10.3,1.7);
+  \node[hw label, text=BookInk] at (9.1,1.35) {旋转等待 $\approx$4.17 ms};
+  \filldraw[fill=BookTeal!30, draw=BookTeal, line width=0.5pt] (10.3,1.0) rectangle (10.44,1.7);
+  \draw[BookMuted, line width=0.5pt] (10.37,1.7) -- (10.37,2.2);
+  \node[hw label, anchor=south] at (10.37,2.22) {传输 $\approx$0.02 ms};
+  \draw[BookMuted, line width=0.6pt, <->] (5.3,0.78) -- (10.3,0.78);
+  \node[hw label] at (7.8,0.5) {机械运动，毫秒级，占约 99.8\%};
+  \node[hw label, anchor=west] at (5.3,0.05) {IOPS $\approx$ 1000/9.2 $\approx$ 109（"约 100 IOPS"的由来）};
+\end{pdfdiagram}
+\diagramnote{机械盘的结构与一次随机 4 KB 读的时间构成。左图俯视盘片：同心圆环是磁道，圆周上的一小段是扇区，磁臂把磁头送到目标半径后，等目标扇区转到磁头下方。右图把三段耗时按真实比例排开：寻道约 5 ms、旋转等待约 4.17 ms 都是毫秒级的机械运动，传输约 0.02 ms 是微秒级的电过程——随机小请求的时间几乎全部花在前两段，"一块机械盘约 100 IOPS"由此而来。}
+
+寻道本身还可再拆：磁臂加速、巡航、减速、在目标磁道上安定到可读
+写的精度。短寻道花不完加速段，长寻道大部分时间在巡航，所以"平
+均寻道时间"必须注明工作负载：厂商标称的 4--10 ms 通常指随机访问
+下的平均；相邻磁道间的一步只需不到 1 ms，从盘片最外到最内的全程
+寻道则要 15--20 ms。后文电梯调度能省时间，靠的正是把随机寻道换
+成道间寻道。
+
+\begin{longtable}{L{0.16\linewidth}L{0.30\linewidth}L{0.42\linewidth}}
+\toprule
+阶段 & 物理动作 & 典型耗时与决定因素 \\
+\midrule
+寻道 & 磁臂移动并安定 & 随机平均 4--10 ms；道间 <1 ms；全程 15--20 ms \\
+旋转等待 & 等目标扇区转到位 & 平均半圈：7200 rpm 约 4.17 ms，15000 rpm 约 2 ms \\
+传输 & 读通道、缓存、DMA 进内存 & 4 KB 约 0.02 ms，由介质读速决定 \\
+\bottomrule
+\end{longtable}
+
+旋转等待的演算：7200 rpm 即每秒 120 转，一转 $60000/7200\approx
+8.33$ ms；目标扇区等概率出现在圆周任意位置，平均等半圈，即约
+4.17 ms。这个数由转速唯一决定，软件动不了它；15000 rpm 的企业盘
+把它减半到 2 ms，代价是更小的盘片、更小的容量与更高的功耗。调度
+能做的只有重排——让每次定位更接近"顺路"，而不是消灭等待本身。
+
+随机 4 KB 读的总账：取随机平均寻道 5 ms（4--10 ms 区间内偏低的典型值），加
+旋转等待 4.17 ms，加传输 0.02 ms，合计约 9.2 ms，常说"约 10 ms"。于
+是单盘纯随机 4 KB 读每秒最多完成约 $1000/9.2\approx109$ 次，即约
+100 IOPS；乘 4 KB，吞吐约 0.45 MB/s。"一块机械盘约 100 IOPS"这条
+经验值就是这么来的：IOPS 不是接口参数，而是机械时间常数的倒数。
+工程含义很直接：凡把机械盘当随机小请求设备用的设计——数据库直
+接随机写裸盘、把虚机镜像打散在机械盘上——容量规划都要从每盘约
+100 IOPS 起步，而不是从标称的 200 MB/s 起步。
+
+把这条换算画成计算链，从转速到吞吐的每一步都能复算：
+
+\begin{pdfdiagram}
+  % 三段耗时
+  \node[hw compute, minimum width=2.3cm] (seek) at (1.65,0) {随机寻道 $\approx$5 ms\\（4--10 ms 中值）};
+  \node[hw compute, minimum width=2.3cm] (rot) at (4.35,0) {旋转等待 $\approx$4.17 ms\\（7200 rpm 平均半圈）};
+  \node[hw compute, minimum width=2.3cm] (xfer) at (7.05,0) {传输 $\approx$0.02 ms\\（4 KB 经 DMA）};
+  \node[hw control, minimum width=6.9cm] (sum) at (4.35,-1.5) {一次随机 4 KB 读 $\approx$ 9.2 ms（机械运动占约 99.8\%）};
+  \draw[hw bus] (seek.south) -- (seek.south |- sum.north);
+  \draw[hw bus] (rot.south) -- (rot.south |- sum.north);
+  \draw[hw bus] (xfer.south) -- (xfer.south |- sum.north);
+  \node[hw state, minimum width=5.2cm] (iops) at (3.15,-2.9) {IOPS $=1000/9.2\approx109$（常说约 100）};
+  \node[hw memory, minimum width=4.2cm] (bw) at (8.15,-2.9) {吞吐 $=109\times4$ KB $\approx0.45$ MB/s};
+  \draw[hw bus] (sum.south) -- (sum.south |- iops.north);
+  \draw[hw bus] (iops.east) -- (bw.west);
+  \node[hw label] at (4.35,-3.95) {IOPS 不是接口参数，而是机械时间常数的倒数；对照顺序读外圈约 200 MB/s};
+\end{pdfdiagram}
+\diagramnote{随机 4 KB 读的 IOPS 换算链：随机寻道约 5 ms 加平均半圈的旋转等待约 4.17 ms，再加 4 KB 传输约 0.02 ms，合计约 9.2 ms；IOPS 是它的倒数，约 109，乘 4 KB 得吞吐约 0.45 MB/s——与顺序读外圈约 200 MB/s 差两个数量级。容量规划要从每盘约 100 IOPS 起步，而不是从标称带宽起步。}
+
+短行程（short-stroking）是用容量换定位时间的经典手段：只使用外
+圈一小部分柱面，寻道范围被限制在最窄的一弧，平均寻道从 5 ms 压到
+1--2 ms，旋转等待不变，单次随机访问降到约 6 ms，IOPS 提到约 170；
+外圈同时又是 ZBR 里最快的一区，顺序吞吐也最高。代价是只用盘容
+量的一小角。它说明一个事实：机械盘的容量、时延、IOPS 三者可以
+互相兑换，兑换率由机械时间常数决定。
+
+这个换算直接进容量规划。一个需要 5000 随机 IOPS 的应用，用机械盘
+做 RAID0 需要约 50 块盘（每盘约 100 IOPS），哪怕总容量只需要其
+中十块盘的量；同一负载换 SATA SSD（随机读数万 IOPS），一块就
+够。存储选型先定 IOPS 指标、再定容量指标，顺序弄反是机械盘时代
+最常见的预算事故之一——盘买够了容量，性能却只有预算值的几十分
+之一。“冒险、异常与性能”一章的 Amdahl 定律在这里换成一句大白话：整个阵列的随机
+吞吐，等于盘数乘以每盘那约 100 次。
+
+\topic{顺序与随机的吞吐差距}顺序读时磁头定位一次，之后盘片每转
+一圈交出一条完整磁道，接口与缓存全速运行：外圈约 200 MB/s，整盘
+平均约 150--160 MB/s。顺序吞吐由位密度与转速决定，是"电"的速
+度；随机吞吐由寻道与旋转决定，是"机械"的速度。同一块盘有两个
+速度，差多少完全取决于访问模式。接口在这里不是瓶颈：SATA 6 Gb/s
+按 8b/10b 编码折算有效带宽约 600 MB/s（“电源、时钟与信号完整性”一章讨论过这类编码开销
+的来源），介质供数最多 200 MB/s，线路一直空着一多半；是 SSD 的出
+现才把 SATA 真正打满。
+
+三笔演算把差距钉死。吞吐比：$200\div0.45\approx450$ 倍，超过两
+个数量级。任务时间：顺序读 1 GB 约 5 秒；随机读同样 1 GB 是
+$2^{30}/2^{12}=262144$ 次 4 KB 读，乘 9.2 ms 约 2410 秒——5 秒对
+40 分钟，读的是同一份数据。整盘扫描：4 TB 盘以平均 160 MB/s 顺序
+扫一遍约 $4\times10^{12}/(1.6\times10^{8})=25000$ 秒，约 7 小时
+——阵列重建与备份窗口的时长下限就是这么估的。
+
+这三个数不必靠相信，一台机器几条命令就能复现。fio 的顺序读、队
+列深 1 的随机读、队列深 32 的随机读，恰好对应本节的三个吞吐档
+位；iodepth 就是在途请求数，与“冒险、异常与性能”一章 Little 定律里的在途数是同一
+个量。
+
+\begin{lstlisting}
+# same 7200rpm disk, three access patterns (Linux, fio)
+fio --name=seq   --rw=read     --bs=1M --size=4G --filename=/dev/sdX
+#     => about 200 MB/s on outer tracks
+fio --name=rand  --rw=randread --bs=4k --size=4G --iodepth=1  ...
+#     => about 100 IOPS, i.e. about 0.4 MB/s
+fio --name=randq --rw=randread --bs=4k --size=4G --iodepth=32 ...
+#     => NCQ reorders in the drive: a few hundred IOPS
+\end{lstlisting}
+
+\begin{longtable}{L{0.22\linewidth}L{0.30\linewidth}L{0.36\linewidth}}
+\toprule
+访问模式 & 每次定位开销 & 7200 rpm 盘的吞吐 \\
+\midrule
+顺序读 & 一次寻道，之后免定位 & 外圈约 200 MB/s，平均约 160 MB/s \\
+随机 4 KB，队列深 1 & 每次都寻道加旋转 & 约 100 IOPS，约 0.45 MB/s \\
+随机 4 KB，排队重排后 & 短寻道加部分旋转 & 数百 IOPS，约 1--1.6 MB/s \\
+\bottomrule
+\end{longtable}
+
+物理根源是惯性。磁臂和盘片有质量，加速、减速、安定都要毫秒；而
+磁性状态的读出快得多——磁头一旦就位，读通道以每纳秒若干位的速
+度采样流过的弧段。"机械盘怕随机"不是介质慢，是定位慢。由此得
+到全部工程推论的共同方向：把随机访问变成顺序访问。日志结构文件
+系统先写日志、数据库顺序追加 redo、文件系统按分配组聚集数据，
+以及下一段的调度与合并，都是这同一件事在不同层的化身。
+
+\topic{电梯调度与合并}块层队列给了软件选择权：队列里同时压着
+32 个请求时，先服务谁是自由的。SCAN（电梯算法）把请求按目标柱
+面排序，磁臂从一端扫到另一端、沿途服务，到头反向，像电梯不在无
+人楼层停靠；LOOK 不到物理端点就提前折返，C-LOOK 只单向服务、到
+头快速回扫。排序换掉的是"随机平均寻道 5 ms"这个前提：排序后相
+邻请求大多位于相邻柱面，寻道从毫秒级的全程动作退化成不到 1 ms
+的道间一步。
+
+与排序同时发生的是合并：LBA 相邻的请求在块层拼成一个更大的请
+求。8 个相邻 4 KB 读合成一次 32 KB 读，一次定位全部到手；排序吃的
+是磁道维度上的重排，合并吃的是"LBA 相邻本就大概率在同一条磁
+道"。请求在队列里停留的时间因此有了双重价值——既等来了排序的
+依据，也等来了可合并的邻居。
+
+收益演算：32 个随机 4 KB 请求按到来顺序（FCFS）服务，约
+$32\times9.2\approx294$ ms。电梯排序后，磁臂一趟扫过请求分布的柱
+面区间，每请求摊到短寻道加一次旋转等待，按
+$0.8+4.17+0.02\approx5$ ms 粗算，约 160 ms；LBA 相邻的请求再被合
+并，总时间更短。注意这个收益的前提：队列里得有东西可排。队列深
+度为 1 时没有重排空间，调度无能为力。这正是“冒险、异常与性能”一章 Little 定律的
+另一面——在途请求数既是吞吐的原料，也是调度的原料；评测随机性
+能必须把队列深度写进条件，QD1 的约 100 IOPS 与 QD32 的数百 IOPS
+是同一块盘的两种真实，谁也不是"作弊"。
+
+把同一批请求的两种服务顺序画成磁臂轨迹，排序省下的是什么就有了形状：
+
+\begin{pdfdiagram}
+  % 横轴：时间（服务顺序）；纵轴：柱面 0-100
+  \draw[BookMuted, line width=0.6pt, ->] (0,0) -- (10.4,0);
+  \draw[BookMuted, line width=0.6pt, ->] (0,0) -- (0,4.5);
+  \node[hw label, anchor=north] at (5.2,-0.6) {时间（服务顺序）};
+  \node[hw label, rotate=90, anchor=south] at (-0.85,2.2) {柱面};
+  \foreach \y/\t in {0/0, 2/50, 4/100} {
+    \draw[BookMuted, line width=0.5pt] (-0.07,\y) -- (0.07,\y);
+    \node[hw label, anchor=east] at (-0.12,\y) {\t};
+  }
+  % FCFS：按到达顺序，来回甩动
+  \draw[BookAccent, line width=0.9pt] (0.7,0.8) -- (2.1,3.4) -- (3.5,1.6) -- (4.9,2.4) -- (6.3,0.4) -- (7.7,3.6) -- (9.1,2.2);
+  % SCAN：按柱面排序，单趟扫过
+  \draw[BookTeal, line width=0.9pt] (0.7,0.4) -- (2.1,0.8) -- (3.5,1.5) -- (4.9,2.2) -- (6.3,2.4) -- (7.7,3.4) -- (9.1,3.6);
+  \foreach \p in {(0.7,0.8), (2.1,3.4), (4.9,2.4), (6.3,0.4), (7.7,3.6), (9.1,2.2)} {
+    \fill[BookAccent] \p circle (0.05);
+  }
+  \foreach \p in {(0.7,0.4), (2.1,0.8), (4.9,2.2), (6.3,2.4), (7.7,3.4), (9.1,3.6)} {
+    \fill[BookTeal] \p circle (0.05);
+  }
+  \node[hw label, anchor=west] at (0.2,4.2) {同一批 32 个随机请求};
+  \node[hw label, anchor=west] at (0.2,3.75) {省下的寻道时间：约 130 ms};
+  \draw[BookAccent, line width=0.9pt] (5.9,4.2) -- (6.9,4.2);
+  \node[hw label, anchor=west] at (7.0,4.2) {FCFS：约 294 ms};
+  \draw[BookTeal, line width=0.9pt] (5.9,3.75) -- (6.9,3.75);
+  \node[hw label, anchor=west] at (7.0,3.75) {SCAN：约 160 ms};
+\end{pdfdiagram}
+\diagramnote{同一批随机请求的两种磁臂轨迹（示意其中七个请求的位置）。FCFS 按到达先后服务，磁臂在柱面间来回甩动，32 个请求全程约 $32\times9.2\approx294$ ms；SCAN 按柱面排序后单趟扫过，每请求只摊到短寻道加一次旋转等待，全程约 160 ms。两条轨迹之间省下的约 130 ms，全是寻道时间。}
+
+\begin{longtable}{L{0.20\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+调度策略 & 服务顺序 & 关键问题 \\
+\midrule
+FCFS & 按到达先后 & 无重排，随机负载下磁臂来回甩 \\
+SATF & 最短访问时间优先 & 吞吐最好，远端请求可能饿死 \\
+SCAN / LOOK & 按柱面排序，到头折返 & 兼顾公平，折返点附近等待偏长 \\
+C-LOOK & 单向扫描，到头回扫 & 等待更均匀，回扫本身空跑一趟 \\
+mq-deadline & 排序加截止时间，读优先于写 & 读期限远短于写期限，防止饿死 \\
+none & 不调度 & SSD 无机械定位，排序是净开销 \\
+\bottomrule
+\end{longtable}
+
+读优先于写有应用层的原因：读大多是同步等待，应用线程停在原地；
+写走页缓存 write-back，应用写完就走。把写无限推迟却不行——脏
+页终究要回写，推迟过久会把抖动挪到更糟的时刻，所以调度器给写也
+设期限，只是宽得多。调度器也不是越聪明越好：机械定位消失之后，
+排序本身成了净开销，介质换成 SSD，内核调度器就该退场。软件结构
+跟着介质的物理常数走，这是外设栈的普遍规律。
+
+期限的具体值可以读出来：Linux 的 mq-deadline 给读请求默认约
+500 ms、写请求约 5 s 的期限，到期未服务的请求优先发出，饿死被时
+间上限封死。调度器与队列预算也可以直接观察：
+
+\begin{lstlisting}
+$ cat /sys/block/sda/queue/scheduler
+none [mq-deadline] kyber bfq      # current: mq-deadline
+$ cat /sys/block/sda/queue/nr_requests
+128                               # block layer queue depth budget
+\end{lstlisting}
+
+块层队列预算（nr\_requests）决定最多能攒多少请求供排序与合并：
+太小，重排空间不足；太大，单请求的排队时延上升。同一个旋钮，在
+机械盘上和 NVMe 上的合适应答完全不同——第五节会再回到这个数。
+
+测量的另一半在 iostat 里：r\_await 与 w\_await 把每次读写的平均
+总时延以毫秒报出，机械盘随机负载下看到 5--10 ms，正是寻道加旋转
+的直接读数；await 突然涨到几十毫秒，多半意味着队列在某一层堵住
+或盘内在做重映射。“冒险、异常与性能”一章"用测量代替猜测"的原则在外设上格外省
+钱：磁盘几乎从不说谎，它的毫秒数摆在那里，与本节的时间构成一项
+一项核对即可。
+
+\topic{NCQ 与 SMR}操作系统的排序发生在驱动里，驱动不知道盘此刻
+磁头停在哪、盘片转到什么角度；盘固件知道。SATA 的原生命令队列
+（NCQ）允许主机一次提交最多 32 条命令，盘内按"当前柱面加旋转相
+位"重排：同一柱面的多个请求按扇区转到磁头下的先后执行，旋转等
+待从平均半圈降到更小。同样是 32 个随机 4 KB 请求，盘内重排后每条
+摊到的定位时间约 2.5--4 ms，IOPS 从约 100 提到约 250--400。这正
+解释了"一次随机读约 10 ms"与"标称数百 IOPS"为何同时成立：前者
+是单请求的物理时延，后者是排队重排后的吞吐；时延没变，在途数变
+了，按“冒险、异常与性能”一章 Little 定律，吞吐随之改变。AHCI 只有一条 32 深的队
+列；更深的队列模型——NVMe 的 64K 条队列、每条 64K 深——为 SSD
+准备，本章第五节展开。对机械盘，32 个在途请求提供的重排空间已
+把大部分收益吃掉。
+
+重排做的事用六个请求示意便清楚（实际队列里是 32 个）：
+
+\begin{pdfdiagram}
+  % 上：到达顺序，相位乱跳
+  \node[hw label, anchor=east] at (0.55,0) {到达顺序};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a1) at (1.6,0) {相位 5};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a2) at (3.15,0) {相位 1};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a3) at (4.7,0) {相位 6};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a4) at (6.25,0) {相位 2};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a5) at (7.8,0) {相位 4};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (a6) at (9.35,0) {相位 3};
+  \draw[hw bus] (a1.east) -- (a2.west);
+  \draw[hw bus] (a2.east) -- (a3.west);
+  \draw[hw bus] (a3.east) -- (a4.west);
+  \draw[hw bus] (a4.east) -- (a5.west);
+  \draw[hw bus] (a5.east) -- (a6.west);
+  \node[hw label] at (5.5,-0.82) {按到达先后服务：寻道加平均半圈等待，每条约 10 ms $\Rightarrow$ 约 100 IOPS};
+  % 下：按旋转相位重排
+  \node[hw label, anchor=east] at (0.55,-1.9) {NCQ 重排后};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b1) at (1.6,-1.9) {相位 1};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b2) at (3.15,-1.9) {相位 2};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b3) at (4.7,-1.9) {相位 3};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b4) at (6.25,-1.9) {相位 4};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b5) at (7.8,-1.9) {相位 5};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.6cm, inner sep=1pt] (b6) at (9.35,-1.9) {相位 6};
+  \draw[hw bus] (b1.east) -- (b2.west);
+  \draw[hw bus] (b2.east) -- (b3.west);
+  \draw[hw bus] (b3.east) -- (b4.west);
+  \draw[hw bus] (b4.east) -- (b5.west);
+  \draw[hw bus] (b5.east) -- (b6.west);
+  \node[hw label] at (5.5,-2.72) {按转到磁头下的先后执行：每条摊定位约 2.5--4 ms $\Rightarrow$ 约 250--400 IOPS};
+\end{pdfdiagram}
+\diagramnote{同一批随机请求的两种服务顺序（示意六个，实际是 32 个在途）。按到达先后服务，相邻请求相位乱跳，每条都要付一次寻道加平均半圈的旋转等待；盘内固件知道磁头位置与盘片角度，按"当前柱面加旋转相位"重排后，同一柱面的请求按转到磁头下的先后执行，旋转等待被摊薄，每条定位约 2.5--4 ms。时延没变，在途数变了——IOPS 从约 100 提到约 250--400。}
+
+SMR（叠瓦式磁记录）从另一头榨容量。写入磁道天生比读取所需宽度
+宽，叠瓦布局让后一条磁道盖住前一条的边缘，像屋顶瓦片一样部分重
+叠，磁道密度因此提高，单盘容量便宜约两成。代价全在写的方向：写
+第 N 道会顺带覆盖第 N+1 道的重叠区，于是一组磁道构成一条带
+（band），典型 256 MB，带内只能从带首顺序追加；要改写带中间一个
+扇区，必须把它之后的内容读出、合并、整条带重写。极端情况下一次
+4 KB 随机写牵连 256 MB 的重写，写放大约六万五千倍；盘内固件当然不
+会每次真这么做，它用下一段的缓存机制把账延后，但账不会消失。
+
+叠瓦的结构与改写的牵连画在一起看，"便宜两成"的代价
+就具体了：
+
+\begin{pdfdiagram}
+  % 五条叠瓦磁道：后一条盖住前一条的边缘
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,0) rectangle (6.7,0.55);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-0.35) rectangle (6.7,0.2);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-0.7) rectangle (6.7,-0.15);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-1.05) rectangle (6.7,-0.5);
+  \draw[BookTeal, line width=0.42pt, fill=white] (0.7,-1.4) rectangle (6.7,-0.85);
+  % 重叠区（被后一道盖住的边缘）
+  \fill[BookAmber!25] (0.7,0) rectangle (6.7,0.2);
+  \fill[BookAmber!25] (0.7,-0.35) rectangle (6.7,-0.15);
+  \fill[BookAmber!25] (0.7,-0.7) rectangle (6.7,-0.5);
+  \fill[BookAmber!25] (0.7,-1.05) rectangle (6.7,-0.85);
+  \node[hw label] at (1.55,0.375) {道 N};
+  \node[hw label] at (1.55,0.025) {道 N+1};
+  \node[hw label] at (1.55,-0.325) {道 N+2};
+  \node[hw label] at (1.55,-0.675) {道 N+3};
+  \node[hw label] at (1.55,-1.025) {道 N+4};
+  % 改写点：写第 N+2 道会顺带覆盖第 N+3 道的重叠区
+  \draw[BookRed, line width=0.5pt, fill=BookRed!30] (3.6,-0.5) rectangle (4.4,-0.15);
+  \node[hw label, anchor=west, text=BookRed] at (4.5,-0.325) {改写点};
+  % 读/写宽度对照
+  \draw[BookMuted, line width=0.6pt, <->] (7.15,0.2) -- (7.15,0.55);
+  \node[hw label, anchor=west] at (7.3,0.375) {读所需宽度};
+  \draw[BookMuted, line width=0.6pt, <->] (8.85,-0.35) -- (8.85,0.2);
+  \node[hw label, anchor=west] at (9.0,-0.075) {写入磁道宽度};
+  % 带
+  \draw[BookAmber, line width=0.6pt] (0.5,-1.4) -- (0.5,0.55);
+  \node[hw label] at (3.7,-2.1) {一条带（band，典型 256 MB）：带内只能从带首顺序追加};
+  \node[hw label, text=BookRed] at (3.7,-2.75) {改写带中一个扇区：其后各道读出、合并，整条带重写——极端时 4 KB 写牵连 256 MB};
+\end{pdfdiagram}
+\diagramnote{SMR 叠瓦磁道的结构（深色条带是被后一道盖住的重叠区）。写入磁道天生比读取所需的宽度宽，叠瓦布局让后一道盖住前一道的边缘，磁道密度提高，单盘容量便宜约两成。代价在写的方向：写第 N 道会顺带覆盖第 N+1 道的重叠区，于是一组磁道构成一条带，带内只能从带首顺序追加；要改写带中间一个扇区，必须把它之后的内容读出、合并、整条带重写——极端情况一次 4 KB 随机写牵连 256 MB 重写，写放大约六万五千倍。}
+
+设备管理型 SMR（DM-SMR）用一小片 CMR 缓存区先收下随机写，空闲时再
+整理回叠瓦区：轻负载看不出差别，持续随机写打穿缓存之后，稳态写
+吞吐可跌到个位数 MB/s，单次写延迟出现秒级尖峰；NAS 阵列重建时
+SMR 盘超时掉盘的案例，根源即此。主机管理型（HM-SMR）索性要求主
+机按带分段、带内顺序写，把约束摆上接口，换取确定性——这与
+NVMe 分区命名空间（ZNS）是同一思想：介质把脾气讲清楚，软件按脾
+气写，双方都轻松。
+
+\begin{longtable}{L{0.22\linewidth}L{0.30\linewidth}L{0.36\linewidth}}
+\toprule
+特征 & CMR 传统盘 & SMR 叠瓦盘 \\
+\midrule
+磁道布局 & 磁道分开，可原位改写 & 磁道重叠，带内只能顺序追加 \\
+随机写稳态 & 约 100--数百 IOPS & 缓存打穿后可跌到个位数 MB/s \\
+缓存特征 & 常见 64--256 MB & 同容量点常配异常大的缓存 \\
+典型定位 & 通用、NAS、监控 & 归档、冷数据、顺序写为主 \\
+阵列重建 & 按标称 IOPS 估算时间 & 持续负载下可能超时掉盘 \\
+确认途径 & 厂商型号规格页 & 查厂商公布的 SMR 型号清单 \\
+\bottomrule
+\end{longtable}
+
+SMR 值得单独成题，还因为一段行业插曲：2020 年前后，厂商曾把
+DM-SMR 盘不加说明地混进 NAS 与桌面产品线，用户在做阵列重建与持
+续随机写时遭遇数小时卡顿乃至掉盘，追查之下才发现同一型号存在
+CMR 与 SMR 两个版本。事件以三家大厂公开 SMR 型号清单收场。教训
+写在规格页的边角：同一名称的盘，介质组织方式可以不同，而介质组
+织方式决定的是写的语义，不只是速度。读规格书时，CMR 还是 SMR
+这一栏与容量、转速同等重要——它回答的是"这块盘允许什么样的访
+问模式"。
+
+选购识别并不靠猜：三家大厂在 2020 年后都公布了 SMR 型号清单；同
+系列里缓存异常大的容量点值得警惕；商品页出现"归档""冷数据"定
+位词时按 SMR 理解。用途涉及随机写、数据库、RAID 重建的，明确选
+CMR。SMR 不是"坏盘"，它把"只能顺序写"这条介质的脾气换成容量
+与价格；买错场景才是问题。本节结尾回看章首那句：让介质按其擅长
+的方式工作——对机械盘，"擅长"二字几乎就是"顺序"的同义词。

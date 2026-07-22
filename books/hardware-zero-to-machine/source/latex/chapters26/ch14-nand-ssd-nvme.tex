@@ -1,0 +1,1272 @@
+\chapter{NAND Flash、SSD 与 NVMe}
+
+\begin{keyidea}
+SSD 用控制器和映射层把擦写受限的 NAND 包装成块设备。本章把单元物理、FTL、队列接口和完成通知连成一条路径。
+\end{keyidea}
+
+\section{一、NAND Flash 单元、3D 堆叠与 FTL}
+
+NAND Flash 是当代大容量\hwkey{非易失存储}（non-volatile storage，断电后数据不丢失的存储器，与断电即丢失内容的 DRAM/SRAM 相对）的绝对主力：从手机里的 256\,GB UFS（Universal Flash Storage，手机与平板的主流嵌入式存储标准）到数据中心的 30\,TB 企业级 SSD，底层都是同一种器件——把电子困在绝缘层包围的势阱中，断电后电子不会逃逸，从而实现非易失。本节从单个浮栅晶体管的截面图讲起，经过编程/擦除/读出的物理机制、多值存储的阈值电压分布、3D 垂直堆叠结构，一直讲到控制器内部的 FTL 映射、垃圾回收、磨损均衡和 NVMe 接口协议，完整呈现"一颗电子如何被写入、保存、读出，直至器件随磨损走向失效"的生命周期。
+
+\begin{keyidea}
+NAND Flash 的核心物理是\hwkey{量子隧穿}：电子在强电场下穿过 8\,nm 氧化层进入或离开浮栅/电荷俘获层。写入和擦除都是隧穿过程，因此速度慢（$\mu$s--ms 级）、电压高（18--20\,V）、且每次隧穿都轻微损伤氧化层——这决定了 NAND 的 P/E 寿命（\hwkey{P/E 循环}即 program/erase cycle，一次编程加一次擦除；每个单元能承受的 P/E 循环次数有限，构成闪存最基本的寿命指标）、读干扰和保持时间等所有可靠性指标。
+\end{keyidea}
+
+%======================================================================
+\topic{浮栅单元截面：逐层拆解}
+
+传统 2D NAND Flash 单元是一个改造过的 N 沟道 MOSFET。与逻辑 MOSFET 相比，它在栅极和沟道之间多插入了两层关键结构：一层极薄的\hwkey{隧穿氧化层}（tunnel oxide）——厚度仅 7--9\,nm，薄到强电场下电子能以量子隧穿方式穿过，又厚到零电场下电子几乎不可能自发泄漏；以及一个被绝缘体完全包围的\hwkey{浮栅}（floating gate）——因不与任何金属引线相连、电位处于"浮空"状态而得名，注入其中的电荷没有逃逸通路，这正是非易失性的来源。从下往上依次为：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % P 型衬底
+  \draw[fill=BookCodeBg] (0,-1.2) rectangle (8,0);
+  \node[hw label] at (4,-0.6) {P 型衬底（P-substrate / P-well）};
+  % N+ 源区
+  \draw[fill=BookNavy!25] (0.3,-1.2) rectangle (1.8,0);
+  \node[hw label, font=\tiny] at (1.05,-0.6) {N+ 源};
+  % N+ 漏区
+  \draw[fill=BookNavy!25] (6.2,-1.2) rectangle (7.7,0);
+  \node[hw label, font=\tiny] at (6.95,-0.6) {N+ 漏};
+  % 沟道区标注
+  \node[hw label, font=\tiny, BookTeal] at (4,-0.15) {沟道区};
+  % 隧穿氧化层
+  \draw[fill=BookAmber!25] (2.2,0) rectangle (5.8,0.35);
+  \node[hw label, font=\tiny] at (4,0.17) {隧穿氧化层（SiO$_2$, $\sim$8\,nm）};
+  % 浮栅
+  \draw[fill=BookAccent!35] (2.5,0.35) rectangle (5.5,0.85);
+  \node[hw label, font=\tiny] at (4,0.6) {浮栅（多晶硅 poly-Si）};
+  % IPD/ONO 层
+  \draw[fill=BookAmber!25] (2.2,0.85) rectangle (5.8,1.25);
+  \node[hw label, font=\tiny] at (4,1.05) {IPD / ONO（$\sim$15\,nm）};
+  % 控制栅
+  \draw[fill=BookTeal!35] (2.5,1.25) rectangle (5.5,1.75);
+  \node[hw label, font=\tiny] at (4,1.5) {控制栅（CG = 字线 WL）};
+  % 尺寸标注
+  \draw[BookRed, line width=0.4pt, <->] (6.0,0) -- (6.0,0.35);
+  \node[BookRed, font=\tiny] at (6.6,0.17) {8\,nm};
+  \draw[BookRed, line width=0.4pt, <->] (6.0,0.85) -- (6.0,1.25);
+  \node[BookRed, font=\tiny] at (6.6,1.05) {15\,nm};
+  % 电子隧穿箭头
+  \draw[BookRed, line width=0.6pt, ->] (4,-0.3) -- (4,0.5);
+  \node[BookRed, font=\tiny] at (3.2,-0.3) {$e^-$ 隧穿};
+  % 底部说明
+  \node[hw label, text width=9cm] at (4,-2.0) {浮栅 NAND 单元截面（沿沟道方向）。N+ 源/漏之间是 P 型沟道；浮栅被隧穿氧化层（下）和 ONO 层间介质（上）完全包围，形成电荷势阱。};
+\end{pdfdiagram}
+\diagramnote{浮栅 NAND 单元截面。各层功能：P 型衬底提供沟道；N+ 源/漏是电流通路端点；隧穿氧化层（8\,nm SiO$_2$）是电子隧穿的唯一通道，其完整性决定器件寿命；浮栅（多晶硅）是电荷存储体；IPD/ONO（SiO$_2$/Si$_3$N$_4$/SiO$_2$，共约 15\,nm）把浮栅与控制栅绝缘；控制栅即字线，施加外部电压控制隧穿和读出。}
+
+各层的物理角色：
+
+\begin{longtable}{L{0.18\linewidth}L{0.16\linewidth}L{0.56\linewidth}}
+\toprule
+层 & 材料/厚度 & 功能 \\
+\midrule
+P 型衬底 & 掺杂 B 的 Si & 提供 P 型沟道体；编程时表面反型形成 N 沟道；擦除时 P-well 施加高压 \\
+N+ 源/漏 & 重掺杂 As/P & 串（string）中相邻单元共享源/漏；提供电流通路端点 \\
+隧穿氧化层 & SiO$_2$, 7--9\,nm & 编程/擦除时电子 FN 隧穿的势垒层；厚度决定隧穿概率和保持时间；每 P/E 循环产生少量界面态损伤 \\
+浮栅 & 多晶硅, 30--50\,nm & 电荷存储体；导体，电子在其中自由分布；电荷量决定单元 $V_{th}$ \\
+IPD (ONO) & SiO$_2$ / Si$_3$N$_4$ / SiO$_2$, 共 $\sim$15\,nm & 层间介质（Inter-Poly Dielectric）；阻止浮栅电荷向控制栅泄漏；等效氧化层厚度（EOT）决定 CG 对 FG 的耦合比 \\
+控制栅 & W 或 WSi$_2$ & 即字线（WL）；外部电压施加端；通过电容耦合控制浮栅电位 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{耦合比}（coupling ratio, CR）是浮栅单元的设计关键参数。浮栅不与任何电极相连，其电位完全由周围电极通过电容分压决定：$CR = C_{CG} / (C_{CG} + C_{tunnel} + C_{S/D})$，即控制栅与浮栅之间的电容占浮栅总电容的比例。浮栅电位的变化量等于控制栅电压变化量乘以 CR，因此 CR 越高，同样的外部电压就能在隧穿氧化层上产生越强的电场，编程/擦除所需的外部电压也就越低。提高 CR 的途径是加大 $C_{CG}$——减薄 ONO 层或换用高介电常数材料，其薄厚用\hwkey{等效氧化层厚度}（Equivalent Oxide Thickness, EOT，与叠层介质电容相同的 SiO$_2$ 厚度）衡量。量产浮栅单元的 CR 典型为 0.6--0.8。
+
+%======================================================================
+\topic{编程物理：Fowler-Nordheim 隧穿}
+
+NAND 编程的核心物理是 \hwkey{Fowler-Nordheim (FN) 隧穿}（以 1928 年建立该量子隧穿理论的 Fowler 和 Nordheim 命名）：在隧穿氧化层两侧施加足够强的电场（$>$10\,MV/cm），把矩形势垒拉成三角形、压窄电子的隧穿距离，电子便以不可忽略的概率穿过势垒进入浮栅。
+
+具体操作：控制栅（字线）施加 $V_{CG} \approx 18$--$20$\,V，源极接地或浮空，P-well 接地。按耦合比 0.6--0.8 估算，浮栅电位被耦合到约 12--15\,V；扣除沟道表面势与衬底耗尽层的分压（合计数伏）后，实际落在 8\,nm 隧穿氧化层上的压降约 8\,V，对应峰值场强约 10\,MV/cm 量级——恰好达到 FN 隧穿所需场强，又低于 SiO$_2$ 的击穿场强（$\sim$10--13\,MV/cm）。沟道中的电子在强电场下隧穿进入浮栅。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 能量轴
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (0,4.5) node[above, hw label] {能量 $E$};
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (8,0) node[right, hw label] {位置（沟道→浮栅→CG）};
+  % 沟道导带
+  \draw[BookTeal, line width=0.7pt] (0.5,1.0) -- (2.0,1.0);
+  \node[hw label, font=\tiny] at (1.2,0.7) {沟道 $E_C$};
+  % 氧化层势垒（三角形）
+  \draw[BookAccent, line width=0.7pt] (2.0,1.0) -- (2.0,3.8);
+  \draw[BookAccent, line width=0.7pt] (2.0,3.8) -- (3.8,1.0);
+  \draw[BookAccent, line width=0.7pt] (3.8,1.0) -- (3.8,2.5);
+  \node[hw label, font=\tiny] at (2.9,3.0) {SiO$_2$ 势垒};
+  \node[hw label, font=\tiny] at (2.9,2.2) {（三角化）};
+  % 浮栅
+  \draw[BookTeal, line width=0.7pt] (3.8,1.0) -- (5.5,1.0);
+  \node[hw label, font=\tiny] at (4.6,0.7) {浮栅 $E_C$};
+  % ONO + CG
+  \draw[BookAccent, line width=0.5pt, dashed] (5.5,1.0) -- (5.5,3.0) -- (7.0,3.0);
+  \node[hw label, font=\tiny] at (6.2,2.7) {ONO + CG};
+  % 电子箭头
+  \draw[BookRed, line width=0.7pt, ->] (1.5,1.0) .. controls (2.5,1.5) .. (3.5,1.0);
+  \node[BookRed, font=\tiny\bfseries] at (2.5,0.4) {$e^-$ FN 隧穿};
+  % 电场标注
+  \node[hw label, font=\tiny] at (2.9,4.2) {$V_{CG}$=18--20\,V → $E_{ox}$$\approx$10\,MV/cm};
+  % 说明
+  \node[hw label, text width=8.5cm] at (4,-1.0) {编程时能带图：强正栅压使氧化层势垒三角化，沟道电子通过 FN 隧穿穿过势垒进入浮栅。隧穿电流密度 $J_{FN} \propto E_{ox}^2 \exp(-B/E_{ox})$。};
+\end{pdfdiagram}
+\diagramnote{FN 隧穿能带图。无外加电场时 SiO$_2$ 势垒高 3.2\,eV（对电子），电子无法越过；施加 18--20\,V 后势垒被拉成三角形，有效隧穿宽度降到 2--3\,nm，电子以量子隧穿方式穿过。}
+
+FN 隧穿电流密度由 Fowler-Nordheim 方程给出：
+$$J_{FN} = A \cdot E_{ox}^2 \cdot \exp\!\left(-\frac{B}{E_{ox}}\right)$$
+其中 $A \approx 1.4 \times 10^{-6}$\,$\mathrm{A/V^2}$，$B \approx 2.4 \times 10^{8}$\,V/cm（对 SiO$_2$，$\phi_B = 3.2$\,eV）。代入量级估算：$E_{ox} = 8$\,MV/cm 时 $J_{FN} \approx 8$\,$\mu\mathrm{A/cm^2}$，$E_{ox} = 10$\,MV/cm 时 $J_{FN} \approx 5$\,$\mathrm{mA/cm^2}$——场强仅增加 25\%，电流密度上升近三个数量级（场强每增加约 10\%，隧穿电流约增加一个数量级）。这种指数敏感性意味着：单元间工艺涨落造成的场强微小差别会被放大为注入速度的巨大差别，用单一开环脉冲不可能把整页单元都精确编到目标 $V_{th}$，这正是后文 ISPP"脉冲—验证"闭环算法存在的物理原因。
+
+\begin{warningbox}
+常见误区：把 NAND 编程电流小归因于"FN 隧穿电流密度极低"。按上面的估算，编程场强下电流密度达 $\mu\mathrm{A/cm^2}$--$\mathrm{mA/cm^2}$ 量级，并不低；单单元电流只有 fA--pA 级，是因为单个单元的隧穿面积仅 $\sim$$10^{-12}$\,$\mathrm{cm^2}$ 量级。编程之所以仍需毫秒级时间，是因为每个脉冲注入的电荷必须小而可控（否则 $V_{th}$ 分布过宽），且片上电荷泵供流能力有限，只能靠多脉冲逐步积累。
+\end{warningbox}
+
+\hwkey{沟道热电子注入（CHE）}是另一种编程机制（主要用于 NOR Flash）：沟道中的电子被横向电场加速获得高动能（$>$3.1\,eV），在漏端附近"热"电子越过氧化层势垒注入浮栅。CHE 编程电流大（$\mu$A 级）、速度快（$\mu$s），但功耗高且只能逐单元操作，不适合 NAND 的页编程架构。NAND 几乎全部使用 FN 隧穿编程。
+
+\begin{longtable}{L{0.2\linewidth}L{0.35\linewidth}L{0.35\linewidth}}
+\toprule
+编程机制 & FN 隧穿（NAND 主流） & CHE 注入（NOR 主流） \\
+\midrule
+驱动电压 & $V_{CG}$=18--20\,V, 源/漏接地 & $V_{CG}$=10--12\,V, $V_D$=5--7\,V \\
+电流 & $J \sim \mu\mathrm{A/cm^2}$--$\mathrm{mA/cm^2}$；单元面积极小，单单元仅 fA--pA（低功耗） & $\mu$A/单元（高功耗） \\
+速度 & 慢（页编程 0.5--2\,ms） & 快（单字 5--20\,$\mu$s） \\
+粒度 & 整页同时编程 & 逐字节/逐字 \\
+适合架构 & NAND（串联，面积小） & NOR（并联，随机读快） \\
+\bottomrule
+\end{longtable}
+
+%======================================================================
+\topic{擦除物理：电子隧穿离开浮栅}
+
+擦除是编程的逆过程：把浮栅中的电子"抽"出来。操作方式：P-well（衬底）施加 $V_{well} \approx 18$--$20$\,V，控制栅接地（$V_{CG} = 0$\,V）。此时电场方向反转，浮栅中的电子在强电场下隧穿\emph{离开}浮栅、穿过隧穿氧化层进入衬底。
+
+\begin{lstlisting}
+Erase operation (block erase):
+  V_WL (all wordlines in block) = 0 V     // CG grounded
+  V_P-well                       = +18~20 V  // substrate boosted
+  V_source, V_drain              = floating  // or 0 V
+  Duration                       = 2~5 ms
+  Result: electrons tunnel OUT of FG → Vth drops to erased state (~-2~-3 V)
+\end{lstlisting}
+
+\hwkey{块擦除}（block erase）：NAND 架构中，一个 block 内所有字线同时接地，P-well 整体升压，因此整个 block（4--16\,MiB）一次性擦除。不能只擦除一个页或一个单元——这是 NAND 与 NOR 的关键架构差异。
+
+为什么擦除慢（2--5\,ms）？
+\begin{itemize}
+  \item 单单元隧穿电流极小，移走全部电荷需要时间积累。擦除场强下 FN 电流密度虽达 $\mathrm{mA/cm^2}$ 量级，但单个单元的隧穿面积只有 $\sim$$10^{-12}$\,$\mathrm{cm^2}$，换算成单单元电流仅 pA 级；而现代小尺寸单元浮栅中存储的电子约为 $10^3$--$10^4$ 个（早期大尺寸单元可达 $10^5$ 个），把这么多电子逐一抽出，毫秒级的时间并不宽裕。
+  \item P-well 升压需要时间。芯片外部供电只有几伏，18--20\,V 的高压由片上\hwkey{电荷泵}（charge pump）产生——用电容和开关逐级把电荷"泵"到高压节点。电荷泵供流能力有限，而整个 block 共用的 P-well 电容很大，充电到 18--20\,V 典型需要数百 $\mu$s。
+  \item 擦除后需要验证（erase verify）：检查所有单元 $V_{th}$ 是否降到擦除态以下；未通过的单元需要再擦一次，擦除—验证可能重复多轮。
+\end{itemize}
+
+\hwevidence{典型 TLC NAND（每单元存 3 bit 的多值单元，详见后文"SLC/MLC/TLC/QLC 阈值电压分布"小节）擦除时间 3.5\,ms（含验证），同一单元工作在 SLC 模式（每单元只存 1 bit）时约 2\,ms。一次擦除清除 4--16\,MiB 数据，因此擦除带宽并不低（$\sim$4\,GB/s），但延迟极高。}
+
+%======================================================================
+\topic{读操作：阈值电压判别}
+
+读出时不施加隧穿级高压，只用中等电压判断沟道是否导通：
+
+\begin{lstlisting}
+Read operation (one page):
+  Unselected WLs:  V_pass   = +7~10 V   // 强制导通，不管 FG 有无电荷
+  Selected WL:     V_read   = 0~1 V      // 介于擦除态(-2~-3V)和SLC编程态 Vth 之间
+  Source line:     0 V
+  Bit line:        precharged, then sense current
+
+  If FG has electrons (programmed): Vth > V_read → cell OFF → no current → reads "0"
+  If FG is empty (erased):          Vth < V_read → cell ON  → current flows → reads "1"
+\end{lstlisting}
+
+关键点：$V_{pass}$（7--10\,V）加在\emph{未选中}字线上，它高于最高编程态的 $V_{th}$、又远低于会引发隧穿的编程电压，确保同一 string 中其他单元无论处于什么状态都强制导通，使电流通路不被阻断。只有被选中的那条字线施加 $V_{read}$（SLC 约 0--1\,V，介于擦除态 $V_{th}\approx-2$--$-3$\,V 与编程态之间；MLC/TLC 的高档位参考电压可到 4--5\,V），让目标单元的导通/截止取决于其自身 $V_{th}$。
+
+对于 MLC/TLC/QLC，$V_{read}$ 不只有一个值——需要在每对相邻状态之间各设一个参考电压（详见下一 topic）。
+
+%======================================================================
+\topic{SLC/MLC/TLC/QLC 阈值电压分布}
+
+从擦除态到最高编程态，$V_{th}$ 窗口总共约 5--6\,V。窗口里只放两个状态（擦除/编程）时，一个单元存 1 bit，称为 \hwkey{SLC}（Single-Level Cell，单级单元）。通过精确控制浮栅中的电子数量，可以把窗口划分成更多离散区间，每个区间代表一个编程状态：4 态存 2 bit 为 \hwkey{MLC}（Multi-Level Cell），8 态存 3 bit 为 \hwkey{TLC}（Triple-Level Cell），16 态存 4 bit 为 \hwkey{QLC}（Quad-Level Cell）。$2^n$ 个状态需要 $2^n - 1$ 个读参考电压分隔相邻区间，每个状态在分布图上表现为一个以目标 $V_{th}$ 为中心的钟形分布：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 坐标轴
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (11,0) node[right, hw label] {$V_{th}$ (V)};
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (0,3.5) node[above, hw label] {单元数};
+  % SLC: 2 states
+  \draw[BookTeal, line width=0.7pt] (0.5,0.2) .. controls (1.0,3.0) and (1.5,3.0) .. (2.0,0.2);
+  \node[hw label, font=\tiny] at (1.25,-0.3) {E};
+  \draw[BookTeal, line width=0.7pt] (3.0,0.2) .. controls (3.5,3.0) and (4.0,3.0) .. (4.5,0.2);
+  \node[hw label, font=\tiny] at (3.75,-0.3) {P};
+  \draw[BookRed, line width=0.5pt, dashed] (2.5,0) -- (2.5,3.2);
+  \node[BookRed, font=\tiny] at (2.5,3.4) {$V_{ref}$};
+  % TLC: 8 states (simplified)
+  \foreach \x/\s in {5.5/E, 6.2/P1, 6.9/P2, 7.6/P3, 8.3/P4, 9.0/P5, 9.7/P6, 10.4/P7} {
+    \draw[BookAccent, line width=0.5pt] (\x,0.2) .. controls (\x+0.15,2.0) and (\x+0.25,2.0) .. (\x+0.4,0.2);
+    \node[hw label, font=\tiny] at (\x+0.2,-0.3) {\s};
+  }
+  % Vref lines for TLC
+  \foreach \x in {6.0, 6.7, 7.4, 8.1, 8.8, 9.5, 10.2} {
+    \draw[BookRed, line width=0.3pt, dashed] (\x,0) -- (\x,2.2);
+  }
+  % 标注
+  \node[hw label, font=\tiny] at (2.5,-0.9) {SLC: 2 态, 1 个 $V_{ref}$};
+  \node[hw label, font=\tiny] at (8.0,-0.9) {TLC: 8 态, 7 个 $V_{ref}$};
+  \node[hw label, text width=9cm] at (5.5,-1.7) {阈值电压分布：每个状态是一个高斯分布（$\sigma$ 由工艺波动、读干扰、保持退化决定）。相邻分布间距越窄（QLC 仅 $\sim$0.4\,V），对噪声越敏感。};
+\end{pdfdiagram}
+\diagramnote{SLC 与 TLC 的 $V_{th}$ 分布对比。SLC 只有擦除态（E）和编程态（P），间距大（$\sim$5\,V），抗干扰能力极强。TLC 有 8 个状态（E, P1--P7），相邻间距仅 $\sim$0.8\,V，需要 7 个读参考电压。QLC 有 16 个状态，间距压缩到 $\sim$0.4\,V。}
+
+\begin{longtable}{L{0.09\linewidth}L{0.09\linewidth}L{0.12\linewidth}L{0.16\linewidth}L{0.14\linewidth}L{0.14\linewidth}L{0.13\linewidth}}
+\toprule
+类型 & 状态数 & bit/单元 & 相邻态间距 & 读参考电压数 & P/E 寿命 & 典型读延迟 \\
+\midrule
+SLC & 2 & 1 & $\sim$5\,V & 1 & 100K & 25\,$\mu$s \\
+MLC & 4 & 2 & $\sim$2\,V & 3 & 3K--10K & 40\,$\mu$s \\
+TLC & 8 & 3 & $\sim$0.8\,V & 7 & 1K--3K & 60--90\,$\mu$s \\
+QLC & 16 & 4 & $\sim$0.4\,V & 15 & 500--1K & 90--130\,$\mu$s \\
+\bottomrule
+\end{longtable}
+
+表中相邻态间距一列是多值存储一切可靠性问题的根源。分布宽度由 ISPP 步进设定下限，又被工艺涨落、读干扰和保持退化逐步拉宽；总窗口只有 5--6\,V，状态数每翻一倍，相邻间距就减半，同样的拉宽会更早使相邻分布的尾部交叠，读出错误率随之上升。这就是从 SLC 到 QLC，P/E 寿命逐档缩短、读延迟逐档变长（更多参考电压、更多采样与重试）、ECC 必须逐档增强的根本原因。
+
+\hwkey{Program verify 电平}：编程时，每施加一个脉冲后需要验证单元 $V_{th}$ 是否已进入目标状态区间。验证参考电压 $V_{vfy}$ 设在目标状态的下边界。若 $V_{th} < V_{vfy}$，说明电子注入不够，需要继续施加编程脉冲。
+
+%======================================================================
+\topic{ISPP：增量步进脉冲编程}
+
+由于 FN 隧穿电流对场强指数敏感、单元间特性又存在涨落，开环地施加一个固定脉冲不可能把整页数万个单元同时编进不足 1\,V 宽的目标窗口。NAND 编程因此不是一次完成的，而是使用闭环的\hwkey{增量步进脉冲编程}（Incremental Step Pulse Program, ISPP）算法逐步逼近目标 $V_{th}$：
+
+\begin{lstlisting}
+ISPP algorithm (per page):
+  Vpgm = Vpgm_start          // 初始编程电压, e.g. 14 V
+  loop:
+    apply Vpgm pulse to selected WL (duration ~10-20 us)
+    verify: read with V_vfy for target state
+    if all cells pass (Vth >= V_vfy):
+      DONE
+    else:
+      Vpgm = Vpgm + dV_ISPP  // 步进增量, e.g. +0.3 V
+      repeat
+  Typical: 8~16 pulses per page for TLC (full-window program)
+\end{lstlisting}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 时间轴
+  \draw[BookRule, line width=0.5pt, ->] (0,0) -- (11,0) node[right, hw label] {时间};
+  % 阶梯波形
+  \draw[BookAccent, line width=0.8pt] (0.5,1.0) -- (1.5,1.0) -- (1.5,1.5) -- (2.5,1.5) -- (2.5,2.0) -- (3.5,2.0) -- (3.5,2.5) -- (4.5,2.5) -- (4.5,3.0) -- (5.5,3.0) -- (5.5,3.5) -- (6.5,3.5);
+  % 验证脉冲
+  \foreach \x in {1.5, 2.5, 3.5, 4.5, 5.5} {
+    \draw[BookTeal, line width=0.5pt] (\x,0) -- (\x,0.6);
+    \node[BookTeal, font=\tiny] at (\x,-0.25) {V};
+  }
+  % 电压标注
+  \node[hw label, font=\tiny] at (0.2,1.0) {$V_{start}$};
+  \node[hw label, font=\tiny] at (0.0,1.5) {$+\Delta V$};
+  \node[hw label, font=\tiny] at (0.0,2.0) {$+2\Delta V$};
+  \node[hw label, font=\tiny] at (0.0,3.5) {$+5\Delta V$};
+  % dV 标注
+  \draw[BookRed, line width=0.4pt, <->] (7.0,1.0) -- (7.0,1.5);
+  \node[BookRed, font=\tiny] at (7.6,1.25) {$\Delta V_{ISPP}$};
+  % 说明
+  \node[hw label, text width=8cm] at (5.5,-1.2) {ISPP 阶梯波形：每个编程脉冲后跟一次验证（V）。未通过的单元在下一个更高脉冲中继续注入电子。$\Delta V_{ISPP}$ 典型 0.2--0.5\,V。};
+\end{pdfdiagram}
+\diagramnote{ISPP 阶梯波形。编程电压从 $V_{start}$（约 14\,V）开始，每步增加 $\Delta V_{ISPP}$（0.2--0.5\,V）。每步之后验证。TLC 写满全部 7 个编程态（全窗口编程）典型需要 8--16 个脉冲；SLC 只需 2--4 个。步进越小精度越高但编程越慢。}
+
+ISPP 能把分布做窄的关键在于\emph{逐单元闭环}：每个脉冲把未通过验证单元的 $V_{th}$ 推高约 $\Delta V_{ISPP}$，单元一旦在某次验证中越过 $V_{vfy}$，后续脉冲到来时其沟道会被抬升电位禁止注入（program inhibit），不再吸收电子。于是所有单元的最终 $V_{th}$ 都落在宽度约 $\Delta V_{ISPP}$ 的窗口 $[V_{vfy},\,V_{vfy} + \Delta V_{ISPP}]$ 内——分布宽度不再取决于单元间的隧穿速度差异，而只取决于步进大小。这也是页编程时间与状态数同步增长的原因：脉冲数（8--16 个）$\times$（单脉冲 10--20\,$\mu$s + 逐档验证时间）恰好在 0.5--2\,ms 量级，与前文的操作时间一致。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+ISPP 参数 & 典型值（TLC） & 影响 \\
+\midrule
+$V_{pgm\_start}$ & 13--15\,V & 初始编程电压；太低则第一个脉冲无效 \\
+$\Delta V_{ISPP}$ & 0.2--0.5\,V & 步进越小→$V_{th}$ 分布越窄→但脉冲数越多→编程越慢 \\
+脉冲数/页 & 8--16（TLC 全窗口） & 取决于目标状态数和步进大小 \\
+单脉冲宽度 & 10--20\,$\mu$s & 隧穿需要时间积累 \\
+页编程总时间 & 0.5--2\,ms & 含所有脉冲 + 验证 \\
+\bottomrule
+\end{longtable}
+
+%======================================================================
+\topic{Page / Block / Plane / Die 层次结构}
+
+NAND 内部有严格的层次结构，每一层对应不同的操作粒度：
+
+\begin{longtable}{L{0.14\linewidth}L{0.18\linewidth}L{0.28\linewidth}L{0.3\linewidth}}
+\toprule
+层级 & 典型大小 & 操作粒度 & 说明 \\
+\midrule
+Page & 16--36\,KiB & \hwkey{编程单位} & 一次 ISPP 编程操作写入一整页；页内所有单元共享同一条字线 \\
+Block & 4--16\,MiB & \hwkey{擦除单位} & 一次擦除操作清除一整块；2D MLC 块 = 128--256 页（$\sim$4--8\,MiB），3D TLC 块 = 字线层数 $\times$ 3 页（232 层约 700 页，$>$10\,MiB）\\
+Plane & 2--4 / die & 并行单位 & 每个 plane 有独立的 page register 和行译码，可同时操作 \\
+Die (LUN) & 1--2\,Tbit & 独立操作单位 & 一个 die 可独立执行命令；多 die 可并行 \\
+Package & 1--4 die & 封装单位 & 一个芯片封装内堆叠 1--4 个 die（多 die 堆叠） \\
+\bottomrule
+\end{longtable}
+
+每一层粒度背后都有对应的硬件支撑。页粒度来自\hwkey{页寄存器}（page register）：die 内紧邻存储阵列的一页大小（16--36\,KiB）的 SRAM 缓冲。读操作时，整条字线的单元被同时感应进页寄存器，数据再从寄存器串行输出到 I/O 引脚；编程操作顺序相反，先把整页数据装入页寄存器，再对整条字线执行 ISPP。因此 NAND 的最小读写单位是页而不是字节——即使主机只要一个字节，也要先把整页感应进寄存器，再从中取出目标字节。每页还附带一块主机通常不可见的\hwkey{带外区}（out-of-band area，又称 spare area），存放该页的 ECC 校验码、坏块标记和 FTL 元数据（如该物理页对应的逻辑页号），上表"16--36\,KiB"的页容量已包含这部分。
+
+\hwevidence{以 1\,Tbit TLC die 为例：page = 16\,KiB（含 spare），block = 256 页 = 4\,MiB，die 内共 $\sim$32K 个 block，2--4 个 plane。一个 2\,TB SSD = 16 个 1\,Tbit die，分 4--8 个通道。}
+
+%======================================================================
+\topic{NAND String 结构：串联的代价}
+
+NAND 的核心架构特征是把 32--128 个存储单元\hwkey{串联}成一条 string（2D NAND 典型 32--64 个，3D NAND 可达 128--232 个）。string 两端各有一个选择门：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Bit line
+  \draw[hw bus] (0,3.5) -- (0,3.0);
+  \node[hw label] at (0,3.7) {BL};
+  % SSL
+  \node[hw control, minimum width=1.2cm, minimum height=0.5cm] (ssl) at (0,2.6) {SSL};
+  % 存储单元串
+  \node[hw compute, minimum width=1.2cm, minimum height=0.35cm] at (0,2.0) {WL31};
+  \node[hw compute, minimum width=1.2cm, minimum height=0.35cm] at (0,1.6) {WL30};
+  \node[hw compute, minimum width=1.2cm, minimum height=0.35cm] at (0,1.2) {WL29};
+  \node[hw label] at (0,0.8) {$\vdots$};
+  \node[hw compute, minimum width=1.2cm, minimum height=0.35cm] at (0,0.4) {WL1};
+  \node[hw compute, minimum width=1.2cm, minimum height=0.35cm] at (0,0.0) {WL0};
+  % Dummy WL
+  \node[hw memory, minimum width=1.2cm, minimum height=0.35cm] at (0,-0.5) {Dummy};
+  % GSL
+  \node[hw control, minimum width=1.2cm, minimum height=0.5cm] (gsl) at (0,-1.1) {GSL};
+  % Source line
+  \draw[hw bus] (0,-1.5) -- (0,-2.0);
+  \node[hw label] at (0,-2.2) {CSL (源线)};
+  % 连接线
+  \draw[BookRule, line width=0.4pt] (0,3.0) -- (ssl.north);
+  \draw[BookRule, line width=0.4pt] (ssl.south) -- (0,2.17);
+  \draw[BookRule, line width=0.4pt] (0,-0.67) -- (0,-0.85);
+  \draw[BookRule, line width=0.4pt] (gsl.north) -- (0,-0.85);
+  \draw[BookRule, line width=0.4pt] (gsl.south) -- (0,-1.5);
+  % 右侧说明
+  \node[hw label, text width=5cm, anchor=west] at (1.5,1.0) {32--128 个单元串联。读时电流必须穿过所有单元。SSL/GSL 是选择门，控制 string 与 BL/CSL 的通断。Dummy WL 位于 string 边缘，减少边缘效应。};
+\end{pdfdiagram}
+\diagramnote{NAND string 结构。SSL（String Select Line）在漏端，GSL（Ground Select Line）在源端。读操作时 SSL 和 GSL 都打开，电流从 BL 穿过整条 string 到 CSL。未选中单元的 WL 加 $V_{pass}$ 强制导通。Dummy（哑）字线不存数据：紧邻选择门的边缘单元电场环境特殊、特性偏差大，作为哑单元吸收边缘效应。}
+
+为什么用串联？\hwkey{面积效率}：NOR 架构中每个单元直接连到位线，需要独立的金属接触孔（contact），面积大。NAND 串联后，相邻单元共享源/漏扩散区，不需要中间接触孔，单元面积缩小到 $\sim$$4\,\mathrm{F}^2$（F = 特征尺寸，即工艺节点最小线宽），是 NOR 的 $\sim$1/3。
+
+代价：
+\begin{itemize}
+  \item 读速度慢：电流必须穿过 32--232 个串联晶体管，等效电阻大，位线放电慢（读延迟 25--130\,$\mu$s vs 并行 NOR 的 60--100\,ns）。
+  \item 编程干扰：同一 string 中未选中单元的沟道电位受选中单元影响。
+  \item 不能随机读单个字节：必须读整页（16\,KiB），再在 page register 中选字节输出。
+\end{itemize}
+
+%======================================================================
+\topic{3D NAND：垂直堆叠结构}
+
+2D NAND 的面积缩小已接近物理极限（单元间电容耦合干扰随间距缩小而急剧增大）。3D NAND 的解决方案：不再缩小水平尺寸，而是把字线层\hwkey{垂直堆叠}，沟道变成垂直的多晶硅圆柱体穿过所有字线层。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 垂直沟道（中心）
+  \draw[fill=BookTeal!15] (3.6,-3.0) rectangle (4.4,3.5);
+  \node[hw label, rotate=90, font=\tiny] at (4.0,0.3) {poly-Si 垂直沟道};
+  % 隧穿氧化层（包裹沟道）
+  \draw[fill=BookAmber!20] (3.3,-3.0) rectangle (3.6,3.5);
+  \draw[fill=BookAmber!20] (4.4,-3.0) rectangle (4.7,3.5);
+  % 电荷俘获层 SiN
+  \draw[fill=BookAccent!25] (2.9,-3.0) rectangle (3.3,3.5);
+  \draw[fill=BookAccent!25] (4.7,-3.0) rectangle (5.1,3.5);
+  % 阻挡氧化层
+  \draw[fill=BookAmber!15] (2.6,-3.0) rectangle (2.9,3.5);
+  \draw[fill=BookAmber!15] (5.1,-3.0) rectangle (5.4,3.5);
+  % 字线层（W/TiN）
+  \foreach \y in {-2.8, -2.2, -1.6, -1.0, -0.4, 0.2, 0.8, 1.4, 2.0, 2.6, 3.2} {
+    \draw[fill=BookNavy!20] (0.3,\y) rectangle (2.6,\y+0.35);
+    \draw[fill=BookNavy!20] (5.4,\y) rectangle (7.7,\y+0.35);
+  }
+  % 层间介质
+  \foreach \y in {-2.45, -1.85, -1.25, -0.65, -0.05, 0.55, 1.15, 1.75, 2.35, 2.95} {
+    \draw[fill=BookCodeBg] (0.3,\y) rectangle (2.6,\y+0.25);
+    \draw[fill=BookCodeBg] (5.4,\y) rectangle (7.7,\y+0.25);
+  }
+  % 标注
+  \node[hw label, font=\tiny, anchor=east] at (0.2,3.3) {WL (W/TiN)};
+  \node[hw label, font=\tiny, anchor=east] at (0.2,2.6) {层间介质};
+  % 层名标注：从上方空白处先横后竖正交引线，指向各层顶边，不横穿 WL/层间介质
+  \node[BookRed, font=\tiny, anchor=west] at (6.1,3.85) {阻挡氧化层};
+  \draw[BookRed, line width=0.4pt, ->] (6.05,3.85) -- (5.25,3.85) -- (5.25,3.5);
+  \node[BookRed, font=\tiny, anchor=west] at (7.4,4.2) {SiN 电荷俘获层};
+  \draw[BookRed, line width=0.4pt, ->] (7.35,4.2) -- (4.9,4.2) -- (4.9,3.5);
+  \node[BookRed, font=\tiny, anchor=west] at (8.7,4.55) {隧穿氧化层};
+  \draw[BookRed, line width=0.4pt, ->] (8.65,4.55) -- (4.55,4.55) -- (4.55,3.5);
+  % 底部说明
+  \node[hw label, text width=9cm] at (4,-3.8) {3D NAND 垂直截面：从沟道中心向外依次为 poly-Si 沟道→隧穿氧化层→SiN 电荷俘获层→阻挡氧化层→W/TiN 字线。每层字线与沟道交叉处形成一个存储单元。};
+\end{pdfdiagram}
+\diagramnote{3D NAND 垂直 string 截面。量产产品已达 232--300+ 层字线，即一根垂直沟道上串联 232+ 个存储单元。沟道孔直径约 80--120\,nm；导电的 poly-Si 沟道并非实心圆柱，而是沉积在孔壁上、厚约 10\,nm 的圆筒形薄膜，孔中心通常以氧化层回填（俗称"通心粉"结构），字线层间距约 30--40\,nm。}
+
+\hwkey{String stacking}（串堆叠）：当层数超过 $\sim$128 层时，要一次刻穿全部叠层形成沟道孔，刻蚀\hwkey{深宽比}（aspect ratio，孔深与孔径之比）超过 60:1——等离子体难以把孔底刻干净，侧壁也容易弯曲变形，工艺上不可行。解决方案是把 string 分成两半（如上半 116 层 + 下半 116 层）分别刻蚀，中间通过金属连接层（中段互连，mid-stack contact）把两段沟道对接。232 层产品通常是 2$\times$116 层堆叠。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+3D NAND 参数 & 典型值（232 层） & 含义 \\
+\midrule
+字线层数 & 232（2$\times$116 堆叠） & 每根沟道上的存储单元数 \\
+沟道材料 & poly-Si 薄膜，壁厚 $\sim$10\,nm & 沟道孔 $\phi$$\sim$80--120\,nm；poly-Si 沉积于孔壁形成圆筒沟道；晶粒边界影响迁移率 \\
+字线材料 & W 或 Mo + TiN 阻挡层 & 低电阻金属字线（替代 2D 的 poly-Si） \\
+电荷俘获层 & SiN, $\sim$5--7\,nm & 替代浮栅；局域陷阱存储 \\
+隧穿氧化层 & SiO$_2$, $\sim$4--5\,nm & 比 2D 更薄，靠能带工程叠层兼顾擦除与保持 \\
+阻挡氧化层 & SiO$_2$ / high-$k$, $\sim$5--8\,nm & 阻止电荷向字线泄漏 \\
+Die 容量 & 1--2\,Tbit & 单 die \\
+\bottomrule
+\end{longtable}
+
+两点需要特别说明。其一，3D NAND 的编程电压（15--20\,V）与 2D 相当——隧穿氧化层更薄并不意味着工作电压更低。更薄的隧穿氧化层之所以可行，是因为 SiN 中的深能级陷阱对电荷束缚较强，再配合 high-$k$（高介电常数）阻挡层挡住字线一侧的电荷回注，其收益是擦除更容易、氧化层承受的电场应力更小。其二，垂直沟道是多晶硅而非单晶：晶粒边界会散射载流子、降低迁移率并加大单元间涨落，这是 3D NAND 读电流小、$V_{th}$ 分布偏宽的结构性原因。
+
+%======================================================================
+\topic{电荷俘获 vs 浮栅：为什么 3D 选择 CT}
+
+3D NAND 几乎全部采用\hwkey{电荷俘获}（Charge Trap, CT）结构而非浮栅。原因：
+
+\begin{longtable}{L{0.2\linewidth}L{0.35\linewidth}L{0.35\linewidth}}
+\toprule
+特性 & 浮栅（Floating Gate） & 电荷俘获（Charge Trap, SiN） \\
+\midrule
+存储层材料 & 多晶硅（导体） & Si$_3$N$_4$（绝缘体） \\
+电子状态 & 自由移动，整层等电位 & 被局域陷阱捕获，固定不动 \\
+横向迁移 & 有：电子可沿 FG 横向扩散 & 无：陷阱位置固定 \\
+单点缺陷影响 & 致命：一个针孔→整层电荷泄漏 & 局部：只影响缺陷附近少量电荷 \\
+单元间耦合 & 显著：相邻 FG 电容耦合（$C_{coupling}$） & 极小：绝缘体无横向电场扩展 \\
+3D 工艺兼容性 & 差：poly-Si FG 在垂直结构中难以均匀沉积 & 好：SiN 可用 ALD/CVD 在深孔侧壁上共形（conformal，即各处厚度均匀贴合）沉积 \\
+适合 3D 堆叠 & 困难 & 天然适合 \\
+\bottomrule
+\end{longtable}
+
+在 2D NAND 中，浮栅间的电容耦合是主要干扰源：相邻字线编程时，通过 $C_{coupling}$ 改变已编程单元的浮栅电位，导致 $V_{th}$ 偏移（program disturb）。3D 的 CT 结构基本消除了单元间电容耦合这一干扰源——电荷被固定在陷阱中，不会因相邻单元的电场而重新分布；但 GIDL（栅致漏极泄漏，见后文"编程干扰"小节）等其他干扰机制在 3D 结构中仍然存在。
+
+%======================================================================
+\topic{读干扰（Read Disturb）}
+
+读操作时，未选中字线上施加的 $V_{pass}$（7--10\,V）不足以引起明显的 FN 隧穿：经耦合比（0.6--0.8）折算到浮栅只剩数伏，隧穿氧化层上的场强仅为数 MV/cm 的中等水平，与编程时的 $\sim$10\,MV/cm 有明显距离。但 FN 电流随场强指数变化、并不严格为零，每次读操作仍有极少量电子隧穿进入未选中单元的浮栅/陷阱层。单次效应极小（$\Delta V_{th} < 1$\,mV），但累积效应显著：
+
+\begin{lstlisting}
+Read disturb mechanism:
+  Each read: unselected cells see Vpass = 7~10 V on CG
+  Per-read Vth shift: ~0.1~1 mV (tiny)
+  After 100,000 reads: cumulative shift = 10~100 mV
+  If shift exceeds read margin → read error
+
+Mitigation:
+  1. Read count tracking: FTL counts reads per block
+  2. Threshold: when count > limit (e.g. 100K~200K), trigger data refresh
+  3. Data refresh: read out entire block → rewrite to new block → erase old block
+  4. Cost: refresh consumes P/E cycles and bandwidth
+\end{lstlisting}
+
+\hwevidence{TLC NAND 读干扰限制典型为 100K--200K 次读/块。QLC 更敏感（$\sim$50K--100K）。企业级 SSD 在热数据区域可能数小时内就达到读限制，需要主动刷新。}
+
+%======================================================================
+\topic{编程干扰与数据保持（Retention）}
+
+\hwkey{编程干扰}（Program Disturb）：编程某一页时，同一 block 中其他页的单元也会受到应力：
+\begin{itemize}
+  \item 同一 string 中未选中单元：沟道被 $V_{pass}$ 拉高，但漏端（已编程页侧）电位不同，可能产生 \hwkey{GIDL}（Gate-Induced Drain Leakage，栅致漏极泄漏——栅与漏交叠区的强纵向电场诱发带间隧穿，产生的电子-空穴对中，获得能量的电子可能注入浮栅）或轻微 FN 注入。
+  \item 相邻字线：电容耦合改变已编程单元的 $V_{th}$（2D 浮栅严重，3D CT 极轻）。
+\end{itemize}
+
+\hwkey{数据保持}（Retention）：浮栅/陷阱中的电子会随时间缓慢泄漏（通过隧穿氧化层的缺陷辅助隧穿或热激发）。规格要求：
+
+\begin{longtable}{L{0.16\linewidth}L{0.24\linewidth}L{0.24\linewidth}L{0.26\linewidth}}
+\toprule
+类型 & 保持规格 & 条件 & 失效后果 \\
+\midrule
+SLC & 10 年（新片，常温） & 裸片宣称值；寿命末期的 JEDEC JESD218 要求：消费级 1 年 @ 30°C，企业级 3 个月 @ 40°C & $V_{th}$ 下移→读错误 \\
+MLC & 10 年 @ 55°C & 消费级 & 同上 \\
+TLC & 1--5 年 @ 40--55°C & 取决于 P/E 次数 & 高 P/E 后保持急剧退化 \\
+QLC & 1--3 年 @ 40°C & 新片；P/E 后更短 & 需更频繁刷新 \\
+\bottomrule
+\end{longtable}
+
+保持退化与 P/E 循环次数强相关：每次 P/E 循环都在隧穿氧化层中产生少量\hwkey{界面态}（Si/SiO$_2$ 界面上的悬挂键缺陷）和氧化层体内的陷阱；这些缺陷首尾相接，在氧化层中形成低场下的泄漏通道，使远低于 FN 阈值的电场也能缓慢导电——这一现象称为\hwkey{应力诱生漏电流}（Stress-Induced Leakage Current, SILC），是保持特性随磨损退化的主要载体。新片保持 10 年，经过数千次 P/E 后可能只保持数月。
+
+%======================================================================
+\topic{坏块管理}
+
+NAND 出厂时就允许存在一定比例的\hwkey{坏块}（bad block），使用中还会产生新的坏块：
+
+\begin{longtable}{L{0.2\linewidth}L{0.35\linewidth}L{0.35\linewidth}}
+\toprule
+坏块类型 & 原因 & 标记方式 \\
+\midrule
+出厂坏块 & 制造缺陷（氧化层针孔、颗粒污染） & 出厂时在 spare area 写入坏块标记（0x00） \\
+运行时坏块 & P/E 循环耗尽（氧化层退化→编程/擦除失败） & 控制器检测到 P/E 失败后标记 \\
+\bottomrule
+\end{longtable}
+
+FTL 的坏块管理：
+\begin{lstlisting}
+Bad block management:
+  Factory bad blocks:
+    - Scan spare area of block 0 page 0 (or last page) at initialization
+    - Build bad block table (BBT) in memory
+    - Never use these blocks for data storage
+
+  Runtime bad blocks:
+    - Program fail or erase fail detected by verify
+    - Mark block as bad in BBT (persist to NAND reserved area)
+    - Remap: FTL redirects logical addresses to spare/good blocks
+
+  Spare blocks:
+    - Factory reserves 3~5% extra blocks for replacement
+    - FTL uses these to replace bad blocks transparently
+\end{lstlisting}
+
+%======================================================================
+\topic{FTL 详解：映射、GC 与写放大}
+
+\hwkey{闪存转换层}（Flash Translation Layer, FTL）是 SSD 控制器的核心固件，解决 NAND 的三个根本限制：不能原地更新（in-place update），改写必须另找空闲页写入（out-of-place write，异地写）；擦除只能以 block 为单位，无法按页擦除；单元有 P/E 寿命上限。
+
+\textbf{L2P 映射表}：由于数据的物理位置由 FTL 动态分配，FTL 必须维护一张从逻辑页号（Logical Page Address, LPA）到物理页号（Physical Page Address, PPA）的\hwkey{映射表}（mapping table）——主机看到的连续逻辑地址，在 NAND 上的物理位置可以任意散布。映射表要支撑每次读写的随机快速查询，因此常驻 SSD 板载 DRAM；无 DRAM 的低成本盘则借助 NVMe 的 \hwkey{HMB}（Host Memory Buffer，主机内存缓冲）特性把映射表放在主机内存中，经 PCIe 访问，代价是额外的总线延迟。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+参数 & 计算 & 说明 \\
+\midrule
+映射粒度 & 页级（4\,KiB 或 16\,KiB） & 每个逻辑页对应一个物理页 \\
+每条目大小 & 4 字节（PPA） & 物理页号 = die + block + page + plane \\
+1\,TB SSD 映射表 & 1\,TB / 4\,KiB $\times$ 4\,B = 1\,GiB & 需要 DRAM 或 HMB 存储 \\
+2\,TB SSD 映射表 & $\sim$2\,GiB & 大容量 SSD 需 2--4\,GiB DRAM \\
+\bottomrule
+\end{longtable}
+
+\textbf{垃圾回收（GC）}：NAND 不能原地覆盖——要更新一个页，必须把新数据写到另一个空闲页，旧页标记为无效。当空闲 block 不足时，FTL 执行 GC：
+
+\begin{lstlisting}
+Garbage Collection (greedy algorithm):
+  1. Select victim block: pick the block with MOST invalid pages
+     (minimizes valid page copies → minimizes write amplification)
+  2. Copy valid pages: read all valid pages from victim → write to new free block
+  3. Erase victim block: now all pages invalid → erase → becomes free block
+  4. Update L2P: remap copied pages' logical addresses to new physical locations
+
+  Trigger: free block count < threshold (e.g. < 5% of total blocks)
+\end{lstlisting}
+
+\textbf{写放大}（Write Amplification, WA）：主机写入 1 页数据，FTL 实际写入 NAND 的页数（含 GC 搬移）。
+
+$$WA = \frac{\text{NAND 实际写入量}}{\text{主机写入量}} = \frac{1}{1 - u}$$
+
+其中 $u$ 是\hwkey{空间利用率}（space utilization，全盘所有 block 中有效页所占的比例）。该式是纯随机写、greedy GC（总是回收无效页最多的块）下的理想模型，实际 WA 还受写模式、OP 比例和 GC 策略影响。按理想模型，当 $u = 0.9$（90\% 满）时 $WA = 10$；实际产品的稳态 WA 明显低于这一上限（见下表）。
+
+\hwkey{预留空间}（Overprovisioning, OP）：预留一部分物理容量不对主机开放，使 FTL 始终有空闲块周转，同时降低全盘空间利用率 $u$，从而降低 WA：
+
+\begin{longtable}{L{0.2\linewidth}L{0.2\linewidth}L{0.2\linewidth}L{0.3\linewidth}}
+\toprule
+OP 比例 & 可用容量（物理 1\,TB） & 稳态 WA & 典型场景 \\
+\midrule
+7\% & 930\,GB & $\sim$3--5 & 消费级 SSD \\
+28\% & 720\,GB & $\sim$1.5--2.5 & 企业级 SSD \\
+50\%+ & 500\,GB & $\sim$1.2--1.5 & 高耐久企业级 \\
+\bottomrule
+\end{longtable}
+
+%======================================================================
+\topic{磨损均衡（Wear Leveling）}
+
+P/E 寿命以单个 block 计，而主机写负载天然不均匀：日志、元数据等热数据被反复改写，操作系统镜像等冷数据写入后常年不动。如果某些 block 被频繁擦写而其他 block 很少使用，前者会先耗尽 P/E 寿命变成坏块，整盘寿命随之缩短。\hwkey{磨损均衡}（wear leveling）的目标是让所有 block 的擦除次数尽量均匀，分动态、静态两层配合：
+
+\begin{lstlisting}
+Dynamic wear leveling:
+  - New writes always go to the free block with LOWEST erase count
+  - Effect: hot data spreads writes across all blocks evenly
+
+Static wear leveling:
+  - Periodically scan for "cold" blocks (low erase count, holding static data)
+  - Move cold data to a high-erase-count free block
+  - The freed cold block (now with low erase count) becomes available for hot writes
+  - Trigger: when max_erase_count - min_erase_count > threshold
+
+Erase count histogram:
+  - FTL maintains histogram of erase counts across all blocks
+  - Healthy: narrow distribution (all blocks within ~10% of average)
+  - Degraded: wide distribution → some blocks near P/E limit while others barely used
+\end{lstlisting}
+
+\hwevidence{TLC NAND P/E 寿命约 1000--3000 次。1\,TB SSD 在 7\% OP 下，总写入寿命 TBW（Terabytes Written，寿命期内允许的主机累计写入量）= 1\,TB $\times$ 1000 / WA $\approx$ 200--350\,TBW。企业级通过更大 OP 和 SLC 缓存策略提升到数千 TBW。}
+
+\hwkey{SLC 缓存}（SLC caching）是消费级 SSD 的标配策略：把一部分 TLC/QLC 单元临时按 SLC 方式使用——只写 1 bit，编程快、寿命长——主机写入先高速进入 SLC 缓存，控制器再在空闲时把数据折叠（folding）成 TLC 形态长期保存。缓存未耗尽时主机看到的是 SLC 的速度；持续写入耗尽缓存后，写入速度跌回 TLC 原生水平，这也是评测中长时写入出现"掉速"的原因。
+
+%======================================================================
+\topic{掉电保护（Power-Loss Protection, PLP）}
+
+SSD 内部操作（编程 NAND、更新 L2P 映射表）不是原子的，而且写路径上的数据和映射表都先经过易失的 DRAM。如果在编程中途或映射表更新前掉电，DRAM 中尚未写入 NAND 的数据与映射更新会全部丢失——轻则丢数据，重则映射表损坏、整盘无法识别。\hwkey{掉电保护}（Power-Loss Protection, PLP）的思路是用储能电容争取出最后几毫秒，让固件把关键状态收尾：
+
+\begin{lstlisting}
+Power-loss protection mechanism:
+  Hardware:
+    - Capacitor bank on SSD PCB (e.g. 47~220 uF, charged to 5V/12V)
+    - Energy stored: E = 0.5 * C * V^2 (e.g. 100uF * 12V = 7.2 mJ)
+    - Must sustain: complete in-flight NAND program (~2 ms) + flush mapping table
+
+  Firmware protocol:
+    1. Host write arrives → data buffered in DRAM
+    2. NAND program initiated (0.5~2 ms)
+    3. After program verify passes → update L2P mapping in DRAM
+    4. Periodically flush L2P snapshot to NAND (checkpoint)
+    5. On power-loss detection (voltage monitor):
+       a. Capacitor provides hold-up energy
+       b. Complete any in-flight NAND program
+       c. Flush dirty L2P entries to NAND checkpoint area
+       d. Write "power-loss marker" so next boot knows to recover
+
+  Recovery on next boot:
+    - If marker indicates unclean shutdown:
+      replay journal / rebuild L2P from last checkpoint + NAND metadata
+\end{lstlisting}
+
+企业级 SSD 需通过严格的随机掉电测试（厂商验证流程，典型为数百次随机掉电无数据丢失）。消费级 SSD 通常只有基本 PLP（仅保证完成在途编程操作），不保证映射表完整刷新。
+
+%======================================================================
+\topic{NVMe 接口：从主机命令到 NAND 操作}
+
+\hwkey{NVMe}（Non-Volatile Memory Express）是专为闪存 SSD 设计的主机接口协议，运行在 PCIe 总线上（高速点对点串行总线，详见第 6 章）。在它之前，SSD 沿用为机械硬盘设计的 AHCI（Advanced Host Controller Interface）/SATA 接口：单条命令队列、深度仅 32，协议路径为毫秒级寻道的硬盘优化。与 AHCI/SATA 相比，NVMe 的核心优势是\hwkey{深度队列化}和\hwkey{低延迟}。
+
+\begin{longtable}{L{0.24\linewidth}L{0.26\linewidth}L{0.4\linewidth}}
+\toprule
+NVMe 特性 & 参数 & 说明 \\
+\midrule
+Submission Queue (SQ) & 最多 64K 个队列 & 每个队列深度最多 64K 条目 \\
+Completion Queue (CQ) & 与 SQ 配对 & 控制器写入完成条目，触发中断 \\
+Doorbell 寄存器 & 每队列一对（SQ tail, CQ head） & 主机写 SQ tail doorbell 通知控制器有新命令 \\
+中断 & MSI-X, 最多 2048 个向量 & 每个 CQ 绑定一个中断向量→CPU 核；64K 是队列数上限，不是向量数上限 \\
+命令格式 & 64 字节（SQE） & 含 opcode, LBA, 长度, PRP/SGL 指针 \\
+完成格式 & 16 字节（CQE） & 含 status, command ID, SQ head pointer \\
+\bottomrule
+\end{longtable}
+
+这张表的核心思想是\hwkey{队列对}（queue pair）：主机驱动为每个 CPU 核建立一对位于主机内存的环形队列——\hwkey{提交队列}（Submission Queue, SQ）存放主机发出的 64 字节命令，\hwkey{完成队列}（Completion Queue, CQ）存放控制器写回的 16 字节结果。主机把命令写入 SQ 后，只需写一次 \hwkey{doorbell 寄存器}（门铃寄存器，SSD 上的一组 MMIO 寄存器，写它表示"队列尾部已推进"），控制器便通过 DMA 自行取走命令，主机不必逐条等待握手。数据缓冲区的物理地址以 \hwkey{PRP}（Physical Region Page，物理页指针列表）或 \hwkey{SGL}（Scatter-Gather List，"地址+长度"段的散列表）的形式随命令传给控制器；执行完毕后控制器把结果写入 CQ，再触发 \hwkey{MSI-X} 中断（消息信号中断：设备向约定的内存地址写入一条中断消息，由中断控制器转交 CPU，不需要专用中断引脚）。每核一对队列、各自独立，提交路径上没有任何共享锁。
+
+NVMe 命令到 NAND 操作的映射：
+
+\begin{lstlisting}
+NVMe Write command flow:
+  Host:
+    1. Build SQE: opcode=0x01, LBA=start, NLB=count, PRP=DMA address
+    2. Write SQE to SQ in host memory
+    3. Ring SQ tail doorbell (MMIO write to SSD BAR0)
+
+  SSD Controller:
+    4. Fetch SQE via PCIe DMA read
+    5. DMA read data from host memory (PRP/SGL)
+    6. FTL: L2P lookup → allocate free physical page
+    7. NAND program: ISPP sequence (0.5~2 ms)
+    8. Update L2P mapping; mark old physical page invalid
+    9. Write CQE to CQ in host memory
+    10. Assert MSI-X interrupt
+
+  Host:
+    11. ISR reads CQE, checks status, completes I/O
+
+NVMe Read command flow:
+    Similar but step 7 becomes: NAND read (25~130 us) + ECC decode
+    + DMA write data to host memory
+\end{lstlisting}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % === Host domain (left) ===
+  \draw[fill=BookTeal!5, line width=0.5pt, dashed] (-0.5,-2.0) rectangle (4.0,3.5);
+  \node[hw label, font=\small\bfseries] at (1.75,3.2) {主机 (Host)};
+  % CPU
+  \draw[fill=BookTeal!15, line width=0.5pt] (0.0,1.5) rectangle (1.6,2.6);
+  \node[hw label, font=\tiny] at (0.8,2.05) {CPU + 驱动};
+  % Host memory with SQ/CQ
+  \draw[fill=BookCodeBg, line width=0.5pt] (0.0,-0.5) rectangle (3.5,1.0);
+  \node[hw label, font=\tiny] at (1.75,0.75) {主机 DRAM};
+  \draw[BookTeal, line width=0.4pt] (0.3,0.0) rectangle (1.5,0.5);
+  \node[hw label, font=\tiny] at (0.9,0.25) {SQ};
+  \draw[BookAccent, line width=0.4pt] (2.0,0.0) rectangle (3.2,0.5);
+  \node[hw label, font=\tiny] at (2.6,0.25) {CQ};
+  % Data buffer
+  \draw[BookNavy, line width=0.4pt] (0.3,-0.4) rectangle (3.2,-0.1);
+  \node[hw label, font=\tiny] at (1.75,-0.25) {数据缓冲 (PRP/SGL)};
+
+  % === PCIe boundary ===
+  \draw[BookRed, line width=1.0pt, dashed] (4.5,-2.0) -- (4.5,3.5);
+  \node[BookRed, font=\tiny, rotate=90] at (4.7,0.75) {PCIe};
+
+  % === SSD domain (right) ===
+  \draw[fill=BookAccent!5, line width=0.5pt, dashed] (5.0,-2.0) rectangle (12.0,3.5);
+  \node[hw label, font=\small\bfseries] at (8.5,3.2) {SSD};
+  % Doorbell register
+  \draw[fill=BookAmber!20, line width=0.4pt] (5.3,1.8) rectangle (6.5,2.5);
+  \node[hw label, font=\tiny] at (5.9,2.15) {Doorbell\\(BAR0)};
+  % SSD Controller
+  \draw[fill=BookAccent!15, line width=0.5pt] (7.0,0.5) rectangle (9.5,2.8);
+  \node[hw label, font=\small\bfseries] at (8.25,2.5) {SSD 控制器};
+  % Internal blocks
+  \draw[BookAccent, line width=0.3pt] (7.3,1.6) rectangle (9.2,2.1);
+  \node[hw label, font=\tiny] at (8.25,1.85) {命令解析 + DMA 引擎};
+  \draw[BookAccent, line width=0.3pt] (7.3,0.8) rectangle (9.2,1.3);
+  \node[hw label, font=\tiny] at (8.25,1.05) {FTL (L2P 映射)};
+  % DRAM cache
+  \draw[fill=BookNavy!15, line width=0.4pt] (7.5,-0.5) rectangle (9.0,0.2);
+  \node[hw label, font=\tiny] at (8.25,-0.15) {DRAM 缓存};
+  % NAND channels
+  \draw[fill=BookCodeBg, line width=0.5pt] (10.0,-1.5) rectangle (11.7,2.8);
+  \node[hw label, font=\tiny] at (10.85,2.5) {NAND};
+  \foreach \y in {-1.0, -0.3, 0.4, 1.1, 1.8} {
+    \draw[BookTeal, line width=0.3pt] (10.2,\y) rectangle (11.5,\y+0.5);
+  }
+  \node[hw label, font=\tiny] at (10.85,-1.3) {ch0\quad ch1\quad $\cdots$\quad ch7};
+
+  % === Numbered flow arrows ===
+  % Step 1: CPU writes SQE
+  \draw[BookTeal, line width=0.6pt, ->] (0.8,1.5) -- (0.8,0.5);
+  \node[BookTeal, font=\tiny\bfseries] at (0.4,1.0) {\textcircled{1}};
+  % Step 2: Ring doorbell (crosses PCIe)
+  \draw[BookAmber, line width=0.6pt, ->] (1.6,2.0) -- (5.3,2.15);
+  \node[BookAmber, font=\tiny\bfseries] at (3.5,2.4) {\textcircled{2} ring};
+  % Step 3: DMA fetch SQE（正交：底部通道绕到 SQ 左边，不穿 CQ 框）
+  \draw[BookAccent, line width=0.6pt, ->] (7.0,1.8) -- (6.6,1.8) -- (6.6,-0.75) -- (-0.2,-0.75) -- (-0.2,0.25) -- (0.3,0.25);
+  \node[BookAccent, font=\tiny\bfseries] at (3.3,-0.98) {\textcircled{3} DMA};
+  % Step 4: DMA data transfer（正交，入数据缓冲右边）
+  \draw[BookNavy, line width=0.6pt, ->] (7.0,1.5) -- (6.3,1.5) -- (6.3,-0.25) -- (3.2,-0.25);
+  \node[BookNavy, font=\tiny\bfseries] at (5.1,-0.02) {\textcircled{4} data};
+  % Step 5: NAND program
+  \draw[BookTeal, line width=0.6pt, ->] (9.5,1.5) -- (10.0,1.5);
+  \node[BookTeal, font=\tiny\bfseries] at (9.75,1.8) {\textcircled{5}};
+  % Step 6: CQE（正交，从上方通道入 CQ 顶边）+ MSI-X
+  \draw[BookRed, line width=0.6pt, ->] (7.0,0.6) -- (6.0,0.6) -- (6.0,1.15) -- (2.9,1.15) -- (2.9,0.5);
+  \node[BookRed, font=\tiny\bfseries] at (5.3,1.37) {\textcircled{6} CQE};
+  \draw[BookRed, line width=0.5pt, ->] (2.6,0.0) -- (2.6,1.5) -- (1.6,1.8);
+  \node[BookRed, font=\tiny\bfseries] at (3.0,1.0) {\textcircled{7} MSI-X};
+
+  % Legend
+  \node[hw label, text width=11cm] at (6.0,-2.6) {NVMe 写命令全流程：\textcircled{1}CPU 写 SQE 到 SQ；\textcircled{2}MMIO 写 doorbell；\textcircled{3}控制器 DMA 取 SQE；\textcircled{4}DMA 搬数据；\textcircled{5}NAND 编程；\textcircled{6}写 CQE；\textcircled{7}MSI-X 中断通知完成。};
+\end{pdfdiagram}
+\diagramnote{NVMe 命令处理流程。64K 队列 $\times$ 64K 深度允许数万条命令同时在途（in-flight），远超 AHCI 的单队列 32 深度。多队列可绑定到不同 CPU 核，消除锁竞争。}
+
+%======================================================================
+\topic{Multi-plane 与 Multi-die 并行}
+
+单颗 NAND die 的内部带宽有限（一次页编程 16\,KiB / 1\,ms = 16\,MB/s）。SSD 通过多层并行叠加带宽：
+
+\begin{longtable}{L{0.2\linewidth}L{0.2\linewidth}L{0.24\linewidth}L{0.26\linewidth}}
+\toprule
+并行层级 & 并行度 & 操作方式 & 带宽提升 \\
+\midrule
+Multi-plane & 2--4 plane/die & 同一 die 内多 plane 同时编程/读 & 2--4$\times$ \\
+Multi-die (LUN) & 2--4 die/pkg & 不同 die 独立执行命令 & 再 2--4$\times$ \\
+Multi-channel & 4--8 ch & 控制器多通道并行 & 再 4--8$\times$ \\
+Multi-CE & 2--4 CE & 多芯片使能（封装级） & 再 2--4$\times$ \\
+\bottomrule
+\end{longtable}
+
+\hwkey{Cache program}：NAND 支持"缓存编程"——每个 plane 内有 cache register 和 page register 两级缓冲。当一页数据正在从 page register 向存储阵列执行内部编程（ISPP 序列）时，控制器可以把下一页的数据预先加载到 cache register 中；当前页编程完成后，cache register 的内容转存到 page register，立即开始下一页编程。这样数据传输（host $\to$ cache register）与 NAND 内部编程流水重叠，隐藏编程延迟。
+
+\hwkey{Cache read}：类似地，当一个 die 正在输出数据时，另一个 die 可以同时执行内部读操作（sense），重叠读延迟。
+
+\hwevidence{高端企业级 SSD（如 8 通道 $\times$ 4 die/ch $\times$ 4 plane/die = 128 路并行）顺序读带宽可达 14\,GB/s（PCIe 5.0 $\times$4），随机读 IOPS（每秒 I/O 操作数）可达 2--3M。}
+
+%======================================================================
+\topic{Read Retry 与 Soft-bit 读}
+
+当默认读参考电压 $V_{ref}$ 无法正确区分相邻状态时（由于保持退化、读干扰或编程干扰导致 $V_{th}$ 分布偏移），控制器执行\hwkey{读重试}（Read Retry）：
+
+\begin{lstlisting}
+Read retry sequence:
+  1. Default read: use nominal Vref → ECC decode
+  2. If ECC fails (uncorrectable):
+     Shift Vref by +delta or -delta (e.g. +/- 0.1~0.3 V)
+     Re-read page with shifted Vref → ECC decode
+  3. Repeat with different offsets (typical 8~16 retry levels)
+  4. If all retries fail → use soft-bit read + LDPC soft decoding
+
+  Retry table: NAND vendor provides optimal Vref shift sets
+  (different tables for different P/E cycle ranges and temperatures)
+\end{lstlisting}
+
+之所以要按 P/E 区间和温度换用不同的偏移表，是因为 $V_{th}$ 分布漂移的方向和幅度随二者变化：P/E 次数越多，氧化层损伤越重，分布整体下移且展宽；温度则同时影响隧穿速率与陷阱占据。查表给出最接近当前状态的起点，可以把重试次数减到最少。
+
+\hwkey{Soft-bit 读}（Soft-bit read / soft-decision read）：硬判决只回答"这个 bit 是 0 还是 1"，软判决还要回答"有多确定"。做法是在标称 $V_{ref}$ 附近多个偏移位置各读一次，把多次结果合成每个 bit 的可靠性信息，量化为\hwkey{对数似然比}（Log-Likelihood Ratio, LLR——判 0 与判 1 的概率之比取对数：符号给出判决方向，绝对值给出置信度，靠近分布边界的单元 $|$LLR$|$ 小）：
+
+\begin{lstlisting}
+Soft-bit read for LDPC:
+  Read at Vref - delta  → result A
+  Read at Vref          → result B (hard decision)
+  Read at Vref + delta  → result C
+
+  LLR estimation per bit:
+    If A=B=C: high confidence (|LLR| large)
+    If A!=B or B!=C: low confidence (|LLR| small, near boundary)
+
+  Feed LLR values to LDPC decoder as soft input
+  → significantly improves correction capability vs hard-decision only
+\end{lstlisting}
+
+%======================================================================
+\topic{LDPC ECC：为什么 BCH 不够用}
+
+随着 TLC/QLC 的状态间距缩小和 P/E 退化，原始误码率（Raw Bit Error Rate, RBER）从 SLC 的 $10^{-9}$ 上升到 TLC 的 $10^{-3}$--$10^{-4}$（寿命末期）。传统 \hwkey{BCH} 码（Bose-Chaudhuri-Hocquenghem 码，一类基于有限域代数的循环纠错码，译码时用确定性的代数方法一步算出错误位置，如 24-bit/1KiB）已无法纠正如此高的错误率。
+
+\hwkey{LDPC}（Low-Density Parity-Check，低密度奇偶校验）码成为 TLC/QLC NAND 的标配 ECC。其校验矩阵中 1 的密度极低，因此可以在变量节点与校验节点之间反复传递置信度、迭代译码，并且天然能利用 soft-bit 读提供的 LLR 软信息——同样的码长下，软判决 LDPC 的纠错能力远超硬判决 BCH，代价是译码延迟和功耗更高：
+
+\begin{longtable}{L{0.24\linewidth}L{0.28\linewidth}L{0.38\linewidth}}
+\toprule
+特性 & BCH（旧） & LDPC（现代） \\
+\midrule
+纠错能力 & 24--72 bit/1KiB & 120--240 bit/1KiB \\
+译码方式 & 硬判决，代数译码 & 迭代译码（belief propagation） \\
+软判决支持 & 不支持 & 支持（利用 LLR 信息） \\
+译码延迟 & 低（$\mu$s 级） & 较高（迭代 10--50 次） \\
+适合 RBER & $<$10$^{-5}$ & 10$^{-3}$--10$^{-4}$（TLC/QLC 寿命末期） \\
+开销 & 5--8\% & 8--15\%（parity 页） \\
+\bottomrule
+\end{longtable}
+
+LDPC 迭代译码过程：
+
+\begin{lstlisting}
+LDPC iterative decoding (simplified):
+  Input: soft-decision LLR values from NAND read (soft-bit read)
+  Parity check matrix H (sparse, stored in controller ROM)
+
+  Iteration (repeat 10~50 times):
+    1. Variable nodes → Check nodes: send messages (LLR updates)
+    2. Check nodes → Variable nodes: apply parity constraints, update messages
+    3. Variable nodes: accumulate all incoming messages + channel LLR
+    4. Hard decision: sign of accumulated LLR → decoded bit
+    5. Syndrome check: H * decoded_word == 0? → if yes, SUCCESS
+
+  If all iterations fail → uncorrectable → report UECC to host
+  (or trigger read retry with different Vref offsets, then re-decode)
+\end{lstlisting}
+
+\hwevidence{典型 TLC SSD 使用 LDPC 码率 15/16 或 13/15，纠错能力 120--160 bit/1KiB。配合 soft-decision read，可在 RBER = 4$\times$10$^{-3}$ 时仍可靠译码。QLC 需要更强码率（如 12/15）和更多迭代次数。}
+
+%======================================================================
+\topic{NAND 操作时序总览}
+
+把本节所有操作的时间尺度汇总：
+
+\begin{longtable}{L{0.24\linewidth}L{0.2\linewidth}L{0.2\linewidth}L{0.26\linewidth}}
+\toprule
+操作 & SLC & TLC & QLC \\
+\midrule
+页读（page read） & 25\,$\mu$s & 60--90\,$\mu$s & 90--130\,$\mu$s \\
+页编程（page program） & 200--300\,$\mu$s & 0.5--2\,ms & 1--3\,ms \\
+块擦除（block erase） & 1.5--2\,ms & 3--5\,ms & 4--7\,ms \\
+读重试（per retry） & +25\,$\mu$s & +60\,$\mu$s & +90\,$\mu$s \\
+P/E 寿命 & 100K & 1K--3K & 500--1K \\
+数据保持（新片） & 10 年 & 1--5 年 & 1--3 年 \\
+\bottomrule
+\end{longtable}
+
+这些时间尺度决定了 SSD 控制器的所有设计决策：读延迟在 $\mu$s 级（比 DRAM 慢 1000 倍但比 HDD 快 100 倍），编程延迟在 ms 级（必须用队列和并行隐藏），擦除延迟更大（必须在后台异步执行）。FTL、NVMe 队列、multi-plane/die 并行、SLC 缓存——所有这些机制都是为了在 NAND 的物理限制之上，向主机呈现一个低延迟、高带宽、可随机写的块设备抽象。
+
+主存、总线和 DMA 已经讲完，本章看设备本身。磁盘按块搬运，网络按帧到达，它们的速度都比内存慢几个数量级，而且慢的方式完全不同：闪存能读快写慢还有寿命问题，机械盘怕寻道，网络怕突发。但它们的接入方式惊人地一致——操作系统准备好队列和描述符，设备通过 DMA 搬运，完成后再通知。理解外设，一半在理解介质，一半在理解这套队列机制怎样把慢介质藏在高吞吐后面。
+
+\begin{longtable}{L{0.16\linewidth}L{0.36\linewidth}L{0.38\linewidth}}
+\toprule
+设备 & 介质的脾气 & 队列机制要解决什么 \\
+\midrule
+SSD & 读快写慢、擦除单位大、有寿命 & 写放大、FTL、磨损均衡 \\
+机械硬盘 & 寻道和旋转是毫秒级 & 调度合并、NCQ、顺序化 \\
+网卡 & 帧突发、线速不可退 & 描述符环、中断聚合、多队列 \\
+\bottomrule
+\end{longtable}
+
+\begin{keyidea}
+外设性能的本质是"让介质按其擅长的方式工作，让队列吸收其不擅长的部分"。读外设文档时，先问介质的物理限制是什么，再看队列机制怎样弥补。
+\end{keyidea}
+
+\section{二、SSD 与闪存的硬件特性}
+
+第一节把块设备当成"按号寻址的线性数组"，那是接口视角。
+本节打开 SSD 的盖子看介质：NAND 闪存的读、写、擦三个操
+作各有各的粒度，谁也不迁就谁——读按页、写按页、擦按块，
+改写不许原地进行。为了让线性数组的承诺在这种介质上成立，
+SSD 内部跑着一整套地址翻译、垃圾回收与磨损均衡软件，盘
+里那颗控制器的算力超过最后的教学计算机项目的整机。
+
+\topic{NAND 闪存的页写块擦}
+NAND 闪存的存储单元是浮栅（或电荷俘获）晶体管：绝缘层
+里困住的电子改变阈值电压，读出时给控制栅加参考电压、看
+沟道导不导通，就知道这一位是 0 还是 1。一个单元存几位，
+决定同一片硅的容量、速度与寿命：
+
+\begin{longtable}{L{0.1\linewidth}L{0.14\linewidth}L{0.12\linewidth}L{0.26\linewidth}L{0.24\linewidth}}
+\toprule
+类型 & 每单元位数 & 阈值档位 & P/E 循环量级 & 典型去处 \\
+\midrule
+SLC & 1 & 2 & 约 $10^{5}$ 次 & 设备缓存、企业特殊款 \\
+MLC & 2 & 4 & 约 $3\times10^{3}$-$10^{4}$ 次 & 早期主流，现多见于工业盘 \\
+TLC & 3 & 8 & 约 $10^{3}$-$3\times10^{3}$ 次 & 当前消费与数据中心主流 \\
+QLC & 4 & 16 & 数百次 & 大容量、读多写少 \\
+\bottomrule
+\end{longtable}
+
+位数越多，阈值电压要分清的档位越多：TLC 是 $2^{3}=8$ 档，
+QLC 是 16 档。写入时把电压逐档调准的时间越长，读出时分
+辨档位的余量越小，单元能经受的擦写次数也越少——容量、
+速度、寿命在同一条曲线上取舍，没有白捡的密度。闪存还有
+NOR 一派：支持按字节随机读，用来存固件，但密度低、成本
+高；U 盘、SD 卡、eMMC、SSD 全是 NAND 一派——牺牲随机字
+节访问换密度，再用控制器把粒度差藏起来。本章说的"闪存"
+默认指 NAND。
+
+怪脾气集中在三个操作的粒度上，而且粒度由物理直接给定：
+
+\begin{longtable}{L{0.12\linewidth}L{0.26\linewidth}L{0.2\linewidth}L{0.3\linewidth}}
+\toprule
+操作 & 粒度 & 时延量级 & 物理原因 \\
+\midrule
+读 & 页，4-16 KiB & 25-100 $\mu$s & 一页共享字线，整页同时选通 \\
+编程（写） & 页，只能 1 写成 0 & 数百 $\mu$s 到约 1 ms & 逐档校准阈值电压，TLC 调 8 档 \\
+擦除 & 块，256 KiB-4 MiB & 数 ms & 高压加在整个块的衬底上，按块放电子 \\
+\bottomrule
+\end{longtable}
+
+编程只能把 1 写成 0，想让任何一位回到 1 必须擦除；擦除
+高压施加在整个块共用的衬底上，单独擦一页等于给每页配隔
+离与高压通路，芯片面积与可靠性都不答应——块做得越大，
+摊到每字节上的外围电路越少，擦除块一路长到数 MiB 正是
+这条经济学。三条合起来就是"页写块擦"：写以页为单位，一
+页在两次擦除之间只能写一次；擦以块为单位，一块几百页同
+生共死。"改写"这个词在闪存里因此失去含义：把一页从 A 改
+成 B 不能原地进行，原页里的 0 变不回 1。唯一的出路是把
+B 写到另一页、把旧页标记为无效，攒够一整块无效页后一起
+擦除。闪存天生是一种"只许追加、不许原地改"的介质。与主
+存对照数量级：读一页约 50 $\mu$s，是 DRAM 读的约 500 倍；
+写一页约 1 ms，是 DRAM 写的约一万倍——SSD"读快写慢"的
+物理出处就在这里。
+
+寿命限制同样来自物理。每次擦除的高压都磨损浮栅外的隧穿
+氧化层，磨到电子关不住，块就报废。注意寿命的单位是每块：
+一块 2 MiB 的块按 1000 次 P/E 计，一生承担 2 GiB 写入；
+整盘寿命是全部块寿命之和。这个"按块计"给后面的磨损均衡
+出了题目：谁让擦除集中到少数块上，谁就先杀死整块盘。另
+有两条次要脾气记在这里：同一块被读得太多会扰动相邻页
+（读干扰），数据放久了电荷会漏（保持力）——FTL 因此要
+定期巡检、搬动刷新，这是盘内又一份主机看不见的日常工
+作。
+
+\topic{FTL：闪存翻译层}
+主机要的接口是"按 LBA 原地改写的线性数组"，介质给的能
+力是"只许追加、按块擦除"，中间的鸿沟由 FTL（flash
+translation layer，闪存翻译层）填平。FTL 是跑在盘内控制
+器上的固件，日常工作四件事，每件对应介质的一条限制：
+
+\begin{longtable}{L{0.16\linewidth}L{0.3\linewidth}L{0.4\linewidth}}
+\toprule
+职责 & 对应的介质限制 & 做法 \\
+\midrule
+地址映射 & 不许原地改写 & 写新页、改映射、旧页标脏 \\
+空页供给 & 写前必须有已擦空块 & 预留空闲块池，随写随补 \\
+垃圾回收 & 擦按块、块内混有有效页 & 搬走有效页，再整块擦除 \\
+掉电恢复 & 映射表放在易失 DRAM & 定期写回闪存，凭日志重建 \\
+\bottomrule
+\end{longtable}
+
+第一件是映射表。FTL 维护从逻辑页号（LBA 按 4 KiB 折算）
+到物理页号的映射；主机写某个逻辑页，FTL 从不原地改，而
+是把数据写进当前可写块的下一个空页，把映射指向新页、旧
+页标脏。"改写 = 写新页 + 旧页标脏"，原地改写就这样被翻
+译成追加写。映射的粒度也有讲究：页级映射最灵活、表也最
+大；块级映射表小，但块内页偏移被锁死，改一页要动整块，
+现代盘几乎清一色选页级。表的体积可以算：256 GiB 的盘按
+4 KiB 分页，共 $2^{38}/2^{12}=2^{26}\approx6.7\times10^{7}$
+个逻辑页，每条映射 4 字节，整表 $2^{28}$ 字节 = 256 MiB
+——恰好是"每 GiB 容量配 1 MiB 表"的比例。这就是 SSD 要
+配 DRAM 的首要原因，256 GiB 的盘配 256 MiB 上下；无 DRAM
+的廉价盘把映射挤在小块 SRAM 和闪存里，或借主机内存
+（NVMe 的 HMB 机制）暂存，随机访问映射本身成了新的瓶颈。
+
+把介质的页块格局与 FTL 的翻译过程画在一起，"改写"在盘内
+的真实形态就清楚了：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=2.0cm] (host) at (1.05,0.35) {主机：改写逻辑页 L};
+  \node[hw compute, minimum width=3.4cm] (ftl) at (5.3,0.35) {FTL 映射表\\逻辑页 $\to$ 物理页};
+  \draw[hw bus] (host.east) -- (ftl.west);
+  \node[hw label, anchor=south] at (3.3,0.9) {改写请求};
+  % 块 A：原页所在块，内含若干页
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (0.5,-3.2) rectangle (4.1,-1.6);
+  \node[hw label] at (2.6,-1.85) {原页所在块};
+  \node[hw memory, minimum width=1.0cm, minimum height=0.66cm, fill=BookRed!10] (oldpage) at (1.15,-2.55) {旧页 L};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (2.35,-2.55) {页};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (3.45,-2.55) {页$\cdots$};
+  % 块 B：当前可写块，只许追加
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (6.1,-3.2) rectangle (9.7,-1.6);
+  \node[hw label] at (8.05,-1.85) {当前可写块};
+  \node[hw memory, minimum width=1.0cm, minimum height=0.66cm, fill=BookTeal!15] (newpage) at (6.85,-2.55) {新页 L};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (8.05,-2.55) {空页};
+  \node[hw memory, minimum width=0.8cm, minimum height=0.66cm] at (9.15,-2.55) {空页$\cdots$};
+  % FTL 的两条动作线：共享竖直干线，按 y 分层各自折出
+  \draw[hw bus] (ftl.south) -- (5.3,-1.1) -- (6.85,-1.1) -- (newpage.north);
+  \node[hw label, above] at (6.9,-1.1) {① 写新页、映射改指};
+  \draw[hw return] (ftl.south) -- (5.3,-0.72) -- (1.15,-0.72) -- (oldpage.north);
+  \node[hw label, above] at (3.2,-0.72) {② 旧页标脏};
+  \node[hw label, text width=9.4cm] at (5.2,-3.85) {块（256 KiB--4 MiB）内含数百页（4--16 KiB）；无效页攒满一整块后，垃圾回收搬走仍有效的页、整块擦除、收回空块。};
+\end{pdfdiagram}
+\diagramnote{NAND 闪存的页写块擦与 FTL 地址映射。主机以为自己原地改写了逻辑页 L；盘内实际是两步：FTL 把数据写进当前可写块的下一个空页、映射改指新页，旧页标脏等待回收。无效页攒满一整块后，垃圾回收搬走仍有效的页、整块擦除、收回空块——追加写加周期性回收，就是 SSD 在只许追加的介质上提供原地改写接口的全部机制。}
+
+第二件是空页供给：追加写需要源源不断的已擦空块，FTL 平
+时预留若干，写完再补。第三件因此必然登场——垃圾回收
+（garbage collection，GC）：无效页攒多了，挑一个无效页
+占比高的块，把仍有效的页读出、搬进新块，再整块擦除回收。
+读、搬、擦全在盘内悄悄进行，主机只看到 LBA 数组一切如常，
+只是时延偶尔抖一下。第四件是掉电恢复：映射表在 DRAM 里，
+FTL 要定期把表与变更日志写回闪存，断电后凭日志重建，否
+则一次意外掉电就是一块砖。
+
+四件事合起来看，SSD 里的控制器名不副实：它远不止"控制"，
+那是一颗多核 ARM 级处理器，跑着带映射管理、GC、磨损均衡、
+坏块替换、掉电重建的完整软件，配的 DRAM 比最后的教学计算机项目整台教
+学机的主存大几个数量级。买一块 SSD 等于买回一台专用小计
+算机，它的全部工作是让 NAND 假装成一块可以原地改写的磁
+盘。下一节会看到，机械盘的控制器同样不闲，只是忙的方向
+相反——不是躲开介质的限制，而是迎合介质的转动。
+
+\topic{写放大的计算}
+GC 搬运的有效页本身是额外的闪存写入：主机没让它们发生，
+FTL 为了让介质继续可用不得不写。写放大（write
+amplification，WA）把这笔开销量化：
+
+\begin{lstlisting}
+WA = 实际写入闪存的总量 / 主机写入的总量
+\end{lstlisting}
+
+WA = 1 是理想值：主机写多少，介质写多少，GC 零搬运。顺
+序写满一块再整块改写的负载就接近它——改写让整块的页同
+时失效，回收时没有有效页可搬，擦掉即可。WA 大于 1 的部
+分，全是 GC 搬家的运费。
+
+具体算一次。设块含 256 页，某块一半（128 页）有效、一半
+已无效。回收它：128 个有效页读出并写入新块，闪存写入
+128 页；擦掉旧块得 256 个空页，其中 128 页被搬来的数据
+占用，剩 128 页供主机写新数据。等主机写满这 128 页盘点：
+主机写入 128 页，闪存实际写入 $128+128=256$ 页，WA
+$=256/128=2$。有效页占一半，写放大恰为 2 倍。一般化只
+剩一步：块内有效页比例为 $v$ 时，回收一块要搬 $vN$ 页、
+腾出 $(1-v)N$ 页给主机：
+
+\begin{lstlisting}
+WA = (vN + (1-v)N) / ((1-v)N) = 1 / (1 - v)
+\end{lstlisting}
+
+$v$ 每涨一点，代价不是线性涨，是倒数式地涨：
+
+\begin{longtable}{L{0.22\linewidth}L{0.14\linewidth}L{0.48\linewidth}}
+\toprule
+有效页比例 $v$ & WA & 直观画面 \\
+\midrule
+0 & 1 & 无页可搬，擦掉即可（顺序改写的尽头） \\
+0.25 & 约 1.33 & 搬 1 页换 3 页空位 \\
+0.5 & 2 & 搬一页换一页，写一倍送一倍 \\
+0.9 & 10 & 接近写满的盘做随机写 \\
+\bottomrule
+\end{longtable}
+
+把 $v=0.5$ 那一行画成过程图，"搬一页换一页"的运费
+就看得见了：
+
+\begin{pdfdiagram}
+  % 待回收块
+  \node[hw label, anchor=south] at (2.1,0.08) {待回收块：256 页};
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (0.4,-0.2) rectangle (3.8,-2.0);
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm, fill=BookTeal!15] (va) at (1.3,-1.3) {有效\\128 页};
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm, fill=BookRed!10] (ia) at (3.0,-1.3) {无效\\128 页};
+  % 新块
+  \node[hw label, anchor=south] at (8.9,0.08) {新块};
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (7.2,-0.2) rectangle (10.6,-2.0);
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm, fill=BookTeal!15] (vb) at (8.1,-1.3) {搬入\\128 页};
+  \node[hw memory, minimum width=1.4cm, minimum height=0.72cm] (hb) at (9.8,-1.3) {主机新写\\128 页};
+  % ① 搬运：左侧出框、顶部通道，再竖直落入新块
+  \draw[hw bus] (va.west) -- (0.22,-1.3) -- (0.22,0.72) -- (8.1,0.72) -- (vb.north);
+  \node[hw label, anchor=south] at (4.7,0.78) {① 有效页读出、写入新块：闪存写 128 页};
+  % ② 主机写满余下空页
+  \draw[hw bus] (9.8,-2.75) -- (hb.south);
+  \node[hw label, anchor=north] at (9.8,-2.85) {② 主机写入 128 页};
+  % ③ 整块擦除
+  \draw[hw bus] (2.1,-2.0) -- (2.1,-3.05);
+  \node[hw label, anchor=west] at (2.3,-2.55) {③ 整块擦除};
+  \draw[BookRule, line width=0.42pt, dashed, rounded corners=2pt] (0.6,-3.15) rectangle (3.6,-3.95);
+  \node[hw label] at (2.1,-3.55) {空块：256 页全部可写};
+  % 盘点
+  \node[hw label] at (5.5,-4.6) {主机写入 128 页，闪存实际写入 $128+128=256$ 页 $\Rightarrow$ WA $=256/128=2$};
+\end{pdfdiagram}
+\diagramnote{一次 GC 的完整过程（块含 256 页、一半有效）。回收：128 个有效页读出并写入新块，这是主机没有要求的闪存写入；旧块整块擦除，换回 256 个空页，其中 128 页被搬来的数据占用，剩 128 页供主机写新数据。等主机写满盘点：主机写 128 页，介质写 256 页，WA 恰为 2——有效页占一半，写一倍送一倍。}
+
+随机写为什么放大更严重，看 $v$ 的下场就知道。顺序写把失
+效集中到少数块上：文件被顺序覆盖，整块一起变脏，$v$ 趋
+于 0、WA 趋于 1。均匀随机写把失效撒到所有块上：每个块
+都攒一点无效页，又都剩一堆有效页，长期稳态下各块的 $v$
+收敛到同一高位——盘越满，$v$ 越高。剩余空间只有一成的
+盘，各块平均 $v\approx0.9$，按上式 WA 逼近 10：主机每写
+1 GiB，介质实际承受约 10 GiB。GC 挑块因此遵循贪心原则：
+优先回收无效页最多的块，同样换回一个空块，$v=0.1$ 的块
+只搬一成，$v=0.9$ 的块要搬九成。GC 的时机也影响体验：
+空闲时做的后台 GC 主机无感，写路径上被空块耗尽逼出来的
+同步 GC 则直接拖慢当次写——同一笔写放大，前者藏在空闲
+里，后者变成时延尖峰。同一个"随机写"，在“冒险、异常与性能”一章只是时延
+问题，在闪存这里同时是寿命问题：放大几倍，P/E 预算就被
+多吃几倍。工程上的缓冲垫是预留空间（overprovisioning）：
+盘内实装闪存多于标称容量，消费盘多留约 7\%，企业盘留到
+28\% 上下，差额直接压低 $v$ 的有效值，把稳态 WA 降回个
+位数。消费 TLC 盘还有一招 SLC 缓存：拿一部分闪存按 SLC
+模式用，突发写先进缓存、空闲时再腾进 TLC，缓存打穿后的
+"缓外速度"才是介质的真速度。
+
+\topic{磨损均衡与寿命}
+写放大吃掉的是寿命预算，而 P/E 次数按块计：写入分布不
+均，少数块先被擦穿，整盘提前报废。磨损均衡（wear
+leveling）的任务是把擦除次数在所有块之间摊平。动态磨损
+均衡只盯活跃数据：每次分配空块时挑擦除次数最少的，新写
+入自然流向年轻块。它对冷数据无效——一批文件写进去三年
+不动，占着的块擦除次数恒为零，剩下的块继续挨打。静态磨
+损均衡连冷数据也搬：定期把长期不改写的数据挪到擦除次数
+多的块里"养老"，把年轻块换出来轮换。消费盘多做动态加有
+限的静态，企业盘两者做足；注意均衡搬运同样计入写放大，
+寿命的公平本身是花钱买的。坏块管理走的是同一条备用通道：
+出厂坏块与使用中长出的坏块都由备用块池顶替，顶替一次，
+可用块与预留空间就少一分。
+
+把擦除次数按块排成直方图，均衡与不均衡的差距一眼见底：
+
+\begin{pdfdiagram}
+  % 左：只有动态均衡
+  \node[hw label] at (2.55,2.85) {只有动态均衡：热块先被擦穿};
+  \draw[BookMuted, line width=0.6pt] (0.4,0) -- (4.7,0);
+  \filldraw[fill=BookRed!25, draw=BookRed, line width=0.5pt] (0.475,0) rectangle (0.925,2.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (1.095,0) rectangle (1.545,2.1);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (1.715,0) rectangle (2.165,1.7);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (2.335,0) rectangle (2.785,1.3);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (2.955,0) rectangle (3.405,0.9);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (3.575,0) rectangle (4.025,0.45);
+  \filldraw[fill=BookAmber!20, draw=BookAmber, line width=0.5pt] (4.195,0) rectangle (4.645,0.12);
+  \draw[BookRed, line width=0.5pt, dashed] (0.4,2.25) -- (4.7,2.25);
+  \node[hw label, anchor=west, text=BookRed] at (4.78,2.25) {P/E 预算};
+  \node[hw label, anchor=north] at (0.7,-0.12) {热};
+  \node[hw label, anchor=north] at (4.42,-0.12) {冷};
+  \node[hw label] at (2.55,-0.75) {新写入总挑年轻块：热块反复被分配};
+  \node[hw label] at (2.55,-1.35) {冷块擦除次数恒为零，少数块先撞预算};
+  % 右：加静态均衡
+  \node[hw label] at (8.35,2.85) {加静态均衡：擦除次数摊平};
+  \draw[BookMuted, line width=0.6pt] (6.2,0) -- (10.5,0);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (6.275,0) rectangle (6.725,1.55);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (6.895,0) rectangle (7.345,1.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (7.515,0) rectangle (7.965,1.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (8.135,0) rectangle (8.585,1.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (8.755,0) rectangle (9.205,1.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (9.375,0) rectangle (9.825,1.45);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (9.995,0) rectangle (10.445,1.45);
+  % 冷数据搬向高计数块
+  \draw[hw return] (10.22,1.7) -- (10.22,2.45) -- (6.6,2.45) -- (6.6,1.7);
+  \node[hw label, anchor=south] at (8.4,2.5) {冷数据搬进高计数块};
+  \node[hw label] at (8.35,-0.75) {年轻块换出来承接新写，各块摊平};
+  \node[hw label] at (8.35,-1.35) {均衡搬运本身计入写放大};
+\end{pdfdiagram}
+\diagramnote{磨损均衡前后的擦除次数分布（块按擦除次数排列）。只有动态均衡时，新写入总挑擦除次数最少的块，热数据块反复被分配、先撞到 P/E 预算，而冷数据占着的块擦除次数恒为零——少数块先擦穿，整盘提前报废。静态磨损均衡定期把长期不改写的冷数据搬进擦除次数多的块里"养老"，把年轻块换出来轮换，各块擦除次数被摊平；均衡搬运本身计入写放大，寿命的公平是花钱买的。}
+
+盘厂把寿命预期做成一个标称值：TBW（total bytes
+written），承诺"累计主机写入达到此数之前，盘在规格内工
+作"。它按主机写入计、不按闪存实际写入计——写放大是盘
+厂自己的成本，TBW 是给用户的承诺。拿 TBW 反推每日预算
+是一道除法。例：256 GB 消费盘，TBW 150 TB，每天写
+40 GB：
+
+\begin{lstlisting}
+寿命 = 150 TB / (40 GB/天) = 150000 / 40 = 3750 天，约 10.3 年
+\end{lstlisting}
+
+约十年，超过多数机器的服役期——前提写在算式背后：WA
+低、负载里没有集中的擦写热点。同一张标称，不同的每日写
+入量对应完全不同的寿命预期：
+
+\begin{longtable}{L{0.2\linewidth}L{0.2\linewidth}L{0.2\linewidth}}
+\toprule
+每天写入量 & 预算天数 & 折合年限 \\
+\midrule
+20 GB & 7500 天 & 约 20.5 年 \\
+40 GB & 3750 天 & 约 10.3 年 \\
+100 GB & 1500 天 & 约 4.1 年 \\
+500 GB & 300 天 & 约 0.8 年 \\
+\bottomrule
+\end{longtable}
+
+同一道题换个角度更有意思：150 TB 相当于把 256 GB 的盘写
+满约 $150\,000/256\approx586$ 次，而 TLC 的 P/E 预算还有
+1000-3000 次——标称值留出的安全边，正是给写放大与均衡
+搬运预备的。若负载让 WA 长期停在 3，同样的主机写入量下，
+闪存实际承受约 $586\times3\approx1760$ 次全盘擦写，落在
+TLC 预算中段。这也让"TBW 相同的两块盘，体质可能差几倍"
+有了定量含义：标称一样，WA 不同，介质实际寿命就不同。
+
+规格书里的配套指标 DWPD（drive writes per day，保修期内
+每天可把整盘写几遍）与 TBW 是同一笔账的两种记法：上例每
+天 40 GB 合 $40/256\approx0.16$ DWPD，五年保修累计约
+$40/256\times365\times5\approx285$ 次全盘写入，仍在 586 次
+标称之内。读寿命规格时先分清它在报哪一个，再换算成自己
+的每日写入量，比直接比数字可靠。温度是另一个隐形变量：
+电荷保持力随温度升高而下降，消费盘的保持力标称大致是
+"断电后 30 摄氏度存放一年"；FTL 的定期巡检刷新正是为这
+条曲线兜底，刷新本身也耗 P/E，又一笔主机看不见的磨损。
+
+\topic{TRIM 与稳态性能}
+最后一个机制同时解释"盘为什么越用越慢"和"为什么能慢得
+不那么狠"。文件系统删除文件时只改自己的元数据，从不通知
+盘——机械盘时代这是美德，老数据原地留着，误删还能恢复。
+对 SSD 这却意味着两个世界脱节：文件早删了，FTL 还当那些
+页是有效数据，GC 照样把它们当宝贝搬走，写放大白白上涨。
+盘越用越满，$v$ 越高，WA 沿 $1/(1-v)$ 爬升，随机写越来
+越慢——"盘满变慢"的全部机理就在此。
+
+TRIM 是补上脱节的命令：文件系统删文件、释放区间时，顺手
+给盘发一条 TRIM（ATA 里是 DATA SET MANAGEMENT 命令的
+TRIM 属性，NVMe 里是 Dataset Management 的 deallocate），
+告知这段 LBA 不再使用。FTL 收到后直接把这些页标记无效，
+下次 GC 它们与从没写过一样，不必再搬。TRIM 不改变任何物
+理规律，只改变 FTL 的信息量：$v$ 从此按真实值算，而不是
+按"文件系统有史以来写过的所有页"算。顺带一提，被 TRIM
+的页读回什么由盘决定（不少盘返回全零），指望删除后还能
+恢复文件的软件从此失业。下发时机有两派：挂载选项
+\code{discard} 每次删除即时下发，简单但每次删除多一笔命
+令开销；\code{fstrim} 定时任务攒一批区间一起发，是多数
+发行版的默认。
+
+把出厂态与稳态摆在一起，差距一眼见底：
+
+\begin{longtable}{L{0.26\linewidth}L{0.2\linewidth}L{0.14\linewidth}L{0.26\linewidth}}
+\toprule
+状态 & 空块来源 & WA 量级 & 4 KiB 随机写 IOPS 量级 \\
+\midrule
+出厂态（新盘） & 全部块空闲 & 1 & 数万 \\
+稳态，有 TRIM 与预留 & GC 回收 & 2-3 & 万级 \\
+稳态，无 TRIM 且盘满 & GC 反复搬运 & 5-10 & 千级，伴随时延尖峰 \\
+\bottomrule
+\end{longtable}
+
+新盘所有块皆空，写请求直接编程空页，WA = 1；持续随机写
+把盘推入稳态后，每次写都可能触发 GC，IOPS 按 WA 的倒数
+缩水，时延还伴随 GC 尖峰——主机在队列那头看到的现象、
+它对本章第五节尾延迟的含义，留到那时再算。企业盘规格书
+分报"出厂态"与"稳态"两组随机写数字，正因为它们本就是两
+个量；消费盘多半只报前者，读规格书时这是第一个要问的问
+题。要把整块盘拉回出厂态，手段是全盘擦除：ATA 的
+\code{SECURITY ERASE}、NVMe 的 Format/Sanitize，或对所有
+已用区间一次性 TRIM——映射表清空、块全部回收，WA 回到
+1；二手交易前的数据清除与性能恢复，是同一条命令的两份
+用途。
+
+稳态性能还有队列一侧的条件，用“冒险、异常与性能”一章的 Little 定律随手
+可算：4 KiB 随机读时延约 80 $\mu$s，队列深度 1 时吞吐上
+限是 $1/80\ \mu\mathrm{s}=12\,500$ IOPS，约 50 MB/s；想
+吃到 NVMe 标称的 50 万 IOPS，需要随时有
+$5\times10^{5}\times80\ \mu\mathrm{s}=40$ 个请求在途。这
+就是深队列存在的理由，也是"单线程跑不满 SSD"的正解——
+不是盘虚标，是队列深度不够。维护一块盘的长期性能，说到
+底三件事：留足空闲容量压低 $v$、打开 TRIM 让 FTL 知情、
+别把随机写当顺序写使。三条都不花钱，花的只是对介质脾气
+的理解。
+
+\section{三、NVMe 队列如何把块请求交给 SSD}
+
+NVMe 控制器通过 PCIe 接入系统。主机先在 DRAM 中建立 submission queue（SQ）与 completion queue（CQ），把它们的物理地址和深度写入控制器寄存器。提交一次读请求时，软件先填好 SQ 项，其中包含 opcode、namespace、逻辑块范围和目标缓冲区描述；随后执行必要的内存屏障，再写 MMIO doorbell 更新队尾。
+
+控制器看到 doorbell 后 DMA 读取命令和数据指针，访问 NAND/FTL，最后把完成项 DMA 写入 CQ，再更新完成相位并选择轮询或 MSI-X 通知。doorbell 写返回只说明寄存器事务完成，不代表数据已经到达内存。
+
+\begin{lstlisting}
+host memory: write SQ entry -> memory barrier -> ring doorbell
+controller:  DMA command -> execute media work -> DMA data
+completion:  write CQ entry -> interrupt/poll -> host consumes CQ
+\end{lstlisting}
+
+PRP 或 SGL 描述数据缓冲区的物理页列表。它们必须在命令有效期内保持固定并允许设备访问；IOMMU 映射、页锁定和完成后的解映射共同划定缓冲区所有权。队列深度提高并行度，但超过介质与控制器能并行处理的程度后，只会增加排队和尾延迟。
+
+\section{四、错误、复位与持久化边界}
+
+完成项中的状态码、命令标识和 SQ 标识决定主机能否把结果归还给正确请求。超时后不能立刻重用命令缓冲，因为旧控制器事务可能仍在路上；驱动通常先停止新提交、屏蔽通知、确认或复位队列，再按协议处理未完成请求。
+
+普通写完成可能只表示数据进入控制器易失缓存。需要持久化时，文件系统或数据库还要使用 FUA、FLUSH 等语义，并让控制器的断电保护或介质提交边界参与保证。性能数字必须说明测的是提交、完成还是持久化完成。

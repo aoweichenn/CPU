@@ -1,0 +1,588 @@
+\chapter{ISA、汇编与机器码}
+
+\begin{keyidea}
+ISA 是软件与处理器之间可长期保持的硬件契约。本章把指令编码、可见状态、条件码、调用约定和逐条执行 trace 对齐。
+\end{keyidea}
+
+\section{一、极小 ISA 与可接线数据通路}
+
+\topic{先规定一个极小 ISA，程序才能进入 ROM}为了让整机实验真正运行，需要把“指令”编码成固定 bit。下面是一种 16-bit 教学编码：高 4 bit 是 opcode，中间字段选择寄存器，低位可解释为寄存器号、立即数或分支偏移。寄存器字段 3 bit，即 R0–R7，其中 R0 固定为 0。它不是任何真实 ISA 的复制品，但足以把编码、译码、控制字和 ROM 内容连接起来。
+
+\begin{longtable}{L{0.13\linewidth}L{0.24\linewidth}L{0.3\linewidth}L{0.25\linewidth}}
+\toprule
+指令 & 编码格式 & 语义 & 需要的硬件路径 \\
+\midrule
+\code{ADD Rd, Rs} & \code{0001 d a b ---} & \code{R[d]=R[d]+R[b]} & 双读端口、ALU、写回 \\
+\code{MOV Rd, imm8} & \code{0010 d x imm8} & \code{R[d]=zero_extend(imm8)} & 立即数扩展、写回 \\
+\code{MOV Rd, [Ra+off4]} & \code{0011 d a off4 --} & \code{R[d]=MEM[R[a]+off4]} & 地址形成、读存储、写回 \\
+\code{MOV [Ra+off4], Rs} & \code{0100 s a off4 --} & \code{MEM[R[a]+off4]=R[s]} & 地址形成、写数据、字节使能 \\
+\code{JZ} & \code{0101 r x off8} & 若 \code{R[r]==0}，\code{PC=PC+1+sign\_extend(off8)} & 比较、符号扩展、PC 选择 \\
+\code{JMP} & \code{0110 off12} & \code{PC=PC+1+sign\_extend(off12)} & 目标形成、PC 写入 \\
+\code{SHL Rd, imm4} & \code{0111 d a imm4 --} & \code{R[d]=R[d]<<imm4}，低位补 0 & 移位器、写回 \\
+\bottomrule
+\end{longtable}
+
+两个语义细节必须先定死，后面的程序才跑得上。第一，跳转偏移都相对\hwkey{下一条指令的地址}计算：跳转目标 = 本条地址 + 1 + 偏移，偏移按补码解释，可正可负。第二，立即数形式的 \code{MOV} 只能装 8 位立即数，高地址必须靠移位拼出来：\code{MOV R1, 0xF0} 得到 \code{R1=0x00F0}，再 \code{SHL R1, 8} 左移 8 位得到 \code{R1=0xF000}。\code{SHL} 的字段布局与 \code{ADD} 相同（d、a、低 4 位立即数），所以译码路径几乎免费。与 x86-64 的二操作数约定一致，\code{ADD Rd, Rs} 和 \code{SHL Rd, imm4} 的目的寄存器同时是源操作数，编码中 a 字段固定等于 d。另外，\code{JZ R2, +3} 把判零与跳转融合为一条指令，这是教学子集的简化；在 x86-64 中，同样的动作对应 \code{test}/\code{cmp} 与 \code{jz} 两条指令。
+
+这个编码能直接写入 ROM。若 \code{GPIO_IN=0xF004}、\code{GPIO_OUT=0xF000}，程序先用 \code{MOV}+\code{SHL} 拼出 MMIO 基址 \code{0xF000}，再循环读取按键、条件跳转、写 LED。下面左栏是 ROM 中的真实 16-bit 字，右栏是对应汇编和语义：
+
+\begin{longtable}{L{0.1\linewidth}L{0.13\linewidth}L{0.24\linewidth}L{0.45\linewidth}}
+\toprule
+地址 & 内容 & 汇编 & 语义 \\
+\midrule
+0 & \code{0x22F0} & \code{MOV R1, 0xF0} & \code{R1 = 0x00F0} \\
+1 & \code{0x7260} & \code{SHL R1, 8} & \code{R1 = 0xF000}（MMIO 基址） \\
+2 & \code{0x3450} & \code{MOV R2, [R1+4]} & \code{R2 = MEM[0xF004]}，读 GPIO\_IN \\
+3 & \code{0x5403} & \code{JZ R2, +3} & \code{R2==0} 时跳到地址 7（$3+1+3$） \\
+4 & \code{0x2601} & \code{MOV R3, 1} & \code{R3 = 1} \\
+5 & \code{0x4640} & \code{MOV [R1+0], R3} & \code{MEM[0xF000] = 1}，点亮 LED \\
+6 & \code{0x6FFB} & \code{JMP -5} & 跳回地址 2（$6+1-5$） \\
+7 & \code{0x2600} & \code{MOV R3, 0} & \code{R3 = 0} \\
+8 & \code{0x4640} & \code{MOV [R1+0], R3} & \code{MEM[0xF000] = 0}，熄灭 LED \\
+9 & \code{0x6FF8} & \code{JMP -8} & 跳回地址 2（$9+1-8$） \\
+\bottomrule
+\end{longtable}
+
+这个程序有三个可以直接核对的事实。第一，分支偏移逐项吻合：地址 3 的 \code{JZ +3} 跳到地址 7，地址 6 的 \code{JMP -5} 和地址 9 的 \code{JMP -8} 都跳回地址 2。第二，\code{0xF004} 这个地址在 ISA 里是\textbf{可以形成}的——不是注释里的愿望，而是 \code{(0x00F0 << 8) + 4} 的真实计算。第三，ROM 里每个 16-bit 字都能被译码器逐字段读出：拿 \code{0x7260} 核对，高 4 位 \code{0111} 是 \code{SHL}，d=\code{001}、a=\code{001}、imm4=\code{1000}=8。
+
+\topic{定长编码与变长编码的取舍}本章用的是定长编码：每条指令恰好占一个 16-bit 字，取指地址每次加 1，字段位置一成不变。代价直接可见——\code{ADD} 有 3 位空置，立即数 \code{MOV} 空 1 位且只能装 8 位立即数，\code{JMP} 的范围被 12 位偏移限制在 $-2048$ 到 $+2047$ 个字。把 ROM 程序十条的空位加总：3 条立即数 \code{MOV} 各空 1 位，\code{SHL} 与 3 条访存 \code{MOV} 各空 2 位，\code{JZ} 空 1 位，共 12 位，占全部 160 位的 7.5\%。收益同样直接：译码器是对固定字段的纯组合查表，任何一条指令的边界无需计算，这为以后每拍同时取多条、译多条留了路。
+
+x86-64 在另一极：指令长 1 到 15 字节，长度由前缀字节、opcode、ModRM 字段逐层决定——不先译出本条长度，就不知道下一条从哪个字节开始，边界本身构成串行依赖。变长换来编码密度：常用指令短，\code{push rbp} 仅 1 字节，\code{ret} 仅 1 字节；长格式只在需要时出现。一个函数序言 \code{push rbp; mov rbp, rsp; sub rsp, 32} 实际占 8 字节（$1+3+4$）；若按最长格式定长 8 字节排布，同样三条要占 24 字节。
+
+为什么 RISC 传统坚持定长、x86 坚持变长，原因都在各自约束里。RISC 的目标是把译码做窄做快：定长让字段位置固定、多条指令的边界天然已知，译码逻辑短，才有可能每拍译出多条并维持高频率。x86 背负 8086 以来的兼容：历史二进制里充满变长编码，高密度编码也确实省指令存储和取指带宽。它的工程补偿是预取加预译码：8086 的总线接口单元带 6 字节预取队列，在执行单元忙碌时提前把后续字节取回排队，把“按字节块取指”和“按条译码执行”的速率差解耦；分支跳转时队列作废重填，这正是变长世界里控制冒险代价的一部分。现代 x86 走得更远：按 16 字节块取指，预译码逻辑标出每条指令的边界再送进指令 cache，译出的微操作还可以进微操作 cache，把变长译码的成本从“每条指令每次执行”摊薄到“每条指令一次”。
+
+\begin{longtable}{L{0.2\linewidth}L{0.32\linewidth}L{0.36\linewidth}}
+\toprule
+维度 & 本章 16-bit 定长 & x86-64 变长（1–15 字节） \\
+\midrule
+下一指令边界 & \code{PC+1}，无需译码 & 须先译出本条长度 \\
+译码逻辑 & 固定字段查表，纯组合 & 前缀、opcode、ModRM 逐层判定 \\
+编码密度 & 低，短指令也占满 16 位 & 高，常用指令 1–3 字节 \\
+取指方式 & 按字一次一条 & 按字节块预取，队列缓冲 \\
+每拍多条 & 边界已知，容易扩展 & 靠预译码标记和微操作 cache 补偿 \\
+\bottomrule
+\end{longtable}
+
+\topic{指令字段放在哪里也是设计决策}本章编码里每个字段的位置都有一条理由。把它们逐字段摆出来，就能看出编码格式不是随手排布，而是译码路径的形状。
+
+opcode 固定占最高 4 位（bit 15–12）。理由是分级译码：第一级只看这 4 位就分出大类，决定低位如何解释——是寄存器号、立即数还是偏移。位置固定意味着这 4 位到译码器的连线与指令无关，取指一完成查表就开始。这个约定对人同样友好：ROM 十六进制字的第一个数字就是 opcode，\code{0x22F0} 的 2 是立即数 \code{MOV}，\code{0x7260} 的 7 是 \code{SHL}，人工核对与硬件译码走同一顺序。
+
+寄存器字段位置固定。\code{d}（以及 \code{JZ} 的 \code{r}、存储的 \code{s}）恒在 bit 11–9，\code{a} 恒在 bit 8–6。理由是寄存器堆的读地址可以直接由 IR 的固定位驱动，与 opcode 译码并行启动——读出来的值若用不上，丢弃即可，没有副作用。若字段位置随格式漂移，读地址之前就必须先插一级按格式选择的多路选择器，译码路径条数加倍，寄存器读还被推迟到译码完成之后，恰好撞上关键路径。\code{0x3450} 里 \code{d=010}（R2）、\code{a=001}（R1），与 \code{0x4640} 里 \code{s=011}（R3）、\code{a=001}，占的是完全相同的位置——这不是巧合，是让读地址“免译码”的刻意安排。
+
+立即数和偏移一律向低位对齐。\code{imm4}/\code{off4} 从 bit 5 起向下占 4 位，\code{imm8}/\code{off8} 占 bit 7–0，\code{off12} 占满 opcode 以外的 bit 11–0。理由是扩展逻辑单一：各种长度的立即数共享从 bit 0 起的低位段，零扩展或符号扩展只需按格式决定从哪一位开始复制符号、向上补多少位，低位部分原样旁路；指令字的 bit 0 就是立即数的 bit 0，数值意义与位置一致。\code{JMP} 把 opcode 之外全部 12 位留给偏移，符号位在 bit 11，范围 $-2048$ 到 $+2047$ 个字，\code{0x6FFB} 的低 12 位 \code{0xFFB} 即 $-5$——这是“低位全给数值、拿长度换范围”的极端情形。
+
+\begin{longtable}{L{0.16\linewidth}L{0.14\linewidth}L{0.34\linewidth}L{0.22\linewidth}}
+\toprule
+字段 & 位置 & 这样放的理由 & 本章实例 \\
+\midrule
+opcode & bit 15–12 & 先出大类，第一级译码只接 4 位 & \code{0x22F0} 首位 2 = 立即数 \code{MOV} \\
+d/r/s & bit 11–9 & 第一个寄存器号位置恒定，读地址免选择 & \code{0x5403} 的 \code{r=010} 即 R2 \\
+a & bit 8–6 & 基址/源读地址恒定，可与译码并行启动 & \code{0x3450} 的 \code{a=001} 即 R1 \\
+b、imm4/off4 & bit 5 起向下 & 第二源与短立即数共用低位段 & \code{0x7260} 的 \code{imm4=1000=8} \\
+imm8/off8 & bit 7–0 & 长立即数低字节对齐，扩展路径单一 & \code{0x5403} 的 \code{off8=+3} \\
+off12 & bit 11–0 & opcode 之外全给跳转范围 & \code{0x6FFB} 低 12 位 $=-5$ \\
+\bottomrule
+\end{longtable}
+
+把本章 16-bit 编码按 bit 位置画成字段条，各字段的译码去向可以直接读出：
+
+\begin{pdfdiagram}
+  % 字段条：bit 15 在左，bit 0 在右，按位宽比例分段
+  \draw[BookTeal, line width=0.9pt] (0,2.4) rectangle (2.4,3.2);
+  \node[font=\small\sffamily] at (1.2,2.8) {opcode};
+  \draw[BookTeal, line width=0.9pt] (2.4,2.4) rectangle (4.2,3.2);
+  \node[font=\small\sffamily] at (3.3,2.8) {d / r / s};
+  \draw[BookTeal, line width=0.9pt] (4.2,2.4) rectangle (6.0,3.2);
+  \node[font=\small\sffamily] at (5.1,2.8) {a};
+  \draw[BookTeal, line width=0.9pt] (6.0,2.4) rectangle (9.6,3.2);
+  \node[font=\small\sffamily] at (7.8,2.8) {b / imm4 / off4 / 低字节};
+  % bit 编号标在各段上方
+  \node[hw label, above] at (1.2,3.2) {bit 15--12};
+  \node[hw label, above] at (3.3,3.2) {bit 11--9};
+  \node[hw label, above] at (5.1,3.2) {bit 8--6};
+  \node[hw label, above] at (7.8,3.2) {bit 5--0};
+  % 译码去向
+  \node[hw control, minimum width=2.4cm, align=center] (dec) at (1.2,0.4) {主控制器\\控制字};
+  \node[hw state, minimum width=2.6cm, align=center] (rf) at (4.2,0.4) {寄存器堆\\读/写地址};
+  \node[hw compute, minimum width=2.8cm, align=center] (ext) at (7.8,0.4) {立即数扩展\\与 +off 加法器};
+  \draw[hw bus] (1.2,2.4) -- (dec.north);
+  \draw[hw bus] (3.3,2.4) -- (3.3,0.9);
+  \draw[hw bus] (5.1,2.4) -- (5.1,0.9);
+  \draw[hw bus] (7.8,2.4) -- (ext.north);
+  % 长立即数：a 与低位段合成 imm8/off8
+  \draw[hw return] (5.6,2.4) -- (5.6,1.8) -- node[hw label, above, pos=0.5]{合成 imm8/off8} (7.0,1.8) -- (7.0,0.9);
+\end{pdfdiagram}
+\diagramnote{16-bit 编码的字段条与各字段的译码去向。opcode 固定占 bit 15--12，第一级译码只接这 4 位；d/r/s 与 a 位置恒定，直接驱动寄存器堆的读/写地址，与 opcode 译码并行启动；低位段进入立即数扩展与偏移加法路径，长立即数 imm8/off8 由 a 字段与低位段合成（虚线）。以 \code{0x7260} 核对：高 4 位 \code{0111} 是 \code{SHL}，d=a=\code{001}，imm4=\code{1000}=8。}
+
+字段位置定下来之后，下面的数据通路图里那些从 IR 直接引出的线才有依据：寄存器字段到寄存器堆读地址的竖线、立即数扩展器的输入、偏移到 \code{+off} 加法器的路径，都对应这里的固定位置。
+
+\topic{把这台 ISA 画成可接线的数据通路}有了确定指令集，数据通路就不能再停在“ALU 加寄存器”的粗框上。下面这张图把取指、执行、写回和 PC 更新全部画成可检查的路径，每条指令都可以在上面走一遍：
+
+\begin{pdfdiagram}
+  % 取排行（顶部，数据自左向右）
+  \node[hw state, minimum width=1.5cm] (pc) at (0.8,4.2) {PC};
+  \node[hw compute, minimum width=2.2cm] (imem) at (3.4,4.2) {指令存储};
+  \node[hw state, minimum width=1.5cm] (ir) at (6.3,4.2) {IR};
+  \node[hw control, minimum width=2.0cm] (ctrl) at (10.3,4.2) {控制器};
+  \draw[hw bus] (pc) -- node[hw label, above]{取指地址} (imem);
+  \draw[hw bus] (imem) -- node[hw label, above]{16-bit 编码} (ir);
+  \draw[hw bus] (ir) -- node[hw label, above]{opcode} (ctrl);
+  % PC 更新列（左侧）
+  \node[hw compute, minimum width=1.7cm] (add1) at (0.8,2.9) {+1 加法器};
+  \node[hw compute, minimum width=2.2cm] (addoff) at (0.8,1.5) {+off 加法器};
+  \node[hw compute, minimum width=1.5cm] (pmux) at (0.8,0.1) {pc mux};
+  \draw[hw bus] (pc.south) -- (add1.north);
+  \draw[hw bus] (0.8,3.55) -- (1.75,3.55) -- (1.75,1.95);
+  \draw[hw bus] (add1.south) -- ++(0,-0.35) -- ++(1.2,0) -- ++(0,-2.0) -- (pmux.east);
+  \draw[hw bus] (addoff.south) -- (pmux.north);
+  \draw[hw bus] (pmux.west) -- ++(-0.45,0) |- (pc.west);
+  \node[hw label, anchor=west] at (-0.35,2.25) {下一 PC};
+  % IR 字段扇出（共享竖直干线，再分三路）
+  \draw[hw bus] (ir.south) -- (6.3,3.5) -- (2.2,3.5) node[hw label, above, pos=0.35]{off8/off12} -- (2.2,1.5) -- (addoff.east);
+  \draw[hw bus] (ir.south) -- (6.3,3.15) -- (2.6,3.15) node[hw label, above, pos=0.5]{寄存器字段 r/s} -- (2.6,-2.15);
+  \draw[hw bus] (ir.south) -- (6.3,2.8) -- (5.0,2.8) node[hw label, above, pos=0.6]{imm8/off4} -- (5.0,-0.45);
+  % 执行行
+  \node[hw state, minimum width=1.8cm] (rf) at (2.6,-2.6) {寄存器堆};
+  \node[hw compute, minimum width=2.4cm] (ext) at (5.0,-0.9) {立即数扩展\\imm8 零扩 / off4 符号扩};
+  \node[hw compute, minimum width=1.6cm] (muxa) at (5.0,-2.2) {mux A};
+  \node[hw compute, minimum width=1.6cm] (muxb) at (5.0,-3.4) {mux B};
+  \node[hw compute, minimum width=2.0cm] (alu) at (7.9,-2.8) {ALU/移位器};
+  \node[hw compute, minimum width=1.6cm] (wb) at (10.7,-2.8) {写回 mux};
+  \node[hw memory, minimum width=2.2cm] (dmem) at (10.7,-4.3) {数据存储/MMIO};
+  \draw[hw bus] (ext.south) -- (muxa.north);
+  \draw[hw bus] (ext.south) -- (5.0,-1.5) -- (6.0,-1.5) -- (6.0,-2.8) -| (5.4,-2.95);
+  \draw[hw bus] (rf.east) -- ++(0.5,0) |- (muxa.west);
+  \draw[hw bus] (rf.east) -- ++(0.5,0) -- ++(0,-0.8) -- (muxb.west);
+  \draw[hw bus] (muxa.east) -- (7.4,-2.2) -- (7.4,-2.35);
+  \draw[hw bus] (muxb.east) -- (7.4,-3.4) -- (7.4,-3.25);
+  \draw[hw bus] (alu.east) -- node[hw label, above]{结果/地址} (wb.west);
+  \draw[hw bus] (alu.east) -- ++(0.35,0) |- (dmem.west);
+  \draw[hw bus] (dmem.north) -- node[hw label, right]{读数据} (wb.south);
+  % 写回与 Zero 标志（底部两条并行通道）
+  \draw[hw bus] (wb.east) -- ++(0.2,0) -- ++(0,-2.2) -- (2.6,-5.0) node[hw label, below, pos=0.75]{写回数据+写地址 d} -- (rf.south);
+  \draw[hw bus] (alu.south) -- (7.9,-5.35) -- (1.5,-5.35) node[hw label, below, pos=0.5]{Zero 标志} -- (1.5,-0.35);
+  % 控制线（虚线）
+  \draw[hw return] (ctrl.south) -- (10.3,3.3) node[hw label, above, pos=0.5]{控制线} -- (11.5,3.3) -- (11.5,-2.6) -| (11.0,-2.35);
+  \draw[hw return] (11.5,3.3) -- (11.9,3.3) -- (11.9,-4.3) -- (dmem.east);
+  \draw[hw return] (ctrl.south) -- (10.3,2.95) -- (7.9,2.95) -- (7.9,-2.35);
+  \draw[hw return] (ctrl.south) -- (10.3,2.6) -- (6.35,2.6) -- (6.35,-1.5) -| (muxa.north east);
+\end{pdfdiagram}
+\diagramnote{这台最小 ISA 的完整数据通路。实线是数据路径，虚线是控制线。左侧一列是 PC 更新：顺序值和分支目标都先算好，由 \code{pc mux} 按 Zero 标志选择；中间是执行路径；右侧写回 mux 在 ALU 结果和存储器数据之间选择。任何一条指令的 trace，都应能在这张图上逐段指出来。}
+
+用六条指令走查这张图，可以覆盖除 \code{JMP} 外的全部指令类型：\code{ADD} 走“寄存器堆双读 → ALU → 写回 mux 选 ALU 结果”；立即数 \code{MOV} 走“imm8 零扩展 → mux A → ALU 直送 → 写回”；加载 \code{MOV} 走“基址寄存器加 off4 符号扩展 → ALU 形成地址 → 数据存储 → 写回 mux 选存储器数据”；存储 \code{MOV} 复用加载的地址路径，但数据从寄存器堆流向数据存储；\code{JZ} 的 Zero 决定 \code{pc mux} 选 +1 加法器还是 +off 加法器；\code{SHL} 走“mux A → ALU 内置移位路径 → 写回”。没有一条指令需要图外的部件——这是数据通路完整性的基本要求。
+
+写回 mux 是这条通路上选择最集中的部件，把它的候选来源单独画出来：
+
+\begin{pdfdiagram}
+  % 三路候选来源
+  \node[hw compute, minimum width=3.4cm, align=center] (src1) at (0,2.2) {ALU 结果\\ADD/SUB/SHL};
+  \node[hw memory, minimum width=3.4cm, align=center] (src2) at (0,0.6) {存储器数据 MDR\\加载 MOV};
+  \node[hw compute, minimum width=3.4cm, align=center] (src3) at (0,-1.0) {立即数\\立即数 MOV};
+  % 控制器与选择线
+  \node[hw control, minimum width=2.4cm, align=center] (wctrl) at (5.2,3.3) {控制器\\wb\_sel};
+  % 写回 mux（加高以容纳三个入口）
+  \node[hw compute, minimum width=1.6cm, minimum height=2.6cm, align=center] (wbmux) at (5.2,0.6) {写回\\mux};
+  \node[hw state, minimum width=2.4cm, align=center] (wrf) at (8.7,0.6) {寄存器堆\\写地址 d};
+  % 三条正交入线，水平进入 mux 左边框
+  \draw[hw bus] (src1.east) -- node[hw label, above=2pt, pos=0.4, fill=white, inner sep=1pt]{wb\_sel=ALU} (2.9,2.2) -- (2.9,1.5) -- (4.4,1.5);
+  \draw[hw bus] (src2.east) -- node[hw label, above=2pt, pos=0.5, fill=white, inner sep=1pt]{wb\_sel=MDR} (4.4,0.6);
+  \draw[hw bus] (src3.east) -- node[hw label, below=2pt, pos=0.4, fill=white, inner sep=1pt]{wb\_sel=立即数} (3.2,-1.0) -- (3.2,-0.3) -- (4.4,-0.3);
+  % 控制线（虚线）与写回输出
+  \draw[hw return] (wctrl.south) -- (wbmux.north);
+  \draw[hw bus] (wbmux.east) -- node[hw label, above=2pt, fill=white, inner sep=1pt]{写回数据} (wrf.west);
+\end{pdfdiagram}
+\diagramnote{写回 mux 的选择语义。经典五级流水的写回候选有三类：ALU 结果、存储器读回的数据（MDR）和立即数，选择线 \code{wb\_sel} 由控制器按 opcode 驱动。本机的立即数 \code{MOV} 走“imm8 零扩展 → mux A → ALU 直送”，等价于把立即数候选并入 ALU 一路，因此物理写回 mux 只需 ALUOut 与 MDR 两路——理解三路语义后，两路实现就是它的特例。}
+
+最后把 ROM 程序放进这台机器跑一整圈。设初态 \code{PC=0}、按键未按下（GPIO\_IN 读 0），第 8 个时钟沿前按键被按下（GPIO\_IN 读 1）：
+
+\begin{longtable}{L{0.12\linewidth}L{0.12\linewidth}L{0.15\linewidth}L{0.53\linewidth}}
+\toprule
+时钟沿 & PC & IR & 本沿提交的状态 \\
+\midrule
+1 & 0 & \code{0x22F0} & \code{R1=0x00F0} \\
+2 & 1 & \code{0x7260} & \code{R1=0xF000} \\
+3 & 2 & \code{0x3450} & \code{R2=0}（读 GPIO\_IN） \\
+4 & 3 & \code{0x5403} & 无（Zero=1，\code{pc\_sel} 选目标：$3+1+3=7$） \\
+5 & 7 & \code{0x2600} & \code{R3=0} \\
+6 & 8 & \code{0x4640} & \code{MEM[0xF000]=0}，灯灭 \\
+7 & 9 & \code{0x6FF8} & 无（跳回 2） \\
+8 & 2 & \code{0x3450} & \code{R2=1}（按键已按下） \\
+9 & 3 & \code{0x5403} & 无（Zero=0，顺序执行） \\
+10 & 4 & \code{0x2601} & \code{R3=1} \\
+11 & 5 & \code{0x4640} & \code{MEM[0xF000]=1}，灯亮 \\
+12 & 6 & \code{0x6FFB} & 无（跳回 2） \\
+\bottomrule
+\end{longtable}
+
+这一圈执行过程值得逐行核对：偏移算术（沿 4 的 $3+1+3$、沿 7 和 12 的回跳）、MMIO 地址形成（沿 3 和 8 的 \code{0xF000+4}）、条件跳转两次走向相反（沿 4 跳、沿 9 不跳）、以及程序效果本身——LED 跟随按键状态循环亮灭。能写出这张表，才说明编码、译码、数据通路、控制字和 PC 更新在同一个执行模型中互相吻合；任何一格对不上，回到控制真值表和数据通路图逐格反查即可。
+
+\topic{为这台 ISA 增加一条指令要走完一圈改动}以新增 \code{SUB Rd, Rs}（语义 \code{R[d] <- R[d]-R[b]}，按结果更新 Zero）为例，把“加一条指令”拆成必须同时完成的几处改动。漏掉任何一处，机器都会出现一种特征明确的故障。
+
+第一步，定语义与编码。语义必须连标志一起写清：结果写回 \code{d}，Zero 按结果更新，供软件随后用条件跳转读取。要留意的是，本章的 \code{JZ} 并不依赖这个标志——它总是自己重新读寄存器判零，SUB 写 Zero 只是为软件多留一条判零途径。编码要找一个空 opcode：\code{0001} 到 \code{0111} 已被占用；\code{0000} 故意保留——空 ROM 字、越界取指都会读出全零，让它译成“非法指令”比译成某条真指令更容易暴露问题。于是取 \code{1000}，字段布局与 \code{ADD} 完全相同：\code{1000 d a b ---}，二操作数约定同样是 \code{a=d}。
+
+第二步，改译码真值表。控制字表新增一行：\code{alu\_op=SUB}，两个源都选寄存器，\code{wb\_sel=ALU}，\code{reg\_w=1}，\code{pc\_sel=顺序}；布尔式里 \code{reg\_write} 多析取一项 \code{(op == 1000)}。
+
+第三步，确认数据通路已有减法路径。减法是加补码：\code{R[d]-R[b] = R[d] + (按位取反 R[b]) + 1}。本机 ALU 的加法器与异或网络（整机实验中由 74HC283 与 74HC86 构成）天然带这条路径：\code{SUB} 控制线让 B 输入走异或取反、进位输入置 1 即可，不需要任何新部件。这一步的工作量是“确认”，不是“新建”。
+
+第四步，更新写回与标志通路。写回 mux 对 \code{SUB} 选 ALU 结果，与 \code{ADD} 共用同一条写回线；Zero 在同一个时钟沿随结果提交，软件此后读到的就是本次减法的标志，而不是更早指令留下的旧值。
+
+第五步，补 trace 案例。先在纸面上核对编码：\code{SUB R1, R2} 拼出 \code{1000 001 001 010 000 = 0x8250}；再放进一段小程序走数值：
+
+\begin{longtable}{L{0.1\linewidth}L{0.09\linewidth}L{0.14\linewidth}L{0.5\linewidth}}
+\toprule
+时钟沿 & PC & IR & 本沿提交的状态 \\
+\midrule
+1 & 0 & \code{0x2209} & \code{R1=9}（\code{MOV R1, 9}） \\
+2 & 1 & \code{0x2404} & \code{R2=4}（\code{MOV R2, 4}） \\
+3 & 2 & \code{0x8250} & \code{R1=9-4=5}，\code{Zero=0}（\code{SUB R1, R2}） \\
+4 & 3 & \code{0x8490} & \code{R2=0}，\code{Zero=1}（\code{SUB R2, R2}） \\
+\bottomrule
+\end{longtable}
+
+沿 4 之后 \code{Zero=1}，软件若随后用条件跳转读取该标志，拿到的就是新值——这一步同时检验了第四步的标志更新时序。若下一条是本章的 \code{JZ R2, +off}，结果也一样：\code{JZ} 自己重新读 \code{R2} 判零，不经过 Zero 标志。把五步归并一下，ISA 扩展的本质是四处一起改：编码表、译码真值表、数据通路、控制字（含写回与标志）；前两处决定“新指令是谁”，后两处决定“新指令做什么”，trace 案例则把四处改动放进同一个执行模型互相印证。
+
+把这五步画成流程图，先后依赖与各自归属就更清楚：
+
+\begin{pdfdiagram}
+  \node[hw state] (t1) at (0,0) {第一步　定编码：取空 opcode 1000，字段布局同 ADD};
+  \node[hw control] (t2) at (0,-1.3) {第二步　改译码：控制字表加一行 alu\_op=SUB};
+  \node[hw compute] (t3) at (0,-2.6) {第三步　确认路径：减法 = B 取反加一，ALU 不添新部件};
+  \node[hw compute] (t4) at (0,-3.9) {第四步　更新写回：wb\_sel 选 ALU，Zero 随结果同沿提交};
+  \node[hw state] (t5) at (0,-5.2) {第五步　补 trace：0x8250 走数值，R1 = 9-4 = 5};
+  \draw[hw bus] (t1.south) -- (t2.north);
+  \draw[hw bus] (t2.south) -- (t3.north);
+  \draw[hw bus] (t3.south) -- (t4.north);
+  \draw[hw bus] (t4.south) -- (t5.north);
+\end{pdfdiagram}
+\diagramnote{为最小 ISA 新增 \code{SUB} 的五步流程。前两步决定“新指令是谁”（编码与译码），中间两步决定“新指令做什么”（路径与写回），最后一步用数值 trace 把四处改动放进同一个执行模型互相印证。任何一步漏掉都对应一类特征明确的故障，见下表。}
+
+\begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+改动处 & 关键问题 & 漏改时的故障 \\
+\midrule
+编码表 & 有没有空 opcode，字段布局能否复用 & 新编码无处安放，或与保留字冲突 \\
+译码真值表 & 新行与布尔式是否同步加上 & 新指令译成非法，或译成别的指令 \\
+数据通路 & 现有部件能否完成新运算 & \code{alu\_op=SUB} 没有对应连线 \\
+控制字与写回 & 写回选择、写使能、标志更新是否正确 & 结果写不回去，或 Zero 标志停在旧值 \\
+\bottomrule
+\end{longtable}
+
+\section{二、可见状态、条件码与调用约定}
+
+\topic{程序员可见状态不是全部硬件状态}
+机器级程序通常只直接看见一小组状态：PC、通用寄存器、条件码或标志、可寻址内存，有些 ISA 还显式暴露栈指针、链接寄存器或状态寄存器。CPU 内部还会有 IR、MDR、ALUOut、流水线寄存器、旁路网络和微程序计数器，但这些通常不是普通程序可以直接读写的对象。区分这两类状态很重要：ISA 规定的是程序必须可依赖的边界，微结构内部状态则服务于实现速度、面积和功耗。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+状态 & 程序员视角 & 硬件实现视角 \\
+\midrule
+PC & 下一条或当前执行位置 & 取指地址、分支选择、异常入口和返回路径 \\
+通用寄存器 & 保存整数、地址、临时值和返回值 & 寄存器堆端口、旁路、写回优先级 \\
+条件码 & 最近运算留下的比较结果 & ALU 标志生成、\code{flags_write} 和分支条件译码 \\
+内存 & 按地址访问的字节对象 & cache、TLB、总线、MMIO 和权限检查 \\
+栈指针 & 当前栈顶位置 & 普通寄存器加受约束的加减和加载/存储序列 \\
+\bottomrule
+\end{longtable}
+
+这种划分能解释为什么同一套 ISA 可以有不同实现。一个简单教学 CPU 可以用多周期状态机执行加载指令；一个高性能 CPU 可以把它拆进流水线、cache 和乱序队列。只要最终提交到程序员可见状态的结果相同，内部路径可以不同。反过来，若内部优化改变了 PC、寄存器、内存或条件码的可见顺序，就不再只是实现细节，而是破坏了 ISA 约定。
+
+\topic{条件码把 ALU 结果变成控制流}
+条件分支不是“看高级语言的 if”，而是看硬件已经保存的标志。ALU 做加法、减法或比较时，可以同时产生 Zero、Sign、Carry、Overflow 等标志。控制器把这些标志与指令中的条件字段组合，决定下一 PC 选择顺序地址还是分支目标。比较指令常常等价于一次不写回结果的减法：结果本身丢弃，但标志被保留下来供后续分支使用。
+
+\begin{longtable}{L{0.16\linewidth}L{0.34\linewidth}L{0.4\linewidth}}
+\toprule
+条件 & 常见硬件标志 & 容易犯错的解释 \\
+\midrule
+相等 & \code{A-B} 的 Zero 为 1 & 只适合判断 bit 模式相等，不说明大小 \\
+无符号小于 & 减法借位或 Carry 约定 & 不能直接用结果最高位判断 \\
+有符号小于 & Sign 与 Overflow 的组合 & 最高位受溢出影响，必须修正 \\
+结果为负 & Sign 标志为 1 & 只在补码解释下表示负数 \\
+有符号溢出 & 同号相加得到异号，或减法符号规则触发 & 与无符号进位不是同一件事 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+CMP R1, R2       // flags = R1 - R2, result is not written
+JE  equal_path   // branch if Zero == 1
+JL  less_path    // signed branch uses Sign xor Overflow
+JB  below_path   // unsigned branch uses borrow/carry convention
+\end{lstlisting}
+
+这个例子说明，分支条件必须绑定解释规则。同一对寄存器 \code{R1} 和 \code{R2} 的 bit 模式，按无符号数、有符号补码数或地址偏移解释，可能得到不同的“小于”。硬件不会自动知道程序员想要哪一种比较，必须由 opcode 或条件字段告诉控制器使用哪组标志逻辑。
+
+\topic{条件码的使用模式：比较只设标志，分支只读标志}
+x86-64 把一次“判断”拆成两条指令配合完成。\code{cmp} 与 \code{test} 做一次减法或按位与，运算结果本身被丢弃，不写回任何寄存器或内存，只留下 Zero、Sign、Carry、Overflow 等标志；随后的 \code{jz}、\code{jnz}、\code{jg}、\code{jl} 等条件跳转不再访问通用寄存器，只读标志决定是否改写 PC。两条指令之间唯一的通信通道就是标志寄存器——这正是 x86-64 把标志归入程序员可见状态的原因：离开它，\code{cmp} 的结果无处可去。
+
+三个最常用的配对覆盖绝大多数分支。第一，\code{cmp} 后接 \code{jz}/\code{jnz} 判断相等或不等：两操作数的 bit 模式相同则差为零，ZF 置 1。
+
+\begin{lstlisting}
+cmp rax, rbx     // 计算 rax - rbx，只写标志，不写寄存器
+jz  equal_path   // ZF=1 时跳转：rax 与 rbx 相等
+\end{lstlisting}
+
+第二，\code{cmp} 后接 \code{jg}/\code{jl} 判断有符号大小：\code{jl} 的成立条件是 SF 与 OF 不同，\code{jg} 的成立条件是 ZF=0 且 SF 与 OF 相同。之所以要两个标志组合，是因为减法一旦溢出，结果最高位就不再可靠，必须用溢出标志修正符号位。
+
+\begin{lstlisting}
+cmp rax, rbx     // 同一对操作数，同一组标志
+jl  less_path    // SF 与 OF 不同：按补码解释 rax < rbx
+jg  greater_path // ZF=0 且 SF 与 OF 相同：rax > rbx
+\end{lstlisting}
+
+第三，\code{test} 后接 \code{jz} 判断一个寄存器是否为零：\code{test rcx, rcx} 计算 rcx 与自身的按位与，结果必等于 rcx 本身，ZF 于是恰好表示“rcx 是否为 0”，同时 Carry 与 Overflow 被清零。这是编译器生成“判零”时的惯用写法，比 \code{cmp rcx, 0} 更短。
+
+\begin{lstlisting}
+test rcx, rcx    // rcx AND rcx：ZF 恰好表示 rcx==0
+jz  loop_done    // ZF=1 时跳转：计数器已减到 0
+\end{lstlisting}
+
+\begin{longtable}{L{0.22\linewidth}L{0.28\linewidth}L{0.38\linewidth}}
+\toprule
+配对 & 判断依据 & 关键问题 \\
+\midrule
+\code{cmp} + \code{jz}/\code{jnz} & ZF，差是否为零 & 只比较 bit 模式是否相同，有符号与无符号通用 \\
+\code{cmp} + \code{jg}/\code{jl} & ZF 与 SF、OF 的组合 & 只适用于补码有符号比较；无符号大小要换 \code{ja}/\code{jb}，改读 Carry \\
+\code{test} + \code{jz} & 按位与结果的 ZF & 操作数与自身相与，等价于判零，附带清 Carry/Overflow \\
+\bottomrule
+\end{longtable}
+
+回头看本章的教学 ISA，\code{JZ Rr, +off} 把“读寄存器、与零比较、条件改写 PC”三件事融合在一条指令里，数据通路因此省掉独立的标志寄存器和 \code{cmp}/\code{test}，分支可以在一个周期内完成。这是有意的教学简化，代价同样清楚：每条分支都要重新读一次寄存器，而且只能判零。真实 ISA 把比较与跳转分开，多付一条指令和一组必须在异常、中断时一并保护的标志状态，换来的是一次比较可供多条后续分支复用，判断条件也不限于零。
+
+\topic{调用、返回和栈帧是受约束的地址事务}
+函数调用可以从软件语法降到三件硬件事务：保存返回地址，跳到被调用函数入口，为局部对象和保存寄存器预留内存。返回时再恢复必要状态，把 PC 改回返回地址。很多 ISA 用专门的 CALL/RET 指令完成其中一部分；精简教学 CPU 也可以用普通的存储、加载、加减栈指针和跳转指令组合出来。
+
+\begin{lstlisting}
+CALL target, stack grows downward:
+  RSP = RSP - word_size
+  MEM[RSP] = PC + instruction_size   // push return address
+  PC = target
+
+RET:
+  PC = MEM[RSP]                       // pop return address
+  RSP = RSP + word_size
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+栈帧对象 & 机器级表示 & 硬件动作 \\
+\midrule
+返回地址 & 一个位宽等于 PC 的地址值 & push 压栈保存，RET 时 pop 到 PC \\
+保存寄存器 & 调用约定规定要保留的寄存器内容 & 进入时压栈，返回前弹出恢复 \\
+局部变量 & RSP 或帧指针加固定偏移 & 地址形成后普通加载/存储 \\
+实参溢出区 & 寄存器放不下的参数位置 & 调用方或被调用方按约定访问 \\
+对齐空洞 & 为总线宽度、ABI 或向量访问保留的字节 & 调整 RSP，避免未对齐访问代价或异常 \\
+\bottomrule
+\end{longtable}
+
+把调用栈看成地址事务后，许多系统错误会变得具体。栈越界写不是抽象的“内存不安全”，而是一次存储指令形成了错误地址，可能覆盖相邻局部变量、保存寄存器、返回地址或未映射页。若返回地址被覆盖，RET 只是按约定把栈顶字节装进 PC；CPU 并不知道这个地址原本是否可信。后续章节讨论保护模式、页表、异常和执行权限时，就是在给这些地址事务加上硬件可检查的边界。
+
+\topic{从一条语句贯通到硬件事务}一条简单语句可以贯通整机：\code{if (MMIO[GPIO_IN] != 0) MMIO[GPIO_OUT] = 1;}。在软件层面它像一次条件判断；在硬件层面，它至少包含取指、译码、地址形成、MMIO 读、条件分支、MMIO 写和 PC 更新。每一步都可以写成可逐项核对的硬件事务。
+
+\begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}}
+\toprule
+层次 & 发生的动作 & 需要观察的信号 \\
+\midrule
+取指 & PC 指向 ROM 或 I-cache 中的 MOV/JZ 等指令编码 & PC、指令存储片选、IR 内容 \\
+译码 & opcode 被译成 \code{mem_read}、\code{pc_sel}、\code{mem_write} 等控制线 & 控制字和寄存器读地址 \\
+地址形成 & 基址寄存器与偏移形成 \code{GPIO_IN} 或 \code{GPIO_OUT} 地址 & ALU 输入、ALUOut、地址总线 \\
+MMIO 读 & GPIO 控制器返回已同步按键状态 & GPIO 片选、读使能、返回数据稳定 \\
+条件判断 & 比较结果决定顺序 PC 或分支目标 & Zero 标志、分支控制、下一 PC \\
+MMIO 写 & 输出锁存器接收写数据并驱动 LED & 写使能、字节使能、锁存器输出 \\
+\bottomrule
+\end{longtable}
+
+这个例子也说明，编译后的指令顺序与外设副作用不能随意重排。普通内存访问可以被 cache、写缓冲和预取优化；但 \code{GPIO_OUT} 写入是外部可见动作，必须按设备属性和顺序规则执行。若系统把 MMIO 当作普通 cacheable 内存，LED 可能不会在预期时刻改变，甚至写入被合并或延迟到错误位置。
+
+\topic{五类基本指令覆盖了 CPU 的主要通路}最小 CPU 不必一开始支持复杂指令，但至少要能解释五类动作：寄存器到寄存器运算、加载、存储、条件分支和无条件跳转。它们共同覆盖寄存器堆、ALU、数据存储器、PC 选择器和标志位。
+
+\begin{longtable}{L{0.14\linewidth}L{0.34\linewidth}L{0.32\linewidth}L{0.1\linewidth}}
+\toprule
+指令类 & 典型路径 & 必须打开的控制 & 写回对象 \\
+\midrule
+ADD/SUB & 寄存器读出，经 ALU，结果写回寄存器 & \code{alu_op}、\code{wb_sel=ALU}、\code{reg_write} & 寄存器、Flags \\
+MOV（加载） & 基址寄存器加立即数形成地址，存储器读回数据 & \code{alu_op=ADD}、\code{mem_read}、\code{wb_sel=MEM} & 寄存器 \\
+MOV（存储） & 基址寄存器加立即数形成地址，源寄存器写入存储器 & \code{alu_op=ADD}、\code{mem_write}、\code{store_data_sel} & 存储器或 MMIO \\
+BRANCH & 比较源操作数或标志位，条件成立则选择分支目标 & \code{alu_op=CMP}、\code{pc_sel}、\code{pc_write} & PC \\
+JUMP & 立即数、寄存器或链接地址决定下一 PC & \code{target_sel}、\code{pc_sel}、可选 \code{reg_write} & PC，可选链接寄存器 \\
+\bottomrule
+\end{longtable}
+
+以加载指令为例，\code{MOV R3, [R1 + 8]}（即 \code{R3 = MEM[R1 + 8]}）不是单纯“读内存”。硬件要先读出 R1，把立即数 8 符号扩展或零扩展到 ALU 输入宽度，ALU 做地址加法，地址进入数据存储路径，读响应回来后经过写回 mux，最后在时钟沿写入 R3。若目标地址落入普通 RAM，读回的是存储阵列内容；若目标地址落入 MMIO 区，读回的是设备寄存器当前状态。地址相同形式，语义由地址译码决定。
+
+\begin{lstlisting}
+MOV R3, [R1 + 8]
+  EX:  addr = R1 + sign_extend(8)
+  MEM: read target selected by addr
+  WB:  R3 = read_data
+\end{lstlisting}
+
+存储指令的风险更高，因为它有副作用。\code{MEM[R1 + 8] = R3} 若落在 RAM，表示保存数据；若落在设备命令寄存器，可能启动设备、清除中断或改变输出引脚。因此存储指令必须明确字节使能、写数据来源、地址空间属性和完成条件。普通内存写响应表示写事务被接受；设备命令写响应通常不表示设备动作完成。
+
+\begin{lstlisting}
+MOV [R1 + 8], R3
+  EX:  addr = R1 + sign_extend(8)
+  MEM: write_data = R3, byte_en = access_size
+       target receives write command
+  WB:  no register writeback
+\end{lstlisting}
+
+BRANCH 和 JUMP 则说明 PC 是数据通路的一部分。条件分支一般要先得到比较标志，例如 Zero、Sign、Carry 或 Overflow，再由控制器决定 \code{pc_sel}。无条件跳转可以直接选择目标地址；带链接跳转还会把返回地址写入寄存器。此时同一条指令可能同时写 PC 和一个通用寄存器，控制器必须明确两个写边界是否在同一时钟沿提交。
+
+\topic{基本块和循环把 PC 更新变成可读结构}
+机器级程序可以先按基本块理解。一个基本块内部只有顺序执行，入口只有一个，出口通常是分支、跳转、返回或异常边界。硬件不认识“基本块”这个软件概念，但基本块对读 trace 很有用：块内每条指令都让 PC 顺序前进，块尾那条指令才选择下一 PC。循环就是某个块尾分支把 PC 改回较低地址。
+
+\begin{lstlisting}
+loop:
+  mov eax, [rdi]
+  add rsi, rax
+  add rdi, 4
+  sub rcx, 1
+  jnz loop
+\end{lstlisting}
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+程序结构 & PC 动作 & 硬件表现 \\
+\midrule
+顺序指令 & \code{PC = PC + size} & 取指地址递增，\code{pc_sel=sequential} \\
+条件分支 & 根据标志选择顺序 PC 或目标 PC & 标志位、条件译码、目标加法器 \\
+循环回边 & 分支目标小于当前 PC 附近地址 & 同一组编码被重复取指 \\
+函数调用 & 保存返回地址并选择函数入口 & 链接寄存器或栈写入，PC 改为目标 \\
+返回 & 从寄存器或栈恢复 PC & \code{RET} 或间接跳转选择返回地址 \\
+\bottomrule
+\end{longtable}
+
+用这个视角看循环，性能问题也会具体起来。循环体中的加载可能 cache miss，加法依赖加载结果，分支依赖计数器更新，取指路径又要处理回跳。简单 CPU 会逐条完成；流水线 CPU 需要处理 load-use 冒险和分支控制冒险；带预测的 CPU 会猜测回跳是否成立。无论复杂度如何，循环仍然是 PC、寄存器、标志和内存状态反复经过同一批硬件路径。
+
+\topic{调用约定把寄存器和栈的责任写成明确约定}
+硬件只提供寄存器、加载/存储、PC 改写和少数专门指令；函数调用是否能可靠嵌套，还需要调用约定。调用约定规定参数放在哪些寄存器或栈位置，返回值放在哪里，哪些寄存器由调用者保存，哪些由被调用者保存，栈指针如何对齐。它不是纯软件礼节，因为每一条规则都会变成具体寄存器写回和内存访问。
+
+\begin{longtable}{L{0.2\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+调用约定对象 & 机器级作用 & 硬件动作 \\
+\midrule
+参数寄存器 & 前几个参数直接进入寄存器 & 调用前写寄存器，被调用函数读寄存器 \\
+返回值寄存器 & 函数结果放在约定寄存器 & 返回前写回，调用者随后读取 \\
+调用者保存寄存器 & 调用后不保证保持旧值 & 调用者必要时先压栈保存 \\
+被调用者保存寄存器 & 函数返回前必须恢复 & 被调用者入口压栈，出口弹出恢复 \\
+栈对齐 & 保证局部对象、返回地址和向量访问边界 & 调整 RSP，可能插入填充字节 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+caller:
+  push r10               // caller saves if it needs r10 later
+  mov edi, arg0
+  mov esi, arg1
+  call target
+  pop r10
+  use eax                // return value
+
+callee:
+  push rbx               // callee-saved register
+  ...
+  pop rbx
+  ret
+\end{lstlisting}
+
+这套约定在 System V AMD64 里的具体分工，可以画成一张寄存器分配图：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=4.6cm, align=center] (pr) at (2.5,1.9) {参数寄存器\\rdi, rsi, rdx, rcx, r8, r9};
+  \node[hw state, minimum width=4.6cm, align=center] (rv) at (7.7,1.9) {返回值寄存器\\rax};
+  \node[hw state, minimum width=4.6cm, align=center] (cs) at (2.5,0.1) {调用者保存\\rax, rcx, rdx, rsi, rdi, r8--r11};
+  \node[hw state, minimum width=4.6cm, align=center] (ks) at (7.7,0.1) {被调用者保存\\rbx, rbp, r12--r15};
+  \node[hw memory, minimum width=9.8cm, align=center] (sp) at (5.1,-1.7) {rsp：栈指针，call 执行前须按 16 字节对齐};
+  \node[hw label, above] at (2.5,2.6) {调用前由调用者写入};
+  \node[hw label, above] at (7.7,2.6) {返回前由被调用者写入};
+  \node[hw label, below] at (2.5,-0.6) {跨 call 还要用：调用者先压栈};
+  \node[hw label, below] at (7.7,-0.6) {被调用者入口保存、出口恢复};
+\end{pdfdiagram}
+\diagramnote{System V AMD64 调用约定的寄存器分工。前 6 个整型参数依次进入 rdi、rsi、rdx、rcx、r8、r9，返回值进入 rax；调用者保存寄存器跨 call 不保证保持，还需要旧值时由调用者自己压栈；被调用者保存寄存器由被调用者在入口保存、出口恢复。本章 \code{sum2} 的参数 \code{edi}/\code{esi}、返回值 \code{eax} 和序言里的 \code{push rbx}，正是按这张图分工的实例。}
+
+栈损坏常常表现成“返回后失控”。返回地址、保存寄存器和局部数组可能同在一段连续内存中。若局部数组越界写覆盖了保存寄存器，错误会在函数返回后才显现；若覆盖了返回地址，RET 会把被污染的字节装入 PC。CPU 执行 RET 时并不知道这个地址是否来自真实 CALL，它只执行“从约定位置取一个地址并写入 PC”的硬件动作。
+
+\topic{叶子函数与非叶子函数的保存策略不同}
+编译器和手写汇编都按同一条规则决定函数序言的规模：这个函数还会不会调用别人。不再调用任何函数的函数称为叶子函数。它不会触发新的 CALL，栈顶不会被再压入一层返回地址，参数寄存器、返回值寄存器这类调用者保存寄存器也可以放心使用——没有下游调用来破坏它们。本章的 \code{sum2} 正是叶子函数：函数体只用 \code{eax}、\code{edi}、\code{esi}，按 System V AMD64 约定它们都属于调用者保存（调用后不必保持原值），所以单就计算而言它连栈帧都不必建立，三条指令足够。后面案例 trace 中那对 \code{push rbx}/\code{pop rbx} 是为了展示序言与尾声而保留的，最小的 \code{sum2} 长这样：
+
+\begin{lstlisting}
+sum2:                // 叶子函数：不调用别人
+  mov eax, edi       // 只用调用者保存寄存器
+  add eax, esi
+  ret                // 没有 push，也没有 sub rsp
+\end{lstlisting}
+
+一旦 \code{sum2} 改成自己也要调用别人——例如先调用 \code{sat_add} 对第二个参数做一元饱和加（约定 \code{sat_add(x)} 返回饱和意义下的 \code{x+x}），再把结果与第一个参数相加——它就不再是叶子，至少要补上三类动作。第一，保护会被下游调用破坏的现场：\code{edi}/\code{esi} 要腾出来给新调用传参，call 之后还需要的旧值必须先挪进被调用者保存寄存器或栈上。第二，凡是自己要用的被调用者保存寄存器，入口按约定保存、出口按相反顺序恢复。第三，维护栈对齐：x86-64 约定 call 执行前 rsp 是 16 的倍数，而函数入口因返回地址压栈变成 16 的倍数减 8，非叶子函数通常用一次 push 或 \code{sub rsp, 8} 把对齐调回来。
+
+\begin{lstlisting}
+sum2:
+  push rbx           // 保存被调用者保存寄存器，顺带对齐 rsp
+  mov ebx, edi       // a 在 call 之后还要用，先进 rbx 保命
+  mov edi, esi       // 为 sat_add 准备唯一参数 b
+  call sat_add       // eax = 饱和的 b+b；栈顶再压一层返回地址
+  add eax, ebx       // call 之后仍能取回 a，完成最后一步相加
+  pop rbx            // 按相反顺序恢复
+  ret
+\end{lstlisting}
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+对比项 & 叶子函数 & 非叶子函数 \\
+\midrule
+可用寄存器 & 调用者保存寄存器可随意使用 & 跨过 call 还要用的值必须放被调用者保存寄存器或栈 \\
+栈帧 & 可以不建，rsp 全程不动 & 通常用 push 或 sub 建帧，出口反向拆除 \\
+返回地址 & 只在栈顶出现一层 & 每层内层 call 再压一层，自己的帧不能遮挡栈顶 \\
+对齐责任 & 无下游调用，无对齐负担 & 每次 call 前必须保证 rsp 按 16 字节对齐 \\
+\bottomrule
+\end{longtable}
+
+这个区分直接决定序言与尾声的指令数，也就决定小函数的调用开销。叶子函数省下的不只是几条 push 和 pop，还有对应的栈读写事务；非叶子函数少做一次保存，错误不会立刻显现，而会推迟到某次深层调用之后，以“寄存器值莫名改变”的形式暴露。调用约定的意义正在这里：保存责任按“谁会破坏、谁还需要旧值”预先分配，每个函数只管自己那一段，调用链才能任意嵌套。
+
+\topic{栈对齐是约定的一部分，不是性能洁癖}
+x86-64 的 System V 约定要求：\code{call} 执行的一瞬间，rsp 必须是 16 的倍数；call 压入 8 字节返回地址后，被调用函数入口处的 rsp 就是 16 的倍数减 8。这条规则写进约定而不是留给各人随意，原因有三层。第一层是压栈粒度：一次 push 或 pop 固定移动 8 字节，栈上每一格都是整字；若 rsp 不以 8 为边界，相邻两格就会错位重叠，读写互相覆盖。第二层是指令的硬性要求：\code{movaps} 这类对齐传送指令要求内存地址 16 字节对齐，编译器会把栈上某些局部对象按 16 字节放置，入口对齐一旦被破坏，这些指令直接触发通用保护异常。第三层是异常路径：中断与异常入口按约定位置保存现场，若干平台的异常栈帧同样假设栈指针对齐，对齐失守会让处理程序自身再出异常。
+
+对齐的算术只有一条规律：每一次 8 字节的 push 或 call，都把“rsp 模 16”的余数翻转一次。入口时余数为 8，做奇数次 push（或一次 \code{sub rsp, 8}）后余数回到 0，可以安全 call；做偶数次则余数仍是 8，再 call 就把错位传给下游。上一条目里非叶子 \code{sum2} 用一条 \code{push rbx} 同时完成寄存器保存与对齐调整，正是这个算术的应用。
+
+把每次压栈后的余数标在栈格边界上，翻转规律一眼可见：
+
+\begin{pdfdiagram}
+  % 栈格（每格 8 字节，高地址在上）
+  \node[hw memory, minimum width=3.8cm, minimum height=0.7cm] at (1.9,3.15) {返回地址（call 压入）};
+  \node[hw memory, minimum width=3.8cm, minimum height=0.7cm] at (1.9,2.45) {保存的 RBX（第一次 push）};
+  \node[hw memory, minimum width=3.8cm, minimum height=0.7cm] at (1.9,1.75) {第二次 push 的一格};
+  \node[hw memory, minimum width=3.8cm, minimum height=0.7cm] at (1.9,1.05) {（pop 后释放）};
+  % 边界余数标注
+  \node[hw label, anchor=east] at (-0.15,3.5) {$\equiv 0$};
+  \node[hw label, anchor=east] at (-0.15,2.8) {$\equiv 8$};
+  \node[hw label, anchor=east] at (-0.15,2.1) {$\equiv 0$};
+  \node[hw label, anchor=east] at (-0.15,1.4) {$\equiv 8$};
+  \node[hw label, anchor=east] at (-0.15,0.7) {$\equiv 0$};
+  % 对齐窗口（余数为 0 的边界）用粗线标出
+  \draw[BookAccent, line width=1.8pt] (0,3.5) -- (3.8,3.5);
+  \draw[BookAccent, line width=1.8pt] (0,2.1) -- (3.8,2.1);
+  \draw[BookAccent, line width=1.8pt] (0,0.7) -- (3.8,0.7);
+  % 事件：每次压栈/弹栈 8 字节，余数翻转一次
+  \draw[hw bus] (4.5,3.4) -- (4.5,2.9);
+  \node[hw label, anchor=west] at (4.7,3.15) {call 压入 8 B：$0\to8$};
+  \draw[hw bus] (4.5,2.7) -- (4.5,2.2);
+  \node[hw label, anchor=west] at (4.7,2.45) {push 8 B：$8\to0$（恢复对齐）};
+  \draw[hw bus] (4.5,2.0) -- (4.5,1.5);
+  \node[hw label, anchor=west] at (4.7,1.75) {push 8 B：$0\to8$};
+  \draw[hw bus] (4.5,0.8) -- (4.5,1.3);
+  \node[hw label, anchor=west] at (4.7,1.05) {pop 8 B：$8\to0$};
+  % 图例
+  \node[hw label] at (2.6,0.3) {粗线边界 = 对齐窗口（rsp mod 16 = 0，此处才能 call）};
+\end{pdfdiagram}
+\diagramnote{栈按 8 字节为一格，高地址在上。每次 push 或 call 压入一格，rsp mod 16 的余数就翻转一次；pop 弹出一格，余数再翻转回来。call 要求执行瞬间余数为 0——图中粗线标出的对齐窗口；call 压入返回地址后，被调用函数入口处的余数变为 8，序言用奇数次 push（或一条 \code{sub rsp, 8}）把余数调回 0，下游的 call 才落在对齐窗口上。}
+
+\begin{longtable}{L{0.26\linewidth}L{0.32\linewidth}L{0.3\linewidth}}
+\toprule
+对齐规则 & 机制理由 & 失守后果 \\
+\midrule
+rsp 以 8 字节为粒度移动 & push/pop 按整字压栈、读栈 & 相邻栈格错位重叠，数据互相覆盖 \\
+call 前 rsp 是 16 的倍数 & 给 \code{movaps} 等 16 字节对齐访问留边界 & 对齐传送指令触发通用保护异常 \\
+入口处余数为 8 由 call 压栈造成 & 序言用奇数次 push 或 sub 把余数调回 0 & 错位沿调用链向下游传播 \\
+普通访问允许未对齐 & 一次访问可能横跨两个 cache 行甚至两页 & 拆成两次总线事务，变慢且失去单次事务的原子性 \\
+\bottomrule
+\end{longtable}
+
+未对齐的后果因此分两档：普通整数加载/存储未对齐时，x86-64 硬件大多照常执行，只是付出额外事务的代价；对齐传送指令、严格平台以及打开 Alignment Check 的 x86 则直接抛对齐异常。这与存储与设备事务部分总线事务的字节使能互为表里：总线按字传输时，字节使能标记本次事务实际写哪些字节，地址未对齐意味着同一数据要动用两个总线周期、两组字节使能。对齐约定把这种代价在编译期就消掉，而不是留给硬件每次补救。

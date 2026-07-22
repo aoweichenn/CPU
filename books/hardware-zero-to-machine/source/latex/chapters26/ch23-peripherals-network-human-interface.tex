@@ -1,0 +1,966 @@
+\chapter{外设、网络与人机接口}
+
+\begin{keyidea}
+介质和物理接口各不相同，但高吞吐外设普遍依赖队列、描述符、DMA 和完成通知。本章用网络与外设案例比较这些共同机制。
+\end{keyidea}
+
+\section{一、网卡与网络队列}
+
+网卡面对的约束与磁盘相反：磁盘是"你求它快"，网络是"它不管你收
+不收"。链路上的帧按线速到达，不能暂停、不可减速；对端何时发、
+发多快，本机说了不算。网卡的全部队列设计都在回答同一个问题：帧
+已经在线上了，CPU 还没准备好，怎么办。本节沿帧的生命周期走一
+遍：线上怎么数帧，帧进内存走哪条环，CPU 以什么节奏被叫醒，多核
+怎样分流，以及数据怎样少搬一次是一次。
+
+\topic{帧、MTU 与线速}以太帧在线上的完整样子：先是 7 字节前导码
+加 1 字节帧起始符（SFD），让接收方的时钟恢复电路锁定比特边界；
+随后 6 字节目的 MAC、6 字节源 MAC、2 字节类型字段（EtherType），
+指明载荷交给谁——IPv4、IPv6 还是 ARP；载荷 46--1500 字节，不足
+46 字节必须填充；最后 4 字节 FCS，对整帧做 CRC32 校验，错帧在网
+卡层面直接丢弃，不进内存。帧与帧之间还有 12 字节的帧间隙
+（IFG），是链路上的静默间隔。MTU 1500 指的是载荷上限；线上一帧
+实为 14 字节头加 1500 字节载荷加 4 字节 FCS，共 1518 字节，再算
+上前导与帧间隙，每帧占线 1538 字节。
+
+把这一帧的字节布局画出来，固定开销与载荷的比例就有了形状：
+
+\begin{pdfdiagram}
+  % 线上一帧：字段宽度为示意，总长对应 1538 字节
+  \node[hw label, anchor=south west] at (0,3.3) {线上一帧共占 1538 字节（字段宽度为示意）};
+  \draw[BookTeal, line width=0.8pt, fill=BookCodeBg] (0,2.3) rectangle (1.0,3.2);
+  \node[align=center] at (0.5,2.75) {前导\\8 B};
+  \draw[BookTeal, line width=0.8pt, fill=BookCodeBg] (1.0,2.3) rectangle (2.1,3.2);
+  \node[align=center] at (1.55,2.75) {目的\\6 B};
+  \draw[BookTeal, line width=0.8pt, fill=BookCodeBg] (2.1,2.3) rectangle (3.2,3.2);
+  \node[align=center] at (2.65,2.75) {源\\6 B};
+  \draw[BookTeal, line width=0.8pt, fill=BookCodeBg] (3.2,2.3) rectangle (4.1,3.2);
+  \node[align=center] at (3.65,2.75) {类型\\2 B};
+  \draw[BookAccent, line width=0.9pt, fill=BookCodeBg] (4.1,2.3) rectangle (9.0,3.2);
+  \node at (6.55,2.75) {载荷 46--1500 B（MTU 1500）};
+  \draw[BookTeal, line width=0.8pt, fill=BookCodeBg] (9.0,2.3) rectangle (9.9,3.2);
+  \node[align=center] at (9.45,2.75) {FCS\\4 B};
+  \draw[BookMuted, line width=0.8pt, fill=white] (9.9,2.3) rectangle (11.0,3.2);
+  \node[align=center] at (10.45,2.75) {IFG\\12 B};
+  % 开销占比对照：小帧 vs 大帧
+  \node[hw label, anchor=east] at (-0.15,1.35) {最小帧 64 B};
+  \draw[BookRed, line width=0.8pt, fill=white] (0,1.0) rectangle (2.0,1.7);
+  \node[hw label] at (1.0,1.35) {开销 45\%};
+  \draw[BookAccent, line width=0.8pt, fill=BookCodeBg] (2.0,1.0) rectangle (4.5,1.7);
+  \node[hw label] at (3.25,1.35) {载荷};
+  \node[hw label, anchor=west] at (4.7,1.35) {线上 84 B，载荷率约一半（548 Mb/s）};
+  \node[hw label, anchor=east] at (-0.15,0.35) {最大帧 1518 B};
+  \draw[BookRed, line width=0.8pt, fill=white] (0,0.0) rectangle (0.11,0.7);
+  \draw[BookAccent, line width=0.8pt, fill=BookCodeBg] (0.11,0.0) rectangle (4.5,0.7);
+  \node[hw label] at (2.3,0.35) {载荷};
+  \node[hw label, anchor=west] at (4.7,0.35) {线上 1538 B，开销仅 2.5\%（975 Mb/s）};
+\end{pdfdiagram}
+\diagramnote{以太帧在线上的字节布局：前导与 SFD 8 字节用于时钟锁定，MAC 地址与类型字段 14 字节，载荷最多 1500 字节，FCS 4 字节校验，帧间还有 12 字节静默。每帧 38 字节的固定开销与帧长无关：64 字节小帧把它摊成 45\% 的负担，1518 字节大帧只付 2.5\%——压力测试用小帧考 pps、吞吐测试用大帧考带宽，原因就在这张图上。}
+
+\begin{longtable}{L{0.20\linewidth}L{0.12\linewidth}L{0.56\linewidth}}
+\toprule
+字段 & 字节数 & 作用 \\
+\midrule
+前导码 + SFD & 8 & 时钟恢复与帧定界，属于物理层，不进内存 \\
+目的 MAC & 6 & 网卡按它做第一层过滤，不符则直接丢弃 \\
+源 MAC & 6 & 标识发送方，交换机按它学习转发表 \\
+类型 EtherType & 2 & 指明载荷协议：IPv4、IPv6、ARP 等 \\
+载荷 payload & 46--1500 & MTU 所指的部分，不足 46 字节要填充 \\
+FCS & 4 & CRC32 校验，错帧在网卡即丢弃 \\
+帧间隙 IFG & 12 & 帧间静默，链路占用但无内容 \\
+\bottomrule
+\end{longtable}
+
+线速的换算从这里开始。1 GbE 的线上比特率是 $10^{9}$ bit/s——第九
+章讲眼图时给过这个速率的直观：1 Gbps 下每个比特只有 1 ns 的判决窗
+口。帧越小，每秒能过的帧越多，因为每帧都要付 38 字节的固定开销
+（前导 8、帧间隙 12、头 14、FCS 4）。两个端点情形：最小帧 64 字
+节，线上占 $64+8+12=84$ 字节即 672 bit，1 GbE 每秒过
+$10^{9}/672\approx1.49\times10^{6}$ 帧，约 1.49 Mpps；最大帧 1518
+字节，线上占 1538 字节即 12304 bit，每秒约
+$10^{9}/12304\approx81274$ 帧。10 GbE 把这两个数都乘 10：约 14.88
+Mpps 与约 81.3 万 pps。
+
+\begin{longtable}{L{0.16\linewidth}L{0.20\linewidth}L{0.24\linewidth}L{0.24\linewidth}}
+\toprule
+帧长（字节） & 线上占用（字节） & 1 GbE（pps） & 10 GbE（pps） \\
+\midrule
+64（最小帧） & 84 & 约 149 万 & 约 1488 万 \\
+512 & 532 & 约 23.5 万 & 约 235 万 \\
+1518（最大帧） & 1538 & 81274 & 约 81.3 万 \\
+\bottomrule
+\end{longtable}
+
+有效载荷效率值得单独算：小帧线速下，每秒载荷只有
+$1.49\times10^{6}\times46\times8\approx548$ Mb/s，约线速的一半；
+大帧下 $81274\times1500\times8\approx975$ Mb/s，接近满载。所以
+"线速"与"pps"是两个独立的指标：线速（bit/s）是物理层能力，
+pps 度量每帧固定成本的总量——网卡 DMA 一次、描述符消耗一个、协
+议栈走一遍，都与帧长无关。压力测试用 64 字节小帧考 pps，吞吐测
+试用 1518 字节大帧考带宽，两个数字各回答一个问题；选型时先量业
+务的平均帧长，再决定该为哪个指标付钱。
+
+帧格式也不是只有这一种长相。802.1Q 在源 MAC 与类型字段之间插入
+4 字节标签，携带 VLAN 编号，帧长上限随之变成 1522 字节；QinQ、
+MPLS 再往外套。每多一层封装，MTU 的有效载荷就被咬一口：隧道出
+口看到的 1500 字节帧里，真正的数据可能只剩 1400 余字节——VPN
+与隧道环境里"MTU 要调小"这条运维经验的来源，就是各层封装头的
+总长度。
+
+最小帧 64 字节也有来历。早期共享总线式以太网靠冲突检测
+（CSMA/CD）工作：发送方必须发够长的时间，才能让冲突信号从总线
+最远端传回来，否则冲突发生而发送方浑然不觉。按 10Mb/s 时代的线
+缆长度与传播时延算，这个窗口定为 512 比特时，即 64 字节——最短
+合法帧由此而来。交换式全双工以太网早已没有冲突，最小帧却作为约
+定的一部分留了下来，今天我们数 pps 时仍在为它付费：每帧 38 字节
+的固定开销，一半来自这段历史。
+
+MTU 本身也可以调。数据中心内部常用 9000 字节载荷的巨型帧
+（jumbo frame）：线上每帧约 9038 字节，1 GbE 每秒帧数降到约 1.4
+万，每帧固定成本被摊到六倍的载荷上，pps 与中断、协议栈开销同步
+下降约六倍。前提是路径上每一跳的 MTU 都得一致放大，否则分片甚
+至静默丢包会把收益全部吃回去——巨型帧是全网约定，不是单机参
+数。
+
+"网卡不能喊停"严格说有一个例外：以太网流控允许接收方发 PAUSE
+帧，请对端暂停发送指定时长。它的本意是防丢包，实际效果是把缓冲
+区不足的问题传染给上游——一台主机收不动，整条链路上的无辜流量
+一起被压。现代数据中心普遍关闭全局 PAUSE，丢包问题留给更深的
+环、更快的消费和拥塞协议去解决；存储网络使用的按类暂停（PFC）
+是另一套权衡，以队头阻塞为代价换无损。这个例外恰好坐实本节的出
+发点：默认情况下，到达速率不由接收方控制，缓冲深度与消费速率必
+须自己兜底。
+
+\topic{接收环与发送环}网卡与内存之间走的就是存储与设备事务部分的描述符环，
+机制原封不动：环是内存里的描述符数组，CPU 推进软件指针、设备推
+进硬件指针，doorbell 只提示"指针动了"，完成以设备写回的状态位
+为准。网卡的特殊性在于，收发两个方向的环各有一条不对称的约定：
+接收环要预投，发送环要回收。
+
+RX 环是预投的。收帧不可预约——对端随时发，网卡不能喊停——所
+以驱动必须提前把一批空缓冲区的地址铺满接收环。帧到达后，网卡
+MAC 校验 FCS，由 DMA 把帧直接写进下一个空缓冲区，写回描述符状
+态（帧长、校验结果、RSS 队列号），再按中断策略通知 CPU。驱动取
+走数据、把缓冲区交给协议栈之后，必须立刻补投新的空缓冲区：预投
+是义务，不是优化。环上可用缓冲区一旦耗尽，再到的帧没有地方放，
+只能丢弃——帧本身没有错，是没人接。
+
+TX 环是回收的。发送由软件发起：驱动把待发帧的描述符挂上发送
+环、敲 doorbell；网卡按描述符 gather 数据、送上线路，发完写回完
+成状态；驱动在中断或轮询里回收描述符并释放缓冲区。回收不及时，
+环被挂满，新帧无处提交，协议栈只能排队等待，背压沿协议栈向上传
+导。两个方向的环因此有不同的"满"的含义：RX 环空是丢包，TX 环
+满是阻塞。
+
+发送环的回收节奏同样可调：每发完一帧就中断一次太奢侈，驱动通常
+让网卡攒一批完成再通知，或干脆在下次发送与定时轮询时顺手回收。
+回收延迟直接占用环深——一批未回收的描述符，与一串未补投的空缓
+冲区，是同一个问题的两面：环的有效深度，等于标称深度减去滞留在
+"已完成未回收"状态里的那部分。
+
+环深与丢包的关系可以直接算。RX 环的深度必须吸收"最坏通知延
+迟"内到达的全部帧：1 GbE 小帧每秒约 149 万帧，若中断聚合加调度
+把最坏通知延迟拖到 200 $\mu$s，期间到达
+$1.49\times10^{6}\times200\times10^{-6}\approx298$ 帧——环深 64
+必然丢，512 才够；10 GbE 同样的窗口要容纳约 2980 帧，常见取
+4096。丢包在以太网层面不报错、不重传，只体现为网卡计数器里的数
+字，最后由 TCP 重传表现为"网速偶尔抖一下"。存储与设备事务部分"缓冲区何时
+归 CPU、何时归设备"的所有权问题，在这里直接变成丢包与否的分界
+线。
+
+\begin{lstlisting}
+$ ethtool -g eth0      # show ring depths: RX 512, TX 512
+$ ethtool -S eth0 | grep -E 'rx_missed|rx_no_buffer'
+     rx_missed_errors: 1382     # frames arrived with no buffer
+$ ethtool -G eth0 rx 4096      # deepen RX ring (driver permitting)
+\end{lstlisting}
+
+丢包计数是这条链上最诚实的仪表。应用看到的是吞吐波动与重传，协
+议栈看到的是乱序，只有网卡计数器直接说出"哪一环没接住"：
+rx\_no\_buffer 指预投断供，rx\_missed 指环深或处理速度不够。排障
+的顺序因此固定：先看计数器分辨丢在哪一层，再回头调环深、中断参
+数或核数——本节后面三个话题，正好各管其中一环。
+
+\topic{中断聚合}每帧一中断在小帧线速下根本不成立。1.49 Mpps 意味
+着每 0.67 $\mu$s 一次中断；一次完整的中断处理——保存现场、读状态、
+递交协议栈、恢复现场——按保守的 3 $\mu$s 计，单核每秒最多服务约 33
+万次。需要的算力是 $1.49\times10^{6}\times3\mu s\approx4.5$ 颗核
+的全部时间，而且全花在中断进出上，协议栈和应用一行代码都轮不
+到：越忙越处理不完，吞吐反而崩，这就是中断风暴（receive
+livelock）。0.67 $\mu$s 这个帧间隔值得记住：它就是"软件为每帧固定成
+本付费"的时钟节拍。
+
+把帧间隔与处理时长画在同一条时间轴上，风暴的自我放大就
+清楚了：
+
+\begin{waveform}[x=0.8cm,y=0.9cm]
+  % 帧到达：每 0.67 µs 一帧
+  \foreach \x in {1,2,...,12} \draw[BookTeal, line width=0.9pt] (\x,5.9) -- (\x,6.5);
+  \node[hw label, anchor=east] at (0.8,6.2) {帧到达};
+  % 3 µs 里又到约 4 帧
+  \draw[BookMuted, line width=0.6pt, <->] (1,5.3) -- (5.5,5.3);
+  \node[hw label, anchor=south] at (3.25,5.4) {3 $\mu$s 里又到约 4 帧};
+  % CPU：一次中断处理 3 µs，处理一帧又积下数帧
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (1,4.3) rectangle (5.5,4.9);
+  \node at (3.25,4.6) {处理第 1 帧：3 $\mu$s};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (5.5,4.3) rectangle (10,4.9);
+  \node at (7.75,4.6) {处理第 2 帧：3 $\mu$s};
+  \draw[BookAccent, fill=BookCodeBg, line width=0.8pt] (10,4.3) rectangle (13,4.9);
+  \node[hw label] at (11.5,4.6) {处理第 3 帧 $\cdots$};
+  \node[hw label, anchor=east] at (0.8,4.6) {中断处理};
+  % 未处理积压：阶梯单调上涨（每个 3 µs 窗口净增约 3 帧）
+  \draw[BookRed, line width=0.9pt] (1,1.2) -- (1,1.47) -- (2,1.47) -- (2,1.74) -- (3,1.74) -- (3,2.01) -- (4,2.01) -- (4,2.28) -- (5,2.28) -- (5,2.55) -- (5.5,2.55) -- (5.5,2.28) -- (6,2.28) -- (6,2.55) -- (7,2.55) -- (7,2.82) -- (8,2.82) -- (8,3.09) -- (9,3.09) -- (9,3.36) -- (10,3.36) -- (10,3.09) -- (11,3.09) -- (11,3.36) -- (12,3.36) -- (12,3.63) -- (13,3.63);
+  \node[hw label, anchor=east] at (0.8,2.4) {未处理积压};
+  \node[hw label] at (6.6,0.55) {帧每 0.67 $\mu$s 一帧，处理一帧又净增约 3 帧：越忙越处理不完};
+\end{waveform}
+\diagramnote{中断风暴（receive livelock）的时序（1 GbE 小帧线速）。帧每 0.67 $\mu$s 到达一帧，一次完整的中断处理——保存现场、读状态、递交协议栈、恢复现场——按保守的 3 $\mu$s 计：处理一帧的功夫线上又到约四帧，未处理积压单调上涨，需要的算力约 $1.49\times10^{6}\times3\ \mu$s 即 4.5 颗核的全部时间，协议栈和应用一行代码都轮不到。越忙越处理不完、吞吐反而崩；出路是把到达率除以批大小，即下一段的中断聚合。}
+
+NAPI 把"中断驱动"改成"中断提示加轮询收尾"：第一帧触发中断后
+关闭该队列的中断，驱动进入轮询，在预算内尽量多地收完积压的帧，
+收干了再重新开中断——忙时纯轮询，闲时纯中断，两种状态自动切
+换。网卡硬件侧的中断合并（interrupt moderation）提供两个阈值：
+攒够 N 帧发一次中断，或距上次中断满 T $\mu$s 发一次，先到为准；低负
+载时靠超时保证单帧不被无限积压。
+
+补一个实现细节：NAPI 的轮询收包运行在软中断（softirq）上下文，
+协议栈的 IP、TCP 处理大多也在其中。top 里看到的 si 一项的占比，
+就是这条收包路径的 CPU 开销；它高到挤压应用，说明帧处理本身—
+—而不只是中断进出——已经成为瓶颈，下一步手段是多队列分流，见
+下一段。
+
+权衡可以量化。设合并参数 N=32、T=40 $\mu$s：小帧线速下 32 帧只需
+$32\times0.672\approx21.5\mu s$，先于超时触发，中断率从约 149 万
+次/秒降到 $1.49\times10^{6}/32\approx4.7$ 万次/秒，CPU 开销
+$4.7\times10^{4}\times3\mu s\approx0.14$ 颗核——从中断风暴的 4.5
+颗核降到约七分之一颗。代价是延迟：一帧平均多等约半批的时间，十
+微秒量级。吞吐型业务把 N、T 调大；低延迟业务（行情、内存数据
+库）调小甚至关闭合并，改用绑核加 busy-poll——拿一颗核 100\% 的
+占用，换确定的几微秒时延。两个方向都对，区别只在业务把哪一头算
+作成本。
+
+把两种策略各画一条时序，这笔交换的形状如下：
+
+\begin{waveform}[x=0.8cm,y=0.9cm]
+  % 参考虚线：第 32 帧到达触发 / 等满 T 超时触发
+  \draw[BookRule, line width=0.45pt, dashed] (8.75,1.35) -- (8.75,3.9);
+  \draw[BookRule, line width=0.45pt, dashed] (12.0,1.35) -- (12.0,3.9);
+  % 帧到达（线速，不聚合场景）
+  \foreach \x in {1.0,1.25,...,8.9} \draw[BookTeal, line width=0.9pt] (\x,7.0) -- (\x,7.55);
+  \node[hw label, anchor=east] at (0.8,7.28) {帧到达（线速）};
+  % 中断·不聚合：每帧一次
+  \draw[BookAccent, line width=0.9pt] (1.0,5.4) -- (9.0,5.4);
+  \foreach \x in {1.0,1.25,...,8.9} \draw[BookAccent, line width=0.9pt] (\x,5.4) -- (\x,6.0) -- ({\x+0.13},6.0) -- ({\x+0.13},5.4);
+  \node[hw label, anchor=east] at (0.8,5.7) {中断·不聚合};
+  \node[hw label] at (6.4,4.9) {不聚合：每帧一次，$\approx$149 万次/秒，CPU $\approx$4.5 核};
+  % 帧到达（聚合场景：线速 32 帧 + 低负载单帧）
+  \foreach \x in {1.0,1.25,...,8.9} \draw[BookTeal, line width=0.9pt] (\x,3.2) -- (\x,3.75);
+  \draw[BookTeal, line width=0.9pt] (10.2,3.2) -- (10.2,3.75);
+  \node[hw label, anchor=east] at (0.8,3.48) {帧到达};
+  \draw[BookMuted, line width=0.6pt, <->] (1.0,4.05) -- (8.75,4.05);
+  \node[hw label] at (4.9,4.34) {攒满 32 帧 $\approx$21.5 $\mu$s（先于超时）};
+  \draw[BookMuted, line width=0.6pt, <->] (10.2,4.05) -- (12.0,4.05);
+  \node[hw label] at (11.1,4.34) {等满 $T$=40 $\mu$s};
+  \node[hw label] at (10.4,2.92) {低负载：单帧到达};
+  % 中断·聚合：攒满一批或超时，才发一次
+  \draw[BookAccent, line width=0.9pt] (1.0,1.6) -- (8.75,1.6) -- (8.75,2.2) -- (9.05,2.2) -- (9.05,1.6) -- (12.0,1.6) -- (12.0,2.2) -- (12.3,2.2) -- (12.3,1.6) -- (12.6,1.6);
+  \node[hw label, anchor=east] at (0.8,1.9) {中断·聚合};
+  \node[hw label] at (6.3,0.95) {聚合 $N$=32 / $T$=40 $\mu$s：$\approx$4.7 万次/秒，CPU $\approx$0.14 核};
+\end{waveform}
+\diagramnote{中断聚合的时序对比。上方不聚合：每帧一次中断，1.49 Mpps 折合每秒约 149 万次中断进出，约 4.5 颗核的算力全花在保存与恢复现场上。下方聚合：攒满 32 帧（线速下约 21.5 $\mu$s，先于超时）或等满 T=40 $\mu$s——先到为准——才发一次中断，中断率降到约 4.7 万次/秒，CPU 开销约 0.14 核；代价是一帧平均多等约半个聚合窗口。}
+
+\begin{longtable}{L{0.16\linewidth}L{0.32\linewidth}L{0.20\linewidth}L{0.20\linewidth}}
+\toprule
+参数 & 机制 & 偏向吞吐 & 偏向时延 \\
+\midrule
+帧数阈值 N & 攒够 N 帧发一次中断 & 调大（如 32--64） & 调小或置 1 \\
+超时 T & 距上次中断满 T $\mu$s 即发 & 调大（几十 $\mu$s） & 调小或置 0 \\
+轮询预算 & NAPI 每次最多收多少帧 & 调大 & 适中，防占核过久 \\
+busy-poll & 应用自旋收帧，跳过中断 & 浪费核 & 时延最低且稳 \\
+\bottomrule
+\end{longtable}
+
+观察手段是现成的：每秒读一次 /proc/interrupts 里各网卡队列的中
+断计数，与流量对比就知道合并参数是否合身——中断率贴近 pps，说
+明合并未生效；中断率过低而时延投诉上升，说明 N、T 过了头。
+ethtool -c 与 -C 查询、调整这些参数。调网卡的第一步通常不是换硬
+件，而是把中断率、环深、pps 三个数摆在一起看；三者相符，瓶颈才
+轮到协议栈和应用。
+
+\begin{lstlisting}
+$ grep eth0 /proc/interrupts
+ 28:  1204431        0        0        0  IO-APIC  28-fasteoi  eth0-rx-0
+ 29:        0  1188204        0        0  IO-APIC  29-fasteoi  eth0-rx-1
+ 30:        0        0  1210022        0  IO-APIC  30-fasteoi  eth0-rx-2
+ 31:        0        0        0  1195330  IO-APIC  31-fasteoi  eth0-rx-3
+# per-queue counters spread over 4 CPUs: RSS and affinity agree
+\end{lstlisting}
+
+读法：每个队列的中断计数应大致均匀地散在各核上；挤在一列说明
+RSS 或绑核没有配对，整行全为 0 的队列说明中断亲和漏配。这个文
+件也是下一话题的入口：多队列不是插上就有，是用对才有。
+
+\topic{多队列与 RSS}单队列的天花板先算清楚：一个环只能由一颗核
+服务——保序与 cache 局部性都要求如此——单核跑协议栈每秒约
+1--2M 帧已是优化后的水平；10 GbE 小帧是 14.88 Mpps，差一个数量
+级。单队列网卡插上万兆链路，瓶颈不在线，在环。用“冒险、异常与性能”一章 Little
+定律的读法：收帧路径的吞吐等于并行消费者数乘单消费者速率，在途
+帧排得再多，消费者只有一颗核。
+
+多队列网卡把 RX/TX 环做成很多对，常见 16--128 对，每对绑一个
+MSI-X 中断向量、绑一颗核。接收侧的分流由硬件完成：RSS 对每帧的
+五元组（源 IP、目的 IP、源端口、目的端口、协议号）计算 Toeplitz
+哈希，取哈希低位查间接表，把帧定向到对应队列。同一条流哈希相
+同，永远进同一队列，天然保序；不同的流散到不同核，并行处理。发
+送侧对称：软件按流或按 CPU 选发送队列，各核各挂各的环，提交路
+径无锁。
+
+分流的全过程画成一张图，就是哈希定向加按核绑环：
+
+\begin{pdfdiagram}
+  \node[hw label, anchor=south] at (5.5,0.68) {同一条流哈希相同，永远进同一队列——天然保序};
+  \node[hw state, minimum width=2.4cm] (nic) at (1.5,-1.28) {网卡收包\\10GbE 小帧\\14.88 Mpps};
+  \node[hw compute, minimum width=2.8cm] (hash) at (4.35,-1.28) {RSS：五元组\\Toeplitz 哈希\\低位查间接表};
+  \draw[hw bus] (nic.east) -- (hash.west);
+  % 队列（示意 4 行，常见 16--128 对）
+  \node[hw memory, minimum width=1.6cm, minimum height=0.55cm, inner sep=1pt] (q0) at (7.05,0) {RX 环 0};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.55cm, inner sep=1pt] (q1) at (7.05,-0.85) {RX 环 1};
+  \node[hw label] at (7.05,-1.7) {$\vdots$};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.55cm, inner sep=1pt] (q15) at (7.05,-2.55) {RX 环 15};
+  % 核
+  \node[hw compute, minimum width=1.3cm, minimum height=0.55cm, inner sep=1pt] (c0) at (9.6,0) {核 0};
+  \node[hw compute, minimum width=1.3cm, minimum height=0.55cm, inner sep=1pt] (c1) at (9.6,-0.85) {核 1};
+  \node[hw label] at (9.6,-1.7) {$\vdots$};
+  \node[hw compute, minimum width=1.3cm, minimum height=0.55cm, inner sep=1pt] (c15) at (9.6,-2.55) {核 15};
+  % 哈希到队列：共享竖直干线，分层折出
+  \draw[hw bus] (hash.east) -- (6.05,-1.28);
+  \draw[BookMuted, line width=0.62pt] (6.05,0) -- (6.05,-2.55);
+  \draw[hw bus] (6.05,0) -- (q0.west);
+  \draw[hw bus] (6.05,-0.85) -- (q1.west);
+  \draw[hw bus] (6.05,-2.55) -- (q15.west);
+  % 队列到核：一对一
+  \draw[hw bus] (q0.east) -- (c0.west);
+  \draw[hw bus] (q1.east) -- (c1.west);
+  \draw[hw bus] (q15.east) -- (c15.west);
+  \node[hw label] at (5.5,-3.4) {每对环绑一个 MSI-X 向量、绑一颗核；单核约 1.5 Mpps，16 颗核并行才接得住 14.88 Mpps};
+\end{pdfdiagram}
+\diagramnote{RSS 接收分流：网卡对每帧的五元组算 Toeplitz 哈希，取低位查间接表，把帧定向到对应 RX 环；每对环绑一个 MSI-X 中断向量、绑一颗核，各核独立处理自己环上的帧，提交路径无锁。同一条流哈希相同、永远进同一队列，保序由哈希天然保证；并行度由队列对数决定——10 GbE 小帧 14.88 Mpps 对单核约 1.5 Mpps，16 队列绑 16 核才接得住。}
+
+配置按一遍数：10 GbE 小帧 14.88 Mpps，单核约 1.5 Mpps，需要约 10
+颗核起步，留余量配 16 队列、16 个 MSI-X 向量、绑 16 颗核。三个
+配置必须一起看：队列数、间接表、中断亲和——队列开了 32 条而中
+断全绑在核 0，等于单队列；irqbalance 之类的自动均衡在万兆以上
+往往帮倒忙，绑核要按队列手工固定。
+
+同样的算法推到更高速率：25 GbE 小帧约 37.2 Mpps，40 GbE 约 59.5
+Mpps，100 GbE 约 148.8 Mpps——单核约 1.5 Mpps 的处理率面前，需
+要的核数按比例涨到约 25、40、100 颗，已经没有机器装得下。速率
+每翻一番，"每帧固定成本"问题就尖锐一分：100 GbE 时代还按"中断
+加协议栈逐帧处理"的模型工作是不成立的，内核旁路与硬件卸载从可
+选项变成必选项，这正是零拷贝一段要收尾的方向。
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.34\linewidth}}
+\toprule
+组件 & 作用 & 配置不当的典型症状 \\
+\midrule
+队列对 & 收发各一条环，独立 DMA 与中断 & 队列少于核数，部分核闲置 \\
+MSI-X 向量 & 每队列一个中断号 & 向量不足，多队列共享中断互拖 \\
+RSS 间接表 & 哈希值到队列的映射 & 映射不均，各核负载歪斜 \\
+中断亲和 & 把向量绑到指定核 & 全绑核 0，等于退回单队列 \\
+\bottomrule
+\end{longtable}
+
+RSS 也有边界。它只认五元组：GRE、VxLAN 等隧道的外层包头都相
+同，所有隧道流量挤进一条队列，较新的网卡支持按内层字段哈希来解
+决。单条大象流永远只能跑一颗核的速度，这是保序的代价，只能靠多
+开几条流来绕。与 RSS 同族的卸载还有 TSO 与 GRO：发送侧由网卡把
+大块数据切成 MTU 帧，接收侧把同流相邻帧拼成大块再上交——它们
+不改队列结构，改的是"每帧固定成本"里的帧数，与巨型帧是同一思
+想的软硬件两种实现。
+
+\topic{零拷贝的基本思想}先算拷贝一次的成本。传统收包路径上，网
+卡 DMA 把帧写进内核缓冲区，这一步不占 CPU；协议栈处理后再由
+copy\_to\_user 把数据复制一份到应用缓冲区——这一次是 CPU 逐字
+节的复制，读一遍、写一遍。10 Gb/s 的流量约 1.25 GB/s，一次拷贝产
+生 2.5 GB/s 的内存流量；收发各拷一次就是 5 GB/s，约占一条
+DDR4-3200 通道（25.6 GB/s）可用带宽的两成，还没算 cache 被冲刷的
+间接代价。用“冒险、异常与性能”一章 roofline 的话说：每次无谓的拷贝都在消耗全机
+共享的带宽屋顶，留给应用的屋顶相应变矮。
+
+零拷贝的思路是让数据在内存里只躺一份，流转的是"这块缓冲区归
+谁"。sendfile 让文件页缓存直接对接 socket，配合支持
+scatter-gather 的网卡，连"协议头加数据"的拼接都由网卡 gather
+DMA 完成，CPU 一个字节不搬；splice 在两个文件描述符之间搬运页
+指针；mmap 让应用直接读写内核页，省掉复制但引入页错误与同步的
+成本；io\_uring 的固定缓冲区与 AF\_XDP 更进一步，把缓冲区的所有
+权约定直接开放给用户态。注意"零拷贝"省的从来不是 DMA 那一次
+——设备搬运本来就绕不开——省的是内核与用户态之间那一次 CPU
+复制。
+
+\begin{lstlisting}
+#include <sys/sendfile.h>
+
+/* stream a file to a socket without copying through user space */
+ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count);
+
+/* kernel path: page cache pages -> socket buffer -> NIC gather DMA;
+   file contents never pass through a CPU register */
+\end{lstlisting}
+
+两条路径并排画出来，零拷贝省掉的是哪一段就一目了然：
+
+\begin{pdfdiagram}
+  % 传统路径：两次 CPU 拷贝
+  \node[hw label, anchor=west] at (0.4,0.98) {传统：页缓存 $\to$ 应用缓冲 $\to$ socket 缓冲，两次 CPU 拷贝};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (pc1) at (1.4,0) {页缓存};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (ub) at (4.2,0) {应用缓冲};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (sb1) at (7.0,0) {socket 缓冲};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (nic1) at (9.8,0) {网卡};
+  \draw[hw bus] (pc1.east) -- (ub.west);
+  \draw[hw bus] (ub.east) -- (sb1.west);
+  \draw[hw bus] (sb1.east) -- (nic1.west);
+  \node[hw label, anchor=south] at (2.8,0.62) {① CPU 拷贝};
+  \node[hw label, anchor=south] at (5.6,0.62) {② CPU 拷贝};
+  \node[hw label, anchor=south] at (8.4,0.62) {③ DMA};
+  % 零拷贝路径
+  \node[hw label, anchor=west] at (0.4,-0.98) {零拷贝 sendfile：流转的是缓冲区归属，CPU 不搬数据};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (pc2) at (1.4,-1.95) {页缓存};
+  \node[hw memory, minimum width=2.6cm, minimum height=0.8cm] (sb2) at (5.6,-1.95) {socket 缓冲\\只记指针};
+  \node[hw memory, minimum width=2.0cm, minimum height=0.8cm] (nic2) at (9.8,-1.95) {网卡};
+  \draw[hw return] (pc2.east) -- (sb2.west);
+  \draw[hw bus] (sb2.east) -- (nic2.west);
+  \node[hw label, anchor=south] at (2.85,-1.33) {只改归属};
+  \node[hw label, anchor=south] at (8.35,-1.33) {gather DMA};
+  \node[hw label] at (5.5,-2.9) {10 Gb/s 下两次 CPU 拷贝产生 5 GB/s 内存流量，约占一条 DDR4-3200 通道（25.6 GB/s）的两成};
+\end{pdfdiagram}
+\diagramnote{发送一个文件的两种路径。传统路径上数据两次经过 CPU：页缓存拷进应用缓冲、应用缓冲再拷进 socket 缓冲，每次都是读一遍写一遍，10 Gb/s 的流量就此产生 5 GB/s 的内存流量。sendfile 让页缓存直接对接 socket，缓冲区只改归属、内容原地不动，网卡用 gather DMA 把协议头与数据拼接发出，CPU 一个字节不搬——省的是内核与用户态之间那次复制，设备 DMA 那一步本来就有。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+机制 & 省掉的是哪次拷贝 & 适用场景 \\
+\midrule
+sendfile & 文件页缓存到用户态的往返 & 静态文件服务、CDN \\
+splice & 任意两个 fd 之间的搬运 & 代理、转发管道 \\
+mmap & 读方向的复制 & 随机访问大文件 \\
+io\_uring 固定缓冲 & 每次 I/O 的缓冲区注册与复制 & 高频异步 I/O \\
+AF\_XDP / DPDK & 整个内核协议栈路径 & 极端 pps 的专用应用 \\
+\bottomrule
+\end{longtable}
+
+工程含义与边界。零拷贝的本质是所有权转移代替内容复制，正是第五
+章"缓冲区何时归 CPU、何时归设备"那条问题在协议栈内部的延长
+线。它不是免费午餐：页共享带来生命周期管理与写时复制的复杂度，
+数据量小时固定开销可能盖过节省；它适用的条件是大块数据、高带
+宽、CPU 比带宽更紧张——这正是存储服务器、CDN、反向代理人手一
+份 sendfile 的原因。从本章视角看，零拷贝与中断聚合、RSS 是同一
+族手段：网络栈的性能工作，大半是在给"每帧固定成本"与"每字节
+搬运成本"这两项开销找出路。
+
+旁路也不是没有代价。把协议栈整个绕开，意味着 TCP 的拥塞控制、
+分片、校验和、防火墙一并让位，应用要么自己实现，要么声明不需
+要；内核协议栈占的 CPU，换来的正是这些不免费的功能。工程上成熟
+的做法是分层：极端 pps 的入口（行情网关、负载均衡）用旁路或
+AF\_XDP，业务主体仍走内核栈加零拷贝。存储与设备事务部分那句提醒在这里同样
+成立：约定一旦绕开，原来由内核代管的所有权、可见性与错误处理，
+全部换成应用自己的功课。
+
+\section{二、外设队列综合案例与尾延迟}
+
+前四节分别看了三类设备的介质与各自的队列结构，本节把它们汇合到一个
+问题上：队列机制怎样决定外设实际表现出来的性能。
+
+\topic{NVMe 的队列模型}
+存储与设备事务部分讲描述符环时给过一般结构：环不动、指针动，doorbell 只通知、不
+携带数据，完成与否以设备写回的状态为准。NVMe 把这套结构定型为规范，
+并针对多核做了两处关键改动。第一处改动是队列成对：NVMe 的基本单元
+是一对队列——提交队列 SQ（submission queue）与完成队列 CQ
+（completion queue）。SQ 项是 64 字节的命令：操作码（读、写、
+flush）、起始 LBA、块数，以及 PRP 数据指针列表，逐页给出数据在主机
+内存里的物理地址；CQ 项是 16 字节的完成记录：命令 ID、状态码，以及
+一个相位位——队列回绕一圈相位翻一次，主机据此区分新旧完成项，不必
+比较指针。提交与完成分成两个环，各走各的指针：设备消费 SQ 不必等主
+机回收 SQ，完成信息也不挤在命令项里写回。这是比存储与设备事务部分通用环更彻底
+的分工。
+
+一次提交的完整序列有七步，逐步对应存储与设备事务部分的每一条约定：
+
+\begin{lstlisting}
+1. 驱动把 64 B 命令项写入本核 SQ 的尾槽
+2. 屏障：保证命令项先于通知对设备可见
+3. 写 SQ 尾 doorbell（一次 MMIO 写，内容只是新尾指针）
+4. 设备看到指针差，DMA 取走新命令项
+5. 设备执行：查 FTL、读 NAND，按 PRP 地址把数据 DMA 进内存
+6. 设备写 16 B CQ 完成项，相位位翻转
+7. 设备发 MSI-X 中断；驱动读 CQ、按命令 ID 找回请求并回收，
+   最后写 CQ 头 doorbell，把完成槽位还给设备
+\end{lstlisting}
+
+第 3 步的 doorbell 仍然不携带数据：设备靠首尾指针的差补读新命令，偶
+尔错过一次 doorbell 并无妨碍；第 6、7 步的次序也不许交换：先写完成
+项、再发中断，主机在中断处理里读到的一定是已经写好的 CQ 项。存储与设备事务部分
+"描述符先可见、再通知"和"完成以写回状态为准"这两条规则，在这里原
+样成立，只是被写进了设备规范，由硬件而不是驱动员的细心来保证。
+
+把这条链路画成图，主机内存、doorbell 寄存器与设备之间的
+分工如下：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=1.9cm] (cpu) at (0.9,0.55) {CPU\\（本核驱动）};
+  % 主机内存：SQ 环与 CQ 环
+  \draw[BookAmber, line width=0.42pt, rounded corners=2pt] (2.6,-1.3) rectangle (7.2,1.35);
+  \node[hw label, anchor=west] at (2.75,1.08) {SQ：64 B 命令项环};
+  \node[hw label, anchor=east] at (7.1,0.12) {主机内存（DRAM）};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] (sq1) at (3.35,0.55) {命令};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (4.35,0.55) {命令};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (5.35,0.55) {命令};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] (sq4) at (6.35,0.55) {$\cdots$};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (3.35,-0.55) {完成};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (4.35,-0.55) {完成};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] at (5.35,-0.55) {完成};
+  \node[hw state, minimum width=0.78cm, minimum height=0.5cm] (cq4) at (6.35,-0.55) {$\cdots$};
+  \node[hw label, anchor=west] at (2.75,-1.05) {CQ：16 B 完成项环};
+  \node[hw control, minimum width=1.6cm] (db) at (8.3,0.45) {doorbell\\寄存器};
+  \node[hw compute, minimum width=1.9cm] (dev) at (10.45,0.45) {NVMe 控制器\\FTL + DMA};
+  % ① 驱动把命令项写进本核 SQ 尾槽
+  \draw[hw bus] (cpu.east) -- (sq1.west);
+  \node[hw label, anchor=west] at (2.75,0.12) {① 写命令项};
+  % ② 屏障后写 SQ 尾 doorbell（MMIO，控制）
+  \draw[hw return] (cpu.south) -- (0.9,-2.0) -- (8.3,-2.0) -- (db.south);
+  \node[hw label, above] at (4.5,-2.0) {② 写 SQ 尾 doorbell（MMIO）};
+  % ③ 设备按指针差 DMA 取走命令
+  \draw[hw bus] (sq4.north) -- (6.35,1.85) -- (10.45,1.85) -- (dev.north);
+  \node[hw label, above] at (8.3,1.85) {③ DMA 取命令};
+  % doorbell 通知设备（只携带新尾指针）
+  \draw[hw return] (db.east) -- (dev.west);
+  % ④ 设备写完成项进 CQ（device.south 竖直干线共享）
+  \draw[hw bus] (dev.south) -- (10.45,-1.5) -- (6.35,-1.5) -- (cq4.south);
+  \node[hw label, below] at (7.3,-1.5) {④ 写完成项};
+  % ⑤ MSI 中断回本核
+  \draw[hw return] (dev.south) -- (10.45,-2.6) -- (0.3,-2.6) -- (0.3,0.07);
+  \node[hw label, below] at (5.0,-2.6) {⑤ MSI 中断回本核};
+\end{pdfdiagram}
+\diagramnote{NVMe 的提交—完成链路。驱动把 64 B 命令项写进本核 SQ 尾槽（①），屏障之后写 SQ 尾 doorbell（②）——doorbell 只携带新尾指针；设备按指针差 DMA 取走命令（③），执行后把 16 B 完成项写进 CQ（④），此时数据已按 PRP 地址 DMA 进入内存，最后以 MSI-X 中断通知本核（⑤）。SQ 与 CQ 各自独立、每核一对，提交路径上没有需要上锁的共享状态。}
+
+第二处改动是多队列。规范允许最多 65535 对 I/O 队列，每对深度上限
+65535；真实盘实现的对数远小于此（几十到几千），但已足够给每个 CPU
+核配一对。每核一对的用意是免锁：各核写自己的 SQ、收自己的 CQ，尾指
+针是核私有的，提交路径上没有任何共享状态需要上锁。这不是锁实现得好，
+而是根本没有共享——“冒险、异常与性能”一章谈多核时说过，把共享拆开比把锁做快更值钱，
+NVMe 的多队列是这句话在外设接口上的直接应用。配合 MSI-X 的多向量中
+断，完成也能按队列分发回本核处理，提交与完成两条路径都不出核。
+
+把每核一对的结构画出来，免锁与不出核是同一件事的两个侧面：
+
+\begin{pdfdiagram}
+  % 左：各核
+  \node[hw compute, minimum width=1.1cm, minimum height=0.62cm] (k0) at (0.85,0.5) {核 0};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.62cm] (k1) at (0.85,-0.6) {核 1};
+  \node[hw label] at (0.85,-1.55) {$\vdots$};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.62cm] (kn) at (0.85,-2.5) {核 $n$};
+  % 中：每核一对 SQ/CQ（主机内存）
+  \node[hw memory, minimum width=3.1cm] (p0) at (4.05,0.5) {SQ 0：命令环\\CQ 0：完成环};
+  \node[hw memory, minimum width=3.1cm] (p1) at (4.05,-0.6) {SQ 1：命令环\\CQ 1：完成环};
+  \node[hw label] at (4.05,-1.55) {$\vdots$};
+  \node[hw memory, minimum width=3.1cm] (pn) at (4.05,-2.5) {SQ $n$：命令环\\CQ $n$：完成环};
+  \node[hw compute, minimum width=2.6cm] (ctl) at (8.35,-1.0) {NVMe 控制器\\FTL＋DMA 引擎};
+  % 提交：命令项 + doorbell
+  \draw[hw bus] (k0.east) -- (p0.west);
+  \draw[hw bus] (k1.east) -- (p1.west);
+  \draw[hw bus] (kn.east) -- (pn.west);
+  \node[hw label, anchor=south] at (1.95,1.0) {写命令项};
+  \draw[BookMuted, line width=0.62pt] (6.15,0.5) -- (6.15,-2.5);
+  \draw[hw bus] (p0.east) -- (6.15,0.5);
+  \draw[hw bus] (p1.east) -- (6.15,-0.6);
+  \draw[hw bus] (pn.east) -- (6.15,-2.5);
+  \draw[hw bus] (6.15,-1.0) -- (ctl.west);
+  \node[hw label, anchor=east] at (6.0,-1.15) {DMA 取命令};
+  % doorbell：只带新尾指针
+  \draw[hw return] (kn.south) -- (0.85,-3.35) -- (8.35,-3.35) -- (ctl.south);
+  \node[hw label, anchor=north] at (4.6,-3.42) {doorbell：只带新尾指针（每队列一对寄存器）};
+  % 完成：写 CQ + MSI-X 回本核
+  \draw[hw return] (ctl.north) -- (8.35,1.35) -- (4.05,1.35) -- (p0.north);
+  \node[hw label, anchor=south] at (6.2,1.42) {写 CQ 完成项，MSI-X 回本核};
+  \node[hw label] at (4.6,-4.25) {尾指针核私有：提交路径上没有共享状态；规范上限 65535 对、每对深 65535};
+\end{pdfdiagram}
+\diagramnote{NVMe 的多队列结构：每核一对 SQ/CQ，尾指针核私有，doorbell 只携带新尾指针；设备经 DMA 取走命令、写 CQ 完成项，再以 MSI-X 按队列分发回本核——提交与完成两条路径都不出核。免锁不是锁实现得好，而是提交路径上根本没有共享状态。规范允许最多 65535 对队列、每对深 65535，真实盘实现几十到几千对，常用深度 32 至 1024。}
+
+对照 AHCI，就能看出这两处改动解决了什么。AHCI 整台控制器只有一张命
+令表，32 个槽位（NCQ 深度 32），一个完成中断源：所有核的提交都抢同
+一张表的锁，完成中断也集中在一处。在 SATA 的 600 MB/s、约十万 IOPS
+的上限下，这张表不是瓶颈；PCIe SSD 把带宽抬高一个数量级、把 IOPS
+抬高两个数量级，提交路径上的共享状态先成为瓶颈。NVMe 的多队列不是
+锦上添花，而是把 AHCI 那张唯一的表拆开之后的必然形态。
+
+把两代接口的提交结构并排画出来，瓶颈的出处一目了然：
+
+\begin{pdfdiagram}
+  % 分隔线
+  \draw[BookRule, line width=0.45pt, dashed] (5.35,0.9) -- (5.35,-3.0);
+  % 左：AHCI
+  \node[hw label] at (2.55,0.95) {AHCI：整控制器一张命令表（32 槽）};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (c0) at (0.55,0.35) {核 0};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (c1) at (0.55,-0.35) {核 1};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (c2) at (0.55,-1.05) {核 2};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (c3) at (0.55,-1.75) {核 3};
+  \draw[BookMuted, line width=0.62pt] (1.35,0.35) -- (1.35,-1.75);
+  \draw[hw bus] (c0.east) -- (1.35,0.35);
+  \draw[hw bus] (c1.east) -- (1.35,-0.35);
+  \draw[hw bus] (c2.east) -- (1.35,-1.05);
+  \draw[hw bus] (c3.east) -- (1.35,-1.75);
+  \node[hw control, minimum width=1.3cm] (lk) at (2.35,-0.7) {表锁};
+  \node[hw memory, minimum width=2.0cm] (tb) at (4.1,-0.7) {命令表\\32 槽（NCQ）};
+  \draw[hw bus] (1.35,-0.7) -- (lk.west);
+  \draw[hw bus] (lk.east) -- (tb.west);
+  \node[hw label] at (2.55,-2.6) {多核提交抢同一把表锁\\完成中断集中一处};
+  % 右：NVMe
+  \node[hw label] at (8.6,0.95) {NVMe：每核一对 SQ/CQ};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (d0) at (6.25,0.35) {核 0};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (d1) at (6.25,-0.35) {核 1};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (d2) at (6.25,-1.05) {核 2};
+  \node[hw compute, minimum width=0.9cm, minimum height=0.55cm] (d3) at (6.25,-1.75) {核 3};
+  \node[hw memory, minimum width=1.9cm, minimum height=0.55cm] (q0) at (8.05,0.35) {SQ/CQ 0};
+  \node[hw memory, minimum width=1.9cm, minimum height=0.55cm] (q1) at (8.05,-0.35) {SQ/CQ 1};
+  \node[hw memory, minimum width=1.9cm, minimum height=0.55cm] (q2) at (8.05,-1.05) {SQ/CQ 2};
+  \node[hw memory, minimum width=1.9cm, minimum height=0.55cm] (q3) at (8.05,-1.75) {SQ/CQ 3};
+  \draw[hw bus] (d0.east) -- (q0.west);
+  \draw[hw bus] (d1.east) -- (q1.west);
+  \draw[hw bus] (d2.east) -- (q2.west);
+  \draw[hw bus] (d3.east) -- (q3.west);
+  \draw[BookMuted, line width=0.62pt] (9.2,0.35) -- (9.2,-1.75);
+  \draw[hw bus] (q0.east) -- (9.2,0.35);
+  \draw[hw bus] (q1.east) -- (9.2,-0.35);
+  \draw[hw bus] (q2.east) -- (9.2,-1.05);
+  \draw[hw bus] (q3.east) -- (9.2,-1.75);
+  \node[hw compute, minimum width=1.7cm] (nc) at (10.25,-0.7) {NVMe\\控制器};
+  \draw[hw bus] (9.2,-0.7) -- (nc.west);
+  \node[hw label] at (8.6,-2.6) {核私有指针，提交免锁\\MSI-X 按核分发完成};
+\end{pdfdiagram}
+\diagramnote{AHCI 与 NVMe 的提交结构对照。AHCI 整台控制器只有一张 32 槽命令表（NCQ 深度 32）：所有核的提交抢同一把表锁，完成中断也集中在一处；SATA 的 600 MB/s、约十万 IOPS 下这张表不是瓶颈，PCIe SSD 把带宽抬高一个数量级、IOPS 抬高两个数量级之后，提交路径上的共享状态先成为瓶颈。NVMe 把表拆开：每核一对 SQ/CQ，尾指针核私有、提交免锁，完成由 MSI-X 按核分发——多队列是把那张唯一的表拆开之后的必然形态。}
+
+\begin{longtable}{L{0.16\linewidth}L{0.30\linewidth}L{0.34\linewidth}}
+\toprule
+维度 & AHCI（SATA 时代） & NVMe（PCIe 时代） \\
+\midrule
+队列数 & 整控制器一张命令表 & 规范上限 65535 对 SQ/CQ \\
+每队深度 & 32（NCQ 槽位） & 上限 65535，常用 32 至 1024 \\
+提交路径 & 共享表，多核提交要抢锁 & 每核一对，核私有指针，免锁 \\
+完成通知 & 单一中断源 & MSI-X 多向量，可按核分发 \\
+典型上限 & 600 MB/s、约十万 IOPS & 数 GB/s、几十万到百万 IOPS \\
+\bottomrule
+\end{longtable}
+
+深度上限 65535 也不意味着要用满。队列深度的用途是维持在途请求数，
+“冒险、异常与性能”一章的 Little 定律给出该维持多少；用满上限买到的是排队而不是吞
+吐——本节第四主题会把这笔账算到具体数字。
+
+\topic{案例：一次 NVMe 读的完整 trace}
+把一个进程执行 \code{read(fd, buf, 4096)}、且数据不在页缓存的全过
+程按时序列出。设备取一块典型的 PCIe 3.0 x4 NVMe SSD，请求是 4 KB
+随机读。
+
+\begin{longtable}{L{0.06\linewidth}L{0.44\linewidth}L{0.14\linewidth}L{0.16\linewidth}}
+\toprule
+步 & 动作 & 耗时量级 & 执行者 \\
+\midrule
+1 & 系统调用陷入内核，检查参数与文件描述符 & 约 1 $\mu$s & CPU \\
+2 & VFS 查页缓存：未命中，分配空闲页框 & 微秒级 & CPU \\
+3 & 文件系统把文件偏移翻译成设备 LBA & 微秒级 & CPU \\
+4 & 块层生成请求，调度器尝试与相邻请求合并 & 微秒级 & CPU \\
+5 & 驱动把请求编成 64 B 命令项，写入本核 SQ 尾槽 & 微秒级 & CPU \\
+6 & 屏障之后写 SQ 尾 doorbell（MMIO 写） & 百纳秒级 & CPU \\
+7 & 设备 DMA 取走命令项 & 微秒级 & 设备 \\
+8 & 查 FTL 映射，读 NAND 页，ECC 校验 & 约 80 $\mu$s & 介质 \\
+9 & 数据按 PRP 地址 DMA 写入第 2 步的页框 & 约 1 $\mu$s & 设备 \\
+10 & 设备写 16 B CQ 完成项，相位位翻转 & 微秒级 & 设备 \\
+11 & 设备发 MSI-X，中断控制器转成 CPU 中断 & 微秒级 & 设备 \\
+12 & 中断处理读 CQ，找回请求，标记完成，唤醒进程 & 微秒级 & CPU \\
+13 & 页缓存数据拷入用户缓冲，\code{read} 返回 4096 & 微秒级 & CPU \\
+\bottomrule
+\end{longtable}
+
+总时延约 100 $\mu$s，其中第 8 步介质本身占去八成，软件与队列合计约
+两成——这就是 NVMe 时代的比例：协议和驱动的开销已被压到介质时延的
+零头，继续优化软件路径收益有限，优化介质的访问形态（对齐、合并、足
+够的在途深度）才是主战场。这张表也是排障地图：慢在哪个量级，就查哪
+一列——微秒级的步骤出问题多半是驱动或内核配置，毫秒级的问题才轮到
+介质与垃圾回收。
+
+第 6 步值得停一下：先写命令项、再写 doorbell，中间隔一道屏障，这正
+是存储与设备事务部分"描述符先可见、再通知"的约定；顺序反了，设备可能读到半写
+入的命令项。第 11 步也值得一提：MSI 不是一根专用电平线，而是设备向
+中断控制器的特定地址做一次写事务。“电源、时钟与信号完整性”一章讨论过沿导线传播的信号要付
+出走线与时序的代价；MSI 干脆把中断变成数据流里的一次写，省掉专用引
+脚，还能在写数据里携带向量号，MSI-X 于是能按队列把中断分发到不同
+核——中断从"一根线"演化成"一条消息"，和多队列是同一个设计方向。
+
+同一件事在经典芯片与平台案例的 BIOS 路径上长什么样，对照一下就清楚了：
+
+\begin{longtable}{L{0.14\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+维度 & int 13h（经典芯片与平台案例 BIOS 路径） & NVMe 路径 \\
+\midrule
+提交 & 参数装寄存器，执行 \code{int 0x13} & 命令项写内存队列，doorbell 通知 \\
+地址 & CHS 柱面/磁头/扇区 & LBA 加 PRP 物理页列表 \\
+等待 & BIOS 轮询状态寄存器，独占 CPU & 进程睡眠，完成由 MSI 唤醒 \\
+并发 & 一次一个在途 & 几百在途，多队列并行 \\
+搬运 & 软盘走 8237 DMA，硬盘 PIO 或总线主控 & 设备直接 DMA 到页框 \\
+\bottomrule
+\end{longtable}
+
+骨架是同一个：准备命令、通知设备、DMA 搬数、确认完成。int 13h 是这
+套骨架的同步简化版——提交即等待，全程没有队列，CPU 停在 BIOS 例程
+里轮询；NVMe 是它的并发完整版——提交与完成解耦，等待换成中断，在
+途请求从一个变成几百个。从 8237 的一个 DMA 通道到每核一对队列，外
+设接口四十年的演进主线，就是把"一次一单"改成"持续事务流"，而描
+述符与 DMA 这两个零件自始至终没有换过。
+
+\topic{尾延迟：P99 从哪里来}
+前面反复出现的"典型时延 100 $\mu$s"只是中位数附近的值。“冒险、异常与性能”一章已
+经立下规矩：时延是一个分布，平均值会撒谎。外设是把这条规矩演绎得最
+充分的地方——慢请求不是随机噪声，而是有明确物理来源的事件，每一类
+都对应本章前几节讲过的机制：
+
+\begin{longtable}{L{0.16\linewidth}L{0.36\linewidth}L{0.14\linewidth}L{0.20\linewidth}}
+\toprule
+长尾来源 & 物理机制 & 典型幅度 & 触发条件 \\
+\midrule
+GC 擦除 & 写请求排在一次块擦除与有效页搬运后面 & 毫秒级 & 空闲块耗尽、盘接近写满 \\
+队列拥塞 & 深队列高负载下排队，“冒险、异常与性能”一章的 $1/(1-\rho)$ & 百微秒级 & 深度过大或负载接近饱和 \\
+SMR 重写 & 区域写满触发整段重写（第三节） & 十毫秒级至秒级 & 随机写命中已写区域 \\
+读重试 & 阈值电压漂移，ECC 纠不动，换挡重读 & 数十微秒至毫秒 & 老盘、高温、久置数据 \\
+映射回读 & FTL 映射在 DRAM 中未命中，回读 NAND 映射页 & 百微秒级 & 冷地址、大跨度跳跃 \\
+\bottomrule
+\end{longtable}
+
+这些事件不常发生，所以中位数很好看；但一旦发生就是十倍、百倍的慢。
+消费级 NVMe SSD 上 4 KB 随机读的典型分布是：
+
+\begin{longtable}{L{0.14\linewidth}L{0.16\linewidth}L{0.20\linewidth}L{0.32\linewidth}}
+\toprule
+百分位 & 时延 & 相对中位数 & 直观含义 \\
+\midrule
+P50 & 100 $\mu$s & 1 倍 & 典型请求 \\
+P99 & 1 ms & 10 倍 & 每 100 个里约 1 个这么慢 \\
+P999 & 10 ms & 100 倍 & 每 1000 个里约 1 个这么慢 \\
+\bottomrule
+\end{longtable}
+
+把这张分布画成直方图，长尾的形状比数字更直接：
+
+\begin{pdfdiagram}
+  % 坐标轴
+  \draw[BookMuted, line width=0.6pt, ->] (0.5,0) -- (11.0,0);
+  \draw[BookMuted, line width=0.6pt, ->] (0.5,0) -- (0.5,4.0);
+  \node[hw label, anchor=south] at (0.5,4.05) {请求数};
+  \node[hw label] at (6.9,-0.3) {时延（横轴按对数间距）};
+  % 直方图：主峰在 100 µs 附近，长尾拖向 1 ms、10 ms
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (0.8,0) rectangle (1.3,0.7);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (1.35,0) rectangle (1.85,3.2);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (1.95,0) rectangle (2.45,1.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (2.55,0) rectangle (3.05,0.8);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (3.25,0) rectangle (3.75,0.5);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (4.05,0) rectangle (4.55,0.35);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (5.05,0) rectangle (5.55,0.25);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (6.25,0) rectangle (6.75,0.18);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (7.65,0) rectangle (8.15,0.13);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (9.15,0) rectangle (9.65,0.1);
+  \filldraw[fill=BookTeal!25, draw=BookTeal, line width=0.5pt] (10.15,0) rectangle (10.65,0.07);
+  % 百分位参考线与平均值
+  \draw[BookMuted, line width=0.5pt, dashed] (1.6,0) -- (1.6,3.75);
+  \node[hw label, anchor=west] at (1.72,3.9) {P50 = 100 $\mu$s};
+  \draw[BookRed, line width=0.5pt, dashed] (2.5,0) -- (2.5,3.35);
+  \node[hw label, anchor=west, text=BookRed] at (2.62,3.5) {平均值 $\approx$199 $\mu$s};
+  \draw[BookRed, line width=0.6pt, ->] (1.72,2.9) -- (2.4,2.9);
+  \node[hw label, anchor=west] at (2.62,2.9) {被长尾拉偏};
+  \draw[BookMuted, line width=0.5pt, dashed] (9.4,0) -- (9.4,1.5);
+  \node[hw label, anchor=south] at (9.4,1.55) {P99 = 1 ms};
+  \draw[BookMuted, line width=0.5pt, dashed] (10.4,0) -- (10.4,1.1);
+  \node[hw label, anchor=south] at (10.4,1.15) {P999 = 10 ms};
+  % 横轴刻度与长尾来源
+  \node[hw label, anchor=north] at (1.6,-0.12) {100 $\mu$s};
+  \node[hw label, anchor=north] at (9.4,-0.12) {1 ms};
+  \node[hw label, anchor=north] at (10.4,-0.12) {10 ms};
+  \node[hw label] at (6.2,0.85) {长尾：GC 擦除、队列拥塞、SMR 重写、读重试};
+\end{pdfdiagram}
+\diagramnote{消费级 NVMe SSD 4 KB 随机读的时延分布（横轴按对数间距）。主峰在 P50 = 100 $\mu$s；GC 擦除、队列拥塞、SMR 重写、读重试这类不常发生、一发生就是十倍百倍慢的事件，把分布拖出长尾：P99 = 1 ms，P999 = 10 ms。平均值被长尾向右拉偏，离中位数越来越远——所以外设时延必须带百分位一起报。}
+
+平均时延把这些全藏了起来。算一遍“冒险、异常与性能”一章的同款例子：100 个请求里 99
+个花 100 $\mu$s、1 个花 10 ms，平均值是
+$(99\times100+10000)/100=199\ \mu$s——平均看上去只比中位数差一倍，
+可那一个请求慢了 100 倍。若服务目标是"99\% 的请求快于
+200 $\mu$s"，一份只报平均值 199 $\mu$s 的报告，会把一次彻底的违约
+藏进"接近达标"的表象里。用户记住的从来不是平均那次，而是最慢那
+次：页面偶尔卡住三秒，原因往往就是排在 P999 上的那个请求撞上了 GC
+擦除或 SMR 重写。
+
+工程含义有三条。其一，报外设时延必须带百分位：平均值至少配 P99，交
+互与实时负载再看 P999，只报平均值的测试报告不可信。其二，容量规划
+按 P99 反推负载上限：让 P99 保持在目标内的负载，通常只有平均时延开
+始明显变坏时的一半左右——这与“冒险、异常与性能”一章"稳态利用率压在五到七成"是同
+一条纪律在外设上的形式。其三，长尾不能靠平均优化消掉，只能按来源逐
+个治理：GC 尖峰靠预留空闲块和 TRIM，队列拥塞靠限深或限流，SMR 重写
+靠改变写入形态——这正是本节后面两个主题的内容。
+
+\topic{队列深度与吞吐时延的权衡}
+“冒险、异常与性能”一章的 Little 定律 $L=\lambda W$ 用在外设上的形式是：在途请求数
+等于 IOPS 乘单请求时延。介质时延 $W$ 由物理决定（4 KB 随机读约
+100 $\mu$s），吞吐目标 $\lambda$ 由应用决定，队列深度是主机侧唯一
+的旋钮。两个方向都有代价。
+
+深度太小，喂不饱设备。QD=1 时 $\lambda=1/W=10^{4}$ IOPS，按 4 KB
+折算只有 40 MB/s——一块标称 3.5 GB/s 的盘只用了约 1\%。深度加大，
+吞吐近似线性上升，直到撞上设备自身的并行度上限（NAND 通道数与控制
+器能力）。设某盘上限为 50 万 IOPS，拐点的位置由
+$L=\lambda W=5\times10^{5}\times10^{-4}=50$ 唯一决定。越过拐点再加
+深度，吞吐不变，多出来的在途全部变成排队：QD=256 时平均时延约
+$256/(5\times10^{5})=512\ \mu$s，是介质时延的五倍多。
+
+\begin{longtable}{L{0.12\linewidth}L{0.18\linewidth}L{0.18\linewidth}L{0.34\linewidth}}
+\toprule
+队列深度 & 可达 IOPS & 平均时延 & 位置 \\
+\midrule
+1 & 1 万 & 100 $\mu$s & 深度限制，带宽饿着 \\
+4 & 4 万 & 100 $\mu$s & 深度限制 \\
+16 & 16 万 & 100 $\mu$s & 深度限制 \\
+32 & 32 万 & 100 $\mu$s & 接近拐点 \\
+64 & 50 万（封顶） & 约 128 $\mu$s & 刚过拐点，开始排队 \\
+128 & 50 万 & 约 256 $\mu$s & 排队区，吞吐不再涨 \\
+256 & 50 万 & 约 512 $\mu$s & 排队区，纯买时延 \\
+\bottomrule
+\end{longtable}
+
+这条曲线的形状与“冒险、异常与性能”一章的 roofline 是同一族：拐点左侧被深度（在途
+数）限制，右侧被设备能力封顶，拐点本身由 $\lambda W$ 决定。工程读
+法也只有一句：深度按 $\lambda W$ 取，再留一档余量；过了拐点一分钱
+吞吐也买不到，买到的全是时延。
+
+主机侧的经验值：每队列深度取 32 至 128 是常见区间；\code{fio} 压测
+的惯例 \code{iodepth=32} 正落在典型拐点附近——这是压测惯例，不是
+默认值：\code{fio} 默认走同步 I/O，\code{iodepth=1}（本章末尾的案
+例一就是踩在这个默认值上）。时延敏感的负载反而要浅：日志刷盘、同步写这类请求应走独立队列
+或浅队列，避免排在批量流量后面——用“冒险、异常与性能”一章的语言说，浅队列买的是时
+延的可预期性，不是平均速度。多队列改变的是这笔账的分母：$n$ 个核各
+开一对队列，每对只承担 $\lambda/n$，同样的总吞吐用更浅的每队深度就
+够，排队时延同步下降——NVMe 的多队列与深度取舍，是同一条定律的两
+个应用。
+
+\topic{调试案例两则}
+两则案例的共同点是：症状都出现在吞吐或时延上，根因都在队列机制与介
+质特性的交界处，定位方法都是"先看队列计数，再看介质状态"。
+
+案例一：队列深度 1 的吞吐瓶颈。症状：新服务器的 NVMe SSD 规格
+3.5 GB/s，实测顺序读只有约 40 MB/s，4 KB 随机读约 1 万 IOPS，离规格
+差两个数量级。定位：\code{iostat -x} 显示设备利用率 100\%，但队列
+长度 \code{aqu-sz} 恒为 1.00；压测用的是 \code{fio} 默认的同步
+I/O，\code{iodepth=1}。根因：同步 I/O 一次只有一个请求在途，
+Little 定律直接封顶——$4\ \text{KB}/100\ \mu\text{s}=40$ MB/s。设
+备没有病，是提交方式只给它一单做一单。修复：改用 \code{libaio} 或
+\code{io\_uring}，\code{iodepth} 提到 32。同机复测：4 KB 随机读从 1
+万 IOPS 升到约 32 万 IOPS，顺序读回到 3 GB/s 量级——吞吐涨了约 32
+倍，硬件一分钱没动。教训：报外设性能必须先报队列深度，没有深度的
+IOPS 数字没有意义；看到利用率 100\% 先看队列长度——利用率满而队列
+空，瓶颈在提交侧，不在设备侧。
+
+案例二：GC 风暴导致的周期性延迟尖峰。症状：持续随机写的服务，P50
+写时延稳定在 200 $\mu$s，但每隔几秒出现一批 10 至 50 ms 的慢写，
+P99 从 1 ms 恶化到 30 ms；写入速率越快，尖峰间隔越短。定位：时延直
+方图呈双峰；盘已写到接近满容量；SSD 健康信息里主机写入量远小于
+NAND 实际写入量，写放大超过 3。根因：盘写满后没有现成空闲块，每次
+写都要先做一次 GC——读出整块、搬走有效页、擦除——写请求排在一次
+毫秒级的擦除后面；空闲块耗尽一批就尖峰一次，所以呈周期性，且写入越
+快耗尽越快。对照实验：对盘做安全擦除（或全量 TRIM）后重测，尖峰消
+失、P99 回落，确认根因在空闲块供给，不在队列深度或接口。修复：文件
+系统开启 \code{discard} 或定期 \code{fstrim}，让删除的文件及时变回
+设备可用的空闲块；预留空间提到 20\% 以上；时延敏感的服务不把盘写
+满，容量水位线设在 70\%。用闲置容量换空闲块的持续供给，本质上是给
+GC 留余量——与“冒险、异常与性能”一章"服务台保持余量"是同一条纪律。
+
+两则案例放在一起看，方法上的共性比结论本身更值得带走。两案的设备都
+是完好的，换硬件解决不了任何一案；两案的突破口都是计数器而不是猜
+测——队列长度、利用率、写放大、时延直方图，全是现成的可观测数据；
+两案的修复也都不动设备，一个改提交方式，一个改介质水位。外设问题的
+默认值应当是"机制问题"而不是"硬件坏了"：先把 Little 定律和介质的
+脾气代进去算一遍，算不通再怀疑硬件。
+
+\topic{外设问题的通用读法}
+全章收束为一张检查表。面对任何外设的性能或异常问题，按三步走：先问
+介质特性——这类设备的物理限制是什么；再问队列机制——它用什么结构
+弥补介质的短板；最后测量验证——不看规格书看计数器，不看平均看百分
+位。三类设备放进同一张表：
+
+\begin{longtable}{L{0.10\linewidth}L{0.26\linewidth}L{0.26\linewidth}L{0.26\linewidth}}
+\toprule
+设备 & 介质先问 & 队列再问 & 测量验证 \\
+\midrule
+SSD & 空闲块剩多少，写放大多少 & 提交深度多少，谁在排队 & \code{fio} 按百分位报时延，\code{iostat} 看 \code{aqu-sz} \\
+机械盘 & 随机还是顺序，寻道占几成 & 调度器合并了吗，NCQ 用上了吗 & \code{iostat} 看 await 与服务时间之差 \\
+网卡 & 先到 pps 顶还是带宽顶，帧多大 & 聚合参数多少，多队列吃满核了吗 & \code{ethtool -S} 看丢包计数，按核看中断分布 \\
+\bottomrule
+\end{longtable}
+
+三类设备共享同一张检查表不是巧合：存储与设备事务部分的描述符环与 DMA、“冒险、异常与性能”一章的
+Little 定律与百分位纪律，在每一块外设上都是同一套语言。读外设问题
+的功力，说到底就是先认出介质那一栏，再走完后两栏。
+
+把三步走完整演练一次。某数据库机器报告"磁盘慢"：第一步问介质——这
+是一块 SATA SSD 还是 NVMe SSD、写到了几成满、随机写占多大比例，因
+为满盘加随机写正是 GC 尖峰的经典触发条件；第二步问队列——提交深度
+多少、走的是单队列还是多队列、同步写有没有和批量读混在同一对队列
+里，因为平均时延 200 $\mu$s 但 P99 到 20 ms 的形状，指向的是"排在
+慢事件后面"而不是"介质本身慢"；第三步测量验证——\code{fio} 单独复
+现负载并按百分位报时延，\code{iostat -x} 对照 \code{aqu-sz} 与利用
+率，再查 SSD 健康信息里的写放大与剩余备用块。三步走完，"磁盘慢"这
+句模糊报告就被翻译成一句可执行的话：盘已到 92\% 容量、写放大 4.5，
+先把水位降到 70\% 再谈别的。同一个流程搬到网卡上，只是第一栏换成
+pps 与帧长、第三栏换成 \code{ethtool} 计数——方法不动，参数换设备。
+
+\section*{章末练习}
+
+\begin{longtable}{L{0.2\linewidth}L{0.5\linewidth}L{0.2\linewidth}}
+\toprule
+任务 & 要求 & 学习目标 \\
+\midrule
+扇区对齐 & 某 4 KB 扇区硬盘的分区从 63 号逻辑（512 B）扇区开始，文件系统按 4 KB 块写入。求分区起始字节偏移是否为 4 KB 的整数倍；说明每次文件系统块写要触及几个物理扇区、代价是什么，并给出修复做法 & 分区边界与物理扇区对齐 \\
+写放大计算 & 某 SSD 页 16 KB、每块 256 页，随机写稳态下每块平均 75\% 为有效页。求写放大系数；主机累计写入 10 GB 时，NAND 实际被写入多少 & 写放大 $=1/(1-\text{有效占比})$ 的来源 \\
+随机 IOPS 估算 & 7200 rpm 硬盘，平均寻道 4 ms，顺序传输率 150 MB/s。估算 4 KB 随机读的 IOPS 与等效带宽，并与顺序读带宽比较 & 毫秒级寻道加旋转决定随机 IOPS \\
+中断聚合权衡 & 1 Gb/s 网卡满载 64 B 小帧（线速约 148.8 万 pps），每次中断处理约 5 $\mu$s。求不聚合时的 CPU 开销；聚合到每 32 帧一次中断后的开销；说明聚合付出的代价 & 聚合用时延换 CPU 占用 \\
+NVMe trace 排序 & 把一次 NVMe 读的这些事件排成时间序：DMA 写数据到内存、写 SQ 尾 doorbell、页缓存未命中、设备写 CQ 完成项、MSI 中断、驱动写命令项到 SQ、唤醒进程 & 提交—执行—完成三段的次序 \\
+队列深度选择 & 某 NVMe SSD 4 KB 随机读时延 90 $\mu$s，应用目标 40 万 IOPS。用 Little 定律求所需最小队列深度；若设备服务率上限 50 万 IOPS，求 QD=256 时的平均时延 & $L=\lambda W$；过拐点只加排队 \\
+\bottomrule
+\end{longtable}
+
+\section*{参考解答与要点}
+
+\begin{longtable}{L{0.18\linewidth}L{0.5\linewidth}L{0.22\linewidth}}
+\toprule
+任务 & 参考解答 & 必须掌握的要点 \\
+\midrule
+扇区对齐 & 起始偏移 $=63\times512=32256$ B，$32256/4096=7.875$，不是 4 KB 的整数倍，分区未对齐。文件系统每个 4 KB 块都跨越两个物理 4 KB 扇区，写一块要先读出两个扇区、修改、再写回（读-改-写），写代价约翻倍；SSD 上同理跨页、放大 GC 负担。修复：分区起始对齐到 1 MiB（2048 个 512 B 扇区）边界，现代分区工具默认如此 & 先算偏移再谈对齐；不对齐的代价是读-改-写 \\
+写放大计算 & 每回收一个块：块容量 $256\times16$ KB $=4$ MB，其中有效 $4\times0.75=3$ MB 须先搬出，只换得 1 MB 空闲。稳态下主机每写 1 MB，NAND 要写 1 MB 数据加 3 MB 搬运共 4 MB，写放大 $=4=1/(1-0.75)$。主机累计写 10 GB，NAND 实际写入 $10\times4=40$ GB & 有效占比越高写放大越大；留空闲空间直接降放大 \\
+随机 IOPS 估算 & 7200 rpm 每转 $60/7200\approx8.33$ ms，平均旋转等待半转 $4.17$ ms；加平均寻道 4 ms，4 KB 传输 $4096/(1.5\times10^{8})\approx0.03$ ms，单次共约 8.2 ms。IOPS $\approx1/0.0082\approx122$；等效带宽 $122\times4$ KB $\approx0.49$ MB/s，与顺序 150 MB/s 相差约 300 倍 & 随机 IOPS 由寻道加旋转写死；顺序与随机差两个数量级 \\
+中断聚合权衡 & 不聚合：$1.488\times10^{6}\times5\ \mu\text{s}\approx7.4$ CPU 秒/秒，约需 8 个核专职处理中断，系统实际早已丢包。聚合 32 帧一次：中断率 $1.488\times10^{6}/32\approx4.65\times10^{4}$ 次/秒，CPU 开销 $\approx4.65\times10^{4}\times5\ \mu\text{s}\approx0.23$ 秒/秒，约一个核的 23\%。代价：帧要等够一批或等到聚合定时器超时，平均时延增加约半个聚合窗口（$T/2$） & 聚合把到达率除以批大小；吞吐与时延的交换 \\
+NVMe trace 排序 & 次序：页缓存未命中 → 驱动写命令项到 SQ → 写 SQ 尾 doorbell → 设备 DMA 写数据到内存 → 设备写 CQ 完成项 → MSI 中断 → 唤醒进程。两处次序是硬性约定：doorbell 必须在命令项写好之后（先可见、再通知），CQ 完成项必须在 DMA 数据之后（先数据、后完成），唤醒只能在中断处理确认完成之后 & 提交—执行—完成三段；每段先后都是可见性约定 \\
+队列深度选择 & $L=\lambda W=4\times10^{5}\times90\times10^{-6}=36$，最小深度 36，工程上取 64 留一档余量。设备上限 50 万 IOPS 时已经饱和，QD=256 的平均时延 $\approx256/(5\times10^{5})=512\ \mu$s：吞吐仍是 50 万 IOPS，多出的深度全部变成排队，时延约为 90 $\mu$s 的 5.7 倍 & 深度按 $\lambda W$ 取并留余量；过拐点后加深只买排队 \\
+\bottomrule
+\end{longtable}
+\section{三、USB、HID 与音频接口的共同边界}
+
+USB 是主机调度的分层总线。设备接入后先完成复位和枚举，主机读取描述符、分配地址、选择配置，再由驱动按 endpoint 类型提交传输。设备不能像 PCIe 主设备那样任意 DMA 系统内存，而是由主控制器按调度表发起总线事务，再由主控制器 DMA 主机缓冲区。
+
+\begin{longtable}{L{0.18\linewidth}L{0.32\linewidth}L{0.4\linewidth}}
+\toprule
+传输类型 & 典型设备 & 优先保证 \\
+\midrule
+control & 枚举与配置 & 正确、可重试、双向短消息 \\
+bulk & U 盘、打印机 & 正确性和剩余带宽利用率 \\
+interrupt & 键盘、鼠标、触控 & 有界轮询间隔，不等同于物理中断线 \\
+isochronous & 音频、摄像头 & 周期带宽和时延，允许按协议处理丢失 \\
+\bottomrule
+\end{longtable}
+
+HID 报告把按键或指针状态编码成固定格式；音频接口还要处理生产者与消费者时钟略有偏差的问题，靠反馈端点、缓冲水位或采样率转换避免缓冲区逐渐溢出/耗尽。传感器接口也遵循同一思路：先确定采样时钟和数据格式，再定义缓冲、时间戳、丢样与错误报告。
+
+\section{四、从物理事件到进程可见事件}
+
+一次键盘按键会经历开关抖动、设备端扫描与消抖、USB 报告、主控制器 DMA、完成中断、内核输入子系统和用户态读取。每层都可能合并或延迟事件，因此“按键发生时刻”至少有物理接触、设备采样、主机收包和进程读取四个时间戳。
+
+排错时按层观察：设备是否枚举，endpoint 是否配置，主控制器队列是否前进，DMA 缓冲是否更新，完成中断是否到达，驱动是否把报告交给上层。只在应用程序里反复重试，无法区分线缆、电源、协议、控制器和驱动故障。

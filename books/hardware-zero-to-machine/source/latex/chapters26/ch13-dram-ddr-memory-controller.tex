@@ -1,0 +1,1762 @@
+\chapter{DRAM、DDR 与内存控制器}
+
+\begin{keyidea}
+主存访问要穿过电容单元、感放、bank、命令调度、PHY 和训练。本章把器件结构、接口时序与控制器决策放在同一条 trace 上。
+\end{keyidea}
+
+\section{一、DRAM 单元、感放与阵列}
+
+DRAM（Dynamic Random Access Memory）是主存的物理载体。与 SRAM 用六个晶体管锁存一个 bit 不同，DRAM 用\hwkey{一个晶体管加一个电容}存储一个 bit——面积仅为 SRAM 的 1/6 到 1/8，代价是读出过程破坏数据、电容持续漏电需要周期性刷新、访问延迟比 SRAM 高一个数量级。本节从单颗电容的物理结构出发，逐步推导电荷共享的定量关系、灵敏放大器的正反馈机制、行列译码与 bank 组织、时序参数、刷新策略，直到 DDR5 的子通道和片上 ECC。
+
+\begin{keyidea}
+DRAM 的核心矛盾：用最小面积（1T1C）实现最大密度，但由此带来三个工程代价——\hwkey{破坏性读出}（必须回写）、\hwkey{电容漏电}（必须刷新）、\hwkey{微弱信号}（必须感放）。所有 DRAM 架构设计都围绕这三个代价展开。
+\end{keyidea}
+
+% ======================================================================
+\topic{1T1C 单元结构：用电容存一个 bit}
+
+DRAM 存储单元由一个\hwkey{访问晶体管}（access transistor，NMOS）和一个\hwkey{存储电容}（storage capacitor, $C_S$）组成。晶体管的栅极接字线（Word Line, WL），源极接位线（Bit Line, BL），漏极接存储节点（storage node）。存储电容一端接存储节点，另一端接公共极板电压 $V_{DD}/2$。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 位线（垂直）
+  \draw[hw bus, line width=0.8pt] (0,3.2) -- (0,1.2);
+  \node[hw label, font=\small\bfseries, above] at (0,3.3) {BL};
+  % 访问晶体管 M1
+  \node[hw compute, minimum width=1.4cm, minimum height=0.9cm] (acc) at (0,0.5) {M1\\(NMOS)};
+  \draw[hw bus] (0,1.2) -- (acc.north);
+  % 字线（水平，接栅极）
+  \draw[BookAccent, line width=0.8pt] (-2.2,0.5) -- (acc.west);
+  \node[BookAccent, font=\small\bfseries, left] at (-2.3,0.5) {WL};
+  % 存储节点连线
+  \draw[hw bus, line width=0.7pt] (acc.east) -- ++(1.2,0);
+  \node[BookTeal, font=\small\bfseries] at (1.6,0.9) {storage node};
+  % 存储电容（平行板符号）
+  \draw[line width=0.9pt, BookTeal] (2.8,0.18) -- (2.8,0.82);
+  \draw[line width=0.9pt, BookTeal] (3.1,0.18) -- (3.1,0.82);
+  \draw[hw bus] (2.0,0.5) -- (2.8,0.5);
+  % 极板接 VDD/2
+  \draw[hw return, line width=0.6pt] (3.1,0.5) -- ++(1.0,0) node[right, hw label, font=\small] {$V_{DD}/2$ (plate)};
+  \node[BookTeal, font=\small\bfseries] at (2.95,-0.35) {$C_S$};
+  % 衬底接地
+  \draw[hw return] (0,-0.2) -- (0,-0.7) node[below, hw label] {VSS (substrate)};
+  % 截面标注
+  \node[hw label, text width=9.5cm] at (1.5,-1.7) {1T1C 单元截面：WL 控制 M1 栅极；M1 源极接 BL，漏极接存储节点；$C_S$ 一端接存储节点，另一端接 $V_{DD}/2$ 公共极板。存 1 时 $V_{SN} \approx V_{DD}$，存 0 时 $V_{SN} \approx 0$。};
+\end{pdfdiagram}
+\diagramnote{1T1C DRAM 单元。电容公共极板统一接 $V_{DD}/2$，使存 1 与存 0 时介质两侧的电场大小相等、方向相反（$+V_{DD}/2$ 与 $-V_{DD}/2$），把介质承受的最大电压应力减半，并减小数据内容对极板电压的耦合干扰。感放的共模工作点由位线预充电压决定，与极板电压无关。}
+
+\topic{为什么电容能存储电荷}
+
+MOS 电容的物理本质是两块导体被一层绝缘介质（$\text{SiO}_2$，或介电常数更高的\hwkey{高 $k$ 介质}如 $\text{HfO}_2$、$\text{ZrO}_2$）隔开。当存储节点电压高于极板电压时，电子被排斥出存储节点侧的导体板，等效于该板带正电荷；反之亦然。电荷量 $Q = C_S \cdot (V_{SN} - V_{plate})$。只要绝缘层足够好（漏电流极小），电荷可以保持数十毫秒。
+
+现代 DRAM 使用\hwkey{堆叠电容}（stacked capacitor）结构：电容垂直建在晶体管上方，利用圆柱形或柱状电极增大面积，在有限平面面积内实现 20--30 fF 的电容值。圆柱电极的有效面积主要是侧壁面积（周长 $\times$ 高度），把电容“立”起来之后平面占位不变而面积随高度增长，这正是“堆叠”一词的由来；高 $k$ 介质则从另一方向帮忙——介电常数约为 $\text{SiO}_2$ 的数倍，同样介质厚度下单位面积电容成倍增大，因此可以在不增加漏电的前提下维持 $C_S$。早期工艺使用沟槽电容（trench capacitor），在硅衬底中刻蚀深槽形成电容；90 nm 前后几乎全部转向堆叠结构。
+
+\begin{longtable}{L{0.22\linewidth}L{0.22\linewidth}L{0.46\linewidth}}
+\toprule
+电容结构 & 典型工艺节点 & 特点 \\
+\midrule
+平面电容 & $>$1 $\mu$m & 面积大，已被淘汰 \\
+沟槽电容（trench） & 250--90 nm & 在硅中刻蚀深槽，工艺复杂 \\
+堆叠电容（stacked） & 90 nm 至今 & 电容建在晶体管上方，高纵横比柱状结构 \\
+高 $k$ 介质 + 堆叠 & 20 nm 至今 & $\text{ZrO}_2$/$\text{Al}_2\text{O}_3$ 叠层，维持 $C_S$ 不随工艺缩小 \\
+\bottomrule
+\end{longtable}
+
+% ======================================================================
+\topic{电荷共享定量推导}
+
+读出 DRAM 单元的核心物理事件是\hwkey{电荷共享}（charge sharing）：字线打开后，存储电容 $C_S$ 与位线寄生电容 $C_{BL}$ 并联，电荷重新分配，BL 电压发生微小偏移。$C_{BL}$ 来自两部分：位线自身贯穿整个子阵列的长走线电容，以及挂在同一条位线上的数百个单元的访问管结电容——一条位线通常连接 512 到 1024 个单元，因此 $C_{BL}$ 天然比 $C_S$ 大约一个数量级。这个比值不是设计选择，而是阵列结构的直接后果，也是 DRAM 读信号必然微弱的原因。
+
+设典型参数：
+\begin{lstlisting}[numbers=none]
+Cs   = 30 fF      (storage capacitor)
+Cbl  = 300 fF     (bitline parasitic capacitance, ~10x Cs)
+VDD  = 1.0 V
+Vpre = VDD/2 = 0.5 V   (bitline precharge voltage)
+\end{lstlisting}
+
+\textbf{情况一：单元存储 1}（$V_{SN} = V_{DD} = 1.0$ V）
+
+电荷守恒：共享前总电荷 $Q_{before} = C_{BL} \cdot V_{pre} + C_S \cdot V_{DD}$。共享后两电容并联，电压相等：
+
+$$V_{BL}' = \frac{C_{BL} \cdot V_{pre} + C_S \cdot V_{DD}}{C_{BL} + C_S} = \frac{300 \times 0.5 + 30 \times 1.0}{300 + 30} = \frac{150 + 30}{330} = 0.5454 \text{ V}$$
+
+$$\Delta V_{BL} = V_{BL}' - V_{pre} = +45.4 \text{ mV}$$
+
+\textbf{情况二：单元存储 0}（$V_{SN} = 0$ V）
+
+$$V_{BL}' = \frac{C_{BL} \cdot V_{pre} + C_S \cdot 0}{C_{BL} + C_S} = \frac{300 \times 0.5 + 0}{330} = 0.4545 \text{ V}$$
+
+$$\Delta V_{BL} = V_{BL}' - V_{pre} = -45.4 \text{ mV}$$
+
+\begin{keyidea}
+通用公式：$\Delta V_{BL} = \pm\frac{C_S}{C_S + C_{BL}} \cdot \frac{V_{DD}}{2}$。信号幅度与 $C_S/(C_S+C_{BL})$ 成正比。典型比值 1:10 给出约 45 mV 信号——这就是灵敏放大器必须存在的根本原因。
+\end{keyidea}
+
+\begin{longtable}{L{0.2\linewidth}L{0.15\linewidth}L{0.15\linewidth}L{0.4\linewidth}}
+\toprule
+$C_S$ (fF) & $C_{BL}$ (fF) & 比值 & $\Delta V_{BL}$ (mV), VDD=1.0V \\
+\midrule
+30 & 300 & 1:10 & $\pm$45.4 \\
+25 & 300 & 1:12 & $\pm$38.5 \\
+20 & 300 & 1:15 & $\pm$31.3 \\
+30 & 200 & 1:6.7 & $\pm$65.2 \\
+\bottomrule
+\end{longtable}
+
+工艺缩小使 $C_S$ 难以维持，信号幅度持续下降。这就是为什么先进节点必须使用高 $k$ 介质、更复杂的电容结构，以及更精密的感放设计。
+
+% ======================================================================
+\topic{灵敏放大器：交叉耦合锁存正反馈}
+
+电荷共享产生的 $\pm$45 mV 信号太弱，无法直接驱动外部电路。\hwkey{灵敏放大器}（sense amplifier）的任务是把这个微小差分电压在 1--2 ns 内放大到全摆幅（0 或 $V_{DD}$）。DRAM 使用的感放是\hwkey{交叉耦合锁存}（cross-coupled latch），结构与 SRAM 6T 单元的锁存器相同，但晶体管尺寸大得多。晶体管之所以要做得大，是为了抑制工艺失配：失配引入的输入失调电压（offset）若与几十 mV 的信号同量级，正反馈会把错误的极性放大成全摆幅，造成读出错误。加大晶体管尺寸可以把失调压到信号幅度以下。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % PMOS 交叉耦合对
+  \node[hw state, minimum width=1.1cm, minimum height=0.7cm] (P1) at (-1.2,2.8) {P1};
+  \node[hw state, minimum width=1.1cm, minimum height=0.7cm] (P2) at (1.2,2.8) {P2};
+  % NMOS 交叉耦合对
+  \node[hw compute, minimum width=1.1cm, minimum height=0.7cm] (N1) at (-1.2,0.8) {N1};
+  \node[hw compute, minimum width=1.1cm, minimum height=0.7cm] (N2) at (1.2,0.8) {N2};
+  % 位线节点轨：P 管与 N 管漏极上下相连，轨中点为 BL / BL̄
+  \draw[BookAccent, line width=0.7pt] (P1.south) -- (N1.north);
+  \draw[BookAccent, line width=0.7pt] (P2.south) -- (N2.north);
+  % 交叉耦合：BL 驱动右列（P2/N2）栅极，BL̄ 驱动左列（P1/N1）栅极，两个方向都可见
+  \draw[BookAccent, line width=0.7pt] (-1.2,1.5) -- (0.45,1.5) -- (0.45,2.8) -- (P2.west);
+  \draw[BookAccent, line width=0.7pt] (0.45,1.5) -- (0.45,0.8) -- (N2.west);
+  \draw[BookAccent, line width=0.7pt] (1.2,2.1) -- (-0.45,2.1) -- (-0.45,0.8) -- (N1.east);
+  \draw[BookAccent, line width=0.7pt] (-0.45,2.1) -- (-0.45,2.8) -- (P1.east);
+  % 内部节点标注
+  \node[BookTeal, font=\small\bfseries, fill=white, inner sep=1pt] at (-1.2,1.8) {BL};
+  \node[BookTeal, font=\small\bfseries, fill=white, inner sep=1pt] at (1.2,1.8) {$\overline{BL}$};
+  % VDD
+  \draw[hw return] (P1.north) -- ++(0,0.5) node[above, hw label] {VDD};
+  \draw[hw return] (P2.north) -- ++(0,0.5) node[above, hw label] {VDD};
+  % VSS
+  \draw[hw return] (N1.south) -- ++(0,-0.5) node[below, hw label] {VSS};
+  \draw[hw return] (N2.south) -- ++(0,-0.5) node[below, hw label] {VSS};
+  % 隔离信号：虚线短引线指向 BL/BL̄ 节点轨
+  \draw[BookAmber, line width=0.6pt, dashed, ->] (-2.6,1.8) -- (-1.45,1.8);
+  \node[hw label, anchor=east] at (-2.65,1.8) {from cell};
+  \draw[BookAmber, line width=0.6pt, dashed, ->] (2.6,1.8) -- (1.55,1.8);
+  \node[hw label, anchor=west] at (2.65,1.8) {from cell};
+  % 说明
+  \node[hw label, text width=8.5cm] at (0,-1.3) {交叉耦合感放：P1 栅极接 $\overline{BL}$，P2 栅极接 BL；N1 栅极接 $\overline{BL}$，N2 栅极接 BL。初始 BL 略高于 $\overline{BL}$ 时，N2 导通更强→$\overline{BL}$ 下降→P1 导通更强→BL 上升→正反馈→1--2 ns 内锁存到全摆幅。};
+\end{pdfdiagram}
+\diagramnote{DRAM 交叉耦合灵敏放大器。NMOS 对（N1/N2）在感放使能后首先放大差分；PMOS 对（P1/P2）随后把高侧拉到 VDD。整个过程是正反馈，增益趋向无穷，最终锁定为 BL=VDD、$\overline{BL}$=0（或反之）。}
+
+\topic{感放工作的四个阶段}
+
+感放从空闲到完成锁存经历四个阶段，每个阶段对应一个明确的物理事件，也是后文 tRCD、tRAS 等时序参数的物理来源：
+
+\begin{longtable}{L{0.06\linewidth}L{0.2\linewidth}L{0.34\linewidth}L{0.3\linewidth}}
+\toprule
+阶段 & 名称 & 物理事件 & 时间 \\
+\midrule
+1 & 预充电（precharge） & BL 和 $\overline{BL}$ 均被拉到 $V_{DD}/2$；感放关闭 & 上一个 PRECHARGE 命令后 \\
+2 & 电荷共享 & WL 打开，$C_S$ 与 $C_{BL}$ 并联；BL 偏移 $\pm$45 mV & WL 上升后 $\sim$1 ns \\
+3 & NMOS 放大 & 感放使能（SAEN），NMOS 交叉耦合对开始正反馈；差分指数增长 & $\sim$0.5--1 ns \\
+4 & PMOS 上拉 & 高侧被 PMOS 对拉到 VDD，低侧被 NMOS 拉到 0；全摆幅锁存 & 再 $\sim$0.5--1 ns \\
+\bottomrule
+\end{longtable}
+
+正反馈的数学描述：设初始差分 $\delta_0 = V_{BL} - V_{\overline{BL}} \approx 45$ mV（BL 偏移 $\pm$45 mV，$\overline{BL}$ 保持 $V_{DD}/2$），跨导为 $g_m$，节点电容为 $C$，则差分电压按 $\delta(t) = \delta_0 \cdot e^{g_m t / C}$ 指数增长。从 45 mV 增长到 VDD = 1.0 V 需要：
+
+$$t_{amp} = \frac{C}{g_m} \ln\frac{V_{DD}}{\delta_0} = \frac{C}{g_m} \ln\frac{1000}{45} \approx 3.1 \frac{C}{g_m}$$
+
+典型 $C/g_m \approx 0.5$ ns，故 $t_{amp} \approx 1.5$ ns。
+
+% ======================================================================
+\topic{破坏性读出与回写（restore）}
+
+DRAM 读出是\hwkey{破坏性的}（destructive read）。电荷共享后，$C_S$ 上的原始电荷已经与 $C_{BL}$ 混合——无论原始数据是 1 还是 0，存储节点电压都变成了 $V_{BL}' \approx V_{DD}/2 \pm 45$ mV，不再是完整的 VDD 或 0。如果不回写，下次读出时信号会更弱，最终数据丢失。
+
+\hwkey{回写}（restore）过程：感放锁存到全摆幅后，BL 被驱动到 VDD（若原始数据为 1）或 0（若为 0）。此时 WL 仍然打开，$C_S$ 通过 M1 被充电到 BL 的全摆幅电压。当 WL 关闭后，$C_S$ 上恢复了完整的 VDD 或 0 电荷——数据被还原。
+
+\begin{lstlisting}[numbers=none,caption={DRAM 读出-回写时序（伪代码）}]
+// 1. Precharge: BL = BLbar = VDD/2, sense amp OFF
+precharge_bitline(VDD/2);
+
+// 2. Activate: WL goes HIGH
+assert_wordline(row_address);
+
+// 3. Charge sharing: Cs connects to Cbl
+//    BL shifts by +/-45mV (destructive!)
+wait(t_charge_share);  // ~1 ns
+
+// 4. Sense amp ON: positive feedback amplifies to full swing
+enable_sense_amp();
+wait(t_amp);  // ~1-2 ns, BL -> VDD or 0
+
+// 5. Restore: WL still ON, Cs recharged to full BL voltage
+//    Cs now holds full VDD (data=1) or 0 (data=0)
+// 6. Data available in row buffer (sense amp latch)
+
+// 7. Later: PRECHARGE command turns off WL, equalizes BL
+\end{lstlisting}
+
+关键点：回写不需要额外命令——它是 ACTIVATE 操作的固有组成部分。WL 在感放完成前保持打开，$C_S$ 自然被充满。PRECHARGE 命令才关闭 WL 并重新均衡 BL。
+
+% ======================================================================
+\topic{行译码与列译码：阵列组织}
+
+DRAM 阵列是二维矩阵：\hwkey{行}由字线（WL）选择，\hwkey{列}由列多路选择器（column mux）选择。同一行所有单元共享同一条字线；同一列所有单元共享同一条位线。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 行译码器
+  \node[hw control, minimum width=1.6cm, minimum height=2.8cm] (rowdec) at (-2.5,1.5) {Row\\Decoder};
+  % 字线（先画线）
+  \foreach \y in {0.5, 1.5, 2.5} {
+    \draw[BookAccent, line width=0.5pt] (-1.6,\y) -- (5.5,\y);
+    \node[hw label, font=\tiny, left] at (-1.7,\y) {WL\pgfmathparse{int((\y-0.5))}\pgfmathresult};
+  }
+  % 位线（先画线）
+  \foreach \x in {0, 1.5, 3.0, 4.5} {
+    \draw[BookTeal, line width=0.5pt] (\x,-0.2) -- (\x,3.2);
+  }
+  % 存储单元阵列（3x4 示意）：小方块压盖在线上交点，线在方块边止
+  \foreach \x in {0, 1.5, 3.0, 4.5} {
+    \foreach \y in {0.5, 1.5, 2.5} {
+      \node[hw memory, minimum width=0.42cm, minimum height=0.42cm, fill=white] at (\x,\y) {};
+    }
+  }
+  \node[hw label, font=\tiny, anchor=west] at (5.7,1.5) {1T1C 单元};
+  \node[hw label, font=\tiny, anchor=east] at (-0.1,-0.5) {BL0};
+  \node[hw label, font=\tiny, anchor=east] at (1.4,-0.5) {BL1};
+  \node[hw label, font=\tiny, anchor=east] at (2.9,-0.5) {BL2};
+  \node[hw label, font=\tiny, anchor=east] at (4.4,-0.5) {BL3};
+  % 感放行
+  \node[hw compute, minimum width=5.5cm, minimum height=0.6cm] (sa) at (2.25,-1.2) {Sense Amplifiers (Row Buffer)};
+  \foreach \x in {0, 1.5, 3.0, 4.5} {
+    \draw[hw bus] (\x,-0.5) -- (\x,-0.9);
+  }
+  % 列译码器
+  \node[hw control, minimum width=1.6cm, minimum height=0.8cm] (coldec) at (2.25,-2.3) {Col Decoder};
+  \draw[hw bus] (sa.south) -- (coldec.north);
+  % 数据输出
+  \draw[hw bus] (coldec.south) -- ++(0,-0.6) node[below, hw label] {DQ (to I/O)};
+  % 地址输入（箭头指向译码器框内）
+  \draw[hw bus] (-4.1,1.5) -- (rowdec.west) node[midway, above, hw label] {Row Addr};
+  \draw[hw bus] (0.65,-2.3) -- (coldec.west) node[midway, above, hw label] {Col Addr};
+\end{pdfdiagram}
+\diagramnote{DRAM 阵列组织。行译码器激活一条 WL，该行所有 1T1C 单元同时与各自 BL 发生电荷共享；感放行（row buffer）锁存整行数据；列译码器从 row buffer 中选取若干列输出到 DQ。}
+
+\begin{longtable}{L{0.2\linewidth}L{0.35\linewidth}L{0.35\linewidth}}
+\toprule
+操作 & 行侧 & 列侧 \\
+\midrule
+ACTIVATE & 行译码器选中一条 WL；整行（8--16 Kbit）电荷共享并被感放锁存到 row buffer & 列侧不活动 \\
+READ/WRITE & WL 保持打开（row buffer 有效） & 列译码器从 row buffer 选取 8/16 bit 送到 DQ \\
+PRECHARGE & WL 关闭；BL 重新均衡到 $V_{DD}/2$；row buffer 失效 & 列侧不活动 \\
+\bottomrule
+\end{longtable}
+
+% ======================================================================
+\topic{行缓冲（Row Buffer）与开页策略}
+
+ACTIVATE 命令完成后，整行数据（典型 8 Kbit = 1 KB，DDR5 可达 16 Kbit = 2 KB）被锁存在感放中。这组锁存器就是\hwkey{行缓冲}（row buffer），也称\hwkey{页}（page）。后续对同一行的 READ 或 WRITE 命令只需经过列译码和 I/O 路径，延迟仅为 \hwtiming{CAS latency（CL）}——即 READ 命令发出到数据出现在 DQ 引脚之间的时钟拍数，详见“时序参数详解”小节——无需再次激活行。
+
+\begin{lstlisting}[numbers=none,caption={行缓冲命中与未命中的延迟对比}]
+Row buffer HIT  (same row, different column):
+  latency = CL only
+  DDR4-3200: CL=22 -> 22 * 0.625ns = 13.75 ns
+
+Row buffer MISS (different row):
+  latency = tRP + tRCD + CL
+  DDR4-3200: 14ns + 14ns + 13.75ns = 41.75 ns
+
+Row buffer EMPTY (bank precharged, first access):
+  latency = tRCD + CL
+  DDR4-3200: 14ns + 13.75ns = 27.75 ns
+\end{lstlisting}
+
+\hwevidence{DDR4-3200 CL22 实测：row buffer hit 约 14 ns，row buffer miss 约 42 ns——三倍差距。}这就是为什么内存控制器的\hwkey{页策略}（page policy，决定一次访问结束后行保持打开还是立即关闭）和地址映射对性能影响巨大。
+
+\topic{开页与关页策略}
+
+一次读写完成后，控制器面临一个选择：保持行打开，赌下一次访问仍命中同一行；还是立即预充电，为快速换行做好准备。由此形成两种基本页策略，实际控制器多在二者之间自适应：
+
+\begin{longtable}{L{0.18\linewidth}L{0.38\linewidth}L{0.34\linewidth}}
+\toprule
+策略 & 行为 & 适用场景 \\
+\midrule
+Open-page & ACTIVATE 后保持行打开，直到显式 PRECHARGE 或超时 & 时间局部性强（连续访问同一行） \\
+Close-page & 每次 READ/WRITE 后自动 PRECHARGE（auto-precharge） & 空间局部性差、随机访问为主 \\
+Adaptive & 控制器根据访问模式动态选择 & 现代控制器默认策略 \\
+\bottomrule
+\end{longtable}
+
+% ======================================================================
+\topic{Bank 结构与 Bank Group}
+
+一个 DRAM 芯片内部划分为多个\hwkey{bank}，每个 bank 拥有独立的行译码器、感放行和列 I/O。同一时刻每个 bank 只能有一行打开，但不同 bank 可以并行工作——一个 bank 在 ACTIVATE 时，另一个 bank 可以 READ。
+
+\hwkey{Bank Group}（DDR4 引入，DDR5 扩展）：将 bank 分组，不同 group 之间的命令间隔（timing penalty）比同 group 内更短。这是因为共享 I/O 总线和全局数据线（global data line）的争用主要发生在同 group 内。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % Bank Group 0
+  \node[hw lane, minimum width=4.2cm, minimum height=3.2cm] (bg0) at (0,2.0) {};
+  \node[hw label, font=\small\bfseries] at (0,3.8) {Bank Group 0};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b0) at (-1.0,2.6) {Bank 0};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b1) at (1.0,2.6) {Bank 1};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b2) at (-1.0,1.4) {Bank 2};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b3) at (1.0,1.4) {Bank 3};
+  % Bank Group 1
+  \node[hw lane, minimum width=4.2cm, minimum height=3.2cm] (bg1) at (5.5,2.0) {};
+  \node[hw label, font=\small\bfseries] at (5.5,3.8) {Bank Group 1};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b4) at (4.5,2.6) {Bank 4};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b5) at (6.5,2.6) {Bank 5};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b6) at (4.5,1.4) {Bank 6};
+  \node[hw memory, minimum width=1.6cm, minimum height=0.7cm, font=\tiny] (b7) at (6.5,1.4) {Bank 7};
+  % 共享 I/O
+  \node[hw compute, minimum width=9.5cm, minimum height=0.7cm] (io) at (2.75,-0.5) {Shared I/O Bus \& Global Data Lines};
+  \draw[hw bus] (bg0.south) -- (io.north -| bg0.south);
+  \draw[hw bus] (bg1.south) -- (io.north -| bg1.south);
+  % DQ
+  \draw[hw bus] (io.south) -- ++(0,-0.5) node[below, hw label] {DQ Pads};
+  % 标注
+  \node[hw label, text width=9cm] at (2.75,-2.35) {DDR4: 4 bank groups $\times$ 4 banks = 16 banks。DDR5: 8 bank groups $\times$ 4 banks = 32 banks（per sub-channel）。不同 group 间 tCCD\_L 可缩短为 tCCD\_S。};
+\end{pdfdiagram}
+\diagramnote{Bank Group 组织。同 group 内连续 CAS 命令需要更长间隔（tCCD\_L），跨 group 只需更短间隔（tCCD\_S），从而提高有效带宽。}
+
+\begin{longtable}{L{0.22\linewidth}L{0.22\linewidth}L{0.22\linewidth}L{0.24\linewidth}}
+\toprule
+代际 & Bank Groups & Banks/Group & 总 Banks \\
+\midrule
+DDR3 & 无 & 8 & 8 \\
+DDR4 & 4 & 4 & 16 \\
+DDR5 & 8 (per sub-ch) & 4 & 32 (per sub-ch) \\
+\bottomrule
+\end{longtable}
+
+% ======================================================================
+\topic{时序参数详解}
+
+DRAM 的性能由一组\hwkey{时序参数}（timing parameters）约束。控制器必须遵守这些最小间隔，否则数据损坏或命令被忽略。参数的命名大多沿用异步 DRAM 时代的两根控制信号：RAS（Row Address Strobe，行地址选通）与 CAS（Column Address Strobe，列地址选通）。SDRAM 时代行、列选通已改为命令编码，但 tRCD（RAS-to-CAS Delay，行到列延迟）、tRP（RAS Precharge，预充时间）、tRAS（RAS Active，行激活时间）、CL（CAS Latency，列延迟）这些名字保留至今。
+
+\begin{longtable}{L{0.12\linewidth}L{0.33\linewidth}L{0.24\linewidth}L{0.24\linewidth}}
+\toprule
+参数 & 含义 & DDR4-3200 (CL22) & DDR5-4800 (CL40) \\
+\midrule
+\hwtiming{tRCD} & ACTIVATE → READ/WRITE（行到列延迟） & 13.75 ns / 22 clk & 16.25 ns / 39 clk \\
+\hwtiming{CL (tCL)} & READ 命令 → 数据出现在 DQ（CAS 延迟） & 13.75 ns / 22 clk & 16.67 ns / 40 clk \\
+\hwtiming{tRP} & PRECHARGE → 下一次 ACTIVATE（预充电时间） & 13.75 ns / 22 clk & 16.25 ns / 39 clk \\
+\hwtiming{tRAS} & ACTIVATE → PRECHARGE（最小行激活时间） & 32 ns / 52 clk & 32 ns / 77 clk \\
+\hwtiming{tRC} & ACTIVATE → 下一次 ACTIVATE 同一 bank（= tRAS+tRP） & 46 ns / 74 clk & 48.25 ns / 116 clk \\
+\hwtiming{tRFC} & REFRESH 命令持续时间（bank 不可用） & 350 ns / 560 clk & 295 ns / 708 clk \\
+\hwtiming{tWR} & 写数据完成 → PRECHARGE（写恢复） & 15 ns / 24 clk & 30 ns / 72 clk \\
+\hwtiming{tWTR} & 写数据完成 → READ（写转读） & 7.5 ns / 12 clk & 10 ns / 24 clk \\
+\hwtiming{tRRD} & 同 bank group 的 ACTIVATE 间隔（tRRD\_L） & 5 ns / 8 clk & 5 ns / 12 clk \\
+\hwtiming{tFAW} & 四个 ACTIVATE 的最小窗口（限制峰值电流） & 21 ns / 34 clk & 20 ns / 48 clk \\
+\hwtiming{tCCD\_S} & 跨 bank group 的 CAS-to-CAS 间隔 & 4 clk / 2.5 ns & 8 clk / 3.33 ns \\
+\hwtiming{tCCD\_L} & 同 bank group 的 CAS-to-CAS 间隔 & 8 clk / 5 ns & 8 clk / 3.33 ns \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{Micron MT40A1G8（8Gb DDR4）datasheet: tRCD=13.75ns min, tRP=13.75ns min, tRAS=32ns min, tRC=45.75ns min, tRFC=350ns (8Gb density)。}
+
+\topic{时序参数的物理根源}
+
+上表中的每个参数都对应一个不可压缩的物理过程，没有一个是标准机构的任意规定。把它们与本节前文的机制一一对应：
+
+\begin{lstlisting}[numbers=none,caption={为什么需要这些等待}]
+tRCD:  WL 打开 -> 电荷共享 -> 感放锁存。
+       物理上需要等感放完成，row buffer 有效。
+
+tRP:   关闭 WL -> BL 重新均衡到 VDD/2。
+       物理上需要等 BL 电容充放电完成。
+
+tRAS:  感放锁存后，Cs 回写需要时间。
+       过早 PRECHARGE 会截断回写，丢失数据。
+
+tRFC:  刷新期间整行（或多行）被读出再回写。
+       密度越大行越多，tRFC 越长。
+
+tFAW:  同时激活多行会产生峰值电流（每行感放同时翻转）。
+       限制 4-ACTIVATE 窗口防止电源跌落。
+\end{lstlisting}
+
+% ======================================================================
+\topic{突发长度与预取架构}
+
+DDR SDRAM 内部阵列的实际数据通路宽度远大于外部 DQ 引脚数。\hwkey{预取}（prefetch）架构让一次列访问从 row buffer 中取出 $n$ 个数据字，然后通过内部高速总线分时送到外部引脚。从外部看，一次列命令在 DQ 上连续传输固定的拍数，称为\hwkey{突发}（burst）；突发长度 BL（Burst Length）即拍数，DDR 在时钟上升沿和下降沿各传一拍，BL8 就是在 4 个时钟周期内传完 8 拍。
+
+\begin{longtable}{L{0.15\linewidth}L{0.18\linewidth}L{0.22\linewidth}L{0.35\linewidth}}
+\toprule
+代际 & 突发长度 (BL) & 预取宽度 & 内部总线 vs 外部引脚 \\
+\midrule
+DDR1 & BL2 & 2n & 内部 2$\times$ 外部宽度 \\
+DDR2 & BL4 & 4n & 内部 4$\times$ 外部宽度 \\
+DDR3 & BL8 & 8n & 内部 8$\times$ 外部宽度 \\
+DDR4 & BL8 & 8n & 内部 8$\times$ 外部宽度（每 sub-ch 8 bit DQ → 内部 64 bit） \\
+DDR5 & BL16 & 16n & 内部 16$\times$ 外部宽度（每 sub-ch 32 bit DQ → 内部 512 bit） \\
+\bottomrule
+\end{longtable}
+
+\textbf{DDR4 示例}：外部每通道 64 bit DQ（8 字节），BL8 意味着一次 READ 命令输出 $8 \times 8 = 64$ 字节 = 一条 cache line。内部感放行宽 512 bit（64 字节），列选通一次取出 512 bit，分 8 个时钟沿（DDR 双沿 × 4 个时钟周期）送到外部。
+
+\textbf{DDR5 示例}：每个 sub-channel 32 bit DQ（4 字节），BL16 意味着一次 READ 输出 $16 \times 4 = 64$ 字节 = 一条 cache line。内部感放行宽 512 bit，分 16 个沿（8 个时钟周期）送出。
+
+\begin{keyidea}
+预取架构的本质：内部阵列速度慢（感放行读出一次需要 ns 级），但外部接口速度快（GHz 级）。一次多取、分时送出，让慢速内部操作匹配快速外部传输。BL 越大，每次列访问的"摊销"效率越高，但对随机小粒度访问浪费带宽。从 DDR1 到 DDR5，外部数据率提升了二十余倍，而阵列的核心周期（tRC）几乎没有缩短——代际演进主要靠预取宽度逐代翻倍来消化这个剪刀差。
+\end{keyidea}
+
+% ======================================================================
+\topic{刷新：电容漏电的持续代价}
+
+DRAM 电容通过 PN 结反向漏电流、栅极漏电和介质缺陷持续丢失电荷。典型保持时间（retention time）为 32--64 ms。量级估算：$C_S = 30$ fF 存 1 时电荷约 $Q = C_S V_{DD} \approx 30$ fC；若允许衰减一半（信号仍剩 20 mV 量级，感放尚可判别），则 64 ms 保持时间对应的单单元漏电流 $I_{\text{leak}} \approx 15\text{ fC} / 64\text{ ms} \approx 0.2$ pA——DRAM 单元的漏电必须控制在亚皮安量级。超过保持时间，电荷衰减到无法被感放正确判别的程度，数据丢失。因此必须在保持时间内把所有行重新读出并回写——这就是\hwkey{刷新}（refresh）。
+
+\topic{Auto-Refresh 机制}
+
+标准做法：在保持时间内完成全部行的刷新。以 DDR4 为例：每 64 ms 刷新全部行，若阵列有 8192 行（$2^{13}$ 行地址），则每 $64\text{ ms} / 8192 = 7.8\;\mu\text{s}$ 发一次 REFRESH 命令（Auto-Refresh, REFab），该间隔记为 \hwtiming{tREFI}（refresh interval，刷新间隔）；DDR5 的刷新窗口缩短为 32 ms，对应的 tREFI 为 3.9 $\mu$s。每次 REFab 刷新一行（或少数几行），期间该 bank（或所有 bank）不可访问，持续 tRFC。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+刷新参数 & 典型值 & 说明 \\
+\midrule
+保持时间（retention） & 32--64 ms & 超过则数据丢失；温度越高越短 \\
+刷新窗口 & 64 ms（DDR4）/ 32 ms（DDR5） & JEDEC 标准 \\
+Auto-Refresh 间隔（tREFI） & 7.8 $\mu$s（DDR4）/ 3.9 $\mu$s（DDR5） & 刷新窗口 / 8192 行 \\
+tRFC（8Gb DDR4） & 350 ns & 刷新期间 bank 不可用 \\
+tRFC（16Gb DDR5） & 295 ns & 密度增大但工艺改进 \\
+tRFC（32Gb DDR5） & 410 ns & 更多行需要更长时间 \\
+刷新带宽损失 & $\sim$3--5\% & 每 7.8 $\mu$s 中 350 ns 不可用 \\
+\bottomrule
+\end{longtable}
+
+\topic{DDR5 刷新模式}
+
+DDR5 在把刷新窗口缩短到 32 ms 的同时提供三种刷新粒度，让控制器在“一次刷完全部、集中阻塞”与“分批刷新、平滑开销”之间选择：
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+模式 & 行为 & 优势 \\
+\midrule
+All-bank REF (REFab) & 一次刷新所有 bank 的同一行 & 简单，但所有 bank 同时不可用 \\
+Same-bank REF (REFsb) & 同时刷新所有 bank group 中同编号的 bank，其余 bank 继续服务 & 降低带宽损失 \\
+Fine-granularity (REFfg) & 每次只刷新一小段行，更频繁但每次更短 & 进一步平滑刷新开销 \\
+\bottomrule
+\end{longtable}
+
+\topic{温度补偿刷新}
+
+漏电流随温度指数增长（大约每升高 10°C 翻倍）。JEDEC 规定：
+\begin{itemize}
+  \item 正常温度范围（0--85°C）：刷新间隔 7.8 $\mu$s（DDR4）/ 3.9 $\mu$s（DDR5），即 1$\times$ 刷新率
+  \item 扩展温度（Tcase $>$ 85°C）：刷新间隔减半——DDR4 为 3.9 $\mu$s，DDR5 为 1.95 $\mu$s（2$\times$ 刷新率）
+  \item DDR5 支持片上温度传感器（on-die thermal sensor），DRAM 可自行调整刷新率
+\end{itemize}
+
+\hwevidence{JEDEC JESD79-5: DDR5 刷新窗口为 32 ms（8192 行），常温 tREFI = 3.9 $\mu$s；当 Tcase > 85°C 时 tREFI 降为 1.95 $\mu$s。DDR5 还支持 same-bank refresh（REFsb）和 adaptive refresh。}
+
+% ======================================================================
+\topic{DDR5 子通道（Sub-Channel）}
+
+DDR5 最重要的架构变化之一是\hwkey{子通道}（sub-channel）。每个 \term{DIMM}{Dual Inline Memory Module}（双列直插内存模组，即插在主板上的内存条）物理上仍是一个 64-bit 通道，但被拆分为两个独立的 32-bit 子通道（sub-channel A 和 sub-channel B），每个子通道拥有独立的命令/地址总线和数据线。单 \hwkey{rank}（共享同一组片选信号、并联组成一个 64-bit 通道的芯片组）下每个子通道由 4 颗 $\times$8 芯片组成（$4 \times 8 = 32$ bit DQ）。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % DIMM 外框
+  \node[hw lane, minimum width=10cm, minimum height=3.5cm] (dimm) at (4.5,1.5) {};
+  \node[hw label, font=\small\bfseries] at (4.5,3.5) {DDR5 DIMM (64-bit total)};
+  % Sub-channel A
+  \node[hw state, minimum width=4.0cm, minimum height=2.2cm] (sca) at (2.2,1.5) {};
+  \node[hw label, font=\small\bfseries] at (2.2,2.8) {Sub-Channel A};
+  \node[hw memory, minimum width=1.5cm, minimum height=0.6cm, font=\tiny] (ra) at (1.2,1.8) {4$\times$ x8 DRAM};
+  \node[hw compute, minimum width=3.2cm, minimum height=0.5cm, font=\tiny] (caa) at (2.2,0.8) {CA Bus A + DQ[31:0]};
+  % Sub-channel B
+  \node[hw state, minimum width=4.0cm, minimum height=2.2cm] (scb) at (6.8,1.5) {};
+  \node[hw label, font=\small\bfseries] at (6.8,2.8) {Sub-Channel B};
+  \node[hw memory, minimum width=1.5cm, minimum height=0.6cm, font=\tiny] (rb) at (5.8,1.8) {4$\times$ x8 DRAM};
+  \node[hw compute, minimum width=3.2cm, minimum height=0.5cm, font=\tiny] (cab) at (6.8,0.8) {CA Bus B + DQ[63:32]};
+  % 控制器
+  \node[hw control, minimum width=3.0cm, minimum height=0.8cm] (mc) at (4.5,-1.0) {Memory Controller};
+  % 共享竖直干线，再分两层正交折入各子通道 CA 总线
+  \draw[BookMuted, line width=0.62pt] (mc.north) -- (4.5,0.0);
+  \draw[hw bus] (4.5,0.0) -| (caa.south);
+  \draw[hw bus] (4.5,0.0) -| (cab.south);
+  % 标注
+  \node[hw label, text width=9cm] at (4.5,-2.0) {两个子通道完全独立：可以同时对 A 发 ACTIVATE、对 B 发 READ。每个子通道 32-bit DQ，BL16 仍输出 64 字节（一条 cache line）。};
+\end{pdfdiagram}
+\diagramnote{DDR5 子通道架构。每个子通道有独立命令总线，控制器可以并行调度两个子通道，减少 bank 冲突和刷新阻塞的影响。}
+
+\topic{子通道为什么提高效率}
+
+同一 bank 同一时刻只能打开一行：两个访问若命中同一 bank 的不同行，后者必须等前者 PRECHARGE 之后再 ACTIVATE，损失 tRP $+$ tRCD，这称为\hwkey{bank 冲突}。拆分子通道把这类串行化限制在半个通道内，收益体现在三个方面：
+
+\begin{longtable}{L{0.3\linewidth}L{0.3\linewidth}L{0.3\linewidth}}
+\toprule
+问题（DDR4 单通道） & DDR5 子通道解决方案 & 效果 \\
+\midrule
+一次 REFab 阻塞整个 64-bit 通道 & 两个子通道独立刷新，一个刷新时另一个继续服务 & 刷新损失减半 \\
+Bank 冲突时整个通道等待 & 两个子通道独立调度，冲突只影响一个子通道 & 有效并行度翻倍 \\
+短突发（$<$64B）浪费带宽 & 每个子通道独立服务 64B（BL16×32bit），粒度更细 & 小请求效率提升 \\
+\bottomrule
+\end{longtable}
+
+% ======================================================================
+\topic{DDR5 片上 ECC（On-Die ECC）}
+
+DDR5 在芯片内部集成了\hwkey{片上 ECC}（on-die ECC），对每个 128-bit 数据粒（granule）附加 8-bit 校验码（SEC：单比特纠错）。这个 ECC 对内存控制器完全透明——控制器看到的仍是纯数据，纠错在 DRAM 芯片内部完成。
+
+\begin{lstlisting}[numbers=none,caption={DDR5 on-die ECC 结构}]
+Internal data granule:  128 bits (data) + 8 bits (ECC) = 136 bits
+ECC code:               SEC (Single Error Correction)
+                        Hamming code with 8 check bits for 128 data bits
+Correction:             done inside DRAM die during READ
+Transparency:           controller sees only 128 data bits
+                        ECC bits never appear on DQ pins
+Scope:                  protects against cell-level bit flips
+                        does NOT protect bus errors (that's sideband ECC)
+\end{lstlisting}
+
+\begin{warningbox}
+On-die ECC 不能替代 DIMM 上的 sideband ECC（服务器用的 72-bit 模块）。On-die ECC 只保护芯片内部存储单元的位翻转；数据从芯片到控制器的总线传输错误仍需 sideband ECC 保护。服务器平台通常两者兼有。
+\end{warningbox}
+
+% ======================================================================
+\topic{功耗模式}
+
+DRAM 芯片有多种功耗状态，控制器根据空闲时间的长短选择进入相应级别的低功耗模式。表中 CKE（Clock Enable，时钟使能引脚）是进入低功耗状态的总开关；DLL（Delay-Locked Loop，延迟锁定环）负责把 DRAM 内部数据输出时序与外部时钟对齐，关断它更省电，但唤醒时需要重新锁定：
+
+\begin{longtable}{L{0.18\linewidth}L{0.32\linewidth}L{0.2\linewidth}L{0.2\linewidth}}
+\toprule
+模式 & 状态 & 典型电流（16Gb DDR5） & 唤醒时间 \\
+\midrule
+Active & 至少一个 bank 有行打开，正常读写 & $I_{DD0} \approx 48$ mA & --- \\
+Idle (all banks precharged) & 所有 bank 关闭，时钟运行 & $I_{DD2N} \approx 34$ mA & 立即可发 ACT \\
+Power-Down (fast) & CKE 拉低，时钟运行，DLL 保持 & $I_{DD2P} \approx 20$ mA & tXP $\approx$ 7.5 ns \\
+Power-Down (slow) & CKE 拉低，时钟运行，DLL 关闭 & $I_{DD2P} \approx 14$ mA & tXP + DLL relock $\approx$ 10 ns \\
+Self-Refresh & 内部振荡器维持刷新，外部时钟可停 & $I_{DD6} \approx 12$ mA & tXSR $\approx$ tRFC + 10 ns \\
+Self-Refresh (low power) & 降低刷新率或温度补偿 & $I_{DD6L} \approx 8$ mA & 同上 \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{Micron MT60B2G8（16Gb DDR5）: $I_{DD0}$=48mA, $I_{DD2N}$=34mA, $I_{DD6}$=12mA (at 1.1V, 4800 MT/s)。Self-refresh 时内部 oscillator 自动产生刷新时钟，外部 CK 可以停止。}
+
+\topic{Self-Refresh 的工作原理}
+
+进入 self-refresh 后，DRAM 芯片内部的振荡器（oscillator）产生刷新定时，自动执行刷新循环。外部时钟（CK）可以完全停止，控制器和 PHY 可以关闭以节省系统功耗。这是笔记本休眠（S3）和手机深度睡眠的关键机制。唤醒时需要等待 tXSR（约等于 tRFC + 10 ns，16Gb 器件约 303 ns）让内部电路稳定。
+
+% ======================================================================
+\topic{Row Hammer：反复激活的物理攻击}
+
+\hwkey{Row Hammer} 是一种利用 DRAM 物理特性的攻击：对某一行（aggressor row）反复执行 ACTIVATE + PRECHARGE（典型 $>10^5$ 次/64ms），相邻行（victim row）的电容会因字线耦合噪声和衬底漏电而逐渐丢失电荷，最终导致位翻转。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 三行示意
+  \node[hw memory, minimum width=6cm, minimum height=0.7cm] (row0) at (3,2.5) {Row N-1 (victim)};
+  \node[hw memory, minimum width=6cm, minimum height=0.7cm, draw=BookRed] (row1) at (3,1.5) {Row N (aggressor) — 反复 ACT/PRE};
+  \node[hw memory, minimum width=6cm, minimum height=0.7cm] (row2) at (3,0.5) {Row N+1 (victim)};
+  % 耦合箭头
+  \draw[hw danger, dashed] (row1.north) -- (row0.south) node[midway, right, hw label, text=BookRed] {coupling noise};
+  \draw[hw danger, dashed] (row1.south) -- (row2.north) node[midway, right, hw label, text=BookRed] {coupling noise};
+  % 位翻转标记
+  \node[BookRed, font=\small\bfseries] at (7.0,2.5) {bit flip!};
+  \node[BookRed, font=\small\bfseries] at (7.0,0.5) {bit flip!};
+  % 说明
+  \node[hw label, text width=8cm] at (3,-0.7) {每次 ACTIVATE 激活 Row N 时，WL 电压从 0 跳到 VDD（boosted），通过寄生电容耦合到相邻行的存储节点，使 victim 行电荷微量泄漏。累积足够多次后，victim 行数据翻转。};
+\end{pdfdiagram}
+\diagramnote{Row Hammer 攻击原理。Aggressor 行被高频激活，耦合噪声使相邻 victim 行电荷泄漏。正常刷新间隔（64 ms）内若 victim 行未被访问，其电荷可能衰减到错误值。}
+
+\topic{Row Hammer 缓解措施}
+
+缓解思路沿两个方向展开：让 victim 行的电荷来不及衰减到出错（更频繁地刷新、定向补刷），或者在出错之后纠正（ECC）。据此演进出的措施如下：
+
+\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.3\linewidth}}
+\toprule
+措施 & 机制 & 代际 \\
+\midrule
+增加刷新率（2$\times$ REF） & 缩短刷新间隔，让 victim 行更频繁被恢复 & DDR4 可选 \\
+TRR (Target Row Refresh) & 芯片内部检测高频激活行，主动刷新其相邻行 & DDR4/DDR5 强制 \\
+DDR5 TRR 增强 & 更精细的计数器，检测多行同时 hammer 的模式 & DDR5 \\
+PARA (概率刷新) & 以一定概率额外刷新随机行 & 学术方案 \\
+ECC 保护 & 即使发生位翻转，ECC 可纠正单比特错误 & 服务器 DIMM \\
+\bottomrule
+\end{longtable}
+
+JEDEC 在 DDR5 中引入\term{刷新管理}{Refresh Management, RFM}命令作为 TRR 的标准化形式：DRAM 内部统计每个 bank 的激活次数（RAA，Rolling Accumulated ACT），控制器必须在该计数达到上限之前发出 RFM 命令，DRAM 利用这段时间对受攻击行的相邻行执行额外刷新。具体的计数阈值与刷新策略由厂商实现决定，不对外公开。近年研究表明，TRR/RFM 类机制仍可被精心设计的访问模式绕过：TRRespass（2020）用多 aggressor 行组合使芯片内部的行跟踪表漏记真正的攻击行，Half-Double（2021）则利用耦合效应传递到非直接相邻行的特点发起攻击——缓解与攻击的博弈仍在持续演进。
+
+% ======================================================================
+\topic{实际芯片示例：16Gb DDR5 Die}
+
+以 Micron MT60B2G8（16Gb DDR5，$\times$8 组织）为参考，给出内部组织结构：
+
+\begin{longtable}{L{0.3\linewidth}L{0.6\linewidth}}
+\toprule
+参数 & 值 \\
+\midrule
+密度 & 16 Gbit (2 GByte) \\
+组织 & 2G $\times$ 8（die 级，共 16 Gbit） \\
+Bank Groups & 8 \\
+Banks per Group & 4 \\
+Total Banks & 32 \\
+Rows per Bank & 64K ($2^{16}$) \\
+Columns per Row & 1024 (10 bit column address) \\
+Page Size & 1024 $\times$ 8 bit = 1 KB（$\times$8 器件） \\
+Prefetch & 16n (BL16) \\
+Internal Data Bus Width & 128 bit per die（16n 预取 $\times$ 8 bit DQ） \\
+VDD & 1.1 V \\
+Speed Bin & DDR5-4800 (4800 MT/s) \\
+\bottomrule
+\end{longtable}
+
+这里需要说明页大小的口径：表中 1 KB 按 $\times$8 器件计算（1024 列 $\times$ 8 bit）。同容量的 $\times$16 器件列数减半（512 列）而每列 16 bit，页大小为 $512 \times 16$ bit $=$ 2 KB——这正是前文“行缓冲”小节“DDR5 可达 16 Kbit”说法的来源。页大小决定一次 ACTIVATE 之后无需换行即可连续访问的数据量，数值随器件位宽而异，工作机制完全相同。
+
+\topic{16Gb DDR5 时序表（DDR5-4800, CL40）}
+
+下表把 DDR5-4800 的主要时序参数同时按时钟周期数（nCK）和绝对时间列出：物理约束以时间为单位，控制器则以周期数计数，两者经 tCK 换算：
+
+\begin{longtable}{L{0.2\linewidth}L{0.2\linewidth}L{0.2\linewidth}L{0.3\linewidth}}
+\toprule
+参数 & 时钟数 (nCK) & 时间 (ns) & 备注 \\
+\midrule
+tCK & 1 & 0.4167 & 4800 MT/s → 2400 MHz clock \\
+CL & 40 & 16.67 & CAS latency \\
+tRCD & 39 & 16.25 & ACT → RD/WR \\
+tRP & 39 & 16.25 & PRE → ACT \\
+tRAS & 77 & 32.08 & ACT → PRE (min) \\
+tRC & 116 & 48.25 & ACT → ACT same bank \\
+tRFC & 708 & 295 & REF command duration (16Gb) \\
+tWR & 72 & 30.0 & write recovery \\
+tWTR\_S & 12 & 5.0 & write-to-read (short) \\
+tWTR\_L & 24 & 10.0 & write-to-read (long) \\
+tRRD\_S & 12 & 5.0 & ACT-to-ACT diff group \\
+tRRD\_L & 12 & 5.0 & ACT-to-ACT same group \\
+tFAW & 48 & 20.0 & four-ACT window \\
+tCCD\_S & 8 & 3.33 & CAS-to-CAS diff group \\
+tCCD\_L & 8 & 3.33 & CAS-to-CAS same group \\
+tXP & 18 & 7.5 & power-down exit \\
+tXSR & 728 & 303.3 & self-refresh exit \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{JEDEC DDR5-4800B 标准时序：CL40-39-39（40-39-39）。16Gb 密度 tRFC=295ns，每 die 8 bank groups $\times$ 4 banks，on-die ECC 为 DDR5 标配。}
+
+\topic{从芯片到 DIMM：地址映射}
+
+一根 DDR5 DIMM（如 32 GB，2 rank $\times$ 16 Gb $\times$ 8）的完整地址空间映射：
+
+\begin{lstlisting}[numbers=none,caption={DDR5 32GB DIMM 地址分解}]
+Total capacity:     32 GB = 256 Gbit
+Per rank:           8 dies x 16 Gbit = 128 Gbit (16 GB)
+Ranks:              2 (rank 0, rank 1)
+
+Per rank address decomposition:
+  Sub-channel:      2 (A, B) -- independent command buses, 32-bit DQ each
+  Bank Group:       8  (3 bits)
+  Bank:             4  (2 bits)
+  Row:              64K (16 bits)
+  Column:           1024 (10 bits; BL16 burst start is 16-column aligned --
+                    lowest 4 bits implied, counted up by on-chip counter)
+
+  Effective address bits per sub-channel:
+    BG[2:0] + BA[1:0] + Row[15:0] + Col[9:0] = 31 bits
+    -> 2^31 words x 32-bit sub-channel word = 8 GB per sub-channel
+    -> 2 sub-channels = 16 GB per rank -> 32 GB with 2 ranks
+
+Burst:  BL16 x 32-bit DQ = 64 bytes = one cache line per READ command
+\end{lstlisting}
+
+列地址的低 4 位对应 BL16 突发内部的 16 个列位置，不由命令显式提供：突发起始地址按 16 列对齐，DRAM 内部的列计数器在 16 个传输沿上自动递增。因此列地址的有效粒度是 16 列，每行共有 $1024 / 16 = 64$ 个可寻址的突发位置。
+
+\begin{keyidea}
+从 1T1C 电容到 32 GB DIMM，DRAM 的设计是一条完整的放大链：30 fF 电容上的 $\pm$45 mV 信号→感放锁存到全摆幅→row buffer 保存整行→列选通取出 16 个 32-bit 字→内部 512-bit 总线→外部 32-bit DQ 分 16 沿送出→控制器 PHY 采样→cache line 到达 CPU。每一级都在解决上一级留下的速度、粒度或可靠性问题。
+\end{keyidea}
+
+\section{二、DDR 信号、PHY 与训练}
+
+\topic{DDR 信号组总览}
+
+前两节讨论了 DRAM 单元与阵列的内部结构，本节转向芯片外部：控制器与 DRAM 之间靠哪些信号连接、这些信号如何在每秒数十亿次的速率下保持可靠，以及上电后如何通过训练把链路校准到最优工作点。
+
+DDR（Double Data Rate，双倍数据率）SDRAM 在时钟的上升沿和下降沿都传输数据。以 DDR4/DDR5 为参考，信号分为五组：
+
+\begin{longtable}{L{0.14\linewidth}L{0.36\linewidth}L{0.4\linewidth}}
+\toprule
+信号组 & 包含信号 & 方向与作用 \\
+\midrule
+命令/地址（CA） & DDR4: CK/$\overline{\text{CK}}$, CKE, $\overline{\text{CS}}$, $\overline{\text{RAS}}$, $\overline{\text{CAS}}$, $\overline{\text{WE}}$, A[16:0], BA[1:0], BG[1:0]；DDR5: CA[13:0] 复用编码 & 控制器→DRAM：时钟上升沿发一条命令+地址 \\
+数据（DQ） & DQ[7:0]（$\times$8 器件）或 DQ[15:0]（$\times$16）；64-bit 通道 = 8 颗 $\times$8 & 双向：读时 DRAM→控制器，写时控制器→DRAM \\
+数据选通（DQS） & DQS/$\overline{\text{DQS}}$ 差分对，每 8-bit 字节一对 & 源同步选通：发送端与 DQ 同源发出，接收端用 DQS 边沿采样 \\
+数据掩码/反转（DM/DBI） & DM/$\overline{\text{DBI}}$：写时掩码，读时 DBI & 写：标记该字节无效；读：Data Bus Inversion 减少翻转 \\
+复位/控制 & $\overline{\text{RESET}}$（DDR4）、RFU、ZQ、TEN & 初始化、阻抗校准、测试模式 \\
+\bottomrule
+\end{longtable}
+
+这五组信号对应两种不同的时钟方案。命令/地址是单向信号，每周期最多一条命令，直接由控制器按 CK 驱动即可；数据信号每周期要传 2 bit 且双向切换，速率高一个量级，无法再用一根全局时钟保证收发两端的相位关系，因此为每 8 bit 数据线配一对专用的数据选通信号 DQS，让发送端自带"时钟"随行——这就是下一小节要展开的源同步方案。
+
+DDR5 把 RAS/CAS/WE 三根命令线编码进 CA[13:0] 总线。CA 总线是 SDR 的——仅在 CK 上升沿采样，每个 CK 周期传 14 bit；多周期命令占 2 个 CK 周期、共传 28 bit，足够编码命令+行/列地址。这减少了引脚数，为更高频率留出信号完整性裕量。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % CK 波形
+  \draw[BookRule, line width=0.7pt] (0.5,4.2) -- (1.0,4.2) -- (1.0,4.8) -- (2.0,4.8) -- (2.0,4.2) -- (3.0,4.2) -- (3.0,4.8) -- (4.0,4.8) -- (4.0,4.2) -- (5.0,4.2) -- (5.0,4.8) -- (6.0,4.8) -- (6.0,4.2) -- (7.0,4.2) -- (7.0,4.8) -- (8.0,4.8) -- (8.0,4.2) -- (9.0,4.2);
+  \node[hw label, anchor=east] at (0.4,4.5) {CK};
+  % CKE
+  \draw[BookTeal, line width=0.6pt] (0.5,3.6) -- (9.0,3.6);
+  \node[hw label, anchor=east] at (0.4,3.6) {CKE};
+  % CS：低脉冲覆盖 ACT 与 RD 两条命令
+  \draw[BookAccent, line width=0.6pt] (0.5,3.0) -- (1.0,3.0) -- (1.0,2.5) -- (3.0,2.5) -- (3.0,3.0) -- (9.0,3.0);
+  \node[hw label, anchor=east] at (0.4,2.8) {$\overline{\text{CS}}$};
+  % CA/CMD
+  \draw[BookNavy, line width=0.6pt] (0.5,1.9) -- (1.0,1.9) -- (1.0,1.4) -- (2.0,1.4) -- (2.0,1.9) -- (3.0,1.9) -- (3.0,1.4) -- (4.0,1.4) -- (4.0,1.9) -- (5.0,1.9);
+  \node[hw label, anchor=east] at (0.4,1.7) {CA};
+  \node[hw label, font=\tiny] at (1.5,1.15) {ACT};
+  \node[hw label, font=\tiny] at (2.5,1.15) {RD};
+  \node[hw label, font=\tiny] at (3.5,1.15) {NOP};
+  % DQS
+  \draw[BookAccent, line width=0.7pt] (4.5,0.8) -- (5.0,0.8) -- (5.0,1.3) -- (5.5,1.3) -- (5.5,0.8) -- (6.0,0.8) -- (6.0,1.3) -- (6.5,1.3) -- (6.5,0.8) -- (7.0,0.8) -- (7.0,1.3) -- (7.5,1.3) -- (7.5,0.8) -- (8.0,0.8) -- (8.0,1.3) -- (8.5,1.3) -- (8.5,0.8) -- (9.0,0.8);
+  \node[hw label, anchor=east] at (0.4,1.05) {DQS};
+  % DQ
+  \draw[BookTeal, line width=0.6pt] (4.5,0.0) -- (5.0,0.0) -- (5.25,0.4) -- (5.5,0.0) -- (5.75,0.4) -- (6.0,0.0) -- (6.25,0.4) -- (6.5,0.0) -- (6.75,0.4) -- (7.0,0.0) -- (7.25,0.4) -- (7.5,0.0) -- (7.75,0.4) -- (8.0,0.0) -- (8.25,0.4) -- (8.5,0.0) -- (8.75,0.4) -- (9.0,0.0);
+  \node[hw label, anchor=east] at (0.4,0.2) {DQ};
+  % 时间标注
+  \draw[BookRule, line width=0.3pt, dashed] (1.0,5.0) -- (1.0,-0.3);
+  \draw[BookRule, line width=0.3pt, dashed] (5.0,5.0) -- (5.0,-0.3);
+  \node[hw label, font=\tiny] at (3.0,5.2) {命令阶段 (CA bus)};
+  \node[hw label, font=\tiny] at (7.0,5.2) {数据阶段 (DQ/DQS)};
+  % CL 标注
+  \draw[BookAmber, line width=0.5pt, <->] (2.0,5.5) -- (5.0,5.5);
+  \node[BookAmber, font=\tiny\bfseries] at (3.5,5.7) {CL (t$_{CL}$)};
+\end{pdfdiagram}
+\diagramnote{DDR4 读操作时序总览。控制器在 CK 上升沿发 ACT 命令打开行，经 tRCD 后发 READ 命令，经 CL 后 DRAM 驱动 DQS/DQ 返回数据。DQS 频率 = CK 频率（DDR 采样）。}
+
+\topic{双倍数据率与源同步选通}
+
+DDR 的核心思想：在时钟的\hwkey{上升沿和下降沿}都传输有效数据。若 CK = 1600 MHz（DDR4-3200），则数据率 = 3200 MT/s（Mega Transfers per second，每秒百万次传输）。每个 DQS 周期传输 2 bit。
+
+之所以用双沿传输而不是直接把时钟频率翻倍，是因为时钟是片上负载最重的网络之一：它要驱动整个芯片的触发器，频率越高，时钟树引入的偏斜（skew）和抖动（jitter）越难控制。让数据率与时钟频率解耦——时钟频率减半、每周期传两个数据——就能在不恶化时钟完整性的前提下翻倍带宽。
+
+\hwkey{DQS 是源同步选通}（source-synchronous strobe）：它由数据发送端与 DQ 同时驱动，频率与 CK 相同（每 DQS 周期传输 2 bit，即数据率的一半），但相位相对 DQ 偏移 90°（即 DQS 边沿对齐 DQ 数据眼中心）。接收端不需要从数据中恢复时钟，只需用 DQS 的上升沿和下降沿分别锁存 DQ。
+
+为什么不让发送端和接收端共享一根全局时钟（共同时钟方案）？DDR4-3200 下 1 UI 只有 312.5 ps，而 PCB 走线的传播延迟典型为每英寸 150--180 ps，走线长度差零点几英寸、插座与过孔的延迟差异就足以吞掉大半个数据窗口，两端的全局时钟相位关系无法保证。源同步方案让选通信号与数据同源发出、走同样的走线、经历同样的延迟，延迟与抖动中的共模部分被自动抵消，剩下的只有两者之间很小的失配——"源同步"由此得名。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % DQ 数据（方波表示 0101...）
+  \draw[BookTeal, line width=0.8pt] (0.5,1.0) -- (1.0,1.0) -- (1.0,1.6) -- (1.5,1.6) -- (1.5,1.0) -- (2.0,1.0) -- (2.0,1.6) -- (2.5,1.6) -- (2.5,1.0) -- (3.0,1.0) -- (3.0,1.6) -- (3.5,1.6) -- (3.5,1.0) -- (4.0,1.0) -- (4.0,1.6) -- (4.5,1.6) -- (4.5,1.0) -- (5.0,1.0);
+  \node[hw label, anchor=east] at (0.4,1.3) {DQ};
+  \node[hw label, font=\tiny] at (0.75,1.8) {D0};
+  \node[hw label, font=\tiny] at (1.25,1.8) {D1};
+  \node[hw label, font=\tiny] at (1.75,1.8) {D2};
+  \node[hw label, font=\tiny] at (2.25,1.8) {D3};
+  \node[hw label, font=\tiny] at (2.75,1.8) {D4};
+  \node[hw label, font=\tiny] at (3.25,1.8) {D5};
+  \node[hw label, font=\tiny] at (3.75,1.8) {D6};
+  \node[hw label, font=\tiny] at (4.25,1.8) {D7};
+  % DQS（偏移 90°，边沿在 DQ 眼中心）
+  \draw[BookAccent, line width=0.8pt] (0.5,0.0) -- (0.75,0.0) -- (0.75,0.6) -- (1.25,0.6) -- (1.25,0.0) -- (1.75,0.0) -- (1.75,0.6) -- (2.25,0.6) -- (2.25,0.0) -- (2.75,0.0) -- (2.75,0.6) -- (3.25,0.6) -- (3.25,0.0) -- (3.75,0.0) -- (3.75,0.6) -- (4.25,0.6) -- (4.25,0.0) -- (4.75,0.0) -- (4.75,0.6) -- (5.0,0.6);
+  \node[hw label, anchor=east] at (0.4,0.3) {DQS};
+  % 采样点（DQS 边沿处）
+  \foreach \x in {0.75,1.25,1.75,2.25,2.75,3.25,3.75,4.25,4.75} {
+    \fill[BookAmber] (\x,1.3) circle (0.07);
+  }
+  % 90° 偏移标注
+  \draw[BookAmber, line width=0.4pt, <->] (0.5,2.2) -- (0.75,2.2);
+  \draw[BookAmber, line width=0.4pt, <->] (0.75,2.2) -- (1.25,2.2);
+  \node[BookAmber, font=\tiny\bfseries] at (0.875,2.45) {90° = 0.5 UI};
+  % 说明
+  \node[hw label, text width=9cm] at (2.7,-0.8) {DQS 边沿（$\uparrow$和$\downarrow$）对齐 DQ 数据眼中心。每个 DQS 半周期采一次数据。1 UI = 1 个数据位时间 = $\frac{1}{\text{数据率}}$。DDR4-3200: 1 UI = 312.5 ps。};
+\end{pdfdiagram}
+\diagramnote{DQS/DQ 对齐关系。DQS 相对 DQ 偏移 90°（即四分之一个 DQS 周期，0.5 UI），使 DQS 的上升沿和下降沿恰好落在 DQ 数据有效窗口的中心。}
+
+\topic{Fly-by 拓扑与写均衡}
+
+上一小节讨论的是单条链路的采样关系；DIMM 上并列着 8--9 颗 DRAM，命令/地址总线怎样连到每一颗，是另一个需要专门解决的问题。
+
+DDR3 及以后的标准采用 \hwkey{fly-by}（"掠过式"菊花链：总线依次掠过每颗芯片）拓扑：CA 总线从控制器出发，依次经过 DIMM 上的每颗 DRAM，末端接终端电阻。这与早期 DDR2 的 T 型拓扑（所有 DRAM 等距挂在主干上）不同。
+
+T 型拓扑的每个分支都是一段短截线（stub），在高频下形成多个阻抗不连续点，各处反射相互叠加，频率升高后眼图迅速闭合。Fly-by 的好处：CA 总线是单向的（控制器→DRAM），菊花链只有一条受控阻抗主干，每颗芯片的短 stub 由片内终端吸收，信号完整性更好，支持更高频率。代价：CA 信号到达不同 DRAM 的\hwkey{飞行时间}（flight time，信号沿走线传播所需的时间）不同——第一颗 DRAM 先收到命令，最后一颗晚收到。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 控制器
+  \node[hw compute, minimum width=1.8cm, minimum height=1.0cm] (mc) at (0,0) {控制器\\PHY};
+  % CA 总线走线
+  \draw[BookAccent, line width=0.8pt] (0.9,0.3) -- (2.5,0.3);
+  \draw[BookAccent, line width=0.8pt] (2.5,0.3) -- (4.5,0.3);
+  \draw[BookAccent, line width=0.8pt] (4.5,0.3) -- (6.5,0.3);
+  \draw[BookAccent, line width=0.8pt] (6.5,0.3) -- (8.0,0.3);
+  % DRAM 节点
+  \node[hw memory, minimum width=1.4cm, minimum height=0.8cm] (d0) at (2.5,-0.6) {DRAM 0};
+  \node[hw memory, minimum width=1.4cm, minimum height=0.8cm] (d1) at (4.5,-0.6) {DRAM 1};
+  \node[hw memory, minimum width=1.4cm, minimum height=0.8cm] (d2) at (6.5,-0.6) {DRAM 2};
+  % 连接
+  \draw[hw bus] (2.5,0.3) -- (d0.north);
+  \draw[hw bus] (4.5,0.3) -- (d1.north);
+  \draw[hw bus] (6.5,0.3) -- (d2.north);
+  % 终端电阻
+  \draw[BookRule, line width=0.6pt] (8.0,0.3) -- (8.0,0.8);
+  \draw[BookRule, line width=0.6pt] (7.85,0.8) rectangle (8.15,1.1);
+  \node[hw label, font=\tiny] at (8.0,1.3) {RTT};
+  % DQ 点对点（正交走线：共享底部通道，分别竖直进各 DRAM 底边）
+  \draw[BookTeal, line width=0.5pt, dashed] (0.9,-0.3) -- (1.3,-0.3) -- (1.3,-1.55) -- (6.5,-1.55);
+  \draw[BookTeal, line width=0.5pt, dashed] (2.5,-1.55) -- (2.5,-1.0);
+  \draw[BookTeal, line width=0.5pt, dashed] (4.5,-1.55) -- (4.5,-1.0);
+  \draw[BookTeal, line width=0.5pt, dashed] (6.5,-1.55) -- (6.5,-1.0);
+  \node[hw label, font=\tiny, text=BookTeal, anchor=west] at (6.8,-1.55) {DQ/DQS: 点对点};
+  % 飞行时间标注
+  \draw[BookAmber, line width=0.4pt, <->] (0.9,0.7) -- (2.5,0.7);
+  \node[BookAmber, font=\tiny] at (1.7,0.9) {$t_{f0}$};
+  \draw[BookAmber, line width=0.4pt, <->] (0.9,0.7) -- (4.5,0.7);
+  \node[BookAmber, font=\tiny] at (2.7,1.1) {$t_{f1}$};
+  \draw[BookAmber, line width=0.4pt, <->] (0.9,0.7) -- (6.5,0.7);
+  \node[BookAmber, font=\tiny] at (3.7,1.3) {$t_{f2}$};
+  \node[hw label, text width=9cm] at (4.0,-2.2) {Fly-by: CA 菊花链，飞行时间递增。DQ/DQS 仍是点对点。写均衡（write leveling）补偿各 DRAM 的 CA 飞行时间差。};
+\end{pdfdiagram}
+\diagramnote{Fly-by 拓扑。CA 信号依次经过 DRAM 0→1→2，飞行时间 $t_{f0} < t_{f1} < t_{f2}$。写均衡让每颗 DRAM 的 DQS 输出延迟补偿其 CA 飞行时间。}
+
+\hwkey{写均衡}（Write Leveling）补偿飞行时间差：若不加补偿，靠后的 DRAM 收到 CA 命令更晚，而数据是按各自命令到达时刻起算的，各颗 DRAM 的 DQS/DQ 相对 CK 的相位就会错开。控制器进入写均衡模式后，在 DQS 引脚上发脉冲；每颗 DRAM 比较自己收到的 CK 边沿与 DQS 边沿的先后，通过 DQ[0] 回报 0（DQS 早于 CK）或 1（DQS 晚于 CK）。控制器逐步调整 DQS 输出延迟，直到所有 DRAM 报告 CK 与 DQS 对齐——相当于每颗 DRAM 用自己的"本地时刻表"工作，互相错开，但对各自的 CK 而言节奏一致。
+
+\topic{片上终端电阻（ODT）}
+
+DDR 数据总线是多点拓扑：一条走线上挂着多颗芯片的收发器。当传输线末端的负载阻抗与走线的特性阻抗不匹配时，入射信号的能量无法被全部吸收，多余部分沿线折返，形成\hwkey{反射}，叠加在后续信号上使波形出现过冲与振铃，眼图随之缩小。片上终端电阻（On-Die Termination, ODT）在 DRAM 芯片内部接一个可编程电阻网络到 VDDQ 或 VSS，让末端阻抗与传输线匹配，把到达的信号能量就地吸收。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 驱动器
+  \node[hw compute, minimum width=1.4cm] (drv) at (0,0) {驱动器\\$R_{out}$};
+  % 传输线
+  \draw[BookRule, line width=0.7pt] (0.7,0) -- (5.0,0);
+  \node[hw label, font=\tiny] at (2.8,0.3) {传输线 $Z_0$ = 50$\Omega$};
+  % DRAM 接收器
+  \node[hw state, minimum width=1.4cm] (rx) at (5.8,0) {DRAM\\接收器};
+  % ODT 到 VDDQ
+  \draw[BookAccent, line width=0.6pt] (5.0,0) -- (5.0,0.8);
+  \draw[BookAccent, line width=0.6pt] (4.85,0.8) rectangle (5.15,1.3);
+  \node[BookAccent, font=\tiny\bfseries] at (5.0,1.5) {RTT$\to$VDDQ};
+  % ODT 到 VSS
+  \draw[BookTeal, line width=0.6pt] (5.0,0) -- (5.0,-0.8);
+  \draw[BookTeal, line width=0.6pt] (4.85,-1.3) rectangle (5.15,-0.8);
+  \node[BookTeal, font=\tiny\bfseries] at (5.0,-1.5) {RTT$\to$VSS};
+  % 电压分压标注
+  \node[hw label, text width=8cm] at (3.0,-2.2) {ODT 等效为接收端并联电阻。驱动器输出阻抗 $R_{out}$ 与 ODT 形成分压：$V_{recv} = V_{drive} \times \frac{R_{ODT}}{R_{out}+R_{ODT}}$。};
+\end{pdfdiagram}
+\diagramnote{ODT 原理。接收端内部电阻到 VDDQ（上拉）和/或 VSS（下拉），吸收传输线末端能量，抑制反射。}
+
+DDR4/5 定义了三种 ODT 模式：
+
+\begin{longtable}{L{0.18\linewidth}L{0.22\linewidth}L{0.22\linewidth}L{0.28\linewidth}}
+\toprule
+ODT 模式 & RTT 值 & 何时生效 & 用途 \\
+\midrule
+RTT\_NOM & RZQ/1$\sim$RZQ/7（240$\sim$34 $\Omega$，DDR4 档位） & 该 rank 未被访问时 & 作用于 DQ/DQS/DBI 数据线的常态终端（CA 终端在 DIMM 端 VTT） \\
+RTT\_WR & 120/240 $\Omega$（DDR4；DDR5 增加 80 $\Omega$ 档） & 写操作期间 & 写时终端（控制器驱动 DQ） \\
+RTT\_PARK & RZQ/1$\sim$RZQ/7（240$\sim$34 $\Omega$，DDR4 档位） & 多 rank 系统中未被访问的 rank & 未访问 rank 的常驻终端，保持数据线稳定 \\
+\bottomrule
+\end{longtable}
+
+\hwkey{动态 ODT}（Dynamic ODT, DDR4+）：控制器可以在不改变 DRAM \term{模式寄存器}{Mode Register, MR}的情况下，通过命令动态切换 ODT 值。模式寄存器是 DRAM 片内的一组配置寄存器，控制器在上电初始化时通过 MRS（Mode Register Set）命令写入突发长度、CL、ODT 档位等参数；运行中改写模式寄存器需要额外的稳定时间，动态 ODT 正是为了绕开这一开销而引入的命令通路。例如写操作时目标 DRAM 用 RTT\_WR，非目标 DRAM 用 RTT\_NOM，减少总线负载。
+
+上表与后文多处出现的 RZQ 与 rank 需要先交代。RZQ 指 DRAM 的 ZQ 引脚外接的 240 $\Omega$ $\pm$1\% 精密参考电阻，所有驱动阻抗与 ODT 档位都以它的分数表示，其校准过程见后文"阻抗校准（ZQ）"小节。\term{rank}{排}则是 DIMM 上由同一根片选（$\overline{\text{CS}}$）选中、共同拼出一个通道位宽的一组 DRAM 芯片：一颗 $\times$8 器件只提供 8 bit，8 颗并联才组成 64-bit 通道，这 8 颗就是一个 rank。双 rank DIMM 任一时刻只有一个 rank 占用数据总线，未占用的 rank 恰好可以充当常驻终端，这就是 RTT\_PARK 的用途。
+
+\topic{驱动强度与电压分压}
+
+ODT 决定接收端如何吸收信号，发送端如何驱动信号则是另一个独立可调的量。
+
+DDR 输出驱动器的阻抗可编程：DDR4 支持 34/40/48 $\Omega$（通过 ZQ 校准）。DDR4 DQ 采用\hwkey{POD12}（Pseudo Open-Drain，伪开漏）电平：驱动管只负责把信号线下拉到 VSS，高电平靠终端电阻上拉到 VDDQ。称之为"伪"开漏，是因为上拉电阻是阻值受控的终端网络而非真正的开路；只下拉的驱动方式省掉了上拉到高电平的电流路径，摆幅和功耗都随之减小。驱动强度与 ODT 配合形成\hwkey{电压分压器}，决定接收端看到的逻辑电平。
+
+以 DDR4-3200、VDDQ = 1.2V、$R_{out}$ = 40 $\Omega$、RTT = 60 $\Omega$（上拉到 VDDQ）为例：
+
+$$V_{OH} \approx VDDQ = 1.2 \text{ V} \quad \text{（驱动管截止，RTT 上拉到 VDDQ）}$$
+
+$$V_{OL} = VDDQ \times \frac{R_{out}}{R_{out} + R_{TT}} = 1.2 \times \frac{40}{40 + 60} = 0.48 \text{ V} \quad \text{（驱动管下拉，与 RTT 分压）}$$
+
+POD12 是 DDR4 对电平标准的一次重新设计。此前的 \hwkey{SSTL}（Stub Series Terminated Logic，短截线串联端接逻辑，DDR3 及以前的 DQ 电平标准）使用固定判决门限：以 VDDQ 的一半为参考电压，VIH/VIL 门限固定在约 0.65/0.35 $\times$ VDDQ，不随实际信号质量调整。POD12 不再使用这种固定门限，接收端以可编程 VREF（VrefDQ）作为判决门限，通过 VREF 训练把门限置于实际高、低电平之间的最优位置。
+
+\begin{longtable}{L{0.2\linewidth}L{0.2\linewidth}L{0.2\linewidth}L{0.3\linewidth}}
+\toprule
+$R_{out}$ & RTT & $V_{OL}$ & 信号摆幅（$V_{OH} - V_{OL}$） \\
+\midrule
+34 $\Omega$ & 40 $\Omega$ & 0.55 V & 0.65 V \\
+34 $\Omega$ & 60 $\Omega$ & 0.43 V & 0.77 V \\
+40 $\Omega$ & 60 $\Omega$ & 0.48 V & 0.72 V \\
+48 $\Omega$ & 80 $\Omega$ & 0.45 V & 0.75 V \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{DDR4 DQ 为 POD12 电平：$V_{OH} \approx$ VDDQ，$V_{OL}$ 由驱动阻抗与 RTT 对 VDDQ 上拉的分压决定（典型 0.4--0.55 V）；接收端判决门限为可编程 VrefDQ（Range1 = 60--92.5\% $\times$ VDDQ，Range2 = 45--77\% $\times$ VDDQ，步进约 0.65\%，约 50 档）。}
+
+\topic{PHY 架构}
+
+前几小节讨论了链路对信号的要求，本小节看控制器一侧用什么电路满足这些要求。
+
+物理层接口（Physical Layer Interface, PHY）是控制器数字逻辑与 DDR 模拟信号之间的桥梁：它把控制器内部的并行数据流转换成满足 DDR 时序的高速信号发出，并把读回的数据从 DQS 时钟域安全地转回控制器时钟域。一个典型 DDR4 PHY 包含：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % DLL
+  \node[hw control, minimum width=2.0cm, minimum height=0.9cm] (dll) at (0,2.5) {DLL\\延迟锁定环};
+  % 写路径
+  \node[hw compute, minimum width=2.2cm, minimum height=0.9cm] (wbuf) at (0,1.0) {写数据缓冲\\+ 延迟线};
+  % 读路径
+  \node[hw state, minimum width=2.2cm, minimum height=0.9cm] (fifo) at (0,-0.5) {读 FIFO\\+ DQS 门控};
+  % Per-bit 延迟
+  \node[hw memory, minimum width=2.4cm, minimum height=0.9cm] (delay) at (3.5,1.0) {Per-bit\\延迟线 $\times$72};
+  % IO pad
+  \node[hw state, minimum width=1.6cm, minimum height=0.9cm] (io) at (6.5,1.0) {I/O Pad\\ODT/驱动};
+  % 连接
+  \draw[hw bus] (dll) -- (wbuf);
+  \draw[hw bus] (wbuf) -- (delay);
+  \draw[hw bus] (delay) -- (io);
+  % 读返回路径：正交折线，绕开"每 bit 独立延迟"标注
+  \draw[hw return] (io.south) -- (6.5,-0.5) -- (fifo.east);
+  % DLL 到读 FIFO 的多相时钟：左侧通道，不穿写缓冲框
+  \draw[hw bus] (dll.west) -- (-1.6,2.5) -- (-1.6,-0.5) -- (fifo.west);
+  % 标注
+  \node[hw label, font=\tiny] (ckref) at (0,3.35) {CK 参考};
+  \draw[hw bus] (ckref.south) -- (dll.north);
+  \node[hw label, font=\tiny] at (3.5,0.3) {每 bit 独立延迟};
+  \node[hw label, text width=8cm] at (3.2,-1.5) {PHY 内部：DLL 产生多相时钟；写路径经延迟线对齐 DQS/DQ；读路径用 DQS 门控+ FIFO 跨时钟域。};
+\end{pdfdiagram}
+\diagramnote{DDR PHY 内部结构。DLL 锁定外部 CK，产生精细延迟步进；每根 DQ/DQS 有独立延迟线；读 FIFO 把 DQS 域数据转入控制器时钟域。}
+
+PHY 关键组件：
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+组件 & 功能 & 关键参数 \\
+\midrule
+DLL（延迟锁定环） & 锁定 CK，产生 0--360° 均匀延迟步进 & 步进精度 $\sim$5--10 ps（DDR4），$\sim$2--5 ps（DDR5） \\
+写数据缓冲 & 暂存写数据，按 DQS 节拍发出 & 深度 4--8 burst \\
+Per-bit 延迟线 & 每根 DQ/DQS 独立可调延迟 & 范围 0--2 UI，步进 1/64--1/128 UI \\
+读 FIFO & DQS 域→控制器时钟域的跨域缓冲 & 深度 4--8 条目 \\
+DQS 门控逻辑 & 只在有效数据窗口内使能 DQS 采样 & 防止 preamble/postamble 误触发 \\
+ZQ 校准引擎 & 周期性校准驱动阻抗和 ODT & 每 128 ms 或温度变化时 \\
+\bottomrule
+\end{longtable}
+
+其中 DLL（Delay-Locked Loop，延迟锁定环）值得单独说明。它由相位比较器和一条数控延迟线构成闭环：比较器检测延迟线输出与参考时钟 CK 的相位差，反馈逻辑据此增减延迟，直到两者对齐。锁定之后，从延迟线的各个抽头取出的信号就是相位均匀分布的一组时钟，为每根 DQ/DQS 的延迟线提供皮秒级的步进基准。与 PLL 不同，DLL 不生成新频率，只对既有时钟做相位搬移，因此锁定快、引入的抖动小。读 FIFO 解决的是另一类问题：读数据随 DQS 到达，而 DQS 相位由 DRAM 决定、与控制器的内部时钟没有固定关系，FIFO 用写指针随 DQS、读指针随内部时钟的方式吸收两者之间的相位差。
+
+\topic{训练序列详解}
+
+PHY 提供了可调延迟线和可编程门限，但每块主板、每根 DIMM 的走线长度、过孔、封装都不同，这些调节量取什么值无法预先写死，只能上电后实测——这个实测并写入最优配置的过程称为\hwkey{训练}（training）。训练在 cold boot、warm boot 和 DDR5 运行时周期性执行。目标是补偿 PCB 走线、过孔、封装和温度漂移带来的时序偏移。
+
+\textbf{（a）写均衡（Write Leveling）}
+
+控制器进入写均衡模式（MR1[7]=1）。控制器在 DQS 上发脉冲，DRAM 在 CK 上升沿采样 DQS，通过 DQ[0] 回报：0 = DQS 边沿早于 CK 边沿，1 = DQS 边沿晚于 CK 边沿。控制器逐步增加 DQS 输出延迟，直到回报从 0 翻转为 1——此时 DQS 对齐 CK。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % CK
+  \draw[BookRule, line width=0.7pt] (0.5,3.0) -- (1.5,3.0) -- (1.5,3.5) -- (2.5,3.5) -- (2.5,3.0) -- (3.5,3.0) -- (3.5,3.5) -- (4.5,3.5) -- (4.5,3.0) -- (5.5,3.0) -- (5.5,3.5) -- (6.5,3.5) -- (6.5,3.0) -- (7.5,3.0);
+  \node[hw label, anchor=east] at (0.4,3.25) {CK};
+  % DQS（逐步右移）
+  \draw[BookAccent, line width=0.6pt] (0.5,2.0) -- (1.0,2.0) -- (1.0,2.5) -- (1.5,2.5) -- (1.5,2.0) -- (2.0,2.0);
+  \draw[BookAccent, line width=0.6pt] (2.5,2.0) -- (3.0,2.0) -- (3.0,2.5) -- (3.5,2.5) -- (3.5,2.0) -- (4.0,2.0);
+  \draw[BookAccent, line width=0.6pt] (4.5,2.0) -- (5.0,2.0) -- (5.0,2.5) -- (5.5,2.5) -- (5.5,2.0) -- (6.0,2.0);
+  \node[hw label, anchor=east] at (0.4,2.25) {DQS};
+  % DQ[0] 回报
+  \draw[BookTeal, line width=0.6pt] (0.5,1.0) -- (2.0,1.0) -- (2.0,1.5) -- (4.0,1.5) -- (4.0,1.0) -- (7.5,1.0);
+  \node[hw label, anchor=east] at (0.4,1.25) {DQ[0]};
+  \node[hw label, font=\tiny] at (1.2,0.7) {0};
+  \node[hw label, font=\tiny] at (3.0,1.7) {0};
+  \node[hw label, font=\tiny] at (5.5,0.7) {1};
+  % 翻转点
+  \draw[BookAmber, line width=0.5pt, dashed] (4.0,3.8) -- (4.0,0.5);
+  \node[BookAmber, font=\tiny\bfseries] at (4.0,4.0) {对齐点};
+  \node[hw label, text width=8cm] at (4.0,-0.3) {写均衡：DQS 延迟逐步增加。DQ[0] 从 0 翻转为 1 的时刻即 DQS 对齐 CK 边沿。};
+\end{pdfdiagram}
+\diagramnote{写均衡波形。控制器逐步推迟 DQS，DRAM 在 CK 沿采样 DQS 并回报。0→1 翻转点即对齐。}
+
+\textbf{（b）读门控训练（Read Gate Training）}
+
+DQS 在有效数据之前有 1--2 个前导（preamble）周期：DQS 先从高阻态拉到低电平，有的配置下还会先翻转一两个周期，用以提示接收端"数据将至"；有效数据结束之后同样有一段收尾（postamble）。若 PHY 在 preamble 期间就使能 DQS 采样，会采到无效数据。读门控训练确定 DQS preamble 的精确起始位置，设置 DQS 使能窗口的开启时刻。
+
+控制器发 READ 命令，逐步调整 DQS gate 延迟：太早→采到 preamble 噪声；太晚→丢失第一个数据位。找到刚好能正确采到 preamble 后第一个有效数据的 gate 位置。
+
+\textbf{（c）读 per-bit 去偏斜（Read Per-Bit Deskew）}
+
+每根 DQ 的走线长度不同，到达 PHY 的时间有差异。训练对每根 DQ 独立扫描 DQS 采样延迟，把"采样正确"的延迟区间左右边界找出来，取中点——这个正确采样区间就是后文"眼图"小节要形式化的\hwkey{数据眼}在水平方向上的宽度：
+
+\begin{lstlisting}
+for each DQ bit i:
+  for delay = 0 to MAX_DELAY step 1:
+    set DQS_delay[i] = delay
+    send READ command, capture DQ[i]
+    if captured == expected:
+      mark delay as PASS
+    else:
+      mark delay as FAIL
+  left_edge  = first PASS delay
+  right_edge = last PASS delay
+  optimal_delay[i] = (left_edge + right_edge) / 2
+\end{lstlisting}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 眼图轮廓
+  \draw[BookTeal, line width=0.8pt] (1.0,0.5) .. controls (2.0,2.5) and (3.0,2.8) .. (4.0,2.8) .. controls (5.0,2.8) and (6.0,2.5) .. (7.0,0.5);
+  \draw[BookTeal, line width=0.8pt] (1.0,0.5) .. controls (2.0,-1.5) and (3.0,-1.8) .. (4.0,-1.8) .. controls (5.0,-1.8) and (6.0,-1.5) .. (7.0,0.5);
+  % 扫描线
+  \foreach \x in {1.5,2.0,2.5,3.0,3.5,4.0,4.5,5.0,5.5,6.0,6.5} {
+    \draw[BookRule, line width=0.2pt, dashed] (\x,-2.0) -- (\x,3.0);
+  }
+  % PASS 区域
+  \fill[BookAccent!15] (2.5,-1.5) rectangle (5.5,2.5);
+  % 左右边界
+  \draw[BookAmber, line width=0.7pt] (2.5,-2.0) -- (2.5,3.0);
+  \draw[BookAmber, line width=0.7pt] (5.5,-2.0) -- (5.5,3.0);
+  \node[BookAmber, font=\tiny\bfseries] at (2.5,3.2) {左边沿};
+  \node[BookAmber, font=\tiny\bfseries] at (5.5,3.2) {右边沿};
+  % 中心
+  \draw[BookRed, line width=0.7pt] (4.0,-2.0) -- (4.0,3.0);
+  \node[BookRed, font=\tiny\bfseries] at (4.0,-2.3) {最优采样点};
+  \fill[BookRed] (4.0,0.5) circle (0.1);
+  % 标注
+  \node[hw label, text width=8cm] at (4.0,-3.0) {读去偏斜：水平扫描 DQS 延迟，找到数据眼左右边界（PASS→FAIL 翻转），取中心为最优采样点。眼宽 = 右边沿 $-$ 左边沿。};
+\end{pdfdiagram}
+\diagramnote{读 per-bit 去偏斜眼图。水平轴是 DQS 延迟步进，垂直轴是电压。扫描找到 PASS 区域的左右边界，中心即最优采样时刻。}
+
+\textbf{（d）写 per-bit 去偏斜（Write Per-Bit Deskew）}
+
+与读去偏斜对称：控制器逐步调整每根 DQ 的\hwkey{输出延迟}（相对 DQS），DRAM 端采样并回报正确/错误。找到 DRAM 端数据眼的中心，设置 DQ 输出延迟。
+
+\begin{lstlisting}
+for each DQ bit i:
+  for delay = 0 to MAX_DELAY step 1:
+    set DQ_output_delay[i] = delay
+    write known pattern to DRAM
+    read back and compare
+    if match: mark PASS else: mark FAIL
+  optimal_DQ_delay[i] = center of PASS window
+\end{lstlisting}
+
+\textbf{（e）VREF 训练（DDR4/5）}
+
+DDR4/5 接收端使用可编程 VREF 作为逻辑判决阈值。VREF 训练扫描接收端 VREF（DDR4 VrefDQ：Range1 = 60--92.5\% $\times$ VDDQ，Range2 = 45--77\% $\times$ VDDQ，步进约 0.65\%、约 50 档），与时间延迟扫描组合，形成\hwkey{二维眼图}（时间 $\times$ 电压）：
+
+\begin{lstlisting}
+for vref = VREF_MIN to VREF_MAX step VREF_STEP:
+  set receiver VREF = vref
+  for delay = 0 to MAX_DELAY step 1:
+    set DQS_delay = delay
+    capture and compare
+    eye_map[vref][delay] = PASS/FAIL
+  end
+end
+optimal_vref  = vertical center of 2D PASS region
+optimal_delay = horizontal center of 2D PASS region
+\end{lstlisting}
+
+\hwevidence{DDR4 VrefDQ 范围：Range1 = 60--92.5\% $\times$ VDDQ，Range2 = 45--77\% $\times$ VDDQ，步进约 0.65\% $\times$ VDDQ（约 50 档）。DDR5 的 VREF 体系更细：DRAM 端有独立的 CA VREF 和 DQ VREF，由片上 VREF 发生器产生。}
+
+\topic{眼图与信号质量}
+
+训练过程扫描出的 PASS 区域，换一个角度看就是信号质量的度量。把连续数千个 UI 的 DQ 波形叠加在同一时间窗口，形成\hwkey{眼图}（eye diagram）：所有 0→1、1→0 跳变沿围出一个张开的"眼睛"，眼睛内部是禁止采样落入的区域。眼的张开程度直接反映链路信号质量：
+
+\begin{longtable}{L{0.2\linewidth}L{0.3\linewidth}L{0.4\linewidth}}
+\toprule
+眼图参数 & 含义 & DDR4-3200 工程参考值 \\
+\midrule
+眼宽（水平） & 数据有效时间窗口 & $>$ 0.2 UI = 62.5 ps（@3200 MT/s） \\
+眼高（垂直） & 电压噪声裕量 & $>$ 100 mV（VDDQ=1.2V 时） \\
+总抖动 Tj & 边沿时间总不确定度 & $<$ 0.2 UI (pk-pk) \\
+确定性抖动 Dj & ISI + 串扰 + 占空比失真 & $<$ 0.1 UI \\
+随机抖动 Rj & 热噪声、散粒噪声 & $<$ 3 ps RMS \\
+建立时间 $t_{su}$ & DQ 相对 DQS 边沿的最小提前量 & $>$ 50 ps \\
+保持时间 $t_{h}$ & DQ 相对 DQS 边沿的最小延后量 & $>$ 50 ps \\
+\bottomrule
+\end{longtable}
+
+需要说明上表的口径：JEDEC 标准并不直接规定眼宽、眼高的具体数值，它规定的是接收端的电压/时间参考与误码率目标，眼图余量由链路各环节的预算叠加而成。上表给出的是满足这些约束时工程上常用的设计参考值，而非规范条文。
+
+表中三种抖动的关系值得展开。\hwkey{抖动}（jitter）指信号边沿相对理想时刻的时间偏移。确定性抖动（Dj）有明确的物理来源（ISI、串扰、占空比失真），其峰峰值有界；随机抖动（Rj）来自热噪声等随机过程，近似高斯分布、理论上无界，因此只能用 RMS 值描述。总抖动 Tj 是在给定误码率（如 $10^{-12}$）下把 Rj 按高斯尾部折算成峰峰值后与 Dj 求和的结果——误码率要求越低，Rj 折算系数越大，Tj 随之变宽。
+
+\hwevidence{DDR4-3200: 1 UI = 312.5 ps。眼宽设计目标 $>$ 0.2 UI = 62.5 ps、眼高 $>$ 100 mV（均为工程参考值）。DDR5-4800: 1 UI = 208.3 ps，同等相对余量下眼宽仅 $\sim$37.5 ps，绝对裕量显著收紧——这是 DDR5 必须引入片内均衡的直接原因。}
+
+\topic{信号完整性：ISI、串扰与均衡}
+
+数据率继续升高后，限制带宽的不再是晶体管的速度，而是信道本身对波形的损伤。主要有两类机制。其一是\term{符号间干扰}{Inter-Symbol Interference, ISI}：PCB 走线对高频分量衰减更强（趋肤效应使导体有效截面积随频率缩小，介质损耗随频率上升），一个 bit 的方波被拉长，拖尾侵入后续 bit 的采样窗口，前后波形互相叠加。其二是\term{串扰}{crosstalk}：相邻信号线通过寄生电容和互感耦合能量，按受害端与干扰源的位置关系分为近端串扰（NEXT）与远端串扰（FEXT）。DDR5 数据率（4800--8800 MT/s）使信号完整性成为主要挑战：
+
+\begin{longtable}{L{0.16\linewidth}L{0.34\linewidth}L{0.4\linewidth}}
+\toprule
+损伤 & 物理原因 & 对眼图的影响 \\
+\midrule
+ISI & 传输线损耗（趋肤效应+介质损耗）使高频分量衰减，前后 bit 波形重叠 & 眼水平闭合，边沿模糊 \\
+FEXT & 相邻 DQ 线远端耦合（同向传播） & 叠加噪声，减小眼高 \\
+NEXT & 相邻 DQ 线近端耦合（反向传播） & 脉冲式干扰 \\
+反射 & 阻抗不连续（过孔、连接器、分支） & 振铃，多次过冲 \\
+损耗 & PCB 介质（FR-4: $\sim$0.2 dB/inch @3 GHz） & 幅度衰减，眼高减小 \\
+\bottomrule
+\end{longtable}
+
+DDR5 引入\hwkey{均衡}技术对抗 ISI：
+
+\begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}}
+\toprule
+技术 & 原理 & 应用位置 \\
+\midrule
+CTLE & 连续时间线性均衡：高频增益提升，补偿传输线低通特性 & DRAM 接收端 / 控制器 PHY \\
+DFE & 判决反馈均衡：用已判决 bit 的加权反馈消除后续 bit 的 ISI 拖尾 & 控制器 PHY 接收端（1--4 tap） \\
+TX 预加重 & 发送端对跳变 bit 加大驱动，对连续同值 bit 减小驱动 & 控制器 PHY 发送端 \\
+\bottomrule
+\end{longtable}
+
+\begin{classicnote}
+三种均衡的思路差异在于"在哪里补偿、用什么信息补偿"。CTLE 是线性滤波器，在接收端提升高频分量以抵消信道的低通特性，电路简单，但噪声和信号一起被放大。发送端预加重把补偿移到发送侧：对将要被信道衰减的高频分量（跳变沿）预先加大驱动，等效于给信道做预失真，代价是低频分量（连续同值 bit）的幅度被压低。DFE 则利用已判决出的 bit 是干净 0/1 这一信息，重构它们对后续 bit 的 ISI 拖尾并从输入中减去——反馈信号不含噪声，所以 DFE 不放大噪声，这是它相对线性均衡的根本优势；代价是一旦误判，错误会通过反馈传播给后续若干 bit（误差传播）。表中 DFE 的 tap 数即参与反馈的历史 bit 个数。
+\end{classicnote}
+
+\hwevidence{DDR5-4800 在标准 FR-4 PCB（6 英寸走线）上，信道损耗约 $-$6 dB @2.4 GHz（奈奎斯特频率，即数据率的一半，跳变最密的方波图案其基频所在）。无均衡时眼几乎完全闭合；1-tap DFE + CTLE 可恢复 $\sim$30 mV 眼高。}
+
+\topic{阻抗校准（ZQ）}
+
+驱动器的输出阻抗和 ODT 电阻值随温度和电源电压漂移。DDR 芯片内部有一个\hwkey{ZQ 校准引擎}：将内部电阻网络与外部精密参考电阻（通常 240 $\Omega$ $\pm$1\%）比较，调整内部电阻码使阻抗匹配目标值。
+
+\begin{longtable}{L{0.24\linewidth}L{0.26\linewidth}L{0.4\linewidth}}
+\toprule
+ZQ 操作 & 触发条件 & 耗时 \\
+\midrule
+ZQ 初始化校准（上电 ZQCL，tZQinit） & 上电复位后 & 1024 CK = 640 ns @DDR4-3200 \\
+ZQ 长校准（ZQCL，tZQoper） & 初始化之后、退出 self-refresh 后 & 512 CK = 320 ns @DDR4-3200 \\
+ZQ 短校准（ZQCS） & 每 128 ms 或温度变化 $>$ 一定阈值 & 128 CK = 80 ns @DDR4-3200 \\
+ZQ 操作期间 & 该 rank 不可接受读写命令 & 调度器需避开 \\
+\bottomrule
+\end{longtable}
+
+校准目标：输出阻抗 34/40/48 $\Omega$（$\pm$15\%），ODT 40/60/80/120 $\Omega$（$\pm$15\%）。校准码存储在内部寄存器，供驱动器和 ODT 网络查用。
+
+可编程阻抗的实现并不是电流舵 DAC，而是\hwkey{二进制加权开关电阻阵列}：驱动器和 ODT 各由若干条并联支路构成，支路的导通电阻按 1:2:4:8……加权，每条支路用一个 MOS 开关控制通断，校准码选择导通哪些支路，并联后的等效电阻即为目标阻抗。校准过程类似逐次逼近：先把上拉阵列与外部 RZQ 接成分压器，比较器中点电压与 VDDQ/2，逐位调整上拉校准码直到两者相等；再以已校准的上拉为基准，用同样方法校准下拉阵列。之所以需要周期性重校，是因为 MOS 导通电阻随温度、电压明显漂移，校准码只在写下它的那个工作点上准确。
+
+\topic{LPDDR5 差异}
+
+至此讨论的都是面向桌面与服务器的标准 DDR。移动平台对功耗的要求苛刻得多，由此分化出 LPDDR 系列；其最新一代 LPDDR5（低功耗 DDR5）与 DDR5 的差异不只是电压，而是信号方案的重新设计：
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+特性 & LPDDR5 & 标准 DDR5 \\
+\midrule
+VDDQ & 0.5 V（极低摆幅） & 1.1 V \\
+WCK（写时钟） & 独立写时钟，频率 = 数据率/2，源同步 & 无独立写时钟，DQS 兼做写选通 \\
+通道宽度 & 16-bit（更窄） & 32-bit（每 subchannel 32-bit $\times$ 2 = 64-bit 通道；含 ECC 40-bit） \\
+Bank 结构 & 16 bank / 4 bank group & 32 bank / 8 bank group \\
+训练 & 简化：WCK 训练 + DQ 训练（无 fly-by 写均衡） & 完整 5 步训练 \\
+数据率 & 6400--8533 MT/s & 4800--8800 MT/s \\
+功耗模式 & 深度掉电（DSM）、自刷新（SR） & 自刷新、掉电 \\
+\bottomrule
+\end{longtable}
+
+LPDDR5 的 \hwkey{WCK}（Write Clock）是独立于 CK 的高频时钟，仅在写操作时激活。WCK 训练确保 WCK 与 DQ 在 DRAM 端对齐。由于 VDDQ 仅 0.5V，信号摆幅极小（$\sim$250 mV），对噪声和串扰更敏感，PCB 设计需要更严格的等长和阻抗控制。这些取舍的共同目标是功耗：I/O 动态功耗与电压平方成正比，摆幅减半使其降为约四分之一，时钟类信号又可在空闲时停转，这对以待机为主的移动设备比峰值带宽更重要。
+
+\section{三、内存控制器与调度}
+
+\topic{控制器在 SoC 中的位置}
+
+第三节讨论了信号如何可靠地在控制器与 DRAM 之间传输，本节讨论这些信号由谁、按什么顺序发出：内存控制器如何把处理器侧杂乱无章的访存请求，编排成满足 DRAM 时序约束、又能充分利用 bank 并行度的命令流。
+
+内存控制器（Memory Controller, MC）集成在 CPU die 内部（Intel 从 Nehalem 2008 年起，AMD 从 K8 2003 年起），位于 LLC（末级缓存）与 PHY 之间。它把 LLC miss 请求翻译成 DDR 命令序列，管理刷新、ECC、功耗和调度。之所以要把控制器从北桥搬进 CPU die，原因与集成 cache 相同：北桥时代的内存访问要经过一次片外往返，延迟多出几十纳秒；控制器与 LLC 同片后，请求路径全部留在片内，省掉了这段开销。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % === Pipeline stages with register boundaries ===
+  % Stage 1: Request Queue
+  \draw[fill=BookTeal!8, line width=0.5pt] (0.2,0.3) rectangle (2.4,3.2);
+  \node[hw label, font=\small\bfseries] at (1.3,2.9) {入队};
+  % Per-bank queue entries
+  \foreach \y in {0.7, 1.2, 1.7, 2.2} {
+    \draw[BookTeal, line width=0.4pt] (0.5,\y) rectangle (2.1,\y+0.35);
+  }
+  \node[hw label, font=\tiny] at (1.3,0.5) {per-bank FIFO};
+  % Pipeline register
+  \draw[BookRule, line width=1.0pt] (2.6,0.3) -- (2.6,3.2);
+  \fill[BookRule] (2.6,0.8) rectangle (2.7,1.0);
+  \fill[BookRule] (2.6,1.5) rectangle (2.7,1.7);
+  \fill[BookRule] (2.6,2.2) rectangle (2.7,2.4);
+
+  % Stage 2: Scheduler
+  \draw[fill=BookAmber!8, line width=0.5pt] (2.9,0.3) rectangle (5.1,3.2);
+  \node[hw label, font=\small\bfseries] at (4.0,2.9) {调度};
+  % Bank state table
+  \draw[BookAmber, line width=0.4pt] (3.2,1.8) rectangle (4.8,2.5);
+  \node[hw label, font=\tiny] at (4.0,2.15) {bank 状态表};
+  % FR-FCFS logic
+  \draw[BookAmber, line width=0.4pt] (3.2,0.7) rectangle (4.8,1.5);
+  \node[hw label, font=\tiny] at (4.0,1.1) {FR-FCFS 仲裁};
+  % Pipeline register
+  \draw[BookRule, line width=1.0pt] (5.3,0.3) -- (5.3,3.2);
+  \fill[BookRule] (5.3,1.5) rectangle (5.4,1.7);
+
+  % Stage 3: Command Generator
+  \draw[fill=BookAccent!8, line width=0.5pt] (5.6,0.3) rectangle (7.8,3.2);
+  \node[hw label, font=\small\bfseries] at (6.7,2.9) {命令生成};
+  % Command sequence
+  \node[hw label, font=\tiny] at (6.7,2.3) {ACT $\to$ tRCD};
+  \node[hw label, font=\tiny] at (6.7,1.8) {RD/WR $\to$ CL};
+  \node[hw label, font=\tiny] at (6.7,1.3) {PRE $\to$ tRP};
+  % ECC block
+  \draw[BookAccent, line width=0.4pt] (5.9,0.5) rectangle (7.5,1.0);
+  \node[hw label, font=\tiny, fill=white, inner sep=1pt] at (6.7,0.75) {ECC encode/decode};
+  % Pipeline register
+  \draw[BookRule, line width=1.0pt] (8.0,0.3) -- (8.0,3.2);
+
+  % Stage 4: PHY
+  \draw[fill=BookNavy!8, line width=0.5pt] (8.3,0.3) rectangle (10.2,3.2);
+  \node[hw label, font=\small\bfseries] at (9.25,2.9) {PHY};
+  % DQ/DQS/CA signals
+  \node[hw label, font=\tiny] at (9.25,2.2) {CA/CMD};
+  \node[hw label, font=\tiny] at (9.25,1.6) {DQ (wr)};
+  \node[hw label, font=\tiny] at (9.25,1.0) {DQ (rd)};
+  \node[hw label, font=\tiny] at (9.25,0.5) {DQS};
+
+  % DRAM (external)
+  \draw[fill=BookCodeBg, line width=0.6pt] (10.6,0.5) rectangle (12.0,3.0);
+  \node[hw label, font=\small\bfseries] at (11.3,1.75) {DRAM\\DIMM};
+
+  % === Data flow arrows ===
+  % Request path (top, left to right)
+  \draw[BookTeal, line width=0.7pt, ->] (2.4,2.6) -- (2.9,2.6);
+  \draw[BookTeal, line width=0.7pt, ->] (5.1,2.6) -- (5.6,2.6);
+  \draw[BookTeal, line width=0.7pt, ->] (7.8,2.6) -- (8.3,2.6);
+  \draw[BookTeal, line width=0.7pt, ->] (10.2,2.2) -- (10.6,2.2);
+  % Response path (bottom, right to left)
+  \draw[BookRed, line width=0.7pt, ->] (10.6,1.0) -- (10.2,1.0);
+  \draw[BookRed, line width=0.7pt, ->] (8.0,0.8) -- (5.6,0.8);
+  \node[BookRed, font=\tiny, fill=white, inner sep=1pt] at (6.8,0.4) {读数据返回 + ECC 校验};
+
+  % === Side inputs ===
+  % LLC miss input
+  \draw[hw bus, ->] (1.3,3.8) -- (1.3,3.2);
+  \node[hw label, font=\tiny] at (1.3,4.0) {LLC miss 请求};
+  % Refresh/power management
+  \draw[BookAmber, line width=0.5pt, ->] (4.0,-0.5) -- (4.0,0.3);
+  \node[BookAmber, font=\tiny] at (4.0,-0.8) {刷新/功耗管理};
+  % Read data output
+  \draw[BookRed, line width=0.6pt, ->] (1.3,0.3) -- (1.3,-0.3);
+  \node[BookRed, font=\tiny] at (1.3,-0.6) {读数据 $\to$ LLC fill};
+
+  % Legend
+  \node[hw label, text width=11cm] at (6.0,-1.5) {内存控制器四级流水线。竖线为流水线寄存器（每级一拍）。上路径（绿）：请求→调度→命令→PHY→DRAM。下路径（红）：DRAM 读数据经 ECC 校验后回填 LLC。刷新和功耗管理作为旁路输入插入调度级。};
+\end{pdfdiagram}
+\diagramnote{内存控制器内部流水线。请求队列按 bank 组织（深度 8--32）；调度器查 bank 状态表选 row-hit 请求（FR-FCFS）；命令生成器把请求翻译成 DDR 命令序列并插入 ECC；PHY 驱动 CA/DQ/DQS 信号。}
+
+\topic{请求队列结构}
+
+控制器内部维护请求队列，常见两种组织方式：
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+组织方式 & 结构 & 优缺点 \\
+\midrule
+Per-bank 队列 & 每个 bank 一个独立 FIFO（深度 8--32） & 调度器可快速判断 row-hit；但跨 bank 公平性需额外逻辑 \\
+统一队列 & 所有请求共享一个大队列（深度 64--256） & 灵活，但 row-hit 判断需查 bank 状态表 \\
+\bottomrule
+\end{longtable}
+
+队列深度的意义在于重排空间：调度器只能优化它看得见的请求，队列越深，越容易在其中找到可以命中的行和可以并行的 bank；但深度增加也会拉长仲裁延迟，商用控制器的队列深度通常在几十到上百条目之间。
+
+每个请求条目包含：
+
+\begin{lstlisting}
+struct MC_Request {
+  uint64_t phys_addr;     // 物理地址
+  bool     is_write;      // R/W 类型
+  uint8_t  priority;      // 优先级（CPU 核编号、QoS 等级）
+  uint64_t timestamp;     // 到达时间戳（用于 FCFS 和超时）
+  uint8_t  channel;       // 目标通道
+  uint8_t  rank;          // 目标 rank
+  uint8_t  bank_group;    // 目标 bank group
+  uint8_t  bank;          // 目标 bank
+  uint16_t row;           // 目标行
+  uint16_t col;           // 目标列
+  uint8_t  burst_len;     // BL8 或 BL16
+  bool     is_urgent;     // 紧急标志（如 TLB miss、prefetch）
+};
+\end{lstlisting}
+
+\topic{Bank 状态机}
+
+调度器能否发出一条命令，取决于目标 bank 当前处于什么状态、距上一条命令过了多久。每个 bank 在任意时刻处于以下状态之一。状态转换受 DRAM 时序参数约束：
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % IDLE
+  \node[hw state, minimum width=1.8cm, minimum height=0.9cm] (idle) at (0,0) {IDLE\\(预充态)};
+  % ACTIVE
+  \node[hw compute, minimum width=1.8cm, minimum height=0.9cm] (active) at (3.5,0) {ACTIVE\\(行打开)};
+  % READ/WRITE
+  \node[hw memory, minimum width=1.8cm, minimum height=0.9cm] (rw) at (7.0,0) {READ/\\WRITE};
+  % PRECHARGE
+  \node[hw control, minimum width=1.8cm, minimum height=0.9cm] (pre) at (3.5,-2.0) {PRECHARGE\\(关闭行)};
+  % REFRESH
+  \node[hw control, minimum width=1.8cm, minimum height=0.9cm] (ref) at (0,-2.0) {REFRESH};
+  % 转换箭头
+  \draw[hw bus] (idle) -- node[above, hw label, font=\tiny] {ACT (tRCD)} (active);
+  \draw[hw bus] (active) -- node[above, hw label, font=\tiny] {RD/WR (CL)} (rw);
+  \draw[hw bus] (active) -- node[right, hw label, font=\tiny] {PRE (tRP)} (pre);
+  % PRECHARGE -> IDLE：正交折线，从底部通道绕到 IDLE 左边
+  \draw[hw bus] (pre.south) -- (3.5,-3.0) -- (-1.55,-3.0) -- (-1.55,0) -- (idle.west);
+  \node[hw label, font=\tiny] at (1.0,-3.25) {tRP 完成};
+  % IDLE <-> REFRESH：两条平行竖直箭头，标签分列两侧
+  \draw[hw bus] (-0.3,-0.45) -- (-0.3,-1.55) node[midway, left, hw label, font=\tiny] {REF (tRFC)};
+  \draw[hw bus] (0.3,-1.55) -- (0.3,-0.45) node[midway, right, hw label, font=\tiny] {tRFC 完成};
+  % 时序标注
+  \node[hw label, font=\tiny, text=BookAmber] at (1.75,0.5) {tRCD=13.75ns};
+  \node[hw label, font=\tiny, text=BookAmber] at (5.25,0.5) {CL=13.75ns};
+  \node[hw label, font=\tiny, text=BookAmber, anchor=east] at (3.35,-1.25) {tRP=13.75ns};
+  \node[hw label, font=\tiny, text=BookAmber] at (0,-2.7) {tRFC=350ns};
+\end{pdfdiagram}
+\diagramnote{Bank 状态机。IDLE→ACTIVE 需 tRCD（13.75 ns @DDR4-3200 = 22 CK）；ACTIVE→READ/WRITE 需 CL（13.75 ns = 22 CK）；ACTIVE→PRECHARGE 需 tRAS(min)=32 ns；PRECHARGE→IDLE 需 tRP=13.75 ns。}
+
+关键时序约束（DDR4-3200, CL=22, tRCD=22, tRP=22）：
+
+\begin{longtable}{L{0.16\linewidth}L{0.16\linewidth}L{0.16\linewidth}L{0.42\linewidth}}
+\toprule
+参数 & 时钟周期 & 时间 & 约束含义 \\
+\midrule
+tRCD & 22 CK & 13.75 ns & ACT→RD/WR 最小间隔 \\
+CL (RL) & 22 CK & 13.75 ns & RD 命令→数据返回 \\
+WL & 16 CK & 10 ns & WR 命令→数据发出 \\
+tRP & 22 CK & 13.75 ns & PRE→下一次 ACT \\
+tRAS & 52 CK & 32.5 ns & ACT→PRE 最小间隔（行必须保持打开） \\
+tRC & 74 CK & 46.25 ns & ACT→下一次 ACT（同 bank）= tRAS+tRP \\
+tRFC & 560 CK & 350 ns & REF 命令占用时间（8 Gb 器件） \\
+tRRD\_S & 5 CK & 3 ns & 不同 bank group 的 ACT→ACT \\
+tRRD\_L & 8 CK & 4.9 ns & 同 bank group 的 ACT→ACT \\
+tFAW & 34 CK & 21 ns & 滑动窗口内最多 4 个 ACT \\
+\bottomrule
+\end{longtable}
+
+表中 tRRD\_S/tRRD\_L/tFAW 三行按 JEDEC DDR4-3200、1KB 页尺寸取值，规范分别以 max(4nCK, 3 ns)、max(4nCK, 4.9 ns) 和约 21 ns 的形式给出；页尺寸更大的器件这三项更保守（如 2KB 页 tRRD\_S 为 max(4nCK, 5.3 ns)），因为一次 ACT 要驱动更长的字线和更多的感放。这三条约束的共同物理根源是峰值电流：每次 ACT 都要给整行字线和整排感放充放电，是各项操作中瞬时电流最大的一类（数据手册中 ACT 相关的 IDD 规格明显高于读写）；若允许 ACT 无限密集地发出，电源网络的压降与地弹会使内部节点电平失真。tRRD 限制相邻两次 ACT 的最小间隔，tFAW（Four Activate Window，四激活窗口）进一步规定任意滑动窗口内最多 4 次 ACT，把激活电流摊到更长的时间尺度上。同 bank group 的 tRRD\_L 比跨 group 的 tRRD\_S 更长，是因为同 group 的 bank 共享 I/O 与全局数据线，资源回收更慢。
+
+\topic{地址映射}
+
+物理地址的各位如何映射到 channel/rank/bank group/bank/row/column，直接影响 row-hit 率和并行度。以 DDR4-3200、64-bit 通道、BL8（64B burst）为例：
+
+\begin{lstlisting}
+物理地址位分配（示例，row-first 映射）:
+  [5:0]   = column offset (64B = 2^6)
+  [8:6]   = column address (BL8, 8 bursts)
+  [10:9]  = bank address (每组 4 banks → 2 bit)
+  [12:11] = bank group (4 groups → 2 bit)
+  [13]    = rank (2 ranks → 1 bit)
+  [14]    = channel (2 channels → 1 bit)
+  [31:15] = row address (17 bit → 128K rows)
+\end{lstlisting}
+
+这个示例值得读慢一点。相邻 cache line 的地址差为 64B，即最低变化位是 bit 6：连续访问先在列内推进（bit 6--8），随后依次翻转 bank、bank group、rank、channel 位，row 位（bit 15 及以上）最后才变。一段连续地址流会先"扫过"所有 bank 再换行——row 位于地址最高位、最后变化，这正是 row-first 名称的含义。DDR4 的 16 个 bank 由 BA[1:0]（组内 bank）加 BG[1:0]（bank group）共 4 bit 寻址，与上面 [12:9] 的分配一致；row 位宽随器件容量而变（8 Gb 器件 16 bit、16 Gb 器件 17 bit，这里取 17 bit）。
+
+\hwkey{交织策略}对性能影响巨大：
+
+\begin{longtable}{L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}}
+\toprule
+策略 & 地址位顺序 & 效果 \\
+\midrule
+Row-first & row 在高位，bank 在低位（与上文示例一致） & 连续地址在 bank 间轮转→高 bank 并行度；同 bank 内仍保持行局部性，兼顾 row-hit \\
+Bank-first & bank 在高位，row 在低位 & 连续地址集中在同一 bank 逐行推进→并行度低，且频繁换行导致 row-conflict \\
+XOR 交织 & 用 row 高位 XOR bank 位 & 打散热点，兼顾并行度和 row-hit \\
+\bottomrule
+\end{longtable}
+
+Row-first 能兼顾并行度与 row-hit 的机制值得展开：流式访问依次点亮所有 bank，而每个 bank 中被访问的行号在很长一段时间内不变（row 位最后才翻转），该行在各 bank 的 row buffer 中保持打开，于是周期性回访几乎都是 row-hit，只有流前进到下一行时各 bank 才集中换行一次。XOR 交织针对的是另一类问题：若多个线程的访问因地址模式相关而恰好挤在相同的 bank 子集上，用 row 高位与 bank 位异或可以把热点重新打散到不同 bank。
+
+\hwevidence{典型服务器配置（row-first + XOR）：顺序流式访问 row-hit 率 $>$ 90\%（因为同一 bank 内连续访问仍命中同一行）；随机 4K 访问 row-hit 率 30--50\%。}
+
+\topic{FR-FCFS 调度}
+
+地址映射决定了一个请求"去哪"，调度器决定的是队列中的请求"谁先走"。最常用的调度策略是 \hwkey{FR-FCFS}（First-Ready, First-Come-First-Served）：先筛出所有"就绪"请求（时序约束均已满足、命令可立即发出），在就绪集合内按行缓冲命中情况排优先级，同级再按到达时间先来先服务：
+
+\begin{lstlisting}
+每周期调度决策:
+  1. 筛选所有 ready 请求（满足时序约束）
+  2. 优先级排序:
+     priority 1: row-hit  (目标行已在 row buffer) → 代价 = CL = 13.75 ns
+     priority 2: row-empty (bank idle)            → 代价 = tRCD + CL = 27.5 ns
+     priority 3: row-conflict (需先 PRE)          → 代价 = tRP + tRCD + CL = 41.25 ns
+  3. 同优先级内按 timestamp 排序 (FCFS)
+  4. 发出选中请求对应的命令
+\end{lstlisting}
+
+FR-FCFS 最大化带宽的原理：row-hit 请求只需 CL 就能返回数据，是代价最低的路径。优先发 row-hit 请求等价于最大化每单位时间的数据传输量。
+
+\begin{classicnote}
+FR-FCFS 源自 Rixner 等人 2000 年关于内存访问调度的经典研究（ISCA 2000）。其思想可以概括为"把 row buffer 当 cache 管理"：调度器像 cache 一样对待打开的行——命中（row-hit）优先，miss（row-conflict）最贵，因此尽量推迟；先来先服务则保证请求不会被无限推迟。此后商用控制器的调度器基本都是这一框架的变体。
+\end{classicnote}
+
+\begin{longtable}{L{0.24\linewidth}L{0.18\linewidth}L{0.24\linewidth}L{0.24\linewidth}}
+\toprule
+访问模式 & Row-hit 率 & 有效带宽 & 平均延迟 \\
+\midrule
+顺序流式（streaming） & $>$95\% & 22--24 GB/s & $\sim$45 ns \\
+随机 4K 粒度 & 30--50\% & 8--14 GB/s & $\sim$65 ns \\
+完全随机 64B & $<$10\% & 3--6 GB/s & $\sim$80 ns \\
+混合（70\% 读 30\% 写） & 50--70\% & 12--18 GB/s & $\sim$55 ns \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{DDR4-3200 单通道峰值 = 25.6 GB/s。STREAM 基准实测 $\sim$22 GB/s（86\% 效率）。随机 4K 读实测 $\sim$10 GB/s（39\% 效率）。}
+
+\topic{其他调度算法}
+
+FR-FCFS 对单线程流式负载最优，但多核场景下它有明显短板：一个行局部性好的线程会持续产生 row-hit 请求，永远排在优先级最高的位置，其他线程的 row-conflict 请求被不断推迟，极端情况下长期得不到服务（饿死）。研究界针对公平性提出了多种改进：
+
+\begin{longtable}{L{0.14\linewidth}L{0.32\linewidth}L{0.24\linewidth}L{0.2\linewidth}}
+\toprule
+算法 & 核心思想 & 公平性 & 带宽损失 \\
+\midrule
+FR-FCFS & Row-hit 优先 + FCFS & 差（可饿死） & 基准 \\
+PAR-BS & 把同批次请求分组，组内 row-hit 优先，组间轮转 & 好 & $<$3\% \\
+BLISS & 检测连续 row-hit 的源，临时黑名单化 & 好 & $<$2\% \\
+ATLAS & 按线程归一化延迟排序，最慢线程优先 & 最好 & $<$5\% \\
+TCM & 线程聚类内存调度（Thread Cluster Memory scheduling）：按线程的内存敏感度分群，群间轮转，群内 FCFS & 好 & $<$3\% \\
+\bottomrule
+\end{longtable}
+
+\hwkey{PAR-BS}（Parallelism-Aware Batch Scheduling）：把当前队列中的请求按来源（CPU 核）分成批次，每批内用 FR-FCFS，批间轮转。防止单核大量 row-hit 请求垄断总线。
+
+\hwkey{BLISS}（BLacklisting-based Scheduling）：监测每个源连续获得 row-hit 的次数；超过阈值后临时将该源加入黑名单，调度时降低其优先级。实现简单（只需计数器），效果接近 ATLAS。
+
+\hwkey{ATLAS}（Adaptive Thread-Level Access Scheduling）：计算每个线程的归一化延迟（实际延迟/理想延迟），优先服务归一化延迟最大的线程。公平性最好，但需要更多硬件状态。
+
+\topic{读写批处理（Read/Write Batching）}
+
+DDR 数据总线是半双工的：读时由 DRAM 驱动 DQ，写时由控制器驱动 DQ。方向切换不能瞬间完成——原驱动方必须先释放总线，新驱动方才能接管，否则两个驱动器同时驱动一条线，轻则电平不确定，重则形成贯穿电流。这段双方都不得驱动总线的空窗期称为\hwkey{死区}（dead time，又称总线换向时间 turnaround）：
+
+\begin{longtable}{L{0.24\linewidth}L{0.2\linewidth}L{0.46\linewidth}}
+\toprule
+切换方向 & 死区 & 原因 \\
+\midrule
+Read → Write & 2--4 CK (1.25--2.5 ns) & DQS preamble + 总线释放 + 驱动器切换 \\
+Write → Read & 4--7 CK (2.5--4.4 ns) & DQS postamble + 总线释放 + ODT 切换 \\
+\bottomrule
+\end{longtable}
+
+上表数值是总线物理切换所需的最小空窗，口径上只计"驱动权交接"本身。JEDEC 对写转读还有更长的时序参数约束调度器：跨 bank group 的 tWTR\_S = max(2nCK, 2.5 ns)，同 bank group 的 tWTR\_L = max(4nCK, 7.5 ns)，DDR4-3200 下约 12 CK——同 group 的 bank 共享感放 I/O 通路，写数据从内部通路撤出需要更久，因此约束更长。控制器实际预留的写读间隔以 tWTR 为准，表中的死区是其物理来源。写转读的约束比读转写更紧，是因为总线换向之外还要多等一步：写数据占用的 DRAM 内部共享 I/O 通路必须恢复之后才能用于读出，tWTR 因此明显长于单纯的换向时间。
+
+若读写频繁交替，死区占比显著。控制器采用\hwkey{批处理}策略：
+
+\begin{lstlisting}
+读写批处理算法:
+  mode = READ_BATCH
+  write_queue_count = 0
+
+  每周期:
+    if mode == READ_BATCH:
+      调度读请求 (FR-FCFS)
+      write_queue_count = 写队列中累积的请求数
+      if write_queue_count >= WRITE_DRAIN_THRESHOLD (e.g. 28/32):
+        mode = WRITE_BATCH   // 切换到写模式
+    else:  // WRITE_BATCH
+      调度写请求 (FR-FCFS)
+      write_queue_count--
+      if write_queue_count <= WRITE_FILL_THRESHOLD (e.g. 8/32):
+        mode = READ_BATCH    // 切换回读模式
+\end{lstlisting}
+
+\hwevidence{典型配置：写队列深度 32，WRITE\_DRAIN\_THRESHOLD = 28（87.5\%），WRITE\_FILL\_THRESHOLD = 8（25\%）。批次大小 $\sim$20 个请求。切换频率从每请求一次降到每 20 请求一次，死区损失从 $\sim$15\% 降到 $<$2\%。}
+
+\topic{刷新调度}
+
+无论调度多么优化，控制器都必须周期性地把总线让给刷新——第二节已经说明 1T1C 单元的电容会漏电，刷新是 DRAM 存在的固有代价，调度器能选择的只是何时执行、以多大粒度执行。DRAM 必须周期性刷新所有行（DDR4：每 64 ms 一遍、每 7.8 $\mu$s 一次 REFRESH；DDR5：每 32 ms 一遍、每 3.9 $\mu$s 一次）。刷新期间目标 bank（或所有 bank）不可访问。调度策略：
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+策略 & 机制 & 延迟影响 \\
+\midrule
+Postpone（推迟） & 允许推迟最多 8 次刷新（$8 \times 7.8 = 62.4$ $\mu$s），在空闲时集中执行 & 减少与请求冲突；但集中刷新时延迟突增 \\
+Pull-in（提前） & 在队列空闲时提前执行刷新 & 平滑刷新分布；但可能浪费带宽 \\
+Same-bank refresh（REFsb，DDR5） & 一次刷新所有 bank group 中同编号的 bank（32 bank 中的 8 个），其余 bank 继续服务 & 刷新期间仍有 75\% bank 可用 \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{DDR4 all-bank REFRESH: tRFC = 350 ns（8 Gb），期间所有 bank 不可用。DDR5 same-bank REFRESH（REFsb）: tRFCsb = 130 ns（16 Gb），仅 1/4 bank 不可用。刷新带宽损失：DDR4 $\sim$4.5\%，DDR5 REFsb $\sim$1.5\%。}
+
+刷新对尾延迟的影响：在 REFRESH 开始之后（刷新期间）到达该 bank 的请求，必须等待 tRFC 完成。最坏情况额外延迟 = tRFC = 350 ns（DDR4-3200, 8Gb）。这是 DRAM 访问 P99 延迟远高于平均值的主要原因。
+
+\topic{多通道调度}
+
+单通道的带宽受限于 64-bit 数据宽度与 DRAM 器件速度，最直接的扩展是增加相互独立的通道。现代 CPU 有 2--12 个独立内存通道，每通道有独立的控制器实例（或共享调度逻辑但独立命令/数据路径）：
+
+\begin{longtable}{L{0.22\linewidth}L{0.22\linewidth}L{0.22\linewidth}L{0.24\linewidth}}
+\toprule
+配置 & 峰值带宽 & 交织粒度 & 典型平台 \\
+\midrule
+单通道 DDR4-3200 & 25.6 GB/s & — & 入门桌面 \\
+双通道 DDR4-3200 & 51.2 GB/s & 64B/128B & 主流桌面 \\
+双通道 DDR5-5600 & 89.6 GB/s & 64B & 高端桌面 \\
+四通道 DDR5-4800 & 153.6 GB/s & 64B & HEDT/工作站 \\
+八通道 DDR5-4800/5600 & 307.2/358.4 GB/s & 64B & 服务器（Intel SPR/EMR） \\
+十二通道 DDR5-4800 & 460.8 GB/s & 64B & 服务器（AMD Genoa） \\
+十二通道 DDR5-6400 & 614.4 GB/s & 64B & 服务器（Intel Granite Rapids） \\
+\bottomrule
+\end{longtable}
+
+地址交织：物理地址的某些位（通常 bit[6] 或 bit[7]）选择通道。64B 粒度交织意味着连续 cache line 分布在不同通道，多通道可并行服务。粒度取 64B 不是巧合：LLC 以 cache line 为单位发出 miss 请求，粒度等于 line 大小时，一个 line 的全部数据来自同一通道、一次突发即可完成，相邻 line 又自然分流到不同通道；粒度再大（如整页），连续数据会长时间集中在一个通道，多核负载下各通道忙闲不均。
+
+\begin{lstlisting}
+双通道交织示例 (64B 粒度):
+  addr[6] = 0 → Channel 0
+  addr[6] = 1 → Channel 1
+
+  连续 128B 访问:
+    line 0 (addr 0x0000--0x003F) → Ch0
+    line 1 (addr 0x0040--0x007F) → Ch1
+    → 两通道并行，带宽翻倍
+\end{lstlisting}
+
+多通道调度的关键：各通道独立调度，但 LLC 的 miss 流需要均匀分布到各通道。若地址映射不当（如大量访问落在同一通道），多通道退化为单通道。
+
+\topic{功耗管理}
+
+前面的调度策略追逐带宽与延迟，功耗管理是另一组正交的决策：没有请求时把 DRAM 放进哪种省电状态、何时唤醒。
+
+DRAM 功耗占服务器总功耗的 20--30\%。控制器管理多种低功耗状态：
+
+\begin{longtable}{L{0.18\linewidth}L{0.22\linewidth}L{0.22\linewidth}L{0.28\linewidth}}
+\toprule
+状态 & 进入条件 & 退出延迟 & 功耗节省 \\
+\midrule
+Active（正常） & 有请求 & — & 基准 \\
+Power-down (PD) & 队列空闲 $>$ tIDLE\_PD & tXP = max(4nCK, 6 ns) & $\sim$30\%（关闭 I/O） \\
+Self-refresh (SR) & 长时间空闲 $>$ tIDLE\_SR & 约 512 CK（tXSDLL $\approx$ 0.32 $\mu$s） & $\sim$90\%（仅保持刷新） \\
+Deep SR (DSR) & 极长空闲（移动平台） & 数十 $\mu$s & $>$95\% \\
+\bottomrule
+\end{longtable}
+
+进入 PD 的决策：若所有 bank 都预充且队列空超过阈值（典型 100--500 CK），控制器发 CKE=0 进入 power-down。退出只需拉高 CKE 并等待 tXP（max(4nCK, 6 ns)）。
+
+进入 SR 的决策：若空闲超过更长阈值（典型 10--100 $\mu$s），控制器发 self-refresh 命令。DRAM 内部自主刷新，外部时钟可关闭。退出自刷新\emph{不需要}重新训练：训练得到的延迟线与门限设置保存在 PHY 寄存器中，进入 SR 并不会丢失。真正需要等待的是 DRAM 片内 DLL 在外部时钟恢复后重新锁定——JEDEC 规定从退出自刷新到可以接收需要 DLL 的命令之间须满足 tXSDLL（约 512 CK，DDR4-3200 下约 320 ns），期间通常还伴随一次 ZQ 校准。
+
+\hwevidence{DDR4 8Gb 器件功耗：Active 读写 $\sim$1.2W，Power-down $\sim$0.8W，Self-refresh $\sim$0.1W。服务器 64GB DIMM（16 颗）：Active $\sim$19W，SR $\sim$1.6W。}
+
+\topic{ECC 流程}
+
+服务器使用 ECC DRAM：每 64 数据位加 8 校验位（共 72 bit），实现 \hwkey{SEC-DED}（Single Error Correction, Double Error Detection，纠一检二）。
+
+8 个校验位的一种经典组织方式是扩展海明码：其中 7 位按海明码规则各负责一组位置的奇偶性（$2^7 = 128 \ge 72$，足以为 72 个位置各编一个非零编号）。读出时重新计算各组奇偶，与存回的校验位比较，差异组成的图样称为\hwkey{校正子}（syndrome）：全零表示无错；非零时其数值本身就是出错位置的编号，据此翻转该位即可完成纠正。第 8 位是覆盖全部 72 位的总体奇偶——校正子非零而总体奇偶不变时，说明出错位数为偶数（至少两位），即检出不可纠正的双错。商用实现多采用等效的 Hsiao 码，思路相同，但每个校验位负责的位数更少、译码延迟更低。
+
+\begin{lstlisting}
+ECC 读路径:
+  1. 从 DRAM 读回 72 bit (64 data + 8 check)
+  2. 计算 syndrome = H × received_vector (H 是 8×72 校验矩阵)
+  3. if syndrome == 0: 无错误，直接返回 64-bit 数据
+  4. if syndrome 匹配单 bit 位置: 翻转该 bit，返回纠正后数据
+     → 记录 CE (Correctable Error) 到 MCE 日志
+  5. if syndrome 非零但不匹配任何单 bit: 双 bit 错误（不可纠正）
+     → 触发 UE (Uncorrectable Error)
+     → 选项: poison (标记数据有毒，消费时触发异常)
+              kill (立即终止进程/panic)
+              报告给 BMC/IPMI
+
+ECC 写路径:
+  1. 接收 64-bit 数据
+  2. 计算 8-bit 校验 = H^T × data
+  3. 写入 72 bit 到 DRAM
+\end{lstlisting}
+
+\hwkey{Patrol Scrub}（巡检清洗）：控制器后台周期性扫描全部物理内存，读出每行、ECC 校验、纠正单 bit 错误并回写。目的是防止单 bit 错误积累成不可纠正的双 bit 错误。其原理基于软错误的统计独立性：若一个 64-bit 字在一段时间内出现一次软错误的概率为 $p$，则两次独立错误恰好落在同一字的概率只有 $p^2$ 量级。只要在第二次错误到来之前把第一次纠正掉，不可纠正错误率就被压低多个数量级——scrub 正是用极小的后台带宽换来这层保险。
+
+\begin{longtable}{L{0.28\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+Scrub 参数 & 典型值 & 含义 \\
+\midrule
+扫描周期 & 24 小时（可配置 1--24 h） & 全部内存扫一遍的时间 \\
+扫描速率 & 每 $\sim$80 $\mu$s 扫一个 cache line & 64 GiB / 24 h $\approx$ 795 KB/s 折算 \\
+带宽占用 & $<$0.003\%（64B / 24h / 总容量） & 对正常请求影响极小 \\
+优先级 & 最低（任何正常请求都抢占 scrub） & 不影响前台延迟 \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{64 GB 内存、24h scrub 周期：每秒扫描 $64 \times 2^{30} / (24 \times 3600) \approx 795$ KB/s，即每 $\sim$80 $\mu$s 扫一个 64B cache line。带宽占用 $<$ 0.003\%。}
+
+\topic{内存镜像与备用（Mirroring \& Sparing）}
+
+SEC-DED 与 scrub 对付的是随机软错误，而整颗芯片、整个 rank 的失效需要更重的冗余手段。服务器 RAS（Reliability, Availability, Serviceability）特性：
+
+\hwkey{内存镜像}（Memory Mirroring）：把物理内存分成两半，控制器同时写两份相同数据到不同通道/rank。读时从任一份读取。一份完全失效时另一份仍可服务。代价：可用容量减半，写带宽减半。
+
+\hwkey{内存备用}（Memory Sparing）：预留一个 rank 作为热备。当某个 rank 的 CE 率超过阈值（如每小时 $>$ 10 次 CE——这是示例策略值，实际阈值由平台固件按器件错误模型设定），控制器触发 rank sparing：把故障 rank 的数据复制到备用 rank，后续访问重定向到备用 rank。故障 rank 下线。
+
+表中 ADDDC（Adaptive Double Device Data Correction，自适应双器件数据纠正）是更精细的方案：当某颗 DRAM 器件出现持续性错误时，控制器自适应地重组 ECC 冗余，把失效器件负责的比特改用其余器件加校验重构，从而容忍最多两颗器件先后失效，而不必像 sparing 那样整 rank 替换。
+
+\begin{longtable}{L{0.18\linewidth}L{0.28\linewidth}L{0.22\linewidth}L{0.22\linewidth}}
+\toprule
+RAS 特性 & 保护级别 & 容量代价 & 性能代价 \\
+\midrule
+ECC (SEC-DED) & 单 bit 纠正 & 11.1\%（8/72） & $<$1\% \\
+Mirroring & 整个通道/rank 失效 & 50\% & 写带宽 $-$50\% \\
+Sparing & 单个 rank 失效 & 1 rank（$\sim$12.5\%） & 无（切换后） \\
+ADDDC & 双器件失效 & 1 rank & $<$2\% \\
+\bottomrule
+\end{longtable}
+
+\topic{性能数据：延迟分解与有效带宽}
+
+把前面各小节的机制汇总成数字：一次 LLC miss 到数据返回的完整延迟分解（DDR4-3200, CL=22）：
+
+\begin{longtable}{L{0.3\linewidth}L{0.2\linewidth}L{0.4\linewidth}}
+\toprule
+阶段 & 延迟 & 说明 \\
+\midrule
+LLC miss 检测 + MC 入队 & 2--5 ns & 片上互连 + 队列写入 \\
+MC 调度等待 & 0--50 ns & 取决于队列深度和 bank 冲突 \\
+ACT 命令 + tRCD & 13.75 ns & 打开目标行（row-conflict 时） \\
+READ 命令 + CL & 13.75 ns & 列读 + 数据从 DRAM 核心到 I/O \\
+PHY 传输 + 片上返回 & 3--5 ns & DQ 传输 + 互连回 LLC \\
+\midrule
+\textbf{Row-hit 总延迟} & \textbf{$\sim$45--55 ns} & 无需 ACT/PRE \\
+\textbf{Row-empty 总延迟} & \textbf{$\sim$60--70 ns} & 需 ACT + tRCD \\
+\textbf{Row-conflict 总延迟} & \textbf{$\sim$75--90 ns} & 需 PRE + tRP + ACT + tRCD \\
+\bottomrule
+\end{longtable}
+
+\hwevidence{实测（Intel Sapphire Rapids, DDR5-4800）：空载顺序读延迟约 90 ns 量级（公开测试多在 90--100 ns，随平台配置与测量口径波动），随机读延迟 $\sim$95--120 ns（含 MC 排队）。STREAM Triad 带宽：八通道 DDR5-4800 实测 $\sim$260 GB/s（峰值 307 GB/s 的 85\%）。}
+
+实测延迟高于上表理想化分解的原因有两层：上表只计 DRAM 侧的关键路径，实测还包含 TLB 遍历、片上互连拥塞与实际队列深度的开销；且 DDR5 的 CL 虽然周期数更高，绝对时间也更长（DDR5-4800 CL40 $\approx$ 16.7 ns vs DDR4-3200 CL22 $=$ 13.75 ns），代际提升主要体现在带宽而非单次访问延迟。
+
+有效带宽 vs 峰值带宽（DDR4-3200 单通道, 25.6 GB/s 峰值）：
+
+\begin{longtable}{L{0.28\linewidth}L{0.18\linewidth}L{0.18\linewidth}L{0.26\linewidth}}
+\toprule
+访问模式 & 有效带宽 & 效率 & 瓶颈 \\
+\midrule
+STREAM Copy/Scale/Add & 22--24 GB/s & 86--94\% & 接近峰值 \\
+矩阵乘法（大 tile） & 18--22 GB/s & 70--86\% & 部分 row-conflict \\
+图遍历（BFS, 随机） & 5--10 GB/s & 20--39\% & row-conflict + 刷新 \\
+指针追踪（linked list） & 2--4 GB/s & 8--16\% & 完全串行，无并行度 \\
+多线程混合（8 核） & 15--20 GB/s & 59--78\% & bank 冲突 + 公平性 \\
+\bottomrule
+\end{longtable}
+
+带宽损失的主要来源：刷新（$\sim$4\%）、读写切换死区（$\sim$2\%）、row-conflict（$\sim$10--40\%，取决于模式）、bank 并行度不足（$\sim$5--15\%）。调度器的目标是在这些约束下最大化有效带宽，同时保证公平性和尾延迟。
+
+\section{四、CPU 如何控制内存：地址译码、命令生成与训练}
+
+内存是 CPU 最特殊的控制对象：它不是外设，却比任何外设都更需要控制。DRAM 芯片自己什么都不记得——哪一行开着、隔多久才能发下一条命令、采样点定在哪个相位，全部由 CPU 一侧的内存控制器维护。本节按控制的三个层次展开：先控制"去哪"（物理地址地图），再控制"何时动"（命令生成与调度），最后控制"参数取多少"（上电训练）。
+
+\topic{2.1\quad 物理地址空间地图：DRAM 窗口、MMIO 洞与固件区}
+
+物理地址不是 DRAM 的同义词。一个 32 位物理地址送出 CPU 后，第一级译码要回答的问题是：这个地址属于 DRAM、某台设备的寄存器窗口，还是固件 ROM？主存与总线章已经给出 MMIO 不可缓存等属性要求，经典芯片与平台章给出 PCIe 枚举时如何把各设备的 BAR（Base Address Register，基址寄存器）窗口分配到互不重叠的区间；这里把结果画成一张完整地图。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 主条：x 0..1.8, y 0..10.2（非线性示意）
+  % 常规内存 0-640KB
+  \fill[BookTeal!14] (0,0) rectangle (1.8,1.0);
+  \draw[BookRule, line width=0.5pt] (0,0) rectangle (1.8,1.0);
+  % VGA 0xA0000-0xBFFFF
+  \fill[BookAmber!18] (0,1.0) rectangle (1.8,1.6);
+  \draw[BookRule, line width=0.5pt] (0,1.0) rectangle (1.8,1.6);
+  % PAM 区 0xC0000-0xFFFFF
+  \fill[BookRed!10] (0,1.6) rectangle (1.8,2.4);
+  \draw[BookRule, line width=0.5pt] (0,1.6) rectangle (1.8,2.4);
+  % 主 DRAM 1MB-TOLUD
+  \fill[BookTeal!14] (0,2.4) rectangle (1.8,5.6);
+  \draw[BookRule, line width=0.5pt] (0,2.4) rectangle (1.8,5.6);
+  % PCIe MMIO 洞 TOLUD-0xEFFFFFFF
+  \fill[BookAmber!18] (0,5.6) rectangle (1.8,7.6);
+  \draw[BookRule, line width=0.5pt] (0,5.6) rectangle (1.8,7.6);
+  % HPET/IOAPIC/LAPIC
+  \fill[BookAccent!12] (0,7.6) rectangle (1.8,8.3);
+  \draw[BookRule, line width=0.5pt] (0,7.6) rectangle (1.8,8.3);
+  % 固件 ROM
+  \fill[BookRed!10] (0,8.3) rectangle (1.8,9.2);
+  \draw[BookRule, line width=0.5pt] (0,8.3) rectangle (1.8,9.2);
+  % 4GB 以上重映射
+  \fill[BookTeal!14] (0,9.2) rectangle (1.8,10.2);
+  \draw[BookRule, line width=0.5pt] (0,9.2) rectangle (1.8,10.2);
+  % 地址轴
+  \draw[BookMuted, line width=0.6pt, ->] (-0.5,0) -- (-0.5,10.5);
+  \node[hw label, font=\tiny] at (-0.5,10.75) {地址增大};
+  % 右侧标注（引导线 + 文字）
+  \draw[BookMuted, line width=0.3pt] (1.8,0.5) -- (2.1,0.5);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,0.5) {\code{0x00000000}--\code{0x0009FFFF} 常规内存 640 KB（DRAM）};
+  \draw[BookMuted, line width=0.3pt] (1.8,1.3) -- (2.1,1.3);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,1.3) {\code{0x000A0000}--\code{0x000BFFFF} VGA 帧缓冲（MMIO）};
+  \draw[BookMuted, line width=0.3pt] (1.8,2.0) -- (2.1,2.0);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,2.0) {\code{0x000C0000}--\code{0x000FFFFF} 扩展 ROM/BIOS 区（PAM 控制）};
+  \draw[BookMuted, line width=0.3pt] (1.8,4.0) -- (2.1,4.0);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,4.0) {\code{0x00100000}--TOLUD 主 DRAM 窗口（可达数 GB）};
+  \draw[BookMuted, line width=0.3pt] (1.8,6.6) -- (2.1,6.6);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,6.6) {TOLUD--\code{0xEFFFFFFF} PCIe MMIO 洞（各设备 BAR 窗口）};
+  \draw[BookMuted, line width=0.3pt] (1.8,7.95) -- (2.1,7.95);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,7.95) {\code{0xFED00000} HPET、\code{0xFEC00000} IOAPIC、\code{0xFEE00000} LAPIC};
+  \draw[BookMuted, line width=0.3pt] (1.8,8.75) -- (2.1,8.75);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,8.75) {\code{0xFF000000}--\code{0xFFFFFFFF} 固件 ROM（复位向量 \code{0xFFFFFFF0}）};
+  \draw[BookMuted, line width=0.3pt] (1.8,9.7) -- (2.1,9.7);
+  \node[hw label, font=\tiny, anchor=west] at (2.2,9.7) {4 GB 以上：被 MMIO 洞挡住的 DRAM 重映射到此};
+\end{pdfdiagram}
+\diagramnote{典型 PC 物理地址地图（非线性比例）。绿色是 DRAM 可达的窗口，黄色是 MMIO，红色是 ROM/固件区；顶部 \code{0xFEC00000}--\code{0xFEE00000} 一带是 IOAPIC、HPET、LAPIC 各控制器的固定 MMIO 窗口区。1 MB 以下的布局是 PC 兼容遗产；TOLUD 以下尽量留给 DRAM，TOLUD 到 4 GB 之间是 MMIO 洞；被洞挡住的物理内存由重映射寄存器搬到 4 GB 以上，64 位系统照常可用。}
+
+这张地图不是硬件写死的，而是固件在上电早期配置的。Intel 平台的两组寄存器决定了地图的形状：\hwkey{TOLUD}（Top of Low Usable DRAM，低位可用 DRAM 顶界）由固件按实际内存容量写入 host bridge，它以下的地址译码到 DRAM、以上（至 4 GB）译码到 PCIe/MMIO；\hwkey{PAM}（Programmable Attribute Map，可编程属性映射）寄存器组把 \code{0xC0000}--\code{0xFFFFF} 这段 256 KB 按 16 KB 粒度逐段设置读写属性——指向 ROM 只读、指向 DRAM 可读写、或谁都不响应。系统 BIOS 区默认指向固件 ROM，固件跑起来之后常把 ROM 内容复制到同地址的 DRAM 并把该段 PAM 切到 DRAM（shadow RAM），因为 DRAM 比固件芯片快得多。地图顶端的几个地址是各控制器的固定窗口：本地 APIC 在 \code{0xFEE00000}、IOAPIC 在 \code{0xFEC00000}、HPET（High Precision Event Timer，高精度事件定时器）在 \code{0xFED00000}，最顶端 16 MB 留给固件，复位后 CPU 取的第一条指令在 \code{0xFFFFFFF0}——第四节讲启动时还会回到这里。
+
+ARM 世界没有这套 PC 遗产，地址地图由 SoC 厂商自行定义：片上 SRAM、DRAM 窗口、各外设寄存器块的位置每颗芯片都不同，内核无法靠猜。于是发现机制也不同——x86 靠固件提供的 E820/ACPI 表，ARM 靠\term{设备树}{device tree}：一个随固件传给内核的数据结构，\code{/memory} 节点声明 DRAM 窗口，各总线节点的 \code{reg} 属性声明每个设备的寄存器基址与长度。地图的形状不同，问题相同：任何一个物理地址都必须有唯一确定的响应者，或一个确定的"无响应"错误——这正是 1.1 节译码器在整机尺度的展开。
+
+\topic{2.2\quad 从"读 64 字节"到命令序列：约束计数器与一拍决策}
+
+存储器件结构章第四节已经把内存控制器的算法面讲完了：bank 状态机、全套时序参数、FR-FCFS 调度策略；第八节的 trace 给出了从 load 指令到 DRAM 命令的端到端路径。本节不重复这些内容，改问一个实现问题：这些算法在硬件里到底长什么样？一条"读 64 字节"的请求进了控制器，调度器凭什么在一拍之内说出"现在能发哪条命令"？
+
+答案的第一部分是\hwkey{约束计数器}。DRAM 的每条时序约束（存储器件结构章第四节那张参数表里的 tRCD、tRAS、tRP、tRRD、tFAW 等）含义都是"某条命令之后，多少拍之内不许发某类命令"。硬件把这个含义直译成电路：每个 bank 挂一列倒计数器，控制器每发出一条命令，就把相关参数值装进目标 bank 对应的计数器——发 ACT 时装入 \hwtiming{tRCD} 与 \hwtiming{tRAS}，发 PRE 时装入 \hwtiming{tRP}；此后每个时钟周期所有计数器同时减一，减到 0 即表示该约束解除。一个 bank 此刻能否接受 RD/WR，看它的 tRCD 计数器是否为 0；能否接受 PRE，看 tRAS 是否到期——每条约束一个比较器，全部比较器的结果与起来就是一个 ready 位。tFAW 这类跨 bank 的全局约束则另有实现：维护一个装最近 4 次 ACT 时间戳的小移位链，最早那次超过 \hwtiming{tFAW}=34 CK 窗口之前不再批准新的 ACT。
+
+答案的第二部分是并行。队列里几十条请求，每条都要算自己的 ready 位（目标 bank 的状态与计数器全在片内寄存器里，读取没有延迟），几十个 ready 位同拍得出；随后是一级优先级编码器——先筛 row-hit，再在命中者中取时间戳最老者，这正是存储器件结构章第四节 FR-FCFS 算法的电路形态：它不是一段顺序执行的程序，而是一拍内稳定下来的组合网络。调度"算法"与"电路"的对应关系，和最小 CPU 章里"指令语义"与"控制字真值表"的关系如出一辙。
+
+被选中的请求最后交给命令编码器，翻译成 CA 总线上的一个周期。DDR 命令用几根控制线的电平组合编码（下表为 DDR3 风格的经典编码，信号均为低有效；DDR4/DDR5 引脚定义不同，如 DDR4 有独立的 ACT\_n，但"组合编码 + 时序约束"的结构相同）：
+
+\begin{longtable}{L{0.13\linewidth}L{0.09\linewidth}L{0.09\linewidth}L{0.09\linewidth}L{0.09\linewidth}L{0.39\linewidth}}
+\toprule
+命令 & CS & RAS & CAS & WE & 含义 \\
+\midrule
+NOP & 0 & 1 & 1 & 1 & 空操作，保持总线同步 \\
+ACT & 0 & 0 & 1 & 1 & 激活：打开指定 bank 的一行进 row buffer \\
+RD & 0 & 1 & 0 & 1 & 读：从打开行取一列，CL 拍后数据上线 \\
+WR & 0 & 1 & 0 & 0 & 写：向打开行写一列，WL 拍后发出数据 \\
+PRE & 0 & 0 & 1 & 0 & 预充：关闭打开的行，tRP 后回 IDLE \\
+REF & 0 & 0 & 0 & 1 & 按内部刷新计数器刷新全部 bank 的对应行，占用 tRFC \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % bank 状态表：4 行 x 4 列 + 就绪位
+  \draw[BookRule, line width=0.5pt] (0,1.1) rectangle (4.6,3.85);
+  \draw[BookRule, line width=0.3pt] (0,3.3) -- (4.6,3.3);
+  \draw[BookRule, line width=0.3pt] (0,2.75) -- (4.6,2.75);
+  \draw[BookRule, line width=0.3pt] (0,2.2) -- (4.6,2.2);
+  \draw[BookRule, line width=0.3pt] (0,1.65) -- (4.6,1.65);
+  \draw[BookRule, line width=0.3pt] (0.7,1.1) -- (0.7,3.85);
+  \draw[BookRule, line width=0.3pt] (1.8,1.1) -- (1.8,3.85);
+  \draw[BookRule, line width=0.3pt] (2.8,1.1) -- (2.8,3.85);
+  % 表头
+  \node[hw label, font=\tiny\bfseries] at (0.35,3.58) {bank};
+  \node[hw label, font=\tiny\bfseries] at (1.25,3.58) {状态};
+  \node[hw label, font=\tiny\bfseries] at (2.3,3.58) {打开行};
+  \node[hw label, font=\tiny\bfseries] at (3.7,3.58) {tRCD/tRAS/tRP\\计数};
+  % 行内容
+  \node[hw label, font=\tiny] at (0.35,3.03) {0};
+  \node[hw label, font=\tiny] at (1.25,3.03) {ACT};
+  \node[hw label, font=\tiny] at (2.3,3.03) {\code{0x1F3}};
+  \node[hw label, font=\tiny] at (3.7,3.03) {0 / 12 / 0};
+  \node[hw label, font=\tiny] at (0.35,2.48) {1};
+  \node[hw label, font=\tiny] at (1.25,2.48) {ACT};
+  \node[hw label, font=\tiny] at (2.3,2.48) {\code{0x0A2}};
+  \node[hw label, font=\tiny] at (3.7,2.48) {0 / 7 / 0};
+  \node[hw label, font=\tiny] at (0.35,1.93) {2};
+  \node[hw label, font=\tiny] at (1.25,1.93) {IDLE};
+  \node[hw label, font=\tiny] at (2.3,1.93) {---};
+  \node[hw label, font=\tiny] at (3.7,1.93) {0 / 0 / 0};
+  \node[hw label, font=\tiny] at (0.35,1.38) {3};
+  \node[hw label, font=\tiny] at (1.25,1.38) {PRE};
+  \node[hw label, font=\tiny] at (2.3,1.38) {---};
+  \node[hw label, font=\tiny] at (3.7,1.38) {-- / -- / 4};
+  % 就绪位小格
+  \foreach \y in {3.03, 2.48, 1.93, 1.38} {
+    \draw[BookRule, line width=0.3pt] (4.9,\y-0.22) rectangle (5.9,\y+0.22);
+  }
+  \node[hw label, font=\tiny, text=BookTeal] at (5.4,3.03) {RD 就绪};
+  \node[hw label, font=\tiny, text=BookTeal] at (5.4,2.48) {RD 就绪};
+  \node[hw label, font=\tiny, text=BookTeal] at (5.4,1.93) {ACT 就绪};
+  \node[hw label, font=\tiny, text=BookRed] at (5.4,1.38) {等待};
+  % 连线到仲裁器
+  \draw[hw bus] (5.9,3.03) -- (6.3,3.03) -- (6.3,2.6) -- (6.6,2.6);
+  \draw[hw bus] (5.9,2.48) -- (6.6,2.48);
+  \draw[hw bus] (5.9,1.93) -- (6.6,1.93);
+  \draw[hw return] (5.9,1.38) -- (6.6,1.38);
+  % 仲裁器
+  \node[hw control, minimum width=2.4cm, minimum height=1.8cm] (arb) at (7.8,1.9) {优先级仲裁\\row-hit 优先\\同级 FCFS};
+  % 命令编码器
+  \node[hw compute, minimum width=2.0cm, minimum height=1.8cm] (enc) at (10.7,1.9) {命令编码\\CS/RAS/\\CAS/WE};
+  \draw[hw bus] (9.0,1.9) -- (9.7,1.9);
+  \node[hw label, font=\tiny, anchor=south] at (9.4,1.94) {选中};
+  % CA 总线输出
+  \draw[hw bus] (10.7,1.0) -- (10.7,0.4);
+  \node[hw label, font=\tiny, anchor=north] at (10.7,0.32) {CA 总线 $\to$ DRAM};
+\end{pdfdiagram}
+\diagramnote{bank 状态表与约束计数器。每个 bank 一行：状态、打开的行号、按 tRCD/tRAS/tRP 排列的一列倒计数器；发命令时装入对应时序参数，此后每拍减一，计数器为 0 是约束解除。就绪位针对队列中指向该 bank 的请求逐一判定（图中 bank 0/1 对应读请求，bank 2 对应激活请求），判定是纯组合逻辑，几十个请求的 ready 位同拍产生，优先级仲裁一拍内选出下一条命令，编码器把它翻译成 CA 总线上的控制线组合。bank 3 的 tRP 计数器未归零，本拍只能等待。}
+
+这张图把"控制"二字展开到了电路尺度：内存控制器不知道也不关心什么是纳秒，它只数自己的时钟。DRAM 数据手册里的纳秒参数，在上电时被固件换算成拍数写进控制器寄存器——这本身就是一次软件对硬件的"参数配置"，与 1.4 节给 8254 装初值没有本质区别。
+
+\topic{2.3\quad 内存训练：控制器如何做系统辨识}
+
+上电瞬间，内存控制器面对的是一个参数未知的对象。DRAM 的时序参数写在 SPD（内存条上的参数 EEPROM，见 3.6 与 4.5 节）里可以读出来，但信号从控制器引脚到 DRAM 引脚要走多快——这取决于这块主板的走线长度、这根 DIMM（Dual In-line Memory Module，双列直插内存条）的插槽位置、今天的温度——没有任何地方写着。存储器件结构章第三节已经逐项讲过训练的操作细节：写均衡扫 DQS-CK 相位、读 per-bit 去偏斜为每根 DQ 扫描延迟线找出 PASS 窗口取中点、VREF 训练把时间与电压合成二维眼图。本节把这些步骤抽象回控制问题，因为它们是本章反馈主题的第一个完整实例。
+
+训练的第一步是\hwkey{测量}，而测量的信息通道窄得惊人：写均衡时 DRAM（x8 器件）只能通过 DQ[0] 一根线、每拍回报 1 个 bit——DQS 边沿在 CK 之前还是之后。控制器就用这 1 bit 做二分或步进搜索，逐拍调整 DQS 输出延迟，直到回报翻转。第二步是\hwkey{参数搜索}：读去偏斜对每根 DQ 独立扫描延迟线的全部档位，记录 PASS 区间的左右边界，取中心——搜索目标是让采样点离两个失效边界等距，即最大化噪声裕量。第三步是\hwkey{写回配置}：搜索到的几十个最优值（每根 DQ 的延迟、每个 VREF 档位）写进 PHY 的配置寄存器。注意这正是 1.1 节的模式：PHY 是一台状态机，训练结果就是它的控制寄存器值，只是这次写寄存器的"软件"是固件里的内存参考代码（MRC），而不是操作系统。
+
+把三步连起来看：发激励（写已知 pattern）、测响应（回读比较）、按误差调整参数、直到误差最小——这与磁盘伺服用 PES 调整音圈电流（存储器件结构章第六节）、与锁相环用相位差调整振荡频率，是同一个"测量—比较—调整"结构。差别只在环的速度：训练是固件闭合的慢环，一次冷启动执行一次，耗时几十到几百毫秒；训练后 PHY 按这组静态参数工作，直到下一次重训。而且慢环并不止于启动——LPDDR 平台（及部分 DDR5 平台）支持运行期周期性重训，跟踪温度与电压漂移；JEDEC DDR5 规定的是周期性 ZQ 校准，因为被控对象（走线延迟）本身随环境缓慢变化。本章第五节会把"测量—比较—调整"形式化成反馈控制的一般结构，内存训练、磁盘伺服、时钟恢复都将成为它的特例。
+% ch06b 第三节：平台控制器
