@@ -1,0 +1,1148 @@
+\chapter{文件系统：从磁盘字节到现代设计}
+
+块设备提供的是一段可按块号寻址的字节空间。文件系统把这段空间组织成有名字、有结构、有权限、有缓存、有崩溃恢复的存储对象。这一章从最小的可行设计开始，一步步加层，直到 ext4、XFS、Btrfs 和 F2FS 的设计决策都能落到具体理由。
+
+\section{为什么需要文件系统}
+
+假设磁盘只有一种用法：程序直接指定块号读写。一个简单程序可以把数据存到第 100--120 块，下次读回来。这在单任务、单程序、文件数量极少时勉强可用，但很快会遇到以下问题：
+
+\begin{longtable}{@{}L{0.2\linewidth}L{0.36\linewidth}L{0.36\linewidth}@{}}
+\toprule
+需求 & 不用文件系统时的困境 & 文件系统提供的解法 \\
+\midrule
+命名 & 程序要记每个文件的块号 & 路径名到 inode 的映射 \\
+分配 & 程序要自己决定写哪些块 & 空闲空间管理器自动分配 \\
+增长 & 文件变大后要手动搬迁 & 间接指针/extent 动态扩展 \\
+共享 & 多个程序同时读写同一区域 & inode 引用计数和锁 \\
+隔离 & 一个程序能覆盖另一个的数据 & 权限检查和地址空间隔离 \\
+崩溃 & 写到一半断电，结构损坏 & 日志/COW 恢复机制 \\
+缓存 & 每次读写都直接访问磁盘 & page cache 透明加速 \\
+\bottomrule
+\end{longtable}
+
+\begin{keyidea}
+文件系统的核心是\emph{把磁盘块号翻译成有意义的对象}。用户操作路径名，文件系统把路径名翻译成 inode，把 inode 翻译成块号，把块号翻译成 DMA 请求。每一层翻译都有缓存、权限和回滚。
+\end{keyidea}
+
+\section{最小文件系统：四类对象}
+
+一个能工作的文件系统至少需要四类磁盘上对象。以 4096 字节块大小、1 GiB 磁盘为例：
+
+\begin{lstlisting}
+磁盘布局（按块号）:
+  block 0:      boot/reserved
+  block 1:      superblock（文件系统全局参数）
+  block 2:      inode bitmap（哪些 inode 被使用）
+  block 3:      block bitmap（哪些数据块空闲）
+  block 4..67:   inode table（64 个 inode，每个 64 字节）
+  block 68..end: data blocks
+\end{lstlisting}
+
+\subsection{superblock}
+
+superblock 描述文件系统全局状态：块大小、总块数、inode 数量、inode 表位置、空闲块数、挂载时间。它是文件系统的入口——挂载时首先要读 superblock，才能找到其他所有结构。
+
+\begin{lstlisting}
+struct superblock {
+  uint32_t magic;        // 文件系统标识，如 0xEF53
+  uint32_t block_size;   // 4096
+  uint32_t total_blocks; // 262144 (1 GiB)
+  uint32_t inode_count;  // 64
+  uint32_t free_blocks;  // 262076
+  uint32_t inode_table_start; // 4
+  uint32_t block_bitmap_start; // 3
+  uint32_t inode_bitmap_start; // 2
+  uint32_t data_start;   // 68
+};
+\end{lstlisting}
+
+superblock 损坏会导致整个文件系统不可用。因此现代文件系统会在磁盘多个位置存放 superblock 副本（ext2/3/4 在每个块组开头存放备份）。
+
+\subsection{inode}
+
+inode 是文件的身份卡。它不包含文件名（文件名在目录中），只包含元数据和数据块指针。一个 inode 固定 64--256 字节，记录文件类型、权限、大小、时间戳和数据块位置。
+
+\begin{lstlisting}
+struct inode {
+  uint16_t mode;        // 文件类型 + 权限位
+  uint16_t uid;         // 所有者
+  uint32_t size;        // 文件大小（字节）
+  uint32_t atime;       // 访问时间
+  uint32_t mtime;       // 修改时间
+  uint32_t block[12];   // 12 个直接块指针
+  uint32_t indirect;    // 1 个一级间接块指针
+  uint32_t dindirect;   // 1 个二级间接块指针
+  uint16_t links;       // 硬链接数
+};
+\end{lstlisting}
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.2\linewidth}L{0.56\linewidth}@{}}
+\toprule
+字段 & 作用 & 为什么需要 \\
+\midrule
+\code{mode} & 类型+权限 & 决定是普通文件、目录、设备还是链接；权限位限制访问 \\
+\code{size} & 逻辑大小 & 读时要检查 offset 不超过 size；写时更新 \\
+\code{block[]} & 块指针 & 把文件 offset 翻译成磁盘块号 \\
+\code{links} & 硬链接计数 & 目录项删除时不一定要回收数据块 \\
+\code{mtime} & 修改时间 & 增量备份按时间判断是否变化 \\
+\bottomrule
+\end{longtable}
+
+\code{inode} 不存文件名。文件名只存在于目录数据中，是\emph{名字指向 inode 号}的映射。这是 Unix 文件系统的核心设计决策——同一个 inode 可以被多个名字引用（硬链接）。
+
+\subsection{directory}
+
+目录是一种特殊文件，其数据内容是一张\code{名字 → inode 号}的表。最简单的目录格式是线性表：
+
+\begin{lstlisting}
+struct dirent {
+  uint32_t inode_number;
+  uint16_t name_len;
+  char     name[252];  // 最多 255 字节
+};
+\end{lstlisting}
+
+根目录（inode 1）的数据块里存放着类似这样的内容：
+
+\begin{lstlisting}
+目录块内容（根目录 inode=1）:
+  inode=2  name="."
+  inode=2  name=".."
+  inode=10 name="home"
+  inode=20 name="etc"
+  inode=30 name="bin"
+\end{lstlisting}
+
+路径解析 \code{/home/user/a.txt} 就是反复读目录数据、查找名字、获取 inode 号、读下一个 inode 的过程：
+
+\begin{lstlisting}
+path_resolve("/home/user/a.txt"):
+  root = read_inode(1)           // 根目录 inode
+  home = dir_lookup(root, "home")    // home 的 inode 号
+  home_inode = read_inode(home)
+  user = dir_lookup(home_inode, "user")
+  user_inode = read_inode(user)
+  file = dir_lookup(user_inode, "a.txt")
+  return read_inode(file)
+
+dir_lookup(dir_inode, name):
+  for block in dir_inode.block[]:
+    data = read_block(block)
+    for entry in data:
+      if entry.name == name:
+        return entry.inode_number
+  return -ENOENT
+\end{lstlisting}
+
+每次路径解析可能要读多个磁盘块。这是后续讨论 dentry cache 和 B-tree 目录的直接原因。
+
+\subsection{free space manager}
+
+空闲空间管理决定文件系统在哪里放新数据。最简单的方式是 bitmap：每个块对应一个 bit，1 表示已用，0 表示空闲。
+
+\begin{lstlisting}
+alloc_block():
+  for i in 0..total_blocks:
+    if bitmap[i] == 0:
+      bitmap[i] = 1
+      mark_bitmap_dirty(i)
+      return i
+  return -ENOSPC
+
+free_block(n):
+  bitmap[n] = 0
+  mark_bitmap_dirty(n)
+\end{lstlisting}
+
+bitmap 简单直观，但从头扫描可能很慢。实际文件系统会用块组划分、buddy 分配器或 B-tree 空闲空间索引来加速。
+
+\begin{pdfdiagram}
+  % Disk layout
+  \node[os small block, fill=BookRedTint, minimum width=12mm] (b0) at (0,0) {boot};
+  \node[os small block, fill=BookBlueTint, minimum width=12mm, right=0pt of b0] (b1) {super};
+  \node[os small block, fill=BookAmberTint, minimum width=14mm, right=0pt of b1] (b2) {inode\\bitmap};
+  \node[os small block, fill=BookAmberTint, minimum width=14mm, right=0pt of b2] (b3) {block\\bitmap};
+  \node[os small block, fill=BookGreenTint, minimum width=28mm, right=0pt of b3] (b4) {inode table};
+  \node[os small block, fill=white, minimum width=40mm, right=0pt of b4] (b5) {data blocks};
+  % Labels
+  \node[os label, above=2mm of b1] {块 1};
+  \node[os label, above=2mm of b4] {块 4--67};
+  \node[os label, above=2mm of b5] {块 68+};
+  % Arrows
+  \draw[os strong bus] (b1) -- ++(0,8mm) -| (b2);
+  \draw[os strong bus] (b1) -- ++(0,8mm) -| (b3);
+  \draw[os strong bus] (b1) -- ++(0,8mm) -| (b4);
+\end{pdfdiagram}
+\diagramnote{最小文件系统磁盘布局。superblock 是入口，指向 inode bitmap、block bitmap 和 inode table 的位置。数据块占绝大部分空间。}
+
+\section{块映射：从直接指针到 extent 树}
+
+\subsection{直接指针和间接指针}
+
+inode 里的 \code{block[]} 数组把文件 offset 映射到磁盘块号。4096 字节块大小下，12 个直接指针覆盖文件前 48 KiB。超过 48 KiB 的部分用间接指针：
+
+\begin{lstlisting}
+offset = 50000 bytes  (约 49 KiB，超过直接指针)
+logical_block = 50000 / 4096 = 12  (第 13 个逻辑块，索引 12)
+
+indirect_block = read_block(inode.indirect)
+indirect_table = parse(indirect_block)  // 1024 个 uint32 指针
+physical_block = indirect_table[0]      // logical_block - 12 = 0
+\end{lstlisting}
+
+\begin{longtable}{@{}L{0.18\linewidth}L{0.16\linewidth}L{0.26\linewidth}L{0.32\linewidth}@{}}
+\toprule
+指针类型 & 容量（4K 块） & 一次查找需读块数 & 适用场景 \\
+\midrule
+12 直接 & 48 KiB & 0（指针在 inode 内） & 小文件 \\
+1 一级间接 & $\sim$4 MiB & 1（读间接块） & 中文件 \\
+1 二级间接 & $\sim$4 GiB & 2（读二级+一级块） & 大文件 \\
+1 三级间接 & $\sim$4 TiB & 3 & 巨大文件 \\
+\bottomrule
+\end{longtable}
+
+间接指针的问题是\emph{大文件每次寻址要多读磁盘块}。一个 1 GiB 文件的随机读，要先读二级间接块，再读一级间接块，才能得到数据块号——三次 I/O 只为找到一个块。
+
+\subsection{extent：连续区间的表示}
+
+extent 用一对 \code{(起始块, 长度)} 表示一段连续的物理块。一个文件如果数据完全连续，一个 extent 就够：
+
+\begin{lstlisting}
+// 间接指针方式：100 MiB 文件需要 25600 个指针
+// 每个间接块存 1024 个指针，需要 25 个间接块
+
+// extent 方式：100 MiB 文件，如果连续，只需 1 个 extent
+struct extent {
+  uint32_t start_block;  // 起始物理块
+  uint32_t length;       // 连续块数
+};
+// extent[0] = {start=5000, length=25600}
+\end{lstlisting}
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.34\linewidth}L{0.42\linewidth}@{}}
+\toprule
+方式 & 100 MiB 连续文件元数据 & 100 MiB 碎片文件元数据 \\
+\midrule
+间接指针 & 25 个间接块 = 100 KiB & 25 个间接块 = 100 KiB \\
+extent & 1 个 extent = 8 字节 & 多个 extent，每个描述一段 \\
+\bottomrule
+\end{longtable}
+
+ext4 的 inode 内嵌 4 个 extent 头（\code{i\_data} 区域），小文件不需要任何额外块。文件更大时，extent 组织成一棵 B+ 树，查找复杂度 \code{O(log n)}。
+
+\subsection{ext4 extent 树}
+
+ext4 的 extent 树是一棵从 inode 出发的 B+ 树。内部节点存放索引（逻辑块范围 → 子节点指针），叶子节点存放 extent（逻辑块 → 物理块范围）。
+
+\begin{lstlisting}
+// ext4 extent 结构 (linux/fs/ext4/extents.h)
+struct ext4_extent {
+  uint32_t ee_block;    // 逻辑块号
+  uint16_t ee_len;      // 长度（块数）
+  uint16_t ee_start_hi; // 高 16 位物理块
+  uint32_t ee_start_lo; // 低 32 位物理块
+};
+
+struct ext4_extent_idx {
+  uint32_t ei_block;    // 逻辑块号
+  uint32_t ei_leaf;     // 子节点块号
+};
+
+struct ext4_extent_header {
+  uint16_t eh_magic;    // 0xF30A
+  uint16_t eh_entries;  // 当前节点条目数
+  uint16_t eh_max;      // 最大条目数
+  uint16_t eh_depth;    // 树深（0 = 叶子）
+};
+\end{lstlisting}
+
+\begin{pdfdiagram}
+  % Root (in inode)
+  \node[os state, minimum width=42mm] (root) at (0,0) {inode extent header\\depth=1, entries=2};
+  % Index children
+  \node[os compute, minimum width=32mm] (idx1) at (-45mm,-16mm) {idx[0]\\block 0--1023};
+  \node[os compute, minimum width=32mm] (idx2) at (0,-16mm) {idx[1]\\block 1024--2047};
+  \node[os compute, minimum width=32mm] (idx3) at (45mm,-16mm) {idx[2]\\block 2048+};
+  % Leaf nodes
+  \node[os memory, minimum width=28mm] (leaf1) at (-45mm,-34mm) {ext[0]\\phys 5000, len 1024};
+  \node[os memory, minimum width=28mm] (leaf2) at (0,-34mm) {ext[1]\\phys 8000, len 1024};
+  \node[os memory, minimum width=28mm] (leaf3) at (45mm,-34mm) {ext[2]\\phys 12000, len $\ldots$};
+  % Edges
+  \draw[os strong bus] (root) -- (idx1);
+  \draw[os strong bus] (root) -- (idx2);
+  \draw[os strong bus] (root) -- (idx3);
+  \draw[os bus] (idx1) -- (leaf1);
+  \draw[os bus] (idx2) -- (leaf2);
+  \draw[os bus] (idx3) -- (leaf3);
+\end{pdfdiagram}
+\diagramnote{ext4 extent 树。inode 内嵌根节点（depth=1），指向索引块，索引块指向叶子 extent。查找逻辑块号 1500 时，从根走到 idx[1]，再到叶子 ext[1]，得到物理块 8000 + (1500-1024) = 8476。}
+
+\subsection{XFS 的 B+ 树设计}
+
+XFS 从一开始就使用 B+ 树管理数据块映射，而非间接指针。XFS 的 extent 记录在 B+ 树叶子中，根节点直接嵌在 inode 的 \code{di\_u} 联合体中。XFS 的设计哲学是\emph{大文件优先}：数据库和视频流场景中，文件经常数十 GiB 到数 TiB，B+ 树的 \code{O(log n)} 查找是必须的。
+
+\begin{longtable}{@{}L{0.14\linewidth}L{0.28\linewidth}L{0.28\linewidth}L{0.22\linewidth}@{}}
+\toprule
+& ext2/3（间接指针） & ext4（extent 树） & XFS（B+ 树） \\
+\midrule
+小文件元数据 & 12 个直接指针 & 4 个 inline extent & inline extent \\
+大文件查找 & \code{O(n)} & \code{O(log n)} & \code{O(log n)} \\
+碎片开销 & 高 & 中 & 低 \\
+碎片整理 & 难 & 支持 & 不需要 \\
+\bottomrule
+\end{longtable}
+
+\section{空间分配：bitmap、块组与局部性}
+
+\subsection{块组与局部性原理}
+
+ext2 引入块组（block group）概念：把磁盘分成若干组，每组有自己的 superblock 副本、inode 表、bitmap 和数据块。块组的核心目标不是容错，而是\emph{局部性}：同一文件的块尽量在同一块组内，减少磁头寻道（HDD）或利用 SSD 内部并行（多 die）。
+
+\begin{pdfdiagram}
+  % Block groups layout
+  \foreach \i/\xoff in {0/0, 1/26, 2/52, 3/78} {
+    \node[os small block, fill=BookBlueTint, minimum width=5mm] at (\xoff+0, 0) {};
+    \node[os small block, fill=BookAmberTint, minimum width=5mm] at (\xoff+5.5, 0) {};
+    \node[os small block, fill=BookGreenTint, minimum width=5mm] at (\xoff+11, 0) {};
+    \node[os small block, fill=white, minimum width=14mm] at (\xoff+17, 0) {};
+  }
+  % Group labels
+  \node[os label] at (8.5,-5mm) {块组 0};
+  \node[os label] at (34.5,-5mm) {块组 1};
+  \node[os label] at (60.5,-5mm) {块组 2};
+  \node[os label] at (86.5,-5mm) {块组 3};
+  % Legend
+  \node[os label] at (2.5,8mm) {SB};
+  \node[os label] at (8,8mm) {bitmap};
+  \node[os label] at (13.5,8mm) {inode};
+  \node[os label] at (19,8mm) {data};
+\end{pdfdiagram}
+\diagramnote{ext2/3/4 块组布局。每个块组有自己的 superblock 副本、块/inode bitmap、inode 表和数据块。分配时优先在同一个块组内分配，提高局部性。}
+
+ext4 的 \code{mballoc}（multi-block allocator）在块组基础上做了以下优化：
+
+\begin{longtable}{@{}L{0.18\linewidth}L{0.38\linewidth}L{0.36\linewidth}@{}}
+\toprule
+策略 & 做什么 & 为什么 \\
+\midrule
+多块分配 & 一次调用分配多个连续块 & 减少 bitmap 扫描次数和锁竞争 \\
+局部分配 & 文件数据尽量和 inode 在同组 & 减少寻道、提高预读效果 \\
+目标管道 & 预留一块连续空间给增长中的文件 & 避免文件碎片化 \\
+延迟分配 & 写入先进 page cache，写回时才分配块 & 用全局视角选最优位置 \\
+预分配 & 打开文件时预留 8--32 KiB 空间 & 小文件追加写不会碎片化 \\
+\bottomrule
+\end{longtable}
+
+\subsection{延迟分配}
+
+传统文件系统在 \code{write()} 系统调用时就分配物理块。问题：此时只知道写入 offset，不知道文件后续是否还有写操作。如果每次 write 都分配一个块，大量小块写会产生严重碎片。
+
+延迟分配（delalloc）的核心思想：\code{write()} 只把数据写入 page cache，不分配物理块。等到 writeback 把脏页刷到磁盘时，文件系统已经知道文件完整的写入模式，可以一次性选择最优的连续物理块。
+
+\begin{lstlisting}
+// 传统方式：每次 write 立即分配
+write(fd, buf, 4096):
+  block = alloc_block()      // 分配块 5000
+  set_inode_block(offset, 5000)
+  memcpy(page_cache[offset], buf)
+  mark_dirty(page)
+  // 下次 write 再分配一个可能不相邻的块
+
+// 延迟分配：write 不分配，writeback 才分配
+write(fd, buf, 4096):
+  reserve_space(offset, 4096)  // 只预留空间
+  memcpy(page_cache[offset], buf)
+  mark_dirty(page)
+
+// writeback 时一次性分配
+flush_pages(inode):
+  // 看到脏页 0--3 连续，一次性分配 4 个连续块
+  block = alloc_blocks(4)     // 分配块 5000--5003
+  set_extent(inode, 0, 5000, 4)
+  submit_io(block, pages)
+\end{lstlisting}
+
+\begin{warningbox}
+延迟分配有代价：\code{write()} 返回成功不代表块已分配。如果系统在 writeback 前崩溃，page cache 里的脏页丢失，但磁盘上对应的块从未被分配——数据丢失且无法恢复。ext4 默认在 \code{fsync} 时触发分配并提交日志，保证 \code{fsync} 返回后数据可恢复。
+\end{warningbox}
+
+\subsection{XFS 的分配器}
+
+XFS 不用块组，而是用\emph{分配组}（Allocation Group, AG）。每个 AG 有自己的空闲空间 B+ 树和 inode B+ 树，可以独立并发分配。XFS 的分配策略是\emph{大范围优先}：先尝试在一个 AG 内找到足够大的连续范围；找不到再跨 AG。这种设计对大文件写入和并发写特别有利。
+
+\begin{longtable}{@{}L{0.18\linewidth}L{0.34\linewidth}L{0.4\linewidth}@{}}
+\toprule
+分配器 & ext4 mballoc & XFS AG + B+ 树 \\
+\midrule
+组织 & 块组（固定大小） & 分配组（可变数量） \\
+空闲索引 & bitmap + buddy & 两棵 B+ 树（按长度和按位置） \\
+并发 & 块组级锁 & AG 级锁，多 AG 并行 \\
+大文件 & 目标管道预分配 & 大范围优先扫描 \\
+\bottomrule
+\end{longtable}
+
+\section{目录结构：线性表、hash、B-tree}
+
+\subsection{线性目录}
+
+最简单的目录格式是线性数组：遍历每个 \code{dirent} 直到找到名字。对于一个只有 10 个文件的目录，这足够快。但目录文件可以有上万甚至百万条目——\code{O(n)} 查找变成灾难。
+
+\begin{lstlisting}
+dir_lookup_linear(dir_inode, name):
+  for block in dir_inode.block[]:
+    buf = read_block(block)
+    pos = 0
+    while pos < buf.size:
+      entry = parse_dirent(buf + pos)
+      if strncmp(entry.name, name) == 0:
+        return entry.inode_number
+      pos += entry.rec_len
+  return -ENOENT
+\end{lstlisting}
+
+\subsection{HTree 目录（ext4）}
+
+ext3 引入 \code{dx\_entries}（HTree），ext4 默认开启。HTree 是一棵\emph{基于 hash 的 B-tree}：目录项按文件名的 hash 值组织，查找时先计算 hash，再在树中走一条路径。
+
+\begin{lstlisting}
+htree_lookup(dir, name):
+  hash = hash_function(name)
+  node = read_block(dir.root_block)
+  while node.is_index:
+    idx = binary_search(node.entries, hash)
+    node = read_block(idx.child_block)
+  // 叶子节点：线性扫描该 bucket 内的目录项
+  for entry in node.entries:
+    if entry.name == name:
+      return entry.inode
+  return -ENOENT
+\end{lstlisting}
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.3\linewidth}L{0.4\linewidth}@{}}
+\toprule
+目录格式 & 查找复杂度 & 适用场景 \\
+\midrule
+线性表 & \code{O(n)} & 小目录（$\le$ 100 项） \\
+HTree & \code{O(log n)} + 常数 & 中大目录（ext4） \\
+B-tree & \code{O(log n)} & 大目录（XFS, Btrfs） \\
+\bottomrule
+\end{longtable}
+
+HTree 的优点是兼容性好：目录文件仍然是传统 \code{dirent} 格式，HTree 只是一层加速索引。\code{fsck} 不认识 HTree 时可以忽略它，退化为线性扫描。
+
+\subsection{B-tree 目录（XFS、Btrfs）}
+
+XFS 和 Btrfs 的目录从设计之初就是 B-tree：每个目录项是 B-tree 中的一个键值对（key=name hash, value=inode number）。这种结构的查找、插入和删除都是 \code{O(log n)}，适合超大目录。
+
+\begin{pdfdiagram}
+  % Linear directory
+  \node[os title] at (0,0) {线性目录};
+  \foreach \i/\name in {0/a, 1/b, 2/c, 3/d, 4/e, 5/f} {
+    \node[os small block, minimum width=8mm] at (\i*9mm, -8mm) {\name};
+  }
+  \node[os label] at (22mm,-16mm) {查找 f：扫描 6 次};
+
+  % HTree
+  \node[os title] at (60mm,0) {HTree (ext4)};
+  \node[os compute, minimum width=18mm] (root) at (60mm,-8mm) {hash root};
+  \node[os state, minimum width=10mm] (l1) at (48mm,-20mm) {A-D};
+  \node[os state, minimum width=10mm] (l2) at (72mm,-20mm) {E-Z};
+  \draw[os strong bus] (root) -- (l1);
+  \draw[os strong bus] (root) -- (l2);
+  \node[os label] at (60mm,-28mm) {查找 f：hash→E-Z→1次};
+
+  % B-tree
+  \node[os title] at (110mm,0) {B-tree (XFS)};
+  \node[os compute, minimum width=18mm] (broot) at (110mm,-8mm) {root};
+  \node[os state, minimum width=10mm] (bl1) at (98mm,-20mm) {$<$m};
+  \node[os state, minimum width=10mm] (bl2) at (122mm,-20mm) {$\ge$m};
+  \draw[os strong bus] (broot) -- (bl1);
+  \draw[os strong bus] (broot) -- (bl2);
+  \node[os label] at (110mm,-28mm) {查找 f：2次比较};
+\end{pdfdiagram}
+\diagramnote{三种目录结构对比。线性表简单但 \code{O(n)}；HTree 在 ext4 兼容传统 dirent 格式上加了 hash 索引；B-tree 目录（XFS/Btrfs）从设计之初就是树结构。}
+
+\subsection{dentry cache}
+
+无论目录结构多快，每次路径解析都读磁盘仍然太慢。Linux VFS 维护 dentry cache（dcache）：把最近查过的目录项缓存在内存中，包括\emph{负 dentry}（记录"这个名字不存在"的结果）。
+
+\begin{lstlisting}
+vfs_lookup(parent, name):
+  dentry = dcache_lookup(parent, name)
+  if dentry != NULL:
+    if dentry.is_negative:
+      return -ENOENT
+    return dentry.inode
+
+  // cache miss: 真正去文件系统查
+  inode = fs_specific_lookup(parent, name)
+  if inode:
+    dcache_add_positive(parent, name, inode)
+  else:
+    dcache_add_negative(parent, name)
+  return inode
+\end{lstlisting}
+
+负 dentry 的价值：很多程序会反复尝试打开不存在的配置文件（如 \code{.bashrc} $\to$ \code{/etc/bash.bashrc}）。缓存"不存在"的结果可以避免每次都查磁盘。代价：\code{rename}、\code{unlink}、\code{mount} 变化时必须失效相关 dentry。
+
+\section{VFS：统一接口与分发}
+
+\subsection{VFS 对象模型}
+
+Linux VFS 定义四类核心对象，所有具体文件系统都通过这四类对象接入：
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.2\linewidth}L{0.58\linewidth}@{}}
+\toprule
+对象 & 生命周期 & 许住什么 \\
+\midrule
+\code{super\_block} & 挂载期间 & 文件系统全局状态：块大小、inode 数、空闲数、挂载选项 \\
+\code{inode} & inode 在内存期间 & 文件元数据 + 数据块映射 + 操作表指针 \\
+\code{dentry} & 路径查找后 & 名字 → inode 关系，组成路径缓存 \\
+\code{file} & 一次 \code{open} 到 \code{close} & 打开实例：offset、模式、引用计数 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+// VFS 分发：用户调 read，实际走到具体文件系统的实现
+ssize_t vfs_read(struct file *file, char *buf, size_t len, loff_t *pos):
+  if (!file->f_op->read && !file->f_op->read_iter)
+    return -EINVAL;
+  // 分发到 ext4/ext4_file_read_iter / xfs_file_read_iter / ...
+  if (file->f_op->read_iter)
+    return new_sync_read(file, buf, len, pos);
+  return file->f_op->read(file, buf, len, pos);
+\end{lstlisting}
+
+VFS 的价值是\emph{统一生命周期和权限边界}：\code{fd} 引用 \code{file}，\code{file} 引用 \code{dentry}，\code{dentry} 引用 \code{inode}，\code{inode} 引用具体文件系统对象。关闭 \code{fd} 不等于 \code{inode} 消失；\code{unlink} 路径名也不等于已打开文件立刻不可用。
+
+\subsection{操作表}
+
+每个 VFS 对象都挂一组操作表，具体文件系统负责填充：
+
+\begin{longtable}{@{}L{0.22\linewidth}L{0.5\linewidth}@{}}
+\toprule
+操作表 & 典型方法 \\
+\midrule
+\code{file\_operations} & \code{read\_iter}, \code{write\_iter}, \code{mmap}, \code{fsync}, \code{poll}, \code{ioctl} \\
+\code{inode\_operations} & \code{lookup}, \code{create}, \code{unlink}, \code{rename}, \code{getattr}, \code{setattr} \\
+\code{super\_operations} & \code{alloc\_inode}, \code{evict\_inode}, \code{sync\_fs}, \code{statfs} \\
+\bottomrule
+\end{longtable}
+
+\subsection{特殊文件系统}
+
+并非所有文件系统都对应磁盘。VFS 的统一接口让以下对象都能被 \code{open/read/write}，但语义完全不同：
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.36\linewidth}L{0.36\linewidth}@{}}
+\toprule
+文件系统 & 存储介质 & 语义 \\
+\midrule
+tmpfs & 内存 + swap & 临时文件，断电丢失 \\
+procfs & 无存储，动态生成 & 暴露进程和内核状态 \\
+sysfs & 无存储，动态生成 & 暴露设备和驱动属性 \\
+overlayfs & lower + upper 层 & 容器镜像层叠，copy-up \\
+FUSE & 用户态 daemon & 文件系统实现在用户进程 \\
+\bottomrule
+\end{longtable}
+
+写 \filepath{/sys/class/net/eth0/mtu} 可能触发驱动重新配置网卡 MTU；读 \filepath{/proc/meminfo} 是内核现场生成文本。这些不是普通磁盘文件，但 VFS 让它们共享同一套 \code{open/read/write} 接口。
+
+\section{page cache 与写回}
+
+\subsection{page cache 的角色}
+
+page cache 是内核在内存中维护的文件数据缓存。读文件时，如果目标页已在 cache 中，直接返回，不访问磁盘；如果不在，从磁盘读入 cache 再返回。写文件时，数据先写入 cache 中的页（标记为 dirty），之后由 writeback 线程异步刷到磁盘。
+
+\begin{lstlisting}
+// 读路径
+vfs_read(file, buf, len, pos):
+  page = pagecache_lookup(file.inode, pos)
+  if page exists:
+    memcpy(buf, page.data + offset, len)  // cache hit
+  else:
+    page = pagecache_alloc(file.inode, pos)
+    submit_read(file.inode, page, pos)     // cache miss
+    wait_for_completion(page)
+    memcpy(buf, page.data + offset, len)
+  return len
+
+// 写路径
+vfs_write(file, buf, len, pos):
+  page = pagecache_lookup(file.inode, pos)
+  if not page:
+    page = pagecache_alloc(file.inode, pos)
+  memcpy(page.data + offset, buf, len)
+  page.dirty = true                        // 标记为脏页
+  // write 返回，数据在内存里，还没到磁盘
+  return len
+\end{lstlisting}
+
+\begin{longtable}{@{}L{0.18\linewidth}L{0.34\linewidth}L{0.4\linewidth}@{}}
+\toprule
+操作 & cache 行为 & 磁盘是否更新 \\
+\midrule
+\code{read} & 命中则返回内存数据 & 否 \\
+\code{write} & 数据写入内存页 & 否（标脏） \\
+\code{fsync} & 把脏页刷到磁盘 & 是 \\
+\code{writeback} & 后台线程定期刷脏页 & 是（异步） \\
+\code{O\_DIRECT} & 绕过 cache，直接 I/O & 是 \\
+\code{mmap} & 把文件页映射到用户地址空间 & 延迟 \\
+\bottomrule
+\end{longtable}
+
+\subsection{writeback 机制}
+
+Linux 的脏页写回由 \code{writeback} 线程（\filepath{mm/page-writeback.c}）驱动。触发条件有三种：
+
+\begin{enumerate}
+\tightlist
+\item \emph{内存压力}：系统空闲内存低于阈值，回收脏页。
+\item \emph{时间到期}：脏页存活超过 \code{dirty\_expire\_centisecs}（默认 30 秒）。
+\item \emph{显式同步}：\code{fsync}、\code{sync} 或 \code{fdatasync}。
+\end{enumerate}
+
+\begin{lstlisting}
+// writeback 核心逻辑（简化）
+wb_writeback(sb):
+  while (pages = find_dirty_pages(sb)) > 0:
+    for page in pages:
+      // 分配块（延迟分配在这里完成）
+      if not page.allocated:
+        block = fs.alloc_blocks(page.logical_offset)
+        fs.set_extent(page.inode, page.logical_offset, block)
+        page.allocated = true
+      // 构造 bio 提交给块层
+      bio = bio_alloc(page.inode.block_device, block, page.data)
+      submit_bio(WRITE, bio)
+      page.dirty = false
+\end{lstlisting}
+
+\subsection{fsync 与屏障}
+
+\code{fsync(fd)} 要求文件内容和元数据都持久化到磁盘。它不只刷脏页，还要确保日志（如果文件系统用日志）也写到了磁盘。
+
+\begin{lstlisting}
+ext4_fsync(file):
+  // 1. 把文件数据脏页刷到磁盘
+  filemap_write_and_wait(file.inode)
+  // 2. 提交日志事务（保证元数据一致）
+  if journal_enabled:
+    jbd2_journal_force_commit(journal)
+  // 3. 确保磁盘缓存中的数据已写到介质
+  blkdev_issue_flush(file.inode.block_device)
+\end{lstlisting}
+
+第三步 \code{blkdev\_issue\_flush} 是\emph{屏障操作}（cache flush）。许多磁盘有易失性写缓存——数据写到磁盘缓存后，磁盘返回"完成"，但断电时缓存中的数据丢失。屏障命令强制磁盘把缓存刷到非易失介质。
+
+\begin{warningbox}
+如果磁盘的写缓存是易失的且文件系统没发屏障命令，\code{fsync} 返回后断电仍可能丢数据。文件系统默认开启屏障（\code{barrier=1}），但用户可以用 \code{barrier=0} 挂载选项关闭以提升性能——这会牺牲崩溃一致性。
+\end{warningbox}
+
+\subsection{Direct I/O 和 DAX}
+
+Direct I/O（\code{O\_DIRECT}）绕过 page cache，用户 buffer 直接 DMA 到磁盘。适合数据库等自己管理缓存的程序，避免双重缓存。
+
+\begin{lstlisting}
+// O_DIRECT 读写路径
+vfs_read(file, buf, len, pos, O_DIRECT):
+  // 不查 page cache
+  // 直接构造 bio，用户 buffer 必须页对齐
+  bio = bio_alloc(bdev, disk_block, buf)
+  submit_bio(READ, bio)
+  wait_for_completion(bio)
+  return len
+\end{lstlisting}
+
+DAX（Direct Access）更彻底：持久内存（PMEM）映射到 CPU 地址空间，\code{mmap} 返回的指针直接访问持久介质，没有 page cache、没有 block I/O 层。写 DAX 文件就是写持久内存，\code{fsync} 变成 \code{clwb}（cache writeback）+ \code{sfence}（fence）。
+
+\begin{longtable}{@{}L{0.14\linewidth}L{0.24\linewidth}L{0.24\linewidth}L{0.26\linewidth}@{}}
+\toprule
+& 普通 buffered I/O & Direct I/O & DAX \\
+\midrule
+路径 & page cache → block I/O & block I/O（绕 cache） & CPU store → PMEM \\
+\code{fsync} & 刷脏页 + 屏障 & 屏障 & \code{clwb} + \code{sfence} \\
+缓存 & 内核 page cache & 应用自己管 & CPU cache line \\
+适用 & 通用 & 数据库 & 持久内存设备 \\
+\bottomrule
+\end{longtable}
+
+\section{崩溃一致性与日志}
+
+\subsection{崩溃问题}
+
+磁盘写操作不是原子的。一个文件创建涉及多步磁盘修改：分配 inode、写目录项、更新 inode 表、更新 bitmap。如果在第二步和第三步之间断电，磁盘上的状态是：inode 已分配但目录项指向一个不存在的 inode。
+
+\begin{lstlisting}
+create_file(parent, "newfile"):
+  inode = alloc_inode()          // 步骤 1: 标记 inode 已用
+  init_inode(inode)               // 步骤 2: 写 inode 内容
+  dir_add_entry(parent, "newfile", inode) // 步骤 3: 写目录
+  // 如果在步骤 2 和 3 之间崩溃:
+  //   inode 已分配但不可达
+  //   bitmap 标记 inode 已用但无目录项
+  //   = 空间泄漏 + 恢复需要全盘扫描
+\end{lstlisting}
+
+\subsection{fsck：旧方案}
+
+没有日志时，崩溃恢复依赖 \code{fsck}（file system check）。\code{e2fsck} 对 ext2 文件系统执行五步检查：
+
+\begin{enumerate}
+\tightlist
+\item \emph{superblock} 和块组描述符是否合理。
+\item \emph{inode} 表中每个 inode 的类型、大小、块指针是否合理。
+\item \emph{目录} 项是否指向合法 inode，目录结构是否可达。
+\item \emph{link count} 与目录引用数是否一致。
+\item \emph{bitmap} 与实际引用集合是否一致。
+\end{enumerate}
+
+\code{fsck} 的复杂度与文件系统大小成正比。一个 1 TiB 文件系统可能需要 10--30 分钟才能检查完。在越来越大的磁盘上，这个时间不可接受。
+
+\subsection{日志：write-ahead logging}
+
+日志的核心思想：在修改文件系统结构之前，先把修改内容写到一块专门的日志区域。崩溃后只需重放日志中已提交的事务，跳过未提交的，就能恢复一致性。
+
+\begin{lstlisting}
+// 带日志的文件创建
+journal_create_file(parent, "newfile"):
+  // 1. 在日志中记录"我要做这些修改"
+  handle = journal_start()
+  journal_log(handle, "alloc inode 42")
+  journal_log(handle, "set inode 42 mode=FILE")
+  journal_log(handle, "add dir entry parent/newfile -> 42")
+
+  // 2. 提交日志事务
+  journal_commit(handle)        // <-- commit record 写到磁盘
+
+  // 3. 在主文件系统位置执行实际修改
+  alloc_inode(42)
+  init_inode(42)
+  dir_add_entry(parent, "newfile", 42)
+
+// 崩溃恢复:
+//   if commit_record exists and checksum_ok:
+//     replay all logged changes  (redo)
+//   else:
+//     ignore this transaction     (未提交的修改不应用)
+\end{lstlisting}
+
+\begin{keyidea}
+日志的关键规则是\emph{日志先行}（write-ahead）：描述修改的日志必须在实际修改之前持久化。否则崩溃后无法判断磁盘上的半成品是否应该保留。
+\end{keyidea}
+
+\subsection{ext4 + jbd2 事务模型}
+
+ext4 的日志由 jbd2（Journaling Block Device v2）实现。核心对象和流程：
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.36\linewidth}L{0.4\linewidth}@{}}
+\toprule
+对象 & 作用 & 生命周期 \\
+\midrule
+\code{handle} & 一次修改上下文（如创建一个文件） & \code{journal\_start} 到 \code{journal\_stop} \\
+\code{transaction} & 收集多个 handle，批量提交 & 一个 commit 周期 \\
+\code{commit block} & 事务提交标记 + 校验和 & 恢复时判断事务是否完整 \\
+\code{checkpoint} & 把已提交的修改从日志区搬到主区域 & 空间回收 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+// jbd2 commit 流程（简化）
+jbd2_commit(transaction):
+  // 1. 等待所有 handle 关闭
+  wait_for_handles(transaction)
+  // 2. 写描述符块（列出哪些数据块属于本事务）
+  write_descriptor_block(transaction)
+  // 3. 写元数据块（实际修改的内容）
+  for buffer in transaction.metadata_buffers:
+    write_block(buffer)
+  // 4. 写 commit 块（含校验和）
+  write_commit_block(transaction)
+  fsync(journal_area)
+
+  // 5. 后续 checkpoint 把修改传播到主位置
+  // （可以延迟执行）
+\end{lstlisting}
+
+恢复时，\code{journal\_recover} 扫描日志区域：看到有 commit 块的事务就重放（redo），没有 commit 块的事务跳过。恢复时间与日志大小成正比（通常几十 MiB），与文件系统总大小无关。
+
+\subsection{三种日志模式}
+
+ext4 支持三种日志模式，权衡一致性和性能：
+
+\begin{longtable}{@{}L{0.14\linewidth}L{0.34\linewidth}L{0.42\linewidth}@{}}
+\toprule
+模式 & 日志内容 & 崩溃后保证 \\
+\midrule
+\code{data=journal} & 元数据 + 数据 & 最强：数据不丢，但写入两遍 \\
+\code{data=ordered} & 只元数据 & 数据在元数据之前写入，崩溃时要么看到新数据要么看到旧数据 \\
+\code{data=writeback} & 只元数据 & 最弱：可能看到刚写的数据被部分覆盖 \\
+\bottomrule
+\end{longtable}
+
+\code{data=ordered} 是 ext4 默认模式。它在提交元数据日志之前，先保证文件数据脏页已经写到磁盘（通过 flush barrier）。这样崩溃时，元数据要么指向旧数据（事务未提交），要么指向已经完整落盘的新数据。代价是每次 fsync 需要额外 barrier。
+
+\code{data=writeback} 只日志元数据，不保证数据顺序。崩溃后可能看到元数据指向一块刚分配但数据没写完的块——内容是旧的磁盘垃圾。性能最快，但一致性最弱。
+
+\subsection{checkpoint 与日志空间回收}
+
+日志空间有限。jbd2 的日志通常 128 MiB。提交后的事务不会被立即从日志中删除——它要等到 checkpoint 把修改传播到主文件系统位置后才能回收。
+
+\begin{lstlisting}
+jbd2_checkpoint(transaction):
+  // 把事务中记录的元数据修改写到主文件系统位置
+  for buffer in transaction.metadata_buffers:
+    write_to_main_location(buffer)
+  // 标记日志空间可回收
+  free_log_space(transaction)
+\end{lstlisting}
+
+如果 checkpoint 跟不上新事务产生速度，日志空间耗尽，新事务必须等待。这会导致写入停顿。
+
+\section{Copy-on-Write 文件系统}
+
+\subsection{COW 原理}
+
+传统文件系统（ext4、XFS）在原地覆盖写：文件块更新时，直接写回原来的物理块。COW 文件系统（Btrfs、ZFS、Reiser4）不在原地覆盖，而是\emph{写新块，再原子更新根指针}。
+
+\begin{lstlisting}
+// 传统原地覆盖写
+update_block(inode, offset, new_data):
+  block = lookup(inode, offset)     // 找到物理块 5000
+  write_block(5000, new_data)        // 直接覆盖
+
+// COW 方式
+cow_update_block(inode, offset, new_data):
+  // 1. 分配新物理块
+  new_block = alloc_block()         // 分配块 8000
+  write_block(new_block, new_data)  // 写新块
+  // 2. 更新 B-tree 叶子指向新块
+  update_extent_tree(inode, offset, new_block)
+  // 3. 原子更新超级块的根指针
+  atomic_update_root(new_root)
+  // 旧块 5000 如果没有其他引用，可以回收
+\end{lstlisting}
+
+\begin{longtable}{@{}L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}@{}}
+\toprule
+& 原地覆盖（ext4/XFS） & COW（Btrfs/ZFS） \\
+\midrule
+崩溃一致性 & 需要日志 & 天然一致（根指针原子切换） \\
+snapshot & 需要额外日志/COW 层 & 原生支持（保留旧根指针） \\
+写放大 & 低（直接覆盖） & 高（元数据树全部要 COW） \\
+碎片 & 低 & 高（每次 COW 写到新位置） \\
+空间回收 & 不需要 & 需要（refcount 跟踪引用） \\
+\bottomrule
+\end{longtable}
+
+\subsection{Btrfs：B-tree 文件系统}
+
+Btrfs 的全称是 B-tree file system。所有数据——超级块、extent 分配、目录、inode——都是 B-tree。每个 B-tree 节点是一块 4 KiB（或更大）的磁盘块。
+
+\begin{longtable}{@{}L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}@{}}
+\toprule
+B-tree & key & value \\
+\midrule
+root tree & tree id & 指向子树 \\
+extent tree & 逻辑块号 & extent ref（物理块号 + 引用计数） \\
+chunk tree & 逻辑 chunk & 物理 chunk \\
+dev tree & 物理 extent & 设备号 + 偏移 \\
+fs tree & inode number & inode 结构 \\
+\bottomrule
+\end{longtable}
+
+Btrfs 的 snapshot 创建只需复制 root tree 的根节点——\code{O(1)} 操作。之后两个 snapshot 共享所有数据块，直到一方写入触发 copy-up。
+
+\subsection{ZFS：事务对象存储}
+
+ZFS 的设计哲学与 Btrfs 类似（COW + snapshot），但组织方式不同。ZFS 的关键概念：
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.38\linewidth}L{0.36\linewidth}@{}}
+\toprule
+概念 & 含义 & 作用 \\
+\midrule
+pool & 存储池，由多个 vdev 组成 & 聚合和冗余 \\
+vdev & 虚拟设备（磁盘、mirror、RAID-Z） & 冗余层 \\
+dataset & 文件系统或卷 & 独立的 snapshot/quota \\
+objset & 对象集合 & dataset 的实际数据 \\
+bp (block pointer) & 带校验和的块指针 & 端到端数据完整性 \\
+ZIL & ZFS Intent Log & 同步写加速 \\
+ARC/L2ARC & 内存/SSD 缓存 & 读加速 \\
+\bottomrule
+\end{longtable}
+
+ZPS 的每个 block pointer 都带\emph{校验和}。读数据时校验 checksum，不匹配则从冗余副本修复。这是 ZFS 独有的"端到端数据完整性"——文件系统自身检测静默数据损坏（silent data corruption）。
+
+\subsection{写放大问题}
+
+COW 文件系统的写放大是核心代价。一次 4 KiB 的随机写，在 COW 文件系统中需要：
+
+\begin{enumerate}
+\tightlist
+\item 分配新数据块 4 KiB（1 次写）
+\item 更新叶子 B-tree 节点（COW）4 KiB（1 次写）
+\item 更新父节点（COW）4 KiB（1 次写）
+\item 更新祖父节点（COW）4 KiB（1 次写）
+\item 更新根节点（COW）4 KiB（1 次写）
+\item 更新超级块 4 KiB（1 次写）
+\end{enumerate}
+
+最坏情况下 6 次写服务 1 次用户写，写放大 6 倍。Btrfs 和 ZFS 通过批量提交、CoW 合并和日志（ZIL）来缓解，但无法完全消除。
+
+\section{闪存文件系统}
+
+\subsection{闪存与磁盘的区别}
+
+NAND Flash 的物理特性与 HDD 完全不同，直接影响了文件系统设计：
+
+\begin{longtable}{@{}L{0.18\linewidth}L{0.34\linewidth}L{0.36\linewidth}@{}}
+\toprule
+特性 & HDD & NAND Flash \\
+\midrule
+寻址 & 机械寻道（ms 级） & 电气寻址（$\mu$s 级） \\
+覆盖写 & 直接覆盖 & 必须先擦除（erase block 128--512 KiB） \\
+寿命 & 无限（理论上） & P/E 循环有限（SLC 100K, TLC 1--3K） \\
+错误 & 坏道 & 坏块、读干扰、保持退化 \\
+对称 & 读写单位相同 & 读/写页（4--16 KiB），擦除块 \\
+\bottomrule
+\end{longtable}
+
+\subsection{FTL：闪存翻译层}
+
+大多数 SSD 内部有 FTL（Flash Translation Layer），把闪存芯片的页/块语义模拟成块设备的扇区语义。FTL 负责：
+
+\begin{enumerate}
+\tightlist
+\item \emph{地址映射}：逻辑扇区号 → 物理页号，维护一张映射表。
+\item \emph{垃圾回收}：回收包含无效页的物理块——先搬走有效页，再擦除整个块。
+\item \emph{磨损均衡}：把写操作均匀分布到所有物理块，避免热点块过早耗尽 P/E 循环。
+\item \emph{坏块管理}：跳过出厂坏块和运行时产生的坏块。
+\end{enumerate}
+
+FTL 在 SSD 控制器内部运行，对文件系统透明。但 FTL 的垃圾回收和磨损均衡会产生\emph{写放大}——用户写 4 KiB，FTL 可能内部写了 16 KiB（搬移有效页 + 擦除 + 重写）。
+
+\subsection{TRIM/discard}
+
+文件系统删除文件时只更新元数据（bitmap、inode），不擦除数据块内容。在 HDD 上这不影响性能——磁盘不需要擦除就能覆盖写。但 SSD 的物理块需要先擦除才能写入，FTL 不知道哪些逻辑块对应的物理块可以回收。
+
+\code{TRIM}（或 \code{discard}）命令让文件系统告诉 SSD："这些逻辑块不再被使用，你可以回收对应的物理块"。FTL 收到 TRIM 后可以把对应物理页标记为无效，在下次垃圾回收时优先回收。
+
+\begin{lstlisting}
+// 文件系统删除文件后发 TRIM
+unlink(path):
+  free_inode(inode)
+  free_blocks(inode.block[])
+  // 告诉 SSD 这些块不再使用
+  blkdev_discard(bdev, inode.block[], len)
+
+// FTL 收到 discard 后
+ftl_discard(logical_blocks):
+  for lb in logical_blocks:
+    physical = mapping_table[lb]
+    mark_page_invalid(physical)
+    // 垃圾回收时会优先回收含无效页的块
+\end{lstlisting}
+
+\subsection{F2FS：日志结构闪存文件系统}
+
+F2FS（Flash-Friendly File System）是 Samsung 开发的 Linux 文件系统，专门为 NAND Flash 优化。它的核心设计是\emph{日志结构}（log-structured）：所有写操作都是追加写，不覆盖旧数据。
+
+\begin{longtable}{@{}L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}@{}}
+\toprule
+F2FS 区域 & 内容 & 作用 \\
+\midrule
+Superblock & 全局参数 & 文件系统入口 \\
+Checkpoint & 两个交替 checkpoint & 崩溃恢复 \\
+SIT (Segment Info Table) & 段使用状态 & 空间管理和垃圾回收 \\
+NAT (Node Address Table) & inode/indirect 块地址映射 & 间接寻址翻译 \\
+SSA (Segment Summary Area) & 每段内块的有效性 & GC 时判断块是否有效 \\
+Main Area & 6 个 segment 类型区域 & 数据和元数据存储 \\
+\bottomrule
+\end{longtable}
+
+F2FS 的 Main Area 分为 6 种 segment：hot/warm/cold node 和 hot/warm/cold data。这种分类让 F2FS 按数据热度分离写入，减少 GC 代价。
+
+\begin{keyidea}
+日志结构文件系统的核心优势是\emph{顺序写}。NAND Flash 的顺序写比随机写快得多（无需先擦除，利用 page program 顺序），且写放大更低。代价是 GC 和空间回收的复杂度。
+\end{keyidea}
+
+\section{现代优化技术}
+
+\subsection{inline data：小文件内嵌}
+
+ext4 和 Btrfs 支持把小文件（$\le$ 60--256 字节）直接存在 inode 内部，不分配数据块。一个 4 KiB 的 inode 可以存 60 字节 inline data + 元数据。对于系统中有大量小文件（如 \filepath{/etc}、包管理器数据库），这能显著减少空间占用和 I/O 次数。
+
+\begin{lstlisting}
+// 小文件存储对比
+// 传统：10 字节文件
+//   inode (256B) + 1 data block (4096B) = 4352B 磁盘占用
+// inline：10 字节文件
+//   inode (256B, 内含 10B data) = 256B 磁盘占用
+// 节省 94% 空间
+\end{lstlisting}
+
+\subsection{压缩}
+
+Btrfs、ZFS、NTFS 和 F2FS 支持透明文件压缩。写入时压缩数据块，读取时解压。压缩效果取决于数据类型：
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.28\linewidth}L{0.24\linewidth}L{0.24\linewidth}@{}}
+\toprule
+数据类型 & 压缩率 & CPU 开销 & 磁盘 I/O 节省 \\
+\midrule
+文本 & 3--5$\times$ & 低 & 大 \\
+代码 & 2--3$\times$ & 低 & 中 \\
+已有压缩文件 & $\sim$1$\times$ & 浪费 & 无 \\
+已加密数据 & $\sim$1$\times$ & 浪费 & 无 \\
+视频/图片 & $\sim$1$\times$ & 浪费 & 无 \\
+\bottomrule
+\end{longtable}
+
+ZFS 的压缩默认开启 \code{lz4} 算法，对不可压缩数据快速跳过（early-abort）。Btrfs 默认 \code{zlib} 或 \code{zstd}。压缩减少磁盘 I/O，在 I/O 瓶颈的系统中可能反而提高吞吐。
+
+\subsection{去重}
+
+ZFS 和 Btrfs 支持块级去重（deduplication）：相同内容的块只存一份，通过引用计数共享。去重的元数据代价很高——需要维护一张全文件系统的 hash 表，内存占用与块数成正比。
+
+\begin{lstlisting}
+// 去重写入
+dedup_write(block_data):
+  hash = sha256(block_data)
+  existing = dedup_table_lookup(hash)
+  if existing:
+    // 块已存在，增加引用计数
+    increase_refcount(existing.physical_block)
+    return existing.physical_block
+  else:
+    // 新块，实际写入
+    new_block = alloc_block()
+    write_block(new_block, block_data)
+    dedup_table_insert(hash, new_block)
+    return new_block
+\end{lstlisting}
+
+去重对虚拟机镜像、容器镜像层等高重复场景有效。对一般工作负载，内存开销可能超过空间节省。
+
+\subsection{预读和预取}
+
+文件系统在检测到顺序读模式时，会提前从磁盘读入后续页面到 page cache。这利用了磁盘的顺序带宽优势（HDD 顺序带宽 200 MB/s vs 随机 IOPS 100）。
+
+\begin{lstlisting}
+// 预读逻辑（简化）
+readpage(inode, offset):
+  page = pagecache_get(inode, offset)
+  if page:
+    return page  // cache hit
+  // cache miss: 读这一页 + 预读后续页
+  readahead(inode, offset, num_pages=8)
+  // 如果检测到顺序模式，增大预读窗口
+  if is_sequential_access(inode, offset):
+    increase_readahead_window(inode)
+\end{lstlisting}
+
+\subsection{多流写入}
+
+NVMe SSD 支持多流（multiple streams）：不同类型的数据写入不同流，利用 SSD 内部并行。例如元数据写 stream 0，热数据写 stream 1，冷数据写 stream 2。同一 stream 内的数据物理上更连续，GC 代价更低。
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.34\linewidth}L{0.42\linewidth}@{}}
+\toprule
+优化 & 做什么 & 收益 \\
+\midrule
+延迟分配 & 写回时才分配块 & 减少碎片 \\
+extent & 连续块范围 & 大文件元数据小 \\
+HTree 目录 & hash 索引 & 大目录查找快 \\
+inline data & 小文件存 inode 内 & 省空间省 I/O \\
+预读 & 提前读后续页 & 顺序读吞吐高 \\
+压缩 & 透明压缩 & 省 I/O 省 40--70\% 空间 \\
+去重 & 块级共享 & 重复数据省空间 \\
+多流 & 分离写入流 & SSD GC 代价低 \\
+DAX & 持久内存直接访问 & 无 I/O 路径 \\
+\bottomrule
+\end{longtable}
+
+\section{设计选择与对比}
+
+不同文件系统的设计选择反映了不同的优先级。下表把主流文件系统的关键设计决策并列：
+
+\begin{longtable}{@{}L{0.14\linewidth}L{0.16\linewidth}L{0.16\linewidth}L{0.16\linewidth}L{0.16\linewidth}L{0.12\linewidth}@{}}
+\toprule
+& ext4 & XFS & Btrfs & ZFS & F2FS \\
+\midrule
+块映射 & extent 树 & B+ 树 & B-tree & B-tree & node table \\
+日志 & jbd2 & 日志 & COW & ZIL & log \\
+一致性 & journal & journal & COW & COW & log \\
+snapshot & 否 & 否 & 是 & 是 & 否 \\
+压缩 & 否 & 否 & 是 & 是 & 是 \\
+去重 & 否 & 否 & 是(实验) & 是 & 否 \\
+inline data & 是 & 否 & 是 & 否 & 否 \\
+延迟分配 & 是 & 是 & 是 & 是 & 是 \\
+目标 & 通用 & 大文件 & 现代/功能 & 数据完整性 & 闪存 \\
+\bottomrule
+\end{longtable}
+
+\begin{keyidea}
+文件系统没有"最好"的选择，只有\emph{不同约束下的取舍}。ext4 追求稳定兼容；XFS 追求大文件吞吐；Btrfs 追求功能和灵活性；ZFS 追求数据完整性；F2FS 追求闪存友好。选择哪个文件系统取决于工作负载的优先级：一致性、吞吐、空间效率还是功能。
+\end{keyidea}
+
+\section{测试}
+
+\begin{rubricbox}
+文件系统测试必须覆盖以下场景：
+\begin{itemize}
+\tightlist
+\item 创建文件后立即崩溃，恢复后不出现 inode 泄漏或 bitmap 不一致。
+\item \code{fsync} 后崩溃，数据可恢复。\code{write} 后崩溃不保证恢复。
+\item 大文件 extent 树深度增加时，查找复杂度仍为 \code{O(log n)}。
+\item 目录有 10 万条目时，HTree/B-tree 查找比线性快 100$\times$ 以上。
+\item unlink 已打开文件后 fd 仍可读写，最后引用释放后回收 inode 和数据块。
+\item COW 文件系统的 snapshot 创建是 \code{O(1)}，之后独立写入触发 copy-up。
+\item TRIM 后 SSD 垃圾回收优先回收对应物理块。
+\item 延迟分配的文件在 \code{fsync} 后保证块已分配且可恢复。
+\end{itemize}
+\end{rubricbox}
+
+\section{源码级补充}
+
+\detailsection{Linux VFS 核心路径}
+
+VFS 的路径解析在 \filepath{fs/namei.c} 的 \code{path\_lookupat} 中。它逐段处理路径字符串，对每一段调用 \code{link\_path\_walk} $\to$ \code{walk\_component} $\to$ \code{lookup\_fast}（dcache）或 \code{lookup\_slow}（调用具体文件系统的 \code{inode\_operations.lookup}）。
+
+读 \filepath{fs/namei.c} 时重点看：RCU path walk（无锁快速路径）、\code{LOOKUP\_RCU} 标志在什么条件下 fallback 到 ref-walk、以及 \code{unlazy\_walk} 何时被调用。
+
+\detailsubsection{ext4 extent 查找}
+
+\filepath{fs/ext4/extents.c} 的 \code{ext4\_ext\_map\_blocks} 是 ext4 块映射的核心。它从 inode 的 inline extent header 出发，按 B+ 树查找包含目标逻辑块的叶子 extent。如果查找命中 hole（无 extent 覆盖该范围），则触发延迟分配或返回 hole。
+
+\detailsubsection{jbd2 commit}
+
+\filepath{fs/jbd2/commit.c} 的 \code{jbd2\_journal\_commit\_transaction} 是 jbd2 提交核心。它等待所有 handle 关闭，写描述符块和元数据块，最后写 commit 块。commit 块包含 CRC32C 校验和，恢复时据此判断事务完整性。
+
+\detailsubsection{XFS B+ 树}
+
+XFS 的 B+ 树实现在 \filepath{fs/xfs/libxfs/xfs\_btree.c} 中。所有 XFS 结构（extent 分配、inode 分配、空闲空间、目录）都基于同一个 B+ 树框架。读代码时重点看 \code{xfs\_btree\_lookup}、\code{xfs\_btree\_insert} 和 \code{xfs\_btree\_delete} 的通用实现。
+
+\detailsubsection{Btrfs COW 事务}
+
+Btrfs 的事务管理在 \filepath{fs/btrfs/transaction.c} 中。每次写操作分配一个 \code{struct btrfs\_trans\_handle}，修改先在内存中的 B-tree 副本上进行。\code{btrfs\_commit\_transaction} 把所有修改过的 B-tree 节点写到新磁盘位置，最后原子更新超级块根指针。
+
+\detailsubsection{page cache 写回}
+
+\filepath{mm/page-writeback.c} 控制全局脏页比例和写回节奏。\filepath{fs/fs-writeback.c} 的 \code{wb\_workfn} 是 writeback 线程主循环，它调用具体文件系统的 \code{super\_operations.write\_inode} 或 \code{address\_space\_operations.writepages}。
+
+\detailsubsection{dentry cache}
+
+\filepath{fs/dcache.c} 管理 dentry 缓存。\code{d\_lookup} 是快速路径（RCU），\code{d\_add} 和 \code{d\_invalidate} 管理缓存生命。\code{shrink\_dcache\_parent} 在 unmount 时释放所有子树 dentry。
+
+\detailsubsection{应用层一致性不能外包给文件系统}
+
+文件系统保证自己的元数据一致，不保证应用多个文件之间的业务关系。配置更新涉及 \code{config.json} 和 \code{index.json} 两个文件，文件系统无法知道它们必须同版本。应用要用 manifest、版本号、checksum 和原子切换表达业务提交。
+
+\begin{lstlisting}
+publish_version(v):
+  write_all("objects/v/data", data)
+  fsync("objects/v/data")
+  write_all("manifests/v", checksum_and_metadata)
+  fsync("manifests/v")
+  rename("manifests/v", "CURRENT")
+  fsync("manifests")
+\end{lstlisting}
+
+这也是数据库使用 WAL 的原因。文件系统日志保护文件系统结构；数据库日志保护数据库事务；应用 manifest 保护应用版本。层次不同，日志语义不同。

@@ -14,10 +14,10 @@ MAIN = ROOT / "main.tex"
 INPUT_RE = re.compile(r"\\input(?:topic|detail)?\{([^}]+)\}")
 CHAPTER_INPUT_RE = re.compile(r"^\\input\{chapters/([^}]+)\}", re.MULTILINE)
 
-EXPECTED_CHAPTERS = 12
+EXPECTED_CHAPTERS = 13
 # Only these files may be included as numbered chapters. Extra hardware,
 # source-reading, and lab material must be wired through \inputdetail so the
-# printed book stays at 12 chapters instead of drifting back to a 20+ chapter
+# printed book stays at 13 chapters instead of drifting back to a 20+ chapter
 # outline.
 EXPECTED_CHAPTER_INPUTS = (
     "ch01-os-map-and-contracts",
@@ -30,6 +30,7 @@ EXPECTED_CHAPTER_INPUTS = (
     "ch12-mmap-page-cache",
     "ch14-device-drivers-dma",
     "ch16-files-devices-io",
+    "ch17b-filesystem-from-scratch",
     "ch18-socket-network-entry",
     "ch20-security-isolation",
 )
