@@ -30,6 +30,9 @@ Use these rules for reader-facing prose. They are editing rules, not manuscript 
 - Avoid filler conclusions such as “由此可见” when the next sentence can state the conclusion directly.
 - Do not vary a technical term merely for literary effect. In particular, keep Cache/cache, TLB, MMIO, DMA, IOMMU, PCIe, NVMe, PHY, FTL, fence, trace, bit, byte, and cycle internally consistent with the chapter’s established convention.
 - Keep warnings specific: state the violated condition, the observable symptom, and the measurement or correction that closes the loop.
+- Prefer mechanism verbs over coercive or violent metaphors. Write “约束决定”“条件触发”“占用预算”“达到寿命上限”“暴露错误” and “传递数据”, not “逼出来”“吃掉预算”“擦穿”“逼出错误” or “喂给”。
+- Avoid casual evaluation and debugging slang such as “挨打”“硬扛”“死磕”“翻车”“遮羞布”“兜底” and “白白”。Name the actual load, limit, failure, recovery mechanism, or unnecessary work instead.
+- Use an explicit causal transition when moving from an observation to a design decision: state the measured condition or physical limit first, then state the resulting design choice. Do not use a vivid metaphor as a substitute for that transition.
 
 ## Comment pseudocode at hardware boundaries
 

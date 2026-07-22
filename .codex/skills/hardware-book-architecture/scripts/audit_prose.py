@@ -23,6 +23,14 @@ HARD_PATTERNS = {
         r"数字硬件基础部分|数值与数据通路部分|处理器核心部分|存储与设备事务部分|NVMe 与存储 I/O 两章|最后的教学计算机项目"
     ),
     "mechanical duplicate": re.compile(r"(部分|项目|案例|章节|一章)\1"),
+    "informal coercive or violent metaphor": re.compile(
+        r"逼(?!近|真)|硬扛|挨打|吃掉|吞掉|砍掉|白白|喂给|踩坑|死磕|翻车现场|"
+        r"遮羞布|打穿缓存|当宝贝|养老|盯住|吐出|狠狠干扰|掐个表|"
+        r"最先摔倒|钉死|写死|揪出|代码自己在被啃|收拾其余一切|"
+        r"被仪器扔掉|从另一头榨容量|有效载荷就被咬一口|"
+        r"帧预算啃掉|真正干活|线程在干活|按命令干活|设备干活|替谁干活|"
+        r"兜底|饿死|一眼见底|一招|无感|还债|随手"
+    ),
 }
 
 
@@ -65,7 +73,7 @@ def main() -> int:
         "Prose audit OK: "
         f"{len(paths)} chapters, {stats['sections']} sections, "
         f"{stats['lines']} lines, {stats['characters']} characters; "
-        "no stale numeric, relative, or legacy-title references"
+        "no stale references or disallowed colloquial metaphors"
     )
     return 0
 
