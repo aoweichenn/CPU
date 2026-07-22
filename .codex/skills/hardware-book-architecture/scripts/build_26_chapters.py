@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
 import re
 import sys
@@ -296,6 +297,303 @@ def apply_diagram_overrides(text: str, chapter_number: int, overrides_dir: Path)
     return text
 
 
+ROW_END_RE = re.compile(r"\\\\(?:\[[^]]*\])?\s*$")
+CHAPTER_END_SECTION_RE = re.compile(
+    r"(?m)^\\section\*\{(章末练习|参考解答[^}]*)\}"
+)
+LONGTABLE_BEGIN_RE = re.compile(r"\\begin\{longtable\}\{[^\n]+\}")
+
+
+def split_table_cells(row: str) -> list[str]:
+    """Split a simple longtable row while preserving escaped ampersands."""
+    cells: list[str] = []
+    start = 0
+    for index, character in enumerate(row):
+        if character != "&":
+            continue
+        backslashes = 0
+        cursor = index - 1
+        while cursor >= 0 and row[cursor] == "\\":
+            backslashes += 1
+            cursor -= 1
+        if backslashes % 2 == 0:
+            cells.append(row[start:index].strip())
+            start = index + 1
+    cells.append(row[start:].strip())
+    return cells
+
+
+def parse_simple_longtable(table: str, chapter_number: int, section_title: str) -> list[list[str]]:
+    """Read the three-column chapter-end tables without changing cell content."""
+    begin = LONGTABLE_BEGIN_RE.search(table)
+    if not begin:
+        raise ValueError(f"chapter {chapter_number} {section_title}: malformed longtable")
+    body = table[begin.end(): table.rfind(r"\end{longtable}")]
+    rows: list[list[str]] = []
+    buffer: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line or line in (r"\toprule", r"\midrule", r"\bottomrule"):
+            continue
+        buffer.append(line)
+        joined = " ".join(buffer)
+        if not ROW_END_RE.search(joined):
+            continue
+        row = ROW_END_RE.sub("", joined).strip()
+        cells = split_table_cells(row)
+        if len(cells) != 3:
+            raise ValueError(
+                f"chapter {chapter_number} {section_title}: expected 3 cells, got {len(cells)}"
+            )
+        rows.append(cells)
+        buffer.clear()
+    if buffer:
+        raise ValueError(f"chapter {chapter_number} {section_title}: unterminated table row")
+    if len(rows) < 2:
+        raise ValueError(f"chapter {chapter_number} {section_title}: table has no exercises")
+    return rows
+
+
+def format_chapter_end_exercises(text: str, chapter_number: int) -> str:
+    """Turn chapter-end exercise/answer tables into numbered textbook problems."""
+    sections = list(CHAPTER_END_SECTION_RE.finditer(text))
+    records: list[dict[str, object]] = []
+    for index, section in enumerate(sections):
+        section_title = section.group(1)
+        section_end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
+        begin = LONGTABLE_BEGIN_RE.search(text, section.end(), section_end)
+        if not begin:
+            raise ValueError(f"chapter {chapter_number} {section_title}: missing longtable")
+        end_token = r"\end{longtable}"
+        end = text.find(end_token, begin.end(), section_end)
+        if end < 0:
+            raise ValueError(f"chapter {chapter_number} {section_title}: unterminated longtable")
+        end += len(end_token)
+        rows = parse_simple_longtable(text[begin.start():end], chapter_number, section_title)
+        records.append(
+            {
+                "start": begin.start(),
+                "end": end,
+                "title": section_title,
+                "header": rows[0],
+                "entries": rows[1:],
+            }
+        )
+
+    if len(records) % 2:
+        raise ValueError(f"chapter {chapter_number}: unpaired exercise/answer section")
+
+    replacements: list[tuple[int, int, str]] = []
+    for pair_index in range(0, len(records), 2):
+        exercise_record = records[pair_index]
+        answer_record = records[pair_index + 1]
+        if exercise_record["title"] != "章末练习" or not str(answer_record["title"]).startswith("参考解答"):
+            raise ValueError(f"chapter {chapter_number}: exercise/answer sections are out of order")
+        exercises = exercise_record["entries"]
+        answers = answer_record["entries"]
+        assert isinstance(exercises, list) and isinstance(answers, list)
+        if len(exercises) != len(answers):
+            raise ValueError(
+                f"chapter {chapter_number}: {len(exercises)} exercises but {len(answers)} answers"
+            )
+
+        def title_key(title: str) -> str:
+            key = re.sub(r"[\s：:（）()、，,/-]", "", title).lower()
+            suffixes = ("读写周期", "寄存器", "顺序", "计算", "分析", "拍数", "事务序列", "序列", "周期")
+            for suffix in suffixes:
+                if key.endswith(suffix):
+                    key = key[: -len(suffix)]
+                    break
+            return key
+
+        unmatched = set(range(len(answers)))
+        ordered_answers: list[list[str]] = []
+        for exercise in exercises:
+            exercise_key = title_key(exercise[0])
+
+            def score(answer_index: int) -> tuple[float, int]:
+                answer_key = title_key(answers[answer_index][0])
+                exact_bonus = 2.0 if exercise_key == answer_key else 0.0
+                containment_bonus = 0.5 if exercise_key in answer_key or answer_key in exercise_key else 0.0
+                similarity = SequenceMatcher(None, exercise_key, answer_key).ratio()
+                return exact_bonus + containment_bonus + similarity, -answer_index
+
+            answer_index = max(unmatched, key=score)
+            best_score = score(answer_index)[0]
+            if best_score < 0.5:
+                raise ValueError(
+                    f"chapter {chapter_number}: cannot match answer {answers[answer_index][0]!r} "
+                    f"to exercise {exercise[0]!r}"
+                )
+            ordered_answers.append(answers[answer_index])
+            unmatched.remove(answer_index)
+
+        exercise_header = exercise_record["header"]
+        answer_header = answer_record["header"]
+        assert isinstance(exercise_header, list) and isinstance(answer_header, list)
+        exercise_rendered: list[str] = []
+        answer_rendered: list[str] = []
+        for exercise, answer in zip(exercises, ordered_answers):
+            title, body, check = exercise
+            exercise_rendered.extend(
+                (
+                    f"\\begin{{chapterexercise}}{{{title}}}",
+                    body,
+                    f"\\exercisecheck{{{exercise_header[2]}}}{{{check}}}",
+                    r"\end{chapterexercise}",
+                    "",
+                )
+            )
+            _, body, check = answer
+            answer_rendered.extend(
+                (
+                    f"\\begin{{chapteranswer}}{{{title}}}",
+                    body,
+                    f"\\answercheck{{{answer_header[2]}}}{{{check}}}",
+                    r"\end{chapteranswer}",
+                    "",
+                )
+            )
+        replacements.extend(
+            (
+                (
+                    int(exercise_record["start"]),
+                    int(exercise_record["end"]),
+                    "\n".join(exercise_rendered).rstrip(),
+                ),
+                (
+                    int(answer_record["start"]),
+                    int(answer_record["end"]),
+                    "\n".join(answer_rendered).rstrip(),
+                ),
+            )
+        )
+
+    for start, end, replacement in reversed(replacements):
+        text = text[:start] + replacement + text[end:]
+    return text
+
+
+def parse_longtable_rows(body: str) -> list[str]:
+    """Return header and data rows from the manuscript's simple longtable dialect."""
+    rows: list[str] = []
+    buffer: list[str] = []
+    for raw_line in body.splitlines():
+        line = raw_line.strip()
+        if not line or line in (r"\toprule", r"\midrule", r"\bottomrule"):
+            continue
+        buffer.append(line)
+        joined = " ".join(buffer)
+        if not ROW_END_RE.search(joined):
+            continue
+        rows.append(joined.strip())
+        buffer.clear()
+    if buffer:
+        raise ValueError("unterminated row in oversized longtable")
+    return rows
+
+
+def split_oversized_longtables(text: str) -> str:
+    """Break page-filling tables into readable chunks with repeated context."""
+    end_token = r"\end{longtable}"
+    position = 0
+    output: list[str] = []
+    while begin := LONGTABLE_BEGIN_RE.search(text, position):
+        end = text.find(end_token, begin.end())
+        if end < 0:
+            raise ValueError("unterminated longtable while splitting oversized tables")
+        output.append(text[position:begin.start()])
+        body = text[begin.end():end]
+        rows = parse_longtable_rows(body)
+        if len(rows) < 2:
+            raise ValueError("longtable has no data rows")
+        header, data_rows = rows[0], rows[1:]
+        source_size = sum(len(ROW_END_RE.sub("", row)) for row in data_rows)
+        needs_split = len(data_rows) >= 11 or (len(data_rows) >= 5 and source_size >= 1100)
+        chunks: list[list[str]] = []
+        current: list[str] = []
+        current_size = 0
+        if needs_split:
+            for row in data_rows:
+                row_size = len(ROW_END_RE.sub("", row))
+                if current and (len(current) >= 7 or current_size + row_size > 720):
+                    chunks.append(current)
+                    current = []
+                    current_size = 0
+                current.append(row)
+                current_size += row_size
+            if current:
+                chunks.append(current)
+        if len(chunks) <= 1:
+            output.append(text[begin.start():end + len(end_token)])
+            position = end + len(end_token)
+            continue
+
+        spec = begin.group(0)
+        rendered_chunks: list[str] = []
+        total = len(chunks)
+        for chunk_index, chunk in enumerate(chunks, start=1):
+            first_cell = split_table_cells(ROW_END_RE.sub("", chunk[0]))[0]
+            last_cell = split_table_cells(ROW_END_RE.sub("", chunk[-1]))[0]
+            # A spanning summary row contains \multicolumn, which is valid only
+            # inside an alignment.  Never copy that command into the prose note.
+            if first_cell.startswith(r"\multicolumn"):
+                first_cell = "汇总行"
+            if last_cell.startswith(r"\multicolumn"):
+                last_cell = "汇总行"
+            rendered_chunks.extend(
+                (
+                    f"\\tablechunkintro{{{chunk_index}}}{{{total}}}{{{first_cell}}}{{{last_cell}}}",
+                    spec,
+                    r"\toprule",
+                    header,
+                    r"\midrule",
+                    *chunk,
+                    r"\bottomrule",
+                    end_token,
+                    "",
+                )
+            )
+        output.append("\n".join(rendered_chunks).rstrip())
+        position = end + len(end_token)
+    output.append(text[position:])
+    return "".join(output)
+
+
+def add_longtable_row_rules(text: str) -> str:
+    """Add subtle horizontal separators between body rows of every remaining table."""
+    end_token = r"\end{longtable}"
+    position = 0
+    output: list[str] = []
+    while begin := LONGTABLE_BEGIN_RE.search(text, position):
+        end = text.find(end_token, begin.end())
+        if end < 0:
+            raise ValueError("unterminated longtable while adding row rules")
+        output.append(text[position:begin.end()])
+        body = text[begin.end():end]
+        lines = body.splitlines(keepends=True)
+        styled: list[str] = []
+        for index, line in enumerate(lines):
+            stripped = line.rstrip("\r\n")
+            row_match = re.search(r"(\\\\(?:\[[^]]*\])?)\s*$", stripped)
+            if row_match:
+                next_content = ""
+                for following in lines[index + 1:]:
+                    if following.strip():
+                        next_content = following.strip()
+                        break
+                if next_content not in (r"\midrule", r"\bottomrule"):
+                    stripped = stripped[:row_match.end()] + r"\tablerowrule"
+                    newline = line[len(line.rstrip("\r\n")):]
+                    line = stripped + newline
+            styled.append(line)
+        output.append("".join(styled))
+        output.append(end_token)
+        position = end + len(end_token)
+    output.append(text[position:])
+    return "".join(output)
+
+
 def main() -> int:
     root = find_root(Path.cwd().resolve())
     source_dir = root / "books/hardware-zero-to-machine/source/latex/chapters"
@@ -338,6 +636,9 @@ def main() -> int:
             "".join(body_parts).lstrip("\n"), chapter.number
         )
         body = apply_diagram_overrides(body, chapter.number, overrides_dir)
+        body = format_chapter_end_exercises(body, chapter.number)
+        body = split_oversized_longtables(body)
+        body = add_longtable_row_rules(body)
         body = renumber_sections(body)
         output = output_dir / f"ch{chapter.number:02d}-{chapter.slug}.tex"
         expected_outputs.add(output)
