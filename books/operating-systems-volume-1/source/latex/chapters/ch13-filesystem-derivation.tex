@@ -237,31 +237,28 @@ inode 表采用固定大小记录。给定 inode 编号 $i$，其字节位置可
 接下来的内容先把教学块号接到真实设备 I/O，再讨论 ext4 inode、extent、目录索引、
 page cache 和日志如何在大容量、并发与故障条件下维护同一组关系。
 
-\subsection{用 MiniFS-Lab 验证布局和恢复}
+\subsection{MiniFS-Lab 中的编码与恢复逻辑}
 
-参考实现位于 \filepath{source/latex/listings/minifs\_lab.cpp}，并由本书
-\code{make check} 自动编译运行。程序逐字段写入小端定宽整数，没有把 C++ 结构体
-直接复制到磁盘，因此可以将实现中的偏移与本节布局逐项对照。
+MiniFS-Lab 使用 \code{put\_u16}、\code{put\_u32}、\code{get\_u16} 和
+\code{get\_u32} 显式转换定宽整数。写入函数把整数按小端顺序拆成字节，读取函数再按
+相同顺序组合；每次访问都先确认字段没有越过块边界。磁盘格式因此由字段宽度、字节序
+和偏移共同确定，不依赖 C++ 结构体的填充与对齐。
 
-测试包含三组场景：
+代码中的三条执行路径分别说明正常操作、资源回收和中途掉电时的状态变化：
 
 \begin{enumerate}\tightlist
-\item \textbf{格式化与重挂载}：mkfs 写入超级块、两张位图、根 inode 和根目录项；
-  mount 丢弃旧内存状态，只根据磁盘字节重新找到 \code{/hello}。
-\item \textbf{删除与资源回收}：unlink 移除目录项并释放 inode 与数据块，audit 随后
-  检查可达对象、位图和块映射是否一致。
-\item \textbf{掉电注入}：create 已经分配 inode 和数据块并写入内容，在目录项发布前
-  模拟掉电。重新挂载后名字不存在，audit 会报告不可达 inode 和没有可达所有者的
-  已分配块；修复器根据可达关系回收这些资源。
+\item \textbf{格式化与重挂载}：\code{format} 写入超级块、两张位图、根 inode 和
+  根目录项；\code{mount} 不沿用先前的内存对象，而是读取超级块、确认布局参数，再从
+  根 inode 开始恢复路径解析。
+\item \textbf{删除与资源回收}：\code{unlink} 先移除目录项，再清除数据块位图和
+  inode 位图中的占用标记，同时将相应记录复位。\code{audit} 从根目录计算可达对象，
+  并将该结果与两张位图及 inode 块映射相互核对。
+\item \textbf{掉电注入}：\code{create} 已经分配 inode 和数据块并写入内容，在目录项发布前
+  中断执行。重新挂载后，该名字尚不可见；\code{audit} 会识别不可达 inode 和没有
+  可达所有者的已分配块，\code{reclaim\_unreachable} 再依据可达关系回收这些资源。
 \end{enumerate}
 
-\begin{lstlisting}
-$ make -C books/operating-systems-volume-1 check
-CXX source/latex/listings/minifs_lab.cpp
-MiniFS-Lab checks passed
-\end{lstlisting}
-
-这个故障场景展示了无事务更新的恢复边界。mount 只能读取当前磁盘状态，无法推知
-半完成操作原本打算发布的名字；fsck 可以修复结构和回收泄漏，却未必能够恢复用户
+这个故障场景展示了无事务更新的恢复边界。\code{mount} 只能读取当前磁盘状态，无法推知
+半完成操作原本打算发布的名字；\code{fsck} 可以修复结构和回收泄漏，却未必能够恢复用户
 意图。日志为完整事务保存提交证据，使恢复程序能够重放已提交事务，并忽略没有完成
 提交的尾部更新。
