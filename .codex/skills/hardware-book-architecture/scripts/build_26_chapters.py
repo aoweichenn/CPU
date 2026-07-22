@@ -76,7 +76,14 @@ EXTRAS = {
 DIAGRAM_OVERRIDES = {
     6: (("这台最小 ISA 的完整数据通路", "ch06-minimal-isa-datapath.tex"),),
     13: (("内存控制器内部流水线", "ch13-memory-controller-pipeline.tex"),),
-    14: (("NVMe 命令处理流程", "ch14-nvme-command-flow.tex"),),
+    14: (
+        ("NVMe 命令处理流程", "ch14-nvme-command-flow.tex"),
+        ("磨损均衡前后的擦除次数分布", "ch14-wear-leveling-balance.tex"),
+    ),
+    15: (
+        ("HDD 整机框图", "ch15-hdd-signal-path.tex"),
+        ("ZBR 区位布局", "ch15-zbr-zone-layout.tex"),
+    ),
     16: (("从 read() 到寄存器的完整路径", "ch16-read-end-to-end.tex"),),
     21: (("台式机主板布局与三大分配网络", "ch21-motherboard-distribution.tex"),),
     26: (("J 的条件选通逻辑", "ch26-conditional-jump-select.tex"),),
