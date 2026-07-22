@@ -1,0 +1,219 @@
+\chapter{持久化、崩溃一致性与恢复}
+
+\section{原理}
+
+持久化问题的核心是：系统可能在任意两步之间崩溃。程序调用 \code{write}，内核可能只把数据放进 page cache；设备可能只完成了一部分请求；目录项和文件内容可能以不同顺序持久化；应用日志可能写了意图但没有应用数据；manifest 可能发布了一个并不完整的输出。崩溃一致性讨论的不是“正常运行时看起来对不对”，而是“重启后能否解释磁盘状态”。
+
+\code{write}、\code{fsync}、\code{rename} 和 manifest 分别处在不同层次。\code{write} 把字节交给内核；\code{fsync} 推进文件内容和部分元数据的持久化；\code{rename} 可以提供目录项替换的原子可见性，但目录本身是否持久也需要考虑；manifest 是业务层承认某批输出有效的提交点。只有把这些层次分开，才能写可靠输出。
+
+文件系统常用日志或 copy-on-write 技术维护自己的元数据一致性，但这不自动等于应用数据一致。文件系统保证的是它自己的结构能恢复，不保证你的两个文件之间满足业务事务。应用如果需要“数据文件和索引文件同时生效”，就必须设计应用层提交协议。
+
+最小可靠写出协议通常是：写临时文件，写完后 \code{fsync} 临时文件，校验大小和 checksum，\code{rename} 到最终路径，\code{fsync} 父目录，最后写或更新 manifest。这个协议不是唯一答案，但它展示了 prepared 和 committed 的区别。
+
+日志恢复要区分 redo 和 undo。redo 日志记录“应该完成什么”，崩溃后可以重放；undo 日志记录“如何撤销未完成修改”。write-ahead logging 的关键规则是：描述修改的日志必须先于实际修改持久化，否则崩溃后无法判断磁盘上的半成品是否应该保留。
+
+\section{实践}
+
+纸上实践先写提交状态机：
+
+\begin{lstlisting}
+NoOutput
+  -> TempCreated
+  -> DataWritten
+  -> DataSynced
+  -> RenamedVisible
+  -> DirectorySynced
+  -> ManifestCommitted
+\end{lstlisting}
+
+每个状态都要写出崩溃后恢复规则：
+
+\begin{longtable}{p{0.24\linewidth}p{0.66\linewidth}}
+\toprule
+崩溃点 & 恢复策略 \\
+\midrule
+TempCreated & 删除临时文件或忽略 \\
+DataWritten & 校验失败则删除，不能发布 \\
+DataSynced & 仍未提交，等待 rename 或清理 \\
+RenamedVisible & 若 manifest 未提交，按业务规则决定是否采用 \\
+DirectorySynced & 文件名持久，但业务仍以 manifest 为准 \\
+ManifestCommitted & 读取者可以信任并校验文件 \\
+\bottomrule
+\end{longtable}
+
+实践中要避免把“文件存在”当成业务成功。目录中有最终文件名，只说明某次 rename 可能发生过；manifest 提交并通过 checksum，才说明业务层承认它属于某个版本或批次。
+
+再写一份日志协议：
+
+\begin{lstlisting}
+append log record: transaction T intends to write block B with checksum C
+fsync log
+write data block
+fsync data
+append commit record for T
+fsync log
+\end{lstlisting}
+
+恢复时扫描日志：有 commit 的事务必须 redo；没有 commit 的事务按规则忽略或 undo；checksum 不匹配的记录停止或进入人工恢复。这里的重点不是实现数据库，而是理解日志先行、提交记录和幂等恢复。
+
+\section{算法与实现分析}
+
+\subsection{原子 rename 发布}
+
+很多应用用临时文件加 rename 发布结果。算法分为写入、同步、替换、同步目录四步：
+
+\begin{lstlisting}
+write_atomic(path, bytes):
+  tmp = path + ".tmp." + unique_id()
+  fd = open(tmp, O_CREAT | O_EXCL | O_WRONLY)
+  write_all(fd, bytes)
+  fsync(fd)
+  close(fd)
+  rename(tmp, path)
+  dirfd = open(parent_dir(path))
+  fsync(dirfd)
+  close(dirfd)
+\end{lstlisting}
+
+这个算法保证读者要么看到旧文件，要么看到新文件，不应看到半个最终文件。但它仍然只是单文件发布。若业务需要多个文件同时生效，还需要 manifest 或事务日志。
+
+\subsection{manifest 提交}
+
+manifest 把多个输出文件绑定成一个版本。数据文件可以先各自写好并 fsync；manifest 最后写入，列出版本号、文件名、大小和 checksum。读取者只读取 manifest 指向的文件。
+
+\begin{lstlisting}
+commit_version(version, files):
+  for file in files:
+    write_atomic(file.tmp_path, file.bytes)
+    verify_checksum(file.tmp_path)
+    rename(file.tmp_path, file.final_path)
+  manifest = build_manifest(version, files)
+  write_atomic("MANIFEST.new", manifest)
+  rename("MANIFEST.new", "MANIFEST")
+\end{lstlisting}
+
+manifest 的优点是恢复简单：重启后读取 MANIFEST，把它当作权威事实；不在 manifest 里的临时文件或孤儿文件可以清理。缺点是提交粒度较粗，manifest 本身也需要可靠写出。
+
+\subsection{redo 日志}
+
+redo 日志适合“提交后必须能重放”的场景。日志记录足够的信息，使恢复程序可以重新执行已经提交但未完全应用的修改。日志记录必须先持久化，数据页才能写出。
+
+\begin{lstlisting}
+transaction_write(T, block, data):
+  log_append(INTENT, T, block, checksum(data))
+  fsync(log)
+  write(block, data)
+  log_append(COMMIT, T)
+  fsync(log)
+\end{lstlisting}
+
+恢复算法扫描日志：看到 INTENT 但没有 COMMIT 的事务不应用；看到 COMMIT 的事务检查数据是否已经应用，未应用则 redo。redo 操作必须幂等，即重复执行不会改变最终正确结果。
+
+\subsection{检查点}
+
+日志无限增长不可接受，所以系统要做 checkpoint。checkpoint 把当前稳定状态写成快照，并记录“恢复只需从这个日志位置之后开始”。算法难点是 checkpoint 期间仍可能有新事务进入，因此要记录 epoch 或 LSN。
+
+\begin{lstlisting}
+checkpoint():
+  begin_lsn = log.current_lsn()
+  flush_dirty_pages_up_to(begin_lsn)
+  write_checkpoint_record(begin_lsn)
+  fsync(log)
+  truncate_log_before(begin_lsn)
+\end{lstlisting}
+
+checkpoint 的正确性依赖顺序：只有当某个 LSN 之前的脏数据都已经安全写出，才能截断之前的日志。否则崩溃后会丢失 redo 所需信息。
+
+\section{测试}
+
+持久化测试必须做故障注入。只在正常路径写文件再读取，不足以证明崩溃一致性。
+
+\begin{itemize}
+\tightlist
+\item 在每个提交状态后模拟崩溃，恢复程序能给出确定结果。
+\item 临时文件残留不会被读取者当成有效输出。
+\item manifest 指向缺失文件时，读取者拒绝该版本。
+\item checksum 错误时，恢复程序能定位坏文件并拒绝提交。
+\item 重复执行恢复程序是幂等的，不会一次恢复成功、二次恢复破坏状态。
+\item \code{write} 成功但 \code{fsync} 失败时，业务提交必须失败。
+\item rename 后但 manifest 前崩溃，恢复策略必须明确。
+\end{itemize}
+
+测试报告不要只写“断电恢复成功”。必须列出崩溃点、磁盘上允许出现的文件集合、恢复后权威事实、被清理对象和未覆盖边界。可靠性来自状态枚举，不来自运气。
+
+\section{源码级补充：WAL、COW 文件系统、RAID、LVM 与 media failure}
+
+\subsection{崩溃模型分层}
+
+崩溃一致性至少有三类故障：transaction crash，系统在两步之间断电；system crash，内核或整机停止但介质仍可靠；media failure，介质本身丢失或返回坏数据。日志能处理前两类的一部分，但不能让坏盘自动恢复数据，后者需要冗余、校验和副本。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+故障 & 例子 & 需要的机制 \\
+\midrule
+transaction crash & commit 前断电 & WAL/journal/manifest 状态机 \\
+system crash & 内核 panic、掉电 & fsync、flush、replay、fsck \\
+media failure & 坏块、整盘损坏 & RAID、复制、checksum、备份 \\
+\bottomrule
+\end{longtable}
+
+\subsection{LSN 与 checkpoint}
+
+WAL 系统通常给每条日志记录 LSN。数据页记录 pageLSN，表示该页包含到哪个日志位置的修改。恢复时若 pageLSN 小于 committed LSN，就 redo；checkpoint 记录某个 LSN 之前的脏页已经安全传播。
+
+\begin{lstlisting}
+redo_recovery():
+  start = last_checkpoint_lsn
+  for record in log from start:
+    if record.committed and page.page_lsn < record.lsn:
+      apply(record)
+      page.page_lsn = record.lsn
+\end{lstlisting}
+
+LSN 的价值是让恢复可判定，而不是靠文件时间戳或猜测。数据库、文件系统 journal 和 manifest 版本号都在解决同一问题：给恢复程序一个可比较的事实。
+
+\subsection{COW 文件系统}
+
+btrfs、ZFS 等 COW 文件系统不在原地覆盖元数据，而是写新块，再用新的根指针发布版本。snapshot、clone、send/receive 都建立在“旧版本块仍被引用，新版本写到新位置”的基础上。
+
+\begin{lstlisting}
+cow_update(tree, key, value):
+  new_leaf = copy_and_modify(old_leaf)
+  new_parent = copy_and_point_to(new_leaf)
+  ...
+  write_all_new_blocks()
+  atomically_update_super_root(new_root)
+\end{lstlisting}
+
+COW 避免部分原地覆盖造成的结构破坏，但带来写放大、碎片和空间回收复杂度。snapshot 多时，一个旧块可能被许多版本引用，不能简单释放。
+
+\subsection{RAID 与 write hole}
+
+RAID 0 条带化提高吞吐但无冗余；RAID 1 镜像；RAID 5/6 用奇偶校验节省空间；RAID 10 结合镜像和条带。RAID 5 写入数据和 parity 时若断电，可能出现 write hole：数据和校验不一致。
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+级别 & 优点 & 风险 \\
+\midrule
+RAID0 & 高吞吐、高容量利用 & 任一盘坏全丢 \\
+RAID1 & 简单冗余，读可并行 & 容量减半 \\
+RAID5/6 & 容量效率高，有校验 & 小写放大、write hole、重建压力 \\
+RAID10 & 性能和可靠性较好 & 成本高 \\
+\bottomrule
+\end{longtable}
+
+write hole 可用日志、非易失缓存、bitmap 或 copy-on-write parity 缓解。这里再次说明：持久化正确性来自顺序证据和冗余，不来自“写了两次应该差不多”。
+
+\subsection{LVM 和 device mapper}
+
+Linux device mapper 把上层块设备映射到底层设备区域，LVM 的 linear、snapshot、thin provisioning 都建立在此之上。dm-snapshot 用 COW 保存旧块，dm-thin 动态分配块，带来空间耗尽时的错误传播问题。
+
+\begin{lstlisting}
+bio to /dev/mapper/vg-lv
+  -> dm target maps logical sector
+  -> lower device sector(s)
+  -> submit cloned bio
+  -> complete original bio after all lower bios complete
+\end{lstlisting}
+
+读 \filepath{drivers/md/dm.c} 和具体 target。关注 bio clone、错误合并、flush 传播和 snapshot 元数据一致性。

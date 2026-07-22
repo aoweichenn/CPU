@@ -1,0 +1,684 @@
+\chapter{块设备、I/O 调度与文件路径}
+
+从 bio 到用户 buffer，I/O 要穿过块层、调度器和 VFS。本章把 request 队列、merge/sort、fd→file→inode 链和 buffered/direct 路径串成一条线。把这条线走通，才能说清 \code{write} 为什么快返回、\code{fsync} 为什么慢，以及掉电后哪些数据会丢。
+
+\section{块层原理与对象}
+
+文件系统最终要把逻辑块读写交给块设备。若每个上层请求都直接变成一次磁盘操作，系统会遭遇两个问题：机械磁盘上寻道开销巨大，随机请求顺序会让吞吐崩溃；即使在 SSD/NVMe 上，请求大小、队列深度、合并策略和 flush 顺序也直接影响延迟和持久化语义。因此操作系统在文件系统和驱动之间放置块层，负责把 bio 合并、拆分、排序、限流、派发和完成。
+
+块层的目标不是“越重排越好”。对普通读写，重排可以提高吞吐；对日志提交、数据库事务和文件系统 barrier，错误重排会破坏崩溃一致性。I/O 调度器必须同时理解性能和顺序约束：哪些请求可合并，哪些可越过，哪些必须在 flush 后才能报告完成。
+
+\begin{keyidea}
+块层把“文件系统想读写哪些块”转化为“设备能高效且按约束完成的请求序列”。它是性能优化层，也是持久化契约层。
+\end{keyidea}
+
+从设备演进看，机械磁盘偏好按扇区顺序扫描；SATA SSD 降低了寻道成本但仍受擦写块和队列深度影响；NVMe 提供多队列并行，单一全局电梯队列反而会成为瓶颈。教材不能只讲一个 SCAN 算法就结束，而要说明为什么算法随硬件变化。
+
+块层常用对象如下：
+
+\begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
+\toprule
+对象 & 含义 & 关键字段 \\
+\midrule
+bio & 上层的一段块 I/O 意图 & sector、len、page list、op、flags、endio \\
+request & 设备队列中的可派发请求 & 合并后的 bio 链、方向、优先级、deadline \\
+request queue & 块设备的软件队列 & pending、inflight、depth、scheduler \\
+hardware queue & 多队列设备的硬件提交队列 & doorbell、completion、CPU 亲和 \\
+flush request & 缓存刷新或持久化屏障 & preflush、FUA、barrier dependency \\
+\bottomrule
+\end{longtable}
+
+一次写入的路径可以写成：
+
+\begin{lstlisting}
+filesystem_writeback(page):
+  bio = build_bio(page.block, page.data, WRITE)
+  submit_bio(bio)
+
+submit_bio(bio):
+  q = bio.device.queue
+  if can_merge(q.last_request, bio):
+    merge(q.last_request, bio)
+  else:
+    req = make_request(bio)
+    scheduler_insert(q, req)
+  dispatch_if_possible(q)
+\end{lstlisting}
+
+这里的关键是 bio 的生命周期。bio 完成并不等于调用者数据结构一定可释放，除非 endio 回调已经把 page 状态、错误码和等待者唤醒都处理完。对写请求而言，“设备报告完成”也不必然等于掉电后数据存在，除非请求带有 FUA 或之前执行了正确 flush。
+
+\section{I/O 调度算法}
+
+\subsection{合并与拆分}
+
+合并减少请求数量，提高吞吐。前向合并是新 bio 紧接已有请求后方；后向合并是新 bio 紧接已有请求前方。
+
+\begin{lstlisting}
+try_merge(req, bio):
+  if req.op != bio.op or req.device != bio.device:
+    return false
+  if req.end_sector == bio.start_sector:
+    append(req, bio)
+    return true
+  if bio.end_sector == req.start_sector:
+    prepend(req, bio)
+    return true
+  return false
+\end{lstlisting}
+
+合并复杂度取决于查找结构。只看队尾是 \code{O(1)}，但合并机会少；用按 sector 排序的树查找相邻请求是 \code{O(\log n)}，合并率更高。拆分发生在请求跨越设备最大段数、最大字节数、DMA 边界或 zone 限制时。教学模型可以只实现连续扇区合并，但要保留“设备约束可能要求拆分”的接口。
+
+\subsection{SCAN 和 deadline}
+
+SCAN 电梯算法按当前磁头方向服务请求，到尽头后反向。它适合解释机械磁盘为什么怕随机寻道。
+
+\begin{lstlisting}
+pick_scan(queue, head, direction):
+  candidates = requests_in_direction(queue, head, direction)
+  if empty(candidates):
+    direction = reverse(direction)
+    candidates = requests_in_direction(queue, head, direction)
+  return nearest_by_sector(candidates, head, direction)
+\end{lstlisting}
+
+SCAN 的吞吐较好，但远处请求可能等待很久。deadline 调度器给读写请求设置截止时间，选择时优先处理过期请求，否则继续按 sector 顺序提升吞吐。
+
+\begin{lstlisting}
+pick_deadline(queue):
+  if has_expired(queue.read_deadline):
+    return pop_oldest(queue.read_fifo)
+  if has_expired(queue.write_deadline):
+    return pop_oldest(queue.write_fifo)
+  return pop_by_sector_order(queue)
+\end{lstlisting}
+
+deadline 的本质是用最大等待时间约束吞吐优化。它不保证实时性，但能避免单纯电梯算法在混合负载下让读请求被大量写请求拖垮。
+
+\subsection{CFQ/BFQ 与公平性}
+
+桌面和多租户环境还需要进程间公平。按进程或控制组建立 I/O 队列，可以避免一个大顺序写任务压制交互读。BFQ 这类预算公平队列给每个实体分配服务预算，用“服务了多少字节”和“等待了多久”共同决定下一个队列。
+
+\begin{lstlisting}
+pick_fair(queue_set):
+  entity = min_virtual_finish_time(queue_set.active)
+  req = entity.pop_next_request()
+  entity.service += req.bytes
+  entity.vfinish = entity.vstart + entity.service / entity.weight
+  if entity.has_more():
+    reinsert(entity)
+  return req
+\end{lstlisting}
+
+公平调度会牺牲部分全局顺序性，尤其在机械磁盘上可能增加寻道。工程选择取决于目标：批处理吞吐、桌面响应、数据库尾延迟还是云主机隔离。
+
+\section{持久化语义与多队列}
+
+\subsection{flush、FUA 与 barrier}
+
+现代存储有缓存。普通写完成可能只表示数据到达设备缓存，不表示掉电持久。flush 请求要求设备把缓存写入介质；FUA 要求当前写绕过或强制落到持久介质；barrier 规定顺序，防止前后的写被重排穿越。
+
+\begin{lstlisting}
+submit_ordered_write(data_req):
+  if data_req.requires_preflush:
+    submit(FLUSH)
+    wait_flush_done()
+  submit(data_req with FUA if requested)
+  wait_data_done()
+  if data_req.requires_postflush:
+    submit(FLUSH)
+    wait_flush_done()
+  complete_to_filesystem()
+\end{lstlisting}
+
+这段逻辑解释了为什么 \code{fsync} 慢：它不只是把 page cache 交给设备，还可能要求等待队列中相关写完成，并发出 flush 来建立掉电后的顺序证据。
+
+\subsection{多队列 NVMe}
+
+NVMe 设备支持多个 submission/completion queue。块层会把请求映射到 CPU 本地硬件队列，减少全局锁竞争。
+
+\begin{lstlisting}
+submit_nvme(req):
+  hctx = map_cpu_to_hw_queue(current.cpu)
+  tag = allocate_tag(hctx)
+  cmd = build_nvme_command(req, tag)
+  sq = hctx.submission_queue
+  sq.entries[sq.tail] = cmd
+  sq.tail = next(sq.tail)
+  ring_doorbell(hctx)
+\end{lstlisting}
+
+多队列提高并行度，但也削弱了全局排序。需要顺序语义的请求必须带明确依赖，不能假设“提交顺序就是完成顺序”。
+
+\subsection{blk-mq 对象关系}
+
+blk-mq 把软件提交队列映射到硬件队列，减少单锁瓶颈。核心对象包括 \code{request\_queue}、\code{blk\_mq\_tag\_set}、hardware context、software context 和 tag。tag 是请求在硬件队列中的身份，用 completion 找回 request。
+
+\begin{lstlisting}
+submit_bio
+  -> blk_mq_submit_bio
+  -> get request tag
+  -> map current CPU to hctx
+  -> driver queue_rq
+  -> device completion interrupt
+  -> blk_mq_complete_request
+  -> bio end_io
+\end{lstlisting}
+
+读源码看 \filepath{block/blk-mq.c}、\filepath{block/bio.c} 和具体驱动的 \code{queue\_rq}。关注 request 从 free tag 到 in-flight，再到 completion 释放 tag 的生命周期。
+
+\section{块层的统计、限流与错误处理}
+
+\subsection{IO 统计从哪里来}
+
+\filepath{/proc/diskstats}、\filepath{/proc/[pid]/io}、iostat 看到的数字来自块层和任务 I/O 统计。它们能说明请求数、扇区数、队列时间、服务时间，但不能直接告诉你应用层哪个业务请求慢。需要把应用 trace、系统调用和块层事件串起来。
+
+\begin{longtable}{p{0.22\linewidth}p{0.52\linewidth}}
+\toprule
+指标 & 解释注意点 \\
+\midrule
+read/write IOPS & 请求次数，受合并影响，不等于应用调用次数 \\
+sectors & 数据量，可和吞吐换算 \\
+await/latency & 队列等待加服务时间，受队列深度影响 \\
+util & 设备忙碌时间比例，多队列设备上不等同饱和度 \\
+\bottomrule
+\end{longtable}
+
+错误诊断不要只看 util。NVMe util 高不一定坏，机械盘 util 高更可能意味着排队；await 上升要结合队列深度、flush、写回和 cgroup 限流。
+
+\subsection{IO 优先级和 cgroup}
+
+\code{ionice}、IO priority class 和 blk-cgroup 可影响不同任务的 I/O 服务顺序。云主机和容器环境常通过 cgroup v2 的 io controller 控制权重或限速。公平性会改变尾延迟：低权重任务可能明显变慢，高权重任务不应被后台写回完全淹没。
+
+\subsection{writeback、dirty throttling 与块层的关系}
+
+应用 \code{write} 把页标脏后，脏页并不会无限积累。内核用 dirty ratio、dirty bytes、writeback 线程和 per-bdi 状态控制写回。当脏页过多时，写入者可能被迫参与平衡，表现为一次普通 \code{write} 变慢。
+
+\begin{lstlisting}
+balance_dirty_pages(task, mapping):
+  dirty = global_dirty_pages()
+  if dirty < dirty_background:
+    return
+  wake_writeback_threads()
+  if dirty > dirty_limit:
+    sleep_or_writeback_until_below_limit(task)
+\end{lstlisting}
+
+这个机制把存储压力反馈给应用。没有 throttling，快 CPU 可以瞬间制造大量脏页，把内存挤爆；有 throttling，局部写入延迟会上升，但系统保持可控。诊断写慢时要区分：是用户态复制慢，page cache 分配慢，dirty throttling，块层排队，还是设备 flush。
+
+\subsection{zone 设备和顺序写约束}
+
+某些设备把空间划成 zone，并要求一个 zone 内按顺序写入。文件系统和块层必须知道 zone write pointer，不能随意把随机写重排进去。这个例子说明块层不只是性能优化，还承载设备语义。
+
+\begin{lstlisting}
+submit_zone_write(req):
+  zone = lookup_zone(req.sector)
+  if req.sector != zone.write_pointer:
+    return -EIO
+  dispatch(req)
+  zone.write_pointer += req.length
+\end{lstlisting}
+
+对普通块设备，逻辑块可随机覆盖；对 zone 设备，文件系统可能要采用 log-structured 布局或显式 reset zone。硬件约束改变，上层算法就必须改变。
+
+\subsection{请求取消、超时与错误完成}
+
+块请求提交后可能超时、被设备 reset、被上层取消或完成失败。取消不是“把请求从队列里删除”这么简单，因为请求可能已经在设备硬件队列中，甚至设备正在 DMA。
+
+\begin{lstlisting}
+timeout_request(req):
+  mark req timed_out
+  ask driver eh_timed_out(req)
+  if driver says reset:
+    freeze_queue()
+    reset_device()
+    complete_lost_requests(EIO)
+    unfreeze_queue()
+  else if request completed meanwhile:
+    ignore timeout
+\end{lstlisting}
+
+这里存在竞态：timeout 线程准备处理请求时，中断也可能完成请求。request 状态机必须保证 completion 只发生一次，tag 只释放一次，bio endio 只调用一次。块层测试要专门构造 timeout 和 completion 交错。
+
+\subsection{从 fio 数字到 OS 解释}
+
+I/O benchmark 不能只报 MB/s 和 IOPS。高质量报告要写明 direct/buffered、sync/async、iodepth、block size、read/write mix、文件系统、是否预热、是否清缓存、是否包含 fsync。
+
+\begin{longtable}{p{0.24\linewidth}p{0.48\linewidth}p{0.18\linewidth}}
+\toprule
+参数 & 含义 & 影响 \\
+\midrule
+\code{bs} & 每次 I/O 大小 & 合并、吞吐和延迟 \\
+\code{iodepth} & in-flight 请求数量 & 设备并行度和排队 \\
+\code{direct} & 是否绕过 page cache & 缓存干扰和对齐要求 \\
+\code{fsync} & 是否等待持久化 & flush 延迟和事务成本 \\
+\code{rw} & 顺序/随机、读/写混合 & 调度器和介质特性 \\
+\bottomrule
+\end{longtable}
+
+如果不说明这些参数，“磁盘很快”或“磁盘很慢”没有工程意义。OS 学习里的性能测试必须可复现，也必须能解释观测值背后的路径。
+
+\begin{warningbox}
+本章块层部分的合格标准：能说明 bio、request、queue 的区别；能分析 SCAN、deadline、公平调度的取舍；能解释 flush/FUA/barrier 为什么属于正确性而不仅是性能。
+\end{warningbox}
+
+\section{VFS 文件层}
+
+文件描述符是用户态访问内核对象的句柄。它可以指向普通文件、管道、socket、设备或匿名内核对象。进程拿到的是一个小整数，但内核维护的是对象、offset、权限、引用计数和关闭状态。
+
+先看一段最普通的代码：
+
+\begin{lstlisting}
+int fd = open("log.txt", O_CREAT | O_APPEND | O_WRONLY, 0644);
+write(fd, "hello\n", 6);
+close(fd);
+\end{lstlisting}
+
+初学时容易把它理解成三步：打开文件、把 6 个字节写到磁盘、关闭文件。真实路径更长：路径字符串要解析成目录项和 inode；\code{open} 要创建 open file description 并放入进程 fd 表；\code{write} 要验证 fd 权限、复制用户 buffer、更新文件 offset、修改 page cache 或提交设备请求；\code{close} 只是释放一个引用，不保证已经持久落盘。
+
+把错误版本写出来更清楚：
+
+\begin{lstlisting}
+write(fd, buf, len):
+  inode = fd_to_inode(fd)
+  disk.write(inode.block, buf, len)
+  return len
+\end{lstlisting}
+
+这个版本至少错在五处。第一，fd 不直接指向 inode，中间还有 open file description，它保存 offset 和 status flags。第二，\code{O\_APPEND} 必须在内核里原子决定写入位置，不能让用户态先 \code{lseek}。第三，普通文件写通常先进 page cache，\code{write} 返回不等于磁盘完成。第四，写入可能短写或被信号打断。第五，错误可能异步出现，例如后台 writeback 失败，之后 \code{fsync} 才报告。
+
+文件 I/O 的第一层对象关系是：路径字符串经过路径解析找到目录项和 inode；\code{open} 产生 open file description；进程 fd 表保存一个小整数到 open file description 的引用。\code{dup} 产生新的 fd，但通常仍指向同一个 open file description，因此共享 offset 和状态。再次 \code{open} 同一路径通常产生新的 open file description，因此 offset 分离。
+
+普通文件读写经常经过 page cache。读命中 page cache 时不碰设备；读未命中时可能提交块设备请求并等待完成。写通常先把用户字节复制进 page cache，把页标记为 dirty，再由后台 writeback 或 \code{fsync} 推进到设备。\code{write} 返回不等于数据安全落盘，这一点必须反复强调。
+
+设备可以看作有特殊行为的文件对象。终端、磁盘、网卡、timerfd、eventfd、epoll、pipe、socket 都可以放进 fd/event 模型，但它们的 read/write 语义不同：有的返回字节流，有的返回结构化事件，有的可能阻塞，有的可能短读短写，有的只表示 readiness。
+
+阻塞、非阻塞和异步是三种控制流模型。阻塞 I/O 让当前线程睡眠直到有结果；非阻塞 I/O 在不能推进时返回 \code{EAGAIN}，调用者等待 readiness 后重试；异步 I/O 提交请求，completion 稀后返回结果。三者没有绝对高低，关键是请求身份、buffer 生命周期、短读短写、错误传播和背压。
+
+背压是 I/O 系统的安全阀。无界队列能让短 benchmark 看起来很快，因为生产者从不等待；一旦设备变慢，内存会持续增长，尾延迟扩大，最终进程可能被杀。可靠系统要同时限制 item 数、字节数和 in-flight 请求数，并在关闭时 drain 或 cancel。
+
+\begin{keyidea}
+fd 是入口，file 是打开实例，inode 是文件身份，page cache 是缓存和脏页账本，block request 是设备请求。文件 I/O 的连贯理解来自把这几层一条线串起来，而不是把 \code{read/write} 当成直接磁盘函数。
+\end{keyidea}
+
+\subsection{fd 分配表}
+
+进程的 fd table 可以先看作数组：下标是 fd，元素是指向 open file description 的引用。open 要找最小空闲 fd；close 清空槽位并减少引用计数；dup 找新槽位并增加引用计数。
+
+\begin{lstlisting}
+alloc_fd(file):
+  for i in 0..max_fd:
+    if table[i] == null:
+      table[i] = file
+      file.refcount += 1
+      return i
+  return -EMFILE
+
+close(fd):
+  file = table[fd]
+  if file == null: return -EBADF
+  table[fd] = null
+  file.refcount -= 1
+  if file.refcount == 0:
+    file.ops.release(file)
+\end{lstlisting}
+
+线性扫描是 \code{O(n)}，但简单。真实系统会用 bitmap 或 hint 记录下一个可能空闲位置，把常见分配降到接近 \code{O(1)}。无论怎么优化，不变量都是：fd 只是进程局部索引，open file description 才保存 offset、flags 和对象引用。
+
+\subsection{路径解析}
+
+路径解析把字符串变成目录项和 inode。绝对路径从根目录开始，相对路径从当前工作目录开始；每个路径分量都要查目录；遇到符号链接可能要跳转；权限和 mount namespace 会改变可见结果。
+
+\begin{lstlisting}
+resolve(path):
+  node = path.starts_with("/") ? root : current.cwd
+  for component in split(path, "/"):
+    if component == "." continue
+    if component == "..": node = node.parent
+    else:
+      node = lookup_child(node, component)
+      if node is symlink:
+        node = resolve_symlink(node)
+  return node
+\end{lstlisting}
+
+路径解析的复杂度大致和路径分量数相关，每个目录查找又取决于文件系统目录结构。缓存 dentry 可以避免每次都从磁盘读目录。安全实现还要限制符号链接递归深度，避免循环。
+
+\subsection{fd、file 和 inode 的并发引用}
+
+fd 是进程 fd 表下标，不是对象身份。内核执行 \code{read(fd)} 时，先把 fd 转成 \code{struct file} 引用；只要引用拿到，即使另一个线程随后 \code{close(fd)}，当前 I/O 也能在 file 对象上完成。close 删除的是 fd 表槽位，并减少 file 引用；它不能把正在执行的 I/O 用到的 file 直接释放。
+
+\begin{lstlisting}
+sys_read(fd, buf, len):
+  file = fget(fd)
+  if file == null:
+    return -EBADF
+  ret = vfs_read(file, buf, len)
+  fput(file)
+  return ret
+
+sys_close(fd):
+  file = files_table_remove(fd)
+  if file == null:
+    return -EBADF
+  fput(file)
+  return 0
+\end{lstlisting}
+
+这个规则解释 fd reuse 风险：线程 A 保存整数 fd=5，线程 B close(5)，线程 C open 得到新的 fd=5。A 再用整数 5 时，访问的可能已经是另一个对象。内核靠 file 引用保护内部生命周期，用户态也要避免把裸 fd 长期跨线程传递而没有所有权约定。
+
+\subsection{open flags 的作用域}
+
+flag 不是都绑定在同一层。fd flag 绑定 fd 表项；file status flag 绑定 open file description。dup 后两个 fd 指向同一个 open file description，所以共享 file status flag 和 offset；但 close-on-exec 是 fd flag，每个 fd 可以不同。
+
+\begin{longtable}{p{0.20\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+标志 & 作用范围 & 边界 \\
+\midrule
+\code{O\_CLOEXEC} & fd 表项 & exec 提交时关闭该 fd，不影响其他 fd 的标志 \\
+\code{O\_NONBLOCK} & open file description & dup 后共享，影响 read、write、accept、connect 的等待行为 \\
+\code{O\_APPEND} & open file description & 每次写前在内核内原子移动到文件尾 \\
+\code{O\_DIRECT} & file I/O 路径 & 对齐、页 pin、缓存一致性和短 I/O 更复杂 \\
+\code{O\_SYNC/O\_DSYNC} & 写入持久化语义 & 返回前要推进数据或元数据到更强边界 \\
+\bottomrule
+\end{longtable}
+
+\code{O\_APPEND} 不是用户态先 \code{lseek} 到末尾再 \code{write}。后者在并发下会竞争：两个线程都看到同一个旧文件尾，然后互相覆盖。append 语义要求内核在持有文件系统相关锁的状态下决定写入位置。
+
+\subsection{源码阅读入口}
+
+fd 表和引用看 \filepath{fs/file.c}、\filepath{include/linux/fdtable.h}；open 和路径解析看 \filepath{fs/open.c}、\filepath{fs/namei.c}；read/write 主干看 \filepath{fs/read\_write.c}；page cache 看 \filepath{mm/filemap.c}；epoll 看 \filepath{fs/eventpoll.c}；io\_uring 看 \filepath{io\_uring/}。阅读时跟住一个 fd：它从整数变成 file，如何增加引用，如何进入具体 file operations，错误码在哪里返回，最后一个引用在哪里释放。
+
+\section{I/O 路径}
+
+VFS 的 read/write 并不直接落到设备。普通文件读写经过 page cache，未命中时才生成 bio 进入块层；direct I/O 绕过 page cache 但仍走块层提交。本节把缓存命中与未命中、buffered 与 direct、同步与异步的路径分别拆开。
+
+\subsection{page cache 读写}
+
+普通文件读路径先查 page cache。若缓存命中，从内核页复制到用户 buffer；若未命中，分配 page cache 页，提交块 I/O，等待完成，再复制。写路径通常复制用户数据到 page cache，标记 dirty，并在之后由 writeback 或 fsync 推进设备写。
+
+\begin{lstlisting}
+buffered_read(file, offset, len):
+  while len > 0:
+    page_index = offset / PAGE_SIZE
+    page = page_cache_lookup(file, page_index)
+    if page == null:
+      page = read_page_from_storage(file, page_index)
+    n = copy_page_to_user(page, offset % PAGE_SIZE, len)
+    offset += n
+    len -= n
+\end{lstlisting}
+
+这个算法解释了冷读和热读差异。热读可能完全不碰设备；冷读可能等待存储。benchmark 若不说明缓存状态，就无法比较。
+
+把一次冷读走完整。进程调用 \code{read(fd, buf, 6000)}，当前文件 offset 是 3000，页大小是 4096。第一次要读的是文件第 0 页的后 1096 字节，第二次要读第 1 页的前 4096 字节，最后还要读第 2 页的 808 字节。若这三页都不在 page cache，内核要为每页建立 page cache 条目，发起块 I/O，把线程挂到等待队列。设备 completion 到来后，页状态从 locked/loading 变成 uptodate，等待线程被唤醒，再把页内容复制到用户 buffer。
+
+\begin{longtable}{p{0.16\linewidth}p{0.38\linewidth}p{0.34\linewidth}}
+\toprule
+阶段 & page cache 状态 & 线程看到什么 \\
+\midrule
+查第 0 页 & miss，分配 cache 页并标记 locked & 不能直接返回，需要等待 I/O \\
+提交 I/O & 块层生成 request，设备 DMA 填页 & 线程 sleeping，不占 CPU \\
+completion & 页标记 uptodate，清 locked，唤醒等待者 & 线程变 runnable，不一定立即运行 \\
+复制用户 buffer & 从 page cache 页复制对应片段 & 可能再次遇到用户页 fault \\
+推进 offset & 成功复制多少，offset 推进多少 & 短读时不能假设请求全完成 \\
+\bottomrule
+\end{longtable}
+
+热读路径不同：若页已经 uptodate，内核只需要拿到页引用并复制到用户 buffer，不发设备 I/O。这里的“快”来自 page cache 保存了文件内容的内存副本，而不是文件系统跳过权限和边界检查。读性能测试若第一轮冷读、第二轮热读，却把两者当同一种读，就会得出错误结论。
+
+写路径可以按这条线理解：
+
+\begin{lstlisting}
+sys_write(fd, user_buf, len):
+  file = fget(fd)
+  check file allows write
+  decide offset, handling O_APPEND under lock
+  copy bytes from user into page cache pages
+  mark pages dirty
+  update file size if needed
+  return copied bytes
+
+later:
+  writeback finds dirty pages
+  filesystem maps file offsets to blocks
+  block layer submits requests
+  device completes DMA
+  fsync reports delayed writeback errors
+\end{lstlisting}
+
+这条线解释了三个常见困惑。第一，\code{write} 很快返回，是因为它可能只完成了“复制到内核缓存并标脏”。第二，系统掉电时，dirty page 还没写到持久介质就会丢。第三，\code{fsync} 的意义不是“再写一遍”，而是把先前的脏数据和必要元数据推进到更强的持久化边界，并把异步错误交还给调用者。
+
+\subsection{设备队列和完成}
+
+块设备、网卡和异步 I/O 都可以抽象成提交队列和完成队列。提交时生成 request，放入设备或驱动队列；完成时中断或轮询拿到结果，唤醒等待任务或投递 completion。
+
+\begin{lstlisting}
+submit(req):
+  req.id = next_id()
+  req.state = IN_FLIGHT
+  device_queue.push(req)
+  kick_device()
+
+complete(req_id, status, bytes):
+  req = lookup(req_id)
+  req.status = status
+  req.bytes = bytes
+  req.state = COMPLETED
+  wake(req.waiter)
+\end{lstlisting}
+
+请求身份非常重要。异步完成可能乱序返回；取消后的请求也可能迟到完成；buffer 所有权必须跟着请求身份走。没有 request id，就无法把 completion 正确对应到提交者。
+
+\subsection{短读短写不是异常}
+
+普通文件顺序读常尽量返回请求长度，但很多 fd 都允许短读短写。pipe 可能只剩一部分数据；socket 是字节流，接收缓冲里有什么就先给什么；非阻塞 fd 无法继续推进时返回 \code{EAGAIN}；信号可能让系统调用返回 \code{EINTR}；存储错误可能让已经完成的部分和错误同时出现。
+
+\begin{lstlisting}
+write_all(fd, buf, len):
+  done = 0
+  while done < len:
+    n = write(fd, buf + done, len - done)
+    if n > 0:
+      done += n
+      continue
+    if errno == EINTR:
+      continue
+    if errno == EAGAIN:
+      wait_writable(fd)
+      continue
+    return error
+  return done
+\end{lstlisting}
+
+读路径也需要协议层状态机。对 TCP，\code{recv} 返回 20 字节不表示一个业务消息完整；对 UDP，一次 \code{recvmsg} 对应一个 datagram，buffer 太小会截断；对终端，行规程可能改变返回时机。OS 提供 fd 语义，应用协议必须自己定义消息边界。
+
+短写也要用具体事故理解。假设应用要把 1MiB 日志写到非阻塞 socket，第一次 \code{write} 返回 64KiB，第二次返回 \code{EAGAIN}。如果应用把第一次返回当作“整条日志已经发送”，就会丢掉后 960KiB；如果它在 \code{EAGAIN} 时忙循环重试，会把 CPU 打满；如果它没有保存剩余 buffer 和当前偏移，等 socket 可写时也不知道从哪里继续。正确实现需要一个输出队列，记录每条待发送数据、已发送 offset 和连接关闭时的清理策略。
+
+\begin{lstlisting}
+connection_on_writable(conn):
+  while !conn.outq.empty():
+    item = conn.outq.front()
+    n = write(conn.fd, item.buf + item.off, item.len - item.off)
+    if n > 0:
+      item.off += n
+      if item.off == item.len:
+        conn.outq.pop_front()
+      continue
+    if errno == EAGAIN:
+      arm_epollout(conn)
+      return
+    if errno == EINTR:
+      continue
+    fail_connection(conn, errno)
+    return
+\end{lstlisting}
+
+这段代码把“短写不是异常”落实成状态机：数据没写完时必须保留；\code{EAGAIN} 表示当前 fd 暂不可推进；真正错误才关闭连接或上报。文件 fd、pipe、socket、终端的短 I/O 原因不同，但调用者都不能假设一次系统调用等于业务消息完整提交。
+
+\subsection{buffered I/O 和 direct I/O 的不同风险}
+
+buffered I/O 经过 page cache，适合普通应用和共享缓存；direct I/O 尽量绕过 page cache，适合数据库一类自己管理缓存和写入顺序的程序。direct I/O 不是“更高级的 read/write”，它把对齐、页 pin、设备队列、缓存一致性和错误处理暴露得更多。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+路径 & 优点 & 代价 \\
+\midrule
+buffered read & 命中 page cache 很快，可共享缓存 & 多一次复制，缓存污染可能影响其他任务 \\
+buffered write & 快速标脏，后台批量写回 & write 返回不代表持久化 \\
+direct read/write & 减少 page cache 干扰，适合自管缓存 & 对齐、pin 页、短 I/O 和并发一致性复杂 \\
+mmap & load/store 直接访问映射页 & 缺页、SIGBUS、dirty/writeback 语义更隐蔽 \\
+\bottomrule
+\end{longtable}
+
+direct I/O 和 buffered I/O 混用尤其危险。一个路径绕过 page cache，另一个路径读写 page cache，若文件系统没有正确失效或同步缓存，应用可能看到旧数据。真实系统会在文件系统层处理这类一致性，但应用设计仍应尽量避免无计划混用。
+
+\subsection{epoll item 绑定的是 file}
+
+\code{epoll\_ctl} 把一个 fd 对应的 file 和 interest mask 加进 epoll 实例。之后整数 fd 关闭并复用，不代表旧 epoll item 自动变成新文件的监听项。事件返回里带着用户当初登记的 fd 数字，但内核里的等待关系绑定的是旧 file。
+
+\begin{lstlisting}
+epoll_ctl(epfd, ADD, fd):
+  file = fget(fd)
+  epitem.file = file
+  epitem.fd_number_for_user = fd
+  attach_poll_callback(file, epitem)
+
+event delivery:
+  file state changes
+  callback enqueues epitem
+  epoll_wait returns stored fd_number and event mask
+\end{lstlisting}
+
+事件循环通常要给每个连接对象加 generation 或指针身份，而不是只根据 fd 整数找状态。close、dup、fork、exec、线程并发都可能让 fd 数字的直觉失效。
+
+\subsection{io\_uring 的提交、完成与取消}
+
+io\_uring 用共享提交队列 SQ 和完成队列 CQ 减少系统调用往返，支持固定 buffer、固定文件、poll、timeout、链式请求和异步取消。它不是“绕过内核”，而是把提交和完成批量化，让内核在更少入口中处理更多请求。
+
+io\_uring 把“提交请求”和“收完成结果”拆成两个环。SQE 中的 \code{user\_data} 是应用识别 completion 的关键；CQE 中的 \code{res} 是最终字节数或负 errno。提交成功只表示内核接收了请求，不表示 I/O 完成。
+
+\begin{lstlisting}
+userspace:
+  sqe = get_sqe()
+  sqe.op = READV
+  sqe.fd = fixed_file
+  sqe.buf = fixed_buffer
+  sqe.user_data = request_id
+  submit_sq_tail()
+  io_uring_enter()        # or rely on SQPOLL
+
+kernel:
+  consume SQEs
+  issue async work or direct submit
+  post CQEs with res = bytes or -errno
+\end{lstlisting}
+
+fixed buffer/file 提高性能，但也把生命周期责任推给应用：buffer 在 completion 前不能释放，取消可能和完成竞态，部分完成必须按 CQE 结果处理。
+
+取消请求要按竞态理解：取消到达时，请求可能还在队列里，可能已经派发给设备，可能刚刚完成。应用必须能接受“取消成功”“取消失败因为已经完成”“先收到完成后收到取消结果”等情况。只要 completion 可能到来，buffer 和请求对象就不能提前复用。
+
+更具体地说，\code{io\_uring} 取消不是“把那次 I/O 从世界上抹掉”。假设应用提交读请求 R，\code{user\_data=42}，buffer 指向一块复用池内存。100ms 后应用超时，提交 cancel(42)。此时可能有三种真实状态：R 还在内核队列，取消可以把它摘掉；R 已经交给块设备，设备可能无法撤销，只能等 completion；R 已经完成，CQE 还没被应用收走。应用若在提交 cancel 后立刻把 buffer 给另一个请求使用，就可能和迟到的 R completion 冲突。
+
+\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\toprule
+取消到达时 & 内核可能返回什么 & 应用必须怎样处理 \\
+\midrule
+请求未派发 & cancel CQE 表示取消成功，原请求不会再完成 & 可以释放 buffer，但仍要消费 cancel 结果 \\
+请求已派发 & cancel 可能失败或标记取消中，原请求仍会完成 & buffer 继续保持有效，直到看到原请求 CQE \\
+请求已完成 & cancel 返回未找到或已完成 & 根据原 CQE 的结果处理，不重复释放 \\
+完成和取消乱序到达 & 先看到哪一个都可能 & 用 request 状态机合并结果，避免双重释放 \\
+\bottomrule
+\end{longtable}
+
+所以异步 I/O 的基本规则是：提交记录、buffer 所有权和 completion 消费必须绑定。真正能释放或复用 buffer 的点，不是“我不想等了”，而是“所有可能引用这个 buffer 的请求状态都已经收敛”。这和驱动层 DMA request 的规则是同一件事，只是对象从设备 descriptor 换成了用户可见的 SQE/CQE。
+
+\section{实践}
+
+纸上实践一：画 fd 引用图。
+
+\begin{lstlisting}
+process fd table:
+  fd 3 -> open file description A -> inode X
+  fd 4 -> open file description A -> inode X   # dup
+  fd 5 -> open file description B -> inode X   # open same path again
+\end{lstlisting}
+
+这张图能解释 offset 行为：fd 3 和 fd 4 共享 offset，fd 5 有独立 offset。并行文件读取如果使用 fd 3 和 fd 4，就可能因为共享 offset 得到不可预期的分片；使用 \code{pread} 或独立 open file description 更清楚。
+
+纸上实践二：写出短写循环。任何 \code{write} 都可能只写入一部分字节，尤其是 pipe、socket、非阻塞 fd 或被信号打断时。正确代码必须记录已完成字节数，继续写剩余部分，遇到 \code{EINTR} 重试，遇到 \code{EAGAIN} 进入等待，而不是把短写当成完整成功。
+
+纸上实践三：区分 readiness 和 message。\code{epoll} 告诉你 fd 可能可读或可写，不告诉你协议帧已经完整。网络程序必须有用户态 receive buffer、解析状态机和背压策略。把 fd readiness 当成完整请求，是事件驱动程序常见错误。
+
+\begin{lstlisting}
+PreparedBuffer
+  -> Submitted
+  -> InFlight
+  -> Completed(bytes, error)
+  -> ConsumedByProtocol
+  -> BufferReleased
+\end{lstlisting}
+
+异步 I/O 中，buffer 在 completion 前不能被上游复用；completion 失败不能被提交路径吞掉；cancel 后也可能收到迟到 completion，所以请求身份必须稳定。
+
+\section{测试}
+
+块层侧的测试覆盖合并、拆分、调度、flush 顺序和多队列身份：
+
+\begin{enumerate}
+\tightlist
+\item 合并测试：连续写 bio 应合并成较少 request，非连续不得错误合并。
+\item 拆分测试：超过最大请求大小时必须拆分，完成回调仍只向上层报告一次整体结果或清晰的部分错误。
+\item SCAN 测试：给定 head 和方向，选择顺序可手算。
+\item deadline 测试：过期读请求应越过大量未过期写请求。
+\item flush 顺序测试：日志数据、flush、commit block 的完成顺序不能被重排破坏。
+\item 多队列测试：同一队列 tag 唯一，completion 能找到原请求。
+\item 错误注入：设备返回 I/O error 时，page、bio、request、等待者状态都能收敛。
+\end{enumerate}
+
+文件 I/O 侧的测试覆盖 open/write/read、dup 后共享内容、close 一个 fd 后另一个 fd 仍有效、关闭所有引用后访问失败、未知 fd 返回诊断。还要测试 fd 分配单调或复用策略是否有明确规则。
+
+\begin{itemize}
+\tightlist
+\item \code{dup} 后 offset 共享，独立 \code{open} 后 offset 分离。
+\item \code{pread} 不改变 current offset。
+\item pipe 空读阻塞或非阻塞返回 \code{EAGAIN}，写端关闭后读端得到 EOF。
+\item 读端关闭后写 pipe 失败，不应静默丢数据。
+\item socket 或 pipe 短写后，调用者继续写剩余字节。
+\item readiness 事件只触发解析尝试，不被当成完整消息。
+\item 异步请求完成前，buffer 所有权不能释放。
+\item 队列达到字节上限时，生产者受到背压。
+\end{itemize}
+
+第一版必须先保证句柄生命周期可解释。持久化和崩溃恢复不要另起一条线，而要回到 fd、file、inode、page cache、block request 和目录项这些对象上验收。
+
+\section{文件系统恢复与崩溃一致性}
+
+VFS 给用户一个统一 fd 接口，具体文件系统负责目录项、inode、块映射、权限、日志和恢复。路径解析得到 dentry/inode，open 生成 file，read/write 进入 file operations，普通文件再落到 address\_space、page cache 和文件系统块映射。主线里先抓住对象边界，而不是先背某个文件系统格式。
+
+\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\toprule
+对象 & 保存什么 & 关键不变量 \\
+\midrule
+dentry & 名字到 inode 的缓存关系 & rename/unlink 后缓存不能让旧名字错误复活 \\
+inode & 文件身份、权限、大小、块映射、时间戳 & 多个路径和 fd 可引用同一 inode \\
+file & 一次打开实例、offset、status flags、ops & \code{dup} 共享，独立 \code{open} 分离 \\
+address\_space & 文件页缓存和写回状态 & read/write/mmap 必须看到同一份 page cache 账本 \\
+journal/log & 元数据或数据提交记录 & 崩溃恢复只能重放完整事务 \\
+\bottomrule
+\end{longtable}
+
+文件系统恢复的核心不是“写得更勤”，而是“崩溃后能判断哪些写已经构成完整状态”。以创建文件并重命名为例，数据块、inode 大小、目录项、父目录元数据、日志 commit 和设备 flush 之间必须有顺序。若应用写临时文件、\code{fsync(tmp)}、\code{rename(tmp, final)}，但忘记 \code{fsync} 父目录，崩溃后目录项是否存在就依赖文件系统和挂载语义，不能当作通用保证。
+
+\begin{lstlisting}
+durable_replace(tmp, final):
+  write tmp contents
+  fsync(tmp_fd)
+  rename(tmp, final)
+  fsync(parent_dir_fd)
+\end{lstlisting}
+
+这段不是所有场景的万能配方，但它展示了恢复协议的写法：每一步都要说明崩溃发生后恢复程序能看到什么。若看到旧文件，旧版本必须仍完整；若看到新名字，新内容必须已经同步；若看到临时文件，恢复程序应能删除或继续提交。文件系统、块层和设备只提供若干提交边界，业务正确性还要靠应用自己的版本号、校验和、manifest 或事务日志。
+
+\begin{warningbox}
+文件与 I/O 章的最终验收：跟住一个字节从用户 buffer 到 page cache、bio、request、设备 completion、writeback error、\code{fsync} 返回和恢复程序判断。若不能指出每层的状态对象和错误返回点，就不能声称理解了文件 I/O。
+\end{warningbox}

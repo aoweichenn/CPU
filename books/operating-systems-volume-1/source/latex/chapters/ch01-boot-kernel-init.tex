@@ -1,0 +1,1327 @@
+\chapter{裸机、引导与内核初始化}
+
+本章把单片机裸机程序、中断与定时器、引导与内核初始化三条线索合并成一条路径，解释一台机器从上电到 \code{kernel\_main} 运行的全过程。我们先从一块最小的温控板出发，看清裸机主循环为什么会失败；再用中断和定时器补上事件驱动与抢占这两块缺口；最后回到真实机器的复位向量、链接脚本和分阶段初始化，追踪内核如何一步步建立可运行环境。理解这条路径后，后续进程、内存、文件等章节讨论的内核服务才有立足之地。
+
+\section{从单片机裸机程序开始}
+
+理解操作系统，最稳的起点不是 Linux，也不是进程和虚拟内存，而是一块最小单片机。先看一个具体任务：做一块温控板。
+
+这块板子要做四件事：
+
+\begin{enumerate}
+\tightlist
+\item 每 1ms 读取温度传感器。
+\item 每 1ms 根据温度更新电机或风扇输出。
+\item 随时接收串口命令，例如修改目标温度。
+\item 每 100ms 通过串口发一行日志。
+\end{enumerate}
+
+第一版最容易写成这样：
+
+\begin{lstlisting}
+init_clock();
+init_sensor();
+init_motor();
+init_uart();
+
+while (true) {
+  read_sensor();
+  update_motor();
+  handle_uart_command_if_any();
+  send_log_if_due();
+}
+\end{lstlisting}
+
+这就是裸机程序：没有操作系统，程序直接拥有整台机器。所有内存都能读写，所有外设寄存器都能访问，任何函数都可以关中断、改时钟、写串口、改 GPIO。它的优点是简单、启动快、路径短；缺点也同样直接：只要某个函数等硬件，后面的函数就全被拖住。
+
+假设 \code{send\_log\_if\_due()} 里要发 80 个字节，而串口暂时发送缓冲区满。最朴素写法会忙等：
+
+\begin{lstlisting}
+void uart_putc(char c) {
+  while (!uart_tx_ready()) {
+    // wait until hardware can accept one byte
+  }
+  uart_write(c);
+}
+\end{lstlisting}
+
+如果这一等花了 50ms，那么 1ms 周期的 \code{read\_sensor()} 和 \code{update\_motor()} 就会迟到 50 次。程序不是“逻辑错”，而是结构错：它把需要等待的 I/O 当成了立刻完成的普通函数。
+
+所以本章的过渡线不是从术语开始，而是从这个失败开始：
+
+\begin{enumerate}
+\tightlist
+\item 暴力写法：所有工作按顺序塞进一个 \code{while (true)}。
+\item 发现问题：相邻工作共享同一个 CPU，慢 I/O 会拖死周期任务。
+\item 第一步优化：把任务的周期、下次运行时间和状态显式记录下来。
+\item 第二步优化：把阻塞发送改成状态机，硬件没准备好就先返回。
+\item 再往后：让硬件用中断通知事件，把“主动一直问”改成“事件到了再处理”。
+\end{enumerate}
+
+\begin{keyidea}
+裸机程序的失败不是因为代码写得不仔细，而是因为它把“需要等待的 I/O”和“能立刻完成的计算”放在同一条顺序执行流里。操作系统不是凭空出现的奢侈品：只要程序里出现多个活动、共享资源、等待硬件、错误恢复和时间预算，就已经需要 OS 式的状态管理。理解 OS 的最低门槛，就是看清这一步为何不可避免。
+\end{keyidea}
+
+\subsection{一个 MCU 芯片里面通常有什么}
+
+现在再看硬件部件。单片机，也叫 MCU，是一颗芯片上集成了一套很小的计算机。温控板不需要插显卡和硬盘，但它需要 CPU 核执行指令，需要 Flash 保存程序，需要 SRAM 放栈和全局变量，需要 GPIO 控制电机引脚，需要 UART 收发命令，需要定时器提供 1ms 节拍。很多外设不是运行时枚举出来，而是在芯片手册里固定了基地址和寄存器布局。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+部件 & 作用 & 与 OS 的关系 \\
+\midrule
+CPU core & 执行指令和异常入口 & 上下文、特权模式、中断响应 \\
+Flash & 保存程序镜像和只读数据 & 类似启动介质和只读代码段 \\
+SRAM & 保存栈、堆、全局变量 & 物理内存管理的最小形态 \\
+中断控制器 & 管理外设中断 & IRQ 分发和优先级的原型 \\
+SysTick/Timer & 周期时间基准 & tick、超时和抢占的原型 \\
+GPIO、UART、SPI、I2C & 连接外部设备 & 字符设备和总线驱动的原型 \\
+DMA controller & 在外设和内存间搬运数据 & DMA 生命周期和 completion 的原型 \\
+\bottomrule
+\end{longtable}
+
+这些部件通常共享同一个地址空间。CPU 访问 0x20000000 可能是 SRAM，访问 0x40000000 可能是 UART 寄存器。区别不在指令，而在地址译码后连到哪个硬件。地址译码可以理解为“硬件看地址范围，把这次访问交给内存或某个外设”。这个事实会一路延伸到大型 OS：驱动通过 MMIO 地址访问 PCIe 设备寄存器，本质仍是 load/store 触发硬件状态机。
+
+\subsection{芯片设计者怎样选择寄存器接口}
+
+外设寄存器是硬件和软件的协议。设计一个 UART 外设时，芯片设计者通常会暴露控制寄存器、状态寄存器、数据寄存器、波特率寄存器和中断使能寄存器。软件写控制寄存器启用发送接收；读状态寄存器判断 TX ready 或 RX available；读写数据寄存器收发字节。
+
+\begin{lstlisting}
+UART register model:
+  CTRL     bit0 enable_rx, bit1 enable_tx
+  STATUS   bit0 rx_ready, bit1 tx_empty, bit2 overrun
+  DATA     read pops received byte, write submits transmit byte
+  BAUD     divisor for baud rate generator
+  IRQ_EN   enable rx/tx/error interrupt
+\end{lstlisting}
+
+注意 \code{DATA} 寄存器不是普通内存。读它可能弹出接收 FIFO 的一个字节，写它可能启动发送状态机。状态位也可能有特殊清除规则，例如“写 1 清除”。驱动必须严格按手册顺序访问这些寄存器，否则问题不是编译错误，而是硬件进入不可预期状态。
+
+\subsection{从外设状态机看驱动}
+
+一个 UART 发送器可以看成硬件状态机：空闲时等待软件写 DATA；收到字节后按波特率移位输出；完成后设置 tx\_empty；若开启中断，则向中断控制器发请求。软件驱动的任务不是“调用发送函数”，而是和这个状态机同步。
+
+\begin{lstlisting}
+UART_TX_IDLE:
+  if software writes DATA:
+    shift_reg = DATA
+    state = UART_TX_BUSY
+
+UART_TX_BUSY:
+  shift one bit per baud tick
+  if all bits sent:
+    STATUS.tx_empty = 1
+    if IRQ_EN.tx_empty:
+      raise_irq()
+    state = UART_TX_IDLE
+\end{lstlisting}
+
+这就是为什么驱动要处理 ready 位、超时、FIFO 满、错误位和中断确认。ready 位表示“硬件现在能不能接收下一步动作”；FIFO 是硬件里的小队列，用来暂存还没处理完的字节；错误位记录溢出、校验失败或线路异常。硬件不会执行 C 函数返回值协议，它只会按寄存器位和状态机推进。操作系统把这种硬件状态机包装成 \code{read/write/poll/ioctl}，但底层仍然必须尊重硬件协议。
+
+\subsection{暴力写法：一个主循环包办所有工作}
+
+\begin{lstlisting}
+init_clock();
+init_gpio();
+init_uart();
+
+while (true) {
+  if (uart_has_byte()) {
+    byte b = uart_read();
+    handle_command(b);
+  }
+  if (timer_expired()) {
+    update_control_loop();
+  }
+  flush_logs_if_needed();
+}
+\end{lstlisting}
+
+这段代码看起来不像 OS，但它已经暴露了 OS 的胚胎问题。第一，多个活动共享一个 CPU，谁先执行？第二，事件到达时间不可控，怎样避免漏事件？第三，某个处理函数太慢，怎样不拖死其他工作？第四，共享状态由谁保护？第五，故障后怎样恢复到可解释状态？
+
+注意这里的“任务”还不是 Linux 里的进程或线程。它只是一个需要周期性或事件性执行的函数。先把这个简单含义抓住，后面再逐步升级成调度器里的 task。
+
+\subsection{从超级循环到任务表}
+
+裸机主循环通常被称为超级循环。它的结构是一个大循环里按固定顺序调用多个任务函数。温控板的第一版可以直接写：
+
+\begin{lstlisting}
+while (true) {
+  task_read_sensor();
+  task_control_motor();
+  task_send_telemetry();
+  task_blink_led();
+}
+\end{lstlisting}
+
+这种写法的问题是隐含了调度策略。调度策略就是“谁先用 CPU，谁后用 CPU，最多能用多久”的规则。超级循环没有把规则写成数据；它把规则藏在代码顺序里：每个任务的优先级就是它在代码里的顺序，每个任务的时间预算完全靠自觉，任何任务卡住，后面的任务都不会运行。
+
+要让它可分析，第一步是把任务放进表里，并给每个任务明确的周期、deadline 和上次运行时间。deadline 是“最晚必须完成的时间点”。例如控制电机每 1ms 必须更新一次，超过这个时间点，系统还能跑，但控制效果已经变差。
+
+\begin{lstlisting}
+struct Task {
+  const char* name;
+  uint32_t period_ms;
+  uint32_t next_release_ms;
+  void (*run)();
+};
+
+while (true) {
+  uint32_t now = ticks_ms();
+  for each task in tasks:
+    if (now >= task.next_release_ms) {
+      task.run();
+      task.next_release_ms += task.period_ms;
+    }
+}
+\end{lstlisting}
+
+这个算法是最小合作式调度器。合作式的意思是：任务必须主动返回，系统才有机会运行下一个任务。它没有抢占；抢占是“任务还没主动返回，定时器或内核入口就把 CPU 收回来”。这里先不要急着上抢占，先看合作式的边界。
+
+它的复杂度是每轮扫描 \code{O(n)}，n 是任务数量；它的关键不变量是 \code{next\_release\_ms} 单调前进，每个任务函数必须短小、不能无限循环、不能执行不可控阻塞。
+
+合作式调度器已经比手写超级循环好，因为任务的释放条件变成数据。但它仍然无法处理一个任务超时的问题。如果 \code{task\_send\_telemetry} 等串口缓冲区空等了 50ms，那么 1ms 周期的控制任务就会迟到。于是我们需要区分“能立刻做的计算”和“需要等待的 I/O”，这会把系统推向事件队列和中断。
+
+\subsection{最小调度算法的复杂度和失败边界}
+
+周期任务表的扫描算法很容易写，但它把每轮成本变成 \code{O(n)}。如果任务数量很少，成本可忽略；如果任务很多或周期很短，调度器本身会吃掉可观 CPU 时间。更重要的是，它没有强制时间预算，只能在任务返回后继续扫描。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+策略 & 算法成本 & 失败边界 \\
+\midrule
+固定顺序超级循环 & 每轮 \code{O(n)} & 任务顺序即隐式优先级，慢任务拖累后续任务 \\
+周期任务表 & 每轮扫描 \code{O(n)} & 任务不返回则全局停顿，deadline 只能事后发现 \\
+优先级就绪队列 & 取最高优先级可为 \code{O(1)} 或 \code{O(log n)} & 低优先级可能饥饿，需要抢占和时间统计 \\
+时间片轮转 & 每次切换接近 \code{O(1)} & 交互延迟和吞吐受时间片影响 \\
+\bottomrule
+\end{longtable}
+
+这里已经能看见调度器设计的核心：策略不是口号，必须落到数据结构和复杂度。任务少时，简单扫描最可靠；任务多、优先级复杂、需要抢占时，就要引入 runqueue、时间统计和上下文切换。
+
+\subsection{状态机替代阻塞函数}
+
+裸机程序最常见的灾难是阻塞等待：
+
+\begin{lstlisting}
+void send_packet(Packet p) {
+  for each byte in p:
+    while (!uart_tx_ready()) {
+      // busy wait
+    }
+    uart_write(byte);
+}
+\end{lstlisting}
+
+这段代码在功能上正确，但会占住整个 CPU。它的问题在于：明明只有“串口暂时不能收下一个字节”这一点新情况，程序却把整个 CPU 都扣在原地。更好的写法是把发送过程改成状态机：如果硬件暂时不能发送，就保存进度并返回，让其他任务继续运行。
+
+\begin{lstlisting}
+enum TxState { Idle, Sending };
+
+void uart_tx_step() {
+  if (tx_state == Idle || !uart_tx_ready()) {
+    return;
+  }
+  uart_write(tx_buffer[tx_pos++]);
+  if (tx_pos == tx_len) {
+    tx_state = Idle;
+  }
+}
+\end{lstlisting}
+
+状态机的核心代价是复杂性。阻塞函数把“下一步在哪里”藏在调用栈里；状态机把下一步显式放在 \code{tx\_state} 和 \code{tx\_pos} 里。操作系统中的线程，就是另一种保存“下一步在哪里”的方法：线程把寄存器、栈和程序计数器保存为上下文，使阻塞代码看起来仍像顺序代码。但线程要付出调度和栈内存成本。
+
+\subsection{资源所有权和最小内核对象}
+
+没有 OS 时，所有模块都能直接操作硬件寄存器。小程序可以这样写；程序变大后，它会造成所有权混乱。串口驱动、日志模块、命令行模块如果都直接写 UART 寄存器，就无法保证输出顺序，也无法处理并发写入。
+
+于是我们引入最小内核对象：一个对象拥有硬件资源，其他模块只能通过它的接口请求操作。比如串口对象维护发送队列、接收队列、错误计数和当前硬件状态。它不一定需要特权级，但已经有了内核思想：资源集中管理，状态对外封装，错误通过接口返回。
+
+\begin{lstlisting}
+struct UartDevice {
+  RingBuffer rx;
+  RingBuffer tx;
+  uint32_t overrun_count;
+  bool tx_busy;
+};
+
+bool uart_submit(UartDevice* dev, Span bytes);
+bool uart_read(UartDevice* dev, byte* out);
+\end{lstlisting}
+
+从这里可以看到后续 fd、socket、设备文件的影子。用户不应该直接改设备寄存器，而应该持有一个句柄，请求拥有者执行操作。差别只是大型 OS 里这个拥有者运行在内核态，并且有硬件权限保护。
+
+\subsection{从裸机模块边界到用户/内核边界}
+
+裸机程序里也可以规定“只有 UART 模块能写 UART 寄存器”，但这只是团队约定。任何 C 文件只要拿到寄存器地址，仍然能直接写硬件。通用 OS 不能依赖所有程序守规矩，它必须让硬件禁止用户程序访问设备寄存器。
+
+\begin{lstlisting}
+bare-metal convention:
+  app calls uart_submit()
+  but app could still write UART_BASE directly
+
+protected OS:
+  user VA does not map UART MMIO
+  user write to UART physical address triggers fault
+  app must call write(fd, ...)
+  kernel driver performs MMIO after permission checks
+\end{lstlisting}
+
+这就是模块化和隔离的区别。模块化让代码更清楚，但不能阻止恶意或错误代码；隔离由 CPU 特权级、页表权限和异常入口强制执行。OS 的很多复杂性，就是把裸机里的“请大家遵守约定”升级成“硬件保证不能绕过”。
+
+\subsection{轮询、中断和 CPU 占用率}
+
+裸机驱动要么轮询要么中断，二者不是非此即彼，而是同一根折中曲线上的两端。假设 UART 每秒收到 100 个字节，CPU 频率 100MHz。若主循环每 10 微秒轮询一次状态寄存器，一秒轮询 100000 次，其中只有 100 次有用；若每次轮询花 30 个周期，纯轮询检查就耗掉 300 万周期，约 3\% CPU。若轮询间隔变大，CPU 占用下降，但输入延迟和溢出风险上升。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+模式 & 优点 & 失败边界 \\
+\midrule
+忙轮询 & 实现最简单，延迟可控 & 浪费 CPU，慢操作会漏事件 \\
+周期轮询 & 降低 CPU 消耗 & 延迟取决于周期，burst 易溢出 \\
+中断驱动 & 空闲时不耗 CPU，事件到达即处理 & ISR 竞态、队列满、中断风暴 \\
+DMA + 中断 & 大吞吐低 CPU & buffer 生命周期、cache、一致性复杂 \\
+\bottomrule
+\end{longtable}
+
+这张表也适用于大 OS：epoll 减少无效轮询，NAPI 在高负载下把中断转为轮询，io\_uring 用共享队列减少系统调用往返。机制不同，目标都是在 CPU 占用、延迟和复杂度之间折中。
+
+\subsection{MCU 上的 DMA：从串口接收到环形缓冲区}
+
+即使在单片机上，DMA 也不是高级服务器才有的东西。典型场景是 UART 持续接收数据，CPU 不想每个字节都进中断。驱动可以准备一个环形缓冲区，让 DMA 控制器把 UART 接收数据直接写入 SRAM，半满或满时再中断 CPU。
+
+\begin{lstlisting}
+uart_rx_dma_setup():
+  dma.src = UART_DATA_REGISTER
+  dma.dst = rx_ring_buffer
+  dma.len = RING_SIZE
+  dma.mode = circular
+  dma.enable_half_full_irq = true
+  dma.enable_full_irq = true
+  start_dma()
+
+dma_irq():
+  produced = compute_dma_write_position()
+  publish_new_bytes_to_parser(produced)
+\end{lstlisting}
+
+这个例子把 DMA 的三条规则讲清楚。第一，buffer 在 DMA 运行期间不能随意改用途。第二，CPU 读取 DMA 写入的数据前，必须理解缓存一致性和写入位置。第三，completion 不一定表示全部 I/O 结束，也可能只是半缓冲区可消费。大型 OS 的网卡 RX ring 和块设备 completion，本质上是这个模型的扩展。
+
+\section{中断、定时器与内核入口}
+
+上一节的温控板已经有了主循环和任务表，但还有两个问题没有解决。
+
+第一个问题是串口接收。主循环如果每 1ms 才检查一次串口，而用户连续发来 20 个字节，硬件 FIFO 可能很快满掉。FIFO 满后再来的字节会丢失，命令就被截断。
+
+第二个问题是坏任务。假设日志任务里出现死循环：
+
+\begin{lstlisting}
+void task_send_log() {
+  while (true) {
+    // bug: waits forever
+  }
+}
+\end{lstlisting}
+
+合作式调度器要求任务主动返回。这个任务不返回，1ms 控制任务就再也没有机会运行。也就是说，仅靠“大家自觉让出 CPU”不够。
+
+先看轮询的暴力解。CPU 在主循环里反复问硬件：
+
+\begin{lstlisting}
+while (true) {
+  if (uart_has_byte()) {
+    byte b = uart_read();
+    ring_push(&rx_queue, b);
+  }
+  if (timer_expired()) {
+    run_periodic_tasks();
+  }
+}
+\end{lstlisting}
+
+这个版本的问题是 CPU 每轮都重新问所有事件有没有发生，大多数检查没有新信息。检查太频繁，浪费 CPU；检查太慢，输入延迟变大，还可能丢字节。于是硬件提供另一种过渡：事件发生时主动打断 CPU。
+
+\emph{中断}（interrupt）可以先理解成硬件事件入口。外设或定时器发现事件后，向 CPU 发出请求；CPU 在合适的指令边界停下当前代码，保存必要现场，跳到内核登记好的入口函数。处理完后，CPU 再恢复被打断的代码。中断不是魔法，它只是把“CPU 一直问设备”改成“设备有事时通知 CPU”。
+
+\begin{keyidea}
+轮询和中断不是对立的两条技术路线，而是同一条折中曲线的两端。轮询把判断时机的成本放在 CPU 上，延迟可控但浪费算力；中断把判断时机的成本放在硬件上，空闲时不耗 CPU 但要付出上下文保存、竞态和入口管理的代价。从“超级循环”走到“事件驱动”，本质是把“什么时候做”这件事从代码顺序交给硬件事件，再把硬件事件整理成可调度的内核对象。
+\end{keyidea}
+
+中断处理函数必须短。原因很具体：中断期间可能屏蔽同级或低级中断；处理太久会增加其他事件延迟；处理函数如果访问复杂共享状态，会和主循环或其他中断产生竞态。因此常见设计是 top half 只读取硬件状态、清中断、把事件放入队列；bottom half 或普通任务稍后完成复杂处理。top half 指“中断入口里马上做的短路径”；bottom half 指“离开硬中断后继续做的延后工作”。
+
+\begin{lstlisting}
+interrupt uart_rx_isr() {
+  byte b = UART_DATA;
+  ring_push(&rx_queue, b);
+  UART_CLEAR_INTERRUPT();
+}
+
+void uart_task_step() {
+  while (ring_pop(&rx_queue, &b)) {
+    parse_byte(b);
+  }
+}
+\end{lstlisting}
+
+中断引入了共享状态竞争。主循环和中断处理函数可能同时访问 \code{rx\_queue}。在单核单片机上，最简单的临界区是短暂关中断，修改队列指针，再开中断。这个方法有效，但必须短；如果关中断期间做慢操作，就会丢事件或增加控制延迟。
+
+\begin{lstlisting}
+disable_interrupts();
+bool ok = ring_push(&queue, value);
+enable_interrupts();
+\end{lstlisting}
+
+这个临界区就是锁的祖先。临界区指“这段代码运行到一半时，共享数据结构暂时不完整，不能被另一个执行流插进来”。以后在多核机器上，关本核中断不能阻止另一个核心同时访问同一数据结构，于是需要自旋锁、互斥锁和原子操作。但基本问题没有变：某段代码需要在状态不变量被临时打破时不被并发打断。
+
+\subsection{中断控制器为什么不是可选部件}
+
+若只有一个外设和一个 CPU，外设可以直接把中断线连到 CPU。真实系统有串口、网卡、磁盘、定时器、多个 CPU，事件会同时出现。CPU 不能只收到一句“有事了”，它还要知道“哪个事件、是否允许现在处理、送到哪个入口”。中断控制器负责把混乱的硬件事件整理成 CPU 能处理的 vector。
+
+vector 是 CPU 入口编号，可以理解成“这类中断应该跳到哪一个入口”。pending 位表示“这个中断源已经有事件等待处理”。mask 表示“软件暂时屏蔽这个中断源”。EOI 是 end of interrupt，表示处理方告诉控制器“这次中断处理完了，可以继续投递后续事件”。
+
+\begin{lstlisting}
+interrupt_controller:
+  pending[source] = device_irq_line
+  enabled[source] = software_mask
+  priority[source] = configured_priority
+  target[source] = cpu_id
+
+deliver():
+  candidates = pending & enabled
+  source = highest_priority(candidates)
+  cpu = target[source]
+  cpu.raise_interrupt(vector[source])
+\end{lstlisting}
+
+没有中断控制器，OS 就不能可靠地屏蔽某类中断，不能区分中断来源，不能把高吞吐设备分散到多个 CPU，也不能在多核系统中发送 IPI。中断控制器是“外设事件”和“CPU 异常入口”之间的路由层。
+
+\subsection{x86-64 中断控制器：local APIC、IOAPIC、MSI/MSI-X}
+
+x86-64 主线里，中断控制器不是一个单独芯片名，而是一组协作机制。先抓住最小含义：每个 CPU 旁边有本地中断入口管理，外部设备要通过路由机制把事件送到某个 CPU 的某个 vector。
+
+local APIC 属于每个 CPU，用于本地 timer、IPI 和接收 vector。IPI 是 CPU 给另一个 CPU 发的中断，常用于让别的核心重新调度或刷新地址翻译缓存。IOAPIC 把传统外部 IRQ 重定向到目标 CPU 和 vector。MSI/MSI-X 让 PCIe 设备通过一次特殊内存写投递中断；它的好处是多队列设备可以给不同队列分配不同 vector。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+机制 & 主要用途 & OS 关心点 \\
+\midrule
+local APIC & 每 CPU 中断、本地 timer、IPI & 多核调度、TLB shootdown、timer tick \\
+IOAPIC & 把外部 IRQ 重定向到 CPU/vector & IRQ 路由、触发方式、亲和性 \\
+MSI/MSI-X & PCIe 设备通过内存写投递中断 & 多队列设备、vector 分配、隔离 \\
+x2APIC & 扩展 APIC 编址和访问方式 & 大规模 CPU、虚拟化、IPI 成本 \\
+\bottomrule
+\end{longtable}
+
+MSI/MSI-X 值得单独强调。传统中断像一根线；MSI 是设备向一个特殊地址写入消息来触发中断。这样 PCIe 设备可以为多个队列分配多个 vector，让网卡 RX queue 0 中断送到 CPU0，RX queue 1 中断送到 CPU1。多队列网络和 NVMe 的伸缩性很大程度依赖这种硬件能力。
+
+\subsection{定时器和时间片}
+
+现在回到坏任务。串口中断解决的是“外设事件来了怎么办”；定时器中断解决的是“没有外设事件，但当前任务一直不回来怎么办”。没有定时器，只有任务主动让出 CPU 时，系统才能切换任务；一旦任务死循环，整个系统就失控。
+
+定时器最小形态是一个硬件计数器和一个比较值。计数器按时钟递增；计数器达到比较值时，硬件产生中断。OS 在中断中增加 tick、检查超时、唤醒等待任务，并在必要时设置“需要调度”的标志。tick 是内核维护的软件时间刻度，不等于现实世界里唯一的时间表示，但足够说明周期调度和超时。
+
+\begin{lstlisting}
+interrupt timer_isr() {
+  ticks++;
+  for each timer in timer_wheel[current_slot]:
+    if (timer.expired(ticks)) {
+      make_task_runnable(timer.task);
+    }
+  if (current_task.time_slice_used++ >= current_task.time_slice) {
+    need_reschedule = true;
+  }
+}
+\end{lstlisting}
+
+\subsection{定时器从硬件计数器到 OS 超时}
+
+硬件定时器最小形态是一个递增或递减计数器，加一个比较寄存器。计数器来自固定频率时钟；当计数器达到比较值时，硬件产生中断。OS 在中断里更新软件时间，并设置下一次比较值。
+
+\begin{lstlisting}
+program_next_timer(deadline):
+  timer.compare = deadline
+  timer.enable_interrupt = true
+
+timer_interrupt():
+  now = timer.counter
+  run_expired_timers(now)
+  next = earliest_deadline()
+  program_next_timer(next)
+\end{lstlisting}
+
+周期 tick 的做法是每隔固定时间中断一次，例如 1ms 或 10ms。高精度和 tickless 的做法是按最近事件编程下一次中断。前者实现简单，后者减少无意义中断，但要求内核精确维护最近 deadline。无论哪种方式，抢占和超时都依赖硬件在未来把控制权交回内核。
+
+\subsection{异常和系统调用}
+
+中断来自外设，异常来自当前指令执行，例如除零、非法指令、缺页、权限错误。系统调用也是一种受控入口：用户程序主动执行特定指令，请求进入内核。三者共同构成内核入口。
+
+\begin{longtable}{p{0.18\linewidth}p{0.32\linewidth}p{0.38\linewidth}}
+\toprule
+入口 & 来源 & 典型处理 \\
+\midrule
+中断 & 外设或定时器 & 读取设备状态，唤醒任务，记录 tick \\
+异常 & 当前指令失败 & 发送信号、修复缺页、终止进程 \\
+系统调用 & 用户主动请求 & 检查参数和权限，操作内核对象 \\
+\bottomrule
+\end{longtable}
+
+从这里开始，OS 的边界清楚了：用户代码不能直接操作所有资源，而是通过受控入口进入内核；内核根据当前上下文、权限和对象状态决定是否允许请求。
+
+\subsection{异常入口保存的是诊断证据}
+
+异常不是“出错就跳到内核”这么简单。硬件必须保存足够证据，让内核判断能否修复。以 page fault 为例，内核需要知道 faulting address、访问类型、当前特权级、出错指令地址和错误码。以非法指令为例，内核需要知道是哪条指令，以便发送信号或模拟指令。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+证据 & 用途 & 缺失后果 \\
+\midrule
+fault RIP & 返回或报告出错指令 & 无法重试或定位错误 \\
+fault address & 判断哪个虚拟地址出错 & 无法处理缺页或 SIGSEGV \\
+access type & 读、写、执行、用户/内核 & 无法区分 COW、NX、权限错误 \\
+RFLAGS/CPL & 中断状态、特权级、条件位 & 返回路径不安全 \\
+error code/cause & 架构提供的分类原因 & 只能粗暴终止，无法精细恢复 \\
+\bottomrule
+\end{longtable}
+
+这也是内核崩溃日志要打印寄存器、RIP、栈和 fault address 的原因。它们不是噪声，而是硬件给出的最低层证据。没有这些证据，调试只能猜。
+
+\subsection{上下文保存}
+
+中断、异常和调度都需要保存上下文。x86-64 的最小上下文包括 RIP、RFLAGS、通用寄存器和 RSP。若要切换任务，还要保存当前任务的内核栈、地址空间标识和调度账本。
+
+\begin{lstlisting}
+struct Context {
+  uint64_t rip;
+  uint64_t rsp;
+  uint64_t rflags;
+  uint64_t regs[16];
+};
+
+void switch_to(Task* prev, Task* next) {
+  save_context(&prev->ctx);
+  current = next;
+  restore_context(&next->ctx);
+}
+\end{lstlisting}
+
+这段伪代码隐藏了真实汇编细节，但说明了不变量：一个任务被切走时，它的下一条指令位置和栈必须能恢复；一个任务被恢复时，寄存器必须像它从未离开 CPU 一样。上下文保存不正确，任何高级调度策略都没有意义。
+
+\subsection{上下文分两类：异常上下文和调度上下文}
+
+异常上下文由硬件入口和低级入口共同保存，描述“被打断的执行现场”。调度上下文描述“线程被切走后下次如何继续”。二者有关但不完全相同。系统调用和中断进入内核时，需要 trap frame；线程主动睡眠或被调度出去时，需要保存 callee-saved 寄存器、内核栈位置和调度状态。
+
+\begin{longtable}{p{0.2\linewidth}p{0.36\linewidth}p{0.32\linewidth}}
+\toprule
+上下文 & 保存内容 & 典型时机 \\
+\midrule
+trap frame & 用户 RIP、RSP、RFLAGS、系统调用参数、错误码 & 中断、异常、系统调用入口 \\
+switch context & 内核栈指针、callee-saved 寄存器、返回地址 & scheduler 切换内核线程 \\
+地址空间上下文 & 页表根、PCID、TLB 状态 & 切换进程地址空间 \\
+浮点/SIMD 上下文 & FPU、向量寄存器、控制字 & 用户使用浮点/SIMD 或信号处理 \\
+\bottomrule
+\end{longtable}
+
+把这几类上下文混在一起会导致很多误解。例如中断打断用户程序时，内核需要 trap frame 才能返回用户态；调度器在两个都已进入内核的线程之间切换时，通常只需要保存内核执行所需的最小寄存器集合。地址空间切换还要改页表根和处理 TLB。
+
+\subsection{trap frame、switch context 和 stack frame 的区别}
+
+“保存现场”这个说法太粗，会掩盖三种完全不同的结构。trap frame 是硬件入口和汇编入口为异常/中断/系统调用保存的用户或被打断现场；switch context 是调度器在内核线程之间切换时保存的最小恢复信息；stack frame 是普通函数调用在栈上的返回地址、旧帧指针和局部变量布局。
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
+\toprule
+结构 & 谁创建 & 用来回答什么问题 \\
+\midrule
+trap frame & CPU 硬件入口 + 低级汇编入口 & 从哪个 RIP/RSP/RFLAGS 返回用户态或被打断点 \\
+switch context & 调度器和架构切换代码 & 下次调度到该线程时，从哪个内核位置继续 \\
+stack frame & 编译器按 ABI 生成的函数调用代码 & 当前函数返回到哪里，局部变量在哪里 \\
+signal frame & 内核在用户栈上构造 & 用户态 signal handler 结束后如何恢复原现场 \\
+\bottomrule
+\end{longtable}
+
+一个线程在系统调用中睡眠时，通常同时拥有这些结构：用户态曾经有 stack frame；进入内核后有 trap frame；内核 C 函数有自己的 stack frame；调度出去时还要保存 switch context。调度器切换的是“当前内核执行点”，不是直接切换到用户程序入口；返回用户态时才消费 trap frame。
+
+\begin{lstlisting}
+user calls read()
+  -> user stack frame exists
+  -> syscall creates trap frame
+  -> kernel functions create kernel stack frames
+  -> task sleeps, scheduler saves switch context
+  -> later scheduler restores switch context
+  -> syscall completes and return path restores trap frame
+\end{lstlisting}
+
+这也解释了为什么每个线程需要独立内核栈。线程睡在内核里时，它的内核 stack frames 和 trap frame 都还活着；另一个线程进入内核不能覆盖这段栈。
+
+\subsection{中断入口的最小状态机}
+
+中断入口要做的第一件事不是调用 C 函数，而是保存足够现场，让被打断代码将来能继续。可以把入口写成四段：硬件自动保存、汇编入口补充保存、C 层分发、返回路径恢复。
+
+\begin{lstlisting}
+interrupt_entry(vector):
+  frame = hardware_saved_frame()
+  save_scratch_registers(frame)
+  switch_to_kernel_stack_if_needed(frame)
+  dispatch_interrupt(vector, frame)
+  maybe_preempt_on_return(frame)
+  restore_registers(frame)
+  iret(frame)
+\end{lstlisting}
+
+这个状态机维护两个不变量。第一，任何会被中断处理函数破坏的寄存器，要么已经保存，要么按 ABI 规定不需要保存。第二，返回用户态之前，内核必须处理挂起信号、抢占标志和可能的调度请求。若在中断中直接切换任务，必须保证旧任务的内核栈仍保存完整 trap frame。
+
+\subsection{精确中断和延迟中断}
+
+外部中断通常在指令边界被接收，CPU 完成当前指令的架构效果后进入中断入口。这样内核返回时可以从下一条指令继续。异常则和当前指令绑定：缺页异常通常要返回到同一条指令重试，除零或非法指令可能发送信号。精确性让 OS 能用同一套保存/恢复机制处理多种入口。
+
+\begin{lstlisting}
+external interrupt:
+  instruction N committed
+  interrupt taken before N+1
+  saved RIP = address of N+1
+
+page fault:
+  instruction N cannot complete
+  saved RIP = address of N
+  kernel may fix page and retry N
+\end{lstlisting}
+
+中断延迟来自多个来源：CPU 临时关中断、硬件优先级屏蔽、长时间持有自旋锁、中断控制器路由、cache miss、下半部积压。实时系统关心最大延迟；通用系统也要避免长时间关中断，因为它会让定时器、网络、块 I/O 和 RCU 都延后。
+
+\subsection{中断控制器与优先级}
+
+真实硬件通常通过中断控制器管理多路中断。控制器至少要完成屏蔽、优先级、确认和结束通知。教学模型可以抽象成 pending bitmap：
+
+\begin{lstlisting}
+interrupt_controller_tick():
+  pending = pending_bits & enabled_bits
+  if pending == 0:
+    return
+  vector = highest_priority(pending)
+  pending_bits.clear(vector)
+  cpu_raise_interrupt(vector)
+
+end_of_interrupt(vector):
+  controller.eoi(vector)
+\end{lstlisting}
+
+\begin{warningbox}
+若忘记 EOI，控制器可能不再投递后续同类中断；若过早 EOI，同一个设备可能在 handler 尚未处理完共享状态时再次打断。驱动通常先读取设备状态并清设备侧中断源，再向控制器确认完成。顺序错误会导致中断风暴或丢事件。很多“中断风暴”并非来自设备本身，而是来自清除顺序错误或设备侧 pending 条件未被真正消费。
+\end{warningbox}
+
+\subsection{IRQ、vector、handler 和 completion 的区别}
+
+设备 I/O 里还有一组容易混的词。IRQ 是“有中断事件需要处理”的硬件/内核资源；vector 是 CPU 入口编号；handler 是内核注册的处理函数；completion 是某个具体 I/O 请求完成的事实。一个 IRQ 可以对应一个队列，一次 handler 可以处理多个 completion，一个 completion 也可能在轮询模式下被发现而不是靠中断发现。
+
+\begin{longtable}{p{0.18\linewidth}p{0.30\linewidth}p{0.40\linewidth}}
+\toprule
+概念 & 表示什么 & 常见误解 \\
+\midrule
+IRQ line/vector & CPU 被通知有事件 & 误以为它等于某个请求完成 \\
+handler & 处理该类事件的函数 & 误以为 handler 只能处理一个事件 \\
+completion entry & 设备写回的请求结果 & 误以为一定伴随一次中断 \\
+wait queue & 等待某个条件的任务集合 & 误以为中断直接唤醒某个用户函数 \\
+poll budget & 一次下半部最多处理多少完成 & 误以为只要有中断就会处理完所有包/请求 \\
+\bottomrule
+\end{longtable}
+
+高吞吐设备通常把中断当成“提醒你去看队列”，而不是“这个请求完成了”的一对一消息。网卡可能一次中断后处理几十个 RX completion；NVMe 可能一个 MSI-X vector 对应一个 completion queue；NAPI 甚至会暂时关闭中断，改用轮询批量处理。这样吞吐更好，但延迟、budget、队列深度和背压都必须进入设计。
+
+\subsection{电平触发、边沿触发和 MSI}
+
+中断触发方式影响 handler 的确认顺序。边沿触发在信号变化瞬间产生事件；若软件没及时处理，可能错过后续边沿。电平触发只要设备中断线保持有效，控制器就认为中断仍 pending；若 handler 没清设备状态，EOI 后会立刻再次进入。MSI/MSI-X 则是设备写一个中断消息，通常不依赖共享物理线。
+
+\begin{longtable}{p{0.18\linewidth}p{0.34\linewidth}p{0.36\linewidth}}
+\toprule
+触发方式 & 特点 & handler 重点 \\
+\midrule
+边沿触发 & 变化瞬间产生一次事件 & 不能丢边沿，事件队列要足够 \\
+电平触发 & 条件保持则持续 pending & 必须清设备侧原因再 EOI \\
+MSI/MSI-X & 设备写消息触发 vector & vector 分配、队列亲和性、屏蔽同步 \\
+\bottomrule
+\end{longtable}
+
+OS 不能只从 CPU 侧看中断，还要看设备侧 pending 条件是否被真正清掉。
+
+\subsection{top half 与 bottom half 的分工}
+
+中断上半部只做必须立即完成的工作：读取硬件状态、清中断源、把事件入队、唤醒下半部。下半部可以在软中断、工作队列或普通内核线程中运行。
+
+\begin{lstlisting}
+irq_top_half(dev):
+  status = mmio_read(dev.status)
+  mmio_write(dev.ack, status)
+  push_event(dev.event_queue, status)
+  schedule_bottom_half(dev)
+
+bottom_half(dev):
+  while pop_event(dev.event_queue, &event):
+    process_event(event)
+    wake_waiters(dev.waitq)
+\end{lstlisting}
+
+分工的理由是延迟控制。上半部越长，其他中断越晚被处理；下半部越慢，队列越容易积压。因此测试不只看功能，还要看最大关中断时间、队列峰值和事件丢失计数。
+
+\subsection{定时器数据结构选择}
+
+若每个 tick 扫描所有定时器，复杂度是 \code{O(n)}。最小堆适合定时器数量中等、过期时间分散的系统；时间轮适合大量短超时；分层时间轮适合同时覆盖短超时和长超时。
+
+\begin{longtable}{p{0.18\linewidth}p{0.24\linewidth}p{0.24\linewidth}p{0.22\linewidth}}
+\toprule
+结构 & 插入 & 取最近超时 & 适用场景 \\
+\midrule
+线性表 & \code{O(1)} & \code{O(n)} & 少量定时器，教学 baseline \\
+最小堆 & \code{O(log n)} & \code{O(1)} & 通用超时，精度清楚 \\
+单级时间轮 & 接近 \code{O(1)} & 接近 \code{O(1)} & 大量短超时，槽宽可接受 \\
+分层时间轮 & 接近 \code{O(1)} & 接近 \code{O(1)} & 长短超时混合 \\
+\bottomrule
+\end{longtable}
+
+选择定时器结构时要写清精度、最大超时、插入成本和 tick 成本。一个只在 10 个定时器上正确的实现，不能直接推广到 100000 个 socket 超时。
+
+下面的图把一次设备事件从产生到 EOI 的完整投递路径画出来。读这段路径时要记住：每一跳都对应一种具体的硬件结构或内核数据结构，任何一跳出错都会让事件丢失或重复投递。
+
+\begin{pdfdiagram}
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (dev) at (0,7) {device event: 网卡/磁盘/定时器产生事件};
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (route) at (0,6) {IOAPIC redirection 或 MSI/MSI-X 消息写};
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (lapic) at (0,5) {local APIC on target CPU};
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (vec) at (0,4) {CPU vector};
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (idt) at (0,3) {IDT gate};
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (entry) at (0,2) {low-level entry: 保存 trap frame};
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (disp) at (0,1) {generic IRQ dispatch -> device handler};
+  \node[draw, rounded corners, align=center, minimum width=10cm, minimum height=0.7cm] (eoi) at (0,0) {EOI: controller 可继续投递后续事件};
+
+  \draw[->, >=stealth, thick] (dev) -- (route);
+  \draw[->, >=stealth, thick] (route) -- (lapic);
+  \draw[->, >=stealth, thick] (lapic) -- (vec);
+  \draw[->, >=stealth, thick] (vec) -- (idt);
+  \draw[->, >=stealth, thick] (idt) -- (entry);
+  \draw[->, >=stealth, thick] (entry) -- (disp);
+  \draw[->, >=stealth, thick] (disp) -- (eoi);
+\end{pdfdiagram}
+
+\diagramnote{上半段是硬件路由：设备事件经 IOAPIC 或 MSI 消息送到目标 CPU 的 local APIC，再变成 vector。下半段是软件分发：IDT gate 找到入口，低级汇编保存 trap frame，通用 IRQ 层分发到设备 handler，最后 EOI 通知控制器可以继续。任何一跳的路由、亲和性或清除顺序出错，都会让事件丢失或重复投递。}
+
+\section{引导、链接脚本与启动状态机}
+
+从裸机程序走向内核，第一道门是启动。先看一个最容易误判的写法：
+
+\begin{lstlisting}
+power_on:
+  call kernel\_main
+\end{lstlisting}
+
+这段伪代码看起来干净，但在真实机器上通常不能成立。C 函数不是孤立存在的，它默认栈已经可用，全局变量已经初始化，代码和数据在链接器预期的位置，必要地址能访问，最小输出设备已经准备好。上电瞬间，这些条件都不是天然存在的。
+
+机器上电后，CPU 只知道从复位向量或固件指定入口取第一条指令。复位向量就是架构规定或固件约定的起始地址。CPU 不会自动理解“这是内核主函数”，也不会自动准备堆、栈、全局变量和设备。操作系统必须把“二进制文件如何进入内存、第一条指令在哪里、栈在哪里、全局变量如何初始化、设备何时可用”这些问题全部讲清。
+
+在单片机上，启动路径通常是 reset handler：设置栈指针，把 \code{.data} 从 Flash 复制到 SRAM，把 \code{.bss} 清零，初始化时钟和最小串口，然后调用 \code{main} 或 \code{kernel\_main}。\code{.data} 是带初值的全局数据段，例如 \code{int x = 7}；\code{.bss} 是未显式初始化的全局数据段，C 语言要求它运行时从 0 开始。在 PC 或服务器上，路径更长：固件初始化硬件，bootloader 加载内核镜像和启动参数，切换 CPU 模式，建立最小页表，最后跳到内核入口。
+
+\begin{warningbox}
+启动阶段的特点是“没有服务可用”：还没有调度器不能睡眠，还没有内存分配器不能随便 \code{malloc}，还没有完整中断不能依赖异步事件，还没有文件系统不能读普通文件，调试输出只能靠串口或早期 console。任何 early init 函数偷偷调用需要调度器或内存分配器的路径，都会在小配置上“刚好能跑”、在大配置上随机损坏——这正是内核初始化必须按严格阶段组织的原因。
+\end{warningbox}
+
+\subsection{上电后 CPU 为什么不能直接运行内核 C 函数}
+
+C 函数依赖一组运行环境：栈指针有效，全局变量已初始化，BSS 为零，代码和数据位于链接器预期地址，调用约定可用，必要的地址映射存在。上电瞬间这些条件都不自动成立。CPU 只处在架构定义的复位状态，从固定入口取指；剩下的环境必须由启动代码一步步建立。
+
+可以按下面这条线理解从“不能调用 C”到“可以调用 \code{kernel\_main}”的过渡：
+
+\begin{lstlisting}
+Reset:
+  CPU only has architectural reset state
+
+MinimalStack:
+  set stack pointer, now simple calls can return
+
+DataCopied:
+  copy initialized globals to runtime memory
+
+BssCleared:
+  zero uninitialized globals
+
+EarlyConsole:
+  prepare minimal output for failure evidence
+
+KernelMain:
+  now ordinary early C code has a reliable base
+\end{lstlisting}
+
+每一步都只解决一个问题。先有栈，函数调用才不会把返回地址写到未知位置；再有 \code{.data/.bss}，全局锁、队列和指针才有可预测初值；再有 early console，后面的失败才有证据。
+
+\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\toprule
+C 代码假设 & 谁建立 & 若缺失会怎样 \\
+\midrule
+栈可用 & reset handler 或 bootloader & 函数调用和局部变量破坏未知内存 \\
+全局变量已初始化 & 启动代码复制 \code{.data}、清 \code{.bss} & 锁、队列、指针从随机值开始 \\
+代码地址正确 & 链接脚本和装载器 & 跳转、全局地址、异常表错误 \\
+内存可访问 & 页表或物理映射 & 取指或访存 fault \\
+最小输出可用 & early console 初始化 & 出错时没有证据 \\
+\bottomrule
+\end{longtable}
+
+所以内核入口往往先是汇编或极小 C 代码。它不是为了炫技，而是因为在运行时环境建立前，普通 C 抽象还没有可靠落脚点。
+
+\subsection{x86-64 早期入口、\_start 与最小启动代码}
+
+早期启动的第一份“内核源码”通常不是 C 函数，而是入口汇编和链接脚本。x86-64 上，UEFI/bootloader 或 EFI stub 把内核镜像放入内存，传入启动参数和内存地图；早期入口建立最小栈、清 BSS、准备早期页表和 IDT，然后才调用 \code{kernel\_main} 一类 C 入口。
+
+\begin{lstlisting}
+early_x86_64_entry:
+  lea rsp, [rip + boot_stack_top]
+  copy .data from flash LMA to sram VMA
+  zero .bss
+  build early page tables
+  load provisional IDT
+  call early_console_init
+  call kernel\_main
+halt_loop:
+  hlt
+  jmp halt_loop
+\end{lstlisting}
+
+这里已经出现了 OS 启动的三个根概念：入口地址、内存布局和异常表。后面 IDT、内核入口和多核启动更复杂，但本质仍是“硬件和 bootloader 按固定规则跳到一段受信任代码，代码建立可运行环境”。
+
+\subsection{链接脚本决定内存布局}
+
+链接脚本把代码段、只读数据、已初始化数据、未初始化数据和栈安排到具体地址。代码段通常叫 \code{.text}，只读数据段通常叫 \code{.rodata}，已初始化全局数据是 \code{.data}，未初始化全局数据是 \code{.bss}。没有链接脚本，编译器和链接器不知道内核应该放在物理地址哪里，也不知道哪些符号表示段边界。
+
+\begin{lstlisting}
+SECTIONS {
+  . = 0x80200000;
+  __kernel_start = .;
+  .text : { *(.text*) }
+  .rodata : { *(.rodata*) }
+  .data : { *(.data*) }
+  __bss_start = .;
+  .bss : { *(.bss*) *(COMMON) }
+  __bss_end = .;
+  __kernel_end = .;
+}
+\end{lstlisting}
+
+\begin{warningbox}
+这些段边界符号不是装饰。启动代码需要 \code{\_\_bss\_start} 和 \code{\_\_bss\_end} 来清零 BSS；早期物理页分配器需要 \code{\_\_kernel\_end} 知道哪些内存已经被内核占用；页表初始化要知道哪些区域可执行、只读或可写。若链接脚本导出的段边界不单调递增或不按页对齐，后续清 BSS、页分配和页表权限设置都会出错。
+\end{warningbox}
+
+\subsection{链接地址、加载地址和重定位}
+
+链接地址是代码认为自己运行的位置，加载地址是 bootloader 把镜像放到内存的位置。二者可以相同，也可以不同。若不同，早期代码要么以位置无关方式运行，要么完成重定位，要么建立页表把链接虚拟地址映射到实际物理地址。重定位就是把“代码里原本按某个地址计算的引用”修正到实际运行地址。
+
+\begin{lstlisting}
+kernel linked at virtual address: 0xffffffff81000000
+kernel loaded at physical address: 0x00100000
+
+early page table maps:
+  0xffffffff81000000 -> 0x00100000
+\end{lstlisting}
+
+这解释了为什么 64 位内核常有“高半区内核”概念。用户进程使用低地址范围，内核映射在高虚拟地址范围；每个进程切换页表时仍保留内核映射，系统调用和中断进入内核后能访问同一套内核代码和数据。这个设计依赖页表，而不是物理内存真的在高地址。
+
+\subsection{VMA 与 LMA：为什么 data 要复制}
+
+链接脚本里常见 VMA 和 LMA。VMA 是代码运行时使用的地址，LMA 是镜像中加载的位置。已初始化全局变量的初值保存在 Flash 中，但运行时变量要位于 SRAM，所以启动代码要从 LMA 复制到 VMA。
+
+\begin{lstlisting}
+MEMORY {
+  FLASH (rx)  : ORIGIN = 0x08000000, LENGTH = 512K
+  SRAM  (rwx) : ORIGIN = 0x20000000, LENGTH = 128K
+}
+
+SECTIONS {
+  .text : { *(.text*) *(.rodata*) } > FLASH
+  .data : AT(ADDR(.text) + SIZEOF(.text)) {
+    __data_start = .;
+    *(.data*)
+    __data_end = .;
+  } > SRAM
+  __data_load = LOADADDR(.data);
+  .bss : {
+    __bss_start = .;
+    *(.bss*) *(COMMON)
+    __bss_end = .;
+  } > SRAM
+}
+\end{lstlisting}
+
+\begin{warningbox}
+若 \code{.data} 未复制，带初值的全局对象会从错误内容开始；若 \code{.bss} 未清零，锁、队列和指针的初始值不可预测。这个失败和大型 OS 的早期页表、per-CPU 区域未初始化一样，通常不会在第一条错误处崩溃，而是在后续随机位置表现出来——这正是启动 bug 最难定位的原因。
+\end{warningbox}
+
+\subsection{启动阶段的状态机}
+
+前面的步骤可以收束成启动状态机：
+
+\begin{lstlisting}
+Reset
+  -> MinimalStack
+  -> DataCopied
+  -> BssCleared
+  -> EarlyConsole
+  -> BootMemoryDiscovered
+  -> PageTablesReady
+  -> InterruptsReady
+  -> SchedulerReady
+  -> InitProcessStarted
+\end{lstlisting}
+
+每个阶段只能使用之前已经建立的能力。EarlyConsole 之前不能输出复杂日志；BootMemoryDiscovered 之前不能建立通用页分配；SchedulerReady 之前不能阻塞等待；InterruptsReady 之前不能依赖设备中断。
+
+\begin{pdfdiagram}
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s0) at (0,9) {Reset: 只有架构复位状态};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s1) at (0,8) {MinimalStack: 栈指针可用};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s2) at (0,7) {DataCopied / BssCleared: 全局变量可预测};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s3) at (0,6) {EarlyConsole: 失败有证据};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s4) at (0,5) {BootMemoryDiscovered: 知道哪些页可用};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s5) at (0,4) {PageTablesReady: 地址翻译可用};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s6) at (0,3) {InterruptsReady: 可依赖设备中断};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s7) at (0,2) {SchedulerReady: 可阻塞等待};
+  \node[draw, rounded corners, align=center, minimum width=7cm, minimum height=0.6cm] (s8) at (0,1) {InitProcessStarted: 第一个用户任务};
+
+  \draw[->, >=stealth, thick] (s0) -- (s1);
+  \draw[->, >=stealth, thick] (s1) -- (s2);
+  \draw[->, >=stealth, thick] (s2) -- (s3);
+  \draw[->, >=stealth, thick] (s3) -- (s4);
+  \draw[->, >=stealth, thick] (s4) -- (s5);
+  \draw[->, >=stealth, thick] (s5) -- (s6);
+  \draw[->, >=stealth, thick] (s6) -- (s7);
+  \draw[->, >=stealth, thick] (s7) -- (s8);
+\end{pdfdiagram}
+
+\diagramnote{启动是一条单向状态链。每个阶段只能使用之前已经建立的能力：栈可用之前不能调用普通 C 函数；全局变量初始化之前锁和队列不可预测；console 之前失败无证据；内存图之前不能分配页；页表之前地址翻译不可用；中断之前不能依赖设备事件；调度器之前不能阻塞。任何 early init 函数跨阶段使用未就绪能力，都会在小配置上巧合通过、在大配置上随机损坏。}
+
+\subsection{BSS 清零和 data 复制}
+
+\begin{lstlisting}
+boot_zero_bss():
+  p = __bss_start
+  while p < __bss_end:
+    *p = 0
+    p += word_size
+
+boot_copy_data():
+  src = __data_load_start
+  dst = __data_start
+  while dst < __data_end:
+    *dst++ = *src++
+\end{lstlisting}
+
+这两个循环是 \code{O(n)}，n 是段大小。它们必须在使用对应全局变量之前完成。若 BSS 没清零，全局队列、锁和指针会从随机值开始，后续 bug 很难定位。
+
+\subsection{早期 bump allocator}
+
+完整页分配器建立前，内核常用 bump allocator 分配早期对象。它只维护一个 next 指针，每次按对齐向上推进，不支持释放。
+
+\begin{lstlisting}
+early_alloc(size, align):
+  next = align_up(early_next, align)
+  end = next + size
+  if end > early_limit: panic()
+  early_next = end
+  return next
+\end{lstlisting}
+
+分配是 \code{O(1)}，实现极简单。代价是不能释放，且必须在切换到正式分配器后停止使用。它适合页表、启动参数副本、早期设备表等生命周期贯穿启动阶段的对象。
+
+\subsection{x86-64 模式演进：实模式、保护模式、长模式}
+
+x86-64 的历史兼容层让启动路径明显分阶段。复位后 CPU 从兼容模式开始，早期代码或固件/bootloader 需要逐步建立 GDT、打开保护机制、准备页表、启用 PAE 和长模式，最后跳到 64 位代码。现代 UEFI 固件和 bootloader 会替内核完成大量工作，但内核仍要理解进入时的 CPU 模式、页表、内存地图和调用约定。
+
+\begin{lstlisting}
+legacy shape:
+  reset vector
+  -> real mode firmware/bootloader
+  -> load kernel setup code / image + initrd
+  -> build provisional GDT and boot parameters
+  -> enter protected mode
+  -> build early page tables, enable PAE
+  -> enable long mode (EFER.LME)
+  -> jump to 64-bit kernel entry / start_kernel()
+\end{lstlisting}
+
+实模式只能直接访问有限地址空间，保护模式引入段和保护，长模式引入 64 位寄存器和分页模型。操作系统教材不需要把每条切换指令都背下来，但必须知道：64 位内核能运行，是因为早期代码已经设置好 GDT、控制寄存器、EFER.LME、页表和跳转序列。GDT 在长模式下不再像 32 位分段那样用于普通地址计算，但仍参与代码段、数据段、TSS、特权切换和系统调用入口设置；TSS 也不只是历史名词，x86-64 可用 IST 为 NMI、double fault 等关键异常提供专用栈，避免在当前栈损坏时继续崩溃。
+
+\subsection{BIOS、UEFI 和 bootloader 的职责边界}
+
+BIOS 风格启动和 UEFI 风格启动不同，但目标相同：把内核镜像和硬件描述交给内核。bootloader 不应替内核做所有工作，它只建立足够条件让内核接管。内核接管后，必须停止依赖大部分固件 Boot Services，改用自己的内存管理、驱动和中断。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+阶段 & 可依赖对象 & 退出后的边界 \\
+\midrule
+固件早期 & DRAM 初始化、平台基础设置 & 内核通常看不到细节，只接收结果 \\
+bootloader & 读取磁盘/网络、加载镜像、构造参数 & 不再参与普通运行时服务 \\
+UEFI Boot Services & 分配内存、访问协议、获取内存地图 & \code{ExitBootServices} 后不可再调用 \\
+内核 early boot & 启动参数、内存地图、早期 console & 必须校验并建立自己的对象 \\
+\bottomrule
+\end{longtable}
+
+\code{ExitBootServices} 是一个硬边界。退出前，固件仍可能拥有内存和设备；退出后，内核承担管理责任。若内核拿到内存地图后，固件又分配了内存，而内核没有重新获取地图，就可能把固件仍使用的页当成空闲页。
+
+两种风格的具体差异值得一提：BIOS 常从磁盘引导扇区开始，靠中断调用访问受限固件服务，内存地图来自 e820，图形走 VGA/vesa；UEFI 则以 EFI 应用或 EFI stub 为入口，提供标准化的 Boot/Runtime Services 和 \code{GetMemoryMap}，图形走 GOP framebuffer，并以 \code{ExitBootServices} 作为硬边界。无论哪种风格，内核接管的标志都是同一条：固件退出后，内核必须靠自己的驱动和内存管理独立运行。
+
+\section{内核初始化：从 kernel\_main 到第一个任务}
+
+\code{kernel\_main}（或 Linux 的 \code{start\_kernel}）被调用时，运行时环境刚刚勉强够用：栈、\code{.data}/\code{.bss}、early console 已经就绪，但调度器、完整中断、内存分配器和文件系统都还没有。本节追踪内核如何在这一起点之上，按依赖图把各子系统依次建立起来，直到第一个用户任务可以运行。
+
+\subsection{初始化依赖图}
+
+内核初始化不能只靠函数排列顺序。一个模块可能依赖 console，一个模块依赖内存分配器，一个模块依赖中断，一个模块必须在调度器启动前完成。把这些关系写成依赖图，才能解释为什么初始化常被分成 early、core、subsys、device、late 等阶段。
+
+\begin{lstlisting}
+init_node {
+  name: "page_allocator"
+  requires: ["boot_memory_map", "early_console"]
+  provides: ["alloc_pages"]
+}
+
+run_init_graph(nodes):
+  ready = nodes with all requirements satisfied
+  while ready not empty:
+    n = pop(ready)
+    run(n.init)
+    mark_provided(n.provides)
+    add newly unblocked nodes to ready
+  if unfinished nodes remain:
+    panic("init dependency cycle or missing provider")
+\end{lstlisting}
+
+\begin{keyidea}
+初始化依赖图的实质是拓扑排序，复杂度是 \code{O(V + E)}。它的工程价值不是算法本身，而是把“某函数必须先跑”从隐含的代码顺序变成可检查约束。若出现环，例如文件系统初始化依赖块设备、而块设备初始化又要从文件系统读取配置，就必须拆出更早的配置来源。可检查的依赖关系比“作者记得调用顺序”可靠得多。
+\end{keyidea}
+
+\subsection{启动参数与可信边界}
+
+bootloader 会把 UEFI 内存地图、命令行、initrd 和 ACPI 表交给内核。内核不能盲信这些数据，因为它们可能来自固件 bug、配置错误或攻击面。早期解析必须检查地址范围、长度、对齐和重叠。
+
+\begin{lstlisting}
+validate_memory_region(region):
+  require region.start aligned to PAGE_SIZE
+  require region.length > 0
+  require checked_add(region.start, region.length, &end)
+  require end <= physical_address_limit
+  require not overlaps(kernel_image)
+  require not overlaps(previous_accepted_regions)
+\end{lstlisting}
+
+若把内核镜像所在物理页误标为空闲，后续页分配器会把正在运行的内核代码分配给别人。启动阶段的错误通常不是立刻崩溃，而是在很久以后变成随机损坏，因此必须在早期就把内存地图打印和校验做好。
+
+\subsection{ACPI 和 PCI 配置空间：硬件不是凭空出现的}
+
+内核要知道“有哪些 CPU、哪些内存、哪些设备、设备寄存器在哪、用哪个 IRQ、挂在哪个 NUMA node、有哪些电源关系”。在本书的 x86-64 主线里，这部分信息主要来自 UEFI/ACPI、PCI/PCIe 配置空间和固件内存地图。它们都不是设备驱动本身，而是硬件描述入口。
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+描述来源 & x86-64 常见用途 & 描述内容 \\
+\midrule
+ACPI & PC、服务器 & CPU 拓扑、NUMA、PCI routing、电源、热管理、平台设备资源 \\
+PCI config & 可枚举 PCIe 设备 & vendor/device、BAR、MSI、能力链 \\
+UEFI memory map & 启动阶段内存交接 & RAM、保留区、runtime services、ACPI reclaim 区域 \\
+\bottomrule
+\end{longtable}
+
+驱动 probe 的输入很多来自这些描述。若 ACPI resource 或 PCI BAR 错，MMIO 映射到错误地址；若 IRQ routing 或 MSI-X 配置错，设备完成不会唤醒驱动；若 DMA mask 或 IOMMU domain 配置错，设备可能访问不到高地址内存。硬件描述错误会表现成软件 bug，所以启动阶段要尽早暴露和校验资源表。
+
+\subsection{从单核启动到多核启动}
+
+多核系统通常只有 bootstrap processor 先运行内核入口，其他 CPU 处于等待状态。主 CPU 建立全局页表、per-CPU 区域和调度数据后，再唤醒 application processors。每个 CPU 都需要自己的内核栈、当前任务指针、runqueue 和中断状态。
+
+\begin{lstlisting}
+boot_cpu_main():
+  setup_global_memory()
+  setup_percpu_area(boot_cpu)
+  for cpu in secondary_cpus:
+    allocate_cpu_stack(cpu)
+    send_startup_ipi(cpu, secondary_entry)
+  wait_until_all_online()
+  start_scheduler()
+
+secondary_entry(cpu):
+  load_kernel_page_table()
+  set_percpu_base(cpu)
+  init_local_interrupts()
+  mark_cpu_online(cpu)
+  idle_loop()
+\end{lstlisting}
+
+这里的不变量是：CPU online 之前不能被调度器选作迁移目标；per-CPU 数据初始化之前不能接收普通设备中断；所有 CPU 使用的内核文本映射必须一致。多核启动把“初始化顺序”从单线流程变成了并发协议。
+
+\subsection{per-CPU 数据为什么必须很早准备}
+
+多核 OS 不能让所有 CPU 频繁写同一批全局变量。每个 CPU 需要自己的当前任务指针、内核栈、runqueue、计数器、本地 timer 状态、抢占计数和中断统计。这些对象通常放在 per-CPU 区域，通过特殊基址寄存器或固定偏移快速访问。
+
+\begin{lstlisting}
+per_cpu_area[cpu]:
+  current_task
+  kernel_stack_top
+  runqueue
+  irq_count
+  preempt_count
+  local_timer_state
+\end{lstlisting}
+
+\begin{warningbox}
+secondary CPU 进入内核后，必须先设置自己的 per-CPU base，才能安全访问 \code{current} 这类隐式变量。否则 CPU1 可能误用 CPU0 的当前任务或 runqueue，造成调度和中断统计混乱。per-CPU 既是多核性能优化，也是正确性边界：在 base 设置完成前接收设备中断或被调度器选中，都会让一个 CPU 误操作另一个 CPU 的私有状态。
+\end{warningbox}
+
+\subsection{Linux start\_kernel 调用序列}
+
+Linux 的 \code{start\_kernel} 是阅读大型内核初始化的主干。它不是所有细节的开始，但它把架构初始化、内存、调度、RCU、中断、定时器、VFS、proc、driver model、init 进程串起来。
+
+\begin{lstlisting}
+start_kernel()
+  setup_arch()
+  setup_command_line()
+  mm_init()
+  sched_init()
+  radix_tree_init()
+  trap_init()
+  init_IRQ()
+  tick_init()
+  rcu_init()
+  vfs_caches_init()
+  rest_init()
+\end{lstlisting}
+
+不同版本顺序会变化，读源码时应抓依赖：\code{setup\_arch} 解析固件和内存；\code{mm\_init} 建立内存分配基础；\code{sched\_init} 建立 runqueue；\code{trap\_init/init\_IRQ} 建立入口和中断；\code{rest\_init} 创建 kernel thread 和第一个用户态 init 的路径。
+
+\subsection{initcall 机制}
+
+驱动和子系统不能全都手写进一个巨大初始化函数。Linux 用 initcall 等级把初始化函数放入特殊段，启动时按等级依次调用。常见等级包括 early、core、postcore、arch、subsys、fs、device、late。
+
+\begin{lstlisting}
+early_initcall(foo_early);
+core_initcall(mm_subsystem);
+subsys_initcall(bus_subsystem);
+fs_initcall(vfs_feature);
+device_initcall(driver_init);
+late_initcall(debug_late);
+\end{lstlisting}
+
+initcall 的实质是链接脚本和函数指针数组。它让模块能声明“我属于哪个初始化阶段”，但不能自动解决所有依赖。若一个 device initcall 假设某总线已注册，而总线初始化等级写错，启动会出现只在特定配置下复现的失败。
+
+\subsection{多核启动和 CPU hotplug}
+
+bootstrap processor 先运行全局初始化，然后通过 IPI 或固件接口唤醒 application processors。每个 CPU 上线前要设置 per-CPU base、内核栈、本地 APIC、idle task 和 runqueue。CPU hotplug 则要求运行中 CPU 可下线和上线，所以初始化/清理路径必须可重复、可回滚。
+
+\begin{lstlisting}
+bringup_cpu(cpu):
+  allocate_idle_task(cpu)
+  allocate_percpu_area(cpu)
+  send_startup_ipi(cpu)
+  wait cpu reports online
+  add cpu to scheduler domains
+  enable interrupts on cpu
+\end{lstlisting}
+
+失败案例：CPU 已经标记 online 但本地 timer 未初始化，调度器可能把任务迁过去后无法抢占；CPU 下线时未迁走 timer 或 workqueue，后续事件投递到离线 CPU。多核启动不是“让其他核心开始跑”，而是把每个 CPU 纳入调度、中断和时间子系统的一致状态。
+
+\section{源码级补充：MCU 启动、UART 与中断路径}
+
+读真实代码时，先把一条最短路径追通，比试图一次理解整个框架更有效。本节给出从 MCU 启动文件到 Linux 中断路径的若干阅读入口。
+
+\subsection{GPIO 和 UART 寄存器}
+
+裸机驱动的核心是 MMIO。GPIO 通常有模式寄存器、输出数据寄存器、输入数据寄存器；UART 通常有状态寄存器、数据寄存器、波特率 divisor、控制寄存器。真实芯片位名不同，但结构类似。
+
+\begin{lstlisting}
+#define UART_SR   (UART_BASE + 0x00)
+#define UART_DR   (UART_BASE + 0x04)
+#define UART_BRR  (UART_BASE + 0x08)
+#define UART_CR   (UART_BASE + 0x0c)
+#define UART_TXE  (1u << 7)
+#define UART_RXNE (1u << 5)
+
+void uart_putc(char c) {
+  uint32_t deadline = ticks + 10;
+  while (!(read32(UART_SR) & UART_TXE)) {
+    if (time_after(ticks, deadline)) {
+      uart_errors.timeout++;
+      return;
+    }
+  }
+  write32(UART_DR, c);
+}
+\end{lstlisting}
+
+这里的超时是工程边界。没有超时的驱动把硬件故障扩大成系统停顿。大型内核中的块设备超时、网络设备 reset、watchdog 都是同一思想：设备是异步状态机，不是可靠函数。
+
+\subsection{x86 异常入口保存了什么}
+
+x86-64 的中断和异常入口由 IDT 描述。CPU 根据 vector 找到 gate，切换特权级时切到内核栈，硬件压入返回所需状态。某些异常还会压入 error code。汇编入口随后保存通用寄存器，形成内核能理解的寄存器帧。
+
+\begin{lstlisting}
+struct TrapFrame {
+  // software-saved general registers
+  u64 r15, r14, r13, r12, r11, r10, r9, r8;
+  u64 rdi, rsi, rbp, rbx, rdx, rcx, rax;
+
+  // hardware-saved frame
+  u64 vector;
+  u64 error_code;
+  u64 rip;
+  u64 cs;
+  u64 rflags;
+  u64 rsp;
+  u64 ss;
+};
+\end{lstlisting}
+
+真实布局会因入口类型和内核版本变化，但读源码时要抓住语义：\code{rip/cs/rflags/rsp/ss} 决定如何返回；error code 帮助 page fault 和保护异常分类；通用寄存器保存系统调用参数和被打断计算状态。
+
+\subsection{IDT、APIC、IOAPIC 和 MSI 的投递路径}
+
+IDT 是 CPU 本地表；APIC/IOAPIC/MSI 解决“设备事件如何送到哪个 CPU 的哪个 vector”。传统外设中断可经 IOAPIC 重定向到本地 APIC；PCIe 设备常用 MSI/MSI-X，通过一次内存写消息触发中断。多核重调度和 TLB shootdown 使用 IPI，由一个 CPU 通过本地 APIC 向另一个 CPU 投递。完整的投递路径见本节前面的 pdfdiagram，这里只补充性能要点。
+
+中断亲和性影响性能。网卡 RX 队列中断若全部打到 CPU0，CPU0 会成为瓶颈；把队列中断分散到处理对应网络栈的 CPU，可以减少跨核 cache line 迁移。但过度分散也会让连接状态在 CPU 间跳动。真实系统因此有 irq affinity、RSS/RPS/XPS 等策略。
+
+\subsection{Linux 中断路径阅读点}
+
+读 Linux 中断路径可以从这些位置开始：
+
+\begin{itemize}
+\tightlist
+\item \filepath{arch/x86/kernel/idt.c}：IDT gate 初始化。
+\item \filepath{arch/x86/entry/entry\_64.S}：低级入口、寄存器保存、返回路径。
+\item \filepath{kernel/irq/handle.c}：通用 IRQ 分发。
+\item \filepath{kernel/irq/manage.c}：\code{request\_irq}、\code{request\_threaded\_irq}。
+\item \filepath{kernel/time/timer.c}、\filepath{kernel/time/hrtimer.c}：低精度 timer wheel 与 hrtimer。
+\end{itemize}
+
+阅读时不要只看 handler 函数。要同时看谁注册 handler、handler 运行在哪种上下文、是否允许睡眠、谁发送 EOI、错误返回如何统计、设备移除时如何注销并等待 in-flight handler 完成。
+
+\subsection{四种下半部机制}
+
+\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\toprule
+机制 & 特点 & 适用场景 \\
+\midrule
+softirq & 固定类型，常用于网络和块层，高并发 & 极热路径，要求不能随意睡眠 \\
+tasklet & 基于 softirq 的延后执行，同一 tasklet 串行 & 旧驱动常见，新代码逐步少用 \\
+workqueue & 在内核线程中执行，可睡眠 & 需要分配内存、拿 mutex、访问慢设备 \\
+threaded IRQ & 把 IRQ handler 线程化 & 降低硬中断时间，适合较复杂设备处理 \\
+\bottomrule
+\end{longtable}
+
+选择机制的核心问题是上下文：是否需要睡眠，是否要高吞吐，是否允许同一事件并行，是否要限制 CPU 占用。把会睡眠的代码放进 hard IRQ 或 softirq，是典型内核 bug。
+
+\subsection{hrtimer、timer wheel 与 tickless}
+
+低精度超时适合 timer wheel，例如 TCP 重传、普通超时、周期任务；高精度计时适合 hrtimer，例如纳秒级睡眠、音视频定时、精确 profiler。tickless 则在 CPU 空闲或单任务运行时减少周期 tick，降低功耗和噪声。
+
+\begin{lstlisting}
+timer wheel:
+  cheap insertion, coarse granularity, many ordinary timeouts
+
+hrtimer:
+  ordered by expiry in high-resolution time, higher overhead, precise wakeup
+
+tickless:
+  program next hardware timer to nearest event instead of fixed periodic tick
+\end{lstlisting}
+
+tickless 不表示没有时间。它表示内核不再无条件固定频率打断 CPU，而是计算下一个必要事件并设置硬件定时器。调度统计、RCU、负载均衡和超时都要适配这种模式。
+
+\subsection{真实代码阅读入口}
+
+读真实 MCU 代码时，建议按下面顺序找：启动汇编或 startup 文件（向量表、reset handler、栈顶符号）、链接脚本（Flash/SRAM 区域、\code{.text/.data/.bss}、堆栈布局）、HAL 或裸驱动（UART/GPIO/TIMER 寄存器定义和初始化序列）、中断文件（IRQ handler 如何清中断、入队、唤醒主循环）、示例 main（是否有阻塞等待、超时、错误计数）。x86-64 教学内核则可从 \filepath{boot/entry\_64.S}、\filepath{kernel/head64.c}、\filepath{linker.ld}、\filepath{drivers/early\_uart.c} 入手——不要先读完整驱动框架，先把 UEFI/bootloader 交接到第一个字符输出的路径追通。
+
+\section{实践}
+
+本章实践需要三组动手实验，覆盖裸机、中断和启动三个层面。
+
+第一组是裸机实验，不需要复杂环境。拿任意一个单片机或模拟器，写三版程序：
+
+\begin{enumerate}
+\tightlist
+\item 超级循环：固定顺序调用四个任务。
+\item 周期任务表：每个任务有 period 和 next release。
+\item 非阻塞状态机：把串口发送或传感器读取改成 step 函数。
+\end{enumerate}
+
+报告要记录每个任务最长运行时间、周期、deadline、是否可能阻塞、是否访问共享状态。对于每个任务，写出下面的表：
+
+\begin{longtable}{p{0.2\linewidth}p{0.66\linewidth}}
+\toprule
+字段 & 内容 \\
+\midrule
+输入 & 读取哪些寄存器、队列或全局状态 \\
+输出 & 写哪些寄存器、队列或全局状态 \\
+时间预算 & 最坏执行时间和周期 \\
+等待点 & 是否忙等硬件、锁或缓冲区 \\
+失败 & 超时、溢出、校验失败、设备错误 \\
+\bottomrule
+\end{longtable}
+
+第二组是中断与定时器实验。建议写一个事件日志：每次进入中断、退出中断、唤醒任务、设置 need\_reschedule，都记录 tick、事件类型和当前任务。然后用日志回答：哪个事件打断了谁，哪个任务被唤醒，什么时候真正运行。
+
+\begin{lstlisting}
+tick=100 enter timer_isr current=control
+tick=100 wake task=telemetry reason=period
+tick=100 set need_reschedule
+tick=100 exit timer_isr current=control
+tick=100 switch control -> telemetry
+\end{lstlisting}
+
+同时实现两个定时器队列版本：全表扫描和最小堆。比较 n 从 10 到 100000 时，每个 tick 的处理成本。这个实验能说明为什么 OS 算法不能只看功能正确，还要看事件规模。
+
+第三组是启动实验。先写一个启动依赖表：
+
+\begin{longtable}{p{0.24\linewidth}p{0.32\linewidth}p{0.32\linewidth}}
+\toprule
+阶段 & 可用能力 & 禁止事项 \\
+\midrule
+Reset & 寄存器、固定入口 & 使用全局变量假设已初始化 \\
+MinimalStack & 栈、少量汇编 & 调用复杂 C 运行库 \\
+BssCleared & 零初始化全局变量 & 动态分配内存 \\
+EarlyConsole & 最小输出 & 格式化复杂日志、大缓冲 \\
+BootMemory & 物理内存范围 & 使用完整虚拟内存假设 \\
+PageTables & 基础地址翻译 & 访问未映射设备 \\
+Scheduler & 任务切换 & 在早期 init 中遗留永久锁 \\
+\bottomrule
+\end{longtable}
+
+然后画出内核镜像布局：text、rodata、data、bss、boot stack、page tables、free memory。只要能解释“内核自己占了哪些页，哪些页可以交给分配器”，后续物理页管理才有根。
+
+\section{测试}
+
+本章覆盖三个层面的最低测试清单。
+
+裸机层面的测试不是“灯会闪”，而是证明调度和状态机边界：
+
+\begin{itemize}
+\tightlist
+\item 任一任务执行一次后必须返回主循环。
+\item 周期任务的 \code{next\_release\_ms} 单调前进，不因时间溢出立刻失控。
+\item 串口发送缓冲区满时，提交失败或施加背压，而不是覆盖旧数据。
+\item 非阻塞状态机在硬件未 ready 时不改变发送进度。
+\item 任一任务超时应被计数或记录，不能静默拖慢全系统。
+\end{itemize}
+
+中断与定时器层面的测试：
+
+\begin{itemize}
+\tightlist
+\item 中断处理函数只做短路径工作，不调用可能阻塞的函数。
+\item 环形队列在主循环和 ISR 同时访问时不破坏 head/tail/size。
+\item 定时器 tick 单调增加，超时任务只被唤醒一次。
+\item 时间片用尽后设置 reschedule 标志，不能在任意位置破坏当前上下文。
+\item 上下文切换后，任务能从被切走的位置继续执行。
+\item 异常路径能区分可修复缺页、权限错误和不可恢复错误。
+\end{itemize}
+
+启动与内核初始化层面的测试：
+
+\begin{itemize}
+\tightlist
+\item 链接脚本导出的段边界单调递增且按页对齐。
+\item BSS 清零后，全局计数器、指针和队列初值可预测。
+\item 早期分配器返回地址满足对齐，且不会覆盖内核镜像。
+\item 未初始化 console 前，日志路径不会访问空设备。
+\item 调度器 ready 前，任何初始化函数都不能睡眠。
+\item 页表 ready 后，text 只读可执行，data/bss 可写不可执行。
+\end{itemize}
+
+\begin{keyidea}
+本章的验收结论是一条贯穿三个层面的不变量：操作系统不是凭空出现的。裸机程序里出现多个活动、共享资源、等待硬件、错误恢复和时间预算时，就已经需要 OS 式的状态管理；中断和定时器让系统获得外部事件和抢占能力，但也迫使我们认真处理共享状态、上下文保存和入口权限；启动和内核初始化则把“硬件按固定规则跳到一段受信任代码”落实成可解释的阶段链。能从第一条指令解释到第一个用户任务启动，中间每一阶段可用能力和禁止事项都清楚，本章才算过关。
+\end{keyidea}

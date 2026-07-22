@@ -14,25 +14,26 @@ MAIN = ROOT / "main.tex"
 INPUT_RE = re.compile(r"\\input(?:topic|detail)?\{([^}]+)\}")
 CHAPTER_INPUT_RE = re.compile(r"^\\input\{chapters/([^}]+)\}", re.MULTILINE)
 
-EXPECTED_CHAPTERS = 13
-# Only these files may be included as numbered chapters. Extra hardware,
-# source-reading, and lab material must be wired through \inputdetail so the
-# printed book stays at 13 chapters instead of drifting back to a 20+ chapter
-# outline.
+EXPECTED_CHAPTERS = 17
+# Restructured from boot to runtime: power-on → process → memory → I/O → security.
 EXPECTED_CHAPTER_INPUTS = (
+    "ch01-boot-kernel-init",
+    "ch02-hardware-kernel-contracts",
     "ch01-os-map-and-contracts",
-    "ch00-hardware-foundations",
-    "ch00-machine-contracts",
     "ch05-process-thread-scheduling",
     "ch09-system-calls-permissions",
     "ch10-exec-elf-loader",
+    "ch07-synchronization-ipc-locks",
     "ch11-virtual-memory",
     "ch12-mmap-page-cache",
+    "ch10-kernel-memory-allocators",
     "ch14-device-drivers-dma",
-    "ch16-files-devices-io",
+    "ch12-block-io-files",
     "ch17b-filesystem-from-scratch",
     "ch18-socket-network-entry",
     "ch20-security-isolation",
+    "ch16-persistence-recovery",
+    "ch17-panic-observability",
 )
 
 
