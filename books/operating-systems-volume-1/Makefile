@@ -8,7 +8,8 @@ LISTING_SOURCES := \
 	$(LATEX_SOURCE_DIR)/listings/stage_one_hardware_model.cpp \
 	$(LATEX_SOURCE_DIR)/listings/x86_64_stage_one_model.cpp \
 	$(LATEX_SOURCE_DIR)/listings/x86_64_page_fault_cow_model.cpp \
-	$(LATEX_SOURCE_DIR)/listings/os_reference_implementation.cpp
+	$(LATEX_SOURCE_DIR)/listings/os_reference_implementation.cpp \
+	$(LATEX_SOURCE_DIR)/listings/minifs_lab.cpp
 
 .PHONY: check test pdf phone-export clean
 

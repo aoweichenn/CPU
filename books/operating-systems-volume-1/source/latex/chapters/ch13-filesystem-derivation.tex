@@ -1,0 +1,311 @@
+\section{从一个块开始：让问题逐个逼出文件系统概念}
+
+这一节故意不从 inode、超级块或 VFS 开始。直接给出这些名词，读者只能背定义，
+却不知道它们为什么存在。我们只先接受一个事实：掉电后还想保留的数据，必须
+最终进入某种非易失存储设备；操作系统把这类设备先抽象成一串可编号的块。
+
+这里的\emph{块（block）}是一次寻址和管理所使用的固定大小区间。假设块大小为
+4096 字节，那么块 7 表示从设备字节偏移 $7\times4096$ 开始的 4096 字节。
+选择固定大小不是为了让文件也固定大小，而是为了让“第几块”可以用一个整数表示，
+让分配、缓存、校验和 I/O 请求都有明确边界。设备逻辑块、文件系统块和内存页
+可能大小不同；本节统一取 4096 字节，只是为了让推导可以手算。
+
+\begin{keyidea}
+块只回答两个问题：\textbf{位置在哪里、一次管理多少字节}。它还没有回答
+“这些字节属于谁”“有效长度是多少”“叫什么名字”“重启后从哪里开始找”。
+文件系统中的其他概念，都是为了补上这些缺失的信息。
+\end{keyidea}
+
+\subsection{第一步：一个块为什么还不能叫文件}
+
+假设设备现在只有一个 4096 字节块，我们把字符串 \code{"hello"} 写在块首部。
+重启后读出这个块，会立刻遇到三个问题：
+
+\begin{enumerate}\tightlist
+\item 有效内容究竟是 5 字节，还是后面的零也属于内容？
+\item 这 5 字节是文本、目录、图片，还是某个程序的内部状态？
+\item 如果写到一半掉电，怎样判断块里的内容能不能信任？
+\end{enumerate}
+
+因此，只有数据字节还不够。系统还需要一些\emph{描述数据的数据}，例如类型、
+有效长度和校验信息。描述其他数据的数据叫作\emph{元数据（metadata）}。
+“元”不是神秘的新介质；它仍然是普通字节，只是解释角色不同。
+
+最小记录可以先写成：
+
+\begin{lstlisting}
++----------+----------+----------------------+------------------+
+| type     | length   | payload              | unused           |
+| 1 byte   | 4 bytes  | length bytes         | rest of block    |
++----------+----------+----------------------+------------------+
+\end{lstlisting}
+
+有了 \code{length=5}，重启后才知道只应返回 \code{"hello"}。这一步得到的
+不是完整文件系统，只是一个“带边界的持久记录”。
+
+\subsection{第二步：第二个文件逼出身份和分配问题}
+
+现在要同时保存 \code{a.txt} 和 \code{b.txt}。若程序各自随便挑一个块，
+两个程序可能都选择块 20，后写者会覆盖先写者。因此必须有一个全局规则回答：
+
+\begin{quote}
+哪些块已经属于某个对象，哪些块仍可分配？
+\end{quote}
+
+最直接的办法是为每个块保存一位。位只有 0 和 1：0 表示空闲，1 表示已占用。
+把这些位按块号排列，就得到\emph{块位图（block bitmap）}。例如：
+
+\begin{lstlisting}
+block number:  0 1 2 3 4 5 6 7 8 9 ...
+bitmap bit:    1 1 1 1 0 0 1 0 0 0 ...
+
+解释：块 0--3 和块 6 已被占用；下一次分配可以从值为 0 的位置中选择。
+\end{lstlisting}
+
+位图解决的是\emph{空间所有权冲突}，不是文件内容定位。看到“块 6 已用”，
+仍不知道它属于哪个文件，也不知道文件有多长。
+
+接着考虑一个 9000 字节文件。一个 4096 字节块放不下它，至少需要三个块；
+这三个块还可能是 20、21、90，并不连续。系统于是需要为每个文件保存一份记录：
+
+\begin{itemize}\tightlist
+\item 文件的类型和权限；
+\item 文件的精确字节长度；
+\item 文件内容所在的块号，或能找到这些块的索引；
+\item 链接计数、时间戳等生命周期信息。
+\end{itemize}
+
+这份“每个文件一份、描述文件但不保存文件名”的持久记录，就是
+\emph{inode（index node，索引节点）}。这个名字强调它首先是一个索引入口：
+给定 inode，就能找到该文件的数据块和元数据。
+
+\begin{warningbox}
+inode 不是文件内容，也不是文件名，更不是进程里的 fd。inode 是文件系统内部
+对一个持久对象的身份记录。文件数据可以搬到别的块，名字也可以改变，但只要
+对象仍是同一个对象，它的 inode 身份就可以保持不变。
+\end{warningbox}
+
+多个 inode 也需要分配和回收，所以还需要\emph{inode 位图}。块位图回答
+“哪些数据块空闲”，inode 位图回答“哪些 inode 编号空闲”。两张位图管理的是
+不同资源，不能合并成一张含义模糊的表。
+
+\subsection{第三步：文件名为什么不直接塞进 inode}
+
+用户希望通过 \code{/notes/today.txt} 找文件，而不是记住 inode 37。
+因此必须有一种持久映射，把一个名字转换成 inode 编号：
+
+\begin{lstlisting}
+"today.txt"  -> inode 37
+"todo.txt"   -> inode 52
+\end{lstlisting}
+
+保存这种映射的对象叫\emph{目录（directory）}；映射中的一项叫
+\emph{目录项（directory entry，简称 dirent）}。目录不是磁盘之外的特殊容器，
+它本身也是一种文件：普通文件的数据是用户字节，目录文件的数据是一组
+“名字 $\rightarrow$ inode 编号”记录。
+
+文件名不直接放在 inode 中有三个直接收益：
+
+\begin{enumerate}\tightlist
+\item 同一个 inode 可以被多个目录项引用，这就是硬链接；
+\item 改名主要修改目录项，不必搬动文件内容；
+\item inode 表可以保持固定大小记录，目录项则按名字长度独立组织。
+\end{enumerate}
+
+这里也解释了为什么删除名字不一定立刻删除数据。\code{unlink} 删除的是一个
+目录项，并把 inode 的链接计数减一；只有链接计数已经为零，并且也没有进程
+继续打开该文件时，inode 和数据块才真正具备回收条件。
+
+\subsection{第四步：目录树从哪里开始，逼出根目录}
+
+目录项能够从名字找到 inode，但路径解析必须先有起点。解析
+\code{/notes/today.txt} 时，系统需要先找到 \code{/}，再在其中查
+\code{notes}，最后在 \code{notes} 目录中查 \code{today.txt}。
+
+这个固定起点叫\emph{根目录（root directory）}。根目录仍然有自己的 inode；
+“根”只表示路径解析从它开始，并不表示它采用另一种磁盘格式。因此文件系统必须
+在某个全局位置记住根目录 inode 编号。
+
+\subsection{第五步：重启后的第一个块怎么找，逼出超级块}
+
+现在磁盘上已经有 inode 位图、块位图、inode 表、目录数据和普通文件数据。
+但机器重启后，内存中的所有指针都消失了。挂载程序面对的仍只是一串块：
+
+\begin{quote}
+块有多大？共有多少块？inode 表从哪一块开始？根目录 inode 是多少？
+这个设备上的字节甚至是不是我们认识的文件系统？
+\end{quote}
+
+这些问题不能再通过 inode 回答，因为此时连 inode 表在哪里都不知道。必须规定
+一个预先约定的位置，放置足以解释整个文件系统布局的全局元数据。这个入口记录
+叫\emph{超级块（superblock）}。
+
+“超级”表示它描述的是整个文件系统，而 inode 只描述单个文件。超级块至少需要：
+
+\begin{itemize}\tightlist
+\item magic：用于拒绝把随机字节误认成这种文件系统；
+\item version：说明磁盘格式版本，避免用错误规则解释旧数据；
+\item block size 和 block count：确定块的粒度和合法范围；
+\item inode count：确定合法 inode 编号范围；
+\item inode/块位图以及 inode 表的位置；
+\item data start：数据区从哪里开始；
+\item root inode：路径解析的固定起点。
+\end{itemize}
+
+magic 不是安全校验，也不能证明数据没有损坏；它只是格式身份标记。version 也不是
+程序版本号，而是\emph{磁盘格式}版本。真正的损坏检测还需要字段范围检查、校验和、
+副本或日志，这些机制后面再引入。
+
+\begin{pdfdiagram}
+  \node[os title] at (0,4.6) {挂载时的引导链：每一步只使用上一步刚获得的信息};
+  \node[os control, minimum width=8.8cm] (dev) at (0,3.7) {已知事实：设备可按块号读取，超级块位于约定位置};
+  \node[os memory, minimum width=8.8cm] (sb) at (0,2.6) {读超级块：验证 magic/version/范围，得到各区域位置};
+  \node[os compute, minimum width=8.8cm] (itable) at (0,1.5) {按 root inode 计算 inode 表中的字节位置，读根 inode};
+  \node[os state, minimum width=8.8cm] (root) at (0,0.4) {按根 inode 的块映射读取根目录项};
+  \node[os small block, minimum width=8.8cm] (path) at (0,-0.7) {从根目录开始逐段解析路径，最终找到目标 inode};
+  \draw[os strong bus] (dev) -- (sb);
+  \draw[os strong bus] (sb) -- (itable);
+  \draw[os strong bus] (itable) -- (root);
+  \draw[os strong bus] (root) -- (path);
+\end{pdfdiagram}
+\diagramnote{这条链证明超级块的必要性：若没有一个位置固定、格式可验证的全局入口，重启后的系统就无法知道 inode 表和根目录在哪里，后续所有名字和文件都无从查找。}
+
+\subsection{六个概念各自只解决一个核心问题}
+
+\begin{longtable}{L{0.16\linewidth}L{0.30\linewidth}L{0.22\linewidth}L{0.24\linewidth}}
+\toprule
+\textbf{概念} & \textbf{没有它时首先坏在哪里} & \textbf{它保存什么} & \textbf{它不负责什么} \\
+\midrule
+块 & 无法用整数表达稳定位置和管理粒度 & 固定大小的字节区间 & 不表达文件身份和名字 \\
+块位图 & 两个对象可能分到同一块 & 每个块是否已分配 & 不说明块属于哪个文件 \\
+inode & 文件变长或不连续后，无处保存块映射 & 单个文件的身份、长度、类型和块映射 & 通常不保存文件名 \\
+inode 位图 & 无法判断哪个 inode 编号可以复用 & inode 编号的分配状态 & 不保存 inode 正文 \\
+目录项 & 用户只能记 inode 编号，无法使用路径 & 名字到 inode 编号的映射 & 不保存普通文件内容 \\
+超级块 & 重启后不知道怎样解释磁盘布局 & 全局格式、区域位置和根 inode & 不保存每个文件的全部元数据 \\
+\bottomrule
+\end{longtable}
+
+这张表也是后续阅读的约束：每当出现一个新字段或新对象，都必须指出它在解决哪一个
+此前无法解决的问题。如果只是给出名词而没有失败场景，就还没有完成解释。
+
+\subsection{一个最小磁盘布局怎样闭环}
+
+教学文件系统 MiniFS-Lab 使用 64 个块，每块 4096 字节，总容量 256 KiB。
+它只为了暴露机制，不追求容量和性能：
+
+\begin{lstlisting}
+block 0      superblock：全局格式与区域位置
+block 1      inode bitmap：哪些 inode 编号已分配
+block 2      block bitmap：哪些块已分配
+block 3--6   inode table：32 个固定大小 inode
+block 7      root directory data：根目录的目录项
+block 8--62  ordinary data blocks
+block 63     reserved：后续日志实验使用
+\end{lstlisting}
+
+为什么把超级块放在块 0？不是因为所有真实文件系统都必须如此，而是教学格式做了
+这个约定，使 mount 知道第一步读哪里。真实文件系统可能预留引导区、在固定偏移放
+超级块并保存备份；关键不在具体块号，而在“入口位置必须由格式事先约定”。
+
+为什么 inode 表使用固定大小记录？因为给定 inode 编号 $i$ 后，可以直接计算：
+
+\[
+\text{byte offset}=\text{inode table start}+i\times\text{inode size}.
+\]
+
+这让读取 inode 不必先扫描所有旧 inode。代价是每个 inode 能内联保存的字段有限；
+更大的可变信息需要放到其他块中。
+
+为什么根目录先占用块 7？因为格式化完成后必须立刻存在一个路径起点。mkfs 会同时：
+
+\begin{enumerate}\tightlist
+\item 写超级块；
+\item 在 inode 位图中标记根 inode 已用；
+\item 在块位图中标记元数据块和块 7 已用；
+\item 初始化根 inode，使它指向块 7；
+\item 在块 7 写入 \code{"."} 和 \code{".."} 目录项。
+\end{enumerate}
+
+如果只写超级块而不初始化根 inode，文件系统虽然“能识别”，却没有路径起点；
+如果初始化根 inode但忘记标记块位图，后续分配器可能把根目录块再次分给普通文件。
+这说明 mkfs 不是打印一个 magic，而是在磁盘上建立一组互相一致的不变量。
+
+\subsection{第一次创建文件：每个对象为什么都必须参与}
+
+现在执行 \code{create("/hello", "abc")}。暂不考虑崩溃，最小正确顺序如下：
+
+\begin{enumerate}\tightlist
+\item 从超级块得到 root inode 编号和各区域位置；否则不知道去哪里解析路径。
+\item 读取根 inode，再读取根目录块，确认名字 \code{hello} 尚不存在；否则会无意覆盖已有名字。
+\item 扫描 inode 位图，选择一个空闲 inode 并标记已用；否则新文件没有稳定身份。
+\item 扫描块位图，选择一个空闲数据块并标记已用；否则文件没有独占存储空间。
+\item 初始化新 inode：类型为普通文件，长度为 3，数据块指向刚分配的块；否则读路径无法解释数据。
+\item 把 \code{abc} 写入数据块；这是用户真正要求保存的内容。
+\item 在根目录中加入 \code{"hello" -> new inode}；否则文件存在但没有路径可达。
+\end{enumerate}
+
+这里故意把“为什么”写进每一步。创建文件不是“写一份 inode”这么简单，而是同时修改
+两张分配表、一个 inode、一个目录和一个数据块。也正因为一次逻辑操作对应多次块写，
+掉电可能留下半完成状态；日志和 copy-on-write 将在后文由这个具体失败自然引出。
+
+\begin{warningbox}
+在学习文件系统时，必须始终区分三类关系：\textbf{位图说明资源是否被占用，
+inode 说明文件数据在哪里，目录项说明什么名字能找到该 inode}。三者任何两个一致、
+第三个不一致，都可能造成块重复分配、空间泄漏、悬空名字或不可达 inode。
+\end{warningbox}
+
+\subsection{磁盘记录与内存对象不是同一个东西}
+
+磁盘 inode 是固定格式的持久字节；内核中的 \code{struct inode} 是运行时对象，
+除了从磁盘读出的字段，还包含锁、引用计数、page cache 入口和操作表。磁盘目录项是
+持久的名字映射；内存 dentry 是路径查找缓存。超级块也同时有磁盘格式和内存实例。
+
+这样区分的原因是：磁盘格式必须跨重启稳定，不能随编译器结构体布局变化；内存对象
+只服务当前运行，可以包含指针、锁和缓存。把 C++ 结构体直接 \code{memcpy} 到磁盘，
+会受到字节序、对齐、填充和版本变化影响。MiniFS-Lab 因此使用显式的定宽整数编码，
+并在 mount 时逐字段验证范围。
+
+至此，超级块、inode、目录项和位图都不是凭空给出的名词，而是一条完整推导链：
+
+\begin{lstlisting}
+固定位置需求 -> block
+多个对象不能冲突 -> allocation bitmap
+变长、非连续文件需要身份和块映射 -> inode
+人需要用名字寻找对象 -> directory entry
+路径解析需要固定起点 -> root inode
+重启后需要知道整个布局 -> superblock
+多块更新可能只完成一半 -> journal / copy-on-write（后文）
+\end{lstlisting}
+
+后续各节会对这些概念做第二遍深化：先看真实 I/O 怎样把块送到设备，再看 ext4
+inode、extent、目录索引、page cache 和日志怎样把同一组问题扩展到现代系统。
+
+\subsection{可运行证据：MiniFS-Lab 不是纸上结构图}
+
+完整参考实现位于
+\filepath{source/latex/listings/minifs\_lab.cpp}，并由本书 \code{make check}
+自动编译运行。它没有把 C++ 结构体直接复制到磁盘，而是逐字段写入小端定宽整数；
+这样读者可以把每一个磁盘字节与本节格式表对应起来。
+
+实现包含三组验收：
+
+\begin{enumerate}\tightlist
+\item \textbf{格式化与重挂载}：mkfs 写入超级块、两张位图、根 inode 和根目录项；
+  mount 丢弃所有旧内存对象，只凭磁盘字节重新找到 \code{/hello}。
+\item \textbf{删除与资源回收}：unlink 同时移除目录项、清 inode 位和块位，随后
+  audit 验证“可达对象、位图、inode 块映射”三者一致。
+\item \textbf{掉电注入}：create 已经分配 inode 和数据块、也写好了内容，但在发布
+  目录项之前模拟掉电。重挂载后名字不存在，audit 却会发现一个不可达 inode 和一个
+  无可达所有者的已分配块；修复器扫描可达关系后才能回收它们。
+\end{enumerate}
+
+\begin{lstlisting}
+$ make -C books/operating-systems-volume-1 check
+CXX source/latex/listings/minifs_lab.cpp
+MiniFS-Lab checks passed
+\end{lstlisting}
+
+这个失败实验正是后文引入日志的理由。若 create 的多次块写没有事务边界，mount
+只能看到“磁盘现在是什么样”，无法知道半完成操作原本想做什么；fsck 可以扫描并
+修补结构，却不一定能恢复用户原本想发布的名字和内容。日志增加的不是另一个名词，
+而是可判定的提交证据：恢复程序据此区分“应当重放的完整事务”和“应当丢弃的半成品”。

@@ -1,18 +1,22 @@
 \chapter{文件系统：从磁盘字节到现代设计}
 
+\input{chapters/ch13-filesystem-derivation}
+
 %% 文件系统：从磁盘字节到现代设计
 %% Sections 1--4
 
 %%% ================================================================
-%%% Section 1: 为什么需要文件系统
+%%% Section 1: 从概念模型回到真实块设备
 %%% ================================================================
 
-\section{为什么需要文件系统}
+\section{从概念模型回到真实块设备}
 
-\subsection{裸磁盘模型}
+\subsection{教学块号与设备 I/O 的边界}
 
-在我们引入文件系统之前，先回到最底层：一块磁盘（无论是机械硬盘 HDD
-还是固态硬盘 SSD）对 CPU 而言是什么？
+上一节从“一个块”推导出了位图、inode、目录项和超级块。那一遍有意把设备
+简化成可读写的块数组；现在把镜头下移，回答这些块怎样经过控制器、DMA 和
+Linux 块层成为真实 I/O。概念推导解释“为什么需要这些对象”，本节则解释
+“对象中的块号最终怎样变成设备命令”。
 
 从操作系统块层看，它可以先抽象成\emph{一个有固定容量、可按逻辑块寻址的线性空间}。这里的“块”不是宇宙通用的 4096 字节：设备逻辑块、设备物理块、文件系统块和内存页是四个相关但不同的粒度。为便于后面的算例，本节暂时假设文件系统块为 4096 字节。
 
@@ -85,7 +89,7 @@ read(fd, my_data, 8192);
 
 但只要场景稍微复杂一点，问题就来了。
 
-\subsection{裸磁盘的问题清单}
+\subsection{第一遍推导的设备级复核}
 
 下表列出了裸磁盘模型在面对真实多任务、持久化需求时的核心问题：
 
@@ -109,9 +113,11 @@ read(fd, my_data, 8192);
 写已经落盘（持久化顺序），而并发写需要某种锁机制，锁机制又需要
 命名来标识被锁的对象。
 
-文件系统（file system）就是解决这些问题的\emph{软件层}。它在裸磁盘
+文件系统（file system）就是处理这些问题的\emph{软件层}。它在裸磁盘
 之上构建了一组抽象：文件（命名的字节序列）、目录（命名的层级结构）、
-权限（访问控制）、原子写（崩溃一致性）、缓存（性能）。
+权限（访问控制）、事务或 COW 提交协议（崩溃一致性）以及缓存（性能）。
+这里不把“原子写”列成文件系统自动提供的通用属性：不同系统调用、不同文件系统、
+不同挂载模式所承诺的可见性与持久性边界并不相同，后文会逐项拆开。
 
 \begin{keyidea}
 文件系统的本质是\textbf{变换}：它把一个无名的、块号的线性数组变换为
@@ -235,11 +241,12 @@ Linux 的页缓存（page cache）是文件数据的内存缓存。每个文件�
 \end{enumerate}
 
 \begin{keyidea}
-页缓存是 Linux 文件 I/O 的核心设计：\textbf{所有文件读写都经过页缓存}。
-\code{read()} 先查缓存，miss 时才走 I/O 栈。\code{write()} 先写缓存页
-（标记为 dirty），由 \code{pdflush} / \code{writeback} 线程异步刷回磁盘。
-这意味着 \code{write()} 返回后数据\emph{不一定}在磁盘上——只有
-\code{fsync()} 保证落盘。
+页缓存是 Linux \emph{buffered I/O} 的核心设计：普通 \code{read()} 先查缓存，
+miss 时才走设备 I/O；普通 \code{write()} 先修改缓存 folio 并标脏，再由
+writeback 机制异步回写。\code{O\_DIRECT} 和 DAX 等路径可以绕过传统页缓存，
+所以不能把“buffered I/O 的默认路径”写成“所有文件读写的唯一通路”。
+\code{write()} 返回也不等于掉电持久；可靠程序还必须检查 \code{fsync()} 的
+返回值，并确认底层设备履行 flush/FUA 等持久化承诺。
 \end{keyidea}
 
 \subsection{块 I/O 层：bio 结构}
@@ -803,7 +810,7 @@ Step 9: mark dirty
   - Block 43 dirty (dirent added)
 
 Step 10: writeback
-  - Eventually, pdflush/writeback thread wakes up
+  - Eventually, the writeback mechanism selects dirty folios
   - Flushes all dirty pages to disk via submit_bio()
   - Order may vary (depends on journal mode)
   - On ext4 with journal=data: metadata changes go through journal first
@@ -1754,8 +1761,8 @@ flush / writeback: alloc 5000-5002 (连续)
 
 ext4 的缓解措施：
 \begin{itemize}\tightlist
-\item \textbf{预留块}：默认为 root 保留 5\% 的块，
-  使 root 进程（含 \code{pdflush}）有空间完成 writeback。
+\item \textbf{预留块}：可为特权用户保留一部分空间，降低普通用户写满文件系统后
+  管理员完全无法修复或腾挪数据的风险；这不是某个名为 \code{pdflush} 的进程专用空间。
 \item \textbf{写时检查}：在 \code{write()} 路径上做粗略空间检查
   （\code{ext4\_nospace\_check}），但这是尽力而为。
 \item \textbf{回退到立即分配}：当剩余空间低于阈值，
@@ -1996,8 +2003,8 @@ struct super_block {
     unsigned long s_maxbytes;     // 最大文件大小
     unsigned long s_flags;        // MS_RDONLY, MS_NOSUID, ...
     unsigned long s_magic;        // 0xEF53 (ext2/3/4), 0x58465342 (xfs)
-    struct inode  *s_root;        // 根目录 inode
-    struct xarray s_inodes;       // 本 fs 的所有 inode
+    struct dentry *s_root;        // 此挂载实例的根 dentry
+    struct list_lru s_dentry_lru; // 可回收 dentry 的运行时状态（示意）
     const struct super_operations *s_op;
     // ...
 };
@@ -2053,7 +2060,7 @@ struct dentry {
     const struct dentry_operations *d_op;
     struct list_head d_subdirs;
     unsigned char d_flags;     // DCACHE_MOUNTED, ...
-    int d_lockref;            // 引用计数
+    struct lockref d_lockref; // 自旋锁与引用计数的组合
 };
 \end{lstlisting}
 
@@ -2135,8 +2142,9 @@ VFS 分发的本质是\emph{延迟绑定}：\code{open()} 时
 \subsection{open() 完整路径追踪}
 
 \begin{enumerate}\tightlist
-\item \code{sys\_open(path, flags, mode)} $\rightarrow$ \code{do\_sys\_open}.
-\item \code{path\_lookupat(path, LOOKUP\_FOLLOW)}：解析路径得到 \code{dentry} + \code{inode}。
+\item 用户态 \code{open()} 通常经 libc 进入 \code{openat} 系统调用；内核当前实现可沿
+  \code{do\_sys\_openat2} 一类入口进入路径打开逻辑。函数名会随版本调整，本追踪强调机制而非背诵符号。
+\item \code{path\_openat} 协调路径遍历与最终打开，逐段解析得到 \code{dentry} + \code{inode}。
   遍历过程中若遇挂载点，\code{follow\_mount()} 跳转到挂载的子树。
 \item 权限检查：\code{inode\_permission(inode, MAY\_OPEN)}
   $\rightarrow$ 调用 \code{inode->i\_op->permission}（ext4: \code{ext4\_permission}）。
@@ -2239,6 +2247,8 @@ Docker 镜像层叠正是基于 overlayfs。
 
 这些机制层层叠叠：VFS 分发 $\rightarrow$ 文件系统特定操作 $\rightarrow$ extent 树查找 $\rightarrow$ 块分配 $\rightarrow$ 目录索引 $\rightarrow$ dcache 命中。
 理解每一层的权衡与数据结构，才能诊断从"大文件随机读慢"到"容器挂载层叠"的各类性能问题。
+\input{chapters/ch13-filesystem-operation-protocols}
+
 \section{page cache 与写回}
 
 \subsection{问题：磁盘比内存慢一千倍}
@@ -2247,13 +2257,16 @@ Docker 镜像层叠正是基于 overlayfs。
 
 先看数字。DDR4 内存访问延迟 $\sim$80 ns，带宽 $\sim$25 GB/s。NVMe SSD 读取延迟 $\sim$100 $\mu$s（慢 1250 倍），带宽 $\sim$3 GB/s（慢 8 倍）。HDD 随机读取延迟 $\sim$10 ms（慢 125000 倍），带宽 $\sim$200 MB/s（慢 125 倍）。如果用户程序每次 \code{read} 都要等磁盘返回，一个 4 KiB 的读请求在 HDD 上就要花 10 ms；如果一个程序依次读 10000 个 4 KiB 页面，总耗时 100 秒。而如果把这 40 MiB 数据缓存在内存中，10000 次内存拷贝只需 $\sim$0.8 ms。差距是五个数量级。
 
-因此，现代操作系统几乎不会让用户 \code{read} 直接接触磁盘。内核在内存中维护一层文件数据缓存——\emph{page cache}——作为用户进程与块设备之间的中介。读操作先查缓存，命中则零磁盘 I/O；写操作只写到缓存就返回，磁盘写入延迟到后台异步完成。
+因此，普通文件的 buffered I/O 默认经过内核的文件数据缓存——\emph{page cache}。
+读操作先查缓存，命中则不产生本次磁盘 I/O；buffered write 通常先修改缓存并标脏，
+随后由后台写回或同步调用送往设备。Direct I/O 和 DAX 是后文单独讨论的旁路，不能
+把这段默认路径扩大成所有文件 I/O 的唯一实现。
 
 \begin{keyidea}
 page cache 的本质是把磁盘内容映射到内存页帧。每个缓存页由 \code{(inode, offset)} 唯一标识。读路径优先在缓存中查找；写路径只修改缓存中的页，标记为脏页后立即返回。磁盘 I/O 被推迟到 writeback 线程异步执行。
 \end{keyidea}
 
-\subsection{address\_space：从 (inode, offset) 到 page}
+\subsection{address\_space：从 (inode, offset) 到 folio}
 
 page cache 不是一张全局哈希表。内核为每个 inode 关联一个 \code{address\_space} 对象，它是该 inode 所有缓存页的管理容器。
 
@@ -2264,44 +2277,49 @@ struct address_space {
     pgoff_t                 writeback_index; // 上次 writeback 停止位置
     const struct address_space_operations *a_ops; // 操作表
     unsigned long           nrpages;         // 已缓存页数
-    unsigned long           wb_pages;        // 正在 writeback 的页数
     struct rb_root_cached   i_mmap;          // 私有映射的 VMA 树
+    struct rw_semaphore     invalidate_lock; // 截断/失效与填充的互斥边界
     struct rw_semaphore     i_mmap_rwsem;    // mmap 信号量
-    spinlock_t              xa_lock;         // XArray 自旋锁
-    unsigned long           flags;           // AS_EIO, AS_ENOSPC 等
+    errseq_t                wb_err;           // 异步写回错误序列
+    unsigned long           flags;
 };
 \end{lstlisting}
 
-\code{host} 指回拥有此 \code{address\_space} 的 inode。\code{i\_pages} 是一棵 XArray，键是页索引（\code{pgoff\_t}，即文件内偏移除以页大小），值是指向 \code{struct page} 的指针。\code{nrpages} 记录当前缓存了多少页；一个 1 GiB 文件的 \code{nrpages} 在全部缓存时为 $2^{30} / 2^{12} = 262144$。
+\code{host} 指回拥有此 \code{address\_space} 的 inode。\code{i\_pages} 是
+XArray 索引，键表示文件中的页索引，值通常指向 folio。folio 是一个或多个连续
+基础页的内存管理单位；引入它是为了让页缓存不必永远以单个 4 KiB 页为粒度。
+\code{nrpages} 仍以基础页数量记账，不能简单理解成“XArray 中有多少个 folio”。
 
 \code{a\_ops} 是操作表，决定了具体的读、写、写回行为如何落到底层文件系统：
 
 \begin{lstlisting}
 struct address_space_operations {
-    int   (*readpage)(struct file *, struct page *);
-    int   (*writepage)(struct page *, struct writeback_control *);
-    int   (*write_begin)(struct file *, struct address_space *,
-                         loff_t, unsigned, unsigned,
-                         struct page **, void **);
-    int   (*write_end)(struct file *, struct address_space *,
-                       loff_t, unsigned, unsigned,
-                       struct page *, void *);
-    ssize_t (*direct_IO)(struct kiocb *, struct iov_iter *);
-    int   (*set_page_dirty)(struct page *);
-    void  (*invalidatepage)(struct page *, unsigned int, unsigned int);
-    int   (*releasepage)(struct page *, gfp_t);
-    int   (*migratepage)(struct address_space *,
-                         struct page *, struct page *, enum migrate_mode);
-    bool  (*is_dirty_writeback)(struct page *, bool *, bool *);
-    int   (*error_remove_page)(struct address_space *, struct page *);
+    int  (*read_folio)(struct file *, struct folio *);
+    void (*readahead)(struct readahead_control *);
+    int  (*writepages)(struct address_space *,
+                       struct writeback_control *);
+    int  (*write_begin)(const struct kiocb *, struct address_space *,
+                        loff_t, unsigned, struct folio **, void **);
+    int  (*write_end)(const struct kiocb *, struct address_space *,
+                      loff_t, unsigned, unsigned,
+                      struct folio *, void *);
+    bool (*dirty_folio)(struct address_space *, struct folio *);
+    void (*invalidate_folio)(struct folio *, size_t, size_t);
+    bool (*release_folio)(struct folio *, gfp_t);
 };
 \end{lstlisting}
 
-ext4 填充的是 \code{ext4\_aops}，XFS 填充的是 \code{xfs\_address\_space\_operations}。当 VFS 调用 \code{a\_ops->readpage} 时，实际执行的函数取决于文件系统类型。这就是 VFS 分发在 page cache 层的体现。
+具体字段会随内核版本变化；这里以本书 Linux 6.16 基线附近的 folio 接口说明职责，
+源码走读仍须以实际 checkout 的 tag 为准。许多现代文件系统还通过 iomap 复用
+buffered I/O、direct I/O 和块映射的公共实现，而不是各自手写整套旧式 page 回调。
 
-\subsection{XArray：页索引的 O(1) 查找}
+\subsection{XArray：低树高的稀疏索引}
 
-\code{address\_space.i\_pages} 是一棵 XArray（前身是 radix tree）。键是 \code{pgoff\_t}（无符号长整型，表示页在文件中的序号），值是 \code{struct page} 指针。XArray 是一棵多叉树，每个内部节点有 64 个槽位（\code{XA\_CHUNK\_SHIFT = 6}），每个槽位指向下一级节点或叶子。
+\code{address\_space.i\_pages} 是一棵 XArray（历史上使用 radix tree）。键以
+\code{pgoff\_t} 页索引表达文件位置，普通叶项可指向 folio/page；同一 folio 覆盖
+多个页索引时还会使用 XArray 的多索引表示。常见 64 位配置中内部节点通常有 64 个
+槽位（\code{XA\_CHUNK\_SHIFT = 6}），但应把它理解为低树高稀疏索引，而不是对
+所有架构和配置都写死的磁盘格式常量。
 
 \begin{lstlisting}
 // 1 GiB 文件，页大小 4 KiB
@@ -2322,7 +2340,9 @@ ext4 填充的是 \code{ext4\_aops}，XFS 填充的是 \code{xfs\_address\_space
 //   lo = (100000 >> 0)  & 0x3F = 32   // level 2 → slot 32 = page*
 \end{lstlisting}
 
-三层 XArray 的查找只需要 3 次内存访问（每级一次指针解引用），这与文件大小无关——1 GiB 文件和 1 TiB 文件的查找都是 $O(1)$（常数级内存访问次数，层数随 $\log_{64}(n)$ 增长极慢）。
+在这个 1 GiB、4 KiB 粒度的例子中，路径只有 3 层，因此常数很小；但严格复杂度
+仍是 $O(\log_{64} n)$，不是与索引范围无关的 $O(1)$。XArray 的优势还包括稀疏
+分配、标记和并发访问接口，不能只用“大分支树所以等于常数”概括。
 
 \begin{pdfdiagram}
   % XArray structure
@@ -2358,7 +2378,7 @@ ext4 填充的是 \code{ext4\_aops}，XFS 填充的是 \code{xfs\_address\_space
   \node[os label] at (-30mm, 6mm) {\textcolor{BookRed}{\textbf{slot 24}}};
   \node[os label] at (-42mm, -22mm) {\textcolor{BookRed}{\textbf{slot 38}}};
 \end{pdfdiagram}
-\diagramnote{XArray 查找路径。1 GiB 文件需要 3 级 XArray（每级 64 槽）。查找 page index=100000 时，从 root 的 slot 24 进入 level 1 节点 24，再从其 slot 38 进入 level 2 节点，取出 page 指针。3 次内存访问完成 $O(1)$ 查找。}
+\diagramnote{XArray 查找路径。这个教学参数下需要 3 级节点；树高随可表示的索引范围缓慢增长，因此应写成低树高的对数查找，而不是严格 $O(1)$。}
 
 \subsection{读路径深追踪}
 
@@ -2378,47 +2398,42 @@ ssize_t vfs_read(struct file *file, char __user *buf,
     return generic_file_read_iter(iocb, to);
 }
 
-// 步骤 2: 查找 page cache
+// 以下是机制级伪代码，不是可直接编译的内核源码。
+// 步骤 2: 按文件页索引查找 page cache
 pgoff_t index = 8192 / 4096;  // index = 2
-struct page *page = pagecache_lookup(
-    file->f_inode->i_mapping,  // address_space
-    index                       // page index 2
-);
-// XArray 查找：i_pages.xa_head → level 0 → slot 2
+struct address_space *mapping = file->f_mapping;
+struct folio *folio = lookup_cached_folio(mapping, index);
 
-// 步骤 3a: 如果命中（page 存在且 PageUptodate）
-if (page && PageUptodate(page)) {
-    // copy_page_to_user: 把 page 内偏移拷到用户 buffer
-    // 8192 在 page 2 内的偏移 = 8192 % 4096 = 0
-    copy_page_to_iter(page, 0, 4096, buf);
+// 步骤 3a: 如果命中且 folio 内容有效
+if (folio && folio_test_uptodate(folio)) {
+    copy_folio_to_iter(folio, 0, 4096, to);
     // 没有设备 I/O；耗时取决于复制长度、CPU cache、缺页和调度状态
     return 4096;
 }
 
 // 步骤 3b: 如果未命中
-// 分配一个新 page，加入 address_space
-page = page_cache_alloc(file->f_inode->i_mapping);
-page->index = index;
-// 将 page 插入 XArray（其他线程现在可以看到它）
-__add_to_page_cache(page, mapping, index, gfp);
+// 分配并锁住新 folio，再加入 mapping->i_pages。
+// 先发布“正在装入”的 locked folio，是为了让并发读者等待同一次 I/O，
+// 而不是为同一 (inode,index) 重复发起设备读取。
+folio = allocate_locked_folio(index);
+add_folio_to_mapping(mapping, folio, index);
 
-// 步骤 4: 调用文件系统的 readpage
-// ext4: ext4_readpage → ext4_readpage_inline 或 mpage_readpage
-mapping->a_ops->readpage(file, page);
-// ext4_readpage 内部:
-//   1. 查 extent 树，找到 page index=2 对应的物理块
-//   2. 构造 bio: bio_alloc(bdev, sector, 1 page)
-//   3. submit_bio(READ, bio) → 交给块层 → 驱动 → 磁盘
-//   4. page 被标记 PG_locked，等待 I/O 完成
+// 步骤 4: 对 folio 发起读取；具体文件系统可复用 iomap 等公共路径
+mapping->a_ops->read_folio(file, folio);
+// read_folio / iomap 路径内部:
+//   1. 查 extent 或其他映射，找到 folio 对应的物理范围
+//   2. 按设备约束构造一个或多个 bio
+//   3. 提交到块层、驱动和设备
+//   4. I/O 完成后设置 uptodate/error，并解锁 folio
 
 // 步骤 5: 等待 I/O 完成
-wait_on_page_locked(page);
-// I/O 完成后，中断处理程序调用 SetPageUptodate(page)
-// 并解锁 page
+folio_wait_locked(folio);
+if (!folio_test_uptodate(folio))
+    return -EIO;
 
 // 步骤 6: 拷贝数据到用户空间
-copy_page_to_iter(page, 0, 4096, buf);
-// page 留在 cache 中，下次读同一页直接命中
+copy_folio_to_iter(folio, 0, 4096, to);
+// folio 留在 page cache 中，下次读同一区间可能直接命中
 return 4096;
 \end{lstlisting}
 
@@ -2429,7 +2444,7 @@ return 4096;
 路径 & 执行步骤 & 磁盘 I/O & 延迟 \\
 \midrule
 缓存命中 & XArray 查找 $\to$ \code{copy\_page\_to\_user} & 无 & $\sim$100 ns \\
-缓存未命中 & XArray 查找 $\to$ 分配 page $\to$ \code{readpage} $\to$ \code{submit\_bio} $\to$ 等待 $\to$ 拷贝 & 1 次 4 KiB 读 & $\sim$100 $\mu$s (NVMe) \\
+缓存未命中 & XArray 查找 $\to$ 分配 folio $\to$ \code{read\_folio} / iomap $\to$ 提交 I/O $\to$ 等待 $\to$ 拷贝 & 取决于映射与预读 & 取决于设备和队列 \\
 \bottomrule
 \end{longtable}
 
@@ -2546,7 +2561,7 @@ put_page(page);
 \midrule
 \code{write()} 返回 & page cache（内存） & 丢失 \\
 writeback 完成 & 磁盘写缓存 & 可能丢失（易失缓存） \\
-\code{fsync()} 返回 & 磁盘非易失介质 & 保留 \\
+\code{fsync()} 成功返回 & 文件系统与设备已完成其持久化协议 & 设备兑现 flush/FUA 等承诺且硬件无故障时保留 \\
 \bottomrule
 \end{longtable}
 
@@ -2554,7 +2569,10 @@ writeback 完成 & 磁盘写缓存 & 可能丢失（易失缓存） \\
 
 \subsection{脏页追踪}
 
-page cache 需要区分"干净页"（内容与磁盘一致）和"脏页"（内存中修改过，磁盘还没更新）。\code{address\_space} 用一棵独立的脏页树（也是 XArray）来追踪脏页。
+page cache 需要区分“干净 folio”（内容不需要写回）和“脏 folio”（内存中修改过，
+需要写回）。\code{address\_space.i\_pages} 是保存 page-cache folio 的 XArray；脏状态
+由 folio 标志表示，并通过同一 XArray 上的 mark 让扫描者快速筛选。这里没有另一棵
+与缓存索引平行的“脏页树”。下面继续使用单页大小的伪代码，以便突出标记机制：
 
 \begin{lstlisting}
 // 每个 page 有一个 page->flags 字段
@@ -2566,11 +2584,10 @@ page cache 需要区分"干净页"（内容与磁盘一致）和"脏页"（内�
 int set_page_dirty(struct page *page)
 {
     struct address_space *mapping = page->mapping;
-    // 把 page 加入 mapping 的脏页 XArray
-    // 脏页树与正常页树可以共享结构，
-    // 但内核用 page->flags 区分
+    // page 已在 mapping->i_pages 中；设置 folio/page 脏标志，
+    // 并在同一 XArray 上设置 DIRTY mark
     if (!TestSetPageDirty(page)) {
-        // 之前不是脏页，加入脏页链表
+        // 之前不是脏页，给其 XArray 索引设置脏 mark
         __xa_set_mark(&mapping->i_pages, page->index,
                       PAGECACHE_TAG_DIRTY);
         // 增加全局脏页计数
@@ -2663,7 +2680,7 @@ dirty_threshold = 4194304 * 0.20 = 838860 pages
 void wb_workfn(struct writeback_control *wbc)
 {
     while (wbc->nr_to_write > 0) {
-        // 1. 收集脏页：从 address_space 的脏页树中
+        // 1. 收集脏 folio：按 address_space.i_pages 的 DIRTY mark 扫描
         //    扫描最多 1024 页
         struct page *pages[1024];
         int nr = find_dirty_pages(mapping, wbc,
@@ -2701,7 +2718,7 @@ void wb_workfn(struct writeback_control *wbc)
             // 4. 标记为正在写回
             SetPageWriteback(page);
             ClearPageDirty(page);
-            // 从脏页树移到 writeback 树
+            // 在同一 XArray 中把 DIRTY/WRITEBACK marks 转换
 
             // 5. 提交给块层
             submit_bio(WRITE, bio);
@@ -2755,16 +2772,22 @@ void bio_endio(struct bio *bio)
 
 \subsection{fsync：从内存到非易失介质}
 
-\code{fsync(fd)} 是用户进程强制持久化的唯一可靠手段。它执行三个步骤，确保数据真正到达磁盘的非易失介质：
+\code{fsync(fd)} 是 POSIX 文件 API 中请求文件数据与相关元数据完成同步的核心接口，
+但不是所有持久化场景的“唯一手段”：\code{fdatasync}、同步打开标志、数据库自己的
+日志协议以及目录 \code{fsync} 都可能参与。成功返回表示内核和文件系统已完成该
+对象要求的写回与提交，并向设备发出了必要的顺序/持久化命令；这个承诺依赖设备
+正确实现 flush、FUA 或非易失缓存，也不等于新建文件的父目录项必然已经持久。
+下面的代码是机制级伪代码，不是某个内核版本的逐行 \code{ext4\_fsync}：
 
 \begin{lstlisting}
-// ext4_fsync (简化)
-int ext4_fsync(struct file *file, loff_t start, loff_t end, int datasync)
+// 文件系统 fsync 的机制级伪代码
+int filesystem_fsync(struct file *file, loff_t start,
+                     loff_t end, int datasync)
 {
     struct inode *inode = file->f_inode;
 
     // 步骤 1: 把此 inode 的所有脏页刷到磁盘
-    // filemap_write_and_wait 遍历 address_space 的脏页树
+    // filemap_write_and_wait 按 address_space.i_pages 的脏 mark 扫描
     // 对每个脏页: 构造 bio → submit_bio → 等待完成
     ret = filemap_write_and_wait_range(
         inode->i_mapping, start, end);
@@ -2780,23 +2803,22 @@ int ext4_fsync(struct file *file, loff_t start, loff_t end, int datasync)
         //   flush 日志区域
     }
 
-    // 步骤 3: 发送 CACHE FLUSH 命令到磁盘
-    // 强制磁盘把内部写缓存刷到非易失介质
-    ret = blkdev_issue_flush(inode->i_sb->s_bdev);
-    // blkdev_issue_flush 构造一个 barrier bio
-    // 驱动把它翻译成 SCSI SYNCHRONIZE CACHE
-    //   或 NVMe FLUSH CACHE 命令
-    // 磁盘控制器把 DRAM 写缓存写入 NAND/HDD 介质
-    // 完成后返回，此时数据在非易失介质上
+    // 步骤 3: 按文件系统、块层和设备能力完成顺序/持久化协议
+    // 可能使用 preflush、FUA、单独 flush，或由事务提交路径承担；
+    // 不能假定每次 fsync 都恰好直接调用一次 blkdev_issue_flush。
+    ret = finish_persistence_protocol(inode->i_sb);
 
     return ret;
 }
 \end{lstlisting}
 
 \begin{warningbox}
-许多磁盘有\emph{易失性写缓存}（volatile write cache）。磁盘控制器收到写请求后，数据先进入磁盘内部的 DRAM 缓存，磁盘立即向主机返回"完成"。如果此时断电，缓存中的数据丢失。\code{blkdev\_issue\_flush} 发送的 FLUSH 命令强制磁盘把缓存内容写到非易失介质，并在完成后才返回。没有这一步，\code{fsync} 返回后断电仍可能丢数据。
-
-某些磁盘声称写缓存是非易失的（电池备份），此时 FLUSH 可以是空操作。但文件系统无法信任磁盘的声明——许多消费级 SSD 声称非易失但在断电时实际丢失数据。
+许多设备有\emph{易失性写缓存}（volatile write cache）。普通写完成可能只表示数据
+进入控制器缓存；掉电后仍会丢失。块层与驱动必须把文件系统的持久化要求翻译成
+设备支持的 flush/FUA 等命令，且设备必须诚实兑现协议。若设备具有受保护的
+非易失写缓存，某些 flush 可以快速完成；若设备或虚拟化层谎报能力，软件单靠
+\code{fsync} 无法修复硬件契约的破坏。因此“成功返回”是分层协议承诺，不是软件
+越过控制器亲眼观察了 NAND 或盘片。
 \end{warningbox}
 
 \subsection{屏障与磁盘命令顺序}
@@ -3189,11 +3211,10 @@ ext4 的日志由 jbd2（Journaling Block Device v2）实现。日志是一块�
 //    块 108      109   110   111   112
 
 // descriptor block 格式:
-struct journal_header2_t {
-    uint32_t h_magic;       // 0x4a533334 = "J3S4"
-    uint32_t h_blocktype;   // 2 = descriptor
-    uint32_t h_sequence;    // 事务序号
-    uint32_t h_blocknr;     // 本块在日志中的物理块号
+struct journal_header_s {
+    __be32 h_magic;       // 0xC03B3998
+    __be32 h_blocktype;   // 1=descriptor, 2=commit, 5=revoke
+    __be32 h_sequence;    // 事务序号
 };
 // 后跟一组 block_tag:
 struct journal_block_tag_s {
@@ -3205,13 +3226,18 @@ struct journal_block_tag_s {
 
 // commit block 格式:
 struct journal_commit_header {
-    journal_header2_t h;      // h_blocktype = 6 (commit)
+    journal_header_s h;       // h_blocktype = 2 (commit)
     uint8_t   chksum_type;    // 校验类型
-    uint8_t   flags[3];
-    uint32_t  chksum[16];     // CRC32C 校验数组
-    // 每个 checksum 对应事务中的一个数据块
+    uint8_t   chksum_size;
+    uint8_t   padding[2];
+    __be32    chksum[8];      // 具体解释取决于 checksum feature
 };
 \end{lstlisting}
+
+jbd2 的磁盘字段采用大端序，这一点与 ext4 主体结构采用小端序相反。descriptor
+后面可以有数据块或 revoke 记录；revoke 用来阻止恢复时重放已经被释放并重新解释
+的旧块。若忽略 revoke，只靠“看到 commit 就逐块覆盖”，恢复器可能把旧元数据
+写到后来已经属于文件数据的块上。
 
 \begin{pdfdiagram}
   % Journal layout
@@ -3499,9 +3525,14 @@ jbd2_checkpoint(journal):
 
 \subsection{COW 原理：不覆盖，只追加}
 
-传统文件系统（ext4、XFS）在原地覆盖写：文件块更新时，直接写回原来的物理块。如果写入过程中断（断电），块中一半是旧数据一半是新数据——数据损坏。ext4 用日志来修复这种情况：日志保证要么全部回滚要么全部重放。
+ext4、XFS 一类文件系统可以原地更新部分数据或元数据，但它们并不因此共享一个
+简单的“覆盖后由日志回滚全部文件数据”模型。以 ext4 默认 \code{data=ordered}
+为例，日志主要保护元数据结构；普通文件数据通常不进入日志，覆盖写仍可能受到
+设备原子写粒度和掉电时序影响。必须把“结构可恢复”和“用户数据原子更新”分开。
 
-COW（Copy-on-Write）文件系统采用另一种策略：\emph{永远不在原地覆盖}。修改一个块时，分配一个新块写入数据，然后更新所有指向旧块的指针指向新块，最后原子切换根指针。
+COW（Copy-on-Write）文件系统的基本策略是：对受 COW 保护的块，不在原地址
+发布新版本，而是写到新位置，再逐层发布新的引用关系。真实系统还需要 generation、
+校验和、写序、超级块副本和恢复选择规则；不能把它缩成一次天然原子的指针赋值。
 
 \begin{lstlisting}
 // 传统原地覆盖写
@@ -3532,12 +3563,9 @@ cow_write(inode, offset, new_data):
 
   // ... 递归 COW 到根 ...
 
-  // 4. 原子更新超级块的根指针
-  atomic_write(superblock.root, new_root_block)  // 块 8400
-  // 这是唯一的"切换"操作
-  // 切换前: 根指针指向旧树 → 旧数据可见
-  // 切换后: 根指针指向新树 → 新数据可见
-  // 不存在"中间状态"
+  // 4. 按格式要求写入带 generation/checksum 的新超级块版本
+  publish_superblock_copy(new_root_block, generation)
+  // mount/recovery 选择校验通过且代数完整的版本
 
   // 旧块 (5000, 旧叶子, 旧父节点...) 仍被旧根引用
   // 如果有 snapshot, 旧根仍然有效
@@ -3548,11 +3576,11 @@ cow_write(inode, offset, new_data):
 \toprule
 & 原地覆盖（ext4/XFS） & COW（Btrfs/ZFS） \\
 \midrule
-崩溃一致性 & 需要日志修复 & 天然一致（根指针原子切换） \\
+崩溃一致性 & 依靠日志、写序和恢复规则 & 依靠 COW、generation、校验和与提交协议 \\
 snapshot & 需要额外 LVM 层 & 原生支持（保留旧根指针） \\
 写放大 & 低（1 次写服务 1 次用户写） & 高（3--6 倍） \\
 碎片 & 低（原地覆盖） & 高（每次写新位置） \\
-空间回收 & 不需要 & 需要 refcount 追踪 \\
+空间回收 & 仍需位图/B+树等空间管理 & 还需引用追踪与延迟回收 \\
 \bottomrule
 \end{longtable}
 
@@ -3609,7 +3637,7 @@ checksum tree & (inode\#, offset) & 数据块校验和 \\
 \end{pdfdiagram}
 \diagramnote{Btrfs 的多棵 B-tree 结构。root tree 是顶层，指向 fs tree（每个 subvolume 一棵）、extent tree（块分配跟踪）、checksum tree 等。所有树共享统一的 \code{(objectid, type, offset)} 键空间。}
 
-\subsection{Btrfs snapshot：O(1) 创建}
+\subsection{Btrfs snapshot：不复制文件数据的快速创建}
 
 Btrfs 的 snapshot 创建只需复制 root tree 的根节点指针，不复制任何数据块：
 
@@ -3625,8 +3653,8 @@ btrfs_snapshot(src_subvol, dst_subvol):
   dst_subvol->fs_tree_root = src_subvol->fs_tree_root;
   // 即块 5000
   increase_refcount(5000);  // extent tree 中 refcount 1->2
-  // 耗时: 写一个 root tree 节点 + 更新 extent ref
-  //       = O(1) 磁盘 I/O
+  // 关键性质: 不遍历并复制全部文件数据；
+  // 实际元数据工作量与实现和待提交事务状态有关。
 
 // 之后在 dst 中修改文件:
 btrfs_write(dst_subvol, inode, offset, data):
@@ -3644,10 +3672,15 @@ btrfs_write(dst_subvol, inode, offset, data):
   // 旧数据块 (5000 的子树) 仍被 src 引用, 不回收
 \end{lstlisting}
 
-snapshot 创建后，两个 subvolume 共享所有未修改的数据块。只有被修改的块及其元数据路径才会被复制。这使得 Btrfs 的 snapshot 在空间和时间上都是极其高效的。
+snapshot 创建后，两个 subvolume 共享未修改的数据块；只有后续被修改的块及其
+相关元数据路径才会分叉。因此创建通常远快于复制整棵文件树，但不能据此许诺与
+任意系统状态无关的严格常数时间。
 
 \begin{keyidea}
-Btrfs snapshot 是 COW 的直接收益：旧树根仍然有效，新树根通过 COW 路径逐渐分叉。共享的数据块通过 extent tree 中的引用计数管理——refcount $>$ 1 的块被多棵树引用，refcount 降到 0 时才回收。snapshot 创建本身只是增加一次引用，O(1) 完成。
+Btrfs snapshot 是 COW 的直接收益：旧树根仍然有效，新树根通过 COW 路径逐渐分叉。
+共享的数据块通过 extent tree 的引用记录管理，最后一个引用消失后才具备回收条件。
+创建时不复制全部文件数据，这是应当记住的复杂度优势；真实完成时间还受事务提交、
+元数据更新和系统负载影响。
 \end{keyidea}
 
 \subsection{ZFS：事务对象存储}
@@ -3703,7 +3736,10 @@ zio_read(bp):
   // 都坏了 → 不可恢复, 返回 EIO
 \end{lstlisting}
 
-ZFS 的 TXG（Transaction Group）机制批量提交写操作。每隔几秒（或 ZIL 满时），ZFS 把所有未提交的修改组装成一个 TXG，COW 写入新块，更新所有 block pointer，最后原子切换 uberblock（ZFS 的超级块等价物）。
+ZFS 的 TXG（Transaction Group）机制批量提交写操作。系统把修改组装成 TXG，
+COW 写入新块并更新 block pointer，最后按格式协议写出新的 uberblock 槽位。
+恢复时从多个候选 uberblock 中选择校验和与事务号有效的版本；这不是假设任意宽度的
+根指针更新天然具有硬件原子性。
 
 \begin{lstlisting}
 // ZFS TXG 提交流程
@@ -3735,16 +3771,20 @@ txg_commit(pool):
   write_block(new_objset_block, objset);
   // objset 指向新的 dnode blocks
 
-  // 5. 原子写 uberblock
+  // 5. 按格式要求写新的 uberblock 槽位并完成持久化顺序
   //    uberblock 包含指向 root objset 的指针
   new_uberblock = make_uberblock(
       new_objset_block, txg->txg_num, timestamp);
-  atomic_write_uberblock(pool, new_uberblock);
+  publish_uberblock_slot(pool, new_uberblock);
   // 旧 uberblock 仍然存在 (ZFS 存多个 uberblock)
   // 崩溃恢复: 读最新的有效 uberblock
 \end{lstlisting}
 
-ZIL（ZFS Intent Log）是 ZFS 对 \code{fsync} 的加速机制。没有 ZIL 时，每次 \code{fsync} 需要等待整个 TXG 提交（COW 全路径），延迟可能数秒。ZIL 是一块独立的日志区域，\code{fsync} 时先把同步写请求记录到 ZIL，立即返回。后续 TXG 提交时把数据正式 COW 到主存储，然后释放 ZIL 空间。崩溃恢复时，如果 uberblock 指向的 TXG 已提交，ZIL 内容被忽略；如果未提交，重放 ZIL 中的同步写。
+ZIL（ZFS Intent Log）记录尚未进入已提交 TXG、却已向调用者承诺持久的同步写意图。
+同步调用必须等相应日志记录达到稳定存储后才可成功返回，而不是“写进内存后立即返回”。
+后续 TXG 提交把修改纳入主存储状态，相关日志记录即可回收；崩溃恢复时重放尚未被
+已提交 TXG 覆盖的有效同步记录。独立的 SLOG 设备是 ZIL 记录的一种承载位置，ZIL
+本身不是必须单独购买的一块设备。
 
 \subsection{写放大：COW 的核心代价}
 
@@ -3814,13 +3854,13 @@ Btrfs 和 ZFS 通过以下策略缓解写放大：
 \toprule
 & ext4 (journal) & Btrfs (COW) & ZFS (COW) \\
 \midrule
-崩溃恢复 & 日志重放 & 根指针原子切换 & uberblock 原子切换 \\
-snapshot & 需 LVM & 原生 O(1) & 原生 O(1) \\
+崩溃恢复 & 日志重放与有序数据规则 & COW 事务、tree-log 与超级块代数选择 & TXG、ZIL 与 uberblock 选择 \\
+snapshot & 需 LVM 等上层机制 & 原生、创建元数据开销较小 & 原生、创建元数据开销较小 \\
 写放大 & 1--1.5x & 3--6x & 3--6x \\
 碎片 & 低（原地覆盖） & 高（COW 散布） & 高（COW 散布） \\
 空间效率 & 需日志空间 & 需 refcount 元数据 & 需校验和+refcount \\
 数据完整性 & 无校验 & 有校验 (checksum tree) & 端到端校验+自修复 \\
-RAID 支持 & 无（需 mdadm） & 无（已移除） & 原生 RAID-Z \\
+冗余集成 & 通常依赖 md/device-mapper & 原生 block-group profiles，RAID56 有额外风险 & 原生 mirror/RAID-Z \\
 压缩 & 否 & 是（zlib/zstd） & 是（lz4/gzip） \\
 \bottomrule
 \end{longtable}
@@ -3880,15 +3920,15 @@ COW 文件系统用写放大换取了崩溃一致性和 snapshot 能力。原地
   % Shared blocks (dashed lines to old tree)
   \draw[os feedback] (nl2.west) -- ++(-4mm, 0) -- ++(0, 0) node[os label] {共享};
 
-  % Atomic switch
-  \draw[os strong bus, draw=BookRed] (oroot.east) -- node[os label, text=BookRed, above] {原子切换} (nroot.west);
+  % Commit-protocol publication
+  \draw[os strong bus, draw=BookRed] (oroot.east) -- node[os label, text=BookRed, above] {提交后选新根} (nroot.west);
 
   % New block highlight
   \node[os label, text=BookRed] at (10mm, -49mm) {新块};
   \node[os label, text=BookRed] at (24mm, -23mm) {COW};
   \node[os label, text=BookRed] at (40mm, -11mm) {COW};
 \end{pdfdiagram}
-\diagramnote{COW 更新路径。写入块 5000 的数据时，不覆盖块 5000，而是分配新块 8000 写入数据。从叶子到根的路径上的每个节点都 COW 出新版本（红色标记）。旧树（左侧）保持完整，根指针原子切换到新树根。旧块 5000 仍被旧树引用，可用于 snapshot。共享的子树（parent 右子树、leaf 和 6000/7000/7500 块）不被复制。}
+\diagramnote{COW 更新路径。写入块 5000 的数据时，不覆盖块 5000，而是分配新块 8000 写入数据。从叶子到根的路径上的每个节点都 COW 出新版本（红色标记）。格式规定的提交协议完成后，恢复规则才选择新根；这不依赖一个抽象根指针天然原子。旧块 5000 仍被旧树引用，可用于 snapshot。共享的子树（parent 右子树、leaf 和 6000/7000/7500 块）不被复制。}
 
 \section{闪存文件系统}
 
@@ -5070,11 +5110,11 @@ void fs_persist(int fd)
 \node[os label] at (5,-0.7) {DAX path};
 
 \node[os label, font=\scriptsize] at (2.5,4.5)
-  {DAX 省去 3 层：page cache + block layer + 驱动};
+  {映射后的数据访问绕过传统 page cache 与块 I/O 热路径};
 \end{pdfdiagram}
-\diagramnote{DAX 与传统文件系统路径对比。传统路径需要 5 层
-（应用→系统调用→页缓存→块层→驱动→SSD），每次 I/O 需要系统调用。
-DAX 路径仅需 mmap 后直接 load/store 到 PMEM，零系统调用。}
+\diagramnote{DAX 与传统 buffered I/O 数据路径对比。建立映射和处理缺页仍需
+系统调用、文件系统与驱动参与；映射建立后的普通 load/store 不再为每次访问走
+传统 page cache 和块 I/O 提交路径。}
 
 \emph{持久性保证}：DAX 模式下，CPU store 指令将数据写入 L1/L2 缓存，
 然后通过写缓冲（write buffer）异步刷新到 PMEM。如果在刷新完成前断电，
@@ -5091,18 +5131,16 @@ inode 的脏页，对每页执行 \code{clwb} + \code{sfence}。
 4 KiB 页意味着 $2.5 \times 10^6$ 个页表项，产生大量 TLB miss。x86-64 的
 TLB 容量有限（L1 dTLB 通常 64--72 项 for 4 KiB 页），覆盖范围仅 256--288 KiB。
 
-\emph{大页}（large folios / huge pages）使用 2 MiB 页（甚至 1 GiB 巨页）替代
-4 KiB 页。一个 2 MiB 页覆盖相同数据量只需要 1 个 TLB 项——TLB 覆盖范围扩大
-512 倍。Linux 6.5+ 内核中，ext4 和 XFS 的页缓存支持 \emph{透明大页}
-（Transparent Huge Pages for page cache）：当文件系统检测到顺序访问大文件时，
-内核可以使用 2 MiB folio 替代 4 KiB 页。
+页缓存可以使用包含多个基础页的 large folio，减少逐页管理开销并形成更大的 I/O。
+这不等同于承诺用户映射一定得到 2 MiB TLB huge-page 映射；页缓存 folio 大小、
+页表映射粒度和文件系统支持是三个需要分别验证的条件。现代文件系统通常通过
+iomap 逐步获得 large-folio 支持，具体能力必须绑定内核版本和文件系统配置。
 
 对于顺序读取 10 GiB 文件：
 \begin{itemize}\tightlist
 \item 4 KiB 页：$2.5 \times 10^6$ 个页，TLB miss 频繁
-\item 2 MiB 大页：4883 个页，TLB miss 减少 512 倍
-\item I/O 层面：2 MiB bio 请求比 4 KiB bio 更高效——块层、驱动和 SSD
-      都更擅长处理大 I/O 请求
+\item 2 MiB folio：只需约 5120 个 folio 对象，显著减少页缓存管理对象数量
+\item I/O 层面：较大 folio 有机会形成更大请求，但仍受 extent 连续性、设备限制和预读策略约束
 \end{itemize}
 
 % ------------------------------------------------------------------
@@ -5549,9 +5587,10 @@ int xfs_btree_lookup(struct xfs_btree_cur *cur,
 % ----------------------------------------------------------------%
 
 Btrfs 的事务提交（\code{btrfs\_commit\_transaction}，
-\filepath{fs/btrfs/transaction.c}）通过 COW B 树和原子根指针更新实现
-崩溃一致性。与 ext4 的日志不同，Btrfs 不需要单独的日志区域——B 树的
-COW 特性本身就是日志。
+\filepath{fs/btrfs/transaction.c}）用 COW 树、generation、校验和与超级块
+提交协议维护一致状态。它没有 ext4/jbd2 那样的块日志，但存在专门的 tree-log，
+用于在完整事务提交前记录 \code{fsync} 等需要持久化的更新；不能概括成
+“B 树本身就是全部日志”。
 
 \begin{lstlisting}[language=C]
 /* fs/btrfs/transaction.c — commit (simplified) */
@@ -5566,8 +5605,7 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
     btrfs_write_dirty_roots(trans);  /* COW B-tree nodes */
 
     /* Phase 2: write superblock with new root pointers */
-    /* Btrfs has multiple superblock slots (usually 4).
-       The new root pointer is written atomically. */
+    /* Write checksummed superblock mirrors carrying new generations. */
     btrfs_write_super(trans);
 
     /* Phase 3: mark old data as reclaimable */
@@ -5583,11 +5621,10 @@ int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
  */
 \end{lstlisting}
 
-Btrfs 的超级块有多个槽位（通常 4 个），分布在不同位置。提交时，
-新根指针写入下一个槽位——这是一个原子操作（单个扇区写入是原子的）。
-如果在写入新超级块之前崩溃，旧超级块仍然指向旧根，文件系统状态
-回滚到上次提交点。Btrfs 的 COW 模型意味着 \emph{旧数据永远不会被
-覆盖}——提交本质上是切换根指针的``地址''，而非修改已有数据。
+Btrfs 在固定物理位置保存超级块镜像，超级块带 checksum 和 generation，并指向
+各棵树的已提交根。恢复不能假定“任意单扇区写天然原子”，而要验证超级块及其
+引用树是否属于完整代数。旧块只在仍被已提交树或快照引用时保留；引用解除并跨过
+安全事务边界后，空间最终可以复用，所以“旧数据永远不覆盖”也不是永久承诺。
 
 % ------------------------------------------------------------------
 \detailsubsection{page cache 与写回}
@@ -5620,15 +5657,15 @@ void wb_workfn(struct work_struct *work)
         /* Pop next inode to write back */
         inode = wb_writeback_single(bdi, &wbc);
         __writeback_single_inode(inode, &wbc);
-        /* Calls inode->i_op->writepages() → ext4_writepages()
+        /* Calls mapping->a_ops->writepages() → filesystem writeback
            which calls ext4_mballoc to allocate blocks
            for all dirty pages at once (delayed alloc!) */
     }
 }
 \end{lstlisting}
 
-\code{\_\_writeback\_single\_inode} 调用文件系统的 \code{writepages} 方法
-（例如 \code{ext4\_writepages}），后者负责将脏页写入磁盘。对于延迟分配的
+\code{\_\_writeback\_single\_inode} 通过 \code{mapping->a\_ops->writepages}
+进入文件系统写回路径，后者负责将脏 folio 变成块映射与 I/O。对于延迟分配的
 文件系统，\code{writepages} 是实际物理块分配发生的时刻——多块分配器
 \code{ext4\_mballoc} 在此处一次性为所有脏页分配连续物理块。
 

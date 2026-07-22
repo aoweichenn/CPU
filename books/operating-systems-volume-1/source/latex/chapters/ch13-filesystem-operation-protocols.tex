@@ -1,0 +1,209 @@
+\section{从数据结构到操作协议：一次修改为何不能随便排序}
+
+前面已经知道 create 会改位图、inode、目录项和数据块。但“需要改哪些块”只回答了
+静态结构问题，还没有回答三个动态问题：两个线程同时改怎么办，中途失败怎样撤销，
+掉电后哪一个版本算已经完成。要回答它们，先给出三个不混用的词。
+
+\begin{description}
+\item[可见性（visibility）] 其他线程现在能否通过名字或已打开的文件描述符观察到修改。
+  它讨论的是运行中内存状态，不自动意味着数据已经掉电不失。
+\item[持久性（durability）] 系统成功返回某个同步边界后，掉电重启是否仍能恢复该修改。
+  它依赖文件系统提交协议、块层顺序和设备对 flush/FUA 的兑现。
+\item[一致性（consistency）] 位图、inode、目录项和块映射是否仍满足格式规定的不变量。
+  一致的文件系统也可能保存旧数据；“结构能挂载”不等于“应用的最后一次写已持久”。
+\end{description}
+
+于是，\code{write} 返回通常建立的是新字节对进程的可见性；\code{rename} 可以建立
+名字切换的原子可见性；\code{fsync} 请求建立持久性。三个边界有关联，却不是同一个
+边界。把它们统称为“原子写”会掩盖真正需要证明的性质。
+
+\subsection{锁、事务和写序分别解决什么}
+
+\emph{锁（lock）}是运行期间的互斥或同步规则。例如父目录锁可以防止两个 create
+同时把同一个名字插入目录；inode 锁可以协调 truncate 与 write。锁保存在内存中，
+断电后会消失，所以锁本身不能提供崩溃恢复。
+
+\emph{事务（transaction）}把多项持久修改归为一个恢复单位。日志型文件系统先把
+“本事务要发布哪些元数据版本”写入日志，并用 commit record（提交记录）表示事务
+已经完整。恢复程序只重放具有有效提交证据的事务。事务解决的是“掉电后该接受哪组
+修改”，并不替代运行中的锁。
+
+\emph{写序（write ordering）}规定某个写在另一个写获得持久性之前必须先获得持久性。
+例如 ordered 模式需要先保证新文件数据已写出，再提交让该块可达的元数据，否则
+重启后可能通过正确目录名读到旧块残留。设备可以重排普通写，因此文件系统还要通过
+依赖关系、flush、FUA 或等价协议把逻辑顺序传到设备。
+
+\emph{回滚（rollback）}处理的是尚未发布时的运行期错误。例如分配 inode 成功、分配
+数据块却返回 ENOSPC，就要撤销 inode 位图和计数的修改。日志恢复常用的是重放已提交
+事务，而不一定是在磁盘上逐步执行传统意义的“反向撤销”。两者不要因为都叫恢复就混为一谈。
+
+\begin{longtable}{@{}L{0.16\linewidth}L{0.28\linewidth}L{0.26\linewidth}L{0.22\linewidth}@{}}
+\toprule
+机制 & 首先防止的问题 & 生效时间 & 单独做不到什么 \\
+\midrule
+锁 & 线程并发交错破坏内存状态 & 系统运行期间 & 不能跨断电保存 \\
+运行期回滚 & 系统调用中途报错泄漏资源 & 错误返回之前 & 不能修复已经掉电的机器 \\
+日志事务 & 多块元数据只持久了一部分 & mount 恢复与 checkpoint & 不自动保证普通数据内容原子 \\
+写序/flush/FUA & 设备重排或易失缓存破坏依赖 & I/O 提交到持久化完成 & 不能决定两个线程谁先修改目录 \\
+fsck 式扫描 & 已有结构不满足全局不变量 & 离线或受控修复期间 & 通常不知道应用原本想完成什么 \\
+\bottomrule
+\end{longtable}
+
+\subsection{create：名字是最后的“发布边”}
+
+设两个线程同时执行 \code{open("/d/x", O_CREAT|O_EXCL)}。如果都先查到名字不存在，
+再分别插入，就可能产生重名目录项或泄漏其中一个 inode。因此检查和插入必须受同一
+目录修改协议保护，不能在两步之间释放父目录的排他锁。
+
+一次简化但完整的 create 可以按下面的状态机理解：
+
+\begin{lstlisting}
+create(parent, "x"):
+  1. lock(parent directory)             // 串行化同目录名字修改
+  2. lookup("x")                        // 在锁内再次确认不存在
+  3. reserve journal credits            // 预留本事务最坏所需日志空间
+  4. allocate inode; initialize it       // 还没有目录项，外部路径不可达
+  5. if initial data is required:
+       allocate block; write data
+  6. insert dirent "x" -> inode          // 发布边：名字开始可达
+  7. update parent time/counts
+  8. attach all metadata changes to transaction
+  9. unlock(parent directory)
+
+on error before step 6:
+  free block if allocated
+  free inode if allocated
+  cancel or stop transaction
+  unlock(parent directory)
+  return error
+\end{lstlisting}
+
+第 6 步叫发布边，因为在它之前，新 inode 即使已经存在，也没有从根目录出发的路径；
+在它之后，路径解析可以找到它。发布边之前出错，资源应被回滚。发布边之后若向用户
+返回失败，调用者也不能武断地认为名字不存在：网络文件系统、I/O 错误或崩溃边界都
+可能造成“操作已经生效但答复丢失”，稳健程序要重新查询状态。
+
+“先预留日志空间”也不是性能小技巧。若先把目录项发布，最后才发现日志已满，就会
+进入既不能安全提交、又不能简单撤销的困境。预留是在修改前证明：最坏情况下有足够
+空间记录使结构一致所需的元数据。
+
+\subsection{create 的掉电矩阵：结构一致不等于用户意图完成}
+
+下面假设没有日志，只按顺序写 MiniFS-Lab 的几个块。表中的“泄漏”是指位图认为资源
+已占用，却没有从根目录可达的对象拥有它。
+
+\begin{longtable}{@{}L{0.24\linewidth}L{0.28\linewidth}L{0.38\linewidth}@{}}
+\toprule
+掉电点 & 重启后可能看到 & 为什么 \\
+\midrule
+只写 inode 位图后 & 一个已占用但未初始化/不可达的 inode & 分配状态先于对象正文持久 \\
+再写块位图后 & 不可达 inode，加一个无所有者数据块 & 两种资源都分了，但映射尚未建立 \\
+再写 inode 与数据后 & 完整数据仍没有名字可达 & 目录项这个发布边尚未持久 \\
+只持久目录项、inode 未持久 & 名字指向无效或旧 inode & 发布发生在被发布对象之前 \\
+全部写完后 & 结构可能正确 & 仍要确认设备是否兑现写序与持久化命令 \\
+\bottomrule
+\end{longtable}
+
+日志的价值现在可以精确描述：把相关元数据版本连同事务号写入日志，完整写出 commit
+record 后才把事务视为可重放；没有完整提交证据的尾部事务被忽略。ordered data 模式
+还建立“数据先于使其可达的元数据提交”的顺序。日志不是让掉电不发生，而是把恢复时
+无限多种半完成组合压缩成“重放已提交事务、丢弃未提交事务”两类可判定选择。
+
+\subsection{unlink：删除名字为什么不等于删除正在打开的文件}
+
+目录项对 inode 的持久引用数由链接计数表示；进程已打开文件所持有的是运行时引用。
+这两种引用必须分开。考虑：
+
+\begin{lstlisting}
+fd = open("/tmp/report", O_RDWR);  // 得到运行时 file/inode 引用
+unlink("/tmp/report");             // 删除名字，链接计数可能变为 0
+write(fd, "tail", 4);              // 仍然合法
+close(fd);                          // 最后一个运行时引用消失
+\end{lstlisting}
+
+\code{unlink} 的直接语义是从父目录移除“名字 $\rightarrow$ inode”映射并减少链接计数。
+链接计数降为零后，新的路径查找找不到该对象；但只要 \code{fd} 仍引用它，内核就不能
+回收 inode 和数据块。最后一个打开引用关闭后，回收路径才释放块映射和 inode 编号。
+
+这里产生一个新的崩溃窗口：目录项已删除、链接计数为零，但系统在释放全部数据块前
+掉电。很多日志型文件系统维护类似 orphan list（孤儿链表）的持久恢复线索。它记录
+“这个 inode 已经没有名字，但清理尚未完成”；mount 恢复时继续 truncate/删除，避免
+永久泄漏。孤儿在这里不是“找不到就猜”，而是删除协议主动留下的待办记录。
+
+\subsection{rename：原子可见性与持久发布是两回事}
+
+常见安全更新模式是先写临时文件，再把它改名到正式名字：
+
+\begin{lstlisting}
+fd = open("config.tmp", O_CREAT | O_TRUNC | O_WRONLY, 0600);
+write_all(fd, new_bytes);
+fsync(fd);                         // 先持久化临时文件内容
+close(fd);
+rename("config.tmp", "config");  // 名字切换对并发查找原子可见
+dirfd = open(".", O_DIRECTORY | O_RDONLY);
+fsync(dirfd);                      // 请求持久化目录项变化
+close(dirfd);
+\end{lstlisting}
+
+这里的\emph{原子可见}表示其他进程不会观察到半个目录项：目标名在某个线性化点从旧
+对象切到新对象。但 \code{rename} 成功返回本身不应被泛化成“掉电后新名字必然存在”。
+文件数据和目录项是两个持久对象，所以先同步文件，再执行 rename，再同步父目录。
+跨两个目录 rename 时，若应用要求两个目录的变更都可靠，还要按目标平台契约处理
+相关目录同步。
+
+rename 还暴露了锁顺序问题。两个线程若一个先锁目录 A 再锁 B，另一个先锁 B 再锁 A，
+就会形成死锁：双方都拿着对方需要的锁等待。VFS 因此规定目录操作的锁层级与祖先
+关系规则；跨目录 rename 还必须防止把目录移动进自己的后代，从而制造目录环。锁顺序
+不是实现细枝末节，而是“目录树始终是一棵无环层级结构”这一不变量的并发证明。
+
+\subsection{truncate：改变长度为何会牵动 page cache、块映射和 mmap}
+
+\code{truncate(file, 5000)} 看似只改一个长度字段，实际上旧文件若长 20 KiB，它还要：
+
+\begin{enumerate}\tightlist
+\item 在 inode 锁与映射失效协议保护下发布新的 \code{i\_size}；
+\item 处理 page cache 中新 EOF 之后的 folio，不能让旧缓存内容再次被写回；
+\item 将包含新 EOF 的最后一个块尾部清零，避免文件以后增长时泄露旧字节；
+\item 删除 EOF 之后的 extent/间接块映射并释放物理块；
+\item 与正在进行的 buffered write、direct I/O、writeback 和 mmap page fault 协调；
+\item 把长度、块映射和空闲空间修改纳入可恢复的元数据事务。
+\end{enumerate}
+
+顺序错误会形成真实漏洞。如果先把物理块分给文件 B，再允许文件 A 的旧脏 folio 写回，
+A 的写回就可能覆盖 B 的数据；如果不清理最后一个部分块，A 随后扩展时可能读到截断前
+的旧内容。因此 truncate 的核心不是“把 size 赋成 5000”，而是撤销 EOF 之后所有层次
+对旧数据的引用，并与仍可能使用这些引用的并发路径建立同步屏障。
+
+对已 mmap 的文件，映射地址也不是永久拥有物理块。截短后访问新 EOF 之外的页面可能
+触发 \code{SIGBUS}；内核需要让相关页表映射和 page cache 状态失效。这个例子再次说明：
+磁盘 inode、内存 inode、page cache 与进程页表是同一文件的不同层次，不能只改其中一个。
+
+\subsection{fsync：到底同步了文件、名字还是整个文件系统}
+
+对普通文件调用 \code{fsync(fd)}，目标是该文件的数据和恢复它所需的相关元数据；
+\code{fdatasync} 可以不强求与数据读取无关的部分元数据，但仍必须同步影响数据正确
+读取的长度等信息。二者都必须检查返回值，因为延迟分配、writeback 或设备错误可能
+直到同步时才报告。
+
+文件名属于目录数据，不属于普通文件 inode。因此新建文件的可靠发布通常还需要同步
+父目录；rename、link、unlink 改的也是目录命名关系。不能因为文件内容已同步，就推出
+重启后包含它的名字也一定存在。反过来，只同步目录也不能替代先把新文件内容同步好。
+
+\begin{warningbox}
+持久性证明必须写出对象集合和顺序，而不是只写一句“调用 fsync”：哪些文件的数据，
+哪些 inode 元数据，哪些父目录项，先后顺序怎样，每次调用是否检查错误，设备是否具有
+正确的持久化语义。应用若需要跨多个文件的原子提交，通常还要用 WAL、manifest 或
+数据库事务；单个文件的 fsync 不会自动把多个文件变成一个事务。
+\end{warningbox}
+
+最后，用四条不变量检查本节所有协议：
+
+\begin{enumerate}\tightlist
+\item 每个可达目录项都指向一个已分配、类型合法的 inode；
+\item 每个可达 inode 引用的数据块都已分配，且非共享格式中不会被别的 inode 重复拥有；
+\item 不可达且无运行时引用的零链接 inode 最终能够回收，清理中断后仍有恢复线索；
+\item 对外声称已经持久的状态，必须存在一条从有效超级块/日志提交点到该状态的完整恢复路径。
+\end{enumerate}
+
+前两条是空间与引用一致性，第三条是生命周期闭环，第四条是崩溃后的可证明性。后面的
+page cache、日志和 COW 看似是新主题，其实都在实现或优化这四条约束。
