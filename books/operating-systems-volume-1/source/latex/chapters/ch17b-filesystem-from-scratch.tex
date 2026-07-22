@@ -14,10 +14,10 @@
 在我们引入文件系统之前，先回到最底层：一块磁盘（无论是机械硬盘 HDD
 还是固态硬盘 SSD）对 CPU 而言是什么？
 
-答案极其简单：\emph{一个块号的线性数组}。
+从操作系统块层看，它可以先抽象成\emph{一个有固定容量、可按逻辑块寻址的线性空间}。这里的“块”不是宇宙通用的 4096 字节：设备逻辑块、设备物理块、文件系统块和内存页是四个相关但不同的粒度。为便于后面的算例，本节暂时假设文件系统块为 4096 字节。
 
 \begin{lstlisting}
-Block 0     Block 1     Block 2     ...     Block N-1
+FS Block 0  FS Block 1  FS Block 2  ...     FS Block N-1
 +-----------+-----------+-----------+-------+-----------+
 |  4096 B   |  4096 B   |  4096 B   |  ...  |  4096 B   |
 +-----------+-----------+-----------+-------+-----------+
@@ -26,38 +26,34 @@ Block 0     Block 1     Block 2     ...     Block N-1
   块号 = 起始字节地址 / 4096
 \end{lstlisting}
 
-每个块（block）是 4096 字节（在传统 HDD 上，物理扇区 sector 是 512 字节，
-但现代文件系统以 4096 字节的页 page 为逻辑单元）。CPU 不能直接用
+图中的 4096 字节只是本章示例。实际设备会报告 logical block size、physical block size、minimum I/O size 和 optimal I/O size；文件系统再选择自己的块大小，内存管理也有独立的页大小。CPU 不能直接用
 \code{mov} 指令读写这些块——磁盘不在内存地址空间中。CPU 必须通过
 \emph{磁盘控制器}（disk controller）间接访问。
 
 \subsection{DMA 路径：CPU 如何让磁盘干活}
 
-CPU 读写磁盘块的标准路径是 \emph{直接内存访问}（Direct Memory Access,
-DMA）。整个过程可以分解为以下步骤：
+现代高性能块设备通常用 \emph{直接内存访问}（Direct Memory Access,
+DMA）传输数据。下面是队列式设备的简化路径；具体设备可能使用 submission queue、descriptor ring 或厂商自定义命令格式，不能把某一种寄存器布局当成所有设备的标准。
 
 \begin{enumerate}\tightlist
-\item CPU 在内存中准备好一个 \emph{散布-收集列表}（scatter-gather list）。
-  每个条目描述一段物理内存区域：起始物理地址和长度。
-\item CPU 将 scatter-gather 列表的物理地址写入控制器的一个 MMIO 寄存器
-  （称为 DMA 描述符寄存器）。
-\item CPU 将命令（读/写、起始扇区号、传输长度）写入控制器的命令寄存器。
+\item 内核分配并 pin 住传输缓冲区，通过 DMA API 把它映射成设备可见的 DMA 地址；启用 IOMMU 时，这通常是 IOVA，不等同于 CPU 物理地址。
+\item 驱动在内存队列或描述符环中准备命令和散布-收集列表，并在发布前完成必要的内存排序。
+\item 驱动更新队列尾指针或写 doorbell MMIO 寄存器，通知控制器有新命令。
 \item 控制器开始工作：它自行读取 scatter-gather 描述符，然后通过总线
-  直接在磁盘和 RAM 之间搬移数据。\emph{CPU 全程不碰数据字节}。
+  在设备与已映射缓冲区之间传输数据。传输本身不依赖 CPU 执行逐字节复制指令，但 CPU 仍可能在提交前填充写缓冲区、在完成后解析或复制数据。
 \item 数据传输完成后，控制器向 CPU 发出一个中断（现代设备用 MSI-X
   消息信号中断）。
 \item CPU 的中断处理程序被调用，确认 I/O 完成。
 \end{enumerate}
 
-关键洞察：在 DMA 传输期间，CPU 是\emph{自由的}——它可以执行其他线程
-的指令。这就是为什么 DMA 比轮询（polling）I/O 高效得多。
+关键洞察：在 DMA 传输期间，发起 I/O 的线程通常不必占用 CPU 等待；CPU 可以执行其他线程，也可以按设备与负载选择中断或轮询完成队列。DMA 解决的是数据搬运方式，轮询与中断解决的是完成通知方式，两者不是互斥的替代关系。
 
 \begin{lstlisting}
   CPU               Memory                Disk Controller        Disk
    |                  |                        |                  |
    |--setup SG list-->| (write to RAM)         |                  |
-   |--write desc reg--------------------------->|                  |
-   |--write cmd reg---------------------------->|                  |
+   |--publish queue entry---------------------->|                  |
+   |--ring doorbell---------------------------->|                  |
    |                  |                        |--read SG list--->| (DMA)
    |     (free to     |<======== DMA transfer =====================>| (data)
    |      run other   |                        |                  |
@@ -139,17 +135,13 @@ int fd = open("/dev/sda", O_RDWR);
 \end{lstlisting}
 
 你得到一个文件描述符，它支持 \code{read}、\code{write}、\code{lseek}
-和 \code{fsync}。但有\textbf{关键区别}：
+和部分同步操作。但它有固定容量，而且 I/O 必须服从设备拓扑和访问模式的约束：
 
 \begin{itemize}\tightlist
-\item \code{lseek} 可以跳到任意字节偏移，但实际 I/O \emph{总是以块为单位}
-  对齐的。你 \code{lseek} 到字节 100 然后 \code{read} 1 字节，内核实际
-  会读取包含字节 100 的整个 4096 字节块。
-\item \code{write} 不到一个块大小的数据会导致读-修改-写（read-modify-write）：
-  内核先读整个块，修改你写入的部分，再写回整个块。
-\item \code{fsync} 在普通文件上是"把脏页刷到磁盘"，在块设备上也是类似语义。
-\item 块设备没有"文件结束"（EOF）——\code{lseek} 可以跳到设备容量的
-  最后一个字节。
+\item buffered I/O 可以接受字节范围，内核再通过缓存、合并和拆分生成满足设备限制的请求；\code{O\_DIRECT} 等路径通常要求地址、偏移和长度满足对齐约束，否则可能返回 \code{EINVAL}。
+\item 小于物理写入粒度或跨越不利边界的写，可能在块层、设备固件或闪存 FTL 中触发读-修改-写，但这不是每次短写都由 Linux 内核固定执行的步骤。
+\item 同步操作要区分页缓存写回、块层 flush/FUA 和设备持久化承诺；具体语义依文件类型、驱动和设备能力而定。
+\item 块设备的容量就是可寻址范围。到达容量边界后读取会得到 EOF 或短读，越界写会失败；它与普通文件的区别是容量通常不能通过普通 \code{write} 自动增长。
 \end{itemize}
 
 \subsection{Linux 块 I/O 栈}
@@ -317,44 +309,37 @@ I/O 调度器（I/O scheduler）处理。调度器的核心任务：
 \endhead
 none & 不调度，直接提交 & NVMe SSD & 随机访问延迟一致，无需排序 \\
 deadline & 读写分离队列，按扇区排序 + 截止时间 & HDD, 通用 & 防止请求饥饿 \\
-cfq & 完全公平队列，按进程分配时间片 & HDD, 桌面 & 尽量公平，开销大 \\
+cfq（历史） & 单队列时代按进程分配时间片 & 旧式 HDD 桌面系统 & 已被 blk-mq 时代的策略取代，不应作为当前默认方案 \\
 bfq & 预算公平队列，权重分配 & HDD, 桌面/移动 & 交互响应好 \\
 mq-deadline & 多队列版 deadline & NVMe + HDD & 兼顾排序与多队列 \\
 \end{longtable}
 
 \begin{warningbox}
-对于 NVMe SSD，\textbf{不要使用排序型调度器}。SSD 没有磁头，随机访问
-延迟与顺序访问几乎相同（$\sim$ 50 $\mu$s vs $\sim$ 50 $\mu$s）。
-排序只会增加 CPU 开销而不会减少 I/O 延迟。Linux 默认对 NVMe 使用
-\code{none} 调度器，仅做相邻合并。对 HDD，排序可以将随机 I/O 转为
-顺序 I/O，性能提升可达 10$\times$。
+NVMe 没有机械寻道，因此按扇区排序的收益通常远小于 HDD，但不能据此规定“永远使用 \code{none}”。\code{none}、\code{mq-deadline} 或 BFQ 的选择还取决于延迟隔离、公平性、虚拟化层和工作负载。应在目标设备上比较吞吐与尾延迟，而不是把设备类型直接映射成唯一调度器。
 \end{warningbox}
 
 \subsection{DMA 深入：从描述符到中断}
 
 当 I/O 调度器将请求派发给设备驱动后，驱动程序需要设置 DMA 传输。
-现代 DMA 控制器使用\emph{描述符链}（descriptor chain）：
+现代设备常用描述符环、散布-收集列表或 submission/completion queue。以队列式设备为例：
 
 \begin{enumerate}\tightlist
 \item CPU 在内存中构造一个或多个 DMA 描述符。每个描述符包含：
   \begin{itemize}\tightlist
-  \item 源/目的物理地址（对于读：源 = 磁盘扇区，目的 = RAM 物理页帧）
+  \item 设备可见的 DMA 地址与长度；启用 IOMMU 时地址通常是 IOVA
   \item 传输长度（字节数）
   \item 标志位（方向、中断使能）
-  \item 下一个描述符的物理地址（链表）
+  \item 下一个描述符索引、地址或队列位置，具体由设备格式定义
   \end{itemize}
-\item CPU 将第一个描述符的物理地址写入控制器的 DMA 描述符寄存器
-  （通过 MMIO）。
-\item CPU 向控制器的门铃寄存器（doorbell register）写入通知，触发
-  控制器开始处理。
+\item 驱动把描述符发布到设备约定的内存队列；有的设备在初始化时配置队列基址，有的设备使用链式描述符。
+\item 驱动执行必要的内存屏障，再更新队列尾指针或写 doorbell，触发控制器处理。
 \item 控制器\emph{自行}通过总线读取内存中的描述符（这是 DMA 本身的
   第一次使用——用 DMA 来读 DMA 描述符！）。
 \item 控制器按照描述符链执行数据传输：直接在磁盘和 RAM 之间搬移数据，
   \textbf{不经过 CPU 寄存器}。
 \item 每个描述符完成后，控制器可以发出一个中断；或者等所有描述符
   完成后发一个中断。现代设备通常用 MSI-X（Message Signaled Interrupts
-  with eXtended），中断消息直接写入 CPU 的 APIC 寄存器，无需传统
-  的中断引线。
+  with eXtended），设备发起约定地址与数据格式的内存写事务，由平台中断控制器路由到目标 CPU，无需传统中断引线。
 \item CPU 收到中断，调用驱动注册的中断处理函数。处理函数标记
   \code{bio} 为完成状态，调用 \code{bi_end_io} 回调。
 \end{enumerate}
@@ -410,16 +395,16 @@ Step 6: Device driver
     opcode = READ
     slba   = 40000 (starting LBA)
     nlb    = 7 (number of logical blocks = 8 sectors - 1, 0-based)
-    prp1   = physical address of page frame 0x00012345
+    prp1   = DMA address returned by the DMA mapping API
   - writes command to submission queue tail
   - rings doorbell register (SQyTDBL)
 
 Step 7: DMA transfer
   - NVMe controller fetches command from submission queue (via DMA)
   - controller reads 4096 bytes from NAND at LBA 40000
-  - controller writes 4096 bytes to RAM at physical frame 0x12345
+  - controller writes 4096 bytes through the mapped DMA address
   - CPU is free to run other threads during this transfer
-  - (transfer time: approx 50 us for NVMe, approx 5 ms for HDD)
+  - transfer latency depends on device, queue depth, cache state and workload
 
 Step 8: Interrupt
   - controller writes completion entry to completion queue
@@ -435,19 +420,12 @@ Step 9: Copy to user
   - read() returns 4096
 \end{lstlisting}
 
-注意 Step 7：\textbf{CPU 全程没有触碰数据字节}。数据从 NAND 芯片
-直接写入 RAM 物理页帧 0x12345，CPU 只是在 Step 9 做了一次
-\code{copy_to_user}（这是 CPU 到 CPU 的内存复制，不是设备 I/O）。
+注意 Step 7：设备通过 DMA 映射把数据写入内核页，CPU 不执行设备到内存的逐字节复制。Step 9 的 \code{copy\_to\_user} 仍由 CPU 完成；若使用 direct I/O、零拷贝或用户页 pin，数据路径又会不同。因此“DMA 不占用 CPU 搬运设备数据”不能简写成“整条 I/O 路径 CPU 不碰数据”。
 
-Step 8 中的中断处理在现代 NVMe 驱动中通常被推迟到\emph{软中断}
-（softirq / NAPI）。硬中断只做最少的工作（确认完成队列），大量
-处理在软中断中完成，以减少硬中断对实时性的影响。
+Step 8 的完成上下文取决于驱动和配置：NVMe 可以在中断处理路径中处理完成队列，也可以使用 polling 等模式。NAPI 是网络收包的中断缓和与轮询框架，不能作为通用 NVMe 完成机制的名称。
 
 \begin{warningbox}
-\code{read()} 的返回并不意味着数据在磁盘上——它只意味着数据在
-\textbf{页缓存}中。如果在这之后断电，数据是否在磁盘上取决于它
-是否已经被 writeback 线程刷回。只有 \code{fsync()} 强制 writeback
-完成并等待磁盘确认。这是"缓存一致性 vs 性能"的基本权衡。
+\code{read()} 成功返回表示请求的字节已经交给调用者；它不建立新的持久化承诺，也不需要随后调用 \code{fsync()} 来让这次读取“更可靠”。持久化问题属于写路径：\code{write()} 返回、脏页写回、块层完成和设备稳定介质承诺是不同边界。页缓存只说明读取可能从内存命中，不能据此推断数据此前是否由本次 I/O 从设备取回。
 \end{warningbox}
 
 %%% ================================================================
@@ -1351,14 +1329,12 @@ ext4 默认启用 \code{EXT4_EXTENTS} 标志（\code{i_flags} 中），此时
 
 经典的 UNIX 文件系统（ext2、UFS）在 inode 中保存若干
 \emph{直接指针}、一个\emph{单间接指针}、一个\emph{双间接指针}和一个
-\emph{三间接指针}。对小区件这足够了，但当文件增大时，
+\emph{三间接指针}。对小文件这足够了，但当文件增大时，
 随机访问一个偏移需要多次磁盘 I/O 才能定位数据块。
 
 考虑一个 1~GiB 的文件。在 4~KiB 块、4 字节指针的前提下：
 直接指针只能覆盖前 12 个块（48~KiB），其余都要走间接。
-一个落在双间接区的随机读，\emph{仅定位数据块}就要 3 次 I/O；
-落在三间接区要 4 次 I/O。对 HDD，每次 I/O $\sim$~10~ms，
-光查找开销就达 30--40~ms，与真正读取数据块的时间相当甚至更长。
+在 inode 已经驻留内存而间接块均未缓存时，双间接区要读取 2 个间接块，三间接区要读取 3 个间接块，然后才能读取数据块。对 HDD，这些元数据若分散在不同位置，机械寻道会显著放大延迟；具体数值取决于缓存命中、布局和设备，不能用一个固定毫秒数代表。
 
 \begin{warningbox}
 间接指针的本质缺陷：\emph{元数据散布在许多不连续的磁盘块中}。
@@ -1409,11 +1385,11 @@ logical_block = 5000000 / 4096 = 1220   // 落在双间接区
 
 \begin{enumerate}\tightlist
 \item \code{logical\_block = 1220}，落在双间接区（1036 起）。
-\item 读 \code{inode->block[13]}（双间接指针）$\rightarrow$ 间接块 6000。
-\item 在块 6000 中取索引 0 的指针 $\rightarrow$ 二级间接块 7000。
-\item 在块 7000 中取索引 184 的指针 $\rightarrow$ 数据块 8000。
+\item inode 已在内存中，其 \code{block[13]} 给出双重间接根块号 6000；读取块 6000（第 1 次 I/O）。
+\item 在块 6000 中取索引 0 的指针得到二级间接块号 7000；读取块 7000（第 2 次 I/O）。
+\item 在块 7000 中取索引 184 的指针得到数据块号 8000。
 \item 读块 8000 $\rightarrow$ 数据。
-\item \textbf{总计：3 次 I/O 定位 + 1 次数据读 = 4 次 I/O}（无缓存时）。
+\item \textbf{总计：2 次间接块 I/O + 1 次数据读 = 3 次 I/O}（inode 已在内存、间接块均未缓存时）。若连 inode 所在磁盘块也未缓存，还需另计读取 inode 的 I/O。
 \end{enumerate}
 
 \begin{pdfdiagram}
@@ -1432,8 +1408,8 @@ logical_block = 5000000 / 4096 = 1220   // 落在双间接区
 \node[os label, right=0.2cm of l1] {I/O \#1};
 \node[os label, right=0.2cm of l2] {I/O \#2};
 \node[os label, right=0.2cm of d] {I/O \#3};
-\diagramnote{双间接读偏移 5\,000\,000 的三次 I/O 链。无缓存时每跳 $\sim$~10~ms，定位开销 $\sim$~30~ms。}
 \end{pdfdiagram}
+\diagramnote{双间接读偏移 5\,000\,000 的三次 I/O 链：两个间接块加一个数据块。实际延迟由缓存命中、介质与队列状态决定。}
 
 \subsection{间接指针的问题总结}
 
@@ -1441,7 +1417,7 @@ logical_block = 5000000 / 4096 = 1220   // 落在双间接区
 \item \textbf{元数据膨胀}：100~MiB 文件需要 $\lceil(100 \times 1024 / 4)\rceil = 25600$
   个数据块，其中间接块约 25 个（每 1024 个数据块 1 个间接块），
   共 $25 \times 4 = 100$~KiB 纯元数据。
-\item \textbf{随机访问延迟}：三间接读需 4 次 I/O，SSD 上也有 $\sim$~0.4~ms。
+\item \textbf{随机访问延迟}：三间接读在最坏的无缓存路径上需要 3 次间接块 I/O 加 1 次数据 I/O；SSD 消除了机械寻道，但没有消除额外请求、队列和控制器处理成本。
 \item \textbf{元数据碎片化}：间接块本身可能不连续，进一步加剧寻道。
 \item \textbf{无范围信息}：无法高效表达"这 1000 个块连续"，
   导致 \code{FIEMAP} 类查询效率低。
@@ -1511,8 +1487,8 @@ inode 尾部的 60 字节（\code{i\_block[15]}）内联一个 extent header + 4
 \node[os label, below=0.05cm of l0] {ext: (0, 8000, 1024)};
 \node[os label, below=0.05cm of l1] {ext: (1024, 12000, 1024)};
 \node[os label, below=0.05cm of l2] {ext: (2048, 16000, ...)};
-\diagramnote{ext4 extent 树。根内联于 inode，depth=1 时指向若干叶块。}
 \end{pdfdiagram}
+\diagramnote{ext4 extent 树。根内联于 inode，depth=1 时指向若干叶块。}
 
 \subsection{追踪：在 depth=1 树中查找逻辑块 1500}
 
@@ -1531,7 +1507,7 @@ inode 尾部的 60 字节（\code{i\_block[15]}）内联一个 extent header + 4
 \item \textbf{总计：1 次 I/O（叶块）+ 1 次数据读 = 2 次 I/O}。
 \end{enumerate}
 
-对比：双间接方案需要 3 次定位 I/O。Extent 树减少为 1 次，
+对比：在 inode 驻留内存且元数据均未缓存时，双间接方案需要 2 次间接块 I/O，extent 树在这个示例里只需读取 1 个叶块，
 因为内联 header 不需要 I/O，而索引层只多一层。
 
 \subsection{Extent 的分裂与合并}
@@ -1676,8 +1652,8 @@ free[6] = {32}         // 剩下的 32
 \node[os small block, os compute, minimum width=1cm, below=0.3cm of c1.south east, anchor=north east] (d2) {8};
 \node[os small block, fill=BookGreenTint, draw=BookTeal, minimum width=0.5cm, below=0.3cm of d1.south west, anchor=north west] (e1) {4 分配};
 \node[os small block, os memory, minimum width=0.5cm, below=0.3cm of d1.south east, anchor=north east] (e2) {4};
-\diagramnote{Buddy 分配器：64 块区为服务 4 块请求，分裂 3 次，产生 3 个"伙伴"空闲块。}
 \end{pdfdiagram}
+\diagramnote{Buddy 分配器：64 块区为服务 4 块请求，分裂 3 次，产生 3 个"伙伴"空闲块。}
 
 Buddy 优势：合并 $O(1)$（释放时检查伙伴是否也空闲），
 但内部碎片高：请求 5 块也要分 8 块。
@@ -1697,8 +1673,8 @@ ext2 把磁盘分成\emph{块组}（block group），每组约 32768 个块
 \node[os small block, fill=BookGreenTint, draw=BookTeal, minimum width=3.5cm, right=0pt of it] (db) {数据块};
 \node[os label, below=0.1cm of sb] {组 0};
 \node[os label, below=0.1cm of db] {$\sim$~128~MiB};
-\diagramnote{ext2 块组布局。元数据与数据同居一组，利于 HDD 局部性。}
 \end{pdfdiagram}
+\diagramnote{ext2 块组布局。元数据与数据同居一组，利于 HDD 局部性。}
 
 \begin{keyidea}
 块组的三大设计理由：
@@ -1764,8 +1740,8 @@ flush / writeback: alloc 5000-5002 (连续)
 \node[os small block, fill=BookGreenTint, draw=BookTeal] at (2.7,1.5) {5001};
 \node[os small block, fill=BookGreenTint, draw=BookTeal] at (3.9,1.5) {5002};
 \node[os label] at (3,0.6) {1 个连续 extent};
-\diagramnote{延迟分配让 writeback 一次性分配连续块，消除逐次分配导致的碎片化。}
 \end{pdfdiagram}
+\diagramnote{延迟分配让 writeback 一次性分配连续块，消除逐次分配导致的碎片化。}
 
 \subsection{delalloc 的 ENOSPC 困境}
 
@@ -1991,8 +1967,8 @@ vfs_lookup("/home/user/foo.txt"):
 \node[os small block, fill=BookRedTint, draw=BookRed, below=0.5cm of etc] (neg) {no-such-file};
 \node[os label, right=0.1cm of neg] {负向 dentry};
 \draw[os bus] (etc) -- (neg);
-\diagramnote{dcache 树：正向 dentry 缓存存在路径，负向 dentry 缓存"不存在"。}
 \end{pdfdiagram}
+\diagramnote{dcache 树：正向 dentry 缓存存在路径，负向 dentry 缓存"不存在"。}
 
 % ============================================================
 \section{VFS：统一接口与分发}
@@ -2125,8 +2101,8 @@ struct file_operations {
 \node[os label, below=0.1cm of dentry] {路径缓存};
 \node[os label, below=0.1cm of inode] {文件};
 \node[os label, below=0.1cm of sb] {文件系统};
-\diagramnote{VFS 对象链：fd 引用 file，file 指向 dentry 和 inode，inode 属于 super\_block。}
 \end{pdfdiagram}
+\diagramnote{VFS 对象链：fd 引用 file，file 指向 dentry 和 inode，inode 属于 super\_block。}
 
 \subsection{分发机制}
 
@@ -2243,8 +2219,8 @@ Docker 镜像层叠正是基于 overlayfs。
 \draw[os feedback] (daemon.east) .. controls +(2,0) and +(2,0) .. (app.east);
 \node[os label, right=0.3cm of fuse, yshift=0.4cm] {请求下行};
 \node[os label, right=0.3cm of fuse, yshift=-0.4cm] {结果上行};
-\diagramnote{FUSE 请求往返：应用 $\rightarrow$ VFS $\rightarrow$ FUSE 内核 $\rightarrow$ 用户态守护进程，结果原路返回。}
 \end{pdfdiagram}
+\diagramnote{FUSE 请求往返：应用 $\rightarrow$ VFS $\rightarrow$ FUSE 内核 $\rightarrow$ 用户态守护进程，结果原路返回。}
 
 \subsection{小结}
 
@@ -2415,7 +2391,7 @@ if (page && PageUptodate(page)) {
     // copy_page_to_user: 把 page 内偏移拷到用户 buffer
     // 8192 在 page 2 内的偏移 = 8192 % 4096 = 0
     copy_page_to_iter(page, 0, 4096, buf);
-    // 没有任何磁盘 I/O。延迟 ~80 ns（内存拷贝）
+    // 没有设备 I/O；耗时取决于复制长度、CPU cache、缺页和调度状态
     return 4096;
 }
 
@@ -2717,7 +2693,7 @@ void wb_workfn(struct writeback_control *wbc)
             bio->bi_bdev = inode->i_sb->s_bdev;
             bio->bi_iter.bi_sector =
                 pblk * (blocksize >> 9);
-            // page 的物理地址作为 bio 的目标
+            // bio 记录 page、页内偏移和长度；DMA 映射在更低层建立
             bio->bi_io_vec[0].bv_page = page;
             bio->bi_io_vec[0].bv_len = 4096;
             bio->bi_io_vec[0].bv_offset = 0;
@@ -2918,9 +2894,9 @@ length 对齐 & 块对齐 & 不能 DMA 半个块 \\
 
 \subsection{DAX：持久内存直接访问}
 
-DAX（Direct Access）针对的是一类新型存储介质：\emph{持久内存}（persistent memory, PMEM），如 Intel Optane DC Persistent Memory、NVDIMM-N。PMEM 既有接近 DRAM 的访问延迟（$\sim$300 ns），又有磁盘的非易失性。
+DAX（Direct Access）面向可由 CPU load/store 访问的持久内存（persistent memory, PMEM）或支持 DAX 的设备映射。具体延迟依平台而变；稳定特征是它能绕过传统 page cache 数据路径，并保留非易失性介质的持久化要求。
 
-DAX 模式下，文件 \code{mmap} 返回的指针直接指向持久内存的物理地址。读写文件就是 CPU 的 load/store 指令，没有 page cache，没有 block I/O 层，没有 DMA。
+DAX 模式下，文件 \code{mmap} 返回用户虚拟地址，页表把该地址映射到持久内存页。应用可用 CPU load/store 访问映射内容，数据不经过传统 page cache，也不靠设备 DMA 完成每次 load/store；但地址仍然是受页表权限约束的虚拟地址。
 
 \begin{lstlisting}
 // DAX 写路径
@@ -2928,7 +2904,7 @@ struct data_t { int data; };
 int fd = open("/pmem/file.dat", O_RDWR);
 struct data_t *p = mmap(NULL, 4096,
     PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-// p 直接指向持久内存物理地址
+// p 是映射到持久内存页的用户虚拟地址
 
 p->data = 42;    // CPU store 指令直接写 PMEM
                  // 这是一条 mov 指令, 不经过 page cache
@@ -4541,18 +4517,16 @@ struct ext4_inode {
 
 \begin{pdfdiagram}
 \node[os block, fill=BookGreenTint] (meta)
-  {inode metadata (128 B)\\mode, uid, gid, size,\\timestamps, flags, generation};
+  {inode core fields (schematic)\\mode, uid, gid, size,\\timestamps, flags, generation};
 \node[os block, fill=BookAmberTint, below=0pt of meta] (data)
-  {inline data ($\sim$128 B)\\i\_block[15] (60 B) + extra space (68 B)};
+  {inline data (capacity varies)\\i\_block[15] (60 B) + inode xattr space};
 \node[os label, font=\scriptsize] at ($(meta.north west)+(-0.8,0)$) {0};
 \node[os label, font=\scriptsize] at ($(data.north west)+(-0.8,0)$) {128};
 \node[os label, font=\scriptsize] at ($(data.south west)+(-0.8,0)$) {256};
 \node[os label, font=\scriptsize, right=0.3cm of meta.east]
   {\textcolor{BookMuted}{inode = 256 B}};
-\diagramnote{ext4 inline data inode 布局。标准元数据 128 字节不变；i\_block[]
-和额外 inode 空间合并用作内嵌数据区域，合计 $\sim$ 128 字节。一个 100 字节
-的文件需要 0 个独立数据块。}
 \end{pdfdiagram}
+\diagramnote{ext4 inline data inode 布局示意。前一部分数据可放在 60 字节的 i\_block[] 区域，更多内容可使用 inode 的扩展属性空间；实际容量取决于 inode 大小和已有 xattr，不能固定写成 128 字节。足够小的文件可以不分配独立数据块。}
 
 Btrfs 提供了类似但更慷慨的内嵌支持。Btrfs 的 \emph{inline extent} 可以将整个
 小文件存储在 B 树叶子节点中，容量上限取决于叶子大小（通常 4 KiB）减去头部和
@@ -4640,9 +4614,9 @@ static __le32 ext4_extent_block_csum(struct inode *inode,
 \draw[os feedback, ->] (data) -- (btrfs)
   node[os label, midway, left, font=\scriptsize]
   {ext4 不校验文件数据};
+\end{pdfdiagram}
 \diagramnote{ext4 仅对元数据计算 CRC32C 校验和。文件数据块本身没有校验。
 Btrfs 和 ZFS 对所有数据和元数据均计算校验和，并在每次读取时验证。}
-\end{pdfdiagram}
 
 \begin{warningbox}
 ext4 的元数据校验和 \emph{不保护文件数据内容}。如果一个数据块在磁盘上
@@ -4713,14 +4687,13 @@ ext4 & --- & --- & --- & \emph{不支持}透明压缩 \\
 压缩后: 262144 / 3 = 87381 blocks (向上取整)
 空间:   87381 * 4 KiB = 341 MiB  (节省 683 MiB, 67%)
 I/O:    写入减少 67%, 读取减少 67%
-CPU:    压缩 1 GiB @ lz4 ≈ 2 s (CPU-bound)
-        解压 1 GiB @ lz4 ≈ 0.4 s
+CPU:    压缩和解压成本必须在目标 CPU、数据集和算法级别上实测
 
 === 性能权衡 ===
 I/O-bound:   CPU 空闲等 I/O → 压缩用 CPU 换 I/O → 吞吐 ↑
 CPU-bound:  CPU 已满 → 压缩增加 CPU 负载 → 吞吐 ↓
-SSD 4K rand read: ~100K IOPS → I/O-bound → 压缩有利
-HDD 4K rand read: ~200 IOPS → I/O-bound → 压缩极有利
+存储受限且 CPU 有余量 → 压缩可能提升吞吐
+CPU 已饱和或数据不可压缩 → 压缩可能降低吞吐
 \end{lstlisting}
 
 \begin{pdfdiagram}
@@ -4750,10 +4723,10 @@ HDD 4K rand read: ~200 IOPS → I/O-bound → 压缩极有利
   at ($(wapp.north)+(0,0.3)$) {write path};
 \node[os label, font=\scriptsize, text=BookNavy]
   at ($(rapp.south)+(0,-0.3)$) {read path};
+\end{pdfdiagram}
 \diagramnote{透明压缩的写入与读取路径。写入时压缩每个数据块，仅存储压缩后
 的数据。读取时先读取压缩块，再解压返回。对 I/O-bound 的工作负载，CPU 用在
 压缩上的时间通常远小于节省的 I/O 等待时间。}
-\end{pdfdiagram}
 
 % ------------------------------------------------------------------
 \subsection{块级去重}
@@ -4825,10 +4798,10 @@ int ddt_lookup(zfs_sb_t *zsb, ddt_entry_t *dde, void *data)
 \draw[os bus, ->] (sha) -- (table);
 \draw[os strong bus, ->] (table) -- (p1)
   node[os label, midway, right, font=\scriptsize] {hit: refcnt++};
+\end{pdfdiagram}
 \diagramnote{块级去重流程。写入时计算块内容的 SHA-256 哈希，在去重表中
 查找。如果哈希已存在，增加引用计数并返回已有物理块地址——不执行实际写入。
 新块才真正写入磁盘并添加到去重表。}
-\end{pdfdiagram}
 
 \begin{warningbox}
 去重表的内存在规模化后变得不可接受。对于 10 TiB 存储，DDT 需要 $\sim$ 256 GiB
@@ -4899,10 +4872,10 @@ read(0):   cache miss → reset win=4, read [0-3]                win=4
 
 \node[os label, font=\scriptsize] at (5,-0.8)
   {\textcolor{BookMuted}{绿 = hit, 红 = miss, 蓝 = prefetch}};
+\end{pdfdiagram}
 \diagramnote{预读窗口增长过程。每次缓存命中（绿色）后，窗口大小翻倍。
 蓝色区域为预取的页。窗口从 4 页增长到 128 页（512 KiB），在连续命中
 5 次后达到上限。}
-\end{pdfdiagram}
 
 预读算法的关键在于区分顺序访问与随机访问。如果检测到 \code{lseek()} 回退
 （当前读取位置在上次预读窗口之前），算法判定为随机访问，将窗口重置为 0
@@ -4958,10 +4931,10 @@ SSD 的垃圾回收（garbage collection, GC）是写放大的主要来源。当
 
 \node[os label] at (3.5,1.2) {GC 回收 stream 2 块: 全部无效 → 0 次复制};
 \node[os label] at (3.5,0.7) {\textcolor{BookMuted}{V = valid, X = invalid}};
+\end{pdfdiagram}
 \diagramnote{NVMe 多流写入。不同生命周期的数据分配到不同流，SSD 内部将
 流映射到不同的擦除块组。当 GC 回收 stream 2 的块时，所有页已无效——
 零次有效页复制，写放大 = 1.0。}
-\end{pdfdiagram}
 
 \emph{收益}：当 GC 回收 stream 2 的擦除块时，由于该流中的数据都是短寿命的，
 很可能所有页都已经失效——无需复制任何有效页，直接擦除即可。而对于 stream 0
@@ -5018,9 +4991,9 @@ ext4 的 \emph{延迟分配}（delayed allocation, \code{delalloc}）将物理�
 
 \node[os small block] (d) at (9.5,0.8) {disk: [A|B|C] contiguous};
 \draw[os strong bus, ->] (a) -- (d);
+\end{pdfdiagram}
 \diagramnote{延迟分配时间线。三次 \texttt{write()} 调用仅在内存中预留空间。
 写回时，ext4\_mballoc 一次性为所有脏页分配连续物理块，实现最优布局。}
-\end{pdfdiagram}
 
 \emph{预留与超额预留}：每个 inode 按需预留块数，但多个 inode 的预留可能
 重叠（即总预留量可能超过实际可用空间）。ext4 使用全局空闲块计数器
@@ -5040,10 +5013,7 @@ ext4 通过 \code{li\_get\_block\_create\_hint} 和预留机制尽量避免此�
 \subsection{持久内存与 DAX}
 % ----------------------------------------------------------------%
 
-\emph{非易失性内存}（non-volatile memory, NVM）以 DDR4/DDR5 DIMM 形态存在，
-字节寻址，断电后数据不丢失。Intel Optane PMEM（基于 3D XPoint）是典型代表
-（已停产，但技术概念仍然重要）。PMEM 的访问延迟 $\sim$ 300 ns——比 NVMe SSD
-（$\sim$ 10--100 $\mu$s）快 1--2 个数量级，比 DRAM（$\sim$ 100 ns）慢约 3 倍。
+\emph{非易失性内存}（non-volatile memory, NVM）可以提供字节寻址或可直接映射的持久存储。Intel Optane PMEM（基于 3D XPoint）是历史上的典型代表，虽然产品已经停产，DAX、缓存行写回和持久化域等概念仍然重要。延迟会随介质、CPU、NUMA 拓扑和访问模式变化，本章不使用固定纳秒数代表整个类别。
 
 \emph{DAX 模式}（Direct Access，\code{CONFIG\_FS\_DAX}）：当文件系统以 DAX
 模式挂载时（\code{mount -o dax}），\code{mmap()} 系统调用返回的虚拟地址
@@ -5101,10 +5071,10 @@ void fs_persist(int fd)
 
 \node[os label, font=\scriptsize] at (2.5,4.5)
   {DAX 省去 3 层：page cache + block layer + 驱动};
+\end{pdfdiagram}
 \diagramnote{DAX 与传统文件系统路径对比。传统路径需要 5 层
 （应用→系统调用→页缓存→块层→驱动→SSD），每次 I/O 需要系统调用。
 DAX 路径仅需 mmap 后直接 load/store 到 PMEM，零系统调用。}
-\end{pdfdiagram}
 
 \emph{持久性保证}：DAX 模式下，CPU store 指令将数据写入 L1/L2 缓存，
 然后通过写缓冲（write buffer）异步刷新到 PMEM。如果在刷新完成前断电，
@@ -5199,10 +5169,10 @@ open("/etc/passwd", O_RDONLY)
 \draw[os feedback, ->, text=BookRed] (l1.east) to[bend right=40]
   node[os label, midway, right, font=\scriptsize]
   {copy on write} (u.east);
+\end{pdfdiagram}
 \diagramnote{OverlayFS 层叠结构。merged 是应用程序看到的统一视图。
 upper 是可写层。lower1/lower2 是只读层。copy-up：首次写入 lower 层文件时，
 文件被复制到 upper 层，后续操作在 upper 副本上进行。}
-\end{pdfdiagram}
 
 \emph{性能注意}：copy-up 是同步操作——大文件的首次写入需要先完整复制文件
 到 upper 层。对于一个 1 GiB 的日志文件，首次 \code{open(O\_WRONLY)} 会触发
@@ -5213,41 +5183,37 @@ upper 是可写层。lower1/lower2 是只读层。copy-up：首次写入 lower �
 \section{设计选择与对比}
 % ==================================================================
 
-不同的文件系统做出了不同的设计选择，反映了对不同工作负载和约束的优化。
-下表比较了七个主流文件系统在十二个维度上的差异。
+不同的文件系统做出了不同的设计选择，反映了对工作负载、兼容性和故障模型的取舍。功能开关、容量上限和算法会随版本、格式参数和操作系统集成变化，因此这里比较稳定的设计轴，不把易过期的“yes/no”和最大容量数字伪装成永久事实。
 
-\begin{longtable}{L{0.12\linewidth}L{0.105\linewidth}L{0.105\linewidth}L{0.105\linewidth}L{0.105\linewidth}L{0.105\linewidth}L{0.105\linewidth}L{0.105\linewidth}}
-\caption{主流文件系统设计对比}\\
+\begingroup
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{@{}L{0.12\linewidth}L{0.24\linewidth}L{0.29\linewidth}L{0.27\linewidth}@{}}
+\caption{主流文件系统的稳定设计取舍}\\
 \toprule
- & \textbf{ext4} & \textbf{XFS} & \textbf{Btrfs} & \textbf{ZFS} & \textbf{F2FS} & \textbf{NTFS} & \textbf{APFS} \\
+\textbf{系统} & \textbf{更新与索引思路} & \textbf{主要优势} & \textbf{边界与代价} \\
 \midrule
 \endfirsthead
-\caption[]{主流文件系统设计对比（续）}\\
+\caption[]{主流文件系统的稳定设计取舍（续）}\\
 \toprule
- & \textbf{ext4} & \textbf{XFS} & \textbf{Btrfs} & \textbf{ZFS} & \textbf{F2FS} & \textbf{NTFS} & \textbf{APFS} \\
+\textbf{系统} & \textbf{更新与索引思路} & \textbf{主要优势} & \textbf{边界与代价} \\
 \midrule
 \endhead
 \bottomrule
 \endfoot
-块映射 & extent tree & B+tree extent & B-tree (COW) & B-tree (bpobj) & node table & run list & B-tree \\
-一致性 & jbd2 journal & journal & COW B-tree & COW + ZIL & checkpoint & \$LogFile & COW \\
-快照 & no (LVM) & no (reflink) & yes (subvol) & yes & no & VSS & yes \\
-压缩 & no & no & zlib/zstd/lzo & lz4/gzip/zstd & lz4/zstd & LZX/XPRESS & LZFSE/zlib \\
-去重 & no & reflink & exp. & yes (SHA256) & no & yes* & no \\
-内嵌数据 & $\sim$128--384 B & no & $\sim$3.8 KB & no & no & no & no \\
-延迟分配 & yes & yes & yes & yes & yes & no & yes \\
-校验和 & meta CRC32C & meta CRC32C & all CRC32C & all (fletcher4+) & meta CRC32C & no & all data \\
-碎片整理 & e4defrag & xfs\_fsr & no (COW) & no (COW) & GC & yes & yes \\
-最大文件 & 16 TiB & 8 EiB & 16 EiB & 16 EiB & 3.9 TiB & 8 PB & $\sim$8 EiB \\
-最大卷 & 1 EiB & 8 EiB & 16 EiB & 256 ZiB & 16 TiB & 8 PB & $\sim$8 EiB \\
-目标负载 & 通用 & 大文件 & 功能丰富 & 数据完整性 & Android/SSD & Windows & Apple/SSD \\
+ext4 & extent 映射，jbd2 日志保护元数据更新 & 成熟、兼容性广，适合通用 Linux 工作负载 & 不原生提供 Btrfs/ZFS 式子卷快照和透明压缩 \\
+XFS & allocation group、B+ 树和元数据日志 & 大文件、并行分配和高吞吐扩展性强 & 管理工具与恢复模型不同于 ext 系列；reflink 不等同于快照产品 \\
+Btrfs & 数据和元数据采用 COW B 树 & 校验和、子卷、快照、压缩和 send/receive 集成 & 重写型负载可能碎片化；defrag 会破坏 extent sharing 并增加空间占用 \\
+ZFS & COW 树、事务组、ZIL 与存储池 & 端到端校验、快照、压缩和冗余修复能力强 & 内存、运维模型和平台集成成本较高 \\
+F2FS & 日志结构写入，NAT/SIT、checkpoint 与 GC & 面向闪存，支持冷热数据分离和自适应分配 & 空间压力下前台 GC 会形成尾延迟；不提供原生通用快照 \\
+NTFS & MFT、run list 与 \$LogFile 元数据日志 & 与 Windows 权限、加密和管理生态紧密集成 & VSS 是上层卷影复制机制，不能简单等同于文件系统原生快照 \\
+APFS & COW 元数据、空间共享、clone 与 snapshot & 面向 Apple 平台，集成加密、快照和快速克隆 & 实现与可用特性受 Apple 系统版本约束，跨平台可观测性有限 \\
 \end{longtable}
+\endgroup
 
 \subsection*{设计哲学}
 
-\noindent\textbf{ext4}：向后兼容是首要约束。ext4 必须能在 ext2/ext3 的
-磁盘结构上工作——这意味着 128 字节的标准 inode 格式和块指针布局不能完全
-推翻。ext4 通过区段树（extent tree）向后兼容地扩展了块映射，通过 jbd2
+\noindent\textbf{ext4}：兼容演进是重要约束。ext4 继承 ext2/ext3 的磁盘格式家族，并通过 compatible/incompatible feature flags 区分旧实现能否安全挂载；新建文件系统也可以选择更大的 inode 和新特性。ext4 通过区段树（extent tree）扩展块映射，通过 jbd2
 日志提供崩溃一致性，通过 inline\_data 和元数据校验和增量地添加现代特性。
 这种保守的演进路径使 ext4 成为 Linux 最广泛使用的文件系统，但也限制了
 它支持快照和透明压缩等需要根本性结构改变的功能。
@@ -5260,11 +5226,9 @@ XFS 使用并行分配组（allocation groups, AG），每个 AG 有自己的 in
 优化和并行性使其在高性能计算和数据库工作负载中表现优异。
 
 \noindent\textbf{Btrfs}：Oracle 赞助开发，目标是成为 Linux 的``下一代文件
-系统''。Btrfs 的核心是 COW B 树——所有数据和元数据都存储在 B 树中，
-每次修改创建新副本。这使得快照几乎是零成本操作（只需复制根指针）。
+系统''。Btrfs 的核心是 COW B 树——元数据组织在多棵 B 树中，文件数据由 extent item 引用，更新通过 COW 发布新树路径。这使得创建快照通常很快，因为可以共享既有 extent。
 Btrfs 支持透明压缩、子卷（subvolume）、快照、发送/接收（send/receive）
-等现代特性。但 COW 的代价是碎片化——频繁修改的文件会被分散到不同位置，
-且 Btrfs 不支持在线碎片整理（COW 本质上与原地写入不兼容）。
+等现代特性。但 COW 的代价是碎片化——频繁修改的文件会被分散到不同位置。Btrfs 支持在已挂载文件系统上整理文件；代价是整理会重写 extent，并可能打破 reflink 或快照之间的 extent sharing，显著增加空间占用。
 
 \noindent\textbf{ZFS}：Sun Microsystems（后被 Oracle 收购）工程团队设计，
 将数据完整性置于一切之上。ZFS 的设计原则是``永不静默损坏''：每个块（数据
@@ -5277,21 +5241,17 @@ Btrfs 支持透明压缩、子卷（subvolume）、快照、发送/接收（send
 是 Android 设备。F2FS 的设计围绕闪存的物理特性：日志结构写入
 （log-structured write）将随机写转换为顺序写，减少闪存擦除次数；冷热
 数据分离（warm/cold separation）将不同生命周期的数据写入不同区域，
-减少 GC 开销；前台 GC 在空闲时主动整理碎片。F2FS 不支持快照和去重，
-但其对闪存的优化使其在移动设备上延长了 SSD 寿命。
+减少 GC 开销。后台 GC 可以在 I/O 空闲时清理；空间压力触发的前台 GC 则可能直接增加应用延迟。F2FS 不提供原生通用快照和去重，其目标是在闪存上平衡写放大、吞吐和尾延迟。
 
 \noindent\textbf{NTFS}：Microsoft 为 Windows NT 设计，使用 \$LogFile 日志
-保证元数据一致性。NTFS 的特色是卷影副本（Volume Shadow Copy, VSS）——
-通过 COW 快照机制实现系统还原点和备份。NTFS 支持透明压缩（LZX、XPRESS）
-和加密（EFS），但不支持内嵌数据或块级去重（Windows Server 2012+ 支持数据
-去重，但是后处理式而非实时）。NTFS 的最大文件大小（8 PB）和卷大小受
-簇大小限制。
+保证元数据一致性。小文件数据可以作为 resident attribute 保存在 MFT 记录中，
+大文件则用 run list 描述簇范围。NTFS 支持每文件压缩和 EFS 加密；Windows 的
+VSS 与服务器数据去重属于更大的存储栈，讨论时不能直接当成 NTFS 磁盘格式本身的能力。
 
 \noindent\textbf{APFS}：Apple 为 macOS/iOS 设计，2017 年推出。APFS 针对闪存
 优化——所有写入都是 COW，原生支持 TRIM，并为 SSD 优化了空间分配。APFS 的
-快照功能是 Time Machine 的底层机制。APFS 支持透明压缩（LZFSE、zlib）和
-加密（文件级）。APFS 的 clone（克隆）功能利用 COW 实现零成本文件复制。
-APFS 不支持去重，但其 COW 特性使得文件克隆和快照几乎无开销。
+快照可被 Time Machine 等上层功能使用。APFS 原生支持加密、snapshot 和 clone；
+clone 利用共享 extent 避免创建时复制全部数据，但后续写入仍会分配新空间，不能把它理解成永远零成本。
 
 \begin{keyidea}
 没有``最好的''文件系统，只有不同约束下的权衡。ext4 追求稳定兼容，
@@ -5374,22 +5334,17 @@ XFS 追求大文件吞吐，Btrfs 追求功能丰富，ZFS 追求数据完整性
 以下场景覆盖了最常见的文件系统故障模式：
 
 \begin{enumerate}\tightlist
-\item \textbf{崩溃在 fsync 之前}：创建文件 → 崩溃（在 \code{fsync} 之前）→
-      恢复 → \emph{文件不应存在}。验证文件系统不会暴露半创建的 inode。
-\item \textbf{崩溃在 fsync 之后}：创建文件 → \code{fsync} → 崩溃 → 恢复 →
-      \emph{文件必须存在且数据正确}。验证日志正确提交了事务。
+\item \textbf{崩溃在同步之前}：创建并写文件 → 在任意步骤崩溃 → 恢复。未建立持久化承诺时，文件可能不存在，也可能以某个已提交状态存在；测试应验证文件系统结构合法、旧状态仍可解释，并且不会暴露越界块、悬空目录项或未初始化数据，而不是强行要求“文件不应存在”。
+\item \textbf{新文件的持久发布}：创建并写临时文件 → \code{fsync(file)} → \code{rename} 到目标名 → \code{fsync(parent\_dir)} → 崩溃 → 恢复 → 文件名和正确数据都必须存在。只同步文件不能单独保证包含它的目录项已经持久化。
 \item \textbf{每 4K fsync 的吞吐量}：顺序写入 1 MiB，每 4 KiB 后调用
-      \code{fsync} → 测量吞吐量（IOPS）。这是数据库 WAL 的典型模式。
-      预期：ext4 $\sim$ 5K--10K IOPS；ZFS（ZIL on SSD）$\sim$ 10K--20K IOPS。
+      \code{fsync} → 测量吞吐量和 p50/p95/p99 延迟。这是数据库 WAL 的典型模式。报告必须记录设备型号、缓存与断电保护、文件系统版本、挂载参数、队列深度和测试工具；没有这些条件，不给固定“预期 IOPS”。
 \item \textbf{并发创建}：100 个进程各在同一目录中创建 1000 个文件 →
       \emph{无文件丢失、无数据竞争、无死锁}。验证目录锁的正确性。
 \item \textbf{满盘碎片化}：填充至 99\% → 随机 create/delete 10000 次 →
       测量碎片化（最大连续空闲区段 vs 总空闲空间）。验证分配器不会
       退化到无法分配连续区段。
 \item \textbf{SSD 写放大}：在 SSD 上写入 100 GiB → 读取 SSD SMART
-      \code{Media\_Wearout\_Indicator} → 计算实际闪存写入量与逻辑写入量
-      之比。ext4 顺序写预期 $\sim$ 1.0--1.2；F2FS 预期 $\sim$ 1.0--1.5；
-      ext4 随机写预期 $\sim$ 2--4（取决于 GC 效率）。
+      \code{Media\_Wearout\_Indicator} 或厂商提供的 NAND 写入计数 → 计算实际闪存写入量与逻辑写入量之比。不同 SSD 对 SMART 字段的定义不同，必须先验证计数单位，并把文件系统写放大与设备 FTL 写放大分开报告。
 \item \textbf{快照一致性}：创建快照 → 修改 10\% 的数据 → 验证快照仍然
       保存原始数据 → 删除快照 → 验证空间被正确回收。
 \item \textbf{累积崩溃}：在持续写入工作负载下，执行 1000 次随机断电 →
@@ -5454,8 +5409,7 @@ static int walk_component(struct nameidata *nd)
 \end{lstlisting}
 
 RCU walk 的性能优势在于完全避免了原子操作和缓存行争用。在高度并行的
-场景下（例如 Web 服务器处理数千并发请求），RCU walk 将路径查找的扩展性
-从 O(n) 锁争用提升到 O(1) 无锁读取。
+场景下（例如 Web 服务器处理数千并发请求），RCU walk 能显著减少共享锁和引用计数争用。不过路径遍历仍与路径分量数量相关，并没有从算法上的 $O(n)$ 变成 $O(1)$；改善的是并发扩展性和常数开销。
 
 % ------------------------------------------------------------------
 \detailsubsection{ext4 extent 查找}

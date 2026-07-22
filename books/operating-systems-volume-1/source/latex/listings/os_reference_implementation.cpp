@@ -384,7 +384,7 @@ class AddressSpace {
       return entry;
     }
     require(entry.cow, "write fault: permission denied");
-    if (!entry.page.unique()) {
+    if (entry.page.use_count() > 1) {
       PagePtr copied = this->allocator_.allocate_zeroed();
       copied->bytes = entry.page->bytes;
       entry.page = copied;
