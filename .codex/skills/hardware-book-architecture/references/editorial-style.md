@@ -30,3 +30,10 @@ Use these rules for reader-facing prose. They are editing rules, not manuscript 
 - Avoid filler conclusions such as “由此可见” when the next sentence can state the conclusion directly.
 - Do not vary a technical term merely for literary effect. In particular, keep Cache/cache, TLB, MMIO, DMA, IOMMU, PCIe, NVMe, PHY, FTL, fence, trace, bit, byte, and cycle internally consistent with the chapter’s established convention.
 - Keep warnings specific: state the violated condition, the observable symptom, and the measurement or correction that closes the loop.
+
+## Comment pseudocode at hardware boundaries
+
+- Comment the invariant or advancement rule, not a word-for-word translation of the next line.
+- State where a result becomes visible: combinational settling, active clock edge, bus sampling point, completion entry, persistence point, or recovery checkpoint.
+- For transactions, distinguish request, acceptance, data visibility, completion, and ownership return. For loops, name the exit and failure conditions. For state machines and microcode, distinguish same-cycle parallel controls from next-state transfer.
+- Keep comments short enough that the algorithm remains scannable. Two focused header comments are the default; add inline comments only when a branch or exceptional path would otherwise be ambiguous.

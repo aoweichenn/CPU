@@ -19,6 +19,15 @@ class Chapter:
     units: tuple[tuple[str, tuple[int, ...]], ...]
 
 
+@dataclass(frozen=True)
+class PseudocodeSpec:
+    """A stable pseudocode block selected by its first reader-visible line."""
+
+    prefix: str
+    category: str
+    expected: int = 1
+
+
 CHAPTERS = (
     Chapter(1, "levels-devices-digital-abstraction", "电平、器件与数字抽象", "数字硬件不是从符号 0 和 1 开始，而是从可测量的电压区间、可控制的电流路径和明确的失效边界开始。本章建立从物理节点到可靠 bit 的第一层抽象。", (("ch01-electricity-diode-switch.tex", (0, 1, 2)),)),
     Chapter(2, "gates-combinational-logic", "逻辑门与组合电路", "有了可靠电平，下一步是把受控路径组织成逻辑门，再把门组织成选择、译码和运算网络。本章始终同时追踪逻辑功能、传播延迟、负载和毛刺。", (("ch01-electricity-diode-switch.tex", (3, 4, 5)),)),
@@ -112,6 +121,186 @@ TARGET_REPLACEMENTS = {
     25: (("前面十四章", "前面二十四章"),),
     26: (("前面七章", "前面二十五章"),),
 }
+
+# Only algorithmic descriptions belong here.  Real Verilog/C/assembly examples,
+# equations, terminal transcripts and data layouts keep their native comments.
+# The expected counts make a moved, deleted or accidentally duplicated block fail
+# the build instead of silently losing its teaching annotation.
+PSEUDOCODE_SPECS: dict[int, tuple[PseudocodeSpec, ...]] = {
+    1: (PseudocodeSpec("if A can drive through a diode:", "decision"),),
+    2: (
+        PseudocodeSpec("if sel = 0, Y = A", "decision"),
+        PseudocodeSpec("if A = 0: Y = B", "decision"),
+    ),
+    3: (
+        PseudocodeSpec("on clock edge:", "sequential", 3),
+        PseudocodeSpec("next = current + 1", "sequential"),
+        PseudocodeSpec("f = Q3 XOR Q2", "sequential"),
+        PseudocodeSpec("case (S):", "state"),
+        PseudocodeSpec("for each bit:", "transaction"),
+        PseudocodeSpec("button pipeline:", "procedure"),
+    ),
+    5: (PseudocodeSpec("if op = ADD:", "decision"),),
+    6: (
+        PseudocodeSpec("CALL target, stack grows downward:", "trace"),
+        PseudocodeSpec("MOV R3, [R1 + 8]", "trace"),
+        PseudocodeSpec("MOV [R1 + 8], R3", "trace"),
+    ),
+    7: (
+        PseudocodeSpec("state EXEC_ADD:", "state"),
+        PseudocodeSpec("; 微程序示意：ADD 与条件跳转 BEQ 各对应一段微指令", "microcode"),
+        PseudocodeSpec("S0: read_sel_a=R1, read_sel_b=R2", "microcode", 2),
+        PseudocodeSpec("addr = base(a) + i * 4", "trace"),
+        PseudocodeSpec("status = MMIO[UART_STAT]", "transaction"),
+        PseudocodeSpec("if length > buffer_capacity:", "decision"),
+        PseudocodeSpec("product = 0", "algorithm"),
+        PseudocodeSpec("microinstruction sketch:", "microcode"),
+        PseudocodeSpec("ADD Rd, Rs:", "microcode"),
+    ),
+    8: (
+        PseudocodeSpec("branch predicted not taken:", "trace"),
+        PseudocodeSpec("8086 memory read sketch:", "transaction"),
+        PseudocodeSpec("8086 memory write sketch:", "transaction"),
+        PseudocodeSpec("IF:  PC -> instruction memory", "trace"),
+    ),
+    9: (
+        PseudocodeSpec("faulting load:", "trace"),
+        PseudocodeSpec("朴素版(i-j-k 顺序, float):", "algorithm"),
+    ),
+    10: (
+        PseudocodeSpec("SRAM read:", "transaction"),
+        PseudocodeSpec("单 bank，两次访问落在同一 bank 的不同行:", "trace"),
+        PseudocodeSpec("prepare DMA descriptor:", "transaction"),
+        PseudocodeSpec("receive ring:", "transaction"),
+        PseudocodeSpec("receive path:", "transaction"),
+    ),
+    11: (
+        PseudocodeSpec("READ OPERATION (step by step):", "transaction"),
+        PseudocodeSpec("WRITE OPERATION (writing 0 to cell", "transaction"),
+        PseudocodeSpec("ECC SEC-DED for 64-bit data word:", "algorithm"),
+    ),
+    12: (
+        PseudocodeSpec("effective address -> segmentation", "trace"),
+        PseudocodeSpec("80386-style address walk:", "transaction"),
+    ),
+    13: (
+        PseudocodeSpec("// 1. Precharge: BL = BLbar", "transaction"),
+        PseudocodeSpec("Row buffer HIT  (same row, different column):", "trace"),
+        PseudocodeSpec("for each DQ bit i:", "training", 2),
+        PseudocodeSpec("for vref = VREF_MIN", "training"),
+        PseudocodeSpec("每周期调度决策:", "state"),
+        PseudocodeSpec("读写批处理算法:", "algorithm"),
+        PseudocodeSpec("ECC 读路径:", "transaction"),
+    ),
+    14: (
+        PseudocodeSpec("Erase operation (block erase):", "procedure"),
+        PseudocodeSpec("Read operation (one page):", "transaction"),
+        PseudocodeSpec("ISPP algorithm (per page):", "algorithm"),
+        PseudocodeSpec("Read disturb mechanism:", "recovery"),
+        PseudocodeSpec("Bad block management:", "recovery"),
+        PseudocodeSpec("Garbage Collection (greedy algorithm):", "algorithm"),
+        PseudocodeSpec("Dynamic wear leveling:", "algorithm"),
+        PseudocodeSpec("Power-loss protection mechanism:", "recovery"),
+        PseudocodeSpec("NVMe Write command flow:", "transaction"),
+        PseudocodeSpec("Read retry sequence:", "recovery"),
+        PseudocodeSpec("Soft-bit read for LDPC:", "training"),
+        PseudocodeSpec("LDPC iterative decoding (simplified):", "algorithm"),
+        PseudocodeSpec("host memory: write SQ entry", "transaction"),
+    ),
+    15: (
+        PseudocodeSpec("TFC control loop:", "control_loop"),
+        PseudocodeSpec("seek state machine:", "state"),
+        PseudocodeSpec("track-following loop", "control_loop"),
+        PseudocodeSpec("NCQ optimization example:", "algorithm"),
+    ),
+    18: (PseudocodeSpec("handshake rule:", "transaction"),),
+    19: (
+        PseudocodeSpec("device command sequence:", "transaction"),
+        PseudocodeSpec("I2C register read transaction:", "transaction"),
+        PseudocodeSpec("SPI mode-0 byte read", "transaction"),
+        PseudocodeSpec("DMA receive sketch:", "transaction"),
+        PseudocodeSpec("scan_bus(bus):", "algorithm"),
+    ),
+    20: (
+        PseudocodeSpec("纹波测量流程", "procedure"),
+        PseudocodeSpec("偶发故障排查顺序", "diagnostic"),
+        PseudocodeSpec("面包板阶段就要养成的测量与设计习惯", "diagnostic"),
+    ),
+    21: (PseudocodeSpec("minimal whole-machine program:", "trace"),),
+    23: (PseudocodeSpec("1. 驱动把 64 B 命令项写入本核 SQ", "transaction"),),
+    24: (PseudocodeSpec("驱动侧提交一批命令的序列：", "transaction"),),
+    25: (
+        PseudocodeSpec("reset_handler:", "procedure"),
+        PseudocodeSpec("reset trace:", "trace"),
+        PseudocodeSpec("protected-mode checklist:", "procedure"),
+        PseudocodeSpec("M2 counter loop:", "algorithm"),
+        PseudocodeSpec("M3 trace example:", "trace"),
+        PseudocodeSpec("timer interrupt arrives while A runs", "trace"),
+    ),
+    26: (
+        PseudocodeSpec("STA 的 T3 一拍之内", "trace"),
+        PseudocodeSpec("1. 停机：", "procedure"),
+        PseudocodeSpec("T0  CO+MI", "microcode"),
+        PseudocodeSpec("W = [0x0000] * 128", "microcode"),
+        PseudocodeSpec("while 行为与预期不符:", "diagnostic"),
+    ),
+}
+
+PSEUDOCODE_COMMENTS: dict[str, tuple[str, str]] = {
+    "decision": (
+        "先判断条件，再只执行命中的分支；分支顺序同时表达优先级。",
+        "所有输入稳定后才读取结果；未覆盖的条件必须有明确默认行为。",
+    ),
+    "sequential": (
+        "右侧先由旧状态计算，所有状态只在有效时钟沿同时更新。",
+        "条件未命中或处于两个时钟沿之间时，寄存器保持原值。",
+    ),
+    "state": (
+        "当前状态与输入共同选择动作和下一状态，先确认每个分支的优先级。",
+        "本拍只计算 next，状态在时钟边界更新；等待和错误都要有去向。",
+    ),
+    "transaction": (
+        "逐行追踪发起者、所有权和可见性；请求被接受不等于事务完成。",
+        "以采样沿、状态位或 completion 为准，再允许消费者使用结果。",
+    ),
+    "trace": (
+        "按行追踪数据来源、经过的部件和最终写入目标。",
+        "只有标出的时钟沿、阶段或异常入口会改变体系结构可见状态。",
+    ),
+    "microcode": (
+        "每个 u/T 行代表一个控制节拍，同一行内的控制信号并行生效。",
+        "next 决定下一微地址；等待或错误时不得提前进入写回。",
+    ),
+    "algorithm": (
+        "每轮只推进一个元素或一个控制步，并保持中间状态的一致性。",
+        "退出条件成立后才提交结果；空集合、越界和失败要单独处理。",
+    ),
+    "training": (
+        "逐点扫描延迟或阈值并记录连续通过窗口，不能只看单个通过点。",
+        "训练结束取稳定窗口中心；没有有效窗口时进入明确失败路径。",
+    ),
+    "control_loop": (
+        "每个采样周期先测量、再计算误差，最后更新执行器。",
+        "输出必须限幅；测量无效或误差失控时转入安全状态。",
+    ),
+    "recovery": (
+        "先检测失效并保存仍可信的数据，再切换到备用位置或重试路径。",
+        "更新映射或元数据后必须校验；掉电重启应能判断最后有效版本。",
+    ),
+    "procedure": (
+        "按步骤依次执行，前一步的稳定结果是后一步的前提。",
+        "每一步都保留可观察读回；不满足预期就停在当前层排错。",
+    ),
+    "diagnostic": (
+        "先固定现象和测量点，再做一次单变量改动。",
+        "改动后回到上一边界复测，确认故障没有迁移到下一级。",
+    ),
+}
+PSEUDOCODE_ANNOTATION_RE = re.compile(r"^(?://|;|#) 注释（[^）]+）：")
+LSTLISTING_RE = re.compile(
+    r"(\\begin\{lstlisting\}(?:\[[^\n]*\])?\n)(.*?)(\\end\{lstlisting\})",
+    re.DOTALL,
+)
 
 
 def find_root(start: Path) -> Path:
@@ -594,6 +783,122 @@ def add_longtable_row_rules(text: str) -> str:
     return "".join(output)
 
 
+def _annotation_token(body: str) -> str:
+    """Use a familiar comment token without changing listing language metadata."""
+    if body.startswith(";"):
+        return ";"
+    if body.startswith("W = [0x0000] * 128"):
+        return "#"
+    return "//"
+
+
+def _strip_pseudocode_annotation(body: str) -> tuple[str, int]:
+    """Return the original listing body and number of generated comment lines."""
+    lines = body.splitlines(keepends=True)
+    count = 0
+    while count < len(lines) and PSEUDOCODE_ANNOTATION_RE.match(
+        lines[count].rstrip("\r\n")
+    ):
+        count += 1
+    return "".join(lines[count:]), count
+
+
+def annotate_pseudocode_listings(text: str, chapter_number: int) -> str:
+    """Add two teaching comments to every registered pseudocode listing."""
+    specs = PSEUDOCODE_SPECS.get(chapter_number, ())
+    counts = {spec: 0 for spec in specs}
+
+    def replace(match: re.Match[str]) -> str:
+        begin, body, end = match.groups()
+        original, prior_annotations = _strip_pseudocode_annotation(body)
+        matched = [spec for spec in specs if original.startswith(spec.prefix)]
+        if len(matched) > 1:
+            prefixes = [spec.prefix for spec in matched]
+            raise ValueError(
+                f"chapter {chapter_number}: ambiguous pseudocode listing {prefixes}"
+            )
+        if not matched:
+            if prior_annotations:
+                raise ValueError(
+                    f"chapter {chapter_number}: orphan pseudocode annotation before "
+                    f"{original.splitlines()[0] if original else '<empty>'}"
+                )
+            return match.group(0)
+
+        spec = matched[0]
+        counts[spec] += 1
+        if prior_annotations:
+            if prior_annotations != 2:
+                raise ValueError(
+                    f"chapter {chapter_number}: {spec.prefix!r} has "
+                    f"{prior_annotations} generated annotations, expected 2"
+                )
+            return match.group(0)
+
+        token = _annotation_token(original)
+        comments = PSEUDOCODE_COMMENTS[spec.category]
+        annotation = "\n".join(
+            f"{token} 注释（{label}）：{comment}"
+            for label, comment in zip(("推进", "边界"), comments)
+        )
+        return f"{begin}{annotation}\n{original}{end}"
+
+    annotated = LSTLISTING_RE.sub(replace, text)
+    mismatches = [
+        f"{spec.prefix!r}: expected {spec.expected}, found {counts[spec]}"
+        for spec in specs
+        if counts[spec] != spec.expected
+    ]
+    if mismatches:
+        raise ValueError(
+            f"chapter {chapter_number}: pseudocode inventory mismatch: "
+            + "; ".join(mismatches)
+        )
+    return annotated
+
+
+def audit_pseudocode_annotations(text: str, chapter_number: int) -> int:
+    """Fail unless each registered block has exactly two generated comments."""
+    specs = PSEUDOCODE_SPECS.get(chapter_number, ())
+    counts = {spec: 0 for spec in specs}
+    annotated_blocks = 0
+
+    for match in LSTLISTING_RE.finditer(text):
+        body = match.group(2)
+        original, annotation_count = _strip_pseudocode_annotation(body)
+        matched = [spec for spec in specs if original.startswith(spec.prefix)]
+        if len(matched) > 1:
+            raise ValueError(
+                f"chapter {chapter_number}: ambiguous annotated pseudocode block"
+            )
+        if not matched:
+            if annotation_count:
+                raise ValueError(
+                    f"chapter {chapter_number}: generated annotation has no inventory entry"
+                )
+            continue
+        spec = matched[0]
+        counts[spec] += 1
+        annotated_blocks += 1
+        if annotation_count != 2:
+            raise ValueError(
+                f"chapter {chapter_number}: {spec.prefix!r} has "
+                f"{annotation_count} generated comments, expected 2"
+            )
+
+    mismatches = [
+        f"{spec.prefix!r}: expected {spec.expected}, found {counts[spec]}"
+        for spec in specs
+        if counts[spec] != spec.expected
+    ]
+    if mismatches:
+        raise ValueError(
+            f"chapter {chapter_number}: pseudocode audit mismatch: "
+            + "; ".join(mismatches)
+        )
+    return annotated_blocks
+
+
 def main() -> int:
     root = find_root(Path.cwd().resolve())
     source_dir = root / "books/hardware-zero-to-machine/source/latex/chapters"
@@ -636,6 +941,8 @@ def main() -> int:
             "".join(body_parts).lstrip("\n"), chapter.number
         )
         body = apply_diagram_overrides(body, chapter.number, overrides_dir)
+        body = annotate_pseudocode_listings(body, chapter.number)
+        audit_pseudocode_annotations(body, chapter.number)
         body = format_chapter_end_exercises(body, chapter.number)
         body = split_oversized_longtables(body)
         body = add_longtable_row_rules(body)

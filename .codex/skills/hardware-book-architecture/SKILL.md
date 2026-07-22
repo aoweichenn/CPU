@@ -63,3 +63,9 @@ Do not claim completion from line counts alone. Report the ledger status, build 
 When improving wording, keep the intact legacy files as the content baseline and make repeatable editorial transformations in `scripts/build_26_chapters.py` or reader-facing additions. Do not hand-edit generated `chapters26/ch*.tex` without updating its source of truth.
 
 After regeneration, run `python3 .codex/skills/hardware-book-architecture/scripts/audit_prose.py`. Treat old numeric chapter references, `§` references, stale legacy chapter names, and vague relative section references as migration defects. Resolve them to stable topic or section names before publishing.
+
+## Keep pseudocode annotated
+
+Treat algorithms, state machines, transactions, training/recovery procedures, control loops, and micro-operation traces as pseudocode. Give every such `lstlisting` at least one comment about how state or ownership advances and one comment about its completion, commit, failure, or recovery boundary. Do not relabel equations, terminal transcripts, data layouts, or real Verilog/C/assembly examples as pseudocode merely to raise the count; preserve their native comments instead.
+
+Register generated-chapter pseudocode in `scripts/build_26_chapters.py` with a stable first-line prefix and expected occurrence count. Regenerate rather than hand-editing `chapters26`, then run `python3 .codex/skills/hardware-book-architecture/scripts/audit_pseudocode_comments.py`. A moved, missing, duplicated, unannotated, or multiply annotated registered block is a publishing failure.
