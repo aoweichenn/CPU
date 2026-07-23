@@ -1,6 +1,6 @@
 LATEX_DIR := source/latex
 PHONE_EXPORT_ROOT ?= /mnt/sdcard/STU/BOOKS
-PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/样本卷/操作系统演进样本
+PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/操作系统第一册
 
 .PHONY: pdf phone-export clean
 
