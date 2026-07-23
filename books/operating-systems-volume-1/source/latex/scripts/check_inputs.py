@@ -14,11 +14,10 @@ MAIN = ROOT / "main.tex"
 INPUT_RE = re.compile(r"\\input(?:topic|detail)?\{([^}]+)\}")
 CHAPTER_INPUT_RE = re.compile(r"^\\input\{chapters/([^}]+)\}", re.MULTILINE)
 
-EXPECTED_CHAPTERS = 17
-# Restructured from boot to runtime: power-on → process → memory → I/O → security.
+EXPECTED_PARTS = 4
+EXPECTED_CHAPTERS = 15
+# The OS volume starts at kernel objects; hardware and bare-metal material live separately.
 EXPECTED_CHAPTER_INPUTS = (
-    "ch01-boot-kernel-init",
-    "ch02-hardware-kernel-contracts",
     "ch01-os-map-and-contracts",
     "ch05-process-thread-scheduling",
     "ch09-system-calls-permissions",
@@ -76,8 +75,8 @@ def main() -> int:
         return 1
 
     parts = part_heading_count()
-    if parts != 5:
-        print(f"expected 5 top-level parts in main.tex, found {parts}")
+    if parts != EXPECTED_PARTS:
+        print(f"expected {EXPECTED_PARTS} top-level parts in main.tex, found {parts}")
         return 1
 
     chapters = chapter_heading_count()
@@ -100,7 +99,6 @@ def main() -> int:
         ROOT / "frontmatter" / "abbreviations.tex",
         ROOT / "backmatter" / "capability-checklist.tex",
         ROOT / "backmatter" / "supplement-reading-map.tex",
-        ROOT / "backmatter" / "source-reading-index.tex",
         ROOT / "supplements" / "hardware",
         ROOT / "supplements" / "pre-os",
         ROOT / "supplements" / "models",

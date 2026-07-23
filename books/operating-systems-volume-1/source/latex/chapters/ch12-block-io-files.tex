@@ -1,4 +1,4 @@
-\chapter{块设备、I/O 调度与文件路径}
+\chapter{块设备、I/O 调度与 VFS}
 
 从 bio 到用户 buffer，I/O 要穿过块层、调度器和 VFS。本章把 request 队列、merge/sort、fd→file→inode 链和 buffered/direct 路径串成一条线。把这条线走通，才能说清 \code{write} 为什么快返回、\code{fsync} 为什么慢，以及掉电后哪些数据会丢。
 
@@ -384,9 +384,9 @@ flag 不是都绑定在同一层。fd flag 绑定 fd 表项；file status flag �
 
 \code{O\_APPEND} 不是用户态先 \code{lseek} 到末尾再 \code{write}。后者在并发下会竞争：两个线程都看到同一个旧文件尾，然后互相覆盖。append 语义要求内核在持有文件系统相关锁的状态下决定写入位置。
 
-\subsection{源码阅读入口}
+\subsection{Linux VFS 的关键对象关系}
 
-fd 表和引用看 \filepath{fs/file.c}、\filepath{include/linux/fdtable.h}；open 和路径解析看 \filepath{fs/open.c}、\filepath{fs/namei.c}；read/write 主干看 \filepath{fs/read\_write.c}；page cache 看 \filepath{mm/filemap.c}；epoll 看 \filepath{fs/eventpoll.c}；io\_uring 看 \filepath{io\_uring/}。阅读时跟住一个 fd：它从整数变成 file，如何增加引用，如何进入具体 file operations，错误码在哪里返回，最后一个引用在哪里释放。
+Linux VFS 以 fd table、\code{file}、\code{dentry}、\code{inode} 和 file operations 组织打开文件；page cache 承载普通文件的缓存页，epoll 和 io\_uring 则在对象引用之上建立事件与异步完成关系。理解实现时应跟住一个 fd：它如何从整数索引解析为 \code{file}，引用如何增加，操作如何进入具体 file operations，错误如何返回，以及最后一个引用在何时释放。
 
 \section{I/O 路径}
 
@@ -592,7 +592,7 @@ fixed buffer/file 提高性能，但也把生命周期责任推给应用：buffe
 
 所以异步 I/O 的基本规则是：提交记录、buffer 所有权和 completion 消费必须绑定。真正能释放或复用 buffer 的点，不是“我不想等了”，而是“所有可能引用这个 buffer 的请求状态都已经收敛”。这和驱动层 DMA request 的规则是同一件事，只是对象从设备 descriptor 换成了用户可见的 SQE/CQE。
 
-\section{实践}
+\section{块 I/O 与文件路径观察}
 
 纸上实践一：画 fd 引用图。
 
@@ -620,7 +620,7 @@ PreparedBuffer
 
 异步 I/O 中，buffer 在 completion 前不能被上游复用；completion 失败不能被提交路径吞掉；cancel 后也可能收到迟到 completion，所以请求身份必须稳定。
 
-\section{测试}
+\section{队列、文件与错误路径验证}
 
 块层侧的测试覆盖合并、拆分、调度、flush 顺序和多队列身份：
 
@@ -651,7 +651,7 @@ PreparedBuffer
 
 第一版必须先保证句柄生命周期可解释。持久化和崩溃恢复不要另起一条线，而要回到 fd、file、inode、page cache、block request 和目录项这些对象上验收。
 
-\section{文件系统恢复与崩溃一致性}
+\section{VFS 与文件系统的持久化边界}
 
 VFS 给用户一个统一 fd 接口，具体文件系统负责目录项、inode、块映射、权限、日志和恢复。路径解析得到 dentry/inode，open 生成 file，read/write 进入 file operations，普通文件再落到 address\_space、page cache 和文件系统块映射。主线里先抓住对象边界，而不是先背某个文件系统格式。
 
