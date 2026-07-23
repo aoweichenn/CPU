@@ -319,3 +319,154 @@ PCIe 的中断不再需要一根设备专用导线。MSI/MSI-X 本质上是设�
 \begin{classicnote}
 PCIe 带宽应按有效负载计算。编码、包头、LCRC、ACK/NAK、流控和小包比例都会让应用带宽低于 lane 速率；队列深度不足还会使链路在等待完成包时空闲。
 \end{classicnote}
+
+\section{四、Lane、SerDes 与链路训练状态机}
+
+一条 PCIe lane 由一对发送差分线和一对接收差分线组成，两个方向可同时传输。发送端把并行数据编码、扰码并串行化，接收端经终端、均衡、时钟数据恢复和解串恢复为内部数据。多 lane 链路把相邻数据分配到多条 lane，接收端还要消除各 lane 到达时间差，再按原顺序合并。
+
+物理连接存在不等于链路可用。端口复位后由链路训练与状态状态机（Link Training and Status State Machine, LTSSM）推进：Detect 检测远端终端；Polling 交换训练序列并获得 bit/符号锁定；Configuration 确定 lane 编号、宽度和链路参数；L0 才是正常收发状态。信号质量或错误率恶化时，链路进入 Recovery 重新训练，也可能降速或降宽后回到 L0。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.0cm] (d) at (0,1.2) {Detect\\检测终端};
+  \node[hw state, minimum width=2.0cm] (p) at (3.0,1.2) {Polling\\锁定训练序列};
+  \node[hw state, minimum width=2.1cm] (c) at (6.1,1.2) {Configuration\\编号与宽度};
+  \node[hw compute, minimum width=2.0cm] (l0) at (9.2,1.2) {L0\\正常传输};
+  \node[hw control, minimum width=2.0cm] (r) at (9.2,-0.8) {Recovery\\重训练};
+  \draw[hw bus] (d) -- (p) -- (c) -- (l0);
+  \draw[hw danger] (l0.south) -- node[right,hw label]{进入恢复} (r.north);
+  \draw[hw return] (r.east) to[bend right=55] node[right,hw label]{恢复参数后返回} (l0.east);
+  \draw[hw return] (r.west) -- ++(-0.6,0) |- node[pos=0.25,below,hw label]{重新协商} (p.south);
+\end{pdfdiagram}
+\diagramnote{PCIe 链路训练的主路径。链路只有进入 L0 后才能承载普通 TLP；Recovery 可以回到 L0，也可以重新协商。设备“枚举不到”时，首先要区分物理链路尚未进入 L0，还是链路正常但配置事务失败。}
+
+早期代际使用 8b/10b 编码，每 8 bit 数据在线路上占 10 bit；Gen3 到 Gen5 使用 128b/130b 编码，编码效率为 $128/130\approx98.46\%$。以 Gen3 单 lane 的 8 GT/s 为例，扣除编码后单向原始字节率为
+
+\[
+8\times10^9\times\frac{128}{130}\div8\approx0.985\ \text{GB/s}.
+\]
+
+x4 链路只把该值乘 4，得到约 3.94 GB/s；这仍不是应用有效载荷，因为 TLP 包头、LCRC、数据链路包和完成等待尚未扣除。速率、宽度和有效负载比例必须分别记录，不能只读设备名称推断实际带宽。
+
+高速代际还需要接收均衡。发送端预加重或去加重补偿高频损耗，接收端 CTLE/DFE 调整通道响应，训练阶段在规定系数中选择误码率更低的工作点。训练成功但频繁进入 Recovery，通常意味着链路裕量不足；检查方向应包括插槽接触、参考时钟、走线损耗、连接器和电源噪声，而不只是驱动程序。
+
+\section{五、数据链路层：序号、重放与 credit}
+
+事务层交给链路层的 TLP 会加上序号和链路 CRC（LCRC）。接收端检查 LCRC：正确则用 ACK DLLP 确认已经接收，错误则用 NAK 请求从指定序号重新发送。发送端在收到确认前把 TLP 保存在 replay buffer 中；超时或 NAK 时从相应序号重放。重放修复的是单跳链路传输错误，不会把目标设备返回的 Unsupported Request 变成成功。
+
+\begin{longtable}{L{0.18\linewidth}L{0.32\linewidth}L{0.30\linewidth}L{0.12\linewidth}}
+\toprule
+机制 & 保存的状态 & 完成边界 & 不能解决 \\
+\midrule
+LCRC & 当前 TLP 的链路校验 & 接收端确认该包无链路位错误 & 端到端数据语义错误 \\\tablerowrule
+序号与 ACK & 已发送未确认序号范围 & 对端确认后释放 replay 项 & 目标设备执行失败 \\\tablerowrule
+NAK/超时重放 & replay buffer 中的完整 TLP & 重放包再次得到 ACK & 永久性通道故障 \\\tablerowrule
+credit 流控 & 对端可用 header/data 缓冲数量 & credit 足够才允许发出对应类别 & 软件队列自身溢出 \\
+\bottomrule
+\end{longtable}
+
+credit 是“对端保证能接收多少”的显式状态。Posted、Non-Posted 和 Completion 分别维护 header 与 data credit。发送方在发包前检查对应 credit，发出后扣减；接收端释放缓冲时再用流控 DLLP 返还。Memory Write 属于 Posted 类，Memory Read 请求属于 Non-Posted 类，其返回数据消耗 Completion credit。若 Completion credit 或 tag 耗尽，新的读请求必须停止，即使物理线路此刻空闲。
+
+credit 防止接收缓冲溢出，但不等于应用层公平。一个端口可以合法地占用大量 Non-Posted 请求和完成带宽，使其他流量延迟上升；交换机和根复合体仍需要虚通道、仲裁和 QoS 策略。
+
+\section{六、事务层：TLP 字段、拆分与完成匹配}
+
+一个请求 TLP 至少要表达类型、长度、请求者标识、tag、地址和属性。请求者标识通常对应 BDF；tag 标识请求者内部的一项在途状态。Memory Write 的 payload 直接跟在请求头后，属于 posted request；Memory Read 只发送地址和长度，目标稍后返回一个或多个 Completion with Data。
+
+返回数据可能被拆成多个 completion。请求者不能看到第一段就释放目标缓冲，而要根据 byte count、lower address、长度和 tag 累计已返回区间。所有期望字节都到齐且状态成功，读请求才完成。若 completion 状态报告 Unsupported Request、Completer Abort，或超时未返回，请求者必须以错误结束原事务，并保留足够信息定位目标 BDF 和地址。
+
+边界对齐限制也会拆分 TLP。设备发起 DMA 时，单个请求不能任意跨越协议规定的边界；最大有效载荷（MPS）限制写包大小，最大读请求（MRRS）限制单次读请求大小。一个 16 KiB 缓冲区可能被拆成多笔 TLP，再由根复合体映射为若干内存事务。驱动提交的是一个缓冲区，互连看到的却是一串带不同序号、地址和完成片段的包。
+
+\begin{longtable}{L{0.17\linewidth}L{0.22\linewidth}L{0.30\linewidth}L{0.20\linewidth}}
+\toprule
+事务 & 是否带 payload & 是否逐笔返回 completion & 主机必须保存 \\
+\midrule
+Memory Write & 是 & 通常否 & 写入顺序、错误报告和必要的 fence \\\tablerowrule
+Memory Read & 否 & 是，可能多段 & tag、目标缓冲、剩余字节、超时 \\\tablerowrule
+Config Read & 否 & 是 & BDF、寄存器号、枚举状态 \\\tablerowrule
+MSI/MSI-X & 小型写消息 & 否 & 中断地址/数据与向量配置 \\
+\bottomrule
+\end{longtable}
+
+posted write 没有逐笔 completion，因此“写包离开发送端”不等于“目标副作用已完成”。需要确认前序 posted write 已到达目标时，可以按设备协议发起一次会返回 completion 的读，或使用设备定义的 flush/fence 寄存器。具体边界必须由设备规范给出，不能把 PCIe 链路 ACK 当成设备动作完成。
+
+\section{七、配置空间、BAR 与枚举资源分配}
+
+枚举从根复合体发起配置读开始。系统遍历总线号、设备号和功能号，读取 Vendor ID/Device ID；有效功能再读取 class code、header type 和能力链表。桥设备会建立新的下游总线号范围，枚举因此沿树状拓扑递归进行。设备驱动尚未加载时，固件或操作系统已经完成了链路训练、身份发现和资源窗口分配。
+
+BAR 描述设备需要的地址空间类型和大小。固件在关闭相应地址译码后向 BAR 写全 1，再读回硬件保留的地址位掩码，由最低可实现地址位计算窗口大小；随后从系统 MMIO 或 I/O 资源池分配满足对齐的基址，写回 BAR，并在命令寄存器中启用 Memory Space 或 I/O Space。64-bit BAR 占用相邻两个 BAR 寄存器，必须作为一个整体处理。
+
+例如读回 32-bit Memory BAR 掩码 \code{0xFFFFF000}，忽略低属性位后，最低 12 bit 不可实现，表示窗口大小为 $2^{12}=4$ KiB，基址也必须按 4 KiB 对齐。若系统把 \code{0x80004000} 写回，该功能就在相应地址范围响应 MMIO 事务。BAR 只建立地址窗口；DMA 能力、IOMMU 映射和中断向量还要另行配置。
+
+能力链表把 MSI/MSI-X、PCIe 能力、电源管理和 AER 等结构串联起来。软件必须沿 next pointer 解析，不能假定结构出现在固定偏移。SR-IOV 等扩展能力则位于扩展配置空间，允许一个物理功能创建多个虚拟功能；每个功能仍有独立身份、资源和隔离要求。
+
+\section{八、中断、错误分级与链路恢复}
+
+MSI-X 表项包含消息地址、消息数据和屏蔽位。驱动先建立中断处理程序，再写表项，执行必要屏障，最后解除向量屏蔽和设备中断总开关。若先允许设备发送，设备可能在表项尚未稳定时发出消息，导致中断投递到错误向量。
+
+AER 把错误按可纠正、不可纠正非致命和不可纠正致命分类。接收端错误、重放计时器等可纠正事件可能由硬件重试后继续运行，但计数持续增长说明物理裕量不足。Unsupported Request、Completion Timeout 等非致命错误通常终止相关事务，设备其余功能可能继续。链路或数据状态无法信任时，错误可升级为致命并触发端口隔离、下游复位或系统级恢复。
+
+恢复顺序必须先停止新流量，再处理在途状态。驱动通常屏蔽中断、停止提交、等待或取消队列，平台隔离故障功能并执行 function-level reset、secondary bus reset 或更大范围复位；重新训练和重新枚举之后，软件重建 BAR、IOMMU 和队列状态。旧 completion 不能写入已经重新分配的缓冲区，因此复位前后的世代必须可区分。
+
+\section*{章末练习}
+
+\begin{chapterexercise}{分层概念}
+分别说明事务层、数据链路层和物理层为一笔读请求增加什么保证
+\exercisecheck{检查要点}{不把链路重放当成设备执行重试}
+\end{chapterexercise}
+
+\begin{chapterexercise}{训练 trace}
+写出 Detect 到 L0 的主状态，并说明频繁进入 Recovery 的排查方向
+\exercisecheck{检查要点}{区分物理不上线与配置事务失败}
+\end{chapterexercise}
+
+\begin{chapterexercise}{带宽演算}
+计算 Gen3 x4 扣除 128b/130b 后的单向字节率，再说明为何应用带宽更低
+\exercisecheck{检查要点}{编码效率、包开销与队列深度分别计算}
+\end{chapterexercise}
+
+\begin{chapterexercise}{完成匹配}
+一笔 1024 B Memory Read 分四个 completion 返回，说明请求者何时释放 tag
+\exercisecheck{检查要点}{所有字节到齐或错误闭合后才释放}
+\end{chapterexercise}
+
+\begin{chapterexercise}{BAR 计算}
+对掩码 \code{0xFFFFE000} 求窗口大小和允许的基址对齐
+\exercisecheck{检查要点}{忽略属性位并从最低地址位计算}
+\end{chapterexercise}
+
+\begin{chapterexercise}{故障定位}
+设备由 x8 降到 x1 且 AER 可纠正错误增长，给出物理层到软件层的检查顺序
+\exercisecheck{检查要点}{先查链路裕量，不先修改应用逻辑}
+\end{chapterexercise}
+
+\section*{参考解答与要点}
+
+\begin{chapteranswer}{分层概念}
+事务层表达地址、类型、tag 与完成语义；链路层加序号、LCRC、ACK/NAK、重放和 credit；物理层负责训练、编码、串行传输和信号恢复。
+\answercheck{必须保留的检查点}{三层错误边界不可互相替代}
+\end{chapteranswer}
+
+\begin{chapteranswer}{训练 trace}
+主路径为 Detect、Polling、Configuration、L0；错误率或参数变化可进入 Recovery。检查终端检测、参考时钟、lane 接触、均衡、走线和电源噪声。
+\answercheck{必须保留的检查点}{L0 是普通 TLP 可传输的边界}
+\end{chapteranswer}
+
+\begin{chapteranswer}{带宽演算}
+$8\text{ GT/s}\times128/130\div8\times4\approx3.94$ GB/s。TLP/DLLP、LCRC、ACK、空闲和小包比例继续降低有效负载带宽。
+\answercheck{必须保留的检查点}{GT/s 不能直接当 GB/s}
+\end{chapteranswer}
+
+\begin{chapteranswer}{完成匹配}
+请求者按 tag 定位表项，累计四段的地址与 byte count；四段完整且均成功后释放。任何状态错误或超时都以失败闭合。
+\answercheck{必须保留的检查点}{第一段完成包不代表整笔请求完成}
+\end{chapteranswer}
+
+\begin{chapteranswer}{BAR 计算}
+掩码低 13 个地址 bit 为 0，窗口大小为 $2^{13}=8$ KiB，基址必须按 8 KiB 对齐。
+\answercheck{必须保留的检查点}{64-bit BAR 还要合并高低两个寄存器}
+\end{chapteranswer}
+
+\begin{chapteranswer}{故障定位}
+先读链路状态确认协商宽度与速率，再看 LTSSM/Recovery 和 AER 计数，随后检查插槽、连接器、lane 走线、参考时钟与供电，最后才验证固件参数和驱动。
+\answercheck{必须保留的检查点}{降宽通常首先指向 lane 可用性或信号质量}
+\end{chapteranswer}

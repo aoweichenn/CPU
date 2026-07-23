@@ -291,3 +291,143 @@ TLB miss、页表项有效 & page-table walker & 读取页表并回填 TLB \\\ta
 切换进程时，旧 TLB 项不能被新地址空间误用。最简单的办法是清空 TLB；带 ASID/PCID 的实现把地址空间标识一同参与匹配，使多个进程的翻译可以共存。操作系统修改已缓存的页表项后，还必须向相关核心发出 TLB shootdown，并等待它们确认失效，之后才能回收旧页框。
 
 设备侧 IOMMU 使用相同思想把设备虚拟地址翻译成物理页框，并按设备或进程检查权限。它解决的是 DMA 隔离与地址重映射，不会自动替代 CPU Cache 一致性和描述符可见性屏障。
+
+\section{四、逐位走完一次四级页表遍历}
+
+考虑一种常见的 48-bit 虚拟地址、4 KiB 页面、每级页表含 512 项的四级结构。页内偏移占 12 bit，每级索引占 9 bit，虚拟地址可写成 $[L4:9][L3:9][L2:9][L1:9][offset:12]$。根页表的物理地址保存在页表基址寄存器中；walker 用 L4 索引读取第一级页表项，取出下一级页框，再依次使用 L3、L2、L1 索引。末级页表项给出物理页框号，与原 offset 拼接成物理地址。
+
+每次读取页表项都必须检查 present、读写、用户/特权、可执行和保留位等约束。权限通常沿层级收紧：上层禁止用户访问时，下层不能重新放开。若中间层页表项声明大页，遍历提前结束，由更低的部分 VPN 直接充当大页内偏移。由此可见，大页既减少 TLB 项需求，也减少 walker 的内存访问次数。
+
+\begin{pdfdiagram}[
+  node distance=7mm and 9mm,
+  vmbox/.style={draw, rounded corners, align=center, minimum width=25mm, minimum height=9mm, fill=blue!5},
+  vmdecision/.style={draw, diamond, aspect=2.0, align=center, fill=yellow!8},
+  >=Stealth]
+\node[vmbox] (req) {虚拟地址访问};
+\node[vmdecision, right=of req] (tlb) {TLB 命中？};
+\node[vmbox, right=of tlb, yshift=10mm] (access) {权限检查\\访问 Cache};
+\node[vmbox, right=of tlb, yshift=-10mm] (walk) {逐级读取 PTE};
+\node[vmdecision, right=of walk] (valid) {映射有效？};
+\node[vmbox, right=of valid, yshift=10mm] (fill) {回填 TLB};
+\node[vmbox, right=of valid, yshift=-10mm] (fault) {精确缺页异常\\操作系统处理};
+\draw[->] (req) -- (tlb);
+\draw[->] (tlb) -- node[above, font=\small]{是} (access);
+\draw[->] (tlb) -- node[below, font=\small]{否} (walk);
+\draw[->] (walk) -- (valid);
+\draw[->] (valid) -- node[above, font=\small]{是} (fill);
+\draw[->] (fill) |- (access);
+\draw[->] (valid) -- node[right, font=\small]{否} (fault);
+\draw[->] (fault) |- node[pos=0.25, below, font=\small]{修复映射后重试} (req);
+\end{pdfdiagram}
+\diagramnote{TLB miss 后的地址转换与重试路径。硬件遍历成功时回填并继续访问；映射缺失时形成精确异常，操作系统修复映射后回到原指令。}
+
+walker 并非每次都从 DRAM 读取四次。页表项参与普通 Cache 层次，一些实现还设置 page-walk cache，缓存上层页表项或部分遍历结果。若多个 miss 共享上层索引，后续遍历可复用状态；但 walker 槽位和内存请求队列有限，密集 TLB miss 仍会形成排队。
+
+\section{五、TLB 层次、权限与访问状态}
+
+处理器常为指令和数据各设小型一级 TLB，再用容量更大的二级统一 TLB 降低 page walk 频率。TLB 项至少保存 VPN、页框号、页大小、ASID/PCID、权限和内存类型。匹配时既要比较地址，也要比较地址空间标识；大页与小页项共存时，还要按各自页大小屏蔽不同数量的低位。
+
+页表项的 accessed 和 dirty 状态帮助操作系统判断页面活跃度与回写需要。有的体系结构由硬件置位，有的由软件通过首次访问异常模拟。更新这些位本身是共享内存写，walker、Cache 和操作系统清位之间必须遵守体系结构规定，避免丢失一次并发访问。
+
+内存类型同样是翻译结果的一部分。普通可缓存内存允许推测和合并，而设备内存往往限制重排、推测或访问宽度。把 MMIO 页错误地映射为普通 Cache 内存，不只是性能问题，还可能使寄存器读写次数和顺序偏离设备协议。
+
+\section{六、VIPT Cache 的别名边界}
+
+L1 常用虚拟 index 与物理 tag 并行 TLB 查询。要避免同一物理地址因不同虚拟别名落入不同集合，index 与 line offset 最好完全位于页内偏移。例如 4 KiB 页面、64 B line 只有 6 bit 可用于 index，因此每路最多容纳 $2^6\times64=4$ KiB；8 路 Cache 可做到 32 KiB 而不越过这一自然边界。
+
+若容量或索引超出页内位，硬件需要额外的别名检测、页着色或其他约束。这里的关键不是“虚拟地址能否访问同一页面”，而是 Cache 在物理 tag 尚未返回时用哪些位选择了集合。指令自修改、同一页多重映射和 DMA 所有权交接都会使别名问题更加明显。
+
+\section{七、缺页异常、写时复制与精确重试}
+
+page fault 是地址转换的受控分支，不等同于程序崩溃。需求零页可分配新物理页并清零；文件映射缺页可从页缓存或存储装入；换出页需要发起 I/O；写时复制则在首次写入共享只读页时分配新页、复制内容并修改当前进程映射。只有地址非法或权限无法修复时，操作系统才把错误报告给进程。
+
+为了正确重试，处理器必须保留发生异常的指令边界，使该指令没有留下对体系结构可见的半完成状态。操作系统修复页表、执行必要的 TLB 失效后，从原指令重新执行。若缺页发生在一次跨页访问中，实现还要确保前半段不会被重复提交两次。
+
+缺页处理中的 I/O 可以让当前线程睡眠，调度器运行其他任务。页面到达后，内核更新 PTE，再将线程置为可运行。因而一次 load 的墙钟时间可能包含存储设备延迟，但执行单元并不会一直占住流水线等待。
+
+\section{八、TLB shootdown 的完整时间线}
+
+修改映射的核心不能在写完 PTE 后立即回收旧页框。它先发布新 PTE 或清除旧 PTE，再向可能缓存该地址空间翻译的核心发送处理器间中断；远端核心执行本地 TLB 失效并确认；发起者收齐确认后，才可把旧页框交给其他用途。否则远端核心可能用陈旧翻译访问已重新分配的数据。
+
+ASID/PCID 减少上下文切换时的全量清空，却不能消除同一地址空间页表修改所需的定向失效。为避免标识复用造成旧项误命中，操作系统还要管理 generation：标识绕回或重新分配时，对相关旧项作全局清理。批量 unmap 可合并失效范围和中断次数，但会延迟页框回收。
+
+\section{九、嵌套翻译与 IOMMU}
+
+虚拟机中，客户虚拟地址先经客户页表成为客户物理地址，再经管理程序维护的第二阶段页表成为主机物理地址。一次普通 page walk 中的每个客户页表地址本身还要经过第二阶段翻译，最坏访存次数会成倍增加，因此硬件会缓存组合翻译和中间结果。故障报告必须区分第一阶段权限错误与第二阶段映射缺失，交给不同软件层处理。
+
+IOMMU 也可提供多级翻译、权限和设备标识隔离。设备提交的地址先由 IOMMU 转换，缺失可能导致请求阻塞、页请求消息或 DMA 错误，取决于平台能力。即使 CPU 与设备共享虚拟地址，TLB 失效、设备在途请求、Cache 一致性和页框回收仍要按明确次序闭合。
+
+\begin{longtable}{L{0.2\linewidth}L{0.32\linewidth}L{0.38\linewidth}}
+\toprule
+故障位置 & 典型含义 & 主要处理者 \\
+\midrule
+CPU 第一阶段 & 进程页未映射或权限不符 & 客户/主机操作系统 \\\tablerowrule
+CPU 第二阶段 & 虚拟机物理页未映射 & 管理程序 \\\tablerowrule
+IOMMU 翻译 & 设备地址越界、权限错误或项缺失 & IOMMU 与设备驱动 \\\tablerowrule
+内存访问阶段 & 翻译成功后出现总线或 ECC 错误 & 平台 RAS 路径 \\
+\bottomrule
+\end{longtable}
+
+\section*{章末练习}
+
+\begin{chapterexercise}{1}
+地址分解
+\exercisecheck{题目}{将一个 48-bit 虚拟地址按四级 4 KiB 页表拆分，说明每段位数及每级 512 项的来源。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{2}
+性能分析
+\exercisecheck{题目}{在不命中任何 TLB 或页表缓存、页表项均命中数据 Cache 与均落到 DRAM 两种情况下，比较一次 load 需要的存储访问。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{3}
+Cache 联动
+\exercisecheck{题目}{4 KiB 页面、64 B line 的 VIPT Cache 为什么每路容量自然受 4 KiB 约束？8 路时可得到多大容量？}
+\end{chapterexercise}
+
+\begin{chapterexercise}{4}
+异常路径
+\exercisecheck{题目}{按顺序描述写时复制 fault 从指令触发到安全重试的状态变化。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{5}
+并发正确性
+\exercisecheck{题目}{某核心撤销映射后立即复用旧页框，为什么即使已写回 PTE 也不安全？给出正确的 shootdown 顺序。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{6}
+设备隔离
+\exercisecheck{题目}{IOMMU 翻译成功是否意味着 DMA 数据一定已与 CPU Cache 保持一致？说明理由。}
+\end{chapterexercise}
+
+\section*{参考解答与要点}
+
+\begin{chapteranswer}{1}
+地址分解
+\answercheck{解答要点}{offset 为 12 bit，其余 36 bit 分成四段各 9 bit；每项 8 B 时，一页可放 $4096/8=512=2^9$ 项。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{2}
+性能分析
+\answercheck{解答要点}{页表项全命中 Cache 时，逻辑上仍有四级遍历和最终数据访问，但下级流量较小；全部落到 DRAM 时，最坏是四次页表读取加一次数据读取，且存在串行依赖。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{3}
+Cache 联动
+\answercheck{解答要点}{offset 6 bit，页内剩余 6 bit 可作 index，共 64 个集合；每路容量为 $64\times64$ B，即 4 KiB，8 路总容量 32 KiB。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{4}
+异常路径
+\answercheck{解答要点}{写权限检查失败并形成精确异常；内核确认 COW，分配和复制新页，更新当前进程 PTE，失效旧 TLB 项，然后返回原指令重试。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{5}
+并发正确性
+\answercheck{解答要点}{远端 TLB 可能仍缓存旧翻译。应先修改 PTE，向相关核心发送失效请求，等待它们执行并确认，最后回收或复用页框。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{6}
+设备隔离
+\answercheck{解答要点}{不能。IOMMU 处理地址与权限；非一致性 DMA 仍需 Cache 维护和屏障，并要等待设备在途事务结束后才能回收页。}
+\end{chapteranswer}

@@ -479,3 +479,125 @@ DVFS & 性能与功耗 & 负载计数器、功耗计 & 频率与电压档位 & O
 把这张表按时间尺度从上往下读，一个结构浮现出来：整台机器就是几十个控制环的嵌套，时间尺度从皮秒一直排到秒。快的环离物理近——VRM 贴着功率级，PLL 贴着时钟树，DRAM 调度贴着命令总线，它们必须做进硅片，因为被控对象的变化比任何软件的反应都快；慢的环离物理远——DVFS 看的是毫秒级的负载趋势，风扇看的是秒级的温度走向，调度器看的是毫秒级的公平性，它们可以放在固件和操作系统里，用可升级的代码实现。中间地带属于设备自己的固件：硬盘伺服和 TFC 运行在盘控处理器上，内存训练运行在开机固件里——它们比软件快、又不必像模拟环那样连续，恰好落在可编程但不可打扰的位置。
 
 这张地图同时回答了本书开头隐含的那个问题：什么叫理解一台机器。一半答案是数据通路——数据从哪里来、经过哪些变换、到哪里去，从取指到执行，从内存层次到 DMA 回填；另一半答案是控制面——谁按什么规则让这一切发生：哪个环稳住电压，哪个环对齐相位，哪个环决定下一条命令，哪个环分配时间。数据通路决定机器能做什么，控制面决定机器在什么条件下持续地做下去。两者都看见了，机器才不再是黑箱。
+\section{五、RAS：错误检测、约束与恢复}
+
+RAS 分别关注可靠性、可用性与可维护性。可靠性强调在规定时间内给出正确结果；可用性强调出现局部故障后系统仍能提供服务；可维护性强调能否定位、更换并验证故障部件。三者并不总是一致：立即停机能保护数据正确性，却降低当下可用性；忽略可纠正错误能减少告警，却可能错过器件劣化趋势。
+
+硬件错误首先按影响分为 corrected、deferred 与 uncorrected。可纠正错误由 ECC 或重试恢复，当前操作可继续，但应记录位置和频率；deferred 错误暂未影响当前指令，却表明某份数据已经损坏，必须在未来使用前隔离；不可纠正错误若已污染架构状态，则需要机器检查、任务终止或系统复位。报告“发现错误”不等于已经阻止错误数据被消费，必须继续追踪传播边界。
+
+\begin{longtable}{L{0.18\linewidth}L{0.31\linewidth}L{0.41\linewidth}}
+\toprule
+机制 & 能力边界 & 仍需配套 \\
+\midrule
+奇偶校验 & 检出部分奇数位错误，通常不能纠正 & 重试、失效或错误上报 \\\tablerowrule
+SECDED ECC & 纠正单 bit、检测双 bit（具体能力依编码而定） & scrub、地址记录与坏页隔离 \\\tablerowrule
+CRC/LCRC & 检测传输中突发错误 & 序号、重放缓冲与超时 \\\tablerowrule
+watchdog & 检测控制流长时间无进展 & 安全复位域、状态保留和原因日志 \\\tablerowrule
+冗余副本 & 在副本独立失效时恢复服务 & 一致性、仲裁和共同故障域分析 \\
+\bottomrule
+\end{longtable}
+
+\section{六、错误如何穿过整机}
+
+一次内存 ECC 错误的路径可能是：内存控制器检测综合征；若可纠正则修正返回数据并递增计数；把物理地址、通道、DIMM、bank 和 syndrome 写入错误寄存器；中断或机器检查通知固件与操作系统；操作系统聚合同一页的错误频率，必要时迁移数据并下线页面；管理软件最终把部件位置映射为可更换单元。
+
+这条路径中的寄存器必须考虑“首次错误”和“后续错误”。若后续事件覆盖首次地址，根因会丢失；若只锁存首次事件又不提供计数，错误风暴会被低估。常见做法是首错锁存、分类计数、溢出标志和明确清除协议，并在复位后保留足以解释上一次关机的记录。
+
+互连错误同样需要闭合。请求可能在源端成功发送，却因目标不存在、权限错误、CRC 重试耗尽或目标超时而失败。响应要携带可归属的 requester/tag，使异常能够回到发起指令、DMA 队列或驱动请求；无法归属的错误则升级为平台级事件。仅在控制台打印“总线错误”不能支持恢复。
+
+\section{七、复位域、隔离与降级运行}
+
+整机复位不是唯一恢复手段。设计可把 CPU 核、PCIe function、控制器、PHY 或外设划成独立复位域，在保留其他服务的同时恢复局部状态。但复位边界必须覆盖所有在途事务和缓存状态：停止新请求，等待或取消旧请求，屏蔽中断，保存诊断信息，执行复位，重新训练与枚举，重建队列，最后恢复流量。
+
+若设备支持功能级复位，驱动仍不能假定内存中的旧描述符自动失效。复位前后 generation 或 queue phase 必须变化，使迟到完成不会被当作新请求；IOMMU 映射和 DMA 所有权也要在设备确实停止后才能撤销。
+
+降级运行要明确性能和安全边界。例如内存通道下线会改变交织映射，链路降速会改变带宽与超时假设，风扇故障后的功耗限制会降低处理能力。控制面应把这些状态提供给调度与运维，而不是继续使用正常容量和时延模型。
+
+\section{八、遥测、故障注入与可验证恢复}
+
+可维护系统应让每个重要队列观察提交、完成、超时与重置次数；让每个链路观察纠错、重放、降速和失步；让每个存储层观察校验失败、介质重试与持久化屏障。时间戳要说明来自哪个时钟域，计数器要说明清零和饱和行为。跨层关联通常依赖请求标识、物理地址、设备 BDF/队列号和软件 trace id。
+
+恢复流程若从不被触发，就不能证明可用。故障注入可以在受控环境中制造 ECC、丢中断、完成超时、链路复训和突然断电，验证系统是否在规定边界内检测、隔离、恢复并保留证据。注入点要位于真实检测路径之前，且测试结束后确认所有强制错误开关已经清除。
+
+\begin{pdfdiagram}[
+  node distance=8mm and 8mm,
+  rasbox/.style={draw, rounded corners, align=center, minimum width=24mm, minimum height=9mm, fill=blue!5},
+  >=Stealth]
+\node[rasbox] (detect) {检测与纠正};
+\node[rasbox, right=of detect] (record) {锁存证据\\分类计数};
+\node[rasbox, right=of record] (contain) {阻止传播\\隔离故障域};
+\node[rasbox, below=of contain] (recover) {重试、复位\\或降级};
+\node[rasbox, left=of recover] (verify) {验证服务与\\数据一致性};
+\node[rasbox, left=of verify] (trend) {趋势分析与\\维护决策};
+\draw[->] (detect) -- (record);
+\draw[->] (record) -- (contain);
+\draw[->] (contain) -- (recover);
+\draw[->] (recover) -- (verify);
+\draw[->] (verify) -- (trend);
+\draw[->] (trend) -- node[left, font=\small]{改进阈值与策略} (detect);
+\end{pdfdiagram}
+\diagramnote{平台错误从检测到恢复的闭环。恢复成功仍要验证数据与服务状态，并把错误趋势用于后续阈值和维护决策。}
+
+\section*{章末练习}
+
+\begin{chapterexercise}{1}
+概念
+\exercisecheck{题目}{可靠性、可用性和可维护性各自关注什么？举例说明三者可能的取舍。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{2}
+错误分级
+\exercisecheck{题目}{为什么“ECC 已纠正”仍需要记录地址和累计次数？}
+\end{chapterexercise}
+
+\begin{chapterexercise}{3}
+故障传播
+\exercisecheck{题目}{从内存控制器到可更换 DIMM，列出一次重复可纠正错误所需的观测字段。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{4}
+复位顺序
+\exercisecheck{题目}{为一个仍可能 DMA 的设备设计局部复位顺序，并说明何时才能撤销 IOMMU 映射。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{5}
+迟到完成
+\exercisecheck{题目}{设备复位后旧完成写回队列，如何避免它被识别为新请求的完成？}
+\end{chapterexercise}
+
+\begin{chapterexercise}{6}
+验证
+\exercisecheck{题目}{设计一次丢中断故障注入，说明预期检测、恢复和验收条件。}
+\end{chapterexercise}
+
+\section*{参考解答与要点}
+
+\begin{chapteranswer}{1}
+概念
+\answercheck{解答要点}{可靠性关注结果正确，可用性关注服务连续，维护性关注定位与修复。发现风险后停机可提高正确性保障，却暂时降低可用性。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{2}
+错误分级
+\answercheck{解答要点}{单次纠正隐藏了器件劣化趋势；重复集中在同一页、bank 或器件时，需要主动迁移、下线和维护。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{3}
+故障传播
+\answercheck{解答要点}{至少含时间、物理地址、通道、DIMM、rank/bank、syndrome、纠正等级、首次状态、累计数和溢出标志。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{4}
+复位顺序
+\answercheck{解答要点}{停止提交，屏蔽中断，等待或取消事务，确认设备停止 DMA，保存错误状态，再撤映射并复位；重建队列与映射后才恢复流量。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{5}
+迟到完成
+\answercheck{解答要点}{在请求和完成中加入 generation/phase，复位时递增；清理旧队列并拒绝 generation 不匹配的完成。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{6}
+验证
+\answercheck{解答要点}{屏蔽一次完成中断但保留完成状态；预期 watchdog/轮询发现队列无进展，驱动读取完成并恢复中断；验收包括无重复完成、无请求遗失和错误计数正确。}
+\end{chapteranswer}

@@ -20,3 +20,82 @@ HID 报告把按键或指针状态编码成固定格式；音频接口还要处�
 一次键盘按键会经历开关抖动、设备端扫描与消抖、USB 报告、主控制器 DMA、完成中断、内核输入子系统和用户态读取。每层都可能合并或延迟事件，因此“按键发生时刻”至少有物理接触、设备采样、主机收包和进程读取四个时间戳。
 
 排错时按层观察：设备是否枚举，endpoint 是否配置，主控制器队列是否前进，DMA 缓冲是否更新，完成中断是否到达，驱动是否把报告交给上层。只在应用程序里反复重试，无法区分线缆、电源、协议、控制器和驱动故障。
+
+\section{USB 拓扑、枚举与描述符}
+
+USB 的树形拓扑由主控制器、root hub、外部 hub 和设备组成。连接检测后，端口先完成供电与复位，设备在默认地址响应；主机读取设备描述符的基本字段，分配唯一地址，再读取完整的配置、接口和 endpoint 描述符。一个物理设备可包含多个 interface，例如摄像头同时提供视频、麦克风和控制接口，由不同类驱动绑定。
+
+描述符是一组带长度与类型的记录。解析器必须验证长度、层级归属和 endpoint 数量，不能因为设备声称总长度很大就越界读取。选择 configuration 或 alternate setting 会改变设备启用的 endpoint 与带宽需求；高速周期传输若没有足够调度预算，配置阶段就应失败，而不是运行后随机丢包。
+
+hub 不只是被动分线器。它报告端口连接、电源、过流和复位状态，并转发不同速度设备的事务。共享上行链路意味着多个 endpoint 竞争同一周期预算；逻辑上独立的设备仍可能共享 hub、电源和主控制器故障域。
+
+\section{xHCI 队列与一次 USB 传输}
+
+xHCI 主控制器使用内存中的 ring 描述工作。驱动把 TRB 写入 transfer ring，执行必要的 DMA 同步，再写 doorbell。控制器取走 TRB，通过相应 endpoint 发起总线事务，把数据 DMA 到缓冲区或从缓冲区读出，随后在 event ring 写入完成事件并触发中断。驱动根据 slot、endpoint 和 TRB 指针归属完成，再推进 ring。
+
+ring 的 cycle bit 用于区分环回后的新旧条目。生产者只有在完整写好 TRB 后才交出所有权；消费者不能跨过 cycle 不匹配的条目。取消传输或复位 endpoint 时，还要处理已经预取的 TRB 和迟到事件。仅清空软件链表而不停止控制器，会让旧 DMA 写入已经复用的缓冲区。
+
+\begin{pdfdiagram}[
+  node distance=7mm and 8mm,
+  usbbox/.style={draw, rounded corners, align=center, minimum width=24mm, minimum height=10mm, fill=blue!5},
+  >=Stealth]
+\node[usbbox] (driver) {驱动填写\\TRB 与缓冲};
+\node[usbbox, right=of driver] (doorbell) {doorbell\\交出所有权};
+\node[usbbox, right=of doorbell] (host) {xHCI 调度\\并执行 DMA};
+\node[usbbox, right=of host] (usb) {USB 事务\\endpoint 响应};
+\node[usbbox, below=of host] (event) {event ring\\完成码};
+\node[usbbox, left=of event] (consume) {驱动回收\\缓冲与 TRB};
+\draw[->] (driver) -- (doorbell);
+\draw[->] (doorbell) -- (host);
+\draw[->] (host) -- (usb);
+\draw[->] (usb) |- (event);
+\draw[->] (event) -- (consume);
+\draw[->] (consume) -- node[left, font=\small]{新请求} (driver);
+\end{pdfdiagram}
+\diagramnote{USB 请求从驱动到设备再返回。doorbell 只交出描述符所有权，真正完成要等设备事务、DMA 与 event ring 状态全部闭合。}
+
+\section{HID：报告、消抖与输入语义}
+
+HID report descriptor 描述字段的用途、位宽、逻辑范围、单位和 report ID。键盘可以报告当前按下的键集合，鼠标可以报告相对位移，触控设备则包含多个 contact 的坐标与状态。驱动必须按 bit 字段解析，而不能假定每个值都按整字节对齐。
+
+机械按键在接触瞬间会抖动，设备固件通过时间窗或状态机滤除快速翻转。之后主机按 interrupt endpoint 的轮询间隔获取报告。“interrupt”表示主机为它保留周期性轮询机会，并非设备直接拉起 CPU 中断线；主控制器完成一批传输后才通过平台中断通知 CPU。
+
+输入系统还要处理键位按下、保持、重复和释放。若丢失包含释放状态的报告，软件可能认为按键一直按下；协议、设备或上层需要用完整状态报告、超时或重新同步恢复。安全相关输入还应区分设备身份与注入来源。
+
+\section{音频流：时钟域、反馈与缓冲水位}
+
+USB 音频把连续采样分装进周期传输。即使主机和设备都配置为 48 kHz，它们的晶振仍有微小频差：生产稍快会使缓冲逐渐上升，消费稍快会使缓冲逐渐下降。仅靠一个大缓冲只能延后溢出或欠载，不能消除长期速率差。
+
+异步音频 endpoint 可用 feedback 告知主机实际消费速率，主机据此调整每个服务间隔发送的样本数。另一种系统使用采样率转换吸收频差。控制环要平滑噪声和抖动，调节过快会把水位波动变成可闻调制，调节过慢又可能越过缓冲边界。
+
+音频时延由采样周期、USB 调度、设备缓冲、主控制器与软件队列共同组成。减小所有缓冲可以降低平均时延，却提高对调度抖动的敏感度。评价应同时报告端到端时延、抖动、欠载/溢出次数和时钟恢复状态。
+
+\section*{章末练习}
+
+\begin{longtable}{L{0.08\linewidth}L{0.32\linewidth}L{0.5\linewidth}}
+\toprule
+题号 & 类型 & 题目 \\
+\midrule
+1 & 枚举 & 按顺序说明 USB 设备从连接到类驱动可提交传输之间的主要步骤。 \\
+2 & 带宽 & 为什么两个独立 endpoint 仍可能互相影响？列出至少两个共享资源。 \\
+3 & 队列 & xHCI 驱动写 TRB 后为何不能省略 DMA 同步与 doorbell 前的顺序约束？ \\
+4 & 复位 & endpoint 复位时，怎样防止迟到事件或 DMA 访问已经复用的缓冲区？ \\
+5 & HID & 解释 USB interrupt transfer 与 CPU 物理中断线的区别；按键释放报告丢失会出现什么现象？ \\
+6 & 音频 & 主机与设备标称采样率相同，为什么仍会逐渐欠载或溢出？反馈 endpoint 如何帮助稳定水位？ \\
+\bottomrule
+\end{longtable}
+
+\section*{参考解答与要点}
+
+\begin{longtable}{L{0.08\linewidth}L{0.32\linewidth}L{0.5\linewidth}}
+\toprule
+题号 & 类型 & 解答要点 \\
+\midrule
+1 & 枚举 & 检测连接与供电，端口复位，在默认地址读取基本描述符，分配地址，读取配置/接口/endpoint 描述符，选择配置和 alternate setting，绑定类驱动。 \\
+2 & 带宽 & endpoint 可能共享设备上行、hub 上行、周期调度预算、主控制器 ring、DMA 和中断处理，因此逻辑独立不代表性能与故障域独立。 \\
+3 & 队列 & 必须先让 TRB 和缓冲内容对控制器可见，再通知控制器取用；否则控制器可能看到 doorbell 却读到旧描述符或旧数据。 \\
+4 & 复位 & 先停止 endpoint 并等待控制器确认，取消或隔离旧 TRB，改变 cycle/generation，处理 event ring 中旧事件，确认无 DMA 后才释放和复用缓冲。 \\
+5 & HID & interrupt endpoint 由主机周期轮询，CPU 中断是主控制器报告完成的机制。释放报告丢失可能形成“粘键”，需后续完整状态或重新同步纠正。 \\
+6 & 音频 & 独立晶振存在频差；反馈提供实际消费速率，主机按服务间隔微调样本数，使长期平均生产率匹配并把水位保持在目标附近。 \\
+\bottomrule
+\end{longtable}

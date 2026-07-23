@@ -708,3 +708,93 @@ TPM & LPC/SPI/I2C 或 fTPM & 密钥存储、启动度量 & \code{/dev/tpm0}，�
 
 至此，本节的对象可以收成一句话：整机不是一颗 CPU 加若干外设，而是一套\hwkey{分层的控制结构}——最快的路径收进 CPU die，慢的长尾留给 PCH 与一众小控制器，层与层之间全部用地址空间中的事务说话。设备枚举决定了每块硬件在地址空间里的位置，中断路由决定了事件如何找到正确的核，IOMMU 决定了设备的 DMA 能碰到哪些内存，定时器决定了操作系统何时醒来；这四件事加上小控制器们的值守，共同构成了 CPU 控制整台机器的控制平面。
 % ch06b part3: 第四节 主板：供电、时钟与固件
+
+\section{四、设备队列的所有权、顺序与回收}
+
+MMIO、中断、DMA 和 IOMMU 最终在设备队列上汇合。驱动先分配队列和数据缓冲，建立 IOMMU 映射；填完描述符后执行平台要求的 Cache 同步和写屏障，再写 doorbell。设备 DMA 读取描述符和数据，执行工作，把状态写入完成队列；驱动在中断或轮询中读取完成，确认 DMA 已结束后才解除映射并复用缓冲。
+
+描述符的 ownership bit 或 phase 不能在其他字段尚未可见时提前交给设备。完成方向同理：设备先写结果和状态，最后改变所有权；主机观察到所有权后执行读屏障，再消费其余字段。这是生产者--消费者协议，适用于网卡、NVMe、GPU 和音频队列。
+
+队列满与设备不响应是两种状态。满表示生产者追上尚未回收的消费者位置，应通过 backpressure 等待完成；不响应表示消费者位置长时间不前进，需要超时和复位。统计提交指针、设备取走指针、完成指针、中断次数和最后进展时间，才能区分软件没有提交、doorbell 未到达、DMA 受阻与设备执行停滞。
+
+\section{五、中断竞争、合并与轮询}
+
+设备写完成后触发 MSI-X，本质上是一次定向消息写。CPU 接收中断时，后续完成可能已经到达；驱动通常一次批量回收多个条目，并在队列仍有工作时继续处理。中断合并减少每个完成的固定开销，却增加单个请求等待通知的时间，因此吞吐与尾延迟需要共同调节。
+
+避免丢唤醒的常见顺序是：暂时屏蔽该队列中断；处理到当前看不到更多完成；重新使能；再次检查队列。若新完成恰好出现在检查与使能之间，第二次检查会发现它。高负载网络路径常在中断触发后切换为预算轮询，队列清空后再恢复中断，以避免中断风暴。
+
+\section{六、IOMMU 失效与页框生命周期}
+
+建立映射后，IOMMU TLB 可能缓存设备虚拟地址到物理页框的翻译。撤销页表项后必须执行 IOMMU 失效，并按接口等待失效完成；但失效只阻止未来翻译，不能取消已经通过翻译、正在互连中的 DMA。正确回收还要先停止队列或确认相关命令完成，再撤销映射和失效，最后释放页框。
+
+支持共享虚拟内存或页请求的设备可以在缺页时请求操作系统补页，但这并未消除生命周期约束。进程退出、unmap 或设备复位时，软件仍需阻止新请求、排空在途访问并使 CPU 与设备侧翻译共同失效。
+
+\section{七、设备复位后的代际隔离}
+
+复位会清除设备内部指针，却未必清除主存中的旧队列或互连中的迟到写。驱动为每次队列实例分配 generation，把它加入软件请求状态或协议允许的标识中。恢复后只接受当前 generation 的完成；旧完成用于诊断并被丢弃，不能释放新请求的资源。
+
+安全流程通常为：停止新提交；屏蔽中断；等待取消，必要时执行功能级复位；确认 DMA 静止；保存错误信息；为未决请求给出确定结果；建立新映射和新队列；改变 generation；最后恢复通知与提交。请求是否可自动重试取决于操作是否幂等，设备写寄存器或外部动作不能默认重复执行。
+
+\section*{章末练习}
+
+\begin{chapterexercise}{1}
+事务追踪
+\exercisecheck{题目}{从驱动填写描述符到释放数据页，写出一次 DMA 请求的完整所有权顺序。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{2}
+内存序
+\exercisecheck{题目}{设备看到新的 ownership bit，却读到旧地址字段，最可能缺少哪类约束？如何修正？}
+\end{chapterexercise}
+
+\begin{chapterexercise}{3}
+中断竞争
+\exercisecheck{题目}{说明“使能中断后再次检查队列”为何能够避免检查与使能之间的丢唤醒。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{4}
+IOMMU
+\exercisecheck{题目}{清除 IOMMU 页表项后为什么还不能立刻释放页框？}
+\end{chapterexercise}
+
+\begin{chapterexercise}{5}
+排错
+\exercisecheck{题目}{队列无完成时，列出区分未提交、doorbell 丢失、DMA 失败和设备停滞的观测点。}
+\end{chapterexercise}
+
+\begin{chapterexercise}{6}
+复位
+\exercisecheck{题目}{generation 如何防止迟到完成错误释放新请求？哪些操作不适合自动重试？}
+\end{chapterexercise}
+
+\section*{参考解答与要点}
+
+\begin{chapteranswer}{1}
+事务追踪
+\answercheck{解答要点}{分配并映射，写数据和描述符，Cache 同步与屏障，交 ownership 并写 doorbell；设备 DMA 与执行，先写结果再交完成；主机同步读取，确认 DMA 结束后解映射和释放。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{2}
+内存序
+\answercheck{解答要点}{缺少发布前的写屏障或非一致性平台的 Cache clean。应先完成所有字段与数据的可见性处理，再最后交出 ownership/doorbell。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{3}
+中断竞争
+\answercheck{解答要点}{若完成发生在使能前，重新检查能直接发现；若发生在使能后，设备会产生中断。两条路径覆盖竞争窗口。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{4}
+IOMMU
+\answercheck{解答要点}{IOTLB 可能有缓存，且先前已经翻译的 DMA 仍在途。必须停队列、等待完成，执行并等待 IOMMU 失效后才复用页框。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{5}
+排错
+\answercheck{解答要点}{查软件 producer、内存描述符、doorbell 寄存器、设备 consumer、IOMMU fault、互连错误、完成 producer、中断计数和最后进展时间。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{6}
+复位
+\answercheck{解答要点}{新队列使用新 generation，旧标识不匹配便不得操作新资源。具有外部副作用或无法查询提交状态的非幂等写不应盲目重试。}
+\end{chapteranswer}

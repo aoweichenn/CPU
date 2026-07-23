@@ -26,3 +26,100 @@ T_{avg}=T_{L1}+m_{L1}(T_{L2}+m_{L2}(T_{LLC}+m_{LLC}T_{DRAM})).
 多核中，同一物理 cache line 可能被多个核心保存。写者必须先取得独占所有权，使其他副本失效；读者若命中别处的修改副本，数据要由拥有者或已更新的下一级返回。一致性解决“同一地址最终看到同一写入次序”，内存序还要规定不同地址之间哪些重排对软件可见，二者不能混为一谈。
 
 DMA 设备若不参与硬件一致性，驱动必须在所有权交接处清理或失效 Cache，并使用屏障保证“描述符内容先可见，doorbell 后可见”。这条规则会在设备事务章节再次出现。
+
+\section{命中路径：一拍之内完成哪些工作}
+
+处理器给出虚拟地址后，L1 Cache 不能只做一次“查表”。在典型的虚拟索引、物理标记设计中，页内偏移里的 index 先选择集合；TLB 同时给出物理页号；随后将物理 tag 与各路 tag、valid 和权限状态比较。命中的一路还要经过字节选择、对齐检查和转发选择，最终才能把数据送到执行单元。若 load/store queue 中存在更早的同地址写，数据甚至可能来自写转发，而不是 SRAM 数据阵列。
+
+这条并行路径解释了为什么 L1 容量、路数和时钟频率不能独立选择。增加路数能够减少冲突 miss，却会增加 tag 比较器数量和数据多路选择器延迟；增大 line 会减少 tag 数量，却会带来更大的误取流量。工程上常把 tag 阵列、数据阵列和路预测结合起来，使常见命中保持短延迟，并为预测错误保留重选路径。
+
+\begin{pdfdiagram}[
+  node distance=8mm and 9mm,
+  cachebox/.style={draw, rounded corners, align=center, minimum width=25mm, minimum height=9mm, fill=blue!5},
+  cachesmall/.style={draw, rounded corners, align=center, minimum width=20mm, minimum height=8mm, fill=green!6},
+  >=Stealth]
+\node[cachebox] (va) {虚拟地址};
+\node[cachesmall, right=of va, yshift=8mm] (idx) {index\\选择集合};
+\node[cachesmall, right=of va, yshift=-8mm] (tlb) {TLB\\产生物理 tag};
+\node[cachebox, right=of idx] (arrays) {多路数据阵列\\并行读出};
+\node[cachebox, right=of tlb] (tags) {多路 tag 比较\\valid/权限检查};
+\node[cachebox, right=of arrays, yshift=-8mm] (mux) {命中路选择\\字节与对齐选择};
+\node[cachebox, right=of mux] (out) {数据返回或\\异常/缺失};
+\draw[->] (va) -- (idx);
+\draw[->] (va) -- (tlb);
+\draw[->] (idx) -- (arrays);
+\draw[->] (tlb) -- (tags);
+\draw[->] (arrays) -- (mux);
+\draw[->] (tags) -- (mux);
+\draw[->] (mux) -- (out);
+\end{pdfdiagram}
+\diagramnote{一次 L1 读取的并行关键路径。集合选择与 TLB 翻译同时开始，物理 tag 比较结果再选择对应数据路；图中上下分支之间保留间距，以区分数据阵列和翻译比较两条路径。}
+
+\section{缺失路径：MSHR、写回缓冲与背压}
+
+阻塞式 Cache 在一次 miss 完成前停止接受新的访问，结构简单但会浪费主存等待时间。非阻塞 Cache 用 MSHR（miss status holding register）记录每个未完成 line 的地址、请求者、访问大小、目标寄存器和权限状态。后续请求若命中同一个在途 line，可以合并到原 MSHR；命中其他常驻 line 的访问则继续执行，这分别称为“hit under miss”和“miss under miss”。
+
+一次替换通常包含以下状态，而不是一个瞬时动作：选择 victim；若 victim 为 dirty，将其地址和数据放入写回缓冲；为新 line 分配 MSHR；向下一级发请求；接收若干 beat；在满足关键字优先或整行到齐条件后唤醒等待者；最后提交 tag、valid 和一致性状态。写回缓冲、MSHR 或下行信用任一耗尽，都会沿请求路径产生背压。因此性能计数器中的“Cache miss”还应区分合并 miss、MSHR 满、写回缓冲满和下一级阻塞。
+
+\begin{longtable}{L{0.2\linewidth}L{0.31\linewidth}L{0.39\linewidth}}
+\toprule
+资源 & 保存的关键状态 & 资源满时的可见结果 \\
+\midrule
+MSHR & line 地址、等待者、返回 beat、错误状态 & 新 miss 暂停，已有命中仍可能前进 \\
+写回缓冲 & victim 地址、dirty 数据、字节掩码 & 不能继续替换 dirty line \\
+填充缓冲 & 从下一级返回但尚未提交的数据 & 返回通道施加背压或延后新的读取 \\
+store buffer & 尚未写入 Cache 的写及其顺序信息 & 提交端停止，屏障等待时间上升 \\
+\bottomrule
+\end{longtable}
+
+\section{替换、预取与包含关系}
+
+真正的 LRU 需要记录完整的最近使用次序，路数增加后代价迅速上升，因此硬件常用 tree-PLRU、NRU 或随机替换近似。替换策略不能只看命中率：脏行的写回成本、共享行的失效成本、预取行的置信度也会影响 victim 选择。流式访问还可能逐出循环反复使用的工作集，所以“更积极预取”并不总能提高性能。
+
+预取器根据顺序流、固定步长或相关地址提前请求 line。评价它至少要同时看准确率、覆盖率、及时性和污染：有用但太晚的预取仍落在需求 miss 之后；准确却占满 MSHR 的预取会延迟需求请求；错误预取既消耗互连带宽又挤出有效数据。常见控制办法是降低预取优先级、动态调节距离，并在压力升高时暂停发射。
+
+多级 Cache 还要声明包含关系。inclusive 设计让上级 line 必然在下级有副本，便于用末级目录筛选探测，但下级替换可能迫使上级失效；exclusive 设计尽量让各级保存不同 line，提高总有效容量，却增加迁移复杂度；non-inclusive/non-exclusive 不承诺两者，需用独立目录维护共享者信息。包含关系是数据放置策略，不等于一致性协议本身。
+
+\section{从 MESI 状态到真实写入事务}
+
+以 MESI 为例，I 表示本地无有效副本，S 表示可能有多个只读副本，E 表示只有本核心持有且数据干净，M 表示本核心持有已修改数据。读取 miss 通常发出共享读；若没有其他共享者，可进入 E，否则进入 S。对 S 状态 line 写入时，核心必须请求升级并等待其他共享者确认失效；只有取得写权限后才能让该 store 对一致性域生效。E 状态的本地写可静默转为 M。
+
+两个核心写同一 line 中不同变量仍会反复争夺所有权，这就是 false sharing。变量在源代码中互不相关并不能阻止 line 粒度的失效。定位时应结合失效探测、远端命中和 line 迁移计数，再通过数据布局或每核分片减少共享写，而不是简单增大 Cache。
+
+一致性事务还要处理竞争和暂态。例如某核心发出升级请求、尚未收到全部失效确认时，line 既不能被当作稳定 S，也不能被当作稳定 M；控制器需保存暂态、待收确认数和可能到达的数据响应。协议死锁分析必须覆盖请求网、响应网和 snoop 网之间的资源依赖。
+
+\section{Cache 中的校验与故障闭合}
+
+tag 和状态位常用奇偶校验或 ECC，数据阵列可按若干字节分组保护。可纠正错误在读取时被修正并记录，后台 scrub 再把正确值写回；不可纠正错误不能继续作为普通数据交付。若 dirty line 出现不可纠正错误，下一级没有最新副本，处理器通常需要上报机器检查并隔离受影响的执行上下文。若 clean line 损坏，则可将其失效并从下一级重新获取，但仍应保留诊断信息。
+
+错误处理与正常 miss 共用许多资源，设计时要确保错误响应不会因 MSHR 或写回队列已满而永久等待。可观测性至少包括错误物理地址、阵列与路、可纠正/不可纠正分类、首次错误状态和累计计数；软件据此区分偶发位翻转、持续坏单元与更大故障域。
+
+\section*{章末练习}
+
+\begin{longtable}{L{0.08\linewidth}L{0.32\linewidth}L{0.5\linewidth}}
+\toprule
+题号 & 类型 & 题目 \\
+\midrule
+1 & 地址分解 & 32 KiB、64 B line、8 路组相联 Cache 使用 48-bit 物理地址。求集合数以及 offset、index、tag 位数。 \\
+2 & 路径分析 & 按时间顺序说明一次 L1 读取命中的 tag、TLB、数据阵列和路选择动作，并指出增加路数影响哪段关键路径。 \\
+3 & 状态追踪 & 同一 line 上先发生两个 load miss，随后另一地址发生 miss。说明 MSHR 合并条件，以及资源不足时的背压位置。 \\
+4 & 一致性 & 两个核心交替修改同一 line 中的两个不同计数器。解释 line 状态如何迁移，并给出一种数据布局改进。 \\
+5 & 预取评价 & 某预取器准确率很高，但程序反而变慢。列出至少三项还需检查的指标或资源冲突。 \\
+6 & 故障处理 & clean line 与 dirty line 分别发生不可纠正错误时，为何恢复策略不同？应记录哪些诊断信息？ \\
+\bottomrule
+\end{longtable}
+
+\section*{参考解答与要点}
+
+\begin{longtable}{L{0.08\linewidth}L{0.32\linewidth}L{0.5\linewidth}}
+\toprule
+题号 & 类型 & 解答要点 \\
+\midrule
+1 & 地址分解 & 集合数为 $32\,\text{KiB}/(64\times8)=64$；offset 6 bit，index 6 bit，tag 为 $48-6-6=36$ bit。 \\
+2 & 路径分析 & index 先选集合，TLB 并行给出物理 tag；多路 tag 比较与数据读出并行，命中结果控制路选择和字节选择。路数增加主要加重 tag 比较和数据多选延迟。 \\
+3 & 状态追踪 & line 地址相同且请求属性兼容时合并到同一 MSHR；不同 line 需要新项。MSHR 满会阻止新 miss，填充或下行资源不足还会使返回或请求通道背压。 \\
+4 & 一致性 & 每次写都要使对方副本失效并取得 M/E 权限，line 在核心间反复迁移。可把计数器放到不同 line，或改为每核计数后汇总。 \\
+5 & 预取评价 & 检查覆盖率、及时性、Cache 污染、互连带宽、MSHR/队列占用及需求请求优先级；高准确率不保证请求足够及时或资源代价可接受。 \\
+6 & 故障处理 & clean line 可失效后重取；dirty line 的最新值只在本级，通常需上报不可恢复错误。记录地址、路与阵列、错误等级、综合征、首次错误和累计计数。 \\
+\bottomrule
+\end{longtable}

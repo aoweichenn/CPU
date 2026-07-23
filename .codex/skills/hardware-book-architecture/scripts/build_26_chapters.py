@@ -63,14 +63,22 @@ NUMBERED_SECTION_RE = re.compile(r"^(\\section\{)(?:〇|[一二三四五六七�
 CHINESE_NUMERALS = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
 CHINESE_TO_ARABIC = {number: str(index) for index, number in enumerate(CHINESE_NUMERALS, start=1)}
 EXTRAS = {
+    1: ("ch01-chapter-exercises.tex",),
+    5: ("ch05-chapter-exercises.tex",),
+    6: ("ch06-isa-real-world.tex",),
     8: ("ch08-pipeline-core.tex",),
     9: ("ch09-pipeline-hazards.tex",),
     11: ("ch11-cache-interface.tex",),
     12: ("ch12-modern-vm-tlb.tex",),
+    13: ("ch13-chapter-exercises.tex",),
     14: ("ch14-nvme-interface.tex",),
+    15: ("ch15-chapter-exercises.tex",),
     16: ("ch16-persistence-reliability.tex",),
     17: ("ch17-handshake-axi.tex",),
     18: ("ch18-pcie-transactions.tex",),
+    19: ("ch19-device-queues.tex",),
+    21: ("ch21-platform-recovery.tex",),
+    22: ("ch22-ras-reliability.tex",),
     23: ("ch23-usb-human-interface.tex",),
 }
 DIAGRAM_OVERRIDES = {
