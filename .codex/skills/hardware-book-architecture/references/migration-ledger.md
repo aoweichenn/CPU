@@ -194,3 +194,13 @@
 |---|---|---|
 | 第 6 章 | RISC-V 特权状态、trap CSR、用户栈到内核栈、系统调用返回、release/acquire、FENCE 与原子读改写 | verified |
 | 第 16 章 | 页缓存、文件块映射、BIO/request、blk-mq、scatter-gather DMA、tag 完成、RAID 校验小写、降级读与重建 | verified |
+
+## 2026-07 队列、共享内存与以太网物理路径案例深化批次
+
+本批次继续处理“术语已经出现，但零基础读者还难以从具体状态推导结果”的三处接口。第 14 章用小深度环形队列和跨页缓冲案例展开 NVMe 的队首、队尾、phase、CID、PRP 与复位代际；第 18 章用同一 Cache line 的所有权案例区分 PCIe DMA、CXL.cache 与 CXL.mem，并把 chiplet 请求拆到协议适配、链路可靠性和封装 PHY；第 23 章用最小帧和普通数据帧的线速预算连接 MAC、PCS、PMA、PMD、FCS 与接收队列。只增加正文、算例、机制图和正文表格，不增加章末练习，也不改变既有迁移单元归属。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 14 章 | NVMe 环形 SQ/CQ、doorbell、phase/CID、PRP 跨页映射、超时与 generation 回收边界 | verified |
+| 第 18 章 | PCIe DMA 与 CXL 一致性对照、home agent、Cache line 所有权、CXL.mem 可见边界、chiplet 协议栈与故障定位 | verified |
+| 第 23 章 | Ethernet 帧上线预算、MAC/PCS/PMA/PMD 表示转换、FCS/FEC 边界、RX DMA 与分层错误证据 | verified |

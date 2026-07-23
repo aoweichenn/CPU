@@ -500,13 +500,53 @@ PCIe 为设备提供配置、内存读写和消息事务，但传统设备通常
 \topic{设备类型描述的是一致性角色}
 Type 1 设备面向没有本地设备内存的加速器，重点是设备对主机内存的一致性访问；Type 2 设备既有加速计算也有设备内存，需要同时处理主机内存与设备内存的一致性关系；Type 3 设备主要把设备内存暴露给主机。枚举阶段必须读取能力结构，固件和操作系统再为设备内存建立地址窗口、拓扑和错误域。软件不能仅凭“容量出现”就把远端设备内存等同于本地 DRAM：时延、带宽、持久性、热插拔和故障传播边界可能不同。
 
+\begin{longtable}{L{0.16\linewidth}L{0.25\linewidth}L{0.29\linewidth}L{0.20\linewidth}}
+\toprule
+协议 & 主要发起者与对象 & 必须维护的状态 & 软件可见边界 \\
+\midrule
+CXL.io & 驱动访问设备寄存器、队列与配置空间 & BAR、tag、credit、AER 与中断状态 & 设备发现、命令提交和完成报告 \\\tablerowrule
+CXL.cache & 设备缓存或访问主机内存的 Cache line & line 所有者、共享者、脏状态与探测完成 & 设备和 CPU 对同一主机内存保持一致观察 \\\tablerowrule
+CXL.mem & 主机访问设备附带内存 & 地址窗口、home agent、设备介质与 RAS 状态 & 设备内存进入主机物理地址空间 \\
+\bottomrule
+\end{longtable}
+
 \topic{一次 CXL.mem 读取仍然有请求、数据和完成边界}
 CPU 发出 load 后，Cache 与 home agent 先判断本地是否持有有效副本。若物理地址映射到 Host-managed Device Memory，控制器把请求路由到 CXL 端口；链路和交换结构依据地址映射选择目标设备，设备内存控制器再访问介质并返回数据。数据到达并通过一致性检查后才能填入主机 Cache，随后等待该 load 所在指令按序退休。
+
+\topic{同一 Cache line 案例：共享地址必须先找到当前所有者}
+
+设 CPU 核 0 已修改地址 \code{0x80004000} 所在的 64 B Cache line，但新值仍以 Modified 状态停在私有 Cache 中，主存副本已经过时。加速器随后通过 CXL.cache 请求读取同一行。home agent 不能直接从主存返回旧值；它先查询目录并向核 0 发探测，核 0 提供最新数据并把状态降为 Shared，探测完成后 home agent 才把数据授予设备。若设备请求写权限，核 0 和其他共享者还必须失效并确认，系统才能保证只有一个可写所有者。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 上排：传统 PCIe DMA，以显式缓冲区所有权为中心。
+  \node[hw label, font=\small\bfseries] at (-0.2,4.05) {PCIe DMA};
+  \node[hw state, minimum width=2.1cm, align=center] (buf) at (1.25,3.35) {主机缓冲区\\软件拥有};
+  \node[hw control, minimum width=2.15cm, align=center] (desc) at (4.0,3.35) {描述符 + doorbell\\显式发布};
+  \node[hw compute, minimum width=2.15cm, align=center] (dma) at (6.75,3.35) {设备 DMA\\读写缓冲区};
+  \node[hw state, minimum width=2.15cm, align=center] (done) at (9.5,3.35) {completion\\归还所有权};
+  \draw[hw bus] (buf) -- (desc);
+  \draw[hw bus] (desc) -- (dma);
+  \draw[hw bus] (dma) -- (done);
+
+  % 下排：CXL.cache，以 Cache line 的一致性所有权为中心。
+  \node[hw label, font=\small\bfseries] at (-0.2,1.15) {CXL.cache};
+  \node[hw state, minimum width=2.1cm, align=center] (req) at (1.25,0.45) {设备请求\\读 / 写 64 B 行};
+  \node[hw control, minimum width=2.15cm, align=center] (home) at (4.0,0.45) {home agent\\查询目录};
+  \node[hw memory, minimum width=2.15cm, align=center] (owner) at (6.75,0.45) {当前所有者\\CPU Cache / 内存};
+  \node[hw state, minimum width=2.15cm, align=center] (grant) at (9.5,0.45) {数据 + 状态授予\\共享或独占};
+  \draw[hw bus] (req) -- (home);
+  \draw[hw bus] (home) -- (owner);
+  \draw[hw return] (owner) -- (grant);
+  \draw[hw return] (grant.south) -- (9.5,-0.55) -- (4.0,-0.55) -- (home.south);
+\end{pdfdiagram}
+\diagramnote{PCIe DMA 与 CXL.cache 的核心差别。上排由软件划出缓冲区并用 completion 归还所有权；下排由一致性协议按 Cache line 寻找当前所有者，收齐探测或失效确认后再授予状态。CXL 共享地址减少显式复制，但没有消除所有权、顺序和错误闭合。}
 
 这条路径至少存在四类失败：链路重放或降级、地址窗口配置错误、设备介质不可纠正错误，以及一致性事务超时。AER、CXL RAS 记录、操作系统内存下线和进程错误通知处在不同恢复层级。仅看到 CPU 机器检查并不能直接判断故障发生在本地 DRAM；必须把物理地址、拓扑和设备错误日志关联起来。
 
 \topic{容量扩展不等于延迟透明}
 若本地 DRAM 读取为 90 ns，而某段扩展内存平均读取为 240 ns，随机指针追踪会直接暴露 150 ns 差值；可批量预取或具有高并发度的流式负载则可能用带宽覆盖部分时延。内存放置策略因此需要识别页面温度、访问局部性、带宽需求和迁移成本。把所有页面平均分散到本地与扩展内存，未必比把冷页集中放到扩展层更好。
+
+设备内存成为系统 RAM 后，拔出设备也不再只是“停止驱动”。操作系统必须先阻止新页面分配，把可迁移页复制到其他内存，等待页表与 IOMMU 失效，处理不可迁移的固定页，并让 CPU Cache 中属于该地址窗口的脏行写回或失效。只有地址窗口不再承载有效页面，端口遏制和断电才不会把一次普通 load 变成无法定位的数据丢失。
 
 \section{十二、Chiplet 与封装内互连的边界}
 
@@ -516,6 +556,40 @@ CPU 发出 load 后，Cache 与 home agent 先判断本地是否持有有效副�
 
 \topic{封装内一次请求也要跨越明确契约}
 源 chiplet 在本地互连接收请求，协议适配器形成 flit，链路层加入序号与可靠性信息，die-to-die PHY 经凸点和封装走线传输，目标 chiplet 校验后再把请求送入自己的 NoC。返回数据沿反向路径归还信用和所有权。链路训练失败、lane 修复耗尽、时钟漂移或某个 chiplet 掉电，都必须在封装管理与平台 RAS 中形成可定位状态。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 请求从左上进入封装链路，再由右下进入目标裸片。
+  \node[hw state, minimum width=2.35cm, align=center] (src) at (0.9,3.25) {源 chiplet NoC\\请求与事务身份};
+  \node[hw compute, minimum width=2.45cm, align=center] (proto) at (4.05,3.25) {协议适配层\\PCIe / CXL / Stream};
+  \node[hw control, minimum width=2.45cm, align=center] (link) at (7.25,3.25) {die-to-die 适配\\CRC、重试、credit};
+  \draw[hw bus] (src) -- (proto);
+  \draw[hw bus] (proto) -- (link);
+
+  \node[hw lane, minimum width=3.0cm, minimum height=1.45cm,
+        label={[hw label]above:封装物理边界}] (package) at (10.3,1.85) {};
+  \node[hw memory, minimum width=2.45cm, align=center] (phy) at (10.3,1.85) {PHY + lane\\凸点与封装走线};
+  \draw[hw bus] (link.east) -- (9.0,3.25) -- (9.0,2.55) -- (phy.north west);
+
+  \node[hw compute, minimum width=2.45cm, align=center] (targetproto) at (7.25,0.35) {目标适配层\\校验并恢复 flit};
+  \node[hw state, minimum width=2.35cm, align=center] (target) at (4.05,0.35) {目标 chiplet NoC\\路由到控制器};
+  \node[hw state, minimum width=2.35cm, align=center] (complete) at (0.9,0.35) {完成或错误\\返回原事务};
+  \draw[hw bus] (phy.south west) -- (9.0,1.15) -- (9.0,0.35) -- (targetproto.east);
+  \draw[hw bus] (targetproto) -- (target);
+  \draw[hw return] (target) -- (complete);
+\end{pdfdiagram}
+\diagramnote{一次封装内请求的分层路径。NoC 保存系统内的路由和事务身份，协议适配层保存 PCIe/CXL 等上层语义，die-to-die 适配层负责链路可靠性，PHY 负责 lane、训练和封装电气传输。某层报告“成功”只证明该层的边界闭合，不能替代目标控制器的最终完成。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.25\linewidth}L{0.28\linewidth}L{0.19\linewidth}}
+\toprule
+层次 & 主要状态 & 成功边界 & 典型故障证据 \\
+\midrule
+源 / 目标 NoC & 路由、虚通道、事务标识 & 请求进入或离开目标端口 & 超时、credit 停滞、路由错误 \\\tablerowrule
+协议适配层 & header、顺序、一致性属性 & flit 与上层事务一一归属 & 协议错误、完成不匹配 \\\tablerowrule
+die-to-die 适配层 & 序号、重试缓冲、链路 credit & flit 通过校验并被远端接受 & CRC、重放、缓冲耗尽 \\\tablerowrule
+PHY 与封装 & lane、训练、采样裕量 & 链路进入可传输状态 & lane 失锁、误码、降宽或训练失败 \\\tablerowrule
+目标控制器 & 队列、介质或执行状态 & 最终 completion 返回请求者 & 设备超时、不可纠正错误、复位 \\
+\bottomrule
+\end{longtable}
 
 Chiplet 并不会消除物理设计问题，只是把一部分片上连线变成封装内高速接口。分析整机时应依次确认：逻辑事务由谁发出、协议在哪一层保持顺序与一致性、PHY 在哪里训练、封装如何供电散热、错误由哪个管理实体汇总。这样才能把“模块化封装”还原为可测量的硬件路径。
 \section{十三、交换机、Retimer、热插拔与端口遏制}

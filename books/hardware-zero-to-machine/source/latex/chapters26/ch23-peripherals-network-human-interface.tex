@@ -960,6 +960,58 @@ pps 与帧长、第三栏换成 \code{ethtool} 计数——方法不动，参数
 
 接收方向按相反顺序推进。模拟前端先均衡并判决采样，时钟数据恢复电路从信号中恢复采样相位，PMA 形成稳定符号流，FEC 尝试纠错，PCS 解码并恢复 lane 顺序，MAC 最后校验 FCS 并决定接收、统计错误或丢弃。一个 FCS 错误只说明帧到达 MAC 时内容不一致；要继续定位，还需查看纠错计数、符号错误、lane 对齐、信噪比和收发光功率等 PHY 证据。
 
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 发送路径和接收路径分开占两排，避免返回箭头穿过节点。
+  \node[hw label, font=\small\bfseries] at (-0.15,3.85) {发送};
+  \node[hw state, minimum width=2.05cm, align=center] (txdma) at (1.05,3.2) {主机内存\\TX 描述符与帧};
+  \node[hw control, minimum width=2.05cm, align=center] (txmac) at (3.8,3.2) {MAC\\地址、长度、FCS};
+  \node[hw compute, minimum width=2.05cm, align=center] (txpcs) at (6.55,3.2) {PCS / FEC\\编码与加扰};
+  \node[hw compute, minimum width=2.05cm, align=center] (txpma) at (9.3,3.2) {PMA / PMD\\串行化与驱动};
+  \draw[hw bus] (txdma) -- (txmac);
+  \draw[hw bus] (txmac) -- (txpcs);
+  \draw[hw bus] (txpcs) -- (txpma);
+
+  \node[hw label, font=\small\bfseries] at (-0.15,0.95) {接收};
+  \node[hw state, minimum width=2.05cm, align=center] (rxdma) at (1.05,0.3) {RX completion\\DMA 到主机页};
+  \node[hw control, minimum width=2.05cm, align=center] (rxmac) at (3.8,0.3) {MAC\\FCS 与帧过滤};
+  \node[hw compute, minimum width=2.05cm, align=center] (rxpcs) at (6.55,0.3) {PCS / FEC\\纠错与解码};
+  \node[hw compute, minimum width=2.05cm, align=center] (rxpma) at (9.3,0.3) {PMA / PMD\\采样与时钟恢复};
+  \draw[hw return] (rxpma) -- (rxpcs);
+  \draw[hw return] (rxpcs) -- (rxmac);
+  \draw[hw return] (rxmac) -- (rxdma);
+
+  \node[hw memory, minimum width=2.15cm, minimum height=1.2cm, align=center] (medium) at (11.85,1.75) {介质\\铜缆 / 光纤};
+  \draw[hw bus] (txpma.east) -- (10.7,3.2) -- (10.7,2.25) -- (medium.north west);
+  \draw[hw return] (medium.south west) -- (10.7,1.25) -- (10.7,0.3) -- (rxpma.east);
+\end{pdfdiagram}
+\diagramnote{一帧以不同表示穿过以太网接口。主机内存保存字节和描述符，MAC 处理帧语义，PCS/FEC 处理码块与纠错，PMA/PMD 处理 lane、采样和介质信号；接收完成只有在 PHY 恢复数据、MAC 接受帧并把内容 DMA 到主机页后才成立。每层都留下不同的错误证据。}
+
+\topic{1 Gb/s 数值案例：64 B 最小帧并不只占 512 ns}
+
+以不带 VLAN 标签的经典以太网帧为例，从目的 MAC 地址到 FCS 的最小帧长为 64 B，其中有效载荷不足时要填充到 46 B。介质上还要发送 7 B 前导码和 1 B SFD，并在下一帧前留出相当于 12 B 的帧间隔。因此，一次最小帧占用的线速时间为
+\[
+(8+64+12)\times8\ \mathrm{bit}\div10^9\ \mathrm{bit/s}
+=672\ \mathrm{ns}.
+\]
+一个 1518 B 普通最大帧对应
+\[
+(8+1518+12)\times8\ \mathrm{bit}\div10^9\ \mathrm{bit/s}
+=12.304\ \mu\mathrm{s}.
+\]
+这两个数字解释了为什么“每秒帧数”和“每秒有效载荷字节数”不是同一个指标：短帧中前导码、帧头、FCS 与帧间隔所占比例更大；驱动、DMA 和中断还会增加不在线路字节数中的主机开销。\cite{ieee8023-baselines}
+
+\begin{longtable}{L{0.18\linewidth}L{0.23\linewidth}L{0.29\linewidth}L{0.20\linewidth}}
+\toprule
+边界 & 表示形式 & 本层确认什么 & 本层不能确认什么 \\
+\midrule
+TX 描述符 & 地址、长度、offload 与所有权位 & 驱动已经发布一块可 DMA 缓冲区 & 帧已经离开 PHY \\\tablerowrule
+MAC & 前导、地址、类型/长度、payload、FCS & 帧格式成立并完成 FCS 生成或检查 & 模拟眼图和 FEC 裕量 \\\tablerowrule
+PCS / FEC & 码块、加扰数据、对齐标记与冗余 & 码块同步，错误在能力范围内已纠正 & 远端应用已经消费数据 \\\tablerowrule
+PMA / PMD & 串行符号、采样相位与电气/光学幅度 & lane 锁定并满足当前接收判决 & MAC 帧地址与上层校验正确 \\\tablerowrule
+RX completion & 缓冲区、长度、状态与校验结果 & NIC 已把被接受的帧写入主机内存 & 应用线程已经运行并读取它 \\
+\bottomrule
+\end{longtable}
+
 \topic{自动协商先确定共同能力}
 链路两端上电后先交换能力，选择双方共同支持的速率、双工方式以及适用的流控或 FEC 参数。某些高速铜缆和背板链路还要执行链路训练：发送端提供规定序列，接收端测量信道响应并请求调整发射均衡，直到误码和裕量满足进入数据态的条件。协商完成只表示参数达成一致；训练、块锁定、lane 对齐和错误率稳定后，链路才真正可承载 MAC 流量。
 
@@ -972,6 +1024,12 @@ pps 与帧长、第三栏换成 \code{ethtool} 计数——方法不动，参数
 
 \topic{从收帧异常回溯到物理层}
 当应用报告吞吐下降时，先确认 MAC 是否出现丢帧、暂停帧或环耗尽；若 MAC 错误不多，再检查驱动队列和 CPU 调度。若 FCS、符号或 FEC 计数同步上升，则沿 PCS、PMA、PMD 回溯。这个顺序能避免把物理链路误判成软件队列问题，也能避免在 RX 环已经耗尽时反复调整模拟均衡。完整证据链应同时保存协商结果、训练状态、PHY 计数器、MAC 计数器、驱动队列和应用时间线。
+
+\topic{案例：吞吐下降但 link 仍为 up}
+
+假设应用吞吐从 940 Mb/s 降到 300 Mb/s，而管理界面仍显示 1 Gb/s、全双工。第一种可能是主机侧 RX 环耗尽：PHY 与 MAC 计数正常，但 \code{rx\_no\_buffer}、丢包和 CPU 软中断积压上升，此时应增加队列处理能力或修正中断亲和性。第二种可能是介质裕量下降：FCS、符号错误或已纠正 FEC 码字随时间增加，并伴随重训练，此时应检查线缆、连接器、光功率、温度和均衡。第三种可能是流控：收到大量 pause 帧时，发送端会按协议停顿，链路不掉线却无法持续发满。
+
+定位的关键不是先重启驱动，而是把同一时间窗内的应用速率、RX/TX 环水位、MAC FCS 计数、PHY 符号/FEC 计数、pause 帧和重训练次数对齐。队列水位先恶化而 PHY 计数稳定，根因更接近主机；PHY 错误先增加而队列随后空闲，根因更接近介质。只有最早变化的证据才能指向最早失效边界。
 \section{四、USB、HID 与音频接口的共同边界}
 
 USB 是主机调度的分层总线。设备接入后先完成复位和枚举，主机读取描述符、分配地址、选择配置，再由驱动按 endpoint 类型提交传输。设备不能像 PCIe 主设备那样任意 DMA 系统内存，而是由主控制器按调度表发起总线事务，再由主控制器 DMA 主机缓冲区。

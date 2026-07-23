@@ -1265,11 +1265,77 @@ controller:  DMA command -> execute media work -> DMA data
 completion:  write CQ entry -> interrupt/poll -> host consumes CQ
 \end{lstlisting}
 
+这条三行 trace 还隐藏着四个彼此独立的游标。主机维护 SQ tail，表示“已经写好、允许控制器取走”的命令边界；控制器维护 SQ head，表示“已经取走”的命令边界。控制器维护 CQ tail，选择下一个完成槽；主机维护 CQ head，表示“已经检查状态并回收”的完成边界。doorbell 只把主机拥有的游标通知设备，不能替另一方推进游标。
+
+\topic{四槽队列案例：数组下标相同，phase 仍能区分新旧完成}
+
+设 CQ 深度只有 4，内存中的四个槽初始 phase 都为 0，主机期望看到的 phase 为 1。控制器依次把 CID 为 \code{0x31}、\code{0x08}、\code{0x52} 和 \code{0x19} 的完成写入槽 0--3，并把每项 phase 写成 1。主机每消费一项就推进 CQ head；消费槽 3 后，head 环回槽 0，同时把期望 phase 翻成 0。此时槽 0 仍残留上一圈的 \code{CID=0x31, phase=1}，但它与期望 phase 不同，因此不能被误认为新完成。控制器下一次覆盖槽 0 时写入 phase=0，主机才把它识别为新一圈的完成。\cite{nvme-spec}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 上排是请求发布，下排是完成回收；两条走廊不交叉。
+  \node[hw state, minimum width=2.25cm, align=center] (write) at (0.8,3.2) {主机写 SQ[2]\\\code{CID=0x52}};
+  \node[hw control, minimum width=2.35cm, align=center] (bell) at (3.65,3.2) {内存屏障\\SQ tail doorbell};
+  \node[hw compute, minimum width=2.35cm, align=center] (fetch) at (6.55,3.2) {控制器 DMA 取项\\推进内部 SQ head};
+  \node[hw memory, minimum width=2.25cm, align=center] (work) at (9.4,3.2) {FTL / NAND\\执行命令};
+  \draw[hw bus] (write) -- (bell);
+  \draw[hw bus] (bell) -- (fetch);
+  \draw[hw bus] (fetch) -- (work);
+
+  \node[hw state, minimum width=2.25cm, align=center] (reuse) at (0.8,0.55) {解除 DMA 映射\\CID 可以复用};
+  \node[hw control, minimum width=2.35cm, align=center] (cqbell) at (3.65,0.55) {主机写 CQ head\\归还完成槽};
+  \node[hw compute, minimum width=2.35cm, align=center] (consume) at (6.55,0.55) {检查 phase/status\\按 CID 找请求};
+  \node[hw state, minimum width=2.25cm, align=center] (post) at (9.4,0.55) {DMA 写 CQ 槽\\phase 匹配后可见};
+  \draw[hw bus] (work.south) -- (9.4,1.75) -- (post.north);
+  \draw[hw return] (post) -- (consume);
+  \draw[hw return] (consume) -- (cqbell);
+  \draw[hw return] (cqbell) -- (reuse);
+\end{pdfdiagram}
+\diagramnote{一条 NVMe 命令的两次所有权交接。上排由主机发布 SQ 槽，doorbell 只扩大控制器可取范围；下排由控制器发布 CQ 槽，主机只有在 phase 匹配且 status 合法后才消费。CID 解决“完成属于哪笔命令”，phase 解决“这个数组槽属于哪一圈”，generation 还要解决“完成属于复位前还是复位后”。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.25\linewidth}L{0.27\linewidth}L{0.20\linewidth}}
+\toprule
+状态 & 谁推进 & 推进说明什么 & 不能据此推断 \\
+\midrule
+SQ tail & 主机 & 此前 SQ 项已写好并允许设备取走 & 控制器已经取项或命令已经完成 \\\tablerowrule
+SQ head & 控制器 & 对应 SQ 槽已经被控制器消费 & 数据已经跨过介质或持久化边界 \\\tablerowrule
+CQ tail / phase & 控制器 & 新完成项已经写到下一个 CQ 槽 & 主机已经检查状态并回收请求 \\\tablerowrule
+CQ head & 主机 & 此前完成项已经被软件消费 & 迟到 DMA 已因复位自动消失 \\\tablerowrule
+CID & 主机分配，设备回显 & 把乱序完成匹配到原请求 & 区分复位前后的同号请求 \\\tablerowrule
+generation & 驱动在重建队列时更新 & 把资源和完成归入同一复位代际 & 代替停止 DMA 与确认旧队列失效 \\
+\bottomrule
+\end{longtable}
+
 PRP 或 SGL 描述数据缓冲区的物理页列表。它们必须在命令有效期内保持固定并允许设备访问；IOMMU 映射、页锁定和完成后的解映射共同划定缓冲区所有权。队列深度提高并行度，但超过介质与控制器能并行处理的程度后，只会增加排队和尾延迟。
+
+\topic{10 KiB 跨页案例：PRP 指向的是物理片段，不是虚拟连续性}
+
+设主机页大小为 4 KiB，读缓冲区从第一页内偏移 \code{0x600} 开始，长度为 10 KiB。第一页只能容纳 $4096-1536=2560$ B，剩余 7680 B 还要占用一个完整页和第三页的 3584 B，因此这笔读跨越三个物理页。PRP1 保存第一个有效字节的地址；当传输跨越两个以上页面时，PRP2 指向一张 PRP list，表内再给出后续两个页框的页对齐地址。三个页框在物理内存中可以完全不相邻，IOMMU 也可以把它们映射成设备可访问的 IOVA。\cite{nvme-spec}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw control, minimum width=2.25cm, minimum height=2.0cm, align=center] (sqe) at (0.9,2.15)
+    {NVMe SQE\\PRP1：首字节\\PRP2：列表地址};
+
+  \node[hw memory, minimum width=2.55cm, align=center] (first) at (4.25,3.45)
+    {物理页 A\\从 \code{0x600} 起\\有效 2560 B};
+  \node[hw state, minimum width=2.55cm, align=center] (list) at (4.25,0.85)
+    {PRP list\\项 0：页 B\\项 1：页 C};
+  \node[hw memory, minimum width=2.55cm, align=center] (second) at (8.2,1.65)
+    {物理页 B\\完整 4096 B};
+  \node[hw memory, minimum width=2.55cm, align=center] (third) at (8.2,-0.05)
+    {物理页 C\\前 3584 B};
+
+  \draw[hw bus] (sqe.north east) -- (2.65,3.45) -- (first.west);
+  \draw[hw bus] (sqe.south east) -- (2.65,0.85) -- (list.west);
+  \draw[hw bus] (list.east) -- (5.95,0.85) -- (5.95,1.65) -- (second.west);
+  \draw[hw bus] (5.95,0.85) -- (5.95,-0.05) -- (third.west);
+\end{pdfdiagram}
+\diagramnote{一个 10 KiB NVMe 缓冲区的 PRP 展开。PRP1 可以带页内偏移，后续 PRP 表项必须给出页边界；控制器按“首片段、完整中间页、末片段”计算有效长度。完成前释放任一页框或撤销映射，设备仍可能把数据 DMA 到已经转作他用的物理内存。}
 
 \section{四、错误、复位与持久化边界}
 
 完成项中的状态码、命令标识和 SQ 标识决定主机能否把结果归还给正确请求。超时后不能立刻重用命令缓冲，因为旧控制器事务可能仍在路上；驱动通常先停止新提交、屏蔽通知、确认或复位队列，再按协议处理未完成请求。
+
+一个具体的危险场景是：旧队列中的 \code{CID=7} 超时，驱动立即把 CID 7 和数据页分给新请求；随后旧控制器写回迟到完成或继续 DMA。此时 CID 数值虽然相同，资源所有者已经不同，软件可能把旧错误报告给新请求，设备也可能覆盖新请求的数据页。安全恢复必须先冻结提交，隔离通知，停止或复位控制器并确认旧 DMA 不会继续，再为新队列建立新的 generation，最后才复用 CID、CQ 槽和页框。
 
 普通写完成可能只表示数据进入控制器易失缓存。需要持久化时，文件系统或数据库还要使用 FUA、FLUSH 等语义，并让控制器的断电保护或介质提交边界参与保证。性能数字必须说明测的是提交、完成还是持久化完成。
 
