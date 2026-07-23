@@ -12,11 +12,14 @@ CHAPTER_DIR = REPO_ROOT / "books/hardware-zero-to-machine/source/latex/chapters2
 NUMBERED_SECTION_RE = re.compile(r"(?m)^\\section\{")
 EXERCISE_HEADING_RE = re.compile(r"(?m)^\\section\*\{章末练习\}")
 ANSWER_HEADING_RE = re.compile(r"(?m)^\\section\*\{参考解答与要点\}")
+EXPECTED_EXERCISE_UNITS = 356
+MAX_NUMBERED_EXERCISES_PER_CHAPTER = 10
 
 
 def main() -> None:
     failures: list[str] = []
     total_exercises = 0
+    total_exercise_units = 0
     chapters = sorted(CHAPTER_DIR.glob("ch[0-9][0-9]-*.tex"))
     if len(chapters) != 26:
         failures.append(f"expected 26 generated chapters, found {len(chapters)}")
@@ -46,17 +49,42 @@ def main() -> None:
 
         exercise_count = text.count(r"\begin{chapterexercise}")
         answer_count = text.count(r"\begin{chapteranswer}")
+        composite_count = len(
+            re.findall(r"\\begin\{chapterexercise\}\{综合练习：", text)
+        )
+        exercise_subproblem_count = text.count(r"\begin{exercisesubproblem}")
+        answer_subproblem_count = text.count(r"\begin{answersubproblem}")
         if exercise_count == 0 or exercise_count != answer_count:
             failures.append(
                 f"{label}: exercise/answer count is {exercise_count}/{answer_count}"
             )
+        if exercise_count > MAX_NUMBERED_EXERCISES_PER_CHAPTER:
+            failures.append(
+                f"{label}: {exercise_count} numbered exercises exceeds "
+                f"the limit {MAX_NUMBERED_EXERCISES_PER_CHAPTER}"
+            )
+        if exercise_subproblem_count != answer_subproblem_count:
+            failures.append(
+                f"{label}: exercise/answer subproblem count is "
+                f"{exercise_subproblem_count}/{answer_subproblem_count}"
+            )
         total_exercises += exercise_count
+        total_exercise_units += (
+            exercise_count - composite_count + exercise_subproblem_count
+        )
+
+    if total_exercise_units != EXPECTED_EXERCISE_UNITS:
+        failures.append(
+            f"expected {EXPECTED_EXERCISE_UNITS} preserved exercise units, "
+            f"found {total_exercise_units}"
+        )
 
     if failures:
         raise SystemExit("chapter flow audit failed:\n- " + "\n- ".join(failures))
     print(
         f"chapter flow audit OK: {len(chapters)} chapters, {total_exercises} numbered "
-        "exercises with matching answers; all chapter-end material follows reader content"
+        f"exercises containing {total_exercise_units} preserved exercise/answer units; "
+        "all chapter-end material follows reader content"
     )
 
 

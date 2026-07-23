@@ -119,10 +119,10 @@ MTU 本身也可以调。数据中心内部常用 9000 字节载荷的巨型帧
 （jumbo frame）：线上每帧约 9038 字节，1 GbE 每秒帧数降到约 1.4
 万，每帧固定成本被摊到六倍的载荷上，pps 与中断、协议栈开销同步
 下降约六倍。前提是路径上每一跳的 MTU 都得一致放大，否则分片甚
-至静默丢包会把收益全部吃回去——巨型帧是全网约定，不是单机参
+至静默丢包会抵消全部收益——巨型帧是全网约定，不是单机参
 数。
 
-“网卡不能喊停”严格说有一个例外：以太网流控允许接收方发 PAUSE
+“网卡通常不能要求发送端立即停止”严格说有一个例外：以太网流控允许接收方发 PAUSE
 帧，请对端暂停发送指定时长。它的本意是防丢包，实际效果是把缓冲
 区不足的问题传染给上游——一台主机收不动，整条链路上的无辜流量
 一起被压。现代数据中心普遍关闭全局 PAUSE，丢包问题留给更深的
@@ -137,7 +137,7 @@ MTU 本身也可以调。数据中心内部常用 9000 字节载荷的巨型帧
 为准。网卡的特殊性在于，收发两个方向的环各有一条不对称的约定：
 接收环要预投，发送环要回收。
 
-RX 环是预投的。收帧不可预约——对端随时发，网卡不能喊停——所
+RX 环是预投的。收帧不可预约——对端随时发，网卡通常不能要求发送端立即停止——所
 以驱动必须提前把一批空缓冲区的地址铺满接收环。帧到达后，网卡
 MAC 校验 FCS，由 DMA 把帧直接写进下一个空缓冲区，写回描述符状
 态（帧长、校验结果、RSS 队列号），再按中断策略通知 CPU。驱动取
@@ -349,7 +349,7 @@ MSI-X 中断向量、绑一颗核。接收侧的分流由硬件完成：RSS 对�
 颗核起步，留余量配 16 队列、16 个 MSI-X 向量、绑 16 颗核。三个
 配置必须一起看：队列数、间接表、中断亲和——队列开了 32 条而中
 断全绑在核 0，等于单队列；irqbalance 之类的自动均衡在万兆以上
-往往帮倒忙，绑核要按队列手工固定。
+反而可能降低性能，绑核要按队列手工固定。
 
 同样的算法推到更高速率：25 GbE 小帧约 37.2 Mpps，40 GbE 约 59.5
 Mpps，100 GbE 约 148.8 Mpps——单核约 1.5 Mpps 的处理率面前，需
@@ -371,7 +371,7 @@ RSS 间接表 & 哈希值到队列的映射 & 映射不均，各核负载歪斜 
 
 RSS 也有边界。它只认五元组：GRE、VxLAN 等隧道的外层包头都相
 同，所有隧道流量挤进一条队列，较新的网卡支持按内层字段哈希来解
-决。单条大象流永远只能跑一颗核的速度，这是保序的代价，只能靠多
+决。单条单条高带宽流永远只能跑一颗核的速度，这是保序的代价，只能靠多
 开几条流来绕。与 RSS 同族的卸载还有 TSO 与 GRO：发送侧由网卡把
 大块数据切成 MTU 帧，接收侧把同流相邻帧拼成大块再上交——它们
 不改队列结构，改的是“每帧固定成本”里的帧数，与巨型帧是同一思
@@ -448,7 +448,7 @@ AF\_XDP / DPDK & 整个内核协议栈路径 & 极端 pps 的专用应用 \\
 
 工程含义与边界。零拷贝的本质是所有权转移代替内容复制，正是第五
 章“缓冲区何时归 CPU、何时归设备”那条问题在协议栈内部的延长
-线。它不是免费午餐：页共享带来生命周期管理与写时复制的复杂度，
+线。该机制也会引入额外代价：页共享带来生命周期管理与写时复制的复杂度，
 数据量小时固定开销可能盖过节省；它适用的条件是大块数据、高带
 宽、CPU 比带宽更紧张——这正是存储服务器、CDN、反向代理人手一
 份 sendfile 的原因。从本章视角看，零拷贝与中断聚合、RSS 是同一
@@ -890,7 +890,7 @@ GC 留余量——与“冒险、异常与性能”一章“服务台保持余�
 测——队列长度、利用率、写放大、时延直方图，全是现成的可观测数据；
 两案的修复也都不动设备，一个改提交方式，一个改介质水位。外设问题的
 默认值应当是“机制问题”而不是“硬件坏了”：先把 Little 定律和介质的
-脾气代进去算一遍，算不通再怀疑硬件。
+物理与协议约束代入算一遍，算不通再怀疑硬件。
 
 \topic{外设问题的通用读法}
 全章收束为一张检查表。面对任何外设的性能或异常问题，按三步走：先问
@@ -951,7 +951,28 @@ pps 与帧长、第三栏换成 \code{ethtool} 计数——方法不动，参数
 
 
 
-\section{三、USB、HID 与音频接口的共同边界}
+\section{三、以太网 PHY：从 MAC 帧到介质信号}
+
+网卡驱动建立描述符并启动 DMA 后，MAC 得到的是一串帧字节；线缆或光纤传输的却是经过编码、加扰、纠错和模拟发送的符号。二者之间由协调子层、介质无关接口、PCS、PMA 和 PMD/MDI 等层次连接。不同速率和介质采用的编码与训练细节不同，但从 MAC 到 PHY 的责任边界保持一致：MAC 管理帧和链路层地址，PHY 管理符号、时钟恢复、信道适配与介质电气/光学接口。\cite{ieee8023-baselines}
+
+\topic{发送路径逐层改变表示形式}
+发送时，MAC 先形成前导码、帧头、有效载荷和 FCS，并通过 MII 家族接口把数据交给 PHY。PCS 完成编码、加扰、lane 分配与对齐标记；需要前向纠错时，FEC 编码器加入冗余；PMA 负责串并转换、lane 复用和时钟关系；PMD 最终驱动铜缆、背板或光模块。每层都可能扩大数据量或改变时钟域，因此“MAC 每秒交出多少有效载荷”不能直接等同于“介质上需要多少符号带宽”。
+
+接收方向按相反顺序推进。模拟前端先均衡并判决采样，时钟数据恢复电路从信号中恢复采样相位，PMA 形成稳定符号流，FEC 尝试纠错，PCS 解码并恢复 lane 顺序，MAC 最后校验 FCS 并决定接收、统计错误或丢弃。一个 FCS 错误只说明帧到达 MAC 时内容不一致；要继续定位，还需查看纠错计数、符号错误、lane 对齐、信噪比和收发光功率等 PHY 证据。
+
+\topic{自动协商先确定共同能力}
+链路两端上电后先交换能力，选择双方共同支持的速率、双工方式以及适用的流控或 FEC 参数。某些高速铜缆和背板链路还要执行链路训练：发送端提供规定序列，接收端测量信道响应并请求调整发射均衡，直到误码和裕量满足进入数据态的条件。协商完成只表示参数达成一致；训练、块锁定、lane 对齐和错误率稳定后，链路才真正可承载 MAC 流量。
+
+排障时应把状态分成三层：没有协商结果，优先检查介质、对端能力和管理配置；已经协商但训练失败，检查损耗、端接、均衡和 lane；链路已进入数据态但错误持续增长，再检查 FEC 纠错余量、温度、连接器与串扰。直接重启驱动可能暂时重新训练，却不能证明物理问题消失。
+
+\topic{FEC 用确定延迟换取误码容限}
+假设接收端在一个 FEC 码块内检测到少量错误，译码器可利用冗余恢复原始数据并增加“已纠正码字”计数；错误超过纠错能力时，只能报告不可纠正码字，上层帧校验通常也会失败。FEC 改善的是给定信道条件下的有效误码率，不会增加模拟眼图本身的裕量，并且会引入编码冗余和固定流水延迟。
+
+因此健康链路也可能持续出现少量已纠正错误。判断是否退化要观察单位时间纠错率、不可纠正错误、链路重训练次数和环境变化，而不是看到非零计数就立即更换硬件。若纠错率随温度或线缆弯折显著上升，它就是物理裕量收窄的早期证据。
+
+\topic{从收帧异常回溯到物理层}
+当应用报告吞吐下降时，先确认 MAC 是否出现丢帧、暂停帧或环耗尽；若 MAC 错误不多，再检查驱动队列和 CPU 调度。若 FCS、符号或 FEC 计数同步上升，则沿 PCS、PMA、PMD 回溯。这个顺序能避免把物理链路误判成软件队列问题，也能避免在 RX 环已经耗尽时反复调整模拟均衡。完整证据链应同时保存协商结果、训练状态、PHY 计数器、MAC 计数器、驱动队列和应用时间线。
+\section{四、USB、HID 与音频接口的共同边界}
 
 USB 是主机调度的分层总线。设备接入后先完成复位和枚举，主机读取描述符、分配地址、选择配置，再由驱动按 endpoint 类型提交传输。设备不能像 PCIe 主设备那样任意 DMA 系统内存，而是由主控制器按调度表发起总线事务，再由主控制器 DMA 主机缓冲区。
 
@@ -968,13 +989,13 @@ isochronous & 音频、摄像头 & 周期带宽和时延，允许按协议处理
 
 HID 报告把按键或指针状态编码成固定格式；音频接口还要处理生产者与消费者时钟略有偏差的问题，靠反馈端点、缓冲水位或采样率转换避免缓冲区逐渐溢出/耗尽。传感器接口也遵循同一思路：先确定采样时钟和数据格式，再定义缓冲、时间戳、丢样与错误报告。
 
-\section{四、从物理事件到进程可见事件}
+\section{五、从物理事件到进程可见事件}
 
 一次键盘按键会经历开关抖动、设备端扫描与消抖、USB 报告、主控制器 DMA、完成中断、内核输入子系统和用户态读取。每层都可能合并或延迟事件，因此“按键发生时刻”至少有物理接触、设备采样、主机收包和进程读取四个时间戳。
 
 排错时按层观察：设备是否枚举，endpoint 是否配置，主控制器队列是否前进，DMA 缓冲是否更新，完成中断是否到达，驱动是否把报告交给上层。只在应用程序里反复重试，无法区分线缆、电源、协议、控制器和驱动故障。
 
-\section{五、USB 拓扑、枚举与描述符}
+\section{六、USB 拓扑、枚举与描述符}
 
 USB 的树形拓扑由主控制器、root hub、外部 hub 和设备组成。连接检测后，端口先完成供电与复位，设备在默认地址响应；主机读取设备描述符的基本字段，分配唯一地址，再读取完整的配置、接口和 endpoint 描述符。一个物理设备可包含多个 interface，例如摄像头同时提供视频、麦克风和控制接口，由不同类驱动绑定。
 
@@ -982,7 +1003,7 @@ USB 的树形拓扑由主控制器、root hub、外部 hub 和设备组成。连
 
 hub 不只是被动分线器。它报告端口连接、电源、过流和复位状态，并转发不同速度设备的事务。共享上行链路意味着多个 endpoint 竞争同一周期预算；逻辑上独立的设备仍可能共享 hub、电源和主控制器故障域。
 
-\section{六、xHCI 队列与一次 USB 传输}
+\section{七、xHCI 队列与一次 USB 传输}
 
 xHCI 主控制器使用内存中的 ring 描述工作。驱动把 TRB 写入 transfer ring，执行必要的 DMA 同步，再写 doorbell。控制器取走 TRB，通过相应 endpoint 发起总线事务，把数据 DMA 到缓冲区或从缓冲区读出，随后在 event ring 写入完成事件并触发中断。驱动根据 slot、endpoint 和 TRB 指针归属完成，再推进 ring。
 
@@ -1007,7 +1028,7 @@ ring 的 cycle bit 用于区分环回后的新旧条目。生产者只有在完�
 \end{pdfdiagram}
 \diagramnote{USB 请求从驱动到设备再返回。doorbell 只交出描述符所有权，真正完成要等设备事务、DMA 与 event ring 状态全部闭合。}
 
-\section{七、HID：报告、消抖与输入语义}
+\section{八、HID：报告、消抖与输入语义}
 
 HID report descriptor 描述字段的用途、位宽、逻辑范围、单位和 report ID。键盘可以报告当前按下的键集合，鼠标可以报告相对位移，触控设备则包含多个 contact 的坐标与状态。驱动必须按 bit 字段解析，而不能假定每个值都按整字节对齐。
 
@@ -1015,7 +1036,7 @@ HID report descriptor 描述字段的用途、位宽、逻辑范围、单位和 
 
 输入系统还要处理键位按下、保持、重复和释放。若丢失包含释放状态的报告，软件可能认为按键一直按下；协议、设备或上层需要用完整状态报告、超时或重新同步恢复。安全相关输入还应区分设备身份与注入来源。
 
-\section{八、音频流：时钟域、反馈与缓冲水位}
+\section{九、音频流：时钟域、反馈与缓冲水位}
 
 USB 音频把连续采样分装进周期传输。即使主机和设备都配置为 48 kHz，它们的晶振仍有微小频差：生产稍快会使缓冲逐渐上升，消费稍快会使缓冲逐渐下降。仅靠一个大缓冲只能延后溢出或欠载，不能消除长期速率差。
 
@@ -1050,7 +1071,7 @@ USB 音频把连续采样分装进周期传输。即使主机和设备都配置�
 
 
 
-\section{九、传感器把连续世界变成带时间的数据}
+\section{十、传感器把连续世界变成带时间的数据}
 
 传感器路径不是“读一个寄存器”这么简单。温度、压力、加速度或光强先被敏感元件转换为电压、电流、电容或电阻变化，模拟前端完成偏置、放大与滤波，模数转换器（Analog-to-Digital Converter, ADC）在采样时刻量化输入，数字接口再把样本、状态和时间信息交给控制器。驱动最终看到的整数同时受量程、分辨率、参考电压、校准系数和采样时刻约束。
 
@@ -1058,7 +1079,7 @@ USB 音频把连续采样分装进周期传输。即使主机和设备都配置�
 
 采样率必须覆盖信号带宽并留出模拟抗混叠滤波的过渡带。高于 Nyquist 频率的输入会折叠到低频，软件事后无法从样本中判断它原来位于哪个频段。提高数字采样率可以放宽模拟滤波器设计，却会增加总线、FIFO、DMA 和处理器预算；因此采样率是从模拟边界一直影响到内存带宽的系统参数。
 
-\section{十、I2C、SPI 与采样 FIFO 的边界}
+\section{十一、I2C、SPI 与采样 FIFO 的边界}
 
 低速配置常用 I2C：控制器按地址选择目标，通过寄存器号读写量程、采样率和中断阈值；目标可用 NACK 表示未接受，也可通过 clock stretching 延长某一位时间。较高速的样本流常用 SPI：片选界定目标和帧，时钟极性/相位决定采样边沿，全双工移位意味着“读寄存器”往往也要同时发送命令或空字节。两者都只保证接口上的 bit/byte 转移，不自动说明样本对应哪个物理时刻。
 
@@ -1077,7 +1098,7 @@ DMA 环 & 描述符、所有权、时间戳范围 & completion 归还整批缓�
 \bottomrule
 \end{longtable}
 
-\section{十一、过载、丢样与重新同步}
+\section{十二、过载、丢样与重新同步}
 
 缓冲区只能吸收短时速率差，不能修复长期过载。采样器以 10 ksample/s 产生 16-bit 三轴数据，未计头部时原始速率为 $10{,}000\times6=60$ kB/s；若控制器最长可能连续 40 ms 得不到总线服务，仅保存这段突发就需要至少 2400 B，再加水位中断延迟和 DMA 描述符切换裕量。队列满时必须定义策略：停止采样、覆盖最旧样本、丢弃最新样本或降低采样率，并通过序号间隙和溢出位让软件知道数据不连续。
 
@@ -1087,74 +1108,48 @@ DMA 环 & 描述符、所有权、时间戳范围 & completion 归还整批缓�
 
 \section*{章末练习}
 
-\begin{chapterexercise}{扇区对齐}
-某 4 KB 扇区硬盘的分区从 63 号逻辑（512 B）扇区开始，文件系统按 4 KB 块写入。求分区起始字节偏移是否为 4 KB 的整数倍；说明每次文件系统块写要触及几个物理扇区、代价是什么，并给出修复做法
-\exercisecheck{学习目标}{分区边界与物理扇区对齐}
-\end{chapterexercise}
-
-\begin{chapterexercise}{写放大计算}
-某 SSD 页 16 KB、每块 256 页，随机写稳态下每块平均 75\% 为有效页。求写放大系数；主机累计写入 10 GB 时，NAND 实际被写入多少
-\exercisecheck{学习目标}{写放大 $=1/(1-\text{有效占比})$ 的来源}
-\end{chapterexercise}
-
-\begin{chapterexercise}{随机 IOPS 估算}
-7200 rpm 硬盘，平均寻道 4 ms，顺序传输率 150 MB/s。估算 4 KB 随机读的 IOPS 与等效带宽，并与顺序读带宽比较
-\exercisecheck{学习目标}{毫秒级寻道加旋转决定随机 IOPS}
-\end{chapterexercise}
-
-\begin{chapterexercise}{中断聚合权衡}
-1 Gb/s 网卡满载 64 B 小帧（线速约 148.8 万 pps），每次中断处理约 5 $\mu$s。求不聚合时的 CPU 开销；聚合到每 32 帧一次中断后的开销；说明聚合付出的代价
-\exercisecheck{学习目标}{聚合用时延换 CPU 占用}
-\end{chapterexercise}
-
-\begin{chapterexercise}{NVMe trace 排序}
-把一次 NVMe 读的这些事件排成时间序：DMA 写数据到内存、写 SQ 尾 doorbell、页缓存未命中、设备写 CQ 完成项、MSI 中断、驱动写命令项到 SQ、唤醒进程
-\exercisecheck{学习目标}{提交—执行—完成三段的次序}
-\end{chapterexercise}
-
-\begin{chapterexercise}{队列深度选择}
-某 NVMe SSD 4 KB 随机读时延 90 $\mu$s，应用目标 40 万 IOPS。用 Little 定律求所需最小队列深度；若设备服务率上限 50 万 IOPS，求 QD=256 时的平均时延
-\exercisecheck{学习目标}{$L=\lambda W$；过拐点只加排队}
-\end{chapterexercise}
-
-\begin{chapterexercise}{1}
+\begin{chapterexercise}{综合练习：1 至 2}
+\begin{exercisesubproblem}{（a）1}
 枚举
 \exercisecheck{题目}{按顺序说明 USB 设备从连接到类驱动可提交传输之间的主要步骤。}
-\end{chapterexercise}
-
-\begin{chapterexercise}{2}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）2}
 带宽
 \exercisecheck{题目}{为什么两个独立 endpoint 仍可能互相影响？列出至少两个共享资源。}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
-\begin{chapterexercise}{3}
+\begin{chapterexercise}{综合练习：3 至 4}
+\begin{exercisesubproblem}{（a）3}
 队列
 \exercisecheck{题目}{xHCI 驱动写 TRB 后为何不能省略 DMA 同步与 doorbell 前的顺序约束？}
-\end{chapterexercise}
-
-\begin{chapterexercise}{4}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）4}
 复位
 \exercisecheck{题目}{endpoint 复位时，怎样防止迟到事件或 DMA 访问已经复用的缓冲区？}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
-\begin{chapterexercise}{5}
+\begin{chapterexercise}{综合练习：5 至 6}
+\begin{exercisesubproblem}{（a）5}
 HID
 \exercisecheck{题目}{解释 USB interrupt transfer 与 CPU 物理中断线的区别；按键释放报告丢失会出现什么现象？}
-\end{chapterexercise}
-
-\begin{chapterexercise}{6}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）6}
 音频
 \exercisecheck{题目}{主机与设备标称采样率相同，为什么仍会逐渐欠载或溢出？反馈 endpoint 如何帮助稳定水位？}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
-\begin{chapterexercise}{量化计算}
+\begin{chapterexercise}{综合练习：量化计算至采样边界}
+\begin{exercisesubproblem}{（a）量化计算}
 计算 12-bit、3.3 V ADC 的理想最低有效位
 \exercisecheck{检查要点}{分辨率不等于精度}
-\end{chapterexercise}
-
-\begin{chapterexercise}{采样边界}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）采样边界}
 说明抗混叠必须在 ADC 之前完成的原因
 \exercisecheck{检查要点}{混叠后频率身份不可恢复}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
 \begin{chapterexercise}{时间戳}
@@ -1177,76 +1172,60 @@ HID
 \exercisecheck{检查要点}{配置与校准归属可能已改变}
 \end{chapterexercise}
 
+\begin{chapterexercise}{UART 帧分析}
+给定 RX 波形和标称波特率，数出起始位、数据位、停止位，还原字节并核对波特率误差
+\exercisecheck{预期结果}{帧结构和误差判断都有依据}
+\end{chapterexercise}
+
+\begin{chapterexercise}{I2C 事务序列}
+写出主机从 7 位地址 \code{0x50} 的从机寄存器 \code{0x10} 读 2 字节的完整序列：START、地址字节、读写位、ACK/NACK、repeated START、STOP
+\exercisecheck{预期结果}{\code{0xA0}/\code{0xA1} 正确，最后一字节 NACK，repeated START 位置正确}
+\end{chapterexercise}
+
 \section*{参考解答与要点}
 
-\begin{chapteranswer}{扇区对齐}
-起始偏移 $=63\times512=32256$ B，$32256/4096=7.875$，不是 4 KB 的整数倍，分区未对齐。文件系统每个 4 KB 块都跨越两个物理 4 KB 扇区，写一块要先读出两个扇区、修改、再写回（读-改-写），写代价约翻倍；SSD 上同理跨页、放大 GC 负担。修复：分区起始对齐到 1 MiB（2048 个 512 B 扇区）边界，现代分区工具默认如此
-\answercheck{必须掌握的要点}{先算偏移再谈对齐；不对齐的代价是读-改-写}
-\end{chapteranswer}
-
-\begin{chapteranswer}{写放大计算}
-每回收一个块：块容量 $256\times16$ KB $=4$ MB，其中有效 $4\times0.75=3$ MB 须先搬出，只换得 1 MB 空闲。稳态下主机每写 1 MB，NAND 要写 1 MB 数据加 3 MB 搬运共 4 MB，写放大 $=4=1/(1-0.75)$。主机累计写 10 GB，NAND 实际写入 $10\times4=40$ GB
-\answercheck{必须掌握的要点}{有效占比越高写放大越大；留空闲空间直接降放大}
-\end{chapteranswer}
-
-\begin{chapteranswer}{随机 IOPS 估算}
-7200 rpm 每转 $60/7200\approx8.33$ ms，平均旋转等待半转 $4.17$ ms；加平均寻道 4 ms，4 KB 传输 $4096/(1.5\times10^{8})\approx0.03$ ms，单次共约 8.2 ms。IOPS $\approx1/0.0082\approx122$；等效带宽 $122\times4$ KB $\approx0.49$ MB/s，与顺序 150 MB/s 相差约 300 倍
-\answercheck{必须掌握的要点}{随机 IOPS 由寻道加旋转固定；顺序与随机差两个数量级}
-\end{chapteranswer}
-
-\begin{chapteranswer}{中断聚合权衡}
-不聚合：$1.488\times10^{6}\times5\ \mu\text{s}\approx7.4$ CPU 秒/秒，约需 8 个核专职处理中断，系统实际早已丢包。聚合 32 帧一次：中断率 $1.488\times10^{6}/32\approx4.65\times10^{4}$ 次/秒，CPU 开销 $\approx4.65\times10^{4}\times5\ \mu\text{s}\approx0.23$ 秒/秒，约一个核的 23\%。代价：帧要等够一批或等到聚合定时器超时，平均时延增加约半个聚合窗口（$T/2$）
-\answercheck{必须掌握的要点}{聚合把到达率除以批大小；吞吐与时延的交换}
-\end{chapteranswer}
-
-\begin{chapteranswer}{NVMe trace 排序}
-次序：页缓存未命中 → 驱动写命令项到 SQ → 写 SQ 尾 doorbell → 设备 DMA 写数据到内存 → 设备写 CQ 完成项 → MSI 中断 → 唤醒进程。两处次序是硬性约定：doorbell 必须在命令项写好之后（先可见、再通知），CQ 完成项必须在 DMA 数据之后（先数据、后完成），唤醒只能在中断处理确认完成之后
-\answercheck{必须掌握的要点}{提交—执行—完成三段；每段先后都是可见性约定}
-\end{chapteranswer}
-
-\begin{chapteranswer}{队列深度选择}
-$L=\lambda W=4\times10^{5}\times90\times10^{-6}=36$，最小深度 36，工程上取 64 留一档余量。设备上限 50 万 IOPS 时已经饱和，QD=256 的平均时延 $\approx256/(5\times10^{5})=512\ \mu$s：吞吐仍是 50 万 IOPS，多出的深度全部变成排队，时延约为 90 $\mu$s 的 5.7 倍
-\answercheck{必须掌握的要点}{深度按 $\lambda W$ 取并留余量；过拐点后加深只买排队}
-\end{chapteranswer}
-
-\begin{chapteranswer}{1}
+\begin{chapteranswer}{综合练习：1 至 2}
+\begin{answersubproblem}{（a）1}
 枚举
 \answercheck{解答要点}{检测连接与供电，端口复位，在默认地址读取基本描述符，分配地址，读取配置/接口/endpoint 描述符，选择配置和 alternate setting，绑定类驱动。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{2}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）2}
 带宽
 \answercheck{解答要点}{endpoint 可能共享设备上行、hub 上行、周期调度预算、主控制器 ring、DMA 和中断处理，因此逻辑独立不代表性能与故障域独立。}
+\end{answersubproblem}
 \end{chapteranswer}
 
-\begin{chapteranswer}{3}
+\begin{chapteranswer}{综合练习：3 至 4}
+\begin{answersubproblem}{（a）3}
 队列
 \answercheck{解答要点}{必须先让 TRB 和缓冲内容对控制器可见，再通知控制器取用；否则控制器可能看到 doorbell 却读到旧描述符或旧数据。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{4}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）4}
 复位
 \answercheck{解答要点}{先停止 endpoint 并等待控制器确认，取消或隔离旧 TRB，改变 cycle/generation，处理 event ring 中旧事件，确认无 DMA 后才释放和复用缓冲。}
+\end{answersubproblem}
 \end{chapteranswer}
 
-\begin{chapteranswer}{5}
+\begin{chapteranswer}{综合练习：5 至 6}
+\begin{answersubproblem}{（a）5}
 HID
 \answercheck{解答要点}{interrupt endpoint 由主机周期轮询，CPU 中断是主控制器报告完成的机制。释放报告丢失可能形成“粘键”，需后续完整状态或重新同步纠正。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{6}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）6}
 音频
 \answercheck{解答要点}{独立晶振存在频差；反馈提供实际消费速率，主机按服务间隔微调样本数，使长期平均生产率匹配并把水位保持在目标附近。}
+\end{answersubproblem}
 \end{chapteranswer}
 
-\begin{chapteranswer}{量化计算}
+\begin{chapteranswer}{综合练习：量化计算至采样边界}
+\begin{answersubproblem}{（a）量化计算}
 $3.3/4096\approx0.806$ mV/LSB；实际精度还受参考、噪声、偏移与非线性影响。
 \answercheck{必须保留的检查点}{不把码宽直接当准确度}
-\end{chapteranswer}
-
-\begin{chapteranswer}{采样边界}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）采样边界}
 高频分量采样后会折叠到基带，与真实低频产生相同样本序列；数字处理无法区分二者。
 \answercheck{必须保留的检查点}{模拟滤波位于采样之前}
+\end{answersubproblem}
 \end{chapteranswer}
 
 \begin{chapteranswer}{时间戳}
@@ -1267,4 +1246,14 @@ I2C 尝试释放时钟并发 STOP 后重配；SPI 拉高片选结束残帧，再
 \begin{chapteranswer}{代际隔离}
 复位可能恢复默认量程、采样率和校准，残留码无法确定属于哪套配置；generation 变化后应拒绝旧样本。
 \answercheck{必须保留的检查点}{数值合理不代表语义正确}
+\end{chapteranswer}
+
+\begin{chapteranswer}{UART 帧分析}
+先找起始位下降沿，再按位时间中点逐位采样：1 起始位、8 数据位（低位在前）、1 停止位；还原字节后核对实测位时间与标称波特率的偏差，双方每一侧误差一般不超过约 2\%，收发合计留有约 5\% 的理论上限。
+\answercheck{必须保留的要点}{位边界、采样点和误差都要核对。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{I2C 事务序列}
+START $\rightarrow$ \code{0xA0}（\code{0x50} 左移一位、读写位 0 表示写）$\rightarrow$ 从机 ACK $\rightarrow$ \code{0x10}（寄存器号）$\rightarrow$ ACK $\rightarrow$ repeated START $\rightarrow$ \code{0xA1}（读写位 1 表示读）$\rightarrow$ ACK $\rightarrow$ 读第 1 字节 $\rightarrow$ 主机 ACK $\rightarrow$ 读第 2 字节 $\rightarrow$ 主机 NACK $\rightarrow$ STOP。
+\answercheck{必须保留的要点}{先写寄存器地址，repeated START 转读；最后字节 NACK 通知从机结束。}
 \end{chapteranswer}

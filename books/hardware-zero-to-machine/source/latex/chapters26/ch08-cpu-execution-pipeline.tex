@@ -1,10 +1,132 @@
 \chapter{CPU 执行：单周期、多周期与流水线}
 
 \begin{keyidea}
-单周期、多周期和流水线并不是三套互不相干的机器，而是对硬件复用、关键路径和吞吐的三种组织方式。本章从完整执行 trace 进入处理器实现的演进。
+单周期、多周期和流水线并不是三套互不相干的机器，而是对硬件复用、关键路径和吞吐的三种组织方式。本章先建立执行组织与逐拍控制，再用整机和经典处理器案例核对这些机制，最后进入现代乱序执行。
 \end{keyidea}
 
-\section{一、整机实验、调试顺序与案例 trace}
+\section{一、单周期、多周期与流水线的共同状态边界}
+
+设一条指令要依次完成取指 IF、译码 ID、执行 EX、访存 MEM 和写回 WB。三种组织的差别不是指令语义，而是组合逻辑放在哪些时钟边界之间。
+
+\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+组织 & 每拍发生什么 & 决定时钟周期的路径 \\
+\midrule
+单周期 & 一拍内走完 IF 到 WB & 最慢指令的整条组合路径 \\\tablerowrule
+多周期 & 一条指令分几拍复用 ALU 和存储端口 & 最慢阶段，加上阶段寄存器开销 \\\tablerowrule
+流水线 & 多条指令分别占据不同阶段 & 最慢流水阶段，加上流水寄存器开销 \\
+\bottomrule
+\end{longtable}
+
+若五段组合延迟分别为 200、120、180、250、100 ps，流水寄存器的时钟到输出、建立时间和偏斜预算合计 30 ps，则单周期下限约为 $850$ ps，理想五级流水周期下限是 $250+30=280$ ps。流水化缩短的是连续指令的启动间隔，不会把单条指令的五段工作凭空删掉；单条指令还要跨过五个边界，延迟约为 $5\times280=1400$ ps。
+
+\begin{keyidea}
+流水线提高吞吐，不保证降低单条指令时延。每增加一级流水寄存器，都会付出寄存器延迟、时钟功耗、旁路复杂度和冲刷代价。
+\end{keyidea}
+
+\section{二、五级流水线的数据与控制随行}
+
+IF/ID、ID/EX、EX/MEM、MEM/WB 四组流水寄存器不仅保存数据，还必须保存后续阶段需要的控制位。例如译码阶段产生的“是否写寄存器、写回来自 ALU 还是内存、是否读写数据存储器”，要与对应指令的数据一路同行。若控制位错位，机器可能用上一条指令的写使能提交下一条指令的结果。
+
+\begin{lstlisting}
+// 注释（推进）：按行追踪数据来源、经过的部件和最终写入目标。
+// 注释（边界）：只有标出的时钟沿、阶段或异常入口会改变体系结构可见状态。
+IF:  PC -> instruction memory -> instruction, PC+4
+ID:  decode -> source values, immediate, destination id, controls
+EX:  ALU/compare -> result, branch decision
+MEM: load/store transaction -> read data or store completion
+WB:  select result -> architectural register write
+\end{lstlisting}
+
+分支决定在 EX 才得到时，IF 和 ID 可能已经装入两条错误路径指令。控制器必须把它们变成不写任何状态的气泡，并把 PC 重定向到正确目标。等待内存时则不同：相关阶段和上游寄存器必须保持，不能一边等待旧事务一边让后续指令覆盖其地址、数据和控制位。
+
+\begin{classicnote}
+流水线图要同时画三类线：数据向前走，旁路结果逆着阶段边界送回 EX，停顿与冲刷控制横向冻结或清空流水寄存器。只画五个方框，无法证明机器正确。
+\end{classicnote}
+\section{三、有效位、气泡与流水寄存器的所有权}
+
+流水寄存器不能只保存“看起来像一条指令”的数据，还要有有效位说明这些字段是否代表一项真实工作。复位、停顿、冲刷和异常都会改变有效位：复位后各级无有效指令；前端停顿时 PC 与 IF/ID 保持，但允许下游继续排空；插入气泡时下一级得到 code{valid=0}，所有写使能随之失效；冲刷则把错误路径上的年轻项标成无效。气泡不是一条编码为 NOP 的普通指令，因为普通 NOP 仍可能携带取指异常、性能计数或调试语义。
+
+每一级对流水寄存器只有三种互斥动作：保持旧值、接收上一级的新值、写入无效项。控制器必须先按优先级处理复位和异常重定向，再处理资源等待，最后处理正常推进。若同一拍既发生 Cache miss 又发现更老指令异常，机器应保留能完成精确异常所需的老状态，同时撤销年轻请求；简单地让“stall 优先”可能阻止异常入口，简单地让“flush 清空一切”又可能丢失尚未归属的总线响应。
+
+\begin{longtable}{L{0.18\linewidth}L{0.32\linewidth}L{0.40\linewidth}}
+\toprule
+事件 & 流水寄存器动作 & 不能丢失的状态 \\
+\midrule
+正常推进 & 下一级接收数据、控制与 valid & PC、目标寄存器、异常元数据 \\\tablerowrule
+上游停顿 & PC 与相关前级保持，下游可排空 & 被阻塞指令及其控制位 \\\tablerowrule
+插入气泡 & 下一级 valid 清零 & 老指令仍按原路径推进 \\\tablerowrule
+分支冲刷 & 错误路径各级 valid 清零，PC 重定向 & 分支自身结果与正确目标 \\\tablerowrule
+可变时延等待 & 请求级保持事务身份，响应级按 ID 接收 & 地址、byte enable、请求 ID、错误状态 \\\tablerowrule
+精确异常 & 阻止年轻副作用并保存异常 PC/原因 & 老指令提交状态和异常指令身份 \\
+\bottomrule
+\end{longtable}
+
+\section{四、多周期功能单元与可变时延存储器}
+
+固定五级图默认 EX 和 MEM 各在一个周期内给出结果，真实乘除法器、Cache miss、TLB miss 和设备访问却具有可变时延。流水线因此需要明确请求、接受、响应和取消边界。执行级把操作数和操作码交给乘法器，只有在请求握手成功后才能认为功能单元取得所有权；乘法器忙时，相关指令和其上游依赖项必须停顿，独立功能单元是否继续运行则取决于核心是否支持多发射或记分牌。
+
+数据访问也不能用固定倒计时替代响应。load 请求被 Cache 接受后，流水状态要保存目标寄存器、访问宽度、符号扩展方式和异常归属。命中可以很快返回；缺失则由 MSHR 继续追踪，响应可能在若干十到数百周期后到达。若核心只允许一笔阻塞式访问，可以冻结前端直到返回；若允许多笔在途，就需要 tag、返回队列和提交顺序把响应重新归属到正确指令。
+
+store 的边界更严格。地址和数据算出不代表可以立即改写外部状态。普通内存 store 可以先进入 store buffer，待指令达到提交点后再向 Cache 取得所有权；MMIO store 往往具有不可撤销副作用，必须在所有更老异常已经排除且协议允许时才发出。第 9 章讨论的精确异常，落实到这里就是“年轻指令不能越过不可恢复的设备副作用边界”。
+
+\section{五、分支预测器保存什么状态}
+
+没有预测时，前端只能等待分支方向与目标确定，深流水线会频繁空闲。动态预测把历史状态放在取指路径上：方向预测表（Branch History Table, BHT）用饱和计数器估计是否跳转；分支目标缓冲（Branch Target Buffer, BTB）缓存已见分支的目标；返回地址栈（Return Address Stack, RAS）预测函数返回目标。三者分别回答“跳不跳”“跳到哪”“返回到哪”，不能互相替代。
+
+预测只选择下一条要取的指令，不改变架构状态。分支在执行级解析后比较实际方向/目标与预测结果：正确则保留年轻指令，错误则清除错误路径 valid、恢复正确 PC，并更新预测器。预测器更新通常可以在解析时发生，但其状态必须按实现定义处理异常、上下文切换和安全隔离；预测器内容不是程序可见寄存器，却会影响性能和微架构侧信道。
+
+二位饱和计数器有强不跳转、弱不跳转、弱跳转、强跳转四态。实际跳转使状态向强跳转移动一步，未跳转使其向强不跳转移动一步。它需要连续两次相反结果才从一个强状态翻到相反预测，可避免循环末次退出立即破坏下一轮的整体预测。BTB 命中但 BHT 预测不跳转时仍取顺序 PC；BHT 预测跳转但 BTB 没有目标时，前端可能只能等待译码形成目标。
+
+\begin{longtable}{L{0.18\linewidth}L{0.28\linewidth}L{0.34\linewidth}L{0.12\linewidth}}
+\toprule
+结构 & 索引/输入 & 保存状态 & 输出 \\
+\midrule
+BHT & 取指 PC 与可选历史 & 饱和计数器或模式状态 & 跳转方向预测 \\\tablerowrule
+BTB & 取指 PC & tag、分支类型、目标地址 & 预测目标 \\\tablerowrule
+RAS & call/return 事件 & 有限深度的返回地址栈 & 预测返回 PC \\\tablerowrule
+恢复检查点 & 预测发生时的重命名/前端状态 & 可恢复指针或快照 & 误预测后的正确状态 \\
+\bottomrule
+\end{longtable}
+
+\section{六、逐拍核对一次相关、停顿与重定向}
+
+考虑 code{LOAD R3,[R1]}、code{ADD R5,R3,R4}、code{BEQ R5,R0,target} 三条连续指令。假设 load 命中但数据到 MEM 末端才有效，分支在 EX 末端解析。第 1 至第 3 拍依次形成正常流水；第 4 拍 ADD 原本要进入 EX，却拿不到 R3，因此 IF/ID 保持，ID/EX 写入气泡，LOAD 继续进入 MEM。第 5 拍数据可由 MEM/WB 旁路给 ADD，流水恢复。分支随后读取经旁路得到的 R5；若预测错误，则在解析沿之后清除 IF 与 ID 中的年轻项，并把 PC 改为 target。
+
+这条 trace 要同时检查四类状态：数据值是否来自最新生产者，valid 是否随停顿和冲刷正确变化，分支之前的老指令是否仍能提交，以及错误路径是否从未写寄存器、Cache 或 MMIO。只核对最终 R5 的数值，无法发现错误路径曾短暂写设备寄存器的严重缺陷。
+
+\begin{keyidea}
+流水线控制的核心是所有权：每项工作在哪一级、是否有效、依赖谁、何时可以产生不可撤销副作用。旁路解决“值已产生但尚未写回”，停顿解决“值尚未产生”，冲刷解决“这项工作本来就不该执行”。
+\end{keyidea}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{七、整机实验、调试顺序与案例 trace}
 
 \topic{最小整机实验要先有明确的观察点}若在一块低速实验板上实现本节内容，不必立即追求完整 ISA。可以先定义四条动作：\code{ADD}、\code{MOV}（加载）、\code{MOV}（存储）、\code{JZ}。指令 ROM 提供编码，4 个寄存器保存通用值，74HC283/74HC86 构成加减核心，SRAM 或寄存器堆模拟数据存储器，若干 LED 和拨码开关映射成 MMIO。实现要点是每一步都可观察：PC LED 显示当前取指地址，IR LED 或逻辑分析仪显示当前指令，控制线可单步观察，写回和 PC 更新只在时钟沿发生。
 
@@ -598,7 +720,7 @@ CPU 设计是否扎实，不能只跑一段加法程序来判断。控制器必�
 \end{pdfdiagram}
 \diagramnote{经典芯片观察线索。每一代都把存储与互连相关章节的事务边界移动、扩宽或缓存。}
 
-\section{二、早期微处理器：从 6502、Z80 到 8086}
+\section{八、早期微处理器：从 6502、Z80 到 8086}
 
 在 8086 之前，8-bit 微处理器已经把“CPU 加外部总线”这台戏完整演过一遍。6502、Z80 和 8051 各自回答了一个整机问题：寄存器太少怎么办，上下文切换和 DRAM 刷新如何省掉总线事务，整机部件能不能收进同一颗芯片。
 
@@ -1216,128 +1338,6 @@ GDTR、LDTR、IDTR & 各存表基址加限长，LGDT/LIDT 装载 & 约定在此�
 \end{pdfdiagram}
 \diagramnote{80286 保护模式的选择子与描述符。段寄存器的高 13 位是描述符表内索引，每项 8 字节，索引乘 8 得表内偏移；TI 位选 GDT 还是 LDT；低 2 位是请求特权级。GDTR 保存 GDT 的基址和限长，描述符装着 24 位段基址、16 位限长和访问权字节——查表得到基址再加偏移，才是最终的物理地址。}
 
-\section{三、单周期、多周期与流水线的共同状态边界}
-
-设一条指令要依次完成取指 IF、译码 ID、执行 EX、访存 MEM 和写回 WB。三种组织的差别不是指令语义，而是组合逻辑放在哪些时钟边界之间。
-
-\begin{longtable}{L{0.2\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
-\toprule
-组织 & 每拍发生什么 & 决定时钟周期的路径 \\
-\midrule
-单周期 & 一拍内走完 IF 到 WB & 最慢指令的整条组合路径 \\\tablerowrule
-多周期 & 一条指令分几拍复用 ALU 和存储端口 & 最慢阶段，加上阶段寄存器开销 \\\tablerowrule
-流水线 & 多条指令分别占据不同阶段 & 最慢流水阶段，加上流水寄存器开销 \\
-\bottomrule
-\end{longtable}
-
-若五段组合延迟分别为 200、120、180、250、100 ps，流水寄存器的时钟到输出、建立时间和偏斜预算合计 30 ps，则单周期下限约为 $850$ ps，理想五级流水周期下限是 $250+30=280$ ps。流水化缩短的是连续指令的启动间隔，不会把单条指令的五段工作凭空删掉；单条指令还要跨过五个边界，延迟约为 $5\times280=1400$ ps。
-
-\begin{keyidea}
-流水线提高吞吐，不保证降低单条指令时延。每增加一级流水寄存器，都会付出寄存器延迟、时钟功耗、旁路复杂度和冲刷代价。
-\end{keyidea}
-
-\section{四、五级流水线的数据与控制随行}
-
-IF/ID、ID/EX、EX/MEM、MEM/WB 四组流水寄存器不仅保存数据，还必须保存后续阶段需要的控制位。例如译码阶段产生的“是否写寄存器、写回来自 ALU 还是内存、是否读写数据存储器”，要与对应指令的数据一路同行。若控制位错位，机器可能用上一条指令的写使能提交下一条指令的结果。
-
-\begin{lstlisting}
-// 注释（推进）：按行追踪数据来源、经过的部件和最终写入目标。
-// 注释（边界）：只有标出的时钟沿、阶段或异常入口会改变体系结构可见状态。
-IF:  PC -> instruction memory -> instruction, PC+4
-ID:  decode -> source values, immediate, destination id, controls
-EX:  ALU/compare -> result, branch decision
-MEM: load/store transaction -> read data or store completion
-WB:  select result -> architectural register write
-\end{lstlisting}
-
-分支决定在 EX 才得到时，IF 和 ID 可能已经装入两条错误路径指令。控制器必须把它们变成不写任何状态的气泡，并把 PC 重定向到正确目标。等待内存时则不同：相关阶段和上游寄存器必须保持，不能一边等待旧事务一边让后续指令覆盖其地址、数据和控制位。
-
-\begin{classicnote}
-流水线图要同时画三类线：数据向前走，旁路结果逆着阶段边界送回 EX，停顿与冲刷控制横向冻结或清空流水寄存器。只画五个方框，无法证明机器正确。
-\end{classicnote}
-\section{五、有效位、气泡与流水寄存器的所有权}
-
-流水寄存器不能只保存“看起来像一条指令”的数据，还要有有效位说明这些字段是否代表一项真实工作。复位、停顿、冲刷和异常都会改变有效位：复位后各级无有效指令；前端停顿时 PC 与 IF/ID 保持，但允许下游继续排空；插入气泡时下一级得到 code{valid=0}，所有写使能随之失效；冲刷则把错误路径上的年轻项标成无效。气泡不是一条编码为 NOP 的普通指令，因为普通 NOP 仍可能携带取指异常、性能计数或调试语义。
-
-每一级对流水寄存器只有三种互斥动作：保持旧值、接收上一级的新值、写入无效项。控制器必须先按优先级处理复位和异常重定向，再处理资源等待，最后处理正常推进。若同一拍既发生 Cache miss 又发现更老指令异常，机器应保留能完成精确异常所需的老状态，同时撤销年轻请求；简单地让“stall 优先”可能阻止异常入口，简单地让“flush 清空一切”又可能丢失尚未归属的总线响应。
-
-\begin{longtable}{L{0.18\linewidth}L{0.32\linewidth}L{0.40\linewidth}}
-\toprule
-事件 & 流水寄存器动作 & 不能丢失的状态 \\
-\midrule
-正常推进 & 下一级接收数据、控制与 valid & PC、目标寄存器、异常元数据 \\\tablerowrule
-上游停顿 & PC 与相关前级保持，下游可排空 & 被阻塞指令及其控制位 \\\tablerowrule
-插入气泡 & 下一级 valid 清零 & 老指令仍按原路径推进 \\\tablerowrule
-分支冲刷 & 错误路径各级 valid 清零，PC 重定向 & 分支自身结果与正确目标 \\\tablerowrule
-可变时延等待 & 请求级保持事务身份，响应级按 ID 接收 & 地址、byte enable、请求 ID、错误状态 \\\tablerowrule
-精确异常 & 阻止年轻副作用并保存异常 PC/原因 & 老指令提交状态和异常指令身份 \\
-\bottomrule
-\end{longtable}
-
-\section{六、多周期功能单元与可变时延存储器}
-
-固定五级图默认 EX 和 MEM 各在一个周期内给出结果，真实乘除法器、Cache miss、TLB miss 和设备访问却具有可变时延。流水线因此需要明确请求、接受、响应和取消边界。执行级把操作数和操作码交给乘法器，只有在请求握手成功后才能认为功能单元取得所有权；乘法器忙时，相关指令和其上游依赖项必须停顿，独立功能单元是否继续运行则取决于核心是否支持多发射或记分牌。
-
-数据访问也不能用固定倒计时替代响应。load 请求被 Cache 接受后，流水状态要保存目标寄存器、访问宽度、符号扩展方式和异常归属。命中可以很快返回；缺失则由 MSHR 继续追踪，响应可能在若干十到数百周期后到达。若核心只允许一笔阻塞式访问，可以冻结前端直到返回；若允许多笔在途，就需要 tag、返回队列和提交顺序把响应重新归属到正确指令。
-
-store 的边界更严格。地址和数据算出不代表可以立即改写外部状态。普通内存 store 可以先进入 store buffer，待指令达到提交点后再向 Cache 取得所有权；MMIO store 往往具有不可撤销副作用，必须在所有更老异常已经排除且协议允许时才发出。第 9 章讨论的精确异常，落实到这里就是“年轻指令不能越过不可恢复的设备副作用边界”。
-
-\section{七、分支预测器保存什么状态}
-
-没有预测时，前端只能等待分支方向与目标确定，深流水线会频繁空闲。动态预测把历史状态放在取指路径上：方向预测表（Branch History Table, BHT）用饱和计数器估计是否跳转；分支目标缓冲（Branch Target Buffer, BTB）缓存已见分支的目标；返回地址栈（Return Address Stack, RAS）预测函数返回目标。三者分别回答“跳不跳”“跳到哪”“返回到哪”，不能互相替代。
-
-预测只选择下一条要取的指令，不改变架构状态。分支在执行级解析后比较实际方向/目标与预测结果：正确则保留年轻指令，错误则清除错误路径 valid、恢复正确 PC，并更新预测器。预测器更新通常可以在解析时发生，但其状态必须按实现定义处理异常、上下文切换和安全隔离；预测器内容不是程序可见寄存器，却会影响性能和微架构侧信道。
-
-二位饱和计数器有强不跳转、弱不跳转、弱跳转、强跳转四态。实际跳转使状态向强跳转移动一步，未跳转使其向强不跳转移动一步。它需要连续两次相反结果才从一个强状态翻到相反预测，可避免循环末次退出立即破坏下一轮的整体预测。BTB 命中但 BHT 预测不跳转时仍取顺序 PC；BHT 预测跳转但 BTB 没有目标时，前端可能只能等待译码形成目标。
-
-\begin{longtable}{L{0.18\linewidth}L{0.28\linewidth}L{0.34\linewidth}L{0.12\linewidth}}
-\toprule
-结构 & 索引/输入 & 保存状态 & 输出 \\
-\midrule
-BHT & 取指 PC 与可选历史 & 饱和计数器或模式状态 & 跳转方向预测 \\\tablerowrule
-BTB & 取指 PC & tag、分支类型、目标地址 & 预测目标 \\\tablerowrule
-RAS & call/return 事件 & 有限深度的返回地址栈 & 预测返回 PC \\\tablerowrule
-恢复检查点 & 预测发生时的重命名/前端状态 & 可恢复指针或快照 & 误预测后的正确状态 \\
-\bottomrule
-\end{longtable}
-
-\section{八、逐拍核对一次相关、停顿与重定向}
-
-考虑 code{LOAD R3,[R1]}、code{ADD R5,R3,R4}、code{BEQ R5,R0,target} 三条连续指令。假设 load 命中但数据到 MEM 末端才有效，分支在 EX 末端解析。第 1 至第 3 拍依次形成正常流水；第 4 拍 ADD 原本要进入 EX，却拿不到 R3，因此 IF/ID 保持，ID/EX 写入气泡，LOAD 继续进入 MEM。第 5 拍数据可由 MEM/WB 旁路给 ADD，流水恢复。分支随后读取经旁路得到的 R5；若预测错误，则在解析沿之后清除 IF 与 ID 中的年轻项，并把 PC 改为 target。
-
-这条 trace 要同时检查四类状态：数据值是否来自最新生产者，valid 是否随停顿和冲刷正确变化，分支之前的老指令是否仍能提交，以及错误路径是否从未写寄存器、Cache 或 MMIO。只核对最终 R5 的数值，无法发现错误路径曾短暂写设备寄存器的严重缺陷。
-
-\begin{keyidea}
-流水线控制的核心是所有权：每项工作在哪一级、是否有效、依赖谁、何时可以产生不可撤销副作用。旁路解决“值已产生但尚未写回”，停顿解决“值尚未产生”，冲刷解决“这项工作本来就不该执行”。
-\end{keyidea}
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 \section{九、从五级流水线走向超标量前端}
 
 五级流水线默认每拍取一条、译一条、发一条。现代核心要把每拍退休指令数继续提高，首先要扩大前端宽度：取指单元按字节块读取指令，分支预测器给出下一取指地址，边界识别逻辑从字节流中切出若干条指令，译码器再把它们变成内部操作。RISC 定长指令的边界预先确定；x86 变长指令必须先识别前缀、opcode、ModR/M、SIB、位移和立即数，复杂指令还可能拆成多个微操作。
@@ -1445,286 +1445,416 @@ store buffer 接受 & 写获得一致性与 Cache 路径资源 & 其他核心已
 
 分支恢复与异常恢复的共同原则是“最早失败者优先”。同一窗口里可能同时报告一个较晚分支误预测和一个更早 load 的页错误；核心必须按程序顺序选择最早需要重定向的事件。否则先按较晚分支恢复，随后又发现更早异常，会让映射表和队列状态经历无法证明正确的组合。
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{十一、向量执行：一条指令怎样推进多个数据元素}
+
+超标量处理器在同一周期发射多条彼此独立的标量指令；\term{单指令多数据}{single instruction, multiple data, SIMD} 则让一条指令对多个数据元素执行同一种操作。二者可以同时存在：前端把向量指令译成一个或多个微操作，乱序核心仍负责重命名、唤醒和提交，而向量执行单元在多个 lane 上并行处理元素。Intel 的 SSE、AVX 系列和 RISC-V V 扩展采用的寄存器宽度与控制方式不同，但都必须解决元素宽度、有效 lane、掩码、访存和精确异常这些共同问题。\cite{intel-sdm,riscv-vector}
+
+\topic{向量状态不仅是一组更宽的寄存器}
+一条向量加法的输入状态至少包括两个源向量、目标向量、元素宽度以及有效元素集合。固定宽度 SIMD 通常由指令编码决定寄存器宽度和元素类型；向量长度可变的 ISA 还保存向量长度和元素配置状态。掩码决定哪些 lane 可以写回，未激活 lane 必须按 ISA 规定保持旧值、写零或处于无关状态，不能由具体实现任意选择。
+
+数据路径从向量寄存器文件或重命名后的物理向量寄存器开始。源操作数经过 lane 划分进入加法、乘法、置换或转换单元；结果先进入完成缓冲或物理目标寄存器，最终仍由 ROB 的按序退休边界变成架构可见状态。若 256-bit 数据路径处理 32-bit 元素，一次可容纳 8 个元素；但“容纳 8 个”不等于“每周期完成 8 个”。实际吞吐还取决于执行端口数量、指令延迟、单元是否分拍复用以及目标寄存器的数据相关。
+
+\topic{向量 load/store 仍受 Cache line、页和 LSQ 约束}
+连续向量加载可以在一个或多个 Cache line 内形成若干访问。地址生成单元先计算起始地址和跨度，LSQ 检查与更早 store 的顺序，再由 Cache 端口拆分跨行请求。若向量横跨页边界，两个页面必须分别完成 TLB 查找和权限检查。前半段命中、后半段缺页时，处理器不能把一个不符合 ISA 异常语义的“半更新结果”提交给软件。
+
+聚集/散布（gather/scatter）进一步把每个 lane 的索引变成独立地址。它能表达不规则访问，却可能产生多个 TLB 查找、多个 Cache miss 和多次 bank 冲突。此时向量算术单元并不是瓶颈，地址生成、MSHR、TLB 和内存带宽才决定完成时间。性能分析必须区分“每条指令处理的元素数”和“每周期真正返回的元素数”。
+
+\topic{掩码与精确异常共同定义提交边界}
+设一条掩码向量除法有 8 个 lane，其中 5 个 lane 有效。无效 lane 不应触发除零异常；有效 lane 中若第 4 个访问了无效页面，处理器必须按照 ISA 定义保存可重启状态或在退休点报告异常。实现可以让较早 lane 已经完成计算，但在异常指令退休以前，这些结果仍不能越过架构提交边界。恢复时还要知道哪些元素已经完成、哪些需要重做，因此向量异常状态本身也是处理器与操作系统之间的接口。
+
+\topic{上下文切换要保存实际可见的向量状态}
+操作系统不能仅保存通用寄存器。线程一旦使用向量扩展，其向量寄存器、掩码和控制状态也属于架构上下文。更宽的状态会增加保存、恢复和迁移成本；实现可以采用延迟保存等策略，但必须确保另一线程无法观察前一线程遗留的架构状态。这里再次出现本章的共同边界：微架构可以延后搬运，线程重新运行前的可见状态却必须完整恢复。
+
+\section{十二、SMT：多个硬件线程怎样共享一个乱序核心}
+
+\term{同时多线程}{simultaneous multithreading, SMT} 在一个物理核心内维护两组或更多架构线程状态，并允许它们的微操作共同竞争前端、执行端口和存储层次。每个逻辑线程至少具有独立 PC、架构寄存器映射和异常状态；分支预测器、取指带宽、译码器、物理寄存器、发射队列、执行单元、Cache 与 TLB 则可能按实现选择共享、分区或动态借用。SMT 的目标不是让一个线程凭空获得更多执行单元，而是让另一个线程利用第一个线程因依赖或 Cache miss 留下的空槽。\cite{arm-smt}
+
+\topic{逐周期共享从取指选择开始}
+假设线程 A 因 L2 miss 暂时缺少可发射微操作，线程 B 的操作数已经就绪。取指策略可以暂时提高 B 的份额，重命名阶段为 B 分配物理寄存器和 ROB 项，发射器再把 B 的微操作送入空闲端口。A 的数据返回后，两线程同时具有就绪工作，仲裁器必须限制单个线程长期占满 ROB、LSQ 或提交带宽，否则另一线程可能无法前进。
+
+因此 SMT 的控制状态至少包含每线程取指优先级、各结构占用计数和公平性阈值。一次微操作退休时，只更新所属线程的架构映射；一个线程发生分支误预测或异常时，也只能清除该线程中更年轻的工作，不能破坏另一线程已经建立的状态。
+
+\topic{吞吐增加与单线程性能下降可以同时发生}
+若单线程只能利用 60\% 的执行槽，加入第二线程可能把核心总利用率提高到 85\%。但两个线程还会争用 L1、TLB、分支预测表、内存带宽和功耗预算，所以线程 A 的单独完成时间可能变长。评价 SMT 必须同时报告总吞吐、每线程尾延迟、公平性以及共享资源 miss，而不能把“两个逻辑处理器均显示忙碌”直接解释为性能翻倍。
+
+\topic{共享状态也是隔离边界}
+同一物理核心上的线程可能通过 Cache、预测器、端口争用和执行时延相互影响。调度器在安排不同安全域时，需要结合平台提供的预测控制、Cache 隔离和 SMT 策略判断风险。关闭 SMT 可以消除一部分同核共享，但不能自动消除跨核心共享 Cache、内存控制器或互连产生的全部侧信道。具体安全边界将在“推测执行留下的微架构痕迹”一节继续展开。
+
 \section*{章末练习}
 
-\begin{chapterexercise}{PC 取指}
-写出 PC、指令存储器、IR 和 \code{pc_write/ir_write} 的周期关系
-\exercisecheck{检查点}{能说明哪一拍保存指令}
-\end{chapterexercise}
-
-\begin{chapterexercise}{ADD trace}
-为 \code{ADD R1,R2}（即 \code{R1=R1+R2}）列出读地址、ALU 操作、写回选择和写使能
-\exercisecheck{检查点}{写回只在目标时钟沿发生}
-\end{chapterexercise}
-
-\begin{chapterexercise}{加载 trace}
-把加载指令拆成地址形成、存储读、MDR 保存、寄存器写回
-\exercisecheck{检查点}{能处理存储器未 ready}
-\end{chapterexercise}
-
-\begin{chapterexercise}{存储 trace}
-说明地址、写数据、字节使能、写控制和无寄存器写回
-\exercisecheck{检查点}{能区分 RAM 写和 MMIO 副作用}
-\end{chapterexercise}
-
-\begin{chapterexercise}{JZ trace}
-说明 Zero 标志如何影响下一 PC
-\exercisecheck{检查点}{分支目标和顺序 PC 选择明确}
-\end{chapterexercise}
-
-\begin{chapterexercise}{条件码比较}
-分别解释有符号小于和无符号小于使用哪些 ALU 标志
-\exercisecheck{检查点}{不把 Carry、Sign 和 Overflow 混用}
-\end{chapterexercise}
-
-\begin{chapterexercise}{CALL/RET trace}
-把调用和返回拆成保存返回地址、更新栈指针、改写 PC 和恢复 PC
-\exercisecheck{检查点}{能指出栈访问本质上是加载/存储事务}
-\end{chapterexercise}
-
-\begin{chapterexercise}{控制字}
-设计一个包含 \code{alu_op/wb_sel/reg_write/mem_read/mem_write/pc_sel} 的控制字
-\exercisecheck{检查点}{每一位能追到实际电路}
-\end{chapterexercise}
-
-\begin{chapterexercise}{微程序}
-为加载指令写出 5 个微步骤和等待状态处理
-\exercisecheck{检查点}{慢存储器只拖住访存阶段}
-\end{chapterexercise}
-
-\begin{chapterexercise}{流水线冒险}
-说明结构、数据、控制三类冒险各破坏什么边界
-\exercisecheck{检查点}{能提出停顿、转发或冲刷策略}
-\end{chapterexercise}
-
-\begin{chapterexercise}{SHL 微操作}
-为 \code{0x7260}=\code{SHL R1, 8} 写出 T1--T5 各拍的微操作、控制线与提交对象
-\exercisecheck{检查点}{不经过 T4，写回只在 T5 提交}
-\end{chapterexercise}
-
-\begin{chapterexercise}{三种组织拍数}
-统计 ROM 前三条（\code{0x22F0}、\code{0x7260}、\code{0x3450}）在单周期、五拍多周期、理想五级流水下各用多少拍
-\exercisecheck{检查点}{拍数与周期长度分开讨论}
-\end{chapterexercise}
-
-\begin{chapterexercise}{新增 SUB}
-为 \code{SUB Rd, Rs}（\code{R[d]=R[d]-R[b]}）写控制字行和逐拍流程，说明数据通路是否要加新部件
-\exercisecheck{检查点}{复用既有 ALU 减法路径}
-\end{chapterexercise}
-
-\begin{chapterexercise}{cmp+jcc 配对}
-把 \code{JZ R2, +3} 改写成 x86-64 的 \code{test}/\code{jz} 两条指令，说明标志位在两条指令之间的角色
-\exercisecheck{检查点}{标志是前写后读的约定状态}
-\end{chapterexercise}
-
-\begin{chapterexercise}{CPI 演算}
-某程序动态执行 100 条指令：加载 20、存储 10、其余 70 条为 \code{ADD}/\code{MOV} 立即数/\code{SHL}/\code{JZ}/\code{JMP}；按多周期拍数求总拍数、CPI 与 100 MHz 时钟下的执行时间
-\exercisecheck{检查点}{CPI 是动态混合的平均}
-\end{chapterexercise}
-
-\begin{chapterexercise}{pending 表读法}
-对 \code{MOV R2,[R1+4]}、\code{ADD R3,R2}、\code{MOV R4,1}、\code{SHL R4,4} 序列（五级流水、无转发、写回在 WB 拍末提交）写出 pending 表逐拍变化并标出停顿
-\exercisecheck{检查点}{置位在译码拍末、清除在写回拍末}
-\end{chapterexercise}
-
-\begin{chapterexercise}{有效位}
+\begin{chapterexercise}{综合练习：有效位至预测结构}
+\begin{exercisesubproblem}{（a）有效位}
 比较气泡与编码 NOP 的状态含义
 \exercisecheck{检查要点}{气泡不携带真实工作或副作用}
-\end{chapterexercise}
-
-\begin{chapterexercise}{优先级}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）优先级}
 同拍发生老指令异常和年轻 load 等待时给出控制顺序
 \exercisecheck{检查要点}{精确异常优先且响应仍可归属}
-\end{chapterexercise}
-
-\begin{chapterexercise}{可变时延}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）可变时延}
 列出 load miss 等待期间必须保存的字段
 \exercisecheck{检查要点}{地址、目标、宽度、ID 和错误同行}
-\end{chapterexercise}
-
-\begin{chapterexercise}{预测结构}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（d）预测结构}
 分别说明 BHT、BTB 与 RAS 的输入和输出
 \exercisecheck{检查要点}{方向、普通目标、返回目标分开}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
-\begin{chapterexercise}{计数器 trace}
+\begin{chapterexercise}{综合练习：计数器 trace 至 ADD trace}
+\begin{exercisesubproblem}{（a）计数器 trace}
 从弱跳转开始，对 T、T、N、N、N 更新二位计数器
 \exercisecheck{检查要点}{每次只向实际结果移动一态}
-\end{chapterexercise}
-
-\begin{chapterexercise}{流水 trace}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）流水 trace}
 写出 LOAD-use 停顿与随后分支误预测的 valid 变化
 \exercisecheck{检查要点}{停顿保持，气泡插入，误预测清除}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）PC 取指}
+写出 PC、指令存储器、IR 和 \code{pc_write/ir_write} 的周期关系
+\exercisecheck{检查点}{能说明哪一拍保存指令}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（d）ADD trace}
+为 \code{ADD R1,R2}（即 \code{R1=R1+R2}）列出读地址、ALU 操作、写回选择和写使能
+\exercisecheck{检查点}{写回只在目标时钟沿发生}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
-\begin{chapterexercise}{乱序重命名}
+\begin{chapterexercise}{综合练习：加载 trace 至条件码比较}
+\begin{exercisesubproblem}{（a）加载 trace}
+把加载指令拆成地址形成、存储读、MDR 保存、寄存器写回
+\exercisecheck{检查点}{能处理存储器未 ready}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）存储 trace}
+说明地址、写数据、字节使能、写控制和无寄存器写回
+\exercisecheck{检查点}{能区分 RAM 写和 MMIO 副作用}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）JZ trace}
+说明 Zero 标志如何影响下一 PC
+\exercisecheck{检查点}{分支目标和顺序 PC 选择明确}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（d）条件码比较}
+分别解释有符号小于和无符号小于使用哪些 ALU 标志
+\exercisecheck{检查点}{不把 Carry、Sign 和 Overflow 混用}
+\end{exercisesubproblem}
+\end{chapterexercise}
+
+\begin{chapterexercise}{综合练习：CALL/RET trace 至流水线冒险}
+\begin{exercisesubproblem}{（a）CALL/RET trace}
+把调用和返回拆成保存返回地址、更新栈指针、改写 PC 和恢复 PC
+\exercisecheck{检查点}{能指出栈访问本质上是加载/存储事务}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）控制字}
+设计一个包含 \code{alu_op/wb_sel/reg_write/mem_read/mem_write/pc_sel} 的控制字
+\exercisecheck{检查点}{每一位能追到实际电路}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）微程序}
+为加载指令写出 5 个微步骤和等待状态处理
+\exercisecheck{检查点}{慢存储器只拖住访存阶段}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（d）流水线冒险}
+说明结构、数据、控制三类冒险各破坏什么边界
+\exercisecheck{检查点}{能提出停顿、转发或冲刷策略}
+\end{exercisesubproblem}
+\end{chapterexercise}
+
+\begin{chapterexercise}{综合练习：SHL 微操作至 cmp+jcc 配对}
+\begin{exercisesubproblem}{（a）SHL 微操作}
+为 \code{0x7260}=\code{SHL R1, 8} 写出 T1--T5 各拍的微操作、控制线与提交对象
+\exercisecheck{检查点}{不经过 T4，写回只在 T5 提交}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）三种组织拍数}
+统计 ROM 前三条（\code{0x22F0}、\code{0x7260}、\code{0x3450}）在单周期、五拍多周期、理想五级流水下各用多少拍
+\exercisecheck{检查点}{拍数与周期长度分开讨论}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）新增 SUB}
+为 \code{SUB Rd, Rs}（\code{R[d]=R[d]-R[b]}）写控制字行和逐拍流程，说明数据通路是否要加新部件
+\exercisecheck{检查点}{复用既有 ALU 减法路径}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（d）cmp+jcc 配对}
+把 \code{JZ R2, +3} 改写成 x86-64 的 \code{test}/\code{jz} 两条指令，说明标志位在两条指令之间的角色
+\exercisecheck{检查点}{标志是前写后读的约定状态}
+\end{exercisesubproblem}
+\end{chapterexercise}
+
+\begin{chapterexercise}{综合练习：CPI 演算至唤醒与端口}
+\begin{exercisesubproblem}{（a）CPI 演算}
+某程序动态执行 100 条指令：加载 20、存储 10、其余 70 条为 \code{ADD}/\code{MOV} 立即数/\code{SHL}/\code{JZ}/\code{JMP}；按多周期拍数求总拍数、CPI 与 100 MHz 时钟下的执行时间
+\exercisecheck{检查点}{CPI 是动态混合的平均}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）pending 表读法}
+对 \code{MOV R2,[R1+4]}、\code{ADD R3,R2}、\code{MOV R4,1}、\code{SHL R4,4} 序列（五级流水、无转发、写回在 WB 拍末提交）写出 pending 表逐拍变化并标出停顿
+\exercisecheck{检查点}{置位在译码拍末、清除在写回拍末}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）乱序重命名}
 初始 \code{x1->p1}、\code{x2->p2}。依次重命名 \code{x1=x2+1}、\code{x3=x1+2}、\code{x1=x4+3}，可用物理寄存器从 \code{p20} 开始。写出三条指令的源标签、新目的标签和每次被替代的旧映射。
 \exercisecheck{学习目标}{区分 RAW 真依赖与 WAW/WAR 名字依赖}
-\end{chapterexercise}
-
-\begin{chapterexercise}{唤醒与端口}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（d）唤醒与端口}
 两条乘法的源都在同拍就绪，但核心只有一个乘法端口。说明 select 逻辑如何处理未选中的一条，以及为什么不能清除它的就绪位。
 \exercisecheck{学习目标}{就绪不等于已经获得执行资源}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
-\begin{chapterexercise}{存储转发}
+\begin{chapterexercise}{综合练习：存储转发至误预测恢复}
+\begin{exercisesubproblem}{（a）存储转发}
 较早的 8-byte store 写 \code{0x1000--0x1007}，较晚的 4-byte load 读 \code{0x1004--0x1007}。说明 load 应从哪里取值；若 store 地址在 load 完成后才算出，应怎样恢复。
 \exercisecheck{学习目标}{按物理地址与字节掩码检查依赖，并能重放违规 load}
-\end{chapterexercise}
-
-\begin{chapterexercise}{精确异常}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）精确异常}
 I1、I2 已完成，I3 报缺页，I4、I5 已执行完成但尚未退休。写出 ROB 提交端从发现 I3 到进入异常处理程序的状态变化。
 \exercisecheck{学习目标}{执行完成与架构提交必须分离}
-\end{chapterexercise}
-
-\begin{chapterexercise}{误预测恢复}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）误预测恢复}
 列出分支误预测时除 PC 外至少四类必须恢复或清除的状态，并解释遗漏物理寄存器空闲表会产生什么后果。
 \exercisecheck{学习目标}{恢复对象包含映射、队列、所有权和资源计数}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
-\begin{chapterexercise}{宽度瓶颈}
+\begin{chapterexercise}{综合练习：宽度瓶颈至复用总线}
+\begin{exercisesubproblem}{（a）宽度瓶颈}
 某核心取指、译码、重命名和退休宽度均为 4，但每拍最多只有两个整数执行端口。一个长基本块全部由互不依赖的整数加法组成。忽略 miss 和分支后，稳态 IPC 上限是多少？哪个边界决定上限？
 \exercisecheck{学习目标}{流水宽度由最窄的持续服务边界限制}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）8086 地址形成}
+用段寄存器和偏移计算一个物理地址
+\exercisecheck{学习目标}{能说明 20-bit 地址来自硬件加法路径}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）复用总线}
+写出 8086 读周期中地址、ALE、数据方向和 READY 的阶段
+\exercisecheck{学习目标}{能指出何时锁存地址、何时采样数据}
+\end{exercisesubproblem}
+\end{chapterexercise}
+
+\begin{chapterexercise}{综合练习：字节存储体至 Z80 交换与刷新}
+\begin{exercisesubproblem}{（a）字节存储体}
+解释 A0 与 \(\overline{\mathrm{BHE}}\) 如何选择低/高字节
+\exercisecheck{学习目标}{能处理奇地址字访问}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）6502 寻址与拍数}
+用零页寻址和 (zp),Y 间接变址写数组求和循环并逐拍计数
+\exercisecheck{学习目标}{理解拍数就是总线事务序列}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）Z80 交换与刷新}
+说明 EXX 怎样加速中断响应、R 寄存器怎样把刷新藏进取指
+\exercisecheck{学习目标}{寄存器组交换=不访存的上下文切换}
+\end{exercisesubproblem}
+\end{chapterexercise}
+
+\begin{chapterexercise}{综合练习：486/Pentium 集成至 Z80 M/T 计数}
+\begin{exercisesubproblem}{（a）486/Pentium 集成}
+列出 80486 和 Pentium 各自搬进片内的部件及对应收益
+\exercisecheck{学习目标}{集成把等待从板级移到片内}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（b）6502 五拍 trace}
+写出 \code{(zp),Y} 间接变址读一个字节的 5 个时钟拍：每拍地址总线上是什么、CPU 内部在做什么
+\exercisecheck{学习目标}{拍数能还原成总线事务序列}
+\end{exercisesubproblem}
+\begin{exercisesubproblem}{（c）Z80 M/T 计数}
+数出 \code{LD A,(HL)} 和 \code{EXX} 各占几个机器周期、几个 T 状态，并指出 DRAM 刷新藏在哪一拍
+\exercisecheck{学习目标}{M1 后半拍兼做刷新，不另占总线事务}
+\end{exercisesubproblem}
 \end{chapterexercise}
 
 \section*{参考解答与要点}
 
-\begin{chapteranswer}{PC 取指}
-PC 输出取指地址，指令存储器返回编码，\code{ir_write} 在取指边界保存编码；下一 PC 可由 \code{pc+size}、分支目标或异常入口选择。
-\answercheck{必须保留的要点}{PC 和 IR 都是状态元件。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{ADD trace}
-读端口选择 R1/R2，ALU 选择 ADD，写回 mux 选择 ALUOut，写地址为 R1，\code{reg_write=1} 只在写回边界有效。示例：\code{R1=5,R2=7} 时 \code{read\_a=5}、\code{read\_b=7}、\code{ALU\_out=12}，时钟沿 \code{R1<-12}、\code{PC=100->102}。
-\answercheck{必须保留的要点}{算对不等于写对。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{加载 trace}
-EX 阶段形成地址，MEM 阶段发起读，目标未 ready 时保持地址和控制，响应后保存 MDR，WB 阶段写回目标寄存器。
-\answercheck{必须保留的要点}{等待不能污染其他状态。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{存储 trace}
-存储指令使用 ALU 形成地址，源寄存器提供写数据，打开字节使能和写控制，不打开寄存器写回。若地址命中 MMIO，副作用由设备规格决定。
-\answercheck{必须保留的要点}{存储是有副作用的事务。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{JZ trace}
-比较或 ALU 结果产生 Zero，控制器根据 Zero 选择顺序 PC 或分支目标；PC 只在提交边界更新。示例（本章 ROM 程序）：地址 3 的 \code{JZ +3} 在 \code{R2=0} 时 \code{PC=3+1+3=7}；同一指令在 \code{R2=1} 时顺序取地址 4。
-\answercheck{必须保留的要点}{条件输入必须在采样前稳定。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{条件码比较}
-无符号小于看减法后的借位/Carry 约定（结果可能为正仍算小于）；有符号小于看 \code{Sign XOR Overflow}（如 \code{0x80-1}：$-128-1$ 的真值超出范围，结果为正 \code{0x7F} 但溢出位置 1，符号位经溢出修正后仍有符号小于成立）。相等判断只看 Zero。
-\answercheck{必须保留的要点}{标志必须绑定解释规则。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{CALL/RET trace}
-CALL：返回地址先压栈保存（栈指针减小后写入栈顶），再 \code{PC=目标}；RET：从栈读回返回地址，恢复栈指针，\code{PC=返回地址}。栈访问本质就是加载/存储事务，栈指针是普通寄存器加约定。
-\answercheck{必须保留的要点}{调用链是事务序列，不是语法。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{控制字}
-控制字字段应覆盖 PC、IR、寄存器堆、ALU、存储器和下一状态逻辑；任何字段没有连接对象都不是硬件控制。
-\answercheck{必须保留的要点}{控制字是电线集合，不是注释。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{微程序}
-加载指令可写为取指、读寄存器、地址形成、访存等待、写回；访存未完成时微地址保持在等待状态，错误时跳异常入口。
-\answercheck{必须保留的要点}{微步骤提供清晰的观察点。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{流水线冒险}
-结构冒险来自资源争用，数据冒险来自结果未写回，控制冒险来自下一 PC 尚未确定。停顿保护边界，转发减少等待，冲刷丢弃错误路径。
-\answercheck{必须保留的要点}{提高吞吐不能破坏提交顺序。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{SHL 微操作}
-T1：\code{IR←MEM[PC]}，取回 \code{0x7260}，\code{imem\_read/ir\_write=1}；T2：\code{A←R1=0x00F0}，imm4 读出 8；T3：\code{alu\_op=} 左移、\code{b\_sel=} imm4，\code{ALUOut←0x00F0<<8=0xF000}；跳过 T4；T5：\code{wb\_sel=} ALU、\code{reg\_write=1}，时钟沿 \code{R1←0xF000}、\code{PC←PC+1}。
-\answercheck{必须保留的要点}{非访存指令不走 T4。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{三种组织拍数}
-单周期 3 拍：每条一拍，但周期长度按最慢的加载路径定。五拍多周期：\code{MOV} 立即数 4 拍、\code{SHL} 4 拍、\code{MOV} 加载 5 拍，共 $4+4+5=13$ 拍。理想五级流水（无冒险、每拍流入一条）：第 5 拍完成第一条，共 $3+5-1=7$ 拍。
-\answercheck{必须保留的要点}{比较组织要同时看拍数和周期长度。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{新增 SUB}
-控制字与 \code{ADD} 同行，仅 \code{alu\_op=SUB}：\code{a\_sel/b\_sel=} 寄存器、\code{wb\_sel=} ALU、\code{reg\_w=1}、\code{mem\_r/mem\_w=0}、\code{pc\_sel=} 顺序。流程同 \code{ADD}：T1 取指，T2 双读，T3 ALU 做减（B 取反加一），跳过 T4，T5 写回并 \code{PC+1}。数据通路不加新部件，译码真值表加一行即可。
-\answercheck{必须保留的要点}{新指令优先复用既有路径。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{cmp+jcc 配对}
-x86-64 写法：\code{test ecx, ecx}（或 \code{cmp ecx, 0}）按结果置 ZF，再由 \code{jz target} 读 ZF 决定是否跳转。标志寄存器是两条指令之间“前一条写、后一条读”的约定状态；教学 \code{JZ} 把比较与跳转内部化为一条。两者的偏移都相对下一条指令计算。
-\answercheck{必须保留的要点}{标志位必须绑定解释规则。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{CPI 演算}
-总拍数 $20\times5+10\times5+70\times4=100+50+280=430$ 拍；$\mathrm{CPI}=430/100=4.3$；100 MHz 时钟下执行时间为 $430/10^{8}$ 秒 $=4.3\,\mu\mathrm{s}$。
-\answercheck{必须保留的要点}{CPI 依赖指令混合，不是硬件常数。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{pending 表读法}
-拍 2 I1 译码置 P2；拍 3--5 I2（读 R2）停顿三拍，拍 5 末 I1 写回清 P2，拍 6 I2 放行置 P3；拍 7 I3 译码置 P4；拍 8--10 I4（读 R4）停顿三拍，拍 10 末 I3 写回清 P4，拍 11 I4 放行并再置 P4。共停 6 拍，四条指令 14 拍完成；无冒险理想流水为 8 拍。
-\answercheck{必须保留的要点}{同拍比对用清除前的值。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{有效位}
+\begin{chapteranswer}{综合练习：有效位至预测结构}
+\begin{answersubproblem}{（a）有效位}
 NOP 是有效指令且可能计入退休、异常和调试语义；气泡的 valid 为 0，所有架构写使能必须无效。
 \answercheck{必须保留的检查点}{不用某个 opcode 代替所有权状态}
-\end{chapteranswer}
-
-\begin{chapteranswer}{优先级}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）优先级}
 保存老指令异常 PC/原因，撤销年轻请求或标记其响应不可提交；流水转入异常入口，同时保证已接受事务不会失去归属。
 \answercheck{必须保留的检查点}{老状态精确、年轻副作用不可见}
-\end{chapteranswer}
-
-\begin{chapteranswer}{可变时延}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）可变时延}
 至少保存 PC、目标寄存器、地址、宽度、符号扩展、请求 ID、异常和取消状态。
 \answercheck{必须保留的检查点}{返回数据必须匹配原指令}
-\end{chapteranswer}
-
-\begin{chapteranswer}{预测结构}
+\end{answersubproblem}
+\begin{answersubproblem}{（d）预测结构}
 BHT 预测方向，BTB 给普通控制转移目标，RAS 给 return 目标；解析结果负责校验并恢复。
 \answercheck{必须保留的检查点}{预测不等于提交}
+\end{answersubproblem}
 \end{chapteranswer}
 
-\begin{chapteranswer}{计数器 trace}
+\begin{chapteranswer}{综合练习：计数器 trace 至 ADD trace}
+\begin{answersubproblem}{（a）计数器 trace}
 弱跳转依次到强跳转、强跳转、弱跳转、弱不跳转、强不跳转。
 \answercheck{必须保留的检查点}{强态需两次相反结果才翻转预测}
-\end{chapteranswer}
-
-\begin{chapteranswer}{流水 trace}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）流水 trace}
 LOAD 继续进 MEM，ADD 前级保持并向 EX 插气泡；数据可旁路后恢复。分支误预测沿清除更年轻 valid 并重定向 PC。
 \answercheck{必须保留的检查点}{老指令不被误清除}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）PC 取指}
+PC 输出取指地址，指令存储器返回编码，\code{ir_write} 在取指边界保存编码；下一 PC 可由 \code{pc+size}、分支目标或异常入口选择。
+\answercheck{必须保留的要点}{PC 和 IR 都是状态元件。}
+\end{answersubproblem}
+\begin{answersubproblem}{（d）ADD trace}
+读端口选择 R1/R2，ALU 选择 ADD，写回 mux 选择 ALUOut，写地址为 R1，\code{reg_write=1} 只在写回边界有效。示例：\code{R1=5,R2=7} 时 \code{read\_a=5}、\code{read\_b=7}、\code{ALU\_out=12}，时钟沿 \code{R1<-12}、\code{PC=100->102}。
+\answercheck{必须保留的要点}{算对不等于写对。}
+\end{answersubproblem}
 \end{chapteranswer}
 
-\begin{chapteranswer}{乱序重命名}
+\begin{chapteranswer}{综合练习：加载 trace 至条件码比较}
+\begin{answersubproblem}{（a）加载 trace}
+EX 阶段形成地址，MEM 阶段发起读，目标未 ready 时保持地址和控制，响应后保存 MDR，WB 阶段写回目标寄存器。
+\answercheck{必须保留的要点}{等待不能污染其他状态。}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）存储 trace}
+存储指令使用 ALU 形成地址，源寄存器提供写数据，打开字节使能和写控制，不打开寄存器写回。若地址命中 MMIO，副作用由设备规格决定。
+\answercheck{必须保留的要点}{存储是有副作用的事务。}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）JZ trace}
+比较或 ALU 结果产生 Zero，控制器根据 Zero 选择顺序 PC 或分支目标；PC 只在提交边界更新。示例（本章 ROM 程序）：地址 3 的 \code{JZ +3} 在 \code{R2=0} 时 \code{PC=3+1+3=7}；同一指令在 \code{R2=1} 时顺序取地址 4。
+\answercheck{必须保留的要点}{条件输入必须在采样前稳定。}
+\end{answersubproblem}
+\begin{answersubproblem}{（d）条件码比较}
+无符号小于看减法后的借位/Carry 约定（结果可能为正仍算小于）；有符号小于看 \code{Sign XOR Overflow}（如 \code{0x80-1}：$-128-1$ 的真值超出范围，结果为正 \code{0x7F} 但溢出位置 1，符号位经溢出修正后仍有符号小于成立）。相等判断只看 Zero。
+\answercheck{必须保留的要点}{标志必须绑定解释规则。}
+\end{answersubproblem}
+\end{chapteranswer}
+
+\begin{chapteranswer}{综合练习：CALL/RET trace 至流水线冒险}
+\begin{answersubproblem}{（a）CALL/RET trace}
+CALL：返回地址先压栈保存（栈指针减小后写入栈顶），再 \code{PC=目标}；RET：从栈读回返回地址，恢复栈指针，\code{PC=返回地址}。栈访问本质就是加载/存储事务，栈指针是普通寄存器加约定。
+\answercheck{必须保留的要点}{调用链是事务序列，不是语法。}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）控制字}
+控制字字段应覆盖 PC、IR、寄存器堆、ALU、存储器和下一状态逻辑；任何字段没有连接对象都不是硬件控制。
+\answercheck{必须保留的要点}{控制字是电线集合，不是注释。}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）微程序}
+加载指令可写为取指、读寄存器、地址形成、访存等待、写回；访存未完成时微地址保持在等待状态，错误时跳异常入口。
+\answercheck{必须保留的要点}{微步骤提供清晰的观察点。}
+\end{answersubproblem}
+\begin{answersubproblem}{（d）流水线冒险}
+结构冒险来自资源争用，数据冒险来自结果未写回，控制冒险来自下一 PC 尚未确定。停顿保护边界，转发减少等待，冲刷丢弃错误路径。
+\answercheck{必须保留的要点}{提高吞吐不能破坏提交顺序。}
+\end{answersubproblem}
+\end{chapteranswer}
+
+\begin{chapteranswer}{综合练习：SHL 微操作至 cmp+jcc 配对}
+\begin{answersubproblem}{（a）SHL 微操作}
+T1：\code{IR←MEM[PC]}，取回 \code{0x7260}，\code{imem\_read/ir\_write=1}；T2：\code{A←R1=0x00F0}，imm4 读出 8；T3：\code{alu\_op=} 左移、\code{b\_sel=} imm4，\code{ALUOut←0x00F0<<8=0xF000}；跳过 T4；T5：\code{wb\_sel=} ALU、\code{reg\_write=1}，时钟沿 \code{R1←0xF000}、\code{PC←PC+1}。
+\answercheck{必须保留的要点}{非访存指令不走 T4。}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）三种组织拍数}
+单周期 3 拍：每条一拍，但周期长度按最慢的加载路径定。五拍多周期：\code{MOV} 立即数 4 拍、\code{SHL} 4 拍、\code{MOV} 加载 5 拍，共 $4+4+5=13$ 拍。理想五级流水（无冒险、每拍流入一条）：第 5 拍完成第一条，共 $3+5-1=7$ 拍。
+\answercheck{必须保留的要点}{比较组织要同时看拍数和周期长度。}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）新增 SUB}
+控制字与 \code{ADD} 同行，仅 \code{alu\_op=SUB}：\code{a\_sel/b\_sel=} 寄存器、\code{wb\_sel=} ALU、\code{reg\_w=1}、\code{mem\_r/mem\_w=0}、\code{pc\_sel=} 顺序。流程同 \code{ADD}：T1 取指，T2 双读，T3 ALU 做减（B 取反加一），跳过 T4，T5 写回并 \code{PC+1}。数据通路不加新部件，译码真值表加一行即可。
+\answercheck{必须保留的要点}{新指令优先复用既有路径。}
+\end{answersubproblem}
+\begin{answersubproblem}{（d）cmp+jcc 配对}
+x86-64 写法：\code{test ecx, ecx}（或 \code{cmp ecx, 0}）按结果置 ZF，再由 \code{jz target} 读 ZF 决定是否跳转。标志寄存器是两条指令之间“前一条写、后一条读”的约定状态；教学 \code{JZ} 把比较与跳转内部化为一条。两者的偏移都相对下一条指令计算。
+\answercheck{必须保留的要点}{标志位必须绑定解释规则。}
+\end{answersubproblem}
+\end{chapteranswer}
+
+\begin{chapteranswer}{综合练习：CPI 演算至唤醒与端口}
+\begin{answersubproblem}{（a）CPI 演算}
+总拍数 $20\times5+10\times5+70\times4=100+50+280=430$ 拍；$\mathrm{CPI}=430/100=4.3$；100 MHz 时钟下执行时间为 $430/10^{8}$ 秒 $=4.3\,\mu\mathrm{s}$。
+\answercheck{必须保留的要点}{CPI 依赖指令混合，不是硬件常数。}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）pending 表读法}
+拍 2 I1 译码置 P2；拍 3--5 I2（读 R2）停顿三拍，拍 5 末 I1 写回清 P2，拍 6 I2 放行置 P3；拍 7 I3 译码置 P4；拍 8--10 I4（读 R4）停顿三拍，拍 10 末 I3 写回清 P4，拍 11 I4 放行并再置 P4。共停 6 拍，四条指令 14 拍完成；无冒险理想流水为 8 拍。
+\answercheck{必须保留的要点}{同拍比对用清除前的值。}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）乱序重命名}
 第一条读取 \code{p2}，为 x1 分配 \code{p20}，替代 \code{p1}；第二条读取第一条产生的 \code{p20}，为 x3 分配 \code{p21}；第三条读取 x4 的当前映射，为 x1 分配 \code{p22}，替代 \code{p20}。第二条保留对 \code{p20} 的 RAW 依赖，第三条不会覆盖它。
 \answercheck{必须掌握的要点}{组内后继读取新映射；旧物理寄存器到退休后才能回收}
-\end{chapteranswer}
-
-\begin{chapteranswer}{唤醒与端口}
+\end{answersubproblem}
+\begin{answersubproblem}{（d）唤醒与端口}
 select 只从两条就绪操作中选择一条占用乘法端口；另一条继续留在发射队列，源就绪位保持有效，下一拍重新参与选择。清除就绪位会使它等待一个不会再次广播的结果标签。
 \answercheck{必须掌握的要点}{wakeup 记录数据已到达，select 决定本拍资源归属}
+\end{answersubproblem}
 \end{chapteranswer}
 
-\begin{chapteranswer}{存储转发}
+\begin{chapteranswer}{综合练习：存储转发至误预测恢复}
+\begin{answersubproblem}{（a）存储转发}
 load 的四个字节完全被较早 store 覆盖，应从 store queue 转发对应高四字节。若 load 先读了 Cache，后来才发现同址更早 store，LSQ 标记内存顺序违规，使该 load 及其依赖操作失效并从安全边界重放。
 \answercheck{必须掌握的要点}{转发与违规检测都按地址范围和字节掩码判断}
-\end{chapteranswer}
-
-\begin{chapteranswer}{精确异常}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）精确异常}
 提交端先让无异常的 I1、I2 按序退休；I3 到达 ROB 队首时停止提交，保存异常原因和故障地址，恢复 I3 之前的架构映射，清除 I3、I4、I5 及其队列项，然后把 PC 重定向到异常入口。I4、I5 的物理结果从未成为架构状态。
 \answercheck{必须掌握的要点}{异常前已提交，异常指令及更年轻指令均不提交}
-\end{chapteranswer}
-
-\begin{chapteranswer}{误预测恢复}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）误预测恢复}
 至少恢复 RAT、空闲表位置、ROB 尾、发射队列、LSQ 和取指队列，并清除错误路径操作。若只恢复 RAT 而不恢复空闲表，错误路径分配的物理寄存器不会归还，运行一段时间后会出现虚假的“无空闲寄存器”停顿。
 \answercheck{必须掌握的要点}{状态值和资源所有权必须回到同一检查点}
+\end{answersubproblem}
 \end{chapteranswer}
 
-\begin{chapteranswer}{宽度瓶颈}
+\begin{chapteranswer}{综合练习：宽度瓶颈至复用总线}
+\begin{answersubproblem}{（a）宽度瓶颈}
 稳态每拍最多执行两个加法，IPC 上限为 2。前端与退休虽能处理 4 条，但持续服务能力由两个整数端口限定；队列只能暂时吸收波动，不能改变长期吞吐上限。
 \answercheck{必须掌握的要点}{长期吞吐取决于最窄且持续被使用的资源}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）8086 地址形成}
+物理地址由 \code{segment*16+offset} 得到，内部编程模型保持 16-bit，外部地址能力扩展到 20-bit。
+\answercheck{必须掌握的要点}{分段是地址形成硬件。}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）复用总线}
+T1 输出地址并用 ALE 锁存；T2 改变总线方向并给出读控制；T3/Tw 等待目标驱动数据且 READY 可延长；T4 采样并结束。
+\answercheck{必须掌握的要点}{复用引脚必须分阶段解释。}
+\end{answersubproblem}
+\end{chapteranswer}
+
+\begin{chapteranswer}{综合练习：字节存储体至 Z80 交换与刷新}
+\begin{answersubproblem}{（a）字节存储体}
+偶地址低字节由 A0 选择，奇地址高字节由 \(\overline{\mathrm{BHE}}\) 参与选择；奇地址字访问可能拆成两个周期。
+\answercheck{必须掌握的要点}{位宽不等于任意地址一次完成。}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）6502 寻址与拍数}
+LDA 零页 3 拍，(zp),Y 间接变址 5 拍（跨页 6 拍）；求和循环每轮用 (zp),Y 读一个元素，接 INY、BNE，拍数可手工核对。
+\answercheck{必须掌握的要点}{简单数据通路让逐拍 trace 可行。}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）Z80 交换与刷新}
+\code{EX AF,AF'} 交换 AF 一对，\code{EXX} 一条指令交换 BC、DE、HL 三对，省去压栈；M1 取指后半段把 R 输出到地址总线完成 DRAM 刷新。
+\answercheck{必须掌握的要点}{交换和借用都是减少总线事务。}
+\end{answersubproblem}
+\end{chapteranswer}
+
+\begin{chapteranswer}{综合练习：486/Pentium 集成至 Z80 M/T 计数}
+\begin{answersubproblem}{（a）486/Pentium 集成}
+486 搬入 cache、FPU、流水线；Pentium 搬入双发射、BTB 预测、分离 cache 和 64-bit 数据总线。
+\answercheck{必须掌握的要点}{每一代都在移动等待的位置。}
+\end{answersubproblem}
+\begin{answersubproblem}{（b）6502 五拍 trace}
+拍 1 取 opcode，拍 2 取零页操作数，拍 3、拍 4 从零页相邻两字节读出 16-bit 指针的低、高字节，拍 5 用指针加 Y 的有效地址读数据；低字节加法跨页时多 1 拍修正高字节，共 6 拍。
+\answercheck{必须掌握的要点}{5 拍 = 2 拍取指、2 拍取指针、1 拍读数。}
+\end{answersubproblem}
+\begin{answersubproblem}{（c）Z80 M/T 计数}
+\code{LD A,(HL)} 为 2 个机器周期共 7 个 T 状态（M1 取指 4T，存储器读 3T）；\code{EXX} 只有 M1，共 4 个 T 状态。刷新藏在每个 M1 的 T3、T4：指令字节已入 CPU，地址总线让给 R 寄存器输出刷新行地址。
+\answercheck{必须掌握的要点}{T 状态计数能直接核对数据手册的时序图。}
+\end{answersubproblem}
 \end{chapteranswer}

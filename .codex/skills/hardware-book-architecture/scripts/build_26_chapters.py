@@ -36,9 +36,9 @@ CHAPTERS = (
     Chapter(5, "numbers-arithmetic-circuits", "数值表示与算术电路", "硬件只搬运固定宽度 bit，数值含义来自解释规则。本章从补码和标志位进入加法、移位、比较、乘法与 ALU 的实现取舍。", (("ch03-number-arithmetic-circuits.tex", (0, 1, 2, 3)),)),
     Chapter(6, "isa-assembly-machine-code", "ISA、汇编与机器码", "ISA 是软件与处理器之间可长期保持的硬件契约。本章把指令编码、可见状态、条件码、调用约定和逐条执行 trace 对齐。", (("ch04-minimal-cpu.tex", (2, 3)),)),
     Chapter(7, "datapath-controller", "数据通路与控制器", "一条指令必须落实为源状态、组合路径、控制线和提交边界。本章把 ALU、寄存器、选择器、控制字和状态机接成可走读的数据通路。", (("ch03-number-arithmetic-circuits.tex", (4, 5)), ("ch04-minimal-cpu.tex", (0, 1)), ("ch-control-plane.tex", (2,)))),
-    Chapter(8, "cpu-execution-pipeline", "CPU 执行：单周期、多周期与流水线", "单周期、多周期和流水线并不是三套互不相干的机器，而是对硬件复用、关键路径和吞吐的三种组织方式。本章从完整执行 trace 进入处理器实现的演进。", (("ch04-minimal-cpu.tex", (5,)), ("ch06-classic-chips-platforms.tex", (0, 1)))),
+    Chapter(8, "cpu-execution-pipeline", "CPU 执行：单周期、多周期与流水线", "单周期、多周期和流水线并不是三套互不相干的机器，而是对硬件复用、关键路径和吞吐的三种组织方式。本章先建立执行组织与逐拍控制，再用整机和经典处理器案例核对这些机制，最后进入现代乱序执行。", (("ch04-minimal-cpu.tex", (5,)), ("ch06-classic-chips-platforms.tex", (0, 1)))),
     Chapter(9, "hazards-exceptions-performance", "冒险、异常与性能", "并行执行只有在依赖、异常和提交边界都受控时才保持正确。本章把异常控制流与 CPI、吞吐、带宽和瓶颈分析放进同一套定量框架。", (("ch04-minimal-cpu.tex", (4,)), ("ch10-performance-analysis.tex", (0, 1, 2, 3, 4, 5)))),
-    Chapter(10, "storage-hierarchy-overview", "存储层次与访问全景", "存储系统不是一排容量和速度数字，而是一条由不同粒度、协议和完成语义组成的访问路径。本章先建立从 load 到块 I/O 的全局坐标系。", (("ch05b-storage-cell-structures.tex", (0, 1)), ("ch05-memory-bus-io-dma.tex", (0, 1, 6)), ("ch05b-storage-cell-structures.tex", (8,)))),
+    Chapter(10, "storage-hierarchy-overview", "存储层次与访问全景", "存储系统不是一排容量和速度数字，而是一条由不同粒度、协议和完成语义组成的访问路径。本章建立从 load 到块 I/O 的全局坐标系；后续各章分别承担 Cache、地址转换、DRAM 与块设备的首次完整教学。", (("ch05b-storage-cell-structures.tex", (0, 1, 8)), ("ch05-memory-bus-io-dma.tex", (0, 1, 6)))),
     Chapter(11, "sram-register-file-cache", "SRAM、寄存器文件与 Cache", "离计算核心越近，存储越依赖低延迟、并行端口和局部性。本章从 SRAM 单元与阵列出发，建立寄存器文件和 Cache 的结构基础。", (("ch05b-storage-cell-structures.tex", (2,)),)),
     Chapter(12, "address-translation-tlb-vm", "地址转换、TLB 与虚拟内存", "处理器发出的虚拟地址必须经过权限、页表和 TLB 才能成为实际事务。本章用 80386 的历史边界进入现代地址转换路径。", (("ch06-classic-chips-platforms.tex", (2,)),)),
     Chapter(13, "dram-ddr-memory-controller", "DRAM、DDR 与内存控制器", "主存访问要穿过电容单元、感放、bank、命令调度、PHY 和训练。本章把器件结构、接口时序与控制器决策放在同一条 trace 上。", (("ch05b-storage-cell-structures.tex", (3, 4, 5)), ("ch-control-plane.tex", (3,)))),
@@ -53,7 +53,7 @@ CHAPTERS = (
     Chapter(22, "platform-control-feedback-reliability", "平台控制、反馈与可靠性", "整机由大量不同时间尺度的控制环维持稳定。本章把硬件状态机、固件策略、驱动调度、反馈控制和故障恢复统一成平台控制面。", (("ch-control-plane.tex", (0, 1, 6, 7, 8)),)),
     Chapter(23, "peripherals-network-human-interface", "外设、网络与人机接口", "介质和物理接口各不相同，但高吞吐外设普遍依赖队列、描述符、DMA 和完成通知。本章用网络与外设案例比较这些共同机制。", (("ch11-peripherals-queues.tex", (4, 5)),)),
     Chapter(24, "gpu-vram-display", "GPU、显存与显示系统", "GPU 用大量并行执行资源换取吞吐，并以命令队列、显存和 fence 接入整机。本章从执行模型一直走到显示扫描边界。", (("ch12-gpu-display.tex", (0, 1, 2, 3, 4, 5)),)),
-    Chapter(25, "linking-loading-system-boundary", "链接、装载与系统软件边界", "硬件执行的是确定地址上的机器码，软件工具链负责把名字、段和重定位变成这种状态。本章把目标文件、固件、装载器和异常入口接回硬件。", (("ch06-classic-chips-platforms.tex", (4,)), ("ch13-linking-loading.tex", (0, 1, 2, 3, 4, 5)))),
+    Chapter(25, "linking-loading-system-boundary", "链接、装载与系统软件边界", "硬件执行的是确定地址上的机器码，软件工具链负责把名字、段和重定位变成这种状态。本章先沿目标文件、链接、装载和异常入口建立主线，再用固件镜像作为无操作系统环境的对照案例。", (("ch13-linking-loading.tex", (0, 1, 2, 3, 4, 5)), ("ch06-classic-chips-platforms.tex", (4,)))),
     Chapter(26, "power-on-program-trace", "从上电到程序运行：搭机、全链路 Trace 与故障定位", "最后一章把全书重新连成一台可观察的机器：从供电复位到取指执行，从主存和设备访问到输出与排错。目标不是只让程序运行，而是能解释每一个边界。", (("ch07-breadboard-computer.tex", (0, 1, 2, 3, 4, 5)),)),
 )
 
@@ -70,8 +70,8 @@ EXTRAS = {
     4: ("ch04-verification-closure.tex",),
     5: ("ch05-chapter-exercises.tex",),
     6: ("ch06-isa-real-world.tex",),
-    8: ("ch08-pipeline-core.tex", "ch08-execution-control.tex", "ch08-modern-ooo.tex"),
-    9: ("ch09-pipeline-hazards.tex", "ch09-commit-recovery.tex"),
+    8: ("ch08-modern-ooo.tex", "ch08-vector-smt.tex"),
+    9: ("ch09-pipeline-hazards.tex", "ch09-commit-recovery.tex", "ch09-speculation-security.tex"),
     10: ("ch10-memory-model.tex",),
     11: ("ch11-cache-interface.tex", "ch11-cache-deep-dive.tex"),
     12: ("ch12-modern-vm-tlb.tex", "ch12-vm-deep-dive.tex"),
@@ -80,13 +80,16 @@ EXTRAS = {
     15: ("ch15-chapter-exercises.tex",),
     16: ("ch16-persistence-reliability.tex",),
     17: ("ch17-handshake-axi.tex", "ch17-noc-deep-dive.tex"),
-    18: ("ch18-pcie-transactions.tex", "ch18-pcie-deep-dive.tex"),
+    18: ("ch18-pcie-transactions.tex", "ch18-pcie-deep-dive.tex", "ch18-cxl-chiplet.tex"),
     19: ("ch19-device-queues.tex",),
     21: ("ch21-platform-recovery.tex", "ch21-firmware-deep-dive.tex"),
     22: ("ch22-ras-reliability.tex", "ch22-ras-deep-dive.tex"),
-    23: ("ch23-usb-human-interface.tex", "ch23-sensor-acquisition.tex"),
+    23: ("ch23-ethernet-phy.tex", "ch23-usb-human-interface.tex", "ch23-sensor-acquisition.tex"),
     24: ("ch24-gpu-memory-visibility.tex",),
     26: ("ch26-modern-system-trace.tex",),
+}
+EXTRAS_BEFORE = {
+    8: ("ch08-pipeline-core.tex", "ch08-execution-control.tex"),
 }
 DIAGRAM_OVERRIDES = {
     6: (("这台最小 ISA 的完整数据通路", "ch06-minimal-isa-datapath.tex"),),
@@ -149,8 +152,120 @@ TARGET_REPLACEMENTS = {
         ),
     ),
     13: (("Fine-granularity (REFfg)", r"Fine-\allowbreak granularity (REFfg)"),),
+    19: (
+        (
+            r"\hwkey{Local APIC} 每个 CPU 核一个，MMIO 基址 \code{0xFEE00000}，",
+            r"\hwkey{Local APIC} 每个 CPU 核一个。在传统 xAPIC 模式中，其基址由 \code{IA32_APIC_BASE} MSR 给出，常见复位映射为 \code{0xFEE00000}；x2APIC 模式则通过 MSR 编号访问寄存器，不再使用这段 MMIO 窗口。\cite{intel-sdm} Local APIC",
+        ),
+        (
+            r"设备要发中断时，往 \code{0xFEExxxxx} 区间做一次 32 位内存写——地址位编码目标核的 APIC ID，数据低 8 位是向量号。",
+            r"设备要发中断时，执行一笔使用平台分配的消息地址与消息数据的写事务；在未启用中断重映射的传统 xAPIC 示例中，地址通常落在 \code{0xFEExxxxx} 区间，部分地址位选择目标 APIC，数据低位携带向量。采用 x2APIC 或中断重映射时，目的标识和重映射格式由平台另行解释，不能只按这段传统地址编码推导。",
+        ),
+        (
+            "MSI 还有一条容易被忽视的保序性质：它是一次 posted write，遵循 PCIe 的排序规则，不会越过同一设备先发的 DMA 数据写。因此“DMA 写完数据 $\\to$ 发 MSI”这个序列到达内存系统的顺序与发出顺序一致，中断处理程序读到的一定是完整数据，不需要额外的人工同步——引脚时代“中断先到、数据还在路上”的竞态在机制上被消除了。",
+            "MSI 还承担一项重要的完成通知契约：设备应先发出 DMA 数据写，再发 MSI；在未设置 Relaxed Ordering 等放宽属性的常规路径中，PCIe 排序规则阻止后发的中断消息越过同一流量类中的前序写事务。不过，驱动仍须遵守平台 DMA API 的所有权与屏障规则；非一致性平台还要完成必要的 Cache 维护。只有这些条件同时满足，中断处理程序才能把完成通知解释为数据已经对 CPU 可见。",
+        ),
+    ),
     20: (("前面七章", "前面的数字与处理器章节"),),
-    25: (("前面十四章", "前面二十四章"),),
+    25: (
+        ("前面十四章", "前面二十四章"),
+        (
+            "编号就是向量号。x86-64 Linux 的编号表由内核源码发布，一旦公布就永不回收、只增不改——已编译的用户程序把编号烧进了自己的代码，回收一个编号就等于弄瞎一批旧程序，这是 ABI 稳定性的含义。",
+            "系统调用编号是系统调用表的稳定索引，可以类比异常向量中的选择号，但它并不是 IDT 向量。x86-64 Linux 的编号表由内核 ABI 定义；已经发布的编号需要保持兼容，即使某项服务废弃也通常保留相应编号或兼容处理，因为已编译程序会把编号写入机器码。",
+        ),
+        (
+            r"{本进程内核栈：pt\_regs\\ss、rsp（用户）、rflags\\cs、rip（用户）← CPU 保存\\orig\_rax ← 调用号\\rdi rsi rdx rcx rax r10\\r8 r9 r11 rbx rbp r12–r15}",
+            r"{当前线程内核栈：pt\_regs\\用户 rsp、rip、rflags\\由入口代码按布局保存\\orig\_rax ← 调用号\\rdi rsi rdx rcx rax r10\\r8 r9 r11 rbx rbp r12–r15}",
+        ),
+        (
+            r"\code{syscall} 指令把返回地址装进 \code{rcx}、标志装进 \code{r11}——这正是第四个参数改用 \code{r10} 的原因——并把 \code{rip} 换成 LSTAR 入口。入口代码切到本进程内核栈，",
+            r"\code{syscall} 指令把返回地址装进 \code{rcx}、标志装进 \code{r11}——这正是第四个参数改用 \code{r10} 的原因——并把 \code{rip} 换成 LSTAR 入口；它本身不保存用户 \code{rsp}，也不自动切换栈。入口代码随后切到当前线程的内核栈，",
+        ),
+        (
+            r"使用的栈 & 同一条用户栈 & 切到本进程内核栈 \\",
+            r"使用的栈 & 同一条用户栈 & 指令不换栈；入口代码切到当前线程内核栈 \\",
+        ),
+        (
+            r"保存现场 & \code{rip}→\code{rcx}、\code{rflags}→\code{r11}、切内核栈、建 \code{pt\_regs}",
+            r"保存现场 & 硬件完成 \code{rip}→\code{rcx}、\code{rflags}→\code{r11}；入口代码切栈并建立 \code{pt\_regs}",
+        ),
+        (
+            r"{LSTAR 入口：切内核栈\\现场存为 pt\_regs}",
+            r"{LSTAR 入口汇编\\保存用户 rsp、切线程内核栈\\现场存为 pt\_regs}",
+        ),
+        (
+            r"从本进程的 TSS 取出内核栈指针——每个进程都有一条独立的内核栈，典型大小 16 KiB，专门承接它陷入内核时的现场；",
+            r"先把用户 \code{rsp} 保存到每 CPU 的入口临时状态，再从当前任务信息取得该线程的内核栈指针。每个线程都有独立内核栈，具体大小由内核配置决定，专门承接它进入内核后的现场。TSS 的 \code{RSP0} 用于中断门等发生特权级切换时的硬件换栈，并不是 \code{SYSCALL} 自动换栈的来源；",
+        ),
+        (
+            ";   ss, rsp(user), rflags(user), cs, rip(user)   <- saved by CPU",
+            ";   rsp(user), rip(user), rflags(user)           <- arranged by entry code",
+        ),
+        (
+            "; pt_regs on the per-process kernel stack, high to low address:",
+            "; pt_regs on the current thread's kernel stack, high to low address:",
+        ),
+        (
+            "为什么每进程一条内核栈？",
+            "为什么每个线程需要一条独立内核栈？",
+        ),
+        (
+            "内核栈就是该进程“在内核里的工作台”",
+            "内核栈保存该线程进入内核后的调用链与现场",
+        ),
+        (
+            "因为进程可能在内核里被切走",
+            "因为线程可能在内核里被切走",
+        ),
+        (
+            "16 KiB 同时是一条纪律",
+            "若当前内核配置使用 16 KiB 栈，这一容量同时形成明确约束",
+        ),
+        (
+            r"入口代码切到本进程内核栈，把全部通用寄存器存成 \code{pt\_regs}，",
+            r"入口代码切到当前线程内核栈，把全部通用寄存器存成 \code{pt\_regs}；返回时由入口代码先恢复通用状态和用户 \code{rsp}，",
+        ),
+        (
+            r"\code{sysret} 逆序恢复，返回值仍由 \code{rax} 带回",
+            r"最后由 \code{sysret} 恢复 \code{rip}/\code{rflags} 与用户特权级，返回值仍由 \code{rax} 带回",
+        ),
+        (
+            r"{sysret：rax 带回返回值，逆序恢复，CPL 0→3}",
+            r"{入口代码恢复通用状态；sysret 恢复 rip/rflags 与 CPL}",
+        ),
+        (
+            r"{sysret：恢复现场\\rcx→rip，r11→rflags}",
+            r"{入口代码恢复寄存器与用户 rsp\\sysret：rcx→rip，r11→rflags}",
+        ),
+        (
+            r"服务完成后 \code{sysret} 逆向恢复。",
+            r"服务完成后，入口代码先恢复通用寄存器和用户栈指针，再由 \code{sysret} 完成最后的返回状态切换。",
+        ),
+        (
+            r"\code{syscall} 把入口搬进 MSR，把“编号到服务”的分发表",
+            r"\code{syscall} 使用 MSR 中预置的专用入口，并只保存最小返回状态，把“编号到服务”的分发表",
+        ),
+        (
+            "慢在一次内存访问，且向量表本身也要保护；",
+            "需要执行门描述符检查、硬件换栈和规定的现场保存；",
+        ),
+        (
+            r"MSR 里的内核入口地址装进 \code{rip}。没有内存访问，没有查表——入口地址早在系统启动时就被内核写进了 MSR。",
+            r"MSR 里的内核入口地址装进 \code{rip}。指令本身不访问内存，也不查询 IDT；入口地址早在系统启动时就由内核写入 MSR。\cite{intel-sdm}",
+        ),
+        (
+            r"入口代码切到当前线程内核栈，把全部通用寄存器存成 \code{pt\_regs}；返回时由入口代码先恢复通用状态和用户 \code{rsp}，再按 \code{rax} 中的编号查 \code{sys\_call\_table} 分发；服务完成后",
+            r"入口代码切到当前线程内核栈，把全部通用寄存器存成 \code{pt\_regs}，再按 \code{rax} 中的编号查 \code{sys\_call\_table} 分发；服务完成后",
+        ),
+        (
+            "栈顶指针存在进程控制块里",
+            "栈顶指针保存在当前线程的任务控制结构中",
+        ),
+        (
+            "否则栈溢出踩穿的是自己的现场",
+            "否则栈溢出会破坏当前线程的现场",
+        ),
+    ),
     26: (("前面七章", "前面二十五章"),),
 }
 
@@ -658,6 +773,49 @@ EDITORIAL_PHRASE_REPLACEMENTS = (
     ("CALL/RET 与栈要新增 SP 计数器模块，最贵", "CALL/RET 与栈需要新增 SP 计数器模块，成本最高"),
     ("不加模块只算账", "不增加模块，只核算时序"),
     ("三个目标各有走法", "三个目标各有相应的实现路径"),
+    ("“网卡不能喊停”", "“网卡通常不能要求发送端立即停止”"),
+    ("网卡不能喊停", "网卡通常不能要求发送端立即停止"),
+    ("把收益全部吃回去", "抵消全部收益"),
+    ("往往帮倒忙", "反而可能降低性能"),
+    ("大象流", "单条高带宽流"),
+    ("它不是免费午餐", "该机制也会引入额外代价"),
+    ("介质的怪脾气", "介质的特殊约束"),
+    ("怪脾气", "特殊约束"),
+    ("介质的脾气", "介质的物理特性"),
+    ("器件的脾气", "器件的输出特性"),
+    ("它的脾气", "它的实现特性"),
+    ("脾气代进去", "物理与协议约束代入"),
+    ("脾气讲清楚", "约束公开给上层"),
+    ("活已干完", "任务已经完成"),
+    ("活已经干完了", "任务已经完成"),
+    ("这批活干完了", "这批任务已经完成"),
+    ("再开工", "再开始执行"),
+    ("干完把", "完成后把"),
+    ("活已干完", "任务已经完成"),
+    ("不是免费午餐", "需要付出额外代价"),
+    ("不是玄学", "并非不可解释"),
+    ("任何一步抢跑", "任何一步提前推进"),
+    ("一片钱办两件事", "一个器件同时完成两项功能"),
+    ("故障钉在那根漏插的线上", "故障定位到那根漏插的线上"),
+    ("钉在带宽屋顶上", "受带宽上限约束"),
+    ("钉在 CPI", "受 CPI"),
+    ("钉在 ROM", "固定在 ROM"),
+    ("把入口钉在复位向量", "把入口固定在复位向量"),
+    ("把节钉在物理地", "把节固定在物理地"),
+    ("输出钉在 1", "输出保持为 1"),
+    ("被钉在", "受限于"),
+    ("这不是\n玄学，是符号表一次查询失败的回执", "这并非不可解释的现象，而是符号表查询失败的直接结果"),
+    ("反射不是噪声玄学", "反射并非不可量化的噪声现象"),
+    ("有两条次要脾气记在这里", "还需要记录两项次要物理约束"),
+    ("对介质脾气\n的理解", "对介质物理约束\n的理解"),
+    ("“顺序快、随机慢”的脾气", "“顺序访问快、随机访问慢”的特性"),
+    ("既治好了脾气又提供了三态边界", "既校正了输出极性，又提供了三态边界"),
+    ("把温度钉在某一度", "把温度严格保持在某一设定值"),
+    ("“别过热也别太吵”", "“避免过热并控制噪声”"),
+    ("谁就先杀死整块盘", "擦除越集中，少数块就越早达到寿命上限"),
+    ("三条都不花钱", "这三项措施不需要新增硬件"),
+    ("贸然\n开工", "贸然\n开始实施"),
+    ("干完推到 87", "完成后将计数推进到 87"),
     ("钉死", "限定"),
     ("写死", "固定"),
 )
@@ -768,6 +926,38 @@ CHAPTER_ANSWER_BLOCK_RE = re.compile(
     r"\\begin\{chapteranswer\}.*?\\end\{chapteranswer\}", re.DOTALL
 )
 LONGTABLE_BEGIN_RE = re.compile(r"\\begin\{longtable\}\{[^\n]+\}")
+
+EXERCISE_RELOCATIONS: dict[tuple[int, str], int] = {
+    # 数值表示与算术电路的原题回到第 5 章。
+    **{
+        (7, title): 5
+        for title in (
+            "补码解释", "位宽扩展", "二进制小数", "定点 Q 格式", "有符号定点",
+            "定点乘法", "BCD 表示", "BCD 校正", "浮点字段", "浮点特殊值",
+            "浮点舍入", "格式选型", "减法复用", "标志位", "进位路径",
+            "桶形移位", "比较器", "乘法器", "分立 ALU", "74181 级联",
+            "补码溢出判定", "浮点加法四步", "CLA 展开", "Booth 编码", "除法演算",
+        )
+    },
+    # 第 10 章只检验全景与可见顺序；具体机制由后续主讲章检验。
+    **{(10, title): 11 for title in ("SRAM 读写周期", "cache 行", "组相联查找", "替换策略", "预取演算", "MESI 走查")},
+    **{(10, title): 12 for title in ("地址映射", "TLB/cache 区分")},
+    **{(10, title): 13 for title in ("DRAM 时序计算", "bank 交错拍数")},
+    **{(10, title): 16 for title in ("块设备队列", "持久化辨析")},
+    **{(10, title): 17 for title in ("等待状态", "valid/ready", "未映射访问", "仲裁对照")},
+    **{(10, title): 19 for title in ("MMIO 寄存器", "中断顺序", "DMA 顺序", "MMIO 属性", "描述符环顺序", "非一致性 DMA")},
+    **{(10, title): 23 for title in ("UART 帧分析", "I2C 事务序列")},
+    # 存储题不再占据外设章的核心题位。
+    **{(23, title): 14 for title in ("写放大计算", "NVMe trace 排序", "队列深度选择")},
+    **{(23, title): 15 for title in ("扇区对齐", "随机 IOPS 估算")},
+    (23, "中断聚合权衡"): 19,
+    # 第 25 章只保留链接、装载、系统调用与编译链练习。
+    **{(25, title): 8 for title in ("8086 地址形成", "复用总线", "字节存储体", "6502 寻址与拍数", "Z80 交换与刷新", "486/Pentium 集成", "6502 五拍 trace", "Z80 M/T 计数")},
+    **{(25, title): 12 for title in ("80386 分页", "保护模式入口", "页表 walk 演算", "页错误诊断")},
+    (25, "PCIe 设备"): 18,
+    **{(25, title): 21 for title in ("复位向量", "平台分层", "SoC 演进", "主板结构", "BIOS 四阶段", "RISC-V/x86 对照")},
+    (25, "显卡路径"): 24,
+}
 
 
 def split_table_cells(row: str) -> list[str]:
@@ -976,6 +1166,185 @@ def move_chapter_end_material(text: str, chapter_number: int) -> str:
         + "\n\n".join(answers)
         + "\n"
     )
+
+
+def _parse_numbered_block(block: str, kind: str) -> tuple[str, str]:
+    heading = re.match(
+        rf"\\begin\{{chapter{kind}\}}\{{(.*)\}}\s*\n", block
+    )
+    if not heading:
+        raise ValueError(f"malformed chapter {kind} block")
+    end_token = rf"\end{{chapter{kind}}}"
+    end = block.rfind(end_token)
+    if end < heading.end():
+        raise ValueError(f"unterminated chapter {kind} block")
+    return heading.group(1), block[heading.end():end].strip()
+
+
+def _split_chapter_end(text: str, chapter_number: int) -> tuple[str, list[str], list[str]]:
+    exercise_heading = text.find(r"\section*{章末练习}")
+    answer_heading = text.find(r"\section*{参考解答与要点}")
+    if exercise_heading < 0 or answer_heading < exercise_heading:
+        raise ValueError(f"chapter {chapter_number}: missing consolidated chapter end")
+    prefix = text[:exercise_heading].rstrip()
+    exercise_text = text[
+        exercise_heading + len(r"\section*{章末练习}"):answer_heading
+    ]
+    answer_text = text[
+        answer_heading + len(r"\section*{参考解答与要点}"):]
+    exercises = [match.group(0).strip() for match in CHAPTER_EXERCISE_BLOCK_RE.finditer(exercise_text)]
+    answers = [match.group(0).strip() for match in CHAPTER_ANSWER_BLOCK_RE.finditer(answer_text)]
+    if not exercises or len(exercises) != len(answers):
+        raise ValueError(
+            f"chapter {chapter_number}: malformed chapter-end inventory "
+            f"{len(exercises)}/{len(answers)}"
+        )
+    for exercise, answer in zip(exercises, answers):
+        exercise_title, _ = _parse_numbered_block(exercise, "exercise")
+        answer_title, _ = _parse_numbered_block(answer, "answer")
+        if exercise_title != answer_title:
+            raise ValueError(
+                f"chapter {chapter_number}: exercise/answer title mismatch "
+                f"{exercise_title!r}/{answer_title!r}"
+            )
+    return prefix, exercises, answers
+
+
+def _render_chapter_end(prefix: str, exercises: list[str], answers: list[str]) -> str:
+    return (
+        prefix.rstrip()
+        + "\n\n\\section*{章末练习}\n\n"
+        + "\n\n".join(exercises)
+        + "\n\n\\section*{参考解答与要点}\n\n"
+        + "\n\n".join(answers)
+        + "\n"
+    )
+
+
+def relocate_chapter_exercises(bodies: dict[int, str]) -> dict[int, str]:
+    """Move exercises to the chapter that owns their mechanism without deleting any."""
+    inventories: dict[int, tuple[str, list[str], list[str]]] = {
+        number: _split_chapter_end(text, number)
+        for number, text in bodies.items()
+    }
+    incoming: dict[int, list[tuple[str, str]]] = {number: [] for number in bodies}
+    rebuilt: dict[int, tuple[str, list[str], list[str]]] = {}
+    moved = 0
+
+    for number, (prefix, exercises, answers) in inventories.items():
+        kept_exercises: list[str] = []
+        kept_answers: list[str] = []
+        for exercise, answer in zip(exercises, answers):
+            title, _ = _parse_numbered_block(exercise, "exercise")
+            target = EXERCISE_RELOCATIONS.get((number, title))
+            if target is None:
+                kept_exercises.append(exercise)
+                kept_answers.append(answer)
+                continue
+            if target not in bodies:
+                raise ValueError(
+                    f"chapter {number}: exercise {title!r} targets missing chapter {target}"
+                )
+            incoming[target].append((exercise, answer))
+            moved += 1
+        rebuilt[number] = (prefix, kept_exercises, kept_answers)
+
+    expected_moves = len(EXERCISE_RELOCATIONS)
+    if moved != expected_moves:
+        found = {
+            (number, _parse_numbered_block(exercise, "exercise")[0])
+            for number, (_, exercises, _) in inventories.items()
+            for exercise in exercises
+        }
+        missing = sorted(set(EXERCISE_RELOCATIONS) - found)
+        raise ValueError(
+            f"exercise relocation inventory mismatch: expected {expected_moves}, "
+            f"moved {moved}, missing={missing}"
+        )
+
+    output: dict[int, str] = {}
+    for number, (prefix, exercises, answers) in rebuilt.items():
+        for exercise, answer in incoming[number]:
+            exercises.append(exercise)
+            answers.append(answer)
+        output[number] = _render_chapter_end(prefix, exercises, answers)
+    return output
+
+
+def consolidate_chapter_exercises(
+    text: str, chapter_number: int, target_count: int = 10
+) -> str:
+    """Keep at most target_count numbered problems while retaining every original subproblem."""
+    prefix, exercises, answers = _split_chapter_end(text, chapter_number)
+    if len(exercises) <= target_count:
+        return text
+
+    base, remainder = divmod(len(exercises), target_count)
+    group_sizes = [base + (1 if index < remainder else 0) for index in range(target_count)]
+    grouped_exercises: list[str] = []
+    grouped_answers: list[str] = []
+    cursor = 0
+
+    for group_size in group_sizes:
+        exercise_group = exercises[cursor:cursor + group_size]
+        answer_group = answers[cursor:cursor + group_size]
+        cursor += group_size
+        if group_size == 1:
+            grouped_exercises.append(exercise_group[0])
+            grouped_answers.append(answer_group[0])
+            continue
+
+        parsed_exercises = [
+            _parse_numbered_block(block, "exercise") for block in exercise_group
+        ]
+        parsed_answers = [
+            _parse_numbered_block(block, "answer") for block in answer_group
+        ]
+        first_title = parsed_exercises[0][0]
+        last_title = parsed_exercises[-1][0]
+        group_title = f"综合练习：{first_title}至{last_title}"
+        exercise_lines = [rf"\begin{{chapterexercise}}{{{group_title}}}"]
+        answer_lines = [rf"\begin{{chapteranswer}}{{{group_title}}}"]
+        for index, ((exercise_title, exercise_body), (answer_title, answer_body)) in enumerate(
+            zip(parsed_exercises, parsed_answers)
+        ):
+            if exercise_title != answer_title:
+                raise ValueError(
+                    f"chapter {chapter_number}: cannot consolidate mismatched pair"
+                )
+            label = chr(ord("a") + index)
+            exercise_lines.extend(
+                (
+                    rf"\begin{{exercisesubproblem}}{{（{label}）{exercise_title}}}",
+                    exercise_body,
+                    r"\end{exercisesubproblem}",
+                )
+            )
+            answer_lines.extend(
+                (
+                    rf"\begin{{answersubproblem}}{{（{label}）{answer_title}}}",
+                    answer_body,
+                    r"\end{answersubproblem}",
+                )
+            )
+        exercise_lines.append(r"\end{chapterexercise}")
+        answer_lines.append(r"\end{chapteranswer}")
+        grouped_exercises.append("\n".join(exercise_lines))
+        grouped_answers.append("\n".join(answer_lines))
+
+    if cursor != len(exercises):
+        raise ValueError(f"chapter {chapter_number}: exercise consolidation lost content")
+    return _render_chapter_end(prefix, grouped_exercises, grouped_answers)
+
+
+def normalize_topic_headings(text: str) -> str:
+    """Remove numbering inherited from a former chapter's internal hierarchy."""
+    text = re.sub(
+        r"(?m)^(\\topic\{)(?:[〇一二三四五六七八九十]+、|[0-9]+(?:\.[0-9]+)+\\quad\s*)",
+        r"\1",
+        text,
+    )
+    return text
 
 
 def parse_longtable_rows(body: str) -> list[str]:
@@ -1242,8 +1611,14 @@ def main() -> int:
     assigned: list[tuple[str, int]] = []
 
     expected_outputs: set[Path] = set()
+    prepared_bodies: dict[int, str] = {}
     for chapter in CHAPTERS:
         body_parts: list[str] = []
+        for extra_name in EXTRAS_BEFORE.get(chapter.number, ()):
+            extra = additions_dir / extra_name
+            if not extra.is_file():
+                raise FileNotFoundError(f"missing chapter addition: {extra}")
+            body_parts.append(extra.read_text(encoding="utf-8"))
         for name, indices in chapter.units:
             for index in indices:
                 if index >= len(units[name]):
@@ -1271,8 +1646,24 @@ def main() -> int:
         audit_pseudocode_annotations(body, chapter.number)
         body = format_chapter_end_exercises(body, chapter.number)
         body = move_chapter_end_material(body, chapter.number)
+        prepared_bodies[chapter.number] = body
+
+    duplicates = sorted({item for item in assigned if assigned.count(item) > 1})
+    missing = sorted(expected - set(assigned))
+    extra = sorted(set(assigned) - expected)
+    if duplicates or missing or extra:
+        print(f"coverage failure: duplicates={duplicates} missing={missing} extra={extra}", file=sys.stderr)
+        return 1
+
+    prepared_bodies = relocate_chapter_exercises(prepared_bodies)
+
+    for chapter in CHAPTERS:
+        body = consolidate_chapter_exercises(
+            prepared_bodies[chapter.number], chapter.number
+        )
         body = split_oversized_longtables(body)
         body = add_longtable_row_rules(body)
+        body = normalize_topic_headings(body)
         body = renumber_sections(body)
         output = output_dir / f"ch{chapter.number:02d}-{chapter.slug}.tex"
         expected_outputs.add(output)
@@ -1286,15 +1677,6 @@ def main() -> int:
         text = polish_reader_text(text)
         text = text.rstrip() + "\n"
         output.write_text(text, encoding="utf-8")
-
-    duplicates = sorted({item for item in assigned if assigned.count(item) > 1})
-    missing = sorted(expected - set(assigned))
-    extra = sorted(set(assigned) - expected)
-    if duplicates or missing or extra:
-        for output in expected_outputs:
-            output.unlink(missing_ok=True)
-        print(f"coverage failure: duplicates={duplicates} missing={missing} extra={extra}", file=sys.stderr)
-        return 1
 
     for stale in output_dir.glob("ch*.tex"):
         if stale not in expected_outputs:

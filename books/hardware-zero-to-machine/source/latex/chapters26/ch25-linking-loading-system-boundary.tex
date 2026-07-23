@@ -1,10 +1,2116 @@
 \chapter{链接、装载与系统软件边界}
 
 \begin{keyidea}
-硬件执行的是确定地址上的机器码，软件工具链负责把名字、段和重定位变成这种状态。本章把目标文件、固件、装载器和异常入口接回硬件。
+硬件执行的是确定地址上的机器码，软件工具链负责把名字、段和重定位变成这种状态。本章先沿目标文件、链接、装载和异常入口建立主线，再用固件镜像作为无操作系统环境的对照案例。
 \end{keyidea}
 
-\section{一、从目标文件、固件到可启动机器}
+\begin{longtable}{L{0.2\linewidth}L{0.4\linewidth}L{0.3\linewidth}}
+\toprule
+阶段 & 做什么 & 对应的硬件动作 \\
+\midrule
+编译 & 源码变目标文件 & 生成指令编码和重定位记录 \\\tablerowrule
+链接 & 合并目标文件、解析符号 & 把符号名变成确定地址 \\\tablerowrule
+装载 & 把程序映像放进内存 & 建立页表、映射段 \\\tablerowrule
+运行 & 请求内核服务 & 系统调用陷入异常入口 \\
+\bottomrule
+\end{longtable}
+
+\begin{keyidea}
+链接和装载不是编译器内部魔法，而是“什么时候把哪个名字定成哪个地址”的时间表。读懂这张时间表，静态库、动态库、PLT、系统调用这些名词都会各就各位。
+\end{keyidea}
+
+\section{一、目标文件与符号}
+
+本节回答一个问题：编译器交出来的目标文件，里面到底装
+了什么。前面二十四章讲的都是硬件怎样执行指令，从本节开
+始换一个视角：指令被执行之前，先作为字节躺在文件里。
+目标文件就是这批字节的容器，读懂它只需要一张“哪段字
+节是什么、给谁看”的地图。
+
+\topic{ELF 是目标文件的通用容器}
+x86-64 Linux 上，编译器每处理一个源文件就交出一个 ELF
+目标文件，链接器拼出的可执行文件是 ELF，共享库也是
+ELF。ELF（Executable and Linkable Format）是这一整条流
+程的通用容器：同一套字节排布约定，既能让链接器读到“这
+里有一段代码、那里有一张符号表”，也能让内核装载器读到
+“把哪一段映射到哪个虚拟地址”——后者是第三节的事。
+
+容器从固定格式的头部开始。前 16 字节是身份区：头 4 字
+节是魔数 \code{0x7F} 加字母 \code{E}、\code{L}、
+\code{F}，任何工具拿到文件先核对这个签名，对不上就立
+刻拒收；随后两个字节说明类别（32 位还是 64 位）和字节
+序（大端还是小端）——只凭这两个字段，解析程序就知道
+后面所有多字节字段该按什么宽度、什么顺序读。头部其余
+字段里最重要的几个列在下表。
+
+\begin{longtable}{L{0.14\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
+\toprule
+字段 & 内容 & 谁来读 \\
+\midrule
+\code{e\_type} & 文件类型：ET\_REL / ET\_EXEC / ET\_DYN & 一切工具先按它分流 \\\tablerowrule
+\code{e\_machine} & 指令集编号，x86-64 为 62 & 链接器据此拒绝混链不同 ISA \\\tablerowrule
+\code{e\_entry} & 进程入口的虚拟地址 & 装载器；可重定位文件恒为 0 \\\tablerowrule
+\code{e\_phoff} & 程序头表（段表）的文件偏移 & 装载器 \\\tablerowrule
+\code{e\_shoff} & 节头表（节表）的文件偏移 & 链接器与观察工具 \\
+\bottomrule
+\end{longtable}
+
+三种类型对应程序出生过程的三个形态。可重定位文件
+（\code{.o}）是半成品：代码和数据都在，但地址一律未
+定，凡涉及地址的字段全部留空，另附一叠“这里以后要
+填”的重定位记录。可执行文件是成品：每个节的虚拟地址
+已定，入口字段指向第一条要执行的指令（现代发行版常把
+可执行文件编成 ET\_DYN 形态的 PIE，把定址推迟到装载
+时，第三节展开）。共享库（\code{.so}）介于两者之间：
+代码数据齐全，却故意不绑定固定装载地址，好让多个进程
+各自把它映射到不同位置。三种形态共用一套头部与节表格
+式，差别只在几个字段的取值和洞里填没填。
+
+头部之后是两份“目录”，给出同一批字节的两种看法。节
+表（section header table）逐项列出每个节的名字、类
+型、大小、文件偏移和属性标志，这是链接视图：链接器按
+节合并、按节定址。程序头表（program header table，常
+称段表）把属性相同的若干节归并成段，逐项给出段的虚拟
+地址、文件范围和读写执行权限，这是执行视图：装载器只
+看它，根本不关心 \code{.text} 叫什么名字。可重定位文
+件通常只有节表——它离执行还早；可执行文件两份都有，
+装载时只用段表。同一份字节，链接器和装载器各取所需，
+这正是“通用容器”的含义。
+
+两份目录的分工画成对视图更
+直观：左边的节按名字与用途
+分，右边的段按权限归并，箭
+头就是链接器的归并动作：
+
+\begin{pdfdiagram}
+  % 左列：链接视图（节表）
+  \node[hw label] at (1.5,3.3) {链接视图：节表};
+  \node[hw compute, minimum width=2.6cm] (st) at (1.5,2.6) {.text};
+  \node[hw compute, minimum width=2.6cm] (sr) at (1.5,1.8) {.rodata};
+  \node[hw compute, minimum width=2.6cm] (sd) at (1.5,1.0) {.data};
+  \node[hw memory, minimum width=2.6cm, dashed] (sb) at (1.5,0.2) {.bss};
+  \node[hw state, minimum width=2.6cm, align=center] (ss) at (1.5,-0.8) {.symtab / .strtab\\符号与字符串};
+  % 右列：执行视图（段表）
+  \node[hw label] at (9.3,3.3) {执行视图：段表};
+  \node[hw state, minimum width=3.2cm, align=center] (lx) at (9.3,2.6) {LOAD：读/执行};
+  \node[hw state, minimum width=3.2cm, align=center] (lr) at (9.3,1.8) {LOAD：只读};
+  \node[hw state, minimum width=3.2cm, align=center] (lw) at (9.3,0.6) {LOAD：读写};
+  \node[hw label, align=center] (ln) at (9.3,-0.8) {不进段表\\装载器不看};
+  % 归并箭头：同级水平直连
+  \draw[hw bus] (st.east) -- (lx.west);
+  \draw[hw bus] (sr.east) -- (lr.west);
+  % .data 与 .bss 共享一小段干线，汇入同一个读写段
+  \draw[hw bus] (sd.east) -- (4.9,1.0) -- (4.9,0.6) -- (lw.west);
+  \draw[hw bus] (sb.east) -- (4.3,0.2) -- (4.3,0.6) -- (4.9,0.6);
+  \fill[BookMuted] (4.9,0.6) circle (0.05);
+  \node[hw label, fill=white, inner sep=1pt] at (6.2,0.32) {按属性归并};
+  % 符号表与字符串表只供链接期
+  \draw[hw return] (ss.east) -- (ln.west);
+\end{pdfdiagram}
+\diagramnote{同一份字节的两种看法。链接视图按节组织：名字、类型、大小与属性逐项登记在节表里，链接器按节合并、按节定址；执行视图把属性相同的节归并成 LOAD 段，只保留虚拟地址、文件范围与读写执行权限，装载器只看这一份。可重定位文件通常只有节表；可执行文件两份都有，装载时只用段表——\code{strip} 把节表整个剥掉，程序照样运行。}
+
+把这份容器按文件偏移画成竖向排布，头部、两份目录与各节的位置关系便一目了然；\code{readelf} 的每个常用选项，恰好对应图中的一块：
+
+\begin{pdfdiagram}
+  % 主体：按文件偏移自上而下排布的字节布局
+  \node[hw state, minimum width=3.4cm] (ehdr) at (1.6,4.5) {ELF 头（64 字节）\\魔数、e\_phoff、e\_shoff};
+  \node[hw state, minimum width=3.4cm] (phdr) at (1.6,3.3) {程序头表（段表）\\执行视图，装载器读};
+  \node[hw compute, minimum width=3.4cm] (sect) at (1.6,2.1) {.text：指令编码};
+  \node[hw compute, minimum width=3.4cm] (srod) at (1.6,1.2) {.rodata：只读常量};
+  \node[hw compute, minimum width=3.4cm] (sdat) at (1.6,0.3) {.data：已初始化数据};
+  \node[hw memory, minimum width=3.4cm, dashed] (sbss) at (1.6,-0.6) {.bss：不占文件字节};
+  \node[hw memory, minimum width=3.4cm] (ssym) at (1.6,-1.5) {.symtab：符号表};
+  \node[hw state, minimum width=3.4cm] (shtab) at (1.6,-2.4) {节头表（节表）\\链接视图，链接器读};
+  % 左侧：文件偏移增长方向
+  \draw[BookMuted, line width=0.6pt, ->] (-0.6,4.5) -- (-0.6,-2.4);
+  \node[hw label, anchor=east] at (-0.75,1.0) {文件偏移增大};
+  % 右侧：readelf 各选项（虚线指出读取的部分）
+  \node[hw label, anchor=west] (rh) at (4.3,4.5) {\code{readelf -h}：读 ELF 头};
+  \node[hw label, anchor=west] (rl) at (4.3,3.3) {\code{readelf -l}：读段表};
+  \node[hw label, anchor=west] (rs) at (4.3,-1.5) {\code{readelf -s}：读符号表};
+  \node[hw label, anchor=west] (rS) at (4.3,-2.4) {\code{readelf -S}：读节表};
+  \draw[hw return] (rh.west) -- (ehdr.east);
+  \draw[hw return] (rl.west) -- (phdr.east);
+  \draw[hw return] (rs.west) -- (ssym.east);
+  \draw[hw return] (rS.west) -- (shtab.east);
+\end{pdfdiagram}
+\diagramnote{ELF 文件按字节偏移的排布（自上而下偏移增大）。ELF 头中的 \code{e\_phoff} 与 \code{e\_shoff} 分别给出段表与节表的文件偏移；\code{.bss} 是 NOBITS 类型，节表里只登记大小，文件里一个字节也不占，图中用虚线框表示。右侧标出 \code{readelf} 各选项读取的部分：同一份字节，链接器取节表与符号表，装载器只取段表。}
+
+最后要戳破一层神秘感：ELF 没有任何魔法，它只是按约定
+排布的字节。文件自己并不“知道”节表在哪，是工具按
+\code{e\_shoff} 找过去的；头部里某个偏移写错，读出来
+的就是垃圾，没有类型系统代为保证正确性。本书反复出现的主题
+在这里再次出现：软与硬之间、工具与文件之间，一切协作
+都靠约定，不靠神秘力量。
+
+\topic{常见节的分工}
+打开任意一个目标文件的节表，总能见到几张熟面孔。它们
+的分工不是编译器的发明，而是把“用途与权限相同”的字
+节归在一起：用途决定放在哪，权限决定内存页怎么保护。
+
+\code{.text} 装指令字节，属性是分配、只读、可执行；
+\code{.rodata} 装只读常量——字符串字面量、\code{const}
+全局量、编译器为 \code{switch} 生成的跳转表，属性是分
+配、只读；\code{.data} 装初值非零的全局变量和静态局部
+变量，文件里存的就是初值本身，属性是分配、可写；
+\code{.bss} 装未初始化或初值恰为零的全局量与静态量，
+属性同样是分配、可写，但它在文件里一个字节都不占。
+
+\begin{longtable}{L{0.12\linewidth}L{0.34\linewidth}L{0.16\linewidth}L{0.24\linewidth}}
+\toprule
+节 & 装什么 & 占文件字节 & 内存权限 \\
+\midrule
+\code{.text} & 指令编码 & 占 & 只读、可执行 \\\tablerowrule
+\code{.rodata} & 字符串、const 常量、跳转表 & 占 & 只读 \\\tablerowrule
+\code{.data} & 初值非零的全局/静态变量 & 占，内容即初值 & 可读写 \\\tablerowrule
+\code{.bss} & 未初始化或初值为零的变量 & 不占 & 可读写，装载时清零 \\
+\bottomrule
+\end{longtable}
+
+\code{.bss} 省空间的机制一句话就能说清：它的节头类型
+是 NOBITS，节表里只有名字、大小和对齐要求，没有对应
+的文件范围；装载器读到它时不复制任何字节，直接在内存
+里划出大小相等的一片并填零。这与装载器的既有动作正好
+合拍——内核给新映射提供的本来就是填零的页（第三节的
+装载过程还会用到），所以
+\code{.bss} 的清零几乎不花额外代价。
+
+省多少可以算出来。假设程序里有一个 1 MiB 的未初始化
+静态数组：若放进 \code{.data}，目标文件要多存 1 MiB
+内容，而这 1 MiB 全是零字节，运载的信息量却是零；放
+进 \code{.bss}，文件只多一行几十字节的节头记录，内存
+里照样得到 1 MiB 全零空间。文件的职责是保存非零信
+息；全零内容用“长度加填零”几个字就说完了。C 的规则
+也顺着这个机制设计：显式初始化为零的变量同样进
+\code{.bss}——\code{int x = 0;} 与 \code{int x;} 同等
+待遇，只有初值非零才需要 \code{.data} 里的真实字节。
+
+节的属性标志不是注释，它们会一路传到硬件。链接器按属
+性把节归并成段，段头里的读写执行标志最终被装载器转成
+页表项的权限位：于是 \code{.text} 所在页不可写、
+\code{.data} 所在页不可执行。这些保护不是操作系统额
+外的好意，而是目标文件里早就写明的属性，经链接、装载
+两步原样传给 MMU。存储与设备事务相关章节问页表项权限位的来历，答案
+有一半就在这里。
+
+\topic{符号表是名字到位置的映射}
+节回答了“字节是什么”，还没回答“名字在哪”。
+\code{main.c} 里调用 \code{add}，编译器生成
+\code{main.o} 时并不知道 \code{add} 的地址——它可能
+根本不在本文件里。目标文件的处理办法是：把每个名字连
+同它的状态登记进符号表 \code{.symtab}，名字与位置的
+对应关系全部走这张表。
+
+符号表每个条目记录：名字（字符串存在 \code{.strtab}，
+条目里存偏移）、值（\code{st\_value}：可重定位文件里
+是节内偏移，可执行文件里是虚拟地址）、大小、类型（函
+数 FUNC、数据 OBJECT）、绑定属性，以及“定义在哪个
+节”。最后一项是定义与引用的分界线：纯引用的条目这一
+栏是 UND（未定义），意思是“这个名字本文件要用，定义
+在别处”；有定义的条目这一栏是本文件某个节的编号。
+
+绑定属性分三档。LOCAL 是文件内私有：\code{static} 修
+饰的函数和变量都是 LOCAL，不参与跨文件解析，别的文件
+有同名符号也互不干扰。GLOBAL 是默认档：普通函数与全
+局变量，在全程序范围内参与解析。WEAK 是可以商量档：
+弱定义遇到同名 GLOBAL 强定义时自动让位，没有强定义时
+才用它——库常用弱符号提供可替换的默认实现；弱引用更
+宽容，找不到定义也不报错，运行时取到 0，由程序自己判
+空。
+
+\begin{longtable}{L{0.2\linewidth}L{0.28\linewidth}L{0.38\linewidth}}
+\toprule
+类别 & 怎么产生 & 链接器怎么处理 \\
+\midrule
+LOCAL & \code{static} 函数/变量 & 不进全局解析，只供本文件与调试器 \\\tablerowrule
+GLOBAL 定义 & 普通函数、全局变量 & 全程序只允许一个强定义 \\\tablerowrule
+GLOBAL 引用（UND） & 调用或访问外部名字 & 必须在某个输入文件里找到定义 \\\tablerowrule
+WEAK 定义 & \code{\_\_attribute\_\_((weak))} & 有强定义则让位，否则用它 \\
+\bottomrule
+\end{longtable}
+
+链接器两个经典报错都来自这张表。未定义引用：扫完所有
+输入文件，某个 UND 条目始终没找到对应的 GLOBAL 定义，
+于是报告 \code{undefined reference to `foo'}——这并非不可解释的现象，而是符号表查询失败的直接结果。多重定义：同一名字
+出现两个 GLOBAL 强定义，链接器无法裁决哪个算数，只能
+拒绝。在 C 头文件里误定义非 \code{static}、非
+\code{inline} 的变量，被多个源文件包含后各产生一个强
+定义，正是这个错误的头号来源。
+
+把符号表看成“接口的物理形态”很有用：目标文件对外提
+供什么（GLOBAL 定义）、向外索取什么（UND 引用），表
+上一目了然。第二节的符号解析、第三节的动态链接，处理
+的始终是这三个问题：名字是谁、值是多少、定义在不在
+场。
+
+\topic{用 readelf/objdump 观察真实目标文件}
+这些结构不必靠想象，工具可以直接翻开看。常用的四个用
+法：\code{readelf -h} 读头部，核对类型、机器、入口和
+两份目录的位置；\code{readelf -S} 列节表，看每个节的
+类型、偏移、大小和属性标志；\code{readelf -s} 列符号
+表；\code{objdump -d -M intel} 反汇编 \code{.text}，换
+\code{-r} 则看重定位记录。拿一个最小源文件完整试一
+遍：
+
+\begin{lstlisting}
+/* min.c */
+int  counter = 42;        /* 初值非零：进 .data    */
+const char msg[] = "hi";  /* 只读常量：进 .rodata  */
+int  stash;               /* 未初始化：进 .bss     */
+
+int bump(int x)           /* 函数体：进 .text      */
+{
+    counter += x;         /* 两条指令引用 counter  */
+    return counter;
+}
+\end{lstlisting}
+
+用 \code{gcc -c -O1 -o min.o min.c} 编译，然后逐个窗口
+看进去。第一扇窗是头部，注意类型、机器、入口和两份目
+录的位置：
+
+\begin{lstlisting}
+$ readelf -h min.o
+ELF Header:
+  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Version:                           1 (current)
+  OS/ABI:                            UNIX - System V
+  Type:                              REL (Relocatable file)
+  Machine:                           Advanced Micro Devices X86-64
+  Entry point address:               0x0
+  Start of program headers:          0 (bytes into file)
+  Start of section headers:          472 (bytes into file)
+  Size of this header:               64 (bytes)
+  Number of program headers:         0
+  Number of section headers:         9
+  Section header string table index: 8
+\end{lstlisting}
+
+魔数之后，\code{02} 表示 64 位、\code{01} 表示小端，与
+本机一致；类型 REL 说明这是半成品，所以入口地址是 0、
+程序头表个数也是 0——离执行还早，段表还没必要存在。
+第二扇窗是节表：
+
+\begin{lstlisting}
+$ readelf -S min.o
+There are 9 section headers, starting at offset 0x1d8:
+
+Section Headers:
+  [Nr] Name       Type     Address          Off    Size   ES Flg Lk Inf Al
+  [ 0]            NULL     0000000000000000 000000 000000 00      0   0  0
+  [ 1] .text      PROGBITS 0000000000000000 000040 00000d 00  AX  0   0  1
+  [ 2] .rela.text RELA     0000000000000000 0001a8 000030 18   I  6   1  8
+  [ 3] .data      PROGBITS 0000000000000000 000050 000004 00  WA  0   0  4
+  [ 4] .bss       NOBITS   0000000000000000 000054 000004 00  WA  0   0  4
+  [ 5] .rodata    PROGBITS 0000000000000000 000054 000003 00   A  0   0  1
+  [ 6] .symtab    SYMTAB   0000000000000000 000058 0000f0 18      7   6  8
+  [ 7] .strtab    STRTAB   0000000000000000 000148 00001e 00      0   0  1
+  [ 8] .shstrtab  STRTAB   0000000000000000 000166 00003f 00      0   0  1
+Flags: W (write), A (alloc), X (execute), I (info)
+\end{lstlisting}
+
+三处细节值得停下来看。第一，所有节的 Address 一栏全
+是 0——地址还不存在，这正是“半成品”最直观的迹象。
+第二，\code{.bss} 的文件偏移（0x54）与 \code{.rodata}
+相同：NOBITS 不占文件字节，所以“链接：重定位与地址形成”一节从同一偏移接着
+排，而它的 4 字节大小照样登记在案，装载时按这个数划
+出内存。第三，\code{.text} 只有 13 字节——一个函数
+的全部代码就这么多，里面还留着两个待填的洞。第三扇
+窗是符号表：
+
+\begin{lstlisting}
+$ readelf -s min.o
+Symbol table '.symtab' contains 10 entries:
+   Num:    Value          Size Type    Bind   Vis      Ndx Name
+     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
+     1: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS min.c
+     2: 0000000000000000     0 SECTION LOCAL  DEFAULT    1
+     3: 0000000000000000     0 SECTION LOCAL  DEFAULT    3
+     4: 0000000000000000     0 SECTION LOCAL  DEFAULT    4
+     5: 0000000000000000     0 SECTION LOCAL  DEFAULT    5
+     6: 0000000000000000    13 FUNC    GLOBAL DEFAULT    1 bump
+     7: 0000000000000000     4 OBJECT  GLOBAL DEFAULT    3 counter
+     8: 0000000000000000     4 OBJECT  GLOBAL DEFAULT    4 stash
+     9: 0000000000000000     3 OBJECT  GLOBAL DEFAULT    5 msg
+\end{lstlisting}
+
+源码里的四个名字各就各位：\code{bump} 是 13 字节的
+FUNC，定义在 1 号节（\code{.text}）；\code{counter} 是
+4 字节 OBJECT，在 3 号节（\code{.data}）；\code{stash}
+在 4 号节（\code{.bss}）；\code{msg} 是 3 字节（连结尾
+的 \code{'\textbackslash 0'}），在 5 号节
+（\code{.rodata}）。Value 一栏全是 0：它们目前都只是
+节内偏移，三个变量恰好都位于各自节的起点。最后一扇窗
+看代码本身和那两个洞：
+
+\begin{lstlisting}
+$ objdump -d -M intel min.o
+Disassembly of section .text:
+
+0000000000000000 <bump>:
+   0:  01 3d 00 00 00 00   add  DWORD PTR [rip+0x0],edi   # 6
+   6:  8b 05 00 00 00 00   mov  eax,DWORD PTR [rip+0x0]   # c
+   c:  c3                  ret
+
+$ objdump -r min.o
+RELOCATION RECORDS FOR [.text]:
+OFFSET           TYPE              VALUE
+0000000000000002 R_X86_64_PC32     counter-0x4
+0000000000000008 R_X86_64_PC32     counter-0x4
+\end{lstlisting}
+
+两条指令都带 \code{[rip+0x0]} 形式的 4 字节位移字段，
+内容暂时是 0——这就是洞。重定位记录说清了两个洞的位
+置（偏移 2 和 8，各在操作码之后）、填法
+（R\_X86\_64\_PC32，PC 相对 32 位）和目标（符号
+\code{counter}，加数 -4）。注意 \code{counter} 就在本
+文件定义，照样要留洞：它在 \code{.data}，代码在
+\code{.text}，两节的距离要等布局后才知道，怎么填正是
+第二节的主题。
+
+\topic{一个最小函数的完整解剖}
+收尾前做一次最彻底的走查：把一个最小函数从源码到字
+节、到符号、到重定位记录逐项对一遍。源码只有一行：
+
+\begin{lstlisting}
+int add(int a, int b) { return a + b; }
+\end{lstlisting}
+
+\code{gcc -O0} 生成的汇编如下（Intel 语法，小写寄存
+器）：
+
+\begin{lstlisting}
+add:
+        push    rbp
+        mov     rbp, rsp
+        mov     DWORD PTR [rbp-4], edi
+        mov     DWORD PTR [rbp-8], esi
+        mov     edx, DWORD PTR [rbp-4]
+        mov     eax, DWORD PTR [rbp-8]
+        add     eax, edx
+        pop     rbp
+        ret
+\end{lstlisting}
+
+这段代码汇编成 20 个字节。逐字节解剖如下，每一条指令
+的编码都能用处理器核心相关章节的字段格式读出来：
+
+\begin{longtable}{L{0.07\linewidth}L{0.17\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
+\toprule
+偏移 & 字节 & 指令 & 编码要点 \\
+\midrule
+0x00 & \code{55} & \code{push rbp} & 单字节，寄存器号 5 编在操作码低 3 位（0x50+5） \\\tablerowrule
+0x01 & \code{48 89 e5} & \code{mov rbp,rsp} & \code{48} 是 REX.W 前缀；ModRM=0xE5：mod=11 寄存器直寻，reg=100 是 rsp，rm=101 是 rbp \\\tablerowrule
+0x04 & \code{89 7d fc} & \code{mov [rbp-4],edi} & ModRM=0x7D：mod=01 带 8 位位移，disp8=0xFC 即 -4，reg=111 是 edi \\\tablerowrule
+0x07 & \code{89 75 f8} & \code{mov [rbp-8],esi} & 同一格式，reg=110 是 esi，disp8=0xF8 即 -8 \\\tablerowrule
+0x0a & \code{8b 55 fc} & \code{mov edx,[rbp-4]} & 操作码 8B 方向相反：内存到寄存器，reg=010 是 edx \\\tablerowrule
+0x0d & \code{8b 45 f8} & \code{mov eax,[rbp-8]} & reg=000 是 eax，位移仍是 -8 \\\tablerowrule
+0x10 & \code{01 d0} & \code{add eax,edx} & ModRM=0xD0：rm=000（eax）是目的，reg=010（edx）是源 \\\tablerowrule
+0x12 & \code{5d} & \code{pop rbp} & 单字节，0x58+5 \\\tablerowrule
+0x13 & \code{c3} & \code{ret} & 弹栈顶作为返回地址 \\
+\bottomrule
+\end{longtable}
+
+每一列都能和处理器核心相关章节对上。ModRM 字节的 mod、reg、rm 三
+字段正是处理器核心相关章节“寻址方式加寄存器号”的同一套结构；
+\code{[rbp-4]} 里的 -4 就是编码格式中的 disp8 位移字
+段。参数与返回值的位置则来自调用约定——处理器核心相关章节“调用
+约定把寄存器和栈的责任写成明确约定”的 x86-64 版本：
+头两个整型参数依次在 edi、esi，返回值在 eax。还可以
+看到 -O0 的字面意思：参数先原样存入栈、用时再取回，
+20 个字节里真正做加法的只有 \code{01 d0} 两个字节。
+若开 -O1，整个函数收缩成 \code{8d 04 37 c3}：
+\code{lea eax,[rdi+rsi]} 借用“基址加变址”的求和路
+径直接算出 a+b，外加一条 \code{ret}——地址形成硬件
+被借来做算术，这是处理器核心相关章节 SIB 求和器的又一次登场。
+
+再看符号与重定位两栏的对应。符号表里这个函数产生一个
+条目：名字 \code{add}，类型 FUNC，绑定 GLOBAL，大小
+20，Ndx 指向 \code{.text}，Value 为 0——函数正好位于
+本文件 \code{.text} 的起点，最终虚拟地址要等链接器分
+配，此刻只能记节内偏移。重定位记录一栏则是空的：这个
+函数的每个操作数不是寄存器就是 rbp 相对的栈槽，位移
+-4、-8 在编译时就是定数，整条指令流不引用任何名字，
+自然没有要填的洞。这给出一条判据：重定位记录只在指令
+里出现名字——外部函数、全局变量——时才产生。把函数
+改成带外部调用的版本，记录立刻现身：
+
+\begin{lstlisting}
+extern int twice(int);
+
+int add_twice(int a, int b) { return twice(a + b); }
+\end{lstlisting}
+
+\code{-O1} 生成的代码与字节如下（分号后是注释）：
+
+\begin{lstlisting}
+add_twice:
+        sub     rsp, 8            ; 48 83 ec 08  栈对齐到 16 字节
+        lea     edi, [rdi+rsi]    ; 8d 3c 37     a+b 送入第一个参数
+        call    twice             ; e8 00 00 00 00  <- 洞在这里
+        add     rsp, 8            ; 48 83 c4 08
+        ret                       ; c3
+\end{lstlisting}
+
+\code{call} 的 4 字节相对偏移在编译时未知——
+\code{twice} 在别的文件里，它的地址此刻不存在。汇编
+器把字段清零，并登记一条重定位记录：
+
+\begin{lstlisting}
+$ objdump -r add_twice.o
+RELOCATION RECORDS FOR [.text]:
+OFFSET           TYPE              VALUE
+0000000000000008 R_X86_64_PC32     twice-0x4
+\end{lstlisting}
+
+读法：\code{.text} 偏移 0x8 处（\code{e8} 操作码之后
+那 4 个字节）要按 PC 相对 32 位规则、用符号
+\code{twice} 的地址修补，加数 -4。三个要素——改哪
+里、按什么规则、用谁的值——全部登记在案，但演算还做
+不了：S 尚未存在。填洞需要符号的值，而符号的值来自链
+接器的布局，这就是第二节的开场。
+
+\section{二、链接：重定位与地址形成}
+
+“目标文件与符号”一节的结论是：目标文件是半成品——字节齐备，地址未
+定，凡涉及名字的字段都留着洞，洞的位置和填法记在重定
+位记录里。本节看链接器怎样把若干半成品拼成一张完整的
+地址地图。
+
+\topic{链接器做三件事}
+把链接器看成一台只做三件简单事的机器，它的行为就不再
+神秘。第一件，合并同类节：把各输入文件的 \code{.text}
+依次接成输出的 \code{.text}，\code{.data}、
+\code{.rodata}、\code{.bss} 同样处理，再按读写执行属
+性把节归并成段。第二件，符号解析与地址分配：给输出的
+每个节定下虚拟地址，于是每个符号的值从“某节内偏移”
+换算成“节基址加偏移”的具体数；同时把各文件的符号表
+汇成一张全局表，为每个 UND 引用找到唯一的 GLOBAL 定
+义。第三件，重定位：按重定位记录逐条改写输出文件里的
+字节——填 \code{call} 的相对偏移、填全局变量的位移、
+填数据区的指针初值。
+
+\begin{longtable}{L{0.22\linewidth}L{0.24\linewidth}L{0.26\linewidth}L{0.14\linewidth}}
+\toprule
+步骤 & 输入 & 产出 & 改文件字节吗 \\
+\midrule
+合并同类节 & 各 \code{.o} 的同名节 & 输出的节与段布局 & 拼接拷贝 \\\tablerowrule
+符号解析与定址 & 全部符号表 & 全局符号表、各节基址 & 不改，只算数 \\\tablerowrule
+重定位 & 重定位记录加符号值 & 填好的指令与数据 & 改，逐条修补 \\
+\bottomrule
+\end{longtable}
+
+三件事里前两件是簿记，第三件才真正动字节；但改哪里、
+改多少，完全由前两件的结果决定。这就是“链接等于把多
+个半成品拼成一张完整地址地图”的准确含义：地图由第二
+件事算出，由第三件事誊进字节。次序也不能乱：只有合并
+与定址完成，符号才有值；符号有了值，重定位的算术才能
+做。所以第一节那两个经典报错都发生在第二件事——名字
+查不到或重复定义，地图就画不出来，根本轮不到第三件事
+动手。
+
+把三件事放到一对最小输入上看一遍数值。设链接器只收到
+\code{main.o} 与 \code{add.o}：合并把 \code{main.o} 的
+\code{.text}（0x20 字节）铺在输出 \code{.text} 的基址
+\code{0x401120} 处，\code{add.o} 的 \code{.text}（20
+字节，即 0x14）紧随其后，从 \code{0x401140} 开始；数
+据节同样依次排布、各按对齐要求取整。定址随即给出符号
+值：\code{main = 0x401120}，\code{add = 0x401140}，
+\code{main.o} 符号表里那条 UND 的 \code{add} 就此有了
+定义；重定位拿着这两个值去填 \code{main.o} 里那条
+\code{call} 留下的洞——具体演算正是下一个专题的内
+容。
+
+把合并与定址画成一张排布图，
+“同类节依次拼接、符号值随
+之确定”就是图上的两个动作：
+
+\begin{pdfdiagram}
+  % 输入：两个目标文件的同类节
+  \node[hw state, minimum width=2.4cm, align=center] (mt) at (1.2,2.4) {main.o\\.text 0x20 字节};
+  \node[hw state, minimum width=2.4cm, align=center] (at) at (1.2,1.2) {add.o\\.text 0x14 字节};
+  \node[hw memory, minimum width=2.4cm, align=center] (md) at (1.2,-0.2) {main.o\\.data};
+  \node[hw memory, minimum width=2.4cm, align=center] (ad) at (1.2,-1.4) {add.o\\.data};
+  % 输出：合并后的节，地址已定
+  \node[hw compute, minimum width=4.2cm, align=center] (ot) at (8.8,1.8) {输出 .text\\main @ 0x401120\\add @ 0x401140};
+  \node[hw compute, minimum width=4.2cm, align=center] (od) at (8.8,-0.8) {输出 .data\\初值依次排布\\按对齐取整};
+  % 拼接箭头：各自折入输出框
+  \draw[hw bus] (mt.east) -- (3.4,2.4) -- (3.4,2.05) -- ($(ot.west)+(0,0.25)$);
+  \draw[hw bus] (at.east) -- (3.0,1.2) -- (3.0,1.55) -- ($(ot.west)+(0,-0.25)$);
+  \node[hw label, fill=white, inner sep=1pt] at (4.9,2.05) {从基址排起};
+  \node[hw label, fill=white, inner sep=1pt] at (4.9,1.55) {紧随其后};
+  \draw[hw bus] (md.east) -- (3.4,-0.2) -- (3.4,-0.55) -- ($(od.west)+(0,0.25)$);
+  \draw[hw bus] (ad.east) -- (3.0,-1.4) -- (3.0,-1.05) -- ($(od.west)+(0,-0.25)$);
+  % 定址结果
+  \node[hw label, align=center] at (5.6,-2.4) {定址结果：main = 0x401120，add = 0x401140\\0x401140 = 0x401120 + 0x20，拼接次序即地址次序};
+\end{pdfdiagram}
+\diagramnote{静态链接的地址形成（对应正文 main.o 与 add.o 的最小例）。链接器把各输入文件的同类节依次拼接成输出的节：\code{main.o} 的 \code{.text}（0x20 字节）铺在基址 \code{0x401120}，\code{add.o} 的 \code{.text}（0x14 字节）紧随其后从 \code{0x401140} 开始；数据节同样处理。拼接完成，每个符号的值便从“节内偏移”换算成“节基址加偏移”的具体数——\code{main = 0x401120}，\code{add = 0x401140}，重定位所需的 S 至此全部就位。}
+
+工程上，布局不是只能听默认值。链接脚本可以指定每个节
+的位置、入口符号和段的对齐方式：本书末章的教学计算机项目的裸机镜像把
+\code{.text} 固定在 ROM 起始地址、把入口固定在复位向量，
+用的就是这套机制的手工模式；Linux 的默认链接脚本则把
+\code{.text} 安排在 \code{0x400000} 附近的惯例地址。
+同一台机器，自动挡与手动挡并存；学完本节和第三节，可
+以回头把本书末章的教学计算机项目那个链接脚本逐行再读一遍。
+
+\topic{重定位记录怎么读}
+第一节末尾留下一条记录：\code{offset 0x8, type
+R\_X86\_64\_PC32, symbol twice, addend -4}。现在把它读
+透。一条重定位记录回答三个问题：位置（offset）——改
+输出文件里的哪几个字节；类型（type）——按哪条公式
+算；符号与加数（symbol、addend）——用谁的地址、再做
+什么修正。x86-64 的 ELF 用 RELA 格式，加数显式存在记
+录里，被修补字段的旧内容直接丢弃不看。
+
+顺带一提，32 位 x86 的 ELF 用的是 REL 格式：记录里没
+有加数字段，加数藏在被修补字段的旧内容里，链接器要先
+读出旧值再代入计算。RELA 把加数显式化，字段旧内容一
+律作废，逻辑更直白。这也解释了观察重定位时的一个现
+象：在 RELA 文件里，洞里的旧字节是什么都无所谓，汇编
+器统一清零——“目标文件与符号”一节目标文件里那些
+\code{00 00 00 00} 的位移字段，正是这个约定的样子。
+
+最常用的两种类型对应两条公式。绝对 32 位重定位
+（R\_X86\_64\_32）：往字段写入 S+A 的低 32 位，S 是符
+号的最终地址，A 是加数——填的是地址本身。PC 相对 32
+位重定位（R\_X86\_64\_PC32）：写入 S+A−P，P 是被修补
+字段自己的最终地址——填的是字段到目标的距离。下面把
+一条 \code{call} 的修补从头算到尾。设 \code{main.o}
+里有一处调用 \code{add}（定义在另一个文件），用
+\code{objdump -dr} 可以把指令和记录放在一起看：
+
+\begin{lstlisting}
+$ objdump -dr -M intel main.o
+Disassembly of section .text:
+
+0000000000000000 <main>:
+   ...
+  10:  e8 00 00 00 00      call   15 <main+0x15>
+                         11: R_X86_64_PC32  add-0x4
+   ...
+\end{lstlisting}
+
+链接器做完合并与定址后：\code{main} 所在 \code{.text}
+块的基址定为 \code{0x401120}，\code{add} 定在
+\code{0x401140}。于是三个数全部就位：被修补字段的地
+址 P = 0x401120 + 0x11 = 0x401131；符号值 S =
+0x401140；加数 A = −4。代入公式，并站在 CPU 执行语义
+一侧核对结果：
+
+\begin{lstlisting}
+写入值 = S + A - P
+       = 0x401140 + (-4) - 0x401131
+       = 0x401140 - 0x401135
+       = 0x0000000B
+
+核对（CPU 执行 call 的语义）：
+目标 = 下一条指令地址 + rel32
+     = (0x401131 + 4) + 0xB
+     = 0x401135 + 0xB
+     = 0x401140  = add    对上了
+\end{lstlisting}
+
+修补后，该处字节从 \code{e8 00 00 00 00} 变成
+\code{e8 0b 00 00 00}——0xB 按小端排布，低字节在前，
+这正是链接器必须通晓 ISA 字节序与字段位置的原因。加
+数为什么是 −4 也值得说透：CPU 求 \code{call} 目标时
+的基准是下一条指令的地址，即字段末尾之后；公式里的 P
+却是字段的开头，两者恰好差 4 个字节，汇编器把这 4 字
+节折进加数里补齐。整个演算没有一个新数：S 来自符号
+表，P 来自节布局，A 来自记录本身，公式来自 ISA 对
+\code{call} 语义的定义。四者各就各位，填洞就是一次减
+法。
+
+把这条演算画成修补流水线，四个数各就各位的动作就是四步：
+
+\begin{pdfdiagram}
+  % 左列：三个数的来源
+  \node[hw memory, align=center, minimum width=3.0cm] (rec) at (0,1.6) {重定位记录\\offset 0x11，addend $-4$\\类型 PC32};
+  \node[hw state, align=center, minimum width=3.0cm] (sym) at (0,0) {符号表\\S = add = 0x401140};
+  \node[hw state, align=center, minimum width=3.0cm] (lay) at (0,-1.6) {节布局\\P = 0x401131};
+  % 汇入干线
+  \draw[draw=BookMuted, line width=0.62pt] (rec.east) -- (2.4,1.6);
+  \draw[draw=BookMuted, line width=0.62pt] (sym.east) -- (2.4,0);
+  \draw[draw=BookMuted, line width=0.62pt] (lay.east) -- (2.4,-1.6);
+  \draw[draw=BookMuted, line width=0.62pt] (2.4,1.6) -- (2.4,-1.6);
+  \fill[BookMuted] (2.4,1.6) circle (0.05);
+  \fill[BookMuted] (2.4,0) circle (0.05);
+  \fill[BookMuted] (2.4,-1.6) circle (0.05);
+  % 计算与写回
+  \node[hw compute, align=center, minimum width=3.6cm] (calc) at (5.6,0) {S + A $-$ P\\= 0x401140 $-$ 4 $-$ 0x401131\\= 0x0B};
+  \node[hw memory, align=center, minimum width=3.0cm] (bytes) at (9.9,0) {call 字段\\e8 00 00 00 00\\→ e8 0b 00 00 00};
+  \draw[hw bus] (2.4,0) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{三数就位} (calc.west);
+  \draw[hw bus] (calc.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{写回} (bytes.west);
+\end{pdfdiagram}
+\diagramnote{重定位修补流水线（对应正文 main.o 调用 add 的演算）。链接器读出记录的位置、类型与加数，从符号表取 S、从节布局取 P，按类型公式代入：PC32 写入 S+A$-$P = 0x401140 $-$ 4 $-$ 0x401131 = 0x0B；结果按小端排布写回字段，e8 00 00 00 00 变成 e8 0b 00 00 00。RELA 格式下字段旧内容直接丢弃，整个修补就是一次减法加一次写字节。}
+
+\topic{绝对重定位与 PC 相对重定位}
+两种类型为什么并存？因为它们服务的字段性质不同。PC 相
+对重定位填距离，适合代码内部的控制转移和就近访问的数
+据：\code{call}、\code{jmp}、条件转移，以及 x86-64 的
+RIP 相对数据寻址，字段 32 位，够到前后各 2 GiB。绝对
+重定位填地址本身，适合数据区里的指针：函数指针数组、
+\code{switch} 的跳转表、\code{char *p = msg;} 这类全
+局指针的初值，以及 \code{movabs} 的 64 位立即数字段
+——这些场合程序要的是值，不是距离。
+
+差别要到镜像搬动时才显形。绝对字段把装载地址烧进了字
+节：镜像每换一个装载位置，所有绝对字段都得按新基址重
+填一遍——这正是第三节要讲的装载时重定位，也是 ASLR
+每次随机布局都必须付的代价。PC 相对字段只记距离：整
+段代码连同它引用的目标一起搬，距离不变，字节原样可
+用，一处都不用改。
+
+看一个绝对重定位的具体形状。\code{switch} 语句分支密
+集时，编译器常在 \code{.rodata} 里生成跳转表：每个表
+项是 8 字节的绝对地址，指向某个分支的代码。目标文件
+里这些表项先是零，旁边一一对应 R\_X86\_64\_64 记录；
+链接时按公式 S+A 填入各分支标签的最终地址。一旦镜像
+换了装载基址，整张表每一项都要加上同一个差值——表
+有多大，重填的工作量就有多大，绝对字段的代价在此现
+出原形。
+
+条件转移则是 PC 相对的纯血用户：x86-64 的 \code{jz}、
+\code{jne} 只有 rel8 与 rel32 两种偏移形式，编码里根
+本没有放绝对目标的位置，想跳远只能先跳到附近再做间
+接转移。控制流指令因此天生位置无关，代码段整体搬移
+时，从来不必为它们操心。
+
+这就是位置无关代码（PIC）的雏形。共享库想被多个进程
+映射到各自不同的虚拟地址、又共享同一批物理代码页，前
+提是 \code{.text} 里几乎没有绝对字段：代码内部的转移
+天然是 PC 相对的，剩下绕不开的绝对访问——调外部函
+数、取外部数据——全部改道两张间接表（GOT 与 PLT），
+需要按装载地址修补的绝对字段集中收进这两张表里，
+\code{.text} 保持干净。编译共享库时加 \code{-fPIC} 的
+本质，就是把绝对重定位从代码节里赶出去；两张表怎么工
+作，是第三节的内容。
+
+\begin{longtable}{L{0.2\linewidth}L{0.26\linewidth}L{0.24\linewidth}L{0.16\linewidth}}
+\toprule
+类型 & 写入内容 & 典型场合 & 镜像整体搬动后 \\
+\midrule
+R\_X86\_64\_32 / 64 & S+A，地址本身 & 数据指针、跳转表、\code{movabs} & 所有绝对字段要重填 \\\tablerowrule
+R\_X86\_64\_PC32 & S+A−P，与字段的距离 & \code{call}/\code{jmp}、RIP 相对访存 & 字节原样可用 \\
+\bottomrule
+\end{longtable}
+
+回头看历史能加深理解：x86-64 把 RIP 相对寻址设为默认
+的数据寻址方式，正是操作系统全面转向 PIC 之后 ISA 做
+出的配合。处理器核心相关章节讲寻址方式时给过这一模式的硬件结构，
+现在能看到它另一半成因在软件侧：链接器和装载器喜欢距
+离，讨厌地址本身。ISA 与系统软件在这里是互相塑造的。
+
+\topic{静态库是按需求出的目标文件包}
+静态库 \code{libfoo.a} 不是新的文件格式：用 \code{ar}
+把一批 \code{.o} 捆成一个归档，再附一张符号索引
+（\code{ar} 的 \code{s} 选项，旧系统里由 \code{ranlib}
+生成），索引记录哪个名字在哪个成员里，仅此而已。库成
+员仍是普普通通的可重定位文件，链接器对它们的处理也和
+对普通 \code{.o} 一样——只多一条抽取规则。
+
+抽取规则是理解静态库的全部关键。链接器从左到右扫描命
+令行上的输入，沿途维护一个“当前未定义符号”集合：扫
+到普通 \code{.o}，无条件整个收进，它定义的符号进全局
+表，它引用的符号进未定义集合；扫到库，则翻看索引，只
+把能消解当前未定义符号的成员抽出来——被抽出的成员自
+己又可能带来新引用，于是对同一个库要反复查，直到不再
+有新成员被抽出。扫描结束时，未定义集合必须为空，否则
+报错。
+
+把这条抽取规则画成数据流，“用多少、取多少”就是中间那个集合的进出平衡：
+
+\begin{pdfdiagram}
+  % 左列：两类输入
+  \node[hw state, align=center] (maino) at (0,1.5) {main.o\\普通目标文件};
+  \node[hw memory, align=center, minimum width=3.2cm] (lib) at (0,-1.1) {libfoo.a\\ar 归档＋符号索引\\成员 a.o b.o c.o};
+  % 中列：未定义集合与被抽出的成员
+  \node[hw control, align=center, minimum width=2.8cm] (undef) at (5.6,1.5) {当前未定义\\符号集合};
+  \node[hw compute, align=center, minimum width=2.8cm] (ext) at (5.6,-1.1) {按索引抽出的\\成员};
+  % 右列：输出
+  \node[hw state, align=center] (out) at (10.3,0.2) {可执行文件};
+  \draw[hw bus] (maino.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{无条件整个收进} (undef.west);
+  \draw[hw bus] (lib.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{按需抽取} (ext.west);
+  \draw[hw bus] (ext.east) -- (8.1,-1.1) -- (8.1,0.2) -- (out.west);
+  % 集合与抽取之间的控制往返
+  \draw[hw return] ($(undef.south)+(-0.6,0)$) -- node[midway, left=1pt, hw label, fill=white, inner sep=1pt]{查索引} ($(ext.north)+(-0.6,0)$);
+  \draw[hw return] ($(ext.north)+(0.6,0)$) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{新引用回集合} ($(undef.south)+(0.6,0)$);
+  \node[hw label, align=center] at (5.6,2.7) {扫描结束：集合必须为空};
+\end{pdfdiagram}
+\diagramnote{静态库的按需抽取。链接器从左到右扫描输入：普通目标文件无条件整个收进，它引用的符号进未定义集合；扫到库时翻符号索引，只把能消解当前未定义符号的成员抽出；被抽成员若带来新引用，就对同一个库再查一遍，直到没有新成员。扫描结束时集合必须为空，否则报未定义引用——库因此必须排在命令行上使用它的文件之后。}
+
+顺序因此有了意义：库必须出现在使用它的文件之后。
+\code{gcc main.o -lfoo} 里，扫到库时 \code{main.o} 的
+引用已在未定义集合里等着，成员被正常抽出；
+\code{gcc -lfoo main.o} 里，扫到库时集合还是空的，一
+个成员也不抽；等 \code{main.o} 把引用放进来，库已经
+扫过，链接器不会回头。
+
+连锁抽取值得再看一眼：成员甲被抽出后又引用了成员乙定
+义的符号，乙也得跟着出库，所以库内部的依赖会被引用链
+自动拉齐。真正的麻烦在库与库互相引用：\code{liba.a}
+需要 \code{libb.a}，\code{libb.a} 又回头需要
+\code{liba.a}，单向扫描无论谁先谁后都可能漏抽。
+\code{ld} 为此准备了 \code{--start-group} 与
+\code{--end-group}：把互相循环的库圈进一组，链接器在
+组内反复扫描，直到没有新成员被抽出。日常遇到的顺序问
+题多半不是循环依赖，而是单纯把库摆错了位置。
+
+\begin{lstlisting}
+$ gcc -c main.c helper.c
+$ ar rcs libhelper.a helper.o
+$ gcc main.o -L. -lhelper -o app        # 正确：库在使用者之后
+$ gcc -L. -lhelper main.o -o app        # 经典错误：库扫描早于未解析符号出现
+/usr/bin/ld: main.o: in function `main':
+main.c:(.text+0x1f): undefined reference to `helper'
+collect2: error: ld returned 1 exit status
+\end{lstlisting}
+
+第一节那两个经典错误，在这里能看到完整成因。未定义引
+用：扫描结束而未定义集合非空——可能忘了给库，可能顺
+序错了，也可能库里确实没有这个名字；三重原因共用一个
+症状，排查时就按这三条挨个问。多重定义：两个输入各交
+出一个同名强定义，链接器无法裁决。边界情形也值得一
+记：两个弱定义不报错，链接器任取一个；一强一弱取强
+——这条规则正是库用弱符号提供可替换默认实现的依据。
+
+“用多少、取多少”的抽取粒度带来两个直接的工程后果。
+其一，只引用库里一个函数就只抽一个成员，所以
+\code{libc.a} 这类库把每个函数单独成目标文件（成员），静态链接出的
+可执行文件才不会把整个库背在身上。其二，抽取沿引用链
+传递：抽出的成员又引用别的成员会连锁抽取，所以被依赖
+的底层库（如 \code{-lm}）要放在命令行更靠后的位置。
+第三节会看到，动态库换了一套哲学：整个库先映射进内存
+再说，抽取问题让位给绑定问题。
+
+\topic{与处理器核心相关章节 ISA 寻址方式的关系}
+现在把镜头拉回处理器核心相关章节。那里讲指令编码时反复出现两类字
+段：立即数字段和地址/偏移字段——教学 ISA 里
+\code{JZ +3}、\code{JMP -5} 的偏移，x86-64 里
+\code{call} 的 rel32、RIP 相对寻址的 disp32、
+\code{movabs} 的 imm64。当时这些字段的值都由汇编器顺
+手算出；本章能看到它们的另一半来历：凡字段里出现名
+字，值就要等链接器。链接器填的正是处理器核心相关章节编码格式里那
+些 imm 与地址字段，一分不多，一分不少。
+
+两处约定遥相呼应。处理器核心相关章节的教学 ISA 规定“跳转目标等
+于本条地址加 1 加偏移”，x86-64 规定“目标等于下一条
+指令地址加 rel32”——同一个“相对下一条指令”的约
+定，一个定长一个变长而已。本节的公式 S+A−P 就是这个
+约定的代数形式：式中每个量都对应编码格式里一个具体的
+字段位置。学会读重定位记录，等于把处理器核心相关章节的指令编码又
+读了一遍，只是这次手里拿的是链接器的视角。
+
+还有一个细节能巩固这层对应。处理器核心相关章节给教学 ISA 定编码
+时，把立即数与偏移一律向低位对齐，理由是扩展逻辑单
+一；链接器面对的正是同一批低位字段——rel32 从指令的
+固定位开始占 4 字节，链接器只改写这 4 字节，绝不碰操
+作码与 ModRM。字段的位置由 ISA 定死，字段的值由链接
+器算定，双方各守一半约定，拼起来才是一条完整的指令。
+
+更完整地说，地址形成是一条跨越四个时刻的流水线，每个
+时刻各填各的字段：
+
+\begin{longtable}{L{0.1\linewidth}L{0.24\linewidth}L{0.52\linewidth}}
+\toprule
+时刻 & 谁定值 & 定什么 \\
+\midrule
+编译时 & 编译器/汇编器 & 字段的位置与格式、寄存器与寻址方式、重定位记录 \\\tablerowrule
+链接时 & 链接器 & 静态符号的地址：\code{call} 偏移、全局量位移、数据指针初值 \\\tablerowrule
+装载时 & 装载器/动态链接器 & 运行前才定的地址：库基址、GOT 条目（第三节） \\\tablerowrule
+运行时 & CPU 硬件 & 有效地址求和：基址+变址×比例+位移 \\
+\bottomrule
+\end{longtable}
+
+链接器坐在这条流水线的倒数第二站：它不管语法语义（那
+是编译前端的事），也不生成指令模板（那是编译后端的
+事），只管“名字到地址”的最后定值。说链接是 ISA 地
+址形成的最后一步，准确含义就在于此——处理器核心相关章节数据通路
+里那个“基址加变址乘比例加位移”的求和器，它的位移输
+入常常就是链接器在磁盘上写下的那个数。裸机世界同样成
+立：本书末章的教学计算机项目的镜像没有操作系统，链接脚本把节固定在物理地
+址上，重定位照算不误，S 与 P 只是换成了手工指定的
+值。从教学板到 Linux，这套机制是同一件事的两种装法。
+
+读懂这一层，链接错误就不再神秘：它是地址形成流水线倒
+数第二站的报错——某个名字走到这一站还没有地址，或者
+有两个地址。“装载与动态链接”一节进入最后一站：装载器把这张填好的地
+图铺进内存。
+
+\section{三、装载与动态链接}
+
+“链接：重定位与地址形成”一节结束时，磁盘上已经躺着一个地址全部定好的可执行文件：代码在 \code{0x401000} 附近，数据在 \code{0x403dd8} 附近，入口点写在文件头里。但它此刻还只是一串字节，离“正在运行的进程”还差最后一步，这一步由内核完成：\code{execve} 把文件变成进程，动态链接器把库接进来。本节回答两件事：内核装载时做了什么，以及为什么其中相当大的一部分被推迟到“第一次用到”的那一刻。
+
+先立一个总观点：装载不是搬运。直觉上“把程序装进内存”像一次大块复制——把文件读进 RAM，再跳过去执行；本书末章的教学计算机项目的面包板机把程序逐字节拨进 RAM，就是这种字面意义的装载。现代内核的做法不同：它只登记映射——“这段虚拟地址对应那个文件的这段字节”——真正的字节要等程序第一次访问那一页时，才由缺页异常从磁盘取回。把\hwkey{装载理解成建立映射而不是复制字节}，按需调页、写时复制、共享库就都是同一条逻辑的推论。
+
+\topic{execve 之后内核做的事}
+\code{execve} 是少数“成功后不返回”的系统调用：成功时原进程的地址空间被整个换掉，等它“返回”到用户态时，运行的已经是另一个程序。内核按固定顺序做四件事：读 ELF 头部与段表、按段表建立映射、准备栈、跳到入口。下面把它做完一遍。
+
+先把四步按执行先后画成一条流水线，“只登记、不搬字节”写在第二步上：
+
+\begin{pdfdiagram}
+  \node[hw memory, minimum width=5.2cm, align=center] (src) at (2.8,3.3) {磁盘上的 ELF 文件\\头部、段表、各节字节};
+  \node[hw compute, minimum width=5.2cm, align=center] (s1) at (2.8,2.1) {① 读头部：核对魔数与类型\\取入口 0x401040 与段表};
+  \node[hw compute, minimum width=5.2cm, align=center] (s2) at (2.8,0.8) {② 建映射：按 LOAD 段折算\\登记 vm\_area，不读字节};
+  \node[hw compute, minimum width=5.2cm, align=center] (s3) at (2.8,-0.5) {③ 备栈：字符串、argv/envp\\auxv，rsp 指向 argc};
+  \node[hw control, minimum width=5.2cm, align=center] (s4) at (2.8,-1.8) {④ 跳入口：rip ← 入口\\动态程序先跳 ld.so};
+  \draw[hw bus] (src.south) -- (s1.north);
+  \draw[hw bus] (s1.south) -- (s2.north);
+  \draw[hw bus] (s2.south) -- (s3.north);
+  \draw[hw bus] (s3.south) -- (s4.north);
+  % 右侧：装载产物
+  \node[hw state, minimum width=3.0cm, align=center] (proc) at (9.1,-0.5) {新进程\\地址空间备好\\等待首次缺页};
+  \draw[hw bus] (s4.east) -- (6.9,-1.8) -- (6.9,-0.5) -- (proc.west);
+\end{pdfdiagram}
+\diagramnote{\code{execve} 的四步流程（数值对应正文 \code{hello} 例）。内核核对魔数与类型后取出入口 \code{0x401040} 与段表，把每个 \code{LOAD} 段折算成一条映射登记下来——此时程序的一个字节都还没进内存；再把参数字符串、\code{argv}/\code{envp} 与辅助向量摆上栈顶，最后设置 \code{rip}：静态程序直指入口，动态程序先给动态链接器。四步几乎不搬数据，所以 \code{execve} 很快；失败时正常返回 \code{-1}，四步一件都没做。}
+
+第一件事，读头部。内核核对 ELF 魔数与机器类型，确认文件类型（\code{EXEC} 或 \code{DYN}），取出入口地址和程序头表（段表）。段表里的每个 \code{LOAD} 段回答一个问题：文件的哪一段字节，要以什么权限，出现在虚拟地址的哪一段。用 \code{readelf} 看一个典型小程序（节选 \code{LOAD} 段；数值为模拟，格式与真实输出一致）：
+
+\begin{lstlisting}
+$ readelf -l hello
+Elf file type is EXEC (Executable file)
+Entry point 0x401040
+There are 11 program headers, starting at offset 64
+
+Program Headers:
+  Type           Offset             VirtAddr           PhysAddr
+                 FileSiz            MemSiz             Flags  Align
+  LOAD           0x0000000000000000 0x0000000000400000 0x0000000000400000
+                 0x00000000000004f0 0x00000000000004f0 R      0x1000
+  LOAD           0x0000000000001000 0x0000000000401000 0x0000000000401000
+                 0x0000000000000195 0x0000000000000195 R E    0x1000
+  LOAD           0x0000000000002000 0x0000000000402000 0x0000000000402000
+                 0x0000000000000110 0x0000000000000110 R      0x1000
+  LOAD           0x0000000000002dd8 0x0000000000403dd8 0x0000000000403dd8
+                 0x0000000000000248 0x0000000000000250 RW     0x1000
+\end{lstlisting}
+
+第二件事，按段表建映射。把四个 \code{LOAD} 段逐段算账。第一段从文件偏移 0 映到 \code{0x400000}，ELF 头和程序头表都在其中。第二段是代码：文件区间 \code{[0x1000, 0x1195)} 映到 \code{[0x401000, 0x401195)}，\code{0x195} 即 405 字节，不足一页；内核按整页映射，页内超出段长的字节来自文件同页的对齐填充。入口 \code{0x401040} 就在这段内偏移 \code{0x40} 处。第三段是只读数据。第四段是可写数据：\code{MemSiz} 比 \code{FileSiz} 多出 8 字节，多出的部分就是 \code{.bss}——文件里不占字节，内存里必须是零；内核映完文件部分后把这 8 字节清零，若 \code{.bss} 大到跨页，整页挂匿名零页。
+
+\begin{longtable}{L{0.08\linewidth}L{0.26\linewidth}L{0.24\linewidth}L{0.32\linewidth}}
+\toprule
+段 & 文件偏移→虚拟地址 & 字节数（文件→内存） & 权限与内容 \\
+\midrule
+1 & \code{0x0000}→\code{0x400000} & \code{0x4f0}→\code{0x4f0} & 只读：ELF 头、段表、\code{.interp} \\\tablerowrule
+2 & \code{0x1000}→\code{0x401000} & \code{0x195}→\code{0x195} & 读/执行：\code{.text}，入口在其中 \\\tablerowrule
+3 & \code{0x2000}→\code{0x402000} & \code{0x110}→\code{0x110} & 只读：\code{.rodata} \\\tablerowrule
+4 & \code{0x2dd8}→\code{0x403dd8} & \code{0x248}→\code{0x250} & 读写：\code{.data} 与 \code{.bss}，多出 8 字节清零 \\
+\bottomrule
+\end{longtable}
+
+每个 \code{LOAD} 段还满足一条同余：虚拟地址与文件偏移模页长同余——\code{0x403dd8} 与 \code{0x2dd8} 模 \code{0x1000} 都余 \code{0xdd8}。这不是巧合：只有页内偏移一致，一个文件页才能原样映到一个虚拟页上，内核不必做任何搬移对齐。“链接：重定位与地址形成”一节的链接器在定址时就按这条约束摆段：链接不仅决定“放在哪个地址”，还决定“按页怎样对齐”。
+
+映射在内核里的形态是一张映射表（\code{vm\_area\_struct} 的集合），每条记录由段表折算而来。注意这张表是登记簿而非内容：此时程序的一个字节都还没进内存。
+
+\begin{longtable}{L{0.20\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
+\toprule
+字段 & 含义 & 本例第四段的值 \\
+\midrule
+起止地址 & 虚拟地址区间 & \code{[0x403dd8, 0x404028)} \\\tablerowrule
+权限 & 读/写/执行 & 读、写 \\\tablerowrule
+来源 & 文件加偏移，或匿名 & \code{hello} 偏移 \code{0x2dd8} \\\tablerowrule
+补齐规则 & 段尾不足一页如何处理 & 超出 \code{FileSiz} 的部分清零 \\
+\bottomrule
+\end{longtable}
+
+第三件事，准备栈。内核把命令行参数和环境变量的字符串复制到新地址空间的栈顶，再向下摆辅助向量、\code{envp} 和 \code{argv} 指针数组，最后把 \code{rsp} 指向 \code{argc}：
+
+\begin{lstlisting}
+high  strings: "./hello\0" "world\0" "PATH=/usr/bin\0" ...
+      alignment padding; rsp ends 16-byte aligned
+      AT_NULL
+      auxv pairs: AT_PAGESZ=4096, AT_ENTRY=0x401040,
+                  AT_PHDR=0x400040, ...
+      envp: NULL, ptr -> envp strings ...
+      argv: NULL, ptr -> "world", ptr -> "./hello"
+low   rsp -> argc = 2
+\end{lstlisting}
+
+辅助向量（auxiliary vector）是内核留给用户态的小抄：\code{AT\_PAGESZ} 告诉 libc 页长是 4096；\code{AT\_PHDR} 告诉动态链接器段表映在哪里——\code{0x400040} 的来历很直接，ELF 头长 64 字节（\code{0x40}），程序头表紧跟其后，第一段又从 \code{0x400000} 开始映射，所以表在 \code{0x400040}；\code{AT\_ENTRY} 就是文件头里的入口 \code{0x401040}。\code{argc}/\code{argv}/\code{envp} 的摆法则与处理器核心相关章节的栈约定一脉相承：指针数组以 \code{NULL} 结尾，字符串本体在栈顶，\code{rsp} 保持 16 字节对齐。
+
+第四件事，跳到入口。静态链接程序的 \code{rip} 直接设为入口地址；动态链接程序则先映射 \code{.interp} 段指定的动态链接器 \code{/lib64/ld-linux-x86-64.so.2}，\code{rip} 指向它的入口，由它装载共享库、做完装载时重定位，最后才跳到 \code{0x401040}——本节第四、五个主题就发生在它身上。
+
+装载完成后，这套映射从用户态可以直接核对：\code{/proc} 把它原样摆出来。逐项对照段表，能看到每个 \code{LOAD} 段变成一行，以及段表里没有的 libc 和栈：
+
+\begin{lstlisting}
+$ cat /proc/742/maps
+00400000-00401000 r--p 00000000 08:01 131073    /home/user/hello
+00401000-00402000 r-xp 00001000 08:01 131073    /home/user/hello
+00402000-00403000 r--p 00002000 08:01 131073    /home/user/hello
+00403000-00404000 r--p 00002000 08:01 131073    /home/user/hello
+00404000-00405000 rw-p 00003000 08:01 131073    /home/user/hello
+7f9a3c090000-7f9a3c22c000 r-xp 00000000 08:01 262146   /lib/x86_64-linux-gnu/libc.so.6
+7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0        [stack]
+\end{lstlisting}
+
+第四段的兑现方式值得多看一眼：它跨两页，第一页 \code{0x403000} 映的是文件页 \code{0x2000}——同一个文件页也映在第三段的 \code{0x402000}，两处只读映射共享同一个物理页；这页里混着 \code{.rodata} 的尾巴和 \code{.data} 的头——链接器把这段重定位之后不再改写的数据按 RELRO 归进只读段，映射是纯只读的：写入不会触发写时复制，只会吃到一个 SIGSEGV。需要运行期改写的 GOT 条目放在 \code{0x404000}，那页才是可写页。映射表把“一页一个权限、一页一个来源”表达得清清楚楚。
+
+把这套映射从低地址到高地址画成一张布局图，段表到页表的折算链放在右侧：
+
+\begin{pdfdiagram}
+  % 左列：地址空间布局（上高下低）
+  \node[hw label] at (1.5,5.7) {高地址};
+  \node[hw memory, minimum width=3.4cm] (stk) at (1.5,5.0) {栈 [stack]，向下增长};
+  \node[hw memory, minimum width=3.4cm] (lib) at (1.5,3.8) {共享库映射（libc）};
+  \node[hw label] at (1.5,3.2) {（未映射空洞）};
+  \node[hw memory, minimum width=3.4cm] (heap) at (1.5,2.6) {堆，向上增长（brk）};
+  \node[hw compute, minimum width=3.4cm] (dseg) at (1.5,1.5) {.data/.bss：段 4，读写};
+  \node[hw compute, minimum width=3.4cm] (rseg) at (1.5,0.5) {.rodata：段 3，只读};
+  \node[hw compute, minimum width=3.4cm] (tseg) at (1.5,-0.5) {.text：段 2，读/执行};
+  \node[hw state, minimum width=3.4cm] (hseg) at (1.5,-1.5) {ELF 头/段表：段 1，只读};
+  \node[hw label] at (1.5,-2.2) {低地址 \code{0x400000}};
+  % 右列：段表 LOAD 段 → 映射条目 → 页表项
+  \node[hw state, minimum width=1.9cm] (l4) at (5.6,1.5) {LOAD 4：RW};
+  \node[hw state, minimum width=1.9cm] (l3) at (5.6,0.5) {LOAD 3：R};
+  \node[hw state, minimum width=1.9cm] (l2) at (5.6,-0.5) {LOAD 2：R+E};
+  \node[hw state, minimum width=1.9cm] (l1) at (5.6,-1.5) {LOAD 1：R};
+  \draw[hw bus] (l4.west) -- (dseg.east);
+  \draw[hw bus] (l3.west) -- (rseg.east);
+  \draw[hw bus] (l2.west) -- (tseg.east);
+  \draw[hw bus] (l1.west) -- (hseg.east);
+  % 共享竖直干线汇入映射条目
+  \draw[BookMuted, line width=0.62pt] (l1.east) -- (6.85,-1.5);
+  \draw[BookMuted, line width=0.62pt] (l2.east) -- (6.85,-0.5);
+  \draw[BookMuted, line width=0.62pt] (l3.east) -- (6.85,0.5);
+  \draw[BookMuted, line width=0.62pt] (l4.east) -- (6.85,1.5);
+  \draw[BookMuted, line width=0.62pt] (6.85,-1.5) -- (6.85,1.5);
+  \node[hw state, minimum width=1.7cm] (vma) at (8.15,0.0) {映射条目\\vm\_area};
+  \node[hw control, minimum width=1.7cm] (pte) at (10.35,0.0) {页表项\\按需填入};
+  \draw[hw bus] (6.85,0.0) -- (vma.west);
+  \draw[hw return] (vma.east) -- node[hw label, above, yshift=10pt]{缺页时填} (pte.west);
+\end{pdfdiagram}
+\diagramnote{进程地址空间从低地址到高地址的布局（对应正文 \code{hello} 例）：主程序四个 \code{LOAD} 段从 \code{0x400000} 起依次排开，堆紧随其后向上增长，共享库映在 \code{0x7f...} 区间，栈在最高处向下增长，各区之间隔着未映射的空洞。右侧是同一张地图的折算链：装载时内核把 \code{LOAD} 段折算成映射条目登记下来，页表项则等某页第一次被访问、触发缺页时才填入——装载只建映射，不读字节。}
+
+顺带把四件事摆成一张表，作为本主题的总览：
+
+\begin{longtable}{L{0.14\linewidth}L{0.44\linewidth}L{0.32\linewidth}}
+\toprule
+步骤 & 内核动作 & 可观察处 \\
+\midrule
+读头部 & 核对魔数与类型，取入口地址与段表 & \code{readelf -h}、\code{readelf -l} \\\tablerowrule
+建映射 & 按 \code{LOAD} 段登记映射，不读字节 & \code{/proc/PID/maps} \\\tablerowrule
+准备栈 & 复制字符串，摆 \code{argc}/\code{argv}/\code{envp}/auxv & 调试器里查看栈顶 \\\tablerowrule
+跳入口 & \code{rip} 指向动态链接器或入口地址 & \code{strace} 中 \code{execve} 后的 \code{mmap} \\
+\bottomrule
+\end{longtable}
+
+还有两张表容易混淆，要分清：段表（程序头表）是给装载器看的，节表是给链接器和调试器看的。\code{strip} 把节表整个剥掉，程序照样运行——装载只需要段表；反过来，段表若损坏，内核连映射都建不起来。此外 \code{execve} 有一类“不换”的东西：文件描述符、进程号、工作目录跨 exec 保留，地址空间全换而它们不换——shell 的重定向正是靠“fork 之后、exec 之前先换描述符”实现的。
+
+工程含义只有一句：\code{execve} 本身很快，因为它几乎不搬数据。等 \code{rip} 指向 \code{0x401040} 的第一次取指触发缺页，程序的第一页才真正进内存。把装载从搬运改成建映射，是本节后面全部机制的地基。
+
+补一个反例帮助记忆：\code{execve} 失败时（文件不存在、格式不对、权限不足）正常返回 \code{-1}，原进程的地址空间分毫不动——四件事一件都没做。“成功后不返回”因此也可以反着读：只要它返回了，就一定没成功。
+
+\begin{warningbox}
+把装载想成“把程序读进内存”是最常见的误判。按这个模型，fork 之后 exec 前要复制全部分页、程序越大启动越慢、共享库无从谈起——每一条都与观察相反。修正办法是把单位想清楚：内核登记的对象是映射条目和页表项，不是字节；字节只在被访问到时才流动。
+\end{warningbox}
+
+\topic{写时复制与按需调页}
+fork 的语义是复制整个地址空间，而几乎每个 shell 命令的出生都是 fork 紧跟 exec——若真复制，这将是全系统最昂贵的动作之一。两个机制把它变便宜，它们共用同一个驱动器：经典芯片与平台案例的页错误硬件。
+
+写时复制（copy-on-write）：fork 时内核不复制任何页，只把父进程所有私有可写页在双方页表里都改成只读，父子页表指向同一批物理页。此后任何一方写入都会触发页错误——用经典芯片与平台案例的三问来读：页存在（P=1）、是写访问、权限不允许写——内核据此知道这不是真错误，而是该复制了：分配一个新页，把旧页内容抄过去，写入方的页表项指向新页并恢复可写；若某页只剩一个引用方，直接改回可写，连复制都省。读访问永远不触发复制。
+
+把 fork 前后的页表画成三格，写时复制的全部动作就在其中：
+
+\begin{pdfdiagram}
+  % 三格：fork 后 / 写入触发 / 拆页后
+  \node[hw label] at (1.6,2.62) {fork 后：共享只读};
+  \node[hw label] at (5.4,2.62) {写入触发：页错误};
+  \node[hw label] at (9.2,2.62) {拆页后：各自独立};
+  \draw[BookMuted, line width=0.5pt, dashed] (3.7,-0.6) -- (3.7,2.35);
+  \draw[BookMuted, line width=0.5pt, dashed] (7.5,-0.6) -- (7.5,2.35);
+  % 格一：fork 后，双方只读共享同一物理页
+  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (f1) at (0.75,1.5) {父页表项\\只读};
+  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (c1) at (0.75,0.2) {子页表项\\只读};
+  \node[hw memory, minimum width=1.15cm, minimum height=1.6cm] (p1) at (2.75,0.85) {物理页 A};
+  \draw[hw bus] (f1.east) -| (p1.north);
+  \draw[hw bus] (c1.east) -| (p1.south);
+  % 格二：父写入，撞上只读权限，触发页错误
+  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (f2) at (4.55,1.5) {父页表项\\只读};
+  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (c2) at (4.55,0.2) {子页表项\\只读};
+  \node[hw memory, minimum width=1.15cm, minimum height=1.6cm] (p2) at (6.55,0.85) {物理页 A};
+  \draw[hw bus] (f2.east) -| (p2.north);
+  \draw[hw bus] (c2.east) -| (p2.south);
+  \draw[hw danger] (4.55,2.4) -- (f2.north);
+  \node[hw label, anchor=west] at (4.72,2.15) {父写入};
+  % 格三：拆页后，父指新页可写，子仍指旧页
+  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (f3) at (8.35,1.5) {父页表项\\可写};
+  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (c3) at (8.35,0.2) {子页表项\\只读};
+  \node[hw memory, minimum width=1.15cm, minimum height=0.75cm] (p3n) at (10.35,1.5) {新页 A$'$};
+  \node[hw memory, minimum width=1.15cm, minimum height=0.75cm] (p3o) at (10.35,0.2) {物理页 A};
+  \draw[hw bus] (f3.east) -- (p3n.west);
+  \draw[hw bus] (c3.east) -- (p3o.west);
+\end{pdfdiagram}
+\diagramnote{写时复制的三幕。fork 后：父子页表项指向同一批物理页，双方都标只读，复制量为零。写入触发：任何一方写共享页都会撞上只读权限，页错误硬件把这次写截住，内核据此知道该拆页了。拆页后：内核分配新页、抄好内容，写入方的页表项改指新页并恢复可写，另一方仍指旧页——复制只发生在被写的那一页上。}
+
+算一笔账：父进程有 5120 个可写私有页，共 $5120\times4\ \text{KiB}=20\ \text{MiB}$；立即复制要搬 20 MiB 并改 5120 条页表项，写时复制只改 5120 条页表项。若子进程在 exec 前只写 200 页，实际复制 $200\times4\ \text{KiB}=800\ \text{KiB}$，约为 20 MiB 的 $4\%$；而 fork 后立刻 \code{execve} 的场合，子进程写的页屈指可数，复制量几乎为零。
+
+历史上这条路走了三段：早期 Unix 的 fork 真的逐页复制，代价随地址空间线性增长；BSD 曾引入 \code{vfork} 作为权宜——子进程借用父进程的地址空间直到 exec，父进程全程冻结，语义脆弱；写时复制普及之后，\code{vfork} 这类绕道基本退场，fork 回到“语义最贵、实现最便宜”的状态。
+
+按需调页（demand paging）是同一思路在装载一侧的应用：上一主题说装载只登记映射，映射的兑现靠缺页。CPU 访问一个存在位为 0 的页，触发页错误，CR2 保存故障地址；内核查映射表，发现该地址属于某文件的某段，就分配物理页、从磁盘读入对应文件页、填好页表项，再重新执行被中断的那条指令。对程序完全透明：它只看到访问成功，只是这一次慢了若干数量级。
+
+再算一笔账：一个 200 MiB 映像共 $200\ \text{MiB}\div4\ \text{KiB}=51200$ 页的程序，启动到 \code{main} 实际触及约 500 页，即 $500\times4096=2\,048\,000$ 字节，约 2 MiB——整个映像的 $1\%$。这就是大程序启动快的原因：启动成本与实际触及的页数成正比，与文件总大小几乎无关。没碰的页不读，几百 MiB 的程序也能在一秒内开窗。
+
+缺页的三种结局值得并排看，因为它们是同一条检查链的三个出口：
+
+\begin{longtable}{L{0.16\linewidth}L{0.44\linewidth}L{0.30\linewidth}}
+\toprule
+结局 & 内核的发现与动作 & 程序看到什么 \\
+\midrule
+文件页 & 地址在某文件映射内，从文件读入该页 & 访问成功，仅这一次慢 \\\tablerowrule
+匿名零页 & 地址在 \code{.bss}、堆或栈映射内，挂零页 & 访问成功，读到 0 \\\tablerowrule
+非法访问 & 地址不属于任何映射 & 收到 SIGSEGV（第四节） \\
+\bottomrule
+\end{longtable}
+
+按需调页还有一个对偶动作：换出。物理页紧张时，内核把久未访问的匿名页写到交换区，把对应页表项标为不存在；下次访问触发缺页，再把它读回来。于是“页错误”成了统一的内存入口——文件页、零页、交换页都从它进来，虚拟内存因此可以大于物理内存。每个物理页上的引用计数则回答另一个问题：这页被几方共享，写时复制要不要真拆。
+
+\begin{longtable}{L{0.14\linewidth}L{0.28\linewidth}L{0.26\linewidth}L{0.22\linewidth}}
+\toprule
+方案 & 复制发生在何时 & 复制多少 & 页表改动 \\
+\midrule
+立即复制 & fork 当场 & 全部可写页 & 新建整套 \\\tablerowrule
+写时复制 & 第一次写某页 & 仅被写的页 & 双方先改只读 \\\tablerowrule
+按需调页 & 第一次访问某页 & 仅被访问的页 & 缺页时填一条 \\
+\bottomrule
+\end{longtable}
+
+缺页成本可以按页的来源分档，这也是 \code{/usr/bin/time -v} 里两类缺页计数的含义：
+
+\begin{longtable}{L{0.22\linewidth}L{0.40\linewidth}L{0.28\linewidth}}
+\toprule
+类型 & 页从哪来 & 典型量级 \\
+\midrule
+次要缺页（minor） & 页已在内存缓存，只需填页表项 & 亚微秒 \\\tablerowrule
+主要缺页（major） & 从磁盘读入文件页 & 几十微秒（SSD） \\\tablerowrule
+换入 & 从交换区读回 & 几十到几百微秒 \\
+\bottomrule
+\end{longtable}
+
+\begin{lstlisting}
+$ /usr/bin/time -v ./hello
+hello, world
+        ...
+        Minor (reclaiming a frame) page faults: 152
+        Major (requiring I/O) page faults: 3
+\end{lstlisting}
+
+内核还会顺势多走一步：缺页读盘时通常顺带读入后续若干页（预读），因为程序访问文件页往往有明显的顺序性——用一次磁盘事务换掉后面的若干次缺页，这正是存储与设备事务相关章节“突发传输比单拍省事务”的同一思想。观察侧的对应概念是常驻集（RSS）：进程实际占着的物理页数。一个 200 MiB 映像的程序启动后 RSS 只有几 MiB，这个差值就是按需调页最直白的观察。
+
+两个机制是同一骨架的两端：都把工作推迟到第一次真正需要时，都由页错误驱动。工程推论同样直接：缺页对程序不可见但真实耗时——磁盘取页约几十微秒，页仍在内存缓存则亚微秒——于是有了预热、内存锁定、大页这类“提前把页备好”的手段；一张 2 MiB 大页把 $2\ \text{MiB}\div4\ \text{KiB}=512$ 次缺页合并成 1 次，存储与外设队列案例谈延迟与队列的视角在这里同样适用。
+
+\topic{动态库的优势与代价}
+“链接：重定位与地址形成”一节的链接把全部代码装订进可执行文件，那是静态链接。动态链接把一部分装订推迟到装载时：可执行文件里只记录“我需要 \code{libc.so.6} 里的 \code{printf}”，真正的代码躺在系统里所有进程共享的库文件中。用 \code{readelf -d} 能看到这份“我需要谁”的清单（动态段，输出为模拟节选）：
+
+\begin{lstlisting}
+$ readelf -d hello | head -4
+Dynamic section at offset 0x2dd8 contains 25 entries:
+  Tag        Type                         Name/Value
+ 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
+\end{lstlisting}
+
+收益一，共享代码页：libc 的代码段在全部进程间共享一份物理页。算一笔账：libc 代码段约 1.6 MiB（上面 maps 里的 \code{0x19c000} 字节），系统里 300 个进程都用它；静态链接意味着 300 份副本共约 480 MiB，动态链接意味着内存里一份 1.6 MiB（每进程另有少量私有数据页），差约 300 倍。共享成立的条件是代码页只读：谁也不写它，写时复制就不会把共享页拆成私有页。第五个主题会看到，这条约束反过来决定了位置无关代码的形状。
+
+把“共享一份代码页”画成页表指向图，三百倍的差距就写在两组指针上：
+
+\begin{pdfdiagram}
+  % 左列：两个进程的页表
+  \node[hw state, align=center, minimum width=3.4cm] (pa) at (0,1.4) {进程 A 页表\\代码页项（只读）\\虚拟 0x7f9a3c090000};
+  \node[hw state, align=center, minimum width=3.4cm] (pb) at (0,-1.4) {进程 B 页表\\代码页项（只读）\\虚拟地址另一基址};
+  % 右列：物理页
+  \node[hw memory, align=center, minimum width=3.6cm, minimum height=2.6cm] (phys) at (8.6,0) {物理内存\\libc 代码页一份\\约 1.6 MiB};
+  \draw[hw bus] (pa.east) -- (5.2,1.4) -- (5.2,0.5) -- ($(phys.west)+(0,0.5)$);
+  \draw[hw bus] (pb.east) -- (5.2,-1.4) -- (5.2,-0.5) -- ($(phys.west)+(0,-0.5)$);
+  \node[hw label, fill=white, inner sep=1pt] at (4.3,0) {同一批物理页};
+  % 私有数据页对照
+  \node[hw compute, align=center, minimum width=3.6cm] (priv) at (8.6,-2.6) {各进程私有数据页\\每进程一份};
+  \node[hw label, align=center] at (2.4,-2.9) {300 个进程：静态 300 份约 480 MiB，\\动态链接内存里一份 1.6 MiB};
+\end{pdfdiagram}
+\diagramnote{动态库的共享代码页。两个进程的页表各自把不同的虚拟地址映射到同一批 libc 物理页——代码段约 1.6 MiB，全系统只有一份；300 个进程时，静态链接要 300 份副本共约 480 MiB，动态链接只要一份（每进程另有少量私有数据页），差约 300 倍。共享成立的条件是页面只读：谁也不写它，写时复制就不会把共享页拆成私有页。}
+
+收益二，升级不重链：修复 libc 的一个缺陷，只需替换库文件本身，下次启动的程序自动用新版；静态链接则必须重新链接并重新分发每一个程序。安全补丁的分发成本因此从“重发所有程序”变成“重发一个库”。文件名里的“\code{.6}”是主版本号：它承诺二进制接口（ABI）不变，只有不兼容时才进位——libc 的主版本号已经二十多年停在 6，于是一个安全更新可以直接替换同名文件。
+
+主版本号管不了的演化，由符号版本接着管：同一个 \code{printf} 在 libc 里带着版本标签 \code{GLIBC\_2.2.5}，可执行文件记录的不仅是“要 \code{printf}”，还有“要哪个版本的 \code{printf}”。于是同一个 \code{libc.so.6} 可以在内部继续演化，老程序拿到的仍是当年那个语义的符号。
+
+\begin{lstlisting}
+$ readelf -sW /lib/x86_64-linux-gnu/libc.so.6 | grep -w printf
+  1402: 00000000000645e0  137 FUNC   GLOBAL DEFAULT  15 printf@@GLIBC_2.2.5
+\end{lstlisting}
+
+还有一条更晚的定址时机值得一提：\code{dlopen}/\code{dlsym} 把“装载一个库”推迟到运行中的任意时刻，插件机制全靠它——浏览器加载扩展、文本编辑器加载语法插件，都是程序自己请动态链接器中途再接一个库进来。链接的三档时机（编译链接时、装载时、运行时）至此全部到齐。
+
+代价同样明确。其一，装载时重定位：库内部对数据和函数的引用在基址确定之前是半成品，装载时要按“基址加偏移”把 GOT 等表项逐条填好，库越多表越长。其二，间接跳转：跨模块调用不能用直接 \code{call}，要经 PLT/GOT 间接一级，每次调用多一次内存间接。其三，依赖管理：“升级不重链”的另一面是“库变了程序没重编”，二进制接口兼容因此成为发行版甩不掉的长期负担。
+
+\begin{longtable}{L{0.16\linewidth}L{0.37\linewidth}L{0.37\linewidth}}
+\toprule
+方面 & 静态链接 & 动态链接 \\
+\midrule
+代码份数 & 每进程一份副本 & 全系统共享一份代码页 \\\tablerowrule
+升级 & 重新链接并分发每个程序 & 替换库文件即可 \\\tablerowrule
+启动前工作 & 无 & 映射库、按基址修补重定位表 \\\tablerowrule
+调用开销 & 直接 \code{call} & PLT/GOT 间接一次 \\\tablerowrule
+文件体积 & 大，自带全部代码 & 小，只记依赖名 \\
+\bottomrule
+\end{longtable}
+
+顺带说明，静态链接并没有被淘汰：容器镜像和嵌入式固件反而偏爱它——一个自包含、零依赖的二进制，拷到任何机器上都能跑，这正是用磁盘体积换部署确定性。推到极限，本书末章的教学计算机项目的裸机镜像就是“终极静态链接”：连操作系统都链在同一个映像里，没有任何运行期依赖可言。
+
+\topic{PLT/GOT 的延迟绑定}
+动态链接的程序调用 \code{printf} 时，目标地址在链接时还不在本文件里。链接器的办法是两级间接：\code{call} 先到本模块内一小段固定桩（PLT 项），桩里是一条间接跳转，跳的目标写在 GOT 表项里；GOT 是可写数据，真实地址由装载时或运行时填入。这样代码段保持只读可共享，所有需要修补的地址集中在一小张表里。
+
+为什么不干脆在装载时改写 \code{call} 指令的目标？因为那要写代码页：代码页一变脏，写时复制立刻把共享页拆成私有页，共享库和下一主题的 ASLR 一起失效。PLT/GOT 的全部存在理由就是八个字：代码不动，数据可改——代码段一个字节不动，所有可写的定址信息集中到数据段的一张表。
+
+\begin{lstlisting}
+        call  printf@plt              ; call site in main
+
+plt0:                                 ; 0x401020
+        push  qword ptr [rip+0x2fe2]  ; GOT[1] = link_map
+        jmp   qword ptr [rip+0x2fe4]  ; GOT[2] = _dl_runtime_resolve
+printf@plt:                           ; 0x401030
+        jmp   qword ptr [rip+0x2fe2]  ; GOT[3] at 0x404018
+        push  0                       ; relocation index of printf
+        jmp   plt0
+\end{lstlisting}
+
+把一次 \code{printf} 调用的两级跳走读一遍。第一级是静态的：\code{call printf@plt} 跳到 \code{0x401030}。第二级是动态的：桩里 \code{jmp qword ptr [rip+0x2fe2]} 是 rip 相对寻址，指令长 6 字节，下一条指令在 \code{0x401036}，所以表项地址是 \code{0x401036 + 0x2fe2 = 0x404018}，即 GOT[3]；\code{plt0} 的两条同理，分别指向 GOT[1] 与 GOT[2]，读者可自行核对 \code{0x401026 + 0x2fe2 = 0x404008}、\code{0x40102c + 0x2fe4 = 0x404010}。
+
+第一次调用时，GOT[3] 里装的是 \code{0x401036}——桩里那条 \code{jmp} 的下一条指令自己，这次间接跳等于原地踏步；顺序执行 \code{push 0}（\code{printf} 的重定位下标）和 \code{jmp plt0}，\code{plt0} 把 \code{link\_map} 压栈后跳进动态链接器的解析例程。解析器按下标找到符号名 \code{printf}，在 libc 里查出真实地址（设为 \code{0x7f9a3c0f45e0}），写进 GOT[3]，再直接调进 \code{printf}。第二次调用只剩两条指令：\code{call} 进桩，\code{jmp [0x404018]} 直达 \code{0x7f9a3c0f45e0}，一次内存间接，没有任何解析。
+
+把两次调用画成两条分开的路径，第一次的解析绕路与之后的一跳直达，差别一眼可见：
+
+\begin{pdfdiagram}
+  % 上路：首次调用，经解析例程并回写 GOT
+  \node[hw label, anchor=west] at (0.05,3.6) {首次调用：解析并回写 GOT};
+  \node[hw compute, minimum width=1.7cm] (callA) at (0.9,2.8) {call printf@plt};
+  \node[hw compute, minimum width=1.5cm] (pltA) at (2.9,2.8) {PLT 桩};
+  \node[hw memory, minimum width=2.2cm] (gotA) at (5.2,2.8) {GOT[3]：\\指回桩内};
+  \node[hw compute, minimum width=1.6cm] (plt0) at (7.5,2.8) {plt0\\公共桩};
+  \node[hw control, minimum width=1.9cm] (res) at (9.8,2.8) {动态链接器\\解析例程};
+  \node[hw compute, minimum width=1.8cm] (fnA) at (9.8,1.3) {printf 本体};
+  \draw[hw bus] (callA) -- (pltA);
+  \draw[hw bus] (pltA) -- (gotA);
+  \draw[hw bus] (gotA) -- (plt0);
+  \draw[hw bus] (plt0) -- (res);
+  \draw[hw bus] (res.south) -- node[hw label, left]{调入} (fnA.north);
+  % 回写 GOT：从解析例程下方绕到 gotA.south，避开 plt0 与 fnA
+  \draw[hw return] (res.west) -- (8.7,2.8) -- (8.7,2.0) -- (5.2,2.0) -- (gotA.south);
+  \node[hw label, fill=white, inner sep=1pt] at (7.0,2.0) {写回真实地址};
+  % 下路：第二次及以后，一次间接直达
+  \node[hw label, anchor=west] at (0.05,0.8) {第二次及以后：一跳直达};
+  \node[hw compute, minimum width=1.7cm] (callB) at (0.9,0.0) {call printf@plt};
+  \node[hw compute, minimum width=1.5cm] (pltB) at (2.9,0.0) {PLT 桩};
+  \node[hw memory, minimum width=2.2cm] (gotB) at (5.2,0.0) {GOT[3]：\\真实地址};
+  \node[hw compute, minimum width=1.8cm] (fnB) at (8.0,0.0) {printf 本体};
+  \draw[hw bus] (callB) -- (pltB);
+  \draw[hw bus] (pltB) -- (gotB);
+  \draw[hw bus] (gotB) -- node[hw label, below]{直达} (fnB);
+\end{pdfdiagram}
+\diagramnote{PLT/GOT 两级间接的两条路径。首次调用时 GOT 表项指回桩内，流程经公共桩进入动态链接器的解析例程，查出真实地址后先写回 GOT 表项（虚线）再调入函数本体；此后每次调用只剩 \code{call} 进桩、桩内经 GOT 一次间接跳直达。代码段自始至终不被改写，可写的定址信息全部集中在 GOT 这张表里。}
+
+把首次调用绕进解析例程的那一段再放大一级，ld.so 被触发后的完整路径是“查、写、跳”三步：
+
+\begin{pdfdiagram}
+  % 上行：经两级桩进入解析例程
+  \node[hw compute, minimum width=1.9cm, align=center] (n1) at (1.0,1.2) {printf@plt\\push 下标 0};
+  \node[hw compute, minimum width=1.9cm, align=center] (n2) at (3.3,1.2) {plt0\\push link\_map};
+  \node[hw control, minimum width=2.3cm, align=center] (n3) at (5.85,1.2) {动态链接器\\\_dl\_runtime\_resolve};
+  \node[hw memory, minimum width=2.6cm, align=center] (n4) at (8.9,1.2) {按 .dynsym 查到\\printf 真实地址};
+  % 下行：回写 GOT，再直接调入
+  \node[hw memory, minimum width=3.2cm, align=center] (n5) at (8.9,-0.7) {GOT[3] $\leftarrow$ 0x7f9a3c0f45e0\\回写表项};
+  \node[hw compute, minimum width=2.6cm, align=center] (n6) at (4.6,-0.7) {跳入 printf 本体\\解析不再发生};
+  \draw[hw bus] (n1.east) -- (n2.west);
+  \draw[hw bus] (n2.east) -- (n3.west);
+  \draw[hw bus] (n3.east) -- (n4.west);
+  \draw[hw return] (n4.south) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{写回} (n5.north);
+  \draw[hw bus] (n5.west) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{直接调入} (n6.east);
+\end{pdfdiagram}
+\diagramnote{首次调用时动态链接器的解析路径（数值对应正文 \code{printf} 例）。桩先压入重定位下标 0，公共桩 \code{plt0} 再压入 \code{link\_map}，跳进解析例程；例程按下标找到符号名 \code{printf}，在 libc 中查出真实地址 \code{0x7f9a3c0f45e0}，写进 \code{0x404018} 处的 GOT[3]（虚线回写），最后直接调入函数本体。这张表项填好之后，第二次调用只剩桩内一次间接跳，解析路径被完全绕过。}
+
+\begin{longtable}{L{0.16\linewidth}L{0.37\linewidth}L{0.37\linewidth}}
+\toprule
+检查点 & 第一次调用 & 第二次及以后 \\
+\midrule
+GOT[3] 内容 & \code{0x401036}（桩内下一条） & \code{0x7f9a3c0f45e0}（真实地址） \\\tablerowrule
+经过路径 & 桩→\code{plt0}→解析器→\code{printf} & 桩→\code{printf} \\\tablerowrule
+关键动作 & 查符号、写 GOT[3] & 无 \\\tablerowrule
+预期开销 & 一次符号查找，微秒级 & 一次间接跳，纳秒级 \\
+\bottomrule
+\end{longtable}
+
+PLT 与 GOT 的分工可以列成一张对照：
+
+\begin{longtable}{L{0.16\linewidth}L{0.18\linewidth}L{0.26\linewidth}L{0.30\linewidth}}
+\toprule
+对象 & 所在段 & 可写性 & 内容由谁何时填 \\
+\midrule
+PLT 桩 & 代码段 & 只读 & 链接器静态生成，运行期不变 \\\tablerowrule
+GOT 表项 & 数据段 & 可写（见下） & 动态链接器按基址与符号填 \\
+\bottomrule
+\end{longtable}
+
+GOT 的“可写”本身是一个攻击面：谁改写了 GOT[3]，谁就把下一次 \code{printf} 调用拐到自己选的地方。对策叫全 RELRO：装载时用 \code{LD\_BIND\_NOW} 把全部符号解析完，然后把 GOT 所在页改回只读——用启动时间换“运行期不可覆写”。这与上一个主题“代码页只读才能共享”是同一条纪律的延伸：凡是可被写的定址信息，要么推迟到必要时再写，要么写完立刻封死。
+
+这种“第一次才解析”的做法叫懒绑定（lazy binding）。它的收益可以用数字说话：一个中型程序导入约 1200 个动态符号，典型启动路径只用其中约 150 个，懒绑定让启动时省掉约 1050 次符号查找——每次查找都要算哈希、比字符串、写表项。对短生命进程（脚本里一闪而过的每个命令）省得更多：大量导入函数整个生命期一次都没被调用。代价是第一次调用某个函数时有一次不可预测的解析延迟；实时系统可以设 \code{LD\_BIND\_NOW=1}，装载时把全部符号解析完，用启动时间换运行期的确定性。还要记住分工：桩和 GOT 的骨架、GOT 的初值，都是“链接：重定位与地址形成”一节的链接器在静态时就排好的局，动态链接器运行期只做“填表”这一件事。
+
+\topic{ASLR 与装载时重定位}
+前面例子的地址全是固定的：代码在 \code{0x401000}，GOT 在 \code{0x404000}。固定地址对攻击者同样是固定的：栈溢出拿到 \code{rip} 控制权后，只要知道 libc 里 \code{system} 或某条指令片段的地址，就能拼接利用。地址空间布局随机化（ASLR）的对策是让每次运行的基址都不同：栈、堆、mmap 区和共享库各加一个随机偏移；编译成位置无关可执行文件（PIE）时，连主程序自己的基址也随机。同一个程序连跑两次：
+
+\begin{lstlisting}
+$ ./showaddr                       $ ./showaddr
+main   = 0x555555555149            main   = 0x555555e8e149
+printf = 0x7f9a3c0f45e0            printf = 0x7f2b8d1a35e0
+&buf   = 0x7ffffffde2ac            &buf   = 0x7ffc2a1d59ac
+\end{lstlisting}
+
+三个地址全变。换算成攻击者的处境：若某区域基址带 28 位随机位，一次猜中的概率是 $1/2^{28}=1/268\,435\,456\approx3.7\times10^{-9}$；猜错通常意味着目标进程崩溃重来，而崩溃本身就可能暴露行踪。32 位时代有过反面教训：地址空间只有 4 GiB，随机位只有十几位，几千到几万次尝试量级就能爆破；64 位空间让随机位和猜测代价一起变大。ASLR 不是绝对防御——一次地址信息泄漏就能让它失效——但它把一大类利用的成本从“查一次表”抬高到“先泄漏、再猜、还不能错”。
+
+把两次运行的地址空间并排画出，随机化的形状就是“布局不变、基址平移”：
+
+\begin{pdfdiagram}
+  \node[hw label] at (0,2.6) {第一次运行};
+  \node[hw label] at (7.6,2.6) {第二次运行};
+  % 左列（上高下低）
+  \node[hw state, align=center, minimum width=4.4cm] (stk1) at (0,1.6) {栈：顶 0x7ffffffde000 附近};
+  \node[hw memory, align=center, minimum width=4.4cm] (lib1) at (0,0.4) {libc：基址 0x7f9a3c090000};
+  \node[hw compute, align=center, minimum width=4.4cm] (exe1) at (0,-0.8) {主程序：基址 0x555555555000};
+  % 右列
+  \node[hw state, align=center, minimum width=4.4cm] (stk2) at (7.6,1.6) {栈：顶 0x7ffc2a1d5000 附近};
+  \node[hw memory, align=center, minimum width=4.4cm] (lib2) at (7.6,0.4) {libc：基址 0x7f2b8d13f000};
+  \node[hw compute, align=center, minimum width=4.4cm] (exe2) at (7.6,-0.8) {主程序：基址 0x555555e8e000};
+  % 对应区域的平移
+  \draw[hw return] (stk1.east) -- (stk2.west);
+  \draw[hw return] (lib1.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{各区域基址平移} (lib2.west);
+  \draw[hw return] (exe1.east) -- (exe2.west);
+  \node[hw label, align=center] at (3.8,-1.9) {布局与代码内容不变，代码页继续只读共享\\变的只是基址：选随机值，按“基址＋偏移”填 GOT};
+\end{pdfdiagram}
+\diagramnote{ASLR 两次运行对照（对应正文 showaddr 输出）。两次运行的区域顺序与相对布局完全相同，变的只是基址：主程序 0x555555555000 对 0x555555e8e000，libc 0x7f9a3c090000 对 0x7f2b8d13f000，栈顶 0x7ffffffde000 附近对 0x7ffc2a1d5000 附近。换基址不改代码一个字节——PIC 让模块内引用全是 rip 相对、跨模块引用全走 GOT，随机化的全部成本就是选基址加填那张可写的表。}
+
+\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+区域 & 传统固定位置 & ASLR 之后 \\
+\midrule
+主程序 & \code{0x400000}（\code{-no-pie}） & PIE 下随机基址 \\\tablerowrule
+共享库与 mmap 区 & 固定在 \code{0x7f...} 某处 & 每次运行换基址 \\\tablerowrule
+栈 & \code{0x7ffffffff000} 附近 & 栈顶加随机偏移 \\\tablerowrule
+堆（brk） & 紧接 \code{.bss} 之后 & 起点加随机偏移 \\
+\bottomrule
+\end{longtable}
+
+ASLR 便宜的前提是位置无关代码（PIC）。若代码里固定绝对地址，换基址就要逐条修补代码；代码页一被写脏，写时复制立刻把共享页拆成私有页，“300 个进程共享一份 libc”就此作废。PIC 的做法是：模块内引用全部改成 rip 相对（\code{lea rdi, [rip+0x0e31]} 之类），跨模块引用全部走 GOT。换基址因此只剩两步——随机选一个基址，按“基址加偏移”修补那张可写的 GOT——代码页一个字节都不动，继续只读、继续共享。
+
+装载时重定位也正因为集中在一张表里而便宜：表项密度高、缓存友好。一个链接几十个库的 GUI 程序，启动前动态链接器要处理几万条 RELA 记录，每条不过是“基址加符号偏移，写入 GOT[n]”的一次内存写，总量毫秒级。相比之下，若允许对代码段做重定位（老式的 text relocation），每个进程都要先把代码页复制再逐条改写——共享、ASLR、启动速度同时受损，现代工具链因此默认拒绝生成代码重定位。
+
+随机化可以被直接观察，也可以被关掉做对照。\code{setarch -R} 关闭 ASLR 后再跑同一个程序，两次运行的地址逐位相同——这正是“关掉随机化，世界就回到固定地址”的实验：
+
+\begin{lstlisting}
+$ setarch -R ./showaddr          $ setarch -R ./showaddr
+main   = 0x555555555149            main   = 0x555555555149
+printf = 0x7ffff7d645e0            printf = 0x7ffff7d645e0
+&buf   = 0x7fffffffe2ac            &buf   = 0x7fffffffe2ac
+\end{lstlisting}
+
+把四件事串成一条链：代码页只读，所以可共享；可共享，所以换基址不能改代码；不改代码，ASLR 的成本只剩选基址和填表。本书末章的教学计算机项目的面包板机是这条链的反面：程序拨在哪个地址就运行在哪个地址，没有随机化、没有重定位、没有共享——不是做不到，而是那台机器上根本没有第二个程序需要防。
+
+\begin{classicnote}
+经典教材把定址时机分成三档：编译链接时（静态链接，地址在链接后不再变）、装载时（动态链接器映射库并修补重定位表）、运行时（懒绑定在第一次调用时才解析符号）。本节给三档各配了一个可观察的数字：装载只建映射不读字节，所以 \code{execve} 快；懒绑定把上千次符号查找改成按需，所以启动快；PIC 把换基址缩成填一张 GOT，所以 ASLR 几乎免费。记住这张时机表，每个机制省的是哪一笔就都有数了。
+\end{classicnote}
+
+\section{四、系统调用与异常控制流}
+
+程序一旦开始执行，就运行在用户态：能算数、能读写自己的内存，但碰不了设备、改不了页表、造不出新进程——这些事必须请内核代办，请代办的门就是系统调用。本节把系统调用、上下文切换和信号串成一条线：它们都是处理器核心相关章节那张“受控的非顺序 PC 更新”表的实例，与存储与设备事务相关章节的硬件中断共用同一副骨架——保存现场、按号定向、服务、返回。
+
+\topic{syscall 指令触发的受控陷入}
+用户程序与内核之间有一条硬约定——系统调用 ABI：服务编号放 \code{rax}，参数依次放 \code{rdi}、\code{rsi}、\code{rdx}、\code{r10}、\code{r8}、\code{r9}，然后执行 \code{syscall} 指令，返回值放在 \code{rax}。它与处理器核心相关章节的普通调用约定几乎同形，只有一个反常：第四个参数用 \code{r10} 而不是 \code{rcx}。原因马上会看到——\code{syscall} 指令本身要占用 \code{rcx}，参数只能绕道；这样设计的好处是包装层只需挪一个寄存器，其余位置原样沿用。参数至多六个，现实中系统调用的参数个数在设计时就被压在这条线内。
+
+系统调用编号是系统调用表的稳定索引，可以类比异常向量中的选择号，但它并不是 IDT 向量。x86-64 Linux 的编号表由内核 ABI 定义；已经发布的编号需要保持兼容，即使某项服务废弃也通常保留相应编号或兼容处理，因为已编译程序会把编号写入机器码。
+
+\begin{lstlisting}
+; x86-64 Linux, arch/x86/entry/syscalls/syscall_64.tbl (excerpt)
+  0   common  read
+  1   common  write
+  2   common  open
+  3   common  close
+  9   common  mmap
+ 57   common  fork
+ 59   common  execve
+231   common  exit_group
+\end{lstlisting}
+
+一条 \code{write(1, msg, 13)} 按 ABI 写出来是这样（Intel 语法）：
+
+\begin{lstlisting}
+        mov  eax, 1              ; __NR_write
+        mov  edi, 1              ; fd = stdout
+        lea  rsi, [rip+msg]      ; buf
+        mov  edx, 13             ; count
+        syscall                  ; controlled trap into kernel
+        ; rax = 13 on success, or -errno
+
+msg:    db   "hello, world", 10
+\end{lstlisting}
+
+\code{syscall} 指令的硬件动作极少而精：把返回地址（下一条指令的 \code{rip}）装进 \code{rcx}，把 \code{rflags} 装进 \code{r11}，按 \code{IA32\_FMASK} MSR 的掩码清掉 \code{rflags} 的指定位，特权级从 3 升为 0，最后把 \code{IA32\_LSTAR} MSR 里的内核入口地址装进 \code{rip}。指令本身不访问内存，也不查询 IDT；入口地址早在系统启动时就由内核写入 MSR。\cite{intel-sdm}
+
+为什么参数全走寄存器，而不像普通调用那样允许栈传参？因为内核不能信任用户栈指针：\code{syscall} 那一刻 CPU 还在用户栈上，而这个栈指针本身就可能指向不可写的页。六个寄存器是“内核不用解引用任何用户指针就能拿到的全部输入”；参数个数因此被设计时压在这条线内——历史上 32 位 ABI 只有五个寄存器可用，第六个参数被迫走内存，至今还能在老代码里看到那处别扭。
+
+以 \code{write(1, msg, 13)} 为例，把寄存器摆参与内核栈上的 \code{pt\_regs} 画在一张图里，陷入与返回各是一次受控交接：
+
+\begin{pdfdiagram}
+  \node[hw state, minimum width=4.2cm, align=center] (ureg) at (2.1,1.0) {用户态摆参（write 例）\\rax ← 1（调用号）\\rdi ← 1，rsi ← msg\\rdx ← 13\\第 4–6 参数：r10、r8、r9\\指令占用：rcx ← rip，r11 ← rflags};
+  \node[hw memory, minimum width=4.6cm, align=center] (ptregs) at (8.5,1.0) {当前线程内核栈：pt\_regs\\用户 rsp、rip、rflags\\由入口代码按布局保存\\orig\_rax ← 调用号\\rdi rsi rdx rcx rax r10\\r8 r9 r11 rbx rbp r12–r15};
+  \draw[hw bus] (ureg.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{陷入：CPL 3→0} (ptregs.west);
+  \draw[hw return] (ptregs.south) -- (8.5,-1.5) -- (2.1,-1.5) -- (ureg.south);
+  \node[hw label, fill=white, inner sep=1pt] at (5.3,-1.22) {入口代码恢复通用状态；sysret 恢复 rip/rflags 与 CPL};
+\end{pdfdiagram}
+\diagramnote{系统调用的参数传递与现场保存（\code{write(1, msg, 13)} 例）。用户态按 ABI 摆好 \code{rax} 编号与 \code{rdi}/\code{rsi}/\code{rdx} 参数；\code{syscall} 指令把返回地址装进 \code{rcx}、标志装进 \code{r11}——这正是第四个参数改用 \code{r10} 的原因——并把 \code{rip} 换成 LSTAR 入口；它本身不保存用户 \code{rsp}，也不自动切换栈。入口代码随后切到当前线程的内核栈，把用户态现场连同全部通用寄存器存成 \code{pt\_regs}，内核 C 代码看到的“寄存器”就是这张内存表；最后由 \code{sysret} 恢复 \code{rip}/\code{rflags} 与用户特权级，返回值仍由 \code{rax} 带回，一进一出同一个寄存器。}
+
+把普通调用和系统调用并排，ABI 的同形与差异一眼可见：
+
+\begin{longtable}{L{0.24\linewidth}L{0.32\linewidth}L{0.34\linewidth}}
+\toprule
+方面 & 普通函数调用 & 系统调用 \\
+\midrule
+第四个参数 & \code{rcx} & \code{r10}（\code{rcx} 被指令占用） \\\tablerowrule
+返回地址 & 由 \code{call} 压到栈上 & 装进 \code{rcx} 寄存器 \\\tablerowrule
+特权级 & 不变 & 3→0，返回时 0→3 \\\tablerowrule
+使用的栈 & 同一条用户栈 & 指令不换栈；入口代码切到当前线程内核栈 \\\tablerowrule
+入口地址 & 固定在指令编码里 & \code{IA32\_LSTAR} MSR \\
+\bottomrule
+\end{longtable}
+
+与老式的 \code{int 0x80} 对照最能看清这副骨架：\code{int} 要按处理器核心相关章节的“表基址+异常号×项宽”去内存里查 IDT，需要执行门描述符检查、硬件换栈和规定的现场保存；\code{syscall} 使用 MSR 中预置的专用入口，并只保存最小返回状态，把“编号到服务”的分发表 \code{sys\_call\_table} 留给内核软件去查。但两者只是同一副骨架的两种实现：指令显式请求进入特权服务，硬件保存返回位置、切换权限和入口——处理器核心相关章节异常表里“系统调用”那一行，写的就是它。
+
+\begin{longtable}{L{0.14\linewidth}L{0.44\linewidth}L{0.32\linewidth}}
+\toprule
+骨架阶段 & \code{syscall} 路径上的动作 & 对应前章的谁 \\
+\midrule
+保存现场 & 硬件完成 \code{rip}→\code{rcx}、\code{rflags}→\code{r11}；入口代码切栈并建立 \code{pt\_regs} & 处理器核心相关章节“保存故障 PC 和原因” \\\tablerowrule
+定向 & 硬件入口 = \code{IA32\_LSTAR}；内核再按 \code{sys\_call\_table[rax]} 分发 & 处理器核心相关章节向量表查表；\code{int 0x80} 走 IDT \\\tablerowrule
+服务 & \code{sys\_read}/\code{sys\_write} 等操作设备与文件 & 存储与设备事务相关章节 MMIO/DMA 由内核代发 \\\tablerowrule
+返回 & \code{sysret}：\code{rcx}→\code{rip}、\code{r11}→\code{rflags}、特权级 0→3 & 存储与设备事务相关章节中断返回恢复现场 \\
+\bottomrule
+\end{longtable}
+
+这副“保存现场、按号定向、服务、返回”的骨架值得背下来，因为本节后面三个主题全是它的实例：上下文切换是“定时器中断加换一套现场”，信号是“返回用户态之前的检查点”，边界清单则是“哪些服务必须在这副骨架里完成”。
+
+把一次系统调用的完整往返按时间自上而下画成两条泳道，特权级的两次切换就是图上两次越过边界的时刻：
+
+\begin{pdfdiagram}
+  % 泳道底框（先画，垫在节点之下）
+  \node[hw lane, minimum width=4.4cm, minimum height=6.6cm] at (2.2,1.7) {};
+  \node[hw lane, minimum width=4.4cm, minimum height=6.6cm] at (8.0,1.7) {};
+  \node[hw label] at (2.2,5.35) {用户态（CPL 3）};
+  \node[hw label] at (8.0,5.35) {内核态（CPL 0）};
+  % 特权级边界
+  \draw[BookRule, line width=0.45pt, dashed] (5.1,-1.6) -- (5.1,5.0);
+  \node[hw label] at (5.1,-1.95) {特权级边界};
+  % 用户态泳道
+  \node[hw compute, minimum width=3.2cm] (u1) at (2.2,4.2) {用户程序摆好编号与参数\\rax、rdi、rsi、rdx};
+  \node[hw control, minimum width=3.2cm] (u2) at (2.2,2.9) {syscall 指令\\rip→rcx，rflags→r11};
+  \node[hw compute, minimum width=3.2cm] (u3) at (2.2,-1.0) {继续执行下一条指令\\rax = 返回值};
+  % 内核态泳道
+  \node[hw state, minimum width=3.2cm] (k1) at (8.0,2.9) {LSTAR 入口汇编\\保存用户 rsp、切线程内核栈\\现场存为 pt\_regs};
+  \node[hw compute, minimum width=3.2cm] (k2) at (8.0,1.6) {按号分发\\sys\_call\_table[rax]};
+  \node[hw compute, minimum width=3.2cm] (k3) at (8.0,0.3) {服务例程\\sys\_write 等};
+  \node[hw state, minimum width=3.2cm] (k4) at (8.0,-1.0) {入口代码恢复寄存器与用户 rsp\\sysret：rcx→rip，r11→rflags};
+  \draw[hw bus] (u1.south) -- (u2.north);
+  \draw[hw bus] (u2.east) -- (k1.west);
+  \node[hw label] at (5.2,3.9) {陷入：特权级 3→0};
+  \draw[hw bus] (k1.south) -- (k2.north);
+  \draw[hw bus] (k2.south) -- (k3.north);
+  \draw[hw bus] (k3.south) -- (k4.north);
+  \draw[hw bus] (k4.west) -- (u3.east);
+  \node[hw label] at (5.1,-0.1) {返回：特权级 0→3};
+\end{pdfdiagram}
+\diagramnote{一次系统调用往返的泳道图：左为用户态（CPL 3），右为内核态（CPL 0），中间虚线是特权级边界，两次越界即 CPL 3→0 与 0→3 的切换点。\code{syscall} 指令把返回地址与标志装进 \code{rcx}/\code{r11}、把 \code{rip} 换成 MSR 中的内核入口；入口代码切到当前线程内核栈，把全部通用寄存器存成 \code{pt\_regs}，再按 \code{rax} 中的编号查 \code{sys\_call\_table} 分发；服务完成后，入口代码先恢复通用寄存器和用户栈指针，再由 \code{sysret} 完成最后的返回状态切换。内核全程不必解引用用户栈指针。}
+
+\topic{陷入与返回的上下文}
+\code{syscall} 指令只切换了最小状态，完整的上下文交接由内核入口代码完成：\code{swapgs} 换出内核数据基址；先把用户 \code{rsp} 保存到每 CPU 的入口临时状态，再从当前任务信息取得该线程的内核栈指针。每个线程都有独立内核栈，具体大小由内核配置决定，专门承接它进入内核后的现场。TSS 的 \code{RSP0} 用于中断门等发生特权级切换时的硬件换栈，并不是 \code{SYSCALL} 自动换栈的来源；然后把用户态的 \code{rsp}、\code{rcx}（用户 \code{rip}）、\code{r11}（用户 \code{rflags}）和全部通用寄存器按固定布局存成一张 \code{pt\_regs}。此后内核 C 代码看到的“寄存器”，其实是这张内存表。返回时逆序恢复，\code{sysret} 用 \code{rcx}/\code{r11} 还原 \code{rip}/\code{rflags}，并把特权级降回 3。
+
+\begin{lstlisting}
+; pt_regs on the current thread's kernel stack, high to low address:
+;   rsp(user), rip(user), rflags(user)           <- arranged by entry code
+;   orig_rax                                     <- syscall number
+;   rdi rsi rdx rcx rax r8 r9 r10 r11 rbx rbp
+;   r12 r13 r14 r15                              <- saved by entry code
+\end{lstlisting}
+
+为什么每个线程需要一条独立内核栈？因为线程可能在内核里被切走：它服务到一半被定时器打断，现场得有个各自安放的地方。内核栈保存该线程进入内核后的调用链与现场，栈顶指针保存在当前线程的任务控制结构中——下一个主题会看到，上下文切换保存的全部东西，最后都归结为这个指针。若当前内核配置使用 16 KiB 栈，这一容量同时形成明确约束：内核态不能深递归，也不能在栈上放大数组，否则栈溢出会破坏当前线程的现场。
+
+把一次 \code{read(0, buf, 4096)} 的完整往返走一遍。\code{strace} 里它只有一行：
+
+\begin{lstlisting}
+$ strace -e read ./hello
+read(0, "hello\n", 4096)               = 6
+\end{lstlisting}
+
+第一步，用户态摆好 ABI：\code{rdi=0}、\code{rsi=buf}、\code{rdx=4096}、\code{rax=0}，执行 \code{syscall}。到这一步为止，一切和普通函数调用的准备没有区别——区别从下一步开始。
+
+第二步，陷入：特权级升为 0，\code{rip} 换成 LSTAR 入口，入口代码建 \code{pt\_regs}，按 \code{rax=0} 查 \code{sys\_call\_table} 分发到 \code{sys\_read}。注意返回地址此刻在 \code{rcx} 里、被存进 \code{pt\_regs}，而不在用户栈上——内核从始至终不需要解引用用户栈指针。
+
+第三步，服务：经虚拟文件层到终端驱动，键盘缓冲里已有 6 字节，复制到 \code{buf}——复制前内核先检查 \code{buf} 所在页可写，不可写就不复制，直接返回 \code{-14}。设备寄存器、DMA 描述符这些存储与设备事务相关章节的对象，只有在这一步、只有内核态才能碰。
+
+第四步，返回：\code{rax=6}，\code{sysret} 回用户态，libc 包装看到非负值，直接把它作为返回值交出。返回值用 \code{rax} 不是巧合：编号进内核时用的就是 \code{rax}，一进一出，同一个寄存器完成交接，调用者连第二个寄存器都不用读。
+
+\begin{lstlisting}
+before:  rax=0  rdi=0  rsi=0x7ffffffde2a0  rdx=4096
+trap:    rcx=rip(next)  r11=rflags  CPL 3->0  rip=LSTAR
+return:  rax=6
+\end{lstlisting}
+
+错误约定值得单独说清。内核用 \code{-errno} 表示失败：\code{rax} 落在 $[-4095,-1]$ 区间即出错，例如 \code{-14=-EFAULT}（\code{buf} 不可写）、\code{-9=-EBADF}（描述符无效）。判断只需一次无符号比较：\code{-14} 的无符号形式是 \code{0xFFFFFFFFFFFFFFF2}，不小于 \code{-4095} 的无符号形式 \code{0xFFFFFFFFFFFFF001}，一条 \code{cmp} 就分出成败。glibc 的包装函数负责翻译：检出该区间就把 \code{errno} 置为 14、返回 \code{-1}——C 程序看到的是 \code{read} 返回 \code{-1} 且 \code{errno==EFAULT}，内核内部的 \code{-14} 由包装层转换，不直接暴露给程序。
+
+为什么连 \code{buf} 都要检查？因为内核不能信任用户态递来的任何指针：它可能指向不可写的页，也可能故意指向内核地址。每个系统调用开头的参数检查，是内核自保的第一课，也是“边界”二字在服务一侧的具体形态。
+
+常见错误码可以列成一张小表，以后读 \code{strace} 输出时会反复遇到它们：
+
+\begin{longtable}{L{0.10\linewidth}L{0.18\linewidth}L{0.62\linewidth}}
+\toprule
+数值 & 名字 & 典型触发场景 \\
+\midrule
+\code{-1} & \code{EPERM} & 操作不被允许，如向别人的进程发信号 \\\tablerowrule
+\code{-2} & \code{ENOENT} & 路径不存在，\code{open} 失败 \\\tablerowrule
+\code{-9} & \code{EBADF} & 描述符无效，如 \code{read} 一个已关闭的 fd \\\tablerowrule
+\code{-11} & \code{EAGAIN} & 非阻塞读暂时无数据 \\\tablerowrule
+\code{-14} & \code{EFAULT} & 指针指向不可访问的页 \\
+\bottomrule
+\end{longtable}
+
+\code{pt\_regs} 里的 \code{orig\_rax} 还藏着一条与信号的衔接：慢系统调用（比如等键盘的 \code{read}）若被信号打断，服务例程会返回一个内部码 \code{ERESTART}；处理函数若按 \code{SA\_RESTART} 安装，内核就在 \code{sigreturn} 后用 \code{orig\_rax} 里的编号把这次调用重新发起，用户态毫无察觉，否则 libc 把 \code{-EINTR} 交给程序，由程序自己决定要不要重试。系统调用能被“重启”，前提正是完整现场都在 \code{pt\_regs} 里。
+
+工程含义是一笔时间账：一次系统调用往返的典型开销在百纳秒级，比普通函数调用贵约两个数量级——贵在特权切换、\code{pt\_regs} 保存、查表分发和参数检查。后世的优化几乎全部围绕“少进几次内核”：stdio 缓冲、\code{readv}/\code{writev} 批量提交、\code{mmap} 免复制、vDSO 和 \code{io\_uring}，最后一个主题还会回到这张清单。
+
+\topic{上下文切换的完整步骤}
+系统调用是程序主动进内核，定时器中断则是内核定期不请自来——走存储与设备事务相关章节那条链路：定时器拉起 IRQ，中断控制器判优，CPU 在指令边界接收，查向量表进服务程序。服务程序发现当前进程的时间片用完，就做一次上下文切换：把整套程序员可见状态换成另一个进程的。完整步骤可以写成一条 trace：
+
+\begin{lstlisting}
+// 注释（推进）：按行追踪数据来源、经过的部件和最终写入目标。
+// 注释（边界）：只有标出的时钟沿、阶段或异常入口会改变体系结构可见状态。
+timer interrupt arrives while A runs
+  CPU:   push rip/cs/rflags/rsp/ss of A; enter ISR
+  ISR:   push A's general registers to A's kernel stack
+  A.state = READY
+  B = pick_next()                        ; scheduler decision
+  if (B.mm != A.mm) CR3 = B.pgd          ; switch address space
+  rsp = B.saved_kernel_sp                ; switch kernel stack
+  pop B's general registers
+  iretq                                  ; resume B at its saved rip
+\end{lstlisting}
+
+逐步核对。第一步保存 A：中断已经自动压好 \code{rip}/\code{cs}/\code{rflags}/\code{rsp}/\code{ss}，入口代码补齐通用寄存器——A 的全部可见状态此刻躺在它自己的内核栈上，进程控制块里只要存一个栈顶指针。第二步选下一个：调度器从就绪队列挑出 B——“换谁”是软件策略，“怎么换”才是这里的硬件约定，两者泾渭分明。第三步切地址空间：把 B 的页表基址写进 CR3（经典芯片与平台案例：CR3 指向顶级页表）——从这一刻起，同一个虚拟地址 \code{0x401000} 指向的是 B 的代码；副作用随之而来，TLB 里 A 的翻译全部作废，除非启用 PCID（PCID 标签打在 TLB 项上，取自 CR3 低 12 位），B 恢复后的前几千次访存都会慢一拍。第四步恢复 B 的寄存器并 \code{iretq}——B 从自己的视角看，只是“上一次陷入返回得特别久”。
+
+把这条 trace 画成泳道图，“换一套现场”就是三条道之间的一次往返：
+
+\begin{pdfdiagram}
+  % 泳道标签与分隔虚线
+  \node[hw label] at (0,2.9) {进程 A（用户态）};
+  \node[hw label] at (5.2,2.9) {内核};
+  \node[hw label] at (10.4,2.9) {进程 B（用户态）};
+  \draw[draw=BookMuted, dashed, line width=0.5pt] (2.9,2.55) -- (2.9,-2.6);
+  \draw[draw=BookMuted, dashed, line width=0.5pt] (7.5,2.55) -- (7.5,-2.6);
+  % 事件序列（时间向下）
+  \node[hw state, align=center] (arun) at (0,1.9) {A 运行中};
+  \node[hw control, align=center, minimum width=3.0cm] (save) at (5.2,1.9) {保存 A 现场\\压上 A 的内核栈};
+  \node[hw compute, align=center, minimum width=3.0cm] (pick) at (5.2,0.65) {pick\_next() 选出 B\\A.state = READY};
+  \node[hw compute, align=center, minimum width=3.0cm] (cr3) at (5.2,-0.6) {CR3 $\leftarrow$ B 页表基址\\rsp $\leftarrow$ B 内核栈顶};
+  \node[hw control, align=center, minimum width=3.0cm] (rest) at (5.2,-1.85) {恢复 B 现场\\iretq};
+  \node[hw state, align=center] (brun) at (10.4,-1.85) {B 从断点继续};
+  \draw[hw bus] (arun.east) -- node[pos=0.25, above=1pt, hw label, fill=white, inner sep=1pt]{定时器 IRQ} (save.west);
+  \draw[hw bus] (save.south) -- (pick.north);
+  \draw[hw bus] (pick.south) -- (cr3.north);
+  \draw[hw bus] (cr3.south) -- (rest.north);
+  \draw[hw bus] (rest.east) -- node[pos=0.65, above=1pt, hw label, fill=white, inner sep=1pt]{返回用户态} (brun.west);
+  \node[hw label, align=center] at (0,-0.6) {A 冻结：全部状态\\凝为一个栈指针};
+\end{pdfdiagram}
+\diagramnote{上下文切换泳道（对应正文 trace）。定时器中断在指令边界把 CPU 从 A 带进内核：A 的现场压上它自己的内核栈，调度器选出 B 后写入 B 的页表基址（CR3）、把栈指针切到 B 的内核栈，再弹出 B 的寄存器并 iretq——返回落进 B 的用户态，B 只觉得上次陷入返回得特别久。被切走的 A，全部状态归结为进程控制块里的一个栈指针，等下次被选中时原路恢复。}
+
+定时器不是唯一的切换入口：进程阻塞在 \code{read} 上等键盘、主动 \code{sched\_yield} 让出、等待互斥锁，走的都是同一条“保存、选下一个、恢复”的路径。入口有多个，出口只有一个——沿目标进程的内核栈恢复现场并返回。
+
+\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.30\linewidth}}
+\toprule
+要素 & 保存在哪、切到哪里 & 检查点 \\
+\midrule
+通用寄存器与 \code{rip} & 各自内核栈顶；进程控制块只存栈指针 & 恢复后 \code{rip} 指向被切走时的下一条 \\\tablerowrule
+地址空间 & CR3 写入新页表基址 & 同一虚拟地址从此属于新进程 \\\tablerowrule
+内核栈 & 栈指针切到目标栈 & 返回路径沿目标栈展开 \\
+\bottomrule
+\end{longtable}
+
+算一笔账。保存加恢复的寄存器约 20 个 64 位值，内存流量 $2\times20\times8=320$ 字节，纳秒级；真正的成本在 CR3 切换之后——TLB 和 cache 变冷，使一次进程切换的典型总成本在微秒级，约是一次系统调用往返的十倍。再看频率：设时间片 3 ms，一个核每秒至多切换约 330 次，每次 2 微秒，总开销约 660 微秒，占可用时间的千分之一不到——切换很便宜，而“看起来便宜”是因为时间片把它摊薄了。
+
+有一个边角案例能检验这条 trace 是否真的成立：新进程从来没有“上次被切走”，它的第一次运行从哪来？答案是 fork 时内核手工搭出来的——按上一主题的格式伪造一份 \code{pt\_regs} 和内核栈，把 \code{rip} 设成父进程 fork 返回后的下一条，把 \code{rax} 设成 0。于是子进程第一次被调度时，走的完全是“恢复现场并返回”的老路，只是现场是造的。同一份代码在父子俩身上跑出两个返回值（父得 pid、子得 0），差别就写在这份手工现场里。
+
+定时器中断接手调度，本身是一段历史进步：早期系统是协作式的，进程靠自觉定期让出，一个死循环就能拖死整机；抢占式调度把主动权收归内核——存储与设备事务相关章节那个“除了报时还会发起中断”的定时器，另一个身份就是操作系统的心跳。切换的频繁程度可以直接观察：\code{vmstat} 的 \code{cs} 列是每秒上下文切换次数，\code{in} 列是每秒中断次数，两者同量级，因为大部分切换正是中断带进来的。
+
+\begin{lstlisting}
+$ vmstat 1 3
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 1  0      0 6123456 123456 2345678    0    0    10    20  210  512  5  3 92  0  0
+ 0  0      0 6123300 123456 2345680    0    0     0    12  198  487  4  2 94  0  0
+\end{lstlisting}
+
+TLB 作废的代价也在被硬件压缩：带 PCID 的 CPU 给每条 TLB 项打上地址空间标签，切 CR3 时不必清空 TLB，新旧进程的翻译按标签各归各——这正是存储与设备事务相关章节 cache 用 tag 区分归属的思想，在地址转换缓存上的重演。
+
+\begin{longtable}{L{0.20\linewidth}L{0.40\linewidth}L{0.30\linewidth}}
+\toprule
+切换入口 & 触发原因 & 典型例子 \\
+\midrule
+被动切换 & 定时器中断，时间片用完 & 计算密集的循环被切走 \\\tablerowrule
+主动切换 & 系统调用内阻塞，等资源 & \code{read} 等键盘输入 \\\tablerowrule
+让出切换 & 显式请求调度器换人 & \code{sched\_yield} \\
+\bottomrule
+\end{longtable}
+
+两个推论。其一，\hwkey{进程切换就是把整套可见状态换一遍}：寄存器、地址空间、内核栈，一个不能少；而文件描述符表、信号处理表这类“属于进程但不属于寄存器”的状态挂在进程控制块上，换进程时自然跟着换，不需要逐条保存。其二，同进程的两个线程互切不用写 CR3——它们共享地址空间，TLB 不必作废——这正是线程比进程“轻”的硬件根源。
+
+\topic{信号是软件级中断}
+中断让设备打断 CPU，信号让内核（或另一个进程）打断一个进程。两者同构：信号编号对应中断号，\code{sigaction} 安装的处理表对应 IDT，\code{sigprocmask} 对应中断屏蔽字，pending 位图对应中断挂起寄存器，\code{sigreturn} 对应 \code{iret}。差别只在发起者和投递点：中断由硬件在指令边界投递，信号由内核在“即将从内核返回用户态”这个固定检查点投递——每个进程从系统调用或中断返回前，都要过这一关。
+
+Ctrl-C 是最好的一生案例，四步走完。第一步，按键：终端把 \code{0x03} 字节经存储与设备事务相关章节那条链路送进内核——设备锁存状态、拉起 IRQ、中断控制器判优、CPU 在指令边界接收、键盘服务程序读入扫描码。第二步，行律解释：tty 驱动发现 \code{0x03} 是控制字符 INTR，不把它放进输入缓冲，而是向前台进程组的每个进程置 SIGINT 的 pending 位。第三步，投递：目标进程下次返回用户态前，内核发现 SIGINT 未被屏蔽且注册过处理函数，就在用户栈上搭一帧信号帧（保存被打断时的 \code{rip}、\code{rsp}、\code{rflags} 和通用寄存器），把 \code{rip} 改为处理函数入口、\code{rsp} 指向新帧，然后才执行那次“返回”——返回去的地方已经是处理函数。第四步，收尾：处理函数执行完调用 \code{sigreturn}，内核按帧恢复现场，进程从被打断处继续；若进程从未注册处理函数，默认动作是终止——内核在投递点直接回收进程。Ctrl-C“杀掉”前台程序，走的就是这完整的四步。
+
+把 Ctrl-C 的四步画成一条投递路径，“软件级中断”五个字就写在图上：
+
+\begin{pdfdiagram}
+  % 第一行：发起与置位
+  \node[hw state, align=center] (key) at (0,1.3) {键盘\\0x03};
+  \node[hw compute, align=center, minimum width=2.6cm] (tty) at (3.1,1.3) {tty 行律\\认出 INTR};
+  \node[hw control, align=center, minimum width=3.0cm] (pend) at (6.7,1.3) {前台进程组各进程\\置 SIGINT pending 位};
+  % 第二行：投递
+  \node[hw control, align=center, minimum width=2.6cm] (chk) at (3.1,-1.0) {返回用户态前检查\\未屏蔽且已注册才投递};
+  \node[hw memory, align=center, minimum width=2.6cm] (frame) at (6.7,-1.0) {用户栈上\\搭信号帧};
+  \node[hw state, align=center, minimum width=2.6cm] (hdl) at (10.0,-1.0) {rip $\leftarrow$ 处理函数\\rsp $\leftarrow$ 新帧};
+  \draw[hw bus] (key.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{扫描码} (tty.west);
+  \draw[hw bus] (tty.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{控制字符} (pend.west);
+  \draw[hw bus] (pend.south) -- (6.7,0.15) -- (3.1,0.15) -- (chk.north);
+  \node[hw label, fill=white, inner sep=1pt] at (4.9,0.42) {下次返回前被检查};
+  \draw[hw bus] (chk.east) -- (frame.west);
+  \draw[hw bus] (frame.east) -- (hdl.west);
+  \draw[hw return] (hdl.south) -- (10.0,-2.3) -- (6.7,-2.3) -- (frame.south);
+  \node[hw label, fill=white, inner sep=1pt] at (8.35,-2.56) {sigreturn：按帧恢复现场};
+\end{pdfdiagram}
+\diagramnote{信号投递路径（Ctrl-C 例）。按键字节 0x03 经键盘服务程序送进内核，tty 行律认出控制字符 INTR，不放进输入缓冲，而是向前台进程组每个进程置 SIGINT（2 号）的 pending 位；目标进程下次返回用户态前，内核检出该位未被屏蔽且处理函数已注册，就在用户栈上搭信号帧、把 rip 改为处理函数入口、rsp 指向新帧——那次“返回”落进处理函数；处理函数执行完 sigreturn，内核按帧恢复现场，进程从被打断处继续。}
+
+四步里搭在用户栈上的那帧信号帧值得单独画出来，处理函数能返回被打断处，全靠帧里保存的现场：
+
+\begin{pdfdiagram}
+  \node[hw label] at (2.3,3.5) {用户栈（高地址在上，向下增长）};
+  \node[hw compute, minimum width=3.6cm, align=center] (old) at (2.3,2.6) {被打断处的栈帧\\原 rsp 所指};
+  \node[hw memory, minimum width=4.6cm, align=center] (frame) at (2.3,0.5) {信号帧（内核搭建）\\保存的 rip、rsp、rflags\\全部通用寄存器\\返回地址 → sigreturn 跳板};
+  \draw[BookMuted, line width=0.62pt, ->] (old.south) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{内核压入} (frame.north);
+  \node[hw control, minimum width=3.2cm, align=center] (hdl) at (8.7,0.5) {信号处理函数\\rip ← 处理函数入口};
+  \draw[hw bus] (frame.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{投递} (hdl.west);
+  \draw[hw return] (hdl.south) -- (8.7,-1.2) -- (2.3,-1.2) -- (frame.south);
+  \node[hw label, fill=white, inner sep=1pt] at (5.5,-1.2) {sigreturn：按帧恢复现场，回到被打断处};
+\end{pdfdiagram}
+\diagramnote{用户栈上的信号帧结构（对应 Ctrl-C 四步的第三步）。内核在目标进程的用户栈上搭一帧：保存被打断时的 \code{rip}、\code{rsp}、\code{rflags} 与全部通用寄存器，帧里的返回地址指向 \code{sigreturn} 跳板；随后 \code{rip} 改为处理函数入口、\code{rsp} 指向新帧，那次“返回用户态”便落进处理函数。处理函数执行完经跳板发起 \code{sigreturn}，内核按帧恢复现场，进程从被打断处继续。若用户栈本身已不可用（栈溢出招来 SIGSEGV 的情形），处理函数需要一条事先用 \code{sigaltstack} 备好的备用栈。}
+
+两个信号被故意排除在约定之外：SIGKILL（9）和 SIGSTOP（19）不可捕获、不可屏蔽、不可忽略。理由很硬：若失控进程能把所有信号都拦下，系统就没有回收它的最后手段——\code{kill -9} 之所以总是有效，靠的就是这条“保留一扇不可锁的门”的约定。
+
+\begin{longtable}{L{0.16\linewidth}L{0.37\linewidth}L{0.37\linewidth}}
+\toprule
+概念 & 硬件中断（第四、五章） & 信号 \\
+\midrule
+编号 & 中断号/向量号 & 信号编号（SIGINT=2，SIGSEGV=11） \\\tablerowrule
+入口表 & IDT：基址+号×项宽 & 每进程 \code{sigaction} 表 \\\tablerowrule
+屏蔽 & IF 位/中断控制器屏蔽位 & \code{sigprocmask} 屏蔽字 \\\tablerowrule
+挂起 & IRR 挂起寄存器 & pending 位图 \\\tablerowrule
+返回 & \code{iret} & \code{sigreturn} 系统调用 \\\tablerowrule
+投递点 & 指令边界 & 内核返回用户态之前 \\
+\bottomrule
+\end{longtable}
+
+常见信号的编号和默认动作可以各看一张表。编号表用 \code{kill -l} 就能列出来：
+
+\begin{lstlisting}
+$ kill -l (excerpt)
+ 1) SIGHUP    2) SIGINT    9) SIGKILL  11) SIGSEGV
+13) SIGPIPE  14) SIGALRM  15) SIGTERM  18) SIGCONT
+19) SIGSTOP  20) SIGTSTP
+\end{lstlisting}
+
+\begin{longtable}{L{0.20\linewidth}L{0.24\linewidth}L{0.46\linewidth}}
+\toprule
+默认动作 & 代表信号 & 含义 \\
+\midrule
+终止 & SIGINT、SIGTERM & 内核直接回收进程 \\\tablerowrule
+终止并转储 & SIGSEGV、SIGILL & 回收，另留下 core 文件供调试 \\\tablerowrule
+忽略 & SIGCHLD、SIGURG & 默认什么也不做 \\\tablerowrule
+停止 & SIGSTOP、SIGTSTP & 冻结进程，等 SIGCONT 唤醒 \\
+\bottomrule
+\end{longtable}
+
+Ctrl-C 的四步只换了发起者，就能解释一整族终端控制：Ctrl-Z 发出的是 SIGTSTP，前台进程被“停止”而非终止——它的全部状态原样冻结，shell 把它挂进作业表；之后 \code{fg} 或 \code{bg} 让它收到 SIGCONT，从冻结处继续。这就是 shell 作业控制的全部硬件基础：同一套信号投递路径，不同的编号与默认动作。
+
+还有两个工程细节补全这幅图。其一，标准信号的 pending 是位图，只能记“有”，记不了“几次”——处理函数运行期间再来的同号信号最多再记一位，这就是“信号不排队、可能合并丢失”的原因；需要计数的场合得用可排队的实时信号。其二，信号帧搭在用户栈上，若程序正因栈溢出而被 SIGSEGV 投递，用户栈已经不可用，处理函数需要一条事先用 \code{sigaltstack} 备好的备用栈——又一个“不能信任用户指针”的实例。
+
+同构最漂亮的一处是段错误：经典芯片与平台案例那台检查 P/W/U 三个原因位的页错误硬件，在内核判定“故障地址不属于任何映射”之后，并不直接杀死进程，而是向它投递 SIGSEGV；程序崩溃时打印的“Segmentation fault”，就是这枚信号走完上述投递路径的结果。信号因此不需要任何新硬件——它全部用已有的异常返回路径搭出来，这正是“软件级中断”五个字的含义。
+
+处理函数一侧还有一条对应的工程约束：信号可能在任意指令边界到来，处理函数里只能调用“异步信号安全”的函数，否则可能打断 \code{malloc} 到一半的链表——这与中断服务程序“快进快出、不碰半成品数据”的纪律同出一源。
+
+最后注意一个归属问题：信号处理表和上一主题的页表一样，是每进程状态，挂在进程控制块上。上下文切换换走地址空间的同时，pending 位图和处理表也一起被换走——信号因此总是投递给“当前这个进程”的语义，而不会串到别的进程身上。
+
+\topic{用户态与内核态的边界清单}
+本章反复出现的那条线，现在可以写到底：边界不是软件风俗，而是特权级检查。页表项里的 U/S 位决定哪些页用户态可碰——经典芯片与平台案例页错误三问的第三问——检查由硬件在每次访存时完成，成本为零；\code{syscall}/\code{sysret} 是跨越特权级的唯一受控正门，中断门是另一扇，但钥匙在内核手里。判断一件事在哪一侧，只需问一句：它要不要碰特权状态？
+
+\begin{longtable}{L{0.26\linewidth}L{0.12\linewidth}L{0.52\linewidth}}
+\toprule
+操作 & 在哪侧 & 为什么 \\
+\midrule
+加法、比较、分支 & 用户态 & 只动通用寄存器，不碰特权资源 \\\tablerowrule
+\code{strlen}/\code{memcpy} 等库函数 & 用户态 & 只读写本进程已映射的页 \\\tablerowrule
+\code{malloc} 小对象 & 用户态 & 在已分配的堆区内管理空闲块；堆要长大才 \code{brk}/\code{mmap} 进内核 \\\tablerowrule
+\code{read}/\code{write}/\code{open} & 内核态 & 设备寄存器与 DMA 由内核独占（存储与设备事务相关章节） \\\tablerowrule
+\code{fork}/\code{execve}/\code{exit} & 内核态 & 建/销地址空间要改页表与 CR3，属特权操作 \\\tablerowrule
+\code{mmap}/映射变更 & 内核态 & 页表页标了 U/S=0，用户态写不了 \\\tablerowrule
+\code{gettimeofday}（vDSO） & 用户态 & 内核把只读时间页映给用户，读它不算越界 \\
+\bottomrule
+\end{longtable}
+
+清单最后一行值得展开。\code{gettimeofday} 传统上是系统调用，现代内核把它和校准参数写进一页只读共享页，用户态直接读——一次跨越都省。这是边界工程的一般做法，按优先级排成三条：能不跨就不跨（vDSO）；必须跨就合并（stdio 缓冲、\code{readv} 批量、\code{io\_uring} 一次提交一组）；非要高频跨越，就干脆修一座桥（共享页、门铃寄存器、用户态轮询）。
+
+把跨越的代价并排摆出来，三条策略的动机就一目了然：
+
+\begin{longtable}{L{0.26\linewidth}L{0.18\linewidth}L{0.46\linewidth}}
+\toprule
+动作 & 典型量级 & 边界含义 \\
+\midrule
+普通函数调用 & 纳秒级 & 不跨边界 \\\tablerowrule
+系统调用往返 & 百纳秒级 & 陷入加返回各一次 \\\tablerowrule
+进程上下文切换 & 微秒级 & 陷入加更换整套可见状态 \\\tablerowrule
+SSD 读 4 KiB 页 & 几十微秒 & 内核加设备加缺页服务 \\
+\bottomrule
+\end{longtable}
+
+\code{strace -c} 能把一个程序一生跨越边界的次数统计出来——清单对应的是上面那个最小程序：\code{write} 只出现一次；即使把它改成打印十次，当输出重定向到文件或管道时（全缓冲），\code{write} 通常也只出现一次（stdio 已把十次合并），其余是装载期的 \code{mmap} 和 \code{openat}。数一数这些行，就是把本节所有的账再对一遍：
+
+\begin{lstlisting}
+$ strace -c ./hello
+hello, world
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 35.42    0.000017          17         1           execve
+ 18.75    0.000009           1         9           mmap
+ 16.67    0.000008           2         4         2 openat
+ 12.50    0.000006           6         1           write
+  8.33    0.000004           1         3         1 read
+  4.17    0.000002           1         2           close
+  4.17    0.000002           2         1           arch_prctl
+------ ----------- ----------- --------- --------- ----------------
+100.00    0.000048                    21         3 total
+\end{lstlisting}
+
+边界同时是观察边界：\code{strace} 看不见函数调用，只能看见系统调用，因为陷入点是用户态唯一的“海关”。调试器、审计、沙箱全都挂在这同一个点上——拦住边界，就拦住了一个进程对外能做的全部事情；这也是为什么容器隔离的实施点是“过滤系统调用”，而不是“检查程序代码”。
+
+边界的形态本身也是设计选择。宏内核把文件系统、驱动、协议栈都放在内核态，跨越成本是一次陷入；微内核把它们挪进用户态服务进程，跨越变成进程间消息——边界没有消失，只是挪了位置，而每次跨越的特权检查是物理事实，挪到哪里都要付。\code{time} 的输出把这笔开销记成两列：\code{user} 是用户态指令时间，\code{sys} 是内核代为执行的时间；\code{sys} 占比高的程序，多半就是边界跨越密集型。
+
+\begin{lstlisting}
+$ time ./hello
+hello, world
+real    0m0.002s
+user    0m0.001s
+sys     0m0.001s
+\end{lstlisting}
+
+本书末章的教学计算机项目的面包板机是对照的另一极：程序直接拨进 RAM，每个 MMIO 地址都均可直接访问，没有第二个特权级——那是“程序即内核”。多用户、多进程、要隔离要共享的系统必须有边界，而边界的全部成本，就是每次跨越时那一次受控陷入。
+
+\begin{warningbox}
+“库函数=系统调用”是最常见的混淆。\code{printf} 不是系统调用：它是用户态函数，把字符攒进缓冲区，只在缓冲满或换行刷新时才发起一次 \code{write}。用 \code{strace} 观察一个打印十次 \code{hello} 的程序：当输出重定向到文件或管道时（全缓冲），看不到十次 \code{write}——通常只有一次。判断依据不变：只有碰特权资源才需要陷入，拼字符串始终发生在用户态。
+\end{warningbox}
+
+\begin{classicnote}
+CSAPP 把异常控制流分成四类：中断、陷阱、故障、中止。本章的系统调用是陷阱（trap）——主动、同步、返回下一条；定时器中断是中断——被动、异步；缺页是故障——可修复、返回重试；段错误走到尽头是中止。一张表管住四种入口，剩下的全是各入口里的具体约定。
+\end{classicnote}
+
+\section{五、从源码到进程的完整案例}
+
+本节跟踪一个最小的 C 程序的一生——
+从源码，到进程退出、shell 打印出退出码为止。程序故意
+不用 \code{printf} 而直接调 \code{write}，这样它一生向内
+核提出的请求最少，看得最清楚：
+
+\begin{lstlisting}
+#include <unistd.h>
+
+int main(void)
+{
+        write(1, "hi\n", 3);
+        return 42;
+}
+\end{lstlisting}
+
+为了让地址看得见、对得上，本节统一用 \code{gcc -no-pie} 编
+出传统的固定地址可执行文件；位置无关可执行（PIE）只是把同
+一套机制整体搬到装载时才选定的基址上，步骤一步不少。
+
+\topic{编译链的四个阶段}\code{gcc} 自己并不编译任何东西，
+它是调度员：按固定顺序调用预处理器、编译器本体、汇编器和
+链接器，每一道程序只负责一种表示到下一种表示的翻译。预处
+理是文本层的翻译：宏展开、头文件拼接、条件编译裁剪，产物
+仍然是 C——这个最小的 \code{hello.c} 经过它变成几千行的
+\code{hello.i}，多出来的几乎全是头文件里的声明。编译是语
+义层的翻译：词法语法分析、类型检查、优化，最后把 C 语句变
+成 x86-64 汇编序列，产物还是文本。汇编是编码层的翻译：汇
+编器把每条助记符翻成机器码字节，装进 ELF 可重定位目标文
+件；从这一站起产物不再是文本，外部符号只有名字没有地址，
+机器码里留着空位和重定位记录（“链接：重定位与地址形成”一节）待补。链接是定址层的
+翻译：合并目标文件、解析符号、修补空位，再拼入启动文件与
+动态链接器路径，产出内核能装载的可执行文件。
+
+四把开关各让流水线停一站：
+
+\begin{lstlisting}
+$ gcc -E hello.c -o hello.i   # 停在预处理后：宏与头文件已展开
+$ gcc -S hello.i -o hello.s   # 停在编译后：x86-64 汇编文本
+$ gcc -c hello.s -o hello.o   # 停在汇编后：可重定位目标文件
+$ gcc hello.o -o hello        # 走完全程：可执行文件
+\end{lstlisting}
+
+\begin{longtable}{L{0.09\linewidth}L{0.12\linewidth}L{0.14\linewidth}L{0.14\linewidth}L{0.35\linewidth}}
+\toprule
+阶段 & 停站开关 & 输入 & 输出 & 这一层消去的东西 \\
+\midrule
+预处理 & \code{-E} & \code{hello.c} & \code{hello.i} & 宏、条件编译、头文件嵌套 \\\tablerowrule
+编译 & \code{-S} & \code{hello.i} & \code{hello.s} & 表达式、类型、控制流结构 \\\tablerowrule
+汇编 & \code{-c} & \code{hello.s} & \code{hello.o} & 助记符，只剩机器码与符号名 \\\tablerowrule
+链接 & 无（默认） & \code{hello.o} & \code{hello} & 一切未定的符号地址 \\
+\bottomrule
+\end{longtable}
+
+编译一站的产物值得亲眼过目（\code{-masm=intel} 输出，删
+去伪指令与标号细节）：
+
+\begin{lstlisting}
+main:
+        push    rbp
+        mov     rbp, rsp
+        mov     edx, 3              ; 第三参数：长度
+        lea     rsi, .LC0[rip]      ; 第二参数：字符串地址
+        mov     edi, 1              ; 第一参数：文件描述符 1
+        call    write@PLT
+        mov     eax, 42             ; 返回值放进 eax
+        pop     rbp
+        ret
+\end{lstlisting}
+
+C 的三条基本约定在这七条指令里全部现形：参数按
+\code{rdi}、\code{rsi}、\code{rdx} 依次传递，返回值放
+\code{eax}，调用与返回靠 \code{call} 与 \code{ret}——正
+是处理器核心相关章节讲的 ISA 约定在编译产物里的样子；\code{@PLT} 的
+来历，要等“装载与动态链接”一节讲完延迟绑定再回头认。工程上，四把开关是四
+扇观察窗：排错的第一问永远是“错在哪一层”。宏不对看
+\code{.i}，代码生成有疑问看 \code{.s}，符号未定义是链接层
+的事，装载期才报的错则与运行时找库的路径有关。错误发生在
+哪一层，决定该打开哪扇窗。
+
+\topic{\code{\_start} 与 \code{main} 之间的约定}内核装载
+完可执行文件，把 \code{rip} 置为 ELF 头里的入口地址。这个
+地址指向的不是 \code{main}——\code{main} 只是一个普通函
+数，没有任何硬件地位。入口指向链接时由启动文件
+（\code{crt1.o} 一族）提供的 \code{\_start}：
+
+\begin{lstlisting}
+$ readelf -h hello
+ELF Header:
+  Class:                             ELF64
+  Data:                              2's complement, little endian
+  Type:                              EXEC (Executable file)
+  Machine:                           Advanced Micro Devices X86-64
+  Entry point address:               0x401040
+\end{lstlisting}
+
+\code{\_start} 的处境比任何 C 函数都原始：它不是被谁“调
+用”的，栈上没有返回地址，只有内核按约定摆好的
+\code{argc}、\code{argv} 和环境变量。它的全部工作是把这堆
+原料整理成 C 世界的样子（下为化简后的指令序列）：
+
+\begin{lstlisting}
+_start:
+        xor     ebp, ebp            ; 帧指针清零：这是最外层帧
+        pop     rsi                 ; 新栈顶第一项是 argc（内核在用户栈上摆好 argc/argv）
+        mov     rdx, rsp            ; argv 数组紧随其后
+        and     rsp, -16            ; 调用前 rsp 按 16 字节对齐
+        mov     rdi, main           ; main 的地址作为第一参数
+        call    __libc_start_main   ; 进 C 运行时，不再返回
+        hlt                         ; 永远执行不到
+\end{lstlisting}
+
+三条细节值得停下来看。\code{and rsp, -16} 把栈指针低四位
+清零，满足 ABI 的硬约定：\code{call} 执行的前一刻
+\code{rsp} 必须是 16 的倍数，被调函数里才能安全使用要求
+对齐的 SSE 指令。\code{pop rsi} 取出 \code{argc} 之后，
+\code{rsp} 正好指向 \code{argv[0]}，于是一条
+\code{mov rdx, rsp} 就得到了 \code{argv}。
+\code{\_\_libc\_start\_main} 拿到 \code{main} 的地址后，
+先初始化 C 运行时（环境变量、线程局部存储、栈保护值），再
+按参数约定调用 \code{main}；\code{main} 返回后，它把返回
+值交给 \code{exit}，由 \code{exit} 跑完 \code{atexit} 登
+记的函数、冲洗标准库缓冲，最后发出 \code{exit\_group} 系
+统调用。
+
+所以“程序从 \code{main} 开始”是 C 运行时送的一份礼物：
+控制到达 \code{main} 时，栈已对齐、参数已按约定摆好、退出
+路径已挂好钩子。\code{return 42} 不是返回给内核，而是返
+回给 \code{\_\_libc\_start\_main}，由它转译成
+\code{exit\_group(42)}。退出码只有低 8 位会传给父进程：
+本例在 shell 里查看 \code{\$?} 看到 42；若让 \code{main}
+返回 256，看到的将是 0——256 的低 8 位全是零。本书末章的教学计算机项目的
+裸机上没有这份礼物：复位向量后面直接就是你的代码，栈要自
+己设，“退出”是一条停机指令，没有任何东西替你收尾。
+
+\topic{strace 看一次进程出生}“系统调用与异常控制流”一节说过，系统调用是特殊的
+异常入口。\code{strace} 借 \code{ptrace} 在每次陷入与返回
+时拦一下，把编号翻成名字、把寄存器翻成参数——它打印的就
+是进程一生向内核提出的全部请求的时间表。对这个最小程序，
+时间表短到可以全列出来（模拟输出，地址与布局随机器而
+异）：
+
+\begin{lstlisting}
+$ strace ./hello
+execve("./hello", ["./hello"], 0x7ffd9e5a2400 /* 18 vars */) = 0
+brk(NULL)                               = 0x1c56000
+mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7ffff7fca000
+access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
+openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
+openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
+read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0"..., 832) = 832
+mmap(NULL, 2125824, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7ffff7d00000
+mprotect(0x7ffff7d28000, 1851392, PROT_NONE) = 0
+close(3)                                = 0
+write(1, "hi\n", 3)                     = 3
+exit_group(42)                          = ?
++++ exited with 42 +++
+\end{lstlisting}
+
+真实输出里 \code{libc} 初始化还有几条调用，此处从略；剩下
+的每一行都能和本章的机制对上号：
+
+\begin{longtable}{L{0.17\linewidth}L{0.4\linewidth}L{0.29\linewidth}}
+\toprule
+系统调用 & 它在代表谁执行 & 对应本章机制 \\
+\midrule
+\code{execve} & 内核建地址空间、映射段、把控制交给动态链接器 &“装载与动态链接”一节装载；成功时永不返回 \\\tablerowrule
+\code{brk}/\code{mmap} & 动态链接器登记堆起点、申请工作区 &“装载与动态链接”一节虚拟内存区与按需调页 \\\tablerowrule
+\code{openat}/\code{read} & 动态链接器查缓存、找到并打开 \code{libc.so.6} &“装载与动态链接”一节动态库的查找路径 \\\tablerowrule
+\code{mmap}/\code{mprotect} & 把 \code{libc} 各段映射进来、按段表修正权限 &“装载与动态链接”一节段映射与页权限 \\\tablerowrule
+\code{write} & 你的 \code{main}：\code{rax} 为 1，经 \code{syscall} 陷入 &“系统调用与异常控制流”一节异常入口与参数约定 \\\tablerowrule
+\code{exit\_group} & \code{exit} 的最后一站，注销整个进程 &“系统调用与异常控制流”一节与本节的退出路径 \\
+\bottomrule
+\end{longtable}
+
+这张表里藏着两个反直觉的事实。其一，\code{execve} 是唯一
+一个“成功就不回来”的系统调用：行尾的 \code{= 0} 发生在
+一个崭新的地址空间里，原来那个调用者（shell 用
+\code{fork} 复制出的副本）已经被整体替换——\code{fork}
+返回两次，\code{execve} 一次也不返回，这对组合正是 shell
+启动每条命令的标准动作。其二，\code{write} 之前那一串
+\code{openat} 与 \code{mmap} 没有一条是你的代码发出的：
+动态链接的可执行文件，第一条用户态指令属于动态链接器
+\code{ld.so}；它跑完找库、映射、准备 GOT（“装载与动态链接”一节）之后，才
+把控制交给 \code{\_start}，然后才轮到 \code{main}。
+
+数字也都能闭合：\code{write} 返回 3，即实际写出的字节
+数；\code{exit\_group} 行尾是 \code{= ?}，因为它根本不返
+回，下一行 \code{+++ exited with 42 +++} 是 \code{strace}
+自己补的旁白，42 正是 \code{main} 的返回值。从 C 的
+\code{return} 到 shell 的退出码，整条链在一张表里走完。
+若改用 \code{-static} 静态链接重跑一遍，\code{execve} 与
+\code{write} 之间几乎一片空白——那串调用全是动态链接为
+“共享库”三个字付的装载期成本，也是“装载与动态链接”一节说的装载时重定
+位代价里最显眼的部分。
+
+拿其中最短的一行做字段分解，strace 每行打印的几段内容都能指回陷入时的寄存器：
+
+\begin{pdfdiagram}
+  \node[hw label] at (5.6,2.2) {strace 一行 ＝ 调用名 ＋ 参数 ＋ 返回值（＋ 耗时）};
+  \node[hw compute, minimum width=1.8cm, align=center] (f1) at (1.2,1.0) {\code{write}\\调用名\\由 rax 编号译出};
+  \node[hw compute, minimum width=3.4cm, align=center] (f2) at (4.3,1.0) {\code{(1, "hi\textbackslash n", 3)}\\参数\\由 rdi/rsi/rdx 译出};
+  \node[hw compute, minimum width=2.2cm, align=center] (f3) at (7.5,1.0) {\code{= 3}\\返回值\\由 rax 带回};
+  \node[hw compute, minimum width=2.4cm, align=center] (f4) at (10.1,1.0) {\code{<0.000012>}\\耗时\\\code{-T} 选项追加};
+  % 字段之间的衔接短横（非数据流，只表示同行相连）
+  \draw[BookMuted, line width=0.62pt] (f1.east) -- (f2.west);
+  \draw[BookMuted, line width=0.62pt] (f2.east) -- (f3.west);
+  \draw[BookMuted, line width=0.62pt] (f3.east) -- (f4.west);
+  \node[hw label, align=center] at (5.6,-0.4) {编号与寄存器值都被 ptrace 拦下后译成可读形式\\失败时返回值一段写作 \code{= -1 ENOENT} 这样的形式};
+\end{pdfdiagram}
+\diagramnote{典型 strace 行的字段分解（调用行与正文 \code{write(1, "hi\textbackslash n", 3) = 3} 一致）。\code{strace} 借 \code{ptrace} 在每次陷入与返回时拦一下：陷入时读 \code{rax} 译出调用名、读 \code{rdi}/\code{rsi}/\code{rdx} 译出参数，返回时读 \code{rax} 译出返回值——出错则印成 \code{= -1 ENOENT} 加一行说明；耗时一段只有加 \code{-T} 才出现在行尾（图中数值为示例）。一行的四段，全部来自“系统调用与异常控制流”一节那条 ABI 约定里的寄存器。}
+
+读这张表还有几个顺手的工具用法。\code{strace -f} 会把
+\code{fork} 出的子进程一并跟踪，shell 管道的每一环都能看
+到；\code{strace -c} 不逐行打印，结束时给一张按耗时排序的
+系统调用统计表，先找“哪类调用最多”再回头细看，是性能排
+查的常规第一步；\code{strace -e trace=openat} 这类过滤开
+关只保留关心的调用，用来对付输出以万行计的大程序。时间表
+是本章所有机制的公共观察窗：装载、动态链接、系统调用、退
+出清理，每一节的内容都能在这张表里找到对应的行。
+
+\topic{程序退出时内核回收什么}\code{exit\_group}（编号
+231）是进程的终点，也是看清“进程是什么”的最好窗口。对
+用户来说，进程是一个正在运行的程序；对内核来说，进程是一
+组挂在 \code{task\_struct} 上的数据结构：\code{mm\_struct}
+描述地址空间（页表加虚拟内存区链表），
+\code{files\_struct} 是文件描述符表，再加信号表、子进程链
+表、时钟统计。退出，就是按固定顺序注销这组结构。
+
+严格说，\code{exit\_group} 之前还有一层分工要辨清：
+\code{exit} 是 C 库函数，负责用户态的收尾——按注册的逆
+序跑 \code{atexit} 函数、冲洗 stdio 缓冲区；\code{\_exit}
+才是薄包装，直接把控制交进内核。差别在缓冲上最明显：若
+\code{main} 里用的是 \code{printf} 且输出不含换行，数据可
+能还躺在用户态缓冲里，直接调 \code{\_exit} 会把这些字节
+丢掉；\code{exit} 则先把它们冲刷出去，再走
+\code{exit\_group}。本节程序用 \code{write} 不用
+\code{printf}，也正是为了绕开这层缓冲，让输出与系统调用
+一一对应。
+
+地址空间最先退场：\code{mm\_struct} 的引用计数归零后，页
+表与虚拟内存区链表被释放，匿名页和私有映射页回空闲链表；
+共享映射（比如 \code{libc} 的代码页）只减一次引用计数，别
+的进程还在用就一页不还——这正是“装载与动态链接”一节“多个进程共享一份
+库代码”的镜像。文件描述符表随后：每个表项对内核文件对象
+减一次计数，计数归零才真正关闭；这解释了 \code{fork} 之后
+管道的经典现象——父子各持一份写端，必须两边都关闭，读端
+才看得到 EOF。最后是亲属关系：退出者的子进程被过继给 1 号
+进程，保证每个“孤儿”将来都有人为它收尸。
+
+把这三项注销画成一张清单图，“进程是什么”就成了挂在 \code{task\_struct} 上的三笔：
+
+\begin{pdfdiagram}
+  \node[hw control, minimum width=2.8cm, align=center] (task) at (1.6,0.6) {task\_struct\\进程控制块};
+  \node[hw state, minimum width=3.8cm, align=center] (i1) at (8.0,2.2) {地址空间 mm\_struct\\页表与映射释放\\共享页只减一次计数};
+  \node[hw state, minimum width=3.8cm, align=center] (i2) at (8.0,0.6) {描述符表 files\_struct\\逐项减计数\\归零才真正关闭};
+  \node[hw state, minimum width=3.8cm, align=center] (i3) at (8.0,-1.0) {子进程链表\\过继给 1 号进程};
+  % 共享干线扇出到三项
+  \draw[hw bus] (task.east) -- (4.6,0.6);
+  \draw[hw bus] (4.6,0.6) -- (4.6,2.2) -- (i1.west);
+  \draw[hw bus] (4.6,0.6) -- (i2.west);
+  \draw[hw bus] (4.6,0.6) -- (4.6,-1.0) -- (i3.west);
+  \fill[BookMuted] (4.6,0.6) circle (0.05);
+  \node[hw label, fill=white, inner sep=1pt] at (4.6,1.6) {逐项注销};
+  % 注销之后留下的骨架
+  \node[hw state, minimum width=2.8cm, align=center] (zomb) at (1.6,-1.7) {僵尸态：仅剩\\退出码与统计\\等父进程 wait};
+  \draw[hw return] (task.south) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{留骨架} (zomb.north);
+\end{pdfdiagram}
+\diagramnote{\code{exit\_group} 之后内核的三项注销。地址空间最先退场：\code{mm\_struct} 引用计数归零后页表与映射释放，共享映射只减一次计数——别的进程还在用就一页不还；描述符表随后：每个表项对内核文件对象减一次计数，归零才真正关闭；最后是亲属关系：退出者的子进程过继给 1 号进程。三项办完，\code{task\_struct} 仍留一条骨架记录——退出码还没交到父进程手里，进程以僵尸态等 \code{wait} 来取。}
+
+但 \code{task\_struct} 本身不能立刻删——退出码还没交到
+父进程手里。于是 \code{exit\_group} 之后进程进入僵尸态：
+只剩一条骨架记录（退出码与资源统计），不占地址空间，永不
+再被调度，等父进程用 \code{wait} 一族来取。父进程拿到的
+是 32 位状态字，正常退出时退出码放在第 8 到 15 位：本例
+的 42 对应原始状态值 42 左移 8 位，即 10752（十六进制
+\code{0x2a00}），宏 \code{WEXITSTATUS} 做的就是右移 8 位
+再取低 8 位。若父进程先死，过继来的子进程由 1 号进程负责
+收取，系统里不会留下无人认领的僵尸；真正会留僵尸的情形只
+有一种——父进程活着却忘了 \code{wait}，那是 \code{ps}
+输出里状态列 \code{Z} 的来历。
+
+“进程结束”因此不是一个硬件事件，而是内核数据结构的注销
+顺序；僵尸也不是故障，是“退出码必须可靠传给父进程”这条
+约定的必然代价。判断一个进程是否死透了，等价于问三个问
+题：地址空间还了吗，描述符表清空了吗，最后那条
+\code{task\_struct} 记录有人领走吗。
+
+\topic{与本书末章的教学计算机项目裸机路径的对照}把本节的托管路径与本书末章的教学计算机项目的
+裸机路径并排摆，会看到同一件事——“程序出生”——在两
+个世界的两种做法。本书末章的教学计算机项目的机器上，链接地址在构建时定死：
+复位向量的值就是程序的物理地址；装载器就是你自己——烧写
+器把镜像写进 ROM，或拨码开关逐字节拨进 RAM；复位后的第一
+条指令就是全部启动代码，没有 \code{crt}，更没有动态链接
+器；输出一个字符，是往 I/O 端口或内存映射的显存写一个字
+节，走存储与设备事务相关章节的 I/O 路径；“退出”是停机指令或原地跳转，
+没有内核，自然也没有谁来回收什么。本节的世界相反：链接时
+地址可以待定，装载由内核 \code{execve} 完成，\code{main}
+之前已有 \code{ld.so} 和 \code{\_start} 跑了一整圈，输出
+要经 \code{write} 请内核代劳，退出由内核逐项注销。
+
+\begin{longtable}{L{0.14\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
+\toprule
+维度 & 裸机镜像（本书末章的教学计算机项目） & 托管进程（本章） \\
+\midrule
+链接地址 & 构建时定死的固定地址 & \code{-no-pie} 时链接时定址（本章）；PIE 时只定相对偏移，基址由内核装载时定 \\\tablerowrule
+装载者 & 烧写器或拨码开关，即你自己 & 内核 \code{execve} 加动态链接器 \\\tablerowrule
+入口 & 复位向量直指你的第一条指令 & 入口指向 \code{\_start}，\code{main} 前还有一层 \\\tablerowrule
+输出一个字符 & 直接写 I/O 端口或显存（存储与设备事务相关章节） & \code{write} 系统调用，内核驱动硬件 \\\tablerowrule
+退出 & 停机或死循环，无人回收 & \code{exit\_group}，内核逐项注销数据结构 \\
+\bottomrule
+\end{longtable}
+
+两个世界的分界线只有一条：有没有内核代为执行。有内核，地
+址空间是借来的，文件是借来的，碰硬件要经“系统调用与异常控制流”一节的异常入口
+申请；作为交换，装载、符号收尾、设备驱动、退出清理全有人
+包办。没有内核，全部物理地址都归你，全部中断（存储与设备事务相关章节）也
+都冲你来，自由与负担同比例放大。经典芯片与平台案例讲的启动链——固
+件、引导程序、内核接力——正是从前一个世界走进后一个世
+界的那座桥：引导程序活在裸机世界，它做的最后一件事是把内
+核请进内存；内核一旦接管，桥的这边就改按托管世界的规矩
+办。
+
+把两条路径画成双列对照，中间那条虚线就是“有没有内核”的分界：
+
+\begin{pdfdiagram}
+  \node[hw label] at (2.6,2.9) {裸机路径（经典芯片与平台案例）};
+  \node[hw label] at (9.1,2.9) {托管路径（本章）};
+  \draw[BookMuted, line width=0.5pt, dashed] (5.85,-2.2) -- (5.85,2.55);
+  \node[hw label] at (5.85,-2.55) {分界线：有没有内核};
+  % 左列：裸机
+  \node[hw compute, minimum width=4.0cm, align=center] (b1) at (2.6,2.0) {链接脚本限定地址\\入口＝复位向量};
+  \node[hw compute, minimum width=4.0cm, align=center] (b2) at (2.6,0.9) {烧写器/拨码装载\\镜像进 ROM/RAM};
+  \node[hw compute, minimum width=4.0cm, align=center] (b3) at (2.6,-0.2) {输出：直写 I/O 端口\\或显存（存储与设备事务相关章节）};
+  \node[hw compute, minimum width=4.0cm, align=center] (b4) at (2.6,-1.3) {退出：停机或死循环\\无人回收};
+  \draw[hw bus] (b1.south) -- (b2.north);
+  \draw[hw bus] (b2.south) -- (b3.north);
+  \draw[hw bus] (b3.south) -- (b4.north);
+  % 右列：托管
+  \node[hw state, minimum width=4.0cm, align=center] (h1) at (9.1,2.0) {链接定相对偏移\\基址装载时才定};
+  \node[hw state, minimum width=4.0cm, align=center] (h2) at (9.1,0.9) {execve＋ld.so 装载\\建映射、填 GOT};
+  \node[hw state, minimum width=4.0cm, align=center] (h3) at (9.1,-0.2) {输出：write 系统调用\\内核驱动硬件};
+  \node[hw state, minimum width=4.0cm, align=center] (h4) at (9.1,-1.3) {退出：exit\_group\\内核逐项注销};
+  \draw[hw bus] (h1.south) -- (h2.north);
+  \draw[hw bus] (h2.south) -- (h3.north);
+  \draw[hw bus] (h3.south) -- (h4.north);
+\end{pdfdiagram}
+\diagramnote{裸机路径与托管路径的双列对照（与正文表格同一内容）。同一行是同一件事的两种做法：定址、装载、输出、退出。左列没有内核，链接脚本把地址限定、装载靠自己、输出直写硬件、退出无人收尾；右列有内核，每一步都有人代办，代价是每次碰硬件都要经系统调用申请。两列的分界线只有一条：有没有内核代为执行。}
+
+\begin{classicnote}
+经典教材把 \code{fork}、\code{execve}、\code{exit} 与信号
+一并归入“异常控制流”：它们和系统调用一样，都是控制从用
+户态到内核态的异常转移。本节的 \code{strace} 输出可以读成
+这种转移留下的时间表——每一行都是一次让渡与一次归还。
+把程序的一生读成一张系统调用时间表，是理解进程最不容易过
+时的方式。
+\end{classicnote}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{六、从目标文件、固件到可启动机器}
 
 \topic{目标文件里的符号最终要变成地址}
 汇编器或编译器产生的目标文件通常还不知道所有最终地址。函数名、全局变量名、外部符号和跳转目标先以符号或重定位项表示。链接器把多个目标文件和库合并，决定代码段、只读数据段、数据段、BSS 段等放到什么地址，并把需要修补的位置改成最终地址或相对偏移。
@@ -604,2272 +2710,7 @@ GPU 命令路径 & 命令缓冲、资源可见性、VRAM、fence、显示扫描 
 \bottomrule
 \end{longtable}
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-\begin{longtable}{L{0.2\linewidth}L{0.4\linewidth}L{0.3\linewidth}}
-\toprule
-阶段 & 做什么 & 对应的硬件动作 \\
-\midrule
-编译 & 源码变目标文件 & 生成指令编码和重定位记录 \\\tablerowrule
-链接 & 合并目标文件、解析符号 & 把符号名变成确定地址 \\\tablerowrule
-装载 & 把程序映像放进内存 & 建立页表、映射段 \\\tablerowrule
-运行 & 请求内核服务 & 系统调用陷入异常入口 \\
-\bottomrule
-\end{longtable}
-
-\begin{keyidea}
-链接和装载不是编译器内部魔法，而是“什么时候把哪个名字定成哪个地址”的时间表。读懂这张时间表，静态库、动态库、PLT、系统调用这些名词都会各就各位。
-\end{keyidea}
-
-\section{二、目标文件与符号}
-
-本节回答一个问题：编译器交出来的目标文件，里面到底装
-了什么。前面二十四章讲的都是硬件怎样执行指令，从本节开
-始换一个视角：指令被执行之前，先作为字节躺在文件里。
-目标文件就是这批字节的容器，读懂它只需要一张“哪段字
-节是什么、给谁看”的地图。
-
-\topic{ELF 是目标文件的通用容器}
-x86-64 Linux 上，编译器每处理一个源文件就交出一个 ELF
-目标文件，链接器拼出的可执行文件是 ELF，共享库也是
-ELF。ELF（Executable and Linkable Format）是这一整条流
-程的通用容器：同一套字节排布约定，既能让链接器读到“这
-里有一段代码、那里有一张符号表”，也能让内核装载器读到
-“把哪一段映射到哪个虚拟地址”——后者是第三节的事。
-
-容器从固定格式的头部开始。前 16 字节是身份区：头 4 字
-节是魔数 \code{0x7F} 加字母 \code{E}、\code{L}、
-\code{F}，任何工具拿到文件先核对这个签名，对不上就立
-刻拒收；随后两个字节说明类别（32 位还是 64 位）和字节
-序（大端还是小端）——只凭这两个字段，解析程序就知道
-后面所有多字节字段该按什么宽度、什么顺序读。头部其余
-字段里最重要的几个列在下表。
-
-\begin{longtable}{L{0.14\linewidth}L{0.4\linewidth}L{0.32\linewidth}}
-\toprule
-字段 & 内容 & 谁来读 \\
-\midrule
-\code{e\_type} & 文件类型：ET\_REL / ET\_EXEC / ET\_DYN & 一切工具先按它分流 \\\tablerowrule
-\code{e\_machine} & 指令集编号，x86-64 为 62 & 链接器据此拒绝混链不同 ISA \\\tablerowrule
-\code{e\_entry} & 进程入口的虚拟地址 & 装载器；可重定位文件恒为 0 \\\tablerowrule
-\code{e\_phoff} & 程序头表（段表）的文件偏移 & 装载器 \\\tablerowrule
-\code{e\_shoff} & 节头表（节表）的文件偏移 & 链接器与观察工具 \\
-\bottomrule
-\end{longtable}
-
-三种类型对应程序出生过程的三个形态。可重定位文件
-（\code{.o}）是半成品：代码和数据都在，但地址一律未
-定，凡涉及地址的字段全部留空，另附一叠“这里以后要
-填”的重定位记录。可执行文件是成品：每个节的虚拟地址
-已定，入口字段指向第一条要执行的指令（现代发行版常把
-可执行文件编成 ET\_DYN 形态的 PIE，把定址推迟到装载
-时，第三节展开）。共享库（\code{.so}）介于两者之间：
-代码数据齐全，却故意不绑定固定装载地址，好让多个进程
-各自把它映射到不同位置。三种形态共用一套头部与节表格
-式，差别只在几个字段的取值和洞里填没填。
-
-头部之后是两份“目录”，给出同一批字节的两种看法。节
-表（section header table）逐项列出每个节的名字、类
-型、大小、文件偏移和属性标志，这是链接视图：链接器按
-节合并、按节定址。程序头表（program header table，常
-称段表）把属性相同的若干节归并成段，逐项给出段的虚拟
-地址、文件范围和读写执行权限，这是执行视图：装载器只
-看它，根本不关心 \code{.text} 叫什么名字。可重定位文
-件通常只有节表——它离执行还早；可执行文件两份都有，
-装载时只用段表。同一份字节，链接器和装载器各取所需，
-这正是“通用容器”的含义。
-
-两份目录的分工画成对视图更
-直观：左边的节按名字与用途
-分，右边的段按权限归并，箭
-头就是链接器的归并动作：
-
-\begin{pdfdiagram}
-  % 左列：链接视图（节表）
-  \node[hw label] at (1.5,3.3) {链接视图：节表};
-  \node[hw compute, minimum width=2.6cm] (st) at (1.5,2.6) {.text};
-  \node[hw compute, minimum width=2.6cm] (sr) at (1.5,1.8) {.rodata};
-  \node[hw compute, minimum width=2.6cm] (sd) at (1.5,1.0) {.data};
-  \node[hw memory, minimum width=2.6cm, dashed] (sb) at (1.5,0.2) {.bss};
-  \node[hw state, minimum width=2.6cm, align=center] (ss) at (1.5,-0.8) {.symtab / .strtab\\符号与字符串};
-  % 右列：执行视图（段表）
-  \node[hw label] at (9.3,3.3) {执行视图：段表};
-  \node[hw state, minimum width=3.2cm, align=center] (lx) at (9.3,2.6) {LOAD：读/执行};
-  \node[hw state, minimum width=3.2cm, align=center] (lr) at (9.3,1.8) {LOAD：只读};
-  \node[hw state, minimum width=3.2cm, align=center] (lw) at (9.3,0.6) {LOAD：读写};
-  \node[hw label, align=center] (ln) at (9.3,-0.8) {不进段表\\装载器不看};
-  % 归并箭头：同级水平直连
-  \draw[hw bus] (st.east) -- (lx.west);
-  \draw[hw bus] (sr.east) -- (lr.west);
-  % .data 与 .bss 共享一小段干线，汇入同一个读写段
-  \draw[hw bus] (sd.east) -- (4.9,1.0) -- (4.9,0.6) -- (lw.west);
-  \draw[hw bus] (sb.east) -- (4.3,0.2) -- (4.3,0.6) -- (4.9,0.6);
-  \fill[BookMuted] (4.9,0.6) circle (0.05);
-  \node[hw label, fill=white, inner sep=1pt] at (6.2,0.32) {按属性归并};
-  % 符号表与字符串表只供链接期
-  \draw[hw return] (ss.east) -- (ln.west);
-\end{pdfdiagram}
-\diagramnote{同一份字节的两种看法。链接视图按节组织：名字、类型、大小与属性逐项登记在节表里，链接器按节合并、按节定址；执行视图把属性相同的节归并成 LOAD 段，只保留虚拟地址、文件范围与读写执行权限，装载器只看这一份。可重定位文件通常只有节表；可执行文件两份都有，装载时只用段表——\code{strip} 把节表整个剥掉，程序照样运行。}
-
-把这份容器按文件偏移画成竖向排布，头部、两份目录与各节的位置关系便一目了然；\code{readelf} 的每个常用选项，恰好对应图中的一块：
-
-\begin{pdfdiagram}
-  % 主体：按文件偏移自上而下排布的字节布局
-  \node[hw state, minimum width=3.4cm] (ehdr) at (1.6,4.5) {ELF 头（64 字节）\\魔数、e\_phoff、e\_shoff};
-  \node[hw state, minimum width=3.4cm] (phdr) at (1.6,3.3) {程序头表（段表）\\执行视图，装载器读};
-  \node[hw compute, minimum width=3.4cm] (sect) at (1.6,2.1) {.text：指令编码};
-  \node[hw compute, minimum width=3.4cm] (srod) at (1.6,1.2) {.rodata：只读常量};
-  \node[hw compute, minimum width=3.4cm] (sdat) at (1.6,0.3) {.data：已初始化数据};
-  \node[hw memory, minimum width=3.4cm, dashed] (sbss) at (1.6,-0.6) {.bss：不占文件字节};
-  \node[hw memory, minimum width=3.4cm] (ssym) at (1.6,-1.5) {.symtab：符号表};
-  \node[hw state, minimum width=3.4cm] (shtab) at (1.6,-2.4) {节头表（节表）\\链接视图，链接器读};
-  % 左侧：文件偏移增长方向
-  \draw[BookMuted, line width=0.6pt, ->] (-0.6,4.5) -- (-0.6,-2.4);
-  \node[hw label, anchor=east] at (-0.75,1.0) {文件偏移增大};
-  % 右侧：readelf 各选项（虚线指出读取的部分）
-  \node[hw label, anchor=west] (rh) at (4.3,4.5) {\code{readelf -h}：读 ELF 头};
-  \node[hw label, anchor=west] (rl) at (4.3,3.3) {\code{readelf -l}：读段表};
-  \node[hw label, anchor=west] (rs) at (4.3,-1.5) {\code{readelf -s}：读符号表};
-  \node[hw label, anchor=west] (rS) at (4.3,-2.4) {\code{readelf -S}：读节表};
-  \draw[hw return] (rh.west) -- (ehdr.east);
-  \draw[hw return] (rl.west) -- (phdr.east);
-  \draw[hw return] (rs.west) -- (ssym.east);
-  \draw[hw return] (rS.west) -- (shtab.east);
-\end{pdfdiagram}
-\diagramnote{ELF 文件按字节偏移的排布（自上而下偏移增大）。ELF 头中的 \code{e\_phoff} 与 \code{e\_shoff} 分别给出段表与节表的文件偏移；\code{.bss} 是 NOBITS 类型，节表里只登记大小，文件里一个字节也不占，图中用虚线框表示。右侧标出 \code{readelf} 各选项读取的部分：同一份字节，链接器取节表与符号表，装载器只取段表。}
-
-最后要戳破一层神秘感：ELF 没有任何魔法，它只是按约定
-排布的字节。文件自己并不“知道”节表在哪，是工具按
-\code{e\_shoff} 找过去的；头部里某个偏移写错，读出来
-的就是垃圾，没有类型系统代为保证正确性。本书反复出现的主题
-在这里再次出现：软与硬之间、工具与文件之间，一切协作
-都靠约定，不靠神秘力量。
-
-\topic{常见节的分工}
-打开任意一个目标文件的节表，总能见到几张熟面孔。它们
-的分工不是编译器的发明，而是把“用途与权限相同”的字
-节归在一起：用途决定放在哪，权限决定内存页怎么保护。
-
-\code{.text} 装指令字节，属性是分配、只读、可执行；
-\code{.rodata} 装只读常量——字符串字面量、\code{const}
-全局量、编译器为 \code{switch} 生成的跳转表，属性是分
-配、只读；\code{.data} 装初值非零的全局变量和静态局部
-变量，文件里存的就是初值本身，属性是分配、可写；
-\code{.bss} 装未初始化或初值恰为零的全局量与静态量，
-属性同样是分配、可写，但它在文件里一个字节都不占。
-
-\begin{longtable}{L{0.12\linewidth}L{0.34\linewidth}L{0.16\linewidth}L{0.24\linewidth}}
-\toprule
-节 & 装什么 & 占文件字节 & 内存权限 \\
-\midrule
-\code{.text} & 指令编码 & 占 & 只读、可执行 \\\tablerowrule
-\code{.rodata} & 字符串、const 常量、跳转表 & 占 & 只读 \\\tablerowrule
-\code{.data} & 初值非零的全局/静态变量 & 占，内容即初值 & 可读写 \\\tablerowrule
-\code{.bss} & 未初始化或初值为零的变量 & 不占 & 可读写，装载时清零 \\
-\bottomrule
-\end{longtable}
-
-\code{.bss} 省空间的机制一句话就能说清：它的节头类型
-是 NOBITS，节表里只有名字、大小和对齐要求，没有对应
-的文件范围；装载器读到它时不复制任何字节，直接在内存
-里划出大小相等的一片并填零。这与装载器的既有动作正好
-合拍——内核给新映射提供的本来就是填零的页（第三节的
-装载过程还会用到），所以
-\code{.bss} 的清零几乎不花额外代价。
-
-省多少可以算出来。假设程序里有一个 1 MiB 的未初始化
-静态数组：若放进 \code{.data}，目标文件要多存 1 MiB
-内容，而这 1 MiB 全是零字节，运载的信息量却是零；放
-进 \code{.bss}，文件只多一行几十字节的节头记录，内存
-里照样得到 1 MiB 全零空间。文件的职责是保存非零信
-息；全零内容用“长度加填零”几个字就说完了。C 的规则
-也顺着这个机制设计：显式初始化为零的变量同样进
-\code{.bss}——\code{int x = 0;} 与 \code{int x;} 同等
-待遇，只有初值非零才需要 \code{.data} 里的真实字节。
-
-节的属性标志不是注释，它们会一路传到硬件。链接器按属
-性把节归并成段，段头里的读写执行标志最终被装载器转成
-页表项的权限位：于是 \code{.text} 所在页不可写、
-\code{.data} 所在页不可执行。这些保护不是操作系统额
-外的好意，而是目标文件里早就写明的属性，经链接、装载
-两步原样传给 MMU。存储与设备事务相关章节问页表项权限位的来历，答案
-有一半就在这里。
-
-\topic{符号表是名字到位置的映射}
-节回答了“字节是什么”，还没回答“名字在哪”。
-\code{main.c} 里调用 \code{add}，编译器生成
-\code{main.o} 时并不知道 \code{add} 的地址——它可能
-根本不在本文件里。目标文件的处理办法是：把每个名字连
-同它的状态登记进符号表 \code{.symtab}，名字与位置的
-对应关系全部走这张表。
-
-符号表每个条目记录：名字（字符串存在 \code{.strtab}，
-条目里存偏移）、值（\code{st\_value}：可重定位文件里
-是节内偏移，可执行文件里是虚拟地址）、大小、类型（函
-数 FUNC、数据 OBJECT）、绑定属性，以及“定义在哪个
-节”。最后一项是定义与引用的分界线：纯引用的条目这一
-栏是 UND（未定义），意思是“这个名字本文件要用，定义
-在别处”；有定义的条目这一栏是本文件某个节的编号。
-
-绑定属性分三档。LOCAL 是文件内私有：\code{static} 修
-饰的函数和变量都是 LOCAL，不参与跨文件解析，别的文件
-有同名符号也互不干扰。GLOBAL 是默认档：普通函数与全
-局变量，在全程序范围内参与解析。WEAK 是可以商量档：
-弱定义遇到同名 GLOBAL 强定义时自动让位，没有强定义时
-才用它——库常用弱符号提供可替换的默认实现；弱引用更
-宽容，找不到定义也不报错，运行时取到 0，由程序自己判
-空。
-
-\begin{longtable}{L{0.2\linewidth}L{0.28\linewidth}L{0.38\linewidth}}
-\toprule
-类别 & 怎么产生 & 链接器怎么处理 \\
-\midrule
-LOCAL & \code{static} 函数/变量 & 不进全局解析，只供本文件与调试器 \\\tablerowrule
-GLOBAL 定义 & 普通函数、全局变量 & 全程序只允许一个强定义 \\\tablerowrule
-GLOBAL 引用（UND） & 调用或访问外部名字 & 必须在某个输入文件里找到定义 \\\tablerowrule
-WEAK 定义 & \code{\_\_attribute\_\_((weak))} & 有强定义则让位，否则用它 \\
-\bottomrule
-\end{longtable}
-
-链接器两个经典报错都来自这张表。未定义引用：扫完所有
-输入文件，某个 UND 条目始终没找到对应的 GLOBAL 定义，
-于是报告 \code{undefined reference to `foo'}——这不是
-玄学，是符号表一次查询失败的回执。多重定义：同一名字
-出现两个 GLOBAL 强定义，链接器无法裁决哪个算数，只能
-拒绝。在 C 头文件里误定义非 \code{static}、非
-\code{inline} 的变量，被多个源文件包含后各产生一个强
-定义，正是这个错误的头号来源。
-
-把符号表看成“接口的物理形态”很有用：目标文件对外提
-供什么（GLOBAL 定义）、向外索取什么（UND 引用），表
-上一目了然。第二节的符号解析、第三节的动态链接，处理
-的始终是这三个问题：名字是谁、值是多少、定义在不在
-场。
-
-\topic{用 readelf/objdump 观察真实目标文件}
-这些结构不必靠想象，工具可以直接翻开看。常用的四个用
-法：\code{readelf -h} 读头部，核对类型、机器、入口和
-两份目录的位置；\code{readelf -S} 列节表，看每个节的
-类型、偏移、大小和属性标志；\code{readelf -s} 列符号
-表；\code{objdump -d -M intel} 反汇编 \code{.text}，换
-\code{-r} 则看重定位记录。拿一个最小源文件完整试一
-遍：
-
-\begin{lstlisting}
-/* min.c */
-int  counter = 42;        /* 初值非零：进 .data    */
-const char msg[] = "hi";  /* 只读常量：进 .rodata  */
-int  stash;               /* 未初始化：进 .bss     */
-
-int bump(int x)           /* 函数体：进 .text      */
-{
-    counter += x;         /* 两条指令引用 counter  */
-    return counter;
-}
-\end{lstlisting}
-
-用 \code{gcc -c -O1 -o min.o min.c} 编译，然后逐个窗口
-看进去。第一扇窗是头部，注意类型、机器、入口和两份目
-录的位置：
-
-\begin{lstlisting}
-$ readelf -h min.o
-ELF Header:
-  Magic:   7f 45 4c 46 02 01 01 00 00 00 00 00 00 00 00 00
-  Class:                             ELF64
-  Data:                              2's complement, little endian
-  Version:                           1 (current)
-  OS/ABI:                            UNIX - System V
-  Type:                              REL (Relocatable file)
-  Machine:                           Advanced Micro Devices X86-64
-  Entry point address:               0x0
-  Start of program headers:          0 (bytes into file)
-  Start of section headers:          472 (bytes into file)
-  Size of this header:               64 (bytes)
-  Number of program headers:         0
-  Number of section headers:         9
-  Section header string table index: 8
-\end{lstlisting}
-
-魔数之后，\code{02} 表示 64 位、\code{01} 表示小端，与
-本机一致；类型 REL 说明这是半成品，所以入口地址是 0、
-程序头表个数也是 0——离执行还早，段表还没必要存在。
-第二扇窗是节表：
-
-\begin{lstlisting}
-$ readelf -S min.o
-There are 9 section headers, starting at offset 0x1d8:
-
-Section Headers:
-  [Nr] Name       Type     Address          Off    Size   ES Flg Lk Inf Al
-  [ 0]            NULL     0000000000000000 000000 000000 00      0   0  0
-  [ 1] .text      PROGBITS 0000000000000000 000040 00000d 00  AX  0   0  1
-  [ 2] .rela.text RELA     0000000000000000 0001a8 000030 18   I  6   1  8
-  [ 3] .data      PROGBITS 0000000000000000 000050 000004 00  WA  0   0  4
-  [ 4] .bss       NOBITS   0000000000000000 000054 000004 00  WA  0   0  4
-  [ 5] .rodata    PROGBITS 0000000000000000 000054 000003 00   A  0   0  1
-  [ 6] .symtab    SYMTAB   0000000000000000 000058 0000f0 18      7   6  8
-  [ 7] .strtab    STRTAB   0000000000000000 000148 00001e 00      0   0  1
-  [ 8] .shstrtab  STRTAB   0000000000000000 000166 00003f 00      0   0  1
-Flags: W (write), A (alloc), X (execute), I (info)
-\end{lstlisting}
-
-三处细节值得停下来看。第一，所有节的 Address 一栏全
-是 0——地址还不存在，这正是“半成品”最直观的迹象。
-第二，\code{.bss} 的文件偏移（0x54）与 \code{.rodata}
-相同：NOBITS 不占文件字节，所以“链接：重定位与地址形成”一节从同一偏移接着
-排，而它的 4 字节大小照样登记在案，装载时按这个数划
-出内存。第三，\code{.text} 只有 13 字节——一个函数
-的全部代码就这么多，里面还留着两个待填的洞。第三扇
-窗是符号表：
-
-\begin{lstlisting}
-$ readelf -s min.o
-Symbol table '.symtab' contains 10 entries:
-   Num:    Value          Size Type    Bind   Vis      Ndx Name
-     0: 0000000000000000     0 NOTYPE  LOCAL  DEFAULT  UND
-     1: 0000000000000000     0 FILE    LOCAL  DEFAULT  ABS min.c
-     2: 0000000000000000     0 SECTION LOCAL  DEFAULT    1
-     3: 0000000000000000     0 SECTION LOCAL  DEFAULT    3
-     4: 0000000000000000     0 SECTION LOCAL  DEFAULT    4
-     5: 0000000000000000     0 SECTION LOCAL  DEFAULT    5
-     6: 0000000000000000    13 FUNC    GLOBAL DEFAULT    1 bump
-     7: 0000000000000000     4 OBJECT  GLOBAL DEFAULT    3 counter
-     8: 0000000000000000     4 OBJECT  GLOBAL DEFAULT    4 stash
-     9: 0000000000000000     3 OBJECT  GLOBAL DEFAULT    5 msg
-\end{lstlisting}
-
-源码里的四个名字各就各位：\code{bump} 是 13 字节的
-FUNC，定义在 1 号节（\code{.text}）；\code{counter} 是
-4 字节 OBJECT，在 3 号节（\code{.data}）；\code{stash}
-在 4 号节（\code{.bss}）；\code{msg} 是 3 字节（连结尾
-的 \code{'\textbackslash 0'}），在 5 号节
-（\code{.rodata}）。Value 一栏全是 0：它们目前都只是
-节内偏移，三个变量恰好都位于各自节的起点。最后一扇窗
-看代码本身和那两个洞：
-
-\begin{lstlisting}
-$ objdump -d -M intel min.o
-Disassembly of section .text:
-
-0000000000000000 <bump>:
-   0:  01 3d 00 00 00 00   add  DWORD PTR [rip+0x0],edi   # 6
-   6:  8b 05 00 00 00 00   mov  eax,DWORD PTR [rip+0x0]   # c
-   c:  c3                  ret
-
-$ objdump -r min.o
-RELOCATION RECORDS FOR [.text]:
-OFFSET           TYPE              VALUE
-0000000000000002 R_X86_64_PC32     counter-0x4
-0000000000000008 R_X86_64_PC32     counter-0x4
-\end{lstlisting}
-
-两条指令都带 \code{[rip+0x0]} 形式的 4 字节位移字段，
-内容暂时是 0——这就是洞。重定位记录说清了两个洞的位
-置（偏移 2 和 8，各在操作码之后）、填法
-（R\_X86\_64\_PC32，PC 相对 32 位）和目标（符号
-\code{counter}，加数 -4）。注意 \code{counter} 就在本
-文件定义，照样要留洞：它在 \code{.data}，代码在
-\code{.text}，两节的距离要等布局后才知道，怎么填正是
-第二节的主题。
-
-\topic{一个最小函数的完整解剖}
-收尾前做一次最彻底的走查：把一个最小函数从源码到字
-节、到符号、到重定位记录逐项对一遍。源码只有一行：
-
-\begin{lstlisting}
-int add(int a, int b) { return a + b; }
-\end{lstlisting}
-
-\code{gcc -O0} 生成的汇编如下（Intel 语法，小写寄存
-器）：
-
-\begin{lstlisting}
-add:
-        push    rbp
-        mov     rbp, rsp
-        mov     DWORD PTR [rbp-4], edi
-        mov     DWORD PTR [rbp-8], esi
-        mov     edx, DWORD PTR [rbp-4]
-        mov     eax, DWORD PTR [rbp-8]
-        add     eax, edx
-        pop     rbp
-        ret
-\end{lstlisting}
-
-这段代码汇编成 20 个字节。逐字节解剖如下，每一条指令
-的编码都能用处理器核心相关章节的字段格式读出来：
-
-\begin{longtable}{L{0.07\linewidth}L{0.17\linewidth}L{0.22\linewidth}L{0.4\linewidth}}
-\toprule
-偏移 & 字节 & 指令 & 编码要点 \\
-\midrule
-0x00 & \code{55} & \code{push rbp} & 单字节，寄存器号 5 编在操作码低 3 位（0x50+5） \\\tablerowrule
-0x01 & \code{48 89 e5} & \code{mov rbp,rsp} & \code{48} 是 REX.W 前缀；ModRM=0xE5：mod=11 寄存器直寻，reg=100 是 rsp，rm=101 是 rbp \\\tablerowrule
-0x04 & \code{89 7d fc} & \code{mov [rbp-4],edi} & ModRM=0x7D：mod=01 带 8 位位移，disp8=0xFC 即 -4，reg=111 是 edi \\\tablerowrule
-0x07 & \code{89 75 f8} & \code{mov [rbp-8],esi} & 同一格式，reg=110 是 esi，disp8=0xF8 即 -8 \\\tablerowrule
-0x0a & \code{8b 55 fc} & \code{mov edx,[rbp-4]} & 操作码 8B 方向相反：内存到寄存器，reg=010 是 edx \\\tablerowrule
-0x0d & \code{8b 45 f8} & \code{mov eax,[rbp-8]} & reg=000 是 eax，位移仍是 -8 \\\tablerowrule
-0x10 & \code{01 d0} & \code{add eax,edx} & ModRM=0xD0：rm=000（eax）是目的，reg=010（edx）是源 \\\tablerowrule
-0x12 & \code{5d} & \code{pop rbp} & 单字节，0x58+5 \\\tablerowrule
-0x13 & \code{c3} & \code{ret} & 弹栈顶作为返回地址 \\
-\bottomrule
-\end{longtable}
-
-每一列都能和处理器核心相关章节对上。ModRM 字节的 mod、reg、rm 三
-字段正是处理器核心相关章节“寻址方式加寄存器号”的同一套结构；
-\code{[rbp-4]} 里的 -4 就是编码格式中的 disp8 位移字
-段。参数与返回值的位置则来自调用约定——处理器核心相关章节“调用
-约定把寄存器和栈的责任写成明确约定”的 x86-64 版本：
-头两个整型参数依次在 edi、esi，返回值在 eax。还可以
-看到 -O0 的字面意思：参数先原样存入栈、用时再取回，
-20 个字节里真正做加法的只有 \code{01 d0} 两个字节。
-若开 -O1，整个函数收缩成 \code{8d 04 37 c3}：
-\code{lea eax,[rdi+rsi]} 借用“基址加变址”的求和路
-径直接算出 a+b，外加一条 \code{ret}——地址形成硬件
-被借来做算术，这是处理器核心相关章节 SIB 求和器的又一次登场。
-
-再看符号与重定位两栏的对应。符号表里这个函数产生一个
-条目：名字 \code{add}，类型 FUNC，绑定 GLOBAL，大小
-20，Ndx 指向 \code{.text}，Value 为 0——函数正好位于
-本文件 \code{.text} 的起点，最终虚拟地址要等链接器分
-配，此刻只能记节内偏移。重定位记录一栏则是空的：这个
-函数的每个操作数不是寄存器就是 rbp 相对的栈槽，位移
--4、-8 在编译时就是定数，整条指令流不引用任何名字，
-自然没有要填的洞。这给出一条判据：重定位记录只在指令
-里出现名字——外部函数、全局变量——时才产生。把函数
-改成带外部调用的版本，记录立刻现身：
-
-\begin{lstlisting}
-extern int twice(int);
-
-int add_twice(int a, int b) { return twice(a + b); }
-\end{lstlisting}
-
-\code{-O1} 生成的代码与字节如下（分号后是注释）：
-
-\begin{lstlisting}
-add_twice:
-        sub     rsp, 8            ; 48 83 ec 08  栈对齐到 16 字节
-        lea     edi, [rdi+rsi]    ; 8d 3c 37     a+b 送入第一个参数
-        call    twice             ; e8 00 00 00 00  <- 洞在这里
-        add     rsp, 8            ; 48 83 c4 08
-        ret                       ; c3
-\end{lstlisting}
-
-\code{call} 的 4 字节相对偏移在编译时未知——
-\code{twice} 在别的文件里，它的地址此刻不存在。汇编
-器把字段清零，并登记一条重定位记录：
-
-\begin{lstlisting}
-$ objdump -r add_twice.o
-RELOCATION RECORDS FOR [.text]:
-OFFSET           TYPE              VALUE
-0000000000000008 R_X86_64_PC32     twice-0x4
-\end{lstlisting}
-
-读法：\code{.text} 偏移 0x8 处（\code{e8} 操作码之后
-那 4 个字节）要按 PC 相对 32 位规则、用符号
-\code{twice} 的地址修补，加数 -4。三个要素——改哪
-里、按什么规则、用谁的值——全部登记在案，但演算还做
-不了：S 尚未存在。填洞需要符号的值，而符号的值来自链
-接器的布局，这就是第二节的开场。
-
-\section{三、链接：重定位与地址形成}
-
-“目标文件与符号”一节的结论是：目标文件是半成品——字节齐备，地址未
-定，凡涉及名字的字段都留着洞，洞的位置和填法记在重定
-位记录里。本节看链接器怎样把若干半成品拼成一张完整的
-地址地图。
-
-\topic{链接器做三件事}
-把链接器看成一台只做三件简单事的机器，它的行为就不再
-神秘。第一件，合并同类节：把各输入文件的 \code{.text}
-依次接成输出的 \code{.text}，\code{.data}、
-\code{.rodata}、\code{.bss} 同样处理，再按读写执行属
-性把节归并成段。第二件，符号解析与地址分配：给输出的
-每个节定下虚拟地址，于是每个符号的值从“某节内偏移”
-换算成“节基址加偏移”的具体数；同时把各文件的符号表
-汇成一张全局表，为每个 UND 引用找到唯一的 GLOBAL 定
-义。第三件，重定位：按重定位记录逐条改写输出文件里的
-字节——填 \code{call} 的相对偏移、填全局变量的位移、
-填数据区的指针初值。
-
-\begin{longtable}{L{0.22\linewidth}L{0.24\linewidth}L{0.26\linewidth}L{0.14\linewidth}}
-\toprule
-步骤 & 输入 & 产出 & 改文件字节吗 \\
-\midrule
-合并同类节 & 各 \code{.o} 的同名节 & 输出的节与段布局 & 拼接拷贝 \\\tablerowrule
-符号解析与定址 & 全部符号表 & 全局符号表、各节基址 & 不改，只算数 \\\tablerowrule
-重定位 & 重定位记录加符号值 & 填好的指令与数据 & 改，逐条修补 \\
-\bottomrule
-\end{longtable}
-
-三件事里前两件是簿记，第三件才真正动字节；但改哪里、
-改多少，完全由前两件的结果决定。这就是“链接等于把多
-个半成品拼成一张完整地址地图”的准确含义：地图由第二
-件事算出，由第三件事誊进字节。次序也不能乱：只有合并
-与定址完成，符号才有值；符号有了值，重定位的算术才能
-做。所以第一节那两个经典报错都发生在第二件事——名字
-查不到或重复定义，地图就画不出来，根本轮不到第三件事
-动手。
-
-把三件事放到一对最小输入上看一遍数值。设链接器只收到
-\code{main.o} 与 \code{add.o}：合并把 \code{main.o} 的
-\code{.text}（0x20 字节）铺在输出 \code{.text} 的基址
-\code{0x401120} 处，\code{add.o} 的 \code{.text}（20
-字节，即 0x14）紧随其后，从 \code{0x401140} 开始；数
-据节同样依次排布、各按对齐要求取整。定址随即给出符号
-值：\code{main = 0x401120}，\code{add = 0x401140}，
-\code{main.o} 符号表里那条 UND 的 \code{add} 就此有了
-定义；重定位拿着这两个值去填 \code{main.o} 里那条
-\code{call} 留下的洞——具体演算正是下一个专题的内
-容。
-
-把合并与定址画成一张排布图，
-“同类节依次拼接、符号值随
-之确定”就是图上的两个动作：
-
-\begin{pdfdiagram}
-  % 输入：两个目标文件的同类节
-  \node[hw state, minimum width=2.4cm, align=center] (mt) at (1.2,2.4) {main.o\\.text 0x20 字节};
-  \node[hw state, minimum width=2.4cm, align=center] (at) at (1.2,1.2) {add.o\\.text 0x14 字节};
-  \node[hw memory, minimum width=2.4cm, align=center] (md) at (1.2,-0.2) {main.o\\.data};
-  \node[hw memory, minimum width=2.4cm, align=center] (ad) at (1.2,-1.4) {add.o\\.data};
-  % 输出：合并后的节，地址已定
-  \node[hw compute, minimum width=4.2cm, align=center] (ot) at (8.8,1.8) {输出 .text\\main @ 0x401120\\add @ 0x401140};
-  \node[hw compute, minimum width=4.2cm, align=center] (od) at (8.8,-0.8) {输出 .data\\初值依次排布\\按对齐取整};
-  % 拼接箭头：各自折入输出框
-  \draw[hw bus] (mt.east) -- (3.4,2.4) -- (3.4,2.05) -- ($(ot.west)+(0,0.25)$);
-  \draw[hw bus] (at.east) -- (3.0,1.2) -- (3.0,1.55) -- ($(ot.west)+(0,-0.25)$);
-  \node[hw label, fill=white, inner sep=1pt] at (4.9,2.05) {从基址排起};
-  \node[hw label, fill=white, inner sep=1pt] at (4.9,1.55) {紧随其后};
-  \draw[hw bus] (md.east) -- (3.4,-0.2) -- (3.4,-0.55) -- ($(od.west)+(0,0.25)$);
-  \draw[hw bus] (ad.east) -- (3.0,-1.4) -- (3.0,-1.05) -- ($(od.west)+(0,-0.25)$);
-  % 定址结果
-  \node[hw label, align=center] at (5.6,-2.4) {定址结果：main = 0x401120，add = 0x401140\\0x401140 = 0x401120 + 0x20，拼接次序即地址次序};
-\end{pdfdiagram}
-\diagramnote{静态链接的地址形成（对应正文 main.o 与 add.o 的最小例）。链接器把各输入文件的同类节依次拼接成输出的节：\code{main.o} 的 \code{.text}（0x20 字节）铺在基址 \code{0x401120}，\code{add.o} 的 \code{.text}（0x14 字节）紧随其后从 \code{0x401140} 开始；数据节同样处理。拼接完成，每个符号的值便从“节内偏移”换算成“节基址加偏移”的具体数——\code{main = 0x401120}，\code{add = 0x401140}，重定位所需的 S 至此全部就位。}
-
-工程上，布局不是只能听默认值。链接脚本可以指定每个节
-的位置、入口符号和段的对齐方式：本书末章的教学计算机项目的裸机镜像把
-\code{.text} 钉在 ROM 起始地址、把入口钉在复位向量，
-用的就是这套机制的手工模式；Linux 的默认链接脚本则把
-\code{.text} 安排在 \code{0x400000} 附近的惯例地址。
-同一台机器，自动挡与手动挡并存；学完本节和第三节，可
-以回头把本书末章的教学计算机项目那个链接脚本逐行再读一遍。
-
-\topic{重定位记录怎么读}
-第一节末尾留下一条记录：\code{offset 0x8, type
-R\_X86\_64\_PC32, symbol twice, addend -4}。现在把它读
-透。一条重定位记录回答三个问题：位置（offset）——改
-输出文件里的哪几个字节；类型（type）——按哪条公式
-算；符号与加数（symbol、addend）——用谁的地址、再做
-什么修正。x86-64 的 ELF 用 RELA 格式，加数显式存在记
-录里，被修补字段的旧内容直接丢弃不看。
-
-顺带一提，32 位 x86 的 ELF 用的是 REL 格式：记录里没
-有加数字段，加数藏在被修补字段的旧内容里，链接器要先
-读出旧值再代入计算。RELA 把加数显式化，字段旧内容一
-律作废，逻辑更直白。这也解释了观察重定位时的一个现
-象：在 RELA 文件里，洞里的旧字节是什么都无所谓，汇编
-器统一清零——“目标文件与符号”一节目标文件里那些
-\code{00 00 00 00} 的位移字段，正是这个约定的样子。
-
-最常用的两种类型对应两条公式。绝对 32 位重定位
-（R\_X86\_64\_32）：往字段写入 S+A 的低 32 位，S 是符
-号的最终地址，A 是加数——填的是地址本身。PC 相对 32
-位重定位（R\_X86\_64\_PC32）：写入 S+A−P，P 是被修补
-字段自己的最终地址——填的是字段到目标的距离。下面把
-一条 \code{call} 的修补从头算到尾。设 \code{main.o}
-里有一处调用 \code{add}（定义在另一个文件），用
-\code{objdump -dr} 可以把指令和记录放在一起看：
-
-\begin{lstlisting}
-$ objdump -dr -M intel main.o
-Disassembly of section .text:
-
-0000000000000000 <main>:
-   ...
-  10:  e8 00 00 00 00      call   15 <main+0x15>
-                         11: R_X86_64_PC32  add-0x4
-   ...
-\end{lstlisting}
-
-链接器做完合并与定址后：\code{main} 所在 \code{.text}
-块的基址定为 \code{0x401120}，\code{add} 定在
-\code{0x401140}。于是三个数全部就位：被修补字段的地
-址 P = 0x401120 + 0x11 = 0x401131；符号值 S =
-0x401140；加数 A = −4。代入公式，并站在 CPU 执行语义
-一侧核对结果：
-
-\begin{lstlisting}
-写入值 = S + A - P
-       = 0x401140 + (-4) - 0x401131
-       = 0x401140 - 0x401135
-       = 0x0000000B
-
-核对（CPU 执行 call 的语义）：
-目标 = 下一条指令地址 + rel32
-     = (0x401131 + 4) + 0xB
-     = 0x401135 + 0xB
-     = 0x401140  = add    对上了
-\end{lstlisting}
-
-修补后，该处字节从 \code{e8 00 00 00 00} 变成
-\code{e8 0b 00 00 00}——0xB 按小端排布，低字节在前，
-这正是链接器必须通晓 ISA 字节序与字段位置的原因。加
-数为什么是 −4 也值得说透：CPU 求 \code{call} 目标时
-的基准是下一条指令的地址，即字段末尾之后；公式里的 P
-却是字段的开头，两者恰好差 4 个字节，汇编器把这 4 字
-节折进加数里补齐。整个演算没有一个新数：S 来自符号
-表，P 来自节布局，A 来自记录本身，公式来自 ISA 对
-\code{call} 语义的定义。四者各就各位，填洞就是一次减
-法。
-
-把这条演算画成修补流水线，四个数各就各位的动作就是四步：
-
-\begin{pdfdiagram}
-  % 左列：三个数的来源
-  \node[hw memory, align=center, minimum width=3.0cm] (rec) at (0,1.6) {重定位记录\\offset 0x11，addend $-4$\\类型 PC32};
-  \node[hw state, align=center, minimum width=3.0cm] (sym) at (0,0) {符号表\\S = add = 0x401140};
-  \node[hw state, align=center, minimum width=3.0cm] (lay) at (0,-1.6) {节布局\\P = 0x401131};
-  % 汇入干线
-  \draw[draw=BookMuted, line width=0.62pt] (rec.east) -- (2.4,1.6);
-  \draw[draw=BookMuted, line width=0.62pt] (sym.east) -- (2.4,0);
-  \draw[draw=BookMuted, line width=0.62pt] (lay.east) -- (2.4,-1.6);
-  \draw[draw=BookMuted, line width=0.62pt] (2.4,1.6) -- (2.4,-1.6);
-  \fill[BookMuted] (2.4,1.6) circle (0.05);
-  \fill[BookMuted] (2.4,0) circle (0.05);
-  \fill[BookMuted] (2.4,-1.6) circle (0.05);
-  % 计算与写回
-  \node[hw compute, align=center, minimum width=3.6cm] (calc) at (5.6,0) {S + A $-$ P\\= 0x401140 $-$ 4 $-$ 0x401131\\= 0x0B};
-  \node[hw memory, align=center, minimum width=3.0cm] (bytes) at (9.9,0) {call 字段\\e8 00 00 00 00\\→ e8 0b 00 00 00};
-  \draw[hw bus] (2.4,0) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{三数就位} (calc.west);
-  \draw[hw bus] (calc.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{写回} (bytes.west);
-\end{pdfdiagram}
-\diagramnote{重定位修补流水线（对应正文 main.o 调用 add 的演算）。链接器读出记录的位置、类型与加数，从符号表取 S、从节布局取 P，按类型公式代入：PC32 写入 S+A$-$P = 0x401140 $-$ 4 $-$ 0x401131 = 0x0B；结果按小端排布写回字段，e8 00 00 00 00 变成 e8 0b 00 00 00。RELA 格式下字段旧内容直接丢弃，整个修补就是一次减法加一次写字节。}
-
-\topic{绝对重定位与 PC 相对重定位}
-两种类型为什么并存？因为它们服务的字段性质不同。PC 相
-对重定位填距离，适合代码内部的控制转移和就近访问的数
-据：\code{call}、\code{jmp}、条件转移，以及 x86-64 的
-RIP 相对数据寻址，字段 32 位，够到前后各 2 GiB。绝对
-重定位填地址本身，适合数据区里的指针：函数指针数组、
-\code{switch} 的跳转表、\code{char *p = msg;} 这类全
-局指针的初值，以及 \code{movabs} 的 64 位立即数字段
-——这些场合程序要的是值，不是距离。
-
-差别要到镜像搬动时才显形。绝对字段把装载地址烧进了字
-节：镜像每换一个装载位置，所有绝对字段都得按新基址重
-填一遍——这正是第三节要讲的装载时重定位，也是 ASLR
-每次随机布局都必须付的代价。PC 相对字段只记距离：整
-段代码连同它引用的目标一起搬，距离不变，字节原样可
-用，一处都不用改。
-
-看一个绝对重定位的具体形状。\code{switch} 语句分支密
-集时，编译器常在 \code{.rodata} 里生成跳转表：每个表
-项是 8 字节的绝对地址，指向某个分支的代码。目标文件
-里这些表项先是零，旁边一一对应 R\_X86\_64\_64 记录；
-链接时按公式 S+A 填入各分支标签的最终地址。一旦镜像
-换了装载基址，整张表每一项都要加上同一个差值——表
-有多大，重填的工作量就有多大，绝对字段的代价在此现
-出原形。
-
-条件转移则是 PC 相对的纯血用户：x86-64 的 \code{jz}、
-\code{jne} 只有 rel8 与 rel32 两种偏移形式，编码里根
-本没有放绝对目标的位置，想跳远只能先跳到附近再做间
-接转移。控制流指令因此天生位置无关，代码段整体搬移
-时，从来不必为它们操心。
-
-这就是位置无关代码（PIC）的雏形。共享库想被多个进程
-映射到各自不同的虚拟地址、又共享同一批物理代码页，前
-提是 \code{.text} 里几乎没有绝对字段：代码内部的转移
-天然是 PC 相对的，剩下绕不开的绝对访问——调外部函
-数、取外部数据——全部改道两张间接表（GOT 与 PLT），
-需要按装载地址修补的绝对字段集中收进这两张表里，
-\code{.text} 保持干净。编译共享库时加 \code{-fPIC} 的
-本质，就是把绝对重定位从代码节里赶出去；两张表怎么工
-作，是第三节的内容。
-
-\begin{longtable}{L{0.2\linewidth}L{0.26\linewidth}L{0.24\linewidth}L{0.16\linewidth}}
-\toprule
-类型 & 写入内容 & 典型场合 & 镜像整体搬动后 \\
-\midrule
-R\_X86\_64\_32 / 64 & S+A，地址本身 & 数据指针、跳转表、\code{movabs} & 所有绝对字段要重填 \\\tablerowrule
-R\_X86\_64\_PC32 & S+A−P，与字段的距离 & \code{call}/\code{jmp}、RIP 相对访存 & 字节原样可用 \\
-\bottomrule
-\end{longtable}
-
-回头看历史能加深理解：x86-64 把 RIP 相对寻址设为默认
-的数据寻址方式，正是操作系统全面转向 PIC 之后 ISA 做
-出的配合。处理器核心相关章节讲寻址方式时给过这一模式的硬件结构，
-现在能看到它另一半成因在软件侧：链接器和装载器喜欢距
-离，讨厌地址本身。ISA 与系统软件在这里是互相塑造的。
-
-\topic{静态库是按需求出的目标文件包}
-静态库 \code{libfoo.a} 不是新的文件格式：用 \code{ar}
-把一批 \code{.o} 捆成一个归档，再附一张符号索引
-（\code{ar} 的 \code{s} 选项，旧系统里由 \code{ranlib}
-生成），索引记录哪个名字在哪个成员里，仅此而已。库成
-员仍是普普通通的可重定位文件，链接器对它们的处理也和
-对普通 \code{.o} 一样——只多一条抽取规则。
-
-抽取规则是理解静态库的全部关键。链接器从左到右扫描命
-令行上的输入，沿途维护一个“当前未定义符号”集合：扫
-到普通 \code{.o}，无条件整个收进，它定义的符号进全局
-表，它引用的符号进未定义集合；扫到库，则翻看索引，只
-把能消解当前未定义符号的成员抽出来——被抽出的成员自
-己又可能带来新引用，于是对同一个库要反复查，直到不再
-有新成员被抽出。扫描结束时，未定义集合必须为空，否则
-报错。
-
-把这条抽取规则画成数据流，“用多少、取多少”就是中间那个集合的进出平衡：
-
-\begin{pdfdiagram}
-  % 左列：两类输入
-  \node[hw state, align=center] (maino) at (0,1.5) {main.o\\普通目标文件};
-  \node[hw memory, align=center, minimum width=3.2cm] (lib) at (0,-1.1) {libfoo.a\\ar 归档＋符号索引\\成员 a.o b.o c.o};
-  % 中列：未定义集合与被抽出的成员
-  \node[hw control, align=center, minimum width=2.8cm] (undef) at (5.6,1.5) {当前未定义\\符号集合};
-  \node[hw compute, align=center, minimum width=2.8cm] (ext) at (5.6,-1.1) {按索引抽出的\\成员};
-  % 右列：输出
-  \node[hw state, align=center] (out) at (10.3,0.2) {可执行文件};
-  \draw[hw bus] (maino.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{无条件整个收进} (undef.west);
-  \draw[hw bus] (lib.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{按需抽取} (ext.west);
-  \draw[hw bus] (ext.east) -- (8.1,-1.1) -- (8.1,0.2) -- (out.west);
-  % 集合与抽取之间的控制往返
-  \draw[hw return] ($(undef.south)+(-0.6,0)$) -- node[midway, left=1pt, hw label, fill=white, inner sep=1pt]{查索引} ($(ext.north)+(-0.6,0)$);
-  \draw[hw return] ($(ext.north)+(0.6,0)$) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{新引用回集合} ($(undef.south)+(0.6,0)$);
-  \node[hw label, align=center] at (5.6,2.7) {扫描结束：集合必须为空};
-\end{pdfdiagram}
-\diagramnote{静态库的按需抽取。链接器从左到右扫描输入：普通目标文件无条件整个收进，它引用的符号进未定义集合；扫到库时翻符号索引，只把能消解当前未定义符号的成员抽出；被抽成员若带来新引用，就对同一个库再查一遍，直到没有新成员。扫描结束时集合必须为空，否则报未定义引用——库因此必须排在命令行上使用它的文件之后。}
-
-顺序因此有了意义：库必须出现在使用它的文件之后。
-\code{gcc main.o -lfoo} 里，扫到库时 \code{main.o} 的
-引用已在未定义集合里等着，成员被正常抽出；
-\code{gcc -lfoo main.o} 里，扫到库时集合还是空的，一
-个成员也不抽；等 \code{main.o} 把引用放进来，库已经
-扫过，链接器不会回头。
-
-连锁抽取值得再看一眼：成员甲被抽出后又引用了成员乙定
-义的符号，乙也得跟着出库，所以库内部的依赖会被引用链
-自动拉齐。真正的麻烦在库与库互相引用：\code{liba.a}
-需要 \code{libb.a}，\code{libb.a} 又回头需要
-\code{liba.a}，单向扫描无论谁先谁后都可能漏抽。
-\code{ld} 为此准备了 \code{--start-group} 与
-\code{--end-group}：把互相循环的库圈进一组，链接器在
-组内反复扫描，直到没有新成员被抽出。日常遇到的顺序问
-题多半不是循环依赖，而是单纯把库摆错了位置。
-
-\begin{lstlisting}
-$ gcc -c main.c helper.c
-$ ar rcs libhelper.a helper.o
-$ gcc main.o -L. -lhelper -o app        # 正确：库在使用者之后
-$ gcc -L. -lhelper main.o -o app        # 经典错误：库扫描早于未解析符号出现
-/usr/bin/ld: main.o: in function `main':
-main.c:(.text+0x1f): undefined reference to `helper'
-collect2: error: ld returned 1 exit status
-\end{lstlisting}
-
-第一节那两个经典错误，在这里能看到完整成因。未定义引
-用：扫描结束而未定义集合非空——可能忘了给库，可能顺
-序错了，也可能库里确实没有这个名字；三重原因共用一个
-症状，排查时就按这三条挨个问。多重定义：两个输入各交
-出一个同名强定义，链接器无法裁决。边界情形也值得一
-记：两个弱定义不报错，链接器任取一个；一强一弱取强
-——这条规则正是库用弱符号提供可替换默认实现的依据。
-
-“用多少、取多少”的抽取粒度带来两个直接的工程后果。
-其一，只引用库里一个函数就只抽一个成员，所以
-\code{libc.a} 这类库把每个函数单独成目标文件（成员），静态链接出的
-可执行文件才不会把整个库背在身上。其二，抽取沿引用链
-传递：抽出的成员又引用别的成员会连锁抽取，所以被依赖
-的底层库（如 \code{-lm}）要放在命令行更靠后的位置。
-第三节会看到，动态库换了一套哲学：整个库先映射进内存
-再说，抽取问题让位给绑定问题。
-
-\topic{与处理器核心相关章节 ISA 寻址方式的关系}
-现在把镜头拉回处理器核心相关章节。那里讲指令编码时反复出现两类字
-段：立即数字段和地址/偏移字段——教学 ISA 里
-\code{JZ +3}、\code{JMP -5} 的偏移，x86-64 里
-\code{call} 的 rel32、RIP 相对寻址的 disp32、
-\code{movabs} 的 imm64。当时这些字段的值都由汇编器顺
-手算出；本章能看到它们的另一半来历：凡字段里出现名
-字，值就要等链接器。链接器填的正是处理器核心相关章节编码格式里那
-些 imm 与地址字段，一分不多，一分不少。
-
-两处约定遥相呼应。处理器核心相关章节的教学 ISA 规定“跳转目标等
-于本条地址加 1 加偏移”，x86-64 规定“目标等于下一条
-指令地址加 rel32”——同一个“相对下一条指令”的约
-定，一个定长一个变长而已。本节的公式 S+A−P 就是这个
-约定的代数形式：式中每个量都对应编码格式里一个具体的
-字段位置。学会读重定位记录，等于把处理器核心相关章节的指令编码又
-读了一遍，只是这次手里拿的是链接器的视角。
-
-还有一个细节能巩固这层对应。处理器核心相关章节给教学 ISA 定编码
-时，把立即数与偏移一律向低位对齐，理由是扩展逻辑单
-一；链接器面对的正是同一批低位字段——rel32 从指令的
-固定位开始占 4 字节，链接器只改写这 4 字节，绝不碰操
-作码与 ModRM。字段的位置由 ISA 定死，字段的值由链接
-器算定，双方各守一半约定，拼起来才是一条完整的指令。
-
-更完整地说，地址形成是一条跨越四个时刻的流水线，每个
-时刻各填各的字段：
-
-\begin{longtable}{L{0.1\linewidth}L{0.24\linewidth}L{0.52\linewidth}}
-\toprule
-时刻 & 谁定值 & 定什么 \\
-\midrule
-编译时 & 编译器/汇编器 & 字段的位置与格式、寄存器与寻址方式、重定位记录 \\\tablerowrule
-链接时 & 链接器 & 静态符号的地址：\code{call} 偏移、全局量位移、数据指针初值 \\\tablerowrule
-装载时 & 装载器/动态链接器 & 运行前才定的地址：库基址、GOT 条目（第三节） \\\tablerowrule
-运行时 & CPU 硬件 & 有效地址求和：基址+变址×比例+位移 \\
-\bottomrule
-\end{longtable}
-
-链接器坐在这条流水线的倒数第二站：它不管语法语义（那
-是编译前端的事），也不生成指令模板（那是编译后端的
-事），只管“名字到地址”的最后定值。说链接是 ISA 地
-址形成的最后一步，准确含义就在于此——处理器核心相关章节数据通路
-里那个“基址加变址乘比例加位移”的求和器，它的位移输
-入常常就是链接器在磁盘上写下的那个数。裸机世界同样成
-立：本书末章的教学计算机项目的镜像没有操作系统，链接脚本把节钉在物理地
-址上，重定位照算不误，S 与 P 只是换成了手工指定的
-值。从教学板到 Linux，这套机制是同一件事的两种装法。
-
-读懂这一层，链接错误就不再神秘：它是地址形成流水线倒
-数第二站的报错——某个名字走到这一站还没有地址，或者
-有两个地址。“装载与动态链接”一节进入最后一站：装载器把这张填好的地
-图铺进内存。
-
-\section{四、装载与动态链接}
-
-“链接：重定位与地址形成”一节结束时，磁盘上已经躺着一个地址全部定好的可执行文件：代码在 \code{0x401000} 附近，数据在 \code{0x403dd8} 附近，入口点写在文件头里。但它此刻还只是一串字节，离“正在运行的进程”还差最后一步，这一步由内核完成：\code{execve} 把文件变成进程，动态链接器把库接进来。本节回答两件事：内核装载时做了什么，以及为什么其中相当大的一部分被推迟到“第一次用到”的那一刻。
-
-先立一个总观点：装载不是搬运。直觉上“把程序装进内存”像一次大块复制——把文件读进 RAM，再跳过去执行；本书末章的教学计算机项目的面包板机把程序逐字节拨进 RAM，就是这种字面意义的装载。现代内核的做法不同：它只登记映射——“这段虚拟地址对应那个文件的这段字节”——真正的字节要等程序第一次访问那一页时，才由缺页异常从磁盘取回。把\hwkey{装载理解成建立映射而不是复制字节}，按需调页、写时复制、共享库就都是同一条逻辑的推论。
-
-\topic{execve 之后内核做的事}
-\code{execve} 是少数“成功后不返回”的系统调用：成功时原进程的地址空间被整个换掉，等它“返回”到用户态时，运行的已经是另一个程序。内核按固定顺序做四件事：读 ELF 头部与段表、按段表建立映射、准备栈、跳到入口。下面把它做完一遍。
-
-先把四步按执行先后画成一条流水线，“只登记、不搬字节”写在第二步上：
-
-\begin{pdfdiagram}
-  \node[hw memory, minimum width=5.2cm, align=center] (src) at (2.8,3.3) {磁盘上的 ELF 文件\\头部、段表、各节字节};
-  \node[hw compute, minimum width=5.2cm, align=center] (s1) at (2.8,2.1) {① 读头部：核对魔数与类型\\取入口 0x401040 与段表};
-  \node[hw compute, minimum width=5.2cm, align=center] (s2) at (2.8,0.8) {② 建映射：按 LOAD 段折算\\登记 vm\_area，不读字节};
-  \node[hw compute, minimum width=5.2cm, align=center] (s3) at (2.8,-0.5) {③ 备栈：字符串、argv/envp\\auxv，rsp 指向 argc};
-  \node[hw control, minimum width=5.2cm, align=center] (s4) at (2.8,-1.8) {④ 跳入口：rip ← 入口\\动态程序先跳 ld.so};
-  \draw[hw bus] (src.south) -- (s1.north);
-  \draw[hw bus] (s1.south) -- (s2.north);
-  \draw[hw bus] (s2.south) -- (s3.north);
-  \draw[hw bus] (s3.south) -- (s4.north);
-  % 右侧：装载产物
-  \node[hw state, minimum width=3.0cm, align=center] (proc) at (9.1,-0.5) {新进程\\地址空间备好\\等待首次缺页};
-  \draw[hw bus] (s4.east) -- (6.9,-1.8) -- (6.9,-0.5) -- (proc.west);
-\end{pdfdiagram}
-\diagramnote{\code{execve} 的四步流程（数值对应正文 \code{hello} 例）。内核核对魔数与类型后取出入口 \code{0x401040} 与段表，把每个 \code{LOAD} 段折算成一条映射登记下来——此时程序的一个字节都还没进内存；再把参数字符串、\code{argv}/\code{envp} 与辅助向量摆上栈顶，最后设置 \code{rip}：静态程序直指入口，动态程序先给动态链接器。四步几乎不搬数据，所以 \code{execve} 很快；失败时正常返回 \code{-1}，四步一件都没做。}
-
-第一件事，读头部。内核核对 ELF 魔数与机器类型，确认文件类型（\code{EXEC} 或 \code{DYN}），取出入口地址和程序头表（段表）。段表里的每个 \code{LOAD} 段回答一个问题：文件的哪一段字节，要以什么权限，出现在虚拟地址的哪一段。用 \code{readelf} 看一个典型小程序（节选 \code{LOAD} 段；数值为模拟，格式与真实输出一致）：
-
-\begin{lstlisting}
-$ readelf -l hello
-Elf file type is EXEC (Executable file)
-Entry point 0x401040
-There are 11 program headers, starting at offset 64
-
-Program Headers:
-  Type           Offset             VirtAddr           PhysAddr
-                 FileSiz            MemSiz             Flags  Align
-  LOAD           0x0000000000000000 0x0000000000400000 0x0000000000400000
-                 0x00000000000004f0 0x00000000000004f0 R      0x1000
-  LOAD           0x0000000000001000 0x0000000000401000 0x0000000000401000
-                 0x0000000000000195 0x0000000000000195 R E    0x1000
-  LOAD           0x0000000000002000 0x0000000000402000 0x0000000000402000
-                 0x0000000000000110 0x0000000000000110 R      0x1000
-  LOAD           0x0000000000002dd8 0x0000000000403dd8 0x0000000000403dd8
-                 0x0000000000000248 0x0000000000000250 RW     0x1000
-\end{lstlisting}
-
-第二件事，按段表建映射。把四个 \code{LOAD} 段逐段算账。第一段从文件偏移 0 映到 \code{0x400000}，ELF 头和程序头表都在其中。第二段是代码：文件区间 \code{[0x1000, 0x1195)} 映到 \code{[0x401000, 0x401195)}，\code{0x195} 即 405 字节，不足一页；内核按整页映射，页内超出段长的字节来自文件同页的对齐填充。入口 \code{0x401040} 就在这段内偏移 \code{0x40} 处。第三段是只读数据。第四段是可写数据：\code{MemSiz} 比 \code{FileSiz} 多出 8 字节，多出的部分就是 \code{.bss}——文件里不占字节，内存里必须是零；内核映完文件部分后把这 8 字节清零，若 \code{.bss} 大到跨页，整页挂匿名零页。
-
-\begin{longtable}{L{0.08\linewidth}L{0.26\linewidth}L{0.24\linewidth}L{0.32\linewidth}}
-\toprule
-段 & 文件偏移→虚拟地址 & 字节数（文件→内存） & 权限与内容 \\
-\midrule
-1 & \code{0x0000}→\code{0x400000} & \code{0x4f0}→\code{0x4f0} & 只读：ELF 头、段表、\code{.interp} \\\tablerowrule
-2 & \code{0x1000}→\code{0x401000} & \code{0x195}→\code{0x195} & 读/执行：\code{.text}，入口在其中 \\\tablerowrule
-3 & \code{0x2000}→\code{0x402000} & \code{0x110}→\code{0x110} & 只读：\code{.rodata} \\\tablerowrule
-4 & \code{0x2dd8}→\code{0x403dd8} & \code{0x248}→\code{0x250} & 读写：\code{.data} 与 \code{.bss}，多出 8 字节清零 \\
-\bottomrule
-\end{longtable}
-
-每个 \code{LOAD} 段还满足一条同余：虚拟地址与文件偏移模页长同余——\code{0x403dd8} 与 \code{0x2dd8} 模 \code{0x1000} 都余 \code{0xdd8}。这不是巧合：只有页内偏移一致，一个文件页才能原样映到一个虚拟页上，内核不必做任何搬移对齐。“链接：重定位与地址形成”一节的链接器在定址时就按这条约束摆段：链接不仅决定“放在哪个地址”，还决定“按页怎样对齐”。
-
-映射在内核里的形态是一张映射表（\code{vm\_area\_struct} 的集合），每条记录由段表折算而来。注意这张表是登记簿而非内容：此时程序的一个字节都还没进内存。
-
-\begin{longtable}{L{0.20\linewidth}L{0.38\linewidth}L{0.32\linewidth}}
-\toprule
-字段 & 含义 & 本例第四段的值 \\
-\midrule
-起止地址 & 虚拟地址区间 & \code{[0x403dd8, 0x404028)} \\\tablerowrule
-权限 & 读/写/执行 & 读、写 \\\tablerowrule
-来源 & 文件加偏移，或匿名 & \code{hello} 偏移 \code{0x2dd8} \\\tablerowrule
-补齐规则 & 段尾不足一页如何处理 & 超出 \code{FileSiz} 的部分清零 \\
-\bottomrule
-\end{longtable}
-
-第三件事，准备栈。内核把命令行参数和环境变量的字符串复制到新地址空间的栈顶，再向下摆辅助向量、\code{envp} 和 \code{argv} 指针数组，最后把 \code{rsp} 指向 \code{argc}：
-
-\begin{lstlisting}
-high  strings: "./hello\0" "world\0" "PATH=/usr/bin\0" ...
-      alignment padding; rsp ends 16-byte aligned
-      AT_NULL
-      auxv pairs: AT_PAGESZ=4096, AT_ENTRY=0x401040,
-                  AT_PHDR=0x400040, ...
-      envp: NULL, ptr -> envp strings ...
-      argv: NULL, ptr -> "world", ptr -> "./hello"
-low   rsp -> argc = 2
-\end{lstlisting}
-
-辅助向量（auxiliary vector）是内核留给用户态的小抄：\code{AT\_PAGESZ} 告诉 libc 页长是 4096；\code{AT\_PHDR} 告诉动态链接器段表映在哪里——\code{0x400040} 的来历很直接，ELF 头长 64 字节（\code{0x40}），程序头表紧跟其后，第一段又从 \code{0x400000} 开始映射，所以表在 \code{0x400040}；\code{AT\_ENTRY} 就是文件头里的入口 \code{0x401040}。\code{argc}/\code{argv}/\code{envp} 的摆法则与处理器核心相关章节的栈约定一脉相承：指针数组以 \code{NULL} 结尾，字符串本体在栈顶，\code{rsp} 保持 16 字节对齐。
-
-第四件事，跳到入口。静态链接程序的 \code{rip} 直接设为入口地址；动态链接程序则先映射 \code{.interp} 段指定的动态链接器 \code{/lib64/ld-linux-x86-64.so.2}，\code{rip} 指向它的入口，由它装载共享库、做完装载时重定位，最后才跳到 \code{0x401040}——本节第四、五个主题就发生在它身上。
-
-装载完成后，这套映射从用户态可以直接核对：\code{/proc} 把它原样摆出来。逐项对照段表，能看到每个 \code{LOAD} 段变成一行，以及段表里没有的 libc 和栈：
-
-\begin{lstlisting}
-$ cat /proc/742/maps
-00400000-00401000 r--p 00000000 08:01 131073    /home/user/hello
-00401000-00402000 r-xp 00001000 08:01 131073    /home/user/hello
-00402000-00403000 r--p 00002000 08:01 131073    /home/user/hello
-00403000-00404000 r--p 00002000 08:01 131073    /home/user/hello
-00404000-00405000 rw-p 00003000 08:01 131073    /home/user/hello
-7f9a3c090000-7f9a3c22c000 r-xp 00000000 08:01 262146   /lib/x86_64-linux-gnu/libc.so.6
-7ffffffde000-7ffffffff000 rw-p 00000000 00:00 0        [stack]
-\end{lstlisting}
-
-第四段的兑现方式值得多看一眼：它跨两页，第一页 \code{0x403000} 映的是文件页 \code{0x2000}——同一个文件页也映在第三段的 \code{0x402000}，两处只读映射共享同一个物理页；这页里混着 \code{.rodata} 的尾巴和 \code{.data} 的头——链接器把这段重定位之后不再改写的数据按 RELRO 归进只读段，映射是纯只读的：写入不会触发写时复制，只会吃到一个 SIGSEGV。需要运行期改写的 GOT 条目放在 \code{0x404000}，那页才是可写页。映射表把“一页一个权限、一页一个来源”表达得清清楚楚。
-
-把这套映射从低地址到高地址画成一张布局图，段表到页表的折算链放在右侧：
-
-\begin{pdfdiagram}
-  % 左列：地址空间布局（上高下低）
-  \node[hw label] at (1.5,5.7) {高地址};
-  \node[hw memory, minimum width=3.4cm] (stk) at (1.5,5.0) {栈 [stack]，向下增长};
-  \node[hw memory, minimum width=3.4cm] (lib) at (1.5,3.8) {共享库映射（libc）};
-  \node[hw label] at (1.5,3.2) {（未映射空洞）};
-  \node[hw memory, minimum width=3.4cm] (heap) at (1.5,2.6) {堆，向上增长（brk）};
-  \node[hw compute, minimum width=3.4cm] (dseg) at (1.5,1.5) {.data/.bss：段 4，读写};
-  \node[hw compute, minimum width=3.4cm] (rseg) at (1.5,0.5) {.rodata：段 3，只读};
-  \node[hw compute, minimum width=3.4cm] (tseg) at (1.5,-0.5) {.text：段 2，读/执行};
-  \node[hw state, minimum width=3.4cm] (hseg) at (1.5,-1.5) {ELF 头/段表：段 1，只读};
-  \node[hw label] at (1.5,-2.2) {低地址 \code{0x400000}};
-  % 右列：段表 LOAD 段 → 映射条目 → 页表项
-  \node[hw state, minimum width=1.9cm] (l4) at (5.6,1.5) {LOAD 4：RW};
-  \node[hw state, minimum width=1.9cm] (l3) at (5.6,0.5) {LOAD 3：R};
-  \node[hw state, minimum width=1.9cm] (l2) at (5.6,-0.5) {LOAD 2：R+E};
-  \node[hw state, minimum width=1.9cm] (l1) at (5.6,-1.5) {LOAD 1：R};
-  \draw[hw bus] (l4.west) -- (dseg.east);
-  \draw[hw bus] (l3.west) -- (rseg.east);
-  \draw[hw bus] (l2.west) -- (tseg.east);
-  \draw[hw bus] (l1.west) -- (hseg.east);
-  % 共享竖直干线汇入映射条目
-  \draw[BookMuted, line width=0.62pt] (l1.east) -- (6.85,-1.5);
-  \draw[BookMuted, line width=0.62pt] (l2.east) -- (6.85,-0.5);
-  \draw[BookMuted, line width=0.62pt] (l3.east) -- (6.85,0.5);
-  \draw[BookMuted, line width=0.62pt] (l4.east) -- (6.85,1.5);
-  \draw[BookMuted, line width=0.62pt] (6.85,-1.5) -- (6.85,1.5);
-  \node[hw state, minimum width=1.7cm] (vma) at (8.15,0.0) {映射条目\\vm\_area};
-  \node[hw control, minimum width=1.7cm] (pte) at (10.35,0.0) {页表项\\按需填入};
-  \draw[hw bus] (6.85,0.0) -- (vma.west);
-  \draw[hw return] (vma.east) -- node[hw label, above, yshift=10pt]{缺页时填} (pte.west);
-\end{pdfdiagram}
-\diagramnote{进程地址空间从低地址到高地址的布局（对应正文 \code{hello} 例）：主程序四个 \code{LOAD} 段从 \code{0x400000} 起依次排开，堆紧随其后向上增长，共享库映在 \code{0x7f...} 区间，栈在最高处向下增长，各区之间隔着未映射的空洞。右侧是同一张地图的折算链：装载时内核把 \code{LOAD} 段折算成映射条目登记下来，页表项则等某页第一次被访问、触发缺页时才填入——装载只建映射，不读字节。}
-
-顺带把四件事摆成一张表，作为本主题的总览：
-
-\begin{longtable}{L{0.14\linewidth}L{0.44\linewidth}L{0.32\linewidth}}
-\toprule
-步骤 & 内核动作 & 可观察处 \\
-\midrule
-读头部 & 核对魔数与类型，取入口地址与段表 & \code{readelf -h}、\code{readelf -l} \\\tablerowrule
-建映射 & 按 \code{LOAD} 段登记映射，不读字节 & \code{/proc/PID/maps} \\\tablerowrule
-准备栈 & 复制字符串，摆 \code{argc}/\code{argv}/\code{envp}/auxv & 调试器里查看栈顶 \\\tablerowrule
-跳入口 & \code{rip} 指向动态链接器或入口地址 & \code{strace} 中 \code{execve} 后的 \code{mmap} \\
-\bottomrule
-\end{longtable}
-
-还有两张表容易混淆，要分清：段表（程序头表）是给装载器看的，节表是给链接器和调试器看的。\code{strip} 把节表整个剥掉，程序照样运行——装载只需要段表；反过来，段表若损坏，内核连映射都建不起来。此外 \code{execve} 有一类“不换”的东西：文件描述符、进程号、工作目录跨 exec 保留，地址空间全换而它们不换——shell 的重定向正是靠“fork 之后、exec 之前先换描述符”实现的。
-
-工程含义只有一句：\code{execve} 本身很快，因为它几乎不搬数据。等 \code{rip} 指向 \code{0x401040} 的第一次取指触发缺页，程序的第一页才真正进内存。把装载从搬运改成建映射，是本节后面全部机制的地基。
-
-补一个反例帮助记忆：\code{execve} 失败时（文件不存在、格式不对、权限不足）正常返回 \code{-1}，原进程的地址空间分毫不动——四件事一件都没做。“成功后不返回”因此也可以反着读：只要它返回了，就一定没成功。
-
-\begin{warningbox}
-把装载想成“把程序读进内存”是最常见的误判。按这个模型，fork 之后 exec 前要复制全部分页、程序越大启动越慢、共享库无从谈起——每一条都与观察相反。修正办法是把单位想清楚：内核登记的对象是映射条目和页表项，不是字节；字节只在被访问到时才流动。
-\end{warningbox}
-
-\topic{写时复制与按需调页}
-fork 的语义是复制整个地址空间，而几乎每个 shell 命令的出生都是 fork 紧跟 exec——若真复制，这将是全系统最昂贵的动作之一。两个机制把它变便宜，它们共用同一个驱动器：经典芯片与平台案例的页错误硬件。
-
-写时复制（copy-on-write）：fork 时内核不复制任何页，只把父进程所有私有可写页在双方页表里都改成只读，父子页表指向同一批物理页。此后任何一方写入都会触发页错误——用经典芯片与平台案例的三问来读：页存在（P=1）、是写访问、权限不允许写——内核据此知道这不是真错误，而是该复制了：分配一个新页，把旧页内容抄过去，写入方的页表项指向新页并恢复可写；若某页只剩一个引用方，直接改回可写，连复制都省。读访问永远不触发复制。
-
-把 fork 前后的页表画成三格，写时复制的全部动作就在其中：
-
-\begin{pdfdiagram}
-  % 三格：fork 后 / 写入触发 / 拆页后
-  \node[hw label] at (1.6,2.62) {fork 后：共享只读};
-  \node[hw label] at (5.4,2.62) {写入触发：页错误};
-  \node[hw label] at (9.2,2.62) {拆页后：各自独立};
-  \draw[BookMuted, line width=0.5pt, dashed] (3.7,-0.6) -- (3.7,2.35);
-  \draw[BookMuted, line width=0.5pt, dashed] (7.5,-0.6) -- (7.5,2.35);
-  % 格一：fork 后，双方只读共享同一物理页
-  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (f1) at (0.75,1.5) {父页表项\\只读};
-  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (c1) at (0.75,0.2) {子页表项\\只读};
-  \node[hw memory, minimum width=1.15cm, minimum height=1.6cm] (p1) at (2.75,0.85) {物理页 A};
-  \draw[hw bus] (f1.east) -| (p1.north);
-  \draw[hw bus] (c1.east) -| (p1.south);
-  % 格二：父写入，撞上只读权限，触发页错误
-  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (f2) at (4.55,1.5) {父页表项\\只读};
-  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (c2) at (4.55,0.2) {子页表项\\只读};
-  \node[hw memory, minimum width=1.15cm, minimum height=1.6cm] (p2) at (6.55,0.85) {物理页 A};
-  \draw[hw bus] (f2.east) -| (p2.north);
-  \draw[hw bus] (c2.east) -| (p2.south);
-  \draw[hw danger] (4.55,2.4) -- (f2.north);
-  \node[hw label, anchor=west] at (4.72,2.15) {父写入};
-  % 格三：拆页后，父指新页可写，子仍指旧页
-  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (f3) at (8.35,1.5) {父页表项\\可写};
-  \node[hw state, minimum width=1.5cm, minimum height=0.75cm] (c3) at (8.35,0.2) {子页表项\\只读};
-  \node[hw memory, minimum width=1.15cm, minimum height=0.75cm] (p3n) at (10.35,1.5) {新页 A$'$};
-  \node[hw memory, minimum width=1.15cm, minimum height=0.75cm] (p3o) at (10.35,0.2) {物理页 A};
-  \draw[hw bus] (f3.east) -- (p3n.west);
-  \draw[hw bus] (c3.east) -- (p3o.west);
-\end{pdfdiagram}
-\diagramnote{写时复制的三幕。fork 后：父子页表项指向同一批物理页，双方都标只读，复制量为零。写入触发：任何一方写共享页都会撞上只读权限，页错误硬件把这次写截住，内核据此知道该拆页了。拆页后：内核分配新页、抄好内容，写入方的页表项改指新页并恢复可写，另一方仍指旧页——复制只发生在被写的那一页上。}
-
-算一笔账：父进程有 5120 个可写私有页，共 $5120\times4\ \text{KiB}=20\ \text{MiB}$；立即复制要搬 20 MiB 并改 5120 条页表项，写时复制只改 5120 条页表项。若子进程在 exec 前只写 200 页，实际复制 $200\times4\ \text{KiB}=800\ \text{KiB}$，约为 20 MiB 的 $4\%$；而 fork 后立刻 \code{execve} 的场合，子进程写的页屈指可数，复制量几乎为零。
-
-历史上这条路走了三段：早期 Unix 的 fork 真的逐页复制，代价随地址空间线性增长；BSD 曾引入 \code{vfork} 作为权宜——子进程借用父进程的地址空间直到 exec，父进程全程冻结，语义脆弱；写时复制普及之后，\code{vfork} 这类绕道基本退场，fork 回到“语义最贵、实现最便宜”的状态。
-
-按需调页（demand paging）是同一思路在装载一侧的应用：上一主题说装载只登记映射，映射的兑现靠缺页。CPU 访问一个存在位为 0 的页，触发页错误，CR2 保存故障地址；内核查映射表，发现该地址属于某文件的某段，就分配物理页、从磁盘读入对应文件页、填好页表项，再重新执行被中断的那条指令。对程序完全透明：它只看到访问成功，只是这一次慢了若干数量级。
-
-再算一笔账：一个 200 MiB 映像共 $200\ \text{MiB}\div4\ \text{KiB}=51200$ 页的程序，启动到 \code{main} 实际触及约 500 页，即 $500\times4096=2\,048\,000$ 字节，约 2 MiB——整个映像的 $1\%$。这就是大程序启动快的原因：启动成本与实际触及的页数成正比，与文件总大小几乎无关。没碰的页不读，几百 MiB 的程序也能在一秒内开窗。
-
-缺页的三种结局值得并排看，因为它们是同一条检查链的三个出口：
-
-\begin{longtable}{L{0.16\linewidth}L{0.44\linewidth}L{0.30\linewidth}}
-\toprule
-结局 & 内核的发现与动作 & 程序看到什么 \\
-\midrule
-文件页 & 地址在某文件映射内，从文件读入该页 & 访问成功，仅这一次慢 \\\tablerowrule
-匿名零页 & 地址在 \code{.bss}、堆或栈映射内，挂零页 & 访问成功，读到 0 \\\tablerowrule
-非法访问 & 地址不属于任何映射 & 收到 SIGSEGV（第四节） \\
-\bottomrule
-\end{longtable}
-
-按需调页还有一个对偶动作：换出。物理页紧张时，内核把久未访问的匿名页写到交换区，把对应页表项标为不存在；下次访问触发缺页，再把它读回来。于是“页错误”成了统一的内存入口——文件页、零页、交换页都从它进来，虚拟内存因此可以大于物理内存。每个物理页上的引用计数则回答另一个问题：这页被几方共享，写时复制要不要真拆。
-
-\begin{longtable}{L{0.14\linewidth}L{0.28\linewidth}L{0.26\linewidth}L{0.22\linewidth}}
-\toprule
-方案 & 复制发生在何时 & 复制多少 & 页表改动 \\
-\midrule
-立即复制 & fork 当场 & 全部可写页 & 新建整套 \\\tablerowrule
-写时复制 & 第一次写某页 & 仅被写的页 & 双方先改只读 \\\tablerowrule
-按需调页 & 第一次访问某页 & 仅被访问的页 & 缺页时填一条 \\
-\bottomrule
-\end{longtable}
-
-缺页成本可以按页的来源分档，这也是 \code{/usr/bin/time -v} 里两类缺页计数的含义：
-
-\begin{longtable}{L{0.22\linewidth}L{0.40\linewidth}L{0.28\linewidth}}
-\toprule
-类型 & 页从哪来 & 典型量级 \\
-\midrule
-次要缺页（minor） & 页已在内存缓存，只需填页表项 & 亚微秒 \\\tablerowrule
-主要缺页（major） & 从磁盘读入文件页 & 几十微秒（SSD） \\\tablerowrule
-换入 & 从交换区读回 & 几十到几百微秒 \\
-\bottomrule
-\end{longtable}
-
-\begin{lstlisting}
-$ /usr/bin/time -v ./hello
-hello, world
-        ...
-        Minor (reclaiming a frame) page faults: 152
-        Major (requiring I/O) page faults: 3
-\end{lstlisting}
-
-内核还会顺势多走一步：缺页读盘时通常顺带读入后续若干页（预读），因为程序访问文件页往往有明显的顺序性——用一次磁盘事务换掉后面的若干次缺页，这正是存储与设备事务相关章节“突发传输比单拍省事务”的同一思想。观察侧的对应概念是常驻集（RSS）：进程实际占着的物理页数。一个 200 MiB 映像的程序启动后 RSS 只有几 MiB，这个差值就是按需调页最直白的观察。
-
-两个机制是同一骨架的两端：都把工作推迟到第一次真正需要时，都由页错误驱动。工程推论同样直接：缺页对程序不可见但真实耗时——磁盘取页约几十微秒，页仍在内存缓存则亚微秒——于是有了预热、内存锁定、大页这类“提前把页备好”的手段；一张 2 MiB 大页把 $2\ \text{MiB}\div4\ \text{KiB}=512$ 次缺页合并成 1 次，存储与外设队列案例谈延迟与队列的视角在这里同样适用。
-
-\topic{动态库的优势与代价}
-“链接：重定位与地址形成”一节的链接把全部代码装订进可执行文件，那是静态链接。动态链接把一部分装订推迟到装载时：可执行文件里只记录“我需要 \code{libc.so.6} 里的 \code{printf}”，真正的代码躺在系统里所有进程共享的库文件中。用 \code{readelf -d} 能看到这份“我需要谁”的清单（动态段，输出为模拟节选）：
-
-\begin{lstlisting}
-$ readelf -d hello | head -4
-Dynamic section at offset 0x2dd8 contains 25 entries:
-  Tag        Type                         Name/Value
- 0x0000000000000001 (NEEDED)             Shared library: [libc.so.6]
-\end{lstlisting}
-
-收益一，共享代码页：libc 的代码段在全部进程间共享一份物理页。算一笔账：libc 代码段约 1.6 MiB（上面 maps 里的 \code{0x19c000} 字节），系统里 300 个进程都用它；静态链接意味着 300 份副本共约 480 MiB，动态链接意味着内存里一份 1.6 MiB（每进程另有少量私有数据页），差约 300 倍。共享成立的条件是代码页只读：谁也不写它，写时复制就不会把共享页拆成私有页。第五个主题会看到，这条约束反过来决定了位置无关代码的形状。
-
-把“共享一份代码页”画成页表指向图，三百倍的差距就写在两组指针上：
-
-\begin{pdfdiagram}
-  % 左列：两个进程的页表
-  \node[hw state, align=center, minimum width=3.4cm] (pa) at (0,1.4) {进程 A 页表\\代码页项（只读）\\虚拟 0x7f9a3c090000};
-  \node[hw state, align=center, minimum width=3.4cm] (pb) at (0,-1.4) {进程 B 页表\\代码页项（只读）\\虚拟地址另一基址};
-  % 右列：物理页
-  \node[hw memory, align=center, minimum width=3.6cm, minimum height=2.6cm] (phys) at (8.6,0) {物理内存\\libc 代码页一份\\约 1.6 MiB};
-  \draw[hw bus] (pa.east) -- (5.2,1.4) -- (5.2,0.5) -- ($(phys.west)+(0,0.5)$);
-  \draw[hw bus] (pb.east) -- (5.2,-1.4) -- (5.2,-0.5) -- ($(phys.west)+(0,-0.5)$);
-  \node[hw label, fill=white, inner sep=1pt] at (4.3,0) {同一批物理页};
-  % 私有数据页对照
-  \node[hw compute, align=center, minimum width=3.6cm] (priv) at (8.6,-2.6) {各进程私有数据页\\每进程一份};
-  \node[hw label, align=center] at (2.4,-2.9) {300 个进程：静态 300 份约 480 MiB，\\动态链接内存里一份 1.6 MiB};
-\end{pdfdiagram}
-\diagramnote{动态库的共享代码页。两个进程的页表各自把不同的虚拟地址映射到同一批 libc 物理页——代码段约 1.6 MiB，全系统只有一份；300 个进程时，静态链接要 300 份副本共约 480 MiB，动态链接只要一份（每进程另有少量私有数据页），差约 300 倍。共享成立的条件是页面只读：谁也不写它，写时复制就不会把共享页拆成私有页。}
-
-收益二，升级不重链：修复 libc 的一个缺陷，只需替换库文件本身，下次启动的程序自动用新版；静态链接则必须重新链接并重新分发每一个程序。安全补丁的分发成本因此从“重发所有程序”变成“重发一个库”。文件名里的“\code{.6}”是主版本号：它承诺二进制接口（ABI）不变，只有不兼容时才进位——libc 的主版本号已经二十多年停在 6，于是一个安全更新可以直接替换同名文件。
-
-主版本号管不了的演化，由符号版本接着管：同一个 \code{printf} 在 libc 里带着版本标签 \code{GLIBC\_2.2.5}，可执行文件记录的不仅是“要 \code{printf}”，还有“要哪个版本的 \code{printf}”。于是同一个 \code{libc.so.6} 可以在内部继续演化，老程序拿到的仍是当年那个语义的符号。
-
-\begin{lstlisting}
-$ readelf -sW /lib/x86_64-linux-gnu/libc.so.6 | grep -w printf
-  1402: 00000000000645e0  137 FUNC   GLOBAL DEFAULT  15 printf@@GLIBC_2.2.5
-\end{lstlisting}
-
-还有一条更晚的定址时机值得一提：\code{dlopen}/\code{dlsym} 把“装载一个库”推迟到运行中的任意时刻，插件机制全靠它——浏览器加载扩展、文本编辑器加载语法插件，都是程序自己请动态链接器中途再接一个库进来。链接的三档时机（编译链接时、装载时、运行时）至此全部到齐。
-
-代价同样明确。其一，装载时重定位：库内部对数据和函数的引用在基址确定之前是半成品，装载时要按“基址加偏移”把 GOT 等表项逐条填好，库越多表越长。其二，间接跳转：跨模块调用不能用直接 \code{call}，要经 PLT/GOT 间接一级，每次调用多一次内存间接。其三，依赖管理：“升级不重链”的另一面是“库变了程序没重编”，二进制接口兼容因此成为发行版甩不掉的长期负担。
-
-\begin{longtable}{L{0.16\linewidth}L{0.37\linewidth}L{0.37\linewidth}}
-\toprule
-方面 & 静态链接 & 动态链接 \\
-\midrule
-代码份数 & 每进程一份副本 & 全系统共享一份代码页 \\\tablerowrule
-升级 & 重新链接并分发每个程序 & 替换库文件即可 \\\tablerowrule
-启动前工作 & 无 & 映射库、按基址修补重定位表 \\\tablerowrule
-调用开销 & 直接 \code{call} & PLT/GOT 间接一次 \\\tablerowrule
-文件体积 & 大，自带全部代码 & 小，只记依赖名 \\
-\bottomrule
-\end{longtable}
-
-顺带说明，静态链接并没有被淘汰：容器镜像和嵌入式固件反而偏爱它——一个自包含、零依赖的二进制，拷到任何机器上都能跑，这正是用磁盘体积换部署确定性。推到极限，本书末章的教学计算机项目的裸机镜像就是“终极静态链接”：连操作系统都链在同一个映像里，没有任何运行期依赖可言。
-
-\topic{PLT/GOT 的延迟绑定}
-动态链接的程序调用 \code{printf} 时，目标地址在链接时还不在本文件里。链接器的办法是两级间接：\code{call} 先到本模块内一小段固定桩（PLT 项），桩里是一条间接跳转，跳的目标写在 GOT 表项里；GOT 是可写数据，真实地址由装载时或运行时填入。这样代码段保持只读可共享，所有需要修补的地址集中在一小张表里。
-
-为什么不干脆在装载时改写 \code{call} 指令的目标？因为那要写代码页：代码页一变脏，写时复制立刻把共享页拆成私有页，共享库和下一主题的 ASLR 一起失效。PLT/GOT 的全部存在理由就是八个字：代码不动，数据可改——代码段一个字节不动，所有可写的定址信息集中到数据段的一张表。
-
-\begin{lstlisting}
-        call  printf@plt              ; call site in main
-
-plt0:                                 ; 0x401020
-        push  qword ptr [rip+0x2fe2]  ; GOT[1] = link_map
-        jmp   qword ptr [rip+0x2fe4]  ; GOT[2] = _dl_runtime_resolve
-printf@plt:                           ; 0x401030
-        jmp   qword ptr [rip+0x2fe2]  ; GOT[3] at 0x404018
-        push  0                       ; relocation index of printf
-        jmp   plt0
-\end{lstlisting}
-
-把一次 \code{printf} 调用的两级跳走读一遍。第一级是静态的：\code{call printf@plt} 跳到 \code{0x401030}。第二级是动态的：桩里 \code{jmp qword ptr [rip+0x2fe2]} 是 rip 相对寻址，指令长 6 字节，下一条指令在 \code{0x401036}，所以表项地址是 \code{0x401036 + 0x2fe2 = 0x404018}，即 GOT[3]；\code{plt0} 的两条同理，分别指向 GOT[1] 与 GOT[2]，读者可自行核对 \code{0x401026 + 0x2fe2 = 0x404008}、\code{0x40102c + 0x2fe4 = 0x404010}。
-
-第一次调用时，GOT[3] 里装的是 \code{0x401036}——桩里那条 \code{jmp} 的下一条指令自己，这次间接跳等于原地踏步；顺序执行 \code{push 0}（\code{printf} 的重定位下标）和 \code{jmp plt0}，\code{plt0} 把 \code{link\_map} 压栈后跳进动态链接器的解析例程。解析器按下标找到符号名 \code{printf}，在 libc 里查出真实地址（设为 \code{0x7f9a3c0f45e0}），写进 GOT[3]，再直接调进 \code{printf}。第二次调用只剩两条指令：\code{call} 进桩，\code{jmp [0x404018]} 直达 \code{0x7f9a3c0f45e0}，一次内存间接，没有任何解析。
-
-把两次调用画成两条分开的路径，第一次的解析绕路与之后的一跳直达，差别一眼可见：
-
-\begin{pdfdiagram}
-  % 上路：首次调用，经解析例程并回写 GOT
-  \node[hw label, anchor=west] at (0.05,3.6) {首次调用：解析并回写 GOT};
-  \node[hw compute, minimum width=1.7cm] (callA) at (0.9,2.8) {call printf@plt};
-  \node[hw compute, minimum width=1.5cm] (pltA) at (2.9,2.8) {PLT 桩};
-  \node[hw memory, minimum width=2.2cm] (gotA) at (5.2,2.8) {GOT[3]：\\指回桩内};
-  \node[hw compute, minimum width=1.6cm] (plt0) at (7.5,2.8) {plt0\\公共桩};
-  \node[hw control, minimum width=1.9cm] (res) at (9.8,2.8) {动态链接器\\解析例程};
-  \node[hw compute, minimum width=1.8cm] (fnA) at (9.8,1.3) {printf 本体};
-  \draw[hw bus] (callA) -- (pltA);
-  \draw[hw bus] (pltA) -- (gotA);
-  \draw[hw bus] (gotA) -- (plt0);
-  \draw[hw bus] (plt0) -- (res);
-  \draw[hw bus] (res.south) -- node[hw label, left]{调入} (fnA.north);
-  % 回写 GOT：从解析例程下方绕到 gotA.south，避开 plt0 与 fnA
-  \draw[hw return] (res.west) -- (8.7,2.8) -- (8.7,2.0) -- (5.2,2.0) -- (gotA.south);
-  \node[hw label, fill=white, inner sep=1pt] at (7.0,2.0) {写回真实地址};
-  % 下路：第二次及以后，一次间接直达
-  \node[hw label, anchor=west] at (0.05,0.8) {第二次及以后：一跳直达};
-  \node[hw compute, minimum width=1.7cm] (callB) at (0.9,0.0) {call printf@plt};
-  \node[hw compute, minimum width=1.5cm] (pltB) at (2.9,0.0) {PLT 桩};
-  \node[hw memory, minimum width=2.2cm] (gotB) at (5.2,0.0) {GOT[3]：\\真实地址};
-  \node[hw compute, minimum width=1.8cm] (fnB) at (8.0,0.0) {printf 本体};
-  \draw[hw bus] (callB) -- (pltB);
-  \draw[hw bus] (pltB) -- (gotB);
-  \draw[hw bus] (gotB) -- node[hw label, below]{直达} (fnB);
-\end{pdfdiagram}
-\diagramnote{PLT/GOT 两级间接的两条路径。首次调用时 GOT 表项指回桩内，流程经公共桩进入动态链接器的解析例程，查出真实地址后先写回 GOT 表项（虚线）再调入函数本体；此后每次调用只剩 \code{call} 进桩、桩内经 GOT 一次间接跳直达。代码段自始至终不被改写，可写的定址信息全部集中在 GOT 这张表里。}
-
-把首次调用绕进解析例程的那一段再放大一级，ld.so 被触发后的完整路径是“查、写、跳”三步：
-
-\begin{pdfdiagram}
-  % 上行：经两级桩进入解析例程
-  \node[hw compute, minimum width=1.9cm, align=center] (n1) at (1.0,1.2) {printf@plt\\push 下标 0};
-  \node[hw compute, minimum width=1.9cm, align=center] (n2) at (3.3,1.2) {plt0\\push link\_map};
-  \node[hw control, minimum width=2.3cm, align=center] (n3) at (5.85,1.2) {动态链接器\\\_dl\_runtime\_resolve};
-  \node[hw memory, minimum width=2.6cm, align=center] (n4) at (8.9,1.2) {按 .dynsym 查到\\printf 真实地址};
-  % 下行：回写 GOT，再直接调入
-  \node[hw memory, minimum width=3.2cm, align=center] (n5) at (8.9,-0.7) {GOT[3] $\leftarrow$ 0x7f9a3c0f45e0\\回写表项};
-  \node[hw compute, minimum width=2.6cm, align=center] (n6) at (4.6,-0.7) {跳入 printf 本体\\解析不再发生};
-  \draw[hw bus] (n1.east) -- (n2.west);
-  \draw[hw bus] (n2.east) -- (n3.west);
-  \draw[hw bus] (n3.east) -- (n4.west);
-  \draw[hw return] (n4.south) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{写回} (n5.north);
-  \draw[hw bus] (n5.west) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{直接调入} (n6.east);
-\end{pdfdiagram}
-\diagramnote{首次调用时动态链接器的解析路径（数值对应正文 \code{printf} 例）。桩先压入重定位下标 0，公共桩 \code{plt0} 再压入 \code{link\_map}，跳进解析例程；例程按下标找到符号名 \code{printf}，在 libc 中查出真实地址 \code{0x7f9a3c0f45e0}，写进 \code{0x404018} 处的 GOT[3]（虚线回写），最后直接调入函数本体。这张表项填好之后，第二次调用只剩桩内一次间接跳，解析路径被完全绕过。}
-
-\begin{longtable}{L{0.16\linewidth}L{0.37\linewidth}L{0.37\linewidth}}
-\toprule
-检查点 & 第一次调用 & 第二次及以后 \\
-\midrule
-GOT[3] 内容 & \code{0x401036}（桩内下一条） & \code{0x7f9a3c0f45e0}（真实地址） \\\tablerowrule
-经过路径 & 桩→\code{plt0}→解析器→\code{printf} & 桩→\code{printf} \\\tablerowrule
-关键动作 & 查符号、写 GOT[3] & 无 \\\tablerowrule
-预期开销 & 一次符号查找，微秒级 & 一次间接跳，纳秒级 \\
-\bottomrule
-\end{longtable}
-
-PLT 与 GOT 的分工可以列成一张对照：
-
-\begin{longtable}{L{0.16\linewidth}L{0.18\linewidth}L{0.26\linewidth}L{0.30\linewidth}}
-\toprule
-对象 & 所在段 & 可写性 & 内容由谁何时填 \\
-\midrule
-PLT 桩 & 代码段 & 只读 & 链接器静态生成，运行期不变 \\\tablerowrule
-GOT 表项 & 数据段 & 可写（见下） & 动态链接器按基址与符号填 \\
-\bottomrule
-\end{longtable}
-
-GOT 的“可写”本身是一个攻击面：谁改写了 GOT[3]，谁就把下一次 \code{printf} 调用拐到自己选的地方。对策叫全 RELRO：装载时用 \code{LD\_BIND\_NOW} 把全部符号解析完，然后把 GOT 所在页改回只读——用启动时间换“运行期不可覆写”。这与上一个主题“代码页只读才能共享”是同一条纪律的延伸：凡是可被写的定址信息，要么推迟到必要时再写，要么写完立刻封死。
-
-这种“第一次才解析”的做法叫懒绑定（lazy binding）。它的收益可以用数字说话：一个中型程序导入约 1200 个动态符号，典型启动路径只用其中约 150 个，懒绑定让启动时省掉约 1050 次符号查找——每次查找都要算哈希、比字符串、写表项。对短生命进程（脚本里一闪而过的每个命令）省得更多：大量导入函数整个生命期一次都没被调用。代价是第一次调用某个函数时有一次不可预测的解析延迟；实时系统可以设 \code{LD\_BIND\_NOW=1}，装载时把全部符号解析完，用启动时间换运行期的确定性。还要记住分工：桩和 GOT 的骨架、GOT 的初值，都是“链接：重定位与地址形成”一节的链接器在静态时就排好的局，动态链接器运行期只做“填表”这一件事。
-
-\topic{ASLR 与装载时重定位}
-前面例子的地址全是固定的：代码在 \code{0x401000}，GOT 在 \code{0x404000}。固定地址对攻击者同样是固定的：栈溢出拿到 \code{rip} 控制权后，只要知道 libc 里 \code{system} 或某条指令片段的地址，就能拼接利用。地址空间布局随机化（ASLR）的对策是让每次运行的基址都不同：栈、堆、mmap 区和共享库各加一个随机偏移；编译成位置无关可执行文件（PIE）时，连主程序自己的基址也随机。同一个程序连跑两次：
-
-\begin{lstlisting}
-$ ./showaddr                       $ ./showaddr
-main   = 0x555555555149            main   = 0x555555e8e149
-printf = 0x7f9a3c0f45e0            printf = 0x7f2b8d1a35e0
-&buf   = 0x7ffffffde2ac            &buf   = 0x7ffc2a1d59ac
-\end{lstlisting}
-
-三个地址全变。换算成攻击者的处境：若某区域基址带 28 位随机位，一次猜中的概率是 $1/2^{28}=1/268\,435\,456\approx3.7\times10^{-9}$；猜错通常意味着目标进程崩溃重来，而崩溃本身就可能暴露行踪。32 位时代有过反面教训：地址空间只有 4 GiB，随机位只有十几位，几千到几万次尝试量级就能爆破；64 位空间让随机位和猜测代价一起变大。ASLR 不是绝对防御——一次地址信息泄漏就能让它失效——但它把一大类利用的成本从“查一次表”抬高到“先泄漏、再猜、还不能错”。
-
-把两次运行的地址空间并排画出，随机化的形状就是“布局不变、基址平移”：
-
-\begin{pdfdiagram}
-  \node[hw label] at (0,2.6) {第一次运行};
-  \node[hw label] at (7.6,2.6) {第二次运行};
-  % 左列（上高下低）
-  \node[hw state, align=center, minimum width=4.4cm] (stk1) at (0,1.6) {栈：顶 0x7ffffffde000 附近};
-  \node[hw memory, align=center, minimum width=4.4cm] (lib1) at (0,0.4) {libc：基址 0x7f9a3c090000};
-  \node[hw compute, align=center, minimum width=4.4cm] (exe1) at (0,-0.8) {主程序：基址 0x555555555000};
-  % 右列
-  \node[hw state, align=center, minimum width=4.4cm] (stk2) at (7.6,1.6) {栈：顶 0x7ffc2a1d5000 附近};
-  \node[hw memory, align=center, minimum width=4.4cm] (lib2) at (7.6,0.4) {libc：基址 0x7f2b8d13f000};
-  \node[hw compute, align=center, minimum width=4.4cm] (exe2) at (7.6,-0.8) {主程序：基址 0x555555e8e000};
-  % 对应区域的平移
-  \draw[hw return] (stk1.east) -- (stk2.west);
-  \draw[hw return] (lib1.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{各区域基址平移} (lib2.west);
-  \draw[hw return] (exe1.east) -- (exe2.west);
-  \node[hw label, align=center] at (3.8,-1.9) {布局与代码内容不变，代码页继续只读共享\\变的只是基址：选随机值，按“基址＋偏移”填 GOT};
-\end{pdfdiagram}
-\diagramnote{ASLR 两次运行对照（对应正文 showaddr 输出）。两次运行的区域顺序与相对布局完全相同，变的只是基址：主程序 0x555555555000 对 0x555555e8e000，libc 0x7f9a3c090000 对 0x7f2b8d13f000，栈顶 0x7ffffffde000 附近对 0x7ffc2a1d5000 附近。换基址不改代码一个字节——PIC 让模块内引用全是 rip 相对、跨模块引用全走 GOT，随机化的全部成本就是选基址加填那张可写的表。}
-
-\begin{longtable}{L{0.18\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
-\toprule
-区域 & 传统固定位置 & ASLR 之后 \\
-\midrule
-主程序 & \code{0x400000}（\code{-no-pie}） & PIE 下随机基址 \\\tablerowrule
-共享库与 mmap 区 & 固定在 \code{0x7f...} 某处 & 每次运行换基址 \\\tablerowrule
-栈 & \code{0x7ffffffff000} 附近 & 栈顶加随机偏移 \\\tablerowrule
-堆（brk） & 紧接 \code{.bss} 之后 & 起点加随机偏移 \\
-\bottomrule
-\end{longtable}
-
-ASLR 便宜的前提是位置无关代码（PIC）。若代码里固定绝对地址，换基址就要逐条修补代码；代码页一被写脏，写时复制立刻把共享页拆成私有页，“300 个进程共享一份 libc”就此作废。PIC 的做法是：模块内引用全部改成 rip 相对（\code{lea rdi, [rip+0x0e31]} 之类），跨模块引用全部走 GOT。换基址因此只剩两步——随机选一个基址，按“基址加偏移”修补那张可写的 GOT——代码页一个字节都不动，继续只读、继续共享。
-
-装载时重定位也正因为集中在一张表里而便宜：表项密度高、缓存友好。一个链接几十个库的 GUI 程序，启动前动态链接器要处理几万条 RELA 记录，每条不过是“基址加符号偏移，写入 GOT[n]”的一次内存写，总量毫秒级。相比之下，若允许对代码段做重定位（老式的 text relocation），每个进程都要先把代码页复制再逐条改写——共享、ASLR、启动速度同时受损，现代工具链因此默认拒绝生成代码重定位。
-
-随机化可以被直接观察，也可以被关掉做对照。\code{setarch -R} 关闭 ASLR 后再跑同一个程序，两次运行的地址逐位相同——这正是“关掉随机化，世界就回到固定地址”的实验：
-
-\begin{lstlisting}
-$ setarch -R ./showaddr          $ setarch -R ./showaddr
-main   = 0x555555555149            main   = 0x555555555149
-printf = 0x7ffff7d645e0            printf = 0x7ffff7d645e0
-&buf   = 0x7fffffffe2ac            &buf   = 0x7fffffffe2ac
-\end{lstlisting}
-
-把四件事串成一条链：代码页只读，所以可共享；可共享，所以换基址不能改代码；不改代码，ASLR 的成本只剩选基址和填表。本书末章的教学计算机项目的面包板机是这条链的反面：程序拨在哪个地址就运行在哪个地址，没有随机化、没有重定位、没有共享——不是做不到，而是那台机器上根本没有第二个程序需要防。
-
-\begin{classicnote}
-经典教材把定址时机分成三档：编译链接时（静态链接，地址在链接后不再变）、装载时（动态链接器映射库并修补重定位表）、运行时（懒绑定在第一次调用时才解析符号）。本节给三档各配了一个可观察的数字：装载只建映射不读字节，所以 \code{execve} 快；懒绑定把上千次符号查找改成按需，所以启动快；PIC 把换基址缩成填一张 GOT，所以 ASLR 几乎免费。记住这张时机表，每个机制省的是哪一笔就都有数了。
-\end{classicnote}
-
-\section{五、系统调用与异常控制流}
-
-程序一旦开始执行，就运行在用户态：能算数、能读写自己的内存，但碰不了设备、改不了页表、造不出新进程——这些事必须请内核代办，请代办的门就是系统调用。本节把系统调用、上下文切换和信号串成一条线：它们都是处理器核心相关章节那张“受控的非顺序 PC 更新”表的实例，与存储与设备事务相关章节的硬件中断共用同一副骨架——保存现场、按号定向、服务、返回。
-
-\topic{syscall 指令触发的受控陷入}
-用户程序与内核之间有一条硬约定——系统调用 ABI：服务编号放 \code{rax}，参数依次放 \code{rdi}、\code{rsi}、\code{rdx}、\code{r10}、\code{r8}、\code{r9}，然后执行 \code{syscall} 指令，返回值放在 \code{rax}。它与处理器核心相关章节的普通调用约定几乎同形，只有一个反常：第四个参数用 \code{r10} 而不是 \code{rcx}。原因马上会看到——\code{syscall} 指令本身要占用 \code{rcx}，参数只能绕道；这样设计的好处是包装层只需挪一个寄存器，其余位置原样沿用。参数至多六个，现实中系统调用的参数个数在设计时就被压在这条线内。
-
-编号就是向量号。x86-64 Linux 的编号表由内核源码发布，一旦公布就永不回收、只增不改——已编译的用户程序把编号烧进了自己的代码，回收一个编号就等于弄瞎一批旧程序，这是 ABI 稳定性的含义。
-
-\begin{lstlisting}
-; x86-64 Linux, arch/x86/entry/syscalls/syscall_64.tbl (excerpt)
-  0   common  read
-  1   common  write
-  2   common  open
-  3   common  close
-  9   common  mmap
- 57   common  fork
- 59   common  execve
-231   common  exit_group
-\end{lstlisting}
-
-一条 \code{write(1, msg, 13)} 按 ABI 写出来是这样（Intel 语法）：
-
-\begin{lstlisting}
-        mov  eax, 1              ; __NR_write
-        mov  edi, 1              ; fd = stdout
-        lea  rsi, [rip+msg]      ; buf
-        mov  edx, 13             ; count
-        syscall                  ; controlled trap into kernel
-        ; rax = 13 on success, or -errno
-
-msg:    db   "hello, world", 10
-\end{lstlisting}
-
-\code{syscall} 指令的硬件动作极少而精：把返回地址（下一条指令的 \code{rip}）装进 \code{rcx}，把 \code{rflags} 装进 \code{r11}，按 \code{IA32\_FMASK} MSR 的掩码清掉 \code{rflags} 的指定位，特权级从 3 升为 0，最后把 \code{IA32\_LSTAR} MSR 里的内核入口地址装进 \code{rip}。没有内存访问，没有查表——入口地址早在系统启动时就被内核写进了 MSR。
-
-为什么参数全走寄存器，而不像普通调用那样允许栈传参？因为内核不能信任用户栈指针：\code{syscall} 那一刻 CPU 还在用户栈上，而这个栈指针本身就可能指向不可写的页。六个寄存器是“内核不用解引用任何用户指针就能拿到的全部输入”；参数个数因此被设计时压在这条线内——历史上 32 位 ABI 只有五个寄存器可用，第六个参数被迫走内存，至今还能在老代码里看到那处别扭。
-
-以 \code{write(1, msg, 13)} 为例，把寄存器摆参与内核栈上的 \code{pt\_regs} 画在一张图里，陷入与返回各是一次受控交接：
-
-\begin{pdfdiagram}
-  \node[hw state, minimum width=4.2cm, align=center] (ureg) at (2.1,1.0) {用户态摆参（write 例）\\rax ← 1（调用号）\\rdi ← 1，rsi ← msg\\rdx ← 13\\第 4–6 参数：r10、r8、r9\\指令占用：rcx ← rip，r11 ← rflags};
-  \node[hw memory, minimum width=4.6cm, align=center] (ptregs) at (8.5,1.0) {本进程内核栈：pt\_regs\\ss、rsp（用户）、rflags\\cs、rip（用户）← CPU 保存\\orig\_rax ← 调用号\\rdi rsi rdx rcx rax r10\\r8 r9 r11 rbx rbp r12–r15};
-  \draw[hw bus] (ureg.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{陷入：CPL 3→0} (ptregs.west);
-  \draw[hw return] (ptregs.south) -- (8.5,-1.5) -- (2.1,-1.5) -- (ureg.south);
-  \node[hw label, fill=white, inner sep=1pt] at (5.3,-1.22) {sysret：rax 带回返回值，逆序恢复，CPL 0→3};
-\end{pdfdiagram}
-\diagramnote{系统调用的参数传递与现场保存（\code{write(1, msg, 13)} 例）。用户态按 ABI 摆好 \code{rax} 编号与 \code{rdi}/\code{rsi}/\code{rdx} 参数；\code{syscall} 指令把返回地址装进 \code{rcx}、标志装进 \code{r11}——这正是第四个参数改用 \code{r10} 的原因——并把 \code{rip} 换成 LSTAR 入口。入口代码切到本进程内核栈，把用户态现场连同全部通用寄存器存成 \code{pt\_regs}，内核 C 代码看到的“寄存器”就是这张内存表；\code{sysret} 逆序恢复，返回值仍由 \code{rax} 带回，一进一出同一个寄存器。}
-
-把普通调用和系统调用并排，ABI 的同形与差异一眼可见：
-
-\begin{longtable}{L{0.24\linewidth}L{0.32\linewidth}L{0.34\linewidth}}
-\toprule
-方面 & 普通函数调用 & 系统调用 \\
-\midrule
-第四个参数 & \code{rcx} & \code{r10}（\code{rcx} 被指令占用） \\\tablerowrule
-返回地址 & 由 \code{call} 压到栈上 & 装进 \code{rcx} 寄存器 \\\tablerowrule
-特权级 & 不变 & 3→0，返回时 0→3 \\\tablerowrule
-使用的栈 & 同一条用户栈 & 切到本进程内核栈 \\\tablerowrule
-入口地址 & 固定在指令编码里 & \code{IA32\_LSTAR} MSR \\
-\bottomrule
-\end{longtable}
-
-与老式的 \code{int 0x80} 对照最能看清这副骨架：\code{int} 要按处理器核心相关章节的“表基址+异常号×项宽”去内存里查 IDT，慢在一次内存访问，且向量表本身也要保护；\code{syscall} 把入口搬进 MSR，把“编号到服务”的分发表 \code{sys\_call\_table} 留给内核软件去查。但两者只是同一副骨架的两种实现：指令显式请求进入特权服务，硬件保存返回位置、切换权限和入口——处理器核心相关章节异常表里“系统调用”那一行，写的就是它。
-
-\begin{longtable}{L{0.14\linewidth}L{0.44\linewidth}L{0.32\linewidth}}
-\toprule
-骨架阶段 & \code{syscall} 路径上的动作 & 对应前章的谁 \\
-\midrule
-保存现场 & \code{rip}→\code{rcx}、\code{rflags}→\code{r11}、切内核栈、建 \code{pt\_regs} & 处理器核心相关章节“保存故障 PC 和原因” \\\tablerowrule
-定向 & 硬件入口 = \code{IA32\_LSTAR}；内核再按 \code{sys\_call\_table[rax]} 分发 & 处理器核心相关章节向量表查表；\code{int 0x80} 走 IDT \\\tablerowrule
-服务 & \code{sys\_read}/\code{sys\_write} 等操作设备与文件 & 存储与设备事务相关章节 MMIO/DMA 由内核代发 \\\tablerowrule
-返回 & \code{sysret}：\code{rcx}→\code{rip}、\code{r11}→\code{rflags}、特权级 0→3 & 存储与设备事务相关章节中断返回恢复现场 \\
-\bottomrule
-\end{longtable}
-
-这副“保存现场、按号定向、服务、返回”的骨架值得背下来，因为本节后面三个主题全是它的实例：上下文切换是“定时器中断加换一套现场”，信号是“返回用户态之前的检查点”，边界清单则是“哪些服务必须在这副骨架里完成”。
-
-把一次系统调用的完整往返按时间自上而下画成两条泳道，特权级的两次切换就是图上两次越过边界的时刻：
-
-\begin{pdfdiagram}
-  % 泳道底框（先画，垫在节点之下）
-  \node[hw lane, minimum width=4.4cm, minimum height=6.6cm] at (2.2,1.7) {};
-  \node[hw lane, minimum width=4.4cm, minimum height=6.6cm] at (8.0,1.7) {};
-  \node[hw label] at (2.2,5.35) {用户态（CPL 3）};
-  \node[hw label] at (8.0,5.35) {内核态（CPL 0）};
-  % 特权级边界
-  \draw[BookRule, line width=0.45pt, dashed] (5.1,-1.6) -- (5.1,5.0);
-  \node[hw label] at (5.1,-1.95) {特权级边界};
-  % 用户态泳道
-  \node[hw compute, minimum width=3.2cm] (u1) at (2.2,4.2) {用户程序摆好编号与参数\\rax、rdi、rsi、rdx};
-  \node[hw control, minimum width=3.2cm] (u2) at (2.2,2.9) {syscall 指令\\rip→rcx，rflags→r11};
-  \node[hw compute, minimum width=3.2cm] (u3) at (2.2,-1.0) {继续执行下一条指令\\rax = 返回值};
-  % 内核态泳道
-  \node[hw state, minimum width=3.2cm] (k1) at (8.0,2.9) {LSTAR 入口：切内核栈\\现场存为 pt\_regs};
-  \node[hw compute, minimum width=3.2cm] (k2) at (8.0,1.6) {按号分发\\sys\_call\_table[rax]};
-  \node[hw compute, minimum width=3.2cm] (k3) at (8.0,0.3) {服务例程\\sys\_write 等};
-  \node[hw state, minimum width=3.2cm] (k4) at (8.0,-1.0) {sysret：恢复现场\\rcx→rip，r11→rflags};
-  \draw[hw bus] (u1.south) -- (u2.north);
-  \draw[hw bus] (u2.east) -- (k1.west);
-  \node[hw label] at (5.2,3.9) {陷入：特权级 3→0};
-  \draw[hw bus] (k1.south) -- (k2.north);
-  \draw[hw bus] (k2.south) -- (k3.north);
-  \draw[hw bus] (k3.south) -- (k4.north);
-  \draw[hw bus] (k4.west) -- (u3.east);
-  \node[hw label] at (5.1,-0.1) {返回：特权级 0→3};
-\end{pdfdiagram}
-\diagramnote{一次系统调用往返的泳道图：左为用户态（CPL 3），右为内核态（CPL 0），中间虚线是特权级边界，两次越界即 CPL 3→0 与 0→3 的切换点。\code{syscall} 指令把返回地址与标志装进 \code{rcx}/\code{r11}、把 \code{rip} 换成 MSR 中的内核入口；入口代码切到本进程内核栈，把全部通用寄存器存成 \code{pt\_regs}，再按 \code{rax} 中的编号查 \code{sys\_call\_table} 分发；服务完成后 \code{sysret} 逆向恢复。内核全程不必解引用用户栈指针。}
-
-\topic{陷入与返回的上下文}
-\code{syscall} 指令只切换了最小状态，完整的上下文交接由内核入口代码完成：\code{swapgs} 换出内核数据基址；从本进程的 TSS 取出内核栈指针——每个进程都有一条独立的内核栈，典型大小 16 KiB，专门承接它陷入内核时的现场；然后把用户态的 \code{rsp}、\code{rcx}（用户 \code{rip}）、\code{r11}（用户 \code{rflags}）和全部通用寄存器按固定布局存成一张 \code{pt\_regs}。此后内核 C 代码看到的“寄存器”，其实是这张内存表。返回时逆序恢复，\code{sysret} 用 \code{rcx}/\code{r11} 还原 \code{rip}/\code{rflags}，并把特权级降回 3。
-
-\begin{lstlisting}
-; pt_regs on the per-process kernel stack, high to low address:
-;   ss, rsp(user), rflags(user), cs, rip(user)   <- saved by CPU
-;   orig_rax                                     <- syscall number
-;   rdi rsi rdx rcx rax r8 r9 r10 r11 rbx rbp
-;   r12 r13 r14 r15                              <- saved by entry code
-\end{lstlisting}
-
-为什么每进程一条内核栈？因为进程可能在内核里被切走：它服务到一半被定时器打断，现场得有个各自安放的地方。内核栈就是该进程“在内核里的工作台”，栈顶指针存在进程控制块里——下一个主题会看到，上下文切换保存的全部东西，最后都归结为这个指针。16 KiB 同时是一条纪律：内核态不能深递归，也不能在栈上放大数组，否则栈溢出踩穿的是自己的现场。
-
-把一次 \code{read(0, buf, 4096)} 的完整往返走一遍。\code{strace} 里它只有一行：
-
-\begin{lstlisting}
-$ strace -e read ./hello
-read(0, "hello\n", 4096)               = 6
-\end{lstlisting}
-
-第一步，用户态摆好 ABI：\code{rdi=0}、\code{rsi=buf}、\code{rdx=4096}、\code{rax=0}，执行 \code{syscall}。到这一步为止，一切和普通函数调用的准备没有区别——区别从下一步开始。
-
-第二步，陷入：特权级升为 0，\code{rip} 换成 LSTAR 入口，入口代码建 \code{pt\_regs}，按 \code{rax=0} 查 \code{sys\_call\_table} 分发到 \code{sys\_read}。注意返回地址此刻在 \code{rcx} 里、被存进 \code{pt\_regs}，而不在用户栈上——内核从始至终不需要解引用用户栈指针。
-
-第三步，服务：经虚拟文件层到终端驱动，键盘缓冲里已有 6 字节，复制到 \code{buf}——复制前内核先检查 \code{buf} 所在页可写，不可写就不复制，直接返回 \code{-14}。设备寄存器、DMA 描述符这些存储与设备事务相关章节的对象，只有在这一步、只有内核态才能碰。
-
-第四步，返回：\code{rax=6}，\code{sysret} 回用户态，libc 包装看到非负值，直接把它作为返回值交出。返回值用 \code{rax} 不是巧合：编号进内核时用的就是 \code{rax}，一进一出，同一个寄存器完成交接，调用者连第二个寄存器都不用读。
-
-\begin{lstlisting}
-before:  rax=0  rdi=0  rsi=0x7ffffffde2a0  rdx=4096
-trap:    rcx=rip(next)  r11=rflags  CPL 3->0  rip=LSTAR
-return:  rax=6
-\end{lstlisting}
-
-错误约定值得单独说清。内核用 \code{-errno} 表示失败：\code{rax} 落在 $[-4095,-1]$ 区间即出错，例如 \code{-14=-EFAULT}（\code{buf} 不可写）、\code{-9=-EBADF}（描述符无效）。判断只需一次无符号比较：\code{-14} 的无符号形式是 \code{0xFFFFFFFFFFFFFFF2}，不小于 \code{-4095} 的无符号形式 \code{0xFFFFFFFFFFFFF001}，一条 \code{cmp} 就分出成败。glibc 的包装函数负责翻译：检出该区间就把 \code{errno} 置为 14、返回 \code{-1}——C 程序看到的是 \code{read} 返回 \code{-1} 且 \code{errno==EFAULT}，内核内部的 \code{-14} 由包装层转换，不直接暴露给程序。
-
-为什么连 \code{buf} 都要检查？因为内核不能信任用户态递来的任何指针：它可能指向不可写的页，也可能故意指向内核地址。每个系统调用开头的参数检查，是内核自保的第一课，也是“边界”二字在服务一侧的具体形态。
-
-常见错误码可以列成一张小表，以后读 \code{strace} 输出时会反复遇到它们：
-
-\begin{longtable}{L{0.10\linewidth}L{0.18\linewidth}L{0.62\linewidth}}
-\toprule
-数值 & 名字 & 典型触发场景 \\
-\midrule
-\code{-1} & \code{EPERM} & 操作不被允许，如向别人的进程发信号 \\\tablerowrule
-\code{-2} & \code{ENOENT} & 路径不存在，\code{open} 失败 \\\tablerowrule
-\code{-9} & \code{EBADF} & 描述符无效，如 \code{read} 一个已关闭的 fd \\\tablerowrule
-\code{-11} & \code{EAGAIN} & 非阻塞读暂时无数据 \\\tablerowrule
-\code{-14} & \code{EFAULT} & 指针指向不可访问的页 \\
-\bottomrule
-\end{longtable}
-
-\code{pt\_regs} 里的 \code{orig\_rax} 还藏着一条与信号的衔接：慢系统调用（比如等键盘的 \code{read}）若被信号打断，服务例程会返回一个内部码 \code{ERESTART}；处理函数若按 \code{SA\_RESTART} 安装，内核就在 \code{sigreturn} 后用 \code{orig\_rax} 里的编号把这次调用重新发起，用户态毫无察觉，否则 libc 把 \code{-EINTR} 交给程序，由程序自己决定要不要重试。系统调用能被“重启”，前提正是完整现场都在 \code{pt\_regs} 里。
-
-工程含义是一笔时间账：一次系统调用往返的典型开销在百纳秒级，比普通函数调用贵约两个数量级——贵在特权切换、\code{pt\_regs} 保存、查表分发和参数检查。后世的优化几乎全部围绕“少进几次内核”：stdio 缓冲、\code{readv}/\code{writev} 批量提交、\code{mmap} 免复制、vDSO 和 \code{io\_uring}，最后一个主题还会回到这张清单。
-
-\topic{上下文切换的完整步骤}
-系统调用是程序主动进内核，定时器中断则是内核定期不请自来——走存储与设备事务相关章节那条链路：定时器拉起 IRQ，中断控制器判优，CPU 在指令边界接收，查向量表进服务程序。服务程序发现当前进程的时间片用完，就做一次上下文切换：把整套程序员可见状态换成另一个进程的。完整步骤可以写成一条 trace：
-
-\begin{lstlisting}
-// 注释（推进）：按行追踪数据来源、经过的部件和最终写入目标。
-// 注释（边界）：只有标出的时钟沿、阶段或异常入口会改变体系结构可见状态。
-timer interrupt arrives while A runs
-  CPU:   push rip/cs/rflags/rsp/ss of A; enter ISR
-  ISR:   push A's general registers to A's kernel stack
-  A.state = READY
-  B = pick_next()                        ; scheduler decision
-  if (B.mm != A.mm) CR3 = B.pgd          ; switch address space
-  rsp = B.saved_kernel_sp                ; switch kernel stack
-  pop B's general registers
-  iretq                                  ; resume B at its saved rip
-\end{lstlisting}
-
-逐步核对。第一步保存 A：中断已经自动压好 \code{rip}/\code{cs}/\code{rflags}/\code{rsp}/\code{ss}，入口代码补齐通用寄存器——A 的全部可见状态此刻躺在它自己的内核栈上，进程控制块里只要存一个栈顶指针。第二步选下一个：调度器从就绪队列挑出 B——“换谁”是软件策略，“怎么换”才是这里的硬件约定，两者泾渭分明。第三步切地址空间：把 B 的页表基址写进 CR3（经典芯片与平台案例：CR3 指向顶级页表）——从这一刻起，同一个虚拟地址 \code{0x401000} 指向的是 B 的代码；副作用随之而来，TLB 里 A 的翻译全部作废，除非启用 PCID（PCID 标签打在 TLB 项上，取自 CR3 低 12 位），B 恢复后的前几千次访存都会慢一拍。第四步恢复 B 的寄存器并 \code{iretq}——B 从自己的视角看，只是“上一次陷入返回得特别久”。
-
-把这条 trace 画成泳道图，“换一套现场”就是三条道之间的一次往返：
-
-\begin{pdfdiagram}
-  % 泳道标签与分隔虚线
-  \node[hw label] at (0,2.9) {进程 A（用户态）};
-  \node[hw label] at (5.2,2.9) {内核};
-  \node[hw label] at (10.4,2.9) {进程 B（用户态）};
-  \draw[draw=BookMuted, dashed, line width=0.5pt] (2.9,2.55) -- (2.9,-2.6);
-  \draw[draw=BookMuted, dashed, line width=0.5pt] (7.5,2.55) -- (7.5,-2.6);
-  % 事件序列（时间向下）
-  \node[hw state, align=center] (arun) at (0,1.9) {A 运行中};
-  \node[hw control, align=center, minimum width=3.0cm] (save) at (5.2,1.9) {保存 A 现场\\压上 A 的内核栈};
-  \node[hw compute, align=center, minimum width=3.0cm] (pick) at (5.2,0.65) {pick\_next() 选出 B\\A.state = READY};
-  \node[hw compute, align=center, minimum width=3.0cm] (cr3) at (5.2,-0.6) {CR3 $\leftarrow$ B 页表基址\\rsp $\leftarrow$ B 内核栈顶};
-  \node[hw control, align=center, minimum width=3.0cm] (rest) at (5.2,-1.85) {恢复 B 现场\\iretq};
-  \node[hw state, align=center] (brun) at (10.4,-1.85) {B 从断点继续};
-  \draw[hw bus] (arun.east) -- node[pos=0.25, above=1pt, hw label, fill=white, inner sep=1pt]{定时器 IRQ} (save.west);
-  \draw[hw bus] (save.south) -- (pick.north);
-  \draw[hw bus] (pick.south) -- (cr3.north);
-  \draw[hw bus] (cr3.south) -- (rest.north);
-  \draw[hw bus] (rest.east) -- node[pos=0.65, above=1pt, hw label, fill=white, inner sep=1pt]{返回用户态} (brun.west);
-  \node[hw label, align=center] at (0,-0.6) {A 冻结：全部状态\\凝为一个栈指针};
-\end{pdfdiagram}
-\diagramnote{上下文切换泳道（对应正文 trace）。定时器中断在指令边界把 CPU 从 A 带进内核：A 的现场压上它自己的内核栈，调度器选出 B 后写入 B 的页表基址（CR3）、把栈指针切到 B 的内核栈，再弹出 B 的寄存器并 iretq——返回落进 B 的用户态，B 只觉得上次陷入返回得特别久。被切走的 A，全部状态归结为进程控制块里的一个栈指针，等下次被选中时原路恢复。}
-
-定时器不是唯一的切换入口：进程阻塞在 \code{read} 上等键盘、主动 \code{sched\_yield} 让出、等待互斥锁，走的都是同一条“保存、选下一个、恢复”的路径。入口有多个，出口只有一个——沿目标进程的内核栈恢复现场并返回。
-
-\begin{longtable}{L{0.22\linewidth}L{0.38\linewidth}L{0.30\linewidth}}
-\toprule
-要素 & 保存在哪、切到哪里 & 检查点 \\
-\midrule
-通用寄存器与 \code{rip} & 各自内核栈顶；进程控制块只存栈指针 & 恢复后 \code{rip} 指向被切走时的下一条 \\\tablerowrule
-地址空间 & CR3 写入新页表基址 & 同一虚拟地址从此属于新进程 \\\tablerowrule
-内核栈 & 栈指针切到目标栈 & 返回路径沿目标栈展开 \\
-\bottomrule
-\end{longtable}
-
-算一笔账。保存加恢复的寄存器约 20 个 64 位值，内存流量 $2\times20\times8=320$ 字节，纳秒级；真正的成本在 CR3 切换之后——TLB 和 cache 变冷，使一次进程切换的典型总成本在微秒级，约是一次系统调用往返的十倍。再看频率：设时间片 3 ms，一个核每秒至多切换约 330 次，每次 2 微秒，总开销约 660 微秒，占可用时间的千分之一不到——切换很便宜，而“看起来便宜”是因为时间片把它摊薄了。
-
-有一个边角案例能检验这条 trace 是否真的成立：新进程从来没有“上次被切走”，它的第一次运行从哪来？答案是 fork 时内核手工搭出来的——按上一主题的格式伪造一份 \code{pt\_regs} 和内核栈，把 \code{rip} 设成父进程 fork 返回后的下一条，把 \code{rax} 设成 0。于是子进程第一次被调度时，走的完全是“恢复现场并返回”的老路，只是现场是造的。同一份代码在父子俩身上跑出两个返回值（父得 pid、子得 0），差别就写在这份手工现场里。
-
-定时器中断接手调度，本身是一段历史进步：早期系统是协作式的，进程靠自觉定期让出，一个死循环就能拖死整机；抢占式调度把主动权收归内核——存储与设备事务相关章节那个“除了报时还会发起中断”的定时器，另一个身份就是操作系统的心跳。切换的频繁程度可以直接观察：\code{vmstat} 的 \code{cs} 列是每秒上下文切换次数，\code{in} 列是每秒中断次数，两者同量级，因为大部分切换正是中断带进来的。
-
-\begin{lstlisting}
-$ vmstat 1 3
-procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
- r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
- 1  0      0 6123456 123456 2345678    0    0    10    20  210  512  5  3 92  0  0
- 0  0      0 6123300 123456 2345680    0    0     0    12  198  487  4  2 94  0  0
-\end{lstlisting}
-
-TLB 作废的代价也在被硬件压缩：带 PCID 的 CPU 给每条 TLB 项打上地址空间标签，切 CR3 时不必清空 TLB，新旧进程的翻译按标签各归各——这正是存储与设备事务相关章节 cache 用 tag 区分归属的思想，在地址转换缓存上的重演。
-
-\begin{longtable}{L{0.20\linewidth}L{0.40\linewidth}L{0.30\linewidth}}
-\toprule
-切换入口 & 触发原因 & 典型例子 \\
-\midrule
-被动切换 & 定时器中断，时间片用完 & 计算密集的循环被切走 \\\tablerowrule
-主动切换 & 系统调用内阻塞，等资源 & \code{read} 等键盘输入 \\\tablerowrule
-让出切换 & 显式请求调度器换人 & \code{sched\_yield} \\
-\bottomrule
-\end{longtable}
-
-两个推论。其一，\hwkey{进程切换就是把整套可见状态换一遍}：寄存器、地址空间、内核栈，一个不能少；而文件描述符表、信号处理表这类“属于进程但不属于寄存器”的状态挂在进程控制块上，换进程时自然跟着换，不需要逐条保存。其二，同进程的两个线程互切不用写 CR3——它们共享地址空间，TLB 不必作废——这正是线程比进程“轻”的硬件根源。
-
-\topic{信号是软件级中断}
-中断让设备打断 CPU，信号让内核（或另一个进程）打断一个进程。两者同构：信号编号对应中断号，\code{sigaction} 安装的处理表对应 IDT，\code{sigprocmask} 对应中断屏蔽字，pending 位图对应中断挂起寄存器，\code{sigreturn} 对应 \code{iret}。差别只在发起者和投递点：中断由硬件在指令边界投递，信号由内核在“即将从内核返回用户态”这个固定检查点投递——每个进程从系统调用或中断返回前，都要过这一关。
-
-Ctrl-C 是最好的一生案例，四步走完。第一步，按键：终端把 \code{0x03} 字节经存储与设备事务相关章节那条链路送进内核——设备锁存状态、拉起 IRQ、中断控制器判优、CPU 在指令边界接收、键盘服务程序读入扫描码。第二步，行律解释：tty 驱动发现 \code{0x03} 是控制字符 INTR，不把它放进输入缓冲，而是向前台进程组的每个进程置 SIGINT 的 pending 位。第三步，投递：目标进程下次返回用户态前，内核发现 SIGINT 未被屏蔽且注册过处理函数，就在用户栈上搭一帧信号帧（保存被打断时的 \code{rip}、\code{rsp}、\code{rflags} 和通用寄存器），把 \code{rip} 改为处理函数入口、\code{rsp} 指向新帧，然后才执行那次“返回”——返回去的地方已经是处理函数。第四步，收尾：处理函数执行完调用 \code{sigreturn}，内核按帧恢复现场，进程从被打断处继续；若进程从未注册处理函数，默认动作是终止——内核在投递点直接回收进程。Ctrl-C“杀掉”前台程序，走的就是这完整的四步。
-
-把 Ctrl-C 的四步画成一条投递路径，“软件级中断”五个字就写在图上：
-
-\begin{pdfdiagram}
-  % 第一行：发起与置位
-  \node[hw state, align=center] (key) at (0,1.3) {键盘\\0x03};
-  \node[hw compute, align=center, minimum width=2.6cm] (tty) at (3.1,1.3) {tty 行律\\认出 INTR};
-  \node[hw control, align=center, minimum width=3.0cm] (pend) at (6.7,1.3) {前台进程组各进程\\置 SIGINT pending 位};
-  % 第二行：投递
-  \node[hw control, align=center, minimum width=2.6cm] (chk) at (3.1,-1.0) {返回用户态前检查\\未屏蔽且已注册才投递};
-  \node[hw memory, align=center, minimum width=2.6cm] (frame) at (6.7,-1.0) {用户栈上\\搭信号帧};
-  \node[hw state, align=center, minimum width=2.6cm] (hdl) at (10.0,-1.0) {rip $\leftarrow$ 处理函数\\rsp $\leftarrow$ 新帧};
-  \draw[hw bus] (key.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{扫描码} (tty.west);
-  \draw[hw bus] (tty.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{控制字符} (pend.west);
-  \draw[hw bus] (pend.south) -- (6.7,0.15) -- (3.1,0.15) -- (chk.north);
-  \node[hw label, fill=white, inner sep=1pt] at (4.9,0.42) {下次返回前被检查};
-  \draw[hw bus] (chk.east) -- (frame.west);
-  \draw[hw bus] (frame.east) -- (hdl.west);
-  \draw[hw return] (hdl.south) -- (10.0,-2.3) -- (6.7,-2.3) -- (frame.south);
-  \node[hw label, fill=white, inner sep=1pt] at (8.35,-2.56) {sigreturn：按帧恢复现场};
-\end{pdfdiagram}
-\diagramnote{信号投递路径（Ctrl-C 例）。按键字节 0x03 经键盘服务程序送进内核，tty 行律认出控制字符 INTR，不放进输入缓冲，而是向前台进程组每个进程置 SIGINT（2 号）的 pending 位；目标进程下次返回用户态前，内核检出该位未被屏蔽且处理函数已注册，就在用户栈上搭信号帧、把 rip 改为处理函数入口、rsp 指向新帧——那次“返回”落进处理函数；处理函数执行完 sigreturn，内核按帧恢复现场，进程从被打断处继续。}
-
-四步里搭在用户栈上的那帧信号帧值得单独画出来，处理函数能返回被打断处，全靠帧里保存的现场：
-
-\begin{pdfdiagram}
-  \node[hw label] at (2.3,3.5) {用户栈（高地址在上，向下增长）};
-  \node[hw compute, minimum width=3.6cm, align=center] (old) at (2.3,2.6) {被打断处的栈帧\\原 rsp 所指};
-  \node[hw memory, minimum width=4.6cm, align=center] (frame) at (2.3,0.5) {信号帧（内核搭建）\\保存的 rip、rsp、rflags\\全部通用寄存器\\返回地址 → sigreturn 跳板};
-  \draw[BookMuted, line width=0.62pt, ->] (old.south) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{内核压入} (frame.north);
-  \node[hw control, minimum width=3.2cm, align=center] (hdl) at (8.7,0.5) {信号处理函数\\rip ← 处理函数入口};
-  \draw[hw bus] (frame.east) -- node[midway, above=1pt, hw label, fill=white, inner sep=1pt]{投递} (hdl.west);
-  \draw[hw return] (hdl.south) -- (8.7,-1.2) -- (2.3,-1.2) -- (frame.south);
-  \node[hw label, fill=white, inner sep=1pt] at (5.5,-1.2) {sigreturn：按帧恢复现场，回到被打断处};
-\end{pdfdiagram}
-\diagramnote{用户栈上的信号帧结构（对应 Ctrl-C 四步的第三步）。内核在目标进程的用户栈上搭一帧：保存被打断时的 \code{rip}、\code{rsp}、\code{rflags} 与全部通用寄存器，帧里的返回地址指向 \code{sigreturn} 跳板；随后 \code{rip} 改为处理函数入口、\code{rsp} 指向新帧，那次“返回用户态”便落进处理函数。处理函数执行完经跳板发起 \code{sigreturn}，内核按帧恢复现场，进程从被打断处继续。若用户栈本身已不可用（栈溢出招来 SIGSEGV 的情形），处理函数需要一条事先用 \code{sigaltstack} 备好的备用栈。}
-
-两个信号被故意排除在约定之外：SIGKILL（9）和 SIGSTOP（19）不可捕获、不可屏蔽、不可忽略。理由很硬：若失控进程能把所有信号都拦下，系统就没有回收它的最后手段——\code{kill -9} 之所以总是有效，靠的就是这条“保留一扇不可锁的门”的约定。
-
-\begin{longtable}{L{0.16\linewidth}L{0.37\linewidth}L{0.37\linewidth}}
-\toprule
-概念 & 硬件中断（第四、五章） & 信号 \\
-\midrule
-编号 & 中断号/向量号 & 信号编号（SIGINT=2，SIGSEGV=11） \\\tablerowrule
-入口表 & IDT：基址+号×项宽 & 每进程 \code{sigaction} 表 \\\tablerowrule
-屏蔽 & IF 位/中断控制器屏蔽位 & \code{sigprocmask} 屏蔽字 \\\tablerowrule
-挂起 & IRR 挂起寄存器 & pending 位图 \\\tablerowrule
-返回 & \code{iret} & \code{sigreturn} 系统调用 \\\tablerowrule
-投递点 & 指令边界 & 内核返回用户态之前 \\
-\bottomrule
-\end{longtable}
-
-常见信号的编号和默认动作可以各看一张表。编号表用 \code{kill -l} 就能列出来：
-
-\begin{lstlisting}
-$ kill -l (excerpt)
- 1) SIGHUP    2) SIGINT    9) SIGKILL  11) SIGSEGV
-13) SIGPIPE  14) SIGALRM  15) SIGTERM  18) SIGCONT
-19) SIGSTOP  20) SIGTSTP
-\end{lstlisting}
-
-\begin{longtable}{L{0.20\linewidth}L{0.24\linewidth}L{0.46\linewidth}}
-\toprule
-默认动作 & 代表信号 & 含义 \\
-\midrule
-终止 & SIGINT、SIGTERM & 内核直接回收进程 \\\tablerowrule
-终止并转储 & SIGSEGV、SIGILL & 回收，另留下 core 文件供调试 \\\tablerowrule
-忽略 & SIGCHLD、SIGURG & 默认什么也不做 \\\tablerowrule
-停止 & SIGSTOP、SIGTSTP & 冻结进程，等 SIGCONT 唤醒 \\
-\bottomrule
-\end{longtable}
-
-Ctrl-C 的四步只换了发起者，就能解释一整族终端控制：Ctrl-Z 发出的是 SIGTSTP，前台进程被“停止”而非终止——它的全部状态原样冻结，shell 把它挂进作业表；之后 \code{fg} 或 \code{bg} 让它收到 SIGCONT，从冻结处继续。这就是 shell 作业控制的全部硬件基础：同一套信号投递路径，不同的编号与默认动作。
-
-还有两个工程细节补全这幅图。其一，标准信号的 pending 是位图，只能记“有”，记不了“几次”——处理函数运行期间再来的同号信号最多再记一位，这就是“信号不排队、可能合并丢失”的原因；需要计数的场合得用可排队的实时信号。其二，信号帧搭在用户栈上，若程序正因栈溢出而被 SIGSEGV 投递，用户栈已经不可用，处理函数需要一条事先用 \code{sigaltstack} 备好的备用栈——又一个“不能信任用户指针”的实例。
-
-同构最漂亮的一处是段错误：经典芯片与平台案例那台检查 P/W/U 三个原因位的页错误硬件，在内核判定“故障地址不属于任何映射”之后，并不直接杀死进程，而是向它投递 SIGSEGV；程序崩溃时打印的“Segmentation fault”，就是这枚信号走完上述投递路径的结果。信号因此不需要任何新硬件——它全部用已有的异常返回路径搭出来，这正是“软件级中断”五个字的含义。
-
-处理函数一侧还有一条对应的工程约束：信号可能在任意指令边界到来，处理函数里只能调用“异步信号安全”的函数，否则可能打断 \code{malloc} 到一半的链表——这与中断服务程序“快进快出、不碰半成品数据”的纪律同出一源。
-
-最后注意一个归属问题：信号处理表和上一主题的页表一样，是每进程状态，挂在进程控制块上。上下文切换换走地址空间的同时，pending 位图和处理表也一起被换走——信号因此总是投递给“当前这个进程”的语义，而不会串到别的进程身上。
-
-\topic{用户态与内核态的边界清单}
-本章反复出现的那条线，现在可以写到底：边界不是软件风俗，而是特权级检查。页表项里的 U/S 位决定哪些页用户态可碰——经典芯片与平台案例页错误三问的第三问——检查由硬件在每次访存时完成，成本为零；\code{syscall}/\code{sysret} 是跨越特权级的唯一受控正门，中断门是另一扇，但钥匙在内核手里。判断一件事在哪一侧，只需问一句：它要不要碰特权状态？
-
-\begin{longtable}{L{0.26\linewidth}L{0.12\linewidth}L{0.52\linewidth}}
-\toprule
-操作 & 在哪侧 & 为什么 \\
-\midrule
-加法、比较、分支 & 用户态 & 只动通用寄存器，不碰特权资源 \\\tablerowrule
-\code{strlen}/\code{memcpy} 等库函数 & 用户态 & 只读写本进程已映射的页 \\\tablerowrule
-\code{malloc} 小对象 & 用户态 & 在已分配的堆区内管理空闲块；堆要长大才 \code{brk}/\code{mmap} 进内核 \\\tablerowrule
-\code{read}/\code{write}/\code{open} & 内核态 & 设备寄存器与 DMA 由内核独占（存储与设备事务相关章节） \\\tablerowrule
-\code{fork}/\code{execve}/\code{exit} & 内核态 & 建/销地址空间要改页表与 CR3，属特权操作 \\\tablerowrule
-\code{mmap}/映射变更 & 内核态 & 页表页标了 U/S=0，用户态写不了 \\\tablerowrule
-\code{gettimeofday}（vDSO） & 用户态 & 内核把只读时间页映给用户，读它不算越界 \\
-\bottomrule
-\end{longtable}
-
-清单最后一行值得展开。\code{gettimeofday} 传统上是系统调用，现代内核把它和校准参数写进一页只读共享页，用户态直接读——一次跨越都省。这是边界工程的一般做法，按优先级排成三条：能不跨就不跨（vDSO）；必须跨就合并（stdio 缓冲、\code{readv} 批量、\code{io\_uring} 一次提交一组）；非要高频跨越，就干脆修一座桥（共享页、门铃寄存器、用户态轮询）。
-
-把跨越的代价并排摆出来，三条策略的动机就一目了然：
-
-\begin{longtable}{L{0.26\linewidth}L{0.18\linewidth}L{0.46\linewidth}}
-\toprule
-动作 & 典型量级 & 边界含义 \\
-\midrule
-普通函数调用 & 纳秒级 & 不跨边界 \\\tablerowrule
-系统调用往返 & 百纳秒级 & 陷入加返回各一次 \\\tablerowrule
-进程上下文切换 & 微秒级 & 陷入加更换整套可见状态 \\\tablerowrule
-SSD 读 4 KiB 页 & 几十微秒 & 内核加设备加缺页服务 \\
-\bottomrule
-\end{longtable}
-
-\code{strace -c} 能把一个程序一生跨越边界的次数统计出来——清单对应的是上面那个最小程序：\code{write} 只出现一次；即使把它改成打印十次，当输出重定向到文件或管道时（全缓冲），\code{write} 通常也只出现一次（stdio 已把十次合并），其余是装载期的 \code{mmap} 和 \code{openat}。数一数这些行，就是把本节所有的账再对一遍：
-
-\begin{lstlisting}
-$ strace -c ./hello
-hello, world
-% time     seconds  usecs/call     calls    errors syscall
------- ----------- ----------- --------- --------- ----------------
- 35.42    0.000017          17         1           execve
- 18.75    0.000009           1         9           mmap
- 16.67    0.000008           2         4         2 openat
- 12.50    0.000006           6         1           write
-  8.33    0.000004           1         3         1 read
-  4.17    0.000002           1         2           close
-  4.17    0.000002           2         1           arch_prctl
------- ----------- ----------- --------- --------- ----------------
-100.00    0.000048                    21         3 total
-\end{lstlisting}
-
-边界同时是观察边界：\code{strace} 看不见函数调用，只能看见系统调用，因为陷入点是用户态唯一的“海关”。调试器、审计、沙箱全都挂在这同一个点上——拦住边界，就拦住了一个进程对外能做的全部事情；这也是为什么容器隔离的实施点是“过滤系统调用”，而不是“检查程序代码”。
-
-边界的形态本身也是设计选择。宏内核把文件系统、驱动、协议栈都放在内核态，跨越成本是一次陷入；微内核把它们挪进用户态服务进程，跨越变成进程间消息——边界没有消失，只是挪了位置，而每次跨越的特权检查是物理事实，挪到哪里都要付。\code{time} 的输出把这笔开销记成两列：\code{user} 是用户态指令时间，\code{sys} 是内核代为执行的时间；\code{sys} 占比高的程序，多半就是边界跨越密集型。
-
-\begin{lstlisting}
-$ time ./hello
-hello, world
-real    0m0.002s
-user    0m0.001s
-sys     0m0.001s
-\end{lstlisting}
-
-本书末章的教学计算机项目的面包板机是对照的另一极：程序直接拨进 RAM，每个 MMIO 地址都均可直接访问，没有第二个特权级——那是“程序即内核”。多用户、多进程、要隔离要共享的系统必须有边界，而边界的全部成本，就是每次跨越时那一次受控陷入。
-
-\begin{warningbox}
-“库函数=系统调用”是最常见的混淆。\code{printf} 不是系统调用：它是用户态函数，把字符攒进缓冲区，只在缓冲满或换行刷新时才发起一次 \code{write}。用 \code{strace} 观察一个打印十次 \code{hello} 的程序：当输出重定向到文件或管道时（全缓冲），看不到十次 \code{write}——通常只有一次。判断依据不变：只有碰特权资源才需要陷入，拼字符串始终发生在用户态。
-\end{warningbox}
-
-\begin{classicnote}
-CSAPP 把异常控制流分成四类：中断、陷阱、故障、中止。本章的系统调用是陷阱（trap）——主动、同步、返回下一条；定时器中断是中断——被动、异步；缺页是故障——可修复、返回重试；段错误走到尽头是中止。一张表管住四种入口，剩下的全是各入口里的具体约定。
-\end{classicnote}
-
-\section{六、从源码到进程的完整案例}
-
-本节跟踪一个最小的 C 程序的一生——
-从源码，到进程退出、shell 打印出退出码为止。程序故意
-不用 \code{printf} 而直接调 \code{write}，这样它一生向内
-核提出的请求最少，看得最清楚：
-
-\begin{lstlisting}
-#include <unistd.h>
-
-int main(void)
-{
-        write(1, "hi\n", 3);
-        return 42;
-}
-\end{lstlisting}
-
-为了让地址看得见、对得上，本节统一用 \code{gcc -no-pie} 编
-出传统的固定地址可执行文件；位置无关可执行（PIE）只是把同
-一套机制整体搬到装载时才选定的基址上，步骤一步不少。
-
-\topic{编译链的四个阶段}\code{gcc} 自己并不编译任何东西，
-它是调度员：按固定顺序调用预处理器、编译器本体、汇编器和
-链接器，每一道程序只负责一种表示到下一种表示的翻译。预处
-理是文本层的翻译：宏展开、头文件拼接、条件编译裁剪，产物
-仍然是 C——这个最小的 \code{hello.c} 经过它变成几千行的
-\code{hello.i}，多出来的几乎全是头文件里的声明。编译是语
-义层的翻译：词法语法分析、类型检查、优化，最后把 C 语句变
-成 x86-64 汇编序列，产物还是文本。汇编是编码层的翻译：汇
-编器把每条助记符翻成机器码字节，装进 ELF 可重定位目标文
-件；从这一站起产物不再是文本，外部符号只有名字没有地址，
-机器码里留着空位和重定位记录（“链接：重定位与地址形成”一节）待补。链接是定址层的
-翻译：合并目标文件、解析符号、修补空位，再拼入启动文件与
-动态链接器路径，产出内核能装载的可执行文件。
-
-四把开关各让流水线停一站：
-
-\begin{lstlisting}
-$ gcc -E hello.c -o hello.i   # 停在预处理后：宏与头文件已展开
-$ gcc -S hello.i -o hello.s   # 停在编译后：x86-64 汇编文本
-$ gcc -c hello.s -o hello.o   # 停在汇编后：可重定位目标文件
-$ gcc hello.o -o hello        # 走完全程：可执行文件
-\end{lstlisting}
-
-\begin{longtable}{L{0.09\linewidth}L{0.12\linewidth}L{0.14\linewidth}L{0.14\linewidth}L{0.35\linewidth}}
-\toprule
-阶段 & 停站开关 & 输入 & 输出 & 这一层消去的东西 \\
-\midrule
-预处理 & \code{-E} & \code{hello.c} & \code{hello.i} & 宏、条件编译、头文件嵌套 \\\tablerowrule
-编译 & \code{-S} & \code{hello.i} & \code{hello.s} & 表达式、类型、控制流结构 \\\tablerowrule
-汇编 & \code{-c} & \code{hello.s} & \code{hello.o} & 助记符，只剩机器码与符号名 \\\tablerowrule
-链接 & 无（默认） & \code{hello.o} & \code{hello} & 一切未定的符号地址 \\
-\bottomrule
-\end{longtable}
-
-编译一站的产物值得亲眼过目（\code{-masm=intel} 输出，删
-去伪指令与标号细节）：
-
-\begin{lstlisting}
-main:
-        push    rbp
-        mov     rbp, rsp
-        mov     edx, 3              ; 第三参数：长度
-        lea     rsi, .LC0[rip]      ; 第二参数：字符串地址
-        mov     edi, 1              ; 第一参数：文件描述符 1
-        call    write@PLT
-        mov     eax, 42             ; 返回值放进 eax
-        pop     rbp
-        ret
-\end{lstlisting}
-
-C 的三条基本约定在这七条指令里全部现形：参数按
-\code{rdi}、\code{rsi}、\code{rdx} 依次传递，返回值放
-\code{eax}，调用与返回靠 \code{call} 与 \code{ret}——正
-是处理器核心相关章节讲的 ISA 约定在编译产物里的样子；\code{@PLT} 的
-来历，要等“装载与动态链接”一节讲完延迟绑定再回头认。工程上，四把开关是四
-扇观察窗：排错的第一问永远是“错在哪一层”。宏不对看
-\code{.i}，代码生成有疑问看 \code{.s}，符号未定义是链接层
-的事，装载期才报的错则与运行时找库的路径有关。错误发生在
-哪一层，决定该打开哪扇窗。
-
-\topic{\code{\_start} 与 \code{main} 之间的约定}内核装载
-完可执行文件，把 \code{rip} 置为 ELF 头里的入口地址。这个
-地址指向的不是 \code{main}——\code{main} 只是一个普通函
-数，没有任何硬件地位。入口指向链接时由启动文件
-（\code{crt1.o} 一族）提供的 \code{\_start}：
-
-\begin{lstlisting}
-$ readelf -h hello
-ELF Header:
-  Class:                             ELF64
-  Data:                              2's complement, little endian
-  Type:                              EXEC (Executable file)
-  Machine:                           Advanced Micro Devices X86-64
-  Entry point address:               0x401040
-\end{lstlisting}
-
-\code{\_start} 的处境比任何 C 函数都原始：它不是被谁“调
-用”的，栈上没有返回地址，只有内核按约定摆好的
-\code{argc}、\code{argv} 和环境变量。它的全部工作是把这堆
-原料整理成 C 世界的样子（下为化简后的指令序列）：
-
-\begin{lstlisting}
-_start:
-        xor     ebp, ebp            ; 帧指针清零：这是最外层帧
-        pop     rsi                 ; 新栈顶第一项是 argc（内核在用户栈上摆好 argc/argv）
-        mov     rdx, rsp            ; argv 数组紧随其后
-        and     rsp, -16            ; 调用前 rsp 按 16 字节对齐
-        mov     rdi, main           ; main 的地址作为第一参数
-        call    __libc_start_main   ; 进 C 运行时，不再返回
-        hlt                         ; 永远执行不到
-\end{lstlisting}
-
-三条细节值得停下来看。\code{and rsp, -16} 把栈指针低四位
-清零，满足 ABI 的硬约定：\code{call} 执行的前一刻
-\code{rsp} 必须是 16 的倍数，被调函数里才能安全使用要求
-对齐的 SSE 指令。\code{pop rsi} 取出 \code{argc} 之后，
-\code{rsp} 正好指向 \code{argv[0]}，于是一条
-\code{mov rdx, rsp} 就得到了 \code{argv}。
-\code{\_\_libc\_start\_main} 拿到 \code{main} 的地址后，
-先初始化 C 运行时（环境变量、线程局部存储、栈保护值），再
-按参数约定调用 \code{main}；\code{main} 返回后，它把返回
-值交给 \code{exit}，由 \code{exit} 跑完 \code{atexit} 登
-记的函数、冲洗标准库缓冲，最后发出 \code{exit\_group} 系
-统调用。
-
-所以“程序从 \code{main} 开始”是 C 运行时送的一份礼物：
-控制到达 \code{main} 时，栈已对齐、参数已按约定摆好、退出
-路径已挂好钩子。\code{return 42} 不是返回给内核，而是返
-回给 \code{\_\_libc\_start\_main}，由它转译成
-\code{exit\_group(42)}。退出码只有低 8 位会传给父进程：
-本例在 shell 里查看 \code{\$?} 看到 42；若让 \code{main}
-返回 256，看到的将是 0——256 的低 8 位全是零。本书末章的教学计算机项目的
-裸机上没有这份礼物：复位向量后面直接就是你的代码，栈要自
-己设，“退出”是一条停机指令，没有任何东西替你收尾。
-
-\topic{strace 看一次进程出生}“系统调用与异常控制流”一节说过，系统调用是特殊的
-异常入口。\code{strace} 借 \code{ptrace} 在每次陷入与返回
-时拦一下，把编号翻成名字、把寄存器翻成参数——它打印的就
-是进程一生向内核提出的全部请求的时间表。对这个最小程序，
-时间表短到可以全列出来（模拟输出，地址与布局随机器而
-异）：
-
-\begin{lstlisting}
-$ strace ./hello
-execve("./hello", ["./hello"], 0x7ffd9e5a2400 /* 18 vars */) = 0
-brk(NULL)                               = 0x1c56000
-mmap(NULL, 8192, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0x7ffff7fca000
-access("/etc/ld.so.preload", R_OK)      = -1 ENOENT (No such file or directory)
-openat(AT_FDCWD, "/etc/ld.so.cache", O_RDONLY|O_CLOEXEC) = 3
-openat(AT_FDCWD, "/lib/x86_64-linux-gnu/libc.so.6", O_RDONLY|O_CLOEXEC) = 3
-read(3, "\177ELF\2\1\1\3\0\0\0\0\0\0\0\0"..., 832) = 832
-mmap(NULL, 2125824, PROT_READ, MAP_PRIVATE|MAP_DENYWRITE, 3, 0) = 0x7ffff7d00000
-mprotect(0x7ffff7d28000, 1851392, PROT_NONE) = 0
-close(3)                                = 0
-write(1, "hi\n", 3)                     = 3
-exit_group(42)                          = ?
-+++ exited with 42 +++
-\end{lstlisting}
-
-真实输出里 \code{libc} 初始化还有几条调用，此处从略；剩下
-的每一行都能和本章的机制对上号：
-
-\begin{longtable}{L{0.17\linewidth}L{0.4\linewidth}L{0.29\linewidth}}
-\toprule
-系统调用 & 它在代表谁执行 & 对应本章机制 \\
-\midrule
-\code{execve} & 内核建地址空间、映射段、把控制交给动态链接器 &“装载与动态链接”一节装载；成功时永不返回 \\\tablerowrule
-\code{brk}/\code{mmap} & 动态链接器登记堆起点、申请工作区 &“装载与动态链接”一节虚拟内存区与按需调页 \\\tablerowrule
-\code{openat}/\code{read} & 动态链接器查缓存、找到并打开 \code{libc.so.6} &“装载与动态链接”一节动态库的查找路径 \\\tablerowrule
-\code{mmap}/\code{mprotect} & 把 \code{libc} 各段映射进来、按段表修正权限 &“装载与动态链接”一节段映射与页权限 \\\tablerowrule
-\code{write} & 你的 \code{main}：\code{rax} 为 1，经 \code{syscall} 陷入 &“系统调用与异常控制流”一节异常入口与参数约定 \\\tablerowrule
-\code{exit\_group} & \code{exit} 的最后一站，注销整个进程 &“系统调用与异常控制流”一节与本节的退出路径 \\
-\bottomrule
-\end{longtable}
-
-这张表里藏着两个反直觉的事实。其一，\code{execve} 是唯一
-一个“成功就不回来”的系统调用：行尾的 \code{= 0} 发生在
-一个崭新的地址空间里，原来那个调用者（shell 用
-\code{fork} 复制出的副本）已经被整体替换——\code{fork}
-返回两次，\code{execve} 一次也不返回，这对组合正是 shell
-启动每条命令的标准动作。其二，\code{write} 之前那一串
-\code{openat} 与 \code{mmap} 没有一条是你的代码发出的：
-动态链接的可执行文件，第一条用户态指令属于动态链接器
-\code{ld.so}；它跑完找库、映射、准备 GOT（“装载与动态链接”一节）之后，才
-把控制交给 \code{\_start}，然后才轮到 \code{main}。
-
-数字也都能闭合：\code{write} 返回 3，即实际写出的字节
-数；\code{exit\_group} 行尾是 \code{= ?}，因为它根本不返
-回，下一行 \code{+++ exited with 42 +++} 是 \code{strace}
-自己补的旁白，42 正是 \code{main} 的返回值。从 C 的
-\code{return} 到 shell 的退出码，整条链在一张表里走完。
-若改用 \code{-static} 静态链接重跑一遍，\code{execve} 与
-\code{write} 之间几乎一片空白——那串调用全是动态链接为
-“共享库”三个字付的装载期成本，也是“装载与动态链接”一节说的装载时重定
-位代价里最显眼的部分。
-
-拿其中最短的一行做字段分解，strace 每行打印的几段内容都能指回陷入时的寄存器：
-
-\begin{pdfdiagram}
-  \node[hw label] at (5.6,2.2) {strace 一行 ＝ 调用名 ＋ 参数 ＋ 返回值（＋ 耗时）};
-  \node[hw compute, minimum width=1.8cm, align=center] (f1) at (1.2,1.0) {\code{write}\\调用名\\由 rax 编号译出};
-  \node[hw compute, minimum width=3.4cm, align=center] (f2) at (4.3,1.0) {\code{(1, "hi\textbackslash n", 3)}\\参数\\由 rdi/rsi/rdx 译出};
-  \node[hw compute, minimum width=2.2cm, align=center] (f3) at (7.5,1.0) {\code{= 3}\\返回值\\由 rax 带回};
-  \node[hw compute, minimum width=2.4cm, align=center] (f4) at (10.1,1.0) {\code{<0.000012>}\\耗时\\\code{-T} 选项追加};
-  % 字段之间的衔接短横（非数据流，只表示同行相连）
-  \draw[BookMuted, line width=0.62pt] (f1.east) -- (f2.west);
-  \draw[BookMuted, line width=0.62pt] (f2.east) -- (f3.west);
-  \draw[BookMuted, line width=0.62pt] (f3.east) -- (f4.west);
-  \node[hw label, align=center] at (5.6,-0.4) {编号与寄存器值都被 ptrace 拦下后译成可读形式\\失败时返回值一段写作 \code{= -1 ENOENT} 这样的形式};
-\end{pdfdiagram}
-\diagramnote{典型 strace 行的字段分解（调用行与正文 \code{write(1, "hi\textbackslash n", 3) = 3} 一致）。\code{strace} 借 \code{ptrace} 在每次陷入与返回时拦一下：陷入时读 \code{rax} 译出调用名、读 \code{rdi}/\code{rsi}/\code{rdx} 译出参数，返回时读 \code{rax} 译出返回值——出错则印成 \code{= -1 ENOENT} 加一行说明；耗时一段只有加 \code{-T} 才出现在行尾（图中数值为示例）。一行的四段，全部来自“系统调用与异常控制流”一节那条 ABI 约定里的寄存器。}
-
-读这张表还有几个顺手的工具用法。\code{strace -f} 会把
-\code{fork} 出的子进程一并跟踪，shell 管道的每一环都能看
-到；\code{strace -c} 不逐行打印，结束时给一张按耗时排序的
-系统调用统计表，先找“哪类调用最多”再回头细看，是性能排
-查的常规第一步；\code{strace -e trace=openat} 这类过滤开
-关只保留关心的调用，用来对付输出以万行计的大程序。时间表
-是本章所有机制的公共观察窗：装载、动态链接、系统调用、退
-出清理，每一节的内容都能在这张表里找到对应的行。
-
-\topic{程序退出时内核回收什么}\code{exit\_group}（编号
-231）是进程的终点，也是看清“进程是什么”的最好窗口。对
-用户来说，进程是一个正在运行的程序；对内核来说，进程是一
-组挂在 \code{task\_struct} 上的数据结构：\code{mm\_struct}
-描述地址空间（页表加虚拟内存区链表），
-\code{files\_struct} 是文件描述符表，再加信号表、子进程链
-表、时钟统计。退出，就是按固定顺序注销这组结构。
-
-严格说，\code{exit\_group} 之前还有一层分工要辨清：
-\code{exit} 是 C 库函数，负责用户态的收尾——按注册的逆
-序跑 \code{atexit} 函数、冲洗 stdio 缓冲区；\code{\_exit}
-才是薄包装，直接把控制交进内核。差别在缓冲上最明显：若
-\code{main} 里用的是 \code{printf} 且输出不含换行，数据可
-能还躺在用户态缓冲里，直接调 \code{\_exit} 会把这些字节
-丢掉；\code{exit} 则先把它们冲刷出去，再走
-\code{exit\_group}。本节程序用 \code{write} 不用
-\code{printf}，也正是为了绕开这层缓冲，让输出与系统调用
-一一对应。
-
-地址空间最先退场：\code{mm\_struct} 的引用计数归零后，页
-表与虚拟内存区链表被释放，匿名页和私有映射页回空闲链表；
-共享映射（比如 \code{libc} 的代码页）只减一次引用计数，别
-的进程还在用就一页不还——这正是“装载与动态链接”一节“多个进程共享一份
-库代码”的镜像。文件描述符表随后：每个表项对内核文件对象
-减一次计数，计数归零才真正关闭；这解释了 \code{fork} 之后
-管道的经典现象——父子各持一份写端，必须两边都关闭，读端
-才看得到 EOF。最后是亲属关系：退出者的子进程被过继给 1 号
-进程，保证每个“孤儿”将来都有人为它收尸。
-
-把这三项注销画成一张清单图，“进程是什么”就成了挂在 \code{task\_struct} 上的三笔：
-
-\begin{pdfdiagram}
-  \node[hw control, minimum width=2.8cm, align=center] (task) at (1.6,0.6) {task\_struct\\进程控制块};
-  \node[hw state, minimum width=3.8cm, align=center] (i1) at (8.0,2.2) {地址空间 mm\_struct\\页表与映射释放\\共享页只减一次计数};
-  \node[hw state, minimum width=3.8cm, align=center] (i2) at (8.0,0.6) {描述符表 files\_struct\\逐项减计数\\归零才真正关闭};
-  \node[hw state, minimum width=3.8cm, align=center] (i3) at (8.0,-1.0) {子进程链表\\过继给 1 号进程};
-  % 共享干线扇出到三项
-  \draw[hw bus] (task.east) -- (4.6,0.6);
-  \draw[hw bus] (4.6,0.6) -- (4.6,2.2) -- (i1.west);
-  \draw[hw bus] (4.6,0.6) -- (i2.west);
-  \draw[hw bus] (4.6,0.6) -- (4.6,-1.0) -- (i3.west);
-  \fill[BookMuted] (4.6,0.6) circle (0.05);
-  \node[hw label, fill=white, inner sep=1pt] at (4.6,1.6) {逐项注销};
-  % 注销之后留下的骨架
-  \node[hw state, minimum width=2.8cm, align=center] (zomb) at (1.6,-1.7) {僵尸态：仅剩\\退出码与统计\\等父进程 wait};
-  \draw[hw return] (task.south) -- node[midway, right=1pt, hw label, fill=white, inner sep=1pt]{留骨架} (zomb.north);
-\end{pdfdiagram}
-\diagramnote{\code{exit\_group} 之后内核的三项注销。地址空间最先退场：\code{mm\_struct} 引用计数归零后页表与映射释放，共享映射只减一次计数——别的进程还在用就一页不还；描述符表随后：每个表项对内核文件对象减一次计数，归零才真正关闭；最后是亲属关系：退出者的子进程过继给 1 号进程。三项办完，\code{task\_struct} 仍留一条骨架记录——退出码还没交到父进程手里，进程以僵尸态等 \code{wait} 来取。}
-
-但 \code{task\_struct} 本身不能立刻删——退出码还没交到
-父进程手里。于是 \code{exit\_group} 之后进程进入僵尸态：
-只剩一条骨架记录（退出码与资源统计），不占地址空间，永不
-再被调度，等父进程用 \code{wait} 一族来取。父进程拿到的
-是 32 位状态字，正常退出时退出码放在第 8 到 15 位：本例
-的 42 对应原始状态值 42 左移 8 位，即 10752（十六进制
-\code{0x2a00}），宏 \code{WEXITSTATUS} 做的就是右移 8 位
-再取低 8 位。若父进程先死，过继来的子进程由 1 号进程负责
-收取，系统里不会留下无人认领的僵尸；真正会留僵尸的情形只
-有一种——父进程活着却忘了 \code{wait}，那是 \code{ps}
-输出里状态列 \code{Z} 的来历。
-
-“进程结束”因此不是一个硬件事件，而是内核数据结构的注销
-顺序；僵尸也不是故障，是“退出码必须可靠传给父进程”这条
-约定的必然代价。判断一个进程是否死透了，等价于问三个问
-题：地址空间还了吗，描述符表清空了吗，最后那条
-\code{task\_struct} 记录有人领走吗。
-
-\topic{与本书末章的教学计算机项目裸机路径的对照}把本节的托管路径与本书末章的教学计算机项目的
-裸机路径并排摆，会看到同一件事——“程序出生”——在两
-个世界的两种做法。本书末章的教学计算机项目的机器上，链接地址在构建时定死：
-复位向量的值就是程序的物理地址；装载器就是你自己——烧写
-器把镜像写进 ROM，或拨码开关逐字节拨进 RAM；复位后的第一
-条指令就是全部启动代码，没有 \code{crt}，更没有动态链接
-器；输出一个字符，是往 I/O 端口或内存映射的显存写一个字
-节，走存储与设备事务相关章节的 I/O 路径；“退出”是停机指令或原地跳转，
-没有内核，自然也没有谁来回收什么。本节的世界相反：链接时
-地址可以待定，装载由内核 \code{execve} 完成，\code{main}
-之前已有 \code{ld.so} 和 \code{\_start} 跑了一整圈，输出
-要经 \code{write} 请内核代劳，退出由内核逐项注销。
-
-\begin{longtable}{L{0.14\linewidth}L{0.36\linewidth}L{0.36\linewidth}}
-\toprule
-维度 & 裸机镜像（本书末章的教学计算机项目） & 托管进程（本章） \\
-\midrule
-链接地址 & 构建时定死的固定地址 & \code{-no-pie} 时链接时定址（本章）；PIE 时只定相对偏移，基址由内核装载时定 \\\tablerowrule
-装载者 & 烧写器或拨码开关，即你自己 & 内核 \code{execve} 加动态链接器 \\\tablerowrule
-入口 & 复位向量直指你的第一条指令 & 入口指向 \code{\_start}，\code{main} 前还有一层 \\\tablerowrule
-输出一个字符 & 直接写 I/O 端口或显存（存储与设备事务相关章节） & \code{write} 系统调用，内核驱动硬件 \\\tablerowrule
-退出 & 停机或死循环，无人回收 & \code{exit\_group}，内核逐项注销数据结构 \\
-\bottomrule
-\end{longtable}
-
-两个世界的分界线只有一条：有没有内核代为执行。有内核，地
-址空间是借来的，文件是借来的，碰硬件要经“系统调用与异常控制流”一节的异常入口
-申请；作为交换，装载、符号收尾、设备驱动、退出清理全有人
-包办。没有内核，全部物理地址都归你，全部中断（存储与设备事务相关章节）也
-都冲你来，自由与负担同比例放大。经典芯片与平台案例讲的启动链——固
-件、引导程序、内核接力——正是从前一个世界走进后一个世
-界的那座桥：引导程序活在裸机世界，它做的最后一件事是把内
-核请进内存；内核一旦接管，桥的这边就改按托管世界的规矩
-办。
-
-把两条路径画成双列对照，中间那条虚线就是“有没有内核”的分界：
-
-\begin{pdfdiagram}
-  \node[hw label] at (2.6,2.9) {裸机路径（经典芯片与平台案例）};
-  \node[hw label] at (9.1,2.9) {托管路径（本章）};
-  \draw[BookMuted, line width=0.5pt, dashed] (5.85,-2.2) -- (5.85,2.55);
-  \node[hw label] at (5.85,-2.55) {分界线：有没有内核};
-  % 左列：裸机
-  \node[hw compute, minimum width=4.0cm, align=center] (b1) at (2.6,2.0) {链接脚本限定地址\\入口＝复位向量};
-  \node[hw compute, minimum width=4.0cm, align=center] (b2) at (2.6,0.9) {烧写器/拨码装载\\镜像进 ROM/RAM};
-  \node[hw compute, minimum width=4.0cm, align=center] (b3) at (2.6,-0.2) {输出：直写 I/O 端口\\或显存（存储与设备事务相关章节）};
-  \node[hw compute, minimum width=4.0cm, align=center] (b4) at (2.6,-1.3) {退出：停机或死循环\\无人回收};
-  \draw[hw bus] (b1.south) -- (b2.north);
-  \draw[hw bus] (b2.south) -- (b3.north);
-  \draw[hw bus] (b3.south) -- (b4.north);
-  % 右列：托管
-  \node[hw state, minimum width=4.0cm, align=center] (h1) at (9.1,2.0) {链接定相对偏移\\基址装载时才定};
-  \node[hw state, minimum width=4.0cm, align=center] (h2) at (9.1,0.9) {execve＋ld.so 装载\\建映射、填 GOT};
-  \node[hw state, minimum width=4.0cm, align=center] (h3) at (9.1,-0.2) {输出：write 系统调用\\内核驱动硬件};
-  \node[hw state, minimum width=4.0cm, align=center] (h4) at (9.1,-1.3) {退出：exit\_group\\内核逐项注销};
-  \draw[hw bus] (h1.south) -- (h2.north);
-  \draw[hw bus] (h2.south) -- (h3.north);
-  \draw[hw bus] (h3.south) -- (h4.north);
-\end{pdfdiagram}
-\diagramnote{裸机路径与托管路径的双列对照（与正文表格同一内容）。同一行是同一件事的两种做法：定址、装载、输出、退出。左列没有内核，链接脚本把地址限定、装载靠自己、输出直写硬件、退出无人收尾；右列有内核，每一步都有人代办，代价是每次碰硬件都要经系统调用申请。两列的分界线只有一条：有没有内核代为执行。}
-
-\begin{classicnote}
-经典教材把 \code{fork}、\code{execve}、\code{exit} 与信号
-一并归入“异常控制流”：它们和系统调用一样，都是控制从用
-户态到内核态的异常转移。本节的 \code{strace} 输出可以读成
-这种转移留下的时间表——每一行都是一次让渡与一次归还。
-把程序的一生读成一张系统调用时间表，是理解进程最不容易过
-时的方式。
-\end{classicnote}
-
 \section*{章末练习}
-
-\begin{chapterexercise}{8086 地址形成}
-用段寄存器和偏移计算一个物理地址
-\exercisecheck{学习目标}{能说明 20-bit 地址来自硬件加法路径}
-\end{chapterexercise}
-
-\begin{chapterexercise}{复用总线}
-写出 8086 读周期中地址、ALE、数据方向和 READY 的阶段
-\exercisecheck{学习目标}{能指出何时锁存地址、何时采样数据}
-\end{chapterexercise}
-
-\begin{chapterexercise}{字节存储体}
-解释 A0 与 \(\overline{\mathrm{BHE}}\) 如何选择低/高字节
-\exercisecheck{学习目标}{能处理奇地址字访问}
-\end{chapterexercise}
-
-\begin{chapterexercise}{80386 分页}
-把一个 32-bit 线性地址拆成目录索引、页表索引和页内偏移
-\exercisecheck{学习目标}{能说明异常发生在真正访存前}
-\end{chapterexercise}
-
-\begin{chapterexercise}{保护模式入口}
-列出 GDTR/IDTR、CR0、CR3 和跳转刷新各自作用
-\exercisecheck{学习目标}{能说明状态切换顺序}
-\end{chapterexercise}
-
-\begin{chapterexercise}{复位向量}
-比较 6502、Z80/8051、8086、80386 后续 x86 的复位入口
-\exercisecheck{学习目标}{能说明第一条指令必须由非易失存储响应}
-\end{chapterexercise}
-
-\begin{chapterexercise}{平台分层}
-说明 CPU 本地总线、内存/cache 控制、高速扩展、低速 I/O 和固件层职责
-\exercisecheck{学习目标}{能说明等待来自整个平台}
-\end{chapterexercise}
-
-\begin{chapterexercise}{SoC 演进}
-说明把内存控制器、I/O 和安全启动搬进片内的收益与代价
-\exercisecheck{学习目标}{能指出片上互连和调试复杂度}
-\end{chapterexercise}
-
-\begin{chapterexercise}{主板结构}
-画出 CPU、DDR、PCH、UEFI Flash、PCIe、NVMe、GPU 的连接关系
-\exercisecheck{学习目标}{能说明供电、时钟、复位和枚举不是 CPU 内部问题}
-\end{chapterexercise}
-
-\begin{chapterexercise}{PCIe 设备}
-说明配置空间、BAR、TLP、MSI 和 AER 各自解决什么问题
-\exercisecheck{学习目标}{能把显卡/NVMe/网卡统一成总线主设备}
-\end{chapterexercise}
-
-\begin{chapterexercise}{显卡路径}
-写出 CPU 提交命令、GPU 读资源、VRAM 写帧、显示扫描的 trace
-\exercisecheck{学习目标}{能区分渲染完成、DMA 完成和显示完成}
-\end{chapterexercise}
-
-\begin{chapterexercise}{6502 寻址与拍数}
-用零页寻址和 (zp),Y 间接变址写数组求和循环并逐拍计数
-\exercisecheck{学习目标}{理解拍数就是总线事务序列}
-\end{chapterexercise}
-
-\begin{chapterexercise}{Z80 交换与刷新}
-说明 EXX 怎样加速中断响应、R 寄存器怎样把刷新藏进取指
-\exercisecheck{学习目标}{寄存器组交换=不访存的上下文切换}
-\end{chapterexercise}
-
-\begin{chapterexercise}{486/Pentium 集成}
-列出 80486 和 Pentium 各自搬进片内的部件及对应收益
-\exercisecheck{学习目标}{集成把等待从板级移到片内}
-\end{chapterexercise}
-
-\begin{chapterexercise}{6502 五拍 trace}
-写出 \code{(zp),Y} 间接变址读一个字节的 5 个时钟拍：每拍地址总线上是什么、CPU 内部在做什么
-\exercisecheck{学习目标}{拍数能还原成总线事务序列}
-\end{chapterexercise}
-
-\begin{chapterexercise}{Z80 M/T 计数}
-数出 \code{LD A,(HL)} 和 \code{EXX} 各占几个机器周期、几个 T 状态，并指出 DRAM 刷新藏在哪一拍
-\exercisecheck{学习目标}{M1 后半拍兼做刷新，不另占总线事务}
-\end{chapterexercise}
-
-\begin{chapterexercise}{页表 walk 演算}
-给定 CR3、两级页表内容和线性地址 \code{0x00403ABC}，写出 walk 每一步读到的地址和最终物理地址
-\exercisecheck{学习目标}{一次转换是两次表项读取加一次数据访问}
-\end{chapterexercise}
-
-\begin{chapterexercise}{页错误诊断}
-给定故障地址、错误码和 PDE/PTE 权限位，判断是缺页、写只读页还是用户态越权
-\exercisecheck{学习目标}{三问：存在否、读或写、谁发起}
-\end{chapterexercise}
-
-\begin{chapterexercise}{BIOS 四阶段}
-把 PC 从复位到交出启动扇区控制权的过程拆成 POST、设备初始化、启动设备选择、签名移交四个阶段，写出每阶段完成的边界
-\exercisecheck{学习目标}{每阶段有明确的完成标志和失败现象}
-\end{chapterexercise}
-
-\begin{chapterexercise}{RISC-V/x86 对照}
-用同一段求和循环说明定长 load/store 与变长内存操作数在译码和编译器上的差别
-\exercisecheck{学习目标}{复杂度放在译码前端还是编译器调度里}
-\end{chapterexercise}
 
 \begin{chapterexercise}{ELF 节表读法}
 对 \code{gcc -c} 生成的 \code{hello.o} 执行 \code{readelf -S}，找到 \code{.text}、\code{.rodata}、\code{.bss} 三节，记下各自的类型与大小，并解释 \code{.bss} 为什么在文件里一个字节也不占
@@ -2902,106 +2743,6 @@ exit_group(42)                          = ?
 \end{chapterexercise}
 
 \section*{参考解答与要点}
-
-\begin{chapteranswer}{8086 地址形成}
-物理地址由 \code{segment*16+offset} 得到，内部编程模型保持 16-bit，外部地址能力扩展到 20-bit。
-\answercheck{必须掌握的要点}{分段是地址形成硬件。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{复用总线}
-T1 输出地址并用 ALE 锁存；T2 改变总线方向并给出读控制；T3/Tw 等待目标驱动数据且 READY 可延长；T4 采样并结束。
-\answercheck{必须掌握的要点}{复用引脚必须分阶段解释。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{字节存储体}
-偶地址低字节由 A0 选择，奇地址高字节由 \(\overline{\mathrm{BHE}}\) 参与选择；奇地址字访问可能拆成两个周期。
-\answercheck{必须掌握的要点}{位宽不等于任意地址一次完成。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{80386 分页}
-4 KiB 页下，高 10 bit 选 PDE，中 10 bit 选 PTE，低 12 bit 是页内偏移；PDE/PTE 不存在或权限不允许时触发异常。
-\answercheck{必须掌握的要点}{地址转换也是硬件路径。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{保护模式入口}
-进入保护模式前要准备描述符表、装载 GDTR/IDTR、设置 CR0、刷新取指路径；分页还需准备页目录/页表、装载 CR3、打开分页位。
-\answercheck{必须掌握的要点}{状态切换顺序错误会让取指和异常入口失效。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{复位向量}
-6502 从高端向量取入口，Z80/8051 常从 0 地址开始，8086 从 \code{0xFFFF0} 附近，后续 x86 从更高物理地址附近，SoC 可从 Boot ROM 进入。
-\answercheck{必须掌握的要点}{启动入口是硬件规格。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{平台分层}
-CPU 本地总线处理核心事务，内存/cache 控制处理 DRAM 和回填，高速扩展处理图形/磁盘/网络，低速 I/O 处理串口/键盘/RTC，固件负责初始化和启动选择。
-\answercheck{必须掌握的要点}{主频之外还有平台等待。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{SoC 演进}
-片上集成缩短常见路径、减少引脚和功耗，但引入片上互连、一致性、时钟/电源域、安全启动和调试复杂度。
-\answercheck{必须掌握的要点}{低时延来自边界移动，不是所有路径变快。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{主板结构}
-内存控制器在 CPU 内，CPU 直连 DDR 内存和 PCIe Root（显卡、NVMe 等高速设备）；PCH 经 DMI 与 CPU 相连，挂低速 I/O（串口、键盘、RTC）与固件 Flash；固件上电先执行并完成初始化。
-\answercheck{必须掌握的要点}{平台分层是把不同速度的路径分开组织。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{PCIe 设备}
-固件读配置空间枚举设备并分配 BAR 地址窗口，驱动经 MMIO 配置队列，设备用 DMA 搬数据，MSI/MSI-X 投递完成中断，AER 报告错误。
-\answercheck{必须掌握的要点}{枚举-配置-DMA-完成是统一模型。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{显卡路径}
-CPU 写命令环并按 doorbell，GPU 读资源和命令渲染，结果写 VRAM，显示控制器按扫描时序读出；渲染完成、DMA 完成、显示完成是三件不同的事。
-\answercheck{必须掌握的要点}{三种完成语义不能混。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{6502 寻址与拍数}
-LDA 零页 3 拍，(zp),Y 间接变址 5 拍（跨页 6 拍）；求和循环每轮用 (zp),Y 读一个元素，接 INY、BNE，拍数可手工核对。
-\answercheck{必须掌握的要点}{简单数据通路让逐拍 trace 可行。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{Z80 交换与刷新}
-\code{EX AF,AF'} 交换 AF 一对，\code{EXX} 一条指令交换 BC、DE、HL 三对，省去压栈；M1 取指后半段把 R 输出到地址总线完成 DRAM 刷新。
-\answercheck{必须掌握的要点}{交换和借用都是减少总线事务。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{486/Pentium 集成}
-486 搬入 cache、FPU、流水线；Pentium 搬入双发射、BTB 预测、分离 cache 和 64-bit 数据总线。
-\answercheck{必须掌握的要点}{每一代都在移动等待的位置。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{6502 五拍 trace}
-拍 1 取 opcode，拍 2 取零页操作数，拍 3、拍 4 从零页相邻两字节读出 16-bit 指针的低、高字节，拍 5 用指针加 Y 的有效地址读数据；低字节加法跨页时多 1 拍修正高字节，共 6 拍。
-\answercheck{必须掌握的要点}{5 拍 = 2 拍取指、2 拍取指针、1 拍读数。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{Z80 M/T 计数}
-\code{LD A,(HL)} 为 2 个机器周期共 7 个 T 状态（M1 取指 4T，存储器读 3T）；\code{EXX} 只有 M1，共 4 个 T 状态。刷新藏在每个 M1 的 T3、T4：指令字节已入 CPU，地址总线让给 R 寄存器输出刷新行地址。
-\answercheck{必须掌握的要点}{T 状态计数能直接核对数据手册的时序图。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{页表 walk 演算}
-以 CR3=\code{0x00010000}、PDE 给出页表基址 \code{0x00020000}、PTE 给出页框基址 \code{0x00030000} 为例：地址拆成目录索引 1、页表索引 3、偏移 \code{0xABC}；先读 PDE（地址 \code{0x00010004}），再读 PTE（地址 \code{0x0002000C}），最终物理地址为 \code{0x00030000+0xABC}=\code{0x00030ABC}。
-\answercheck{必须掌握的要点}{TLB 未命中时，一次访问背后是一串总线读。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{页错误诊断}
-错误码 P 位为 0 说明对应 PDE 或 PTE 的 present 为 0，是缺页，可分配页后重试；P 为 1 且 W/R 位为 1、而 PTE 的 RW 为 0，是向只读页写入；P 为 1、U/S 位为 1 且 PTE 的 US 为 0，是用户态访问特权页，应按策略拒绝或终止。故障线性地址由 CR2 给出。
-\answercheck{必须掌握的要点}{错误码、CR2 和表项权限位三者要对照看。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{BIOS 四阶段}
-阶段一，POST 加电自检：检查 CPU、ROM 校验和与芯片组基本寄存器，初始化并测试内存，失败时以蜂鸣码或诊断码报告；阶段二，设备初始化：执行视频等 option ROM，初始化键盘、磁盘控制器，并建立中断向量表与 BIOS 数据区；阶段三，启动设备选择：BIOS 按启动顺序把候选设备的第一个扇区（512 字节）读到 \code{0x0000:0x7C00}；阶段四，签名移交：检查扇区末尾 \code{0x55AA} 签名，有效则跳转到 \code{0x7C00}，交出控制权。
-\answercheck{必须掌握的要点}{每阶段交出确定状态，下一段才有约定可依。}
-\end{chapteranswer}
-
-\begin{chapteranswer}{RISC-V/x86 对照}
-RISC-V 定长 32-bit、load/store、31 个自由寄存器：译码边界固定，循环中加载与加法各一条指令，编译器调度加载以隐藏等待；x86-64 变长 1--15 字节、16 个寄存器、运算可带内存操作数：同一循环指令更少更短，但译码器要先确定指令边界，内存操作数在片内被拆成加载微操作和加法微操作。
-\answercheck{必须掌握的要点}{ISA 风格决定复杂度由译码前端还是编译器调度承担。}
-\end{chapteranswer}
 
 \begin{chapteranswer}{ELF 节表读法}
 \code{.text} 类型 \code{PROGBITS}，是指令字节本身；\code{.rodata} 同为 \code{PROGBITS}，本例装着字符串常量共 3 字节；\code{.bss} 类型 \code{NOBITS}，只有大小声明、没有内容——未初始化数据按约定在装载时清零，文件里存一串零纯属浪费，所以它只占节表中的一个条目，不占文件偏移

@@ -1,35 +1,46 @@
 \chapter{系统调用、权限与内核边界}
 
-\section{用户请求如何受控进入内核}
+\section{从一个无权动作得到受控入口}
 
-系统调用是用户态请求内核代为操作受保护资源的入口。用户程序不能直接修改页表、调度队列、磁盘控制器或其他进程的状态；它只能把请求和参数交给内核。CPU 通过特权级、异常入口和约定寄存器完成控制权转移，内核再检查参数、权限和对象状态。
+先考虑一个尚未提供系统调用的最小系统。用户程序能够执行普通计算，也能够调用同一地址
+空间里的函数。现在程序要把系统时钟向前调整一秒。若时钟控制状态可以由任意程序直接写，
+一个出错的程序就能改变所有进程共同观察的时间；日志顺序、超时判断和文件时间戳都会随之
+失去共同基准。若完全禁止用户程序接触时钟控制状态，合法的时间同步程序也无法工作。
 
-系统调用不是普通函数调用。普通函数调用仍在同一特权级、同一地址空间和同一信任边界里执行；系统调用会从用户态进入内核态，切换到受控入口，使用内核栈或内核上下文，检查用户指针，并在返回前恢复用户态。这个边界使得内核可以拒绝非法请求，也使系统调用有固定开销。
+这个矛盾只要求先增加一个最小机制：用户程序不能直接写受保护状态，但可以把“希望执行
+哪项操作”以及“操作需要哪些参数”交给一段具有更高执行权限的代码。该代码先判断请求是否
+合法，再决定是否修改状态。这个受控请求入口称为\term{系统调用}{system call}。名称出现
+在这里，是因为我们已经知道它必须同时承担两项职责：跨越执行权限边界，以及在边界内验证
+请求。普通函数调用只改变当前程序自己的控制流，不能获得这两项能力。
+
+后续讨论不会立即展示完整入口链路。我们先确定究竟保护什么，再分别解决请求怎样编码、
+用户执行现场保存在哪里、用户地址怎样转为稳定输入、权限依据来自哪里以及阻塞后怎样返回。
+这些局部结构全部建立之后，本章末尾才把它们连接成完整系统调用。
 
 \subsection{特权到底保护了什么}
 
 特权级保护的不是一个抽象名分，而是一组具体硬件状态。用户态不能改页表根，不能关中断，不能改中断向量，不能写任意控制寄存器，不能访问只映射给内核的 MMIO，不能把自己的代码标成内核入口。CPU 在执行敏感指令、地址翻译和异常返回时都会检查当前模式。
 
-\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\begin{longtable}{|p{0.2\linewidth}|p{0.34\linewidth}|p{0.34\linewidth}|}
 \toprule
 受保护对象 & 为什么危险 & 合法路径 \\
 \midrule
-页表根/地址空间控制 & 可映射任意物理页，读取内核或其他进程 & 内核内存管理代码 \\
-中断使能和向量表 & 可阻止调度或劫持异常入口 & 内核入口和中断子系统 \\
-设备 MMIO 寄存器 & 可重置设备、窃取数据、破坏存储 & 驱动通过 fd/ioctl/sysfs 等受控接口 \\
-特权返回状态 & 可伪造内核态返回或跳转地址 & 低级 entry/return 代码检查 \\
+页表根/地址空间控制 & 可映射任意物理页，读取内核或其他进程 & 内核内存管理代码 \\\tablerowrule
+中断使能和向量表 & 可阻止调度或劫持异常入口 & 内核入口和中断子系统 \\\tablerowrule
+设备 MMIO 寄存器 & 可重置设备、窃取数据、破坏存储 & 驱动通过 fd/ioctl/sysfs 等受控接口 \\\tablerowrule
+特权返回状态 & 可伪造内核态返回或跳转地址 & 低级 entry/return 代码检查 \\\tablerowrule
 I/O 权限和端口 & 可直接访问平台设备 & 内核 I/O 权限管理或驱动 \\
 \bottomrule
 \end{longtable}
 
 x86-64 用 Ring 0 和 Ring 3 表达常见用户/内核边界。Ring 3 运行普通用户程序，Ring 0 运行内核；CPU 在执行敏感指令、访问 supervisor-only 页、装载控制寄存器、返回低特权级时检查 CPL 和相关权限位。
 
-\begin{longtable}{p{0.18\linewidth}p{0.3\linewidth}p{0.4\linewidth}}
+\begin{longtable}{|p{0.18\linewidth}|p{0.3\linewidth}|p{0.4\linewidth}|}
 \toprule
 层级 & 角色 & 系统调用入口 \\
 \midrule
-Ring 3 & 用户程序 & 执行 \code{syscall} 请求进入内核 \\
-Ring 0 & 内核 & 由 IA32\_LSTAR MSR 指向的入口接管 \\
+Ring 3 & 用户程序 & 执行 \code{syscall} 请求进入内核 \\\tablerowrule
+Ring 0 & 内核 & 由 IA32\_LSTAR MSR 指向的入口接管 \\\tablerowrule
 VMX root & hypervisor & 可选择拦截 guest 的敏感事件 \\
 \bottomrule
 \end{longtable}
@@ -54,12 +65,12 @@ on syscall from user:
 
 很多初学者把 \code{printf}、\code{write}、系统调用混在一起。实际上它们处在三层边界上。普通函数调用只改变当前进程内部的 RIP 和栈；库调用仍在用户态，只是封装了更复杂逻辑；系统调用才跨越 CPU 特权边界进入内核。
 
-\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\begin{longtable}{|p{0.2\linewidth}|p{0.34\linewidth}|p{0.34\linewidth}|}
 \toprule
 调用类型 & 发生在哪里 & 边界含义 \\
 \midrule
-普通函数调用 & 同一进程、同一特权级 & 调用者和被调者互相信任同一地址空间 \\
-libc/API 调用 & 用户态库代码 & 可做缓冲、格式化、兼容处理，但不能直接改内核对象 \\
+普通函数调用 & 同一进程、同一特权级 & 调用者和被调者互相信任同一地址空间 \\\tablerowrule
+libc/API 调用 & 用户态库代码 & 可做缓冲、格式化、兼容处理，但不能直接改内核对象 \\\tablerowrule
 系统调用 & 用户态陷入内核态 & CPU 切换特权，内核检查权限和对象状态 \\
 \bottomrule
 \end{longtable}
@@ -184,14 +195,14 @@ openat(dirfd, path, flags):
 
 早期 Unix 常把 uid 0 作为全能 root。现代系统把 root 权限拆成 capability，例如 \code{CAP\_NET\_ADMIN}、\code{CAP\_SYS\_ADMIN}、\code{CAP\_DAC\_OVERRIDE}。namespace 又让“这个 capability 对哪个对象集合有效”成为问题。容器内 root 不应自动拥有宿主全部权限。
 
-\begin{longtable}{p{0.2\linewidth}p{0.34\linewidth}p{0.34\linewidth}}
+\begin{longtable}{|p{0.2\linewidth}|p{0.34\linewidth}|p{0.34\linewidth}|}
 \toprule
 机制 & 解决的问题 & 新复杂性 \\
 \midrule
-uid/gid/mode & 简单主体和文件权限 & 粒度粗，root 过大 \\
-capability & 把 root 权限拆小 & 哪个路径检查哪个 capability 要准确 \\
-namespace & 隔离进程看到的资源视图 & capability 必须相对 user namespace 解释 \\
-LSM & 策略化强制访问控制 & hook 覆盖面和策略复杂度 \\
+uid/gid/mode & 简单主体和文件权限 & 粒度粗，root 过大 \\\tablerowrule
+capability & 把 root 权限拆小 & 哪个路径检查哪个 capability 要准确 \\\tablerowrule
+namespace & 隔离进程看到的资源视图 & capability 必须相对 user namespace 解释 \\\tablerowrule
+LSM & 策略化强制访问控制 & hook 覆盖面和策略复杂度 \\\tablerowrule
 seccomp & 收缩系统调用面 & 只看 syscall/参数，难懂对象语义 \\
 \bottomrule
 \end{longtable}
@@ -202,7 +213,9 @@ seccomp & 收缩系统调用面 & 只看 syscall/参数，难懂对象语义 \\
 
 错误码也是契约。\code{EACCES} 表示权限不足，\code{ENOENT} 表示对象不存在，\code{EBADF} 表示 fd 无效，\code{EFAULT} 表示用户指针不可访问，\code{EINTR} 表示系统调用被信号打断，\code{EAGAIN} 表示非阻塞对象暂时不能推进。高质量 OS 程序必须按错误码分支，而不是把所有失败都写成 fatal。
 
-\section{入口现场、ABI 与返回语义}
+\input{chapters/ch09-syscall-anatomy}
+
+\section{把入口语义应用到具体请求}
 
 分析一个系统调用时，按下面顺序写报告：
 
@@ -260,12 +273,12 @@ copy_user_bytes(dst, user_ptr, len):
 
 用 \code{write(fd, user_buf, 8192)} 看一次跨页复制。假设 \code{user\_buf} 从页 A 的最后 100 字节开始，后面 8092 字节落在页 B 和页 C。页 A 可读，页 B 暂时没有 PTE 但 VMA 允许按需调入，页 C 不在任何 VMA 中。内核不能只检查起始地址，也不能在持有文件锁并已经修改文件状态后才发现页 C 不合法。稳妥路径通常是先把用户数据复制或 pin 到内核可控制的状态，再提交给文件或设备层。
 
-\begin{longtable}{p{0.18\linewidth}p{0.38\linewidth}p{0.32\linewidth}}
+\begin{longtable}{|p{0.18\linewidth}|p{0.38\linewidth}|p{0.32\linewidth}|}
 \toprule
 片段 & 复制时发生什么 & 结果 \\
 \midrule
-页 A 尾部 100 字节 & 页表权限允许读，直接复制 & \code{copied = 100} \\
-页 B & PTE 不 present，缺页处理按 VMA 调入或分配页 & 成功后继续复制 \\
+页 A 尾部 100 字节 & 页表权限允许读，直接复制 & \code{copied = 100} \\\tablerowrule
+页 B & PTE 不 present，缺页处理按 VMA 调入或分配页 & 成功后继续复制 \\\tablerowrule
 页 C & 找不到 VMA 或权限不允许读 & 教学包装层返回 \code{-EFAULT}；真实 helper 报告未复制字节数 \\
 \bottomrule
 \end{longtable}
@@ -347,13 +360,13 @@ safe_open(path):
 
 再看一个真实感更强的攻击时序。受害程序想安全打开用户指定目录下的 \code{data.txt}，先调用 \code{stat(path)} 检查它不是符号链接、权限也允许，然后再调用 \code{open(path)}。攻击者在两次调用之间把 \code{data.txt} 替换成指向 \code{/etc/shadow} 的符号链接。若内核或程序把“刚才检查过的路径字符串”当作对象身份，第二次打开的就可能是另一个对象。
 
-\begin{longtable}{p{0.16\linewidth}p{0.42\linewidth}p{0.3\linewidth}}
+\begin{longtable}{|p{0.16\linewidth}|p{0.42\linewidth}|p{0.3\linewidth}|}
 \toprule
 时刻 & 动作 & 对象身份 \\
 \midrule
-1 & 受害者 \code{stat("/tmp/x/data.txt")} & 检查的是旧 dentry/inode \\
-2 & 攻击者 \code{rename} 替换路径分量 & 路径字符串不变，指向对象已变 \\
-3 & 受害者 \code{open("/tmp/x/data.txt")} & 解析得到新 dentry/inode \\
+1 & 受害者 \code{stat("/tmp/x/data.txt")} & 检查的是旧 dentry/inode \\\tablerowrule
+2 & 攻击者 \code{rename} 替换路径分量 & 路径字符串不变，指向对象已变 \\\tablerowrule
+3 & 受害者 \code{open("/tmp/x/data.txt")} & 解析得到新 dentry/inode \\\tablerowrule
 4 & 程序继续写入 & 权限检查和使用对象不一致 \\
 \bottomrule
 \end{longtable}
@@ -382,14 +395,14 @@ safe_open(path):
 
 系统调用深讲材料可以展开很多低级细节：entry 汇编、异常修复表、capability、LSM、seccomp、vDSO、审计、ptrace、restart block 和资源限制。主线阅读时先把它们压成一张账本。任一系统调用都要能说清：入口寄存器保存在哪里，用户指针何时复制成内核快照，权限在哪个稳定对象上检查，失败是否已经改变状态，返回前是否处理信号、审计和抢占。
 
-\begin{longtable}{p{0.20\linewidth}p{0.38\linewidth}p{0.30\linewidth}}
+\begin{longtable}{|p{0.20\linewidth}|p{0.38\linewidth}|p{0.30\linewidth}|}
 \toprule
 边界 & 必须回答的问题 & 错误后果 \\
 \midrule
-entry/return & 用户 RIP/RSP/flags 和参数寄存器怎样保存与恢复 & 返回到错误特权级、泄露寄存器或跳过信号处理 \\
-用户内存 & 外层结构、内层指针和长度何时复制、何时 pin 页 & \code{EFAULT} 变 panic，TOCTOU，整数溢出 \\
-对象解析 & fd、path、inode、socket、namespace 是否已变成稳定引用 & 检查和使用不是同一对象 \\
-权限策略 & DAC、capability、LSM、seccomp、rlimit 谁先失败 & 错误码混乱或绕过最小权限 \\
+entry/return & 用户 RIP/RSP/flags 和参数寄存器怎样保存与恢复 & 返回到错误特权级、泄露寄存器或跳过信号处理 \\\tablerowrule
+用户内存 & 外层结构、内层指针和长度何时复制、何时 pin 页 & \code{EFAULT} 变 panic，TOCTOU，整数溢出 \\\tablerowrule
+对象解析 & fd、path、inode、socket、namespace 是否已变成稳定引用 & 检查和使用不是同一对象 \\\tablerowrule
+权限策略 & DAC、capability、LSM、seccomp、rlimit 谁先失败 & 错误码混乱或绕过最小权限 \\\tablerowrule
 提交点 & 哪一行之后状态对用户可见，失败如何回滚 & fd 泄漏、引用计数泄漏、半初始化对象可见 \\
 \bottomrule
 \end{longtable}
@@ -513,14 +526,14 @@ restart block 用于保存重启系统调用所需状态。比如带 timeout 的
 
 权限检查之外，系统调用还要检查资源限制。进程可打开 fd 数、文件大小、地址空间、栈、锁定内存、进程数都可能受 rlimit 或 cgroup 限制。错误码要表达限制来源。
 
-\begin{longtable}{p{0.22\linewidth}p{0.34\linewidth}p{0.32\linewidth}}
+\begin{longtable}{|p{0.22\linewidth}|p{0.34\linewidth}|p{0.32\linewidth}|}
 \toprule
 限制 & 触发路径 & 常见错误 \\
 \midrule
-open files & \code{open/dup/socket/accept} & \code{EMFILE/ENFILE} \\
-file size & \code{write/truncate} & \code{EFBIG} 或信号 \\
-address space & \code{mmap/brk} & \code{ENOMEM} \\
-locked memory & \code{mlock} & \code{ENOMEM/EPERM} \\
+open files & \code{open/dup/socket/accept} & \code{EMFILE/ENFILE} \\\tablerowrule
+file size & \code{write/truncate} & \code{EFBIG} 或信号 \\\tablerowrule
+address space & \code{mmap/brk} & \code{ENOMEM} \\\tablerowrule
+locked memory & \code{mlock} & \code{ENOMEM/EPERM} \\\tablerowrule
 process count & \code{fork/clone} & \code{EAGAIN} \\
 \bottomrule
 \end{longtable}

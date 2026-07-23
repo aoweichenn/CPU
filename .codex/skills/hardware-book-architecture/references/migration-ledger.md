@@ -121,3 +121,17 @@
 | 第 18 章 | PCIe MPS/MRRS、完成拆分、credit 窗口、排序属性、ACS/PASID 与恢复边界 | verified |
 | 第 21 章 | UEFI 阶段资源边界、DRAM 训练 trace、可信启动、ACPI/设备树核对与 A/B 更新 | verified |
 | 第 22 章 | ECC 综合征、scrub 预算、错误遏制、阈值升级、共同故障域与恢复验收 | verified |
+
+## 2026-07 结构归位与现代接口补全批次
+
+本批次不删除任何既有正文、练习或答案。章节顺序调整以“主讲机制在前、历史与跨层案例在后”为原则；归属错误的练习迁回主讲章，超过每章核心题数量的原题按综合题子题完整保留。新增技术内容以官方架构或协议资料为核对入口。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 7、8、10、25 章 | 主线顺序、跨章归属、旧层级编号与过渡关系 | verified |
+| 全部 26 章 | 核心练习数量收束，全部原题与答案作为独立题或综合题子题保留 | verified |
+| 第 8 章 | SIMD/向量状态、lane、掩码、向量访存、精确异常、上下文与 SMT 共享边界 | verified |
+| 第 9 章 | 瞬态执行、微架构侧信道、隔离措施、性能与威胁边界 | verified |
+| 第 18 章 | CXL.io/cache/mem、设备内存、Chiplet 与 UCIe 封装内事务 | verified |
+| 第 23 章 | Ethernet MAC--PHY 边界、PCS/PMA/PMD、协商、训练、FEC 与故障回溯 | verified |
+| 全书后置资料 | 处理器、推测执行、PCIe/CXL/UCIe、NVMe、UEFI、Ethernet 与 USB 官方资料入口 | verified |
