@@ -742,6 +742,92 @@ Vref 扫描 & 判决参考电压 & 电压和时间窗口均有余量 & 使用保
 
 这里的“原子”通常不是要求整个镜像一次写完，而是把大数据写入与小元数据提交分开，并让元数据自身带版本、校验和与双副本。恢复环境还应独立于两个普通槽，避免同一个解析器错误、供电故障或密钥配置错误同时破坏全部路径。
 
+
+
+
+
+
+
+
+\section{十、复位 Strap、Boot ROM 与 SPI Flash：第一条可变固件怎样获得执行权}
+
+处理器退出复位前，平台常先采样一组 strap 引脚或熔丝，确定启动介质、总线宽度、调试策略和恢复模式。strap 由板级上拉/下拉电阻给出稳定默认值，也可能被跳线或管理控制器覆盖；采样结果锁存后通常要到下一次完整复位才改变。浮空、阻值选择错误或采样时电源域未稳定，会让同一块板表现出不一致的启动源。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (strap) at (1.3,3.9) {Strap/熔丝\\启动源与安全模式};
+  \node[hw control, minimum width=2.5cm] (latch) at (4.2,3.9) {复位采样锁存\\电源与时钟已稳定};
+  \node[hw memory, minimum width=2.5cm] (rom) at (7.1,3.9) {片上 Boot ROM\\不可变验证根};
+  \node[hw control, minimum width=2.5cm] (spi) at (10.0,3.9) {SPI 控制器\\只读取得首阶段};
+  \node[hw memory, minimum width=2.5cm] (flash) at (10.0,1.3) {SPI Flash 区域\\清单、固件、变量};
+  \node[hw state, minimum width=2.5cm] (verify) at (7.1,1.3) {校验签名与版本\\建立执行身份};
+  \node[hw memory, minimum width=2.5cm] (temp) at (4.2,1.3) {片上/临时 RAM\\栈与验证后镜像};
+  \node[hw state, minimum width=2.5cm] (next) at (1.3,1.3) {跳转可变固件\\扩大可用资源};
+  \draw[hw bus] (strap) -- (latch);
+  \draw[hw bus] (latch) -- (rom);
+  \draw[hw bus] (rom) -- (spi);
+  \draw[hw bus] (spi) -- (flash);
+  \draw[hw return] (flash) -- (verify);
+  \draw[hw return] (verify) -- (temp);
+  \draw[hw return] (temp) -- (next);
+\end{pdfdiagram}
+\diagramnote{从物理启动选择到第一段可变代码的可信通路。strap 只决定入口配置，片上 Boot ROM 才执行最初验证；SPI Flash 中的清单、版本与镜像通过验证后装入受控执行环境，跳转发生时可变固件才获得处理器控制权。}
+
+\topic{SPI Flash 不是一整块同权限字节数组}
+
+平台 Flash 往往划分为描述或目录区、Boot ROM 要读取的清单与公钥元数据、主固件镜像、恢复镜像、设备固件以及可变 NVRAM。各区域的读、写、擦除权限和更新主体不同。复位早期可以把顶部地址窗口别名映射到 Flash 取指，初始化后再切换为常规 SPI 控制器访问；地址别名改变的是访问路径，不改变被验证内容的身份。
+
+写保护也要分阶段。硬件写保护引脚、一次性熔丝或受保护寄存器可以锁住信任根和恢复代码；普通主镜像允许经认证更新；启动变量虽然需要写入，却必须限制长度、格式和授权，避免它们成为覆盖固件执行内存的输入。若所有区域共用同一个可随意改写的权限，签名验证代码本身也可能先被替换。
+
+\topic{恢复 strap 只能选择受限路径，不能关闭全部验证}
+
+当主镜像损坏时，恢复 strap 可以让 Boot ROM 选择另一 Flash 区域、USB 下载口或管理控制器提供的镜像。恢复模式应减少依赖并要求物理在场或受认证管理通道，但仍要验证镜像签名、平台型号和防回滚版本。把恢复等同于“执行任意下载字节”会绕过正常启动链的全部保证。
+
+\begin{longtable}{L{0.18\linewidth}L{0.26\linewidth}L{0.28\linewidth}L{0.18\linewidth}}
+\toprule
+启动对象 & 信任或权限来源 & 发布边界 & 失败处理 \\
+\midrule
+strap 锁存值 & 板级电阻、熔丝与复位采样规则 & 复位释放前固定 & 保持复位或进入有限恢复 \\\tablerowrule
+Boot ROM & 芯片制造时固定内容与密钥摘要 & 只从确定入口执行 & 报告根验证失败 \\\tablerowrule
+可变固件镜像 & 签名、平台 ID 与安全版本 & 完整验证后跳转 & 选择恢复槽或拒绝启动 \\\tablerowrule
+NVRAM 变量 & 格式、配额、授权和双副本元数据 & 校验后更新当前变量集 & 丢弃损坏副本并使用默认值 \\
+\bottomrule
+\end{longtable}
+
+\section{十一、SMM 与运行时固件：操作系统接管后谁还能控制硬件}
+
+\code{ExitBootServices} 之后，普通内存分配、设备驱动和中断路由归操作系统管理，但平台仍可能保留少量运行时固件入口。UEFI Runtime Services 提供时间、变量和受约束的固件服务；x86 System Management Mode（SMM）则由 SMI 进入独立执行环境，用于某些电源、兼容或平台管理任务。它们不是普通驱动的替代品，必须明确输入缓冲、可访问内存、最长执行时间和返回边界。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw compute, minimum width=2.7cm] (os) at (1.5,3.8) {操作系统/虚拟机\\普通设备所有者};
+  \node[hw state, minimum width=2.6cm] (event) at (4.6,3.8) {SMI/运行时调用\\来源与参数};
+  \node[hw control, minimum width=2.7cm] (gate) at (7.7,3.8) {入口门控\\保存现场与验证};
+  \node[hw memory, minimum width=2.7cm] (smram) at (10.8,3.8) {SMRAM/固件区\\隔离代码与数据};
+  \node[hw control, minimum width=2.7cm] (action) at (10.8,1.2) {有限平台动作\\寄存器/变量/电源};
+  \node[hw state, minimum width=2.7cm] (result) at (7.7,1.2) {结果与错误码\\审计和超时状态};
+  \node[hw control, minimum width=2.6cm] (restore) at (4.6,1.2) {恢复现场\\RSM/服务返回};
+  \node[hw state, minimum width=2.7cm] (resume) at (1.5,1.2) {原上下文继续\\所有权不被改写};
+  \draw[hw bus] (os) -- (event);
+  \draw[hw bus] (event) -- (gate);
+  \draw[hw bus] (gate) -- (smram);
+  \draw[hw bus] (smram) -- (action);
+  \draw[hw return] (action) -- (result);
+  \draw[hw return] (result) -- (restore);
+  \draw[hw return] (restore) -- (resume);
+\end{pdfdiagram}
+\diagramnote{运行时固件入口是一段暂时的所有权切换。进入时保存原上下文并验证请求，隔离环境只执行规定的平台动作；结果形成后恢复现场，普通操作系统重新获得执行权。固件不能在返回后继续秘密占用普通设备队列或内存缓冲。}
+
+\topic{隔离执行区还必须阻止 DMA 和错误输入绕过边界}
+
+SMRAM 对普通 CPU 访问关闭并不自动阻止 DMA。平台要在芯片组和 IOMMU 层阻止设备写入固件代码、保存现场和敏感数据；锁定位一旦发布，普通软件不能在不复位的情况下重新开放。运行时服务接收的物理指针、长度、变量名和通信缓冲都来自低特权环境，固件必须检查范围、重叠、整数溢出和当前内存归属，不能假定“由内核调用”就可信。
+
+SMM 还会暂停被选中核心的普通执行，长处理程序直接增加中断延迟和尾时延。固件应避免在 SMM 中轮询慢设备或执行无界循环，并为嵌套 SMI、机器检查和多核会合规定有限状态。遥测至少记录进入原因、持续时间、错误码和最后成功阶段，使偶发长停顿能够与固件事件对应。
+
+\topic{运行时固件和操作系统必须共享一份资源所有权协议}
+
+若操作系统正在使用 SPI、SMBus 或电源控制寄存器，运行时固件不能在没有仲裁的情况下改写同一控制器。可行做法包括把该硬件完全留给固件并只暴露受约束服务，或由操作系统拥有设备、固件通过标准通知请求动作。无论选择哪种方式，都要规定请求接受、硬件完成、超时、复位和返回时寄存器状态。
+
+休眠与崩溃恢复同样要核对所有权。固件恢复代码重新初始化设备前，应确认操作系统保存的状态是否仍有效；操作系统恢复后也不能假定固件没有改变时钟、电源或地址窗口。双方通过平台表、版本字段、恢复状态和明确的重新枚举边界重新建立共同事实。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{综合练习：1 至 2}

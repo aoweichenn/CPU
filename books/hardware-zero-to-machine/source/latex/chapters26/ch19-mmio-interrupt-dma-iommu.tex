@@ -825,6 +825,83 @@ DMA 共享 & IOMMU 仅允许共享页，描述符与长度已发布 & 设备使�
 芯片可把根密钥来源放在熔丝、PUF 派生状态或受保护安全存储中。制造态允许测试和调试，部署态锁定量产接口，返修态是否重新开放必须由签名授权与物理策略共同决定。Boot ROM 读取生命周期状态，选择允许的启动密钥、调试能力和恢复入口；运行期安全监控器继续执行这些限制。
 
 报废或安全域销毁时，最可靠的边界通常是使密钥不可恢复，而不是等待逐字节擦除大容量 DRAM 或存储介质。\term{密码学擦除}{cryptographic erase}先销毁数据加密密钥，再清理可访问元数据和共享缓冲；它能快速使旧密文失去解释能力，但仍要保证密钥没有副本停留在调试状态、崩溃转储或设备固件中。
+\section{九、Scatter-Gather DMA：离散页框怎样组成一笔连续设备请求}
+
+应用缓冲在虚拟地址上连续，不代表物理页框连续。若设备只接受一段起始地址和长度，驱动只能申请大块连续物理内存或复制到 bounce buffer；scatter-gather（分散--聚集）DMA 则让描述符列出多段地址和长度，设备按顺序读取或写入这些段，在协议层把它们视作一个逻辑请求。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.5cm] (pages) at (1.3,3.9) {进程缓冲\\多个虚拟页面};
+  \node[hw control, minimum width=2.5cm] (pin) at (4.2,3.9) {固定并映射\\方向与生命周期};
+  \node[hw memory, minimum width=2.5cm] (sg) at (7.1,3.9) {SG 描述符\\IOVA、长度、标志};
+  \node[hw compute, minimum width=2.5cm] (dma) at (10.0,3.9) {设备 DMA 引擎\\按段形成 burst};
+  \node[hw state, minimum width=2.5cm] (memory) at (10.0,1.3) {物理页框/设备\\数据已传输};
+  \node[hw state, minimum width=2.5cm] (complete) at (7.1,1.3) {完成项\\字节数与错误位置};
+  \node[hw control, minimum width=2.5cm] (unmap) at (4.2,1.3) {同步并解除映射\\等待 IOTLB 失效};
+  \node[hw state, minimum width=2.5cm] (reuse) at (1.3,1.3) {解除固定\\页框可再次分配};
+  \draw[hw bus] (pages) -- (pin);
+  \draw[hw bus] (pin) -- (sg);
+  \draw[hw bus] (sg) -- (dma);
+  \draw[hw bus] (dma) -- (memory);
+  \draw[hw return] (memory) -- (complete);
+  \draw[hw return] (complete) -- (unmap);
+  \draw[hw return] (unmap) -- (reuse);
+\end{pdfdiagram}
+\diagramnote{Scatter-gather 的提交与回收闭环。上排把离散页框固定、映射并编码为设备可读的段列表；下排只有在设备完成、CPU 重新获得可见性且 IOMMU 旧翻译失效后，页框才可解除固定并复用。}
+
+\topic{段表同时受设备格式、IOMMU 页和物理 burst 约束}
+
+驱动先把用户缓冲转换为页列表，再按设备的最大段长、地址对齐、边界限制和描述符数量合并相邻段。例如设备规定单段不超过 64 KiB 且不能跨 64 KiB 边界，一段从边界前 4 KiB 开始的 12 KiB 缓冲必须拆成 4 KiB 与 8 KiB 两段，即使对应物理页连续。IOMMU 可以把离散页框映射成连续 IOVA，减少设备看到的段数，却不能违反设备自身的长度和边界限制。
+
+描述符本身也是 DMA 数据。驱动要先写完全部段项和终止标志，执行平台要求的 Cache 同步与写屏障，最后才更新可见的生产者指针或 doorbell。设备不得在 ownership 尚未发布时读取半初始化段表；CPU 也不得在完成到达前修改段地址，因为设备可能预取后续描述符。
+
+\topic{部分完成必须把“请求结束”与“传了多少”分开}
+
+设备可能在第 $k$ 段遇到介质错误、IOMMU fault 或链路超时。完成项要报告总状态、实际传输字节数和能够定位失败段的证据；软件根据协议判断已传输前缀是否有效、剩余部分能否重试。对网络接收，短包是正常长度；对块写，部分完成可能需要上层日志或重建；对设备寄存器写，重复前缀可能产生第二次外部动作，不能默认重试。
+
+解除映射的顺序仍然是生命周期边界：停止或完成相关命令，执行 DMA 同步，撤销 IOMMU 映射并等待失效完成，最后解除页固定。只看到完成中断并不自动证明所有迟到写都已停止；设备的 completion 语义、PCIe 排序规则和复位状态共同决定何时可以复用页框。
+
+\begin{longtable}{L{0.18\linewidth}L{0.25\linewidth}L{0.29\linewidth}L{0.18\linewidth}}
+\toprule
+对象 & 建立时记录的状态 & 回收前必须确认 & 常见故障 \\
+\midrule
+固定页列表 & 页框、方向、偏移与长度 & 设备不再访问这些页 & 提前解除固定 \\\tablerowrule
+IOVA 映射 & 设备域、权限、页框与代际 & IOTLB 失效完成且在途 DMA 排空 & 旧翻译命中新页 \\\tablerowrule
+SG 描述符 & 每段地址、长度、链尾和所有权 & 完成项覆盖整个请求或给出部分结果 & 边界拆分错误 \\\tablerowrule
+完成记录 & 状态、实际字节数、请求代际 & 与当前队列实例和原请求匹配 & 迟到完成释放新资源 \\
+\bottomrule
+\end{longtable}
+
+\section{十、中断重映射与 Posted Interrupt：设备消息怎样安全找到目标执行上下文}
+
+MSI/MSI-X 在链路上表现为一笔消息写，但设备提供的目标地址和数据不能在虚拟化系统中被无条件信任。否则一个 function 可能伪造消息，向未授权核心或来宾投递任意向量。中断重映射单元把 requester ID、消息索引和平台表项共同作为查找键，验证来源并生成真正的目标 APIC、向量和投递模式。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw compute, minimum width=2.5cm] (dev) at (1.3,3.8) {PCIe function\\RID 与 MSI-X 项};
+  \node[hw control, minimum width=2.7cm] (remap) at (4.4,3.8) {中断重映射器\\来源检查与表项};
+  \node[hw state, minimum width=2.5cm] (target) at (7.5,3.8) {目标路由\\物理核或 vCPU};
+  \node[hw compute, minimum width=2.5cm] (cpu) at (10.4,3.8) {Local APIC/来宾\\指令边界投递};
+  \node[hw memory, minimum width=2.5cm] (pid) at (6.8,1.2) {Posted-interrupt 状态\\pending 位与通知向量};
+  \node[hw control, minimum width=2.5cm] (vcpu) at (10.4,1.2) {vCPU 运行状态\\直投或唤醒};
+  \draw[hw bus] (dev) -- (remap);
+  \draw[hw bus] (remap) -- (target);
+  \draw[hw bus] (target) -- (cpu);
+  \draw[hw bus] (remap) -- (pid);
+  \draw[hw bus] (pid) -- (vcpu);
+  \draw[hw return] (vcpu) -- (cpu);
+\end{pdfdiagram}
+\diagramnote{MSI 消息经过来源绑定后才成为可投递中断。物理目标走上排进入 Local APIC；虚拟目标可在 posted-interrupt 状态中设置 pending 位，vCPU 正在运行时直接通知，未运行时先唤醒调度路径。两条路径都不能绕过 requester identity 与表项权限。}
+
+\topic{Posted interrupt 减少 VM exit，但没有取消调度状态}
+
+传统虚拟化路径可能先让宿主接收物理中断，再退出或唤醒来宾并注入虚拟向量。Posted interrupt 允许硬件在受保护描述符中设置待处理位；目标 vCPU 正在合适核心运行时，可用通知向量促使其在来宾上下文接收中断，避免完整 VM exit。若 vCPU 已迁移、阻塞或尚未运行，硬件和监控器仍要把通知送到当前宿主并唤醒正确 vCPU。
+
+因此迁移 vCPU 或改变向量亲和时需要一个更新协议：先阻止旧路由产生新的直投，处理或转移 pending 位，更新目标与通知字段，再开放新路由。只修改目标 CPU 编号可能让一个中断落到旧核心，而队列数据已经由新核心接管。
+
+\topic{队列、向量和 CPU 亲和必须作为一组资源建立与拆除}
+
+多队列设备常把第 $i$ 个队列、MSI-X 第 $i$ 个向量和处理 CPU 绑定，使 DMA 完成、Cache 热点与软件回收在同一核心闭合。建立顺序通常是先分配向量和重映射表项，再创建队列、设置亲和并启用设备；拆除时先停止队列和屏蔽向量，等待处理程序退出，清除设备表项与 remap 状态，最后释放向量号。
+
+中断合并和 posted interrupt 改变的是通知代价，不改变完成项的真实性。处理程序仍要读取队列 phase/generation，验证当前实例的完成，并在解除 DMA 映射前确认设备已结束访问。一次合法中断可以对应多个完成，也可能只是错误通知；中断本身不是资源回收凭证。
 
 \section*{章末练习}
 

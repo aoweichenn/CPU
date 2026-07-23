@@ -1,0 +1,91 @@
+\section{八、取指边界与合法译码：字节流怎样成为一条确定指令}
+
+程序存储器提供的是连续字节，处理器提交的却是一条条具有明确长度和语义的指令。定长 ISA 可以用 PC 的低位检查对齐，再按固定宽度切分；带压缩扩展的 ISA 要先读取低位长度标记；x86 一类变长 ISA 则要依次识别前缀、操作码、ModR/M、SIB、位移和立即数。无论内部前端怎样预测边界，ISA 都必须保证：给定同一组指令字节、执行模式和能力集合，合法指令的长度与软件可见语义唯一。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.5cm] (bytes) at (1.3,3.9) {取指字节窗口\\可能跨 Cache line};
+  \node[hw control, minimum width=2.5cm] (align) at (4.2,3.9) {对齐与边界识别\\长度/前缀状态};
+  \node[hw compute, minimum width=2.5cm] (decode) at (7.1,3.9) {字段译码\\寄存器与立即数};
+  \node[hw state, minimum width=2.6cm] (semantic) at (10.1,3.9) {架构语义\\操作与下一 PC};
+  \node[hw control, minimum width=2.5cm] (mode) at (4.2,1.4) {模式与能力\\特权/扩展启用位};
+  \node[hw control, minimum width=2.5cm] (legal) at (7.1,1.4) {合法性检查\\保留字段与组合};
+  \node[hw state, minimum width=2.6cm] (illegal) at (10.1,1.4) {非法指令陷阱\\原因与故障 PC};
+  \draw[hw bus] (bytes) -- (align);
+  \draw[hw bus] (align) -- (decode);
+  \draw[hw bus] (decode) -- (semantic);
+  \draw[hw bus] (mode) -- (legal);
+  \draw[hw bus] (decode) -- (legal);
+  \draw[hw return] (legal) -- (illegal);
+  \draw[hw bus] (legal.north) -- (7.1,2.65) -- (semantic.south);
+\end{pdfdiagram}
+\diagramnote{译码不是只查 opcode。上排把字节窗口切成指令并形成候选语义；下排再用当前模式、特权和扩展能力检查该编码是否合法。合法路径进入执行，非法路径以故障指令的 PC 进入陷阱，不能把保留编码当作任意普通操作。}
+
+\topic{跨行、跨页取指不改变架构指令边界}
+
+一条变长指令可能从 Cache line 末尾开始，后半段位于下一行；它也可能跨越虚拟页面。前端可并行请求两行、使用指令字节队列并在对齐器中拼接，但只有组成完整指令所需的全部字节都通过地址翻译、执行权限和取指错误检查后，候选指令才成立。若后半页不存在，异常归属于这条跨页指令的起始 PC，而不是已经读到的前半段。
+
+预测器还可能沿错误路径提前取到无权限页面或坏字节。推测取指可以产生内部 miss 或等待，却不能仅因错误路径上的预取就向软件报告异常；异常必须等该路径成为实际执行路径，并在体系结构规定的边界获得优先级。这个约束把“前端观察到错误”和“程序收到异常”分开，与乱序核心按序提交异常是同一种可见性原则。
+
+\topic{保留编码和扩展门控为未来兼容保留空间}
+
+一个 bit 模式只有在当前执行模式允许、所需扩展已启用、保留字段取规定值时才是合法指令。同一编码在不同模式下可能具有不同含义，也可能在旧处理器上非法、在新处理器上属于已定义扩展。译码器因此要把编码结果与能力状态共同检查；软件则应先读取标准能力接口，再进入包含新指令的代码路径。
+
+非法编码必须得到确定结果，通常是非法指令异常，不能随实现版本随机变成无操作。虚拟机监控器还可以选择截获某些敏感指令并模拟结果，但来宾看到的仍是虚拟 ISA 契约。若迁移目标缺少已暴露扩展，监控器必须模拟该能力或在启动前限制能力集合，不能等运行到某条指令才发现状态无法恢复。
+
+\topic{修改数据页面中的机器码后还要建立新的取指观察点}
+
+CPU 把新字节写入数据 Cache，并不自动证明取指前端和指令 Cache 已观察到相同内容。体系结构可能提供硬件 I/D 一致性，也可能要求软件先清理数据侧、使指令侧失效，再执行 instruction synchronization barrier。发布 JIT 代码时还要先写完全部字节，设置最终执行权限，然后才把入口地址交给其他线程；否则另一个核心可能看到旧指令、半写指令或仍不可执行的页面。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.29\linewidth}L{0.16\linewidth}}
+\toprule
+边界 & 必须成立的状态 & 软件可见结果 & 主要证据 \\
+\midrule
+指令边界确定 & 所需字节齐全，长度规则唯一 & 下一 PC 指向后继指令 & PC 与原始字节 \\\tablerowrule
+合法译码完成 & 模式、特权、扩展和保留位匹配 & 执行定义的架构操作 & 能力寄存器与异常原因 \\\tablerowrule
+取指异常发布 & 实际路径需要该指令，错误优先级已确定 & 故障 PC 指向指令起点 & fault 地址与保存 PC \\\tablerowrule
+新代码发布 & 数据写入完成，I/D 同步与权限切换完成 & 所有执行者读取完整新编码 & Cache 维护与同步记录 \\
+\bottomrule
+\end{longtable}
+
+\section{九、陷阱入口与返回：处理器怎样保存足够状态继续执行}
+
+陷阱不是简单跳转。处理器必须先确定当前指令是否已经提交、返回 PC 指向故障指令还是后继指令、哪些特权状态需要保存，以及新处理程序使用哪套栈和地址空间。只有这些状态形成自洽快照，处理程序才能修复页表、处理系统调用或确认中断，并在返回时恢复原执行流。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (event) at (1.3,3.8) {事件被选中\\异常/调用/中断};
+  \node[hw control, minimum width=2.5cm] (boundary) at (4.2,3.8) {确定提交边界\\重试或后继 PC};
+  \node[hw memory, minimum width=2.5cm] (save) at (7.1,3.8) {保存现场\\PC/cause/status};
+  \node[hw compute, minimum width=2.5cm] (handler) at (10.0,3.8) {切换特权与向量\\执行处理程序};
+  \node[hw state, minimum width=2.5cm] (resolve) at (10.0,1.3) {修复/应答/拒绝\\形成返回决定};
+  \node[hw control, minimum width=2.5cm] (restore) at (7.1,1.3) {恢复状态\\检查嵌套与屏蔽};
+  \node[hw state, minimum width=2.5cm] (resume) at (4.2,1.3) {异常返回\\重试或继续};
+  \draw[hw bus] (event) -- (boundary);
+  \draw[hw bus] (boundary) -- (save);
+  \draw[hw bus] (save) -- (handler);
+  \draw[hw bus] (handler) -- (resolve);
+  \draw[hw return] (resolve) -- (restore);
+  \draw[hw return] (restore) -- (resume);
+  \draw[hw return] (resume) -- (1.3,1.3) -- (event.south);
+\end{pdfdiagram}
+\diagramnote{陷阱的闭环由两条路径组成：上排在一个可恢复边界保存架构状态并进入处理程序；下排先消除或确认事件，再恢复状态并选择重试故障指令或从后继 PC 继续。返回指令提交之后，旧特权上下文才重新拥有执行权。}
+
+\topic{重试型异常与已完成请求使用不同返回 PC}
+
+缺页、某些对齐异常和可模拟指令通常要求处理程序修复条件后重试，因此保存 PC 指向故障指令；系统调用指令已经完成“请求进入内核”的架构动作，返回地址通常指向后继指令；外部中断位于两条已提交指令之间，保存的是下一条尚未执行指令的 PC。处理程序不能仅按事件名称猜测，而要使用体系结构定义的 cause 和保存 PC 规则。
+
+以缺页为例，load 尚未把结果写入目的寄存器，也不能留下只完成一半的 MMIO 副作用。内核建立 PTE、执行所需 TLB 失效后返回，处理器重新译码同一 load。以系统调用为例，参数寄存器和调用号已构成请求，内核把返回值写入规定寄存器，异常返回后从下一条用户指令继续。二者都经过陷阱入口，但提交边界不同。
+
+\topic{嵌套陷阱需要独立的保存位置和有限失败路径}
+
+处理程序自身也可能缺页、发生机器检查或接收更高优先级中断。入口硬件通常先屏蔽部分事件并保存先前中断使能与特权状态，软件再决定何时开放嵌套。每一级必须使用不会覆盖上一层的保存区或栈帧；若连入口栈、向量表或页表都不可用，平台要进入 double fault、machine mode 或复位等有限恢复路径，不能反复覆盖同一个返回现场。
+
+\begin{longtable}{L{0.17\linewidth}L{0.24\linewidth}L{0.27\linewidth}L{0.22\linewidth}}
+\toprule
+事件类型 & 进入前提交边界 & 处理动作 & 返回位置 \\
+\midrule
+缺页/可修复故障 & 故障指令未产生架构副作用 & 建立映射并失效旧翻译 & 重试故障指令 \\\tablerowrule
+系统调用 & 调用动作已被接受 & 执行服务并写返回值 & 调用指令的后继 \\\tablerowrule
+外部中断 & 更早指令已提交，当前边界可恢复 & 应答设备或控制器并处理完成 & 下一条未执行指令 \\\tablerowrule
+不可恢复机器错误 & 现场可能只适合诊断 & 保存证据、隔离或复位 & 不保证原位置继续 \\
+\bottomrule
+\end{longtable}

@@ -165,3 +165,13 @@
 | 第 17 章 | 目录一致性、home node、探测完成、虚通道依赖与跨电源/复位域桥接 | verified |
 | 第 18 章 | PCIe 交换拓扑、retimer、热插拔、DPC、SR-IOV、ATS/PRI/PASID 与失效闭环 | verified |
 | 第 22 章 | EC/BMC 带外管理、传感器与主机隔离、FIT/MTBF/MTTR、可用性和共同故障预算 | verified |
+
+## 2026-07 指令入口、设备搬运与固件所有权深化批次
+
+本批次继续补齐三条跨层通路：机器码从取指边界进入合法译码并在陷阱后恢复，离散页框经 IOMMU 和 scatter-gather 描述符交给设备并在完成后回收，平台从复位 strap 与不可变启动根进入可更新固件并在操作系统接管后限制运行时固件权限。只增加读者内容与机制图，不增加章末练习，也不改变既有迁移单元归属。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 6 章 | 指令边界、取指窗口、合法译码、扩展门控、自修改代码同步、陷阱入口与返回状态 | verified |
+| 第 19 章 | scatter-gather DMA、IOVA 映射、部分完成、interrupt remapping、posted interrupt 与向量生命周期 | verified |
+| 第 21 章 | 复位 strap、不可变 Boot ROM、SPI Flash 区域保护、SMM/运行时固件所有权与恢复边界 | verified |
