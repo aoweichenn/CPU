@@ -66,7 +66,8 @@ CHINESE_NUMERALS = (
 )
 CHINESE_TO_ARABIC = {number: str(index) for index, number in enumerate(CHINESE_NUMERALS, start=1)}
 EXTRAS = {
-    1: ("ch01-chapter-exercises.tex",),
+    1: ("ch01-five-volt-input-boundary.tex", "ch01-chapter-exercises.tex"),
+    3: ("ch03-async-fifo-lifecycle.tex",),
     4: ("ch04-verification-closure.tex", "ch04-silicon-fpga-dft.tex"),
     5: ("ch05-signed-division-boundaries.tex", "ch05-floating-point-execution.tex", "ch05-chapter-exercises.tex"),
     6: ("ch06-isa-real-world.tex", "ch06-privilege-atomicity.tex", "ch06-fetch-trap-contract.tex"),
@@ -76,7 +77,7 @@ EXTRAS = {
     10: ("ch10-memory-model.tex",),
     11: ("ch11-cache-interface.tex", "ch11-cache-deep-dive.tex"),
     12: ("ch12-modern-vm-tlb.tex", "ch12-vm-deep-dive.tex", "ch12-memory-attributes-migration.tex", "ch12-allocation-lifecycle.tex"),
-    13: ("ch13-chapter-exercises.tex",),
+    13: ("ch13-cacheline-read-transaction.tex", "ch13-chapter-exercises.tex"),
     14: ("ch14-nvme-interface.tex", "ch14-mobile-emerging-storage.tex"),
     15: ("ch15-ahci-command-recovery.tex", "ch15-chapter-exercises.tex"),
     16: ("ch16-persistence-reliability.tex", "ch16-block-layer-raid.tex"),
@@ -87,7 +88,7 @@ EXTRAS = {
     21: ("ch21-platform-recovery.tex", "ch21-firmware-deep-dive.tex", "ch21-reset-runtime-firmware.tex"),
     22: ("ch22-dvfs-transition.tex", "ch22-ras-reliability.tex", "ch22-ras-deep-dive.tex", "ch22-bmc-availability.tex"),
     23: ("ch23-ethernet-phy.tex", "ch23-usb-human-interface.tex", "ch23-sensor-acquisition.tex", "ch23-wireless-datacenter-fieldbus.tex"),
-    24: ("ch24-gpu-memory-visibility.tex", "ch24-display-camera-accelerator.tex"),
+    24: ("ch24-gpu-memory-visibility.tex", "ch24-display-camera-accelerator.tex", "ch24-frame-visible-lifecycle.tex"),
     26: ("ch26-modern-system-trace.tex",),
 }
 EXTRAS_BEFORE = {

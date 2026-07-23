@@ -1,0 +1,68 @@
+\section{一次 64B DDR4 读取：从行冲突到 Cache line 返回}
+
+DRAM 时序参数只有放进一笔具体事务里，才能看出各自约束了哪一段。下面采用一个教学配置：DDR4-3200、64 bit 数据总线、BL8，器件时钟为 1600MHz，$t_{\mathrm{CK}}=0.625$ns；取 CL22、$t_{\mathrm{RCD}}=22$CK、$t_{\mathrm{RP}}=22$CK，因此三者各约 13.75ns。实际平台参数由 DIMM SPD、训练结果和控制器策略决定，这组数值只用于把命令、数据与完成边界算在同一条时间线上。
+
+处理器缺失一条 64B Cache line，内存控制器已经把物理地址解码为 channel 0、rank 0、bank group 1、bank 2、row \code{0x1234}、目标 column。该 bank 当前打开的是另一行，而且已满足最小开行时间，因此这是一次 row conflict。64 bit 总线每次数据传输搬运 8B，BL8 在四个器件时钟内完成八次双沿传输，恰好返回 64B。
+
+\topic{控制器必须先关闭旧行，再打开目标行}
+
+第一步是 PRE，关闭 bank 2 当前行并恢复位线预充状态；经过 $t_{\mathrm{RP}}$ 才能发 ACT。第二步 ACT 选择 row \code{0x1234}，感放把整行带入 row buffer；经过 $t_{\mathrm{RCD}}$ 才能发 RD。第三步 RD 选择目标 column；经过 CL，PHY 才在 DQS 边沿开始收到数据突发。若目标行原本已经打开，PRE、ACT、$t_{\mathrm{RP}}$ 和 $t_{\mathrm{RCD}}$ 都可以省去。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (queue) at (1.4,4.2) {读请求入队\\地址与事务身份};
+  \node[hw control, minimum width=2.5cm] (pre) at (4.4,4.2) {PRE\\关闭旧行};
+  \node[hw control, minimum width=2.5cm] (act) at (7.4,4.2) {ACT\\打开目标行};
+  \node[hw control, minimum width=2.5cm] (read) at (10.4,4.2) {RD\\选择目标列};
+  \node[hw memory, minimum width=2.7cm] (burst) at (10.4,1.2) {DQS/BL8\\八次传输共 64B};
+  \node[hw compute, minimum width=2.7cm] (ecc) at (7.4,1.2) {PHY 与 ECC\\对齐、纠错、标错};
+  \node[hw state, minimum width=2.7cm] (response) at (4.4,1.2) {返回缓冲\\按事务身份归并};
+  \node[hw state, minimum width=2.5cm] (fill) at (1.4,1.2) {Cache line 有效\\唤醒等待者};
+  \draw[hw bus] (queue) -- (pre);
+  \draw[hw bus] (pre) -- node[above, hw label]{$t_{\mathrm{RP}}$} (act);
+  \draw[hw bus] (act) -- node[above, hw label]{$t_{\mathrm{RCD}}$} (read);
+  \draw[hw bus] (read) -- node[right, hw label]{CL} (burst);
+  \draw[hw return] (burst) -- (ecc);
+  \draw[hw return] (ecc) -- (response);
+  \draw[hw return] (response) -- (fill);
+\end{pdfdiagram}
+\diagramnote{一次 row-conflict 读取的完整状态链。上排依次关闭旧行、打开目标行并选择列；下排在 DQS 边沿接收完整 BL8，完成对齐与 ECC 后，才按原事务身份返回并使 Cache line 有效。命令被 DRAM 接受不等于数据已经返回。}
+
+\begin{longtable}{L{0.12\linewidth}L{0.21\linewidth}L{0.24\linewidth}L{0.33\linewidth}}
+\toprule
+相对时刻 & 命令或事件 & bank/数据状态 & 尚未完成的边界 \\
+\midrule
+0ns & PRE & 旧行开始关闭，位线回预充状态 & 不能立即 ACT \\\tablerowrule
+13.75ns & ACT row \code{0x1234} & 目标行进入感放与 row buffer & 不能立即 RD \\\tablerowrule
+27.50ns & RD target column & DRAM 核心开始列读与 I/O 准备 & DQ 上还没有本次数据 \\\tablerowrule
+41.25ns & 首个数据 beat & PHY 按 DQS 采样，开始组装 64B & Cache line 尚不完整 \\\tablerowrule
+43.75ns & 第八个 beat 结束 & 64B 突发接收完毕 & 仍要完成 ECC 与事务匹配 \\\tablerowrule
+随后若干控制器周期 & ECC/返回 & 数据或错误与原请求身份合并 & 返回缓冲发布后才能唤醒核心 \\
+\bottomrule
+\end{longtable}
+
+在这组简化参数下，row-conflict 的介质命令窗口约为
+\[
+ t_{\mathrm{RP}}+t_{\mathrm{RCD}}+\mathrm{CL}+\mathrm{BL8}
+ =13.75+13.75+13.75+2.5=43.75\mathrm{ns}.
+\]
+row hit 只需 CL 与突发，约 16.25ns。两者都没有包括请求排队、片上互连、控制器仲裁、PHY 弹性缓冲、ECC 和 Cache 填充，所以不能把 43.75ns 直接当作处理器观察到的全部 miss 延迟。若旧行尚未满足 $t_{\mathrm{RAS}}$，PRE 还必须继续等待，尾延迟会更长。
+
+\topic{完整 64B 和正确事务身份到齐后才能发布}
+
+DQS 是源同步选通信号，PHY 使用训练得到的延迟窗口对每个 byte lane 采样，再把多个 beat 对齐成控制器内部数据宽度。带外 ECC DIMM 还会返回校验 bit；控制器解码综合征，单 bit 可纠错时修正数据并记录 corrected error，检测到不可纠正错误时则给返回项附加 poison 或机器检查状态。ECC 纠正完成之前，Cache 不能把这条 line 标为有效。
+
+控制器可能同时服务多个 bank，后发请求也可能先返回。每笔请求因此携带内部事务身份、目标 Cache line 或 MSHR 项。返回缓冲只有在 64B 全部 beat、ECC 状态和请求身份均闭合后，才能把数据送回片上互连。核心看到的是“本条 line 可用”，而不是 PRE、ACT、RD 中任何一个中间事件。
+
+\begin{longtable}{L{0.20\linewidth}L{0.25\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+异常或竞争 & 首个证据 & 控制器动作 & 可见结果 \\
+\midrule
+刷新抢占 & rank/bank 进入 refresh，计数器非零 & 延迟普通命令，保持请求身份与年龄 & 时延增加，数据语义不变 \\\tablerowrule
+可纠正 ECC & 综合征定位单 bit & 修正后返回并累计 CE 计数，可安排 scrub & Cache 获得正确数据并留下遥测 \\\tablerowrule
+不可纠正 ECC & 综合征不满足纠错条件 & 返回 poison/错误，阻止静默使用 & 触发机器检查、页下线或进程终止 \\\tablerowrule
+PHY 训练或采样失败 & lane 错误、训练窗口不足、重复校验异常 & 降速、重训、隔离 rank 或停止服务 & 请求失败，不能发布不可信数据 \\\tablerowrule
+控制器超时 & 命令已发但完成窗口到期 & 冻结新请求并保存 bank/队列证据，执行分级复位 & 旧代际返回不得写入新队列 \\
+\bottomrule
+\end{longtable}
+
+这笔事务把四个常被混淆的边界分开了：RD 被接受表示列命令进入 DRAM；最后一个 DQS beat 表示线上的 64B 已到齐；ECC 和返回缓冲完成表示控制器拥有可信的完整结果；Cache line 置 valid 并唤醒等待者，才是处理器侧可见完成。故障恢复必须保留这四层证据，才能判断问题发生在调度、命令、PHY 还是数据完整性。

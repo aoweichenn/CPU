@@ -2434,6 +2434,71 @@ NPU 并不是“缩小版 GPU”。它把常见张量算子落实为矩阵乘加
 队列或地址故障 & fence 不前进、IOMMU/设备 fault & 修复描述符、映射与复位代际 & 模型本身太慢 \\
 \bottomrule
 \end{longtable}
+\section{十二、60Hz 双缓冲案例：渲染完成不等于画面已经可见}
+
+显示通路至少包含三个独立完成域：CPU 把命令交给 GPU，GPU 把新帧写入 back buffer，显示控制器在刷新边界采用该缓冲并逐行扫描。下面用固定 60Hz、双缓冲的案例把这些边界放到同一时间轴。每帧周期约为
+\[
+  T_{\mathrm{frame}}=\frac{1}{60}\approx16.67\mathrm{ms}.
+\]
+时刻 0，显示控制器已经开始扫描旧 front buffer。CPU 在 1ms 完成新命令提交，GPU 在 7ms 完成渲染并发布 fence。此时新像素已可供设备读取，但当前扫描周期不能在中途换地址，否则同一画面会混入两代帧。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (submit) at (1.4,4.2) {CPU 提交\\命令与目标缓冲};
+  \node[hw compute, minimum width=2.6cm] (render) at (4.5,4.2) {GPU 渲染\\写 back buffer};
+  \node[hw state, minimum width=2.6cm] (fence) at (7.7,4.2) {渲染 fence\\像素写入可见};
+  \node[hw control, minimum width=2.7cm] (flip) at (10.9,4.2) {VBlank 翻页\\锁存新 plane 地址};
+  \node[hw memory, minimum width=2.7cm] (scan) at (10.9,1.2) {显示扫描\\逐行读取新帧};
+  \node[hw block, minimum width=2.7cm] (link) at (7.7,1.2) {显示链路/TCON\\传输与行列驱动};
+  \node[hw state, minimum width=2.7cm] (pixel) at (4.5,1.2) {面板像素响应\\亮度开始变化};
+  \node[hw state, minimum width=2.5cm] (complete) at (1.4,1.2) {整帧可见边界\\最后一行已更新};
+  \draw[hw bus] (submit) -- (render);
+  \draw[hw bus] (render) -- (fence);
+  \draw[hw bus] (fence) -- (flip);
+  \draw[hw bus] (flip) -- (scan);
+  \draw[hw return] (scan) -- (link);
+  \draw[hw return] (link) -- (pixel);
+  \draw[hw return] (pixel) -- (complete);
+\end{pdfdiagram}
+\diagramnote{一帧从命令到可见的四个主要边界。GPU fence 只证明 back buffer 已可读；VBlank 翻页只证明显示控制器采用了新地址；逐行扫描和链路传输之后，面板像素才开始变化；最后一行完成响应，才接近整帧可见。}
+
+\topic{按时间逐项核对这一帧}
+
+在 16.67ms 的 VBlank 边界，显示控制器确认 GPU fence 已完成，锁存 back buffer 地址，并把它变成新的 front buffer。新一轮扫描随后从顶部开始。屏幕顶部像素在 16.67ms 后不久得到新数据，底部像素要接近 33.33ms 才被扫描；LCD/OLED 面板还会增加自身响应时间。因此“这一帧显示了”的精确含义必须说明是首像素变化、整帧扫描完成，还是光学测量达到目标亮度。
+
+\begin{longtable}{L{0.15\linewidth}L{0.24\linewidth}L{0.31\linewidth}L{0.20\linewidth}}
+\toprule
+时刻 & 事件 & 已经证明的事实 & 尚未证明的事实 \\
+\midrule
+0ms & 扫描旧 front buffer & 显示控制器正在消费旧帧 & 新帧是否已开始渲染 \\\tablerowrule
+1ms & CPU 提交完成 & GPU 可以读取命令与资源描述 & GPU 已经执行或写完像素 \\\tablerowrule
+7ms & GPU fence 完成 & back buffer 写入达到设备可见边界 & 当前扫描已采用新缓冲 \\\tablerowrule
+16.67ms & VBlank 翻页 & 新 plane 地址成为下一扫描源 & 整个面板都已显示新帧 \\\tablerowrule
+16.67--33.33ms & 逐行扫描 & 新帧从顶部向底部送往面板 & 尚未扫描的行仍保持旧代际 \\\tablerowrule
+约 33.33ms 以后 & 最后一行及面板响应 & 整帧物理输出接近完成 & 人眼体验仍受响应、背光和处理影响 \\
+\bottomrule
+\end{longtable}
+
+若 GPU 在 16.90ms 才完成 fence，它已经错过本次 VBlank。显示控制器必须继续扫描旧 front buffer，直到 33.33ms 的下一个边界再翻页。只晚 0.23ms 的计算，可能增加接近一整帧的等待。平均 GPU 时间仍可能低于 16.67ms，但偶发尾延迟会形成明显卡顿，这就是显示系统必须同时观察平均帧率和 frame-time 分布的原因。
+
+\topic{双缓冲、三缓冲与低延迟不是同一个目标}
+
+双缓冲中，未显示的缓冲只有一个。GPU 若完成过早，可能等待显示控制器释放旧 front buffer；若完成过晚，就错过刷新边界。三缓冲允许 GPU 在一个缓冲等待显示时继续渲染另一个缓冲，提高吞吐并减少阻塞，但新帧可能在翻页队列中多等待一代，输入到光子的时延反而增加。低延迟模式通常限制排队深度，让 CPU 不要领先 GPU 和显示过多帧。
+
+可变刷新率改变的是 VBlank 到来的策略：显示器允许在范围内延长帧间隔，GPU 一完成就可以更快触发下一次刷新；一旦一行扫描开始，像素链路仍要按规定速率连续发送。可变刷新不会消除 GPU fence、翻页、扫描和面板响应之间的边界，也不能补救显示带宽不足导致的 underflow。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+现象 & 最早检查的边界 & 关键证据 & 恢复或修正 \\
+\midrule
+命令提交后画面静止 & 命令环与 GPU 执行 & 读指针、fault、fence 值与代际 & 修复队列或重建 GPU 上下文 \\\tablerowrule
+fence 完成但仍是旧画面 & 翻页队列与 VBlank & plane 地址、flip 序号、刷新时间戳 & 核对目标缓冲和截止时刻 \\\tablerowrule
+画面中部撕裂 & 地址切换时刻 & 翻页是否在扫描中途生效 & 只在允许刷新边界锁存 \\\tablerowrule
+随机横线或闪屏 & 扫描带宽与链路 & underflow、链路 CRC/训练、像素时钟 & 增加带宽余量或重新训练 \\\tablerowrule
+复位后出现旧帧 & 缓冲与完成代际 & 旧 fence/flip 是否写入新队列 & 递增 generation，丢弃迟到完成 \\
+\bottomrule
+\end{longtable}
+
+显示恢复也必须遵守所有权顺序。驱动先停止新提交，等待或取消在途 GPU 工作；关闭或冻结 plane 更新；重建显存映射、命令环和显示状态；递增队列 generation；最后恢复渲染与翻页。旧代际 fence 或 flip 完成只能用于诊断，不能释放当前缓冲。这样即使 GPU、显示控制器和面板各自有独立时钟与复位，恢复后也不会把旧帧身份误当作新帧完成。
 
 \section*{章末练习}
 
