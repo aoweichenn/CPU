@@ -1,316 +1,40 @@
-\chapter{一台机器怎样只运行一项任务}
+\chapter{第一项任务怎样在裸机上运行}
+
+一台刚刚接通电源的机器并不知道“程序”是什么。电路中只有高低电平，存储器中只有按地址
+排列的位，处理器内部只有一组将在时钟边沿更新的状态。即使某段机器指令已经放在桌面上的
+另一个设备里，这台机器也不会自动找到它、装入它，更不会替它准备入口参数和栈。
+
+本章从一个可复算的要求开始。外部发送端交给机器四个有符号整数
+\[
+7,\quad -2,\quad 11,\quad 5,
+\]
+以及一段求和任务。任务应把结果 \(21\) 写入约定的内存位置，然后返回启动固件。这个要求
+很小，却足以迫使我们回答一组不能省略的问题：第一条指令原来保存在哪里；处理器怎样找到
+它；任务字节怎样进入易失内存；入口地址、参数与栈由谁建立；从哪一个瞬间起，处理器才算
+真正开始执行任务；任务正常返回和任务失控时，机器分别会发生什么。
+
+这里没有操作系统。我们只建立一台能够可靠完成一次“上电—装入—执行—返回”的裸机，并
+且在每一步区分电路事实、软件可见约定和上层可以依赖的能力。
 
 \begin{statebox}
-\textbf{本章要组装的机器。} 一个处理器核、一片启动存储、一片可读写内存、时钟与复位
-电路、连接这些器件的地址互连，以及接收任务字节的最小串行接口。没有进程、线程、系统
-调用、文件和调度器。
+\textbf{贯穿本章的数值约定。} 教学处理器使用 32 位物理地址和 32 位通用寄存器；一个字节
+含 8 位，多字节整数按低有效字节在前的次序存放。任务入口为
+\code{0x00100000}，输入数组从 \code{0x00102000} 开始，结果写到
+\code{0x00102020}，初始栈顶位于 \code{0x001f0000} 之下。所有地址和数值都会在后文逐项
+说明，不要求读者预先理解这些约定。
 \end{statebox}
 
-\section{先把一台能够取到第一条指令的机器接起来}
-
-单独放置一个处理器并不能运行程序。处理器内部即使具有运算单元和寄存器，也必须持续收到
-时钟变化，必须在上电后进入已知状态，还必须能从某处读到第一条指令。程序运行后又要保存
-可变数据，因此只读的启动字节也不能代替全部内存。
-
-本样机采用一组教学化但完整的器件。它们不是现代主板的全部部件，只保留“启动并运行一个
-任务”真正需要的能力：
-
-\begin{longtable}{|L{0.20\linewidth}|L{0.31\linewidth}|L{0.37\linewidth}|}
-\hline
-器件 & 此刻必须解决的问题 & 暂时不承担的职责 \\ \hline
-时钟与复位电路 & 让状态按节拍变化，并给出已知启动时刻 & 不提供日期、定时任务或调度 \\ \hline
-处理器核 & 取指、译码、计算并发起内存读写 & 不知道程序、进程或文件是什么 \\ \hline
-启动存储 & 断电后仍保留最早启动指令 & 不保存任务运行中的栈和变量 \\ \hline
-RAM & 保存运行期会变化的代码副本、数据和栈 & 不保证断电后内容仍在 \\ \hline
-地址互连 & 根据地址把一次请求送到正确器件 & 不解释地址中保存的业务含义 \\ \hline
-串行下载接口 & 把外部任务字节逐个交给处理器读取 & 不把字节组织成文件系统 \\ \hline
-\end{longtable}
-
-串行接口不是所有裸机都必需。若任务预先固化在启动存储中，机器可以省去它。本书希望在不
-重新烧写启动固件的情况下更换任务，所以保留一个只能接收字节的最小输入通道。
-
-\section{这些器件怎样连接}
-
-连接不能只用一句“都挂在总线上”概括。处理器访问外部器件时，至少要表达四类信息：
-
-\begin{itemize}
-\item \textbf{地址}：这次请求指向哪个编号位置；
-\item \textbf{方向与宽度}：读取还是写入，一次传送几个字节；
-\item \textbf{写入数据}：写请求准备交给目标的位串；
-\item \textbf{响应}：目标是否完成，以及读请求返回的位串。
-\end{itemize}
-
-这些信息可以由并行导线、片上网络分组或其他协议承载。本样机把它们统称为一次
-\textbf{总线事务}：处理器发出请求，地址互连选择唯一目标，目标完成后返回响应。这个名称
-描述一次交互，不要求真实电路必须采用某种特定总线标准。
-
-\begin{center}
-\begin{tikzpicture}[
-  node distance=10mm and 16mm,
-  hw/.style={stage,minimum width=3.3cm},
-  link/.style={flow},
-  signal/.style={->,>=Latex,draw=BookMuted,thick}
-]
-\node[hw] (cpu) {处理器核\\寄存器与执行状态};
-\node[hw, right=of cpu, minimum width=3.6cm] (bus) {地址互连\\译码与请求转发};
-\node[hw, above right=8mm and 17mm of bus] (rom) {启动存储\\固件字节};
-\node[hw, right=17mm of bus] (ram) {RAM\\运行期字节};
-\node[hw, below right=8mm and 17mm of bus] (serial) {串行下载接口\\状态与接收字节};
-\node[hw, above=13mm of cpu] (clock) {时钟与复位\\节拍和初始状态};
-\node[draw=BookRule,rounded corners=2pt,align=center,
-      below=12mm of serial,minimum width=3.3cm] (outside) {外部发送端\\任务映像};
-
-\draw[signal] (clock) -- node[right,font=\footnotesize]{clock/reset} (cpu);
-\draw[link] (cpu) -- node[above,font=\footnotesize]{请求} (bus);
-\draw[link] (bus) -- node[below,font=\footnotesize]{响应} (cpu);
-\draw[link] (bus.east) -| (rom.west);
-\draw[link] (bus.east) -- (ram.west);
-\draw[link] (bus.east) -| (serial.west);
-\draw[signal] (outside) -- node[right,font=\footnotesize]{逐字节到达} (serial);
-\end{tikzpicture}
-\end{center}
-\diagramnote{处理器是当前唯一请求发起者。启动存储、RAM 和串行接口都是地址互连后的目标；
-串行接口还从机器外部接收字节。图中尚无计时器、中断控制器或操作系统。}
-
-互连内部的地址译码器比较请求地址与各器件范围。本样机采用下面的物理地址表；具体数值是
-教学约定，不是所有处理器的固定标准：
-
-\begin{longtable}{|L{0.30\linewidth}|L{0.25\linewidth}|L{0.33\linewidth}|}
-\hline
-物理地址范围 & 互连选择的目标 & 当前用途 \\ \hline
-\code{0x00000000--0x0000ffff} & 启动存储 & 固件与复位后的第一条指令 \\ \hline
-\code{0x00100000--0x001fffff} & RAM & 任务代码、数据、栈和固件工作区 \\ \hline
-\code{0x40000000} & 串行状态寄存器 & 判断是否收到一个新字节 \\ \hline
-\code{0x40000004} & 串行数据寄存器 & 读取刚到达的字节 \\ \hline
-\end{longtable}
-
-这里的“寄存器”是串行控制器内部可被处理器寻址的一小块状态，不是处理器通用寄存器。
-处理器用普通读事务访问 \code{0x40000000} 时，互连不会访问 RAM，而会选择串行接口。
-这种把设备状态纳入地址范围的安排称为内存映射 I/O；它只统一访问形式，不会把设备真的
-变成内存。
-
-\section{初始器件的硬件模型、软件模型与抽象}
-
-同一个器件可以从三个层次描述。硬件模型说明电路最少保存什么、接收什么、输出什么；软件
-模型说明程序能通过指令和地址观察什么；抽象则说明后续软件可以稳定依赖哪项能力。三层
-不能合并，否则容易把电路内部实现误当成软件接口，或把软件约定误写成硬件保证。
-
-\subsection{时钟与复位：让状态变化具有起点}
-
-\textbf{硬件模型。} 时钟源周期性产生边沿，处理器等时序电路在规定边沿更新内部状态。
-复位电路在电源稳定前保持复位有效，释放时使处理器的指令位置和控制状态进入规定初值。
-
-\textbf{软件模型。} 普通启动代码不能把“当前经过了多少个时钟边沿”直接当作可用时间。
-本样机只规定复位释放后，处理器从物理地址 \code{0x00000000} 取第一条指令。时钟此时没有
-软件可读寄存器。
-
-\textbf{抽象。} 软件可以依赖“指令按体系结构规则逐步执行”和“每次复位从同一入口开始”。
-它不能依赖真实频率恒定，也不能据此安排若干毫秒后的事件；可编程计时能力要到确有需要时
-另行加入。
-
-\subsection{处理器核：把字节解释成指令}
-
-\textbf{硬件模型。} 处理器保存指令位置、通用寄存器、算术标志和控制状态。它根据指令
-位置发起取指读事务，译码返回位串，执行运算；遇到装入或存储指令时，再发起数据读写事务。
-
-\textbf{软件模型。} 指令集规定哪些位串表示加法、跳转和访存，规定哪些寄存器能被指令
-读写。栈指针在本样机中使用一个通用寄存器承担；“它是栈顶”属于调用约定，不是存储电路
-能够识别的特殊数据类型。
-
-\textbf{抽象。} 软件得到一条顺序执行的指令流和一组可命名的寄存器。分支可以改变下一条
-指令位置，读写指令可以访问物理地址。处理器并不自动保证任务只访问分配给自己的范围。
-
-\subsection{启动存储：让第一条指令在断电后仍存在}
-
-\textbf{硬件模型。} 启动存储可看作按地址索引的非易失字节阵列。读事务输入地址，输出
-对应字节；本样机运行期间不允许普通写事务改变它。
-
-\textbf{软件模型。} 地址 \code{0x00000000--0x0000ffff} 可读，内容是预先写入的固件。
-复位入口落在这个范围内，所以处理器无需先运行别的代码就能取得启动指令。
-
-\textbf{抽象。} 软件得到一段跨断电保存、启动时可直接执行的字节序列。它还不是“磁盘”
-或“文件”；固件中哪段是代码、常量或版本信息，仍由固件自己的布局约定解释。
-
-\subsection{RAM：为运行中的变化提供位置}
-
-\textbf{硬件模型。} RAM 是可读写、断电丢失的存储单元阵列。读事务返回选中单元的内容；
-写事务根据地址、字节使能和写数据更新单元。
-
-\textbf{软件模型。} 程序把 \code{0x00100000--0x001fffff} 当作可读写物理地址。处理器
-不会从 RAM 获得“这里是代码还是栈”的标签；同一字节被怎样解释取决于取指位置和指令。
-
-\textbf{抽象。} 软件得到一片可变的字节数组，可用来放代码副本、变量和栈。当前没有缓存
-一致性、虚拟地址或权限边界，任何处理器存储指令都能改写该范围。
-
-\subsection{地址互连：把一个地址变成唯一目标}
-
-\textbf{硬件模型。} 互连接收请求的地址、操作类型和写数据，将地址与范围表比较，只向
-匹配目标转发请求，再把目标响应送回处理器。无目标匹配或多个目标匹配都属于配置错误；
-真实机器通常会返回错误响应。
-
-\textbf{软件模型。} 软件看到一张物理地址表。对不同范围使用同一类读写指令，却会访问
-不同器件。一次读只有在收到完成响应后，返回寄存器中的值才有效。
-
-\textbf{抽象。} 软件得到统一的物理地址空间：地址足以选择当前机器中的一个目标。这个
-抽象不等于虚拟内存，也不提供命名、所有权或保护。
-
-\subsection{串行下载接口：把外部信号变成可读取字节}
-
-\textbf{硬件模型。} 接收电路把串行线上按时间到达的位组合成一个字节，写入接收寄存器，
-并设置 \code{ready=1}。处理器读取数据寄存器后，接口清除 ready，等待下一个字节。若旧
-字节尚未读取而新字节又到达，最小单槽模型会发生溢出。
-
-\textbf{软件模型。} 固件反复读取状态地址；看到 ready 后读取数据地址，把所得字节写入
-RAM。当前接口没有中断和 DMA，所有搬运都由处理器执行：
-
-\begin{lstlisting}
-receive_one_byte:
-  repeat until read32(0x40000000) has READY
-  byte = read8(0x40000004)
-  store byte at next RAM address
-\end{lstlisting}
-
-\textbf{抽象。} 软件得到一个按到达顺序读取的字节流。它不保证这些字节组成合法任务，
-不提供文件名、长度或校验；这些规则必须由固件与外部发送端另行约定。
-
-\section{一次取指怎样沿连接完成}
-
-现在可以精确描述复位后的第一条取指，而不再用“处理器读取固件”省略中间步骤：
-
-\begin{enumerate}
-\item 复位释放后，处理器的指令位置为 \code{0x00000000}。
-\item 处理器发出读请求：地址为 \code{0x00000000}，方向为读，宽度由指令集规定。
-\item 互连发现地址落在启动存储范围，只向启动存储转发请求。
-\item 启动存储返回相应字节，互连把完成响应和数据送回处理器。
-\item 处理器译码并执行该指令，再按指令语义形成下一条指令位置。
-\end{enumerate}
-
-\begin{center}
-\begin{tikzpicture}[node distance=11mm and 18mm]
-\node[stage,minimum width=3.8cm] (cpu) {处理器\\地址=PC，读请求};
-\node[stage,minimum width=3.8cm,right=of cpu] (bus) {地址互连\\范围匹配};
-\node[stage,minimum width=3.8cm,right=of bus] (rom) {启动存储\\返回指令字节};
-\draw[flow] (cpu) -- node[above,font=\footnotesize]{请求} (bus);
-\draw[flow] (bus) -- node[above,font=\footnotesize]{选中目标} (rom);
-\draw[flow] (rom.south) -- ++(0,-8mm) -|
-  node[below,font=\footnotesize,pos=0.5]{数据与完成响应} (cpu.south);
-\end{tikzpicture}
-\end{center}
-\diagramnote{地址决定目标，读写方向决定动作，完成响应决定结果何时有效。总线事务完成后，
-处理器才拥有可译码的指令字节。}
-
-\section{通电并不等于任务已经运行}
-
-处理器能够执行指令，但它不会自行知道“今天要运行哪项任务”。通电复位只会把少量体系结构
-状态设为规定值，并把下一条取指位置设到一个预先约定的地址。这个地址通常落在固件可用的
-区域，而不是某个应用程序的开头。
-
-先把机器能够提供的最小事实写清楚：
-
-\begin{longtable}{|L{0.20\linewidth}|L{0.30\linewidth}|L{0.38\linewidth}|}
-\hline
-硬件状态 & 复位后提供的含义 & 尚未提供的含义 \\ \hline
-指令位置 & 下一次从哪个地址取指 & 哪项任务应该获得处理器 \\ \hline
-通用寄存器 & 若干可参与计算的位串 & 参数、局部变量或任务身份 \\ \hline
-内存地址 & 处理器可访问的字节位置 & 哪段是代码、数据或栈 \\ \hline
-设备入口 & 固件可从外部取得字节 & 字节属于哪个“文件” \\ \hline
-\end{longtable}
-
-表中右列不是硬件遗漏的缺陷，而是软件必须建立的约定。处理器只认识位模式和地址；“任务”
-是我们为了描述一组代码、初始数据和运行状态而使用的名称。
-
-\section{先让任务字节出现在内存中}
-
-假设要运行的任务已经被编译成一段机器指令和初始数据。外部发送端先发送一个固定长度头部，
-再发送任务载荷：
-
-\begin{lstlisting}
-download_header:
-  payload_bytes
-  requested_load_address
-  entry_offset
-payload:
-  machine instructions and initial data
-\end{lstlisting}
-
-这只是固件与发送端的传输约定，不是文件格式。固件先检查载荷长度和目标范围，再从串行
-数据寄存器逐字节读取载荷并写入 RAM。为了避免隐藏关键条件，给出一个具体布局：
-
-\begin{longtable}{|L{0.30\linewidth}|L{0.20\linewidth}|L{0.38\linewidth}|}
-\hline
-物理范围 & 本次用途 & 必须保持的约束 \\ \hline
-\code{0x100000--0x107fff} & 任务代码与只读常量 & 入口地址必须落在已装入代码中 \\ \hline
-\code{0x108000--0x10bfff} & 任务可写数据 & 初值由任务映像给出，其余字节清零 \\ \hline
-\code{0x10c000--0x10ffff} & 向下增长的栈 & 初始栈顶取范围末端，不能越过数据区 \\ \hline
-\code{0x080000--0x08ffff} & 固件与装入代码 & 启动完成前不能被任务映像覆盖 \\ \hline
-\end{longtable}
-
-这里还没有内存保护。表格描述的是装入者承诺遵守的布局，不是硬件已经阻止越界。若任务
-中的错误指令写到 \code{0x080000}，固件仍可能被覆盖。
-
-\section{仅有代码地址为什么还不能开始}
-
-把指令写到 \code{0x100000} 后直接跳转，仍然缺少栈。普通函数调用要保存返回地址和局部
-状态；如果栈指针没有确定值，第一次压栈就会写入未知位置。
-
-本次启动至少要形成以下初始现场：
-
-\begin{lstlisting}
-instruction pointer = task entry address
-stack pointer       = 0x110000
-general registers   = documented argument values or zero
-interrupt state     = the value required by the startup contract
-addressing mode     = the mode used to build the task
-\end{lstlisting}
-
-“现场”在这里还不是操作系统对象。它只是处理器继续执行所需的一组具体状态。入口地址决定
-取哪条指令，栈指针决定调用与局部数据写到哪里，执行模式决定同一位串如何被解释。
-
-\begin{center}
-\begin{tikzpicture}[node distance=11mm and 15mm]
-\node[stage] (reset) {处理器复位\\从固定地址取指};
-\node[stage, right=of reset] (load) {固件装入\\代码与初始数据};
-\node[stage, right=of load] (state) {建立初始现场\\入口与栈顶};
-\node[stage, below=13mm of state] (run) {跳到任务入口\\任务开始执行};
-\draw[flow] (reset) -- (load);
-\draw[flow] (load) -- (state);
-\draw[flow] (state) -- (run);
-\end{tikzpicture}
-\end{center}
-\diagramnote{“装入”和“开始执行”是两个时刻。前者改变内存，后者改变处理器的下一条指令位置。}
-
-\section{任务怎样结束}
-
-这台机器没有可供任务调用的退出服务。任务入口若执行普通函数返回，栈中也没有一个真实
-调用者留下的返回地址。最小约定可以要求任务在完成后跳到固件提供的固定返回入口：
-
-\begin{lstlisting}
-task_entry:
-  compute the requested result
-  place result code in agreed register
-  jump firmware_return
-\end{lstlisting}
-
-固件返回入口读取结果码，把处理器置于等待状态，或者重新启动同一任务。这里的“返回”完全
-依赖任务合作；任务必须执行那条跳转。
-
-\section{这一方案确实能完成什么}
-
-到此为止，机器已经能完成一条完整但很窄的路径：
-
-\begin{enumerate}
-\item 固件选定一个任务映像并复制到约定物理范围；
-\item 固件清零未初始化数据，设置入口地址与栈顶；
-\item 处理器跳到任务入口；
-\item 任务直接使用全部处理器和物理内存；
-\item 任务主动跳回固件入口并给出结果。
-\end{enumerate}
-
-不应把这台机器描述成已经有了“单任务操作系统”。我们只建立了装入与启动约定；没有常驻
-任务管理对象，也没有隔离、抢占或统一服务接口。
-
-\begin{problemframe}
-\textbf{章末出现的问题。} 现在有任务 A 和任务 B。运行 A 时，B 的代码放在哪里？A 完成
-后，谁重新装入 B 并为它建立初始现场？若想暂停 A、先运行 B、以后再继续 A，需要保存的
-又不只是一个入口地址。下一章只处理这项困难。
-\end{problemframe}
+\input{chapters/ch01/part-a-state-and-storage}
+\input{chapters/ch01/part-a2-instruction-evidence}
+\input{chapters/ch01/part-b-connections-and-startup}
+\input{chapters/ch01/part-b2-processor-contract}
+\input{chapters/ch01/part-b3-handshake-and-alternatives}
+\input{chapters/ch01/part-c-loading-and-handoff}
+\input{chapters/ch01/part-c2-loader-evidence}
+\input{chapters/ch01/part-c3-loader-traces}
+\input{chapters/ch01/part-c4-firmware-control}
+\input{chapters/ch01/part-d-execution-and-boundaries}
+\input{chapters/ch01/part-d2-correctness-accounting}
+\input{chapters/ch01/part-d3-observation-boundaries}
+\input{chapters/ch01/part-d4-connection-diagnostics}
+\input{chapters/ch01/part-e-worked-traces}

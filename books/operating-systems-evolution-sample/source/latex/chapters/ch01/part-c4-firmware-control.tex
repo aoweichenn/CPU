@@ -1,0 +1,152 @@
+\section{把固件主循环连成完整控制程序}
+
+前面已经逐个定义装入记录、串行寄存器和任务现场。现在可以给出不隐藏阶段的固件主循环。
+伪代码使用函数名表达已经解释过的局部动作，不涉及构建工具或源文件位置。
+
+\begin{lstlisting}
+reset_entry:
+  initialize firmware SP
+  clear serial protocol state
+  reset load_record to WAITING
+
+wait_for_transfer:
+  header = receive_exactly(32)
+  if serial overrun: report SERIAL_OVERRUN; goto wait_for_transfer
+  if not validate_header(header):
+    report HEADER_INVALID
+    goto wait_for_transfer
+
+  initialize load_record from header
+  while payload_remaining != 0:
+    b = receive_one_byte()
+    if serial overrun:
+      reject SERIAL_OVERRUN
+      goto discard_and_resync
+    store b at destination_next
+    update checksum and counters
+    acknowledge each completed 64-byte block
+
+  load_record.state = VERIFYING
+  if checksum_so_far != expected_checksum:
+    report CHECKSUM_MISMATCH
+    goto wait_for_transfer
+
+  zero requested region
+  build task stack and arguments
+  assert handoff invariants
+  load_record.state = READY
+  handoff_to_task()        // PC commit occurs here
+\end{lstlisting}
+
+\code{handoff\_to\_task} 正常情况下不返回到下一行。它写入任务寄存器和 SP，最后通过受控
+跳转提交 PC。任务执行最外层 \code{RET} 时进入另一个固定入口
+\code{firmware\_return}，而不是回到调用点。
+
+\subsection{为什么返回入口不能沿用装入函数的普通栈帧}
+
+装入函数的局部变量位于固件栈。移交任务时，SP 已切到任务栈；任务也可以改写所有通用
+寄存器。若返回入口试图像普通函数那样从旧 SP 取局部变量，它会读错位置。固定入口必须先
+把 SP 设为固件栈顶，再通过全局固定地址找到装入记录。
+
+\begin{lstlisting}
+firmware_return:
+  SP = 0x00200000
+  load_record.state = FINISHED
+  result = read32(0x00102020)
+  send_result_frame(result)
+  reset load_record to WAITING
+  goto wait_for_transfer
+\end{lstlisting}
+
+这里 \code{0x00200000} 是 RAM 上界，固件实际第一项栈内容写在其下方。固件工作区位于
+\code{0x001f0000--0x001fffff}，任务栈止于 \code{0x001effff}，两者按软件布局分离。
+
+\subsection{结果帧为什么还要带状态}
+
+只发送四个结果字节，外部端无法区分正常结果、错误码和上一次传输残留。固件发送一个短帧：
+
+\begin{lstlisting}
+result_frame:
+  magic      = "RES1"
+  status     = OK or an error code
+  value      = valid only when status == OK
+  checksum   = checksum of preceding fields
+\end{lstlisting}
+
+本次成功帧中的 value 为 32 位整数 21，在线上按
+\code{15 00 00 00} 发送。外部端只有在完整接收并验证结果帧后，才把任务标记为成功。
+固件写 \code{TXDATA} 只是提交一个待发送字节，不等于外部端已经收到整帧。
+
+\subsection{从复位到等待下一任务的状态图}
+
+\begin{center}
+\begin{tikzpicture}[node distance=9mm and 13mm]
+\node[stage,minimum width=2.8cm] (reset) {复位初始化};
+\node[stage,minimum width=2.8cm,right=of reset] (wait) {等待头部};
+\node[stage,minimum width=2.8cm,right=of wait] (recv) {接收载荷};
+\node[stage,minimum width=2.8cm,below=13mm of recv] (verify) {验证与建栈};
+\node[stage,minimum width=2.8cm,left=of verify] (run) {任务运行};
+\node[stage,minimum width=2.8cm,left=of run] (report) {报告结果};
+\node[stage,minimum width=2.8cm,below=13mm of wait,fill=BookWarm] (reject) {报告拒绝};
+\draw[flow] (reset)--(wait);
+\draw[flow] (wait)--node[above,font=\scriptsize]{合法头部}(recv);
+\draw[flow] (recv)--node[right,font=\scriptsize]{载荷到齐}(verify);
+\draw[flow] (verify)--node[above,font=\scriptsize]{提交 PC}(run);
+\draw[flow] (run)--node[above,font=\scriptsize]{合作返回}(report);
+\draw[flow] (report.west)-| ++(-8mm,13mm) |- (wait.west);
+\draw[->,>=Latex,thick,draw=BookMuted] (wait)--(reject);
+\draw[->,>=Latex,thick,draw=BookMuted] (recv.west)-|(reject.east);
+\draw[->,>=Latex,thick,draw=BookMuted] (verify.north)-|(reject.east);
+\draw[flow] (reject)--(wait);
+\end{tikzpicture}
+\end{center}
+\diagramnote{固件能控制的转换都发生在“任务运行”之外。进入任务后，唯一正常出边是任务主动
+返回；当前机器没有从运行状态强制到达报告或等待状态的事件。}
+
+\subsection{状态图中的终止条件}
+
+等待头部没有时间上限；机器可以长期停在那里。接收载荷若外部端中途停止，当前协议也会
+无限等待，因为机器尚无可编程计时器。若希望超时拒绝，必须增加能产生时间事件的硬件和
+相应软件状态。本章不借用尚未加入的能力。
+
+任务运行同样可能没有终点。状态图不是承诺所有路径最终回到等待，而是准确标出哪些转换
+需要外部合作。正式模型必须允许停留在 \code{RECEIVING} 或任务运行状态。
+
+\subsection{一次完整成功运行中的关键数值}
+
+\begin{longtable}{|L{0.23\linewidth}|L{0.28\linewidth}|L{0.35\linewidth}|}
+\hline
+时刻 & 关键状态 & 可据此推出的事实 \\ \hline
+复位释放 & \code{PC=0x00000000} & 下一笔取指来自启动存储 \\ \hline
+头部通过 & \code{state=RECEIVING} & 地址与长度安全，内容尚未验证 \\ \hline
+载荷到齐 & \code{remaining=0} & 已写 \code{0x2100} 字节 \\ \hline
+校验通过 & \code{state=VERIFYING} & 传输内容与发送端一致 \\ \hline
+现场完成 & \code{SP=0x001efffc} & 栈顶含固件返回地址 \\ \hline
+移交提交 & \code{PC=0x00100000} & 任务开始取指 \\ \hline
+第四轮后 & \code{r4=21,r1=0} & 循环将退出 \\ \hline
+结果写回 & \code{MEM32[0x00102020]=21} & 处理器可读取结果 \\ \hline
+任务返回 & \code{PC=0x00000300} & 固件重新获得控制 \\ \hline
+结果帧到达 & 外部校验通过 & 本次任务对外完成 \\ \hline
+\end{longtable}
+
+这十个时刻覆盖了硬件起点、协议接受、内容验证、执行移交、计算效果、控制返回和外部可见。
+任意相邻两行之间都存在不能省略的动作，因此不能把它们压缩成“开机后运行程序并输出结果”。
+
+\subsection{本章方案的成本}
+
+最小方案追求边界清楚，不追求吞吐最大。处理器轮询串行接口时不能做其他工作；每个任务都
+要完整传输；任务运行时固件完全停止；结果只存在 RAM；错误通常通过复位收束。这些成本
+不是待补的一串现代名词，而是当前路径中可以指认的位置。
+
+\begin{longtable}{|L{0.23\linewidth}|L{0.29\linewidth}|L{0.34\linewidth}|}
+\hline
+当前成本 & 在路径中的原因 & 只有何时才值得改进 \\ \hline
+装入时处理器忙等 & 单槽串行接口只提供轮询状态 & 输入速度或并行工作成为问题 \\ \hline
+启动需完整传输 & RAM 断电丢失且任务不在 ROM & 需要持久保存多个任务 \\ \hline
+不能同时运行别的任务 & 只有一份当前处理器现场 & 第二任务需要取得处理器 \\ \hline
+无限循环无法收束 & 没有异步时间事件 & 必须限制任务运行区间 \\ \hline
+任意 RAM 写可破坏固件 & 物理地址没有权限 & 不可信任务需要隔离 \\ \hline
+\end{longtable}
+
+下一章首先处理第三行：在不要求任务重新从入口开始的条件下，让第二项任务获得处理器。其余
+问题继续保留，避免一次引入尚未由失败要求的结构。

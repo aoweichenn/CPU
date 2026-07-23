@@ -1,0 +1,211 @@
+\section{把装入器写成可审计的状态机}
+
+“固件接收并装入任务”仍然包含多个可能暂停或失败的阶段。若所有局部变量只散落在寄存器
+中，错误入口无法判断已经接收多少字节，也无法给出稳定诊断。固件因此在自己的 RAM 工作区
+保存一份装入记录。它不是操作系统任务对象，只代表当前这一笔传输。
+
+\subsection{字段、写入者和有效期}
+
+\begin{longtable}{|L{0.24\linewidth}|L{0.25\linewidth}|L{0.37\linewidth}|}
+\hline
+字段 & 谁在何时写入 & 后续读取目的 \\ \hline
+\code{state} & 阶段转换代码 & 限制当前允许的操作 \\ \hline
+\code{destination\_next} & 每接受一个字节后递增 & 决定下一笔 RAM 写地址 \\ \hline
+\code{payload\_remaining} & 头部建立，逐字节递减 & 判断载荷何时到齐 \\ \hline
+\code{checksum\_so\_far} & 每个已接受字节更新 & 与头部期望值比较 \\ \hline
+\code{entry\_address} & 头部验证后计算一次 & 移交时写入 PC \\ \hline
+\code{stack\_low/top} & 布局验证后计算一次 & 清零栈并设置 SP \\ \hline
+\code{error\_code} & 首个失败检测点 & 报告哪条契约被破坏 \\ \hline
+\end{longtable}
+
+装入记录从收到头部开始存在，任务入口提交前仍由固件独占。任务运行后，记录不再描述一个
+“正在接收”的事务；固定返回入口可以把它改为 \code{FINISHED}，或直接重置为
+\code{WAITING\_HEADER}。若任务永不返回，记录也不会自行变化。
+
+\subsection{允许的状态转换}
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.25\linewidth}|L{0.29\linewidth}|L{0.17\linewidth}|}
+\hline
+当前状态 & 输入事件 & 必须完成的动作 & 后继状态 \\ \hline
+\code{WAITING} & 32 字节头到齐 & 解码并验证所有范围 & \code{RECEIVING} 或
+\code{REJECTED} \\ \hline
+\code{RECEIVING} & 一个载荷字节到达 & 写 RAM、更新校验和与计数 & 保持或
+\code{VERIFYING} \\ \hline
+\code{RECEIVING} & 控制器溢出 & 记录传输错误 & \code{REJECTED} \\ \hline
+\code{VERIFYING} & 校验匹配 & 清零、建栈、建立参数 & \code{READY} \\ \hline
+\code{VERIFYING} & 校验不匹配 & 记录内容错误 & \code{REJECTED} \\ \hline
+\code{READY} & 固件决定运行 & 设置现场并提交 PC & \code{RUNNING} \\ \hline
+\code{RUNNING} & 固定返回入口获得控制 & 读取并发送结果 & \code{FINISHED} \\ \hline
+\end{longtable}
+
+状态表排除了若干非法动作：\code{WAITING} 状态不能消费载荷；\code{REJECTED} 状态不能
+跳任务入口；\code{RUNNING} 状态下固件也没有机会继续修改记录。把这些限制写入转换函数，
+比在各处检查零散布尔量更容易审计。
+
+\subsection{头部在串行线上也是字节}
+
+以修正后的映像为例，头部前 28 个字节可表示为：
+
+\begin{lstlisting}
+offset  bytes          decoded value
+00      4d 54 4b 31    magic "MTK1"
+04      20 00 00 00    header_bytes = 0x20
+08      00 21 00 00    image_bytes  = 0x2100
+0c      00 00 10 00    load_address = 0x00100000
+10      00 00 00 00    entry_offset = 0
+14      00 01 00 00    zero_bytes   = 0x100
+18      00 40 00 00    stack_bytes  = 0x4000
+1c      .. .. .. ..    checksum
+\end{lstlisting}
+
+\code{load\_address} 的四个字节为 \code{00 00 10 00}。按低有效字节在前组合后才是
+\code{0x00100000}。若固件按相反字节序解码，会得到 \code{0x00001000}，落入未映射
+区域。传输协议必须规定字节序，不能依赖发送端和处理器“碰巧相同”。
+
+\subsection{校验和覆盖什么，不能证明什么}
+
+本章采用一个教学化的 32 位逐字节滚动校验：
+
+\begin{lstlisting}
+checksum = 0
+for each payload byte b:
+  checksum = rotate_left(checksum, 5)
+  checksum = checksum XOR b
+\end{lstlisting}
+
+发送端对全部载荷计算结果并放入头部，固件按实际收到的次序重新计算。它能够高概率检测
+常见误码、丢字节和次序变化，但不是密码学签名。知道算法的人可以构造另一个产生相同校验
+值的载荷；校验通过也不能证明代码可信、没有越界指令或实现了正确算法。
+
+这里有三种不同判断：
+
+\begin{enumerate}
+\item 格式有效：头部字段可安全解释，范围没有越界；
+\item 传输一致：载荷长度和校验符合发送端给出的值；
+\item 程序可信：代码来源和行为满足安全策略。
+\end{enumerate}
+
+本章只完成前两项。当前机器没有签名验证、权限或沙箱，不能从“校验通过”推出“任务可以
+任意访问机器而没有风险”。
+
+\subsection{用失败用例检验头部验证顺序}
+
+给装入器一组具体头部，比只读正常伪代码更容易发现边界错误。
+
+\subsection{长度恰好到达上界}
+
+若 \code{load\_address=0x0017ff00}、\code{image\_bytes=0x100}、
+\code{zero\_bytes=0}，映像终点恰好为开区间上界 \code{0x00180000}，可以接受。最后一个
+有效字节地址为 \code{0x0017ffff}。
+
+若 \code{image\_bytes=0x101}，最后一个字节会落在为栈候选区保留的
+\code{0x00180000}，必须拒绝。用开区间终点计算可以避免“最后一个地址加一”再次溢出。
+
+\subsection{32 位回绕伪装成小终点}
+
+设攻击头部为：
+
+\begin{lstlisting}
+load_address = 0xfffffff0
+image_bytes  = 0x00000040
+\end{lstlisting}
+
+32 位直接相加得到 \code{0x00000030}。若装入器只检查“终点小于 RAM 上界”，会错误接受。
+正确顺序先检查起点是否位于任务区；起点检查已经失败，根本不执行可能回绕的终点判断。
+
+\subsection{入口位于零填充区}
+
+若 \code{entry\_offset=image\_bytes+4}，入口落在固件清零的区域。虽然地址属于任务 RAM，
+那里并不是发送端提供且校验过的指令，所以必须拒绝。入口条件是
+\[
+0\le\texttt{entry\_offset}<\texttt{image\_bytes},
+\]
+而不是小于 \(\texttt{image\_bytes}+\texttt{zero\_bytes}\)。
+
+\subsection{入口未对齐}
+
+\code{entry\_offset=2} 使 PC 成为 \code{0x00100002}。该地址位于载荷内部，却不满足
+教学处理器的 4 字节取指对齐，必须在移交前拒绝。若等到处理器取指才发现，错误仍可检测，
+但诊断会从“非法映像入口”退化成“处理器对齐故障”，丢失了协议层原因。
+
+\subsection{栈与映像不重叠仍可能过小}
+
+只检查栈区不重叠还不够。本章至少要预置 4 字节返回地址，因此
+\code{stack\_bytes<4} 必须拒绝。实际约定采用更大的
+\code{MIN\_STACK}，为任务的函数调用保留空间。最小值是启动协议的一部分，不由 RAM 自动
+推断。
+
+\begin{problemframe}
+\textbf{复算点。} 对
+\code{load\_address=0x00170000}、\code{image\_bytes=0x10000}，
+映像终点为 \code{0x00180000}，仍合法；若再要求
+\code{zero\_bytes=1}，则第一字节零区会进入栈候选范围，整个头部必须拒绝。
+\end{problemframe}
+
+\subsection{串行速度如何限制轮询装入器}
+
+采用常见的 8N1 串行帧时，一个数据字节在线上占 1 个起始位、8 个数据位和 1 个停止位，
+合计 10 位。若传输速率为 \(115200\) 位每秒，一个字节约每
+\[
+\frac{10}{115200}\ \mathrm{s}\approx86.8\ \mathrm{\mu s}
+\]
+到达一次。
+
+假设处理器频率为 \(10\,\mathrm{MHz}\)，两个字节到达之间约有 868 个处理器周期。固件
+读取状态、消费字节、写 RAM 和更新校验必须在这段预算内完成，或让发送端等待。若最坏路径
+需要 950 周期，平均速度看似接近，单槽控制器仍会周期性溢出。
+
+\subsection{平均成本不足以证明不会溢出}
+
+轮询循环平时可能只需 200 周期，但遇到错误报告、长 RAM 等待或其他固件工作时延迟会变大。
+不会溢出的条件约束的是两次消费之间的最长间隔，而不是平均每字节成本：
+\[
+T_{\mathrm{consume,max}} < T_{\mathrm{arrival}}.
+\]
+如果无法满足，可以选择让发送端依据硬件流量控制暂停、增加接收 FIFO，或以后引入中断和
+DMA。每种方案都会新增状态和失败模式；当前样机选择最简单的发送端应答协议。
+
+\subsection{逐块应答建立背压}
+
+外部端每发送 64 字节后等待固件返回一个确认字节。固件只有在这 64 字节全部写入 RAM 且
+未发生溢出时才确认。若返回拒绝码，外部端从整个映像开始重传。本章不实现分块恢复，因为
+那需要块编号、重复检测和部分校验等新状态。
+
+这个协议把发送速率约束反馈给发送端，称为背压。背压不提高控制器内部容量，却阻止外部端
+无限快地提交数据。即便没有操作系统，异步生产者与有限缓冲之间也已经存在同样的资源问题。
+
+\subsection{一次成功移交的详细不变量}
+
+在提交任务 PC 之前，固件逐项确认：
+
+\begin{enumerate}
+\item 装入记录状态为 \code{READY}；
+\item \code{destination\_next=load\_address+image\_bytes}；
+\item \code{payload\_remaining=0}；
+\item 实际校验值等于头部校验值；
+\item 入口位于已校验映像且满足对齐；
+\item 零填充区已经写零；
+\item 输入数组和结果槽位于任务数据范围；
+\item 栈范围与映像、固件工作区均不重叠；
+\item \code{MEM32[0x001efffc]=0x00000300}；
+\item 通用寄存器和 SP 已按启动契约设置。
+\end{enumerate}
+
+这些条件称为移交不变量：只要固件准备改变 PC，它们就必须同时成立。若检查分散在不同函数
+中，最终移交函数仍应以断言或显式返回值确认它们，而不能依赖“前面大概检查过”。
+
+\begin{center}
+\begin{tikzpicture}[node distance=8mm and 12mm]
+\node[stage,minimum width=3.2cm] (bytes) {载荷事实\\长度、终点、校验};
+\node[stage,minimum width=3.2cm,right=of bytes] (layout) {布局事实\\入口、零区、栈};
+\node[stage,minimum width=3.2cm,right=of layout] (state) {现场事实\\寄存器、SP、返回地址};
+\node[stage,minimum width=3.3cm,below=14mm of layout] (commit) {唯一提交动作\\PC 写入任务入口};
+\draw[flow] (bytes) -- (layout);
+\draw[flow] (layout) -- (state);
+\draw[flow] (bytes.south) |- (commit.west);
+\draw[flow] (layout) -- (commit);
+\draw[flow] (state.south) |- (commit.east);
+\end{tikzpicture}
+\end{center}
+\diagramnote{三组事实都成立，才允许执行控制权提交。PC 写入不是又一次“检查”，而是使任务
+开始取指的不可混淆边界。}

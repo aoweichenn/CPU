@@ -1,0 +1,162 @@
+\section{为什么四轮结束时一定得到 21}
+
+逐条 trace 能证明本次输入的实际运行结果，还可以从循环状态中提炼一个每轮都成立的关系。
+设原数组为 \(a_0,a_1,a_2,a_3\)，总元素数为 \(n=4\)，已经处理的元素数为 \(k\)。每次
+进入 \code{LOAD} 前，程序应满足：
+\[
+\begin{aligned}
+\texttt{r0} &= \texttt{array\_base}+4k,\\
+\texttt{r1} &= n-k,\\
+\texttt{r4} &= \sum_{i=0}^{k-1}a_i.
+\end{aligned}
+\]
+这个关系称为循环不变量，因为初始化建立它，每一轮保持它，退出条件再利用它推出结果。
+
+\subsection{初始化为什么建立不变量}
+
+第一轮之前 \(k=0\)。固件令 \code{r0=array\_base}、\code{r1=4}，第一条任务指令令
+\code{r4=0}。空前缀的和定义为 0，因此三个等式全部成立。这里能看出任务代码和启动约定
+共同建立初态：若固件传错 \code{r0} 或 \code{r1}，单靠 \code{MOVI r4,0} 不能修复。
+
+\subsection{一轮怎样保持不变量}
+
+假设进入第 \(k\) 轮时关系成立。\code{LOAD} 从
+\(\texttt{array\_base}+4k\) 读取 \(a_k\)，\code{ADD} 把它加入 \code{r4}；
+\code{ADDI r0,4} 令指针对应 \(k+1\)，\code{ADDI r1,-1} 令剩余数变成
+\(n-(k+1)\)。于是下一次进入循环时：
+\[
+\texttt{r4}=\sum_{i=0}^{k}a_i,
+\]
+正好是把 \(k\) 替换为 \(k+1\) 后的不变量。
+
+\subsection{退出条件怎样推出最终结果}
+
+分支不采用循环目标时 \code{r1=0}。由 \(\texttt{r1}=n-k\) 得 \(k=n=4\)，因此
+\[
+\texttt{r4}=a_0+a_1+a_2+a_3=7-2+11+5=21.
+\]
+\code{STORE} 把该值写到结果槽。这个推导还揭示零长度问题：当前代码在第一次分支检查前
+就执行装入，只有 \(n>0\) 时初始化到第一次循环入口的路径才满足预期使用条件。
+
+\begin{center}
+\begin{tikzpicture}[node distance=11mm and 16mm]
+\node[stage,minimum width=3.3cm] (init) {初始化\\\(k=0,\ r4=0\)};
+\node[stage,minimum width=3.6cm,right=of init] (body) {处理 \(a_k\)\\指针前移、计数减少};
+\node[stage,minimum width=3.3cm,right=of body] (test) {检查\\\(n-(k+1)\)};
+\node[stage,minimum width=3.4cm,below=14mm of body] (done) {退出\\\(k=n,\ r4=\sum a_i\)};
+\draw[flow] (init)--(body);
+\draw[flow] (body)--(test);
+\draw[flow] (test.north) -- ++(0,8mm) -| node[above,font=\scriptsize,pos=0.55]{仍有元素} (body.north);
+\draw[flow] (test.south) |- node[right,font=\scriptsize,pos=0.3]{计数为零} (done.east);
+\end{tikzpicture}
+\end{center}
+\diagramnote{机器 trace 给出每步具体值，不变量说明这些值为何对任意满足启动契约的非空数组
+都沿同一关系推进。}
+
+\subsection{装入一项任务需要多少次数据移动}
+
+载荷长度 \code{0x2100} 等于 8448 字节，也恰好是 132 个 64 字节块。对每个字节，串行
+控制器先把外部位收进 \code{RXDATA}；处理器读取一次 \code{RXDATA}；随后处理器向 RAM
+写入一次。仅计算有效数据移动，就有 8448 笔设备读和 8448 笔 RAM 写。
+
+状态轮询次数不固定。如果每个字节到达时固件恰好检查一次，需要至少 8448 笔
+\code{STATUS} 读；若固件检查十次才等到一个字节，状态读会增加到约 84480 笔。轮询的
+成本来自“没有数据时仍要主动读取状态”。
+
+\begin{longtable}{|L{0.23\linewidth}|L{0.24\linewidth}|L{0.37\linewidth}|}
+\hline
+动作 & 本次最少次数 & 次数由什么决定 \\ \hline
+读取 \code{RXDATA} & 8448 & 载荷字节数 \\ \hline
+写入任务 RAM & 8448 & 载荷字节数 \\ \hline
+读取 \code{STATUS} & 不少于 8448 & 到达间隔与轮询频率 \\ \hline
+发送块确认 & 132 次确认帧 & 64 字节分块规则 \\ \hline
+零填充写入 & 256 字节 & \code{zero\_bytes=0x100} \\ \hline
+建立返回地址 & 1 笔 4 字节写 & 启动栈约定 \\ \hline
+\end{longtable}
+
+这个计数没有把取指事务算入，因为固件执行每条轮询和搬运指令还要取指。即使不建立精确
+周期模型，也能看出装入成本至少与载荷长度线性增长。DMA 可以减少逐字节处理器搬运，但要
+引入描述符、缓冲所有权和完成事件；当前规模没有要求它。
+
+\subsection{确认帧不是免费的}
+
+每 64 字节等待一次确认会限制连续突发长度，也增加往返时间。若确认帧占 8 个串行字节，
+132 次确认会额外发送 1056 字节。把块增大到 256 字节可减少确认次数，却会让出错后重传
+更多数据，并要求控制器或协议容纳更长未确认区间。
+
+因此块大小不是任意常数。它在状态开销、错误恢复粒度和缓冲需求之间取舍。本章固定为
+64 字节，只为使单槽轮询方案具有明确背压点。
+
+\subsection{三个快照足以区分“装入”“运行”和“返回”}
+
+\subsection{快照一：映像已经在 RAM，但固件仍运行}
+
+\begin{lstlisting}
+load_record.state = VERIFYING
+PC = 0x00000280
+SP = 0x001ffec0
+MEM[0x00100000..0x001020ff] = received image
+task registers = not established
+\end{lstlisting}
+
+这时读取任务区域能看到完整字节，却不能说任务已运行。PC 仍在启动存储，寄存器和栈也仍
+属于固件阶段。
+
+\subsection{快照二：第一条任务指令尚未提交}
+
+\begin{lstlisting}
+load_record.state = RUNNING
+PC = 0x00100000
+SP = 0x001efffc
+r0 = 0x00102000
+r1 = 4
+r2 = 0x00102020
+\end{lstlisting}
+
+PC 已指向任务入口，下一笔取指将访问 RAM。第一条 \code{MOVI} 尚未提交，因此这个快照是
+控制权移交后的初始任务现场。
+
+\subsection{快照三：任务返回入口刚获得控制}
+
+\begin{lstlisting}
+PC = 0x00000300
+SP = 0x001f0000
+r4 = 21
+MEM32[0x00102020] = 21
+firmware SP = not restored yet
+\end{lstlisting}
+
+处理器已经进入固件地址，但返回入口的第一条初始化指令尚未执行。SP 仍表示任务栈的空栈
+位置；固件必须先建立自己的 SP，之后才能安全调用发送例程。
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.25\linewidth}|L{0.25\linewidth}|L{0.19\linewidth}|}
+\hline
+快照 & PC 所属范围 & SP 所属范围 & 当前可执行者 \\ \hline
+映像已到齐 & 启动存储 & 固件工作区 & 固件装入器 \\ \hline
+任务初始现场 & 任务 RAM & 任务栈 & 求和任务 \\ \hline
+返回入口刚进入 & 启动存储 & 任务栈上界 & 固件返回入口 \\ \hline
+\end{longtable}
+
+第三行尤其说明 PC 和 SP 不必在同一条指令边界同时“属于同一软件”。受控入口的第一项
+职责常常就是从被打断或返回方的栈切换到入口代码自己的栈。当前固定返回协议很简单，但
+已经展示了这个状态过渡。
+
+\subsection{错误码怎样对应到最早能够判断的层次}
+
+\begin{longtable}{|L{0.25\linewidth}|L{0.25\linewidth}|L{0.34\linewidth}|}
+\hline
+错误码 & 最早检测者 & 能证明的事实 \\ \hline
+\code{SERIAL\_OVERRUN} & 串行控制器/固件 & 至少一个外部字节未被消费 \\ \hline
+\code{HEADER\_INVALID} & 固件头部验证 & 字段不能形成安全布局 \\ \hline
+\code{CHECKSUM\_MISMATCH} & 固件载荷验证 & 实收载荷不同于发送端声明 \\ \hline
+\code{INVALID\_OPCODE} & 处理器译码 & PC 指向的四字节不是合法指令 \\ \hline
+\code{UNMAPPED} & 地址互连 & 一笔合法格式请求没有目标 \\ \hline
+\code{ALIGNMENT} & 处理器或互连 & 地址违反当前宽度对齐规则 \\ \hline
+\end{longtable}
+
+错误码不能相互替代。校验失败不能说明是哪条指令错误；无效操作码也不能证明串行传输损坏，
+因为发送端可能原本就提供了错误代码。诊断应报告最早被可靠观察到的契约破坏，同时保留
+PC、地址和装入阶段等上下文。
+
+经过这些计数、快照和不变量检查，本章不再依赖“任务应该可以运行”的直觉。机器的正确
+起点、数据移动量、执行结果和失败位置都能由具体状态复算。

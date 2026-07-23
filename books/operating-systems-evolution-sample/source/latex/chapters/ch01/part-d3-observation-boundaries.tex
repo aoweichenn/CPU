@@ -1,0 +1,110 @@
+\subsection{同一个“完成”对三个观察者含义不同}
+
+求和任务、固件和外部发送端处在不同位置，能够观察的事件也不同。任务在存储指令收到成功
+响应后知道结果已经进入 RAM；固件只有在任务返回后才开始读取结果；外部端则要等结果帧
+通过串行线到达并完成校验。
+
+\begin{longtable}{|L{0.21\linewidth}|L{0.28\linewidth}|L{0.35\linewidth}|}
+\hline
+观察者 & 首次能够确认的事件 & 此时仍不能推出 \\ \hline
+求和任务 & \code{STORE} 得到 \code{OK} & 固件已经运行、外部端已经收到 \\ \hline
+固件返回入口 & 重新读取结果槽得到 21 & 发送线已经传完结果帧 \\ \hline
+外部发送端 & 完整结果帧到达且校验通过 & 结果断电后仍会保留 \\ \hline
+\end{longtable}
+
+若固件在写入 \code{TXDATA} 后立即复位串行控制器，最后一个字节可能还在移位寄存器中，
+外部端收不到完整帧。因而“处理器完成设备寄存器写入”和“设备完成物理发送”也不是同一
+时刻。最小接口可以增加 \code{TX\_EMPTY} 状态，表示发送槽和移位寄存器都为空；固件在
+进入等待或复位前检查它。
+
+\textbf{硬件模型。} 发送侧除 \code{tx\_ready} 外保存移位寄存器占用状态，最后一位离开
+引脚后置 \code{tx\_empty=1}。
+
+\textbf{软件模型。} \code{STATUS} 的 bit3 暴露 \code{TX\_EMPTY}。写
+\code{TXDATA} 后该位清零，整字节发送结束后重新置位。
+
+\textbf{抽象。} 软件等待 \code{TX\_EMPTY=1}，可以依赖此前提交的字节已经离开控制器；
+这仍不保证远端正确采样或通过帧校验，端到端确认必须由远端协议提供。
+
+\begin{center}
+\begin{tikzpicture}[node distance=10mm and 13mm]
+\node[stage,minimum width=3.0cm] (store) {RAM 写完成};
+\node[stage,minimum width=3.0cm,right=of store] (return) {任务返回固件};
+\node[stage,minimum width=3.0cm,right=of return] (queue) {写入 TXDATA};
+\node[stage,minimum width=3.0cm,below=13mm of queue] (empty) {TX\_EMPTY 置位};
+\node[stage,minimum width=3.0cm,left=of empty] (remote) {远端整帧校验};
+\draw[flow] (store)--(return);
+\draw[flow] (return)--(queue);
+\draw[flow] (queue)--(empty);
+\draw[flow] (empty)--(remote);
+\end{tikzpicture}
+\end{center}
+\diagramnote{五个事件顺序发生，分别关闭计算、控制流、设备提交、物理发送和端到端接收边界。}
+
+\subsection{重新运行任务与整机复位有什么不同}
+
+固件收到下一份合法头部后，可以覆盖任务区、重建栈并再次提交入口，而不必让电源复位。
+这种重新运行保留启动存储内容和固件初始化后的设备配置，只重建与本次任务相关的状态。
+
+整机复位则把 PC 送回 \code{0x00000000}，清除处理器控制状态、串行协议状态和互连未完成
+事务。RAM 字节可能仍在，但不再被信任。两条路径的共同点是：在任务入口提交前都必须重新
+验证映像并建立现场。
+
+\begin{longtable}{|L{0.24\linewidth}|L{0.27\linewidth}|L{0.35\linewidth}|}
+\hline
+状态 & 固件重新运行任务 & 整机复位 \\ \hline
+启动存储 & 不变 & 不变 \\ \hline
+固件设备配置 & 可以沿用 & 重新初始化 \\ \hline
+RAM 旧任务字节 & 按新映像覆盖或清零 & 可能仍在，但必须视为未验证 \\ \hline
+处理器 PC/SP & 由固件直接建立新任务现场 & 先回复位入口，再执行固件 \\ \hline
+未完成串行事务 & 由协议明确丢弃和重同步 & 控制器复位后丢弃 \\ \hline
+\end{longtable}
+
+“重启程序”在当前裸机上不是硬件指令，而是一段固件流程。硬件复位提供确定的最外层恢复
+手段，固件重新运行则是较小范围的软件动作。
+
+\subsection{自修改写入说明保护不能由布局表代替}
+
+设错误任务把结果地址 \code{r2} 改成 \code{0x00100004}，即循环中 \code{LOAD} 指令的
+位置。最终 \code{STORE} 会把整数 21 的字节 \code{15 00 00 00} 写入代码。任务随后立即
+执行位于 \code{0x0010001c} 的 \code{RET}，所以本次仍可能正常回到固件。
+
+固件若不重新装入就再次从 \code{0x00100000} 运行任务，第二条指令字节已经不再是
+\code{20 05 00 00}。操作码 \code{0x15} 未定义，处理器进入
+\code{INVALID\_OPCODE} 错误入口。第一次运行的结果正确，第二次才暴露代码破坏。
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.28\linewidth}|L{0.36\linewidth}|}
+\hline
+时刻 & \code{MEM[0x00100004..07]} & 后果 \\ \hline
+装入完成 & \code{20 05 00 00} & 译码为数组装入 \\ \hline
+错误存储后 & \code{15 00 00 00} & 当前 PC 已越过此处，暂未失败 \\ \hline
+再次从入口执行 & 同上 & 第二条取指得到无效操作码 \\ \hline
+\end{longtable}
+
+地址布局告诉任务“哪里应当是代码”，RAM 和互连却没有只读规则。要阻止这种写入，机器
+需要一种把地址范围与允许操作绑定的强制机制。此处只记录失败，不提前展开地址保护；它会
+在后续机器真正需要隔离时成为新的演进问题。
+
+\subsection{本章事实之间的最终依赖关系}
+
+\begin{center}
+\begin{tikzpicture}[node distance=9mm and 13mm]
+\node[stage,minimum width=3.2cm] (reset) {复位入口可靠};
+\node[stage,minimum width=3.2cm,right=of reset] (fw) {固件能够执行};
+\node[stage,minimum width=3.2cm,right=of fw] (load) {映像可验证装入};
+\node[stage,minimum width=3.2cm,below=13mm of load] (state) {初始现场完整};
+\node[stage,minimum width=3.2cm,left=of state] (run) {任务逐指令推进};
+\node[stage,minimum width=3.2cm,left=of run] (result) {结果返回并报告};
+\draw[flow] (reset)--(fw);
+\draw[flow] (fw)--(load);
+\draw[flow] (load)--(state);
+\draw[flow] (state)--(run);
+\draw[flow] (run)--(result);
+\end{tikzpicture}
+\end{center}
+\diagramnote{每个方框都依赖前一个方框已经建立的状态。缺少任意一环，都不能从“字节存在”
+直接推出“任务完成”。}
+
+至此，最小机器的器件、连接、软件接口、启动协议、执行 trace 和错误边界均已落到具体状态。
+后续章节可以把这台机器作为已知起点，而不必再次把“处理器能够执行一项任务”当作未经证明
+的前提。
