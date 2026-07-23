@@ -1,0 +1,67 @@
+\section{从度量启动到远程证明}
+
+TPM 的 PCR 能记录启动链，密钥封存能在本机根据 PCR 决定是否释放秘密，但远端服务无法直接读取并信任一组普通软件返回的数值。\term{远程证明}{remote attestation}要建立另一条证据链：验证者提供一次性挑战，TPM 对选定 PCR、挑战和附加状态签名，平台同时提供启动事件日志，验证者重算 PCR 并按策略判断这台机器是否处于可接受状态。\cite{tpm20-architecture}
+
+\topic{度量、验证和证明是三个不同动作}
+
+\term{度量启动}{measured boot}在每一级交接前计算下一阶段的摘要，把事件记录进日志，并对相应 PCR 执行 extend。它回答“启动时记录了什么”。Secure Boot 验证签名并决定代码是否允许执行，回答“是否符合本机启动策略”。远程证明则把受 TPM 密钥保护的当前 PCR 状态交给另一主体判断，回答“远端能否相信这份状态来自目标 TPM，而且针对本次询问”。
+
+三者可以组合，但不能相互替代。系统可能允许一个经过签名的旧固件启动，因此 Secure Boot 成功而远端策略仍拒绝；系统也可能度量一段未签名的开发固件，使 PCR 如实变化，但这不表示该固件被信任。证明只说明测量值与身份链符合所声明的事实，不证明被测程序没有逻辑漏洞，也不保证证明完成后的运行状态永不改变。
+
+\topic{Quote 用 nonce 把证据绑定到本次会话}
+
+验证者先产生不可预测的 nonce，并指定要证明的 PCR 集合与哈希算法。平台把请求交给 TPM，TPM 读取当前 PCR，形成 quote 数据，并用\term{证明密钥}{Attestation Key, AK}签名。返回包至少包含 quote、签名、AK 的身份或证书链以及事件日志。验证者先验证 AK 的可信来源与签名，再核对 quote 中的 nonce，随后按日志顺序重新执行每次 extend，确认重算结果与 quote 中 PCR digest 一致。
+
+nonce 是新鲜性边界。若没有 nonce，攻击者可以保存一份旧固件处于合格状态时的 quote，在机器已进入异常状态后反复重放。nonce 不需要写进 PCR；它被包含在本次签名的 quote 数据中即可。验证者还要让 nonce 一次性使用并设置会话期限，否则“随机值存在”仍不能阻止同一证明包在策略窗口内被重复接受。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 上排为挑战，下排为证据返回；TPM 与事件日志分开，避免把日志误作可信签名状态。
+  \node[hw control, minimum width=2.7cm, align=center] (verifier) at (0.9,3.75)
+    {远端验证者\\nonce + PCR 选择};
+  \node[hw state, minimum width=2.7cm, align=center] (agent) at (4.55,3.75)
+    {平台证明代理\\转发请求};
+  \node[hw compute, minimum width=2.8cm, align=center] (tpm) at (8.35,3.75)
+    {TPM\\读取 PCR\\AK 签署 Quote};
+  \draw[hw bus] (verifier) -- (agent);
+  \draw[hw bus] (agent) -- (tpm);
+
+  \node[hw memory, minimum width=2.8cm, align=center] (log) at (8.35,1.25)
+    {启动事件日志\\组件摘要与顺序};
+  \node[hw control, minimum width=2.9cm, align=center] (replay) at (4.55,1.25)
+    {验证者重放 extend\\重算 PCR digest};
+  \node[hw state, minimum width=2.7cm, align=center] (policy) at (0.9,1.25)
+    {策略结论\\允许、隔离或恢复};
+  \draw[hw return] (tpm.south) -- (8.35,2.45) -- (agent.south east);
+  \draw[hw return] (log) -- (replay);
+  \draw[hw return] (agent.south west) -- (5.95,2.45) -- (replay.north east);
+  \draw[hw return] (replay) -- (policy);
+\end{pdfdiagram}
+\diagramnote{远程证明的两类证据。Quote 由 TPM 签名，保护 PCR 摘要和本次 nonce；事件日志通常位于普通内存或固件存储中，本身可以被篡改，但篡改后的重放结果无法与签名保护的 PCR digest 对上。验证完成的可见结果是策略结论，不是 TPM 自动把机器判为“安全”。}
+
+\topic{事件日志负责解释，PCR 负责约束日志}
+
+PCR 的字节数很小，不可能保存每个固件组件、配置项和启动驱动的完整列表。事件日志保存“测量了哪个对象、使用哪个摘要、扩展到哪个 PCR、顺序是什么”；PCR 则把这串可变长记录压缩成难以伪造的最终状态。验证者不能只把 PCR 值与一张固定白名单逐字节比较，因为固件更新、启动顺序和可选设备都可能产生合法差异；更稳健的策略是先验证事件结构，再按组件身份、版本、撤销状态和配置建立允许集合。
+
+日志缺项与日志伪造的结果相似：重放得到的 digest 与 quote 不符。此时不能简单把“PCR 不匹配”解释为恶意攻击，还要区分日志截断、哈希算法选择错误、事件顺序解析错误和确实存在的未知组件。证明系统应保留原始 quote、证书链、事件日志、验证策略版本与时间，才能在拒绝后给出可复现的诊断。
+
+\topic{固件升级需要策略版本与恢复通路}
+
+设平台升级 UEFI，新的固件摘要使 PCR 改变。若磁盘密钥只封存在旧 PCR 值下，升级后的第一次启动可能无法解密；若远端只接受旧事件清单，新版本也会被隔离。安全升级应在旧环境仍可信时完成四件事：验证新镜像签名与撤销状态；把新度量值加入带版本的允许策略；为本地封存准备新旧策略的过渡授权或恢复密钥；升级后重新证明，并在新状态确认后撤销旧策略。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.28\linewidth}L{0.17\linewidth}}
+\toprule
+检查边界 & 验证的事实 & 失败时不能继续推断 & 恢复证据 \\
+\midrule
+AK 身份链 & Quote 来自被接受的 TPM 身份或受认可的注册过程 & 该设备当前运行合格软件 & AK 证书、注册记录与撤销状态 \\\tablerowrule
+Quote 签名与 nonce & PCR 摘要未被软件改写，且响应属于本次挑战 & 事件日志内容完整、组件符合策略 & 原始 Quote、nonce 使用记录与时间窗 \\\tablerowrule
+事件日志重放 & 日志顺序能重算出签名保护的 PCR digest & 每个事件都在允许集合中 & 原始事件、算法与解析器版本 \\\tablerowrule
+组件策略 & 固件、配置和撤销状态满足当前策略版本 & 运行期没有后续漏洞或物理攻击 & 策略版本、允许清单与安全公告 \\\tablerowrule
+秘密释放 & 本次身份、状态与用途均满足授权条件 & 秘密会在未来状态变化后自动回收 & 短期凭据、重新证明和吊销流程 \\
+\bottomrule
+\end{longtable}
+
+\topic{证明后的秘密应短期化并绑定用途}
+
+验证通过后，服务可以发放短期网络凭据、解密某个工作负载密钥，或允许机器进入生产集群。长期主密钥不宜直接交给被证明平台；更安全的做法是返回用途受限、时间有限、可吊销的派生凭据，并要求周期性重新证明。这样，固件撤销、设备丢失或策略升级发生后，验证者可以停止续签，而不必假设第一次 quote 永久代表机器状态。
+
+远程证明的最终边界不是“得到一份签名”，而是建立一条可审计决策：谁提出了新鲜挑战，哪颗 TPM 对哪些 PCR 签名，日志如何解释这些 PCR，哪个策略版本接受了哪些组件，释放了什么权限，以及拒绝或升级时怎样恢复。只有这些状态共同闭合，TPM 才从一颗密码芯片变成平台信任根的一部分。

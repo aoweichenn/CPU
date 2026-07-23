@@ -259,3 +259,15 @@
 | 第 19 章 | L0/L1/L2 嵌套虚拟化、控制结构合成、嵌套退出路由、两级第二阶段翻译、脏页追踪、预复制、停机交接与单一所有权 | verified |
 | 第 21 章 | 多插槽拓扑发现、MADT/SRAT/SLIT/HMAT、远端内存上线、逐插槽核心发布、CPU offline、物理热移除与失败回滚 | verified |
 | 第 21 章 | EVT/DVT/PVT 阶段门、EMC 预扫与认证、首过良率、测试覆盖、失效证据链、根因修正与量产版本闭环 | verified |
+
+## 2026-07 现代存储、证明、老化与片上追踪深化批次
+
+本批次补齐四条高级机制链：主机怎样通过 ZNS/FDP 参与 SSD 数据放置，NVMe 队列怎样跨 fabric 并在 ANA 多路径切换中保持单一所有权，TPM 度量怎样通过带新鲜挑战的 Quote 成为远程可验证证据，器件与封装怎样从长期应力走到现场故障，以及片上 trace 怎样受过滤、缓冲、时间同步和安全权限约束。只增加正文、机制图、算例和正文表格，不增加章末练习，也不改变既有迁移单元归属。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 14 章 | ZNS zone 状态、写指针、Zone Append、Reset/恢复、FDP 的 RU/RG 与放置标识 | verified |
+| 第 16 章 | NVMe-oF 的命令/数据/完成边界、RDMA/TCP 传输、ANA、多路径切换与持久化 | verified |
+| 第 19 章 | TPM Quote、nonce、AK、事件日志重放、策略版本、秘密释放与升级恢复 | verified |
+| 第 22 章 | EM、BTI、HCI、TDDB、热循环、加速寿命试验、降额与现场维护闭环 | verified |
+| 第 26 章 | PMU、Intel PT/CoreSight、trace source/fabric/sink、缓冲溢出、时间同步与跨层定位 | verified |

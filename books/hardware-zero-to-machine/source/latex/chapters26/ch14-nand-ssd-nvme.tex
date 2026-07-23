@@ -1451,6 +1451,98 @@ NVMe & PCIe、多队列、深度在途 & CQ 完成项与阶段位 & 队列/门�
 磁带把数据沿长带顺序记录。驱动器装载卷、穿带、寻找文件标记，再以稳定带速持续读写；达到连续传输后吞吐可以很高，但随机定位需要机械走带，时延以秒甚至分钟计。上层常把大量小文件先打包成大对象，并维护独立目录或索引，避免逐文件往返定位。
 
 磁带机仍通过 SAS、Fibre Channel 或网络库控制器接入主机，但块请求不能掩盖顺序介质的事实。若主机供数速度低于磁带稳定写入速度，驱动器可能停带、回退并重新加速，反复启停会降低吞吐和机械寿命。因此备份系统要以足够大的缓冲和并行读取维持连续数据流；完成语义还要区分数据进入驱动器缓存、写到磁带以及卷被卸载并登记三个边界。
+\section{七、主机参与数据放置：ZNS 与 FDP}
+
+传统 SSD 向主机提供任意覆盖的 LBA 空间，FTL 独自决定逻辑页放到哪一组 NAND block。这个接口容易使用，却隐藏了一个代价：主机认为彼此无关、寿命不同的数据可能混入同一擦除单元；其中一部分失效后，垃圾回收仍要搬走其余有效页。ZNS 与 FDP 都让主机向控制器提供更多放置信息，但两者公开的契约不同：ZNS 公开顺序写入的区域，FDP 保留普通随机写接口，只公开可回收单元与放置标识。\cite{nvme-zns-fdp}
+
+\topic{ZNS 把命名空间拆成带写指针的区域}
+
+\term{分区命名空间}{Zoned Namespace, ZNS}把连续 LBA 范围划成多个 zone。顺序写 zone 内部维护一个写指针（write pointer，WP）：普通写必须从当前 WP 开始，成功后 WP 按实际写入的逻辑块数前移。已经写过的位置不能直接覆盖；主机要重写该区域，必须先迁走仍需保留的数据，再执行 Zone Reset，使整个 zone 回到 Empty 状态。
+
+zone 同时具有容量与大小。zone size 决定下一个 zone 的起始 LBA，zone capacity 决定本 zone 实际允许写入的 LBA 数；两者可能不同，因此主机不能把 size 与 capacity 之间的尾部空洞当作可写空间。控制器还可能限制同时 active 和 open 的 zone 数量。主机即使有大量独立写流，也必须先建立配额账本，关闭暂时不用的 zone 后才能打开新的 zone。
+
+\begin{longtable}{L{0.18\linewidth}L{0.24\linewidth}L{0.28\linewidth}L{0.20\linewidth}}
+\toprule
+zone 状态 & 写指针与资源 & 允许的主要动作 & 离开该状态的边界 \\
+\midrule
+Empty & WP 在 zone 起点；未占用 active 配额 & 首次写、显式打开 & 首次写被接受后进入 Open \\\tablerowrule
+Implicit/\allowbreak Explicit Open & WP 指向下一个可写 LBA；占用 open 与 active 配额 & 从 WP 顺序写、Zone Append、关闭、完成 & 写满、Close 或 Finish 完成 \\\tablerowrule
+Closed & 保留已写数据与 WP；不占 open 配额，仍占 active 配额 & 重新打开、读取、Finish、Reset & Open/\allowbreak Finish/\allowbreak Reset 命令完成 \\\tablerowrule
+Full & WP 到达容量末端；数据只读 & 读取、Reset & Reset 完成并回到 Empty \\\tablerowrule
+Read Only / Offline & 介质或管理状态不再接受正常写入 & 查询、受限读取或管理恢复 & 由控制器规定的恢复或下线流程决定 \\
+\bottomrule
+\end{longtable}
+
+\topic{Zone Append 把并发分配交给控制器}
+
+多个 CPU 若都先读取 WP，再各自向同一 LBA 发普通写，会产生竞争。Zone Append 改为“向这个 zone 追加这些逻辑块”：命令给出 zone 起点和数据长度，控制器原子地选择实际起始 LBA、推进 WP，并在完成项中返回被分配的 LBA。完成之前，主机不能仅凭提交顺序猜测每笔数据的位置；乱序完成时必须用 CID 找回原请求，再把完成项返回的 LBA 写入上层索引。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 上排发布两笔追加，下排按控制器决定的地址返回；走线分层避免交叉。
+  \node[hw state, minimum width=2.35cm, align=center] (a) at (0.9,3.55) {CPU 0\\Append A，8 LBA};
+  \node[hw state, minimum width=2.35cm, align=center] (b) at (0.9,1.85) {CPU 1\\Append B，4 LBA};
+  \node[hw control, minimum width=2.8cm, minimum height=1.9cm, align=center] (ctrl) at (4.65,2.7)
+    {NVMe 控制器\\串行化 WP 分配\\检查 open/active 配额};
+  \draw[hw bus] (a) -- (ctrl.north west);
+  \draw[hw bus] (b) -- (ctrl.south west);
+
+  \node[hw memory, minimum width=2.7cm, align=center] (zone) at (8.55,2.7)
+    {Zone 7\\旧 WP=1000\\A 占 1000--1007\\B 占 1008--1011};
+  \draw[hw bus] (ctrl) -- (zone);
+
+  \node[hw state, minimum width=2.45cm, align=center] (ca) at (12.0,3.55) {完成 A\\实际 LBA=1000};
+  \node[hw state, minimum width=2.45cm, align=center] (cb) at (12.0,1.85) {完成 B\\实际 LBA=1008};
+  \draw[hw return] (zone.north east) -- (ca.west);
+  \draw[hw return] (zone.south east) -- (cb.west);
+\end{pdfdiagram}
+\diagramnote{同一 zone 上的两笔 Zone Append。控制器把“选择实际 LBA 与推进写指针”做成一个原子分配动作；完成项返回的位置才是上层可以提交到索引的地址。若 A 的完成晚于 B，上层仍按各自 CID 和返回 LBA 建立映射，不能按完成先后重新排列数据身份。}
+
+一次追加的边界可以分成四层：SQ doorbell 只发布命令；控制器接受命令后才预留 WP 范围；CQ 成功项公布实际 LBA 并表示数据达到 NVMe 命令定义的完成点；需要掉电后保留时，还要遵守 FUA、Flush 和设备断电保护的持久化契约。若追加超时，主机不能自行把 WP 回退，因为控制器可能已经写入介质而完成项只是在返回途中丢失。恢复时应先查询 zone report，核对 WP 与上层日志，再决定重放、填充空洞或废弃整个 zone。
+
+\topic{FDP 用放置标识隔离不同寿命的数据}
+
+\term{灵活数据放置}{Flexible Data Placement, FDP}不要求主机顺序写 zone。设备把物理非易失容量组织为\term{回收单元}{Reclaim Unit, RU}，若一个 RU 内的有效数据全部失效，该 RU 可以独立擦除或重新使用而不搬动其他 RU。若干 RU 组成 Reclaim Group（RG）；主机通过 Placement Identifier 或 Placement Handle 给写命令附上放置意图，控制器再把具有相近寿命的数据导向合适的 RU。
+
+例如数据库可以给“短寿命临时文件”“持续追加日志”和“长期不变索引”分配不同 placement。逻辑地址仍可随机更新，读路径仍按普通 LBA 工作；区别发生在控制器选择物理落点时。临时数据集中失效后，对应 RU 更可能整体回收，从而减少搬移长期数据的内部写放大。placement 只是提示与资源契约，不是物理地址：主机不能由某个标识推导 NAND die、channel 或 page，也不能假定两次使用同一标识必然落入同一个 RU。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.7cm, align=center] (hot) at (0.8,4.0) {短寿命写流\\临时对象};
+  \node[hw state, minimum width=2.7cm, align=center] (warm) at (0.8,2.35) {中等寿命写流\\追加日志};
+  \node[hw state, minimum width=2.7cm, align=center] (cold) at (0.8,0.7) {长寿命写流\\索引与元数据};
+
+  \node[hw control, minimum width=3.0cm, minimum height=2.4cm, align=center] (map) at (5.0,2.35)
+    {FDP 放置控制\\PID/Handle\\配额与 RU 状态};
+  \draw[hw bus] (hot) -- (map.north west);
+  \draw[hw bus] (warm) -- (map.west);
+  \draw[hw bus] (cold) -- (map.south west);
+
+  \node[hw memory, minimum width=2.55cm, align=center] (ru0) at (9.15,4.0) {RU 0\\短寿命页集中};
+  \node[hw memory, minimum width=2.55cm, align=center] (ru1) at (9.15,2.35) {RU 1\\日志页集中};
+  \node[hw memory, minimum width=2.55cm, align=center] (ru2) at (9.15,0.7) {RU 2\\长期页集中};
+  \draw[hw bus] (map.north east) -- (ru0);
+  \draw[hw bus] (map.east) -- (ru1);
+  \draw[hw bus] (map.south east) -- (ru2);
+
+  \node[hw control, minimum width=2.45cm, align=center] (reclaim) at (12.35,4.0) {失效集中后\\整 RU 回收};
+  \draw[hw return] (ru0) -- (reclaim);
+\end{pdfdiagram}
+\diagramnote{FDP 的作用位置。主机只为写流附加寿命或租户维度的 placement，控制器仍拥有逻辑到物理映射；当短寿命数据集中失效时，RU 可以少搬或不搬长期数据便完成回收。完成项仍按普通 NVMe 队列返回，放置成功不等于数据已经持久化。}
+
+\topic{ZNS 与 FDP 解决同一问题，但不能混用完成语义}
+
+\begin{longtable}{L{0.18\linewidth}L{0.24\linewidth}L{0.24\linewidth}L{0.24\linewidth}}
+\toprule
+比较项 & 传统块命名空间 & ZNS & FDP \\
+\midrule
+主机写入约束 & 任意 LBA 覆盖 & zone 内从 WP 顺序写；重写前 Reset & 仍可随机写；为写命令附加 placement \\\tablerowrule
+主机维护的新增状态 & 普通块映射与持久化顺序 & zone 状态、WP、open/active 配额 & placement、RU/RG 配额与回收信息 \\\tablerowrule
+控制器保留的职责 & 完整 FTL、GC 与介质管理 & 介质管理仍在设备内；主机不直接管理 NAND & 逻辑到物理映射与实际 RU 选择仍在设备内 \\\tablerowrule
+并发提交边界 & CID 与普通 CQ 状态 & Zone Append 完成项还返回实际 LBA & CQ 返回普通写状态；placement 不改变 LBA \\\tablerowrule
+恢复时的关键证据 & 未完成命令、日志与 Flush 状态 & zone report、WP、追加日志和完成项 & RU 使用情况、placement 配置和普通写日志 \\
+\bottomrule
+\end{longtable}
+
+两类接口都以减少写放大和尾延迟为目标，却把复杂度放在不同位置。ZNS 适合本来就能按段追加、整段回收的数据结构；FDP 适合仍需要随机 LBA 语义、但能够区分数据寿命或租户的数据结构。选择接口之前，应先确认上层能否在崩溃恢复时重建额外状态，而不是只比较顺序写带宽。
 
 \section*{章末练习}
 

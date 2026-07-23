@@ -1043,6 +1043,84 @@ P_{\mathrm{new}}
 \approx 8.0\times10^4\ \mathrm{s}\approx22.2\ \mathrm{h}.
 \]
 实际还要与前台 I/O 共享磁盘、互连和校验计算资源，重建可能持续数天。在此期间阵列已经用完一次容错能力，任何第二盘失效或幸存盘上不可恢复读错都可能让部分条带无法重建。提高重建优先级能缩短暴露时间，却会增加用户请求尾延迟和设备温度；降低优先级则相反。可靠性策略必须同时记录重建速率、剩余时间、介质错误计数、温度与前台服务目标，而不能只显示“正在重建”。
+\section{十三、NVMe over Fabrics：把本地队列延伸到远端控制器}
+
+本地 NVMe 把 SQ、CQ 和数据缓冲放在主机 DRAM，控制器通过 PCIe DMA 访问这些结构。\term{NVMe over Fabrics}{NVMe-oF}保留“命令、队列对、CID、完成状态和命名空间”这套上层模型，却把传输边界改成 RDMA、TCP 或 Fibre Channel 等 fabric。主机不再允许远端控制器任意读取本机物理内存；传输层必须把命令 capsule、数据和 completion 按各自协议搬过网络。\cite{nvme-of}
+
+\topic{连接建立先于 I/O 队列所有权}
+
+主机先发现一个 NVMe subsystem 的传输地址，建立 fabric 连接，并通过 Connect 命令创建管理队列。完成控制器识别、属性读取和命名空间发现后，主机才建立一个或多个 I/O queue pair。每条连接都有队列身份、深度、超时和控制器关联；网络 socket 或 RDMA queue pair 建立成功，只表示传输通道可用，不表示 NVMe 控制器已经接受对应 I/O 队列。
+
+NVMe/TCP 把命令、响应与数据组织为带长度和校验边界的 PDU。写操作可以由主机发送命令后继续发送数据，也可以由控制器先请求特定数据范围；读操作则由控制器返回数据，再给出命令完成。RDMA 传输可以使用已注册内存，让远端控制器通过受权限约束的 RDMA Read/Write 搬运数据。注册键相当于临时访问能力：命令结束、连接失效或缓冲区回收时必须撤销，不能把一次映射永久留给远端设备。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 三层水平布局分别表示主机、fabric 和远端子系统。
+  \node[hw state, minimum width=2.55cm, align=center] (req) at (0.7,4.0) {块请求\\tag 与缓冲区};
+  \node[hw control, minimum width=2.75cm, align=center] (hostq) at (4.0,4.0) {NVMe 主机\\I/O queue pair};
+  \draw[hw bus] (req) -- (hostq);
+
+  \node[hw block, minimum width=3.0cm, minimum height=1.9cm, align=center] (fabric) at (7.7,2.65)
+    {RDMA / TCP fabric\\命令 capsule\\数据与完成 PDU};
+  \draw[hw bus] (hostq.south east) -- (6.0,4.0) -- (fabric.north west);
+
+  \node[hw control, minimum width=2.75cm, align=center] (ctrl) at (11.35,4.0) {远端控制器\\CID 与命名空间};
+  \node[hw memory, minimum width=2.75cm, align=center] (media) at (11.35,1.25) {SSD / 阵列介质\\缓存与持久化域};
+  \draw[hw bus] (fabric.north east) -- (9.45,4.0) -- (ctrl.south west);
+  \draw[hw bus] (ctrl) -- (media);
+
+  \node[hw state, minimum width=2.55cm, align=center] (done) at (0.7,1.25) {主机完成\\状态与残余长度};
+  \draw[hw return] (media.west) -- (7.7,1.25) -- (fabric.south);
+  \draw[hw return] (fabric.west) -- (4.0,1.25) -- (done);
+\end{pdfdiagram}
+\diagramnote{一笔 NVMe-oF I/O 的三个所有权域。主机队列发布请求，fabric 只负责按 RDMA/TCP 契约传递命令和数据，远端控制器才解释命名空间并访问介质。网络 ACK、RDMA completion 和 NVMe CQ completion 属于不同层级；只有最后一项能结束 NVMe 命令，持久化还要满足 FUA/Flush 语义。}
+
+\topic{传输完成、命令完成与持久化完成必须分开}
+
+TCP 确认表示字节已经由对端协议栈接收，RDMA 本地 completion 表示工作请求达到该传输操作的完成条件；两者都不能证明远端 NVMe 命令已经成功。控制器可能在接收全部写数据后报告介质错误，也可能把数据放入易失缓存后返回普通成功。主机只有收到带匹配 CID 的 NVMe completion，才能结束命令；若上层要求掉电后可见，还必须使用设备声明支持的 FUA 或 Flush，并把远端阵列内部复制、缓存和电源保护纳入持久化域。
+
+超时最困难的情况是“结果未知”：主机没有收到 completion，但远端控制器可能已经执行写入。对普通覆盖写，重试通常仍需依赖上层幂等性和顺序日志；对带外部副作用的管理命令，不能把超时直接解释为失败。安全恢复要保留请求身份和连接 generation，先确定旧连接是否仍可能返回数据，再在新连接上查询状态或按协议重放。
+
+\section{十四、ANA、多路径与无双主切换}
+
+同一 namespace 可以通过多个控制器和多条 fabric 路径到达。多路径的价值不只是提高带宽，更重要的是在链路、端口或控制器故障时维持单一 I/O 语义。主机要区分“TCP 连接还在”“控制器仍响应 Keep Alive”“该 namespace 经这条路径仍可访问”三个状态。
+
+\term{非对称命名空间访问}{Asymmetric Namespace Access, ANA}给每个路径组报告访问状态。Optimized 表示当前路径适合正常 I/O；Non-Optimized 仍可访问，但可能多经过一次内部转发；Inaccessible 暂时不能访问；Persistent Loss 表示路径不会自行恢复；Change 表示状态正在迁移。状态改变事件只触发重新读取 ANA 日志，不能直接替主机完成所有未决请求。
+
+\begin{longtable}{L{0.18\linewidth}L{0.24\linewidth}L{0.29\linewidth}L{0.19\linewidth}}
+\toprule
+观测事件 & 能确认的事实 & 不能立即确认 & 主机下一步 \\
+\midrule
+Keep Alive 成功 & 控制器管理路径仍能响应 & 某 namespace 的数据路径最优或可用 & 继续结合 ANA 与 I/O 完成判断 \\\tablerowrule
+ANA Non-Optimized & namespace 仍可经该路径访问 & 性能、内部转发距离与持久化域相同 & 可继续或迁往 Optimized 路径 \\\tablerowrule
+连接超时 & 当前传输路径无进展 & 未完成写一定未执行 & 冻结该路径，隔离迟到完成并选择替代路径 \\\tablerowrule
+ANA Persistent Loss & 该路径不会按普通状态迁移自动恢复 & 其他控制器也不可访问 namespace & 撤销该路径资源，检查其余路径 \\\tablerowrule
+新路径 I/O 成功 & 新控制器可完成新请求 & 旧路径没有迟到数据或完成 & 依 generation 拒绝旧事件并核对写顺序 \\
+\bottomrule
+\end{longtable}
+
+\topic{一次安全故障切换的状态链}
+
+假设路径 A 上有 64 笔 outstanding I/O，随后 Keep Alive 和 I/O 同时超时。主机先停止向 A 提交新命令，把 A 的 queue pair 标为 quiescing，并保存每笔请求的 CID、写入范围和持久化要求。随后撤销或失效 A 使用的传输资源，确保旧 RDMA key、socket 和 completion 不会被新队列复用。主机读取路径 B 的 ANA 状态；只有 B 对目标 namespace 可访问，才为 B 建立新 generation 的队列。
+
+未完成的读可以在新缓冲区上重发，因为旧路径仍可能迟到写入原缓冲区。未完成的写则要按上层日志和幂等规则分类：从未发布的数据可以直接重发；执行结果未知的写要保留原顺序与事务身份；已经收到 NVMe 成功但尚未满足持久化屏障的写仍不能宣称落盘。新路径返回成功后，主机还要拒绝路径 A 的迟到 completion，并验证旧写不会覆盖已经转作他用的内存。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.6cm, align=center] (run) at (0.7,3.0) {路径 A 运行\\generation 12};
+  \node[hw control, minimum width=2.6cm, align=center] (freeze) at (3.85,3.0) {超时：冻结提交\\保存 64 笔身份};
+  \node[hw control, minimum width=2.6cm, align=center] (isolate) at (7.0,3.0) {隔离 A\\撤销 key / 队列};
+  \node[hw state, minimum width=2.6cm, align=center] (ana) at (10.15,3.0) {读取 B 的 ANA\\确认可访问};
+  \node[hw state, minimum width=2.6cm, align=center] (resume) at (13.3,3.0) {路径 B 重建\\generation 13};
+  \draw[hw bus] (run) -- (freeze);
+  \draw[hw bus] (freeze) -- (isolate);
+  \draw[hw bus] (isolate) -- (ana);
+  \draw[hw bus] (ana) -- (resume);
+
+  \node[hw label, text width=12.2cm, align=center] at (7.0,1.15)
+    {恢复验收：读使用新缓冲区；结果未知的写按日志重放；B 的 completion 只匹配 generation 13；A 的迟到数据与完成均被隔离；最后核对 Flush/FUA 所定义的持久化顺序。};
+\end{pdfdiagram}
+\diagramnote{多路径切换不是把指针从 A 改到 B，而是一次所有权迁移。旧传输资源先失效，新路径状态随后确认，最后才用新 generation 恢复 I/O；这样才能避免双主、CID 复用和迟到 DMA 污染。}
+
+NVMe-oF 把设备放远了，但没有改变本书反复使用的判断方法：传输层负责把消息送到，NVMe 层负责把完成归属于命令，上层负责决定结果能否重试，持久化协议负责决定掉电后是否可见。任何“网络通了所以存储完成”的推断都跨越了尚未验证的边界。
 
 \section*{章末练习}
 

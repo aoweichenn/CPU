@@ -2518,6 +2518,143 @@ GPU 处理 & CPU 队列到 GPU 和显存 & 结果写入先于 fence 完成可见
 全书所有机制最终都可以归入七个问题：输入是什么，状态在哪里，数据走哪条路，控制为何这样选择，哪个边界使结果可见，失败如何返回，以及用什么证据证明恢复。能沿一次真实程序逐层回答这七问，就已经建立了从器件到整机的软件可见硬件通路。
 \end{keyidea}
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{十、片上追踪：在不停止机器时保存执行证据}
+
+示波器和逻辑分析仪观察引脚与少量可达信号，断点调试器让处理器停在某个状态，性能计数器累计事件数量。现代整机还需要第四种观测方式：处理器和互连在运行中把选定事件编码成 trace packet，经过片上缓冲或 trace fabric 输出，事后再还原执行时间线。它能回答“控制流怎样走到故障点”，却受到带宽、缓冲容量、时间同步和安全权限的严格限制。
+
+\topic{PMU 计数、采样与控制流追踪回答不同问题}
+
+\term{性能监控单元}{Performance Monitoring Unit, PMU}把 Cache miss、分支误预测、周期和退休指令等事件接到可编程计数器。只读计数器差值能给出时间窗口内的总量；设置溢出阈值后，PMU 可以每累计若干事件触发一次采样，记录当时 PC 与部分上下文。采样能估计热点分布，但没有记录样本之间的每次控制转移。
+
+Intel Processor Trace（Intel PT）和 Arm CoreSight ETM 一类硬件则在控制流发生变化时产生压缩 packet，并周期性插入同步、上下文或时间信息。解码器结合程序二进制、装载地址、进程/虚拟机上下文和 packet，可以重建大量已执行分支。\cite{intel-pt}\cite{arm-trace} 这类 trace 通常不等于“记录每条指令的全部数据”：普通 load/store 的数值和每次 Cache 状态变化往往不在 packet 中，仍需借助数据断点、PMU 事件、软件标记或总线 trace。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+观测机制 & 直接保存的事实 & 能回答的问题 & 不能单独证明 \\
+\midrule
+PMU 计数 & 时间窗内的事件总数 & miss 是否增加、IPC 为何下降 & 哪一条具体路径造成每次事件 \\\tablerowrule
+PMU 采样 & 周期性或事件溢出时的 PC/上下文 & 热点与事件概率分布 & 两个样本之间的完整顺序 \\\tablerowrule
+控制流 trace & 分支结果、目标、同步和上下文 packet & 指令路径、异常前控制流与时间近似关系 & 普通数据值、所有微架构内部状态 \\\tablerowrule
+软件 tracepoint & 程序显式记录的状态与请求 ID & 跨软件层语义和所有权变化 & 标记前后硬件是否按预期执行 \\\tablerowrule
+互连/设备 trace & TLP、队列、错误或链路事件 & 请求是否到达、完成在哪层停止 & CPU 软件为什么发起该请求 \\
+\bottomrule
+\end{longtable}
+
+\topic{trace source、路由、sink 和解码器组成独立数据通路}
+
+处理器核、互连、固件微控制器和设备都可以是 trace source。过滤器先按地址范围、特权级、上下文或事件选择要记录的内容；packetizer 把事件压缩并插入同步标记；片上 trace fabric 仲裁多个来源；sink 可以是环形 SRAM、写入主存的 DMA 缓冲或外部 trace port。最后，离线解码器用对应版本的二进制与映射恢复时间线。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.45cm, align=center] (cpu) at (0.7,4.05) {CPU 控制流\\分支/异常/上下文};
+  \node[hw state, minimum width=2.45cm, align=center] (noc) at (0.7,2.35) {NoC / PCIe\\请求、完成、错误};
+  \node[hw state, minimum width=2.45cm, align=center] (fw) at (0.7,0.65) {固件控制器\\状态与软件标记};
+
+  \node[hw control, minimum width=2.8cm, minimum height=2.45cm, align=center] (filter) at (4.45,2.35)
+    {过滤与触发\\地址/上下文\\事件/前后窗口};
+  \draw[hw bus] (cpu) -- (filter.north west);
+  \draw[hw bus] (noc) -- (filter.west);
+  \draw[hw bus] (fw) -- (filter.south west);
+
+  \node[hw compute, minimum width=2.8cm, align=center] (packet) at (8.0,3.3)
+    {packet 与同步\\时间戳/序号};
+  \node[hw control, minimum width=2.8cm, align=center] (fabric) at (8.0,1.4)
+    {trace fabric\\仲裁与流控};
+  \draw[hw bus] (filter.north east) -- (packet);
+  \draw[hw bus] (packet) -- (fabric);
+
+  \node[hw memory, minimum width=2.7cm, align=center] (sink) at (11.6,3.3)
+    {trace sink\\片上 SRAM / DRAM};
+  \node[hw state, minimum width=2.7cm, align=center] (decode) at (11.6,1.4)
+    {离线解码\\二进制、映射、上下文};
+  \draw[hw bus] (fabric.north east) -- (sink.south west);
+  \draw[hw return] (sink) -- (decode);
+\end{pdfdiagram}
+\diagramnote{片上 trace 是一条与被测数据通路并行的证据通路。source 产生事件，过滤器限制流量，fabric 把多个时钟域的 packet 送到 sink，解码器再结合外部映射还原语义。任何一级溢出或缺少同步标记，都会使后续证据出现空洞；解码器不能凭空补回未记录的事件。}
+
+\topic{缓冲容量决定能回看多远}
+
+trace 不可能无限记录。假设高负载程序每秒发生 $2\times10^8$ 次需要编码的控制转移，压缩后平均每次占 2 B，则原始流量约为 400 MB/s。16 MiB 环形缓冲只能保存约
+\[
+  \frac{16\ \mathrm{MiB}}{400\ \mathrm{MB/s}} \approx 42\ \mathrm{ms}.
+\]
+这是用于说明数量级的估算，实际 packet 大小取决于分支类型、同步频率、上下文与时间戳。若故障每小时发生一次，持续全量追踪只会反复覆盖真正需要的窗口。
+
+工程上通常组合三种控制：过滤只选择目标进程、地址段或特权级；触发器在错误、中断、watchdog 或特定状态出现时停止环形缓冲；水位机制在 sink 接近满时产生告警或降低事件密度。若硬件不支持无损背压，trace source 必须丢包并设置 overflow 标志，不能让观测流量阻塞处理器正常执行。看到 overflow 后，后续解码结果只能解释为“已知片段”，不能宣称时间线连续。
+
+\section{十一、跨时钟域关联与一次卡顿定位}
+
+CPU 的时间戳计数器、网卡 PHC、设备本地时钟和示波器触发点可能具有不同起点与频率。合并 trace 前，需要找到至少两个共同事件来估计偏移与漂移。例如驱动在写 NVMe doorbell 前记录 CPU 时间戳，PCIe trace 同时看到该 MMIO TLP；稍后 MSI-X 到达时再建立第二个对应点。两个锚点既能对齐起点，也能估计观察窗口内的频率差。
+
+单个共同事件只能校正固定偏移，不能发现时钟漂移。长时间捕获还要处理计数器回绕、低功耗停钟、核间时间戳偏差和包在缓冲中的排队延迟。可靠的合并工具应保存原始局部时间、时钟域、换算参数和误差范围，而不是只输出一列看似精确的全局纳秒。
+
+\topic{案例：CQ 已写入，线程为什么仍然睡眠}
+
+一次文件读取尾延迟异常，设备侧 trace 显示 NVMe CQ 项在 $t_0$ 写入主存，PCIe trace 显示 MSI-X 随后到达根端口；CPU 控制流 trace 却没有进入目标中断向量。此时故障已经从“SSD 没完成”缩小到中断交付边界。继续核对 IOMMU interrupt remapping、Local APIC 向量、CPU 亲和性与屏蔽状态，发现驱动在队列迁移后更新了 MSI-X 表，却没有把对应中断重映射项切到新目标核。
+
+修复后不能只观察线程被唤醒。验收 trace 应同时证明：CQ phase 与 CID 匹配；中断在数据写入之后交付；新目标核进入正确向量；驱动推进 CQ head 并只完成一次请求；旧核没有收到迟到中断；缓冲区在完成消费前没有被复用。这样，设备完成、硬件交付、软件消费和资源回收四个边界全部闭合。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 五条泳道纵向排列，时间向右；事件只沿相邻泳道转移。
+  \node[hw label, anchor=east] at (1.5,4.4) {NVMe 控制器};
+  \node[hw label, anchor=east] at (1.5,3.35) {主存 CQ};
+  \node[hw label, anchor=east] at (1.5,2.3) {PCIe / 重映射};
+  \node[hw label, anchor=east] at (1.5,1.25) {CPU 控制流};
+  \node[hw label, anchor=east] at (1.5,0.2) {驱动状态};
+  \foreach \y in {4.4,3.35,2.3,1.25,0.2} {
+    \draw[draw=black!25, line width=0.4pt] (1.8,\y) -- (13.2,\y);
+  }
+
+  \node[hw state, minimum width=1.8cm] (cq) at (3.2,4.4) {写完成项};
+  \node[hw state, minimum width=1.8cm] (visible) at (5.3,3.35) {phase 可见};
+  \node[hw state, minimum width=1.8cm] (msi) at (7.4,2.3) {MSI-X 到达};
+  \node[hw control, minimum width=2.1cm] (fault) at (9.65,2.3) {重映射目标错误};
+  \node[hw state, minimum width=2.0cm] (missing) at (11.9,1.25) {无向量入口};
+  \node[hw state, minimum width=2.0cm] (sleep) at (11.9,0.2) {请求仍等待};
+  \draw[hw bus] (cq) -- (visible);
+  \draw[hw bus] (visible) -- (msi);
+  \draw[hw bus] (msi) -- (fault);
+  \draw[hw return] (fault) -- (missing);
+  \draw[hw return] (missing) -- (sleep);
+\end{pdfdiagram}
+\diagramnote{“CQ 已完成但线程未醒”的跨层证据链。最早异常不是介质或 DMA，而是 MSI-X 到达后的中断重映射；CPU trace 缺少预期向量入口，与 PCIe trace 中已经出现的消息共同限定了故障边界。仅看设备完成计数或线程状态，都无法得到这个定位。}
+
+\topic{trace 权限本身也是安全边界}
+
+控制流、地址、上下文切换和固件状态可能泄露密钥位置、隔离域行为与系统拓扑。量产芯片通常按生命周期和特权级限制 trace source，安全世界、机密虚拟机与普通主机之间还要定义哪些事件可以跨域输出。调试授权应限制对象、时间和用途；捕获文件需要访问控制与销毁策略，不能因为它“只是调试数据”就绕过安全审计。
+
+片上追踪的价值不在于记录越多越好，而在于为一次假设保存刚好足够的状态转换：触发条件明确，缓冲窗口覆盖故障前因，时间域可以关联，overflow 可见，解码所需的二进制和映射完整，权限没有越界。满足这些条件后，trace 才能把偶发故障从一句症状还原成可验证的硬件路径。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{综合练习：总线互斥检查至时钟两路}
