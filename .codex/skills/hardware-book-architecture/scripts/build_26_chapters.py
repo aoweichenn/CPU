@@ -74,17 +74,17 @@ EXTRAS = {
     9: ("ch09-pipeline-hazards.tex", "ch09-commit-recovery.tex", "ch09-speculation-security.tex"),
     10: ("ch10-memory-model.tex",),
     11: ("ch11-cache-interface.tex", "ch11-cache-deep-dive.tex"),
-    12: ("ch12-modern-vm-tlb.tex", "ch12-vm-deep-dive.tex"),
+    12: ("ch12-modern-vm-tlb.tex", "ch12-vm-deep-dive.tex", "ch12-memory-attributes-migration.tex"),
     13: ("ch13-chapter-exercises.tex",),
     14: ("ch14-nvme-interface.tex", "ch14-mobile-emerging-storage.tex"),
     15: ("ch15-chapter-exercises.tex",),
     16: ("ch16-persistence-reliability.tex",),
-    17: ("ch17-handshake-axi.tex", "ch17-noc-deep-dive.tex"),
-    18: ("ch18-pcie-transactions.tex", "ch18-pcie-deep-dive.tex", "ch18-cxl-chiplet.tex"),
+    17: ("ch17-handshake-axi.tex", "ch17-noc-deep-dive.tex", "ch17-coherence-power-domains.tex"),
+    18: ("ch18-pcie-transactions.tex", "ch18-pcie-deep-dive.tex", "ch18-cxl-chiplet.tex", "ch18-switch-virtualization.tex"),
     19: ("ch19-device-queues.tex", "ch19-runtime-hardware-security.tex"),
     20: ("ch20-battery-pmic-power-path.tex",),
     21: ("ch21-platform-recovery.tex", "ch21-firmware-deep-dive.tex"),
-    22: ("ch22-ras-reliability.tex", "ch22-ras-deep-dive.tex"),
+    22: ("ch22-ras-reliability.tex", "ch22-ras-deep-dive.tex", "ch22-bmc-availability.tex"),
     23: ("ch23-ethernet-phy.tex", "ch23-usb-human-interface.tex", "ch23-sensor-acquisition.tex", "ch23-wireless-datacenter-fieldbus.tex"),
     24: ("ch24-gpu-memory-visibility.tex", "ch24-display-camera-accelerator.tex"),
     26: ("ch26-modern-system-trace.tex",),
@@ -1018,18 +1018,21 @@ def format_chapter_end_exercises(text: str, chapter_number: int) -> str:
     for index, section in enumerate(sections):
         section_title = section.group(1)
         section_end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
+        section_body = text[section.end():section_end]
+        already_numbered = (
+            section_title == "章末练习"
+            and CHAPTER_EXERCISE_BLOCK_RE.search(section_body)
+        ) or (
+            section_title.startswith("参考解答")
+            and CHAPTER_ANSWER_BLOCK_RE.search(section_body)
+        )
         begin = LONGTABLE_BEGIN_RE.search(text, section.end(), section_end)
+        if already_numbered and (
+            not begin
+            or int(already_numbered.start()) < begin.start() - section.end()
+        ):
+            continue
         if not begin:
-            section_body = text[section.end():section_end]
-            already_numbered = (
-                section_title == "章末练习"
-                and CHAPTER_EXERCISE_BLOCK_RE.search(section_body)
-            ) or (
-                section_title.startswith("参考解答")
-                and CHAPTER_ANSWER_BLOCK_RE.search(section_body)
-            )
-            if already_numbered:
-                continue
             raise ValueError(f"chapter {chapter_number} {section_title}: missing longtable")
         end_token = r"\end{longtable}"
         end = text.find(end_token, begin.end(), section_end)

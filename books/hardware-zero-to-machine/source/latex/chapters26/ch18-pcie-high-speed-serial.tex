@@ -518,6 +518,130 @@ CPU 发出 load 后，Cache 与 home agent 先判断本地是否持有有效副�
 源 chiplet 在本地互连接收请求，协议适配器形成 flit，链路层加入序号与可靠性信息，die-to-die PHY 经凸点和封装走线传输，目标 chiplet 校验后再把请求送入自己的 NoC。返回数据沿反向路径归还信用和所有权。链路训练失败、lane 修复耗尽、时钟漂移或某个 chiplet 掉电，都必须在封装管理与平台 RAS 中形成可定位状态。
 
 Chiplet 并不会消除物理设计问题，只是把一部分片上连线变成封装内高速接口。分析整机时应依次确认：逻辑事务由谁发出、协议在哪一层保持顺序与一致性、PHY 在哪里训练、封装如何供电散热、错误由哪个管理实体汇总。这样才能把“模块化封装”还原为可测量的硬件路径。
+\section{十三、交换机、Retimer、热插拔与端口遏制}
+
+一条 PCIe 链路不一定把 root complex 直接连接到单个设备。交换机把一个上游端口扩展为多个下游端口，每个端口拥有自己的链路状态、credit、错误寄存器和配置空间。Retimer 位于较长或损耗较大的物理路径中间，分别恢复两侧信号并参与链路训练，却不成为事务层路由节点。热插拔槽还要控制供电、时钟、在位检测和机械锁定。理解拓扑时必须区分“谁转发 TLP”“谁只恢复电气信号”“谁控制器件生命周期”。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.4cm] (root) at (1.3,4.0) {Root Complex\\根端口与配置入口};
+  \node[hw control, minimum width=2.5cm] (sw) at (4.3,4.0) {PCIe Switch\\上游/下游端口};
+  \node[hw compute, minimum width=2.4cm] (retimer) at (7.2,4.0) {Retimer\\两段独立 PHY};
+  \node[hw block, minimum width=2.5cm] (slot) at (10.1,4.0) {热插拔槽\\供电、时钟、在位};
+  \node[hw state, minimum width=2.4cm] (ep) at (13.0,4.0) {Endpoint\\function 与队列};
+  \draw[hw bus] (root) -- (sw);
+  \draw[hw bus] (sw) -- (retimer);
+  \draw[hw bus] (retimer) -- (slot);
+  \draw[hw bus] (slot) -- (ep);
+
+  \node[hw state, minimum width=2.4cm] (detect) at (1.3,1.0) {端口检测\\Presence/Link};
+  \node[hw control, minimum width=2.5cm] (power) at (4.3,1.0) {上电与复位\\时钟稳定};
+  \node[hw control, minimum width=2.4cm] (train) at (7.2,1.0) {LTSSM 训练\\速率与 lane};
+  \node[hw memory, minimum width=2.5cm] (enum) at (10.1,1.0) {枚举与资源\\BDF、BAR、MSI};
+  \node[hw state, minimum width=2.4cm] (ready) at (13.0,1.0) {驱动接管\\允许 DMA};
+  \draw[hw bus] (detect) -- (power);
+  \draw[hw bus] (power) -- (train);
+  \draw[hw bus] (train) -- (enum);
+  \draw[hw bus] (enum) -- (ready);
+\end{pdfdiagram}
+\diagramnote{PCIe 拓扑与设备生命周期是两条相互约束的链。上排说明事务穿过根端口、交换端口、Retimer 和插槽到达 endpoint；下排说明设备只有在检测、供电、训练、枚举和资源分配全部完成后，驱动才能允许 DMA。}
+
+\topic{交换机按配置路由和地址窗口转发事务}
+
+枚举从 root bus 向下扫描。交换机的上游端口和每个下游端口表现为桥，固件或操作系统为桥写入 primary、secondary 和 subordinate bus number，并配置 I/O、memory 与 prefetchable memory 窗口。配置请求依据 bus/device/function 选择下游端口；内存 TLP 则依据桥窗口和 BAR 地址向目标转发。窗口重叠、遗漏或 subordinate 范围错误会使设备存在于物理链路上却无法被配置或访问。
+
+交换机不能把所有流量视为一个无身份数据流。ACS（Access Control Services）可以限制下游设备之间的 peer-to-peer 转发，把特定事务上送到 root/IOMMU，以满足隔离策略。没有适当 ACS 边界时，两个设备可能在交换机内部直接通信，绕过主机期望的地址转换或监控路径。是否允许 P2P 应由拓扑、IOMMU 组和设备信任关系共同决定。
+
+\topic{Retimer 把一条逻辑链路分成两个电气段}
+
+Retimer 接收高速串行信号，恢复时钟与数据，再重新发送。它补偿通道损耗和抖动，使主板走线、连接器或线缆能覆盖更长距离。链路训练需要发现 Retimer 并协调均衡，两侧电气问题可能表现为不同 lane 的错误、降速或训练失败；但 TLP 的地址、tag 和完成匹配仍由两端及交换机解释，Retimer 不分配 BDF，也不终止普通事务。
+
+诊断时要把逻辑端口计数与物理段证据对齐。根端口只看到重放、链路降级或失步时，错误可能来自根到 Retimer、Retimer 自身，或 Retimer 到设备三处。平台应保存 Retimer 可访问状态、每段 margin 或错误信息，并把器件位置映射到实际板卡或线缆。只更换 endpoint 不一定改变坏段。
+
+\topic{热插拔是一条受电源和所有权约束的状态机}
+
+插入时，槽控制器先确认在位和机械状态，再按平台顺序供电、提供参考时钟并释放 PERST\#。链路训练进入 L0 后，软件重新枚举设备、分配 BAR 和中断资源、建立 IOMMU 域，驱动初始化队列，最后才允许 DMA。设备出现在配置空间中只说明配置路径可用，不说明驱动数据结构和地址权限已经建立。
+
+安全拔出则先由软件停止新请求，等待或取消在途事务，关闭 bus mastering，撤销 IOMMU 映射并解绑驱动；随后槽控制器关闭链路和电源。突然拔出无法等待这些步骤，端口必须把未完成请求归为失败，阻止进一步错误传播，并让驱动拒绝迟到完成。已分配给设备的内存页在确认 DMA 静止前不能复用。
+
+\topic{DPC 在坏端口附近阻止错误继续向上游扩散}
+
+Downstream Port Containment（DPC）可在下游端口检测到严重错误后，立即禁止该链路继续转发事务并触发上游通知。它的目标不是修复设备，而是阻止畸形 TLP、持续错误或失控 DMA 影响更大拓扑。DPC 触发后，软件读取端口和 AER 状态，确定受影响的下游树，停止相关驱动并决定链路复训、function reset、slot power cycle 或永久下线。
+
+端口恢复必须重建跨边界状态：链路 credit、配置空间、BAR、IOMMU、MSI-X、设备队列和软件 generation。若交换机下有多个 function，DPC 可能同时切断整个下游子树；恢复计划要按共享端口这一故障域处理，不能只重置最先报告错误的 function。
+
+\begin{longtable}{L{0.17\linewidth}L{0.28\linewidth}L{0.31\linewidth}L{0.14\linewidth}}
+\toprule
+对象 & 主要职责 & 它不负责的事情 & 典型证据 \\
+\midrule
+PCIe switch & 路由 TLP、维护端口与桥窗口 & 恢复长通道的模拟波形 & bus number、端口 AER \\\tablerowrule
+Retimer & 恢复时钟数据、重新驱动电气段 & 分配 BDF 或解释 BAR & lane/段训练与 margin \\\tablerowrule
+热插拔控制器 & 在位、供电、时钟与槽事件 & 建立驱动 DMA 队列 & slot status 与电源状态 \\\tablerowrule
+DPC & 在下游端口遏制严重错误 & 自动恢复应用数据与队列 & trigger reason、端口隔离 \\\tablerowrule
+驱动/IOMMU & 队列、页映射、所有权与恢复代际 & 修复物理通道损耗 & fault、完成事件、代际号 \\
+\bottomrule
+\end{longtable}
+
+\section{十四、SR-IOV、ATS、PRI 与 PASID：共享设备怎样保留请求身份}
+
+虚拟化不能只把一个设备的 BAR 映射给多个来宾。每个工作负载需要独立配置、队列、中断、DMA 权限和复位边界。SR-IOV 让一个 Physical Function（PF）创建多个 Virtual Function（VF）；PF 管理设备级资源和策略，VF 提供较轻量的配置空间与队列。IOMMU 依据 requester identity，把不同 VF 的 DMA 放进不同地址域。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.4cm] (work) at (1.3,3.9) {进程/虚拟机\\缓冲与工作请求};
+  \node[hw memory, minimum width=2.5cm] (vf) at (4.2,3.9) {VF 队列\\独立 MSI-X};
+  \node[hw control, minimum width=2.7cm] (func) at (7.3,3.9) {PCIe function\\RID + PASID};
+  \node[hw compute, minimum width=2.6cm] (ats) at (10.4,3.9) {设备 ATS Cache\\缓存地址翻译};
+  \node[hw memory, minimum width=2.5cm] (mem) at (13.3,3.9) {主机内存\\目标物理页};
+  \draw[hw bus] (work) -- (vf);
+  \draw[hw bus] (vf) -- (func);
+  \draw[hw bus] (func) -- (ats);
+  \draw[hw bus] (ats) -- (mem);
+
+  \node[hw control, minimum width=2.7cm] (iommu) at (10.4,1.0) {IOMMU\\权限与组合翻译};
+  \node[hw state, minimum width=2.7cm] (pri) at (7.3,1.0) {PRI 页请求\\缺页暂停与响应};
+  \node[hw control, minimum width=2.5cm] (inv) at (4.2,1.0) {翻译失效\\IOTLB/ATS 确认};
+  \node[hw state, minimum width=2.4cm] (reuse) at (1.3,1.0) {页框安全复用\\旧 DMA 不可到达};
+  \draw[hw return] (ats) -- (iommu);
+  \draw[hw return] (iommu) -- (pri);
+  \draw[hw return] (pri) -- (inv);
+  \draw[hw return] (inv) -- (reuse);
+\end{pdfdiagram}
+\diagramnote{共享设备的一次 DMA 同时携带 function 身份和进程地址空间身份。ATS 允许设备缓存 IOMMU 翻译，PRI 允许缺页时请求软件补页；撤销页面时必须停止新工作并让 IOMMU 与设备翻译缓存都确认失效，旧页框才能复用。}
+
+\topic{PF 与 VF 分开的是接口状态，不一定是全部物理资源}
+
+VF 可以拥有独立队列、doorbell、MSI-X 和 requester ID，使来宾驱动无需通过宿主转发每次数据操作。PF 驱动仍负责创建 VF、分配带宽和队列资源、配置交换策略、执行设备级固件更新与全局复位。多个 VF 可能共享 DMA 引擎、片上 Cache、链路和调度器，因此隔离既包含地址权限，也包含公平性和拒绝服务限制。
+
+VF 的 function-level reset 应清除该 VF 的队列、完成、中断与局部错误状态，同时不能破坏其他 VF。若硬件内部资源无法按 VF 隔离，错误可能升级到 PF 或整设备复位。驱动必须把复位影响范围报告给虚拟化层，不能承诺硬件并不具备的独立恢复。
+
+\topic{PASID 把同一 function 的请求再细分到进程地址空间}
+
+requester ID 通常标识 PCIe function；一个加速器 function 可能服务多个进程，仅靠 requester ID 无法区分它们。PASID 随事务携带进程地址空间身份，使 IOMMU 可以选择相应的进程页表或第二阶段映射。设备队列必须把 PASID 与命令、缓冲地址和完成代际绑定，不能让一个队列槽在重用时沿用旧进程身份。
+
+共享虚拟地址只减少显式地址转换，不取消权限检查。CPU 页表、IOMMU 配置和设备提交仍可能处于不同代际。进程退出时，内核要阻止该 PASID 新提交，等待或取消在途工作，撤销映射并执行翻译失效，最后才能释放 PASID 和页框；否则迟到 DMA 可能命中新进程复用后的地址空间。
+
+\topic{ATS 减少 IOMMU 往返，也增加失效协议}
+
+Address Translation Services（ATS）允许设备向 IOMMU 请求翻译并缓存结果。后续 DMA 命中设备 Translation Cache 时，可以直接携带已翻译地址属性，减少每笔请求经过 IOMMU 查表的延迟。缓存项要保存页大小、权限、PASID 和代际，设备不能把只读翻译用于写，也不能在大页拆分后继续使用旧粒度。
+
+操作系统修改映射时，先阻止相关地址产生新请求，再更新 CPU/IOMMU 页表，向 IOMMU 和设备发送失效，等待设备确认对应 ATS 项已不可用，之后才可回收页框。失效确认是页框生命周期边界；仅把 invalidate 消息放上链路，还不能证明设备内部所有旧请求和缓存翻译已经停止。
+
+\topic{PRI 把设备缺页变成可暂停、可恢复的事务}
+
+Page Request Interface（PRI）允许设备在地址未映射时发送页请求，而不是立即把 DMA 判为永久失败。IOMMU 将请求与 requester ID、PASID、地址和访问类型关联，操作系统判断该 fault 是否可修复；若可以，就分配、迁入或解锁页面，建立映射并返回成功响应，设备随后重试被暂停的访问。
+
+设备可暂停的请求数量有限。页请求队列满、同一地址反复 fault、进程退出或页面无法调入时，系统必须返回失败并终止相关工作，不能无限积压。PRI fault 的完成边界也不同于 DMA 完成：页请求成功只表示翻译条件已经建立，原始 DMA 仍需重试、传输数据并写完成项。
+
+\begin{longtable}{L{0.16\linewidth}L{0.27\linewidth}L{0.31\linewidth}L{0.16\linewidth}}
+\toprule
+机制 & 增加的身份或状态 & 收益 & 新增失效边界 \\
+\midrule
+SR-IOV VF & 独立 requester ID、队列和中断 & 来宾直接提交设备工作 & VF/PF 复位影响范围 \\\tablerowrule
+PASID & function 内的进程地址空间身份 & 多进程共享同一设备 function & 进程退出与 PASID 复用 \\\tablerowrule
+ATS & 设备侧翻译缓存 & 减少 IOMMU 查表往返 & 页表修改后的设备确认 \\\tablerowrule
+PRI & 可暂停的设备缺页请求 & 按需调页与共享虚拟内存 & fault 队列容量与失败响应 \\\tablerowrule
+IOMMU & requester/PASID 到物理页的权限 & DMA 隔离和重映射 & IOTLB、ATS 与在途 DMA 收束 \\
+\bottomrule
+\end{longtable}
 
 \section*{章末练习}
 

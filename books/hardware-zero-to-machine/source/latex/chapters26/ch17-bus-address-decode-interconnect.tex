@@ -340,6 +340,123 @@ QoS 也不能只看仲裁权重。设 1 GHz NoC 中一笔六 flit 包无竞争�
 互连正确性最终由四组不变量组成：缓冲不能溢出或重复记账，通道依赖不能成环，响应必须能归属原请求，顺序与屏障必须在端点观察点闭合。拓扑图只能说明“可能往哪里走”，这些状态才说明“为何一定能正确到达”。
 \end{keyidea}
 
+
+
+
+
+
+
+
+\section{十、目录一致性互连：一次写权限怎样找到唯一所有者}
+
+普通 NoC 只需把请求送到目标并返回响应；一致性互连还要回答“哪些 Cache 持有这条 line，谁拥有可写副本，旧副本何时全部失效”。小系统可以广播 snoop，大系统通常把物理地址映射到 home node，由目录或 snoop filter 记录可能的持有者。home node 是该地址一致性事务的排序点，不一定保存实际数据，也不一定与请求者位于同一芯片区域。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.4cm] (core) at (1.3,3.8) {请求核心\\load 或 store miss};
+  \node[hw memory, minimum width=2.5cm] (local) at (4.2,3.8) {本地 Cache\\分配 MSHR};
+  \node[hw control, minimum width=2.8cm] (home) at (7.5,3.8) {Home/目录\\排序并查持有者};
+  \node[hw block, minimum width=2.8cm] (target) at (10.9,3.8) {当前 owner/共享者\\或内存控制器};
+  \draw[hw bus] (core) -- (local);
+  \draw[hw bus] (local) -- (home);
+  \draw[hw bus] (home) -- (target);
+
+  \node[hw state, minimum width=2.8cm] (resp) at (10.9,1.0) {探测响应与数据\\旧副本降级/失效};
+  \node[hw control, minimum width=2.8cm] (serial) at (7.5,1.0) {Home 收齐确认\\更新目录与顺序};
+  \node[hw memory, minimum width=2.5cm] (fill) at (4.2,1.0) {请求 Cache 填充\\取得 S 或 M 状态};
+  \node[hw state, minimum width=2.4cm] (done) at (1.3,1.0) {指令继续\\结果等待提交};
+  \draw[hw bus] (target) -- (resp);
+  \draw[hw return] (resp) -- (serial);
+  \draw[hw return] (serial) -- (fill);
+  \draw[hw return] (fill) -- (done);
+\end{pdfdiagram}
+\diagramnote{目录一致性的一次请求—探测—完成闭环。请求先到地址对应的 home node，home 查目录并联系 owner、共享者或内存；只有探测响应收齐、目录状态更新并把数据或写权限返回后，请求 Cache 才能结束暂态。}
+
+\topic{读共享与取写权限使用不同完成条件}
+
+读 miss 通常发出 GetS 类请求。若没有脏 owner，home 可让内存返回数据并在目录中加入新共享者；若另一 Cache 持有修改态数据，home 要求它提供最新数据，并按协议保留或降级其状态。请求者收到数据和所需许可后进入 Shared 或相应只读状态，load 才能继续。
+
+写 miss 或对共享 line 的写升级发出 GetM/Upgrade 类请求。home 根据目录向所有共享者发送失效探测。每个目标必须停止使用旧许可、处理本地在途访问并返回确认；home 收齐确认后，才能把独占写权限交给请求者。只收到数据而没有收齐失效确认，不代表请求者已经成为唯一可写者。
+
+并发请求需要统一排序。两个核心同时对同一 line 请求写权限时，home 选择一个先进入服务，另一个等待或重试。先获权者在传输期间可能处于“等待数据”“等待确认”等暂态；目录也可能处于“已发探测但尚未收齐”的暂态。状态机不能只画稳定的 I/S/M 状态，否则无法解释迟到探测、转发数据和重试响应应归属哪一代事务。
+
+\topic{目录和 snoop filter 是提示还是权威，必须由协议规定}
+
+精确目录为每条 line 保存所有共享者，空间成本随核心数增加；有限目录可以只保存少量指针，溢出时退化为广播或粗粒度向量；snoop filter 也可能只用于减少不必要探测，命中与未命中的可靠含义由实现规定。若过滤器允许假阳性，额外探测只影响性能；若出现会漏掉真实持有者的假阴性，一致性就会失效。
+
+目录元数据本身也需要 ECC、复位和初始化。目录位翻转可能把仍持有脏数据的 Cache 从共享集合中删除，后续内存返回旧数据；也可能无故探测大量核心，造成性能下降。平台 RAS 必须区分可重建的过滤状态与决定数据所有权的权威状态，并规定错误时是广播重建、下线地址范围还是升级机器检查。
+
+\topic{虚通道要同时切断请求、探测和响应之间的依赖环}
+
+一致性事务至少包含请求、探测、探测响应和数据返回。若四类消息共用同一组缓冲，可能形成环：请求占满下游缓冲，目标等待发出探测响应才能释放请求，而响应又因缓冲被请求占满无法前进。独立虚通道让不同消息类拥有分开的 credit 与仲裁状态，并规定某些通道永远不等待低优先级通道，从资源依赖图上切断环。
+
+虚通道不增加物理链路带宽。错误的优先级仍可能让某类消息长期得不到服务，过小的响应缓冲仍可能降低并发度。验证需要同时检查“无死锁”的前进性质与“有界等待”的公平性质；运行时则观察每类通道的占用、credit 返回、重试和最长等待时间。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.31\linewidth}L{0.14\linewidth}}
+\toprule
+事务阶段 & 必须保存的身份 & 完成条件 & 典型故障 \\
+\midrule
+请求进入 home & 地址、请求者、事务 ID、目标权限 & 排序位置与目录项锁定 & 同一 line 并发请求混代 \\\tablerowrule
+发出探测 & 共享者集合、owner、探测类型 & 所有必要目标均已接收 & 目录遗漏真实持有者 \\\tablerowrule
+收集响应 & 每个目标的确认、数据来源 & 确认齐全且最新数据唯一 & 响应通道被请求堵塞 \\\tablerowrule
+发布许可 & 新 owner/共享集合与 line 数据 & 目录和请求者状态一致 & 权限早于失效确认发布 \\\tablerowrule
+错误恢复 & 地址、暂态、已完成目标集合 & 重试或隔离不接受旧响应 & 复位后旧探测污染新事务 \\
+\bottomrule
+\end{longtable}
+
+\section{十一、跨时钟、电源与复位域的互连桥}
+
+大型 SoC 不会让全部模块永久使用同一时钟和电源。CPU、GPU、媒体、显示和低速外设可以位于不同频率、不同复位域和可独立断电的电源域。互连桥因此不仅转换协议宽度，还要保证跨时钟采样、掉电隔离、状态保留和在途事务收束。目标模块已经断电时，继续把 valid 或地址送过去不会形成“等待较久”，而会把未知电平传播回始终上电域。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.4cm] (src) at (1.3,4.0) {始终上电域\\请求与响应队列};
+  \node[hw control, minimum width=2.7cm] (cdc) at (4.4,4.0) {CDC 桥\\异步 FIFO/握手};
+  \node[hw control, minimum width=2.7cm] (iso) at (7.7,4.0) {域边界\\隔离、level shift};
+  \node[hw block, minimum width=2.7cm] (dst) at (11.0,4.0) {可断电目标域\\设备与局部状态};
+  \draw[hw bus] (src) -- (cdc);
+  \draw[hw bus] (cdc) -- (iso);
+  \draw[hw bus] (iso) -- (dst);
+
+  \node[hw state, minimum width=2.7cm] (quiesce) at (11.0,1.0) {停止接收新请求\\等待或取消在途事务};
+  \node[hw memory, minimum width=2.7cm] (retain) at (7.7,1.0) {保存保留状态\\夹紧跨域输出};
+  \node[hw control, minimum width=2.7cm] (power) at (4.4,1.0) {关时钟/电源\\保持复位有效};
+  \node[hw state, minimum width=2.4cm] (off) at (1.3,1.0) {域安全关闭\\桥返回受控错误};
+  \draw[hw return] (dst) -- (quiesce);
+  \draw[hw return] (quiesce) -- (retain);
+  \draw[hw return] (retain) -- (power);
+  \draw[hw return] (power) -- (off);
+\end{pdfdiagram}
+\diagramnote{跨域互连的数据路径与安全关断顺序。上排负责跨时钟传输，下排先静止事务、保存状态并隔离输出，再关闭时钟和电源；顺序反过来会遗失完成、传播未知电平或留下无法归属的请求。}
+
+\topic{异步 FIFO 用指针跨域，不能把多 bit 总线逐位同步}
+
+单 bit 电平可用多级同步器降低亚稳态传播概率，多 bit 数据若逐位同步，各位可能在不同周期稳定，接收端会组合出发送端从未产生的值。异步 FIFO 把数据写入双口存储，两侧分别维护读写指针；跨域传递的是经过 Gray 编码的指针，每次只改变一位。接收端同步指针后计算 empty/full，数据本体在目标时钟域按稳定地址读取。
+
+ready/valid 直接跨域也不安全。脉冲可能窄于目标时钟周期，电平握手又可能因双方对状态理解不同而重复接收。跨域桥使用 toggle、请求/确认握手或 FIFO，把“一个事件发生过”保存成状态，直到接收端明确确认。复位必须让两侧指针与握手代际重新一致；只复位一侧可能把旧数据误当成新数据。
+
+\topic{电源关闭前必须证明域已经静止}
+
+电源管理器先阻止新事务进入目标域，再等待队列为空、未决计数归零和必要写回完成。无法自然结束的事务要返回明确错误或由上层取消。随后把需要跨断电保留的寄存器写入 retention cell，启用 isolation cell 将目标域输出夹到协议允许的常量，最后才关闭时钟和电源。
+
+重新上电按相反依赖推进：电压达到允许范围，时钟稳定，复位保持足够周期，恢复保留状态，初始化未保留状态，释放内部复位，最后撤销隔离并重新接受事务。桥要递增 generation，使掉电前迟到的响应不能完成上电后的新请求。电源控制完成项只有在目标域可安全访问并且互连状态重新同步后才能发布。
+
+\topic{复位域边界要与事务所有权边界对齐}
+
+若只复位目标设备而不复位桥中的请求和响应状态，桥可能一直等待已经消失的事务；若只清桥而让设备继续 DMA，设备会把响应写入已复用的槽位。局部复位流程要冻结入口、记录错误、耗尽或取消双方状态、执行复位、重建 credit 和队列代际，再恢复流量。
+
+复位控制信号本身常异步拉低、同步释放。异步拉低可以迅速把电路送入安全态；同步释放确保同一时钟域的触发器在受控时钟沿附近离开复位，避免不同状态位随机早退。多个时钟域各自需要释放同步器，不能把一根未经处理的复位解除信号同时扇出到所有域。
+
+\begin{longtable}{L{0.17\linewidth}L{0.28\linewidth}L{0.31\linewidth}L{0.14\linewidth}}
+\toprule
+边界 & 正确机制 & 发布完成前的检查 & 错误症状 \\
+\midrule
+单 bit CDC & 多级同步器与稳定窗口 & 目标域已采样稳定状态 & 偶发状态跳变 \\\tablerowrule
+多 bit/事件 CDC & 异步 FIFO 或完整握手 & 数据与指针属于同一代际 & 丢事件、重复或撕裂数据 \\\tablerowrule
+电源关闭 & 静止、保留、隔离、关电 & 在途事务归零且输出已夹紧 & 未知电平或队列永久等待 \\\tablerowrule
+电源恢复 & 稳压、时钟、复位、恢复、撤隔离 & 桥和目标 credit/代际一致 & 旧响应完成新请求 \\\tablerowrule
+局部复位 & 双侧停止并重建所有权状态 & DMA、响应和中断均可归属 & 复位后迟到写入 \\
+\bottomrule
+\end{longtable}
+
 \section*{章末练习}
 
 \begin{chapterexercise}{综合练习：握手概念至轮转 trace}

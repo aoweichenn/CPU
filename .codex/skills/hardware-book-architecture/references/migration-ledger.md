@@ -154,3 +154,14 @@
 | 第 24 章 | HDMI/DisplayPort/eDP、TCON、LCD/OLED 驱动与像素可见边界 | verified |
 | 第 24 章 | CMOS 图像传感器、MIPI CSI、ISP、帧缓冲与曝光时间线 | verified |
 | 第 24 章 | NPU 的脉动阵列、片上 SRAM、量化、DMA、命令队列与完成边界 | verified |
+
+## 2026-07 薄弱章节机制深化批次
+
+本批次根据全书内容密度与机制链完整性审计，扩充第 12、17、18、22 章。扩写只增加读者内容，不替换或删减既有材料；不增加章末练习数量。每个新增通路都要明确状态、请求、完成、失效与恢复边界，并在最终 PDF 中逐页检查图文间距。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 12 章 | 内存属性、A/D 位并发、大页拆合、NUMA 页面迁移与页框生命周期 | verified |
+| 第 17 章 | 目录一致性、home node、探测完成、虚通道依赖与跨电源/复位域桥接 | verified |
+| 第 18 章 | PCIe 交换拓扑、retimer、热插拔、DPC、SR-IOV、ATS/PRI/PASID 与失效闭环 | verified |
+| 第 22 章 | EC/BMC 带外管理、传感器与主机隔离、FIT/MTBF/MTTR、可用性和共同故障预算 | verified |
