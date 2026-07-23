@@ -2,7 +2,7 @@
 
 从 bio 到用户 buffer，I/O 要穿过块层、调度器和 VFS。本章把 request 队列、merge/sort、fd→file→inode 链和 buffered/direct 路径串成一条线。把这条线走通，才能说清 \code{write} 为什么快返回、\code{fsync} 为什么慢，以及掉电后哪些数据会丢。
 
-\section{块层原理与对象}
+\section{块请求从何而来}
 
 文件系统最终要把逻辑块读写交给块设备。若每个上层请求都直接变成一次磁盘操作，系统会遭遇两个问题：机械磁盘上寻道开销巨大，随机请求顺序会让吞吐崩溃；即使在 SSD/NVMe 上，请求大小、队列深度、合并策略和 flush 顺序也直接影响延迟和持久化语义。因此操作系统在文件系统和驱动之间放置块层，负责把 bio 合并、拆分、排序、限流、派发和完成。
 
@@ -47,7 +47,7 @@ submit_bio(bio):
 
 这里的关键是 bio 的生命周期。bio 完成并不等于调用者数据结构一定可释放，除非 endio 回调已经把 page 状态、错误码和等待者唤醒都处理完。对写请求而言，“设备报告完成”也不必然等于掉电后数据存在，除非请求带有 FUA 或之前执行了正确 flush。
 
-\section{I/O 调度算法}
+\section{合并、拆分与 I/O 调度}
 
 \subsection{合并与拆分}
 
@@ -111,7 +111,7 @@ pick_fair(queue_set):
 
 公平调度会牺牲部分全局顺序性，尤其在机械磁盘上可能增加寻道。工程选择取决于目标：批处理吞吐、桌面响应、数据库尾延迟还是云主机隔离。
 
-\section{持久化语义与多队列}
+\section{多队列、flush 与 FUA}
 
 \subsection{flush、FUA 与 barrier}
 
@@ -167,7 +167,7 @@ submit_bio
 分析多队列块层时，应沿着 request 的完整生命周期观察：取得空闲 tag，进入 in-flight，
 由设备完成，再释放 tag。任何错误或超时路径都必须保证同一 tag 不会同时代表两个请求。
 
-\section{块层的统计、限流与错误处理}
+\section{限流、统计与错误完成}
 
 \subsection{IO 统计从哪里来}
 
@@ -262,7 +262,7 @@ I/O benchmark 不能只报 MB/s 和 IOPS。高质量报告要写明 direct/buffe
 本章块层部分的合格标准：能说明 bio、request、queue 的区别；能分析 SCAN、deadline、公平调度的取舍；能解释 flush/FUA/barrier 为什么属于正确性而不仅是性能。
 \end{warningbox}
 
-\section{VFS 文件层}
+\section{fd、file、dentry 与 inode}
 
 文件描述符是用户态访问内核对象的句柄。它可以指向普通文件、管道、socket、设备或匿名内核对象。进程拿到的是一个小整数，但内核维护的是对象、offset、权限、引用计数和关闭状态。
 
@@ -389,7 +389,7 @@ flag 不是都绑定在同一层。fd flag 绑定 fd 表项；file status flag �
 
 Linux VFS 以 fd table、\code{file}、\code{dentry}、\code{inode} 和 file operations 组织打开文件；page cache 承载普通文件的缓存页，epoll 和 io\_uring 则在对象引用之上建立事件与异步完成关系。理解实现时应跟住一个 fd：它如何从整数索引解析为 \code{file}，引用如何增加，操作如何进入具体 file operations，错误如何返回，以及最后一个引用在何时释放。
 
-\section{I/O 路径}
+\section{缓冲 I/O、直接 I/O 与异步完成}
 
 VFS 的 read/write 并不直接落到设备。普通文件读写经过 page cache，未命中时才生成 bio 进入块层；direct I/O 绕过 page cache 但仍走块层提交。本节把缓存命中与未命中、buffered 与 direct、同步与异步的路径分别拆开。
 
@@ -593,7 +593,7 @@ fixed buffer/file 提高性能，但也把生命周期责任推给应用：buffe
 
 所以异步 I/O 的基本规则是：提交记录、buffer 所有权和 completion 消费必须绑定。真正能释放或复用 buffer 的点，不是“我不想等了”，而是“所有可能引用这个 buffer 的请求状态都已经收敛”。这和驱动层 DMA request 的规则是同一件事，只是对象从设备 descriptor 换成了用户可见的 SQE/CQE。
 
-\section{块 I/O 与文件路径观察}
+\section{一次文件访问的跨层路径}
 
 第一项分析是画出 fd 引用图。
 
@@ -625,7 +625,7 @@ PreparedBuffer
 
 异步 I/O 中，buffer 在 completion 前不能被上游复用；completion 失败不能被提交路径吞掉；cancel 后也可能收到迟到 completion，所以请求身份必须稳定。
 
-\section{队列、文件与错误路径验证}
+\section{短读写、取消与引用生命周期}
 
 块层侧的测试覆盖合并、拆分、调度、flush 顺序和多队列身份：
 
