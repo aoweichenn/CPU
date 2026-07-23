@@ -907,6 +907,143 @@ FUA 表示该次写要达到设备规定的非易失边界后才完成；FLUSH �
 
 还应覆盖介质返回不可恢复读错、NVMe 控制器复位、完成丢失、重复完成与请求超时。每种故障都要回答：请求是否可能已经执行，软件能否安全重试，队列 generation 如何区分旧完成，数据校验如何判断结果。对非幂等写，未经查询状态便盲目重试可能产生重复副作用。
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{十一、从页缓存到硬件队列：一笔块请求怎样形成并完成}
+
+文件系统不能把“文件偏移 24 KiB”直接交给 SSD 或硬盘。设备只理解逻辑块地址、长度、方向、主存缓冲区和命令标识。中间的块层必须完成三次翻译：文件系统先把文件偏移映射到文件系统块和设备扇区；BIO（block I/O）再把一组内存页片段描述成块范围；请求队列最后按设备限制拆分或合并 BIO，形成驱动能够提交的 request。Linux 的多队列块层使用每 CPU 软件暂存队列和面向设备的硬件派发队列，把文件系统并发请求映射到设备可用队列。\cite{linux-blk-mq}
+
+以一次对齐的 16 KiB 写为例，应用数据先落入四个 4 KiB 页缓存页并被标为 dirty。回写线程根据文件 extent 找到连续的四个设备块，构造指向这四个页片段的 BIO。若起始 LBA 连续、方向与属性相同、长度没有超过设备的最大传输和段边界，块层可以把它们合并成一个 request；驱动再把四个离散物理页映射为 scatter-gather 表，申请一个空闲 tag，并把“LBA、长度、DMA 段、tag”写入设备提交队列。设备完成后返回同一个 tag，驱动据此在常数时间内找到原 request，而不必按地址或完成顺序搜索。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 请求下行。
+  \node[hw memory, minimum width=2.05cm, align=center] (page) at (0.7,3.2) {页缓存\\4 个 dirty 页};
+  \node[hw compute, minimum width=2.1cm, align=center] (map) at (3.2,3.2) {文件块映射\\offset 到 LBA};
+  \node[hw state, minimum width=1.95cm, align=center] (bio) at (5.7,3.2) {BIO\\页片段集合};
+  \node[hw control, minimum width=2.05cm, align=center] (rq) at (8.15,3.2) {blk-mq request\\合并/调度};
+  \node[hw state, minimum width=2.05cm, align=center] (dev) at (10.7,3.2) {驱动与设备队列\\SG + tag};
+  \draw[hw bus] (page) -- (map);
+  \draw[hw bus] (map) -- (bio);
+  \draw[hw bus] (bio) -- (rq);
+  \draw[hw bus] (rq) -- (dev);
+
+  % 完成上行，单独占一条走廊。
+  \node[hw state, minimum width=2.05cm, align=center] (cq) at (10.7,0.55) {completion\\返回 tag/status};
+  \node[hw compute, minimum width=2.05cm, align=center] (endrq) at (8.15,0.55) {结束 request\\拆分结果汇总};
+  \node[hw compute, minimum width=1.95cm, align=center] (endbio) at (5.7,0.55) {结束 BIO\\逐段记账};
+  \node[hw state, minimum width=2.1cm, align=center] (clean) at (3.2,0.55) {页状态更新\\清 dirty/记错误};
+  \node[hw state, minimum width=2.05cm, align=center] (wake) at (0.7,0.55) {唤醒等待者\\或后台回写结束};
+  \draw[hw bus] (dev.south) -- (10.7,1.8) -- (cq.north);
+  \draw[hw return] (cq) -- (endrq);
+  \draw[hw return] (endrq) -- (endbio);
+  \draw[hw return] (endbio) -- (clean);
+  \draw[hw return] (clean) -- (wake);
+\end{pdfdiagram}
+\diagramnote{块 I/O 的双向生命周期。上行从文件语义逐步收缩为设备命令：页缓存、块映射、BIO、request、scatter-gather 与 tag；下行用 tag 把乱序 completion 还原到原 request，再逐层结束 BIO、更新页状态并唤醒等待者。请求下发成功只表示驱动或设备取得所有权，只有完成链返回且错误状态汇总后，上层才能回收页和请求对象。}
+
+\begin{longtable}{L{0.17\linewidth}L{0.25\linewidth}L{0.29\linewidth}L{0.19\linewidth}}
+\toprule
+对象 & 描述的粒度 & 所有权与完成边界 & 常见拆分原因 \\
+\midrule
+页缓存页 & 文件内容所在的内存页 & dirty 表示尚未完成可靠回写 & 文件洞、页边界、内存压力 \\\tablerowrule
+BIO & LBA 范围与一个或多个页片段 & 各片段均返回后 BIO 才结束 & 不连续 LBA、不同操作属性 \\\tablerowrule
+request & 可交给一个硬件上下文的请求 & 驱动接收后启动超时与错误处理 & 最大扇区数、段数、对齐边界 \\\tablerowrule
+SG 表 & 设备可 DMA 的物理页段 & 映射有效期间页不能被释放或复用 & IOMMU 页界、设备段长度限制 \\\tablerowrule
+tag & 队列内唯一的在途标识 & completion 归还 tag 后才能再次分配 & 队列深度耗尽、复位代际变化 \\\tablerowrule
+completion & tag、状态和已完成长度 & 上层汇总全部子请求后报告结果 & 部分完成、介质错误、超时或复位 \\
+\bottomrule
+\end{longtable}
+
+拆分和合并不是单纯的性能优化，也影响错误语义。一个 1 MiB 写可能因设备最大传输为 256 KiB 被拆成四个 request；其中前三个成功、第四个返回介质错误时，上层看到的是部分区域已改变，而不是整笔自动回滚。若文件系统需要原子更新，必须在块请求之外使用日志、写时复制或设备声明的原子写能力。反过来，相邻 BIO 被合并后，完成仍要按原 BIO 的范围逐项记账，不能因硬件只返回一个 tag 就丢失每个上层对象的错误归属。
+
+队列也不保证按提交顺序完成。快请求可能越过慢请求，不同硬件队列可以并行返回；文件系统必须用依赖、flush/FUA 或事务协议表达真正的先后要求。设备复位时，旧 generation 的 completion 还可能迟到，因此 tag 之外还需要队列代际或复位栅栏。只有确认旧 DMA 已停止、旧完成不会再修改内存，页框和 tag 才能安全复用。
+
+\section{十二、校验 RAID 从零推导：异或、部分写与重建窗口}
+
+RAID 5 的校验并不是一份额外完整副本，而是同一条带各数据块逐 bit 异或的结果。设三个数据块首字节分别为 $D_0=\code{0x6A}$、$D_1=\code{0xC3}$、$D_2=\code{0x5C}$，校验字节为
+\[
+P=D_0\oplus D_1\oplus D_2
+ =\code{0x6A}\oplus\code{0xC3}\oplus\code{0x5C}
+ =\code{0xF5}.
+\]
+异或满足 $x\oplus x=0$，所以任意一个数据块丢失都能由其余块和校验重建。例如 $D_1$ 丢失时，$D_0\oplus D_2\oplus P=\code{0xC3}$。这就是降级读的数据路径：控制器并非从失效盘得到数据，而是读同条带的其余成员，在内存或专用 XOR 单元中重建目标块，再把结果返回上层。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 正常条带。
+  \node[hw label, font=\small\bfseries] at (1.1,4.45) {正常条带};
+  \node[hw memory, minimum width=2.0cm] (d0) at (1.0,3.45) {$D_0=\code{6A}$};
+  \node[hw memory, minimum width=2.0cm] (d1) at (3.45,3.45) {$D_1=\code{C3}$};
+  \node[hw memory, minimum width=2.0cm] (d2) at (5.9,3.45) {$D_2=\code{5C}$};
+  \node[hw state, minimum width=2.0cm] (p) at (8.35,3.45) {$P=\code{F5}$};
+  \node[hw compute, minimum width=2.15cm, align=center] (xor) at (5.9,1.75) {逐 bit XOR\\计算或重建};
+  \draw[hw bus] (d0.south) -- (1.0,2.45) -- (xor.west);
+  \draw[hw bus] (d1.south) -- (3.45,2.45) -- (xor.west);
+  \draw[hw bus] (d2.south) -- (xor.north);
+  \draw[hw bus] (xor.east) -- (8.35,1.75) -- (p.south);
+
+  % 降级读证据。
+  \node[hw control, minimum width=2.0cm, align=center] (lost) at (10.75,3.45) {$D_1$ 失效\\无数据返回};
+  \node[hw state, minimum width=2.35cm, align=center] (rebuilt) at (10.75,1.75) {重建 $D_1$\\\code{6A XOR 5C XOR F5 = C3}};
+  \draw[hw danger] (lost.south) -- (10.75,2.55);
+  \draw[hw return] (p.east) -- (9.35,3.45) -- (9.35,1.75) -- (rebuilt.west);
+  \node[hw label, text width=9.5cm] at (5.9,0.45) {校验块保存的是关系，不是副本；失去任一成员后，要读取同条带其余成员并重新计算，访问时延和剩余成员负载都会增加。};
+\end{pdfdiagram}
+\diagramnote{RAID 5 单条带的校验与降级读。正常写入时，三个数据块逐 bit 异或得到校验；$D_1$ 失效后，控制器读取 $D_0$、$D_2$ 与 $P$，经同一个 XOR 数据路径重建 \code{0xC3}。图中的返回路径说明重建依赖全部剩余成员，任何第二个不可读块都会使该条带无法恢复。}
+
+小写会改变其中一个数据块和校验块。若把 $D_1$ 从 \code{0xC3} 改成 \code{0x9F}，控制器可以执行 read-modify-write：先读旧 $D_1$ 与旧 $P$，计算
+\[
+P_{\mathrm{new}}
+ =P_{\mathrm{old}}\oplus D_{1,\mathrm{old}}\oplus D_{1,\mathrm{new}}
+ =\code{0xF5}\oplus\code{0xC3}\oplus\code{0x9F}
+ =\code{0xA9},
+\]
+再分别写新 $D_1$ 和新 $P$。这里出现 write hole：掉电若发生在两个写之间，介质上可能是“新数据配旧校验”或“旧数据配新校验”，重启后只看这一条带无法判断哪一个才是新版本。全条带写可以从全部新数据直接计算新校验，避免读取旧块，却仍要保证数据和校验作为同一事务恢复；非易失写日志、受保护写缓存或条带日志会先把新数据、校验、序号和校验和写到可恢复位置，再更新阵列成员。\cite{linux-raid5-cache}
+
+\begin{longtable}{L{0.18\linewidth}L{0.28\linewidth}L{0.27\linewidth}L{0.17\linewidth}}
+\toprule
+场景 & 必须读取或写入什么 & 完成边界 & 主要风险 \\
+\midrule
+完整条带写 & 写全部新数据与新校验 & 整条带可恢复后才完成 & 多盘写中途掉电 \\\tablerowrule
+小写（RMW） & 读旧数据和旧校验；写新数据和新校验 & 两个新块均进入恢复协议 & write hole、额外读放大 \\\tablerowrule
+正常读 & 只读目标数据块 & 目标块校验与设备状态有效 & 静默损坏未被上层校验发现 \\\tablerowrule
+降级读 & 读取同条带其余数据与校验并 XOR & 重建结果验证后返回 & 时延上升，第二错误无余量 \\\tablerowrule
+重建 & 连续读取全部幸存成员并写备用盘 & 每个条带重建并校验后推进进度 & 前台竞争、潜在扇区错误、温度上升 \\\tablerowrule
+一致性检查 & 重算校验并与介质值比较 & 差异完成定位或修复后闭合 & 不知道错误成员时误修正确数据 \\
+\bottomrule
+\end{longtable}
+
+重建窗口可以定量估算。一个 16 TB 成员若以持续 200 MB/s 顺序读取，理想重建时间约为
+\[
+16\times10^{12}\ \mathrm{B}\div(200\times10^{6}\ \mathrm{B/s})
+\approx 8.0\times10^4\ \mathrm{s}\approx22.2\ \mathrm{h}.
+\]
+实际还要与前台 I/O 共享磁盘、互连和校验计算资源，重建可能持续数天。在此期间阵列已经用完一次容错能力，任何第二盘失效或幸存盘上不可恢复读错都可能让部分条带无法重建。提高重建优先级能缩短暴露时间，却会增加用户请求尾延迟和设备温度；降低优先级则相反。可靠性策略必须同时记录重建速率、剩余时间、介质错误计数、温度与前台服务目标，而不能只显示“正在重建”。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{1}

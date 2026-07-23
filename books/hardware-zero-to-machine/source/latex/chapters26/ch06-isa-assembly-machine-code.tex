@@ -693,7 +693,94 @@ load/store 指令通常用基址寄存器加符号扩展位移形成有效地址
 
 
 
-\section{八、取指边界与合法译码：字节流怎样成为一条确定指令}
+\section{八、特权状态机：一次系统调用怎样进入内核再返回}
+
+“用户态不能访问内核资源”只有落实为硬件检查才有意义。下面用一个简化的 RISC-V S 模式入口说明这条边界；假设平台已经把 U 模式的 environment call 委托给 S 模式处理。程序在 U 模式执行 \code{ecall} 时，处理器不会把它当作普通函数调用，也不会继续执行下一条指令。硬件先把发生事件时的指令地址写入 \code{sepc}，把原因写入 \code{scause}，把补充地址或指令信息写入 \code{stval}，再把先前特权级和中断使能状态压入 \code{sstatus} 的对应字段，最后从 \code{stvec} 取得入口地址并切换到 S 模式。\cite{riscv-priv}
+
+这组控制状态寄存器（control and status register, CSR）不是普通通用寄存器。每个字段都参与权限、入口或返回决策；用户指令若试图直接修改页表根、陷阱向量或中断使能，会在提交前触发非法指令异常。以 \code{ecall} 位于 \code{0x400100}、下一条指令位于 \code{0x400104} 为例，陷阱入口保存的 \code{sepc} 是 \code{0x400100}，因为它记录触发事件的指令。系统调用处理程序完成服务后要把 \code{sepc} 增加 4，才能让 \code{sret} 返回下一条；若处理的是缺页这类可重试异常，处理程序修好页表后则保留原 \code{sepc}，让故障指令重新执行。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  % 上行：硬件完成的陷阱入口。
+  \node[hw state, minimum width=2.25cm, align=center] (u) at (0.9,3.2) {U 模式\\\code{ecall @ 0x400100}};
+  \node[hw control, minimum width=2.35cm, align=center] (check) at (3.65,3.2) {异常识别\\提交前停止};
+  \node[hw state, minimum width=2.55cm, align=center] (save) at (6.65,3.2) {写 CSR\\\code{sepc/scause/stval}};
+  \node[hw control, minimum width=2.45cm, align=center] (vector) at (9.65,3.2) {切到 S 模式\\\code{pc <- stvec}};
+  \draw[hw bus] (u) -- (check);
+  \draw[hw bus] (check) -- (save);
+  \draw[hw bus] (save) -- (vector);
+  \node[hw label] at (5.25,3.62) {硬件原子入口};
+
+  % 下行：入口汇编和处理程序完成的保存、服务与返回。
+  \node[hw state, minimum width=2.45cm, align=center] (stack) at (9.65,0.55) {入口汇编\\切线程内核栈};
+  \node[hw compute, minimum width=2.55cm, align=center] (frame) at (6.65,0.55) {保存通用寄存器\\形成 trap frame};
+  \node[hw compute, minimum width=2.35cm, align=center] (service) at (3.65,0.55) {按 \code{scause} 分派\\执行系统服务};
+  \node[hw state, minimum width=2.25cm, align=center] (ret) at (0.9,0.55) {\code{sret}\\恢复 U 模式};
+  \draw[hw bus] (vector.south) -- (9.65,1.7) -- (stack.north);
+  \draw[hw bus] (stack) -- (frame);
+  \draw[hw bus] (frame) -- (service);
+  \draw[hw bus] (service) -- (ret);
+  \draw[hw return] (ret.west) -- (-0.35,0.55) -- (-0.35,3.2) -- (u.west);
+  \node[hw label] at (5.25,0.12) {软件保存、服务并选择返回位置};
+\end{pdfdiagram}
+\diagramnote{一次 U 模式 \code{ecall} 的完整交接。上行由硬件在提交边界原子完成：记录故障 PC 与原因、保存先前特权状态、切换模式并装入向量入口；下行由入口汇编和内核完成：切栈、保存通用状态、分派服务，最后由 \code{sret} 恢复先前模式。硬件没有自动切到线程内核栈，因此“已进入 S 模式”和“已经有安全的内核栈”是两个不同边界。}
+
+RISC-V 的陷阱入口故意只保存最小架构状态，不自动把三十多个通用寄存器压入内存，也不自动选择某个进程的内核栈。入口汇编通常用 \code{sscratch} 保存当前线程的内核栈指针或临时指针，通过一次寄存器交换取得可用栈，再把通用寄存器写成 trap frame。这样设计让裸机固件、实时内核和通用操作系统可以采用不同现场布局；代价是入口最前面的几条指令必须在栈尚未建立、可用寄存器很少的条件下保持正确。
+
+\begin{longtable}{L{0.17\linewidth}L{0.28\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+状态 & 入口时记录什么 & 返回或处理时怎样使用 & 错误后的症状 \\
+\midrule
+\code{stvec} & S 模式入口基址与向量方式 & 硬件据此形成新 \code{pc} & 入口未映射或未对齐，立即再次异常 \\\tablerowrule
+\code{sepc} & 被中断或触发异常的指令地址 & 重试时保留；系统调用成功后推进 & 返回后重复执行或跳过错误指令 \\\tablerowrule
+\code{scause} & 中断标志与异常原因码 & 选择系统调用、缺页或设备事件路径 & 把不同事件送入错误处理程序 \\\tablerowrule
+\code{stval} & 故障地址或事件补充值 & 定位缺页地址、非法编码等原因 & 只能看到“发生异常”，不能定位对象 \\\tablerowrule
+\code{sstatus} & 先前特权级和中断使能状态 & \code{sret} 恢复模式与中断状态 & 过早开中断，或返回到错误特权级 \\\tablerowrule
+\code{sscratch} & 入口约定的线程指针或栈指针 & 在无安全栈时取得内核执行环境 & 使用用户栈保存特权现场，形成越权写入 \\
+\bottomrule
+\end{longtable}
+
+嵌套陷阱要求再加一层不变量：只有第一层 trap frame 已经完整、内核栈仍有容量、当前入口允许被打断时，才可以重新开放中断。若入口在保存 \code{sepc} 或通用寄存器之前再次发生异常，第二次入口会覆盖第一层证据，处理器可能失去可靠返回点。工程实现会给关键入口保留独立栈空间、设置嵌套深度或 double-trap 检测，并让无法恢复的入口故障转入受限停机路径，而不是继续使用已经不可信的现场。
+
+\section{九、原子与内存序：两个核心怎样可靠交接一份数据}
+
+原子性回答“一次读改写会不会被其他核心插入”，内存序回答“不同地址上的多次访问能以什么先后被其他观察者看到”。二者不能互相替代。一个原子地写入 \code{ready=1} 的操作，若没有 release 顺序，仍可能先于较早的 \code{payload} 写传播到另一个核心；一个全屏障能约束前后访问顺序，却不会把普通的“读—加一—写”三步自动合成不可分割的计数器更新。
+
+考虑生产者先写 \code{payload=42}，再发布 \code{ready=1}；消费者等待 \code{ready} 后读取 \code{payload}。在弱内存序机器上，普通 store 可能先进入本核 store buffer，再以不同时间传播；消费者也可能提前发出不相关的 load。正确契约是生产者用 release store 发布 \code{ready}，消费者用 acquire load 观察 \code{ready}。release 要求生产者此前的普通写先于发布动作可见；acquire 要求消费者观察到发布值之后，后续读取不能越过该观察点。两者通过同一个原子对象的同步关系，把 \code{payload} 的可见性接起来。\cite{riscv-atomics}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.0cm, align=center] (data) at (0.8,2.2) {核心 A\\写 \code{payload=42}};
+  \node[hw control, minimum width=2.05cm, align=center] (rel) at (3.45,2.2) {release store\\\code{ready=1}};
+  \node[hw memory, minimum width=2.1cm, align=center] (coh) at (6.15,2.2) {一致性可见点\\数据与标志};
+  \node[hw control, minimum width=2.05cm, align=center] (acq) at (8.85,2.2) {acquire load\\观察 \code{ready=1}};
+  \node[hw state, minimum width=2.0cm, align=center] (read) at (11.45,2.2) {核心 B\\读 \code{payload}};
+  \draw[hw bus] (data) -- (rel);
+  \draw[hw bus] (rel) -- (coh);
+  \draw[hw bus] (coh) -- (acq);
+  \draw[hw bus] (acq) -- (read);
+  \node[hw label, text width=4.4cm] at (2.1,0.75) {release 左侧：payload 写必须先发布，不能落到 ready 之后};
+  \node[hw label, text width=4.4cm] at (9.85,0.75) {acquire 右侧：payload 读取必须后发生，不能提前越过 ready};
+  \draw[hw return] (3.45,1.72) -- (3.45,1.2) -- (1.0,1.2);
+  \draw[hw return] (8.85,1.72) -- (8.85,1.2) -- (11.25,1.2);
+\end{pdfdiagram}
+\diagramnote{release/acquire 建立的发布链。箭头表达可见顺序，不是要求所有写立刻进入 DRAM：核心 A 的 payload 写可以停留在 Cache 一致性域中，只要任何观察到 release 发布值的核心 B 随后的 acquire 读取都能看到对应 payload。屏障约束的是观察顺序；Cache 刷新和持久化处理的是副本与掉电边界。}
+
+原子读改写再解决竞争本身。若两个核心都执行普通的“读计数器、加一、写回”，它们可能同时读到 7，最后都写 8，两个增加只留下一个。RISC-V 的 AMO 可以把取旧值与写新值作为一次原子事务；LR/SC 则先建立 reservation，随后只有在受监视位置没有发生破坏性竞争时，条件写才成功。SC 失败不是异常，而是“所有权已经变化”的可观察结果，软件必须回到 LR 重试；循环还要有退避或调度策略，避免高竞争下长期无法成功。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+原语 & 保证的边界 & 不自动保证 & 典型用途 \\
+\midrule
+普通 load/store & 当前地址的一次读取或写入 & 跨核心顺序、读改写不可分割 & 私有数据、已由锁保护的数据 \\\tablerowrule
+release /\allowbreak acquire & 发布前写与观察后读的跨核次序 & 整机所有访问全序、介质持久化 & 队列头尾、一次性对象发布 \\\tablerowrule
+\code{FENCE} & 指定前驱访问先于指定后继访问可见 & 把普通计数更新变成原子操作 & 内存与 I/O 顺序、协议阶段分隔 \\\tablerowrule
+AMO 或 CAS & 一个地址上的原子读改写 & 其他地址的完整事务协议 & 计数器、锁状态、无锁指针 \\\tablerowrule
+LR/SC & reservation 未被竞争破坏时条件提交 & SC 一定成功、公平性与有限重试 & 可编程原子更新循环 \\\tablerowrule
+Cache 维护/持久化 flush & 管理副本或推进掉电边界 & 替代多核同步顺序 & 非一致性 DMA、持久化存储 \\
+\bottomrule
+\end{longtable}
+
+内存与设备 I/O 还要分开选择屏障集合。描述符位于普通内存，doorbell 位于设备地址空间；只约束“内存写对内存写”的 release 不一定覆盖“内存写先于 I/O 写”这一跨域关系。ISA 和平台因此会给 \code{FENCE} 指定前驱、后继是内存读写还是设备 I/O。驱动提交时的正确问题不是“是否放置了某一道屏障”，而是“描述符写属于哪个域，doorbell 属于哪个域，设备在哪个观察点取得所有权”。把对象和观察者写清楚，才能选择恰好覆盖这条边界的顺序原语。
+\section{十、取指边界与合法译码：字节流怎样成为一条确定指令}
 
 程序存储器提供的是连续字节，处理器提交的却是一条条具有明确长度和语义的指令。定长 ISA 可以用 PC 的低位检查对齐，再按固定宽度切分；带压缩扩展的 ISA 要先读取低位长度标记；x86 一类变长 ISA 则要依次识别前缀、操作码、ModR/M、SIB、位移和立即数。无论内部前端怎样预测边界，ISA 都必须保证：给定同一组指令字节、执行模式和能力集合，合法指令的长度与软件可见语义唯一。
 
@@ -742,7 +829,7 @@ CPU 把新字节写入数据 Cache，并不自动证明取指前端和指令 Cac
 \bottomrule
 \end{longtable}
 
-\section{九、陷阱入口与返回：处理器怎样保存足够状态继续执行}
+\section{十一、陷阱入口与返回：处理器怎样保存足够状态继续执行}
 
 陷阱不是简单跳转。处理器必须先确定当前指令是否已经提交、返回 PC 指向故障指令还是后继指令、哪些特权状态需要保存，以及新处理程序使用哪套栈和地址空间。只有这些状态形成自洽快照，处理程序才能修复页表、处理系统调用或确认中断，并在返回时恢复原执行流。
 
