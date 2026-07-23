@@ -2,6 +2,7 @@ BUILD_DIR ?= build
 LATEX_SOURCE_DIR := source/latex
 PHONE_EXPORT_ROOT ?= /mnt/sdcard/STU/BOOKS
 PHONE_EXPORT_DIR := $(PHONE_EXPORT_ROOT)/按卷类型/原理卷/操作系统第一册
+SAMPLE_BOOK_DIR := ../operating-systems-evolution-sample
 CXX ?= g++
 CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -Werror
 LISTING_SOURCES := \
@@ -32,7 +33,11 @@ pdf: check
 	cd $(LATEX_SOURCE_DIR) && latexmk -xelatex -interaction=nonstopmode -halt-on-error main.tex
 
 phone-export: pdf
-	python3 ../../tools/export_book.py --source $(LATEX_SOURCE_DIR) --dest "$(PHONE_EXPORT_DIR)" --pdf-name "操作系统第一册"
+	$(MAKE) -C $(SAMPLE_BOOK_DIR) pdf
+	python3 $(SAMPLE_BOOK_DIR)/scripts/export_phone_pair.py \
+		--formal $(LATEX_SOURCE_DIR)/main.pdf \
+		--sample $(SAMPLE_BOOK_DIR)/source/latex/main.pdf \
+		--dest "$(PHONE_EXPORT_DIR)"
 
 clean:
 	rm -rf $(BUILD_DIR)
