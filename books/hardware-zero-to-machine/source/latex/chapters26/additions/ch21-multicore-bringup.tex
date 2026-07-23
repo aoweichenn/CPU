@@ -1,0 +1,100 @@
+\section{从启动核到全部核心上线：多核启动的完成边界}
+
+处理器从复位向量取到第一条指令时，整台多核机器通常还只有一个执行上下文真正推进。这个最先运行的逻辑处理器可称为启动核、bootstrap processor 或 boot hart；其他核心可能仍在复位、低功耗态或固件停车循环中。操作系统必须为每个次级核心建立独立运行环境，发出唤醒请求，并等到对方明确报告 online，才能把普通线程调度过去。
+
+\topic{启动核先建立所有核心共同依赖的地基}
+
+次级核心开始执行之前，启动核和固件要先完成共享时钟、电源域、互连一致性、主存、异常入口和基础地址转换等共同条件。若 Cache 一致性还未启用，启动核写入的启动记录可能根本不能被次级核心可靠看见；若主存仍在训练，放在 DRAM 中的栈和页表也不可用。多核启动因此不是“给另一个核一个地址”这么简单，而是一次跨核心发布事务。
+
+操作系统通常为每个核心准备一份启动记录：目标入口、临时栈顶、页表根或地址空间上下文、每核数据区、核心逻辑编号，以及本轮启动 generation。启动核填完内容后，以体系结构要求的内存顺序发布，再调用平台唤醒机制。generation 用于区分首次启动、热插拔重新上线与一次失败后的重试，防止迟到的旧确认误把新状态置为 online。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.35cm] (boot) at (1.25,4.8) {启动核运行\\枚举核心拓扑};
+  \node[hw control, minimum width=2.35cm] (shared) at (4.1,4.8) {共同依赖\\内存/互连/页表};
+  \node[hw memory, minimum width=2.35cm] (record) at (6.95,4.8) {每核启动记录\\入口、栈、代际};
+  \node[hw control, minimum width=2.35cm] (wake) at (9.8,4.8) {唤醒请求\\指向目标核心};
+
+  \node[hw state, minimum width=2.35cm] (release) at (9.8,2.4) {次级核离开\\复位或停车态};
+  \node[hw compute, minimum width=2.35cm] (trampoline) at (6.95,2.4) {低地址 trampoline\\建立最小环境};
+  \node[hw state, minimum width=2.35cm] (percpu) at (4.1,2.4) {每核状态\\异常/中断/计时器};
+  \node[hw state, minimum width=2.35cm] (ack) at (1.25,2.4) {online 确认\\写回同一代际};
+
+  \node[hw control, minimum width=2.35cm] (acquire) at (1.25,0.0) {启动核获取确认\\核对核心与代际};
+  \node[hw state, minimum width=2.35cm] (schedule) at (4.1,0.0) {加入调度集合\\允许普通线程};
+  \node[hw control, minimum width=2.35cm] (timeout) at (6.95,0.0) {超时与诊断\\记录最后阶段};
+  \node[hw state, minimum width=2.35cm] (offline) at (9.8,0.0) {隔离失败核心\\其余核心继续};
+
+  \draw[hw bus] (boot) -- (shared);
+  \draw[hw bus] (shared) -- (record);
+  \draw[hw bus] (record) -- (wake);
+  \draw[hw bus] (wake) -- (release);
+  \draw[hw bus] (release) -- (trampoline);
+  \draw[hw bus] (trampoline) -- (percpu);
+  \draw[hw bus] (percpu) -- (ack);
+  \draw[hw bus] (ack) -- (acquire);
+  \draw[hw bus] (acquire) -- (schedule);
+  \draw[hw bus, dashed] (wake.east) -- (11.25,4.8) -- (11.25,-0.75) -- (6.95,-0.75) -- (timeout.south);
+  \draw[hw bus] (timeout) -- (offline);
+\end{pdfdiagram}
+\diagramnote{一次次级核心上线事务。主路径从启动核发布记录、唤醒次级核，经过 trampoline 与每核初始化后返回 online 确认；只有启动核以匹配的 generation 获取确认后，调度器才使用该核心。虚线是超时分支，失败核心可以保持 offline，而不必让所有已健康核心一起停机。}
+
+\topic{三类平台机制不同，发布合同相同}
+
+x86 平台常由启动核通过本地中断控制器向目标 AP 发 INIT，再发送 Startup IPI；Startup IPI 提供的向量让 AP 从一个受限的低地址入口开始，因此 trampoline 要非常短，并尽快建立正常的执行模式。工程资料中常见 INIT--SIPI--SIPI 序列，第二个 SIPI 用于覆盖时序和接收不确定性；具体要求应以目标处理器手册为准。\cite{intel-sdm}
+
+Arm 平台通常由操作系统通过 PSCI \code{CPU\_ON} 请求更高特权固件建立电源域、复位和入口状态；RISC-V 平台可通过 SBI HSM 的 hart start 接口给出目标 hart、起始物理地址与 opaque 参数。\cite{arm-psci,riscv-sbi-hsm} 某些小型平台也会让次级核心上电后一直轮询 spin table。名称虽不同，它们都要传递“启动哪个执行上下文、从哪里开始、使用哪一代参数、怎样确认成功”。
+
+\begin{longtable}{L{0.18\linewidth}L{0.25\linewidth}L{0.29\linewidth}L{0.18\linewidth}}
+\toprule
+平台示例 & 唤醒入口 & 次级核心首先拥有的状态 & 必须由软件补齐 \\
+\midrule
+x86 AP 启动 & INIT 与 Startup IPI 指向 trampoline & 架构规定的启动模式和向量入口 & 模式切换、页表、栈、每核描述符与 APIC \\\tablerowrule
+Arm PSCI & \code{CPU\_ON} 给出目标 CPU 和入口 & 固件建立的电源/复位状态与约定寄存器 & 页表上下文、每核异常入口、GIC 与计时器 \\\tablerowrule
+RISC-V SBI HSM & hart start 给出 hartid、物理入口和 opaque & 固件准备的 M-mode/PMP 后进入约定特权级 & \code{satp}、陷阱向量、每 hart 数据和中断 \\\tablerowrule
+spin table & 轮询共享内存中的入口与 release 标志 & 平台上电默认状态 & 发布顺序、缓存一致性和明确确认 \\
+\bottomrule
+\end{longtable}
+
+\topic{trampoline 只解决“能跑”，每核初始化才解决“能被调度”}
+
+次级核心刚离开复位时可用环境很少：正常页表可能尚未装入，栈还未建立，每核变量也无法安全访问。trampoline 的任务是使用架构保证的最小状态找到自己的启动记录，切换到独立栈，装入地址转换上下文，再跳到统一的高层初始化入口。它不应依赖尚未建立的动态分配、普通中断或复杂运行库。
+
+进入正常地址空间后，次级核心还要初始化每核异常/陷阱入口、本地中断控制器接口、计时器、浮点/向量或扩展状态策略、性能监控和每核调度数据。启动核可能已更新微码或安全配置，次级核心要核对自身版本与能力，不能把一个能力集合不同的核心悄悄放进同一调度域。
+
+\begin{longtable}{L{0.09\linewidth}L{0.23\linewidth}L{0.29\linewidth}L{0.29\linewidth}}
+\toprule
+阶段 & 执行位置 & 核心状态 & 放行条件 \\
+\midrule
+M0 & 启动核 & 拓扑已枚举，目标核心标记为 starting & 共享基础设施已经可用 \\\tablerowrule
+M1 & 启动核 & 启动记录填写完毕 & 以规定顺序发布记录和 generation \\\tablerowrule
+M2 & 平台固件/中断控制器 & 唤醒请求已接受 & 目标电源、时钟与复位条件满足 \\\tablerowrule
+M3 & 次级核 trampoline & 能取指并使用临时地址环境 & 找到匹配自身身份的启动记录 \\\tablerowrule
+M4 & 次级核正常入口 & 独立栈、页表和每核数据可用 & 不再共享其他核心的临时栈 \\\tablerowrule
+M5 & 次级核平台初始化 & 本地中断、异常、计时器和能力核对完成 & 可以安全处理中断与调度切换 \\\tablerowrule
+M6 & 次级核 & 以 release 语义发布 online 与 generation & 所有此前初始化对启动核可见 \\\tablerowrule
+M7 & 启动核/调度器 & 以 acquire 语义读到匹配确认 & 才把核心加入可运行 CPU 集合 \\
+\bottomrule
+\end{longtable}
+
+\topic{online 位是一次发布确认，不是一盏装饰灯}
+
+次级核心必须在全部关键初始化之后写 online；启动核以匹配的内存顺序读取这个标志，才能保证它同时看到栈、每核表、异常入口等先前写入。若先写 online、后配置本地中断，调度器可能立即把线程迁入，第一次计时器中断就落入未初始化入口。
+
+同一个物理核心还可能经历 offline、热拔出和再次 online。每次启动都要使用新 generation，并清理上次遗留的 pending interrupt、计时器比较值和每核队列。仅把布尔 online 从 0 改成 1，无法区分迟到确认属于哪一次启动。
+
+\topic{失败恢复的目标是隔离，而不是无限等待}
+
+\begin{longtable}{L{0.20\linewidth}L{0.26\linewidth}L{0.29\linewidth}L{0.15\linewidth}}
+\toprule
+失败现象 & 首个可靠证据 & 处理动作 & 系统结果 \\
+\midrule
+唤醒请求未被接受 & 平台接口返回错误或目标状态不变化 & 核对目标 ID、电源域和固件能力 & 核心保持 offline \\\tablerowrule
+已离开复位但未到 trampoline 里程碑 & 取指/trace 或启动邮箱无进展 & 检查入口地址、低地址映射和复位状态 & 保存早期现场后重试或隔离 \\\tablerowrule
+trampoline 卡住 & 里程碑停在页表、栈或模式切换前后 & 核对共享记录可见性和地址上下文 & 不允许调度 \\\tablerowrule
+能力或微码不匹配 & 次级核报告的版本/特性与启动策略冲突 & 更新、降级共同能力或隔离该核 & 其余核心仍可上线 \\\tablerowrule
+online 确认超时 & 启动核计时器到期，generation 未匹配 & 记录最后阶段，取消本代启动并递增 generation & 迟到确认被拒绝 \\\tablerowrule
+上线后自检失败 & 本地中断、计时器或一致性测试异常 & 先从调度集合移除，再清空队列并下线 & 避免错误扩散到共享状态 \\
+\bottomrule
+\end{longtable}
+
+多核启动的真正完成点不是 SIPI、\code{CPU\_ON} 或 hart start 返回，而是目标核心用自己的执行流完成每核初始化，并把同一 generation 的 online 确认发布回来。到这里，硬件拓扑才从“封装里存在这些核心”转化为“操作系统可以安全使用这些核心”。

@@ -237,3 +237,14 @@
 | 第 11 章 | write-allocate 写缺失、脏牺牲行、RFO/GetM、填充合并、写入可见性与失败恢复 | verified |
 | 第 21 章 | 待机电源、按键门控、PS\_ON\#、主电源与 VRM、时钟锁定、复位释放和首取指 | verified |
 | 第 23 章 | 48 kHz 全双工音频、I²S/TDM、DMA period/ring、时钟漂移、xrun 与代际恢复 | verified |
+
+## 2026-07 DRAM 写入、虚拟机切换、多核上线与主板制造案例深化批次
+
+本批次补齐四条仍缺少完整状态链的关键通路：64B Cache line 怎样从写回队列穿过 DDR 写突发并落实到单元，处理器怎样在 guest 与 VMM 之间完成 VM Entry/Exit，启动核怎样逐个发布并验收其他核心，以及主板怎样从设计资料经过制造装联走到受控首轮上电。只增加正文、机制图和正文表格，不增加章末练习，也不改变既有迁移单元归属。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 13 章 | 64B DDR4 Cache line 写回、行冲突、PRE/ACT/WR、DQS/BL8、ECC、tWR、可见性与恢复边界 | verified |
+| 第 19 章 | VM Entry/Exit、两阶段地址转换、退出证据、模拟或重试、PC 推进、虚拟中断与失效恢复 | verified |
+| 第 21 章 | 启动核、每核启动记录、唤醒机制、trampoline、每核状态、online 确认与隔离失败核 | verified |
+| 第 21 章 | 原理图、PCB、制造资料、制板、装联、AOI/X-ray/ICT/JTAG 与受限流首轮上电 | verified |

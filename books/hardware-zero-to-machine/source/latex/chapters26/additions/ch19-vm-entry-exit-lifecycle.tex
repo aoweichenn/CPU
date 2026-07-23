@@ -1,0 +1,108 @@
+\section{一次 VM Entry 与 VM Exit：处理器怎样切换两套特权世界}
+
+虚拟化并不是“再模拟一颗 CPU”这么笼统。硬件必须在同一个物理核心上保存两套架构状态：guest 以为自己控制处理器，VMM 则决定哪些操作可以直接执行、哪些必须退出处理。下面用一笔具体事务闭合这条路径：guest 驱动向一个由 VMM 模拟的 UART MMIO 页写入字符，第二阶段页表故意不把该页映射为普通设备直通，于是处理器发生 nested page fault 并退出到 VMM。\cite{intel-sdm}
+
+\topic{进入 guest 之前，VMM 先构造可验证的运行合同}
+
+VMM 为一个 vCPU 准备控制结构，内容可归为四组：guest 的 PC、通用/控制寄存器与中断状态；退出后要恢复的 host 状态；哪些指令、异常和地址访问需要截获；第二阶段页表根、地址空间标识以及虚拟中断策略。Intel VMX 使用 VMCS，AMD SVM 使用 VMCB，Arm 与 RISC-V 的字段组织不同，但共同目标都是让处理器能在硬件边界上完成“保存一套、装入另一套”。
+
+VMM 还要把 vCPU 与当前物理核心、调度代际和内存映射代际绑定。若另一个线程正在修改第二阶段页表，必须先完成规定的同步与失效，再允许本次 Entry 使用新映射。否则 guest 可能带着旧 TLB 项运行，软件以为已经撤销的设备页仍然可达。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.35cm] (prepare) at (1.25,4.8) {VMM 准备\\guest/host 状态};
+  \node[hw control, minimum width=2.35cm] (entry) at (4.1,4.8) {VM Entry 检查\\装入控制合同};
+  \node[hw compute, minimum width=2.35cm] (guest) at (6.95,4.8) {guest 运行\\普通指令直执行};
+  \node[hw memory, minimum width=2.35cm] (store) at (9.8,4.8) {写虚拟 UART\\GVA 产生 GPA};
+
+  \node[hw control, minimum width=2.35cm] (nested) at (9.8,2.4) {第二阶段拒绝\\形成退出原因};
+  \node[hw state, minimum width=2.35cm] (exit) at (6.95,2.4) {VM Exit\\保存 guest 现场};
+  \node[hw compute, minimum width=2.35cm] (handle) at (4.1,2.4) {VMM 分派\\模拟或修复映射};
+  \node[hw state, minimum width=2.35cm] (commit) at (1.25,2.4) {提交结果\\推进或保留 PC};
+
+  \node[hw control, minimum width=2.35cm] (inject) at (1.25,0.0) {更新中断状态\\核对屏蔽窗口};
+  \node[hw control, minimum width=2.35cm] (invalidate) at (4.1,0.0) {必要时失效\\旧翻译与代际};
+  \node[hw control, minimum width=2.35cm] (reentry) at (6.95,0.0) {再次 Entry\\恢复 guest};
+  \node[hw state, minimum width=2.35cm] (resume) at (9.8,0.0) {继续下一条\\或重试原指令};
+
+  \draw[hw bus] (prepare) -- (entry);
+  \draw[hw bus] (entry) -- (guest);
+  \draw[hw bus] (guest) -- (store);
+  \draw[hw bus] (store) -- (nested);
+  \draw[hw bus] (nested) -- (exit);
+  \draw[hw bus] (exit) -- (handle);
+  \draw[hw bus] (handle) -- (commit);
+  \draw[hw bus] (commit) -- (inject);
+  \draw[hw bus] (inject) -- (invalidate);
+  \draw[hw bus] (invalidate) -- (reentry);
+  \draw[hw bus] (reentry) -- (resume);
+\end{pdfdiagram}
+\diagramnote{一次由模拟 MMIO 触发的 VM Exit/Entry 闭环。上排从控制合同进入 guest，中排在第二阶段翻译处形成精确退出并交给 VMM，下排处理虚拟中断、翻译代际和再次进入。VMM 若完成指令模拟就推进 guest PC；若只是补映射等待原指令重试，则保留 PC。}
+
+\topic{两阶段翻译既给出地址，也决定这次访问是否必须退出}
+
+guest 发出的 store 先由 guest 页表把 guest virtual address 转成 guest physical address；第二阶段页表再把 GPA 转成 host physical address。对于普通内存，两级权限都允许后，访问直接命中 Cache 或主存，VMM 不需要参与每次 load/store。对于本例的 UART 页，VMM 故意让第二阶段条目缺失或带有截获属性，处理器因此无法形成最终 HPA。
+
+此时不是“guest 发生普通缺页”这么简单。处理器记录一次虚拟化退出：访问类型是写、目标 GPA 是 UART 页、退出原因是第二阶段翻译/权限不允许，并保留能够让 VMM 判断指令是否已经产生架构副作用的信息。设备写不能既真实发生一次、又被 VMM 模拟一次；因此退出边界必须保证 VMM 知道这条访问处于“尚未提交”还是“需要补齐剩余状态”的哪一种状态。
+
+\begin{longtable}{L{0.09\linewidth}L{0.22\linewidth}L{0.29\linewidth}L{0.30\linewidth}}
+\toprule
+阶段 & 执行主体 & 已建立的状态 & 完成或失败边界 \\
+\midrule
+V0 & VMM & guest/host 状态、截获规则、二阶段根与代际已填写 & Entry 前仍要做合法性检查 \\\tablerowrule
+V1 & 处理器 Entry 逻辑 & 控制字段通过检查，host 恢复入口可用 & 检查失败时 guest 一条也不能执行 \\\tablerowrule
+V2 & guest & 普通指令直接运行，架构视图与裸机近似 & 被截获事件到来前无需 VMM \\\tablerowrule
+V3 & 地址转换硬件 & GVA 已得到 GPA，第二阶段拒绝 UART 页 & 设备写尚未提交 \\\tablerowrule
+V4 & 处理器 Exit 逻辑 & guest 现场、退出原因、GPA 和访问属性已记录 & host 状态装入后才能运行 VMM \\\tablerowrule
+V5 & VMM 处理器 & 找到对应虚拟设备，校验宽度、偏移与权限 & 非法访问要注入 guest 异常而非伪造成功 \\\tablerowrule
+V6 & VMM 提交 & 字符进入虚拟 UART 队列，guest 可见结果写回 & 模拟完成时推进 PC；重试路径不推进 \\\tablerowrule
+V7 & VMM/处理器 & 必要的 TLB 失效、虚拟中断与控制字段更新完成 & 旧代际完成不得进入新 vCPU 状态 \\\tablerowrule
+V8 & guest & 再次 Entry 后从下一条或原指令继续 & 只有 guest 架构状态一致才算闭环 \\
+\bottomrule
+\end{longtable}
+
+\topic{Exit 保存的不是“所有晶体管状态”，而是可恢复合同}
+
+VM Exit 会把架构规定的 guest 状态写回控制结构，记录退出原因及辅助信息，再装入 host 状态并转到 VMM 的退出入口。实现可以在微架构内部保留或丢弃流水线、预测器和 Cache 内容；这些并不属于 guest 可依赖的架构快照。VMM 读取退出原因后才能决定分派到 MMIO 模拟、特权指令模拟、外部中断、缺页修复或致命错误路径。
+
+退出现场也不是越多越好。硬件自动保存哪些字段、VMM 入口还要保存哪些通用寄存器，由具体架构 ABI 决定。工程上应把“硬件已保存”“汇编入口补充保存”“高层处理器允许修改”分成清晰层次，否则一个寄存器会在异常路径上被悄悄覆盖。
+
+\topic{模拟完成与修复后重试，PC 处理正好相反}
+
+本例若由 VMM 模拟 UART，VMM 读取 store 的数据和访问宽度，把字符放入虚拟发送 FIFO，并按虚拟设备模型更新状态。由于原 store 不会再执行，VMM 必须把 guest PC 推进到下一条指令；必要时还要安排一个虚拟中断，表示发送队列出现新空间或操作完成。
+
+另一种退出可能来自普通 guest 内存的第二阶段缺页。VMM 分配 host 页、补上第二阶段映射并做所需失效后，通常让原指令重试。此时 guest PC 不能前进，否则那次 load/store 会被跳过。判断依据不是“退出原因看起来像缺页”，而是 VMM 是否已经替原指令完成了架构效果。
+
+\begin{longtable}{L{0.21\linewidth}L{0.25\linewidth}L{0.25\linewidth}L{0.19\linewidth}}
+\toprule
+退出类型 & VMM 的主要动作 & guest PC & 恢复后的第一件事 \\
+\midrule
+模拟 MMIO 写 & 更新虚拟设备和可见状态 & 推进到下一条 & 执行后续指令 \\\tablerowrule
+补二阶段普通页 & 分配/固定 host 页，更新映射并失效旧翻译 & 保持不变 & 重试原访存 \\\tablerowrule
+截获特权指令 & 校验权限并模拟允许的结果，或注入异常 & 成功模拟时推进 & 看到模拟结果或异常 \\\tablerowrule
+外部中断导致退出 & VMM 处理 host 事件，决定是否注入虚拟中断 & 通常保持架构边界 & 从被打断位置继续 \\\tablerowrule
+guest 致命状态 & 保存诊断并停止该 vCPU/虚拟机 & 不再继续 & 管理面看到失败 \\
+\bottomrule
+\end{longtable}
+
+\topic{虚拟中断也有“请求、可注入、已接受”三个时刻}
+
+VMM 把虚拟中断标为 pending，并不代表 guest 已经进入中断处理程序。guest 可能屏蔽该优先级，正在不可中断窗口，或者该 vCPU 尚未被调度。传统实现可能等到合适的 Entry 注入；posted interrupt 等硬件路径则可在条件满足时减少一次 Exit，但仍要维护向量归属、pending 状态和重放规则。
+
+若 Exit 的原因本身是 host 外部中断，VMM 先完成 host 侧中断处理，再决定它属于 host、某个 guest，还是一个可合并的设备完成。直通设备配合 interrupt remapping 时，目标 vCPU 和向量由受保护表项决定；复位或迁移后必须更新代际，防止旧设备完成落到已经重用的 vCPU 队列。
+
+\topic{Entry 失败和 Exit 后失败必须分开}
+
+\begin{longtable}{L{0.20\linewidth}L{0.26\linewidth}L{0.29\linewidth}L{0.15\linewidth}}
+\toprule
+故障 & 首个可靠证据 & 处理原则 & guest 可见结果 \\
+\midrule
+Entry 控制字段非法 & Entry 检查失败码，guest 未执行 & 修正控制结构或停止 vCPU & 不得推进 guest 时间线 \\\tablerowrule
+第二阶段映射代际过旧 & 映射版本与 vCPU/TLB 代际不一致 & 阻止 Entry，失效后重新装入 & 继续前不暴露旧页 \\\tablerowrule
+MMIO 宽度或偏移非法 & 退出信息与设备模型不匹配 & 向 guest 注入规定异常或设备错误 & 不能默默丢写 \\\tablerowrule
+VMM 模拟过程中 host 故障 & host 异常现场指向 VMM 处理路径 & 由 host 内核恢复或终止虚拟机 & 不重复提交半次模拟 \\\tablerowrule
+vCPU 迁移遇到迟到完成 & 完成项携带旧 vCPU/映射代际 & 丢弃或回收旧代际，重新路由合法事件 & 不污染新运行实例 \\\tablerowrule
+退出风暴 & 同一 PC/原因高频重复，前进计数停滞 & 限流并检查 PC 推进、映射和中断窗口 & 性能下降但保留诊断 \\
+\bottomrule
+\end{longtable}
+
+VM Entry/Exit 的完成边界可以归结为一句话：重新进入 guest 之前，VMM 必须让 guest 架构状态看起来像某条指令完整发生、完整重试或明确失败，三者只能选一。只要 PC、内存映射、虚拟设备状态和中断状态中有一项仍处于旧代际，再快的硬件切换也不是一次正确的虚拟化事务。

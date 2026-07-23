@@ -1822,6 +1822,119 @@ PHY 训练或采样失败 & lane 错误、训练窗口不足、重复校验异�
 \end{longtable}
 
 这笔事务把四个常被混淆的边界分开了：RD 被接受表示列命令进入 DRAM；最后一个 DQS beat 表示线上的 64B 已到齐；ECC 和返回缓冲完成表示控制器拥有可信的完整结果；Cache line 置 valid 并唤醒等待者，才是处理器侧可见完成。故障恢复必须保留这四层证据，才能判断问题发生在调度、命令、PHY 还是数据完整性。
+\section{六、一次 64B DDR4 写入：从脏 Cache line 到 DRAM 单元}
+
+读取事务回答“数据怎样回来”，写入事务还要回答另外三个问题：谁先取得这条 Cache line 的最终版本，控制器何时可以向上游报告接收，以及数据什么时候真正越过 DRAM 的写恢复边界。下面沿用前一节的教学配置：DDR4-3200、64 bit 通道、BL8，$t_{\mathrm{CK}}=0.625$ns；取 $t_{\mathrm{RP}}=t_{\mathrm{RCD}}=13.75$ns，示例速度档的 $t_{\mathrm{WR}}=15$ns。实际时序仍由 SPD、器件规格和训练结果共同决定。
+
+设 LLC 要写回一条 64B 脏 Cache line。内存控制器把地址解码到 channel 0、rank 0、bank group 1、bank 2、row \code{0x2345}。该 bank 当前打开的是另一行，并且已经满足最小开行时间，因此控制器需要先 PRE，再 ACT，最后才发 WR。64 bit 通道每个数据 beat 搬运 8B，BL8 的八次双沿传输用四个器件时钟完成，正好覆盖整条 64B Cache line。
+
+\topic{写请求先取得队列身份，再取得总线与 bank}
+
+LLC 交出的不只是 64B 数据，还包括物理地址、byte enable、事务身份和错误属性。控制器先为它分配写队列项；若平台使用带外 ECC，ECC bit 在进入 PHY 前由控制器根据最终数据生成。整行写回的所有 byte enable 都有效；若上游只修改部分字节，控制器还可能先合并旧数据，或使用器件支持的写掩码。不能把“写队列已经收下”误解成“DRAM 单元已经改写”。
+
+写队列使控制器可以成批调度写请求，减少 DQ 总线在读方向与写方向之间频繁换向。选中本请求后，调度器还要核对 bank 状态、刷新期限、读写换向窗口以及功耗约束。若目标行已打开，PRE 与 ACT 可以省去；若旧行仍未满足 $t_{\mathrm{RAS}}$，即使请求已经等待很久，也不能提前关闭它。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.35cm] (llc) at (1.25,4.8) {LLC 写回\\地址、64B、掩码};
+  \node[hw state, minimum width=2.35cm] (queue) at (4.1,4.8) {写队列项\\身份与代际};
+  \node[hw compute, minimum width=2.35cm] (ecc) at (6.95,4.8) {合并与 ECC\\形成最终 bit};
+  \node[hw control, minimum width=2.35cm] (schedule) at (9.8,4.8) {地址调度\\选择 rank/bank};
+
+  \node[hw control, minimum width=2.35cm] (preact) at (9.8,2.4) {PRE/ACT\\关闭旧行再开行};
+  \node[hw control, minimum width=2.35cm] (write) at (6.95,2.4) {WR 命令\\约定突发位置};
+  \node[hw compute, minimum width=2.35cm] (phy) at (4.1,2.4) {PHY 驱动\\DQS 与八个 beat};
+  \node[hw memory, minimum width=2.35cm] (cells) at (1.25,2.4) {列通路与单元\\锁存新数据};
+
+  \node[hw state, minimum width=2.35cm] (twr) at (1.25,0.0) {$t_{\mathrm{WR}}$\\保持该行可恢复};
+  \node[hw state, minimum width=2.35cm] (bankdone) at (4.1,0.0) {bank 可继续\\读写或预充};
+  \node[hw state, minimum width=2.35cm] (visible) at (6.95,0.0) {控制器完成\\顺序条件闭合};
+  \node[hw control, minimum width=2.35cm] (recover) at (9.8,0.0) {错误或超时\\保存证据再恢复};
+
+  \draw[hw bus] (llc) -- (queue);
+  \draw[hw bus] (queue) -- (ecc);
+  \draw[hw bus] (ecc) -- (schedule);
+  \draw[hw bus] (schedule) -- (preact);
+  \draw[hw bus] (preact) -- (write);
+  \draw[hw bus] (write) -- (phy);
+  \draw[hw bus] (phy) -- (cells);
+  \draw[hw bus] (cells) -- (twr);
+  \draw[hw bus] (twr) -- (bankdone);
+  \draw[hw bus] (bankdone) -- (visible);
+  \draw[hw bus] (visible) -- (recover);
+\end{pdfdiagram}
+\diagramnote{一条 64B 写回的三层状态链。上排完成接收、合并和调度，中排把命令与数据真正送入目标 bank，下排等待写恢复并闭合可见性。图中的“控制器完成”不是持久化保证；DRAM 断电后仍会丢失内容。}
+
+\topic{WR 命令与写数据是配对的两个阶段}
+
+PRE 关闭旧行，经过 $t_{\mathrm{RP}}$ 才能 ACT；ACT 把 row \code{0x2345} 带入感放，经过 $t_{\mathrm{RCD}}$ 才能 WR。WR 命令在命令/地址线上给出 bank 与 column，并约定写突发何时开始。经过 CAS Write Latency 后，控制器 PHY 驱动 DQS 和 DQ；与读取时由 DRAM 驱动不同，写入时控制器是 DQ 总线的发送方，DRAM 以 DQS 边沿为采样参考。
+
+PHY 把控制器内部较宽的数据字拆成八个 beat，并使用训练得到的每 lane 延迟与电压参数对齐信号。DRAM 的 I/O 门控把这些 bit 送入目标列，再由感放和写驱动改变相应单元的电荷状态。BL8 的总线占用约为 $4t_{\mathrm{CK}}=2.5$ns，但数据最后一拍到达并不表示 bank 可以立刻 PRE：目标行还必须保持至少 $t_{\mathrm{WR}}$，让内部写入和恢复稳定完成。
+
+\begin{longtable}{L{0.10\linewidth}L{0.20\linewidth}L{0.28\linewidth}L{0.31\linewidth}}
+\toprule
+阶段 & 命令或事件 & 数据与 bank 状态 & 尚未完成的边界 \\
+\midrule
+\endfirsthead
+\toprule
+阶段（续） & 命令或事件 & 数据与 bank 状态 & 尚未完成的边界 \\
+\midrule
+\endhead
+W0 & 写队列接收 & 64B、地址、掩码与身份已经锁存 & 尚未选择命令发射时刻 \\\tablerowrule
+W1 & PRE & 旧行关闭，位线回到预充状态 & $t_{\mathrm{RP}}$ 前不能 ACT \\\tablerowrule
+W2 & ACT row \code{0x2345} & 目标行进入感放和 row buffer & $t_{\mathrm{RCD}}$ 前不能 WR \\\tablerowrule
+W3 & WR target column & DRAM 记住目标列和突发安排 & DQ 上还没有本次有效数据 \\\tablerowrule
+W4 & 首个 DQS/DQ beat & DRAM 开始按 lane 采样 & 64B 尚未全部到达 \\\tablerowrule
+W5 & 第八个 beat 结束 & 完整 64B 已越过外部数据引脚 & 内部写恢复尚未闭合 \\\tablerowrule
+W6 & $t_{\mathrm{WR}}$ 到期 & 目标行的写恢复要求满足 & 此后才能按约束 PRE 或转入后续操作 \\\tablerowrule
+W7 & 顺序与错误状态闭合 & 控制器可退休队列项并释放相关资源 & 仍不代表数据具备断电持久性 \\
+\bottomrule
+\end{longtable}
+
+若只看介质侧的简化关键路径，行冲突写入包含 $t_{\mathrm{RP}}+t_{\mathrm{RCD}}$、写命令到突发的等待、2.5ns 的 BL8 以及最后一个 beat 后的 $t_{\mathrm{WR}}$。这些时段并非都能简单相加为处理器看到的延迟：控制器可能提前接收写回，也能在不同 bank 间交叠命令；相反，写队列排队、刷新和读写换向会增加尾延迟。真正可靠的做法是分别记录“上游接收”“命令发射”“数据突发结束”和“写恢复结束”四个时间戳。
+
+\topic{部分写入的困难不在 64B，而在最终 bit 是否齐全}
+
+Cache 常以整条 line 写回，因此控制器通常拥有最终 64B，可以直接重新计算 ECC。设备小写、非缓存写或字节存储合并不足时，请求可能只带部分 byte enable。此时平台可以在控制器内与队列中的旧写合并，可以先读出原数据再做 read--modify--write，也可以在器件和接口支持时使用写掩码。无论采用哪种方法，ECC 都必须对应“合并后的最终数据”，不能拿旧 ECC 配新数据。
+
+这也解释了为什么 byte mask、ECC 和原子性是三个不同概念。掩码决定哪些 byte 被物理修改；ECC 保护最后的码字；原子性说明其他观察者能否看到中间组合。接口支持字节掩码，并不自动保证任意跨 Cache line 写是原子的。跨越两条 line 的存储仍可能拆成两笔独立事务，掉电或异常时只完成其中一笔。
+
+\topic{写完成至少有五种口径}
+
+\begin{longtable}{L{0.22\linewidth}L{0.29\linewidth}L{0.38\linewidth}}
+\toprule
+口径 & 已经成立的事实 & 仍不能推出 \\
+\midrule
+进入 store buffer & 核心已保存待提交写入 & 其他核心或内存控制器已经看到 \\\tablerowrule
+进入一致性与 LLC & Cache line 所有权和新数据已在缓存层闭合 & 数据已经到 DRAM \\\tablerowrule
+内存控制器接收 & 写队列保有完整数据和身份，可对上游施加顺序 & WR 与 DQ 突发已经发生 \\\tablerowrule
+最后一个 DQ beat 被采样 & 64B 已越过 DDR 引脚 & $t_{\mathrm{WR}}$ 已满足、bank 可预充 \\\tablerowrule
+控制器退休写项 & 命令、数据、恢复和所需顺序条件已闭合 & 断电后仍能保留；DRAM 不是持久介质 \\
+\bottomrule
+\end{longtable}
+
+普通程序关心的通常是内存一致性模型定义的可见性；内存控制器关心写队列资源和 bank 时序；电源故障分析则必须追到数据是否仍只在易失缓冲或 DRAM 中。持久化语义只有在使用具备持久性的介质、平台提供相应冲刷与电源失败保护，并满足其完成协议时才成立，不能由一次 DDR 写突发推导出来。
+
+\topic{错误处理要防止“早确认、晚失败”变成静默损坏}
+
+\begin{longtable}{L{0.20\linewidth}L{0.25\linewidth}L{0.29\linewidth}L{0.16\linewidth}}
+\toprule
+故障或竞争 & 首个可靠证据 & 恢复动作 & 对上游的结果 \\
+\midrule
+\endfirsthead
+\toprule
+故障或竞争（续） & 首个可靠证据 & 恢复动作 & 对上游的结果 \\
+\midrule
+\endhead
+刷新或高优先级读抢占 & 写项仍在队列，命令尚未发射 & 保持身份并重新仲裁，防止超龄 & 只增加延迟 \\\tablerowrule
+PHY 眼图余量不足 & lane 校验、训练或运行期错误计数异常 & 降速、重训或隔离 channel/rank & 不得继续静默接收 \\\tablerowrule
+写 CRC/命令校验异常 & 器件或链路报告校验失败；能力依平台而定 & 按平台协议重试、记录地址与代际，必要时复位 rank & 返回可追踪错误 \\\tablerowrule
+$t_{\mathrm{WR}}$ 前错误 PRE & 控制器时序检查或数据校验出现违规证据 & 停止相关 bank，保存最近命令 trace & 该数据不能视为可信 \\\tablerowrule
+命令已发后超时 & 队列未得到预期进展，超时计数到期 & 冻结新请求，分级复位 PHY/channel 并丢弃旧代际完成 & 上报机器检查或 poison \\\tablerowrule
+上游已经收到早确认后才发现错误 & 队列身份可回溯到物理地址与请求者 & 记录不可纠正错误、隔离页或停止系统 & 不能伪装成成功 \\
+\bottomrule
+\end{longtable}
+
+完整写事务因此不是“发一个 WRITE 命令”这么简单。它从最终数据和所有权开始，穿过调度、命令、DQS/DQ、单元写入与 $t_{\mathrm{WR}}$，最后才关闭顺序和错误状态。读写两条 trace 合在一起后，DRAM 控制器的核心职责才完整显现：它既是地址与命令翻译器，也是并发调度器、时序守门人和错误证据的保管者。
 
 \section*{章末练习}
 
