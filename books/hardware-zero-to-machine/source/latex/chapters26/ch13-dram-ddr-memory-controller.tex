@@ -1935,6 +1935,139 @@ $t_{\mathrm{WR}}$ 前错误 PRE & 控制器时序检查或数据校验出现违�
 \end{longtable}
 
 完整写事务因此不是“发一个 WRITE 命令”这么简单。它从最终数据和所有权开始，穿过调度、命令、DQS/DQ、单元写入与 $t_{\mathrm{WR}}$，最后才关闭顺序和错误状态。读写两条 trace 合在一起后，DRAM 控制器的核心职责才完整显现：它既是地址与命令翻译器，也是并发调度器、时序守门人和错误证据的保管者。
+\section{七、一次 DDR5 64B 写与运行期恢复：从双子通道到 RAS}
+
+前面的 DDR4 写事务使用 64 bit 通道与 BL8，一次突发恰好搬完 64B。DDR5 DIMM 把同一组 64 bit 数据引脚组织成两个可独立发命令的 32 bit 子通道；在一个 32 bit 子通道上，BL16 仍恰好搬运一条 64B Cache line：
+\[
+  \frac{32\ \mathrm{bit}}{8}\times 16=64\ \mathrm{B}.
+\]
+这种改变没有让 Cache line 变大，而是把一个较宽的调度域拆成两个较窄的调度域。两个子通道可以分别选择 bank、排队和传输，控制器因而有更多机会避开 bank 冲突。下面以 DDR5-4800 为教学配置，沿一条 64B 写回解释子通道选择、BL16、链路侧 ECC、on-die ECC、运行期裕量监视和恢复。具体时序、训练项目与 RAS 能力仍应以处理器、DIMM、SPD 与平台固件为准。\cite{micron-ddr5}
+
+\topic{地址先选子通道，事务身份不能被拆丢}
+
+LLC 把物理地址、64B 最终数据、byte enable、请求身份和错误属性交给内存控制器。地址映射先选 channel、DIMM、rank、子通道、bank group、bank、row 与 column。本例落在子通道 A 的某个 bank；子通道 B 可以在同一时段处理另一笔兼容事务，不必陪同 A 一起等待。
+
+控制器为写入分配队列项，并记录映射代际。若系统使用带外 ECC，控制器根据最终 64B 数据形成系统级校验位；带 ECC 的 DIMM 会为每个子通道提供相应的额外校验数据通路。这个系统级 ECC 保护控制器、封装、DIMM 连接和 DRAM 数据路径所构成的可见码字。DDR5 芯片内部的 on-die ECC 则使用器件私有校验位保护芯片内部阵列，二者不是同一份校验信息，也不能互相替代。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.35cm] (line) at (1.25,4.9) {LLC 写回\\64B 与身份};
+  \node[hw control, minimum width=2.35cm] (map) at (4.1,4.9) {地址映射\\选子通道与 bank};
+  \node[hw compute, minimum width=2.35cm] (secc) at (6.95,4.9) {系统级 ECC\\形成外部码字};
+  \node[hw control, minimum width=2.35cm] (sched) at (9.8,4.9) {命令调度\\ACT/WR 与 BL16};
+
+  \node[hw compute, minimum width=2.35cm] (phy) at (9.8,2.45) {PHY 驱动\\32 bit DQ 与 DQS};
+  \node[hw memory, minimum width=2.35cm] (odecc) at (6.95,2.45) {on-die ECC\\形成内部码字};
+  \node[hw memory, minimum width=2.35cm] (array) at (4.1,2.45) {阵列写入\\满足恢复时序};
+  \node[hw state, minimum width=2.35cm] (retire) at (1.25,2.45) {写项退休\\关闭顺序状态};
+
+  \node[hw state, minimum width=2.35cm] (telemetry) at (1.25,0.0) {运行期遥测\\错误、温度、裕量};
+  \node[hw control, minimum width=2.35cm] (drain) at (4.1,0.0) {排空受影响域\\冻结新事务};
+  \node[hw compute, minimum width=2.35cm] (repair) at (6.95,0.0) {重训练或修复\\更新参数与代际};
+  \node[hw state, minimum width=2.35cm] (resume) at (9.8,0.0) {验证后恢复\\或降级隔离};
+
+  \draw[hw bus] (line) -- (map);
+  \draw[hw bus] (map) -- (secc);
+  \draw[hw bus] (secc) -- (sched);
+  \draw[hw bus] (sched) -- (phy);
+  \draw[hw bus] (phy) -- (odecc);
+  \draw[hw bus] (odecc) -- (array);
+  \draw[hw bus] (array) -- (retire);
+  \draw[hw bus] (retire) -- (telemetry);
+  \draw[hw bus] (telemetry) -- (drain);
+  \draw[hw bus] (drain) -- (repair);
+  \draw[hw bus] (repair) -- (resume);
+\end{pdfdiagram}
+\diagramnote{DDR5 写入与运行期恢复的三层状态链。上排形成子通道可见的外部码字，中排完成 32 bit、BL16 数据突发和芯片内部编码，下排处理运行期裕量下降。on-die ECC 位不会出现在系统内存总线上；系统级 ECC 与器件内部 ECC 分别保护不同故障域。}
+
+\topic{BL16 只说明传输个数，不说明整笔写入已经完成}
+
+DDR5-4800 的数据传输率为每引脚每秒 4800 mega-transfer，单个传输单位 UI 约为
+\[
+  t_{\mathrm{UI}}=\frac{1}{4.8\times 10^9}\approx 208.3\ \mathrm{ps}.
+\]
+BL16 占用约 $16t_{\mathrm{UI}}=3.33$ns。这个数字是理想数据突发窗口，不包括排队、行冲突、ACT 到 WR、写延迟、总线换向和最后一个数据 beat 后的写恢复时间。32 bit 子通道并没有把一条 64B line 拆成两个必须分别提交的半行；本例由同一子通道的 16 个 beat 承载全部 64B，并由同一写队列身份跟踪到完成。
+
+\begin{longtable}{L{0.09\linewidth}L{0.23\linewidth}L{0.29\linewidth}L{0.29\linewidth}}
+\toprule
+阶段 & 所有者或接口 & 已建立的事实 & 仍未跨过的边界 \\
+\midrule
+\endfirsthead
+\toprule
+阶段（续） & 所有者或接口 & 已建立的事实 & 仍未跨过的边界 \\
+\midrule
+\endhead
+D0 & LLC/控制器 & 64B 最终数据、掩码、身份被写队列接收 & 尚未选择子通道发射时刻 \\\tablerowrule
+D1 & 地址映射器 & channel、rank、子通道、bank 与 row 已确定 & 目标 bank 可能仍有旧行或刷新任务 \\\tablerowrule
+D2 & ECC/调度器 & 系统级 ECC 和命令序列已形成 & 数据尚未越过 DIMM 引脚 \\\tablerowrule
+D3 & DDR PHY & WR 对应的 DQS/DQ 窗口开始 & 16 个 beat 尚未全部采样 \\\tablerowrule
+D4 & DRAM I/O & 32 bit 数据路径完成 BL16 & 芯片内部编码与写恢复仍要闭合 \\\tablerowrule
+D5 & DRAM 阵列 & on-die ECC 私有码字写入并满足时序 & 控制器仍要核对错误与顺序状态 \\\tablerowrule
+D6 & 内存控制器 & 队列项可退休，相关资源可重用 & 仍不具有断电持久性 \\
+\bottomrule
+\end{longtable}
+
+若一条 Cache line 跨越控制器规定的交织边界，地址映射可以把相邻 line 分散到不同子通道，但不能在未定义原子性的情况下把一笔架构原子写任意拆散。映射函数还要与错误地址解码、巡检和页隔离共用；否则日志中的物理地址无法还原到出错 DIMM、rank、子通道和器件位置。
+
+\topic{系统级 ECC 与 on-die ECC 回答的是两类问题}
+
+on-die ECC 的主要价值，是在 DRAM 芯片读出内部阵列码字时纠正其覆盖范围内的单 bit 错误，再把数据送到外部 DQ。系统通常看不到内部校验位，也不能仅凭一次正常读取判断内部是否发生过纠正；是否提供可读的错误统计取决于器件与平台能力。系统级 ECC 在内存控制器侧重新检查外部码字，可以发现或纠正从器件输出、封装、焊点、DIMM 连接到控制器接收路径上的部分错误。
+
+\begin{longtable}{L{0.19\linewidth}L{0.24\linewidth}L{0.25\linewidth}L{0.22\linewidth}}
+\toprule
+保护层 & 校验位位置 & 主要覆盖范围 & 不能单独保证 \\
+\midrule
+DDR5 on-die ECC & DRAM 芯片内部，不占用普通数据引脚 & 芯片内部阵列码字中的受覆盖错误 & DIMM 连接、DQ 链路和整颗器件失效 \\\tablerowrule
+系统级 ECC & 控制器生成，经 DIMM 额外数据位传送 & 外部可见码字、链路和部分器件故障 & 所有多 bit、整 rank 或控制器共同失效 \\\tablerowrule
+链路 CRC/奇偶校验 & 命令或数据传输协议规定的位置 & 传输过程中被覆盖的瞬态错误 & DRAM 单元长期保持和软件地址正确性 \\\tablerowrule
+端到端数据校验 & 软件、设备或持久化格式保存 & 跨内存、I/O 与介质的内容一致性 & 自动定位具体坏 lane 或坏单元 \\
+\bottomrule
+\end{longtable}
+
+因此“DDR5 有 on-die ECC”不能推出普通消费级内存具备服务器 ECC DIMM 的系统级保护。反过来，系统级 ECC 报告一次可纠正错误，也不能立刻断言 DRAM 单元损坏；链路采样裕量、连接器接触、供电噪声和控制器时序都在外部码字的故障域中。可靠诊断必须同时保留物理地址、syndrome、子通道、lane、温度、电压、训练参数和时间分布。
+
+\topic{训练不是一次性校准，运行期重训练也不能直接插进事务中间}
+
+开机训练通过读写校准、DQS 门控、每 bit deskew、Vref 搜索和均衡参数选择，把板级时延与模拟裕量收敛为 PHY 可用参数。系统运行后，温度、电压、老化和相邻活动会改变眼图。部分控制器可以根据错误计数、PHY 监视器或定期维护窗口执行运行期校准；这是一项平台能力，不应把某种实现误写成所有 DDR5 系统都强制执行的统一流程。
+
+重训练前必须先定义受影响域。只调整一个 lane，也可能要求停止整个子通道的数据传输。控制器先禁止新请求进入该域，等待已发出的读写、刷新依赖和错误报告回收；随后保存旧参数和新 generation，再在受控模式下扫描延迟、Vref 或均衡点。候选参数只有通过规定的读写模式和错误阈值验证后才能发布。失败时应恢复旧参数、降低速率或隔离 rank/channel，不能把半套新参数留给普通流量。
+
+\begin{longtable}{L{0.10\linewidth}L{0.24\linewidth}L{0.29\linewidth}L{0.27\linewidth}}
+\toprule
+状态 & 动作 & 必须保存的证据 & 放行条件 \\
+\midrule
+R0 & 监视错误率、温度、电压与 PHY 裕量 & 时间窗、lane、地址分布和当前参数版本 & 未越阈值时继续服务 \\\tablerowrule
+R1 & 冻结受影响子通道的新请求 & 冻结时刻与在途队列身份 & 新事务不再进入 \\\tablerowrule
+R2 & 排空已发命令并满足刷新约束 & 最后完成身份、bank 状态和刷新期限 & 不存在使用旧参数的在途事务 \\\tablerowrule
+R3 & 扫描写时序、读门控、Vref 或均衡参数 & 每 lane 窗口与失败点 & 得到满足策略的公共工作区 \\\tablerowrule
+R4 & 用受控模式验证候选参数 & 错误计数、温压条件和 generation & 验证覆盖达到平台要求 \\\tablerowrule
+R5 & 原子发布新参数并恢复调度 & 新旧版本和恢复时刻 & 普通流量只看到完整的一代参数 \\\tablerowrule
+R6 & 验证失败时降级或隔离 & 最后安全速率、坏 lane/rank 与页范围 & 不再向上层报告静默成功 \\
+\bottomrule
+\end{longtable}
+
+\topic{RFM、ECS 与 PPR 处在不同的时间尺度}
+
+DDR5 增加的 RAS 机制不能概括为一个“自动修复”开关。Refresh Management（RFM）让控制器根据激活压力触发额外的器件内部管理，目标是限制高频 ACT 对相邻单元保持能力的影响。Error Check and Scrub（ECS）在器件内部检查并纠正其覆盖范围内的错误，可用于周期性巡检。Post-Package Repair（PPR）在器件与平台支持时把故障行替换到备用资源；hard PPR 与 soft PPR 的保持和调用语义不同，必须按器件资料执行。\cite{micron-ddr5}
+
+\begin{longtable}{L{0.18\linewidth}L{0.25\linewidth}L{0.27\linewidth}L{0.20\linewidth}}
+\toprule
+机制 & 触发依据 & 主要动作 & 完成后仍要做什么 \\
+\midrule
+RFM & bank 激活压力或控制器策略 & 给器件一个内部管理机会，降低高激活风险 & 继续监视性能、刷新期限与错误趋势 \\\tablerowrule
+ECS & 周期维护或平台显式安排 & 检查器件内部码字并在覆盖范围内纠正 & 读取可用状态，关联地址与时间趋势 \\\tablerowrule
+内存巡检 scrub & 系统级 ECC 策略与后台带宽预算 & 读出、纠正并把修正数据写回系统内存 & 对重复地址升级隔离或维修 \\\tablerowrule
+PPR & 稳定复现的行故障且器件允许修复 & 用备用资源替换故障行 & 验证修复、记录消耗的备用资源 \\\tablerowrule
+降速/降级/隔离 & 裕量或不可纠正错误越限 & 降低数据率、关闭 rank/channel 或隔离页 & 更新可用容量并向管理面报告 \\
+\bottomrule
+\end{longtable}
+
+错误升级应同时看强度和趋势。一个被系统级 ECC 纠正的偶发 bit 可以先计数并巡检；同一地址、同一 lane 或同一时间窗反复出现，则提示稳定缺陷或共享环境问题。出现不可纠正错误时，控制器要阻止损坏数据继续被当成普通 line 使用，向处理器报告机器检查或 poison，并让操作系统隔离页、终止受影响执行或触发平台恢复。
+
+\topic{恢复完成的判据是“新代际可验证”，不是错误计数暂时归零}
+
+一次可靠恢复至少要满足四项条件：旧代际在途事务全部回收；新训练或修复参数以完整版本发布；受控读写验证覆盖了目标 lane、rank 与温压条件；系统级错误日志能够把恢复前后的地址和 generation 区分开。错误计数器被清零只能开始一个新观察窗口，不能证明根因已经消失。
+
+DDR5 的高级特性由此形成一条连续通路：子通道化增加调度并行度，BL16 在较窄数据总线上保持 64B 传输效率，on-die ECC 改善器件内部阵列可靠性，系统级 ECC 继续保护外部可见路径，而 RFM、ECS、巡检、重训练、PPR 和降级策略把一次错误扩展成可观测、可恢复的生命周期。只有把这些层的证据边界分开，才能判断“写入已接收”“数据已进入阵列”“错误已纠正”和“平台已恢复”分别在何时成立。
 
 \section*{章末练习}
 

@@ -1,0 +1,141 @@
+\section{多插槽 NUMA 启动与 CPU 热插拔：拓扑怎样上线和退出}
+
+单插槽多核启动只要回答“目标核心能否进入调度集合”。多插槽服务器还要回答另外三件事：每段内存物理上靠近哪个处理器，跨插槽访问经过哪条一致性互连，处理器或内存从系统中移除时谁接管它原来拥有的任务、中断和页。NUMA（non-uniform memory access）不是“远端内存比较慢”这一句现象描述，而是一份由硬件、固件和操作系统共同维护的资源拓扑合同。
+
+\topic{物理地址统一，访问代价却由 home node 和路径决定}
+
+每个插槽通常包含若干核心、最后级 Cache、内存控制器和一致性/主代理。接在本插槽控制器上的 DRAM 是本地内存；另一个插槽的核心访问该地址时，请求先穿过跨插槽一致性链路，到目标地址的 home node 查询目录和所有权，再访问对应内存控制器。程序仍使用一个系统物理地址空间，不需要把“远端”编码进 load/store 指令，但延迟、带宽和链路竞争会不同。
+
+地址交织会改变粒度。平台可以把连续大区域归属一个 node，也可以按较细粒度在多个控制器或插槽间交织，以换取带宽和容错。操作系统只有拿到与真实硬件一致的 affinity 和 distance，才能让首次触碰、线程迁移、页迁移和设备中断亲和性做出合理决策。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.35cm] (bsp) at (1.25,4.9) {Socket 0 启动核\\取得平台控制};
+  \node[hw control, minimum width=2.35cm] (fabric) at (4.1,4.9) {发现一致性\\fabric 链路\\核对 home};
+  \node[hw memory, minimum width=2.35cm] (memory) at (6.95,4.9) {训练各插槽内存\\形成地址窗口};
+  \node[hw state, minimum width=2.35cm] (tables) at (9.8,4.9) {发布 ACPI 拓扑\\CPU、node\\与 distance};
+
+  \node[hw control, minimum width=2.35cm] (wake) at (9.8,2.45) {逐插槽唤醒 AP\\绑定 proximity\\domain};
+  \node[hw state, minimum width=2.35cm] (online) at (6.95,2.45) {上线 CPU 与内存\\加入调度和分配};
+  \node[hw compute, minimum width=2.35cm] (place) at (4.1,2.45) {NUMA 放置\\线程、页、IRQ};
+  \node[hw state, minimum width=2.35cm] (service) at (1.25,2.45) {稳定运行\\监视远端流量};
+
+  \node[hw control, minimum width=2.35cm] (block) at (1.25,0.0) {CPU offline\\阻止新任务\\与 IRQ};
+  \node[hw compute, minimum width=2.35cm] (migrate) at (4.1,0.0) {迁移并排空\\任务、timer\\与每核队列};
+  \node[hw control, minimum width=2.35cm] (quiesce) at (6.95,0.0) {架构停机\\退出中断与\\一致性活动};
+  \node[hw state, minimum width=2.35cm] (removed) at (9.8,0.0) {确认 offline\\再允许电源\\或物理移除};
+
+  \draw[hw bus] (bsp) -- (fabric);
+  \draw[hw bus] (fabric) -- (memory);
+  \draw[hw bus] (memory) -- (tables);
+  \draw[hw bus] (tables) -- (wake);
+  \draw[hw bus] (wake) -- (online);
+  \draw[hw bus] (online) -- (place);
+  \draw[hw bus] (place) -- (service);
+  \draw[hw bus] (service) -- (block);
+  \draw[hw bus] (block) -- (migrate);
+  \draw[hw bus] (migrate) -- (quiesce);
+  \draw[hw bus] (quiesce) -- (removed);
+\end{pdfdiagram}
+\diagramnote{双插槽平台从发现到退出的三层闭环。上排先让一致性 fabric、内存地址窗口和固件拓扑相互一致，中排才发布远端 CPU/内存供调度与分配使用，下排按上线所有权的逆序下线 CPU。逻辑 offline 完成后，平台还要满足机箱、电源和固件条件，才可能物理移除。}
+
+\topic{固件表把电气拓扑翻译成操作系统资源图}
+
+在 ACPI 平台中，MADT 描述可用处理器/中断控制器身份及中断拓扑；SRAT 把处理器和内存范围关联到 proximity domain；SLIT 给出 domain 间的相对距离矩阵；HMAT 可进一步描述 initiator 到 memory target 的性能属性。它们分别回答“有哪些执行上下文”“资源属于哪个邻近域”“域之间相对多远”“某类内存的性能特征是什么”，不能用一张表替代全部关系。\cite{uefi-spec}
+
+\begin{longtable}{L{0.16\linewidth}L{0.26\linewidth}L{0.28\linewidth}L{0.20\linewidth}}
+\toprule
+信息来源 & 主要内容 & 操作系统用途 & 典型不一致后果 \\
+\midrule
+处理器/封装发现 & socket、die、core、thread 与硬件 ID & 建立调度拓扑与共享 Cache 域 & 把 SMT 线程当独立核心或漏核 \\\tablerowrule
+MADT & CPU/中断控制器身份及可启用状态 & 建立逻辑 CPU 与中断投递目标 & 唤醒错误核心或中断无目标 \\\tablerowrule
+SRAT & CPU、内存范围与 proximity domain & 建立 NUMA node 和本地分配范围 & 页被系统性放到远端 \\\tablerowrule
+SLIT & domain 间相对距离 & 调度、页迁移和回退顺序 & 选择物理上更远的 node \\\tablerowrule
+HMAT & initiator--target 延迟、带宽等属性 & 区分分层或异构内存目标 & 把容量型内存误作最低延迟内存 \\\tablerowrule
+实际 fabric/内存探测 & 链路状态、地址译码与训练结果 & 与固件描述交叉核对 & 固件发布了硬件实际不可达的资源 \\
+\bottomrule
+\end{longtable}
+
+distance 是调度启发信息，不是每次访问的固定纳秒数。实际延迟还受频率、排队、目录命中、链路拥塞、内存行状态和电源状态影响。HMAT 的性能属性也应被看成平台在规定条件下发布的能力描述，而不是任意负载都能得到的承诺。
+
+\topic{远端内存必须在 fabric 与地址译码闭合后才能发布}
+
+固件可以并行训练不同插槽的内存，但对操作系统发布某段地址以前，至少要确认对应内存控制器完成训练、全系统地址窗口无重叠、home/目录逻辑知道该范围、跨插槽路由可达，并且 RAS 地址解码能够把错误还原到具体 DIMM。若 Socket 1 的 DRAM 已训练而一致性链路未就绪，Socket 0 核心仍不能安全把它当作普通系统内存。
+
+\begin{longtable}{L{0.09\linewidth}L{0.24\linewidth}L{0.30\linewidth}L{0.27\linewidth}}
+\toprule
+阶段 & 主体 & 建立的状态 & 发布条件 \\
+\midrule
+N0 & 启动固件 & 发现插槽、die、内存控制器和 fabric 端点 & 身份没有冲突 \\\tablerowrule
+N1 & 平台硬件/固件 & 跨插槽链路训练并建立一致性路由 & home 与 snoop 路径可用 \\\tablerowrule
+N2 & 各内存控制器 & DIMM 识别、训练、容量与 RAS 能力确定 & 目标速率和裕量验证通过 \\\tablerowrule
+N3 & 地址映射器 & 形成无重叠的物理地址窗口和交织规则 & 所有代理使用同一映射代际 \\\tablerowrule
+N4 & 固件 & 生成 MADT/SRAT/SLIT/HMAT 等描述 & 表间 CPU、domain、地址范围互相引用一致 \\\tablerowrule
+N5 & 操作系统启动核 & 建立 node、CPU mask 与内存块对象 & 不发布固件未启用或不可达资源 \\\tablerowrule
+N6 & 次级核心 & 按插槽/核心上线并核对 node 身份 & 本地中断、时钟和一致性自检完成 \\\tablerowrule
+N7 & 内存与调度子系统 & 把页范围和 CPU 加入分配/调度集合 & 首次触碰和回退策略已经建立 \\
+\bottomrule
+\end{longtable}
+
+如果某条 fabric 链路或某组 DIMM 失败，平台可以在能力允许时缩减拓扑继续启动：不发布受影响地址范围，把相关核心标为不可用，重算距离与交织。不能保留原容量数字却让其中一部分地址在访问时超时；容量降级必须在内存映射、ACPI 描述、错误日志和管理面中一致可见。
+
+\topic{first-touch 只是默认策略，不是物理定律}
+
+常见操作系统在进程首次写入匿名页时，从执行该线程的 node 分配物理页，这就是 first-touch。它适合初始化线程与后续计算线程位于同一 node 的工作集；若单个启动线程串行初始化全部大数组，随后多个 node 的线程并行计算，所有页可能错误集中在启动线程所在 node。解决方法可以是并行初始化、显式 NUMA 策略或后续页迁移，而不是盲目把线程来回移动。
+
+设备也有 locality。PCIe 根端口、网卡队列和加速器通常更靠近某个 socket；让设备 DMA 到本地内存，并把 MSI-X 向量和协议线程放在同一 node，可以减少跨插槽流量。若容量、负载均衡或故障回退更重要，远端放置仍可能是正确选择。NUMA 优化要同时观察 CPU 利用率、本地/远端页比例、互连带宽、队列延迟和内存容量，不能只追求“remote access 为零”。
+
+\begin{longtable}{L{0.20\linewidth}L{0.25\linewidth}L{0.28\linewidth}L{0.17\linewidth}}
+\toprule
+工作负载 & 首选放置 & 需要同时观察 & 何时允许远端 \\
+\midrule
+线程私有工作集 & 线程与页位于同一 node & 迁移次数、LLC 与内存带宽 & 本地容量不足或调度失衡 \\\tablerowrule
+共享只读数据 & 复制热点页或选择多数读者附近 & 复制成本与一致性需求 & 数据大且访问分散 \\\tablerowrule
+频繁写共享 line & 减少跨 node 写者并保持所有权稳定 & coherence transfer 与伪共享 & 业务必须跨 node 协作 \\\tablerowrule
+高速网卡 RX/TX & 队列、IRQ、处理线程和 DMA 页同 node & PCIe、互连和队列尾延迟 & 目标 node CPU 已饱和 \\\tablerowrule
+容量型内存层 & 热页留低延迟层，冷页放容量层 & HMAT 属性、迁移开销与抖动 & 性能预算允许且容量优先 \\
+\bottomrule
+\end{longtable}
+
+\topic{logical offline 是资源迁移事务，不等于立刻断电}
+
+操作系统通常区分 possible、present 与 online：possible 表示本次内核生命周期中可能管理的逻辑 CPU，present 表示硬件当前存在，online 才表示可接收调度和中断。一个 CPU 可以 present 但 offline；物理拔出还要经过固件通知、平台电源和机箱互锁。Linux CPU hotplug 使用从 CPUHP\_OFFLINE 到 CPUHP\_ONLINE 的线性状态机，上线按顺序调用 startup 回调，下线按逆序调用 teardown 回调。\cite{linux-cpu-hotplug}
+
+下线请求首先把目标 CPU 从新任务和新中断的候选集合中移除，再迁走可运行线程、计时器、IRQ affinity、每核 workqueue、性能监控和其他注册的 per-CPU 状态。固定 CPU affinity 的实时线程、不可迁移回调或缺少替代目标的中断都会阻止安全下线；管理面应得到明确失败原因，而不是强行清 online 位。
+
+\begin{longtable}{L{0.09\linewidth}L{0.24\linewidth}L{0.29\linewidth}L{0.28\linewidth}}
+\toprule
+阶段 & 目标 CPU 状态 & 控制面动作 & 成功判据 \\
+\midrule
+H0 & online & 校验不是不可下线启动 CPU，寻找替代 node/CPU & 所有资源有迁移目标 \\\tablerowrule
+H1 & dying，不接新负载 & 从调度、负载均衡和 IRQ 新分配集合移除 & 新任务与新 IRQ 不再进入 \\\tablerowrule
+H2 & 仍可执行 teardown & 迁走线程、timer、workqueue、RCU 与性能事件 & 每核软件队列排空 \\\tablerowrule
+H3 & 本地中断受控 & 重定向设备 IRQ，处理或取消 pending 事件 & 没有必须由本核完成的中断 \\\tablerowrule
+H4 & 架构停机入口 & 关闭本地 timer/中断接口，完成规定的一致性退出 & 不再参与普通调度和中断 \\\tablerowrule
+H5 & offline/present & 控制 CPU 获取同 generation 的死亡确认 & online mask 已清且迟到回调被拒绝 \\\tablerowrule
+H6 & 平台可选低功耗 & 固件关闭核心/封装电源，或保持停车 & 仅在平台明确允许时断电 \\\tablerowrule
+H7 & 可选 physical remove & ACPI/机箱流程更新 present 与硬件状态 & 关联资源和错误记录已移交 \\
+\bottomrule
+\end{longtable}
+
+Cache 的处理由架构一致性协议和平台停机入口决定，不能套用“下线前软件把所有 Cache flush 一遍”的固定规则。关键是目标 CPU 不再持有只有它能提交的写入或响应义务，并由架构规定的序列退出一致性参与。TLB、地址空间标识和本地中断状态也要按平台规则失效或重新初始化，防止再次上线时继承旧 generation。
+
+\topic{CPU hot-remove 与 memory hot-remove 是两笔不同事务}
+
+下线某个 CPU 不会自动移除其本地内存。只要内存控制器和 fabric 仍工作，其他 node 可以继续远端访问该内存；反之，要物理移除整个插槽，必须先把关联内存中的可迁移页搬走，阻止新分配，处理内核不可迁移页、huge page、持久映射和设备 DMA pin，再从系统物理地址图中撤销范围。任何一页仍被设备或内核长期固定，都可能阻止 memory offline。
+
+\begin{longtable}{L{0.22\linewidth}L{0.26\linewidth}L{0.27\linewidth}L{0.15\linewidth}}
+\toprule
+阻塞条件 & 可靠证据 & 处理选择 & 不可接受做法 \\
+\midrule
+固定 affinity 任务无替代 CPU & cpuset/实时约束与目标 mask 无交集 & 修改策略、增加替代 CPU 或取消 & 让任务无声消失 \\\tablerowrule
+IRQ 无合法迁移目标 & 中断控制器/驱动拒绝新 affinity & 停设备、重配置路由或取消 & 清位后遗留无主中断 \\\tablerowrule
+per-CPU 回调排空超时 & hotplug 状态机停在明确 teardown 阶段 & 回滚到 online 并保存诊断 & 继续物理断电 \\\tablerowrule
+内存存在不可迁移页 & 页隔离扫描给出页类型与引用者 & 释放、迁移工作负载或保留内存 & 撤销仍被引用的物理地址 \\\tablerowrule
+设备仍 DMA 到目标 node & IOMMU 映射、pin 和设备队列仍存在 & 停队列、解除映射并等待完成 & 拔出后让 DMA 指向空洞 \\\tablerowrule
+平台死亡确认未到 & generation 与固件状态不匹配 & 回滚或隔离，禁止物理操作 & 仅凭操作超时认定 CPU 已停 \\
+\bottomrule
+\end{longtable}
+
+失败回滚也要按状态机执行。若 teardown 在仍可失败的阶段返回错误，系统依次调用相应 startup 路径，把已经迁走的服务重新建立后再恢复 online；不能只把 mask 的一个 bit 改回 1。越过架构不可失败的停机边界后，则应由控制 CPU完成剩余清理，或把该 CPU 保持隔离状态，避免一颗只初始化一半的核心重新接收任务。
+
+多插槽 NUMA 的完整理解由此从一张距离图扩展成生命周期：fabric 与地址窗口先闭合，固件再发布 CPU、内存和距离，操作系统据此上线资源并安排 locality；下线时则先撤销软件所有权，再停本地中断和架构执行，最后才考虑电源与物理移除。online、offline、present 和 removed 是四个不同边界，任何一步都必须有可核对的 generation 与确认。

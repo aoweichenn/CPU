@@ -1091,6 +1091,180 @@ vCPU 迁移遇到迟到完成 & 完成项携带旧 vCPU/映射代际 & 丢弃或
 \end{longtable}
 
 VM Entry/Exit 的完成边界可以归结为一句话：重新进入 guest 之前，VMM 必须让 guest 架构状态看起来像某条指令完整发生、完整重试或明确失败，三者只能选一。只要 PC、内存映射、虚拟设备状态和中断状态中有一项仍处于旧代际，再快的硬件切换也不是一次正确的虚拟化事务。
+\section{十三、嵌套虚拟化与实时迁移：跨两层控制和两台主机}
+
+单层虚拟化只有物理 hypervisor 与 guest；嵌套虚拟化再让 guest 自己充当 hypervisor。通常把物理 hypervisor 称为 L0，把运行在其中的 guest hypervisor 称为 L1，把 L1 创建的 guest 称为 L2。处理器仍只有一套真实虚拟化扩展，L0 必须把 L1 看到的“虚拟 VMX/SVM 接口”转换成自己可以安全装入硬件的控制状态。\cite{linux-nested-vmx}
+
+实时迁移解决另一条边界：在虚拟机继续提供服务时，把其内存、vCPU、虚拟设备和时间状态从源主机复制到目标主机，最后把执行所有权只交给目标。两者相遇时，迁移状态还包括 L1 为 L2 构造的虚拟控制结构、嵌套页表和待反射退出；只复制 L2 的通用寄存器并不能重建嵌套执行环境。
+
+\topic{L1 提交控制意图，L0 才拥有真实硬件控制权}
+
+以 Intel VMX 术语为例，L1 为 L2 建立的控制结构常称为 VMCS12：数字 12 表示它描述 L1 到 L2 的虚拟边界。L0 自己运行 L1 时使用 VMCS01；真正让处理器运行 L2 前，L0 校验 VMCS12 中 L1 请求的截获、guest 状态与第二阶段页表，再结合 VMCS01 的安全约束形成 VMCS02。AMD SVM 和其他架构的名称不同，但“下层提交意图、最外层合成硬件合同”的所有权关系相同。
+
+L1 不能关闭 L0 强制的截获，不能让 L2 访问 L0 未授权的物理页，也不能把真实中断控制器据为己有。相反，若 L1 希望截获 L2 的某条特权指令，L0 要在硬件控制或软件路径中保留这一意图，并在事件发生时把等价退出反射给 L1。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.35cm] (l1) at (1.25,4.9) {L1 hypervisor\\填写 VMCS12};
+  \node[hw control, minimum width=2.35cm] (validate) at (4.1,4.9) {L0 校验\\能力与安全约束};
+  \node[hw compute, minimum width=2.35cm] (merge) at (6.95,4.9) {合成 VMCS02\\截获与状态};
+  \node[hw state, minimum width=2.35cm] (l2) at (9.8,4.9) {L2 运行\\真实硬件执行};
+
+  \node[hw memory, minimum width=2.35cm] (walk) at (9.8,2.45) {组合翻译\\L2 GPA 到 HPA};
+  \node[hw control, minimum width=2.35cm] (exit) at (6.95,2.45) {硬件 VM Exit\\记录原因与现场};
+  \node[hw control, minimum width=2.35cm] (route) at (4.1,2.45) {L0 路由\\本层处理或反射};
+  \node[hw state, minimum width=2.35cm] (commit) at (1.25,2.45) {提交结果\\更新对应层 PC};
+
+  \node[hw control, minimum width=2.35cm] (invalidate) at (1.25,0.0) {失效旧翻译\\核对三层代际};
+  \node[hw compute, minimum width=2.35cm] (rebuild) at (4.1,0.0) {重建控制合同\\L1 或 L2};
+  \node[hw control, minimum width=2.35cm] (entry) at (6.95,0.0) {再次 Entry\\装入完整状态};
+  \node[hw state, minimum width=2.35cm] (resume) at (9.8,0.0) {恢复目标层\\执行或重试};
+
+  \draw[hw bus] (l1) -- (validate);
+  \draw[hw bus] (validate) -- (merge);
+  \draw[hw bus] (merge) -- (l2);
+  \draw[hw bus] (l2) -- (walk);
+  \draw[hw bus] (walk) -- (exit);
+  \draw[hw bus] (exit) -- (route);
+  \draw[hw bus] (route) -- (commit);
+  \draw[hw bus] (commit) -- (invalidate);
+  \draw[hw bus] (invalidate) -- (rebuild);
+  \draw[hw bus] (rebuild) -- (entry);
+  \draw[hw bus] (entry) -- (resume);
+\end{pdfdiagram}
+\diagramnote{L2 的一次进入、退出与恢复。VMCS12 是 L1 的控制意图，VMCS02 才是 L0 合成后交给硬件的执行合同。退出先回到 L0；L0 根据截获归属决定本层处理，还是构造等价现场反射给 L1。三层映射任一代际变化，都可能要求失效组合翻译。}
+
+\topic{嵌套地址翻译不是简单把两个页表根拼接}
+
+L2 程序首先通过自己的 guest 页表把 L2 虚拟地址变成 L2 物理地址。L1 以为自己用第二阶段页表把 L2 物理地址映射为 L1 物理地址；但 L1 物理地址仍只是 L0 管理的 guest physical address，还要经过 L0 的第二阶段映射才能得到 host physical address。实现可把后两级关系合成为 shadow/combined 映射并缓存结果，避免每次访问都在软件中走两遍。
+
+\[
+\mathrm{L2VA}\xrightarrow{\text{L2 guest page table}}\mathrm{L2GPA}
+\xrightarrow{\text{L1 second stage}}\mathrm{L1GPA}
+\xrightarrow{\text{L0 second stage}}\mathrm{HPA}.
+\]
+
+任一层撤销权限、迁移页框或重用地址空间标识时，都必须让依赖旧关系的组合 TLB 项失效。只刷新 L1 自己可见的虚拟 TLB，而 L0 的组合映射仍指向旧 HPA，会产生越权或数据别名；只刷新 L0 映射而不更新 L1 看到的完成状态，又会让 L1 误判自己的失效指令已经覆盖全部 L2。
+
+\begin{longtable}{L{0.21\linewidth}L{0.25\linewidth}L{0.26\linewidth}L{0.18\linewidth}}
+\toprule
+事件 & 首先进入哪一层 & 路由依据 & 恢复原则 \\
+\midrule
+L2 执行被 L1 截获的指令 & 硬件先退出到 L0 & VMCS12 的截获意图与 L0 策略 & L0 构造虚拟退出，反射给 L1 \\\tablerowrule
+L2 访问 L1 未映射的页 & 硬件先退出到 L0 & L1 二阶段映射的缺失或权限 & 反射给 L1，由其补映射或注入异常 \\\tablerowrule
+L2 触碰 L0 禁止的 HPA & L0 & 最外层二阶段权限与资源所有权 & L0 拒绝，不能让 L1 绕过隔离 \\\tablerowrule
+物理设备或 host 中断 & L0 & interrupt remapping 与 host 设备归属 & host 处理，必要时再注入 L1/L2 \\\tablerowrule
+L1 自身执行虚拟化指令 & L0 模拟的 VMX/SVM 接口 & 虚拟能力集合与控制结构合法性 & 更新 VMCS12 或返回虚拟失败码 \\\tablerowrule
+嵌套状态不可恢复 & L0 管理面 & 控制 ABI、版本或 generation 不兼容 & 停止迁移/启动，不能猜测字段 \\
+\bottomrule
+\end{longtable}
+
+退出路由的核心问题不是“哪一层先看到”，而是“哪一层拥有产生架构结果的权力”。真实硬件永远先回到 L0；若事件属于 L1 的虚拟控制合同，L0 才把原因、资格字段、guest 状态和 PC 语义转换成 L1 能理解的一次虚拟 Exit。反射前后必须避免同一条 MMIO、异常或中断被两层各提交一次。
+
+\topic{实时迁移先建立兼容合同，再开始复制}
+
+目标主机必须提供源虚拟机已经暴露的 CPU 能力、页大小、时间模型、虚拟化控制和设备模型。管理层通常采用稳定的虚拟 CPU 基线，而不是把源机器所有宿主特性原样暴露；否则迁往较旧处理器时可能缺少 guest 已经执行过的指令。嵌套虚拟化还要求 L1 可见的 VMX/SVM 能力和控制结构 ABI 可恢复。Linux KVM 文档特别指出，内部 VMCS12 表示变化会影响跨版本迁移，因此它必须被当作明确的迁移 ABI，而非普通内存块。\cite{linux-nested-vmx}
+
+设备也要逐个分类：纯模拟设备可以序列化寄存器、队列和计时器；共享后端设备要冻结请求并保存协议状态；直通设备只有在硬件、VFIO 驱动与设备固件共同提供可迁移状态时才适合在线迁移。无法保存内部队列的直通设备不能用“最后再复位一下”代替一致状态。
+
+\begin{longtable}{L{0.20\linewidth}L{0.26\linewidth}L{0.27\linewidth}L{0.17\linewidth}}
+\toprule
+兼容项 & 源端要声明 & 目标端要证明 & 不兼容时的动作 \\
+\midrule
+CPU/ISA & guest 可见特性、微码相关行为与拓扑 & 等价或策略允许的超集 & 降低基线后重启，不能热迁移猜测 \\\tablerowrule
+时间 & TSC/计时器频率、偏移、暂停语义 & 恢复后单调且不倒退 & 拒绝迁移或使用受支持的时间缩放 \\\tablerowrule
+内存 & 页大小、加密属性、NUMA 与共享页策略 & 能建立等价 GPA 映射 & 先转换或拒绝 \\\tablerowrule
+虚拟化 & L1 可见控制能力、嵌套状态 ABI & 能恢复 L1/L2 控制与待处理退出 & 禁止嵌套迁移或匹配软件版本 \\\tablerowrule
+设备 & 型号、寄存器、队列、DMA 和中断状态 & 设备模型/硬件支持保存与恢复 & 拔除、切换模拟设备或停止迁移 \\
+\bottomrule
+\end{longtable}
+
+\topic{预复制用脏页集合逼近一致快照}
+
+预复制开始时虚拟机仍在源端运行。迁移器先复制全部或大部分 guest RAM，同时由虚拟化层记录从本轮扫描后又被写过的页。KVM 可以按内存槽返回一位对应一页的 dirty bitmap，也可在能力允许时使用 dirty ring；管理器必须理解“读取时是否清位、谁负责重新保护、粒度是多少”的具体接口语义。\cite{linux-kvm-api} QEMU 的迁移框架会多轮传送内存与设备状态，并为高脏页率、直通设备和 post-copy 提供相应机制。\cite{qemu-migration}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.35cm] (run) at (1.25,4.9) {源 VM 运行\\开启脏页追踪};
+  \node[hw compute, minimum width=2.35cm] (round) at (4.1,4.9) {预复制轮次\\传送当前集合};
+  \node[hw memory, minimum width=2.35cm] (shadow) at (6.95,4.9) {目标影子内存\\尚不可执行};
+  \node[hw control, minimum width=2.35cm] (gate) at (9.8,4.9) {收敛判断\\脏率与停机预算};
+
+  \node[hw control, minimum width=2.35cm] (stop) at (9.8,2.45) {源端停机\\冻结 vCPU 与设备};
+  \node[hw state, minimum width=2.35cm] (final) at (6.95,2.45) {最终状态包\\脏页、CPU、设备};
+  \node[hw control, minimum width=2.35cm] (validate) at (4.1,2.45) {目标校验\\映射与版本};
+  \node[hw state, minimum width=2.35cm] (token) at (1.25,2.45) {所有权令牌\\目标成为唯一主};
+
+  \node[hw state, minimum width=2.35cm] (fenced) at (1.25,0.0) {源端保持 fenced\\禁止再次执行};
+  \node[hw control, minimum width=2.35cm] (routes) at (4.1,0.0) {重建 IOMMU\\中断与网络路径};
+  \node[hw control, minimum width=2.35cm] (entry) at (6.95,0.0) {目标 VM Entry\\恢复时间与 vCPU};
+  \node[hw state, minimum width=2.35cm] (service) at (9.8,0.0) {服务恢复\\提交完成确认};
+
+  \draw[hw bus] (run) -- (round);
+  \draw[hw bus] (round) -- (shadow);
+  \draw[hw bus] (shadow) -- (gate);
+  \draw[hw bus] (gate) -- (stop);
+  \draw[hw bus] (stop) -- (final);
+  \draw[hw bus] (final) -- (validate);
+  \draw[hw bus] (validate) -- (token);
+  \draw[hw bus] (token) -- (fenced);
+  \draw[hw bus] (fenced) -- (routes);
+  \draw[hw bus] (routes) -- (entry);
+  \draw[hw bus] (entry) -- (service);
+\end{pdfdiagram}
+\diagramnote{一次预复制实时迁移。目标影子内存在所有权交接前不能运行；停机窗口内发送最后脏页和不可并发复制的状态。令牌交接后源端必须保持 fenced，目标端重建 DMA、中断、网络和时间状态后才允许 VM Entry。}
+
+收敛的第一近似条件是内存脏化速率 $D$ 小于有效复制带宽 $B$。若 VM 有 64GiB RAM，$B=25$GiB/s，运行负载以 $D=2$GiB/s 修改页面，则第一轮约用 $64/25=2.56$s，期间新增约 5.12GiB 脏页；第二轮约用 0.205s，又产生约 0.410GiB；第三轮后剩余约 0.033GiB，即约 34MiB。理想化的剩余量按比例 $D/B=0.08$ 递减。
+
+\begin{longtable}{L{0.13\linewidth}L{0.18\linewidth}L{0.21\linewidth}L{0.28\linewidth}}
+\toprule
+轮次 & 本轮起始集合 & 复制时间 & 运行期间新产生的脏数据 \\
+\midrule
+第 1 轮 & 64.000GiB & 2.560s & 5.120GiB \\\tablerowrule
+第 2 轮 & 5.120GiB & 0.205s & 0.410GiB \\\tablerowrule
+第 3 轮 & 0.410GiB & 0.016s & 约 0.033GiB \\\tablerowrule
+停机交接 & 约 34MiB，加 CPU/设备状态 & 取决于最终带宽与设备排空 & guest 已停止，不再产生 CPU 脏页 \\
+\bottomrule
+\end{longtable}
+
+这个算例忽略压缩、零页、网络协议、扫描开销和设备 DMA，只用于解释收敛关系。若 $D\ge B$，反复预复制不会自然变小。平台可以限流高脏页 vCPU、增加带宽、缩小工作集，或在明确接受故障模型后切换 post-copy；也可以因停机预算无法满足而取消迁移。post-copy 让目标先运行、缺页时再从源取页，减少重复复制，却把源端或链路中断变成更难恢复的风险，不能只把它看成“更快的预复制”。\cite{qemu-postcopy}
+
+\topic{停机交接要同时冻结 CPU、DMA、时间和外部可见身份}
+
+进入 stop-and-copy 后，源端停止所有 vCPU，在指令边界保存架构状态；设备模型停止接受新请求，排空或序列化队列；IOMMU/VFIO 路径停止产生新的未追踪 DMA；迁移器复制最终脏页、vCPU 控制结构、虚拟中断、计时器、设备寄存器和嵌套状态。目标端先校验完整性和版本，再建立 GPA 映射、失效旧翻译、恢复设备队列与中断路由。
+
+时间不能简单写成“目标当前时刻”。guest 的单调时钟、计时器截止值、暂停时长补偿和墙钟策略要一致恢复；否则迁移后会出现时间倒退、定时器风暴或租约提前失效。网络与存储身份也要切换：交换机学习、虚拟端口、共享磁盘锁和后端会话必须只认新实例。
+
+\begin{longtable}{L{0.12\linewidth}L{0.23\linewidth}L{0.28\linewidth}L{0.27\linewidth}}
+\toprule
+状态 & 源端 & 目标端 & 所有权判据 \\
+\midrule
+L0 & VM 正常运行并记录脏页 & 只接收兼容性信息 & 源端唯一可执行 \\\tablerowrule
+L1 & 多轮复制，VM 继续运行 & 建立不可执行的影子内存 & 源端仍是唯一主 \\\tablerowrule
+L2 & 停止 vCPU，冻结设备与 DMA & 等待最终状态包 & 源端停止，但尚未交权 \\\tablerowrule
+L3 & 发送最终脏页、CPU/设备/嵌套状态 & 校验并准备映射与路由 & 令牌仍由源端持有 \\\tablerowrule
+L4 & 写入 fence，放弃执行令牌 & 原子取得新 generation 令牌 & 只能有一端持有令牌 \\\tablerowrule
+L5 & 保持 fenced，等待完成确认 & 恢复设备、时间并执行 VM Entry & 目标端唯一可执行 \\\tablerowrule
+L6 & 回收旧影子和连接 & 提交服务恢复与监控 & 目标确认后迁移完成 \\
+\bottomrule
+\end{longtable}
+
+\topic{失败恢复由令牌位置决定，不能同时“各自继续”}
+
+若预复制阶段链路断开，执行令牌仍在源端，管理器可以丢弃目标影子并让源 VM 继续。停机后但交权前失败，源端可在确认目标没有取得令牌后恢复 vCPU。交权之后，源端即使仍保有完整内存也必须保持 fenced；否则两端会用同一 MAC、磁盘租约和内存历史同时运行，形成 split-brain。
+
+\begin{longtable}{L{0.21\linewidth}L{0.25\linewidth}L{0.29\linewidth}L{0.15\linewidth}}
+\toprule
+失败位置 & 首个可靠证据 & 安全恢复动作 & 禁止动作 \\
+\midrule
+兼容性检查失败 & 目标能力/设备 ABI 不满足 & 在运行态取消迁移 & 强行删去 guest 已见能力 \\\tablerowrule
+预复制链路中断 & 源仍持令牌，目标状态不完整 & 源继续，回收目标影子 & 启动不完整目标 \\\tablerowrule
+高脏率不收敛 & 剩余集合和预测停机时间不下降 & 限流、改策略或取消 & 无限循环复制 \\\tablerowrule
+停机后、交权前失败 & 令牌日志确认仍在源 & 丢弃目标，源按新 generation 恢复 & 两端都假定自己成功 \\\tablerowrule
+交权后目标 Entry 失败 & 目标持令牌但未恢复服务 & 在目标修复/回滚到受控检查点 & 未 fencing 就唤醒源 \\\tablerowrule
+完成确认丢失 & 令牌存储与两端 generation 可查询 & 以令牌事实重建管理状态 & 仅凭超时复制第二个主 \\
+\bottomrule
+\end{longtable}
+
+嵌套虚拟化与实时迁移的共同原则是：越靠近物理硬件，越必须掌握最终资源所有权；越靠近 guest，越必须保持其架构观察连续。L0 通过 VMCS02、组合页表和退出路由把 L1 的虚拟控制意图安全落实到真实处理器；迁移管理器通过脏页集合、最终状态包、fence 和 generation 把源端的执行历史只延续到目标端。控制结构、内存、设备、时间和所有权五者同时闭合，迁移才不是一次“看起来还能运行”的内存复制。
 
 \section*{章末练习}
 
