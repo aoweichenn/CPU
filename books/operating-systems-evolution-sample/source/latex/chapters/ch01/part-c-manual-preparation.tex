@@ -1,0 +1,340 @@
+\section{机器开始运行以前，RAM 中究竟要有什么}
+
+到这里，处理器已经能够取指，启动存储和 RAM 也已经接入同一组地址。可是“接好了 RAM”
+并不等于“RAM 里已经有程序”。上电后的 RAM 字节没有本章可依赖的初值；即使某种器件
+偶然保留了上次断电前的电荷，也不能据此判断哪些字节属于这一次运行。
+
+本章暂不增加任何自动输入设备。操作者使用机器外部的调试夹具，在复位保持有效时直接写
+RAM。夹具可以选中一个物理地址并写入一个字节，也可以读回一个字节核对。它不属于正在
+运行的机器，处理器也不能通过指令调用它。这样的准备方式十分笨拙，却能把最基本的问题
+暴露得很清楚：在处理器取得第一条任务指令之前，必须先建立哪些事实？
+
+\subsection{只写入指令字节为什么还不够}
+
+这次要运行的程序把四个 32 位有符号整数相加。若只把八条静态指令写入
+\code{0x00100000}，程序仍无法确定下列内容：
+
+\begin{itemize}
+\item 四个输入整数放在何处，按什么字节顺序解释；
+\item 应当处理几个元素，结果应写到哪个地址；
+\item 栈可以使用哪一段 RAM，最初的 SP 应取什么值；
+\item 最后一条 \code{RET} 应当把 PC 带回哪里；
+\item 这些区域是否已经完整写入，而不是只写完一半。
+\end{itemize}
+
+前四项决定程序如何运行，最后一项决定机器是否可以开始运行。把它们混成一句“程序已装入”
+会丢失最重要的边界。为此，我们先把一次运行所需的 RAM 分成五个区域。
+
+\begin{center}
+\begin{tikzpicture}[x=0.95cm,y=0.74cm]
+\draw[rounded corners=2pt,fill=BookTint,draw=BookRule] (0,0) rectangle (13.2,1.1);
+\draw[fill=BookAccent!18,draw=BookRule] (0.2,0.16) rectangle (2.7,0.94);
+\draw[fill=BookTeal!18,draw=BookRule] (2.7,0.16) rectangle (5.5,0.94);
+\draw[fill=BookWarm,draw=BookRule] (5.5,0.16) rectangle (7.4,0.94);
+\draw[fill=BookAccent!14,draw=BookRule] (7.4,0.16) rectangle (10.2,0.94);
+\draw[fill=BookAccent!10,draw=BookRule] (10.2,0.16) rectangle (13.0,0.94);
+\node[font=\footnotesize,align=center] at (1.45,0.55) {准备记录\\说明本次布局};
+\node[font=\footnotesize,align=center] at (4.1,0.55) {任务代码\\32 字节};
+\node[font=\footnotesize,align=center] at (6.45,0.55) {输入与结果};
+\node[font=\footnotesize,align=center] at (8.8,0.55) {任务栈\\向低地址增长};
+\node[font=\footnotesize,align=center] at (11.6,0.55) {启动程序工作区\\任务不可使用};
+\end{tikzpicture}
+\end{center}
+\diagramnote{图中横向宽度表示逻辑分区，不按真实容量比例绘制。每个区域仍由普通 RAM
+字节组成；分区首先是一份准备约定，并不是 RAM 芯片自动提供的保护。}
+
+\subsection{先把一次运行写成可核对的记录}
+
+操作者和启动程序需要对同一组地址达成一致。若这些数值只记在操作者的纸上，机器无法核对；
+若启动程序把数值全部写死，换一项程序就必须重做启动存储。于是我们在 RAM 中保留一小段
+固定位置，用字段描述本次准备结果。暂且称它为\emph{准备记录}，地址从
+\code{0x001ff000} 开始。
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.18\linewidth}|L{0.20\linewidth}|L{0.31\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+偏移与字段 & 本次取值 & 解释方式 & 启动前必须证明的条件 \\ \hline
+\code{+0x00 magic} & \code{RUN1} & 四个固定字节 & 格式与启动程序约定一致 \\ \hline
+\code{+0x04 generation} & \code{17} & 无符号整数 & 与操作者本次准备编号一致 \\ \hline
+\code{+0x08 code\_base} & \code{0x00100000} & 物理首地址 & 四字节对齐且位于 RAM \\ \hline
+\code{+0x0c code\_bytes} & \code{32} & 字节数 & 非零、四的倍数、末地址不回绕 \\ \hline
+\code{+0x10 data\_base} & \code{0x00102000} & 输入首地址 & 四字节对齐且位于 RAM \\ \hline
+\code{+0x14 data\_bytes} & \code{16} & 输入字节数 & 恰好容纳四个 32 位整数 \\ \hline
+\code{+0x18 result\_base} & \code{0x00102020} & 结果首地址 & 可写、对齐且不覆盖输入 \\ \hline
+\code{+0x1c stack\_low} & \code{0x001e0000} & 栈下界 & 低于 \code{stack\_top} \\ \hline
+\code{+0x20 stack\_top} & \code{0x001f0000} & 栈上界 & 对齐且不越过 RAM 末端 \\ \hline
+\code{+0x24 entry} & \code{0x00100000} & 首条任务指令 & 落在代码区且四字节对齐 \\ \hline
+\code{+0x28 code\_sum} & 代码校验和 & 32 位无符号和 & 与实际 32 个代码字节相符 \\ \hline
+\code{+0x2c data\_sum} & 数据校验和 & 32 位无符号和 & 与实际 16 个输入字节相符 \\ \hline
+\code{+0x30 prepared} & \code{1} & 提交标志 & 必须最后写入 \\ \hline
+\end{longtable}
+
+记录没有让程序自动进入 RAM。它只是把“操作者声称自己做完了什么”变成机器可读取的
+字节。启动程序仍要逐项验证这些声称。尤其不能看见 \code{prepared=1} 就直接跳转，因为
+旧 RAM 里可能恰好留着一个一。
+
+\subsection{为什么提交标志必须最后写}
+
+假设操作者先写 \code{prepared=1}，随后写到第 19 个代码字节时连接松动。启动程序若只
+看提交标志，就会把后半段旧字节当作新程序。相反，若提交标志最后写入，那么任意中断点
+都属于下面两种状态之一：
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.28\linewidth}|L{0.40\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+观察时刻 & \code{prepared} & 启动程序可以作出的判断 \\ \hline
+准备尚未完成 & \code{0} & 不得进入任务，不必猜测哪些区域已写完 \\ \hline
+全部写入并读回后 & \code{1} & 可以继续核对格式、边界与校验和 \\ \hline
+\end{longtable}
+
+这里出现了本书第一次明确的\emph{提交顺序}：先建立所有被依赖的内容，最后写一个代表
+“整组内容已经准备完成”的字段。这个字段不保证内容正确，却把“尚未完成”与“可以开始
+核对”分开了。
+
+\begin{center}
+\begin{tikzpicture}[node distance=11mm and 13mm]
+\node[stage,minimum width=2.8cm] (clear) {清零提交标志};
+\node[stage,minimum width=2.8cm,right=of clear] (body) {写代码、数据\\栈顶返回字};
+\node[stage,minimum width=2.8cm,right=of body] (record) {写记录其余字段};
+\node[stage,minimum width=2.8cm,right=of record] (readback) {逐区读回核对};
+\node[stage,minimum width=2.8cm,below=13mm of readback] (commit) {最后写\\\code{prepared=1}};
+\draw[flow] (clear) -- (body);
+\draw[flow] (body) -- (record);
+\draw[flow] (record) -- (readback);
+\draw[flow] (readback) -- (commit);
+\end{tikzpicture}
+\end{center}
+\diagramnote{顺序由操作者和调试夹具保证。机器运行以后才会读取提交标志，因此不存在
+处理器与夹具同时修改这些字节的情形。}
+
+\subsection{代数检查为什么要在访问以前完成}
+
+判断一个区域是否落在 RAM 中，不能只检查首地址。若代码首地址为 \code{base}、长度为
+\code{size}，最后一个有效字节是
+\[
+\texttt{last}=\texttt{base}+\texttt{size}-1.
+\]
+直接用 32 位加法计算这个式子可能回绕。例如
+\code{base=0xfffffff0}、\code{size=0x40} 会得到一个很小的结果，看起来反而位于低地址。
+启动程序因此采用不会先发生回绕的比较：
+\[
+\texttt{size}>0,\qquad
+\texttt{base}\le \texttt{RAM\_END},\qquad
+\texttt{size}-1\le \texttt{RAM\_END}-\texttt{base}.
+\]
+
+同一方法用于代码、输入和结果槽。两个半开区间
+\([a,a+n)\) 与 \([b,b+m)\) 不重叠，当且仅当
+\[
+a+n\le b\quad\text{或}\quad b+m\le a,
+\]
+但端点加法仍需先做防回绕检查。对本次布局，启动程序应证明：
+
+\begin{itemize}
+\item 代码区 \([\code{0x00100000},\code{0x00100020})\) 与输入区分离；
+\item 输入区 \([\code{0x00102000},\code{0x00102010})\) 不覆盖结果槽；
+\item 栈区 \([\code{0x001e0000},\code{0x001f0000})\) 不覆盖准备记录；
+\item 入口位于代码区，初始 SP 位于栈上界并满足四字节对齐。
+\end{itemize}
+
+这些检查并不创造内存保护。任务开始后仍能形成任意物理地址。它们只证明启动程序自己
+不会把一个显然自相矛盾的布局当作有效布局。
+
+\subsection{校验和能证明什么，不能证明什么}
+
+操作者把代码区每个字节按无符号数相加，只保留低 32 位，得到
+\code{code\_sum}；数据区同理。启动程序重新读取对应范围并复算。若结果不同，至少有一个
+字节、长度或地址与准备记录不一致。
+
+简单加法校验和可能让两处相反方向的变化互相抵消，所以它不能抵抗蓄意修改，也不能证明
+程序含义正确。本章使用它只有一个有限目的：让最常见的漏写、错址和连接不稳在跳转前暴露。
+后续若需要对抗恶意内容，必须引入更强的完整性与身份机制，不能更换一个术语就假定安全性
+已经获得。
+
+\section{把具体的任务字节放入具体地址}
+
+现在可以给出这项任务的完整静态布局。指令均为四字节定长；表中“作用”是对字节编码的
+解释，真正存入 RAM 的仍是机器码。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.43\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+物理地址 & 指令 & 成功提交后的作用 \\ \hline
+\code{0x00100000} & \code{MOVI r4,0} & 把累加器清零，PC 前进四字节 \\ \hline
+\code{0x00100004} & \code{LOAD r5,[r0]} & 从当前输入地址读一个 32 位整数 \\ \hline
+\code{0x00100008} & \code{ADD r4,r4,r5} & 把本轮整数加入累加器 \\ \hline
+\code{0x0010000c} & \code{ADDI r0,r0,4} & 输入指针指向下一个整数 \\ \hline
+\code{0x00100010} & \code{ADDI r1,r1,-1} & 剩余元素数减一 \\ \hline
+\code{0x00100014} & \code{BNEZ r1,-5} & 若尚有元素，回到 \code{0x00100004} \\ \hline
+\code{0x00100018} & \code{STORE r4,[r2]} & 把最终和写入结果槽 \\ \hline
+\code{0x0010001c} & \code{RET} & 从栈顶读取返回 PC \\ \hline
+\end{longtable}
+
+输入按小端字节序写入。数字 \(7,-2,11,5\) 的 32 位表示分别是
+\code{0x00000007}、\code{0xfffffffe}、\code{0x0000000b} 和
+\code{0x00000005}。因此前八个输入字节是：
+
+\begin{lstlisting}
+address      +0  +1  +2  +3
+0x00102000   07  00  00  00
+0x00102004   fe  ff  ff  ff
+\end{lstlisting}
+
+读取 \code{0x00102004} 的四个字节时，处理器按
+\[
+\texttt{fe}+(\texttt{ff}\ll 8)+(\texttt{ff}\ll16)+(\texttt{ff}\ll24)
+=\texttt{0xfffffffe}
+\]
+重组。加法单元只处理 32 位位型；把该位型解释为有符号数时才得到 \(-2\)。这一区分解释
+了为什么 RAM 不需要知道“这里存的是负整数”。
+
+\subsection{结果槽为何先写成已知的哨兵值}
+
+操作者在 \code{0x00102020} 写入 \code{0xdeadbeef}，而不是预先写零。运行后若仍读到
+哨兵值，说明结果存储没有成功提交；若预先写零而正确结果也恰好为零，就无法凭该地址区分
+“程序算出零”和“程序根本没有写”。
+
+\begin{longtable}{|L{0.24\linewidth}|L{0.25\linewidth}|L{0.39\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+观察到的结果槽 & 可确定的事实 & 尚不能单独确定的事实 \\ \hline
+\code{0xdeadbeef} & 预期结果写入尚未发生 & 程序未开始、运行中或已失败 \\ \hline
+\code{0x00000015} & 某次写入留下十进制 21 & 是否由预期代码在本次运行写入 \\ \hline
+其他值 & 发生过非预期写入或计算 & 错误来自输入、代码、布局还是硬件 \\ \hline
+\end{longtable}
+
+因此还需要准备编号和处理器停止状态共同判断。单个内存值是证据的一部分，不是完整运行
+历史。
+
+\subsection{最外层返回地址为何也要由操作者建立}
+
+任务最后执行 \code{RET}。按照已经定义的指令规则，它从 \code{MEM32[SP]} 读新 PC，
+随后把 SP 增加四。若初始 SP 直接等于栈上界 \code{0x001f0000}，第一次读取就落在栈区
+之外。启动前应当在最高的有效栈字写入返回地址：
+
+\begin{lstlisting}
+MEM32[0x001efffc] = 0x00000300
+initial SP        = 0x001efffc
+\end{lstlisting}
+
+\code{0x00000300} 位于启动存储，其中的代码只把“任务已经合作返回”写入启动程序工作区，
+然后进入一个不再修改任务结果的停止循环。这里没有第二项任务，也没有调度决策；返回只把
+控制权交还给本次运行的固定启动程序。
+
+\begin{center}
+\begin{tikzpicture}[x=1.05cm,y=0.72cm]
+\draw[rounded corners=2pt,fill=BookTint,draw=BookRule] (0,0) rectangle (8.8,4.6);
+\draw[fill=BookAccent!15,draw=BookRule] (0.7,0.55) rectangle (8.1,1.25);
+\draw[fill=BookAccent!10,draw=BookRule] (0.7,1.25) rectangle (8.1,3.65);
+\draw[fill=BookWarm,draw=BookRule] (0.7,3.65) rectangle (8.1,4.05);
+\node[font=\footnotesize] at (4.4,0.9) {可增长的栈空间，最低地址 \code{0x001e0000}};
+\node[font=\footnotesize,align=center] at (4.4,2.45) {本任务没有内部调用，因而保持未使用};
+\node[font=\footnotesize] at (4.4,3.85) {\code{0x001efffc}: 返回地址 \code{0x00000300}};
+\draw[->,>=Latex,thick,BookAccent] (8.45,4.05) -- (8.45,3.67);
+\node[font=\scriptsize,anchor=west] at (8.5,3.86) {初始 SP};
+\node[font=\scriptsize,BookMuted] at (4.4,4.34) {栈上界 \code{0x001f0000}（不属于栈内字节）};
+\end{tikzpicture}
+\end{center}
+\diagramnote{采用半开区间后，上界本身不是有效地址；把返回字放在
+\code{stack\_top-4}，恰好满足四字节读取。}
+
+\section{启动程序如何判断“现在可以进入任务”}
+
+复位释放后，启动程序从 \code{0x00000100} 开始。它不负责把任务从外部搬进 RAM，因为
+这项工作已经由操作者完成；它只把不可信的 RAM 内容逐步缩小为一组可以采用的初值。
+
+\subsection{检查顺序不是任意排列}
+
+启动程序采用下列顺序：
+
+\begin{enumerate}
+\item 读取 \code{prepared}。若不是一，进入“未准备”停止状态；
+\item 核对 \code{magic} 和准备编号，排除旧格式与旧批次；
+\item 检查所有地址的对齐、范围、长度与互不重叠关系；
+\item 重新计算代码和输入校验和；
+\item 检查返回地址位于启动存储规定的返回入口；
+\item 把参数和栈值写成候选寄存器状态；
+\item 最后一次重新读取 \code{prepared}，仍为一才提交任务入口 PC。
+\end{enumerate}
+
+之所以先检查短字段，再扫描代码和输入，是因为明显无效的记录不值得触碰它声称的任意地址。
+之所以在跳转前重读提交标志，是为了明确提交所依据的仍是同一份准备结果。本章规定操作者
+在释放复位后不再使用夹具写 RAM，所以不会出现真正并发修改；第二次读取仍能让协议边界
+清晰，并为后续自动输入留下可比较的结构。
+
+\subsection{候选寄存器状态具体包含哪些值}
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.25\linewidth}|L{0.45\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+寄存器 & 任务入口值 & 该值从何而来 \\ \hline
+\code{PC} & \code{0x00100000} & 准备记录的 \code{entry}，已证明落在代码区 \\ \hline
+\code{SP} & \code{0x001efffc} & \code{stack\_top-4}，该处已有返回地址 \\ \hline
+\code{r0} & \code{0x00102000} & 输入区首地址 \\ \hline
+\code{r1} & \code{4} & \code{data\_bytes/4} \\ \hline
+\code{r2} & \code{0x00102020} & 结果槽首地址 \\ \hline
+\code{r3} & \code{17} & 本次准备编号，供返回后核对 \\ \hline
+\code{r4--r7} & \code{0} & 消除上电旧值对本任务的影响 \\ \hline
+\end{longtable}
+
+启动程序自己的临时变量位于专用工作区，不能继续依赖将要交给任务的通用寄存器。建立入口
+状态时，它先在内部或工作区形成候选值；任何检查失败都不提交任务 PC。PC 是最后改变的
+状态，因为一旦 PC 指向任务入口，下一笔取指就不再属于启动程序。
+
+\begin{center}
+\begin{tikzpicture}[node distance=11mm and 14mm]
+\node[stage,minimum width=3.0cm] (record) {读取准备记录\\仍视为不可信};
+\node[stage,minimum width=3.1cm,right=of record] (bounds) {范围、重叠\\与校验和成立};
+\node[stage,minimum width=3.0cm,right=of bounds] (candidate) {形成候选\\参数、SP、入口};
+\node[stage,minimum width=3.2cm,below=14mm of candidate] (commit) {同一提交边界\\写寄存器与任务 PC};
+\node[stage,minimum width=3.2cm,below=14mm of bounds,fill=BookWarm] (stop) {任一条件失败\\留下原因并停止};
+\draw[flow] (record) -- (bounds);
+\draw[flow] (bounds) -- (candidate);
+\draw[flow] (candidate) -- (commit);
+\draw[->,>=Latex,thick,draw=BookMuted] (record) -- (stop);
+\draw[->,>=Latex,thick,draw=BookMuted] (bounds) -- (stop);
+\end{tikzpicture}
+\end{center}
+\diagramnote{“形成候选值”和“让任务开始运行”是两个阶段。只有最后的 PC 提交才改变
+取指所属的代码区域。}
+
+\subsection{六种准备错误分别停在哪里}
+
+\begin{longtable}{|L{0.22\linewidth}|L{0.28\linewidth}|L{0.38\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+错误 & 最早能发现它的检查 & 为什么不能继续 \\ \hline
+提交标志仍为零 & 第一步 & 内容可能尚未全部写完 \\ \hline
+准备编号仍为 16 & 格式字段检查 & RAM 中可能是上一次运行留下的记录 \\ \hline
+代码长度为 \code{0xfffffff0} & 范围检查 & 末地址计算可能回绕，不能扫描 \\ \hline
+入口为 \code{0x00102000} & 入口检查 & 它落在输入而不是代码区 \\ \hline
+代码校验和不符 & 完整性检查 & 至少一个被执行的字节与清单不一致 \\ \hline
+返回地址为奇数 & 栈字检查 & \code{RET} 将产生未对齐取指地址 \\ \hline
+\end{longtable}
+
+当前机器没有屏幕，也没有串行输出。启动程序把失败阶段和一个辅助数值写到工作区，然后
+执行停止指令。操作者通过夹具读取：
+
+\begin{lstlisting}
+boot_status:
+  phase   = PREPARED, FORMAT, RANGE, CHECKSUM, STACK, or ENTERED
+  detail  = field offset or failing address
+  run_id  = generation copied from the record
+\end{lstlisting}
+
+这仍是人工诊断。它的意义在于让每次失败对应一个已经说明的边界，而不是让机器“没反应”
+成为唯一现象。
+
+\subsection{这一阶段真正形成了什么}
+
+此时可以谨慎地把“可运行的一项程序”描述为四部分的组合：
+\[
+\text{指令字节}+\text{初始数据}+\text{初始处理器状态}+\text{开始条件}.
+\]
+缺少其中任何一项，物理 RAM 里即使存在某些正确字节，也不足以得到一次可重复运行。准备
+记录把前三项的位置写明，最后写入的提交标志给出开始核对的条件；启动程序完成验证并提交
+PC，才给出真正的开始事件。
+
+这一结构还不是文件，也不是进程映像。它没有名称查找、持久保存、权限、动态分配或多个
+运行实例。现在给它更大的概念名只会把尚未解决的问题藏起来。下一节将沿着这份具体布局，
+观察第一条任务指令怎样开始、最后一条又怎样返回。

@@ -1,0 +1,184 @@
+\section{处理器内部必须保存哪些运行事实}
+
+寄存器表只列出了程序能够直接命名的状态。处理器在一条指令尚未完成时，还要记住取到的
+指令、等待的事务和候选结果。否则外部响应经过数个周期回来时，它无法知道响应属于哪条
+指令，也无法在失败时保留旧状态。
+
+\subsection{可见状态与暂存状态先分开}
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.30\linewidth}|L{0.40\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+类别 & 具体字段 & 生命周期 \\ \hline
+程序可见 & PC、SP、\code{r0--r7}、算术标志 & 从一条已提交指令延续到下一条 \\ \hline
+当前指令 & \code{instruction\_pc}、四个编码字节、译码字段 & 从取指响应到提交或失败 \\ \hline
+访存等待 & 操作、地址、宽度、数据、目标寄存器、后继 PC & 从数据请求接受到数据响应 \\ \hline
+候选效果 & 新寄存器值、新 PC、新 SP & 只在当前指令成功时写入可见状态 \\ \hline
+停止记录 & 故障 PC、地址、原因、\code{halted} & 从失败提交保持到复位 \\ \hline
+\end{longtable}
+
+“切换到下一条指令”准确地说，是清除当前指令与候选字段，保留刚提交的程序可见状态，再用
+新的 PC 发起取指。它不是把处理器全部清零。
+
+\subsection{最小顺序处理器怎样分阶段推进}
+
+\begin{center}
+\begin{tikzpicture}[node distance=9mm and 12mm]
+\node[stage,minimum width=2.5cm] (fetch) {\code{FETCH}\\发起取指};
+\node[stage,minimum width=2.5cm,right=of fetch] (decode) {\code{DECODE}\\保存并解释字段};
+\node[stage,minimum width=2.5cm,right=of decode] (execute) {\code{EXECUTE}\\计算候选效果};
+\node[stage,minimum width=2.5cm,below=13mm of execute] (memory) {\code{MEMORY}\\等待外部响应};
+\node[stage,minimum width=2.5cm,left=of memory] (commit) {\code{COMMIT}\\更新可见状态};
+\node[stage,minimum width=2.5cm,left=of commit,fill=BookWarm] (halt) {\code{HALT}\\保留故障事实};
+\draw[flow] (fetch) -- (decode);
+\draw[flow] (decode) -- (execute);
+\draw[flow] (execute) -- node[right,font=\scriptsize]{需要访存} (memory);
+\draw[flow] (memory) -- node[below,font=\scriptsize]{成功} (commit);
+\draw[flow] (execute.west) -| node[above,font=\scriptsize,pos=0.25]{无访存} (commit.north);
+\draw[flow] (commit) -- (fetch);
+\draw[->,>=Latex,thick,BookMuted] (decode) |- (halt);
+\draw[->,>=Latex,thick,BookMuted] (memory) -- (halt);
+\end{tikzpicture}
+\end{center}
+\diagramnote{图中一次只有一条指令占据这些阶段。后续若讨论流水线，必须允许多条指令同时
+处于不同阶段，并重新定义提交顺序；第一章不预设该结构。}
+
+\subsection{\code{FETCH} 保存当前 PC 的副本}
+
+发起取指前，处理器执行：
+
+\begin{lstlisting}
+instruction_pc = PC
+request.address = PC
+request.operation = READ
+request.width = 4
+\end{lstlisting}
+
+即使后续已有候选顺序 PC，故障报告也使用 \code{instruction\_pc}。取指响应回来后，四个
+字节进入指令寄存器。只有此时译码器才稳定看到操作码和字段。若启动存储需要两个周期，
+处理器在等待期间不能用输入端口上暂时出现的其他数值进行译码。
+
+\subsection{\code{DECODE} 读取的是旧寄存器值}
+
+以 \code{ADD r4,r4,r5} 为例，译码字段选择两个读端口：
+
+\begin{lstlisting}
+source_a = registers[4]
+source_b = registers[5]
+destination = 4
+\end{lstlisting}
+
+寄存器堆读出当前已提交的 \code{r4} 和 \code{r5}。运算结果先进入
+\code{candidate\_value}；在 \code{COMMIT} 以前，寄存器堆中的 \code{r4} 不变。这样，
+同一条指令的两个源操作数都来自统一的前置状态。
+
+\begin{center}
+\begin{tikzpicture}[node distance=11mm and 14mm]
+\node[stage,minimum width=3.0cm] (reg) {寄存器堆\\两个读端口、一个写端口};
+\node[stage,minimum width=3.0cm,right=of reg] (alu) {算术单元\\加、减、地址形成};
+\node[stage,minimum width=3.0cm,right=of alu] (cand) {候选锁存器\\结果与标志};
+\node[stage,minimum width=3.0cm,below=14mm of alu] (control) {控制状态\\决定是否提交};
+\draw[flow] (reg) -- node[above,font=\scriptsize]{旧源值} (alu);
+\draw[flow] (alu) -- node[above,font=\scriptsize]{候选值} (cand);
+\draw[->,>=Latex,thick,BookAccent] (cand.south) |- node[below,font=\scriptsize,pos=0.65]{成功边界写回} (reg.south);
+\draw[->,>=Latex,thick,BookMuted] (control) -- (cand);
+\end{tikzpicture}
+\end{center}
+\diagramnote{候选锁存器把计算与提交隔开。发生错误时，控制状态可以丢弃候选值而不改动
+程序可见寄存器。}
+
+\subsection{不同指令实际使用哪些内部字段}
+
+\begin{longtable}{|L{0.16\linewidth}|L{0.30\linewidth}|L{0.42\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+指令 & 执行期间额外保存 & 成功时提交 \\ \hline
+\code{MOVI} & 目标号、符号扩展后的立即数、顺序 PC & 目标寄存器与 PC \\ \hline
+\code{ADD} & 两个旧源值、目标号、候选和 & 目标寄存器、标志与 PC \\ \hline
+\code{LOAD} & 有效地址、宽度、目标号、顺序 PC & 返回值写目标寄存器，更新 PC \\ \hline
+\code{STORE} & 有效地址、宽度、源数据、字节使能 & RAM 效果已经成功后更新 PC \\ \hline
+\code{BNEZ} & 测试值、顺序 PC、分支目标 & 二选一的新 PC \\ \hline
+\code{RET} & 旧 SP、栈地址、候选返回 PC & 新 PC 与 \code{SP+4} \\ \hline
+\end{longtable}
+
+表中没有“当前任务编号”。第一章的处理器不知道任务身份；同一组字段先执行启动程序，
+后执行求和程序。软件约定改变了这些位的含义，硬件保存结构没有随之更换。
+
+\subsection{一次 \code{LOAD} 的内部状态逐周期变化}
+
+假设 RAM 三个周期后响应，且请求在第 2 个边沿被接受：
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.19\linewidth}|L{0.29\linewidth}|L{0.28\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+边沿后 & 控制阶段 & 保持的内部事实 & 程序可见状态 \\ \hline
+0 & \code{FETCH} & \code{instruction\_pc=00100004} & PC 仍为 \code{00100004} \\ \hline
+1 & \code{DECODE} & 目标 \code{r5}、基址 \code{r0} & 全部不变 \\ \hline
+2 & \code{MEMORY} & 地址 \code{00102000}、宽度 4、后继 PC & 全部不变 \\ \hline
+3 & \code{MEMORY} & 同一待处理记录 & 全部不变 \\ \hline
+4 & \code{MEMORY} & 收到数据 7，形成候选 & 全部不变 \\ \hline
+5 & \code{COMMIT} & 待处理记录即将清除 & \code{r5=7,PC=00100008} \\ \hline
+6 & \code{FETCH} & 新 \code{instruction\_pc=00100008} & 保持边沿 5 的值 \\ \hline
+\end{longtable}
+
+若边沿 4 收到 \code{UNMAPPED}，边沿 5 改为提交停止记录，\code{r5} 和 PC 保持边沿 0
+以前的值。响应延迟只增加中间等待行，不改变成功提交后的状态。
+
+\subsection{一次 \code{STORE} 的候选效果为什么不在处理器里}
+
+装入的候选值最终写寄存器；存储的目标位于 RAM。处理器能保存地址和数据，却不能仅凭
+“请求已经送出”认定 RAM 已改变。RAM 的成功响应说明目标侧已经在自己的提交边界接受了
+全部字节，处理器随后只需更新 PC。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.30\linewidth}|L{0.40\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+观察位置 & 请求接受后、响应前 & 成功响应后 \\ \hline
+处理器 & 保存地址、数据、字节使能与后继 PC & 清除待处理记录，提交后继 PC \\ \hline
+RAM & 保存待检查的写请求 & 四字节已经作为一组更新 \\ \hline
+程序可见 & 当前 \code{STORE} 尚未完成 & 后续同地址读取必须看到新值 \\ \hline
+\end{longtable}
+
+\subsection{PC 为何不能在发请求时提前增加}
+
+若发起 \code{LOAD} 时就把 PC 改到下一条，等待中发生故障时会出现两个问题：停止记录不再
+自然指向失败指令；复位以外的恢复机制将不知道该重试哪一条。保留旧 PC，把
+\code{PC+4} 只放在候选字段中，可以让“当前指令”在整个等待期保持稳定。
+
+某些真实处理器会在内部预测和提前取后续指令，但仍需要一个按程序顺序提交的边界，使软件
+观察结果等价于规定模型。第一章直接采用顺序实现，不让优化掩盖基本状态关系。
+
+\subsection{停止状态为何仍需要时钟边沿提交}
+
+组合电路检测到错误的瞬间，\code{fault\_cause} 可能随输入变化。处理器在规定边沿同时
+锁存 PC、地址和原因，再置 \code{halted=1}。从下一周期开始，控制状态保持 \code{HALT}，
+不再发请求。这样操作者读到的四个字段来自同一次失败，而不是不同时刻的混合。
+
+\begin{lstlisting}
+if response.error:
+  next_fault_pc      = instruction_pc
+  next_fault_address = pending.address
+  next_fault_cause   = response.error
+  next_halted        = 1
+  commit no ordinary destination
+\end{lstlisting}
+
+\subsection{交接时改变的是同一套寄存器，不是复制出第二套}
+
+启动程序进入任务时，处理器没有把旧 \code{r0--r7} 自动保存到隐藏区域。它们被任务入口值
+直接覆盖。启动程序能够在任务返回后继续，是因为返回入口不依赖交接前那些临时寄存器，长期
+需要的准备编号已经写在 RAM 工作区。
+
+\begin{longtable}{|L{0.21\linewidth}|L{0.29\linewidth}|L{0.38\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+交接对象 & 本章实际动作 & 没有发生的动作 \\ \hline
+通用寄存器 & 写成任务参数和清零值 & 没有保存启动程序完整寄存器副本 \\ \hline
+SP & 从启动栈值改为任务栈顶 & 没有同时保留两个活动 SP \\ \hline
+PC & 从交接指令改为任务入口 & 没有“任务模式”位 \\ \hline
+RAM & 保留两段栈和工作区字节 & 没有自动禁止任务访问启动区 \\ \hline
+\end{longtable}
+
+这一事实为后续多项程序问题留下准确起点：若程序 A 暂停后还要从原位置继续，就必须在
+覆盖寄存器前把它的 PC、SP 和仍有用的寄存器值保存到某处。第一章没有这种需要，所以也
+不提前引入保存现场结构。

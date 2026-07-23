@@ -1,0 +1,216 @@
+\section{一个地址怎样在 RAM 中选中确切的字节}
+
+前文把 RAM 画成一个方框，并规定它占用一段物理地址。这个方框还需要展开到足以解释
+“为什么地址加一会得到下一个字节”。本节不重复存储电路的门级实现，只说明控制一次访问
+所必需的内部结构。
+
+\subsection{容量来自地址数量与每个位置的宽度}
+
+本章 RAM 范围为 \code{0x00100000--0x001fffff}，共
+\[
+\texttt{0x001fffff}-\texttt{0x00100000}+1=\texttt{0x00100000}
+\]
+个字节，即 \(2^{20}\) 字节。RAM 内部不需要保存完整的高位地址。互连已经证明请求落在
+这个范围后，向 RAM 提供范围内偏移：
+\[
+\texttt{offset}=\texttt{physical\_address}-\texttt{0x00100000}.
+\]
+偏移的低 20 位足以选择 \(2^{20}\) 个字节位置。
+
+\begin{center}
+\begin{tikzpicture}[node distance=11mm and 15mm]
+\node[stage,minimum width=3.1cm] (addr) {物理地址\\32 位};
+\node[stage,minimum width=3.2cm,right=of addr] (range) {互连范围比较\\高位决定目标};
+\node[stage,minimum width=3.2cm,right=of range] (offset) {减去 RAM 基址\\得到 20 位偏移};
+\node[stage,minimum width=3.2cm,below=14mm of offset] (array) {RAM 字节阵列\\选中一个或四个相邻字节};
+\draw[flow] (addr) -- (range);
+\draw[flow] (range) -- (offset);
+\draw[flow] (offset) -- (array);
+\end{tikzpicture}
+\end{center}
+\diagramnote{完整物理地址用于整机选择目标；目标内部只需使用足够区分自身位置的偏移位。}
+
+如果直接把 \(2^{20}\) 个字节画成一条线，硬件结构会显得不现实。实际阵列通常分成行、列
+和若干存储体。对本章的软件契约而言，这些组织方式可以不同，只要同一地址总返回同一组
+已提交字节，并遵守规定的响应次序。
+
+\subsection{为何一次四字节读取仍以字节地址命名}
+
+处理器的地址单位是字节。\code{LOAD} 宽度为四时，地址 \(A\) 表示读取
+\(A,A+1,A+2,A+3\) 四个相邻字节。地址没有自动除以四；只是 RAM 可以把低两位用来选择
+一个四字节组中的起点。
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.25\linewidth}|L{0.43\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+地址低两位 & 四字节访问是否对齐 & 本章处理方式 \\ \hline
+\code{00} & 是 & 读取或写入同一个四字节组 \\ \hline
+\code{01} & 否 & 返回 \code{ALIGNMENT}，不改变任何字节 \\ \hline
+\code{10} & 否 & 返回 \code{ALIGNMENT}，不改变任何字节 \\ \hline
+\code{11} & 否 & 返回 \code{ALIGNMENT}，不改变任何字节 \\ \hline
+\end{longtable}
+
+禁止未对齐访问不是数学必然。某些处理器会拆成两次阵列读取，再在内部拼接。本章选择拒绝，
+是为了让每条四字节事务只涉及一个对齐组，错误时也容易保证“全写或全不写”。程序因此
+必须让整数地址和 SP 都是四的倍数。
+
+\subsection{四条字节通道怎样组成一个 32 位值}
+
+可以把数据端口理解为四条八位通道。对齐地址 \(A\) 的低两位为零；第零通道连接 \(A\)，
+第一通道连接 \(A+1\)，依此类推。读取时，小端组合器产生：
+\[
+\texttt{value}=
+b_0+(b_1\ll8)+(b_2\ll16)+(b_3\ll24).
+\]
+
+\begin{center}
+\begin{tikzpicture}[x=1.55cm,y=0.75cm]
+\foreach \x/\lab in {0/{\(A\)},1/{\(A+1\)},2/{\(A+2\)},3/{\(A+3\)}} {
+  \draw[fill=BookTint,draw=BookRule] (\x*1.7,1.8) rectangle ++(1.3,0.8);
+  \node[font=\footnotesize] at (\x*1.7+0.65,2.2) {\lab};
+  \draw[->,>=Latex,thick,BookAccent] (\x*1.7+0.65,1.8) -- (3.2+0.35*\x,0.8);
+}
+\draw[rounded corners=2pt,fill=BookAccent!12,draw=BookRule] (2.4,0.1) rectangle (5.1,0.8);
+\node[font=\footnotesize,align=center] at (3.75,0.45) {小端组合器\\形成 32 位返回值};
+\end{tikzpicture}
+\end{center}
+\diagramnote{字节顺序是处理器与存储接口之间的解释规则。RAM 单元只保存八个位，并不保存
+“最低有效字节”这个语义标签。}
+
+\subsection{写入时为什么需要字节使能}
+
+写请求除了 32 位数据，还带四位 \code{byte\_enable}。四字节 \code{STORE} 使用
+\code{1111}；若以后增加单字节存储，地址低位和字节使能可只选择一条通道。例如在地址
+\(A+2\) 写入 \code{0x7f}，可能使用：
+
+\begin{lstlisting}
+aligned_address = A
+write_data      = 0x007f0000
+byte_enable     = 0100
+\end{lstlisting}
+
+RAM 必须先同时检查范围、对齐规则和字节使能是否合法，再更新被选择的通道。若先更新第零
+通道、随后才发现第四个字节越界，软件将面对部分写入。本章接口把检查与更新分开，成功边沿
+一次提交全部被使能字节。
+
+\subsection{读取端口和写入端口是否能同时工作}
+
+当前机器只有一个处理器请求发起者，互连一次只接受一笔未完成事务。RAM 因而使用一个共享
+端口就足够：某个周期接受读或写，经过固定或可变延迟后给出一次响应。在响应出现以前，
+请求字段必须由发起者或 RAM 内部锁存。
+
+\begin{lstlisting}
+ram_pending:
+  valid
+  operation
+  offset
+  width
+  write_data
+  byte_enable
+\end{lstlisting}
+
+这些字段解释了“RAM 正在忙”究竟保存什么。若只保存地址而忘记操作方向，响应时就无法
+判断应返回数据还是提交写入；若不保存字节使能，等待期间输入线变化会改变原请求含义。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.29\linewidth}|L{0.41\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+内部阶段 & 已锁存的状态 & 对外接口状态 \\ \hline
+\code{IDLE} & 无待处理请求 & \code{req\_ready=1} \\ \hline
+\code{CHECK} & 请求全部字段 & 暂不接受第二笔请求 \\ \hline
+\code{READ} & 偏移与宽度 & 阵列选择相应字节 \\ \hline
+\code{WRITE} & 偏移、数据、字节使能 & 成功边沿提交所选字节 \\ \hline
+\code{RESPOND} & 数据或错误码 & \code{resp\_valid=1} \\ \hline
+\end{longtable}
+
+阶段名只是本章的一种实现。软件不能读取这些名称，只能观察到请求是否被接受、响应何时
+有效以及成功响应对应什么效果。把内部状态列出，是为了证明接口承诺有足够的物理状态可以
+实现，而不是把特定状态机强加给所有 RAM。
+
+\subsection{启动存储与 RAM 为什么不能合成同一种可写阵列}
+
+如果复位入口也位于普通可写 RAM，操作者准备任务时的一次错址就可能覆盖下一次启动所需的
+第一条指令。机器随后连检查错误记录的代码都无法取得。将启动程序放在普通运行不能写的
+存储中，保留了一个比任务内容更稳定的起点。
+
+两种存储仍可共享读取请求格式：
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.28\linewidth}|L{0.40\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+性质 & 启动存储 & RAM \\ \hline
+复位后内容 & 制造或维护阶段已确定 & 本章不规定 \\ \hline
+普通读取 & 支持 & 支持 \\ \hline
+普通写入 & 返回 \code{READ\_ONLY} & 合法范围内提交 \\ \hline
+本章用途 & 检查、交接、返回入口 & 任务代码、数据、栈与工作区 \\ \hline
+\end{longtable}
+
+因此“都能返回字节”不等于“具有相同生命周期”。启动存储给出稳定起点，RAM 给出运行期
+可变状态；地址互连把同一种请求送到承担不同责任的目标。
+
+\subsection{物理地址表仍然不是内存保护表}
+
+范围比较只回答地址属于哪个器件。任务向 \code{0x001ff000} 写入时，互连会正确选择 RAM，
+RAM 也会正确更新准备记录；两个器件都履行了当前契约，却破坏了下一次启动依据。要拒绝这
+笔写入，判断还需要知道“当前请求者身份”和“该范围允许何种访问”。第一章尚未建立这两项
+输入，所以不能从地址表推断保护已经存在。
+
+\subsection{复位为什么不顺便清空全部 RAM}
+
+处理器复位只需设置少量控制寄存器，几个边沿内即可完成。RAM 有 \(2^{20}\) 个字节；
+若要求复位信号直接把每个存储单元同时改成零，就要为整个阵列增加清零通路，并规定清零
+期间普通访问如何处理。另一种实现是由启动程序逐地址写零，但这需要发出
+\(2^{18}\) 笔四字节写，复位释放到首次检查之间会出现很长的执行阶段。
+
+本章没有任何需求要求全部 RAM 为零。代码区、输入区、结果槽、返回栈字和准备记录都会由
+操作者明确写入；启动程序工作区只在首次写入后读取。其余字节保持未规定更简单，也迫使
+程序不依赖自己尚未建立的初值。
+
+\begin{longtable}{|L{0.22\linewidth}|L{0.29\linewidth}|L{0.37\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+可选策略 & 获得的性质 & 付出的代价或仍有的限制 \\ \hline
+硬件全阵列清零 & 复位后每个 RAM 字节为零 & 阵列增加清零结构，复位时序更复杂 \\ \hline
+启动程序逐字清零 & 无需阵列专用清零线 & 启动时间随 RAM 容量增长 \\ \hline
+只初始化将要使用的区域 & 启动工作与本次需求成比例 & 未声明区域必须始终视为未规定 \\ \hline
+\end{longtable}
+
+第三种策略形成一条重要纪律：任何代码在读取某个可写字节前，都要能指出本次运行中哪一步
+先写入了它。若回答只能追溯到“机器通常会给零”，该读取就没有建立在本章契约上。
+
+\subsection{调试夹具怎样写 RAM 而不与处理器争用端口}
+
+人工准备要求外部夹具能够访问 RAM，而正常运行时 RAM 端口属于处理器。两者若同时驱动
+地址线，电气上会冲突，协议上也无法判断哪笔请求先发生。本章利用复位状态设置一个简单
+选择器：
+
+\begin{center}
+\begin{tikzpicture}[node distance=11mm and 16mm]
+\node[stage,minimum width=3.0cm] (cpu) {处理器请求\\仅在复位释放后有效};
+\node[stage,minimum width=3.0cm,below=14mm of cpu] (fixture) {调试夹具请求\\仅在复位保持时有效};
+\node[stage,minimum width=3.2cm,right=22mm of cpu,yshift=-7mm] (mux) {端口选择器\\由复位状态控制};
+\node[stage,minimum width=3.0cm,right=of mux] (ram) {RAM 共享端口};
+\draw[flow] (cpu) -- (mux);
+\draw[flow] (fixture) -- (mux);
+\draw[flow] (mux) -- (ram);
+\end{tikzpicture}
+\end{center}
+\diagramnote{选择器不是运行中的第二个请求发起者。复位状态保证同一时刻只有一侧能够产生
+有效请求，因此第一章仍是单发起者机器。}
+
+夹具写入期间，处理器被复位阻止，不能观察半成品；复位释放以后，选择器固定选择处理器，
+夹具即使改变自己的地址输入也不会触及 RAM。操作者若要再次修改内容，必须重新保持复位，
+先让处理器停止普通事务，再取得端口。
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.22\linewidth}|L{0.22\linewidth}|L{0.24\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+复位状态 & 处理器端口 & 夹具端口 & RAM 接受者 \\ \hline
+保持有效 & 不发普通请求 & 可读写 & 夹具 \\ \hline
+正在释放的规定边沿 & 仍不接受新请求 & 结束最后一笔请求 & 无；完成所有权转换 \\ \hline
+已经释放 & 可发普通请求 & 被隔离 & 处理器 \\ \hline
+\end{longtable}
+
+中间一行防止夹具最后一笔写尚未响应，处理器就开始第一笔取指。复位控制器只有在夹具报告
+空闲后才允许释放；因此 \code{prepared=1} 的写响应先于第一条启动指令。这个硬件次序与
+前文的人工提交顺序共同保证，启动程序不会读到正在变化的准备记录。
