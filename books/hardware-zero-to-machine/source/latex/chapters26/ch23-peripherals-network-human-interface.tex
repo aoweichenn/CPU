@@ -1321,6 +1321,98 @@ CAN 收发器把逻辑状态转换为 CAN\_H/CAN\_L 差分电压。显性 bit 0 
 LIN 通常使用单线加地、较低数据率和主从调度。主节点按调度表发送 break、同步字节和标识符，被指定的发布者随后发送数据与校验。没有逐 bit 多主仲裁，时间确定性来自主节点预先安排的时隙。节点可使用低成本 RC 时钟，通过同步字节校准当前帧的 bit 时间。
 
 LIN 的低成本也带来边界：主节点故障会影响整条调度，单线对短路和地偏移更敏感，错误检测能力弱于 CAN。车辆常用 CAN 承担制动、动力等高可靠网络，用 LIN 承担车窗、座椅和传感器等低速支线；网关在两者之间转换信号时，必须定义更新时间、超时默认值和失联后的安全状态。
+\section{十六、全双工音频的完整数据通路：Codec、DMA 环与时钟漂移}
+
+前文从 USB endpoint 解释了音频时钟反馈。板载音频、DSP 和许多嵌入式系统还常用 I²S 或 TDM 在 codec 与 SoC 之间搬运连续样本。下面用一个具体配置把模拟边界、串行链路、FIFO、DMA period、内存环形缓冲和软件处理串成闭环：48 kHz、双声道，每个样本有效 24 bit、在线上占用 32-bit slot，同时采集和播放。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=1.9cm] (mic) at (1.0,4.0) {麦克风/输入\\模拟电压};
+  \node[hw compute, minimum width=1.9cm] (adc) at (3.4,4.0) {Codec ADC\\滤波与量化};
+  \node[hw control, minimum width=1.9cm] (rxfifo) at (5.8,4.0) {I²S RX FIFO\\串并转换};
+  \node[hw compute, minimum width=1.9cm] (rxdma) at (8.2,4.0) {RX DMA\\写一个 period};
+  \node[hw memory, minimum width=1.9cm] (capring) at (10.6,4.0) {采集环\\四个 period};
+
+  \node[hw state, minimum width=1.9cm] (spk) at (1.0,1.1) {扬声器/输出\\模拟波形};
+  \node[hw compute, minimum width=1.9cm] (dac) at (3.4,1.1) {Codec DAC\\重建与驱动};
+  \node[hw control, minimum width=1.9cm] (txfifo) at (5.8,1.1) {I²S TX FIFO\\并串转换};
+  \node[hw compute, minimum width=1.9cm] (txdma) at (8.2,1.1) {TX DMA\\读一个 period};
+  \node[hw memory, minimum width=1.9cm] (playring) at (10.6,1.1) {播放环\\四个 period};
+
+  \node[hw state, minimum width=2.6cm] (dsp) at (10.6,2.55) {CPU/DSP 回调\\处理并发布 period};
+
+  \draw[hw bus] (mic) -- (adc);
+  \draw[hw bus] (adc) -- (rxfifo);
+  \draw[hw bus] (rxfifo) -- (rxdma);
+  \draw[hw bus] (rxdma) -- (capring);
+  \draw[hw bus] (capring) -- (dsp);
+  \draw[hw bus] (dsp) -- (playring);
+  \draw[hw return] (playring) -- (txdma);
+  \draw[hw return] (txdma) -- (txfifo);
+  \draw[hw return] (txfifo) -- (dac);
+  \draw[hw return] (dac) -- (spk);
+\end{pdfdiagram}
+\diagramnote{一条全双工音频通路。采集方向从模拟输入经 ADC、I²S RX FIFO 和 RX DMA 写入采集环；软件只处理已经完成的 period。播放方向中，软件先填好播放 period 并交出所有权，TX DMA 再把样本送入 FIFO 和 DAC。上下两条链共享采样时钟、内存、DMA 仲裁与软件调度，因此必须分别追踪数据所有权，又共同核对长期速率。}
+
+\topic{先把线上速率、内存速率和回调周期算清楚}
+
+I²S 每个声道使用一个 32-bit slot，双声道每帧共 64 bit，因此 bit clock 为
+\[
+48{,}000\times 2\times 32=3.072\ \mathrm{Mbit/s}.
+\]
+有效样本只有 24 bit，但 DMA 通常按 32-bit 容器访问内存，单方向内存数据率为
+\[
+48{,}000\times 2\times 4=384{,}000\ \mathrm{B/s}.
+\]
+全双工仅原始样本就产生约 384 kB/s 写入和 384 kB/s 读取，尚未计入 DSP 的读写、Cache line 搬运和描述符。
+
+若一个 period 含 256 帧，则每个 period 是 $256\times2\times4=2048$ B，持续 $256/48{,}000\approx5.333$ ms。四 period 环共 8192 B，覆盖约 21.333 ms 的样本。这个数不是固定的端到端时延：采样滤波、当前 FIFO 深度、环内目标水位、调度唤醒和播放队列都会再增加时间。
+
+\begin{longtable}{L{0.08\linewidth}L{0.2\linewidth}L{0.28\linewidth}L{0.32\linewidth}}
+\toprule
+阶段 & 当前所有者 & 完成边界 & 关键错误证据 \\
+\midrule
+A0 & 模拟前端/ADC & 采样沿锁存输入并形成带状态的码值 & 过载、欠量程、模拟静音、PLL unlock \\\tablerowrule
+A1 & RX FIFO & 完整左右声道帧进入 FIFO & frame sync、slot 宽度、FIFO overrun \\\tablerowrule
+A2 & RX DMA & 2048 B 已写入指定 period & 总线错误、短传输、IOMMU fault \\\tablerowrule
+A3 & 采集软件 & completion 代际匹配，Cache 可见 & 迟到中断、旧 completion、时间戳间隙 \\\tablerowrule
+P0 & 播放软件 & period 数据和元数据均已发布 & 未初始化样本、格式或声道顺序错误 \\\tablerowrule
+P1 & TX DMA & 2048 B 已从该 period 取走 & DMA 欠读、总线错误、代际不匹配 \\\tablerowrule
+P2 & TX FIFO/DAC & 样本按 LRCLK 消费并完成转换 & FIFO underrun、静音插入、PLL unlock \\\tablerowrule
+P3 & 模拟输出 & 重建滤波与驱动级产生波形 & 削顶、过流、pop/click 与热保护 \\
+\bottomrule
+\end{longtable}
+
+\topic{DMA completion 只归还一个 period，不代表声音已经离开扬声器}
+
+采集 completion 表示 RX DMA 已把该 period 写入内存；驱动执行必要的 DMA 同步并核对 generation 后，CPU 才能读取。它不表示应用已经处理样本。播放 completion 通常表示 TX DMA 已经读走或控制器已经消费该缓冲区，驱动可以重填该槽；样本可能仍在 TX FIFO、codec 数字滤波器和模拟输出级中。因此测量端到端时延要使用同一物理事件的采集时间戳与最终输出观测，不能只相减两个软件中断时间。
+
+环中每个槽至少需要 EMPTY、DEVICE\_OWNED、CPU\_OWNED/READY 之类的所有权状态以及 generation。CPU 写好播放数据后先使数据对 DMA 可见，再发布描述符或生产者指针；RX 方向则先读取完成状态，再使 DMA 写入对 CPU 可见。非一致性平台还需要按方向 clean 或 invalidate Cache。仅更新软件指针而不处理可见性，会产生重复旧音频或随机噪声。
+
+\topic{独立晶振的 100 ppm 会怎样耗尽缓冲}
+
+若采集端实际为 48,004.8 frame/s，而消费端为 48,000 frame/s，两者相差 100 ppm，即每秒净增加 4.8 帧。假设控制器把水位维持在四 period 环的中点，从中点到满约有 512 帧余量；只考虑这项固定频差，大约 $512/4.8\approx106.7$ s 后仍会溢出。增大环只会延后时刻，不会让两个长期平均速率相等。实际调度停顿可能一次消耗许多毫秒裕量，通常比固定漂移更快触发 xrun。
+
+系统必须选择一个速率主基准：让 codec 以 SoC 提供的主时钟工作；用 USB feedback 微调主机每个服务间隔的样本数；用异步采样率转换器在两个时钟域之间插值；或由控制环根据缓冲水位做极小的速率校正。控制环要滤除瞬时调度抖动，不能见到一次水位变化就突然丢样或重复样本，否则会形成可闻 click、音高调制和周期性噪声。
+
+\begin{longtable}{L{0.2\linewidth}L{0.24\linewidth}L{0.26\linewidth}L{0.2\linewidth}}
+\toprule
+现象 & 可能停点 & 不充分的解释 & 应同时查看 \\
+\midrule
+周期性爆音 & period 截止时刻、时钟校正或电源噪声 & “CPU 性能不够” & xrun 计数、水位、调度延迟、PLL 与电源 \\\tablerowrule
+播放静音但 DMA 前进 & 格式、slot、DAC mute 或模拟路径 & “数据已经送到 codec” & LRCLK/BCLK/SD、声道映射、DAC 状态 \\\tablerowrule
+采集重复旧块 & Cache 可见性或 completion 代际 & “麦克风没变化” & DMA 同步、ring 指针、generation 与序号 \\\tablerowrule
+数分钟后才 xrun & 长期时钟频差或缓慢水位控制 & “环还不够大” & 实际采样率、反馈值、ASRC 与水位趋势 \\\tablerowrule
+左右声道互换/失真 & slot 宽度、对齐、符号扩展、端序 & “模拟串扰” & I²S 模式、有效位、DMA 容器格式 \\
+\bottomrule
+\end{longtable}
+
+\topic{xrun 恢复是一项带代际的停止—清空—重启事务}
+
+RX FIFO overrun 表示新样本到来时没有空间，至少一段输入历史已经丢失；TX FIFO underrun 表示 DAC 需要下一样本时数据未到，硬件可能重复末样本或插入零。驱动必须把不连续性上报给上层，不能只清状态位继续假装时间线连续。
+
+可靠恢复先停止或静音流，等待 DMA 停在规定边界，记录最后完整 period、硬件样本计数和错误原因；再清 FIFO 与旧描述符，提升 generation，重建环指针和目标水位。播放端可先填充若干 period、采用短淡入避免 click，再同时释放 DMA 与串行端口；采集端则从新的时间基开始发布样本。任何迟到的旧 completion 都因 generation 不匹配而丢弃。
+
+由此可以区分三类指标：bit clock 是否连续描述物理传输，period completion 是否按时描述设备与内存交接，应用回调是否按时描述软件调度。音频“不卡顿”要求三条时间线都连续；其中任一条单独正常，都不足以证明端到端数据通路正确。
 
 \section*{章末练习}
 

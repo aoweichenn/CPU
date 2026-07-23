@@ -1,0 +1,84 @@
+\section{一次写缺失的完整生命周期：从 Store Buffer 到全局可见}
+
+前文已经分别介绍 write-allocate、MSHR、写回缓冲和一致性状态。把它们放进同一条事务，才能看清一次普通写为何会同时占用多种资源。设 L1 数据 Cache 为 4 路组相联、line 大小为 64 B；核心执行一条 4-byte store，目标地址所在 line 不在 L1，而目标 set 的替换候选恰好是一条 Modified 状态的脏 line。这里采用常见的 write-back、write-allocate 策略，并用 RFO/GetM 表示“取回数据并取得独占写权限”的协议请求。具体协议名称可以不同，状态依赖关系不变。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.2cm] (sb) at (1.2,4.4) {Store Buffer\\地址、数据、字节掩码};
+  \node[hw control, minimum width=2.2cm] (lookup) at (4.0,4.4) {L1 查 tag\\确认写缺失};
+  \node[hw memory, minimum width=2.2cm] (mshr) at (6.8,4.4) {分配 MSHR\\记录等待写入};
+  \node[hw control, minimum width=2.2cm] (rfo) at (9.6,4.4) {发 RFO/GetM\\请求 line 所有权};
+
+  \node[hw state, minimum width=2.2cm] (victim) at (1.2,2.2) {脏牺牲行\\原 tag＋64 B};
+  \node[hw memory, minimum width=2.2cm] (wbb) at (4.0,2.2) {写回缓冲\\暂存旧 line};
+  \node[hw compute, minimum width=2.2cm] (home) at (6.8,2.2) {下级/Home\\接收写回与 RFO};
+  \node[hw state, minimum width=2.2cm] (snoop) at (9.6,2.2) {探测共享者\\失效并确认};
+
+  \node[hw state, minimum width=2.2cm] (fill) at (6.8,0.0) {64 B 填充返回\\数据＋M 权限};
+  \node[hw control, minimum width=2.2cm] (merge) at (4.0,0.0) {按字节掩码合并\\更新 ECC 与 dirty};
+  \node[hw state, minimum width=2.2cm] (done) at (1.2,0.0) {写入可服务\\释放 MSHR};
+
+  \draw[hw bus] (sb) -- (lookup);
+  \draw[hw bus] (lookup) -- (mshr);
+  \draw[hw bus] (mshr) -- (rfo);
+  \draw[hw bus] (lookup) -- (victim);
+  \draw[hw bus] (victim) -- (wbb);
+  \draw[hw bus] (wbb) -- (home);
+  \draw[hw bus] (rfo) -- (home);
+  \draw[hw bus] (home) -- (snoop);
+  \draw[hw return] (snoop) -- (fill);
+  \draw[hw return] (fill) -- (merge);
+  \draw[hw return] (merge) -- (done);
+\end{pdfdiagram}
+\diagramnote{含脏牺牲行的一次 write-allocate 写缺失。旧 line 先进入写回缓冲，新 line 的未完成状态进入 MSHR；RFO/GetM 只有在共享副本完成失效并取得权限后才能返回 M。填充数据与 store 的字节掩码合并后，目标 line 才成为本核可继续命中的脏行。写回与取所有权可以在下级并行推进，但任何资源未被接受都会形成背压。}
+
+\topic{先区分三种“完成”}
+
+执行单元算出地址和数据，只说明 store 已经产生；store 进入 Store Buffer、且不会再因更老指令异常而被撤销，才达到架构退休边界；目标 line 取得写权限并使其他观察者按内存模型能够看到该写入，才达到相应的全局可见边界。三者可能相隔许多拍。处理器允许退休后的 store 继续留在 Store Buffer，是隐藏 Cache miss 延迟的重要手段；但 fence、原子操作和设备 doorbell 会要求更强的排空或可见顺序。
+
+若地址翻译、权限或对齐检查尚未结束，store 不能不可逆地修改 Cache。实现可以提前查 tag 或发起推测访问，但必须把结果留在可撤销结构中。只有当这条 store 成为非推测、访问属性确定为普通可缓存内存后，才能按正常一致性协议交出外部可见状态。
+
+\begin{longtable}{L{0.08\linewidth}L{0.19\linewidth}L{0.28\linewidth}L{0.33\linewidth}}
+\toprule
+阶段 & 占用资源 & 新建立的事实 & 尚不能声称的事情 \\
+\midrule
+S0 & Load/Store Queue & 虚拟地址、数据和字节掩码已形成 & 尚未证明翻译与权限合法 \\\tablerowrule
+S1 & Store Buffer & 指令可按架构规则退休 & 写入不一定已经离开本核 \\\tablerowrule
+S2 & tag/data 端口 & 目标 line 缺失，选中替换路 & 牺牲行仍不能被覆盖 \\\tablerowrule
+S3 & 写回缓冲、MSHR & 旧脏 line 有安全暂存；新 miss 有身份 & 下级尚未接受写回或 RFO \\\tablerowrule
+S4 & 一致性事务槽 & Home 已接受 RFO/GetM，探测正在进行 & 尚未取得全部失效确认 \\\tablerowrule
+S5 & fill buffer & 64 B 数据与 M 权限返回 & store 字节尚未合并并校验 \\\tablerowrule
+S6 & L1 data/tag/ECC & 掩码合并完成，line 为 M、dirty & 其他地址的先后关系仍由内存模型决定 \\\tablerowrule
+S7 & 完成/唤醒状态 & MSHR 释放，合并的等待者可继续 & 持久化内存中的耐久性并未因此成立 \\
+\bottomrule
+\end{longtable}
+
+\topic{脏牺牲行为什么不能“边覆盖边写回”}
+
+牺牲行处于 Modified，意味着下一级可能没有它的最新数据。L1 若先覆盖 data array、再等待下级接收写回，一旦下行背压或链路报错，旧数据就已经丢失。正确顺序是先把旧 tag、完整数据和一致性身份原子地转移到写回缓冲，确认缓冲拥有该 line 后，替换路才可供填充使用。写回缓冲由此成为临时所有者，而不只是一个性能队列。
+
+写回与 RFO 是否必须串行取决于下级结构。若有独立事务 ID、足够信用且协议不要求先完成旧地址的写回，两者可以重叠；若写回缓冲已满、MSHR 已满或下行请求槽耗尽，L1 必须停在相应边界，不能丢弃请求后假装 miss 已发出。后续命中其他 line 的访问是否还能前进，则取决于 Cache 是否支持 hit-under-miss。
+
+\topic{填充不是把 64 B 原样写进去}
+
+返回 line 可能分成多个 beat。fill buffer 要记录每个 beat 的有效位、错误状态和事务代际；store 的 4-byte 数据只覆盖其中被字节掩码选中的位置，其余 60 B 必须保留返回值。合并后重新计算相应 ECC，最后再一次性发布 tag、valid、dirty 和 M 状态。若实现支持 critical-word-first，可以较早唤醒等待的 load，但在整行和权限状态闭合前仍不能把不完整 line 当作普通命中。
+
+同一 line 上随后到达的 load/store 可以合并进原 MSHR，但必须保留程序顺序、字节重叠和转发关系。后一条 load 若读取的是前一条未排出的 store 所写字节，应由 Store Buffer 转发新值；读取 line 的其他字节则来自 fill buffer。简单地等整行返回虽然较慢，却是验证复杂转发逻辑时的重要参考模型。
+
+\begin{longtable}{L{0.2\linewidth}L{0.24\linewidth}L{0.27\linewidth}L{0.19\linewidth}}
+\toprule
+阻塞或错误 & 最后可靠状态 & 不安全处理 & 正确恢复边界 \\
+\midrule
+写回缓冲满 & 脏牺牲行仍在 L1 & 先覆盖该路再等待空位 & 保持 line 有效，等缓冲获得所有权 \\\tablerowrule
+RFO 被 NACK & MSHR 仍保存请求身份 & 重建一个无关联的新 miss & 保留或重发同代际请求，遵守退避 \\\tablerowrule
+探测确认超时 & 权限尚未授予 & 提前把 line 标成 M & 报告协议超时，隔离或复位相关域 \\\tablerowrule
+填充 ECC 不可纠正 & 错误绑定原 MSHR & 把部分 beat 发布成命中 & 使等待者获得精确错误，不发布 line \\\tablerowrule
+核心流水线回滚 & 已退休 store 与年轻推测操作分开 & 撤销已经退休并在途的写 & 只清除年轻状态，保留已退休 store \\\tablerowrule
+Cache/互连复位 & 旧 completion 可能迟到 & 复用原事务号和缓冲 & 提升 generation，耗尽或丢弃旧响应 \\
+\bottomrule
+\end{longtable}
+
+\topic{用什么证据定位写缺失停在哪里}
+
+只看“L1 写 miss 次数”无法判断瓶颈。至少要把 Store Buffer 满、MSHR 分配失败、dirty eviction、写回缓冲满、RFO 重试、探测往返、fill beat 延迟和 ECC 错误放到同一时间线。若 Store Buffer 长时间接近满而下级带宽仍空闲，问题可能在一致性权限；若 dirty eviction 与下行写流量同时升高，替换和写回才是主因；若大量请求合并到同一 MSHR，则真正的热点是少数 line，而不是容量不足。
+
+这条 trace 也给出程序层面的判断方法：普通 store 的退休时间、fence 完成时间、另一核心读到新值的时间和持久化介质确认时间是四个不同观测点。讨论“写完成”时必须先说明采用哪一个边界。

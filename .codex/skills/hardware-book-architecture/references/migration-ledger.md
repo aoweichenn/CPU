@@ -227,3 +227,13 @@
 | 第 3 章 | 四槽异步 FIFO、双口存储、格雷指针、保守空满、跨域可见性、独立复位与代际恢复 | verified |
 | 第 13 章 | 64B DDR4 Cache line 读、行冲突、PRE/ACT/RD、BL8、DQS、ECC、返回排序与错误闭合 | verified |
 | 第 24 章 | 60Hz 双缓冲、GPU fence、VBlank 翻页、扫描完成、面板响应、错帧代价与显示恢复 | verified |
+
+## 2026-07 缓存写入、平台上电与音频流案例深化批次
+
+本批次继续把已有概念收束为可以从零逐状态追踪的事务。第 11 章用一次命中脏牺牲行的 write-allocate 写缺失，闭合 store buffer、MSHR、写回缓冲、独占请求、填充合并与全局可见性；第 21 章用 ATX 类平台从待机电源、按键、主电源、VRM、时钟和复位走到复位向量首取指；第 23 章用 48 kHz、双声道、32-bit slot 的全双工音频流，闭合 codec、I²S/TDM、FIFO、DMA period、环形缓冲、时钟漂移与 xrun 恢复。只增加正文、机制图和正文表格，不增加章末练习，也不改变既有迁移单元归属。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 11 章 | write-allocate 写缺失、脏牺牲行、RFO/GetM、填充合并、写入可见性与失败恢复 | verified |
+| 第 21 章 | 待机电源、按键门控、PS\_ON\#、主电源与 VRM、时钟锁定、复位释放和首取指 | verified |
+| 第 23 章 | 48 kHz 全双工音频、I²S/TDM、DMA period/ring、时钟漂移、xrun 与代际恢复 | verified |
