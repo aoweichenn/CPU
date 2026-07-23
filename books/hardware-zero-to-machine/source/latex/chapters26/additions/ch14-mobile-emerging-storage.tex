@@ -1,0 +1,85 @@
+\section{五、UFS、eMMC 与 SD：同一 NAND 介质的三种主机边界}
+
+UFS、eMMC、SD 卡和 NVMe SSD 都可以使用 NAND Flash，但主机看到的接口并不相同。介质物理只决定擦除、编程、保持和磨损约束；控制器怎样暴露队列、命令、数据通道、完成通知和电源状态，决定了主机软件能够形成多少并行度，以及设备在复位或掉电后怎样恢复。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.2cm] (req) at (1.2,2.8) {块请求};
+  \node[hw control, minimum width=2.4cm] (host) at (4.0,2.8) {主机控制器};
+  \draw[hw bus] (req) -- (host);
+
+  \node[hw block, minimum width=2.6cm] (ufs) at (7.3,4.2) {UFS\\UTP + UniPro + M-PHY};
+  \node[hw block, minimum width=2.6cm] (emmc) at (7.3,2.8) {eMMC\\命令/数据并行总线};
+  \node[hw block, minimum width=2.6cm] (sd) at (7.3,1.4) {SD\\可移除卡接口};
+  \draw[hw bus] (host.east) -- (5.6,2.8) -- (5.6,4.2) -- (ufs.west);
+  \draw[hw bus] (host.east) -- (emmc.west);
+  \draw[hw bus] (host.east) -- (5.6,2.8) -- (5.6,1.4) -- (sd.west);
+
+  \node[hw memory, minimum width=2.7cm, minimum height=2.4cm] (flash) at (11.2,2.8) {设备控制器\\FTL / ECC / GC\\NAND 阵列};
+  \draw[hw bus] (ufs.east) -- (9.2,4.2) -- (9.2,3.55) -- (flash.north west);
+  \draw[hw bus] (emmc.east) -- (flash.west);
+  \draw[hw bus] (sd.east) -- (9.2,1.4) -- (9.2,2.05) -- (flash.south west);
+\end{pdfdiagram}
+\diagramnote{三类嵌入式/可移除存储接口共享同一种 NAND 控制器内部骨架，却在主机边界采用不同事务组织。UFS 把命令和数据放进分层串行链路并支持多命令在途，eMMC 使用板内并行数据总线，SD 还必须处理热拔插、触点和可移除介质状态。}
+
+\topic{eMMC 把 NAND 控制器与封装固定在主板上}
+
+eMMC 设备把 NAND die 和控制器封装在一起，以 CMD、CLK 和多位 DAT 总线连接 SoC。主机先发送带参数的命令，再在数据线上按块传输，设备状态寄存器报告忙、错误和当前状态。高性能模式使用源同步选通信号并要求调谐采样点，但总体仍是一条主机与单设备共享的命令/数据通路。其优点是实现成熟、引脚和控制器简单；局限是队列深度、并行命令和全双工能力弱于 UFS。
+
+eMMC 的“写命令完成”同样不自动等于 NAND 已经持久化。设备可以先把数据接收到内部 SRAM，再在后台执行 FTL 更新、编程和垃圾回收。主机若需要掉电语义，必须使用规范提供的 flush、可靠写或增强分区机制，并确认电源保持时间覆盖设备完成边界。
+
+\topic{UFS 把存储请求组织成可并行的全双工事务}
+
+UFS 使用 UTP（UFS Transport Protocol）承载存储命令，经 UniPro 链路层进入 M-PHY 串行物理层。发送与接收使用独立方向，链路可同时搬运命令、数据和响应；较新主机接口还允许多个请求排队和乱序完成。每个请求必须保留任务标识，完成响应用同一标识归还命令槽，主机不能按“先提交必先完成”回收缓冲区。
+
+一次 UFS 读从主机描述符开始：驱动写好命令与目标缓冲地址，控制器取描述符并发送 UPIU；设备控制器查 FTL、读 NAND、执行 ECC，再经反向链路返回数据与响应；主机控制器写完成状态并中断 CPU。若链路进入低功耗状态，控制器还要先完成唤醒与同步；若响应超时，则按任务管理、链路复位或设备复位逐级升级，旧请求的任务标识必须在新代际中失效。
+
+\topic{SD 卡还增加了连接、枚举和热拔插状态}
+
+SD 卡是可移除介质。插卡检测只说明触点状态发生变化，主机仍要供电、送初始化时钟、查询能力、分配相对地址并选择总线宽度与速度模式。触点反弹、供电跌落或用户在写入时拔卡，都可能使主机命令、控制器缓存和 NAND 编程处于不同完成阶段。因此文件系统一致性不能由“卡已经离开插槽”推断，写入关键数据后仍要使用同步与安全移除流程。
+
+\begin{longtable}{L{0.15\linewidth}L{0.25\linewidth}L{0.24\linewidth}L{0.26\linewidth}}
+\toprule
+接口 & 并行与物理边界 & 典型完成依据 & 主要故障特征 \\
+\midrule
+UFS & 差分串行、全双工、多请求在途 & 带任务标识的响应/完成项 & 链路低功耗恢复、任务超时、代际混淆 \\\tablerowrule
+eMMC & 板内 CMD/CLK/DAT，共享设备通路 & 状态寄存器与忙信号释放 & 调谐失败、内部缓存未持久化 \\\tablerowrule
+SD & 可移除触点、模式协商与卡检测 & 命令响应、数据 CRC 与状态 & 接触不良、热拔插、供电中断 \\\tablerowrule
+NVMe & PCIe、多队列、深度在途 & CQ 完成项与阶段位 & 队列/门铃/复位代际错误 \\
+\bottomrule
+\end{longtable}
+
+\section{六、新型非易失存储、光存储与磁带}
+
+存储介质不能只按“速度快慢”排成一列。读写粒度、是否需要擦除、写入能量、保持时间、可写次数、随机定位成本和控制器复杂度共同决定接口。MRAM、ReRAM 和 PCM 试图缩短易失内存与块存储之间的距离；光盘与磁带则选择低成本、长保持和可离线保存，接受更高的定位代价。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.5cm] (dram) at (1.5,3.8) {DRAM\\易失、字节寻址};
+  \node[hw memory, minimum width=2.5cm] (mram) at (4.6,3.8) {MRAM/ReRAM/PCM\\非易失阵列};
+  \node[hw memory, minimum width=2.5cm] (nand) at (7.7,3.8) {NAND\\页编程、块擦除};
+  \node[hw memory, minimum width=2.5cm] (tape) at (10.8,3.8) {光盘/磁带\\可移除、归档};
+
+  \node[hw label, text width=11.8cm] at (6.2,2.65) {向右移动：随机访问能力降低，单 bit 成本下降，适合离线与长期保存；向左移动：接口更接近 load/store，但待机保持、写入耐久和阵列面积约束更强。};
+
+  \node[hw state, minimum width=2.6cm] (cache) at (2.8,0.9) {Cache line / 内存控制器};
+  \node[hw control, minimum width=2.6cm] (blk) at (6.2,0.9) {块控制器 / FTL};
+  \node[hw control, minimum width=2.6cm] (seq) at (9.6,0.9) {卷/轨道顺序控制};
+  \draw[hw bus] (cache) -- node[hw label,above]{字节或 line 语义} (blk);
+  \draw[hw bus] (blk) -- node[hw label,above]{块语义} (seq);
+\end{pdfdiagram}
+\diagramnote{不同非易失介质不是同一接口的速度版本。上排是物理取舍，下排是相应控制边界：新型存储可能接近内存控制器，NAND 依赖块控制器与 FTL，光盘和磁带还需要卷、轨道与长距离定位状态。}
+
+\topic{MRAM、ReRAM 与 PCM 改变存储单元，不自动消除系统边界}
+
+\term{MRAM}{Magnetoresistive RAM}用磁性状态影响隧穿结电阻，读出电阻、写入磁化方向；\term{ReRAM}{Resistive RAM}通过材料中的导电细丝或阻态变化保存信息；\term{PCM}{Phase-Change Memory}利用材料晶态与非晶态的电阻差异。三者都可在断电后保持状态，并允许比 NAND 更细粒度的改写，但写入时延、写入能量、耐久性、读扰动和阵列密度各不相同。
+
+即使介质支持字节寻址，处理器写入仍可能先停留在 store buffer、Cache 和内存控制器队列。若系统把它用作持久内存，软件仍须知道\term{持久化域}{persistence domain}从哪里开始：Cache line 写回到控制器是否已经抵抗掉电，还是必须继续进入有后备电源的介质队列。地址可达性、Cache 一致性和掉电持久性是三条独立契约。
+
+\topic{光存储用光斑与轨道换取可移除介质}
+
+光盘把信息编码成轨道上的物理标记或可改变反射率的材料状态。激光经光学头聚焦到盘面，反射光由光电探测器转换为电信号，再经伺服、时钟恢复、解调和纠错形成扇区。顺序读取可以连续跟踪螺旋轨道，随机读取则要移动光头并等待伺服重新锁定。可记录光盘还要区分一次写入与可擦写材料，写入功率和冷却过程决定最终物理状态。
+
+\topic{磁带的主接口是卷与流，而不是随机块}
+
+磁带把数据沿长带顺序记录。驱动器装载卷、穿带、寻找文件标记，再以稳定带速持续读写；达到连续传输后吞吐可以很高，但随机定位需要机械走带，时延以秒甚至分钟计。上层常把大量小文件先打包成大对象，并维护独立目录或索引，避免逐文件往返定位。
+
+磁带机仍通过 SAS、Fibre Channel 或网络库控制器接入主机，但块请求不能掩盖顺序介质的事实。若主机供数速度低于磁带稳定写入速度，驱动器可能停带、回退并重新加速，反复启停会降低吞吐和机械寿命。因此备份系统要以足够大的缓冲和并行读取维持连续数据流；完成语义还要区分数据进入驱动器缓存、写到磁带以及卷被卸载并登记三个边界。

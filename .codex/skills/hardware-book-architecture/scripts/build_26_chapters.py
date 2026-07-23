@@ -67,7 +67,7 @@ CHINESE_NUMERALS = (
 CHINESE_TO_ARABIC = {number: str(index) for index, number in enumerate(CHINESE_NUMERALS, start=1)}
 EXTRAS = {
     1: ("ch01-chapter-exercises.tex",),
-    4: ("ch04-verification-closure.tex",),
+    4: ("ch04-verification-closure.tex", "ch04-silicon-fpga-dft.tex"),
     5: ("ch05-chapter-exercises.tex",),
     6: ("ch06-isa-real-world.tex",),
     8: ("ch08-modern-ooo.tex", "ch08-vector-smt.tex"),
@@ -76,16 +76,17 @@ EXTRAS = {
     11: ("ch11-cache-interface.tex", "ch11-cache-deep-dive.tex"),
     12: ("ch12-modern-vm-tlb.tex", "ch12-vm-deep-dive.tex"),
     13: ("ch13-chapter-exercises.tex",),
-    14: ("ch14-nvme-interface.tex",),
+    14: ("ch14-nvme-interface.tex", "ch14-mobile-emerging-storage.tex"),
     15: ("ch15-chapter-exercises.tex",),
     16: ("ch16-persistence-reliability.tex",),
     17: ("ch17-handshake-axi.tex", "ch17-noc-deep-dive.tex"),
     18: ("ch18-pcie-transactions.tex", "ch18-pcie-deep-dive.tex", "ch18-cxl-chiplet.tex"),
-    19: ("ch19-device-queues.tex",),
+    19: ("ch19-device-queues.tex", "ch19-runtime-hardware-security.tex"),
+    20: ("ch20-battery-pmic-power-path.tex",),
     21: ("ch21-platform-recovery.tex", "ch21-firmware-deep-dive.tex"),
     22: ("ch22-ras-reliability.tex", "ch22-ras-deep-dive.tex"),
-    23: ("ch23-ethernet-phy.tex", "ch23-usb-human-interface.tex", "ch23-sensor-acquisition.tex"),
-    24: ("ch24-gpu-memory-visibility.tex",),
+    23: ("ch23-ethernet-phy.tex", "ch23-usb-human-interface.tex", "ch23-sensor-acquisition.tex", "ch23-wireless-datacenter-fieldbus.tex"),
+    24: ("ch24-gpu-memory-visibility.tex", "ch24-display-camera-accelerator.tex"),
     26: ("ch26-modern-system-trace.tex",),
 }
 EXTRAS_BEFORE = {

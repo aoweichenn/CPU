@@ -135,3 +135,22 @@
 | 第 18 章 | CXL.io/cache/mem、设备内存、Chiplet 与 UCIe 封装内事务 | verified |
 | 第 23 章 | Ethernet MAC--PHY 边界、PCS/PMA/PMD、协商、训练、FEC 与故障回溯 | verified |
 | 全书后置资料 | 处理器、推测执行、PCIe/CXL/UCIe、NVMe、UEFI、Ethernet 与 USB 官方资料入口 | verified |
+
+## 2026-07 硅实现、物理外设与专用通路补全批次
+
+本批次补齐“RTL 如何成为芯片、数字事务如何穿过模拟与物理接口、专用硬件如何接回统一内存与完成语义”三类断点。所有内容继续进入现有二十六章，不新增章节容器，不删除既有正文与习题。每个图必须先明确要证明的机制，再按分层图、泳道图或状态链表达，并经过 PDF 页面目视检查。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 4 章 | ASIC 后端、签核、流片、封装与首次上电的完整实现链 | verified |
+| 第 4 章 | FPGA 的 LUT、互连、BRAM、DSP、时钟资源、位流与配置启动 | verified |
+| 第 4 章 | scan/ATPG、MBIST/LBIST、JTAG 边界扫描、晶圆测试、分档与熔丝修复 | verified |
+| 第 14 章 | UFS/eMMC/SD 主机接口、新型非易失存储、光存储与磁带边界 | verified |
+| 第 19 章 | TEE、内存加密、完整性保护、机密虚拟机与调试/密钥生命周期 | verified |
+| 第 20 章 | 电池、充电、PMIC、USB-PD、电源路径选择与掉电边界 | verified |
+| 第 23 章 | Wi-Fi/蓝牙的 MAC、基带、RF 前端、天线、关联与错误回溯 | verified |
+| 第 23 章 | RDMA/RoCE、SmartNIC/DPU、PTP 硬件时间戳与数据中心完成语义 | verified |
+| 第 23 章 | CAN/LIN 的仲裁、电气边界、错误计数、总线关闭与恢复 | verified |
+| 第 24 章 | HDMI/DisplayPort/eDP、TCON、LCD/OLED 驱动与像素可见边界 | verified |
+| 第 24 章 | CMOS 图像传感器、MIPI CSI、ISP、帧缓冲与曝光时间线 | verified |
+| 第 24 章 | NPU 的脉动阵列、片上 SRAM、量化、DMA、命令队列与完成边界 | verified |

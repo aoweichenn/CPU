@@ -1,0 +1,168 @@
+\section{九、显示物理通路：从帧缓冲到屏幕发光}
+
+GPU 把像素写入帧缓冲，只完成了“画面已经生成”。显示控制器还要在固定刷新节拍下读取像素，完成平面合成、色彩转换和时序生成；链路控制器再把像素变成 HDMI、DisplayPort 或 eDP 上的高速串行数据；显示器内部的时序控制器最后驱动面板行列电路。直到对应像素真正改变透光率或发光强度，一帧图像才走完物理通路。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.5cm] (fb) at (1.3,3.7) {帧缓冲\\像素、stride、格式};
+  \node[hw control, minimum width=2.7cm] (dc) at (4.4,3.7) {显示控制器\\取数、合成、时序};
+  \node[hw compute, minimum width=2.7cm] (tx) at (7.7,3.7) {链路发送端\\编码、分包、SerDes};
+  \node[hw block, minimum width=2.7cm] (link) at (11.0,3.7) {HDMI/DP/eDP\\差分通道与辅助通道};
+  \draw[hw bus] (fb) -- (dc);
+  \draw[hw bus] (dc) -- (tx);
+  \draw[hw bus] (tx) -- (link);
+
+  \node[hw control, minimum width=2.7cm] (rx) at (11.0,1.0) {接收端与 TCON\\恢复时钟、重排像素};
+  \node[hw block, minimum width=2.7cm] (panel) at (7.7,1.0) {面板行列驱动\\栅极/源极或像素电流};
+  \node[hw state, minimum width=2.7cm] (light) at (4.4,1.0) {LCD/OLED 像素\\透光或主动发光};
+  \node[hw state, minimum width=2.5cm] (seen) at (1.3,1.0) {可见画面\\亮度、色彩、刷新};
+  \draw[hw bus] (link) -- (rx);
+  \draw[hw bus] (rx) -- (panel);
+  \draw[hw bus] (panel) -- (light);
+  \draw[hw bus] (light) -- (seen);
+\end{pdfdiagram}
+\diagramnote{一帧画面的完整物理通路。上排从帧缓冲读取像素并转换成串行链路数据，下排从接收、时序控制和行列驱动一直走到像素发光。渲染 fence、翻页、链路传输、面板扫描和人眼看到画面是五个不同的完成边界。}
+
+\topic{显示控制器按扫描节拍消费帧缓冲}
+
+帧缓冲不仅是一片像素数组，还带有宽高、像素格式、每行跨度、平面地址、色域和传递函数。显示控制器通常拥有多个硬件平面：主画面、光标和视频层可以分别取数，再由合成器缩放、混合并转换到链路需要的色彩格式。若一行像素需要的内存带宽在截止时刻前没有得到满足，扫描逻辑不能停下来等待，它会重复旧数据、显示底色或报告 underflow；因此显示带宽必须按像素时钟、每像素位数、平面数量和缩放开销预留，而不能只看 GPU 的平均显存带宽。
+
+刷新时序包含有效像素区与水平、垂直消隐区。现代数字链路不再需要电子束回扫，但发送端与接收端仍用这套时序约定一帧和一行的边界。系统在垂直消隐附近更新 plane 地址，可以让下一帧从新缓冲区开始，避免同一刷新周期混入两代画面。可变刷新率允许延长帧间间隔，却仍要求每一行一旦开始就按约定速率送完。
+
+\topic{HDMI、DisplayPort 与 eDP 先建立能力和链路，再发送视频}
+
+HDMI 通过 DDC 读取接收端的 EDID，了解分辨率、刷新率、色彩格式和音频能力；随后发送端选择双方都支持的时序与链路速率。DisplayPort 使用 AUX 辅助通道读取能力并执行链路训练：接收端反馈时钟恢复和均衡状态，发送端逐步调整电压摆幅与预加重，直到各 lane 在目标速率下可靠工作。eDP 把相同的分组化链路用于设备内部面板，并增加面板电源、背光和低功耗状态的协同。
+
+链路带宽预算必须基于实际传输格式。分辨率和刷新率给出每秒有效像素数，消隐、编码和分包带来额外开销；RGB 8 bit 每分量与 10 bit 每分量、全色度与色度抽样也会改变数据率。若模式超出通道数量与每 lane 速率的组合，系统只能降低刷新率、降低色深、使用压缩或拒绝该模式。所谓“接口支持 4K”没有完整含义，必须同时给出刷新率、色深、色度格式和链路配置。
+
+\topic{TCON 与面板把数字像素落实为电压、电流和光}
+
+接收端恢复串行时钟和数据，重建像素流并交给 TCON（timing controller，时序控制器）。TCON 生成逐行、逐列的选通信号。LCD 像素本身不发光：背光先产生光，薄膜晶体管给液晶单元充电，液晶改变偏振状态，从而控制穿过彩色滤光片的光量；电容保持像素电压直到下次刷新。OLED 子像素则由驱动晶体管控制电流并主动发光，不需要统一背光，但亮度均匀性、老化补偿和低灰阶控制更复杂。
+
+面板响应不是瞬时的。LCD 液晶转动、OLED 驱动与补偿、背光调制和图像处理都可能增加延迟。高动态范围还要求内容元数据、色调映射、面板峰值亮度和局部调光共同配合。链路已经无误并不保证画面正确：偏色可能来自色彩矩阵或传递函数，闪屏可能来自链路训练或面板供电，横线可能来自 TCON、行驱动或连接排线，必须沿边界逐级定位。
+
+\begin{longtable}{L{0.18\linewidth}L{0.34\linewidth}L{0.36\linewidth}}
+\toprule
+可观察事件 & 它真正证明的事实 & 仍未证明的后续边界 \\
+\midrule
+GPU fence 完成 & 渲染写入达到设备规定的可见点 & 新帧已被显示控制器采用 \\\tablerowrule
+翻页事件完成 & plane 地址已在约定刷新边界切换 & 链路与面板已显示最后一个像素 \\\tablerowrule
+链路训练成功 & lane 在当前速率和均衡参数下可传输 & 像素格式、TCON 与面板供电均正确 \\\tablerowrule
+扫描输出一帧 & 显示控制器和链路已发送整帧 & 面板响应与背光已经达到目标亮度 \\\tablerowrule
+光学传感器读到变化 & 光子已经离开屏幕 & 人眼主观体验不存在拖影或闪烁 \\
+\bottomrule
+\end{longtable}
+
+\section{十、相机与 ISP：从入射光到可计算图像}
+
+相机是显示通路的逆向互补案例：外界光先经过镜头投到 CMOS 像素阵列，像素把光子积分成电荷，列电路与 ADC 把模拟量变成 Bayer RAW 采样；MIPI CSI-2 再把采样传给 SoC，DMA 写入内存，ISP 完成去马赛克、降噪、颜色和曝光处理。应用收到的图像已经穿过光学、模拟、串行链路、内存和专用计算多个边界。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.2cm] (scene) at (1.2,4.0) {场景光\\光谱与亮度};
+  \node[hw block, minimum width=2.3cm] (lens) at (3.9,4.0) {镜头/光圈\\聚焦与通光量};
+  \node[hw memory, minimum width=2.5cm] (sensor) at (6.8,4.0) {CMOS 阵列\\曝光、逐行读出};
+  \node[hw compute, minimum width=2.5cm] (adc) at (9.8,4.0) {列放大器/ADC\\Bayer RAW};
+  \node[hw block, minimum width=2.3cm] (csi) at (12.7,4.0) {CSI-2 PHY\\分包与串行化};
+  \draw[hw bus] (scene) -- (lens);
+  \draw[hw bus] (lens) -- (sensor);
+  \draw[hw bus] (sensor) -- (adc);
+  \draw[hw bus] (adc) -- (csi);
+
+  \node[hw memory, minimum width=2.3cm] (dma) at (12.7,1.1) {DMA/帧缓冲\\行号与时间戳};
+  \node[hw compute, minimum width=3.0cm] (isp) at (9.3,1.1) {ISP\\校正、降噪、去马赛克};
+  \node[hw control, minimum width=3.0cm] (threea) at (5.4,1.1) {3A 控制\\曝光、白平衡、对焦};
+  \node[hw state, minimum width=2.3cm] (image) at (1.6,1.1) {输出图像\\RGB/YUV/统计量};
+  \draw[hw bus] (csi) -- (dma);
+  \draw[hw bus] (dma) -- (isp);
+  \draw[hw bus] (isp) -- (image);
+  \draw[hw return] (isp) -- (threea);
+  \draw[hw return] (threea) -- (sensor);
+\end{pdfdiagram}
+\diagramnote{相机数据面与控制面的闭环。上排把光转换成 Bayer RAW 并送入 CSI-2，下排由 DMA 和 ISP 生成图像；ISP 统计量还会驱动自动曝光、自动白平衡和自动对焦，修改下一批帧的传感器与镜头参数。一次控制调整通常要过若干帧才完全可见。}
+
+\topic{CMOS 像素先积分光子，再逐行读出电压}
+
+曝光期间，光电二极管把到达的光子转换为电荷；积分时间越长、模拟增益越高，暗处信号越容易观察，运动模糊、饱和与噪声也会增加。常见彩色传感器在像素上覆盖 Bayer 彩色滤光阵列，每个采样点只测红、绿、蓝中的一种。黑电平、像素响应不均匀、坏点、镜头阴影和读出噪声都在此时进入数据，后续 ISP 只能估计和校正，不能凭空恢复已经饱和或被噪声淹没的信息。
+
+多数移动传感器使用 rolling shutter：各行曝光起止时间不同，快速移动或抖动会把直线拍成斜线。帧时间戳若只记 DMA 完成时刻，就会掩盖第一行与最后一行的实际曝光差；做传感器融合时应保留帧开始、曝光中点或逐行时序。global shutter 同时结束所有像素曝光，运动几何更稳定，但像素电路、噪声、面积和功耗代价不同。
+
+\topic{MIPI CSI-2 负责分包，D-PHY/C-PHY 负责电气传输}
+
+传感器把短包用于帧开始、帧结束和行边界，把长包用于像素负载；包头中的数据类型和虚拟通道可以在同一链路上区分 RAW、嵌入式元数据或多路传感器。CSI-2 定义协议和包，D-PHY 或 C-PHY 定义引脚上的高速传输方式。接收端先检查同步、包头纠错与负载 CRC，再按行写入目标缓冲。
+
+链路错误必须和缓冲错误分开。CRC 或同步错误指向传感器时钟、lane 映射、信号完整性或速率配置；帧开始存在但 DMA 缓冲无完成，通常要查描述符、stride、IOMMU 和中断；连续丢帧还可能是 ISP 或内存带宽不能在下一帧到达前归还缓冲。可靠驱动同时记录帧序号、虚拟通道、错误包、DMA 完成和缓冲代际。
+
+\topic{ISP 是按像素流工作的专用流水线}
+
+典型 ISP 依次执行黑电平校正、坏点修复、镜头阴影校正、降噪、去马赛克、颜色校正、伽马或色调映射、锐化和 RGB/YUV 转换。顺序不能任意交换：例如去马赛克前的噪声仍服从 Bayer 采样结构，过早锐化会把噪声一并放大。高分辨率视频要求流水线每拍接收一个或多个像素，中间结果主要保存在行缓冲而不是整帧往返 DRAM。
+
+自动曝光、自动白平衡和自动对焦构成跨帧反馈。ISP 对当前帧统计亮度直方图、颜色分布和清晰度，控制算法据此更新下一帧或后续若干帧的曝光时间、模拟增益、白平衡增益和镜头位置。参数写入、传感器锁存、实际曝光和 DMA 完成属于不同帧代际；若驱动不标记“参数从第几帧生效”，算法会用旧图像评价新参数，形成振荡。
+
+\begin{longtable}{L{0.17\linewidth}L{0.30\linewidth}L{0.41\linewidth}}
+\toprule
+异常现象 & 首先检查的边界 & 关键证据 \\
+\midrule
+整帧过曝且高光剪切 & 曝光与模拟增益 & 曝光寄存器生效帧、RAW 最大码值、直方图 \\\tablerowrule
+斜线或果冻形变 & rolling shutter 与运动 & 行时间、曝光区间、陀螺仪时间戳 \\\tablerowrule
+彩色噪点或偏色 & RAW/ISP 参数与校准 & Bayer 顺序、黑电平、白平衡增益、颜色矩阵 \\\tablerowrule
+随机横线或 CRC 错误 & CSI-2 PHY 与 lane 配置 & 包错误计数、速率、终端匹配、lane 映射 \\\tablerowrule
+有帧中断却无应用图像 & DMA、缓冲代际与 ISP 完成 & 描述符、IOMMU fault、帧序号、队列水位 \\
+\bottomrule
+\end{longtable}
+
+\section{十一、NPU：数据复用、量化与张量完成边界}
+
+NPU 并不是“缩小版 GPU”。它把常见张量算子落实为矩阵乘加阵列、片上 SRAM、搬运引擎和少量向量/标量单元，追求让权重与激活在芯片内尽可能多次复用。峰值 TOPS 只描述乘加阵列在理想数据类型和满利用率下的运算能力；真实性能往往由张量切块、片上容量、外存带宽、量化尺度和不规则算子决定。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.4cm] (cmd) at (1.3,3.8) {命令队列\\算子、形状、地址};
+  \node[hw control, minimum width=2.4cm] (sched) at (4.2,3.8) {调度/DMA\\切块与预取};
+  \node[hw memory, minimum width=2.7cm] (sram) at (7.3,3.8) {片上 SRAM\\激活块与权重块};
+  \node[hw compute, minimum width=2.7cm] (array) at (10.6,3.8) {MAC/脉动阵列\\乘法与累加};
+  \draw[hw bus] (cmd) -- (sched);
+  \draw[hw bus] (sched) -- (sram);
+  \draw[hw bus] (sram) -- (array);
+
+  \node[hw compute, minimum width=2.7cm] (post) at (10.6,1.0) {后处理单元\\激活、缩放、量化};
+  \node[hw memory, minimum width=2.7cm] (out) at (7.3,1.0) {输出缓冲\\片上或外部内存};
+  \node[hw state, minimum width=2.4cm] (done) at (4.2,1.0) {完成项/fence\\状态、代际、错误};
+  \node[hw state, minimum width=2.4cm] (host) at (1.3,1.0) {CPU/后续算子\\观察结果};
+  \draw[hw bus] (array) -- (post);
+  \draw[hw bus] (post) -- (out);
+  \draw[hw bus] (out) -- (done);
+  \draw[hw bus] (done) -- (host);
+\end{pdfdiagram}
+\diagramnote{一次 NPU 算子的请求—数据—完成闭环。调度器把大张量切成片上 SRAM 能容纳的块，MAC 阵列反复复用这些数据，后处理单元再完成激活与量化。输出写回、错误状态和 fence 必须按规定顺序发布，峰值 TOPS 不包含这些搬运与完成成本。}
+
+\topic{切块决定同一字节能在片上被使用多少次}
+
+矩阵乘法 $C_{M\times N}=A_{M\times K}B_{K\times N}$ 若每次乘加都从 DRAM 读取两个操作数，外存能耗和带宽会先达到上限。NPU 把 $A$、$B$ 切成 SRAM 可容纳的小块：一个激活块沿多个输出通道复用，一个权重块沿多个输入位置复用，部分和则尽量留在累加器中。脉动阵列让数据在相邻处理单元之间逐拍传递，减少对共享寄存器文件和全局互连的反复访问。
+
+片上 SRAM 容量、阵列尺寸与算子形状若不匹配，利用率会明显下降。矩阵边缘不足一个完整 tile 时，一部分 MAC lane 空闲；深度可分离卷积、归一化、索引和动态形状也未必能填满大阵列。编译器需要选择循环次序、tile 大小、双缓冲和算子融合，使 DMA 在阵列计算当前块时预取下一块，并尽量避免中间张量写回外存。
+
+\topic{量化降低带宽和乘法成本，但引入数值契约}
+
+把 FP32 权重和激活量化为 INT8，可把同样容量容纳的数据量提高四倍，并让阵列集成更多低位宽乘法器。量化值通常满足 $x \approx s(q-z)$，其中 $q$ 是整数码、$s$ 是尺度、$z$ 是零点。矩阵乘加常用更宽的整数累加器保存部分和，再经缩放、舍入、饱和和激活函数转换到输出位宽。
+
+尺度可以按整个张量、按通道或按更细粒度设置。粒度越细，数值误差通常越小，尺度读取和硬件控制越复杂。溢出、舍入模式、有符号性和饱和规则必须由模型转换器、编译器与硬件共同遵守；否则模型可能正常运行却在少数输入上产生系统性偏差。比较 NPU 正确性时，应同时保留浮点参考、各层量化参数和允许误差，而不能只看最终分类是否一致。
+
+\topic{稀疏性只有在编码、调度和阵列都支持时才节省时间}
+
+权重中出现零值并不自动提高性能。硬件必须能用位图、索引或结构化模式跳过零乘法，DMA 也要少搬相应数据；非结构化稀疏的索引和不规则调度可能抵消收益。结构化稀疏把每组元素中非零数量限制为固定模式，较容易映射到规则阵列，但模型训练必须遵守该约束。规格中的“稀疏 TOPS”应与稠密 TOPS 分开理解，并说明所需模式。
+
+\topic{NPU 仍然服从队列、地址、可见性和复位规则}
+
+运行时把算子描述符、张量地址、形状、数据类型与量化参数写入命令队列，执行发布屏障后敲 doorbell。NPU 经 IOMMU 或共享虚拟地址读取缓冲；如果平台并非硬件一致，CPU 与 NPU 之间还要执行 cache 清理和失效。算子完成时，设备必须先让输出写入达到规定的可见点，再更新完成项或 fence；后续 CPU、GPU 或另一个 NPU 队列只能在等待该边界后消费结果。
+
+异常不只有“算错”。描述符非法、张量越界、IOMMU fault、DMA 超时、ECC 错误、看门狗超时和热限频都需要独立状态。复位时应停止新提交，隔离 DMA，标记所有未完成任务失败，重建队列与地址映射，并递增 generation；旧 fence 即使随后到达，也不能被当作新任务完成。由此可见，NPU 与 GPU、NVMe 的计算内容不同，系统边界仍是同一套提交—执行—完成—恢复闭环。
+
+\begin{longtable}{L{0.17\linewidth}L{0.25\linewidth}L{0.29\linewidth}L{0.17\linewidth}}
+\toprule
+限制来源 & 典型证据 & 优先优化方向 & 不应混淆为 \\
+\midrule
+阵列利用率低 & 活跃 MAC 比例低、边缘 tile 多 & 调整 tile、批量或算子映射 & 外存一定不足 \\\tablerowrule
+外存带宽不足 & DMA 忙、阵列等数、复用率低 & 融合算子、扩大复用、压缩/量化 & 峰值 TOPS 太低 \\\tablerowrule
+片上容量不足 & 中间张量频繁溢写 DRAM & 改切块、生命周期与双缓冲 & 计算精度问题 \\\tablerowrule
+量化误差过大 & 与浮点参考偏差按层累积 & 校准尺度、提高敏感层位宽 & 驱动完成错误 \\\tablerowrule
+队列或地址故障 & fence 不前进、IOMMU/设备 fault & 修复描述符、映射与复位代际 & 模型本身太慢 \\
+\bottomrule
+\end{longtable}
