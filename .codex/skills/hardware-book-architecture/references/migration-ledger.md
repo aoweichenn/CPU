@@ -204,3 +204,15 @@
 | 第 14 章 | NVMe 环形 SQ/CQ、doorbell、phase/CID、PRP 跨页映射、超时与 generation 回收边界 | verified |
 | 第 18 章 | PCIe DMA 与 CXL 一致性对照、home agent、Cache line 所有权、CXL.mem 可见边界、chiplet 协议栈与故障定位 | verified |
 | 第 23 章 | Ethernet 帧上线预算、MAC/PCS/PMA/PMD 表示转换、FCS/FEC 边界、RX DMA 与分层错误证据 | verified |
+
+## 2026-07 零基础完整事务案例深化批次
+
+本批次把已经出现的术语组织成零基础读者可以逐状态手推的完整事务。新增内容只进入现有二十六章，不减少正文、图表、案例、习题或答案，也不增加章末练习数量。第 5 章闭合有符号整数除法的预处理、迭代、异常与提交；第 12 章从程序申请虚拟区走到首次触碰、TLB、Cache、COW 与回收；第 17 章逐拍展开 AXI 五通道和 AXI--APB 桥；第 19 章用四槽网卡接收环闭合 DMA、IOMMU、MSI-X 与缓冲回收；第 22 章用安全 P-state 切换闭合电压、频率、温度与故障回退。所有机制图按宽松分层、泳道或状态链绘制，并在最终 PDF 中逐页检查。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 5 章 | 有符号整数除法、符号归一化、商余数规则、除零、最小负数除以负一、可变时延与精确提交 | verified |
+| 第 12 章 | `malloc` 虚拟区、首次触碰、需求零页、PTE/TLB/Cache、A/D 位、NUMA、COW、unmap 与页框回收 | verified |
+| 第 17 章 | AXI 五通道逐拍写、双 ID 交错读、背压、`LAST`、响应归属、AXI--APB 桥接与错误闭合 | verified |
+| 第 19 章 | 四槽网卡 RX 环、缓冲发布、IOMMU/DMA、完成所有权、MSI-X、屏蔽重查、代际与回收 | verified |
+| 第 22 章 | P-state 安全升降序、VRM 斜率、时钟确认、热惯性、硬件保护、失败回退与完成确认 | verified |

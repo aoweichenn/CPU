@@ -1,0 +1,82 @@
+\section{从申请两页内存到第一次写入：把虚拟内存通路走完}
+
+页表、TLB、缺页和 NUMA 若分别理解，读者仍可能误以为 \code{malloc} 返回指针时，操作系统已经为范围内每个 byte 安排好 DRAM。真实过程把“拥有一段虚拟地址”与“拥有物理页框”分成两个时间点。运行库可以从已有堆区切出空间，也可以向内核申请新的匿名映射；为突出硬件路径，下面假设得到一段新建、页对齐、尚未触碰的 8 KiB 匿名区域。具体分配器阈值会改变系统调用次数，但不会改变首次访问必须经过地址翻译这一事实。
+
+设页大小为 4 KiB，返回基址为 \code{0x00007F20A0402000}。程序随后执行两条动作：
+\[
+  p[0]=1,\qquad p[4096]\ \text{暂时不访问}.
+\]
+第一条 store 的虚拟地址位于第一个页面，页内偏移为 0；第二个页面虽然属于同一虚拟内存区域，却没有因为第一个页面被触碰而自动获得物理页框。
+
+\topic{第一次 store 是一次可修复的控制流分支}
+
+地址生成单元先形成虚拟地址，TLB 查找该虚拟页号。新映射尚无有效叶子 PTE 时，TLB miss 触发 page walk，walker 最终发现表项不存在或处于需求分页状态，于是真正的数据写尚未进入 Cache，处理器先形成精确 page fault。内核依据故障地址查找虚拟内存区域，确认该地址属于可写匿名映射，随后从当前 NUMA 节点取得一个清零页框，建立带读写权限的 PTE，并使旧翻译失效。
+
+返回用户态后，处理器重试原 store。这一次 TLB 可由新 PTE 填充，物理地址进入 Cache；Cache line 被写成脏状态，PTE 的 Accessed/Dirty 状态也按体系结构规则更新。只有重试后的 store 到达正常提交边界，程序才真正观察到 \code{p[0]==1}。
+
+\begin{longtable}{L{0.10\linewidth}L{0.24\linewidth}L{0.34\linewidth}L{0.22\linewidth}}
+\toprule
+时刻 & 主体与状态 & 发生的动作 & 尚未发生的事 \\
+\midrule
+$t_0$ & 运行库/虚拟内存区域 & 返回覆盖两页的虚拟地址范围 & 不保证两页已有物理页框 \\
+$t_1$ & CPU 地址生成与 TLB & 形成第一页虚拟地址，TLB 未命中 & store 尚未写入 Cache \\
+$t_2$ & page walker & 逐级读取页表，发现叶子映射不可用 & 没有形成可提交的数据写 \\
+$t_3$ & 精确异常入口 & 保存故障地址、访问类型与返回状态 & 目标页面内容仍不可见 \\
+$t_4$ & 内核页框分配器 & 在当前策略允许的 NUMA 节点取得清零页 & 第二个未触碰页面仍无页框 \\
+$t_5$ & 内核页表代码 & 初始化 PTE，发布映射并处理旧翻译 & 用户 store 尚未重试 \\
+$t_6$ & 异常返回与 TLB & 重试指令，填充第一页翻译 & 仅获得地址与权限 \\
+$t_7$ & Cache 与提交单元 & 写入目标 Cache line，形成 A/D 状态 & DRAM 不一定已立即收到写回 \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (program) at (1.4,4.4) {程序\\首次写虚拟地址};
+  \node[hw control, minimum width=2.5cm] (tlb) at (4.5,4.4) {TLB/page walk\\翻译未建立};
+  \node[hw state, minimum width=2.5cm] (fault) at (7.6,4.4) {精确 page fault\\保存访问身份};
+  \node[hw control, minimum width=2.7cm] (kernel) at (10.8,4.4) {内核验证 VMA\\分配清零页框};
+  \node[hw memory, minimum width=2.7cm] (pte) at (10.8,1.4) {发布 PTE\\PFN/权限/内存属性};
+  \node[hw control, minimum width=2.5cm] (retry) at (7.6,1.4) {返回并重试\\TLB 填充};
+  \node[hw memory, minimum width=2.5cm] (cache) at (4.5,1.4) {Cache line\\写入并变脏};
+  \node[hw state, minimum width=2.5cm] (visible) at (1.4,1.4) {程序可见\\store 正常提交};
+  \draw[hw bus] (program) -- (tlb);
+  \draw[hw bus] (tlb) -- (fault);
+  \draw[hw bus] (fault) -- (kernel);
+  \draw[hw bus] (kernel) -- (pte);
+  \draw[hw return] (pte) -- (retry);
+  \draw[hw return] (retry) -- (cache);
+  \draw[hw return] (cache) -- (visible);
+\end{pdfdiagram}
+\diagramnote{匿名页首次写入的闭环。上排在真正写数据之前确认映射缺失并进入可修复异常；下排先发布完整 PTE，再重试同一条 store。页框分配完成不是程序可见边界，重试后的 store 提交才是。}
+
+\topic{页框位置由第一次实际触碰者决定}
+
+若系统采用 first-touch NUMA 策略，执行 $t_4$ 分配动作的 CPU 所在节点会影响页框位置。假设进程在节点 0 申请 8 KiB，但线程迁移到节点 1 后才执行 \code{p[0]=1}，第一页很可能落在节点 1；尚未触碰的第二页仍没有位置。以后节点 0 的线程访问第一页时，地址翻译完全正确，却要经一致性互连访问节点 1 的内存控制器。
+
+这说明“虚拟地址连续”“物理页框已分配”和“页框靠近当前执行核心”是三个不同事实。诊断 NUMA 性能时，需要同时观察故障发生在哪个核心、PTE 指向哪个物理页框、物理地址由哪个内存控制器负责，不能只看分配调用发生在哪个线程。
+
+\topic{fork 之后，下一次写会把同一页分成两个生命周期}
+
+假设第一页已经包含 \code{p[0]=1}，进程随后执行 \code{fork}。内核不必立即复制整页，而是让父子 PTE 指向同一页框，并把两边都改成只读 COW 状态。子进程第一次执行 \code{p[0]=2} 时，TLB 权限检查形成 protection fault；内核确认这是可修复的 COW，分配新页、复制旧内容、原子发布子进程的新 PTE、失效旧翻译，再重试 store。父进程仍从旧页读到 1，子进程从新页读到 2。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.7cm] (reserved) at (1.5,4.2) {虚拟区已保留\\叶子 PTE 不存在};
+  \node[hw memory, minimum width=2.7cm] (resident) at (5.0,4.2) {首次触碰后驻留\\PTE 指向页框 P};
+  \node[hw state, minimum width=2.7cm] (shared) at (8.5,4.2) {fork 后共享只读\\父子均指向 P};
+  \node[hw memory, minimum width=2.7cm] (split) at (12.0,4.2) {COW 完成\\父→P，子→Q};
+  \node[hw control, minimum width=3.0cm] (unmap) at (8.5,1.2) {撤销映射\\PTE 更新与 shootdown};
+  \node[hw state, minimum width=3.0cm] (quiescent) at (5.0,1.2) {等待静止\\无旧 TLB/固定 DMA};
+  \node[hw memory, minimum width=2.7cm] (free) at (1.5,1.2) {引用计数归零\\页框可重新分配};
+  \draw[hw bus] (reserved) -- node[above, hw label]{首次 fault} (resident);
+  \draw[hw bus] (resident) -- node[above, hw label]{fork} (shared);
+  \draw[hw bus] (shared) -- node[above, hw label]{首次写} (split);
+  \draw[hw return] (split) -- (unmap);
+  \draw[hw return] (unmap) -- (quiescent);
+  \draw[hw return] (quiescent) -- (free);
+\end{pdfdiagram}
+\diagramnote{一个匿名页从虚拟预留到回收的状态链。COW 不是复制动作本身，而是把一个共享映射原子分成两个页框生命周期；unmap 也不是清除 PTE 后立即结束，只有旧 TLB、IOTLB 和在途访问均无法到达页框时，物理页才可复用。}
+
+\topic{unmap 的完成边界晚于页表写入}
+
+释放这段虚拟区域时，内核先阻止新访问并撤销 PTE，再向可能缓存相关翻译的核心发送 TLB shootdown。若页面还交给设备 DMA，CPU 侧 shootdown 之外还要停止设备提交、撤销 IOMMU 映射、等待 IOTLB 或 ATS 失效，并确认在途 DMA 已结束。页框引用计数只有在这些到达路径全部关闭之后才可降到可回收状态。
+
+因此整个案例有三个不同的“完成”：分配器返回指针，只完成虚拟空间管理；page fault 处理返回，只完成映射建立；store 提交，才完成本次数据写。释放方向同样分层：PTE 清除只撤销页表中的许可，远端翻译确认与设备静止之后，才完成页框生命周期回收。

@@ -1,0 +1,86 @@
+\section{一次安全 P-state 切换：电压、频率与温度不能同时跳变}
+
+DVFS 策略决定“希望使用哪个性能档”，真正执行切换的是一组不同时间尺度的硬件。频率提高会缩短每级组合逻辑可用的传播时间，而晶体管在较低电压下驱动能力更弱、延迟更长。因此升高性能时必须先让供电达到新频率要求的最低电压，再切换时钟；降低性能时则先降低频率，再降低电压。顺序反转会短暂进入“频率已经过高、电压仍然不足”的非法工作点。
+
+下面使用一组明确声明为教学假设的参数：处理器从 0.80 V、2.0 GHz 的 P0 切到 1.00 V、4.0 GHz 的 P1；VRM 有效斜率为 10 mV/$\mu$s，达到目标后等待 5 $\mu$s 稳定窗口，时钟分频或 PLL 切换与确认需要 2 $\mu$s。实际平台的电压表、斜率、锁定时间和控制接口由芯片与主板共同规定，不能把这些示例数值直接当成产品规格。
+
+\topic{升频路径：先建立电气余量，再缩短时钟周期}
+
+电压需要提高 200 mV，按假设斜率计算，最少爬升时间为
+\[
+  \frac{1.00-0.80}{0.010}\ \mu\mathrm{s}=20\ \mu\mathrm{s}.
+\]
+控制器先验证温度、功率预算和 VRM 状态，再发送新 VID。VRM 的内部模拟环逐步改变参考值并稳定输出；处理器读取 power-good 或调压完成状态，等待额外 5 $\mu$s 稳定窗口后，才把时钟切到 4.0 GHz。再经过 2 $\mu$s 的时钟确认，控制器才能发布“P1 已达到”。从请求到可确认完成的教学时间至少约为 $20+5+2=27\ \mu$s。
+
+\begin{longtable}{L{0.10\linewidth}L{0.24\linewidth}L{0.38\linewidth}L{0.18\linewidth}}
+\toprule
+阶段 & 控制状态 & 执行动作与等待条件 & 对软件可见的事实 \\
+\midrule
+S0 & P0 稳定 & 0.80 V、2.0 GHz 正常运行 & 当前档位仍是 P0 \\
+S1 & 请求已收 & 检查温度、功率上限、VRM 与时钟故障位 & 只表示请求被接受 \\
+S2 & 电压上升 & 发送 1.00 V VID，等待约 20 $\mu$s & 频率仍保持 2.0 GHz \\
+S3 & 电压确认 & 等待 power-good 与 5 $\mu$s 稳定窗口 & 新电压余量已经建立 \\
+S4 & 时钟切换 & 请求 4.0 GHz，等待分频/PLL 状态确认 & 不能提前报告 P1 完成 \\
+S5 & P1 提交 & 发布 achieved P-state 与完成状态 & 软件可确认 1.00 V、4.0 GHz 档位 \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.3cm] (p0) at (1.3,4.4) {P0 稳定\\0.80 V / 2.0 GHz};
+  \node[hw control, minimum width=2.5cm] (validate) at (4.3,4.4) {接收请求\\预算与故障检查};
+  \node[hw control, minimum width=2.5cm] (raisev) at (7.4,4.4) {先升电压\\VID 与 VRM 斜率};
+  \node[hw state, minimum width=2.5cm] (vok) at (10.5,4.4) {电压确认\\power-good/稳定窗};
+  \node[hw control, minimum width=2.5cm] (raisef) at (10.5,1.3) {再升频率\\分频/PLL 切换};
+  \node[hw state, minimum width=2.5cm] (p1) at (7.4,1.3) {P1 已达到\\1.00 V / 4.0 GHz};
+  \node[hw control, minimum width=2.5cm] (safe) at (4.3,1.3) {失败回退\\保持或返回安全档};
+  \draw[hw bus] (p0) -- (validate);
+  \draw[hw bus] (validate) -- node[above, hw label]{允许} (raisev);
+  \draw[hw bus] (raisev) -- (vok);
+  \draw[hw bus] (vok) -- (raisef);
+  \draw[hw return] (raisef) -- (p1);
+  \draw[hw return] (validate) -- node[right, hw label]{拒绝} (safe);
+  \draw[hw return] (raisev) -- (safe);
+  \draw[hw return] (raisef) -- (safe);
+\end{pdfdiagram}
+\diagramnote{升性能档的安全状态链。电压确认是频率提高的前置条件；任一检查、调压或时钟确认失败都转入安全档，而不是继续发布目标 P-state。请求被接受与目标档真正达到是两个不同边界。}
+
+\topic{降频路径必须反向排序}
+
+从 P1 回到 P0 时，控制器先把频率从 4.0 GHz 降到 2.0 GHz并等待确认，此时 1.00 V 对较低频率仍有充足余量；随后才把 VID 降到 0.80 V。若先降电压，时钟仍以 4.0 GHz 运行的过渡窗口可能产生建立时间违例，错误会表现为运算、地址或控制状态的随机损坏，而不一定形成一个可定位的“欠压异常”。
+
+调压完成也不表示温度已经稳定。动态功耗变化几乎立即影响电流，VRM 在微秒量级响应，芯片结温却受封装与散热器热容影响，通常在更慢的毫秒至秒尺度变化。P-state 控制器不能等待温度完全收敛后才结束每次切换；热管理环会在后续采样中继续观察趋势，必要时再次降低性能档。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.7cm] (policy) at (1.5,4.3) {性能策略\\约毫秒级更新};
+  \node[hw control, minimum width=2.7cm] (pstate) at (5.0,4.3) {P-state 状态机\\顺序与完成确认};
+  \node[hw control, minimum width=2.7cm] (vrm) at (8.5,4.3) {VRM 电压环\\微秒级稳定};
+  \node[hw control, minimum width=2.7cm] (clock) at (12.0,4.3) {时钟环/分频\\微秒级确认};
+  \node[hw state, minimum width=3.0cm] (power) at (10.2,1.2) {芯片功耗与结温\\毫秒至秒级变化};
+  \node[hw control, minimum width=3.0cm] (thermal) at (6.2,1.2) {热管理与风扇\\采样、迟滞、限功率};
+  \node[hw state, minimum width=2.7cm] (protect) at (2.2,1.2) {硬件保护\\PROCHOT/THERMTRIP};
+  \draw[hw bus] (policy) -- (pstate);
+  \draw[hw bus] (pstate) -- (vrm);
+  \draw[hw bus] (vrm) -- (clock);
+  \draw[hw bus] (clock) -- (power);
+  \draw[hw return] (power) -- (thermal);
+  \draw[hw return] (thermal) -- (pstate);
+  \draw[hw return] (power) -- (protect);
+  \draw[hw return] (protect) -- (policy);
+\end{pdfdiagram}
+\diagramnote{DVFS 由多个时间尺度的控制器嵌套组成。P-state 状态机协调 VRM 与时钟的微秒级动作，热管理在更慢尺度上根据功耗和温度继续修正策略；PROCHOT/THERMTRIP 等硬件保护不等待软件环完成。}
+
+\topic{异常路径要区分“目标未达到”与“平台必须立即保护”}
+
+\begin{longtable}{L{0.20\linewidth}L{0.27\linewidth}L{0.31\linewidth}L{0.12\linewidth}}
+\toprule
+观测状态 & 可能原因 & 控制动作与保留证据 & 最终边界 \\
+\midrule
+VRM 超时或 power-good 无效 & 调压器故障、负载过大、遥测失联 & 不提高频率；记录目标 VID、实测电压和超时计数 & 保持原档或转安全低档 \\
+PLL 未锁定或切换失败 & 参考时钟异常、配置不合法、抖动超限 & 继续使用安全时钟，记录 lock/fault 状态 & 不发布目标频率 \\
+温度传感器 stale/missing & 侧带总线错误、传感器失效 & 不把旧低温值当成当前事实，限制功率 & 保守运行或受控关机 \\
+PROCHOT 有效 & 温度、电流或平台策略超过硬限制 & 硬件立即压低频率，软件随后读取原因 & 保护优先于性能请求 \\
+THERMTRIP 有效 & 温度达到不可继续运行的边界 & 硬件关闭相关电源，BMC/固件保存事件 & 断电，不尝试普通重试 \\
+\bottomrule
+\end{longtable}
+
+请求寄存器中的目标档、控制器内部正在执行的档、状态寄存器报告的 achieved 档和性能计数器测得的实际频率可能在过渡期间同时不同。软件若要做测量或热策略，必须以完成状态和时间戳区分这些值；只写一次目标寄存器后立即读取性能数据，会把调压和时钟切换的过渡期误算成目标档性能。

@@ -1,0 +1,81 @@
+\section{四槽网卡接收环：从线上帧到缓冲区重新交还}
+
+设备队列的抽象可以用一只很小的接收环具体化。设网卡 RX 队列只有 4 个描述符 D0--D3，每项包含缓冲区 IOVA、容量、实际长度、校验状态、generation 和一个教学用所有权位。规定 \code{OWN=1} 表示设备可以写该缓冲，\code{OWN=0} 表示 CPU 可以读取结果。真实网卡可能用独立完成环、head write-back 或 phase bit 表达同一事实，字段名称不同，但“只有一方拥有可修改权”的不变量相同。
+
+驱动先分配 B0--B3 四个 2 KiB 缓冲，固定相应页框并建立 IOMMU 映射。描述符的地址、容量和 generation 全部写完后，驱动完成平台要求的 Cache clean 与写屏障，最后才把 \code{OWN} 置为 1 并更新可见队尾。若所有权位先到达设备，网卡可能按旧地址执行 DMA。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.5cm, minimum height=1.4cm] (d0) at (1.5,3.8) {D0 / B0\\OWN=0\\len=1500};
+  \node[hw memory, minimum width=2.5cm, minimum height=1.4cm] (d1) at (4.8,3.8) {D1 / B1\\OWN=1\\空闲};
+  \node[hw memory, minimum width=2.5cm, minimum height=1.4cm] (d2) at (8.1,3.8) {D2 / B2\\OWN=1\\空闲};
+  \node[hw memory, minimum width=2.5cm, minimum height=1.4cm] (d3) at (11.4,3.8) {D3 / B3\\OWN=1\\空闲};
+  \node[hw control, minimum width=2.7cm] (cpu) at (1.5,1.2) {CPU 待回收\\clean=0};
+  \node[hw control, minimum width=2.7cm] (nic) at (4.8,1.2) {网卡下一槽\\rx\_head=1};
+  \draw[hw return] (d0) -- node[right, hw label]{CPU 所有} (cpu);
+  \draw[hw bus] (d1) -- node[right, hw label]{设备所有} (nic);
+\end{pdfdiagram}
+\diagramnote{网卡完成第一帧后的四槽环快照。四个描述符从左到右构成环的槽位顺序；D0 已交回 CPU，实际长度为 1500 B，D1--D3 仍归设备。网卡 head 已推进到 D1，但 D0 在驱动清理状态并重新发布 OWN 之前不能再次接收数据。}
+
+\topic{一次接收要跨过数据、描述符和通知三个可见边界}
+
+现在让一个 1500 B Ethernet 帧进入 D0。MAC 完成 FCS 检查后，DMA 引擎使用 D0 中的 IOVA 请求 IOMMU 翻译；IOMMU 验证 requester identity、读写权限和页框映射，随后网卡把帧数据写入 B0。数据写完成后，设备再写实际长度、校验结果和错误状态，最后把 D0 的 \code{OWN} 改为 0。完成信息发布后，设备发送对应队列的 MSI-X 消息。
+
+\begin{longtable}{L{0.09\linewidth}L{0.22\linewidth}L{0.39\linewidth}L{0.20\linewidth}}
+\toprule
+事件 & 状态所有者 & 动作与顺序 & 可见边界 \\
+\midrule
+E0 & 驱动 & 写完 D0 地址、容量和 generation，屏障后发布 \code{OWN=1} & 设备可以读取描述符 \\
+E1 & MAC/网卡 & 校验收到的帧并选中 D0 & 尚未修改主存缓冲 \\
+E2 & IOMMU/DMA & 翻译 IOVA，把 1500 B 数据写入 B0 & 数据写已进入内存系统 \\
+E3 & 网卡 & 写 length、checksum、error，最后发布 \code{OWN=0} & CPU 可以消费完成字段 \\
+E4 & MSI-X/APIC & 发送并投递队列通知 & 只表示可能有完成，不是回收凭证 \\
+E5 & CPU 驱动 & 读屏障后检查 OWN/generation，读取 B0 和状态 & 软件取得缓冲所有权 \\
+E6 & 网络栈/驱动 & 上送数据或处理错误，清理旧状态 & B0 尚未重新归设备 \\
+E7 & 驱动 & 重新同步缓冲，屏障后置 \code{OWN=1} 并推进 rearm 指针 & 设备可以再次使用 B0 \\
+\bottomrule
+\end{longtable}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (frame) at (1.4,4.4) {MAC 收到帧\\FCS/长度有效};
+  \node[hw control, minimum width=2.6cm] (select) at (4.6,4.4) {RX 引擎选择 D0\\读取 IOVA};
+  \node[hw control, minimum width=2.6cm] (iommu) at (7.8,4.4) {IOMMU 翻译\\身份与写权限};
+  \node[hw memory, minimum width=2.7cm] (data) at (11.1,4.4) {DMA 写 B0\\数据先到达};
+  \node[hw memory, minimum width=2.7cm] (completion) at (11.1,1.3) {写状态与 OWN\\发布完成};
+  \node[hw state, minimum width=2.6cm] (msix) at (7.8,1.3) {MSI-X 通知\\目标 Local APIC};
+  \node[hw control, minimum width=2.6cm] (driver) at (4.6,1.3) {驱动验证代际\\消费并同步};
+  \node[hw state, minimum width=2.5cm] (rearm) at (1.4,1.3) {重新发布 D0\\缓冲归设备};
+  \draw[hw bus] (frame) -- (select);
+  \draw[hw bus] (select) -- (iommu);
+  \draw[hw bus] (iommu) -- (data);
+  \draw[hw bus] (data) -- (completion);
+  \draw[hw return] (completion) -- (msix);
+  \draw[hw return] (msix) -- (driver);
+  \draw[hw return] (driver) -- (rearm);
+\end{pdfdiagram}
+\diagramnote{一帧接收的端到端所有权路径。设备先写数据、再发布完成、最后通知；CPU 以描述符所有权和 generation 判断真实性，而不是仅凭中断。回收方向在同步与屏障之后才把同一缓冲重新交给设备。}
+
+在未放宽排序属性的常规路径中，设备应保证前序 DMA 数据与完成写先于后发的 MSI-X 通知到达相应可见边界；驱动仍需使用平台 DMA API 和读屏障，非一致性系统还要执行 Cache invalidation。协议排序和软件同步是两层互补条件，不能用其中一层替代另一层。
+
+\topic{屏蔽、排空、重新开放与再检查共同关闭丢唤醒窗口}
+
+高负载时，驱动可能在第一次中断后临时屏蔽该队列通知，按预算连续处理 D0、D1 等多个完成。处理到暂时看不到新完成时，若直接开放中断并返回，会存在一个边界问题：新完成可能恰好发生在“最后一次检查”与“重新开放”之间，而设备认为队列已经处于有完成状态，不一定再生成新的边沿通知。
+
+稳妥顺序是先排空当前可见完成，再开放通知，随后立即重新检查队列。竞争窗口被分成两半：
+
+\begin{longtable}{L{0.22\linewidth}L{0.34\linewidth}L{0.34\linewidth}}
+\toprule
+新完成发生时刻 & 哪条路径发现它 & 为什么不会丢失 \\
+\midrule
+重新开放之前 & 开放后的再次检查 & 描述符所有权已经改变，CPU 主动观察到 \\
+重新开放之后 & 设备产生 MSI-X，或再次检查先看到 & 通知路径与主动检查至少一条成立 \\
+处理预算耗尽时 & 保持轮询调度状态并继续下一轮 & 不依赖每个完成都产生一次中断 \\
+\bottomrule
+\end{longtable}
+
+中断合并也不改变这个原则。一次 MSI-X 可以对应多个完成，合法中断也可能到达时队列已被别的 CPU 排空；真正的工作量来自完成环，而不是中断计数。
+
+\topic{复位后必须让旧完成失去释放新缓冲的能力}
+
+若 D0 的 DMA 超时，驱动不能只把软件 head 清零后重新使用 B0。设备、IOMMU、互连和内存控制器中仍可能存在旧请求。恢复顺序是停止新接收、屏蔽向量、请求设备停止并等待 DMA 静止；随后撤销旧映射并等待 IOTLB/ATS 失效，保存错误证据，为未决帧给出丢弃或重试结果，再以新的 generation 建立描述符和映射。
+
+迟到完成若携带旧 generation，驱动只记录它而不释放任何当前缓冲。generation 不是数据校验码，而是生命周期身份：它防止“旧队列的合法完成”被误认为“新队列的合法完成”。只有设备静止、旧翻译不可用且当前代际已经发布，接收环才重新开放。

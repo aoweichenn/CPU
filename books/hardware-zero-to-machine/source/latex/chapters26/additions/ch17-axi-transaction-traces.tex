@@ -1,0 +1,96 @@
+\section{把 AXI 五通道走成逐拍事务}
+
+“AXI 有五条独立通道”若只停留在接口名称，仍不足以判断一笔访问何时被接受、何时完成。下面用一条 128-bit 数据通道走完一次 64 B 写突发：起始地址为 \code{0x80001000}，事务 ID 为 3，\code{AWLEN=3} 表示共有 4 个 data beat，\code{AWSIZE=4} 表示每 beat 为 $2^4=16$ B，burst 类型为递增地址。为隔离核心规则，示例中只有这一笔写在途。
+
+AXI4 的写地址通道 AW、写数据通道 W 和写响应通道 B 分别握手。地址可以先到，也可以数据先到；从设备或桥必须分别保存，不能用“同一拍出现”作为配对条件。AXI4 写数据通道不携带 WID，因此多笔写的 W beat 还要遵守接口规定的写数据顺序；复杂互连不能仅凭观察到某个 \code{WVALID} 就任意匹配地址。
+
+\topic{案例一：4-beat 写在第 3 个 beat 遇到背压}
+
+\begin{longtable}{L{0.09\linewidth}L{0.22\linewidth}L{0.30\linewidth}L{0.29\linewidth}}
+\toprule
+周期 & 地址通道 AW & 数据通道 W & 响应通道 B 与内部状态 \\
+\midrule
+C0 & \code{AWVALID=1}、\code{AWREADY=0}，地址保持 & 无有效数据 & 地址尚未被接受 \\
+C1 & \code{AWVALID=1}、\code{AWREADY=1}，ID 3 地址被接受 & 可独立保持空闲 & 从设备占用一项写状态 \\
+C2 & 地址发送者可撤销 \code{AWVALID} & beat 0 握手，地址范围 \code{0x1000--0x100F} & 已收 16 B，不能返回 B \\
+C3 & --- & beat 1 握手，地址范围 \code{0x1010--0x101F} & 已收 32 B，不能返回 B \\
+C4 & --- & beat 2 给出但 \code{WREADY=0}；数据、strobe 与 \code{WVALID} 全部保持 & 计数器仍为 2，不能假装收到数据 \\
+C5 & --- & 同一 beat 2 在握手沿被接受 & 已收 48 B，状态推进一次 \\
+C6 & --- & beat 3 握手且 \code{WLAST=1} & 地址和全部 4 beat 均已接受 \\
+C7 & --- & 无新数据 & 从设备执行写入并形成响应状态 \\
+C8 & --- & --- & \code{BVALID=1}、\code{BID=3}；与 \code{BREADY} 握手后释放状态 \\
+\bottomrule
+\end{longtable}
+
+C4 是判断实现是否正确的关键拍。发送者必须保持 beat 2 的数据、byte strobe、\code{WVALID} 和对应的 \code{WLAST=0}；只有 C5 的有效握手沿才能把内部 beat 计数从 2 推进到 3。若发送者按墙钟周期推进，C5 会送出 beat 3，原本的 beat 2 永久丢失；若接收者在 C4 就推进计数，则同一数据会被重复计算。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (aw) at (1.4,4.5) {AW 通道\\C1 接受地址};
+  \node[hw memory, minimum width=2.7cm] (write_state) at (4.7,4.5) {写事务状态\\ID=3，期望 4 beat};
+  \node[hw state, minimum width=2.5cm] (w01) at (8.0,4.5) {W 通道\\C2/C3 收 beat 0/1};
+  \node[hw control, minimum width=2.7cm] (stall) at (11.3,4.5) {C4 背压\\beat 2 保持不变};
+  \node[hw state, minimum width=2.7cm] (w23) at (11.3,1.4) {C5/C6\\beat 2/3，WLAST};
+  \node[hw control, minimum width=2.7cm] (execute) at (8.0,1.4) {从设备执行\\形成 OKAY/错误};
+  \node[hw state, minimum width=2.7cm] (b) at (4.7,1.4) {B 通道\\ID=3 返回响应};
+  \node[hw state, minimum width=2.5cm] (release) at (1.4,1.4) {响应握手\\释放在途状态};
+  \draw[hw bus] (aw) -- (write_state);
+  \draw[hw bus] (write_state) -- (w01);
+  \draw[hw bus] (w01) -- (stall);
+  \draw[hw bus] (stall) -- (w23);
+  \draw[hw return] (w23) -- (execute);
+  \draw[hw return] (execute) -- (b);
+  \draw[hw return] (b) -- (release);
+\end{pdfdiagram}
+\diagramnote{一笔 AXI 写的状态链。地址接受、每个 data beat 接受、从设备执行和 B 响应握手是四类不同边界；C4 背压只延长 beat 2 的停留时间，不产生任何状态推进。}
+
+写响应只证明这笔 AXI 总线事务以相应状态闭合。它不自动等于数据已写入非易失介质，也不等于外部设备动作已经完成；持久化和设备副作用还要服从目标部件自己的完成契约。
+
+\topic{案例二：两个读 ID 可以交错返回，但每个 ID 内部仍有顺序}
+
+再考虑两笔 32 B 读取，每笔包含 2 个 16 B beat。读请求 A 使用 ID 2，读请求 B 使用 ID 5；从设备的两个 bank 可以并行工作。C0 接受 A 的 AR，C1 接受 B 的 AR。B 所在 bank 先准备好，因此 R 通道可以先返回 B 的 beat 0，再穿插 A 的 beat 0。不同 ID 的完成先后不必等于地址接受先后，但同一 ID 的 beat 必须保持原顺序，最后一个 beat 才能携带 \code{RLAST=1}。
+
+\begin{longtable}{L{0.11\linewidth}L{0.24\linewidth}L{0.31\linewidth}L{0.24\linewidth}}
+\toprule
+周期 & AR 通道 & R 通道 & 接收端状态 \\
+\midrule
+C0 & 接受 ID 2、长度 2 beat & --- & 分配 A 的返回缓冲与计数 \\
+C1 & 接受 ID 5、长度 2 beat & --- & 分配 B 的返回缓冲与计数 \\
+C3 & --- & \code{RID=5}、B beat 0、\code{RLAST=0} & B 已收 1/2 \\
+C4 & --- & \code{RID=2}、A beat 0、\code{RLAST=0} & A 已收 1/2 \\
+C5 & --- & \code{RID=5}、B beat 1、\code{RLAST=1} & B 完成并可释放 ID 5 状态 \\
+C6 & --- & \code{RID=2}、A beat 1，但 \code{RREADY=0} & A 最后一拍必须保持 \\
+C7 & --- & 同一 A beat 1 握手，\code{RLAST=1} & A 完成并释放 ID 2 状态 \\
+\bottomrule
+\end{longtable}
+
+返回路由先用 \code{RID} 找到对应状态项，再把 beat 写入该事务的下一位置。接收端不能维护一个全局“下一笔返回”指针，否则 C3 的 ID 5 数据会被错写进先提交的 A。C6 又说明 \code{RLAST} 属于具体数据 beat，不属于某个预估周期；背压期间它必须与数据一起保持到 C7。
+
+\section{AXI--APB 桥：五通道怎样收敛成一次低速寄存器访问}
+
+APB 没有独立的地址、数据和响应通道。一次写先进入 setup 阶段：\code{PSEL=1}、\code{PENABLE=0}，地址和写数据稳定；下一拍进入 access 阶段，\code{PENABLE=1}。若 \code{PREADY=0}，桥必须保持全部 APB 信号；只有 \code{PREADY=1} 的采样沿才结束访问，并同时采样 \code{PSLVERR}。
+
+因此 AXI--APB 桥内部至少要有地址缓冲、数据缓冲、byte strobe、当前 AXI ID 和响应状态。AW 与 W 谁先到都只会分别置一个“已收”位；两个已收位同时成立后，桥才能发 APB setup。桥在 APB access 完成之前不能返回 B 响应，否则上游会复用 ID 和输入缓冲，而低速设备仍在使用旧事务。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.7cm] (collect) at (1.5,4.2) {收集 AXI 写\\AW/W 独立缓冲};
+  \node[hw control, minimum width=2.7cm] (setup) at (4.7,4.2) {APB SETUP\\PSEL=1，PENABLE=0};
+  \node[hw control, minimum width=2.9cm] (access) at (8.0,4.2) {APB ACCESS\\保持到 PREADY};
+  \node[hw state, minimum width=2.7cm] (result) at (11.4,4.2) {采样结果\\PRDATA/PSLVERR};
+  \node[hw state, minimum width=2.9cm] (bresp) at (11.4,1.2) {形成 AXI 响应\\OKAY 或 SLVERR};
+  \node[hw state, minimum width=2.9cm] (done) at (8.0,1.2) {B 通道握手\\释放地址与数据缓冲};
+  \node[hw control, minimum width=2.9cm] (timeout) at (4.7,1.2) {本地超时\\隔离并形成错误响应};
+  \draw[hw bus] (collect) -- node[above, hw label]{两侧均已收} (setup);
+  \draw[hw bus] (setup) -- (access);
+  \draw[hw bus] (access) -- node[above, hw label]{PREADY=1} (result);
+  \draw[hw return] (result) -- (bresp);
+  \draw[hw return] (bresp) -- (done);
+  \draw[hw return] (access.south) -- (8.0,2.35) -- (4.7,2.35) -- node[right, hw label]{超时策略} (timeout.north);
+  \draw[hw return] (timeout) -- (done);
+\end{pdfdiagram}
+\diagramnote{AXI--APB 写桥的所有权状态机。桥先取得 AXI 地址和数据的所有权，再在 APB 侧完成 setup/access；正常结果沿右侧下行转换为 B 响应，超时路径沿左侧隔离下游并形成错误响应，两条路径在 B 握手处汇合。不能在 APB 从设备仍可能继续动作时直接复用旧缓冲。}
+
+\topic{错误响应也必须完成原事务，而不是让总线无限等待}
+
+若 APB 在最终 access 拍返回 \code{PSLVERR=1}，桥应把它转换为 AXI \code{SLVERR}，并保留原 AXI ID 直到 B 握手。若地址在进入桥之前就未命中任何目标，互连可以直接形成 \code{DECERR}，不应启动 APB。若低速设备永久不拉高 \code{PREADY}，APB 协议本身没有自动取消事务的消息；平台若要求有限等待，桥必须实现超时、记录目标地址和状态，并按系统规定隔离或复位下游，再向上游闭合错误。
+
+这三个错误分别定位不同边界：\code{DECERR} 表示路由或地址地图失败，\code{SLVERR} 表示目标已经接收但无法成功执行，超时表示目标没有给出有限结果。把它们统一返回一个模糊失败码，会失去判断“请求是否曾到达设备、设备是否可能产生部分副作用”的关键信息。
