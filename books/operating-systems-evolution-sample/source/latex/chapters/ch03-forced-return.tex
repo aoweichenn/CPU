@@ -21,10 +21,123 @@ repeat_forever:
 要在 B 不执行交还指令时重新获得控制，机器必须提供一种与当前指令流独立的事件：事件到达
 后，处理器先保存足以继续 B 的状态，再把指令位置改成预先登记的入口。
 
-\section{为什么选择周期性时钟事件}
+\section{为什么选择可编程时钟事件}
 
 设备完成也能产生外部事件，但机器空闲时未必有设备活动，不能用它保证处理器一定被收回。
 一个可编程计时器可以在设定时间后发出事件，与 B 是否读内存、是否调用函数无关。
+
+\subsection{新器件接到现有机器的哪里}
+
+第一章的时钟源只能推动电路状态变化，软件不能要求它在未来某个计数值通知处理器。现在
+增加的计时器是一项独立器件：它接收同一参考时钟，通过地址互连暴露配置寄存器，并用一根
+事件请求线连接处理器的异步事件输入。
+
+本样机只有一个事件源，所以计时器请求线直接连接处理器，不增加中断控制器。以后事件源
+增多，才会出现“多根请求线如何编号、屏蔽和路由”的新问题。
+
+\begin{center}
+\begin{tikzpicture}[
+  node distance=11mm and 18mm,
+  hw/.style={stage,minimum width=3.8cm},
+  irq/.style={->,>=Latex,thick,draw=BookNavy}
+]
+\node[hw] (cpu) {扩展后的处理器\\异步事件输入};
+\node[hw,right=of cpu] (bus) {原有地址互连\\增加计时器范围};
+\node[hw,right=of bus] (timer) {可编程计时器\\计数、比较、pending};
+\node[hw,above=13mm of timer] (clock) {原有参考时钟\\周期边沿};
+\draw[flow] (cpu) -- node[above,font=\footnotesize]{寄存器读写请求} (bus);
+\draw[flow] (bus) -- node[above,font=\footnotesize]{地址译码后转发} (timer);
+\draw[flow] (timer.south) -- ++(0,-10mm) -|
+  node[below,font=\footnotesize,pos=0.5]{event request} (cpu.south);
+\draw[flow] (clock) -- (timer);
+\end{tikzpicture}
+\end{center}
+\diagramnote{总线方向用于配置和查询，事件请求线用于计时器主动通知处理器。软件写过寄存器
+并不等于事件已经发生；只有计数条件满足后，计时器才置 pending 并拉起请求线。}
+
+\subsection{计时器的硬件模型}
+
+计时器内部保存四类最小状态：
+
+\begin{longtable}{|L{0.22\linewidth}|L{0.28\linewidth}|L{0.38\linewidth}|}
+\hline
+内部状态 & 状态变化 & 对外作用 \\ \hline
+\code{counter} & 每个参考时钟边沿递增 & 提供单调增加的比较基准 \\ \hline
+\code{deadline} & 处理器通过写事务设置 & 指定下一次到期计数值 \\ \hline
+\code{enabled} & 处理器启用或停止计时比较 & 决定是否检查到期条件 \\ \hline
+\code{pending} & 到期时置 1，确认后清 0 & 为 1 时保持事件请求有效 \\ \hline
+\end{longtable}
+
+每个时钟边沿后，若 \code{enabled=1} 且 \code{counter >= deadline}，硬件就设置
+\code{pending=1}。请求线保持有效，直到软件确认事件。采用“保持”而不是一个极短脉冲，
+可以避免处理器暂时关闭事件接收时永久丢失通知。
+
+这个模型没有自动周期。协调代码处理一次到期事件后，写入新的 deadline，才形成重复时间
+片。这样可以先看清“本次到期”和“安排下次到期”是两个动作。
+
+\subsection{计时器的软件模型}
+
+软件不直接访问内部连线，而是通过地址互连看到一组内存映射寄存器：
+
+\begin{longtable}{|L{0.27\linewidth}|L{0.23\linewidth}|L{0.38\linewidth}|}
+\hline
+物理地址与名称 & 访问方式 & 软件可见语义 \\ \hline
+\code{0x40001000 COUNT} & 只读 & 返回当前 counter 快照 \\ \hline
+\code{0x40001008 DEADLINE} & 读写 & 设置下一次到期比较值 \\ \hline
+\code{0x40001010 CONTROL} & 读写 & bit 0 控制 enabled \\ \hline
+\code{0x40001014 STATUS/ACK} & 读/写 & 读 bit 0 得 pending；写 1 清除 pending \\ \hline
+\end{longtable}
+
+让计时器在 \(Q\) 个计数单位后产生一次事件，软件按以下顺序配置：
+
+\begin{lstlisting}
+now = read64(COUNT)
+write64(DEADLINE, now + Q)
+write32(STATUS_ACK, 1)       // clear an earlier pending event
+write32(CONTROL, ENABLE)
+\end{lstlisting}
+
+若先启用、后写 deadline，旧 deadline 可能立即满足并产生一次非预期事件。寄存器顺序因此
+是软件模型的一部分，不只是代码风格。
+
+\subsection{计时器提供的抽象}
+
+上层软件得到“在单调计数达到 deadline 后形成一个保持到确认的事件”。它没有得到以下
+保证：
+
+\begin{itemize}
+\item deadline 不是日期，也不自动等于毫秒；
+\item 到期表示请求已经提出，不表示处理器恰好在该计数值执行入口；
+\item 事件被屏蔽时，请求可以延迟交付；
+\item 计时器不会保存任务现场，也不会选择下一项任务。
+\end{itemize}
+
+因此，计时器抽象适合保证协调代码最终重新获得一次入口机会；任务选择仍属于软件。
+
+\subsection{处理器异步入口也需要明确三层模型}
+
+计时器有了请求线，原处理器仍只会顺序取指。机器还要扩展处理器的事件入口能力。
+
+\textbf{硬件模型。} 处理器在一条指令完成后检查事件输入。若事件允许且请求有效，处理器
+保存下一条指令位置、原栈指针和状态标志，切到固定入口栈顶，关闭同类事件嵌套，再把指令
+位置改为固定事件入口。事件返回指令执行相反的受控恢复。
+
+\textbf{软件模型。} 固件把事件入口约定为 \code{0x00008000}，把入口栈顶约定为
+\code{0x001f0000}。硬件建立的最小帧按顺序包含：
+
+\begin{lstlisting}
+event_frame:
+  resume_instruction
+  interrupted_stack_pointer
+  saved_flags
+\end{lstlisting}
+
+入口代码能读取这份帧，并通过确认寄存器清除计时器 pending。普通通用寄存器尚未由硬件
+保存，必须由入口软件补齐。
+
+\textbf{抽象。} 软件得到一个可在普通指令流之外发生的受控入口，以及一份足以返回被打断
+位置的最小继续状态。该抽象不等于完整上下文切换：它不保存全部寄存器，也不决定事件到达
+后继续原任务还是恢复另一个任务。
 
 为支持这条路径，硬件至少要明确：
 
