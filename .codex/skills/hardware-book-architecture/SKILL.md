@@ -20,6 +20,8 @@ Treat an explicit user instruction as higher priority than these references. Do 
 
 Before finishing any manuscript change, explicitly check the applicable non-negotiable rules from `user-book-rules.md`; a successful LaTeX compile alone is not sufficient.
 
+For every content or continuity change, run `python3 .codex/skills/hardware-book-architecture/scripts/audit_chapter_flow.py`. Treat a numbered reader section after “章末练习”, exercises rendered as tables, repeated chapter-end headings, or unmatched exercises and answers as a publishing failure.
+
 ## Keep rules outside the manuscript
 
 Store architecture rules, migration policy, ledgers, and audit tooling only in this skill directory. Do not put them in `books/hardware-zero-to-machine`, manuscript front matter, chapter prose, `AGENT.md`, or the book Makefile. Add only reader-facing book content to the manuscript.

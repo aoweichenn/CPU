@@ -64,9 +64,10 @@ CHINESE_NUMERALS = ("一", "二", "三", "四", "五", "六", "七", "八", "九
 CHINESE_TO_ARABIC = {number: str(index) for index, number in enumerate(CHINESE_NUMERALS, start=1)}
 EXTRAS = {
     1: ("ch01-chapter-exercises.tex",),
+    4: ("ch04-verification-closure.tex",),
     5: ("ch05-chapter-exercises.tex",),
     6: ("ch06-isa-real-world.tex",),
-    8: ("ch08-pipeline-core.tex",),
+    8: ("ch08-pipeline-core.tex", "ch08-execution-control.tex"),
     9: ("ch09-pipeline-hazards.tex",),
     11: ("ch11-cache-interface.tex",),
     12: ("ch12-modern-vm-tlb.tex",),
@@ -79,7 +80,9 @@ EXTRAS = {
     19: ("ch19-device-queues.tex",),
     21: ("ch21-platform-recovery.tex",),
     22: ("ch22-ras-reliability.tex",),
-    23: ("ch23-usb-human-interface.tex",),
+    23: ("ch23-usb-human-interface.tex", "ch23-sensor-acquisition.tex"),
+    24: ("ch24-gpu-memory-visibility.tex",),
+    26: ("ch26-modern-system-trace.tex",),
 }
 DIAGRAM_OVERRIDES = {
     6: (("这台最小 ISA 的完整数据通路", "ch06-minimal-isa-datapath.tex"),),
@@ -745,6 +748,12 @@ ROW_END_RE = re.compile(r"\\\\(?:\[[^]]*\])?\s*$")
 CHAPTER_END_SECTION_RE = re.compile(
     r"(?m)^\\section\*\{(章末练习|参考解答[^}]*)\}"
 )
+CHAPTER_EXERCISE_BLOCK_RE = re.compile(
+    r"\\begin\{chapterexercise\}.*?\\end\{chapterexercise\}", re.DOTALL
+)
+CHAPTER_ANSWER_BLOCK_RE = re.compile(
+    r"\\begin\{chapteranswer\}.*?\\end\{chapteranswer\}", re.DOTALL
+)
 LONGTABLE_BEGIN_RE = re.compile(r"\\begin\{longtable\}\{[^\n]+\}")
 
 
@@ -916,6 +925,34 @@ def format_chapter_end_exercises(text: str, chapter_number: int) -> str:
     for start, end, replacement in reversed(replacements):
         text = text[:start] + replacement + text[end:]
     return text
+
+
+def move_chapter_end_material(text: str, chapter_number: int) -> str:
+    """Collect every migrated exercise/answer group at the actual chapter end."""
+    exercises = [match.group(0).strip() for match in CHAPTER_EXERCISE_BLOCK_RE.finditer(text)]
+    answers = [match.group(0).strip() for match in CHAPTER_ANSWER_BLOCK_RE.finditer(text)]
+    if not exercises and not answers:
+        return text
+    if not exercises or len(exercises) != len(answers):
+        raise ValueError(
+            f"chapter {chapter_number}: cannot form complete chapter-end exercise groups"
+        )
+
+    # Remove only the numbered problem/answer environments and their old headings.
+    # Any reader-facing table, note, or explanation that happened to follow an old
+    # answer heading remains at its original teaching location.
+    text = CHAPTER_EXERCISE_BLOCK_RE.sub("", text)
+    text = CHAPTER_ANSWER_BLOCK_RE.sub("", text)
+    text = CHAPTER_END_SECTION_RE.sub("", text)
+
+    return (
+        text.rstrip()
+        + "\n\n\\section*{章末练习}\n\n"
+        + "\n\n".join(exercises)
+        + "\n\n\\section*{参考解答与要点}\n\n"
+        + "\n\n".join(answers)
+        + "\n"
+    )
 
 
 def parse_longtable_rows(body: str) -> list[str]:
@@ -1210,6 +1247,7 @@ def main() -> int:
         body = annotate_pseudocode_listings(body, chapter.number)
         audit_pseudocode_annotations(body, chapter.number)
         body = format_chapter_end_exercises(body, chapter.number)
+        body = move_chapter_end_material(body, chapter.number)
         body = split_oversized_longtables(body)
         body = add_longtable_row_rules(body)
         body = renumber_sections(body)

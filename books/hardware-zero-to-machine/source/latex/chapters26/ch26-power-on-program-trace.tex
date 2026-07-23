@@ -2434,6 +2434,90 @@ T 状态 & 每条指令固定走满 T0--T7 八拍；T0、T1 公共取指，用�
 台机器不必是——从划掉那页规格书的某一行、写上你自己的一行开始，那
 就是你的设计的开头。
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{六、把教学机边界映射回现代整机}
+
+面包板教学机把 PC、寄存器、ALU、存储、控制字和输出锁存器放在可直接观察的位置。现代处理器扩大了规模并加入流水线、Cache、虚拟内存和设备队列，但边界没有消失：教学机的总线授权对应片上互连仲裁，RAM 读周期对应 Cache/DRAM 请求，输出寄存器对应 MMIO 设备状态，微码步进对应控制状态推进。理解现代机器的关键不是记住更多模块，而是继续问同一组问题：谁发起、谁拥有状态、何时采样、何时完成、失败怎样返回。
+
+\begin{longtable}{L{0.20\linewidth}L{0.30\linewidth}L{0.40\linewidth}}
+\toprule
+教学机可见边界 & 现代整机对应物 & 不变的检查问题 \\
+\midrule
+PC 与取指 ROM & 分支预测前端、I-Cache、页表和主存 & 下一 PC 从何而来，取指错误归属哪条指令 \\\tablerowrule
+共享 8-bit 总线 & crossbar/NoC、协议桥和 PCIe & 哪个发起者获授权，背压时谁保持负载 \\\tablerowrule
+RAM 读写脉冲 & Cache line、DDR burst、块 I/O 与 DMA & 请求何时接受，数据何时可见，错误怎样闭合 \\\tablerowrule
+输出锁存器 & MMIO 寄存器、doorbell、设备队列 & 写返回是否等于设备副作用完成 \\\tablerowrule
+微码计数器 & 流水控制、队列状态机和固件阶段 & 当前状态以哪个边沿推进，复位从何处恢复 \\\tablerowrule
+LED/示波器测点 & trace buffer、性能计数器、AER/RAS 日志 & 证据来自哪个时钟域，是否保留首次故障 \\
+\bottomrule
+\end{longtable}
+
+\section{七、一次程序首次运行的全链路时间线}
+
+考虑冷启动后首次运行一个读取文件、处理数据并显示结果的程序。电源控制器先使各电压轨进入允许范围，时钟和复位网络建立已知状态；固件从受保护入口取指，训练 DRAM，枚举 PCIe 与 NVMe，发布内存和中断拓扑，再把控制权交给装载器与内核。到这一刻为止，硬件完成的是“让软件拥有可靠的执行和设备发现环境”，还没有执行目标程序。
+
+进程启动时，装载器解析 ELF 段和重定位，建立虚拟地址空间，把尚未实际读入的代码页记录为文件映射。CPU 首次取指触发缺页：页表遍历发现映射未驻留，异常入口保存精确 PC，内核把文件偏移转换为块请求，NVMe 驱动写 submission queue 和 doorbell。SSD 控制器从 NAND 取得页面，经 PCIe DMA 写主存，写 completion queue 并发送 MSI-X；内核验证完成状态、更新页表并失效必要的 TLB 项，返回异常指令。相同 PC 再次取指，这次通过 TLB、Cache 和 DRAM 获得机器码。
+
+程序读取输入文件时，页缓存命中可能让系统调用不再访问设备；未命中则重走块层和 DMA。处理循环在 CPU 流水线中执行，load/store 经 Cache 与一致性互连交换数据。若结果交给 GPU，CPU 先发布资源和命令，GPU 经设备地址转换读取输入，在 VRAM 或共享内存中计算，写结果并更新 fence；显示引擎只在翻页边界采用完成帧。若程序还写日志，code{write()} 返回通常只说明数据进入内核缓存，只有文件系统提交、设备 flush 与介质持久化边界全部满足后，掉电重启才应看到记录。
+
+\begin{longtable}{L{0.14\linewidth}L{0.24\linewidth}L{0.31\linewidth}L{0.21\linewidth}}
+\toprule
+阶段 & 发起者与目标 & 完成边界 & 失败证据 \\
+\midrule
+上电启动 & 电源/固件到 CPU、DRAM、互连 & 内存可用、设备已枚举、内核入口有效 & 复位原因、训练码、固件阶段 \\\tablerowrule
+程序装载 & 装载器到页表与文件映射 & 入口地址和初始栈成为进程状态 & ELF/重定位错误、映射冲突 \\\tablerowrule
+首次取指 & CPU 到 TLB、页表、存储栈 & 缺页处理后同一 PC 可精确重试 & fault 地址、PTE、块请求 ID \\\tablerowrule
+设备读取 & 驱动到 NVMe/SSD 与主存 & CQ 成功且 DMA 数据对 CPU 可见 & SQ/CQ 指针、状态码、IOMMU fault \\\tablerowrule
+GPU 处理 & CPU 队列到 GPU 和显存 & 结果写入先于 fence 完成可见 & 命令读指针、GPU fault、fence \\\tablerowrule
+显示输出 & 显示引擎到帧缓冲和链路 & 新帧被采用并扫描输出 & 翻页序号、扫描位置、链路状态 \\\tablerowrule
+持久化日志 & 文件系统到控制器和介质 & flush/提交协议规定的持久化点 & 日志序号、设备错误、掉电恢复记录 \\
+\bottomrule
+\end{longtable}
+
+\section{八、用唯一事务身份连接跨层证据}
+
+跨层排错最困难的地方是每层使用不同名字：CPU 有 PC 和异常号，内核有进程、页和 bio，请求队列有 tag，PCIe 有 requester/tag，NVMe 有 queue ID/command ID，GPU 有 context/queue/fence。不能要求所有层使用同一个位宽相同的全局 ID，但可以在进入下一层时记录映射关系和时间戳，使一个上层请求能够沿日志追到下层完成。
+
+时间戳本身也需要校准。CPU 核、设备、网卡和示波器可能使用不同频率与起点；先用共同事件建立偏移和漂移关系，再比较先后。若只按日志打印顺序排列，缓冲和异步刷新可能让较晚发生的事件先出现。可靠 trace 应同时保存事件来源、局部序号、时钟域、请求身份和状态变化，而不只保存一句自然语言说明。
+
+观测还会改变系统。开启详细总线 trace 可能增加缓冲压力，串口打印可能延长中断，示波器探头会增加电容。排错记录应注明观测配置，并优先选择已有硬件计数器、只读状态和触发式缓冲。需要插入探针时，先估算负载和时序影响，再用开启/关闭观测的对照实验确认现象没有被测量手段掩盖。
+
+\section{九、从症状定位最早失效边界}
+
+“程序卡住”只是最终症状。定位应从最后一个已确认完成的边界向前后逐层缩小范围：若 PC 仍退休指令，处理器没有完全停机；若 NVMe SQ 尾指针增长而设备头指针不动，问题位于 doorbell、队列可见性或设备取命令；若 CQ 已更新但中断计数不变，检查 MSI-X 路由和屏蔽；若 fence 已完成而画面未变，转向翻页与扫描域。每一步都用状态转换缩小范围，不从软件表象直接跳到更换硬件。
+
+恢复动作也必须与故障域相称。重试适合瞬态传输错误；功能级复位适合单设备控制状态失步；链路复训适合物理连接暂时失锁；整机复位只在共享状态已无法隔离时使用。复位前先停止新流量并保留证据，复位后重建地址、翻译、队列和中断状态，再用一笔已知事务验证恢复。只看到服务重新工作而不验证旧 DMA、迟到完成和持久化状态，不能证明恢复闭环。
+
+\begin{keyidea}
+全书所有机制最终都可以归入七个问题：输入是什么，状态在哪里，数据走哪条路，控制为何这样选择，哪个边界使结果可见，失败如何返回，以及用什么证据证明恢复。能沿一次真实程序逐层回答这七问，就已经建立了从器件到整机的软件可见硬件通路。
+\end{keyidea}
+
 \section*{章末练习}
 
 \begin{chapterexercise}{总线互斥检查}
@@ -2466,6 +2550,41 @@ T 状态 & 每条指令固定走满 T0--T7 八拍；T0、T1 公共取指，用�
 \exercisecheck{学习目标}{地址位宽牵动全局}
 \end{chapterexercise}
 
+\begin{chapterexercise}{边界映射}
+把教学机输出锁存器映射到现代设备事务
+\exercisecheck{检查要点}{MMIO 写接受不等于设备完成}
+\end{chapterexercise}
+
+\begin{chapterexercise}{首次取指}
+写出文件映射代码页首次取指的完整缺页 trace
+\exercisecheck{检查要点}{同一 PC 在状态修复后精确重试}
+\end{chapterexercise}
+
+\begin{chapterexercise}{GPU 显示}
+区分命令提交、GPU fence 和显示扫描完成
+\exercisecheck{检查要点}{三个边界不能合并}
+\end{chapterexercise}
+
+\begin{chapterexercise}{持久化}
+解释 \code{write()} 返回与掉电后可见的差别
+\exercisecheck{检查要点}{还要经过文件系统和设备持久化协议}
+\end{chapterexercise}
+
+\begin{chapterexercise}{证据关联}
+为 NVMe 读列出五层事务身份及映射记录
+\exercisecheck{检查要点}{不要求同一 ID，但必须可追踪}
+\end{chapterexercise}
+
+\begin{chapterexercise}{故障定位}
+CQ 已更新但线程仍等待，给出由近到远的测点
+\exercisecheck{检查要点}{先查中断、完成消费和唤醒路径}
+\end{chapterexercise}
+
+\begin{chapterexercise}{恢复验收}
+设计设备局部复位后的最小验证序列
+\exercisecheck{检查要点}{重建映射/队列并拒绝迟到完成}
+\end{chapterexercise}
+
 \section*{参考解答与要点}
 
 \begin{chapteranswer}{总线互斥检查}
@@ -2496,4 +2615,39 @@ T 计数器没接复位：PC 被清到 0，T 却停在复位前的 T2（\code{IO
 \begin{chapteranswer}{扩展设计}
 至少三处：①MAR 由 4 位加宽到 5 位；②RAM 换成 32×8，编程模式拨码覆盖第 5 位；③指令格式：低 4 位放不下 5 位地址——要么改两字节指令（取指后加一拍读地址字节），要么约定程序只用低 16 字节、高 16 字节纯作数据。改动最大的是③：微码 T 序列与本章全部编码表都要跟着重排
 \answercheck{必须掌握的要点}{地址位宽是全局约定，牵一发动全身}
+\end{chapteranswer}
+
+\begin{chapteranswer}{边界映射}
+输出锁存器对应 MMIO 寄存器或 doorbell；总线采样沿只证明写被目标接口接受，设备内部状态机可能稍后才完成动作。
+\answercheck{必须保留的检查点}{接受、完成和副作用分开}
+\end{chapteranswer}
+
+\begin{chapteranswer}{首次取指}
+CPU 取指触发缺页，内核按文件偏移发块请求，设备 DMA 并完成，内核更新 PTE/TLB 后返回，原 PC 再次取指。
+\answercheck{必须保留的检查点}{异常指令不提前提交}
+\end{chapteranswer}
+
+\begin{chapteranswer}{GPU 显示}
+doorbell 只发布命令，fence 表示 GPU 结果达到规定可见点，显示完成还需翻页采用并扫描。
+\answercheck{必须保留的检查点}{每个域读取独立状态}
+\end{chapteranswer}
+
+\begin{chapteranswer}{持久化}
+\code{write()} 可在页缓存接收后返回；持久化还依赖日志/元数据顺序、设备 flush 和介质确认。
+\answercheck{必须保留的检查点}{完成语义由接口层级定义}
+\end{chapteranswer}
+
+\begin{chapteranswer}{证据关联}
+可记录进程/页或 bio、块层 tag、NVMe queue/command ID、PCIe requester/tag 与 DMA 地址，并在层间保存映射及时间戳。
+\answercheck{必须保留的检查点}{关联关系比统一编号更重要}
+\end{chapteranswer}
+
+\begin{chapteranswer}{故障定位}
+核对 CQ phase/status、驱动头指针、MSI-X 向量与屏蔽、中断控制器计数、软中断/完成回调和等待队列唤醒。
+\answercheck{必须保留的检查点}{CQ 到达后路径仍未结束}
+\end{chapteranswer}
+
+\begin{chapteranswer}{恢复验收}
+停止提交并保存状态，隔离 DMA/中断，复位后重建 BAR/IOMMU/队列，递增 generation，发一笔已知请求并验证数据、完成和旧事件隔离。
+\answercheck{必须保留的检查点}{服务恢复且旧状态不可污染新事务}
 \end{chapteranswer}
