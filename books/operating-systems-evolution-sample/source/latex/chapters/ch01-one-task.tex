@@ -1,0 +1,110 @@
+\chapter{一台机器怎样只运行一项任务}
+
+\begin{statebox}
+\textbf{本章开始时的机器。} 一个处理器核，一片可读写内存，一个固定复位入口，以及能把
+外部字节送入内存的最小固件。没有进程、线程、系统调用、文件和调度器。
+\end{statebox}
+
+\section{通电并不等于任务已经运行}
+
+处理器能够执行指令，但它不会自行知道“今天要运行哪项任务”。通电复位只会把少量体系结构
+状态设为规定值，并把下一条取指位置设到一个预先约定的地址。这个地址通常落在固件可用的
+区域，而不是某个应用程序的开头。
+
+先把机器能够提供的最小事实写清楚：
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.30\linewidth}|L{0.38\linewidth}|}
+\hline
+硬件状态 & 复位后提供的含义 & 尚未提供的含义 \\ \hline
+指令位置 & 下一次从哪个地址取指 & 哪项任务应该获得处理器 \\ \hline
+通用寄存器 & 若干可参与计算的位串 & 参数、局部变量或任务身份 \\ \hline
+内存地址 & 处理器可访问的字节位置 & 哪段是代码、数据或栈 \\ \hline
+设备入口 & 固件可从外部取得字节 & 字节属于哪个“文件” \\ \hline
+\end{longtable}
+
+表中右列不是硬件遗漏的缺陷，而是软件必须建立的约定。处理器只认识位模式和地址；“任务”
+是我们为了描述一组代码、初始数据和运行状态而使用的名称。
+
+\section{先让任务字节出现在内存中}
+
+假设要运行的任务已经被编译成一段机器指令和初始数据。它目前位于外部介质。最小固件必须
+选定一段物理内存，把这些字节复制进去。为了避免隐藏关键条件，给出一个具体布局：
+
+\begin{longtable}{|L{0.30\linewidth}|L{0.20\linewidth}|L{0.38\linewidth}|}
+\hline
+物理范围 & 本次用途 & 必须保持的约束 \\ \hline
+\code{0x100000--0x107fff} & 任务代码与只读常量 & 入口地址必须落在已装入代码中 \\ \hline
+\code{0x108000--0x10bfff} & 任务可写数据 & 初值由任务映像给出，其余字节清零 \\ \hline
+\code{0x10c000--0x10ffff} & 向下增长的栈 & 初始栈顶取范围末端，不能越过数据区 \\ \hline
+\code{0x080000--0x08ffff} & 固件与装入代码 & 启动完成前不能被任务映像覆盖 \\ \hline
+\end{longtable}
+
+这里还没有内存保护。表格描述的是装入者承诺遵守的布局，不是硬件已经阻止越界。若任务
+中的错误指令写到 \code{0x080000}，固件仍可能被覆盖。
+
+\section{仅有代码地址为什么还不能开始}
+
+把指令写到 \code{0x100000} 后直接跳转，仍然缺少栈。普通函数调用要保存返回地址和局部
+状态；如果栈指针没有确定值，第一次压栈就会写入未知位置。
+
+本次启动至少要形成以下初始现场：
+
+\begin{lstlisting}
+instruction pointer = task entry address
+stack pointer       = 0x110000
+general registers   = documented argument values or zero
+interrupt state     = the value required by the startup contract
+addressing mode     = the mode used to build the task
+\end{lstlisting}
+
+“现场”在这里还不是操作系统对象。它只是处理器继续执行所需的一组具体状态。入口地址决定
+取哪条指令，栈指针决定调用与局部数据写到哪里，执行模式决定同一位串如何被解释。
+
+\begin{center}
+\begin{tikzpicture}[node distance=11mm and 15mm]
+\node[stage] (reset) {处理器复位\\从固定地址取指};
+\node[stage, right=of reset] (load) {固件装入\\代码与初始数据};
+\node[stage, right=of load] (state) {建立初始现场\\入口与栈顶};
+\node[stage, below=13mm of state] (run) {跳到任务入口\\任务开始执行};
+\draw[flow] (reset) -- (load);
+\draw[flow] (load) -- (state);
+\draw[flow] (state) -- (run);
+\end{tikzpicture}
+\end{center}
+\diagramnote{“装入”和“开始执行”是两个时刻。前者改变内存，后者改变处理器的下一条指令位置。}
+
+\section{任务怎样结束}
+
+这台机器没有可供任务调用的退出服务。任务入口若执行普通函数返回，栈中也没有一个真实
+调用者留下的返回地址。最小约定可以要求任务在完成后跳到固件提供的固定返回入口：
+
+\begin{lstlisting}
+task_entry:
+  compute the requested result
+  place result code in agreed register
+  jump firmware_return
+\end{lstlisting}
+
+固件返回入口读取结果码，把处理器置于等待状态，或者重新启动同一任务。这里的“返回”完全
+依赖任务合作；任务必须执行那条跳转。
+
+\section{这一方案确实能完成什么}
+
+到此为止，机器已经能完成一条完整但很窄的路径：
+
+\begin{enumerate}
+\item 固件选定一个任务映像并复制到约定物理范围；
+\item 固件清零未初始化数据，设置入口地址与栈顶；
+\item 处理器跳到任务入口；
+\item 任务直接使用全部处理器和物理内存；
+\item 任务主动跳回固件入口并给出结果。
+\end{enumerate}
+
+不应把这台机器描述成已经有了“单任务操作系统”。我们只建立了装入与启动约定；没有常驻
+任务管理对象，也没有隔离、抢占或统一服务接口。
+
+\begin{problemframe}
+\textbf{章末出现的问题。} 现在有任务 A 和任务 B。运行 A 时，B 的代码放在哪里？A 完成
+后，谁重新装入 B 并为它建立初始现场？若想暂停 A、先运行 B、以后再继续 A，需要保存的
+又不只是一个入口地址。下一章只处理这项困难。
+\end{problemframe}
