@@ -1,0 +1,159 @@
+\section{用 AMAT 把命中率变成实际停顿}
+
+Cache 的价值不能只用“命中率很高”判断，因为不同层 miss 的代价不同。平均访存时间 AMAT（average memory access time）可按条件概率逐层展开。设 L1 命中时间 1 ns，L1 miss 率 5\%；L2 在收到 L1 miss 后的命中时间为 6 ns，局部 miss 率 20\%；主存额外代价为 80 ns，则：
+\[
+\mathrm{AMAT}=1+0.05\times(6+0.20\times80)=2.1\ \mathrm{ns}.
+\]
+
+这里的 20\% 是“到达 L2 的请求中有多少仍 miss”，不是全部访问的全局比例。真正到达主存的比例是 $0.05\times0.20=1\%$。若把 20\% 直接乘到全部访问，会把主存流量高估二十倍。
+
+平均值还不能替代并行性。阻塞式核心可能把一次 80 ns miss 全部计入停顿；乱序核心若有足够 MSHR 和独立工作，可以让多个 miss 重叠。此时 AMAT 仍描述单次访问的平均层次代价，但程序时间还取决于内存级并行度、依赖链和 ROB 能覆盖的窗口。评价 Cache 应同时报告命中率、每级局部 miss 率、miss 延迟、在途数和最终停顿拍数。
+
+\begin{longtable}{L{0.20\linewidth}L{0.25\linewidth}L{0.25\linewidth}L{0.20\linewidth}}
+\toprule
+指标 & 分母 & 回答的问题 & 常见误用 \\
+\midrule
+L1 miss 率 & 全部 L1 访问 & 多少请求进入 L2 & 与 L2 局部 miss 率直接相加 \\
+L2 局部 miss 率 & 到达 L2 的请求 & L1 miss 中多少进入主存 & 当成全部访问比例 \\
+MPKI & 每千条退休指令 & 程序产生多少 miss & 忽略每个 miss 的代价和重叠 \\
+停顿周期 & 总周期或每条指令 & miss 最终阻塞了多少执行 & 只由 miss 数推算而不看并行性 \\
+\bottomrule
+\end{longtable}
+
+\topic{逐地址走完一次冲突 miss}
+
+设直接映射 Cache 总容量 1 KiB，line 为 64 B，共 16 个集合，index 占 4 bit，offset 占 6 bit。地址 \code{0x0000} 与 \code{0x0400} 相差 1024 B，offset 和 index 完全相同，只是 tag 不同，因此二者都映射到集合 0。
+
+\begin{longtable}{L{0.11\linewidth}L{0.17\linewidth}L{0.16\linewidth}L{0.16\linewidth}L{0.30\linewidth}}
+\toprule
+次序 & 地址 & 集合 & tag & 结果与集合 0 状态 \\
+\midrule
+1 & \code{0x0000} & 0 & 0 & miss，装入 tag 0 \\
+2 & \code{0x0400} & 0 & 1 & miss，替换 tag 0，装入 tag 1 \\
+3 & \code{0x0000} & 0 & 0 & miss，替换 tag 1 \\
+4 & \code{0x0400} & 0 & 1 & miss，再次替换 tag 0 \\
+\bottomrule
+\end{longtable}
+
+工作集只有两条 line，远小于 1 KiB 容量，仍然每次 miss；这不是容量 miss，而是映射冲突。改成 2 路组相联并保持总容量不变后，集合数降为 8，两个地址仍进入同一集合，但可以分别占据两路；前两次强制 miss 后，后两次变为 hit。代价是每次访问要并行读两路 tag 和数据，再由比较结果选择一路。
+
+这个例子也给出定位方法：先把地址按 line 大小右移得到 line 编号，再对集合数取模得到 index，最后比较同时活跃地址是否反复落到少数集合。只看总工作集大小无法发现冲突；性能计数器若支持按集合或物理地址采样，可以进一步确认是容量不足、冲突还是共享失效。
+
+\topic{非阻塞 Cache 的暂态与返回 beat}
+
+稳定的 MESI 字母不足以描述 miss 正在进行时的状态。某 line 从 I 发出共享读、等待数据时，可以记为 IS；从 S 发出升级、等待其他核心失效确认时，可以记为 SM；M line 被替换、等待写回完成时也需要独立暂态。暂态项至少保存目标稳定状态、待收响应数量、已经返回的 beat、等待的处理器请求和错误标记。
+
+\begin{longtable}{L{0.13\linewidth}L{0.22\linewidth}L{0.28\linewidth}L{0.27\linewidth}}
+\toprule
+暂态 & 触发动作 & 等待的事件 & 完成或失败边界 \\
+\midrule
+IS & I 状态 load miss 发共享读 & 数据响应与权限结果 & 数据到齐后进入 S/E；错误则唤醒异常 \\
+IM & I 状态 store miss 请求独占 & 数据与全部失效确认 & 两者都满足后进入 M \\
+SM & S 状态写请求升级 & 其他共享者确认失效 & 确认数归零后允许写生效 \\
+MI & dirty victim 被替换 & 下级接受完整写回 & 写回完成后释放 victim 资源 \\
+\bottomrule
+\end{longtable}
+
+若一条 64 B line 经 16 B 总线分四个 beat 返回，Cache 可以采用 critical-word-first：包含处理器所需字的 beat 到达后先唤醒 load，其他 beat 继续填充。但 tag 和 line 状态在整行未闭合前仍处于暂态；另一个访问不能把“关键字已返回”误认为“整行已稳定”。若后续 beat 报错，控制器还要按体系结构规定撤销尚未提交的使用者或报告机器检查。
+
+MSHR 合并也要比较访问属性。两个普通 load 命中同一在途 line 通常可以合并；一个取独占的 store 到达已有共享读 miss 时，可能升级原事务，也可能等待读完成后再发升级，取决于协议。对 MMIO、不可缓存访问或不同权限域的请求，不能只因地址相同就合并。
+
+\section{目录一致性把共享者集合变成显式状态}
+
+小规模共享总线可以广播 snoop：每个核心都观察请求并检查本地 tag。核心数增加后，广播带宽和比较功耗上升，目录协议改为在 home 节点记录某条 line 的所有者和共享者集合。读 miss 先到 home；若 line 为 clean shared，home 返回数据并加入请求者；若某核心持有 M，home 转发请求给 owner，由 owner 提供最新数据并按请求类型降级或交出所有权。
+
+以两个核心 C0、C1 和 home H 为例，初始 line A 在 C0 为 M：
+
+\begin{longtable}{L{0.10\linewidth}L{0.23\linewidth}L{0.29\linewidth}L{0.28\linewidth}}
+\toprule
+步骤 & 消息 & 状态变化 & 为什么不能提前完成 \\
+\midrule
+1 & C1 向 H 发 ReadShared(A) & H 查到 owner=C0 & H 的内存副本可能是旧值 \\
+2 & H 向 C0 发 ForwardRead(A) & C0 准备最新数据 & C1 尚未收到数据和权限 \\
+3 & C0 向 C1/H 返回数据 & C0 从 M 降到 S，H 更新目录 & 目录更新与数据响应要对应同一事务 \\
+4 & C1 收到数据并确认 & C1 进入 S & 此时 load 才能以正确数据完成 \\
+\bottomrule
+\end{longtable}
+
+若 C1 请求写权限，H 还要向所有共享者发送 invalidate 并等待确认。目录项的共享者表示可以用完整位图、有限指针或分层目录；位图随核心数增长，有限指针溢出时可能退化为广播。无论编码方式如何，协议必须保证任一时刻至多一个可写所有者，并保证最新 dirty 数据不会因 owner 失联或目录错误而丢失。
+
+消息网络也会死锁。请求、转发、数据和确认若共享有限缓冲，可能形成“请求占满队列等待响应，响应又没有队列空间”的环。实现通常使用不同虚拟通道或规定严格的资源获取次序，并保证某些响应通道始终可前进。一致性正确性不仅是 MESI 状态图，还包括消息、缓冲和互连的前进性。
+
+\topic{伪共享的量化代价}
+
+设两个核心各自每 20 ns 更新一个 8-byte 计数器，但两个计数器位于同一 64 B line。每次写都需要把 line 的 M 权限从另一核心迁移过来；若一次往返所有权迁移为 80 ns，那么单次更新的最低间隔不再由本地 ALU 决定，而接近 80 ns，理论更新率从每核 5000 万次/秒降到全局约 1250 万次/秒量级。
+
+把两个计数器按 64 B 对齐分开放置后，每个核心长期保持自己 line 的 M 状态，更新走本地 L1；最终汇总时才发生共享读取。数据字节数几乎没有变化，性能差异来自一致性权限事务。定位伪共享时应寻找“源代码对象不同、物理 line 相同、写失效和远端 line 命中频繁”这组证据。
+
+\topic{指令 Cache 与自修改代码的同步边界}
+
+数据 Cache 中写入的新机器码不保证立即被指令 Cache 和取指前端观察。某些体系结构维持 I/D Cache 硬件一致，另一些要求软件 clean 数据 Cache、invalidate 指令 Cache，并执行指令同步屏障。动态链接器修补跳转表、JIT 编译器生成代码和调试器写断点都必须遵守平台规定。
+
+正确协议的目标是让三个状态对齐：数据写已到达指令侧可见的一致性点；旧指令副本已经失效；流水线中此前预取或译码的旧字节已经被丢弃。只清 D-Cache 不会删除 I-Cache 旧副本，只清 I-Cache 也不能保证脏数据已经向指令侧传播，只做普通内存屏障更不能替代专用的指令同步边界。
+
+\section*{章末练习}
+
+\begin{chapterexercise}{AMAT 演算}
+L1 命中 1 ns、miss 率 4\%；L2 局部命中时间 8 ns、局部 miss 率 10\%；主存额外代价 90 ns。计算 AMAT，以及全部访问中真正到达主存的比例。
+\exercisecheck{学习目标}{逐层使用条件 miss 率}
+\end{chapterexercise}
+
+\begin{chapterexercise}{冲突 trace}
+直接映射 Cache 容量 2 KiB、line 64 B。判断 \code{0x0000}、\code{0x0800}、\code{0x1000} 是否映射到同一集合，并走完顺序 A、B、C、A 的命中结果。
+\exercisecheck{学习目标}{由 line 编号和集合数识别冲突 miss}
+\end{chapterexercise}
+
+\begin{chapterexercise}{暂态闭合}
+一条 store miss 已收到数据，但还差两个失效确认。此时能否把 line 标成稳定 M 并让 store 对外可见？还必须保存哪些状态？
+\exercisecheck{学习目标}{数据返回和写权限确认是两个完成条件}
+\end{chapterexercise}
+
+\begin{chapterexercise}{目录事务}
+某 line 在 C0 为 M，C1 发起读。写出 home、C0、C1 之间的消息和最终状态；说明为什么 home 不能直接从内存返回数据。
+\exercisecheck{学习目标}{dirty owner 持有最新副本}
+\end{chapterexercise}
+
+\begin{chapterexercise}{伪共享预算}
+两个线程各以 25 ns 周期写同一 line 中不同变量，所有权迁移往返为 100 ns。估算共享 line 能支持的更新率上限，并说明按 line 分离后的主要变化。
+\exercisecheck{学习目标}{把一致性迁移时延换算为吞吐上限}
+\end{chapterexercise}
+
+\begin{chapterexercise}{自修改代码}
+JIT 把新指令写入普通可写页面后准备跳转执行。列出数据侧、指令侧和流水线侧需要闭合的三个边界。
+\exercisecheck{学习目标}{区分数据可见、指令副本失效和前端同步}
+\end{chapterexercise}
+
+\section*{参考解答与要点}
+
+\begin{chapteranswer}{AMAT 演算}
+\[
+\mathrm{AMAT}=1+0.04\times(8+0.10\times90)=1.68\ \mathrm{ns}.
+\]
+真正到达主存的比例为 $0.04\times0.10=0.4\%$。
+\answercheck{必须掌握的要点}{下一级局部 miss 率只以到达该级的请求为分母}
+\end{chapteranswer}
+
+\begin{chapteranswer}{冲突 trace}
+2 KiB/64 B 得 32 个集合；三个地址分别相差 2 KiB，line 编号相差 32，取模后都进入集合 0。A、B、C、A 全部 miss，每次都替换该集合唯一的一路。
+\answercheck{必须掌握的要点}{工作集小于容量也可能因映射集中而持续 miss}
+\end{chapteranswer}
+
+\begin{chapteranswer}{暂态闭合}
+不能。收到数据只满足数据条件，尚未取得唯一写权限；必须等待两个确认归零后才能进入稳定 M 并让写生效。暂态要保存目标状态、待确认计数、数据返回状态、请求者和错误标记。
+\answercheck{必须掌握的要点}{权限完成不能由数据到达替代}
+\end{chapteranswer}
+
+\begin{chapteranswer}{目录事务}
+C1 向 home 发共享读；home 查到 C0 是 owner，转发请求；C0 把最新数据发送给 C1，并向 home 提供状态更新，从 M 降到 S；home 把 C0、C1 记为共享者，C1 收到数据后进入 S。内存副本在 C0 为 M 时可能陈旧，不能直接使用。
+\answercheck{必须掌握的要点}{请求要到达持有最新 dirty 数据的 owner}
+\end{chapteranswer}
+
+\begin{chapteranswer}{伪共享预算}
+所有权每 100 ns 最多完成一次迁移，合计更新率上限约为 $1/100\ \mathrm{ns}=1000$ 万次/秒，低于两个本地更新器的需求。按 line 分离后，各核心可长期持有自己的 M line，更新主要受本地 L1 和执行端限制，只在汇总时通信。
+\answercheck{必须掌握的要点}{瓶颈从 ALU/本地 Cache 转为 line 所有权往返}
+\end{chapteranswer}
+
+\begin{chapteranswer}{自修改代码}
+先使数据写到达指令侧可见的一致性点，再失效可能保存旧字节的 I-Cache 项，最后执行指令同步操作，丢弃流水线、预取队列或译码缓存中的旧指令。三个边界缺一不可。
+\answercheck{必须掌握的要点}{D-Cache、I-Cache 和前端是三个不同状态持有者}
+\end{chapteranswer}

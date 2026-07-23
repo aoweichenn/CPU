@@ -60,17 +60,21 @@ CHAPTERS = (
 
 SECTION_RE = re.compile(r"(?m)^\\section\{")
 NUMBERED_SECTION_RE = re.compile(r"^(\\section\{)(?:〇|[一二三四五六七八九十]+)、")
-CHINESE_NUMERALS = ("一", "二", "三", "四", "五", "六", "七", "八", "九", "十", "十一", "十二")
+CHINESE_NUMERALS = (
+    "一", "二", "三", "四", "五", "六", "七", "八", "九", "十",
+    "十一", "十二", "十三", "十四", "十五", "十六", "十七", "十八", "十九", "二十",
+)
 CHINESE_TO_ARABIC = {number: str(index) for index, number in enumerate(CHINESE_NUMERALS, start=1)}
 EXTRAS = {
     1: ("ch01-chapter-exercises.tex",),
     4: ("ch04-verification-closure.tex",),
     5: ("ch05-chapter-exercises.tex",),
     6: ("ch06-isa-real-world.tex",),
-    8: ("ch08-pipeline-core.tex", "ch08-execution-control.tex"),
-    9: ("ch09-pipeline-hazards.tex",),
-    11: ("ch11-cache-interface.tex",),
-    12: ("ch12-modern-vm-tlb.tex",),
+    8: ("ch08-pipeline-core.tex", "ch08-execution-control.tex", "ch08-modern-ooo.tex"),
+    9: ("ch09-pipeline-hazards.tex", "ch09-commit-recovery.tex"),
+    10: ("ch10-memory-model.tex",),
+    11: ("ch11-cache-interface.tex", "ch11-cache-deep-dive.tex"),
+    12: ("ch12-modern-vm-tlb.tex", "ch12-vm-deep-dive.tex"),
     13: ("ch13-chapter-exercises.tex",),
     14: ("ch14-nvme-interface.tex",),
     15: ("ch15-chapter-exercises.tex",),
@@ -134,7 +138,16 @@ REFERENCE_CLEANUPS = (
 )
 TARGET_REPLACEMENTS = {
     2: (("独占整章", "独占一个完整部分"),),
-    9: (("独占整章", "独占一个完整部分"),),
+    9: (
+        ("独占整章", "独占一个完整部分"),
+        ("虽然本书不展开乱序核心设计，但提前理解", "要展开乱序核心设计，首先要理解"),
+    ),
+    10: (
+        (
+            "多核内存模型本身超出本书范围，这里只需要与 DMA 直接相关的一条规则：",
+            "本章后文将从 DMA 可见性进入多核内存模型；这里先固定一条直接相关的规则：",
+        ),
+    ),
     13: (("Fine-granularity (REFfg)", r"Fine-\allowbreak granularity (REFfg)"),),
     20: (("前面七章", "前面的数字与处理器章节"),),
     25: (("前面十四章", "前面二十四章"),),
@@ -816,6 +829,16 @@ def format_chapter_end_exercises(text: str, chapter_number: int) -> str:
         section_end = sections[index + 1].start() if index + 1 < len(sections) else len(text)
         begin = LONGTABLE_BEGIN_RE.search(text, section.end(), section_end)
         if not begin:
+            section_body = text[section.end():section_end]
+            already_numbered = (
+                section_title == "章末练习"
+                and CHAPTER_EXERCISE_BLOCK_RE.search(section_body)
+            ) or (
+                section_title.startswith("参考解答")
+                and CHAPTER_ANSWER_BLOCK_RE.search(section_body)
+            )
+            if already_numbered:
+                continue
             raise ValueError(f"chapter {chapter_number} {section_title}: missing longtable")
         end_token = r"\end{longtable}"
         end = text.find(end_token, begin.end(), section_end)

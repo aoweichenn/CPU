@@ -98,3 +98,15 @@
 | 第 24 章 | CPU/GPU 可见性、页面迁移、设备缺页、fence 与显示完成域 | verified |
 | 第 26 章 | 教学机到现代整机映射、首次运行全链路 trace、证据关联与恢复 | verified |
 | 全部 26 章 | 汇总迁移来源中的练习与解答，并放置于实际章末 | verified |
+
+## 2026-07 现代处理器与存储前端深化批次
+
+本批次不改变章节数量和既有单元归属。新增内容以“具体状态、逐拍或逐事件 trace、数值演算、并发边界、故障恢复、练习答案”为验收单位；新增文件进入生成图、章节流审计和全书构建后，方可标记为 `verified`。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 8 章 | 超标量前端、寄存器重命名、发射队列、ROB、LSQ、按序退休与误预测恢复 | verified |
+| 第 9 章 | 乱序执行中的精确异常、加载/存储排序、重放、提交带宽与性能代价 | verified |
+| 第 10 章 | 多核内存模型、store buffer、acquire/release、屏障与 DMA 可见性对照 | verified |
+| 第 11 章 | AMAT、冲突 miss、非阻塞 Cache、MESI 暂态、目录一致性与 litmus trace | verified |
+| 第 12 章 | 真实 PTE 位字段、页表内存成本、TLB reach、page-walk cache、COW 与 shootdown 竞争 | verified |

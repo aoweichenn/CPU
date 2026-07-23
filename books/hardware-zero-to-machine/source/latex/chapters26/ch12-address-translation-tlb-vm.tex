@@ -368,6 +368,154 @@ IOMMU 翻译 & 设备地址越界、权限错误或项缺失 & IOMMU 与设备�
 \bottomrule
 \end{longtable}
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{十、把一条真实 PTE 按位读完}
+
+“页表项保存页框号和权限”只是结构概括。以常见 x86-64 的 4 KiB 叶子 PTE 为例，一个表项为 64 bit：bit 0 是 Present，bit 1 是 Read/Write，bit 2 是 User/Supervisor，bit 3、4 控制页级缓存属性，bit 5 是 Accessed，bit 6 是 Dirty，bit 7 在 4 KiB 叶子中参与 PAT 属性，bit 8 是 Global，bit 9--11 通常留给软件使用，物理页框地址位于中间地址字段，bit 63 是 NX（no-execute）。物理地址有效宽度与保留位随处理器能力变化，软件必须按能力字段构造，不能假定所有中间位都可作为地址。
+
+\begin{longtable}{L{0.15\linewidth}L{0.19\linewidth}L{0.30\linewidth}L{0.26\linewidth}}
+\toprule
+位或字段 & 常见名称 & 硬件作用 & 错误设置的结果 \\
+\midrule
+0 & P & 表项是否给出有效翻译 & 0 时访问形成 not-present page fault \\\tablerowrule
+1 & R/W & 是否允许写 & 写只读页形成 protection fault \\\tablerowrule
+2 & U/S & 用户态是否可访问 & 用户态访问 supervisor 页失败 \\\tablerowrule
+5 & A & 记录该层或叶子曾被访问 & OS 可据此估计活跃度 \\\tablerowrule
+6 & D & 记录叶子页曾被写 & 回收前决定是否需要写回 \\\tablerowrule
+地址字段 & PFN & 给出下一级表或最终页框 & 未按页面对齐或越过物理宽度会触发保留位错误 \\\tablerowrule
+63 & NX & 禁止从该页取指 & 数据页可读写但不能执行 \\
+\bottomrule
+\end{longtable}
+
+权限沿层级共同生效。上层页目录项若清除 U/S，下层 PTE 即使设置 U/S 也不能重新允许用户访问；上层清除 R/W 时，写权限同样受限制。walker 每走一级都要累计权限，最终 TLB 项缓存的是组合结果，而不是只复制叶子表项。操作系统修改任一级权限后，都必须处理可能缓存旧组合权限的 TLB 项。
+
+页错误码把故障拆成几个维度：映射不存在还是权限失败，访问是读还是写，发起者是用户态还是特权态，是否由取指触发，以及是否命中保留位错误。调试时应同时读取故障虚拟地址、错误码和对应层级表项；只看到“page fault”无法判断是需求调页、COW、栈增长、执行禁止还是页表损坏。
+
+\topic{页表本身也要占内存}
+
+四级页表不是免费元数据。4 KiB 页表页可放 512 个 8-byte 表项；一张末级页表覆盖 $512\times4$ KiB = 2 MiB 虚拟空间，一张上一级页目录覆盖 $512\times2$ MiB = 1 GiB。映射连续 1 GiB 普通页面需要 512 张末级页表，共 2 MiB，再加页目录和更高层入口所在的页面，专用页表内存约 2 MiB 量级。
+
+若改用 2 MiB 大页，同一 1 GiB 只需要 512 个叶子 PDE，正好放进一张 4 KiB 页目录；加上更高层页面，元数据从约 2 MiB 降到十几 KiB。代价是物理内存必须按 2 MiB 粒度连续，保护和 COW 粒度变粗，部分使用仍占用整页，迁移或回收一次也要处理更大对象。
+
+\begin{longtable}{L{0.18\linewidth}L{0.24\linewidth}L{0.24\linewidth}L{0.24\linewidth}}
+\toprule
+映射方式 & 映射 1 GiB 的叶子项数 & 叶子表内存量级 & 主要代价 \\
+\midrule
+4 KiB 页 & 262144 个 PTE & 512 页，约 2 MiB & TLB 项多、walk 层级完整 \\\tablerowrule
+2 MiB 页 & 512 个 PDE & 1 页，4 KiB & 内部碎片与连续物理内存要求 \\\tablerowrule
+1 GiB 页 & 1 个 PDPTE & 复用上层页表中的 1 项 & 粒度极粗，权限和迁移不灵活 \\
+\bottomrule
+\end{longtable}
+
+稀疏地址空间的优势来自按需分配下级表。进程即使拥有数 TiB 的虚拟范围，只要实际触碰很少区域，就只为相应分支分配页表页。反过来，若每隔 2 MiB 只映射一个 4 KiB 页面，每个稀疏区域仍可能需要一张独立末级页表，页表开销会接近有效数据大小。判断页表成本要看虚拟地址分布，不能只看已映射字节总数。
+
+\topic{TLB reach 与 page-walk cache 的数值账}
+
+TLB reach 是 TLB 不发生替换时能覆盖的地址范围：
+\[
+\text{TLB reach}=\text{项数}\times\text{页大小}.
+\]
+64 项、4 KiB 页的 L1 DTLB 只能覆盖 256 KiB；1536 项二级 TLB 覆盖 6 MiB。若其中 32 项支持 2 MiB 大页，仅这部分即可覆盖 64 MiB。大页加速大工作集的首要原因常常是扩大 reach，而不是 DRAM 本身更快。
+
+TLB 组相联仍会产生冲突。若一个 64 项、4 路 TLB 有 16 个集合，多个虚拟页号反复映射到同一集合时，活跃页面只有 5 个也会持续替换。操作系统页着色主要用于 Cache，但地址分配和页大小选择同样会影响 TLB 集合分布。
+
+page-walk cache 保存上层页表项或中间翻译。假设一次四级 walk 的四个表项若都命中 L1，每次 1 ns，最终数据访问 1 ns，逻辑串行代价约 5 ns；若四项均到 DRAM，每项 80 ns，再加数据 80 ns，最坏约 400 ns。若 walk cache 命中前三层，只需读取末级 PTE 和数据，代价可从五次存储层访问降为两次。实际核心会让多个 walk 并行，但同一条 walk 的层级地址存在数据依赖，不能完全重叠。
+
+\begin{longtable}{L{0.22\linewidth}L{0.24\linewidth}L{0.24\linewidth}L{0.20\linewidth}}
+\toprule
+情况 & 翻译所需读取 & 最终数据读取 & 主要瓶颈 \\
+\midrule
+TLB hit & 0 次页表读取 & 1 次 & TLB 与 L1 并行关键路径 \\\tablerowrule
+TLB miss、上层 walk cache hit & 1 次末级 PTE & 1 次 & 末级表项位置与数据位置 \\\tablerowrule
+四级表项均在 Cache & 4 次逻辑串行读取 & 1 次 & 层级依赖与 Cache 延迟 \\\tablerowrule
+四级表项均到 DRAM & 最坏 4 次 DRAM 读取 & 1 次 DRAM 读取 & 数百 ns 串行延迟 \\
+\bottomrule
+\end{longtable}
+
+\section{十一、COW fault 是页框所有权转移}
+
+fork 后，父子进程的 PTE 可以同时指向同一物理页框，并都清除写权限；内核在页框元数据中记录引用计数。任一进程首次写入时产生 protection fault。处理程序确认这是可修复的 COW，而不是非法写，分配新页框，复制旧页内容，把当前进程 PTE 改为新页框并恢复写权限，再失效当前地址的 TLB 项，最后重试原 store。
+
+\begin{longtable}{L{0.12\linewidth}L{0.27\linewidth}L{0.29\linewidth}L{0.22\linewidth}}
+\toprule
+步骤 & PTE 与页框状态 & 所有权变化 & 可提交边界 \\
+\midrule
+1 & 父子 PTE 均指向旧页，R/O & 旧页引用计数至少为 2 & store 尚未产生可见写 \\\tablerowrule
+2 & 当前进程分配新页 & 新页暂属内核处理路径 & 复制未完成，不能发布 PTE \\\tablerowrule
+3 & 复制旧页到新页 & 新页内容形成稳定快照 & 仍未对用户映射可见 \\\tablerowrule
+4 & 原子发布新 PTE，R/W & 当前进程取得新页写所有权 & 旧翻译必须失效 \\\tablerowrule
+5 & 重试原 store & 写进入新页 Cache line & 正常提交后对当前进程可见 \\
+\bottomrule
+\end{longtable}
+
+并发使顺序更严格。两个线程可能同时 fault 到同一进程映射，另一个核心可能仍缓存旧只读翻译，页面也可能在复制期间被回收路径观察。内核需要用页表锁、PTE 原子更新和页框引用计数决定谁发布结果；未获胜的一方重新检查 PTE，不能把自己复制的页无条件覆盖上去。旧页引用计数只有在映射更新和必要 shootdown 完成后才能减少到可回收状态。
+
+若引用计数已经为 1，处理程序可以直接把原页改为可写而不复制，但仍要原子更新 PTE 并失效旧 TLB 权限。COW 的优化点不是跳过正确性边界，而是在确认没有其他所有者后省去数据复制。
+
+\topic{TLB shootdown 中最危险的是过早复用页框}
+
+设核心 C0 撤销虚拟页 V 到物理页 P 的映射，核心 C1 仍运行同一地址空间并缓存 \code{V->P}。错误顺序是：C0 清 PTE，立即把 P 分配给另一个进程 B，然后才通知 C1。若 C1 在通知到达前访问 V，它会通过陈旧 TLB 直接读写已经属于 B 的页框，页表内的新状态完全来不及参与检查。
+
+正确顺序如下：
+
+\begin{longtable}{L{0.10\linewidth}L{0.25\linewidth}L{0.35\linewidth}L{0.20\linewidth}}
+\toprule
+步骤 & C0 动作 & 必须成立的不变量 & C1 状态 \\
+\midrule
+1 & 清除或替换 V 的 PTE & P 仍归旧映射生命周期所有，不能复用 & 可能仍缓存 \code{V->P} \\\tablerowrule
+2 & 发布页表更新 & 远端失效处理能观察新 PTE 状态 & 旧 TLB 仍可能命中 \\\tablerowrule
+3 & 发送 shootdown IPI & 所有可能缓存该 ASID/V 的核心都在目标集合 & 进入失效处理 \\\tablerowrule
+4 & 等待确认 & 每个目标核心已执行本地失效 & 不再使用旧翻译 \\\tablerowrule
+5 & 回收或复用 P & 没有 CPU 仍可由 V 到达 P & 可以运行新映射 \\
+\bottomrule
+\end{longtable}
+
+批量 unmap 可以先收集多个地址范围，再发送一次 IPI，降低中断次数；代价是相关页框在确认前都不能复用。使用 generation 可以让整个地址空间切换到新代际，旧 TLB 项即使物理上仍在，也因 ASID/PCID 代际不匹配而不再命中；标识最终复用时仍要保证更旧代际已经被全局清除。
+
+设备还有独立的 IOTLB 或 ATS 缓存。撤销 DMA 映射时，CPU TLB shootdown 不能替代 IOMMU/设备失效；必须阻止新提交、撤销映射、发出相应 IOTLB/ATS invalidation，等待设备确认和在途请求结束，最后才能复用页框。
+
+\section{十二、嵌套翻译为什么需要专用缓存}
+
+四级客户页表加四级第二阶段页表的最坏代价远不只是八次读取。读取每一个客户 PTE 时，该 PTE 的客户物理地址本身要经过第二阶段四级 walk：四次第二阶段表项读取，加一次客户 PTE 读取，共五次；四级客户 walk 最多需要 $4\times5=20$ 次。得到最终客户物理数据地址后，还要再做四次第二阶段表项读取和一次数据访问，总计最多 25 次存储层访问，其中 24 次服务于翻译。
+
+真实处理器用 TLB、组合翻译缓存和各级 walk cache 避免每次支付这个最坏值。若组合 TLB 直接命中“客户虚拟地址到主机物理地址”，两阶段细节都被旁路；若只命中部分第二阶段上层项，仍能显著减少每个客户 PTE 地址的重复 walk。虚拟化工作负载的性能分析因此要区分第一阶段 miss、第二阶段 miss、组合 TLB miss 和最终数据 Cache miss。
+
+故障归属也必须保留。第一阶段 not-present 通常交给客户操作系统；第二阶段缺失交给管理程序；设备地址缺失交给 IOMMU 与宿主驱动。把三类故障都报告成普通缺页，会让错误的软件层尝试修改自己并不拥有的页表。
+
+\topic{NUMA 把“物理页框在哪里”变成性能状态}
+
+多插槽或多芯粒系统中，不同物理页框连接到不同内存控制器。地址转换得到物理页框后，home 节点与地址交织规则决定请求走本地控制器还是跨互连到远端内存。虚拟地址连续不表示物理页一定在同一 NUMA 节点，页表权限正确也不表示访问时延相同。
+
+常见 first-touch 策略在某线程首次写页时从其所在节点分配物理页。若初始化线程在节点 0 串行清零全部数组，随后节点 1 的工作线程会持续远端访问；并行初始化可让每个线程在自己的节点触碰负责区域。页面迁移可以修正放置，但迁移期间要复制数据、更新 PTE、执行 shootdown，并处理 DMA pin 或共享映射等不能移动的情况。
+
+NUMA 诊断应把三张表对齐：线程在哪个核心运行，虚拟页映射到哪个物理节点，访问最终在哪个内存控制器完成。只看到 LLC miss 增多不能区分本地 DRAM 压力和远端互连时延；还要观察远端访问、互连流量和页面放置。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{1}
@@ -400,6 +548,41 @@ Cache 联动
 \exercisecheck{题目}{IOMMU 翻译成功是否意味着 DMA 数据一定已与 CPU Cache 保持一致？说明理由。}
 \end{chapterexercise}
 
+\begin{chapterexercise}{PTE 判错}
+某用户态 store 命中一个 P=1、R/W=0、U/S=1、NX=1 的 4 KiB PTE。判断是否缺页、错误属于不存在还是权限失败，以及 NX 是否参与本次数据写判断。
+\exercisecheck{学习目标}{按访问类型逐位解释 PTE}
+\end{chapterexercise}
+
+\begin{chapterexercise}{页表成本}
+用 4 KiB 页连续映射 2 GiB，需要多少张末级页表页、占多少 MiB？若改用 2 MiB 大页，需要多少个叶子 PDE？
+\exercisecheck{学习目标}{页表项数、覆盖范围和元数据容量换算}
+\end{chapterexercise}
+
+\begin{chapterexercise}{TLB reach}
+某 DTLB 有 128 个 4 KiB 项，另有 16 个 2 MiB 项。分别计算两部分 reach；一个顺序扫描 32 MiB 数组的程序主要受哪部分覆盖能力影响？
+\exercisecheck{学习目标}{页大小会直接改变 TLB 覆盖范围}
+\end{chapterexercise}
+
+\begin{chapterexercise}{COW 并发}
+两个线程同时写同一 COW 页并同时进入 fault。说明为什么需要原子 PTE 更新或页表锁，失败的一方应怎样处理自己已经分配的新页。
+\exercisecheck{学习目标}{COW 是并发所有权转移，不只是复制数据}
+\end{chapterexercise}
+
+\begin{chapterexercise}{shootdown 顺序}
+把“清 PTE、发送 IPI、等待确认、复用页框、远端失效”排成正确顺序，并说明把复用页框提前会造成什么安全问题。
+\exercisecheck{学习目标}{页框回收必须晚于所有旧翻译失效}
+\end{chapterexercise}
+
+\begin{chapterexercise}{嵌套 walk}
+四级客户页表和四级第二阶段页表均完全 miss，且所有页表项读取都要实际访问存储层。计算在最终数据读取之前最多有多少次翻译相关读取，并说明组合 TLB 命中后剩多少次页表读取。
+\exercisecheck{学习目标}{理解嵌套翻译的乘法型代价}
+\end{chapterexercise}
+
+\begin{chapterexercise}{NUMA 放置}
+节点 0 的单线程初始化 8 GiB 数组，随后节点 1 的线程独占处理该数组。解释 first-touch 下的页框位置和访问路径，并给出一种不改变算法的数据放置改进。
+\exercisecheck{学习目标}{把线程位置、页框位置和内存控制器对齐}
+\end{chapterexercise}
+
 \section*{参考解答与要点}
 
 \begin{chapteranswer}{1}
@@ -430,4 +613,39 @@ Cache 联动
 \begin{chapteranswer}{6}
 设备隔离
 \answercheck{解答要点}{不能。IOMMU 处理地址与权限；非一致性 DMA 仍需 Cache 维护和屏障，并要等待设备在途事务结束后才能回收页。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{PTE 判错}
+P=1 表示映射存在，用户访问也被 U/S 允许；store 因 R/W=0 产生 protection fault，不是 not-present fault。NX 只约束取指，不决定普通数据写是否允许。
+\answercheck{必须掌握的要点}{先判断存在，再按访问类型检查写、用户和执行权限}
+\end{chapteranswer}
+
+\begin{chapteranswer}{页表成本}
+2 GiB 含 $2\,\mathrm{GiB}/4\,\mathrm{KiB}=524288$ 个页面。每张末级表放 512 项，需要 1024 张页表页，占 $1024\times4$ KiB = 4 MiB。改用 2 MiB 大页，需要 $2\,\mathrm{GiB}/2\,\mathrm{MiB}=1024$ 个叶子 PDE。
+\answercheck{必须掌握的要点}{末级表页覆盖 2 MiB 虚拟范围}
+\end{chapteranswer}
+
+\begin{chapteranswer}{TLB reach}
+128 个 4 KiB 项覆盖 512 KiB；16 个 2 MiB 项覆盖 32 MiB。若数组能够用 2 MiB 页连续映射，后者恰好覆盖整个 32 MiB 扫描范围，显著减少 TLB 替换。
+\answercheck{必须掌握的要点}{reach 等于项数乘页大小}
+\end{chapteranswer}
+
+\begin{chapteranswer}{COW 并发}
+若两方都无条件发布 PTE，后写者会覆盖先写者映射，泄漏页框并破坏引用计数。锁或 compare-and-swap 只允许一方完成发布；失败方重新读取已经更新的 PTE，释放自己未发布的新页，然后按新映射重试。
+\answercheck{必须掌握的要点}{数据复制可以并行，映射所有权只能原子提交一次}
+\end{chapteranswer}
+
+\begin{chapteranswer}{shootdown 顺序}
+正确顺序是清 PTE、发布更新、发送 IPI、远端执行失效、等待全部确认，最后复用页框。若提前复用，远端可用陈旧 \code{V->P} 翻译访问已经属于另一个进程或对象的页框，造成越权读取或内存破坏。
+\answercheck{必须掌握的要点}{旧翻译全部失效之前，旧页框仍属于原生命周期}
+\end{chapteranswer}
+
+\begin{chapteranswer}{嵌套 walk}
+四个客户 PTE 各需要四次第二阶段表项读取，再读取客户 PTE，共 $4\times5=20$ 次；最终客户物理地址还需四次第二阶段读取，因此最终数据访问前最多有 24 次翻译相关读取。组合 TLB 命中后直接得到主机物理地址，页表读取为 0，只剩最终数据访问。
+\answercheck{必须掌握的要点}{嵌套代价来自“客户 PTE 地址本身也要翻译”}
+\end{chapteranswer}
+
+\begin{chapteranswer}{NUMA 放置}
+first-touch 会把数组页主要分配到节点 0；节点 1 线程之后的 miss 经一致性互连访问节点 0 的内存控制器，形成远端时延和链路流量。可让节点 1 线程完成并行初始化，或在运行前把页面迁移/绑定到节点 1。
+\answercheck{必须掌握的要点}{初始化位置会决定后续物理页归属}
 \end{chapteranswer}

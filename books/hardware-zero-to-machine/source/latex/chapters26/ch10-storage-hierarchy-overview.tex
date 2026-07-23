@@ -605,7 +605,7 @@ MMIO 状态寄存器 & cache 命中会隐藏设备新状态 & 设备内存属性
 这张表就是一致性协议的 trace：每一行对应状态图上的一条边，每一步结束都满足同一条不变式——X 的最新值在全局唯一，要么在某核的 M 行里（其余全为 I，内存过期），要么在所有 S 副本与内存里保持一致。调试多核程序时若怀疑数据不一致，最有效的办法正是把可疑的访问序列按这种方式列成表，逐步检查哪一步破坏了唯一性。
 
 \topic{store buffer 和屏障把“执行完成”与“可见”分开}
-STORE 对流水线来说可以很早“执行完成”：地址和数据已经形成，写事务进入 store buffer，后续独立指令可以继续执行。但这个 STORE 什么时候对其他核心、DMA 或设备可见，要看 store buffer 排队、cache 状态、内存类型和屏障规则。多核内存模型本身超出本书范围，这里只需要与 DMA 直接相关的一条规则：普通 RAM 写可以合并和延迟；MMIO 写通常要求更强顺序；DMA 描述符写在通知设备前必须已经对设备可见。
+STORE 对流水线来说可以很早“执行完成”：地址和数据已经形成，写事务进入 store buffer，后续独立指令可以继续执行。但这个 STORE 什么时候对其他核心、DMA 或设备可见，要看 store buffer 排队、cache 状态、内存类型和屏障规则。本章后文将从 DMA 可见性进入多核内存模型；这里先固定一条直接相关的规则：普通 RAM 写可以合并和延迟；MMIO 写通常要求更强顺序；DMA 描述符写在通知设备前必须已经对设备可见。
 
 \begin{lstlisting}
 // 注释（推进）：逐行追踪发起者、所有权和可见性；请求被接受不等于事务完成。
@@ -1209,6 +1209,94 @@ HDD & 磁畴方向 & 1--24 TB & 4--12 ms & 4--12 ms & 数十年 & 磁头碰撞�
 
 每一层的访问粒度、写入代价和失效模式都由其物理结构决定，不能通过软件抽象消除。理解这些结构，才能理解为什么 cache miss 代价是 100 ns 而不是 1 ns，为什么 SSD 随机写比顺序写慢，为什么 HDD 随机 IOPS 只有 100 而顺序带宽有 200 MB/s。
 
+\section{五、从单核程序顺序到多核可见顺序}
+
+程序文本给出一条线程内顺序，处理器内部却可能让无依赖操作重叠执行：load 可以在较早 store 仍留在 store buffer 时读取其他地址，Cache miss 可以与后续命中并行，不同核心还各自持有 Cache 副本。内存模型规定的不是“硬件内部必须完全顺序”，而是其他核心和设备允许观察到哪些结果。
+
+先区分三个边界。指令执行完成表示地址或数值已经算出；指令退休表示它不再因较早异常被撤销；写对某个观察者可见表示该观察者之后的读取必须按模型看到它或更新的值。一个 store 可以已经退休，却仍留在本核 store buffer，尚未取得 Cache line 写权限；因此退休顺序不能直接当作跨核可见顺序。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+边界 & 状态变化 & 可以确认的事实 & 尚不能确认 \\
+\midrule
+store 执行 & 地址、数据和字节掩码形成 & 写请求内容确定 & 该写不会因异常撤销 \\\tablerowrule
+store 退休 & 指令越过精确异常边界 & 写属于正确程序路径 & 其他核心已经看到 \\\tablerowrule
+取得写权限 & 其他共享副本失效或降级 & 本核可以修改该 line & 写已经持久化 \\\tablerowrule
+观察者读取 & 观察者按内存模型取得某个版本 & 该观察者的可见顺序确定 & 介质掉电后仍存在 \\\tablerowrule
+持久化完成 & 数据越过平台持久化边界 & 掉电恢复后应保留 & 与其他地址的顺序仍需协议规定 \\
+\bottomrule
+\end{longtable}
+
+\topic{store buffer 允许出现反直觉但合法的结果}
+
+考虑初始 \code{x=0,y=0}，两个核心同时执行：
+
+\begin{longtable}{L{0.14\linewidth}L{0.31\linewidth}L{0.14\linewidth}L{0.31\linewidth}}
+\toprule
+核心 0 & 动作 & 核心 1 & 动作 \\
+\midrule
+S0 & \code{x=1} & S1 & \code{y=1} \\\tablerowrule
+L0 & \code{r0=y} & L1 & \code{r1=x} \\
+\bottomrule
+\end{longtable}
+
+若两次 store 都先进入各自 store buffer，而两次 load 对另一个地址的 Cache 副本读取发生在写传播之前，就可能得到 \code{r0=0,r1=0}。每个核心仍保持自己的依赖规则：核心 0 若随后读取 x，必须能从自己的 store buffer 转发 1；但这不要求核心 1 已经看到 x 的新值。
+
+这个例子称为 store buffering litmus test。它说明“每个线程都先写后读”不足以建立跨线程通信。要禁止 \code{0,0} 结果，需要使用体系结构提供的屏障或具有适当顺序语义的原子操作。编译器也参与这份契约：源代码中的普通访问若没有同步语义，编译器可能重排或删除它们；硬件屏障不能补回编译器已经改变的程序顺序。
+
+一致性和内存模型也要分开。Cache coherence 通常保证同一地址的写最终按一个一致顺序被所有核心观察，并维持单写者/多读者权限；memory consistency 还规定不同地址之间允许怎样重排。MESI 能阻止两个核心同时以可写状态修改同一 line，却不会自动规定“先写 data、再写 flag”必须被另一核心按相同顺序观察。
+
+\topic{release/acquire 把数据发布接成因果链}
+
+消息传递常用两个对象：数据 \code{data} 和发布标志 \code{ready}。生产者先写 data，再以 release 语义写 ready；消费者以 acquire 语义读取 ready，确认其值为 1 后再读 data。
+
+\begin{longtable}{L{0.16\linewidth}L{0.25\linewidth}L{0.25\linewidth}L{0.24\linewidth}}
+\toprule
+生产者 & 顺序约束 & 消费者 & 顺序约束 \\
+\midrule
+\code{data=42} & 普通写可先在缓冲中推进 & \code{r=load\_acquire(ready)} & 后续访问不能越过成功 acquire \\\tablerowrule
+\code{store\_release(ready,1)} & release 之前的写先于发布可见 & 若 \code{r==1}，读取 data & 应观察到发布前的数据写或更新值 \\
+\bottomrule
+\end{longtable}
+
+release 约束它之前的访问不能在全局效果上落到发布动作之后；acquire 约束它之后的访问不能提前到成功观察发布之前。两者通过同一个同步对象读写配对，形成 happens-before 因果链。release 本身不约束它之后的普通操作，acquire 本身也不要求它之前的普通操作全部完成；需要双向约束时要使用更强的 read-modify-write 或 fence 语义。
+
+把同样结构放到设备队列中，描述符内容相当于 data，doorbell 相当于 ready。CPU 必须先完成描述符写和平台要求的 Cache 可见性处理，再用合适的写屏障发布 doorbell。设备读到新的队列尾后，才可以相信此前描述符内容有效。设备完成方向则相反：设备先写数据和 completion，再发中断；驱动确认完成并执行平台需要的 DMA 同步后，才能读取结果。
+
+\topic{屏障、Cache 维护与持久化是三类不同操作}
+
+内存屏障约束观察顺序或完成条件；Cache clean/invalidate 改变某一级副本的脏状态、有效状态或所有权；持久化操作把数据推进到掉电后仍可靠的域。三类操作可能在一个协议中连续出现，但不能互相替代。
+
+\begin{longtable}{L{0.20\linewidth}L{0.25\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+操作类别 & 主要对象 & 保证的边界 & 常见误判 \\
+\midrule
+编译器屏障 & 编译器的指令与访问排序 & 编译阶段不跨越指定点移动 & 不会自动生成硬件同步事务 \\\tablerowrule
+硬件内存屏障 & load/store、原子操作与观察顺序 & 按 ISA 规定限制重排或等待完成 & 不等于清空全部 Cache \\\tablerowrule
+Cache clean & 脏 Cache line & 把修改推进到指定一致性点 & 不一定到达持久介质 \\\tablerowrule
+Cache invalidate & 本地有效副本 & 后续读取重新取得数据 & 未先 clean 可能丢失脏数据 \\\tablerowrule
+持久化 flush & Cache、控制器缓冲与介质队列 & 把写推进到规定持久化域 & 仍需日志或原子更新安排顺序 \\
+\bottomrule
+\end{longtable}
+
+对一致性 DMA 平台，设备访问会参与硬件一致性域，软件通常不必手工 clean 每个描述符，但仍需要发布顺序和完成顺序。对非一致性 DMA 平台，CPU 写过的 line 可能只存在于本地 Cache，设备看不到；提交前要 clean，设备写回后 CPU 读取前要 invalidate 或执行 DMA API 规定的同步。IOMMU 只决定设备地址能翻译到哪里，不决定这些 Cache 副本是否一致。
+
+\topic{用允许结果而不是口号描述内存模型}
+
+分析并发硬件时，最可靠的方法是写出初始值、每个线程的访问、同步操作和关注的最终寄存器值，再判断哪些结果被模型允许。只说“这是强内存序”或“加一个屏障”不够，因为不同屏障约束的方向、地址类型和共享域可能不同。
+
+至少要逐项回答：
+
+\begin{enumerate}
+  \item 编译器是否必须保留源码中的访问及其顺序；
+  \item load 是否可能绕过较早 store，store buffer 是否提供同核转发；
+  \item 哪个原子读观察到了哪个发布写，两者是否形成同步关系；
+  \item 访问对象是普通一致性内存、非一致性 DMA 缓冲还是 MMIO；
+  \item 完成要求停在其他核心可见、设备可见，还是掉电后可恢复。
+\end{enumerate}
+
+同一条 \code{write()}、同一次 doorbell 和同一个 fence 在不同层的“完成”含义不同。把允许结果与完成域写清楚，才能把处理器内存模型、Cache 一致性、DMA 协议和存储持久化放到同一张图中而不混淆。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{SRAM 读写周期}
@@ -1326,6 +1414,31 @@ HDD & 磁畴方向 & 1--24 TB & 4--12 ms & 4--12 ms & 数十年 & 磁头碰撞�
 \exercisecheck{预期结果}{每步最新值位置唯一，失效与写回/转发正确}
 \end{chapterexercise}
 
+\begin{chapterexercise}{store buffer 结果}
+对正文的 \code{x/y} 双核例子，解释为什么 \code{r0=0,r1=0} 可能发生，以及为什么每个核心读取自己刚写的地址时仍必须得到转发的新值。
+\exercisecheck{学习目标}{区分对本核的转发与对其他观察者的传播}
+\end{chapterexercise}
+
+\begin{chapterexercise}{发布协议}
+生产者写入长度和数据，再把 ready 置 1；消费者看到 ready 后读取长度和数据。指出 release、acquire 应放在哪里，并说明只有编译器屏障为什么不足。
+\exercisecheck{学习目标}{建立跨核心 happens-before 关系}
+\end{chapterexercise}
+
+\begin{chapterexercise}{一致性与内存模型}
+两个核心写同一 Cache line 与两个核心分别写不同地址，分别主要受 Cache coherence 还是 memory consistency 约束？说明二者为什么不能互相替代。
+\exercisecheck{学习目标}{同址写序与跨地址顺序是两个问题}
+\end{chapterexercise}
+
+\begin{chapterexercise}{非一致性 DMA}
+CPU 填写发送描述符后通知设备，设备 DMA 读取；完成后设备 DMA 写状态并发中断。按顺序列出 CPU 提交方向和完成方向所需的 Cache 维护、屏障与完成检查。
+\exercisecheck{学习目标}{地址翻译、数据可见性和完成通知分别闭合}
+\end{chapterexercise}
+
+\begin{chapterexercise}{持久化辨析}
+程序把日志记录写入页缓存后执行普通内存屏障。说明这为什么不能保证掉电后记录仍存在，还缺少哪些软件和设备边界。
+\exercisecheck{学习目标}{可见顺序不等于持久化顺序}
+\end{chapterexercise}
+
 \section*{参考解答与要点}
 
 \begin{chapteranswer}{SRAM 读写周期}
@@ -1441,4 +1554,29 @@ START $\rightarrow$ \code{0xA0}（\code{0x50} 左移一位、读写位 0 表示�
 \begin{chapteranswer}{MESI 走查}
 步骤 1：A 由 I 变 S，B 保持 I（读入共享副本）；步骤 2：B 由 I 变 S，A 保持 S；步骤 3：A 广播失效，B 由 S 变 I，A 由 S 变 M，内存过期；步骤 4：B 读 miss，A 写回或转发后由 M 降为 S，B 得 S，内存恢复最新。
 \answercheck{必须保留的要点}{每步最新值唯一：S 期间在内存，M 期间在 A 的 cache。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{store buffer 结果}
+两次 store 可分别停留在本核 store buffer，两次 load 在对方写传播前读取旧 Cache 值，因此得到 \code{0,0}。同核读取自己刚写的地址时，地址比较会命中 store buffer，必须转发最新字节，否则连单线程语义都会被破坏。
+\answercheck{必须掌握的要点}{本核转发可以先成立，跨核传播稍后完成}
+\end{chapteranswer}
+
+\begin{chapteranswer}{发布协议}
+生产者对 ready 使用 release store，消费者对 ready 使用 acquire load；消费者只有观察到 1 后才读长度和数据。编译器屏障只约束编译器，处理器 store buffer、Cache 和互连仍可能改变观察顺序，必须使用 ISA 与语言内存模型共同定义的原子语义。
+\answercheck{必须掌握的要点}{release/acquire 要通过同一同步对象配对}
+\end{chapteranswer}
+
+\begin{chapteranswer}{一致性与内存模型}
+同一 line 的写权限和同址写序主要由 coherence 保证；不同地址之间是否可重排、另一个核心允许观察到哪些组合主要由 consistency 规定。一致性只为每个地址提供连贯版本，不能自动建立 data 与 flag 之间的发布顺序。
+\answercheck{必须掌握的要点}{同址版本正确不推出跨地址因果顺序}
+\end{chapteranswer}
+
+\begin{chapteranswer}{非一致性 DMA}
+提交方向：CPU 写描述符，clean 对应 line，执行写屏障，再写 doorbell。完成方向：先确认 completion 或中断对应正确代际，执行平台 DMA 同步并 invalidate 设备写过的 line，再读取结果。IOMMU 映射应在提交前建立，在确认所有在途 DMA 结束后才撤销。
+\answercheck{必须掌握的要点}{先发布数据再通知；先确认完成和可见性再消费或回收}
+\end{chapteranswer}
+
+\begin{chapteranswer}{持久化辨析}
+普通屏障最多约束 CPU 可见顺序，数据可能仍在页缓存、文件系统延迟写、设备队列、控制器易失缓存或介质内部。还需要文件系统提交协议、相应系统调用或同步接口、设备 flush/FUA，以及介质声明的持久化完成边界。
+\answercheck{必须掌握的要点}{可见、设备完成和掉电持久化是三个边界}
 \end{chapteranswer}
