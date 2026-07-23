@@ -407,6 +407,85 @@ AER 把错误按可纠正、不可纠正非致命和不可纠正致命分类。�
 
 恢复顺序必须先停止新流量，再处理在途状态。驱动通常屏蔽中断、停止提交、等待或取消队列，平台隔离故障功能并执行 function-level reset、secondary bus reset 或更大范围复位；重新训练和重新枚举之后，软件重建 BAR、IOMMU 和队列状态。旧 completion 不能写入已经重新分配的缓冲区，因此复位前后的世代必须可区分。
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{九、把 PCIe 读请求落实为拆分、窗口与完成匹配}
+
+PCIe Memory Read 不应只画成一个请求箭头。请求者先按 Max Read Request Size（MRRS）限制每笔请求长度，完成者再按 Max Payload Size（MPS）、Read Completion Boundary（RCB）、可用 completion credit 和内部数据就绪情况拆成一个或多个 Completion with Data。请求 TLP 和完成 TLP 因而不是一一对应关系。
+
+\topic{MRRS 限制请求，MPS 与 RCB 共同影响返回分段}
+
+设请求者读取 1024 B，MRRS 为 512 B，它至少要发两笔读请求。再看其中一笔：起始地址低位为 \code{0x40}，长度 512 B，RCB 为 128 B，completion 的 MPS 为 256 B。第一段只能返回 64 B，先走到下一个 128 B 边界；之后可返回三个 128 B 段，最后再返回 64 B，总计
+\[
+64+128+128+128+64=512\ \text{B}.
+\]
+请求者不能按“预计五段”盲目计数，而要使用 completion 中的 tag、Lower Address、Byte Count 和状态验证覆盖范围，防止重复、缺口或越界数据被写入目标缓冲区。
+
+\begin{longtable}{L{0.14\linewidth}L{0.18\linewidth}L{0.22\linewidth}L{0.26\linewidth}L{0.10\linewidth}}
+\toprule
+完成段 & 长度 & 起始低位 & 累计覆盖 & tag \\
+\midrule
+1 & 64 B & \code{0x40} & 0--63 B & T \\\tablerowrule
+2 & 128 B & \code{0x00} & 64--191 B & T \\\tablerowrule
+3 & 128 B & \code{0x00} & 192--319 B & T \\\tablerowrule
+4 & 128 B & \code{0x00} & 320--447 B & T \\\tablerowrule
+5 & 64 B & \code{0x00} & 448--511 B & T \\
+\bottomrule
+\end{longtable}
+
+完成可以跨链路和交换结构乱序返回，不同 tag 之间尤其如此。接收端状态表应保存目标缓冲区、剩余字节数、已覆盖区间、完成状态和超时计时器。只有全部范围恰好覆盖一次，且所有完成均为成功状态，才能释放 tag；收到 Unsupported Request、Completer Abort 或超时，则以失败闭合整笔软件请求。
+
+\topic{tag 数量要覆盖带宽时延积}
+
+Gen3 x4 扣除编码后的单向原始字节率约为 3.94 GB/s。若一次读往返需 800 ns，仅让链路持续有数据所需的在途有效负载约为
+\[
+3.94\times10^9\times800\times10^{-9}\approx3152\ \text{B}.
+\]
+若每个 tag 对应 512 B 请求，理论上至少需要 $\lceil3152/512\rceil=7$ 笔同时在途；考虑 TLP 头、空闲、交换排队和完成分段，工程实现还需留余量。只增加链路宽度而队列仍只允许一笔读在途，吞吐会受往返延迟限制。
+
+\topic{六类 credit 分开记账}
+
+流控把 Posted、Non-Posted 和 Completion 三类事务的 header/data credit 分开。Memory Write 消耗 posted header/data，Memory Read 请求消耗 non-posted header，而返回数据消耗 completion header/data。某一类 credit 为零只应阻止相应类别，不能把整个链路错误地判为失效。
+
+credit 表示接收端承诺的缓冲，不表示最终设备已经处理事务。posted write 在链路层成功交付后通常没有逐笔 completion；若它写的是 doorbell，软件仍要通过设备状态、队列完成或后续 non-posted read 确认设备动作。把链路可靠交付等同于设备语义完成，会漏掉设备内部错误和队列拒绝。
+
+\section{十、排序、隔离与地址空间身份}
+
+PCIe 的 Relaxed Ordering、ID-Based Ordering 和 No Snoop 等属性只在协议规定范围内改变排序或缓存处理，不能当作通用性能开关。典型提交序列仍要明确：CPU 先写描述符数据，使其对设备可见，再写 doorbell；设备先写回数据和完成项，再发 MSI-X。任何允许绕过的属性都必须与端点、IOMMU 和软件内存模型共同核对。
+
+现代设备还可能携带进程地址空间身份。PASID 区分同一 Function 发出的不同地址空间；ATS 允许设备缓存 IOMMU 翻译；PRI 允许设备请求尚未驻留的页面。三者提高共享虚拟内存效率，也扩大失效协议：撤销页面时，不仅要更新 CPU 页表和 IOMMU，还要使设备 ATS 缓存失效，并等待旧翻译不再被用于新 DMA。
+
+ACS（Access Control Services）用于约束交换结构中的对等事务转发。例如策略可要求下游设备的 P2P 请求上送根端口接受 IOMMU 与隔离检查，而不是在交换机内部直接抵达另一个端点。是否启用取决于拓扑和隔离目标；“设备位于不同虚拟机”不能单独证明它们的 P2P 路径已经被隔离。
+
+\begin{keyidea}
+PCIe 端到端正确性同时依赖四本账：tag 记录哪笔请求尚未闭合，credit 记录远端还承诺多少缓冲，BAR/IOMMU/PASID 记录地址属于谁，generation 记录复位前后的完成属于哪个时代。任何一本账被提前释放，都可能把迟到事务交给错误对象。
+\end{keyidea}
+
 \section*{章末练习}
 
 \begin{chapterexercise}{分层概念}
@@ -439,6 +518,16 @@ AER 把错误按可纠正、不可纠正非致命和不可纠正致命分类。�
 \exercisecheck{检查要点}{先查链路裕量，不先修改应用逻辑}
 \end{chapterexercise}
 
+\begin{chapterexercise}{完成拆分}
+512 B 读请求从 128 B 边界后的 32 B 处开始，RCB 为 128 B、completion MPS 为 256 B。给出一种合法的分段长度序列。
+\exercisecheck{检查要点}{首段先抵达 RCB，后续不超过 MPS}
+\end{chapterexercise}
+
+\begin{chapterexercise}{共享虚拟内存失效}
+进程撤销一页映射，而设备启用了 PASID 与 ATS。列出从停止新工作到复用页框的必要步骤。
+\exercisecheck{检查要点}{CPU、IOMMU 与设备翻译缓存均要失效并确认}
+\end{chapterexercise}
+
 \section*{参考解答与要点}
 
 \begin{chapteranswer}{分层概念}
@@ -469,4 +558,14 @@ $8\text{ GT/s}\times128/130\div8\times4\approx3.94$ GB/s。TLP/DLLP、LCRC、ACK
 \begin{chapteranswer}{故障定位}
 先读链路状态确认协商宽度与速率，再看 LTSSM/Recovery 和 AER 计数，随后检查插槽、连接器、lane 走线、参考时钟与供电，最后才验证固件参数和驱动。
 \answercheck{必须保留的检查点}{降宽通常首先指向 lane 可用性或信号质量}
+\end{chapteranswer}
+
+\begin{chapteranswer}{完成拆分}
+首段可为 96 B，先到下一个 128 B 边界；随后可返回 256 B，再返回 160 B，总计 512 B。完成者也可按更小合法段拆分，请求者必须按字段验证而非假定固定段数。
+\answercheck{必须保留的检查点}{每段不能跨越不允许的 RCB，且不超过 MPS}
+\end{chapteranswer}
+
+\begin{chapteranswer}{共享虚拟内存失效}
+先阻止该 PASID 提交新工作并等待或取消在途请求，撤销 CPU 页表与 IOMMU 映射，发送 IOTLB/ATS 失效，等待设备确认旧翻译不再可用，最后才回收并复用页框。
+\answercheck{必须保留的检查点}{不能只做 CPU TLB shootdown}
 \end{chapteranswer}

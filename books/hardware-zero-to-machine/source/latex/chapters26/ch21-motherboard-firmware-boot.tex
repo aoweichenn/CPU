@@ -651,6 +651,97 @@ SPD 也是“软件怎么碰到硬件”的一个干净样本：它不产生数�
 
 热插拔也遵循相同原则：检测存在变化，隔离新流量，确认在途事务结束，更新地址与中断路由，最后释放资源。强行移除的路径必须让未决请求以错误闭合，并阻止设备原有 DMA 地址在页框被复用后继续生效。
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{七、固件阶段的本质是逐步扩大可用资源}
+
+把“固件启动”只写成 POST 会隐藏最重要的约束：早期代码每前进一步，都必须先建立下一步要依赖的执行环境。以常见 UEFI 路径为例，SEC 建立最小可信入口和临时执行环境；PEI 发现并初始化 DRAM，产生描述已发现资源的 HOB；DXE 在可用内存上装载驱动、枚举总线并建立 Boot Services；BDS 按策略选择启动项；ExitBootServices 之后，操作系统接管普通设备与内存管理，只保留受约束的 Runtime Services。
+
+\begin{longtable}{L{0.14\linewidth}L{0.24\linewidth}L{0.28\linewidth}L{0.24\linewidth}}
+\toprule
+阶段 & 已可靠使用的资源 & 主要产物 & 不能提前假设 \\
+\midrule
+SEC & 复位入口、片上或临时存储 & 信任根、临时栈、PEI 入口 & DRAM 与完整设备树可用 \\\tablerowrule
+PEI & 临时环境、逐步可用的内存控制器 & DRAM、HOB、恢复路径选择 & 全部总线驱动已经装载 \\\tablerowrule
+DXE & 普通内存、固件驱动模型 & 设备协议、地址资源、启动服务 & 操作系统已经接管硬件 \\\tablerowrule
+BDS & 可访问的启动设备与文件系统 & 选中的启动项和加载映像 & 候选镜像一定可信或可启动 \\\tablerowrule
+OS 接管 & 固件发布的内存图与平台表 & 内核自己的驱动和策略 & Boot Services 仍可继续调用 \\
+\bottomrule
+\end{longtable}
+
+临时存储可能是片上 SRAM，也可能是特定处理器提供的 cache-as-RAM 模式；它容量小、属性受限，不能把在普通 DRAM 上成立的缓存、DMA 和并发假设直接搬过来。PEI 完成内存迁移时，还要把临时栈和关键上下文复制到 DRAM，再切换指针，任何仍引用旧地址的对象都会在稍后变成隐蔽故障。
+
+\topic{DRAM 训练是在二维时序窗口中寻找采样中心}
+
+固件先从 SPD 取得器件组织与时序能力，配置电源、参考时钟和内存控制器，然后进行写 leveling、读门控、逐 bit deskew、Vref 扫描和最小数据测试。训练不是“测出一个延迟”，而是在电压与时间二维窗口中找出具有足够左右、上下余量的工作点。
+
+设某个 DQ 的延迟线共有 64 个 tap，扫描发现 tap 18 到 42 连续通过。中心可选 $(18+42)/2=30$，左余量为 12 tap，右余量为 12 tap。若温度升高后通过窗口缩到 25 到 37，中心仍约为 31，但单侧余量只剩 6 tap；系统虽然还能启动，遥测却应记录训练裕量下降。只保存最终 tap=31 而不保存窗口边缘，就无法区分“宽窗口中心”和“勉强碰巧通过”。
+
+\begin{longtable}{L{0.18\linewidth}L{0.24\linewidth}L{0.28\linewidth}L{0.20\linewidth}}
+\toprule
+训练动作 & 调整对象 & 通过判据 & 失败后的有限动作 \\
+\midrule
+write leveling & DQS 相对时钟 & DRAM 在规定边界采到写选通 & 降速、改拓扑参数或下线 rank \\\tablerowrule
+read gate & 接收使能窗口 & 只在返回数据有效期内打开 & 重训或缩小可用速率 \\\tablerowrule
+bit deskew & 每个 DQ 延迟 & 所有 bit 均有连续通过区间 & 记录失败 lane/器件位置 \\\tablerowrule
+Vref 扫描 & 判决参考电压 & 电压和时间窗口均有余量 & 使用保守档位或拒绝启动 \\
+\bottomrule
+\end{longtable}
+
+\section{八、可信启动要同时防替换、防回滚和验证时刻竞争}
+
+不可变根用内置公钥或密钥摘要验证第一可变阶段，后者再验证下一阶段。签名证明镜像由授权密钥产生且内容未被修改，却不自动证明版本足够新，因此还要把镜像安全版本与单调防回滚计数比较。计数更新也必须容错：应先验证并试运行候选版本，确认它能可靠启动后再提交不可逆的最低版本，否则一次有缺陷的更新可能同时封死旧版本和新版本。
+
+“验证后才执行”还要求验证对象与执行对象是同一份内容。若验证 Flash 中的镜像后，DMA 或另一个处理器还能在执行前改写它，就存在检查与使用之间的竞争。工程上可从受保护缓冲区执行、锁定写权限，或让后续装载再次验证。测量日志同样要记录组件身份、版本、摘要算法和加载顺序，只有一串无法归属的哈希值不足以解释平台实际运行了什么。
+
+\topic{固件描述必须与资源分配形成双向核对}
+
+在典型 PC 平台，MADT 描述处理器与中断控制器，MCFG 描述 PCIe 配置空间窗口，SRAT/SLIT 描述 NUMA 亲和与距离，DMAR 或 IORT 类结构描述 DMA 重映射关系；嵌入式平台常用设备树表达类似的地址、时钟、中断与父子关系。名字不是重点，重点是每条描述都能回到真实硬件和已分配资源。
+
+例如设备的 BAR 被分到 \code{0x90000000--0x9000FFFF}，固件表却把同一区域标为普通可用 RAM，操作系统可能把页面分配给应用，而设备同时响应 MMIO，结果不是简单的“驱动失败”，而是地址所有权冲突。启动阶段应验证内存图中的 RAM、保留区、固件运行区和 MMIO 窗口互不非法重叠，并把冲突作为可定位错误停止移交。
+
+\section{九、A/B 更新是一台跨掉电运行的状态机}
+
+设元数据含 active、candidate、attempts 和 confirmed 四项。写候选槽时 active 保持不变；镜像写完并验证后才设置 candidate。下次启动先把 attempts 持久递增再跳转候选；操作系统完成自检后设置 confirmed 并原子切换 active。若在限制次数内未确认，启动器清除 candidate 并回到旧 active。
+
+\begin{longtable}{L{0.16\linewidth}L{0.25\linewidth}L{0.27\linewidth}L{0.22\linewidth}}
+\toprule
+掉电时刻 & 重启后可信事实 & 选择动作 & 至少一个可启动镜像 \\
+\midrule
+候选写到一半 & active 未变，candidate 未发布 & 继续旧槽 & 旧 active \\\tablerowrule
+候选已验证 & candidate 可试，active 仍有效 & 递增 attempts 后试启动 & 新候选或旧 active \\\tablerowrule
+首次启动中 & confirmed 尚未提交 & 有限重试，随后回退 & 旧 active \\\tablerowrule
+确认提交后 & 新槽成为 active & 正常启动新槽 & 新 active \\
+\bottomrule
+\end{longtable}
+
+这里的“原子”通常不是要求整个镜像一次写完，而是把大数据写入与小元数据提交分开，并让元数据自身带版本、校验和与双副本。恢复环境还应独立于两个普通槽，避免同一个解析器错误、供电故障或密钥配置错误同时破坏全部路径。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{1}
@@ -683,6 +774,16 @@ SPD 也是“软件怎么碰到硬件”的一个干净样本：它不产生数�
 \exercisecheck{题目}{设备被强行移除后，为何必须先处理 DMA 与 IOMMU 状态再释放缓冲页？}
 \end{chapterexercise}
 
+\begin{chapterexercise}{训练窗口}
+某 DQ 在 tap 11 到 35 通过。选择中心并计算左右余量；若温漂后窗口变为 20 到 30，比较裕量变化。
+\exercisecheck{检查要点}{不仅保存中心，还要保存窗口边缘}
+\end{chapterexercise}
+
+\begin{chapterexercise}{A/B 掉电}
+列出候选写入中、验证后、首次启动中和确认提交后四个掉电点的重启选择。
+\exercisecheck{检查要点}{active 在候选确认前始终可回退}
+\end{chapterexercise}
+
 \section*{参考解答与要点}
 
 \begin{chapteranswer}{1}
@@ -713,4 +814,14 @@ SPD 也是“软件怎么碰到硬件”的一个干净样本：它不产生数�
 \begin{chapteranswer}{6}
 热移除
 \answercheck{解答要点}{旧设备或在途事务仍可能写内存；须阻止新请求、隔离/失效 IOMMU 映射并确认 DMA 静止，再失败未决请求和释放页面。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{训练窗口}
+初始中心为 23，左右各 12 tap；温漂后中心为 25，左右各 5 tap。中心变化不大，但最小余量从 12 降到 5，风险显著增加。
+\answercheck{必须保留的检查点}{训练质量由窗口宽度而非单一中心值决定}
+\end{chapteranswer}
+
+\begin{chapteranswer}{A/B 掉电}
+写入中继续旧 active；验证后可试 candidate，失败仍回旧槽；首次启动中未 confirmed，按 attempts 有限重试后回退；确认提交后新槽成为 active。四处都不应让两个槽同时失去可选资格。
+\answercheck{必须保留的检查点}{大镜像写入与小元数据提交分离}
 \end{chapteranswer}

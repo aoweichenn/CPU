@@ -538,6 +538,89 @@ watchdog & 检测控制流长时间无进展 & 安全复位域、状态保留和
 \end{pdfdiagram}
 \diagramnote{平台错误从检测到恢复的闭环。恢复成功仍要验证数据与服务状态，并把错误趋势用于后续阈值和维护决策。}
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+\section{九、从 ECC 综合征走到可执行的错误策略}
+
+“有 ECC”只说明编码器与检查器存在，平台仍要定义综合征如何分类、数据是否可交付、证据写到哪里以及何时升级恢复。以扩展 Hamming SECDED 为例，普通 Hamming 校验给出 syndrome，额外总奇偶位给出 overall parity。四种组合决定不同动作。
+
+\begin{longtable}{L{0.18\linewidth}L{0.18\linewidth}L{0.26\linewidth}L{0.28\linewidth}}
+\toprule
+syndrome & overall parity & 解释 & 数据动作 \\
+\midrule
+0 & 0 & 未检测到错误 & 正常交付 \\\tablerowrule
+非 0 & 1 & syndrome 指向的单 bit 错误 & 翻转该 bit 后交付并记录 \\\tablerowrule
+0 & 1 & 额外总奇偶位自身出错 & 修正校验位并记录 \\\tablerowrule
+非 0 & 0 & 检测到双 bit 错误 & 不可按 syndrome 误纠正 \\
+\bottomrule
+\end{longtable}
+
+例如 syndrome 为 6 且 overall parity 为 1，可把码字第 6 位翻转后交付；若 syndrome 仍为 6 而 overall parity 为 0，则符合双 bit 错误模式，不能把第 6 位改掉后声称数据已经恢复。实际内存控制器还会交织多个器件与通道，syndrome 到“哪根 DQ、哪颗 DRAM”的映射必须结合布线和控制器配置解释。
+
+\topic{scrub 周期是容量、带宽与风险的共同预算}
+
+patrol scrub 周期性读取内存，使潜伏单 bit 错误在遇到第二个错误前被纠正并写回。若可用内存为 256 GiB，scrub 带宽为 1 GiB/s，一次完整扫描至少需 256 s；提高到 8 GiB/s 可降到 32 s。若内存可用带宽按 100 GiB/s 估算，1 GiB/s scrub 约占 1\%，但实际干扰还取决于 bank 冲突、刷新和业务局部性。
+
+周期太长会增大两个独立错误在同一码字累积的窗口，周期太短又会抢占带宽、增加功耗。平台应记录实际完成周期和被业务背压的时间，而不是只保存配置目标。发现已纠正错误后可以触发 demand scrub 或页面迁移，但要限制错误风暴下的额外流量，防止恢复动作本身压垮系统。
+
+\section{十、遏制边界决定错误能否从局部升级为全局}
+
+错误检测位置不一定就是污染边界。Cache 读出不可纠正数据时，可以把对应 line 标为 poison，阻止它被当成普通数据静默使用；互连把 poison 与请求身份带到消费端，操作系统再根据地址归属决定杀死进程、下线页面或升级机器检查。若 poison 位在协议桥处丢失，硬件虽然“检测过”，错误数据仍可能被设备或 CPU 使用。
+
+\begin{longtable}{L{0.16\linewidth}L{0.24\linewidth}L{0.28\linewidth}L{0.22\linewidth}}
+\toprule
+边界 & 必须保留的身份 & 可选遏制动作 & 升级条件 \\
+\midrule
+Cache/内存 & 物理地址、syndrome、读写类型 & 纠正、poison、失效 line & 数据已进入不可撤销状态 \\\tablerowrule
+互连 & requester、事务 ID、目标 & 错误响应、隔离端口 & 无法归属或协议状态失真 \\\tablerowrule
+I/O 设备 & BDF、PASID、队列、generation & 停队列、FLR、撤映射 & DMA 仍无法停止 \\\tablerowrule
+操作系统 & 页面、进程、文件或虚机所有者 & 下线页、杀任务、迁移服务 & 共享内核状态受污染 \\
+\bottomrule
+\end{longtable}
+
+deferred error 的意义正是“现在尚未消费，但未来使用前必须处理”。平台若只发一次日志却仍允许该页面被重新分配，就把确定的潜伏错误变成不确定的后续崩溃。错误状态要随对象生命周期移动：页面迁移后旧页下线，设备复位后旧 generation 拒绝，虚机迁移后错误归属仍能追到原工作负载。
+
+\topic{阈值策略要有时间窗、迟滞和有限状态}
+
+单次 corrected error 可以记录后继续，重复错误则可能预示器件劣化。阈值不能只写“超过 N 次告警”，还要说明对象和时间窗。例如同一物理页 24 小时内出现 4 次 corrected error 时迁移并下线；同一 DIMM 一小时内有 100 个不同页面报告错误时升级部件维护。前者捕捉局部弱单元，后者捕捉范围性问题。
+
+状态机可分为 healthy、watch、degraded 和 isolated。进入高风险状态用较高阈值，恢复到低风险状态用更低阈值并要求保持一段安静期，形成迟滞，避免温度或负载在边界附近抖动时反复下线和上线。所有阈值都要能回放：输入计数、窗口起点、状态转移原因和执行动作必须进入日志。
+
+\section{十一、共同故障域与恢复验收}
+
+两个副本只有在失效足够独立时才提供预期冗余。双电源若接在同一 PDU，双网卡若共用同一交换机，两个固件槽若由同一个易错更新器同时改写，都有共同故障域。可靠性图不能只数部件数量，还要沿电源、时钟、冷却、固件、布线和运维动作寻找共享依赖。
+
+恢复成功也不能只看“设备重新出现”。一块网卡复位后至少要验证：旧 DMA 不再发生，IOMMU 映射与新队列一致，旧 completion 被 generation 拒绝，中断向量只对应新队列，收发序号和统计没有重复或遗漏，上层连接按策略恢复。平台级故障注入的验收应写成不变量，而不是观察到一次成功 ping 就结束。
+
+\begin{keyidea}
+完整 RAS 闭环是：检测并分类，保存首错与趋势证据，阻止错误跨过遏制边界，选择重试/复位/降级，最后验证数据与服务不变量。任何“自动恢复”若缺少最后一步，都只能证明状态机执行过，不能证明系统恢复正确。
+\end{keyidea}
+
 \section*{章末练习}
 
 \begin{chapterexercise}{1}
@@ -570,6 +653,16 @@ watchdog & 检测控制流长时间无进展 & 安全复位域、状态保留和
 \exercisecheck{题目}{设计一次丢中断故障注入，说明预期检测、恢复和验收条件。}
 \end{chapterexercise}
 
+\begin{chapterexercise}{SECDED 分类}
+分别判断以下组合：syndrome=0/overall=1，syndrome=5/overall=1，syndrome=5/overall=0，并给出数据动作。
+\exercisecheck{检查要点}{双 bit 错误不能按 syndrome 误纠正}
+\end{chapterexercise}
+
+\begin{chapterexercise}{恢复验收}
+设备 FLR 后重新枚举成功。列出证明它可以安全恢复 DMA 队列的五项不变量。
+\exercisecheck{检查要点}{检查旧事务、地址映射、队列世代、中断与数据完整性}
+\end{chapterexercise}
+
 \section*{参考解答与要点}
 
 \begin{chapteranswer}{1}
@@ -600,4 +693,14 @@ watchdog & 检测控制流长时间无进展 & 安全复位域、状态保留和
 \begin{chapteranswer}{6}
 验证
 \answercheck{解答要点}{屏蔽一次完成中断但保留完成状态；预期 watchdog/轮询发现队列无进展，驱动读取完成并恢复中断；验收包括无重复完成、无请求遗失和错误计数正确。}
+\end{chapteranswer}
+
+\begin{chapteranswer}{SECDED 分类}
+0/1 表示额外总奇偶位错误，修正校验位；5/1 表示第 5 位单 bit 错误，翻转后交付并记录；5/0 表示检测到双 bit 错误，不得按位置 5 纠正。
+\answercheck{必须保留的检查点}{syndrome 必须与 overall parity 联合解释}
+\end{chapteranswer}
+
+\begin{chapteranswer}{恢复验收}
+确认旧 DMA 已静止，IOMMU 只含新映射，新 generation 拒绝旧完成，MSI-X 向量与新队列一致，描述符所有权与收发序号连续且无重复；随后再恢复上层流量。
+\answercheck{必须保留的检查点}{重新枚举只证明配置访问恢复}
 \end{chapteranswer}

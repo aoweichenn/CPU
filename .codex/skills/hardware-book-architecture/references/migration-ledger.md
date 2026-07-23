@@ -110,3 +110,14 @@
 | 第 10 章 | 多核内存模型、store buffer、acquire/release、屏障与 DMA 可见性对照 | verified |
 | 第 11 章 | AMAT、冲突 miss、非阻塞 Cache、MESI 暂态、目录一致性与 litmus trace | verified |
 | 第 12 章 | 真实 PTE 位字段、页表内存成本、TLB reach、page-walk cache、COW 与 shootdown 竞争 | verified |
+
+## 2026-07 互连、固件与平台可靠性深化批次
+
+本批次沿“请求进入互连、设备完成事务、固件建立平台、错误被检测并恢复”的通路补齐量化例子。新增内容先记为 `copied`；生成、内容审计、全书构建、代表页目视检查和手机导出均通过后再改为 `verified`。
+
+| 增补范围 | 内容单元 | 状态 |
+|---|---|---|
+| 第 17 章 | NoC 分包、虚通道、credit 账本、通道依赖死锁、QoS 与端到端时延 | verified |
+| 第 18 章 | PCIe MPS/MRRS、完成拆分、credit 窗口、排序属性、ACS/PASID 与恢复边界 | verified |
+| 第 21 章 | UEFI 阶段资源边界、DRAM 训练 trace、可信启动、ACPI/设备树核对与 A/B 更新 | verified |
+| 第 22 章 | ECC 综合征、scrub 预算、错误遏制、阈值升级、共同故障域与恢复验收 | verified |
