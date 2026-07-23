@@ -1,6 +1,6 @@
 ---
 name: hardware-book-architecture
-description: Plan, restructure, expand, renumber, audit, export, or publish the LaTeX book `books/hardware-zero-to-machine` while preserving every existing content unit. Use for changes to the book's parts, chapter sequence, storage coverage, hardware learning path, chapter migration, content-loss validation, phone export, or final commit and push.
+description: Plan, restructure, expand, typeset, polish, audit, export, or publish the LaTeX book `books/hardware-zero-to-machine` while preserving every existing content unit. Use for changes to parts or chapters, storage coverage, prose, tables, checklists, exercises, pseudocode, diagrams, fonts, PDF layout, content-loss validation, phone export, or final commit and push.
 ---
 
 # Hardware Book Architecture
@@ -11,11 +11,14 @@ Treat the approved 7-part, 26-chapter structure as the default target. Preserve 
 
 Read these references completely before planning or editing:
 
-1. `references/architecture-26-chapters.md`
-2. `references/migration-ledger.md`
-3. For prose editing, rewriting, expansion, or polishing, also read `references/editorial-style.md`.
+1. **On every invocation, without exception:** `references/user-book-rules.md`. Load it before inspecting, planning, answering a book-status question, or editing, even when the requested change appears small.
+2. `references/architecture-26-chapters.md`
+3. `references/migration-ledger.md`
+4. For prose editing, rewriting, expansion, or polishing, also read `references/editorial-style.md`.
 
 Treat an explicit user instruction as higher priority than these references. Do not change the 26-chapter target merely to make migration easier.
+
+Before finishing any manuscript change, explicitly check the applicable non-negotiable rules from `user-book-rules.md`; a successful LaTeX compile alone is not sufficient.
 
 ## Keep rules outside the manuscript
 
@@ -69,3 +72,9 @@ After regeneration, run `python3 .codex/skills/hardware-book-architecture/script
 Treat algorithms, state machines, transactions, training/recovery procedures, control loops, and micro-operation traces as pseudocode. Give every such `lstlisting` at least one comment about how state or ownership advances and one comment about its completion, commit, failure, or recovery boundary. Do not relabel equations, terminal transcripts, data layouts, or real Verilog/C/assembly examples as pseudocode merely to raise the count; preserve their native comments instead.
 
 Register generated-chapter pseudocode in `scripts/build_26_chapters.py` with a stable first-line prefix and expected occurrence count. Regenerate rather than hand-editing `chapters26`, then run `python3 .codex/skills/hardware-book-architecture/scripts/audit_pseudocode_comments.py`. A moved, missing, duplicated, unannotated, or multiply annotated registered block is a publishing failure.
+
+## Enforce table readability
+
+Keep chapter-end exercises out of tables and render them with the numbered exercise/answer environments. Give every reachable body table and checklist visible row and column separators. Split page-filling longtables into contextual chunks instead of shrinking them.
+
+After regeneration, run `python3 .codex/skills/hardware-book-architecture/scripts/audit_table_rules.py`. Then render and inspect representative body tables, split longtables, and every back-matter checklist at normal page size; source-level rules and a clean compile do not replace PDF visual inspection.

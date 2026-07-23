@@ -132,6 +132,7 @@ REFERENCE_CLEANUPS = (
 TARGET_REPLACEMENTS = {
     2: (("独占整章", "独占一个完整部分"),),
     9: (("独占整章", "独占一个完整部分"),),
+    13: (("Fine-granularity (REFfg)", r"Fine-\allowbreak granularity (REFfg)"),),
     20: (("前面七章", "前面的数字与处理器章节"),),
     25: (("前面十四章", "前面二十四章"),),
     26: (("前面七章", "前面二十五章"),),
@@ -1004,7 +1005,7 @@ def split_oversized_longtables(text: str) -> str:
 
 
 def add_longtable_row_rules(text: str) -> str:
-    """Add subtle horizontal separators between body rows of every remaining table."""
+    """Add clearly visible horizontal separators between body rows of every table."""
     end_token = r"\end{longtable}"
     position = 0
     output: list[str] = []
@@ -1035,6 +1036,17 @@ def add_longtable_row_rules(text: str) -> str:
         position = end + len(end_token)
     output.append(text[position:])
     return "".join(output)
+
+
+def style_checklist_tables(text: str) -> str:
+    """Render intact checklist content with the book's strong row/column grid."""
+
+    def replace_columns(match: re.Match[str]) -> str:
+        spec = match.group(1).replace("p{", "L{")
+        return rf"\begin{{longtable}}{{{spec}}}"
+
+    styled = re.sub(r"\\begin\{longtable\}\{([^\n]+)\}", replace_columns, text)
+    return add_longtable_row_rules(styled)
 
 
 def _annotation_token(body: str) -> str:
@@ -1226,6 +1238,13 @@ def main() -> int:
     for stale in output_dir.glob("ch*.tex"):
         if stale not in expected_outputs:
             stale.unlink()
+
+    checklist_source = source_dir.parent / "backmatter/checklist.tex"
+    checklist_output = source_dir.parent / "backmatter/checklist-rendered.tex"
+    checklist_output.write_text(
+        style_checklist_tables(checklist_source.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
 
     print(
         f"built {len(CHAPTERS)} chapters from {len(expected)} legacy content units; "
