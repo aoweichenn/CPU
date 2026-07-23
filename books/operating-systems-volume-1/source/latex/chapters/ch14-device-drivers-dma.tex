@@ -49,6 +49,86 @@ DMA & 准备 buffer 和描述符，让设备直接搬运内存 & buffer 生命�
 
 驱动和前面章节的连接也要明确：提交请求时可能让当前 task 睡眠，completion 到来后要唤醒 wait queue；DMA buffer 来自页分配器和虚拟内存系统；设备错误最终要通过 fd、socket、块层或文件系统返回给用户；权限和 namespace 决定用户能否打开这个设备。驱动不是孤立章节，而是硬件异步事件进入 OS 对象系统的入口。
 
+\section{从发现设备到安全移除}
+
+\subsection{为什么设备和驱动要成为两个对象}
+
+若内核为每一块具体硬件直接写一段固定初始化代码，单一机器可以启动，但设备替换、热插拔、
+休眠恢复和同类多设备都会使这套做法失效。内核必须分别保存两类事实：机器上实际出现了
+哪些设备，以及当前有哪些软件能够控制某类设备。前者形成 device 对象，后者形成 driver 对象。
+
+两者通过可匹配的身份信息建立绑定。例如总线发现一个设备后，先登记设备身份、资源范围和
+父子关系；驱动注册时声明自己支持哪些身份。匹配成功只说明“可以尝试控制”，还不能立即向
+用户发布设备，因为初始化过程中仍可能缺少中断、DMA 队列或电源资源。
+
+\begin{lstlisting}
+discover device
+  -> create device object
+  -> match a compatible driver
+  -> probe and acquire resources
+  -> initialize queues and interrupt handling
+  -> publish usable interface
+\end{lstlisting}
+
+这个顺序使失败保持局部。若初始化队列失败，驱动释放此前取得的资源，device 对象仍可保留
+为“已发现但尚不可用”，也可以等待另一个驱动；如果在资源尚未齐备时就提前创建设备节点，
+用户请求可能进入一个半初始化对象。
+
+\subsection{probe 为什么是一项可回滚事务}
+
+一次初始化通常按顺序取得寄存器映射、中断向量、DMA 能力、队列内存、设备固件和上层注册。
+任一步都可能失败。资源释放必须采用相反顺序，因为较后的对象往往引用较早的对象：队列使用
+DMA 映射，完成路径使用中断，用户接口引用队列和设备状态。
+
+\begin{lstlisting}
+probe(dev):
+  regs = map_registers(dev)
+  irq = allocate_interrupt(dev)
+  queues = allocate_dma_queues(dev)
+  reset_and_negotiate(dev)
+  start_device(dev, queues)
+  publish_interface(dev)
+  return success
+
+on failure:
+  unpublish_if_needed()
+  stop_device_if_started()
+  free_dma_queues()
+  release_interrupt()
+  unmap_registers()
+\end{lstlisting}
+
+这里的提交点是向其他子系统发布可用接口。在此之前，错误只需释放私有资源；在此之后，
+关闭和移除还必须阻止新请求，并处理已经取得对象引用的调用者。托管资源可以减少遗漏，
+但不会替驱动决定设备是否仍在 DMA、请求是否已完成以及用户接口何时不可见。
+
+\subsection{移除为何不能直接释放对象}
+
+设备被拔出或驱动卸载时，仍可能存在三类活动：尚未提交到设备的新请求、设备已经接收的
+in-flight 请求，以及持有 fd 或其他引用的用户。若移除路径直接释放队列和 DMA buffer，
+迟到的中断或设备写入就可能访问已经复用的内存。
+
+安全移除通常先把设备状态改为 quiescing，使新请求立即失败或留在上层；随后停止队列、
+屏蔽并同步中断，等待设备不再访问 DMA 映射；未完成请求以明确错误完成；最后撤销用户可见
+接口并等待对象引用归零。只有这些条件同时成立，寄存器、队列和设备对象才能释放。
+
+\begin{longtable}{@{}F{0.19\linewidth}F{0.38\linewidth}F{0.33\linewidth}@{}}
+\toprule
+\rowcolor{BookBlueTint}
+阶段 & 必须建立的事实 & 过早进入下一阶段的后果 \\
+\midrule
+停止接收 & 新请求不能再进入设备队列 & 关闭过程永远追不上新提交 \\\tablerowrule
+终止设备访问 & 设备不再读取描述符或 DMA buffer & 设备访问已释放内存 \\\tablerowrule
+同步完成路径 & 旧中断和延后工作已经退出 & 迟到完成使用旧 request 或 tag \\\tablerowrule
+完成未决请求 & 所有等待者收到成功或错误 & 线程永久睡眠，引用无法归零 \\\tablerowrule
+撤销与释放 & 接口不可见且外部引用为零 & 用户通过旧 fd 进入已销毁对象 \\
+\bottomrule
+\end{longtable}
+
+复位是同一问题的较小版本。复位前后的请求 tag 可能数值相同，因此驱动还需要 generation
+或等价状态区分旧队列和新队列。完成记录只有同时匹配队列世代和活动请求，才能成为释放
+buffer 的证据。
+
 \section{设备队列与中断行为观察}
 
 先画一个网卡或磁盘的描述符环：
@@ -187,7 +267,7 @@ poll(budget):
 \item 设备 reset 后，驱动能清理 in-flight 请求并通知上层失败。
 \end{itemize}
 
-\subsection{本章压缩进来的块层与提交顺序}
+\subsection{设备完成如何支撑上层提交}
 
 块层原本可以单独讲很久，但放在设备章里看更清楚：它是把文件系统的逻辑读写转换成设备队列 request 的中间层。文件系统提交的是 bio，描述“文件系统需要这些扇区读写”；blk-mq 把 bio 合并、排序、分派给硬件队列；驱动把 request 变成设备描述符；completion 再把错误和字节数一路传回等待者。
 
@@ -279,9 +359,9 @@ tx_complete(desc):
 
 IOMMU 为设备建立地址空间，限制设备只能 DMA 到授权页。没有 IOMMU 或映射错误时，设备 bug 可能覆盖任意内存；有 IOMMU 时，错误 DMA 会变成 IOMMU fault，至少能阻止破坏扩大。
 
-\subsection{NAPI、NVMe 与 virtio 阅读入口}
+\subsection{NAPI、NVMe 与 virtio 的共同队列模型}
 
-网络驱动可读 \filepath{drivers/net/ethernet/intel/e1000e/} 或 virtio-net；NVMe 可读 \filepath{drivers/nvme/host/}；virtio 核心可读 \filepath{drivers/virtio/}。阅读时按同一模板：
+网络设备、NVMe 与 virtio 的具体队列格式不同，但都可以按同一组问题分析：
 
 \begin{enumerate}
 \tightlist

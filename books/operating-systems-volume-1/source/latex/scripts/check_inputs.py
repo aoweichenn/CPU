@@ -15,7 +15,7 @@ INPUT_RE = re.compile(r"\\input(?:topic|detail)?\{([^}]+)\}")
 CHAPTER_INPUT_RE = re.compile(r"^\\input\{chapters/([^}]+)\}", re.MULTILINE)
 
 EXPECTED_PARTS = 4
-EXPECTED_CHAPTERS = 15
+EXPECTED_CHAPTERS = 18
 # The OS volume starts at kernel objects; hardware and bare-metal material live separately.
 EXPECTED_CHAPTER_INPUTS = (
     "ch01-os-map-and-contracts",
