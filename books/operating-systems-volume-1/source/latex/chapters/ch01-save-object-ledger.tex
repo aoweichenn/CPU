@@ -1,0 +1,163 @@
+\section{把一次写入展开为对象账本}
+
+前面已经沿调用顺序列出了 fd、打开文件对象、inode、page cache 和 request。仅知道这些
+名称仍然不足以解释一次写入：fd 为什么能够共享偏移，修改文件内容时为什么还要修改 inode，
+系统调用已经返回时又是谁继续记住尚未完成的设备请求。要回答这些问题，必须把对象之间的
+引用和每个对象保存的状态同时展开。
+
+\subsection{整数 fd 只负责找到一次打开实例}
+
+设进程先后执行 \code{open("data", O_RDWR)} 和 \code{dup(fd)}。两个整数槽位指向同一个
+打开文件对象，因此它们共享当前偏移；另一个进程独立 \code{open} 同一路径时，会得到新的
+打开文件对象，偏移互不影响。三次打开最终可以指向同一个 inode，因为 inode 表示文件身份，
+而不是某一次打开行为。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=35mm, minimum height=45mm] (fdt) at (0,0) {};
+  \node[os title] at (0,17mm) {进程 P 的 fd table};
+  \node[os small block, minimum width=25mm] (fd3) at (0,8mm) {槽 3};
+  \node[os small block, minimum width=25mm] (fd7) at (0,-4mm) {槽 7};
+  \node[os small block, minimum width=25mm] (fd9) at (0,-16mm) {槽 9};
+
+  \node[os compute, minimum width=44mm, minimum height=30mm] (of1) at (58mm,7mm) {};
+  \node[os title] at (58mm,17mm) {打开文件对象 A};
+  \node[os label, fill=none, text=BookInk] at (58mm,7mm)
+    {\code{f\_pos=4096}\\\code{flags=O\_RDWR}\\引用计数、操作方法};
+  \node[os compute, minimum width=44mm, minimum height=25mm] (of2) at (58mm,-23mm) {};
+  \node[os title] at (58mm,-15mm) {打开文件对象 B};
+  \node[os label, fill=none, text=BookInk] at (58mm,-24mm)
+    {\code{f\_pos=0}\\独立的一次打开};
+
+  \node[os memory, minimum width=45mm, minimum height=38mm] (ino) at (125mm,-4mm) {};
+  \node[os title] at (125mm,10mm) {inode：文件身份};
+  \node[os label, fill=none, text=BookInk] at (125mm,-4mm)
+    {文件长度、权限、时间戳\\数据块映射、缓存映射\\引用与写回状态};
+
+  \draw[os strong bus] (fd3.east) -- (of1.west |- fd3.east);
+  \draw[os strong bus] (fd7.east) -- (of1.west |- fd7.east);
+  \draw[os bus] (fd9.east) -- (of2.west);
+  \draw[os strong bus] (of1.east) -- (ino.west |- of1.east);
+  \draw[os bus] (of2.east) -- (ino.west |- of2.east);
+  \node[os label] at (28mm,15mm) {\code{dup} 后共享};
+  \node[os label] at (91mm,14mm) {指向同一文件身份};
+\end{pdfdiagram}
+\diagramnote{fd、打开文件对象与 inode 的引用关系。槽 3 和槽 7 共享打开文件对象 A，所以任一槽推进 \code{f_pos}，另一个槽随后观察到同一偏移；槽 9 拥有独立偏移，但三个槽最终可以到达同一个 inode。}
+
+这三个层次不能合并为一个“文件结构”。fd table 是进程看到的句柄空间，它要处理分配、
+关闭和 close-on-exec；打开文件对象保存一次打开行为的可变状态；inode 保存不依赖某次
+打开的文件身份和元数据。若把偏移直接放进 inode，所有独立打开者都会相互改变读写位置；
+若把权限和数据块映射放进 fd 槽位，\code{dup}、进程间传递 fd 以及关闭其中一个槽位都会
+失去明确语义。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.25\linewidth}|L{0.20\linewidth}|}
+\hline
+对象 & 关键状态 & 主要修改者 & 生命周期边界 \\ \hline
+fd 槽位 & 指向打开文件对象的引用、fd 级标志 & \code{open}、\code{dup}、\code{close}、\code{exec} & 槽位关闭后可被后续 \code{open} 复用 \\ \hline
+打开文件对象 & 当前偏移、打开标志、引用计数、操作方法 & \code{read}/\code{write}/\code{lseek} 与引用管理路径 & 最后一个 fd、映射或内核引用消失后释放 \\ \hline
+inode & 文件类型、长度、权限、时间戳、数据映射与缓存入口 & 文件系统元数据路径和写回路径 & 链接与打开引用都消失后才可回收身份 \\ \hline
+缓存页 & 页索引、内容、dirty、writeback 与 error 状态 & 读写路径、回写线程、I/O 完成路径 & 与映射脱离且无人引用、无人回写后才能回收 \\ \hline
+\end{longtable}
+
+\subsection{一次 write 同时推进三个位置}
+
+假设打开文件对象的 \code{f_pos} 为 4096，用户请求写入 6000 字节。文件页大小为 4096
+字节，因此这次请求会修改文件页索引 1 和 2：第一页从页内偏移 0 写到末尾，共 4096
+字节；第二页从页首写入 1904 字节。若原文件只有 5000 字节，成功推进全部数据后，文件
+长度变为 10096。
+
+这里至少有三个位置不能混为一个数值：用户缓冲区已经消费到哪里，打开文件对象的顺序偏移
+推进到哪里，文件内容的哪几个缓存页被修改。它们通常一起推进，但在缺页、短写或空间不足时
+可能停在不同边界。
+
+\begin{pdfdiagram}
+  \node[os state, minimum width=42mm] (before) at (0,16mm)
+    {调用前\\\code{f\_pos=4096}\\\code{i\_size=5000}};
+  \node[os control, minimum width=44mm] (req) at (0,-8mm)
+    {用户请求\\\code{buf[0..5999]}};
+
+  \node[os memory, minimum width=42mm] (p1) at (57mm,16mm)
+    {缓存页 index 1\\文件区间 4096--8191\\写入 4096 B};
+  \node[os memory, minimum width=42mm] (p2) at (57mm,-12mm)
+    {缓存页 index 2\\文件区间 8192--12287\\写入 1904 B};
+
+  \node[os compute, minimum width=46mm] (after) at (126mm,5mm)
+    {成功后的可见状态\\\code{f\_pos=10096}\\\code{i\_size=10096}\\page 1、2 为 dirty};
+
+  \draw[os strong bus] (before.east) -- node[os label, above]{定位起点} (p1.west);
+  \draw[os strong bus] (req.east) -- (p1.west |- req.east);
+  \draw[os strong bus] (p1.south) -- (p2.north);
+  \draw[os strong bus] (p1.east) -- (after.west |- p1.east);
+  \draw[os strong bus] (p2.east) -- (after.west |- p2.east);
+\end{pdfdiagram}
+\diagramnote{6000 字节写入的字段变化。写入不是“把一个 buffer 交给文件”这一项动作，而是把用户缓冲区进度映射到两个缓存页，并在成功范围确定后推进打开文件偏移与文件长度。dirty 表示内存副本已修改，不表示设备已经完成。}
+
+若第二个缓存页准备失败，系统调用可能只返回 4096。此时不能把整个操作回滚成“零字节
+发生”，因为第一页内容已经进入 page cache；也不能返回 6000，因为后 1904 字节没有被
+接受。返回值 4096 是本次调用的提交边界，调用者下一次应从 \code{buf+4096} 继续。顺序
+文件偏移也只能推进到 8192，不能提前写成 10096。
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.21\linewidth}|L{0.20\linewidth}|L{0.23\linewidth}|L{0.11\linewidth}|}
+\hline
+时刻 & 用户缓冲进度 & 打开文件偏移 & inode 与缓存页 & 可返回结果 \\ \hline
+进入写路径 & 0/6000 & 4096 & 原长度 5000，页 1 含旧内容 & 尚未决定 \\ \hline
+页 1 复制完成 & 4096/6000 & 暂存为 8192 & 页 1 已修改并标 dirty，长度至少可到 8192 & 可形成短写 4096 \\ \hline
+页 2 准备失败 & 停在 4096 & 提交为 8192 & 页 2 未获得可提交的新内容 & 返回 4096 \\ \hline
+两页均完成 & 6000/6000 & 提交为 10096 & 页 1、2 dirty，长度为 10096 & 返回 6000 \\ \hline
+\end{longtable}
+
+这个例子说明“保存状态”不是泛指把若干字段留在内存中。每个字段都回答一个独立问题：
+\code{f_pos} 决定下一次顺序访问从哪里开始，\code{i_size} 决定读者能够到达的文件末端，
+缓存页的 dirty 位决定回写路径是否必须处理它，系统调用返回值则把本次已经提交的前缀告诉
+调用者。字段之间需要按同一个成功范围更新，否则重试会重复、遗漏或越过尚未形成的数据。
+
+\subsection{系统调用返回后，异步请求接管未完成状态}
+
+普通缓冲写可以在数据进入 page cache 后返回。稍后的写回路径要把多个 dirty 页组织成
+块请求，并把完成责任交给设备。函数调用栈此时早已返回，未完成信息必须进入长期对象。
+一个最小请求记录至少需要保存操作类型、设备范围、缓冲区片段、请求身份、剩余子操作数和
+最终状态；只有请求对象持有这些信息，设备中断才能知道自己完成的是哪项工作。
+
+\begin{pdfdiagram}
+  \node[os memory, minimum width=39mm, minimum height=42mm] (pages) at (0,0) {};
+  \node[os title] at (0,15mm) {dirty 缓存页};
+  \node[os label, fill=none, text=BookInk] at (0,3mm)
+    {inode + 页索引\\锁定/回写标志\\页内容与错误状态};
+
+  \node[os state, minimum width=46mm, minimum height=48mm] (rq) at (59mm,0) {};
+  \node[os title] at (59mm,18mm) {request};
+  \node[os label, fill=none, text=BookInk] at (59mm,1mm)
+    {操作：WRITE\\LBA 与长度\\buffer/segment 列表\\tag、pending、status};
+
+  \node[os compute, minimum width=43mm, minimum height=36mm] (desc) at (124mm,8mm)
+    {设备队列描述符\\地址、长度、方向\\请求 tag};
+  \node[os control, minimum width=43mm, minimum height=30mm] (cpl) at (124mm,-27mm)
+    {completion\\tag、完成状态\\错误与实际长度};
+
+  \draw[os strong bus] (pages.east) -- node[os label, above]{建立回写所有权} (rq.west);
+  \draw[os strong bus] (rq.east) -- (desc.west);
+  \draw[os feedback] (desc.south) -- node[os label, right]{设备稍后写回} (cpl.north);
+  \draw[os feedback] (cpl.west) -| node[os label, below, pos=0.25]{按 tag 找回请求} (rq.south);
+\end{pdfdiagram}
+\diagramnote{系统调用返回后的状态承接。request 把缓存页与设备描述符联系起来；completion 只携带足以定位原请求的身份和结果。中断路径按 tag 找回 request，合并子操作状态，最后解除缓存页的 writeback 状态并唤醒等待者。}
+
+\begin{longtable}{|L{0.17\linewidth}|L{0.29\linewidth}|L{0.25\linewidth}|L{0.19\linewidth}|}
+\hline
+请求字段 & 保存的事实 & 谁写入或更新 & 何时不再需要 \\ \hline
+operation、range & 读或写、设备起点和长度 & 块层在提交前确定 & 所有子操作完成后 \\ \hline
+segment list & 哪些内存区间归本次 DMA 使用 & 映射与拆分路径建立 & 设备不再访问且 DMA 解除映射后 \\ \hline
+tag & completion 应归属哪个在途请求 & 队列分配器在提交时分配 & completion 已消费且 tag 归还后 \\ \hline
+pending & 还有多少子操作尚未结束 & 提交时设定，完成路径递减 & 归零时形成请求级完成 \\ \hline
+status & 第一项或聚合后的错误结果 & 设备完成路径更新 & 上层读取并传播结果后 \\ \hline
+通知目标 & 完成后通知谁或继续哪个阶段 & 请求建立者登记 & 通知已经交付、引用已经释放后 \\ \hline
+\end{longtable}
+
+完成路径的提交点不是“中断已经发生”，而是所有属于该请求的完成项都已核对，设备不再拥有
+buffer，最终状态已经发布。只有到这一边界，等待 \code{fsync} 的 task 才能被唤醒，缓存页
+才能从 writeback 转为 clean 或 error。若过早解除页面所有权，页面可能在 DMA 尚未结束时
+被改写或回收；若遗漏错误状态，调用者会把设备失败误解释为可靠保存。
+
+\begin{keyidea}
+内核对象的必要性来自时间跨度和共享关系：当一次工作会越过当前函数调用、由另一条执行路径
+继续，或者需要在失败后说明已经完成的前缀时，相关状态就必须进入有身份、有所有者和有
+生命周期的对象。字段不是实现装饰，而是后续路径重新取得上下文的依据。
+\end{keyidea}

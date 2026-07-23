@@ -1,0 +1,424 @@
+\section{从一条执行流推导 task 的具体结构}
+
+状态机说明了 task 可以在 RUNNING、RUNNABLE 和 BLOCKED 之间移动，但还没有回答一个更
+基础的问题：task 被移出 CPU 以后，系统究竟靠哪些数据把它恢复回来。不能只回答“保存
+上下文”，因为用户态返回现场、内核函数调用现场、地址空间身份和调度队列位置并不是同一类
+状态，也不是在同一时刻保存。
+
+\subsection{暂停一条执行流需要保留哪些事实}
+
+设线程 T 正在用户态执行，随后调用 \code{read}，因 socket 暂无数据而阻塞。若将来要让
+它像普通函数返回一样继续，系统至少要回答五个问题：
+
+\begin{enumerate}
+\tightlist
+\item 返回用户态时，下一条指令在哪里，用户栈顶在哪里，条件码和通用寄存器应是什么值；
+\item 阻塞发生在内核调用链的哪一层，恢复内核执行时应使用哪一片内核栈；
+\item 用户虚拟地址应按哪套页表解释，线程又引用哪一组文件、凭据和信号状态；
+\item 线程当前能否运行，若能运行位于哪个 CPU 的哪个运行队列，若不能运行正在等待什么；
+\item 谁仍然引用这条执行流，它退出以后哪些结果要保留到父进程读取。
+\end{enumerate}
+
+这五类事实变化频率不同。寄存器可能在每次入口与切换时变化，地址空间通常在 \code{exec}
+或映射操作时变化，文件表可能在 \code{open}/\code{close} 时变化，调度字段会在每次
+入队、出队和运行核算时变化。把全部内容每次都复制一遍既昂贵又容易失去共享语义，因此
+task 通常内嵌线程私有和调度所需的热状态，再通过引用连接体积更大、可能由多线程共享的
+资源对象。
+
+\begin{pdfdiagram}[scale=0.90]
+  \node[os state, minimum width=49mm, minimum height=72mm] (task) at (0,0) {};
+  \node[os title] at (0,29mm) {task：可调度实体};
+  \node[os label, fill=none, text=BookInk] at (0,10mm)
+    {身份：tid、进程关系\\状态：state、on\_rq、cpu\\调度：policy、weight、vruntime\\
+     现场：kernel\_sp、switch frame\\等待：wait node、wake reason\\引用：mm、files、cred、signal};
+
+  \node[os memory, minimum width=42mm] (ks) at (62mm,25mm)
+    {每线程内核栈\\入口帧、调用帧\\调度切换帧};
+  \node[os memory, minimum width=42mm] (mm) at (62mm,3mm)
+    {地址空间对象\\VMA、页表根\\地址空间标识};
+  \node[os memory, minimum width=42mm] (files) at (62mm,-19mm)
+    {文件与目录状态\\fd table、cwd\\打开对象引用};
+
+  \node[os compute, minimum width=44mm] (rq) at (126mm,24mm)
+    {每 CPU runqueue\\current、候选集合\\锁、时钟、统计};
+  \node[os control, minimum width=44mm] (wq) at (126mm,-8mm)
+    {wait queue\\等待谓词、节点\\唤醒回调};
+  \node[os compute, minimum width=44mm] (shared) at (126mm,-28mm)
+    {进程共享对象\\凭据、信号处理\\namespace、cgroup};
+
+  \draw[os strong bus] (task.east |- ks.west) -- (ks.west);
+  \draw[os bus] (task.east |- mm.west) -- (mm.west);
+  \draw[os bus] (task.east |- files.west) -- (files.west);
+  \draw[os strong bus] (ks.east) -- (rq.west);
+  \draw[os feedback] (task.east |- wq.west) -- (wq.west);
+  \draw[os bus] (files.east) -- (shared.west);
+\end{pdfdiagram}
+\diagramnote{task 不是“进程全部资源的盒子”。它保存恢复执行和参加调度所需的私有状态，并引用地址空间、文件表和安全状态。运行时，task 由某个 CPU 的 current 到达；阻塞时，由等待队列节点到达；两种位置必须互斥。}
+
+下面给出一份教学化的最小结构。它不承诺某个内核版本的二进制布局，但字段分组对应真实
+实现必须承担的责任。省略某个字段并不表示责任消失，而是意味着它必须由另一个可到达对象
+保存。
+
+\begin{lstlisting}
+struct Task {
+  // Identity and lifetime
+  TaskId tid;
+  ProcessId tgid;
+  RefCount refs;
+  Task *parent;
+
+  // Scheduler-owned state
+  TaskState state;
+  bool on_rq;
+  CpuId cpu;
+  SchedEntity se;       // weight, vruntime/deadline, queue node
+
+  // Architecture-owned execution state
+  Address kernel_sp;
+  SwitchFrame switch_frame;
+  ExtendedState *fp_vector;
+  TrapFrame *user_return_frame;
+
+  // Wait and wakeup linkage
+  WaitNode wait_node;
+  WakeReason wake_reason;
+
+  // Shared process resources, reached by references
+  AddressSpace *mm;
+  FileTable *files;
+  Credentials *cred;
+  SignalState *signal;
+};
+\end{lstlisting}
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.28\linewidth}|L{0.27\linewidth}|L{0.18\linewidth}|}
+\hline
+字段组 & 回答的问题 & 主要修改路径 & 一致性要求 \\ \hline
+\code{state/on_rq/cpu} & 能否运行，位于哪个 CPU 的何处 & 阻塞、唤醒、调度与迁移 & 状态、队列成员关系和 CPU 归属必须共同更新 \\ \hline
+\code{kernel_sp/switch_frame} & 下次进入该 task 的内核执行流从哪里继续 & 架构切换例程 & 保存完成前不能让别的 CPU 恢复同一 task \\ \hline
+\code{user_return_frame} & 离开内核时恢复哪份用户态现场 & 系统调用、异常和中断入口/出口 & 必须属于该线程当前内核栈，且返回前经过权限检查 \\ \hline
+\code{mm/files/cred} & 地址、句柄和权限按哪套资源解释 & fork、exec、资源更新与退出 & 共享用引用表达，最后引用消失前对象不能释放 \\ \hline
+\code{wait_node/wake_reason} & 正在等待哪个条件，为何恢复 & 等待对象和唤醒路径 & 节点只能属于一个等待队列，醒后必须清理并复查谓词 \\ \hline
+\end{longtable}
+
+\subsection{线程私有状态与进程共享状态怎样分开}
+
+同一进程内的两个线程可以使用同一虚拟地址和同一 fd，却不能使用同一套栈指针和同一片内核
+栈。若 T1 在函数 A 中暂停，T2 在函数 B 中暂停，两者的返回地址、局部变量和寄存器不同；
+但 T1 调用 \code{close(3)} 后，T2 再访问 fd 3 会观察到文件表变化。前者要求分别保存，
+后者要求共享引用。
+
+\begin{pdfdiagram}[scale=0.90]
+  \node[os state, minimum width=42mm] (t1) at (0,20mm)
+    {线程 T1\\用户 RIP/RSP\\内核栈、调度实体\\信号屏蔽、等待节点};
+  \node[os state, minimum width=42mm] (t2) at (0,-20mm)
+    {线程 T2\\用户 RIP/RSP\\内核栈、调度实体\\信号屏蔽、等待节点};
+
+  \node[os memory, minimum width=51mm, minimum height=66mm] (shared) at (62mm,0) {};
+  \node[os title] at (62mm,27mm) {两条引用到达同一组进程对象};
+  \node[os label, fill=none, text=BookInk] at (62mm,12mm)
+    {地址空间\\代码、堆、共享映射、页表根};
+  \draw[os guide] (39mm,1mm) -- (85mm,1mm);
+  \node[os label, fill=none, text=BookInk] at (62mm,-8mm)
+    {文件表\\fd 0、1、2、3…};
+  \draw[os guide] (39mm,-17mm) -- (85mm,-17mm);
+  \node[os label, fill=none, text=BookInk] at (62mm,-25mm)
+    {信号处理、凭据、进程关系};
+
+  \node[os compute, minimum width=44mm] (cpu0) at (128mm,20mm)
+    {CPU0 current=T1\\只恢复 T1 现场};
+  \node[os compute, minimum width=44mm] (cpu1) at (128mm,-20mm)
+    {CPU1 current=T2\\只恢复 T2 现场};
+
+  \draw[os bus] (t1.east) -- (shared.west |- t1.east);
+  \draw[os bus] (t2.east) -- (shared.west |- t2.east);
+  \draw[os strong bus] (shared.east |- cpu0.west) -- (cpu0.west);
+  \draw[os strong bus] (shared.east |- cpu1.west) -- (cpu1.west);
+\end{pdfdiagram}
+\diagramnote{两个线程各自保存可独立暂停和恢复的执行现场，却通过引用共享进程资源。共享不是把全部字段复制成相同值，而是让两个 task 到达同一对象；私有不是禁止访问同一内存，而是每个 task 有自己的恢复位置和调度归属。}
+
+这一区分也解释了线程创建为何比独立进程创建少做一部分工作：它可以增加共享对象引用，
+不必复制一套独立地址空间；但它仍需分配用户栈、内核栈、task、调度实体和初始寄存器现场。
+反过来，进程隔离更强，是因为地址空间、文件表和安全状态可以独立管理，而不是因为“进程
+拥有寄存器、线程没有”。
+
+\section{两类现场：用户返回帧与调度切换帧}
+
+“保存寄存器”最容易造成误解，因为入口路径和任务切换路径保存的集合不同。用户程序通过
+系统调用、异常或中断进入内核时，内核需要保留一份足以返回用户态的现场；调度器从 task A
+切到 task B 时，只需保存内核调用约定规定的长期存活寄存器和内核栈位置。前者称为
+\emph{用户返回帧（trap frame）}，后者称为\emph{调度切换帧（switch frame）}。
+
+\subsection{用户返回帧保存特权边界两侧的契约}
+
+以 x86-64 的常见组织为例，用户返回帧至少要表达用户指令位置、用户栈、标志、系统调用号
+或异常原因、参数寄存器和返回值位置。不同入口指令由硬件直接保存的字段并不完全相同；
+入口汇编必须把硬件已经提供的字段与软件补存的通用寄存器整理成内核能够统一处理的布局。
+因此，下面强调字段责任，不把一种具体指令的压栈顺序误写成所有平台的固定 ABI。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.26\linewidth}|L{0.19\linewidth}|}
+\hline
+现场字段 & 保存的事实 & 为什么返回时需要 & 典型保存者 \\ \hline
+用户 RIP & 被打断或系统调用之后的继续位置 & 离开内核后从正确指令边界继续 & 入口硬件状态与入口代码共同整理 \\ \hline
+用户 RSP & 用户栈顶 & 恢复原调用栈和局部变量可达性 & 特权入口路径 \\ \hline
+RFLAGS & 条件码、方向位及可返回的控制状态 & 保持用户程序分支与算术语义，并在返回前过滤特权位 & 入口路径保存，出口路径校验 \\ \hline
+通用寄存器 & 系统调用参数、临时值和 ABI 规定的存活值 & 内核不能无条件破坏用户可见寄存器 & 入口代码按统一帧布局补存 \\ \hline
+调用号/异常号/错误码 & 进入内核的原因 & 选择处理函数并形成错误结果 & 调用约定、硬件异常信息与入口代码 \\ \hline
+用户 CS/SS 或等价特权状态 & 返回后的代码与栈特权属性 & 防止构造越权返回环境 & 特权切换机制保存或由安全出口构造 \\ \hline
+\end{longtable}
+
+\begin{pdfdiagram}[scale=0.90]
+  \node[os control, minimum width=47mm] (user) at (0,25mm)
+    {用户态执行\\RIP、RSP、RFLAGS\\参数与通用寄存器};
+  \node[os compute, minimum width=47mm] (entry) at (0,0)
+    {受控入口\\切到特权态入口\\取得当前 task 的内核栈};
+  \node[os state, minimum width=55mm, minimum height=61mm] (tf) at (60mm,10mm) {};
+  \node[os title] at (60mm,34mm) {内核栈上的 trap frame};
+  \node[os label, fill=none, text=BookInk] at (60mm,12mm)
+    {用户 RIP、RSP、RFLAGS\\通用寄存器与参数\\调用号或异常原因\\返回值槽位、特权状态};
+  \node[os compute, minimum width=47mm] (handler) at (120mm,23mm)
+    {内核处理函数\\按统一帧读取参数\\把结果写回返回值槽};
+  \node[os control, minimum width=47mm] (exit) at (120mm,-12mm)
+    {安全返回检查\\处理信号/重调度\\恢复现场并返回用户态};
+
+  \draw[os strong bus] (user.south) -- (entry.north);
+  \draw[os strong bus] (entry.east) -- node[os label, above]{构造完整帧} (tf.west);
+  \draw[os strong bus] (tf.east) -- (handler.west);
+  \draw[os strong bus] (handler.south) -- (exit.north);
+  \draw[os feedback] (exit.west) -- node[os label, below]{从同一帧恢复} (tf.east |- exit.west);
+\end{pdfdiagram}
+\diagramnote{用户态入口不是立即切换 task。处理器和入口代码先在当前 task 的内核栈上构造用户返回帧，内核处理函数仍代表同一 task 执行。只有处理过程中阻塞或出口发现需要重调度，才可能再发生任务上下文切换。}
+
+\subsection{内核栈为何必须属于线程而不是 CPU}
+
+系统调用可能在内核深处阻塞。阻塞时，内核调用链中的返回地址、局部变量和已保存寄存器仍
+位于当前线程的内核栈上。CPU 随后运行另一个线程，如果两者复用同一片尚未保存的栈，后者
+会覆盖前者的恢复路径。因此，每个可同时处于暂停状态的线程都需要独立内核栈；CPU 只在
+运行某个 task 时把当前栈指针指向该 task 的栈。
+
+\begin{pdfdiagram}[scale=0.90]
+  \node[os memory, minimum width=54mm, minimum height=78mm] (stack) at (0,0) {};
+  \node[os title] at (0,33mm) {task A 的内核栈（高地址在上）};
+  \draw[os guide] (-25mm,22mm) -- (25mm,22mm);
+  \draw[os guide] (-25mm,2mm) -- (25mm,2mm);
+  \draw[os guide] (-25mm,-18mm) -- (25mm,-18mm);
+  \node[os label, fill=none, text=BookInk] at (0,12mm)
+    {trap frame\\用户 RIP/RSP/RFLAGS\\参数、返回值与通用寄存器};
+  \node[os label, fill=none, text=BookInk] at (0,-8mm)
+    {系统调用调用帧\\read → socket → wait};
+  \node[os label, fill=none, text=BookInk] at (0,-28mm)
+    {switch frame\\callee-saved 寄存器\\恢复点与 kernel SP};
+
+  \node[os state, minimum width=43mm] (task) at (70mm,18mm)
+    {task A\\\code{kernel\_sp}\\指向切换帧};
+  \node[os compute, minimum width=44mm] (cpu) at (70mm,-10mm)
+    {CPU 当前 RSP\\运行 A 时位于此栈\\切走后写回 task};
+  \node[os control, minimum width=43mm] (guard) at (70mm,-34mm)
+    {栈边界/保护页\\越界时尽早故障};
+
+  \draw[os strong bus] (task.west) -- (stack.east |- task.west);
+  \draw[os strong bus] (cpu.west) -- (stack.east |- cpu.west);
+  \draw[os feedback] (guard.west) -- (stack.east |- guard.west);
+\end{pdfdiagram}
+\diagramnote{同一片内核栈同时容纳用户返回帧、普通内核调用帧和调度切换帧。task A 阻塞后，这些内容保持不动；CPU 的 RSP 改指 task B 的内核栈。A 再次被选择时，先恢复底部切换帧，再沿调用链返回，最终使用顶部 trap frame 回到用户态。}
+
+内核栈通常较小，因此不能无限递归或放置巨大局部数组；栈底还会设置保护边界，以便溢出尽早
+变成可诊断故障。中断是否使用当前线程内核栈、每 CPU 中断栈或专用异常栈取决于体系结构与
+实现，但所有设计都必须回答相同问题：入口时选择哪片栈，嵌套事件的帧放在哪里，切换后谁
+仍然拥有原栈。
+
+\subsection{调度切换帧只保存继续内核控制流所需的最小集合}
+
+调度器调用切换例程时，本来就处在内核态。按照调用约定，调用者保存寄存器可以在普通函数
+调用中被覆盖，真正必须跨函数返回保持的是 callee-saved 寄存器、栈指针以及架构要求的
+控制状态。浮点和向量状态体积较大，内核可以按平台规则立即保存、延迟保存或在首次使用时
+管理，但不能让下一个 task 继承上一个 task 的用户可见值。
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.27\linewidth}|L{0.26\linewidth}|L{0.19\linewidth}|}
+\hline
+切换状态 & 是否总在 switch frame 内 & 作用 & 可省略或延迟的条件 \\ \hline
+内核栈指针 & 是 & 找到原 task 的调用链与恢复地址 & 不可省略 \\ \hline
+callee-saved 通用寄存器 & 通常是 & 保持内核调用约定承诺 & 只能按该架构调用约定精确决定 \\ \hline
+返回地址/恢复入口 & 是或由栈布局隐含 & 让原 task 将来从切换调用之后继续 & 不可失去 \\ \hline
+页表根与地址空间标识 & 由地址空间切换路径管理 & 让虚拟地址按 next 的空间解释 & prev 与 next 共享同一地址空间时可保持 \\ \hline
+浮点/向量扩展状态 & 常在独立区域 & 保存用户可见的 SIMD、浮点与扩展寄存器 & 仅可依架构支持和所有权规则延迟 \\ \hline
+TLS、调试和特权控制状态 & 按平台分散保存 & 保持线程局部存储、断点和安全控制 & 值相同或硬件有独立标签时可避免重写 \\ \hline
+\end{longtable}
+\section{一次上下文切换究竟改变了什么}
+
+设 CPU0 当前运行 task A，A 已进入内核并准备阻塞；runqueue 中 task B 可运行。切换前，
+CPU 的通用寄存器和 RSP 属于 A，\code{current} 指向 A，页表上下文为 A 的地址空间。
+切换后，RSP 和长期存活寄存器属于 B，\code{current} 指向 B；只有 A 与 B 的
+\code{mm} 不同时，才需要改变地址空间上下文。
+
+\begin{pdfdiagram}[scale=0.90]
+  \node[os state, minimum width=48mm, minimum height=55mm] (a) at (0,9mm) {};
+  \node[os title] at (0,29mm) {切换前：task A};
+  \node[os label, fill=none, text=BookInk] at (0,10mm)
+    {CPU RSP → A 内核栈\\current → A\\A 正在内核中执行\\B 位于 runqueue};
+
+  \node[os compute, minimum width=50mm, minimum height=65mm] (sw) at (60mm,6mm) {};
+  \node[os title] at (60mm,31mm) {switch(A,B)};
+  \node[os label, fill=none, text=BookInk] at (60mm,7mm)
+    {1 保存 A 的 switch frame\\2 写回 A.kernel\_sp\\3 必要时切换 mm\\
+     4 current 改为 B\\5 载入 B.kernel\_sp\\6 恢复 B 的寄存器};
+
+  \node[os state, minimum width=48mm, minimum height=55mm] (b) at (120mm,9mm) {};
+  \node[os title] at (120mm,29mm) {切换后：task B};
+  \node[os label, fill=none, text=BookInk] at (120mm,10mm)
+    {CPU RSP → B 内核栈\\current → B\\B 从旧恢复点返回\\A 已不在 CPU 上};
+
+  \node[os memory, minimum width=44mm] (asame) at (28mm,-36mm)
+    {若 A.mm = B.mm\\保持页表根};
+  \node[os memory, minimum width=48mm] (adiff) at (91mm,-36mm)
+    {若 A.mm ≠ B.mm\\装入 B 的页表上下文\\处理地址空间标识/TLB};
+
+  \draw[os strong bus] (a.east) -- (sw.west);
+  \draw[os strong bus] (sw.east) -- (b.west);
+  \draw[os bus] (sw.south) -- (asame.north);
+  \draw[os bus] (sw.south) -- (adiff.north);
+\end{pdfdiagram}
+\diagramnote{上下文切换的前后快照。被切换的是 CPU 当前归属的执行现场和 task 身份，不是把 A 的全部进程资源复制到 B。共享地址空间的线程切换可以保持页表根；不同进程切换才进入地址空间切换路径。}
+
+切换例程最反直觉的地方是“由 B 返回”。A 调用 \code{switch(A,B)} 后，切换例程把 RSP
+改为 B 以前保存的栈指针；随后执行的返回指令从 B 的栈取出恢复地址，所以控制流出现在 B
+上次被切走的位置。A 没有等在某个隐藏的 CPU 槽位里，它的等待位置就是 A 内核栈上的
+switch frame。将来另一次 \code{switch(X,A)} 恢复 A 的栈，A 才从最初那次调用继续返回。
+
+\begin{longtable}{|L{0.14\linewidth}|L{0.25\linewidth}|L{0.25\linewidth}|L{0.25\linewidth}|}
+\hline
+状态 & 切换前 & 切换动作 & 切换后 \\ \hline
+CPU RSP & 指向 A 内核栈 & 保存到 A，载入 B 的 \code{kernel_sp} & 指向 B 内核栈 \\ \hline
+长期存活寄存器 & 保存 A 的内核计算状态 & 压入 A 栈，从 B 栈恢复 & 包含 B 上次保存值 \\ \hline
+\code{current} & A & 在受保护边界更新为 B & B \\ \hline
+A 的位置 & RUNNING/current & 若阻塞则不入 runqueue；若被抢占则重新入队 & wait queue 或 runqueue \\ \hline
+B 的位置 & RUNNABLE/runqueue & 从候选集合删除并选为 next & RUNNING/current \\ \hline
+地址空间 & A.mm & 比较 A.mm 与 B.mm & 相同则保持，不同则使用 B.mm \\ \hline
+\end{longtable}
+
+地址空间切换也不是“清空全部 TLB”这一句就能概括。带地址空间标识的处理器可以让不同进程
+的翻译项同时留在 TLB 中，以标识区分归属；页表映射被修改时仍需按相应范围失效旧翻译。
+因此，任务切换、页表根切换和 TLB 失效是相关但不同的事件，必须分别记录。
+
+\section{运行队列保存候选关系，等待队列保存条件关系}
+
+task 只有一份，队列节点却可能服务于不同关系。runqueue 回答“哪些 task 已具备运行条件，
+按什么字段选择”；wait queue 回答“哪些 task 在等这个对象的哪个条件，条件变化时怎样
+找到它们”。阻塞过程不是把 task 从一个普通链表机械搬到另一个链表，而是先在对象锁保护下
+登记等待关系，再撤销运行资格。
+
+\begin{pdfdiagram}[scale=0.82]
+  \node[os compute, minimum width=55mm, minimum height=65mm] (rq) at (0,5mm) {};
+  \node[os title] at (0,30mm) {CPU0 runqueue};
+  \node[os label, fill=none, text=BookInk] at (0,8mm)
+    {lock、clock、capacity\\current = C\\候选集合：A、B\\
+     A.se：vruntime/weight/node\\B.se：vruntime/weight/node};
+
+  \node[os control, minimum width=55mm, minimum height=65mm] (wq) at (64mm,5mm) {};
+  \node[os title] at (64mm,30mm) {socket receive wait queue};
+  \node[os label, fill=none, text=BookInk] at (64mm,8mm)
+    {object lock\\谓词：receive queue 非空\\等待者：T.wait\_node\\
+     可中断标志、唤醒函数};
+
+  \node[os state, minimum width=45mm] (task) at (132mm,18mm)
+    {task T\\state=BLOCKED\\on\_rq=false\\wake\_reason=none};
+  \node[os memory, minimum width=45mm] (sock) at (132mm,-18mm)
+    {socket receive queue\\当前为空\\稍后由协议栈填充};
+
+  \draw[os feedback] (wq.east) -- (task.west);
+  \draw[os bus] (sock.west) -- (wq.east |- sock.west);
+  \draw[os feedback] (rq.east) -- node[os label, above]{T 阻塞时不在此处} (wq.west);
+\end{pdfdiagram}
+\diagramnote{runqueue 与 wait queue 保存不同关系。BLOCKED 的 T 由 socket 等待队列到达，不在任何 runqueue；唤醒后等待节点被清理，T 进入且只进入一个目标 runqueue，但尚未成为某个 CPU 的 current。}
+
+\begin{longtable}{|L{0.17\linewidth}|L{0.25\linewidth}|L{0.25\linewidth}|L{0.23\linewidth}|}
+\hline
+runqueue 字段 & 保存的事实 & 更新时机 & 错误后果 \\ \hline
+\code{current} & 此 CPU 当前执行哪个 task & 任务切换的受保护边界 & CPU 记账和实际栈归属不一致 \\ \hline
+候选集合 & 具备运行条件但尚未占用 CPU 的 task & 创建、唤醒、抢占、选择、迁移 & task 丢失或重复执行 \\ \hline
+队列锁 & 谁可以同时改变候选关系与归属 & 每次入队、出队、选择和迁移 & 两个 CPU 同时选择同一 task \\ \hline
+调度时钟与运行统计 & 当前运行段长度和候选者服务历史 & tick、切换和显式核算点 & 公平、预算和期限判断使用旧值 \\ \hline
+容量与拓扑信息 & 此 CPU 能提供多少服务、与其他 CPU 距离如何 & 拓扑和频率/热状态更新 & 负载看似均衡，实际完成能力失衡 \\ \hline
+\end{longtable}
+
+\subsection{无丢失阻塞需要一个原子观察边界}
+
+仍以线程 T 等待 socket 数据为例。正确顺序不是“看见空，于是稍后睡眠”，而是在同一对象
+锁保护下完成三件事：检查 receive queue，登记 T 的等待节点，把 T 标为不可运行。生产者
+也在该同步关系下先把数据发布到 receive queue，再查找等待者并授予运行资格。这样事件
+要么发生在 T 检查前，T 看见数据而不睡；要么发生在登记后，生产者一定能找到 T。
+
+\begin{pdfdiagram}[scale=0.90]
+  \node[os title] at (0,34mm) {线程 T / CPU0};
+  \node[os title] at (63mm,34mm) {socket 对象};
+  \node[os title] at (128mm,34mm) {协议栈 / CPU1};
+  \draw[os guide] (0,27mm) -- (0,-48mm);
+  \draw[os guide] (63mm,27mm) -- (63mm,-48mm);
+  \draw[os guide] (128mm,27mm) -- (128mm,-48mm);
+
+  \node[os state, minimum width=43mm] (check) at (0,18mm)
+    {持锁检查谓词\\receive queue 为空};
+  \node[os control, minimum width=46mm] (reg) at (63mm,2mm)
+    {登记 T.wait\_node\\T.state=BLOCKED};
+  \node[os state, minimum width=43mm] (sched) at (0,-14mm)
+    {释放对象锁\\调用调度器\\离开 CPU};
+  \node[os memory, minimum width=43mm] (publish) at (128mm,-28mm)
+    {取得同一对象锁\\把数据发布到队列};
+  \node[os control, minimum width=46mm] (wake) at (63mm,-43mm)
+    {找到 T\\BLOCKED→RUNNABLE\\加入目标 runqueue};
+
+  \draw[os strong bus] (check.south east) -- (reg.north west);
+  \draw[os strong bus] (reg.south west) -- (sched.north east);
+  \draw[os strong bus] (sched.south east) -- (publish.north west);
+  \draw[os strong bus] (publish.south west) -- (wake.north east);
+\end{pdfdiagram}
+\diagramnote{一次无丢失阻塞与唤醒。对象锁把“条件仍为假”和“等待者已经可被找到”接成连续事实。wakeup 的提交结果只是 T 获得运行资格并进入目标 runqueue；T 何时执行、数据是否仍未被其他线程消费，必须在恢复后重新检查。}
+
+\begin{longtable}{|L{0.10\linewidth}|L{0.28\linewidth}|L{0.28\linewidth}|L{0.24\linewidth}|}
+\hline
+步骤 & T 的状态与位置 & socket/唤醒方状态 & 提交边界 \\ \hline
+1 & RUNNING，是 CPU0 current & receive queue 为空 & 尚未决定阻塞 \\ \hline
+2 & wait node 已登记，state 改为 BLOCKED & 对象锁仍由 T 持有 & 等待关系已经可被唤醒方观察 \\ \hline
+3 & 释放锁并切走，不在 runqueue & 条件仍可能为空 & T 已撤销运行资格 \\ \hline
+4 & 仍为 BLOCKED & 数据先进入 receive queue & 谓词变真，但 T 尚未 runnable \\ \hline
+5 & RUNNABLE，只进入一个目标 runqueue & 等待节点被移除，记录唤醒原因 & 唤醒资格完成，不等于已经运行 \\ \hline
+6 & 被选为 current 后继续 \code{read} & 重新加锁检查 receive queue & 谓词再次为真时才消费数据 \\ \hline
+\end{longtable}
+
+\section{跨 CPU 迁移改变的是队列所有权}
+
+多核系统的每 CPU runqueue 降低了共同队列锁竞争，却使 task 的 CPU 归属成为显式状态。
+task T 从 CPU0 迁移到 CPU1 时，源候选集合、\code{T.cpu} 和目标候选集合必须作为一个
+受保护转换完成。若先插入目标再删除源，两个 CPU 可能同时选择 T；若先删除后失去引用，
+T 仍为 RUNNABLE 却不在任何队列。
+
+\begin{pdfdiagram}[scale=0.87]
+  \node[os compute, minimum width=50mm, minimum height=54mm] (r0) at (0,8mm) {};
+  \node[os title] at (0,28mm) {CPU0 runqueue};
+  \node[os label, fill=none, text=BookInk] at (0,8mm)
+    {lock0\\候选：A、T、C\\T.cpu=0};
+  \node[os compute, minimum width=50mm, minimum height=54mm] (r1) at (120mm,8mm) {};
+  \node[os title] at (120mm,28mm) {CPU1 runqueue};
+  \node[os label, fill=none, text=BookInk] at (120mm,8mm)
+    {lock1\\候选：B\\目标加入 T};
+
+  \node[os state, minimum width=53mm, minimum height=59mm] (move) at (60mm,4mm) {};
+  \node[os title] at (60mm,26mm) {受保护的迁移区间};
+  \node[os label, fill=none, text=BookInk] at (60mm,5mm)
+    {按固定次序取得 lock0/lock1\\确认 T 非 running 且仍在源队列\\
+     从源删除 → 更新 T.cpu\\插入目标 → 必要时通知 CPU1};
+
+  \node[os control, minimum width=53mm] (ipi) at (60mm,-38mm)
+    {若 T 应抢占 CPU1.current\\设置 need\_resched / 发送 IPI};
+
+  \draw[os strong bus] (r0.east) -- (move.west);
+  \draw[os strong bus] (move.east) -- (r1.west);
+  \draw[os bus] (move.south) -- (ipi.north);
+\end{pdfdiagram}
+\diagramnote{跨 CPU 迁移是候选关系的所有权转移，不是复制 task。迁移区间内必须同时保护源队列、目标队列和 \code{T.cpu}；完成后 T 只在 CPU1 的候选集合中。IPI 只要求目标 CPU 尽快重新考虑调度，不直接让 T 在远端开始执行。}
+
+\begin{keyidea}
+上下文切换保存的是“怎样继续这条执行流”，运行队列保存的是“这条执行流是否有资格取得
+CPU”，等待队列保存的是“哪个条件变化后应重新授予资格”，地址空间对象保存的是“这条
+执行流的地址按什么映射解释”。四类状态相互连接，但不能用一个含混的“进程上下文”替代。
+\end{keyidea}
