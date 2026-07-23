@@ -1153,6 +1153,99 @@ F 输出 & 4-bit 结果输出 & 写回候选结果 \\
 \bottomrule
 \end{longtable}
 
+\section{四、浮点执行流水：从编码分类到一次确定舍入}
+
+浮点运算不能把两个编码直接交给整数加法器。执行单元首先要根据阶码和尾数字段把输入分成零、非规格化数、规格化数、无穷大和 NaN，再决定走普通数据通路还是特殊值旁路。普通加减随后经历指数比较、较小尾数右移、有效数加减、规格化、舍入和重新编码；特殊值旁路则按运算类型直接形成结果类别和异常条件。两条路径最终必须在同一个提交点汇合，不能让 NaN 规则、舍入结果和异常标志来自彼此不一致的周期。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.5cm] (input) at (1.3,4.0) {输入编码\\符号、阶码、尾数};
+  \node[hw control, minimum width=2.5cm] (classify) at (4.2,4.0) {拆包与分类\\普通值/特殊值};
+  \node[hw compute, minimum width=2.5cm] (align) at (7.1,4.0) {对阶或部分积\\保留扩展精度};
+  \node[hw compute, minimum width=2.5cm] (operate) at (10.0,4.0) {尾数运算\\加减乘或乘加};
+  \node[hw control, minimum width=2.5cm] (special) at (4.2,1.4) {特殊值旁路\\NaN/Inf/零规则};
+  \node[hw compute, minimum width=2.5cm] (normalize) at (10.0,1.4) {规格化与舍入\\GRS 和舍入模式};
+  \node[hw state, minimum width=2.5cm] (commit) at (7.1,1.4) {结果与状态提交\\编码、标志、目的寄存器};
+  \draw[hw bus] (input) -- (classify);
+  \draw[hw bus] (classify) -- (align);
+  \draw[hw bus] (align) -- (operate);
+  \draw[hw bus] (operate) -- (normalize);
+  \draw[hw bus] (classify) -- (special);
+  \draw[hw bus] (special) -- (commit);
+  \draw[hw bus] (normalize) -- (commit);
+\end{pdfdiagram}
+\diagramnote{浮点流水先分类，再分成普通数值路径和特殊值旁路。普通路径保留比目标格式更多的内部位，直到规格化完成后才按当前模式舍入；特殊值路径独立判定 NaN、无穷大和零的结果。两条路径在结果编码与异常状态的共同提交点汇合。}
+
+\topic{Guard、round、sticky 位把被移出的信息带到舍入点}
+
+对阶会把较小尾数右移，规格化也可能继续移动有效数。若被移出的 bit 全部丢弃，舍入器就无法区分“刚好位于两个可表示数中点”“略大于中点”和“略小于中点”。硬件因此在目标尾数之外保留 guard、round、sticky（GRS）三类信息：guard 是截断边界后的第一位，round 是再下一位，sticky 是其余所有被移出位的 OR。sticky 一旦成为 1，在本次运算剩余阶段就保持为 1，表示尾部仍有非零信息。
+
+以“最接近且中点取偶”为例，guard 为 0 时结果已经落在当前可表示值附近，不进位；guard 为 1 且 round 或 sticky 为 1 时，真实值越过中点，尾数最低保留位进位；恰好中点时，round 与 sticky 都为 0，此时只在最低保留位为 1 时进位，使结果末位变成偶数。若进位使尾数从 \code{1.111...} 变成 \code{10.000...}，规格化逻辑还要右移一位并增加指数；指数随后可能溢出，舍入并不是数据通路的装饰步骤，而会改变结果类别。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.27\linewidth}L{0.18\linewidth}}
+\toprule
+舍入方向 & 正数选择 & 负数选择 & 控制状态 \\
+\midrule
+最接近，中点取偶 & 取最近值；恰好中点时使末位为偶 & 取最近值；恰好中点时使末位为偶 & GRS 与尾数最低位 \\\tablerowrule
+向零 & 丢弃目标精度之外的非零尾部 & 丢弃目标精度之外的非零尾部 & 符号不改变截断方向 \\\tablerowrule
+向正无穷 & 尾部非零时取更大值 & 尾部非零时取更接近零的值 & 符号与 sticky \\\tablerowrule
+向负无穷 & 尾部非零时取更接近零的值 & 尾部非零时取更小值 & 符号与 sticky \\
+\bottomrule
+\end{longtable}
+
+\topic{流水化提高吞吐，但异常状态仍要跟随对应操作}
+
+对阶、尾数运算和规格化可以分别插入寄存器，使执行单元每周期接受一个新操作；这改变吞吐，不改变单个操作跨越多个周期的事实。每一级除数据外还要携带目的寄存器号、舍入模式快照、操作类别、异常候选位和流水有效位。若分支误预测或更早指令发生异常，年轻浮点操作即使已算出内部结果，也必须被取消，不能更新目的寄存器或累计异常标志。
+
+有些实现把非规格化数或少见特殊组合转给微码 assist。assist 可以延长该操作并占用额外执行资源，但它仍要返回与普通路径相同的结果编码和异常状态，并在同一按序提交规则下变得可见。软件观察到的是体系结构结果，不能因内部走了快速路径还是 assist 而得到不同舍入。
+
+\section{五、融合乘加与异常状态：一次完成怎样保持数值语义}
+
+融合乘加（fused multiply-add，FMA）计算 \(a\times b+c\)，但与先执行乘法再执行加法不是同一条数值路径。分离操作先把乘积舍入到目标格式，再把该结果与 \(c\) 相加并第二次舍入；FMA 保留完整乘积及对齐所需的扩展位，把 \(c\) 合入后只在最终结果处舍入一次。二者在实数数学上等价，在有限精度硬件上可能相差一个或多个最低有效位。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.0cm] (ab1) at (1.1,4.0) {\(a,b\)};
+  \node[hw compute, minimum width=2.4cm] (mul1) at (3.8,4.0) {乘法\\扩展乘积};
+  \node[hw control, minimum width=2.2cm] (round1) at (6.6,4.0) {第一次舍入\\目标格式};
+  \node[hw compute, minimum width=2.2cm] (add1) at (9.3,4.0) {与 \(c\) 相加};
+  \node[hw state, minimum width=2.1cm] (out1) at (11.8,4.0) {第二次舍入};
+  \node[hw memory, minimum width=2.0cm] (ab2) at (1.1,1.4) {\(a,b,c\)};
+  \node[hw compute, minimum width=3.0cm] (mul2) at (4.1,1.4) {乘积与 \(c\) 对齐\\保留扩展精度};
+  \node[hw compute, minimum width=2.5cm] (sum2) at (7.5,1.4) {宽加法与规格化};
+  \node[hw state, minimum width=2.5cm] (out2) at (10.7,1.4) {一次最终舍入\\结果与标志};
+  \draw[hw bus] (ab1) -- (mul1);
+  \draw[hw bus] (mul1) -- (round1);
+  \draw[hw bus] (round1) -- (add1);
+  \draw[hw bus] (add1) -- (out1);
+  \draw[hw bus] (ab2) -- (mul2);
+  \draw[hw bus] (mul2) -- (sum2);
+  \draw[hw bus] (sum2) -- (out2);
+  \node[hw label, anchor=west] at (1.0,5.0) {分离 MUL+ADD：中间结果先变成架构精度};
+  \node[hw label, anchor=west] at (1.0,2.4) {FMA：完整乘积直到最终结果才舍入};
+\end{pdfdiagram}
+\diagramnote{上排的乘法和加法各有一次舍入，中间误差已经不可恢复；下排的 FMA 在宽内部数据通路中完成乘积对齐与相加，只在最终编码处舍入一次。编译器是否允许把 MUL+ADD 收缩成 FMA，会直接影响最低位结果和异常标志。}
+
+\topic{异常标志记录已经发生的条件，陷阱是另一层控制决定}
+
+IEEE 浮点环境通常区分无效操作、除以零、溢出、下溢和不精确五类条件。执行单元在形成结果时产生候选异常位；提交时把本操作的位 OR 进累计状态，使软件能在一段计算后查询曾发生过哪些条件。异常被屏蔽时，运算仍按规则产生 NaN、无穷大、有限饱和值或舍入结果；若体系结构允许并启用了相应陷阱，处理器才在精确边界转入处理程序。标志是状态，陷阱是控制流，二者不能混为一件事。
+
+\begin{longtable}{L{0.17\linewidth}L{0.27\linewidth}L{0.26\linewidth}L{0.20\linewidth}}
+\toprule
+条件 & 典型输入或中间状态 & 默认可见结果 & 提交证据 \\
+\midrule
+无效操作 & \(0/0\)、\(\infty-\infty\)、信号 NaN & quiet NaN & invalid 与结果类别 \\\tablerowrule
+除以零 & 有限非零数除以零 & 带符号无穷大 & 除零（DZ） \\\tablerowrule
+溢出 & 舍入后指数超过格式上界 & 无穷大或最大有限值，取决于舍入方向 & overflow、inexact \\\tablerowrule
+下溢 & 极小结果在舍入前后进入非规格化区间 & 非规格化数或带符号零 & underflow，通常伴随 inexact \\\tablerowrule
+不精确 & 被丢弃尾部不为零 & 按模式舍入后的有限结果 & inexact 累计位 \\
+\bottomrule
+\end{longtable}
+
+\topic{可复现性要固定操作序列、格式和浮点环境}
+
+同一公式在不同机器上得到不同最低位，不一定说明硬件故障。编译器可能把乘加收缩成 FMA，也可能重新结合表达式；执行环境可能选择不同舍入方向、对非规格化数采用渐进下溢或 flush-to-zero；向量化还会改变求和树的结合顺序。要得到可复现结果，软件和测试必须同时固定目标格式、舍入模式、是否允许 FMA 收缩、非规格化数处理、表达式重排规则以及异常状态的读取位置。
+
+硬件验证也要覆盖这些控制状态。不能只把随机有限数送入数据通路比较高位结果，还应定向检查恰好中点、规格化进位、最大有限数溢出、最小正规数附近下溢、NaN payload 传播、正负零和 FMA 与分离操作出现差异的向量。最终判据是“结果编码、异常标志与提交时机”三者同时匹配。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{综合练习：1 至 4}

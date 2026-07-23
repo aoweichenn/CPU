@@ -1653,6 +1653,95 @@ LSR 的关键位：
 
 16550 相对早期 8250 的主要改进是 16 字节收发 FIFO，而 FCR 的触发水位（1/4/8/14 字节可选）体现的是同一个权衡：水位设 14，则收满 14 字节才发一次中断，中断频率降为逐字节中断的十几分之一，但软件看到数据的延迟最长可达 14 个字节时间。它就是 1.3 节“查询周期 $P$”在硬件里的翻版，只是这个环由硬件闭合，软件只在配置时选一次参数。
 
+\section{五、微序列器：控制字怎样按条件推进}
+
+把复杂指令写成多行微码，只解决了“每一行输出哪些控制线”，还没有回答“下一行从哪里来”。微序列器（microsequencer）保存微程序计数器 \(\mu PC\)，用当前微指令的下一地址字段、条件码、等待输入和主指令入口表共同选择下一 \(\mu PC\)。控制存储器读出的控制字一部分直接驱动数据通路，另一部分回到微序列器，决定顺序前进、条件分支、调用公共子程序、返回或结束本条指令。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.4cm] (ir) at (1.3,4.0) {指令寄存器\\opcode 与模式};
+  \node[hw control, minimum width=2.5cm] (entry) at (4.2,4.0) {入口映射\\首条微地址};
+  \node[hw state, minimum width=2.0cm] (upc) at (7.0,4.0) {\(\mu PC\)};
+  \node[hw memory, minimum width=2.6cm] (store) at (10.1,4.0) {控制存储器\\控制字与下一地址};
+  \node[hw compute, minimum width=2.6cm] (datapath) at (10.1,1.3) {数据通路动作\\读、运算、写候选};
+  \node[hw control, minimum width=2.8cm] (next) at (6.8,1.3) {下一地址选择\\条件/等待/返回};
+  \node[hw state, minimum width=2.5cm] (inputs) at (3.5,1.3) {状态输入\\标志、ready、异常};
+  \draw[hw bus] (ir) -- (entry);
+  \draw[hw bus] (entry) -- (upc);
+  \draw[hw bus] (upc) -- (store);
+  \draw[hw bus] (store) -- (datapath);
+  \draw[hw bus] (store) -- (next);
+  \draw[hw bus] (inputs) -- (next);
+  \draw[hw return] (next) -- (upc);
+\end{pdfdiagram}
+\diagramnote{微序列器的闭环。主指令通过入口映射给出首条微地址；控制存储器同时输出数据通路控制和下一地址信息；标志、ready 与异常参与下一地址选择。只有结束微指令到达提交条件后，主指令才完成，\(\mu PC\) 的中间推进不是架构完成。}
+
+\topic{等待状态必须保持控制幂等，不能重复外部副作用}
+
+若某条微指令启动存储器读，控制器可能要在 \code{ready=0} 时停留数拍。最安全的组织是把“发出一次请求”和“等待完成”分成不同微状态：发出状态只在握手成功的那个周期转移所有权，等待状态只观察完成条件，不再次拉起会被从设备当成新请求的有效信号。若协议采用 valid/ready，valid 可以保持，但请求内容和事务身份必须稳定；接收一次 ready 后立即转入下一状态。
+
+同理，写寄存器、递增 PC 和写 MMIO 不能放在会反复执行的等待控制字中。内部暂存寄存器可以在每拍覆盖同一候选值，架构寄存器和外部设备却必须只更新一次。微码审查不仅要看每行控制位，还要标出每个动作是“可重复计算”“握手一次”“架构提交”还是“不可重放副作用”。
+
+\begin{longtable}{L{0.18\linewidth}L{0.28\linewidth}L{0.27\linewidth}L{0.17\linewidth}}
+\toprule
+微状态类型 & 允许重复的动作 & 离开条件 & 错误表现 \\
+\midrule
+入口/译码 & 组合形成候选地址 & 指令和模式合法 & 进入错误微程序 \\\tablerowrule
+请求发出 & 保持地址、数据和身份稳定 & valid 与 ready 同拍成立 & 重复事务或请求丢失 \\\tablerowrule
+等待完成 & 读取状态，保持暂存值 & completion 与身份匹配 & 把旧完成认作当前完成 \\\tablerowrule
+内部运算 & 覆盖私有临时寄存器 & 运算状态稳定或计数结束 & 中间值提前可见 \\\tablerowrule
+架构提交 & 一次写入寄存器、PC 或标志 & 无更高优先级异常 & 重复副作用或不精确异常 \\
+\bottomrule
+\end{longtable}
+
+\topic{公共微子程序节省控制存储，但要保存有限返回状态}
+
+地址形成、规格化和权限检查可能被多条指令复用。微序列器可以提供一层或少量深度的返回栈：调用微指令保存 \(\mu PC+1\)，跳到公共入口；返回微指令恢复保存地址。这个栈不是软件可见调用栈，容量通常固定，溢出应在设计验证中被证明不可达。若公共序列可能等待、异常或再调用，返回地址、原指令身份和中间状态都必须保持到它结束。
+
+\section{六、可重启微操作与微码补丁：内部复杂度怎样不破坏架构边界}
+
+一条架构指令可以展开成多条内部微操作，但软件通常只允许看到“未执行”或“已完成”两个状态。处理器因此把地址、部分结果和循环计数保存在不可见临时状态中，直到全部检查通过才一次更新架构寄存器、标志和 PC。若中途发生可处理缺页或外部中断，控制器可以丢弃临时状态并从原指令重启，或在体系结构明确允许的检查点保存内部进度；两种方案都必须保证已对外产生的副作用不会被重复。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (start) at (1.3,4.0) {架构旧状态\\PC、寄存器、标志};
+  \node[hw control, minimum width=2.5cm] (expand) at (4.2,4.0) {译码/assist 入口\\建立微操作身份};
+  \node[hw memory, minimum width=2.5cm] (temp) at (7.1,4.0) {临时状态\\地址、部分结果、计数};
+  \node[hw control, minimum width=2.5cm] (check) at (10.0,4.0) {最终检查\\异常与完成条件};
+  \node[hw state, minimum width=2.5cm] (commit) at (10.0,1.3) {架构提交\\结果与后继 PC};
+  \node[hw control, minimum width=2.5cm] (recover) at (7.1,1.3) {取消/恢复\\清理临时所有权};
+  \node[hw state, minimum width=2.5cm] (retry) at (4.2,1.3) {保存原因\\原 PC 重试};
+  \draw[hw bus] (start) -- (expand);
+  \draw[hw bus] (expand) -- (temp);
+  \draw[hw bus] (temp) -- (check);
+  \draw[hw bus] (check) -- (commit);
+  \draw[hw return] (check) -- (recover);
+  \draw[hw return] (recover) -- (retry);
+  \draw[hw return] (retry) -- (start);
+\end{pdfdiagram}
+\diagramnote{复杂指令的内部状态与架构状态分离。上排可以执行许多微操作并暂存部分结果；只有最终检查通过才沿右侧提交。异常路径先撤销临时所有权，再以原 PC 和确定原因进入重试，不能把半完成结果留给软件。}
+
+\topic{内存和 MMIO 副作用决定一条微序列能否整体重启}
+
+纯寄存器计算只要结果尚未提交，通常可以整体丢弃并重算。读普通内存也可在权限和一致性规则允许时重发，因为重复读取不会写入外部状态。写内存则需要在提交点之前保存在 store buffer 或私有写队列，待整条指令无异常后再获得可见性；若微序列直接写到 Cache 或总线后才发现异常，整体重启可能重复写入。
+
+MMIO 更严格。读设备状态可能具有 read-to-clear 语义，写门铃可能立即启动外部动作，这些事务不能假设可重放。实现要么在所有可能故障检查完成后才发出 MMIO，要么把指令定义成发生该副作用后不再报告可重试故障。可重启性不是“保存一个 \(\mu PC\)”就完成，而取决于微序列之前是否已经越过不可撤销边界。
+
+\topic{微码 assist 和补丁仍要经过版本、状态与回滚验证}
+
+现代核心会把少见复杂指令、特殊输入或硬件勘误处理转入微码 assist。assist 注入的内部操作可以比常规译码路径更长，因此会改变延迟和吞吐，却不能改变 ISA 规定的结果、异常优先级和提交语义。性能计数器若显示 assist 增多，说明工作负载频繁进入慢路径；这是一条定位证据，不等于数据已经错误。
+
+可更新微码通常在复位或受控更新流程中装入受验证的补丁映像。平台要核对处理器签名、补丁版本和认证结果，再使新入口或替换序列生效；多核系统还要保证所有目标核心进入一致版本。更新失败时应保留原有可启动路径，不能让一部分核心运行旧序列、另一部分核心运行新序列。补丁改变的是控制实现，架构状态格式和软件可见契约必须保持兼容。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.28\linewidth}L{0.17\linewidth}}
+\toprule
+边界 & 内部状态处理 & 架构可见结果 & 恢复要求 \\
+\midrule
+普通完成 & 临时结果通过全部检查 & 一次更新目的状态与后继 PC & 释放微序列资源 \\\tablerowrule
+可重试故障 & 丢弃或保存规定检查点 & 目的状态不变，保存原指令 PC & 修复后执行语义等价 \\\tablerowrule
+不可重放副作用 & 在发出前完成全部可故障检查 & 外部动作只发生一次 & 禁止从副作用之前盲目重启 \\\tablerowrule
+微码更新 & 验证映像、目标和版本后切换 & ISA 契约保持不变 & 失败回到已验证版本 \\
+\bottomrule
+\end{longtable}
+
 \section*{章末练习}
 
 \begin{chapterexercise}{寄存器堆}

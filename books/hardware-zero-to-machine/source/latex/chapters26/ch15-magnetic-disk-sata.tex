@@ -1301,6 +1301,98 @@ CMR。SMR 不是“坏盘”，它把“只能顺序写”这条介质的物理�
 与价格；买错场景才是问题。本节结尾回看章首那句：让介质按其擅长
 的方式工作——对机械盘，“擅长”二字几乎就是“顺序”的同义词。
 
+\section{三、AHCI 与 SATA 命令链：主存槽位怎样成为一次设备事务}
+
+SATA 线缆上传输的是帧信息结构（Frame Information Structure，FIS），而操作系统首先写的是主存中的 AHCI 数据结构。每个端口有一张命令列表，列表中的槽位指向命令表；命令表包含给设备的命令 FIS、可选 ATAPI 命令和物理区域描述表（Physical Region Descriptor Table，PRDT）。PRDT 把一个请求拆成若干 DMA 内存段。驱动必须先写完命令表和 PRDT，再通过内存屏障发布槽位，最后设置端口命令发出位；HBA 看到该位后才取得这些结构的读取所有权。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw memory, minimum width=2.5cm] (bio) at (1.3,4.0) {块请求\\LBA、方向、缓冲};
+  \node[hw control, minimum width=2.5cm] (slot) at (4.2,4.0) {分配 AHCI 槽位\\写 header/table};
+  \node[hw memory, minimum width=2.5cm] (prdt) at (7.1,4.0) {CFIS 与 PRDT\\地址、长度、tag};
+  \node[hw compute, minimum width=2.5cm] (hba) at (10.0,4.0) {HBA 取表\\产生 SATA FIS};
+  \node[hw compute, minimum width=2.5cm] (device) at (10.0,1.3) {磁盘执行与 DMA\\介质/缓存数据};
+  \node[hw state, minimum width=2.5cm] (fis) at (7.1,1.3) {完成 FIS\\状态与活动位};
+  \node[hw control, minimum width=2.5cm] (reap) at (4.2,1.3) {中断/轮询回收\\核对槽位与错误};
+  \node[hw state, minimum width=2.5cm] (done) at (1.3,1.3) {请求完成\\解除 DMA 映射};
+  \draw[hw bus] (bio) -- (slot);
+  \draw[hw bus] (slot) -- (prdt);
+  \draw[hw bus] (prdt) -- (hba);
+  \draw[hw bus] (hba) -- (device);
+  \draw[hw return] (device) -- (fis);
+  \draw[hw return] (fis) -- (reap);
+  \draw[hw return] (reap) -- (done);
+\end{pdfdiagram}
+\diagramnote{AHCI/SATA 的所有权闭环。上排由驱动建立命令槽、CFIS 和 PRDT，发布后 HBA 才能取表并在链路上发出 FIS；下排由设备传输数据并返回完成状态，驱动核对槽位后才结束请求、解除 DMA 映射并复用内存。}
+
+\topic{NCQ tag 把乱序执行后的完成重新关联到原请求}
+
+原生命令队列（Native Command Queuing，NCQ）允许设备同时保存多条命令，并按磁头位置与旋转相位调整执行顺序。每条排队命令携带 tag，主机用活动位图记录哪些 tag 仍在设备中；设备成功完成一条或多条命令时，通过 Set Device Bits FIS 报告对应活动位。完成顺序可以不同于发出顺序，但 tag、AHCI 槽位、PRDT 和软件请求必须保持一一对应。
+
+tag 的生命周期包含四个边界：软件分配但尚未发布，HBA 已接受且设备可能访问 PRDT，设备报告完成但软件尚未回收，软件确认完成并释放槽位。只有最后一个边界之后，tag 和描述符内存才能复用。若端口复位后迟到的中断仍引用旧槽位，驱动还要用端口代际或队列状态拒绝该完成，避免把新请求错误结束。
+
+\begin{longtable}{L{0.18\linewidth}L{0.26\linewidth}L{0.28\linewidth}L{0.18\linewidth}}
+\toprule
+阶段 & 所有权与状态 & 可观察证据 & 过早动作的后果 \\
+\midrule
+构造槽位 & CPU 写 CFIS、header 与 PRDT & 槽位尚未置为 active & HBA 读到半初始化描述符 \\\tablerowrule
+发布命令 & 屏障后设置命令/活动位 & HBA 与设备持有 tag & CPU 修改缓冲导致 DMA 竞态 \\\tablerowrule
+数据阶段 & HBA 按 PRDT 执行 DMA & 字节计数、链路与设备状态推进 & 把中断误当成数据已持久化 \\\tablerowrule
+完成通知 & SDB 或 D2H FIS 更新状态 & tag 对应活动位结束 & 未核对错误就返回成功 \\\tablerowrule
+软件回收 & 驱动确认完成和当前代际 & 请求结束、映射可解除 & 旧完成释放新槽位 \\
+\bottomrule
+\end{longtable}
+
+\topic{数据完成、命令完成和持久化是三个不同边界}
+
+读命令的数据 DMA 完成后，内存中已有返回字节，但驱动仍要检查设备状态，确认该 tag 没有介质错误。写命令报告完成时，数据可能只进入磁盘易失写缓存；若上层要求掉电后仍可恢复，还需要设备遵守 FUA 或在适当位置执行 FLUSH CACHE，并等待该持久化命令完成。AHCI 中断只说明端口有状态变化，不自动证明某个写已经落到磁介质。
+
+\section{四、SATA 错误恢复：先确定失败层，再决定重试还是复位}
+
+一条命令失败可能来自不同层：链路 CRC 错误意味着某个 FIS 没有可靠到达，协议可以在不重复介质动作的边界重传；设备报告 UNC 表示目标扇区经重读和纠错仍不可恢复；ABRT 可能表示命令或参数不被支持；主机超时则只说明在预算内没有看到完成，设备究竟仍在执行、已经失败还是链路失联仍需进一步确认。恢复动作必须由错误层决定，不能把所有失败都归为“磁盘坏了”或都直接重发。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.5cm] (timeout) at (1.3,4.0) {异常证据\\FIS/状态/超时};
+  \node[hw control, minimum width=2.5cm] (classify) at (4.2,4.0) {错误分层\\链路/命令/介质};
+  \node[hw compute, minimum width=2.5cm] (local) at (7.1,4.0) {局部恢复\\重传/读日志/重试};
+  \node[hw state, minimum width=2.5cm] (verify) at (10.0,4.0) {验证结果\\tag 与数据状态};
+  \node[hw control, minimum width=2.5cm] (quiesce) at (10.0,1.3) {停止新命令\\冻结槽位所有权};
+  \node[hw compute, minimum width=2.5cm] (reset) at (7.1,1.3) {端口复位\\重新建链与识别};
+  \node[hw state, minimum width=2.5cm] (resolve) at (4.2,1.3) {逐项结束旧请求\\成功/重试/失败};
+  \node[hw state, minimum width=2.5cm] (resume) at (1.3,1.3) {新代际运行\\重新开放队列};
+  \draw[hw bus] (timeout) -- (classify);
+  \draw[hw bus] (classify) -- (local);
+  \draw[hw bus] (local) -- (verify);
+  \draw[hw return] (verify) -- (quiesce);
+  \draw[hw return] (quiesce) -- (reset);
+  \draw[hw return] (reset) -- (resolve);
+  \draw[hw return] (resolve) -- (resume);
+\end{pdfdiagram}
+\diagramnote{错误恢复先尝试与失败层匹配的局部动作；只有错误持续或端口状态不再可信时，才冻结队列并复位端口。复位后仍要逐项处理旧 tag，再建立新代际并开放请求，不能把“链路重新起来”直接等同于所有旧命令都失败或都成功。}
+
+\topic{NCQ 错误要先保存队列证据，再释放或重发请求}
+
+排队命令发生错误时，单个状态寄存器未必足以说明哪一个 tag 失败、哪些命令已经完成。驱动应读取规定的 queued error log，保存失败 tag、LBA 和状态，再根据活动位与协议规则结束已完成请求、标记失败请求，并决定其余请求能否继续。若先清空端口状态或复位设备，定位信息可能随之丢失，之后只能把整批命令作为不确定结果处理。
+
+写请求尤其不能在未知完成状态下直接重发。普通数据块的重复写通常幂等，但写入日志提交记录、设备管理命令或带外部副作用的请求可能不是；即使数据相同，重复执行与上层事务次序也可能冲突。块层要用请求类型、持久化语义和文件系统日志共同决定是否重试。
+
+\begin{longtable}{L{0.17\linewidth}L{0.27\linewidth}L{0.28\linewidth}L{0.18\linewidth}}
+\toprule
+错误层 & 关键证据 & 合适的第一动作 & 升级条件 \\
+\midrule
+物理/链路 & CRC、PHY 计数、失锁或重连记录 & 协议重传，检查线缆与信号质量 & 错误持续则降速或复位端口 \\\tablerowrule
+命令/队列 & task-file 状态、失败 tag、queued error log & 冻结队列并保存上下文 & 活动位不可信则清队列并复位 \\\tablerowrule
+介质 & UNC、失败 LBA、重映射与校正记录 & 重读、上层冗余恢复、标记坏块 & 无法恢复则返回永久 I/O 错误 \\\tablerowrule
+超时/失联 & 在途 tag、最后 FIS、端口状态 & 停止新提交并确认设备状态 & 无法确认则 COMRESET 并重枚举 \\\tablerowrule
+持久化失败 & FLUSH/FUA 状态与掉电事件 & 保持事务未提交并执行恢复日志 & 无可靠副本则报告数据风险 \\
+\bottomrule
+\end{longtable}
+
+\topic{SMART 提供趋势证据，不能替代一次 I/O 的完成状态}
+
+SMART 属性、错误日志和 PHY 计数适合判断错误是否在增长：重映射扇区增加指向介质退化，接口 CRC 增加更可能指向链路，命令超时增加可能来自供电、固件或机械恢复。但 SMART 通过不等于当前读写一定成功，属性阈值也不能证明未来不会突然失效。一次请求是否成功仍由该命令的完成状态决定；设备是否应被预防性更换，则结合错误趋势、冗余状态和恢复时间预算判断。
+
+端口复位完成后，驱动要重新确认设备签名、链路速率和能力，重建接收 FIS 区与命令列表状态，再开放新请求。旧 tag 全部进入明确结局之前，不能把槽位直接交给新队列。这样才能把物理重连、控制器重新初始化、软件请求完成三个边界分开验证。
+
 \section*{章末练习}
 
 \begin{chapterexercise}{1}
