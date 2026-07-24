@@ -1,0 +1,136 @@
+\section{物理攻击面：熵、密钥、泄漏与故障注入}
+
+地址权限、IOMMU 和 TEE 都建立在一个共同前提上：硬件按照规定的时序执行规定的状态转换。具有物理接触能力的攻击者还可以观察供电电流、电磁辐射和完成时间，或者改变电压、时钟、温度与存储器访问节奏。前一类手段从运行中提取相关信息，后一类手段试图使电路在某个采样边界产生错误。硬件安全因此不能只检查“谁可以访问这个地址”，还要控制秘密从哪里产生、在哪些状态可用、异常物理条件怎样被检测，以及检测后哪些输出必须被阻断。\cite{nist-ir8320}
+
+\topic{熵源提供不可预测性，条件化不能凭空产生熵}
+
+\term{噪声源}{noise source}把振荡器相位噪声、热噪声或亚稳态等物理涨落采样成原始符号。原始符号通常有偏置和相关性，不能直接作为密钥。完整的\term{熵源}{entropy source}还包括在线健康检测与可选条件化：健康检测寻找卡死、偏置突变或相关性异常；条件化用密码散列等函数把足够多的原始输入压缩成近似均匀的种子。种子随后初始化确定性随机位生成器（DRBG），由 DRBG 以较高吞吐提供 nonce、临时密钥和掩码。\cite{nist-sp800-90b}
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block, minimum width=2.35cm, align=center] (noise) at (0.8,3.3)
+    {物理噪声源\\抖动、热噪声};
+  \node[hw compute, minimum width=2.35cm, align=center] (sample) at (3.8,3.3)
+    {采样与原始 FIFO\\保留连续符号};
+  \node[hw control, minimum width=2.35cm, align=center] (health) at (6.8,3.3)
+    {在线健康检测\\重复与比例窗口};
+  \node[hw compute, minimum width=2.35cm, align=center] (condition) at (9.8,3.3)
+    {条件化\\压缩偏置与相关};
+  \draw[hw bus] (noise) -- (sample);
+  \draw[hw bus] (sample) -- (health);
+  \draw[hw bus] (health) -- (condition);
+
+  \node[hw state, minimum width=2.35cm, align=center] (seed) at (9.8,0.7)
+    {种子 FIFO\\带质量状态};
+  \node[hw compute, minimum width=2.35cm, align=center] (drbg) at (6.8,0.7)
+    {DRBG / CSRNG\\扩展随机流};
+  \node[hw memory, minimum width=2.35cm, align=center] (consumer) at (3.8,0.7)
+    {密钥管理器\\nonce 与掩码};
+  \node[hw control, minimum width=2.35cm, align=center] (alert) at (0.8,0.7)
+    {安全控制器\\停发、告警、重启};
+  \draw[hw bus] (condition) -- (seed);
+  \draw[hw bus] (seed) -- (drbg);
+  \draw[hw bus] (drbg) -- (consumer);
+  \draw[hw danger] (health.south) -- (6.8,2.0) -- (0.8,2.0) -- (alert.north);
+\end{pdfdiagram}
+\diagramnote{随机数通路的两个完成域。健康检测通过只说明当前窗口未观察到规定异常；种子还要经过条件化并带质量状态进入 DRBG。健康检测失败时，控制器停止向密钥消费者提供新熵，而不是继续输出看似随机的数据。}
+
+最小熵是对“最容易猜中的结果”给出的保守下界。假设经过器件表征和依赖分析后，原始符号的有效最小熵下界为每 bit 0.35 bit；收集 1024 个满足该模型的原始 bit，名义下界为 $1024\times0.35=358.4$ bit。把它条件化成 256-bit 种子可以保留安全余量，但条件化不能把只有 100 bit 不确定性的输入变成 256 bit 真正不可预测的种子。原始符号若存在未建模相关性，也不能直接把每个符号的估计值相加。
+
+在线检测同样不是通用随机性证明。重复计数检测适合发现输出卡在同一值，比例检测适合发现窗口内 0/1 比例突变；两者都可能漏过仍落在阈值内的缓慢退化。阈值还要平衡误报与漏报，并保存水位、失败计数、温度和电源状态，使现场异常能够与器件表征条件比较。OpenTitan 的公开硬件实现把物理噪声、健康检测、SHA-3 条件化、种子 FIFO 与下游随机数网络明确分层，说明这些状态必须分别验收。\cite{opentitan-security-hw}
+
+\topic{根密钥应派生用途密钥，而不应成为软件可读数据}
+
+设备根密钥可以来自一次性可编程存储、熔丝、受保护非易失存储，或由 PUF 响应经纠错与稳定化后重建。无论物理来源是什么，根密钥都不应通过普通 load 或调试寄存器读出。密钥管理器接收设备身份、固件度量、生命周期状态、用途标签和版本号，经密钥派生函数产生工作密钥；工作密钥最好通过专用 sideload 端口直接进入 AES、HMAC 或存储加密单元，软件只获得操作句柄或密文结果。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw state, minimum width=2.25cm, align=center] (test) at (0.8,3.25)
+    {TEST\\扫描与制造测试};
+  \node[hw state, minimum width=2.25cm, align=center] (dev) at (3.7,3.25)
+    {DEV\\受控调试};
+  \node[hw control, minimum width=2.25cm, align=center] (prod) at (6.6,3.25)
+    {PROD\\任务运行};
+  \node[hw control, minimum width=2.25cm, align=center] (rma) at (9.5,3.25)
+    {RMA\\授权返修};
+  \draw[hw bus] (test) -- node[hw label,above]{测试退出令牌} (dev);
+  \draw[hw bus] (dev) -- node[hw label,above]{不可逆提交} (prod);
+  \draw[hw danger] (prod) -- node[hw label,above]{擦除后授权} (rma);
+
+  \node[hw memory, minimum width=2.65cm, align=center] (root) at (1.8,0.55)
+    {OTP / PUF 根秘密\\普通总线不可读};
+  \node[hw compute, minimum width=2.65cm, align=center] (kdf) at (5.2,0.55)
+    {密钥派生\\状态、版本、用途};
+  \node[hw memory, minimum width=2.65cm, align=center] (work) at (8.6,0.55)
+    {硬件工作密钥\\sideload 到消费者};
+  \draw[hw bus] (root) -- (kdf);
+  \draw[hw bus] (kdf) -- (work);
+  \draw[hw return] (prod.south) -- (6.6,1.75) -- (5.2,1.75) -- (kdf.north);
+  \draw[hw danger] (rma.south) -- (9.5,1.75) -- node[hw label,below]{旧任务密钥失效} (8.6,1.75) -- (work.north);
+\end{pdfdiagram}
+\diagramnote{生命周期与密钥路径必须互相约束。PROD 状态参与派生，返修前先清除任务数据并使旧工作密钥不可再生；否则“重新打开调试”会同时重新打开任务期秘密。状态转换、密钥版本和调试能力属于同一次不可逆提交。}
+
+\begin{longtable}{L{0.15\linewidth}L{0.23\linewidth}L{0.27\linewidth}L{0.25\linewidth}}
+\toprule
+生命周期 & 允许的观察能力 & 密钥边界 & 转换证据 \\
+\midrule
+TEST & 扫描、存储器测试和制造诊断 & 不生成任务身份；测试秘密与产品秘密隔离 & 测试结果、器件身份与退出令牌 \\\tablerowrule
+DEV & 签名授权的 CPU/固件调试 & 使用开发用途派生域，不能等同 PROD 密钥 & 调试证书、时限与审计记录 \\\tablerowrule
+PROD & 关闭侵入式调试，只保留受控遥测 & 根秘密不可读，工作密钥绑定版本与用途 & 不可逆生命周期状态和启动度量 \\\tablerowrule
+RMA & 在物理和密码授权后开放有限诊断 & 先擦除任务数据并撤销原身份密钥 & 擦除确认、返修令牌和新 generation \\\tablerowrule
+SCRAP & 仅保留可识别的报废状态 & 禁止再生成任务或返修密钥 & 不可逆报废状态 \\
+\bottomrule
+\end{longtable}
+
+制造测试需要高可见性，任务运行需要强隔离，这两个目标不能靠一枚普通软件配置位切换。生命周期状态应由冗余编码状态机、OTP 转换和挑战响应共同约束；非法编码、跳步或重复使用旧授权都进入故障状态。OpenTitan 的公开生命周期设计把制造、开发、生产、返修和报废状态与调试、NVM 后门和密钥派生相连，并明确部分转换不可逆。\cite{opentitan-security-hw}
+
+\topic{侧信道观察与故障注入改变的是不同方向的信息流}
+
+\term{侧信道}{side channel}不直接读取密钥寄存器，而是观察运算时间、Cache 行为、供电电流或电磁辐射与秘密数据之间的统计关系。常数时间与固定访存路径减少时间和 Cache 泄漏；掩码把中间值分成多个随机份额，使单次观测不直接对应秘密；隐藏技术调整操作顺序、平衡切换或加入噪声，以降低信号相关性。任何措施都要用明确泄漏模型和足够样本验证，随机延迟本身不能消除功耗样本与内部中间值的关系。
+
+\term{故障注入}{fault injection}则主动改变电路条件。短时欠压、过压、时钟异常、电磁脉冲、温度越界或局部光照都可能让某个触发器漏采、让总线出现错误 bit，或使安全状态机跳过检查。电压/时钟监视器、冗余状态编码、控制流签名、时间或空间冗余计算以及最终输出比较可以提高检测率；但两个副本若共享同一电源、时钟和布局区域，一次共同扰动可能让它们产生相同错误，比较器便看不出分歧。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block, minimum width=2.7cm, align=center] (passive) at (1.0,3.45)
+    {被动观察\\时间、功耗、电磁};
+  \node[hw block, minimum width=2.7cm, align=center] (active) at (1.0,0.65)
+    {主动扰动\\电压、时钟、温度};
+
+  \node[hw compute, minimum width=2.75cm, align=center] (crypto) at (4.7,3.45)
+    {密码与密钥数据通路\\中间值和访存};
+  \node[hw control, minimum width=2.75cm, align=center] (fsm) at (4.7,0.65)
+    {控制与采样边界\\状态机和比较};
+
+  \node[hw control, minimum width=2.75cm, align=center] (counter) at (8.4,3.45)
+    {泄漏约束\\常数时间、掩码\\隔离与统计验证};
+  \node[hw control, minimum width=2.75cm, align=center] (detect) at (8.4,0.65)
+    {故障约束\\监视器、冗余\\编码与输出阻断};
+
+  \draw[hw danger] (passive) -- (crypto);
+  \draw[hw bus] (crypto) -- (counter);
+  \draw[hw danger] (active) -- (fsm);
+  \draw[hw bus] (fsm) -- (detect);
+  \draw[hw return] (counter.south) -- (8.4,2.05) -- node[hw label,above]{减少可观测相关性} (4.7,2.05) -- (crypto.south);
+  \draw[hw return] (detect.south) -- (8.4,-0.45)
+    -- node[hw label,below]{异常时清密钥并拒绝输出} (4.7,-0.45)
+    -- (fsm.south);
+\end{pdfdiagram}
+\diagramnote{侧信道与故障注入是两条相反的信息路径。侧信道从正常计算泄漏相关量，措施要降低“秘密—观测”的统计关系；故障注入从外部改变内部状态，措施要在结果发布前检测异常并阻断输出。两类措施不能互相替代。}
+
+\begin{longtable}{L{0.17\linewidth}L{0.24\linewidth}L{0.27\linewidth}L{0.22\linewidth}}
+\toprule
+物理现象 & 首个可见证据 & 主要硬件措施 & 完成边界 \\
+\midrule
+时间/Cache 泄漏 & 秘密类别与时延、miss 分布相关 & 固定控制流、固定访存、隔离共享资源 & 统计测试未检出规定模型下的相关性 \\\tablerowrule
+功耗/电磁泄漏 & 波形与中间值假设相关 & 掩码、平衡、随机份额与物理屏蔽 & 目标样本规模下相关检验满足阈值 \\\tablerowrule
+电压/时钟注入 & 监视器越界、冗余比较不一致 & 独立监视、编码状态、重复计算、输出门控 & 错误结果未离开安全边界，秘密已清除 \\\tablerowrule
+激光/局部电磁注入 & 局部寄存器或总线产生稀疏错误 & 物理遮蔽、传感网、空间分离和完整性码 & 检测覆盖与未检出残余风险有证据 \\\tablerowrule
+调试口滥用 & 生命周期与授权不匹配 & 不可逆状态、挑战响应、能力最小化 & 会话到期后接口关闭且密钥域未跨界 \\
+\bottomrule
+\end{longtable}
+
+\topic{Rowhammer 表明地址隔离仍依赖 DRAM 的物理邻接}
+
+DRAM 控制器把一次行访问展开为 ACT、列命令和 PRE。若攻击者在一个刷新窗口内反复激活并关闭特定行，电气扰动可能使物理邻行的单元漏失电荷并翻转，即使攻击者没有该邻行的地址权限。原始 Rowhammer 实验表明，软件可通过制造高频行激活触发这种扰动错误；这使“页表禁止写入”与“物理内容不会改变”不再等价。\cite{rowhammer-isca}
+
+防护需要多层证据。内存控制器可以跟踪单位窗口的行激活频率，对邻行做定向刷新，或限制异常访问率；DRAM 内部措施可以提供更细粒度刷新管理；ECC 可纠正部分 bit 错并把错误趋势交给 RAS；系统软件还可避免把不同安全域的关键页放在可能共享扰动边界的位置。任一层都不能假定其他层必然覆盖所有模式：地址映射可能被控制器重排，多个 bit 可能同时翻转，刷新措施也可能存在有限跟踪容量。
+
+物理安全的完成边界不是“某个监视器产生告警”。系统必须在秘密或错误结果离开受保护域之前阻断输出，清除可能暴露的工作密钥，保存足够但不泄密的证据，并把恢复绑定到新生命周期状态或新 generation。熵、密钥、调试、侧信道、故障注入和存储扰动只有共同进入这条失败路径，逻辑安全机制的前提才得到硬件层约束。

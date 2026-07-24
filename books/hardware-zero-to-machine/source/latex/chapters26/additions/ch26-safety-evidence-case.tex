@@ -1,0 +1,65 @@
+\section{功能安全案例：传感器输出卡滞后怎样在截止时间内关闭执行器}
+
+最后用一条跨层时间线检验全书接口。设一台电机控制器每 1 ms 采集两路独立位置传感器，正常时两路值应在允许误差内共同变化；安全目标规定任一路卡滞或两路持续不一致时，PWM 驱动必须在故障出现后 10 ms 内撤销。主处理器执行控制算法，锁步副本检查核心分歧，独立安全岛掌握最终驱动许可。这个案例不依赖具体车辆或工业标准，而是把采样、存储、DMA、调度、比较、门控和证据保存放进同一个 FTTI。
+
+\topic{新的 DMA 完成不表示新的物理信息}
+
+ADC 每次触发后把两路样本、硬件时间戳、序号和通道状态写入 DMA 环。若传感器 A 的模拟输出卡在某个合法电压，ADC 与 DMA 仍会按时完成，每个描述符也都有新序号；只有“值变化率”“A/B 差值”和“样本年龄”能暴露物理信息已经失效。因此设备队列的完成语义必须与传感器信息的新鲜度语义分开。
+
+安全任务读取同一批次的 A/B 样本，先验证序号、CRC 和时间戳，再计算通道差值与变化率。一次瞬时偏差可以进入去抖窗口，连续三批不一致则在第三批截止点提交故障状态。主控制任务不能用旧 A 值继续扩大 PWM，也不能等待普通日志系统写盘后才反应；安全岛在收到经过锁步比较的禁止请求或独立 deadline monitor 超时后，直接撤销硬件许可。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block, minimum width=2.45cm, align=center] (fault) at (0.8,4.35)
+    {$t_0$ 物理故障\\传感器 A 输出卡滞};
+  \node[hw state, minimum width=2.45cm, align=center] (dma) at (4.0,4.35)
+    {$t_0+1$ ms\\ADC/DMA 仍按时完成};
+  \node[hw compute, minimum width=2.45cm, align=center] (check) at (7.2,4.35)
+    {$t_0+3$ ms\\三批一致性检查失败};
+  \node[hw control, minimum width=2.45cm, align=center] (lock) at (10.4,4.35)
+    {$t_0+3.4$ ms\\锁步比较禁止请求};
+  \draw[hw bus] (fault) -- (dma) -- (check) -- (lock);
+
+  \node[hw control, minimum width=2.45cm, align=center] (gate) at (10.4,1.25)
+    {$t_0+4$ ms\\安全岛撤销 PWM 许可};
+  \node[hw state, minimum width=2.45cm, align=center] (feedback) at (7.2,1.25)
+    {$t_0+6.8$ ms\\驱动反馈确认关闭};
+  \node[hw memory, minimum width=2.45cm, align=center] (evidence) at (4.0,1.25)
+    {异步保存证据\\样本、比较点、监视器};
+  \node[hw state, minimum width=2.45cm, align=center] (hold) at (0.8,1.25)
+    {保持 Safe\\验收前不得重启输出};
+  \draw[hw danger] (lock) -- (gate);
+  \draw[hw return] (gate) -- (feedback);
+  \draw[hw return] (feedback) -- (evidence);
+  \draw[hw return] (evidence) -- (hold);
+
+  \draw[draw=black!65, line width=0.7pt] (0.8,0.0) -- (10.4,0.0);
+  \draw[draw=black!65, line width=0.7pt] (0.8,-0.2) -- (0.8,0.2);
+  \draw[draw=black!65, line width=0.7pt] (10.4,-0.2) -- (10.4,0.2);
+  \node[hw label] at (5.6,-0.4) {实测安全动作 6.8 ms，早于 10 ms FTTI};
+\end{pdfdiagram}
+\diagramnote{一次传感器卡滞的完整安全时间线。DMA 完成只证明转换结果进入内存；三批一致性窗口确认信息失效，锁步核心产生禁止请求，安全岛撤销独立硬件许可，执行器反馈才确认安全动作完成。证据保存位于关断之后的异步路径，不占用关键 FTTI。}
+
+\begin{longtable}{L{0.15\linewidth}L{0.24\linewidth}L{0.30\linewidth}L{0.21\linewidth}}
+\toprule
+时刻 & 状态与所有者 & 可验证证据 & 尚不能宣称 \\
+\midrule
+$t_0$ & 传感器 A 物理值停止变化 & 环境激励继续变化，A 输出保持不变 & 控制器已经观察到故障 \\\tablerowrule
+$t_0+1$ ms & ADC/DMA 发布新描述符 & 新序号、时间戳、CRC 与完成位 & 新样本包含新的物理信息 \\\tablerowrule
+$t_0+3$ ms & 安全任务提交不一致状态 & 三批 A/B 差值和变化率超过边界 & 执行器已经关闭 \\\tablerowrule
+$t_0+3.4$ ms & 锁步接口比较一致 & 两核都发布同代禁止请求，无核心分歧 & 安全岛与输出门已经执行 \\\tablerowrule
+$t_0+4$ ms & 安全岛撤销 PWM 许可 & 许可锁存器为 0，PWM 输出进入关闭序列 & 机械能量已经消散 \\\tablerowrule
+$t_0+6.8$ ms & 驱动反馈达到安全值 & 门极状态、电流和执行器反馈满足边界 & 可以自动恢复正常模式 \\
+\bottomrule
+\end{longtable}
+
+\topic{独立 deadline monitor 覆盖主计算路径停止响应}
+
+如果主核心、DMA 队列或中断路径完全停止，三批比较任务可能根本没有机会提交故障。独立安全岛因此维护样本序号和控制心跳的最迟到达时间：每个新周期只有在样本有效、锁步比较通过且控制输出属于当前 generation 时才刷新 deadline。计时器到期直接撤销许可，不依赖主操作系统调度，也不需要先判断故障位于 ADC、DMA、Cache、中断还是任务本身。
+
+该监视器必须使用独立或受监测的时钟，并把计数器、比较器与输出门纳入启动自检和周期故障注入。若主时钟与安全时钟同时停止，硬件许可应依靠默认关闭的电气结构释放；若输出门短路，反馈触点或电流传感器必须把“命令已关闭但能量仍存在”升级为另一条关断路径。watchdog 产生中断而主核心无法处理，不算完成。
+
+\topic{恢复要重建物理可信度，而不只是清除故障位}
+
+进入 Safe 后，系统冻结故障样本、描述符 generation、锁步比较点、电压/时钟监视器状态和执行器反馈。普通遥测可以随后把这些证据写入持久存储，但不得保存根密钥、掩码份额或会扩大攻击面的原始安全状态。重新许可前要确认传感器 A 已恢复变化并与 B 在校准范围内，ADC 自检和 DMA 环使用新 generation，锁步与 deadline monitor 测试通过，执行器反馈在关闭命令下保持安全。
+
+这条时间线把全书的完成语义再次分开：ADC 完成是一次采样事务结束，DMA completion 是数据到达主存，锁步比较是计算结果一致，许可撤销是控制命令到达输出边界，反馈确认才是物理安全动作完成。跨层故障定位只有保存这些不同时间点和事务身份，才能判断 10 ms 预算具体消耗在哪一段，并证明恢复后不会把旧完成或旧许可带回新运行周期。
