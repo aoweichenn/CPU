@@ -1,0 +1,225 @@
+\section{一次可复算的映像替换：从路径到新入口}
+
+前文已经分别说明 ELF 段、用户栈、解释器和提交点。下面把这些结构放进一次带具体初值的
+替换过程，用同一份对象账本同时验证成功路径和失败路径。设进程 P 的标识为 420，当前只有
+线程 T0，旧映像入口为 \code{0x00401000}，旧地址空间对象记为 M0。T0 执行：
+
+\begin{lstlisting}
+// 路径、参数和环境都位于旧地址空间 M0；内核必须先取得稳定副本。
+execve("/opt/demo/bin/calc",
+       ["calc", "17", "25"],
+       ["LANG=zh_CN.UTF-8", "MODE=safe"])
+\end{lstlisting}
+
+目标文件是 64 位位置无关可执行文件。ELF program header 给出三个需要装入的区段：
+
+\begin{longtable}{|L{0.16\linewidth}|L{0.20\linewidth}|L{0.20\linewidth}|L{0.18\linewidth}|L{0.16\linewidth}|}
+\hline
+区段 & 文件范围 & 目标虚拟范围 & 权限与对齐 & 需要验证的事实 \\ \hline
+\code{PT\_LOAD 0} & 偏移 \code{0x0000}，长度 \code{0x1a30} &
+\code{0x555555554000} 起 & 读、执行；页对齐 &
+文件范围未越界，尾页补零不覆盖下一段 \\\tablerowrule
+\code{PT\_LOAD 1} & 偏移 \code{0x2000}，长度 \code{0x0830} &
+\code{0x555555557000} 起 & 只读；页对齐 &
+重定位后仍不可写 \\\tablerowrule
+\code{PT\_LOAD 2} & 偏移 \code{0x3000}，文件长 \code{0x0410}、内存长 \code{0x0a00} &
+\code{0x555555558000} 起 & 读、写；页对齐 &
+\code{memsz >= filesz}，BSS 区域清零 \\ \hline
+\end{longtable}
+
+这一组数字让“装入程序”不再等于复制整个文件。第一段的文件偏移和虚拟地址页内偏移必须
+相容；第二段不能因为重定位方便而永久保持可写；第三段后半没有对应文件字节，却必须在新
+程序第一次读取之前表现为零。内核还要为解释器、用户栈、随机化区域和辅助页面选择互不
+重叠的地址。
+
+\subsection{准备阶段为何仍然依赖旧地址空间}
+
+系统调用入口建立在 T0 的内核栈上，但 \code{path}、\code{argv} 和 \code{envp} 指针仍按
+M0 解释。如果内核先切换到新页表，再读取参数，原指针可能已经无效；如果只保存指针而不
+复制字符串，另一个线程还能在校验过程中改变内容。即使本例只有一个线程，接口也应维持
+同一条稳定规则：先限制总字节数和指针数，再把参数复制到内核拥有的临时对象。
+
+\begin{lstlisting}
+prepare_exec(user_path, user_argv, user_envp):
+  // 复制以后不再信任用户指针；长度上限同时限制内存消耗和扫描时间。
+  args = copy_argument_block(user_argv, user_envp, ARG_MAX)
+  path = copy_path(user_path, PATH_MAX)
+
+  // 打开对象保存稳定的文件身份；之后的路径改名不会替换这个引用。
+  image_file = open_for_exec(path)
+  deny_write_if_required(image_file)
+
+  // 新地址空间尚未公开，任何失败都只释放准备对象。
+  candidate_mm = allocate_empty_address_space()
+  return ExecCandidate(args, image_file, candidate_mm)
+\end{lstlisting}
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.24\linewidth}|L{0.25\linewidth}|L{0.22\linewidth}|}
+\hline
+对象 & 代表字段 & 当前所有者与寿命 & 失败时的责任 \\ \hline
+参数块 & 字符串字节、指针个数、总长度 & exec 准备对象；提交后复制进用户栈 &
+释放内核页，不改变 M0 \\\tablerowrule
+可执行文件引用 & inode/file 引用、打开方式、写入排斥状态 & exec 准备对象；提交后转入新映像记录 &
+解除写入排斥并减少引用 \\\tablerowrule
+候选地址空间 M1 & VMA 集合、页表根、ASLR 选择、入口 & 准备路径独占；提交后由进程 P 持有 &
+撤销映射并释放页表和页面 \\\tablerowrule
+旧地址空间 M0 & 旧 VMA、页表、用户栈和代码 & 提交前始终由 P 持有 &
+准备失败时继续运行，不能提前释放 \\ \hline
+\end{longtable}
+
+\subsection{先验证结构，再产生可见映射}
+
+ELF 解析器不能把文件头中的长度和计数直接用于内存访问。设 program header 表从文件偏移
+\code{0x40} 开始，每项 56 字节，共 9 项。解析器至少要用不溢出的算术验证
+\code{0x40 + 9 * 56} 位于文件范围内，并逐项检查文件偏移、虚拟范围、对齐关系和权限组合。
+这些检查发生在候选对象中，不把“看起来像 ELF”误当成“已经可以执行”。
+
+\begin{lstlisting}
+validate_load_segment(ph, file_size):
+  // 先检查加法和区间，再读取或建立任何映射。
+  require checked_add(ph.offset, ph.filesz) <= file_size
+  require ph.memsz >= ph.filesz
+  require same_page_offset(ph.offset, ph.vaddr)
+
+  // 地址上界和区间重叠由候选地址空间统一判定。
+  range = checked_user_range(ph.vaddr, ph.memsz)
+  require !candidate_mm.overlaps(range)
+  require !(ph.writable && ph.executable) unless policy_allows_wx
+\end{lstlisting}
+
+映射阶段只建立 M1。文件支持的页面可以按需缺页装入；BSS 尾部由匿名零页或新分配页支持；
+暂时需要重定位的页面必须在动态链接器完成后收紧权限。此时处理器仍按 M0 取指，父进程、
+\code{/proc} 观察者和同一进程的其他内核路径也不应把 M1 当成已经生效的映像。
+
+\subsection{用户栈是一份具有内部引用的序列化对象}
+
+设内核为新栈选择顶端 \code{0x00007fffffffe000}。字符串从高地址向低地址复制，随后按 ABI
+要求对齐，再写入辅助向量、环境指针、参数指针和 \code{argc}。指针值必须指向 M1 中最终
+地址，不能指向准备阶段的内核参数块。
+
+\begin{pdfdiagram}[scale=0.90]
+  \node[os memory, minimum width=70mm, minimum height=76mm] (stack) at (0,0) {};
+  \node[os title] at (0,31mm) {新用户栈 M1：地址向上增长};
+  \node[os label, fill=none, text=BookInk] at (0,21mm)
+    {\code{0x7fffffffdfe0} \quad 随机字节、平台字符串};
+  \draw[os guide] (-31mm,14mm) -- (31mm,14mm);
+  \node[os label, fill=none, text=BookInk] at (0,7mm)
+    {环境字符串与参数字符串\\每个字符串以零字节结束};
+  \draw[os guide] (-31mm,-2mm) -- (31mm,-2mm);
+  \node[os label, fill=none, text=BookInk] at (0,-10mm)
+    {\code{auxv[]}：类型、值成对，末项为 \code{AT\_NULL}};
+  \draw[os guide] (-31mm,-18mm) -- (31mm,-18mm);
+  \node[os label, fill=none, text=BookInk] at (0,-27mm)
+    {\code{envp[]}、\code{argv[]}、\code{argc=3}};
+
+  \node[os compute, minimum width=49mm] (builder) at (92mm,15mm)
+    {栈构造器\\先放字符串\\再计算并写指针};
+  \node[os state, minimum width=49mm] (entry) at (92mm,-18mm)
+    {提交后初值\\RIP=解释器入口\\RSP=栈布局起点};
+  \draw[os bus] (builder.west) -- (stack.east |- builder.west);
+  \draw[os strong bus] (stack.east |- entry.west) -- (entry.west);
+\end{pdfdiagram}
+\diagramnote{栈中的指针引用同一栈内更高地址的字符串。构造顺序可以从高地址向低地址进行，但提交后的读取顺序由 ABI 规定；两种顺序不能混为一谈。}
+
+动态链接程序的初始 RIP 通常不是主程序 ELF 头中的入口，而是 \code{PT_INTERP} 指定解释器
+的入口。主程序入口、program header 地址、页大小、安全随机数和执行文件描述等信息通过
+辅助向量交给解释器。解释器完成依赖库映射和重定位后，才转到主程序入口。这项用户态工作
+发生在 exec 已经提交之后；若解释器随后缺库退出，内核不能恢复旧映像。
+
+\subsection{提交点只交换已经验证完成的根引用}
+
+到提交前，M0 和 M1 同时存在。M0 是公开状态，M1 是准备状态。提交不能逐个把旧 VMA
+替换成新 VMA，否则观察者可能看见代码来自 M1、栈仍来自 M0 的混合状态。教学模型把提交
+表达为根引用交换，并在交换前完成所有仍可回滚的工作。
+
+\begin{pdfdiagram}[scale=0.88]
+  \node[os state, minimum width=44mm] (old) at (-58mm,18mm)
+    {公开状态\\P.mm=M0\\旧 RIP、旧用户栈};
+  \node[os compute, minimum width=44mm] (prepare) at (0,18mm)
+    {准备 M1\\校验段、建 VMA\\构造栈与入口};
+  \node[os control, minimum width=44mm] (commit) at (58mm,18mm)
+    {提交临界点\\停止其他线程\\交换 P.mm};
+
+  \node[os memory, minimum width=44mm] (rollback) at (0,-20mm)
+    {提交前失败\\释放 M1\\继续按 M0 返回错误};
+  \node[os state, minimum width=44mm] (new) at (58mm,-20mm)
+    {提交后状态\\P.mm=M1\\关闭 CLOEXEC fd};
+
+  \draw[os bus] (old.east) -- node[above,font=\scriptsize\sffamily,fill=white,inner sep=1pt]{仍可返回} (prepare.west);
+  \draw[os strong bus] (prepare.east) -- node[above,font=\scriptsize\sffamily,fill=white,inner sep=1pt]{全部验证通过} (commit.west);
+  \draw[os feedback] (prepare.south) -- (rollback.north);
+  \draw[os strong bus] (commit.south) -- (new.north);
+\end{pdfdiagram}
+\diagramnote{提交前的失败路径回收候选对象并保留 M0；提交后的错误只能终止或在新映像内报告。判断一道错误路径是否可回滚，关键是它发生在根引用交换之前还是之后。}
+
+\begin{lstlisting}
+commit_exec(candidate):
+  // 所有可能返回普通错误的校验必须已经完成。
+  require candidate.state == READY
+  stop_or_remove_sibling_threads()
+  lock(process.exec_lock)
+
+  // 根引用交换是用户可见身份变化的中心提交点。
+  old_mm = process.mm
+  process.mm = candidate.mm
+  install_new_credentials(candidate.cred)
+  close_cloexec_descriptors(process.files)
+  install_user_entry(candidate.entry, candidate.stack_pointer)
+
+  unlock(process.exec_lock)
+  // 旧地址空间在不可达且引用归零后回收；不能在交换前释放。
+  release_address_space(old_mm)
+\end{lstlisting}
+
+这里还要区分三个相邻边界。文件格式通过验证，只说明候选字节可解释；M1 准备完成，只说明
+存在一个可以提交的地址空间；根引用交换完成，才说明进程身份已经切换。动态链接成功和
+主程序开始执行则是提交后的后续结果。
+
+\subsection{失败位置决定错误返回还是进程终止}
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.27\linewidth}|L{0.18\linewidth}|}
+\hline
+失败位置 & 已改变的状态 & 收束方式 & 用户可见结果 \\ \hline
+复制参数时遇到坏指针 & 只有临时参数块 & 释放临时页 & 旧程序得到 \code{EFAULT} \\\tablerowrule
+ELF 段越出文件 & 文件引用与部分 M1 映射 & 撤销候选映射并关闭引用 & 旧程序得到 \code{ENOEXEC} \\\tablerowrule
+构造栈时内存不足 & M1 已基本形成 & 释放 M1，保持 M0 & 旧程序得到 \code{ENOMEM} \\\tablerowrule
+根引用交换后解释器缺少依赖 & M0 已不可恢复，M1 已公开 & 新映像按装载器规则退出 & 进程终止并留下新身份的退出状态 \\\tablerowrule
+提交后第一次取指缺页失败 & 新凭据和新地址空间可能已经生效 & 形成致命信号或异常退出 & 不能回到旧程序继续 \\ \hline
+\end{longtable}
+
+\section{本章复核：一次 exec 必须对清的六本账}
+
+完整复核不再从“exec 会加载程序”开始，而是逐项核对：输入字节属于 M0，稳定副本属于
+准备对象；文件引用固定映像身份；M1 独立保存候选映射；栈指针引用 M1 内的最终字符串；
+提交只交换已完成的根对象；提交前失败回滚，提交后失败由新映像承担。只有六项同时成立，
+进程标识保持不变与程序映像被完全替换才不矛盾。
+
+\begin{chapterexercise}{判断三个不同的成功边界}
+某次 \code{execve} 已通过 ELF 校验并完成 M1 映射，但尚未交换 \code{process.mm}。分别说明
+“格式有效”“候选映像完成”“exec 已成功”是否成立，并指出此时发生内存不足应由哪个映像继续。
+\end{chapterexercise}
+
+\begin{chapteranswer}{判断三个不同的成功边界}
+格式有效和候选映像完成已经成立，exec 成功尚未成立，因为进程公开根引用仍指向 M0。
+内存不足发生在提交前，应释放 M1 和准备对象，按 M0 返回 \code{ENOMEM}；不能留下部分新映像。
+\end{chapteranswer}
+
+\begin{chapterexercise}{复算用户栈中的引用}
+若三个参数字符串最终位于 \code{0x7fffffffd900}、\code{0x7fffffffd905} 和
+\code{0x7fffffffd908}，说明 \code{argv[0..2]} 应保存什么，为什么不能保存内核参数块地址。
+\end{chapterexercise}
+
+\begin{chapteranswer}{复算用户栈中的引用}
+\code{argv} 三项依次保存这三个用户虚拟地址，末项再保存空指针。内核参数块只在准备阶段
+可达，提交后会释放，而且用户态不能按内核地址访问它；因此栈内引用必须指向 M1 中的最终字符串。
+\end{chapteranswer}
+
+\begin{chapterexercise}{定位不可回滚的失败}
+比较“解释器 ELF 自身校验失败”和“解释器已经开始运行但找不到共享库”。哪一种通常可以向
+旧程序返回错误，哪一种只能在新映像中终止？用提交点解释，而不要只依据错误名称。
+\end{chapterexercise}
+
+\begin{chapteranswer}{定位不可回滚的失败}
+内核在提交前校验解释器 ELF 时失败，仍可释放候选映像并让旧程序得到错误。解释器开始运行
+意味着根引用已经交换，旧地址空间和旧凭据变化不能作为普通调用回滚；缺库只能由新映像报告并退出。
+\end{chapteranswer}

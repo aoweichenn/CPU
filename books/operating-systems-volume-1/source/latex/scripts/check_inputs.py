@@ -9,6 +9,22 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "main.tex"
+BOOKS_ROOT = ROOT.parents[2]
+SAMPLE_CHAPTERS = (
+    BOOKS_ROOT
+    / "operating-systems-evolution-sample"
+    / "source"
+    / "latex"
+    / "chapters"
+)
+EVOLUTION_DEST = ROOT / "chapters18" / "evolution"
+FILESYSTEM_SOURCE = ROOT / "chapters" / "ch17b-filesystem-from-scratch.tex"
+FILESYSTEM_OUTPUTS = (
+    "ch11-filesystem-formation.tex",
+    "ch12-filesystem-indexing.tex",
+    "ch13-filesystem-recovery.tex",
+    "ch14-modern-filesystems.tex",
+)
 
 
 INPUT_RE = re.compile(
@@ -78,6 +94,46 @@ def part_heading_count() -> int:
     return len(re.findall(r"^\\part\{", text, flags=re.MULTILINE))
 
 
+def generated_drift() -> list[str]:
+    """Return generated chapter assets that no longer match their sources."""
+    drift: list[str] = []
+    for source in sorted(SAMPLE_CHAPTERS.rglob("*.tex")):
+        relative = source.relative_to(SAMPLE_CHAPTERS)
+        destination = EVOLUTION_DEST / relative
+        expected = source.read_text(encoding="utf-8").replace(
+            r"\input{chapters/ch01/",
+            r"\input{chapters18/evolution/ch01/",
+        )
+        if not destination.is_file() or destination.read_text(encoding="utf-8") != expected:
+            drift.append(str(destination.relative_to(ROOT)))
+
+    filesystem = FILESYSTEM_SOURCE.read_text(encoding="utf-8")
+    filesystem = filesystem.removeprefix("\\begin{filesystemlayout}\n\n")
+    filesystem = filesystem.removesuffix("\n\\end{filesystemlayout}\n")
+    markers = [
+        index
+        for index in range(len(filesystem))
+        if filesystem.startswith("\\chapter{", index)
+    ]
+    if len(markers) != len(FILESYSTEM_OUTPUTS):
+        drift.append("chapters/ch17b-filesystem-from-scratch.tex: chapter markers")
+        return drift
+
+    markers.append(len(filesystem))
+    for output_name, start, end in zip(
+        FILESYSTEM_OUTPUTS, markers[:-1], markers[1:], strict=True
+    ):
+        expected = (
+            "\\begin{filesystemlayout}\n\n"
+            + filesystem[start:end].strip()
+            + "\n\n\\end{filesystemlayout}\n"
+        )
+        output = ROOT / "chapters18" / output_name
+        if not output.is_file() or output.read_text(encoding="utf-8") != expected:
+            drift.append(str(output.relative_to(ROOT)))
+    return drift
+
+
 def main() -> int:
     missing = [path for path in input_paths() if not path.is_file()]
     if missing:
@@ -119,6 +175,14 @@ def main() -> int:
         print("missing required front/back matter:")
         for path in missing_required:
             print(path)
+        return 1
+
+    drift = generated_drift()
+    if drift:
+        print("generated chapter assets are stale:")
+        for path in drift:
+            print(f"  {path}")
+        print("run source/latex/scripts/restructure_volume.py and inspect the result")
         return 1
 
     print("checked Operating Systems LaTeX manuscript inputs")

@@ -1,0 +1,178 @@
+\section{一次异步写请求：函数返回以后谁仍然拥有状态}
+
+设驱动要把内存页 P 中的 8192 字节写到设备逻辑块 4096，设备队列深度为 64。调用线程 T
+进入驱动时可以被调度，设备则独立运行。若驱动只把局部变量地址写进寄存器，提交函数返回后
+局部变量失效，设备仍可能继续 DMA。因而请求对象必须比提交调用活得更久，并明确区分
+“软件接受”“设备可见”“设备完成”和“等待者观察完成”。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.28\linewidth}|L{0.27\linewidth}|L{0.17\linewidth}|}
+\hline
+对象 & 代表字段 & 所有权与寿命 & 完成条件 \\ \hline
+请求 R37 & id、generation、operation、range、state、result、waiter &
+从分配到最终引用释放；队列和等待者可同时持有引用 & 状态进入终态且结果只发布一次 \\\tablerowrule
+DMA 映射 D37 & 设备地址、长度、方向、页引用、映射域 &
+映射成功后由请求拥有；设备不再访问后才能解除 & completion 已证明该描述符不再取数 \\\tablerowrule
+描述符槽 12 & 命令字段、DMA 地址、长度、请求标签、phase &
+入队前由驱动拥有，doorbell 后由设备消费 & 设备通过完成项归还对应标签 \\\tablerowrule
+完成项 C37 & 标签、状态、完成长度、phase/generation &
+设备产生，驱动消费 & 驱动校验身份并推进 completion head \\ \hline
+\end{longtable}
+
+\subsection{发布描述符必须先于通知设备}
+
+处理器把描述符字段写入内存，并不自动保证设备在 doorbell 之后看到完整新值。驱动先填写
+DMA 地址、长度、操作和标签，再执行适合该体系结构与 DMA 模型的发布屏障，最后写 doorbell。
+屏障不让设备更快，只建立“看到通知就应看到此前描述符”的顺序。
+
+\begin{lstlisting}
+submit_write(page, block, length):
+  // 映射阶段固定页面并产生设备可使用的地址；失败时尚未发布请求。
+  req = allocate_request()
+  req.generation = queue.generation
+  req.dma = dma_map(page, WRITE_TO_DEVICE)
+
+  // 先完整写描述符，再通过发布屏障和 doorbell 转移消费权。
+  slot = reserve_submission_slot()
+  fill_descriptor(slot, req.id, req.dma.address, block, length)
+  dma_write_barrier()
+  ring_doorbell(queue.tail)
+
+  req.state = IN_FLIGHT
+  return req
+\end{lstlisting}
+
+\begin{pdfdiagram}[scale=0.87]
+  \node[os state, minimum width=43mm] (cpu) at (-60mm,22mm)
+    {CPU/驱动\\填写槽 12\\执行发布屏障};
+  \node[os memory, minimum width=48mm] (sq) at (0,22mm)
+    {提交环 SQ\\head=8, tail=13\\槽 12 保存 R37};
+  \node[os control, minimum width=43mm] (dev) at (60mm,22mm)
+    {设备\\读取新 tail\\按序取得描述符};
+  \node[os memory, minimum width=48mm] (cq) at (0,-22mm)
+    {完成环 CQ\\标签 37、状态、phase};
+  \node[os compute, minimum width=43mm] (irq) at (-60mm,-22mm)
+    {中断/轮询路径\\消费完成项\\唤醒 T};
+  \draw[os strong bus] (cpu.east) -- node[above,font=\scriptsize\sffamily,fill=white,inner sep=1pt]{先发布字段} (sq.west);
+  \draw[os bus] (sq.east) -- node[above,font=\scriptsize\sffamily,fill=white,inner sep=1pt]{doorbell} (dev.west);
+  \draw[os bus] (dev.south) |- (cq.east);
+  \draw[os strong bus] (cq.west) -- (irq.east);
+\end{pdfdiagram}
+\diagramnote{提交环和完成环的方向相反。doorbell 只通知设备检查新 tail，不携带完整请求；完成中断只通知软件检查完成环，也不直接等于某个调用已经返回。}
+
+\subsection{等待线程状态与请求状态必须分别推进}
+
+T 可以同步等待 R37，也可以把 R37 交给异步上层后继续执行。同步等待时，T 从 RUNNING
+进入 BLOCKED，R37 仍是 IN\_FLIGHT；设备完成先把 R37 推入 COMPLETING，再由完成路径写入
+结果、解除 DMA 映射并唤醒 T。唤醒只把 T 变成 RUNNABLE，真正返回还要等调度器再次选择它。
+
+\begin{longtable}{|L{0.16\linewidth}|L{0.22\linewidth}|L{0.24\linewidth}|L{0.28\linewidth}|}
+\hline
+时刻 & T 的状态 & R37 的状态 & 此时可以断言什么 \\ \hline
+$t_0$ 提交前 & RUNNING & PREPARED & 页面仍由软件访问规则约束，设备尚不可见 \\\tablerowrule
+$t_1$ doorbell 后 & RUNNING 或即将等待 & IN\_FLIGHT & 设备可以访问 DMA 区域，buffer 不得提前复用 \\\tablerowrule
+$t_2$ T 睡眠 & BLOCKED & IN\_FLIGHT & CPU 可以运行其他任务，请求没有因此取消 \\\tablerowrule
+$t_3$ 完成项出现 & BLOCKED & COMPLETING & 设备给出结果，驱动仍需校验和清理 \\\tablerowrule
+$t_4$ 驱动发布结果 & RUNNABLE & DONE/FAILED & DMA 已解除，等待谓词成立 \\\tablerowrule
+$t_5$ T 再次运行 & RUNNING & 终态 & 调用者读取稳定结果并释放最后引用 \\ \hline
+\end{longtable}
+
+\begin{lstlisting}
+complete_from_queue(entry):
+  // 标签和队列代次共同识别请求，避免复位前的迟到完成命中新请求。
+  req = lookup(entry.request_id)
+  if req.generation != queue.generation:
+    account_stale_completion(entry)
+    return
+
+  // 先使设备停止拥有 buffer，再向等待者发布最终结果。
+  dma_unmap(req.dma)
+  req.result = translate_device_status(entry.status)
+  store_release(req.state, terminal_state(req.result))
+  wake(req.wait_queue)
+\end{lstlisting}
+
+\subsection{中断只提供“有工作”的证据}
+
+共享中断可能服务多个队列，合并中断可能代表多项完成，轮询模式甚至不为每项完成产生中断。
+因此中断处理程序不能凭中断号猜测 R37 已完成。上半部确认设备来源并屏蔽或应答事件，下半部
+或轮询器消费完成环，只有带请求标签的完成项才能推进具体对象。
+
+若完成量很大，上半部逐项处理会长期占用高优先级上下文。常见做法是限制一次消费预算：
+处理最多 N 项，尚有工作则继续调度轮询；队列清空后才重新允许中断。预算是在中断延迟和
+吞吐之间建立边界，不改变每个请求必须恰好完成一次的要求。
+
+\subsection{超时、复位和迟到完成}
+
+超时只说明规定时间内没有观察到完成，不证明设备绝不会再写 buffer。若驱动立即释放 R37
+和页面，迟到 DMA 会破坏已经分配给别人的内存。正确路径先把请求转入 TIMED\_OUT，阻止
+新的普通完成发布，再取消队列或复位设备；只有设备访问能力被撤销后才能解除映射。
+
+\begin{pdfdiagram}[scale=0.87]
+  \node[os state, minimum width=37mm] (flight) at (-62mm,15mm) {IN\_FLIGHT};
+  \node[os control, minimum width=37mm] (timeout) at (-20mm,15mm) {TIMED\_OUT};
+  \node[os compute, minimum width=37mm] (reset) at (22mm,15mm) {RESETTING};
+  \node[os state, minimum width=37mm] (failed) at (64mm,15mm) {FAILED};
+  \node[os memory, minimum width=50mm] (late) at (22mm,-20mm)
+    {迟到完成\\旧 generation\\只结算旧证据，不再发布成功};
+  \draw[os strong bus] (flight.east) -- (timeout.west);
+  \draw[os strong bus] (timeout.east) -- (reset.west);
+  \draw[os strong bus] (reset.east) -- (failed.west);
+  \draw[os feedback] (reset.south) -- (late.north);
+\end{pdfdiagram}
+\diagramnote{超时不是释放许可。复位代次把复位前后的请求身份分开；旧完成可以用于统计和清理，但不能完成复位后复用同一槽位的新请求。}
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.28\linewidth}|L{0.27\linewidth}|L{0.15\linewidth}|}
+\hline
+故障 & 直接释放为何错误 & 收束条件 & 对上层结果 \\ \hline
+DMA 映射失败 & 设备从未取得地址，但部分请求对象已分配 & 回收准备对象，不写 doorbell &
+同步返回资源错误 \\\tablerowrule
+提交后超时 & 设备可能仍持有描述符和 buffer & 取消或复位并撤销设备访问能力 &
+返回超时或设备错误 \\\tablerowrule
+设备热移除 & MMIO 与队列可能随时不可访问 & 阻止新提交，排空/失败旧请求，等待引用归零 &
+未完成请求统一失败 \\\tablerowrule
+完成项状态错误 & 传输已结束但数据结果无效 & 解除 DMA，保存精确错误与完成长度 &
+上层决定重试或部分完成 \\ \hline
+\end{longtable}
+
+\subsection{IOMMU 限制设备可访问的对象范围}
+
+没有 IOMMU 时，设备地址往往直接或经固定偏移对应物理地址，错误描述符可能访问任意可达
+内存。IOMMU 为设备建立独立地址域，使 D37 只映射请求所需页面。它不能证明设备写入内容
+正确，也不能替代请求寿命管理；它提供的是“即使描述符地址错误，访问仍被限制在已授权映射”
+这一故障边界。
+
+\section{本章复核：四次所有权转移}
+
+一次设备请求至少经历四次所有权变化：调用者把 buffer 的设备访问权交给请求；驱动发布
+描述符后把消费权交给设备；设备写入完成项后把槽位和结果交回驱动；驱动解除 DMA 并发布
+终态后，调用者才重新取得普通复用权。任何一步省略，都会把函数调用寿命误写成设备寿命。
+
+\begin{chapterexercise}{区分中断与请求完成}
+设备触发一次合并中断，完成环中有 R35、R36、R37 三项。为什么不能在中断入口直接唤醒
+R37 的等待者？写出驱动必须先取得的证据。
+\end{chapterexercise}
+
+\begin{chapteranswer}{区分中断与请求完成}
+中断只说明队列可能有新工作。驱动必须读取完成环、验证 phase、标签和 generation，取得
+R37 的状态与完成长度，再解除其 DMA 映射并发布终态。之后的唤醒才对应 R37。
+\end{chapteranswer}
+
+\begin{chapterexercise}{分析超时后的 buffer 寿命}
+R37 超时，但控制器仍可能执行旧描述符。说明为什么设置错误码还不够，以及在哪个事件后
+页面 P 才能交给其他用途。
+\end{chapterexercise}
+
+\begin{chapteranswer}{分析超时后的 buffer 寿命}
+错误码只改变软件观察，不撤销设备访问。驱动需要成功取消、排空队列，或复位设备并使旧
+映射失效；确认设备不能再 DMA 后才能解除 D37，随后页面 P 才可复用。
+\end{chapteranswer}
+
+\begin{chapterexercise}{解释发布屏障的位置}
+若驱动先写 doorbell，再补写描述符长度，设备可能观察到什么？正确顺序中的屏障保护哪一条
+因果关系？
+\end{chapterexercise}
+
+\begin{chapteranswer}{解释发布屏障的位置}
+设备可能按新 tail 取得槽位，却读到旧长度或混合字段。正确顺序先完成全部描述符写入，再
+执行 DMA 发布屏障，最后写 doorbell；它保证设备看到通知后能够看到此前发布的字段。
+\end{chapteranswer}

@@ -1,0 +1,179 @@
+\section{一次共享页实验：同一文件偏移为何只能有一个缓存身份}
+
+设文件 F 的 inode 编号为 901，页大小为 4096 字节。进程 A 通过 \code{read} 读取偏移
+8192，进程 B 把同一文件映射到 \code{0x70000000}，随后读取地址 \code{0x70002064}。
+两个操作都需要文件页索引 2 中偏移 100 的字节。如果两条路径分别分配页面，A 可能看到
+旧内容，B 却看到新内容；回写和截断也不知道该处理哪一份副本。
+
+\begin{lstlisting}
+// A 的描述符路径和 B 的地址路径必须汇合到同一缓存键。
+cache_key = (inode 901, page_index 2)
+A: pread(fd, buffer, 200, 8192)
+B: load byte at 0x70002064
+\end{lstlisting}
+
+因此，缓存身份不能属于 fd，也不能属于 VMA。fd 是一次打开关系，VMA 是一段地址策略；
+两者寿命都可能短于缓存页。稳定键应由文件身份和文件内页索引组成，代表性实现把它保存在
+inode 对应的 \code{address\_space} 索引中。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.28\linewidth}|L{0.17\linewidth}|}
+\hline
+对象 & 代表字段 & 责任与非责任 & 主要保护方式 \\ \hline
+\code{address\_space} & host inode、页索引结构、回写操作、错误序号 &
+确定同一文件偏移的缓存身份；不保存某进程的虚拟地址 & 索引锁、页锁和引用 \\\tablerowrule
+缓存页或 folio & index、uptodate、dirty、writeback、mapping、引用计数 &
+保存当前缓存字节和状态；不决定映射到哪个用户地址 & 页锁、状态位与引用 \\\tablerowrule
+VMA & 起止地址、文件引用、文件偏移、权限、共享/私有策略 &
+把地址故障翻译成文件页索引；不拥有公共缓存页内容 & 地址空间锁与 VMA 引用 \\\tablerowrule
+PTE & 物理页号、读写权限、present、dirty 等硬件可见状态 &
+保存当前地址翻译；不替代文件缓存索引和持久化状态 & 页表锁与失效协议 \\ \hline
+\end{longtable}
+
+\subsection{第一次缺页怎样发布缓存页}
+
+B 的地址减去 VMA 起点得到映射内偏移，再加 VMA 保存的文件起始偏移，得到文件偏移
+8292。向下取整得到页索引 2。若索引中没有页面，缺页处理程序先分配一个尚未公开的页面，
+以“锁定、内容未就绪”的状态插入索引，然后发起读取。其他执行流查到同一页面时等待它，
+而不是再次建立副本。
+
+\begin{lstlisting}
+file_fault(vma, address):
+  // 地址策略先给出文件页索引；此时还没有当前 PTE。
+  offset = vma.file_offset + (address - vma.start)
+  index = offset / PAGE_SIZE
+
+  // 插入者发布唯一身份，未完成读取前保持页面 locked。
+  page, created = lookup_or_create_locked(vma.file.mapping, index)
+  if created:
+    submit_read(page)
+  wait_until_unlocked(page)
+
+  // uptodate 是建立用户映射的前置条件，不能把 I/O 错误当成零页。
+  require page.uptodate
+  install_pte(address, page, permissions_from(vma))
+\end{lstlisting}
+
+\begin{pdfdiagram}[scale=0.89]
+  \node[os state, minimum width=45mm] (a) at (-58mm,22mm)
+    {进程 A\\fd 路径\\文件偏移 8192};
+  \node[os state, minimum width=45mm] (b) at (-58mm,-22mm)
+    {进程 B\\VMA 路径\\地址 \code{0x70002064}};
+  \node[os compute, minimum width=48mm] (index) at (0,0)
+    {文件缓存索引\\键=(inode 901, index 2)\\值=同一缓存页};
+  \node[os memory, minimum width=45mm] (page) at (60mm,20mm)
+    {缓存页\\uptodate、dirty\\writeback、refs};
+  \node[os control, minimum width=45mm] (io) at (60mm,-22mm)
+    {文件系统与块层\\首次 miss 才读盘\\dirty 后才写回};
+  \draw[os bus] (a.east) -| (index.north);
+  \draw[os bus] (b.east) -| (index.south);
+  \draw[os strong bus] (index.east) -- (page.west);
+  \draw[os bus] (page.south) -- (io.north);
+\end{pdfdiagram}
+\diagramnote{描述符读取和映射缺页采用不同入口，却用相同的文件身份与页索引查找缓存。VMA 和 PTE 可以有多份，公共缓存身份仍只有一份。}
+
+\subsection{共享写和私有写在首次写故障处分开}
+
+\code{MAP\_SHARED} 的写入目标仍是文件缓存页。写权限建立前，内核要确认映射允许写，
+对页面加锁，等待可能存在的写回或建立适当并发协议，随后标脏。PTE 的 dirty 位说明处理器
+发生过写入，缓存页的 dirty 状态说明文件系统需要安排回写；两者位于不同层，不能互相替代。
+
+\code{MAP\_PRIVATE} 则只共享最初读取的字节。第一次写故障分配匿名页，把旧内容复制过去，
+再让当前 PTE 指向匿名页。文件缓存页不因此变脏，其他进程也不会看到这次私有修改。
+
+\begin{pdfdiagram}[scale=0.88]
+  \node[os memory, minimum width=48mm] (file) at (0,23mm)
+    {文件缓存页 P\\键=(inode,index)\\初值 \code{0x2a}};
+  \node[os state, minimum width=48mm] (shared) at (-56mm,-21mm)
+    {\code{MAP\_SHARED}\\PTE 仍指向 P\\写后标记 P dirty};
+  \node[os state, minimum width=48mm] (private) at (56mm,-21mm)
+    {\code{MAP\_PRIVATE}\\分配匿名页 Q\\复制后 PTE 指向 Q};
+  \draw[os strong bus] (file.south west) -- node[left,font=\scriptsize\sffamily,fill=white,inner sep=1pt]{共享写} (shared.north);
+  \draw[os bus] (file.south east) -- node[right,font=\scriptsize\sffamily,fill=white,inner sep=1pt]{COW} (private.north);
+\end{pdfdiagram}
+\diagramnote{两种映射可以从同一只读缓存页开始。共享写改变公共文件页并进入回写协议；私有写建立匿名身份，之后不再由文件回写负责。}
+
+\subsection{回写完成不等于应用事务完成}
+
+缓存页从 clean 变为 dirty，表示内存中的文件版本领先于已知持久版本；进入 writeback 后，
+设备请求拥有正在传输的字节范围；完成回调清除 writeback，并根据结果更新错误序号。普通
+后台回写完成不自动向某个调用者形成持久化承诺。只有同步接口圈定范围、等待相关写回并取得
+错误结果，调用者才能判断本次要求是否满足。
+
+\begin{lstlisting}
+sync_file_range(mapping, first, last):
+  // 先把范围内的 dirty 页转交给写回请求，避免只等待旧请求。
+  submit_dirty_pages(mapping, first, last)
+  wait_for_writeback(mapping, first, last)
+
+  // 错误序号让每个打开对象判断自己尚未观察过的新错误。
+  error = sample_writeback_error(mapping)
+  return error
+\end{lstlisting}
+
+这里仍应区分“缓存页不再 dirty”“设备完成写请求”和“介质在故障模型下保持结果”。前两项
+属于本章可追踪状态，最后一项还需要第十七章的刷新、顺序和恢复协议。
+
+\subsection{truncate 与缺页并发为何需要失效协议}
+
+若另一个进程把 F 截断到 4096 字节，页索引 2 已越出新文件长度。仅更新 inode 的长度不够：
+旧缓存页、已有 PTE 和正在进行的缺页都可能继续暴露被删除范围。截断路径必须先发布新长度，
+阻止或序列化新的越界映射，再撤销 PTE、移除缓存索引并等待已有引用退出。
+
+\begin{lstlisting}
+truncate_file(inode, new_size):
+  // 新长度先成为边界判定依据，后续 fault 不得重新发布越界页。
+  lock(inode.mapping_invalidation)
+  inode.size = new_size
+  unmap_user_ptes_beyond(new_size)
+  remove_cache_pages_beyond(new_size)
+  unlock(inode.mapping_invalidation)
+\end{lstlisting}
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.28\linewidth}|L{0.28\linewidth}|L{0.14\linewidth}|}
+\hline
+交错位置 & 若没有协调会发生什么 & 正确收束 & 用户结果 \\ \hline
+fault 已算出 index 2，尚未插入页 & truncate 后又重新发布越界缓存页 &
+插入前复查长度或持有失效序列 & 映射访问得到 \code{SIGBUS} \\\tablerowrule
+页已映射，truncate 更新长度 & 处理器继续通过旧 PTE 读取删除内容 &
+先撤销越界 PTE，再移除缓存页 & 后续访问重新故障并失败 \\\tablerowrule
+页正在 writeback & 删除范围与设备写请求寿命冲突 &
+等待、取消或让完成回调识别失效代次 & 不让迟到完成恢复已删除身份 \\ \hline
+\end{longtable}
+
+\section{本章复核：地址、缓存身份与持久身份}
+
+一个用户地址首先由 VMA 解释成文件偏移，再由 inode 和页索引找到缓存身份，最后由 PTE
+建立当前物理映射。地址可以变化，PTE 可以失效，多个进程可以同时引用；公共缓存键仍然
+稳定。共享写、私有写、回写和截断之所以能够放进同一章，是因为它们都在改变或终止这条
+身份关系。
+
+\begin{chapterexercise}{追踪同一文件页的两个入口}
+A 使用 \code{pread} 读取偏移 12288，B 的 VMA 从文件偏移 8192 开始，B 访问映射内偏移
+4096。说明两条路径使用的缓存键、VMA 和 PTE 是否相同。
+\end{chapterexercise}
+
+\begin{chapteranswer}{追踪同一文件页的两个入口}
+两者都到达文件偏移 12288，即页索引 3，因此缓存键相同。A 不需要 B 的 VMA；B 有自己的
+VMA 和 PTE。缓存身份相同不意味着地址策略或当前页表项相同。
+\end{chapteranswer}
+
+\begin{chapterexercise}{区分共享写与私有写}
+两个进程最初都映射同一缓存页。一个进程执行私有写后，列出文件缓存页、匿名页、两个 PTE
+和 dirty 状态的变化。
+\end{chapterexercise}
+
+\begin{chapteranswer}{区分共享写与私有写}
+写入者获得复制出的匿名页，其 PTE 改指匿名页并允许写；另一个 PTE 仍指文件缓存页。文件
+缓存页内容和 dirty 状态不因私有写改变，匿名页的脏状态由匿名内存回收规则管理。
+\end{chapteranswer}
+
+\begin{chapterexercise}{解释截断后的迟到完成}
+页索引 5 正在写回时文件被截断到只保留页索引 0。为什么设备完成回调不能无条件把索引 5
+重新标为有效？说明需要比较或保护的身份信息。
+\end{chapterexercise}
+
+\begin{chapteranswer}{解释截断后的迟到完成}
+请求只证明旧页面的一次传输结束，不证明该文件偏移仍存在。完成路径必须受映射失效协议
+约束，或携带可识别旧代次的页面引用；它只能结束旧请求和报告错误，不能重新把已从索引移除
+的页面发布为当前缓存身份。
+\end{chapteranswer}
