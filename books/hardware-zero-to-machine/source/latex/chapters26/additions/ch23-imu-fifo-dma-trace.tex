@@ -1,0 +1,77 @@
+\section{十七、IMU 完整采集案例：FIFO 水位、SPI burst、DMA 与时间戳回绕}
+
+把传感器章节中的边界落实到一颗六轴 IMU。设备以 1 ksample/s 同时采集三轴加速度和三轴角速度，每个轴为 16 bit，并给每组样本附带 16-bit 设备时间戳。单样本长度为
+\[
+6\times2+2=14\ \text{B},
+\]
+原始 payload 为 14 kB/s。设备 FIFO 容量为 512 B，最多完整保存 $\lfloor512/14\rfloor=36$ 组样本，也就是约 36 ms 历史。
+
+驱动把水位设为 28 组，即 392 B。正常情况下每约 28 ms 触发一次服务，FIFO 还保留 8 组、约 8 ms 的余量。SPI 时钟为 10 MHz，一次 burst 发送 1 B 读命令并接收 392 B，线上时间约为
+\[
+(1+392)\times8/10\,000\,000\approx314.4\ \mu\text{s}.
+\]
+这个数只说明串行搬运时间；总预算还包括中断同步、总线仲裁、DMA 建立和任务调度。
+
+\topic{水位中断描述一批数据可取，不描述每个样本的发生时刻}
+
+IMU 的采样定时器每 1 ms 锁存一次模拟结果，递增样本序号并写 FIFO。水位到达 28 后，中断线变为有效；控制器读取 FIFO count，建立 SPI RX DMA 描述符，随后一次 burst 把整批样本写入内存环。DMA completion 归还的是这段内存的所有权，不会把 28 个样本的时间都改成 completion 时刻。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block,minimum width=2.35cm,align=center] (sample) at (0.5,3.25)
+    {1 kHz 采样\\序号与时间戳};
+  \node[hw state,minimum width=2.35cm,align=center] (fifo) at (3.7,3.25)
+    {FIFO 达 28 组\\水位中断};
+  \node[hw compute,minimum width=2.35cm,align=center] (spi) at (6.9,3.25)
+    {SPI burst\\RX DMA};
+  \node[hw state,minimum width=2.35cm,align=center] (ring) at (10.1,3.25)
+    {内存环 completion\\归还一批缓冲};
+
+  \node[hw control,minimum width=2.35cm,align=center] (publish) at (10.1,0.55)
+    {校准并发布\\物理单位};
+  \node[hw control,minimum width=2.35cm,align=center] (unwrap) at (6.9,0.55)
+    {展开时间戳\\检查序号连续};
+  \node[hw control,minimum width=2.35cm,align=center] (check) at (3.7,0.55)
+    {核对 count/CRC\\检查 overflow};
+  \node[hw control,minimum width=2.35cm,align=center] (recover) at (0.5,0.55)
+    {异常时换 generation\\清 FIFO 重启};
+
+  \draw[hw bus] (sample) -- (fifo) -- (spi) -- (ring);
+  \draw[hw bus] (ring) -- (publish) -- (unwrap) -- (check);
+  \draw[hw danger] (check) -- (recover);
+\end{pdfdiagram}
+\diagramnote{物理时间由采样端记录，DMA completion 只说明一批字节已经进入内存。驱动按序号、FIFO 状态和时间戳恢复事件顺序；发现溢出或帧失步时，必须终止旧批次并从新 generation 重新建立时间关系。}
+
+\topic{有限位宽时间戳需要展开为单调时间}
+
+假设设备时间戳每 25 $\mu$s 加一，16-bit 计数器每
+\[
+65536\times25\ \mu\text{s}=1.6384\ \text{s}
+\]
+回绕一次。驱动保存上一批末值和高位 epoch：若新值相对旧值出现符合正常前进范围的大幅下降，就把 epoch 加一；若下降同时伴随设备复位标志、序号跳变或 FIFO 清空，则不能解释成自然回绕，而要开始新 generation。
+
+把设备 tick 映射到系统时钟还需要锚点。驱动可以在读取设备时间和系统硬件计数器之间建立成对观测，估计固定偏移与频率误差。中断到达时间适合约束“这一批最晚何时被观察到”，不适合替代每个样本的采样时间。
+
+\begin{longtable}{L{0.17\linewidth}L{0.25\linewidth}L{0.30\linewidth}L{0.18\linewidth}}
+\toprule
+状态或证据 & 正常解释 & 异常解释 & 处理边界 \\
+\midrule
+FIFO count=392 B & 28 组完整样本待取 & 长度不是 14 B 整数倍 & 只搬完整帧 \\\tablerowrule
+序号连续 & FIFO 顺序未见缺口 & 跳号表示丢样或复位 & 标记不连续区间 \\\tablerowrule
+时间戳下降 & 可能发生自然回绕 & 结合复位/序号判定代际变化 & 展开 epoch 或重置 \\\tablerowrule
+overflow=1 & FIFO 曾覆盖或拒绝数据 & 缺口大小可能无法精确恢复 & 丢弃不可信连续性 \\\tablerowrule
+DMA completion & 本批字节进入主存缓冲 & 样本未必已经校准发布 & 同步后再解析 \\\tablerowrule
+generation 改变 & 新配置和新时间关系生效 & 旧批次不得继续拼接 & 清 FIFO 后重新锚定 \\
+\bottomrule
+\end{longtable}
+
+\topic{45 ms 服务停顿会越过缓冲边界}
+
+若主控制器连续 45 ms 无法服务该 IMU，设备产生 45 组样本，而 FIFO 只能保存 36 组。无论策略是覆盖最旧还是拒绝最新，至少 9 组样本的连续性已经丢失。水位中断仍可能保持有效，随后 DMA 也可能成功完成；因此“completion 正常”不能证明采集无缺口。
+
+驱动必须在解析前读取 overflow、FIFO count 和样本序号。发现溢出后，先停止或屏蔽新采样，完成当前总线帧，保存最后可信序号和时间戳，清 FIFO，重新写入量程、采样率与水位，再递增 generation 并建立新的时钟锚点。应用得到的是两个明确分开的连续区间，而不是一条看似平滑却时间错误的曲线。
+
+\topic{批处理大小同时约束效率与最坏时延}
+
+把水位从 28 组提高到 34 组，会减少中断和 DMA 次数，却只留下约 2 ms 余量；降低到 8 组可缩短等待时延，却增加每秒约 125 次服务和更高的固定开销。合理水位必须同时满足 SPI 搬运、最坏调度停顿、FIFO 容量和应用时延目标。
+
+这条采集路径的完成语义依次是：采样沿锁存物理量，FIFO 保存顺序，SPI/DMA 搬运字节，completion 交回内存所有权，驱动验证时间与代际，应用才获得可解释的物理样本。任意一个中间完成都不能替代最终语义验证。

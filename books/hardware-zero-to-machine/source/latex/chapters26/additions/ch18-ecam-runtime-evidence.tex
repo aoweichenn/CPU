@@ -1,0 +1,75 @@
+\section{十五、从 ECAM 到运行期失效：把一块 PCIe 设备完整接入再安全移除}
+
+PCIe 设备能被驱动使用之前，软件必须先把拓扑身份变成可访问资源。设平台为 segment 0 公布的 ECAM 基址是 \code{0xE0000000}，目标功能的 BDF 为 \code{03:05.1}，软件要读取配置偏移 \code{0x10} 的 BAR0。ECAM 地址按
+\[
+\mathrm{ECAM}+\mathrm{bus}\ll20+\mathrm{device}\ll15
++\mathrm{function}\ll12+\mathrm{offset}
+\]
+计算，所以本次处理器物理地址是
+\[
+\code{0xE0000000}+\code{0x00300000}+\code{0x00028000}
++\code{0x00001000}+\code{0x10}
+=\code{0xE0329010}.
+\]
+根复合体把该内存访问转换为配置请求 TLP。桥和交换机依据总线号向下游转发，目标 function 返回 Completion with Data；配置读只有在 completion 状态成功且 tag 匹配后才完成。\cite{pcie-base}
+
+\topic{发现身份后还要建立地址窗口}
+
+枚举软件先读取 Vendor ID/Device ID 和 Header Type，再在关闭 Memory Space Enable 的条件下探测 BAR 大小。若 32-bit Memory BAR 写入全 1 后读回地址掩码 \code{0xFFFF0000}，忽略低属性位后得到 64 KiB 窗口。资源分配器选择按 64 KiB 对齐且不与其他窗口重叠的 \code{0x90000000}，写回 BAR0，随后配置上游桥窗口并开启 Memory Space Enable。
+
+此时 \code{0x90000000--0x9000FFFF} 才成为该 function 的 MMIO 入口。BAR 建立的是地址响应关系，不会自动建立 DMA 权限、MSI-X 表项或设备队列；驱动还要配置 IOMMU 映射、中断向量和描述符所有权，最后才能允许设备执行任务。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block,minimum width=2.25cm,align=center] (ecam) at (0.5,3.3)
+    {CPU 读 ECAM\\\code{0xE0329010}};
+  \node[hw control,minimum width=2.25cm,align=center] (rc) at (3.6,3.3)
+    {根复合体\\形成 Config TLP};
+  \node[hw block,minimum width=2.25cm,align=center] (sw) at (6.7,3.3)
+    {桥/交换机\\按 bus 转发};
+  \node[hw compute,minimum width=2.25cm,align=center] (ep) at (9.8,3.3)
+    {Endpoint\\返回配置数据};
+
+  \node[hw block,minimum width=2.25cm,align=center] (mmio) at (0.5,0.55)
+    {驱动写 MMIO\\posted request};
+  \node[hw state,minimum width=2.25cm,align=center] (pending) at (3.6,0.55)
+    {链路已接收\\设备动作未知};
+  \node[hw control,minimum width=2.25cm,align=center] (flush) at (6.7,0.55)
+    {读状态/fence\\等待 completion};
+  \node[hw control,minimum width=2.25cm,align=center] (done) at (9.8,0.55)
+    {动作已确认\\或错误闭合};
+
+  \draw[hw bus] (ecam) -- (rc) -- (sw) -- (ep);
+  \draw[hw return] (ep.south) -- ++(0,-0.55) -| node[pos=0.25,below,hw label]
+    {Completion with Data} (rc.south);
+  \draw[hw danger] (mmio) -- (pending);
+  \draw[hw bus] (pending) -- (flush) -- (done);
+\end{pdfdiagram}
+\diagramnote{配置读和运行期写具有不同完成语义。配置读必须取得带 tag 的 completion；运行期 posted MMIO write 没有逐笔 completion，驱动若需要确认设备副作用，必须使用设备规定的状态读、flush 或 fence。}
+
+\topic{posted write 离开根复合体仍不等于设备动作完成}
+
+驱动把队列尾指针写入 MMIO doorbell 时，Memory Write TLP 属于 posted request。数据链路 ACK 只证明相邻接收端正确接收了 TLP，交换机也可能暂存该包；两者都不能证明 endpoint 已读取新描述符。若设备规范要求在复位或释放缓冲前确认写入，可以读取一个有序状态寄存器，利用其 non-posted completion 建立规定观察点。
+
+\begin{longtable}{L{0.18\linewidth}L{0.27\linewidth}L{0.29\linewidth}L{0.16\linewidth}}
+\toprule
+观察点 & 已证明的事实 & 仍未证明 & 证据 \\
+\midrule
+配置 completion & BDF 目标响应了该寄存器访问 & BAR 已分配并启用 & tag、状态、返回数据 \\\tablerowrule
+BAR 写回 & 功能保存了窗口基址 & 上游桥窗口和译码已开启 & 配置空间回读 \\\tablerowrule
+链路 ACK & 下一跳无 LCRC 错误地收包 & endpoint 已执行 MMIO 副作用 & replay 序号状态 \\\tablerowrule
+状态读 completion & 设备按规定顺序观察到前序写 & DMA 数据已经持久化 & 状态位和设备队列 \\\tablerowrule
+任务 completion & 设备任务及规定的数据交接完成 & 设备可被立即热移除 & CQ、tag、DMA 同步 \\
+\bottomrule
+\end{longtable}
+
+\topic{链路失效后先保存身份和端口证据}
+
+设 endpoint 在 doorbell 到达后发生物理移除。posted write 本身没有 completion，CPU 可能先继续执行；随后状态读出现 Completion Timeout，根端口 AER 记录首个错误，请求者 ID、TLP 头摘要或链路状态提供定位依据。若下游端口支持 DPC，端口可以阻断故障链路，避免畸形或不可信流量继续影响上游。
+
+错误处理不能先释放 DMA 缓冲。平台应依次停止新提交、屏蔽设备中断、撤销或隔离 IOMMU 映射、冻结旧队列 generation、读取 AER/DPC 与链路状态，再复位端口或等待物理重插。DPC 已触发只说明错误被限制在端口下游，不说明所有旧 DMA 与 completion 都已安全消失。
+
+\topic{重新枚举建立的是一套新生命周期}
+
+链路重新进入 L0 后，软件从配置空间重新发现 function，重新分配或核对 BAR，恢复桥窗口、MSI-X、IOMMU 和队列。即使 BDF 与 BAR 地址恰好不变，新设备实例也不能继承旧请求所有权；驱动必须递增 generation，并拒绝带旧 generation 的迟到完成。
+
+这条链把“设备出现在配置空间”和“任务完成”分成五个边界：链路可传 TLP、配置访问成功、资源窗口启用、运行期事务闭合、错误后新生命周期验收。任何一层的成功都不能替代后一层。

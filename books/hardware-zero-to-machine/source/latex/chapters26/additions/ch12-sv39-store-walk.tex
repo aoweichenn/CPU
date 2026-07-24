@@ -1,0 +1,79 @@
+\section{十六、一次 Sv39 store：TLB miss、页表遍历与提交不是同一件事}
+
+“从申请两页内存到第一次写入”案例解释了操作系统何时建立页框，这里固定一条已经存在的映射，只看硬件怎样完成一次普通写。设处理器使用 Sv39，\code{satp} 指向物理地址 \code{0x0000000080000000} 的根页表，ASID 为 \code{0x2A}。用户态执行 \code{store 0x0000000041234568 <- 0x5A}，且当前 TLB 中没有该虚拟页。Sv39 把低 39 bit 分成三个 9-bit VPN 和 12-bit 页内偏移：
+\[
+\mathrm{VPN}[2]=\code{0x001},\quad
+\mathrm{VPN}[1]=\code{0x009},\quad
+\mathrm{VPN}[0]=\code{0x034},\quad
+\mathrm{offset}=\code{0x568}.
+\]
+高位还必须满足规范规定的符号扩展形式；地址不规范时，处理器在读取页表前就产生异常。\cite{riscv-priv}
+
+\topic{页表遍历产生的是隐式内存访问}
+
+页表遍历器先从根页表读取第一级 PTE。每项 8 B，因此三个 PTE 地址依次为：
+\[
+\begin{aligned}
+\mathrm{PTE}_2 &: \code{0x80000000}+\code{0x001}\times8=\code{0x80000008},\\
+\mathrm{PTE}_1 &: \code{0x80004000}+\code{0x009}\times8=\code{0x80004048},\\
+\mathrm{PTE}_0 &: \code{0x80008000}+\code{0x034}\times8=\code{0x800081A0}.
+\end{aligned}
+\]
+这里假设前两项分别指向 \code{0x80004000} 和 \code{0x80008000}。每次 PTE 读取都要经过物理地址权限检查和 Cache/内存层次；page-walk cache 命中可以省去部分读取，却不能绕过最终叶项的有效性和权限判断。
+
+叶 PTE 取值为 \code{0x0000000048D000D7}。低位 \code{V/R/W/U/A/D} 均允许本次用户态写，高位 PPN 为 \code{0x123400}，所以数据目标是
+\[
+\code{0x0000000123400000}+\code{0x568}
+=\code{0x0000000123400568}.
+\]
+如果任一非叶项无效、叶项不允许用户写，或者大页 PPN 没按其页大小对齐，遍历立即以 page fault 闭合；此时不能填充一项“近似可用”的 TLB 记录。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \node[hw block, minimum width=2.25cm, align=center] (store) at (0.5,3.2)
+    {用户态 store\\TLB 查询未命中};
+  \node[hw state, minimum width=2.25cm, align=center] (p2) at (3.5,3.2)
+    {读 L2 PTE\\根页表};
+  \node[hw state, minimum width=2.25cm, align=center] (p1) at (6.5,3.2)
+    {读 L1 PTE\\下一级基址};
+  \node[hw state, minimum width=2.25cm, align=center] (p0) at (9.5,3.2)
+    {读叶 PTE\\权限与 PPN};
+
+  \node[hw control, minimum width=2.25cm, align=center] (ad) at (9.5,0.55)
+    {原子确认 A/D\\或产生 fault};
+  \node[hw state, minimum width=2.25cm, align=center] (fill) at (6.5,0.55)
+    {填充 TLB\\绑定 ASID};
+  \node[hw compute, minimum width=2.25cm, align=center] (data) at (3.5,0.55)
+    {写数据 Cache\\处理一致性};
+  \node[hw control, minimum width=2.25cm, align=center] (retire) at (0.5,0.55)
+    {指令退休\\架构可见};
+
+  \draw[hw bus] (store) -- (p2) -- (p1) -- (p0);
+  \draw[hw bus] (p0) -- (ad);
+  \draw[hw bus] (ad) -- (fill) -- (data) -- (retire);
+\end{pdfdiagram}
+\diagramnote{TLB miss 只选择硬件页表遍历路径，不等于 page fault。遍历必须取得合法叶项，完成必要的 A/D 位更新，填充带 ASID 的翻译，再把数据写入 Cache；只有 store 到达处理器规定的退休边界，软件才观察到该指令完成。}
+
+\topic{A/D 位更新与数据写入有不同的原子边界}
+
+若叶 PTE 的 A 或 D 位尚未置位，硬件可以按架构规则原子更新 PTE，或者在相应扩展配置下产生异常交给软件处理。原子性要求“重新读取叶项、确认它仍是同一映射、置位并写回”不能被页表复用穿插破坏。A 位可以因推测遍历提前出现；D 位必须与真实写语义匹配。因此操作系统不能把“A=1”解释为那条 load 已经退休，也不能在清除映射后立即复用页表页。
+
+数据写入物理地址后，还要遵守 Cache 一致性和内存序。TLB fill 只说明后续地址转换可复用结果；它不说明 store 已经离开 store buffer，更不说明数据已经写入 DRAM。对普通缓存内存，架构提交、其他核心可见和介质持久化是三个不同观察点。
+
+\begin{longtable}{L{0.16\linewidth}L{0.26\linewidth}L{0.30\linewidth}L{0.18\linewidth}}
+\toprule
+边界 & 新建立的事实 & 仍不能宣称 & 首个失败证据 \\
+\midrule
+TLB miss & 当前翻译缓存没有命中 & 页面不存在 & miss 计数、walker 启动 \\\tablerowrule
+非叶 PTE 合法 & 找到下一级页表物理页 & 最终访问获准 & 无效/保留位 fault \\\tablerowrule
+叶 PTE 合法 & PPN、权限和内存属性确定 & 数据访问已经完成 & 权限或对齐 fault \\\tablerowrule
+A/D 更新完成 & 页表记录本次访问状态 & store 已对其他核心可见 & 原子更新失败或重试 \\\tablerowrule
+TLB fill & ASID 与 VPN 可复用该翻译 & store 已退休 & shootdown/代际冲突 \\\tablerowrule
+store 退休 & 本 hart 的架构状态已越过指令 & 数据已经持久化 & 精确异常或重放 \\
+\bottomrule
+\end{longtable}
+
+\topic{fault 恢复必须回到原指令，而不是越过它}
+
+若叶 PTE 的 W 位为 0，处理器保存 fault 地址和访问类型，并把控制转交异常入口。操作系统若判断这是合法的 COW 写，就分配新页、复制旧内容、原子替换 PTE，执行相应的 TLB 失效，再返回原 store。该 store 重新译码和执行；第一次 fault 路径没有产生一次“半完成写”。
+
+恢复还要防止旧遍历结果复活。修改 PTE 后的失效操作必须覆盖当前 ASID/VPN，并与其他 hart 的 shootdown 完成相协调；页框只有在所有可能使用旧翻译的观察者退出后才能复用。这个案例的完成边界因此不是“walker 读到一个 PTE”，而是翻译、权限、页表状态、数据访问和精确重试共同闭合。

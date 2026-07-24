@@ -1,0 +1,70 @@
+\section{十四、4×3 Mesh 定量案例：一笔请求怎样穿过路由、竞争与返回}
+
+NoC 的框图容易让人误以为 hop 数就是时延。设一个 4×3 Mesh 使用确定性 XY 路由，源节点 S 位于 $(0,0)$，内存控制器 MC 位于 $(3,2)$。每条链路每拍发送一个 16 B flit，每个路由 hop 的“路由选择加链路传输”固定为 2 cycle；请求包由 1 个 head、4 个 data 和 1 个 tail 组成，共 6 flit。端点提交和接收事务时仍遵守 AXI 一类接口对 valid/ready、通道与响应的约束。\cite{arm-amba-axi} S 到 MC 的曼哈顿距离为
+\[
+H=|3-0|+|2-0|=5\ \text{hop}.
+\]
+确定性 XY 路由先沿 X 方向走三跳，再沿 Y 方向走两跳。它让路径唯一、依赖关系容易证明，但热点流量仍可能在同一输出端口排队。
+
+\begin{pdfdiagram}[x=1cm,y=1cm]
+  \foreach \x in {0,...,3} {
+    \foreach \y in {0,...,2} {
+      \node[draw,rounded corners,minimum width=1.25cm,minimum height=0.72cm,
+            fill=black!2] (r\x\y) at (1.0+2.45*\x,0.65+1.55*\y)
+            {R\scriptsize(\x,\y)};
+    }
+  }
+  \foreach \y in {0,...,2} {
+    \draw[black!30] (r0\y) -- (r1\y) -- (r2\y) -- (r3\y);
+  }
+  \foreach \x in {0,...,3} {
+    \draw[black!30] (r\x0) -- (r\x1) -- (r\x2);
+  }
+  \node[hw block,minimum width=1.25cm] at (r00) {S};
+  \node[hw control,minimum width=1.25cm] at (r32) {MC};
+  \draw[hw danger,very thick] (r00) -- (r10) -- (r20) -- (r30)
+    -- (r31) -- (r32);
+\end{pdfdiagram}
+\diagramnote{4×3 Mesh 中从 S 到 MC 的唯一 XY 路径：先沿底行向右三跳，再沿最右列向上两跳。灰线表示其他可用链路，红线只表示本请求占用的五跳路径；图没有把返回包画成同一条反向箭头，因为响应使用独立虚拟网络和独立 credit。}
+
+\topic{head 决定路径，tail 决定资源何时释放}
+
+在无竞争、路由完全流水化的简化模型中，head flit 到达 MC 需要 $5\times2=10$ cycle；其余 5 个 flit 每拍注入一个，tail 比 head 晚 5 cycle 到达，所以请求网络时延为 15 cycle。若 MC 固定服务 12 cycle，并返回一个 3-flit 响应，则响应 head 反向经过五跳需 10 cycle，tail 再晚 2 cycle。端到端时间为
+\[
+T_{\text{roundtrip}}=15+12+12=39\ \text{cycle}.
+\]
+这里的 39 cycle 从请求 head 获得首次注入许可开始，到响应 tail 被源端接收为止，不含源端等待注入的排队时间。
+
+\begin{longtable}{L{0.18\linewidth}L{0.24\linewidth}L{0.30\linewidth}L{0.18\linewidth}}
+\toprule
+阶段 & 本例预算 & 状态所有者 & 完成边界 \\
+\midrule
+源端排队 & 单独统计 & 网络接口请求 FIFO & head 获得首跳 credit \\\tablerowrule
+请求穿越 & 15 cycle & 请求虚拟网络 & tail 到达 MC \\\tablerowrule
+目标服务 & 12 cycle & 内存控制器 tag & 数据/状态准备完毕 \\\tablerowrule
+响应穿越 & 12 cycle & 响应虚拟网络 & 响应 tail 到达 S \\\tablerowrule
+源端提交 & 由端点规定 & 原请求 ID 表项 & 响应校验并归属原请求 \\
+\bottomrule
+\end{longtable}
+
+\topic{credit 窗口决定链路能否持续满速}
+
+设每个输入虚拟通道只有 4 个 flit 槽，credit 从下游释放到上游可重新使用的往返为 6 cycle。单流长期吞吐最多约为 $4/6$ flit/cycle；6-flit 请求发出前四个 flit 后会停顿，直到首批 credit 返回。wormhole 路由不要求某一跳容纳整包，但每个 flit 仍必须得到真实空槽承诺。
+
+若希望一条链路持续达到 1 flit/cycle，单个活跃流的有效 credit 至少要覆盖 6-cycle 带宽时延积，或者系统要用多个独立虚拟通道交错填充空隙。增加物理链路带宽而不扩大缓冲窗口，峰值仍受 credit 限制。
+
+\topic{竞争时延必须从具体输出端口计算}
+
+现在假设另一条不可抢占的 6-flit 包刚刚获得路由器 $(2,0)$ 的东向输出，而本请求的 head 随后到达。该输出每拍一 flit，本请求最多新增 6 cycle 阻塞；阻塞通过背压向源端传播，但不会凭空复制成每一跳各 6 cycle。若三个不同输出端口分别遇到独立占用，才需要分别累计。
+
+QoS 权重给出长期份额，不自动给出单笔上界。要承诺最坏时延，系统还必须限制最长不可抢占包、同优先级流量数量、每个源的注入率、目标服务上限和 credit 停顿。对本例若只允许一处 6-cycle 竞争，且源端排队上限 8 cycle，则请求往返的网络与目标预算为
+\[
+8+15+6+12+12=53\ \text{cycle}.
+\]
+任何实际观测超过 53 cycle，都说明假设中至少一个边界被违反，而不是简单地说明“Mesh 较慢”。
+
+\topic{超时不能替代响应归属与代际隔离}
+
+源端用事务 ID 保存地址、长度、顺序域和目标缓冲。响应到达时先匹配 ID，再确认所有 flit、状态和完整性检查均成功，最后释放表项。若 53-cycle 预算到期，源端可以上报错误或发起恢复，但不能立即把相同 ID 和缓冲交给新请求：旧响应可能仍在网络或目标中。
+
+安全恢复顺序是停止新注入、保留或撤销旧 ID、排空相关虚拟网络、复位故障端点并递增 generation，随后才恢复路由和 credit。请求与响应放入独立无环虚拟网络保证它们有前进条件；generation 则保证复位前的合法响应不会被解释成复位后的新完成。
