@@ -269,7 +269,39 @@ TARGET_REPLACEMENTS = {
             "否则栈溢出会破坏当前线程的现场",
         ),
     ),
-    26: (("前面七章", "前面二十五章"),),
+    26: (
+        ("前面七章", "前面二十五章"),
+        (
+            r"\draw[hw return] ($(alu.east)+(0,0.15)$) -- (4.6,0.6) -- (4.6,-3.6) -- (3.2,-3.6);",
+            r"\draw[hw return] ($(alu.east)+(0,0.15)$) -- (4.4,0.6) -- (4.4,-3.6) -- (3.2,-3.6);",
+        ),
+        (
+            r"\node[hw label, anchor=east, fill=white, inner sep=1pt] at (4.55,-1.0) {CF、ZF};",
+            r"\node[hw label, anchor=east, fill=white, inner sep=1pt] at (4.35,-1.0) {CF、ZF};",
+        ),
+        (
+            r"\draw[hw return] ($(ctrl.east)+(0,0.15)$) -- (4.75,-3.75) -- (4.75,2.85);",
+            r"\draw[hw return] ($(ctrl.east)+(0,0.15)$) -- (5.2,-3.75) -- (5.2,2.85);",
+        ),
+        (
+            r"\draw[hw return] (4.75,2.85) -- ($(ir.east)+(0,0.15)$);",
+            r"\draw[hw return] (5.2,2.85) -- ($(ir.east)+(0,0.15)$);",
+        ),
+        (r"\draw[hw return] (4.75,1.7) -- (acc.east);", r"\draw[hw return] (5.2,1.7) -- (acc.east);"),
+        (
+            r"\draw[hw return] (4.75,0.3) -- ($(alu.east)+(0,-0.15)$);",
+            r"\draw[hw return] (5.2,0.3) -- ($(alu.east)+(0,-0.15)$);",
+        ),
+        (r"\draw[hw return] (4.75,-0.7) -- (regb.east);", r"\draw[hw return] (5.2,-0.7) -- (regb.east);"),
+        (r"\fill[BookTeal] (4.75,2.85) circle (0.05);", r"\fill[BookTeal] (5.2,2.85) circle (0.05);"),
+        (r"\fill[BookTeal] (4.75,1.7) circle (0.05);", r"\fill[BookTeal] (5.2,1.7) circle (0.05);"),
+        (r"\fill[BookTeal] (4.75,0.3) circle (0.05);", r"\fill[BookTeal] (5.2,0.3) circle (0.05);"),
+        (r"\fill[BookTeal] (4.75,-0.7) circle (0.05);", r"\fill[BookTeal] (5.2,-0.7) circle (0.05);"),
+        (
+            r"\node[hw label, rotate=90] at (5.1,0.4) {16 根控制线};",
+            r"\node[hw label, rotate=90] at (5.55,0.4) {16 根控制线};",
+        ),
+    ),
 }
 
 # Only algorithmic descriptions belong here.  Real Verilog/C/assembly examples,
@@ -540,7 +572,7 @@ def rewrite_legacy_section_references(
 
 
 INLINE_LITERAL_RE = re.compile(
-    r"(\\(?:code|texttt|url|path)\{[^{}]*\})"
+    r"(\\(?:code|codetext|texttt|url|path)\{[^{}]*\})"
 )
 PROSE_QUOTE_RE = re.compile(r'"([^"]*)"')
 
@@ -892,6 +924,22 @@ def rewrite_legacy_chapter_references(text: str, chapter_number: int) -> str:
     for old, new in TARGET_REPLACEMENTS.get(chapter_number, ()):
         text = text.replace(old, new)
     return text
+
+
+CODE_WITH_ESCAPED_LITERAL_RE = re.compile(
+    r"\\code\{([^{}\n]*(?:\\\$|\\textbackslash)[^{}\n]*)\}"
+)
+
+
+def render_escaped_code_literals(text: str) -> str:
+    r"""Keep escaped dollar signs and backslashes out of ``nolinkurl``.
+
+    ``\code`` deliberately uses ``\nolinkurl`` for ordinary identifiers, but
+    that command prints LaTeX escape/protection macros literally.  Generated
+    chapters therefore route only the affected, brace-free snippets through
+    ``\codetext`` while leaving the immutable legacy units untouched.
+    """
+    return CODE_WITH_ESCAPED_LITERAL_RE.sub(r"\\codetext{\1}", text)
 
 
 def apply_diagram_overrides(text: str, chapter_number: int, overrides_dir: Path) -> str:
@@ -1647,6 +1695,7 @@ def main() -> int:
         body = rewrite_legacy_chapter_references(
             "".join(body_parts).lstrip("\n"), chapter.number
         )
+        body = render_escaped_code_literals(body)
         body = apply_diagram_overrides(body, chapter.number, overrides_dir)
         body = annotate_pseudocode_listings(body, chapter.number)
         audit_pseudocode_annotations(body, chapter.number)
