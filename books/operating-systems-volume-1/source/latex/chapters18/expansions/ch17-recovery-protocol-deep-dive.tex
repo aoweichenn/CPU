@@ -1,0 +1,630 @@
+\section{从版本 41 到版本 42：先确定恢复程序必须回答什么}
+
+前文已经建立了写回、日志、检查点、写时复制和冗余的基本作用。现在把这些机制放进同一项
+可复算任务：程序要发布模型版本 42。一个完整版本由三个持久对象组成：
+\code{weights.bin} 保存 12\,MiB 参数，\code{index.bin} 保存 64\,KiB 索引，
+\code{MANIFEST} 指明当前有效版本及两个数据文件的校验和。版本 41 仍在为读者服务，
+版本 42 必须满足下列业务不变量：
+
+\begin{enumerate}
+\tightlist
+\item 读取者只能选择版本 41 或完整的版本 42，不能把两个版本的文件混合使用；
+\item \code{MANIFEST} 一旦承认版本 42，两个数据文件就必须存在、长度正确且校验和匹配；
+\item 发布程序重复执行、崩溃后重新执行或恢复程序重复扫描，都不能产生第三种结果；
+\item 任一同步操作返回错误时，发布者不能把版本 42 报告为已提交。
+\end{enumerate}
+
+这四条不是接口名称，而是恢复程序最终必须判断的事实。为了作出判断，系统需要保留“内容
+是什么”“内容保存在哪里”“哪个版本获得发布资格”和“哪一项证据已经跨过持久化边界”
+四类状态。把这些状态全部塞进文件名会造成歧义：文件名可以原子替换，却不能同时保存长度、
+校验和、生成号与提交状态。
+
+\begin{longtable}{|L{0.17\linewidth}|L{0.27\linewidth}|L{0.29\linewidth}|L{0.17\linewidth}|}
+\hline
+对象 & 代表字段 & 所有者与生命周期 & 提交意义 \\ \hline
+版本文件 & version、length、content checksum &
+发布者创建；被 manifest 引用期间不得删除 & 只证明候选内容已经形成 \\\tablerowrule
+manifest 记录 & generation、文件集合、长度、checksum、record checksum &
+发布者生成；读取者与回收器共同引用 & 决定读取者承认哪个版本 \\\tablerowrule
+目录项 & name、inode identity、parent directory &
+文件系统维护；随创建、改名和删除变化 & 使名称关系可见，不等于业务提交 \\\tablerowrule
+同步请求 & object、requested range、result、error sequence &
+内核与设备完成路径持有，调用返回后结束 & 给调用者一项成功或失败证据 \\
+\hline
+\end{longtable}
+
+\subsection{五个完成边界不能合并成一个“写好了”}
+
+设 \code{weights.bin.tmp} 的第一个 4\,KiB 页面已经从 41 更新为 42。下面五个位置可以
+同时保存不同版本：
+
+\begin{enumerate}
+\tightlist
+\item 用户缓冲区已经保存新字节；
+\item 页缓存已经保存新字节并标为脏页；
+\item 文件系统已经把脏页转换为块请求；
+\item 设备已经接收请求，但数据仍可能位于易失写缓存；
+\item 非易失介质已经保存新字节。
+\end{enumerate}
+
+调用者观察到 \code{write} 返回，只能证明内核接受了指定数量的字节；观察到设备普通写
+完成，也未必能排除设备易失缓存。只有同步协议把数据、必要元数据和设备刷新要求推进到
+规定边界，并把下层错误传回调用者，程序才获得相应故障模型下的持久性证据。
+
+\begin{pdfdiagram}[scale=0.88]
+  \node[os state, minimum width=25mm] (user) at (-60mm,16mm)
+    {用户缓冲区\\版本 42};
+  \node[os memory, minimum width=25mm] (cache) at (-30mm,16mm)
+    {页缓存\\脏页};
+  \node[os compute, minimum width=25mm] (fs) at (0,16mm)
+    {文件系统\\写回请求};
+  \node[os control, minimum width=25mm] (device) at (30mm,16mm)
+    {设备缓存\\已接收};
+  \node[os state, minimum width=25mm] (media) at (60mm,16mm)
+    {非易失介质\\已保存};
+  \draw[os bus] (user.east) -- (cache.west);
+  \draw[os bus] (cache.east) -- (fs.west);
+  \draw[os bus] (fs.east) -- (device.west);
+  \draw[os strong bus] (device.east) -- (media.west);
+
+  \node[os label, text width=27mm] at (-45mm,-2mm) {\code{write} 可在此返回};
+  \node[os label, text width=31mm] at (15mm,-2mm) {普通完成可能只到设备缓存};
+  \node[os label, text width=31mm] at (53mm,-2mm) {刷新完成形成持久证据};
+  \draw[os guide] (-30mm,5mm) -- (-30mm,-10mm);
+  \draw[os guide] (30mm,5mm) -- (30mm,-10mm);
+  \draw[os guide] (60mm,5mm) -- (60mm,-10mm);
+\end{pdfdiagram}
+\diagramnote{图中从左向右是数据传播，不是五次独立复制的强制实现。接口返回点取决于所请求的语义；“被下一层接收”不能替代“在故障后仍可恢复”。}
+
+这幅图建立的第一条判断规则是：\emph{完成必须带边界}。书中后续出现“完成”时，应能回答
+完成的是复制、排队、设备执行、介质持久化还是业务发布。没有边界限定的“写成功”不能作为
+恢复协议的前提。
+
+\section{单文件发布：原子可见性如何与持久性配合}
+
+先只发布一个配置文件 \code{config.json}。朴素做法直接截断旧文件再写入新内容。若进程在
+截断后退出，读者会看到空文件；若系统在写入一半后掉电，读者可能看到短文件。问题不在于
+JSON，而在于旧版本的名称已经指向正在被破坏的对象。
+
+临时文件发布把“形成候选内容”和“让最终名称指向候选对象”分成两步。旧对象在候选内容
+完成前保持不变，名称替换成为单独的发布动作：
+
+\begin{lstlisting}
+publish_one(parent_dir, final_name, bytes):
+  // 1. 独占创建候选文件；随机后缀避免误用旧临时文件。
+  tmp = create_temp_exclusive(parent_dir, final_name)
+
+  // 2. 循环处理短写和可重试中断；只在全部字节被接受后继续。
+  write_all_or_fail(tmp, bytes)
+  set_required_metadata(tmp)
+
+  // 3. 同步候选对象；任何错误都使本次发布失败。
+  if fsync(tmp) != SUCCESS:
+    close_and_record_cleanup(tmp)
+    return NOT_COMMITTED
+
+  // 4. 在同一文件系统内原子替换名称；读者只见旧对象或新对象。
+  if rename(tmp.name, final_name) != SUCCESS:
+    close_and_record_cleanup(tmp)
+    return NOT_COMMITTED
+
+  // 5. 同步父目录，推进新名称关系的持久化。
+  if fsync(parent_dir) != SUCCESS:
+    return COMMIT_UNCERTAIN
+
+  return COMMITTED
+\end{lstlisting}
+
+算法故意把最后一种结果写成 \code{COMMIT\_UNCERTAIN}。目录同步失败并不证明改名没有发生；
+当前运行中的读者可能已经看见新名称，但调用者缺少“重启后仍能据此恢复”的证据。可靠程序
+不能把不确定结果简单重试为一次全新的非幂等操作，而应重新读取名称、对象身份和内容校验和，
+再决定承认、补做同步或回滚到另一条版本记录。
+
+\subsection{每个崩溃切点对应一个允许状态集合}
+
+\begin{longtable}{|L{0.15\linewidth}|L{0.25\linewidth}|L{0.29\linewidth}|L{0.21\linewidth}|}
+\hline
+切点 & 介质上允许存在的对象 & 重启后权威状态 & 恢复动作 \\ \hline
+临时文件创建前 & 只有旧最终文件 & 旧版本 & 无动作 \\\tablerowrule
+候选同步前 & 旧文件和不完整临时文件 & 旧版本 & 删除或隔离临时文件 \\\tablerowrule
+候选同步后、改名前 & 旧文件和完整临时文件 & 旧版本 & 校验后重试发布或清理 \\\tablerowrule
+改名后、目录同步前 & 当前运行时名称可能指向新对象 & 证据不足，按协议判定 &
+核对对象身份与校验和，不盲目覆盖 \\\tablerowrule
+目录同步成功后 & 最终名称稳定指向新对象 & 新版本 & 回收旧对象或旧备份 \\
+\hline
+\end{longtable}
+
+表中的“允许状态集合”是测试预言，而不是对某次运行结果的猜测。故障注入可以在每个切点
+停止系统，重启后只要观察结果属于允许集合且恢复动作收敛，协议就满足已声明的故障模型。
+
+\subsection{关闭文件描述符不是持久化接口}
+
+\code{close} 结束的是进程对打开文件对象的引用。内核可能在关闭时发现延迟错误，但普通
+关闭并不普遍承担“把所有脏数据推进到非易失介质”的承诺。进程退出同样不能替代显式同步。
+如果业务提交依赖掉电后的内容，程序必须在仍能处理错误时请求并检查相应同步结果。
+
+\code{fdatasync} 通常只推进恢复文件数据所需的元数据，\code{fsync} 的目标还包括与文件
+一致性有关的更多元数据；具体范围由系统接口契约决定。二者都不能自动同步另一个文件或把
+父目录的名称变化合成同一业务事务。接口名字可以缩短调用代码，却不能缩短协议中的对象集合。
+
+\section{多文件发布：manifest 为什么必须成为独立提交对象}
+
+回到版本 42。若程序依次改名 \code{weights.bin} 和 \code{index.bin}，两个改名之间发生
+崩溃时，最终目录会混合版本 42 的参数与版本 41 的索引。两个单文件原子操作不能组合成
+一个多文件原子操作。解决办法不是寻找“更强的文件名”，而是让读者只通过一个独立的小对象
+选择整组数据。
+
+教学化 manifest 记录可以具有以下字段：
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.24\linewidth}|L{0.46\linewidth}|}
+\hline
+字段 & 示例 & 恢复作用 \\ \hline
+magic 与格式版本 & \code{MV1}, format=3 & 拒绝把随机字节或不兼容布局解释为记录 \\\tablerowrule
+generation & 42 & 比较两个有效候选记录的新旧，不依赖文件时间戳 \\\tablerowrule
+entry count & 2 & 限定后续变长区域，防止越界解析 \\\tablerowrule
+文件条目 & 名称、长度、内容 checksum & 证明所选版本的组成与期望字节 \\\tablerowrule
+previous generation & 41 & 支持回退并检查版本链是否断裂 \\\tablerowrule
+record checksum & 覆盖整个记录 & 检测 torn write 和静默损坏 \\
+\hline
+\end{longtable}
+
+manifest 保存业务选择，目录项保存名称映射，inode 保存文件身份。三个对象必须分开，因为
+它们的修改频率、所有者和恢复意义不同。读者不应扫描目录后“挑看起来最新的文件”，而应先
+验证 manifest，再严格读取它列出的对象。
+
+\begin{lstlisting}
+commit_version_42(files):
+  // 1. 每个数据文件使用不可复用名称形成候选，例如 weights.v42。
+  for file in files:
+    create_exclusive(file.versioned_name)
+    write_all_or_fail(file.bytes)
+    fsync_or_fail(file.fd)
+    verify_length_and_checksum(file.versioned_name)
+
+  // 2. 同步目录，使候选名称可在重启后找到；此时尚未业务提交。
+  fsync_or_fail(files_directory)
+
+  // 3. 构造只引用已验证候选文件的新 manifest。
+  record = make_manifest(
+      generation = 42,
+      previous = 41,
+      entries = files.lengths_and_checksums)
+  write_atomic_and_sync("MANIFEST.next", record)
+
+  // 4. 最后替换权威入口，并同步其父目录。
+  rename_or_fail("MANIFEST.next", "MANIFEST")
+  fsync_or_fail(manifest_directory)
+  return COMMITTED
+\end{lstlisting}
+
+\begin{pdfdiagram}[scale=0.9]
+  \node[os state, minimum width=38mm] (oldm) at (-52mm,24mm)
+    {MANIFEST\\generation 41};
+  \node[os memory, minimum width=38mm] (oldfiles) at (-52mm,-18mm)
+    {weights.v41\\index.v41};
+  \node[os compute, minimum width=38mm] (newfiles) at (0,-18mm)
+    {weights.v42\\index.v42\\均已同步};
+  \node[os control, minimum width=38mm] (nextm) at (52mm,24mm)
+    {MANIFEST.next\\generation 42\\记录校验和有效};
+  \node[os state, minimum width=38mm] (published) at (52mm,-18mm)
+    {最终 MANIFEST\\原子替换后指向 v42};
+
+  \draw[os bus] (oldm.south) -- (oldfiles.north);
+  \draw[os bus] (newfiles.north east) -- (nextm.south west);
+  \draw[os strong bus] (nextm.south) -- (published.north);
+  \draw[os feedback] (oldm.east) -- node[os label,above]{替换前仍为权威} (nextm.west);
+\end{pdfdiagram}
+\diagramnote{候选数据文件先形成，manifest 最后发布。虚线表示替换前旧 manifest 仍是唯一权威入口；目录中出现 v42 文件并不等于读者已经选择版本 42。}
+
+\subsection{读取路径也必须验证提交证据}
+
+\begin{lstlisting}
+open_current_version():
+  // 1. 只从权威名称取得 manifest，并先验证记录自身。
+  m = read_exact("MANIFEST")
+  require(m.magic == "MV1")
+  require(checksum(m.without_record_checksum) == m.record_checksum)
+
+  // 2. 按 manifest 列表逐一验证，不扫描目录猜测版本。
+  opened = []
+  for entry in m.entries:
+    fd = open_no_follow(entry.name)
+    require(file_identity_is_stable(fd))
+    require(length(fd) == entry.length)
+    require(checksum(fd) == entry.content_checksum)
+    opened.append(fd)
+
+  // 3. 全部验证以后才向上层发布同一代对象集合。
+  return VersionHandle(m.generation, opened)
+\end{lstlisting}
+
+读取者在验证期间持有文件引用，避免名称在“检查以后、使用以前”被替换。稳定引用解决运行期
+竞态，checksum 解决内容证据，generation 解决版本选择；任何一个都不能替代另外两个。
+
+\section{WAL：把恢复决定写在目标页之前}
+
+manifest 适合整组不可变文件的粗粒度发布。若程序每秒修改许多 4\,KiB 页面，每次重写整组
+文件代价过高。此时目标页会被反复更新，恢复程序需要知道哪些更新已经获得提交资格。写前
+日志（write-ahead log, WAL）用顺序追加记录保存这项决定。
+
+设事务 T7 把页 P3 的计数从 41 改为 42。日志记录不能只保存一句“更新成功”，至少要能识别
+事务、顺序位置、目标对象、重做内容和记录完整性：
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.25\linewidth}|L{0.47\linewidth}|}
+\hline
+字段 & 示例 & 必要性 \\ \hline
+LSN & 0x1200 & 为记录建立全局可比较顺序 \\\tablerowrule
+transaction id & T7 & 把多条页面修改归入同一提交决定 \\\tablerowrule
+record type & UPDATE/COMMIT & 区分数据描述、提交证据与恢复补偿 \\\tablerowrule
+page id 与 offset & P3, 128 & 指定重做或撤销作用位置 \\\tablerowrule
+before/after image & 41/42 & 支持所选恢复策略所需的 undo 或 redo \\\tablerowrule
+previous LSN & 0x1180 & 沿单个事务反向查找记录 \\\tablerowrule
+length 与 checksum & 96 B, C7 & 识别日志尾部 torn record，不越界解析 \\
+\hline
+\end{longtable}
+
+\subsection{两条写前规则}
+
+若系统允许脏目标页在事务提交前写回，恢复可能需要撤销未提交值，因此必须在目标页写回前
+先持久化足够的 undo 信息。若系统宣布 T7 已提交，恢复可能需要重做尚未写回的目标页，因此
+必须在向调用者返回提交成功前先持久化 T7 的 redo 信息和提交记录。写成不变量就是：
+
+\begin{enumerate}
+\tightlist
+\item \(\operatorname{durableLSN} \geq \operatorname{pageLSN}\) 后，包含该
+      \code{pageLSN} 的目标页才有资格写到原位置；
+\item T7 的 COMMIT 记录跨过日志持久化边界后，系统才可以向事务调用者返回提交成功。
+\end{enumerate}
+
+\begin{pdfdiagram}[scale=0.89]
+  \node[os title] at (-63mm,28mm) {调用者};
+  \node[os title] at (-22mm,28mm) {WAL};
+  \node[os title] at (22mm,28mm) {目标页 P3};
+  \node[os title] at (61mm,28mm) {恢复者};
+
+  \node[os state, minimum width=29mm] (begin) at (-52mm,13mm) {begin T7};
+  \node[os memory, minimum width=31mm] (update) at (-17mm,13mm)
+    {LSN 0x1200\\UPDATE P3: 41→42};
+  \node[os compute, minimum width=31mm] (page) at (20mm,13mm)
+    {内存页 P3\\value=42\\pageLSN=0x1200};
+  \node[os control, minimum width=31mm] (commit) at (-17mm,-18mm)
+    {LSN 0x1260\\COMMIT T7\\日志同步};
+  \node[os state, minimum width=29mm] (return) at (-52mm,-18mm)
+    {返回\\COMMITTED};
+  \node[os memory, minimum width=31mm] (redo) at (58mm,-18mm)
+    {若页仍为 41\\按 LSN 幂等 redo};
+
+  \draw[os strong bus] (begin.east) -- (update.west);
+  \draw[os bus] (update.east) -- (page.west);
+  \draw[os bus] (update.south) -- (commit.north);
+  \draw[os strong bus] (commit.west) -- (return.east);
+  \draw[os bus] (commit.east) -- (redo.west);
+  \draw[os feedback] (page.south) |- node[os label,near start]{崩溃时可能尚未写回} (redo.north);
+\end{pdfdiagram}
+\diagramnote{提交资格来自已持久化的 COMMIT 记录，不来自目标页是否碰巧先写回。恢复者比较日志 LSN 与 pageLSN：需要时重复执行 redo，已经应用的更新则跳过。}
+
+\subsection{带 pageLSN 的幂等重做}
+
+\begin{lstlisting}
+redo_update(record, page):
+  // 日志记录先通过长度、类型和 checksum 校验。
+  require(record.type == UPDATE)
+  require(record.is_committed)
+
+  // pageLSN 已达到或超过本记录，说明效果已经包含在页中。
+  if page.page_lsn >= record.lsn:
+    return ALREADY_APPLIED
+
+  // 在固定偏移写入 after image，并同时推进页面证据。
+  page.bytes[record.offset : record.offset + record.length] =
+      record.after_image
+  page.page_lsn = record.lsn
+  mark_dirty(page)
+  return APPLIED
+\end{lstlisting}
+
+幂等不是“多执行几次大概没关系”，而是存在可检查的前置条件和单调证据。恢复可能在重做
+一半时再次崩溃；下次启动仍从检查点扫描，只要 pageLSN 与日志记录遵循单调规则，重复扫描
+就会收敛到同一个结果。
+
+\subsection{日志尾部不完整时如何停止}
+
+掉电可能只写入一条记录的前 37 字节。恢复程序必须先读取固定头部，验证长度上限，再读取
+完整记录并校验 checksum。首条不完整或校验失败的尾部记录之后没有可信边界，恢复程序不能
+在随机字节中搜索一个看似合法的 COMMIT 标记继续执行。
+
+\begin{lstlisting}
+scan_log(from_lsn):
+  // valid_end 只推进到连续、完整且校验成功的记录之后。
+  valid_end = from_lsn
+  while header_is_complete(valid_end):
+    header = read_header(valid_end)
+    if header.length < MIN_RECORD or header.length > MAX_RECORD:
+      break
+    record = read_exact_or_stop(valid_end, header.length)
+    if checksum(record) != header.checksum:
+      break
+    index_record(record)
+    valid_end += header.length
+  return valid_end
+\end{lstlisting}
+
+\section{检查点与三阶段恢复：缩短扫描不能删除必要证据}
+
+WAL 只追加不截断会无限增长。检查点的目标是证明某个日志位置以前的状态已经由另一组稳定
+对象承接，而不是机械删除旧文件。若检查点期间事务仍在运行，系统需要记录活跃事务与脏页
+状态；否则恢复无法判断从哪里开始 redo、哪些事务还需要 undo。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.3\linewidth}|L{0.4\linewidth}|}
+\hline
+检查点字段 & 代表内容 & 恢复用途 \\ \hline
+checkpoint LSN & 0x2000 & 找到最近一份完整检查点记录 \\\tablerowrule
+transaction table & T7=COMMITTED，T8=ACTIVE，lastLSN=… &
+判断崩溃时哪些事务已经提交或仍需收束 \\\tablerowrule
+dirty page table & P3=recLSN 0x1200，P9=0x1F20 &
+找到每页可能首次尚未写回的日志位置 \\\tablerowrule
+checkpoint checksum & 覆盖记录与变长表 & 排除 torn checkpoint \\\tablerowrule
+previous checkpoint & 0x1800 & 当前检查点损坏时回退到前一有效入口 \\
+\hline
+\end{longtable}
+
+恢复可分为分析、重做和撤销三阶段。分析重建“崩溃时有哪些事务和脏页”；重做从最早必要
+位置重复历史，使已提交结果与恢复所需的中间状态重新出现；撤销沿未提交事务的日志链反向
+执行，并写补偿日志记录（compensation log record, CLR），使撤销本身也可以在再次崩溃后
+继续。
+
+\begin{lstlisting}
+recover(last_checkpoint):
+  // 1. 分析：恢复事务表、脏页表以及连续有效日志尾。
+  state = analysis_pass(last_checkpoint)
+
+  // 2. 重做：按 LSN 正序检查；pageLSN 已覆盖的记录直接跳过。
+  for record in log_from(state.smallest_rec_lsn):
+    if record.needs_redo and page_lsn(record.page) < record.lsn:
+      redo_update(record, load_page(record.page))
+
+  // 3. 撤销：只处理崩溃时未提交的事务，按事务链逆序进行。
+  for transaction in state.loser_transactions:
+    undo_with_compensation_records(transaction)
+
+  // 4. 所有恢复记录同步后，才发布“存储已可服务”。
+  fsync_or_fail(log)
+  return RECOVERY_COMPLETE
+\end{lstlisting}
+
+\subsection{为什么恢复期间仍要写日志}
+
+若恢复撤销 T8 的两个修改，在第一个修改撤销后再次掉电，下一次启动必须知道第一项撤销已经
+完成。CLR 保存“哪条更新已经被补偿”和“下一条待撤销记录在哪里”。它通常只需 redo，不再
+被 undo，因而撤销进度单调前进。没有这项证据，恢复程序只能从头猜测，甚至可能反复翻转
+同一字节。
+
+\subsection{检查点截断的安全条件}
+
+日志前缀只有在以下信息都不再依赖它时才能回收：
+
+\begin{itemize}
+\tightlist
+\item 任何未提交事务的 undo 链都不再指向该前缀；
+\item 任何脏页的最早未传播更新都不再位于该前缀；
+\item 至少一份完整、可定位且校验有效的检查点已经持久化；
+\item 旧检查点入口的替换本身具有可恢复规则。
+\end{itemize}
+
+“脏页已经发出写请求”不足以满足第二项；系统必须获得目标边界的完成证据。日志截断发生
+过早会把性能优化变成数据丢失，发生过晚只会占用更多空间，因此正确性条件必须先于回收策略。
+
+\section{写时复制：根引用是提交记录，不是普通指针}
+
+写时复制（copy-on-write, COW）把新页面写到未发布位置，沿索引路径逐层生成新节点，最后
+切换根引用。旧根在切换前始终描述完整旧版本。这个结构减少原地覆盖产生的中间状态，却没有
+消除顺序要求：所有新节点必须先于新根获得持久化证据。
+
+设根 A 的 generation 为 41，新建叶 L42、内部节点 I42 和根 R42。安全发布顺序为：
+
+\begin{enumerate}
+\tightlist
+\item 写入 L42，并在节点头保存 generation、owner、长度和 checksum；
+\item 写入引用 L42 的 I42，再写入引用 I42 的 R42；
+\item 等待所有新节点跨过所需持久边界；
+\item 把超级块槽 B 写成 generation 42，保存 R42 地址和 checksum；
+\item 同步槽 B；恢复时在所有校验有效的槽中选择最高 generation。
+\end{enumerate}
+
+\begin{pdfdiagram}[scale=0.88]
+  \node[os state, minimum width=42mm] (slotA) at (-48mm,25mm)
+    {超级块槽 A\\generation 41\\root=R41\\checksum 有效};
+  \node[os memory, minimum width=42mm] (treeA) at (-48mm,-20mm)
+    {旧树 R41\\所有节点保持可达};
+  \node[os compute, minimum width=42mm] (newnodes) at (4mm,-20mm)
+    {新节点\\L42 → I42 → R42\\均已写入并校验};
+  \node[os control, minimum width=42mm] (slotB) at (56mm,25mm)
+    {超级块槽 B\\generation 42\\root=R42\\最后同步};
+
+  \draw[os bus] (slotA.south) -- (treeA.north);
+  \draw[os strong bus] (newnodes.north) -| (slotB.south);
+  \draw[os feedback] (slotA.east) -- node[os label,above]{B 有效前仍选 A} (slotB.west);
+\end{pdfdiagram}
+\diagramnote{恢复程序不根据“哪个槽最后写过”猜测新旧，而是先验证槽与根节点，再比较 generation。若槽 B 是 torn write，槽 A 仍提供完整旧版本。}
+
+\subsection{根切换以后仍有回收债务}
+
+根 B 发布后，旧树不再是当前版本，却可能仍被快照、打开引用或后台发送任务使用。空间回收
+必须根据引用计数、延迟引用或可达性证据判断，不能在根切换时立即释放整棵旧树。否则一次
+逻辑上正确的提交会在并发读取或快照恢复中制造悬空引用。
+
+COW 还会产生碎片和写放大：修改一个叶中的几个字节可能重写整条树路径。只有当基本根切换
+协议成立后，系统才可以用节点打包、延迟引用、日志树或批量提交减少成本；这些优化不能改变
+“子节点先稳定、根最后发布”的恢复不变量。
+
+\section{设备顺序契约：请求完成、刷新与 FUA 各证明什么}
+
+文件系统最终通过块层向设备提交请求。即使文件系统按 D 后 M 的顺序发出，设备也可能并行
+执行或把结果留在易失缓存。上层必须把所需顺序翻译成设备能够执行的命令，并把下层失败完整
+合并回原请求。
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.31\linewidth}|L{0.4\linewidth}|}
+\hline
+动作 & 能建立的证据 & 不能单独证明的事项 \\ \hline
+普通写完成 & 设备已按接口完成该命令 & 数据一定越过设备易失缓存 \\\tablerowrule
+flush 完成 & flush 之前受其覆盖的写被推进到规定边界 &
+flush 之后才发出的写已经持久 \\\tablerowrule
+FUA 写完成 & 该写按设备契约绕过或推进易失缓存 &
+其他没有 FUA 的写也获得相同保证 \\\tablerowrule
+队列 barrier/依赖 & 后续命令不能越过指定顺序点 &
+顺序点之前的命令一定成功 \\\tablerowrule
+设备错误完成 & 下层无法给出所请求的成功证据 &
+目标介质完全没有发生任何部分修改 \\
+\hline
+\end{longtable}
+
+文件系统需要把一次高层同步拆成数据写、元数据写、flush 或 FUA 等下层动作，并记录它们
+之间的依赖。若映射层把一个上层请求克隆到两块下层设备，只有所有必要子请求都满足协议，
+上层才能报告成功。任一层未传播 flush、提前完成父请求或忽略迟到错误，都会破坏更高层的
+持久性含义。
+
+\subsection{同步失败后不能假装回到操作前}
+
+\code{fsync} 返回错误表示系统没有取得请求的持久性证据，不表示所有写都没有落盘。部分
+页面可能已持久，另一些仍在缓存或已经失败。应用必须把该版本标为未提交或不确定，通过
+manifest、日志或下一次恢复检查重新判定，不能假设简单重写最后一个系统调用就能恢复原子性。
+
+错误也可能延迟到写回或同步时才出现。写入调用已经返回的字节仍可能在后台写回中失败，因此
+可靠程序要把同步结果纳入提交状态，并保存足够上下文说明失败对应哪个版本、对象和操作范围。
+
+\subsection{DAX 与持久内存只缩短路径，不取消顺序}
+
+直接访问（DAX）可以让 CPU 通过地址映射访问持久介质，路径中没有普通页缓存与块请求。
+但 CPU store 可能仍停留在缓存层级或以不同顺序到达持久域。软件必须使用平台规定的写回、
+持久化屏障和原子写粒度，并明确平台把哪一层纳入掉电保护。少了一层队列不等于少了提交协议。
+
+\section{校验、冗余与修复：发现错误和恢复数据是两项能力}
+
+checksum 能回答“读出的字节是否符合记录时的摘要”，不能凭空生成正确副本。镜像能提供另一个
+候选副本，却必须用 generation、checksum 或更高层记录判断哪个副本可信。恢复系统因此需要
+把检测证据与修复来源配对。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.28\linewidth}|L{0.25\linewidth}|L{0.17\linewidth}|}
+\hline
+机制 & 能发现或承受的故障 & 仍需的证据 & 失败后的动作 \\ \hline
+块 checksum & torn write、静默位翻转 & checksum 本身受保护且绑定块身份 & 拒绝或寻找副本 \\\tablerowrule
+双副本镜像 & 一个副本不可读或校验失败 & 哪个副本 generation 合法 & 从好副本读并修复坏副本 \\\tablerowrule
+奇偶校验 & 规定数量的数据盘故障 & 条带成员身份与一致 generation & 重建并校验 \\\tablerowrule
+快照 & 逻辑误删后的旧版本可达 & 快照创建点本身已提交 & 选择旧根，不等同于异地备份 \\\tablerowrule
+备份 & 主系统永久损坏 & 备份完整性、时间点和恢复演练 & 在独立介质重建服务 \\
+\hline
+\end{longtable}
+
+\subsection{镜像读取的具体判定}
+
+设块 B 的两个副本都能读取。副本 0 保存 generation 42 但 checksum 失败；副本 1 保存
+generation 41 且 checksum 有效。系统不能因为 42 较新就返回损坏字节，也不能在不知道提交
+记录的情况下直接把 41 宣布为当前版本。它先查权威根或日志：若版本 42 已提交却两个有效
+副本均缺失，结果应是不可恢复错误；若版本 42 尚未提交，副本 1 才可能是正确旧状态。
+
+后台 scrub 会主动读取数据、验证 checksum，并在冗余允许时修复坏副本。scrub 缩短潜伏错误
+存在时间，但不能替代在线写协议。若所有副本都以同样方式写入错误内容且重新计算了 checksum，
+块级校验仍会认为它们一致；端到端校验和业务不变量仍然必要。
+
+\subsection{RAID write hole 的状态推演}
+
+一个条带由数据 D0、D1 和 parity P 组成。更新 D0 需要使 P 与新 D0、旧 D1 匹配。若先写
+新 D0，随后掉电而 P 仍是旧值，三者都可能单独可读，却不再满足 parity 方程。重建另一块盘
+时会生成错误内容。日志化条带更新、非易失写缓存、写意图位图或 COW parity 都是在为
+“D0 与 P 属于同一代”增加恢复证据。
+
+\section{故障注入：把协议变成可穷举的状态空间}
+
+正常运行十万次不能覆盖“恰好在提交记录的第 37 字节掉电”。崩溃一致性测试要控制持久化
+模型：记录每次写、刷新和根切换，在任意两个持久事件之间截断执行，然后从截断后的介质镜像
+启动真实恢复代码。
+
+\begin{lstlisting}
+enumerate_crash_points(operation):
+  // 基线运行只记录持久事件序列，不把内存可见误作介质可见。
+  trace = run_with_persistence_recorder(operation)
+
+  // 每个 cut 构造一次可能的介质状态，并从冷启动路径恢复。
+  for cut in 0 .. trace.persistence_events.count:
+    image = materialize_media_state(trace, cut)
+    recovered = cold_boot_and_recover(image)
+
+    // 预言只允许旧版本或完整新版本；恢复再次运行也必须相同。
+    require(recovered in {VALID_V41, VALID_V42})
+    require(cold_boot_and_recover(image) == recovered)
+\end{lstlisting}
+
+测试模型必须与声明的故障范围一致。若设备允许扇区 torn write，模型要枚举部分扇区；若接口
+只保证某个原子写粒度，就不能假设更大的记录一次完成；若设备 flush 可能失败，测试要注入
+失败并检查上层没有发布成功。模型比真实设备更强或更弱，都会得到误导性结论。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.31\linewidth}|L{0.39\linewidth}|}
+\hline
+测试维度 & 注入方式 & 必须核对的观察结果 \\ \hline
+进程崩溃 & 在系统调用之间终止发布者 & 内核继续运行，未提交候选不被读取者采用 \\\tablerowrule
+内核崩溃 & 在写回、日志提交或根切换处停止 & 冷启动恢复只选择允许版本 \\\tablerowrule
+短写与 EINTR & 限制单次写入长度、注入可重试中断 & 循环写入不丢失偏移，失败不发布 \\\tablerowrule
+同步错误 & 让文件或目录同步返回错误 & 业务状态保持未提交或不确定 \\\tablerowrule
+torn record & 只保留记录前缀或单个扇区 & checksum 使扫描停在连续有效日志尾 \\\tablerowrule
+迟到完成 & 超时后再交付旧设备完成 & generation 阻止旧完成命中新请求 \\\tablerowrule
+静默损坏 & 翻转数据但不更新 checksum & 读取路径拒绝损坏并按冗余策略修复或报错 \\
+\hline
+\end{longtable}
+
+\subsection{测试报告要保存因果证据}
+
+一次失败报告至少包含：随机种子、初始介质镜像、持久事件序列、崩溃 cut、注入错误、恢复日志、
+最终权威 generation、孤儿对象集合和不变量检查结果。只有保留这些信息，开发者才能重放同一
+失败并判断错误来自发布协议、恢复算法还是测试模型。
+
+\section{完整复盘：版本 42 在哪里才算完成}
+
+现在沿对象和边界重新追踪开篇任务：
+
+\begin{enumerate}
+\item 发布者分别创建带 generation 的不可变数据文件。每个文件在写入后校验长度与内容
+      checksum，并检查文件同步结果。此时它们只是候选对象。
+\item 发布者同步候选文件所在目录，使重启后的恢复程序能够按记录名称找到它们。目录中
+      出现候选文件仍不是业务提交。
+\item 发布者构造 generation 42 的 manifest，记录前一代、文件集合、长度、内容 checksum
+      和记录 checksum。manifest 只引用已经取得持久性证据的候选对象。
+\item 临时 manifest 同步完成后，发布者原子替换权威 \code{MANIFEST} 名称，再同步父目录。
+      目录同步成功是本协议向调用者返回 \code{COMMITTED} 的边界。
+\item 读取者先稳定引用 manifest，再验证记录和全部文件。全部验证成功后才构造
+      \code{VersionHandle(42)}；在此之前，任何 v42 文件都不能泄漏给业务代码。
+\item 崩溃恢复只在校验有效的 manifest 中选择 generation，忽略或回收未被权威版本引用的
+      候选文件。恢复重复执行仍选择同一代。
+\item 若同步、校验或设备层返回错误，发布者保存未提交或不确定状态。校验和负责检测，
+      冗余负责在存在可信副本时修复；没有可信副本时必须报告不可恢复错误。
+\end{enumerate}
+
+这条链路把四个容易混淆的结论分开：字节被接受、对象可见、介质持久和业务提交。WAL 用
+COMMIT 记录承担细粒度更新的发布证据，COW 用校验有效的新根承担树形状态的发布证据，
+manifest 用一个小型权威记录承担多文件版本的发布证据。三种结构不同，却共享同一条恢复
+原则：先形成完整候选状态，再持久化足以重建决定的证据，最后才向观察者发布提交结果。
+
+\subsection{恢复结束以后，服务仍要经过开放门槛}
+
+恢复程序返回并不自动表示所有接口都可以接收写请求。日志可能已经收束，但空间索引仍在核对；
+主副本可能可读，但后台仍在重建冗余；文件系统结构可能足以只读挂载，却不足以安全分配新块。
+系统应把“恢复算法完成”和“允许哪类服务”分成两个状态。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.31\linewidth}|L{0.39\linewidth}|}
+\hline
+开放门槛 & 必须成立的事实 & 不满足时的服务状态 \\ \hline
+权威根可选 & 至少一个根或 manifest 的格式、generation 与 checksum 有效 &
+拒绝装载，不能扫描目录猜测版本 \\\tablerowrule
+日志已收束 & 所有 winner 已 redo，loser 已 undo 或隔离，恢复记录已同步 &
+保持恢复模式，不接受普通读写 \\\tablerowrule
+空间归属可判定 & 已分配、空闲、延迟回收和孤儿对象之间没有重复归属 &
+只读开放或继续一致性检查 \\\tablerowrule
+读取完整性可验证 & 被权威版本引用的数据有校验依据，损坏有明确报错路径 &
+允许健康对象读取，损坏对象返回可定位错误 \\\tablerowrule
+写入冗余满足策略 & 所需副本或 parity 已可更新，降级写规则已经明确 &
+只读服务、受限写入或等待重建 \\
+\hline
+\end{longtable}
+
+开放状态必须可观察：启动日志记录所选 generation、检查点 LSN、未完成恢复项、降级原因与
+允许的操作集合。这样，下一章面对“服务启动很慢”“目录可读但写入失败”或“重建期间延迟升高”
+等症状时，才能把用户现象连接到一个具体恢复阶段，而不是把所有启动问题统称为存储故障。
