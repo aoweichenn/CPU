@@ -96,8 +96,14 @@ EXTRAS_BEFORE = {
 }
 DIAGRAM_OVERRIDES = {
     6: (("这台最小 ISA 的完整数据通路", "ch06-minimal-isa-datapath.tex"),),
+    9: (("内存墙的历史分叉", "ch09-memory-wall-plot.tex"),),
+    11: (
+        ("SRAM 蝶形图与 SNM 测量", "ch11-snm-butterfly-plot.tex"),
+        ("两种写辅助技术", "ch11-write-assist-waveforms.tex"),
+    ),
     13: (("内存控制器内部流水线", "ch13-memory-controller-pipeline.tex"),),
     14: (
+        ("SLC 与 TLC 的 $V_{th}$ 分布对比", "ch14-threshold-distributions.tex"),
         ("NVMe 命令处理流程", "ch14-nvme-command-flow.tex"),
         ("磨损均衡前后的擦除次数分布", "ch14-wear-leveling-balance.tex"),
     ),
@@ -107,6 +113,7 @@ DIAGRAM_OVERRIDES = {
     ),
     16: (("从 read() 到寄存器的完整路径", "ch16-read-end-to-end.tex"),),
     21: (("台式机主板布局与三大分配网络", "ch21-motherboard-distribution.tex"),),
+    22: (("同一阶跃目标下三种阻尼形态的响应", "ch22-step-response-plot.tex"),),
     26: (("J 的条件选通逻辑", "ch26-conditional-jump-select.tex"),),
 }
 LEGACY_CHAPTER_REFERENCES = (
