@@ -1,0 +1,615 @@
+\section{从一个 336 字节请求对象开始：分配器究竟要交付什么}
+
+前文已经说明页级 buddy 与对象级 slab 的基本分工。现在用一项具体任务贯穿慢路径和释放
+路径：块层要创建请求 R37。教学化的 R37 占 336 字节，要求 64 字节对齐，保存操作类型、
+逻辑块范围、缓冲区引用、完成状态和等待队列。提交线程可以睡眠，但设备完成中断不能睡眠；
+请求发布到设备以后，局部函数即使返回，R37 仍必须存在。
+
+朴素的 \code{allocate(336)} 接口没有表达以下问题：
+
+\begin{enumerate}
+\tightlist
+\item 返回的是虚拟连续、物理连续还是仅由页表拼成的地址？
+\item 分配失败时能否睡眠、回收页、启动 I/O 或进入文件系统？
+\item 对象属于哪个 NUMA 节点和资源组，能否使用系统应急储备？
+\item 内存清零、构造函数、对齐和调试红区由谁完成？
+\item 调用者在何时可以发布指针，最后一个引用消失后何时才能复用槽位？
+\end{enumerate}
+
+因此，分配结果不只是一个地址。它同时兑现“容量、布局、上下文与生命周期”四类契约。
+
+\Needspace{16\baselineskip}
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.31\linewidth}|L{0.14\linewidth}|}
+\hline
+契约 & R37 的要求 & 分配器或调用者保存的证据 & 失败结果 \\ \hline
+\endfirsthead
+\hline
+契约 & R37 的要求 & 分配器或调用者保存的证据 & 失败结果 \\ \hline
+\endhead
+容量与对齐 & usable size 至少 336 B，按 64 B 对齐 &
+cache object size、alignment、slab layout & 返回空指针或错误 \\\tablerowrule
+地址性质 & CPU 可访问；请求对象本身不要求物理连续 &
+虚拟地址、所属 slab、承载页 & 改用合适接口 \\\tablerowrule
+执行上下文 & 提交路径可等待；中断完成路径不可进入直接回收 &
+allocation context、GFP 约束、预留池身份 & 降级或消费预留 \\\tablerowrule
+资源归属 & 记入发起任务所在 memcg 与 NUMA 策略 &
+charge owner、node、cache 统计 & 局部回收或 memcg OOM \\\tablerowrule
+生命周期 & 发布后保持到完成、引用归零和延迟读者结束 &
+refcount、state、RCU callback、debug generation & 延迟释放或报告错误 \\
+\hline
+\end{longtable}
+
+本章后续把这五类证据逐层建立。只有在最后一节，R37 才从“需要 336 字节”变成一个可以
+安全提交、完成和回收的内核对象。
+
+\section{可分配页从哪里来：固件范围不能直接当作空闲链表}
+
+机器启动时，固件或平台描述提供若干物理地址范围。范围可能包含可用 RAM、固件保留区、
+设备窗口、内核映像、启动页表和早期分配结果。此时还没有完整 buddy；若直接把所有
+“RAM 范围”挂入空闲链表，分配器可能把正在保存内核代码或页表的页面交给普通请求。
+
+早期分配器先维护“可用 extent 减去保留 extent”的区间集合。建立每页描述符、zone 和
+buddy 元数据以后，系统再逐段释放确实可分配的页。这个转换具有提交意义：某个 PFN 只有在
+固件类型、内核占用、体系结构保留和早期分配四项检查都通过后，才进入普通页分配器。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.31\linewidth}|L{0.39\linewidth}|}
+\hline
+启动状态 & 代表字段 & 此阶段允许的动作 \\ \hline
+固件内存图 & start、length、type、attributes & 识别候选 RAM 和设备/保留窗口 \\\tablerowrule
+早期 extent 集 & available、reserved、allocation cursor &
+在 buddy 建立前分配连续启动结构 \\\tablerowrule
+页描述符数组 & PFN、flags、refcount、node、zone & 为每个受管页建立稳定身份 \\\tablerowrule
+zone 初始化状态 & start PFN、spanned、present、managed pages、watermarks &
+定义区域边界和可参与分配的容量 \\\tablerowrule
+buddy 空闲表 & order、migratetype、free block head、count &
+接受普通页分配与释放 \\
+\hline
+\end{longtable}
+
+\begin{pdfdiagram}[scale=0.9]
+  \node[os state, minimum width=34mm] (firmware) at (-56mm,18mm)
+    {固件范围\\可用 RAM 与保留窗口};
+  \node[os memory, minimum width=34mm] (early) at (-19mm,18mm)
+    {早期 extent\\扣除内核、页表和启动分配};
+  \node[os compute, minimum width=34mm] (pages) at (19mm,18mm)
+    {页描述符\\PFN、zone、refcount};
+  \node[os control, minimum width=34mm] (buddy) at (56mm,18mm)
+    {zone/buddy\\按 order 与迁移类型入表};
+  \draw[os bus] (firmware.east) -- (early.west);
+  \draw[os bus] (early.east) -- (pages.west);
+  \draw[os strong bus] (pages.east) -- (buddy.west);
+
+  \node[os label, text width=34mm] at (-19mm,-4mm)
+    {保留范围不能被普通请求取得};
+  \node[os label, text width=36mm] at (39mm,-4mm)
+    {只有 managed pages 进入分配容量};
+  \draw[os guide] (-19mm,7mm) -- (-19mm,-12mm);
+  \draw[os guide] (39mm,7mm) -- (39mm,-12mm);
+\end{pdfdiagram}
+\diagramnote{“物理地址属于 RAM”只说明介质类型，不说明页面当前空闲。启动转换要先扣除所有占用，再把具有页描述符身份的 managed pages 交给 buddy。}
+
+\Needspace{8\baselineskip}
+\subsection{页描述符为何独立于页内字节}
+
+物理页保存实际数据，页描述符保存内核管理事实。代表性字段包括：
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.28\linewidth}|L{0.42\linewidth}|}
+\hline
+字段类别 & 代表字段 & 作用与边界 \\ \hline
+身份与位置 & PFN、zone、node & 说明页面位于何处，不表示当前用途 \\\tablerowrule
+生命状态 & flags、refcount、mapcount & 判断是否仍有引用、映射或特殊状态 \\\tablerowrule
+用途关联 & mapping、index、private & 把页关联到文件偏移、匿名映射或子系统私有状态 \\\tablerowrule
+分配器状态 & buddy order、migratetype、slab marker &
+字段含义随页面当前状态变化，不能同时解释为多种用途 \\\tablerowrule
+链表关系 & lru、buddy list、slab list & 同一嵌入节点在不同状态下由不同所有者使用 \\
+\hline
+\end{longtable}
+
+稳定语义是“每个受管页有可定位的管理身份”；具体字段复用和布局属于实现选择。页面处于
+buddy 空闲状态时，描述符中的 order 才能解释为连续空闲块阶数；页面交给 slab 后，相同存储
+位置可能改作 slab 元数据。状态转换必须先从旧所有者的数据结构移除，再由新所有者解释字段。
+
+\section{一次精确 buddy 演算：地址相邻不等于可以合并}
+
+设页大小为 4096 字节，一个 zone 的 PFN 0--15 全部空闲。R37 的对象页最终只需 order 0，
+但为展示拆分，先请求 order 1，即两个连续页。分配器从 order 4 的 PFN 0--15 块开始：
+
+\begin{enumerate}
+\tightlist
+\item 拆成 PFN 0--7 与 8--15 两个 order 3 块，把 8--15 放回空闲表；
+\item 把 0--7 拆成 0--3 与 4--7 两个 order 2 块，把 4--7 放回；
+\item 把 0--3 拆成 0--1 与 2--3 两个 order 1 块，返回 0--1；
+\item 页描述符把 PFN 0 标为已分配块头，PFN 2、4、8 分别记录空闲块阶数。
+\end{enumerate}
+
+\begin{pdfdiagram}[scale=0.9]
+  \node[os state, minimum width=48mm] (o4) at (0,28mm)
+    {order 4\\PFN 0--15};
+  \node[os compute, minimum width=40mm] (o3l) at (-30mm,8mm)
+    {order 3\\PFN 0--7};
+  \node[os memory, minimum width=40mm] (o3r) at (30mm,8mm)
+    {order 3 空闲\\PFN 8--15};
+  \node[os compute, minimum width=34mm] (o2l) at (-48mm,-13mm)
+    {order 2\\PFN 0--3};
+  \node[os memory, minimum width=34mm] (o2r) at (-12mm,-13mm)
+    {order 2 空闲\\PFN 4--7};
+  \node[os control, minimum width=30mm] (alloc) at (-58mm,-34mm)
+    {order 1 已分配\\PFN 0--1};
+  \node[os memory, minimum width=30mm] (free) at (-25mm,-34mm)
+    {order 1 空闲\\PFN 2--3};
+  \draw[os bus] (o4.south) -- (o3l.north);
+  \draw[os bus] (o4.south) -- (o3r.north);
+  \draw[os bus] (o3l.south) -- (o2l.north);
+  \draw[os bus] (o3l.south) -- (o2r.north);
+  \draw[os strong bus] (o2l.south) -- (alloc.north);
+  \draw[os bus] (o2l.south) -- (free.north);
+\end{pdfdiagram}
+\diagramnote{每次拆分只产生一个继续向下的候选块和一个放回相应 order 的空闲 buddy。释放 PFN 0--1 时，只有 PFN 2--3 仍为空闲 order 1 块才可以先合成 PFN 0--3。}
+
+order \(k\) 块的 buddy 块头可以教学化地写成
+\(\textit{buddyPFN}=\textit{blockPFN}\mathbin{\mathrm{xor}}2^k\)。
+例如 PFN 0 的 order 1 buddy 是 PFN 2；PFN 4 虽与 PFN 2--3 相邻，却属于另一个 order 2
+父块，不能与 PFN 0--1 直接合并。
+
+\begin{lstlisting}
+free_pages(block_pfn, order):
+  // 只有块头记录当前 order；调用者必须使用与分配相同的阶数释放。
+  while order < MAX_ORDER:
+    buddy_pfn = block_pfn xor (1 << order)
+    buddy = page_descriptor(buddy_pfn)
+
+    // buddy 必须空闲、阶数相同、属于同一 zone 和迁移兼容集合。
+    if not buddy.is_free or buddy.order != order:
+      break
+    if buddy.zone != page_descriptor(block_pfn).zone:
+      break
+
+    remove_from_free_list(buddy, order)
+    block_pfn = min(block_pfn, buddy_pfn)
+    order += 1
+
+  // 最终合并块只登记一次，内部页不能同时出现在其他空闲块中。
+  insert_free_block(block_pfn, order)
+\end{lstlisting}
+
+\subsection{空闲页守恒之外还要验证不重叠}
+
+只比较分配前后的空闲页总数，无法发现同一页面被两个 order 同时登记。buddy 的核心不变量是：
+
+\begin{itemize}
+\tightlist
+\item 每个空闲页恰好属于一个空闲块；
+\item 每个空闲块按自身大小对齐，且不跨 zone 边界；
+\item 已登记块之间不重叠；
+\item 可合并的同阶 buddy 不应长期同时留在两个空闲表中；
+\item 分配块只由块头携带阶数，释放接口必须取得正确的原始 order。
+\end{itemize}
+
+错误 order 的释放尤其危险。把一个 order 0 页面误报为 order 2，会让分配器把仍属于其他
+对象的相邻页面登记为空闲；后续分配成功反而会产生两个合法调用者写同一物理页的破坏。
+
+\section{zone、水位与 zonelist：有空闲页为何仍可能拒绝分配}
+
+一个 zone 不能把最后几页全部交给普通可等待请求。中断、页表建立、回收本身和设备完成路径
+仍可能需要内存；如果这些路径也因内存不足而无法前进，系统就不能释放任何页面。zone 因此
+设置最低、较低和较高水位，并为原子上下文保留一部分应急容量。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.3\linewidth}|L{0.42\linewidth}|}
+\hline
+状态 & 典型判定 & 分配与回收动作 \\ \hline
+高于 high & 空闲量充足且目标 order 可取得 & 快路径分配，后台回收可停止 \\\tablerowrule
+介于 low 与 high & 仍可服务普通请求，但余量下降 & 唤醒后台回收线程 \\\tablerowrule
+介于 min 与 low & 普通分配需要谨慎推进 & 进入直接回收或按策略回退节点 \\\tablerowrule
+低于 min & 普通请求不得继续消耗保留页 & 仅允许符合资格的原子/应急请求 \\\tablerowrule
+总量足够但高阶不足 & 空闲页分散，watermark 可能通过 & 尝试 compaction 或降低 order \\
+\hline
+\end{longtable}
+
+zonelist 表示一次请求允许尝试的 zone 和 NUMA 节点顺序。它不是固定的全机优先级：内存策略、
+CPU 所在节点、地址限制和请求标志会共同决定候选顺序。分配器必须区分“本地节点没有合适块”
+与“所有允许节点都失败”，否则既可能过早 OOM，也可能为一次小分配付出长期远端访问代价。
+
+\begin{lstlisting}
+alloc_from_zonelist(order, context):
+  // 先按 NUMA 策略和地址限制生成本次请求可使用的 zone 顺序。
+  candidates = build_zonelist(context.node_policy, context.zone_limit)
+
+  for zone in candidates:
+    // watermark 检查同时考虑 order、保留页和本请求是否有资格使用储备。
+    if zone_watermark_ok(zone, order, context.reserve_class):
+      block = remove_suitable_free_block(zone, order, context.migratetype)
+      if block != NONE:
+        return block
+
+  // 快路径没有交付对象；是否回收由上下文决定，不能在这里无条件睡眠。
+  return SLOWPATH_REQUIRED
+\end{lstlisting}
+
+\section{slab 几何：336 字节对象怎样落到页面中的槽位}
+
+R37 的有效字段为 336 字节，要求 64 字节对齐。若调试配置在对象前后各放 16 字节红区，
+并增加 16 字节元数据，单槽原始长度为 384 字节；向 64 字节对齐后仍是 384 字节。
+一个 4096 字节页可排列 10 个槽，留下 256 字节给页尾空隙或其他 slab 元数据。调试关闭时，
+实现可能选择不同布局；稳定语义是返回地址满足对象大小与对齐，而不是固定“每页十个”。
+
+\begin{pdfdiagram}[scale=0.9]
+  \node[os title] at (-61mm,21mm) {一个承载 R37 类型对象的 slab 页};
+  \foreach \x/\lab/\sty in {
+    -54/0/os state,
+    -42/1/os state,
+    -30/2/os memory,
+    -18/3/os state,
+    -6/4/os memory,
+    6/5/os state,
+    18/6/os state,
+    30/7/os memory,
+    42/8/os state,
+    54/9/os memory} {
+      \node[\sty, minimum width=10mm, minimum height=13mm, inner sep=1pt]
+        at (\x mm,6mm) {\lab};
+  }
+  \node[os label, text width=45mm] at (-34mm,-12mm)
+    {绿色：已分配对象\\黄色：freelist 中的空闲槽};
+  \node[os label, text width=45mm] at (34mm,-12mm)
+    {每槽 384 B\\页内余量 256 B};
+\end{pdfdiagram}
+\diagramnote{固定大小槽把任意字节切分转换为“从 freelist 取一个对象”。颜色表达槽位状态，不表达对象引用是否已经安全归零；发布和回收仍由对象所属子系统证明。}
+
+\subsection{slab 页、对象槽和业务对象是三种身份}
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.3\linewidth}|L{0.4\linewidth}|}
+\hline
+身份 & 代表字段 & 所有权边界 \\ \hline
+cache & name、object size、alignment、flags、constructor &
+描述一种对象布局，跨越许多 slab 页 \\\tablerowrule
+slab 页 & freelist、inuse、objects、node、list state &
+由 cache 管理，在 partial/full/empty 之间迁移 \\\tablerowrule
+对象槽 & slot address、debug state、freelist link &
+空闲时由分配器拥有，分配后由调用子系统拥有 \\\tablerowrule
+R37 业务对象 & id、generation、refcount、request state、completion &
+由块层和驱动引用，不能用 slab 的 inuse 代替业务引用计数 \\
+\hline
+\end{longtable}
+
+slab 的 \code{inuse} 只说明多少槽已经交给调用者，不知道 R37 是否仍在设备队列、等待队列
+或完成路径中。业务对象必须先解除这些引用，才能调用释放接口。反过来，R37 的引用计数归零
+也不负责把整页交回 buddy；cache 会根据 partial/empty 策略和压力决定何时释放 slab 页。
+
+\Needspace{8\baselineskip}
+\section{SLUB 快路径与慢路径：每 CPU freelist 怎样转移所有权}
+
+多核同时访问一条全局 freelist 会让小对象分配受锁竞争限制。SLUB 类实现让当前 CPU 暂时
+拥有一个活动 slab 和其中的 freelist。常见分配只弹出一个本地槽；本地耗尽以后，慢路径从
+节点 partial 集合取得另一个 slab，或向 buddy 申请新页。
+
+\begin{lstlisting}
+allocate_r37(cache, context):
+  // 1. 快路径只操作当前 CPU 已拥有的 freelist，不进入回收。
+  local = cache.per_cpu[current_cpu()]
+  obj = local.pop_with_consistency_check()
+  if obj != NONE:
+    initialize_r37(obj)
+    return obj
+
+  // 2. 慢路径先从本 NUMA 节点的 partial 集合转移一个 slab。
+  slab = take_partial_slab(cache.node[context.preferred_node])
+  if slab != NONE:
+    local.install(slab)
+    obj = local.pop_with_consistency_check()
+    initialize_r37(obj)
+    return obj
+
+  // 3. 没有 partial slab 时才向页分配器请求承载页。
+  slab = new_slab_from_pages(cache, context)
+  if slab == NONE:
+    return ALLOCATION_FAILED
+  local.install(slab)
+  obj = local.pop_with_consistency_check()
+  initialize_r37(obj)
+  return obj
+\end{lstlisting}
+
+“每 CPU”表示所有权和同步域，不表示对象永远由同一 CPU 释放。R37 可以在 CPU 2 创建，
+由 CPU 7 的中断完成。远端释放要按实现协议安全地把槽接回目标 freelist 或节点 partial
+集合，不能无锁修改另一个 CPU 正在消费的链表。
+
+\subsection{CPU 下线时必须归还本地库存}
+
+若 CPU 7 下线而本地 cache 仍持有 80 个空闲 R37 槽，这些槽仍计入系统内存，却不再有正常
+分配路径访问。CPU 热插拔协议必须停止该 CPU 的分配活动、排空本地 freelist、把 partial
+slab 归还节点集合，并在所有并发引用收束后释放 per-CPU 状态。
+
+内存压力下也会主动 drain 每 CPU 缓存。这样做增加同步和缓存失效，却能把分散在各 CPU 的
+空闲对象集中到 slab 页，使完全空闲的页有机会退回 buddy。快路径优化因此产生一项维护债务：
+系统必须在 CPU 下线和回收时重新集中局部库存。
+
+\section{分配慢路径：回收、压缩与 OOM 是不同失败的处理}
+
+快路径失败后，系统先判断请求允许做什么。order 0 请求通常关心总量；高阶请求还关心连续性。
+直接回收尝试释放可回收页面，compaction 尝试移动可移动页以形成连续区间，OOM 选择终止
+某个资源消费者。三者处理的条件不同，不能把“再试一次”写成没有边界的循环。
+
+\begin{pdfdiagram}[scale=0.88]
+  \node[os state, minimum width=34mm] (request) at (-55mm,24mm)
+    {请求\\order、zone、context};
+  \node[os compute, minimum width=34mm] (fast) at (-18mm,24mm)
+    {快路径\\watermark 与 free area};
+  \node[os memory, minimum width=34mm] (reclaim) at (20mm,24mm)
+    {直接回收\\扫描可回收页};
+  \node[os control, minimum width=34mm] (compact) at (57mm,24mm)
+    {连续性仍不足\\执行 compaction};
+  \node[os state, minimum width=36mm] (success) at (20mm,-12mm)
+    {重新检查成功\\返回分配块};
+  \node[os control, minimum width=36mm] (oom) at (57mm,-12mm)
+    {策略允许时\\进入 OOM 决策};
+  \node[os memory, minimum width=36mm] (fail) at (-18mm,-12mm)
+    {不可等待上下文\\立即失败或使用预留};
+  \draw[os bus] (request.east) -- (fast.west);
+  \draw[os bus] (fast.east) -- (reclaim.west);
+  \draw[os bus] (reclaim.east) -- (compact.west);
+  \draw[os strong bus] (reclaim.south) -- (success.north);
+  \draw[os strong bus] (compact.south) -- (oom.north);
+  \draw[os feedback] (fast.south) -- (fail.north);
+\end{pdfdiagram}
+\diagramnote{图中三条离开快路径的路线由分配上下文和失败类型选择：不可等待请求不能进入直接回收；总量改善后可直接成功；总量存在但连续性不足时才需要 compaction。}
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.27\linewidth}|L{0.31\linewidth}|L{0.12\linewidth}|}
+\hline
+阶段 & 输入证据 & 成功条件 & 可能代价 \\ \hline
+后台回收 & zone 低于 low watermark & 空闲量回到目标水位 & 写回与缓存淘汰 \\\tablerowrule
+直接回收 & 当前请求允许睡眠与回收 & 释放足够页面后重试成功 & 调用延迟不可预测 \\\tablerowrule
+compaction & 高阶块不足且存在可移动页 & 形成目标 order 连续空闲块 & 迁移复制与 TLB 更新 \\\tablerowrule
+memcg 回收 & 资源组 charge 达到限制 & 在同一 memcg 内释放容量 & 局部抖动 \\\tablerowrule
+OOM 决策 & 允许回收路径均无法前进 & 终止对象释放足够资源 & 业务失败与恢复时间 \\
+\hline
+\end{longtable}
+
+\subsection{compaction 的前后状态必须同时满足映射正确}
+
+设 PFN 100--107 中，100、102、104、106 空闲，其他页可移动。系统总计有四个空闲页，却没有
+order 2 连续块。compaction 为已占用页分配目标页，复制内容，更新所有映射与反向映射，
+完成必要的 TLB 协议后才释放旧页。只复制字节而未更新引用会让访问继续指向旧 PFN。
+
+\begin{lstlisting}
+migrate_page(old_page, new_page):
+  // 1. 隔离旧页，阻止建立新的不受控引用；不可移动或被 pin 时立即失败。
+  if not isolate_movable_page(old_page):
+    return NOT_MOVABLE
+
+  // 2. 锁定并复制内容；复制期间旧映射不能观察半更新状态。
+  lock(old_page)
+  copy_page_bytes(old_page, new_page)
+  copy_required_page_state(old_page, new_page)
+
+  // 3. 把文件/匿名映射、页表项和反向映射切换到新页。
+  replace_all_mappings(old_page, new_page)
+  complete_required_tlb_invalidation()
+
+  // 4. 新映射已经生效后，旧页才重新进入空闲集合。
+  unlock(old_page)
+  free_migrated_source(old_page)
+  return MIGRATED
+\end{lstlisting}
+
+被设备长期 pin 的页、部分内核页、不可迁移页表状态或处于写回冲突的页会阻断压缩。诊断
+高阶失败时必须同时观察不可移动页分布和迁移失败原因；只报告“尚有 20\% 空闲内存”不能
+解释连续块为何不存在。
+
+\section{分配上下文：GFP 规则是在阻止递归等待}
+
+R37 的普通提交路径可以使用允许等待的上下文；设备中断完成路径不能睡眠。更隐蔽的问题是
+“可以睡眠”不等于“可以进入任意回收”。若文件系统持有 inode 锁时分配内存，直接回收又
+进入同一文件系统写回并等待 inode 锁，原任务会等待自己释放锁。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.26\linewidth}|L{0.32\linewidth}|L{0.12\linewidth}|}
+\hline
+上下文 & 允许动作 & 禁止或受限原因 & 失败策略 \\ \hline
+普通进程路径 & 睡眠、直接回收、按契约启动 I/O & 仍需服从已持锁和递归边界 & 返回错误或 OOM \\\tablerowrule
+文件系统递归敏感路径 & 睡眠、非文件系统回收 & 重新进入文件系统可能等待当前锁 & 预留、延迟或失败 \\\tablerowrule
+I/O 递归敏感路径 & 睡眠、避免发起新 I/O 的回收 & 新 I/O 可能依赖当前请求完成 & 预留或失败 \\\tablerowrule
+中断/自旋锁路径 & 非阻塞快路径与授权预留 & 调度睡眠会破坏执行上下文 & 丢弃、延迟工作或预分配 \\\tablerowrule
+恢复关键路径 & 预留池中保证的最小对象 & 失败会阻止释放资源本身 & 消费 mempool，完成后归还 \\
+\hline
+\end{longtable}
+
+\subsection{mempool 解决的是前进保证，不是无限容量}
+
+若块层错误恢复至少需要 16 个请求对象才能排空已提交队列，系统可以预先建立 16 个 R37
+预留对象。正常分配先用普通 cache；普通路径失败时，符合资格的恢复路径消费预留。对象完成
+后优先补回预留池，恢复其最小保证。
+
+\begin{lstlisting}
+alloc_recovery_request(pool, context):
+  // 正常路径不消耗稀缺预留，先尝试普通对象 cache。
+  obj = slab_try_alloc(pool.cache, context.without_recursive_reclaim)
+  if obj != NONE:
+    return obj
+
+  // 只有声明为恢复关键的调用者可以消费预留对象。
+  if context.recovery_critical:
+    obj = pool.take_reserved()
+    if obj != NONE:
+      return obj
+
+  // 预留也耗尽时必须显式失败，不能在不可等待路径循环。
+  return ALLOCATION_FAILED
+\end{lstlisting}
+
+预留池的大小来自可证明的最小并发需求。若所有普通调用都能消费它，真正的恢复路径仍会在
+压力峰值时失败；若预留过大，则大量内存长期不可供其他请求使用。
+
+\section{接口选择：连续的究竟是地址、PFN 还是设备视图}
+
+“需要一块连续缓冲区”必须说明由谁观察连续。CPU 可以通过页表把离散物理页映射成连续虚拟
+区间；支持 scatter-gather 的设备可以通过描述符看到多个片段；IOMMU 还可以为设备建立连续
+I/O 虚拟地址。只有明确观察者，才能选择接口。
+
+\Needspace{18\baselineskip}
+\begin{longtable}{|L{0.19\linewidth}|L{0.23\linewidth}|L{0.28\linewidth}|L{0.2\linewidth}|}
+\hline
+需求 & 合适来源 & 获得的连续性 & 不能据此推断 \\ \hline
+\endfirsthead
+\hline
+需求 & 合适来源 & 获得的连续性 & 不能据此推断 \\ \hline
+\endhead
+固定小对象 R37 & 专用 slab cache & 单对象虚拟地址与所需对齐 & 多对象彼此物理相邻 \\\tablerowrule
+若干完整连续页 & buddy 高阶分配 & PFN 物理连续且内核可映射 & 高阶请求必定成功 \\\tablerowrule
+大型 CPU 缓冲 & vmalloc 类映射 & 内核虚拟地址连续 & 可直接用于无 SG 的 DMA \\\tablerowrule
+设备 DMA 区域 & DMA API、SG 或一致性分配 & 符合设备和 IOMMU 契约的设备视图 & CPU 虚拟地址等于 DMA 地址 \\\tablerowrule
+紧急对象集合 & mempool 加底层 allocator & 规定数量的前进保证 & 无限并发时仍不失败 \\
+\hline
+\end{longtable}
+
+R37 本体只是控制对象，使用专用 cache 最合适；它引用的数据页可以由页缓存或 DMA 映射单独
+管理。把控制对象和大数据缓冲强制放进同一连续分配，会放大高阶失败并让两个不同生命周期
+互相约束。
+
+\section{对象发布与释放：refcount 归零以后仍可能不能复用}
+
+R37 创建后经历 INIT、PUBLISHED、IN\_FLIGHT、COMPLETING 和 RETIRED。设备队列、等待者、
+超时工作和查找表可能同时持有引用。把对象从查找表移除，只阻止未来查找；已经取得指针的
+RCU 读者仍可能继续访问。因此“不可再找到”“引用计数归零”“宽限期结束”和“槽位回到
+freelist”是四个边界。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.28\linewidth}|L{0.34\linewidth}|L{0.1\linewidth}|}
+\hline
+阶段 & 所有者与代表字段 & 进入下一阶段的证据 & 可复用 \\ \hline
+INIT & 创建线程；字段尚未公开 & 初始化完成，发布写建立顺序 & 否 \\\tablerowrule
+PUBLISHED & 全局表和调用者持有引用 & 队列接收并取得自身引用 & 否 \\\tablerowrule
+IN\_FLIGHT & 设备/驱动、等待者、超时工作 & 完成或复位证明设备不再访问 & 否 \\\tablerowrule
+RETIRED & 已从查找表移除，旧读者可能存在 & refcount 归零并经过所需宽限期 & 否 \\\tablerowrule
+QUARANTINED & 调试器持有，内容已 poison & 隔离策略允许重新进入 freelist & 否 \\\tablerowrule
+FREE & slab freelist 拥有槽位 & 新分配原子取得所有权 & 是 \\
+\hline
+\end{longtable}
+
+\begin{lstlisting}
+retire_request(req):
+  // 1. 先阻止新查找；已持有引用的读者仍可访问。
+  remove_from_request_index(req.id)
+  store_release(req.state, RETIRED)
+
+  // 2. 释放索引持有的引用；最后引用可能在另一 CPU 的完成路径归零。
+  if refcount_put(req.refcount) == LAST_REFERENCE:
+    call_after_rcu_grace_period(final_free_request, req)
+
+final_free_request(req):
+  // 3. 宽限期证明旧 RCU 读者结束，再检查设备和调试状态。
+  require(req.device_mapping == NONE)
+  require(req.timer_state == CANCELLED)
+  poison_and_quarantine_or_free(req)
+\end{lstlisting}
+
+\subsection{generation 防止旧完成命中新对象}
+
+槽位释放后可能很快重新用于 R52，地址恰好与旧 R37 相同。若设备复位前的迟到完成只携带
+槽位地址或短标签，它可能错误地把 R52 标为完成。请求身份要组合 tag 与 queue generation；
+队列复位推进 generation，旧完成即使到达也只能结算为过期证据，不能修改新对象。
+
+这项规则说明分配器能够复用地址，却不能替子系统复用身份。地址相同只是存储位置再次分配，
+不表示旧异步事件属于新生命周期。
+
+\section{资源归属与失败范围：memcg OOM 不等于整机 OOM}
+
+R37 的控制对象、引用的数据页和间接分配可能属于不同计费类别。资源组 charge 要在对象对
+业务可见前建立；若 charge 失败，初始化路径必须按相反顺序释放已经取得的页、槽和引用。
+释放时 uncharge 只能发生一次，通常与最终资源所有权解除绑定，而不是与某个用户句柄关闭
+简单等同。
+
+\begin{lstlisting}
+create_charged_request(owner, bytes):
+  // 1. 先预留资源组额度；失败时还没有可见对象。
+  charge = memcg_try_charge(owner.memcg, bytes)
+  if charge == FAILED:
+    return MEMCG_LIMIT
+
+  // 2. 分配和初始化失败时必须撤销已经成功的 charge。
+  req = allocate_r37(request_cache, owner.allocation_context)
+  if req == ALLOCATION_FAILED:
+    memcg_uncharge(charge)
+    return NO_MEMORY
+
+  // 3. 对象保存 charge 身份，最终释放路径负责恰好撤销一次。
+  req.memcg_charge = charge
+  initialize_owner_fields(req, owner)
+  publish_request(req)
+  return req
+\end{lstlisting}
+
+memcg 达到上限时，回收应优先限制在该资源组；无法前进时触发局部 OOM，不应因为一个容器
+超限就任意终止宿主其他业务。只有全局允许 zone 都无法满足请求，问题才属于整机容量或碎片。
+
+\section{调试证据：错误访问发生点与错误释放点往往不同}
+
+对象越界可能在 R37 正常运行时破坏相邻槽，直到邻居释放才被发现；释放后访问可能在槽位
+重新分配为另一个类型后才表现为随机字段损坏。调试机制需要分别覆盖边界、时间和可达性。
+
+\Needspace{20\baselineskip}
+\begin{longtable}{|L{0.18\linewidth}|L{0.25\linewidth}|L{0.31\linewidth}|L{0.16\linewidth}|}
+\hline
+证据机制 & 保存状态 & 能定位的问题 & 主要代价 \\ \hline
+\endfirsthead
+\hline
+证据机制 & 保存状态 & 能定位的问题 & 主要代价 \\ \hline
+\endhead
+redzone/\allowbreak canary & 对象边界前后的固定模式 & 相邻越界写与部分下溢 & 增加槽大小 \\\tablerowrule
+poison & 分配/释放时填入特征字节 & 未初始化读取、释放后内容变化 & 写入开销 \\\tablerowrule
+quarantine & 延迟复用及释放栈 & 提高 UAF 在旧生命周期内暴露概率 & 内存滞留 \\\tablerowrule
+shadow memory & 每段地址的可访问状态 & 精确越界与 UAF 访问点 & 较高内存/性能开销 \\\tablerowrule
+guard page sampling & 少量对象邻接不可访问页 & 低开销捕获部分堆越界 & 非确定覆盖 \\\tablerowrule
+alloc/free stack & 调用点、CPU、时间和 generation & 把错误访问连接到生命周期 & 记录与存储成本 \\
+\hline
+\end{longtable}
+
+检测到 canary 损坏时，报告应包含 cache 名称、对象地址、slab 页、相邻槽状态、分配栈、
+释放栈、CPU、generation 和首次异常字节偏移。只打印“内存损坏”不能区分分配器元数据错误、
+调用者越界还是错误 order 释放。
+
+\section{完整复盘：R37 怎样从物理页中取得身份并安全消失}
+
+现在把开篇任务逐层闭合：
+
+\begin{enumerate}
+\item 启动阶段从固件候选 RAM 中扣除内核、页表和保留范围，为 managed PFN 建立页描述符，
+      再按 zone、order 和迁移类型放入 buddy。
+\item 请求 cache 保存 R37 的有效大小、64 字节对齐、构造与调试布局。首次缺少 slab 页时，
+      cache 通过允许等待的上下文向 buddy 取得页面并切成固定槽。
+\item 当前 CPU 从本地 freelist 取得一个槽；慢路径可能转移 partial slab 或新建 slab。
+      槽位所有权从分配器转给块层，但此时 R37 尚未发布。
+\item 创建线程初始化 id、queue generation、refcount、状态、等待队列和资源 charge；发布写
+      完成后，全局索引和设备队列才可以取得引用。
+\item 普通提交路径可以按上下文进入回收；中断或恢复关键路径只能使用非阻塞快路径和授权
+      预留。失败结果必须返回调用者或执行明确降级，不能在不可等待路径隐式睡眠。
+\item 完成路径先撤销设备访问能力，再发布结果并移除索引。refcount 归零只结束显式引用；
+      RCU 宽限期和调试 quarantine 结束后，槽位才回到 freelist。
+\item 当 slab 页全部为空且缓存策略允许回收时，页才从对象分配器退回 buddy。buddy 按相同
+      order 验证并合并伙伴，最终恢复页级连续空闲块。
+\end{enumerate}
+
+这条路径把三组相邻概念分开：虚拟地址连续、物理页连续和设备地址连续；空闲页总量、最大
+连续块和可用应急储备；对象不可查找、引用归零和内存可复用。读者能够指出每次所有权转移的
+字段和证据以后，buddy、SLUB、GFP、mempool、compaction 与 memcg 才不再是孤立名称。
+
+\Needspace{32\baselineskip}
+\subsection{一次失败回放：为什么“还有空闲内存”不足以定位}
+
+假设 R37 的 cache 补充 slab 时请求 order 2 页面失败，而监控仍显示 18\% 空闲内存。有效
+诊断不能从空闲百分比直接跳到 OOM，至少要按下面的证据顺序回放：
+
+\begin{enumerate}
+\tightlist
+\item 先核对请求的 order、允许 zone、NUMA 策略和 allocation context，确认它究竟在什么
+      地址范围内寻找哪一种连续块，以及是否允许睡眠和回收；
+\item 再读取候选 zone 的 watermark、各 order 空闲块计数和不可移动页分布，区分“总量低”
+      与“总量分散”；
+\item 若直接回收已经释放页面，记录释放页进入了哪个 zone 和迁移类型；释放到不合资格的
+      区域不会使当前请求成功；
+\item 若 compaction 失败，记录首个不可迁移 PFN、pin 来源、写回状态和迁移错误，而不是只
+      保存一个笼统失败码；
+\item 最后才依据上下文决定返回失败、使用预留、降低 order 或进入 OOM，并把所选分支写入
+      请求级追踪记录。
+\end{enumerate}
+
+这份记录把“调用者提出了什么契约”“分配器看到了什么状态”和“策略为何选择该结果”连在
+一起。只有三类证据能在同一时间线上对齐，才可能判断应当调整对象布局、减少长期 pin、改变
+NUMA 策略，还是修复错误的分配上下文。
