@@ -1,0 +1,322 @@
+\section{从复位到任务入口：控制权怎样真正改变}
+
+RAM 已由操作者完整准备，但处理器尚处于复位状态。现在释放复位。为了避免把“启动”
+写成无法检查的瞬间，本节沿时间顺序记录谁发起事务、哪些状态只是候选、哪些状态已经提交。
+
+\subsection{复位只建立最少的处理器起点}
+
+复位电路规定：
+
+\begin{lstlisting}
+PC      = 0x00000100
+halted  = 0
+control = FETCH
+SP, r0 ... r7 = unspecified
+\end{lstlisting}
+
+通用寄存器仍是不确定值，所以启动程序不能先使用旧 \code{SP} 压栈，也不能假定某个寄存器
+已经为零。启动程序开头使用处理器内部复位时可用的少量暂存状态，先把自己的工作栈设为
+\code{0x001fd000}，随后才执行普通调用。这个栈属于启动程序工作区，与任务栈分离。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.43\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+状态 & 复位刚释放 & 启动程序初始化后 \\ \hline
+\code{PC} & \code{0x00000100} & 位于记录检查代码中 \\ \hline
+\code{SP} & 未规定 & \code{0x001fd000} \\ \hline
+\code{r0--r7} & 未规定 & 启动程序按自身约定使用 \\ \hline
+任务参数 & 尚不存在 & 仍未提交，只保存在候选区 \\ \hline
+\end{longtable}
+
+这里的“未规定”不是随机数发生器，而是软件不得依赖的值。某次实验恰好观察到零，不会把
+它升级为体系结构承诺。
+
+\subsection{第一条装入为何分成两笔读取}
+
+位于 \code{0x00000100} 的第一条指令要读取准备记录的提交标志。处理器先按 PC 取回
+指令字，再执行该指令形成的数据地址 \code{0x001ff030}。两笔事务不可混为一笔：
+
+\begin{longtable}{|L{0.16\linewidth}|L{0.23\linewidth}|L{0.22\linewidth}|L{0.27\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+事务 & 地址 & 目标 & 返回内容 \\ \hline
+取指 & \code{0x00000100} & 启动存储 & \code{LOAD} 的四个编码字节 \\ \hline
+数据读 & \code{0x001ff030} & RAM & 提交标志 \code{1} \\ \hline
+\end{longtable}
+
+第一笔读取回答“要执行什么动作”，第二笔读取才回答“提交标志是什么”。只有第二笔响应
+成功后，目标寄存器和顺序 PC 才提交。若准备记录地址未映射，处理器保留
+\code{fault\_pc=0x00000100}，而不是错误地报告下一条指令。
+
+\begin{center}
+\begin{tikzpicture}[x=1.45cm,y=0.72cm]
+\foreach \x in {0,1,2,3,4,5,6} {
+  \draw[dashed,BookRule] (\x,0) -- (\x,4.6);
+}
+\node[anchor=east,font=\footnotesize] at (-0.25,4.0) {PC};
+\node[anchor=east,font=\footnotesize] at (-0.25,3.0) {取指};
+\node[anchor=east,font=\footnotesize] at (-0.25,2.0) {数据读};
+\node[anchor=east,font=\footnotesize] at (-0.25,1.0) {提交};
+\draw[very thick,BookAccent] (0,3.8) -- (5,3.8);
+\node[font=\scriptsize] at (2.5,4.08) {\code{0x00000100} 保持为当前指令};
+\draw[very thick,BookAccent] (0.4,2.8) -- (1.4,2.8);
+\node[font=\scriptsize] at (0.9,3.06) {读指令字};
+\draw[very thick,BookTeal] (2.2,1.8) -- (4.2,1.8);
+\node[font=\scriptsize] at (3.2,2.06) {读 \code{prepared}};
+\draw[very thick,BookMuted] (0,0.8) -- (4.2,0.8);
+\draw[very thick,BookAccent] (4.2,0.8) -- (4.2,1.16) -- (5.5,1.16);
+\node[font=\scriptsize,anchor=west] at (4.3,1.38) {寄存器与 PC 一同提交};
+\end{tikzpicture}
+\end{center}
+\diagramnote{PC 在数据读取等待期间仍指向产生该读取的指令。这使失败位置具有唯一含义。}
+
+\subsection{验证完成以前，任务寄存器仍不能被看作有效}
+
+启动程序可能暂时把 \code{entry} 读入某个寄存器，但这不表示它已经接受入口。只有格式、
+范围、重叠、校验和和栈字全部通过后，候选区才包含一组相互一致的值。
+
+\begin{lstlisting}
+candidate:
+  task_pc = 0x00100000
+  task_sp = 0x001efffc
+  r0      = 0x00102000
+  r1      = 4
+  r2      = 0x00102020
+  r3      = 17
+  r4..r7  = 0
+\end{lstlisting}
+
+若代码校验失败，启动程序丢弃整个候选区并停止，而不是保留已经读出的三个参数、只修补
+其中一个。这样，“任务入口状态”要么完整提交，要么完全没有出现。
+
+\subsection{交接边界上到底保存了什么、改变了什么}
+
+验证结束时，启动程序先把自己的继续地址
+\code{0x00000300} 放入任务栈顶，再写任务通用寄存器和 SP，最后提交任务 PC。紧邻提交
+边界的两份快照如下。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.32\linewidth}|L{0.38\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+状态 & 交接前最后一刻 & 交接后第一刻 \\ \hline
+\code{PC} & 启动程序交接指令地址 & \code{0x00100000} \\ \hline
+\code{SP} & 启动程序工作栈 & \code{0x001efffc} \\ \hline
+\code{r0} & 启动程序临时值 & \code{0x00102000} \\ \hline
+\code{r1} & 启动程序临时值 & \code{4} \\ \hline
+\code{r2} & 启动程序临时值 & \code{0x00102020} \\ \hline
+\code{r3} & 启动程序临时值 & \code{17} \\ \hline
+\code{r4--r7} & 启动程序临时值 & 全部为零 \\ \hline
+启动程序工作栈 & 保留检查过程的帧 & 原样留在 RAM，但任务不应使用 \\ \hline
+\end{longtable}
+
+处理器并没有一个名为“任务”的硬件开关。它只在同一时钟提交边界写入这些寄存器，并让
+下一笔取指使用新的 PC。我们把边界前后的两段执行分别称为启动程序与任务，是因为它们的
+代码地址、数据约定和责任不同。
+
+\begin{center}
+\begin{tikzpicture}[node distance=12mm and 17mm]
+\node[stage,minimum width=3.3cm] (check) {启动程序\\完成全部检查};
+\node[stage,minimum width=3.2cm,right=of check] (candidate) {候选入口状态\\尚未取任务指令};
+\node[stage,minimum width=3.2cm,right=of candidate] (commit) {提交 PC 与寄存器\\\code{PC=0x00100000}};
+\node[stage,minimum width=3.2cm,below=15mm of commit] (fetch) {下一笔取指\\来自任务代码区};
+\draw[flow] (check) -- (candidate);
+\draw[flow] (candidate) -- node[above,font=\footnotesize]{唯一交接边界} (commit);
+\draw[flow] (commit) -- (fetch);
+\end{tikzpicture}
+\end{center}
+\diagramnote{交接不是把代码“搬进处理器”，而是改变处理器下一次取指所使用的地址，并按
+约定建立这段代码将读取的寄存器和栈。}
+
+\subsection{第一项任务怎样逐步得到 21}
+
+任务入口处的静态指令已经给出。现在不再用“循环执行四次”一句带过，而是从第一次取指
+开始，区分指令地址、数据地址和提交后的状态。
+
+\subsection{入口指令只清零累加器}
+
+第一笔任务取指访问 \code{0x00100000}。互连根据地址选择 RAM，返回
+\code{MOVI r4,0} 的编码。处理器译码后形成两个候选：
+
+\begin{lstlisting}
+candidate r4 = 0x00000000
+candidate PC = 0x00100004
+\end{lstlisting}
+
+这条指令不访问数据 RAM。提交时同时写 \code{r4} 和 PC。其他寄存器保持入口值，尤其
+\code{r0} 仍指向第一个输入，\code{r1} 仍为四。
+
+\subsection{第一轮装入为何同时出现两个地址}
+
+PC 为 \code{0x00100004} 时，取指地址是 \code{0x00100004}；译码得到
+\code{LOAD r5,[r0]} 后，读取旧 \code{r0=0x00102000}，形成数据地址
+\code{0x00102000}。前者指向“装入动作的编码”，后者指向“被装入的整数”。
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.28\linewidth}|L{0.40\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+阶段 & 保存的事实 & 尚未允许发生的效果 \\ \hline
+取指完成 & 当前 PC、操作码、目标寄存器号 & 不得写 \code{r5} \\ \hline
+数据请求被接受 & 地址、宽度、目标 \code{r5}、后继 PC & 不得开始下一条指令 \\ \hline
+RAM 返回 \code{0x00000007} & 候选 \code{r5=7} & 响应成功前仍不提交 \\ \hline
+装入提交 & \code{r5=7, PC=0x00100008} & 无其他寄存器变化 \\ \hline
+\end{longtable}
+
+随后 \code{ADD r4,r4,r5} 读取旧值 \(0\) 与 \(7\)，候选结果为 \(7\)，提交后
+\code{r4=7}。再后两条指令分别令输入指针增加四、剩余计数减少一。
+
+\subsection{分支位移怎样回到正确的指令}
+
+分支位于 \code{0x00100014}。它的顺序后继是 \code{0x00100018}，编码中的有符号位移
+为 \(-5\) 个指令字，即 \(-20\) 字节：
+\[
+\texttt{0x00100018}+(-20)=\texttt{0x00100004}.
+\]
+第一轮结束时 \code{r1=3}，所以采用目标地址。处理器不会重新执行清零指令；循环入口刻意
+放在装入处，累加器由此保留上一轮结果。
+
+\begin{center}
+\begin{tikzpicture}[node distance=8mm and 11mm]
+\node[stage,minimum width=2.7cm] (load) {\code{00100004}\\装入当前元素};
+\node[stage,minimum width=2.7cm,right=of load] (add) {\code{00100008}\\加入累加器};
+\node[stage,minimum width=2.7cm,right=of add] (ptr) {\code{0010000c}\\指针加四};
+\node[stage,minimum width=2.7cm,below=13mm of ptr] (count) {\code{00100010}\\计数减一};
+\node[stage,minimum width=2.7cm,left=of count] (branch) {\code{00100014}\\计数非零？};
+\node[stage,minimum width=2.7cm,left=of branch,fill=BookWarm] (exit) {\code{00100018}\\写结果};
+\draw[flow] (load) -- (add);
+\draw[flow] (add) -- (ptr);
+\draw[flow] (ptr) -- (count);
+\draw[flow] (count) -- (branch);
+\draw[flow] (branch) -- node[below,font=\scriptsize]{为零} (exit);
+\draw[->,>=Latex,thick,BookAccent] (branch.south) -- ++(0,-8mm) -|
+  node[below,font=\scriptsize,pos=0.25]{非零：位移 \(-5\)，回到装入} (load.south);
+\end{tikzpicture}
+\end{center}
+\diagramnote{回边指向装入指令而不是初始化指令。地址计算使“保留累加器”成为可以核对的
+控制流事实。}
+
+\subsection{四轮以后哪些值应当精确相等}
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.18\linewidth}|L{0.18\linewidth}|L{0.18\linewidth}|L{0.22\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+轮次结束 & 本轮元素 & \code{r4} & \code{r1} & \code{r0} \\ \hline
+第一轮 & \(7\) & \(7\) & \(3\) & \code{0x00102004} \\ \hline
+第二轮 & \(-2\) & \(5\) & \(2\) & \code{0x00102008} \\ \hline
+第三轮 & \(11\) & \(16\) & \(1\) & \code{0x0010200c} \\ \hline
+第四轮 & \(5\) & \(21\) & \(0\) & \code{0x00102010} \\ \hline
+\end{longtable}
+
+第四轮分支不采用回边，PC 顺序前进到 \code{0x00100018}。注意
+\code{r0=0x00102010} 指向输入区末端的第一个字节，不再指向某个有效元素。这是常见的
+半开区间表示：已处理范围为
+\([\code{0x00102000},\code{0x00102010})\)。
+
+\subsection{结果写入何时才算完成}
+
+\code{STORE r4,[r2]} 形成地址 \code{0x00102020}、数据
+\code{0x00000015} 和四个有效字节。小端写入后的 RAM 为：
+
+\begin{lstlisting}
+0x00102020 = 15
+0x00102021 = 00
+0x00102022 = 00
+0x00102023 = 00
+\end{lstlisting}
+
+RAM 在检查地址和字节使能后，于自己的写提交边界替换四个字节并返回 \code{OK}。处理器
+收到成功响应后才把 PC 改为 \code{0x0010001c}。若连接在响应前失败，处理器不能假定结果
+已写；本章 RAM 契约则保证目标要么接受全部四字节，要么一个也不改变。
+
+\subsection{\code{RET} 怎样把控制权交回启动程序}
+
+执行 \code{RET} 前：
+
+\begin{lstlisting}
+PC                  = 0x0010001c
+SP                  = 0x001efffc
+MEM32[0x001efffc]   = 0x00000300
+\end{lstlisting}
+
+处理器读取栈顶，验证返回地址四字节对齐且位于可取指范围，然后形成
+\code{new\_PC=0x00000300} 与 \code{new\_SP=0x001f0000}。两者在同一指令提交边界更新。
+下一笔取指重新落入启动存储。
+
+\begin{center}
+\begin{tikzpicture}[node distance=12mm and 16mm]
+\node[stage,minimum width=3.1cm] (ret) {任务 \code{RET}\\读取旧 SP};
+\node[stage,minimum width=3.2cm,right=of ret] (ram) {RAM 栈顶\\返回 \code{0x00000300}};
+\node[stage,minimum width=3.3cm,right=of ram] (commit) {同时提交\\PC 与增加后的 SP};
+\node[stage,minimum width=3.3cm,below=14mm of commit] (boot) {启动存储取指\\记录合作返回};
+\draw[flow] (ret) -- (ram);
+\draw[flow] (ram) -- (commit);
+\draw[flow] (commit) -- (boot);
+\end{tikzpicture}
+\end{center}
+\diagramnote{返回地址不是处理器猜出的“调用者”。它是启动前写入栈中的四个具体字节。}
+
+\subsection{把整次运行放到同一条时间线上}
+
+现在可以从操作者开始准备一直排到结果被读回。表中的“可见状态”只列已经提交的事实。
+
+\begin{longtable}{|L{0.10\linewidth}|L{0.19\linewidth}|L{0.25\linewidth}|L{0.34\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+阶段 & 主动者 & 关键动作 & 阶段结束时可依赖的事实 \\ \hline
+\(\mathrm{T_0}\) & 操作者 & 保持复位，清零提交标志 & 处理器不发起普通事务 \\ \hline
+\(\mathrm{T_1}\) & 调试夹具 & 写代码、输入、哨兵值和返回字 & 各区域存在，但尚未宣告完整 \\ \hline
+\(\mathrm{T_2}\) & 调试夹具 & 写记录、读回、最后提交 & \code{prepared=1} 且读回一致 \\ \hline
+\(\mathrm{T_3}\) & 复位电路 & 在稳定边沿释放复位 & \code{PC=0x00000100} \\ \hline
+\(\mathrm{T_4}\) & 启动程序 & 检查记录、范围、校验和与栈 & 候选入口状态完整 \\ \hline
+\(\mathrm{T_5}\) & 启动程序 & 提交参数、SP 与任务 PC & 下一笔取指属于任务 \\ \hline
+\(\mathrm{T_6}\) & 任务 & 四轮装入与加法 & \code{r4=21,r1=0} \\ \hline
+\(\mathrm{T_7}\) & 任务 & 写结果并执行 \code{RET} & 结果槽为 21，PC 回到启动存储 \\ \hline
+\(\mathrm{T_8}\) & 启动程序 & 写返回状态并停止修改结果 & 操作者可以稳定读回 \\ \hline
+\end{longtable}
+
+“程序运行结束”在这台机器上不是一个物理引脚。我们把它定义为三个可共同核对的条件：
+
+\begin{enumerate}
+\item 启动程序工作区的 \code{boot\_status.phase} 为 \code{RETURNED}；
+\item 其中记录的准备编号仍为 17；
+\item 结果槽不再是哨兵，并且本例值为 \code{0x00000015}。
+\end{enumerate}
+
+仅满足第二项不能证明任务运行过；仅满足第三项不能排除旧 RAM；仅看到 PC 位于启动存储，
+也可能是验证尚未结束。组合条件把“本次运行、合作返回、结果可读”联系起来。
+
+\subsection{如果任务永远不执行 \code{RET}}
+
+把分支位移改成让程序永远回到自身。任务一旦进入该循环，时钟仍不断推动取指与分支，
+启动程序却没有机会继续执行。当前机器没有能在任务运行中主动改变 PC 的其他部件，也没有
+第二份处理器状态。
+
+操作者只能重新拉起整机复位。复位会丢弃正在运行的寄存器值，并从
+\code{0x00000100} 重新开始。若 RAM 仍保留原内容，启动程序还必须借助新的准备编号或
+人工清除提交标志，避免误把旧批次当作一次新运行。
+
+\subsection{如果任务写错了地址}
+
+任务中的 \code{STORE} 若把 \code{r2} 改为代码地址，RAM 会按普通写请求接受，因为当前
+互连只按地址选择目标，不检查“这段字节原来被当作代码”。本次最后一次取指已经完成时，
+错误写入甚至可能不影响本次结果，却会破坏下一次运行。
+
+这说明启动前的区域不重叠检查只约束初始布局，不能约束运行中的每笔访问。要让某些地址
+在任务运行时不可写，后续必须增加会参与每笔事务判定的新机制，并说明判定依据从何而来。
+本章尚未获得这种能力。
+
+\subsection{如果处理器记录了故障}
+
+无效操作码、未映射地址、未对齐访问或向启动存储写入都会使普通效果不提交。处理器锁存
+\code{fault\_pc}、\code{fault\_address} 与 \code{fault\_cause}，再把
+\code{halted} 置一。此后时钟仍存在，但取指状态机保持停止。
+
+操作者读取记录后能定位最初失败的指令，却不能让任务从那里继续。复位清除
+\code{halted} 的同时也重新建立 PC，所有未另行保存的寄存器进度都会丢失。故障记录因此
+属于整机诊断，不属于任务恢复。
+
+\begin{problemframe}
+\textbf{到这里能够完整描述的运行。} 操作者在复位期间建立代码、数据、栈和准备记录；
+启动程序只验证这些既有字节并提交一组入口状态；处理器随后顺序执行一项任务，任务把 21
+写入结果槽并合作返回。任何阶段失败都停止或依赖整机复位，没有后台程序、第二项任务、
+自动输入设备或运行中强制转移。
+\end{problemframe}

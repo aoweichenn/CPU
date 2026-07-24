@@ -1,0 +1,2292 @@
+\begin{filesystemlayout}
+
+\chapter{缓存、写回与崩溃一致性}
+\begin{keyidea}
+缓存把“程序已经修改的状态”和“介质已经保存的状态”分离开来。只要一次文件操作会改变
+多个持久对象，崩溃就可能落在这些写入之间。本章先确定可见性与持久性的不同边界，再从
+半完成更新推导写回顺序、日志提交、检查点和恢复规则。
+\end{keyidea}
+
+\input{chapters/ch13-filesystem-operation-protocols}
+
+\fsdivision{页缓存、脏页与写回}
+
+\fstopic{问题：磁盘比内存慢一千倍}
+
+上一节讨论了 VFS 的统一接口与分发机制，但还没有回答一个更根本的问题：每次 \code{read} 和 \code{write} 都访问磁盘，系统会慢到什么程度？
+
+先看数字。DDR4 内存访问延迟 $\sim$80 ns，带宽 $\sim$25 GB/s。NVMe SSD 读取延迟 $\sim$100 $\mu$s（慢 1250 倍），带宽 $\sim$3 GB/s（慢 8 倍）。HDD 随机读取延迟 $\sim$10 ms（慢 125000 倍），带宽 $\sim$200 MB/s（慢 125 倍）。如果用户程序每次 \code{read} 都要等磁盘返回，一个 4 KiB 的读请求在 HDD 上就要花 10 ms；如果一个程序依次读 10000 个 4 KiB 页面，总耗时 100 秒。而如果把这 40 MiB 数据缓存在内存中，10000 次内存拷贝只需 $\sim$0.8 ms。差距是五个数量级。
+
+因此，普通文件的 buffered I/O 默认经过内核的文件数据缓存——\emph{page cache}。
+读操作先查缓存，命中则不产生本次磁盘 I/O；buffered write 通常先修改缓存并标脏，
+随后由后台写回或同步调用送往设备。Direct I/O 和 DAX 是后文单独讨论的旁路，不能
+把这段默认路径扩大成所有文件 I/O 的唯一实现。
+
+页缓存按文件映射与页索引组织 folio，使同一文件区间能够被 read、write 和 mmap
+共享。buffered read 优先查找缓存；buffered write 通常修改缓存并标脏，随后由后台
+写回或同步调用提交 I/O。这里描述的是默认 buffered 路径，不包括 Direct I/O 与 DAX。
+
+\fstopic{address\_space：从 (inode, offset) 到 folio}
+
+page cache 不是一张全局哈希表。内核为每个 inode 关联一个 \code{address\_space} 对象，它是该 inode 所有缓存页的管理容器。
+
+\begin{lstlisting}
+struct address_space {
+    struct inode           *host;            // 拥有此 address_space 的 inode
+    struct xarray           i_pages;         // page cache 页的索引
+    pgoff_t                 writeback_index; // 上次 writeback 停止位置
+    const struct address_space_operations *a_ops; // 操作表
+    unsigned long           nrpages;         // 已缓存页数
+    struct rb_root_cached   i_mmap;          // 私有映射的 VMA 树
+    struct rw_semaphore     invalidate_lock; // 截断/失效与填充的互斥边界
+    struct rw_semaphore     i_mmap_rwsem;    // mmap 信号量
+    errseq_t                wb_err;           // 异步写回错误序列
+    unsigned long           flags;
+};
+\end{lstlisting}
+
+\code{host} 指回拥有此 \code{address\_space} 的 inode。\code{i\_pages} 是
+XArray 索引，键表示文件中的页索引，值通常指向 folio。folio 是一个或多个连续
+基础页的内存管理单位；引入它是为了让页缓存不必永远以单个 4 KiB 页为粒度。
+\code{nrpages} 仍以基础页数量记账，不能简单理解成“XArray 中有多少个 folio”。
+
+\code{a\_ops} 是操作表，决定了具体的读、写、写回行为如何落到底层文件系统：
+
+\begin{lstlisting}
+struct address_space_operations {
+    int  (*read_folio)(struct file *, struct folio *);
+    void (*readahead)(struct readahead_control *);
+    int  (*writepages)(struct address_space *,
+                       struct writeback_control *);
+    int  (*write_begin)(const struct kiocb *, struct address_space *,
+                        loff_t, unsigned, struct folio **, void **);
+    int  (*write_end)(const struct kiocb *, struct address_space *,
+                      loff_t, unsigned, unsigned,
+                      struct folio *, void *);
+    bool (*dirty_folio)(struct address_space *, struct folio *);
+    void (*invalidate_folio)(struct folio *, size_t, size_t);
+    bool (*release_folio)(struct folio *, gfp_t);
+};
+\end{lstlisting}
+
+具体字段会随内核版本变化；这里以 Linux 6.16 基线附近的 folio 接口说明职责。
+许多现代文件系统还通过 iomap 复用 buffered I/O、direct I/O 和块映射的公共实现，
+从而避免分别维护功能重叠的 page 回调。
+
+\fstopic{XArray：低树高的稀疏索引}
+
+\code{address\_space.i\_pages} 是一棵 XArray（历史上使用 radix tree）。键以
+\code{pgoff\_t} 页索引表达文件位置，普通叶项可指向 folio/page；同一 folio 覆盖
+多个页索引时还会使用 XArray 的多索引表示。常见 64 位配置中内部节点通常有 64 个
+槽位（\code{XA\_CHUNK\_SHIFT = 6}），但应把它理解为低树高稀疏索引，而不是对
+所有架构和配置都写死的磁盘格式常量。
+
+\begin{lstlisting}
+// 1 GiB 文件，页大小 4 KiB
+// 总页数 = 1 GiB / 4 KiB = 262144 = 2^18
+// XArray 层级计算：
+//   每级 64 个槽 (2^6)
+//   2^18 个键需要 ceil(18/6) = 3 级
+//   level 0 (root):     64 个槽 → 覆盖 2^6 = 64 页
+//   level 1:            64^2 个槽 → 覆盖 2^12 = 4096 页
+//   level 2:            64^3 个槽 → 覆盖 2^18 = 262144 页
+//
+// 查找 page index = 100000:
+//   index = 100000 = 0x186A0
+//   slot[0] = (100000 >> 0)  & 0x3F = 0x20 = 32   // 实际用高 12 位
+//   实际分三段：高6位、中6位、低6位
+//   hi = (100000 >> 12) & 0x3F = 24   // root → level 1 节点 24
+//   mi = (100000 >> 6)  & 0x3F = 38   // level 1 → level 2 节点 38
+//   lo = (100000 >> 0)  & 0x3F = 32   // level 2 → slot 32 = page*
+\end{lstlisting}
+
+在这个 1 GiB、4 KiB 粒度的例子中，路径只有 3 层，因此常数很小；但严格复杂度
+仍是 $O(\log_{64} n)$，不是与索引范围无关的 $O(1)$。XArray 的优势还包括稀疏
+分配、标记和并发访问接口，不能只用“大分支树所以等于常数”概括。
+
+\begin{fspdfdiagram}
+  % XArray structure
+  \node[os compute, minimum width=48mm] (root) at (0,0) {root\\64 slots};
+  \node[os label] at (24mm, 6mm) {hi = (index >> 12) \& 0x3F};
+
+  % Level 1 nodes
+  \node[os state, minimum width=18mm] (l1a) at (-30mm, -16mm) {node 24};
+  \node[os state, minimum width=18mm] (l1b) at (0, -16mm) {node 25};
+  \node[os state, minimum width=18mm] (l1c) at (30mm, -16mm) {node 26};
+
+  % Level 2 nodes under node 24
+  \node[os memory, minimum width=14mm] (l2a) at (-42mm, -32mm) {n24-38};
+  \node[os memory, minimum width=14mm] (l2b) at (-24mm, -32mm) {n24-39};
+
+  % Leaf pages
+  \node[os small block, fill=BookGreenTint, minimum width=12mm] (p1) at (-50mm, -48mm) {page};
+  \node[os small block, fill=BookGreenTint, minimum width=12mm] (p2) at (-34mm, -48mm) {page};
+  \node[os small block, fill=BookAmberTint, minimum width=12mm] (p3) at (-18mm, -48mm) {page};
+
+  % Edges
+  \draw[os strong bus] (root.south) -- (l1a.north);
+  \draw[os bus] (root.south) -- (l1b.north);
+  \draw[os bus] (root.south) -- (l1c.north);
+  \draw[os strong bus] (l1a.south) -- (l2a.north);
+  \draw[os bus] (l1a.south) -- (l2b.north);
+  \draw[os strong bus] (l2a.south) -- (p1.north);
+  \draw[os bus] (l2a.south) -- (p2.north);
+  \draw[os bus] (l2b.south) -- (p3.north);
+
+  % Highlight path
+  \node[os label, text=BookRed] at (0, -40mm) {查找 index=100000 走红色路径};
+  \node[os label] at (-30mm, 6mm) {\textcolor{BookRed}{\textbf{slot 24}}};
+  \node[os label] at (-42mm, -22mm) {\textcolor{BookRed}{\textbf{slot 38}}};
+\end{fspdfdiagram}
+\fsdiagramnote{XArray 查找路径。这个教学参数下需要 3 级节点；树高随可表示的索引范围缓慢增长，因此应写成低树高的对数查找，而不是严格 $O(1)$。}
+
+\fstopic{读路径深追踪}
+
+下面追踪一次 \code{vfs\_read(file, buf, 4096, offset=8192)} 的完整执行路径。文件使用 ext4，页大小 4 KiB，offset 8192 对应 page index = 2。
+
+\begin{lstlisting}
+// 步骤 1: VFS 入口
+ssize_t vfs_read(struct file *file, char __user *buf,
+                 size_t count, loff_t *pos)
+{
+    // offset = 8192, count = 4096
+    // 检查权限、锁、文件模式
+    if (ret = rw_verify_area(READ, file, pos, count))
+        return ret;
+    // 分发到 file->f_op->read_iter
+    // ext4: ext4_file_read_iter -> generic_file_read_iter
+    return generic_file_read_iter(iocb, to);
+}
+
+// buffered read 的机制级伪代码
+// 步骤 2: 按文件页索引查找 page cache
+pgoff_t index = 8192 / 4096;  // index = 2
+struct address_space *mapping = file->f_mapping;
+struct folio *folio = lookup_cached_folio(mapping, index);
+
+// 步骤 3a: 如果命中且 folio 内容有效
+if (folio && folio_test_uptodate(folio)) {
+    copy_folio_to_iter(folio, 0, 4096, to);
+    // 没有设备 I/O；耗时取决于复制长度、CPU cache、缺页和调度状态
+    return 4096;
+}
+
+// 步骤 3b: 如果未命中
+// 分配并锁住新 folio，再加入 mapping->i_pages。
+// 先发布“正在装入”的 locked folio，是为了让并发读者等待同一次 I/O，
+// 而不是为同一 (inode,index) 重复发起设备读取。
+folio = allocate_locked_folio(index);
+add_folio_to_mapping(mapping, folio, index);
+
+// 步骤 4: 对 folio 发起读取；具体文件系统可复用 iomap 等公共路径
+mapping->a_ops->read_folio(file, folio);
+// read_folio / iomap 路径内部:
+//   1. 查 extent 或其他映射，找到 folio 对应的物理范围
+//   2. 按设备约束构造一个或多个 bio
+//   3. 提交到块层、驱动和设备
+//   4. I/O 完成后设置 uptodate/error，并解锁 folio
+
+// 步骤 5: 等待 I/O 完成
+folio_wait_locked(folio);
+if (!folio_test_uptodate(folio))
+    return -EIO;
+
+// 步骤 6: 拷贝数据到用户空间
+copy_folio_to_iter(folio, 0, 4096, to);
+// folio 留在 page cache 中，下次读同一区间可能直接命中
+return 4096;
+\end{lstlisting}
+
+整个读路径的两种结局：
+
+\begin{longtable}{|F{0.13\linewidth}|F{0.36\linewidth}|F{0.24\linewidth}|F{0.15\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+路径 & 执行步骤 & 磁盘 I/O & 延迟 \\
+\midrule
+缓存命中 & XArray 查找 $\to$ \code{copy\_page\_to\_user} & 无 & $\sim$100 ns \\\tablerowrule
+缓存未命中 & XArray 查找 $\to$ 分配 folio $\to$ \code{read\_folio} / iomap $\to$ 提交 I/O $\to$ 等待 $\to$ 拷贝 & 取决于映射与预读 & 取决于设备和队列 \\
+\bottomrule
+\end{longtable}
+
+第二次读同一页面时走缓存命中路径，延迟降到 $\sim$100 ns。这就是 page cache 对重复读的加速比：$\sim$1000 倍。
+
+\fstopic{预读：检测顺序访问并预取}
+
+当内核检测到访问模式是顺序的，会主动把后续页面提前读入 cache，避免每次都 cache miss。预读窗口按指数增长：
+
+\begin{lstlisting}
+// read-ahead 窗口增长（简化）
+// 第一次读 offset=0: cache miss, 读 1 页
+//   预读窗口 = 4 KiB (1 page)
+// 第二次读 offset=4096: cache miss, 读 1 页 + 预读 3 页
+//   预读窗口 = 8 KiB (2 pages), 实际预读 4-16 KiB
+// 第三次读 offset=8192: cache hit (被预读)
+//   预读窗口增长到 16 KiB (4 pages)
+//   内核继续预读下一批
+// 第四次读 offset=12288: cache hit
+//   预读窗口 = 32 KiB (8 pages)
+// ...
+// 最终预读窗口稳定在 128 KiB (32 pages)
+
+// 内核使用 onstack_readahead_control 结构
+struct readahead_control {
+    struct file *rac_file;        // 关联的 file
+    struct address_space *mapping;
+    pgoff_t _index;               // 预读起始页索引
+    unsigned int _nr_pages;        // 本次预读页数
+    unsigned int _batch_count;     // 已提交页数
+};
+
+// 预读决策在 page_cache_sync_readahead 中
+void page_cache_sync_readahead(mapping, file, page, index)
+{
+    // ondemand_readahead 判断是否应该预读
+    if (ondemand_readahead(mapping, ra, file, true, index)) {
+        // 预读窗口增长逻辑
+        ra->size = next_ra_size(ra);  // 指数增长
+        // ra_pages = min(ra->size, 128)  // 上限 128 KiB
+        __do_page_cache_readahead(mapping, file,
+                                  ra->start, ra->size);
+    }
+}
+\end{lstlisting}
+
+\begin{longtable}{|F{0.09\linewidth}|F{0.11\linewidth}|F{0.13\linewidth}|F{0.28\linewidth}|F{0.25\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+次序 & offset & 用户读 & 预读动作 & 预读窗口 \\
+\midrule
+1 & 0 & 4 KiB & 读 1 页，启动预读 & 4 KiB \\\tablerowrule
+2 & 4K & 4 KiB & 命中（预读命中），继续预读 4 页 & 8 KiB \\\tablerowrule
+3 & 8K & 4 KiB & 命中，预读 8 页 & 16 KiB \\\tablerowrule
+4 & 12K & 4 KiB & 命中，预读 16 页 & 32 KiB \\\tablerowrule
+5 & 16K & 4 KiB & 命中，预读 32 页 & 64 KiB \\\tablerowrule
+6 & 20K & 4 KiB & 命中，预读 64 页 & 128 KiB \\\tablerowrule
+7+ & $\ldots$ & 4 KiB & 命中，稳定预读 128 KiB & 128 KiB \\
+\bottomrule
+\end{longtable}
+
+预读的关键收益：当窗口稳定在 128 KiB 时，后续每次 4 KiB 读都命中 cache，没有磁盘 I/O。磁盘在后台以一次大 I/O 读取 128 KiB（32 页），而非 32 次小 I/O。大 I/O 的吞吐远高于小 I/O——HDD 上一次 128 KiB 顺序读 $\sim$0.6 ms，而 32 次 4 KiB 随机读 $\sim$320 ms，快 500 倍。
+
+\begin{warningbox}
+预读是\emph{投机}（speculation）。如果用户程序只读了文件头部就退出，预读的 128 KiB 全部浪费。内核的预读算法因此需要检测随机访问模式并关闭预读：如果连续两次读的 offset 不连续，预读窗口立即缩减到 0。
+\end{warningbox}
+
+\fstopic{写路径深追踪}
+
+写路径与读路径有一个根本区别：写操作\emph{不等待磁盘}。数据拷入 page cache、标记为脏页后立即返回。
+
+\begin{lstlisting}
+// vfs_write(file, buf, 4096, offset=8192)
+ssize_t vfs_write(struct file *file, const char __user *buf,
+                  size_t count, loff_t *pos)
+{
+    // offset = 8192, count = 4096
+    // 分发到 generic_file_write_iter
+    return generic_file_write_iter(iocb, from);
+}
+
+// generic_file_write_iter 内部:
+// 1. 获取 page cache 中的 page
+pgoff_t index = 8192 / 4096;  // index = 2
+struct page *page;
+
+// write_begin 回调（ext4: ext4_write_begin）
+// 如果 page 不在 cache 中，分配并加入
+page = grab_cache_page_write_begin(mapping, index);
+// ext4_write_begin 可能还需要处理延迟分配预留
+
+// 2. 从用户空间拷贝数据到 page
+// page 内偏移 = 8192 % 4096 = 0
+copied = copy_from_user(page_address(page) + 0, buf, 4096);
+// 此时数据在内核 page cache 中
+
+// 3. write_end 回调（ext4: ext4_write_end）
+// 更新 inode 的 i_size
+// 标记 page 为脏
+set_page_dirty(page);
+// SetPageDirty(page) → 把 page 加入 address_space 的脏页树
+
+// 4. 解锁 page，返回用户空间
+unlock_page(page);
+put_page(page);
+// write() 系统调用返回 4096
+// 数据在内存中，磁盘上还没有
+\end{lstlisting}
+
+\code{write()} 返回时，数据的安全级别取决于缓存层次：
+
+\begin{longtable}{|F{0.18\linewidth}|F{0.42\linewidth}|F{0.34\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+时刻 & 数据位置 & 断电后 \\
+\midrule
+普通 buffered \code{write()} 返回 & page cache（内存） & 掉电时通常丢失 \\\tablerowrule
+writeback 完成 & 磁盘写缓存 & 可能丢失（易失缓存） \\\tablerowrule
+\code{fsync()} 成功返回 & 文件系统与设备已完成其持久化协议 & 设备兑现 flush/FUA 等承诺且硬件无故障时保留 \\
+\bottomrule
+\end{longtable}
+
+对这里讨论的普通 buffered write，\code{write()} 成功返回只说明内核已经接收数据；
+持久化仍取决于后续写回、文件系统提交和设备协议。
+
+\fstopic{脏页追踪}
+
+page cache 需要区分“干净 folio”（内容不需要写回）和“脏 folio”（内存中修改过，
+需要写回）。\code{address\_space.i\_pages} 是保存 page-cache folio 的 XArray；脏状态
+由 folio 标志表示，并通过同一 XArray 上的 mark 让扫描者快速筛选。这里没有另一棵
+与缓存索引平行的“脏页树”。下面继续使用单页大小的伪代码，以便突出标记机制：
+
+\begin{lstlisting}
+// 每个 page 有一个 page->flags 字段
+// 其中包含 PG_dirty 位:
+//   PG_dirty = 1: 页被修改过，需要 writeback
+//   PG_dirty = 0: 页与磁盘一致（或刚从磁盘读入）
+
+// SetPageDirty(page) 的简化逻辑:
+int set_page_dirty(struct page *page)
+{
+    struct address_space *mapping = page->mapping;
+    // page 已在 mapping->i_pages 中；设置 folio/page 脏标志，
+    // 并在同一 XArray 上设置 DIRTY mark
+    if (!TestSetPageDirty(page)) {
+        // 之前不是脏页，给其 XArray 索引设置脏 mark
+        __xa_set_mark(&mapping->i_pages, page->index,
+                      PAGECACHE_TAG_DIRTY);
+        // 增加全局脏页计数
+        __inc_node_page_state(page, NR_FILE_DIRTY);
+        // 增加 inode 的脏页计数
+        __mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+        return 1;
+    }
+    return 0;
+}
+\end{lstlisting}
+
+脏页的追踪使用三个标记：\code{PAGECACHE\_TAG\_DIRTY}（需要写回）、\code{PAGECACHE\_TAG\_WRITEBACK}（正在写回中）、\code{PAGECACHE\_TAG\_TOWRITE}（等待写回）。writeback 代码通过扫描这些标记找到需要处理的页。
+
+\fstopic{写回机制：阈值与触发}
+
+Linux 的脏页写回由 per-CPU 计数器和全局阈值驱动。核心计数器是 \code{nr\_dirty}（全局脏页数）和 \code{nr\_writeback}（正在写回的页数），通过 per-CPU 变量维护以减少锁竞争。
+
+\begin{longtable}{|F{0.22\linewidth}|F{0.18\linewidth}|F{0.16\linewidth}|F{0.36\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+参数 & 默认值 & 可调范围 & 含义 \\
+\midrule
+\code{vm.dirty\_ratio} & 20\% & 0--100 & 脏页达到总内存的比例时，写进程被阻塞 \\\tablerowrule
+\code{vm.dirty\_background\_ratio} & 10\% & 0--100 & 脏页达到此比例时，后台 flush 线程启动 \\\tablerowrule
+\code{vm.dirty\_expire\_centisecs} & 3000 (30s) & --- & 脏页存活超过此时长后优先写回 \\\tablerowrule
+\code{vm.dirty\_writeback\_centisecs} & 500 (5s) & --- & flush 线程周期性唤醒间隔 \\
+\bottomrule
+\end{longtable}
+
+以 16 GiB RAM 为例：
+
+\begin{lstlisting}
+// 16 GiB RAM 的脏页阈值计算
+total_memory = 16 * 1024 * 1024 KiB = 16777216 KiB
+// 假设每页 4 KiB
+total_pages = 16777216 / 4 = 4194304
+
+dirty_background_ratio = 10%  // 默认
+dirty_background_threshold = 4194304 * 0.10 = 419430 pages
+                                    = 419430 * 4 KiB = 1638 MiB
+// 脏页超过 1638 MiB → kworker flush 线程启动
+
+dirty_ratio = 20%  // 默认
+dirty_threshold = 4194304 * 0.20 = 838860 pages
+                               = 838860 * 4 KiB = 3276 MiB
+// 脏页超过 3276 MiB → 写进程被阻塞（throttle）
+// 写进程被迫同步执行 writeback，不能继续产生脏页
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+  % Memory bar showing thresholds
+  \node[os label] at (0, 8mm) {16 GiB RAM};
+
+  % Total bar
+  \node[os small block, fill=BookBlueTint, minimum width=80mm, minimum height=10mm] (bar) at (40mm, 0) {};
+  \node[os label] at (40mm, 0) {总内存 16 GiB};
+
+  % dirty_background at 10%
+  \draw[os brace, transform canvas={yshift=-5mm}] (32mm, -3mm) -- (48mm, -3mm);
+  \node[os label, text=BookTeal] at (40mm, -9mm) {dirty\_background = 10\% = 1.6 GiB};
+  \node[os label, text=BookTeal] at (40mm, -14mm) {flush 线程启动};
+
+  % dirty_ratio at 20%
+  \draw[os brace, transform canvas={yshift=-5mm}] (32mm, -3mm) -- (64mm, -3mm);
+  \node[os label, text=BookRed] at (48mm, -20mm) {dirty\_ratio = 20\% = 3.2 GiB};
+  \node[os label, text=BookRed] at (48mm, -25mm) {写进程被阻塞};
+
+  % Mark positions
+  \draw[draw=BookMuted, line width=0.38pt] (32mm, -2mm) -- (32mm, 4mm);
+  \draw[draw=BookMuted, line width=0.38pt] (48mm, -2mm) -- (48mm, 4mm);
+  \draw[draw=BookMuted, line width=0.38pt] (64mm, -2mm) -- (64mm, 4mm);
+
+  \node[os label] at (32mm, 7mm) {0};
+  \node[os label] at (48mm, 7mm) {10\%};
+  \node[os label] at (64mm, 7mm) {20\%};
+  \node[os label] at (80mm, 7mm) {100\%};
+
+  % Dirty region
+  \node[os small block, fill=BookAmberTint, minimum width=16mm, minimum height=10mm] at (40mm, 0) {};
+  \node[os small block, fill=BookRedTint, minimum width=16mm, minimum height=10mm] at (56mm, 0) {};
+\end{fspdfdiagram}
+\fsdiagramnote{脏页阈值示意。16 GiB RAM 时，脏页超过 1.6 GiB（10\%）触发后台写回；超过 3.2 GiB（20\%）阻塞写进程。黄色区域为后台写回触发范围，红色区域为写进程阻塞范围。}
+
+\fstopic{写回追踪}
+
+当脏页达到阈值或时间过期，\code{kworker} 线程被唤醒执行 \code{wb\_workfn}：
+
+\begin{lstlisting}
+// 写回核心逻辑（简化）
+void wb_workfn(struct writeback_control *wbc)
+{
+    while (wbc->nr_to_write > 0) {
+        // 1. 收集脏 folio：按 address_space.i_pages 的 DIRTY mark 扫描
+        //    扫描最多 1024 页
+        struct page *pages[1024];
+        int nr = find_dirty_pages(mapping, wbc,
+                                   pages, 1024);
+
+        if (nr == 0)
+            break;  // 没有脏页了
+
+        for (int i = 0; i < nr; i++) {
+            struct page *page = pages[i];
+
+            // 2. 如果是延迟分配，此时才分配物理块
+            if (test_bit(PG_delalloc, &page->flags)) {
+                // ext4: ext4_mballoc 在块组中找连续块
+                ext4_lblk_t lblk = page->index;
+                ext4_fsblk_t pblk;
+                int allocated = ext4_mb_new_blocks(
+                    handle, &ar, &pblk);
+                // 设置 extent: (lblk, pblk, 1)
+                ext4_ext_map_blocks(handle, inode, &map,
+                                    EXT4_GET_BLOCKS_CREATE);
+                clear_bit(PG_delalloc, &page->flags);
+            }
+
+            // 3. 构造 bio
+            struct bio *bio = bio_alloc(GFP_NOIO, 1);
+            bio->bi_bdev = inode->i_sb->s_bdev;
+            bio->bi_iter.bi_sector =
+                pblk * (blocksize >> 9);
+            // bio 记录 page、页内偏移和长度；DMA 映射在更低层建立
+            bio->bi_io_vec[0].bv_page = page;
+            bio->bi_io_vec[0].bv_len = 4096;
+            bio->bi_io_vec[0].bv_offset = 0;
+
+            // 4. 标记为正在写回
+            SetPageWriteback(page);
+            ClearPageDirty(page);
+            // 在同一 XArray 中把 DIRTY/WRITEBACK marks 转换
+
+            // 5. 提交给块层
+            submit_bio(WRITE, bio);
+        }
+
+        // 6. 等待这批 bio 完成
+        //    (部分 writeback 模式异步等待)
+        wbc->nr_to_write -= nr;
+    }
+}
+
+// bio 完成回调（中断上下文）
+void bio_endio(struct bio *bio)
+{
+    for (page in bio->bi_io_vec) {
+        // 清除 writeback 标记
+        end_page_writeback(page);
+        // 从 writeback 树移除
+        // page 现在是干净页，留在 cache 中
+    }
+    bio_put(bio);  // 释放 bio
+}
+\end{lstlisting}
+
+脏页到磁盘的完整数据流：
+
+\begin{fspdfdiagram}
+  % Pipeline stages
+  \node[os compute, minimum width=22mm] (dirty) at (0,0) {脏页\\(page cache)};
+  \node[os memory, minimum width=22mm] (collect) at (32mm,0) {收集脏页\\(scan dirty tree)};
+  \node[os state, minimum width=22mm] (alloc) at (64mm,0) {延迟分配\\(ext4\_mballoc)};
+  \node[os control, minimum width=22mm] (bio) at (96mm,0) {构造 bio\\submit\_bio};
+  \node[os memory, minimum width=22mm] (disk) at (128mm,0) {磁盘};
+
+  % Second row
+  \node[os compute, minimum width=22mm] (wb) at (0, -16mm) {writeback\\标记};
+  \node[os label] at (32mm, -8mm) {最多 1024 页};
+  \node[os label] at (64mm, -8mm) {分配物理块};
+  \node[os label] at (96mm, -8mm) {DMA 传输};
+  \node[os label] at (128mm, -8mm) {4 KiB/页};
+
+  % Arrows
+  \draw[os strong bus] (dirty) -- (collect);
+  \draw[os strong bus] (collect) -- (alloc);
+  \draw[os strong bus] (alloc) -- (bio);
+  \draw[os strong bus] (bio) -- (disk);
+  \draw[os feedback] (disk.south) -- ++(0, -8mm) -| (wb.west);
+  \draw[os bus] (wb.north) -- (dirty.south);
+\end{fspdfdiagram}
+\fsdiagramnote{写回数据流。脏页从 page cache 出发，经过脏页扫描、延迟分配、bio 构造、DMA 传输到达磁盘。I/O 完成后中断回调清除 writeback 标记，page 变为干净页留在 cache 中。}
+
+\fstopic{fsync：从内存到非易失介质}
+
+\code{fsync(fd)} 是 POSIX 文件 API 中请求文件数据与相关元数据完成同步的核心接口，
+但不是所有持久化场景的“唯一手段”：\code{fdatasync}、同步打开标志、数据库自己的
+日志协议以及目录 \code{fsync} 都可能参与。成功返回表示内核和文件系统已完成该
+对象要求的写回与提交，并向设备发出了必要的顺序/持久化命令；这个承诺依赖设备
+正确实现 flush、FUA 或非易失缓存，也不等于新建文件的父目录项必然已经持久。
+下面的代码是机制级伪代码，不是某个内核版本的逐行 \code{ext4\_fsync}：
+
+\begin{lstlisting}
+// 文件系统 fsync 的机制级伪代码
+int filesystem_fsync(struct file *file, loff_t start,
+                     loff_t end, int datasync)
+{
+    struct inode *inode = file->f_inode;
+
+    // 步骤 1: 把此 inode 的所有脏页刷到磁盘
+    // filemap_write_and_wait 按 address_space.i_pages 的脏 mark 扫描
+    // 对每个脏页: 构造 bio → submit_bio → 等待完成
+    ret = filemap_write_and_wait_range(
+        inode->i_mapping, start, end);
+    // 此时数据已到磁盘（或磁盘写缓存）
+
+    // 步骤 2: 如果文件系统有日志，强制提交日志事务
+    // 确保元数据修改也持久化
+    if (!datasync || ext4_should_journal_data(inode)) {
+        ret = ext4_fc_commit(journal, start, end);
+        // 或旧版: jbd2_complete_transaction(journal, tid)
+        // 这会触发 jbd2 的 commit 流程:
+        //   写 descriptor + metadata + commit block
+        //   flush 日志区域
+    }
+
+    // 步骤 3: 按文件系统、块层和设备能力完成顺序/持久化协议
+    // 可能使用 preflush、FUA、单独 flush，或由事务提交路径承担；
+    // 不能假定每次 fsync 都恰好直接调用一次 blkdev_issue_flush。
+    ret = finish_persistence_protocol(inode->i_sb);
+
+    return ret;
+}
+\end{lstlisting}
+
+\begin{warningbox}
+许多设备有\emph{易失性写缓存}（volatile write cache）。普通写完成可能只表示数据
+进入控制器缓存；掉电后仍会丢失。块层与驱动必须把文件系统的持久化要求翻译成
+设备支持的 flush/FUA 等命令，且设备必须诚实兑现协议。若设备具有受保护的
+非易失写缓存，某些 flush 可以快速完成；若设备或虚拟化层谎报能力，软件单靠
+\code{fsync} 无法修复硬件契约的破坏。因此“成功返回”是分层协议承诺，不是软件
+越过控制器亲眼观察了 NAND 或盘片。
+\end{warningbox}
+
+\fstopic{屏障与磁盘命令顺序}
+
+在有易失写缓存的磁盘上，写操作的完成顺序与提交顺序可能不同。内核用\emph{屏障}（barrier）来保证顺序。考虑以下场景：先写数据块 5000，再写元数据块 6000，必须保证 5000 先到非易失介质。
+
+\begin{lstlisting}
+// 磁盘命令序列（有屏障）
+WRITE block 5000   // 数据块
+WRITE block 5001   // 数据块
+FLUSH_CACHE         // ← 屏障：强制 5000/5001 到非易失介质
+--barrier--          // 后续写必须在此之后
+WRITE block 6000    // 元数据块（依赖 5000 已落盘）
+FLUSH_CACHE         // 确保 6000 也落盘
+
+// 如果在 FLUSH_CACHE 之前断电:
+//   block 5000/5001 可能没落盘
+//   block 6000 一定没落盘（还在屏障之后）
+//   元数据不会指向未落盘的数据块 → 一致
+
+// 如果没有屏障，磁盘可能重排:
+WRITE block 6000   // 先落盘
+WRITE block 5000   // 后落盘
+// 断电: block 6000 在盘上，block 5000 不在
+//   元数据指向不存在的数据 → 不一致
+\end{lstlisting}
+
+现代 SATA 和 NVMe 协议提供了原语的 FUA（Force Unit Access）和 FLUSH 命令来支持屏障语义。内核在 \code{submit\_bio} 时设置 \code{BIO\_RW\_BARRIER} 或使用 \code{blkdev\_issue\_flush} 来插入屏障。
+
+\fstopic{Direct I/O：绕过 page cache}
+
+有些应用程序不需要内核 page cache——它们自己管理缓存。数据库系统（Oracle、PostgreSQL）在用户态维护 buffer pool，数据缓存在自己的内存中。如果再经过 page cache，就会产生双重缓存：同一份数据既在数据库 buffer pool 中，又在内核 page cache 中，浪费内存且增加一次拷贝。
+
+\code{O\_DIRECT} 标志让 \code{read}/\code{write} 绕过 page cache，直接在用户 buffer 和块设备之间通过 DMA 传输数据。
+
+\begin{lstlisting}
+// O_DIRECT 读路径
+vfs_read(file, buf, 4096, offset=8192, O_DIRECT):
+    // 1. 不查 page cache，不分配 page
+    // 2. 检查对齐约束
+    //    buf 必须页对齐 (buf % 4096 == 0)
+    //    offset 必须块对齐 (offset % 512 == 0)
+    //    len 必须块对齐
+    if ((unsigned long)buf % blocksize != 0)
+        return -EINVAL;
+    if (offset % blocksize != 0)
+        return -EINVAL;
+    if (len % blocksize != 0)
+        return -EINVAL;
+
+    // 3. 直接构造 bio，用户 buffer 作为 DMA 目标
+    //    需要 pin 住用户 page 防止换出
+    bio = bio_alloc(GFP_KERNEL, 1);
+    bio->bi_bdev = inode->i_sb->s_bdev;
+    bio->bi_iter.bi_sector = offset / 512;
+    bio->bi_io_vec[0].bv_page = virt_to_page(buf);
+    bio->bi_io_vec[0].bv_offset = offset_in_page(buf);
+    bio->bi_io_vec[0].bv_len = 4096;
+
+    // 4. 提交给块层，等待完成
+    submit_bio(READ, bio);
+    wait_for_completion(bio);
+
+    // 5. 不经过 page cache，不产生缓存页
+    //    数据直接 DMA 到用户 buffer
+    return 4096;
+\end{lstlisting}
+
+\begin{longtable}{|F{0.17\linewidth}|F{0.34\linewidth}|F{0.38\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+条件 & 要求 & 原因 \\
+\midrule
+buffer 对齐 & 页对齐 & DMA 需要物理连续页帧 \\\tablerowrule
+offset 对齐 & 块对齐（512B 或 4K） & 块设备最小寻址单元 \\\tablerowrule
+length 对齐 & 块对齐 & 不能 DMA 半个块 \\
+\bottomrule
+\end{longtable}
+
+何时使用 \code{O\_DIRECT}：
+
+\begin{itemize}
+\tightlist
+\item 数据库（Oracle、PostgreSQL、MySQL InnoDB）：自己管理 buffer pool，避免双重缓存，减少一次内存拷贝。
+\item 大文件顺序写（视频录制、日志归档）：不需要 page cache 的读缓存，直接写入即可。
+\end{itemize}
+
+何时不使用 \code{O\_DIRECT}：
+
+\begin{itemize}
+\tightlist
+\item 小文件随机读：没有预读收益，每次都直接访问磁盘。
+\item 写密集型小写：没有写回批量化，每次写直接落盘。
+\item 通用文件访问：page cache 的读缓存和写批量对小 I/O 至关重要。
+\end{itemize}
+
+\fstopic{DAX：持久内存直接访问}
+
+DAX（Direct Access）面向可由 CPU load/store 访问的持久内存（persistent memory, PMEM）或支持 DAX 的设备映射。具体延迟依平台而变；稳定特征是它能绕过传统 page cache 数据路径，并保留非易失性介质的持久化要求。
+
+DAX 模式下，文件 \code{mmap} 返回用户虚拟地址，页表把该地址映射到持久内存页。应用可用 CPU load/store 访问映射内容，数据不经过传统 page cache，也不靠设备 DMA 完成每次 load/store；但地址仍然是受页表权限约束的虚拟地址。
+
+\begin{lstlisting}
+// DAX 写路径
+struct data_t { int data; };
+int fd = open("/pmem/file.dat", O_RDWR);
+struct data_t *p = mmap(NULL, 4096,
+    PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+// p 是映射到持久内存页的用户虚拟地址
+
+p->data = 42;    // CPU store 指令直接写 PMEM
+                 // 这是一条 mov 指令, 不经过 page cache
+
+// 但 CPU 有自己的 L1/L2 cache
+// store 先进入 CPU cache, 可能还没到 PMEM
+// 要保证持久化, 需要显式刷 cache line
+
+clwb(p);          // cache line writeback
+                  // 把包含 p 的 cache line 刷到 PMEM
+sfence();         // store fence
+                  // 确保之前的所有 store (包括 clwb) 完成
+                  // 之后才能继续执行
+// 此刻 p->data = 42 已在持久内存上, 断电不丢
+
+munmap(p, 4096);
+close(fd);
+\end{lstlisting}
+
+DAX 下的 \code{fsync} 语义完全不同：
+
+\begin{lstlisting}
+// DAX fsync
+int dax_fsync(struct inode *inode)
+{
+    // 遍历此 inode 的所有 dirty PMEM 映射
+    // 对每个 dirty cache line:
+    //   clwb(addr)  // flush to PMEM
+    // sfence()      // ensure ordering
+    // 不需要 submit_bio, 不需要 blkdev_issue_flush
+    // 因为 PMEM 本身就是非易失介质
+
+    struct address_space *mapping = inode->i_mapping;
+    // 扫描 DAX dirty 标记的页面
+    pgoff_t index = 0;
+    while ((page = find_get_page_tag(mapping, &index,
+            PAGECACHE_TAG_DIRTY))) {
+        // 对 PMEM 中的地址执行 clwb
+        void *addr = dax_get_addr(page);
+        arch_wb_cache_pmem(addr, PAGE_SIZE);
+    }
+    arch_wmb_cache();  // sfence
+    return 0;
+}
+\end{lstlisting}
+
+\begin{longtable}{|F{0.16\linewidth}|F{0.24\linewidth}|F{0.24\linewidth}|F{0.26\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+& buffered I/O & Direct I/O & DAX \\
+\midrule
+数据路径 & page cache $\to$ block I/O & block I/O & CPU store $\to$ PMEM \\\tablerowrule
+\code{fsync} & 刷脏页 + 屏障 & 屏障 & \code{clwb} + \code{sfence} \\\tablerowrule
+缓存层 & 内核 page cache & 应用自管 & CPU cache line \\\tablerowrule
+延迟 & $\sim$100 ns (命中) & $\sim$100 $\mu$s & $\sim$300 ns \\\tablerowrule
+对齐要求 & 无 & 页/块对齐 & 无 \\\tablerowrule
+适用 & 通用 & 数据库 & 持久内存设备 \\
+\bottomrule
+\end{longtable}
+
+\begin{fspdfdiagram}
+  % Three paths comparison
+  % Buffered I/O
+  \node[os title] at (0, 5mm) {buffered I/O};
+  \node[os compute, minimum width=16mm] (app1) at (0, 0) {用户进程};
+  \node[os memory, minimum width=16mm] (pc1) at (0, -12mm) {page cache};
+  \node[os control, minimum width=16mm] (bio1) at (0, -24mm) {block I/O};
+  \node[os state, minimum width=16mm] (disk1) at (0, -36mm) {磁盘};
+  \draw[os strong bus] (app1) -- (pc1);
+  \draw[os strong bus] (pc1) -- (bio1);
+  \draw[os strong bus] (bio1) -- (disk1);
+
+  % Direct I/O
+  \node[os title] at (32mm, 5mm) {Direct I/O};
+  \node[os compute, minimum width=16mm] (app2) at (32mm, 0) {用户进程};
+  \node[os control, minimum width=16mm] (bio2) at (32mm, -12mm) {block I/O};
+  \node[os state, minimum width=16mm] (disk2) at (32mm, -24mm) {磁盘};
+  \draw[os strong bus] (app2) -- (bio2);
+  \draw[os strong bus] (bio2) -- (disk2);
+  \draw[os feedback] (app1.east) -- (app2.west);
+  \node[os label] at (16mm, -6mm) {无 cache};
+
+  % DAX
+  \node[os title] at (64mm, 5mm) {DAX};
+  \node[os compute, minimum width=16mm] (app3) at (64mm, 0) {用户进程};
+  \node[os memory, minimum width=16mm] (cc) at (64mm, -12mm) {CPU cache};
+  \node[os state, minimum width=16mm] (pmem) at (64mm, -24mm) {PMEM};
+  \draw[os strong bus] (app3) -- (cc);
+  \draw[os strong bus] (cc) -- (pmem);
+  \node[os label] at (64mm, -32mm) {clwb + sfence};
+\end{fspdfdiagram}
+\fsdiagramnote{三种 I/O 路径对比。buffered I/O 经过 page cache 和 block I/O 两层；Direct I/O 绕过 page cache 但仍走 block I/O；DAX 完全绕过 page cache 和 block I/O，CPU store 直接写持久内存。}
+
+\fsdivision{崩溃一致性、日志与检查点}
+
+\fstopic{崩溃问题：多步写不是原子的}
+
+文件系统的一次逻辑操作（如创建文件）在磁盘上需要修改多个独立的块。磁盘每次只写一个块（或者一个扇区），而电源可能在任意时刻中断。这导致磁盘上的状态可能停留在"半完成"的状态——部分块已更新，部分块还是旧的。
+
+以创建文件 \filepath{/foo} 为例，需要四步磁盘写入：
+
+\begin{lstlisting}
+// 创建 /foo 需要的磁盘修改
+create_file(root_dir, "foo"):
+  // 步骤 1: 分配 inode 5
+  //   修改 inode bitmap: 标记 inode 5 为已用
+  //   写磁盘块 2 (inode bitmap)
+  mark_inode_used(inode_bitmap, 5)
+  write_block(2, inode_bitmap)
+
+  // 步骤 2: 初始化 inode 5
+  //   修改 inode table: 写 inode 5 的内容
+  //   写磁盘块 4 (inode table 中 inode 5 所在块)
+  init_inode(5, mode=REG_FILE, size=0, ...)
+  write_block(4, inode_table_block)
+
+  // 步骤 3: 添加目录项
+  //   修改根目录数据块: 添加 "foo" -> 5
+  //   写磁盘块 68 (根目录数据块)
+  dir_add_entry(root_dir, "foo", inode=5)
+  write_block(68, dir_data_block)
+
+  // 步骤 4: 分配数据块（如果文件有内容）
+  //   修改 block bitmap: 标记块 68 为已用
+  //   写磁盘块 3 (block bitmap)
+  mark_block_used(block_bitmap, 68)
+  write_block(3, block_bitmap)
+\end{lstlisting}
+
+崩溃在不同时刻发生，造成不同的不一致状态：
+
+\begin{longtable}{|F{0.16\linewidth}|F{0.36\linewidth}|F{0.42\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+崩溃时刻 & 已完成的写 & 不一致后果 \\
+\midrule
+步骤 1 之后 & 块 2 (inode bitmap) & inode 5 标记为已用，但 inode table 中内容未初始化。inode 5 有垃圾数据。 \\\tablerowrule
+步骤 2 之后 & 块 2 + 块 4 & inode 5 已分配且初始化，但无目录项指向它。inode 泄漏。bitmap 说已用，但无路径可达。 \\\tablerowrule
+步骤 3 之后 & 块 2 + 4 + 68 & 目录指向 inode 5，但 block bitmap 未标记块 68 为已用。另一个文件可能分配到同一块。 \\\tablerowrule
+步骤 4 之后 & 全部完成 & 一致。 \\
+\bottomrule
+\end{longtable}
+
+步骤 3 之后崩溃尤其危险：目录项说 \code{"foo" → inode 5}，inode 5 的 \code{block[]} 指向块 68，但 block bitmap 仍标记块 68 为空闲。下次分配时，另一个文件可能拿到块 68，两个文件共享同一数据块——数据损坏。
+
+\begin{keyidea}
+崩溃一致性的核心困难是：一次逻辑修改需要多个磁盘写，而磁盘写之间\emph{没有原子性}。任何时刻断电都可能留下部分更新的状态。文件系统必须能恢复到一致状态，无论崩溃发生在哪一步。
+\end{keyidea}
+
+\fstopic{fsck：旧方案的代价}
+
+ext2 没有日志，崩溃恢复依赖 \code{e2fsck} 在挂载前扫描整个文件系统。\code{fsck} 分五步检查：
+
+\begin{lstlisting}
+e2fsck(dev):
+  // Pass 1: 检查每个 inode
+  //   遍历 inode table 中所有 inode
+  //   验证 mode 合法、size 非负
+  //   验证 block 指针在合法范围 [0, total_blocks]
+  //   统计每个 inode 使用的块
+  for i in 0..inode_count:
+    inode = read_inode(i)
+    if inode.mode == 0: continue  // 未使用
+    for block in inode.block_pointers:
+      if block < 0 or block >= total_blocks:
+        mark_bad_inode(i)
+      block_usage[block].add(i)  // 谁用了这个块
+
+  // Pass 2: 检查目录结构
+  //   从根目录开始 BFS
+  //   每个目录项指向的 inode 必须存在且类型正确
+  //   "." 必须指向自身, ".." 必须指向父目录
+  bfs_from_root():
+    queue = [root_inode]
+    while queue:
+      dir = dequeue(queue)
+      for entry in dir.entries:
+        if not inode_exists(entry.inode):
+          error("dangling dir entry")
+        if entry.name == "." and entry.inode != dir:
+          error("bad . entry")
+        enqueue(entry.inode)
+
+  // Pass 3: 检查连通性
+  //   从根目录可达的 inode 集合 vs 全部已用 inode
+  //   不可达的 inode 是"孤儿" (orphan)
+  //   将孤儿 inode 链到 lost+found
+  reachable = bfs_from_root()
+  for i in 0..inode_count:
+    if inode_used(i) and i not in reachable:
+      link_to_lost_found(i)
+
+  // Pass 4: link count 验证
+  //   inode.links 字段 vs 实际目录引用数
+  //   不匹配则修正 links 字段
+  for i in 0..inode_count:
+    actual_links = count_dir_references(i)
+    if inode[i].links != actual_links:
+      fix_links(i, actual_links)
+
+  // Pass 5: bitmap 一致性
+  //   inode bitmap: 标记已用的 inode 是否确实在使用
+  //   block bitmap: 标记已用的块是否被某 inode 引用
+  //   不匹配则修正 bitmap
+  for block in 0..total_blocks:
+    if bitmap[block] == USED and block not in block_usage:
+      bitmap[block] = FREE
+    if bitmap[block] == FREE and block in block_usage:
+      bitmap[block] = USED  // 可能是泄漏
+\end{lstlisting}
+
+全盘检查的工作量随 inode 与块数增长。一个 1 TiB 文件系统若采用 4 KiB 块，共有
+$2^{40}/2^{12}=2^{28}\approx2.68$ 亿个块；即使以每秒 100000 块的理想速度线性扫描，
+仅块扫描也约需 45 分钟。真实耗时还受 inode 数量、元数据局部性、设备并行度和修复
+工作影响，因此大容量文件系统的完整检查可能持续更久。
+
+\begin{warningbox}
+\code{fsck} 在大型文件系统上恢复时间长达数十分钟到数小时。服务器重启窗口要求几秒到几分钟，\code{fsck} 的恢复时间是不可接受的。这正是日志文件系统被发明的直接动机：把恢复时间从 $O(\text{文件系统大小})$ 降到 $O(\text{日志大小})$。
+\end{warningbox}
+
+\fstopic{日志：write-ahead logging}
+
+日志采用\emph{写前记录}（write-ahead logging, WAL）：相关主位置更新获得持久性之前，
+先将事务所需的元数据版本和提交信息写入日志区域。事务提交后，主文件系统位置可以在
+checkpoint 阶段更新，已完成 checkpoint 的日志空间随后回收。
+
+\begin{lstlisting}
+// 带日志的文件创建
+journal_create_file(root_dir, "foo"):
+  // 1. 开启一个日志事务 (handle)
+  handle = journal_start()
+
+  // 2. 在日志中记录所有要做的修改
+  //    这些记录描述了修改后的"完整块内容"
+  journal_log(handle, "inode 5: set mode=FILE, size=0")
+  journal_log(handle, "dir block 68: add entry foo->5")
+  journal_log(handle, "inode bitmap: set bit 5")
+  journal_log(handle, "block bitmap: set bit 68")
+
+  // 3. 提交日志事务
+  //    commit record 写到日志区域的磁盘上
+  //    这是"事务完成"的不可撤销标记
+  journal_commit(handle)
+  // ← 此刻之前断电: 事务未提交, 恢复时丢弃
+  // ← 此刻之后断电: 事务已提交, 恢复时重放
+
+  // 4. 把修改写到主文件系统位置
+  //    (checkpoint, 可延迟执行)
+  write_inode(5, ...)
+  write_dir_block(68, ...)
+  write_inode_bitmap(...)
+  write_block_bitmap(...)
+\end{lstlisting}
+
+崩溃恢复规则因此变得简单：
+
+\begin{longtable}{|F{0.24\linewidth}|F{0.34\linewidth}|F{0.34\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+崩溃时刻 & 日志状态 & 恢复动作 \\
+\midrule
+\code{journal\_commit} 之前 & 无 commit 块 & 丢弃此事务，所有修改未应用 \\\tablerowrule
+\code{journal\_commit} 之后 & 有 commit 块 & 重放日志中的修改到主文件系统 \\\tablerowrule
+checkpoint 之后 & 日志已回收 & 无需恢复（修改已在主位置） \\
+\bottomrule
+\end{longtable}
+
+\begin{keyidea}
+日志先行约束要求恢复所需的日志记录先于受保护的主位置更新持久化。恢复程序还要验证
+事务序号、描述块、校验和与 commit 块；只有满足格式规定的完整事务才可重放。commit
+块提供提交证据，但不能脱离写序和完整性检查单独解释。
+\end{keyidea}
+
+\fstopic{jbd2 日志格式}
+
+ext4 的日志由 jbd2（Journaling Block Device v2）实现。日志是一块循环使用的磁盘区域，内部由一系列块组成。每个事务在日志中的布局如下：
+
+\begin{lstlisting}
+// jbd2 日志区域布局 (磁盘上)
+// 每个块 4 KiB
+//
+// 事务 T1:
+//   [descriptor][data][data][data][commit]
+//    块 100      101   102   103   104
+//
+// 事务 T2:
+//   [descriptor][data][commit]
+//    块 105      106    107
+//
+// 事务 T3:
+//   [descriptor][data][data][data][commit]
+//    块 108      109   110   111   112
+
+// descriptor block 格式:
+struct journal_header_s {
+    __be32 h_magic;       // 0xC03B3998
+    __be32 h_blocktype;   // 1=descriptor, 2=commit, 5=revoke
+    __be32 h_sequence;    // 事务序号
+};
+// 后跟一组 block_tag:
+struct journal_block_tag_s {
+    uint32_t t_blocknr;      // 被修改块在主 FS 中的块号
+    uint16_t t_checksum;     // 数据块校验和 (CRC32C)
+    uint16_t t_flags;        // JBD2_FLAG_ESCAPE 等
+    uint32_t t_blocknr_high; // 高 32 位块号 (大 FS)
+};
+
+// commit block 格式:
+struct journal_commit_header {
+    journal_header_s h;       // h_blocktype = 2 (commit)
+    uint8_t   chksum_type;    // 校验类型
+    uint8_t   chksum_size;
+    uint8_t   padding[2];
+    __be32    chksum[8];      // 具体解释取决于 checksum feature
+};
+\end{lstlisting}
+
+jbd2 的磁盘字段采用大端序，这一点与 ext4 主体结构采用小端序相反。descriptor
+后面可以有数据块或 revoke 记录；revoke 用来阻止恢复时重放已经被释放并重新解释
+的旧块。若忽略 revoke，只靠“看到 commit 就逐块覆盖”，恢复器可能把旧元数据
+写到后来已经属于文件数据的块上。
+
+\begin{fspdfdiagram}
+  % Journal layout
+  \node[os small block, fill=BookBlueTint, minimum width=14mm] (d1) at (0, 0) {descriptor};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of d1] (dd1) {data};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of dd1] (dd2) {data};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of dd2] (dd3) {data};
+  \node[os small block, fill=BookRedTint, minimum width=10mm, right=0pt of dd3] (c1) {commit};
+
+  \node[os small block, fill=BookBlueTint, minimum width=14mm, right=4mm of c1] (d2) {descriptor};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of d2] (dd4) {data};
+  \node[os small block, fill=BookRedTint, minimum width=10mm, right=0pt of dd4] (c2) {commit};
+
+  \node[os small block, fill=BookBlueTint, minimum width=14mm, right=4mm of c2] (d3) {descriptor};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of d3] (dd5) {data};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of dd5] (dd6) {data};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of dd6] (dd7) {data};
+  \node[os small block, fill=BookRedTint, minimum width=10mm, right=0pt of dd7] (c3) {commit};
+
+  % Labels
+  \node[os label] at (24mm, 8mm) {事务 T1};
+  \node[os label] at (62mm, 8mm) {事务 T2};
+  \node[os label] at (104mm, 8mm) {事务 T3};
+
+  % Brace for log area
+  \draw[os brace] (0, -5mm) -- (130mm, -5mm);
+  \node[os label] at (65mm, -10mm) {日志区域（循环使用，默认 128 MiB）};
+\end{fspdfdiagram}
+\fsdiagramnote{jbd2 日志布局。每个事务以 descriptor 块开始（列出后续数据块对应的主 FS 块号），中间是数据块（修改后的完整块内容），最后以 commit 块结束（含 CRC32C 校验和）。恢复时，有 commit 块且校验通过的事务被重放。}
+
+\fstopic{崩溃恢复追踪}
+
+系统启动挂载文件系统时，jbd2 执行日志恢复：
+
+\begin{lstlisting}
+journal_recover(journal):
+  // 从日志区域的头部开始扫描
+  log_start = journal->j_head;   // 下一个要写的位置
+  log_end   = journal->j_tail;  // 最老的未 checkpoint 位置
+
+  // 扫描每个事务
+  seq = journal->j_tail_sequence;
+  block = log_end;
+
+  while block < log_start:
+    // 读 descriptor 块
+    desc = read_block(block);
+    if desc.h_magic != MAGIC || desc.h_blocktype != DESCRIPTOR:
+      break;  // 不是有效的日志内容
+
+    // 读后续的数据块, 直到遇到 commit 块
+    data_blocks = [];
+    tag = desc.tags;
+    while tag != NULL:
+      data = read_block(block + offset);
+      // 校验: data 的 CRC32C == tag.t_checksum?
+      if crc32c(data) != tag.t_checksum:
+        // 数据损坏, 事务不可信
+        break;
+      data_blocks.append({target: tag.t_blocknr,
+                         content: data});
+      tag = tag->next;
+
+    // 读 commit 块
+    commit = read_block(block + data_count + 1);
+    if commit.h_blocktype == COMMIT:
+      // 有 commit 块 → 事务已提交
+      // 校验 commit 块的 checksum
+      if verify_commit_checksum(commit, data_blocks):
+        // 重放: 把每个数据块写到主 FS 位置
+        for entry in data_blocks:
+          write_block(entry.target, entry.content);
+        // 事务重放完成
+      else:
+        // commit 校验失败, 跳过
+        break;
+    else:
+      // 没有 commit 块 → 事务未完成, 丢弃
+      break;
+
+  // 恢复完成
+  // 恢复时间 = O(日志大小), 通常几秒
+  // 128 MiB 日志 / 4 KiB 块 = 32768 块
+  // 每块读 + 可能重写 = 最坏 32768 * 2 次 I/O
+  // NVMe 上约 32768 * 0.1ms = 3.3 秒
+\end{lstlisting}
+
+恢复时间与日志大小成正比，与文件系统总大小无关。128 MiB 日志的恢复在 NVMe 上约 3 秒，远优于 \code{fsck} 的 10--30 分钟。
+
+\fstopic{ext4 + jbd2 事务模型}
+
+jbd2 有两级抽象：
+
+\begin{longtable}{|F{0.16\linewidth}|F{0.34\linewidth}|F{0.44\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+对象 & 粒度 & 生命周期 \\
+\midrule
+\code{handle} & 一次逻辑操作（创建一个文件、一次 rename） & 线程局部，\code{journal\_start} 到 \code{journal\_stop} \\\tablerowrule
+\code{transaction} & 一个 commit 周期内的所有 handle & 一个 jbd2 线程唤醒周期，批量提交 \\
+\bottomrule
+\end{longtable}
+
+一个 \code{transaction} 可以收集来自不同线程的多个 \code{handle}。jbd2 线程定期唤醒（默认 5 秒或脏数据达到阈值），把当前 transaction 的所有修改一次性提交到日志。
+
+\begin{lstlisting}
+// jbd2 commit 流程（简化）
+void jbd2_commit_transaction(journal_t *journal)
+{
+    transaction_t *commit_transaction =
+        journal->j_running_transaction;
+
+    // 1. 等待所有 handle 关闭
+    //    新的 handle 会进入下一个 transaction
+    wait_for_all_handles_closed(commit_transaction);
+    journal->j_running_transaction = new_transaction();
+
+    // 2. 切换到 commit 状态
+    commit_transaction->t_state = T_LOCKED;
+
+    // 3. 写 descriptor 块
+    //    descriptor 列出本事务中所有被修改的 buffer
+    //    及其在校 FS 中的目标块号
+    write_descriptor_block(journal, commit_transaction);
+
+    // 4. 写数据/元数据块到日志
+    //    把每个被修改的 buffer 的完整内容写入日志
+    for (jh in commit_transaction->t_buffers):
+        // 如果是 data=journal 模式, 数据块也写入
+        // 如果是 data=ordered, 此时不写数据块
+        journal_write_buffer(journal, jh);
+
+    // 5. 写 commit 块
+    //    包含本事务所有块的 CRC32C 校验和
+    write_commit_block(journal, commit_transaction);
+
+    // 6. flush 日志区域
+    //    确保日志内容在非易失介质上
+    blkdev_issue_flush(journal->j_dev);
+
+    // 7. 标记旧 transaction 可以被 checkpoint
+    commit_transaction->t_state = T_COMMIT;
+
+    // 8. 后续 checkpoint (可以延迟):
+    //    把已提交的修改从日志复制到主 FS 位置
+    //    完成后释放日志空间
+}
+\end{lstlisting}
+
+\fstopic{三种日志模式}
+
+ext4 支持三种日志模式，在一致性和性能之间做不同取舍：
+
+\begin{longtable}{|F{0.15\linewidth}|F{0.20\linewidth}|F{0.24\linewidth}|F{0.28\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+模式 & 日志内容 & 数据顺序 & 崩溃后保证 \\
+\midrule
+\code{data=journal} & 元数据 + 数据 & 数据先入日志 & 最强：数据不丢。写放大 2 倍。 \\\tablerowrule
+\code{data=ordered} & 只元数据 & 数据先写盘，再提交元数据 & 中等：要么旧数据要么新数据。 \\\tablerowrule
+\code{data=writeback} & 只元数据 & 无顺序保证 & 最弱：可能看到旧垃圾数据。 \\
+\bottomrule
+\end{longtable}
+
+下面追踪三种模式下 \code{write(fd, buf, 4096); fsync(fd);} 的磁盘 I/O 序列：
+
+\begin{lstlisting}
+// ====== data=journal 模式 ======
+// write() 触发: 数据进入 page cache (无 I/O)
+// fsync() 触发:
+//   1. jbd2 提交事务, 包含数据和元数据
+//   日志: [data: buf 内容][metadata: inode 更新][commit]
+//   flush 日志区域
+//   2. checkpoint: 把数据写入主 FS 位置
+//   主 FS: [data: buf 内容][metadata: inode 更新]
+//   3. flush 主 FS
+//
+// 磁盘写: 数据写 2 次 (日志 + 主 FS), 元数据写 2 次
+// 写放大: 2x
+// 崩溃后: 日志重放恢复数据, 数据完整
+
+// ====== data=ordered 模式 (ext4 默认) ======
+// write() 触发: 数据进入 page cache (无 I/O)
+// fsync() 触发:
+//   1. 先把数据脏页刷到主 FS
+//   主 FS: [data: buf 内容]  ← 先落盘
+//   flush 数据 (barrier)
+//   2. jbd2 提交元数据事务
+//   日志: [metadata: inode 更新][commit]
+//   flush 日志
+//   3. checkpoint: 元数据写入主 FS
+//   主 FS: [metadata: inode 更新]
+//
+// 磁盘写: 数据写 1 次 (主 FS), 元数据写 2 次 (日志 + 主 FS)
+// 写放大: ~1.5x (元数据部分)
+// 崩溃后:
+//   如果 commit 之前崩溃: 数据在盘上, 元数据不在
+//     → inode 不指向新数据 → 看到旧数据 (或 hole)
+//   如果 commit 之后崩溃: 数据和元数据都在
+//     → 看到新数据, 完整一致
+
+// ====== data=writeback 模式 ======
+// write() 触发: 数据进入 page cache (无 I/O)
+// fsync() 触发:
+//   1. jbd2 提交元数据事务
+//   日志: [metadata: inode 更新][commit]
+//   flush 日志
+//   2. checkpoint: 元数据写入主 FS
+//   主 FS: [metadata: inode 更新]
+//   3. 数据可能在 fsync 时也刷了, 也可能没有
+//      (取决于实现, writeback 模式不强制数据顺序)
+//
+// 磁盘写: 元数据写 2 次 (日志 + 主 FS), 数据写 0 或 1 次
+// 写放大: ~1x (最快)
+// 崩溃后:
+//   元数据可能指向一个块, 但数据没写
+//   → 读到的是磁盘上的旧垃圾数据
+//   → 可能暴露上一个文件的残留内容!
+\end{lstlisting}
+
+\begin{warningbox}
+\code{data=writeback} 模式在崩溃后可能暴露\emph{旧数据}：元数据（inode 的块指针）已更新指向新分配的块，但数据内容还没写。这个块上可能存着另一个已删除文件的内容。这是安全漏洞——一个用户可能看到另一个用户的旧数据。\code{data=ordered}（默认模式）通过强制数据先于元数据落盘来避免此问题。
+\end{warningbox}
+
+\fstopic{checkpoint 与日志空间回收}
+
+日志区域大小有限（ext4 默认 128 MiB）。提交后的事务修改记录留在日志中，直到被 checkpoint 到主文件系统位置后才能回收。日志因此是一块循环使用的环形缓冲区。
+
+\begin{lstlisting}
+// 日志环形缓冲区
+//   j_head: 下一个写入位置 (指向日志的最新事务末尾之后)
+//   j_tail: 最老的未 checkpoint 事务的起始位置
+//   j_free: j_head 到 j_tail 之间的可用空间
+//
+//   ... [T_old][T_newer][T_current] ... [free space] ... [T_oldest]
+//                                            ↑head              ↑tail
+//   (日志是循环的, head 可能绕回 tail 之前)
+
+// checkpoint 流程
+jbd2_checkpoint(journal):
+  // 找到最早未 checkpoint 的 transaction
+  t = journal->j_checkpoint_transactions;
+  while t:
+    // 把 t 中记录的修改写到主 FS 位置
+    for jh in t->t_buffers:
+      // jh->b_bh 是被修改的 buffer
+      // buffer 内容已在日志中, 现在写到主位置
+      write_block(jh->b_blocknr, jh->b_data);
+    // 此事务的日志空间可以回收
+    free_log_space(journal, t);
+    t = t->t_next;
+
+  // 更新 j_tail
+  journal->j_tail = next_oldest_start;
+  // 写日志 superblock (更新 tail 指针)
+  update_journal_superblock(journal);
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+  % Circular log
+  \node[os label] at (0, 0) {日志区域 128 MiB};
+
+  % Log segments arranged in a line (representing circular)
+  \node[os small block, fill=BookGreenTint, minimum width=16mm] (t1) at (8mm, -8mm) {T1 (已 ckpt)};
+  \node[os small block, fill=BookAmberTint, minimum width=16mm, right=0pt of t1] (t2) {T2 (已提交)};
+  \node[os small block, fill=BookAmberTint, minimum width=16mm, right=0pt of t2] (t3) {T3 (已提交)};
+  \node[os small block, fill=BookBlueTint, minimum width=20mm, right=0pt of t3] (free) {空闲空间};
+  \node[os small block, fill=BookGreenTint, minimum width=16mm, right=0pt of free] (t0) {T0 (已 ckpt)};
+
+  % Head and tail pointers
+  \node[os label, text=BookAccent] at (56mm, -16mm) {head};
+  \draw[draw=BookMuted, line width=0.38pt, -{Latex[length=2.25mm,width=1.85mm]}] (56mm, -14mm) -- (56mm, -11mm);
+
+  \node[os label, text=BookRed] at (108mm, -16mm) {tail};
+  \draw[draw=BookMuted, line width=0.38pt, -{Latex[length=2.25mm,width=1.85mm]}] (108mm, -14mm) -- (108mm, -11mm);
+
+  % Circular arrow
+  \draw[os feedback] (t0.east) -- ++(6mm, 0) -- ++(0, 10mm) -| (t1.west);
+  \node[os label] at (130mm, -3mm) {循环};
+
+  % Free space label
+  \node[os label] at (66mm, -16mm) {可写入};
+\end{fspdfdiagram}
+\fsdiagramnote{日志环形缓冲区。head 指向下一个写入位置，tail 指向最老的未 checkpoint 事务。已 checkpoint 的事务（T0、T1）空间可回收。如果 checkpoint 跟不上新事务产生速度，free 空间耗尽，新事务必须等待——导致写入停顿。}
+
+\fsdivision{写时复制、快照与根切换}
+
+\fstopic{COW 原理：不覆盖，只追加}
+
+ext4、XFS 一类文件系统可以原地更新部分数据或元数据，但它们并不因此共享一个
+简单的“覆盖后由日志回滚全部文件数据”模型。以 ext4 默认 \code{data=ordered}
+为例，日志主要保护元数据结构；普通文件数据通常不进入日志，覆盖写仍可能受到
+设备原子写粒度和掉电时序影响。必须把“结构可恢复”和“用户数据原子更新”分开。
+
+COW（Copy-on-Write）文件系统的基本策略是：对受 COW 保护的块，不在原地址
+发布新版本，而是写到新位置，再逐层发布新的引用关系。真实系统还需要 generation、
+校验和、写序、超级块副本和恢复选择规则；不能把它缩成一次天然原子的指针赋值。
+
+\begin{lstlisting}
+// 传统原地覆盖写
+update_block(inode, offset, new_data):
+  block = lookup(inode, offset)  // 找到物理块 5000
+  write_block(5000, new_data)    // 直接覆盖块 5000
+  // 如果写到一半断电:
+  //   块 5000 一半旧一半新 → 数据损坏
+  //   需要 journal 回滚
+
+// COW 方式
+cow_write(inode, offset, new_data):
+  // 1. 分配新物理块
+  new_data_block = alloc_block()  // 分配块 8000
+  write_block(8000, new_data)     // 写新块, 旧块不动
+
+  // 2. 更新 B-tree 叶子指向新块
+  //    叶子也要 COW (不能原地改)
+  new_leaf = copy_and_modify(old_leaf, offset -> 8000)
+  new_leaf_block = alloc_block()  // 分配块 8100
+  write_block(8100, new_leaf)
+
+  // 3. 父节点也要 COW (因为叶子指针变了)
+  new_parent = copy_and_modify(old_parent,
+                                leaf_ptr -> 8100)
+  new_parent_block = alloc_block()  // 分配块 8200
+  write_block(8200, new_parent)
+
+  // ... 递归 COW 到根 ...
+
+  // 4. 按格式要求写入带 generation/checksum 的新超级块版本
+  publish_superblock_copy(new_root_block, generation)
+  // mount/recovery 选择校验通过且代数完整的版本
+
+  // 旧块 (5000, 旧叶子, 旧父节点...) 仍被旧根引用
+  // 如果有 snapshot, 旧根仍然有效
+  // 如果没有 snapshot, 旧块可以回收
+\end{lstlisting}
+
+\begin{longtable}{|F{0.2\linewidth}|F{0.36\linewidth}|F{0.36\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+& 原地覆盖（ext4/XFS） & COW（Btrfs/ZFS） \\
+\midrule
+崩溃一致性 & 依靠日志、写序和恢复规则 & 依靠 COW、generation、校验和与提交协议 \\\tablerowrule
+snapshot & 需要额外 LVM 层 & 原生支持（保留旧根指针） \\\tablerowrule
+写放大 & 低（1 次写服务 1 次用户写） & 高（3--6 倍） \\\tablerowrule
+碎片 & 低（原地覆盖） & 高（每次写新位置） \\\tablerowrule
+空间回收 & 仍需位图/B+树等空间管理 & 还需引用追踪与延迟回收 \\
+\bottomrule
+\end{longtable}
+
+\fstopic{Btrfs：一切都是 B-tree}
+
+Btrfs（B-tree file system）的核心设计是\emph{把所有数据结构统一为 B-tree}。超级块、extent 分配、目录、inode、校验和都是不同类型的 B-tree。
+
+每个 B-tree 节点是一个磁盘块（4 KiB--64 KiB）。键是三元组 \code{(objectid, type, offset)}，这种统一键空间让不同类型的树可以共享同一套查找、插入、删除代码。
+
+\begin{longtable}{|F{0.20\linewidth}|F{0.22\linewidth}|F{0.46\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+B-tree & key & value \\
+\midrule
+root tree & tree id & 指向子树根节点 \\\tablerowrule
+extent tree & 逻辑块号 & extent ref（物理块号 + 引用计数 + owner） \\\tablerowrule
+chunk tree & 逻辑 chunk 号 & 物理 chunk 映射（设备号 + 偏移） \\\tablerowrule
+dev tree & 物理 extent & 设备号 + 偏移 \\\tablerowrule
+fs tree（每个子卷） & (inode\#, type, offset) & inode / dir entry / file extent \\\tablerowrule
+checksum tree & (inode\#, offset) & 数据块校验和 \\
+\bottomrule
+\end{longtable}
+
+\begin{fspdfdiagram}
+  % Btrfs B-tree structure
+  \node[os compute, minimum width=42mm] (root) at (0,0) {root tree\\root node};
+
+  % Sub-trees
+  \node[os state, minimum width=26mm] (fs) at (-48mm, -16mm) {fs tree\\(subvolume)};
+  \node[os state, minimum width=26mm] (ext) at (0, -16mm) {extent tree\\(allocations)};
+  \node[os state, minimum width=26mm] (ck) at (48mm, -16mm) {checksum tree};
+
+  % fs tree children
+  \node[os memory, minimum width=18mm] (inode) at (-66mm, -32mm) {inode 256};
+  \node[os memory, minimum width=18mm] (dirent) at (-48mm, -32mm) {dir entries};
+  \node[os memory, minimum width=18mm] (fext) at (-30mm, -32mm) {file extents};
+
+  % extent tree children
+  \node[os memory, minimum width=18mm] (e1) at (-12mm, -32mm) {ext: blk 5000};
+  \node[os memory, minimum width=18mm] (e2) at (12mm, -32mm) {ext: blk 8000};
+
+  % Edges
+  \draw[os strong bus] (root) -- (fs);
+  \draw[os strong bus] (root) -- (ext);
+  \draw[os strong bus] (root) -- (ck);
+  \draw[os bus] (fs) -- (inode);
+  \draw[os bus] (fs) -- (dirent);
+  \draw[os bus] (fs) -- (fext);
+  \draw[os bus] (ext) -- (e1);
+  \draw[os bus] (ext) -- (e2);
+
+  % Key annotation
+  \node[os label] at (-48mm, -8mm) {key=(subvol\_id, ...)};
+  \node[os label] at (0, -8mm) {key=(block\_nr, ...)};
+\end{fspdfdiagram}
+\fsdiagramnote{Btrfs 的多棵 B-tree 结构。root tree 是顶层，指向 fs tree（每个 subvolume 一棵）、extent tree（块分配跟踪）、checksum tree 等。所有树共享统一的 \code{(objectid, type, offset)} 键空间。}
+
+\fstopic{Btrfs snapshot：不复制文件数据的快速创建}
+
+Btrfs 的 snapshot 创建只需复制 root tree 的根节点指针，不复制任何数据块：
+
+\begin{lstlisting}
+// Btrfs snapshot 创建
+btrfs_snapshot(src_subvol, dst_subvol):
+  // src_subvol 的 fs tree root 在块 5000
+  // 创建 dst_subvol:
+  //   1. 在 root tree 中添加一个新条目
+  //      指向 src 的 fs tree root (块 5000)
+  //   2. 增加块 5000 的引用计数 (从 1 到 2)
+  //   完成! 没有复制任何数据块
+  dst_subvol->fs_tree_root = src_subvol->fs_tree_root;
+  // 即块 5000
+  increase_refcount(5000);  // extent tree 中 refcount 1->2
+  // 关键性质: 不遍历并复制全部文件数据；
+  // 实际元数据工作量与实现和待提交事务状态有关。
+
+// 之后在 dst 中修改文件:
+btrfs_write(dst_subvol, inode, offset, data):
+  // COW 路径:
+  //   1. alloc new block 8000, write data
+  //   2. COW leaf: 新叶子指向 8000 (新块 8100)
+  //   3. COW parent: ... (新块 8200)
+  //   4. ...
+  //   5. COW 到 fs tree root: 新 root 在块 8400
+  //   6. 更新 dst_subvol->fs_tree_root = 8400
+  //   dst 现在有独立的树, 指向自己的新块
+
+  // src 的 fs tree root 仍然指向块 5000
+  // 块 5000 的 refcount 降回 1 (被 src 引用)
+  // 旧数据块 (5000 的子树) 仍被 src 引用, 不回收
+\end{lstlisting}
+
+snapshot 创建后，两个 subvolume 共享未修改的数据块；只有后续被修改的块及其
+相关元数据路径才会分叉。因此创建通常远快于复制整棵文件树，但不能据此许诺与
+任意系统状态无关的严格常数时间。
+
+旧树根在 COW 更新期间仍然有效，新快照通过共享引用保留既有数据，后续写入才使相关
+路径逐渐分叉。
+共享的数据块通过 extent tree 的引用记录管理，最后一个引用消失后才具备回收条件。
+创建时不复制全部文件数据；真实完成时间还受事务提交、
+元数据更新和系统负载影响。
+
+\fstopic{ZFS：事务对象存储}
+
+ZFS（Zettabyte File System）的设计哲学与 Btrfs 类似（COW + snapshot），但组织方式和数据完整性保证不同。
+
+\begin{longtable}{|F{0.16\linewidth}|F{0.40\linewidth}|F{0.36\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+概念 & 含义 & 作用 \\
+\midrule
+pool & 存储池，由多个 vdev 组成 & 聚合空间、提供冗余 \\\tablerowrule
+vdev & 虚拟设备（disk、mirror、RAID-Z） & 冗余层 \\\tablerowrule
+dataset & 文件系统或卷 & 独立的 snapshot/quota/属性 \\\tablerowrule
+objset & dataset 内的对象集合 & 包含 dnode 和数据 \\\tablerowrule
+dnode & ZFS 的 inode 等价物 & 存储元数据和 block pointer \\\tablerowrule
+block pointer & 带校验和的块指针 & 端到端数据完整性 \\\tablerowrule
+TXG & transaction group & 批量原子提交 \\\tablerowrule
+ZIL & ZFS Intent Log & 同步写加速 \\\tablerowrule
+ARC & Adaptive Replacement Cache & 内存读缓存 \\\tablerowrule
+L2ARC & SSD 二级缓存 & 读缓存扩展 \\
+\bottomrule
+\end{longtable}
+
+ZFS 的每个 block pointer 都携带\emph{校验和}（256 位 SHA-256 或 fletcher4）。读数据时，ZFS 先读块、再校验 checksum。如果不匹配，说明数据静默损坏（silent data corruption）——磁盘返回了数据但内容不对。此时 ZFS 从冗余副本（mirror 或 RAID-Z）读取并修复。
+
+\begin{lstlisting}
+// ZFS block pointer 结构 (简化)
+struct blkptr_t {
+    uint64_t  blk_dva[3];    // 3 个 Data Virtual Address
+                             // (可存 3 个副本的位置)
+    uint64_t  blk_prop;      // 压缩级别、加密、类型
+    uint64_t  blk_birth;     // 创建此块的 TXG 号
+    uint64_t  blk_fill;      // 填充信息
+    uint64_t  blk_cksum[8]; // 256-bit checksum
+                             // (ZIO_CHECKSUM_SHA256)
+};
+
+// 读取一个 block pointer 指向的数据:
+zio_read(bp):
+  data = read_block(bp->blk_dva[0]);  // 从第一副本读
+  if checksum(data) == bp->blk_cksum:
+    return data;  // 校验通过, 数据完好
+
+  // 校验失败 → 数据损坏!
+  // 从第二副本读 (如果有 mirror/RAID-Z)
+  data = read_block(bp->blk_dva[1]);
+  if checksum(data) == bp->blk_cksum:
+    // 第二副本完好
+    // 修复第一副本: 重写 blk_dva[0]
+    zio_rewrite(bp->blk_dva[0], data);
+    return data;
+
+  // 都坏了 → 不可恢复, 返回 EIO
+\end{lstlisting}
+
+ZFS 的 TXG（Transaction Group）机制批量提交写操作。系统把修改组装成 TXG，
+COW 写入新块并更新 block pointer，最后按格式协议写出新的 uberblock 槽位。
+恢复时从多个候选 uberblock 中选择校验和与事务号有效的版本；这不是假设任意宽度的
+根指针更新天然具有硬件原子性。
+
+\begin{lstlisting}
+// ZFS TXG 提交流程
+txg_commit(pool):
+  // 1. 冻结当前 TXG, 收集所有 dirty 数据
+  txg = pool->txg_current;
+  txg->state = TXG_STATE_QUIESCING;
+  // 新写入进入下一个 TXG
+
+  // 2. COW 写所有新数据块
+  for dnode in txg->dirty_dnodes:
+    for block in dnode->dirty_blocks:
+      new_block = alloc_block();   // 从空间分配
+      write_block(new_block, block.new_data);
+      // 更新 block pointer: 指向新块, 带新 checksum
+      block.bp = make_blkptr(new_block,
+                             checksum(block.new_data),
+                             txg->txg_num);
+      // 旧块不覆盖, 旧 block pointer 还在旧 uberblock
+
+  // 3. 更新所有 dnode (COW)
+  for dnode in txg->dirty_dnodes:
+    new_dnode_block = alloc_block();
+    write_block(new_dnode_block, dnode);
+    // dnode 指向新的 block pointers
+
+  // 4. 更新 objset (COW)
+  new_objset_block = alloc_block();
+  write_block(new_objset_block, objset);
+  // objset 指向新的 dnode blocks
+
+  // 5. 按格式要求写新的 uberblock 槽位并完成持久化顺序
+  //    uberblock 包含指向 root objset 的指针
+  new_uberblock = make_uberblock(
+      new_objset_block, txg->txg_num, timestamp);
+  publish_uberblock_slot(pool, new_uberblock);
+  // 旧 uberblock 仍然存在 (ZFS 存多个 uberblock)
+  // 崩溃恢复: 读最新的有效 uberblock
+\end{lstlisting}
+
+ZIL（ZFS Intent Log）记录尚未进入已提交 TXG、却已向调用者承诺持久的同步写意图。
+同步调用必须等相应日志记录达到稳定存储后才可成功返回，而不是“写进内存后立即返回”。
+后续 TXG 提交把修改纳入主存储状态，相关日志记录即可回收；崩溃恢复时重放尚未被
+已提交 TXG 覆盖的有效同步记录。独立的 SLOG 设备是 ZIL 记录的一种承载位置，ZIL
+本身不是必须单独购买的一块设备。
+
+\fstopic{写放大：COW 的核心代价}
+
+COW 文件系统的写放大是核心代价。一次 4 KiB 的随机写，最坏情况下需要：
+
+\begin{lstlisting}
+// 4 KiB 随机写在 Btrfs 中的写放大
+// 假设 B-tree 深度 3 (root → internal → leaf → data)
+
+// 步骤 1: 写新数据块
+new_data_block = alloc_block();   // 块 8000
+write_block(8000, user_data);     // 1 次 4 KiB 写
+
+// 步骤 2: COW 叶子节点 (data → 8000)
+new_leaf = copy_modify(old_leaf);
+new_leaf_block = alloc_block();   // 块 8100
+write_block(8100, new_leaf);      // 1 次 4 KiB 写
+
+// 步骤 3: COW 父节点 (leaf → 8100)
+new_parent = copy_modify(old_parent);
+new_parent_block = alloc_block(); // 块 8200
+write_block(8200, new_parent);    // 1 次 4 KiB 写
+
+// 步骤 4: COW 祖父节点
+new_grandparent = copy_modify(old_gp);
+new_gp_block = alloc_block();    // 块 8300
+write_block(8300, new_gp);       // 1 次 4 KiB 写
+
+// 步骤 5: COW 根节点
+new_root = copy_modify(old_root);
+new_root_block = alloc_block();  // 块 8400
+write_block(8400, new_root);     // 1 次 4 KiB 写
+
+// 步骤 6: 原子更新超级块根指针
+atomic_write(superblock.root, 8400); // 1 次 4 KiB 写
+
+// 总计: 6 次 4 KiB 写, 服务 1 次用户写
+// 写放大 = 6x
+\end{lstlisting}
+
+\begin{longtable}{|F{0.07\linewidth}|F{0.28\linewidth}|F{0.13\linewidth}|F{0.39\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+步 & 写什么 & 块号 & 说明 \\
+\midrule
+1 & 数据块 & 8000 & 新数据内容 \\\tablerowrule
+2 & 叶子节点 & 8100 & COW: extent 指向 8000 \\\tablerowrule
+3 & 父节点 & 8200 & COW: 指向新叶子 8100 \\\tablerowrule
+4 & 祖父节点 & 8300 & COW: 指向新父节点 8200 \\\tablerowrule
+5 & 根节点 & 8400 & COW: 指向新祖父 8300 \\\tablerowrule
+6 & 超级块 & --- & 原子更新根指针 $\to$ 8400 \\
+\bottomrule
+\end{longtable}
+
+Btrfs 和 ZFS 通过以下策略缓解写放大：
+
+\begin{itemize}
+\tightlist
+\item \emph{批量提交}：把许多写操作收集到一个 TXG/transaction 中，一次提交。多用户写共享同一批 COW 元数据节点，分摊开销。
+\item \emph{ZIL / journal}：同步写先记到小日志，不等完整 COW 路径。
+\item \emph{Clone-friendly allocator}：分配器尽量让新块在物理上靠近，减少碎片和元数据分散。
+\item \emph{B-tree 节点变大}：Btrfs 可用 64 KiB 节点，每个节点容纳更多条目，减少树深度和 COW 层数。
+\end{itemize}
+
+\fstopic{对比：ext4 vs Btrfs vs ZFS}
+
+\begin{longtable}{|F{0.16\linewidth}|F{0.24\linewidth}|F{0.24\linewidth}|F{0.24\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+& ext4 (journal) & Btrfs (COW) & ZFS (COW) \\
+\midrule
+崩溃恢复 & 日志重放与有序数据规则 & COW 事务、tree-log 与超级块代数选择 & TXG、ZIL 与 uberblock 选择 \\\tablerowrule
+snapshot & 需 LVM 等上层机制 & 原生、创建元数据开销较小 & 原生、创建元数据开销较小 \\\tablerowrule
+写放大 & 1--1.5x & 3--6x & 3--6x \\\tablerowrule
+碎片 & 低（原地覆盖） & 高（COW 散布） & 高（COW 散布） \\\tablerowrule
+空间效率 & 需日志空间 & 需 refcount 元数据 & 需校验和+refcount \\\tablerowrule
+数据完整性 & 无校验 & 有校验 (checksum tree) & 端到端校验+自修复 \\\tablerowrule
+冗余集成 & 通常依赖 md/device-mapper & 原生 block-group profiles，RAID56 有额外风险 & 原生 mirror/RAID-Z \\\tablerowrule
+压缩 & 否 & 是（zlib/zstd） & 是（lz4/gzip） \\
+\bottomrule
+\end{longtable}
+
+COW 设计通过写新版本与提交协议提供恢复点和原生 snapshot，但会引入元数据更新、
+引用追踪和碎片等成本。允许原地更新的文件系统通常以日志保护特定元数据，并获得
+不同的写放大与延迟特征。两类设计对用户数据原子性、校验和和恢复范围的承诺仍取决于
+具体实现与配置，不能只按“COW”或“日志”标签推断。
+
+\begin{fspdfdiagram}
+  % COW update: old tree and new tree
+  \node[os title] at (-50mm, 5mm) {旧树（写入前）};
+  \node[os compute, minimum width=16mm] (oroot) at (-50mm, -5mm) {root};
+  \node[os state, minimum width=12mm] (op1) at (-66mm, -18mm) {parent};
+  \node[os state, minimum width=12mm] (op2) at (-34mm, -18mm) {parent};
+  \node[os memory, minimum width=10mm] (ol1) at (-72mm, -31mm) {leaf};
+  \node[os memory, minimum width=10mm] (ol2) at (-50mm, -31mm) {leaf};
+  \node[os memory, minimum width=10mm] (ol3) at (-28mm, -31mm) {leaf};
+  \node[os small block, fill=BookRedTint, minimum width=8mm] (od1) at (-72mm, -43mm) {5000};
+  \node[os small block, fill=BookGreenTint, minimum width=8mm] (od2) at (-58mm, -43mm) {6000};
+  \node[os small block, fill=BookGreenTint, minimum width=8mm] (od3) at (-42mm, -43mm) {7000};
+  \node[os small block, fill=BookGreenTint, minimum width=8mm] (od4) at (-28mm, -43mm) {7500};
+
+  \draw[os bus] (oroot) -- (op1);
+  \draw[os bus] (oroot) -- (op2);
+  \draw[os bus] (op1) -- (ol1);
+  \draw[os bus] (op1) -- (ol2);
+  \draw[os bus] (op2) -- (ol3);
+  \draw[os bus] (ol1) -- (od1);
+  \draw[os bus] (ol1) -- (od2);
+  \draw[os bus] (ol3) -- (od3);
+  \draw[os bus] (ol3) -- (od4);
+
+  % New tree
+  \node[os title] at (40mm, 5mm) {新树（COW 写入后）};
+  \node[os compute, minimum width=16mm, draw=BookRed] (nroot) at (40mm, -5mm) {root'};
+  \node[os state, minimum width=12mm] (np1) at (24mm, -18mm) {parent'};
+  \node[os state, minimum width=12mm] (np2) at (56mm, -18mm) {parent};
+
+  \node[os memory, minimum width=10mm] (nl1) at (18mm, -31mm) {leaf'};
+  \node[os memory, minimum width=10mm] (nl2) at (40mm, -31mm) {leaf};
+
+  \node[os small block, fill=BookGreenTint, minimum width=8mm] (nd1) at (10mm, -43mm) {8000};
+  \node[os small block, fill=BookGreenTint, minimum width=8mm] (nd2) at (26mm, -43mm) {6000};
+  \node[os small block, fill=BookGreenTint, minimum width=8mm] (nd3) at (40mm, -43mm) {7000};
+  \node[os small block, fill=BookGreenTint, minimum width=8mm] (nd4) at (56mm, -43mm) {7500};
+
+  \draw[os strong bus] (nroot) -- (np1);
+  \draw[os strong bus] (nroot) -- (np2);
+  \draw[os strong bus] (np1) -- (nl1);
+  \draw[os strong bus] (np1) -- (nl2);
+  \draw[os bus] (np2) -- (nl2);
+  \draw[os strong bus] (nl1) -- (nd1);
+  \draw[os bus] (nl1) -- (nd2);
+  \draw[os bus] (nl2) -- (nd3);
+  \draw[os bus] (nl2) -- (nd4);
+
+  % Shared blocks (dashed lines to old tree)
+  \draw[os feedback] (nl2.west) -- ++(-4mm, 0) -- ++(0, 0) node[os label] {共享};
+
+  % Commit-protocol publication
+  \draw[os strong bus, draw=BookRed] (oroot.east) -- node[os label, text=BookRed, above] {提交后选新根} (nroot.west);
+
+  % New block highlight
+  \node[os label, text=BookRed] at (10mm, -49mm) {新块};
+  \node[os label, text=BookRed] at (24mm, -23mm) {COW};
+  \node[os label, text=BookRed] at (40mm, -11mm) {COW};
+\end{fspdfdiagram}
+\fsdiagramnote{COW 更新路径。写入块 5000 的数据时，不覆盖块 5000，而是分配新块 8000 写入数据。从叶子到根的路径上的每个节点都 COW 出新版本（红色标记）。格式规定的提交协议完成后，恢复规则才选择新根；这不依赖一个抽象根指针天然原子。旧块 5000 仍被旧树引用，可用于 snapshot。共享的子树（parent 右子树、leaf 和 6000/7000/7500 块）不被复制。}
+
+\fsdivision{闪存约束、FTL 与日志结构}
+
+\fstopic{NAND Flash 的物理约束}
+
+NAND Flash 的物理特性与 HDD 有根本区别，直接决定了闪存文件系统的设计方向。
+
+\begin{longtable}{|F{0.16\linewidth}|F{0.38\linewidth}|F{0.36\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+特性 & NAND Flash & HDD \\
+\midrule
+读写单位 & page (4--16 KiB) & sector (512 B) \\\tablerowrule
+擦除单位 & block (128--512 KiB = 32--128 pages) & 无需擦除，直接覆盖 \\\tablerowrule
+写约束 & 只能写已擦除的页（全 1） & 无约束 \\\tablerowrule
+寻址 & 电气（$\mu$s 级） & 机械寻道（ms 级） \\\tablerowrule
+寿命 & P/E 循环有限 & 无限（理论上） \\
+\bottomrule
+\end{longtable}
+
+NAND 的核心约束是\emph{写之前必须先擦除，而擦除单位远大于写入单位}。一个 block 包含 64--128 个 page。要修改一个 page 的内容，不能直接覆盖——必须先擦除包含该 page 的整个 block，然后重新写入。但 block 中其他 page 可能还有有效数据，擦除会丢失它们。
+
+\begin{lstlisting}
+// NAND Flash 的操作约束
+// page: 4 KiB (读写单位)
+// block: 256 KiB = 64 pages (擦除单位)
+//
+// 写一个 page:
+//   如果该 page 已被擦除 (所有 bit = 1):
+//     page_program(page_addr, data)  // 直接写入
+//   如果该 page 之前写过 (有非 1 bit):
+//     不能直接覆盖! 会损坏数据
+//     必须:
+//       1. 找一个已擦除的新 page
+//       2. 写入新数据到新 page
+//       3. 旧 page 标记为 "invalid" (stale)
+//       4. 当整个 block 的有效页很少时:
+//          a. 把有效页复制到新 block
+//          b. erase_block(old_block) → 全部变 1
+//          c. 旧 block 可以重新写
+
+// P/E 循环寿命 (Program/Erase cycles)
+//   SLC: 100,000 次/block
+//   MLC: 3,000-10,000 次/block
+//   TLC: 1,000-3,000 次/block
+//   QLC: 100-1,000 次/block
+//   超过 P/E 寿命的 block 变成坏块
+\end{lstlisting}
+
+除了 P/E 寿命限制，NAND 还有其他可靠性问题：
+
+\begin{itemize}
+\tightlist
+\item \emph{Read Disturb}（读干扰）：读取同一个 page 太多次，可能导致相邻 page 的 bit 翻转。典型阈值：每个 block 读取 $10^5$--$10^6$ 次后需要刷新。
+\item \emph{Write Disturb}（写干扰）：编程一个 page 时，高压脉冲可能影响同一 block 中相邻 page 的电荷。
+\item \emph{Retention}（保持性）：存储的电荷随时间泄漏。TLC 闪存在室温下数据保持约 1--3 年，高温环境保持时间更短。
+\item \emph{Bad blocks}（坏块）：出厂时有初始坏块（通常 $\le$ 2\%），运行中会持续产生新的坏块。
+\end{itemize}
+
+\begin{warningbox}
+NAND Flash 的\emph{写前擦除}约束是所有闪存文件系统设计的出发点。传统文件系统（ext4）假设可以随时覆盖任何块，这在 NAND 上不成立——要么通过 FTL 翻译层隐藏这个约束，要么设计专门的日志结构文件系统（F2FS）直接适配它。
+\end{warningbox}
+
+\fstopic{FTL：闪存翻译层}
+
+大多数 SSD 内部有 FTL（Flash Translation Layer），把 NAND 的页/块语义翻译成块设备的扇区语义，对上层文件系统透明。FTL 的核心职责是地址映射、垃圾回收和磨损均衡。
+
+\begin{lstlisting}
+// FTL 地址映射表
+// 逻辑扇区号 → 物理页号
+//
+// 1 TiB SSD, 4 KiB pages
+// 逻辑扇区数 = 1 TiB / 512 B = 2 * 10^9
+// 逻辑页数 = 1 TiB / 4 KiB = 256 * 10^6 = 256M
+// 映射表项 = 256M entries * 4 bytes = 1 GiB
+//
+// 这张表存在 SSD 的 DRAM 中 (SSD 有自己的 DRAM)
+// 断电时持久化到 NAND 的保留区域
+
+struct ftl_mapping_entry {
+    uint32_t logical_page;   // 逻辑页号
+    uint32_t physical_page;   // 物理页号
+};
+// 映射表: logical_page -> physical_page
+
+// FTL 写操作
+ftl_write(logical_page, data):
+  // 1. 分配一个已擦除的物理页
+  physical_page = alloc_erased_page();
+  // 2. 编程写入数据
+  nand_page_program(physical_page, data);
+  // 3. 更新映射表
+  old_physical = mapping_table[logical_page];
+  mapping_table[logical_page] = physical_page;
+  // 4. 旧物理页标记为无效
+  mark_page_invalid(old_physical);
+  // 注意: 旧页不能直接擦除
+  //       要等整个 block 的有效页都迁移后才能擦除
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+  % FTL mapping table
+  \node[os title] at (0, 5mm) {FTL 映射表};
+
+  % Logical addresses
+  \node[os small block, fill=BookBlueTint, minimum width=12mm] (l0) at (0, -5mm) {LPN 0};
+  \node[os small block, fill=BookBlueTint, minimum width=12mm, right=0pt of l0] (l1) {LPN 1};
+  \node[os small block, fill=BookBlueTint, minimum width=12mm, right=0pt of l1] (l2) {LPN 2};
+  \node[os small block, fill=BookBlueTint, minimum width=12mm, right=0pt of l2] (l3) {LPN 3};
+  \node[os label] at (18mm, 2mm) {逻辑页号};
+
+  % Physical pages
+  \node[os small block, fill=BookGreenTint, minimum width=12mm] (p0) at (0, -22mm) {PPN 1024};
+  \node[os small block, fill=BookGreenTint, minimum width=12mm, right=0pt of p0] (p1) {PPN 1025};
+  \node[os small block, fill=BookRedTint, minimum width=12mm, right=0pt of p1] (p2) {PPN 500};
+  \node[os small block, fill=BookGreenTint, minimum width=12mm, right=0pt of p2] (p3) {PPN 1026};
+  \node[os label] at (18mm, -26mm) {物理页号};
+
+  % Mapping arrows
+  \draw[os strong bus] (l0) -- (p0);
+  \draw[os strong bus] (l1) -- (p1);
+  \draw[os feedback] (l2) -- (p2);
+  \draw[os strong bus] (l3) -- (p3);
+
+  % Invalid page annotation
+  \node[os label, text=BookRed] at (36mm, -22mm) {无效页};
+  \node[os label] at (36mm, -5mm) {(旧数据)};
+
+  % Block erase boundary
+  \draw[os brace] (-8mm, -28mm) -- (24mm, -28mm);
+  \node[os label] at (8mm, -34mm) {物理 block 0 (PPN 0--63)};
+
+  \draw[os brace] (24mm, -28mm) -- (56mm, -28mm);
+  \node[os label] at (40mm, -34mm) {物理 block 1 (PPN 64--127)};
+\end{fspdfdiagram}
+\fsdiagramnote{FTL 地址映射表。逻辑页号（LPN）映射到物理页号（PPN）。LPN 2 的旧映射指向 PPN 500，已被新写入标记为无效。当物理 block 0 的有效页比例足够低时，FTL 垃圾回收会迁移有效页并擦除整个 block。}
+
+\fstopic{FTL 垃圾回收}
+
+当空闲的已擦除 block 不足时，FTL 执行垃圾回收，回收包含大量无效页的 block：
+
+\begin{lstlisting}
+ftl_gc():
+  // 1. 选择 victim block: 无效页最多的 block
+  victim = find_block_with_most_invalid_pages();
+  // 假设 victim 有 60 个无效页, 4 个有效页
+
+  // 2. 分配一个已擦除的新 block
+  new_block = alloc_erased_block();
+
+  // 3. 遍历 victim 中的每个 page
+  new_page_offset = 0;
+  for page in victim.pages:
+    if is_page_valid(page):
+      // 有效页: 复制到新 block
+      data = nand_page_read(page.physical);
+      nand_page_program(new_block[new_page_offset], data);
+      // 更新映射表
+      mapping_table[page.logical] = new_block[new_page_offset];
+      new_page_offset++;
+    // 无效页: 跳过, 不复制
+
+  // 4. 擦除旧 block
+  nand_block_erase(victim);
+  // 现在 victim 是全 1, 可以重新写入
+
+  // 5. 新 block 还有剩余已擦除页, 加入空闲池
+  // victim 有 64 pages, 4 个被复制, 60 个空闲
+  // → 新 block 提供 60 个空闲页
+
+// 写放大计算:
+// 用户写入 4 个页 (4 * 4 KiB = 16 KiB)
+// GC 迁移了 4 个有效页 (4 * 4 KiB = 16 KiB)
+// 总闪存写 = 用户写 + GC 写 = 16 + 16 = 32 KiB
+// 写放大 = 32 / 16 = 2x
+//
+// 如果 victim 只有 1 个有效页:
+// 用户写 63 页, GC 迁移 1 页
+// 写放大 = (63 + 1) / 63 ≈ 1.02x  (很好)
+//
+// 如果 victim 有 32 个有效页:
+// 用户写 32 页, GC 迁移 32 页
+// 写放大 = (32 + 32) / 32 = 2x
+//
+// 最坏情况: 几乎所有页都有效, GC 频繁迁移
+// 写放大可达 3-4x 甚至更高
+\end{lstlisting}
+
+\fstopic{磨损均衡}
+
+P/E 循环有限，必须把写操作均匀分布到所有 block，避免热点 block 过早耗尽。磨损均衡分两种：
+
+\begin{lstlisting}
+// 动态磨损均衡 (Dynamic Wear Leveling)
+//   分配器选择 P/E 循环最少的已擦除 block
+ftl_alloc_page_dynamic():
+  // 从空闲 block 池中选择 erase_count 最小的
+  block = min(free_blocks, key=lambda b: b.erase_count);
+  return block.alloc_page();
+
+// 静态磨损均衡 (Static Wear Leveling)
+//   后台任务: 把冷数据从高磨损 block 迁移到低磨损 block
+//   释放高磨损 block 给新写入使用
+ftl_static_wl():
+  // 找到 erase_count 最高的 block (写多, 存冷数据)
+  hot_block = max(all_blocks, key=lambda b: b.erase_count);
+  // 找到 erase_count 最低的 block (写少, 存热数据)
+  cold_block = min(all_blocks, key=lambda b: b.erase_count);
+
+  if hot_block.erase_count - cold_block.erase_count > threshold:
+    // 交换: 把冷数据移到低磨损 block
+    for page in hot_block.valid_pages:
+      data = read_page(page);
+      new_page = cold_block.alloc_page();
+      write_page(new_page, data);
+      update_mapping(page.logical, new_page);
+    // 高磨损 block 现在空了, 擦除后可用于新写入
+    erase_block(hot_block);
+\end{lstlisting}
+
+\fstopic{TRIM/DISCARD}
+
+文件系统删除文件时只更新元数据（bitmap、inode），不擦除数据块内容。在 HDD 上这不影响性能——磁盘不需要擦除就能覆盖写。但 SSD 的物理块需要先擦除才能写入，FTL 不知道哪些逻辑块对应的物理块可以回收。
+
+\code{TRIM}（也叫 \code{DISCARD}）命令让文件系统告诉 SSD"这些逻辑块不再被使用"：
+
+\begin{lstlisting}
+// 文件系统删除文件后发 TRIM
+unlink(path):
+  inode = resolve(path)
+  // 释放 inode 和数据块 (更新文件系统元数据)
+  free_inode(inode)
+  free_blocks(inode.block[])
+  // 告诉 SSD 这些逻辑块不再使用
+  // blkdev_discard 发送 DISCARD/TRIM 命令
+  blkdev_discard(bdev,
+      inode.block[] * blocksize,
+      inode.block_count * blocksize)
+
+// FTL 收到 TRIM 后
+ftl_trim(logical_blocks):
+  for lb in logical_blocks:
+    physical = mapping_table[lb]
+    // 标记物理页为无效
+    mark_page_invalid(physical)
+    // 不需要立即擦除
+    // 垃圾回收时这些无效页不需要迁移
+    // → GC 更快, 写放大更低
+
+// ext4 挂载选项:
+//   mount -o discard /dev/nvme0n1 /mnt
+//     → 同步 TRIM: 删除时立即发 TRIM
+//   mount -o discard=async /dev/nvme0n1 /mnt
+//     → 异步 TRIM: 收集后批量发
+//   mount -o nODiscard /dev/nvme0n1 /mnt
+//     → 禁用 TRIM
+\end{lstlisting}
+
+\begin{longtable}{|F{0.2\linewidth}|F{0.36\linewidth}|F{0.36\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+& 无 TRIM & 有 TRIM \\
+\midrule
+GC 迁移 & 迁移已删除数据的无效页 & 不迁移（已知无效） \\\tablerowrule
+写放大 & 高 & 低 \\\tablerowrule
+空闲块 & 少（GC 不知哪些可回收） & 多 \\
+\bottomrule
+\end{longtable}
+
+\fstopic{F2FS：日志结构闪存文件系统}
+
+F2FS（Flash-Friendly File System）是 Samsung 开发的 Linux 文件系统，专门为 NAND Flash 优化。核心设计是\emph{日志结构}（log-structured）：所有写操作都是顺序追加，不覆盖旧数据。
+
+\begin{lstlisting}
+// F2FS 磁盘布局
+// 整个设备分为以下区域 (按顺序):
+//
+// [Superblock] [Checkpoint] [SIT] [NAT] [SSA] [Main Area]
+//
+// Superblock:   全局参数 (块大小, 段大小, 总段数)
+// Checkpoint:   两个交替的 checkpoint (崩溃恢复)
+//   每个 checkpoint 记录:
+//     - NAT 的根位置
+//     - SIT 的根位置
+//     - Main Area 的空闲段位置
+//     - 活跃 segment 列表
+//
+// SIT (Segment Info Table):
+//   每个 segment 的状态: 有效块数, 无效块数
+//   GC 用 SIT 找到无效块最多的 segment
+//
+// NAT (Node Address Table):
+//   inode 号 → node block 的物理地址
+//   类似于 ext4 的 indirect block, 但用一张表而非指针
+//   作用: 数据块地址不直接存在 inode 中
+//         inode -> NAT -> node block -> data block
+//
+// SSA (Segment Summary Area):
+//   每个 segment 内每个块的: (inode 号, 偏移)
+//   GC 用 SSA 判断一个块是否有效
+//   有效 = 该逻辑块仍被某 inode 引用
+//
+// Main Area: 6 种 segment 类型
+//   hot node:   直接 inode block (频繁更新)
+//   warm node:  间接 node block
+//   cold node:  目录/很少更新的 node
+//   hot data:   目录数据 (频繁更新)
+//   warm data:  普通文件数据
+//   cold data:  很少访问的数据 (多媒体等)
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+  % F2FS layout
+  \node[os small block, fill=BookRedTint, minimum width=10mm] (sb) at (0, 0) {SB};
+  \node[os small block, fill=BookBlueTint, minimum width=14mm, right=0pt of sb] (cp) {Checkpoint};
+  \node[os small block, fill=BookAmberTint, minimum width=10mm, right=0pt of cp] (sit) {SIT};
+  \node[os small block, fill=BookGreenTint, minimum width=10mm, right=0pt of sit] (nat) {NAT};
+  \node[os small block, fill=BookAmberTint, minimum width=10mm, right=0pt of nat] (ssa) {SSA};
+  \node[os small block, fill=white, minimum width=40mm, right=0pt of ssa] (main) {Main Area};
+
+  % Main Area detail
+  \node[os small block, fill=BookRedTint, minimum width=6mm] (m1) at (76mm, -10mm) {HN};
+  \node[os small block, fill=BookAmberTint, minimum width=6mm, right=0pt of m1] (m2) {WN};
+  \node[os small block, fill=BookGreenTint, minimum width=6mm, right=0pt of m2] (m3) {CN};
+  \node[os small block, fill=BookRedTint, minimum width=6mm, right=0pt of m3] (m4) {HD};
+  \node[os small block, fill=BookAmberTint, minimum width=6mm, right=0pt of m4] (m5) {WD};
+  \node[os small block, fill=BookGreenTint, minimum width=6mm, right=0pt of m5] (m6) {CD};
+
+  % Labels
+  \node[os label] at (5mm, 8mm) {超块};
+  \node[os label] at (17mm, 8mm) {检查点};
+  \node[os label] at (29mm, 8mm) {段信息};
+  \node[os label] at (41mm, 8mm) {节点表};
+  \node[os label] at (53mm, 8mm) {段摘要};
+  \node[os label] at (77mm, 8mm) {主区域};
+
+  \node[os label] at (79mm, -16mm) {热/温/冷 $\times$ node/data};
+
+  % Log tail arrow
+  \draw[os strong bus] (main.south) -- ++(0, -6mm) node[os label, below] {追加写方向 →};
+  \draw[os feedback] (m6.east) -- ++(8mm, 0) -- ++(0, 4mm) -| (m1.west);
+  \node[os label] at (130mm, -8mm) {循环};
+\end{fspdfdiagram}
+\fsdiagramnote{F2FS 磁盘布局。Superblock 和 Checkpoint 是元数据入口。SIT/NAT/SSA 是三张辅助表，分别管理段状态、节点地址映射和块有效性。Main Area 分 6 种 segment 类型（hot/warm/cold $\times$ node/data），按热度分离写入。所有写入都是顺序追加到 log tail。}
+
+\fstopic{F2FS 写路径与 GC}
+
+F2FS 的写路径完全顺序化：新数据始终追加到 log tail 的下一个空闲 segment。旧数据所在的 segment 逐渐变为只有少量有效页。
+
+\begin{lstlisting}
+// F2FS 写路径
+f2fs_write(inode, offset, data):
+  // 1. 找到当前 log tail 的位置
+  //    (hot/warm/cold 决定写入哪个 segment 类型)
+  segment = get_active_segment(SEG_WARM_DATA);
+  page_offset = segment.next_free_page;
+
+  // 2. 写数据到 segment
+  write_page(segment, page_offset, data);
+  segment.next_free_page++;
+
+  // 3. 更新 NAT: inode 的 node block 指向新数据位置
+  //    node block 本身也要 COW (日志结构)
+  node_block = get_node_block(inode);
+  new_node_block = copy_modify(node_block,
+      offset -> segment:page_offset);
+  node_segment = get_active_segment(SEG_WARM_NODE);
+  new_node_addr = node_segment.next_free_page;
+  write_page(node_segment, new_node_addr, new_node_block);
+
+  // 4. 更新 NAT 表: inode -> new_node_block 地址
+  nat_update(inode, new_node_addr);
+  // 旧 node block 所在 page 变为无效
+
+  // 5. 更新 SSA: 记录新数据页和 node 页的归属
+  ssa_update(segment, page_offset, (inode, offset));
+  ssa_update(node_segment, new_node_addr, (inode, NODE));
+
+  // 6. 如果当前 segment 写满, 分配新 segment
+  if segment.next_free_page >= segment_size:
+    segment = alloc_new_segment(SEG_WARM_DATA);
+
+// F2FS GC
+f2fs_gc():
+  // 1. 用 SIT 找无效块最多的 segment
+  victim = find_segment_with_most_invalid_blocks();
+  //    例如: segment 有 512 blocks, 480 无效, 32 有效
+
+  // 2. 用 SSA 确定每个有效块的归属
+  for block in victim.valid_blocks:
+    (inode, offset) = ssa_lookup(block);
+    // 3. 复制有效块到 log tail
+    data = read_block(block);
+    f2fs_write(inode, offset, data);  // 追加到新位置
+    //    NAT 和 SSA 自动更新
+
+  // 4. 整个 segment 现在全是无效块, 回收
+  free_segment(victim);
+  //    segment 加入空闲池, 可重新使用
+\end{lstlisting}
+
+F2FS 的 hot/warm/cold 分离是关键优化。元数据（hot node，频繁更新）与用户数据（warm/cold data）写入不同的 segment。这样 GC 时不会因为迁移热元数据而连带迁移冷数据——热 segment 会更频繁地被 GC 回收（因为无效页增长快），但冷 segment 不受影响。
+
+\begin{longtable}{|F{0.18\linewidth}|F{0.36\linewidth}|F{0.38\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+segment 类型 & 内容 & GC 特点 \\
+\midrule
+hot node & 直接 inode block & 更新频繁, 无效快, GC 频繁但小 \\\tablerowrule
+warm node & 间接 node block & 中等频率 \\\tablerowrule
+cold node & 目录 node & 很少更新, GC 几乎不碰 \\\tablerowrule
+hot data & 目录数据 & 频繁更新 \\\tablerowrule
+warm data & 普通文件数据 & 中等 \\\tablerowrule
+cold data & 多媒体等 & 写一次读多次, GC 不碰 \\
+\bottomrule
+\end{longtable}
+
+\fstopic{日志结构文件系统原理（LFS）}
+
+F2FS 的设计思想源自 LFS（Log-structured File System），由 Rosenblum 和 Ousterhout 在 1992 年提出。LFS 的核心原则：\emph{磁盘是一个只追加的日志}。
+
+\begin{lstlisting}
+// LFS 核心原理
+// 1. 所有写操作都是追加:
+//    数据块、inode、目录项、间接块
+//    全部追加写入日志尾部
+//    旧版本数据变成 "garbage" (垃圾)
+
+// 2. inode map (类似 F2FS 的 NAT):
+//    inode 号 -> inode 最新版本的磁盘位置
+//    inode map 本身也写入日志
+
+// 3. 读操作:
+//    查 inode map 找到 inode 位置
+//    读 inode 获取数据块指针
+//    读数据块 (位置在日志中, 可能很分散)
+//    → 随机读可能慢 (数据散布在日志各处)
+
+// 4. 清理 (cleaner / GC):
+//    后台进程扫描旧 segment
+//    复制有效块到 log tail
+//    释放旧 segment
+
+// LFS 的基本权衡:
+//   写: 快 (顺序追加, 无需寻道/擦除)
+//   读: 可能慢 (数据散布在日志中, 随机访问)
+//   GC: 后台开销, 可能影响前台延迟
+\end{lstlisting}
+
+\begin{longtable}{|F{0.16\linewidth}|F{0.38\linewidth}|F{0.38\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+& LFS/F2FS（日志结构） & ext4（原地覆盖+日志） \\
+\midrule
+写模式 & 顺序追加 & 原地覆盖 + 独立日志 \\\tablerowrule
+写放大 & 低（无覆盖写） & 中（日志 + 主 FS） \\\tablerowrule
+随机读 & 慢（数据散布） & 快（extent 连续） \\\tablerowrule
+GC 开销 & 有（cleaner） & 无 \\\tablerowrule
+空间开销 & NAT/SIT/SSA 元数据 & bitmap + 日志 \\\tablerowrule
+碎片 & 随时间增长 & 延迟分配缓解 \\
+\bottomrule
+\end{longtable}
+
+\begin{keyidea}
+日志结构文件系统的核心收益是\emph{写性能}：NAND Flash 的顺序写比随机写快得多（无需先擦除，利用 page program 的顺序特性），且写放大更低。代价是读性能可能下降（数据散布在日志各处）和 GC 的后台开销。F2FS 通过 hot/warm/cold 分离、NAT 间接寻址和前台 GC 控制来缓解这些代价。
+\end{keyidea}
+
+\fstopic{F2FS vs ext4 on SSD}
+
+在 SSD 上，F2FS 和 ext4 都能工作，但性能特征不同：
+
+\begin{longtable}{|F{0.2\linewidth}|F{0.34\linewidth}|F{0.34\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+& F2FS & ext4 \\
+\midrule
+写模式 & 顺序追加（闪存友好） & 原地覆盖（FTL 翻译） \\\tablerowrule
+写放大 & 低（无覆盖，GC 高效） & 中（FTL GC + ext4 日志） \\\tablerowrule
+元数据开销 & 高（NAT + SIT + SSA） & 低（bitmap + inode table） \\\tablerowrule
+随机读 & 中（NAT 间接一层） & 快（extent 直接映射） \\\tablerowrule
+崩溃恢复 & checkpoint 交替 & jbd2 日志重放 \\\tablerowrule
+TRIM & 集成到 GC & 需挂载选项 \\
+\bottomrule
+\end{longtable}
+
+F2FS 的优势在写密集场景：闪存的顺序追加写不需要 FTL 做额外的地址翻译和 GC，写放大接近 1x。ext4 的原地覆盖写触发 FTL 的写前擦除约束，FTL 内部 GC 产生额外写放大。
+
+ext4 的优势在读密集和元数据密集场景：extent 树直接映射逻辑块到物理块，而 F2FS 需要通过 NAT 间接一层。对于小文件和目录操作，ext4 的 bitmap 分配比 F2FS 的 segment 管理更轻量。
+
+\begin{fspdfdiagram}
+  % NAND page/block structure
+  \node[os title] at (0, 5mm) {NAND Flash 物理结构};
+
+  % Block
+  \node[os small block, fill=BookBlueTint, minimum width=8mm] (p0) at (0, -5mm) {page 0};
+  \node[os small block, fill=BookBlueTint, minimum width=8mm, right=0pt of p0] (p1) {page 1};
+  \node[os small block, fill=BookRedTint, minimum width=8mm, right=0pt of p1] (p2) {page 2};
+  \node[os small block, fill=BookBlueTint, minimum width=8mm, right=0pt of p2] (p3) {page 3};
+  \node[os label] at (40mm, -5mm) {...};
+
+  \node[os small block, fill=BookRedTint, minimum width=8mm] (p60) at (56mm, -5mm) {p 60};
+  \node[os small block, fill=BookBlueTint, minimum width=8mm, right=0pt of p60] (p61) {p 61};
+  \node[os small block, fill=white, minimum width=8mm, right=0pt of p61] (p62) {p 62};
+  \node[os small block, fill=white, minimum width=8mm, right=0pt of p62] (p63) {p 63};
+
+  % Block brace
+  \draw[os brace] (0, -12mm) -- (72mm, -12mm);
+  \node[os label] at (36mm, -18mm) {block (256 KiB = 64 pages)};
+
+  % Labels
+  \node[os label, text=BookTeal] at (4mm, 3mm) {有效};
+  \node[os label, text=BookRed] at (20mm, 3mm) {无效};
+  \node[os label, text=BookMuted] at (68mm, 3mm) {已擦除};
+
+  % Operations
+  \node[os label] at (0, -24mm) {读写单位: page (4 KiB)};
+  \node[os label] at (0, -29mm) {擦除单位: block (256 KiB)};
+  \node[os label, text=BookRed] at (0, -34mm) {写 page 2: 不能覆盖, 需新页};
+
+  % Multiple blocks
+  \draw[draw=BookMuted, line width=0.38pt] (0, -38mm) -- (0, -40mm);
+  \node[os small block, fill=BookAmberTint, minimum width=70mm] (blk2) at (36mm, -44mm) {block 1};
+  \node[os small block, fill=BookAmberTint, minimum width=70mm, right=0pt of blk2] (blk3) {block 2};
+  \node[os label] at (36mm, -50mm) {...更多 block...};
+\end{fspdfdiagram}
+\fsdiagramnote{NAND Flash 物理结构。一个 block 包含 64 个 page（256 KiB）。绿色为有效页，红色为无效页（旧数据），白色为已擦除页（全 1，可写）。写单位是 page，擦除单位是 block。修改 page 2 不能直接覆盖——必须分配新页写入，旧页标记无效。当 block 的无效页足够多时，GC 迁移有效页并擦除整个 block。}
+
+\begin{fspdfdiagram}
+  % GC process
+  \node[os title] at (0, 5mm) {FTL 垃圾回收过程};
+
+  % Before GC: victim block
+  \node[os label] at (0, 0) {GC 前};
+  \node[os small block, fill=BookGreenTint, minimum width=7mm] (v0) at (0, -8mm) {V};
+  \node[os small block, fill=BookRedTint, minimum width=7mm, right=0pt of v0] (v1) {X};
+  \node[os small block, fill=BookRedTint, minimum width=7mm, right=0pt of v1] (v2) {X};
+  \node[os small block, fill=BookGreenTint, minimum width=7mm, right=0pt of v2] (v3) {V};
+  \node[os small block, fill=BookRedTint, minimum width=7mm, right=0pt of v3] (v4) {X};
+  \node[os small block, fill=BookRedTint, minimum width=7mm, right=0pt of v4] (v5) {X};
+  \node[os small block, fill=BookRedTint, minimum width=7mm, right=0pt of v5] (v6) {X};
+  \node[os small block, fill=BookGreenTint, minimum width=7mm, right=0pt of v6] (v7) {V};
+  \draw[os brace] (0, -14mm) -- (56mm, -14mm);
+  \node[os label] at (28mm, -20mm) {victim block: 3 有效, 5 无效};
+
+  % Arrow
+  \draw[os strong bus] (28mm, -22mm) -- (28mm, -28mm);
+
+  % After GC: new block + erased block
+  \node[os label] at (0, -32mm) {GC 后};
+  \node[os small block, fill=BookGreenTint, minimum width=7mm] (n0) at (0, -40mm) {V};
+  \node[os small block, fill=BookGreenTint, minimum width=7mm, right=0pt of n0] (n1) {V};
+  \node[os small block, fill=BookGreenTint, minimum width=7mm, right=0pt of n1] (n2) {V};
+  \node[os small block, fill=white, minimum width=7mm, right=0pt of n2] (n3) {E};
+  \node[os small block, fill=white, minimum width=7mm, right=0pt of n3] (n4) {E};
+  \node[os small block, fill=white, minimum width=7mm, right=0pt of n4] (n5) {E};
+  \node[os small block, fill=white, minimum width=7mm, right=0pt of n5] (n6) {E};
+  \node[os small block, fill=white, minimum width=7mm, right=0pt of n6] (n7) {E};
+  \draw[os brace] (0, -46mm) -- (56mm, -46mm);
+  \node[os label] at (28mm, -52mm) {新 block: 3 有效 + 5 已擦除};
+
+  % Legend
+  \node[os label, text=BookTeal] at (70mm, -8mm) {V = 有效};
+  \node[os label, text=BookRed] at (70mm, -13mm) {X = 无效};
+  \node[os label, text=BookMuted] at (70mm, -18mm) {E = 已擦除};
+\end{fspdfdiagram}
+\fsdiagramnote{FTL 垃圾回收过程。GC 前victim block 有 3 个有效页和 5 个无效页。GC 把 3 个有效页复制到新 block，然后擦除 victim block。结果是一个新 block 包含 3 个有效页和 5 个已擦除页，可以接受新写入。写放大 = (3 迁移 + 3 用户写) / 3 = 2x。}
+
+\begin{keyidea}
+从 page cache 到 COW 到闪存文件系统，本章展示了文件系统设计的核心张力：\emph{性能、一致性、介质适应性}三者之间的取舍。page cache 用内存换延迟；日志用额外写换恢复速度；COW 用写放大换崩溃一致性和 snapshot；日志结构用顺序写换闪存友好性。没有免费的午餐——每个优化都在另一个维度产生代价。理解这些取舍，才能根据工作负载和硬件选择正确的文件系统。
+\end{keyidea}
+%% Part 4: Sections 13-16 of "文件系统：从磁盘字节到现代设计"
+% Chinese prose, English code/identifiers. CSAPP style: problem-first, quantitative, concrete.
+
+% -- Column type for longtable --
+
+% ==================================================================
+
+\end{filesystemlayout}

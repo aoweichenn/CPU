@@ -1,6 +1,6 @@
 \chapter{硬件事实与内核对象}
 
-用户已经有一本专门的硬件书，把晶体管、门电路、加法器、流水线、cache 层次和总线协议逐一推导过。本章不重讲这些内容。本章只做两件事：第一，把操作系统真正必须知道的硬件事实压成一份精简清单——CPU 特权级与受控入口、地址翻译与页表、MMIO 与 DMA、多核 cache 一致性、设备完成与持久化边界；第二，说明这些硬件事实怎样逼出 task、地址空间、VMA、fd、request、wait queue、completion 等内核对象。
+用户已经有一本专门的硬件书，把晶体管、门电路、加法器、流水线、cache 层次和总线协议逐一推导过。本章不重讲这些内容。本章只做两件事：第一，把操作系统真正必须知道的硬件事实压成一份精简清单——CPU 特权级与受控入口、地址翻译与页表、MMIO 与 DMA、多核 cache 一致性、设备完成与持久化边界；第二，说明怎样从这些硬件事实推导 task、地址空间、VMA、fd、request、wait queue、completion 等内核对象。
 
 task、地址空间、VMA、fd、request、wait queue 这些名字不是先验规定出来的。它们解决的都是同一个问题：硬件只给瞬时状态和低层事件，OS 必须把它们组织成可恢复、可检查、可等待、可取消、可释放的长期状态。只要这条线不清楚，后面讲调度、虚拟内存、文件系统和驱动时，就会像在背结构体字段。
 
@@ -101,7 +101,7 @@ page cache & 文件读写复用内存页，合并小 I/O & dirty、uptodate、wr
 以上五组硬件事实就是本章其余部分的全部前提。CPU 只能从当前现场继续执行；虚拟地址要翻译和检查权限；设备靠 MMIO、队列和 DMA 协作；多核共享内存要靠一致性和屏障；完成异步到达且不等于持久化。后面每一个内核对象，都是在补这些事实缺失的语义。
 \end{keyidea}
 
-\section{二、硬件事实怎样逼出内核对象}
+\section{二、怎样从硬件事实推导内核对象}
 
 先从一个非常普通的动作开始。一个进程往日志文件追加一行：
 
@@ -136,7 +136,7 @@ write(fd, user_buf, len):
 
 \begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
 \toprule
-硬件事实 & 如果只写成普通函数会怎样 & 被逼出的内核对象 \\
+硬件事实 & 如果只写成普通函数会怎样 & 由此建立的内核对象 \\
 \midrule
 CPU 只能从当前现场继续执行 & 进入内核后覆盖寄存器，返回用户态时找不到原位置 & trap frame、task、内核栈 \\
 用户地址只是虚拟地址 & 用户传坏指针会让内核读错页、越权读，或跨页时只检查了一半 & address space、VMA、PTE、用户拷贝边界 \\
@@ -147,9 +147,9 @@ DMA 会让设备直接访问内存 & CPU 和设备同时改 buffer，或设备�
 \bottomrule
 \end{longtable}
 
-读到任何 OS 名词时，都应问一句：它是在补哪条硬件事实缺失的语义？下面几节把每条事实展开，看它怎样逼出对应的内核对象。
+读到任何 OS 名词时，都应问一句：它是在补哪条硬件事实缺失的语义？下面几节把每条事实展开，看怎样由此建立对应的内核对象。
 
-\section{三、CPU 入口逼出 task 和 trap frame}
+\section{三、从 CPU 入口推导 task 和 trap frame}
 
 用户程序执行 \code{write(fd, user\_buf, len)} 后，硬件进入内核配置好的入口，并保存返回用户态所需的一部分状态。内核入口代码随后把更多通用寄存器保存成一份结构化现场，叫 trap frame。
 
@@ -221,7 +221,7 @@ device interrupt 的特点是“完成事实在设备侧”。设备中断到来
 task 是 CPU 硬件事实的内核化：CPU 只能执行一个当前现场，OS 就把每个可恢复现场做成 task；CPU 入口只能给一次瞬时 trap，OS 就把入口证据保存成 trap frame；CPU 会被中断打断，OS 就把等待原因和调度状态也放进 task。
 \end{keyidea}
 
-\section{四、地址翻译逼出 address space、VMA 和 PTE}
+\section{四、从地址翻译推导 address space、VMA 和 PTE}
 
 现在看 \code{user\_buf}。用户传给内核的是一个虚拟地址。它不直接说明真实内存条上的位置，也不说明当前是否允许读写。MMU 查页表把虚拟页翻译成物理页，并检查权限。
 
@@ -334,7 +334,7 @@ DMA 地址 & 设备和 IOMMU & 生命周期受 DMA mapping 控制 \\
 
 如果一个进程提交直接 I/O 后马上 \code{munmap(user\_buf)}，用户虚拟地址可以从 address space 中消失，但被 pin 的物理页不能立刻释放，因为设备 request 仍然引用它们。等 completion 到达、驱动同步 DMA、撤销 IOMMU 映射并放掉页引用后，这些页才真正回到普通内存管理。地址空间解决 CPU 访问的合法性，request 和 DMA mapping 解决设备访问期间的所有权。
 
-\section{五、设备请求逼出 request、wait queue 和 completion}
+\section{五、从设备请求推导 request、wait queue 和 completion}
 
 假设内核已经把用户数据安全地接收到内核对象里，下一步要让设备写出去。错误版本会写成：
 
@@ -405,11 +405,11 @@ completion 后 & 结果回到驱动，但还没完全释放 & 先读取状态、
 
 失败路径更能说明 request 的必要性。设备可能超时。超时不代表设备一定没做；它只代表“在规定时间内没有观察到 completion”。此时内核不能马上释放 buffer，因为设备可能稍后还会 DMA。可靠恢复通常要停止队列、屏蔽中断或 quiesce 设备、尝试 abort request、必要时 reset 控制器、确认没有 in-flight DMA 后再撤销映射。没有 request 列表，内核不知道哪些请求还在飞；没有 request state，内核不知道哪些能重试、哪些已经失败、哪些不能再释放。
 
-为了避免把设备统一想成“磁盘”，再看三个设备路径。它们的规模不同，但都在逼出同一组 OS 对象。
+为了避免把设备统一想成“磁盘”，再看三个设备路径。它们的规模不同，但都要求同一组 OS 对象。
 
 \begin{longtable}{p{0.16\linewidth}p{0.39\linewidth}p{0.33\linewidth}}
 \toprule
-设备路径 & 典型动作 & 逼出的对象 \\
+设备路径 & 典型动作 & 所需对象 \\
 \midrule
 PIO 串口发送一个字节 & CPU 读状态寄存器，ready 后写 DATA 寄存器 & wait queue、设备锁、寄存器访问顺序 \\
 网卡接收一个包 & 设备 DMA 到预先给出的 buffer，写 completion 或更新 ring & buffer pool、descriptor ring、packet object、NAPI/poll 状态 \\

@@ -11,39 +11,51 @@ ROOT = Path(__file__).resolve().parents[1]
 MAIN = ROOT / "main.tex"
 
 
-INPUT_RE = re.compile(r"\\input(?:topic|detail)?\{([^}]+)\}")
-CHAPTER_INPUT_RE = re.compile(r"^\\input\{chapters/([^}]+)\}", re.MULTILINE)
+INPUT_RE = re.compile(
+    r"\\input(?:topic|detail|chapterbody|samplechapter)?\{([^}]+)\}"
+)
+CHAPTER_INPUT_RE = re.compile(r"^\\input\{chapters18/([^}]+)\}", re.MULTILINE)
 
-EXPECTED_PARTS = 4
+EXPECTED_PARTS = 5
 EXPECTED_CHAPTERS = 18
-# The OS volume starts at kernel objects; hardware and bare-metal material live separately.
+# The formal volume follows one causal route from a no-OS machine to diagnosis.
 EXPECTED_CHAPTER_INPUTS = (
-    "ch01-os-map-and-contracts",
-    "ch05-process-thread-scheduling",
-    "ch09-system-calls-permissions",
-    "ch10-exec-elf-loader",
-    "ch07-synchronization-ipc-locks",
-    "ch11-virtual-memory",
-    "ch12-mmap-page-cache",
-    "ch10-kernel-memory-allocators",
-    "ch14-device-drivers-dma",
-    "ch12-block-io-files",
-    "ch17b-filesystem-from-scratch",
-    "ch18-socket-network-entry",
-    "ch20-security-isolation",
-    "ch16-persistence-recovery",
-    "ch17-panic-observability",
+    "ch01-bare-machine-to-kernel",
+    "ch02-task-scheduling",
+    "ch03-system-call-boundary",
+    "ch04-exec-image",
+    "ch05-synchronization",
+    "ch06-address-space",
+    "ch07-file-backed-memory",
+    "ch08-kernel-allocators",
+    "ch09-device-requests",
+    "ch10-block-vfs",
+    "ch11-filesystem-formation",
+    "ch12-filesystem-indexing",
+    "ch13-filesystem-recovery",
+    "ch14-modern-filesystems",
+    "ch15-network-endpoints",
+    "ch16-security-isolation",
+    "ch17-persistence",
+    "ch18-observability",
 )
 
 
 def input_paths() -> list[Path]:
     paths: list[Path] = []
-    for line in MAIN.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        match = INPUT_RE.search(stripped)
-        if match is None:
+    pending = [MAIN]
+    visited: set[Path] = set()
+    while pending:
+        current = pending.pop()
+        if current in visited or not current.is_file():
             continue
-        paths.append(ROOT / f"{match.group(1)}.tex")
+        visited.add(current)
+        for match in INPUT_RE.finditer(current.read_text(encoding="utf-8")):
+            if "#" in match.group(1):
+                continue
+            path = ROOT / f"{match.group(1)}.tex"
+            paths.append(path)
+            pending.append(path)
     return paths
 
 
@@ -51,7 +63,7 @@ def chapter_heading_count() -> int:
     text = MAIN.read_text(encoding="utf-8")
     count = len(re.findall(r"^\\chapter\{", text, flags=re.MULTILINE))
     for relative in CHAPTER_INPUT_RE.findall(text):
-        path = ROOT / "chapters" / f"{relative}.tex"
+        path = ROOT / "chapters18" / f"{relative}.tex"
         if path.is_file():
             count += len(re.findall(r"^\\chapter\{", path.read_text(encoding="utf-8"), flags=re.MULTILINE))
     return count
@@ -99,9 +111,8 @@ def main() -> int:
         ROOT / "frontmatter" / "abbreviations.tex",
         ROOT / "backmatter" / "capability-checklist.tex",
         ROOT / "backmatter" / "supplement-reading-map.tex",
-        ROOT / "supplements" / "hardware",
-        ROOT / "supplements" / "pre-os",
-        ROOT / "supplements" / "models",
+        ROOT / "chapters18" / "evolution",
+        ROOT / "scripts" / "restructure_volume.py",
     )
     missing_required = [path for path in required if not path.exists()]
     if missing_required:

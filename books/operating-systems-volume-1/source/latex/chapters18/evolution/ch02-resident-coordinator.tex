@@ -1,0 +1,145 @@
+\chapter{第二项任务为什么需要常驻协调代码}
+
+\begin{statebox}
+\textbf{继承的机器。} 固件能装入一项任务，为它设置入口、栈和初始寄存器；任务完成时主动
+跳回固定入口。所有地址仍是物理地址，任务仍可访问整台机器。
+\end{statebox}
+
+\section{直接从 A 跳到 B 会丢掉什么}
+
+设 A 正在累加一组数据。下一条指令地址保存在指令位置寄存器中，当前循环计数和部分和位于
+通用寄存器，函数调用关系位于 A 的栈。此时若把指令位置改成 B 的入口，处理器会立即开始
+取 B 的指令；但它仍带着 A 的栈顶与寄存器值。
+
+给 B 设置自己的栈和寄存器可以让 B 正确开始，却会覆盖处理器中唯一的一份 A 状态。以后
+再把指令位置改回 A，并不能恢复 A，因为“不知道回到 A 的哪条指令”只是丢失状态的一部分。
+
+\begin{longtable}{|L{0.21\linewidth}|L{0.28\linewidth}|L{0.39\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+必须保留的状态 & 丢失后的表现 & 为什么不能从代码映像重建 \\ \hline
+继续指令位置 & A 从错误位置执行或重新开始 & 它取决于暂停发生的时刻 \\ \hline
+栈指针 & 返回地址与局部变量无法找到 & 栈深度随已经完成的调用变化 \\ \hline
+通用寄存器 & 循环变量、地址和中间结果改变 & 它们是运行结果，不是初始映像 \\ \hline
+状态标志 & 后续条件分支得到不同结果 & 标志来自暂停前最后一次运算 \\ \hline
+约定的扩展状态 & 浮点或向量计算被 B 覆盖 & 同样属于运行中的中间结果 \\ \hline
+\end{longtable}
+
+这组状态可以称为任务的处理器现场。名称出现在问题之后：我们需要一份数据，能够让暂停的
+任务在未来像没有被中断一样继续，才有必要给这份数据命名。
+
+\section{现场保存在哪里}
+
+不能把 A 的现场继续留在处理器寄存器里，因为 B 就要使用这些寄存器。也不能把所有现场
+都压到同一栈上，再任意切换栈而不记位置。最小安排是为每项任务分配一块现场记录和一段
+独立栈：
+
+\begin{lstlisting}
+task_state A:
+  status
+  resume_instruction
+  stack_pointer
+  general_registers
+  arithmetic_flags
+  stack_low, stack_high
+
+task_state B:
+  same fields, different storage
+\end{lstlisting}
+
+\code{status} 至少区分“尚未开始”“可以继续”“正在运行”和“已经完成”。它不是为了美化
+结构，而是避免协调代码把一份只有初始入口、尚无暂停现场的记录当作可恢复记录。
+
+\subsection{谁有资格保存现场}
+
+若 A 自己把寄存器依次写入记录，会遇到一个细节：执行保存代码本身也需要寄存器，而且
+“保存后的继续地址”应当指向 A 交还处理器之后的位置。最小方案规定一个调用约定：
+A 像调用函数一样进入协调代码，调用约定先把一部分状态压到 A 的栈，协调代码再补存其余
+状态并记录当前栈指针。
+
+协调代码必须常驻在不会被任务映像覆盖的内存中。它还需要一个只在选择任务和恢复现场时
+使用的协调栈，否则恢复 A 的栈之后再运行复杂选择代码，会误把协调者的局部数据写进 A。
+
+\begin{center}
+\begin{tikzpicture}[node distance=10mm and 14mm]
+\node[stage] (a) {A 正在运行\\使用 A 的栈};
+\node[stage, right=of a] (entry) {A 主动进入\\保存返回位置};
+\node[stage, right=of entry] (save) {补齐 A 现场\\切到协调栈};
+\node[stage, below=13mm of save] (choose) {选择 B\\读取 B 的记录};
+\node[stage, left=of choose] (restore) {恢复 B 现场\\切到 B 的栈};
+\node[stage, left=of restore] (b) {B 继续运行\\从保存位置取指};
+\draw[flow] (a) -- (entry);
+\draw[flow] (entry) -- (save);
+\draw[flow] (save) -- (choose);
+\draw[flow] (choose) -- (restore);
+\draw[flow] (restore) -- (b);
+\end{tikzpicture}
+\end{center}
+\diagramnote{切换不是把 A 的代码换成 B 的代码，而是先把处理器唯一的活动现场写回 A 的
+记录，再把 B 的记录装入处理器。}
+
+\subsection{第一次运行和恢复运行为何不同}
+
+B 第一次获得处理器时，没有“暂停位置”。它的记录由装入者人工构造成一种可恢复形态：
+继续位置设为 B 的入口，栈指针设为 B 的初始栈顶，其余寄存器按启动约定给值。以后 B 主动
+交还处理器，记录才被真实运行状态覆盖。
+
+\begin{longtable}{|L{0.22\linewidth}|L{0.29\linewidth}|L{0.37\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+B 的阶段 & 记录中的继续位置 & 栈中已经存在的内容 \\ \hline
+尚未第一次运行 & 任务入口 & 人工准备的初始参数或空栈 \\ \hline
+运行后主动交还 & 交还入口之后的继续点 & B 已经形成的调用链与局部数据 \\ \hline
+已经完成 & 不再作为可恢复位置使用 & 可等待回收或检查结果 \\ \hline
+\end{longtable}
+
+统一的恢复代码只读取记录，不必在最后一步区分“第一次”和“后来”。区别已经在记录如何
+构造、状态字段是否允许恢复中表达。
+
+\section{最小选择规则怎样形成}
+
+当前只有 A 和 B。协调代码可使用一个当前编号：A 交还时若 B 可继续，就选择 B；B 交还
+时再选择 A。这个规则尚不需要复杂队列，但仍要处理任务完成：
+
+\begin{lstlisting}
+choose_next:
+  inspect the other task
+  if it is ready:
+    return that task
+  if current task only yielded and remains ready:
+    return current task
+  otherwise:
+    wait for an external event
+\end{lstlisting}
+
+这里第一次出现“选择下一项可运行任务”的职责。由于选择只发生在任务主动进入协调代码后，
+它仍是合作式安排：协调者能决定交还之后运行谁，却不能决定任务何时交还。
+
+\subsection{一次切换的状态账本}
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.26\linewidth}|L{0.25\linewidth}|L{0.25\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+时刻 & 处理器活动现场 & A 的内存记录 & B 的内存记录 \\ \hline
+\(t_0\) & A 的状态 & 旧值，不可用于恢复当前 A & B 的初始或暂停状态 \\ \hline
+\(t_1\) & A 正在执行保存入口 & 部分字段已更新 & 不变 \\ \hline
+\(t_2\) & 协调代码使用协调栈 & A 的完整暂停状态 & 不变 \\ \hline
+\(t_3\) & 正在装入 B 的状态 & 完整且稳定 & 被读取，尚未运行 \\ \hline
+\(t_4\) & B 的活动现场 & A 可恢复 & B 记录成为旧值 \\ \hline
+\end{longtable}
+
+任一时刻，正在运行任务的最新寄存器在处理器中，其内存记录只是上一次保存值；暂停任务的
+最新现场则必须完整位于内存记录和它自己的栈中。说“每项任务都有一份现场”时，需要同时
+说明活动现场究竟位于处理器还是内存。
+
+\section{这段常驻代码已经是什么}
+
+它不是完整操作系统，却已经具有三个此前不存在的职责：保存当前任务、选择下一任务、恢复
+所选任务。由于任务运行期间协调代码仍保留在内存中，可以把它称为常驻协调者。以后若加入
+更多任务，选择规则和记录集合会扩展，但本章不提前设计最终结构。
+
+\begin{problemframe}
+\textbf{章末出现的问题。} A 可以约定每处理一批数据就主动交还处理器；B 却可能进入无限
+循环，或者因为错误永远不调用交还入口。此时协调代码虽然常驻，却没有任何机会执行。下一章
+只处理“机器怎样在任务不合作时重新得到控制”。
+\end{problemframe}

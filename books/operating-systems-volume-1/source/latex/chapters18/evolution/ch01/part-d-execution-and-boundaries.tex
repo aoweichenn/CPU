@@ -1,0 +1,306 @@
+\section{沿着处理器状态走完求和任务}
+
+任务已经获得处理器。现在用具体地址和数值逐条检查执行结果。任务开始时输入内存为：
+
+\begin{lstlisting}
+MEM32[0x00102000] = 7
+MEM32[0x00102004] = -2
+MEM32[0x00102008] = 11
+MEM32[0x0010200c] = 5
+MEM32[0x00102020] = 0
+\end{lstlisting}
+
+\subsection{初始化指令}
+
+第一笔任务取指从 \code{0x00100000} 到达 RAM。互连不关心这是任务代码，只因地址匹配而
+选择 RAM。返回字节译码为 \code{MOVI r4,0}。指令提交后：
+
+\begin{lstlisting}
+PC: 0x00100000 -> 0x00100004
+r4: 0x00000000 -> 0x00000000
+other architectural state: unchanged
+\end{lstlisting}
+
+虽然 \code{r4} 的数值碰巧没有变化，写入动作仍由指令语义决定。若固件没有按约定清零
+\code{r4}，这条指令也会建立相同起点。
+
+\subsection{第一轮：从字节到部分和}
+
+在 \code{0x00100004}，\code{LOAD r5,[r0+0]} 读取
+\code{0x00102000--03}。事务成功后 \code{r5=7}，PC 进入
+\code{0x00100008}。\code{ADD r4,r5} 读取旧值 \(0\) 和 \(7\)，产生候选结果 \(7\)，
+提交后 \code{r4=7}。
+
+接下来的两条 \code{ADDI} 分别改变指针和计数：
+
+\begin{lstlisting}
+r0: 0x00102000 -> 0x00102004
+r1: 4          -> 3
+\end{lstlisting}
+
+\code{BNEZ r1,0x00100004} 读取 \code{r1=3}，条件成立，因此下一 PC 不是顺序地址
+\code{0x00100018}，而是循环入口 \code{0x00100004}。
+
+\subsection{四轮状态表}
+
+每轮在条件分支提交后，关键状态如下：
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.22\linewidth}|L{0.16\linewidth}|L{0.16\linewidth}|L{0.18\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+轮次 & 本轮读地址 & 读出值 & 部分和 \code{r4} & 分支后的 \code{r1} \\ \hline
+1 & \code{0x00102000} & \(7\) & \(7\) & \(3\) \\ \hline
+2 & \code{0x00102004} & \(-2\) & \(5\) & \(2\) \\ \hline
+3 & \code{0x00102008} & \(11\) & \(16\) & \(1\) \\ \hline
+4 & \code{0x0010200c} & \(5\) & \(21\) & \(0\) \\ \hline
+\end{longtable}
+
+第四轮后，\code{BNEZ} 不采用分支目标，PC 顺序进入 \code{0x00100018}。此时
+\code{r0=0x00102010}，正好指向数组末尾之后的位置。这个地址没有被解引用；它只表示所有
+元素已经消费。若循环多执行一轮，处理器会读取数组外字节，而当前机器没有边界检查替任务
+阻止这一错误。
+
+\subsection{结果写入的可见边界}
+
+\code{STORE r4,[r2+0]} 形成地址 \code{0x00102020}，写数据为
+\code{0x00000015}，宽度为 4。RAM 在事务完成时把四个字节更新为
+\code{15 00 00 00}。在写响应返回前，任务不能把该存储指令视为完成。
+
+写入完成表示后续处理器读取能够取得新值。它不表示结果跨断电保存，因为目标是 RAM；也不
+表示外部发送端已经看到结果，因为串行发送尚未发生。可见、传达和持久是三个不同边界。
+
+\begin{center}
+\begin{tikzpicture}[node distance=10mm and 8mm]
+\node[stage,minimum width=2.5cm] (reg) {寄存器结果\\\code{r4=21}};
+\node[stage,minimum width=2.8cm,right=of reg] (ram) {RAM 写完成\\处理器可读};
+\node[stage,minimum width=2.7cm,right=of ram] (tx) {串行发送\\外部端收到};
+\node[stage,minimum width=2.8cm,right=of tx,fill=BookWarm] (power) {断电后保留\\本章不保证};
+\draw[flow] (reg) -- node[above,font=\scriptsize]{STORE} (ram);
+\draw[flow] (ram) -- node[above,font=\scriptsize]{固件报告} (tx);
+\draw[->,>=Latex,dashed,thick,draw=BookMuted] (tx) -- (power);
+\end{tikzpicture}
+\end{center}
+\diagramnote{前三个方框是不同层次的事实。最右侧使用虚线，因为 RAM 和串行发送都不能提供
+断电持久性。}
+
+\subsection{任务怎样返回固件}
+
+执行到 \code{0x0010001c} 时，任务发出 \code{RET}。处理器必须先从
+\code{SP=0x001efffc} 读取 4 字节返回地址。RAM 返回 \code{0x00000300} 后，处理器把
+SP 增加到 \code{0x001f0000}，并把 PC 改为 \code{0x00000300}。这两个状态更新共同完成
+返回。
+
+\subsection{返回前后快照}
+
+\begin{longtable}{|L{0.26\linewidth}|L{0.27\linewidth}|L{0.27\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+状态 & \code{RET} 开始前 & \code{RET} 完成后 \\ \hline
+\code{PC} & \code{0x0010001c} & \code{0x00000300} \\ \hline
+\code{SP} & \code{0x001efffc} & \code{0x001f0000} \\ \hline
+\code{MEM32[0x001efffc]} & \code{0x00000300} & 内容仍在，但已不属于有效栈 \\ \hline
+\code{MEM32[0x00102020]} & \(21\) & \(21\) \\ \hline
+\end{longtable}
+
+SP 上升不会自动擦除旧返回地址。栈的有效范围由 SP 与约定共同决定，旧字节可以继续留在
+RAM 中。后续压栈可能覆盖它。
+
+\subsection{固件返回入口能依赖什么}
+
+固件不能假定任务保留了自己的临时寄存器，因为本章没有要求任务这样做。固定返回入口只
+依赖两项事实：PC 已指向 \code{0x00000300}，结果位于约定的 RAM 地址。它重新建立自己的
+SP，读取结果，等待串行发送端可用，然后按四个字节发送结果或发送文本表示。
+
+\begin{lstlisting}
+firmware_return:
+  SP = FIRMWARE_STACK_TOP
+  result = MEM32[0x00102020]
+  for each byte in encode(result):
+    repeat until STATUS has TX_READY
+    write8(TXDATA, byte)
+  enter firmware_wait_loop
+\end{lstlisting}
+
+固件必须先重建 SP，再进行函数调用或压栈。任务返回时的 SP 已在任务栈上界，不能当作固件
+栈继续使用。两片栈位于同一 RAM，却属于不同执行阶段的软件约定。
+
+\subsection{正常路径的端到端时间线}
+
+前面分别建立了器件和局部事务，现在可以把它们综合成一次完整运行。下图只使用已经解释过
+的对象：
+
+\begin{center}
+\begin{tikzpicture}[x=2.25cm,y=0.78cm]
+\node[font=\footnotesize] at (0,7.5) {外部端};
+\node[font=\footnotesize] at (1,7.5) {串行控制器};
+\node[font=\footnotesize] at (2,7.5) {固件};
+\node[font=\footnotesize] at (3,7.5) {RAM};
+\node[font=\footnotesize] at (4,7.5) {任务};
+\foreach \x in {0,1,2,3,4} {\draw[BookRule] (\x,7.2) -- (\x,0.1);}
+\draw[flow] (0,6.8) -- node[above,font=\scriptsize]{头部字节} (1,6.8);
+\draw[flow] (2,6.35) -- node[above,font=\scriptsize]{轮询读取} (1,6.35);
+\draw[flow] (2,5.8) -- node[above,font=\scriptsize]{验证头部} (3,5.8);
+\draw[flow] (0,5.2) -- node[above,font=\scriptsize]{载荷字节} (1,5.2);
+\draw[flow] (2,4.7) -- node[above,font=\scriptsize]{逐字节写入} (3,4.7);
+\draw[flow] (2,4.1) -- node[above,font=\scriptsize]{校验、清零、建栈} (3,4.1);
+\draw[flow] (2,3.5) -- node[above,font=\scriptsize]{提交入口 PC} (4,3.5);
+\draw[flow] (4,2.9) -- node[above,font=\scriptsize]{读取输入} (3,2.9);
+\draw[flow] (4,2.3) -- node[above,font=\scriptsize]{写结果 21} (3,2.3);
+\draw[flow] (4,1.7) -- node[above,font=\scriptsize]{RET 到固定入口} (2,1.7);
+\draw[flow] (2,1.1) -- node[above,font=\scriptsize]{写 TXDATA} (1,1.1);
+\draw[flow] (1,0.55) -- node[above,font=\scriptsize]{结果字节} (0,0.55);
+\end{tikzpicture}
+\end{center}
+\diagramnote{时间从上向下。载荷进入 RAM、任务获得 PC、结果进入 RAM、结果到达外部端分别是
+四个不同事件；前一事件不会自动包含后一事件。}
+
+\subsection{把每个边界写成一句可检验的事实}
+
+\begin{enumerate}
+\item 头部接受：字段合法且后续计算不会越过任务区域；
+\item 载荷接收完成：规定数量的字节已经写入 RAM；
+\item 映像验证完成：校验通过、零区和栈均已建立；
+\item 控制权移交：PC 已提交任务入口，下一次取指来自任务；
+\item 计算完成：结果存储事务已得到 \code{OK}；
+\item 任务返回：PC 和 SP 已按 \code{RET} 规则更新；
+\item 外部可见：串行发送完成，外部端实际收到结果字节。
+\end{enumerate}
+
+如果只说“任务运行成功”，就无法定位失败究竟发生在传输、装入、移交、计算、返回还是
+报告阶段。正式系统中的请求、完成和持久化边界更复杂，但分析方法从这台小机器开始已经
+相同：先命名对象状态，再指出哪个事件改变了它。
+
+\subsection{错误路径揭示了当前机器缺少什么}
+
+正常示例证明最小方案可行，错误路径则说明它的边界。下面每种错误都对应一个具体检测者，
+不能用“系统会处理”概括。
+
+\subsection{头部损坏：固件可以在移交前拒绝}
+
+若 \code{magic} 错误、长度越界或入口未对齐，固件仍掌握 PC，因此可以停止接收、通过
+串行发送错误码并回到等待头部状态。此时 RAM 中即使残留部分字节，也没有被执行。
+
+错误处理的关键不是把 RAM 恢复成全零，而是不提交任务入口。下一次合法装入会覆盖规定
+范围；若固件需要避免旧数据泄漏，可以在重新使用前清零，但这属于额外策略。
+
+\subsection{串行溢出：控制器只能报告已经丢失}
+
+若发送端速度超过固件轮询速度，新字节会覆盖单槽接收寄存器，控制器随即置溢出位
+\code{RX\_OVERRUN}。固件无法由该位推断丢失字节的内容和位置，只能拒绝整次传输并
+要求外部端重发。校验和可以检测内容不一致，却不能凭空恢复缺失字节。
+
+增加接收 FIFO、流量控制或 DMA 都能改变吞吐边界，但当前问题只需要一个最小可靠方案，
+所以采用“检测溢出并重传”的规则。后续若设备速率成为主要矛盾，再引入更复杂硬件。
+
+\subsection{未映射地址：互连报告错误，任务没有恢复机制}
+
+若任务错误地读取 \code{0x20000000}，互连返回 \code{UNMAPPED}。教学处理器把失败地址、
+访问方向和当时 PC 写入固定固件错误槽，然后跳到固件错误入口。这使机器至少不会把任意
+电平当作成功数据。
+
+本章尚未为不同任务建立独立错误现场，也没有把错误转换成可返回给应用的信号。故障后的
+最小处理是报告并复位。错误可检测不等于错误可恢复。
+
+\subsection{任务写坏固件工作区：软件约定无法强制隔离}
+
+任务执行：
+
+\begin{lstlisting}
+STORE r4, [0x001f0000]
+\end{lstlisting}
+
+时，地址合法地落在 RAM 范围。互连和 RAM 都会完成写入，因为它们不知道该范围按约定属于
+固件。任务随后返回时，固件的装入记录或栈可能已经损坏。这不是地址互连故障，而是当前
+机器缺少访问权限边界。
+
+\subsection{栈指针损坏：返回地址的存在也不足以保证返回}
+
+若任务把 SP 改成 \code{0x00102000} 后执行 \code{RET}，处理器会把第一个输入整数
+\code{0x00000007} 当作返回 PC。该地址未按指令对齐或落在无效区域，机器随后进入错误
+入口。固件预置返回地址只能保证合作任务有一条返回路径，不能保证任意代码使用它。
+
+\subsection{无限循环：没有外部事件就无法取回处理器}
+
+任务可能执行：
+
+\begin{lstlisting}
+repeat:
+  ADDI r4, 1
+  BNEZ r4, repeat
+\end{lstlisting}
+
+只要指令和 RAM 访问合法，处理器就会继续执行任务。串行控制器即使收到新命令，当前代码
+也没有读取它。时钟边沿只能推动指令前进，并不会把 PC 自动改回固件。机器此时既没有可编程
+时钟事件，也没有异步入口，固件无法重新获得控制。
+
+\begin{problemframe}
+\textbf{这一失败是后续演进的关键证据。} “任务最终会执行 \code{RET}”是合作约定，不是
+机器保证。若希望运行多个任务或限制单个任务占用处理器的时间，必须先回答怎样保存正在
+执行的现场，再回答怎样在任务不合作时进入受控代码。
+\end{problemframe}
+
+\subsection{这台机器的软件模型究竟是什么}
+
+到本章末，程序员面对的不是一堆孤立器件，而是一组边界清楚的契约。
+
+\subsection{地址契约}
+
+一个 32 位物理地址经过互连选择启动存储、RAM、串行控制器或错误响应。读写宽度和方向是
+事务的一部分。地址只标识位置，不表达对象身份、权限或所有权。
+
+\subsection{执行契约}
+
+PC 指出下一条指令，寄存器与 RAM 保存继续计算所需的状态。普通指令顺序推进，分支、调用
+和返回按明确规则改变 PC。只有已经提交的状态才属于下一条指令的输入。
+
+\subsection{启动契约}
+
+复位先进入固件。固件验证任务映像，建立内存布局、参数和栈，最后提交任务入口 PC。任务
+执行 \code{RET} 才会沿预置栈内容回到固定固件入口。
+
+\subsection{设备契约}
+
+串行控制器把异步到达的线信号变成带状态位的字节槽。固件通过轮询消费字节，并负责在溢出
+或校验失败时拒绝整次传输。控制器不理解任务格式。
+
+\section{为什么这仍然不是操作系统}
+
+固件已经做了不少软件工作：它初始化器件、接收字节、检查范围、装入任务、建立初始现场并
+报告结果。但“存在启动软件”不等于“已经有操作系统”。当前方案只服务于一条预先约定的
+运行路径，没有建立长期存在的任务身份和资源管理规则。
+
+\begin{longtable}{|L{0.24\linewidth}|L{0.29\linewidth}|L{0.35\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+当前已经具备 & 依靠什么实现 & 当前仍未具备 \\ \hline
+确定的复位入口 & 复位状态与启动存储 & 多个任务的身份和生命周期 \\ \hline
+任务字节装入 RAM & 串行协议与固件装入记录 & 文件、目录和持久命名 \\ \hline
+一次明确的控制权移交 & 初始寄存器、栈和 PC 提交 & 暂停后恢复任意任务现场 \\ \hline
+合作式返回 & 预置返回地址与 \code{RET} & 强制收回处理器 \\ \hline
+物理地址访问 & 地址互连 & 地址隔离和访问权限 \\ \hline
+错误检测与复位 & 互连错误和固件入口 & 面向任务的独立错误恢复 \\ \hline
+\end{longtable}
+
+表的左列是本章已经逐步建立并走读过的能力，右列则是具体失败留下的空缺。后续章节不会
+直接罗列现代操作系统模块，而会从这些空缺中一次选择一个进行演进。
+
+\subsection{本章复盘：从一个要求到一台可运行机器}
+
+最初的要求只有“计算四个整数之和”。为了让这句话在真实机器上成立，我们依次得到以下
+因果链：
+
+\begin{enumerate}
+\item 计算必须跨动作保留事实，因此需要寄存器、PC、SP 和可写状态；
+\item 第一条指令必须跨断电存在，因此需要启动存储；
+\item 运行数据必须可变，因此需要 RAM；
+\item 多个器件不能同时响应同一请求，因此需要地址互连和明确事务；
+\item 上电状态不可靠，因此需要时钟边界、复位状态和固定入口；
+\item 外部任务不能凭空进入 RAM，因此需要串行控制器和传输协议；
+\item 任意字节不能直接执行，因此需要范围、校验和入口验证；
+\item 任务不能继承固件偶然状态，因此需要初始寄存器、独立栈和移交顺序；
+\item 任务完成后必须有控制流去向，因此需要预置返回地址和固定固件入口。
+\end{enumerate}
+
+这条链不是整机启动的口号，而是每一步都有对象、字段和状态变化的运行记录。求和任务的
+最终结果为 \(21\)，RAM 中的结果字节为 \code{15 00 00 00}，外部端只有在串行发送完成后
+才能看到它。

@@ -1,6 +1,6 @@
-\chapter{硬件事实怎样逼出内核对象}
+\chapter{怎样从硬件事实推导内核对象}
 
-上一章已经把硬件链路单独讲清楚：CPU 只能从当前寄存器和程序计数器继续执行；地址要经过页表、TLB、cache 和内存属性；设备通过 MMIO、队列、DMA、中断和 completion 与 CPU 协作。现在往上走一层：这些硬件事实怎样逼出内核对象。
+上一章已经把硬件链路单独讲清楚：CPU 只能从当前寄存器和程序计数器继续执行；地址要经过页表、TLB、cache 和内存属性；设备通过 MMIO、队列、DMA、中断和 completion 与 CPU 协作。现在往上走一层：怎样从这些硬件事实推导内核对象。
 
 task、地址空间、VMA、fd、request、wait queue 这些名字不是先验规定出来的。它们解决的都是同一个问题：硬件只给瞬时状态和低层事件，OS 必须把它们组织成可恢复、可检查、可等待、可取消、可释放的长期状态。只要这条线不清楚，后面讲调度、虚拟内存、文件系统和驱动时，就会像在背结构体字段。
 
@@ -21,7 +21,7 @@ write(fd, user_buf, len);
 
 \begin{longtable}{p{0.18\linewidth}p{0.36\linewidth}p{0.34\linewidth}}
 \toprule
-硬件事实 & 如果只写成普通函数会怎样 & 被逼出的内核对象 \\
+硬件事实 & 如果只写成普通函数会怎样 & 由此建立的内核对象 \\
 \midrule
 CPU 只能从当前现场继续执行 & 进入内核后覆盖寄存器，返回用户态时找不到原位置 & trap frame、task、内核栈 \\
 用户地址只是虚拟地址 & 用户传坏指针会让内核读错页、越权读，或跨页时只检查了一半 & address space、VMA、PTE、用户拷贝边界 \\
@@ -115,7 +115,7 @@ write(fd, "A\n", 2);
 write(fd, "B\n", 2);
 \end{lstlisting}
 
-如果二者都先读到同一个文件尾，再各自写入，就可能互相覆盖。文件对象和文件系统锁必须把“取尾部位置并分配写入范围”做成一个受控动作。再往下，系统突然断电时，用户看到 \code{write} 返回并不等价于数据已经越过设备缓存落到介质上；\code{fsync} 返回也依赖文件系统日志、块层 flush、设备对 flush/FUA 的实现。这里逼出的对象不仅是 open file 和 page cache，还有 journal transaction、dirty inode、writeback request 和错误回报位置。后面文件系统章会继续展开，但此处先记住一点：硬件只提供写 cache line、发 request、收到 completion 这些事实，OS 必须把它们组合成“追加”“可见”“持久化”这些接口语义。
+如果二者都先读到同一个文件尾，再各自写入，就可能互相覆盖。文件对象和文件系统锁必须把“取尾部位置并分配写入范围”做成一个受控动作。再往下，系统突然断电时，用户看到 \code{write} 返回并不等价于数据已经越过设备缓存落到介质上；\code{fsync} 返回也依赖文件系统日志、块层 flush、设备对 flush/FUA 的实现。这里需要的对象不仅是 open file 和 page cache，还有 journal transaction、dirty inode、writeback request 和错误回报位置。后面文件系统章会继续展开，但此处先记住一点：硬件只提供写 cache line、发 request、收到 completion 这些事实，OS 必须把它们组合成“追加”“可见”“持久化”这些接口语义。
 
 把四条路径放在一起，就能看出本章的主线：同一个 API 名字下面有多层完成边界。page cache 命中路径主要考验用户拷贝、页状态和延迟回写；部分块写路径暴露读改写；直接 I/O 路径暴露 DMA 和 IOMMU；append 路径暴露并发提交和崩溃恢复。内核对象不是为了把代码写复杂，而是为了让这些不同硬件事实不会互相冒充。
 
@@ -134,7 +134,7 @@ write(fd, "B\n", 2);
 
 所以本章不是给结构体起名，而是把一次普通写入拆成对象形成过程。对象不是为了“面向对象设计”，而是为了保存跨越硬件边界的事实：谁拥有、谁等待、谁能访问、谁已经提交、谁还可能失败。
 
-\section{二、CPU 入口为什么逼出 task 和 trap frame}
+\section{二、为什么要从 CPU 入口建立 task 和 trap frame}
 
 先只看 CPU，不看文件和设备。用户程序执行到这里：
 
@@ -263,7 +263,7 @@ device interrupt 的特点是“完成事实在设备侧”。设备中断到来
 
 CPU 入口还会发生在内核态。内核正在执行文件系统代码时，设备中断可能到来；内核正在做用户拷贝时，page fault 可能到来；内核拿着某个锁时，定时器中断可能到来。于是 trap frame 还要记录被打断时的特权级和状态。若中断来自用户态，返回路径可能经过调度、信号投递和用户态恢复；若中断来自内核态，返回路径通常要回到被打断的内核代码，并且必须遵守“哪些锁已持有、哪些栈帧仍有效、哪些操作不可重入”。这就是为什么 OS 入口代码往往比普通函数调用复杂：它不仅要进来，还要能在各种嵌套和异步条件下正确出去。
 
-\section{三、地址翻译为什么逼出 address space、VMA 和 PTE}
+\section{三、为什么要从地址翻译建立 address space、VMA 和 PTE}
 
 现在看 \code{user\_buf}。用户传给内核的是一个虚拟地址。虚拟地址是进程自己看到的地址编号，例如 \code{0x7fff00001234}。它不直接说明真实内存条上的位置，也不说明当前是否允许读写。硬件里的 MMU 查页表，把虚拟页翻译成物理页，并检查权限。页表项叫 PTE，也就是 page table entry。
 
@@ -409,7 +409,7 @@ DMA 地址 & 设备和 IOMMU & 生命周期受 DMA mapping 控制 \\
 
 从硬件角度看，地址空间是页表和权限检查；从内核角度看，地址空间是一个进程能触碰哪些虚拟地址、这些地址来自哪里、出现 fault 时怎样补救的对象。二者必须同时成立。
 
-\section{四、设备请求为什么逼出 request、wait queue 和 completion}
+\section{四、为什么要从设备请求建立 request、wait queue 和 completion}
 
 假设内核已经把用户数据安全地接收到内核对象里，下一步要让设备写出去。错误版本会写成：
 
@@ -491,11 +491,11 @@ completion 后 & 结果回到驱动，但还没完全释放 & 先读取状态、
 
 失败路径更能说明 request 的必要性。设备可能超时。超时不代表设备一定没做；它只代表“在规定时间内没有观察到 completion”。此时内核不能马上释放 buffer，因为设备可能稍后还会 DMA。可靠恢复通常要停止队列、屏蔽中断或 quiesce 设备、尝试 abort request、必要时 reset 控制器、确认没有 in-flight DMA 后再撤销映射。没有 request 列表，内核不知道哪些请求还在飞；没有 request state，内核不知道哪些能重试、哪些已经失败、哪些不能再释放。
 
-为了避免把设备统一想成“磁盘”，再看三个设备路径。它们的规模不同，但都在逼出同一组 OS 对象。
+为了避免把设备统一想成“磁盘”，再看三个设备路径。它们的规模不同，但都要求同一组 OS 对象。
 
 \begin{longtable}{p{0.16\linewidth}p{0.39\linewidth}p{0.33\linewidth}}
 \toprule
-设备路径 & 典型动作 & 逼出的对象 \\
+设备路径 & 典型动作 & 所需对象 \\
 \midrule
 PIO 串口发送一个字节 & CPU 读状态寄存器，ready 后写 DATA 寄存器 & wait queue、设备锁、寄存器访问顺序 \\
 网卡接收一个包 & 设备 DMA 到预先给出的 buffer，写 completion 或更新 ring & buffer pool、descriptor ring、packet object、NAPI/poll 状态 \\

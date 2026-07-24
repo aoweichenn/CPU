@@ -1,0 +1,388 @@
+\section{让外部任务进入机器：串行控制器}
+
+可以把求和任务永久写进启动存储，但那样每换一次任务都要重新烧写固件。本章为机器增加
+一个最小串行控制器。外部发送端在一根接收线上按时间发送位，控制器把位组合成字节，再把
+字节暴露为处理器可以寻址的状态。发送方向用于固件报告接受、拒绝和最终结果。
+
+\subsection{新器件接在哪里}
+
+串行控制器有两类连接。第一类是机器外部的收发信号；第二类是接入现有地址互连的配置与
+数据端口。处理器不直接观察线上的每一位，而是通过内存映射寄存器读取已经组装好的字节。
+
+\begin{center}
+\begin{tikzpicture}[node distance=10mm and 9mm]
+\node[stage,minimum width=2.6cm] (host) {外部发送端\\任务字节流};
+\node[stage,minimum width=3.0cm,right=of host] (uart) {串行控制器\\状态与收发槽};
+\node[stage,minimum width=2.8cm,right=of uart] (bus) {地址互连\\设备范围};
+\node[stage,minimum width=2.6cm,right=of bus] (cpu) {处理器\\轮询搬运};
+\draw[flow] ([yshift=3mm]host.east) -- node[above,font=\footnotesize]{接收线} ([yshift=3mm]uart.west);
+\draw[flow] ([yshift=-3mm]uart.west) -- node[below,font=\footnotesize]{发送线} ([yshift=-3mm]host.east);
+\draw[flow] ([yshift=3mm]cpu.west) -- node[above,font=\footnotesize]{读写请求} ([yshift=3mm]bus.east);
+\draw[flow] ([yshift=-3mm]bus.east) -- node[below,font=\footnotesize]{响应} ([yshift=-3mm]cpu.west);
+\draw[flow] ([yshift=3mm]bus.west) -- node[above,font=\footnotesize]{寄存器请求} ([yshift=3mm]uart.east);
+\draw[flow] ([yshift=-3mm]uart.east) -- node[below,font=\footnotesize]{寄存器响应} ([yshift=-3mm]bus.west);
+\end{tikzpicture}
+\end{center}
+\diagramnote{串行线与处理器请求不是同一种事件。控制器先在外部时间域接收位，再把完整字节
+保存在内部槽中；处理器随后通过互连读取这个槽。}
+
+\subsection{串行控制器内部保存什么}
+
+\textbf{硬件模型。} 接收移位寄存器按串行时序收集位，形成一个字节后写入
+\code{rx\_data} 并置 \code{rx\_ready=1}。处理器读取 \code{RXDATA} 后清除
+\code{rx\_ready}。若旧字节尚未读取而新字节到达，控制器置
+\code{rx\_overrun=1}。发送侧在 \code{tx\_ready=1} 时接受一个字节，移出期间清零
+\code{tx\_ready}，发送完毕后重新置位。
+
+接收线上的一个电平不能直接写进 \code{RXDATA}。采样状态先在约定时刻取得每一位，移位
+寄存器按位次保存它们，位计数器在收满八位时产生“字节完成”。只有这个事件才允许接收槽
+替换旧值并设置 \code{rx\_ready}。发送方向按相反顺序工作：处理器写入发送槽，移位状态
+逐位取出，位计数归零后才重新设置 \code{tx\_ready}。
+
+\begin{center}
+\begin{tikzpicture}[node distance=10mm and 7mm]
+\node[stage,minimum width=2.65cm] (rxline) {外部接收线\\逐位电平};
+\node[stage,minimum width=2.8cm,right=of rxline] (sample) {采样与位计数\\确定第 0--7 位};
+\node[stage,minimum width=2.85cm,right=of sample] (rxshift) {接收移位寄存器\\暂存未满八位的数据};
+\node[stage,minimum width=3.1cm,right=of rxshift] (rxslot) {\code{RXDATA} 接收槽\\\code{ready/overrun}};
+\draw[flow] (rxline) -- (sample);
+\draw[flow] (sample) -- (rxshift);
+\draw[flow] (rxshift) -- (rxslot);
+\node[stage,minimum width=2.65cm,below=14mm of rxline] (txline) {外部发送线\\逐位输出};
+\node[stage,minimum width=2.8cm,right=of txline] (txshift) {发送移位寄存器\\移出当前最低位};
+\node[stage,minimum width=2.85cm,right=of txshift] (txcount) {发送位计数\\八位后置空闲};
+\node[stage,minimum width=3.1cm,right=of txcount] (txslot) {\code{TXDATA} 发送槽\\\code{tx\_ready}};
+\draw[flow] (txslot) -- (txcount);
+\draw[flow] (txcount) -- (txshift);
+\draw[flow] (txshift) -- (txline);
+\node[font=\scriptsize,BookMuted,below=4mm of rxslot,align=center]
+  {处理器读：返回槽中字节\\并清除 \code{rx\_ready}};
+\node[font=\scriptsize,BookMuted,below=4mm of txslot,align=center]
+  {处理器写：仅在空闲时\\替换发送槽};
+\end{tikzpicture}
+\end{center}
+\diagramnote{上排把外部位流提交为一个软件可读字节，下排把一个软件提交的字节展开成位流。
+接收槽和发送槽是两个独立所有权边界，不能用一根“串口缓冲”线概括。}
+
+\textbf{软件模型。} 地址互连为控制器分配三个 32 位寄存器：
+
+\begin{longtable}{|L{0.28\linewidth}|L{0.18\linewidth}|L{0.42\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+地址与名称 & 访问方式 & 软件可见语义 \\ \hline
+\code{0x40000000 STATUS} & 只读 & bit0 为 \code{RX\_READY}，bit1 为
+\code{RX\_OVERRUN}，bit2 为 \code{TX\_READY} \\ \hline
+\code{0x40000004 RXDATA} & 只读 & 返回接收字节，并消费当前接收槽 \\ \hline
+\code{0x40000008 TXDATA} & 只写 & 在 \code{TX\_READY=1} 时提交一个待发送字节 \\ \hline
+\end{longtable}
+
+固件读取字节时必须先检查状态：
+
+\begin{lstlisting}
+receive_byte:
+  status = read32(0x40000000)
+  if status has RX_OVERRUN: reject current transfer
+  if status lacks RX_READY: repeat
+  return read8(0x40000004)
+\end{lstlisting}
+
+\textbf{抽象。} 上层软件得到一个按到达次序读取、按提交次序发送的字节通道。它不保证
+任务边界、长度、校验或重传；这些规则要由固件和外部发送端建立。它也不保证处理器在做
+其他计算时仍能及时取走字节，单槽接收的速率上限由轮询速度决定。
+
+\subsection{为什么不能只约定“发完为止”}
+
+串行字节本身没有结束标记。若发送端静默，固件无法区分“任务已经发完”和“下一个字节
+还没到”。因此，传输必须先提供长度。长度又可能因误码变成巨大数值，固件还需要固定标识
+和校验，才能避免把随机字节当作可执行映像。
+
+本章使用 32 字节的教学头部：
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.24\linewidth}|L{0.46\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+偏移 & 字段 & 为什么必须存在 \\ \hline
+\code{+0x00} & \code{magic} & 区分任务传输和随机输入，本章固定为 \code{MTK1} \\ \hline
+\code{+0x04} & \code{header\_bytes} & 使接收者知道载荷从哪里开始 \\ \hline
+\code{+0x08} & \code{image\_bytes} & 决定接收终点并用于范围检查 \\ \hline
+\code{+0x0c} & \code{load\_address} & 指定载荷写入 RAM 的起始位置 \\ \hline
+\code{+0x10} & \code{entry\_offset} & 在载荷内部指出第一条任务指令 \\ \hline
+\code{+0x14} & \code{zero\_bytes} & 指定载荷后需清零的可写区域 \\ \hline
+\code{+0x18} & \code{stack\_bytes} & 说明任务要求的最小栈空间 \\ \hline
+\code{+0x1c} & \code{checksum} & 检测头部之外的载荷是否损坏 \\ \hline
+\end{longtable}
+
+这只是固件与发送端的装入协议，不是文件系统中的文件格式。它没有文件名、目录、权限、
+时间戳或持久对象身份。给它增加这些名称并不会让机器自动获得文件系统。
+
+\section{装入不是复制一遍就结束}
+
+固件收到头部后，不能立即按其中地址写 RAM。一个恶意或损坏的
+\code{image\_bytes} 可能在加法中溢出，使表面上的终点变成较小地址；载荷可能覆盖固件
+工作区或任务栈；入口偏移也可能指到载荷之外。所有会影响写入范围和最终 PC 的字段都必须
+先验证。
+
+\subsection{先确定本次内存所有权}
+
+本章采用以下 RAM 布局：
+
+\begin{longtable}{|L{0.29\linewidth}|L{0.27\linewidth}|L{0.32\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+物理范围 & 启动期间的所有者 & 用途 \\ \hline
+\code{0x00100000--0x0017ffff} & 待装入任务 & 映像、零填充区和任务数据 \\ \hline
+\code{0x00180000--0x001effff} & 待装入任务 & 向下增长的任务栈候选区 \\ \hline
+\code{0x001f0000--0x001fffff} & 固件 & 接收状态、校验状态和固件栈 \\ \hline
+\end{longtable}
+
+“所有者”此时只是固件遵守的软件约定，并非硬件权限。固件在移交前不会主动把任务载荷写
+进自己的工作区；任务开始后却仍可用普通存储指令覆盖那里。正是这种缺乏强制边界的事实，
+决定了本章还不能称为有了操作系统保护。
+
+\subsection{范围检查必须考虑整数溢出}
+
+设
+\[
+L=\texttt{load\_address},\qquad
+N=\texttt{image\_bytes},\qquad
+Z=\texttt{zero\_bytes}.
+\]
+若直接计算 \(L+N+Z\)，32 位加法可能回绕。稳妥检查先确认每个长度不超过允许区间，再用
+减法形式判断：
+\[
+N \le U-L,\qquad
+Z \le U-(L+N),
+\]
+其中 \(U\) 是任务载入区的开区间上界 \code{0x00180000}。在使用 \(U-L\) 前，还要确认
+\(L<U\) 且 \(L\) 不低于 \code{0x00100000}。
+
+入口地址
+\[
+E=L+\texttt{entry\_offset}
+\]
+必须落在已接收的映像字节中，并满足 4 字节指令对齐。栈大小必须能在候选栈区内安排，且
+栈区不能与载荷及零填充区重叠。
+
+\begin{lstlisting}
+validate_header(h):
+  require h.magic == MTK1
+  require h.header_bytes == 32
+  require TASK_LOAD_LOW <= h.load_address < TASK_LOAD_HIGH
+  require h.image_bytes <= TASK_LOAD_HIGH - h.load_address
+  image_end = h.load_address + h.image_bytes
+  require h.zero_bytes <= TASK_LOAD_HIGH - image_end
+  require h.entry_offset < h.image_bytes
+  require (h.load_address + h.entry_offset) is 4-byte aligned
+  require MIN_STACK <= h.stack_bytes <= STACK_REGION_SIZE
+\end{lstlisting}
+
+验证顺序是协议的一部分。只有前一项证明相应运算安全，后一项才可以使用计算结果。把所有
+条件压成一个长布尔表达式，会掩盖哪一步可能先发生溢出。
+
+\subsection{逐字节接收时谁拥有哪些状态}
+
+头部通过后，固件建立一个装入记录：
+
+\begin{lstlisting}
+load_record:
+  destination_start
+  destination_next
+  payload_remaining
+  checksum_so_far
+  expected_checksum
+  entry_address
+  zero_start
+  zero_bytes
+  stack_low
+  stack_top
+  state = RECEIVING
+\end{lstlisting}
+
+\code{destination\_next} 指出下一个字节写到哪里；
+\code{payload\_remaining} 防止接收循环依赖外部静默；
+\code{checksum\_so\_far} 只覆盖已经接受的载荷。每消费一个 \code{RXDATA} 字节，固件按
+固定顺序更新这些字段：
+
+\begin{enumerate}
+\item 从控制器消费一个字节；
+\item 把字节写到 \code{destination\_next}；
+\item 将该字节并入校验状态；
+\item 递增 \code{destination\_next}；
+\item 递减 \code{payload\_remaining}。
+\end{enumerate}
+
+若在第 2 步之后复位，RAM 中可能留下部分载荷，但复位会重新从启动存储执行，装入记录也
+会重建。固件不能仅凭 RAM 中“看起来像代码”的字节跳转，必须重新完成协议验证。
+
+\subsection{接收完成、验证完成与可执行不是一个时刻}
+
+最后一个字节写入 RAM 时，只能说明传输长度已经满足。固件还要比较最终校验值、清零
+\code{zero\_bytes} 指定的区域、建立输入数组和初始栈。为避免把半成品当作任务，装入
+记录按以下状态推进：
+
+\begin{center}
+\begin{tikzpicture}[node distance=10mm and 12mm]
+\node[stage,minimum width=2.8cm] (header) {等待头部};
+\node[stage,minimum width=2.8cm,right=of header] (recv) {接收载荷};
+\node[stage,minimum width=2.8cm,right=of recv] (verify) {校验与清零};
+\node[stage,minimum width=2.8cm,right=of verify] (ready) {可移交};
+\node[stage,minimum width=11.2cm,below=13mm of recv,fill=BookWarm] (reject)
+  {任一头部、长度、校验或布局检查失败：拒绝当前传输并报告原因};
+\draw[flow] (header) -- node[above,font=\scriptsize]{头部合法} (recv);
+\draw[flow] (recv) -- node[above,font=\scriptsize]{长度满足} (verify);
+\draw[flow] (verify) -- node[above,font=\scriptsize]{校验通过} (ready);
+\draw[->,>=Latex,thick,draw=BookMuted] (header.south) -- (header.south |- reject.north);
+\draw[->,>=Latex,thick,draw=BookMuted] (recv.south) -- (recv.south |- reject.north);
+\draw[->,>=Latex,thick,draw=BookMuted] (verify.south) -- (verify.south |- reject.north);
+\end{tikzpicture}
+\end{center}
+\diagramnote{“载荷到齐”只关闭接收阶段；只有校验、零填充和布局建立全部成功，装入记录才
+进入“可移交”。任何失败都不能改变 PC 到任务入口。}
+
+本章的提交点不是写入最后一个字节，而是稍后把处理器 PC 改为已经验证的入口地址。在此
+之前，即使 RAM 中已有完整任务，处理器仍执行固件。
+
+\subsection{用具体数字走完一次装入}
+
+求和任务头部给出：
+
+\begin{lstlisting}
+magic          = MTK1
+header_bytes   = 32
+image_bytes    = 0x00000300
+load_address   = 0x00100000
+entry_offset   = 0x00000000
+zero_bytes     = 0x00000100
+stack_bytes    = 0x00004000
+checksum       = expected value
+\end{lstlisting}
+
+载荷占用 \code{0x00100000--0x001002ff}，零填充区占用
+\code{0x00100300--0x001003ff}，都低于任务载入区上界。任务栈使用
+\code{0x001ec000--0x001effff}，与映像不重叠。入口地址就是
+\code{0x00100000}。
+
+输入数组是任务数据的一部分，位于 \code{0x00102000}，不在上述 0x300 字节载荷范围内
+会产生矛盾。为使布局一致，本次实际映像应覆盖到输入区之后，因此把
+\code{image\_bytes} 修正为 \code{0x00002100}。这项复算刻意展示了字段之间必须相互
+核对：若只逐项抄表，装入器会接受一个宣称包含输入数据、实际长度却到不了输入地址的映像。
+
+修正后的范围为：
+
+\begin{longtable}{|L{0.32\linewidth}|L{0.22\linewidth}|L{0.32\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+范围 & 装入后的内容 & 来源 \\ \hline
+\code{0x00100000--0x0010001f} & 求和核心指令 & 载荷 \\ \hline
+\code{0x00100020--0x00101fff} & 其他任务代码与常量 & 载荷 \\ \hline
+\code{0x00102000--0x0010200f} & 四个输入整数 & 载荷 \\ \hline
+\code{0x00102020--0x00102023} & 结果槽，初值为零 & 载荷 \\ \hline
+\code{0x00102100--0x001021ff} & 未初始化区 & 固件清零 \\ \hline
+\code{0x001ec000--0x001effff} & 任务栈 & 固件保留并建立初始内容 \\ \hline
+\end{longtable}
+
+外部发送端不应发送含糊的“差不多大小”。装入协议中的长度必须覆盖实际传输的每个字节，
+固件也只能在校验过的范围内解释入口和数据。
+
+\section{从固件现场建立任务现场}
+
+任务字节可执行后，处理器仍保存固件的 PC、SP 和寄存器。直接把 PC 改为任务入口会让任务
+继承任意寄存器值，并继续使用固件栈。任务第一次访问参数或执行 \code{RET} 时就会得到
+错误结果。固件必须先构造一份明确的初始现场。
+
+\subsection{初始寄存器约定}
+
+本次启动约定如下：
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.26\linewidth}|L{0.44\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+状态 & 移交值 & 原因 \\ \hline
+\code{r0} & \code{0x00102000} & 输入数组首地址 \\ \hline
+\code{r1} & \code{4} & 数组元素个数 \\ \hline
+\code{r2} & \code{0x00102020} & 结果槽地址 \\ \hline
+\code{r3--r7} & \code{0} & 消除对固件残留值的依赖 \\ \hline
+\code{SP} & \code{0x001efffc} & 指向预置的固件返回地址 \\ \hline
+\code{PC} & \code{0x00100000} & 最后一步才写入的任务入口 \\ \hline
+\end{longtable}
+
+SP 不是直接设为 \code{0x001f0000}。固件先在
+\code{0x001efffc--0x001effff} 写入 32 位返回地址 \code{0x00000300}，再让 SP 指向这
+个字。任务最终执行 \code{RET} 时，处理器读取 \code{MEM32[SP]} 作为新 PC，并把 SP 增加
+4，于是控制流回到固件返回入口。
+
+\begin{center}
+\begin{tikzpicture}[x=1cm,y=0.72cm]
+\draw[BookRule,thick] (0,0) rectangle (8,4.1);
+\draw[BookRule] (0,1.1) -- (8,1.1);
+\draw[BookRule] (0,2.2) -- (8,2.2);
+\draw[BookRule] (0,3.3) -- (8,3.3);
+\node[anchor=west] at (0.2,3.7) {\code{0x001f0000}：栈区上界，不属于栈中有效字};
+\node[anchor=west] at (0.2,2.75) {\code{0x001efffc}：\code{0x00000300}，固件返回地址};
+\node[anchor=west] at (0.2,1.65) {\code{0x001efff8}：后续调用可使用};
+\node[anchor=west] at (0.2,0.55) {\code{0x001ec000}：栈区下界};
+\draw[flow] (9.4,2.75) -- (8.05,2.75);
+\node[anchor=west] at (9.5,2.75) {初始 SP};
+\draw[->,>=Latex,BookMuted,thick] (8.8,1.7) -- (8.8,0.5);
+\node[anchor=west,font=\footnotesize] at (9.0,1.1) {压栈方向};
+\end{tikzpicture}
+\end{center}
+\diagramnote{向下增长表示压入新内容时 SP 减小。栈区上界本身是开区间；预置返回地址占用
+上界下方最后 4 字节。}
+
+\subsection{为什么入口地址必须最后提交}
+
+建立初始现场的安全顺序是：
+
+\begin{enumerate}
+\item 确认装入记录处于“可移交”；
+\item 停止接收本次映像，避免后续字节继续改写任务区；
+\item 写入输入数据、结果初值和零填充区；
+\item 建立任务栈并写入固件返回地址；
+\item 设置通用寄存器和 SP；
+\item 最后把 PC 改为任务入口。
+\end{enumerate}
+
+前五步仍在固件指令流中执行。第六步一旦提交，下一次取指来自任务区域，固件就不能继续
+执行“还有一步初始化”。因此 PC 的改变是控制权移交的提交边界。
+
+\begin{center}
+\begin{tikzpicture}[node distance=10mm and 8mm]
+\node[stage,minimum width=2.5cm] (loaded) {映像已验证};
+\node[stage,minimum width=2.6cm,right=of loaded] (memory) {数据与栈已建立};
+\node[stage,minimum width=2.6cm,right=of memory] (regs) {参数寄存器已写入};
+\node[stage,minimum width=2.5cm,right=of regs] (pc) {PC 提交入口};
+\node[stage,minimum width=3.1cm,below=14mm of pc] (task) {任务第一条取指};
+\draw[flow] (loaded) -- (memory);
+\draw[flow] (memory) -- (regs);
+\draw[flow] (regs) -- node[above,font=\scriptsize]{移交点} (pc);
+\draw[flow] (pc) -- (task);
+\end{tikzpicture}
+\end{center}
+\diagramnote{“字节已经在 RAM 中”和“任务已经运行”之间隔着初始现场建立与 PC 提交。
+只有最右侧事件改变取指来源。}
+
+\subsection{移交前后的处理器快照}
+
+移交前，固件可能有如下状态：
+
+\begin{lstlisting}
+PC = 0x000002d8       SP = 0x001ffec0
+r0 = load_record_ptr r1 = checksum_so_far
+r2 = 0x40000000      r3 = temporary value
+\end{lstlisting}
+
+移交完成后的第一条任务指令开始前，状态必须变为：
+
+\begin{lstlisting}
+PC = 0x00100000       SP = 0x001efffc
+r0 = 0x00102000       r1 = 4
+r2 = 0x00102020       r3 = 0
+r4 = 0                r5 = 0
+r6 = 0                r7 = 0
+\end{lstlisting}
+
+这两个快照说明“切换”不能只描述为跳转。至少有 PC、SP、参数寄存器和清理后的临时寄存器
+发生变化。当前固件不需要保存自己的全部现场，因为任务返回后固件进入一个固定返回入口，
+而不是回到 \code{0x000002d8} 继续原函数。下一章需要暂停并继续不同任务时，保存现场的
+要求会更严格。

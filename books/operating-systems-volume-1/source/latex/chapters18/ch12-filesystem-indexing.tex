@@ -1,0 +1,1417 @@
+\begin{filesystemlayout}
+
+\chapter{文件身份、空间索引与路径命名}
+\begin{keyidea}
+文件内容可以移动，文件名可以改变，同一个文件还可以拥有多个名字。因此，位置、身份和
+名称不能由同一个字段承担。本章先建立稳定的文件身份，再从文件增长问题推导块映射，
+从大量名字的查找问题推导目录索引，最后说明 VFS 如何把这些持久对象接入统一接口。
+\end{keyidea}
+
+\fsdivision{inode 记录与文件生命周期}
+\label{sec:inode-deep}
+
+\fstopic{文件为什么需要独立于名字和位置的身份}
+
+先设想只用目录项保存“文件名、长度和全部数据块号”。这种做法在一个名字对应一个小文件
+时可以工作；一旦文件改名，整份记录就要移动；一旦建立硬链接，两份目录记录又会重复保存
+权限、长度和块映射。此后修改文件时，系统无法判断哪一份记录才是权威状态。
+
+解决办法是把“文件本身的稳定记录”从“用户看到的名字”中分离。目录只保存名字到文件
+编号的映射，编号再定位一份独立记录。这样，改名只改变名称关系，硬链接只增加一个名称
+引用，数据块移动也不会改变文件身份。这份按文件编号定位的持久记录就是 inode。
+
+inode 因而不是为了给某个数据块命名，也不是把每个块再切出一部分。文件系统在格式化时
+为 inode 记录保留独立区域；一个 inode 描述一个文件，并把文件内的字节偏移映射到零个或
+多个数据块。空文件已经可以拥有 inode，却不需要数据块；大文件则由一个 inode 管理许多
+数据块。明确这一点之后，inode 中各类字段的职责才容易理解：
+
+\begin{itemize}\tightlist
+\item \textbf{身份}：inode 编号唯一标识文件。
+\item \textbf{类型}：普通文件、目录、符号链接、设备文件……
+\item \textbf{权限}：谁可以读、写、执行。
+\item \textbf{大小}：文件有多少字节。
+\item \textbf{时间戳}：访问、修改、创建、删除时间。
+\item \textbf{数据位置}：通过 \code{i_block[15]} 数组指向数据块。
+\item \textbf{链接计数}：有多少个目录项指向这个 inode。
+\end{itemize}
+
+文件名\emph{不}在 inode 中。文件名在目录文件的数据块中，作为目录项
+的 \code{name} 字段。一个 inode 可以有多个名字（硬链接），也可以
+没有名字但仍然存在（被进程通过 \code{open()} 持有但已从目录中删除）。
+
+\fstopic{ext4 on-disk inode 格式}
+
+下面以简化的 ext4 磁盘 inode 定义说明各字段的偏移和职责：
+
+\begin{lstlisting}[language=C]
+/* ext4 on-disk inode (256 bytes, little-endian) */
+struct ext4_inode {
+    /* --- bytes 0--127: ext2-compatible core --- */
+    __le16  i_mode;            /* +0:  file mode (type + perms)     */
+    __le16  i_uid;             /* +2:  low 16 bits of owner UID     */
+    __le32  i_size_lo;        /* +4:  low 32 bits of size (bytes)  */
+    __le32  i_atime;           /* +8:  last access time             */
+    __le32  i_ctime;           /* +12: inode change time            */
+    __le32  i_mtime;           /* +16: data modification time       */
+    __le32  i_dtime;           /* +20: deletion time                */
+    __le16  i_gid;             /* +24: low 16 bits of group GID     */
+    __le16  i_links_count;    /* +26: hard link count              */
+    __le32  i_blocks_lo;      /* +28: low 32 bits of sector count  */
+    __le32  i_flags;           /* +32: ext4 flags                   */
+    __le32  i_osd1;            /* +36: OS-specific (Linux: version) */
+
+    /* +40: block pointers (60 bytes) */
+    __le32  i_block[15];      /* 12 direct, 1 indirect,            */
+                               /* 1 double indirect, 1 triple       */
+
+    __le32  i_generation;     /* +100: inode version (NFS)         */
+    __le32  i_file_acl_lo;    /* +104: extended attribute block    */
+    __le32  i_size_high;      /* +108: high 32 bits of size        */
+    __le32  i_obso_faddr;     /* +112: obsolete fragment address   */
+
+    /* +116: OS-specific area (12 bytes) */
+    __le16  i_blocks_hi;      /* high 16 bits of i_blocks         */
+    __le16  i_file_acl_hi;    /* high 16 bits of file ACL          */
+    __le16  i_uid_high;       /* high 16 bits of UID              */
+    __le16  i_gid_high;       /* high 16 bits of GID              */
+    __le16  i_checksum_lo;    /* low 16 bits of checksum          */
+    __le16  i_reserved2;      /* reserved                          */
+
+    /* --- bytes 128--255: ext4 extensions --- */
+    __le32  i_ctime_extra;    /* +128: extra ctime (ns precision)  */
+    __le32  i_mtime_extra;    /* +132: extra mtime (ns precision)  */
+    __le32  i_atime_extra;    /* +136: extra atime (ns precision)  */
+    __le32  i_crtime;          /* +140: creation time              */
+    __le32  i_crtime_extra;   /* +144: extra crtime (ns precision) */
+    __le32  i_version_hi;     /* +148: high 32 bits of version    */
+    __le32  i_projid;          /* +152: project ID                  */
+    /* bytes 156--255: checksums, inline data, etc. */
+};
+\end{lstlisting}
+
+\fssubtopic{逐字段深入}
+
+\begin{longtable}{|F{0.15\linewidth}|F{0.10\linewidth}|F{0.65\linewidth}|}
+\hline
+\rowcolor{BookBlueTint}
+\textbf{字段} & \textbf{偏移} & \textbf{含义与设计理由} \\\tablerowrule
+\endhead
+\code{i_mode} & +0 & 16 位。高 4 位是文件类型（\code{S_IFREG}=0100,
+\code{S_IFDIR}=0040, \code{S_IFLNK}=0120 等），低 12 位是权限位
+（rwxrwxrwx + setuid/setgid/sticky）。用 16 位而非 32 位是为了节省空间
+——512 个 inode $\times$ 2 字节 = 1 KiB 节省。 \\\tablerowrule
+\code{i_uid} & +2 & 16 位低部。加上 \code{i_uid_high}（+118）组成 32 位 UID。
+早期 Unix 只有 16 位 UID（最多 65536 用户），足够小型系统。 \\\tablerowrule
+\code{i_size_lo} & +4 & 32 位低部。加上 \code{i_size_high}（+108）组成
+64 位文件大小。ext2 时代 \code{i_size_high} 用于目录（\code{i_dir_acl}），
+ext4 重新定义为大小高位，支持 $> 4$ GiB 文件。 \\\tablerowrule
+\code{i_atime} & +8 & 最后访问时间。32 位 Unix epoch 秒。ext4 扩展
+\code{i_atime_extra} 提供纳秒精度。注意：\code{atime} 更新会产生写 I/O！
+现代系统用 \code{noatime} 挂载选项避免此开销。 \\\tablerowrule
+\code{i_ctime} & +12 & inode 元数据修改时间（改权限、改属主时更新）。
+\code{i_mtime} 是\emph{数据}修改时间（写文件内容时更新）。 \\\tablerowrule
+\code{i_dtime} & +20 & 删除时间。文件被删除时写入此字段。用于恢复工具
+（如 \code{extundelete}）判断文件何时被删。非零意味着此 inode 曾被删除。 \\\tablerowrule
+\end{longtable}
+
+前一组字段描述文件身份、大小和时间；下一组字段描述引用关系、块映射方式和 inode 复用后的识别依据：
+
+\begin{longtable}{|F{0.15\linewidth}|F{0.10\linewidth}|F{0.65\linewidth}|}
+\hline
+\rowcolor{BookBlueTint}
+\textbf{字段} & \textbf{偏移} & \textbf{含义与设计理由} \\\tablerowrule
+\endhead
+\code{i_links_count} & +26 & 硬链接计数。每创建一个硬链接 +1，每删除
+一个 -1。降为 0 时，inode 被释放（位图中对应位清零，数据块回收）。 \\\tablerowrule
+\code{i_blocks_lo} & +28 & \textbf{512 字节扇区数}，不是块数！包括
+间接指针块和扩展属性块。加上 \code{i_blocks_hi}（+116）组成 48 位值。 \\\tablerowrule
+\code{i_flags} & +32 & ext4 特性标志：\code{EXT4_EXTENTS}（使用区段
+树而非经典间接指针）、\code{EXT4_IMMUTABLE_FL}（不可修改）、
+\code{EXT4_APPEND_FL}（仅追加）等。现代 ext4 默认设置
+\code{EXT4_EXTENTS}，此时 \code{i_block[15]} 的含义改变为区段树头。 \\\tablerowrule
+\code{i_block[15]} & +40 & 60 字节的块指针数组。经典模式下：12 直接 +
+1 间接 + 1 双重间接 + 1 三重间接。ext4 区段模式下：存储区段树根。 \\\tablerowrule
+\code{i_generation} & +100 & inode 版本号。每次 inode 被回收再分配时
+递增。NFS 用它检测"这个 inode 号是否还指向原来的文件"（防止
+ABA 问题）。 \\\tablerowrule
+\end{longtable}
+
+\fstopic{i\_block[15]：经典间接指针方案}
+
+当 \code{i_flags} 不包含 \code{EXT4_EXTENTS} 时，\code{i_block[15]}
+使用经典的\textbf{多级间接指针}方案。这是 ext2/ext3 的设计，
+也是理解 inode 数据定位的基础。
+
+15 个 \code{uint32_t} 槽位分为 4 组：
+
+\begin{fspdfdiagram}
+  \node[os title] at (5, 3.5) {i\_block[15] 指针结构};
+
+  % Direct pointers
+  \node[os bit, minimum width=1cm] (d0) at (0, 2) {[0]};
+  \node[os bit, minimum width=1cm] (d1) at (1.1, 2) {[1]};
+  \node[os label] at (2.2, 2) {...};
+  \node[os bit, minimum width=1cm] (d11) at (3.3, 2) {[11]};
+  \node[os small block, minimum width=1.5cm, fill=BookGreenTint] (dd0) at (0, 0.8) {data};
+  \node[os small block, minimum width=1.5cm, fill=BookGreenTint] (dd1) at (1.1, 0.8) {data};
+  \node[os label] at (2.2, 0.8) {...};
+  \node[os small block, minimum width=1.5cm, fill=BookGreenTint] (dd11) at (3.3, 0.8) {data};
+  \draw[os bus] (d0) -- (dd0);
+  \draw[os bus] (d1) -- (dd1);
+  \draw[os bus] (d11) -- (dd11);
+  \node[os label] at (0, -0.2) {12 direct};
+  \node[os label] at (0, -0.7) {$48$ KiB};
+
+  % Single indirect
+  \node[os bit, minimum width=1cm, fill=BookBlueTint] (i12) at (5.5, 2) {[12]};
+  \node[os small block, minimum width=1.5cm, fill=BookBlueTint] (ind) at (5.5, 0.8) {indirect};
+  \draw[os bus] (i12) -- (ind);
+  \node[os small block, minimum width=1.5cm, fill=BookGreenTint] (indd) at (5.5, -0.4) {1024 data};
+  \draw[os bus] (ind) -- (indd);
+  \node[os label] at (5.5, -1.2) {$\sim 4$ MiB};
+
+  % Double indirect
+  \node[os bit, minimum width=1cm, fill=BookAmberTint] (i13) at (8, 2) {[13]};
+  \node[os small block, minimum width=1.5cm, fill=BookAmberTint] (dind) at (8, 0.8) {double};
+  \draw[os bus] (i13) -- (dind);
+  \node[os small block, minimum width=1.5cm, fill=BookBlueTint] (dindd) at (8, -0.4) {$1024 \times$ indirect};
+  \draw[os bus] (dind) -- (dindd);
+  \node[os label] at (8, -1.2) {$\sim 4$ GiB};
+
+  % Triple indirect
+  \node[os bit, minimum width=1cm, fill=BookRedTint] (i14) at (10.5, 2) {[14]};
+  \node[os small block, minimum width=1.5cm, fill=BookRedTint] (tind) at (10.5, 0.8) {triple};
+  \draw[os bus] (i14) -- (tind);
+  \node[os small block, minimum width=1.5cm, fill=BookAmberTint] (tindd) at (10.5, -0.4) {$1024 \times$ double};
+  \draw[os bus] (tind) -- (tindd);
+  \node[os label] at (10.5, -1.2) {$\sim 4$ TiB};
+\end{fspdfdiagram}
+
+\fsdiagramnote{蓝色 = 单重间接，琥珀色 = 双重间接，红色 = 三重间接，绿色 = 数据块。
+每个间接块包含 1024 个 4 字节指针（4096 / 4 = 1024）。颜色越深表示
+间接层级越多、寻址时需要的磁盘读次数越多。}
+
+\fssubtopic{精确容量计算}
+
+块大小 4096 字节，指针 4 字节，每块可容纳 $4096 / 4 = 1024$ 个指针。
+
+\begin{longtable}{|F{0.20\linewidth}|F{0.30\linewidth}|F{0.20\linewidth}|F{0.20\linewidth}|}
+\hline
+\rowcolor{BookBlueTint}
+\textbf{层级} & \textbf{计算} & \textbf{容量（字节）} & \textbf{磁盘读次数} \\\tablerowrule
+\endhead
+12 直接 & $12 \times 4096$ & $49{,}152$ (48 KiB) & 1 \\\tablerowrule
+1 间接 & $1024 \times 4096$ & $4{,}194{,}304$ (4 MiB) & 2 \\\tablerowrule
+1 双重间接 & $1024^2 \times 4096$ & $4{,}294{,}967{,}296$ (4 GiB) & 3 \\\tablerowrule
+1 三重间接 & $1024^3 \times 4096$ & $4{,}398{,}046{,}511{,}104$ (4 TiB) & 4 \\\tablerowrule
+\textbf{总计} & \textbf{以上之和} & $\sim 4$ TiB & 最多 4 \\\tablerowrule
+\end{longtable}
+
+\begin{keyidea}
+多级指针方案的核心权衡是\textbf{查找深度 vs 元数据紧凑性}：小文件
+（$< 48$ KiB）只需 1 次磁盘读（直接指针直达数据），大文件需要 2--4 次。
+由于大多数文件很小（Unix 系统中 $> 90\%$ 的文件 $< 48$ KiB），这种设计
+在实践中非常高效。ext4 的区段（extent）方案进一步优化：用一棵 B+ 树
+替代 15 个指针槽，使连续区域用单个区段描述符表示。
+\end{keyidea}
+
+\fstopic{追踪：读取偏移 5,000,000 处的数据}
+
+假设文件使用了所有四种指针类型。我们追踪读取文件内偏移
+5,000,000 字节处所在的数据块。
+
+\begin{lstlisting}
+目标：读取 byte offset 5,000,000
+
+Step 1: 计算逻辑块号
+  logical_block = 5,000,000 / 4096 = 1220 (整数除法)
+  byte_offset_in_block = 5,000,000 % 4096 = 3120
+
+Step 2: 判断指针层级
+  Direct blocks cover logical 0..11     -> 12 blocks
+  1220 >= 12, so NOT in direct range.
+  offset_in_indirect = 1220 - 12 = 1208
+
+  Single indirect covers logical 12..1035 -> 1024 blocks
+  1208 >= 1024, so NOT in single indirect range.
+  offset_in_double = 1208 - 1024 = 184
+
+  Double indirect covers logical 1036..1,049,611 -> 1,048,576 blocks
+  184 < 1,048,576, so it IS in double indirect range. ✓
+
+Step 3: 读取双重间接块
+  double_indirect_block = read_block(inode.i_block[13])
+  -- DISK READ #1: read the double indirect block
+  -- This block contains 1024 pointers to single indirect blocks
+  -- We need entry index = 184 / 1024 = 0
+
+Step 4: 读取单重间接块
+  indirect_ptr = double_indirect_table[0]  -> block 6000 (example)
+  indirect_block = read_block(6000)
+  -- DISK READ #2: read the single indirect block
+  -- This block contains 1024 pointers to data blocks
+  -- We need entry index = 184 % 1024 = 184
+
+Step 5: 读取数据块
+  physical_block = indirect_table[184]  -> block 8000 (example)
+  data = read_block(8000)
+  -- DISK READ #3: read the actual data block
+  -- The byte we want is at offset 3120 within this block
+
+Result: byte at physical block 8000, offset 3120
+\end{lstlisting}
+
+\fssubtopic{为什么是 3 次磁盘读？}
+
+在没有缓存的情况下，读取这一个数据块需要 3 次磁盘 I/O：
+
+\begin{enumerate}\tightlist
+\item 读双重间接块（\code{i_block[13]} 指向的块）。
+\item 读单重间接块（双重间接块中第 0 项指向的块）。
+\item 读数据块（单重间接块中第 184 项指向的块）。
+\end{enumerate}
+
+如果磁盘是 HDD，每次随机读约需 5--10 ms，则总延迟 15--30 ms。
+如果是 NVMe SSD，每次约 50 $\mu$s，总延迟约 150 $\mu$s。
+
+实际中，Linux 的\textbf{预读}（readahead）机制会提前读取间接块
+周围的数据，以及 inode 所在的整个块组。页缓存也会缓存间接块，
+后续访问同一区域的间接块时不再需要磁盘 I/O。
+
+\begin{warningbox}
+\textbf{别混淆逻辑块和物理块}。逻辑块号 1220 是\emph{文件内的}
+第 1220 个块（从文件头算起）。物理块号 8000 是\emph{磁盘上的}
+第 8000 个块（从磁盘头算起）。inode 的 \code{i_block[]} 数组
+做的正是从逻辑块号到物理块号的映射。这个映射可能不是连续的
+（逻辑块 1220 在物理块 8000，逻辑块 1221 可能在物理块 5000），
+这就是\textbf{碎片化}。
+\end{warningbox}
+
+\fstopic{稀疏文件（Sparse Files）}
+
+当 \code{i_block[]} 中的某个指针为 0 时，意味着该逻辑块\emph{没有被
+分配}。这不是错误——读取该块时，内核返回一个\textbf{全零页}，而不是
+报错。这就是\emph{稀疏文件}（sparse file）的工作原理。
+
+\begin{lstlisting}[language=C]
+// 创建一个稀疏文件：只有块 0 和块 1000 有数据
+int fd = open("sparse.dat", O_CREAT | O_WRONLY, 0644);
+write(fd, "hello", 5);              // 写块 0 (offset 0)
+lseek(fd, 1000 * 4096, SEEK_SET);  // 跳到块 1000
+write(fd, "world", 5);              // 写块 1000
+close(fd);
+
+// inode 的 i_block[] 状态:
+// i_block[0] = 68        (块 0 有数据)
+// i_block[1..11] = 0     (块 1-11 是 "hole", 未分配)
+// i_block[12] = 5000     (间接块, 指向块 1000 的间接指针)
+//   间接块中: entry[988] = 70  (块 1000 的物理块号)
+//   间接块中: entry[0..987] = 0  (块 12-999 是 hole)
+//
+// 磁盘实际占用: 3 块 (块 0 的数据 + 间接块 + 块 1000 的数据)
+// 逻辑大小: 1001 * 4096 + 5 = 4,102,405 字节
+// 实际占用: 3 * 4096 = 12,288 字节 (节省 99.7%)
+
+// 读取 hole 区域:
+char buf[4096];
+lseek(fd, 500 * 4096, SEEK_SET);   // 偏移在 hole 中间
+read(fd, buf, 4096);                // 返回全零页, 不产生磁盘 I/O!
+// 内核发现 i_block[] 指针 = 0, 直接返回 zero-filled page
+\end{lstlisting}
+
+在经典间接指针表示中，\code{i_block[]} 的 0 指针表示相应逻辑块尚未分配，
+读取结果按零填充。这个区间称为 hole。读取 hole 无须读取数据块；写入其中某一段时，
+文件系统才为相应范围分配物理空间。虚拟机镜像和数据库文件常利用这一性质表示
+逻辑容量很大、实际写入范围较小的文件。
+
+\fstopic{inode 表的布局}
+
+inode 表是一段连续的磁盘块区域，存储所有 inode 的 on-disk 记录。
+每个 inode 256 字节，每个块 4096 字节，因此每个块容纳
+$4096 / 256 = 16$ 个 inode。
+
+\begin{lstlisting}
+inode 表布局 (blocks 11--42, 32 blocks, 512 inodes):
+
+Block 11:  inode 0    inode 1    inode 2    ... inode 15
+Block 12:  inode 16   inode 17   inode 18   ... inode 31
+Block 13:  inode 32   inode 33   inode 34   ... inode 47
+  ...
+Block 42:  inode 496  inode 497  inode 498  ... inode 511
+
+inode N 的位置:
+  block  = inode_table_start + N / 16
+         = 11 + N / 16
+  offset = (N % 16) * 256
+
+例: inode 5
+  block  = 11 + 5 / 16 = 11 + 0 = 11
+  offset = (5 % 16) * 256 = 5 * 256 = 1280
+
+  inode 5 位于块 11 的字节偏移 1280 (0x500)
+\end{lstlisting}
+
+\begin{warningbox}
+ext2 中 inode 编号从 1 开始（inode 0 无效），但 inode 表在磁盘上
+从偏移 0 开始存储。因此 inode 1 在表偏移 0，inode N 在表偏移
+$(N-1) \times \text{inode\_size}$。MDFS 为了简化教学，让 inode N
+在表偏移 $N \times \text{inode\_size}$，即 inode 1 在偏移 256。
+真实 ext2/ext4 中需要减 1。
+\end{warningbox}
+
+\fstopic{硬链接与符号链接}
+
+\fssubtopic{硬链接}
+
+硬链接（hard link）是\emph{目录中的一个额外条目}，指向一个已存在的
+inode 编号。创建硬链接不创建新 inode，而是：
+
+\begin{enumerate}\tightlist
+\item 在目标目录的数据块中追加一个 dirent，\code{inode} 字段填为
+  被链接文件的 inode 编号，\code{name} 填为新名字。
+\item 将被链接文件的 \code{i_links_count} 加 1。
+\end{enumerate}
+
+\begin{lstlisting}[language=C]
+// 创建硬链接
+link("/foo", "/bar");
+// 效果:
+//   /foo 的目录项: inode=5, name="foo"
+//   /bar 的目录项: inode=5, name="bar"  (新增)
+//   inode 5 的 i_links_count: 1 -> 2
+//
+// 删除 /foo:
+unlink("/foo");
+//   /foo 的目录项被删除 (inode=0, rec_len 合并)
+//   inode 5 的 i_links_count: 2 -> 1
+//   inode 5 不被释放 (links_count > 0)
+//
+// 删除 /bar:
+unlink("/bar");
+//   /bar 的目录项被删除
+//   inode 5 的 i_links_count: 1 -> 0
+//   inode 5 被释放! 数据块回收, inode 位图清零
+\end{lstlisting}
+
+\fssubtopic{符号链接}
+
+符号链接（symbolic link, symlink）是一个\emph{独立的文件}，其
+\code{i_mode} 为 \code{S_IFLNK}。文件内容是\emph{目标路径的字符串}。
+
+\begin{lstlisting}[language=C]
+// 创建符号链接
+symlink("/foo", "/baz");
+// 效果:
+//   分配新 inode 6
+//   inode 6: i_mode = S_IFLNK | 0777
+//   inode 6: i_links_count = 1
+//   inode 6: 数据 = "/foo" (4 bytes, 存在 i_block[] 内联)
+//
+// 路径解析 open("/baz"):
+//   1. dir_lookup(root, "baz") -> inode 6
+//   2. read inode 6: i_mode = S_IFLNK
+//   3. read symlink data: "/foo"
+//   4. 重新解析 open("/foo")
+//   5. dir_lookup(root, "foo") -> inode 5
+//   6. open inode 5
+
+// 删除 /foo 后:
+unlink("/foo");
+//   inode 5 被释放 (links_count -> 0)
+//   /baz 仍然存在, 但指向一个不存在的路径 -> "dangling symlink"
+\end{lstlisting}
+
+\fssubtopic{对比}
+
+\begin{longtable}{|F{0.15\linewidth}|F{0.38\linewidth}|F{0.38\linewidth}|}
+\hline
+\rowcolor{BookBlueTint}
+\textbf{方面} & \textbf{硬链接} & \textbf{符号链接} \\\tablerowrule
+\endhead
+实现 & 目录项指向同一 inode 编号 & 独立 inode，内容为目标路径字符串 \\\tablerowrule
+inode & 与原文件共享同一 inode & 有自己的 inode \\\tablerowrule
+\code{i_links_count} & 创建时 +1 & 新 inode 的 links\_count = 1 \\\tablerowrule
+原文件删除 & 数据不丢（links\_count $> 0$） & 链接悬空（dangling） \\\tablerowrule
+跨文件系统 & 不行（inode 号是 FS 局部的） & 可以（只是路径字符串） \\\tablerowrule
+链接到目录 & 通常禁止（防止循环） & 允许 \\\tablerowrule
+路径解析 & 直接找到 inode（1 次 lookup） & 需读链接内容、重新解析（2+ 次 lookup） \\\tablerowrule
+ inode 大小 & 无额外空间（仅目录项） & 需要新 inode + 路径字符串 \\\tablerowrule
+\end{longtable}
+
+\begin{keyidea}
+硬链接和符号链接代表了两种不同的\textbf{引用模型}：硬链接是
+\emph{物理引用}（直接指向存储对象的编号），符号链接是\emph{逻辑引用}
+（通过路径名间接指向）。硬链接的代价是不能跨文件系统、不能链接目录；
+符号链接的代价是解析时有额外开销，且原文件移动/删除后链接失效。
+Unix 的设计哲学是同时提供两种机制，让用户根据场景选择。
+\end{keyidea}
+
+\fstopic{inode 分配：Orlov 分配器}
+
+ext2/ext3/ext4 面临一个经典问题：新创建的 inode 应该放在 inode 表的
+哪个位置？这个决策影响\textbf{数据局部性}（data locality）——如果
+同一目录下的文件 inode 被放在相邻的块组（block group）中，读取这些
+文件时磁头移动更少。
+
+ext4 默认使用 \emph{Orlov 分配器}（由 Grigory Orlov 提出），其策略是：
+
+\begin{enumerate}\tightlist
+\item \textbf{目录分散}：新目录应分散到不同块组，避免同一块组中出现
+  过多目录（目录会产生大量子文件，导致该块组 inode 和数据块耗尽）。
+  Orlov 倾向于选择\emph{空闲 inode 和空闲块最多}的块组。
+\item \textbf{文件聚集}：新文件应与父目录在\emph{同一块组}中。这样，
+  遍历目录时的 I/O 集中在一个块组内，磁头移动最小。
+\end{enumerate}
+
+\begin{lstlisting}
+Orlov 策略示意:
+
+Block Group 0          Block Group 1          Block Group 2
++-----------------+    +-----------------+    +-----------------+
+| inode: root/    |    | inode: /docs/   |    | inode: /media/  |
+|        /src/    |    |       /docs/a   |    |       /media/x  |
+|        /src/a   |    |       /docs/b   |    |       /media/y  |
+|        /src/b   |    |       /docs/c   |    |       /media/z  |
++-----------------+    +-----------------+    +-----------------+
+
+/root 和 /src 在 BG0; /docs 及其文件在 BG1; /media 及其文件在 BG2
+目录分散到不同 BG; 文件与父目录同 BG
+\end{lstlisting}
+
+Orlov 的核心启发式：\emph{目录是"重"的}（会产生大量子文件），应分散；
+\emph{文件是"轻"的}（不会产生子节点），应聚集。这种"重者散、轻者聚"
+的策略在大规模文件系统上显著减少了碎片化和寻道开销。
+
+\begin{warningbox}
+ext4 默认启用 \code{EXT4_EXTENTS} 标志（\code{i_flags} 中），此时
+\code{i_block[15]} 不再是 12+1+1+1 的经典指针方案，而是存储一棵
+\emph{区段树}（extent tree）的根节点。区段树用一个
+\code{(logical_block, length, physical_block)} 三元组描述一段连续
+的物理块，大幅减少了大文件的元数据开销。经典间接指针方案仅在不支持
+区段的旧文件系统中使用。但理解经典方案对于理解 inode 的设计哲学
+仍然至关重要——它是区段方案的前身和对照。
+\end{warningbox}
+% ============================================================
+% 文件系统：从磁盘字节到现代设计  (第 5–8 节)
+% ============================================================
+
+\fsdivision{文件偏移到数据块：从指针到 extent 树}
+
+\fstopic{问题：间接指针的大文件代价}
+
+经典的 UNIX 文件系统（ext2、UFS）在 inode 中保存若干
+\emph{直接指针}、一个\emph{单间接指针}、一个\emph{双间接指针}和一个
+\emph{三间接指针}。对小文件这足够了，但当文件增大时，
+随机访问一个偏移需要多次磁盘 I/O 才能定位数据块。
+
+考虑一个 1~GiB 的文件。在 4~KiB 块、4 字节指针的前提下：
+直接指针只能覆盖前 12 个块（48~KiB），其余都要走间接。
+在 inode 已经驻留内存而间接块均未缓存时，双间接区要读取 2 个间接块，三间接区要读取 3 个间接块，然后才能读取数据块。对 HDD，这些元数据若分散在不同位置，机械寻道会显著放大延迟；具体数值取决于缓存命中、布局和设备，不能用一个固定毫秒数代表。
+
+\begin{warningbox}
+间接指针的本质缺陷：\emph{元数据散布在许多不连续的磁盘块中}。
+一个 100~MiB 的文件需要 25 个间接块，它们随机散布在磁盘各处，
+导致寻道时间随文件大小线性增长。
+\end{warningbox}
+
+\fstopic{各级指针的精确容量}
+
+设块大小 $B = 4096$ 字节，指针宽度 $P = 4$ 字节。
+一个间接块可容纳的指针数为：
+\[
+N = \frac{B}{P} = \frac{4096}{4} = 1024 \quad\text{（个 uint32 指针）}
+\]
+
+各级指针的覆盖范围如下表所示。
+
+\begin{longtable}{|F{0.20\linewidth}|F{0.22\linewidth}|F{0.26\linewidth}|F{0.22\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+\textbf{指针级别} & \textbf{指针数} & \textbf{覆盖块数} & \textbf{覆盖字节} \\
+\midrule
+直接（12 个）       & 12          & 12                & 48~KiB \\\tablerowrule
+单间接（1 个）       & 1024        & 1024              & 4~MiB \\\tablerowrule
+双间接（1 个）       & $1024^2$    & 1\,048\,576        & 4~GiB \\\tablerowrule
+三间接（1 个）       & $1024^3$    & 1\,073\,741\,824   & 4~TiB \\
+\bottomrule
+\end{longtable}
+
+{\par\noindent\textbf{表 5.1：ext2 inode 各级指针容量（4~KiB 块、4 字节指针）。}\par}
+
+注意双间接理论上可覆盖 4~GiB，但 ext2 inode 的
+\code{i\_size} 字段限制了实际最大文件。真正的大文件落在三间接区，
+随机读需要读 3 个间接块再读数据块 = 4 次 I/O。
+
+\fstopic{追踪：在双间接区读取偏移 5\,000\,000}
+
+给定文件偏移 \code{offset = 5\,000\,000} 字节，块大小 4096：
+
+\begin{lstlisting}
+logical_block = 5000000 / 4096 = 1220   // 落在双间接区
+// 直接区: 0..11, 单间接区: 12..1035, 双间接区: 1036..(1036+1024*1024-1)
+// 1220 在双间接区: index_into_double = 1220 - 1036 = 184
+//   first_level_index  = 184 / 1024 = 0
+//   second_level_index = 184 % 1024 = 184
+\end{lstlisting}
+
+逐步追踪：
+
+\begin{enumerate}\tightlist
+\item \code{logical\_block = 1220}，落在双间接区（1036 起）。
+\item inode 已在内存中，其 \code{block[13]} 给出双重间接根块号 6000；读取块 6000（第 1 次 I/O）。
+\item 在块 6000 中取索引 0 的指针得到二级间接块号 7000；读取块 7000（第 2 次 I/O）。
+\item 在块 7000 中取索引 184 的指针得到数据块号 8000。
+\item 读块 8000 $\rightarrow$ 数据。
+\item \textbf{总计：2 次间接块 I/O + 1 次数据读 = 3 次 I/O}（inode 已在内存、间接块均未缓存时）。若连 inode 所在磁盘块也未缓存，还需另计读取 inode 的 I/O。
+\end{enumerate}
+
+\begin{fspdfdiagram}
+% inode
+\node[os small block, os memory] (ino) {inode};
+\node[os small block, os memory, below=0.3cm of ino] (d13) {block[13]};
+% level1
+\node[os small block, os compute, below=0.8cm of d13, xshift=-2.5cm] (l1) {块 6000\\[2pt]\footnotesize idx 0};
+% level2
+\node[os small block, os compute, below=0.8cm of l1] (l2) {块 7000\\[2pt]\footnotesize idx 184};
+% data
+\node[os small block, os memory, below=0.8cm of l2, fill=BookGreenTint, draw=BookTeal] (d) {块 8000\\[2pt]\footnotesize 数据};
+\draw[os bus] (d13) -- (l1);
+\draw[os bus] (l1) -- (l2);
+\draw[os bus] (l2) -- (d);
+\node[os label, right=0.2cm of l1] {I/O \#1};
+\node[os label, right=0.2cm of l2] {I/O \#2};
+\node[os label, right=0.2cm of d] {I/O \#3};
+\end{fspdfdiagram}
+\fsdiagramnote{双间接读偏移 5\,000\,000 的三次 I/O 链：两个间接块加一个数据块。实际延迟由缓存命中、介质与队列状态决定。}
+
+\fstopic{间接指针的问题总结}
+
+\begin{itemize}\tightlist
+\item \textbf{元数据膨胀}：100~MiB 文件需要 $\lceil(100 \times 1024 / 4)\rceil = 25600$
+  个数据块，其中间接块约 25 个（每 1024 个数据块 1 个间接块），
+  共 $25 \times 4 = 100$~KiB 纯元数据。
+\item \textbf{随机访问延迟}：三间接读在最坏的无缓存路径上需要 3 次间接块 I/O 加 1 次数据 I/O；SSD 消除了机械寻道，但没有消除额外请求、队列和控制器处理成本。
+\item \textbf{元数据碎片化}：间接块本身可能不连续，进一步加剧寻道。
+\item \textbf{无范围信息}：无法高效表达"这 1000 个块连续"，
+  导致 \code{FIEMAP} 类查询效率低。
+\end{itemize}
+
+\fstopic{Extent：用 $(\text{start}, \text{length})$ 表达连续性}
+
+\begin{keyidea}
+Extent 把"一个数据块指针"升级为"一段连续数据块的描述"：
+一个 extent 记录 \code{(logical\_block, start\_block, length)}，
+能覆盖任意长的连续区域。100~MiB 的连续文件只需 1 个 extent = 12 字节，
+而间接指针方案需要 25 个间接块 = 100~KiB 元数据。
+\end{keyidea}
+
+\fstopic{ext4 extent 的字段组织}
+
+\begin{lstlisting}
+// 叶子节点中的 extent：描述一段连续物理块
+struct ext4_extent {
+    __le32 ee_block;       // 逻辑块号（文件内偏移）
+    __le16 ee_len;         // 覆盖的块数（最多 32768）
+    __le16 ee_start_hi;    // 物理起始块高 16 位
+    __le32 ee_start_lo;    // 物理起始块低 32 位
+};
+
+// 索引节点：指向子节点（另一 extent 块）
+struct ext4_extent_idx {
+    __le32 ei_block;       // 此索引覆盖的逻辑块号下界
+    __le32 ei_leaf_lo;     // 子节点块号低 32 位
+    __le16 ei_leaf_hi;     // 子节点块号高 16 位
+    __u16   ei_unused;     // 保留
+};
+
+// 每个 extent 块（含 inode 内联）的头部
+struct ext4_extent_header {
+    __le16 eh_magic;       // 0xF30A，标识 extent
+    __le16 eh_entries;     // 实际条目数
+    __le16 eh_max;         // 最大条目数
+    __le16 eh_depth;       // 0=叶子，1=一层索引，2=两层
+    __le16 eh_generation;  // 用于一致性校验
+};
+\end{lstlisting}
+
+inode 尾部的 60 字节（\code{i\_block[15]}）内联一个 extent header + 4 个 extent。
+\code{eh\_depth=0} 时这 4 个 extent 直接描述数据；文件更大时 \code{eh\_depth=1}，
+内联区变为 4 个 \code{ext4\_extent\_idx}，每个指向一个叶子块；
+再大则 \code{eh\_depth=2}，极端情况可覆盖 $\sim$~4~PiB。
+
+\fstopic{Extent 树结构}
+
+\begin{fspdfdiagram}
+% root (inode inline)
+\node[os small block, os memory] (root) {inode 内联 header (depth=1)};
+\node[os small block, os compute, below=0.6cm of root, xshift=-3.6cm] (i0) {idx[0] blk 0};
+\node[os small block, os compute, below=0.6cm of root] (i1) {idx[1] blk 1024};
+\node[os small block, os compute, below=0.6cm of root, xshift=3.6cm] (i2) {idx[2] blk 2048};
+% leaves
+\node[os small block, os memory, below=1.0cm of i0] (l0) {叶块 9000};
+\node[os small block, os memory, below=1.0cm of i1] (l1) {叶块 9500};
+\node[os small block, os memory, below=1.0cm of i2] (l2) {叶块 10000};
+\draw[os bus] (root.south) -- (i0.north);
+\draw[os bus] (root.south) -- (i1.north);
+\draw[os bus] (root.south) -- (i2.north);
+\draw[os bus] (i0) -- (l0);
+\draw[os bus] (i1) -- (l1);
+\draw[os bus] (i2) -- (l2);
+\node[os label, below=0.05cm of l0] {ext: (0, 8000, 1024)};
+\node[os label, below=0.05cm of l1] {ext: (1024, 12000, 1024)};
+\node[os label, below=0.05cm of l2] {ext: (2048, 16000, ...)};
+\end{fspdfdiagram}
+\fsdiagramnote{ext4 extent 树。根内联于 inode，depth=1 时指向若干叶块。}
+
+\fstopic{追踪：在 depth=1 树中查找逻辑块 1500}
+
+前提：inode 内联 header \code{depth=1}，有 3 个索引条目。
+
+\begin{enumerate}\tightlist
+\item 读内联 header：\code{depth=1}，3 个 \code{ext4\_extent\_idx}。
+\item 二分查找：
+  \code{ei[0].block=0}，\code{ei[1].block=1024}，\code{ei[2].block=2048}。
+  1500 落在 $[1024, 2048)$，即 \code{ei[1]}。
+\item 读 \code{ei[1].leaf} $\rightarrow$ 叶块 9000。
+\item 块 9000 header：\code{depth=0}，2 个 extent：
+  \code{ext[0]=\{block=1024, start=8000, len=1024\}}，
+  \code{ext[1]=\{block=2048, start=12000, ...\}}。
+\item 1500 落在 \code{ext[0]}：物理块 $= 8000 + (1500 - 1024) = 8476$。
+\item \textbf{总计：1 次 I/O（叶块）+ 1 次数据读 = 2 次 I/O}。
+\end{enumerate}
+
+对比：在 inode 驻留内存且元数据均未缓存时，双间接方案需要 2 次间接块 I/O，extent 树在这个示例里只需读取 1 个叶块，
+因为内联 header 不需要 I/O，而索引层只多一层。
+
+\fstopic{Extent 的分裂与合并}
+
+\begin{itemize}\tightlist
+\item \textbf{合并}：当新写入恰好紧接在已有 extent 末尾
+  （逻辑块连续、物理块连续），直接把 \code{ee\_len} 加 1，不新增条目。
+\item \textbf{分裂}：当 extent 块已满（\code{eh\_entries == eh\_max}），
+  需要分裂：把一半条目移到新块，在父层插入新索引。若父层也满，递归分裂。
+\item \textbf{延迟分裂}：ext4 默认不立即分裂，
+  先尝试在现有 extent 上扩展 \code{ee\_len}，减少树高度。
+\end{itemize}
+
+\fstopic{Extent 树中的洞}
+
+两个 extent 之间的逻辑块间隙即为\emph{洞}（hole）。
+读洞时返回零页——ext4 不为洞分配物理块。
+\code{FIEMAP} ioctl 返回 \code{FIEMAP\_EXTENT\_UNKNOWN} 标志标记洞。
+写入洞的某个偏移时，ext4 分配块并在 extent 树中插入新条目。
+
+\fstopic{XFS B+ 树：无历史包袱的设计}
+
+XFS 从设计之初就以 B+ 树为映射结构，没有间接指针的历史包袱。
+其 extent 讑录格式更简洁：
+
+\begin{lstlisting}
+// XFS B+ tree 叶子节点（extent 记录）
+struct xfs_bmbt_rec {
+    __be64 br_startoff;   // 逻辑块号
+    __be64 br_startblock; // 物理块号
+    __be64 br_blockcount; // 块数
+};
+// 内部节点：键 + 指针
+struct xfs_bmbt_key { __be64 br_startoff; };
+struct xfs_bmbt_ptr  { __be64 br_startblock; };
+\end{lstlisting}
+
+XFS 的 B+ 树是真正的平衡树：插入/删除后自动调整高度与分裂/合并，
+而 ext4 extent 树的深度在多数文件上固定为 0--2。
+XFS 的优势在于\emph{动态伸缩}：小文件 1 层即可，
+超大文件自动增到 3--4 层，查找代价始终 $O(\log n)$。
+
+\fstopic{映射方案对比}
+
+\begin{longtable}{|F{0.20\linewidth}|F{0.24\linewidth}|F{0.24\linewidth}|F{0.20\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+\textbf{方案} & \textbf{元数据大小（100~MiB 连续文件）} & \textbf{查找复杂度} & \textbf{碎片化倾向} \\
+\midrule
+ext2 间接指针  & $\sim$~100~KiB（25 间接块）  & $O(\text{层数})$，最多 4 I/O & 高 \\\tablerowrule
+ext4 extent   & 12 字节（1 extent）          & $O(\log n)$，1--2 I/O        & 低 \\\tablerowrule
+XFS B+ 树     & $\sim$~24 字节（1 叶记录）   & $O(\log n)$，严格平衡        & 最低 \\
+\bottomrule
+\end{longtable}
+
+{\par\noindent\textbf{表 5.2：三种块映射方案的定量对比。}\par}
+
+% ============================================================
+\fsdivision{空闲空间、块组与分配局部性}
+
+\fstopic{分配问题}
+
+当 \code{write()} 写入新数据时，文件系统必须决定\emph{把新块放在磁盘哪里}。
+看似简单的选择，却影响三个关键指标：
+
+\begin{itemize}\tightlist
+\item \textbf{连续性}：连续布局使预读和顺序读受益，HDD 上减少寻道。
+\item \textbf{空间利用率}：低碎片化意味着空闲空间可被大请求复用。
+\item \textbf{分配延迟}：\code{write()} 路径上的分配必须快——它是热路径。
+\item \textbf{局部性}：数据块应靠近其 inode 和同目录的其他文件，
+  使目录遍历（如 \code{ls -R}）时的寻道最小。
+\end{itemize}
+
+这些目标常常冲突：best-fit 减少碎片但扫描慢；
+first-fit 快但可能产生外部碎片。现代文件系统用多层策略逼近帕累托前沿。
+
+\fstopic{Bitmap 分配}
+
+最朴素的方案：每个块用 1 bit 标记空闲（0=空闲，1=已用）。
+1~GiB 磁盘、4~KiB 块：
+
+\[
+\text{块数} = \frac{1\,\text{GiB}}{4\,\text{KiB}} = 262\,144
+\quad\Rightarrow\quad
+\text{bitmap 字节} = \frac{262\,144}{8} = 32\,768\,\text{B} = 32\,\text{KiB}
+\]
+
+即 8 个块大小的 bitmap。分配时扫描 bitmap 找第一个 0 bit，
+复杂度 $O(n)$（$n$ 为块数）。对 1~TiB 磁盘，bitmap 达 32~MiB，
+全扫描不可接受，因此实际中 bitmap 按块组分区，配合缓存与索引。
+
+\fstopic{first-fit / best-fit / worst-fit}
+
+\begin{longtable}{|F{0.15\linewidth}|F{0.27\linewidth}|F{0.27\linewidth}|F{0.19\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+\textbf{策略} & \textbf{规则} & \textbf{碎片化} & \textbf{速度} \\
+\midrule
+first-fit  & 选第一个足够大的空闲区 & 中等，外部碎片在前部 & 快 \\\tablerowrule
+best-fit   & 选最小的足够大空闲区   & 低内部碎片，高外部碎片 & 慢（全扫描） \\\tablerowrule
+worst-fit  & 选最大的空闲区         & 高（浪费大区）        & 慢 \\
+\bottomrule
+\end{longtable}
+
+{\par\noindent\textbf{表 6.1：三种经典分配策略。}\par}
+
+\textbf{first-fit 追踪}（空闲区链表：[0--31], [40--71], [80--95]，请求 8 块）：
+选 [0--31] 的前 8 块 $\rightarrow$ 剩 [8--31]。
+下次请求 28 块：[8--31] 只有 24 不够 $\rightarrow$ 跳到 [40--71]，分走 28，剩 [68--71]。
+外部碎片出现在前部。
+
+\textbf{best-fit 追踪}（同上，请求 8 块）：
+扫描全部：[0--31](32)、[40--71](32)、[80--95](16)。8 最接近 16，
+选 [80--95]，分 8 块 $\rightarrow$ 剩 [88--95](8)。
+碎片被挤到小区域，但每次都要全扫描。
+
+\fstopic{Buddy 分配器}
+
+Buddy 系统把空闲空间按 $2^k$ 大小组织。分配请求 $m$ 块时向上取整到
+$2^{\lceil\log_2 m\rceil}$，递归分裂更大的块。
+
+\textbf{追踪}：初始一个 64 块的空闲区，请求 4 块：
+
+\begin{lstlisting}
+free[6] = {64}        // 只有 1 个大小为 64 的区
+请求 4 块:
+  分裂 64 -> 32 + 32,  选第一个 32
+  分裂 32 -> 16 + 16,  选第一个 16
+  分裂 16 -> 8  + 8,   选第一个 8
+  分裂 8  -> 4  + 4,   选第一个 4  -> 分配
+free[3] = {4}          // 剩下的 4
+free[4] = {8}          // 剩下的 8
+free[5] = {16}         // 剩下的 16
+free[6] = {32}         // 剩下的 32
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+\node[os small block, os memory, minimum width=8cm] (a) {64 块空闲};
+\node[os small block, os memory, minimum width=4cm, below=0.3cm of a.south west, anchor=north west] (b1) {32};
+\node[os small block, os compute, minimum width=4cm, below=0.3cm of a.south east, anchor=north east] (b2) {32};
+\node[os small block, os memory, minimum width=2cm, below=0.3cm of b1.south west, anchor=north west] (c1) {16};
+\node[os small block, os compute, minimum width=2cm, below=0.3cm of b1.south east, anchor=north east] (c2) {16};
+\node[os small block, os memory, minimum width=1cm, below=0.3cm of c1.south west, anchor=north west] (d1) {8};
+\node[os small block, os compute, minimum width=1cm, below=0.3cm of c1.south east, anchor=north east] (d2) {8};
+\node[os small block, fill=BookGreenTint, draw=BookTeal, minimum width=0.5cm, below=0.3cm of d1.south west, anchor=north west] (e1) {4 分配};
+\node[os small block, os memory, minimum width=0.5cm, below=0.3cm of d1.south east, anchor=north east] (e2) {4};
+\end{fspdfdiagram}
+\fsdiagramnote{Buddy 分配器：64 块区为服务 4 块请求，分裂 3 次，产生 3 个"伙伴"空闲块。}
+
+Buddy 优势：合并 $O(1)$（释放时检查伙伴是否也空闲），
+但内部碎片高：请求 5 块也要分 8 块。
+ext4 的 \code{mballoc} 在 buddy 之上做了多块优化。
+
+\fstopic{ext2 块组}
+
+ext2 把磁盘分成\emph{块组}（block group），每组约 32768 个块
+（4~KiB 块时 $\sim$~128~MiB/组）。每组内部布局：
+
+\begin{fspdfdiagram}
+\node[os small block, os compute, minimum width=1.4cm] (sb) {超级块\\备份};
+\node[os small block, os memory, minimum width=1.2cm, right=0pt of sb] (bg) {组描述};
+\node[os small block, os compute, minimum width=1.6cm, right=0pt of bg] (bb) {块 bitmap};
+\node[os small block, os compute, minimum width=1.6cm, right=0pt of bb] (ib) {inode\\bitmap};
+\node[os small block, os memory, minimum width=1.8cm, right=0pt of ib] (it) {inode\\表};
+\node[os small block, fill=BookGreenTint, draw=BookTeal, minimum width=3.5cm, right=0pt of it] (db) {数据块};
+\node[os label, below=0.1cm of sb] {组 0};
+\node[os label, below=0.1cm of db] {$\sim$~128~MiB};
+\end{fspdfdiagram}
+\fsdiagramnote{ext2 块组布局。元数据与数据同居一组，利于 HDD 局部性。}
+
+\begin{keyidea}
+块组的三大设计理由：
+\begin{enumerate}\tightlist
+\item \textbf{局部性}：inode 与其数据块在同一组内，目录遍历寻道小。
+\item \textbf{并行性}：不同组可被不同 CPU 并行分配（各组有独立 bitmap锁）。
+\item \textbf{故障隔离}：一个组 bitmap 损坏不影响其他组。
+\end{enumerate}
+\end{keyidea}
+
+\fstopic{ext4 mballoc：多块分配器}
+
+ext4 的 \code{mballoc}（multi-block allocator）在块组之上叠加多层策略：
+
+\begin{itemize}\tightlist
+\item \textbf{Buddy bitmap}：每组维护 buddy 结构，
+  查找连续 $2^k$ 块的代价 $O(\log(\text{组内块数}))$ 而非 $O(n)$。
+\item \textbf{Locality group（局部性组）}：尝试把同一 inode 的数据
+  和同目录的新文件分配到同一组。
+\item \textbf{Preallocation（预分配）}：对正在增长的文件，
+  预留 8--32~KiB 连续块，使后续 \code{write()} 直接命中预留区。
+\item \textbf{Goal（目标）}：记录上次分配的最后块号，
+  新分配尽量靠近 goal，使 extent 可合并。
+\item \textbf{Multi-block 一次性分配}：一次 \code{writeback}
+  可能脏了上百个页，\code{mballoc} 一次分配所有块，减少锁竞争。
+\end{itemize}
+
+\fstopic{延迟分配（delalloc）}
+
+延迟分配在 buffered \code{write()} 阶段先记录脏缓存和逻辑范围，暂缓决定物理块。
+到 writeback 阶段，分配器能够观察更完整的脏范围，并尝试一次分配连续 extent。
+这改善了布局机会，但也意味着空间不足等错误可能延迟到写回或 \code{fsync} 才出现。
+
+对比两种场景（写 3 个 4~KiB 页）：
+
+\begin{lstlisting}
+// 无 delalloc：每次 write() 立即分配
+write(0..4095):    alloc block 5000
+write(4096..8191): alloc block 8000   // 5000 已被占用, 跳到 8000
+write(8192..12287):alloc block 3500   // 又跳到 3500
+结果: 3 个 extent, 高碎片化
+
+// 有 delalloc: writeback 看到全部脏页
+write(0..4095):    page cache only
+write(4096..8191): page cache only
+write(8192..12287):page cache only
+flush / writeback: alloc 5000-5002 (连续)
+结果: 1 个 extent, 无碎片
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+% no delalloc
+\node[os label] at (-3,2.5) {无 delalloc};
+\node[os small block, os compute] at (-4.5,1.5) {5000};
+\node[os small block, os compute] at (-3,1.5) {8000};
+\node[os small block, os compute] at (-1.5,1.5) {3500};
+\node[os label] at (-3,0.6) {3 个不连续 extent};
+% delalloc
+\node[os label] at (3,2.5) {有 delalloc};
+\node[os small block, fill=BookGreenTint, draw=BookTeal] at (1.5,1.5) {5000};
+\node[os small block, fill=BookGreenTint, draw=BookTeal] at (2.7,1.5) {5001};
+\node[os small block, fill=BookGreenTint, draw=BookTeal] at (3.9,1.5) {5002};
+\node[os label] at (3,0.6) {1 个连续 extent};
+\end{fspdfdiagram}
+\fsdiagramnote{延迟分配让 writeback 一次性分配连续块，消除逐次分配导致的碎片化。}
+
+\fstopic{delalloc 的 ENOSPC 困境}
+
+\begin{warningbox}
+延迟分配带来一个微妙问题：\code{write()} 在页缓存中成功，
+但 \code{writeback} 时可能发现磁盘已满（ENOSPC）。
+此时 \code{write()} 早已返回 0（成功），用户以为数据已落盘，
+却在后台刷盘时失败。
+\end{warningbox}
+
+ext4 的缓解措施：
+\begin{itemize}\tightlist
+\item \textbf{预留块}：可为特权用户保留一部分空间，降低普通用户写满文件系统后
+  管理员完全无法修复或腾挪数据的风险；这不是某个名为 \code{pdflush} 的进程专用空间。
+\item \textbf{写时检查}：在 \code{write()} 路径上做粗略空间检查
+  （\code{ext4\_nospace\_check}），但这是尽力而为。
+\item \textbf{回退到立即分配}：当剩余空间低于阈值，
+  关闭 delalloc 改为同步分配，保证 ENOSPC 在 \code{write()} 时即报错。
+\end{itemize}
+
+\fstopic{Orlov 分配器}
+
+Orlov 策略针对\emph{目录}分配：新目录应分散到不同块组，
+避免所有热目录挤在一个组导致该组 inode 表与 bitmap 成为瓶颈。
+规则：
+
+\begin{itemize}\tightlist
+\item 新目录选空闲率最高的组（\code{free\_blocks} 和 \code{free\_inodes} 都较高）。
+\item 同一目录下的\emph{文件}（非子目录）仍跟随父目录，
+  保证目录内局部性。
+\item 目录分散 $\rightarrow$ 子树分散 $\rightarrow$ 负载均衡。
+\end{itemize}
+
+\fstopic{XFS 分配组（Allocation Group, AG）}
+
+XFS 把磁盘分成独立的 AG，每组有自己的超级块、inode 表、
+\emph{两棵 B+ 树}：
+\begin{itemize}\tightlist
+\item \textbf{by-size 树}：键 = 空闲区长度，便于 best-fit 查找。
+\item \textbf{by-location 树}：键 = 起始块号，便于局部性分配。
+\end{itemize}
+
+两棵树互补：by-size 满足空间效率，by-location 满足局部性。
+不同 AG 可被不同 CPU 并行分配，每组各持一把自旋锁，
+\code{mp\_io\_resource} 级别的锁竞争极低。
+
+% ============================================================
+\fsdivision{名称索引：线性目录、hash 与 B-tree}
+
+\fstopic{目录问题}
+
+目录本身也是一个文件，其"数据"是\emph{名字 $\rightarrow$ inode 号}的映射表。
+关键问题：如何组织这张表使查找快、增删快、且向后兼容？
+
+理想目录应满足：查找 $O(\log n)$ 或 $O(1)$，插入 $O(1)$ amortized，
+删除不移动数据（避免大目录整块搬移）。不同文件系统选择了不同平衡点。
+
+\fstopic{线性目录（ext2/ext4 基础格式）}
+
+ext2/ext4 的目录数据块是一串变长 \code{dirent}：
+
+\begin{lstlisting}
+struct ext4_dirent {
+    __le32 inode;      // 0 表示已删除
+    __le16 rec_len;    // 本条目总长度（含 padding）
+    __u8   name_len;   // 文件名实际字节数
+    __u8   file_type;  // DT_REG, DT_DIR, DT_LNK, DT_CHR, DT_BLK, DT_FIFO, DT_SOCK
+    char   name[];     // name_len 字节, NUL 填充到 4 字节边界
+};
+\end{lstlisting}
+
+\code{rec_len} 是变长布局的关键：它允许条目大小不等，
+删除时只需把被删条目的 \code{rec_len} 加到前一条目上——\emph{零数据搬移}。
+
+\textbf{具体目录块}（块 4096 字节，含 \code{.}、\code{..}、\code{foo.txt}、\code{bar.c}）：
+
+\begin{longtable}{|F{0.10\linewidth}|F{0.11\linewidth}|F{0.14\linewidth}|F{0.14\linewidth}|F{0.17\linewidth}|F{0.14\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+\textbf{偏移} & \textbf{inode} & \textbf{rec\_len} & \textbf{name\_len} & \textbf{file\_type} & \textbf{name} \\
+\midrule
+0    & 12     & 12  & 1  & DT\_DIR  & \code{.} \\\tablerowrule
+12   & 2      & 12  & 2  & DT\_DIR  & \code{..} \\\tablerowrule
+24   & 15     & 20  & 7  & DT\_REG  & \code{foo.txt} \\\tablerowrule
+44   & 16     & 16  & 5  & DT\_REG  & \code{bar.c} \\\tablerowrule
+60   & 0      & 4036& 0  & ---      & (剩余空间, 空闲) \\
+\bottomrule
+\end{longtable}
+
+{\par\noindent\textbf{表 7.1：一个 ext4 目录块的具体布局。\code{rec\_len} 使最后一条目吞掉所有剩余空间。}\par}
+
+\textbf{删除 \code{foo.txt}}：把偏移 24 的条目 \code{rec\_len} 累加到偏移 12 的 \code{..}：
+\code{..} 的 \code{rec\_len} 变为 $12 + 20 = 32$。
+\code{foo.txt} 的空间被"折叠"进前一条，无需移动 \code{bar.c}。
+查找时遇到 \code{inode==0} 直接跳过。
+
+\fstopic{线性查找复杂度}
+
+线性扫描是 $O(n)$。对 10 个文件的目录，$<1~\mu$s，完全可接受。
+对 100\,000 个文件的目录（如 \filepath{/usr/lib}、邮件 spool），
+每次 \code{stat} 都要扫半个目录——灾难性。
+这驱动了 HTree 和 B-tree 目录的诞生。
+
+\fstopic{HTree：ext3/ext4 的 hash B-tree}
+
+HTree（也叫 dx\_tree）是\emph{在线性目录之上叠加的 hash 索引}。
+目录数据块仍是线性 dirent，但额外维护一个 B-tree 索引：
+
+\begin{itemize}\tightlist
+\item \textbf{Hash 函数}：\code{half\_md4} 或 \code{dx\_hash}（tear、rupasov 等）。
+  对文件名算 hash，hash 决定它落在哪个数据块。
+\item \textbf{索引节点}：一个 \code{(hash, child\_block)} 对的数组。
+\item \textbf{查找}：\code{hash(name)} $\rightarrow$ 在索引中二分 $\rightarrow$
+  读 child\_block $\rightarrow$ 在该块的线性 dirent 中扫描。
+\end{itemize}
+
+\begin{lstlisting}
+struct dx_node {
+    struct dx_entry entries[];  // 变长
+};
+struct dx_entry {
+    __le32 hash;         // 子树的最小 hash
+    __le32 child_block;  // 子目录块号
+};
+// 根索引内联于目录第一个数据块的开头
+// (与 dirent 共存, 通过 dirent 的 rec_len 隐藏索引部分)
+\end{lstlisting}
+
+\textbf{查找追踪}（目录有 4 个数据块，HTree depth=1）：
+
+\begin{enumerate}\tightlist
+\item \code{hash("foo.txt") = 0xA3B7}。
+\item 根索引 4 个 entry：\code{[0x0000$\rightarrow$blk100, 0x4000$\rightarrow$blk200, 0x8000$\rightarrow$blk300, 0xC000$\rightarrow$blk400]}。
+\item 二分：0xA3B7 落在 $[0x8000, 0xC000)$ $\rightarrow$ \code{blk300}。
+\item 读 blk300，线性扫描找 \code{name=="foo.txt"} $\rightarrow$ inode 15。
+\item 总计：1 次索引 I/O + 1 次数据 I/O = 2 I/O（对比纯线性 4 I/O）。
+\end{enumerate}
+
+\begin{keyidea}
+HTree 的精妙在于\emph{向后兼容}：不理解 HTree 的工具
+（旧版 \code{e2fsck}、只读挂载）看到的仍是线性 dirent，
+因为索引被巧妙隐藏在第一个条目的 \code{rec\_len} 里。
+只有 \code{EXT4\_INDEX\_FL} 标志位告知新内核"这里有索引"。
+\end{keyidea}
+
+\fstopic{B-tree 目录（XFS、Btrfs）}
+
+XFS dir2 和 Btrfs 把目录\emph{本身}做成 B-tree，
+不再有线性 dirent 层：
+
+\begin{itemize}\tightlist
+\item \textbf{XFS dir2}：叶节点存 dirent 数据，内部节点存 (hash, ptr) 索引。
+  查找 $O(\log n)$，插入/删除自动再平衡。
+\item \textbf{Btrfs}：所有元数据统一为 B-tree，
+  键为 \code{(objectid, type, offset)}，
+  目录条目的 type=\code{BTRFS\_DIR\_ITEM\_KEY}，
+  值为完整 dirent。整个文件系统就是一棵大 B-tree 的不同子树。
+\end{itemize}
+
+B-tree 目录的优势：所有操作 $O(\log n)$，
+可以扩展到百万级条目（如容器镜像层的 \filepath{/usr/lib}）。
+代价是结构复杂、小目录有额外开销（一个节点至少一个块）。
+
+\fstopic{dentry 缓存（dcache）}
+
+dcache 是 VFS 层的\emph{路径解析结果缓存}，与具体文件系统无关：
+
+\begin{itemize}\tightlist
+\item \textbf{正向 dentry}：名字存在，缓存了对应 inode 指针。
+  再次访问该名字直接命中，无需调用底层 \code{lookup}。
+\item \textbf{负向 dentry}：名字不存在。
+  缓存"不存在"这一事实，避免对缺失文件的反复磁盘查找
+  （典型场景：\code{PATH} 搜索中 90\% 的路径不存在）。
+\end{itemize}
+
+dcache 是\emph{基于路径}的：\filepath{/home/user/foo} 被缓存为一串 dentry：
+\code{root $\rightarrow$ home $\rightarrow$ user $\rightarrow$ foo}。
+每段都是独立缓存条目，可被不同路径复用。
+
+\textbf{RCU-walk}：Linux 3.2+ 引入的无锁路径遍历。
+遍历 dentry 树时用 RCU（Read-Copy-Update）保护，
+不取任何锁，只在需要修改（创建/删除 dentry）时降级为 ref-walk。
+热路径 \code{stat("/usr/bin/gcc")} 几乎全在 RCU 下完成。
+
+\textbf{失效}：\code{rename}、\code{unlink}、跨挂载点变化
+必须使受影响 dentry 失效（\code{d\_invalidate}），否则返回过时结果。
+
+\fstopic{带 dcache 的完整路径解析}
+
+\begin{lstlisting}
+vfs_lookup("/home/user/foo.txt"):
+  root_dentry = dcache_lookup(NULL, "/")       // 命中: 根 dentry
+  home_dentry = dcache_lookup(root_dentry, "home")  // 命中?
+  if !home_dentry:
+      home_inode = ext4_lookup(root_inode, "home")  // 落盘
+      home_dentry = d_add(root_dentry, "home", home_inode)
+  user_dentry = dcache_lookup(home_dentry, "user")   // 命中?
+  if !user_dentry:
+      user_inode = ext4_lookup(home_inode, "user")
+      user_dentry = d_add(home_dentry, "user", user_inode)
+  foo_dentry = dcache_lookup(user_dentry, "foo.txt") // 命中?
+  if !foo_dentry:
+      foo_inode = ext4_lookup(user_inode, "foo.txt")
+      foo_dentry = d_add(user_dentry, "foo.txt", foo_inode)
+  return foo_dentry->d_inode
+\end{lstlisting}
+
+热路径下，每一级 \code{dcache\_lookup} 都命中，
+\code{ext4\_lookup} 永不被调用——整个解析在内存中 $O(\text{路径深度})$。
+
+\begin{fspdfdiagram}
+% dcache tree
+\node[os small block, os memory] (root) {/ (dentry)};
+\node[os small block, os memory, below left=0.5cm and 0.8cm of root] (home) {home};
+\node[os small block, os memory, below right=0.5cm and 0.8cm of root] (etc) {etc};
+\node[os small block, os memory, below=0.5cm of home] (user) {user};
+\node[os small block, os compute, below=0.5cm of user] (foo) {foo.txt};
+\draw[os bus] (root) -- (home);
+\draw[os bus] (root) -- (etc);
+\draw[os bus] (home) -- (user);
+\draw[os bus] (user) -- (foo);
+\node[os label, right=0.1cm of foo] {未命中 $\rightarrow$ 落盘 ext4\_lookup};
+\node[os label, right=0.1cm of home] {命中 (正向)};
+\node[os small block, fill=BookRedTint, draw=BookRed, below=0.5cm of etc] (neg) {no-such-file};
+\node[os label, right=0.1cm of neg] {负向 dentry};
+\draw[os bus] (etc) -- (neg);
+\end{fspdfdiagram}
+\fsdiagramnote{dcache 树：正向 dentry 缓存存在路径，负向 dentry 缓存"不存在"。}
+
+% ============================================================
+\fsdivision{VFS 对象与统一分发}
+
+\fstopic{VFS 问题}
+
+Linux 支持 ext4、xfs、btrfs、nfs、proc、sysfs、tmpfs、fuse 等数十种文件系统。
+应用程序只想用 \code{open}/\code{read}/\code{write}/\code{close}，
+不关心底层是 ext4 还是网络协议。
+
+\begin{keyidea}
+VFS（Virtual File System Switch）是内核中的一层\emph{抽象接口与分发器}：
+它定义了一组抽象对象和操作方法表，
+每个具体文件系统实现这些方法。
+应用层看到统一 API，内核根据挂载信息把调用分发到具体实现。
+\end{keyidea}
+
+\fstopic{四个核心 VFS 对象}
+
+\fssubtopic{super\_block：每个已挂载文件系统一个}
+
+\begin{lstlisting}
+struct super_block {
+    unsigned long s_blocksize;     // 块大小（字节）
+    unsigned long s_maxbytes;     // 最大文件大小
+    unsigned long s_flags;        // MS_RDONLY, MS_NOSUID, ...
+    unsigned long s_magic;        // 0xEF53 (ext2/3/4), 0x58465342 (xfs)
+    struct dentry *s_root;        // 此挂载实例的根 dentry
+    struct list_lru s_dentry_lru; // 可回收 dentry 的运行时状态（示意）
+    const struct super_operations *s_op;
+    // ...
+};
+struct super_operations {
+    struct inode *(*alloc_inode)(struct super_block *sb);
+    void (*destroy_inode)(struct inode *);
+    void (*evict_inode)(struct inode *);
+    int  (*write_inode)(struct inode *, struct writeback_control *);
+    int  (*sync_fs)(struct super_block *, int wait);
+    // ...
+};
+\end{lstlisting}
+
+\code{super\_block} 在 \code{mount()} 时由 \code{fill\_super} 回调创建，
+卸载时销毁。它持有全文件系统级别的状态（空闲块/inode 计数、脏标志）。
+
+\fssubtopic{inode：每个文件一个（在内存中）}
+
+\begin{lstlisting}
+struct inode {
+    umode_t   i_mode;      // 文件类型与权限
+    loff_t    i_size;      // 文件大小（字节）
+    blkcnt_t  i_blocks;    // 占用的 512 字节块数
+    const struct inode_operations *i_op;
+    const struct file_operations  *i_fop;
+    struct address_space *i_mapping;  // 页缓存
+    struct super_block *i_sb;
+    // ...
+};
+struct inode_operations {
+    struct dentry *(*lookup)(struct inode *, struct dentry *, unsigned int);
+    int (*create)(struct inode *, struct dentry *, umode_t, bool);
+    int (*link)(struct dentry *, struct inode *, struct dentry *);
+    int (*unlink)(struct inode *, struct dentry *);
+    int (*mkdir)(struct inode *, struct dentry *, umode_t);
+    int (*rename)(..., unsigned int);
+    const char *(*get_link)(struct dentry *, struct inode *, void **);
+    int (*permission)(struct inode *, int);
+    // ...
+};
+\end{lstlisting}
+
+内存 inode 由磁盘 inode 实例化，但额外维护运行时状态
+（页缓存引用、脏标志、锁、引用计数）。
+
+\fssubtopic{dentry：路径组件缓存}
+
+\begin{lstlisting}
+struct dentry {
+    struct qstr d_name;        // 名字 + hash
+    struct inode *d_inode;     // NULL = 负向 dentry
+    struct dentry *d_parent;
+    const struct dentry_operations *d_op;
+    struct list_head d_subdirs;
+    unsigned char d_flags;     // DCACHE_MOUNTED, ...
+    struct lockref d_lockref; // 自旋锁与引用计数的组合
+};
+\end{lstlisting}
+
+dentry 形成\emph{镜像目录结构的树}，是 dcache 的载体。
+
+\fssubtopic{file：每次 open() 一个}
+
+\begin{lstlisting}
+struct file {
+    struct path f_path;         // dentry + vfsmount
+    struct inode *f_inode;
+    const struct file_operations *f_op;
+    loff_t  f_pos;             // 当前偏移
+    fmode_t f_mode;            // FMODE_READ, FMODE_WRITE
+    unsigned int f_flags;      // O_RDONLY, O_NONBLOCK, ...
+    atomic_long_t f_count;     // 引用计数
+    // ...
+};
+struct file_operations {
+    ssize_t (*read_iter)(struct kiocb *, struct iov_iter *);
+    ssize_t (*write_iter)(struct kiocb *, struct iov_iter *);
+    int (*open)(struct inode *, struct file *);
+    int (*release)(struct inode *, struct file *);
+    int (*mmap)(struct file *, struct vm_area_struct *);
+    int (*fsync)(struct file *, loff_t, loff_t, int);
+    long (*ioctl)(struct file *, unsigned int, unsigned long);
+    // ...
+};
+\end{lstlisting}
+
+\fstopic{对象关系：fd $\rightarrow$ file $\rightarrow$ dentry $\rightarrow$ inode $\rightarrow$ super\_block}
+
+\begin{fspdfdiagram}
+\node[os small block, os control] (fd) {fd[3]};
+\node[os small block, os memory, right=0.6cm of fd] (file) {struct file\\\scriptsize f\_pos, f\_op};
+\node[os small block, os memory, right=0.6cm of file] (dentry) {dentry\\\scriptsize d\_name, d\_inode};
+\node[os small block, os compute, right=0.6cm of dentry] (inode) {inode\\\scriptsize i\_size, i\_fop};
+\node[os small block, os control, right=0.6cm of inode] (sb) {super\_block\\\scriptsize s\_blocksize, s\_op};
+\draw[os bus] (fd) -- (file);
+\draw[os bus] (file) -- (dentry);
+\draw[os bus] (dentry) -- (inode);
+\draw[os bus] (inode) -- (sb);
+\node[os label, below=0.1cm of fd] {进程};
+\node[os label, below=0.1cm of file] {打开实例};
+\node[os label, below=0.1cm of dentry] {路径缓存};
+\node[os label, below=0.1cm of inode] {文件};
+\node[os label, below=0.1cm of sb] {文件系统};
+\end{fspdfdiagram}
+\fsdiagramnote{VFS 对象链：fd 引用 file，file 指向 dentry 和 inode，inode 属于 super\_block。}
+
+\fstopic{分发机制}
+
+VFS 的核心是\emph{函数指针表分发}。
+\code{vfs\_read} 不直接读数据，而是调用 \code{file->f\_op->read\_iter}，
+后者对 ext4 是 \code{ext4\_file\_read\_iter}，对 xfs 是 \code{xfs\_file\_read\_iter}：
+
+\begin{lstlisting}
+ssize_t vfs_read(struct file *file, char __user *buf, size_t len, loff_t *pos) {
+    if (file->f_op->read_iter)
+        return new_sync_read(file, buf, len, pos);  // 调 read_iter
+    else if (file->f_op->read)
+        return file->f_op->read(file, buf, len, pos);  // 旧接口
+    return -EINVAL;
+}
+// new_sync_read 最终调用:
+//   file->f_op->read_iter(kiocb, iov_iter)
+//   ext4: ext4_file_read_iter  -> generic_file_read_iter -> pagecache
+//   xfs:  xfs_file_read_iter   -> generic_file_read_iter
+//   nfs:  nfs_file_read_iter   -> 网络 RPC
+\end{lstlisting}
+
+VFS 通过\emph{延迟绑定}完成分发：打开文件时，
+\code{file->f\_op = inode->i\_fop}；具体文件系统在实例化相应 inode 时设置操作表。
+此后每次 \code{read}/\code{write}/\code{fsync} 都通过这张函数指针表
+分发到正确的实现。应用代码、VFS 通用代码、文件系统特定代码三者解耦。
+
+\fstopic{open() 完整路径追踪}
+
+\begin{enumerate}\tightlist
+\item 用户态 \code{open()} 通常经 libc 进入 \code{openat} 系统调用；内核当前实现可沿
+  \code{do\_sys\_openat2} 一类入口进入路径打开逻辑。函数名会随版本调整，本追踪强调机制而非背诵符号。
+\item \code{path\_openat} 协调路径遍历与最终打开，逐段解析得到 \code{dentry} + \code{inode}。
+  遍历过程中若遇挂载点，\code{follow\_mount()} 跳转到挂载的子树。
+\item 权限检查：\code{inode\_permission(inode, MAY\_OPEN)}
+  $\rightarrow$ 调用 \code{inode->i\_op->permission}（ext4: \code{ext4\_permission}）。
+\item 分配 \code{struct file}，设置 \code{f\_pos=0}，
+  \code{f\_op = inode->i\_fop}，\code{f\_inode = inode}。
+\item 调用 \code{file->f\_op->open}（若存在）做文件系统特定初始化，
+  再调 \code{security\_file\_open}（SELinux/AppArmor 钩子）。
+\item \code{fd\_install}：把 \code{file} 装入当前进程的 fd 表，返回 fd 号。
+\end{enumerate}
+
+\fstopic{挂载命名空间}
+
+每个容器/命名空间有自己的挂载树。\code{/proc/mounts} 只显示当前命名空间的挂载。
+\code{mount --bind /src /dst} 为同一 inode 子树创建第二个 dentry 入口——
+两路径访问同一数据。\code{mount --move} 可在树间搬移子树。
+
+\fstopic{特殊文件系统}
+
+\begin{longtable}{|F{0.14\linewidth}|F{0.18\linewidth}|F{0.30\linewidth}|F{0.30\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+\textbf{文件系统} & \textbf{后端存储} & \textbf{语义} & \textbf{典型用途} \\
+\midrule
+tmpfs    & 内存（+swap） & 易失, 读写   & \code{/tmp}, \code{/dev/shm} \\\tablerowrule
+procfs   & 无            & 读即生成     & \code{/proc/<pid>/status} \\\tablerowrule
+sysfs    & 无            & 属性 $\leftrightarrow$ 驱动函数 & \code{/sys/class/...} \\\tablerowrule
+overlayfs & lower+upper  & 写时复制     & 容器镜像层叠 \\\tablerowrule
+fuse     & 用户态守护进程 & 请求经 \code{/dev/fuse} 往返 & 自定义文件系统 \\
+\bottomrule
+\end{longtable}
+
+{\par\noindent\textbf{表 8.1：常见特殊文件系统。}\par}
+
+\fssubtopic{tmpfs}
+
+数据在页缓存中，无磁盘 inode。可用 swap 作后端：内存压力时换出。
+\code{shmem\_alloc} 在 \code{shmem\_fs\_type} 下注册。
+\code{ls /dev/shm} 看到的"文件"实为 \code{shmem\_inode\_info}。
+
+\fssubtopic{procfs}
+
+\code{/proc} 无后端存储。\code{read()} 触发 \code{proc\_generate()}
+动态生成内容。如 \code{/proc/meminfo} 的 \code{seq\_file} 回调
+\code{meminfo\_show} 实时遍历 \code{global\_node\_page\_state} 等计数器。
+
+\fssubtopic{sysfs}
+
+\code{/sys} 是 \code{kobject} 层次的镜像。每个 \code{kobject} 对应一个目录，
+每个 \code{attribute} 对应一个文件。\code{read(attribute)} 调用驱动注册的
+\code{show} 回调，\code{write(attribute)} 调用 \code{store} 回调——
+直接映射到驱动函数，无"文件"实体。
+
+\fssubtopic{overlayfs}
+
+叠加 lower（只读）和 upper（可写）层。读时自顶向下找第一层命中；
+首次写时\emph{写时复制}（copy-up）：把 lower 文件复制到 upper 再修改。
+Docker 镜像层叠正是基于 overlayfs。
+
+\fssubtopic{FUSE}
+
+\code{fuse} 把文件操作路由到用户态守护进程：
+
+\begin{enumerate}\tightlist
+\item 内核 VFS 调用 \code{fuse\_file\_read\_iter}。
+\item 内核把请求写入 \code{/dev/fuse} 字符设备，守护进程阻塞在 \code{read(/dev/fuse)}。
+\item 守护进程处理请求（可能是网络、内存、任意逻辑），把结果 \code{write} 回 \code{/dev/fuse}。
+\item 内核唤醒等待的 \code{vfs\_read}，返回数据给应用。
+\end{enumerate}
+
+代价是每次 I/O 两次内核$\leftrightarrow$用户态切换，延迟 $\sim$~$\mu$s 级，
+不适合高吞吐场景。优势是文件系统逻辑可在用户态实现，无需内核权限。
+
+\begin{fspdfdiagram}
+\node[os small block, os control] (app) {应用\\\scriptsize read()};
+\node[os small block, os memory, below=0.5cm of app] (vfs) {VFS\\\scriptsize fuse\_file\_read\_iter};
+\node[os small block, os compute, below=0.5cm of vfs] (fuse) {FUSE 内核模块\\\scriptsize /dev/fuse 队列};
+\node[os small block, os control, below=0.5cm of fuse] (daemon) {用户态守护进程\\\scriptsize 自定义逻辑};
+\draw[os bus] (app) -- (vfs);
+\draw[os bus] (vfs) -- (fuse);
+\draw[os bus] (fuse) -- (daemon);
+\draw[os feedback] (daemon.east) .. controls +(2,0) and +(2,0) .. (app.east);
+\node[os label, right=0.3cm of fuse, yshift=0.4cm] {请求下行};
+\node[os label, right=0.3cm of fuse, yshift=-0.4cm] {结果上行};
+\end{fspdfdiagram}
+\fsdiagramnote{FUSE 请求往返：应用 $\rightarrow$ VFS $\rightarrow$ FUSE 内核 $\rightarrow$ 用户态守护进程，结果原路返回。}
+
+\fstopic{小结}
+
+本节覆盖了从块映射到 VFS 的完整栈：
+
+\begin{itemize}\tightlist
+\item \textbf{块映射}从间接指针演化到 extent 树与 B+ 树，
+  把大文件的元数据从 100~KiB 降到 12 字节，查找从 4 I/O 降到 2 I/O。
+\item \textbf{空间分配}用块组 + buddy + 延迟分配的组合，
+  在连续性、利用率、延迟间逼近帕累托前沿。
+\item \textbf{目录结构}从线性表升级到 HTree 和 B-tree，
+  把 $O(n)$ 查找变为 $O(\log n)$，并辅以 dcache 实现热路径零 I/O。
+\item \textbf{VFS} 用函数指针表分发统一 API，
+  使 ext4/xfs/nfs/tmpfs/fuse 共享同一套 \code{open}/\code{read}/\code{write} 接口。
+\end{itemize}
+
+这些机制层层叠叠：VFS 分发 $\rightarrow$ 文件系统特定操作 $\rightarrow$ extent 树查找 $\rightarrow$ 块分配 $\rightarrow$ 目录索引 $\rightarrow$ dcache 命中。
+理解每一层的权衡与数据结构，才能诊断从"大文件随机读慢"到"容器挂载层叠"的各类性能问题。
+
+\end{filesystemlayout}

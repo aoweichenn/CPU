@@ -1,0 +1,1274 @@
+\begin{filesystemlayout}
+
+\chapter{现代文件系统的组织与取舍}
+\begin{keyidea}
+基础文件系统已经能够保存、查找和恢复文件，但容量、并发、介质特征与可靠性要求会继续
+放大元数据访问、随机写、空间碎片和静默损坏等成本。现代设计不是术语的集合；每一种优化
+都应当从明确的工作负载或故障条件出发，并说明它增加的状态、写放大与恢复责任。
+\end{keyidea}
+
+\fsdivision{小文件、校验和与空间效率}
+% ==================================================================
+
+前几节建立了文件系统的基础机制：索引节点、目录项、日志、B+ 树、空间分配。
+然而，真实世界中的文件系统还必须应对一系列工程挑战——小文件膨胀导致的空间
+浪费、静默数据腐烂（bit rot）、闪存设备的写放大、延迟敏感型工作负载、容器
+镜像的层叠结构。本节深入分析现代文件系统采用的核心优化技术，每一项都是资源
+（CPU、内存、复杂性）与收益（I/O、空间、可靠性）之间的权衡。
+
+% ------------------------------------------------------------------
+\fstopic{inline data：小文件内嵌}
+% ------------------------------------------------------------------
+
+一个典型的配置文件——\filepath{/etc/hostname}——通常只有 10--20 字节。在
+传统的 ext4 布局中，即使文件只有 1 字节，文件系统也会为其分配至少一个 4 KiB
+数据块。inode 本身占据 256 字节，其中 \code{i_block[15]} 数组（60 字节）用于
+存放区段树（extent tree）的根节点。对于小文件而言，这些空间大部分被浪费。
+
+ext4 的 \emph{inline data} 特性（标志 \code{EXT4_FEATURE_INCOMPAT_INLINE_DATA}）
+解决了这个问题：当文件足够小时，直接将文件数据内嵌到 inode 结构中，不需要任何
+独立的数据块。\code{i_block[]} 数组原本用于存放区段指针，现在被重新利用为内嵌
+数据区域。对于一个 256 字节的 inode，标准元数据占据前 128 字节，剩余 128 字节
+的额外 inode 空间（extra inode space）也可以用于内嵌数据，合计 $\sim$ 128 字节。
+ext4 进一步支持通过 \code{i_data} 字段（位于额外 inode 空间内）将内嵌容量扩展
+到 $\sim$ 384 字节。
+
+\begin{lstlisting}[language=C]
+/* simplified ext4 on-disk inode */
+struct ext4_inode {
+    __le16  i_mode;            /*  0  file mode                 */
+    __le16  i_uid;             /*  2  low 16 bits of UID        */
+    __le32  i_size_lo;         /*  4  size (low 32 bits)        */
+    __le32  i_atime;           /*  8  access time               */
+    __le32  i_ctime;           /* 12  inode change time         */
+    __le32  i_mtime;           /* 16  modification time         */
+    __le32  i_dtime;           /* 20  deletion time            */
+    __le16  i_gid;             /* 24  low 16 bits of GID        */
+    __le16  i_links_count;     /* 26  hard link count          */
+    __le32  i_blocks_lo;       /* 28  blocks count             */
+    __le32  i_flags;           /* 32  inode flags              */
+    __le32  i_osd1;            /* 36  OS-specific              */
+    __le32  i_block[15];       /* 40  block pointers / extents  */
+                               /*     repurposed for inline_data */
+    __le32  i_generation;      /* 100  version (NFS)           */
+    __le32  i_file_acl_lo;     /* 104  extended attr block     */
+    /* --- standard inode ends at offset 128 ---                 */
+    __le32  i_size_high;       /* 108  size (high 32 bits)     */
+    __le32  i_obso_faddr;      /* 112  obsolete fragment addr  */
+    __le16  i_checksum_lo;     /*      CRC32C checksum (low)  */
+    /* --- extra inode space: up to 256 bytes total ---          */
+    /*     inline data continues here via xattr mechanism        */
+};
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+\node[os block, fill=BookGreenTint] (meta)
+  {inode core fields (schematic)\\mode, uid, gid, size,\\timestamps, flags, generation};
+\node[os block, fill=BookAmberTint, below=0pt of meta] (data)
+  {inline data (capacity varies)\\i\_block[15] (60 B) + inode xattr space};
+\node[os label, font=\scriptsize] at ($(meta.north west)+(-0.8,0)$) {0};
+\node[os label, font=\scriptsize] at ($(data.north west)+(-0.8,0)$) {128};
+\node[os label, font=\scriptsize] at ($(data.south west)+(-0.8,0)$) {256};
+\node[os label, font=\scriptsize, right=0.3cm of meta.east]
+  {\textcolor{BookMuted}{inode = 256 B}};
+\end{fspdfdiagram}
+\fsdiagramnote{ext4 inline data inode 布局示意。前一部分数据可放在 60 字节的 i\_block[] 区域，更多内容可使用 inode 的扩展属性空间；实际容量取决于 inode 大小和已有 xattr，不能固定写成 128 字节。足够小的文件可以不分配独立数据块。}
+
+Btrfs 提供了类似但更慷慨的内嵌支持。Btrfs 的 \emph{inline extent} 可以将整个
+小文件存储在 B 树叶子节点中，容量上限取决于叶子大小（通常 4 KiB）减去头部和
+其他条目，实际上可达 $\sim$ 3.8 KiB。由于 Btrfs 的 B 树叶子已经在内存中，
+内嵌文件的读取不需要额外的 I/O。
+
+\emph{影响分析}：考虑一个典型的 \filepath{/etc} 目录，包含 $\sim$ 3000 个配置
+文件，其中大多数 $<$ 128 字节。在不启用 inline data 时，每个小文件至少需要
+1 个 inode 块（与其他 inode 共享）加 1 个数据块 = 8 KiB I/O（最坏情况）。
+启用 inline data 后，文件数据随 inode 一起读取，零额外 I/O。对于遍历
+\filepath{/etc} 的全量扫描，I/O 从 $\sim$ 3000 次数据块读取降至 0 次——
+所有数据已在 inode 块中。
+
+inline data 利用 inode 内的可用空间保存小文件内容，省去独立数据块和一次间接寻址。
+当内容超过内联容量时，文件系统需要把它迁移到普通块映射；实际读取是否产生 I/O
+还取决于 inode 所在元数据块是否已经缓存。
+
+% ------------------------------------------------------------------
+\fstopic{元数据校验和}
+% ------------------------------------------------------------------
+
+存储介质会发生 \emph{静默数据腐烂}（silent data corruption, bit rot）。
+原因包括：宇宙射线导致的位翻转、控制器固件 bug、NAND 读取扰动
+（read disturb）、磁介质磁畴退化、固件写入不完整。一个被损坏的 inode 块
+如果不被检测到，会导致文件系统将错误的物理块号映射给文件——这是灾难性的。
+
+ext4 的 \emph{metadata checksums} 特性（标志
+\code{EXT4_FEATURE_RO_COMPAT_METADATA_CSUM}）为以下结构添加 CRC32C
+校验和：
+
+\begin{longtable}{|F{0.35\linewidth}|F{0.25\linewidth}|F{0.30\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+结构 & 校验和字段 & 覆盖范围 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+superblock & \code{s_checksum} & superblock 全部字段 \\\tablerowrule
+group descriptor & \code{bg_checksum} & group descriptor 全部字段 \\\tablerowrule
+inode & \code{i_checksum_lo/hi} & inode + inode number + generation \\\tablerowrule
+extent header & \code{eh_checksum} & extent header + 所有 extent 条目 \\\tablerowrule
+directory htree & \code{dx_tail} (dx\_node 尾部) & 目录块全部内容 \\\tablerowrule
+block bitmap & (group descriptor 中的校验和) & bitmap 块全部内容 \\\tablerowrule
+\end{longtable}
+
+CRC32C（Castagnoli 多项式 $0\text{x}1\text{EDC}6\text{F}41$）被选中是因为
+x86 SSE4.2 提供了硬件加速指令 \code{crc32}，使得校验计算几乎零开销。
+ARMv8 也提供了 \code{CRC32} 指令。在没有硬件支持的平台，内核回退到软件
+CLMUL 实现。
+
+\begin{lstlisting}[language=C]
+/* ext4 extent checksum computation (simplified) */
+static __le32 ext4_extent_block_csum(struct inode *inode,
+                                     struct ext4_extent_header *eh)
+{
+    struct ext4_inode_info *ei = EXT4_I(inode);
+    struct ext4_extent_tail *tail;
+
+    /* checksum covers: extent header + all extent entries
+       (but NOT the tail itself, which holds the checksum) */
+    tail = find_ext4_extent_tail(eh);
+    return cpu_to_le32(
+        ext4_crc32c(inode->i_sb,
+                    (void *)eh,
+                    (__u8 *)tail - (__u8 *)eh,   /* data to checksum */
+                    ei->i_crc_seed));             /* seed = inode
+                                                      number + generation */
+}
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+\node[os state] (sb) {superblock};
+\node[os state, right=of sb] (gd) {group desc};
+\node[os state, right=of gd] (ino) {inode};
+\node[os state, below=0.3cm of sb] (bm) {bitmap};
+\node[os state, right=of bm] (ext) {extent tree};
+\node[os state, right=of ext] (dir) {dir entries};
+\node[os control, below=0.6cm of bm] (data) {file data};
+\node[os control, right=of data] (xf) {xattr};
+\node[os label, right=0.3cm of xf] {ext4: metadata only};
+\node[os block, fill=BookBlueTint, below=0.6cm of data] (btrfs)
+  {Btrfs / ZFS: ALL data + metadata};
+\draw[os feedback, ->] (data) -- (btrfs)
+  node[os label, midway, left, font=\scriptsize]
+  {ext4 不校验文件数据};
+\end{fspdfdiagram}
+\fsdiagramnote{ext4 仅对元数据计算 CRC32C 校验和。文件数据块本身没有校验。
+Btrfs 和 ZFS 对所有数据和元数据均计算校验和，并在每次读取时验证。}
+
+\begin{warningbox}
+ext4 的元数据校验和 \emph{不保护文件数据内容}。如果一个数据块在磁盘上
+发生了位翻转，ext4 在读取该块时不会检测到错误，应用程序会收到损坏的数据。
+只有 Btrfs 和 ZFS 的全数据校验才能在读取时检测并（通过镜像/校验）修复
+数据损坏。
+\end{warningbox}
+
+ZFS 的校验和策略更为彻底：每个块（数据块和元数据块）都有 256 位校验和
+（默认 \code{fletcher4}，可选 \code{sha256} 或 \code{edon-R}）。ZFS 在
+\emph{每次读取}时都会重新计算并验证校验和。如果校验失败，ZFS 会尝试从
+镜像副本或 RAID-Z 校验数据中恢复正确的块。Btrfs 默认使用 CRC32C，也
+支持 \code{xxhash64}、\code{sha256} 和 \code{blake2b}。
+
+% ------------------------------------------------------------------
+\fstopic{透明压缩}
+% ------------------------------------------------------------------
+
+存储 I/O 是许多工作负载的瓶颈。如果数据可以被压缩，那么在写入时压缩、在
+读取时解压，可以减少实际 I/O 量——以 CPU 时间换取 I/O 带宽。Btrfs、ZFS
+和 F2FS 支持透明压缩（transparent compression），应用程序无需感知。
+
+\emph{写入路径}：应用程序调用 \code{write()}，数据进入页缓存（page cache）。
+在写回时，文件系统对每个数据块执行压缩算法。如果压缩后的块比原始块小，
+文件系统分配更少的物理空间并记录压缩信息（压缩算法、压缩后大小）。
+\emph{读取路径}：文件系统读取压缩后的块，执行解压，返回原始数据。
+
+\begin{lstlisting}[language=C]
+/* ZFS compression: lz4 early-abort logic (simplified) */
+int lz4_compress(void *src, void *dst, size_t s_len, size_t d_len)
+{
+    /* Early abort: compress first 4 KiB.
+       If ratio < 1/8 (12.5% improvement), skip entirely. */
+    if (s_len >= 4096) {
+        int prefix = lz4_compress_4k(src, dst);
+        if (prefix > 4096 * 7 / 8) {
+            /* Not compressible enough — store uncompressed */
+            return -1;  /* signals: store raw block */
+        }
+    }
+    /* Full compression attempt */
+    return lz4_compress_full(src, dst, s_len, d_len);
+}
+\end{lstlisting}
+
+\begin{longtable}{|F{0.15\linewidth}|F{0.15\linewidth}|F{0.20\linewidth}|F{0.15\linewidth}|F{0.25\linewidth}|}
+\toprule
+\rowcolor{BookBlueTint}
+文件系统 & 默认算法 & 可选算法 & 早期中止 & 特点 \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+ZFS & lz4 & gzip, zstd & lz4: 前 4 KiB & lz4 速度 $\sim$ 500 MB/s 压缩，
+    $\sim$ 2.5 GB/s 解压 \\\tablerowrule
+Btrfs & zlib & zstd, lzo, none & zlib/zstd: 是 & zstd 压缩比更好，速度接近 \\\tablerowrule
+F2FS & lz4 & zstd, none & 是 & 针对 NAND 优化的压缩 \\\tablerowrule
+ext4 & --- & --- & --- & \emph{不支持}透明压缩 \\\tablerowrule
+\end{longtable}
+
+\emph{具体数字}：1 GiB 文本文件，4 KiB 块大小 = 262144 个块。假设压缩比为
+3:1（典型文本文件），压缩后需要 87381 个块 = $87381 \times 4\text{ KiB} =
+341\text{ MiB}$。I/O 减少了 67\%。
+
+\begin{lstlisting}
+=== 压缩 I/O 节省计算 ===
+原始:   1 GiB / 4 KiB = 262144 blocks
+压缩比: 3:1
+压缩后: 262144 / 3 = 87381 blocks (向上取整)
+空间:   87381 * 4 KiB = 341 MiB  (节省 683 MiB, 67%)
+I/O:    写入减少 67%, 读取减少 67%
+CPU:    压缩和解压成本必须在目标 CPU、数据集和算法级别上实测
+
+=== 性能权衡 ===
+I/O-bound:   CPU 空闲等 I/O → 压缩用 CPU 换 I/O → 吞吐 ↑
+CPU-bound:  CPU 已满 → 压缩增加 CPU 负载 → 吞吐 ↓
+存储受限且 CPU 有余量 → 压缩可能提升吞吐
+CPU 已饱和或数据不可压缩 → 压缩可能降低吞吐
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+% Write path (top row)
+\node[os compute] (wapp) {write()};
+\node[os compute, right=of wapp] (wpc) {page cache};
+\node[os compute, right=of wpc] (wc) {compress block};
+\node[os memory, right=of wc] (ws) {store compressed};
+\node[os small block, right=of ws] (wd) {disk};
+\draw[os bus, ->] (wapp) -- (wpc);
+\draw[os bus, ->] (wpc) -- (wc);
+\draw[os bus, ->] (wc) -- (ws);
+\draw[os bus, ->] (ws) -- (wd);
+
+% Read path (bottom row)
+\node[os compute, below=1.5cm of wapp] (rapp) {read()};
+\node[os small block, right=of rapp] (rd) {disk};
+\node[os compute, right=of rd] (rr) {read compressed};
+\node[os compute, right=of rr] (rc) {decompress};
+\node[os memory, right=of rc] (rpc) {return data};
+\draw[os bus, ->] (rapp) -- (rd);
+\draw[os bus, ->] (rd) -- (rr);
+\draw[os bus, ->] (rr) -- (rc);
+\draw[os bus, ->] (rc) -- (rpc);
+
+\node[os label, font=\scriptsize, text=BookNavy]
+  at ($(wapp.north)+(0,0.3)$) {write path};
+\node[os label, font=\scriptsize, text=BookNavy]
+  at ($(rapp.south)+(0,-0.3)$) {read path};
+\end{fspdfdiagram}
+\fsdiagramnote{透明压缩的写入与读取路径。写入时压缩每个数据块，仅存储压缩后
+的数据。读取时先读取压缩块，再解压返回。对 I/O-bound 的工作负载，CPU 用在
+压缩上的时间通常远小于节省的 I/O 等待时间。}
+
+% ------------------------------------------------------------------
+\fstopic{块级去重}
+% ------------------------------------------------------------------
+
+许多存储系统包含大量重复数据：100 台虚拟机运行相同的操作系统镜像，容器镜像
+共享相同的基础层，备份系统存储逐日累积的相似快照。\emph{块级去重}
+（block-level deduplication）在块内容粒度上消除冗余：如果两个不同的逻辑块
+包含完全相同的字节序列，文件系统只存储一份物理副本。
+
+\emph{机制}：ZFS 维护一张去重表（Dedup Table, DDT）。对于每个写入的块，
+ZFS 计算 \code{SHA-256} 哈希，然后在 DDT 中查找：
+
+\begin{lstlisting}[language=C]
+/* ZFS dedup write path (simplified) */
+int ddt_lookup(zfs_sb_t *zsb, ddt_entry_t *dde, void *data)
+{
+    /* 1. Compute SHA-256 hash of block content */
+    dde->dde_hash = sha256_hash(data, blocksize);
+
+    /* 2. Check dedup table */
+    ddt_entry_t *existing = ddt_table_lookup(zsb, &dde->dde_hash);
+    if (existing != NULL) {
+        /* 3a. Block already exists: increment refcount, return */
+        existing->dde_phys.ddp_refcnt++;
+        dde->dde_phys = existing->dde_phys;  /* physical block addr */
+        return DDT_EXISTING;  /* no actual write performed */
+    }
+
+    /* 3b. New block: write to disk, add to DDT */
+    ddt_table_add(zsb, dde);
+    return DDT_NEW;  /* caller performs actual write */
+}
+\end{lstlisting}
+
+\emph{内存代价}：去重表必须常驻内存（或在 ARC 缓存中），否则每次写入都
+需要额外的 I/O 来查表。对于 1 TiB 存储空间，4 KiB 块大小：
+
+\begin{lstlisting}
+=== 去重表内存计算 ===
+存储容量:    1 TiB = 2^40 B
+块大小:      4 KiB = 2^12 B
+总块数:      2^40 / 2^12 = 2^28 = 268,435,456 (≈ 256M)
+
+每个 DDT 条目:
+  SHA-256 哈希:    32 B
+  物理块指针:      8 B
+  引用计数:        4 B
+  哈希链表指针:    16 B
+  填充/对齐:       ~40 B
+  ─────────────────────
+  合计:            ≈ 100 B
+
+总内存: 268M × 100 B ≈ 25.6 GiB
+  → 1 TiB 存储需要 25 GiB RAM 仅仅用于去重表
+  → 10 TiB 需要 256 GiB RAM → 不现实
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+\node[os compute] (data) {data block\\(4 KiB)};
+\node[os compute, right=of data] (sha) {SHA-256\\→ hash};
+\node[os memory, right=of sha] (table) {dedup table\\hash → {block addr, refcount}};
+
+\node[os small block, below=1.5cm of table] (p1) {physical block A\\refcnt=3};
+\node[os small block, right=of p1] (p2) {physical block B\\refcnt=1};
+\node[os small block, left=of p1] (p3) {physical block C\\refcnt=5};
+
+\draw[os bus, ->] (data) -- (sha);
+\draw[os bus, ->] (sha) -- (table);
+\draw[os strong bus, ->] (table) -- (p1)
+  node[os label, midway, right, font=\scriptsize] {hit: refcnt++};
+\end{fspdfdiagram}
+\fsdiagramnote{块级去重流程。写入时计算块内容的 SHA-256 哈希，在去重表中
+查找。如果哈希已存在，增加引用计数并返回已有物理块地址——不执行实际写入。
+新块才真正写入磁盘并添加到去重表。}
+
+\begin{warningbox}
+去重表的成本取决于唯一块数量、记录格式、缓存命中率和实现。容量相同的数据集，块越小、
+唯一块越多，索引记录就越多；索引不能在内存中保持有效工作集时，写入路径会增加持久
+索引访问。部署前应以目标数据集测量重复率、内存占用、写入放大和恢复时间，不按总容量
+套用一个固定内存比例。
+\end{warningbox}
+
+\emph{最佳用例}：VM 镜像（多台虚拟机安装相同操作系统，90\%+ 块重复）、
+容器镜像（共享基础层，层间大量重复块）、备份目标（每日增量备份的快照间
+重复率极高）。对于这些工作负载，去重可以节省 50--90\% 的存储空间，且 DDT
+大小可控（因为重复块数量有限）。
+
+% ------------------------------------------------------------------
+\fstopic{预读和预取}
+% ------------------------------------------------------------------
+
+当应用程序顺序读取文件时，每次 \code{read()} 触发一次页缓存缺失（cache miss），
+导致一次磁盘 I/O。如果文件系统能预测应用程序接下来会读哪些页，它可以提前
+将这些页加载到页缓存中。Linux 内核的 \emph{read-ahead} 机制实现了这一预测。
+
+Linux 的预读算法采用自适应状态机。它跟踪每个文件的访问模式，并据此动态调整
+预读窗口大小：
+
+\begin{lstlisting}
+=== 顺序读取：预读窗口增长 ===
+
+read(0):   cache miss → read pages [0-3],   prefetch [4-7]     win=4
+read(4):   cache hit  → win × 2 = 8,        prefetch [8-15]    win=8
+read(8):   cache hit  → win × 2 = 16,       prefetch [16-31]   win=16
+read(16):  cache hit  → win × 2 = 32,       prefetch [32-63]   win=32
+read(32):  cache hit  → win × 2 = 64,       prefetch [64-127]  win=64
+read(64):  cache hit  → win × 2 = 128,      prefetch [128-255] win=128 (cap)
+
+→ 128 pages = 512 KiB 预读窗口上限 (4 KiB page)
+
+=== 随机回退读取：窗口重置 ===
+
+read(0):   cache miss → reset win=4, read [0-3]                win=4
+           (检测到回退 → 标记为随机访问 → 停止预读)
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+% t=0: miss, read 0-3, prefetch 4-7
+\node[os control, minimum width=0.6cm] (a0) at (0,3) {0};
+\node[os control, minimum width=0.6cm, right=0pt of a0] (a1) {3};
+\node[os state, minimum width=0.6cm, right=0.1cm of a1] (a2) {4};
+\node[os state, minimum width=0.6cm, right=0pt of a2] (a3) {7};
+\node[os label, left=0.3cm of a0] {win=4};
+
+% t=1: hit, win=8, prefetch 8-15
+\node[os state, minimum width=0.6cm] (b0) at (0,2) {4};
+\node[os state, minimum width=0.6cm, right=0pt of b0] (b1) {7};
+\node[os state, minimum width=1.3cm, right=0.1cm of b1] (b2) {8--15};
+\node[os label, left=0.3cm of b0] {win=8};
+
+% t=2: hit, win=16
+\node[os state, minimum width=0.6cm] (c0) at (0,1) {8};
+\node[os state, minimum width=0.6cm, right=0pt of c0] (c1) {15};
+\node[os state, minimum width=2.6cm, right=0.1cm of c1] (c2) {16--31};
+\node[os label, left=0.3cm of c0] {win=16};
+
+% t=3: hit, win=32
+\node[os state, minimum width=0.6cm] (d0) at (0,0) {16};
+\node[os state, minimum width=0.6cm, right=0pt of d0] (d1) {31};
+\node[os state, minimum width=5.3cm, right=0.1cm of d1] (d2) {32--63};
+\node[os label, left=0.3cm of d0] {win=32};
+
+\node[os label, font=\scriptsize] at (5,-0.8)
+  {\textcolor{BookMuted}{绿 = hit, 红 = miss, 蓝 = prefetch}};
+\end{fspdfdiagram}
+\fsdiagramnote{预读窗口增长过程。每次缓存命中（绿色）后，窗口大小翻倍。
+蓝色区域为预取的页。窗口从 4 页增长到 128 页（512 KiB），在连续命中
+5 次后达到上限。}
+
+预读算法的关键在于区分顺序访问与随机访问。如果检测到 \code{lseek()} 回退
+（当前读取位置在上次预读窗口之前），算法判定为随机访问，将窗口重置为 0
+（不预读）。这避免了为随机访问工作负载预取无用的页——随机 4 KiB 读取时
+预读 512 KiB 会浪费 99\% 的 I/O 带宽。
+
+% ------------------------------------------------------------------
+\fstopic{多流写入}
+% ------------------------------------------------------------------
+
+SSD 的垃圾回收（garbage collection, GC）是写放大的主要来源。当 GC 需要回收
+一个擦除块时，必须先将其中的有效页复制到其他块。如果一个擦除块中混合了
+长寿命数据（如文件系统元数据）和短寿命数据（如临时文件），GC 在回收短寿命
+数据的同时被迫复制长寿命数据——这完全是不必要的写放大。
+
+\emph{NVMe streams}（NVMe 1.3+ 规范）通过 \emph{Directive} 机制解决了这个
+问题。SSD 暴露多个流（stream），每个流被映射到不同的擦除块组。文件系统将
+不同生命周期的写入分配到不同的流：
+
+\begin{itemize}\tightlist
+\item 流 0：文件系统元数据（journal, inode table, directory blocks）——长寿命
+\item 流 1：热数据（数据库活跃表、日志文件）——中寿命
+\item 流 2：冷数据/临时数据（日志轮转、临时文件）——短寿命
+\end{itemize}
+
+\begin{fspdfdiagram}
+% Streams
+\node[os small block] (s0) at (0,3) {stream 0\\metadata};
+\node[os small block] (s1) at (3.5,3) {stream 1\\hot data};
+\node[os small block] (s2) at (7,3) {stream 2\\cold data};
+
+% Erase blocks for stream 0
+\node[os state] (b00) at (0,2) {valid};
+\node[os state, right=0pt of b00] (b01) {valid};
+\node[os state, right=0pt of b01] (b02) {valid};
+\node[os state, right=0pt of b02] (b03) {valid};
+
+% Erase blocks for stream 1
+\node[os state] (b10) at (3.5,2) {V};
+\node[os control, right=0pt of b10] (b11) {X};
+\node[os state, right=0pt of b11] (b12) {V};
+\node[os control, right=0pt of b12] (b13) {X};
+
+% Erase blocks for stream 2
+\node[os control] (b20) at (7,2) {X};
+\node[os control, right=0pt of b20] (b21) {X};
+\node[os control, right=0pt of b21] (b22) {X};
+\node[os control, right=0pt of b22] (b23) {X};
+
+\draw[os bus, ->] (s0) -- (b00);
+\draw[os bus, ->] (s1) -- (b10);
+\draw[os bus, ->] (s2) -- (b20);
+
+\node[os label] at (3.5,1.2) {GC 回收 stream 2 块: 全部无效 → 0 次复制};
+\node[os label] at (3.5,0.7) {\textcolor{BookMuted}{V = valid, X = invalid}};
+\end{fspdfdiagram}
+\fsdiagramnote{NVMe 多流写入。不同生命周期的数据分配到不同流，SSD 内部将
+流映射到不同的擦除块组。当 GC 回收 stream 2 的块时，所有页已无效——
+零次有效页复制，写放大 = 1.0。}
+
+\emph{收益}：当 GC 回收 stream 2 的擦除块时，由于该流中的数据都是短寿命的，
+很可能所有页都已经失效——无需复制任何有效页，直接擦除即可。而对于 stream 0
+的块，由于元数据是长寿命的，GC 很少需要回收它们。多流将 \emph{生命周期
+相似的数据隔离到不同的擦除块}，从根本上减少了 GC 的有效页复制量。
+
+ext4 和 XFS 的多流支持通过 \code{write\_hint} 接口（\code{f\_hint} 字段
+在 \code{struct inode} 中）实现，传递到块层的 \code{REQ\_OP\_WRITE} 请求中，
+最终通过 NVMe Directive 命令传递到 SSD。
+
+% ------------------------------------------------------------------
+\fstopic{延迟分配深入}
+% ----------------------------------------------------------------%
+
+传统文件系统在 \code{write()} 系统调用时立即分配物理块。但这有几个问题：
+（1）如果应用程序先写 4 KiB 块 A，再写 4 KiB 块 B（不相邻的偏移量），文件系统
+可能为 A 和 B 分配不相邻的物理块——即使 B 的写入随后紧随 A。（2）对于追加写入
+（append），立即分配无法利用未来的写入模式来优化布局。
+
+ext4 的 \emph{延迟分配}（delayed allocation, \code{delalloc}）将物理块分配
+推迟到写回（writeback）时间：
+
+\begin{enumerate}\tightlist
+\item \code{write()} 系统调用：数据进入页缓存，标记为脏页。ext4 在内存中
+      为该 inode 预留所需块数（per-inode reservation），但不分配物理块。
+      \code{write()} 返回成功。
+\item 写回触发（定时器、脏页比例超限、\code{fsync()}）：ext4 的多块分配器
+      \code{ext4\_mballoc} 一次性为该 inode 的所有脏页分配物理块。分配器在选择
+      合适的连续区段（contiguous extent）
+      时拥有全局视角——它看到所有待写入的页，可以选择最大连续的物理区段。
+\item 数据写入磁盘：所有脏页按分配的连续物理块顺序写入，最大化 I/O 效率。
+\end{enumerate}
+
+\begin{fspdfdiagram}
+% Timeline
+\node[os label] at (0,3.5) {t=0: write(4K)};
+\node[os label] at (3,3.5) {t=1: write(4K)};
+\node[os label] at (6,3.5) {t=2: write(4K)};
+\node[os label] at (9.5,3.5) {t=3: writeback};
+
+\node[os memory] (c1) at (0,2.5) {page A\\dirty};
+\node[os memory] (c2) at (3,2.5) {page B\\dirty};
+\node[os memory] (c3) at (6,2.5) {page C\\dirty};
+
+\node[os label] at (1.5,1.8) {\textcolor{BookMuted}{reserve (in-memory)}};
+\node[os label] at (4.5,1.8) {\textcolor{BookMuted}{reserve (in-memory)}};
+\node[os label] at (7.5,1.8) {\textcolor{BookMuted}{reserve (in-memory)}};
+
+\node[os compute] (a) at (9.5,2.5) {ext4\_mballoc:\\allocate 3 contiguous\\blocks at once};
+
+\draw[os bus, ->] (c1) to[bend left=20] (a);
+\draw[os bus, ->] (c2) to[bend left=10] (a);
+\draw[os bus, ->] (c3) -- (a);
+
+\node[os small block] (d) at (9.5,0.8) {disk: [A|B|C] contiguous};
+\draw[os strong bus, ->] (a) -- (d);
+\end{fspdfdiagram}
+\fsdiagramnote{延迟分配时间线。三次 \texttt{write()} 调用仅在内存中预留空间。
+写回时，ext4\_mballoc 一次性为所有脏页分配连续物理块，实现最优布局。}
+
+\emph{预留与超额预留}：每个 inode 按需预留块数，但多个 inode 的预留可能
+重叠（即总预留量可能超过实际可用空间）。ext4 使用全局空闲块计数器
+（\code{s\_freeclusters\_counter}）作为权威判断：在 \code{write()} 时检查
+全局计数器是否有足够空间，但实际分配在写回时才发生。如果写回时发现空间
+不足（其他 inode 的写回消耗了空间），\code{write()} 已经返回了成功——
+应用程序会收到一个延迟的 \code{ENOSPC} 错误。
+
+\begin{warningbox}
+延迟分配的 \code{ENOSPC} 延迟问题：\code{write()} 返回成功但写回时空间不足。
+ext4 通过 \code{li\_get\_block\_create\_hint} 和预留机制尽量避免此问题，
+但在接近满盘时仍可能发生。应用程序应当检查 \code{write()} 和 \code{fsync()}
+的返回值——\code{fsync()} 会冲刷所有延迟分配的块并返回最终的错误状态。
+\end{warningbox}
+
+% ------------------------------------------------------------------
+\fstopic{持久内存与 DAX}
+% ----------------------------------------------------------------%
+
+\emph{非易失性内存}（non-volatile memory, NVM）可以提供字节寻址或可直接映射的持久存储。Intel Optane PMEM（基于 3D XPoint）是历史上的典型代表，虽然产品已经停产，DAX、缓存行写回和持久化域等概念仍然重要。延迟会随介质、CPU、NUMA 拓扑和访问模式变化，本章不使用固定纳秒数代表整个类别。
+
+\emph{DAX 模式}（Direct Access，\code{CONFIG\_FS\_DAX}）：当文件系统以 DAX
+模式挂载时（\code{mount -o dax}），\code{mmap()} 系统调用返回的虚拟地址
+直接映射到 PMEM 的物理地址。\emph{没有页缓存}（page cache）介入，没有块
+设备层（block layer）介入。CPU 的 load/store 指令直接访问持久内存。
+
+\begin{lstlisting}[language=C]
+/* PMEM 持久性写入流程 (PMDK libpmem, simplified) */
+void pmem_persist(const void *addr, size_t len)
+{
+    /* 1. 将脏缓存行写回 PMEM */
+    pmem_clwb(addr, len);       /* clwb (Cache Line Write Back) */
+
+    /* 2. 确保所有 store 对其他 CPU 和 PMEM 可见 */
+    asm volatile("sfence" ::: "memory");  /* sfence (Store Fence) */
+
+    /* 此后 addr 处的数据已持久化到 PMEM。
+       断电也不会丢失。 */
+}
+
+/* 对比：传统文件系统写持久化 */
+void fs_persist(int fd)
+{
+    write(fd, buf, len);   /* 数据进入页缓存 */
+    fsync(fd);            /* 刷页缓存到块设备 → I/O syscall */
+    /* 需要 syscall 上下文切换 + 块层 + 驱动 */
+}
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+% Regular path (left)
+\node[os compute] (app1) at (0,4) {application};
+\node[os state] (k1) at (0,3) {syscall};
+\node[os memory] (c1) at (0,2) {page cache};
+\node[os state] (b1) at (0,1) {block layer};
+\node[os small block] (d1) at (0,0) {NVMe SSD};
+
+\draw[os bus, ->] (app1) -- (k1);
+\draw[os bus, ->] (k1) -- (c1);
+\draw[os bus, ->] (c1) -- (b1);
+\draw[os bus, ->] (b1) -- (d1);
+
+\node[os label] at (0,-0.7) {regular FS path};
+
+% DAX path (right)
+\node[os compute] (app2) at (5,4) {application};
+\node[os memory] (p2) at (5,2.5) {PMEM (DAX)};
+\node[os label, font=\scriptsize] at (5,1.5)
+  {\textcolor{BookMuted}{直接 load/store}};
+
+\draw[os strong bus, ->] (app2) -- (p2)
+  node[os label, midway, right, font=\scriptsize] {mmap()};
+
+\node[os label] at (5,-0.7) {DAX path};
+
+\node[os label, font=\scriptsize] at (2.5,4.5)
+  {映射后的数据访问绕过传统 page cache 与块 I/O 热路径};
+\end{fspdfdiagram}
+\fsdiagramnote{DAX 与传统 buffered I/O 数据路径对比。建立映射和处理缺页仍需
+系统调用、文件系统与驱动参与；映射建立后的普通 load/store 不再为每次访问走
+传统 page cache 和块 I/O 提交路径。}
+
+\emph{持久性保证}：DAX 模式下，CPU store 指令将数据写入 L1/L2 缓存，
+然后通过写缓冲（write buffer）异步刷新到 PMEM。如果在刷新完成前断电，
+数据会丢失。必须显式执行 \code{clwb}（Cache Line Write Back）将缓存行
+写回 PMEM，然后执行 \code{sfence}（Store Fence）确保所有之前的 store
+指令对 PMEM 可见。ext4 和 XFS 在 DAX 模式下的 \code{fsync()} 会遍历
+inode 的脏页，对每页执行 \code{clwb} + \code{sfence}。
+
+% ------------------------------------------------------------------
+\fstopic{大页支持}
+% ----------------------------------------------------------------%
+
+页缓存（page cache）传统上使用 4 KiB 页。对于大文件（例如 10 GiB 数据库），
+4 KiB 页意味着 $2.5 \times 10^6$ 个页表项，产生大量 TLB miss。x86-64 的
+TLB 容量有限（L1 dTLB 通常 64--72 项 for 4 KiB 页），覆盖范围仅 256--288 KiB。
+
+页缓存可以使用包含多个基础页的 large folio，减少逐页管理开销并形成更大的 I/O。
+这不等同于承诺用户映射一定得到 2 MiB TLB huge-page 映射；页缓存 folio 大小、
+页表映射粒度和文件系统支持是三个需要分别验证的条件。现代文件系统通常通过
+iomap 逐步获得 large-folio 支持，具体能力必须绑定内核版本和文件系统配置。
+
+对于顺序读取 10 GiB 文件：
+\begin{itemize}\tightlist
+\item 4 KiB 页：$2.5 \times 10^6$ 个页，TLB miss 频繁
+\item 2 MiB folio：只需约 5120 个 folio 对象，显著减少页缓存管理对象数量
+\item I/O 层面：较大 folio 有机会形成更大请求，但仍受 extent 连续性、设备限制和预读策略约束
+\end{itemize}
+
+% ------------------------------------------------------------------
+\fstopic{overlayfs 与容器}
+% ----------------------------------------------------------------%
+
+容器镜像通常由多个层（layer）组成：基础 OS 层 + 应用层 + 依赖层。每个层是
+一个只读的目录树。容器运行时需要一个可写层来记录修改。OverlayFS 将这些层叠合并
+为一个统一的目录视图。
+
+\begin{itemize}\tightlist
+\item \emph{lowerdir}（下层）：一个或多个只读目录，叠加顺序从下到上
+\item \emph{upperdir}（上层）：一个可写目录，所有修改写入此层
+\item \emph{workdir}（工作目录）：overlayfs 内部使用，用于 copy-up 原子操作
+\end{itemize}
+
+挂载命令：\\
+\code{mount -t overlay overlay -o lowerdir=/lower1:/lower2,upperdir=/upper,workdir=/work /merged}
+
+\emph{copy-up} 机制：当应用程序尝试写入一个位于 lower 层的文件时，
+overlayfs 不能直接修改只读的 lower 层。它先将文件从 lower 层完整复制到
+upper 层，然后在 upper 层的副本上执行写入。lower 层的原始文件保持不变
+（其他容器可能正在使用它）。
+
+\begin{lstlisting}
+=== overlayfs copy-up trace ===
+
+open("/etc/passwd", O_WRONLY)
+  │
+  ├─ lookup: /etc/passwd found in lower layer (read-only)
+  ├─ cannot write to lower layer
+  ├─ copy /etc/passwd: lower → upper (full file copy, atomic)
+  ├─ open upper copy for writing
+  └─ return fd (points to upper copy)
+
+write(fd, "newuser:x:1000:1000::/home/newuser:/bin/bash\n", 47)
+  │
+  └─ writes 47 bytes to upper copy
+     lower layer copy is unchanged
+
+close(fd)
+  │
+  └─ upper layer now has modified /etc/passwd
+
+=== 后续读取 ===
+open("/etc/passwd", O_RDONLY)
+  └─ overlayfs checks upper layer first → returns upper copy
+     (lower layer shadowed by upper copy)
+\end{lstlisting}
+
+\begin{fspdfdiagram}
+\node[os state] (m) at (0,4) {merged view: /merged\\\textcolor{BookMuted}{(应用看到的统一目录)}};
+\node[os compute] (u) at (0,2.5) {upper (read-write): /upper\\write here};
+\node[os control] (l1) at (0,1) {lower2 (read-only): app layer};
+\node[os control] (l2) at (0,-0.5) {lower1 (read-only): base OS};
+
+\draw[os strong bus, ->] (m) -- (u);
+\draw[os bus, ->] (u) -- (l1);
+\draw[os bus, ->] (l1) -- (l2);
+
+% Copy-up arrow
+\node[os label, font=\scriptsize, text=BookRed]
+  at (3.5,1.75) {copy-up};
+\draw[os feedback, ->, text=BookRed] (l1.east) to[bend right=40]
+  node[os label, midway, right, font=\scriptsize]
+  {copy on write} (u.east);
+\end{fspdfdiagram}
+\fsdiagramnote{OverlayFS 层叠结构。merged 是应用程序看到的统一视图。
+upper 是可写层。lower1/lower2 是只读层。copy-up：首次写入 lower 层文件时，
+文件被复制到 upper 层，后续操作在 upper 副本上进行。}
+
+\emph{性能注意}：copy-up 是同步操作——大文件的首次写入需要先完整复制文件
+到 upper 层。对于一个 1 GiB 的日志文件，首次 \code{open(O\_WRONLY)} 会触发
+1 GiB 的复制 I/O。此外，overlayfs 的目录查找需要在多个层中搜索，增加了
+\code{lookup()} 的开销。
+
+% ==================================================================
+\fsdivision{文件系统设计维度与取舍}
+% ==================================================================
+
+不同的文件系统做出了不同的设计选择，反映了对工作负载、兼容性和故障模型的取舍。功能开关、容量上限和算法会随版本、格式参数和操作系统集成变化，因此这里比较稳定的设计轴，不把易过期的“yes/no”和最大容量数字伪装成永久事实。
+
+\begingroup
+\small
+\setlength{\tabcolsep}{3pt}
+\begin{longtable}{|F{0.12\linewidth}|F{0.24\linewidth}|F{0.29\linewidth}|F{0.27\linewidth}|}
+\caption{主流文件系统的稳定设计取舍}\\
+\toprule
+\rowcolor{BookBlueTint}
+\textbf{系统} & \textbf{更新与索引思路} & \textbf{主要优势} & \textbf{边界与代价} \\
+\midrule
+\endfirsthead
+\caption[]{主流文件系统的稳定设计取舍（续）}\\
+\toprule
+\rowcolor{BookBlueTint}
+\textbf{系统} & \textbf{更新与索引思路} & \textbf{主要优势} & \textbf{边界与代价} \\
+\midrule
+\endhead
+\bottomrule
+\endfoot
+ext4 & extent 映射，jbd2 日志保护元数据更新 & 成熟、兼容性广，适合通用 Linux 工作负载 & 不原生提供 Btrfs/ZFS 式子卷快照和透明压缩 \\\tablerowrule
+XFS & allocation group、B+ 树和元数据日志 & 大文件、并行分配和高吞吐扩展性强 & 管理工具与恢复模型不同于 ext 系列；reflink 不等同于快照产品 \\\tablerowrule
+Btrfs & 数据和元数据采用 COW B 树 & 校验和、子卷、快照、压缩和 send/receive 集成 & 重写型负载可能碎片化；defrag 会破坏 extent sharing 并增加空间占用 \\\tablerowrule
+ZFS & COW 树、事务组、ZIL 与存储池 & 端到端校验、快照、压缩和冗余修复能力强 & 内存、运维模型和平台集成成本较高 \\\tablerowrule
+F2FS & 日志结构写入，NAT/SIT、checkpoint 与 GC & 面向闪存，支持冷热数据分离和自适应分配 & 空间压力下前台 GC 会形成尾延迟；不提供原生通用快照 \\\tablerowrule
+NTFS & MFT、run list 与 \$LogFile 元数据日志 & 与 Windows 权限、加密和管理生态紧密集成 & VSS 是上层卷影复制机制，不能简单等同于文件系统原生快照 \\\tablerowrule
+APFS & COW 元数据、空间共享、clone 与 snapshot & 面向 Apple 平台，集成加密、快照和快速克隆 & 实现与可用特性受 Apple 系统版本约束，跨平台可观测性有限 \\\tablerowrule
+\end{longtable}
+\endgroup
+
+\fstopic{设计哲学}
+
+\noindent\textbf{ext4}：兼容演进是重要约束。ext4 继承 ext2/ext3 的磁盘格式家族，并通过 compatible/incompatible feature flags 区分旧实现能否安全挂载；新建文件系统也可以选择更大的 inode 和新特性。ext4 通过区段树（extent tree）扩展块映射，通过 jbd2
+日志提供崩溃一致性，通过 inline\_data 和元数据校验和增量地添加现代特性。
+这种保守的演进路径使 ext4 成为 Linux 最广泛使用的文件系统，但也限制了
+它支持快照和透明压缩等需要根本性结构改变的功能。
+
+\noindent\textbf{XFS}：源自 SGI IRIX 系统，设计之初就面向大文件吞吐量。
+XFS 使用并行分配组（allocation groups, AG），每个 AG 有自己的 inode 表
+和空闲空间 B+ 树，允许多 CPU 并行分配而无需全局锁。XFS 的 B+ 树框架
+（\code{xfs\_btree}）是一个通用实现——空闲空间、inode 分配、区段映射
+和大目录都使用同一框架。XFS 不支持快照和压缩，但其对大文件顺序 I/O 的
+优化和并行性使其在高性能计算和数据库工作负载中表现优异。
+
+\noindent\textbf{Btrfs}：Oracle 赞助开发，目标是成为 Linux 的``下一代文件
+系统''。Btrfs 的核心是 COW B 树——元数据组织在多棵 B 树中，文件数据由 extent item 引用，更新通过 COW 发布新树路径。这使得创建快照通常很快，因为可以共享既有 extent。
+Btrfs 支持透明压缩、子卷（subvolume）、快照、发送/接收（send/receive）
+等现代特性。但 COW 的代价是碎片化——频繁修改的文件会被分散到不同位置。Btrfs 支持在已挂载文件系统上整理文件；代价是整理会重写 extent，并可能打破 reflink 或快照之间的 extent sharing，显著增加空间占用。
+
+\noindent\textbf{ZFS}：Sun Microsystems（后被 Oracle 收购）工程团队设计，
+将数据完整性置于一切之上。ZFS 的设计原则是``永不静默损坏''：每个块（数据
+和元数据）都有校验和，每次读取都验证。ZFS 的 COW + intent log (ZIL)
+提供了强一致性保证。ZFS 的存储池（zpool）模型将物理设备与文件系统解耦——
+多个文件系统可以共享一个池的存储空间。ZFS 支持透明压缩、去重、快照、
+克隆和纠错（RAID-Z）。代价是复杂性和内存消耗（ARC 缓存通常占用大量 RAM）。
+
+\noindent\textbf{F2FS}：Samsung 开发，专门为 NAND 闪存优化，主要目标
+是 Android 设备。F2FS 的设计围绕闪存的物理特性：日志结构写入
+（log-structured write）将随机写转换为顺序写，减少闪存擦除次数；冷热
+数据分离（warm/cold separation）将不同生命周期的数据写入不同区域，
+减少 GC 开销。后台 GC 可以在 I/O 空闲时清理；空间压力触发的前台 GC 则可能直接增加应用延迟。F2FS 不提供原生通用快照和去重，其目标是在闪存上平衡写放大、吞吐和尾延迟。
+
+\noindent\textbf{NTFS}：Microsoft 为 Windows NT 设计，使用 \$LogFile 日志
+保证元数据一致性。小文件数据可以作为 resident attribute 保存在 MFT 记录中，
+大文件则用 run list 描述簇范围。NTFS 支持每文件压缩和 EFS 加密；Windows 的
+VSS 与服务器数据去重属于更大的存储栈，讨论时不能直接当成 NTFS 磁盘格式本身的能力。
+
+\noindent\textbf{APFS}：Apple 为 macOS/iOS 设计，2017 年推出。APFS 针对闪存
+优化——所有写入都是 COW，原生支持 TRIM，并为 SSD 优化了空间分配。APFS 的
+快照可被 Time Machine 等上层功能使用。APFS 原生支持加密、snapshot 和 clone；
+clone 利用共享 extent 避免创建时复制全部数据，但后续写入仍会分配新空间，不能把它理解成永远零成本。
+
+\begin{keyidea}
+没有``最好的''文件系统，只有不同约束下的权衡。ext4 追求稳定兼容，
+XFS 追求大文件吞吐，Btrfs 追求功能丰富，ZFS 追求数据完整性，F2FS 追求
+闪存友好，NTFS 追求 Windows 生态，APFS 追求 Apple 生态。选择取决于
+工作负载、硬件平台和可靠性要求。
+\end{keyidea}
+
+% ==================================================================
+\fsdivision{结构不变量与崩溃恢复检验}
+% ==================================================================
+
+文件系统的正确性和性能不能仅靠代码审查保证。一个文件系统必须在各种异常
+条件下经过系统性测试——包括崩溃恢复、并发竞争、空间碎片和闪存磨损。
+以下测试分类和具体场景构成了一个文件系统验证的最小集合。
+
+\fstopic{测试分类}
+
+\begin{rubricbox}{Correctness（正确性）}
+\begin{itemize}\tightlist
+\item 基本 API 正确性：\code{create}、\code{unlink}、\code{rename}、\code{link}、
+      \code{fsync}、\code{fdatasync} 在所有文件类型上的行为
+\item 边界条件：空文件、最大文件、路径长度上限、文件名特殊字符
+\item 崩溃恢复：在每个操作序列的每个中间状态下断电，验证恢复后状态
+\end{itemize}
+\end{rubricbox}
+
+\begin{rubricbox}{Performance（性能）}
+\begin{itemize}\tightlist
+\item 顺序读/写吞吐量：1 MiB 块大小，测量 MB/s 和 IOPS
+\item 随机读/写吞吐量：4 KiB 块大小，队列深度 1/16/64
+\item 不同块大小（512 B -- 1 MiB）下的吞吐量曲线
+\item 元数据操作延迟：\code{stat}、\code{open}、\code{readdir} 的 p99 延迟
+\end{itemize}
+\end{rubricbox}
+
+\begin{rubricbox}{Scalability（可扩展性）}
+\begin{itemize}\tightlist
+\item 单目录 1M 文件：\code{readdir}、\code{lookup}、\code{unlink} 性能
+\item 10 TiB 单文件：顺序读写性能不随偏移量退化
+\item 100 万并发文件描述符：内核内存消耗和调度延迟
+\end{itemize}
+\end{rubricbox}
+
+\begin{rubricbox}{Crash Recovery（崩溃恢复）}
+\begin{itemize}\tightlist
+\item 故障注入：在每个操作（\code{create}、\code{write}、\code{fsync}、
+      \code{rename}、\code{unlink}）的每个步骤后断电
+\item 日志恢复：验证 jbd2/ZIL/checkpoint 在各种中断场景下能正确恢复
+\item 校验和验证：注入位翻转后，文件系统是否能检测并报告损坏
+\end{itemize}
+\end{rubricbox}
+
+\begin{rubricbox}{Concurrency（并发）}
+\begin{itemize}\tightlist
+\item 100 个进程在同一目录中并发创建文件——无数据竞争，无死锁
+\item 并发 \code{rename} 到同一目标路径——最终状态一致
+\item 并发 \code{fsync} 与 \code{write}——崩溃后数据状态可预测
+\end{itemize}
+\end{rubricbox}
+
+\begin{rubricbox}{Space Efficiency（空间效率）}
+\begin{itemize}\tightlist
+\item 1M 次 create + delete 循环后测量碎片化程度
+\item 填充至 99\% 后随机 create/delete——验证分配器在满盘时的退化
+\item 空闲空间报告准确性：\code{statfs()} 报告的空闲块数与实际一致
+\end{itemize}
+\end{rubricbox}
+
+\begin{rubricbox}{Flash Optimization（闪存优化）}
+\begin{itemize}\tightlist
+\item 写放大测量：写入 100 GiB 数据，测量 SSD 实际闪存写入量
+\item TRIM 有效性：删除大量文件后验证 SSD 回收了擦除块
+\item 对齐：验证文件系统块大小与 SSD 页大小对齐
+\end{itemize}
+\end{rubricbox}
+
+\fstopic{具体测试场景}
+
+以下场景覆盖了最常见的文件系统故障模式：
+
+\begin{enumerate}\tightlist
+\item \textbf{崩溃在同步之前}：创建并写文件 → 在任意步骤崩溃 → 恢复。未建立持久化承诺时，文件可能不存在，也可能以某个已提交状态存在；测试应验证文件系统结构合法、旧状态仍可解释，并且不会暴露越界块、悬空目录项或未初始化数据，而不是强行要求“文件不应存在”。
+\item \textbf{新文件的持久发布}：创建并写临时文件 → \code{fsync(file)} → \code{rename} 到目标名 → \code{fsync(parent\_dir)} → 崩溃 → 恢复 → 文件名和正确数据都必须存在。只同步文件不能单独保证包含它的目录项已经持久化。
+\item \textbf{每 4K fsync 的吞吐量}：顺序写入 1 MiB，每 4 KiB 后调用
+      \code{fsync} → 测量吞吐量和 p50/p95/p99 延迟。这是数据库 WAL 的典型模式。报告必须记录设备型号、缓存与断电保护、文件系统版本、挂载参数、队列深度和测试工具；没有这些条件，不给固定“预期 IOPS”。
+\item \textbf{并发创建}：100 个进程各在同一目录中创建 1000 个文件 →
+      \emph{无文件丢失、无数据竞争、无死锁}。验证目录锁的正确性。
+\item \textbf{满盘碎片化}：填充至 99\% → 随机 create/delete 10000 次 →
+      测量碎片化（最大连续空闲区段 vs 总空闲空间）。验证分配器不会
+      退化到无法分配连续区段。
+\item \textbf{SSD 写放大}：在 SSD 上写入 100 GiB → 读取 SSD SMART
+      \code{Media\_Wearout\_Indicator} 或厂商提供的 NAND 写入计数 → 计算实际闪存写入量与逻辑写入量之比。不同 SSD 对 SMART 字段的定义不同，必须先验证计数单位，并把文件系统写放大与设备 FTL 写放大分开报告。
+\item \textbf{快照一致性}：创建快照 → 修改 10\% 的数据 → 验证快照仍然
+      保存原始数据 → 删除快照 → 验证空间被正确回收。
+\item \textbf{累积崩溃}：在持续写入工作负载下，执行 1000 次随机断电 →
+      每次恢复后验证文件系统一致性 → \emph{无累积损坏}。验证日志
+      恢复是幂等的。
+\end{enumerate}
+
+% ==================================================================
+\fsdivision{关键机制的运行路径}
+% =================================================================%
+
+下面通过经过删减的 Linux 关键函数说明路径查找、区段映射、日志提交、写回和目录项
+缓存之间的控制关系。代码保留影响机制理解的分支和状态转换，省略与主题无关的参数
+处理及平台细节。
+
+% ------------------------------------------------------------------
+\fstopic{Linux VFS 核心路径}
+% ------------------------------------------------------------------
+
+路径查找（path lookup）是文件系统最频繁的操作——每次 \code{open()}、
+\code{stat()}、\code{read()} 都需要将路径名解析为 inode。Linux VFS 通过
+\code{path\_lookupat} 组织这条查找路径。
+
+路径查找有两条路径：\emph{RCU walk}（无锁快速路径）和 \emph{ref walk}
+（引用计数慢速路径）。RCU walk 使用 Read-Copy-Update 机制在无锁状态下
+遍历 dentry 和 inode——这是 \code{stat} 和 \code{open} 热路径上的常见
+情况（缓存命中）。当遇到复杂情况（跨挂载点、符号链接、dentry 缺失、
+竞争检测到修改）时，RCU walk 回退到 ref walk，后者使用 \code{d\_lock}
+和 \code{i\_rwsem} 保证安全。
+
+\begin{lstlisting}[language=C]
+/* VFS path lookup (simplified) */
+static int path_lookupat(struct nameidata *nd,
+                         unsigned flags, struct path *path)
+{
+    /* Phase 1: try RCU walk (lockless, fast path) */
+    rcu_read_lock();
+    nd->flags |= LOOKUP_RCU;
+    err = link_path_walk(nd);          /* walk path components */
+    if (!err && can_lookup_fast(nd))
+        err = walk_component(nd);     /* try dcache hit */
+    rcu_read_unlock();
+
+    /* Phase 2: fallback to ref walk on contention */
+    if (err == -ECHILD || err == -ESTALE) {
+        err = link_path_walk(nd);      /* ref walk: d_lock + i_rwsem */
+    }
+    return err;
+}
+
+/* walk_component: fast path vs slow path */
+static int walk_component(struct nameidata *nd)
+{
+    /* lookup_fast: dcache hit (RCU-protected) */
+    dentry = lookup_fast(nd);         /* d_lookup in dcache */
+    if (dentry)
+        return step_into(nd, dentry);  /* consume one component */
+
+    /* lookup_slow: dcache miss → call filesystem */
+    dentry = lookup_slow(nd);          /* inode->i_op->lookup() */
+    return step_into(nd, dentry);
+}
+\end{lstlisting}
+
+RCU walk 的性能优势在于完全避免了原子操作和缓存行争用。在高度并行的
+场景下（例如 Web 服务器处理数千并发请求），RCU walk 能显著减少共享锁和引用计数争用。不过路径遍历仍与路径分量数量相关，并没有从算法上的 $O(n)$ 变成 $O(1)$；改善的是并发扩展性和常数开销。
+
+% ------------------------------------------------------------------
+\fssubtopic{ext4 extent 查找}
+% ----------------------------------------------------------------%
+
+ext4 使用 \code{ext4\_ext\_map\_blocks} 查找区段树（extent tree）。给定一个
+逻辑块号，该函数在 B+ 树中查找对应的物理块号。
+
+\begin{lstlisting}[language=C]
+/* ext4 extent lookup (simplified) */
+int ext4_ext_map_blocks(handle_t *handle, struct inode *inode,
+    struct ext4_map_blocks *map, int flags)
+{
+    struct ext4_extent_header *eh;
+    struct ext4_extent *ex;
+    ext4_lblk_t block = map->m_lblk;  /* logical block number */
+
+    /* Start from inline header in inode */
+    eh = ext_inode_hdr(inode);  /* i_block[0] as extent header */
+
+    /* Traverse B+ tree: descend from root to leaf */
+    while (eh->eh_depth > 0) {
+        /* Index node: find correct child pointer */
+        struct ext4_extent_idx *idx;
+        idx = ext4_ext_find_index(eh, block);
+        bh = sb_bread(sb, ext4_idx_pblock(idx));  /* read child */
+        eh = ext_block_hdr(bh);
+    }
+
+    /* Leaf level: search for extent covering 'block' */
+    ex = ext4_ext_search_right(eh, block);
+    if (ex == NULL) {
+        /* No extent covers this range → it's a hole */
+        map->m_flags |= EXT4_MAP_HOLE;
+        map->m_pblk = 0;  /* zero-filled page on read */
+        return 0;
+    }
+
+    /* Found: compute physical block */
+    map->m_pblk = ext4_ext_pblock(ex) + (block - ex->ee_block);
+    map->m_len = ext4_ext_get_actual_len(ex)
+                 - (block - ex->ee_block);
+    return map->m_len;
+}
+\end{lstlisting}
+
+\emph{空洞（hole）处理}：如果逻辑块号不在任何 extent 的覆盖范围内，
+\code{ext4\_ext\_map\_blocks} 返回 \code{EXT4\_MAP\_HOLE} 标志。VFS 层
+据此返回一个全零页——读取空洞区域得到零字节，不需要分配物理块。
+
+% ------------------------------------------------------------------
+\fssubtopic{jbd2 提交}
+% ----------------------------------------------------------------%
+
+ext4 的日志由 jbd2（Journaling Block Device 2）驱动。
+\code{jbd2\_journal\_commit\_transaction} 将内存中的事务，也就是一组已经登记的
+元数据修改，提交到磁盘日志区域。
+
+\begin{lstlisting}[language=C]
+/* jbd2 transaction commit (simplified) */
+int jbd2_journal_commit_transaction(journal_t *journal)
+{
+    transaction_t *commit_txn = journal->j_running_transaction;
+
+    /* Phase 1: write all descriptors and data buffers */
+    /* For each journal block: write to log area */
+    err = journal_write_data_buffers(commit_txn);
+
+    /* Phase 2: write commit block */
+    commit_blk = jbd2_journal_get_descriptor(journal);
+    commit_blk->h_magic = JBD2_MAGIC_NUMBER;
+    commit_blk->h_blocktype = JBD2_COMMIT_BLOCK;
+
+    /* CRC32C checksum of all blocks in this transaction */
+    commit_blk->h_chksum_type = JBD2_CRC32C;
+    commit_blk->h_chksum[0] = crc32c_journal(commit_txn);
+
+    /* Write commit block → this is the atomic commit point */
+    submit_bio(WRITE, commit_bio);
+    wait_for_completion();  /* commit record is now durable */
+
+    /* Phase 3: checkpoint */
+    /* Move committed data from log to final locations,
+       then free journal space for reuse */
+    jbd2_journal_checkpoint_transaction(journal);
+}
+\end{lstlisting}
+
+提交块（commit block）是事务的原子提交点——只有在提交块成功写入后，
+事务才算``已提交''。如果在写入提交块之前崩溃，恢复时该事务被视为未提交，
+所有相关修改回滚。提交块中的 CRC32C 校验和用于在恢复时验证提交块
+本身没有损坏。
+
+% ------------------------------------------------------------------
+\fssubtopic{XFS B+ 树框架}
+% ----------------------------------------------------------------%
+
+XFS 的核心索引结构共用一套 B+ 树框架。这个框架提供查找、插入和删除的通用实现，
+具体的数据结构再通过函数指针定制键值提取和比较规则。
+
+\begin{lstlisting}[language=C]
+/* XFS generic B+ tree lookup (simplified) */
+int xfs_btree_lookup(struct xfs_btree_cur *cur,
+                     xfs_lookup_t dir, int *stat)
+{
+    /* Traverse from root to leaf, comparing keys */
+    for (level = cur->bc_nlevels - 1; level >= 0; level--) {
+        /* Binary search within node */
+        xfs_btree_binary_search(cur, level, &key, &ptr);
+        if (ptr > xfs_btree_get_numrecs(block))
+            ptr = xfs_btree_get_numrecs(block);
+        if (level > 0)
+            block = xfs_btree_read_block(cur, ptr);  /* descend */
+    }
+    *stat = (found_exact_match) ? 1 : 0;
+    return 0;
+}
+
+/* Users of the generic framework:
+ * - xfs_btree_cur for free space by block number  (AGFL)
+ * - xfs_btree_cur for free space by block count    (AGFL)
+ * - xfs_btree_cur for inode allocation             (AGI)
+ * - xfs_btree_cur for extent map                   (BMBT)
+ * - xfs_btree_cur for directory (large dirs)       (BMDA)
+ */
+\end{lstlisting}
+
+所有 XFS 的 B+ 树（空闲空间索引、inode 分配、区段映射、大目录）都通过
+\code{struct xfs\_btree\_cur} 配置不同的比较函数和键值类型，共享同一套
+遍历、插入和删除代码。这种设计避免了代码重复，也保证了所有 B+ 树操作的
+一致性。
+
+% ------------------------------------------------------------------
+\fssubtopic{Btrfs 事务提交}
+% ----------------------------------------------------------------%
+
+Btrfs 的 \code{btrfs\_commit\_transaction} 使用 COW 树、generation、校验和与超级块
+提交协议维护一致状态。它没有 ext4/jbd2 那样的块日志，但存在专门的 tree-log，
+用于在完整事务提交前记录 \code{fsync} 等需要持久化的更新；不能概括成
+“B 树本身就是全部日志”。
+
+\begin{lstlisting}[language=C]
+/* Btrfs transaction commit (simplified) */
+int btrfs_commit_transaction(struct btrfs_trans_handle *trans)
+{
+    struct btrfs_transaction *cur = trans->transaction;
+
+    /* Phase 1: COW all modified B-tree nodes */
+    /* Each modified node is written to a NEW disk location.
+       Old locations remain intact until superblock is updated. */
+    btrfs_write_dirty_block_groups(trans);
+    btrfs_write_dirty_roots(trans);  /* COW B-tree nodes */
+
+    /* Phase 2: write superblock with new root pointers */
+    /* Write checksummed superblock mirrors carrying new generations. */
+    btrfs_write_super(trans);
+
+    /* Phase 3: mark old data as reclaimable */
+    /* Old B-tree nodes are no longer referenced.
+       Future writes can reuse those disk blocks. */
+    btrfs_run_delayed_refs(trans);
+}
+
+/* Two ways to join a transaction:
+ * btrfs_join_transaction:  read-only join, does NOT force commit
+ * btrfs_start_transaction: write join, MAY force commit if
+ *                           transaction is large or old
+ */
+\end{lstlisting}
+
+Btrfs 在固定物理位置保存超级块镜像，超级块带 checksum 和 generation，并指向
+各棵树的已提交根。恢复不能假定“任意单扇区写天然原子”，而要验证超级块及其
+引用树是否属于完整代数。旧块只在仍被已提交树或快照引用时保留；引用解除并跨过
+安全事务边界后，空间最终可以复用，所以“旧数据永远不覆盖”也不是永久承诺。
+
+% ------------------------------------------------------------------
+\fssubtopic{page cache 与写回}
+% ----------------------------------------------------------------%
+
+Linux 的脏页管理分为全局调节和文件系统写回两个层次：前者计算全局脏页阈值并实施
+写回节流，后者组织写回线程的主循环和逐 inode 的写回逻辑。
+
+\begin{lstlisting}[language=C]
+/* global dirty-page throttling (simplified) */
+/* vm_dirty_ratio (default 20%): max dirty pages as % of memory */
+/* vm_dirty_background_ratio (default 10%): when writeback starts */
+
+void global_dirty_limits(unsigned long *pbackground,
+                          unsigned long *pdirty)
+{
+    unsigned long total = global_page_state(NR_FREE_PAGES)
+                        + global_reclaimable_pages();
+    *pbackground = total * vm_dirty_background_ratio / 100;
+    *pdirty      = total * vm_dirty_ratio / 100;
+    /* When dirty pages > pdirty: new write() blocks
+       When dirty pages > pbackground: writeback thread wakes */
+}
+
+/* filesystem writeback thread (simplified) */
+void wb_workfn(struct work_struct *work)
+{
+    while (!list_empty(&bdi->work_list)) {
+        /* Pop next inode to write back */
+        inode = wb_writeback_single(bdi, &wbc);
+        __writeback_single_inode(inode, &wbc);
+        /* Calls mapping->a_ops->writepages() → filesystem writeback
+           which calls ext4_mballoc to allocate blocks
+           for all dirty pages at once (delayed alloc!) */
+    }
+}
+\end{lstlisting}
+
+\code{\_\_writeback\_single\_inode} 通过 \code{mapping->a\_ops->writepages}
+进入文件系统写回路径，后者负责将脏 folio 变成块映射与 I/O。对于延迟分配的
+文件系统，\code{writepages} 是实际物理块分配发生的时刻——多块分配器
+\code{ext4\_mballoc} 在此处一次性为所有脏页分配连续物理块。
+
+% ------------------------------------------------------------------
+\fssubtopic{dcache RCU 遍历}
+% ----------------------------------------------------------------%
+
+目录项缓存（dcache）保存路径分量到 inode 的查找结果。dcache 的查找使用 RCU
+实现无锁快速路径。
+
+\begin{lstlisting}[language=C]
+/* dcache lookup (simplified) */
+struct dentry *d_lookup(const struct dentry *parent,
+                        const struct qstr *name)
+{
+    /* RCU fast path: lockless dcache lookup */
+    rcu_read_lock();
+    hlist = rcu_dereference(
+        parent->d_flags & DCACHE_OP_COMPARE
+        ? d_compare_rcu : d_hash_rcu);
+    hlist_for_each_entry_rcu(dentry, hlist, d_hash) {
+        if (dentry->d_parent != parent) continue;
+        if (qstr_casecmp(&dentry->d_name, name)) continue;
+        if (d_unhashed(dentry)) continue;  /* being removed */
+        /* Hit! But must verify under RCU */
+        if (lockref_get_not_dead(&dentry->d_lockref)) {
+            rcu_read_unlock();
+            return dentry;  /* cache hit */
+        }
+    }
+    rcu_read_unlock();
+    return NULL;  /* cache miss → call filesystem lookup */
+}
+\end{lstlisting}
+
+RCU walk 依次调用 \code{link\_path\_walk}、\code{walk\_component}、
+\code{lookup\_fast} 和 \code{d\_lookup}。
+整个路径在 \code{rcu\_read\_lock()} 保护下执行，不持有任何自旋锁。
+当 \code{d\_lookup} 返回 NULL（缓存缺失）或检测到 dentry 正在被删除时，
+VFS 回退到 \code{lookup\_slow}，后者获取 \code{i\_rwsem} 信号量并调用
+文件系统的 \code{i\_op->lookup} 方法。
+
+% ------------------------------------------------------------------
+\fssubtopic{应用层一致性不能外包给文件系统}
+% ----------------------------------------------------------------%
+
+文件系统的日志保证的是 \emph{文件系统自身元数据} 的一致性——inode 表、
+目录项、空闲块位图不会因为崩溃而损坏。但文件系统 \emph{不保证} 应用层面的
+多文件事务一致性。如果一个应用需要原子地更新两个文件（例如：写入数据文件
+A 和更新指向 A 的索引文件 B），文件系统的日志无法帮助——每个文件系统操作
+（\code{write}、\code{fsync}）是独立的，崩溃可能发生在两者之间。
+
+应用必须自行实现原子性。\emph{清单发布协议}（manifest publish protocol）
+是一种常用模式，利用 \code{rename} 的原子性作为提交点：
+
+\begin{lstlisting}[language=C]
+/* Manifest publish protocol — atomic multi-file update */
+
+/* Step 1: Write data object to a unique, versioned path */
+int fd = open("objects/v42/data", O_WRONLY|O_CREAT|O_EXCL, 0644);
+write_all(fd, data, data_len);
+fsync(fd);                    /* persist data to disk */
+close(fd);
+
+/* Step 2: Write manifest referencing the object */
+fd = open("manifests/v42", O_WRONLY|O_CREAT|O_EXCL, 0644);
+write_all(fd, manifest_content);  /* includes checksums, metadata */
+fsync(fd);                    /* persist manifest */
+close(fd);
+
+/* Step 3: Atomic publish via rename */
+rename("manifests/v42", "CURRENT");
+/* rename is atomic: either readers see old CURRENT or new CURRENT,
+   never an intermediate state */
+
+/* Step 4: Persist the directory entry change */
+int dirfd = open(".", O_RDONLY|O_DIRECTORY);
+fsync(dirfd);                 /* ensure rename is durable */
+close(dirfd);
+
+/* Readers: always read CURRENT, which points to a consistent
+   manifest+data pair. No partial state is ever visible. */
+\end{lstlisting}
+
+\begin{keyidea}
+不同层次的一致性由不同的日志机制保护，各司其职，不可混淆：
+
+\begin{enumerate}\tightlist
+\item \emph{文件系统日志}（jbd2/ZIL/Btrfs COW）保护文件系统 \emph{结构} 的
+      一致性——inode、目录项、位图不会损坏。
+\item \emph{数据库 WAL}（Write-Ahead Log）保护数据库 \emph{事务} 的
+      一致性——事务要么全部提交，要么全部回滚。
+\item \emph{应用清单}（manifest + atomic rename）保护应用 \emph{版本} 的
+      一致性——读者要么看到旧版本，要么看到新版本，不会看到中间状态。
+\end{enumerate}
+
+文件系统的崩溃一致性保证止步于元数据。应用程序的跨文件原子性是应用自身
+的责任——不能外包给文件系统。
+\end{keyidea}
+
+\end{filesystemlayout}
