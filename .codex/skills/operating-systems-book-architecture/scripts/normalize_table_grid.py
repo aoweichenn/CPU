@@ -10,7 +10,6 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[4]
 LATEX = REPO / "books" / "operating-systems-volume-1" / "source" / "latex"
-MAIN = LATEX / "main.tex"
 INPUT_RE = re.compile(r"\\input(?:topic|detail)?\{([^}]+)\}")
 BEGIN_RE = re.compile(r"\\begin\{longtable\}\{([^{}]*(?:\{[^{}]*\}[^{}]*)*)\}")
 COLUMN_RE = re.compile(r"([pLF])\{([^{}]+)\}")
@@ -22,8 +21,8 @@ STRUCTURAL_RULE_RE = re.compile(
 )
 
 
-def reachable_files() -> list[Path]:
-    pending = [MAIN]
+def reachable_files(latex: Path) -> list[Path]:
+    pending = [latex / "main.tex"]
     seen: set[Path] = set()
     while pending:
         path = pending.pop()
@@ -37,7 +36,7 @@ def reachable_files() -> list[Path]:
         for match in INPUT_RE.finditer(text):
             if "#" in match.group(1):
                 continue
-            child = (LATEX / f"{match.group(1)}.tex").resolve()
+            child = (latex / f"{match.group(1)}.tex").resolve()
             if child not in seen:
                 pending.append(child)
     return sorted(seen)
@@ -103,10 +102,17 @@ def main() -> int:
         action="store_true",
         help="report required changes without writing files",
     )
+    parser.add_argument(
+        "--latex-dir",
+        type=Path,
+        default=LATEX,
+        help="包含 main.tex 的 LaTeX 根目录",
+    )
     args = parser.parse_args()
+    latex = args.latex_dir.resolve()
 
     dirty: list[tuple[Path, int, int]] = []
-    for path in reachable_files():
+    for path in reachable_files(latex):
         original = path.read_text(encoding="utf-8")
         normalized, specs, rows = normalize_text(original)
         if original == normalized:

@@ -30,6 +30,10 @@ ROADMAP_ROW_RE = re.compile(
     r"^\|\s*(v\d+(?:\.\d+)*)\s*\|\s*([^|]+?)\s*\|\s*([^|]+?)\s*\|",
     re.MULTILINE,
 )
+ROADMAP_HEADING_RE = re.compile(
+    r"^#{2,6}\s+(v\d+(?:\.\d+)*)(?=\s|$)",
+    re.MULTILINE,
+)
 README_CURRENT_RE = re.compile(
     r"当前状态：`(v\d+(?:\.\d+)*)(?:[^`]*)`\s*已完成"
 )
@@ -147,18 +151,22 @@ def roadmap_state(project: Path) -> tuple[list[str], list[str]]:
     if not rows:
         raise ValueError("docs/roadmap.md 中没有可识别的版本表")
 
-    versions = [version for version, _, _ in rows]
+    versions = {
+        version
+        for version, _, _ in rows
+    }
+    versions.update(ROADMAP_HEADING_RE.findall(roadmap))
     completed = [
         version
-        for version, stage, _ in rows
-        if "完成" in stage
+        for version, _, status in rows
+        if "完成" in status
     ]
     if not completed:
         raise ValueError("docs/roadmap.md 中没有已完成里程碑")
 
-    versions.sort(key=version_key)
+    ordered_versions = sorted(versions, key=version_key)
     completed.sort(key=version_key)
-    return versions, completed
+    return ordered_versions, completed
 
 
 def live_state(project: Path) -> dict[str, object]:
