@@ -34,20 +34,21 @@ CHAPTER_INPUT_RE = re.compile(r"^\\input\{chapters18/([^}]+)\}", re.MULTILINE)
 
 EXPECTED_PARTS = 5
 EXPECTED_CHAPTERS = 18
-# The formal volume follows one causal route from a no-OS machine to diagnosis.
+# The formal volume follows the companion project's milestones first, then
+# deepens each milestone into the corresponding operating-system mechanism.
 EXPECTED_CHAPTER_INPUTS = (
     "ch01-bare-machine-to-kernel",
-    "ch02-task-scheduling",
-    "ch03-system-call-boundary",
-    "ch04-exec-image",
-    "ch05-synchronization",
     "ch06-address-space",
-    "ch07-file-backed-memory",
+    "ch04-exec-image",
+    "ch03-system-call-boundary",
     "ch08-kernel-allocators",
     "ch09-device-requests",
+    "ch02-task-scheduling",
+    "ch05-synchronization",
     "ch10-block-vfs",
     "ch11-filesystem-formation",
     "ch12-filesystem-indexing",
+    "ch07-file-backed-memory",
     "ch13-filesystem-recovery",
     "ch14-modern-filesystems",
     "ch15-network-endpoints",
@@ -165,6 +166,7 @@ def main() -> int:
 
     required = (
         ROOT / "frontmatter" / "abbreviations.tex",
+        ROOT / "frontmatter" / "project-spine.tex",
         ROOT / "backmatter" / "capability-checklist.tex",
         ROOT / "backmatter" / "supplement-reading-map.tex",
         ROOT / "chapters18" / "evolution",

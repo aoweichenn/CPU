@@ -1,0 +1,445 @@
+\chapter*{贯穿案例：从复位向量到一台可扩展的操作系统}
+\addcontentsline{toc}{chapter}{贯穿案例：从复位向量到一台可扩展的操作系统}
+
+本册使用一套真实的 x86-64 教学系统作为贯穿案例。案例不借助现成固件或第三方
+引导器把内核直接放进内存，而是从处理器复位向量接管机器：自研 ROM 初始化最早
+的串口和磁盘访问，装入 Stage 1；Stage 1 建立长模式，校验并装入 ELF64 内核；
+内核再接管描述符表、异常、内存、中断和设备。这样，每个操作系统对象都能回到
+一个已经发生的机器状态变化，而不是停在术语定义上。
+
+\begin{keyidea}
+项目主线负责回答“当前机器真实拥有什么、下一步为什么失败、最小实现怎样通过
+证据验收”；其后的原理正文负责把同一问题扩展到多任务、多核、并发、故障恢复和
+现代系统规模。案例给出骨架，深入章节解释骨架继续生长时必须遵守的规则。
+\end{keyidea}
+
+\section*{先确定案例的边界}
+
+模拟器在案例中只承担硬件角色：它提供 x86-64 处理器、内存、串口、IDE、
+计时器、中断控制器和键盘等器件。复位后执行什么字节、怎样读取磁盘、何时打开
+分页、如何解析 ELF、异常入口保存什么、哪个中断需要确认，均由目标系统自行
+决定。这个边界很重要：如果外部环境已经替内核装入 ELF、建立页表或准备
+BootInfo，读者就看不到这些对象为什么存在，也无法区分硬件事实和软件策略。
+
+案例当前已经完成 v0.0 至 v0.7，共有 \(52\) 个进入目标系统的 C++ 或汇编
+源文件，约 \(5307\) 行非空、非纯注释目标代码。代码量不是完成证据；更重要的
+事实是，机器已经能够从 \code{0xFFFFFFF0} 取到自研指令，最终在内核中接收
+真实 PIT 和键盘中断，并用独立的 ATA PIO 驱动重新读取启动盘。用户态、进程
+调度、同步、文件系统和 Shell 属于 v0.8 以后的里程碑，不能把后文的完整设计
+误写成当前代码已经实现的功能。
+
+取得内核控制权以前，五个里程碑依次建立可验证的启动链：
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.23\linewidth}|L{0.31\linewidth}|L{0.24\linewidth}|}
+\toprule
+版本 & 当前机器新增能力 & 必须保留的状态或契约 & 成功证据 \\
+\midrule
+v0.0 & 固定目标平台与空镜像基线 & CPU 型号、内存大小、设备集合与有界运行时间 & 空镜像不能伪造启动成功 \\\tablerowrule
+v0.1 & ROM 从复位向量执行并输出串口 & 复位地址、16 位入口、栈、COM1 寄存器与轮询预算 & \code{RESET}、\code{SERIAL_READY} \\\tablerowrule
+v0.2 & 固件读取并交接 Stage 1 & 磁盘描述符、LBA、加载区间、入口和负载校验 & \code{STAGE1_HEADER_VALID}、\code{STAGE1_LOADED} \\\tablerowrule
+v0.3 & Stage 1 进入 64 位长模式 & A20、GDT、页表、CR0、CR3、CR4 与 EFER 的提交顺序 & \code{LONG_MODE} \\\tablerowrule
+v0.4 & ELF64 内核获得控制权 & Kernel 容器、PT\_LOAD、BSS、BootInfo 与调用 ABI & \code{KERNEL_TRANSFER}、\code{KERNEL ENTERED} \\
+\bottomrule
+\end{longtable}
+
+内核取得控制权以后，后三个里程碑把临时启动环境逐步替换成内核长期拥有的
+控制结构：
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.23\linewidth}|L{0.31\linewidth}|L{0.24\linewidth}|}
+\toprule
+版本 & 当前机器新增能力 & 必须保留的状态或契约 & 成功证据 \\
+\midrule
+v0.5 & 内核接管异常控制边界 & GDT、TSS、IDT、统一异常帧、IST 与 panic 现场 & \code{BREAKPOINT_HANDLED} \\\tablerowrule
+v0.6 & 内核拥有内存与页表 & 物理内存图、页帧状态、四级页表、W\^X、guard page 与早期堆 & \code{MEMORY_PERMISSIONS_VALID} \\\tablerowrule
+v0.7 & 内核接收异步设备事件 & PIC 路由、IRQ 入口、EOI、PIT tick、键盘状态与 ATA 事务 & \code{TIMER_SELF_TEST_PASSED} 与键盘事件 \\
+\bottomrule
+\end{longtable}
+
+\section*{一条不能跳步的控制权链}
+
+复位到内核不是一次函数调用。每一阶段都只能依赖上一阶段明确交付的状态，并且
+必须在交出控制权以后停止修改已转移的对象。下图中的箭头因此表示所有权和 ABI
+边界，而不只是“接下来执行哪个函数”。
+
+\begin{pdfdiagram}
+\node[os control, text width=2.2cm] (reset)
+  {CPU 复位\\CS 隐藏基址 + IP\\物理地址 \code{0xFFFFFFF0}};
+\node[os state, text width=2.2cm, right=7mm of reset] (rom)
+  {128 KiB ROM\\16 位入口、串口\\ATA PIO};
+\node[os compute, text width=2.2cm, right=7mm of rom] (stage)
+  {Stage 1\\A20、GDT、页表\\长模式};
+\node[os memory, text width=2.2cm, right=7mm of stage] (loader)
+  {ELF64 装载\\PT\_LOAD、BSS\\BootInfo};
+\node[os state, text width=2.2cm, right=7mm of loader] (kernel)
+  {freestanding 内核\\异常、内存\\中断与设备};
+\draw[os strong bus] (reset) -- node[os label, above] {取指} (rom);
+\draw[os strong bus] (rom) -- node[os label, above] {远转移} (stage);
+\draw[os strong bus] (stage) -- node[os label, above] {两遍装载} (loader);
+\draw[os strong bus] (loader) -- node[os label, above] {RDI + CALL} (kernel);
+\end{pdfdiagram}
+\diagramnote{案例的主控制权链。每个阶段都要定义入口处理器状态、可使用的内存、
+失败后的停机语义和下一阶段入口；缺少任一项，后续成功只能算偶然现象。}
+
+这条链把“装入”“接受”“运行”和“内核就绪”分成不同事件。ROM 读完 Stage 1
+扇区，只能说明字节已经进入约定内存；校验通过后执行远转移，才说明 Stage 1
+接受控制。Stage 1 把 ELF 段复制到目标地址，只能说明映像已经建立；BootInfo
+准备完成并按 ABI 调用入口，才说明内核获得控制。内核输出 \code{READY} 之前，
+还必须自行验证交接状态并建立长期拥有的结构。
+
+\section*{v0.1：处理器怎样找到第一条项目指令}
+
+案例 ROM 大小为 128 KiB，映射在物理地址
+\code{0xFFFE0000..0xFFFFFFFF}。复位时，处理器第一次取指位于
+\code{0xFFFFFFF0}；这个地址对应 ROM 文件中的 \code{0x1FFF0}。该位置保存
+一条 16 位 near jump，把 IP 从 \code{0xFFF0} 改为 \code{0xF000}，但不改变
+CS 的隐藏基址，因此目标物理地址是 \code{0xFFFFF000}。
+
+\begin{longtable}{|L{0.21\linewidth}|L{0.23\linewidth}|L{0.25\linewidth}|L{0.21\linewidth}|}
+\toprule
+坐标 & 数值 & 谁解释它 & 它不能单独证明什么 \\
+\midrule
+ROM 文件偏移 & \code{0x1FFF0} & 镜像布局与地址译码 & CPU 此刻是否已经取指 \\\tablerowrule
+线性/物理地址 & \code{0xFFFFFFF0} & 复位架构状态与平台映射 & 跳转目标是否有合法代码 \\\tablerowrule
+入口偏移 & \code{0xF000} & 16 位 near jump 与当前 CS 基址 & 栈和数据段是否可用 \\\tablerowrule
+低端栈顶 & \code{0x7000} & ROM 入口软件 & 该区域是否会与后续装载重叠 \\
+\bottomrule
+\end{longtable}
+
+入口首先关闭可屏蔽中断并清除方向标志，再建立 DS、ES、SS、SP 和 BP。这个
+顺序不能由 C++ 运行时替代，因为此时没有谁承诺栈、BSS、全局构造或 ABI 已经
+成立。串口初始化也采用有界 THRE 轮询；设备若永久不就绪，固件进入稳定停机，
+而不是在未知状态下继续读盘。
+
+\begin{lstlisting}
+firmware_entry():
+    // 复位没有提供可直接信任的软件栈，先建立最小 16 位执行环境。
+    disable_interrupts()
+    clear_direction_flag()
+    set_data_segments(0)
+    set_stack(segment=0, offset=0x7000)
+
+    // 串口是后续所有阶段共用的最早证据通道；等待必须有上限。
+    if not initialize_com1_with_bounded_poll():
+        halt_forever()
+    write_marker("RESET")
+    write_marker("SERIAL_READY")
+\end{lstlisting}
+
+\section*{v0.2：从“读到扇区”到“接受一个可执行阶段”}
+
+固件不能把 LBA 0 的任意 512 字节直接当成程序。案例先读取一份固定宽度、
+自描述的 Stage 1 描述符，逐字段校验 magic、版本、头长度、加载段、入口偏移、
+扇区数、标志、负载 LBA 和校验值。描述符通过后，固件才读取负载扇区到
+\code{0x00008000} 起始的窗口。
+
+\begin{pdfdiagram}
+\node[os memory, text width=3.1cm] (disk0)
+  {LBA 0\\Stage 1 描述符\\格式、范围、校验};
+\node[os memory, text width=3.1cm, below=12mm of disk0] (diskn)
+  {LBA 1..N\\Stage 1 负载\\按扇区读取};
+\node[os compute, text width=3.2cm, right=24mm of disk0] (verify)
+  {ROM 验证器\\先校验描述符\\再校验完整负载};
+\node[os state, text width=3.2cm, right=24mm of diskn] (ram)
+  {RAM \code{0x8000..}\\负载字节与入口\\校验前不可执行};
+\draw[os strong bus] (disk0) -- node[os label, above] {ATA PIO} (verify);
+\draw[os strong bus] (diskn) -- node[os label, below] {256 个 16 位 word/扇区} (ram);
+\draw[os strong bus] (verify) -- node[os label, right] {范围成立后允许装入} (ram);
+\end{pdfdiagram}
+\diagramnote{Stage 1 的格式事实与负载字节分开校验。读盘完成不等于内容可执行，
+只有描述符、加载范围和完整负载共同通过验证，固件才交出 CS:IP。}
+
+ATA PIO 状态也不能压成一个 \code{ready} 布尔量。每轮要先判断 BSY 是否清零，
+再区分 ERR、DF 与 DRQ；轮询预算耗尽和设备报告错误具有不同故障原因。成功后，
+DATA 端口每次返回 16 位，精确读取 256 次才得到一个 512 字节扇区。短读、
+多读或忽略错误位都会破坏描述符边界。
+
+\begin{lstlisting}
+read_one_sector(lba, destination):
+    // 命令字段必须在通知设备以前全部写好。
+    select_primary_master_lba28(lba)
+    write_sector_count(1)
+    write_lba_fields(lba)
+    issue_read_sectors()
+
+    for attempt in 0..POLL_LIMIT:
+        status = read_status()
+        // ERR/DF 是稳定失败；BSY 只表示当前不能取数。
+        if status has (ERR or DF):
+            return DEVICE_ERROR
+        if status has DRQ and not status has BSY:
+            // DATA 端口宽度为 16 位，一个扇区恰好读取 256 次。
+            read_256_words(destination)
+            return SUCCEEDED
+    return TIMEOUT
+\end{lstlisting}
+
+校验失败不会回到调用者继续执行未知代码。案例为串口失败、ATA 永久忙、设备
+错误、描述符损坏和负载损坏分别保留失败终态。失败终态的价值在于：测试不仅
+能观察“没有成功”，还可以判断系统在哪一条契约上拒绝了输入。
+
+\section*{v0.3：长模式是按依赖顺序提交的处理器状态}
+
+Stage 1 进入时仍处于 16 位实模式。它必须先打开并验证 A20，再装载平坦 GDT，
+设置 \code{CR0.PE} 并通过远跳转刷新代码段，才能在 32 位保护模式建立进入
+IA-32e 所需的页表和控制状态。案例使用三页结构建立 PML4、PDPT 和 PD，并以
+32 个 2 MiB 大页对低 64 MiB 做恒等映射。
+
+\begin{pdfdiagram}
+\node[os state, text width=2.25cm] (real) {16 位实模式\\A20 已验证};
+\node[os compute, text width=2.25cm, right=9mm of real] (protected)
+  {GDT + \code{CR0.PE}\\远跳到 32 位};
+\node[os memory, text width=2.25cm, right=9mm of protected] (tables)
+  {PML4/PDPT/PD\\低 64 MiB 恒等映射};
+\node[os compute, text width=2.25cm, right=9mm of tables] (enable)
+  {\code{CR4.PAE}\\\code{CR3}\\\code{EFER.LME}\\\code{CR0.PG}};
+\node[os state, text width=2.25cm, right=9mm of enable] (long)
+  {64 位子模式\\\code{EFER.LMA}=1};
+\draw[os strong bus] (real) -- (protected);
+\draw[os strong bus] (protected) -- (tables);
+\draw[os strong bus] (tables) -- (enable);
+\draw[os strong bus] (enable) -- node[os label, above] {L 位代码段远跳} (long);
+\end{pdfdiagram}
+\diagramnote{长模式转换的依赖顺序。任一控制位或页表只在前置状态已经成立时才
+具有预期含义；每一步回读验证后再推进，失败则停在当前阶段。}
+
+“已经写过寄存器”不是证据。案例在每一步回读相应位，并在分页开启后检查
+\code{IA32_EFER.LMA}，证明处理器实际进入了长模式。日志
+\code{PAE_READY}、\code{LME_READY}、\code{PAGING_ENABLED} 和
+\code{LONG_MODE} 因而对应不同提交边界，不能用最后一条日志反推所有中间状态
+都必然正确。
+
+\section*{v0.4：ELF 装载是校验事务，不是边读边跳}
+
+Kernel 容器与 Stage 1 占用不同磁盘区域。LBA 65 保存 Kernel 描述符，
+LBA 66 起保存精确长度的 \code{kernel.elf}，文件末尾到扇区边界的填充必须为
+零。Stage 1 先验证描述符和完整负载 CRC32，再解析 ELF64。
+
+解析采用两遍算法。第一遍检查 ELF 头和全部程序头，确认 PT\_LOAD 的文件范围、
+目标范围、4 KiB 对齐、权限、W\^X、段间不重叠与入口可执行；这一遍不改目标
+内存。只有所有段共同成立，第二遍才复制文件字节并清零
+\code{p_memsz - p_filesz} 对应的 BSS。于是任一段失败都不会留下“前几个段已经
+覆盖内存、后一个段才报错”的半提交映像。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.28\linewidth}|L{0.28\linewidth}|L{0.16\linewidth}|}
+\toprule
+阶段 & 读取的状态 & 允许修改的状态 & 失败结果 \\
+\midrule
+容器验证 & 描述符、文件长度、扇区数、CRC32 与零填充 & 暂存区与验证状态 & 目标段保持不变 \\\tablerowrule
+ELF 第一遍 & ELF 头、程序头、段范围、权限和入口 & 仅验证账本 & 拒绝整个映像 \\\tablerowrule
+ELF 第二遍 & 已通过验证的 PT\_LOAD 集合 & 目标段和 BSS & 进入交接准备 \\\tablerowrule
+BootInfo 交接 & 内存布局、内核栈、文件长度与段数 & 固定宽度交接对象 & 不调用内核 \\
+\bottomrule
+\end{longtable}
+
+BootInfo v2 为 104 字节，字段均为固定宽度的 64 位值。它至少表达 magic、
+版本、结构长度、内核文件长度、加载段数、初始页表根、恒等映射上限、内核栈顶
+以及物理内存图的地址、数量和条目宽度。Stage 1 把 BootInfo 地址放入 RDI，
+在满足 System V AMD64 入口对齐的栈上调用内核入口。
+
+\begin{pdfdiagram}
+\node[os memory, text width=3.1cm] (elf)
+  {ELF 暂存区\\文件字节保持原样\\最多 512 KiB};
+\node[os compute, text width=3.2cm, right=18mm of elf] (pass1)
+  {第一遍：建立事实\\所有 PT\_LOAD 均合法\\入口落在可执行段};
+\node[os memory, text width=3.1cm, right=18mm of pass1] (segments)
+  {第二遍：建立映像\\复制文件区\\清零 BSS};
+\node[os state, text width=3.1cm, below=14mm of pass1] (bootinfo)
+  {BootInfo v2\\地址、长度、页表根\\栈与内存图};
+\node[os control, text width=3.1cm, right=18mm of bootinfo] (entry)
+  {RDI = BootInfo*\\16 字节栈约束\\调用内核入口};
+\draw[os strong bus] (elf) -- (pass1);
+\draw[os strong bus] (pass1) -- node[os label, above] {全体通过} (segments);
+\draw[os strong bus] (segments) -- (entry);
+\draw[os strong bus] (bootinfo) -- (entry);
+\end{pdfdiagram}
+\diagramnote{ELF 校验、映像写入和 ABI 交接是三个边界。第一遍让失败仍可回滚，
+第二遍建立目标内存，BootInfo 再把启动事实交给内核。}
+
+\section*{v0.5：内核必须替换临时描述符状态}
+
+Stage 1 的 GDT 和页表只负责把加载器带进长模式，不应成为内核长期 ABI。
+内核验证 BootInfo、BSS 和传入 CR3 后，构造自己的 GDT、104 字节 TSS 和
+256 槽 IDT。TSS 保存 Ring 0 栈顶，并为双重故障、NMI 和机器检查指定三个
+独立 IST 栈；IDT 的 0..31 项安装架构异常门。
+
+异常入口分成硬件、汇编和 C++ 三层。CPU 保存 RIP、CS、RFLAGS 以及某些异常
+的错误码；每向量汇编桩为“无硬件错误码”的异常补零并压入向量号；公共入口
+再保存 15 个通用寄存器、清除 DF 并对齐 C++ 调用栈，形成 160 字节统一现场。
+分发器允许受控 breakpoint 返回，其他异常进入无动态分配、不可重入的 panic。
+
+\begin{pdfdiagram}
+\node[os control, text width=3.3cm] (cpu)
+  {CPU 硬件压栈\\RIP、CS、RFLAGS\\可选错误码};
+\node[os compute, text width=3.3cm, right=18mm of cpu] (stub)
+  {每向量汇编桩\\补齐错误码、压向量\\进入公共入口};
+\node[os memory, text width=3.3cm, right=18mm of stub] (frame)
+  {统一 160 B 现场\\RAX..R15、vector\\error、返回现场};
+\node[os state, text width=3.3cm, below=14mm of stub] (dispatch)
+  {C++ 分发\\INT3 可恢复\\其他异常记录并停机};
+\draw[os strong bus] (cpu) -- (stub);
+\draw[os strong bus] (stub) -- (frame);
+\draw[os strong bus] (frame) |- (dispatch);
+\end{pdfdiagram}
+\diagramnote{统一异常帧由硬件保存部分、向量桩规范化部分和公共入口保存部分共同
+组成。统一形状不表示所有异常具有相同恢复策略。}
+
+这一里程碑是后续系统调用与用户异常隔离的硬件入口基础，却还不是用户边界。
+当前 IDT 中 breakpoint 和 overflow 可以由 DPL3 软件触发，普通系统调用 ABI、
+用户栈和用户地址验证将在 v0.8 建立。正文的受控入口章节会在这个已实现基础上
+继续推导，而不会把未来设计混入 v0.5 的完成声明。
+
+\section*{v0.6：从启动内存图到内核拥有的页表}
+
+Stage 1 通过 \code{fw\_cfg} 设备读取 \code{etc/e820}，把原始 20 字节条目转换
+为项目的 24 字节物理内存图，并按物理基址排序。内核拒绝空表、零长度、溢出、
+乱序、重叠以及受管范围内没有可用 RAM 的输入。这里的验证不是防止“数据不好看”，
+而是阻止分配器把 MMIO、固件区或越界地址当成普通页帧。
+
+页帧分配器当前管理低 64 MiB，共 16384 个 4 KiB 帧。每帧使用 2 bit 区分
+unavailable、free、allocated 与 reserved。四种状态让“永远不可分配”“启动期
+长期占用”和“动态所有者持有”具有不同失败语义；一位位图无法区分重复释放和
+释放保留页。
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.25\linewidth}|L{0.27\linewidth}|L{0.19\linewidth}|}
+\toprule
+帧状态 & 谁可以建立 & 允许的后继 & 非法操作 \\
+\midrule
+unavailable & 内存图初始化 & 保持不变 & 分配、释放或动态保留 \\\tablerowrule
+free & 可用 RAM 初始化或合法释放 & allocated、reserved & 再次释放 \\\tablerowrule
+allocated & 分配器成功返回 & free；在完整预检后可转保留 & 重复分配、作为不可用区 \\\tablerowrule
+reserved & 平台、内核映像、启动栈等保留过程 & 按明确生命周期解除 & 作为普通对象释放 \\
+\bottomrule
+\end{longtable}
+
+内核不长期沿用 Stage 1 的 2 MiB 大页表，而是从页帧分配器取得新的四级
+4 KiB 页表。零页和四个栈底 guard page 保持 not-present；内核 text 为 RX，
+rodata 为 R/NX，data、BSS、栈与高半区 64 KiB 早期堆为 RW/NX。设置
+\code{IA32_EFER.NXE} 和 \code{CR0.WP} 后，内核切换到新 CR3，再回读控制状态
+并逐项查询映射。
+
+\begin{pdfdiagram}
+\node[os memory, text width=2.65cm] (map)
+  {物理内存图\\范围、类型、顺序\\来自硬件配置设备};
+\node[os compute, text width=2.65cm, right=12mm of map] (frames)
+  {页帧分配器\\2 bit 所有权状态\\保留启动关键区};
+\node[os memory, text width=2.65cm, right=12mm of frames] (tables)
+  {新四级页表\\4 KiB 叶映射\\W\^X 与 guard};
+\node[os control, text width=2.65cm, right=12mm of tables] (cr3)
+  {启用 NX/WP\\写 CR3\\回读并查询映射};
+\draw[os strong bus] (map) -- (frames);
+\draw[os strong bus] (frames) -- node[os label, above] {分配并清零页表页} (tables);
+\draw[os strong bus] (tables) -- node[os label, above] {全部结构完成后提交} (cr3);
+\end{pdfdiagram}
+\diagramnote{物理事实、页帧所有权、页表策略与处理器当前 CR3 是四层不同状态。
+切换 CR3 是提交点，不替代切换前的完整构造与切换后的权限核验。}
+
+写保护故障镜像让 Ring 0 写入一页 present、read-only 的高半区映射。预期
+页故障错误码为 \code{0x3}，CR2 为精确测试地址。这个失败同时证明页存在、
+访问类型为写、访问者为 supervisor，并证明 \code{CR0.WP} 没有被遗漏。相比
+“查询页表项看起来只读”，真实故障把页表数据和处理器执行行为闭合起来。
+
+\section*{v0.7：把外部事件接到内核状态机}
+
+案例平台同时包含 8259A、I/O APIC 和本地 APIC。自研 ROM 没有传统 BIOS
+替系统建立虚拟线模式，因此内核不能假设 8259A 的 INTR 已经能到达 CPU。
+设备启动先清除并回读 \code{IA32\_APIC\_BASE[11]}，再初始化两片 8259A，
+把 IRQ0..15 重映射到 IDT 32..47。
+
+\begin{pdfdiagram}
+\node[os memory, text width=2.5cm] (pit) {8254 PIT\\IRQ0\\递增 tick};
+\node[os memory, text width=2.5cm, below=11mm of pit] (kbd)
+  {i8042 + 键盘\\IRQ1\\扫描码状态机};
+\node[os compute, text width=2.7cm, right=14mm of pit, yshift=-5.5mm] (pic)
+  {8259A 主/从片\\重映射、mask\\ISR 与 EOI};
+\node[os control, text width=2.7cm, right=14mm of pic] (idt)
+  {IDT 32..47\\每向量 IRQ 桩\\公共硬件入口};
+\node[os state, text width=2.7cm, right=14mm of idt] (runtime)
+  {InterruptRuntime\\最小设备处理\\确认后返回};
+\draw[os strong bus] (pit) -- (pic);
+\draw[os strong bus] (kbd) -- (pic);
+\draw[os strong bus] (pic) -- node[os label, above] {INTR} (idt);
+\draw[os strong bus] (idt) -- (runtime);
+\draw[os feedback] (runtime.south) |- node[os label, below] {按主/从来源发送 EOI} (pic.south);
+\end{pdfdiagram}
+\diagramnote{传统中断路径同时依赖设备、PIC 路由、IDT 入口和确认协议。IRQ 与
+同步异常可以共用寄存器帧形状，但分发策略和返回前责任不同。}
+
+第一次实现只重映射 PIC、开放 IRQ0 并执行 \code{STI}。当时 PIT 的 IRR bit0
+已经置位，PIC mask 已开放，CPU 的 IF 也为 1，但向量 32 始终没有进入。增加
+轮询时间或重写 PIT 都不能修复问题，因为本地 APIC 仍全局启用，传统 INTR
+没有完成跨控制器路由。显式关闭并回读 LAPIC 全局使能后，IRQ0 与 IRQ1 才能
+到达。这个真实故障说明：局部寄存器分别正确，不等于器件之间的连接契约已经
+成立。
+
+IRQ0 热路径只递增 64 位 tick，不格式化日志；IRQ1 读取一个扫描码并推进集合 1
+解码器，语义事件在中断返回后的循环中消费。ATA 暂时保持同步单扇区 PIO，不开放
+IRQ14，也没有 DMA 或通用块层。现有设备能力因此是后文长期请求、完成对象和
+块层设计的起点，而不是这些高级机制的完成证明。
+
+\section*{实现边界怎样推动后续章节}
+
+v0.7 结束时，机器已经有内核地址空间、异常、硬件 IRQ、页帧、早期堆、单调
+tick、一个待消费键盘事件和同步磁盘读。它仍然只有 Ring 0 执行流。下一步如果
+直接把任意程序放进内核地址空间，程序可以改页表、访问设备端口或破坏中断状态；
+因此 v0.8 必须先建立 Ring 3 映像、用户页权限、受控入口和用户指针验证。
+
+\begin{longtable}{|L{0.13\linewidth}|L{0.22\linewidth}|L{0.30\linewidth}|L{0.25\linewidth}|}
+\toprule
+里程碑 & 新失败 & 最小新增结构 & 本册对应的深入主题 \\
+\midrule
+v0.8 用户边界 & Ring 0 程序拥有全部机器权限 & 用户 ELF、用户栈、特权转换、系统调用帧与复制规则 & 程序映像、受控入口、地址空间 \\\tablerowrule
+v0.9 进程调度 & 单一用户执行流会阻塞或长期占用 CPU & task、内核栈、runqueue、wait queue、抢占与退出状态 & 调度、生命周期和多核队列 \\\tablerowrule
+v0.10 同步与 IPC & 多执行流修改共享对象会丢失更新或错过唤醒 & 原子状态、锁、条件等待、睡眠唤醒与管道 & 内存顺序、死锁、RCU 与 IPC \\\tablerowrule
+v0.11 文件系统 & 进程只能操作裸 LBA，不能稳定命名和共享持久对象 & 块请求、fd、打开文件对象、inode、目录、分配与恢复 & VFS、索引、页缓存、日志与现代文件系统 \\\tablerowrule
+v1.0 用户环境 & 机制彼此存在，却没有端到端用户工作流 & Shell、基础命令、管道、重定向和完整回归 & 网络、安全、持久化与观测 \\
+\bottomrule
+\end{longtable}
+
+表中的后续版本是项目路线，不是当前代码声明。本册会把这些结构讲到现代系统所需
+的深度，但每章开头都回到项目当时拥有的机器：先做出最小可运行结构，再增加规模、
+并发、延迟和故障条件。这样既不会用项目当前的简化实现限制原理深度，也不会把理论
+上的完整机制冒充成项目已经完成的功能。
+
+\section*{怎样用案例阅读后面的深入章节}
+
+重排后的正文首先跟随已实现的复位、模式转换、ELF 交接、异常、内存和设备
+里程碑；随后沿 v0.8 至 v1.0 的开发边界推导用户任务、同步、文件系统、网络、
+安全、恢复和证据。章节中的 Linux、现代文件系统或高级设备队列用于说明同一
+契约扩展到真实规模时会增加什么状态，不改变案例主线的当前完成边界。
+
+阅读每个项目节点时，至少保留四类证据：
+
+\begin{enumerate}
+\tightlist
+\item \textbf{构造证据}：目标字节、描述符、页表项或对象字段已经写入预期位置。
+\item \textbf{采用证据}：处理器或设备已经实际使用该状态，例如回读 CR3、触发
+  页故障或接收真实 IRQ。
+\item \textbf{失败证据}：损坏输入、超时或非法访问会进入预期错误终态，并禁止
+  后续成功标记。
+\item \textbf{跨层证据}：宿主观察、串口到达时间和来宾内部计数分别表达什么，
+  不能用其中一种替代另一种。
+\end{enumerate}
+
+项目的最终目标不是让日志出现越来越多的 \code{READY}，而是让每个新增能力
+都有清楚的输入、状态对象、所有权、提交边界、失败语义和验证方法。后面的深度
+正文将始终沿这套问题展开。
+
+\begin{pdfdiagram}
+\node[os memory, text width=3.5cm] (boot)
+  {已实现 v0.1--v0.4\\复位、装载、长模式\\ELF64 与 BootInfo};
+\node[os control, text width=3.5cm, right=10mm of boot] (kernel)
+  {已实现 v0.5--v0.7\\异常帧、页帧与页表\\IRQ 和设备事务};
+\node[os state, text width=3.5cm, right=10mm of kernel] (roadmap)
+  {路线 v0.8--v1.0\\用户、进程、同步\\文件与用户环境};
+\node[os compute, text width=3.5cm, below=9mm of boot] (bootdeep)
+  {正文深入\\地址空间、程序映像\\控制权与交接事务};
+\node[os compute, text width=3.5cm, below=9mm of kernel] (kerneldeep)
+  {正文深入\\内核分配、请求队列\\中断、超时与恢复};
+\node[os compute, text width=3.5cm, below=9mm of roadmap] (systemdeep)
+  {正文深入\\调度、并发、VFS\\网络、安全与持久化};
+\draw[os strong bus] (boot) -- node[os label, right] {扩大规模与故障集合} (bootdeep);
+\draw[os strong bus] (kernel) -- node[os label, right] {扩大并发与生命周期} (kerneldeep);
+\draw[os strong bus] (roadmap) -- node[os label, right] {形成端到端系统} (systemdeep);
+\end{pdfdiagram}
+\diagramnote{项目里程碑提供全书的纵向控制权主线；正文不另起一套抽象体系，
+而是在对应节点上增加规模、并发、延迟、隔离和故障恢复条件。}
