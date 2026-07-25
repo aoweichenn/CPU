@@ -1,0 +1,205 @@
+\section{案例 v1.1（实现中）：让全部可用物理内存真正进入内核通路}
+\label{case:v11-physical-memory}
+
+\begin{statebox}
+\textbf{状态边界。} 项目当前发布基线仍是 v1.0；v1.1 的 ADR 0017 已被接受，
+动态页帧元数据、高半区物理直映和 64 GiB QEMU 主规格这一第一增量已经由
+主线提交 \code{89de15e} 落地。
+本轮实时验证通过现有 \(73/73\) 项回归，其中主正常路径已改用 64 GiB 客户机，
+并新增了高端页帧与地址洞测试。但 README、roadmap 完成标记与 CMake 版本
+尚未形成新的版本发布边界：README 与 roadmap 仍以 v1.0 为最新完成
+版本，CMake 工程元数据仍为 v0.11。因此本节只把这些结果称为
+\textbf{实现证据}，不称为 v1.1 发布完成证据。
+\end{statebox}
+
+v0.6 已经能解析 E820 内存图，却只管理 Stage 1 恒等映射覆盖的低 64 MiB。
+这在当时是一条安全边界：页表代码可把低端物理地址直接当作同值指针使用，
+页帧状态也只需一份固定数组。进入 v1.1 后，QEMU 的 E820 可以报告 64 GiB
+可用 RAM；若内核仍输出 64 MiB 的 managed bytes，问题并不在“机器没有内存”，
+而在软件把\emph{启动时能直接访问的范围}误当成了\emph{长期能够管理的范围}。
+
+\subsection{四个上限回答的是四个不同问题}
+
+决定物理内存容量时，至少要区分下列四个边界。把它们压成一个
+\code{memory\_size}，会使越界、地址洞和页表覆盖错误无法定位。
+
+\begin{longtable}{|L{0.21\linewidth}|L{0.25\linewidth}|L{0.28\linewidth}|L{0.16\linewidth}|}
+\toprule
+边界 & 它回答的问题 & v1.1 的处理方式 & 不能推出什么 \\
+\midrule
+\endhead
+E820 type 1 区间 & 固件声明哪些物理区间可作为普通 RAM & 逐项验证排序、重叠、
+长度与溢出，只把可用区间加入页帧账本 & 地址在最高端点以下不等于可分配
+\\\tablerowrule
+处理器物理地址宽度 & 页表项中的物理地址最多能表达多大 & 从
+\code{CPUID.80000008H:EAX[7:0]} 取得位数并计算上限 & E820 中每段都一定合法
+\\\tablerowrule
+高半区直映窗口 & 内核预留的虚拟窗口最多能覆盖多少物理地址 & 四级分页下为
+direct map 保留 64 TiB，并检查基址加法与窗口溢出 & 窗口内地址已经建立映射
+\\\tablerowrule
+Stage 1 恒等映射 & 切换新 CR3 以前，哪些物理页能以同值地址解引用 & 继续保留
+低 64 MiB 作为启动期建表与元数据落点 & 内核长期只能管理低 64 MiB \\
+\bottomrule
+\end{longtable}
+
+受管最高物理地址因此取“最高可用 RAM 端点、处理器物理地址上限、直映窗口容量”
+三者的最小值，再向下按 4 KiB 对齐。这个值只是 PFN 账本的覆盖上限；每个
+E820 洞仍保持 Unavailable，不能因为它落在 \([0,\text{managed limit})\)
+内部就变成 Free。
+
+\begin{pdfdiagram}
+\node[os state, text width=3.0cm] (e820)
+  {E820 可用区间\\RAM 端点与地址洞\\决定候选 PFN};
+\node[os compute, text width=3.0cm, right=14mm of e820] (limit)
+  {容量裁剪\\物理地址宽度\\直映窗口容量};
+\node[os memory, text width=3.0cm, right=14mm of limit] (ledger)
+  {页帧状态账本\\每 PFN 两位\\洞保持 Unavailable};
+\node[os control, text width=3.0cm, below=15mm of e820] (identity)
+  {低 64 MiB 恒等映射\\新 CR3 前可解引用\\限制启动分配};
+\node[os memory, text width=3.0cm, right=14mm of identity] (direct)
+  {高半区 direct map\\新 CR3 后可解引用\\覆盖 type 1 RAM};
+\node[os state, text width=3.0cm, right=14mm of direct] (owner)
+  {所有权状态\\Free/Allocated\\Reserved 与映射分离};
+\draw[os strong bus] (e820) -- (limit);
+\draw[os strong bus] (limit) -- (ledger);
+\draw[os strong bus] (identity) -- node[os label, above] {启动访问} (direct);
+\draw[os strong bus] (ledger) -- (owner);
+\draw[os strong bus] (direct) -- node[os label, above] {访问路径} (owner);
+\draw[os feedback] (limit.south) to[bend right=13]
+  node[os label, below] {容量不由低端映射决定} (identity.north);
+\end{pdfdiagram}
+\diagramnote{容量、访问和所有权是三套状态。E820 与处理器能力决定哪些 PFN
+可以进入账本；恒等映射和 direct map 决定内核怎样访问物理页；页帧状态才决定
+某一页能否分配。任何一条箭头都不能替代另外两条。}
+
+\subsection{两位页帧状态为什么仍可能需要四 MiB 以上}
+
+页大小为 4096 字节，每字节容纳四个两位状态。若没有地址洞，64 GiB RAM
+包含
+\[
+  \frac{64 \times 2^{30}}{2^{12}} = 2^{24}
+\]
+个页帧，最少需要 \(2^{24}/4=2^{22}\) 字节，即 4 MiB 状态存储。
+但元数据下标是 PFN，不是“第几个可用页”。若 3 GiB 可用区之后有 1 GiB 洞，
+高端 RAM 再延伸到 65 GiB 物理地址，那么状态数组必须覆盖洞后的 PFN，实际
+尺寸会略大于 4 MiB；当前 64 GiB QEMU 主规格计算出的状态存储为
+\code{0x410000} 字节。洞对应的状态保持 Unavailable。反过来，高端保留设备
+窗口只要不包含可用 RAM，就不能仅凭自身端点把状态数组扩大到该窗口。
+
+v0.6 的固定 4096 字节数组恰好只能表达低 64 MiB：
+\[
+  4096\ \text{B}\times 4\ \text{frames/B}\times 4096\ \text{B/frame}
+  =64\ \text{MiB}.
+\]
+因此，仅把 \code{MANAGED\_BYTES} 常量改成 64 GiB 会让数组越界。v1.1 先根据
+managed limit 计算元数据尺寸，再从低 64 MiB 的可用区间中寻找一段连续、
+页对齐且不与固件、Stage 1、内核、BootInfo、启动栈及临时缓冲重叠的空间。
+若找不到，启动必须明确失败，不能静默退回较小容量。
+
+\begin{lstlisting}
+prepare_physical_memory(e820, boot_objects):
+    // 容量同时受固件事实、处理器可表达范围和直映窗口约束。
+    cpu_limit = physical_limit_from_cpuid()
+    map_limit = direct_map_capacity()
+    managed_limit = align_down(min(highest_usable_end(e820),
+                                   cpu_limit, map_limit), PAGE_SIZE)
+
+    // 两位状态按 PFN 编号，地址洞也占据索引，但初始保持不可用。
+    metadata_bytes = align_up(ceil(page_count(managed_limit) / 4),
+                              PAGE_SIZE)
+    metadata = find_low_identity_mapped_range(
+        e820, boot_objects, metadata_bytes, PAGE_SIZE)
+    if metadata does not exist:
+        return FRAME_STATE_STORAGE_UNAVAILABLE
+
+    // 先把全部状态置为不可用，再只开放合法 E820 type 1 页。
+    initialize_frame_ledger(metadata, managed_limit, default=UNAVAILABLE)
+    mark_type1_pages_free(e820)
+    reserve_boot_objects(boot_objects, metadata)
+    return SUCCEEDED
+\end{lstlisting}
+
+\subsection{direct map 提供访问路径，不授予页帧所有权}
+
+新直映窗口起于 \code{0xFFFF888000000000}。对一个被纳入直映的物理地址
+\(p\)，内核使用
+\[
+  v=\mathtt{0xFFFF888000000000}+p
+\]
+得到可解引用的高半区虚拟地址。页表项仍保存 \(p\)，CR3 仍要求物理地址；
+只有 C++ 代码准备读写页表帧、清零用户页或复制 ELF 段时，才把物理地址转换成
+当前地址空间中的虚拟地址。
+
+这条规则消除了 v0.6 中隐含的
+\code{reinterpret\_cast<void *>(physicalAddress)}。在旧 CR3 下，页表管理器
+使用“虚拟基址为 0、只从低 64 MiB 分配页表帧”的访问策略；激活新 CR3 后，
+同一管理器切换为“虚拟基址为 direct-map base、可访问全部受管物理页”的策略。
+算法仍处理物理页号，解引用方式则随控制权阶段改变。
+
+直映只覆盖完整的 E820 type 1 RAM，权限为 supervisor、read/write、NX 和普通
+缓存。对齐且完整落在可用区间内部的部分优先使用 2 MiB 大页，区间边界与尾部
+使用 4 KiB 页。保留区、未知区和 MMIO 不会因为落入窗口范围而自动变成普通
+缓存 RAM；例如 LAPIC 仍由独立的 cache-disabled 映射处理。
+
+\subsection{为什么换 CR3 必须是一笔启动事务}
+
+新页表本身也需要物理页。只要处理器还在 Stage 1 的旧 CR3 下，内核就不能解引用
+64 MiB 以上新分配的页表帧；因此建表阶段的分配上限必须暂时保持在恒等映射窗口。
+待新根同时包含低端启动映射、内核映像、高半区直映、早期堆、保护测试页和
+设备映射，并且所有步骤都成功后，内核才能写 CR3。
+
+\begin{pdfdiagram}
+\node[os state, text width=3.0cm] (facts)
+  {验证输入事实\\E820、地址宽度\\managed limit};
+\node[os memory, text width=3.0cm, right=13mm of facts] (meta)
+  {低端选择元数据\\初始化全 PFN 账本\\保留启动对象};
+\node[os compute, text width=3.0cm, right=13mm of meta] (build)
+  {旧 CR3 下建表\\页表帧限于低端\\建立两类映射};
+\node[os control, text width=3.0cm, below=16mm of meta] (commit)
+  {提交新 CR3\\回读根与保护位\\切换页表访问策略};
+\node[os state, text width=3.0cm, right=13mm of commit] (validate)
+  {直映后自检\\查询映射、写读高端页\\释放并核对统计};
+\draw[os strong bus] (facts) -- (meta);
+\draw[os strong bus] (meta) -- (build);
+\draw[os strong bus] (build) |- (commit);
+\draw[os strong bus] (commit) -- (validate);
+\draw[os feedback] (build.south) to[bend left=14]
+  node[os label, right] {任一步失败均不采用半成品根} (facts.south);
+\end{pdfdiagram}
+\diagramnote{新 CR3 是启动内存事务的提交点。提交前所有页表页必须能经旧恒等
+映射访问；提交后统一经 direct map 访问。失败路径不能让一部分高端映射成为
+当前机器状态。}
+
+在 64 GiB 主规格上，目标机还要从 4 GiB 以上分配一个页帧，查询对应直映叶项，
+确认它是 supervisor、writable、NX、普通缓存，然后通过高半区地址写入并读回
+两个 64 位模式，最后释放页帧。这个测试同时证明“高端 PFN 已进入分配器”“页表
+确实采用了该映射”“处理器实际能够读写”“释放后所有权返回”四件事；只打印
+managed bytes 不能替代它。当前主规格要求高端自检物理地址不低于
+\code{0x0000000100001000}，并以 32768 个 2 MiB 叶项覆盖对齐的 RAM 内部区间；
+边界与洞由 4 KiB 叶项和 not-present 区间分别表达。
+
+\subsection{这项基础怎样继续长成通用内核分配}
+
+\begin{longtable}{|L{0.21\linewidth}|L{0.24\linewidth}|L{0.27\linewidth}|L{0.18\linewidth}|}
+\toprule
+项目中的 v1.1 对象 & 已经解除的 v1.0 限制 & 正文继续引入的机制 & 始终保留的不变量 \\
+\midrule
+\endhead
+动态两位 PFN 账本 & 固定状态数组只覆盖低 64 MiB & buddy 的阶次、拆分与合并，
+NUMA 节点和水位控制 & 一个页帧同一时刻只有一个所有权状态 \\\tablerowrule
+\code{AllocateInRange} & 启动建表与高端普通分配不能区分 & DMA zone、低端保留池、
+迁移类型与连续分配 & 约束范围外的页不能作为成功结果 \\\tablerowrule
+高半区物理直映 & 高端物理页不能被内核 C++ 访问 & 临时映射、页缓存页、COW
+复制与统一页表遍历 & 映射存在不等于页帧可分配 \\\tablerowrule
+低端启动元数据 & 固定编译期数组与机器容量耦合 & 可释放 slab、动态内核栈、
+对象缓存与失败回滚 & 发布对象以前，其全部依赖必须构造完成 \\\tablerowrule
+混合 2 MiB/4 KiB 直映 & 全部小页导致建表成本随容量快速增长 & 大页拆分、
+内存热插拔与更细权限 & 大页优化不能跨越地址洞或权限边界 \\
+\bottomrule
+\end{longtable}
+
+因此，direct map 不是 \code{kmalloc}，动态页帧账本也不是 buddy 或 slab。
+当前 64 KiB 高半区早期堆仍是单调分配器，四个 PCB、内核栈和描述符容量也尚未
+完成动态化。v1.1 的价值在于先解除“内核只能看见低 64 MiB”这条结构性限制，
+并为后续可释放分配、动态对象表、COW 和按需分页建立一条统一、可验证的物理页
+访问通路。
