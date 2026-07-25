@@ -1,6 +1,6 @@
 ---
 name: operating-systems-book-architecture
-description: Plan, restructure, expand, typeset, audit, export, or publish the LaTeX textbook `books/operating-systems-volume-1`. Use for operating-system chapter architecture, first-principles explanations, concrete kernel structures, state-transition traces, system-call/process/memory/device/filesystem/network/security coverage, diagrams, tables, exercises, PDF layout, phone export, or final commit and push.
+description: Plan, restructure, expand, typeset, audit, export, or publish the LaTeX textbook `books/operating-systems-volume-1` and keep its main spine synchronized with the live sibling `../os` project. Use for project-version tracking, operating-system chapter architecture, first-principles explanations, concrete kernel structures, state-transition traces, system-call/process/memory/device/filesystem/network/security coverage, diagrams, tables, exercises, PDF layout, phone export, or final commit and push.
 ---
 
 # Operating Systems Book Architecture
@@ -10,10 +10,31 @@ description: Plan, restructure, expand, typeset, audit, export, or publish the L
 Before inspecting, planning, editing, or reporting progress, read these files completely:
 
 1. `references/user-book-rules.md` on every invocation.
-2. `references/progressive-book-architecture.md` for book or chapter design, ordering, restructuring, and expansion.
-3. `references/chapter-workflow.md` for chapter expansion, layout, validation, export, commit, or push work.
+2. `references/project-sync-workflow.md` on every invocation.
+3. `references/progressive-book-architecture.md` for book or chapter design, ordering, restructuring, and expansion.
+4. `references/chapter-workflow.md` for chapter expansion, layout, validation, export, commit, or push work.
 
 Treat the current user instruction as higher priority. Keep editorial and publishing rules in this skill, not in reader-facing manuscript prose.
+
+## Track the live OS project first
+
+Treat the sibling `../os` project as the book's evolving main spine and the existing textbook
+chapters as its retained deepening layer. Before planning, editing, auditing, or reporting on the
+book, run:
+
+```text
+python3 .codex/skills/operating-systems-book-architecture/scripts/audit_project_sync.py
+```
+
+If the check fails, do not continue from the stale book boundary. Follow
+`references/project-sync-workflow.md`: audit the live roadmap, latest release, ADRs, affected
+source and tests; run the project's full verification entry; update the project spine, part
+bridges, affected chapter openings, diagrams, evidence and current-versus-future wording; only
+then refresh the recorded snapshot. A fingerprint change requires re-audit even when the milestone
+number is unchanged. Never update the snapshot merely to silence the check.
+
+At each handoff, report the live completed milestone, the implementation boundary, the verification
+result, and which book nodes were synchronized.
 
 ## Build explanations from causes
 
