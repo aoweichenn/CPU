@@ -1,0 +1,198 @@
+\section{案例 v0.11：从可读写扇区建立可拒绝损坏的持久文件系统}
+
+v0.10 已经能够让进程通过管道传递 256 字节，但管道端点关闭或机器重新启动后，
+这些字节便不再存在。内核虽然能用 ATA PIO 访问 LBA，却没有结构说明哪个块空闲、
+哪些块属于同一文件、一个名字指向哪个对象，也无法判断上次修改是否在中途断电。
+v0.11 的目标因而不是“把数组写到磁盘再马上读回”，而是让一个全新的 QEMU
+实例能够在同一磁盘上重新找到、验证并读取旧文件。
+
+\subsection{先冻结启动链和文件系统的所有权边界}
+
+最初设计让文件系统从 LBA 1024 开始。宿主内存块设备上的全部文件操作都能通过，
+真实镜像却无法挂载：增长后的 Kernel ELF 从 LBA 66 延伸到约 LBA 1054，
+文件系统误把内核尾部当成 superblock。这个故障不是路径解析错误，也不能通过
+“遇到非法 magic 就重新格式化”修复，因为那会覆盖真实冲突并破坏已有数据。
+
+最终磁盘固定为 2 MiB、4096 个 512 字节扇区。LBA 0..2047 的前 1 MiB 永久
+属于启动链；LBA 2048..3071 的 1024 个块属于文件系统；最后 1024 个扇区保留。
+镜像生成器必须拒绝 Kernel 负载越过 LBA 2048。这个规则把两个所有者的边界从
+“根据当前文件大小猜一个空隙”提升为可独立审计的磁盘 ABI。
+
+\begin{pdfdiagram}
+\node[os memory, minimum width=5.0cm, text width=4.5cm] (boot)
+  {LBA 0..2047：启动链\\描述符、Stage 1、Kernel ELF\\最终镜像必须整体落在前 1 MiB};
+\node[os memory, minimum width=5.0cm, text width=4.5cm, right=8mm of boot] (fs)
+  {LBA 2048..3071：文件系统\\1024 个固定 512 B 块\\superblock、位图、inode 与数据};
+\node[os state, minimum width=3.2cm, text width=2.8cm, right=8mm of fs] (reserve)
+  {LBA 3072..4095\\保留扩展\\当前不可分配};
+\draw[os strong bus] (boot) -- node[os label, above] {冻结边界} (fs);
+\draw[os strong bus] (fs) -- node[os label, above] {结束边界} (reserve);
+\end{pdfdiagram}
+\diagramnote{磁盘地址空间首先是所有权空间。启动链、文件系统和保留区的边界由
+最终镜像共同验证，不能由各子模块分别假设。}
+
+\subsection{固定布局怎样把持久字节提升为对象}
+
+文件系统区域仍以一个扇区为块。相对块 0 保存 superblock，块 1 保存 inode
+位图，块 2..9 保存 32 个 128 字节 inode，块 10 保存数据位图，块 11..1023
+是 1013 个目录或普通文件数据块。inode 0 保留，inode 1 固定为根目录。
+
+\begin{longtable}{|L{0.16\linewidth}|L{0.17\linewidth}|L{0.28\linewidth}|L{0.29\linewidth}|}
+\toprule
+相对块 & 数量 & 持久事实 & 为什么必须独立 \\
+\midrule
+0 & 1 & 格式版本、布局、根 inode、事务状态、代次与 CRC32 & 重新挂载需要先知道怎样解释其余块 \\\tablerowrule
+1 & 1 & 32 个 inode 的分配位 & 空闲身份不能从目录遍历代替，未链接对象也可能存在 \\\tablerowrule
+2..9 & 8 & 32 个固定 128 B inode & 文件身份、长度和块归属不能放进可变名称记录 \\\tablerowrule
+10 & 1 & 1013 个数据块的分配位 & 块所有权必须能与 inode 引用集合交叉核对 \\\tablerowrule
+11..1023 & 1013 & 目录项和普通文件字节 & 内容容量与元数据容量分别记账 \\
+\bottomrule
+\end{longtable}
+
+持久结构不直接把 C++ 对象写入扇区。编码器逐字段写入显式小端字节，避免编译器
+填充、对齐和枚举底层类型变成磁盘格式的一部分。superblock 对前 508 字节计算
+CRC32；每个已分配 inode 也保存独立 CRC32。目录项精确为 64 字节，由 inode
+号、节点类型、名称长度和 40 字节名称组成，未使用名称尾部必须为零。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.28\linewidth}|L{0.27\linewidth}|L{0.17\linewidth}|}
+\toprule
+对象 & 代表字段 & 生命周期或提交时机 & 当前显式上限 \\
+\midrule
+superblock & 布局、根编号、Clean/Dirty、事务代次 & 格式化建立；每次修改前后直接持久化 & 恰占 512 B \\\tablerowrule
+inode & 类型、长度、代次、链接数、十个直接块 & 创建分配；写入或截断时更新 & 文件最大 5120 B \\\tablerowrule
+目录项 & inode 号、类型、名称长度与名称 & 父目录事务中追加 & 名称最大 40 B \\\tablerowrule
+打开句柄 & inode 号、偏移、读写能力、打开状态 & 每次 open 建立；read/write 推进偏移；close 释放 & 每进程固定槽位 \\
+\bottomrule
+\end{longtable}
+
+句柄不是磁盘对象。它只在进程生命周期内保存“当前从哪个偏移继续”和“本次打开
+具有什么能力”；inode 才是重启后仍可由目录项重新定位的持久身份。把两者分开，
+两个进程才能以不同偏移打开同一 inode，关闭一个句柄也不会删除文件。
+
+\subsection{八项块缓存改变了可见性，却没有改变介质事实}
+
+内核在文件系统和 ATA 设备之间放置八项写回缓存。每项保存 512 字节、LBA、
+有效位、脏位和单调访问代次。命中读取不访问设备；未命中选择最久未使用项，
+淘汰脏项前必须先写回。缓存拥有块字节的临时副本，却不拥有底层设备生命周期。
+
+\begin{pdfdiagram}
+\node[os state, text width=3.0cm] (handle)
+  {进程打开句柄\\inode + offset\\读写能力};
+\node[os compute, text width=3.0cm, right=15mm of handle] (fs)
+  {文件系统\\路径、位图、inode\\目录与事务};
+\node[os memory, text width=3.0cm, right=15mm of fs] (cache)
+  {8 项 LRU 写回缓存\\LBA、valid、dirty\\访问代次};
+\node[os control, text width=3.0cm, below=13mm of cache] (ata)
+  {ATA PIO\\WRITE SECTORS\\FLUSH CACHE};
+\draw[os strong bus] (handle) -- (fs);
+\draw[os strong bus] (fs) -- node[os label, above] {按相对块访问} (cache);
+\draw[os strong bus] (cache) -- node[os label, right] {淘汰或 Sync} (ata);
+\end{pdfdiagram}
+\diagramnote{句柄偏移、文件系统对象、缓存副本和介质扇区分别形成状态。缓存命中
+只证明内核得到字节，不证明设备已经保存最新版本。}
+
+读成功可能只表示缓存命中；写成功可能只表示缓存项已经变脏。只有缓存把所有脏项
+送入 ATA，设备完成 \code{FLUSH CACHE}，并且 superblock 最后恢复 Clean，
+这次文件系统修改才到达项目定义的持久提交点。该定义比“系统调用已经返回正字节数”
+更强，也仍然受 ATA PIO 和模拟磁盘所提供的介质模型限制。
+
+\subsection{Dirty/Clean 协议只能检测半事务，不能自动恢复}
+
+一次创建目录会同时修改 inode 位图、新 inode、父目录数据和父 inode。若任一
+写入后断电，磁盘可能出现“位图已分配但目录不可达”或“目录已经引用尚未初始化的
+inode”。v0.11 不实现日志重放，而是先建立一条能够明确检测半完成事务的协议。
+
+\begin{enumerate}
+\tightlist
+\item 在内存中预检 inode 和数据块容量，避免已知失败进入事务；
+\item 事务代次加一，把 superblock 写为 Dirty，并立即执行设备 flush；
+\item 在缓存中修改数据块、inode、目录项和位图；
+\item 写回所有脏缓存并再次 flush，使新数据与元数据到达设备；
+\item 把 superblock 写为 Clean、更新 CRC32，再执行最后一次 flush。
+\end{enumerate}
+
+\begin{pdfdiagram}
+\node[os state, text width=2.7cm] (clean0)
+  {Clean, generation \(g\)\\旧文件系统可挂载};
+\node[os control, text width=2.7cm, right=10mm of clean0] (dirty)
+  {持久化 Dirty\\generation \(g+1\)\\第一次 flush};
+\node[os memory, text width=2.7cm, right=10mm of dirty] (updates)
+  {更新缓存对象\\数据、inode\\目录与位图};
+\node[os control, text width=2.7cm, right=10mm of updates] (flush)
+  {写回所有脏块\\第二次 flush\\新结构在介质上};
+\node[os state, text width=2.7cm, below=13mm of updates] (clean1)
+  {持久化 Clean\\更新 CRC32\\最后一次 flush};
+\draw[os strong bus] (clean0) -- (dirty);
+\draw[os strong bus] (dirty) -- (updates);
+\draw[os strong bus] (updates) -- (flush);
+\draw[os strong bus] (flush) |- (clean1);
+\end{pdfdiagram}
+\diagramnote{Dirty 是“事务未确认完成”的持久证据，不是可重放日志。步骤 2 至
+步骤 4 之间断电时，下次挂载必须拒绝，而不是猜测哪些块应当保留。}
+
+挂载先直接读取 superblock。只有整块全零才允许首次格式化；非零但 magic、版本、
+布局、CRC32 或事务状态无效都属于损坏。若状态为 Dirty，系统返回“未完成事务”
+并停止，不能把旧数据自动覆盖为新文件系统。这个规则让故障注入能够观察真实失败，
+而不会被便利性的自动格式化掩盖。
+
+\subsection{一致性检查把可达关系与所有权账本闭合}
+
+CRC32 只能说明单个结构字节没有发生可检测变化，不能证明多个结构彼此一致。
+挂载后的全盘检查从根 inode 1 做有界遍历，并把结果与两张位图交叉验证：
+
+\begin{itemize}
+\tightlist
+\item inode 位图中的每个已分配 inode 都必须从根目录恰好可达；
+\item 每个目录项引用的 inode 必须已分配，节点类型必须一致；
+\item 每个名称满足长度、字符和尾部零填充规则，同一目录中不得重名；
+\item inode 的大小与直接块数量一致，直接块不得越界或重复；
+\item 数据位图的每一位必须与所有可达 inode 拥有的块集合精确相等；
+\item 当前没有硬链接，因此根以外 inode 必须恰有一条目录引用。
+\end{itemize}
+
+\begin{pdfdiagram}
+\node[os memory, text width=3.1cm] (root) {根 inode 1\\有界遍历目录项};
+\node[os memory, text width=3.1cm, right=16mm of root] (reachable)
+  {可达 inode 集合\\节点类型、名称\\直接块所有权};
+\node[os state, text width=3.1cm, above=13mm of reachable] (ibitmap)
+  {inode bitmap\\声明哪些身份已分配};
+\node[os state, text width=3.1cm, below=13mm of reachable] (dbitmap)
+  {data bitmap\\声明哪些块已分配};
+\node[os compute, text width=3.1cm, right=16mm of reachable] (decision)
+  {一致性判定\\集合必须精确相等\\否则拒绝挂载};
+\draw[os strong bus] (root) -- (reachable);
+\draw[os strong bus] (ibitmap) -- (reachable);
+\draw[os strong bus] (dbitmap) -- (reachable);
+\draw[os strong bus] (reachable) -- (decision);
+\end{pdfdiagram}
+\diagramnote{位图是分配账本，目录树是可达关系，inode 是块所有者。三种事实
+必须互相印证；任一单独正确都不足以证明文件系统一致。}
+
+\subsection{跨两次启动的 256 字节文件 trace}
+
+生产者创建目录 \filepath{/shared}，再以 create、truncate 和 write 权限打开
+\filepath{/shared/payload.bin}。它写入与管道相同的 256 字节确定性载荷，
+关闭句柄并显式同步；随后才关闭管道写端。消费者先从管道读到 EOF，再重新打开
+该文件、逐字节验证 256 字节并确认文件 EOF。管道顺序保证消费者验证文件时，
+生产者已经执行关闭和同步。
+
+同一进程内的读回仍不能证明跨启动持久化。系统测试保留一份
+\code{snapshot=off} 临时磁盘，连续启动两个全新的 QEMU 实例。第二次启动必须
+在任何用户写入以前先恢复旧载荷。随后测试翻转 superblock 字节并第三次启动；
+第三次必须报告损坏，且不得格式化、进入 Ring 3 或输出 \code{READY}。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.28\linewidth}|L{0.27\linewidth}|L{0.17\linewidth}|}
+\toprule
+观察阶段 & 必须成立的介质事实 & 目标机动作 & 禁止出现的结果 \\
+\midrule
+第一次启动 & superblock 全零或已有合法 Clean 格式 & 格式化或挂载，写入 256 B，Sync & 半事务后仍宣称成功 \\\tablerowrule
+第二次启动 & 上次 Clean 事务和载荷仍在同一磁盘 & 先挂载并验证旧载荷，再运行用户回归 & 依赖进程内缓存得到旧数据 \\\tablerowrule
+损坏后第三次启动 & superblock CRC32 或格式字段不再成立 & 在用户态以前拒绝挂载 & 自动格式化、进入 Ring 3、\code{READY} \\
+\bottomrule
+\end{longtable}
+
+v0.11 发布时完整回归为 68 项；v1.0 的 73 项继续保留同盘双启动、损坏拒绝、
+目录迭代以及文件与管道双路径验证。当前格式没有删除、rename、硬链接、权限、
+时间戳、间接块和日志恢复，所有文件系统操作还由全局锁串行化。它已经闭合
+“持久字节—分配—身份—名称—事务—重新挂载”的最小链路；后文的日志、COW、
+页缓存和现代文件系统是在这条链上增加恢复能力与规模，而不是替代这些基本事实。

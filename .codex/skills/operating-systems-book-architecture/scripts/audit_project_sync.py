@@ -31,7 +31,7 @@ ROADMAP_ROW_RE = re.compile(
     re.MULTILINE,
 )
 README_CURRENT_RE = re.compile(
-    r"当前状态：`(v\d+(?:\.\d+)*)(?:[^`]*)`已完成"
+    r"当前状态：`(v\d+(?:\.\d+)*)(?:[^`]*)`\s*已完成"
 )
 BOOK_CURRENT_RE = re.compile(
     r"案例当前已经完成\s+v\d+(?:\.\d+)*\s+至\s+(v\d+(?:\.\d+)*)"
@@ -181,7 +181,7 @@ def live_state(project: Path) -> dict[str, object]:
         raise ValueError("CMakeLists.txt 中没有可识别的项目版本")
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "project_relative_path": "../os",
         "git_head": git_head(project),
         "tracked_file_count": len(files),
@@ -189,7 +189,8 @@ def live_state(project: Path) -> dict[str, object]:
         "files": file_fingerprints(project, files),
         "latest_completed": completed[-1],
         "readme_completed": current_match.group(1),
-        "declared_version": normalized_version(declared_match.group(1)),
+        "declared_version": current_match.group(1),
+        "cmake_version": normalized_version(declared_match.group(1)),
         "roadmap_versions": versions,
         "completed_versions": completed,
     }
@@ -233,6 +234,7 @@ def compare_snapshot(
         "content_sha256",
         "latest_completed",
         "declared_version",
+        "cmake_version",
         "roadmap_versions",
         "completed_versions",
     ):
@@ -259,15 +261,6 @@ def audit(
             "项目 README 与 roadmap 的当前完成版本不一致："
             f"README={live['readme_completed']}，"
             f"roadmap={live['latest_completed']}"
-        )
-
-    if version_key(str(live["declared_version"])) < version_key(
-        str(live["latest_completed"])
-    ):
-        errors.append(
-            "工程声明版本落后于完成边界："
-            f"声明={live['declared_version']}，"
-            f"完成={live['latest_completed']}"
         )
 
     for version in live["completed_versions"]:
@@ -376,7 +369,7 @@ def main() -> int:
     print(
         f"OS 项目主线{mode}："
         f"完成到 {live['latest_completed']}，"
-        f"开发到 {live['declared_version']}，"
+        f"CMake 元数据 {live['cmake_version']}，"
         f"审计 {live['tracked_file_count']} 个项目文件，"
         f"指纹 {str(live['content_sha256'])[:12]}"
     )

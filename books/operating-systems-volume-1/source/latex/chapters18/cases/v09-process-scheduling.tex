@@ -1,0 +1,172 @@
+\section{案例 v0.9：把一次用户执行变成可抢占的进程集合}
+
+v0.8 已经证明，内核可以装入一份用户 ELF、用 \code{iretq} 进入 Ring 3，并在
+系统调用、退出或用户异常发生时回到可信内核栈。然而，这条路径只保存一份用户
+现场。若用户程序长期计算，内核只能等待它主动调用；若再装入第二份映像，两个
+程序还会争用相同的用户页、转换栈和执行结果。v0.9 要解决的不是“多调用几次
+用户函数”，而是让四个彼此独立的执行对象能够被真实 PIT 中断抢占。
+
+\subsection{调度状态和机器现场不能合成一个字段}
+
+调度器需要回答“谁有资格运行”，进程运行时还要回答“恢复它时机器应当处于什么
+状态”。前者只依赖 PID、状态、时间片和统计，可以在宿主机上作为纯状态机验证；
+后者包含页表根、用户返回帧和 Ring 0 栈，只能由目标内核建立。把两类状态分开后，
+策略测试不需要伪造 CR3，而目标切换又不会把一个 \code{Running} 枚举误当成完整现场。
+
+\begin{longtable}{|L{0.19\linewidth}|L{0.26\linewidth}|L{0.25\linewidth}|L{0.20\linewidth}|}
+\toprule
+状态类别 & 代表字段 & 字段何时改变 & 不能由什么替代 \\
+\midrule
+调度身份 & \code{processId}、槽位索引 & 创建时分配；PID 一经对外可见便不回退复用 & 用户虚拟地址或页表根 \\\tablerowrule
+调度资格 & \code{state}、\code{waitReason} & 创建、派发、阻塞、唤醒和终止时改变 & 是否存在一份保存帧 \\\tablerowrule
+时间记账 & \code{runTickCount}、\code{dispatchCount}、量子进度 & PIT tick 或派发发生时递增 & 宿主串口到达时间 \\\tablerowrule
+恢复现场 & \code{savedFrame}、用户 RIP/RSP、通用寄存器 & 入口汇编形成帧，切换前保存地址 & 调度状态枚举 \\\tablerowrule
+地址解释 & \code{rootPhysicalAddress}、已映射页集合 & 创建地址空间时建立，退出后释放 & 同一虚拟地址数值 \\\tablerowrule
+特权栈 & 每进程 16 KiB Ring 0 栈和一页 guard & 创建时固定；派发时写入 TSS.RSP0 & 用户栈或公共临时栈 \\
+\bottomrule
+\end{longtable}
+
+当前实现使用四个固定槽位。空槽从 \code{Unused} 进入 \code{Ready} 后才算创建
+成功；第一个被派发的槽位进入 \code{Running}。v0.9 尚未实现条件等待，因此正常
+状态只沿 \code{Ready}、\code{Running} 和 \code{Terminated} 转换。后来的
+v0.10 在同一状态机上增加 \code{Blocked}，没有改变 v0.9 已经建立的身份和派发
+规则。
+
+\begin{pdfdiagram}
+\node[os memory, text width=2.6cm] (unused) {Unused\\槽位没有进程身份};
+\node[os state, text width=2.6cm, right=12mm of unused] (ready)
+  {Ready\\拥有完整现场\\可以被选择};
+\node[os control, text width=2.6cm, right=12mm of ready] (running)
+  {Running\\当前 CR3\\当前 TSS.RSP0};
+\node[os state, text width=2.6cm, right=12mm of running] (terminated)
+  {Terminated\\结果已记录\\资源等待回收};
+\draw[os strong bus] (unused) -- node[os label, above] {创建提交} (ready);
+\draw[os strong bus] (ready) -- node[os label, above] {派发} (running);
+\draw[os feedback] (running.south) to[bend right=18]
+  node[os label, below] {量子到期且存在其他 Ready} (ready.south);
+\draw[os strong bus] (running) -- node[os label, above] {退出或用户异常} (terminated);
+\end{pdfdiagram}
+\diagramnote{v0.9 的最小进程状态机。是否保存过现场不决定调度资格；只有状态转换
+提交后，运行队列选择和资源回收才可以据此推进。}
+
+\subsection{同一虚拟地址为什么必须落到不同物理页}
+
+三个 worker 使用同一份固定地址 ELF，代码均从 \code{0x40000000} 开始，
+可写全局变量也位于相同虚拟地址。若只给每个进程选择不同的用户基址，就无法验证
+页表是否真正提供隔离；若直接复制永久内核页表根，三个 worker 又会共享同一组
+用户叶页。v0.9 因而为每个进程建立独立 PML4，并只共享 supervisor 内核子树。
+
+建立进程根时，内核先以永久内核根为模板，再复制低端 PDPT。用户程序使用的
+PDPT[1] 被清空并重新建表，覆盖 \code{0x40000000..0x7fffffff}；高地址用户栈
+通过独立的 PML4[255] 建立。PML4[0] 下的内核区仍可共享，因为相关叶页没有
+U/S 权限，Ring 3 不能据此获得内核访问权。
+
+\begin{pdfdiagram}
+\node[os memory, text width=3.2cm] (kernel)
+  {永久内核页表根\\supervisor 映射\\内核 text/data/设备};
+\node[os memory, text width=3.2cm, below=12mm of kernel] (p1)
+  {进程 1 PML4\\私有程序子树\\私有用户栈子树};
+\node[os memory, text width=3.2cm, below=12mm of p1] (p2)
+  {进程 2 PML4\\同址程序子树\\落到另一组物理页};
+\node[os compute, text width=3.4cm, right=25mm of p1] (cpu)
+  {当前 CPU 地址解释\\CR3 选择一棵根\\TSS.RSP0 选择同一进程内核栈};
+\draw[os strong bus] (kernel) -- node[os label, right] {共享 supervisor 子树} (p1);
+\draw[os strong bus] (p1) -- node[os label, right] {相同虚拟布局，不共享用户叶页} (p2);
+\draw[os strong bus] (p1) -- node[os label, above] {派发进程 1} (cpu);
+\draw[os feedback] (p2.east) -- node[os label, below] {派发进程 2 时替换 CR3} (cpu.south);
+\end{pdfdiagram}
+\diagramnote{地址空间隔离由“同址、不同根、不同用户叶页”证明。共享内核映射
+只减少重复页表，不改变用户页的物理所有权。}
+
+销毁地址空间时不能遍历并释放所有 present 项，因为其中包含共享的内核子树。
+当前实现只递归释放进程独占的 PDPT[1] 程序子树、PML4[255] 用户栈子树、克隆
+PDPT 和 PML4 本身。永久内核根和当前活动 CR3 都被明确拒绝销毁。这个限制让
+“页表项可达”与“进程拥有该页”保持不同含义。
+
+\subsection{一次抢占必须同时切换三类状态}
+
+PIT IRQ0 进入时，处理器已经在当前进程的 Ring 0 栈上形成 176 字节现场。
+入口先完成设备计数和 PIC 确认，再把现场地址交给调度器。只有中断来自 CPL3、
+量子已经用尽，并且存在另一个 \code{Ready} 进程，当前 tick 才构成抢占。
+Ring 0 中断、量子未到期或没有其他候选者都继续原进程。
+
+\begin{lstlisting}
+handle_user_timer_tick(current_frame):
+    // 入口已经把用户寄存器和硬件返回状态规范成 176 字节现场。
+    current.saved_frame = current_frame
+    account_run_tick(current)
+
+    // 量子到期但没有其他 Ready 进程时，不制造一次“切回自己”的抢占。
+    if not quantum_expired() or not another_ready_process_exists():
+        return current_frame
+
+    // 状态资格先改变，随后机器地址解释和特权栈才转向同一个 next。
+    next = select_next_ready_round_robin()
+    mark_current_ready()
+    mark_next_running()
+    write_cr3(next.page_table_root)
+    write_tss_rsp0(next.kernel_stack_top)
+    return next.saved_frame
+\end{lstlisting}
+
+汇编公共入口采用 C++ 返回的帧地址替换 RSP，然后按固定次序恢复寄存器并执行
+\code{iretq}。因此“调度决策完成”和“CPU 已经执行下一进程”仍是两个事件：
+前者决定下一槽位并更新内核对象，后者在汇编恢复完毕后才对用户程序可见。
+
+\begin{pdfdiagram}
+\node[os control, text width=3.0cm] (irq)
+  {IRQ0 进入\\当前进程内核栈\\形成 176 B 现场};
+\node[os state, text width=3.0cm, right=15mm of irq] (save)
+  {保存旧现场地址\\Running \(\rightarrow\) Ready\\选择下一个 Ready};
+\node[os memory, text width=3.0cm, right=15mm of save] (machine)
+  {写新 CR3\\写新 TSS.RSP0\\当前机器归属改变};
+\node[os control, text width=3.0cm, below=13mm of save] (restore)
+  {RSP 指向新现场\\恢复通用寄存器\\\code{iretq} 回 Ring 3};
+\draw[os strong bus] (irq) -- (save);
+\draw[os strong bus] (save) -- (machine);
+\draw[os strong bus] (machine) |- (restore);
+\end{pdfdiagram}
+\diagramnote{一次进程切换依次提交调度状态、地址空间和特权栈，最后恢复目标现场。
+只换寄存器或只写 CR3 都不能形成可恢复的进程切换。}
+
+\subsection{用八个 tick 复算轮换边界}
+
+设量子固定为四个 PIT tick，初始有 P1、P2、P3 三个 Ready 进程。启动选择
+P1；前三个 tick 只增加 P1 的运行计数。第 4 个 tick 到达时，P2 已经 Ready，
+于是 P1 回到 Ready、P2 进入 Running，抢占计数加一。P2 在第 6 个 tick 主动
+退出，调度器从其后一槽开始选择 P3；这次属于终止后的派发，不计为抢占。
+
+\begin{longtable}{|L{0.13\linewidth}|L{0.18\linewidth}|L{0.26\linewidth}|L{0.23\linewidth}|}
+\toprule
+事件 & 进入前 Running & 提交的状态变化 & 结果与记账 \\
+\midrule
+启动 & 无 & P1：Ready \(\rightarrow\) Running & P1 dispatch \(=1\) \\\tablerowrule
+tick 1--3 & P1 & 只递增 P1 run tick 与量子进度 & 不切换 \\\tablerowrule
+tick 4 & P1 & P1 \(\rightarrow\) Ready；P2 \(\rightarrow\) Running & preemption \(=1\)，P2 dispatch \(=1\) \\\tablerowrule
+tick 5 & P2 & 只递增 P2 run tick & 不切换 \\\tablerowrule
+退出 & P2 & P2 \(\rightarrow\) Terminated；P3 \(\rightarrow\) Running & 终止 \(=1\)，不增加抢占 \\\tablerowrule
+tick 6--8 & P3 & 递增 P3 run tick，量子尚未用尽 & P3 保持 Running \\
+\bottomrule
+\end{longtable}
+
+这份 trace 同时说明两个容易混淆的边界。第一，时间片到期是重新考虑候选者的
+时机，不保证一定切换；第二，任何进程切换都增加派发，但只有时钟量子触发的
+切换才增加抢占。统计字段若不区分这两类事件，测试就无法判断轮转策略是否真正
+由硬件 tick 驱动。
+
+\subsection{退出不是只把状态改成 Terminated}
+
+\code{ExitProcess}、用户态非法指令和用户态缺页共享终止主路径。内核先记录
+退出码或异常现场，再选择后继，切回永久内核 CR3，随后释放当前进程的用户叶页、
+中间页表和 PML4。若仍有 Ready 进程，汇编恢复后继现场；若全部进程结束，运行时
+才恢复首次进入调度器以前保存的内核调用链。
+
+释放顺序中的永久 CR3 是关键。若内核仍在将被销毁的页表下执行，释放 PML4 本身
+会同时移除当前取指和栈地址的解释。先切到永久根，让回收代码和栈脱离被回收对象，
+才能安全递归释放。创建前后的页帧统计相等，是这项所有权规则的跨层证据。
+
+v0.9 发布时完整验证为 59 项；在 v1.0 的 73 项回归中，三个同址 worker、
+真实 PIT 抢占、CR3/TSS.RSP0 切换、用户异常隔离和进程页回收仍全部保留。
+该实现仍是单核、每进程单线程、四个固定槽位，也不保存 x87/SSE/AVX 状态。
+这些限制不削弱已验证的最小切换链，却说明现代调度器为何还需要动态 task、
+每 CPU 运行队列、扩展现场和负载均衡。

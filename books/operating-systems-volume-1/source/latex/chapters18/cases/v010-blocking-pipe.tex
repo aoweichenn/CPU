@@ -1,0 +1,176 @@
+\section{案例 v0.10：让等待成为调度状态，而不是用户态忙等}
+
+v0.9 的四个进程只要尚未结束，就始终具有运行资格。生产者面对一个已满缓冲区
+时，只能反复进入内核询问“现在能写吗”；消费者面对空缓冲区也只能重复读。
+这种循环没有丢失数据，却会持续占用时间片，而且调度器无法知道进程在等待哪个
+条件。v0.10 以一条 64 字节有界管道建立第一项真实条件等待，并用 256 字节载荷
+迫使满、空、部分传输和环形回绕都在目标机上发生。
+
+\subsection{管道对象必须同时保存数据状态和端点状态}
+
+若管道只保存字节数组和读写下标，读者无法区分“当前暂时没有数据”和“写端已经
+关闭，以后也不会再有数据”；写者也无法区分“当前暂时没有空间”和“读端关闭，
+后续字节已经没有接收者”。因此，端点生命周期不是额外装饰，而是 EOF 与
+broken pipe 语义的来源。
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.25\linewidth}|L{0.25\linewidth}|L{0.20\linewidth}|}
+\toprule
+字段或字段组 & 保存的事实 & 修改时机 & 保护规则 \\
+\midrule
+\code{buffer[64]} & 已提交、尚未被消费的字节 & 成功 TryWrite 写入；成功 TryRead 取走 & 只在管道锁内读写 \\\tablerowrule
+\code{readIndex}/\code{writeIndex} & 下一次消费与生产位置 & 按实际传输字节取模推进 & 与字节数组同一临界区 \\\tablerowrule
+\code{bufferedByteCount} & 当前占用量 & 写入增加，读取减少 & 始终位于 \(0..64\) \\\tablerowrule
+\code{readerClosed}/\code{writerClosed} & 对侧未来是否还可能推进 & 关闭或进程异常退出时提交 & 关闭后不可恢复为开放 \\\tablerowrule
+累计统计 & 已读写字节和操作次数 & 每次成功传输后递增 & 冷路径读取，不在热路径打印 \\
+\bottomrule
+\end{longtable}
+
+固定容量不是为了回避真实边界。相反，生产者一次可能提交 64 字节，消费者却只用
+31 字节缓冲读取，两个粒度互不整除。读写下标会多次越过数组末端，部分写和部分读
+也必然出现。最终总写入、总读取、缓冲残留和 EOF 次数必须共同守恒。
+
+\begin{pdfdiagram}
+\node[os state, text width=3.0cm] (writer)
+  {生产者状态\\用户指针与剩余长度\\只拥有写端};
+\node[os memory, text width=3.2cm, right=18mm of writer] (pipe)
+  {64 B 环形管道\\read/write index\\占用量与端点状态};
+\node[os state, text width=3.0cm, right=18mm of pipe] (reader)
+  {消费者状态\\31 B 用户缓冲\\只拥有读端};
+\node[os compute, text width=3.2cm, below=13mm of pipe] (scheduler)
+  {调度器\\Blocked + wait reason\\定向唤醒为 Ready};
+\draw[os strong bus] (writer) -- node[os label, above] {部分写} (pipe);
+\draw[os strong bus] (pipe) -- node[os label, above] {部分读} (reader);
+\draw[os strong bus] (writer) |- node[os label, left] {满时等待可写} (scheduler);
+\draw[os strong bus] (reader) |- node[os label, right] {空时等待可读} (scheduler);
+\draw[os feedback] (scheduler.north) -- node[os label, right] {条件变化后唤醒} (pipe.south);
+\end{pdfdiagram}
+\diagramnote{数据字节由管道对象拥有，执行资格由调度器拥有。阻塞不把用户缓冲
+交给管道长期持有；唤醒也不预留字节，只恢复重新检查条件的资格。}
+
+\subsection{Try 和 Wait 为什么必须分成两种操作}
+
+一次等待不能被解释成“原来的 I/O 已经完成”。进程执行
+\code{WaitDescriptorReadable} 时，保存现场中的 RIP 已位于系统调用指令之后；
+唤醒后直接返回用户态，只能表示等待调用结束。若内核暗中重放之前的读操作，
+用户程序将无法区分第一次调用是否已经产生部分副作用。
+
+当前 ABI 因而把 Try 与 Wait 分开。Try 从不调度：能够推进便返回实际字节数，
+空管道且写端开放则返回 \code{WouldBlock}。用户包装看到这个结果后调用 Wait；
+Wait 把当前进程从 \code{Running} 改为带具名原因的 \code{Blocked}，由调度器
+派发其他 Ready 进程。唤醒后，包装器必须回到 Try，重新观察最新条件。
+
+\begin{lstlisting}
+read_pipe(destination, requested):
+    // 唤醒不拥有数据；循环每次都从共享对象重新读取条件。
+    while true:
+        result = try_read_pipe(destination, requested)
+        if result >= 0:
+            return result          // 正数是字节数，0 是稳定 EOF。
+        if result != WOULD_BLOCK:
+            return result          // 权限、指针和端点错误不进入等待。
+
+        // Wait 只改变调度资格；返回后仍不能假设字节已被预留。
+        wait_result = wait_pipe_readable()
+        if wait_result < 0:
+            return wait_result
+\end{lstlisting}
+
+\begin{pdfdiagram}
+\node[os control, text width=2.7cm] (try1) {TryRead\\检查管道条件};
+\node[os state, text width=2.7cm, right=10mm of try1] (blocked)
+  {WouldBlock\\Running \(\rightarrow\) Blocked\\原因 = PipeReadable};
+\node[os compute, text width=2.7cm, right=10mm of blocked] (producer)
+  {生产者提交字节\\改变可读条件\\发起定向唤醒};
+\node[os state, text width=2.7cm, right=10mm of producer] (ready)
+  {Blocked \(\rightarrow\) Ready\\随后重新派发};
+\node[os control, text width=2.7cm, below=13mm of producer] (try2)
+  {Wait 返回用户态\\包装器重新 TryRead\\本次才取得字节};
+\draw[os strong bus] (try1) -- (blocked);
+\draw[os strong bus] (blocked) -- (producer);
+\draw[os strong bus] (producer) -- (ready);
+\draw[os strong bus] (ready) |- (try2);
+\end{pdfdiagram}
+\diagramnote{等待链中的提交点是“进程失去运行资格”和“共享条件已经改变”。
+唤醒只连接两项事实，不把条件检查与数据传输合并成隐式操作。}
+
+\subsection{条件检查与阻塞之间怎样避免丢失唤醒}
+
+最危险的交错发生在消费者刚看到空管道、但尚未把自己标为 Blocked 时。若生产者
+此刻写入并执行唤醒，它找不到任何等待者；随后消费者再进入 Blocked，就可能在
+管道已经有数据的情况下永久睡眠。正确实现必须让“检查条件”和“登记等待”处于
+同一同步规则下，或者在登记以后再次检查条件。
+
+当前项目使用单核和 DPL3 interrupt gate。系统调用进入内核时 IF 已清除，因此
+从判断 \code{WouldBlock}、把当前 PCB 标为 Blocked 到选择后继的短路径不会被
+普通本地 IRQ 插入。管道内部数据则由 acquire/release 自旋锁保护。这个事实只
+证明当前单核边界；它不能替代多核系统中的等待队列锁和跨 CPU 内存顺序。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.29\linewidth}|L{0.25\linewidth}|L{0.18\linewidth}|}
+\toprule
+条件 & Try 结果 & Wait 或唤醒动作 & 稳定语义 \\
+\midrule
+空且写端开放 & \code{WouldBlock} & 读者以 PipeReadable 阻塞 & 以后仍可能有字节 \\\tablerowrule
+空且写端关闭 & \(0\) & 不阻塞 & EOF，未来不会再有字节 \\\tablerowrule
+有数据 & 实际读取 \(1..capacity\) 字节 & 读取后唤醒可写等待者 & 数据已从管道消费 \\\tablerowrule
+满且读端开放 & \code{WouldBlock} & 写者以 PipeWritable 阻塞 & 以后仍可能有空间 \\\tablerowrule
+读端关闭 & \code{BrokenPipe} & 关闭动作唤醒写者 & 未来写入没有接收者 \\\tablerowrule
+有空间 & 实际写入 \(1..length\) 字节 & 提交后唤醒可读等待者 & 数据由管道拥有 \\
+\bottomrule
+\end{longtable}
+
+关闭也是条件变化。写端关闭必须唤醒读者，使其在清空剩余字节后观察 EOF；读端
+关闭必须唤醒写者，使其观察 broken pipe。若进程因用户异常终止，运行时沿资源
+表自动执行相同关闭操作，不能让异常路径留下永远等待的对侧。
+
+\subsection{用户内存复制不能发生在管道锁内}
+
+写路径先验证完整用户范围，并把本次最多 64 字节复制到内核栈缓冲；随后才获取
+管道锁，把能够容纳的部分提交到环形数组。读路径先在锁内把字节取到内核缓冲，
+释放锁后再复制到已经完整验证为可写的用户范围。这样，用户缺页处理、地址错误
+或未来可能出现的阻塞复制都不会扩大管道临界区。
+
+“先消费再发现目标地址无效”会丢失管道数据，因此读操作必须在消费前完成全部
+用户页验证。验证的是整个半开区间，而不是首地址；跨页缓冲的每个叶页都必须
+present、user accessible 且可写。这个顺序把地址空间失败与共享对象提交明确
+分开。
+
+\begin{pdfdiagram}
+\node[os state, text width=3.1cm] (user)
+  {用户范围\\先检查完整半开区间\\逐页验证读写权限};
+\node[os memory, text width=3.1cm, right=18mm of user] (bounce)
+  {有界内核缓冲\\复制失败不持有\\共享对象锁};
+\node[os compute, text width=3.1cm, right=18mm of bounce] (locked)
+  {管道短临界区\\只改数组、索引\\占用量和端点};
+\draw[os strong bus] (user) -- node[os label, above] {验证后复制} (bounce);
+\draw[os strong bus] (bounce) -- node[os label, above] {获取锁后提交} (locked);
+\draw[os feedback] (locked.south) to[bend right=16]
+  node[os label, below] {读路径先取到内核缓冲，再释放锁复制} (bounce.south);
+\end{pdfdiagram}
+\diagramnote{用户地址、内核暂存和共享管道是三个所有权区域。管道锁只覆盖共享
+状态提交，不覆盖不可信地址访问。}
+
+\subsection{一条 256 字节载荷怎样闭合证据}
+
+生产者按 \((index \times 37 + 11) \mathbin{\&} 0xFF\) 生成 256 字节确定性
+序列。消费者以 31 字节缓冲循环读取，并在 Ring 3 独立重算每个期望字节。
+64 与 31 不整除，保证管道下标多次回绕；256 大于管道容量，保证生产者至少
+面对一次满条件；调度时序还会让消费者面对空条件。生产者写完后关闭写端，
+消费者读尽剩余字节并观察一次 EOF。
+
+验收不能只检查两端都打印“完成”。内核还核对：
+
+\begin{enumerate}
+\tightlist
+\item 总写入和总读取都恰为 256，管道残留为 0；
+\item 生产者只拥有写端、消费者只拥有读端，反向操作被稳定拒绝；
+\item 读写阻塞与唤醒都实际发生，且 Blocked 从不参与 round-robin；
+\item 写端关闭后只出现一次 EOF，重复关闭得到明确错误；
+\item 正常退出和异常退出都关闭所属端点，所有进程页仍能完整回收。
+\end{enumerate}
+
+v0.10 发布时完整回归为 64 项；v1.0 把管道迁移到统一描述符以后，73 项回归
+仍检查原 256 字节序列、EOF、阻塞/唤醒与端点关闭。当前实现只有一个
+bootstrap pipe、一个生产者和一个消费者，也没有超时、公平等待、信号或多核
+锁竞争。深入正文在这条最小证据链上继续引入等待队列、条件变量、优先级继承和
+多种 IPC 对象，而不改变“条件在同一同步规则下检查与改变、唤醒后重新检查”
+这一基本不变量。

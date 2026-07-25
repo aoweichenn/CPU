@@ -1,0 +1,206 @@
+\section{案例 v1.0：让普通 Ring 3 程序通过统一描述符使用整台系统}
+
+v0.11 已经分别提供控制台日志、专用管道调用和普通文件调用，但三套接口没有
+共同的进程局部名字。用户程序不能把“从标准输入读”“向管道写”和“从文件读”
+组织成同一种受控操作；目录也没有可迭代句柄。更重要的是，交互式程序等待键盘
+时可能成为系统中最后一个存活进程：此时没有 Ready 进程是正常等待，不是调度
+完成，也不是必须停机的死锁。v1.0 用统一描述符、控制台 FIFO、空闲唤醒和一份
+独立 Shell ELF 把这些边界连接起来。
+
+\subsection{统一的是命名与生命周期，不是所有对象的语义}
+
+每个进程拥有八槽描述符表。0、1、2 固定为标准输入、标准输出和标准错误；
+3..7 是动态槽，可保存普通文件、目录或启动期管道端点。描述符只是当前进程的
+整数索引，同一个数值在不同进程中可以引用不同对象。进程退出或用户异常时，
+运行时遍历动态槽，先关闭底层对象并执行必要唤醒，再把槽标记为 Closed。
+
+\begin{longtable}{|L{0.12\linewidth}|L{0.24\linewidth}|L{0.30\linewidth}|L{0.24\linewidth}|}
+\toprule
+fd 范围 & 初始种类 & 允许的主要操作 & 关闭与所有权 \\
+\midrule
+0 & ConsoleInput & 通用 TryRead；空时 WaitReadable & 标准槽不能由用户关闭 \\\tablerowrule
+1 & ConsoleOutput & 通用 TryWrite 到串口 & 标准槽不能由用户关闭 \\\tablerowrule
+2 & ConsoleError & 通用 TryWrite 到串口 & 标准槽不能由用户关闭 \\\tablerowrule
+3 & Closed 或管道单向端点 & 生产者仅写，消费者仅读 & 关闭会改变 EOF/broken pipe 条件 \\\tablerowrule
+3..7 & 动态文件或目录 & 文件通用读写；目录专用迭代 & CloseDescriptor 释放对应句柄 \\
+\bottomrule
+\end{longtable}
+
+目录没有被强行伪装成普通字节流。OpenDirectory 返回动态 fd，但
+ReadDirectory 每次返回一份精确 64 字节的目录项 ABI；结果 1 表示读到一项，
+0 表示迭代结束，负值表示错误。普通文件不能调用目录迭代，目录也不能通过通用
+读接口读取。统一描述符因此只统一“如何命名、检查能力和关闭”，仍保留对象操作
+的语义差异。
+
+\begin{pdfdiagram}
+\node[os state, text width=3.0cm] (table)
+  {每进程描述符表\\整数 fd \(\rightarrow\) 对象种类\\关闭规则统一};
+\node[os memory, text width=2.8cm, right=14mm of table, yshift=14mm] (console)
+  {控制台\\输入 FIFO\\输出/错误串口};
+\node[os memory, text width=2.8cm, right=14mm of table] (file)
+  {普通文件/目录\\独立句柄偏移\\目录专用迭代};
+\node[os memory, text width=2.8cm, right=14mm of table, yshift=-14mm] (pipe)
+  {管道端点\\读写方向\\EOF/broken pipe};
+\node[os compute, text width=3.1cm, right=16mm of file] (dispatch)
+  {通用 Try/Wait/Close\\按种类与能力分派\\返回稳定错误};
+\draw[os strong bus] (table) -- (console);
+\draw[os strong bus] (table) -- (file);
+\draw[os strong bus] (table) -- (pipe);
+\draw[os strong bus] (console) -- (dispatch);
+\draw[os strong bus] (file) -- (dispatch);
+\draw[os strong bus] (pipe) -- (dispatch);
+\end{pdfdiagram}
+\diagramnote{描述符统一进程局部命名和资源回收，分发器仍按对象种类执行不同操作。
+“都能用 fd 引用”不表示目录、文件、管道和控制台具有相同数据模型。}
+
+\subsection{通用 Try/Wait 契约怎样跨越不同对象}
+
+通用读写先查询描述符种类和能力。控制台输入与管道可能返回
+\code{WouldBlock}；普通文件按当前句柄偏移推进；控制台输出直接写串口；
+目录拒绝通用读写。等待调用也按种类判断条件：普通文件当前总可推进，管道要看
+数据、空间和端点状态，控制台输入要看 FIFO 是否非空。
+
+\begin{longtable}{|L{0.22\linewidth}|L{0.17\linewidth}|L{0.17\linewidth}|L{0.17\linewidth}|L{0.17\linewidth}|}
+\toprule
+对象种类 & 通用读 & 通用写 & 等待读 & 等待写 \\
+\midrule
+控制台输入 & 是 & 能力拒绝 & FIFO 非空 & 能力拒绝 \\\tablerowrule
+控制台输出/错误 & 能力拒绝 & 是 & 能力拒绝 & 立即可推进 \\\tablerowrule
+普通文件 & 按打开能力 & 按打开能力 & 立即可推进 & 立即可推进 \\\tablerowrule
+目录 & 使用目录专用接口 & 能力拒绝 & 不需要 & 能力拒绝 \\\tablerowrule
+管道读端 & 是 & 能力拒绝 & 数据或 EOF & 能力拒绝 \\\tablerowrule
+管道写端 & 能力拒绝 & 是 & 能力拒绝 & 空间或 broken pipe \\
+\bottomrule
+\end{longtable}
+
+ABI 编号 16..22 提供通用 TryRead、TryWrite、等待读写、通用 Close、
+OpenDirectory 和 ReadDirectory。RAX 保存编号与有符号结果，RDI、RSI、RDX
+保存前三个参数，第四参数固定在 R10。用户 C++ 包装的第五个函数参数原位于
+R8，NASM 桩必须显式搬到 R10；这个细节属于 ABI，而不是编译器可以任意改变的
+临时选择。
+
+通用描述符单次最多传输 256 字节。用户包装对更大的请求分块，在部分传输后
+推进地址与剩余长度；遇到 \code{WouldBlock} 才调用 Wait，并在返回后重新 Try。
+用户范围依然在访问底层对象前逐页验证，数据通过有界内核缓冲，文件系统锁和管道
+锁内都不直接访问 Ring 3 地址。
+
+\subsection{外部按键怎样成为 fd 0 上的一个字节}
+
+QEMU 系统测试只在 PC 键盘前端产生按键，不把命令字符串写入来宾内存。i8042
+把 Set 1 扫描码交给 IRQ1；解码器分别维护左右 Shift 和 Caps Lock，只在
+make code 上产生字符。字符进入 256 字节 FIFO；队列满时拒绝覆盖旧字节并增加
+dropped 统计。IRQ 热路径不逐字打印，只提交字符并唤醒等待读描述符的进程。
+
+\begin{pdfdiagram}
+\node[os memory, text width=2.25cm] (key)
+  {PC 键盘前端\\产生 make/break\\Set 1 扫描码};
+\node[os control, text width=2.25cm, right=5mm of key] (irq)
+  {i8042 + IRQ1\\PIC/IDT 入口\\读取数据端口};
+\node[os compute, text width=2.25cm, right=5mm of irq] (decode)
+  {键盘状态机\\Shift/Caps\\make code 转 ASCII};
+\node[os memory, text width=2.25cm, right=5mm of decode] (fifo)
+  {256 B FIFO\\submitted/read\\dropped\\buffered};
+\node[os state, text width=2.25cm, right=5mm of fifo] (shell)
+  {fd 0 通用读\\唤醒 Shell\\Ring 3 行缓冲};
+\draw[os strong bus] (key) -- (irq);
+\draw[os strong bus] (irq) -- (decode);
+\draw[os strong bus] (decode) -- (fifo);
+\draw[os strong bus] (fifo) -- (shell);
+\end{pdfdiagram}
+\diagramnote{命令字符经过真实设备、中断、解码、内核队列和用户复制。宿主只产生
+硬件输入，不能替代任何来宾边界。}
+
+控制台统计区分四项事实：submitted 表示解码后的字符被 FIFO 接受；read 表示
+字符已被用户描述符消费；dropped 表示满队列拒绝的新字符；buffered 表示验收
+结束时仍由内核拥有的字符。正常回归要求 submitted 与 read 都为 109，
+dropped 与 buffered 都为 0。只检查 Shell 最终打印命令结果，无法证明中间
+没有静默丢字或残留。
+
+\subsection{没有 Ready 进程为什么不等于调度完成}
+
+假设生产者、消费者和 worker 已经结束，只剩 Shell 在空 fd 0 上等待。
+Shell 从 Running 进入 Blocked 后，系统中没有 Ready 或 Running，但仍有一个
+能够被键盘条件唤醒的进程。若调度器把 NoReady 解释为“全部完成”，Shell 会被
+永久丢弃；若用户态循环读，则 CPU 会持续忙等。
+
+v1.0 允许最后一个 Running 进程进入 Blocked。运行时保存其系统调用帧，清空
+当前进程索引，切回永久内核 CR3 和默认 TSS.RSP0，然后在同一内联汇编块执行
+\code{sti; hlt; cli}。STI 的中断影子保证紧随其后的 HLT 在接受可屏蔽中断前
+进入等待；IRQ 返回后相邻 CLI 恢复调度临界区。若把三条指令拆成三个 C++ 调用，
+RET/CALL 可能破坏这项相邻关系。
+
+\begin{pdfdiagram}
+\node[os state, text width=2.75cm] (block)
+  {Shell 空读\\Running \(\rightarrow\) Blocked\\保存用户现场};
+\node[os memory, text width=2.75cm, right=10mm of block] (kernel)
+  {恢复永久 CR3\\默认 TSS.RSP0\\回到内核执行循环};
+\node[os control, text width=2.75cm, right=10mm of kernel] (idle)
+  {相邻 \code{sti; hlt; cli}\\CPU 等待外部中断\\不消耗用户时间片};
+\node[os compute, text width=2.75cm, right=10mm of idle] (wake)
+  {IRQ1 提交字符\\Blocked \(\rightarrow\) Ready\\重新派发 Shell};
+\node[os state, text width=2.75cm, below=13mm of idle] (resume)
+  {恢复 Shell CR3/RSP0\\Wait 返回\\包装器重新 TryRead};
+\draw[os strong bus] (block) -- (kernel);
+\draw[os strong bus] (kernel) -- (idle);
+\draw[os strong bus] (idle) -- (wake);
+\draw[os strong bus] (wake) |- (resume);
+\end{pdfdiagram}
+\diagramnote{空闲路径保存了可唤醒进程，而不是创建一个伪用户任务。NoReady 描述
+当前没有运行候选者；只有所有已创建进程均终止才表示调度完成。}
+
+IRQ0 也可能唤醒 HLT，但它没有改变控制台可读条件。执行循环重新扫描后若仍无
+Ready，便再次进入空闲。IRQ1 成功提交字符后才按 DescriptorReadable 原因唤醒
+Shell；用户包装恢复后仍重新检查具体 fd，保持“唤醒不预留资源”的统一规则。
+
+\subsection{Shell 为什么仍然是普通用户程序}
+
+Shell 是独立的 freestanding C++20 ELF，不链接 libc、C++ 标准库、堆或内核
+符号。它使用 128 字节行缓冲、最多八个参数和 256 字节写缓冲。解析器把文本
+复制到固定存储，参数只保存 offset 与 length，避免保存会随缓冲修改而失效的
+裸指针。它支持单双引号与反斜杠转义，并明确拒绝未闭合引号、悬空转义、超长行
+和参数溢出。
+
+当前没有 fork/exec，因此 help、echo、pwd、ls、mkdir、write、cat、sync 和
+exit 都是 Shell 内建命令。但这些命令只使用公开用户 ABI：\code{ls} 打开目录
+并迭代 64 字节目录项，\code{write} 以 create+truncate 打开普通文件，
+\code{cat} 循环读取到 EOF，\code{sync} 请求文件系统与设备提交。命令位于
+Ring 3，而不是由内核解释预置文本。
+
+考虑下列四条命令：
+
+\begin{lstlisting}
+mkdir /notes
+write /notes/a "hello kernel"
+sync
+cat /notes/a
+\end{lstlisting}
+
+第一条命令通过系统调用复制绝对路径，文件系统事务分配目录 inode 并把目录项
+追加到根目录；第二条建立或截断普通文件，经描述符写入 12 个字节；第三条要求
+写回缓存和 ATA flush；第四条重新打开同一 inode，从独立句柄偏移 0 读到 EOF。
+屏幕出现 \code{hello kernel} 只证明端到端正常路径；事务 Clean、目录可达、
+描述符关闭和后续重新挂载仍需内核统计与跨启动测试分别证明。
+
+\subsection{两个工程失败为什么属于 v1.0 完成证据}
+
+统一描述符表最初使用类内数组初始化，Clang 为全局 PCB 数组生成了
+\code{.init\_array}。自研入口没有 C++ CRT，也不会执行隐藏构造；即使显式初始化
+后来覆盖了表项，产物仍依赖一条没有履行的启动契约。Kernel ELF 审计在写入磁盘
+以前拒绝该产物。最终描述符表保持平凡构造，由显式 Initialize 在第一次读取前
+完整覆盖八个槽位。
+
+空闲路径的第一版分别调用 EnableInterrupts 和 WaitForInterrupt。单看两个函数
+的源码似乎是 STI 后执行 HLT，但编译后的 RET/CALL 可能夹在两条指令之间。
+最终实现把 \code{sti; hlt; cli} 放在同一汇编块，ELF 反汇编审计直接要求三条
+指令相邻。这个例子说明，源级意图与目标机实际指令是两层证据。
+
+v1.0 的完整回归为 73 项。正常 QEMU 在 Shell 输出 READY 后逐字产生十条命令，
+109 个字符全部经过 i8042、IRQ1、解码、FIFO、阻塞唤醒和 Ring 3 读取；同一
+回归还保留四进程调度、管道 256 字节传输、文件持久化、同盘双启动、损坏拒绝、
+用户异常隔离和全部早期启动失败路径。
+
+当前 Shell 没有 fork/exec/wait、作业控制、信号、管道语法或重定向；cwd 固定
+为根，描述符固定八槽且没有 dup、继承、引用计数与 close-on-exec；终端也只支持
+单字节 ASCII 和最小行编辑。v1.0 因而是一条已经闭合的教学系统基线，不是完整
+POSIX 用户环境。正文后续机制可以从这些明确限制继续扩展，而不能把尚未实现的
+接口写成当前项目能力。
