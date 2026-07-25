@@ -1,0 +1,524 @@
+\section{队列深度不等于可随意复用的请求数量}
+
+设控制器有一个包含 8 个槽位的提交环。驱动已经发布槽 5、6、7、0、1，设备刚消费到槽 6；
+软件准备在槽 2 放入 R42。若驱动只保存一个取模后的下标，就无法区分“槽 2 从未使用”
+和“槽 2 属于下一轮回绕”。更危险的是，旧完成项和新请求可能具有相同的槽号。因而环必须
+同时保存位置、回绕代次和每个槽位的发布状态。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.25\linewidth}|L{0.31\linewidth}|L{0.16\linewidth}|}
+\hline
+状态 & 代表字段 & 字段回答的问题 & 不能替代的证据 \\ \hline
+软件生产位置 & producer index、producer phase & 下一个候选槽位属于哪一轮 &
+设备是否已经看见该槽 \\\tablerowrule
+设备消费位置 & device head、consumer phase & 设备已经取得到哪个边界 &
+对应请求是否已经完成 \\\tablerowrule
+槽位发布状态 & valid/owned、slot phase、descriptor fields & 当前内容能否由设备解释 &
+DMA 数据是否已经传输 \\\tablerowrule
+完成位置 & completion head、completion phase & 软件应从哪一项开始消费完成记录 &
+完成记录是否匹配活动请求 \\\tablerowrule
+请求身份 & tag、queue generation、request reference & 完成项属于哪个请求生命周期 &
+上层是否已经观察结果 \\ \hline
+\end{longtable}
+
+“队列深度为 8”只表示硬件环中有 8 个描述符位置，并不表示驱动可以同时安全持有 8 个
+未区分代次的整数标签。通常还要保留一个空槽，或使用额外 phase 位区分满环和空环；tag
+分配器也必须等待旧请求的完成路径和复位路径都结束以后才能复用身份。
+
+\Needspace{8\baselineskip}
+\subsection{一次带回绕的槽位演算}
+
+把槽位画成两轮时间上的同一组存储位置。第一轮的槽 6 保存 R37，第二轮的槽 6 可能保存
+R45；它们的地址相同，内容身份却不同。
+
+\begin{pdfdiagram}[scale=0.9]
+  \node[os label, text width=23mm] at (-67mm,19mm) {第一轮\\phase=0};
+  \node[os label, text width=23mm] at (-67mm,-17mm) {第二轮\\phase=1};
+  \foreach \x/\lab/\sty in {-48/0/os memory,-34/1/os memory,-20/2/os state,-6/3/os state,8/4/os state,22/5/os compute,36/6/os control,50/7/os control} {
+    \node[\sty, minimum width=12mm, minimum height=10mm] at (\x mm,19mm) {\lab};
+  }
+  \foreach \x/\lab/\sty in {-48/0/os compute,-34/1/os compute,-20/2/os memory,-6/3/os memory,8/4/os memory,22/5/os memory,36/6/os memory,50/7/os memory} {
+    \node[\sty, minimum width=12mm, minimum height=10mm] at (\x mm,-17mm) {\lab};
+  }
+  \node[os label, text width=31mm] at (36mm,34mm) {旧槽 6：R37\\完成后才可越过};
+  \draw[os guide] (36mm,29mm) -- (36mm,25mm);
+  \node[os label, text width=33mm] at (-34mm,-33mm) {新槽 1：R42\\发布时携带 phase=1};
+  \draw[os guide] (-34mm,-27mm) -- (-34mm,-23mm);
+  \draw[os strong bus] (-48mm,4mm) -- (50mm,4mm);
+\end{pdfdiagram}
+\diagramnote{同一个槽位地址会跨轮复用。slot phase 说明描述符属于哪一轮，queue generation 说明请求属于哪次队列生命周期；两者解决的范围不同。}
+
+假设生产者当前位置为槽 1、phase 为 1，设备报告的消费边界仍为槽 6、phase 为 0。驱动
+可以继续填写槽 1，但不能把第一轮尚未完成的槽 6 当作第二轮空槽。推进规则可以教学化地写成：
+
+\begin{lstlisting}
+reserve_submission_slot(queue):
+  // 候选位置包含 index 和 phase，不能只比较取模后的整数下标。
+  candidate = (queue.producer_index, queue.producer_phase)
+  next = advance_with_wrap(candidate, queue.size)
+
+  // next 与设备消费边界完全相同表示再推进就会覆盖未消费描述符。
+  if next.index == queue.device_head and next.phase == queue.consumer_phase:
+    return RING_FULL
+
+  slot = queue.slots[candidate.index]
+  // 旧请求引用、旧 DMA 映射和旧发布位都必须已经清除。
+  require(slot.request == NONE)
+  require(slot.dma_mapping == NONE)
+  require(slot.owned_by_device == false)
+  return slot
+\end{lstlisting}
+
+保留槽位还没有发布请求。驱动可以在此阶段分配 tag、建立 DMA 映射并填写字段；任一步失败
+都只需回滚软件私有状态。只有 valid/owned 位以及设备可见的 tail 按规定顺序更新以后，
+设备才获得解释槽位的资格。
+
+\subsection{tag、slot phase 与 queue generation 是三层身份}
+
+三个字段经常同时出现，却不能合并为一个数字：
+
+\Needspace{18\baselineskip}
+\begin{longtable}{|L{0.2\linewidth}|L{0.25\linewidth}|L{0.3\linewidth}|L{0.15\linewidth}|}
+\hline
+身份层 & 复用范围 & 校验对象 & 典型失配含义 \\ \hline
+tag & 同一活动队列中的请求表项 & 完成项能否找到某个活动 request &
+标签已释放或完成项损坏 \\\tablerowrule
+slot phase & 环形存储的一次回绕 & 该槽位内容是否属于当前消费轮 &
+读到了上一轮遗留内容 \\\tablerowrule
+queue generation & reset/reinitialize 前后的一次队列生命期 &
+完成项是否来自当前建立的队列 & 迟到完成属于旧队列 \\\tablerowrule
+request generation & 对象地址或 tag 多次复用的业务生命期 &
+异步回调是否仍属于同一请求 & 旧定时器或旧工作命中新对象 \\ \hline
+\end{longtable}
+
+例如旧队列 generation 7 的 tag 3 对应 R37。复位以后，新队列 generation 8 再次分配
+tag 3 给 R52。完成项若只携带 tag 3，软件没有足够证据决定它属于谁；控制器若不回写
+generation，驱动就必须在复位协议中保证所有旧完成和旧 DMA 已经收敛，再开放 tag 复用。
+身份字段的多少取决于硬件接口，但“复用前必须排除旧生命期”是稳定语义。
+
+\section{一个 buffer 要跨越四种不同的所有权}
+
+R37 引用页面 P0 和 P1。CPU 可以通过内核虚拟地址访问它们，设备只能通过 DMA 地址访问。
+把页面地址写进描述符之前，驱动至少要建立页面寿命、DMA 映射、请求引用和描述符发布四项
+事实。它们可能由同一请求对象串联，却分别由不同子系统维护。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.31\linewidth}|L{0.14\linewidth}|}
+\hline
+所有权或能力 & 建立动作 & 撤销条件 & 失败时的回滚 \\ \hline
+页面寿命 & pin/get page，保存页引用与偏移 & 不再有 CPU、设备或上层引用 &
+按已取得页数逆序 put \\\tablerowrule
+设备地址能力 & DMA map/IOMMU map，保存方向与长度 & 设备已不能再访问该描述符 &
+撤销已建立的映射 \\\tablerowrule
+请求引用 & R37 保存页、映射、tag 和完成回调 & 终态发布且所有并发持有者释放 &
+销毁未发布请求 \\\tablerowrule
+描述符消费权 & 屏障后设置 valid 并更新 tail/doorbell & 完成或取消协议归还槽位 &
+发布前只清软件字段；发布后必须走收束协议 \\ \hline
+\end{longtable}
+
+页面被 pin 只保证物理页不会被迁移或回收，不会自动为设备产生地址；IOMMU 映射只授予
+设备访问范围，不会延长调用者缓冲区的业务寿命；描述符完成只归还设备访问权，不一定结束
+等待者、日志事务或网络协议的上层语义。把这四件事写成一个布尔量，会使失败路径无法判断
+应当撤销到哪一层。
+
+\subsection{离散页面如何变成设备能消费的段}
+
+一个 8192 字节逻辑 buffer 可能从 P0 偏移 3072 开始，跨过 P1，再落到 P2 的前 3072
+字节。DMA API 还要服从设备最大段长、地址对齐、边界限制和 IOMMU 页大小。最终描述符中的
+段数不一定等于虚拟内存中的页数。
+
+\begin{pdfdiagram}[scale=0.9]
+  \node[os state, minimum width=38mm] (logical) at (-55mm,22mm)
+    {逻辑 buffer\\offset=3072\\length=8192};
+  \node[os memory, minimum width=38mm] (pages) at (-15mm,22mm)
+    {页面片段\\P0 尾部、P1、P2 头部};
+  \node[os compute, minimum width=38mm] (sg) at (25mm,22mm)
+    {SG 列表\\合并物理相邻片段\\服从边界限制};
+  \node[os control, minimum width=38mm] (iova) at (65mm,22mm)
+    {设备视图\\IOVA 段与方向\\映射域};
+  \node[os memory, minimum width=44mm] (desc) at (25mm,-18mm)
+    {描述符\\addr[0..n-1]\\len[0..n-1]\\tag};
+  \draw[os bus] (logical.east) -- (pages.west);
+  \draw[os bus] (pages.east) -- (sg.west);
+  \draw[os strong bus] (sg.east) -- (iova.west);
+  \draw[os strong bus] (iova.south) |- (desc.east);
+  \draw[os guide] (sg.south) -- (desc.north);
+\end{pdfdiagram}
+\diagramnote{虚拟连续、物理页面片段、SG 段和设备 IOVA 是四种视图。映射层可以合并或拆分段，驱动必须使用 DMA API 返回的最终段数填写描述符。}
+
+设设备规定单段最大 4096 字节，且段不能跨越 64 KiB 边界。即使 P0、P1、P2 在物理上相邻，
+映射结果也可能为了边界而拆成三段。反过来，IOMMU 可以把离散页组织成设备连续 IOVA，
+但 CPU 的物理页仍不连续。驱动不能根据页数猜测硬件段数。
+
+\begin{lstlisting}
+prepare_dma_request(buffer, direction):
+  req = new_unpublished_request()
+
+  // 先固定实际覆盖的页面；记录成功数量，便于部分失败时准确回滚。
+  req.pages = pin_buffer_pages(buffer)
+  if req.pages.count != buffer.required_page_count:
+    put_each(req.pages)
+    return PAGE_PIN_FAILED
+
+  // SG 描述逻辑片段；DMA 映射返回设备最终可消费的段集合。
+  req.sg = build_scatterlist(req.pages, buffer.offset, buffer.length)
+  mapped_count = dma_map_sg(req.sg, direction)
+  if mapped_count == 0:
+    put_each(req.pages)
+    return DMA_MAP_FAILED
+
+  req.dma_direction = direction
+  req.mapped_count = mapped_count
+  // 请求尚未发布；调用者仍可无并发地撤销整个对象。
+  return req
+\end{lstlisting}
+
+\subsection{映射方向是所有权规则，不只是性能提示}
+
+TO\_DEVICE 表示 CPU 在发布前产生数据，设备在持有期间读取；FROM\_DEVICE 表示设备产生
+数据，CPU 在完成同步以后读取；BIDIRECTIONAL 允许两个方向，但仍不能允许双方无协议地
+同时改写同一 cache line。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.26\linewidth}|L{0.3\linewidth}|L{0.16\linewidth}|}
+\hline
+阶段 & TO\_DEVICE & FROM\_DEVICE & 共同禁令 \\ \hline
+映射前 & CPU 填写稳定输入 & CPU 准备可写空间和元数据 & 页面必须仍有寿命引用 \\\tablerowrule
+发布前同步 & 使 CPU 写对设备可见 & 准备设备写入范围 & valid 不得早于同步完成 \\\tablerowrule
+设备持有期 & CPU 不改设备将读取的字节 & CPU 不读写设备正在产生的字节 &
+不得 unmap、迁移或复用 \\\tablerowrule
+完成后同步 & 通常只需取得完成状态 & 使设备写对 CPU 可见 & 先确认完成身份 \\\tablerowrule
+解除映射后 & CPU 恢复普通访问 & CPU 才能解释新数据 & 旧描述符不得再次访问 \\ \hline
+\end{longtable}
+
+在完全一致的平台上，cache clean/invalidate 可能由硬件和 DMA API 隐藏，但所有权顺序仍然
+存在。数据可见性、描述符发布顺序和请求完成身份是三个不同问题，不能因为平台 coherent
+就省略 doorbell 前的发布屏障或完成项校验。
+
+\section{完成与超时竞争时只能有一个终态发布者}
+
+R37 的定时器在 CPU 2 到期，同时设备完成中断在 CPU 7 到达。两条路径都可能先读到
+IN\_FLIGHT。若它们分别写 result、解除 DMA、唤醒等待者并减少引用，就会产生双重 unmap、
+双重完成或成功结果被超时覆盖。请求需要一个原子裁决点，把“负责收束”这一角色交给唯一
+路径。
+
+\begin{pdfdiagram}[scale=0.9]
+  \node[os state, minimum width=42mm] (flight) at (0,28mm) {IN\_FLIGHT\\terminal owner=NONE};
+  \node[os compute, minimum width=42mm] (device) at (-42mm,2mm)
+    {完成路径\\尝试领取 DEVICE};
+  \node[os control, minimum width=42mm] (timer) at (42mm,2mm)
+    {超时路径\\尝试领取 TIMEOUT};
+  \node[os memory, minimum width=45mm] (winner) at (0,-25mm)
+    {唯一获胜者\\撤销设备访问\\写 result\\发布终态};
+  \node[os label, text width=38mm] at (-57mm,-27mm)
+    {失败者只记录竞争结果\\不重复清理};
+  \draw[os bus] (flight.south) -- (device.north);
+  \draw[os bus] (flight.south) -- (timer.north);
+  \draw[os strong bus] (device.south) -- (winner.west);
+  \draw[os strong bus] (timer.south) -- (winner.east);
+\end{pdfdiagram}
+\diagramnote{原子裁决只决定哪条路径负责收束，不自动证明设备已经停止 DMA。超时获胜后仍要执行取消、排空或复位，才能解除映射。}
+
+完成路径获胜时，可以根据完成项解除映射并发布成功或设备错误。超时路径获胜时，只能先把
+普通完成发布权关闭；它还要等待取消命令、队列排空或控制器复位证明设备不再访问。等待者
+看到 TIMEOUT 终态的时刻，可以晚于定时器第一次到期。
+
+\begin{lstlisting}
+try_finish_request(req, source, evidence):
+  // DEVICE 与 TIMEOUT 竞争同一 terminal owner；只有一个来源取得收束资格。
+  if not compare_exchange(req.terminal_owner, NONE, source):
+    record_losing_terminal_event(req, source, evidence)
+    return ALREADY_CLAIMED
+
+  if source == DEVICE:
+    // 完成项已经匹配 tag、phase 和 generation，能够证明此描述符结束。
+    stop_device_access_from_completion(req, evidence)
+    result = translate_completion(evidence)
+  else:
+    // 定时器本身不撤销 DMA；必须完成取消、排空或复位协议。
+    result = cancel_or_reset_and_wait_for_quiescence(req)
+
+  unmap_dma_once(req)
+  req.result = result
+  // 先写稳定结果，再用 release 发布终态；等待者用 acquire 读取。
+  store_release(req.state, terminal_state(result))
+  wake_all(req.wait_queue)
+  return FINISHED
+\end{lstlisting}
+
+\subsection{完成长度和错误码也要形成一次提交}
+
+部分完成不能只保存一个布尔 success。设备可能报告 8192 字节请求完成 4096 字节后遇到
+介质错误；网络发送完成通常归还 buffer，却不证明对端收到；丢弃写和 flush 还具有不同
+持久化含义。请求终态要同时提交结果类别、已完成范围和剩余责任。
+
+\Needspace{18\baselineskip}
+\begin{longtable}{|L{0.19\linewidth}|L{0.25\linewidth}|L{0.3\linewidth}|L{0.16\linewidth}|}
+\hline
+完成证据 & 可以提交的字段 & 上层仍需决定 & 不可做的推断 \\ \hline
+全量成功 & result=OK、completed=length & 是否还有事务或协议确认 & 普通写一定持久 \\\tablerowrule
+部分完成 & completed bytes、首个错误位置 & 重试剩余范围或返回短操作 & 已完成前缀可重复执行 \\\tablerowrule
+设备错误 & 精确状态、残余长度、故障队列 & 重试、降级或隔离设备 & 所有同类请求都失败 \\\tablerowrule
+超时收束 & timeout、取消/复位证据 & 是否重新提交新请求 & 旧请求绝不会迟到 \\\tablerowrule
+移除失败 & device gone、完成范围 & 向用户关闭或切换设备 & fd 引用仍代表硬件存在 \\ \hline
+\end{longtable}
+
+重试是否安全取决于操作语义。读取同一不可变范围通常可以重新发起；带副作用的设备命令或
+“追加一次”不能仅凭超时盲目重放，因为旧命令可能已经执行但完成记录丢失。驱动应把确定
+完成、确定未执行和结果未知三种状态分开，让上层依据幂等性决定恢复。
+
+\section{从中断切到轮询时怎样避免丢失最后一个完成}
+
+高负载下，设备产生中断，驱动暂时屏蔽队列中断并调度 poll。poll 在预算内消费完成项；
+队列看似为空时，驱动准备重新允许中断。此刻若设备恰好写入新完成，而中断仍被屏蔽，软件
+若直接退出 poll，新完成可能长期无人处理。
+
+防丢事件协议需要一个“重新检查”窗口：先声明即将重新允许中断或更新完成 head，再执行
+必要屏障，开启中断，然后再次检查队列状态。若在窗口中出现完成，就继续轮询或依赖设备
+按协议重新触发。具体寄存器顺序由设备决定，稳定要求是空队列判断和事件重新武装必须形成
+闭合握手。
+
+\begin{pdfdiagram}[scale=0.88]
+  \node[os label, text width=28mm] at (-61mm,30mm) {CPU poll 路径};
+  \node[os label, text width=28mm] at (-61mm,-12mm) {设备完成路径};
+  \node[os state, minimum width=35mm] (drain) at (-32mm,28mm)
+    {消费到暂时为空};
+  \node[os compute, minimum width=35mm] (publish) at (8mm,28mm)
+    {发布 completion head\\准备重新武装};
+  \node[os control, minimum width=35mm] (recheck) at (48mm,28mm)
+    {重新检查\\空则退出\\非空则继续 poll};
+  \node[os memory, minimum width=37mm] (arrive) at (8mm,-12mm)
+    {窗口中写入新完成\\更新设备状态};
+  \draw[os strong bus] (drain.east) -- (publish.west);
+  \draw[os strong bus] (publish.east) -- (recheck.west);
+  \draw[os bus] (arrive.north) -- (publish.south);
+  \draw[os feedback] (arrive.east) -| (recheck.south);
+\end{pdfdiagram}
+\diagramnote{关键不是假设“开中断以后设备一定再通知”，而是按设备契约把重新武装和队列复查配成一组，使窗口中的完成至少由继续轮询或新中断之一观察。}
+
+\begin{lstlisting}
+poll_completion_queue(queue, budget):
+  processed = consume_ready_entries(queue, budget)
+
+  if processed == budget:
+    // 预算耗尽表示可能仍有工作，保持轮询状态并让调度器稍后再次运行。
+    return KEEP_POLLING
+
+  // 先把软件消费位置发布给设备，再重新武装此队列的事件通知。
+  publish_completion_head(queue)
+  dma_read_barrier()
+  arm_queue_interrupt(queue)
+
+  // 关闭轮询前再次读取完成状态，封闭“判断为空到开中断”之间的窗口。
+  if completion_available(queue):
+    disarm_queue_interrupt(queue)
+    return KEEP_POLLING
+
+  return POLL_COMPLETE
+\end{lstlisting}
+
+\subsection{budget 同时约束 CPU 所有权和队列延迟}
+
+一次 poll 若无限消费，会让同一 CPU 上的其他队列、软中断和普通任务长期得不到运行；budget
+过小又会频繁重新调度，增加延迟和缓存抖动。因而调优至少要同时观察每轮完成数、预算耗尽
+比例、重新武装次数、队列延迟和 CPU 占用，不能只以中断次数下降判断成功。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.28\linewidth}|L{0.3\linewidth}|L{0.12\linewidth}|}
+\hline
+现象 & 直接证据 & 可能机制 & 不能直接归因 \\ \hline
+预算经常耗尽 & processed=budget、队列仍非空 & 到达率高或单项处理过慢 &
+中断合并一定过大 \\\tablerowrule
+重新武装后立即再 poll & arm 后复查非空 & 窗口内持续到达或设备阈值较低 &
+一定发生丢中断 \\\tablerowrule
+延迟升高但吞吐稳定 & 队列驻留时间、批大小增大 & 合并窗口或 budget 偏大 &
+设备介质变慢 \\\tablerowrule
+单核利用率过高 & queue affinity、poll 时间 & 队列亲和集中或工作分配不均 &
+整个系统 CPU 不足 \\\tablerowrule
+完成长期不前进 & head 不变、设备 tail 增长 & 事件丢失、队列卡死或同步错误 &
+请求必然已丢失 \\ \hline
+\end{longtable}
+
+\section{reset 是一次队列生命期切换，不是写一个寄存器}
+
+控制器无响应时，驱动可能写 reset 位，但寄存器写入只请求硬件开始复位。安全恢复要依次
+阻止新提交、收束软件执行路径、终止设备访问、结算旧请求、重建队列，再发布新 generation。
+任何一步缺少证据，都可能让旧 DMA、旧中断或旧 tag 进入新队列。
+
+\begin{longtable}{|L{0.17\linewidth}|L{0.3\linewidth}|L{0.31\linewidth}|L{0.12\linewidth}|}
+\hline
+阶段 & 必须建立的证据 & 仍然存在的活动 & 过早推进的后果 \\ \hline
+FREEZING & 提交入口拒绝新请求，软件队列边界固定 & 已发布请求仍可能 DMA &
+旧请求数量继续增长 \\\tablerowrule
+DRAINING & poll、IRQ、定时器和工作队列进入可控集合 & 设备可能仍执行描述符 &
+完成路径与释放路径并发 \\\tablerowrule
+RESETTING & 控制器确认停止取描述符，IOMMU 可撤权 & 旧完成可能留在内存 &
+解除映射后仍有 DMA \\\tablerowrule
+RECONCILING & 每个旧请求恰好结算一次，旧 tag 不再活动 & 等待者和引用仍在退出 &
+新请求命中旧完成 \\\tablerowrule
+REBUILDING & 新环清零、phase 初始化、中断重新配置 & 尚未对上层可见 &
+半初始化队列接收请求 \\\tablerowrule
+LIVE & 新 generation 发布，提交入口重新开放 & 新生命期请求 &
+发布顺序错误导致读到旧字段 \\ \hline
+\end{longtable}
+
+\begin{pdfdiagram}[scale=0.88]
+  \node[os state, minimum width=27mm] (freeze) at (-58mm,18mm)
+    {冻结提交\\确定旧请求集合};
+  \node[os compute, minimum width=27mm] (sync) at (-29mm,18mm)
+    {同步软件路径\\IRQ/poll/work};
+  \node[os control, minimum width=27mm] (stop) at (0,18mm)
+    {停止设备访问\\reset/IOMMU};
+  \node[os memory, minimum width=27mm] (settle) at (29mm,18mm)
+    {结算旧请求\\失败或已完成};
+  \node[os state, minimum width=27mm] (live) at (58mm,18mm)
+    {重建并发布\\generation+1};
+  \draw[os strong bus] (freeze.east) -- (sync.west);
+  \draw[os strong bus] (sync.east) -- (stop.west);
+  \draw[os strong bus] (stop.east) -- (settle.west);
+  \draw[os strong bus] (settle.east) -- (live.west);
+  \node[os label, text width=33mm] at (0,-10mm)
+    {释放 DMA 的许可来自“设备已停止访问”，不是来自“已写 reset 位”};
+  \draw[os guide] (0,7mm) -- (0,-2mm);
+\end{pdfdiagram}
+\diagramnote{队列代次只在旧生命期收束、新队列结构完成以后发布。先增加 generation 再处理旧请求，会让状态表面更新而设备访问事实仍未改变。}
+
+\begin{lstlisting}
+reset_queue(queue, reason):
+  // 1. 原子关闭提交入口，取得本次复位要收束的活动请求快照。
+  transition(queue.state, LIVE, FREEZING)
+  old_generation = queue.generation
+  active = snapshot_active_requests(queue)
+
+  // 2. 停止并同步所有能消费完成项或重新提交工作的软件路径。
+  disable_queue_irq()
+  cancel_poll_and_deferred_work()
+  synchronize_irq_and_workers()
+
+  // 3. 请求控制器停止取描述符；等待有界确认，必要时撤销 IOMMU 访问。
+  stop_result = stop_or_reset_controller_with_timeout(queue)
+  revoke_device_dma_access_if_required(queue.domain)
+
+  // 4. 每个旧请求通过唯一终态裁决结算，解除映射并唤醒等待者。
+  for req in active:
+    finish_old_generation_once(req, old_generation, stop_result)
+
+  // 5. 旧 tag、旧完成和旧软件引用收敛后，再初始化环并发布新代次。
+  require(no_active_tag_for_generation(old_generation))
+  initialize_empty_rings_and_phase(queue)
+  queue.generation = old_generation + 1
+  configure_and_enable_queue_irq()
+  store_release(queue.state, LIVE)
+\end{lstlisting}
+
+\subsection{reset 失败也必须有稳定终态}
+
+硬件可能不响应 reset，PCIe 链路可能已断开，虚拟设备后端可能消失。驱动不能无限等待 READY。
+超时以后，队列应进入 OFFLINE 或 REMOVED，而不是假装恢复成功。旧请求获得明确设备错误，
+新请求立即失败或由上层切换路径，设备对象保留到引用归零以承载这些错误返回。
+
+\section{热移除时要分开“硬件消失”和“对象仍被引用”}
+
+用户进程持有 fd，只能证明它还引用一个内核文件对象和驱动私有对象，不能证明 PCIe 设备、
+USB 端点或虚拟后端仍存在。热移除首先改变硬件可访问性，随后驱动使接口不可接受新工作；
+旧 fd 可以继续调用 close 或读取错误，但不能再次触碰已撤销的 MMIO。
+
+\Needspace{18\baselineskip}
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.32\linewidth}|L{0.13\linewidth}|}
+\hline
+设备状态 & 允许的新动作 & 必须保留的对象 & 退出条件 \\ \hline
+LIVE & 提交、控制、查询 & device、queue、MMIO、IRQ、DMA domain &
+检测移除或管理操作 \\\tablerowrule
+QUIESCING & close、结算旧请求；拒绝新 I/O & 请求表、错误状态、引用计数 &
+设备访问与完成路径收敛 \\\tablerowrule
+OFFLINE & 返回稳定错误、诊断、有限恢复 & device 身份、用户引用、统计 &
+恢复成功或进入移除 \\\tablerowrule
+REMOVED & close、释放用户引用 & 不再含可访问 MMIO/DMA 的壳对象 &
+所有外部引用归零 \\\tablerowrule
+FREED & 无 & 无 & 生命周期结束 \\ \hline
+\end{longtable}
+
+移除通知可能与系统调用并发。进入驱动操作前，调用者需要取得设备引用并检查状态；状态由
+LIVE 变为 QUIESCING 后，已进入的调用者要么被等待，要么在受控点观察取消。仅先删除设备
+节点不能阻止已打开 fd，直接 unmap MMIO 又会让并发调用访问失效地址。
+
+\begin{lstlisting}
+device_operation(handle, command):
+  // 引用保证软件对象存在；随后检查决定硬件资源是否仍可访问。
+  dev = get_device_reference(handle)
+  if dev == NONE:
+    return DEVICE_GONE
+
+  state = load_acquire(dev.state)
+  if state != LIVE:
+    put_device_reference(dev)
+    return stable_error_for(state)
+
+  // active_ops 让移除路径知道已有调用何时退出硬件访问区。
+  enter_active_operation(dev)
+  result = execute_if_still_live(dev, command)
+  leave_active_operation(dev)
+  put_device_reference(dev)
+  return result
+\end{lstlisting}
+
+\subsection{runtime suspend 与 remove 的边界不同}
+
+runtime suspend 预期硬件稍后恢复，因此保留设备身份、配置快照和重新初始化所需资源，并阻止
+休眠期间的新队列访问；remove 假设硬件不会返回，最终撤销资源。若 suspend 与新提交竞争，
+电源管理引用或活动计数必须保证“队列仍有请求”时设备不能断电。
+
+\begin{longtable}{|L{0.2\linewidth}|L{0.27\linewidth}|L{0.31\linewidth}|L{0.12\linewidth}|}
+\hline
+边界 & runtime suspend & remove & 共同要求 \\ \hline
+未来硬件 & 预期可恢复 & 不再依赖其返回 & 先停止新提交 \\\tablerowrule
+队列状态 & 保存或重建后继续使用 & 旧队列永久销毁 & 收束 in-flight \\\tablerowrule
+用户接口 & 通常保留，操作可唤醒设备 & 撤销或返回永久错误 & 不访问失效 MMIO \\\tablerowrule
+DMA 映射 & 依平台和设备契约保留或重建 & 全部撤销 & 设备停止访问后处理 \\\tablerowrule
+失败结果 & resume 失败转 OFFLINE & 进入 REMOVED & 等待者必须被唤醒 \\ \hline
+\end{longtable}
+
+\Needspace{8\baselineskip}
+\section{把数据顺序和控制顺序分别核对}
+
+异步队列同时存在两条方向相反的发布关系。提交方向由 CPU 产生描述符、设备消费；完成方向
+由设备产生完成项、CPU 消费。每个方向都需要“先写内容、后发布可见标志”，消费者则要
+“先确认发布、后读取内容”。MMIO 顺序、DMA 顺序和普通 CPU 内存顺序可能使用不同接口。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.31\linewidth}|L{0.14\linewidth}|}
+\hline
+边 & 生产者动作 & 消费者取得的证据 & 违反后的现象 \\ \hline
+CPU $\rightarrow$ 描述符 & 写 addr/len/tag，再发布 valid & 设备看到 valid 后读完整字段 &
+设备读到旧地址或混合长度 \\\tablerowrule
+CPU $\rightarrow$ doorbell & 描述符可见后写 tail/MMIO & 设备按新边界取槽 &
+通知先到而数据未就绪 \\\tablerowrule
+设备 $\rightarrow$ 完成项 & 写 status/length/tag，再发布 phase & CPU 看到新 phase 后读结果 &
+CPU 使用旧状态或旧长度 \\\tablerowrule
+CPU $\rightarrow$ 等待者 & 清理 DMA、写 result，再发布终态 & 醒来任务读到稳定结果 &
+任务看到 DONE 却仍读到旧 result \\\tablerowrule
+移除 $\rightarrow$ 调用者 & 撤销访问入口，再等待 active ops & 新调用稳定失败，旧调用退出 &
+新旧路径同时触碰已释放资源 \\ \hline
+\end{longtable}
+
+屏障的名称和强度依体系结构、DMA 一致性模型和设备接口而异。教材层面需要保持的不是某条
+固定指令，而是每个发布边的生产内容、发布标志、消费者观察顺序和失败现象。只有把四条边
+分别核对，才不会用一个笼统的“加内存屏障”掩盖方向错误。
+
+\subsection{进入章末综合 trace 前的证据清单}
+
+现在可以把一个请求从槽位保留到设备移除逐项核对：
+
+\begin{enumerate}
+\item 环位置由 index 与 phase 共同解释，tag 和 queue generation 进一步区分请求与队列
+      生命期；槽位地址相同不表示身份相同。
+\item 页面引用、DMA 映射、请求引用和描述符消费权分别建立并按相反次序撤销；发布前失败
+      可以局部回滚，发布后失败必须走取消或复位协议。
+\item 完成、中断、超时和唤醒是不同事件。唯一终态裁决者负责解除设备访问、写入稳定结果，
+      再发布终态并唤醒等待者。
+\item 中断转轮询的退出路径包含重新武装与复查，budget 只限制一次 CPU 消费量，不改变
+      每个完成项恰好结算一次的要求。
+\item reset 先冻结入口，再同步软件路径、终止设备访问、结算旧请求和重建队列；新 generation
+      只在新队列完整以后发布。
+\item 热移除允许软件壳对象继续承载旧 fd 的错误返回，但任何路径都不能再使用已经撤销的
+      MMIO、IRQ 或 DMA 资源。
+\end{enumerate}
+
+这些局部结构建立以后，下一节才能用 R37 的一次 8192 字节写请求做端到端验证：函数返回
+以后哪些对象仍存在，哪个事件把 buffer 交给设备，哪个证据把它交还软件，以及失败时怎样
+保证旧生命期不进入新请求。
