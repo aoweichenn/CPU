@@ -1,0 +1,351 @@
+\section{同一批字节为什么会经历多套地址}
+
+沿启动日志向下读，会连续看到 \code{0xFFFFFFF0}、\code{0x8000}、
+\code{0x03E00000}、\code{0x00100000} 和
+\code{0xFFFF888000000000}。如果把它们都理解成“代码又换了一个地址”，这条
+启动链就会显得反复而多余。真正发生的事情并不相同：有时字节确实从磁盘搬到
+RAM，有时只是处理器根据段状态形成物理地址，有时页表为同一物理页提供另一个
+名字，还有一次写 CR3 只改变后续地址由哪套规则解释。
+
+\begin{keyidea}
+地址不是字节自身携带的永久编号。一条完整的地址事实至少包含三项：
+\emph{数值、坐标系、解释者}。同一个数值在 ROM 文件、磁盘、物理 RAM 和某个
+进程页表中可以指向完全不同的对象；同一批物理字节也可以同时拥有多个虚拟地址。
+\end{keyidea}
+
+\subsection{先把六种不同动作分开}
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.25\linewidth}|L{0.24\linewidth}|L{0.23\linewidth}|}
+\toprule
+动作 & 输入与输出 & 字节是否移动 & 为什么需要这一层 \\
+\midrule
+复位地址形成 &
+CS 隐藏基址与 IP \(\rightarrow\) 物理取指地址 &
+不移动 &
+处理器必须在软件尚未运行时得到唯一第一地址 \\\tablerowrule
+设备搬运 &
+磁盘 LBA 与扇区内偏移 \(\rightarrow\) RAM 物理地址 &
+真实复制 &
+CPU 不能直接把磁盘扇区当作可取指 RAM \\\tablerowrule
+映像放置 &
+ELF 文件偏移 \(\rightarrow\) PT\_LOAD 目标范围 &
+复制文件字节，并为 BSS 写零 &
+文件布局与运行时内存布局承担不同目标 \\\tablerowrule
+分页翻译 &
+当前 CR3 下的虚拟地址 \(\rightarrow\) 物理地址 &
+不移动 &
+为隔离、权限、共享和稀疏布局建立可变解释 \\\tablerowrule
+虚拟别名 &
+物理地址 \(p\) \(\rightarrow\) 恒等地址或高半区直映地址 &
+不移动 &
+让内核在不同阶段用可解引用指针访问同一物理页 \\\tablerowrule
+解释根切换 &
+旧 CR3 \(\rightarrow\) 新 CR3 &
+不移动 &
+一次提交整套翻译和权限规则，而不是逐项公开半成品映射 \\
+\bottomrule
+\end{longtable}
+
+下图把这六类动作放回案例。只有标为“复制”或“清零”的箭头会改写目标字节；
+其余箭头只形成、查询或更换地址解释。
+
+\begin{pdfdiagram}[scale=0.92]
+  \node[os state, text width=35mm] (reset_state) at (-49mm,38mm)
+    {复位处理器状态\\CS 隐藏基址\\IP=\code{0xFFF0}};
+  \node[os compute, text width=31mm] (reset_form) at (0,38mm)
+    {硬件地址形成\\基址加 IP\\不复制};
+  \node[os memory, text width=35mm] (reset_fetch) at (49mm,38mm)
+    {ROM 取指位置\\物理地址\\\code{0xFFFFFFF0}};
+
+  \node[os state, text width=35mm] (disk) at (-49mm,19mm)
+    {磁盘坐标\\LBA 66 起\\扇区内偏移};
+  \node[os compute, text width=31mm] (pio) at (0,19mm)
+    {ATA PIO\\真实搬运\\并校验};
+  \node[os memory, text width=35mm] (staging) at (49mm,19mm)
+    {ELF 暂存物理区\\\code{0x03E00000}\\起始 1 MiB};
+
+  \node[os state, text width=35mm] (file_offset) at (-49mm,0)
+    {ELF 段坐标\\暂存基址\\加 \code{p\_offset}};
+  \node[os compute, text width=31mm] (placement) at (0,0)
+    {第二遍装载\\复制 \code{p\_filesz}\\清零 BSS};
+  \node[os memory, text width=35mm] (target) at (49mm,0)
+    {PT\_LOAD 目标\\\code{0x00100000}\\起始窗口};
+
+  \node[os state, text width=35mm] (virtual) at (-49mm,-19mm)
+    {CPU 发出虚拟地址\\含页号与\\页内偏移};
+  \node[os compute, text width=31mm] (walk) at (0,-19mm)
+    {当前 CR3 页表\\翻译并检查权限\\不复制};
+  \node[os memory, text width=35mm] (physical) at (49mm,-19mm)
+    {物理页地址\\页内偏移不变\\字节仍在原处};
+
+  \node[os state, text width=35mm] (physical_name) at (-49mm,-38mm)
+    {同一物理地址 \(p\)\\页表项仍保存\\这个数值};
+  \node[os compute, text width=31mm] (alias) at (0,-38mm)
+    {建立高半区别名\\基址加 \(p\)\\不复制};
+  \node[os memory, text width=35mm] (direct) at (49mm,-38mm)
+    {内核可解引用地址\\\code{0xFFFF8880}\\\code{00000000}+p};
+
+  \draw[os strong bus] (reset_state.east) -- (reset_form.west);
+  \draw[os strong bus] (reset_form.east) -- (reset_fetch.west);
+  \draw[os strong bus] (disk.east) -- (pio.west);
+  \draw[os strong bus] (pio.east) -- (staging.west);
+  \draw[os strong bus] (file_offset.east) -- (placement.west);
+  \draw[os strong bus] (placement.east) -- (target.west);
+  \draw[os strong bus] (virtual.east) -- (walk.west);
+  \draw[os strong bus] (walk.east) -- (physical.west);
+  \draw[os strong bus] (physical_name.east) -- (alias.west);
+  \draw[os strong bus] (alias.east) -- (direct.west);
+\end{pdfdiagram}
+\diagramnote{每一行都是独立关系，图中没有跨行回绕连线。第二、三行会产生新的
+RAM 内容；第一、四、五行只改变地址的形成或解释。把这些动作都称作“地址变化”，
+会掩盖字节所有权和失败边界。}
+
+\subsection{为什么第一条指令偏偏位于 \code{0xFFFFFFF0}}
+
+\code{0xFFFFFFF0} 不是本项目为了整齐而选择的地址。x86 处理器复位以后已经
+带着一份架构规定的 CS 隐藏基址和 IP；案例机器形成
+\[
+\code{0xFFFF0000}+\code{0xFFF0}=\code{0xFFFFFFF0}.
+\]
+软件还没有机会执行，所以第一地址必须由硬件契约给出。现代项目继续遵守这个
+看似特殊的高地址，主要原因是兼容：处理器、芯片组地址译码与固件镜像已经围绕
+同一复位契约工作。项目若单方面改成 \code{0x00000000}，CPU 仍会到
+\code{0xFFFFFFF0} 取指，只会读到错误内容或空映射。
+
+128 KiB ROM 被放在 4 GiB 物理地址空间顶端，因此它的基址由容量倒推：
+\[
+\code{0x100000000}-128\text{ KiB}=\code{0xFFFE0000}.
+\]
+于是复位字节在 ROM 文件中的位置是
+\[
+\code{0xFFFFFFF0}-\code{0xFFFE0000}=\code{0x1FFF0}.
+\]
+\code{0x1FFF0} 是镜像工具和 ROM 地址译码使用的\emph{文件偏移}；
+\code{0xFFFFFFF0} 才是处理器看到的\emph{物理地址}。这里没有发生复制，只是
+用两个坐标描述同一个 ROM 字节。
+
+复位向量只占 ROM 末尾 16 字节，无法容纳完整初始化。案例在该处放置字节
+\code{E9 0D F0}。处理器取完三字节近跳后，下一 IP 为 \code{0xFFF3}；
+\code{0xF00D} 按 16 位有符号位移解释为负数，得到新 IP
+\code{0xF000}。近跳不改 CS 隐藏基址，因此下一次取指位于
+\[
+\code{0xFFFF0000}+\code{0xF000}=\code{0xFFFFF000}.
+\]
+项目把这个入口选在 4 KiB 边界上，使入口到复位向量之间拥有
+\code{0xFF0} 字节连续 ROM 空间，链接与产物审计也能直接核对边界。远跳并非
+架构上绝对禁止，但它还会更换段状态；在软件栈和描述符环境尚未建立时，近跳只
+改变一项状态，更容易证明。
+
+\begin{longtable}{|L{0.22\linewidth}|L{0.20\linewidth}|L{0.27\linewidth}|L{0.21\linewidth}|}
+\toprule
+地址或偏移 & 决定者 & 采用理由 & 若混淆或省略 \\
+\midrule
+\code{0xFFFFFFF0} &
+x86 复位架构 &
+给未运行软件的处理器一个兼容且唯一的第一取指位置 &
+项目入口放在别处也不会被 CPU 自动采用 \\\tablerowrule
+\code{0xFFFE0000} &
+平台 ROM 映射与 128 KiB 容量 &
+让整份镜像结束于 4 GiB 边界并覆盖复位地址 &
+镜像偏移与物理译码不能一一对应 \\\tablerowrule
+\code{0x1FFF0} &
+ROM 文件布局 &
+指出复位字节在镜像内部的位置 &
+把它当物理地址会检查错误的 RAM/ROM 位置 \\\tablerowrule
+\code{0xFFFFF000} &
+项目链接布局 &
+页对齐、近跳可达，并在复位向量之前留出入口代码空间 &
+跳转编码、链接地址和 ROM 内容任一不一致都会失去控制 \\
+\bottomrule
+\end{longtable}
+
+\subsection{低端 RAM 为什么排成 \code{0x0500}、\code{0x7000}、
+\code{0x8000} 和 \code{0x10000}}
+
+这四个地址都不是 x86 强制值，而是一组共同避免覆盖的项目布局。单看任何一个
+地址都无法说明它是否安全；必须把栈增长方向、Stage 1 最大尺寸和页表对齐一起
+计算。
+
+\begin{longtable}{|L{0.23\linewidth}|L{0.24\linewidth}|L{0.27\linewidth}|L{0.16\linewidth}|}
+\toprule
+物理范围或边界 & 当前对象与访问者 & 为什么选择这里 & 最先出现的覆盖故障 \\
+\midrule
+\code{0x0500} 起 &
+ROM 使用的 512 字节 Stage 1 描述符缓冲 &
+位于实模式低端 RAM，并紧接传统
+\code{0x0000..0x04FF} 平台区之后 &
+再降低会覆盖中断向量或平台数据 \\\tablerowrule
+\code{0x7000} &
+ROM 与 Stage 1 早期向下增长的栈顶 &
+页面对齐，低于 Stage 1 起点一个完整 4 KiB 区间 &
+栈向上布置或顶端过高会改写待执行负载 \\\tablerowrule
+\code{0x8000..0xFFFF} &
+Stage 1 最大负载窗口 &
+\code{0x0800:0x0000} 可直接表达；64 个扇区恰为
+\(64\times512=\code{0x8000}\) 字节 &
+负载过长会进入第一张页表 \\\tablerowrule
+\code{0x10000..0x12FFF} &
+PML4、PDPT、PD 三张 4 KiB 表 &
+从最大 Stage 1 末端开始，三页均满足页对齐且在建表时可直接访问 &
+与 Stage 1 重叠会让代码写表时改写自己 \\
+\bottomrule
+\end{longtable}
+
+这一布局解释了为什么“把 Stage 1 放在更常见的位置”不是只改一个常量。若把
+起点从 \code{0x8000} 改成 \code{0x9000}，最大 32 KiB 负载会结束于
+\code{0x11000}，覆盖 PML4 和 PDPT；要么同时移动页表和全部工作区，要么降低
+最大负载。地址选择不是审美问题，而是一组区间不重叠证明。
+
+页表之后，Stage 1 继续按页隔离小型对象：
+
+\begin{longtable}{|L{0.25\linewidth}|L{0.28\linewidth}|L{0.37\linewidth}|}
+\toprule
+物理位置 & 保存对象 & 分开放置的理由 \\
+\midrule
+\code{0x13000} &
+Kernel 磁盘描述符 &
+ATA 一扇区读入不会覆盖页表或 BootInfo \\\tablerowrule
+\code{0x14000} &
+104 字节 BootInfo v2 &
+拥有固定 ABI 地址；内核可先验证指针和完整结构再采用字段 \\\tablerowrule
+\code{0x15000}、\code{0x16000}、\code{0x17000} &
+ELF 验证账本、内存图计数与 \code{fw\_cfg} 名称暂存 &
+不同协议的临时状态不复用同一批字节，失败现场可以分别检查 \\\tablerowrule
+\code{0x18000..0x18BFF} &
+最多 128 项、每项 24 字节的物理内存图 &
+\(128\times24=\code{0xC00}\)，范围可直接复算且不会进入下一页对象 \\
+\bottomrule
+\end{longtable}
+
+把这些小对象紧密打包当然能够节省若干页，但启动期最稀缺的不是这几 KiB RAM，
+而是可审计性。当前布局用页边界换取简单的范围证明、稳定的调试地址和互不污染的
+失败现场。以后若由分配器动态选择位置，就必须用对象长度、对齐和所有权记录替代
+这些固定地址承担的责任。
+
+\subsection{为什么 ELF 先去 \code{0x03E00000}，又回到
+\code{0x00100000}}
+
+磁盘上的 \code{kernel.elf} 是一个需要整体校验的文件，PT\_LOAD 目标则是运行时
+代码、只读数据和可写数据最终占用的区间。若边读磁盘边覆盖目标段，最后一个程序头
+失败时，前面的内核代码可能已经覆盖旧状态，装载器无法回滚。因此案例先把完整文件
+保存到独立暂存区，再进行“只读验证”和“写目标段”两遍处理。
+
+暂存区为
+\[
+[\code{0x03E00000},\code{0x03F00000}),
+\]
+容量恰为 1 MiB。它满足三项同时成立的约束：
+
+\begin{enumerate}
+\item 整段低于 \code{0x04000000}，Stage 1 的 64 MiB 恒等映射能够访问；
+\item 起点等于 PT\_LOAD 目标开区间上界，源文件不会与任何目标段重叠；
+\item 读取以前由 E820 证明整段落在同一条可用 RAM 记录中，而不是只相信 QEMU
+      常见内存大小。
+\end{enumerate}
+
+对一个程序头，第二遍实际执行的坐标关系是
+\[
+\text{源物理地址}=\code{0x03E00000}+\code{p\_offset},
+\qquad
+\text{目标物理地址}=\code{p\_paddr}.
+\]
+这一步会真实复制 \code{p\_filesz} 字节，并把其后的
+\(\code{p\_memsz}-\code{p\_filesz}\) 字节清零。当前阶段还要求
+\code{p\_vaddr==p\_paddr}，因为打开分页后采用恒等映射；链接器从
+\code{0x00100000} 布置入口，也就使链接地址、早期虚拟地址和目标物理地址数值
+相等。数值相等是有意降低早期变量的结果，不表示三种地址从概念上合并了。高半区
+内核完全可以装到低物理内存，再把不同的高虚拟链接地址映射到它。
+
+\code{0x00100000} 避开低 1 MiB 平台与启动工作区，又是 4 KiB 页边界；项目还把
+PT\_LOAD 目标上界收在 \code{0x03E00000}，专门给暂存文件让出空间。初始内核栈
+则保留
+\([\code{0x03FEF000},\code{0x03FFF000})\)，靠近但不触碰 64 MiB 开区间上界，
+与目标段和暂存区分离，并让向下增长的栈拥有固定 64 KiB 预算。Stage 1 在
+\code{0x03FFF000} 建立 RSP 后执行 \code{CALL}；调用压入的返回地址使内核函数
+入口满足 System V AMD64 的栈对齐关系。这里“靠近顶端”是项目策略，4 KiB 页
+对齐和调用 ABI 才是必须继续满足的契约。
+
+\subsection{恒等映射为什么只是过渡，不是取消地址转换}
+
+Stage 1 用 32 个 2 MiB 叶项覆盖低 64 MiB，令
+\[
+\text{virtual}=\text{physical}.
+\]
+选择恒等映射的理由是模式切换：\code{CR0.PG} 提交前后，当前 RIP、RSP、页表
+指针和串口代码仍可使用相同数值。如果新页表一开始就只提供高半区地址，打开分页
+的下一条指令必须同时落入新映射，栈和所有活跃指针也要在同一边界完成替换，启动
+故障会更难定位。
+
+恒等映射仍然是页表项建立的关系。它只覆盖低 64 MiB；位于该窗口之后第二页的
+物理地址 \code{0x04001000}，即使已被页帧分配器拥有，也不能在旧 CR3 下直接
+当作同值 C++ 指针解引用。这正是项目后来建立高半区物理直映的原因。
+
+新内核页表为每个普通 RAM 物理地址 \(p\) 建立
+\[
+\text{kernel virtual}
+=\code{0xFFFF888000000000}+p.
+\]
+\code{0xFFFF888000000000} 不是 CPU 要求的常量。项目沿用 Linux 风格的四级
+x86-64 布局，把它放在高半区 PML4[273]；64 TiB 窗口恰好占 128 个 PML4
+槽位，并避开从 PML4[256] 开始的早期堆区域。采用已有、容易识别的布局降低调试
+和后续对照成本；换成另一段 canonical 高地址也可以，但所有重叠检查、页表索引、
+调试器脚本和容量上界都必须同步改变。
+
+页表项和 CR3 仍保存物理地址 \(p\)。只有 C++ 要读取页表页、清零用户页或复制
+ELF 内容时，才把 \(p\) 加上直映基址得到可解引用指针。若同一低端物理页同时
+保留恒等映射，它就有两个虚拟别名；修改任一别名访问到的仍是同一批物理字节。
+写 CR3 也不搬运这些字节，它只是让处理器从下一次地址翻译开始采用新根。
+
+\begin{longtable}{|L{0.27\linewidth}|L{0.24\linewidth}|L{0.39\linewidth}|}
+\toprule
+项目虚拟地址 & 页表位置或边界 & 精确选择理由 \\
+\midrule
+\code{0x0000000040000000} &
+PML4[0]、PDPT[1] 起点 &
+1 GiB 对齐，使用户程序子树与 PDPT[0] 的低端 supervisor 启动映射分开；
+不同进程可独立重建该子树 \\\tablerowrule
+\code{0x00007FFFFFFF0000} &
+PML4[255] 顶端附近 &
+位于低半 canonical 空间，距分界仍有 64 KiB；四个栈页和一个 guard
+从空的独立高端用户子树向下布置 \\\tablerowrule
+\code{0xFFFF800000000000} &
+高半区 PML4[256] 起点 &
+选择第一个 canonical 高半区槽放置早期 64 KiB 堆，与用户地址和低端恒等映射
+数值上明确分开 \\\tablerowrule
+\code{0xFFFF888000000000} &
+高半区 PML4[273] 起点 &
+沿用 Linux 风格物理直映槽；为 64 TiB 窗口提供整齐索引，并避开早期堆 \\
+\bottomrule
+\end{longtable}
+
+\subsection{故障注入地址也必须说明为什么选这里}
+
+故障测试不能随意取一个巨大常量。若地址不是 canonical，处理器可能先产生
+\#GP 而不是页故障；若地址偶然已映射，测试又不会失败；若它落在真实对象附近，
+错误写入可能破坏系统后才暴露。案例使用三个容易复算且稳定未映射或受保护的地址：
+
+\begin{longtable}{|L{0.25\linewidth}|L{0.28\linewidth}|L{0.37\linewidth}|}
+\toprule
+测试地址 & 预期硬件路径 & 为什么这个地址能隔离目标机制 \\
+\midrule
+\code{0x04000000} &
+Ring 0 对 not-present 页的读取产生 \#PF &
+它正是 64 MiB 恒等映射后的第一个页对齐地址；既 canonical，又不会命中
+Stage 1 的最后一个大页 \\\tablerowrule
+\code{0x30000000} &
+Ring 3 读取未映射低半地址，CR2 保存同值 &
+它低于从 \code{0x40000000} 开始的用户 ELF 窗口，也不在用户栈子树；
+可验证用户故障收束而不会触碰真实段 \\\tablerowrule
+\code{0xFFFF800000100000} &
+Ring 0 写 present、read-only、NX 页，错误码为 \code{0x3} &
+它在早期堆基址之后 1 MiB，页对齐且不落入 64 KiB 堆；同一高半区子树可建立
+独立只读叶项，用来证明 \code{CR0.WP} 生效 \\
+\bottomrule
+\end{longtable}
+
+\begin{rubricbox}
+以后遇到一个关键地址，不要只问“它是多少”。依次确认：谁有权决定它；它属于
+哪种坐标；为什么该范围不会与现有对象重叠；下一步是否真的搬动字节；处理器当时
+由哪套段状态或 CR3 解释它；换一个数值时还要同时修改哪些契约。六项都能回答，
+一串十六进制数才成为可理解的机器布局。
+\end{rubricbox}

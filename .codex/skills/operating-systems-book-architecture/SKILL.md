@@ -53,6 +53,13 @@ For each mechanism, make this chain explicit:
 
 Use object graphs, field tables, before/after snapshots, stack layouts, and event timelines when prose alone would hide state. Distinguish hardware-saved state, software-saved state, derived state, and state that is merely referenced.
 
+For every consequential address, add an address-decision explanation in the nearby causal
+route: identify who fixes or chooses it, the coordinate system and interpreter, why that exact
+value or range is useful, whether the next step copies bytes or merely changes their
+interpretation, the concrete failure avoided, and the tradeoff of a plausible alternative.
+When one payload crosses several address systems, keep a continuous address passport instead of
+presenting disconnected hexadecimal constants.
+
 ## Maintain operating-system boundaries
 
 Treat hardware facts as interface contracts already established by the hardware book. State only the hardware behavior required to derive the kernel mechanism.

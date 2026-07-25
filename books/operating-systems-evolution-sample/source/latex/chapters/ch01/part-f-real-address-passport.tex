@@ -1,0 +1,143 @@
+\topic{现实机器中的同一边界}
+
+教学机器把复位入口放在低地址，是为了让第一次取指能够手算；真实 x86-64 案例
+不能自行选择第一地址。处理器复位后用 CS 的隐藏基址
+\code{0xffff0000} 加 IP \code{0xfff0}，从物理地址
+\code{0xfffffff0} 取得第一条指令。这个数值是处理器兼容契约，不是固件作者认为
+高地址更美观。若 ROM 只把入口放在 \code{0x00000000}，CPU 不会主动寻找它，
+而会继续访问架构规定的复位位置。
+
+案例把 128 KiB ROM 映射在
+\code{0xfffe0000--0xffffffff}。因此复位字节在 ROM 文件中的偏移为
+\[
+\code{0xfffffff0}-\code{0xfffe0000}=\code{0x1fff0}.
+\]
+\code{0x1fff0} 和 \code{0xfffffff0} 指向同一 ROM 字节，但前者由镜像工具解释，
+后者由处理器和平台地址译码解释。字节没有搬动，只是坐标原点不同。
+
+复位位置到 4 GiB 边界只有 16 字节，放不下串口、磁盘和校验逻辑。案例在这里
+只放三字节近跳，把 IP 改为 \code{0xf000}；近跳保留复位时 CS 的隐藏基址，
+所以下一取指物理地址是 \code{0xfffff000}。项目选择这个页对齐入口，是为了在
+复位向量之前获得一段连续 ROM 代码空间，并让链接脚本能够直接检查边界。换一个
+ROM 内入口并非绝对不行，但跳转编码、链接地址和镜像内容必须一起改变。
+
+\subsection{低端工作区不是一串彼此无关的常量}
+
+ROM 和 Stage 1 还要共同使用一小段低端 RAM。每个地址都由相邻对象的大小与增长
+方向决定：
+
+\begin{longtable}{|L{0.24\linewidth}|L{0.27\linewidth}|L{0.37\linewidth}|}
+\hline
+\rowcolor{BookTableHead}
+物理地址或范围 & 当前用途 & 为什么放在这里 \\ \hline
+\code{0x0500} 起 & Stage 1 描述符缓冲 & 避开
+\code{0x0000--0x04ff} 的传统中断向量与平台数据，又能在实模式直接访问 \\ \hline
+\code{0x7000} & 向下增长的早期栈顶 & 页面边界清楚，并与
+\code{0x8000} 的 Stage 1 起点保留 4 KiB 间隔 \\ \hline
+\code{0x8000--0xffff} & 最多 64 扇区的 Stage 1 & 可写成
+\code{0x0800:0x0000}；\(64\times512=\code{0x8000}\) 字节，末端恰为
+\code{0x10000} \\ \hline
+\code{0x10000--0x12fff} & PML4、PDPT、PD & 从 Stage 1 最大末端开始，
+三张表各占一个 4 KiB 对齐页，不会让建表代码覆盖自身 \\ \hline
+\code{0x13000--0x18bff} & Kernel 描述符、BootInfo、验证暂存和内存图 &
+按协议与页边界分离，失败时可分别核对，不让一项临时数据覆盖另一项 \\ \hline
+\end{longtable}
+
+例如，若保持 32 KiB 最大负载不变，而把 Stage 1 起点整体上移 4 KiB，新的
+占用窗口就会成为
+\[
+  [\code{0x9000},\code{0x11000}),
+\]
+覆盖前两张页表。此时不能只改加载常量，还必须移动页表及其后的工作区，或降低
+最大载荷。地址选择表达的是区间不重叠证明，而不是个人习惯。
+
+\subsection{哪些箭头会搬动字节，哪些只改变解释}
+
+\begin{center}
+\begin{tikzpicture}[
+  item/.style={stage,minimum width=3.35cm,minimum height=1.05cm},
+  action/.style={stage,minimum width=2.75cm,minimum height=1.05cm,fill=BookWarm}
+]
+\node[item] (disk) at (-5.0,2.8)
+  {磁盘 LBA\\Kernel 文件扇区};
+\node[action] (pio) at (0,2.8)
+  {ATA PIO\\真实复制};
+\node[item] (staging) at (5.0,2.8)
+  {暂存物理区\\\code{0x03e00000} 起};
+
+\node[item] (offset) at (-5.0,0.9)
+  {暂存基址\\加 \code{p\_offset}};
+\node[action] (load) at (0,0.9)
+  {PT\_LOAD\\复制并清零};
+\node[item] (target) at (5.0,0.9)
+  {目标物理区\\\code{0x00100000} 起};
+
+\node[item] (virtual) at (-5.0,-1.0)
+  {CPU 虚拟地址\\当前取指或指针};
+\node[action] (translate) at (0,-1.0)
+  {页表翻译\\字节不动};
+\node[item] (physical) at (5.0,-1.0)
+  {物理页地址\\页内偏移不变};
+
+\node[item] (paddr) at (-5.0,-2.9)
+  {同一物理地址 \(p\)\\页表项保存的数值};
+\node[action] (direct) at (0,-2.9)
+  {建立直映别名\\字节不动};
+\node[item] (kva) at (5.0,-2.9)
+  {高半区内核地址\\直映基址 \(+p\)};
+
+\draw[flow] (disk) -- (pio);
+\draw[flow] (pio) -- (staging);
+\draw[flow] (offset) -- (load);
+\draw[flow] (load) -- (target);
+\draw[flow] (virtual) -- (translate);
+\draw[flow] (translate) -- (physical);
+\draw[flow] (paddr) -- (direct);
+\draw[flow] (direct) -- (kva);
+\end{tikzpicture}
+\end{center}
+\diagramnote{四行分别表示设备搬运、ELF 放置、页表翻译和虚拟别名。前两行会向
+RAM 写入新内容；后两行只改变处理器怎样找到原有物理字节。所有连线均在各自行内
+完成，避免把四种动作误读成一条反复搬运的回路线。}
+
+Kernel 文件先放在
+\([\code{0x03e00000},\code{0x03f00000})\)，不是因为内核最终要在那里运行。
+这个 1 MiB 暂存区仍处于低 64 MiB 恒等映射内，却位于 PT\_LOAD 目标上界之后，
+所以校验源文件不会与目标段重叠。Stage 1 先用 E820 证明该区间是可用 RAM，再从
+\(\code{0x03e00000}+\code{p\_offset}\) 复制到 \code{p\_paddr}，并为 BSS
+清零。当前早期布局要求 \code{p\_vaddr==p\_paddr}，因此链接地址、虚拟地址和
+物理地址暂时同值；这是为了减少第一次长模式交接的变量，不是 ELF 永远如此。
+
+内核以后建立正式页表时，又会给物理地址 \(p\) 建立
+\[
+\code{0xffff888000000000}+p
+\]
+这个高半区直映地址。这里没有第三次复制：页表项仍保存 \(p\)，高半区数值只是
+内核在当前 CR3 下能够解引用的另一个名字。写 CR3 也不搬动内存，它只使下一次
+地址翻译改用新根。于是“同一批字节拥有多次地址变化”应拆成三件事：磁盘到 RAM
+是搬运，ELF 暂存到目标是映像放置，虚拟地址到物理页及高半区别名是解释规则。
+
+教学任务用“准备记录最后提交、再改变 PC”划出采用边界；案例机器则要先验证磁盘
+头、校验和与 ELF64 段，完成必要的复制和零填充，最后才把控制权交给新入口。
+地址和指令不同，但稳定起点、完整验证、最后提交以及失败不暴露半成品这四条责任
+完全相同。
+
+\subsection{遇到一个十六进制数时怎样追问}
+
+读者以后再遇到一个关键地址，可以依次补全六项事实，而不是把常量单独背下来：
+
+\begin{enumerate}
+  \item 谁拥有决定权：处理器架构、平台连线、文件格式、链接脚本，还是当前内核策略；
+  \item 它属于哪套坐标：文件偏移、磁盘扇区、物理地址，还是某个 CR3 下的虚拟地址；
+  \item 真正占用的是哪段半开区间，以及对象向高地址还是低地址增长；
+  \item 到达下一地址时，字节真的被复制、被清零，还是只换了解释规则；
+  \item 相邻对象、对齐、容量、权限和可达性共同排除了哪些位置；
+  \item 若改掉这个数，必须同步修改哪些跳转、描述符、页表、边界检查和测试证据。
+\end{enumerate}
+
+以 \code{0x8000} 为例：决定者是项目的 ROM 装入协议；坐标是低端 RAM 物理地址，
+实模式代码也可写成 \code{0x0800:0x0000}；实际占用区间是
+\([\code{0x8000},\code{0x10000})\)，字节由磁盘真实复制进来；它下方要避开
+\code{0x7000} 栈，上方要避开从 \code{0x10000} 开始的页表。若只把起点改为
+\code{0x9000}，末端便进入页表区，所以修改必须连同载荷上限或后续工作区一起
+进行。六项事实合在一起，才构成一个可以复核的地址设计。
