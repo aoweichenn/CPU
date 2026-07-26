@@ -1,15 +1,18 @@
-\section{案例 v1.1（实现中）：让物理页与堆对象都拥有可回收生命周期}
+\section{案例 v1.1（实现中）：让物理页、字节块、固定对象与虚拟区间都拥有生命周期}
 \label{case:v11-physical-memory}
 
 \begin{statebox}
-\textbf{状态边界。} 项目当前发布基线仍是 v1.0；v1.1 已由 ADR 接受并实现三项增量。
+\textbf{状态边界。} 项目当前发布基线仍是 v1.0；v1.1 已由 ADR 接受并实现五项增量。
 ADR 0017 建立动态页帧元数据、高半区物理直映和 64 GiB QEMU 容量路径；
 ADR 0020 把 64 KiB 高半区单调堆升级为可释放、可合并并能完整校验的通用堆。
 ADR 0022 又以逐阶 Free/Allocated 双位图建立 buddy 连续块的分裂、合并和
-精确释放，并通过 \(80/80\) 项完整回归。README、roadmap、架构文档和测试文档
-已经同步接受该增量；但 CMake 工程元数据仍为 v0.11，type cache、KVA、
-动态内核栈和页表回收也未闭合。因此 buddy 是\textbf{已接受的 v1.1 增量}，
-却仍不能被解释成“v1.1 已经发布完成”。
+精确释放。ADR 0023 再在通用堆上建立固定尺寸类型缓存，以活动位图和槽内
+空闲链闭合对象存储的取得、归还与整体销毁。ADR 0024 又用有序有主区间建立
+32 TiB 内核虚拟地址所有权窗口，区分“已经许诺但故意不映射”和“仍可分配”；
+完整回归现为 \(86/86\) 项。README、roadmap、架构文档和测试文档已经同步
+接受这五项增量；但 CMake 工程元数据仍为 v0.11，动态内核栈和空中间页表回收
+尚未闭合。因此 KVA 是\textbf{已接受的 v1.1 增量}，却仍不能被解释成
+“v1.1 已经发布完成”。
 \end{statebox}
 
 v0.6 已经能解析 E820 内存图，却只管理 Stage 1 恒等映射覆盖的低 64 MiB。
@@ -338,15 +341,358 @@ Thread、FileTable 或动态内核栈沿用它，对象退出只会留下无法�
 与统计；64 KiB 集成测试在乱序释放后重新申请最大连续负载；固定种子模型执行
 \(100000\) 次随机申请与释放，逐步核对对齐、首尾数据和拓扑。堆增量落地时，
 三项新增测试使套件由 v1.0 的 73 项增长到 76 项；命名门禁随后推进到 77 项，
-本节前述 buddy 三项测试又把当前完整套件推进到 80 项。
+本节前述 buddy 三项测试又把完整套件推进到 80 项；随后加入的类型缓存单元、
+生命周期和固定种子随机测试再把当前完整套件推进到 83 项。
 
 当前实现仍不是无限增长、并发安全的通用内核分配入口。后备区固定为 64 KiB，
 best-fit 线性扫描空闲链，调用者还必须保证启动路径串行；IRQ、NMI、panic 与
 多 Thread 分配都不在当前契约内。当前 buddy 已负责页粒度连续块，但尚无
-并发、zone、迁移类型与回收水位；未来 type cache 负责固定尺寸热对象，KVA
-负责虚拟区间。通用堆不能替代这些层次。
+并发、zone、迁移类型与回收水位；当前类型缓存负责固定尺寸对象的单后备块，
+KVA 已负责虚拟区间所有权。通用堆不能替代这些层次。
 
-\subsection{三项内存基础怎样继续长成通用内核分配}
+\subsection{为什么通用堆之上还需要固定尺寸类型缓存}
+
+通用堆已经能够释放和合并，继续让每个 64 字节内核对象单独调用它，看起来似乎
+最省设计工作。但通用堆不知道下一个请求的尺寸和对齐：每次申请都要搜索
+best-fit 候选、计算前缀与后缀并携带块头；大量同尺寸短寿命对象还会把空闲区
+切成许多不同形状。类型缓存利用一条额外事实——同一缓存中的对象尺寸与对齐
+相同——在初始化时一次性排好槽位，之后取得和归还都只改链头、位图与计数。
+
+当前实现故意先取固定容量、单后备块，而不是直接实现多 slab 的 SLUB。这样做
+使一份缓存只有一个来自 \code{KernelHeap} 的所有权根：初始化成功后整块归
+缓存，所有槽归还并通过校验后，销毁再把同一块整体交还通用堆。代价是容量耗尽
+时只能明确返回 \code{OutOfObjects}，不能自动增长。KVA 现已能许诺扩展所需
+虚拟区间，但页表回收、多 slab 所有权和并发规则尚未具备，因此本增量仍不自动
+增加后备块。
+
+设对象原始尺寸为 \(s\)，对齐为 \(a\)，容量为 \(N\)。后备布局由下列五个量
+唯一决定：
+\[
+\begin{aligned}
+  B &= \left\lceil N/8 \right\rceil, &
+  A &= \max(a,8),\\
+  S &= \operatorname{align\_up}\!\left(\max(s,8),A\right), &
+  O &= \operatorname{align\_up}(B,A),\\
+  H &= O+N S.
+\end{aligned}
+\]
+\(B\) 是活动位图字节数；\(A\) 是后备块和对象区所需对齐；\(S\) 是相邻槽
+起点间距；\(O\) 是对象区相对后备块起点的偏移；\(H\) 是向通用堆申请的总
+字节数。这里的两个 8 都来自空闲槽要保存一个 64 位“下一槽索引”，不是在暗示
+所有内核对象至少有 8 字节。即使对象只有 1 字节，空闲状态仍须容纳链节点；
+对象一旦活动，整个槽才全部归调用者。尺寸乘法、对齐加法和总长加法都在调用
+通用堆以前检查溢出，因而错误配置不会留下半个后备申请。
+
+\begin{pdfdiagram}[scale=0.96]
+  \node[os memory, text width=24mm] (bitmap) at (-55mm,18mm)
+    {活动位图\\每槽一位\\块首开始};
+  \node[os state, text width=24mm] (padding) at (-18mm,18mm)
+    {对齐填充\\把对象区推进到\\\(A\) 的倍数};
+  \node[os memory, text width=29mm] (slots) at (23mm,18mm)
+    {槽 \(0\) 至 \(N-2\)\\固定步长 \(S\)\\地址不再移动};
+  \node[os memory, text width=24mm] (last) at (60mm,18mm)
+    {槽 \(N-1\)\\空闲时保存\\链尾标记};
+  \node[os control, text width=34mm] (free) at (-42mm,-20mm)
+    {空闲槽\\首 8 字节解释为\\下一空闲槽索引};
+  \node[os compute, text width=34mm] (commit) at (0,-20mm)
+    {取得/归还提交点\\先验证，再改位图、\\链头和守恒计数};
+  \node[os state, text width=34mm] (active) at (42mm,-20mm)
+    {活动槽\\全部 \(S\) 字节由\\调用者按对象解释};
+  \draw[os strong bus] (bitmap.east) -- node[os label, above] {\(B\)} (padding.west);
+  \draw[os strong bus] (padding.east) -- node[os label, above] {\(O-B\)} (slots.west);
+  \draw[os strong bus] (slots.east) -- (last.west);
+  \draw[os strong bus] (free.east) -- node[os label, above] {TryAcquire} (commit.west);
+  \draw[os strong bus] (commit.east) -- node[os label, above] {交付同一地址} (active.west);
+  \draw[os feedback] (active.south) to[bend left=18]
+    node[os label, below] {TryRelease 后首字节可改作链索引} (free.south);
+\end{pdfdiagram}
+\diagramnote{上排是一个连续后备块的概念布局，宽度不按字节比例绘制；下排说明
+同一槽位在空闲与活动状态之间改变的是所有权和解释规则，而不是物理地址。
+取得、归还都不复制对象字节到另一槽。}
+
+\subsection{位图与槽内链为什么不是重复记录}
+
+只有空闲链时，取得链头可以做到 \(O(1)\)，却无法回答传入地址当前是否仍由调用者
+持有。第一次归还会把槽压入链；若第二次归还同一地址，单链结构本身不能可靠区分
+“合法空闲槽”和“重复提交的活动槽”，结果可能让同一地址在链中出现两次，随后被
+交给两个所有者。只有活动位图时可以拒绝重复释放，却需要扫描才能寻找空闲槽。
+因此两份记录回答不同问题：位图是每槽活动所有权的独立真相，链是空闲集合的
+快速访问顺序。
+
+链中保存索引而不是任意下一指针，也把可接受状态约束在
+\([0,N)\cup\{\mathtt{UINT64\_MAX}\}\) 内。校验器可以从链头最多走 \(N\) 步，
+遇到越界索引、活动槽或超过容量仍未到链尾，都立即报告损坏；最后还要把观察到的
+空闲数与位图观察到的活动数、缓存计数逐项核对。LIFO 不是公平性契约，它只是让
+归还成为常数时间压栈，并优先复用刚访问过的槽；调用者不能依赖特定的长期顺序。
+
+\begin{longtable}{|L{0.18\linewidth}|L{0.27\linewidth}|L{0.30\linewidth}|L{0.15\linewidth}|}
+\hline
+\rowcolor{BookBlueTint}
+\textbf{操作} & \textbf{提交前验证} & \textbf{唯一提交点之后的变化} &
+\textbf{失败时保持} \\\tablerowrule
+\endhead
+初始化 & 尺寸非零、对齐为二次幂、容量非零；布局全部乘加无溢出，通用堆接受
+一次后备申请 & 清零活动位图，按 \(0,1,\ldots,N-1\) 写入空闲索引链，建立
+容量与统计 & 缓存保持未初始化；布局错误不调用堆 \\\tablerowrule
+取得 & 缓存守恒式成立，链头在范围内且为空闲槽，下一索引合法，累计计数未溢出 &
+弹出链头、置活动位、更新活动/空闲/累计/峰值，最后才发布槽地址 &
+耗尽时调用者原输出指针不变 \\\tablerowrule
+归还 & 指针非空、落在对象区、恰为槽首且对应活动位为一；链头、计数和累计值一致 &
+清活动位，把旧链头写入该槽首，再把该槽压成新链头 &
+内部、外部或重复指针不改位图和链 \\\tablerowrule
+销毁 & 活动数为零，布局、位图尾位、计数守恒和有界空闲链均通过完整校验 &
+通用堆成功收回唯一后备块后，缓存才清空自身状态 &
+堆拒绝释放时缓存仍初始化，可重试或诊断 \\\hline
+\end{longtable}
+
+归还操作会把该槽首 8 字节改写为空闲链索引。这不是保存对象内容，也不是把对象
+搬到链表节点；它表示调用者的对象生命周期已经结束，该存储现在由缓存重新解释。
+因此归还以后继续读取旧字段属于 use-after-free。相反，取得时只保证返回一段满足
+尺寸与对齐的原始存储，不负责清零，也不隐式执行 C++ 构造函数；模板
+\code{KernelTypeCache<ObjectType>} 目前只用 \code{sizeof}/\code{alignof}
+提供类型化指针。对象构造、析构、poison、redzone 和引用计数都属于更高层契约。
+
+\subsection{为什么代表案例得到 \code{0x840}，而不是把它写成常量}
+
+目标自检选择尺寸 \(s=64\)、对齐 \(a=64\)、容量 \(N=32\)。64 字节对象能够
+明确检查 cache-line 对齐和首尾字段写回；32 槽足以完整耗尽、交错归还并再次
+复用，同时把启动自检成本限制在固定范围。它们是代表案例的输入，不是所有未来
+类型缓存必须遵守的 ABI。
+
+代入布局公式可得
+\[
+  B=\lceil32/8\rceil=4,\quad A=64,\quad S=64,\quad
+  O=\operatorname{align\_up}(4,64)=64,
+\]
+于是位图之后有 60 字节对齐填充，总后备长度为
+\[
+  H=64+32\times64=2112=\mathtt{0x840}.
+\]
+\code{0x840} 因而是尺寸、对齐与容量的派生结果。若对象只有 1 字节、对齐为
+1、容量为 9，当前规则会得到 2 字节位图、8 字节对象区偏移、8 字节槽步长和
+80 字节总长；单元测试专门覆盖这个非整字节位图案例，防止实现只对 32 槽偶然
+成立。
+
+目标机依次取得全部 32 槽并写读首尾模式；第 33 次取得必须返回耗尽且不改输出
+指针。随后先归还偶数槽、尝试一次重复归还并要求拒绝，再归还奇数槽；此时最后
+归还的槽 31 位于 LIFO 链头，下一次取得必须复用同一地址。再次归还并销毁后，
+累计成功取得与归还均为 33，峰值为 32，活动数为 0，空闲数为 32；通用堆的
+当前占用、活动申请与最大空闲负载还要恢复到进入自检前的基线。
+
+宿主单元测试补充无效配置、布局溢出、后备堆不足、内部/外部指针和活动对象销毁；
+集成测试让 8、64、256 字节对齐的三个缓存共享 64 KiB 通用堆，交错释放时核对
+其余缓存的活动数据，最终乱序销毁并恢复单一连续空闲区；固定种子随机测试执行
+\(100000\) 步申请与归还，每 257 步用独立记录核对地址唯一性、数据模式、位图、
+空闲链和统计。三项测试把完整套件由 80 项推进到 83 项，本次完整构建、产物审计
+与真实 QEMU 路径均通过。
+
+当前缓存仍由 BSP 启动路径或调用者串行化，不提供内部锁，也不允许把
+IRQ、NMI 或 panic 路径当作安全调用环境；它只有一个固定容量后备块，没有
+空/部分/满 slab 列表、per-CPU 快速路径和内存压力回收。这些限制说明 ADR 0023
+闭合的是“固定尺寸存储的最小可回收生命周期”，不是宣称现代 slab 分配器已经
+完成。
+
+\subsection{为什么 not-present 不能表示“这段虚拟地址无人拥有”}
+
+物理页分配器已经知道哪些页帧属于谁，页表也能回答某个虚拟页当前是否存在翻译。
+看起来只要扫描 not-present 页，就能找到一段“空闲虚拟地址”。问题在于
+not-present 只是一条硬件翻译事实，不是一条软件所有权事实。动态内核栈会取得
+“首 guard + 若干栈页 + 尾 guard”的完整区间，却故意让两个 guard 没有叶项；
+映射事务还可能先许诺地址，随后才逐页取得物理后备。若另一个调用者把这些
+not-present 页当成空闲地址，保护页就会在没有任何页表冲突的情况下被重复分配。
+
+因此当前项目把一次动态映射拆成三份彼此不能代替的记录：
+
+\begin{pdfdiagram}[scale=0.96]
+  \node[os control, text width=34mm] (kva) at (-48mm,18mm)
+    {KVA 所有权\\许诺虚拟半开区间\\可包含未映射 guard};
+  \node[os memory, text width=34mm] (buddy) at (0,18mm)
+    {buddy 所有权\\交付物理页或连续块\\尚不能由 CPU 解引用};
+  \node[os compute, text width=34mm] (pte) at (48mm,18mm)
+    {页表翻译\\写入物理页号与权限\\提交可访问路径};
+  \node[os state, text width=34mm] (use) at (48mm,-20mm)
+    {处理器真实访存\\TLB/页表翻译后\\读写后备字节};
+  \node[os memory, text width=34mm] (unmap) at (0,-20mm)
+    {撤销映射并失效 TLB\\确认旧虚拟名\\不再访问物理页};
+  \node[os control, text width=34mm] (release) at (-48mm,-20mm)
+    {先还物理页\\最后释放 KVA\\地址才可重新许诺};
+  \draw[os strong bus] (kva.east) -- node[os label, above] {取得地址} (buddy.west);
+  \draw[os strong bus] (buddy.east) -- node[os label, above] {取得后备} (pte.west);
+  \draw[os strong bus] (pte.south) -- node[os label, right] {叶项生效} (use.north);
+  \draw[os feedback] (use.west) -- node[os label, above] {结束使用} (unmap.east);
+  \draw[os feedback] (unmap.west) -- node[os label, above] {逆序归还} (release.east);
+\end{pdfdiagram}
+\diagramnote{上排是建立顺序，下排是销毁顺序。KVA 不自动申请页帧，buddy 不自动
+建立映射，页表也不拥有上层区间。只有三层分别提交，虚拟地址才成为可访问对象；
+只有先撤销翻译、再归还物理页、最后释放区间，旧地址才不会指向已复用的页。}
+
+这里发生了多次“地址变化”，却没有多次复制。KVA 返回的是虚拟页号范围，buddy
+返回的是物理页号范围，PTE 只是把二者关联；处理器随后从虚拟地址看到同一批
+物理字节。改变 PTE 或使 TLB 项失效只改变解释路径，不会搬运数据。只有调用者
+显式清零、写入或复制页内容时，后备字节才真正变化。
+
+\subsection{为什么 KVA 从 \code{0xFFFFC90000000000} 开始}
+
+这个常量既不是处理器规定的 vmalloc 地址，也不是从宿主 Linux 借来的现成映射。
+当前四级分页把高半区物理直映放在 \code{0xFFFF888000000000}，为它保留
+64 TiB；该窗口的独占终点为 \code{0xFFFFC88000000000}。项目再留出
+512 GiB 的完整 PML4 槽位作为布局间隔，于下一个槽位
+\code{PML4[402]} 的起点建立 KVA：
+\[
+\begin{aligned}
+  \mathtt{KVA_{begin}} &= \mathtt{0xFFFFC90000000000},\\
+  \mathtt{KVA_{size}}  &= 32\ \mathrm{TiB}
+                         =\mathtt{0x0000200000000000},\\
+  \mathtt{KVA_{end}}   &= \mathtt{0xFFFFE90000000000}.
+\end{aligned}
+\]
+32 TiB 恰好跨越 64 个 512 GiB PML4 槽位，即 \code{PML4[402..465]}；
+起点和最后一个字节都符合当前 48 位 canonical 规则。选择整槽边界使页表层次、
+容量和冲突检查可以直接复算，也为 direct map 与 KVA 之间保留明显的诊断边界。
+若未来启用五级分页，地址即使仍然 canonical，也不能悄悄沿用；谁解释地址的
+规则已经改变，必须由新的布局决策迁移。
+
+\begin{longtable}{|L{0.20\linewidth}|L{0.22\linewidth}|L{0.30\linewidth}|L{0.18\linewidth}|}
+\hline
+\rowcolor{BookBlueTint}
+\textbf{数值或范围} & \textbf{决定者} & \textbf{为什么这样选择} &
+\textbf{它不能证明什么} \\\tablerowrule
+\endhead
+\code{0xFFFFC90000000000} & 项目的四级高半区布局 &
+避开 64 TiB direct map，并在完整 PML4 槽位边界开始 &
+该页已经映射或已取得物理后备 \\\tablerowrule
+32 TiB & 当前 KVA ABI &
+提供 \(2^{33}\) 个 4 KiB 虚拟页，同时完整落在 48 位高半区 &
+机器拥有 32 TiB RAM \\\tablerowrule
+首个 4 KiB 页 & KVA 初始化策略 &
+永久保留窗口基址，使零偏移和基址附近错误稳定落入未映射页 &
+所有 guard 都必须位于窗口首页 \\\tablerowrule
+256 个描述符 & 当前 BSP 启动配置 &
+只为同时存在的有主区间付费，固定占用 \(256\times24=6144\) 字节 &
+最多只能管理 256 个虚拟页 \\\hline
+\end{longtable}
+
+最后一行区分了“区间数量”和“页容量”。一个描述符保存起始地址、页数和类型，
+既可以代表一页，也可以代表数十亿页；256 限制的是同时活动的 allocation 与
+reservation 总数。若按 32 TiB 窗口每页保存一位，仅一族位图就要
+\(2^{33}/8=1\) GiB；再区分保留与分配还会继续增长。当前启动期只有少量区间，
+用 6 KiB 描述符数组换取 \(O(N)\) 扫描，是有意识的规模选择。
+
+\subsection{为什么只记录有主区间，空闲区间却不用合并}
+
+\code{KernelVirtualAddressRangeDescriptor} 数组只使用前部活动元素，并按
+起始地址严格递增；每项类型为 Allocation 或 Reservation，尾部必须全部保持
+Unused、零地址和零页数。窗口起点、相邻描述符终点与下一个描述符起点之间的
+缝隙就是空闲区间。删除一个 allocation 描述符以后，左右缝隙在数学上立即成为
+一个更大缝隙，不需要再修改空闲链或执行显式合并。
+
+申请使用 best-fit，但对齐的是\emph{绝对虚拟页号}，不是“从窗口起点数第几页”。
+若请求八页对齐，成功地址自身必须是 32 KiB 的倍数；换一个不满足同样对齐的
+窗口基址时，相对偏移八页对齐并不能替代这条要求。实现先遍历全部缝隙、计算对齐
+候选，再选择原始页数最小的可容纳缝隙；同样大小保留低地址候选。所有乘法、向上
+对齐和末端加法都在移动描述符以前检查，因此失败不会留下半次插入。
+
+\begin{lstlisting}
+try_allocate_kva(request_pages, alignment_pages, output):
+    // 页数必须非零；对齐页数必须为二次幂，才能用掩码安全对齐。
+    validate_request_without_changing(output)
+
+    best = none
+    for each gap derived from sorted owned descriptors:
+        // 对齐绝对页号，保证最终虚拟地址本身满足硬件/调用方要求。
+        candidate_page = align_up(gap.begin / PAGE_SIZE,
+                                  alignment_pages)
+        // 先证明候选半开区间仍完整落在当前 gap 中。
+        if candidate fits request_pages:
+            // 选原始 gap 最小者；扫描顺序自然保留同尺寸低地址候选。
+            remember_candidate_if_better(best, gap, candidate_page)
+
+    if no candidate:
+        // 地址耗尽与描述符耗尽是两种压力，错误码不能混写。
+        return OUT_OF_VIRTUAL_ADDRESS_SPACE
+
+    // 到这里才移动数组尾部、插入描述符并更新守恒计数。
+    commit_descriptor_and_statistics(best)
+    output = exact_range(best, request_pages)
+    return SUCCEEDED
+\end{lstlisting}
+
+Reservation 与 Allocation 共用页对齐、窗口边界和重叠验证，但保留区不能通过
+\code{TryRelease} 释放。普通释放也不接受“范围里任意一个地址”：它必须同时
+匹配活动 allocation 的精确起点和原始页数。内部地址、错误页数、保留区与重复
+释放分别得到可区分的错误，并且都不移动数组或修改计数。这样，释放接口不会猜测
+调用者原本拥有哪个对象。
+
+\subsection{为什么六页自检以前还要先映射一页}
+
+当前 \code{UnmapPage} 能清除叶项并执行 \code{INVLPG}，却尚不回收已经变空的
+PML4 以下中间页表。第一次在 KVA 槽位建立 4 KiB 映射，需要新建 PDPT、PD 和
+PT 三页。如果把这三页混入主生命周期的前后统计，就会把“当前已知的页表基础
+设施成本”误报成数据页泄漏。项目先申请、映射、写读、撤销并归还一页作为暖机；
+这段事务归还数据页和 KVA 区间，却有意把三张中间表留作随后测试的基线。
+
+暖机取得窗口第二页 \code{0xFFFFC90000001000}，因为首页已经永久保留。主事务
+随后申请六页并要求八页对齐。窗口基址本身按八页对齐，但从第二页开始的空洞要
+向上越过七页前缀，故结果必为
+\[
+  \mathtt{0xFFFFC90000000000}+8\times4096
+  =\mathtt{0xFFFFC90000008000}.
+\]
+这不是写死的“栈地址”，而是永久保留、绝对对齐和 best-fit 共同推导出的当前
+测试结果。六页中第 0 与第 5 页保持 not-present，中间四页映射到一个 buddy
+order 2 连续块：
+
+\begin{pdfdiagram}[scale=0.96]
+  \node[os control, text width=29mm] (reserve) at (-54mm,20mm)
+    {KVA 六页\\八页绝对对齐\\先取得完整所有权};
+  \node[os memory, text width=29mm] (frames) at (-18mm,20mm)
+    {buddy order 2\\四个连续物理页\\数据后备};
+  \node[os compute, text width=29mm] (map) at (18mm,20mm)
+    {只映射偏移 1..4\\supervisor RW/NX\\两端无叶项};
+  \node[os state, text width=29mm] (verify) at (54mm,20mm)
+    {查询并真实写读\\首尾数据页模式\\guard 仍 not-present};
+  \node[os control, text width=38mm] (unmap) at (37mm,-20mm)
+    {逆序撤销四个叶项\\每页失效当前 CPU 的 TLB};
+  \node[os memory, text width=38mm] (giveback) at (-9mm,-20mm)
+    {归还同一个 order 2 块\\物理页重新进入 buddy};
+  \node[os control, text width=38mm] (free) at (-55mm,-20mm)
+    {最后释放六页 KVA\\区间重新成为隐式空洞};
+  \draw[os strong bus] (reserve.east) -- (frames.west);
+  \draw[os strong bus] (frames.east) -- (map.west);
+  \draw[os strong bus] (map.east) -- (verify.west);
+  \draw[os feedback] (verify.south) -- (unmap.north);
+  \draw[os feedback] (unmap.west) -- (giveback.east);
+  \draw[os feedback] (giveback.west) -- (free.east);
+\end{pdfdiagram}
+\diagramnote{首尾 guard 已由 KVA 许诺给同一对象，却故意没有 PTE；这正是
+“not-present 不等于空闲”的可执行反例。四个数据页从虚拟地址访问时没有发生
+第二份复制，页表只为同一物理块建立四个虚拟名字。}
+
+主事务成功后，累计申请与释放都为 2：一次来自暖机，一次来自六页主测试；
+峰值为 6，活动分配页为 0，永久保留页为 1，活动描述符只剩首页 reservation。
+窗口总计 \(2^{33}\) 页，所以最终空闲页和最大连续空洞都为
+\(2^{33}-1=\mathtt{0x1FFFFFFFF}\)。单元测试覆盖 best-fit、绝对对齐、两类
+耗尽、错误释放和外部元数据损坏；集成测试串联真实页帧与页表；固定种子随机
+测试在 512 页独立逐页模型上执行 \(100000\) 步，并每 257 步复算统计和最大
+空洞。三项测试把完整套件由 83 项推进到 86 项，完整构建、ELF 审计与真实
+QEMU 路径均通过。
+
+本轮审计也保留了一次有解释力的失败：初始 64 GiB 系统测试在 15 秒边界只通过
+85 项，串口停在内存初始化以前的最后一个里程碑。异常跟踪没有出现新的处理器
+故障；原因是 Debug 路径要扫描 \(16777216\) 个页状态，旧墙钟预算与正常运行
+时间过于接近。项目随后把普通配置保持为 15 秒、64 GiB 主规格调整为有界的
+40 秒，CTest 再以 50 秒设外层上限，并为预算选择补单元测试；调整后的首次
+重跑约 12 秒完成，最终提交复验约 16 秒完成，86 项均全部通过。这里调整的是
+宿主观察预算，不是放宽来宾里程碑、跳过 KVA 校验或把超时当成功。
+
+当前 KVA 仍要求 BSP 启动路径或调用者串行化，扫描、插入和删除最多 256 个
+描述符，尚无锁、平衡树、per-CPU 地址缓存或延迟 TLB 批处理。它只管理地址，
+不替调用者取得物理页、建立映射或自动回滚跨层事务；动态内核栈尚未迁移，
+空中间页表也尚未回收。启动自检任何失败都会停止系统；未来运行时调用者则必须
+把“全部 unmap 成功”作为归还物理页的前置提交条件，不能让仍可命中的旧翻译
+指向已经复用的页。
+
+\subsection{五项内存基础怎样继续长成通用内核分配}
 
 \begin{longtable}{|L{0.21\linewidth}|L{0.24\linewidth}|L{0.27\linewidth}|L{0.18\linewidth}|}
 \toprule
@@ -363,15 +709,26 @@ best-fit 线性扫描空闲链，调用者还必须保证启动路径串行；IR
 高半区物理直映 & 高端物理页不能被内核 C++ 访问 & 临时映射、页缓存页、COW
 复制与统一页表遍历 & 映射存在不等于页帧可分配 \\\tablerowrule
 可回收 \code{KernelHeap} & 单调堆无法表达对象销毁、复用与碎片合并 &
-type cache、动态内核栈、对象引用与失败回滚 &
+动态后备扩展、动态内核栈、对象引用与失败回滚 &
 释放只接受活动负载的精确首地址 \\\tablerowrule
+固定尺寸类型缓存 & 同尺寸对象反复经过通用堆搜索、分裂和块头管理 &
+多 slab 增长、构造析构、per-CPU 缓存、poison 与内存压力回收 &
+一个活动槽只能按精确首地址归还一次；全部活动槽退出后才能销毁缓存
+\\\tablerowrule
+\code{KernelVirtualAddressAllocator} & not-present 页无法表达已许诺地址和
+未映射 guard & 动态内核栈、vmalloc、模块区、延迟 TLB 与并发区间索引 &
+区间取得在映射以前，区间释放在全部 unmap 与物理页归还以后
+\\\tablerowrule
 混合 2 MiB/4 KiB 直映 & 全部小页导致建表成本随容量快速增长 & 大页拆分、
 内存热插拔与更细权限 & 大页优化不能跨越地址洞或权限边界 \\
 \bottomrule
 \end{longtable}
 
 因此，direct map 不是 \code{kmalloc}，buddy 也不是字节对象分配器，边界标记堆
-仍不是 type cache。当前四个 PCB、内核栈和描述符容量尚未动态化，堆后备区也
-不会按需增长。v1.1 的三项已接受增量分别解除“内核只能
-看见低 64 MiB”“堆对象只能分配、不能归还”和“只能逐页扫描、不能恢复连续块”
-三条限制，为后续动态对象表、COW 与按需分页建立可逐层验收的资源通路。
+不是类型缓存，当前单后备块类型缓存也不是完整 SLUB，KVA 也不是页表映射器。
+当前四个 PCB、内核栈和
+描述符容量尚未动态化，堆后备区与类型缓存都不会按需增长。v1.1 的五项已接受
+增量分别解除“内核只能看见低 64 MiB”“堆对象只能分配、不能归还”“只能逐页
+扫描、不能恢复连续块”“同尺寸对象仍需反复经过通用堆”和“未映射地址无法记录
+软件所有者”五条限制，为后续动态内核栈、对象表、COW 与按需分页建立可逐层
+验收的资源通路。
